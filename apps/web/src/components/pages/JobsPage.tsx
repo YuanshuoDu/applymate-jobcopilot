@@ -1,0 +1,684 @@
+'use client'
+
+import React, { useMemo, useState, useEffect, useRef } from 'react'
+import { TopBar } from '@/components/layout/TopBar'
+import { Btn, Card, CompanyLogo, ScorePill, StatusBadge, useToast } from '@/components/ui'
+import type { Job, JobStatus, Activity } from '@/lib/types'
+import { apiMutate, fmtDate, fmtRelative } from '@/lib/hooks'
+
+const KANBAN_COLS: JobStatus[] = ['saved', 'applied', 'review', 'interview', 'offer', 'rejected']
+const COL_LABELS: Record<JobStatus, string> = {
+  saved: 'Saved', applied: 'Applied', review: 'In Review',
+  interview: 'Interview', offer: 'Offer', rejected: 'Rejected',
+}
+const COL_COLORS: Record<JobStatus, string> = {
+  saved: '#6B7280', applied: '#185FA5', review: '#854F0B',
+  interview: '#3B6D11', offer: '#0E7490', rejected: '#A32D2D',
+}
+
+// ── ListView ──────────────────────────────────────────────────────────────────
+function ListView({ jobs, onRowClick }: { jobs: Job[]; onRowClick: (job: Job) => void }) {
+  const [sort, setSort] = useState<{ col: string; dir: 'asc' | 'desc' }>({ col: 'date', dir: 'desc' })
+
+  const sorted = useMemo(() => [...jobs].sort((a, b) => {
+    if (sort.col === 'score') {
+      const sa = a.score ?? 0, sb = b.score ?? 0
+      return sort.dir === 'desc' ? sb - sa : sa - sb
+    }
+    if (sort.col === 'company') {
+      return sort.dir === 'desc' ? b.company.localeCompare(a.company) : a.company.localeCompare(b.company)
+    }
+    // date: sort by createdAt
+    const da = new Date(a.createdAt).getTime()
+    const db = new Date(b.createdAt).getTime()
+    return sort.dir === 'desc' ? db - da : da - db
+  }), [jobs, sort])
+
+  function SortTh({ col, label }: { col: string; label: string }) {
+    return (
+      <th
+        onClick={() => setSort(s => ({ col, dir: s.col === col && s.dir === 'desc' ? 'asc' : 'desc' }))}
+        style={{ padding: '8px 16px', textAlign: 'left', fontSize: 10, color: 'var(--text-muted)', fontWeight: 500, borderBottom: '0.5px solid var(--border)', cursor: 'pointer', userSelect: 'none', whiteSpace: 'nowrap' }}>
+        {label} {sort.col === col ? (sort.dir === 'desc' ? '↓' : '↑') : ''}
+      </th>
+    )
+  }
+
+  return (
+    <Card style={{ overflow: 'hidden' }}>
+      <table style={{ width: '100%', borderCollapse: 'collapse' }}>
+        <thead>
+          <tr style={{ background: 'var(--bg-secondary)' }}>
+            <SortTh col="company" label="Company" />
+            <th style={{ padding: '8px 16px', textAlign: 'left', fontSize: 10, color: 'var(--text-muted)', fontWeight: 500, borderBottom: '0.5px solid var(--border)' }}>Role</th>
+            <th style={{ padding: '8px 16px', textAlign: 'left', fontSize: 10, color: 'var(--text-muted)', fontWeight: 500, borderBottom: '0.5px solid var(--border)' }}>Status</th>
+            <SortTh col="score" label="Match" />
+            <SortTh col="date"  label="Added" />
+            <th style={{ padding: '8px 16px', textAlign: 'left', fontSize: 10, color: 'var(--text-muted)', fontWeight: 500, borderBottom: '0.5px solid var(--border)' }}>Follow-up</th>
+            <th style={{ padding: '8px 16px', borderBottom: '0.5px solid var(--border)' }} />
+          </tr>
+        </thead>
+        <tbody>
+          {sorted.map((j, i) => (
+            <tr key={j.id}
+              onClick={() => onRowClick(j)}
+              style={{ borderBottom: i < sorted.length - 1 ? '0.5px solid var(--border)' : 'none', cursor: 'pointer' }}
+              onMouseEnter={e => (e.currentTarget.style.background = 'var(--bg-secondary)')}
+              onMouseLeave={e => (e.currentTarget.style.background = '')}>
+              <td style={{ padding: '10px 16px' }}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                  <CompanyLogo logo={j.logo ?? j.company.slice(0, 2).toUpperCase()} />
+                  <div>
+                    <div style={{ fontSize: 12, fontWeight: 500 }}>{j.company}</div>
+                    <div style={{ fontSize: 10, color: 'var(--text-muted)' }}>{j.location}</div>
+                  </div>
+                </div>
+              </td>
+              <td style={{ padding: '10px 16px', fontSize: 12, color: 'var(--text-muted)' }}>{j.role}</td>
+              <td style={{ padding: '10px 16px' }}><StatusBadge status={j.status} /></td>
+              <td style={{ padding: '10px 16px' }}><ScorePill score={j.score ?? 0} /></td>
+              <td style={{ padding: '10px 16px', fontSize: 11, color: 'var(--text-muted)' }}>
+                {fmtDate(j.appliedAt ?? j.createdAt)}
+              </td>
+              <td style={{ padding: '10px 16px', fontSize: 11, color: j.followUpAt ? '#854F0B' : 'var(--text-muted)' }}>
+                {fmtDate(j.followUpAt) || '—'}
+              </td>
+              <td style={{ padding: '10px 16px' }}>
+                <Btn small variant="ghost" onClick={() => onRowClick(j)}>···</Btn>
+              </td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </Card>
+  )
+}
+
+// ── KanbanView ────────────────────────────────────────────────────────────────
+function KanbanView({ jobs, onStatusChange }: {
+  jobs: Job[]
+  onStatusChange: (id: string, status: JobStatus) => void
+}) {
+  const toast  = useToast()
+  const dragId = useRef<string | null>(null)
+  const [dragOver, setDragOver] = useState<JobStatus | null>(null)
+
+  function handleDrop(col: JobStatus) {
+    if (dragId.current) {
+      const job = jobs.find(j => j.id === dragId.current)
+      if (job && job.status !== col) {
+        onStatusChange(dragId.current, col)
+      }
+      dragId.current = null
+    }
+    setDragOver(null)
+  }
+
+  const cols = useMemo(() => {
+    const m = {} as Record<JobStatus, Job[]>
+    KANBAN_COLS.forEach(c => { m[c] = jobs.filter(j => j.status === c) })
+    return m
+  }, [jobs])
+
+  return (
+    <div style={{ display: 'flex', gap: 12, overflowX: 'auto', paddingBottom: 8, alignItems: 'flex-start' }}>
+      {KANBAN_COLS.map(col => (
+        <div key={col}
+          onDragOver={e => { e.preventDefault(); setDragOver(col) }}
+          onDragLeave={() => setDragOver(null)}
+          onDrop={() => handleDrop(col)}
+          onTouchMove={e => {
+            // Detect which column the touch is over
+            const touch = e.touches[0]
+            const el = document.elementFromPoint(touch.clientX, touch.clientY)
+            const colDiv = el?.closest('[data-col]') as HTMLElement | null
+            if (colDiv) setDragOver(colDiv.dataset.col as JobStatus)
+          }}
+          data-col={col}
+          style={{
+            width: 200, flexShrink: 0,
+            border: dragOver === col ? `1.5px dashed ${COL_COLORS[col]}` : '0.5px solid var(--border)',
+            borderRadius: 10, padding: 10,
+            background: dragOver === col ? `${COL_COLORS[col]}08` : 'var(--bg-secondary)',
+            transition: 'border-color 0.12s, background 0.12s',
+          }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 10 }}>
+            <span style={{ width: 7, height: 7, borderRadius: '50%', background: COL_COLORS[col] }} />
+            <span style={{ fontSize: 11, fontWeight: 500, color: 'var(--text)' }}>{COL_LABELS[col]}</span>
+            <span style={{ marginLeft: 'auto', fontSize: 10, color: 'var(--text-muted)', background: 'var(--bg)', border: '0.5px solid var(--border)', borderRadius: 999, padding: '1px 6px' }}>
+              {cols[col].length}
+            </span>
+          </div>
+          {cols[col].map(job => (
+            <div key={job.id} draggable
+              onDragStart={() => { dragId.current = job.id }}
+              onTouchStart={() => { dragId.current = job.id }}
+              onTouchEnd={() => { dragId.current = null }}
+              onMouseEnter={e => { e.currentTarget.style.borderColor = COL_COLORS[col]; e.currentTarget.style.boxShadow = `0 2px 8px ${COL_COLORS[col]}12` }}
+              onMouseLeave={e => { e.currentTarget.style.borderColor = 'var(--border)'; e.currentTarget.style.boxShadow = 'none' }}
+              style={{ background: 'var(--bg)', border: '0.5px solid var(--border)', borderRadius: 8, padding: 12, marginBottom: 8, cursor: 'grab', transition: 'border-color 0.15s, box-shadow 0.15s, transform 0.12s', touchAction: 'none', userSelect: 'none' }}>
+              <div style={{ display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between', marginBottom: 6 }}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                  <CompanyLogo logo={job.logo ?? job.company.slice(0, 2).toUpperCase()} size={20} />
+                  <span style={{ fontSize: 12, fontWeight: 500, color: 'var(--text)' }}>{job.company}</span>
+                </div>
+                {job.score != null && <ScorePill score={job.score} />}
+              </div>
+              <div style={{ fontSize: 11, color: 'var(--text-muted)', marginBottom: 6 }}>{job.role}</div>
+              <div style={{ fontSize: 10, color: 'var(--text-muted)' }}>{fmtDate(job.appliedAt ?? job.createdAt)}</div>
+            </div>
+          ))}
+          <button
+            onClick={() => toast.info('Add job to ' + COL_LABELS[col])}
+            style={{ width: '100%', padding: '6px 0', border: '0.5px dashed var(--border)', borderRadius: 6, background: 'transparent', color: 'var(--text-muted)', fontSize: 11, cursor: 'pointer' }}>
+            + Add job
+          </button>
+        </div>
+      ))}
+    </div>
+  )
+}
+
+// ── ApplyBasket ───────────────────────────────────────────────────────────────
+function ApplyBasket({ cart, onRemove, onClose }: {
+  cart: Job[]
+  onRemove: (id: string) => void
+  onClose: () => void
+}) {
+  const toast = useToast()
+  return (
+    <div style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.3)', zIndex: 100, display: 'flex', alignItems: 'center', justifyContent: 'center' }}
+      onClick={e => { if (e.target === e.currentTarget) onClose() }}>
+      <Card style={{ width: 520, maxHeight: '80vh', overflow: 'hidden', display: 'flex', flexDirection: 'column' }}>
+        <div style={{ padding: '14px 16px', borderBottom: '0.5px solid var(--border)', display: 'flex', alignItems: 'center', gap: 10 }}>
+          <span style={{ fontSize: 14, fontWeight: 500 }}>🛒 Apply Basket</span>
+          <span style={{ fontSize: 11, color: 'var(--text-muted)' }}>{cart.length} jobs queued</span>
+          <Btn small variant="ghost" style={{ marginLeft: 'auto' }} onClick={onClose}>✕</Btn>
+        </div>
+        <div style={{ flex: 1, overflowY: 'auto', padding: 16, display: 'flex', flexDirection: 'column', gap: 8 }}>
+          {cart.length === 0 ? (
+            <div style={{ textAlign: 'center', padding: 40, color: 'var(--text-muted)', fontSize: 12 }}>No jobs in basket yet</div>
+          ) : cart.map(j => (
+            <div key={j.id} style={{ display: 'flex', alignItems: 'center', gap: 10, padding: 10, background: 'var(--bg-secondary)', borderRadius: 8 }}>
+              <CompanyLogo logo={j.logo ?? j.company.slice(0, 2).toUpperCase()} />
+              <div style={{ flex: 1 }}>
+                <div style={{ fontSize: 12, fontWeight: 500 }}>{j.role}</div>
+                <div style={{ fontSize: 11, color: 'var(--text-muted)' }}>{j.company} · {j.location}</div>
+              </div>
+              <ScorePill score={j.score ?? 0} />
+              <button onClick={() => onRemove(j.id)} style={{ background: 'none', border: 'none', cursor: 'pointer', color: 'var(--text-muted)', fontSize: 13 }}>✕</button>
+            </div>
+          ))}
+        </div>
+        {cart.length > 0 && (
+          <div style={{ padding: '12px 16px', borderTop: '0.5px solid var(--border)', background: 'var(--bg-secondary)', display: 'flex', flexDirection: 'column', gap: 8 }}>
+            <div style={{ fontSize: 11, color: 'var(--text-muted)' }}>AI will tailor your CV + cover letter for each job, then send for your review before applying.</div>
+            <div style={{ display: 'flex', gap: 8 }}>
+              <Btn variant="ghost"   style={{ flex: 1 }} onClick={() => toast.info('Tailoring CVs', 'AI is optimizing for each role…')}>✦ Tailor CVs</Btn>
+              <Btn variant="primary" style={{ flex: 1 }} onClick={() => { toast.success('Sent to review', `${cart.length} applications ready for approval`); onClose() }}>Review & Apply →</Btn>
+            </div>
+          </div>
+        )}
+      </Card>
+    </div>
+  )
+}
+
+// ── AddJobModal ───────────────────────────────────────────────────────────────
+function AddJobModal({ onClose, onAdded }: {
+  onClose: () => void
+  onAdded: (job: Job) => void
+}) {
+  const toast  = useToast()
+  const [form, setForm] = useState({ company: '', role: '', location: '', url: '', salary: '', status: 'saved' as JobStatus })
+  const [saving, setSaving] = useState(false)
+
+  const inputSt: React.CSSProperties = {
+    width: '100%', padding: '7px 10px', fontSize: 12,
+    border: '0.5px solid var(--border)', borderRadius: 6,
+    background: 'var(--bg)', color: 'var(--text)', outline: 'none', boxSizing: 'border-box',
+  }
+  const labelSt: React.CSSProperties = { fontSize: 11, color: 'var(--text-muted)', marginBottom: 4, display: 'block' }
+
+  async function handleSubmit(e: React.FormEvent) {
+    e.preventDefault()
+    if (!form.company.trim() || !form.role.trim()) {
+      toast.error('Required', 'Company and role are required')
+      return
+    }
+    setSaving(true)
+    const { data, error } = await apiMutate<Job>('/api/jobs', 'POST', form)
+    setSaving(false)
+    if (error || !data) { toast.error('Error', error ?? 'Failed to add job'); return }
+    toast.success('Job added', `${form.role} at ${form.company}`)
+    onAdded(data)
+    onClose()
+  }
+
+  return (
+    <div style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.3)', zIndex: 100, display: 'flex', alignItems: 'center', justifyContent: 'center' }}
+      onClick={e => { if (e.target === e.currentTarget) onClose() }}>
+      <Card style={{ width: 460, padding: 24 }}>
+        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 20 }}>
+          <span style={{ fontSize: 14, fontWeight: 500 }}>Add Job</span>
+          <Btn small variant="ghost" onClick={onClose}>✕</Btn>
+        </div>
+        <form onSubmit={handleSubmit} style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12 }}>
+            <div>
+              <label style={labelSt}>Company *</label>
+              <input style={inputSt} value={form.company} onChange={e => setForm(f => ({ ...f, company: e.target.value }))} placeholder="e.g. Stripe" />
+            </div>
+            <div>
+              <label style={labelSt}>Role *</label>
+              <input style={inputSt} value={form.role} onChange={e => setForm(f => ({ ...f, role: e.target.value }))} placeholder="e.g. Backend Engineer" />
+            </div>
+          </div>
+          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12 }}>
+            <div>
+              <label style={labelSt}>Location</label>
+              <input style={inputSt} value={form.location} onChange={e => setForm(f => ({ ...f, location: e.target.value }))} placeholder="e.g. Amsterdam, NL" />
+            </div>
+            <div>
+              <label style={labelSt}>Salary</label>
+              <input style={inputSt} value={form.salary} onChange={e => setForm(f => ({ ...f, salary: e.target.value }))} placeholder="e.g. €70k–90k" />
+            </div>
+          </div>
+          <div>
+            <label style={labelSt}>Job URL</label>
+            <input style={inputSt} value={form.url} onChange={e => setForm(f => ({ ...f, url: e.target.value }))} placeholder="https://…" />
+          </div>
+          <div>
+            <label style={labelSt}>Initial status</label>
+            <select style={{ ...inputSt }} value={form.status} onChange={e => setForm(f => ({ ...f, status: e.target.value as JobStatus }))}>
+              {KANBAN_COLS.map(c => <option key={c} value={c}>{COL_LABELS[c]}</option>)}
+            </select>
+          </div>
+          <div style={{ display: 'flex', gap: 8, justifyContent: 'flex-end', marginTop: 4 }}>
+            <Btn variant="ghost" onClick={onClose}>Cancel</Btn>
+            <button type="submit" disabled={saving} style={{
+              padding: '7px 16px', background: '#185FA5', color: '#fff', border: 'none', borderRadius: 6,
+              fontSize: 12, fontWeight: 500, cursor: saving ? 'not-allowed' : 'pointer', opacity: saving ? 0.7 : 1,
+            }}>
+              {saving ? 'Adding…' : 'Add Job'}
+            </button>
+          </div>
+        </form>
+      </Card>
+    </div>
+  )
+}
+
+// ── JobDetailDrawer ───────────────────────────────────────────────────────────
+function JobDetailDrawer({ job, onClose, onStatusChange, onUpdate, onDelete }: {
+  job:            Job
+  onClose:        () => void
+  onStatusChange: (id: string, status: JobStatus) => void
+  onUpdate:       (updated: Job) => void
+  onDelete:       (id: string) => void
+}) {
+  const toast = useToast()
+  const [notes,        setNotes]        = useState(job.notes ?? '')
+  const [savingNotes,  setSavingNotes]  = useState(false)
+  const [deleting,     setDeleting]     = useState(false)
+  const [activity,     setActivity]     = useState<Activity[]>([])
+  const [loadingAct,   setLoadingAct]   = useState(true)
+
+  // Load per-job activity on mount
+  useEffect(() => {
+    setLoadingAct(true)
+    fetch(`/api/activity?jobId=${job.id}&limit=20`)
+      .then(r => r.json())
+      .then((data: Activity[]) => setActivity(Array.isArray(data) ? data : []))
+      .catch(() => setActivity([]))
+      .finally(() => setLoadingAct(false))
+  }, [job.id])
+
+  // Sync notes if parent job changes
+  useEffect(() => { setNotes(job.notes ?? '') }, [job.notes])
+
+  async function saveNotes() {
+    if (notes === (job.notes ?? '')) return
+    setSavingNotes(true)
+    const { data, error } = await apiMutate<Job>(`/api/jobs/${job.id}`, 'PATCH', { notes })
+    setSavingNotes(false)
+    if (error) { toast.error('Save failed', error); return }
+    if (data)  { onUpdate(data); toast.success('Notes saved') }
+  }
+
+  async function handleDelete() {
+    if (!window.confirm(`Delete ${job.role} at ${job.company}? This cannot be undone.`)) return
+    setDeleting(true)
+    const { error } = await apiMutate(`/api/jobs/${job.id}`, 'DELETE')
+    setDeleting(false)
+    if (error) { toast.error('Delete failed', error); return }
+    onDelete(job.id)
+    onClose()
+  }
+
+  const inputSt: React.CSSProperties = {
+    width: '100%', fontSize: 11, padding: '5px 8px',
+    border: '0.5px solid var(--border)', borderRadius: 5,
+    background: 'var(--bg)', color: 'var(--text)', outline: 'none', boxSizing: 'border-box',
+  }
+
+  return (
+    <>
+      {/* Overlay */}
+      <div style={{ position: 'fixed', inset: 0, zIndex: 90 }} onClick={onClose} />
+
+      {/* Drawer panel */}
+      <div style={{
+        position: 'fixed', top: 0, right: 0, bottom: 0, width: 380, zIndex: 91,
+        background: 'var(--bg)', borderLeft: '0.5px solid var(--border)',
+        display: 'flex', flexDirection: 'column', overflowY: 'auto',
+        boxShadow: '-4px 0 20px rgba(0,0,0,0.12)',
+      }}>
+        {/* Header */}
+        <div style={{ padding: '16px 18px', borderBottom: '0.5px solid var(--border)', display: 'flex', alignItems: 'flex-start', gap: 12 }}>
+          <CompanyLogo logo={job.logo ?? job.company.slice(0, 2).toUpperCase()} size={36} />
+          <div style={{ flex: 1 }}>
+            <div style={{ fontSize: 14, fontWeight: 500, lineHeight: 1.3 }}>{job.company}</div>
+            <div style={{ fontSize: 12, color: 'var(--text-muted)', marginTop: 2 }}>{job.role}</div>
+            {job.location && <div style={{ fontSize: 11, color: 'var(--text-muted)', marginTop: 1 }}>📍 {job.location}</div>}
+          </div>
+          <button onClick={onClose} style={{ background: 'none', border: 'none', cursor: 'pointer', fontSize: 16, color: 'var(--text-muted)', lineHeight: 1, padding: 0, marginTop: 2 }}>✕</button>
+        </div>
+
+        {/* Meta row */}
+        <div style={{ padding: '12px 18px', borderBottom: '0.5px solid var(--border)', display: 'flex', flexWrap: 'wrap', gap: 8, alignItems: 'center' }}>
+          <StatusBadge status={job.status} />
+          {job.score != null && <ScorePill score={job.score} />}
+          {job.salary && <span style={{ fontSize: 11, color: 'var(--text-muted)', background: 'var(--bg-secondary)', border: '0.5px solid var(--border)', borderRadius: 5, padding: '2px 7px' }}>{job.salary}</span>}
+          {/* Status change */}
+          <select
+            value={job.status}
+            onChange={e => onStatusChange(job.id, e.target.value as JobStatus)}
+            onClick={e => e.stopPropagation()}
+            style={{ ...inputSt, width: 'auto', marginLeft: 'auto', fontSize: 11 }}>
+            {KANBAN_COLS.map(c => <option key={c} value={c}>{COL_LABELS[c]}</option>)}
+          </select>
+        </div>
+
+        {/* Body */}
+        <div style={{ flex: 1, padding: 18, display: 'flex', flexDirection: 'column', gap: 16 }}>
+
+          {/* URL */}
+          {job.url && (
+            <div>
+              <div style={{ fontSize: 10, color: 'var(--text-muted)', fontWeight: 500, marginBottom: 4 }}>JOB POSTING</div>
+              <a href={job.url} target="_blank" rel="noopener noreferrer"
+                style={{ fontSize: 11, color: '#185FA5', wordBreak: 'break-all' }}>
+                {job.url.length > 55 ? job.url.slice(0, 52) + '…' : job.url}
+              </a>
+            </div>
+          )}
+
+          {/* Dates */}
+          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10 }}>
+            <div>
+              <div style={{ fontSize: 10, color: 'var(--text-muted)', fontWeight: 500, marginBottom: 2 }}>ADDED</div>
+              <div style={{ fontSize: 11 }}>{fmtDate(job.createdAt)}</div>
+            </div>
+            {job.appliedAt && (
+              <div>
+                <div style={{ fontSize: 10, color: 'var(--text-muted)', fontWeight: 500, marginBottom: 2 }}>APPLIED</div>
+                <div style={{ fontSize: 11 }}>{fmtDate(job.appliedAt)}</div>
+              </div>
+            )}
+            {job.followUpAt && (
+              <div>
+                <div style={{ fontSize: 10, color: '#854F0B', fontWeight: 500, marginBottom: 2 }}>FOLLOW-UP</div>
+                <div style={{ fontSize: 11, color: '#854F0B' }}>{fmtDate(job.followUpAt)}</div>
+              </div>
+            )}
+          </div>
+
+          {/* Notes */}
+          <div>
+            <div style={{ fontSize: 10, color: 'var(--text-muted)', fontWeight: 500, marginBottom: 6, display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+              <span>NOTES</span>
+              {savingNotes && <span style={{ fontSize: 9, color: 'var(--text-muted)' }}>Saving…</span>}
+            </div>
+            <textarea
+              value={notes}
+              onChange={e => setNotes(e.target.value)}
+              onBlur={saveNotes}
+              onKeyDown={e => { if ((e.metaKey || e.ctrlKey) && e.key === 's') { e.preventDefault(); saveNotes() } }}
+              placeholder="Add notes, contacts, salary details…"
+              style={{ ...inputSt, minHeight: 90, resize: 'vertical', lineHeight: 1.6, padding: '7px 9px' }}
+            />
+          </div>
+
+          {/* Activity log */}
+          <div>
+            <div style={{ fontSize: 10, color: 'var(--text-muted)', fontWeight: 500, marginBottom: 8 }}>ACTIVITY</div>
+            {loadingAct ? (
+              <div style={{ fontSize: 11, color: 'var(--text-muted)' }}>Loading…</div>
+            ) : activity.length === 0 ? (
+              <div style={{ fontSize: 11, color: 'var(--text-muted)' }}>No activity yet</div>
+            ) : (
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 0 }}>
+                {activity.map((a, i) => (
+                  <div key={a.id} style={{ display: 'flex', gap: 10, paddingBottom: i < activity.length - 1 ? 10 : 0 }}>
+                    <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', flexShrink: 0 }}>
+                      <div style={{ width: 7, height: 7, borderRadius: '50%', background: a.color ?? '#6B7280', marginTop: 3 }} />
+                      {i < activity.length - 1 && <div style={{ width: 1, flex: 1, background: 'var(--border)', marginTop: 3 }} />}
+                    </div>
+                    <div style={{ paddingBottom: i < activity.length - 1 ? 6 : 0 }}>
+                      <div style={{ fontSize: 11, color: 'var(--text)' }}>{a.text}</div>
+                      <div style={{ fontSize: 10, color: 'var(--text-muted)', marginTop: 1 }}>{fmtRelative(a.createdAt)}</div>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        </div>
+
+        {/* Footer */}
+        <div style={{ padding: '12px 18px', borderTop: '0.5px solid var(--border)', display: 'flex', gap: 8 }}>
+          <Btn variant="danger" small disabled={deleting} onClick={handleDelete} style={{ flex: 1 }}>
+            {deleting ? 'Deleting…' : 'Delete Job'}
+          </Btn>
+          <Btn variant="primary" small onClick={onClose} style={{ flex: 1 }}>Close</Btn>
+        </div>
+      </div>
+    </>
+  )
+}
+
+// ── JobsPage ──────────────────────────────────────────────────────────────────
+export function JobsPage() {
+  const toast = useToast()
+  const [view,         setView        ] = useState<'list' | 'kanban'>('list')
+  const [search,       setSearch      ] = useState('')
+  const [filterStatus, setFilterStatus] = useState<'all' | JobStatus>('all')
+  const [showCart,     setShowCart    ] = useState(false)
+  const [showAdd,      setShowAdd     ] = useState(false)
+  const [cart,         setCart        ] = useState<Job[]>([])
+  const [jobs,         setJobs        ] = useState<Job[]>([])
+  const [total,        setTotal       ] = useState(0)
+  const [loading,      setLoading     ] = useState(true)
+  const [fetchError,   setFetchError  ] = useState<string | null>(null)
+  const [selectedJob,  setSelectedJob ] = useState<Job | null>(null)
+
+  // Debounced fetch whenever search / filter changes
+  useEffect(() => {
+    let cancelled = false
+    const timer = setTimeout(async () => {
+      setLoading(true)
+      setFetchError(null)
+      try {
+        const params = new URLSearchParams({ pageSize: '100' })
+        if (search)                params.set('q',      search)
+        if (filterStatus !== 'all') params.set('status', filterStatus)
+        const res  = await fetch(`/api/jobs?${params}`)
+        const json = await res.json()
+        if (!cancelled) {
+          setJobs(json.jobs   ?? [])
+          setTotal(json.total ?? 0)
+        }
+      } catch {
+        if (!cancelled) setFetchError('Failed to load jobs')
+      } finally {
+        if (!cancelled) setLoading(false)
+      }
+    }, search ? 300 : 0)
+    return () => { cancelled = true; clearTimeout(timer) }
+  }, [search, filterStatus])
+
+  async function handleStatusChange(jobId: string, newStatus: JobStatus) {
+    // Optimistic update
+    setJobs(prev => prev.map(j => j.id === jobId ? { ...j, status: newStatus } : j))
+    const { error } = await apiMutate(`/api/jobs/${jobId}`, 'PATCH', { status: newStatus })
+    if (error) {
+      toast.error('Error', error)
+      // Revert by re-fetching
+      const params = new URLSearchParams({ pageSize: '100' })
+      if (search)                params.set('q',      search)
+      if (filterStatus !== 'all') params.set('status', filterStatus)
+      fetch(`/api/jobs?${params}`).then(r => r.json()).then(json => {
+        setJobs(json.jobs ?? [])
+        setTotal(json.total ?? 0)
+      })
+    } else {
+      toast.success('Moved', `Job moved to ${COL_LABELS[newStatus]}`)
+    }
+  }
+
+  function addToCart(job: Job) {
+    if (cart.find(c => c.id === job.id)) return
+    setCart(c => [...c, job])
+    toast.success('Added to Apply Basket', `${job.role} at ${job.company}`)
+  }
+
+  const savedApplied = jobs.filter(j => j.status === 'saved' || j.status === 'applied').slice(0, 4)
+
+  return (
+    <div style={{ flex: 1, overflowY: 'auto', background: 'var(--bg-tertiary)', display: 'flex', flexDirection: 'column' }}>
+      <TopBar title="Jobs">
+        {/* Total count */}
+        <div style={{ display: 'flex', alignItems: 'center', gap: 8, flex: 1 }}>
+          <span style={{ fontSize: 11, color: 'var(--text-muted)', background: 'var(--bg-secondary)', border: '0.5px solid var(--border)', borderRadius: 999, padding: '2px 8px' }}>
+            {total}
+          </span>
+        </div>
+        {/* Search */}
+        <input value={search} onChange={e => setSearch(e.target.value)} placeholder="Search jobs…"
+          style={{ width: 220, padding: '5px 10px', fontSize: 12, border: '0.5px solid var(--border)', borderRadius: 6, background: 'var(--bg)', color: 'var(--text)', outline: 'none' }} />
+        {/* Status filter */}
+        <select value={filterStatus} onChange={e => setFilterStatus(e.target.value as 'all' | JobStatus)}
+          style={{ padding: '5px 8px', fontSize: 11, border: '0.5px solid var(--border)', borderRadius: 6, background: 'var(--bg)', color: 'var(--text)', outline: 'none' }}>
+          <option value="all">All Status</option>
+          {KANBAN_COLS.map(c => <option key={c} value={c}>{COL_LABELS[c]}</option>)}
+        </select>
+        {/* View toggle */}
+        <div style={{ display: 'flex', border: '0.5px solid var(--border)', borderRadius: 6, overflow: 'hidden' }}>
+          {([['list', '☰'], ['kanban', '⊞']] as const).map(([v, icon]) => (
+            <button key={v} onClick={() => setView(v)} style={{
+              padding: '5px 10px',
+              background: view === v ? '#185FA5' : 'var(--bg)',
+              color:      view === v ? '#fff'     : 'var(--text-muted)',
+              border: 'none', cursor: 'pointer', fontSize: 13,
+            }}>{icon}</button>
+          ))}
+        </div>
+        {/* Basket */}
+        <Btn variant={cart.length ? 'primary' : 'ghost'} onClick={() => setShowCart(true)}>
+          🛒 Basket {cart.length > 0 && <span style={{ background: 'rgba(255,255,255,0.25)', borderRadius: 999, padding: '1px 6px', fontSize: 10, marginLeft: 4 }}>{cart.length}</span>}
+        </Btn>
+        <Btn variant="ghost" onClick={() => setShowAdd(true)}>+ Add Job</Btn>
+      </TopBar>
+
+      <div style={{ padding: 20, flex: 1 }}>
+        {loading ? (
+          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 60 }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 10, color: 'var(--text-muted)', fontSize: 12 }}>
+              <div style={{ width: 20, height: 20, border: '2px solid rgba(24,95,165,0.2)', borderTopColor: '#185FA5', borderRadius: '50%', animation: 'spin 0.7s linear infinite' }} />
+              Loading jobs…
+            </div>
+          </div>
+        ) : fetchError ? (
+          <Card style={{ padding: 32, textAlign: 'center' }}>
+            <div style={{ fontSize: 13, color: '#A32D2D', marginBottom: 12 }}>{fetchError}</div>
+            <Btn variant="ghost" onClick={() => setSearch(s => s)}>Retry</Btn>
+          </Card>
+        ) : jobs.length === 0 ? (
+          <Card style={{ padding: 48, textAlign: 'center' }}>
+            <div style={{ fontSize: 32, marginBottom: 12 }}>📋</div>
+            <div style={{ fontSize: 14, fontWeight: 500, marginBottom: 6 }}>No jobs found</div>
+            <div style={{ fontSize: 12, color: 'var(--text-muted)', marginBottom: 16 }}>
+              {search || filterStatus !== 'all' ? 'Try adjusting your search or filter.' : 'Add your first job or let the AI Agent find matches for you.'}
+            </div>
+            <Btn variant="primary" onClick={() => setShowAdd(true)}>+ Add Job</Btn>
+          </Card>
+        ) : (
+          <>
+            {/* Quick-add to basket bar (list view only) */}
+            {view === 'list' && savedApplied.length > 0 && (
+              <div style={{ marginBottom: 12 }}>
+                <div style={{ fontSize: 11, color: 'var(--text-muted)', marginBottom: 8 }}>
+                  Click &quot;Add to Basket&quot; to queue jobs for AI-optimized batch apply
+                </div>
+                <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+                  {savedApplied.map(j => (
+                    <div key={j.id} style={{ display: 'flex', alignItems: 'center', gap: 6, background: 'var(--bg)', border: '0.5px solid var(--border)', borderRadius: 8, padding: '6px 10px' }}>
+                      <CompanyLogo logo={j.logo ?? j.company.slice(0, 2).toUpperCase()} size={18} />
+                      <span style={{ fontSize: 11 }}>{j.company}</span>
+                      <ScorePill score={j.score ?? 0} />
+                      <button onClick={() => addToCart(j)} style={{
+                        fontSize: 10, padding: '2px 8px', borderRadius: 999, border: '0.5px solid var(--border)',
+                        background: cart.find(c => c.id === j.id) ? 'rgba(24,95,165,0.12)' : 'transparent',
+                        color:      cart.find(c => c.id === j.id) ? '#185FA5'              : 'var(--text-muted)',
+                        cursor: 'pointer',
+                      }}>
+                        {cart.find(c => c.id === j.id) ? '✓ Added' : '+ Basket'}
+                      </button>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+            {view === 'list'
+              ? <ListView jobs={jobs} onRowClick={setSelectedJob} />
+              : <KanbanView jobs={jobs} onStatusChange={handleStatusChange} />}
+          </>
+        )}
+      </div>
+
+      {showCart && (
+        <ApplyBasket
+          cart={cart}
+          onRemove={id => setCart(c => c.filter(x => x.id !== id))}
+          onClose={() => setShowCart(false)}
+        />
+      )}
+      {showAdd && (
+        <AddJobModal
+          onClose={() => setShowAdd(false)}
+          onAdded={job => { setJobs(prev => [job, ...prev]); setTotal(t => t + 1) }}
+        />
+      )}
+
+      {selectedJob && (
+        <JobDetailDrawer
+          job={selectedJob}
+          onClose={() => setSelectedJob(null)}
+          onStatusChange={(id, status) => {
+            handleStatusChange(id, status)
+            setSelectedJob(prev => prev && prev.id === id ? { ...prev, status } : prev)
+          }}
+          onUpdate={updated => {
+            setJobs(prev => prev.map(j => j.id === updated.id ? updated : j))
+            setSelectedJob(updated)
+          }}
+          onDelete={id => {
+            setJobs(prev => prev.filter(j => j.id !== id))
+            setTotal(t => t - 1)
+          }}
+        />
+      )}
+    </div>
+  )
+}

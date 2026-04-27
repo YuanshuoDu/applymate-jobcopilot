@@ -1,0 +1,13 @@
+/* ApplyMate AI injection styles — scoped to our elements only */
+#applymate-save-btn,
+#applymate-toast {
+  all: initial;
+  box-sizing: border-box;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+}
+
+#applymate-save-btn * ,
+#applymate-toast * {
+  all: unset;
+  box-sizing: border-box;
+}

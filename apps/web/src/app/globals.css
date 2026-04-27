@@ -1,0 +1,76 @@
+@import "tailwindcss";
+
+:root {
+  --bg:           #ffffff;
+  --bg-secondary: #f6f6f7;
+  --bg-tertiary:  #eeeff1;
+  --border:       rgba(0, 0, 0, 0.08);
+  --text:         #0f0f10;
+  --text-muted:   #6b7280;
+  --primary:      #185FA5;
+  --sidebar-w:    200px;
+  --bottom-bar:   0px;
+}
+
+.dark {
+  --bg:           #111113;
+  --bg-secondary: #1a1a1e;
+  --bg-tertiary:  #0d0d0f;
+  --border:       rgba(255, 255, 255, 0.08);
+  --text:         #e8e8ec;
+  --text-muted:   #6b7280;
+}
+
+*, *::before, *::after {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+body {
+  font-family: 'Inter', system-ui, sans-serif;
+  font-size: 13px;
+  color: var(--text);
+  background: var(--bg-tertiary);
+  -webkit-font-smoothing: antialiased;
+}
+
+@keyframes spin {
+  to { transform: rotate(360deg); }
+}
+
+/* Auth panel — hidden on mobile */
+@media (max-width: 767px) {
+  .auth-panel { display: none !important; }
+}
+
+@keyframes slideUp {
+  from { transform: translateY(8px); opacity: 0; }
+  to   { transform: translateY(0);   opacity: 1; }
+}
+
+@keyframes drain {
+  from { width: 100%; }
+  to   { width: 0%; }
+}
+
+::-webkit-scrollbar { width: 5px; height: 5px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: rgba(0,0,0,0.12); border-radius: 3px; }
+
+@media (max-width: 767px) {
+  :root {
+    --sidebar-w: 0px;
+    --bottom-bar: 56px;
+  }
+  #desktop-sidebar { display: none !important; }
+  #mobile-bottom-bar { display: flex !important; }
+  #main-content { padding-bottom: var(--bottom-bar); }
+}
+
+#mobile-bottom-bar {
+  display: none;
+  position: fixed; bottom: 0; left: 0; right: 0; height: 56px; z-index: 50;
+  background: var(--bg); border-top: 0.5px solid var(--border);
+  align-items: center; justify-content: space-around;
+}
