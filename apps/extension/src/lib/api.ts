@@ -24,12 +24,27 @@ async function request<T>(
     headers['Authorization'] = `Bearer ${settings.apiToken}`
   }
 
-  const res = await fetch(url, { ...options, headers })
-  if (!res.ok) {
-    const body = await res.json().catch(() => ({ error: res.statusText }))
-    throw new ApiError(res.status, body.error ?? 'Request failed')
+  let lastError: Error | null = null
+  // Retry once on network error
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      const res = await fetch(url, {
+        ...options,
+        headers,
+        signal: AbortSignal.timeout(10_000),
+      })
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({ error: res.statusText }))
+        throw new ApiError(res.status, body.error ?? 'Request failed')
+      }
+      return res.json()
+    } catch (err) {
+      lastError = err instanceof Error ? err : new Error(String(err))
+      if (err instanceof ApiError) throw err // Don't retry API errors
+      if (attempt === 0) await new Promise(r => setTimeout(r, 800))
+    }
   }
-  return res.json()
+  throw lastError
 }
 
 // ── Auth ──────────────────────────────────────────────────────

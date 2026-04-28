@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useCallback } from 'react'
 import { getSettings, isLoggedIn } from '@/lib/storage'
 import { updateJobStatus } from '@/lib/api'
 import type { ScrapedJob, SavedJob, ExtensionSettings } from '@/lib/types'
@@ -123,6 +123,41 @@ function JobTab({ job, saving, savedJob, notes, onNotes, onSave, onStatusChange 
   notes: string; onNotes: (v:string) => void
   onSave: () => void; onStatusChange: (id:string, status:string) => void
 }) {
+  const [scoreLoading, setScoreLoading] = useState(false)
+  const [score, setScore] = useState<number | null>(null)
+  const [scoreKeywords, setScoreKeywords] = useState<string[]>([])
+  const [scoreError, setScoreError] = useState('')
+
+  const fetchScore = useCallback(async () => {
+    if (!job) return
+    setScoreLoading(true)
+    setScoreError('')
+    try {
+      const settings = await getSettings()
+      const res = await fetch(`${settings.apiBaseUrl}/api/ai/score`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${settings.apiToken}` },
+        body: JSON.stringify({ jobTitle: job.title, jobCompany: job.company, jobDescription: job.description }),
+        signal: AbortSignal.timeout(12_000),
+      })
+      if (res.ok) {
+        const data = await res.json()
+        setScore(data.score)
+        setScoreKeywords(data.matchedKeywords ?? [])
+      } else {
+        setScoreError('AI scoring unavailable')
+      }
+    } catch {
+      setScoreError('AI scoring unavailable')
+    } finally {
+      setScoreLoading(false)
+    }
+  }, [job])
+
+  useEffect(() => {
+    if (job) { setScore(null); setScoreKeywords([]); fetchScore() }
+  }, [job, fetchScore])
+
   if (!job) return (
     <div style={{ textAlign:'center', padding:'40px 0', color:C.muted }}>
       <div style={{ fontSize:36, marginBottom:12 }}>🔍</div>
@@ -131,6 +166,8 @@ function JobTab({ job, saving, savedJob, notes, onNotes, onSave, onStatusChange 
       </div>
     </div>
   )
+
+  const scoreColor = score != null ? (score >= 80 ? C.green : score >= 60 ? C.amber : C.red) : C.muted
 
   return (
     <div style={{ display:'flex', flexDirection:'column', gap:14 }}>
@@ -149,16 +186,33 @@ function JobTab({ job, saving, savedJob, notes, onNotes, onSave, onStatusChange 
           <span style={{ fontSize:10, background:'rgba(24,95,165,0.1)', color:C.primary, borderRadius:999, padding:'3px 8px' }}>{job.source}</span>
         </div>
 
-        {/* AI Match Score — placeholder */}
-        <div style={{ background:'rgba(24,95,165,0.06)', borderRadius:8, padding:'10px 12px' }}>
+        {/* AI Match Score — real API */}
+        <div style={{ background:`rgba(${scoreColor === C.green ? '59,109,17' : scoreColor === C.amber ? '133,79,11' : '24,95,165'},0.06)`, borderRadius:8, padding:'10px 12px' }}>
           <div style={{ display:'flex', justifyContent:'space-between', marginBottom:6 }}>
             <span style={{ fontSize:11, fontWeight:500 }}>AI 匹配度</span>
-            <span style={{ fontSize:13, fontWeight:700, color:C.primary }}>–</span>
+            {scoreLoading ? (
+              <span style={{ fontSize:13, fontWeight:700, color:C.muted }}>…</span>
+            ) : score != null ? (
+              <span style={{ fontSize:18, fontWeight:700, color:scoreColor }}>{score}%</span>
+            ) : (
+              <span style={{ fontSize:13, fontWeight:700, color:C.muted }}>{scoreError || '—'}</span>
+            )}
           </div>
-          <div style={{ height:4, background:C.border, borderRadius:2 }}>
-            <div style={{ width:'0%', height:'100%', background:C.primary, borderRadius:2 }} />
-          </div>
-          <div style={{ fontSize:10, color:C.muted, marginTop:4 }}>连接 AI 功能后显示匹配分</div>
+          {score != null && (
+            <>
+              <div style={{ height:4, background:C.border, borderRadius:2 }}>
+                <div style={{ width:`${score}%`, height:'100%', background:scoreColor, borderRadius:2, transition:'width 0.5s' }} />
+              </div>
+              {scoreKeywords.length > 0 && (
+                <div style={{ display:'flex', flexWrap:'wrap', gap:3, marginTop:6 }}>
+                  {scoreKeywords.slice(0,4).map(kw => (
+                    <span key={kw} style={{ fontSize:9, background:'rgba(24,95,165,0.1)', color:C.primary, borderRadius:999, padding:'2px 6px' }}>{kw}</span>
+                  ))}
+                </div>
+              )}
+            </>
+          )}
+          {scoreError && <div style={{ fontSize:10, color:C.muted, marginTop:4 }}>需配置 ANTHROPIC_API_KEY</div>}
         </div>
       </div>
 

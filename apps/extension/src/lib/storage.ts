@@ -1,11 +1,11 @@
 import type { ExtensionSettings, ScrapedJob } from './types'
 
 const DEFAULTS: ExtensionSettings = {
-  apiBaseUrl: 'http://localhost:3000',
+  apiBaseUrl: 'https://web-delta-ruddy-29.vercel.app',
   apiToken:   '',
   userEmail:  '',
   userName:   '',
-  autoSave:   false,
+  autoSave:   true,
 }
 
 // ── Settings (sync — shared across devices) ───────────────────

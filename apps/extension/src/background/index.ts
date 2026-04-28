@@ -93,6 +93,8 @@ chrome.tabs.onUpdated.addListener(async (tabId, info, tab) => {
     /linkedin\.com\/jobs\/(view|search)/,
     /indeed\.com\/viewjob/,
     /glassdoor\.com\/(job-listing|Jobs)/,
+    /stepstone\.(de|at|ch|be|nl|fr)\//,
+    /xing\.com\/jobs\//,
     /wellfound\.com\/jobs\//,
     /greenhouse\.io\/jobs\//,
     /lever\.co\//,
