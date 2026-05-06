@@ -1,26 +1,21 @@
 /**
  * POST /api/ai/suggest
- *
- * Body: {
- *   resumeContent:   ResumeContent
- *   jobTitle?:       string
- *   jobCompany?:     string
- *   jobDescription?: string
- *   missingKeywords?: string[]
- * }
- *
+ * Body: { resumeContent, jobTitle?, jobCompany?, jobDescription?, missingKeywords? }
  * Returns: { suggestions: Array<{ text: string }> }
  */
 import { NextRequest } from 'next/server'
-import Anthropic from '@anthropic-ai/sdk'
 import { requireAuth, isErrorResponse, ok, err } from '@/lib/api-helpers'
+import { checkRateLimit } from '@/lib/rate-limit'
+import { modelChat, stripFences, resolveConfig } from '@/lib/model-router'
+import { db } from '@/lib/db'
 import type { ResumeContent } from '@/lib/types'
 
-const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY })
-
 export async function POST(req: NextRequest) {
-  const auth = await requireAuth()
+  const auth = await requireAuth(req)
   if (isErrorResponse(auth)) return auth
+
+  const rl = checkRateLimit(`ai:${auth.userId}`)
+  if (!rl.ok) return err(`Rate limit exceeded — retry in ${rl.retryAfter}s`, 429)
 
   const body = await req.json().catch(() => null)
   if (!body) return err('Invalid JSON body')
@@ -35,37 +30,29 @@ export async function POST(req: NextRequest) {
 
   if (!resumeContent) return err('resumeContent is required')
 
-  const prompt = `You are an expert career coach helping a candidate improve their resume for a specific job.
+  const user  = await db.user.findUnique({ where: { id: auth.userId }, select: { preferences: true } })
+  const prefs = (user?.preferences ?? {}) as Record<string, unknown>
+  const cfg   = resolveConfig((prefs.aiConfig ?? null) as Parameters<typeof resolveConfig>[0])
 
-CANDIDATE SUMMARY: ${resumeContent.summary || 'Not provided'}
-SKILLS: ${(resumeContent.skills ?? []).join(', ') || 'None listed'}
-EXPERIENCE ROLES: ${(resumeContent.experience ?? []).map(e => `${e.role} at ${e.company}`).join('; ') || 'None listed'}
+  const prompt = `You are a career coach. Give 3 specific resume improvement suggestions.
 
-TARGET JOB: ${jobTitle ?? 'Not specified'} at ${jobCompany ?? 'Not specified'}
-${missingKeywords?.length ? `\nKEYWORDS MISSING FROM RESUME: ${missingKeywords.join(', ')}` : ''}
-${jobDescription ? `\nJOB DESCRIPTION (excerpt):\n${jobDescription.slice(0, 1500)}` : ''}
+RESUME SUMMARY: ${resumeContent.summary || 'None'}
+SKILLS: ${(resumeContent.skills ?? []).join(', ') || 'None'}
+ROLES: ${(resumeContent.experience ?? []).map(e => `${e.role} at ${e.company}`).join('; ') || 'None'}
 
-Provide exactly 3 specific, actionable suggestions to improve this resume for this job.
-Each suggestion must be concrete (mention specific skills, phrases, or metrics to add).
+TARGET: ${jobTitle ?? 'Not specified'} at ${jobCompany ?? 'Not specified'}
+${missingKeywords?.length ? `MISSING KEYWORDS: ${missingKeywords.join(', ')}` : ''}
+${jobDescription ? `JD:\n${jobDescription.slice(0, 1500)}` : ''}
 
-Return ONLY a JSON array of 3 strings — no markdown, no explanation, raw JSON only:
+Return ONLY a JSON array of 3 actionable strings — no markdown:
 ["suggestion 1", "suggestion 2", "suggestion 3"]`
 
   try {
-    const message = await anthropic.messages.create({
-      model:      'claude-sonnet-4-6',
-      max_tokens: 768,
-      messages:   [{ role: 'user', content: prompt }],
-    })
-
-    const raw  = message.content[0].type === 'text' ? message.content[0].text.trim() : '[]'
-    const json = raw.replace(/^```(?:json)?\n?/, '').replace(/\n?```$/, '').trim()
-    const texts: string[] = JSON.parse(json)
-
-    const suggestions = texts.map(text => ({ text, applied: false }))
-    return ok({ suggestions })
+    const result = await modelChat([{ role: 'user', content: prompt }], cfg, 768)
+    const texts: string[] = JSON.parse(stripFences(result.text))
+    return ok({ suggestions: texts.map(text => ({ text, applied: false })), _model: `${cfg.provider}/${cfg.model}` })
   } catch (e) {
-    console.error('[/api/ai/suggest] error:', e)
-    return err('AI suggestions failed — check ANTHROPIC_API_KEY and try again', 500)
+    console.error('[/api/ai/suggest]', e)
+    return err(`AI suggestions failed (${cfg.provider}/${cfg.model}): ${(e as Error).message}`, 500)
   }
 }

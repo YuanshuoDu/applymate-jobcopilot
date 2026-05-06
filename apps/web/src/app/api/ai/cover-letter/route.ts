@@ -1,39 +1,26 @@
 /**
  * POST /api/ai/cover-letter
- *
- * Body: {
- *   resumeContent:   ResumeContent
- *   jobTitle:        string
- *   jobCompany:      string
- *   jobDescription?: string
- *   tone?:           'professional' | 'enthusiastic' | 'concise'  (default: 'professional')
- *   recipientName?:  string
- * }
- *
+ * Body: { resumeContent, jobTitle, jobCompany, jobDescription?, tone?, recipientName? }
  * Returns: { coverLetter: string }
  */
 import { NextRequest } from 'next/server'
-import Anthropic from '@anthropic-ai/sdk'
 import { requireAuth, isErrorResponse, ok, err } from '@/lib/api-helpers'
+import { checkRateLimit } from '@/lib/rate-limit'
+import { modelChat, resolveConfig } from '@/lib/model-router'
+import { db } from '@/lib/db'
 import type { ResumeContent } from '@/lib/types'
 
-const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY })
-
 export async function POST(req: NextRequest) {
-  const auth = await requireAuth()
+  const auth = await requireAuth(req)
   if (isErrorResponse(auth)) return auth
+
+  const rl = checkRateLimit(`ai:${auth.userId}`)
+  if (!rl.ok) return err(`Rate limit exceeded — retry in ${rl.retryAfter}s`, 429)
 
   const body = await req.json().catch(() => null)
   if (!body) return err('Invalid JSON body')
 
-  const {
-    resumeContent,
-    jobTitle,
-    jobCompany,
-    jobDescription,
-    tone = 'professional',
-    recipientName,
-  } = body as {
+  const { resumeContent, jobTitle, jobCompany, jobDescription, tone = 'professional', recipientName } = body as {
     resumeContent:   ResumeContent
     jobTitle:        string
     jobCompany:      string
@@ -46,55 +33,39 @@ export async function POST(req: NextRequest) {
   if (!jobTitle)      return err('jobTitle is required')
   if (!jobCompany)    return err('jobCompany is required')
 
-  const name        = resumeContent.contact?.name ?? 'the applicant'
-  const skills      = (resumeContent.skills ?? []).slice(0, 8).join(', ')
-  const latestRole  = resumeContent.experience?.[0]
-  const roleContext = latestRole ? `currently ${latestRole.role} at ${latestRole.company}` : 'an experienced professional'
-  const greeting    = recipientName ? `Dear ${recipientName},` : 'Dear Hiring Manager,'
+  const user  = await db.user.findUnique({ where: { id: auth.userId }, select: { preferences: true } })
+  const prefs = (user?.preferences ?? {}) as Record<string, unknown>
+  const cfg   = resolveConfig((prefs.aiConfig ?? null) as Parameters<typeof resolveConfig>[0])
 
-  const toneGuide = {
-    professional:  'formal, confident, and polished — suitable for corporate roles',
-    enthusiastic:  'warm, energetic, and genuine — shows real passion for the company',
-    concise:       'direct and punchy — get to the point fast, no filler phrases',
+  const name       = resumeContent.contact?.name ?? 'the applicant'
+  const skills     = (resumeContent.skills ?? []).slice(0, 8).join(', ')
+  const latestRole = resumeContent.experience?.[0]
+  const greeting   = recipientName ? `Dear ${recipientName},` : 'Dear Hiring Manager,'
+  const toneGuide  = {
+    professional: 'formal, confident, and polished',
+    enthusiastic: 'warm, energetic, and genuine',
+    concise:      'direct and punchy — no filler',
   }[tone] ?? 'professional'
 
-  const prompt = `You are an expert career coach writing a cover letter for a job applicant.
+  const prompt = `Write a cover letter for a job applicant.
 
-APPLICANT: ${name}, ${roleContext}
+APPLICANT: ${name}${latestRole ? `, ${latestRole.role} at ${latestRole.company}` : ''}
 KEY SKILLS: ${skills}
-SUMMARY: ${resumeContent.summary || 'Not provided'}
-${latestRole ? `RECENT ACHIEVEMENT: ${latestRole.bullets?.[0] ?? ''}` : ''}
+${resumeContent.summary ? `SUMMARY: ${resumeContent.summary}` : ''}
 
-TARGET JOB: ${jobTitle} at ${jobCompany}
-${jobDescription ? `JOB DESCRIPTION (excerpt):\n${jobDescription.slice(0, 1500)}` : ''}
+TARGET: ${jobTitle} at ${jobCompany}
+${jobDescription ? `JD EXCERPT:\n${jobDescription.slice(0, 1500)}` : ''}
 
-Write a cover letter with this tone: ${toneGuide}
-
-Structure:
-1. Opening: ${greeting} then a compelling hook (1–2 sentences)
-2. Body paragraph 1: Why this specific role at this company excites the applicant (connect to JD if given)
-3. Body paragraph 2: 2–3 specific accomplishments from their experience that match the role
-4. Closing: A confident call-to-action paragraph + sign-off
-
-Rules:
-- 3–4 paragraphs total, around 250–320 words
-- Never use generic filler like "I am writing to express my interest"
-- Make accomplishments specific and quantified where possible
-- End with: Sincerely, / ${name}
-
-Return ONLY the cover letter text — no preamble, no explanation.`
+Tone: ${toneGuide}
+Structure: ${greeting} | hook | why this role | 2-3 achievements | CTA | Sincerely, / ${name}
+Rules: 250–320 words, no filler like "I am writing to express my interest", quantify achievements.
+Return ONLY the cover letter text.`
 
   try {
-    const message = await anthropic.messages.create({
-      model:      'claude-sonnet-4-6',
-      max_tokens: 1024,
-      messages:   [{ role: 'user', content: prompt }],
-    })
-
-    const coverLetter = message.content[0].type === 'text' ? message.content[0].text.trim() : ''
-    return ok({ coverLetter })
+    const result = await modelChat([{ role: 'user', content: prompt }], cfg, 1024)
+    return ok({ coverLetter: result.text, _model: `${cfg.provider}/${cfg.model}` })
   } catch (e) {
-    console.error('[/api/ai/cover-letter] error:', e)
-    return err('Cover letter generation failed — check ANTHROPIC_API_KEY', 500)
+    console.error('[/api/ai/cover-letter]', e)
+    return err(`Cover letter failed (${cfg.provider}/${cfg.model}): ${(e as Error).message}`, 500)
   }
 }

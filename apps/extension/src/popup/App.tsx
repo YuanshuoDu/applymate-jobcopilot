@@ -16,13 +16,13 @@ const C = {
   muted:    '#6b7280',
 }
 
-const STATUS_COLOR: Record<string, string> = {
-  saved:     '#6b7280',
-  applied:   C.primary,
-  review:    C.amber,
-  interview: C.green,
-  offer:     '#0E7490',
-  rejected:  C.red,
+const STATUS_META: Record<string, { color: string; label: string }> = {
+  saved:     { color: '#6b7280', label: '已存'   },
+  applied:   { color: C.primary, label: '已申请' },
+  review:    { color: C.amber,   label: '审核中' },
+  interview: { color: C.green,   label: '面试'   },
+  offer:     { color: '#0E7490', label: 'Offer'  },
+  rejected:  { color: C.red,     label: '已拒绝' },
 }
 
 // ── Main App ─────────────────────────────────────────────────
@@ -286,8 +286,8 @@ function RecentJobsList({ jobs }: { jobs: SavedJob[] }) {
               <div style={{ fontSize:12, fontWeight:600, overflow:'hidden', textOverflow:'ellipsis', whiteSpace:'nowrap' }}>{job.role}</div>
               <div style={{ fontSize:11, color:C.muted }}>{job.company}</div>
             </div>
-            <span style={{ fontSize:10, background: `${STATUS_COLOR[job.status]}18`, color:STATUS_COLOR[job.status], borderRadius:999, padding:'2px 7px', flexShrink:0 }}>
-              {job.status}
+            <span style={{ fontSize:10, background: `${STATUS_META[job.status]?.color ?? C.muted}18`, color: STATUS_META[job.status]?.color ?? C.muted, borderRadius:999, padding:'2px 7px', flexShrink:0 }}>
+              {STATUS_META[job.status]?.label ?? job.status}
             </span>
           </div>
         </div>

@@ -1,10 +1,15 @@
 'use client'
 
-import React, { useState, useEffect } from 'react'
+import React, { useState, useEffect, useMemo } from 'react'
+import { signIn } from 'next-auth/react'
 import { TopBar } from '@/components/layout/TopBar'
-import { Btn, Card, useToast } from '@/components/ui'
-import type { UserProfile } from '@/lib/types'
+import { Btn, Card, useToast, useConfirm, UserAvatar } from '@/components/ui'
+import type { UserProfile, UserPreferences } from '@/lib/types'
 import { useApi, apiMutate } from '@/lib/hooks'
+import {
+  MODEL_CATALOGUE, PROVIDER_LABELS, DEFAULT_AI_CONFIG,
+  type Provider, type AiConfig,
+} from '@/lib/model-router'
 
 // ── Static data ───────────────────────────────────────────────────────────────
 
@@ -78,10 +83,11 @@ function Toggle({ value, onChange }: { value: boolean; onChange: (v: boolean) =>
 
 // ── SettingsPage ──────────────────────────────────────────────────────────────
 
-type Tab = 'profile' | 'accounts' | 'billing' | 'notifs' | 'privacy'
+type Tab = 'profile' | 'accounts' | 'ai' | 'billing' | 'notifs' | 'privacy'
 
 export function SettingsPage() {
   const toast = useToast()
+  const [confirm, ConfirmDialog] = useConfirm()
 
   // Load user profile
   const { data: user, loading: userLoading } = useApi<UserProfile>('/api/me')
@@ -94,32 +100,80 @@ export function SettingsPage() {
   const [github,   setGithub  ] = useState('')
   const [saving,   setSaving  ] = useState(false)
 
-  // Sync from API
+  // Job preferences state
+  const [prefRoles,       setPrefRoles]       = useState('')
+  const [prefLocations,   setPrefLocations]   = useState('')
+  const [prefSalary,      setPrefSalary]      = useState('')
+  const [prefVisa,        setPrefVisa]        = useState('EU citizen / no visa required')
+  const [prefRelocate,    setPrefRelocate]    = useState(true)
+
+  // Sync all fields from API
   useEffect(() => {
-    if (user?.name) setName(user.name)
-  }, [user?.name])
+    if (!user) return
+    setName(user.name ?? '')
+    setPhone(user.phone ?? '')
+    setLocation(user.location ?? '')
+    setLinkedin(user.linkedin ?? '')
+    setGithub(user.github ?? '')
+    if (user.preferences) {
+      setPrefRoles(user.preferences.targetRoles ?? '')
+      setPrefLocations(user.preferences.targetLocations ?? '')
+      setPrefSalary(user.preferences.salaryExpectation ?? '')
+      setPrefVisa(user.preferences.workAuthorization ?? 'EU citizen / no visa required')
+      setPrefRelocate(user.preferences.openToRelocation ?? true)
+    }
+  }, [user])
 
   const [activeTab,      setActiveTab     ] = useState<Tab>('profile')
   const [notifs,         setNotifs        ] = useState({ apply: true, reject: true, interview: true, offer: true, weekly: false, followUp: true })
-  const [accounts,       setAccounts      ] = useState(CONNECTED_ACCOUNTS)
-  const [showCancelModal, setShowCancelModal] = useState(false)
+  const [showCancelModal,   setShowCancelModal]   = useState(false)
+  const [connectedProviders, setConnectedProviders] = useState<{ provider: string; account: string }[]>([])
+
+  // Fetch real OAuth connections
+  useEffect(() => {
+    fetch('/api/me/accounts')
+      .then(r => r.json())
+      .then(d => setConnectedProviders(d.accounts ?? []))
+      .catch(() => {})
+  }, [])
+
+  // Merge real connections with static config
+  const accounts = useMemo(() => {
+    return CONNECTED_ACCOUNTS.map(acc => {
+      const conn = connectedProviders.find(c => c.provider === acc.id || (acc.id === 'gmail' && c.provider === 'google'))
+      return conn ? { ...acc, connected: true, account: conn.account } : acc
+    })
+  }, [connectedProviders])
+
+  // Password change state
+  const [passwordCur,  setPasswordCur]  = useState('')
+  const [passwordNew,  setPasswordNew]  = useState('')
+  const [passwordConf, setPasswordConf] = useState('')
+  const [pwSaving,     setPwSaving]     = useState(false)
 
   const TABS: { id: Tab; label: string }[] = [
     { id: 'profile',  label: 'Profile'        },
     { id: 'accounts', label: 'Accounts'       },
+    { id: 'ai',       label: 'AI 模型'        },
     { id: 'billing',  label: 'Plan & Billing' },
     { id: 'notifs',   label: 'Notifications'  },
     { id: 'privacy',  label: 'Privacy'        },
   ]
 
   const planLabel = user?.plan === 'pro' ? 'Pro' : user?.plan === 'enterprise' ? 'Team' : 'Free'
-  const initials  = name
-    ? name.trim().split(/\s+/).map(p => p[0]).join('').slice(0, 2).toUpperCase()
-    : (user?.email?.slice(0, 2).toUpperCase() ?? '??')
 
   async function saveProfile() {
     setSaving(true)
-    const { error } = await apiMutate('/api/me', 'PATCH', { name })
+    const preferences: UserPreferences = {
+      targetRoles: prefRoles,
+      targetLocations: prefLocations,
+      salaryExpectation: prefSalary,
+      workAuthorization: prefVisa,
+      openToRelocation: prefRelocate,
+    }
+    const { error } = await apiMutate('/api/me', 'PATCH', {
+      name, phone, location, linkedin, github, preferences,
+    })
     setSaving(false)
     if (error) toast.error('Error', error)
     else       toast.success('Profile saved')
@@ -127,6 +181,7 @@ export function SettingsPage() {
 
   return (
     <div style={{ flex: 1, overflowY: 'auto', background: 'var(--bg-tertiary)', display: 'flex', flexDirection: 'column' }}>
+      <ConfirmDialog />
       <TopBar title="Settings">
         <Btn variant="primary" onClick={saveProfile} disabled={saving}>
           {saving ? 'Saving…' : 'Save changes'}
@@ -159,14 +214,7 @@ export function SettingsPage() {
                   <>
                     {/* Avatar */}
                     <div style={{ display: 'flex', alignItems: 'center', gap: 16, marginBottom: 16, paddingBottom: 16, borderBottom: '0.5px solid var(--border)' }}>
-                      {user?.image ? (
-                        // eslint-disable-next-line @next/next/no-img-element
-                        <img src={user.image} alt={name} width={60} height={60} style={{ borderRadius: '50%', objectFit: 'cover' }} />
-                      ) : (
-                        <div style={{ width: 60, height: 60, borderRadius: '50%', background: 'rgba(24,95,165,0.15)', color: '#185FA5', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 20, fontWeight: 500 }}>
-                          {initials}
-                        </div>
-                      )}
+                      <UserAvatar src={user?.image} name={user?.name} email={user?.email} size={60} />
                       <div>
                         <Btn small variant="ghost" onClick={() => toast.info('Upload photo')}>Upload photo</Btn>
                         <div style={{ fontSize: 10, color: 'var(--text-muted)', marginTop: 4 }}>JPG, PNG up to 2MB</div>
@@ -197,29 +245,50 @@ export function SettingsPage() {
               </SettingsSection>
 
               <SettingsSection title="Job Preferences">
-                <FieldRow label="Target roles">    <Input value="" placeholder="Backend Engineer, SWE" /></FieldRow>
-                <FieldRow label="Target locations"><Input value="" placeholder="Amsterdam, Berlin, Remote" /></FieldRow>
-                <FieldRow label="Salary expectation"><Input value="" placeholder="€65,000 – €90,000" /></FieldRow>
+                <FieldRow label="Target roles">    <Input value={prefRoles}     onChange={e => setPrefRoles(e.target.value)}     placeholder="Backend Engineer, SWE" /></FieldRow>
+                <FieldRow label="Target locations"><Input value={prefLocations} onChange={e => setPrefLocations(e.target.value)} placeholder="Amsterdam, Berlin, Remote" /></FieldRow>
+                <FieldRow label="Salary expectation"><Input value={prefSalary}   onChange={e => setPrefSalary(e.target.value)}    placeholder="€65,000 – €90,000" /></FieldRow>
                 <FieldRow label="Work authorisation">
-                  <select style={{ padding: '6px 10px', fontSize: 12, border: '0.5px solid var(--border)', borderRadius: 6, background: 'var(--bg)', color: 'var(--text)', outline: 'none' }}>
+                  <select value={prefVisa} onChange={e => setPrefVisa(e.target.value)} style={{ padding: '6px 10px', fontSize: 12, border: '0.5px solid var(--border)', borderRadius: 6, background: 'var(--bg)', color: 'var(--text)', outline: 'none' }}>
                     <option>EU citizen / no visa required</option>
                     <option>Requires sponsorship</option>
                     <option>Open work permit</option>
                   </select>
                 </FieldRow>
-                <FieldRow label="Open to relocation"><Toggle value={true} onChange={() => {}} /></FieldRow>
+                <FieldRow label="Open to relocation"><Toggle value={prefRelocate} onChange={setPrefRelocate} /></FieldRow>
               </SettingsSection>
 
               <SettingsSection title="Password">
-                <FieldRow label="Current password"><Input type="password" placeholder="••••••••" /></FieldRow>
-                <FieldRow label="New password">    <Input type="password" placeholder="••••••••" /></FieldRow>
-                <FieldRow label="Confirm password"><Input type="password" placeholder="••••••••" /></FieldRow>
+                <FieldRow label="Current password">
+                  <Input type="password" value={passwordCur}  onChange={e => setPasswordCur(e.target.value)}  placeholder="••••••••" />
+                </FieldRow>
+                <FieldRow label="New password">
+                  <Input type="password" value={passwordNew}  onChange={e => setPasswordNew(e.target.value)}  placeholder="••••••••" />
+                </FieldRow>
+                <FieldRow label="Confirm password">
+                  <Input type="password" value={passwordConf} onChange={e => setPasswordConf(e.target.value)} placeholder="••••••••" />
+                </FieldRow>
                 <div style={{ marginTop: 12 }}>
-                  <Btn variant="ghost" onClick={() => toast.success('Password updated')}>Update password</Btn>
+                  <Btn variant="ghost" disabled={pwSaving} onClick={async () => {
+                    if (!passwordCur || !passwordNew) { toast.info('Enter current and new password'); return }
+                    if (passwordNew !== passwordConf) { toast.error('Mismatch', 'New password and confirmation do not match'); return }
+                    if (passwordNew.length < 8) { toast.error('Too short', 'Password must be at least 8 characters'); return }
+                    setPwSaving(true)
+                    const { error } = await apiMutate('/api/me/password', 'PATCH', { currentPassword: passwordCur, newPassword: passwordNew })
+                    setPwSaving(false)
+                    if (error) { toast.error('Password change failed', error) }
+                    else {
+                      toast.success('Password updated')
+                      setPasswordCur(''); setPasswordNew(''); setPasswordConf('')
+                    }
+                  }}>{pwSaving ? 'Updating…' : 'Update password'}</Btn>
                 </div>
               </SettingsSection>
             </>
           )}
+
+          {/* ── AI 模型 ── */}
+          {activeTab === 'ai' && <AiModelSettings />}
 
           {/* ── Accounts ── */}
           {activeTab === 'accounts' && (
@@ -239,15 +308,25 @@ export function SettingsPage() {
                     {acc.connected ? (
                       <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
                         <span style={{ fontSize: 10, color: '#3B6D11', background: 'rgba(59,109,17,0.12)', borderRadius: 999, padding: '2px 8px' }}>● Connected</span>
-                        <Btn small variant="danger" onClick={() => {
-                          setAccounts(a => a.map(x => x.id === acc.id ? { ...x, connected: false, account: null } : x))
-                          toast.warning(`${acc.name} disconnected`)
+                        <Btn small variant="danger" onClick={async () => {
+                          if (acc.id === 'gmail') {
+                            // Google disconnection: clear apps permission link
+                            window.open('https://myaccount.google.com/permissions', '_blank')
+                            toast.info('Google revoke', 'Visit Google Account permissions to revoke access')
+                          } else {
+                            toast.warning(`${acc.name} disconnected`)
+                          }
                         }}>Disconnect</Btn>
                       </div>
                     ) : (
                       <Btn small variant="primary" onClick={() => {
-                        setAccounts(a => a.map(x => x.id === acc.id ? { ...x, connected: true, account: `connected@${acc.id}.com` } : x))
-                        toast.success(`${acc.name} connected`)
+                        if (acc.id === 'gmail') {
+                          signIn('google', { callbackUrl: window.location.href })
+                        } else if (acc.id === 'github') {
+                          signIn('github', { callbackUrl: window.location.href })
+                        } else {
+                          toast.info(`${acc.name} integration`, 'Coming soon')
+                        }
                       }}>Connect</Btn>
                     )}
                   </div>
@@ -351,9 +430,31 @@ export function SettingsPage() {
               <Card style={{ padding: 16, border: '0.5px solid rgba(163,45,45,0.3)', background: 'rgba(163,45,45,0.03)' }}>
                 <div style={{ fontSize: 12, fontWeight: 500, color: '#A32D2D', marginBottom: 8 }}>Danger Zone</div>
                 <div style={{ fontSize: 11, color: 'var(--text-muted)', marginBottom: 12 }}>
-                  Once you delete your account, there is no going back. All your data, applications, and settings will be permanently removed.
+                  Once you delete your account, there is no going back. All your data — jobs, resumes, cover letters, settings — will be permanently removed.
                 </div>
-                <Btn variant="danger" onClick={() => toast.error('Account deletion', 'Contact support to proceed')}>Delete account</Btn>
+                <Btn variant="danger" onClick={async () => {
+                  const ok = await confirm({
+                    title: 'Delete your account?',
+                    message: `This will permanently erase all your data. To confirm, type your email "${user?.email ?? 'your email'}" in the next step.`,
+                    danger: true,
+                    confirmLabel: 'I understand, continue',
+                    cancelLabel: 'Cancel',
+                  })
+                  if (!ok) return
+                  // Second confirmation: user must type their email
+                  const typed = prompt(`Type your email to confirm deletion: ${user?.email ?? ''}`)
+                  if (typed !== user?.email) {
+                    toast.warning('Cancelled', 'Email did not match — account preserved')
+                    return
+                  }
+                  const { error } = await apiMutate('/api/me', 'DELETE', { confirmation: user?.email })
+                  if (error) {
+                    toast.error('Deletion failed', error)
+                  } else {
+                    toast.success('Account deleted', 'Redirecting…')
+                    setTimeout(() => window.location.href = '/login', 1500)
+                  }
+                }}>Delete my account</Btn>
               </Card>
             </>
           )}
@@ -377,6 +478,166 @@ export function SettingsPage() {
           </Card>
         </div>
       )}
+    </div>
+  )
+}
+
+// ── AI Model Settings ─────────────────────────────────────────────────────────
+
+const TIER_COLOR = { fast: '#854F0B', standard: '#185FA5', premium: '#5B3DC8' }
+const TIER_LABEL = { fast: '快速', standard: '标准', premium: '旗舰' }
+
+function AiModelSettings() {
+  const toast = useToast()
+  const [cfg,     setCfg]     = useState<AiConfig>(DEFAULT_AI_CONFIG)
+  const [apiKey,  setApiKey]  = useState('')
+  const [apiBase, setApiBase] = useState('')
+  const [saving,  setSaving]  = useState(false)
+  const [loaded,  setLoaded]  = useState(false)
+
+  useEffect(() => {
+    fetch('/api/me/ai-config').then(r => r.json()).then((data: AiConfig) => {
+      setCfg({ provider: data.provider ?? 'anthropic', model: data.model ?? 'claude-sonnet-4-6' })
+      setApiBase(data.apiBase ?? '')
+      setLoaded(true)
+    }).catch(() => setLoaded(true))
+  }, [])
+
+  const providers = Array.from(new Set(MODEL_CATALOGUE.map(m => m.provider))) as Provider[]
+  const modelsForProvider = MODEL_CATALOGUE.filter(m => m.provider === cfg.provider)
+  const selectedModel = MODEL_CATALOGUE.find(m => m.provider === cfg.provider && m.model === cfg.model)
+    ?? modelsForProvider[0]
+
+  function selectProvider(p: Provider) {
+    const firstModel = MODEL_CATALOGUE.find(m => m.provider === p)
+    setCfg({ provider: p, model: firstModel?.model ?? '' })
+    setApiBase(firstModel?.defaultBase ?? '')
+  }
+
+  async function save() {
+    setSaving(true)
+    const body: AiConfig = {
+      provider: cfg.provider,
+      model:    cfg.model,
+      ...(apiKey.trim()  ? { apiKey:  apiKey.trim()  } : {}),
+      ...(apiBase.trim() ? { apiBase: apiBase.trim() } : {}),
+    }
+    const { error } = await apiMutate('/api/me/ai-config', 'POST', body)
+    setSaving(false)
+    if (error) toast.error('保存失败', error)
+    else       toast.success('AI 模型已更新')
+  }
+
+  if (!loaded) return <div style={{ padding: 24, color: 'var(--text-muted)', fontSize: 13 }}>加载中…</div>
+
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
+
+      {/* Provider selector */}
+      <SettingsSection title="AI 提供商">
+        <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8 }}>
+          {providers.map(p => (
+            <button key={p} onClick={() => selectProvider(p)} style={{
+              padding: '7px 14px', borderRadius: 8, cursor: 'pointer', fontSize: 12, fontWeight: 500,
+              border: `1.5px solid ${cfg.provider === p ? 'var(--primary)' : 'var(--border)'}`,
+              background: cfg.provider === p ? 'rgba(24,95,165,0.08)' : 'transparent',
+              color: cfg.provider === p ? 'var(--primary)' : 'var(--text-muted)',
+            }}>
+              {PROVIDER_LABELS[p]}
+            </button>
+          ))}
+        </div>
+      </SettingsSection>
+
+      {/* Model selector */}
+      <SettingsSection title="选择模型">
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+          {modelsForProvider.map(m => (
+            <button key={m.model} onClick={() => setCfg(prev => ({ ...prev, model: m.model }))} style={{
+              display: 'flex', alignItems: 'flex-start', gap: 12, padding: '12px 14px',
+              borderRadius: 10, cursor: 'pointer', textAlign: 'left', width: '100%',
+              border: `1.5px solid ${cfg.model === m.model ? 'var(--primary)' : 'var(--border)'}`,
+              background: cfg.model === m.model ? 'rgba(24,95,165,0.06)' : 'var(--bg)',
+            }}>
+              <div style={{ flex: 1 }}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 3 }}>
+                  <span style={{ fontSize: 13, fontWeight: 600, color: 'var(--text)' }}>{m.label}</span>
+                  <span style={{ fontSize: 10, fontWeight: 500, color: TIER_COLOR[m.tier], background: `${TIER_COLOR[m.tier]}14`, borderRadius: 999, padding: '1px 7px' }}>
+                    {TIER_LABEL[m.tier]}
+                  </span>
+                </div>
+                <div style={{ fontSize: 11, color: 'var(--text-muted)' }}>{m.description}</div>
+              </div>
+              <div style={{ textAlign: 'right', flexShrink: 0 }}>
+                <div style={{ fontSize: 11, color: 'var(--text-muted)' }}>
+                  {m.priceIn === 0 && m.priceOut === 0 ? '免费' : `$${m.priceIn}/$${m.priceOut}`}
+                </div>
+                <div style={{ fontSize: 10, color: 'var(--text-muted)' }}>/M tokens</div>
+                <div style={{ fontSize: 10, color: 'var(--text-muted)' }}>{m.contextK}K ctx</div>
+              </div>
+            </button>
+          ))}
+        </div>
+      </SettingsSection>
+
+      {/* API Key */}
+      <SettingsSection title="API Key（可选）">
+        <div style={{ fontSize: 11, color: 'var(--text-muted)', marginBottom: 10, lineHeight: 1.6 }}>
+          留空则使用服务器默认 Key。填入自己的 Key 可独立控制用量和账单。
+        </div>
+        <input
+          type="password"
+          value={apiKey}
+          onChange={e => setApiKey(e.target.value)}
+          placeholder={`${PROVIDER_LABELS[cfg.provider]} API Key`}
+          style={{ width: '100%', padding: '9px 12px', border: '1px solid var(--border)', borderRadius: 8, fontSize: 13, color: 'var(--text)', background: 'var(--bg)', outline: 'none' }}
+        />
+        {cfg.provider === 'anthropic'  && <KeyHint href="https://console.anthropic.com/settings/keys" />}
+        {cfg.provider === 'openai'     && <KeyHint href="https://platform.openai.com/api-keys" />}
+        {cfg.provider === 'deepseek'   && <KeyHint href="https://platform.deepseek.com/api-keys" />}
+        {cfg.provider === 'minimax'    && <KeyHint href="https://platform.minimax.chat/user-center/basic-information/interface-key" />}
+        {cfg.provider === 'qwen'       && <KeyHint href="https://dashscope.console.aliyun.com/apiKey" label="阿里云 DashScope" />}
+        {cfg.provider === 'zhipu'      && <KeyHint href="https://open.bigmodel.cn/usercenter/apikeys" label="智谱开放平台" />}
+      </SettingsSection>
+
+      {/* Custom base URL */}
+      {(cfg.provider === 'custom' || apiBase) && (
+        <SettingsSection title="API Base URL">
+          <input
+            type="url"
+            value={apiBase}
+            onChange={e => setApiBase(e.target.value)}
+            placeholder="https://your-endpoint/v1"
+            style={{ width: '100%', padding: '9px 12px', border: '1px solid var(--border)', borderRadius: 8, fontSize: 13, color: 'var(--text)', background: 'var(--bg)', outline: 'none' }}
+          />
+          <div style={{ fontSize: 10, color: 'var(--text-muted)', marginTop: 6 }}>
+            任何 OpenAI-compatible 端点均可使用，例如本地 Ollama: <code style={{ fontFamily: 'monospace' }}>http://localhost:11434/v1</code>
+          </div>
+        </SettingsSection>
+      )}
+
+      {/* Current selection summary */}
+      {selectedModel && (
+        <div style={{ padding: '12px 14px', background: 'rgba(24,95,165,0.05)', borderRadius: 10, border: '1px solid rgba(24,95,165,0.15)', fontSize: 12, color: 'var(--text-muted)' }}>
+          当前选择：<strong style={{ color: 'var(--text)' }}>{selectedModel.label}</strong>
+          {' · '}输入 ${selectedModel.priceIn}/M · 输出 ${selectedModel.priceOut}/M · {selectedModel.contextK}K 上下文
+        </div>
+      )}
+
+      <Btn variant="primary" onClick={save} disabled={saving}>
+        {saving ? '保存中…' : '保存模型设置'}
+      </Btn>
+    </div>
+  )
+}
+
+function KeyHint({ href, label }: { href: string; label?: string }) {
+  return (
+    <div style={{ marginTop: 6, fontSize: 11, color: 'var(--text-muted)' }}>
+      获取 API Key：
+      <a href={href} target="_blank" rel="noreferrer" style={{ color: 'var(--primary)', marginLeft: 4 }}>
+        {label ?? '控制台 ↗'}
+      </a>
     </div>
   )
 }

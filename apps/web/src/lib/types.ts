@@ -2,8 +2,26 @@
 // Domain types — kept in sync with prisma/schema.prisma
 // ─────────────────────────────────────────────────────────────────────────────
 
-export type JobStatus = 'saved' | 'applied' | 'review' | 'interview' | 'offer' | 'rejected'
-export type Plan = 'free' | 'pro' | 'enterprise'
+export type JobStatus     = 'saved' | 'applied' | 'review' | 'interview' | 'offer' | 'rejected'
+export type Plan          = 'free' | 'pro' | 'enterprise'
+export type AgentRoleType = 'scout' | 'analyst' | 'writer' | 'reviewer' | 'executor' | 'auditor'
+
+// ── AgentRole ─────────────────────────────────────────────────────────────────
+export interface AgentRole {
+  id:           string
+  userId:       string
+  role:         AgentRoleType
+  enabled:      boolean
+  provider:     string
+  model:        string
+  apiKey:       string | null
+  systemPrompt: string | null
+  lastRunAt:    string | null  // ISO date
+  lastResult:   { count: number; durationMs: number; summary: string } | null
+  totalRuns:    number
+  createdAt:    string
+  updatedAt:    string
+}
 
 export type ActivityType =
   | 'applied'
@@ -82,11 +100,42 @@ export interface ResumeContent {
   }>
   skills: string[]
   languages?: Array<{ lang: string; level: string }>
+  projects?: Array<{
+    name:    string
+    role?:   string
+    period?: string
+    url?:    string
+    bullets: string[]
+  }>
+  certifications?: Array<{
+    name:   string
+    issuer: string
+    date:   string
+    url?:   string
+  }>
+  custom?: Array<{
+    id:    string
+    title: string
+    items: Array<{
+      title?:    string
+      subtitle?: string
+      period?:   string
+      bullets:   string[]
+    }>
+  }>
+  sectionOrder?: string[]
+}
+
+export interface TemplateOptions {
+  accentColor?: string   // hex, from preset palette
+  fontFamily?:  'serif' | 'sans' | 'mono'
+  density?:     'compact' | 'comfortable' | 'spacious'
 }
 
 export interface Resume extends ResumeListItem {
-  content:    ResumeContent
-  templateId: string | null
+  content:         ResumeContent
+  templateId:      string | null
+  templateOptions: TemplateOptions | null
 }
 
 // ── Agent Config ───────────────────────────────────────────────────────────────
@@ -124,12 +173,25 @@ export interface DashboardData {
 
 // ── User ───────────────────────────────────────────────────────────────────────
 export interface UserProfile {
-  id:        string
-  email:     string
-  name:      string | null
-  image:     string | null
-  plan:      Plan
-  createdAt: string
+  id:          string
+  email:       string
+  name:        string | null
+  image:       string | null
+  plan:        Plan
+  phone:       string | null
+  location:    string | null
+  linkedin:    string | null
+  github:      string | null
+  preferences: UserPreferences | null
+  createdAt:   string
+}
+
+export interface UserPreferences {
+  targetRoles:       string
+  targetLocations:   string
+  salaryExpectation: string
+  workAuthorization: string
+  openToRelocation:  boolean
 }
 
 // ── Pagination wrapper ─────────────────────────────────────────────────────────

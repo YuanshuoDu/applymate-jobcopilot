@@ -48,6 +48,7 @@ export async function getGoogleAccessToken(userId: string): Promise<string | nul
 export function classifyEmail(subject: string, snippet: string): string {
   const t = (subject + ' ' + snippet).toLowerCase()
   if (
+    t.includes('congratulations') ||
     (t.includes('offer') && (t.includes('congratulation') || t.includes('pleased') || t.includes('extend'))) ||
     t.includes('offer letter') || t.includes('job offer')
   ) return 'offer'
@@ -79,6 +80,7 @@ export function classifyEmail(subject: string, snippet: string): string {
 export function extractPlainText(payload: Record<string, unknown>): string {
   const body = payload.body as Record<string, unknown> | undefined
   if (body?.data && typeof body.data === 'string') {
+    if (!/^[A-Za-z0-9+/\-_=\s]*$/.test(body.data)) return ''
     try { return Buffer.from(body.data, 'base64').toString('utf-8') } catch { return '' }
   }
   const parts = payload.parts as Record<string, unknown>[] | undefined

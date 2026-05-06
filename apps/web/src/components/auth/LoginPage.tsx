@@ -1,7 +1,7 @@
 'use client'
 
-import { useState } from 'react'
-import { signIn } from 'next-auth/react'
+import { useState, useEffect } from 'react'
+import { signIn, getProviders } from 'next-auth/react'
 import { useRouter, useSearchParams } from 'next/navigation'
 import Link from 'next/link'
 
@@ -34,6 +34,13 @@ export function LoginPage() {
   const [password, setPassword] = useState('')
   const [error,    setError]    = useState(urlError ? mapOAuthError(urlError) : '')
   const [loading,  setLoading]  = useState<string | null>(null)  // 'credentials' | 'google' | 'github'
+
+  // Detect which OAuth providers are actually configured
+  type Providers = Awaited<ReturnType<typeof getProviders>>
+  const [oauthProviders, setOauthProviders] = useState<Providers>(null)
+  useEffect(() => {
+    getProviders().then(setOauthProviders)
+  }, [])
 
   // ── Credentials login ────────────────────────────────────────
   async function handleCredentials(e: React.FormEvent) {
@@ -100,17 +107,17 @@ export function LoginPage() {
         </div>
 
         {/* Testimonial */}
-        <div style={{ marginTop:'auto', paddingTop:36, borderTop:`1px solid ${C.border}` }}>
-          <div style={{ fontSize:12, color:C.muted, lineHeight:1.7, fontStyle:'italic', marginBottom:12 }}>
-            "用 ApplyMate 两周内拿到了 Adyen、Booking.com 的面试，省了我大量整理简历的时间。"
-          </div>
-          <div style={{ display:'flex', alignItems:'center', gap:8 }}>
-            <div style={{ width:28, height:28, borderRadius:'50%', background:'rgba(24,95,165,0.15)', color:C.primary, display:'flex', alignItems:'center', justifyContent:'center', fontSize:11, fontWeight:600 }}>ZL</div>
-            <div>
-              <div style={{ fontSize:12, fontWeight:500, color:C.text }}>Zhang Li</div>
-              <div style={{ fontSize:10, color:C.muted }}>Backend Engineer · Amsterdam</div>
+        <div style={{ marginTop:'auto', paddingTop:28, borderTop:`1px solid ${C.border}` }}>
+          <blockquote style={{ margin:0 }}>
+            {/* Large decorative quote mark */}
+            <div style={{ fontSize:64, lineHeight:1, color:C.primary, opacity:0.18, fontFamily:'Georgia, serif', marginBottom:-8, userSelect:'none' }}>&ldquo;</div>
+            <p style={{ fontSize:13, color:C.text, lineHeight:1.75, margin:'0 0 14px' }}>
+              用 ApplyMate 两周内拿到了 Adyen、Booking.com 的面试，省了我大量整理简历的时间。
+            </p>
+            <div style={{ fontSize:12, color:C.muted, fontStyle:'normal' }}>
+              — <span style={{ fontWeight:500, color:C.text }}>Zhang Li</span>, Backend Engineer · Amsterdam
             </div>
-          </div>
+          </blockquote>
         </div>
       </div>
 
@@ -134,29 +141,43 @@ export function LoginPage() {
             </div>
           )}
 
-          {/* OAuth buttons */}
-          <div style={{ display:'flex', flexDirection:'column', gap:10, marginBottom:24 }}>
-            <OAuthBtn
-              icon={<GoogleIcon />}
-              label="使用 Google 登录"
-              onClick={() => handleOAuth('google')}
-              loading={loading === 'google'}
-            />
-            <OAuthBtn
-              icon={<GitHubIcon />}
-              label="使用 GitHub 登录"
-              onClick={() => handleOAuth('github')}
-              loading={loading === 'github'}
-              dark
-            />
-          </div>
+          {/* OAuth buttons — only show configured providers */}
+          {oauthProviders && (oauthProviders.google || oauthProviders.github) ? (
+            <>
+              <div style={{ display:'flex', flexDirection:'column', gap:10, marginBottom:24 }}>
+                {oauthProviders.google && (
+                  <OAuthBtn
+                    icon={<GoogleIcon />}
+                    label="使用 Google 登录"
+                    onClick={() => handleOAuth('google')}
+                    loading={loading === 'google'}
+                  />
+                )}
+                {oauthProviders.github && (
+                  <OAuthBtn
+                    icon={<GitHubIcon />}
+                    label="使用 GitHub 登录"
+                    onClick={() => handleOAuth('github')}
+                    loading={loading === 'github'}
+                    dark
+                  />
+                )}
+              </div>
 
-          {/* Divider */}
-          <div style={{ display:'flex', alignItems:'center', gap:12, marginBottom:24 }}>
-            <div style={{ flex:1, height:1, background:C.border }} />
-            <span style={{ fontSize:11, color:C.muted }}>或使用邮箱登录</span>
-            <div style={{ flex:1, height:1, background:C.border }} />
-          </div>
+              {/* Divider */}
+              <div style={{ display:'flex', alignItems:'center', gap:12, marginBottom:24 }}>
+                <div style={{ flex:1, height:1, background:C.border }} />
+                <span style={{ fontSize:11, color:C.muted }}>或使用邮箱登录</span>
+                <div style={{ flex:1, height:1, background:C.border }} />
+              </div>
+            </>
+          ) : oauthProviders === null ? (
+            /* Still loading providers — show skeleton */
+            <div style={{ marginBottom:24 }}>
+              <div style={{ height:44, background:C.border, borderRadius:8, opacity:0.3, marginBottom:10 }} />
+              <div style={{ height:44, background:C.border, borderRadius:8, opacity:0.2 }} />
+            </div>
+          ) : null /* No OAuth providers configured — skip directly to email form */}
 
           {/* Credentials form */}
           <form onSubmit={handleCredentials} style={{ display:'flex', flexDirection:'column', gap:14 }}>
@@ -188,6 +209,14 @@ export function LoginPage() {
           <div style={{ marginTop:20, padding:'10px 14px', background:'rgba(24,95,165,0.06)', borderRadius:8, fontSize:11, color:C.muted, lineHeight:1.6 }}>
             🎮 演示账号：<span style={{ fontFamily:'monospace', color:C.text }}>demo@applymate.ai</span> / <span style={{ fontFamily:'monospace', color:C.text }}>demo1234</span>
           </div>
+
+          {/* Dev hint: OAuth not configured */}
+          {oauthProviders && !oauthProviders.google && !oauthProviders.github && (
+            <div style={{ marginTop:12, padding:'10px 14px', background:'rgba(133,79,11,0.08)', border:'1px solid rgba(133,79,11,0.2)', borderRadius:8, fontSize:11, color:'#854F0B', lineHeight:1.6 }}>
+              ⚙ Google / GitHub 登录未启用<br />
+              <span style={{ fontSize:10, opacity:0.75 }}>在 <code style={{ background:'rgba(0,0,0,0.06)', padding:'1px 4px', borderRadius:3 }}>.env.local</code> 中配置 <code style={{ background:'rgba(0,0,0,0.06)', padding:'1px 4px', borderRadius:3 }}>AUTH_GOOGLE_ID</code> / <code style={{ background:'rgba(0,0,0,0.06)', padding:'1px 4px', borderRadius:3 }}>AUTH_GITHUB_ID</code></span>
+            </div>
+          )}
 
         </div>
       </div>

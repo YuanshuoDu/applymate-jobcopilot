@@ -1,6 +1,6 @@
 'use client'
 
-import React, { useState } from 'react'
+import React, { useState, useEffect } from 'react'
 import { useSession } from 'next-auth/react'
 import { Sidebar } from './Sidebar'
 import { ToastProvider } from '@/components/ui'
@@ -9,7 +9,7 @@ import { DashboardPage }     from '@/components/pages/DashboardPage'
 import { JobsPage }          from '@/components/pages/JobsPage'
 import { ResumePage }        from '@/components/pages/ResumePage'
 import { GmailPage }         from '@/components/pages/GmailPage'
-import { AgentPage }         from '@/components/pages/AgentPage'
+import { AgentPlaygroundPage } from '@/components/pages/AgentPlaygroundPage'
 import { AgentAnimationPage } from '@/components/pages/AgentAnimationPage'
 import { ExtensionPage }     from '@/components/pages/ExtensionPage'
 import { SettingsPage }      from '@/components/pages/SettingsPage'
@@ -27,16 +27,30 @@ const PAGES: Record<Page, React.ComponentType> = {
   jobs:      JobsPage,
   resume:    ResumePage,
   gmail:     GmailPage,
-  agent:     AgentPage,
+  agent:     AgentPlaygroundPage,
   animation: AgentAnimationPage,
   extension: ExtensionPage,
   settings:  SettingsPage,
 }
 
 export function AppShell() {
-  const [page, setPage] = useState<Page>('dashboard')
+  const [page, setPage]         = useState<Page>('dashboard')
+  const [timedOut, setTimedOut] = useState(false)
   const { data: session, status } = useSession()
   const PageComp = PAGES[page]
+
+  // Safety timeout: if session is still loading after 10s, redirect to login
+  useEffect(() => {
+    if (status !== 'loading') return
+    const t = setTimeout(() => setTimedOut(true), 10000)
+    return () => clearTimeout(t)
+  }, [status])
+
+  // Redirect to login if unauthenticated or timed out
+  if (status === 'unauthenticated' || timedOut) {
+    window.location.href = '/login'
+    return null
+  }
 
   // Show loading skeleton while session loads
   if (status === 'loading') {

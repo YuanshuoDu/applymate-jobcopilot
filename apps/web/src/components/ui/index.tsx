@@ -3,6 +3,8 @@
 import React, { createContext, useCallback, useContext, useState } from 'react'
 import type { JobStatus } from '@/lib/types'
 
+export { UserAvatar } from './UserAvatar'
+
 // ─── Status config ─────────────────────────────────────────────────────────────
 export const STATUS_CONFIG: Record<JobStatus, { label: string; color: string; bg: string }> = {
   saved:     { label: 'Saved',      color: '#6B7280', bg: 'rgba(107,114,128,0.12)' },
@@ -214,4 +216,119 @@ export function ScorePill({ score }: { score: number }) {
       {score}%
     </span>
   )
+}
+
+// ─── Shared form input style ──────────────────────────────────────────────────
+/**
+ * Common inline style for <input>, <select>, and <textarea> elements.
+ * Import this instead of redefining `inputSt` in every component.
+ *
+ * Usage:
+ *   import { INPUT_STYLE } from '@/components/ui'
+ *   <input style={INPUT_STYLE} ... />
+ *   <textarea style={{ ...INPUT_STYLE, minHeight: 90, resize: 'vertical' }} ... />
+ */
+export const INPUT_STYLE: React.CSSProperties = {
+  width:      '100%',
+  padding:    '7px 10px',
+  fontSize:   12,
+  border:     '0.5px solid var(--border)',
+  borderRadius: 6,
+  background: 'var(--bg)',
+  color:      'var(--text)',
+  outline:    'none',
+  boxSizing:  'border-box',
+}
+
+// ─── ConfirmDialog ────────────────────────────────────────────────────────────
+/**
+ * In-design-system replacement for window.confirm.
+ *
+ * Usage:
+ *   const [confirm, ConfirmDialog] = useConfirm()
+ *   // in JSX: <ConfirmDialog />
+ *   // to trigger: await confirm({ title, message, danger })
+ */
+interface ConfirmOptions {
+  title:    string
+  message:  string
+  /** If true, the confirm button renders in danger style (default: false) */
+  danger?:  boolean
+  confirmLabel?: string
+  cancelLabel?:  string
+}
+
+type ConfirmFn = (opts: ConfirmOptions) => Promise<boolean>
+
+export function useConfirm(): [ConfirmFn, React.FC] {
+  const [state, setState] = useState<(ConfirmOptions & { resolve: (v: boolean) => void }) | null>(null)
+
+  const confirm: ConfirmFn = useCallback(
+    (opts) =>
+      new Promise<boolean>((resolve) => {
+        setState({ ...opts, resolve })
+      }),
+    [],
+  )
+
+  const Dialog: React.FC = useCallback(() => {
+    if (!state) return null
+
+    function finish(value: boolean) {
+      state!.resolve(value)
+      setState(null)
+    }
+
+    return (
+      <div
+        style={{
+          position: 'fixed', inset: 0, zIndex: 200,
+          background: 'rgba(0,0,0,0.35)',
+          display: 'flex', alignItems: 'center', justifyContent: 'center',
+        }}
+        onClick={() => finish(false)}
+      >
+        <div
+          onClick={e => e.stopPropagation()}
+          style={{
+            background: 'var(--bg)', border: '0.5px solid var(--border)',
+            borderRadius: 12, width: 380, padding: 24,
+            boxShadow: '0 8px 32px rgba(0,0,0,0.18)',
+          }}
+        >
+          {/* Icon + Title */}
+          <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 10 }}>
+            {state.danger && (
+              <div style={{
+                width: 32, height: 32, borderRadius: 8,
+                background: 'rgba(163,45,45,0.12)',
+                display: 'flex', alignItems: 'center', justifyContent: 'center',
+                fontSize: 16, flexShrink: 0,
+              }}>⚠</div>
+            )}
+            <span style={{ fontSize: 14, fontWeight: 600, color: 'var(--text)' }}>{state.title}</span>
+          </div>
+
+          {/* Message */}
+          <p style={{ fontSize: 12, color: 'var(--text-muted)', margin: '0 0 20px', lineHeight: 1.6 }}>
+            {state.message}
+          </p>
+
+          {/* Actions */}
+          <div style={{ display: 'flex', gap: 8, justifyContent: 'flex-end' }}>
+            <Btn variant="ghost" onClick={() => finish(false)}>
+              {state.cancelLabel ?? 'Cancel'}
+            </Btn>
+            <Btn variant={state.danger ? 'danger' : 'primary'} onClick={() => finish(true)}
+              style={state.danger ? { background: 'rgba(163,45,45,0.12)', fontWeight: 600 } : {}}>
+              {state.confirmLabel ?? 'Confirm'}
+            </Btn>
+          </div>
+        </div>
+      </div>
+    )
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [state])
+
+  return [confirm, Dialog]
 }

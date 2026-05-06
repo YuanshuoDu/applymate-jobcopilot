@@ -4,6 +4,7 @@ import { signOut } from 'next-auth/react'
 import type { Session } from 'next-auth'
 import type { Page } from '@/lib/types'
 import { useTheme } from '@/components/ThemeProvider'
+import { UserAvatar } from '@/components/ui'
 
 const NAV_ITEMS: { id: Page; label: string; icon: string }[] = [
   { id: 'dashboard',  label: 'Dashboard',  icon: '▦' },
@@ -23,8 +24,7 @@ interface SidebarProps {
 }
 
 export function Sidebar({ active, onNav, session }: SidebarProps) {
-  const user    = session?.user
-  const initials = getInitials(user?.name ?? user?.email ?? '?')
+  const user      = session?.user
   const planLabel = 'Pro plan' // TODO: pull from DB when needed
   const { theme, toggle } = useTheme()
 
@@ -70,15 +70,7 @@ export function Sidebar({ active, onNav, session }: SidebarProps) {
       <div style={{ borderTop: '0.5px solid var(--border)' }}>
         {/* User info */}
         <div style={{ padding: '10px 12px', display: 'flex', alignItems: 'center', gap: 8 }}>
-          {user?.image ? (
-            // eslint-disable-next-line @next/next/no-img-element
-            <img src={user.image} alt={user.name ?? ''} width={28} height={28}
-              style={{ borderRadius: '50%', flexShrink: 0, objectFit: 'cover' }} />
-          ) : (
-            <div style={{ width: 28, height: 28, borderRadius: '50%', background: 'rgba(24,95,165,0.15)', color: '#185FA5', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 11, fontWeight: 500, flexShrink: 0 }}>
-              {initials}
-            </div>
-          )}
+          <UserAvatar src={user?.image} name={user?.name} email={user?.email} size={28} />
           <div style={{ flex: 1, minWidth: 0 }}>
             <div style={{ fontSize: 12, fontWeight: 500, color: 'var(--text)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
               {user?.name ?? user?.email?.split('@')[0] ?? 'User'}
@@ -122,8 +114,3 @@ export function Sidebar({ active, onNav, session }: SidebarProps) {
   )
 }
 
-function getInitials(str: string): string {
-  const parts = str.trim().split(/\s+/)
-  if (parts.length >= 2) return (parts[0][0] + parts[parts.length - 1][0]).toUpperCase()
-  return str.slice(0, 2).toUpperCase()
-}

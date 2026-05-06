@@ -1,49 +1,42 @@
 /**
  * POST /api/ai/score
- *
- * Body: {
- *   resumeContent: ResumeContent   — the resume to score
- *   jobTitle?:     string          — job role name
- *   jobCompany?:   string          — company name
- *   jobDescription?: string        — full JD text (optional but improves accuracy)
- * }
- *
- * Returns: {
- *   score:           number                     0-100 overall match
- *   matchedKeywords: string[]
- *   missingKeywords: string[]
- *   sectionScores:   Record<string, number>
- *   sectionTips:     Record<string, string>
- * }
+ * Body: { resumeContent, jobTitle?, jobCompany?, jobDescription? }
+ * Returns: { score, matchedKeywords, missingKeywords, sectionScores, sectionTips }
  */
 import { NextRequest } from 'next/server'
-import Anthropic from '@anthropic-ai/sdk'
 import { requireAuth, isErrorResponse, ok, err } from '@/lib/api-helpers'
+import { checkRateLimit } from '@/lib/rate-limit'
+import { modelChat, stripFences, resolveConfig } from '@/lib/model-router'
+import { db } from '@/lib/db'
 import type { ResumeContent } from '@/lib/types'
 
-const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY })
-
 export async function POST(req: NextRequest) {
-  const auth = await requireAuth()
+  const auth = await requireAuth(req)
   if (isErrorResponse(auth)) return auth
+
+  const rl = checkRateLimit(`ai:${auth.userId}`)
+  if (!rl.ok) return err(`Rate limit exceeded — retry in ${rl.retryAfter}s`, 429)
 
   const body = await req.json().catch(() => null)
   if (!body) return err('Invalid JSON body')
 
   const { resumeContent, jobTitle, jobCompany, jobDescription } = body as {
-    resumeContent:  ResumeContent
-    jobTitle?:      string
-    jobCompany?:    string
+    resumeContent?:  ResumeContent
+    jobTitle?:       string
+    jobCompany?:     string
     jobDescription?: string
   }
 
-  if (!resumeContent) return err('resumeContent is required')
   if (!jobTitle && !jobDescription) return err('jobTitle or jobDescription is required')
 
-  const resumeText = resumeToText(resumeContent)
+  // Load user's AI config
+  const user  = await db.user.findUnique({ where: { id: auth.userId }, select: { preferences: true } })
+  const prefs = (user?.preferences ?? {}) as Record<string, unknown>
+  const cfg   = resolveConfig((prefs.aiConfig ?? null) as Parameters<typeof resolveConfig>[0])
 
-  const prompt = `You are an expert ATS (Applicant Tracking System) analyzer and career coach.
-Analyze how well the resume matches the job posting.
+  const resumeText = resumeContent ? resumeToText(resumeContent) : '(no resume provided)'
+
+  const prompt = `You are an expert ATS analyzer. Analyze how well the resume matches the job posting.
 
 RESUME:
 ${resumeText}
@@ -51,56 +44,30 @@ ${resumeText}
 JOB: ${jobTitle ?? 'Not specified'} at ${jobCompany ?? 'Not specified'}
 ${jobDescription ? `JOB DESCRIPTION:\n${jobDescription.slice(0, 2000)}` : ''}
 
-Return ONLY a valid JSON object — no markdown, no explanation, raw JSON only:
+Return ONLY a valid JSON object — no markdown, no explanation:
 {
-  "score": <integer 0-100, overall ATS match percentage>,
+  "score": <integer 0-100>,
   "matchedKeywords": ["keyword", ...],
   "missingKeywords": ["keyword", ...],
-  "sectionScores": {
-    "Summary": <integer 0-100>,
-    "Experience": <integer 0-100>,
-    "Skills": <integer 0-100>,
-    "Education": <integer 0-100>
-  },
-  "sectionTips": {
-    "Summary": "<one actionable sentence>",
-    "Experience": "<one actionable sentence>",
-    "Skills": "<one actionable sentence>",
-    "Education": "<one actionable sentence>"
-  }
+  "sectionScores": { "Summary": <0-100>, "Experience": <0-100>, "Skills": <0-100>, "Education": <0-100> },
+  "sectionTips": { "Summary": "<tip>", "Experience": "<tip>", "Skills": "<tip>", "Education": "<tip>" }
 }`
 
   try {
-    const message = await anthropic.messages.create({
-      model:      'claude-sonnet-4-6',
-      max_tokens: 1024,
-      messages:   [{ role: 'user', content: prompt }],
-    })
-
-    const raw  = message.content[0].type === 'text' ? message.content[0].text.trim() : '{}'
-    // Strip possible markdown code fences
-    const json = raw.replace(/^```(?:json)?\n?/, '').replace(/\n?```$/, '').trim()
-    const result = JSON.parse(json)
-    return ok(result)
+    const result = await modelChat([{ role: 'user', content: prompt }], cfg, 1024)
+    const parsed = JSON.parse(stripFences(result.text))
+    return ok({ ...parsed, _model: `${cfg.provider}/${cfg.model}` })
   } catch (e) {
-    console.error('[/api/ai/score] error:', e)
-    return err('AI scoring failed — check ANTHROPIC_API_KEY and try again', 500)
+    console.error('[/api/ai/score]', e)
+    return err(`AI scoring failed (${cfg.provider}/${cfg.model}): ${(e as Error).message}`, 500)
   }
 }
-
-// ── helpers ───────────────────────────────────────────────────────────────────
 
 function resumeToText(r: ResumeContent): string {
   const lines: string[] = []
   lines.push(`Name: ${r.contact?.name ?? ''}`)
   if (r.contact?.location) lines.push(`Location: ${r.contact.location}`)
-  if (r.contact?.email)    lines.push(`Email: ${r.contact.email}`)
-
-  if (r.summary) {
-    lines.push('\nSUMMARY:')
-    lines.push(r.summary)
-  }
-
+  if (r.summary) { lines.push('\nSUMMARY:'); lines.push(r.summary) }
   if (r.experience?.length) {
     lines.push('\nEXPERIENCE:')
     for (const e of r.experience) {
@@ -108,23 +75,10 @@ function resumeToText(r: ResumeContent): string {
       for (const b of (e.bullets ?? [])) lines.push(`  • ${b}`)
     }
   }
-
-  if (r.skills?.length) {
-    lines.push('\nSKILLS:')
-    lines.push(r.skills.join(', '))
-  }
-
+  if (r.skills?.length) { lines.push('\nSKILLS:'); lines.push(r.skills.join(', ')) }
   if (r.education?.length) {
     lines.push('\nEDUCATION:')
-    for (const e of r.education) {
-      lines.push(`${e.degree} — ${e.institution} (${e.year})`)
-    }
+    for (const e of r.education) lines.push(`${e.degree} — ${e.institution} (${e.year})`)
   }
-
-  if (r.languages?.length) {
-    lines.push('\nLANGUAGES:')
-    lines.push(r.languages.map(l => `${l.lang} (${l.level})`).join(', '))
-  }
-
   return lines.join('\n')
 }

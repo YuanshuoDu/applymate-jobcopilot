@@ -1,114 +1,171 @@
-import { useState, useEffect, useCallback } from 'react'
+/**
+ * ApplyMate AI — Side Panel
+ *
+ * Design philosophy:
+ *  • Sidebar = job TRACKER (list of saved jobs, status management)
+ *  • Deliberately different from the hover popup (which is a lightweight preview)
+ *  • Think: a mini Kanban / CRM panel anchored to the side of the browser
+ */
+import { useState, useEffect, useRef } from 'react'
 import { getSettings, isLoggedIn } from '@/lib/storage'
-import { updateJobStatus } from '@/lib/api'
-import type { ScrapedJob, SavedJob, ExtensionSettings } from '@/lib/types'
+import { updateJobStatus, updateJobNotes } from '@/lib/api'
+import type { SavedJob, ExtensionSettings } from '@/lib/types'
 
+// ── Design tokens ─────────────────────────────────────────────────────────────
 const C = {
-  primary: '#185FA5', green: '#3B6D11', red: '#A32D2D', amber: '#854F0B',
-  teal: '#0E7490', bg: '#f8f9fb', bgCard: '#ffffff', border: '#e5e7ef',
-  text: '#1a1a2e', muted: '#6b7280',
+  primary:  '#185FA5',
+  green:    '#3B6D11',
+  red:      '#A32D2D',
+  amber:    '#854F0B',
+  teal:     '#0E7490',
+  bg:       '#f0f4f8',
+  card:     '#ffffff',
+  border:   '#e2e8f0',
+  text:     '#0f172a',
+  muted:    '#64748b',
+  subtle:   '#94a3b8',
 }
 
 const STATUS_OPTS = [
-  { value:'saved',     label:'保存',   color:C.muted    },
-  { value:'applied',   label:'已申请', color:C.primary  },
-  { value:'review',    label:'审核中', color:C.amber    },
-  { value:'interview', label:'面试',   color:C.green    },
-  { value:'offer',     label:'Offer',  color:C.teal     },
-  { value:'rejected',  label:'拒绝',   color:C.red      },
+  { value: 'saved',     label: '已存',   color: C.subtle  },
+  { value: 'applied',   label: '已申请', color: C.primary },
+  { value: 'review',    label: '审核中', color: C.amber   },
+  { value: 'interview', label: '面试',   color: C.teal    },
+  { value: 'offer',     label: 'Offer',  color: C.green   },
+  { value: 'rejected',  label: '已拒绝', color: C.red     },
 ]
 
+function statusColor(s: string) { return STATUS_OPTS.find(o => o.value === s)?.color ?? C.subtle }
+function statusLabel(s: string) { return STATUS_OPTS.find(o => o.value === s)?.label ?? s }
+
+// ── Root ──────────────────────────────────────────────────────────────────────
+
 export function SidePanel() {
-  const [settings,   setSettings]   = useState<ExtensionSettings | null>(null)
-  const [currentJob, setCurrentJob] = useState<ScrapedJob | null>(null)
-  const [recentJobs, setRecentJobs] = useState<SavedJob[]>([])
-  const [tab,        setTab]        = useState<'job' | 'recent' | 'settings'>('job')
-  const [saving,     setSaving]     = useState(false)
-  const [savedJob,   setSavedJob]   = useState<SavedJob | null>(null)
-  const [notes,      setNotes]      = useState('')
-  const [toast,      setToast]      = useState('')
+  const [settings, setSettings] = useState<ExtensionSettings | null>(null)
+
+  useEffect(() => { getSettings().then(setSettings) }, [])
+
+  if (!settings) return <Spinner />
+  if (!isLoggedIn(settings)) return <NotLoggedIn apiBase={settings.apiBaseUrl} />
+
+  return <TrackerPanel settings={settings} />
+}
+
+// ── Main tracker panel ────────────────────────────────────────────────────────
+
+function TrackerPanel({ settings }: { settings: ExtensionSettings }) {
+  const [jobs,        setJobs]        = useState<SavedJob[]>([])
+  const [loading,     setLoading]     = useState(true)
+  const [expandedId,  setExpandedId]  = useState<string | null>(null)
+  const [filterStatus, setFilter]     = useState<string>('all')
+  const [toast,       setToast]       = useState('')
+
+  function showToast(msg: string) { setToast(msg); setTimeout(() => setToast(''), 2500) }
+
+  const loadJobs = () => {
+    chrome.runtime.sendMessage({ type: 'GET_RECENT_JOBS' }, r => {
+      setJobs(r?.jobs ?? [])
+      setLoading(false)
+    })
+  }
 
   useEffect(() => {
-    getSettings().then(setSettings)
-    chrome.storage.local.get('currentJob', r => setCurrentJob(r.currentJob ?? null))
-    chrome.runtime.sendMessage({ type: 'GET_RECENT_JOBS' }, r => setRecentJobs(r?.jobs ?? []))
-
-    // Listen for job updates from content script
-    const handler = (msg: { type: string; job?: ScrapedJob }) => {
-      if (msg.type === 'JOB_SCRAPED' && msg.job) {
-        setCurrentJob(msg.job)
-        setSavedJob(null)
-        setTab('job')
-      }
+    loadJobs()
+    // Refresh when a new job is saved from content script
+    const handler = (msg: { type: string }) => {
+      if (msg.type === 'JOB_SCRAPED' || msg.type === 'JOB_SAVED') loadJobs()
     }
     chrome.runtime.onMessage.addListener(handler)
     return () => chrome.runtime.onMessage.removeListener(handler)
   }, [])
 
-  function showToast(msg: string) {
-    setToast(msg)
-    setTimeout(() => setToast(''), 2500)
-  }
-
-  async function handleSave() {
-    if (!currentJob) return
-    setSaving(true)
-    const res = await chrome.runtime.sendMessage({ type: 'SAVE_JOB', job: currentJob })
-    setSaving(false)
-    if (res?.success) {
-      setSavedJob(res.savedJob)
-      showToast('✓ 已保存到 ApplyMate')
-      chrome.runtime.sendMessage({ type: 'GET_RECENT_JOBS' }, r => setRecentJobs(r?.jobs ?? []))
-    } else {
-      showToast(`✗ ${res?.error ?? '保存失败'}`)
-    }
-  }
-
-  async function handleStatusChange(jobId: string, status: string) {
-    if (!settings) return
-    await updateJobStatus(settings, jobId, status)
-    setSavedJob(prev => prev ? { ...prev, status: status as SavedJob['status'] } : prev)
-    showToast(`状态更新为：${STATUS_OPTS.find(o => o.value === status)?.label}`)
-  }
-
-  if (!settings) return <div style={{ padding:20, color:C.muted }}>加载中…</div>
-  if (!isLoggedIn(settings)) return <NotLoggedIn apiBase={settings.apiBaseUrl} />
+  const filtered = filterStatus === 'all' ? jobs : jobs.filter(j => j.status === filterStatus)
 
   return (
-    <div style={{ display:'flex', flexDirection:'column', height:'100vh', background:C.bg }}>
-      {/* Header */}
-      <div style={{ padding:'12px 16px', background:C.bgCard, borderBottom:`1px solid ${C.border}`, display:'flex', alignItems:'center', gap:10 }}>
-        <div style={{ width:22, height:22, borderRadius:5, background:C.primary, display:'flex', alignItems:'center', justifyContent:'center', color:'#fff', fontSize:11, fontWeight:700 }}>A</div>
-        <div style={{ flex:1 }}>
-          <div style={{ fontSize:13, fontWeight:600 }}>ApplyMate AI</div>
-          <div style={{ fontSize:10, color:C.muted }}>{settings.userEmail}</div>
+    <div style={{ display: 'flex', flexDirection: 'column', height: '100vh', background: C.bg, fontFamily: '-apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif' }}>
+
+      {/* ── Header ── */}
+      <div style={{ background: C.primary, padding: '14px 16px', display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+          <div style={{ width: 28, height: 28, borderRadius: 7, background: 'rgba(255,255,255,0.2)', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 13, fontWeight: 700, color: '#fff' }}>A</div>
+          <div>
+            <div style={{ fontSize: 13, fontWeight: 600, color: '#fff', lineHeight: 1.2 }}>ApplyMate</div>
+            <div style={{ fontSize: 10, color: 'rgba(255,255,255,0.7)', lineHeight: 1.2 }}>{jobs.length} 个职位已跟踪</div>
+          </div>
         </div>
-        <a href={settings.apiBaseUrl} target="_blank" rel="noreferrer" style={{ fontSize:11, color:C.primary, textDecoration:'none' }}>Dashboard ↗</a>
+        <a href={settings.apiBaseUrl} target="_blank" rel="noreferrer"
+          style={{ fontSize: 11, color: 'rgba(255,255,255,0.8)', textDecoration: 'none', background: 'rgba(255,255,255,0.15)', padding: '4px 8px', borderRadius: 5 }}>
+          Web 端 ↗
+        </a>
       </div>
 
-      {/* Tabs */}
-      <div style={{ display:'flex', background:C.bgCard, borderBottom:`1px solid ${C.border}` }}>
-        {([['job','当前职位'],['recent','最近'],['settings','设置']] as const).map(([t, label]) => (
-          <button key={t} onClick={() => setTab(t)} style={{
-            flex:1, padding:'9px 0', border:'none', background:'transparent',
-            fontSize:12, fontWeight: tab===t ? 600 : 400,
-            color: tab===t ? C.primary : C.muted,
-            borderBottom: tab===t ? `2px solid ${C.primary}` : '2px solid transparent',
-            cursor:'pointer',
-          }}>{label}</button>
+      {/* ── Status filter strip ── */}
+      <div style={{ background: C.card, borderBottom: `1px solid ${C.border}`, padding: '0 12px', display: 'flex', gap: 2, overflowX: 'auto' }}>
+        {[{ value: 'all', label: '全部' }, ...STATUS_OPTS].map(opt => (
+          <button key={opt.value} onClick={() => setFilter(opt.value)} style={{
+            padding: '8px 10px', border: 'none', background: 'transparent', cursor: 'pointer',
+            fontSize: 11, fontWeight: filterStatus === opt.value ? 600 : 400, whiteSpace: 'nowrap',
+            color: filterStatus === opt.value ? C.primary : C.muted,
+            borderBottom: filterStatus === opt.value ? `2px solid ${C.primary}` : '2px solid transparent',
+            transition: 'all 0.1s',
+          }}>
+            {'color' in opt ? (
+              <span style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}>
+                <span style={{ width: 6, height: 6, borderRadius: '50%', background: (opt as typeof STATUS_OPTS[0]).color, display: 'inline-block' }} />
+                {opt.label}
+              </span>
+            ) : opt.label}
+          </button>
         ))}
       </div>
 
-      {/* Content */}
-      <div style={{ flex:1, overflowY:'auto', padding:16 }}>
-        {tab === 'job'      && <JobTab job={currentJob} saving={saving} savedJob={savedJob} notes={notes} onNotes={setNotes} onSave={handleSave} onStatusChange={handleStatusChange} />}
-        {tab === 'recent'   && <RecentTab jobs={recentJobs} />}
-        {tab === 'settings' && <SettingsTab settings={settings} onUpdate={s => setSettings(s)} />}
+      {/* ── Job list ── */}
+      <div style={{ flex: 1, overflowY: 'auto', padding: '10px 10px' }}>
+        {loading ? (
+          <Spinner />
+        ) : filtered.length === 0 ? (
+          <EmptyState filter={filterStatus} />
+        ) : (
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+            {filtered.map(job => (
+              <JobCard
+                key={job.id}
+                job={job}
+                expanded={expandedId === job.id}
+                onToggle={() => setExpandedId(prev => prev === job.id ? null : job.id)}
+                settings={settings}
+                onStatusChange={async (id, status) => {
+                  await updateJobStatus(settings, id, status)
+                  setJobs(prev => prev.map(j => j.id === id ? { ...j, status: status as SavedJob['status'] } : j))
+                  showToast(`状态 → ${statusLabel(status)}`)
+                }}
+                showToast={showToast}
+              />
+            ))}
+          </div>
+        )}
       </div>
 
-      {/* Toast */}
+      {/* ── Footer ── */}
+      <div style={{ background: C.card, borderTop: `1px solid ${C.border}`, padding: '10px 12px', display: 'flex', gap: 8 }}>
+        <button onClick={loadJobs} style={{
+          flex: 1, padding: '8px', background: C.bg, border: `1px solid ${C.border}`,
+          borderRadius: 6, fontSize: 11, cursor: 'pointer', color: C.muted,
+        }}>↺ 刷新</button>
+        <button onClick={() => chrome.tabs.create({ url: settings.apiBaseUrl })} style={{
+          flex: 2, padding: '8px', background: C.primary, border: 'none',
+          borderRadius: 6, fontSize: 11, fontWeight: 500, cursor: 'pointer', color: '#fff',
+        }}>完整管理界面 →</button>
+      </div>
+
+      {/* ── Toast ── */}
       {toast && (
-        <div style={{ position:'fixed', bottom:16, left:'50%', transform:'translateX(-50%)', background:'#1a1a2e', color:'#fff', padding:'8px 16px', borderRadius:8, fontSize:12, zIndex:9999, whiteSpace:'nowrap' }}>
+        <div style={{
+          position: 'fixed', bottom: 60, left: '50%', transform: 'translateX(-50%)',
+          background: '#1a1a2e', color: '#fff', padding: '7px 14px',
+          borderRadius: 8, fontSize: 11, zIndex: 9999, whiteSpace: 'nowrap',
+          boxShadow: '0 4px 12px rgba(0,0,0,0.25)',
+        }}>
           {toast}
         </div>
       )}
@@ -116,248 +173,186 @@ export function SidePanel() {
   )
 }
 
-// ── Job Tab ───────────────────────────────────────────────────
+// ── Job card (expandable) ─────────────────────────────────────────────────────
 
-function JobTab({ job, saving, savedJob, notes, onNotes, onSave, onStatusChange }: {
-  job: ScrapedJob | null; saving: boolean; savedJob: SavedJob | null
-  notes: string; onNotes: (v:string) => void
-  onSave: () => void; onStatusChange: (id:string, status:string) => void
+function JobCard({ job, expanded, onToggle, settings, onStatusChange, showToast }: {
+  job: SavedJob
+  expanded: boolean
+  onToggle: () => void
+  settings: ExtensionSettings
+  onStatusChange: (id: string, status: string) => void
+  showToast: (msg: string) => void
 }) {
-  const [scoreLoading, setScoreLoading] = useState(false)
-  const [score, setScore] = useState<number | null>(null)
-  const [scoreKeywords, setScoreKeywords] = useState<string[]>([])
-  const [scoreError, setScoreError] = useState('')
+  const sColor = statusColor(job.status)
+  const sLabel = statusLabel(job.status)
+  const [notes, setNotes]           = useState(job.notes ?? '')
+  const [notesSaving, setNSaving]   = useState(false)
+  const notesTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
 
-  const fetchScore = useCallback(async () => {
-    if (!job) return
-    setScoreLoading(true)
-    setScoreError('')
-    try {
-      const settings = await getSettings()
-      const res = await fetch(`${settings.apiBaseUrl}/api/ai/score`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${settings.apiToken}` },
-        body: JSON.stringify({ jobTitle: job.title, jobCompany: job.company, jobDescription: job.description }),
-        signal: AbortSignal.timeout(12_000),
-      })
-      if (res.ok) {
-        const data = await res.json()
-        setScore(data.score)
-        setScoreKeywords(data.matchedKeywords ?? [])
-      } else {
-        setScoreError('AI scoring unavailable')
-      }
-    } catch {
-      setScoreError('AI scoring unavailable')
-    } finally {
-      setScoreLoading(false)
-    }
-  }, [job])
-
+  // Auto-save notes with debounce
   useEffect(() => {
-    if (job) { setScore(null); setScoreKeywords([]); fetchScore() }
-  }, [job, fetchScore])
-
-  if (!job) return (
-    <div style={{ textAlign:'center', padding:'40px 0', color:C.muted }}>
-      <div style={{ fontSize:36, marginBottom:12 }}>🔍</div>
-      <div style={{ fontSize:13, lineHeight:1.8 }}>
-        请在 LinkedIn、Indeed 或 Glassdoor<br />上打开一个职位页面
-      </div>
-    </div>
-  )
-
-  const scoreColor = score != null ? (score >= 80 ? C.green : score >= 60 ? C.amber : C.red) : C.muted
+    if (!expanded) return
+    if (notesTimer.current) clearTimeout(notesTimer.current)
+    notesTimer.current = setTimeout(async () => {
+      setNSaving(true)
+      try { await updateJobNotes(settings, job.id, notes) }
+      finally { setNSaving(false) }
+    }, 1200)
+    return () => { if (notesTimer.current) clearTimeout(notesTimer.current) }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [notes])
 
   return (
-    <div style={{ display:'flex', flexDirection:'column', gap:14 }}>
-      {/* Job card */}
-      <div style={{ background:C.bgCard, borderRadius:10, padding:14, border:`1px solid ${C.border}` }}>
-        <div style={{ display:'flex', gap:12, alignItems:'flex-start', marginBottom:12 }}>
-          <div style={{ width:42, height:42, borderRadius:8, background:'rgba(24,95,165,0.1)', color:C.primary, display:'flex', alignItems:'center', justifyContent:'center', fontSize:13, fontWeight:700, flexShrink:0 }}>
-            {job.company.slice(0,2).toUpperCase()}
-          </div>
-          <div style={{ flex:1 }}>
-            <div style={{ fontSize:14, fontWeight:600, lineHeight:1.3, marginBottom:3 }}>{job.title}</div>
-            <div style={{ fontSize:12, color:C.muted, marginBottom:3 }}>{job.company}</div>
-            {job.location && <div style={{ fontSize:11, color:C.muted }}>📍 {job.location}</div>}
-            {job.salary   && <div style={{ fontSize:11, color:C.green, marginTop:2 }}>💰 {job.salary}</div>}
-          </div>
-          <span style={{ fontSize:10, background:'rgba(24,95,165,0.1)', color:C.primary, borderRadius:999, padding:'3px 8px' }}>{job.source}</span>
-        </div>
+    <div style={{ background: C.card, borderRadius: 10, border: `1px solid ${C.border}`, overflow: 'hidden', transition: 'box-shadow 0.15s' }}>
 
-        {/* AI Match Score — real API */}
-        <div style={{ background:`rgba(${scoreColor === C.green ? '59,109,17' : scoreColor === C.amber ? '133,79,11' : '24,95,165'},0.06)`, borderRadius:8, padding:'10px 12px' }}>
-          <div style={{ display:'flex', justifyContent:'space-between', marginBottom:6 }}>
-            <span style={{ fontSize:11, fontWeight:500 }}>AI 匹配度</span>
-            {scoreLoading ? (
-              <span style={{ fontSize:13, fontWeight:700, color:C.muted }}>…</span>
-            ) : score != null ? (
-              <span style={{ fontSize:18, fontWeight:700, color:scoreColor }}>{score}%</span>
-            ) : (
-              <span style={{ fontSize:13, fontWeight:700, color:C.muted }}>{scoreError || '—'}</span>
-            )}
-          </div>
-          {score != null && (
-            <>
-              <div style={{ height:4, background:C.border, borderRadius:2 }}>
-                <div style={{ width:`${score}%`, height:'100%', background:scoreColor, borderRadius:2, transition:'width 0.5s' }} />
-              </div>
-              {scoreKeywords.length > 0 && (
-                <div style={{ display:'flex', flexWrap:'wrap', gap:3, marginTop:6 }}>
-                  {scoreKeywords.slice(0,4).map(kw => (
-                    <span key={kw} style={{ fontSize:9, background:'rgba(24,95,165,0.1)', color:C.primary, borderRadius:999, padding:'2px 6px' }}>{kw}</span>
-                  ))}
-                </div>
-              )}
-            </>
-          )}
-          {scoreError && <div style={{ fontSize:10, color:C.muted, marginTop:4 }}>需配置 ANTHROPIC_API_KEY</div>}
-        </div>
-      </div>
-
-      {/* Status selector (only after saving) */}
-      {savedJob && (
-        <div style={{ background:C.bgCard, borderRadius:10, padding:14, border:`1px solid ${C.border}` }}>
-          <div style={{ fontSize:12, fontWeight:500, marginBottom:10 }}>申请状态</div>
-          <div style={{ display:'grid', gridTemplateColumns:'repeat(3,1fr)', gap:6 }}>
-            {STATUS_OPTS.map(opt => (
-              <button key={opt.value} onClick={() => onStatusChange(savedJob.id, opt.value)} style={{
-                padding:'7px 4px', border:`1.5px solid ${savedJob.status === opt.value ? opt.color : C.border}`,
-                background: savedJob.status === opt.value ? `${opt.color}12` : 'transparent',
-                borderRadius:6, fontSize:11, fontWeight: savedJob.status === opt.value ? 600 : 400,
-                color: savedJob.status === opt.value ? opt.color : C.muted, cursor:'pointer',
-              }}>{opt.label}</button>
-            ))}
-          </div>
-        </div>
-      )}
-
-      {/* Notes */}
-      <div style={{ background:C.bgCard, borderRadius:10, padding:14, border:`1px solid ${C.border}` }}>
-        <div style={{ fontSize:12, fontWeight:500, marginBottom:8 }}>备注</div>
-        <textarea
-          value={notes} onChange={e => onNotes(e.target.value)}
-          placeholder="记录面试题、薪资谈判、联系人…"
-          style={{ width:'100%', height:80, padding:'8px 10px', border:`1px solid ${C.border}`, borderRadius:6, fontSize:12, resize:'vertical', outline:'none', fontFamily:'inherit', color:C.text }}
-        />
-      </div>
-
-      {/* Save button */}
-      {!savedJob ? (
-        <button onClick={onSave} disabled={saving} style={{
-          width:'100%', padding:'11px', background:C.primary, color:'#fff', border:'none', borderRadius:8,
-          fontSize:13, fontWeight:500, cursor: saving ? 'not-allowed' : 'pointer', opacity: saving ? 0.7 : 1,
+      {/* ── Card header (always visible) ── */}
+      <div
+        onClick={onToggle}
+        style={{ padding: '11px 12px', cursor: 'pointer', display: 'flex', gap: 10, alignItems: 'flex-start' }}
+      >
+        {/* Company logo */}
+        <div style={{
+          width: 36, height: 36, borderRadius: 8, flexShrink: 0,
+          background: `${sColor}18`, color: sColor,
+          display: 'flex', alignItems: 'center', justifyContent: 'center',
+          fontSize: 11, fontWeight: 700,
         }}>
-          {saving ? '保存中…' : '⊕ 保存到 ApplyMate'}
-        </button>
-      ) : (
-        <div style={{ textAlign:'center', fontSize:12, color:C.green, fontWeight:500 }}>✓ 已保存到 ApplyMate</div>
-      )}
+          {job.company.slice(0, 2).toUpperCase()}
+        </div>
 
-      {/* Description preview */}
-      {job.description && (
-        <div style={{ background:C.bgCard, borderRadius:10, padding:14, border:`1px solid ${C.border}` }}>
-          <div style={{ fontSize:12, fontWeight:500, marginBottom:8 }}>职位描述</div>
-          <div style={{ fontSize:11, color:C.muted, lineHeight:1.7, maxHeight:200, overflowY:'auto', whiteSpace:'pre-wrap' }}>
-            {job.description.slice(0, 800)}{job.description.length > 800 ? '…' : ''}
+        <div style={{ flex: 1, minWidth: 0 }}>
+          <div style={{ fontSize: 13, fontWeight: 600, color: C.text, lineHeight: 1.3, marginBottom: 2, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+            {job.role}
+          </div>
+          <div style={{ fontSize: 11, color: C.muted, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+            {job.company}{job.location ? ` · ${job.location}` : ''}
           </div>
         </div>
-      )}
-    </div>
-  )
-}
 
-// ── Recent Tab ────────────────────────────────────────────────
+        <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-end', gap: 4, flexShrink: 0 }}>
+          <span style={{ fontSize: 10, fontWeight: 500, color: sColor, background: `${sColor}14`, borderRadius: 999, padding: '2px 7px' }}>
+            {sLabel}
+          </span>
+          {job.score != null && (
+            <span style={{ fontSize: 11, fontWeight: 700, color: job.score >= 80 ? C.green : job.score >= 60 ? C.amber : C.red }}>
+              {job.score}%
+            </span>
+          )}
+          <span style={{ fontSize: 9, color: C.subtle }}>{expanded ? '▲' : '▼'}</span>
+        </div>
+      </div>
 
-function RecentTab({ jobs }: { jobs: SavedJob[] }) {
-  if (!jobs.length) return <div style={{ textAlign:'center', color:C.muted, padding:'40px 0', fontSize:13 }}>暂无保存记录</div>
-  return (
-    <div style={{ display:'flex', flexDirection:'column', gap:10 }}>
-      {jobs.map(job => {
-        const sOpt = STATUS_OPTS.find(o => o.value === job.status)
-        return (
-          <div key={job.id} style={{ background:C.bgCard, borderRadius:10, padding:12, border:`1px solid ${C.border}` }}>
-            <div style={{ display:'flex', justifyContent:'space-between', alignItems:'flex-start', gap:8 }}>
-              <div style={{ flex:1, minWidth:0 }}>
-                <div style={{ fontSize:13, fontWeight:500, overflow:'hidden', textOverflow:'ellipsis', whiteSpace:'nowrap' }}>{job.role}</div>
-                <div style={{ fontSize:11, color:C.muted }}>{job.company}</div>
-                {job.location && <div style={{ fontSize:10, color:C.muted, marginTop:2 }}>📍 {job.location}</div>}
-              </div>
-              <span style={{ fontSize:10, background:`${sOpt?.color ?? C.muted}18`, color: sOpt?.color ?? C.muted, borderRadius:999, padding:'3px 8px', flexShrink:0 }}>
-                {sOpt?.label}
-              </span>
+      {/* ── Expanded detail ── */}
+      {expanded && (
+        <div style={{ borderTop: `1px solid ${C.border}`, padding: '12px 12px', display: 'flex', flexDirection: 'column', gap: 12 }}>
+
+          {/* Status selector */}
+          <div>
+            <div style={{ fontSize: 10, fontWeight: 600, color: C.muted, textTransform: 'uppercase', letterSpacing: '0.06em', marginBottom: 6 }}>申请状态</div>
+            <div style={{ display: 'flex', flexWrap: 'wrap', gap: 5 }}>
+              {STATUS_OPTS.map(opt => (
+                <button key={opt.value} onClick={() => onStatusChange(job.id, opt.value)} style={{
+                  padding: '5px 10px', borderRadius: 999, border: `1.5px solid ${job.status === opt.value ? opt.color : C.border}`,
+                  background: job.status === opt.value ? `${opt.color}14` : 'transparent',
+                  color: job.status === opt.value ? opt.color : C.muted,
+                  fontSize: 11, fontWeight: job.status === opt.value ? 600 : 400, cursor: 'pointer',
+                }}>
+                  {opt.label}
+                </button>
+              ))}
             </div>
           </div>
-        )
-      })}
+
+          {/* Notes */}
+          <div>
+            <div style={{ fontSize: 10, fontWeight: 600, color: C.muted, textTransform: 'uppercase', letterSpacing: '0.06em', marginBottom: 6, display: 'flex', justifyContent: 'space-between' }}>
+              <span>备注</span>
+              {notesSaving && <span style={{ textTransform: 'none', fontWeight: 400 }}>保存中…</span>}
+              {!notesSaving && notes && <span style={{ color: C.green, textTransform: 'none', fontWeight: 400 }}>✓ 已保存</span>}
+            </div>
+            <textarea
+              value={notes}
+              onChange={e => setNotes(e.target.value)}
+              placeholder="记录面试题、薪资、联系人…"
+              style={{
+                width: '100%', height: 70, padding: '7px 9px', resize: 'vertical',
+                border: `1px solid ${C.border}`, borderRadius: 6, fontSize: 11,
+                fontFamily: 'inherit', color: C.text, outline: 'none', background: C.bg,
+              }}
+            />
+          </div>
+
+          {/* Actions */}
+          <div style={{ display: 'flex', gap: 8 }}>
+            {job.url && (
+              <a href={job.url} target="_blank" rel="noreferrer" style={{
+                flex: 1, padding: '7px 0', textAlign: 'center', background: C.bg,
+                border: `1px solid ${C.border}`, borderRadius: 6, fontSize: 11,
+                color: C.primary, textDecoration: 'none',
+              }}>
+                查看原帖 ↗
+              </a>
+            )}
+            <a href={`${settings.apiBaseUrl}?job=${job.id}`} target="_blank" rel="noreferrer" style={{
+              flex: 1, padding: '7px 0', textAlign: 'center', background: C.primary,
+              borderRadius: 6, fontSize: 11, fontWeight: 500, color: '#fff', textDecoration: 'none',
+            }}>
+              详细编辑 →
+            </a>
+          </div>
+        </div>
+      )}
     </div>
   )
 }
 
-// ── Settings Tab ──────────────────────────────────────────────
+// ── Empty state ───────────────────────────────────────────────────────────────
 
-function SettingsTab({ settings, onUpdate }: { settings: ExtensionSettings; onUpdate: (s: ExtensionSettings) => void }) {
-  const [apiUrl, setApiUrl] = useState(settings.apiBaseUrl)
-  const [saved,  setSaved]  = useState(false)
-
-  async function handleSave() {
-    const next = { ...settings, apiBaseUrl: apiUrl }
-    const { saveSettings } = await import('@/lib/storage')
-    await saveSettings(next)
-    onUpdate(next)
-    setSaved(true)
-    setTimeout(() => setSaved(false), 2000)
-  }
-
+function EmptyState({ filter }: { filter: string }) {
   return (
-    <div style={{ display:'flex', flexDirection:'column', gap:14 }}>
-      <Section title="后端地址">
-        <input
-          type="url" value={apiUrl} onChange={e => setApiUrl(e.target.value)}
-          style={{ width:'100%', padding:'9px 11px', border:`1px solid ${C.border}`, borderRadius:7, fontSize:12, color:C.text, outline:'none' }}
-        />
-        <div style={{ fontSize:11, color:C.muted, marginTop:6 }}>开发时填 http://localhost:3000</div>
-        <button onClick={handleSave} style={{ marginTop:10, padding:'8px 14px', background:C.primary, color:'#fff', border:'none', borderRadius:6, fontSize:12, cursor:'pointer' }}>
-          {saved ? '✓ 已保存' : '保存'}
-        </button>
-      </Section>
-
-      <Section title="账号">
-        <div style={{ fontSize:12, color:C.muted, marginBottom:8 }}>{settings.userEmail || '未登录'}</div>
-        <button
-          onClick={async () => { const { clearAuth } = await import('@/lib/storage'); await clearAuth() }}
-          style={{ padding:'7px 14px', background:'transparent', border:`1px solid ${C.border}`, borderRadius:6, fontSize:12, cursor:'pointer', color:C.text }}
-        >
-          退出登录
-        </button>
-      </Section>
-
-      <Section title="版本">
-        <div style={{ fontSize:11, color:C.muted }}>ApplyMate AI Extension v0.1.0</div>
-      </Section>
+    <div style={{ textAlign: 'center', padding: '48px 16px', color: C.muted }}>
+      <div style={{ fontSize: 32, marginBottom: 12 }}>
+        {filter === 'all' ? '📋' : '🔍'}
+      </div>
+      <div style={{ fontSize: 13, fontWeight: 500, marginBottom: 6, color: C.text }}>
+        {filter === 'all' ? '还没有保存的职位' : `没有「${statusLabel(filter)}」的职位`}
+      </div>
+      <div style={{ fontSize: 11, lineHeight: 1.7 }}>
+        {filter === 'all'
+          ? '在 LinkedIn 或 Indeed 上悬停职位卡片\n点击 ⊕ 按钮保存'
+          : '换个状态看看，或在搜索页面保存新职位'}
+      </div>
     </div>
   )
 }
 
-function Section({ title, children }: { title: string; children: React.ReactNode }) {
-  return (
-    <div style={{ background:C.bgCard, borderRadius:10, padding:14, border:`1px solid ${C.border}` }}>
-      <div style={{ fontSize:12, fontWeight:600, marginBottom:10, color:C.text }}>{title}</div>
-      {children}
-    </div>
-  )
-}
+// ── Not logged in ─────────────────────────────────────────────────────────────
 
 function NotLoggedIn({ apiBase }: { apiBase: string }) {
   return (
-    <div style={{ display:'flex', flexDirection:'column', alignItems:'center', justifyContent:'center', height:'100vh', gap:12, padding:24, textAlign:'center' }}>
-      <div style={{ fontSize:40 }}>🔐</div>
-      <div style={{ fontSize:14, fontWeight:600 }}>请先登录</div>
-      <div style={{ fontSize:12, color:C.muted, lineHeight:1.6 }}>在插件弹窗里输入你的<br />ApplyMate 账号</div>
-      <a href={apiBase} target="_blank" rel="noreferrer" style={{ padding:'9px 20px', background:C.primary, color:'#fff', borderRadius:8, textDecoration:'none', fontSize:12, fontWeight:500 }}>
+    <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', height: '100vh', gap: 14, padding: 28, textAlign: 'center', background: C.bg }}>
+      <div style={{ width: 52, height: 52, borderRadius: 14, background: C.primary, display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 24, color: '#fff' }}>A</div>
+      <div>
+        <div style={{ fontSize: 15, fontWeight: 600, marginBottom: 6, color: C.text }}>ApplyMate AI</div>
+        <div style={{ fontSize: 12, color: C.muted, lineHeight: 1.7 }}>请先在插件弹窗中登录<br />才能使用职位跟踪功能</div>
+      </div>
+      <a href={apiBase} target="_blank" rel="noreferrer" style={{
+        padding: '10px 24px', background: C.primary, color: '#fff',
+        borderRadius: 8, textDecoration: 'none', fontSize: 12, fontWeight: 500,
+      }}>
         打开 ApplyMate →
       </a>
+    </div>
+  )
+}
+
+// ── Spinner ───────────────────────────────────────────────────────────────────
+
+function Spinner() {
+  return (
+    <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', height: 200 }}>
+      <div style={{ width: 20, height: 20, border: `2px solid ${C.border}`, borderTopColor: C.primary, borderRadius: '50%', animation: 'spin 0.7s linear infinite' }} />
+      <style>{`@keyframes spin { to { transform: rotate(360deg) } }`}</style>
     </div>
   )
 }

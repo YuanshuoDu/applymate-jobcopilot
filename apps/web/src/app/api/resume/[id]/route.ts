@@ -31,7 +31,7 @@ export async function PATCH(req: NextRequest, { params }: Params) {
   const body = await req.json().catch(() => null)
   if (!body) return err('Invalid JSON body')
 
-  const { name, content, templateId, isDefault } = body
+  const { name, content, templateId, templateOptions, isDefault } = body
 
   if (isDefault && !existing.isDefault) {
     await db.resume.updateMany({
@@ -43,10 +43,11 @@ export async function PATCH(req: NextRequest, { params }: Params) {
   const resume = await db.resume.update({
     where: { id },
     data: {
-      ...(name        !== undefined ? { name }        : {}),
-      ...(content     !== undefined ? { content }     : {}),
-      ...(templateId  !== undefined ? { templateId }  : {}),
-      ...(isDefault   !== undefined ? { isDefault }   : {}),
+      ...(name            !== undefined ? { name }            : {}),
+      ...(content         !== undefined ? { content }         : {}),
+      ...(templateId      !== undefined ? { templateId }      : {}),
+      ...(templateOptions !== undefined ? { templateOptions } : {}),
+      ...(isDefault       !== undefined ? { isDefault }       : {}),
     },
   })
 

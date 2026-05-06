@@ -55,6 +55,7 @@ if (process.env.AUTH_GITHUB_ID && process.env.AUTH_GITHUB_SECRET) {
 export const { handlers, signIn, signOut, auth } = NextAuth({
   adapter: PrismaAdapter(db),
   providers,
+  trustHost: true,
   session: { strategy: 'jwt' },
   callbacks: {
     async jwt({ token, user }) {

@@ -28,6 +28,7 @@ export interface SavedJob {
   status:    JobStatus
   score:     number | null
   salary:    string | null
+  notes:     string | null
   createdAt: string
   url:       string | null
 }

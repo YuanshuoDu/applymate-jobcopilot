@@ -94,7 +94,7 @@ export async function saveJob(
 
 export async function getRecentJobs(settings: ExtensionSettings): Promise<SavedJob[]> {
   const data = await request<{ jobs: SavedJob[]; total: number }>(
-    settings, '/api/jobs?pageSize=5',
+    settings, '/api/jobs?pageSize=20',
   )
   return data.jobs
 }
@@ -107,6 +107,17 @@ export async function updateJobStatus(
   return request<SavedJob>(settings, `/api/jobs/${jobId}`, {
     method: 'PATCH',
     body: JSON.stringify({ status }),
+  })
+}
+
+export async function updateJobNotes(
+  settings: ExtensionSettings,
+  jobId: string,
+  notes: string,
+): Promise<SavedJob> {
+  return request<SavedJob>(settings, `/api/jobs/${jobId}`, {
+    method: 'PATCH',
+    body: JSON.stringify({ notes }),
   })
 }
 

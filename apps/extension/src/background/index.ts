@@ -55,10 +55,15 @@ async function handleMessage(msg: ExtMessage): Promise<unknown> {
       if (!settings.apiToken) {
         return { type: 'SAVE_JOB_RESULT', success: false, error: 'Not logged in' }
       }
-      const savedJob = await saveJob(settings, msg.job)
-      setBadge('✓', '#3B6D11')
-      setTimeout(clearBadge, 3000)
-      return { type: 'SAVE_JOB_RESULT', success: true, savedJob }
+      try {
+        const savedJob = await saveJob(settings, msg.job)
+        setBadge('✓', '#3B6D11')
+        setTimeout(clearBadge, 3000)
+        return { type: 'SAVE_JOB_RESULT', success: true, savedJob }
+      } catch (err) {
+        const error = err instanceof Error ? err.message : String(err)
+        return { type: 'SAVE_JOB_RESULT', success: false, error }
+      }
     }
 
     // ── Get recent jobs ───────────────────────────────────────

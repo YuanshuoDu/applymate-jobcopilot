@@ -2,7 +2,7 @@
 
 import React, { useMemo, useState, useEffect, useRef } from 'react'
 import { TopBar } from '@/components/layout/TopBar'
-import { Btn, Card, CompanyLogo, ScorePill, StatusBadge, useToast } from '@/components/ui'
+import { Btn, Card, CompanyLogo, INPUT_STYLE, ScorePill, StatusBadge, useToast, useConfirm } from '@/components/ui'
 import type { Job, JobStatus, Activity } from '@/lib/types'
 import { apiMutate, fmtDate, fmtRelative } from '@/lib/hooks'
 
@@ -95,9 +95,10 @@ function ListView({ jobs, onRowClick }: { jobs: Job[]; onRowClick: (job: Job) =>
 }
 
 // ── KanbanView ────────────────────────────────────────────────────────────────
-function KanbanView({ jobs, onStatusChange }: {
+function KanbanView({ jobs, onStatusChange, onAddClick }: {
   jobs: Job[]
   onStatusChange: (id: string, status: JobStatus) => void
+  onAddClick: (status: JobStatus) => void
 }) {
   const toast  = useToast()
   const dragId = useRef<string | null>(null)
@@ -169,9 +170,9 @@ function KanbanView({ jobs, onStatusChange }: {
             </div>
           ))}
           <button
-            onClick={() => toast.info('Add job to ' + COL_LABELS[col])}
+            onClick={() => onAddClick(col)}
             style={{ width: '100%', padding: '6px 0', border: '0.5px dashed var(--border)', borderRadius: 6, background: 'transparent', color: 'var(--text-muted)', fontSize: 11, cursor: 'pointer' }}>
-            + Add job
+            + Add {COL_LABELS[col]}
           </button>
         </div>
       ))}
@@ -225,19 +226,15 @@ function ApplyBasket({ cart, onRemove, onClose }: {
 }
 
 // ── AddJobModal ───────────────────────────────────────────────────────────────
-function AddJobModal({ onClose, onAdded }: {
+function AddJobModal({ onClose, onAdded, prefillStatus }: {
   onClose: () => void
   onAdded: (job: Job) => void
+  prefillStatus?: JobStatus | null
 }) {
   const toast  = useToast()
-  const [form, setForm] = useState({ company: '', role: '', location: '', url: '', salary: '', status: 'saved' as JobStatus })
+  const [form, setForm] = useState({ company: '', role: '', location: '', url: '', salary: '', status: (prefillStatus ?? 'saved') as JobStatus })
   const [saving, setSaving] = useState(false)
 
-  const inputSt: React.CSSProperties = {
-    width: '100%', padding: '7px 10px', fontSize: 12,
-    border: '0.5px solid var(--border)', borderRadius: 6,
-    background: 'var(--bg)', color: 'var(--text)', outline: 'none', boxSizing: 'border-box',
-  }
   const labelSt: React.CSSProperties = { fontSize: 11, color: 'var(--text-muted)', marginBottom: 4, display: 'block' }
 
   async function handleSubmit(e: React.FormEvent) {
@@ -267,30 +264,30 @@ function AddJobModal({ onClose, onAdded }: {
           <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12 }}>
             <div>
               <label style={labelSt}>Company *</label>
-              <input style={inputSt} value={form.company} onChange={e => setForm(f => ({ ...f, company: e.target.value }))} placeholder="e.g. Stripe" />
+              <input style={INPUT_STYLE} value={form.company} onChange={e => setForm(f => ({ ...f, company: e.target.value }))} placeholder="e.g. Stripe" />
             </div>
             <div>
               <label style={labelSt}>Role *</label>
-              <input style={inputSt} value={form.role} onChange={e => setForm(f => ({ ...f, role: e.target.value }))} placeholder="e.g. Backend Engineer" />
+              <input style={INPUT_STYLE} value={form.role} onChange={e => setForm(f => ({ ...f, role: e.target.value }))} placeholder="e.g. Backend Engineer" />
             </div>
           </div>
           <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12 }}>
             <div>
               <label style={labelSt}>Location</label>
-              <input style={inputSt} value={form.location} onChange={e => setForm(f => ({ ...f, location: e.target.value }))} placeholder="e.g. Amsterdam, NL" />
+              <input style={INPUT_STYLE} value={form.location} onChange={e => setForm(f => ({ ...f, location: e.target.value }))} placeholder="e.g. Amsterdam, NL" />
             </div>
             <div>
               <label style={labelSt}>Salary</label>
-              <input style={inputSt} value={form.salary} onChange={e => setForm(f => ({ ...f, salary: e.target.value }))} placeholder="e.g. €70k–90k" />
+              <input style={INPUT_STYLE} value={form.salary} onChange={e => setForm(f => ({ ...f, salary: e.target.value }))} placeholder="e.g. €70k–90k" />
             </div>
           </div>
           <div>
             <label style={labelSt}>Job URL</label>
-            <input style={inputSt} value={form.url} onChange={e => setForm(f => ({ ...f, url: e.target.value }))} placeholder="https://…" />
+            <input style={INPUT_STYLE} value={form.url} onChange={e => setForm(f => ({ ...f, url: e.target.value }))} placeholder="https://…" />
           </div>
           <div>
             <label style={labelSt}>Initial status</label>
-            <select style={{ ...inputSt }} value={form.status} onChange={e => setForm(f => ({ ...f, status: e.target.value as JobStatus }))}>
+            <select style={INPUT_STYLE} value={form.status} onChange={e => setForm(f => ({ ...f, status: e.target.value as JobStatus }))}>
               {KANBAN_COLS.map(c => <option key={c} value={c}>{COL_LABELS[c]}</option>)}
             </select>
           </div>
@@ -318,8 +315,10 @@ function JobDetailDrawer({ job, onClose, onStatusChange, onUpdate, onDelete }: {
   onDelete:       (id: string) => void
 }) {
   const toast = useToast()
+  const [confirm, ConfirmDialog] = useConfirm()
   const [notes,        setNotes]        = useState(job.notes ?? '')
   const [savingNotes,  setSavingNotes]  = useState(false)
+  const [followUpAt,   setFollowUpAt]   = useState(job.followUpAt ? job.followUpAt.slice(0, 10) : '')
   const [deleting,     setDeleting]     = useState(false)
   const [activity,     setActivity]     = useState<Activity[]>([])
   const [loadingAct,   setLoadingAct]   = useState(true)
@@ -334,8 +333,9 @@ function JobDetailDrawer({ job, onClose, onStatusChange, onUpdate, onDelete }: {
       .finally(() => setLoadingAct(false))
   }, [job.id])
 
-  // Sync notes if parent job changes
+  // Sync local state when parent job changes
   useEffect(() => { setNotes(job.notes ?? '') }, [job.notes])
+  useEffect(() => { setFollowUpAt(job.followUpAt ? job.followUpAt.slice(0, 10) : '') }, [job.followUpAt])
 
   async function saveNotes() {
     if (notes === (job.notes ?? '')) return
@@ -346,8 +346,26 @@ function JobDetailDrawer({ job, onClose, onStatusChange, onUpdate, onDelete }: {
     if (data)  { onUpdate(data); toast.success('Notes saved') }
   }
 
+  async function saveFollowUpAt(value: string) {
+    // value is '' (clear) or 'YYYY-MM-DD'
+    const prev = job.followUpAt ? job.followUpAt.slice(0, 10) : ''
+    if (value === prev) return
+    const { data, error } = await apiMutate<Job>(
+      `/api/jobs/${job.id}`, 'PATCH',
+      { followUpAt: value ? new Date(value).toISOString() : null },
+    )
+    if (error) { toast.error('Save failed', error); return }
+    if (data)  { onUpdate(data); toast.success(value ? 'Follow-up date set' : 'Follow-up date cleared') }
+  }
+
   async function handleDelete() {
-    if (!window.confirm(`Delete ${job.role} at ${job.company}? This cannot be undone.`)) return
+    const ok = await confirm({
+      title:        'Delete job?',
+      message:      `"${job.role} at ${job.company}" will be permanently removed. This cannot be undone.`,
+      danger:       true,
+      confirmLabel: 'Delete',
+    })
+    if (!ok) return
     setDeleting(true)
     const { error } = await apiMutate(`/api/jobs/${job.id}`, 'DELETE')
     setDeleting(false)
@@ -356,14 +374,12 @@ function JobDetailDrawer({ job, onClose, onStatusChange, onUpdate, onDelete }: {
     onClose()
   }
 
-  const inputSt: React.CSSProperties = {
-    width: '100%', fontSize: 11, padding: '5px 8px',
-    border: '0.5px solid var(--border)', borderRadius: 5,
-    background: 'var(--bg)', color: 'var(--text)', outline: 'none', boxSizing: 'border-box',
-  }
+  // Drawer uses a slightly more compact variant of the shared INPUT_STYLE
+  const drawerInputSt: React.CSSProperties = { ...INPUT_STYLE, fontSize: 11, padding: '5px 8px', borderRadius: 5 }
 
   return (
     <>
+      <ConfirmDialog />
       {/* Overlay */}
       <div style={{ position: 'fixed', inset: 0, zIndex: 90 }} onClick={onClose} />
 
@@ -395,7 +411,7 @@ function JobDetailDrawer({ job, onClose, onStatusChange, onUpdate, onDelete }: {
             value={job.status}
             onChange={e => onStatusChange(job.id, e.target.value as JobStatus)}
             onClick={e => e.stopPropagation()}
-            style={{ ...inputSt, width: 'auto', marginLeft: 'auto', fontSize: 11 }}>
+            style={{ ...drawerInputSt, width: 'auto', marginLeft: 'auto' }}>
             {KANBAN_COLS.map(c => <option key={c} value={c}>{COL_LABELS[c]}</option>)}
           </select>
         </div>
@@ -426,12 +442,30 @@ function JobDetailDrawer({ job, onClose, onStatusChange, onUpdate, onDelete }: {
                 <div style={{ fontSize: 11 }}>{fmtDate(job.appliedAt)}</div>
               </div>
             )}
-            {job.followUpAt && (
-              <div>
-                <div style={{ fontSize: 10, color: '#854F0B', fontWeight: 500, marginBottom: 2 }}>FOLLOW-UP</div>
-                <div style={{ fontSize: 11, color: '#854F0B' }}>{fmtDate(job.followUpAt)}</div>
-              </div>
-            )}
+            {/* followUpAt — always visible, editable */}
+            <div>
+              <div style={{ fontSize: 10, color: followUpAt ? '#854F0B' : 'var(--text-muted)', fontWeight: 500, marginBottom: 4 }}>FOLLOW-UP</div>
+              <input
+                type="date"
+                value={followUpAt}
+                onChange={e => setFollowUpAt(e.target.value)}
+                onBlur={e => saveFollowUpAt(e.target.value)}
+                style={{
+                  ...drawerInputSt,
+                  fontSize: 11,
+                  color: followUpAt ? '#854F0B' : 'var(--text-muted)',
+                  // Show a clear button by keeping the value accessible
+                  colorScheme: 'dark',
+                }}
+              />
+              {followUpAt && (
+                <button
+                  onClick={() => { setFollowUpAt(''); saveFollowUpAt('') }}
+                  style={{ marginTop: 4, fontSize: 10, color: 'var(--text-muted)', background: 'none', border: 'none', cursor: 'pointer', padding: 0 }}>
+                  ✕ Clear date
+                </button>
+              )}
+            </div>
           </div>
 
           {/* Notes */}
@@ -446,7 +480,7 @@ function JobDetailDrawer({ job, onClose, onStatusChange, onUpdate, onDelete }: {
               onBlur={saveNotes}
               onKeyDown={e => { if ((e.metaKey || e.ctrlKey) && e.key === 's') { e.preventDefault(); saveNotes() } }}
               placeholder="Add notes, contacts, salary details…"
-              style={{ ...inputSt, minHeight: 90, resize: 'vertical', lineHeight: 1.6, padding: '7px 9px' }}
+              style={{ ...drawerInputSt, minHeight: 90, resize: 'vertical', lineHeight: 1.6, padding: '7px 9px' }}
             />
           </div>
 
@@ -496,6 +530,7 @@ export function JobsPage() {
   const [filterStatus, setFilterStatus] = useState<'all' | JobStatus>('all')
   const [showCart,     setShowCart    ] = useState(false)
   const [showAdd,      setShowAdd     ] = useState(false)
+  const [prefillStatus, setPrefillStatus] = useState<JobStatus | null>(null)
   const [cart,         setCart        ] = useState<Job[]>([])
   const [jobs,         setJobs        ] = useState<Job[]>([])
   const [total,        setTotal       ] = useState(0)
@@ -588,7 +623,7 @@ export function JobsPage() {
         <Btn variant={cart.length ? 'primary' : 'ghost'} onClick={() => setShowCart(true)}>
           🛒 Basket {cart.length > 0 && <span style={{ background: 'rgba(255,255,255,0.25)', borderRadius: 999, padding: '1px 6px', fontSize: 10, marginLeft: 4 }}>{cart.length}</span>}
         </Btn>
-        <Btn variant="ghost" onClick={() => setShowAdd(true)}>+ Add Job</Btn>
+        <Btn variant="ghost" onClick={() => { setPrefillStatus(null); setShowAdd(true) }}>+ Add Job</Btn>
       </TopBar>
 
       <div style={{ padding: 20, flex: 1 }}>
@@ -611,7 +646,7 @@ export function JobsPage() {
             <div style={{ fontSize: 12, color: 'var(--text-muted)', marginBottom: 16 }}>
               {search || filterStatus !== 'all' ? 'Try adjusting your search or filter.' : 'Add your first job or let the AI Agent find matches for you.'}
             </div>
-            <Btn variant="primary" onClick={() => setShowAdd(true)}>+ Add Job</Btn>
+            <Btn variant="primary" onClick={() => { setPrefillStatus(null); setShowAdd(true) }}>+ Add Job</Btn>
           </Card>
         ) : (
           <>
@@ -642,7 +677,7 @@ export function JobsPage() {
             )}
             {view === 'list'
               ? <ListView jobs={jobs} onRowClick={setSelectedJob} />
-              : <KanbanView jobs={jobs} onStatusChange={handleStatusChange} />}
+              : <KanbanView jobs={jobs} onStatusChange={handleStatusChange} onAddClick={col => { setPrefillStatus(col); setShowAdd(true) }} />}
           </>
         )}
       </div>
@@ -656,8 +691,9 @@ export function JobsPage() {
       )}
       {showAdd && (
         <AddJobModal
-          onClose={() => setShowAdd(false)}
-          onAdded={job => { setJobs(prev => [job, ...prev]); setTotal(t => t + 1) }}
+          prefillStatus={prefillStatus}
+          onClose={() => { setShowAdd(false); setPrefillStatus(null) }}
+          onAdded={job => { setJobs(prev => [job, ...prev]); setTotal(t => t + 1); setPrefillStatus(null) }}
         />
       )}
 
