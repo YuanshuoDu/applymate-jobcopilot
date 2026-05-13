@@ -29,7 +29,7 @@ export async function buildPersona(userId: string): Promise<string> {
   })
 
   const lines: string[] = []
-  const personaFields = (user.personaFields ?? []) as PersonaField[]
+  const personaFields = (user.personaFields ?? []) as unknown as PersonaField[]
 
   // Contact
   lines.push(`NAME: ${user.name || 'N/A'}`)

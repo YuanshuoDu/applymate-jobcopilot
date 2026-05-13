@@ -17,7 +17,7 @@ export async function GET(req: NextRequest) {
     where: { id: auth.userId },
     select: { personaFields: true },
   })
-  const fields = (user?.personaFields ?? []) as PersonaField[]
+  const fields = (user?.personaFields ?? []) as unknown as PersonaField[]
 
   return ok({ fields })
 }
@@ -38,7 +38,7 @@ export async function POST(req: NextRequest) {
     where: { id: auth.userId },
     select: { personaFields: true },
   })
-  const existing = (user?.personaFields ?? []) as PersonaField[]
+  const existing = (user?.personaFields ?? []) as unknown as PersonaField[]
 
   // Merge: update existing by key, append new
   const map = new Map<string, PersonaField>()
@@ -70,7 +70,7 @@ export async function DELETE(req: NextRequest) {
     where: { id: auth.userId },
     select: { personaFields: true },
   })
-  const existing = (user?.personaFields ?? []) as PersonaField[]
+  const existing = (user?.personaFields ?? []) as unknown as PersonaField[]
   const filtered = existing.filter(f => f.key !== body.key)
 
   await db.user.update({
