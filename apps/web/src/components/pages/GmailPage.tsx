@@ -1,7 +1,8 @@
 'use client'
 
-import React, { useState, useEffect, useCallback } from 'react'
+import React, { useState, useEffect, useCallback, useRef } from 'react'
 import { signIn } from 'next-auth/react'
+import { useSession } from 'next-auth/react'
 import { TopBar }              from '@/components/layout/TopBar'
 import { Btn, Card, useToast } from '@/components/ui'
 
@@ -62,23 +63,140 @@ function TagBadge({ tag }: { tag: string }) {
 function ConnectPrompt({ status, onConnect }: { status: GmailStatus; onConnect: () => void }) {
   return (
     <div style={{ flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'center', background: 'var(--bg-tertiary)' }}>
-      <Card style={{ padding: 40, maxWidth: 420, textAlign: 'center' }}>
+      <Card style={{ padding: 40, maxWidth: 440, textAlign: 'center' }}>
         <div style={{ fontSize: 40, marginBottom: 16 }}>📬</div>
         <div style={{ fontSize: 15, fontWeight: 500, marginBottom: 8 }}>
-          {status === 'no_google' ? 'Connect your Google Account' : 'Grant Gmail Access'}
+          {status === 'no_google' ? 'Connect your Google Account' : 'Authorize Gmail Access'}
         </div>
         <div style={{ fontSize: 12, color: 'var(--text-muted)', lineHeight: 1.75, marginBottom: 24 }}>
           {status === 'no_google'
-            ? 'Sign in with Google to enable Gmail tracking. JobCopilot will automatically detect interview invitations, rejections, and offer letters in your inbox.'
-            : 'Your Google account is connected but Gmail read-access was not granted. Click below to reconnect and approve Gmail access.'}
+            ? 'Sign in with Google to enable AI-powered email tracking. ApplyMate will automatically detect and categorize job applications, interviews, rejections, and offer letters in your inbox.'
+            : 'Your Google account is connected, but Gmail access needs to be authorized. Click below — Google will ask you to approve Gmail read access.'}
         </div>
         <Btn variant="primary" onClick={onConnect}>
-          {status === 'no_google' ? '⟳ Sign in with Google' : '⟳ Reconnect with Gmail Access'}
+          {status === 'no_google' ? 'Sign in with Google' : 'Authorize Gmail Access'}
         </Btn>
         <div style={{ fontSize: 10, color: 'var(--text-muted)', marginTop: 16 }}>
-          We request <strong>read-only</strong> access. JobCopilot never sends emails on your behalf.
+          ApplyMate requests <strong>read</strong> access to scan your job-related emails. We never send emails or modify your inbox without your confirmation.
         </div>
       </Card>
+    </div>
+  )
+}
+
+// ── ReplyModal ────────────────────────────────────────────────────────────────
+
+interface ReplyModalProps {
+  email:    GmailEmail
+  body:     string
+  onClose:  () => void
+}
+
+function ReplyModal({ email, body, onClose }: ReplyModalProps) {
+  const [reply,       setReply]       = useState('')
+  const [loading,     setLoading]     = useState(true)
+  const [error,       setError]       = useState('')
+  const [copied,      setCopied]      = useState(false)
+  const toast = useToast()
+
+  useEffect(() => {
+    fetch('/api/gmail/ai-reply', {
+      method:  'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body:    JSON.stringify({
+        emailBody:   body,
+        subject:     email.subject,
+        senderName:  email.name,
+        senderEmail: email.from,
+        tag:         email.tag,
+      }),
+    })
+      .then(r => r.json())
+      .then(d => {
+        if (d.reply) setReply(d.reply)
+        else setError('Could not generate reply.')
+      })
+      .catch(() => setError('Network error. Please try again.'))
+      .finally(() => setLoading(false))
+  }, [email, body])
+
+  function copyToClipboard() {
+    navigator.clipboard.writeText(reply).then(() => {
+      setCopied(true)
+      toast.success('Copied!', 'Reply text copied to clipboard')
+      setTimeout(() => setCopied(false), 2000)
+    })
+  }
+
+  function openGmail() {
+    const subject = encodeURIComponent(`Re: ${email.subject}`)
+    const bodyEnc = encodeURIComponent(reply)
+    const to      = encodeURIComponent(email.from)
+    window.open(`https://mail.google.com/mail/?view=cm&to=${to}&su=${subject}&body=${bodyEnc}`, '_blank')
+  }
+
+  return (
+    <div style={{
+      position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.45)', zIndex: 1000,
+      display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 16,
+    }}>
+      <div style={{
+        background: 'var(--bg)', borderRadius: 12, width: '100%', maxWidth: 560,
+        boxShadow: '0 8px 32px rgba(0,0,0,0.2)', display: 'flex', flexDirection: 'column', maxHeight: '80vh',
+      }}>
+        {/* Header */}
+        <div style={{ padding: '16px 20px', borderBottom: '0.5px solid var(--border)', display: 'flex', alignItems: 'center', gap: 10 }}>
+          <div style={{ flex: 1 }}>
+            <div style={{ fontSize: 14, fontWeight: 500 }}>AI Reply Draft</div>
+            <div style={{ fontSize: 11, color: 'var(--text-muted)', marginTop: 2 }}>
+              To: <strong>{email.name}</strong> &lt;{email.from}&gt;
+            </div>
+            <div style={{ fontSize: 11, color: 'var(--text-muted)' }}>
+              Re: {email.subject}
+            </div>
+          </div>
+          <Btn small variant="ghost" onClick={onClose}>✕</Btn>
+        </div>
+
+        {/* Body */}
+        <div style={{ flex: 1, overflowY: 'auto', padding: 20 }}>
+          {loading ? (
+            <div style={{ display: 'flex', alignItems: 'center', gap: 8, color: 'var(--text-muted)', fontSize: 12 }}>
+              <div style={{ width: 14, height: 14, border: '2px solid rgba(24,95,165,0.2)', borderTopColor: '#185FA5', borderRadius: '50%', animation: 'spin 0.7s linear infinite' }} />
+              Generating reply with AI…
+            </div>
+          ) : error ? (
+            <div style={{ fontSize: 12, color: '#A32D2D' }}>{error}</div>
+          ) : (
+            <textarea
+              value={reply}
+              onChange={e => setReply(e.target.value)}
+              style={{
+                width: '100%', minHeight: 200, fontSize: 12, lineHeight: 1.7,
+                color: 'var(--text)', background: 'var(--bg-secondary)',
+                border: '0.5px solid var(--border)', borderRadius: 6,
+                padding: '10px 12px', resize: 'vertical', outline: 'none',
+                fontFamily: 'inherit', boxSizing: 'border-box',
+              }}
+            />
+          )}
+        </div>
+
+        {/* Footer */}
+        <div style={{ padding: '12px 20px', borderTop: '0.5px solid var(--border)', display: 'flex', gap: 8, flexWrap: 'wrap', justifyContent: 'flex-end' }}>
+          <Btn variant="ghost" onClick={onClose}>Cancel</Btn>
+          {!loading && !error && (
+            <>
+              <Btn variant="ghost" onClick={copyToClipboard}>
+                {copied ? '✓ Copied' : '📋 Copy Text'}
+              </Btn>
+              <Btn variant="primary" onClick={openGmail}>
+                ✉ Open in Gmail
+              </Btn>
+            </>
+          )}
+        </div>
+      </div>
     </div>
   )
 }
@@ -91,8 +209,9 @@ function EmailBody({ email, onClose, onStar, onMarkRead }: {
   onStar:     (id: string) => void
   onMarkRead: (id: string) => void
 }) {
-  const [body,    setBody]    = useState<string | null>(null)
-  const [loading, setLoading] = useState(true)
+  const [body,        setBody]        = useState<string | null>(null)
+  const [loading,     setLoading]     = useState(true)
+  const [showReply,   setShowReply]   = useState(false)
   const toast = useToast()
 
   useEffect(() => {
@@ -102,10 +221,12 @@ function EmailBody({ email, onClose, onStar, onMarkRead }: {
       .then(d => setBody(d.body?.trim() || email.preview))
       .catch(() => setBody(email.preview))
       .finally(() => setLoading(false))
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [email.id])
+  }, [email.id, email.preview, onMarkRead])
+
+  const canReply = ['interview', 'offer', 'rejected', 'review', 'received', 'viewed'].includes(email.tag)
 
   return (
+    <>
     <div style={{ flex: 1, display: 'flex', flexDirection: 'column', borderLeft: '0.5px solid var(--border)', background: 'var(--bg)' }}>
       {/* Header */}
       <div style={{ padding: '14px 18px', borderBottom: '0.5px solid var(--border)', display: 'flex', alignItems: 'flex-start', gap: 10 }}>
@@ -145,12 +266,26 @@ function EmailBody({ email, onClose, onStar, onMarkRead }: {
       </div>
 
       {/* Footer */}
-      <div style={{ padding: '10px 18px', borderTop: '0.5px solid var(--border)', display: 'flex', gap: 8 }}>
+      <div style={{ padding: '10px 18px', borderTop: '0.5px solid var(--border)', display: 'flex', gap: 8, flexWrap: 'wrap' }}>
         <Btn variant="ghost" onClick={() => window.open(`https://mail.google.com/mail/#inbox/${email.threadId}`, '_blank')}>
           Open in Gmail ↗
         </Btn>
+        {canReply && !loading && (
+          <Btn variant="primary" onClick={() => setShowReply(true)}>
+            ✨ AI Reply
+          </Btn>
+        )}
       </div>
     </div>
+
+    {showReply && (
+      <ReplyModal
+        email={email}
+        body={body ?? email.preview}
+        onClose={() => setShowReply(false)}
+      />
+    )}
+    </>
   )
 }
 
@@ -158,6 +293,7 @@ function EmailBody({ email, onClose, onStar, onMarkRead }: {
 
 export function GmailPage() {
   const toast = useToast()
+  const { data: session } = useSession()
 
   const [status,     setStatus]     = useState<GmailStatus>('loading')
   const [emails,     setEmails]     = useState<GmailEmail[]>([])
@@ -165,6 +301,14 @@ export function GmailPage() {
   const [filter,     setFilter]     = useState('all')
   const [search,     setSearch]     = useState('')
   const [refreshing, setRefreshing] = useState(false)
+
+  // Detect return from Gmail OAuth flow
+  const gmailCallbackUrl = typeof window !== 'undefined'
+    ? `${window.location.origin}/?page=gmail&gmailAuth=1`
+    : '/?page=gmail&gmailAuth=1'
+
+  // Prevent double-auth-redirect: track if we already triggered signIn this session
+  const authTriggeredRef = useRef(false)
 
   const loadEmails = useCallback(async (silent = false) => {
     if (!silent) setStatus('loading')
@@ -176,9 +320,18 @@ export function GmailPage() {
 
       if (!res.ok) {
         const code = (body.error ?? '') as string
-        if (code === 'NO_GOOGLE_ACCOUNT')  { setStatus('no_google'); return }
-        if (code.startsWith('GMAIL'))      { setStatus('no_gmail');  return }
-        if (code === 'TOKEN_EXPIRED')      { setStatus('no_gmail');  return }
+
+        if (code === 'NO_GOOGLE_ACCOUNT') {
+          setStatus('no_google')
+          return
+        }
+
+        // Scope missing or token expired/invalid → show connect prompt, do NOT auto-redirect
+        if (code === 'GMAIL_REAUTH' || code === 'GMAIL_SCOPE_MISSING' || code === 'GMAIL_PERMISSION' || code === 'TOKEN_EXPIRED') {
+          setStatus('no_gmail')
+          return
+        }
+
         setStatus('error')
         return
       }
@@ -193,20 +346,32 @@ export function GmailPage() {
     }
   }, [toast])
 
-  useEffect(() => { loadEmails() }, [loadEmails])
+  useEffect(() => {
+    // Detect if returning from Gmail OAuth — show success toast and force reload
+    const params = new URLSearchParams(window.location.search)
+    if (params.get('gmailAuth') === '1') {
+      const url = new URL(window.location.href)
+      url.searchParams.delete('gmailAuth')
+      window.history.replaceState({}, '', url)
+      toast.success('Google account connected!', 'Loading your Gmail…')
+    }
+    loadEmails()
+  }, [loadEmails, toast])
 
   function connectGoogle() {
-    signIn('google', { callbackUrl: window.location.href })
+    if (authTriggeredRef.current) return   // Prevent duplicate triggers
+    authTriggeredRef.current = true
+    signIn('google', { callbackUrl: gmailCallbackUrl })
   }
 
-  function toggleStar(id: string) {
+  const toggleStar = useCallback((id: string) => {
     setEmails(prev => prev.map(e => e.id === id ? { ...e, starred: !e.starred } : e))
     if (selected?.id === id) setSelected(s => s ? { ...s, starred: !s.starred } : s)
-  }
+  }, [selected?.id])
 
-  function markRead(id: string) {
+  const markRead = useCallback((id: string) => {
     setEmails(prev => prev.map(e => e.id === id ? { ...e, read: true } : e))
-  }
+  }, [])
 
   // ── Derived lists ─────────────────────────────────────────────────────────
 
@@ -234,7 +399,7 @@ export function GmailPage() {
       <div style={{ flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
         <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 10 }}>
           <div style={{ width: 24, height: 24, border: '2.5px solid rgba(24,95,165,0.2)', borderTopColor: '#185FA5', borderRadius: '50%', animation: 'spin 0.7s linear infinite' }} />
-          <div style={{ fontSize: 12, color: 'var(--text-muted)' }}>Connecting to Gmail…</div>
+          <div style={{ fontSize: 12, color: 'var(--text-muted)' }}>Loading Gmail…</div>
         </div>
       </div>
     </div>
@@ -255,7 +420,7 @@ export function GmailPage() {
           <div style={{ fontSize: 13, color: '#A32D2D', marginBottom: 12 }}>Failed to load Gmail</div>
           <div style={{ display: 'flex', gap: 8, justifyContent: 'center' }}>
             <Btn variant="ghost"   onClick={connectGoogle}>Reconnect Google</Btn>
-            <Btn variant="primary" onClick={() => loadEmails()}>Retry</Btn>
+            <Btn variant="primary" onClick={() => { authTriggeredRef.current = false; loadEmails() }}>Retry</Btn>
           </div>
         </Card>
       </div>
@@ -320,6 +485,14 @@ export function GmailPage() {
               )}
             </button>
           ))}
+
+          {/* Account info */}
+          {session?.user?.email && (
+            <div style={{ marginTop: 16, padding: '8px 10px', borderTop: '0.5px solid var(--border)' }}>
+              <div style={{ fontSize: 9, color: 'var(--text-muted)', marginBottom: 4 }}>Connected as</div>
+              <div style={{ fontSize: 10, color: 'var(--text)', wordBreak: 'break-all' }}>{session.user.email}</div>
+            </div>
+          )}
         </div>
 
         {/* ── Email list ── */}

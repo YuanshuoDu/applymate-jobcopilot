@@ -8,13 +8,21 @@ import { db } from '@/lib/db'
 export async function getGoogleAccessToken(userId: string): Promise<string | null> {
   const account = await db.account.findFirst({
     where:  { userId, provider: 'google' },
-    select: { access_token: true, refresh_token: true, expires_at: true },
+    select: { access_token: true, refresh_token: true, expires_at: true, scope: true },
   })
-  if (!account?.access_token) return null
+  if (!account?.access_token) {
+    console.error('[gmail] getGoogleAccessToken: no access_token in DB for user', userId)
+    return null
+  }
 
   const isExpired = account.expires_at ? account.expires_at * 1000 < Date.now() + 60_000 : false
+  console.log('[gmail] getGoogleAccessToken: token expires_at=', account.expires_at, 'isExpired=', isExpired, 'hasRefreshToken=', !!account.refresh_token, 'dbScope=', account.scope ?? '(null)')
 
-  if (isExpired && account.refresh_token) {
+  if (isExpired) {
+    if (!account.refresh_token) {
+      console.error('[gmail] token expired and no refresh_token — cannot refresh, returning null')
+      return null
+    }
     try {
       const res = await fetch('https://oauth2.googleapis.com/token', {
         method:  'POST',
@@ -27,6 +35,7 @@ export async function getGoogleAccessToken(userId: string): Promise<string | nul
         }),
       })
       const data = await res.json()
+      console.log('[gmail] token refresh response:', JSON.stringify({ ok: res.ok, status: res.status, hasToken: !!data.access_token, error: data.error }))
       if (data.access_token) {
         await db.account.updateMany({
           where: { userId, provider: 'google' },
@@ -37,7 +46,12 @@ export async function getGoogleAccessToken(userId: string): Promise<string | nul
         })
         return data.access_token
       }
-    } catch { /* fall through — return existing token if refresh fails */ }
+      console.error('[gmail] refresh returned no access_token, error:', data.error)
+      return null
+    } catch (e) {
+      console.error('[gmail] token refresh failed:', e)
+      return null
+    }
   }
 
   return account.access_token
@@ -71,6 +85,12 @@ export function classifyEmail(subject: string, snippet: string): string {
   ) return 'received'
 
   if (t.includes('viewed your profile') || t.includes('viewed your application')) return 'viewed'
+
+  if (
+    t.includes('under review') || t.includes('reviewing your') || t.includes('being reviewed') ||
+    t.includes('application under consideration') || t.includes('assessment in progress') ||
+    t.includes('we are reviewing')
+  ) return 'review'
 
   return 'received'
 }

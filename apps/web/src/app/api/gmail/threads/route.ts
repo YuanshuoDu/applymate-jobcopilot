@@ -7,7 +7,7 @@
  * Error codes in response body:
  *   NO_GOOGLE_ACCOUNT   — user hasn't signed in with Google
  *   TOKEN_EXPIRED       — access token expired AND refresh failed
- *   GMAIL_PERMISSION    — gmail.readonly scope not granted
+ *   GMAIL_REAUTH        — token lacks gmail scope; old account wiped, re-auth needed
  *   GMAIL_ERROR         — other Gmail API error
  */
 import { NextRequest } from 'next/server'
@@ -19,35 +19,54 @@ export async function GET(req: NextRequest) {
   const auth = await requireAuth(req)
   if (isErrorResponse(auth)) return auth
 
-  // 1. Check Google account exists and has Gmail scope
+  console.log('[gmail/threads] === /api/gmail/threads called, userId=', auth.userId)
+
+  // 1. Check Google account exists
   const account = await db.account.findFirst({
     where:  { userId: auth.userId, provider: 'google' },
-    select: { scope: true },
+    select: { access_token: true },
   })
-  if (!account) return err('NO_GOOGLE_ACCOUNT', 403)
-  if (account.scope && !account.scope.includes('gmail')) {
-    return err('GMAIL_PERMISSION', 403)
+  if (!account) {
+    console.error('[gmail/threads] no Google account in DB → NO_GOOGLE_ACCOUNT')
+    return err('NO_GOOGLE_ACCOUNT', 403)
   }
+  console.log('[gmail/threads] Google account exists in DB')
 
   // 2. Get fresh access token (auto-refreshes if needed)
   const accessToken = await getGoogleAccessToken(auth.userId)
-  if (!accessToken) return err('TOKEN_EXPIRED', 401)
+  if (!accessToken) {
+    console.error('[gmail/threads] getGoogleAccessToken returned null → GMAIL_REAUTH (token expired/missing)')
+    return err('GMAIL_REAUTH', 401)
+  }
+  console.log('[gmail/threads] got access token, length=', accessToken.length)
 
   // 3. Fetch Gmail messages
   try {
     const q = encodeURIComponent(
-      'subject:(application OR interview OR offer OR engineer OR developer OR "thank you for applying" OR "your application") -from:me'
+      'subject:(application OR interview OR offer OR "thank you for applying" OR "your application" OR "position" OR "candidacy" OR "hiring" OR "opportunity") -from:me'
     )
     const listRes = await fetch(
       `https://gmail.googleapis.com/gmail/v1/users/me/messages?maxResults=25&q=${q}`,
       { headers: { Authorization: `Bearer ${accessToken}` } }
     )
 
+    console.log('[gmail/threads] Gmail API response status:', listRes.status)
+
     if (!listRes.ok) {
-      if (listRes.status === 401) return err('TOKEN_EXPIRED', 401)
-      if (listRes.status === 403) return err('GMAIL_PERMISSION', 403)
+      if (listRes.status === 401) {
+        console.error('[gmail/threads] Gmail returned 401 → TOKEN_EXPIRED')
+        return err('TOKEN_EXPIRED', 401)
+      }
+      if (listRes.status === 403) {
+        const errorBody = await listRes.text()
+        console.error('[gmail/threads] Gmail returned 403 → GMAIL_SCOPE_MISSING. Body:', errorBody.slice(0, 200))
+        return err('GMAIL_SCOPE_MISSING', 403)
+      }
+      console.error('[gmail/threads] Gmail API unexpected error:', listRes.status)
       return err('GMAIL_ERROR', 500)
     }
+
+    console.log('[gmail/threads] Gmail API call SUCCESS — fetching messages')
 
     const listData = await listRes.json()
     const messages: { id: string }[] = listData.messages ?? []
