@@ -44,3 +44,4 @@ tmp/
 
 # Temp files
 _tmp_*/
+apps/web/package-lock.json
