@@ -35,3 +35,12 @@ prisma/*.db
 # Temporary
 *.tmp
 tmp/
+
+# Chrome test profile
+.chrome-test-profile/
+
+# Claude Code config
+.claude/
+
+# Temp files
+_tmp_*/
