@@ -7,8 +7,8 @@ import { Btn, Card, useToast, useConfirm, UserAvatar } from '@/components/ui'
 import type { UserProfile, UserPreferences } from '@/lib/types'
 import { useApi, apiMutate } from '@/lib/hooks'
 import {
-  MODEL_CATALOGUE, PROVIDER_LABELS, DEFAULT_AI_CONFIG,
-  type Provider, type AiConfig,
+  MODEL_CATALOGUE, PROVIDER_LABELS, FEATURE_LABELS, APPLYMATE_BACKING, APPLYMATE_LABEL,
+  type Provider, type AiConfig, type FeatureId, type UserAiSettings,
 } from '@/lib/model-router'
 
 // ── Static data ───────────────────────────────────────────────────────────────
@@ -29,7 +29,7 @@ const PLANS = [
 ]
 
 const CONNECTED_ACCOUNTS = [
-  { id: 'gmail',    name: 'Gmail',    icon: '✉',  color: '#A32D2D', connected: false, account: null as string | null, desc: 'Recruitment inbox monitoring' },
+  { id: 'gmail',    name: 'Gmail',    icon: '✉',  color: '#A32D2D', connected: false, account: null as string | null, desc: 'AI email detection, auto-labeling & follow-up' },
   { id: 'linkedin', name: 'LinkedIn', icon: 'in', color: '#185FA5', connected: false, account: null as string | null, desc: 'Job search + auto-apply'      },
   { id: 'indeed',   name: 'Indeed',   icon: 'I',  color: '#003A9B', connected: false, account: null as string | null, desc: 'Job aggregation'               },
   { id: 'github',   name: 'GitHub',   icon: '⌥',  color: '#24292f', connected: false, account: null as string | null, desc: 'Pull CV data from repos'       },
@@ -128,12 +128,17 @@ export function SettingsPage() {
   const [notifs,         setNotifs        ] = useState({ apply: true, reject: true, interview: true, offer: true, weekly: false, followUp: true })
   const [showCancelModal,   setShowCancelModal]   = useState(false)
   const [connectedProviders, setConnectedProviders] = useState<{ provider: string; account: string }[]>([])
+  const [gmailHealth, setGmailHealth] = useState<{ hasGmail: boolean; reason: string | null; scopes?: string; gmailError?: string }>({ hasGmail: true, reason: null })
 
-  // Fetch real OAuth connections
+  // Fetch real OAuth connections + gmail health
   useEffect(() => {
     fetch('/api/me/accounts')
       .then(r => r.json())
       .then(d => setConnectedProviders(d.accounts ?? []))
+      .catch(() => {})
+    fetch('/api/gmail/check')
+      .then(r => r.json())
+      .then(d => setGmailHealth({ hasGmail: d.hasGmail, reason: d.reason, scopes: d.scopes, gmailError: d.gmailError }))
       .catch(() => {})
   }, [])
 
@@ -294,43 +299,80 @@ export function SettingsPage() {
           {activeTab === 'accounts' && (
             <SettingsSection title="Connected Accounts">
               <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
-                {accounts.map(acc => (
-                  <div key={acc.id} style={{ display: 'flex', alignItems: 'center', gap: 14, padding: 14, background: 'var(--bg-secondary)', borderRadius: 10, border: '0.5px solid var(--border)' }}>
-                    <div style={{ width: 36, height: 36, borderRadius: 8, background: `${acc.color}18`, color: acc.color, display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 14, fontWeight: 700, flexShrink: 0 }}>
-                      {acc.icon}
-                    </div>
-                    <div style={{ flex: 1 }}>
-                      <div style={{ fontSize: 12, fontWeight: 500 }}>{acc.name}</div>
-                      <div style={{ fontSize: 10, color: 'var(--text-muted)' }}>
-                        {acc.connected ? acc.account : acc.desc}
+                {accounts.map(acc => {
+                  const isGmail = acc.id === 'gmail'
+                  const gmailNeedsFix = isGmail && acc.connected && !gmailHealth.hasGmail
+                  return (
+                    <div key={acc.id} style={{ display: 'flex', alignItems: 'center', gap: 14, padding: 14, background: 'var(--bg-secondary)', borderRadius: 10, border: gmailNeedsFix ? '1px solid rgba(163,45,45,0.25)' : '0.5px solid var(--border)' }}>
+                      <div style={{ width: 36, height: 36, borderRadius: 8, background: `${acc.color}18`, color: acc.color, display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 14, fontWeight: 700, flexShrink: 0 }}>
+                        {acc.icon}
                       </div>
-                    </div>
-                    {acc.connected ? (
-                      <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-                        <span style={{ fontSize: 10, color: '#3B6D11', background: 'rgba(59,109,17,0.12)', borderRadius: 999, padding: '2px 8px' }}>● Connected</span>
-                        <Btn small variant="danger" onClick={async () => {
-                          if (acc.id === 'gmail') {
-                            // Google disconnection: clear apps permission link
-                            window.open('https://myaccount.google.com/permissions', '_blank')
-                            toast.info('Google revoke', 'Visit Google Account permissions to revoke access')
+                      <div style={{ flex: 1 }}>
+                        <div style={{ fontSize: 12, fontWeight: 500, display: 'flex', alignItems: 'center', gap: 6 }}>
+                          {acc.name}
+                          {gmailNeedsFix && (
+                            <span style={{ fontSize: 9, background: 'rgba(163,45,45,0.12)', color: '#A32D2D', borderRadius: 999, padding: '1px 6px' }}>Needs fix</span>
+                          )}
+                        </div>
+                        <div style={{ fontSize: 10, color: 'var(--text-muted)' }}>
+                          {acc.connected
+                            ? gmailNeedsFix
+                              ? <span>Gmail API access failed. Token scopes: <code style={{ fontSize: 9, background: 'var(--bg-tertiary)', padding: '1px 4px', borderRadius: 3 }}>{gmailHealth.scopes || '(none)'}</code></span>
+                              : acc.account
+                            : acc.desc}
+                        </div>
+                        {gmailNeedsFix && gmailHealth.gmailError && (
+                          <div style={{ fontSize: 9, color: '#A32D2D', marginTop: 4, wordBreak: 'break-all', opacity: 0.7 }}>
+                            {gmailHealth.gmailError}
+                          </div>
+                        )}
+                      </div>
+                      {acc.connected ? (
+                        <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                          {gmailNeedsFix ? (
+                            <Btn small variant="primary" onClick={() => {
+                              fetch('/api/me/accounts', {
+                                method: 'DELETE',
+                                headers: { 'Content-Type': 'application/json' },
+                                body: JSON.stringify({ provider: 'google' }),
+                              }).then(() => signIn('google', { callbackUrl: window.location.origin + '/?page=settings' }))
+                            }}>Fix Gmail Access</Btn>
+                          ) : (
+                            <span style={{ fontSize: 10, color: '#3B6D11', background: 'rgba(59,109,17,0.12)', borderRadius: 999, padding: '2px 8px' }}>● Connected</span>
+                          )}
+                          <Btn small variant="danger" onClick={async () => {
+                            if (isGmail) {
+                              await fetch('/api/me/accounts', {
+                                method: 'DELETE',
+                                headers: { 'Content-Type': 'application/json' },
+                                body: JSON.stringify({ provider: 'google' }),
+                              })
+                              fetch('/api/me/accounts')
+                                .then(r => r.json())
+                                .then(d => setConnectedProviders(d.accounts ?? []))
+                                .catch(() => {})
+                              setGmailHealth({ hasGmail: true, reason: null })
+                              window.open('https://myaccount.google.com/permissions', '_blank')
+                              toast.info('Gmail disconnected', 'Visit Google permissions to fully revoke access')
+                            } else {
+                              toast.warning(`${acc.name} disconnected`)
+                            }
+                          }}>Disconnect</Btn>
+                        </div>
+                      ) : (
+                        <Btn small variant="primary" onClick={() => {
+                          if (isGmail) {
+                            signIn('google', { callbackUrl: window.location.origin + '/?page=settings' })
+                          } else if (acc.id === 'github') {
+                            signIn('github', { callbackUrl: window.location.origin + '/?page=settings' })
                           } else {
-                            toast.warning(`${acc.name} disconnected`)
+                            toast.info(`${acc.name} integration`, 'Coming soon')
                           }
-                        }}>Disconnect</Btn>
-                      </div>
-                    ) : (
-                      <Btn small variant="primary" onClick={() => {
-                        if (acc.id === 'gmail') {
-                          signIn('google', { callbackUrl: window.location.href })
-                        } else if (acc.id === 'github') {
-                          signIn('github', { callbackUrl: window.location.href })
-                        } else {
-                          toast.info(`${acc.name} integration`, 'Coming soon')
-                        }
-                      }}>Connect</Btn>
-                    )}
-                  </div>
-                ))}
+                        }}>Connect</Btn>
+                      )}
+                    </div>
+                  )
+                })}
               </div>
             </SettingsSection>
           )}
@@ -487,157 +529,263 @@ export function SettingsPage() {
 const TIER_COLOR = { fast: '#854F0B', standard: '#185FA5', premium: '#5B3DC8' }
 const TIER_LABEL = { fast: '快速', standard: '标准', premium: '旗舰' }
 
+const KEY_HINTS: Partial<Record<Provider, { href: string }>> = {
+  anthropic: { href: 'https://console.anthropic.com/settings/keys' },
+  openai:    { href: 'https://platform.openai.com/api-keys' },
+  deepseek:  { href: 'https://platform.deepseek.com/api-keys' },
+  minimax:   { href: 'https://platform.minimax.chat/user-center/basic-information/interface-key' },
+  qwen:      { href: 'https://bailian.console.aliyun.com/api-key' },
+  zhipu:     { href: 'https://bigmodel.cn/usercenter/apikeys' },
+}
+
+const PROVIDERS_WITH_MODELS = Array.from(new Set(MODEL_CATALOGUE.map(m => m.provider))) as Provider[]
+const FEATURE_IDS = Object.keys(FEATURE_LABELS) as FeatureId[]
+const RECOMMENDED_MODELS = MODEL_CATALOGUE.filter(m => m.label.includes('★'))
+
+type TestStatus = 'idle' | 'testing' | 'ok' | { error: string }
+
 function AiModelSettings() {
   const toast = useToast()
-  const [cfg,     setCfg]     = useState<AiConfig>(DEFAULT_AI_CONFIG)
-  const [apiKey,  setApiKey]  = useState('')
-  const [apiBase, setApiBase] = useState('')
-  const [saving,  setSaving]  = useState(false)
-  const [loaded,  setLoaded]  = useState(false)
+  const [settings,  setSettings ] = useState<UserAiSettings>({ keys: {}, features: {} })
+  const [draftKeys, setDraftKeys] = useState<Partial<Record<Provider, string>>>({})
+  const [saving,    setSaving   ] = useState(false)
+  const [loaded,    setLoaded   ] = useState(false)
+  const [keyTests,  setKeyTests ] = useState<Partial<Record<Provider, TestStatus>>>({})
 
   useEffect(() => {
-    fetch('/api/me/ai-config').then(r => r.json()).then((data: AiConfig) => {
-      setCfg({ provider: data.provider ?? 'anthropic', model: data.model ?? 'claude-sonnet-4-6' })
-      setApiBase(data.apiBase ?? '')
+    fetch('/api/me/ai-config').then(r => r.json()).then((data: UserAiSettings) => {
+      setSettings(data)
       setLoaded(true)
     }).catch(() => setLoaded(true))
   }, [])
 
-  const providers = Array.from(new Set(MODEL_CATALOGUE.map(m => m.provider))) as Provider[]
-  const modelsForProvider = MODEL_CATALOGUE.filter(m => m.provider === cfg.provider)
-  const selectedModel = MODEL_CATALOGUE.find(m => m.provider === cfg.provider && m.model === cfg.model)
-    ?? modelsForProvider[0]
+  function setFeatureCfg(id: FeatureId, cfg: AiConfig | null) {
+    setSettings(prev => ({ ...prev, features: { ...prev.features, [id]: cfg } }))
+  }
 
-  function selectProvider(p: Provider) {
-    const firstModel = MODEL_CATALOGUE.find(m => m.provider === p)
-    setCfg({ provider: p, model: firstModel?.model ?? '' })
-    setApiBase(firstModel?.defaultBase ?? '')
+  async function testKey(p: Provider) {
+    const key = draftKeys[p] || settings.keys?.[p] || ''
+    if (!key || key.startsWith('••••')) { toast.info('请先填写 API Key'); return }
+
+    setKeyTests(prev => ({ ...prev, [p]: 'testing' }))
+    const model = MODEL_CATALOGUE.find(m => m.provider === p)
+    try {
+      const res = await fetch('/api/me/ai-test', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ provider: p, model: model?.model, apiKey: key }),
+      })
+      const data = await res.json()
+      setKeyTests(prev => ({ ...prev, [p]: data.ok ? 'ok' : { error: data.error ?? '连接失败' } }))
+    } catch {
+      setKeyTests(prev => ({ ...prev, [p]: { error: '网络错误' } }))
+    }
   }
 
   async function save() {
     setSaving(true)
-    const body: AiConfig = {
-      provider: cfg.provider,
-      model:    cfg.model,
-      ...(apiKey.trim()  ? { apiKey:  apiKey.trim()  } : {}),
-      ...(apiBase.trim() ? { apiBase: apiBase.trim() } : {}),
+    const body: UserAiSettings = {
+      keys:     { ...settings.keys, ...draftKeys },
+      features: settings.features,
     }
     const { error } = await apiMutate('/api/me/ai-config', 'POST', body)
     setSaving(false)
     if (error) toast.error('保存失败', error)
-    else       toast.success('AI 模型已更新')
+    else { toast.success('AI 设置已更新'); setDraftKeys({}); setKeyTests({}) }
   }
 
   if (!loaded) return <div style={{ padding: 24, color: 'var(--text-muted)', fontSize: 13 }}>加载中…</div>
 
   return (
-    <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 20 }}>
 
-      {/* Provider selector */}
-      <SettingsSection title="AI 提供商">
-        <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8 }}>
-          {providers.map(p => (
-            <button key={p} onClick={() => selectProvider(p)} style={{
-              padding: '7px 14px', borderRadius: 8, cursor: 'pointer', fontSize: 12, fontWeight: 500,
-              border: `1.5px solid ${cfg.provider === p ? 'var(--primary)' : 'var(--border)'}`,
-              background: cfg.provider === p ? 'rgba(24,95,165,0.08)' : 'transparent',
-              color: cfg.provider === p ? 'var(--primary)' : 'var(--text-muted)',
-            }}>
-              {PROVIDER_LABELS[p]}
-            </button>
-          ))}
+      {/* ── ApplyMate 说明卡 ── */}
+      <div style={{ padding: '14px 16px', background: 'linear-gradient(135deg,rgba(24,95,165,0.08),rgba(91,61,200,0.06))', border: '1px solid rgba(24,95,165,0.2)', borderRadius: 12 }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 6 }}>
+          <span style={{ fontSize: 20 }}>✦</span>
+          <span style={{ fontSize: 14, fontWeight: 700, color: 'var(--text)' }}>{APPLYMATE_LABEL}</span>
+          <span style={{ fontSize: 10, background: '#185FA514', color: '#185FA5', border: '0.5px solid #185FA530', borderRadius: 999, padding: '1px 8px', fontWeight: 600 }}>默认</span>
         </div>
-      </SettingsSection>
+        <div style={{ fontSize: 12, color: 'var(--text-muted)', lineHeight: 1.6 }}>
+          平台内置模型，无需填写 API Key，开箱即用。当前由 <strong style={{ color: 'var(--text)' }}>MiniMax M2.7</strong> 提供支持，适合所有功能的日常使用。
+        </div>
+        <div style={{ marginTop: 8, fontSize: 11, color: 'var(--text-muted)' }}>
+          底层模型：{APPLYMATE_BACKING.provider} / {APPLYMATE_BACKING.model}
+        </div>
+      </div>
 
-      {/* Model selector */}
-      <SettingsSection title="选择模型">
-        <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
-          {modelsForProvider.map(m => (
-            <button key={m.model} onClick={() => setCfg(prev => ({ ...prev, model: m.model }))} style={{
-              display: 'flex', alignItems: 'flex-start', gap: 12, padding: '12px 14px',
-              borderRadius: 10, cursor: 'pointer', textAlign: 'left', width: '100%',
-              border: `1.5px solid ${cfg.model === m.model ? 'var(--primary)' : 'var(--border)'}`,
-              background: cfg.model === m.model ? 'rgba(24,95,165,0.06)' : 'var(--bg)',
-            }}>
-              <div style={{ flex: 1 }}>
-                <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 3 }}>
-                  <span style={{ fontSize: 13, fontWeight: 600, color: 'var(--text)' }}>{m.label}</span>
-                  <span style={{ fontSize: 10, fontWeight: 500, color: TIER_COLOR[m.tier], background: `${TIER_COLOR[m.tier]}14`, borderRadius: 999, padding: '1px 7px' }}>
-                    {TIER_LABEL[m.tier]}
-                  </span>
+      {/* ── 分功能模型控制 ── */}
+      <SettingsSection title="各功能模型设置">
+        <div style={{ fontSize: 11, color: 'var(--text-muted)', marginBottom: 14, lineHeight: 1.6 }}>
+          默认所有功能使用 {APPLYMATE_LABEL}。可为每个功能单独指定模型（需先在下方添加对应 API Key）。
+        </div>
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+          {FEATURE_IDS.map(id => {
+            const current   = settings.features?.[id] ?? null
+            const isDefault = current === null
+            return (
+              <div key={id} style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '10px 12px', background: 'var(--bg-secondary)', borderRadius: 8, border: '0.5px solid var(--border)' }}>
+                <div style={{ flex: 1, minWidth: 0 }}>
+                  <div style={{ fontSize: 12, fontWeight: 500, color: 'var(--text)' }}>{FEATURE_LABELS[id]}</div>
+                  <div style={{ fontSize: 10, color: 'var(--text-muted)', marginTop: 2 }}>
+                    {isDefault
+                      ? `✦ ${APPLYMATE_LABEL}（默认）`
+                      : `${PROVIDER_LABELS[current!.provider]} · ${current!.model}`
+                    }
+                  </div>
                 </div>
-                <div style={{ fontSize: 11, color: 'var(--text-muted)' }}>{m.description}</div>
+                <FeatureModelPicker value={current} onChange={cfg => setFeatureCfg(id, cfg)} />
               </div>
-              <div style={{ textAlign: 'right', flexShrink: 0 }}>
-                <div style={{ fontSize: 11, color: 'var(--text-muted)' }}>
-                  {m.priceIn === 0 && m.priceOut === 0 ? '免费' : `$${m.priceIn}/$${m.priceOut}`}
+            )
+          })}
+        </div>
+      </SettingsSection>
+
+      {/* ── 提供商 API Key ── */}
+      <SettingsSection title="自定义 API Key（可选）">
+        <div style={{ fontSize: 11, color: 'var(--text-muted)', marginBottom: 14, lineHeight: 1.6 }}>
+          填入各提供商的 API Key 后，选择该提供商模型时将优先使用你的 Key，账单记在你的账户。留空则使用平台共享额度。
+        </div>
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+          {PROVIDERS_WITH_MODELS.filter(p => p !== 'custom').map(p => {
+            const existing = settings.keys?.[p] ?? ''
+            const draft    = draftKeys[p] ?? ''
+            const display  = draft || existing
+            const hint     = KEY_HINTS[p]
+            const status   = keyTests[p] ?? 'idle'
+            return (
+              <div key={p}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 6 }}>
+                  <span style={{ fontSize: 12, fontWeight: 500, color: 'var(--text)', flex: 1 }}>{PROVIDER_LABELS[p]}</span>
+                  {/* Status badge */}
+                  {status === 'testing' && (
+                    <span style={{ fontSize: 10, color: 'var(--text-muted)' }}>测试中…</span>
+                  )}
+                  {status === 'ok' && (
+                    <span style={{ fontSize: 10, color: '#3B6D11', background: 'rgba(59,109,17,0.1)', borderRadius: 999, padding: '2px 8px' }}>✓ 连接正常</span>
+                  )}
+                  {typeof status === 'object' && (
+                    <span style={{ fontSize: 10, color: '#A32D2D', background: 'rgba(163,45,45,0.1)', borderRadius: 999, padding: '2px 8px' }} title={status.error}>✗ {status.error.slice(0, 40)}</span>
+                  )}
+                  {hint && (
+                    <a href={hint.href} target="_blank" rel="noreferrer" style={{ fontSize: 10, color: 'var(--primary)' }}>
+                      获取 Key ↗
+                    </a>
+                  )}
                 </div>
-                <div style={{ fontSize: 10, color: 'var(--text-muted)' }}>/M tokens</div>
-                <div style={{ fontSize: 10, color: 'var(--text-muted)' }}>{m.contextK}K ctx</div>
+                <div style={{ display: 'flex', gap: 8 }}>
+                  <input
+                    type="password"
+                    value={display}
+                    onChange={e => {
+                      setDraftKeys(prev => ({ ...prev, [p]: e.target.value }))
+                      setKeyTests(prev => ({ ...prev, [p]: 'idle' }))
+                    }}
+                    placeholder={existing ? '已保存（输入新值可覆盖）' : `${PROVIDER_LABELS[p]} API Key`}
+                    style={{ flex: 1, padding: '8px 10px', border: '1px solid var(--border)', borderRadius: 7, fontSize: 12, color: 'var(--text)', background: 'var(--bg)', outline: 'none' }}
+                  />
+                  <button
+                    onClick={() => testKey(p)}
+                    disabled={status === 'testing' || (!display || display.startsWith('••••'))}
+                    style={{ padding: '0 14px', fontSize: 11, borderRadius: 7, border: '0.5px solid var(--border)', background: 'var(--bg-secondary)', color: 'var(--text)', cursor: 'pointer', whiteSpace: 'nowrap', opacity: (!display || display.startsWith('••••')) ? 0.4 : 1 }}>
+                    测试
+                  </button>
+                </div>
               </div>
-            </button>
-          ))}
+            )
+          })}
         </div>
       </SettingsSection>
-
-      {/* API Key */}
-      <SettingsSection title="API Key（可选）">
-        <div style={{ fontSize: 11, color: 'var(--text-muted)', marginBottom: 10, lineHeight: 1.6 }}>
-          留空则使用服务器默认 Key。填入自己的 Key 可独立控制用量和账单。
-        </div>
-        <input
-          type="password"
-          value={apiKey}
-          onChange={e => setApiKey(e.target.value)}
-          placeholder={`${PROVIDER_LABELS[cfg.provider]} API Key`}
-          style={{ width: '100%', padding: '9px 12px', border: '1px solid var(--border)', borderRadius: 8, fontSize: 13, color: 'var(--text)', background: 'var(--bg)', outline: 'none' }}
-        />
-        {cfg.provider === 'anthropic'  && <KeyHint href="https://console.anthropic.com/settings/keys" />}
-        {cfg.provider === 'openai'     && <KeyHint href="https://platform.openai.com/api-keys" />}
-        {cfg.provider === 'deepseek'   && <KeyHint href="https://platform.deepseek.com/api-keys" />}
-        {cfg.provider === 'minimax'    && <KeyHint href="https://platform.minimax.chat/user-center/basic-information/interface-key" />}
-        {cfg.provider === 'qwen'       && <KeyHint href="https://dashscope.console.aliyun.com/apiKey" label="阿里云 DashScope" />}
-        {cfg.provider === 'zhipu'      && <KeyHint href="https://open.bigmodel.cn/usercenter/apikeys" label="智谱开放平台" />}
-      </SettingsSection>
-
-      {/* Custom base URL */}
-      {(cfg.provider === 'custom' || apiBase) && (
-        <SettingsSection title="API Base URL">
-          <input
-            type="url"
-            value={apiBase}
-            onChange={e => setApiBase(e.target.value)}
-            placeholder="https://your-endpoint/v1"
-            style={{ width: '100%', padding: '9px 12px', border: '1px solid var(--border)', borderRadius: 8, fontSize: 13, color: 'var(--text)', background: 'var(--bg)', outline: 'none' }}
-          />
-          <div style={{ fontSize: 10, color: 'var(--text-muted)', marginTop: 6 }}>
-            任何 OpenAI-compatible 端点均可使用，例如本地 Ollama: <code style={{ fontFamily: 'monospace' }}>http://localhost:11434/v1</code>
-          </div>
-        </SettingsSection>
-      )}
-
-      {/* Current selection summary */}
-      {selectedModel && (
-        <div style={{ padding: '12px 14px', background: 'rgba(24,95,165,0.05)', borderRadius: 10, border: '1px solid rgba(24,95,165,0.15)', fontSize: 12, color: 'var(--text-muted)' }}>
-          当前选择：<strong style={{ color: 'var(--text)' }}>{selectedModel.label}</strong>
-          {' · '}输入 ${selectedModel.priceIn}/M · 输出 ${selectedModel.priceOut}/M · {selectedModel.contextK}K 上下文
-        </div>
-      )}
 
       <Btn variant="primary" onClick={save} disabled={saving}>
-        {saving ? '保存中…' : '保存模型设置'}
+        {saving ? '保存中…' : '保存 AI 设置'}
       </Btn>
     </div>
   )
 }
 
-function KeyHint({ href, label }: { href: string; label?: string }) {
+function FeatureModelPicker({ value, onChange }: {
+  value:    AiConfig | null
+  onChange: (cfg: AiConfig | null) => void
+}) {
+  const [open, setOpen] = useState(false)
+  const isDefault = value === null
+
   return (
-    <div style={{ marginTop: 6, fontSize: 11, color: 'var(--text-muted)' }}>
-      获取 API Key：
-      <a href={href} target="_blank" rel="noreferrer" style={{ color: 'var(--primary)', marginLeft: 4 }}>
-        {label ?? '控制台 ↗'}
-      </a>
+    <div style={{ position: 'relative' }}>
+      <button
+        onClick={() => setOpen(v => !v)}
+        style={{ fontSize: 11, padding: '4px 10px', borderRadius: 6, border: '0.5px solid var(--border)', background: isDefault ? 'rgba(24,95,165,0.06)' : 'var(--bg)', color: isDefault ? '#185FA5' : 'var(--text)', cursor: 'pointer', whiteSpace: 'nowrap' }}>
+        {isDefault ? `✦ ${APPLYMATE_LABEL} ▾` : `${value!.model.split('-').slice(-1)[0]} ▾`}
+      </button>
+
+      {open && (
+        <>
+          <div style={{ position: 'fixed', inset: 0, zIndex: 49 }} onClick={() => setOpen(false)} />
+          <div style={{ position: 'absolute', right: 0, top: '110%', zIndex: 50, background: 'var(--bg)', border: '0.5px solid var(--border)', borderRadius: 10, boxShadow: '0 8px 32px rgba(0,0,0,0.14)', minWidth: 280, maxHeight: 400, overflowY: 'auto' }}>
+            <div style={{ padding: '6px 10px', fontSize: 9, fontWeight: 700, color: 'var(--text-muted)', borderBottom: '0.5px solid var(--border)', letterSpacing: 1 }}>选择模型</div>
+
+            {/* ── ApplyMate default ── */}
+            <button onClick={() => { onChange(null); setOpen(false) }} style={{
+              display: 'flex', alignItems: 'center', gap: 8, width: '100%', padding: '10px 12px',
+              background: isDefault ? 'rgba(24,95,165,0.06)' : 'none', border: 'none', cursor: 'pointer', textAlign: 'left',
+            }}>
+              <span style={{ fontSize: 14 }}>✦</span>
+              <div>
+                <div style={{ fontSize: 12, fontWeight: 600, color: 'var(--text)' }}>{APPLYMATE_LABEL}</div>
+                <div style={{ fontSize: 10, color: 'var(--text-muted)' }}>平台默认 · 无需 Key</div>
+              </div>
+              {isDefault && <span style={{ marginLeft: 'auto', fontSize: 10, color: '#185FA5' }}>✓</span>}
+            </button>
+
+            <div style={{ height: 1, background: 'var(--border)', margin: '2px 0' }} />
+
+            {/* ── 推荐模型 ── */}
+            <div style={{ padding: '5px 12px 3px', fontSize: 9, fontWeight: 700, color: '#185FA5', letterSpacing: 1 }}>★ 推荐</div>
+            {RECOMMENDED_MODELS.map(m => {
+              const active = !isDefault && value?.provider === m.provider && value?.model === m.model
+              return (
+                <ModelOption key={`rec-${m.model}`} m={m} active={active} onSelect={() => { onChange({ provider: m.provider, model: m.model }); setOpen(false) }} />
+              )
+            })}
+
+            <div style={{ height: 1, background: 'var(--border)', margin: '4px 0' }} />
+
+            {/* ── 按提供商分组完整列表 ── */}
+            {PROVIDERS_WITH_MODELS.map(p => (
+              <div key={p}>
+                <div style={{ padding: '5px 12px', fontSize: 9, fontWeight: 700, color: 'var(--text-muted)', letterSpacing: 1 }}>{PROVIDER_LABELS[p].toUpperCase()}</div>
+                {MODEL_CATALOGUE.filter(m => m.provider === p).map(m => {
+                  const active = !isDefault && value?.provider === p && value?.model === m.model
+                  return (
+                    <ModelOption key={m.model} m={m} active={active} onSelect={() => { onChange({ provider: p, model: m.model }); setOpen(false) }} />
+                  )
+                })}
+              </div>
+            ))}
+          </div>
+        </>
+      )}
     </div>
+  )
+}
+
+function ModelOption({ m, active, onSelect }: {
+  m:        (typeof MODEL_CATALOGUE)[number]
+  active:   boolean
+  onSelect: () => void
+}) {
+  return (
+    <button onClick={onSelect} style={{
+      display: 'flex', alignItems: 'center', gap: 8, width: '100%', padding: '8px 12px',
+      background: active ? 'rgba(24,95,165,0.06)' : 'none', border: 'none', cursor: 'pointer', textAlign: 'left',
+    }}>
+      <div style={{ flex: 1 }}>
+        <div style={{ fontSize: 12, color: 'var(--text)' }}>{m.label}</div>
+        <div style={{ fontSize: 10, color: 'var(--text-muted)' }}>{m.description}</div>
+      </div>
+      <span style={{ fontSize: 10, color: TIER_COLOR[m.tier], background: `${TIER_COLOR[m.tier]}14`, borderRadius: 999, padding: '1px 6px', flexShrink: 0 }}>{TIER_LABEL[m.tier]}</span>
+      {active && <span style={{ fontSize: 10, color: '#185FA5', marginLeft: 4 }}>✓</span>}
+    </button>
   )
 }

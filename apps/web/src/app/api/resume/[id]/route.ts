@@ -33,6 +33,31 @@ export async function PATCH(req: NextRequest, { params }: Params) {
 
   const { name, content, templateId, templateOptions, isDefault } = body
 
+  // Auto-create a version snapshot only if content actually changed
+  const contentChanged = content !== undefined && JSON.stringify(content) !== JSON.stringify(existing.content)
+  if (contentChanged) {
+    await db.resumeVersion.create({
+      data: {
+        resumeId: id,
+        userId: auth.userId,
+        content: existing.content as object,
+        name: existing.name,
+      },
+    })
+    // Keep only the last 20 versions
+    const oldVersions = await db.resumeVersion.findMany({
+      where: { resumeId: id },
+      orderBy: { createdAt: 'desc' },
+      skip: 20,
+      select: { id: true },
+    })
+    if (oldVersions.length > 0) {
+      await db.resumeVersion.deleteMany({
+        where: { id: { in: oldVersions.map(v => v.id) } },
+      })
+    }
+  }
+
   if (isDefault && !existing.isDefault) {
     await db.resume.updateMany({
       where: { userId: auth.userId },

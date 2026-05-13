@@ -30,6 +30,7 @@ export async function runPrepare(
 
   const aboveThreshold = scoredJobs.filter(sj => sj.score >= agentCfg.minMatchScore)
   const packages: ApplicationPackage[] = []
+  const pendingLetters: Array<{ jobId: string; coverLetter: string }> = []
 
   for (const sj of aboveThreshold) {
     let coverLetter: string | undefined
@@ -37,10 +38,7 @@ export async function runPrepare(
     if (agentCfg.autoCoverLetter) {
       try {
         coverLetter = await generateCoverLetter(sj, agentCfg, resumeContent, effectiveAiConfig, writerSystemPrompt)
-        // Save cover letter to the job record so users can review it later
-        const { db } = await import('@/lib/db')
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        await db.job.update({ where: { id: sj.job.id }, data: { coverLetter } as any }).catch(() => {})
+        pendingLetters.push({ jobId: sj.job.id, coverLetter })
         await new Promise(r => setTimeout(r, THROTTLE_MS))
       } catch (err) {
         console.error('[prepare] cover letter error:', err)
@@ -53,6 +51,16 @@ export async function runPrepare(
       ...(coverLetter ? { coverLetter } : {}),
       tailoredKeywords: sj.missingKeywords.length ? sj.missingKeywords : undefined,
     })
+  }
+
+  // Batch persist cover letters
+  if (pendingLetters.length > 0) {
+    const { db } = await import('@/lib/db')
+    await Promise.all(
+      pendingLetters.map(pl =>
+        db.job.update({ where: { id: pl.jobId }, data: { coverLetter: pl.coverLetter } as any }).catch(() => {})
+      )
+    )
   }
 
   return stageOk('prepare', { packages }, packages.length, Date.now() - t0)

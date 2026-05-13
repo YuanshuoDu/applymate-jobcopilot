@@ -6,10 +6,8 @@
  * - With feedback: returns 1 revised suggestion incorporating user feedback
  */
 import { NextRequest } from 'next/server'
-import { requireAuth, isErrorResponse, ok, err } from '@/lib/api-helpers'
-import { checkRateLimit } from '@/lib/rate-limit'
-import { modelChat, stripFences, resolveConfig } from '@/lib/model-router'
-import { db } from '@/lib/db'
+import { prepareAiRoute, ok, err } from '@/lib/api-helpers'
+import { modelChat, stripFences } from '@/lib/model-router'
 
 type FieldType = 'summary' | 'bullet' | 'description' | 'custom'
 
@@ -60,25 +58,16 @@ Return ONLY a JSON array of 3 strings: ["...", "...", "..."]`,
 }
 
 export async function POST(req: NextRequest) {
-  const auth = await requireAuth(req)
-  if (isErrorResponse(auth)) return auth
-
-  const rl = checkRateLimit(`ai:${auth.userId}`)
-  if (!rl.ok) return err(`Rate limit exceeded — retry in ${rl.retryAfter}s`, 429)
+  const prep = await prepareAiRoute(req, 'fieldSuggest')
+  if ('error' in prep) return prep.error
 
   const body = await req.json().catch(() => null)
   if (!body) return err('Invalid JSON body')
 
   const { fieldType = 'custom', currentValue = '', context = {}, feedback } = body as {
-    fieldType?:    FieldType
-    currentValue?: string
-    context?:      Record<string, string>
-    feedback?:     string
+    fieldType?: FieldType; currentValue?: string; context?: Record<string, string>; feedback?: string
   }
-
-  const user  = await db.user.findUnique({ where: { id: auth.userId }, select: { preferences: true } })
-  const prefs = (user?.preferences ?? {}) as Record<string, unknown>
-  const cfg   = resolveConfig((prefs.aiConfig ?? null) as Parameters<typeof resolveConfig>[0])
+  const cfg = prep.cfg
 
   const ctxStr = Object.entries(context)
     .filter(([, v]) => v)
@@ -89,7 +78,7 @@ export async function POST(req: NextRequest) {
   const prompt   = promptFn(currentValue, ctxStr, feedback)
 
   try {
-    const result = await modelChat([{ role: 'user', content: prompt }], cfg, 512)
+    const result = await modelChat([{ role: 'user', content: prompt }], cfg, 3000)
     const text   = stripFences(result.text).trim()
 
     if (feedback) {

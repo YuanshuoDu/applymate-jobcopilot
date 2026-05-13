@@ -35,22 +35,35 @@ export async function runPipeline(ctx: PipelineCtx): Promise<RunReport> {
 
   // ── Stage 1: Scout ─────────────────────────────────────────────────────────
   emitRole(ctx, 'scout', 'start')
-  emit('stage_start', { stage: 'scout', label: 'Scanning saved jobs…' })
+  const hasTargets = ctx.agentCfg.targetRoles.length > 0
+  emit('stage_start', {
+    stage: 'scout',
+    label: hasTargets ? 'Discovering new jobs + scanning saved…' : 'Scanning saved jobs…',
+  })
   const s1 = await runScout(ctx)
   const a1 = acceptScout(s1)
   if (!a1.ok) {
     emit('error', { message: `Scout failed: ${a1.reason}` })
     return { ...emptyReport(), durationMs: Date.now() - t0 }
   }
-  const scoutSummary = `${s1.data!.jobs.length} jobs found`
-  emitRole(ctx, 'scout', 'done', { count: s1.data!.jobs.length, durationMs: s1.metrics.durationMs, summary: scoutSummary })
+  const { jobs: scoutJobs, discovered } = s1.data!
+  const scoutSummary = discovered > 0
+    ? `Discovered ${discovered} new job${discovered === 1 ? '' : 's'}, ${scoutJobs.length} total queued`
+    : `${scoutJobs.length} saved jobs queued`
+  emitRole(ctx, 'scout', 'done', {
+    count: scoutJobs.length, discovered,
+    durationMs: s1.metrics.durationMs, summary: scoutSummary,
+  })
   emit('stage_done', { stage: 'scout', count: s1.data!.jobs.length, durationMs: s1.metrics.durationMs })
   await recordRoleRun(ctx.userId, 'scout', { count: s1.data!.jobs.length, durationMs: s1.metrics.durationMs, summary: scoutSummary }).catch(() => {})
 
-  const scoutedJobs = s1.data!.jobs
+  const scoutedJobs = scoutJobs
 
   if (scoutedJobs.length === 0) {
-    emit('info', { message: 'No saved jobs to process. Use the Chrome Extension or Add Job to save positions first.' })
+    const msg = hasTargets
+      ? 'No jobs found. Try broadening your target roles or locations in Settings.'
+      : 'No saved jobs to process. Configure target roles in Settings so the agent can discover jobs automatically.'
+    emit('info', { message: msg })
     emit('done', emptyReport(Date.now() - t0))
     return emptyReport(Date.now() - t0)
   }

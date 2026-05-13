@@ -2,8 +2,22 @@
 
 import React, { useState, useEffect, useRef } from 'react'
 import { TopBar } from '@/components/layout/TopBar'
+
+// Module-level analysis cache — survives component unmount/remount during tab navigation
+const LS_KEY = 'applymate_last_analysis'
+let _cachedAnalysis: { resumeId: string; jobId: string; score: ScoreResult | null; suggs: Suggestion[] } | null = null
+function loadCache() {
+  if (_cachedAnalysis) return _cachedAnalysis
+  if (typeof window === 'undefined') return null
+  try { _cachedAnalysis = JSON.parse(localStorage.getItem(LS_KEY) ?? 'null'); return _cachedAnalysis } catch { return null }
+}
+function saveCache(data: { resumeId: string | null; jobId: string | null; score: ScoreResult | null; suggs: Suggestion[]; [k: string]: unknown }) {
+  if (!data.jobId || !data.resumeId) return
+  _cachedAnalysis = { resumeId: data.resumeId, jobId: data.jobId, score: data.score, suggs: data.suggs }
+  try { localStorage.setItem(LS_KEY, JSON.stringify(_cachedAnalysis)) } catch {}
+}
 import { Btn, useToast, useConfirm } from '@/components/ui'
-import { useApi, apiMutate } from '@/lib/hooks'
+import { useApi, apiMutate, fmtDate, fmtRelative } from '@/lib/hooks'
 import type { ResumeListItem, ResumeContent, Resume, Job, ScoreResult, Suggestion, TemplateOptions } from '@/lib/types'
 import { CoverLetterModal } from '@/components/resume/CoverLetterModal'
 import { TemplateModal, TEMPLATES } from '@/components/resume/TemplateModal'
@@ -18,6 +32,7 @@ import { ProjectsSection } from '@/components/resume/ProjectsSection'
 import { CertificationsSection } from '@/components/resume/CertificationsSection'
 import { CustomSection } from '@/components/resume/CustomSection'
 import { AiPanel } from '@/components/resume/AiPanel'
+import { UploadResumeModal } from '@/components/resume/UploadResumeModal'
 import type { DragHandleProps } from '@/components/resume/SectionHeader'
 import type { AiFieldContext } from '@/components/resume/AiFieldSuggestion'
 
@@ -298,18 +313,36 @@ export function ResumePage() {
 
   const { data: jobData } = useApi<{ jobs: Job[] }>('/api/jobs?pageSize=30')
   const [jobs,          setJobs]          = useState<Job[]>([])
-  const [selectedJobId, setSelectedJobId] = useState<string | null>(null)
 
-  const [scoreResult, setScoreResult] = useState<ScoreResult | null>(null)
-  const [suggestions, setSuggestions] = useState<Suggestion[]>([])
+  const cache = loadCache()
+  const [selectedJobId, setSelectedJobId] = useState<string | null>(cache?.jobId ?? null)
+  const [scoreResult, setScoreResult] = useState<ScoreResult | null>(cache?.score ?? null)
+  const [suggestions, setSuggestions] = useState<Suggestion[]>(cache?.suggs ?? [])
   const [scoring,     setScoring]     = useState(false)
   const [suggesting,  setSuggesting]  = useState(false)
+  // Tracks which jobId the current analysis belongs to — used to skip redundant re-runs
+  // after tab navigation (component remount) when cache has already been restored.
+  const analysisJobIdRef  = useRef<string | null>(cache?.jobId ?? null)
+  // True only on the very first resume load (initial mount / tab-remount).
+  // Prevents the selectedResumeId effect from wiping cached analysis on remount.
+  const isFirstResumeLoad = useRef(true)
+  // True when resume content has changed since the last completed analysis.
+  // Drives the "Resume updated — re-analyze?" banner in AiPanel.
+  const [contentChangedSinceAnalysis, setContentChangedSinceAnalysis] = useState(false)
+  // Monotonically increasing counter — incremented on each runAnalysis call.
+  // Responses from superseded calls are silently discarded (race-condition guard).
+  const analysisEpochRef = useRef(0)
 
   const [showTemplates,   setShowTemplates]   = useState(false)
   const [showCoverLetter, setShowCoverLetter] = useState(false)
   const [showNewResume,   setShowNewResume]   = useState(false)
+  const [showUploadModal, setShowUploadModal] = useState(false)
   const [creatingResume,  setCreatingResume]  = useState(false)
   const [showAddSection,  setShowAddSection]  = useState(false)
+  const [showVersions,    setShowVersions]    = useState(false)
+  const [versions,        setVersions]        = useState<Array<{ id: string; name: string; createdAt: string }>>([])
+  const [loadingVers,     setLoadingVers]     = useState(false)
+  const [restoring,       setRestoring]       = useState(false)
 
   // Section ordering
   const [sectionOrder,    setSectionOrder]    = useState<string[]>(DEFAULT_ORDER)
@@ -348,7 +381,17 @@ export function ResumePage() {
 
   useEffect(() => {
     if (!selectedResumeId) return
-    setLoadingCont(true); setDirty(false); setScoreResult(null); setSuggestions([])
+    setLoadingCont(true); setDirty(false); setContentChangedSinceAnalysis(false)
+    if (!isFirstResumeLoad.current) {
+      // User actively switched to a different resume — clear stale analysis
+      setScoreResult(null); setSuggestions([])
+      analysisJobIdRef.current = null
+    } else if (cache?.resumeId && cache.resumeId !== selectedResumeId) {
+      // Cache was written for a different resume — don't show its results here
+      setScoreResult(null); setSuggestions([])
+      analysisJobIdRef.current = null
+    }
+    isFirstResumeLoad.current = false
     fetch(`/api/resume/${selectedResumeId}`)
       .then(r => r.json())
       .then((r: Resume) => {
@@ -367,16 +410,28 @@ export function ResumePage() {
 
   useEffect(() => {
     if (!selectedJobId || !content || jobs.length === 0) return
+    // Skip if we already have analysis results for this exact job (e.g. restored from
+    // cache after tab navigation). The user can still force a re-run via the ↻ button.
+    if (scoreResult && analysisJobIdRef.current === selectedJobId) return
     runAnalysis(content, selectedJobId)
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [selectedJobId, jobs])
 
-  function patch(updater: (prev: ResumeContent) => ResumeContent) {
+  const [flashField, setFlashField] = useState('')
+
+  function triggerFlash(fieldKey: string) {
+    setFlashField(fieldKey)
+    setTimeout(() => setFlashField(''), 2200)
+  }
+
+  function patch(updater: (prev: ResumeContent) => ResumeContent, fieldKey?: string) {
     setContent(prev => {
       if (!prev) return prev
       setDirty(true)
       return updater(prev)
     })
+    setContentChangedSinceAnalysis(true)
+    if (fieldKey) triggerFlash(fieldKey)
   }
 
   function applyFormat([prefix, suffix]: [string, string]) {
@@ -417,26 +472,114 @@ export function ResumePage() {
 
   async function runAnalysis(c: ResumeContent, jobId: string) {
     const job = jobs.find(j => j.id === jobId); if (!job) return
+    // Epoch guard: if a newer analysis starts before this one finishes, discard this result
+    const epoch = ++analysisEpochRef.current
     setScoring(true); setSuggesting(true)
     const [scoreRes, suggestRes] = await Promise.allSettled([
       apiMutate<ScoreResult>('/api/ai/score', 'POST', { resumeContent: c, jobTitle: job.role, jobCompany: job.company, jobDescription: job.description ?? undefined }),
       apiMutate<{ suggestions: Suggestion[] }>('/api/ai/suggest', 'POST', { resumeContent: c, jobTitle: job.role, jobCompany: job.company, jobDescription: job.description ?? undefined }),
     ])
+    // A newer analysis was started — silently drop this (stale) response
+    if (analysisEpochRef.current !== epoch) return
     setScoring(false); setSuggesting(false)
-    if (scoreRes.status === 'fulfilled' && scoreRes.value.data) setScoreResult(scoreRes.value.data)
-    else { const msg = scoreRes.status === 'fulfilled' ? (scoreRes.value.error ?? 'Unknown') : scoreRes.reason; toast.error('Analysis failed', typeof msg === 'string' ? msg : 'Check ANTHROPIC_API_KEY') }
-    if (suggestRes.status === 'fulfilled' && suggestRes.value.data?.suggestions) setSuggestions(suggestRes.value.data.suggestions)
+    if (scoreRes.status === 'fulfilled' && scoreRes.value.data) {
+      setScoreResult(scoreRes.value.data)
+      analysisJobIdRef.current = jobId
+      setContentChangedSinceAnalysis(false)  // analysis is now up-to-date
+    } else { const msg = scoreRes.status === 'fulfilled' ? (scoreRes.value.error ?? 'Unknown') : scoreRes.reason; toast.error('Analysis failed', typeof msg === 'string' ? msg : 'Check ANTHROPIC_API_KEY') }
+    if (suggestRes.status === 'fulfilled' && suggestRes.value.data?.suggestions) {
+      setSuggestions(suggestRes.value.data.suggestions)
+    }
+    // Persist to localStorage — include resumeId so cache is resume-scoped
+    if (scoreRes.status === 'fulfilled' && scoreRes.value.data) {
+      try {
+        const latestJob = jobs.find(j => j.id === selectedJobId)
+        saveCache({
+          resumeId: selectedResumeId,
+          jobId: selectedJobId,
+          jobTitle: latestJob?.role ?? '',
+          jobCompany: latestJob?.company ?? '',
+          score: scoreRes.value.data,
+          suggs: suggestRes.status === 'fulfilled' ? (suggestRes.value.data?.suggestions ?? []) : [],
+        })
+      } catch {}
+    }
   }
 
+  // Always-fresh refs so handleSave never reads stale closure values
+  const latestContent         = useRef(content)
+  const latestSectionOrder    = useRef(sectionOrder)
+  const latestTemplateId      = useRef(templateId)
+  const latestTemplateOptions = useRef(templateOptions)
+  const latestResumeName      = useRef(resumeName)
+  const latestSelectedJobId   = useRef(selectedJobId)
+  const isSavingRef           = useRef(false)
+  const pendingSaveRef        = useRef(false) // new edits arrived while saving
+
+  useEffect(() => { latestContent.current         = content },         [content])
+  useEffect(() => { latestSectionOrder.current    = sectionOrder },    [sectionOrder])
+  useEffect(() => { latestTemplateId.current      = templateId },      [templateId])
+  useEffect(() => { latestTemplateOptions.current = templateOptions }, [templateOptions])
+  useEffect(() => { latestResumeName.current      = resumeName },      [resumeName])
+  useEffect(() => { latestSelectedJobId.current   = selectedJobId },   [selectedJobId])
+
   async function handleSave() {
-    if (!selectedResumeId || !content) return
+    if (!selectedResumeId || !latestContent.current) return
+    if (isSavingRef.current) { pendingSaveRef.current = true; return }
+
+    isSavingRef.current = true
     setSaving(true)
-    const { error } = await apiMutate(`/api/resume/${selectedResumeId}`, 'PATCH', {
-      name: resumeName, content: { ...content, sectionOrder }, templateId, templateOptions,
-    })
+    const snapshot = {
+      name:            latestResumeName.current,
+      content:         { ...latestContent.current, sectionOrder: latestSectionOrder.current },
+      templateId:      latestTemplateId.current,
+      templateOptions: latestTemplateOptions.current,
+    }
+    const { error } = await apiMutate(`/api/resume/${selectedResumeId}`, 'PATCH', snapshot)
+    isSavingRef.current = false
     setSaving(false)
-    if (error) toast.error('Save failed', error)
-    else { setDirty(false); toast.success('Saved', 'Resume updated successfully'); if (selectedJobId) runAnalysis(content, selectedJobId) }
+
+    if (error) {
+      toast.error('Save failed', error)
+    } else {
+      setDirty(false)
+      toast.success('Saved', 'Resume updated successfully')
+      // Re-analysis is intentionally NOT triggered here — the AiPanel stale indicator
+      // prompts the user to re-analyse when ready, avoiding a token burn on every save.
+      // If new edits arrived while we were saving, save again immediately
+      if (pendingSaveRef.current) { pendingSaveRef.current = false; handleSave() }
+    }
+  }
+
+  // Auto-save: 2 s debounce after any edit
+  const autoSaveTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
+  useEffect(() => {
+    if (!dirty) return
+    if (autoSaveTimer.current) clearTimeout(autoSaveTimer.current)
+    autoSaveTimer.current = setTimeout(() => { handleSave() }, 2000)
+    return () => { if (autoSaveTimer.current) clearTimeout(autoSaveTimer.current) }
+  }, [content, sectionOrder, templateId, templateOptions, dirty])
+
+  async function handleImportResume(imported: ResumeContent, mode: 'replace' | 'new') {
+    if (mode === 'replace' && selectedResumeId) {
+      setContent(imported)
+      setSectionOrder(imported.sectionOrder ?? DEFAULT_ORDER)
+      setDirty(true)
+      setContentChangedSinceAnalysis(true)
+      toast.success('Resume imported', 'Review the content and save when ready')
+    } else {
+      // Create a new resume with the imported content
+      const name = imported.contact.name ? `${imported.contact.name}'s Resume` : 'Imported Resume'
+      setCreatingResume(true)
+      const { data, error } = await apiMutate<Resume>('/api/resume', 'POST', { name, content: imported, isDefault: false })
+      setCreatingResume(false)
+      if (data) {
+        const item: ResumeListItem = { id: data.id, name: data.name, isDefault: data.isDefault, createdAt: data.createdAt, updatedAt: data.updatedAt }
+        setResumes(prev => [...prev, item])
+        setSelectedResumeId(data.id)
+        toast.success('Resume imported', `"${name}" created`)
+      } else toast.error('Import failed', error ?? 'Could not create resume')
+    }
   }
 
   async function handleCreateResume(name: string) {
@@ -450,19 +593,145 @@ export function ResumePage() {
     } else toast.error('Error', error ?? 'Could not create resume')
   }
 
+  async function fetchVersions() {
+    if (!selectedResumeId) return
+    setLoadingVers(true)
+    try {
+      const res = await fetch(`/api/resume/${selectedResumeId}/versions`)
+      const data = await res.json()
+      setVersions(Array.isArray(data) ? data : [])
+    } catch { setVersions([]) }
+    finally { setLoadingVers(false) }
+  }
+
+  async function restoreVersion(versionId: string) {
+    if (!selectedResumeId) return
+    setRestoring(true)
+    const { data, error } = await apiMutate<Resume>(`/api/resume/${selectedResumeId}/versions`, 'POST', { versionId })
+    setRestoring(false)
+    if (error || !data) { toast.error('Restore failed', error ?? 'Could not restore version'); return }
+    setContent(data.content as ResumeContent)
+    setResumeName(data.name)
+    setTemplateId(data.templateId ?? 'clean')
+    setTemplateOptions((data.templateOptions as TemplateOptions) ?? {})
+    setShowVersions(false)
+    setDirty(true)
+    setContentChangedSinceAnalysis(true)
+    toast.success('Version restored', 'Previous version loaded. Save to keep it.')
+  }
+
+  // Apply a keyword/item to the correct section (not just skills)
+  function applyTargeted(t: { type: string; section: string; keyword: string; value?: string }) {
+    const { section, keyword } = t
+
+    switch (section) {
+      case 'summary':
+        // Append keyword context to summary
+        patch(p => {
+          const current = p.summary ?? ''
+          const addition = current ? ` ${keyword}.` : keyword
+          return { ...p, summary: current + addition }
+        }, 'summary')
+        triggerFlash('summary')
+        toast.success('Summary updated', `Added "${keyword}" context`)
+        break
+
+      case 'skills':
+        setContent(prev => {
+          if (!prev) return prev
+          const existing = new Set(prev.skills?.map(s => s.toLowerCase()) ?? [])
+          if (existing.has(keyword.toLowerCase())) return prev
+          return { ...prev, skills: [...(prev.skills ?? []), keyword] }
+        })
+        triggerFlash('skills')
+        toast.success('Skill added', `"${keyword}" added to Skills`)
+        break
+
+      case 'experience':
+      case 'projects':
+        toast.success('Tip noted', `"${keyword}" — add this to your ${section} section`)
+        break
+
+      default:
+        setContent(prev => {
+          if (!prev) return prev
+          const existing = new Set(prev.skills?.map(s => s.toLowerCase()) ?? [])
+          if (existing.has(keyword.toLowerCase())) return prev
+          return { ...prev, skills: [...(prev.skills ?? []), keyword] }
+        })
+        triggerFlash('skills')
+        toast.success('Added', `"${keyword}" added`)
+    }
+  }
+
   function applySuggestion(i: number) {
+    const s = suggestions[i]
+    if (!s) return
     setSuggestions(prev => { const n = [...prev]; n[i] = { ...n[i], applied: true }; return n })
     setDirty(true)
-    if (scoreResult?.missingKeywords.length) {
-      setContent(prev => {
-        if (!prev) return prev
-        const existing = new Set(prev.skills?.map(s => s.toLowerCase()) ?? [])
-        const newSkills = scoreResult.missingKeywords.filter(kw => !existing.has(kw.toLowerCase()))
-        if (newSkills.length === 0) return prev
-        return { ...prev, skills: [...(prev.skills ?? []), ...newSkills] }
+
+    const hasProposed = s.proposed && s.proposed.trim()
+
+    switch (s.target) {
+      case 'summary':
+        if (s.action === 'rewrite' && hasProposed) {
+          patch(p => ({ ...p, summary: s.proposed! }), 'summary')
+          toast.success('Summary updated', 'AI-rewritten summary applied')
+        } else { toast.success('Noted', 'Suggestion marked as applied') }
+        break
+
+      case 'skills':
+        if (s.action === 'reorder' && hasProposed) {
+          const reordered = s.proposed!.split(/[,;]\s*/).map(x => x.trim()).filter(Boolean)
+          if (reordered.length > 0) {
+            patch(p => ({ ...p, skills: reordered }), 'skills')
+            toast.success('Skills reordered', `${reordered.length} skills reorganised for ATS`)
+          }
+        } else if (s.action === 'add_keywords' && scoreResult?.missingItems?.length) {
+          // Add ALL section-targeted missing keywords
+          const skillsKw = scoreResult.missingItems.filter(m => m.target === 'skills').map(m => m.keyword)
+          if (skillsKw.length > 0) {
+            setContent(prev => {
+              if (!prev) return prev
+              const existing = new Set(prev.skills?.map(sk => sk.toLowerCase()) ?? [])
+              const added = skillsKw.filter(kw => !existing.has(kw.toLowerCase()))
+              if (added.length === 0) return prev
+              return { ...prev, skills: [...(prev.skills ?? []), ...added] }
+            })
+            setContentChangedSinceAnalysis(true)
+            triggerFlash('skills')
+            toast.success('Skills updated', `Added ${skillsKw.length} targeted keyword(s)`)
+          }
+          // Also toast for non-skills keywords
+          const otherKw = scoreResult.missingItems.filter(m => m.target !== 'skills')
+          if (otherKw.length > 0) {
+            toast.success('Review other gaps', `Also check: ${otherKw.map(m => m.keyword).join(', ')}`)
+          }
+        } else { toast.success('Noted', 'Suggestion marked as applied') }
+        break
+
+      case 'experience':
+        if (s.action === 'enhance' && hasProposed) {
+          toast.success('Experience tip', 'Open the Experience section and use ✦ AI suggest on a bullet to apply enhancements')
+        } else { toast.success('Noted', 'Suggestion marked as applied') }
+        break
+
+      default:
+        toast.success('Noted', 'Suggestion marked as applied')
+    }
+    // Save updated suggestions to localStorage
+    try {
+      const updated = suggestions.map((sug, idx) => idx === i ? { ...sug, applied: true } : sug)
+      const job = jobs.find(j => j.id === selectedJobId)
+      saveCache({
+        resumeId: selectedResumeId,
+        jobId: selectedJobId,
+        jobTitle: job?.role ?? '',
+        jobCompany: job?.company ?? '',
+        score: scoreResult,
+        suggs: updated,
       })
-      toast.success('Skills updated', `Added ${scoreResult.missingKeywords.length} missing keyword(s)`)
-    } else toast.success('Noted', 'Suggestion marked as applied')
+    } catch {}
   }
 
   // ── Section ordering ──────────────────────────────────────────────────────
@@ -517,28 +786,31 @@ export function ResumePage() {
         editing={editSection === 'summary'}
         onEdit={() => setEditSection('summary')}
         onBlur={() => setEditSection(null)}
-        onChange={s => patch(p => ({ ...p, summary: s }))}
+        onChange={s => patch(p => ({ ...p, summary: s }), 'summary')}
         jobContext={jobContext}
         dragHandleProps={dh}
         onRemove={() => removeSection(sectionId)}
+        flash={flashField === 'summary'}
       />
     )
     if (sectionId === 'experience') return (
       <ExperienceSection key={sectionId}
         experience={content.experience}
         jobContext={jobContext}
-        onChange={exp => patch(p => ({ ...p, experience: exp }))}
+        onChange={exp => patch(p => ({ ...p, experience: exp }), 'experience')}
         dragHandleProps={dh}
         onRemove={() => removeSection(sectionId)}
+        flashField={flashField}
       />
     )
     if (sectionId === 'skills') return (
       <SkillsSection key={sectionId}
         skills={content.skills}
         matchedKeywords={scoreResult?.matchedKeywords ?? []}
-        onChange={sk => patch(p => ({ ...p, skills: sk }))}
+        onChange={sk => patch(p => ({ ...p, skills: sk }), 'skills')}
         dragHandleProps={dh}
         onRemove={() => removeSection(sectionId)}
+        flash={flashField === 'skills'}
       />
     )
     if (sectionId === 'education') return (
@@ -561,9 +833,10 @@ export function ResumePage() {
       <ProjectsSection key={sectionId}
         projects={content.projects ?? []}
         jobContext={jobContext}
-        onChange={projects => patch(p => ({ ...p, projects: projects.length > 0 ? projects : undefined }))}
+        onChange={projects => patch(p => ({ ...p, projects: projects.length > 0 ? projects : undefined }), 'projects')}
         dragHandleProps={dh}
         onRemove={() => removeSection(sectionId)}
+        flashField={flashField}
       />
     )
     if (sectionId === 'certifications') return (
@@ -614,6 +887,39 @@ export function ResumePage() {
             style={{ fontSize: 13, lineHeight: 1, padding: '3px 7px', border: '0.5px solid var(--border)', borderRadius: 6, background: 'var(--bg)', color: '#185FA5', cursor: 'pointer' }}>
             {creatingResume ? '…' : '+'}
           </button>
+          <button onClick={() => setShowUploadModal(true)} title="Import resume from PDF/DOCX"
+            style={{ fontSize: 11, lineHeight: 1, padding: '3px 8px', border: '0.5px solid var(--border)', borderRadius: 6, background: 'var(--bg)', color: '#185FA5', cursor: 'pointer' }}>
+            ↑ Import
+          </button>
+          <button
+            title="Delete this resume"
+            disabled={resumes.length <= 1}
+            onClick={async () => {
+              if (!selectedResumeId) return
+              const name = resumes.find(r => r.id === selectedResumeId)?.name ?? 'this resume'
+              const ok = await confirm({
+                title: 'Delete resume?',
+                message: `"${name}" will be permanently deleted. This cannot be undone.`,
+                danger: true,
+                confirmLabel: 'Delete',
+              })
+              if (!ok) return
+              const { error } = await apiMutate(`/api/resume/${selectedResumeId}`, 'DELETE', undefined)
+              if (error) { toast.error('Delete failed', error); return }
+              const remaining = resumes.filter(r => r.id !== selectedResumeId)
+              setResumes(remaining)
+              setSelectedResumeId(remaining[0]?.id ?? null)
+              toast.info('Deleted', `"${name}" has been removed`)
+            }}
+            style={{
+              fontSize: 13, lineHeight: 1, padding: '3px 7px',
+              border: '0.5px solid var(--border)', borderRadius: 6,
+              background: 'var(--bg)', cursor: resumes.length <= 1 ? 'not-allowed' : 'pointer',
+              color: resumes.length <= 1 ? 'var(--text-muted)' : '#A32D2D',
+              opacity: resumes.length <= 1 ? 0.4 : 1,
+            }}>
+            ✕
+          </button>
         </div>
         <Btn variant={previewMode ? 'primary' : 'ghost'} onClick={() => setPreviewMode(v => !v)}>
           {previewMode ? '✎ Edit' : '◻ Preview'}
@@ -629,9 +935,20 @@ export function ResumePage() {
           setShowCoverLetter(true)
         }}>✉ Cover Letter</Btn>
         <Btn variant="ghost" onClick={() => {
-          if (!selectedResumeId) { toast.info('Select a resume first'); return }
+          if (!selectedResumeId || !content) { toast.info('Select a resume first'); return }
+          // Snapshot current state into localStorage — print page reads this directly,
+          // so PDF always reflects what the user sees regardless of save timing
+          const snapshot = {
+            content: { ...content, sectionOrder },
+            templateId, templateOptions, name: resumeName,
+            ts: Date.now(),
+          }
+          localStorage.setItem(`print:${selectedResumeId}`, JSON.stringify(snapshot))
+          // Also persist to DB in the background (non-blocking)
+          if (dirty) handleSave()
           window.open(`/resume/${selectedResumeId}/print`, '_blank')
         }}>↓ PDF</Btn>
+        <Btn variant="ghost" onClick={() => { if (!selectedResumeId) { toast.info('Select a resume first'); return }; fetchVersions(); setShowVersions(true) }}>🕐 History</Btn>
         <Btn variant="primary" onClick={handleSave} disabled={!dirty || saving}>
           {saving ? 'Saving…' : dirty ? 'Save*' : 'Saved'}
         </Btn>
@@ -652,7 +969,7 @@ export function ResumePage() {
         <div style={{ flex: 1, display: 'flex', overflow: 'hidden', background: 'var(--bg-tertiary)' }}>
           <div style={{ flex: 1, overflowY: 'auto', padding: 24 }}>
             {/* ── PREVIEW MODE ── */}
-            {previewMode && <ResumePreview content={content} templateId={templateId} templateOptions={templateOptions} />}
+            {previewMode && <ResumePreview content={{ ...content, sectionOrder }} templateId={templateId} templateOptions={templateOptions} />}
             {/* Format toolbar + Editor (hidden in preview mode) */}
             {!previewMode && (<>
 
@@ -741,7 +1058,12 @@ export function ResumePage() {
             noJobSelected={!selectedJobId}
             onApplySuggestion={applySuggestion}
             onAnalyze={() => content && selectedJobId && runAnalysis(content, selectedJobId)}
-            onAddKeyword={kw => patch(p => ({ ...p, skills: [...(p.skills ?? []), kw] }))}
+            onAddKeyword={kw => patch(p => ({ ...p, skills: [...(p.skills ?? []), kw] }), 'skills')}
+            onApplyTargeted={applyTargeted}
+            onEditSection={sec => setEditSection(sec)}
+            currentSummary={content?.summary}
+            currentSkills={content?.skills}
+            contentChangedSinceAnalysis={contentChangedSinceAnalysis}
           />
         </div>
       )}
@@ -762,8 +1084,46 @@ export function ResumePage() {
       {showCoverLetter && content && selectedJob && (
         <CoverLetterModal resumeContent={content} job={selectedJob} onClose={() => setShowCoverLetter(false)} />
       )}
+      {showVersions && (
+        <div style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.3)', zIndex: 100, display: 'flex', alignItems: 'center', justifyContent: 'center' }}
+          onClick={e => { if (e.target === e.currentTarget) setShowVersions(false) }}>
+          <div style={{ background: 'var(--bg)', border: '0.5px solid var(--border)', borderRadius: 10, padding: 20, width: 400, maxHeight: '70vh', overflow: 'hidden', display: 'flex', flexDirection: 'column', boxShadow: '0 8px 32px rgba(0,0,0,0.15)' }}>
+            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 14 }}>
+              <span style={{ fontSize: 14, fontWeight: 500 }}>Version History</span>
+              <button onClick={() => setShowVersions(false)} style={{ background: 'none', border: 'none', cursor: 'pointer', fontSize: 16, color: 'var(--text-muted)', lineHeight: 1, padding: 0 }}>✕</button>
+            </div>
+            <div style={{ flex: 1, overflowY: 'auto' }}>
+              {loadingVers ? (
+                <div style={{ textAlign: 'center', padding: 30, fontSize: 12, color: 'var(--text-muted)' }}>Loading versions…</div>
+              ) : versions.length === 0 ? (
+                <div style={{ textAlign: 'center', padding: 30 }}>
+                  <div style={{ fontSize: 13, fontWeight: 500, marginBottom: 4 }}>No versions yet</div>
+                  <div style={{ fontSize: 11, color: 'var(--text-muted)' }}>Versions are created automatically when you save your resume.</div>
+                </div>
+              ) : (
+                <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+                  {versions.map((v, i) => (
+                    <div key={v.id} style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '8px 10px', background: i === 0 ? 'rgba(24,95,165,0.06)' : 'var(--bg-secondary)', borderRadius: 6, border: i === 0 ? '0.5px solid rgba(24,95,165,0.2)' : '0.5px solid var(--border)' }}>
+                      <div>
+                        <div style={{ fontSize: 12, fontWeight: 500, color: 'var(--text)' }}>{v.name}</div>
+                        <div style={{ fontSize: 10, color: 'var(--text-muted)' }}>{fmtDate(v.createdAt)} · {fmtRelative(v.createdAt)}</div>
+                      </div>
+                      <Btn small variant="ghost" disabled={restoring} onClick={() => restoreVersion(v.id)}>
+                        Restore
+                      </Btn>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
       {showNewResume && (
         <NewResumeModal onClose={() => setShowNewResume(false)} onCreate={handleCreateResume} />
+      )}
+      {showUploadModal && (
+        <UploadResumeModal onClose={() => setShowUploadModal(false)} onImport={handleImportResume} />
       )}
     </div>
   )

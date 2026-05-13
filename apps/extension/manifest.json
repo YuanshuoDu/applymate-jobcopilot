@@ -30,8 +30,14 @@
     {
       "matches": [
         "*://*.linkedin.com/jobs/*",
+        "*://*.linkedin.com/jobs*",
         "*://*.indeed.com/viewjob*",
         "*://*.indeed.com/jobs*",
+        "*://*.indeed.com/*?q=*",
+        "*://*.indeed.de/*",
+        "*://*.indeed.co.uk/*",
+        "*://*.indeed.fr/*",
+        "*://*.glassdoor.com/Job/*",
         "*://*.glassdoor.com/job-listing/*",
         "*://*.glassdoor.com/Jobs/*",
         "*://*.stepstone.de/*",
@@ -42,9 +48,18 @@
         "*://*.stepstone.fr/*",
         "*://*.xing.com/jobs/*",
         "*://*.wellfound.com/jobs/*",
+        "*://*.wellfound.com/*",
         "*://*.greenhouse.io/jobs/*",
         "*://*.lever.co/*",
-        "*://*.myworkdayjobs.com/*"
+        "*://*.myworkdayjobs.com/*",
+        "*://*.monster.de/*",
+        "*://*.monster.com/*",
+        "*://*.monster.co.uk/*",
+        "*://*.arbeitsagentur.de/jobsuche/*",
+        "*://*.jobs.de/*",
+        "http://localhost:3000/*",
+        "http://localhost:5173/*",
+        "*://web-delta-ruddy-29.vercel.app/*"
       ],
       "js":       ["src/content/index.ts"],
       "css":      ["src/content/inject.css"],
@@ -57,11 +72,25 @@
     "sidePanel",
     "activeTab",
     "scripting",
-    "tabs"
+    "tabs",
+    "contextMenus"
   ],
+  "commands": {
+    "_execute_action": {
+      "suggested_key": { "default": "Ctrl+Shift+Y", "mac": "Command+Shift+Y" },
+      "description": "Open ApplyMate popup"
+    },
+    "open_tracker": {
+      "suggested_key": { "default": "Ctrl+Shift+U", "mac": "Command+Shift+U" },
+      "description": "Open ApplyMate AI sidebar"
+    }
+  },
   "host_permissions": [
     "*://*.linkedin.com/*",
     "*://*.indeed.com/*",
+    "*://*.indeed.de/*",
+    "*://*.indeed.co.uk/*",
+    "*://*.indeed.fr/*",
     "*://*.glassdoor.com/*",
     "*://*.stepstone.de/*",
     "*://*.stepstone.at/*",
@@ -74,13 +103,21 @@
     "*://*.greenhouse.io/*",
     "*://*.lever.co/*",
     "*://*.myworkdayjobs.com/*",
+    "*://*.monster.de/*",
+    "*://*.monster.com/*",
+    "*://*.monster.co.uk/*",
+    "*://*.arbeitsagentur.de/*",
+    "*://*.jobs.de/*",
     "http://localhost:3000/*",
     "https://*.vercel.app/*",
     "https://*.applymate.ai/*"
   ],
+  "optional_host_permissions": [
+    "<all_urls>"
+  ],
   "web_accessible_resources": [
     {
-      "resources": ["icons/*"],
+      "resources": ["icons/*", "chunks/*.js"],
       "matches":   ["<all_urls>"]
     }
   ]

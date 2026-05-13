@@ -1,6 +1,6 @@
 'use client'
 
-import React, { useMemo, useState, useEffect, useRef } from 'react'
+import React, { useMemo, useState, useEffect, useRef, useCallback } from 'react'
 import { TopBar } from '@/components/layout/TopBar'
 import { Btn, Card, CompanyLogo, INPUT_STYLE, ScorePill, StatusBadge, useToast, useConfirm } from '@/components/ui'
 import type { Job, JobStatus, Activity } from '@/lib/types'
@@ -181,12 +181,59 @@ function KanbanView({ jobs, onStatusChange, onAddClick }: {
 }
 
 // ── ApplyBasket ───────────────────────────────────────────────────────────────
-function ApplyBasket({ cart, onRemove, onClose }: {
+function ApplyBasket({ cart, onRemove, onClose, onJobsUpdated }: {
   cart: Job[]
   onRemove: (id: string) => void
   onClose: () => void
+  onJobsUpdated: (jobs: Job[]) => void
 }) {
   const toast = useToast()
+  const [tailoring, setTailoring] = useState(false)
+  const [tailored, setTailored] = useState<Set<string>>(new Set())
+  const [applying, setApplying] = useState(false)
+
+  async function handleTailor() {
+    setTailoring(true)
+    let count = 0
+    for (const job of cart) {
+      try {
+        const res = await fetch('/api/ai/cover-letter', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ jobTitle: job.role, jobCompany: job.company, jobDescription: job.description }),
+        })
+        const data = await res.json()
+        if (res.ok && data.coverLetter) {
+          const { error } = await apiMutate(`/api/jobs/${job.id}`, 'PATCH', { coverLetter: data.coverLetter })
+          if (!error) {
+            setTailored(prev => new Set(prev).add(job.id))
+            count++
+          }
+        }
+      } catch { /* skip failed items */ }
+    }
+    setTailoring(false)
+    if (count > 0) {
+      toast.success('Cover letters ready', `${count}/${cart.length} generated and saved to job details`)
+    } else {
+      toast.error('Generation failed', 'Could not generate cover letters. Check your AI config in Settings.')
+    }
+  }
+
+  async function handleApply() {
+    setApplying(true)
+    const now = new Date().toISOString()
+    let applied = 0
+    for (const job of cart) {
+      const { error } = await apiMutate(`/api/jobs/${job.id}`, 'PATCH', { status: 'applied', appliedAt: now })
+      if (!error) applied++
+    }
+    setApplying(false)
+    toast.success('Applications sent', `${applied}/${cart.length} jobs marked as applied`)
+    onJobsUpdated(cart.map(j => ({ ...j, status: 'applied' as const })))
+    onClose()
+  }
+
   return (
     <div style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.3)', zIndex: 100, display: 'flex', alignItems: 'center', justifyContent: 'center' }}
       onClick={e => { if (e.target === e.currentTarget) onClose() }}>
@@ -207,16 +254,25 @@ function ApplyBasket({ cart, onRemove, onClose }: {
                 <div style={{ fontSize: 11, color: 'var(--text-muted)' }}>{j.company} · {j.location}</div>
               </div>
               <ScorePill score={j.score ?? 0} />
-              <button onClick={() => onRemove(j.id)} style={{ background: 'none', border: 'none', cursor: 'pointer', color: 'var(--text-muted)', fontSize: 13 }}>✕</button>
+              {tailored.has(j.id) && <span style={{ fontSize: 10, color: '#3B6D11', fontWeight: 500 }}>✓ Tailored</span>}
+              {!tailoring && <button onClick={() => onRemove(j.id)} style={{ background: 'none', border: 'none', cursor: 'pointer', color: 'var(--text-muted)', fontSize: 13 }}>✕</button>}
             </div>
           ))}
         </div>
         {cart.length > 0 && (
           <div style={{ padding: '12px 16px', borderTop: '0.5px solid var(--border)', background: 'var(--bg-secondary)', display: 'flex', flexDirection: 'column', gap: 8 }}>
-            <div style={{ fontSize: 11, color: 'var(--text-muted)' }}>AI will tailor your CV + cover letter for each job, then send for your review before applying.</div>
+            <div style={{ fontSize: 11, color: 'var(--text-muted)' }}>
+              {tailored.size > 0
+                ? `${tailored.size}/${cart.length} cover letters generated. Review and apply when ready.`
+                : 'AI will generate a cover letter for each job, then mark them as applied.'}
+            </div>
             <div style={{ display: 'flex', gap: 8 }}>
-              <Btn variant="ghost"   style={{ flex: 1 }} onClick={() => toast.info('Tailoring CVs', 'AI is optimizing for each role…')}>✦ Tailor CVs</Btn>
-              <Btn variant="primary" style={{ flex: 1 }} onClick={() => { toast.success('Sent to review', `${cart.length} applications ready for approval`); onClose() }}>Review & Apply →</Btn>
+              <Btn variant="ghost" style={{ flex: 1 }} disabled={tailoring} onClick={handleTailor}>
+                {tailoring ? 'Generating…' : '✦ Tailor CVs'}
+              </Btn>
+              <Btn variant="primary" style={{ flex: 1 }} disabled={applying} onClick={handleApply}>
+                {applying ? 'Applying…' : 'Review & Apply →'}
+              </Btn>
             </div>
           </div>
         )}
@@ -322,10 +378,21 @@ function JobDetailDrawer({ job, onClose, onStatusChange, onUpdate, onDelete }: {
   const [deleting,     setDeleting]     = useState(false)
   const [activity,     setActivity]     = useState<Activity[]>([])
   const [loadingAct,   setLoadingAct]   = useState(true)
+  const [interviewPrep, setInterviewPrep] = useState<{
+    questions: Array<{ question: string; framework: string }>
+    companyResearch: string
+    followUpEmail: string
+  } | null>(null)
+  const [loadingPrep, setLoadingPrep] = useState(false)
+  const [editingCover, setEditingCover] = useState(false)
+  const [coverText,    setCoverText]    = useState(job.coverLetter ?? '')
+  const [savingCover,  setSavingCover]  = useState(false)
+  const [descExpanded, setDescExpanded] = useState(false)
 
-  // Load per-job activity on mount
+  // Load per-job activity on mount; reset interview prep when job changes
   useEffect(() => {
     setLoadingAct(true)
+    setInterviewPrep(null)
     fetch(`/api/activity?jobId=${job.id}&limit=20`)
       .then(r => r.json())
       .then((data: Activity[]) => setActivity(Array.isArray(data) ? data : []))
@@ -336,6 +403,7 @@ function JobDetailDrawer({ job, onClose, onStatusChange, onUpdate, onDelete }: {
   // Sync local state when parent job changes
   useEffect(() => { setNotes(job.notes ?? '') }, [job.notes])
   useEffect(() => { setFollowUpAt(job.followUpAt ? job.followUpAt.slice(0, 10) : '') }, [job.followUpAt])
+  useEffect(() => { setCoverText(job.coverLetter ?? ''); setEditingCover(false) }, [job.coverLetter])
 
   async function saveNotes() {
     if (notes === (job.notes ?? '')) return
@@ -358,6 +426,15 @@ function JobDetailDrawer({ job, onClose, onStatusChange, onUpdate, onDelete }: {
     if (data)  { onUpdate(data); toast.success(value ? 'Follow-up date set' : 'Follow-up date cleared') }
   }
 
+  async function saveCover() {
+    if (coverText === (job.coverLetter ?? '')) return
+    setSavingCover(true)
+    const { data, error } = await apiMutate<Job>(`/api/jobs/${job.id}`, 'PATCH', { coverLetter: coverText })
+    setSavingCover(false)
+    if (error) { toast.error('Save failed', error); return }
+    if (data) { onUpdate(data); setEditingCover(false); toast.success('Cover letter saved') }
+  }
+
   async function handleDelete() {
     const ok = await confirm({
       title:        'Delete job?',
@@ -372,6 +449,27 @@ function JobDetailDrawer({ job, onClose, onStatusChange, onUpdate, onDelete }: {
     if (error) { toast.error('Delete failed', error); return }
     onDelete(job.id)
     onClose()
+  }
+
+  async function generateInterviewPrep() {
+    setLoadingPrep(true)
+    try {
+      const res = await fetch('/api/ai/interview-prep', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ jobTitle: job.role, jobCompany: job.company, jobDescription: job.description }),
+      })
+      const data = await res.json()
+      if (res.ok && data.questions) {
+        setInterviewPrep(data)
+      } else {
+        toast.error('Prep failed', data.error ?? 'Could not generate interview prep')
+      }
+    } catch {
+      toast.error('Network error', 'Could not reach AI')
+    } finally {
+      setLoadingPrep(false)
+    }
   }
 
   // Drawer uses a slightly more compact variant of the shared INPUT_STYLE
@@ -405,7 +503,7 @@ function JobDetailDrawer({ job, onClose, onStatusChange, onUpdate, onDelete }: {
         <div style={{ padding: '12px 18px', borderBottom: '0.5px solid var(--border)', display: 'flex', flexWrap: 'wrap', gap: 8, alignItems: 'center' }}>
           <StatusBadge status={job.status} />
           {job.score != null && <ScorePill score={job.score} />}
-          {job.salary && <span style={{ fontSize: 11, color: 'var(--text-muted)', background: 'var(--bg-secondary)', border: '0.5px solid var(--border)', borderRadius: 5, padding: '2px 7px' }}>{job.salary}</span>}
+          {job.salary && <span style={{ fontSize: 11, color: 'var(--text-muted)', background: 'var(--bg-secondary)', border: '0.5px solid var(--border)', borderRadius: 5, padding: '2px 7px' }}>{renderSalary(job.salary)}</span>}
           {/* Status change */}
           <select
             value={job.status}
@@ -429,6 +527,84 @@ function JobDetailDrawer({ job, onClose, onStatusChange, onUpdate, onDelete }: {
               </a>
             </div>
           )}
+
+          {/* Description */}
+          {job.description && (
+            <div>
+              <div style={{ fontSize: 10, color: 'var(--text-muted)', fontWeight: 500, marginBottom: 6 }}>DESCRIPTION</div>
+              <div style={{
+                fontSize: 12, color: 'var(--text)', lineHeight: 1.75, whiteSpace: 'pre-wrap',
+                background: 'var(--bg-secondary)', borderRadius: 6, padding: '10px 12px',
+                maxHeight: descExpanded ? 'none' : 280, overflow: descExpanded ? 'visible' : 'hidden',
+                position: 'relative' as const,
+              }}>
+                {job.description}
+                {!descExpanded && job.description.length > 500 && (
+                  <div style={{ position: 'absolute', bottom: 0, left: 0, right: 0, height: 50, background: 'linear-gradient(transparent, var(--bg-secondary))' }} />
+                )}
+              </div>
+              <div style={{ display: 'flex', gap: 12, marginTop: 4 }}>
+                {job.description.length > 500 && (
+                  <button onClick={() => setDescExpanded(v => !v)}
+                    style={{ fontSize: 10, color: '#185FA5', background: 'none', border: 'none', cursor: 'pointer', padding: 0 }}>
+                    {descExpanded ? '▲ Show less' : '▼ Read more'}
+                  </button>
+                )}
+                {job.url && (
+                  <a href={job.url} target="_blank" rel="noopener noreferrer"
+                    style={{ fontSize: 10, color: 'var(--text-muted)', textDecoration: 'underline' }}>
+                    View original posting ↗
+                  </a>
+                )}
+              </div>
+            </div>
+          )}
+
+          {/* Agent Analysis */}
+          {job.analysisNote && (
+            <div>
+              <div style={{ fontSize: 10, color: '#185FA5', fontWeight: 500, marginBottom: 6 }}>AI ANALYSIS</div>
+              <div style={{ fontSize: 11, color: 'var(--text)', lineHeight: 1.7, whiteSpace: 'pre-wrap', background: 'rgba(24,95,165,0.06)', border: '0.5px solid rgba(24,95,165,0.15)', borderRadius: 6, padding: '8px 10px', maxHeight: 200, overflowY: 'auto' }}>
+                {job.analysisNote}
+              </div>
+            </div>
+          )}
+
+          {/* Cover Letter */}
+          <div>
+            <div style={{ fontSize: 10, color: '#3B6D11', fontWeight: 500, marginBottom: 6, display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+              <span>COVER LETTER</span>
+              <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
+                {savingCover && <span style={{ fontSize: 9, color: 'var(--text-muted)' }}>Saving…</span>}
+                {editingCover ? (
+                  <>
+                    <button onClick={saveCover} style={{ fontSize: 9, color: '#3B6D11', background: 'rgba(59,109,17,0.1)', border: '0.5px solid rgba(59,109,17,0.25)', borderRadius: 4, padding: '2px 6px', cursor: 'pointer' }}>Save</button>
+                    <button onClick={() => { setEditingCover(false); setCoverText(job.coverLetter ?? '') }} style={{ fontSize: 9, color: 'var(--text-muted)', background: 'none', border: 'none', cursor: 'pointer', padding: '2px 4px' }}>Cancel</button>
+                  </>
+                ) : job.coverLetter ? (
+                  <button onClick={() => setEditingCover(true)} style={{ fontSize: 9, color: '#185FA5', background: 'rgba(24,95,165,0.08)', border: '0.5px solid rgba(24,95,165,0.2)', borderRadius: 4, padding: '2px 6px', cursor: 'pointer' }}>Edit</button>
+                ) : (
+                  <button onClick={() => { setCoverText(''); setEditingCover(true) }} style={{ fontSize: 9, color: '#3B6D11', background: 'rgba(59,109,17,0.1)', border: '0.5px solid rgba(59,109,17,0.25)', borderRadius: 4, padding: '2px 6px', cursor: 'pointer' }}>+ Add</button>
+                )}
+              </div>
+            </div>
+            {editingCover ? (
+              <textarea
+                value={coverText}
+                onChange={e => setCoverText(e.target.value)}
+                onKeyDown={e => { if ((e.metaKey || e.ctrlKey) && e.key === 's') { e.preventDefault(); saveCover() } }}
+                style={{ ...drawerInputSt, width: '100%', minHeight: 120, resize: 'vertical', lineHeight: 1.6, padding: '7px 9px', fontSize: 11, boxSizing: 'border-box' }}
+              />
+            ) : job.coverLetter ? (
+              <div style={{ fontSize: 11, color: 'var(--text)', lineHeight: 1.7, whiteSpace: 'pre-wrap', background: 'rgba(59,109,17,0.06)', border: '0.5px solid rgba(59,109,17,0.15)', borderRadius: 6, padding: '8px 10px', maxHeight: 200, overflowY: 'auto' }}>
+                {job.coverLetter}
+              </div>
+            ) : (
+              <div style={{ fontSize: 11, color: 'var(--text-muted)', fontStyle: 'italic', padding: '8px 0' }}>
+                No cover letter yet. Click "+ Add" above or use the Apply Basket to generate one.
+              </div>
+            )}
+          </div>
 
           {/* Dates */}
           <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10 }}>
@@ -508,6 +684,68 @@ function JobDetailDrawer({ job, onClose, onStatusChange, onUpdate, onDelete }: {
               </div>
             )}
           </div>
+
+          {/* Interview Prep */}
+          {job.status === 'interview' && (
+            <div>
+              <div style={{ fontSize: 10, color: '#3B6D11', fontWeight: 500, marginBottom: 8 }}>INTERVIEW PREP</div>
+              {!interviewPrep ? (
+                <button
+                  onClick={generateInterviewPrep}
+                  disabled={loadingPrep}
+                  style={{
+                    width: '100%', padding: '8px 0', borderRadius: 6, border: '0.5px solid rgba(59,109,17,0.3)',
+                    background: loadingPrep ? 'var(--bg-secondary)' : 'rgba(59,109,17,0.08)',
+                    color: '#3B6D11', fontSize: 11, fontWeight: 500, cursor: loadingPrep ? 'not-allowed' : 'pointer',
+                    opacity: loadingPrep ? 0.6 : 1,
+                  }}>
+                  {loadingPrep ? 'Generating…' : 'Generate Interview Prep'}
+                </button>
+              ) : (
+                <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+                  <div>
+                    <div style={{ fontSize: 10, color: 'var(--text-muted)', fontWeight: 500, marginBottom: 6 }}>
+                      Practice Questions ({interviewPrep.questions.length})
+                    </div>
+                    <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+                      {interviewPrep.questions.map((q, i) => (
+                        <details key={i} style={{ fontSize: 11 }}>
+                          <summary style={{ color: 'var(--text)', cursor: 'pointer', fontWeight: 500, padding: '4px 0' }}>
+                            {i + 1}. {q.question}
+                          </summary>
+                          <div style={{ color: 'var(--text-muted)', padding: '4px 8px', marginTop: 2, background: 'var(--bg-secondary)', borderRadius: 4, lineHeight: 1.6 }}>
+                            {q.framework}
+                          </div>
+                        </details>
+                      ))}
+                    </div>
+                  </div>
+                  <div>
+                    <div style={{ fontSize: 10, color: 'var(--text-muted)', fontWeight: 500, marginBottom: 4 }}>Company Research</div>
+                    <div style={{ fontSize: 11, color: 'var(--text)', lineHeight: 1.7, background: 'var(--bg-secondary)', borderRadius: 6, padding: '8px 10px', whiteSpace: 'pre-wrap' }}>
+                      {interviewPrep.companyResearch}
+                    </div>
+                  </div>
+                  <div>
+                    <div style={{ fontSize: 10, color: 'var(--text-muted)', fontWeight: 500, marginBottom: 4 }}>Follow-up Email Template</div>
+                    <div style={{ fontSize: 11, color: 'var(--text)', lineHeight: 1.7, background: 'var(--bg-secondary)', borderRadius: 6, padding: '8px 10px', whiteSpace: 'pre-wrap', position: 'relative' }}>
+                      {interviewPrep.followUpEmail}
+                      <button
+                        onClick={() => { navigator.clipboard.writeText(interviewPrep.followUpEmail); toast.success('Copied', 'Email template copied to clipboard') }}
+                        style={{ position: 'absolute', top: 6, right: 6, fontSize: 10, padding: '2px 8px', borderRadius: 4, background: 'var(--bg)', border: '0.5px solid var(--border)', color: 'var(--text-muted)', cursor: 'pointer' }}>
+                        Copy
+                      </button>
+                    </div>
+                  </div>
+                  <button
+                    onClick={() => setInterviewPrep(null)}
+                    style={{ fontSize: 10, color: 'var(--text-muted)', background: 'none', border: 'none', cursor: 'pointer', padding: 0, textAlign: 'left' }}>
+                    Clear & regenerate
+                  </button>
+                </div>
+              )}
+            </div>
+          )}
         </div>
 
         {/* Footer */}
@@ -519,6 +757,91 @@ function JobDetailDrawer({ job, onClose, onStatusChange, onUpdate, onDelete }: {
         </div>
       </div>
     </>
+  )
+}
+
+// Safety helper: salary DB field might be a JSON object from Google Jobs schema
+function renderSalary(salary: unknown): string {
+  if (!salary) return ''
+  if (typeof salary === 'string') return salary
+  return String(salary)
+}
+
+// ── PaginationBar ────────────────────────────────────────────────────────────
+
+const PAGE_SIZE_OPTS = [20, 50]
+const SORT_OPTS: { value: string; label: string }[] = [
+  { value: 'createdAt', label: 'Date' },
+  { value: 'score',     label: 'Score' },
+  { value: 'company',   label: 'Company' },
+  { value: 'role',      label: 'Role' },
+]
+
+function PaginationBar({
+  total, page, pageSize, onChangePage, onChangeSize,
+  sortBy, sortDir, onChangeSort,
+}: {
+  total:        number; page: number; pageSize: number
+  onChangePage: (p: number) => void; onChangeSize: (s: number) => void
+  sortBy:       string; sortDir: string
+  onChangeSort: (by: any, dir: any) => void
+}) {
+  const totalPages = Math.ceil(total / pageSize)
+  const from = (page - 1) * pageSize + 1
+  const to   = Math.min(page * pageSize, total)
+
+  const btnStyle = (disabled: boolean): React.CSSProperties => ({
+    padding: '4px 10px', border: '0.5px solid var(--border)', borderRadius: 5,
+    background: disabled ? 'var(--bg-secondary)' : 'var(--bg)',
+    color: disabled ? 'var(--text-muted)' : 'var(--text)',
+    cursor: disabled ? 'default' : 'pointer', fontSize: 11, fontWeight: 500,
+  })
+
+  const pageNums: number[] = []
+  for (let p = Math.max(1, page - 2); p <= Math.min(totalPages, page + 2); p++) {
+    pageNums.push(p)
+  }
+
+  return (
+    <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap', gap: 10, padding: '10px 16px', borderTop: '0.5px solid var(--border)', background: 'var(--bg-secondary)' }}>
+      {/* Left: page info + size selector */}
+      <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+        <span style={{ fontSize: 11, color: 'var(--text-muted)' }}>
+          {from}–{to} of {total}
+        </span>
+        <select value={pageSize} onChange={e => onChangeSize(Number(e.target.value))}
+          style={{ padding: '3px 6px', fontSize: 10, border: '0.5px solid var(--border)', borderRadius: 5, background: 'var(--bg)', color: 'var(--text)' }}>
+          {PAGE_SIZE_OPTS.map(s => <option key={s} value={s}>{s} / page</option>)}
+        </select>
+      </div>
+
+      {/* Center: sort */}
+      <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+        <span style={{ fontSize: 10, color: 'var(--text-muted)' }}>Sort:</span>
+        <select value={sortBy} onChange={e => onChangeSort(e.target.value, sortDir)}
+          style={{ padding: '3px 6px', fontSize: 10, border: '0.5px solid var(--border)', borderRadius: 5, background: 'var(--bg)', color: 'var(--text)' }}>
+          {SORT_OPTS.map(o => <option key={o.value} value={o.value}>{o.label}</option>)}
+        </select>
+        <button onClick={() => onChangeSort(sortBy, sortDir === 'asc' ? 'desc' : 'asc')}
+          style={{ ...btnStyle(false), fontSize: 12, padding: '3px 7px' }}>
+          {sortDir === 'asc' ? '↑' : '↓'}
+        </button>
+      </div>
+
+      {/* Right: page nav */}
+      <div style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
+        <button onClick={() => onChangePage(1)} disabled={page <= 1} style={btnStyle(page <= 1)}>«</button>
+        <button onClick={() => onChangePage(page - 1)} disabled={page <= 1} style={btnStyle(page <= 1)}>‹</button>
+        {pageNums.map(p => (
+          <button key={p} onClick={() => onChangePage(p)}
+            style={{ ...btnStyle(false), minWidth: 28, textAlign: 'center', fontWeight: p === page ? 700 : 400, background: p === page ? 'rgba(24,95,165,0.08)' : 'var(--bg)', color: p === page ? '#185FA5' : 'var(--text)' }}>
+            {p}
+          </button>
+        ))}
+        <button onClick={() => onChangePage(page + 1)} disabled={page >= totalPages} style={btnStyle(page >= totalPages)}>›</button>
+        <button onClick={() => onChangePage(totalPages)} disabled={page >= totalPages} style={btnStyle(page >= totalPages)}>»</button>
+      </div>
+    </div>
   )
 }
 
@@ -537,21 +860,50 @@ export function JobsPage() {
   const [loading,      setLoading     ] = useState(true)
   const [fetchError,   setFetchError  ] = useState<string | null>(null)
   const [selectedJob,  setSelectedJob ] = useState<Job | null>(null)
+  const [page,         setPage        ] = useState(1)
+  const [pageSize,     setPageSize    ] = useState(20)
+  const [sortBy,       setSortBy      ] = useState<'createdAt' | 'score' | 'company' | 'role'>('createdAt')
+  const [sortDir,      setSortDir     ] = useState<'asc' | 'desc'>('desc')
 
-  // Debounced fetch whenever search / filter changes
+  // When navigating from Search page after a job save+score, force refresh
+  const [refreshTick, setRefreshTick] = useState(0)
+  const triggerRefresh = () => setRefreshTick(t => t + 1)
+
+  // Reset page to 1 when search/filter/pageSize changes
+  const doSearch = useCallback((q: string) => { setSearch(q); setPage(1) }, [])
+  const doFilter  = useCallback((s: string) => { setFilterStatus(s as JobStatus | 'all'); setPage(1) }, [])
+
+  // Debounced fetch
   useEffect(() => {
     let cancelled = false
     const timer = setTimeout(async () => {
       setLoading(true)
       setFetchError(null)
       try {
-        const params = new URLSearchParams({ pageSize: '100' })
+        const params = new URLSearchParams({ page: String(page), pageSize: String(pageSize) })
         if (search)                params.set('q',      search)
         if (filterStatus !== 'all') params.set('status', filterStatus)
         const res  = await fetch(`/api/jobs?${params}`)
         const json = await res.json()
         if (!cancelled) {
-          setJobs(json.jobs   ?? [])
+          const rawJobs: Job[] = json.jobs ?? []
+          // Client-side sort (API returns createdAt desc by default; override for other sorts)
+          const sorted = [...rawJobs].sort((a, b) => {
+            let cmp = 0
+            if (sortBy === 'score') {
+              cmp = (a.score ?? -1) - (b.score ?? -1)
+            } else if (sortBy === 'company') {
+              cmp = a.company.localeCompare(b.company)
+            } else if (sortBy === 'role') {
+              cmp = a.role.localeCompare(b.role)
+            }
+            // createdAt is default from API, no extra sort needed
+            if (sortBy === 'createdAt' || cmp === 0) {
+              cmp = new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime()
+            }
+            return sortDir === 'desc' ? cmp : -cmp
+          })
+          setJobs(sorted)
           setTotal(json.total ?? 0)
         }
       } catch {
@@ -561,7 +913,34 @@ export function JobsPage() {
       }
     }, search ? 300 : 0)
     return () => { cancelled = true; clearTimeout(timer) }
-  }, [search, filterStatus])
+  }, [search, filterStatus, page, pageSize, sortBy, sortDir, refreshTick])
+
+  // When the component gains focus (user navigates back from Search), refresh
+  useEffect(() => {
+    const onFocus = () => triggerRefresh()
+    const onMessage = (e: MessageEvent) => {
+      if (e.data?.type === 'job-saved' || e.data?.type === 'nav-refresh') triggerRefresh()
+    }
+    window.addEventListener('focus', onFocus)
+    window.addEventListener('message', onMessage)
+    return () => { window.removeEventListener('focus', onFocus); window.removeEventListener('message', onMessage) }
+  }, [])
+
+  // Deep-link: ?highlight=<jobId> from extension sidebar/popup — auto-open the job drawer
+  useEffect(() => {
+    if (loading || jobs.length === 0) return
+    const params = new URLSearchParams(window.location.search)
+    const highlightId = params.get('highlight')
+    if (!highlightId) return
+    const match = jobs.find(j => j.id === highlightId)
+    if (match) {
+      setSelectedJob(match)
+      // Clean up the URL param without triggering a navigation
+      const url = new URL(window.location.href)
+      url.searchParams.delete('highlight')
+      window.history.replaceState({}, '', url.toString())
+    }
+  }, [loading, jobs])
 
   async function handleStatusChange(jobId: string, newStatus: JobStatus) {
     // Optimistic update
@@ -623,11 +1002,11 @@ export function JobsPage() {
         <Btn variant={cart.length ? 'primary' : 'ghost'} onClick={() => setShowCart(true)}>
           🛒 Basket {cart.length > 0 && <span style={{ background: 'rgba(255,255,255,0.25)', borderRadius: 999, padding: '1px 6px', fontSize: 10, marginLeft: 4 }}>{cart.length}</span>}
         </Btn>
-        <Btn variant="ghost" onClick={() => { setPrefillStatus(null); setShowAdd(true) }}>+ Add Job</Btn>
+<Btn variant="ghost" onClick={() => { setPrefillStatus(null); setShowAdd(true) }}>+ Add Job</Btn>
       </TopBar>
 
       <div style={{ padding: 20, flex: 1 }}>
-        {loading ? (
+{loading ? (
           <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 60 }}>
             <div style={{ display: 'flex', alignItems: 'center', gap: 10, color: 'var(--text-muted)', fontSize: 12 }}>
               <div style={{ width: 20, height: 20, border: '2px solid rgba(24,95,165,0.2)', borderTopColor: '#185FA5', borderRadius: '50%', animation: 'spin 0.7s linear infinite' }} />
@@ -678,6 +1057,14 @@ export function JobsPage() {
             {view === 'list'
               ? <ListView jobs={jobs} onRowClick={setSelectedJob} />
               : <KanbanView jobs={jobs} onStatusChange={handleStatusChange} onAddClick={col => { setPrefillStatus(col); setShowAdd(true) }} />}
+
+            {/* ── Pagination bar ── */}
+            {total > pageSize && (
+              <PaginationBar total={total} page={page} pageSize={pageSize}
+                onChangePage={setPage} onChangeSize={v => { setPageSize(v); setPage(1) }}
+                sortBy={sortBy} sortDir={sortDir}
+                onChangeSort={(by, dir) => { setSortBy(by); setSortDir(dir) }} />
+            )}
           </>
         )}
       </div>
@@ -687,6 +1074,13 @@ export function JobsPage() {
           cart={cart}
           onRemove={id => setCart(c => c.filter(x => x.id !== id))}
           onClose={() => setShowCart(false)}
+          onJobsUpdated={updated => {
+            setJobs(prev => prev.map(j => {
+              const u = updated.find(x => x.id === j.id)
+              return u ?? j
+            }))
+            setCart([])
+          }}
         />
       )}
       {showAdd && (

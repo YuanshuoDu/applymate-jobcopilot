@@ -5,6 +5,8 @@ import { TopBar } from '@/components/layout/TopBar'
 import { Btn, Card, StatusBadge, useToast } from '@/components/ui'
 import type { DashboardData, AgentConfig, JobStatus } from '@/lib/types'
 import { useApi, apiMutate, fmtDate, fmtRelative } from '@/lib/hooks'
+import { useNav } from '@/lib/nav-context'
+import { OnboardingChecklist } from '@/components/onboarding/OnboardingChecklist'
 
 const ACTIVITY_COLORS: Record<string, string> = {
   applied:             '#185FA5',
@@ -74,6 +76,7 @@ function AgentStatusCard({
   onUpdate: (patch: Partial<AgentConfig>) => void
 }) {
   const toast   = useToast()
+  const { navigate } = useNav()
   const running = config?.isRunning  ?? false
   const limit   = config?.dailyLimit ?? 10
   const score   = config?.minMatchScore ?? 75
@@ -125,8 +128,8 @@ function AgentStatusCard({
       </div>
 
       <div style={{ display: 'flex', gap: 6 }}>
-        <Btn small variant="ghost"   style={{ flex: 1 }} onClick={() => toast.info('Configure agent')}>Configure</Btn>
-        <Btn small variant="primary" style={{ flex: 1 }} onClick={() => toast.info('Opening review queue')}>Review Queue</Btn>
+        <Btn small variant="ghost"   style={{ flex: 1 }} onClick={() => navigate('settings')}>Configure</Btn>
+        <Btn small variant="primary" style={{ flex: 1 }} onClick={() => navigate('jobs')}>Review Queue</Btn>
       </div>
     </Card>
   )
@@ -134,7 +137,7 @@ function AgentStatusCard({
 
 // ── DashboardPage ─────────────────────────────────────────────────────────────
 export function DashboardPage() {
-  const toast  = useToast()
+  const { navigate } = useNav()
   const { data, loading, error, refetch } = useApi<DashboardData>('/api/dashboard')
 
   // Poll for fresh data every 30s
@@ -186,11 +189,21 @@ export function DashboardPage() {
   return (
     <div style={{ flex: 1, overflowY: 'auto', background: 'var(--bg-tertiary)' }}>
       <TopBar title="Dashboard">
-        <Btn variant="ghost" onClick={() => toast.info('Add job', 'Opening job form')}>+ Add Job</Btn>
-        <Btn variant="primary" onClick={() => toast.success('Agent triggered', 'Scanning LinkedIn & Indeed now')}>▶ Run Agent</Btn>
+        <Btn variant="ghost" onClick={() => navigate('jobs')}>+ Add Job</Btn>
+        <Btn variant="primary" onClick={() => navigate('agent')}>▶ Run Agent</Btn>
       </TopBar>
 
       <div style={{ padding: 20, display: 'flex', flexDirection: 'column', gap: 16 }}>
+
+        {/* Onboarding for new users */}
+        {(stats?.total ?? 0) === 0 && (
+          <OnboardingChecklist
+            hasResume={data?.hasResume ?? false}
+            hasJobs={false}
+            hasExtension={false}
+            hasRunAgent={false}
+          />
+        )}
 
         {/* Stats row */}
         <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 12 }}>
@@ -210,7 +223,7 @@ export function DashboardPage() {
           <Card>
             <div style={{ padding: '14px 16px', display: 'flex', alignItems: 'center', justifyContent: 'space-between', borderBottom: '0.5px solid var(--border)' }}>
               <span style={{ fontSize: 12, fontWeight: 500 }}>Recent Applications</span>
-              <Btn small variant="ghost">View all</Btn>
+              <Btn small variant="ghost" onClick={() => navigate('jobs')}>View all</Btn>
             </div>
 
             {recentJobs.length === 0 ? (

@@ -48,11 +48,13 @@ export interface Job {
   description: string | null
   salary:      string | null
   source:      string | null
-  notes:       string | null
-  appliedAt:   string | null  // ISO date string from API
-  followUpAt:  string | null
-  createdAt:   string
-  updatedAt:   string
+  notes:        string | null
+  coverLetter:  string | null
+  analysisNote: string | null
+  appliedAt:    string | null  // ISO date string from API
+  followUpAt:   string | null
+  createdAt:    string
+  updatedAt:    string
 }
 
 // ── Activity ──────────────────────────────────────────────────────────────────
@@ -169,6 +171,7 @@ export interface DashboardData {
   recentJobs:  Job[]
   activity:    Activity[]
   agentConfig: AgentConfig | null
+  hasResume:   boolean
 }
 
 // ── User ───────────────────────────────────────────────────────────────────────
@@ -203,20 +206,44 @@ export interface Paginated<T> {
 }
 
 // ── Resume AI types ───────────────────────────────────────────────────────────
+
+export interface MissingItem {
+  keyword: string       // the keyword/phrase to add
+  target:  string       // which section: "skills" | "summary" | "experience" | "projects"
+  tip:     string       // short guidance, e.g. "mention in summary" | "add to skills" | "cite in experience bullet"
+}
+
+export interface SectionMatch {
+  section:  string
+  keywords: string[]     // what matched in this section
+  score:    number       // 0-100 sub-score
+  tip:      string       // improvement guidance
+}
+
 export interface ScoreResult {
   score:           number
   matchedKeywords: string[]
-  missingKeywords: string[]
+  missingItems:    MissingItem[]    // per-section missing items (replaces flat missingKeywords)
+  sectionMatches:  SectionMatch[]   // per-section matched analysis
   sectionScores:   Record<string, number>
   sectionTips:     Record<string, string>
+  strengthSummary: string
+  skillsGap:       string[]
 }
 
-export interface Suggestion { text: string; applied: boolean }
+export interface Suggestion {
+  text:     string
+  target:   'summary' | 'skills' | 'experience' | 'education' | 'general'
+  action:   'rewrite' | 'reorder' | 'enhance' | 'add_keywords' | 'none'
+  proposed?: string
+  applied:  boolean
+}
 
 // ── UI-only ────────────────────────────────────────────────────────────────────
 export type Page =
   | 'dashboard'
   | 'jobs'
+  | 'search'
   | 'resume'
   | 'gmail'
   | 'agent'

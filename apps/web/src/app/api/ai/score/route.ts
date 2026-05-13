@@ -1,65 +1,98 @@
 /**
  * POST /api/ai/score
- * Body: { resumeContent, jobTitle?, jobCompany?, jobDescription? }
- * Returns: { score, matchedKeywords, missingKeywords, sectionScores, sectionTips }
+ * Analyses resume against target job across all sections.
  */
 import { NextRequest } from 'next/server'
-import { requireAuth, isErrorResponse, ok, err } from '@/lib/api-helpers'
-import { checkRateLimit } from '@/lib/rate-limit'
-import { modelChat, stripFences, resolveConfig } from '@/lib/model-router'
-import { db } from '@/lib/db'
+import { prepareAiRoute, ok, err } from '@/lib/api-helpers'
+import { modelChat, stripFences } from '@/lib/model-router'
 import type { ResumeContent } from '@/lib/types'
 
 export async function POST(req: NextRequest) {
-  const auth = await requireAuth(req)
-  if (isErrorResponse(auth)) return auth
-
-  const rl = checkRateLimit(`ai:${auth.userId}`)
-  if (!rl.ok) return err(`Rate limit exceeded — retry in ${rl.retryAfter}s`, 429)
+  const prep = await prepareAiRoute(req, 'scoring')
+  if ('error' in prep) return prep.error
 
   const body = await req.json().catch(() => null)
   if (!body) return err('Invalid JSON body')
 
-  const { resumeContent, jobTitle, jobCompany, jobDescription } = body as {
-    resumeContent?:  ResumeContent
-    jobTitle?:       string
-    jobCompany?:     string
-    jobDescription?: string
+  const { resumeContent, jobTitle, jobCompany, jobDescription, keySkills } = body as {
+    resumeContent?: ResumeContent; jobTitle?: string; jobCompany?: string
+    jobDescription?: string; keySkills?: string[]
   }
-
   if (!jobTitle && !jobDescription) return err('jobTitle or jobDescription is required')
 
-  // Load user's AI config
-  const user  = await db.user.findUnique({ where: { id: auth.userId }, select: { preferences: true } })
-  const prefs = (user?.preferences ?? {}) as Record<string, unknown>
-  const cfg   = resolveConfig((prefs.aiConfig ?? null) as Parameters<typeof resolveConfig>[0])
+  const cfg        = prep.cfg
+  const resumeText = resumeContent ? resumeToText(resumeContent) : '(no resume)'
 
-  const resumeText = resumeContent ? resumeToText(resumeContent) : '(no resume provided)'
-
-  const prompt = `You are an expert ATS analyzer. Analyze how well the resume matches the job posting.
+  const prompt = `Rate this resume against the job. Output ONLY this JSON (no other text):
+{
+"score": 85,
+"matchedKeywords": ["skill1","skill2"],
+"sectionMatches": [
+  {"section":"Summary","keywords":["keyword"],"score":80,"tip":"improve by..."},
+  {"section":"Skills","keywords":["skill"],"score":90,"tip":"add..."},
+  {"section":"Experience","keywords":["match"],"score":70,"tip":"quantify..."}
+],
+"missingItems": [
+  {"keyword":"missing skill","target":"skills","tip":"add to skills"},
+  {"keyword":"term","target":"summary","tip":"mention in summary"}
+],
+"sectionScores":{"Summary":80,"Skills":90,"Experience":70,"Education":60},
+"sectionTips":{"Summary":"tip","Skills":"tip","Experience":"tip","Education":"tip"},
+"skillsGap":["technology to learn"],
+"strengthSummary":"one sentence summary"
+}
 
 RESUME:
 ${resumeText}
 
-JOB: ${jobTitle ?? 'Not specified'} at ${jobCompany ?? 'Not specified'}
-${jobDescription ? `JOB DESCRIPTION:\n${jobDescription.slice(0, 2000)}` : ''}
-
-Return ONLY a valid JSON object — no markdown, no explanation:
-{
-  "score": <integer 0-100>,
-  "matchedKeywords": ["keyword", ...],
-  "missingKeywords": ["keyword", ...],
-  "sectionScores": { "Summary": <0-100>, "Experience": <0-100>, "Skills": <0-100>, "Education": <0-100> },
-  "sectionTips": { "Summary": "<tip>", "Experience": "<tip>", "Skills": "<tip>", "Education": "<tip>" }
-}`
+JOB: ${jobTitle ?? ''} at ${jobCompany ?? ''}
+${keySkills?.length ? `KEY SKILLS: ${keySkills.join(', ')}` : ''}
+${jobDescription ? `DESCRIPTION:\n${jobDescription.slice(0, 2000)}` : ''}`
 
   try {
-    const result = await modelChat([{ role: 'user', content: prompt }], cfg, 1024)
-    const parsed = JSON.parse(stripFences(result.text))
-    return ok({ ...parsed, _model: `${cfg.provider}/${cfg.model}` })
+    const result = await modelChat([{ role: 'user', content: prompt }], cfg, 3000)
+    const text = stripFences(result.text)
+    let parsed: Record<string, unknown>
+    try { parsed = JSON.parse(text) } catch {
+      return ok({
+        score: 0, matchedKeywords: [], sectionMatches: [], missingItems: [],
+        sectionScores: {}, sectionTips: {}, skillsGap: [], strengthSummary: 'Analysis unavailable. Try again.',
+      })
+    }
+
+    const arr = (v: unknown) => Array.isArray(v) ? v as unknown[] : []
+    // Normalise section names to Title Case so UI lookups (SEC_ORDER, sectionScores[sec])
+    // are reliable regardless of what casing the AI returned ("summary" vs "Summary").
+    const toTitle = (s: string) => s ? s.charAt(0).toUpperCase() + s.slice(1).toLowerCase() : s
+
+    return ok({
+      score:            Number(parsed.score) || 0,
+      matchedKeywords:  Array.isArray(parsed.matchedKeywords) ? parsed.matchedKeywords as string[] : [],
+      sectionMatches:   arr(parsed.sectionMatches).map((m: unknown) => {
+        const o = m as Record<string, unknown> ?? {}
+        return { section: toTitle(String(o.section ?? '')), keywords: arr(o.keywords) as string[], score: Number(o.score) || 0, tip: String(o.tip ?? '') }
+      }),
+      missingItems:     arr(parsed.missingItems).map((m: unknown) => {
+        const o = m as Record<string, unknown> ?? {}
+        // target is lowercase — matches applyTargeted() switch and SEC_LABELS lowercase keys
+        return { keyword: String(o.keyword ?? ''), target: String(o.target ?? 'skills').toLowerCase(), tip: String(o.tip ?? '') }
+      }),
+      // Normalise sectionScores / sectionTips keys to Title Case to match SEC_ORDER values
+      sectionScores: Object.fromEntries(
+        Object.entries((parsed.sectionScores ?? {}) as Record<string, unknown>)
+          .map(([k, v]) => [toTitle(k), Number(v) || 0])
+      ),
+      sectionTips: Object.fromEntries(
+        Object.entries((parsed.sectionTips ?? {}) as Record<string, unknown>)
+          .map(([k, v]) => [toTitle(k), String(v)])
+      ),
+      skillsGap:        Array.isArray(parsed.skillsGap) ? parsed.skillsGap as string[] : [],
+      strengthSummary:  String(parsed.strengthSummary ?? ''),
+      _model:           `${cfg.provider}/${cfg.model}`,
+    })
   } catch (e) {
     console.error('[/api/ai/score]', e)
-    return err(`AI scoring failed (${cfg.provider}/${cfg.model}): ${(e as Error).message}`, 500)
+    return err(`AI scoring failed: ${(e as Error).message}`, 500)
   }
 }
 
@@ -76,6 +109,7 @@ function resumeToText(r: ResumeContent): string {
     }
   }
   if (r.skills?.length) { lines.push('\nSKILLS:'); lines.push(r.skills.join(', ')) }
+  if (r.projects?.length) { lines.push('\nPROJECTS:'); lines.push(r.projects.map(p => p.name).join(', ')) }
   if (r.education?.length) {
     lines.push('\nEDUCATION:')
     for (const e of r.education) lines.push(`${e.degree} — ${e.institution} (${e.year})`)

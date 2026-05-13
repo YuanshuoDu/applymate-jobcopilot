@@ -195,14 +195,21 @@ export function Divider({ style = {} }: { style?: React.CSSProperties }) {
 
 // ─── CompanyLogo ─────────────────────────────────────────────────────────────
 export function CompanyLogo({ logo, size = 24 }: { logo: string; size?: number }) {
+  const isUrl = logo?.startsWith('http')
   return (
     <div style={{
       width: size, height: size, borderRadius: 5,
-      background: 'rgba(24,95,165,0.1)', color: '#185FA5',
+      background: '#f0f4f8', flexShrink: 0, overflow: 'hidden',
       display: 'flex', alignItems: 'center', justifyContent: 'center',
-      fontSize: size * 0.38, fontWeight: 700, flexShrink: 0,
     }}>
-      {logo}
+      {isUrl ? (
+        <img src={logo} alt="" style={{ width: '100%', height: '100%', objectFit: 'contain' }}
+          onError={e => { (e.target as HTMLImageElement).style.display = 'none' }} />
+      ) : (
+        <span style={{ fontSize: size * 0.38, fontWeight: 700, color: '#185FA5' }}>
+          {logo.slice(0, 4).toUpperCase()}
+        </span>
+      )}
     </div>
   )
 }

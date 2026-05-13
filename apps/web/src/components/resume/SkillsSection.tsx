@@ -3,12 +3,13 @@
 import { useState } from 'react'
 import { SectionHeader, type DragHandleProps } from './SectionHeader'
 
-export function SkillsSection({ skills, matchedKeywords, onChange, dragHandleProps, onRemove }: {
+export function SkillsSection({ skills, matchedKeywords, onChange, dragHandleProps, onRemove, flash }: {
   skills:           string[]
   matchedKeywords:  string[]
   onChange:         (s: string[]) => void
   dragHandleProps?: DragHandleProps
   onRemove?:        () => void
+  flash?:           boolean
 }) {
   const [collapsed, setCollapsed] = useState(false)
   const [adding,    setAdding]    = useState(false)
@@ -33,11 +34,11 @@ export function SkillsSection({ skills, matchedKeywords, onChange, dragHandlePro
       />
 
       {!collapsed && (
-        <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}>
-          {skills.map(s => {
+        <div className={flash ? 'ai-flash-highlight' : ''} style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}>
+          {skills.map((s, i) => {
             const isMatch = matchedKeywords.some(k => s.toLowerCase().includes(k.toLowerCase()))
             return (
-              <span key={s} style={{ fontSize: 11, background: isMatch ? 'rgba(59,109,17,0.1)' : 'var(--bg-secondary)', color: isMatch ? '#3B6D11' : 'var(--text)', border: `0.5px solid ${isMatch ? 'rgba(59,109,17,0.2)' : 'var(--border)'}`, borderRadius: 5, padding: '3px 8px', display: 'flex', alignItems: 'center', gap: 4 }}>
+              <span key={`${s}-${i}`} style={{ fontSize: 11, background: isMatch ? 'rgba(59,109,17,0.1)' : 'var(--bg-secondary)', color: isMatch ? '#3B6D11' : 'var(--text)', border: `0.5px solid ${isMatch ? 'rgba(59,109,17,0.2)' : 'var(--border)'}`, borderRadius: 5, padding: '3px 8px', display: 'flex', alignItems: 'center', gap: 4 }}>
                 {isMatch && <span style={{ fontSize: 8, color: '#3B6D11' }}>✓</span>}
                 {s}
                 <button onClick={() => onChange(skills.filter(x => x !== s))} style={{ fontSize: 9, color: 'var(--text-muted)', background: 'none', border: 'none', cursor: 'pointer', lineHeight: 1, padding: 0 }}>✕</button>

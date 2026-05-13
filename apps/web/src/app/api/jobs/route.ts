@@ -55,13 +55,13 @@ export async function POST(req: NextRequest) {
   const body = await req.json().catch(() => null)
   if (!body) return err('Invalid JSON body')
 
-  const { company, role, location, url, description, salary, source, score, status } = body
+  const { company, role, location, url, description, salary, source, score, status, logo } = body
 
   if (!company || !role) return err('company and role are required')
 
   const job = await db.job.create({
     data: {
-      userId: auth.userId,
+      userId:      auth.userId,
       company,
       role,
       location:    location    ?? null,
@@ -71,7 +71,7 @@ export async function POST(req: NextRequest) {
       source:      source      ?? 'manual',
       score:       score       ?? null,
       status:      status      ?? 'saved',
-      logo:        company.slice(0, 2).toUpperCase(),
+      logo:        logo ?? company.slice(0, 2).toUpperCase(),
     },
   })
 

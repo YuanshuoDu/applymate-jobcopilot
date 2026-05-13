@@ -1,0 +1,224 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Job Search Results — Test Page</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #f4f2ee; }
+
+    /* ── Simulated LinkedIn header ── */
+    .mock-header { background: #fff; border-bottom: 1px solid #e0dfdc; padding: 12px 24px; display: flex; align-items: center; gap: 16px; }
+    .mock-logo { background: #0a66c2; color: #fff; font-weight: 700; font-size: 20px; width: 34px; height: 34px; display: flex; align-items: center; justify-content: center; border-radius: 4px; }
+    .mock-search { flex: 1; padding: 8px 12px; border: 1px solid #ccc; border-radius: 20px; max-width: 400px; font-size: 14px; }
+
+    /* ── Layout: sidebar + results ── */
+    .layout { display: flex; max-width: 1128px; margin: 0 auto; padding: 24px; gap: 24px; }
+    .sidebar { width: 280px; flex-shrink: 0; background: #fff; border-radius: 8px; padding: 16px; border: 1px solid #e0dfdc; }
+    .sidebar h3 { font-size: 16px; margin-bottom: 12px; }
+    .filter-chip { display: inline-block; background: #eef3f8; padding: 6px 12px; border-radius: 16px; font-size: 13px; margin: 0 4px 6px 0; cursor: pointer; }
+    .results { flex: 1; }
+
+    /* ── Job cards (simulating LinkedIn) ── */
+    .applymate-test-card {
+      background: #fff; border: 1px solid #e0dfdc; border-radius: 8px; padding: 16px 20px; margin-bottom: 0;
+      cursor: pointer; transition: box-shadow 0.15s; position: relative;
+    }
+    .applymate-test-card:hover { box-shadow: 0 0 0 1px rgba(0,0,0,0.08), 0 4px 12px rgba(0,0,0,0.12); }
+    .applymate-test-card + .applymate-test-card { margin-top: 8px; }
+
+    .card-inner { display: flex; gap: 12px; }
+    .card-avatar { width: 56px; height: 56px; border-radius: 6px; background: #eef3f8; display: flex; align-items: center; justify-content: center; font-size: 20px; font-weight: 700; color: #666; flex-shrink: 0; }
+    .card-body { flex: 1; min-width: 0; }
+
+    .am-test-title { font-size: 16px; font-weight: 600; color: #0a66c2; margin-bottom: 4px; cursor: pointer; }
+    .am-test-title:hover { text-decoration: underline; }
+    .am-test-company { font-size: 14px; color: #333; margin-bottom: 2px; }
+    .am-test-location { font-size: 13px; color: #666; margin-bottom: 8px; }
+    .card-meta { display: flex; gap: 12px; font-size: 12px; color: #666; }
+    .card-meta span { display: flex; align-items: center; gap: 4px; }
+
+    .am-test-link { text-decoration: none; color: inherit; }
+
+    /* ── Separator between cards ── */
+    .section-title { font-size: 14px; font-weight: 600; color: #333; padding: 16px 0 8px 0; }
+    .result-count { font-size: 13px; color: #666; margin-bottom: 16px; }
+
+    /* ── Indeed-style cards ── */
+    .indeed-card { border: 1px solid #e4e2e0; }
+    .indeed-card .card-avatar { background: #f7f7f7; border-radius: 8px; }
+
+    /* Notification */
+    .event-log { position: fixed; bottom: 0; left: 0; right: 0; background: #1a1a2e; color: #fff; padding: 12px 24px; font-size: 12px; display: none; z-index: 99999; }
+    .event-log.visible { display: block; }
+  </style>
+</head>
+<body>
+  <!-- Mock header bar -->
+  <div class="mock-header">
+    <div class="mock-logo">in</div>
+    <input class="mock-search" value="Software Engineer" readonly>
+  </div>
+
+  <div class="layout">
+    <!-- Sidebar filters -->
+    <aside class="sidebar">
+      <h3>Filters</h3>
+      <div class="filter-chip">Remote</div>
+      <div class="filter-chip">Full-time</div>
+      <div class="filter-chip">Mid-Senior level</div>
+      <div class="filter-chip">Engineering</div>
+      <div class="filter-chip">$100K+</div>
+      <div style="margin-top:16px;font-size:12px;color:#666;">
+        <p style="margin-bottom:8px;">✅ Extension should inject:</p>
+        <ul style="padding-left:16px;line-height:1.8;">
+          <li>⊕ button on each card (hover)</li>
+          <li>Popup on hover (1.2s)</li>
+          <li>"Open Tracker" → sidebar</li>
+        </ul>
+      </div>
+    </aside>
+
+    <!-- Results list -->
+    <main class="results">
+      <div class="result-count">Showing 5 test jobs</div>
+
+      <!-- Job Card 1 -->
+      <div class="applymate-test-card">
+        <div class="card-inner">
+          <div class="card-avatar">Go</div>
+          <div class="card-body">
+            <a class="am-test-link" href="detail.html">
+              <div class="am-test-title">Senior Frontend Engineer</div>
+            </a>
+            <div class="am-test-company">Google</div>
+            <div class="am-test-location">Mountain View, CA · Remote</div>
+            <div class="card-meta">
+              <span>💰 $150K - $220K</span>
+              <span>🕐 2 days ago</span>
+              <span>👥 45 applicants</span>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Job Card 2 -->
+      <div class="applymate-test-card">
+        <div class="card-inner">
+          <div class="card-avatar" style="background:#e8f5e9;color:#2e7d32;">MS</div>
+          <div class="card-body">
+            <a class="am-test-link" href="detail.html">
+              <div class="am-test-title">Full Stack Developer — AI Products</div>
+            </a>
+            <div class="am-test-company">Microsoft</div>
+            <div class="am-test-location">Redmond, WA · Hybrid</div>
+            <div class="card-meta">
+              <span>💰 $140K - $190K</span>
+              <span>🕐 1 week ago</span>
+              <span>👥 120 applicants</span>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Job Card 3 -->
+      <div class="applymate-test-card">
+        <div class="card-inner">
+          <div class="card-avatar" style="background:#e3f2fd;color:#1565c0;">AM</div>
+          <div class="card-body">
+            <a class="am-test-link" href="detail.html">
+              <div class="am-test-title">React Native Mobile Developer</div>
+            </a>
+            <div class="am-test-company">Airbnb</div>
+            <div class="am-test-location">San Francisco, CA · Remote (US)</div>
+            <div class="card-meta">
+              <span>💰 $160K - $210K</span>
+              <span>🕐 3 days ago</span>
+              <span>👥 89 applicants</span>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Job Card 4 -->
+      <div class="applymate-test-card">
+        <div class="card-inner">
+          <div class="card-avatar" style="background:#fce4ec;color:#c62828;">SP</div>
+          <div class="card-body">
+            <a class="am-test-link" href="detail.html">
+              <div class="am-test-title">Platform Engineer — Infrastructure</div>
+            </a>
+            <div class="am-test-company">Spotify</div>
+            <div class="am-test-location">Stockholm, Sweden · Remote</div>
+            <div class="card-meta">
+              <span>💰 €80K - €120K</span>
+              <span>🕐 5 days ago</span>
+              <span>👥 34 applicants</span>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Job Card 5 -->
+      <div class="applymate-test-card">
+        <div class="card-inner">
+          <div class="card-avatar" style="background:#fff3e0;color:#e65100;">SH</div>
+          <div class="card-body">
+            <a class="am-test-link" href="detail.html">
+              <div class="am-test-title">Engineering Manager — Developer Experience</div>
+            </a>
+            <div class="am-test-company">Stripe</div>
+            <div class="am-test-location">San Francisco, CA · On-site</div>
+            <div class="card-meta">
+              <span>💰 $200K - $280K</span>
+              <span>🕐 Just now</span>
+              <span>👥 15 applicants</span>
+            </div>
+          </div>
+        </div>
+      </div>
+    </main>
+  </div>
+
+  <div class="event-log" id="event-log"></div>
+
+  <script>
+    // Simple event log to confirm extension activity
+    const log = document.getElementById('event-log');
+    function showLog(msg) {
+      log.textContent = '🔔 ' + msg + ' (time: ' + new Date().toLocaleTimeString() + ')';
+      log.classList.add('visible');
+      setTimeout(() => log.classList.remove('visible'), 4000);
+    }
+
+    // Monitor for extension-injected elements
+    const observer = new MutationObserver((mutations) => {
+      for (const m of mutations) {
+        for (const node of m.addedNodes) {
+          if (node.nodeType === 1) {
+            const el = /** @type {Element} */ (node);
+            if (el.classList?.contains('applymate-card-btn')) {
+              showLog('Extension injected ⊕ button');
+            }
+            if (el.id === 'applymate-popup') {
+              showLog('Extension showed hover popup');
+            }
+          }
+        }
+      }
+    });
+    observer.observe(document.body, { childList: true, subtree: true });
+
+    // Check if extension is active
+    setTimeout(() => {
+      const btns = document.querySelectorAll('.applymate-card-btn');
+      if (btns.length > 0) {
+        showLog('✅ Extension ACTIVE — ' + btns.length + ' buttons found');
+      } else {
+        showLog('❌ Extension NOT active — check chrome://extensions');
+      }
+    }, 3000);
+  </script>
+</body>
+</html>

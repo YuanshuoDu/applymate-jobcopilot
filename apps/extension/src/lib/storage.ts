@@ -49,3 +49,34 @@ export function setBadge(text: string, color = '#185FA5') {
 export function clearBadge() {
   chrome.action.setBadgeText({ text: '' })
 }
+
+// ── Resume helpers ────────────────────────────────────────────────
+
+export async function setCurrentResumeId(id: string): Promise<void> {
+  await chrome.storage.local.set({ currentResumeId: id })
+}
+
+export async function getCurrentResumeId(): Promise<string | null> {
+  const result = await chrome.storage.local.get('currentResumeId')
+  return result.currentResumeId ?? null
+}
+
+export async function setResumeDraft(resumeId: string, content: object): Promise<void> {
+  await chrome.storage.local.set({ [`resumeDraft:${resumeId}`]: { content, ts: Date.now() } })
+}
+
+export async function getResumeDraft(resumeId: string): Promise<{ content: object; ts: number } | null> {
+  const result = await chrome.storage.local.get(`resumeDraft:${resumeId}`)
+  const draft = result[`resumeDraft:${resumeId}`]
+  if (!draft) return null
+  // Discard drafts older than 24h
+  if (Date.now() - draft.ts > 86400000) {
+    await chrome.storage.local.remove(`resumeDraft:${resumeId}`)
+    return null
+  }
+  return draft
+}
+
+export async function clearResumeDraft(resumeId: string): Promise<void> {
+  await chrome.storage.local.remove(`resumeDraft:${resumeId}`)
+}

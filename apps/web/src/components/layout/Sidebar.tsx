@@ -1,21 +1,12 @@
 'use client'
 
+import { useState, useEffect } from 'react'
 import { signOut } from 'next-auth/react'
 import type { Session } from 'next-auth'
 import type { Page } from '@/lib/types'
 import { useTheme } from '@/components/ThemeProvider'
 import { UserAvatar } from '@/components/ui'
-
-const NAV_ITEMS: { id: Page; label: string; icon: string }[] = [
-  { id: 'dashboard',  label: 'Dashboard',  icon: '▦' },
-  { id: 'jobs',       label: 'Jobs',        icon: '◈' },
-  { id: 'resume',     label: 'Resume',      icon: '☰' },
-  { id: 'gmail',      label: 'Gmail',       icon: '✉' },
-  { id: 'agent',      label: 'AI Agent',    icon: '◉' },
-  { id: 'animation',  label: 'Flow Demo',   icon: '▷' },
-  { id: 'extension',  label: 'Extension',   icon: '⊞' },
-  { id: 'settings',   label: 'Settings',    icon: '⚙' },
-]
+import { useI18n } from '@/lib/i18n'
 
 interface SidebarProps {
   active:  Page
@@ -25,8 +16,30 @@ interface SidebarProps {
 
 export function Sidebar({ active, onNav, session }: SidebarProps) {
   const user      = session?.user
-  const planLabel = 'Pro plan' // TODO: pull from DB when needed
+  const planLabel = 'Pro plan'
   const { theme, toggle } = useTheme()
+  const { lang, t, setLang } = useI18n()
+  const [gmailUnread, setGmailUnread] = useState<number | null>(null)
+
+  useEffect(() => {
+    fetch('/api/gmail/unread')
+      .then(r => r.json())
+      .then(d => { if (d.hasGmail) setGmailUnread(d.unread) })
+      .catch(() => {})
+  }, [])
+
+  // Nav items with i18n labels
+  const NAV_ITEMS: { id: Page; label: string; icon: string }[] = [
+    { id: 'dashboard',  label: t('nav.dashboard'),    icon: '▦' },
+    { id: 'jobs',       label: t('nav.jobs'),         icon: '◈' },
+    { id: 'search',     label: t('nav.search'),       icon: '⊕' },
+    { id: 'resume',     label: t('nav.resume'),       icon: '☰' },
+    { id: 'gmail',      label: t('nav.gmail'),        icon: '✉' },
+    { id: 'agent',      label: t('nav.agent'),        icon: '◉' },
+    { id: 'animation',  label: 'Flow Demo',           icon: '▷' },
+    { id: 'extension',  label: t('nav.extension'),    icon: '⊞' },
+    { id: 'settings',   label: t('nav.settings'),     icon: '⚙' },
+  ]
 
   return (
     <div style={{
@@ -59,7 +72,9 @@ export function Sidebar({ active, onNav, session }: SidebarProps) {
             <span style={{ fontSize: 14, opacity: active === item.id ? 1 : 0.5 }}>{item.icon}</span>
             {item.label}
             {item.id === 'jobs'      && <span style={{ marginLeft: 'auto', fontSize: 10, background: 'rgba(24,95,165,0.12)', color: '#185FA5', borderRadius: 999, padding: '1px 6px' }}>47</span>}
-            {item.id === 'gmail'     && <span style={{ marginLeft: 'auto', fontSize: 10, background: 'rgba(163,45,45,0.12)', color: '#A32D2D', borderRadius: 999, padding: '1px 6px' }}>2</span>}
+            {item.id === 'gmail' && gmailUnread != null && gmailUnread > 0 && (
+              <span style={{ marginLeft: 'auto', fontSize: 10, background: 'rgba(163,45,45,0.12)', color: '#A32D2D', borderRadius: 999, padding: '1px 6px' }}>{gmailUnread}</span>
+            )}
             {item.id === 'agent'     && <span style={{ marginLeft: 'auto', width: 7, height: 7, borderRadius: '50%', background: '#3B6D11', flexShrink: 0 }} />}
             {item.id === 'animation' && <span style={{ marginLeft: 'auto', fontSize: 9, background: 'rgba(91,61,200,0.12)', color: '#5B3DC8', borderRadius: 999, padding: '1px 6px' }}>new</span>}
           </button>
@@ -91,6 +106,20 @@ export function Sidebar({ active, onNav, session }: SidebarProps) {
           }}>
           <span style={{ fontSize: 13 }}>{theme === 'dark' ? '☀' : '☾'}</span>
           {theme === 'dark' ? 'Light Mode' : 'Dark Mode'}
+        </button>
+
+        {/* Language switcher */}
+        <button
+          onClick={() => setLang(lang === 'en' ? 'zh' : 'en')}
+          style={{
+            width: '100%', padding: '6px 12px', border: 'none', background: 'transparent',
+            color: 'var(--text-muted)', fontSize: 12, textAlign: 'left', cursor: 'pointer',
+            display: 'flex', alignItems: 'center', gap: 8,
+            borderTop: '0.5px solid var(--border)',
+            transition: 'all 0.12s',
+          }}>
+          <span style={{ fontSize: 13 }}>🌐</span>
+          {t('lang.switch')}
         </button>
 
         {/* Logout button */}

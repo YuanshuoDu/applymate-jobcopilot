@@ -55,11 +55,15 @@ export async function GET() {
   // Agent config
   const agentConfig = await db.agentConfig.findUnique({ where: { userId } })
 
+  // First-resume check (for onboarding)
+  const resumeCount = await db.resume.count({ where: { userId } })
+
   return ok({
     stats: { total, applied, inReview, interviews, offers, thisWeek },
     pipeline,
     recentJobs,
     activity,
     agentConfig,
+    hasResume: resumeCount > 0,
   })
 }

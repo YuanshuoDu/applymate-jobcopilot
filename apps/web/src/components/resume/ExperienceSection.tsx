@@ -7,12 +7,13 @@ import { InlineInput } from './InlineInput'
 import { SectionHeader, type DragHandleProps } from './SectionHeader'
 import { AiFieldSuggestion, type AiFieldContext } from './AiFieldSuggestion'
 
-export function ExperienceSection({ experience, jobContext, onChange, dragHandleProps, onRemove }: {
+export function ExperienceSection({ experience, jobContext, onChange, dragHandleProps, onRemove, flashField }: {
   experience:       ResumeContent['experience']
   jobContext?:      AiFieldContext
   onChange:         (exp: ResumeContent['experience']) => void
   dragHandleProps?: DragHandleProps
   onRemove?:        () => void
+  flashField?:      string
 }) {
   const [editIdx,   setEditIdx]   = useState<number | null>(null)
   const [collapsed, setCollapsed] = useState(false)

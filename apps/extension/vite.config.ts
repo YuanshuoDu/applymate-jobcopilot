@@ -1,9 +1,23 @@
 import { defineConfig } from 'vite'
 import react from '@vitejs/plugin-react'
 import path from 'path'
+import { execSync } from 'child_process'
+
+function postBuild() {
+  return {
+    name: 'postbuild',
+    closeBundle() {
+      try {
+        execSync('node build.cjs', { cwd: __dirname, stdio: 'inherit' })
+      } catch (e) {
+        console.error('postbuild error:', e)
+      }
+    },
+  }
+}
 
 export default defineConfig({
-  plugins: [react()],
+  plugins: [react(), postBuild()],
   resolve: {
     alias: {
       '@': path.resolve(__dirname, 'src'),

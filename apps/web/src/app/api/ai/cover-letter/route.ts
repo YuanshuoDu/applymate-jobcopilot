@@ -4,38 +4,25 @@
  * Returns: { coverLetter: string }
  */
 import { NextRequest } from 'next/server'
-import { requireAuth, isErrorResponse, ok, err } from '@/lib/api-helpers'
-import { checkRateLimit } from '@/lib/rate-limit'
-import { modelChat, resolveConfig } from '@/lib/model-router'
-import { db } from '@/lib/db'
+import { prepareAiRoute, ok, err } from '@/lib/api-helpers'
+import { modelChat } from '@/lib/model-router'
 import type { ResumeContent } from '@/lib/types'
 
 export async function POST(req: NextRequest) {
-  const auth = await requireAuth(req)
-  if (isErrorResponse(auth)) return auth
-
-  const rl = checkRateLimit(`ai:${auth.userId}`)
-  if (!rl.ok) return err(`Rate limit exceeded — retry in ${rl.retryAfter}s`, 429)
+  const prep = await prepareAiRoute(req, 'coverLetter')
+  if ('error' in prep) return prep.error
 
   const body = await req.json().catch(() => null)
   if (!body) return err('Invalid JSON body')
 
   const { resumeContent, jobTitle, jobCompany, jobDescription, tone = 'professional', recipientName } = body as {
-    resumeContent:   ResumeContent
-    jobTitle:        string
-    jobCompany:      string
-    jobDescription?: string
-    tone?:           string
-    recipientName?:  string
+    resumeContent: ResumeContent; jobTitle: string; jobCompany: string; jobDescription?: string; tone?: string; recipientName?: string
   }
 
   if (!resumeContent) return err('resumeContent is required')
   if (!jobTitle)      return err('jobTitle is required')
   if (!jobCompany)    return err('jobCompany is required')
-
-  const user  = await db.user.findUnique({ where: { id: auth.userId }, select: { preferences: true } })
-  const prefs = (user?.preferences ?? {}) as Record<string, unknown>
-  const cfg   = resolveConfig((prefs.aiConfig ?? null) as Parameters<typeof resolveConfig>[0])
+  const cfg = prep.cfg
 
   const name       = resumeContent.contact?.name ?? 'the applicant'
   const skills     = (resumeContent.skills ?? []).slice(0, 8).join(', ')
@@ -62,7 +49,7 @@ Rules: 250–320 words, no filler like "I am writing to express my interest", qu
 Return ONLY the cover letter text.`
 
   try {
-    const result = await modelChat([{ role: 'user', content: prompt }], cfg, 1024)
+    const result = await modelChat([{ role: 'user', content: prompt }], cfg, 4096)
     return ok({ coverLetter: result.text, _model: `${cfg.provider}/${cfg.model}` })
   } catch (e) {
     console.error('[/api/ai/cover-letter]', e)

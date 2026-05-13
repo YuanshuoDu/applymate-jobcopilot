@@ -3,9 +3,10 @@
 import { useEffect, useRef, useState } from 'react'
 import { useParams } from 'next/navigation'
 import { ResumeRenderer } from '@/components/resume/ResumeRenderer'
-import type { Resume } from '@/lib/types'
+import type { Resume, TemplateOptions } from '@/lib/types'
 
-// A4 at 96 dpi = 794 × 1123 px
+// A4 at 96 dpi: 297mm / 25.4 * 96 = 1122.52 → round up to 1123px
+// CSS print uses exact mm units (297mm / 594mm) for pixel-perfect page alignment
 const A4_H = 1123
 
 type FitResult =
@@ -16,7 +17,15 @@ type FitResult =
   | { type: 'too-long';     ratio: number; pages: number }
 
 function applyFit(el: HTMLDivElement): FitResult {
-  const h   = el.scrollHeight
+  // Clear any previously applied fit styles so measurement is clean
+  el.style.transform       = ''
+  el.style.transformOrigin = ''
+  el.style.width           = ''
+  el.style.minHeight       = ''
+  // Force synchronous reflow so scrollHeight reflects actual content
+  void el.offsetHeight
+
+  const h     = el.scrollHeight
   const ratio = h / A4_H
 
   if (ratio < 0.5) {
@@ -32,11 +41,12 @@ function applyFit(el: HTMLDivElement): FitResult {
   }
 
   if (ratio <= 1.15) {
-    // Slight overflow → scale down to fit exactly one page
+    // Slight overflow → scale down to fit one page using transform (works in print, unlike zoom)
     const scale = A4_H / h
-    el.style.zoom          = String(scale)
-    // After zoom, CSS minHeight must compensate: visual = cssVal * scale → cssVal = A4_H / scale
-    el.style.minHeight     = `${Math.ceil(A4_H / scale)}px`
+    el.style.transformOrigin = 'top left'
+    el.style.transform       = `scale(${scale})`
+    el.style.width           = `${Math.round(100 / scale)}%`
+    el.style.minHeight       = `${Math.ceil(h)}px`
     return { type: 'scaled-one', ratio, scale }
   }
 
@@ -81,6 +91,20 @@ function FitBadge({ fit }: { fit: FitResult }) {
 export default function PrintResumePage() {
   const params = useParams<{ id: string }>()
 
+  // Read localStorage snapshot written by the PDF button (always current state, no DB lag)
+  const localSnapshot = (() => {
+    try {
+      const raw = localStorage.getItem(`print:${params.id}`)
+      if (!raw) return null
+      const data = JSON.parse(raw) as {
+        content: Resume['content']; templateId: string | null
+        templateOptions: TemplateOptions | null; name: string; ts: number
+      }
+      if (Date.now() - data.ts > 60_000) return null  // discard if older than 60s
+      return data
+    } catch { return null }
+  })()
+
   const [resume,  setResume]  = useState<Resume | null>(null)
   const [loading, setLoading] = useState(true)
   const [error,   setError]   = useState<string | null>(null)
@@ -88,8 +112,20 @@ export default function PrintResumePage() {
 
   const contentRef = useRef<HTMLDivElement>(null)
 
-  // 1. Fetch resume data
+  // 1. Use localStorage snapshot (set by PDF button) if fresh; otherwise fetch from API
   useEffect(() => {
+    if (localSnapshot) {
+      // Build a minimal Resume object from the snapshot — always matches what user sees
+      setResume({
+        id: params.id, name: localSnapshot.name, isDefault: false,
+        createdAt: '', updatedAt: '',
+        content: localSnapshot.content,
+        templateId: localSnapshot.templateId,
+        templateOptions: localSnapshot.templateOptions,
+      } as Resume)
+      setLoading(false)
+      return
+    }
     fetch(`/api/resume/${params.id}`)
       .then(r => { if (!r.ok) throw new Error('Not found'); return r.json() })
       .then(setResume)
@@ -109,11 +145,14 @@ export default function PrintResumePage() {
     return () => cancelAnimationFrame(raf)
   }, [resume])
 
-  // 3. Auto-print after fit is applied (skip if too sparse — user should review first)
+  // 3. Auto-print after fit is applied — wait for fonts to load first
   useEffect(() => {
     if (!fit || fit.type === 'too-short') return
-    const t = setTimeout(() => window.print(), 700)
-    return () => clearTimeout(t)
+    // document.fonts.ready ensures web fonts (Inter) are loaded before print dialog opens
+    document.fonts.ready.then(() => {
+      const t = setTimeout(() => window.print(), 300)
+      return () => clearTimeout(t)
+    })
   }, [fit])
 
   // ── States ──────────────────────────────────────────────────────────────────
@@ -157,7 +196,7 @@ export default function PrintResumePage() {
 
         /* Screen: show page shadow + page-break line */
         .page-outer { max-width: 794px; margin: 24px auto 48px; position: relative; }
-        .page-wrap   { background: #fff; box-shadow: 0 2px 20px rgba(0,0,0,0.1); overflow: hidden; }
+        .page-wrap  { background: #fff; box-shadow: 0 2px 20px rgba(0,0,0,0.1); overflow-x: hidden; }
 
         .page-break-line {
           position: absolute; left: -20px; right: -20px;
@@ -176,13 +215,14 @@ export default function PrintResumePage() {
         @media print {
           @page { size: A4; margin: 0; }
           body  { background: #fff; }
-          .toolbar        { display: none !important; }
+          /* Force all background colours / images to print (matches screen preview) */
+          * { -webkit-print-color-adjust: exact !important; print-color-adjust: exact !important; }
+          .toolbar         { display: none !important; }
           .page-break-line { display: none !important; }
-          .page-outer     { margin: 0; max-width: 100%; }
-          .page-wrap      { box-shadow: none; }
-          /* Ensure the content fills complete A4 pages */
-          .page-wrap      { min-height: 297mm; }
-          .page-wrap.two  { min-height: 594mm; }
+          /* Lock to exactly A4 width so layout matches the 794px screen preview */
+          .page-outer { margin: 0; width: 210mm; max-width: 210mm; }
+          .page-wrap  { box-shadow: none; overflow: visible; width: 210mm; min-height: 297mm; }
+          .page-wrap.two { min-height: 594mm; }
         }
         @keyframes spin { to { transform: rotate(360deg) } }
       `}</style>
@@ -190,7 +230,7 @@ export default function PrintResumePage() {
       {/* Toolbar */}
       <div className="toolbar">
         <span className="resume-name">{resume.name}</span>
-        {fit && <FitBadge fit={fit} />}
+{fit && <FitBadge fit={fit} />}
         <button className="tb-btn" onClick={() => window.close()}>✕ Close</button>
         <button className="tb-btn primary" onClick={() => window.print()}>⬇ Save as PDF</button>
       </div>

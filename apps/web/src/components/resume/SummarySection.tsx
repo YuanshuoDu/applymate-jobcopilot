@@ -4,7 +4,7 @@ import { useState } from 'react'
 import { SectionHeader, type DragHandleProps } from './SectionHeader'
 import { AiFieldSuggestion, type AiFieldContext } from './AiFieldSuggestion'
 
-export function SummarySection({ summary, matchedKeywords, editing, onEdit, onBlur, onChange, jobContext, dragHandleProps, onRemove }: {
+export function SummarySection({ summary, matchedKeywords, editing, onEdit, onBlur, onChange, jobContext, dragHandleProps, onRemove, flash }: {
   summary:          string
   matchedKeywords:  string[]
   editing:          boolean
@@ -14,6 +14,7 @@ export function SummarySection({ summary, matchedKeywords, editing, onEdit, onBl
   jobContext?:      AiFieldContext
   dragHandleProps?: DragHandleProps
   onRemove?:        () => void
+  flash?:           boolean
 }) {
   const [collapsed, setCollapsed] = useState(false)
   const wordCount   = summary.trim() ? summary.trim().split(/\s+/).filter(Boolean).length : 0
@@ -41,6 +42,7 @@ export function SummarySection({ summary, matchedKeywords, editing, onEdit, onBl
           <div>
             <textarea value={summary} onChange={e => onChange(e.target.value)}
               onBlur={onBlur} autoFocus placeholder="Write a brief professional summary (20–80 words)…"
+              className={flash ? 'ai-flash-highlight' : ''}
               style={{ width: '100%', minHeight: 80, fontSize: 12, lineHeight: 1.7, border: '0.5px solid #185FA5', borderRadius: 5, padding: 8, resize: 'vertical', outline: 'none', color: 'var(--text)', background: 'var(--bg)', boxSizing: 'border-box' }} />
             <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginTop: 4 }}>
               <span style={{ fontSize: 9, color: wColor }}>

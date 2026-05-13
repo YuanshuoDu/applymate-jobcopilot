@@ -66,7 +66,8 @@ export type AcceptResult = { ok: true } | { ok: false; reason: string }
 // ── Stage 1: Scout ────────────────────────────────────────────────────────────
 
 export interface ScoutOutput {
-  jobs: Job[]
+  jobs:       Job[]
+  discovered: number   // how many new jobs were found by autonomous discovery
 }
 
 // ── Stage 2: Analyze ──────────────────────────────────────────────────────────

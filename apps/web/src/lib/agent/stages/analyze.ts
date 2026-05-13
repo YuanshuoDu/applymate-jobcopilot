@@ -32,6 +32,8 @@ export async function runAnalyze(
 
   const scoredJobs: ScoredJob[] = []
   let failed = 0
+  const pendingUpdates: Array<{ jobId: string; score: number; recommendation?: string }> = []
+  const pendingActivities: Array<{ jobId: string; text: string; color: string }> = []
 
   for (const job of jobs) {
     emit('job_start', { jobId: job.id, company: job.company, role: job.role })
@@ -50,49 +52,37 @@ export async function runAnalyze(
       const result = await modelChat(messages, scoringConfig, 512)
       const parsed = parseScoreResult(result.text)
 
-      // Persist score + analyst recommendation (analysisNote) to DB
-      await db.job.update({
-        where: { id: job.id },
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        data: { score: parsed.score, analysisNote: parsed.recommendation || null } as any,
-      })
-
-      // Log activity
-      await db.activity.create({
-        data: {
-          userId,
-          jobId: job.id,
-          type:  'agent_action',
-          text:  `Agent scored ${job.company} · ${job.role}: ${parsed.score}% match`,
-          color: SCORE_COLOR(parsed.score),
-        },
-      })
+      const color = SCORE_COLOR(parsed.score)
+      pendingUpdates.push({ jobId: job.id, score: parsed.score, recommendation: parsed.recommendation })
+      pendingActivities.push({ jobId: job.id, text: `Agent scored ${job.company} · ${job.role}: ${parsed.score}% match`, color })
 
       scoredJobs.push({ job, ...parsed })
 
       emit('job_done', {
-        jobId:           job.id,
-        company:         job.company,
-        role:            job.role,
-        score:           parsed.score,
-        autoApplied:     false,
-        recommendation:  parsed.recommendation,
-        matchedKeywords: parsed.matchedKeywords,
-        missingKeywords: parsed.missingKeywords,
+        jobId: job.id, company: job.company, role: job.role,
+        score: parsed.score, autoApplied: false,
+        recommendation: parsed.recommendation,
+        matchedKeywords: parsed.matchedKeywords, missingKeywords: parsed.missingKeywords,
       })
 
-      // Throttle to respect rate limits
       await new Promise(r => setTimeout(r, THROTTLE_MS))
     } catch (err) {
       failed++
       console.error('[analyze] scoring error:', err)
-      emit('job_error', {
-        jobId:   job.id,
-        company: job.company,
-        role:    job.role,
-        error:   'AI scoring failed',
-      })
+      emit('job_error', { jobId: job.id, company: job.company, role: job.role, error: 'AI scoring failed' })
     }
+  }
+
+  // Batch persist scores and activities
+  if (pendingUpdates.length > 0) {
+    await Promise.all([
+      ...pendingUpdates.map(u =>
+        db.job.update({ where: { id: u.jobId }, data: { score: u.score, analysisNote: u.recommendation || null } as any })
+      ),
+      ...pendingActivities.map(a =>
+        db.activity.create({ data: { userId, jobId: a.jobId, type: 'agent_action' as const, text: a.text, color: a.color } })
+      ),
+    ])
   }
 
   if (scoredJobs.length === 0 && jobs.length > 0) {

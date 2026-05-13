@@ -9,10 +9,11 @@ import { AiFieldSuggestion, type AiFieldContext } from './AiFieldSuggestion'
 
 type Project = NonNullable<ResumeContent['projects']>[number]
 
-export function ProjectsSection({ projects, jobContext, onChange, dragHandleProps, onRemove }: {
+export function ProjectsSection({ projects, jobContext, onChange, dragHandleProps, onRemove, flashField }: {
   projects:         Project[]
   jobContext?:      AiFieldContext
   onChange:         (p: Project[]) => void
+  flashField?:      string
   dragHandleProps?: DragHandleProps
   onRemove?:        () => void
 }) {

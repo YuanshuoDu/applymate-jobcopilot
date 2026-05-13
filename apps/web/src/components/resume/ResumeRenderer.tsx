@@ -283,11 +283,11 @@ function TemplateExecutive({ c, opts }: { c: ResumeContent; opts?: TemplateOptio
   const { accent, font, den } = resolveOpts(opts)
   const order = effectiveOrder(c)
   const [padV, padH] = den.pagePad.split(' ')
-  const headerPad = `${parseInt(padV) + 8}px ${padH}`
+  const headerPadV = `${parseInt(padV) + 8}px`
   return (
     <div style={{ fontFamily: font, background: '#fff', minHeight: '100%' }}>
       {/* Bold header block */}
-      <div style={{ background: accent, padding: headerPad, paddingBottom: 24 }}>
+      <div style={{ background: accent, paddingTop: headerPadV, paddingRight: padH, paddingBottom: 24, paddingLeft: padH }}>
         <div style={{ fontSize: 30, fontWeight: 800, color: '#fff', letterSpacing: '-0.5px', marginBottom: 6 }}>
           {c.contact.name || 'Your Name'}
         </div>
@@ -309,7 +309,7 @@ function TemplateExecutive({ c, opts }: { c: ResumeContent; opts?: TemplateOptio
 function TemplateSidebar({ c, opts }: { c: ResumeContent; opts?: TemplateOptions | null }) {
   const { accent, font, den } = resolveOpts(opts)
   const [padV, padH] = den.pagePad.split(' ')
-  const mainOrder = (c.sectionOrder ?? DEFAULT_ORDER).filter(id => !['skills','education','languages'].includes(id) && !id.startsWith('custom_'))
+  const mainOrder = (c.sectionOrder ?? DEFAULT_ORDER).filter(id => !['skills','education','languages'].includes(id))
 
   return (
     <div style={{ fontFamily: font, display: 'grid', gridTemplateColumns: '200px 1fr', background: '#fff', minHeight: '100%' }}>
