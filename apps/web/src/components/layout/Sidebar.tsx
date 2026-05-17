@@ -125,6 +125,7 @@ export function Sidebar({ active, onNav, session }: SidebarProps) {
         {/* Logout button */}
         <button
           onClick={() => signOut({ callbackUrl: '/login' })}
+          className="sidebar-logout-btn"
           style={{
             width: '100%', padding: '8px 12px', border: 'none', background: 'transparent',
             color: 'var(--text-muted)', fontSize: 12, textAlign: 'left', cursor: 'pointer',
@@ -132,8 +133,6 @@ export function Sidebar({ active, onNav, session }: SidebarProps) {
             borderTop: '0.5px solid var(--border)',
             transition: 'all 0.12s',
           }}
-          onMouseEnter={e => { (e.currentTarget as HTMLButtonElement).style.color = '#A32D2D' }}
-          onMouseLeave={e => { (e.currentTarget as HTMLButtonElement).style.color = 'var(--text-muted)' }}
         >
           <span style={{ fontSize: 13, opacity: 0.6 }}>↪</span>
           退出登录
@@ -142,4 +141,3 @@ export function Sidebar({ active, onNav, session }: SidebarProps) {
     </div>
   )
 }
-
