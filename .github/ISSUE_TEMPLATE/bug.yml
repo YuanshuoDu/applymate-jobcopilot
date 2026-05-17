@@ -1,0 +1,37 @@
+---
+name: Bug Report
+about: Report a bug for Codex to fix
+title: "fix: "
+labels: ["type:bug", "spec-ready", "assignee:codex"]
+assignees: ""
+---
+
+## Summary
+<!-- One-line description of the bug -->
+
+## Reproduction Steps
+1.
+2.
+3.
+
+## Expected Behavior
+
+## Actual Behavior
+
+## Environment
+- Browser/OS:
+- Branch/commit:
+
+## Logs / Screenshots
+<!-- Paste error messages, stack traces, or screenshots -->
+
+## Acceptance Criteria
+- [ ] Bug no longer reproduces with repro steps above
+- [ ] No regression on related flows
+- [ ] Relevant test added / updated
+
+## Tech Notes
+<!-- Suspect files, related code areas -->
+
+---
+@codex Please fix per the ACs above. Branch naming: fix/ISSUE_ID-slug. Open a PR with "Closes #ISSUE_ID" when ready.
