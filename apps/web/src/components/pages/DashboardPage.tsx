@@ -55,7 +55,9 @@ function PipelineBar({ pipeline }: { pipeline: Partial<Record<JobStatus, number>
       <div style={{ display: 'flex', gap: 8, alignItems: 'flex-end', height: 80 }}>
         {stages.map((s, i) => (
           <div key={s.key} style={{ flex: 1, display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 4 }}>
-            <span style={{ fontSize: 11, fontWeight: 500, color: s.color }}>{values[i]}</span>
+            <span style={{ fontSize: 11, fontWeight: 500, color: s.color, textAlign: 'center' }}>
+              {`${s.label}: ${values[i]}`}
+            </span>
             <div style={{ width: '100%', background: 'var(--bg-tertiary)', borderRadius: 4, overflow: 'hidden', height: Math.max(8, (values[i] / max) * 56) }}>
               <div style={{ width: '100%', height: '100%', background: s.color, opacity: 0.8 }} />
             </div>

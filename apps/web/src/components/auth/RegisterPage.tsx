@@ -174,19 +174,19 @@ export function RegisterPage() {
           <form onSubmit={handleRegister} style={{ display:'flex', flexDirection:'column', gap:14 }}>
             <Field label="姓名">
               <input type="text" value={name} autoComplete="name"
-                placeholder="张三" onChange={e => setName(e.target.value)} style={inputSt} />
+                placeholder="张三" onChange={e => setName(e.target.value)} className="input-base" style={inputSt} />
             </Field>
             <Field label="邮箱">
               <input type="email" value={email} autoComplete="email"
-                placeholder="you@example.com" onChange={e => setEmail(e.target.value)} style={inputSt} />
+                placeholder="you@example.com" onChange={e => setEmail(e.target.value)} className="input-base" style={inputSt} />
             </Field>
             <Field label="密码" hint="至少 8 位">
               <input type="password" value={password} autoComplete="new-password"
-                placeholder="••••••••" onChange={e => setPassword(e.target.value)} style={inputSt} />
+                placeholder="••••••••" onChange={e => setPassword(e.target.value)} className="input-base" style={inputSt} />
             </Field>
             <Field label="确认密码">
               <input type="password" value={confirm} autoComplete="new-password"
-                placeholder="再次输入密码" onChange={e => setConfirm(e.target.value)} style={inputSt} />
+                placeholder="再次输入密码" onChange={e => setConfirm(e.target.value)} className="input-base" style={inputSt} />
               {/* Password strength */}
               {password && <PasswordStrength password={password} />}
             </Field>
@@ -290,5 +290,5 @@ function Spinner() {
 
 const inputSt: React.CSSProperties = {
   width:'100%', padding:'10px 12px', border:`1px solid ${C.border}`,
-  borderRadius:8, fontSize:13, color:C.text, background:C.bg, outline:'none',
+  borderRadius:8, fontSize:13, color:C.text, background:C.bg,
 }
