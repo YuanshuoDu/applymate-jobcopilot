@@ -22,7 +22,6 @@ const inputStyle: React.CSSProperties = {
   fontSize: 13,
   color: C.text,
   background: C.bg,
-  outline: 'none',
 }
 
 export function ForgotPasswordPage() {
@@ -106,6 +105,7 @@ export function ForgotPasswordPage() {
                   autoComplete="email"
                   placeholder="you@example.com"
                   onChange={e => setEmail(e.target.value)}
+                  className="input-base"
                   style={inputStyle}
                 />
               </div>

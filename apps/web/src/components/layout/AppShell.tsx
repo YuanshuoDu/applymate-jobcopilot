@@ -206,6 +206,7 @@ export function AppShell() {
         <div id="mobile-bottom-bar">
           {MOB_NAV.map(item => (
             <button key={item.id}
+              aria-label={item.label}
               onClick={() => setPage(item.id)}
               style={{
                 display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 3,
@@ -213,7 +214,7 @@ export function AppShell() {
                 color: page === item.id ? 'var(--primary)' : 'var(--text-muted)',
                 fontSize: 10, fontFamily: 'inherit', position: 'relative',
               }}>
-              <span style={{ fontSize: 18 }}>{item.icon}</span>
+              <span aria-hidden="true" style={{ fontSize: 18 }}>{item.icon}</span>
               <span>{item.label}</span>
               {item.badge && item.id === 'gmail' && (
                 <span style={{ position: 'absolute', top: 4, right: 18, width: 6, height: 6, borderRadius: '50%', background: '#A32D2D' }} />

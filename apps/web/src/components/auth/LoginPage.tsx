@@ -186,6 +186,7 @@ export function LoginPage() {
                 type="email" value={email} autoComplete="email"
                 placeholder="you@example.com"
                 onChange={e => setEmail(e.target.value)}
+                className="input-base"
                 style={inputStyle}
               />
             </FormField>
@@ -198,6 +199,7 @@ export function LoginPage() {
                 type="password" value={password} autoComplete="current-password"
                 placeholder="••••••••"
                 onChange={e => setPassword(e.target.value)}
+                className="input-base"
                 style={inputStyle}
               />
             </FormField>
@@ -311,7 +313,7 @@ function GitHubIcon() {
 const inputStyle: React.CSSProperties = {
   width:'100%', padding:'10px 12px',
   border:`1px solid ${C.border}`, borderRadius:8,
-  fontSize:13, color:C.text, background:C.bg, outline:'none',
+  fontSize:13, color:C.text, background:C.bg,
   transition:'border-color 0.15s',
 }
 
