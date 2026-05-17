@@ -1,6 +1,6 @@
 'use client'
 
-import React, { useState, useEffect } from 'react'
+import React, { useState, useEffect, useRef } from 'react'
 import { useSession, signIn, signOut } from 'next-auth/react'
 import { useRouter } from 'next/navigation'
 import { Sidebar } from './Sidebar'
@@ -37,8 +37,6 @@ const PAGES: Record<Page, React.ComponentType> = {
   settings:  SettingsPage,
 }
 
-let loginSyncInProgress = false
-
 function getInitialPage(): Page {
   if (typeof window === 'undefined') return 'dashboard'
   const params = new URLSearchParams(window.location.search)
@@ -52,6 +50,7 @@ export function AppShell() {
   const [timedOut, setTimedOut] = useState(false)
   const { data: session, status } = useSession()
   const router = useRouter()
+  const loginSyncInProgress = useRef<boolean>(false)
   const PageComp = PAGES[page]
 
   // Clean up ?page= query param after reading it
@@ -97,11 +96,16 @@ export function AppShell() {
       // Extension logged in → auto-login dashboard
       if (e.data?.type === 'APPLYMATE_TOKEN' && e.data?.token) {
         if (status === 'authenticated') return // already logged in
-        if (loginSyncInProgress) return
-        loginSyncInProgress = true
-        signIn('credentials', { token: e.data.token as string, redirect: false })
-          .then(() => { loginSyncInProgress = false })
-          .catch(() => { loginSyncInProgress = false })
+        if (loginSyncInProgress.current) return
+        loginSyncInProgress.current = true
+
+        try {
+          signIn('credentials', { token: e.data.token as string, redirect: false })
+            .then(() => { loginSyncInProgress.current = false })
+            .catch(() => { loginSyncInProgress.current = false })
+        } catch {
+          loginSyncInProgress.current = false
+        }
       }
 
       // Extension logged out → auto-logout dashboard
