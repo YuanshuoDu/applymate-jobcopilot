@@ -66,6 +66,24 @@ Open [http://localhost:3000](http://localhost:3000) 🚀
 
 ---
 
+## Troubleshooting
+
+### Recover from a stale `.next` build cache
+
+If the dev server fails with an `ENOENT` error for `jose.js` under `apps/web/.next`, clear the cached Next.js build output and start again:
+
+```bash
+rm -rf apps/web/.next && pnpm dev
+```
+
+You can also run the web app's clean-start helper:
+
+```bash
+pnpm --filter web dev:clean
+```
+
+---
+
 ## API Reference
 
 All routes require authentication (session cookie or JWT) except `/api/auth/*`.
