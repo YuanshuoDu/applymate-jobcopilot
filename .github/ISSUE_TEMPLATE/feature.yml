@@ -1,0 +1,30 @@
+---
+name: Feature Request
+about: Spec a new feature for Codex to implement
+title: "feat: "
+labels: ["type:feat", "spec-ready", "assignee:codex"]
+assignees: ""
+---
+
+## Problem
+<!-- What user problem or gap does this solve? -->
+
+## Goal
+<!-- One sentence: what should be true after this is done? -->
+
+## Non-Goals
+<!-- Explicitly out of scope -->
+
+## Acceptance Criteria
+- [ ] AC1:
+- [ ] AC2:
+- [ ] AC3:
+
+## Tech Notes
+<!-- Relevant files, constraints, APIs, design system rules -->
+
+## References
+<!-- Figma links, related issues, prior art -->
+
+---
+@codex Please implement per the ACs above. Branch naming: feat/ISSUE_ID-slug. Open a PR with "Closes #ISSUE_ID" when ready.
