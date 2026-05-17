@@ -102,11 +102,26 @@ export const { handlers, signIn, signOut, auth } = NextAuth({
       return true
     },
     async jwt({ token, user }) {
-      if (user) token.id = user.id
+      if (user?.id) {
+        token.id = user.id
+      }
+
+      if (token.id && !token.plan) {
+        const dbUser = await db.user.findUnique({
+          where: { id: token.id as string },
+          select: { plan: true },
+        })
+        token.plan = dbUser?.plan
+      }
+
       return token
     },
     async session({ session, token }) {
-      if (token?.id && session.user) session.user.id = token.id as string
+      if (session.user) {
+        if (token?.id) session.user.id = token.id as string
+        if (token?.plan) session.user.plan = token.plan as string
+      }
+
       return session
     },
   },

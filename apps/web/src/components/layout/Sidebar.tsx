@@ -16,7 +16,9 @@ interface SidebarProps {
 
 export function Sidebar({ active, onNav, session }: SidebarProps) {
   const user      = session?.user
-  const planLabel = 'Pro plan'
+  const planLabel = user?.plan
+    ? `${user.plan.charAt(0).toUpperCase()}${user.plan.slice(1)} plan`
+    : 'Free plan'
   const { theme, toggle } = useTheme()
   const { lang, t, setLang } = useI18n()
   const [gmailUnread, setGmailUnread] = useState<number | null>(null)
