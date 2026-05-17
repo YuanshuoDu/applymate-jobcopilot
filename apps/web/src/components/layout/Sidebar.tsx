@@ -12,9 +12,10 @@ interface SidebarProps {
   active:  Page
   onNav:   (p: Page) => void
   session: Session | null
+  jobCount?: number
 }
 
-export function Sidebar({ active, onNav, session }: SidebarProps) {
+export function Sidebar({ active, onNav, session, jobCount }: SidebarProps) {
   const user      = session?.user
   const planLabel = user?.plan
     ? `${user.plan.charAt(0).toUpperCase()}${user.plan.slice(1)} plan`
@@ -73,7 +74,11 @@ export function Sidebar({ active, onNav, session }: SidebarProps) {
           }}>
             <span style={{ fontSize: 14, opacity: active === item.id ? 1 : 0.5 }}>{item.icon}</span>
             {item.label}
-            {item.id === 'jobs'      && <span style={{ marginLeft: 'auto', fontSize: 10, background: 'rgba(24,95,165,0.12)', color: '#185FA5', borderRadius: 999, padding: '1px 6px' }}>47</span>}
+            {item.id === 'jobs' && jobCount != null && jobCount > 0 && (
+              <span style={{ marginLeft: 'auto', fontSize: 10, background: 'rgba(24,95,165,0.12)', color: '#185FA5', borderRadius: 999, padding: '1px 6px' }}>
+                {jobCount > 99 ? '99+' : jobCount}
+              </span>
+            )}
             {item.id === 'gmail' && gmailUnread != null && gmailUnread > 0 && (
               <span style={{ marginLeft: 'auto', fontSize: 10, background: 'rgba(163,45,45,0.12)', color: '#A32D2D', borderRadius: 999, padding: '1px 6px' }}>{gmailUnread}</span>
             )}
