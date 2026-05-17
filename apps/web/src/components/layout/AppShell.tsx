@@ -5,7 +5,7 @@ import { useSession, signIn, signOut } from 'next-auth/react'
 import { useRouter } from 'next/navigation'
 import { Sidebar } from './Sidebar'
 import { ToastProvider } from '@/components/ui'
-import type { Page } from '@/lib/types'
+import type { DashboardData, JobStatus, Page } from '@/lib/types'
 import { NavContext } from '@/lib/nav-context'
 import { DashboardPage }      from '@/components/pages/DashboardPage'
 import { JobsPage }           from '@/components/pages/JobsPage'
@@ -48,6 +48,7 @@ function getInitialPage(): Page {
 export function AppShell() {
   const [page, setPage]         = useState<Page>(getInitialPage)
   const [timedOut, setTimedOut] = useState(false)
+  const [jobCount, setJobCount] = useState(0)
   const { data: session, status } = useSession()
   const router = useRouter()
   const loginSyncInProgress = useRef<boolean>(false)
@@ -126,6 +127,34 @@ export function AppShell() {
   }, [status])
 
   useEffect(() => {
+    if (status !== 'authenticated') return
+
+    let cancelled = false
+
+    fetch('/api/dashboard')
+      .then(r => r.json() as Promise<DashboardData>)
+      .then(data => {
+        if (cancelled) return
+
+        const pipeline = (data.pipeline ?? {}) as Partial<Record<JobStatus, number>>
+        const nextCount =
+          (pipeline.saved ?? 0) +
+          (pipeline.applied ?? 0) +
+          (pipeline.review ?? 0) +
+          (pipeline.interview ?? 0)
+
+        setJobCount(nextCount)
+      })
+      .catch(() => {
+        if (!cancelled) setJobCount(0)
+      })
+
+    return () => {
+      cancelled = true
+    }
+  }, [status])
+
+  useEffect(() => {
     if (status === 'unauthenticated' || timedOut) {
       router.push('/login?callbackUrl=/')
     }
@@ -166,7 +195,7 @@ export function AppShell() {
       <NavContext.Provider value={{ navigate: setPage }}>
         <div style={{ display: 'flex', height: '100vh', overflow: 'hidden' }}>
           <div id="desktop-sidebar">
-            <Sidebar active={page} onNav={setPage} session={session} />
+            <Sidebar active={page} onNav={setPage} session={session} jobCount={jobCount} />
           </div>
           <div id="main-content" style={{ flex: 1, display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
             <PageComp />
