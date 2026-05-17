@@ -2,6 +2,7 @@
 
 import React, { useState, useEffect } from 'react'
 import { useSession, signIn, signOut } from 'next-auth/react'
+import { useRouter } from 'next/navigation'
 import { Sidebar } from './Sidebar'
 import { ToastProvider } from '@/components/ui'
 import type { Page } from '@/lib/types'
@@ -50,6 +51,7 @@ export function AppShell() {
   const [page, setPage]         = useState<Page>(getInitialPage)
   const [timedOut, setTimedOut] = useState(false)
   const { data: session, status } = useSession()
+  const router = useRouter()
   const PageComp = PAGES[page]
 
   // Clean up ?page= query param after reading it
@@ -119,9 +121,14 @@ export function AppShell() {
     }
   }, [status])
 
+  useEffect(() => {
+    if (status === 'unauthenticated' || timedOut) {
+      router.push('/login?callbackUrl=/')
+    }
+  }, [router, status, timedOut])
+
   // Redirect to login if unauthenticated or timed out
   if (status === 'unauthenticated' || timedOut) {
-    window.location.href = '/login'
     return null
   }
 
