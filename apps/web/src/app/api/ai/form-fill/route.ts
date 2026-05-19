@@ -1,6 +1,6 @@
 import { NextRequest } from 'next/server'
 import { prepareAiRoute, ok, err } from '@/lib/api-helpers'
-import { modelChat, stripFences } from '@/lib/model-router'
+import { modelChat, parseAiJson } from '@/lib/model-router'
 import { FORM_FILL_SYSTEM_PROMPT, buildFormFillPrompt } from '@/lib/form-fill-prompts'
 
 export const maxDuration = 180 // Allow 3 min for multi-field AI analysis
@@ -69,18 +69,9 @@ export async function POST(req: NextRequest) {
       8192, // Larger output for long-form answers + persona classification
     )
 
-    const text = stripFences(result.text).trim()
-    let parsed: FormFillResponse
-    try {
-      parsed = JSON.parse(text) as FormFillResponse
-      if (!parsed.fields || !Array.isArray(parsed.fields)) {
-        throw new Error('Invalid response format')
-      }
-    } catch {
-      // Fallback: try to extract JSON from text
-      const match = text.match(/\{[\s\S]*"fields"[\s\S]*\}/)
-      if (match) parsed = JSON.parse(match[0]) as FormFillResponse
-      else throw new Error('AI response could not be parsed')
+    const parsed = parseAiJson<FormFillResponse>(result.text)
+    if (!parsed.fields || !Array.isArray(parsed.fields)) {
+      throw new Error('AI response missing fields array')
     }
 
     // Map results back and ensure all fields have answers

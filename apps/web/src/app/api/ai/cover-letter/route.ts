@@ -5,7 +5,13 @@
  */
 import { NextRequest } from 'next/server'
 import { prepareAiRoute, ok, err } from '@/lib/api-helpers'
-import { modelChat } from '@/lib/model-router'
+import { modelChat, stripFences, type AiConfig } from '@/lib/model-router'
+import { db } from '@/lib/db'
+
+const COVER_FALLBACKS: AiConfig[] = [
+  { provider: 'deepseek', model: 'deepseek-chat' },
+  { provider: 'minimax',  model: 'MiniMax-M2.7'  },
+]
 import type { ResumeContent } from '@/lib/types'
 
 export async function POST(req: NextRequest) {
@@ -48,9 +54,55 @@ Structure: ${greeting} | hook | why this role | 2-3 achievements | CTA | Sincere
 Rules: 250–320 words, no filler like "I am writing to express my interest", quantify achievements.
 Return ONLY the cover letter text.`
 
+  const messages = [
+    { role: 'system' as const, content: 'You are a professional cover letter writer. Output ONLY the cover letter text — no preamble, no meta-commentary, no explanation. Start directly with the greeting.' },
+    { role: 'user' as const, content: prompt },
+  ]
+
+  async function tryCoverLetter(): Promise<{ text: string; model: string }> {
+    const attempts = [cfg, ...COVER_FALLBACKS.filter(f =>
+      !(f.provider === cfg.provider && f.model === cfg.model)
+    )]
+    let lastErr: unknown
+    for (const attempt of attempts) {
+      try {
+        const result = await modelChat(messages, attempt, 4096)
+        return { text: result.text, model: `${attempt.provider}/${attempt.model}` }
+      } catch (e) {
+        lastErr = e
+        console.warn(`[/api/ai/cover-letter] ${attempt.provider}/${attempt.model} failed:`, (e as Error).message?.slice(0, 100))
+      }
+    }
+    throw lastErr
+  }
+
   try {
-    const result = await modelChat([{ role: 'user', content: prompt }], cfg, 4096)
-    return ok({ coverLetter: result.text, _model: `${cfg.provider}/${cfg.model}` })
+    const { text: raw, model } = await tryCoverLetter()
+    // Strip code fences and <think> blocks, then extract the letter body
+    let letter = stripFences(raw)
+    // If model prepended reasoning/preamble, extract from first greeting
+    const greetingIdx = letter.search(/Dear\s/i)
+    if (greetingIdx > 20) letter = letter.slice(greetingIdx)
+    // Optionally persist to CoverLetter table
+    const { jobId, resumeId } = body as { jobId?: string; resumeId?: string } & typeof body
+    let coverLetterId: string | undefined
+    if (jobId) {
+      try {
+        const cl = await db.coverLetter.create({
+          data: {
+            userId:   prep.userId,
+            jobId,
+            resumeId: resumeId ?? null,
+            content:  letter.trim(),
+            tone:     tone ?? 'professional',
+            origin:   'ai-generated',
+            isFinal:  false,
+          },
+        })
+        coverLetterId = cl.id
+      } catch { /* non-fatal — legacy callers still get the text */ }
+    }
+    return ok({ coverLetter: letter.trim(), coverLetterId, _model: model })
   } catch (e) {
     console.error('[/api/ai/cover-letter]', e)
     return err(`Cover letter failed (${cfg.provider}/${cfg.model}): ${(e as Error).message}`, 500)

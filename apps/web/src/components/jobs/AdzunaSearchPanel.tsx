@@ -250,7 +250,7 @@ export function AdzunaSearchPanel({ variant = 'panel', onJobSaved, onClose }: Pr
           </select>
         </div>
         <button type="submit" disabled={searching || !q.trim()} style={{
-          padding: '8px 18px', background: '#185FA5', color: '#fff', border: 'none', borderRadius: 6,
+          padding: '8px 18px', background: 'var(--primary)', color: '#fff', border: 'none', borderRadius: 6,
           fontSize: 12, fontWeight: 500, cursor: searching ? 'not-allowed' : 'pointer',
           opacity: searching ? 0.7 : 1, whiteSpace: 'nowrap',
         }}>
@@ -269,7 +269,7 @@ export function AdzunaSearchPanel({ variant = 'panel', onJobSaved, onClose }: Pr
         <div style={{ borderTop: isPage ? 'none' : '0.5px solid var(--border)', flex: isPage ? 1 : undefined, display: 'flex', flexDirection: 'column' }}>
           {searching ? (
             <div style={{ padding: 40, textAlign: 'center' }}>
-              <div style={{ width: 22, height: 22, border: '2px solid rgba(24,95,165,0.2)', borderTopColor: '#185FA5', borderRadius: '50%', animation: 'spin 0.7s linear infinite', margin: '0 auto 10px' }} />
+              <div style={{ width: 22, height: 22, border: '2px solid rgba(79,70,229,0.20)', borderTopColor: 'var(--primary)', borderRadius: '50%', animation: 'spin 0.7s linear infinite', margin: '0 auto 10px' }} />
               <div style={{ fontSize: 12, color: 'var(--text-muted)' }}>Searching Adzuna…</div>
             </div>
           ) : results.length === 0 ? (
@@ -304,7 +304,7 @@ export function AdzunaSearchPanel({ variant = 'panel', onJobSaved, onClose }: Pr
                         {r.company}{r.location ? ` · ${r.location}` : ''}
                         {r.postedAt && <span style={{ marginLeft: 8, fontSize: 10, opacity: 0.65 }}>{fmtPosted(r.postedAt)}</span>}
                       </div>
-                      {r.salary && <div style={{ fontSize: 11, color: '#3B6D11', marginTop: 2 }}>{r.salary}</div>}
+                      {r.salary && <div style={{ fontSize: 11, color: 'var(--c-success)', marginTop: 2 }}>{r.salary}</div>}
                       {r.description && <div style={{ fontSize: 10, color: 'var(--text-muted)', marginTop: 4, lineHeight: 1.5 }}>{r.description}</div>}
                     </div>
 
@@ -314,13 +314,13 @@ export function AdzunaSearchPanel({ variant = 'panel', onJobSaved, onClose }: Pr
                         <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-end', gap: 4 }}>
                           {scoringIds.has(r.id) ? (
                             <span style={{ fontSize: 10, color: 'var(--text-muted)', display: 'flex', alignItems: 'center', gap: 4 }}>
-                              <span style={{ display: 'inline-block', width: 10, height: 10, border: '1.5px solid rgba(24,95,165,0.3)', borderTopColor: '#185FA5', borderRadius: '50%', animation: 'spin 0.7s linear infinite' }} />
+                              <span style={{ display: 'inline-block', width: 10, height: 10, border: '1.5px solid rgba(79,70,229,0.30)', borderTopColor: 'var(--primary)', borderRadius: '50%', animation: 'spin 0.7s linear infinite' }} />
                               Scoring…
                             </span>
                           ) : scores[r.id] !== undefined ? (
                             <ScorePill score={scores[r.id]} />
                           ) : (
-                            <span style={{ fontSize: 10, color: '#3B6D11', fontWeight: 500 }}>✓ Saved</span>
+                            <span style={{ fontSize: 10, color: 'var(--c-success)', fontWeight: 500 }}>✓ Saved</span>
                           )}
                         </div>
                       ) : (
@@ -329,7 +329,7 @@ export function AdzunaSearchPanel({ variant = 'panel', onJobSaved, onClose }: Pr
                         </Btn>
                       )}
                       <a href={r.url} target="_blank" rel="noopener noreferrer"
-                        style={{ fontSize: 10, color: '#185FA5', textDecoration: 'none' }}>
+                        style={{ fontSize: 10, color: 'var(--primary)', textDecoration: 'none' }}>
                         View ↗
                       </a>
                     </div>

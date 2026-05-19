@@ -30,7 +30,7 @@ export class ErrorBoundary extends React.Component<
         }}>
           <div style={{ textAlign: 'center', maxWidth: 360 }}>
             <div style={{ fontSize: 24, marginBottom: 10 }}>⚠</div>
-            <div style={{ fontSize: 13, color: '#A32D2D', marginBottom: 6 }}>Something went wrong</div>
+            <div style={{ fontSize: 13, color: 'var(--c-danger)', marginBottom: 6 }}>Something went wrong</div>
             <div style={{ fontSize: 11, color: 'var(--text-muted)', marginBottom: 14, lineHeight: 1.5 }}>
               {this.state.error?.message ?? 'An unexpected error occurred'}
             </div>

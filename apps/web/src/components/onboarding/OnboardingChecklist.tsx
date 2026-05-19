@@ -69,7 +69,7 @@ export function OnboardingChecklist(props: Props) {
 
       {/* Progress bar */}
       <div style={{ height: 3, background: 'var(--bg-tertiary)', borderRadius: 2, marginBottom: 16, overflow: 'hidden' }}>
-        <div style={{ height: '100%', background: '#185FA5', borderRadius: 2, width: `${(done / STEPS.length) * 100}%`, transition: 'width 0.3s' }} />
+        <div style={{ height: '100%', background: 'var(--primary)', borderRadius: 2, width: `${(done / STEPS.length) * 100}%`, transition: 'width 0.3s' }} />
       </div>
 
       <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
@@ -82,7 +82,7 @@ export function OnboardingChecklist(props: Props) {
             }}>
               <div style={{
                 width: 26, height: 26, borderRadius: '50%', flexShrink: 0,
-                background: completed ? '#3B6D11' : 'var(--bg-tertiary)',
+                background: completed ? 'var(--c-success)' : 'var(--bg-tertiary)',
                 color: completed ? '#fff' : 'var(--text-muted)',
                 display: 'flex', alignItems: 'center', justifyContent: 'center',
                 fontSize: 12, fontWeight: 600,

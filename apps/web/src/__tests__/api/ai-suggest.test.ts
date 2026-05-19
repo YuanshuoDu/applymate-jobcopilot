@@ -5,13 +5,17 @@ import { describe, it, expect, vi, beforeEach } from 'vitest'
 
 const mockCreate = vi.fn()
 vi.mock('@anthropic-ai/sdk', () => ({
-  default: vi.fn().mockImplementation(() => ({
-    messages: { create: mockCreate },
-  })),
+  default: class MockAnthropic {
+    messages = { create: mockCreate }
+  },
 }))
 
 vi.mock('@/lib/db', () => ({ db: {} }))
 vi.mock('@/lib/api-helpers', () => ({
+  prepareAiRoute: vi.fn().mockResolvedValue({
+    userId: 'test-user',
+    cfg: { provider: 'anthropic', model: 'claude-sonnet-4-6', apiKey: 'test-key' },
+  }),
   requireAuth: vi.fn().mockResolvedValue({ userId: 'test-user', userEmail: 'test@test.com' }),
   isErrorResponse: (val: unknown) => val instanceof Response && (val as Response).status === 401,
   ok: (data: unknown, status = 200) => Response.json(data, { status }),
@@ -46,10 +50,11 @@ describe('POST /api/ai/suggest', () => {
 
     mockCreate.mockResolvedValueOnce({
       content: [{ type: 'text', text: JSON.stringify([
-        'Add Docker and Kubernetes to your skills section',
-        'Quantify your experience with numbers and metrics',
-        'Tailor your summary to mention cloud-native development',
+        { text: 'Add Docker and Kubernetes to your skills section', target: 'skills', action: 'add_keywords', proposed: 'Docker, Kubernetes, JavaScript' },
+        { text: 'Quantify your experience with numbers and metrics', target: 'experience', action: 'enhance', proposed: 'Improved latency by 40%' },
+        { text: 'Tailor your summary to mention cloud-native development', target: 'summary', action: 'rewrite', proposed: 'Cloud-native engineer with...' },
       ]) }],
+      usage: { input_tokens: 1, output_tokens: 1 },
     })
 
     const req = fakeNextRequest({
@@ -69,7 +74,8 @@ describe('POST /api/ai/suggest', () => {
     const { POST } = await import('@/app/api/ai/suggest/route')
 
     mockCreate.mockResolvedValueOnce({
-      content: [{ type: 'text', text: '```json\n["Suggestion one", "Suggestion two", "Suggestion three"]\n```' }],
+      content: [{ type: 'text', text: '```json\n[{"text":"Suggestion one","target":"summary","action":"rewrite"},{"text":"Suggestion two","target":"skills","action":"add_keywords"},{"text":"Suggestion three","target":"experience","action":"enhance"}]\n```' }],
+      usage: { input_tokens: 1, output_tokens: 1 },
     })
 
     const req = fakeNextRequest({

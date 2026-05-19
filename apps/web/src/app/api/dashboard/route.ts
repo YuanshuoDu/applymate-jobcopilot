@@ -23,10 +23,12 @@ export async function GET() {
   }
 
   const total      = Object.values(pipeline).reduce((a, b) => a + b, 0)
-  const applied    = (pipeline.applied    ?? 0) + (pipeline.review ?? 0) + (pipeline.interview ?? 0) + (pipeline.offer ?? 0) + (pipeline.rejected ?? 0)
-  const inReview   = pipeline.review    ?? 0
-  const interviews = pipeline.interview ?? 0
-  const offers     = pipeline.offer     ?? 0
+  const saved      = pipeline.saved      ?? 0
+  const applied    = pipeline.applied    ?? 0
+  const inProgress = (pipeline.review ?? 0) + (pipeline.interview ?? 0)
+  const interviews = pipeline.interview  ?? 0
+  const offers     = pipeline.offer      ?? 0
+  const rejected   = pipeline.rejected   ?? 0
 
   // Jobs applied this week
   const weekStart = new Date()
@@ -35,7 +37,27 @@ export async function GET() {
     where: { userId, appliedAt: { gte: weekStart } },
   })
 
-  // Recent jobs (last 5 applied/in-progress)
+  // Follow-ups due today or overdue (followUpAt <= end of today)
+  const todayEnd = new Date()
+  todayEnd.setHours(23, 59, 59, 999)
+  const followUpsDue = await db.job.findMany({
+    where: { userId, followUpAt: { lte: todayEnd } },
+    select: { id: true, company: true, role: true, status: true, followUpAt: true },
+    orderBy: { followUpAt: 'asc' },
+    take: 10,
+  })
+
+  // Saved jobs awaiting decision (saved for 7+ days)
+  const staleCutoff = new Date()
+  staleCutoff.setDate(staleCutoff.getDate() - 7)
+  const savedJobs = await db.job.findMany({
+    where: { userId, status: 'saved' },
+    select: { id: true, company: true, role: true, score: true, createdAt: true, url: true },
+    orderBy: { score: { sort: 'desc', nulls: 'last' } },
+    take: 8,
+  })
+
+  // Recent jobs (last 5 non-saved changes)
   const recentJobs = await db.job.findMany({
     where: {
       userId,
@@ -59,8 +81,10 @@ export async function GET() {
   const resumeCount = await db.resume.count({ where: { userId } })
 
   return ok({
-    stats: { total, applied, inReview, interviews, offers, thisWeek },
+    stats: { total, saved, applied, inProgress, interviews, offers, rejected, thisWeek },
     pipeline,
+    followUpsDue,
+    savedJobs,
     recentJobs,
     activity,
     agentConfig,

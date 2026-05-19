@@ -134,7 +134,6 @@ export async function upsertRoleConfig(
   role:   AgentRoleType,
   data:   Partial<Pick<AgentRoleConfig, 'enabled' | 'provider' | 'model' | 'apiKey' | 'systemPrompt'>>,
 ): Promise<AgentRoleConfig> {
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
   return db.agentRole.upsert({
     where:  { userId_role: { userId, role } },
     create: { userId, role, ...ROLE_DEFAULTS[role], ...data } as any,

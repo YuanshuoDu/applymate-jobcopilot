@@ -7,15 +7,19 @@ import { describe, it, expect, vi, beforeEach } from 'vitest'
 
 const mockCreate = vi.fn()
 vi.mock('@anthropic-ai/sdk', () => ({
-  default: vi.fn().mockImplementation(() => ({
-    messages: { create: mockCreate },
-  })),
+  default: class MockAnthropic {
+    messages = { create: mockCreate }
+  },
 }))
 
 // ── Mock Prisma / auth ─────────────────────────────────────────────────────────
 
 vi.mock('@/lib/db', () => ({ db: {} }))
 vi.mock('@/lib/api-helpers', () => ({
+  prepareAiRoute: vi.fn().mockResolvedValue({
+    userId: 'test-user',
+    cfg: { provider: 'anthropic', model: 'claude-sonnet-4-6', apiKey: 'test-key' },
+  }),
   requireAuth: vi.fn().mockResolvedValue({ userId: 'test-user', userEmail: 'test@test.com' }),
   isErrorResponse: (val: unknown) => val instanceof Response && (val as Response).status === 401,
   ok: (data: unknown, status = 200) => Response.json(data, { status }),
@@ -42,19 +46,9 @@ describe('POST /api/ai/score', () => {
     vi.clearAllMocks()
   })
 
-  it('returns 400 when resumeContent is missing', async () => {
-    const { POST } = await import('@/app/api/ai/score/route')
-    const req = fakeNextRequest({ jobTitle: 'Engineer' })
-    const res = await POST(req as never)
-
-    expect(res.status).toBe(400)
-    const body = await res.json()
-    expect(body.error).toContain('resumeContent')
-  })
-
   it('returns 400 when both jobTitle and jobDescription are missing', async () => {
     const { POST } = await import('@/app/api/ai/score/route')
-    const req = fakeNextRequest({ resumeContent: { summary: 'test' } })
+    const req = fakeNextRequest({})
     const res = await POST(req as never)
 
     expect(res.status).toBe(400)
@@ -80,10 +74,11 @@ describe('POST /api/ai/score', () => {
       content: [{ type: 'text', text: JSON.stringify({
         score: 82,
         matchedKeywords: ['react', 'typescript'],
-        missingKeywords: ['docker'],
+        missingItems: [{ keyword: 'docker', target: 'skills', tip: 'Add Docker experience' }],
         sectionScores: { Summary: 75, Experience: 90, Skills: 80, Education: 70 },
         sectionTips: { Summary: 'ok', Experience: 'nice', Skills: 'good', Education: 'fine' },
       }) }],
+      usage: { input_tokens: 1, output_tokens: 1 },
     })
 
     const req = fakeNextRequest({
@@ -97,7 +92,7 @@ describe('POST /api/ai/score', () => {
     const body = await res.json()
     expect(body.score).toBe(82)
     expect(body.matchedKeywords).toEqual(['react', 'typescript'])
-    expect(body.missingKeywords).toEqual(['docker'])
+    expect(body.missingItems).toEqual([{ keyword: 'docker', target: 'skills', tip: 'Add Docker experience' }])
     expect(body.sectionScores.Summary).toBe(75)
   })
 
@@ -105,7 +100,8 @@ describe('POST /api/ai/score', () => {
     const { POST } = await import('@/app/api/ai/score/route')
 
     mockCreate.mockResolvedValueOnce({
-      content: [{ type: 'text', text: '```json\n{"score": 60, "matchedKeywords": [], "missingKeywords": ["a"], "sectionScores": {}, "sectionTips": {}}\n```' }],
+      content: [{ type: 'text', text: '```json\n{"score": 60, "matchedKeywords": [], "missingItems": [{"keyword":"a","target":"skills","tip":"Add skill a"}], "sectionScores": {}, "sectionTips": {}}\n```' }],
+      usage: { input_tokens: 1, output_tokens: 1 },
     })
 
     const req = fakeNextRequest({
@@ -124,6 +120,7 @@ describe('POST /api/ai/score', () => {
 
     mockCreate.mockResolvedValueOnce({
       content: [{ type: 'text', text: 'I cannot process this request' }],
+      usage: { input_tokens: 1, output_tokens: 1 },
     })
 
     const req = fakeNextRequest({
@@ -132,8 +129,10 @@ describe('POST /api/ai/score', () => {
     })
     const res = await POST(req as never)
 
-    // Should return 500 on JSON parse error
-    expect(res.status).toBe(500)
+    expect(res.status).toBe(200)
+    const body = await res.json()
+    expect(body.score).toBe(0)
+    expect(body.strengthSummary).toContain('Analysis unavailable')
   })
 
   it('handles Anthropic API failure', async () => {
@@ -149,6 +148,6 @@ describe('POST /api/ai/score', () => {
 
     expect(res.status).toBe(500)
     const body = await res.json()
-    expect(body.error).toContain('ANTHROPIC_API_KEY')
+    expect(body.error).toContain('API key invalid')
   })
 })

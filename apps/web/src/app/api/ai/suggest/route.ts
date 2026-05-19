@@ -5,7 +5,7 @@
  */
 import { NextRequest } from 'next/server'
 import { prepareAiRoute, ok, err } from '@/lib/api-helpers'
-import { modelChat, stripFences } from '@/lib/model-router'
+import { modelChat, parseAiJson } from '@/lib/model-router'
 import type { ResumeContent } from '@/lib/types'
 
 export async function POST(req: NextRequest) {
@@ -42,14 +42,12 @@ Give 3 improvement suggestions. ONLY use real info from the resume. Output ONLY 
 
   try {
     const result = await modelChat([{ role: 'user', content: prompt }], cfg, 3000)
-    const text   = stripFences(result.text)
     let parsed: unknown[]
     try {
-      parsed = JSON.parse(text)
-      if (!Array.isArray(parsed)) parsed = [parsed]
+      const raw = parseAiJson<unknown>(result.text)
+      parsed = Array.isArray(raw) ? raw : [raw]
     } catch {
-      // Last-resort fallback: return the raw text as a single general suggestion
-      const snippet = text.slice(0, 300).replace(/[{}[\]"]/g, '')
+      const snippet = result.text.replace(/<think>[\s\S]*?<\/think>/gi, '').slice(0, 300).replace(/[{}[\]"]/g, '').trim()
       return ok({
         suggestions: [{
           text: snippet || 'Could not generate suggestions. Try again.',

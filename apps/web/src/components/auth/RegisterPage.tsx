@@ -6,7 +6,7 @@ import { useRouter } from 'next/navigation'
 import Link from 'next/link'
 
 const C = {
-  primary: '#185FA5', green: '#3B6D11', red: '#A32D2D',
+  primary: 'var(--primary)', green: 'var(--c-success)', red: 'var(--c-danger)',
   border: 'rgba(0,0,0,0.08)', text: '#0f0f10', muted: '#6b7280',
   bg: '#ffffff', bgSide: '#f0f5fb',
 }
@@ -83,7 +83,7 @@ export function RegisterPage() {
           <div style={{ fontSize:56, marginBottom:16 }}>🎉</div>
           <h2 style={{ fontSize:22, fontWeight:700, marginBottom:8, color:C.text }}>账号创建成功！</h2>
           <p style={{ fontSize:13, color:C.muted }}>正在跳转到你的 Dashboard…</p>
-          <div style={{ marginTop:20, width:48, height:48, border:`3px solid rgba(24,95,165,0.2)`, borderTopColor:C.primary, borderRadius:'50%', animation:'spin 0.7s linear infinite', margin:'20px auto 0' }} />
+          <div style={{ marginTop:20, width:48, height:48, border:`3px solid rgba(79,70,229,0.20)`, borderTopColor:C.primary, borderRadius:'50%', animation:'spin 0.7s linear infinite', margin:'20px auto 0' }} />
         </div>
       </div>
     )
@@ -157,7 +157,7 @@ export function RegisterPage() {
 
           {/* Error */}
           {error && (
-            <div style={{ padding:'10px 14px', background:'rgba(163,45,45,0.08)', border:`1px solid rgba(163,45,45,0.2)`, borderRadius:8, marginBottom:18, fontSize:12, color:C.red }}>
+            <div style={{ padding:'10px 14px', background:'rgba(163,45,45,0.08)', border:`1px solid rgba(220,38,38,0.20)`, borderRadius:8, marginBottom:18, fontSize:12, color:C.red }}>
               ⚠ {error}
             </div>
           )}
@@ -261,7 +261,7 @@ function PasswordStrength({ password }: { password: string }) {
   ].filter(Boolean).length
 
   const labels = ['', '弱', '一般', '较强', '强']
-  const colors = ['', C.red, '#854F0B', C.primary, C.green]
+  const colors = ['', C.red, 'var(--c-warning)', C.primary, C.green]
 
   return (
     <div style={{ marginTop:6 }}>

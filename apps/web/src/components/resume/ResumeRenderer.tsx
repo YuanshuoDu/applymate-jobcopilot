@@ -16,7 +16,7 @@ import type { ResumeContent, TemplateOptions } from '@/lib/types'
 // ── Palette ───────────────────────────────────────────────────────────────────
 
 export const ACCENT_COLORS = [
-  { id: 'blue',      label: 'Blue',       hex: '#185FA5' },
+  { id: 'blue',      label: 'Blue',       hex: 'var(--primary)' },
   { id: 'slate',     label: 'Slate',      hex: '#3D5A73' },
   { id: 'forest',    label: 'Forest',     hex: '#2E6B4F' },
   { id: 'terracotta',label: 'Terracotta', hex: '#A0522D' },

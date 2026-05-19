@@ -297,11 +297,14 @@ interface OaiRequestConfig {
 }
 
 function oaiFetch(c: OaiRequestConfig): Promise<Response> {
+  const controller = new AbortController()
+  const timer = setTimeout(() => controller.abort(), 30_000)
   return fetch(`${c.base}/chat/completions`, {
     method:  'POST',
     headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${c.key}` },
     body:    JSON.stringify({ model: c.model, max_tokens: c.maxTokens, messages: c.messages, stream: c.stream }),
-  })
+    signal:  controller.signal,
+  }).finally(() => clearTimeout(timer))
 }
 
 async function oaiCheck(resp: Response, provider: Provider): Promise<void> {
@@ -411,6 +414,24 @@ export function stripFences(raw: string): string {
     if (arrMatch) return arrMatch[0]
   }
   return clean
+}
+
+/**
+ * Parse an AI response that is expected to be JSON.
+ * Handles: code fences, <think> blocks, surrounding text, and nested extraction.
+ * Throws if no valid JSON can be found.
+ */
+export function parseAiJson<T = unknown>(raw: string): T {
+  const text = stripFences(raw)
+  // 1. Direct parse
+  try { return JSON.parse(text) as T } catch { /* fall through */ }
+  // 2. Regex-extract first JSON object
+  const objM = text.match(/\{[\s\S]*\}/)
+  if (objM) { try { return JSON.parse(objM[0]) as T } catch { /* fall through */ } }
+  // 3. Regex-extract first JSON array
+  const arrM = text.match(/\[[\s\S]*\]/)
+  if (arrM) { try { return JSON.parse(arrM[0]) as T } catch { /* fall through */ } }
+  throw new Error(`AI response could not be parsed as JSON. Raw: ${text.slice(0, 120)}`)
 }
 
 /** Group catalogue by provider for UI rendering */

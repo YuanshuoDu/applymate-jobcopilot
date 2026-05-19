@@ -1,0 +1,5 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Collaboration Workflow Guide
+    url: https://github.com/YuanshuoDu/applymate-jobcopilot/blob/main/docs/github-collaboration.md
+    about: Read the Claude/Codex GitHub operating model before creating new work.

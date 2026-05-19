@@ -7,7 +7,7 @@
  */
 import { NextRequest } from 'next/server'
 import { prepareAiRoute, ok, err } from '@/lib/api-helpers'
-import { modelChat, stripFences } from '@/lib/model-router'
+import { modelChat, parseAiJson, stripFences } from '@/lib/model-router'
 
 type FieldType = 'summary' | 'bullet' | 'description' | 'custom'
 
@@ -22,7 +22,7 @@ Return ONLY a single improved summary paragraph, no markdown, no quotes.`
 CURRENT: ${v || 'empty'}
 CONTEXT: ${ctx}
 Rules: each 2-4 sentences, professional tone, varies in style (concise/detailed/achievement-focused).
-Return ONLY a JSON array of 3 strings: ["...", "...", "..."]`,
+Output ONLY a JSON array of 3 strings: ["...", "...", "..."]`,
 
   bullet: (v, ctx, fb) => fb
     ? `You are a career coach. Rewrite this resume bullet incorporating the following feedback.
@@ -34,7 +34,7 @@ Return ONLY a single improved bullet point (no leading bullet symbol), no markdo
 CURRENT: ${v || 'empty'}
 CONTEXT: ${ctx}
 Rules: start with an action verb, be specific and quantifiable where possible, vary in approach.
-Return ONLY a JSON array of 3 strings: ["...", "...", "..."]`,
+Output ONLY a JSON array of 3 strings: ["...", "...", "..."]`,
 
   description: (v, ctx, fb) => fb
     ? `Rewrite this project/item description incorporating: ${fb}
@@ -44,7 +44,7 @@ Return ONLY a single improved description, no markdown, no quotes.`
     : `Generate 3 distinct descriptions for this resume item.
 CURRENT: ${v || 'empty'}
 CONTEXT: ${ctx}
-Return ONLY a JSON array of 3 strings: ["...", "...", "..."]`,
+Output ONLY a JSON array of 3 strings: ["...", "...", "..."]`,
 
   custom: (v, ctx, fb) => fb
     ? `Improve this resume text incorporating: ${fb}
@@ -54,7 +54,7 @@ Return ONLY a single improved version, no markdown, no quotes.`
     : `Generate 3 improved versions of this resume text.
 CURRENT: ${v || 'empty'}
 CONTEXT: ${ctx}
-Return ONLY a JSON array of 3 strings: ["...", "...", "..."]`,
+Output ONLY a JSON array of 3 strings: ["...", "...", "..."]`,
 }
 
 export async function POST(req: NextRequest) {
@@ -87,9 +87,8 @@ export async function POST(req: NextRequest) {
 
     let suggestions: string[]
     try {
-      suggestions = JSON.parse(text)
-      if (!Array.isArray(suggestions)) throw new Error('not array')
-      suggestions = suggestions.slice(0, 3).map(String)
+      const parsed = parseAiJson<unknown>(result.text)
+      suggestions = (Array.isArray(parsed) ? parsed : [parsed]).slice(0, 3).map(String)
     } catch {
       suggestions = [text]
     }

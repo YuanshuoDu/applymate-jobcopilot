@@ -39,6 +39,11 @@ export default defineConfig({
         entryFileNames: '[name].js',
         chunkFileNames: 'chunks/[name].js',
         assetFileNames: 'assets/[name].[ext]',
+        // Force storage + api into dedicated chunks so build.cjs can inline them cleanly
+        manualChunks(id) {
+          if (id.includes('/lib/storage')) return 'storage'
+          if (id.includes('/lib/api'))     return 'api'
+        },
       },
     },
   },

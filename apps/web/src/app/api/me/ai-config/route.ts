@@ -84,7 +84,6 @@ export async function POST(req: NextRequest) {
     }
   }
 
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
   await db.user.update({
     where: { id: auth.userId },
     data:  { preferences: { ...prefs, aiSettings: { keys: mergedKeys, features: mergedFeatures } } as any },

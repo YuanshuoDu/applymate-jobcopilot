@@ -3,8 +3,11 @@
 import React, { useMemo, useState, useEffect, useRef, useCallback } from 'react'
 import { TopBar } from '@/components/layout/TopBar'
 import { Btn, Card, CompanyLogo, INPUT_STYLE, ScorePill, StatusBadge, useToast, useConfirm } from '@/components/ui'
-import type { Job, JobStatus, Activity } from '@/lib/types'
-import { apiMutate, fmtDate, fmtRelative } from '@/lib/hooks'
+import type { Job, JobStatus, Activity, CoverLetter, ResumeListItem } from '@/lib/types'
+import { apiMutate, fmtDate, fmtRelative, useApi } from '@/lib/hooks'
+import { useI18n } from '@/lib/i18n'
+import { CoverLetterPanel } from '@/components/coverletter/CoverLetterPanel'
+import { downloadJobBundle, BundleError } from '@/lib/bundle'
 
 const KANBAN_COLS: JobStatus[] = ['saved', 'applied', 'review', 'interview', 'offer', 'rejected']
 const COL_LABELS: Record<JobStatus, string> = {
@@ -12,8 +15,12 @@ const COL_LABELS: Record<JobStatus, string> = {
   interview: 'Interview', offer: 'Offer', rejected: 'Rejected',
 }
 const COL_COLORS: Record<JobStatus, string> = {
-  saved: '#6B7280', applied: '#185FA5', review: '#854F0B',
-  interview: '#3B6D11', offer: '#0E7490', rejected: '#A32D2D',
+  saved:     'var(--text-muted)',
+  applied:   'var(--primary)',
+  review:    'var(--c-warning)',
+  interview: 'var(--c-success)',
+  offer:     'var(--c-info)',
+  rejected:  'var(--c-danger)',
 }
 
 // ── ListView ──────────────────────────────────────────────────────────────────
@@ -76,11 +83,11 @@ function ListView({ jobs, onRowClick }: { jobs: Job[]; onRowClick: (job: Job) =>
               </td>
               <td style={{ padding: '10px 16px', fontSize: 12, color: 'var(--text-muted)' }}>{j.role}</td>
               <td style={{ padding: '10px 16px' }}><StatusBadge status={j.status} /></td>
-              <td style={{ padding: '10px 16px' }}><ScorePill score={j.score ?? 0} /></td>
+              <td style={{ padding: '10px 16px' }}><ScorePill score={j.score ?? null} /></td>
               <td style={{ padding: '10px 16px', fontSize: 11, color: 'var(--text-muted)' }}>
                 {fmtDate(j.appliedAt ?? j.createdAt)}
               </td>
-              <td style={{ padding: '10px 16px', fontSize: 11, color: j.followUpAt ? '#854F0B' : 'var(--text-muted)' }}>
+              <td style={{ padding: '10px 16px', fontSize: 11, color: j.followUpAt ? 'var(--c-warning)' : 'var(--text-muted)' }}>
                 {fmtDate(j.followUpAt) || '—'}
               </td>
               <td style={{ padding: '10px 16px' }}>
@@ -253,8 +260,8 @@ function ApplyBasket({ cart, onRemove, onClose, onJobsUpdated }: {
                 <div style={{ fontSize: 12, fontWeight: 500 }}>{j.role}</div>
                 <div style={{ fontSize: 11, color: 'var(--text-muted)' }}>{j.company} · {j.location}</div>
               </div>
-              <ScorePill score={j.score ?? 0} />
-              {tailored.has(j.id) && <span style={{ fontSize: 10, color: '#3B6D11', fontWeight: 500 }}>✓ Tailored</span>}
+              <ScorePill score={j.score ?? null} />
+              {tailored.has(j.id) && <span style={{ fontSize: 10, color: 'var(--c-success)', fontWeight: 500 }}>✓ Tailored</span>}
               {!tailoring && <button onClick={() => onRemove(j.id)} style={{ background: 'none', border: 'none', cursor: 'pointer', color: 'var(--text-muted)', fontSize: 13 }}>✕</button>}
             </div>
           ))}
@@ -350,7 +357,7 @@ function AddJobModal({ onClose, onAdded, prefillStatus }: {
           <div style={{ display: 'flex', gap: 8, justifyContent: 'flex-end', marginTop: 4 }}>
             <Btn variant="ghost" onClick={onClose}>Cancel</Btn>
             <button type="submit" disabled={saving} style={{
-              padding: '7px 16px', background: '#185FA5', color: '#fff', border: 'none', borderRadius: 6,
+              padding: '7px 16px', background: 'linear-gradient(135deg, var(--primary) 0%, var(--accent) 100%)', color: '#fff', border: 'none', borderRadius: 6, boxShadow: '0 2px 8px rgba(79,70,229,0.30)',
               fontSize: 12, fontWeight: 500, cursor: saving ? 'not-allowed' : 'pointer', opacity: saving ? 0.7 : 1,
             }}>
               {saving ? 'Adding…' : 'Add Job'}
@@ -371,6 +378,7 @@ function JobDetailDrawer({ job, onClose, onStatusChange, onUpdate, onDelete }: {
   onDelete:       (id: string) => void
 }) {
   const toast = useToast()
+  const { t } = useI18n()
   const [confirm, ConfirmDialog] = useConfirm()
   const [notes,        setNotes]        = useState(job.notes ?? '')
   const [savingNotes,  setSavingNotes]  = useState(false)
@@ -388,6 +396,44 @@ function JobDetailDrawer({ job, onClose, onStatusChange, onUpdate, onDelete }: {
   const [coverText,    setCoverText]    = useState(job.coverLetter ?? '')
   const [savingCover,  setSavingCover]  = useState(false)
   const [descExpanded, setDescExpanded] = useState(false)
+  const [scoring,      setScoring]      = useState(false)
+
+  // M6: resume / cover-letter assignment
+  const { data: resumeListData } = useApi<ResumeListItem[]>('/api/resume')
+  const [jobResumes,      setJobResumes]      = useState<ResumeListItem[]>([])
+  const [jobCoverLetters, setJobCoverLetters] = useState<CoverLetter[]>([])
+  const [loadingCLs,      setLoadingCLs]      = useState(false)
+  const [assigningRes,    setAssigningRes]    = useState(false)
+  const [assigningCL,     setAssigningCL]     = useState(false)
+  const [localJob,        setLocalJob]        = useState(job)
+  const [showCLPanel,     setShowCLPanel]     = useState(false)
+
+  useEffect(() => { setLocalJob(job) }, [job])
+  useEffect(() => { if (resumeListData) setJobResumes(resumeListData) }, [resumeListData])
+  useEffect(() => {
+    setLoadingCLs(true)
+    fetch(`/api/jobs/${job.id}/cover-letters`)
+      .then(r => r.json())
+      .then((data) => setJobCoverLetters(Array.isArray(data) ? data : []))
+      .catch(() => setJobCoverLetters([]))
+      .finally(() => setLoadingCLs(false))
+  }, [job.id])
+
+  async function assignResume(resumeId: string | null) {
+    setAssigningRes(true)
+    const { data, error } = await apiMutate<Job>(`/api/jobs/${job.id}/assign`, 'PATCH', { finalResumeId: resumeId })
+    setAssigningRes(false)
+    if (data) { setLocalJob(data); onUpdate(data); toast.success('Resume assigned') }
+    else toast.error('Failed', error ?? 'Could not assign resume')
+  }
+
+  async function assignCoverLetter(clId: string | null) {
+    setAssigningCL(true)
+    const { data, error } = await apiMutate<Job>(`/api/jobs/${job.id}/assign`, 'PATCH', { finalCoverLetterId: clId })
+    setAssigningCL(false)
+    if (data) { setLocalJob(data); onUpdate(data); toast.success('Cover letter set as final') }
+    else toast.error('Failed', error ?? 'Could not assign cover letter')
+  }
 
   // Load per-job activity on mount; reset interview prep when job changes
   useEffect(() => {
@@ -451,6 +497,41 @@ function JobDetailDrawer({ job, onClose, onStatusChange, onUpdate, onDelete }: {
     onClose()
   }
 
+  async function handleRescore() {
+    if (!job.description) { toast.info('No job description', 'Add a job description first to enable AI scoring'); return }
+    setScoring(true)
+    try {
+      // Get resume content
+      const listRes = await fetch('/api/resume')
+      const listData = await listRes.json()
+      const resumes: Array<{ id: string; isDefault?: boolean }> = listData.resumes ?? listData ?? []
+      const resumeId = resumes.find(r => r.isDefault)?.id ?? resumes[0]?.id
+      if (!resumeId) { toast.info('No resume found', 'Create a resume first to enable AI scoring'); setScoring(false); return }
+      const fullRes = await fetch(`/api/resume/${resumeId}`)
+      const fullData = await fullRes.json()
+      const resumeContent = fullData.content ?? fullData.resume?.content
+      if (!resumeContent) { toast.error('Resume empty', 'Your resume has no content'); setScoring(false); return }
+
+      // Score
+      const scoreRes = await fetch('/api/ai/score', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ resumeContent, jobTitle: job.role, jobCompany: job.company, jobDescription: job.description.slice(0, 2000) }),
+      })
+      const scoreData = await scoreRes.json()
+      if (!scoreRes.ok || scoreData.score == null) { toast.error('Scoring failed', scoreData.error ?? 'AI could not score this job'); setScoring(false); return }
+
+      // Save score
+      const { data, error } = await apiMutate<Job>(`/api/jobs/${job.id}`, 'PATCH', { score: scoreData.score })
+      setScoring(false)
+      if (error) { toast.error('Save failed', error); return }
+      if (data) { onUpdate(data); toast.success(`Match score: ${scoreData.score}%`) }
+    } catch {
+      setScoring(false)
+      toast.error('Network error', 'Could not reach AI')
+    }
+  }
+
   async function generateInterviewPrep() {
     setLoadingPrep(true)
     try {
@@ -503,6 +584,9 @@ function JobDetailDrawer({ job, onClose, onStatusChange, onUpdate, onDelete }: {
         <div style={{ padding: '12px 18px', borderBottom: '0.5px solid var(--border)', display: 'flex', flexWrap: 'wrap', gap: 8, alignItems: 'center' }}>
           <StatusBadge status={job.status} />
           {job.score != null && <ScorePill score={job.score} />}
+          <button onClick={handleRescore} disabled={scoring} style={{ fontSize: 10, padding: '2px 9px', borderRadius: 999, border: '0.5px solid var(--border)', background: 'var(--bg-secondary)', color: 'var(--text-muted)', cursor: scoring ? 'default' : 'pointer', whiteSpace: 'nowrap', opacity: scoring ? 0.6 : 1 }}>
+            {scoring ? '⏳ Scoring…' : job.score == null ? '✦ Score' : '↻ Re-score'}
+          </button>
           {job.salary && <span style={{ fontSize: 11, color: 'var(--text-muted)', background: 'var(--bg-secondary)', border: '0.5px solid var(--border)', borderRadius: 5, padding: '2px 7px' }}>{renderSalary(job.salary)}</span>}
           {/* Status change */}
           <select
@@ -522,7 +606,7 @@ function JobDetailDrawer({ job, onClose, onStatusChange, onUpdate, onDelete }: {
             <div>
               <div style={{ fontSize: 10, color: 'var(--text-muted)', fontWeight: 500, marginBottom: 4 }}>JOB POSTING</div>
               <a href={job.url} target="_blank" rel="noopener noreferrer"
-                style={{ fontSize: 11, color: '#185FA5', wordBreak: 'break-all' }}>
+                style={{ fontSize: 11, color: 'var(--primary)', wordBreak: 'break-all' }}>
                 {job.url.length > 55 ? job.url.slice(0, 52) + '…' : job.url}
               </a>
             </div>
@@ -546,7 +630,7 @@ function JobDetailDrawer({ job, onClose, onStatusChange, onUpdate, onDelete }: {
               <div style={{ display: 'flex', gap: 12, marginTop: 4 }}>
                 {job.description.length > 500 && (
                   <button onClick={() => setDescExpanded(v => !v)}
-                    style={{ fontSize: 10, color: '#185FA5', background: 'none', border: 'none', cursor: 'pointer', padding: 0 }}>
+                    style={{ fontSize: 10, color: 'var(--primary)', background: 'none', border: 'none', cursor: 'pointer', padding: 0 }}>
                     {descExpanded ? '▲ Show less' : '▼ Read more'}
                   </button>
                 )}
@@ -563,8 +647,8 @@ function JobDetailDrawer({ job, onClose, onStatusChange, onUpdate, onDelete }: {
           {/* Agent Analysis */}
           {job.analysisNote && (
             <div>
-              <div style={{ fontSize: 10, color: '#185FA5', fontWeight: 500, marginBottom: 6 }}>AI ANALYSIS</div>
-              <div style={{ fontSize: 11, color: 'var(--text)', lineHeight: 1.7, whiteSpace: 'pre-wrap', background: 'rgba(24,95,165,0.06)', border: '0.5px solid rgba(24,95,165,0.15)', borderRadius: 6, padding: '8px 10px', maxHeight: 200, overflowY: 'auto' }}>
+              <div style={{ fontSize: 10, color: 'var(--primary)', fontWeight: 500, marginBottom: 6 }}>AI ANALYSIS</div>
+              <div style={{ fontSize: 11, color: 'var(--text)', lineHeight: 1.7, whiteSpace: 'pre-wrap', background: 'rgba(79,70,229,0.05)', border: '0.5px solid rgba(79,70,229,0.15)', borderRadius: 6, padding: '8px 10px', maxHeight: 200, overflowY: 'auto' }}>
                 {job.analysisNote}
               </div>
             </div>
@@ -572,19 +656,19 @@ function JobDetailDrawer({ job, onClose, onStatusChange, onUpdate, onDelete }: {
 
           {/* Cover Letter */}
           <div>
-            <div style={{ fontSize: 10, color: '#3B6D11', fontWeight: 500, marginBottom: 6, display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+            <div style={{ fontSize: 10, color: 'var(--c-success)', fontWeight: 500, marginBottom: 6, display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
               <span>COVER LETTER</span>
               <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
                 {savingCover && <span style={{ fontSize: 9, color: 'var(--text-muted)' }}>Saving…</span>}
                 {editingCover ? (
                   <>
-                    <button onClick={saveCover} style={{ fontSize: 9, color: '#3B6D11', background: 'rgba(59,109,17,0.1)', border: '0.5px solid rgba(59,109,17,0.25)', borderRadius: 4, padding: '2px 6px', cursor: 'pointer' }}>Save</button>
+                    <button onClick={saveCover} style={{ fontSize: 9, color: 'var(--c-success)', background: 'rgba(5,150,105,0.10)', border: '0.5px solid rgba(5,150,105,0.25)', borderRadius: 4, padding: '2px 6px', cursor: 'pointer' }}>Save</button>
                     <button onClick={() => { setEditingCover(false); setCoverText(job.coverLetter ?? '') }} style={{ fontSize: 9, color: 'var(--text-muted)', background: 'none', border: 'none', cursor: 'pointer', padding: '2px 4px' }}>Cancel</button>
                   </>
                 ) : job.coverLetter ? (
-                  <button onClick={() => setEditingCover(true)} style={{ fontSize: 9, color: '#185FA5', background: 'rgba(24,95,165,0.08)', border: '0.5px solid rgba(24,95,165,0.2)', borderRadius: 4, padding: '2px 6px', cursor: 'pointer' }}>Edit</button>
+                  <button onClick={() => setEditingCover(true)} style={{ fontSize: 9, color: 'var(--primary)', background: 'rgba(79,70,229,0.08)', border: '0.5px solid rgba(79,70,229,0.20)', borderRadius: 4, padding: '2px 6px', cursor: 'pointer' }}>Edit</button>
                 ) : (
-                  <button onClick={() => { setCoverText(''); setEditingCover(true) }} style={{ fontSize: 9, color: '#3B6D11', background: 'rgba(59,109,17,0.1)', border: '0.5px solid rgba(59,109,17,0.25)', borderRadius: 4, padding: '2px 6px', cursor: 'pointer' }}>+ Add</button>
+                  <button onClick={() => { setCoverText(''); setEditingCover(true) }} style={{ fontSize: 9, color: 'var(--c-success)', background: 'rgba(5,150,105,0.10)', border: '0.5px solid rgba(5,150,105,0.25)', borderRadius: 4, padding: '2px 6px', cursor: 'pointer' }}>+ Add</button>
                 )}
               </div>
             </div>
@@ -596,12 +680,12 @@ function JobDetailDrawer({ job, onClose, onStatusChange, onUpdate, onDelete }: {
                 style={{ ...drawerInputSt, width: '100%', minHeight: 120, resize: 'vertical', lineHeight: 1.6, padding: '7px 9px', fontSize: 11, boxSizing: 'border-box' }}
               />
             ) : job.coverLetter ? (
-              <div style={{ fontSize: 11, color: 'var(--text)', lineHeight: 1.7, whiteSpace: 'pre-wrap', background: 'rgba(59,109,17,0.06)', border: '0.5px solid rgba(59,109,17,0.15)', borderRadius: 6, padding: '8px 10px', maxHeight: 200, overflowY: 'auto' }}>
+              <div style={{ fontSize: 11, color: 'var(--text)', lineHeight: 1.7, whiteSpace: 'pre-wrap', background: 'rgba(5,150,105,0.05)', border: '0.5px solid rgba(5,150,105,0.15)', borderRadius: 6, padding: '8px 10px', maxHeight: 200, overflowY: 'auto' }}>
                 {job.coverLetter}
               </div>
             ) : (
               <div style={{ fontSize: 11, color: 'var(--text-muted)', fontStyle: 'italic', padding: '8px 0' }}>
-                No cover letter yet. Click "+ Add" above or use the Apply Basket to generate one.
+                No cover letter yet. Click &quot;+ Add&quot; above or use the Apply Basket to generate one.
               </div>
             )}
           </div>
@@ -620,7 +704,7 @@ function JobDetailDrawer({ job, onClose, onStatusChange, onUpdate, onDelete }: {
             )}
             {/* followUpAt — always visible, editable */}
             <div>
-              <div style={{ fontSize: 10, color: followUpAt ? '#854F0B' : 'var(--text-muted)', fontWeight: 500, marginBottom: 4 }}>FOLLOW-UP</div>
+              <div style={{ fontSize: 10, color: followUpAt ? 'var(--c-warning)' : 'var(--text-muted)', fontWeight: 500, marginBottom: 4 }}>FOLLOW-UP</div>
               <input
                 type="date"
                 value={followUpAt}
@@ -629,7 +713,7 @@ function JobDetailDrawer({ job, onClose, onStatusChange, onUpdate, onDelete }: {
                 style={{
                   ...drawerInputSt,
                   fontSize: 11,
-                  color: followUpAt ? '#854F0B' : 'var(--text-muted)',
+                  color: followUpAt ? 'var(--c-warning)' : 'var(--text-muted)',
                   // Show a clear button by keeping the value accessible
                   colorScheme: 'dark',
                 }}
@@ -641,6 +725,161 @@ function JobDetailDrawer({ job, onClose, onStatusChange, onUpdate, onDelete }: {
                   ✕ Clear date
                 </button>
               )}
+            </div>
+          </div>
+
+          {/* Resume & Cover Letter — M6 */}
+          <div style={{ borderTop: '0.5px solid var(--border)', paddingTop: 12 }}>
+            <div style={{ fontSize: 10, color: 'var(--primary)', fontWeight: 500, marginBottom: 10, letterSpacing: '0.05em' }}>{t('jobs.assign.section')}</div>
+
+            {/* Resume row */}
+            <div style={{ marginBottom: 10 }}>
+              <div style={{ fontSize: 10, color: 'var(--text-muted)', marginBottom: 4 }}>{t('jobs.assign.resume')}</div>
+              {localJob.finalResumeId ? (
+                <div style={{ fontSize: 11, padding: '6px 9px', background: 'rgba(79,70,229,0.06)', border: '0.5px solid rgba(79,70,229,0.20)', borderRadius: 6, display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+                  <span>{jobResumes.find(r => r.id === localJob.finalResumeId)?.name ?? 'Resume'}</span>
+                  <span style={{ fontSize: 9, color: 'var(--primary)', fontWeight: 600 }}>⭐ Final</span>
+                </div>
+              ) : (
+                <div style={{ fontSize: 11, color: 'var(--text-muted)', fontStyle: 'italic', padding: '4px 0' }}>{t('jobs.assign.noResume')}</div>
+              )}
+              <div style={{ display: 'flex', gap: 6, marginTop: 6, alignItems: 'center' }}>
+                <select
+                  value={localJob.finalResumeId ?? ''}
+                  disabled={assigningRes}
+                  onChange={e => assignResume(e.target.value || null)}
+                  style={{ fontSize: 10, padding: '4px 7px', border: '0.5px solid var(--border)', borderRadius: 6, background: 'var(--bg)', color: 'var(--text)', outline: 'none', maxWidth: 180 }}
+                >
+                  <option value="">{t('jobs.assign.switchResume')}</option>
+                  {jobResumes.map(r => <option key={r.id} value={r.id}>{r.name}{r.kind === 'adapted' ? ' (Adapted)' : ''}</option>)}
+                  {localJob.finalResumeId && <option value="">✕ Remove</option>}
+                </select>
+                <span style={{ fontSize: 9, color: 'var(--text-muted)', padding: '4px 7px', border: '0.5px solid var(--border)', borderRadius: 6, opacity: 0.5, cursor: 'not-allowed' }} title="Coming in next iteration">
+                  {t('jobs.assign.aiAdaptSoon')}
+                </span>
+              </div>
+            </div>
+
+            {/* Cover Letter row */}
+            <div style={{ marginBottom: 10 }}>
+              <div style={{ fontSize: 10, color: 'var(--text-muted)', marginBottom: 4 }}>{t('jobs.assign.cl')}</div>
+              {loadingCLs ? (
+                <div style={{ fontSize: 11, color: 'var(--text-muted)' }}>Loading…</div>
+              ) : jobCoverLetters.length > 0 ? (
+                <>
+                  {(() => {
+                    const finalCL = jobCoverLetters.find(cl => cl.id === localJob.finalCoverLetterId) ?? jobCoverLetters[0]
+                    const clIdx   = jobCoverLetters.findIndex(cl => cl.id === finalCL?.id) + 1
+                    return finalCL ? (
+                      <div style={{ fontSize: 11, padding: '6px 9px', background: 'rgba(5,150,105,0.05)', border: '0.5px solid rgba(5,150,105,0.20)', borderRadius: 6, display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+                        <span>v{clIdx} · {finalCL.tone} · {new Date(finalCL.createdAt).toLocaleDateString()}</span>
+                        {finalCL.id === localJob.finalCoverLetterId && <span style={{ fontSize: 9, color: 'var(--c-success)', fontWeight: 600 }}>⭐ Final</span>}
+                      </div>
+                    ) : null
+                  })()}
+                  <div style={{ display: 'flex', gap: 6, marginTop: 6, flexWrap: 'wrap', alignItems: 'center' }}>
+                    <button
+                      onClick={() => setShowCLPanel(true)}
+                      disabled={jobCoverLetters.length === 0}
+                      style={{ fontSize: 10, padding: '4px 9px', border: '0.5px solid var(--border)', borderRadius: 6, background: 'var(--bg)', color: 'var(--primary)', cursor: jobCoverLetters.length > 0 ? 'pointer' : 'not-allowed', opacity: jobCoverLetters.length > 0 ? 1 : 0.5 }}>
+                      ✎ Edit
+                    </button>
+                    <select
+                      value={localJob.finalCoverLetterId ?? ''}
+                      disabled={assigningCL}
+                      onChange={e => assignCoverLetter(e.target.value || null)}
+                      style={{ fontSize: 10, padding: '4px 7px', border: '0.5px solid var(--border)', borderRadius: 6, background: 'var(--bg)', color: 'var(--text)', outline: 'none' }}
+                    >
+                      <option value="">{t('jobs.assign.switchCL')}</option>
+                      {jobCoverLetters.map((cl, i) => (
+                        <option key={cl.id} value={cl.id}>v{jobCoverLetters.length - i} · {cl.tone} · {new Date(cl.createdAt).toLocaleDateString()}</option>
+                      ))}
+                      {localJob.finalCoverLetterId && <option value="">✕ Remove</option>}
+                    </select>
+                    <button
+                      onClick={async () => {
+                        if (!localJob.finalResumeId) { toast.info('Select a resume first', 'Assign a resume before generating a cover letter'); return }
+                        setLoadingCLs(true)
+                        const { data, error } = await apiMutate<CoverLetter>(`/api/jobs/${job.id}/cover-letters/generate`, 'POST', { resumeId: localJob.finalResumeId, tone: 'professional' })
+                        setLoadingCLs(false)
+                        if (data) {
+                          const updated = [data, ...jobCoverLetters]
+                          setJobCoverLetters(updated)
+                          assignCoverLetter(data.id)
+                          toast.success('Cover letter generated')
+                        } else toast.error('Generation failed', error ?? 'Check AI config in Settings')
+                      }}
+                      style={{ fontSize: 10, padding: '4px 9px', border: '0.5px solid rgba(79,70,229,0.30)', borderRadius: 6, background: 'rgba(79,70,229,0.08)', color: 'var(--primary)', cursor: 'pointer' }}>
+                      {t('jobs.assign.generate')}
+                    </button>
+                    <button
+                      onClick={async () => {
+                        const { data, error } = await apiMutate<CoverLetter>(`/api/jobs/${job.id}/cover-letters`, 'POST', { tone: 'professional', content: '' })
+                        if (data) { setJobCoverLetters(prev => [data, ...prev]); toast.success('Blank draft created') }
+                        else toast.error('Failed', error ?? 'Could not create draft')
+                      }}
+                      style={{ fontSize: 10, padding: '4px 9px', border: '0.5px solid var(--border)', borderRadius: 6, background: 'var(--bg)', color: 'var(--text-muted)', cursor: 'pointer' }}>
+                      {t('jobs.assign.blank')}
+                    </button>
+                  </div>
+                </>
+              ) : (
+                <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
+                  <div style={{ fontSize: 11, color: 'var(--text-muted)', fontStyle: 'italic', flex: 1 }}>{t('jobs.assign.noCL')}</div>
+                  <button
+                    onClick={async () => {
+                      const { data, error } = await apiMutate<CoverLetter>(`/api/jobs/${job.id}/cover-letters`, 'POST', { tone: 'professional', content: '' })
+                      if (data) { setJobCoverLetters([data]); toast.success('Blank draft created') }
+                      else toast.error('Failed', error ?? 'Could not create draft')
+                    }}
+                    style={{ fontSize: 10, padding: '4px 9px', border: '0.5px solid var(--border)', borderRadius: 6, background: 'var(--bg)', color: 'var(--text-muted)', cursor: 'pointer' }}>
+                    {t('jobs.assign.blank')}
+                  </button>
+                  <button
+                    onClick={async () => {
+                      if (!localJob.finalResumeId) { toast.info('Select a resume first', 'Assign a resume before generating a cover letter'); return }
+                      setLoadingCLs(true)
+                      const { data, error } = await apiMutate<CoverLetter>(`/api/jobs/${job.id}/cover-letters/generate`, 'POST', { resumeId: localJob.finalResumeId, tone: 'professional' })
+                      setLoadingCLs(false)
+                      if (data) { setJobCoverLetters([data]); assignCoverLetter(data.id); toast.success('Generated') }
+                      else toast.error('Generation failed', error ?? 'Check AI config')
+                    }}
+                    style={{ fontSize: 10, padding: '4px 9px', border: '0.5px solid rgba(79,70,229,0.30)', borderRadius: 6, background: 'rgba(79,70,229,0.08)', color: 'var(--primary)', cursor: 'pointer' }}>
+                    {t('jobs.assign.generate')}
+                  </button>
+                </div>
+              )}
+            </div>
+
+            {/* Download bundle — M9 */}
+            <div style={{ borderTop: '0.5px solid var(--border)', paddingTop: 8, marginTop: 4 }}>
+              <button
+                onClick={async () => {
+                  if (!localJob.finalResumeId) {
+                    toast.info('Pick a resume first', 'Assign a Final Resume before downloading the bundle')
+                    return
+                  }
+                  try {
+                    toast.info('Preparing bundle…', 'Generating PDFs and packaging…')
+                    await downloadJobBundle(localJob.id)
+                    toast.success('Bundle downloaded', 'Check your downloads folder')
+                  } catch (e) {
+                    const msg = e instanceof BundleError ? e.message : 'An unexpected error occurred'
+                    toast.error('Bundle failed', msg)
+                  }
+                }}
+                disabled={!localJob.finalResumeId}
+                title={!localJob.finalResumeId ? 'Pick a resume first' : 'Download as ZIP'}
+                style={{
+                  fontSize: 10, padding: '5px 10px',
+                  border: `0.5px solid ${localJob.finalResumeId ? 'var(--primary)' : 'var(--border)'}`,
+                  borderRadius: 6, background: localJob.finalResumeId ? 'rgba(79,70,229,0.08)' : 'var(--bg)',
+                  color: localJob.finalResumeId ? 'var(--primary)' : 'var(--text-muted)',
+                  cursor: localJob.finalResumeId ? 'pointer' : 'not-allowed',
+                  opacity: localJob.finalResumeId ? 1 : 0.5,
+                }}>
+                {t('jobs.assign.bundle')}
+              </button>
             </div>
           </div>
 
@@ -688,15 +927,15 @@ function JobDetailDrawer({ job, onClose, onStatusChange, onUpdate, onDelete }: {
           {/* Interview Prep */}
           {job.status === 'interview' && (
             <div>
-              <div style={{ fontSize: 10, color: '#3B6D11', fontWeight: 500, marginBottom: 8 }}>INTERVIEW PREP</div>
+              <div style={{ fontSize: 10, color: 'var(--c-success)', fontWeight: 500, marginBottom: 8 }}>INTERVIEW PREP</div>
               {!interviewPrep ? (
                 <button
                   onClick={generateInterviewPrep}
                   disabled={loadingPrep}
                   style={{
-                    width: '100%', padding: '8px 0', borderRadius: 6, border: '0.5px solid rgba(59,109,17,0.3)',
-                    background: loadingPrep ? 'var(--bg-secondary)' : 'rgba(59,109,17,0.08)',
-                    color: '#3B6D11', fontSize: 11, fontWeight: 500, cursor: loadingPrep ? 'not-allowed' : 'pointer',
+                    width: '100%', padding: '8px 0', borderRadius: 6, border: '0.5px solid rgba(5,150,105,0.30)',
+                    background: loadingPrep ? 'var(--bg-secondary)' : 'rgba(5,150,105,0.08)',
+                    color: 'var(--c-success)', fontSize: 11, fontWeight: 500, cursor: loadingPrep ? 'not-allowed' : 'pointer',
                     opacity: loadingPrep ? 0.6 : 1,
                   }}>
                   {loadingPrep ? 'Generating…' : 'Generate Interview Prep'}
@@ -756,6 +995,18 @@ function JobDetailDrawer({ job, onClose, onStatusChange, onUpdate, onDelete }: {
           <Btn variant="primary" small onClick={onClose} style={{ flex: 1 }}>Close</Btn>
         </div>
       </div>
+
+      {showCLPanel && (
+        <CoverLetterPanel
+          job={localJob}
+          resumeContent={null}
+          resumeName="Resume"
+          onClose={() => setShowCLPanel(false)}
+          onSaved={(cl) => {
+            setJobCoverLetters(prev => prev.map(c => c.id === cl.id ? cl : c))
+          }}
+        />
+      )}
     </>
   )
 }
@@ -834,7 +1085,7 @@ function PaginationBar({
         <button onClick={() => onChangePage(page - 1)} disabled={page <= 1} style={btnStyle(page <= 1)}>‹</button>
         {pageNums.map(p => (
           <button key={p} onClick={() => onChangePage(p)}
-            style={{ ...btnStyle(false), minWidth: 28, textAlign: 'center', fontWeight: p === page ? 700 : 400, background: p === page ? 'rgba(24,95,165,0.08)' : 'var(--bg)', color: p === page ? '#185FA5' : 'var(--text)' }}>
+            style={{ ...btnStyle(false), minWidth: 28, textAlign: 'center', fontWeight: p === page ? 700 : 400, background: p === page ? 'rgba(79,70,229,0.08)' : 'var(--bg)', color: p === page ? 'var(--primary)' : 'var(--text)' }}>
             {p}
           </button>
         ))}
@@ -992,8 +1243,8 @@ export function JobsPage() {
           {([['list', '☰'], ['kanban', '⊞']] as const).map(([v, icon]) => (
             <button key={v} onClick={() => setView(v)} style={{
               padding: '5px 10px',
-              background: view === v ? '#185FA5' : 'var(--bg)',
-              color:      view === v ? '#fff'     : 'var(--text-muted)',
+              background: view === v ? 'var(--primary)' : 'var(--bg)',
+              color:      view === v ? '#fff'           : 'var(--text-muted)',
               border: 'none', cursor: 'pointer', fontSize: 13,
             }}>{icon}</button>
           ))}
@@ -1009,13 +1260,13 @@ export function JobsPage() {
 {loading ? (
           <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 60 }}>
             <div style={{ display: 'flex', alignItems: 'center', gap: 10, color: 'var(--text-muted)', fontSize: 12 }}>
-              <div style={{ width: 20, height: 20, border: '2px solid rgba(24,95,165,0.2)', borderTopColor: '#185FA5', borderRadius: '50%', animation: 'spin 0.7s linear infinite' }} />
+              <div style={{ width: 20, height: 20, border: '2px solid rgba(79,70,229,0.15)', borderTopColor: 'var(--primary)', borderRadius: '50%', animation: 'spin 0.7s linear infinite' }} />
               Loading jobs…
             </div>
           </div>
         ) : fetchError ? (
           <Card style={{ padding: 32, textAlign: 'center' }}>
-            <div style={{ fontSize: 13, color: '#A32D2D', marginBottom: 12 }}>{fetchError}</div>
+            <div style={{ fontSize: 13, color: 'var(--c-danger)', marginBottom: 12 }}>{fetchError}</div>
             <Btn variant="ghost" onClick={() => setSearch(s => s)}>Retry</Btn>
           </Card>
         ) : jobs.length === 0 ? (
@@ -1040,11 +1291,11 @@ export function JobsPage() {
                     <div key={j.id} style={{ display: 'flex', alignItems: 'center', gap: 6, background: 'var(--bg)', border: '0.5px solid var(--border)', borderRadius: 8, padding: '6px 10px' }}>
                       <CompanyLogo logo={j.logo ?? j.company.slice(0, 2).toUpperCase()} size={18} />
                       <span style={{ fontSize: 11 }}>{j.company}</span>
-                      <ScorePill score={j.score ?? 0} />
+                      <ScorePill score={j.score ?? null} />
                       <button onClick={() => addToCart(j)} style={{
                         fontSize: 10, padding: '2px 8px', borderRadius: 999, border: '0.5px solid var(--border)',
-                        background: cart.find(c => c.id === j.id) ? 'rgba(24,95,165,0.12)' : 'transparent',
-                        color:      cart.find(c => c.id === j.id) ? '#185FA5'              : 'var(--text-muted)',
+                        background: cart.find(c => c.id === j.id) ? 'rgba(79,70,229,0.12)' : 'transparent',
+                        color:      cart.find(c => c.id === j.id) ? 'var(--primary)'       : 'var(--text-muted)',
                         cursor: 'pointer',
                       }}>
                         {cart.find(c => c.id === j.id) ? '✓ Added' : '+ Basket'}

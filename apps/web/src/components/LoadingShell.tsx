@@ -7,8 +7,8 @@ export function LoadingShell({ text = 'Loading…' }: { text?: string }) {
       <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 10 }}>
         <div style={{
           width: 28, height: 28,
-          border: '2.5px solid rgba(24,95,165,0.2)',
-          borderTopColor: '#185FA5',
+          border: '2.5px solid rgba(79,70,229,0.20)',
+          borderTopColor: 'var(--primary)',
           borderRadius: '50%',
           animation: 'spin 0.7s linear infinite',
         }} />

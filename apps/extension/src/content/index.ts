@@ -56,10 +56,22 @@ async function init() {
     // Safety: for LinkedIn and Indeed detail pages, only scrape on user click.
     // This significantly reduces detectable scraping patterns on these platforms.
     const host = window.location.hostname
-    const isHighRisk = host.includes('linkedin.com') || host.includes('indeed')
+    // High-risk: LinkedIn/Indeed (detection risk) + SPA platforms where content loads async
+    const isHighRisk =
+      host.includes('linkedin.com') ||
+      host.includes('indeed') ||
+      host.includes('workday.com') ||
+      host.includes('myworkdayjobs') ||
+      host.includes('greenhouse.io') ||
+      host.includes('lever.co') ||
+      host.includes('ashbyhq.com') ||
+      host.includes('smartrecruiters.com') ||
+      host.includes('bamboohr.com') ||
+      host.includes('jobvite.com') ||
+      host.includes('icims.com')
 
     if (isHighRisk) {
-      log('Detected HIGH-RISK detail page — injecting lazy button (no auto-scrape)')
+      log('Detected HIGH-RISK / SPA detail page — injecting lazy button (scrape on click)')
       injectLazySaveButton()
     } else {
       currentJob = detectAndScrape()
@@ -99,7 +111,18 @@ function tryInjectPanelDetail() {
 function scheduleRetry() {
   injectAttempts = 0
   const host = window.location.hostname
-  const isHighRisk = host.includes('linkedin.com') || host.includes('indeed')
+  const isHighRisk =
+    host.includes('linkedin.com') ||
+    host.includes('indeed') ||
+    host.includes('workday.com') ||
+    host.includes('myworkdayjobs') ||
+    host.includes('greenhouse.io') ||
+    host.includes('lever.co') ||
+    host.includes('ashbyhq.com') ||
+    host.includes('smartrecruiters.com') ||
+    host.includes('bamboohr.com') ||
+    host.includes('jobvite.com') ||
+    host.includes('icims.com')
 
   const interval = setInterval(() => {
     if (injectAttempts++ > 10) { clearInterval(interval); return }
@@ -216,19 +239,30 @@ async function syncFromDashboard() {
   const meta = document.querySelector('meta[name="applymate:user"]') as HTMLMetaElement | null
   if (!meta?.content) return
 
+  const currentOrigin = window.location.origin // e.g. http://localhost:3000
   const result = await chrome.storage.sync.get('settings')
   const s = result.settings ?? {}
-  if (s.apiToken && s.userEmail === meta.content) return // already synced
 
-  log('Dashboard user detected:', meta.content, '— fetching token directly')
+  // Only skip if token exists AND email matches AND stored apiBaseUrl matches current origin
+  // If apiBaseUrl changed (env switch), always re-fetch
+  const alreadySynced = s.apiToken && s.userEmail === meta.content && s.apiBaseUrl === currentOrigin
+  if (alreadySynced) return
+
+  log('Dashboard user detected:', meta.content, '— fetching extension token for', currentOrigin)
   try {
     const res = await fetch('/api/auth/me/extension-token')
     if (!res.ok) throw new Error(`HTTP ${res.status}`)
     const data = await res.json()
     await chrome.storage.sync.set({
-      settings: { ...s, apiToken: data.token, userEmail: data.user?.email ?? '', userName: data.user?.name ?? '' }
+      settings: {
+        ...s,
+        apiBaseUrl: currentOrigin,
+        apiToken:   data.token,
+        userEmail:  data.user?.email ?? '',
+        userName:   data.user?.name  ?? '',
+      }
     })
-    log('Extension auto-logged in via dashboard:', data.user?.email)
+    log('Extension auto-logged in via dashboard:', data.user?.email, '@', currentOrigin)
     window.dispatchEvent(new CustomEvent('applymate:login'))
   } catch (err) {
     log('Failed to fetch extension token:', err)

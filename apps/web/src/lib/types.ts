@@ -6,6 +6,38 @@ export type JobStatus     = 'saved' | 'applied' | 'review' | 'interview' | 'offe
 export type Plan          = 'free' | 'pro' | 'enterprise'
 export type AgentRoleType = 'scout' | 'analyst' | 'writer' | 'reviewer' | 'executor' | 'auditor'
 
+// M1 new types
+export type ResumeKind   = 'base' | 'adapted'
+export type ResumeOrigin = 'manual' | 'upload' | 'paste' | 'ocr' | 'ai-adapted'
+export type AiAutoPilot  = 'off' | 'suggest' | 'full'
+
+export interface Direction {
+  id:        string
+  userId:    string
+  name:      string
+  color:     string | null
+  icon:      string | null
+  sortOrder: number
+  createdAt: string
+  updatedAt: string
+  _count?:   { resumes: number }
+}
+
+export interface CoverLetter {
+  id:              string
+  userId:          string
+  jobId:           string
+  resumeId:        string | null
+  content:         string
+  tone:            string
+  templateId:      string | null
+  templateOptions: TemplateOptions | null
+  origin:          string
+  isFinal:         boolean
+  createdAt:       string
+  updatedAt:       string
+}
+
 // ── AgentRole ─────────────────────────────────────────────────────────────────
 export interface AgentRole {
   id:           string
@@ -55,6 +87,9 @@ export interface Job {
   followUpAt:   string | null
   createdAt:    string
   updatedAt:    string
+  // M1 extensions
+  finalResumeId:      string | null
+  finalCoverLetterId: string | null
 }
 
 // ── Activity ──────────────────────────────────────────────────────────────────
@@ -71,11 +106,18 @@ export interface Activity {
 
 // ── Resume ────────────────────────────────────────────────────────────────────
 export interface ResumeListItem {
-  id:        string
-  name:      string
-  isDefault: boolean
-  createdAt: string
-  updatedAt: string
+  id:             string
+  name:           string
+  isDefault:      boolean
+  directionId:    string | null
+  kind:           ResumeKind
+  parentResumeId: string | null
+  targetJobId:    string | null
+  origin:         ResumeOrigin
+  basicsDetached: boolean
+  createdAt:      string
+  updatedAt:      string
+  _count?:        { finalForJobs: number }
 }
 
 export interface ResumeContent {
@@ -158,35 +200,58 @@ export interface AgentConfig {
 }
 
 // ── Dashboard API response ─────────────────────────────────────────────────────
+export interface DashboardFollowUp {
+  id:         string
+  company:    string
+  role:       string
+  status:     string
+  followUpAt: string
+}
+
+export interface DashboardSavedJob {
+  id:        string
+  company:   string
+  role:      string
+  score:     number | null
+  createdAt: string
+  url:       string | null
+}
+
 export interface DashboardData {
   stats: {
     total:      number
+    saved:      number
     applied:    number
-    inReview:   number
+    inProgress: number
     interviews: number
     offers:     number
+    rejected:   number
     thisWeek:   number
   }
-  pipeline:    Record<JobStatus, number>
-  recentJobs:  Job[]
-  activity:    Activity[]
-  agentConfig: AgentConfig | null
-  hasResume:   boolean
+  pipeline:     Record<JobStatus, number>
+  followUpsDue: DashboardFollowUp[]
+  savedJobs:    DashboardSavedJob[]
+  recentJobs:   Job[]
+  activity:     Activity[]
+  agentConfig:  AgentConfig | null
+  hasResume:    boolean
 }
 
 // ── User ───────────────────────────────────────────────────────────────────────
 export interface UserProfile {
-  id:          string
-  email:       string
-  name:        string | null
-  image:       string | null
-  plan:        Plan
-  phone:       string | null
-  location:    string | null
-  linkedin:    string | null
-  github:      string | null
-  preferences: UserPreferences | null
-  createdAt:   string
+  id:               string
+  email:            string
+  name:             string | null
+  image:            string | null
+  plan:             Plan
+  phone:            string | null
+  location:         string | null
+  linkedin:         string | null
+  github:           string | null
+  preferences:      UserPreferences | null
+  createdAt:        string
+  onboardedAt:      string | null
+  onboardingGoals:  string[]
 }
 
 export interface UserPreferences {

@@ -86,10 +86,10 @@ function fmtPosted(iso?: string | null): string {
 }
 
 const SOURCE_BADGE: Record<JobSource, { label: string; color: string }> = {
-  adzuna:   { label: 'Adzuna',   color: '#854F0B' },
-  jsearch:  { label: 'JSearch',  color: '#185FA5' },
+  adzuna:   { label: 'Adzuna',   color: 'var(--c-warning)' },
+  jsearch:  { label: 'JSearch',  color: 'var(--primary)' },
   linkedin: { label: 'LinkedIn', color: '#0077B5' },
-  jobicy:   { label: 'Jobicy',   color: '#3B6D11' },
+  jobicy:   { label: 'Jobicy',   color: 'var(--c-success)' },
 }
 
 function JobCard({
@@ -125,27 +125,27 @@ function JobCard({
           {r.company}{r.location ? ` · ${r.location}` : ''}
           {r.postedAt && <span style={{ marginLeft: 8, fontSize: 10, opacity: 0.65 }}>{fmtPosted(r.postedAt)}</span>}
         </div>
-        {r.salary && <div style={{ fontSize: 11, color: '#3B6D11', marginTop: 2 }}>{r.salary}</div>}
+        {r.salary && <div style={{ fontSize: 11, color: 'var(--c-success)', marginTop: 2 }}>{r.salary}</div>}
         {r.description && <div style={{ fontSize: 10, color: 'var(--text-muted)', marginTop: 4, lineHeight: 1.5 }}>{r.description}</div>}
       </div>
       <div style={{ display: 'flex', flexDirection: 'column', gap: 4, flexShrink: 0, alignItems: 'flex-end' }}>
         {saved ? (
           scoring ? (
             <span style={{ fontSize: 10, color: 'var(--text-muted)', display: 'flex', alignItems: 'center', gap: 4 }}>
-              <span style={{ width: 10, height: 10, border: '1.5px solid rgba(24,95,165,0.3)', borderTopColor: '#185FA5', borderRadius: '50%', animation: 'spin 0.7s linear infinite', display: 'inline-block' }} />
+              <span style={{ width: 10, height: 10, border: '1.5px solid rgba(79,70,229,0.30)', borderTopColor: 'var(--primary)', borderRadius: '50%', animation: 'spin 0.7s linear infinite', display: 'inline-block' }} />
               Scoring…
             </span>
           ) : score !== undefined ? (
             <ScorePill score={score} />
           ) : (
-            <span style={{ fontSize: 10, color: '#3B6D11', fontWeight: 500 }}>✓ Saved</span>
+            <span style={{ fontSize: 10, color: 'var(--c-success)', fontWeight: 500 }}>✓ Saved</span>
           )
         ) : (
           <Btn small variant="primary" disabled={saving} onClick={onSave}>
             {saving ? 'Saving…' : '+ Save'}
           </Btn>
         )}
-        <a href={r.url} target="_blank" rel="noopener noreferrer" style={{ fontSize: 10, color: '#185FA5', textDecoration: 'none' }}>
+        <a href={r.url} target="_blank" rel="noopener noreferrer" style={{ fontSize: 10, color: 'var(--primary)', textDecoration: 'none' }}>
           View ↗
         </a>
       </div>
@@ -238,7 +238,7 @@ function SourcePanel({ fetchJobs, formFields, placeholder, q: qProp, onJobSaved,
       <form onSubmit={handleSearch} style={{ padding: '0 0 16px', display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'flex-end' }}>
         {formFields}
         <button type="submit" disabled={searching || !qProp.trim()} style={{
-          padding: '8px 18px', background: '#185FA5', color: '#fff', border: 'none', borderRadius: 6,
+          padding: '8px 18px', background: 'var(--primary)', color: '#fff', border: 'none', borderRadius: 6,
           fontSize: 12, fontWeight: 500, cursor: searching ? 'not-allowed' : 'pointer', opacity: searching ? 0.7 : 1, whiteSpace: 'nowrap',
         }}>
           {searching ? 'Searching…' : 'Search'}
@@ -254,7 +254,7 @@ function SourcePanel({ fetchJobs, formFields, placeholder, q: qProp, onJobSaved,
         <div style={{ borderTop: '0.5px solid var(--border)', flex: 1, display: 'flex', flexDirection: 'column' }}>
           {searching ? (
             <div style={{ padding: 40, textAlign: 'center' }}>
-              <div style={{ width: 22, height: 22, border: '2px solid rgba(24,95,165,0.2)', borderTopColor: '#185FA5', borderRadius: '50%', animation: 'spin 0.7s linear infinite', margin: '0 auto 10px' }} />
+              <div style={{ width: 22, height: 22, border: '2px solid rgba(79,70,229,0.20)', borderTopColor: 'var(--primary)', borderRadius: '50%', animation: 'spin 0.7s linear infinite', margin: '0 auto 10px' }} />
               <div style={{ fontSize: 12, color: 'var(--text-muted)' }}>Searching {placeholder}…</div>
             </div>
           ) : results.length === 0 ? (
@@ -362,10 +362,10 @@ const GEO_JOBICY = [
 // ── Main unified component ────────────────────────────────────────────────────
 
 const SOURCES: { id: JobSource; label: string; desc: string; color: string }[] = [
-  { id: 'adzuna',   label: '🌍 Adzuna',   desc: '欧洲 12 国本地职位（默认）',   color: '#854F0B' },
-  { id: 'jsearch',  label: '🔍 JSearch',  desc: '聚合 LinkedIn · Indeed · 等',  color: '#185FA5' },
+  { id: 'adzuna',   label: '🌍 Adzuna',   desc: '欧洲 12 国本地职位（默认）',   color: 'var(--c-warning)' },
+  { id: 'jsearch',  label: '🔍 JSearch',  desc: '聚合 LinkedIn · Indeed · 等',  color: 'var(--primary)' },
   { id: 'linkedin', label: '💼 LinkedIn', desc: '最近 1 小时实时新职位',        color: '#0077B5' },
-  { id: 'jobicy',   label: '🌐 Jobicy',   desc: '远程职位，完全免费',           color: '#3B6D11' },
+  { id: 'jobicy',   label: '🌐 Jobicy',   desc: '远程职位，完全免费',           color: 'var(--c-success)' },
 ]
 
 interface Props {

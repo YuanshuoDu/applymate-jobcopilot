@@ -5,13 +5,13 @@ import { TopBar } from '@/components/layout/TopBar'
 import { Btn, Card, CompanyLogo, ScorePill, useToast } from '@/components/ui'
 
 const PIPELINE_STAGES = [
-  { id:'scan',   icon:'🔍', label:'Scanning',    color:'#185FA5', desc:'Crawling LinkedIn · Indeed · Career pages' },
-  { id:'match',  icon:'🎯', label:'Matching',    color:'#5B3DC8', desc:'AI scoring against your profile' },
-  { id:'tailor', icon:'✦',  label:'Tailoring CV', color:'#0E7490', desc:'Rewriting keywords + optimizing bullets' },
-  { id:'cover',  icon:'📝', label:'Cover Letter', color:'#854F0B', desc:'Generating personalised letter' },
-  { id:'review', icon:'👁', label:'Your Review', color:'#3B6D11', desc:'Human approval required' },
-  { id:'submit', icon:'📤', label:'Submitting',  color:'#185FA5', desc:'Auto-filling and sending' },
-  { id:'done',   icon:'✓',  label:'Confirmed',   color:'#3B6D11', desc:'Tracker updated · Gmail watching' },
+  { id:'scan',   icon:'🔍', label:'Scanning',    color:'var(--primary)',   desc:'Crawling LinkedIn · Indeed · Career pages' },
+  { id:'match',  icon:'🎯', label:'Matching',    color:'var(--accent)',    desc:'AI scoring against your profile' },
+  { id:'tailor', icon:'✦',  label:'Tailoring CV', color:'var(--c-info)',   desc:'Rewriting keywords + optimizing bullets' },
+  { id:'cover',  icon:'📝', label:'Cover Letter', color:'var(--c-warning)', desc:'Generating personalised letter' },
+  { id:'review', icon:'👁', label:'Your Review', color:'var(--c-success)', desc:'Human approval required' },
+  { id:'submit', icon:'📤', label:'Submitting',  color:'var(--primary)',   desc:'Auto-filling and sending' },
+  { id:'done',   icon:'✓',  label:'Confirmed',   color:'var(--c-success)', desc:'Tracker updated · Gmail watching' },
 ]
 
 const SAMPLE_JOBS = [
@@ -125,15 +125,15 @@ export function AgentAnimationPage() {
         {/* Stats */}
         <div style={{ display:'grid', gridTemplateColumns:'repeat(3,1fr)', gap:12 }}>
           <Card style={{ padding:14, textAlign:'center' }}>
-            <div style={{ fontSize:24, fontWeight:500, color:'#185FA5' }}>{scanCount + 78}</div>
+            <div style={{ fontSize:24, fontWeight:500, color:'var(--primary)' }}>{scanCount + 78}</div>
             <div style={{ fontSize:11, color:'var(--text-muted)', marginTop:4 }}>Listings scanned</div>
           </Card>
           <Card style={{ padding:14, textAlign:'center' }}>
-            <div style={{ fontSize:24, fontWeight:500, color:'#3B6D11' }}>{Math.floor(scanCount * 0.1) + 8}</div>
+            <div style={{ fontSize:24, fontWeight:500, color:'var(--c-success)' }}>{Math.floor(scanCount * 0.1) + 8}</div>
             <div style={{ fontSize:11, color:'var(--text-muted)', marginTop:4 }}>Applications sent</div>
           </Card>
           <Card style={{ padding:14, textAlign:'center' }}>
-            <div style={{ fontSize:24, fontWeight:500, color:'#854F0B' }}>3</div>
+            <div style={{ fontSize:24, fontWeight:500, color:'var(--c-warning)' }}>3</div>
             <div style={{ fontSize:11, color:'var(--text-muted)', marginTop:4 }}>Awaiting review</div>
           </Card>
         </div>

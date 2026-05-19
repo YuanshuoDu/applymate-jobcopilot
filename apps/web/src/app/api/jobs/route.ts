@@ -13,16 +13,18 @@ export async function GET(req: NextRequest) {
   if (isErrorResponse(auth)) return auth
 
   const { searchParams } = req.nextUrl
-  const status   = searchParams.get('status') as JobStatus | null
-  const source   = searchParams.get('source')
-  const q        = searchParams.get('q')        // text search
+  const status        = searchParams.get('status') as JobStatus | null
+  const source        = searchParams.get('source')
+  const q             = searchParams.get('q')              // text search
+  const finalResumeId = searchParams.get('finalResumeId')  // M4: reverse-link filter
   const page     = Math.max(1, Number(searchParams.get('page') ?? 1))
   const pageSize = Math.min(100, Math.max(1, Number(searchParams.get('pageSize') ?? 50)))
 
   const where = {
     userId: auth.userId,
-    ...(status ? { status } : {}),
-    ...(source ? { source } : {}),
+    ...(status        ? { status }        : {}),
+    ...(source        ? { source }        : {}),
+    ...(finalResumeId ? { finalResumeId } : {}),
     ...(q
       ? {
           OR: [

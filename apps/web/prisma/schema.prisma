@@ -71,14 +71,24 @@ model User {
   createdAt     DateTime  @default(now())
   updatedAt     DateTime  @updatedAt
 
-  accounts    Account[]
-  sessions    Session[]
-  jobs        Job[]
-  resumes     Resume[]
-  activities  Activity[]
-  agentConfig   AgentConfig?
-  agentRoles    AgentRole[]
+  // M1 extensions
+  onboardedAt        DateTime?
+  onboardingGoals    String[]
+  defaultTemplateId  String?
+  defaultAccentColor String?
+  defaultFontFamily  String?
+  aiAutoPilot        String   @default("off")
+
+  accounts       Account[]
+  sessions       Session[]
+  jobs           Job[]
+  resumes        Resume[]
+  activities     Activity[]
+  agentConfig    AgentConfig?
+  agentRoles     AgentRole[]
   resumeVersions ResumeVersion[]
+  directions     Direction[]
+  coverLetters   CoverLetter[]
 }
 
 enum Plan {
@@ -101,15 +111,23 @@ model Job {
   salary      String?
   source      String?   // linkedin | indeed | manual | agent
   notes        String?   @db.Text
-  coverLetter  String?   @db.Text  // saved by Writer agent
+  coverLetter  String?   @db.Text  // saved by Writer agent (deprecated — use CoverLetter table)
   analysisNote String?   @db.Text  // saved by Analyst agent (recommendation)
   appliedAt    DateTime?
   followUpAt  DateTime?
   createdAt   DateTime  @default(now())
   updatedAt   DateTime  @updatedAt
 
-  user       User       @relation(fields: [userId], references: [id], onDelete: Cascade)
-  activities Activity[]
+  // M1 extensions
+  finalResumeId      String?
+  finalCoverLetterId String?
+
+  user             User          @relation(fields: [userId], references: [id], onDelete: Cascade)
+  activities       Activity[]
+  finalResume      Resume?       @relation("JobFinalResume",   fields: [finalResumeId],      references: [id], onDelete: SetNull)
+  finalCoverLetter CoverLetter?  @relation("JobFinalCL",       fields: [finalCoverLetterId], references: [id], onDelete: SetNull)
+  adaptedResumes   Resume[]      @relation("JobAdaptedResumes")
+  coverLetters     CoverLetter[]
 
   @@index([userId, status])
   @@index([userId, createdAt(sort: Desc)])
@@ -135,10 +153,26 @@ model Resume {
   createdAt       DateTime @default(now())
   updatedAt       DateTime @updatedAt
 
-  user     User            @relation(fields: [userId], references: [id], onDelete: Cascade)
-  versions ResumeVersion[]
+  // M1 extensions
+  directionId    String?
+  kind           String   @default("base")
+  parentResumeId String?
+  targetJobId    String?
+  origin         String   @default("manual")
+  basicsDetached Boolean  @default(false)
+
+  user         User            @relation(fields: [userId], references: [id], onDelete: Cascade)
+  versions     ResumeVersion[]
+  direction    Direction?      @relation(fields: [directionId], references: [id], onDelete: SetNull)
+  parent       Resume?         @relation("ResumeLineage", fields: [parentResumeId], references: [id], onDelete: SetNull)
+  derivatives  Resume[]        @relation("ResumeLineage")
+  targetJob    Job?            @relation("JobAdaptedResumes", fields: [targetJobId], references: [id], onDelete: SetNull)
+  coverLetters CoverLetter[]
+  finalForJobs Job[]           @relation("JobFinalResume")
 
   @@index([userId])
+  @@index([userId, directionId])
+  @@index([targetJobId])
 }
 
 model ResumeVersion {
@@ -244,4 +278,48 @@ model AgentRole {
 
   @@unique([userId, role])
   @@index([userId])
+}
+
+// ─────────────────────────────────────────────
+// M1: Direction + CoverLetter models
+// ─────────────────────────────────────────────
+
+model Direction {
+  id        String   @id @default(cuid())
+  userId    String
+  name      String
+  color     String?
+  icon      String?
+  sortOrder Int      @default(0)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  user    User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  resumes Resume[]
+
+  @@unique([userId, name])
+  @@index([userId])
+}
+
+model CoverLetter {
+  id              String   @id @default(cuid())
+  userId          String
+  jobId           String
+  resumeId        String?
+  content         String   @db.Text
+  tone            String   @default("professional")
+  templateId      String?
+  templateOptions Json?
+  origin          String   @default("manual")
+  isFinal         Boolean  @default(false)
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  user   User    @relation(fields: [userId], references: [id], onDelete: Cascade)
+  job    Job     @relation(fields: [jobId], references: [id], onDelete: Cascade)
+  resume Resume? @relation(fields: [resumeId], references: [id], onDelete: SetNull)
+  finalForJobs Job[] @relation("JobFinalCL")
+
+  @@index([userId, jobId])
+  @@index([jobId, isFinal])
 }

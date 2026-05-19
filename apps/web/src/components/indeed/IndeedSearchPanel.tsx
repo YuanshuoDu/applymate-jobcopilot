@@ -127,7 +127,7 @@ export function IndeedSearchPanel({ onJobSaved, onClose }: Props) {
           </select>
         </div>
         <button type="submit" disabled={searching || !search.trim()} style={{
-          padding: '8px 16px', background: '#185FA5', color: '#fff', border: 'none', borderRadius: 6,
+          padding: '8px 16px', background: 'var(--primary)', color: '#fff', border: 'none', borderRadius: 6,
           fontSize: 12, fontWeight: 500, cursor: searching ? 'not-allowed' : 'pointer',
           opacity: searching ? 0.7 : 1, whiteSpace: 'nowrap',
         }}>
@@ -140,7 +140,7 @@ export function IndeedSearchPanel({ onJobSaved, onClose }: Props) {
         <div style={{ borderTop: '0.5px solid var(--border)' }}>
           {searching ? (
             <div style={{ padding: 32, textAlign: 'center' }}>
-              <div style={{ width: 22, height: 22, border: '2px solid rgba(24,95,165,0.2)', borderTopColor: '#185FA5', borderRadius: '50%', animation: 'spin 0.7s linear infinite', margin: '0 auto 10px' }} />
+              <div style={{ width: 22, height: 22, border: '2px solid rgba(79,70,229,0.20)', borderTopColor: 'var(--primary)', borderRadius: '50%', animation: 'spin 0.7s linear infinite', margin: '0 auto 10px' }} />
               <div style={{ fontSize: 12, color: 'var(--text-muted)' }}>Searching Indeed…</div>
             </div>
           ) : results.length > 0 ? (
@@ -156,7 +156,7 @@ export function IndeedSearchPanel({ onJobSaved, onClose }: Props) {
                     <div style={{ fontSize: 11, color: 'var(--text-muted)' }}>
                       {r.company}{r.location ? ` · ${r.location}` : ''}
                     </div>
-                    {r.salary && <div style={{ fontSize: 11, color: '#3B6D11', marginTop: 2 }}>{r.salary}</div>}
+                    {r.salary && <div style={{ fontSize: 11, color: 'var(--c-success)', marginTop: 2 }}>{r.salary}</div>}
                   </div>
                   <Btn
                     small

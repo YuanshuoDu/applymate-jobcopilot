@@ -4,8 +4,14 @@
  */
 import { NextRequest } from 'next/server'
 import { prepareAiRoute, ok, err } from '@/lib/api-helpers'
-import { modelChat, stripFences } from '@/lib/model-router'
+import { modelChat, parseAiJson, type AiConfig } from '@/lib/model-router'
 import type { ResumeContent } from '@/lib/types'
+
+// Fallback providers tried in order when primary model fails
+const SCORE_FALLBACKS: AiConfig[] = [
+  { provider: 'deepseek', model: 'deepseek-chat' },
+  { provider: 'minimax',  model: 'MiniMax-M2.7'  },
+]
 
 export async function POST(req: NextRequest) {
   const prep = await prepareAiRoute(req, 'scoring')
@@ -49,15 +55,36 @@ JOB: ${jobTitle ?? ''} at ${jobCompany ?? ''}
 ${keySkills?.length ? `KEY SKILLS: ${keySkills.join(', ')}` : ''}
 ${jobDescription ? `DESCRIPTION:\n${jobDescription.slice(0, 2000)}` : ''}`
 
+  // Try primary model first, then fallbacks if it fails
+  async function tryChat(): Promise<string> {
+    const attempts = [cfg, ...SCORE_FALLBACKS.filter(f =>
+      !(f.provider === cfg.provider && f.model === cfg.model)
+    )]
+    let lastErr: unknown
+    for (const attempt of attempts) {
+      try {
+        const result = await modelChat([{ role: 'user', content: prompt }], attempt, 3000)
+        return result.text
+      } catch (e) {
+        lastErr = e
+        console.warn(`[/api/ai/score] ${attempt.provider}/${attempt.model} failed, trying next:`, (e as Error).message?.slice(0, 100))
+      }
+    }
+    throw lastErr
+  }
+
   try {
-    const result = await modelChat([{ role: 'user', content: prompt }], cfg, 3000)
-    const text = stripFences(result.text)
+    const rawText = await tryChat()
     let parsed: Record<string, unknown>
-    try { parsed = JSON.parse(text) } catch {
-      return ok({
-        score: 0, matchedKeywords: [], sectionMatches: [], missingItems: [],
-        sectionScores: {}, sectionTips: {}, skillsGap: [], strengthSummary: 'Analysis unavailable. Try again.',
-      })
+    try {
+      parsed = parseAiJson<Record<string, unknown>>(rawText)
+    } catch {
+      return err('AI returned invalid response, please try again', 500)
+    }
+
+    const rawScore = Number(parsed.score)
+    if (!Number.isFinite(rawScore) || rawScore < 0 || rawScore > 100) {
+      return err('AI returned invalid score value, please try again', 500)
     }
 
     const arr = (v: unknown) => Array.isArray(v) ? v as unknown[] : []
@@ -66,7 +93,7 @@ ${jobDescription ? `DESCRIPTION:\n${jobDescription.slice(0, 2000)}` : ''}`
     const toTitle = (s: string) => s ? s.charAt(0).toUpperCase() + s.slice(1).toLowerCase() : s
 
     return ok({
-      score:            Number(parsed.score) || 0,
+      score:            rawScore,
       matchedKeywords:  Array.isArray(parsed.matchedKeywords) ? parsed.matchedKeywords as string[] : [],
       sectionMatches:   arr(parsed.sectionMatches).map((m: unknown) => {
         const o = m as Record<string, unknown> ?? {}

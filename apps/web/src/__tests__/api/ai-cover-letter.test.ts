@@ -5,13 +5,17 @@ import { describe, it, expect, vi, beforeEach } from 'vitest'
 
 const mockCreate = vi.fn()
 vi.mock('@anthropic-ai/sdk', () => ({
-  default: vi.fn().mockImplementation(() => ({
-    messages: { create: mockCreate },
-  })),
+  default: class MockAnthropic {
+    messages = { create: mockCreate }
+  },
 }))
 
 vi.mock('@/lib/db', () => ({ db: {} }))
 vi.mock('@/lib/api-helpers', () => ({
+  prepareAiRoute: vi.fn().mockResolvedValue({
+    userId: 'test-user',
+    cfg: { provider: 'anthropic', model: 'claude-sonnet-4-6', apiKey: 'test-key' },
+  }),
   requireAuth: vi.fn().mockResolvedValue({ userId: 'test-user', userEmail: 'test@test.com' }),
   isErrorResponse: (val: unknown) => val instanceof Response && (val as Response).status === 401,
   ok: (data: unknown, status = 200) => Response.json(data, { status }),
@@ -60,6 +64,7 @@ John Doe`
 
     mockCreate.mockResolvedValueOnce({
       content: [{ type: 'text', text: mockLetter }],
+      usage: { input_tokens: 1, output_tokens: 1 },
     })
 
     const req = fakeNextRequest({
@@ -84,6 +89,7 @@ John Doe`
 
     mockCreate.mockResolvedValueOnce({
       content: [{ type: 'text', text: 'Dear Ms. Smith,\n\n...' }],
+      usage: { input_tokens: 1, output_tokens: 1 },
     })
 
     const req = fakeNextRequest({
@@ -102,6 +108,7 @@ John Doe`
 
     mockCreate.mockResolvedValueOnce({
       content: [{ type: 'text', text: 'Short and punchy letter.' }],
+      usage: { input_tokens: 1, output_tokens: 1 },
     })
 
     const req = fakeNextRequest({

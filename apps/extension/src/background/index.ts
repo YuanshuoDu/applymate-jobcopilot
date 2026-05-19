@@ -73,10 +73,16 @@ chrome.commands.onCommand.addListener((command) => {
 
 chrome.runtime.onMessage.addListener(
   (msg: ExtMessage, sender, sendResponse) => {
-    handleMessage(msg, sender).then(sendResponse).catch(err => {
-      sendResponse({ error: String(err) })
-    })
-    return true
+    // Keep service worker alive during async handling (MV3 requirement)
+    // Wrap in try-catch so a closed port doesn't throw
+    handleMessage(msg, sender)
+      .then(result => {
+        try { sendResponse(result) } catch { /* port already closed */ }
+      })
+      .catch(err => {
+        try { sendResponse({ error: String(err) }) } catch { /* port already closed */ }
+      })
+    return true  // keeps the message channel open for async response
   },
 )
 
@@ -86,14 +92,22 @@ async function handleMessage(
 ): Promise<unknown> {
   let settings = await getSettings()
 
-  // Auto-detect localhost: force API URL to localhost for local testing
+  // Auto-detect environment: switch API URL based on where the request comes from.
   const senderUrl = sender.url ?? sender.origin ?? ''
   const isLocalhost = senderUrl.includes('localhost') || senderUrl.includes('127.0.0.1')
+  const PROD_URL = 'https://web-delta-ruddy-29.vercel.app'
+
   if (isLocalhost && settings.apiBaseUrl !== 'http://localhost:3000') {
-    console.log('[ApplyMate] Localhost detected, switching API from', settings.apiBaseUrl, 'to http://localhost:3000')
-    // Clear old token (it was issued by a different server — invalid for localhost)
-    settings = { ...settings, apiBaseUrl: 'http://localhost:3000', apiToken: '', userEmail: '', userName: '' }
-    await saveSettings({ apiBaseUrl: 'http://localhost:3000', apiToken: '', userEmail: '', userName: '' })
+    // Visiting localhost dashboard → switch API base (keep token; syncFromDashboard will refresh it)
+    console.log('[ApplyMate] Localhost detected, switching API base to http://localhost:3000')
+    settings = { ...settings, apiBaseUrl: 'http://localhost:3000' }
+    await saveSettings({ apiBaseUrl: 'http://localhost:3000' })
+  } else if (!isLocalhost && settings.apiBaseUrl.includes('localhost') && !senderUrl.includes('localhost')) {
+    // On a real job site but API still points to localhost → switch to production
+    // Keep existing token; if it's stale the popup will prompt re-login
+    console.log('[ApplyMate] Production site detected, switching API base to', PROD_URL)
+    settings = { ...settings, apiBaseUrl: PROD_URL }
+    await saveSettings({ apiBaseUrl: PROD_URL })
   }
 
   switch (msg.type) {
@@ -245,9 +259,18 @@ chrome.tabs.onUpdated.addListener(async (tabId, info, tab) => {
     /stepstone\.(de|at|ch|be|nl|fr)\//,
     /xing\.com\/jobs\//,
     /wellfound\.com\//,
-    /greenhouse\.io\/jobs\//,
+    /greenhouse\.io\//,       // was /jobs// — misses boards.greenhouse.io/company/jobs/
     /lever\.co\//,
     /myworkdayjobs\.com\//,
+    /workday\.com\//,
+    /smartrecruiters\.com\//,
+    /ashbyhq\.com\//,
+    /bamboohr\.com\/jobs\//,
+    /jobvite\.com\/jobs\//,
+    /icims\.com\//,
+    /monster\.(com|de|co\.uk)\//,
+    /arbeitsagentur\.de\/jobsuche\//,
+    /jobs\.de\//,
   ]
   const isJobPage = JOB_PATTERNS.some(p => p.test(tab.url!))
 

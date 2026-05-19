@@ -147,7 +147,7 @@ function OrchestrationChat({
       <div style={{ position: 'fixed', bottom: 24, right: 24, zIndex: 1000, display: 'flex', flexDirection: 'column', alignItems: 'flex-end', gap: 8 }}>
         {/* Unread badge */}
         {!open && (savedCount > 0 || pendingCount > 0) && (
-          <div style={{ background: '#185FA5', color: '#fff', borderRadius: 999, padding: '4px 10px', fontSize: 11, fontWeight: 500, boxShadow: '0 2px 8px rgba(24,95,165,0.4)' }}>
+          <div style={{ background: 'var(--primary)', color: '#fff', borderRadius: 999, padding: '4px 10px', fontSize: 11, fontWeight: 500, boxShadow: '0 2px 8px rgba(24,95,165,0.4)' }}>
             {savedCount > 0 ? `${savedCount} 个职位待分析` : `${pendingCount} 个待审核`}
           </div>
         )}
@@ -155,7 +155,7 @@ function OrchestrationChat({
           onClick={() => setOpen(o => !o)}
           style={{
             width: 52, height: 52, borderRadius: '50%',
-            background: loading ? '#854F0B' : '#185FA5',
+            background: loading ? 'var(--c-warning)' : 'var(--primary)',
             border: 'none', cursor: 'pointer',
             display: 'flex', alignItems: 'center', justifyContent: 'center',
             fontSize: 22, boxShadow: '0 4px 16px rgba(24,95,165,0.45)',
@@ -178,7 +178,7 @@ function OrchestrationChat({
           display: 'flex', flexDirection: 'column', overflow: 'hidden',
         }}>
           {/* Header */}
-          <div style={{ padding: '12px 14px', background: '#185FA5', display: 'flex', alignItems: 'center', gap: 10 }}>
+          <div style={{ padding: '12px 14px', background: 'var(--primary)', display: 'flex', alignItems: 'center', gap: 10 }}>
             <span style={{ fontSize: 18 }}>🧠</span>
             <div style={{ flex: 1 }}>
               <div style={{ fontSize: 13, fontWeight: 600, color: '#fff', lineHeight: 1.2 }}>Orchestrator</div>
@@ -196,7 +196,7 @@ function OrchestrationChat({
                 <div style={{
                   maxWidth: '82%', padding: '8px 11px',
                   borderRadius: msg.role === 'user' ? '12px 12px 3px 12px' : '12px 12px 12px 3px',
-                  background: msg.role === 'user' ? '#185FA5' : 'var(--bg-secondary)',
+                  background: msg.role === 'user' ? 'var(--primary)' : 'var(--bg-secondary)',
                   color: msg.role === 'user' ? '#fff' : 'var(--text)',
                   border: msg.role === 'assistant' ? '0.5px solid var(--border)' : 'none',
                   fontSize: 12, lineHeight: 1.65,
@@ -251,7 +251,7 @@ function OrchestrationChat({
               disabled={!input.trim() || loading}
               style={{
                 padding: '8px 12px', borderRadius: 8, border: 'none',
-                background: (!input.trim() || loading) ? 'var(--border)' : '#185FA5',
+                background: (!input.trim() || loading) ? 'var(--border)' : 'var(--primary)',
                 color: '#fff', fontSize: 14, cursor: (!input.trim() || loading) ? 'not-allowed' : 'pointer',
               }}
             >
@@ -340,8 +340,8 @@ function PipelineFlowBar({ statuses, currentRole }: {
         {ROLES.map((r, i) => {
           const st     = statuses[r.key]
           const active = currentRole === r.key
-          const color  = st === 'done' ? '#3B6D11' : active ? '#185FA5' : st === 'error' ? '#A32D2D' : 'var(--text-muted)'
-          const bg     = st === 'done' ? 'rgba(59,109,17,0.1)' : active ? 'rgba(24,95,165,0.12)' : 'var(--bg-tertiary)'
+          const color  = st === 'done' ? 'var(--c-success)' : active ? 'var(--primary)' : st === 'error' ? 'var(--c-danger)' : 'var(--text-muted)'
+          const bg     = st === 'done' ? 'rgba(5,150,105,0.10)' : active ? 'rgba(79,70,229,0.12)' : 'var(--bg-tertiary)'
           return (
             <React.Fragment key={r.key}>
               <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 3, width: 72 }}>
@@ -359,7 +359,7 @@ function PipelineFlowBar({ statuses, currentRole }: {
                 </div>
               </div>
               {i < ROLES.length - 1 && (
-                <div style={{ width: 32, height: 1.5, background: st === 'done' ? '#3B6D11' : 'var(--border)', transition: 'background 0.4s', margin: '0 2px', marginBottom: 18, flexShrink: 0 }} />
+                <div style={{ width: 32, height: 1.5, background: st === 'done' ? 'var(--c-success)' : 'var(--border)', transition: 'background 0.4s', margin: '0 2px', marginBottom: 18, flexShrink: 0 }} />
               )}
             </React.Fragment>
           )
@@ -394,7 +394,7 @@ function AgentRoleCard({ roleInfo, config, status, metrics, saving, onModelChang
     if (config?.systemPrompt != null) setPromptText(config.systemPrompt)
   }, [config?.systemPrompt])
 
-  const statusColors: Record<RoleStatus, string> = { idle: 'var(--text-muted)', running: '#185FA5', done: '#3B6D11', error: '#A32D2D' }
+  const statusColors: Record<RoleStatus, string> = { idle: 'var(--text-muted)', running: 'var(--primary)', done: 'var(--c-success)', error: 'var(--c-danger)' }
   const statusLabels: Record<RoleStatus, string> = { idle: 'Idle', running: 'Running…', done: 'Done', error: 'Error' }
   const sc = statusColors[status]
 
@@ -408,9 +408,9 @@ function AgentRoleCard({ roleInfo, config, status, metrics, saving, onModelChang
   return (
     <Card style={{
       padding: 0, overflow: 'hidden', opacity: enabled ? 1 : 0.55,
-      border: status === 'running' ? `1.5px solid #185FA5` : status === 'done' ? `1.5px solid rgba(59,109,17,0.4)` : '0.5px solid var(--border)',
+      border: status === 'running' ? `1.5px solid var(--primary)` : status === 'done' ? `1.5px solid rgba(5,150,105,0.40)` : '0.5px solid var(--border)',
       transition: 'border 0.3s, box-shadow 0.3s',
-      boxShadow: status === 'running' ? '0 0 0 3px rgba(24,95,165,0.12)' : 'none',
+      boxShadow: status === 'running' ? '0 0 0 3px rgba(79,70,229,0.12)' : 'none',
     }}>
       {/* Header */}
       <div style={{ padding: '10px 12px', background: 'var(--bg-secondary)', borderBottom: '0.5px solid var(--border)', display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
@@ -427,7 +427,7 @@ function AgentRoleCard({ roleInfo, config, status, metrics, saving, onModelChang
             animation: status === 'running' ? 'pulse 1.2s ease-in-out infinite' : 'none',
           }} />
           <span style={{ fontSize: 10, color: sc, fontWeight: 500 }}>{statusLabels[status]}</span>
-          <div onClick={() => onToggle(key, !enabled)} style={{ width: 26, height: 14, borderRadius: 7, background: enabled ? '#185FA5' : 'var(--border)', cursor: 'pointer', position: 'relative', flexShrink: 0 }}>
+          <div onClick={() => onToggle(key, !enabled)} style={{ width: 26, height: 14, borderRadius: 7, background: enabled ? 'var(--primary)' : 'var(--border)', cursor: 'pointer', position: 'relative', flexShrink: 0 }}>
             <div style={{ width: 10, height: 10, borderRadius: '50%', background: '#fff', position: 'absolute', top: 2, left: enabled ? 14 : 2, transition: 'left 0.2s' }} />
           </div>
         </div>
@@ -448,7 +448,7 @@ function AgentRoleCard({ roleInfo, config, status, metrics, saving, onModelChang
         {/* Run metrics */}
         {metrics ? (
           <div style={{ fontSize: 10, background: 'rgba(59,109,17,0.06)', borderRadius: 5, padding: '5px 8px', lineHeight: 1.7 }}>
-            <div style={{ color: '#3B6D11', fontWeight: 500 }}>{metrics.summary}</div>
+            <div style={{ color: 'var(--c-success)', fontWeight: 500 }}>{metrics.summary}</div>
             <div style={{ color: 'var(--text-muted)' }}>{(metrics.durationMs / 1000).toFixed(1)}s · 共 {totalRuns + 1} 次运行</div>
           </div>
         ) : lastResult && totalRuns > 0 ? (
@@ -458,14 +458,14 @@ function AgentRoleCard({ roleInfo, config, status, metrics, saving, onModelChang
           </div>
         ) : null}
 
-        {saving && <div style={{ fontSize: 9, color: '#185FA5', textAlign: 'right' }}>保存中…</div>}
+        {saving && <div style={{ fontSize: 9, color: 'var(--primary)', textAlign: 'right' }}>保存中…</div>}
 
         {/* ── System Prompt (fine-tuning) ── */}
         <div>
           <button
             onClick={() => setPromptOpen(o => !o)}
             style={{
-              width: '100%', padding: '5px 8px', background: promptOpen ? 'rgba(24,95,165,0.08)' : 'var(--bg-tertiary)',
+              width: '100%', padding: '5px 8px', background: promptOpen ? 'rgba(79,70,229,0.08)' : 'var(--bg-tertiary)',
               border: '0.5px solid var(--border)', borderRadius: 5, cursor: 'pointer',
               display: 'flex', alignItems: 'center', justifyContent: 'space-between',
               fontSize: 10, color: 'var(--text-muted)',
@@ -500,7 +500,7 @@ function AgentRoleCard({ roleInfo, config, status, metrics, saving, onModelChang
                 <button
                   onClick={savePrompt}
                   disabled={promptSaving}
-                  style={{ padding: '4px 10px', fontSize: 10, background: '#185FA5', color: '#fff', border: 'none', borderRadius: 4, cursor: promptSaving ? 'not-allowed' : 'pointer', opacity: promptSaving ? 0.7 : 1 }}
+                  style={{ padding: '4px 10px', fontSize: 10, background: 'var(--primary)', color: '#fff', border: 'none', borderRadius: 4, cursor: promptSaving ? 'not-allowed' : 'pointer', opacity: promptSaving ? 0.7 : 1 }}
                 >
                   {promptSaving ? 'Saving…' : '💾 Save'}
                 </button>
@@ -524,12 +524,12 @@ function RunLogPanel({ log, running, done, summary, onStart, onStop }: {
   useEffect(() => { logEndRef.current?.scrollIntoView({ behavior: 'smooth' }) }, [log])
 
   function entryColor(e: LogEntry): string {
-    if (e.type === 'done')       return '#3B6D11'
-    if (e.type === 'error')      return '#A32D2D'
-    if (e.type === 'role_start') return '#185FA5'
-    if (e.type === 'role_done')  return '#3B6D11'
+    if (e.type === 'done')       return 'var(--c-success)'
+    if (e.type === 'error')      return 'var(--c-danger)'
+    if (e.type === 'role_start') return 'var(--primary)'
+    if (e.type === 'role_done')  return 'var(--c-success)'
     if (e.type === 'job_skip')   return 'var(--text-muted)'
-    if (e.score != null)         return e.score >= 80 ? '#3B6D11' : e.score >= 60 ? '#854F0B' : 'var(--text-muted)'
+    if (e.score != null)         return e.score >= 80 ? 'var(--c-success)' : e.score >= 60 ? 'var(--c-warning)' : 'var(--text-muted)'
     return 'var(--text)'
   }
 
@@ -543,8 +543,8 @@ function RunLogPanel({ log, running, done, summary, onStart, onStop }: {
           <span style={{ fontSize: 12, fontWeight: 500 }}>Live Run Log</span>
           {running && (
             <div style={{ display: 'flex', alignItems: 'center', gap: 5 }}>
-              <div style={{ width: 7, height: 7, borderRadius: '50%', background: '#3B6D11', animation: 'pulse 1.2s ease-in-out infinite' }} />
-              <span style={{ fontSize: 10, color: '#3B6D11' }}>Pipeline 运行中…</span>
+              <div style={{ width: 7, height: 7, borderRadius: '50%', background: 'var(--c-success)', animation: 'pulse 1.2s ease-in-out infinite' }} />
+              <span style={{ fontSize: 10, color: 'var(--c-success)' }}>Pipeline 运行中…</span>
             </div>
           )}
           {done && !running && <span style={{ fontSize: 10, color: 'var(--text-muted)', marginLeft: 4 }}>Completed</span>}
@@ -560,10 +560,10 @@ function RunLogPanel({ log, running, done, summary, onStart, onStop }: {
         <div style={{ display: 'flex', borderBottom: '0.5px solid var(--border)' }}>
           {[
             { label: 'Processed', value: summary.processed, color: 'var(--text)' },
-            { label: 'Applied',   value: summary.applied,   color: '#3B6D11' },
-            { label: 'Pending',   value: summary.pending,   color: '#854F0B' },
+            { label: 'Applied',   value: summary.applied,   color: 'var(--c-success)' },
+            { label: 'Pending',   value: summary.pending,   color: 'var(--c-warning)' },
             { label: 'Skipped',   value: summary.skipped,   color: 'var(--text-muted)' },
-            { label: 'Failed',    value: summary.failed,    color: '#A32D2D' },
+            { label: 'Failed',    value: summary.failed,    color: 'var(--c-danger)' },
           ].map((s, i) => (
             <div key={s.label} style={{ flex: 1, textAlign: 'center', padding: '7px 0', borderRight: i < 4 ? '0.5px solid var(--border)' : 'none' }}>
               <div style={{ fontSize: 16, fontWeight: 600, color: s.color }}>{s.value}</div>
@@ -624,7 +624,7 @@ function Toggle({ value, onChange, label, sub }: { value: boolean; onChange: (v:
         <div style={{ fontSize: 12 }}>{label}</div>
         {sub && <div style={{ fontSize: 10, color: 'var(--text-muted)', marginTop: 1 }}>{sub}</div>}
       </div>
-      <div onClick={() => onChange(!value)} style={{ width: 32, height: 18, borderRadius: 9, background: value ? '#185FA5' : 'var(--border)', cursor: 'pointer', position: 'relative', flexShrink: 0 }}>
+      <div onClick={() => onChange(!value)} style={{ width: 32, height: 18, borderRadius: 9, background: value ? 'var(--primary)' : 'var(--border)', cursor: 'pointer', position: 'relative', flexShrink: 0 }}>
         <div style={{ width: 14, height: 14, borderRadius: '50%', background: '#fff', position: 'absolute', top: 2, left: value ? 16 : 2, transition: 'left 0.2s' }} />
       </div>
     </div>
@@ -638,10 +638,10 @@ function SliderRow({ label, value, min, max, step = 1, onChange, unit = '' }: {
     <div style={{ padding: '8px 0', borderBottom: '0.5px solid var(--border)' }}>
       <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 6 }}>
         <span style={{ fontSize: 12 }}>{label}</span>
-        <span style={{ fontSize: 12, fontWeight: 500, color: '#185FA5' }}>{value}{unit}</span>
+        <span style={{ fontSize: 12, fontWeight: 500, color: 'var(--primary)' }}>{value}{unit}</span>
       </div>
       <input type="range" min={min} max={max} step={step} value={value} onChange={e => onChange(Number(e.target.value))}
-        style={{ width: '100%', accentColor: '#185FA5', cursor: 'pointer' }} />
+        style={{ width: '100%', accentColor: 'var(--primary)', cursor: 'pointer' }} />
       <div style={{ display: 'flex', justifyContent: 'space-between', marginTop: 2 }}>
         <span style={{ fontSize: 9, color: 'var(--text-muted)' }}>{min}{unit}</span>
         <span style={{ fontSize: 9, color: 'var(--text-muted)' }}>{max}{unit}</span>
@@ -656,9 +656,9 @@ function PillInput({ values, onChange, placeholder }: { values: string[]; onChan
   return (
     <div style={{ display: 'flex', flexWrap: 'wrap', gap: 4, padding: '6px 0', borderBottom: '0.5px solid var(--border)' }}>
       {values.map((v, i) => (
-        <span key={i} style={{ display: 'inline-flex', alignItems: 'center', gap: 3, background: 'rgba(24,95,165,0.1)', color: '#185FA5', borderRadius: 999, padding: '1px 7px', fontSize: 10 }}>
+        <span key={i} style={{ display: 'inline-flex', alignItems: 'center', gap: 3, background: 'rgba(79,70,229,0.10)', color: 'var(--primary)', borderRadius: 999, padding: '1px 7px', fontSize: 10 }}>
           {v}
-          <button onClick={() => onChange(values.filter((_, j) => j !== i))} style={{ background: 'none', border: 'none', cursor: 'pointer', color: '#185FA5', fontSize: 10, padding: 0 }}>✕</button>
+          <button onClick={() => onChange(values.filter((_, j) => j !== i))} style={{ background: 'none', border: 'none', cursor: 'pointer', color: 'var(--primary)', fontSize: 10, padding: 0 }}>✕</button>
         </span>
       ))}
       <input value={input} onChange={e => setInput(e.target.value)}
@@ -1015,8 +1015,8 @@ export function AgentPlaygroundPage() {
     <div style={{ flex: 1, overflowY: 'auto', background: 'var(--bg-tertiary)', display: 'flex', flexDirection: 'column' }}>
       <TopBar title="Agent Playground">
         <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
-          <span style={{ width: 7, height: 7, borderRadius: '50%', background: globalRunning ? '#3B6D11' : 'var(--text-muted)' }} />
-          <span style={{ fontSize: 11, color: globalRunning ? '#3B6D11' : 'var(--text-muted)', fontWeight: 500 }}>
+          <span style={{ width: 7, height: 7, borderRadius: '50%', background: globalRunning ? 'var(--c-success)' : 'var(--text-muted)' }} />
+          <span style={{ fontSize: 11, color: globalRunning ? 'var(--c-success)' : 'var(--text-muted)', fontWeight: 500 }}>
             {globalRunning ? 'Enabled' : 'Paused'}
           </span>
         </div>

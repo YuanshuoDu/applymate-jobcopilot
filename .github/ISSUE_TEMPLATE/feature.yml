@@ -1,0 +1,84 @@
+name: Feature Request
+description: Turn a product idea into a Claude-reviewed, Codex-executed implementation spec.
+title: "[Feature]: "
+labels:
+  - "type:feat"
+  - "P1"
+  - "spec-ready"
+  - "assignee:codex"
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Use this template when Claude is acting as PM/Reviewer and Codex is acting as Executor/Debugger.
+        Every implementation must start from an Issue with clear acceptance criteria.
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What user problem or workflow pain are we solving?
+      placeholder: Users cannot...
+    validations:
+      required: true
+  - type: textarea
+    id: goal
+    attributes:
+      label: Goal
+      description: What outcome should this change produce?
+      placeholder: After this ships, users can...
+    validations:
+      required: true
+  - type: textarea
+    id: non_goals
+    attributes:
+      label: Non-Goals
+      description: Explicitly list what this task will not include.
+      placeholder: |
+        - No redesign of unrelated screens
+        - No schema migration
+    validations:
+      required: true
+  - type: textarea
+    id: acceptance_criteria
+    attributes:
+      label: Acceptance Criteria
+      description: Use a checkbox list. Each item should be objectively verifiable.
+      placeholder: |
+        - [ ] User can ...
+        - [ ] API returns ...
+        - [ ] Edge case ...
+    validations:
+      required: true
+  - type: textarea
+    id: tech_notes
+    attributes:
+      label: Tech Notes
+      description: Relevant files, architectural constraints, API contracts, or design-system rules.
+      placeholder: |
+        - Relevant files: apps/web/src/...
+        - Reuse existing model-router helpers
+        - Do not introduce new dependencies without approval
+    validations:
+      required: true
+  - type: textarea
+    id: verify
+    attributes:
+      label: Verification
+      description: Manual checks, automated checks, or screenshots/logs expected from the implementer.
+      placeholder: |
+        - pnpm lint
+        - pnpm typecheck
+        - pnpm test
+        - pnpm build
+        - Manual: ...
+    validations:
+      required: true
+  - type: textarea
+    id: codex_handoff
+    attributes:
+      label: Codex Handoff
+      description: Paste the final execution instruction for Codex.
+      value: |
+        @codex 请按上述 AC 实现，分支命名 `feat/<issue-id>-<slug>`（bug 用 `fix/<issue-id>-<slug>`），完成后开 PR 并填写 verify 步骤，PR 描述需包含 `Closes #<issue-id>`。
+    validations:
+      required: true

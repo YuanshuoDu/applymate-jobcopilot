@@ -1,37 +1,53 @@
 'use client'
 
-import React, { createContext, useContext, useEffect, useState } from 'react'
+import React, { createContext, useContext, useEffect, useState, useCallback } from 'react'
 
-type Theme = 'light' | 'dark'
+export type ThemeMode = 'light' | 'dark' | 'system'
+export type Theme     = 'light' | 'dark'
 
 interface ThemeCtx {
-  theme: Theme
-  toggle: () => void
+  theme:   Theme      // resolved (actual applied) theme
+  mode:    ThemeMode  // stored user preference
+  setMode: (m: ThemeMode) => void
 }
 
-const ThemeContext = createContext<ThemeCtx>({ theme: 'light', toggle: () => {} })
+const ThemeContext = createContext<ThemeCtx>({
+  theme:   'light',
+  mode:    'system',
+  setMode: () => {},
+})
 
 export function useTheme() {
   return useContext(ThemeContext)
 }
 
-export function ThemeProvider({ children }: { children: React.ReactNode }) {
-  const [theme, setTheme] = useState<Theme>('light')
+function getSystemTheme(): Theme {
+  return (typeof window !== 'undefined' && window.matchMedia?.('(prefers-color-scheme: dark)').matches)
+    ? 'dark' : 'light'
+}
 
-  // On mount, read from localStorage or system preference
+export function ThemeProvider({ children }: { children: React.ReactNode }) {
+  const [mode, setModeState] = useState<ThemeMode>('system')
+  const [systemTheme, setSystemTheme] = useState<Theme>('light')
+
+  // On mount: read stored mode + current system preference
   useEffect(() => {
-    const stored = localStorage.getItem('applymate-theme') as Theme | null
-    if (stored === 'dark' || stored === 'light') {
-      setTheme(stored)
-      return
+    const stored = localStorage.getItem('applymate-theme-mode') as ThemeMode | null
+    if (stored === 'light' || stored === 'dark' || stored === 'system') {
+      setModeState(stored)
     }
-    // Fall back to system preference
-    if (window.matchMedia?.('(prefers-color-scheme: dark)').matches) {
-      setTheme('dark')
-    }
+    setSystemTheme(getSystemTheme())
+
+    // Watch system preference changes
+    const mq = window.matchMedia('(prefers-color-scheme: dark)')
+    const handler = (e: MediaQueryListEvent) => setSystemTheme(e.matches ? 'dark' : 'light')
+    mq.addEventListener('change', handler)
+    return () => mq.removeEventListener('change', handler)
   }, [])
 
-  // Sync to <html> class and localStorage
+  const theme: Theme = mode === 'system' ? systemTheme : mode
+
+  // Apply to <html>
   useEffect(() => {
     const root = document.documentElement
     if (theme === 'dark') {
@@ -39,13 +55,15 @@ export function ThemeProvider({ children }: { children: React.ReactNode }) {
     } else {
       root.classList.remove('dark')
     }
-    localStorage.setItem('applymate-theme', theme)
   }, [theme])
 
-  const toggle = () => setTheme(t => t === 'light' ? 'dark' : 'light')
+  const setMode = useCallback((m: ThemeMode) => {
+    setModeState(m)
+    try { localStorage.setItem('applymate-theme-mode', m) } catch {}
+  }, [])
 
   return (
-    <ThemeContext.Provider value={{ theme, toggle }}>
+    <ThemeContext.Provider value={{ theme, mode, setMode }}>
       {children}
     </ThemeContext.Provider>
   )

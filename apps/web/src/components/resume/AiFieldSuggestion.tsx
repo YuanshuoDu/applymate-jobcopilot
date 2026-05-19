@@ -83,8 +83,8 @@ export function AiFieldSuggestion({ fieldType, currentValue, context, onApply }:
       <button onClick={handleOpen} title="Get AI suggestions"
         style={{
           display: 'inline-flex', alignItems: 'center', gap: 3,
-          fontSize: 10, color: '#185FA5',
-          background: 'rgba(24,95,165,0.07)', border: '0.5px solid rgba(24,95,165,0.2)',
+          fontSize: 10, color: 'var(--primary)',
+          background: 'rgba(24,95,165,0.07)', border: '0.5px solid rgba(79,70,229,0.20)',
           borderRadius: 10, padding: '2px 8px', cursor: 'pointer', marginTop: 4,
         }}>
         ✦ AI suggest
@@ -101,14 +101,14 @@ export function AiFieldSuggestion({ fieldType, currentValue, context, onApply }:
       {/* Panel header */}
       <div style={{
         display: 'flex', alignItems: 'center', justifyContent: 'space-between',
-        padding: '7px 10px', background: 'rgba(24,95,165,0.06)',
-        borderBottom: '0.5px solid rgba(24,95,165,0.15)',
+        padding: '7px 10px', background: 'rgba(79,70,229,0.06)',
+        borderBottom: '0.5px solid rgba(79,70,229,0.15)',
       }}>
-        <span style={{ fontSize: 11, fontWeight: 500, color: '#185FA5' }}>✦ AI Suggestions</span>
+        <span style={{ fontSize: 11, fontWeight: 500, color: 'var(--primary)' }}>✦ AI Suggestions</span>
         <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
           <button onClick={() => fetchSuggestions()} disabled={loading}
             title="Refresh all suggestions"
-            style={{ fontSize: 10, color: '#185FA5', background: 'none', border: 'none', cursor: 'pointer', padding: 0 }}>
+            style={{ fontSize: 10, color: 'var(--primary)', background: 'none', border: 'none', cursor: 'pointer', padding: 0 }}>
             {loading ? '…' : '↻ Refresh'}
           </button>
           <button onClick={() => setOpen(false)}
@@ -122,7 +122,7 @@ export function AiFieldSuggestion({ fieldType, currentValue, context, onApply }:
       <div style={{ padding: 8, display: 'flex', flexDirection: 'column', gap: 8 }}>
         {loading ? (
           <div style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '12px 4px', color: 'var(--text-muted)', fontSize: 11 }}>
-            <div style={{ width: 14, height: 14, border: '2px solid rgba(24,95,165,0.3)', borderTopColor: '#185FA5', borderRadius: '50%', animation: 'spin 0.7s linear infinite', flexShrink: 0 }} />
+            <div style={{ width: 14, height: 14, border: '2px solid rgba(79,70,229,0.30)', borderTopColor: 'var(--primary)', borderRadius: '50%', animation: 'spin 0.7s linear infinite', flexShrink: 0 }} />
             Generating 3 suggestions…
           </div>
         ) : suggestions.length === 0 ? (
@@ -137,7 +137,7 @@ export function AiFieldSuggestion({ fieldType, currentValue, context, onApply }:
               <span style={{ fontSize: 9, fontWeight: 600, color: 'var(--text-muted)' }}>OPTION {i + 1}</span>
               <div style={{ display: 'flex', gap: 8 }}>
                 <button onClick={() => handleApply(i)}
-                  style={{ fontSize: 10, color: '#3B6D11', fontWeight: 600, background: 'rgba(59,109,17,0.08)', border: '0.5px solid rgba(59,109,17,0.2)', borderRadius: 4, padding: '1px 8px', cursor: 'pointer' }}>
+                  style={{ fontSize: 10, color: 'var(--c-success)', fontWeight: 600, background: 'rgba(59,109,17,0.08)', border: '0.5px solid rgba(5,150,105,0.20)', borderRadius: 4, padding: '1px 8px', cursor: 'pointer' }}>
                   Apply
                 </button>
                 <button onClick={() => setShowFeedback(prev => { const n = [...prev]; n[i] = !n[i]; return n })}
@@ -179,8 +179,8 @@ export function AiFieldSuggestion({ fieldType, currentValue, context, onApply }:
                   onClick={() => feedbacks[i].trim() && fetchSuggestions({ index: i, text: feedbacks[i] })}
                   disabled={regen[i] || !feedbacks[i].trim()}
                   style={{
-                    fontSize: 10, color: '#185FA5', fontWeight: 500,
-                    background: 'rgba(24,95,165,0.08)', border: '0.5px solid rgba(24,95,165,0.2)',
+                    fontSize: 10, color: 'var(--primary)', fontWeight: 500,
+                    background: 'rgba(79,70,229,0.08)', border: '0.5px solid rgba(79,70,229,0.20)',
                     borderRadius: 4, padding: '3px 10px', cursor: 'pointer', whiteSpace: 'nowrap',
                   }}>
                   {regen[i] ? '…' : '↻ Regen'}

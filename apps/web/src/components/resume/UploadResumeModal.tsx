@@ -116,7 +116,7 @@ export function UploadResumeModal({ onClose, onImport }: Props) {
               onDrop={onDrop}
               onClick={() => inputRef.current?.click()}
               style={{
-                border: `1.5px dashed ${dragOver ? '#185FA5' : 'var(--border)'}`,
+                border: `1.5px dashed ${dragOver ? 'var(--primary)' : 'var(--border)'}`,
                 borderRadius: 8,
                 padding: '36px 20px',
                 textAlign: 'center',
@@ -151,7 +151,7 @@ export function UploadResumeModal({ onClose, onImport }: Props) {
             {/* Progress bar */}
             <div style={{ height: 4, background: 'var(--border)', borderRadius: 2, overflow: 'hidden', margin: '0 auto', maxWidth: 320 }}>
               <div style={{
-                height: '100%', borderRadius: 2, background: '#185FA5',
+                height: '100%', borderRadius: 2, background: 'var(--primary)',
                 width: `${progress}%`,
                 transition: 'width 0.6s ease',
               }} />
@@ -164,15 +164,15 @@ export function UploadResumeModal({ onClose, onImport }: Props) {
                   <div key={s} style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
                     <div style={{
                       width: 18, height: 18, borderRadius: '50%',
-                      background: done ? '#185FA5' : current ? 'rgba(24,95,165,0.15)' : 'var(--border)',
-                      border: `1.5px solid ${done || current ? '#185FA5' : 'var(--border)'}`,
+                      background: done ? 'var(--primary)' : current ? 'rgba(79,70,229,0.15)' : 'var(--border)',
+                      border: `1.5px solid ${done || current ? 'var(--primary)' : 'var(--border)'}`,
                       display: 'flex', alignItems: 'center', justifyContent: 'center',
-                      fontSize: 9, color: done ? '#fff' : current ? '#185FA5' : 'var(--text-muted)',
+                      fontSize: 9, color: done ? '#fff' : current ? 'var(--primary)' : 'var(--text-muted)',
                       transition: 'all 0.3s',
                     }}>
                       {done ? '✓' : i + 1}
                     </div>
-                    <span style={{ fontSize: 10, color: current ? '#185FA5' : done ? 'var(--text)' : 'var(--text-muted)' }}>
+                    <span style={{ fontSize: 10, color: current ? 'var(--primary)' : done ? 'var(--text)' : 'var(--text-muted)' }}>
                       {s === 'uploading' ? 'Upload' : s === 'extracting' ? 'Extract' : 'AI Parse'}
                     </span>
                   </div>
@@ -185,7 +185,7 @@ export function UploadResumeModal({ onClose, onImport }: Props) {
         {/* Error */}
         {stage === 'error' && (
           <div style={{ padding: '16px 0' }}>
-            <div style={{ padding: '12px 14px', background: 'rgba(163,45,45,0.06)', border: '0.5px solid rgba(163,45,45,0.25)', borderRadius: 8, fontSize: 12, color: '#A32D2D', marginBottom: 14 }}>
+            <div style={{ padding: '12px 14px', background: 'rgba(163,45,45,0.06)', border: '0.5px solid rgba(163,45,45,0.25)', borderRadius: 8, fontSize: 12, color: 'var(--c-danger)', marginBottom: 14 }}>
               {errMsg}
             </div>
             <div style={{ display: 'flex', gap: 8, justifyContent: 'flex-end' }}>
@@ -198,8 +198,8 @@ export function UploadResumeModal({ onClose, onImport }: Props) {
         {/* Preview & import */}
         {stage === 'preview' && parsed && (
           <div style={{ marginTop: 0 }}>
-            <div style={{ padding: '10px 12px', background: 'rgba(24,95,165,0.05)', border: '0.5px solid rgba(24,95,165,0.2)', borderRadius: 8, marginBottom: 14 }}>
-              <div style={{ fontSize: 11, fontWeight: 600, color: '#185FA5', marginBottom: 8 }}>Parsed successfully</div>
+            <div style={{ padding: '10px 12px', background: 'rgba(24,95,165,0.05)', border: '0.5px solid rgba(79,70,229,0.20)', borderRadius: 8, marginBottom: 14 }}>
+              <div style={{ fontSize: 11, fontWeight: 600, color: 'var(--primary)', marginBottom: 8 }}>Parsed successfully</div>
               <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '4px 16px' }}>
                 <PreviewRow label="Name"       value={parsed.contact.name} />
                 <PreviewRow label="Email"      value={parsed.contact.email} />

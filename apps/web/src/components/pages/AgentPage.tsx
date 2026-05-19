@@ -44,13 +44,13 @@ function StagePipeline({
       {STAGES.map((s, i) => {
         const st = statuses[s.key]
         const isCurrent = current === s.key
-        const color = st === 'done' ? '#3B6D11' : isCurrent ? '#185FA5' : st === 'error' ? '#A32D2D' : 'var(--text-muted)'
+        const color = st === 'done' ? 'var(--c-success)' : isCurrent ? 'var(--primary)' : st === 'error' ? 'var(--c-danger)' : 'var(--text-muted)'
         return (
           <React.Fragment key={s.key}>
             <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 3, minWidth: 48 }}>
               <div style={{
                 width: 28, height: 28, borderRadius: '50%',
-                background: st === 'done' ? 'rgba(59,109,17,0.12)' : isCurrent ? 'rgba(24,95,165,0.12)' : 'var(--bg-tertiary)',
+                background: st === 'done' ? 'rgba(5,150,105,0.10)' : isCurrent ? 'rgba(79,70,229,0.12)' : 'var(--bg-tertiary)',
                 border: `1.5px solid ${color}`,
                 display: 'flex', alignItems: 'center', justifyContent: 'center',
                 fontSize: 12, transition: 'all 0.2s',
@@ -61,7 +61,7 @@ function StagePipeline({
               <span style={{ fontSize: 9, color, fontWeight: isCurrent ? 600 : 400 }}>{s.label}</span>
             </div>
             {i < STAGES.length - 1 && (
-              <div style={{ flex: 1, height: 1.5, background: st === 'done' ? '#3B6D11' : 'var(--border)', transition: 'background 0.3s', margin: '0 2px', marginBottom: 14 }} />
+              <div style={{ flex: 1, height: 1.5, background: st === 'done' ? 'var(--c-success)' : 'var(--border)', transition: 'background 0.3s', margin: '0 2px', marginBottom: 14 }} />
             )}
           </React.Fragment>
         )
@@ -192,17 +192,17 @@ function RunPanel({ onClose }: { onClose: () => void }) {
   }
 
   function logColor(entry: LogEntry): string {
-    if (entry.type === 'done')       return '#3B6D11'
-    if (entry.type === 'error')      return '#A32D2D'
-    if (entry.type === 'job_error')  return '#A32D2D'
-    if (entry.type === 'job_skip')   return '#6B7280'
-    if (entry.type === 'stage_start')return '#185FA5'
-    if (entry.type === 'stage_done') return '#3B6D11'
-    if (entry.type === 'start')      return '#185FA5'
+    if (entry.type === 'done')       return 'var(--c-success)'
+    if (entry.type === 'error')      return 'var(--c-danger)'
+    if (entry.type === 'job_error')  return 'var(--c-danger)'
+    if (entry.type === 'job_skip')   return 'var(--text-muted)'
+    if (entry.type === 'stage_start')return 'var(--primary)'
+    if (entry.type === 'stage_done') return 'var(--c-success)'
+    if (entry.type === 'start')      return 'var(--primary)'
     if (entry.score != null) {
-      if (entry.score >= 80) return '#3B6D11'
-      if (entry.score >= 60) return '#854F0B'
-      return '#6B7280'
+      if (entry.score >= 80) return 'var(--c-success)'
+      if (entry.score >= 60) return 'var(--c-warning)'
+      return 'var(--text-muted)'
     }
     return 'var(--text)'
   }
@@ -215,8 +215,8 @@ function RunPanel({ onClose }: { onClose: () => void }) {
           <span style={{ fontSize: 12, fontWeight: 500 }}>Agent Pipeline</span>
           {running && (
             <div style={{ display: 'flex', alignItems: 'center', gap: 5 }}>
-              <div style={{ width: 8, height: 8, borderRadius: '50%', background: '#3B6D11', animation: 'pulse 1.5s ease-in-out infinite' }} />
-              <span style={{ fontSize: 10, color: '#3B6D11' }}>Running…</span>
+              <div style={{ width: 8, height: 8, borderRadius: '50%', background: 'var(--c-success)', boxShadow: '0 0 6px var(--c-success)', animation: 'pulse 1.5s ease-in-out infinite' }} />
+              <span style={{ fontSize: 10, color: 'var(--c-success)' }}>Running…</span>
             </div>
           )}
           {done && !running && <span style={{ fontSize: 10, color: 'var(--text-muted)' }}>Finished</span>}
@@ -235,10 +235,10 @@ function RunPanel({ onClose }: { onClose: () => void }) {
       {summary && (
         <div style={{ display: 'flex', gap: 0, borderBottom: '0.5px solid var(--border)' }}>
           {[
-            { label: 'Scored',   value: summary.processed, color: '#185FA5' },
-            { label: 'Applied',  value: summary.applied,   color: '#3B6D11' },
-            { label: 'Review',   value: summary.pending,   color: '#854F0B' },
-            { label: 'Skipped',  value: summary.skipped,   color: '#6B7280' },
+            { label: 'Scored',   value: summary.processed, color: 'var(--primary)'   },
+            { label: 'Applied',  value: summary.applied,   color: 'var(--c-success)' },
+            { label: 'Review',   value: summary.pending,   color: 'var(--c-warning)' },
+            { label: 'Skipped',  value: summary.skipped,   color: 'var(--text-muted)' },
           ].map((s, i) => (
             <div key={s.label} style={{ flex: 1, textAlign: 'center', padding: '8px 0', borderRight: i < 3 ? '0.5px solid var(--border)' : 'none' }}>
               <div style={{ fontSize: 18, fontWeight: 600, color: s.color }}>{s.value}</div>
@@ -277,7 +277,7 @@ function Toggle({ value, onChange, label, sub }: { value: boolean; onChange: (v:
         <div style={{ fontSize: 12, color: 'var(--text)' }}>{label}</div>
         {sub && <div style={{ fontSize: 10, color: 'var(--text-muted)', marginTop: 2 }}>{sub}</div>}
       </div>
-      <div onClick={() => onChange(!value)} style={{ width: 32, height: 18, borderRadius: 9, background: value ? '#185FA5' : 'var(--border)', cursor: 'pointer', position: 'relative', transition: 'background 0.2s', flexShrink: 0 }}>
+      <div onClick={() => onChange(!value)} style={{ width: 32, height: 18, borderRadius: 9, background: value ? 'var(--primary)' : 'var(--border)', cursor: 'pointer', position: 'relative', transition: 'background 0.2s', flexShrink: 0 }}>
         <div style={{ width: 14, height: 14, borderRadius: '50%', background: '#fff', position: 'absolute', top: 2, left: value ? 16 : 2, transition: 'left 0.2s' }} />
       </div>
     </div>
@@ -291,10 +291,10 @@ function SliderRow({ label, value, min, max, step = 1, onChange, unit = '' }: {
     <div style={{ padding: '10px 0', borderBottom: '0.5px solid var(--border)' }}>
       <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 8 }}>
         <span style={{ fontSize: 12, color: 'var(--text)' }}>{label}</span>
-        <span style={{ fontSize: 12, fontWeight: 500, color: '#185FA5' }}>{value}{unit}</span>
+        <span style={{ fontSize: 12, fontWeight: 500, color: 'var(--primary)' }}>{value}{unit}</span>
       </div>
       <input type="range" min={min} max={max} step={step} value={value} onChange={e => onChange(Number(e.target.value))}
-        style={{ width: '100%', accentColor: '#185FA5', cursor: 'pointer' }} />
+        style={{ width: '100%', accentColor: 'var(--primary)', cursor: 'pointer' }} />
       <div style={{ display: 'flex', justifyContent: 'space-between', marginTop: 2 }}>
         <span style={{ fontSize: 9, color: 'var(--text-muted)' }}>{min}{unit}</span>
         <span style={{ fontSize: 9, color: 'var(--text-muted)' }}>{max}{unit}</span>
@@ -322,9 +322,9 @@ function PillInput({ values, onChange, placeholder }: { values: string[]; onChan
   return (
     <div style={{ display: 'flex', flexWrap: 'wrap', gap: 4, padding: '6px 0' }}>
       {values.map((v, i) => (
-        <span key={i} style={{ display: 'inline-flex', alignItems: 'center', gap: 4, background: 'rgba(24,95,165,0.1)', color: '#185FA5', borderRadius: 999, padding: '2px 8px', fontSize: 11 }}>
+        <span key={i} style={{ display: 'inline-flex', alignItems: 'center', gap: 4, background: 'rgba(79,70,229,0.10)', color: 'var(--primary)', borderRadius: 999, padding: '2px 8px', fontSize: 11 }}>
           {v}
-          <button onClick={() => onChange(values.filter((_, j) => j !== i))} style={{ background: 'none', border: 'none', cursor: 'pointer', color: '#185FA5', fontSize: 11, padding: 0 }}>✕</button>
+          <button onClick={() => onChange(values.filter((_, j) => j !== i))} style={{ background: 'none', border: 'none', cursor: 'pointer', color: 'var(--primary)', fontSize: 11, padding: 0 }}>✕</button>
         </span>
       ))}
       <input value={input} onChange={e => setInput(e.target.value)}
@@ -494,8 +494,8 @@ export function AgentPage() {
     <div style={{ flex: 1, overflowY: 'auto', background: 'var(--bg-tertiary)', display: 'flex', flexDirection: 'column' }}>
       <TopBar title="AI Agent">
         <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
-          <span style={{ width: 7, height: 7, borderRadius: '50%', background: running ? '#3B6D11' : '#6B7280' }} />
-          <span style={{ fontSize: 11, color: running ? '#3B6D11' : 'var(--text-muted)', fontWeight: 500 }}>
+          <span style={{ width: 7, height: 7, borderRadius: '50%', background: running ? 'var(--c-success)' : 'var(--text-muted)', boxShadow: running ? '0 0 6px var(--c-success)' : 'none' }} />
+          <span style={{ fontSize: 11, color: running ? 'var(--c-success)' : 'var(--text-muted)', fontWeight: 500 }}>
             {running ? 'Running' : 'Paused'}
           </span>
         </div>
@@ -535,7 +535,7 @@ export function AgentPage() {
                   <span style={{ fontSize: 11, fontWeight: 500 }}>{cfg.minScore}%</span>
                 </div>
                 <div style={{ height: 6, background: 'var(--bg-tertiary)', borderRadius: 3, overflow: 'hidden' }}>
-                  <div style={{ width: `${cfg.minScore}%`, height: '100%', background: '#185FA5', borderRadius: 3, transition: 'width 0.3s' }} />
+                  <div style={{ width: `${cfg.minScore}%`, height: '100%', background: 'linear-gradient(90deg, var(--primary), var(--accent))', borderRadius: 3, transition: 'width 0.3s' }} />
                 </div>
               </div>
 
