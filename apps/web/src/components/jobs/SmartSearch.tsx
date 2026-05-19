@@ -706,7 +706,7 @@ export function SmartSearch({ onJobSaved }: { onJobSaved?: () => void }) {
                               {savedIds.has(r.id) ? (
                                 scores[r.id] !== undefined
                                   ? <ScorePill score={scores[r.id]} />
-                                  : <Badge color="#059669" bg="rgba(5,150,105,0.12)">{Icon.Bookmark(true)} Saved</Badge>
+                                  : <Badge color="#059669" bg="rgba(5,150,105,0.12)">✓ Saved</Badge>
                               ) : (
                                 <button
                                   onClick={e => { e.stopPropagation(); handleSave(r) }}
@@ -754,7 +754,7 @@ export function SmartSearch({ onJobSaved }: { onJobSaved?: () => void }) {
                             </button>
                           )}
                           {savedIds.has(r.id) && scores[r.id] === undefined && !scoringIds.has(r.id) && (
-                            <span title="Saved" style={{ color: '#059669', display: 'flex' }}>{Icon.Bookmark(true)}</span>
+                            <span title="Saved" style={{ color: '#059669', display: 'flex' }}>✓</span>
                           )}
                         </div>
                       )}

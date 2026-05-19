@@ -432,6 +432,46 @@ export function SettingsPage() {
                 })}
               </div>
             </SettingsSection>
+
+            {/* ── Chrome Extension ── */}
+            <SettingsSection title="Chrome 扩展">
+              <div style={{ display: 'flex', alignItems: 'center', gap: 14, padding: 14, background: 'var(--bg-secondary)', borderRadius: 10, border: '0.5px solid var(--border)', marginTop: 4 }}>
+                {/* Chrome puzzle icon */}
+                <div style={{ width: 36, height: 36, borderRadius: 8, background: 'rgba(79,70,229,0.12)', color: 'var(--primary)', display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0 }}>
+                  <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                    <path d="M20.24 12.24a6 6 0 0 0-8.49-8.49L5 10.5V19h8.5z"/><line x1="16" y1="8" x2="2" y2="22"/><line x1="17.5" y1="15" x2="9" y2="15"/>
+                  </svg>
+                </div>
+                <div style={{ flex: 1 }}>
+                  <div style={{ fontSize: 12, fontWeight: 500, color: 'var(--text)', marginBottom: 2 }}>ApplyMate AI for Chrome</div>
+                  <div style={{ fontSize: 10, color: 'var(--text-muted)', lineHeight: 1.5 }}>在 LinkedIn、Indeed 等求职网站上一键保存职位、自动填表、查看简历匹配分</div>
+                </div>
+                <div style={{ display: 'flex', flexDirection: 'column', gap: 6, alignItems: 'flex-end', flexShrink: 0 }}>
+                  <a
+                    href="https://chrome.google.com/webstore"
+                    target="_blank"
+                    rel="noreferrer"
+                    style={{
+                      display: 'inline-flex', alignItems: 'center', gap: 5,
+                      padding: '5px 12px', borderRadius: 7, fontSize: 11, fontWeight: 600,
+                      background: 'var(--primary)', color: '#fff', textDecoration: 'none',
+                      whiteSpace: 'nowrap',
+                    }}
+                  >
+                    <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+                    安装扩展
+                  </a>
+                  <a
+                    href="https://github.com/YuanshuoDu/applymate-jobcopilot"
+                    target="_blank"
+                    rel="noreferrer"
+                    style={{ fontSize: 10, color: 'var(--text-muted)', textDecoration: 'none' }}
+                  >
+                    查看使用说明 →
+                  </a>
+                </div>
+              </div>
+            </SettingsSection>
           )}
 
           {/* ── Billing ── */}

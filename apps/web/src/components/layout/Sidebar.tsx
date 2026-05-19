@@ -81,7 +81,6 @@ export function Sidebar({ active, onNav, session }: SidebarProps) {
     { id: 'gmail',     label: t('nav.gmail')     },
     { id: 'agent',     label: t('nav.agent')     },
     { id: 'animation', label: 'Flow Demo'        },
-    { id: 'extension', label: t('nav.extension') },
     { id: 'settings',  label: t('nav.settings')  },
   ]
 
