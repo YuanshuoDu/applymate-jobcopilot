@@ -52,8 +52,10 @@ export function PersonaView({ settings, personaUpdateTrigger }: Props) {
     try {
       const result = await getPersonaFields(settings)
       setFields(result.fields)
-    } catch { /* ignore */ }
-    finally { setLoading(false) }
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err)
+      showToast(`Load failed: ${msg}`)
+    } finally { setLoading(false) }
   }, [settings])
 
   useEffect(() => { loadFields() }, [loadFields, personaUpdateTrigger])

@@ -86,6 +86,7 @@ export function ResumeView({ settings }: Props) {
   const [suggestions, setSuggestions] = useState<Suggestion[]>([])
   const [analyzing, setAnalyzing] = useState(false)
   const [uploading, setUploading] = useState(false)
+  const [loadError, setLoadError] = useState('')
 
   const saveTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
   const fileInputRef = useRef<HTMLInputElement>(null)
@@ -103,6 +104,7 @@ export function ResumeView({ settings }: Props) {
   }, [])
 
   async function loadResumeList() {
+    setLoadError('')
     try {
       const list = await listResumes(settings)
       setResumes(list)
@@ -112,7 +114,11 @@ export function ResumeView({ settings }: Props) {
         setActiveId(targetId)
         await loadResume(targetId)
       } else { setLoading(false) }
-    } catch { setLoading(false) }
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err)
+      setLoadError(msg)
+      setLoading(false)
+    }
   }
 
   async function loadResume(id: string) {
@@ -127,7 +133,11 @@ export function ResumeView({ settings }: Props) {
       setScoreResult(null)
       setSuggestions([])
       await setCurrentResumeId(id)
-    } catch { showToast('Failed to load') }
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : 'Failed to load'
+      showToast(msg)
+      setLoadError(msg)
+    }
     finally { setLoading(false) }
   }
 
@@ -267,6 +277,21 @@ export function ResumeView({ settings }: Props) {
   // ── Loading ────────────────────────────────────────────────────────────────────
   if (loading && !resume) {
     return <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', height: '60vh' }}><Spinner /></div>
+  }
+
+  // ── Load error ─────────────────────────────────────────────────────────────────
+  if (!loading && loadError) {
+    return (
+      <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', height: '60vh', gap: 14, padding: 28, textAlign: 'center', background: C.bg, fontFamily: '-apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif' }}>
+        <div style={{ fontSize: 32 }}>⚠️</div>
+        <div style={{ fontSize: 13, fontWeight: 600, color: C.text }}>Failed to load resumes</div>
+        <div style={{ fontSize: 11, color: C.muted, lineHeight: 1.6, maxWidth: 240, wordBreak: 'break-word' }}>{loadError}</div>
+        <div style={{ fontSize: 10, color: C.subtle, background: `${C.border}`, padding: '6px 12px', borderRadius: 6 }}>
+          API: {settings.apiBaseUrl}
+        </div>
+        <button onClick={loadResumeList} style={btnPrimary(C)}>Retry</button>
+      </div>
+    )
   }
 
   // ── Empty state ────────────────────────────────────────────────────────────────
