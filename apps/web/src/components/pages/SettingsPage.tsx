@@ -354,6 +354,7 @@ export function SettingsPage() {
 
           {/* ── Accounts ── */}
           {activeTab === 'accounts' && (
+            <>
             <SettingsSection title={t('settings.connAccounts')}>
               <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
                 {accounts.map(acc => {
@@ -472,6 +473,7 @@ export function SettingsPage() {
                 </div>
               </div>
             </SettingsSection>
+            </>
           )}
 
           {/* ── Billing ── */}
