@@ -161,8 +161,8 @@ export function LoginPage() {
         display: 'flex', flexDirection: 'column', padding: '48px 44px',
         position: 'relative', zIndex: 1,
       }}>
-        {/* Logo */}
-        <div style={{ display:'flex', alignItems:'center', gap:12, marginBottom:52 }}>
+        {/* Logo — clickable */}
+        <Link href="/" style={{ display:'flex', alignItems:'center', gap:12, marginBottom:52, textDecoration:'none' }}>
           <div style={{
             width:38, height:38, borderRadius:11,
             background:'linear-gradient(135deg, #4F46E5 0%, #7C3AED 100%)',
@@ -178,7 +178,7 @@ export function LoginPage() {
             }}>ApplyMate AI</div>
             <div style={{ fontSize:11, color:C.subtle }}>Job Copilot · Europe</div>
           </div>
-        </div>
+        </Link>
 
         {/* Hero text */}
         <div style={{ marginBottom:40 }}>
