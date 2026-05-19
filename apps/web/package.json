@@ -5,7 +5,7 @@
   "scripts": {
     "dev": "next dev --port 3000",
     "dev:clean": "rimraf .next && next dev",
-    "build": "next build",
+    "build": "prisma generate && next build",
     "start": "next start",
     "lint": "next lint",
     "typecheck": "prisma generate && next typegen && tsc --noEmit",
