@@ -21,6 +21,7 @@
  */
 import { db }          from '@/lib/db'
 import { discoverJobs } from '@/lib/agent/discover'
+import { resolveLocations, buildLocationWhere, locationSummary } from '@/lib/agent/location-resolver'
 import type { PipelineCtx, ScoutOutput, StageResult, AcceptResult } from '../types'
 import { stageOk, stageFail } from '../types'
 
@@ -31,16 +32,20 @@ export async function runScout(ctx: PipelineCtx): Promise<StageResult<ScoutOutpu
   const hasTargetRoles = agentCfg.targetRoles.length > 0
   const hasLocations   = agentCfg.targetLocations.length > 0
 
+  // Resolve locations ONCE — expand "Ireland" → Dublin/Cork/Galway/etc.
+  const locResolved = resolveLocations(agentCfg.targetLocations)
+  const locSummary  = locationSummary(agentCfg.targetLocations)
+
   try {
-    // ── Phase A: Live search with location applied at API level ───────────────
+    // ── Phase A: Live search — location filter applied at API search level ────
     let discovered = 0
 
     if (hasTargetRoles) {
       emit('agent_action', {
         role:   'scout',
         action: hasLocations
-          ? `在 [${agentCfg.targetLocations.join(', ')}] 搜索 [${agentCfg.targetRoles.slice(0, 3).join(', ')}]…`
-          : `全球搜索 [${agentCfg.targetRoles.slice(0, 3).join(', ')}]…`,
+          ? `搜索 [${agentCfg.targetRoles.slice(0, 3).join(', ')}]，地点：${locSummary}`
+          : `全球搜索 [${agentCfg.targetRoles.slice(0, 3).join(', ')}]`,
       })
 
       const existingUrls = new Set(
@@ -117,43 +122,41 @@ export async function runScout(ctx: PipelineCtx): Promise<StageResult<ScoutOutpu
     }
 
     // ── Phase B: Load saved jobs with DB-level location filter ────────────────
-    // Location filter is applied in Prisma WHERE — not in JS after loading all rows.
+    // Uses resolved location terms — "Ireland" expands to Dublin/Cork/Galway/etc.
+    // Filter is applied at Prisma WHERE level, not post-JS-filter.
 
     const excludeSet  = new Set(agentCfg.excludeCompanies.map(c => c.toLowerCase().trim()))
     const prioritySet = new Set(agentCfg.priorityCompanies.map(c => c.toLowerCase().trim()))
 
-    // Build Prisma OR conditions for location matching
+    // Build location WHERE using the resolver's expanded terms
     const locationWhere = hasLocations
       ? {
           OR: [
-            { location: null },   // include jobs with no location metadata
+            // Jobs with no location are always included (better to analyse than miss)
+            { location: null },
             { location: '' },
-            // Match any of the target locations (case-insensitive contains)
-            ...agentCfg.targetLocations.map(loc => ({
-              location: { contains: loc, mode: 'insensitive' as const },
+            // Match any of the EXPANDED location terms (e.g. "Ireland" → Dublin, Cork, Galway...)
+            ...locResolved.allDbTerms.map(term => ({
+              location: { contains: term, mode: 'insensitive' as const },
             })),
-            // Also match priority companies regardless of location
-            ...(agentCfg.priorityCompanies.length > 0 ? [{
-              company: { in: agentCfg.priorityCompanies },
-            }] : []),
+            // Priority companies bypass location filter entirely
+            ...(agentCfg.priorityCompanies.length > 0
+              ? [{ company: { in: agentCfg.priorityCompanies } }]
+              : []),
           ],
         }
-      : {}   // no location filter
+      : {}
 
     const allSaved = await db.job.findMany({
       where: {
         userId,
         status: 'saved',
-        // Exclude blacklisted companies at DB level
-        NOT: excludeSet.size > 0
-          ? { company: { in: [...excludeSet] } }
-          : undefined,
-        // Location filter at DB level
+        NOT: excludeSet.size > 0 ? { company: { in: [...excludeSet] } } : undefined,
         ...locationWhere,
       },
       orderBy: [
-        { score: 'asc' },       // unscored first
-        { createdAt: 'desc' },  // then newest
+        { score: 'asc' },
+        { createdAt: 'desc' },
       ],
     })
 
@@ -169,6 +172,15 @@ export async function runScout(ctx: PipelineCtx): Promise<StageResult<ScoutOutpu
     })
 
     const jobs = candidates.slice(0, agentCfg.dailyLimit)
+
+    // Emit location resolution summary
+    if (hasLocations) {
+      const expandedCities = locResolved.allDbTerms.slice(0, 8)
+      emit('agent_observation', {
+        role:        'scout',
+        observation: `📍 地点解析：[${agentCfg.targetLocations.join(', ')}] → 展开为 ${expandedCities.length} 个匹配词（${expandedCities.slice(0, 5).join('、')}${expandedCities.length > 5 ? '…' : ''}）`,
+      })
+    }
 
     // Emit formatted job list
     if (jobs.length > 0) {
