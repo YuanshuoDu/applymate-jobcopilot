@@ -80,7 +80,6 @@ export function Sidebar({ active, onNav, session }: SidebarProps) {
     { id: 'resume',    label: t('nav.resume')    },
     { id: 'gmail',     label: t('nav.gmail')     },
     { id: 'agent',     label: t('nav.agent')     },
-    { id: 'animation', label: 'Flow Demo'        },
     { id: 'settings',  label: t('nav.settings')  },
   ]
 

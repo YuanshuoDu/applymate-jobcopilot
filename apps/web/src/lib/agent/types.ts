@@ -37,6 +37,7 @@ export interface AgentConfigFull {
   coverTone:         string
   useTailoredCV:     boolean
   model:             string
+  throttleMs?:       number   // delay between per-job AI calls (ms), default 300
 }
 
 // ── Pipeline context (threaded through every stage) ───────────────────────────

@@ -44,7 +44,7 @@ export async function GET(req: NextRequest) {
 
     const ctx: PipelineCtx = {
       userId:    prep.userId,
-      agentCfg:  agentCfg as PipelineCtx['agentCfg'],
+      agentCfg:  { ...(agentCfg as PipelineCtx['agentCfg']), throttleMs: (agentCfg as any).throttleMs ?? 300 },
       roleConfigs,
       resumeText: resumeToText(resume.content as unknown as ResumeContent).slice(0, 2500),
       resumeContent: resume.content as unknown as ResumeContent,

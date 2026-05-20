@@ -15,7 +15,6 @@ import type {
 import { stageOk, stageFail } from '../types'
 
 const SCORE_COLOR = (s: number) => s >= 80 ? '#3B6D11' : s >= 60 ? '#854F0B' : '#6B7280'
-const THROTTLE_MS = 300
 
 export async function runAnalyze(
   jobs: Job[],
@@ -23,6 +22,7 @@ export async function runAnalyze(
 ): Promise<StageResult<AnalyzeOutput>> {
   const t0 = Date.now()
   const { agentCfg, resumeText, aiConfig, roleConfigs, emit, userId } = ctx
+  const THROTTLE_MS = agentCfg.throttleMs ?? 300
 
   // Use analyst role's configured model; fall back to global aiConfig
   const analystCfg = roleConfigs.analyst
@@ -35,11 +35,33 @@ export async function runAnalyze(
   const pendingUpdates: Array<{ jobId: string; score: number; recommendation?: string }> = []
   const pendingActivities: Array<{ jobId: string; text: string; color: string }> = []
 
+  // Proactive question: jobs without descriptions
+  const noDescCount = jobs.filter(j => !j.description && !!j.role).length
+  if (noDescCount > 0) {
+    emit('agent_question', {
+      role:       'analyst',
+      questionId: 'no_description_jobs',
+      question:   `发现 ${noDescCount} 个职位没有职位描述。我会尝试根据职位名称和公司评分，但准确度可能偏低。建议：在 Jobs 页面为这些职位手动添加描述后再运行。是否继续？`,
+      options: [
+        { label: '✓ 继续（用职位名称评分）',   value: 'continue' },
+        { label: '↩ 跳过无描述职位',            value: 'skip_no_desc',  action: { field: 'skipNoDescription', value: true } },
+      ],
+    })
+  }
+
   for (const job of jobs) {
     emit('job_start', { jobId: job.id, company: job.company, role: job.role })
+    emit('agent_action', {
+      role:   'analyst',
+      action: `评分 ${job.company} · ${job.role}${job.location ? ` (${job.location})` : ''}`,
+    })
 
     if (!job.description && !job.role) {
       emit('job_skip', { jobId: job.id, company: job.company, role: job.role, reason: 'No job description available' })
+      emit('agent_observation', {
+        role:        'analyst',
+        observation: `⚠ 跳过 ${job.company} · ${job.role}：无职位描述，无法评分`,
+      })
       continue
     }
 
@@ -58,6 +80,15 @@ export async function runAnalyze(
 
       scoredJobs.push({ job, ...parsed })
 
+      // Emit per-job observation with AI reasoning
+      const matchStr  = parsed.matchedKeywords.length  ? `匹配：${parsed.matchedKeywords.slice(0, 4).join(', ')}` : ''
+      const missStr   = parsed.missingKeywords.length   ? `缺失：${parsed.missingKeywords.slice(0, 3).join(', ')}` : ''
+      const scoreTag  = parsed.score >= 80 ? '✦ 高匹配' : parsed.score >= 60 ? '◆ 中等' : '◇ 偏低'
+      emit('agent_observation', {
+        role:        'analyst',
+        observation: `${scoreTag} ${parsed.score}%${matchStr ? ' · ' + matchStr : ''}${missStr ? ' · ' + missStr : ''}${parsed.recommendation ? ' → ' + parsed.recommendation : ''}`,
+      })
+
       emit('job_done', {
         jobId: job.id, company: job.company, role: job.role,
         score: parsed.score, autoApplied: false,
@@ -69,6 +100,10 @@ export async function runAnalyze(
     } catch (err) {
       failed++
       console.error('[analyze] scoring error:', err)
+      emit('agent_observation', {
+        role:        'analyst',
+        observation: `✗ ${job.company} · ${job.role} 评分失败：AI 调用异常`,
+      })
       emit('job_error', { jobId: job.id, company: job.company, role: job.role, error: 'AI scoring failed' })
     }
   }

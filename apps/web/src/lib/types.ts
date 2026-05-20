@@ -312,6 +312,5 @@ export type Page =
   | 'resume'
   | 'gmail'
   | 'agent'
-  | 'animation'
   | 'extension'
   | 'settings'

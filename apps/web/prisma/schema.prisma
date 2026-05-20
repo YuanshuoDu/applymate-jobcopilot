@@ -84,8 +84,9 @@ model User {
   jobs           Job[]
   resumes        Resume[]
   activities     Activity[]
-  agentConfig    AgentConfig?
-  agentRoles     AgentRole[]
+  agentConfig      AgentConfig?
+  agentRoles       AgentRole[]
+  customAgentRoles CustomAgentRole[]
   resumeVersions ResumeVersion[]
   directions     Direction[]
   coverLetters   CoverLetter[]
@@ -277,6 +278,30 @@ model AgentRole {
   user User @relation(fields: [userId], references: [id], onDelete: Cascade)
 
   @@unique([userId, role])
+  @@index([userId])
+}
+
+// ─────────────────────────────────────────────
+// Custom Agent Roles (user-defined pipeline nodes)
+// ─────────────────────────────────────────────
+
+model CustomAgentRole {
+  id           String   @id @default(cuid())
+  userId       String
+  name         String
+  icon         String   @default("🧩")
+  description  String?
+  systemPrompt String?  @db.Text
+  provider     String   @default("anthropic")
+  model        String   @default("claude-haiku-4-5-20251001")
+  insertAfter  String   @default("auditor")
+  enabled      Boolean  @default(true)
+  sortOrder    Int      @default(0)
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
   @@index([userId])
 }
 

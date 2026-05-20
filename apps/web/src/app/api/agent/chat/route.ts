@@ -35,7 +35,14 @@ const SYSTEM_PROMPT = (ctx: {
 ## Recent Jobs
 ${ctx.recentJobs.length === 0 ? 'No jobs yet.' : ctx.recentJobs.map(j => `- ${j.company} · ${j.role} | Score: ${j.score != null ? j.score + '%' : '-'} | ${j.status}`).join('\n')}
 
-Action commands (at END of response, on its own line): ACTION:start_run | ACTION:update_config:key:value | ACTION:navigate:path | ACTION:open_job:<jobId>
+Action commands (at END of response, on its own line):
+  ACTION:start_run
+  ACTION:stop_run
+  ACTION:update_config:key:value
+  ACTION:navigate:path
+  ACTION:open_job:<jobId>
+  ACTION:toggle_agent:roleName:true/false
+
 Rules: max 1 action per response, only when asked or obviously needed, be helpful in Chinese or English, use real data from context.`
 
 export async function POST(req: NextRequest) {
@@ -75,6 +82,11 @@ export async function POST(req: NextRequest) {
       const parts = actionMatch[1].split(':')
       const type = parts[0]
       if (type === 'start_run') send('action', { type: 'start_run' })
+      else if (type === 'stop_run') send('action', { type: 'stop_run' })
+      else if (type === 'toggle_agent' && parts.length >= 3) {
+        const enabled = parts[2] === 'true'
+        send('action', { type: 'toggle_agent', role: parts[1], enabled })
+      }
       else if (type === 'update_config' && parts.length >= 3) {
         let value: unknown = parts[2]
         if (value === 'true') value = true; else if (value === 'false') value = false; else if (!isNaN(Number(value))) value = Number(value)
