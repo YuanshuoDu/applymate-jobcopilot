@@ -39,6 +39,51 @@ export interface QuestionOption {
   action?: { field: string; value: unknown }
 }
 
+// ── Helpers ───────────────────────────────────────────────────────────────────
+
+/**
+ * Strip LLM chain-of-thought preamble, extract only the actionable output.
+ * Models like MiniMax often output "Let me think... <answer>" style.
+ */
+function extractFinalSentence(raw: string): string {
+  // Remove common thinking preambles line by line
+  const lines = raw.split('\n').filter(l => l.trim())
+  const thinkPrefixes = [
+    'let me', 'i need to', 'the user wants', 'i should', 'first,', 'okay,',
+    'sure,', 'to answer', 'thinking:', 'i\'ll', 'i will', 'as an',
+  ]
+  // Find first line that is NOT a thinking line
+  for (const line of lines) {
+    const lower = line.trim().toLowerCase()
+    const isThinking = thinkPrefixes.some(p => lower.startsWith(p))
+    if (!isThinking && line.trim().length > 10) {
+      // Return this line, cleaned of markdown
+      return line.trim().replace(/^[*_`#>\-•·]+\s*/, '').replace(/[*_`]+$/, '').slice(0, 120)
+    }
+  }
+  // Fallback: last sentence
+  const sentences = raw.replace(/\n/g, ' ').split(/[.!?]+/).filter(s => s.trim().length > 10)
+  return (sentences.at(-1) ?? raw).trim().slice(0, 120)
+}
+
+/**
+ * Parse JSON from LLM response robustly.
+ * Handles: ```json ... ```, thinking preamble before JSON, trailing text.
+ */
+function parseDecision(raw: string): Record<string, unknown> | null {
+  // Remove markdown fences
+  let text = raw.replace(/```json|```/g, '').trim()
+  // Find first { ... }
+  const start = text.indexOf('{')
+  const end   = text.lastIndexOf('}')
+  if (start === -1 || end === -1) return null
+  try {
+    return JSON.parse(text.slice(start, end + 1))
+  } catch {
+    return null
+  }
+}
+
 // ── OrchestratorAgent ─────────────────────────────────────────────────────────
 
 export class OrchestratorAgent {
@@ -105,22 +150,25 @@ export class OrchestratorAgent {
 
   async plan(): Promise<string> {
     const { agentCfg } = this.ctx
-    const prompt = `You are an OrchestratorAgent coordinating a job application pipeline.
+    const prompt = `You are an OrchestratorAgent.
 
-User setup:
-- Target roles: ${agentCfg.targetRoles.slice(0, 5).join(', ') || '(not set — will process saved jobs)'}
+RESPOND WITH EXACTLY ONE SENTENCE. No preamble, no explanation, no thinking. Just the sentence.
+
+Context:
+- Target roles: ${agentCfg.targetRoles.slice(0, 5).join(', ') || 'saved jobs only'}
 - Locations: ${agentCfg.targetLocations.slice(0, 3).join(', ') || 'any'}
 - Min match score: ${agentCfg.minMatchScore}%
-- Auto-apply: ${agentCfg.autoApply ? 'ON' : 'OFF (manual queue)'}
-- Cover letter: ${agentCfg.autoCoverLetter ? 'ON' : 'OFF'}
-- Daily limit: ${agentCfg.dailyLimit} jobs
-- Mode: ${this.autonomous ? 'AUTONOMOUS (no user prompts)' : 'INTERACTIVE (will ask when needed)'}
+- Auto-apply: ${agentCfg.autoApply ? 'ON' : 'OFF'}
+- Daily limit: ${agentCfg.dailyLimit}
+- Mode: ${this.autonomous ? 'AUTONOMOUS' : 'INTERACTIVE'}
 
-Write ONE sentence describing your strategy for this run. Be specific and actionable. Max 30 words.`
+Write the strategy sentence now:`
 
     try {
-      const r = await modelChat([{ role: 'user', content: prompt }], this.ctx.aiConfig, 100)
-      const plan = r.text.trim()
+      const r = await modelChat([{ role: 'user', content: prompt }], this.ctx.aiConfig, 80)
+      // Strip any preamble/thinking — take only the last substantive sentence
+      const raw   = r.text.trim()
+      const plan  = extractFinalSentence(raw)
       this.history.push(`[Plan] ${plan}`)
 
       this.emit('orchestrator_thinking', {
@@ -173,16 +221,19 @@ Respond ONLY in valid JSON (no markdown):
 
     try {
       const r      = await modelChat([{ role: 'user', content: prompt }], this.ctx.aiConfig, 400)
-      const clean  = r.text.replace(/```json|```/g, '').trim()
-      const parsed = JSON.parse(clean) as OrchestratorDecision
+      const parsed = parseDecision(r.text) as OrchestratorDecision | null
+      if (!parsed?.decision) throw new Error('no decision')
+
+      // Clean thinking field from any preamble too
+      if (parsed.thinking) parsed.thinking = extractFinalSentence(parsed.thinking)
 
       this.history.push(`[${stage}] ${summary} → ${parsed.decision}: ${parsed.thinking}`)
       this.emit('orchestrator_thinking', { stage, thinking: parsed.thinking, decision: parsed.decision })
       return parsed
     } catch {
-      // Fallback: always proceed
       const fallback: OrchestratorDecision = { decision: 'proceed', thinking: '继续执行下一阶段' }
       this.history.push(`[${stage}] ${summary} → proceed (fallback)`)
+      this.emit('orchestrator_thinking', { stage, thinking: fallback.thinking, decision: 'proceed' })
       return fallback
     }
   }

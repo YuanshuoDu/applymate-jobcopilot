@@ -751,6 +751,65 @@ function OrchestratorChatPanel({
   )
 }
 
+// ── Smart message renderer ────────────────────────────────────────────────────
+
+function SmartMessage({ text, color }: { text: string; color?: string }) {
+  const lines = text.split('\n').filter(l => l.trim())
+
+  // Detect if message has list items (lines starting with -, •, *, numbers)
+  const listLines = lines.filter(l => /^[-•*·]\s/.test(l.trim()) || /^\d+\.\s/.test(l.trim()))
+  const hasList   = listLines.length >= 2
+
+  // Detect if single line with inline formatting
+  const renderInline = (s: string) =>
+    s.replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>')
+     .replace(/`(.+?)`/g, '<code style="background:rgba(0,0,0,0.1);padding:1px 4px;border-radius:3px;font-size:10px">$1</code>')
+
+  if (hasList) {
+    // Render as structured list
+    const items: React.ReactNode[] = []
+    for (const line of lines) {
+      const isBullet = /^[-•*·]\s/.test(line.trim())
+      const isNum    = /^\d+\.\s/.test(line.trim())
+      if (isBullet || isNum) {
+        const content = line.trim().replace(/^[-•*·\d.]\s+/, '')
+        items.push(
+          <div key={items.length} style={{ display: 'flex', gap: 6, alignItems: 'flex-start', marginBottom: 2 }}>
+            <span style={{ flexShrink: 0, color: 'inherit', opacity: 0.6, marginTop: 1 }}>{isNum ? `${items.length + 1}.` : '•'}</span>
+            <span dangerouslySetInnerHTML={{ __html: renderInline(content) }} />
+          </div>
+        )
+      } else {
+        // Non-list line (header/intro)
+        items.push(
+          <div key={items.length} style={{ marginBottom: 4, fontWeight: 500 }}
+            dangerouslySetInnerHTML={{ __html: renderInline(line.trim()) }} />
+        )
+      }
+    }
+    return <div style={{ fontSize: 11, color: color ?? 'var(--text)', lineHeight: 1.7, fontFamily: 'inherit' }}>{items}</div>
+  }
+
+  // Multi-line plain text
+  if (lines.length > 1) {
+    return (
+      <div style={{ fontSize: 11, color: color ?? 'var(--text)', lineHeight: 1.7, fontFamily: 'monospace' }}>
+        {lines.map((l, i) => (
+          <div key={i} dangerouslySetInnerHTML={{ __html: renderInline(l) }} />
+        ))}
+      </div>
+    )
+  }
+
+  // Single line
+  return (
+    <span
+      style={{ fontSize: 11, color: color ?? 'var(--text)', lineHeight: 1.6, fontFamily: 'monospace' }}
+      dangerouslySetInnerHTML={{ __html: renderInline(text) }}
+    />
+  )
+}
+
 // ── Unified Stream (Claude-style: chat + execution in one panel) ──────────────
 
 function UnifiedStream({
@@ -846,7 +905,14 @@ function UnifiedStream({
         }
       }
       if (full.trim()) {
-        log.push({ type: 'orchestrator_thinking', message: full.replace(/^ACTION:.+$/gm, '').trim(), time: new Date() })
+        // Strip ACTION lines, clean thinking preamble
+        const cleaned = full.replace(/^ACTION:.+$/gm, '').trim()
+        // Extract from first meaningful line (skip "Let me..." etc.)
+        const lines = cleaned.split('\n').filter(l => l.trim())
+        const thinkPfx = ['let me', 'i need', 'i will', 'sure,', 'okay,', 'as an']
+        const msgLines = lines.filter(l => !thinkPfx.some(p => l.toLowerCase().trim().startsWith(p)))
+        const message = (msgLines.length > 0 ? msgLines : lines).join('\n').trim()
+        log.push({ type: 'orchestrator_thinking', message, time: new Date() })
       }
     } catch (err) {
       toast.error('Chat failed', (err as Error).message)
@@ -999,21 +1065,25 @@ function UnifiedStream({
               // Apply ready cards (inline in stream)
               if (entry.type === 'info' && entry.message.includes('queued for manual')) return null
 
-              // Default entry
+              // Default entry — use SmartMessage for intelligent formatting
+              const indent = entry.type === 'agent_observation' ? 16 : entry.type === 'agent_plan' ? 8 : 0
               return (
                 <div key={i} style={{
                   display: 'flex', gap: 8, alignItems: 'flex-start',
-                  padding: `1px 0 1px ${entry.type === 'agent_observation' ? 16 : 0}px`,
+                  padding: `2px 0`,
+                  paddingLeft: indent,
                   background: entry.type === 'agent_plan' ? 'rgba(79,70,229,0.03)' : 'transparent',
                   borderLeft: entry.type === 'agent_plan' ? '2px solid rgba(129,140,248,0.3)' : 'none',
-                  paddingLeft: entry.type === 'agent_plan' ? 8 : (entry.type === 'agent_observation' ? 16 : 0),
                 }}>
-                  <span style={{ fontSize: 9, color: 'var(--text-muted)', flexShrink: 0, paddingTop: 2, fontVariantNumeric: 'tabular-nums', minWidth: 56 }}>
+                  <span style={{ fontSize: 9, color: 'var(--text-muted)', flexShrink: 0, paddingTop: 3, fontVariantNumeric: 'tabular-nums', minWidth: 58 }}>
                     {entry.time.toLocaleTimeString('en', { hour: '2-digit', minute: '2-digit', second: '2-digit' })}
                   </span>
-                  <span style={{ fontSize: 11, color: entryColor(entry), lineHeight: 1.6, fontFamily: 'monospace' }}>
-                    {entryPrefix(entry)}{entry.message}
-                  </span>
+                  <div style={{ flex: 1, minWidth: 0 }}>
+                    {entryPrefix(entry) && (
+                      <span style={{ fontSize: 11, color: entryColor(entry), fontFamily: 'monospace' }}>{entryPrefix(entry)}</span>
+                    )}
+                    <SmartMessage text={entry.message} color={entryColor(entry)} />
+                  </div>
                 </div>
               )
             })}

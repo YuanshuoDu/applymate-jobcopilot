@@ -27,7 +27,7 @@ import { stageOk, stageFail } from '../types'
 
 export async function runScout(ctx: PipelineCtx): Promise<StageResult<ScoutOutput>> {
   const t0 = Date.now()
-  const { agentCfg, userId } = ctx
+  const { agentCfg, userId, emit } = ctx
 
   try {
     // ── Phase A: Autonomous discovery ─────────────────────────────────────────
@@ -95,15 +95,43 @@ export async function runScout(ctx: PipelineCtx): Promise<StageResult<ScoutOutpu
     const todayStart = new Date()
     todayStart.setUTCHours(0, 0, 0, 0)
 
+    // Build location filter set (normalised to lowercase keywords)
+    const locationSet = agentCfg.targetLocations.length > 0
+      ? new Set(agentCfg.targetLocations.map(l => l.toLowerCase().trim()))
+      : null   // null = no location filter
+
     const candidates = allSaved.filter(job => {
       const nameLower = job.company.toLowerCase().trim()
 
       if (excludeSet.has(nameLower)) return false
-      if (prioritySet.has(nameLower)) return true   // always process priority
+      if (prioritySet.has(nameLower)) return true   // priority always passes
+
+      // Location filter (soft match: job.location contains any target location keyword)
+      if (locationSet) {
+        const jobLoc = (job.location ?? '').toLowerCase()
+        // Allow if location is unset (no location data on job) OR location matches any target
+        const locationMatch = !job.location ||
+          [...locationSet].some(loc => jobLoc.includes(loc) || loc.includes(jobLoc.split(',')[0]?.trim() ?? ''))
+        if (!locationMatch) {
+          // Emit skip for visibility
+          ctx.emit('job_skip', { jobId: job.id, company: job.company, role: job.role, reason: `地点不匹配 (${job.location} ≠ ${agentCfg.targetLocations.join('/')})` })
+          return false
+        }
+      }
+
       if (job.score !== null && job.updatedAt >= todayStart) return false  // already scored today
 
       return true
     })
+
+    // Emit observation about location filtering
+    if (locationSet && allSaved.length > candidates.length) {
+      const filtered = allSaved.length - candidates.length
+      ctx.emit('agent_observation', {
+        role: 'scout',
+        observation: `📍 地点过滤：${allSaved.length} 个已保存职位中，${filtered} 个不匹配 [${agentCfg.targetLocations.join(', ')}]，已排除`,
+      })
+    }
 
     const jobs = candidates.slice(0, agentCfg.dailyLimit)
 

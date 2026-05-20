@@ -145,35 +145,49 @@ export function acceptAnalyze(result: StageResult<AnalyzeOutput>): AcceptResult 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 function buildScorePrompt(resumeText: string, job: Job): string {
-  return `You are an expert ATS analyzer. Score this resume against this job posting.
-Return ONLY valid JSON — no markdown, no preamble.
+  return `You are an expert ATS analyzer. Score this resume-job fit.
 
-RESUME:
-${resumeText.slice(0, 2500)}
+IMPORTANT: Output ONLY the JSON object below. No explanation, no preamble, no markdown fences.
+
+RESUME (excerpt):
+${resumeText.slice(0, 2000)}
 
 JOB: ${job.role} at ${job.company}${job.location ? ` (${job.location})` : ''}
-${job.description ? `DESCRIPTION:\n${job.description.slice(0, 1200)}` : ''}
+${job.description ? `DESCRIPTION:\n${job.description.slice(0, 1000)}` : '(no description — score based on role/company only)'}
 
-JSON format:
-{
-  "score": <integer 0-100>,
-  "matchedKeywords": [<up to 6 strings>],
-  "missingKeywords": [<up to 4 strings>],
-  "recommendation": "<one actionable sentence to improve this application>"
-}`
+Output this exact JSON structure:
+{"score":75,"matchedKeywords":["skill1","skill2"],"missingKeywords":["skill3"],"recommendation":"One actionable sentence."}
+
+Now output the JSON for this specific job:`
 }
 
 function parseScoreResult(raw: string): Omit<ScoredJob, 'job'> {
   try {
-    const json   = stripFences(raw)
-    const result = JSON.parse(json)
+    const stripped = stripFences(raw)
+    // Find JSON object robustly (handles thinking preamble from non-Claude models)
+    const start  = stripped.indexOf('{')
+    const end    = stripped.lastIndexOf('}')
+    if (start === -1 || end === -1) throw new Error('no JSON')
+    const result = JSON.parse(stripped.slice(start, end + 1))
+
+    const score = Math.min(100, Math.max(0, Number(result.score) || 0))
+    // If score parsed as 0 but looks like there's valid content, check for number in text
+    let finalScore = score
+    if (score === 0) {
+      const numMatch = stripped.match(/"score"\s*:\s*(\d+)/)
+      if (numMatch) finalScore = Math.min(100, Math.max(0, Number(numMatch[1])))
+    }
+
     return {
-      score:           Math.min(100, Math.max(0, Number(result.score) || 0)),
+      score:           finalScore,
       matchedKeywords: Array.isArray(result.matchedKeywords) ? result.matchedKeywords : [],
       missingKeywords: Array.isArray(result.missingKeywords) ? result.missingKeywords : [],
       recommendation:  typeof result.recommendation === 'string' ? result.recommendation : '',
     }
   } catch {
-    return { score: 0, matchedKeywords: [], missingKeywords: [], recommendation: '' }
+    // Last resort: try to extract score from plain text (e.g. "Score: 72%")
+    const scoreMatch = raw.match(/\bscore[:\s]+(\d{1,3})/i)
+    const score = scoreMatch ? Math.min(100, Math.max(0, Number(scoreMatch[1]))) : 0
+    return { score, matchedKeywords: [], missingKeywords: [], recommendation: '' }
   }
 }
