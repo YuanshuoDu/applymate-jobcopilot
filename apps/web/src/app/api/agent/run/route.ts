@@ -29,6 +29,9 @@ export async function GET(req: NextRequest) {
   const prep = await prepareAiRoute(req, 'agent')
   if ('error' in prep) return prep.error
 
+  // autonomous=true → never pause, make all decisions automatically
+  const autonomous = req.nextUrl.searchParams.get('autonomous') === 'true'
+
   return sseResponse(async emit => {
     const agentCfg = await db.agentConfig.findUnique({ where: { userId: prep.userId } })
     if (!agentCfg) return emit('error', { message: 'Agent not configured. Save settings first.' })
@@ -48,7 +51,8 @@ export async function GET(req: NextRequest) {
       roleConfigs,
       resumeText: resumeToText(resume.content as unknown as ResumeContent).slice(0, 2500),
       resumeContent: resume.content as unknown as ResumeContent,
-      aiConfig: prep.cfg,
+      aiConfig:  prep.cfg,
+      autonomous,
       emit,
     }
 

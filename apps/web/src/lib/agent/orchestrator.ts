@@ -1,304 +1,331 @@
 /**
- * OrchestratorAgent — Master Agent Harness
+ * OrchestratorAgent — True LLM-Driven Harness
  *
- * Acts as the "brain" that coordinates all 6 SubAgents.
- * Implements the Plan → Dispatch → Evaluate → Fix → Retry loop,
- * similar to how Claude Code's harness manages sub-agents.
+ * Inspired by Claude Code's harness architecture:
+ *   • Every decision is made by an LLM (not hardcoded if/else)
+ *   • Questions truly pause the pipeline via DB queue + polling
+ *   • Autonomous mode: all decisions made automatically, never asks user
+ *   • Fix strategies are suggested by the LLM based on failure context
  *
- * Architecture:
- *
- *   OrchestratorAgent
- *     ├── plan()          — LLM decides strategy before starting
- *     ├── dispatch()      — runs a SubAgent stage
- *     ├── evaluate()      — LLM checks if output is good enough
- *     ├── diagnose()      — LLM identifies WHY a stage failed
- *     ├── fix()           — applies a fix to ctx/params
- *     └── decide()        — LLM decides: retry / skip / abort
- *
- * Retry policies per stage:
- *   scout:    3 attempts — broaden search on retry
- *   analyst:  2 attempts — fallback model on retry
- *   writer:   2 attempts — simpler prompt on retry
- *   reviewer: 1 attempt  — deterministic, no retry
- *   executor: 3 attempts — backoff retry
- *   auditor:  2 attempts — skip Gmail on retry
+ * Decision loop per stage:
+ *   1. Stage runs and returns output
+ *   2. Orchestrator LLM analyzes output in context
+ *   3. LLM decides: proceed | retry(fix) | ask_user | abort
+ *   4. If ask_user:
+ *      - autonomous=true → auto-select best option, continue
+ *      - autonomous=false → write to DB, emit SSE, POLL for answer (true pause)
+ *   5. Apply decision and continue or retry
  */
 
-import { modelChat }     from '@/lib/model-router'
+import { modelChat }        from '@/lib/model-router'
+import { db }               from '@/lib/db'
 import type { PipelineCtx } from './types'
 
-// ── Event types emitted by Orchestrator ───────────────────────────────────────
+// ── Types ─────────────────────────────────────────────────────────────────────
 
-export type OrchestratorEvent =
-  | 'orchestrator_plan'
-  | 'orchestrator_dispatch'
-  | 'orchestrator_evaluate'
-  | 'orchestrator_fix'
-  | 'orchestrator_retry'
-  | 'orchestrator_decision'
-  | 'orchestrator_complete'
-
-// ── Retry state per stage ─────────────────────────────────────────────────────
-
-export interface StageAttempt {
-  stage:    string
-  attempt:  number
-  maxRetries: number
-  lastError?: string
-  lastResult?: unknown
+export interface OrchestratorDecision {
+  decision:     'proceed' | 'retry' | 'ask_user' | 'abort'
+  thinking:     string
+  // ask_user fields
+  ask_question?: string
+  ask_options?:  Array<{ label: string; value: string; action?: { field: string; value: unknown } }>
+  // retry fields
+  retry_fix?:    Record<string, unknown>
 }
 
-export interface OrchestratorState {
-  userId:        string
-  attempts:      Record<string, StageAttempt>
-  ctxOverrides:  Partial<PipelineCtx['agentCfg']>   // Orchestrator-applied patches
-  skipStages:    Set<string>
-  aborted:       boolean
-  planSummary:   string
+export interface QuestionOption {
+  label:   string
+  value:   string
+  action?: { field: string; value: unknown }
 }
 
-// ── Orchestrator LLM calls ────────────────────────────────────────────────────
-
-async function llmDecide(prompt: string, ctx: PipelineCtx): Promise<string> {
-  try {
-    const result = await modelChat(
-      [{ role: 'user', content: prompt }],
-      ctx.aiConfig,
-      200,
-    )
-    return result.text.trim()
-  } catch {
-    return 'continue'
-  }
-}
-
-// ── Main OrchestratorAgent ────────────────────────────────────────────────────
+// ── OrchestratorAgent ─────────────────────────────────────────────────────────
 
 export class OrchestratorAgent {
-  private ctx:   PipelineCtx
-  private state: OrchestratorState
-  private emit:  PipelineCtx['emit']
+  private ctx:        PipelineCtx
+  private emit:       PipelineCtx['emit']
+  private runId:      string
+  private autonomous: boolean
+  private history:    string[] = []
 
-  constructor(ctx: PipelineCtx) {
-    this.ctx   = ctx
-    this.emit  = ctx.emit
-    this.state = {
-      userId:       ctx.userId,
-      attempts:     {},
-      ctxOverrides: {},
-      skipStages:   new Set(),
-      aborted:      false,
-      planSummary:  '',
-    }
+  constructor(ctx: PipelineCtx, autonomous = false) {
+    this.ctx        = ctx
+    this.emit       = ctx.emit
+    this.runId      = `run_${Date.now()}`
+    this.autonomous = autonomous
   }
 
-  // ── Plan: Orchestrator decides strategy before starting ─────────────────────
+  // ── Retry tracking (lightweight, used by pipeline retry loops) ──────────────
 
-  async plan(): Promise<void> {
-    const { agentCfg } = this.ctx
-    const hasJobs      = agentCfg.targetRoles.length > 0
-    const hasSalary    = (agentCfg as any).salaryMin > 0
+  private attempts: Record<string, { attempt: number; maxRetries: number; lastError?: string }> = {}
 
-    const planPrompt = `You are the OrchestratorAgent managing an automated job application pipeline.
-
-User configuration:
-- Target roles: ${agentCfg.targetRoles.slice(0, 5).join(', ') || 'not set (will process saved jobs only)'}
-- Target locations: ${agentCfg.targetLocations.slice(0, 3).join(', ') || 'any'}
-- Min match score: ${agentCfg.minMatchScore}%
-- Auto-apply: ${agentCfg.autoApply ? 'YES' : 'NO (manual review)'}
-- Cover letter: ${agentCfg.autoCoverLetter ? 'YES' : 'NO'}
-- Daily limit: ${agentCfg.dailyLimit}
-- Salary range: ${hasSalary ? `${(agentCfg as any).salaryMin}–${(agentCfg as any).salaryMax}€` : 'not specified'}
-
-Write a ONE-sentence strategy for this pipeline run. Focus on what the user should expect.
-Be specific. Max 25 words.`
-
-    const plan = await llmDecide(planPrompt, this.ctx)
-    this.state.planSummary = plan
-
-    this.emit('orchestrator_plan', {
-      plan,
-      config: {
-        roles:     agentCfg.targetRoles.slice(0, 3),
-        threshold: agentCfg.minMatchScore,
-        autoCL:    agentCfg.autoCoverLetter,
-        limit:     agentCfg.dailyLimit,
-      },
-    })
-  }
-
-  // ── Dispatch: run a stage, tracking attempts ─────────────────────────────────
-
-  beginStage(stage: string, maxRetries: number): StageAttempt {
-    this.state.attempts[stage] = {
-      stage, attempt: 0, maxRetries,
-    }
-    return this.state.attempts[stage]
+  beginStage(stage: string, maxRetries: number) {
+    this.attempts[stage] = { attempt: 0, maxRetries }
   }
 
   nextAttempt(stage: string): number {
-    const s = this.state.attempts[stage]
+    const s = this.attempts[stage]
     if (!s) return 1
     s.attempt++
     return s.attempt
   }
 
   isExhausted(stage: string): boolean {
-    const s = this.state.attempts[stage]
-    if (!s) return false
-    return s.attempt >= s.maxRetries
+    const s = this.attempts[stage]
+    return s ? s.attempt >= s.maxRetries : false
   }
 
-  recordFailure(stage: string, error: string): void {
-    const s = this.state.attempts[stage]
+  recordFailure(stage: string, error: string) {
+    const s = this.attempts[stage]
     if (s) s.lastError = error
   }
 
-  // ── Evaluate: is the stage output good enough? ───────────────────────────────
-
-  async evaluateScout(jobCount: number): Promise<{ ok: boolean; fix?: string }> {
-    if (jobCount === 0) {
-      return {
-        ok:  false,
-        fix: 'no_jobs_found',
-      }
-    }
-    if (jobCount < 3 && this.ctx.agentCfg.targetRoles.length > 0) {
-      return {
-        ok:  false,
-        fix: 'too_few_jobs',
-      }
-    }
-    return { ok: true }
+  emitRetry(stage: string, attempt: number, maxRetries: number, reason: string) {
+    this.emit('orchestrator_retry', {
+      stage, attempt, maxRetries, reason,
+      message: `🔄 Orchestrator 重试 ${stage}（${attempt}/${maxRetries}）：${reason}`,
+    })
+    this.history.push(`[Retry/${stage}] attempt ${attempt}: ${reason}`)
   }
 
-  async evaluateAnalyst(scoredCount: number, failedCount: number, total: number): Promise<{ ok: boolean; fix?: string }> {
-    if (scoredCount === 0 && total > 0) {
-      return { ok: false, fix: 'all_scoring_failed' }
-    }
-    if (failedCount > total * 0.5) {
-      return { ok: false, fix: 'too_many_scoring_failures' }
-    }
-    return { ok: true }
-  }
-
-  // ── Diagnose & Fix ────────────────────────────────────────────────────────────
-
-  applyFix(stage: string, fix: string): void {
-    const overrides = this.state.ctxOverrides
-
-    switch (fix) {
-      // Scout fixes
-      case 'no_jobs_found':
-        this.emit('orchestrator_fix', {
-          stage, fix,
-          message: '没有找到职位。正在调整：降低每日上限要求，扩大地点搜索范围…',
-        })
-        // Relax: increase max results buffer by expanding daily limit temporarily
-        overrides.dailyLimit = Math.min((this.ctx.agentCfg.dailyLimit ?? 10) * 2, 50)
-        break
-
-      case 'too_few_jobs':
-        this.emit('orchestrator_fix', {
-          stage, fix,
-          message: `职位数量偏少（< 3）。建议：在 Jobs 页面手动保存更多职位，或添加更多目标职位类型。`,
-        })
-        break
-
-      // Analyst fixes
-      case 'all_scoring_failed':
-        this.emit('orchestrator_fix', {
-          stage, fix,
-          message: '所有职位评分失败（可能是 AI API 异常）。正在切换到备用模型重试…',
-        })
-        // Override analyst model to haiku (lighter, faster)
-        if (!overrides.model) overrides.model = 'claude-haiku-4-5-20251001'
-        break
-
-      case 'too_many_scoring_failures':
-        this.emit('orchestrator_fix', {
-          stage, fix,
-          message: `超过 50% 的职位评分失败。正在切换备用模型并降低 throttle 间隔…`,
-        })
-        overrides.model = 'claude-haiku-4-5-20251001'
-        break
-
-      default:
-        this.emit('orchestrator_fix', {
-          stage, fix,
-          message: `检测到问题（${fix}），尝试使用默认参数重试…`,
-        })
-    }
-
-    // Merge overrides into ctx agentCfg
-    Object.assign(this.ctx.agentCfg, overrides)
-  }
-
-  // ── Decide: retry / skip / abort after exhausted retries ────────────────────
-
-  async decideOnExhaustion(
-    stage:   string,
-    error:   string,
-    context: { jobsProcessed: number },
-  ): Promise<'skip' | 'abort'> {
-
-    // Critical stages: if they fail completely, abort is safer
-    const criticalStages = ['scout', 'analyst']
-    if (criticalStages.includes(stage) && context.jobsProcessed === 0) {
-      this.emit('orchestrator_decision', {
-        stage,
-        decision: 'abort',
-        reason:   `${stage} 阶段在 ${this.state.attempts[stage]?.maxRetries ?? 1} 次重试后仍然失败（${error}）。无法继续流水线。`,
-      })
-      this.state.aborted = true
+  async decideOnExhaustion(stage: string, error: string, context: { jobsProcessed: number }): Promise<'skip' | 'abort'> {
+    const critical = ['scout', 'analyst']
+    if (critical.includes(stage) && context.jobsProcessed === 0) {
+      this.abort(stage, error)
       return 'abort'
     }
-
-    // Non-critical stages: skip and continue
     this.emit('orchestrator_decision', {
-      stage,
-      decision: 'skip',
-      reason:   `${stage} 阶段失败，但已有 ${context.jobsProcessed} 个职位处理中。跳过此阶段，继续流水线。`,
+      stage, decision: 'skip',
+      reason: `${stage} 重试耗尽，跳过继续（已处理 ${context.jobsProcessed} 个职位）`,
     })
-    this.state.skipStages.add(stage)
     return 'skip'
   }
 
-  shouldSkip(stage: string): boolean {
-    return this.state.skipStages.has(stage)
+  // ── Plan: LLM generates opening strategy ──────────────────────────────────
+
+  async plan(): Promise<string> {
+    const { agentCfg } = this.ctx
+    const prompt = `You are an OrchestratorAgent coordinating a job application pipeline.
+
+User setup:
+- Target roles: ${agentCfg.targetRoles.slice(0, 5).join(', ') || '(not set — will process saved jobs)'}
+- Locations: ${agentCfg.targetLocations.slice(0, 3).join(', ') || 'any'}
+- Min match score: ${agentCfg.minMatchScore}%
+- Auto-apply: ${agentCfg.autoApply ? 'ON' : 'OFF (manual queue)'}
+- Cover letter: ${agentCfg.autoCoverLetter ? 'ON' : 'OFF'}
+- Daily limit: ${agentCfg.dailyLimit} jobs
+- Mode: ${this.autonomous ? 'AUTONOMOUS (no user prompts)' : 'INTERACTIVE (will ask when needed)'}
+
+Write ONE sentence describing your strategy for this run. Be specific and actionable. Max 30 words.`
+
+    try {
+      const r = await modelChat([{ role: 'user', content: prompt }], this.ctx.aiConfig, 100)
+      const plan = r.text.trim()
+      this.history.push(`[Plan] ${plan}`)
+
+      this.emit('orchestrator_thinking', {
+        thinking: plan,
+        autonomous: this.autonomous,
+      })
+      return plan
+    } catch {
+      const fallback = `处理 ${agentCfg.targetRoles.length > 0 ? agentCfg.targetRoles.slice(0,2).join('/') : '已保存'} 职位，阈值 ${agentCfg.minMatchScore}%`
+      this.emit('orchestrator_thinking', { thinking: fallback, autonomous: this.autonomous })
+      return fallback
+    }
   }
 
-  isAborted(): boolean {
-    return this.state.aborted
+  // ── Evaluate: LLM decides what to do after a stage ────────────────────────
+
+  async evaluate(
+    stage:   string,
+    summary: string,
+    metrics: Record<string, unknown>,
+  ): Promise<OrchestratorDecision> {
+    const { agentCfg } = this.ctx
+    const historyStr   = this.history.slice(-4).join('\n')
+
+    const prompt = `You are an OrchestratorAgent. A pipeline stage just completed.
+
+Stage: ${stage}
+Summary: ${summary}
+Metrics: ${JSON.stringify(metrics)}
+User config: minScore=${agentCfg.minMatchScore}%, dailyLimit=${agentCfg.dailyLimit}, autoApply=${agentCfg.autoApply}
+Recent history:
+${historyStr}
+Autonomous mode: ${this.autonomous}
+
+Decide what to do next. Rules:
+- Only ask_user if something truly needs human judgment (e.g., all jobs skipped, major config conflict)
+- In autonomous mode: NEVER ask_user, always proceed or retry with sensible defaults
+- retry only if there's a concrete fix to apply (e.g., model switch, param change)
+- abort only if pipeline literally cannot continue (0 jobs + 0 from any source)
+- proceed in all other cases
+
+Respond ONLY in valid JSON (no markdown):
+{
+  "decision": "proceed" | "retry" | "ask_user" | "abort",
+  "thinking": "<one sentence why>",
+  "ask_question": "<question for user, only if ask_user>",
+  "ask_options": [{"label":"...", "value":"..."}],
+  "retry_fix": {"field": "value"}
+}`
+
+    try {
+      const r      = await modelChat([{ role: 'user', content: prompt }], this.ctx.aiConfig, 400)
+      const clean  = r.text.replace(/```json|```/g, '').trim()
+      const parsed = JSON.parse(clean) as OrchestratorDecision
+
+      this.history.push(`[${stage}] ${summary} → ${parsed.decision}: ${parsed.thinking}`)
+      this.emit('orchestrator_thinking', { stage, thinking: parsed.thinking, decision: parsed.decision })
+      return parsed
+    } catch {
+      // Fallback: always proceed
+      const fallback: OrchestratorDecision = { decision: 'proceed', thinking: '继续执行下一阶段' }
+      this.history.push(`[${stage}] ${summary} → proceed (fallback)`)
+      return fallback
+    }
   }
 
-  // ── Emit retry notification ──────────────────────────────────────────────────
+  // ── Ask: true pause, waits for user answer ────────────────────────────────
 
-  emitRetry(stage: string, attempt: number, maxRetries: number, reason: string): void {
-    this.emit('orchestrator_retry', {
-      stage,
-      attempt,
-      maxRetries,
-      reason,
-      message: `🔄 Orchestrator 正在重试 ${stage}（第 ${attempt}/${maxRetries} 次）：${reason}`,
+  async ask(
+    stage:    string,
+    question: string,
+    options:  QuestionOption[],
+  ): Promise<string> {
+    if (this.autonomous) {
+      // Never block in autonomous mode — pick first option
+      const chosen = options[0]?.value ?? 'continue'
+      this.emit('orchestrator_thinking', {
+        stage,
+        thinking: `[自主模式] 自动选择：「${options[0]?.label ?? chosen}」`,
+      })
+      this.history.push(`[Ask/${stage}] AUTO: ${chosen}`)
+      return chosen
+    }
+
+    // Write to DB for frontend to pick up
+    const q = await db.agentRunQuestion.create({
+      data: {
+        userId:    this.ctx.userId,
+        runId:     this.runId,
+        stage,
+        question,
+        options:   options as object[],
+        autonomous: false,
+      },
     })
+
+    // Emit the question — frontend will show it prominently and enable the input
+    this.emit('orchestrator_question', {
+      id:       q.id,
+      stage,
+      question,
+      options,
+    })
+
+    // True pause: poll DB until answered or 5 min timeout
+    const deadline = Date.now() + 5 * 60_000
+    while (Date.now() < deadline) {
+      await new Promise(r => setTimeout(r, 2000)) // poll every 2s
+      const updated = await db.agentRunQuestion.findUnique({
+        where:  { id: q.id },
+        select: { answer: true },
+      })
+      if (updated?.answer) {
+        this.emit('orchestrator_answer_received', {
+          id:       q.id,
+          stage,
+          answer:   updated.answer,
+          label:    options.find(o => o.value === updated.answer)?.label ?? updated.answer,
+        })
+        this.history.push(`[Ask/${stage}] USER: ${updated.answer}`)
+        return updated.answer
+      }
+    }
+
+    // Timeout — pick first option as default
+    const fallback = options[0]?.value ?? 'continue'
+    this.emit('orchestrator_thinking', {
+      stage, thinking: `等待超时，自动选择默认选项：「${options[0]?.label ?? fallback}」`,
+    })
+    return fallback
   }
 
-  // ── Complete ─────────────────────────────────────────────────────────────────
+  // ── Apply fix from retry decision ──────────────────────────────────────────
+
+  applyFix(fix: string | Record<string, unknown>, stage: string): void {
+    if (typeof fix === 'string') {
+      const named: Record<string, Record<string, unknown>> = {
+        'no_jobs_found':              { dailyLimit: Math.min((this.ctx.agentCfg.dailyLimit ?? 10) * 2, 50) },
+        'all_scoring_failed':         { model: 'claude-haiku-4-5-20251001' },
+        'too_many_scoring_failures':  { model: 'claude-haiku-4-5-20251001' },
+      }
+      const resolved = named[fix]
+      if (resolved) { this.applyFix(resolved, stage) }
+      else {
+        this.emit('orchestrator_fix', { stage, fix, message: `🔧 Orchestrator 检测到问题 [${stage}]：${fix}，尝试重试…` })
+        this.history.push(`[Fix/${stage}] ${fix}`)
+      }
+      return
+    }
+    const changes: string[] = []
+    for (const [key, value] of Object.entries(fix)) {
+      if (value !== undefined) {
+        (this.ctx.agentCfg as any)[key] = value
+        changes.push(`${key}=${JSON.stringify(value)}`)
+      }
+    }
+    if (changes.length > 0) {
+      this.emit('orchestrator_fix', {
+        stage, fix: changes.join(', '),
+        message: `🔧 Orchestrator 修复 [${stage}]：${changes.join('，')}`,
+      })
+      this.history.push(`[Fix/${stage}] ${changes.join(', ')}`)
+    }
+  }
+
+  // ── Handle option action (config update) ──────────────────────────────────
+
+  async applyOptionAction(answer: string, options: QuestionOption[]): Promise<void> {
+    const opt = options.find(o => o.value === answer)
+    if (!opt?.action) return
+    const { field, value } = opt.action
+    if (field === '_navigate') return // handled by frontend
+    try {
+      await db.agentConfig.updateMany({
+        where: { userId: this.ctx.userId },
+        data:  { [field]: value } as any,
+      });
+      (this.ctx.agentCfg as any)[field] = value
+    } catch { /* non-fatal */ }
+  }
+
+  // ── Abort ─────────────────────────────────────────────────────────────────
+
+  abort(stage: string, reason: string): void {
+    this.emit('orchestrator_decision', {
+      stage, decision: 'abort',
+      reason: `🛑 Orchestrator 中止 [${stage}]：${reason}`,
+    })
+    this.history.push(`[ABORT/${stage}] ${reason}`)
+  }
+
+  // ── Complete ──────────────────────────────────────────────────────────────
 
   complete(report: { processed: number; applied: number; pending: number; skipped: number }): void {
-    const retriesTotal = Object.values(this.state.attempts)
-      .reduce((sum, a) => sum + Math.max(0, a.attempt - 1), 0)
-
+    const retries = this.history.filter(h => h.includes('[Fix/')).length
     this.emit('orchestrator_complete', {
-      planSummary:    this.state.planSummary,
-      skippedStages:  [...this.state.skipStages],
-      totalRetries:   retriesTotal,
-      overridesApplied: Object.keys(this.state.ctxOverrides).length > 0,
+      thinking:   this.history.slice(-3).join(' → '),
+      totalRetries: retries,
+      autonomous:   this.autonomous,
       report,
-      message: retriesTotal > 0
-        ? `Orchestrator 本次运行共重试 ${retriesTotal} 次${this.state.skipStages.size > 0 ? `，跳过了 ${[...this.state.skipStages].join('、')} 阶段` : ''}。`
-        : '所有阶段均一次成功完成，无需干预。',
+      message: retries > 0
+        ? `✅ Orchestrator 完成（共修复 ${retries} 次）`
+        : `✅ Orchestrator 完成，所有阶段顺利通过`,
     })
   }
+
+  get runIdentifier() { return this.runId }
 }

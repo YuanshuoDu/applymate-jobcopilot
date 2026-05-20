@@ -49,6 +49,7 @@ export interface PipelineCtx {
   resumeText:    string         // plain-text resume, truncated to 2500 chars
   resumeContent: ResumeContent  // structured resume for cover-letter generation
   aiConfig:      AiConfig       // fallback global config
+  autonomous:    boolean        // true = never pause, make all decisions automatically
   emit:          (event: string, data: unknown) => void
 }
 

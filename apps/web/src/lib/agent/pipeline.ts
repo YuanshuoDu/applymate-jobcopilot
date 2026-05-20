@@ -37,7 +37,7 @@ function emitRole(ctx: PipelineCtx, role: string, event: 'start' | 'done', extra
 
 export async function runPipeline(ctx: PipelineCtx): Promise<RunReport> {
   const t0   = Date.now()
-  const orch = new OrchestratorAgent(ctx)
+  const orch = new OrchestratorAgent(ctx, ctx.autonomous ?? false)
   const { emit } = ctx
 
   // ── Orchestrator: plan ─────────────────────────────────────────────────────
@@ -75,16 +75,26 @@ export async function runPipeline(ctx: PipelineCtx): Promise<RunReport> {
       continue
     }
 
-    const eval1 = await orch.evaluateScout(s1.data!.jobs.length)
-    if (!eval1.ok) {
-      if (attempt === 1 && eval1.fix) {
-        orch.applyFix('scout', eval1.fix)
-        if (!orch.isExhausted('scout')) continue
-      }
-      emit('orchestrator_decision', {
-        stage: 'scout', decision: 'continue_anyway',
-        reason: `Scout 结果不理想但仍可继续（${s1.data!.jobs.length} 个职位）`,
-      })
+    // True LLM evaluation of scout output
+    const dec1 = await orch.evaluate('scout',
+      `Found ${s1.data!.jobs.length} jobs (${scoutDiscovered} new discovered)`,
+      { jobCount: s1.data!.jobs.length, discovered: scoutDiscovered, targetRoles: ctx.agentCfg.targetRoles.length },
+    )
+    if (dec1.decision === 'abort') {
+      emit('done', emptyReport(Date.now() - t0)); return emptyReport(Date.now() - t0)
+    }
+    if (dec1.decision === 'ask_user' && dec1.ask_question) {
+      const answer = await orch.ask('scout', dec1.ask_question, dec1.ask_options ?? [
+        { label: '继续', value: 'continue' },
+        { label: '中止', value: 'abort' },
+      ])
+      if (answer === 'abort') { emit('done', emptyReport(Date.now() - t0)); return emptyReport(Date.now() - t0) }
+      // Apply option action if any
+      await orch.applyOptionAction(answer, dec1.ask_options ?? [])
+    }
+    if (dec1.decision === 'retry' && dec1.retry_fix && attempt < 3) {
+      orch.applyFix(dec1.retry_fix, 'scout')
+      continue
     }
 
     scoutedJobs     = s1.data!.jobs
@@ -144,9 +154,28 @@ export async function runPipeline(ctx: PipelineCtx): Promise<RunReport> {
       continue
     }
 
-    const eval2 = await orch.evaluateAnalyst(s2.data.scoredJobs.length, s2.data.failed ?? 0, scoutedJobs.length)
-    if (!eval2.ok && attempt < 2) {
-      orch.applyFix('analyst', eval2.fix ?? 'all_scoring_failed')
+    // True LLM evaluation of analyst output
+    const avgScoreEval = s2.data.scoredJobs.length
+      ? Math.round(s2.data.scoredJobs.reduce((s, j) => s + j.score, 0) / s2.data.scoredJobs.length)
+      : 0
+    const aboveEval = s2.data.scoredJobs.filter(j => j.score >= ctx.agentCfg.minMatchScore).length
+    const dec2 = await orch.evaluate('analyst',
+      `Scored ${s2.data.scoredJobs.length}/${scoutedJobs.length} jobs, avg ${avgScoreEval}%, ${aboveEval} above threshold, ${s2.data.failed ?? 0} failed`,
+      { scored: s2.data.scoredJobs.length, avgScore: avgScoreEval, aboveThreshold: aboveEval, failed: s2.data.failed ?? 0, threshold: ctx.agentCfg.minMatchScore },
+    )
+    if (dec2.decision === 'abort') {
+      emit('done', emptyReport(Date.now() - t0)); return emptyReport(Date.now() - t0)
+    }
+    if (dec2.decision === 'ask_user' && dec2.ask_question) {
+      const answer = await orch.ask('analyst', dec2.ask_question, dec2.ask_options ?? [
+        { label: '继续', value: 'continue' },
+        { label: '降低阈值 5%', value: 'lower', action: { field: 'minMatchScore', value: Math.max(40, ctx.agentCfg.minMatchScore - 5) } },
+      ])
+      await orch.applyOptionAction(answer, dec2.ask_options ?? [])
+      if (answer === 'abort') { emit('done', emptyReport(Date.now() - t0)); return emptyReport(Date.now() - t0) }
+    }
+    if (dec2.decision === 'retry' && dec2.retry_fix && attempt < 2) {
+      orch.applyFix(dec2.retry_fix, 'analyst')
       continue
     }
 
@@ -391,31 +420,21 @@ export async function runPipeline(ctx: PipelineCtx): Promise<RunReport> {
     await recordRoleRun(ctx.userId, 'auditor', { count: report.processed, durationMs: s6.metrics.durationMs, summary: auditorSummary }).catch(() => {})
     await runCustomAgents(ctx, scoutedJobs, 'auditor')
 
-    // ── Post-run proactive questions ─────────────────────────────────────────
-    if (report.applied === 0 && report.pending > 0 && !ctx.agentCfg.autoApply) {
-      emit('agent_question', {
-        role: 'auditor', questionId: 'enable_auto_apply',
-        question: `本次有 ${report.pending} 个职位进入待审核队列，但没有进入申请队列（autoApply=false）。是否开启自动投递，下次直接进入申请队列？`,
-        options: [
-          { label: '🚀 开启自动投递', value: 'enable', action: { field: 'autoApply', value: true } },
-          { label: '👁 保持人工审核', value: 'keep' },
-        ],
-      })
-    }
-
+    // ── Post-run LLM evaluation (true Orchestrator decision, not hardcoded) ──
     const postRunAvg = scoredJobs.length
       ? Math.round(scoredJobs.reduce((s, j) => s + j.score, 0) / scoredJobs.length)
       : 0
-    if (postRunAvg > 0 && postRunAvg < ctx.agentCfg.minMatchScore && report.processed > 3) {
-      emit('agent_question', {
-        role: 'auditor', questionId: 'low_avg_score',
-        question: `本次 ${report.processed} 个职位平均评分仅 ${postRunAvg}%，均低于阈值 ${ctx.agentCfg.minMatchScore}%。`,
-        options: [
-          { label: `⬇ 降低阈值至 ${Math.max(40, postRunAvg - 5)}%`, value: 'lower', action: { field: 'minMatchScore', value: Math.max(40, postRunAvg - 5) } },
-          { label: '✏ 去完善简历', value: 'resume', action: { field: '_navigate', value: 'resume' } },
-          { label: '📊 保持不变', value: 'keep' },
-        ],
-      })
+    const decPost = await orch.evaluate('post-run',
+      `Complete: ${report.processed} processed, ${report.applied} queued for apply, ${report.pending} pending review, ${report.skipped} skipped, avg score ${postRunAvg}%`,
+      { processed: report.processed, applied: report.applied, pending: report.pending, skipped: report.skipped, avgScore: postRunAvg, threshold: ctx.agentCfg.minMatchScore, autoApply: ctx.agentCfg.autoApply },
+    )
+    if (decPost.decision === 'ask_user' && decPost.ask_question) {
+      const options = decPost.ask_options ?? [{ label: '✓ 了解', value: 'ok' }]
+      const answer  = await orch.ask('post-run', decPost.ask_question, options)
+      await orch.applyOptionAction(answer, options)
+    }
+    if (decPost.decision === 'retry' && decPost.retry_fix) {
+      orch.applyFix(decPost.retry_fix, 'post-run')
     }
 
     // ── Orchestrator complete ─────────────────────────────────────────────────

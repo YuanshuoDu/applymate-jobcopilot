@@ -84,9 +84,10 @@ model User {
   jobs           Job[]
   resumes        Resume[]
   activities     Activity[]
-  agentConfig      AgentConfig?
-  agentRoles       AgentRole[]
-  customAgentRoles CustomAgentRole[]
+  agentConfig        AgentConfig?
+  agentRoles         AgentRole[]
+  customAgentRoles   CustomAgentRole[]
+  agentRunQuestions  AgentRunQuestion[]
   resumeVersions ResumeVersion[]
   directions     Direction[]
   coverLetters   CoverLetter[]
@@ -279,6 +280,28 @@ model AgentRole {
 
   @@unique([userId, role])
   @@index([userId])
+}
+
+// ─────────────────────────────────────────────
+// Agent Run Questions (pause/resume queue)
+// ─────────────────────────────────────────────
+
+model AgentRunQuestion {
+  id          String    @id @default(cuid())
+  userId      String
+  runId       String
+  stage       String
+  question    String    @db.Text
+  options     Json
+  answer      String?
+  autonomous  Boolean   @default(false)
+  createdAt   DateTime  @default(now())
+  answeredAt  DateTime?
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, runId])
+  @@index([userId, runId, answeredAt])
 }
 
 // ─────────────────────────────────────────────

@@ -67,6 +67,8 @@ interface LogEntry {
            | 'agent_question' | 'question_answered'
            | 'orchestrator_plan' | 'orchestrator_fix' | 'orchestrator_retry'
            | 'orchestrator_decision' | 'orchestrator_complete'
+           | 'orchestrator_thinking' | 'orchestrator_question' | 'orchestrator_answer'
+           | 'user_message'
   message:   string
   score?:    number
   time:      Date
@@ -749,6 +751,321 @@ function OrchestratorChatPanel({
   )
 }
 
+// ── Unified Stream (Claude-style: chat + execution in one panel) ──────────────
+
+function UnifiedStream({
+  log, running, done, summary, applyQueue, waitingQuestion,
+  savedCount, pendingCount, hasRun, autonomousMode,
+  onStart, onStop, onAnswerQuestion, onAnswerOrchestrator, onApplied, onChatAction,
+}: {
+  log: LogEntry[]; running: boolean; done: boolean
+  summary: { processed: number; applied: number; pending: number; skipped: number; failed: number } | null
+  applyQueue: ApplyReadyJob[]
+  waitingQuestion: { id: string; question: string; options: QuestionOption[] } | null
+  savedCount: number; pendingCount: number; hasRun: boolean; autonomousMode: boolean
+  onStart: () => void; onStop: () => void
+  onAnswerQuestion: (entry: LogEntry, opt: QuestionOption) => void
+  onAnswerOrchestrator: (questionId: string, answer: string, options?: QuestionOption[]) => void
+  onApplied: (jobId: string, job: ApplyReadyJob) => void
+  onChatAction: (action: { type: string; [k: string]: unknown }) => void
+}) {
+  const streamEndRef   = useRef<HTMLDivElement>(null)
+  const inputRef       = useRef<HTMLTextAreaElement>(null)
+  const [chatInput, setChatInput] = useState('')
+  const [chatLoading, setChatLoading] = useState(false)
+  const toast = useToast()
+
+  useEffect(() => { streamEndRef.current?.scrollIntoView({ behavior: 'smooth' }) }, [log])
+
+  // Merged stream: convert log entries + apply queue into render items
+  const isEmpty = log.length === 0 && applyQueue.length === 0
+
+  function entryColor(e: LogEntry): string {
+    if (e.type === 'done')                 return 'var(--c-success)'
+    if (e.type === 'error')                return 'var(--c-danger)'
+    if (e.type === 'role_start')           return 'var(--primary)'
+    if (e.type === 'role_done')            return 'var(--c-success)'
+    if (e.type === 'job_skip')             return 'var(--text-muted)'
+    if (e.type === 'agent_plan')           return '#818cf8'
+    if (e.type === 'agent_action')         return 'var(--text)'
+    if (e.type === 'agent_observation')    return '#94a3b8'
+    if (e.type === 'agent_reflect')        return 'var(--c-success)'
+    if (e.type === 'orchestrator_thinking')return '#f59e0b'
+    if (e.type === 'orchestrator_fix')     return '#f97316'
+    if (e.type === 'orchestrator_retry')   return '#fb923c'
+    if (e.type === 'orchestrator_decision')return '#a78bfa'
+    if (e.type === 'orchestrator_complete')return '#34d399'
+    if (e.type === 'orchestrator_answer')  return 'var(--c-success)'
+    if (e.type === 'user_message')         return '#fff'
+    if (e.score != null)                   return e.score >= 80 ? 'var(--c-success)' : e.score >= 60 ? 'var(--c-warning)' : 'var(--text-muted)'
+    return 'var(--text)'
+  }
+
+  function entryPrefix(e: LogEntry): string {
+    if (e.type === 'agent_plan')            return '📋 '
+    if (e.type === 'agent_action')          return '⚡ '
+    if (e.type === 'agent_observation')     return '   👁 '
+    if (e.type === 'agent_reflect')         return '💬 '
+    if (e.type === 'orchestrator_fix')      return '🔧 '
+    if (e.type === 'orchestrator_retry')    return '🔄 '
+    if (e.type === 'orchestrator_decision') return '⚖ '
+    return ''
+  }
+
+  async function sendChat(text: string) {
+    if (!text.trim() || chatLoading) return
+    setChatInput('')
+    setChatLoading(true)
+
+    // Add user message to stream
+    log.push({ type: 'user_message', message: text, time: new Date() })
+
+    try {
+      const res = await fetch('/api/agent/chat', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ messages: [{ role: 'user', content: text }] }),
+      })
+      const reader = res.body!.getReader()
+      const decoder = new TextDecoder()
+      let buf = '', full = '', event = ''
+      while (true) {
+        const { done, value } = await reader.read()
+        if (done) break
+        buf += decoder.decode(value, { stream: true })
+        const lines = buf.split('\n'); buf = lines.pop() ?? ''
+        for (const line of lines) {
+          if (line.startsWith('event: '))      event = line.slice(7).trim()
+          else if (line.startsWith('data: ')) {
+            try {
+              const d = JSON.parse(line.slice(6))
+              if (event === 'text' && d.delta) { full += d.delta }
+              else if (event === 'action')     { onChatAction(d) }
+            } catch { }
+            event = ''
+          }
+        }
+      }
+      if (full.trim()) {
+        log.push({ type: 'orchestrator_thinking', message: full.replace(/^ACTION:.+$/gm, '').trim(), time: new Date() })
+      }
+    } catch (err) {
+      toast.error('Chat failed', (err as Error).message)
+    } finally {
+      setChatLoading(false)
+    }
+  }
+
+  const chips = [
+    savedCount > 0 && !hasRun ? `▶ 开始分析 ${savedCount} 个职位` : null,
+    pendingCount > 0           ? `📋 审核 ${pendingCount} 个待定` : null,
+    '📊 分析求职进展',
+    '⚙️ 把最低匹配分设为 80%',
+  ].filter(Boolean) as string[]
+
+  const applyPending = applyQueue.filter(j => !j.url?.startsWith('_applied'))
+
+  return (
+    <div style={{ flex: 1, display: 'flex', flexDirection: 'column', overflow: 'hidden', background: 'var(--bg)' }}>
+      {/* Stream header */}
+      <div style={{ padding: '8px 16px', borderBottom: '0.5px solid var(--border)', display: 'flex', alignItems: 'center', justifyContent: 'space-between', background: 'var(--bg-secondary)', flexShrink: 0 }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+          <span style={{ fontSize: 12, fontWeight: 600 }}>
+            {autonomousMode ? '🤖 自主模式' : '💬 交互模式'} · Orchestrator Stream
+          </span>
+          {running && <span style={{ fontSize: 10, color: 'var(--c-success)', display: 'flex', alignItems: 'center', gap: 4 }}>
+            <span style={{ width: 6, height: 6, borderRadius: '50%', background: 'var(--c-success)', display: 'inline-block', animation: 'pulse 1.2s ease-in-out infinite' }} />运行中
+          </span>}
+          {waitingQuestion && !autonomousMode && (
+            <span style={{ fontSize: 10, color: '#f59e0b', fontWeight: 600, animation: 'pulse 1.5s ease-in-out infinite' }}>⏸ 等待你的回答</span>
+          )}
+          {applyPending.length > 0 && <span style={{ fontSize: 10, padding: '1px 7px', borderRadius: 999, background: 'var(--primary)', color: '#fff', fontWeight: 600 }}>{applyPending.length} 待申请</span>}
+        </div>
+        <div style={{ display: 'flex', gap: 6 }}>
+          {summary && <span style={{ fontSize: 10, color: 'var(--text-muted)' }}>{summary.processed}处理 · {summary.applied}队列 · {summary.pending}待审核</span>}
+          {!running && <Btn small variant="primary" onClick={onStart}>{done ? '↻ 再次运行' : '▶ 开始运行'}</Btn>}
+          {running  && <Btn small variant="danger"  onClick={onStop}>⏹ 停止</Btn>}
+        </div>
+      </div>
+
+      {/* Unified scrollable stream */}
+      <div style={{ flex: 1, overflowY: 'auto', padding: '12px 16px', display: 'flex', flexDirection: 'column', gap: 4 }}>
+        {isEmpty ? (
+          <div style={{ flex: 1, display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', gap: 16, padding: '40px 0' }}>
+            <div style={{ fontSize: 40 }}>🧠</div>
+            <div style={{ textAlign: 'center' }}>
+              <div style={{ fontSize: 13, fontWeight: 600, color: 'var(--text)', marginBottom: 6 }}>Orchestrator 待命</div>
+              <div style={{ fontSize: 11, color: 'var(--text-muted)', marginBottom: 12 }}>
+                {autonomousMode ? '自主模式：运行时 Orchestrator 自动决策' : '交互模式：Orchestrator 遇到问题会暂停询问你'}
+              </div>
+            </div>
+            {/* Suggestion chips */}
+            <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, justifyContent: 'center', maxWidth: 400 }}>
+              {chips.map((s, i) => (
+                <button key={i} onClick={() => sendChat(s)} style={{
+                  padding: '6px 12px', fontSize: 11, borderRadius: 999,
+                  border: '0.5px solid var(--border)', background: 'var(--bg-secondary)',
+                  cursor: 'pointer', color: 'var(--text)', fontFamily: 'inherit',
+                }}>{s}</button>
+              ))}
+            </div>
+          </div>
+        ) : (
+          <>
+            {log.map((entry, i) => {
+              // User message bubble
+              if (entry.type === 'user_message') {
+                return (
+                  <div key={i} style={{ display: 'flex', justifyContent: 'flex-end', margin: '4px 0' }}>
+                    <div style={{ maxWidth: '70%', padding: '8px 12px', borderRadius: '12px 12px 3px 12px', background: 'var(--primary)', color: '#fff', fontSize: 12, lineHeight: 1.6 }}>
+                      {entry.message}
+                    </div>
+                  </div>
+                )
+              }
+
+              // Orchestrator true-pause question (pipeline is WAITING)
+              if (entry.type === 'orchestrator_question') {
+                return (
+                  <div key={i} style={{ margin: '8px 0', borderRadius: 10, border: `2px solid ${entry.answered ? 'rgba(52,211,153,0.3)' : 'rgba(245,158,11,0.5)'}`, background: entry.answered ? 'rgba(52,211,153,0.05)' : 'rgba(245,158,11,0.06)', overflow: 'hidden' }}>
+                    <div style={{ padding: '8px 14px', background: entry.answered ? 'rgba(52,211,153,0.08)' : 'rgba(245,158,11,0.10)', display: 'flex', alignItems: 'center', gap: 8, borderBottom: '0.5px solid rgba(245,158,11,0.2)' }}>
+                      <span style={{ fontSize: 16 }}>{entry.answered ? '✅' : '⏸'}</span>
+                      <span style={{ fontSize: 12, fontWeight: 600, color: entry.answered ? '#34d399' : '#f59e0b' }}>
+                        {entry.answered ? 'Orchestrator 已获得回答，继续执行' : '🧠 Orchestrator 暂停 — 需要你的决定'}
+                      </span>
+                      <span style={{ fontSize: 9, color: 'var(--text-muted)', marginLeft: 'auto' }}>
+                        {entry.time.toLocaleTimeString('en', { hour: '2-digit', minute: '2-digit', second: '2-digit' })}
+                      </span>
+                    </div>
+                    <div style={{ padding: '10px 14px' }}>
+                      <p style={{ fontSize: 12, color: 'var(--text)', lineHeight: 1.7, margin: '0 0 10px' }}>{entry.question}</p>
+                      {!entry.answered && (
+                        <div style={{ display: 'flex', flexWrap: 'wrap', gap: 7 }}>
+                          {entry.options?.map((opt, oi) => (
+                            <button key={oi} onClick={() => onAnswerOrchestrator(entry.questionId!, opt.value, entry.options)} style={{
+                              padding: '7px 14px', borderRadius: 8, cursor: 'pointer',
+                              border: '1.5px solid rgba(245,158,11,0.5)', background: 'rgba(245,158,11,0.10)',
+                              color: '#92400e', fontSize: 12, fontFamily: 'inherit', fontWeight: 500,
+                              transition: 'all 0.15s',
+                            }}
+                              onMouseEnter={e => { (e.currentTarget as HTMLButtonElement).style.background = 'rgba(245,158,11,0.25)' }}
+                              onMouseLeave={e => { (e.currentTarget as HTMLButtonElement).style.background = 'rgba(245,158,11,0.10)' }}
+                            >{opt.label}</button>
+                          ))}
+                        </div>
+                      )}
+                    </div>
+                  </div>
+                )
+              }
+
+              // agent_question (non-pausing, advisory)
+              if (entry.type === 'agent_question') {
+                return (
+                  <div key={i} style={{ margin: '4px 0', borderRadius: 8, border: '1px solid rgba(234,179,8,0.3)', background: 'rgba(234,179,8,0.04)', overflow: 'hidden' }}>
+                    <div style={{ padding: '6px 12px', background: 'rgba(234,179,8,0.07)', display: 'flex', alignItems: 'center', gap: 7, borderBottom: '0.5px solid rgba(234,179,8,0.15)' }}>
+                      <span style={{ fontSize: 13 }}>🤔</span>
+                      <span style={{ fontSize: 11, fontWeight: 600, color: '#b45309' }}>Agent 建议</span>
+                      {entry.answered && <span style={{ fontSize: 9, color: 'var(--c-success)', marginLeft: 'auto' }}>✓ 已回答</span>}
+                    </div>
+                    <div style={{ padding: '7px 12px' }}>
+                      <p style={{ fontSize: 11, color: 'var(--text)', lineHeight: 1.6, margin: '0 0 7px' }}>{entry.question}</p>
+                      {!entry.answered && (
+                        <div style={{ display: 'flex', flexWrap: 'wrap', gap: 5 }}>
+                          {entry.options?.map((opt, oi) => (
+                            <button key={oi} onClick={() => onAnswerQuestion(entry, opt)} style={{
+                              padding: '4px 10px', borderRadius: 6, cursor: 'pointer',
+                              border: '1px solid rgba(234,179,8,0.35)', background: 'rgba(234,179,8,0.08)',
+                              color: '#92400e', fontSize: 11, fontFamily: 'inherit', fontWeight: 500,
+                            }}>{opt.label}</button>
+                          ))}
+                        </div>
+                      )}
+                    </div>
+                  </div>
+                )
+              }
+
+              // Orchestrator plan / complete — special banner
+              if (entry.type === 'orchestrator_plan' || entry.type === 'orchestrator_complete') {
+                const isComplete = entry.type === 'orchestrator_complete'
+                return (
+                  <div key={i} style={{ margin: '6px 0', padding: '8px 12px', borderRadius: 8, background: isComplete ? 'rgba(52,211,153,0.08)' : 'rgba(245,158,11,0.06)', border: `1px solid ${isComplete ? 'rgba(52,211,153,0.25)' : 'rgba(245,158,11,0.2)'}`, display: 'flex', alignItems: 'center', gap: 8 }}>
+                    <span style={{ fontSize: 15 }}>{isComplete ? '✅' : '🧠'}</span>
+                    <span style={{ fontSize: 11, color: isComplete ? '#34d399' : '#f59e0b', fontWeight: 500 }}>{entry.message}</span>
+                  </div>
+                )
+              }
+
+              // Apply ready cards (inline in stream)
+              if (entry.type === 'info' && entry.message.includes('queued for manual')) return null
+
+              // Default entry
+              return (
+                <div key={i} style={{
+                  display: 'flex', gap: 8, alignItems: 'flex-start',
+                  padding: `1px 0 1px ${entry.type === 'agent_observation' ? 16 : 0}px`,
+                  background: entry.type === 'agent_plan' ? 'rgba(79,70,229,0.03)' : 'transparent',
+                  borderLeft: entry.type === 'agent_plan' ? '2px solid rgba(129,140,248,0.3)' : 'none',
+                  paddingLeft: entry.type === 'agent_plan' ? 8 : (entry.type === 'agent_observation' ? 16 : 0),
+                }}>
+                  <span style={{ fontSize: 9, color: 'var(--text-muted)', flexShrink: 0, paddingTop: 2, fontVariantNumeric: 'tabular-nums', minWidth: 56 }}>
+                    {entry.time.toLocaleTimeString('en', { hour: '2-digit', minute: '2-digit', second: '2-digit' })}
+                  </span>
+                  <span style={{ fontSize: 11, color: entryColor(entry), lineHeight: 1.6, fontFamily: 'monospace' }}>
+                    {entryPrefix(entry)}{entry.message}
+                  </span>
+                </div>
+              )
+            })}
+
+            {/* Apply Queue inline */}
+            {applyQueue.length > 0 && (
+              <div style={{ margin: '8px 0', borderRadius: 10, border: '1px solid var(--border)', overflow: 'hidden' }}>
+                <div style={{ padding: '8px 14px', background: 'var(--bg-secondary)', borderBottom: '0.5px solid var(--border)', display: 'flex', alignItems: 'center', gap: 8 }}>
+                  <span style={{ fontSize: 14 }}>📋</span>
+                  <span style={{ fontSize: 12, fontWeight: 600 }}>待申请队列</span>
+                  <span style={{ fontSize: 10, padding: '1px 7px', borderRadius: 999, background: 'var(--primary)', color: '#fff', fontWeight: 600 }}>{applyPending.length}</span>
+                  <span style={{ fontSize: 10, color: 'var(--text-muted)', marginLeft: 'auto' }}>点击「立即申请」确认投递</span>
+                </div>
+                {applyQueue.map(job => (
+                  <ApplyJobCard key={job.jobId} job={job} onApplied={(id) => onApplied(id, job)} />
+                ))}
+              </div>
+            )}
+          </>
+        )}
+        <div ref={streamEndRef} />
+      </div>
+
+      {/* Input bar — dual purpose: chat OR answer question */}
+      <div style={{ borderTop: '0.5px solid var(--border)', padding: '10px 14px', background: 'var(--bg-secondary)', flexShrink: 0 }}>
+        {waitingQuestion && !autonomousMode && (
+          <div style={{ marginBottom: 8, padding: '6px 10px', borderRadius: 7, background: 'rgba(245,158,11,0.08)', border: '1px solid rgba(245,158,11,0.25)', fontSize: 11, color: '#b45309' }}>
+            ⏸ Orchestrator 正在等待你回答上方问题，或直接在下方输入指令
+          </div>
+        )}
+        <div style={{ display: 'flex', gap: 8, alignItems: 'flex-end' }}>
+          <textarea
+            ref={inputRef}
+            value={chatInput}
+            onChange={e => setChatInput(e.target.value)}
+            onKeyDown={e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendChat(chatInput) } }}
+            placeholder={waitingQuestion && !autonomousMode
+              ? '回答问题或发送指令给 Orchestrator… (Enter 发送)'
+              : '发送指令给 Orchestrator… (Enter 发送)'}
+            rows={2}
+            style={{ flex: 1, padding: '8px 10px', fontSize: 12, borderRadius: 9, border: '0.5px solid var(--border)', background: 'var(--bg)', color: 'var(--text)', outline: 'none', resize: 'none', fontFamily: 'inherit', lineHeight: 1.5 }}
+          />
+          <button onClick={() => sendChat(chatInput)} disabled={!chatInput.trim() || chatLoading}
+            style={{ padding: '10px 14px', borderRadius: 9, border: 'none', background: (!chatInput.trim() || chatLoading) ? 'var(--border)' : 'var(--primary)', color: '#fff', fontSize: 14, cursor: (!chatInput.trim() || chatLoading) ? 'not-allowed' : 'pointer' }}>
+            {chatLoading ? '…' : '→'}
+          </button>
+        </div>
+      </div>
+    </div>
+  )
+}
+
 // ── Apply Job Card ────────────────────────────────────────────────────────────
 
 function ApplyJobCard({ job, onApplied }: { job: ApplyReadyJob; onApplied: (id: string) => void }) {
@@ -1096,6 +1413,8 @@ export function AgentPlaygroundPage() {
   const [hasRun,        setHasRun]        = useState(false)
   const [showAddModal,  setShowAddModal]  = useState(false)
   const [applyQueue,    setApplyQueue]    = useState<ApplyReadyJob[]>([])
+  const [autonomousMode,setAutonomousMode]= useState(false)
+  const [waitingQuestion, setWaitingQuestion] = useState<{ id: string; question: string; options: QuestionOption[] } | null>(null)
 
   // Pipeline run state
   const [roleStatuses,  setRoleStatuses]  = useState<Record<string, RoleStatus>>(
@@ -1147,7 +1466,8 @@ export function AgentPlaygroundPage() {
     setApplyQueue([])
     setRoleStatuses(Object.fromEntries(BUILTIN_ROLES.map(r => [r.key, 'idle'])) as Record<string, RoleStatus>)
 
-    const es = new EventSource('/api/agent/run')
+    const url = `/api/agent/run${autonomousMode ? '?autonomous=true' : ''}`
+    const es  = new EventSource(url)
     esRef.current = es
 
     es.addEventListener('role_start', e => {
@@ -1184,6 +1504,26 @@ export function AgentPlaygroundPage() {
     es.addEventListener('job_skip', e => {
       const d = JSON.parse(e.data)
       addLog({ role: currentRole ?? 'scout', type: 'job_skip', message: `— ${d.company} · ${d.role}: ${d.reason}`, time: new Date() })
+    })
+
+    es.addEventListener('orchestrator_thinking', e => {
+      const d = JSON.parse(e.data)
+      const modeTag = d.autonomous ? ' [自主模式]' : ''
+      addLog({ type: 'orchestrator_thinking', message: d.thinking + modeTag, time: new Date() })
+    })
+
+    // True pause question — pipeline is waiting for this answer
+    es.addEventListener('orchestrator_question', e => {
+      const d = JSON.parse(e.data) as { id: string; stage: string; question: string; options: QuestionOption[] }
+      setWaitingQuestion({ id: d.id, question: d.question, options: d.options })
+      addLog({ type: 'orchestrator_question', questionId: d.id, question: d.question, options: d.options, answered: false, message: d.question, time: new Date() })
+    })
+
+    es.addEventListener('orchestrator_answer_received', e => {
+      const d = JSON.parse(e.data)
+      setWaitingQuestion(null)
+      setRunLog(prev => prev.map(l => l.questionId === d.id ? { ...l, answered: true } : l))
+      addLog({ type: 'orchestrator_answer', message: `✓ 已回答：${d.label}`, time: new Date() })
     })
 
     es.addEventListener('orchestrator_plan', e => {
@@ -1414,6 +1754,17 @@ export function AgentPlaygroundPage() {
             {globalRunning ? '运行中' : '已暂停'}
           </span>
         </div>
+        {/* Autonomous mode toggle */}
+        <div
+          onClick={() => setAutonomousMode(m => !m)}
+          style={{ display: 'flex', alignItems: 'center', gap: 6, cursor: 'pointer', padding: '4px 10px', borderRadius: 7, background: autonomousMode ? 'rgba(124,58,237,0.12)' : 'var(--bg-secondary)', border: `1px solid ${autonomousMode ? 'rgba(124,58,237,0.35)' : 'var(--border)'}`, transition: 'all 0.2s' }}
+          title={autonomousMode ? '自主模式：Orchestrator 自动决策，不打断你' : '交互模式：Orchestrator 遇到问题会暂停询问你'}
+        >
+          <span style={{ fontSize: 13 }}>{autonomousMode ? '🤖' : '👤'}</span>
+          <span style={{ fontSize: 11, color: autonomousMode ? '#a78bfa' : 'var(--text-muted)', fontWeight: 600 }}>
+            {autonomousMode ? '自主模式' : '交互模式'}
+          </span>
+        </div>
         <Btn variant={globalRunning ? 'danger' : 'primary'} onClick={toggleGlobalRunning}>
           {globalRunning ? '⏸ 暂停 Agent' : '▶ 启用 Agent'}
         </Btn>
@@ -1442,48 +1793,41 @@ export function AgentPlaygroundPage() {
         />
       )}
 
-      {/* Main content: left log + right chat */}
+      {/* Unified Stream — Chat + Execution in one panel (like Claude) */}
       <div style={{ flex: 1, display: 'flex', overflow: 'hidden' }}>
-        {/* Left: Execution Log + Apply Queue */}
-        <div style={{ flex: '0 0 58%', overflow: 'hidden', display: 'flex', flexDirection: 'column' }}>
-          <ExecutionLogPanel
-            log={runLog}
-            running={isRunning}
-            done={runDone}
-            summary={runSummary}
-            onStart={startRun}
-            onStop={stopRun}
-            onAnswerQuestion={handleAnswerQuestion}
-          />
-          {/* Manual Apply Queue */}
-          {applyQueue.length > 0 && (
-            <div style={{ borderTop: '0.5px solid var(--border)', background: 'var(--bg)', flexShrink: 0, maxHeight: 280, overflowY: 'auto' }}>
-              <div style={{ padding: '10px 14px 6px', display: 'flex', alignItems: 'center', gap: 8, position: 'sticky', top: 0, background: 'var(--bg-secondary)', borderBottom: '0.5px solid var(--border)', zIndex: 1 }}>
-                <span style={{ fontSize: 14 }}>📋</span>
-                <span style={{ fontSize: 12, fontWeight: 600 }}>待申请队列</span>
-                <span style={{ fontSize: 10, padding: '1px 7px', borderRadius: 999, background: 'var(--primary)', color: '#fff', fontWeight: 600 }}>{applyQueue.filter(j => !j.url?.startsWith('_applied')).length}</span>
-                <span style={{ fontSize: 10, color: 'var(--text-muted)', marginLeft: 'auto' }}>点击「立即申请」确认投递</span>
-              </div>
-              {applyQueue.map(job => (
-                <ApplyJobCard key={job.jobId} job={job} onApplied={async (jobId) => {
-                  await apiMutate(`/api/jobs/${jobId}/apply`, 'POST', {})
-                  setApplyQueue(prev => prev.map(j => j.jobId === jobId ? { ...j, url: `_applied_${j.url}` } : j))
-                  toast.success('已标记为投递', `${job.company} · ${job.role}`)
-                }} />
-              ))}
-            </div>
-          )}
-        </div>
-
-        {/* Right: Orchestrator Chat */}
-        <div style={{ flex: '0 0 42%', overflow: 'hidden', display: 'flex', flexDirection: 'column' }}>
-          <OrchestratorChatPanel
-            savedCount={savedCount}
-            pendingCount={pendingCount}
-            hasRun={hasRun}
-            onAction={handleChatAction}
-          />
-        </div>
+        <UnifiedStream
+          log={runLog}
+          running={isRunning}
+          done={runDone}
+          summary={runSummary}
+          applyQueue={applyQueue}
+          waitingQuestion={waitingQuestion}
+          savedCount={savedCount}
+          pendingCount={pendingCount}
+          hasRun={hasRun}
+          autonomousMode={autonomousMode}
+          onStart={startRun}
+          onStop={stopRun}
+          onAnswerQuestion={handleAnswerQuestion}
+          onAnswerOrchestrator={async (questionId, answer, options) => {
+            // Post answer to DB so pipeline can continue
+            await apiMutate('/api/agent/answer', 'POST', { questionId, answer })
+            setWaitingQuestion(null)
+            setRunLog(prev => prev.map(l => l.questionId === questionId ? { ...l, answered: true } : l))
+            addLog({ type: 'user_message', message: options?.find(o => o.value === answer)?.label ?? answer, time: new Date() })
+            // Apply config action if present
+            const opt = options?.find(o => o.value === answer)
+            if (opt?.action && opt.action.field !== '_navigate') {
+              await apiMutate('/api/agent', 'PATCH', { [opt.action.field]: opt.action.value })
+            }
+          }}
+          onApplied={async (jobId, job) => {
+            await apiMutate(`/api/jobs/${jobId}/apply`, 'POST', {})
+            setApplyQueue(prev => prev.map(j => j.jobId === jobId ? { ...j, url: `_applied_${j.url}` } : j))
+            toast.success('已标记为投递', `${job.company} · ${job.role}`)
+          }}
+          onChatAction={handleChatAction}
+        />
       </div>
 
       {/* Bottom: Collapsible settings */}
