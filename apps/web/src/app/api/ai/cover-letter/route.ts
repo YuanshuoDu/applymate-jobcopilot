@@ -28,7 +28,19 @@ export async function POST(req: NextRequest) {
   if (!resumeContent) return err('resumeContent is required')
   if (!jobTitle)      return err('jobTitle is required')
   if (!jobCompany)    return err('jobCompany is required')
-  const cfg = prep.cfg
+
+  // Load Writer Agent role config (model + system prompt) for consistency with pipeline
+  const writerRole = await db.agentRole.findFirst({
+    where:  { userId: prep.userId, role: 'writer' },
+    select: { provider: true, model: true, apiKey: true, systemPrompt: true },
+  }).catch(() => null)
+
+  const cfg: import('@/lib/model-router').AiConfig = writerRole
+    ? { provider: writerRole.provider as any, model: writerRole.model, apiKey: writerRole.apiKey ?? undefined }
+    : prep.cfg
+
+  const writerSystemPrompt = writerRole?.systemPrompt
+    ?? 'You are a professional cover letter writer. Output ONLY the cover letter text — no preamble, no meta-commentary, no explanation. Start directly with the greeting.'
 
   const name       = resumeContent.contact?.name ?? 'the applicant'
   const skills     = (resumeContent.skills ?? []).slice(0, 8).join(', ')
@@ -51,11 +63,12 @@ ${jobDescription ? `JD EXCERPT:\n${jobDescription.slice(0, 1500)}` : ''}
 
 Tone: ${toneGuide}
 Structure: ${greeting} | hook | why this role | 2-3 achievements | CTA | Sincerely, / ${name}
-Rules: 250–320 words, no filler like "I am writing to express my interest", quantify achievements.
+Rules: 220–280 words, no filler like "I am writing to express my interest", quantify achievements.
 Return ONLY the cover letter text.`
 
+  // Use Writer Agent's system prompt if configured, otherwise default
   const messages = [
-    { role: 'system' as const, content: 'You are a professional cover letter writer. Output ONLY the cover letter text — no preamble, no meta-commentary, no explanation. Start directly with the greeting.' },
+    { role: 'system' as const, content: writerSystemPrompt },
     { role: 'user' as const, content: prompt },
   ]
 

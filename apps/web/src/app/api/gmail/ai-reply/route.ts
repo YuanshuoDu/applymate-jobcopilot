@@ -8,6 +8,7 @@
 import { NextRequest } from 'next/server'
 import { prepareAiRoute, err, ok } from '@/lib/api-helpers'
 import { modelChat } from '@/lib/model-router'
+import { db } from '@/lib/db'
 
 export async function POST(req: NextRequest) {
   const prep = await prepareAiRoute(req, 'coverLetter')
@@ -16,12 +17,13 @@ export async function POST(req: NextRequest) {
   const body = await req.json().catch(() => null)
   if (!body) return err('Invalid JSON body')
 
-  const { emailBody, subject, senderName, senderEmail, tag } = body as {
+  const { emailBody, subject, senderName, senderEmail, tag, jobId } = body as {
     emailBody:   string
     subject:     string
     senderName:  string
     senderEmail: string
     tag:         string
+    jobId?:      string
   }
 
   if (!subject && !emailBody) return err('subject or emailBody is required')
@@ -58,7 +60,22 @@ Write the reply now:`
 
   try {
     const result = await modelChat([{ role: 'user', content: prompt }], prep.cfg, 600)
-    return ok({ reply: result.text.trim(), hrEmail: senderEmail, hrName: senderName })
+    const reply  = result.text.trim()
+
+    // Log this reply action so Auditor won't draft a duplicate follow-up
+    if (jobId) {
+      await db.activity.create({
+        data: {
+          userId: prep.userId,
+          jobId,
+          type:   'agent_action',
+          text:   `[Gmail] 已为 ${tag} 邮件起草回复（发送至 ${senderEmail}）`,
+          color:  '#7C3AED',
+        },
+      }).catch(() => {})
+    }
+
+    return ok({ reply, hrEmail: senderEmail, hrName: senderName })
   } catch (e) {
     console.error('[gmail/ai-reply] error:', e)
     return err('Failed to generate reply', 500)

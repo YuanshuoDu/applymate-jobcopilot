@@ -5,6 +5,7 @@
 import { NextRequest } from 'next/server'
 import { prepareAiRoute, ok, err } from '@/lib/api-helpers'
 import { modelChat, parseAiJson, type AiConfig } from '@/lib/model-router'
+import { db } from '@/lib/db'
 import type { ResumeContent } from '@/lib/types'
 
 // Fallback providers tried in order when primary model fails
@@ -20,9 +21,9 @@ export async function POST(req: NextRequest) {
   const body = await req.json().catch(() => null)
   if (!body) return err('Invalid JSON body')
 
-  const { resumeContent, jobTitle, jobCompany, jobDescription, keySkills } = body as {
+  const { resumeContent, jobTitle, jobCompany, jobDescription, keySkills, jobId } = body as {
     resumeContent?: ResumeContent; jobTitle?: string; jobCompany?: string
-    jobDescription?: string; keySkills?: string[]
+    jobDescription?: string; keySkills?: string[]; jobId?: string
   }
   if (!jobTitle && !jobDescription) return err('jobTitle or jobDescription is required')
 
@@ -92,9 +93,27 @@ ${jobDescription ? `DESCRIPTION:\n${jobDescription.slice(0, 2000)}` : ''}`
     // are reliable regardless of what casing the AI returned ("summary" vs "Summary").
     const toTitle = (s: string) => s ? s.charAt(0).toUpperCase() + s.slice(1).toLowerCase() : s
 
+    const matchedKeywords = Array.isArray(parsed.matchedKeywords) ? parsed.matchedKeywords as string[] : []
+    const skillsGap       = Array.isArray(parsed.skillsGap) ? parsed.skillsGap as string[] : []
+
+    // Persist to DB when jobId provided — keeps UI score in sync with Agent score
+    if (jobId) {
+      const noteLines: string[] = []
+      if (matchedKeywords.length)  noteLines.push(`✓ ${matchedKeywords.slice(0, 5).join(', ')}`)
+      if (skillsGap.length)        noteLines.push(`✗ 缺失：${skillsGap.slice(0, 4).join(', ')}`)
+      if (parsed.strengthSummary)  noteLines.push(String(parsed.strengthSummary))
+      await db.job.updateMany({
+        where: { id: jobId, userId: prep.userId },
+        data:  {
+          score:        rawScore,
+          analysisNote: noteLines.join(' · ') || null,
+        } as any,
+      }).catch(() => {})
+    }
+
     return ok({
       score:            rawScore,
-      matchedKeywords:  Array.isArray(parsed.matchedKeywords) ? parsed.matchedKeywords as string[] : [],
+      matchedKeywords,
       sectionMatches:   arr(parsed.sectionMatches).map((m: unknown) => {
         const o = m as Record<string, unknown> ?? {}
         return { section: toTitle(String(o.section ?? '')), keywords: arr(o.keywords) as string[], score: Number(o.score) || 0, tip: String(o.tip ?? '') }
@@ -113,7 +132,7 @@ ${jobDescription ? `DESCRIPTION:\n${jobDescription.slice(0, 2000)}` : ''}`
         Object.entries((parsed.sectionTips ?? {}) as Record<string, unknown>)
           .map(([k, v]) => [toTitle(k), String(v)])
       ),
-      skillsGap:        Array.isArray(parsed.skillsGap) ? parsed.skillsGap as string[] : [],
+      skillsGap,
       strengthSummary:  String(parsed.strengthSummary ?? ''),
       _model:           `${cfg.provider}/${cfg.model}`,
     })

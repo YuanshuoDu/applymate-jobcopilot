@@ -211,11 +211,27 @@ async function scanGmailForApplicationReplies(
 
         if (classification === 'rejected') {
           tally.rejected++
-          // Draft follow-up inquiry for rejection
-          await draftRejectionFollowUp(
-            matchedJob, subject, msg.snippet, fromName, fromEmail,
-            emit, userId, ctx,
-          )
+          // Check if user already replied via Gmail UI (avoid duplicate draft)
+          const alreadyReplied = await db.activity.findFirst({
+            where: {
+              userId,
+              jobId: matchedJob.id,
+              type:  'agent_action',
+              text:  { contains: '[Gmail] 已为 rejected' },
+            },
+          }).catch(() => null)
+          if (alreadyReplied) {
+            emit('agent_observation', {
+              role:        'auditor',
+              observation: `↩ ${matchedJob.company} · ${matchedJob.role}：拒信回复已通过 Gmail 页面发送，跳过重复起草`,
+            })
+          } else {
+            // Draft follow-up inquiry for rejection
+            await draftRejectionFollowUp(
+              matchedJob, subject, msg.snippet, fromName, fromEmail,
+              emit, userId, ctx,
+            )
+          }
         }
 
         emit('agent_observation', {

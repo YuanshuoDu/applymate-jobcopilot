@@ -207,7 +207,8 @@ function ApplyBasket({ cart, onRemove, onClose, onJobsUpdated }: {
         const res = await fetch('/api/ai/cover-letter', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ jobTitle: job.role, jobCompany: job.company, jobDescription: job.description }),
+          // Pass jobId so cover-letter route uses Writer Agent's config (model + system prompt)
+          body: JSON.stringify({ jobId: job.id, jobTitle: job.role, jobCompany: job.company, jobDescription: job.description }),
         })
         const data = await res.json()
         if (res.ok && data.coverLetter) {
@@ -512,20 +513,32 @@ function JobDetailDrawer({ job, onClose, onStatusChange, onUpdate, onDelete }: {
       const resumeContent = fullData.content ?? fullData.resume?.content
       if (!resumeContent) { toast.error('Resume empty', 'Your resume has no content'); setScoring(false); return }
 
-      // Score
+      // Score — pass jobId so API persists score+analysisNote directly (stays in sync with Agent)
       const scoreRes = await fetch('/api/ai/score', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ resumeContent, jobTitle: job.role, jobCompany: job.company, jobDescription: job.description.slice(0, 2000) }),
+        body: JSON.stringify({
+          resumeContent, jobId: job.id,
+          jobTitle: job.role, jobCompany: job.company,
+          jobDescription: job.description.slice(0, 2000),
+        }),
       })
       const scoreData = await scoreRes.json()
       if (!scoreRes.ok || scoreData.score == null) { toast.error('Scoring failed', scoreData.error ?? 'AI could not score this job'); setScoring(false); return }
 
-      // Save score
-      const { data, error } = await apiMutate<Job>(`/api/jobs/${job.id}`, 'PATCH', { score: scoreData.score })
+      // Refresh the job — score + analysisNote already persisted by API
+      const { data, error } = await apiMutate<Job>(`/api/jobs/${job.id}`, 'PATCH', {})
       setScoring(false)
       if (error) { toast.error('Save failed', error); return }
-      if (data) { onUpdate(data); toast.success(`Match score: ${scoreData.score}%`) }
+      if (data) {
+        onUpdate(data)
+        const kws = scoreData.matchedKeywords?.slice(0, 3).join(', ')
+        const gap = scoreData.skillsGap?.slice(0, 2).join(', ')
+        toast.success(
+          `Match score: ${scoreData.score}%`,
+          [kws && `✓ ${kws}`, gap && `✗ 缺：${gap}`].filter(Boolean).join('  ')
+        )
+      }
     } catch {
       setScoring(false)
       toast.error('Network error', 'Could not reach AI')
@@ -644,12 +657,36 @@ function JobDetailDrawer({ job, onClose, onStatusChange, onUpdate, onDelete }: {
             </div>
           )}
 
-          {/* Agent Analysis */}
+          {/* Agent Analysis — shows matched/missing keywords from Agent OR manual scoring */}
           {job.analysisNote && (
             <div>
               <div style={{ fontSize: 10, color: 'var(--primary)', fontWeight: 500, marginBottom: 6 }}>AI ANALYSIS</div>
-              <div style={{ fontSize: 11, color: 'var(--text)', lineHeight: 1.7, whiteSpace: 'pre-wrap', background: 'rgba(79,70,229,0.05)', border: '0.5px solid rgba(79,70,229,0.15)', borderRadius: 6, padding: '8px 10px', maxHeight: 200, overflowY: 'auto' }}>
-                {job.analysisNote}
+              <div style={{ background: 'rgba(79,70,229,0.04)', border: '0.5px solid rgba(79,70,229,0.15)', borderRadius: 6, padding: '8px 10px' }}>
+                {job.analysisNote.split(' · ').map((part, i) => {
+                  const isMatch   = part.startsWith('✓')
+                  const isMissing = part.startsWith('✗')
+                  if (isMatch || isMissing) {
+                    const keywords = part.replace(/^[✓✗]\s*(缺失：)?/, '').split(',').map(k => k.trim()).filter(Boolean)
+                    return (
+                      <div key={i} style={{ marginBottom: 5 }}>
+                        <span style={{ fontSize: 9, fontWeight: 600, color: isMatch ? 'var(--c-success)' : 'var(--c-danger)', marginRight: 6 }}>
+                          {isMatch ? '✓ 匹配' : '✗ 缺失'}
+                        </span>
+                        <span style={{ display: 'inline-flex', flexWrap: 'wrap', gap: 3 }}>
+                          {keywords.map((k, j) => (
+                            <span key={j} style={{
+                              fontSize: 9, padding: '1px 6px', borderRadius: 999,
+                              background: isMatch ? 'rgba(5,150,105,0.10)' : 'rgba(239,68,68,0.10)',
+                              color: isMatch ? 'var(--c-success)' : 'var(--c-danger)',
+                              border: `0.5px solid ${isMatch ? 'rgba(5,150,105,0.25)' : 'rgba(239,68,68,0.25)'}`,
+                            }}>{k}</span>
+                          ))}
+                        </span>
+                      </div>
+                    )
+                  }
+                  return <div key={i} style={{ fontSize: 10, color: 'var(--text-muted)', lineHeight: 1.5, marginTop: 3 }}>{part}</div>
+                })}
               </div>
             </div>
           )}
