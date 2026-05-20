@@ -25,6 +25,7 @@ interface SearchMeta {
   totalRaw: number; totalDeduped: number; totalFiltered?: number; durationMs: number
   topSkills?: string[]; salaryContext?: { currency: string; median: number; min: number; max: number } | null
   withHiringManager?: number; cached?: boolean
+  apiKeys?: { rapidapi: boolean; adzuna: boolean; reed: boolean; careerjet: boolean }
 }
 
 const DEFAULT_FILTERS: Filters = {
@@ -486,7 +487,24 @@ export function SmartSearch({ onJobSaved }: { onJobSaved?: () => void }) {
                 <Icon.Search />
               </div>
               <div style={{ fontSize: 15, fontWeight: 600, color: 'var(--text)' }}>No jobs found</div>
-              <div style={{ fontSize: 13, color: 'var(--text-muted)', lineHeight: 1.65 }}>Try broader keywords, a different location,<br />or remove some filters.</div>
+              <div style={{ fontSize: 13, color: 'var(--text-muted)', lineHeight: 1.65 }}>
+                Try broader keywords, a different location, or remove some filters.
+              </div>
+              {/* API key diagnostic — shown when keys are missing */}
+              {meta?.apiKeys && !meta.apiKeys.rapidapi && (
+                <div style={{ marginTop: 8, padding: '10px 16px', background: 'rgba(234,179,8,0.08)', border: '1px solid rgba(234,179,8,0.25)', borderRadius: 8, maxWidth: 340, textAlign: 'left' }}>
+                  <div style={{ fontSize: 11, fontWeight: 600, color: '#b45309', marginBottom: 4 }}>⚠ 搜索 API 未配置</div>
+                  <div style={{ fontSize: 11, color: 'var(--text-muted)', lineHeight: 1.6 }}>
+                    LinkedIn、Indeed、JSearch 等付费源需要 <code style={{ fontSize: 10, background: 'rgba(0,0,0,0.07)', padding: '1px 4px', borderRadius: 3 }}>RAPIDAPI_KEY</code> 环境变量。
+                    当前仅 Remotive 等免费源可用。
+                  </div>
+                </div>
+              )}
+              {meta?.routing && (
+                <div style={{ fontSize: 10, color: 'var(--text-muted)', opacity: 0.6 }}>
+                  路由：{meta.routing} · {meta.durationMs}ms
+                </div>
+              )}
             </div>
           ) : (
             <>

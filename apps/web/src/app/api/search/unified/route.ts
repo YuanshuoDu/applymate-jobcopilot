@@ -1561,10 +1561,32 @@ export async function GET(req: NextRequest) {
   let raw: JobResult[] = jobResults.flatMap(r => r.status === 'fulfilled' ? r.value : [])
   const totalRaw = raw.length
 
-  // ⑥ Smart fallback: if < MIN_RESULTS, try LinkedIn globally
+  // ⑥ Smart fallback A: if < MIN_RESULTS, try LinkedIn globally
   if (raw.length < MIN_RESULTS_FOR_FALLBACK && !decision.sources.find(s => s.id === 'linkedin')) {
     const extra = await tryFallback(raw, q, filters)
     raw = [...raw, ...extra]
+  }
+
+  // ⑥b Zero-result guarantee: if STILL 0 results, try free-tier sources that need no API key.
+  // This ensures search always returns something even when RAPIDAPI_KEY is missing/expired.
+  // Free sources: Remotive (remote jobs), Jobicy (remote jobs), IrishJobs (Ireland RSS).
+  if (raw.length === 0) {
+    const hasRapidKey = !!(process.env.RAPIDAPI_KEY)
+    const freeFallbacks: Array<Promise<JobResult[]>> = [
+      withTimeout(fetchRemotive({ q }, filters), SOURCE_TIMEOUT_MS, []),
+      withTimeout(fetchJobicy({ q, geo: 'worldwide' }, filters), SOURCE_TIMEOUT_MS, []),
+    ]
+    // IrishJobs for Ireland/Dublin searches
+    const isIreland = /\b(ireland|dublin|cork|galway)\b/i.test(q + ' ' + filters.location)
+    if (isIreland) freeFallbacks.push(withTimeout(fetchIrishjobs({ q, location: filters.location || 'ireland' }, filters), SOURCE_TIMEOUT_MS, []))
+
+    const freeResults = (await Promise.allSettled(freeFallbacks)).flatMap(r => r.status === 'fulfilled' ? r.value : [])
+    raw = [...raw, ...freeResults]
+
+    // Log diagnostic if paid APIs were supposed to be used
+    if (!hasRapidKey) {
+      console.warn('[search/unified] RAPIDAPI_KEY not configured — paid sources skipped, using free sources only')
+    }
   }
 
   // ⑦ Score → smart dedup → post-filter → sort
@@ -1575,6 +1597,9 @@ export async function GET(req: NextRequest) {
 
   // ⑧ Build enriched meta
   const withHM = sorted.filter(j => j.hiringManager).length
+  const hasRapidKey  = !!(process.env.RAPIDAPI_KEY)
+  const hasAdzunaKey = !!(process.env.ADZUNA_APP_ID && process.env.ADZUNA_APP_KEY)
+
   const meta = {
     sourcesUsed:       decision.sources.map(s => s.id),
     sourceBreakdown:   buildSourceBreakdown(sorted),
@@ -1592,6 +1617,13 @@ export async function GET(req: NextRequest) {
     salaryContext:     salaryCtx,
     durationMs:        Date.now() - t0,
     cached:            false,
+    // API key status — helps diagnose "no results" issues
+    apiKeys: {
+      rapidapi:  hasRapidKey,
+      adzuna:    hasAdzunaKey,
+      reed:      !!(process.env.REED_API_KEY),
+      careerjet: !!(process.env.CAREERJET_AFFID),
+    },
   }
 
   const response = { jobs: sorted, meta }

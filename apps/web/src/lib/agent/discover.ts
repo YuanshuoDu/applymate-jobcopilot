@@ -294,7 +294,6 @@ export async function discoverJobs(params: DiscoverParams): Promise<DiscoveredJo
       // Third+ source based on geography
       if (isIreland) {
         // NOTE: Adzuna does NOT support IE (404). Use JSearch + IrishJobs RSS instead.
-        // JSearch aggregates Google Jobs, which includes IrishJobs.ie and Jobs.ie
         if (apiKey) fetchTasks.push(fetchJSearch(role, loc || 'Ireland', apiKey))
         // IrishJobs.ie RSS — free, native, best-effort
         fetchTasks.push(fetchIrishJobsRss(role, loc || 'ireland'))
@@ -303,6 +302,12 @@ export async function discoverJobs(params: DiscoverParams): Promise<DiscoveredJo
         fetchTasks.push(fetchAdzuna(role, loc, adzunaId, adzunaKey, country!))
       } else if (apiKey) {
         fetchTasks.push(fetchJSearch(role, loc, apiKey))
+      }
+
+      // Free-source guarantee: if NO paid API keys configured, always include IrishJobs RSS
+      // This ensures Scout always returns at least something even with missing API keys
+      if (!apiKey && !hasAdzuna) {
+        fetchTasks.push(fetchIrishJobsRss(role, loc || 'ireland'))
       }
 
       const allResults = await Promise.all(fetchTasks)
