@@ -1,6 +1,6 @@
 'use client'
 
-import React, { useState, useRef, useCallback } from 'react'
+import React, { useState, useRef, useCallback, useEffect } from 'react'
 import { CompanyLogo, ScorePill, useToast } from '@/components/ui'
 import { apiMutate } from '@/lib/hooks'
 import type { Job, ResumeListItem } from '@/lib/types'
@@ -106,6 +106,56 @@ function fmtPosted(iso?: string | null): string {
   return `${Math.floor(d / 30)}mo ago`
 }
 
+// ── City extraction (NLP) ─────────────────────────────────────────────────────
+
+const CITY_HINTS: Record<string, string> = {
+  dublin: 'Dublin', cork: 'Cork', galway: 'Galway', limerick: 'Limerick',
+  amsterdam: 'Amsterdam', rotterdam: 'Rotterdam', eindhoven: 'Eindhoven', utrecht: 'Utrecht',
+  berlin: 'Berlin', munich: 'Munich', münchen: 'Munich', hamburg: 'Hamburg',
+  frankfurt: 'Frankfurt', cologne: 'Cologne', köln: 'Cologne', stuttgart: 'Stuttgart',
+  vienna: 'Vienna', wien: 'Vienna', graz: 'Graz',
+  zurich: 'Zurich', zürich: 'Zurich', bern: 'Bern', geneva: 'Geneva', basel: 'Basel',
+  london: 'London', manchester: 'Manchester', edinburgh: 'Edinburgh', birmingham: 'Birmingham',
+  paris: 'Paris', lyon: 'Lyon', marseille: 'Marseille',
+  brussels: 'Brussels', antwerp: 'Antwerp',
+  madrid: 'Madrid', barcelona: 'Barcelona', valencia: 'Valencia', seville: 'Seville',
+  rome: 'Rome', milan: 'Milan', turin: 'Turin',
+  warsaw: 'Warsaw', krakow: 'Krakow', wroclaw: 'Wroclaw',
+  stockholm: 'Stockholm', gothenburg: 'Gothenburg',
+  copenhagen: 'Copenhagen', oslo: 'Oslo', helsinki: 'Helsinki',
+  lisbon: 'Lisbon', porto: 'Porto',
+  prague: 'Prague', budapest: 'Budapest', bucharest: 'Bucharest',
+  athens: 'Athens', sofia: 'Sofia', zagreb: 'Zagreb',
+}
+
+function extractCityFromQuery(q: string): { cleanQ: string; city: string } | null {
+  for (const [key, city] of Object.entries(CITY_HINTS)) {
+    const match = q.match(new RegExp(`(?:^|\\s|,)${key}(?:\\s|,|$)`, 'i'))
+    if (match) {
+      const clean = q.replace(new RegExp(`[,\\s]*\\b${key}\\b[,\\s]*`, 'i'), ' ').replace(/\s+/g, ' ').trim()
+      return { cleanQ: clean || q, city }
+    }
+  }
+  return null
+}
+
+// ── Region display helper ─────────────────────────────────────────────────────
+
+const FLAG_MAP: Record<string, string> = {
+  ie: '🇮🇪', gb: '🇬🇧', de: '🇩🇪', at: '🇦🇹', ch: '🇨🇭',
+  nl: '🇳🇱', fr: '🇫🇷', be: '🇧🇪', es: '🇪🇸', it: '🇮🇹',
+  pl: '🇵🇱', se: '🇸🇪', dk: '🇩🇰', no: '🇳🇴', fi: '🇫🇮',
+  pt: '🇵🇹', cz: '🇨🇿', hu: '🇭🇺', ro: '🇷🇴', gr: '🇬🇷',
+}
+
+function parseRoutingFlag(routing: string): string {
+  const m = routing.match(/^([A-Z]{2})\s*→/)
+  if (m) return FLAG_MAP[m[1].toLowerCase()] ?? ''
+  if (/ireland/i.test(routing)) return '🇮🇪'
+  if (/remote|远程/i.test(routing)) return '🌍'
+  return ''
+}
+
 const LS_LAST   = 'applymate_last_search'
 const LS_RECENT = 'applymate_recent_searches'
 
@@ -185,17 +235,27 @@ export function SmartSearch({ onJobSaved }: { onJobSaved?: () => void }) {
   const [recent,      setRecent]      = useState(loadRecent)
   const [searchFocus, setSearchFocus] = useState(false)
 
+  // Track what params were used in the last executed search for stale detection
+  const lastSearchedRef = useRef<{ q: string; filters: Filters } | null>(
+    lastSearch.current ? { q: lastSearch.current.q, filters: lastSearch.current.filters } : null
+  )
+
+  const isStale = searched && !!lastSearchedRef.current && (
+    q.trim() !== lastSearchedRef.current.q ||
+    JSON.stringify(filters) !== JSON.stringify(lastSearchedRef.current.filters)
+  )
+
   function setFilter<K extends keyof Filters>(k: K, v: Filters[K]) { setFilters(p => ({ ...p, [k]: v })) }
 
   const hasFilters = !!(filters.location || filters.remote || filters.jobType || filters.datePosted !== 'any' || filters.experience || filters.salaryMin || filters.salaryMax)
 
   const activePills = ([
-    filters.location  && { key: 'loc',  icon: <Icon.MapPin />,    label: filters.location,  onRemove: () => setFilter('location', '') },
-    filters.remote    && { key: 'rem',  icon: <Icon.Home />,      label: 'Remote only',     onRemove: () => setFilter('remote', false) },
-    filters.jobType   && { key: 'jt',   icon: <Icon.Briefcase />, label: filters.jobType,   onRemove: () => setFilter('jobType', '') },
-    filters.datePosted !== 'any' && { key: 'dp', icon: <Icon.Calendar />, label: filters.datePosted, onRemove: () => setFilter('datePosted', 'any') },
-    filters.experience && { key: 'exp', icon: <Icon.Star />,      label: filters.experience,onRemove: () => setFilter('experience', '') },
-    (filters.salaryMin || filters.salaryMax) && { key: 'sal', icon: <Icon.Dollar />, label: `${filters.salaryMin||'?'}k – ${filters.salaryMax||'?'}k`, onRemove: () => { setFilter('salaryMin', ''); setFilter('salaryMax', '') } },
+    filters.location  && { key: 'loc',  icon: <Icon.MapPin />,    label: filters.location,  onRemove: () => { setFilter('location', ''); if (searched) triggerSearch(q, { ...filters, location: '' }) } },
+    filters.remote    && { key: 'rem',  icon: <Icon.Home />,      label: 'Remote only',     onRemove: () => { setFilter('remote', false); if (searched) triggerSearch(q, { ...filters, remote: false }) } },
+    filters.jobType   && { key: 'jt',   icon: <Icon.Briefcase />, label: filters.jobType,   onRemove: () => { setFilter('jobType', ''); if (searched) triggerSearch(q, { ...filters, jobType: '' }) } },
+    filters.datePosted !== 'any' && { key: 'dp', icon: <Icon.Calendar />, label: filters.datePosted, onRemove: () => { setFilter('datePosted', 'any'); if (searched) triggerSearch(q, { ...filters, datePosted: 'any' }) } },
+    filters.experience && { key: 'exp', icon: <Icon.Star />,      label: filters.experience,onRemove: () => { setFilter('experience', ''); if (searched) triggerSearch(q, { ...filters, experience: '' }) } },
+    (filters.salaryMin || filters.salaryMax) && { key: 'sal', icon: <Icon.Dollar />, label: `${filters.salaryMin||'?'}k – ${filters.salaryMax||'?'}k`, onRemove: () => { setFilter('salaryMin', ''); setFilter('salaryMax', ''); if (searched) triggerSearch(q, { ...filters, salaryMin: '', salaryMax: '' }) } },
   ]).filter(Boolean) as { key: string; icon: React.ReactNode; label: string; onRemove: () => void }[]
 
   const runSearch = useCallback(async (query: string, f: Filters) => {
@@ -215,6 +275,7 @@ export function SmartSearch({ onJobSaved }: { onJobSaved?: () => void }) {
       if (!res.ok) throw new Error(json.error ?? 'Search failed')
       setResults(json.jobs ?? [])
       setMeta(json.meta ?? null)
+      lastSearchedRef.current = { q: query.trim(), filters: f }
       saveLast({ q: query.trim(), filters: f, results: json.jobs ?? [], meta: json.meta ?? null })
       addRecent(query.trim())
       setRecent(loadRecent())
@@ -224,7 +285,36 @@ export function SmartSearch({ onJobSaved }: { onJobSaved?: () => void }) {
     } finally { setSearching(false) }
   }, [toast])
 
-  const doSearch = () => runSearch(q, filters)
+  // triggerSearch: stable reference used by pill removal callbacks
+  const triggerSearch = useCallback((searchQ: string, f: Filters) => {
+    runSearch(searchQ, f)
+  }, [runSearch])
+
+  const doSearch = () => {
+    let searchQ = q.trim()
+    let searchFilters = filters
+
+    // Auto-extract city from query if no location filter is set
+    if (!searchFilters.location.trim() && searchQ) {
+      const extracted = extractCityFromQuery(searchQ)
+      if (extracted) {
+        searchQ = extracted.cleanQ
+        searchFilters = { ...filters, location: extracted.city }
+        setQ(extracted.cleanQ)
+        setFilters(searchFilters)
+        toast.success(`📍 Location detected`, `Searching in ${extracted.city}`)
+      }
+    }
+    runSearch(searchQ, searchFilters)
+  }
+
+  // Close filter panel and auto-apply if stale
+  const toggleFilters = () => {
+    if (showFilters && searched && isStale) {
+      runSearch(q, filters)
+    }
+    setShowFilters(v => !v)
+  }
 
   async function handleSave(r: JobResult) {
     setSavingIds(prev => new Set(prev).add(r.id))
@@ -288,25 +378,30 @@ export function SmartSearch({ onJobSaved }: { onJobSaved?: () => void }) {
           disabled={searching || !q.trim()}
           style={{
             padding: '0 24px', height: 44,
-            background: 'linear-gradient(135deg, #4F46E5 0%, #7C3AED 100%)',
+            background: isStale
+              ? 'linear-gradient(135deg, #059669 0%, #047857 100%)'
+              : 'linear-gradient(135deg, #4F46E5 0%, #7C3AED 100%)',
             color: '#fff', border: 'none', borderRadius: 12,
             fontSize: 13, fontWeight: 700, cursor: searching ? 'not-allowed' : 'pointer',
             opacity: (!q.trim() || searching) ? 0.65 : 1,
-            whiteSpace: 'nowrap', transition: 'all 0.18s',
-            boxShadow: '0 4px 14px rgba(79,70,229,0.40)',
+            whiteSpace: 'nowrap', transition: 'all 0.25s',
+            boxShadow: isStale ? '0 4px 14px rgba(5,150,105,0.45)' : '0 4px 14px rgba(79,70,229,0.40)',
             display: 'flex', alignItems: 'center', gap: 7,
+            animation: isStale && !searching ? 'none' : undefined,
           }}
-          onMouseEnter={e => { if (!searching && q.trim()) e.currentTarget.style.boxShadow = '0 6px 20px rgba(79,70,229,0.55)' }}
-          onMouseLeave={e => { e.currentTarget.style.boxShadow = '0 4px 14px rgba(79,70,229,0.40)' }}
+          onMouseEnter={e => { if (!searching && q.trim()) e.currentTarget.style.boxShadow = isStale ? '0 6px 20px rgba(5,150,105,0.6)' : '0 6px 20px rgba(79,70,229,0.55)' }}
+          onMouseLeave={e => { e.currentTarget.style.boxShadow = isStale ? '0 4px 14px rgba(5,150,105,0.45)' : '0 4px 14px rgba(79,70,229,0.40)' }}
         >
           {searching
             ? <><span style={{ width: 14, height: 14, border: '2px solid rgba(255,255,255,0.3)', borderTopColor: '#fff', borderRadius: '50%', animation: 'spin 0.7s linear infinite', display: 'inline-block' }} /> Searching…</>
-            : <><Icon.Search /> Search</>
+            : isStale
+              ? <><Icon.Search /> Apply Filters</>
+              : <><Icon.Search /> Search</>
           }
         </button>
 
         <button
-          onClick={() => setShowFilters(v => !v)}
+          onClick={toggleFilters}
           style={{
             padding: '0 16px', height: 44, borderRadius: 12, cursor: 'pointer',
             background: showFilters ? 'rgba(79,70,229,0.10)' : 'var(--glass-bg)',
@@ -521,14 +616,28 @@ export function SmartSearch({ onJobSaved }: { onJobSaved?: () => void }) {
                   <span style={{ fontSize: 11, color: 'var(--text-muted)' }}>
                     {meta.sourcesUsed.map(s => SOURCE_STYLE[s]?.label ?? s).join(' · ')}
                   </span>
+                  {/* Region routing badge */}
+                  {meta.routing && (() => {
+                    const flag = parseRoutingFlag(meta.routing)
+                    // Extract region label: "IE → ..." or "Ireland → ..." or "远程 → ..."
+                    const m = meta.routing.match(/^(Ireland|[A-Z]{2}|Remote|[^\s→]+)/)
+                    const label = m?.[1]?.trim() ?? ''
+                    const display = flag || label
+                    if (!display) return null
+                    return (
+                      <span title={meta.routing} style={{ display: 'inline-flex', alignItems: 'center', gap: 4, fontSize: 10, fontWeight: 600, padding: '2px 8px', borderRadius: 999, background: 'rgba(79,70,229,0.08)', color: 'var(--primary)', border: '1px solid rgba(79,70,229,0.15)', cursor: 'help' }}>
+                        {display}
+                      </span>
+                    )
+                  })()}
                   {meta.salaryContext && (
                     <span style={{ display: 'flex', alignItems: 'center', gap: 4, fontSize: 11, color: '#059669', fontWeight: 600, marginLeft: 'auto' }}>
                       <Icon.Dollar />
                       {meta.salaryContext.currency === 'EUR' ? '€' : meta.salaryContext.currency === 'GBP' ? '£' : '$'}{Math.round(meta.salaryContext.median / 1000)}k median
                     </span>
                   )}
-                  <span style={{ fontSize: 10, color: 'var(--text-subtle)' }}>{meta.durationMs}ms{meta.cached ? ' · cached' : ''}</span>
-                  <div style={{ display: 'flex', alignItems: 'center', gap: 5, marginLeft: meta.salaryContext ? 0 : 'auto' }}>
+                  <span style={{ fontSize: 10, color: 'var(--text-subtle)', marginLeft: meta.salaryContext ? 0 : 'auto' }}>{meta.durationMs}ms{meta.cached ? ' · cached' : ''}</span>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 5 }}>
                     <span style={{ fontSize: 10, color: 'var(--text-muted)' }}>Score:</span>
                     <button onClick={() => setSortDir(d => d === 'desc' ? 'asc' : 'desc')} style={{ fontSize: 10, padding: '3px 9px', border: '1px solid var(--border)', borderRadius: 6, background: 'var(--glass-bg)', color: 'var(--text-muted)', cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 3 }}>
                       {sortDir === 'desc' ? <><Icon.ChevronDown /> High first</> : <><Icon.ChevronUp /> Low first</>}

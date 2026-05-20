@@ -1385,6 +1385,23 @@ function scoreJobs(jobs: JobResult[], q: string, f: SearchFilters): JobResult[] 
     if (j.source === 'irishjobs')     s += 3  // native Irish job board — high IE relevance
     if (j.source === 'indeed')        s += 1  // broad market coverage
 
+    // ── Location relevance ───────────────────────────────────────────────────
+    if (f.location) {
+      const filterLocL = f.location.toLowerCase()
+      const jobLocL    = j.location.toLowerCase()
+      if (jobLocL.includes(filterLocL)) {
+        s += 6  // exact city match in location field
+      } else {
+        // Check if this job's location clearly belongs to a different region
+        // Only penalise when location data is present and clearly mismatches
+        const isRemoteJob = j.workArrangement === 'Remote Solely' || j.workArrangement === 'Remote OK'
+          || /\b(remote|anywhere|worldwide)\b/i.test(j.location)
+        if (!isRemoteJob && j.location && j.location.length > 3) {
+          s -= 3  // deprioritise jobs in other regions when user specified a location
+        }
+      }
+    }
+
     return { ...j, score: s }
   })
 }
