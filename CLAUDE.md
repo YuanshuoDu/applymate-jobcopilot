@@ -132,12 +132,96 @@ gh api "repos/YuanshuoDu/applymate-jobcopilot/issues/comments?since=$(date -d '2
 取编号最小的 spec-ready Issue 派单
 ```
 
-**每次派单必须在 @codex 评论里包含：**
-1. 分支命名（`fix/ISSUE_ID-slug` 或 `feat/ISSUE_ID-slug`）
-2. `Closes #N` 要求
-3. Lockfile 纪律提醒
-4. 禁止范围蔓延提醒
-5. 两层 review 提醒（link 到 dev-guide §10）
+**每次派单评论必须包含以下所有内容（缺一不可）：**
+
+### 1. 项目背景（每次都要写，不要偷懒）
+
+说明 ApplyMate 是什么、这个 Issue 解决什么业务问题、它在整个 pipeline 中的位置。例如：
+
+> ApplyMate is a SaaS job application assistant for the European market. We help candidates discover jobs, tailor resumes, and auto-apply — all AI-driven. Currently we pay for 11 RapidAPI subscriptions to discover EU jobs; cost grows linearly with users. This issue implements [X] which lets us [business outcome: e.g. "fetch Lever jobs for free, covering ~30 EU tech employers like Spotify, Klarna, Tier"].
+
+### 2. 任务在 pipeline 中的位置
+
+```
+Discovery (this issue) → Enrichment → Scoring + KEYWORDS → Tailor → Auto-Apply
+```
+
+说明这个任务是 pipeline 哪个阶段、它的输出被谁消费。
+
+### 3. 为什么这个任务重要（业务价值）
+
+- 具体说: 覆盖多少个新雇主？节省多少 LLM 成本？解锁哪个后续功能？
+- 不要说废话如 "this is important for the project"
+
+### 4. 技术实现要点
+
+- 相关文件路径
+- 关键 API endpoint（如果是 ATS source）
+- 要注意的坑
+
+### 5. 必填项（每次）
+
+- 分支命名：`feat/ISSUE_ID-slug`
+- PR 必须包含 `Closes #N` + 两层 AC 表格
+- Lockfile 纪律：改 package.json 前先 stash，干净 worktree 里 pnpm install
+- 范围纪律：只改 Tech Notes 里列出的文件
+- 完成后：`@claude ready for review` + PR link
+
+### 派单 comment 模板
+
+```markdown
+@codex This is your next task.
+
+## Context: What is ApplyMate?
+ApplyMate is a SaaS job application assistant for the **European market**. 
+We help candidates discover matching jobs across 50+ EU sources, AI-tailor 
+their resume per job, generate cover letters, and autonomously submit 
+applications — 24/7 without the user being present.
+
+## Why this task matters
+[Explain the specific business problem this issue solves, e.g.:]
+Today, 100% of our job discovery comes from paid APIs (RapidAPI, ~$200/month).
+This issue implements the [ATS name] source which lets us fetch [N] EU employers
+for free. These jobs come with full descriptions inline — so they skip our 
+enrichment LLM call entirely, saving additional cost.
+
+## Where this fits in our pipeline
+```
+Discovery sources → Job DB → Enrichment → Scoring (1-10 + keywords) → 
+Tailoring → Cover Letter → Auto-Apply (AgentHarness + CloakBrowser)
+```
+This issue is in the **Discovery** stage. Its output (`DiscoveredJob[]`) feeds 
+into the enrichment cascade. Full descriptions returned here skip T1/T2/T3 enrichment.
+
+## What to build
+[One paragraph, plain English, describing what the code needs to do]
+
+## Key technical details
+- File to create: `apps/web/src/lib/agent/sources/{ats}.ts`
+- API endpoint: [exact URL]
+- Rate limit to register: `policies.ts` entry for this ATS host
+- Type to return: `DiscoveredJob[]` (from `../discover.ts`)
+- Test the result: `pnpm --filter web exec tsx apps/web/scripts/scout-one.ts {ats} {slug}`
+
+## Existing code to reuse / not touch
+- Reuse: `acquire()` from `pace/policies.ts`, `stripHtml` pattern from `greenhouse.ts`
+- Do NOT touch: `discover.ts` aggregator (wiring comes in a later issue)
+
+## Branch: `feat/ISSUE_ID-slug`
+**PR:** `Closes #ISSUE_ID` + two-layer AC table (see `docs/scraping-autoapply-dev-guide.md §10`)
+
+**Lockfile rule:** If you modify package.json, run `pnpm install` in a clean 
+worktree (stash all other changes first). No phantom entries.
+
+**Scope rule:** Only files listed in the issue's Tech Notes. Everything else is out of scope.
+
+**Read before starting:**
+- Issue spec (all ACs and Tech Notes)
+- `docs/scraping-autoapply-design.md` §4 (ATS coverage matrix)
+- `apps/web/src/lib/agent/sources/greenhouse.ts` (reference implementation)
+
+Comment `@claude ready for review` when done.
+```
 
 ---
 
