@@ -245,3 +245,16 @@ model AgentRole {
   @@unique([userId, role])
   @@index([userId])
 }
+
+model AtsEmployer {
+  id        Int      @id @default(autoincrement())
+  atsType   String
+  slug      String
+  name      String?
+  firstSeen DateTime @default(now())
+  lastSeen  DateTime @updatedAt
+  jobCount  Int      @default(0)
+
+  @@unique([atsType, slug])
+  @@map("ats_employers")
+}

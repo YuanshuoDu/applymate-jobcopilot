@@ -170,5 +170,5 @@ export interface EnrichedJob {
   employmentType?: string | null
   datePosted?: string | null
   /** Which enrichment tier produced this result */
-  method: "jsonld" | "css" | "llm"
+  method: "t0-ats" | "jsonld" | "css" | "llm"
 }
