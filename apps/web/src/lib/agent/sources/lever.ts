@@ -13,26 +13,10 @@
 
 import type { DiscoveredJob } from "../discover"
 import { acquire } from "../pace/policies"
+import { stripHtml } from "../strip-html"
 
 const BASE = "https://api.lever.co/v0/postings"
 
-/** Strip HTML tags and decode common entities. */
-function stripHtml(html: string): string {
-  return html
-    .replace(/<[^>]+>/g, " ")
-    .replace(/&amp;/g, "&")
-    .replace(/&lt;/g, "<")
-    .replace(/&gt;/g, ">")
-    .replace(/&nbsp;/g, " ")
-    .replace(/&rsquo;/g, "'")
-    .replace(/&lsquo;/g, "'")
-    .replace(/&rdquo;/g, '"')
-    .replace(/&ldquo;/g, '"')
-    .replace(/&mdash;/g, "\u2014")
-    .replace(/&ndash;/g, "\u2013")
-    .replace(/\s+/g, " ")
-    .trim()
-}
 
 interface LeverPosting {
   id:               string

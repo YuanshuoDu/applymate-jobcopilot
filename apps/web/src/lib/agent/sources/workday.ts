@@ -17,6 +17,7 @@
 
 import type { DiscoveredJob } from "../discover"
 import { acquire } from "../pace/policies"
+import { stripHtml } from "../strip-html"
 import type { WorkdayEmployer } from "../registries"
 
 const MAX_JOBS_PER_EMPLOYER = 500
@@ -24,23 +25,6 @@ const PAGE_SIZE = 20
 const REQUEST_TIMEOUT_MS = 15_000
 const USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
 
-/** Strip HTML tags and decode common entities. */
-function stripHtml(html: string): string {
-  return html
-    .replace(/<[^>]+>/g, " ")
-    .replace(/&amp;/g, "&")
-    .replace(/&lt;/g, "<")
-    .replace(/&gt;/g, ">")
-    .replace(/&nbsp;/g, " ")
-    .replace(/&rsquo;/g, "'")
-    .replace(/&lsquo;/g, "'")
-    .replace(/&rdquo;/g, '"')
-    .replace(/&ldquo;/g, '"')
-    .replace(/&mdash;/g, "\u2014")
-    .replace(/&ndash;/g, "\u2013")
-    .replace(/\s+/g, " ")
-    .trim()
-}
 
 // ── CXS API response types ──────────────────────────────────────────────
 
