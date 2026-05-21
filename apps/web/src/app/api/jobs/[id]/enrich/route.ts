@@ -209,19 +209,16 @@ export async function POST(_req: NextRequest, { params }: Params) {
   if (result.description && !job.description) updateData.description = result.description
   if (result.salary      && !job.salary)      updateData.salary      = result.salary
   if (result.logo        && !job.logo)        updateData.logo        = result.logo
+  if (result.hiringManager || result.salaryContext) {
+    updateData.analysisNote = JSON.stringify({
+      hiringManager: result.hiringManager ?? null,
+      salaryContext: result.salaryContext ?? null,
+      enrichedAt:    new Date().toISOString(),
+    })
+  }
 
   if (Object.keys(updateData).length > 0) {
     await db.job.update({ where: { id }, data: updateData })
-  }
-
-  // Store hiring manager + company intel in analysisNote as structured JSON supplement
-  if (result.hiringManager || result.salaryContext) {
-    const enrichNote = JSON.stringify({
-      hiringManager:  result.hiringManager  ?? null,
-      salaryContext:  result.salaryContext  ?? null,
-      enrichedAt:     new Date().toISOString(),
-    })
-    await db.job.update({ where: { id }, data: { analysisNote: enrichNote } as any })
   }
 
   const enrichedJob = await db.job.findUnique({ where: { id } })
