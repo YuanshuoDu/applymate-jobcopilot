@@ -3,11 +3,13 @@
  *
  * Usage:
  *   pnpm --filter web exec tsx scripts/scout-one.ts greenhouse booking
+ *   pnpm --filter web exec tsx scripts/scout-one.ts lever spotify
  *
  * Prints discovered jobs to stdout. No DB writes.
  */
 
 import { fetchGreenhouse } from "../src/lib/agent/sources/greenhouse"
+import { fetchLever } from "../src/lib/agent/sources/lever"
 
 async function main() {
   const args = process.argv.slice(2)
@@ -18,13 +20,17 @@ async function main() {
 
   const [ats, slug] = args
 
-  if (ats !== "greenhouse") {
-    console.error(`Unknown ATS: ${ats}. Supported: greenhouse`)
+  let jobs
+  if (ats === "greenhouse") {
+    console.log(`Scouting greenhouse / ${slug} ...`)
+    jobs = await fetchGreenhouse([slug])
+  } else if (ats === "lever") {
+    console.log(`Scouting lever / ${slug} ...`)
+    jobs = await fetchLever([slug])
+  } else {
+    console.error(`Unknown ATS: ${ats}. Supported: greenhouse, lever`)
     process.exit(1)
   }
-
-  console.log(`Scouting ${ats} / ${slug} ...`)
-  const jobs = await fetchGreenhouse([slug])
 
   if (jobs.length === 0) {
     console.log("No jobs found.")
