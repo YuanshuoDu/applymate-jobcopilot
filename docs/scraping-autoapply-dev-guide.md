@@ -303,7 +303,23 @@ Escalate:
 
 ## 10. PR review process (what Claude checks)
 
-Inherits the checklist in `CLAUDE.md`. Plus, for this initiative specifically:
+Every PR goes through **two review layers** in order. A failure on either layer triggers `needs-fix`.
+
+### Layer 1 — Code correctness (inherited from `CLAUDE.md`)
+
+The 7-item mandatory checklist from `CLAUDE.md` applies to every PR. Key items:
+
+| Check | What it means |
+|---|---|
+| No lockfile phantom entries | `pnpm-lock.yaml` only has entries for declared `package.json` deps |
+| No `window.location.href` for in-app nav | Use Next.js router |
+| No `outline: none` without `:focus-visible` | EU EAA compliance |
+| No module-level `let`/`var` for async guard | Use `useRef` |
+| No scope creep | Only files listed in issue Tech Notes |
+| No hardcoded literals | No magic numbers/strings replacing dynamic data |
+| No dep added without lockfile update | `pnpm install` in clean worktree |
+
+Plus, for this initiative specifically:
 
 | Check | What it means |
 |---|---|
@@ -315,7 +331,86 @@ Inherits the checklist in `CLAUDE.md`. Plus, for this initiative specifically:
 | **Storage state never logged** | grep diff for `console.log(.*storageState\|cookies\|profileDir)`. |
 | **Design doc unchanged or updated** | If implementation diverged from design, the design doc was updated in the same PR. |
 
-A PR that fails any of these gets `needs-fix` and a comment explaining what's wrong. We do not pile up review rounds — one comment, one fix, one re-review, merge.
+---
+
+### Layer 2 — Goal alignment (new — required on every PR)
+
+Code passing Layer 1 is necessary but not sufficient. Every PR must also advance the initiative's stated goals from [§11 of the design doc](./scraping-autoapply-design.md#11-success-criteria). The reviewer checks this explicitly and includes a **Goal Alignment** section in every review comment.
+
+#### 2A — Discovery source PRs (Phase 1.1–1.3, Phase 2.x, Phase 6.x)
+
+| Goal check | Question to answer |
+|---|---|
+| **Cost shift** | Does this source produce jobs without a paid API call? If yes, estimate what % of daily jobs could shift to free after this lands. |
+| **EU coverage** | How many EU employer records does this add? Does it cover any country/sector not previously covered? |
+| **Description completeness** | Do returned `DiscoveredJob` records include `description` ≥ 200 chars from the source directly? If yes, these skip the entire enrichment cascade (T1+T2+T3) — confirm this is wired correctly. |
+| **Apply URL quality** | Is `url` a direct ATS apply link (not a job board redirect)? Direct links are required for Mode C (unattended apply). |
+| **Source field set** | Is `source` set to a stable identifier (e.g. `'greenhouse'`, `'lever'`, `'workday'`)? Required for per-source dashboards in Phase 7. |
+| **Module boundary** | Does the source live in `sources/{ats}.ts` with no imports from `apps/worker`? Discovery and apply are separate layers. |
+| **Pace policy present** | Confirmed entry in `pace/policies.ts` — otherwise this source has no ceiling and can get us rate-banned. |
+
+#### 2B — Enrichment PRs (Phase 1.4–1.6)
+
+| Goal check | Question to answer |
+|---|---|
+| **Token savings** | Estimate what % of jobs this tier will handle without an LLM call. Target: T1+T2 combined ≥ 70%. |
+| **Tier cascade correct** | Does the orchestrator skip lower-priority tiers when a higher one succeeds? No double-calling. |
+| **Min-length guard** | Does the tier reject descriptions shorter than 200 chars (preventing low-quality short snippets from blocking T2/T3)? |
+| **No regression** | Does wiring the cascade into the existing enrich endpoint break anything visible in the current UI? |
+
+#### 2C — Auto-apply PRs (Phase 3.x–5.x)
+
+| Goal check | Question to answer |
+|---|---|
+| **Mode C path** | Does this build toward fully unattended application submission (user offline, server submits)? |
+| **ATS flow coverage** | Which ATS does this cover? Expected submit success rate vs. the 80% target in §11. |
+| **CloakBrowser used** | Is the browser session going through CloakBrowser (not stock Playwright)? Required for EU anti-bot sites. |
+| **humanize enabled** | Is `humanize: true` set in the CloakBrowser launch config? Required in production paths. |
+| **Pattern cache wired** | On successful submission, is the field mapping written to `form_patterns` table? |
+| **Per-user isolation** | Does each user get a separate CloakBrowser profile dir? No cross-user session contamination. |
+| **Rate limits enforced** | Is the per-user (30/hr) and per-domain (5/hr) ceiling applied before this worker starts? |
+
+#### 2D — All PRs: integration checkpoint
+
+Answer these for every PR regardless of type:
+
+1. **Pipeline position**: where does this fit in the 6-stage pipeline (discover → enrich → score → tailor → cover → apply)? Does it integrate correctly at that stage?
+2. **Blocking risk**: does this PR introduce a dependency that could stall a later phase? (e.g. a type change that breaks `discover.ts` before the aggregator is updated)
+3. **Observable progress**: after this merges, will the [§11 success criteria](./scraping-autoapply-design.md#11-success-criteria) measurably improve? If no, is it pure infrastructure that unblocks a later PR?
+
+---
+
+### Review comment format
+
+Every review comment must include both layers:
+
+```markdown
+## [APPROVED / CHANGES REQUESTED]
+
+### Layer 1 — Code correctness
+| Check | Status | Evidence |
+|---|---|---|
+| AC1: ... | ✅ / ❌ | file:line |
+...
+
+### Layer 2 — Goal alignment
+| Goal | Status | Notes |
+|---|---|---|
+| Cost shift | ✅ | Adds N Greenhouse employers → ~X% of daily jobs shift to free |
+| EU coverage | ✅ | Covers DE/NL/IE sectors previously missing |
+| Description completeness | ✅ | `content` field returned inline — no enrichment needed |
+| Apply URL quality | ✅ | `absolute_url` is direct Greenhouse apply link |
+| Source field set | ✅ | `source: 'greenhouse'` |
+| Module boundary | ✅ | No worker imports |
+| Pace policy present | ✅ | `policies.ts` line 17 |
+
+### Integration checkpoint
+- Pipeline position: Discovery stage (Stage 1)
+- Blocking risk: None — additive only, no existing code changed
+- Observable progress: After merge, scout pipeline has 2 free ATS sources. With Phase 1.3 registry, est. 60+ EU employers covered.
+```
+
+A PR that fails any Layer 1 OR Layer 2 check gets `needs-fix` with a specific comment per failure. We do not pile up review rounds — one comment, one fix, one re-review, merge.
 
 ---
 
