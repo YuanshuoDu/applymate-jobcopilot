@@ -117,46 +117,6 @@ async function fetchDetail(
   }
 }
 
-// ── Pagination ───────────────────────────────────────────────────────────
-
-async function fetchEmployerPage(
-  employer: WorkdayEmployer,
-  offset: number,
-): Promise<DiscoveredJob[]> {
-  await acquire({ ats: "workday" })
-
-  const search = await fetchSearch(employer, offset)
-  if (!search) return []
-
-  const jobs: DiscoveredJob[] = []
-
-  for (const posting of search.jobPostings) {
-    if (!posting.externalPath) continue
-
-    // Fetch detail for description + apply URL
-    const detail = await fetchDetail(employer, posting.externalPath)
-
-    const description = detail?.jobPostingInfo?.jobDescription
-      ? stripHtml(detail.jobPostingInfo.jobDescription)
-      : ""
-
-    const applyUrl = detail?.jobPostingInfo?.externalUrl ?? ""
-
-    jobs.push({
-      title:       posting.title,
-      company:     employer.name,
-      location:    posting.locationsText ?? "",
-      url:         applyUrl,
-      description,
-      salary:      null,
-      logo:        null,
-      source:      "workday",
-    })
-  }
-
-  return jobs
-}
-
 // ── Main export ──────────────────────────────────────────────────────────
 
 /**
@@ -178,6 +138,7 @@ export async function fetchWorkday(
 
       while (offset < totalReported && offset < MAX_JOBS_PER_EMPLOYER) {
         // Get one page's search results
+        await acquire({ ats: "workday" })
         const search = await fetchSearch(employer, offset)
         if (!search) break  // employer unreachable — skip entirely
 
