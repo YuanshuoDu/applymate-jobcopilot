@@ -51,6 +51,7 @@ export interface Job {
   notes:        string | null
   coverLetter:  string | null
   analysisNote: string | null
+  keywords:     string | null  // ATS keywords from JD scoring, comma-separated
   appliedAt:    string | null  // ISO date string from API
   followUpAt:   string | null
   createdAt:    string

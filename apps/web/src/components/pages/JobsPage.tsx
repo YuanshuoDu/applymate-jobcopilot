@@ -74,7 +74,19 @@ function ListView({ jobs, onRowClick }: { jobs: Job[]; onRowClick: (job: Job) =>
                   </div>
                 </div>
               </td>
-              <td style={{ padding: '10px 16px', fontSize: 12, color: 'var(--text-muted)' }}>{j.role}</td>
+              <td style={{ padding: '10px 16px' }}>
+                <div style={{ fontSize: 12, color: 'var(--text-muted)' }}>{j.role}</div>
+                {j.keywords ? (() => {
+                  const kws = j.keywords.split(',').map(k => k.trim()).filter(Boolean).slice(0, 8)
+                  return kws.length > 0 ? (
+                    <div style={{ display: 'flex', flexWrap: 'wrap', gap: 4, marginTop: 4 }}>
+                      {kws.map((kw, i) => (
+                        <span key={i} style={{ fontSize: 10, padding: '1px 6px', borderRadius: 4, background: 'var(--bg-secondary)', color: 'var(--text-muted)', border: '0.5px solid var(--border)', whiteSpace: 'nowrap' }}>{kw}</span>
+                      ))}
+                    </div>
+                  ) : null
+                })() : null}
+              </td>
               <td style={{ padding: '10px 16px' }}><StatusBadge status={j.status} /></td>
               <td style={{ padding: '10px 16px' }}><ScorePill score={j.score ?? 0} /></td>
               <td style={{ padding: '10px 16px', fontSize: 11, color: 'var(--text-muted)' }}>
@@ -165,7 +177,17 @@ function KanbanView({ jobs, onStatusChange, onAddClick }: {
                 </div>
                 {job.score != null && <ScorePill score={job.score} />}
               </div>
-              <div style={{ fontSize: 11, color: 'var(--text-muted)', marginBottom: 6 }}>{job.role}</div>
+              <div style={{ fontSize: 11, color: 'var(--text-muted)', marginBottom: 4 }}>{job.role}</div>
+              {job.keywords ? (() => {
+                const kws = job.keywords.split(',').map(k => k.trim()).filter(Boolean).slice(0, 6)
+                return kws.length > 0 ? (
+                  <div style={{ display: 'flex', flexWrap: 'wrap', gap: 3, marginBottom: 6 }}>
+                    {kws.map((kw, i) => (
+                      <span key={i} style={{ fontSize: 9, padding: '0px 5px', borderRadius: 3, background: 'var(--bg-secondary)', color: 'var(--text-muted)', border: '0.5px solid var(--border)', whiteSpace: 'nowrap' }}>{kw}</span>
+                    ))}
+                  </div>
+                ) : null
+              })() : null}
               <div style={{ fontSize: 10, color: 'var(--text-muted)' }}>{fmtDate(job.appliedAt ?? job.createdAt)}</div>
             </div>
           ))}

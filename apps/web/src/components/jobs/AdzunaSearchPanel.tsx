@@ -84,6 +84,7 @@ async function runAiScore(
       score:           number
       matchedKeywords: string[]
       missingKeywords: string[]
+      keywords?: string
     }
 
     // 4. Patch job with score + analysisNote
@@ -91,6 +92,7 @@ async function runAiScore(
     const missing = scoreData.missingKeywords?.join(', ') || '—'
     await apiMutate(`/api/jobs/${jobId}`, 'PATCH', {
       score:        scoreData.score,
+        keywords: scoreData.keywords ?? '',
       analysisNote: `Match Score: ${scoreData.score}%\n\nMatched keywords: ${matched}\n\nMissing keywords: ${missing}`,
     })
 

@@ -8,7 +8,7 @@ import { modelChat, stripFences } from '@/lib/model-router'
 import type { ResumeContent } from '@/lib/types'
 
 export async function POST(req: NextRequest) {
-  const prep = await prepareAiRoute(req, 'scoring')
+  const prep = await prepareAiRoute(req, 'jobScoring')
   if ('error' in prep) return prep.error
 
   const body = await req.json().catch(() => null)
@@ -26,6 +26,7 @@ export async function POST(req: NextRequest) {
   const prompt = `Rate this resume against the job. Output ONLY this JSON (no other text):
 {
 "score": 85,
+"keywords": "React, TypeScript, Node.js, AWS, 5 years experience",
 "matchedKeywords": ["skill1","skill2"],
 "sectionMatches": [
   {"section":"Summary","keywords":["keyword"],"score":80,"tip":"improve by..."},
@@ -42,6 +43,8 @@ export async function POST(req: NextRequest) {
 "strengthSummary":"one sentence summary"
 }
 
+The "keywords" field must contain specific technical skills, tools, frameworks, certifications, and role-specific terms extracted from the job description — NOT generic words like "communication" or "teamwork". Output as a comma-separated string.
+
 RESUME:
 ${resumeText}
 
@@ -55,7 +58,7 @@ ${jobDescription ? `DESCRIPTION:\n${jobDescription.slice(0, 2000)}` : ''}`
     let parsed: Record<string, unknown>
     try { parsed = JSON.parse(text) } catch {
       return ok({
-        score: 0, matchedKeywords: [], sectionMatches: [], missingItems: [],
+        score: 0, keywords: '', matchedKeywords: [], sectionMatches: [], missingItems: [],
         sectionScores: {}, sectionTips: {}, skillsGap: [], strengthSummary: 'Analysis unavailable. Try again.',
       })
     }
@@ -67,6 +70,7 @@ ${jobDescription ? `DESCRIPTION:\n${jobDescription.slice(0, 2000)}` : ''}`
 
     return ok({
       score:            Number(parsed.score) || 0,
+      keywords:         String(parsed.keywords ?? ''),
       matchedKeywords:  Array.isArray(parsed.matchedKeywords) ? parsed.matchedKeywords as string[] : [],
       sectionMatches:   arr(parsed.sectionMatches).map((m: unknown) => {
         const o = m as Record<string, unknown> ?? {}
