@@ -1,0 +1,45 @@
+# Lever employer registry (Phase 1.3)
+# Verified: each slug returns >=1 posting on api.lever.co/v0/postings
+# Country codes: ISO 3166-1 alpha-2, lowercase
+# Tier: 1=household name, 2=mid-size, 3=long-tail
+employers:
+  # --- Tier 1: household names ---
+  - { slug: "spotify",               name: "Spotify",              country: "se", tier: 1 }
+  - { slug: "palantir",              name: "Palantir",             country: "us", tier: 1 }
+  - { slug: "aircall",               name: "Aircall",              country: "fr", tier: 1 }
+  - { slug: "farfetch",              name: "Farfetch",             country: "pt", tier: 1 }
+  - { slug: "crypto",                name: "Crypto.com",           country: "us", tier: 1 }
+
+  # --- Tier 2: well-known mid-size ---
+  - { slug: "pipedrive",             name: "Pipedrive",            country: "ee", tier: 2 }
+  - { slug: "zopa",                  name: "Zopa",                 country: "gb", tier: 2 }
+  - { slug: "blablacar",             name: "BlaBlaCar",            country: "fr", tier: 2 }
+  - { slug: "vestiairecollective",   name: "Vestiaire Collective", country: "fr", tier: 2 }
+  - { slug: "contentsquare",         name: "ContentSquare",        country: "fr", tier: 2 }
+  - { slug: "ledger",                name: "Ledger",               country: "fr", tier: 2 }
+  - { slug: "qonto",                 name: "Qonto",                country: "fr", tier: 2 }
+  - { slug: "mendix",                name: "Mendix",               country: "nl", tier: 2 }
+  - { slug: "jobandtalent",          name: "Jobandtalent",         country: "es", tier: 2 }
+  - { slug: "outreach",              name: "Outreach",             country: "us", tier: 2 }
+  - { slug: "greenlight",            name: "Greenlight",           country: "us", tier: 2 }
+  - { slug: "capital",               name: "Capital.com",          country: "gb", tier: 2 }
+  - { slug: "sysdig",                name: "Sysdig",               country: "us", tier: 2 }
+  - { slug: "alloy",                 name: "Alloy",                country: "us", tier: 2 }
+  - { slug: "kavak",                 name: "Kavak",                country: "es", tier: 2 }
+  - { slug: "wealthfront",           name: "Wealthfront",          country: "us", tier: 2 }
+  - { slug: "zoox",                  name: "Zoox",                 country: "us", tier: 2 }
+
+  # --- Tier 3: long tail ---
+  - { slug: "finn",                  name: "Finn",                 country: "no", tier: 3 }
+  - { slug: "swile",                 name: "Swile",                country: "fr", tier: 3 }
+  - { slug: "prismic",               name: "Prismic",              country: "fr", tier: 3 }
+  - { slug: "15five",                name: "15Five",               country: "us", tier: 3 }
+  - { slug: "neon",                  name: "Neon",                 country: "us", tier: 3 }
+  - { slug: "sapling",               name: "Sapling",              country: "us", tier: 3 }
+  - { slug: "secureframe",           name: "Secureframe",          country: "us", tier: 3 }
+  - { slug: "healx",                 name: "Healx",                country: "gb", tier: 3 }
+  - { slug: "swissborg",             name: "SwissBorg",            country: "ch", tier: 3 }
+  - { slug: "superannotate",         name: "SuperAnnotate",        country: "ee", tier: 3 }
+  - { slug: "relay",                 name: "Relay",                country: "us", tier: 3 }
+  - { slug: "skio",                  name: "Skio",                 country: "us", tier: 3 }
+  - { slug: "okendo",                name: "Okendo",               country: "us", tier: 3 }
