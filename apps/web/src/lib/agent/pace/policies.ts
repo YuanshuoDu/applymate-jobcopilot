@@ -15,6 +15,7 @@ export interface RatePolicy {
 /** Per-ATS rate limits — hard ceiling regardless of user count. */
 export const POLICIES: Record<string, RatePolicy> = {
   greenhouse: { host: "boards-api.greenhouse.io", rps: 5 },
+  lever:      { host: "api.lever.co",             rps: 5 },
 }
 
 /**
