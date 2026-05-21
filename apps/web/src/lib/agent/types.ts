@@ -160,3 +160,15 @@ export function resumeToText(r: ResumeContent): string {
   }
   return lines.join('\n')
 }
+
+// ── Enrichment pipeline ───────────────────────────────────────────────────────
+
+export interface EnrichedJob {
+  description: string
+  applyUrl?: string
+  salary?: string | null
+  employmentType?: string | null
+  datePosted?: string | null
+  /** Which enrichment tier produced this result */
+  method: "jsonld" | "css" | "llm"
+}
