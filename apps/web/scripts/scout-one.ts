@@ -1,20 +1,41 @@
 /**
- * Minimal CLI for running a single discovery source against one employer slug.
+ * Minimal CLI for running discovery sources against employer slugs.
  *
- * Usage:
+ * Single slug mode:
  *   pnpm --filter web exec tsx scripts/scout-one.ts greenhouse booking
  *   pnpm --filter web exec tsx scripts/scout-one.ts lever spotify
+ *
+ * Registry mode (batch all employers in the registry):
+ *   pnpm --filter web exec tsx scripts/scout-one.ts --registry greenhouse
+ *   pnpm --filter web exec tsx scripts/scout-one.ts --registry lever
  *
  * Prints discovered jobs to stdout. No DB writes.
  */
 
 import { fetchGreenhouse } from "../src/lib/agent/sources/greenhouse"
 import { fetchLever } from "../src/lib/agent/sources/lever"
+import { loadRegistry, type Employer } from "../src/lib/agent/registries"
+
+type Ats = "greenhouse" | "lever"
 
 async function main() {
   const args = process.argv.slice(2)
+
+  // Registry mode: --registry <ats>
+  if (args[0] === "--registry") {
+    const ats = args[1] as Ats | undefined
+    if (!ats || !["greenhouse", "lever"].includes(ats)) {
+      console.error("Usage: pnpm --filter web exec tsx scripts/scout-one.ts --registry <greenhouse|lever>")
+      process.exit(1)
+    }
+    await runRegistry(ats)
+    return
+  }
+
+  // Single slug mode: <ats> <slug>
   if (args.length < 2) {
     console.error("Usage: pnpm --filter web exec tsx scripts/scout-one.ts <ats> <slug>")
+    console.error("       pnpm --filter web exec tsx scripts/scout-one.ts --registry <greenhouse|lever>")
     process.exit(1)
   }
 
@@ -47,6 +68,32 @@ async function main() {
   }
 
   console.log(`\n${jobs.length} job(s) from ${slug}`)
+}
+
+async function runRegistry(ats: Ats) {
+  const employers = loadRegistry(ats)
+  console.log(`Registry ${ats}: ${employers.length} employers`)
+
+  const slugs = employers.map((e: Employer) => e.slug)
+  const fetcher = ats === "greenhouse" ? fetchGreenhouse : fetchLever
+
+  console.log(`Fetching ${slugs.length} employers (${ats})...\n`)
+  const jobs = await fetcher(slugs)
+
+  // Count jobs per employer
+  const byEmployer = new Map<string, number>()
+  for (const j of jobs) {
+    const prev = byEmployer.get(j.company) ?? 0
+    byEmployer.set(j.company, prev + 1)
+  }
+
+  for (const e of employers) {
+    const count = byEmployer.get(e.slug) ?? 0
+    console.log(`  ${count.toString().padStart(4)} jobs  ${e.slug} (${e.name})`)
+  }
+
+  const activeEmployers = [...byEmployer.keys()].length
+  console.log(`\n${jobs.length} job(s) from ${activeEmployers} employer(s) [${employers.length} registered]`)
 }
 
 main().catch((err) => {
