@@ -16,6 +16,7 @@ export interface RatePolicy {
 export const POLICIES: Record<string, RatePolicy> = {
   greenhouse: { host: "boards-api.greenhouse.io", rps: 5 },
   lever:      { host: "api.lever.co",             rps: 5 },
+  workday:    { host: "myworkdayjobs.com",      rps: 1 },
 }
 
 /**

@@ -13,10 +13,11 @@
  */
 
 import { fetchGreenhouse } from "../src/lib/agent/sources/greenhouse"
+import { fetchWorkday } from "../src/lib/agent/sources/workday"
 import { fetchLever } from "../src/lib/agent/sources/lever"
-import { loadRegistry, type Employer } from "../src/lib/agent/registries"
+import { loadRegistry, loadWorkdayRegistry, type Employer, type WorkdayEmployer } from "../src/lib/agent/registries"
 
-type Ats = "greenhouse" | "lever"
+type Ats = "greenhouse" | "lever" | "workday"
 
 async function main() {
   const args = process.argv.slice(2)
@@ -24,8 +25,8 @@ async function main() {
   // Registry mode: --registry <ats>
   if (args[0] === "--registry") {
     const ats = args[1] as Ats | undefined
-    if (!ats || !["greenhouse", "lever"].includes(ats)) {
-      console.error("Usage: pnpm --filter web exec tsx scripts/scout-one.ts --registry <greenhouse|lever>")
+    if (!ats || !["greenhouse", "lever", "workday"].includes(ats)) {
+      console.error("Usage: pnpm --filter web exec tsx scripts/scout-one.ts --registry <greenhouse|lever|workday>")
       process.exit(1)
     }
     await runRegistry(ats)
@@ -48,6 +49,15 @@ async function main() {
   } else if (ats === "lever") {
     console.log(`Scouting lever / ${slug} ...`)
     jobs = await fetchLever([slug])
+    } else if (ats === "workday") {
+    const employers = loadWorkdayRegistry()
+    const employer = employers.find((e: WorkdayEmployer) => e.tenant === slug)
+    if (!employer) {
+      console.error(`Tenant "${slug}" not found in workday.yaml registry. Available: ${employers.map((e: WorkdayEmployer) => e.tenant).join(", ")}`)
+      process.exit(1)
+    }
+    console.log(`Scouting workday / ${employer.name} (${employer.tenant}) ...`)
+    jobs = await fetchWorkday([employer])
   } else {
     console.error(`Unknown ATS: ${ats}. Supported: greenhouse, lever`)
     process.exit(1)
@@ -71,6 +81,29 @@ async function main() {
 }
 
 async function runRegistry(ats: Ats) {
+  if (ats === "workday") {
+    const wdEmployers = loadWorkdayRegistry()
+    console.log(`Registry workday: ${wdEmployers.length} employers`)
+
+    console.log(`Fetching ${wdEmployers.length} employers (workday)...\n`)
+    const jobs = await fetchWorkday(wdEmployers)
+
+    const byEmployer = new Map<string, number>()
+    for (const j of jobs) {
+      const prev = byEmployer.get(j.company) ?? 0
+      byEmployer.set(j.company, prev + 1)
+    }
+
+    for (const e of wdEmployers) {
+      const count = byEmployer.get(e.name) ?? 0
+      console.log(`  ${count.toString().padStart(4)} jobs  ${e.tenant} (${e.name}) [${e.status}]`)
+    }
+
+    const activeEmployers = [...byEmployer.keys()].length
+    console.log(`\n${jobs.length} job(s) from ${activeEmployers} employer(s) [${wdEmployers.length} registered]`)
+    return
+  }
+
   const employers = loadRegistry(ats)
   console.log(`Registry ${ats}: ${employers.length} employers`)
 
