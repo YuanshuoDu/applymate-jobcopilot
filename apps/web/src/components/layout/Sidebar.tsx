@@ -38,9 +38,7 @@ export function Sidebar({ active, onNav, session, jobCount }: SidebarProps) {
     { id: 'search',     label: t('nav.search'),       icon: '⊕' },
     { id: 'resume',     label: t('nav.resume'),       icon: '☰' },
     { id: 'gmail',      label: t('nav.gmail'),        icon: '✉' },
-    { id: 'agent',      label: t('nav.agent'),        icon: '◉' },
-    { id: 'animation',  label: 'Flow Demo',           icon: '▷' },
-    { id: 'extension',  label: t('nav.extension'),    icon: '⊞' },
+    { id: 'agent',      label: t('nav.agent'),        icon: '◉' },    { id: 'extension',  label: t('nav.extension'),    icon: '⊞' },
     { id: 'settings',   label: t('nav.settings'),     icon: '⚙' },
   ]
 
@@ -82,9 +80,7 @@ export function Sidebar({ active, onNav, session, jobCount }: SidebarProps) {
             {item.id === 'gmail' && gmailUnread != null && gmailUnread > 0 && (
               <span style={{ marginLeft: 'auto', fontSize: 10, background: 'rgba(163,45,45,0.12)', color: '#A32D2D', borderRadius: 999, padding: '1px 6px' }}>{gmailUnread}</span>
             )}
-            {item.id === 'agent'     && <span style={{ marginLeft: 'auto', width: 7, height: 7, borderRadius: '50%', background: '#3B6D11', flexShrink: 0 }} />}
-            {item.id === 'animation' && <span style={{ marginLeft: 'auto', fontSize: 9, background: 'rgba(91,61,200,0.12)', color: '#5B3DC8', borderRadius: 999, padding: '1px 6px' }}>new</span>}
-          </button>
+            {item.id === 'agent'     && <span style={{ marginLeft: 'auto', width: 7, height: 7, borderRadius: '50%', background: '#3B6D11', flexShrink: 0 }} />}          </button>
         ))}
       </nav>
 
