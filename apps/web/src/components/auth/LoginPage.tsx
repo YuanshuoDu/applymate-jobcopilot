@@ -152,7 +152,7 @@ export function LoginPage() {
                 {oauthProviders.google && (
                   <OAuthBtn
                     icon={<GoogleIcon />}
-                    label="{t('auth.login.googleLogin')}"
+                    label={t('auth.login.googleLogin')}
                     onClick={() => handleOAuth('google')}
                     loading={loading === 'google'}
                   />
@@ -160,7 +160,7 @@ export function LoginPage() {
                 {oauthProviders.github && (
                   <OAuthBtn
                     icon={<GitHubIcon />}
-                    label="{t('auth.login.githubLogin')}"
+                    label={t('auth.login.githubLogin')}
                     onClick={() => handleOAuth('github')}
                     loading={loading === 'github'}
                     dark
