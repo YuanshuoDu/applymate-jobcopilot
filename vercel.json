@@ -1,0 +1,7 @@
+{
+  "framework": "nextjs",
+  "buildCommand": "pnpm --filter @jobcopilot/web build",
+  "outputDirectory": "apps/web/.next",
+  "installCommand": "pnpm install",
+  "devCommand": "pnpm --filter @jobcopilot/web dev"
+}
