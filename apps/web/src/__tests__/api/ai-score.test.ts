@@ -79,6 +79,7 @@ describe('POST /api/ai/score', () => {
     mockCreate.mockResolvedValueOnce({
       content: [{ type: 'text', text: JSON.stringify({
         score: 82,
+        keywords: 'React, TypeScript, Node.js, AWS',
         matchedKeywords: ['react', 'typescript'],
         missingKeywords: ['docker'],
         sectionScores: { Summary: 75, Experience: 90, Skills: 80, Education: 70 },
@@ -99,6 +100,7 @@ describe('POST /api/ai/score', () => {
     expect(body.matchedKeywords).toEqual(['react', 'typescript'])
     expect(body.missingKeywords).toEqual(['docker'])
     expect(body.sectionScores.Summary).toBe(75)
+    expect(body.keywords).toBe('React, TypeScript, Node.js, AWS')
   })
 
   it('handles AI response wrapped in markdown code fences', async () => {
@@ -135,6 +137,42 @@ describe('POST /api/ai/score', () => {
     // Should return 500 on JSON parse error
     expect(res.status).toBe(500)
   })
+
+  it('extracts ATS keywords from JD — contains technical terms, not generic words', async () => {
+    const { POST } = await import('@/app/api/ai/score/route')
+
+    mockCreate.mockResolvedValueOnce({
+      content: [{ type: 'text', text: JSON.stringify({
+        score: 78,
+        keywords: 'React, TypeScript, Node.js, AWS, PostgreSQL, Docker, Kubernetes, CI/CD, Terraform',
+        matchedKeywords: ['react', 'typescript', 'nodejs'],
+        missingKeywords: ['terraform'],
+        sectionScores: { Summary: 70, Experience: 85, Skills: 75, Education: 65 },
+        sectionTips: { Summary: 'ok', Experience: 'nice', Skills: 'good', Education: 'fine' },
+      }) }],
+    })
+
+    const req = fakeNextRequest({
+      resumeContent: { summary: 'Backend engineer', skills: ['nodejs'], experience: [] },
+      jobTitle: 'Senior Platform Engineer',
+      jobCompany: 'TechCorp',
+      jobDescription: 'We need someone with React, TypeScript, Node.js, AWS, PostgreSQL, Docker, Kubernetes, CI/CD, Terraform experience for building cloud-native platforms.',
+    })
+    const res = await POST(req as never)
+
+    expect(res.status).toBe(200)
+    const body = await res.json()
+    expect(body.keywords).toContain('React')
+    expect(body.keywords).toContain('Docker')
+    expect(body.keywords).toContain('Terraform')
+    // Verify it does NOT contain generic words
+    expect(body.keywords).not.toContain('communication')
+    expect(body.keywords).not.toContain('teamwork')
+    expect(body.keywords).not.toContain('experience')  // not alone as keyword
+    // Should be a comma-separated string
+    expect(body.keywords.split(',').length).toBeGreaterThanOrEqual(5)
+  })
+
 
   it('handles Anthropic API failure', async () => {
     const { POST } = await import('@/app/api/ai/score/route')

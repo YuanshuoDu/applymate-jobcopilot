@@ -34,7 +34,7 @@ export async function PATCH(req: NextRequest, { params }: Params) {
   const body = await req.json().catch(() => null)
   if (!body) return err('Invalid JSON body')
 
-  const allowedFields = ['status', 'notes', 'followUpAt', 'salary', 'score', 'url', 'description', 'location']
+  const allowedFields = [('status', 'notes', 'followUpAt', 'salary', 'score', 'url', 'description', 'location', 'keywords')]
   const data: Record<string, unknown> = {}
   for (const field of allowedFields) {
     if (field in body) data[field] = body[field]

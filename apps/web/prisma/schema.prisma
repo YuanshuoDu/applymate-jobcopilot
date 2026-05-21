@@ -103,6 +103,7 @@ model Job {
   notes        String?   @db.Text
   coverLetter  String?   @db.Text  // saved by Writer agent
   analysisNote String?   @db.Text  // saved by Analyst agent (recommendation)
+  keywords     String?   @db.Text  // ATS keywords extracted from JD during scoring
   appliedAt    DateTime?
   followUpAt  DateTime?
   createdAt   DateTime  @default(now())

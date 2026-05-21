@@ -125,9 +125,10 @@ async function saveAndScore(
       body: JSON.stringify({ resumeContent: full.content, jobTitle: r.title, jobDescription: r.description.slice(0, 2000), keySkills: r.keySkills ?? [] }),
     })
     if (!scoreRes.ok) return
-    const sd = await scoreRes.json() as { score: number; matchedKeywords: string[]; missingKeywords: string[]; strengthSummary?: string }
+    const sd = await scoreRes.json() as { score: number; matchedKeywords: string[]; missingKeywords: string[]; strengthSummary?: string; keywords?: string }
     await apiMutate(`/api/jobs/${job.id}`, 'PATCH', {
       score: sd.score,
+      keywords: sd.keywords ?? '',
       analysisNote: `Match Score: ${sd.score}%\n\nMatched: ${sd.matchedKeywords?.join(', ') || '—'}\n\nMissing: ${sd.missingKeywords?.join(', ') || '—'}${sd.strengthSummary ? `\n\n${sd.strengthSummary}` : ''}`,
     })
     onScored(r.id, sd.score)
