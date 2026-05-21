@@ -7,6 +7,7 @@
     "lint": "turbo lint"
   },
   "devDependencies": {
+    "next": "^15.3.1",
     "turbo": "^2.5.4",
     "typescript": "^6.0.3"
   },
@@ -14,15 +15,5 @@
   "engines": {
     "node": ">=20",
     "pnpm": ">=9"
-  },
-  "pnpm": {
-    "onlyBuiltDependencies": [
-      "@prisma/client",
-      "@prisma/engines",
-      "esbuild",
-      "prisma",
-      "puppeteer",
-      "sharp"
-    ]
   }
 }
