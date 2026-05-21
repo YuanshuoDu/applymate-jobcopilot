@@ -1,6 +1,7 @@
 'use client'
 
 import { useState } from 'react'
+import { useI18n } from '@/lib/i18n'
 import { signIn } from 'next-auth/react'
 import { useRouter } from 'next/navigation'
 import Link from 'next/link'
@@ -11,9 +12,9 @@ const C = {
   bg: '#ffffff', bgSide: '#f0f5fb',
 }
 
-const PLAN_FEATURES = {
-  free: ['最多保存 20 个职位', '基础匹配评分', 'Chrome 插件', '手动投递'],
-  pro:  ['无限职位保存', 'AI 简历优化', 'AI Agent 自动投递', 'Gmail 集成', '优先支持'],
+const PLAN_FEATURE_KEYS = {
+  free: ['auth.register.planFree.feature1', 'auth.register.planFree.feature2', 'auth.register.planFree.feature3', 'auth.register.planFree.feature4'],
+  pro: ['auth.register.planPro.feature1', 'auth.register.planPro.feature2', 'auth.register.planPro.feature3', 'auth.register.planPro.feature4', 'auth.register.planPro.feature5'],
 }
 
 export function RegisterPage() {
@@ -25,15 +26,16 @@ export function RegisterPage() {
   const [confirm,  setConfirm]  = useState('')
   const [error,    setError]    = useState('')
   const [loading,  setLoading]  = useState<string | null>(null)
+  const { t } = useI18n()
   const [step,     setStep]     = useState<'form' | 'success'>('form')
 
   // ── Validation ───────────────────────────────────────────────
   function validate(): string | null {
-    if (!name.trim())              return '请填写姓名'
-    if (!email.trim())             return '请填写邮箱'
-    if (!/\S+@\S+\.\S+/.test(email)) return '邮箱格式不正确'
-    if (password.length < 8)      return '密码至少 8 位'
-    if (password !== confirm)     return '两次密码输入不一致'
+    if (!name.trim())              return t('auth.register.error.nameRequired')
+    if (!email.trim())             return t('auth.register.error.emailRequired')
+    if (!/\S+@\S+\.\S+/.test(email)) return t('auth.register.error.emailInvalid')
+    if (password.length < 8)      return t('auth.register.error.passwordTooShort')
+    if (password !== confirm)     return t('auth.register.error.passwordMismatch')
     return null
   }
 
@@ -52,7 +54,7 @@ export function RegisterPage() {
         body: JSON.stringify({ name, email, password }),
       })
       const data = await res.json()
-      if (!res.ok) { setError(data.error ?? '注册失败'); setLoading(null); return }
+      if (!res.ok) { setError(data.error ?? t('auth.register.error.registerFailed')); setLoading(null); return }
 
       // Auto login after register
       const login = await signIn('credentials', { email, password, redirect: false })
@@ -65,7 +67,7 @@ export function RegisterPage() {
       }
     } catch {
       setLoading(null)
-      setError('网络错误，请重试')
+      setError(t('auth.register.error.networkError'))
     }
   }
 
@@ -81,8 +83,8 @@ export function RegisterPage() {
       <div style={{ display:'flex', alignItems:'center', justifyContent:'center', minHeight:'100vh', background:C.bg }}>
         <div style={{ textAlign:'center', padding:32 }}>
           <div style={{ fontSize:56, marginBottom:16 }}>🎉</div>
-          <h2 style={{ fontSize:22, fontWeight:700, marginBottom:8, color:C.text }}>账号创建成功！</h2>
-          <p style={{ fontSize:13, color:C.muted }}>正在跳转到你的 Dashboard…</p>
+          <h2 style={{ fontSize:22, fontWeight:700, marginBottom:8, color:C.text }}>{t('auth.register.success.title')}</h2>
+          <p style={{ fontSize:13, color:C.muted }}>{t('auth.register.success.redirecting')}</p>
           <div style={{ marginTop:20, width:48, height:48, border:`3px solid rgba(24,95,165,0.2)`, borderTopColor:C.primary, borderRadius:'50%', animation:'spin 0.7s linear infinite', margin:'20px auto 0' }} />
         </div>
       </div>
@@ -108,8 +110,8 @@ export function RegisterPage() {
           </div>
         </div>
 
-        <h2 style={{ fontSize:20, fontWeight:700, color:C.text, marginBottom:6 }}>开始你的求职之旅</h2>
-        <p style={{ fontSize:13, color:C.muted, lineHeight:1.7, marginBottom:32 }}>免费注册，立即使用 AI 求职助手</p>
+        <h2 style={{ fontSize:20, fontWeight:700, color:C.text, marginBottom:6 }}>{t('auth.register.heroTitle')}</h2>
+        <p style={{ fontSize:13, color:C.muted, lineHeight:1.7, marginBottom:32 }}>{t('auth.register.heroDesc')}</p>
 
         {/* Plan cards */}
         {(['free', 'pro'] as const).map(plan => (
@@ -121,25 +123,25 @@ export function RegisterPage() {
             <div style={{ display:'flex', justifyContent:'space-between', alignItems:'center', marginBottom:12 }}>
               <div>
                 <span style={{ fontSize:13, fontWeight:700, color: plan === 'pro' ? '#fff' : C.text }}>
-                  {plan === 'free' ? '免费版' : 'Pro 版'}
+                  {plan === 'free' ? t('auth.register.free') : t('auth.register.pro')}
                 </span>
-                {plan === 'pro' && <span style={{ fontSize:10, background:'rgba(255,255,255,0.2)', color:'#fff', borderRadius:999, padding:'2px 7px', marginLeft:8 }}>推荐</span>}
+                {plan === 'pro' && <span style={{ fontSize:10, background:'rgba(255,255,255,0.2)', color:'#fff', borderRadius:999, padding:'2px 7px', marginLeft:8 }}>{t('auth.register.recommended')}</span>}
               </div>
               <span style={{ fontSize:14, fontWeight:700, color: plan === 'pro' ? '#fff' : C.primary }}>
                 {plan === 'free' ? '¥0' : '¥39/月'}
               </span>
             </div>
-            {PLAN_FEATURES[plan].map(f => (
+            {PLAN_FEATURE_KEYS[plan].map(f => (
               <div key={f} style={{ display:'flex', alignItems:'flex-start', gap:8, marginBottom:6 }}>
                 <span style={{ fontSize:12, color: plan === 'pro' ? 'rgba(255,255,255,0.8)' : C.green, marginTop:1 }}>✓</span>
-                <span style={{ fontSize:12, color: plan === 'pro' ? 'rgba(255,255,255,0.9)' : C.muted }}>{f}</span>
+                <span style={{ fontSize:12, color: plan === 'pro' ? 'rgba(255,255,255,0.9)' : C.muted }}>{t(f)}</span>
               </div>
             ))}
           </div>
         ))}
 
         <p style={{ fontSize:11, color:C.muted, marginTop:8, lineHeight:1.6 }}>
-          注册即默认使用免费版，随时可在设置中升级为 Pro
+          {t('auth.register.upgradeHint')}
         </p>
       </div>
 
@@ -148,10 +150,10 @@ export function RegisterPage() {
         <div style={{ width:'100%', maxWidth:400 }}>
 
           <div style={{ marginBottom:28 }}>
-            <h2 style={{ fontSize:22, fontWeight:700, color:C.text, marginBottom:6 }}>创建你的账号</h2>
+            <h2 style={{ fontSize:22, fontWeight:700, color:C.text, marginBottom:6 }}>{t('auth.register.createAccount')}</h2>
             <p style={{ fontSize:13, color:C.muted }}>
-              已有账号？
-              <Link href="/login" style={{ color:C.primary, marginLeft:4, textDecoration:'none', fontWeight:500 }}>立即登录</Link>
+              {t('auth.register.hasAccount')}
+              <Link href="/login" style={{ color:C.primary, marginLeft:4, textDecoration:'none', fontWeight:500 }}>{t('auth.register.loginNow')}</Link>
             </p>
           </div>
 
@@ -172,19 +174,19 @@ export function RegisterPage() {
 
           {/* Form */}
           <form onSubmit={handleRegister} style={{ display:'flex', flexDirection:'column', gap:14 }}>
-            <Field label="姓名">
+            <Field label={t("auth.register.name")}>
               <input type="text" value={name} autoComplete="name"
                 placeholder="张三" onChange={e => setName(e.target.value)} className="input-base" style={inputSt} />
             </Field>
-            <Field label="邮箱">
+            <Field label={t("auth.register.email")}>
               <input type="email" value={email} autoComplete="email"
                 placeholder="you@example.com" onChange={e => setEmail(e.target.value)} className="input-base" style={inputSt} />
             </Field>
-            <Field label="密码" hint="至少 8 位">
+            <Field label={t("auth.register.password")} hint={t("auth.register.passwordHint")}>
               <input type="password" value={password} autoComplete="new-password"
                 placeholder="••••••••" onChange={e => setPassword(e.target.value)} className="input-base" style={inputSt} />
             </Field>
-            <Field label="确认密码">
+            <Field label={t("auth.register.confirmPassword")}>
               <input type="password" value={confirm} autoComplete="new-password"
                 placeholder="再次输入密码" onChange={e => setConfirm(e.target.value)} className="input-base" style={inputSt} />
               {/* Password strength */}
@@ -192,9 +194,9 @@ export function RegisterPage() {
             </Field>
 
             <p style={{ fontSize:11, color:C.muted, lineHeight:1.6 }}>
-              注册即表示同意我们的
-              <a href="#" style={{ color:C.primary, margin:'0 3px' }}>服务条款</a>和
-              <a href="#" style={{ color:C.primary, marginLeft:3 }}>隐私政策</a>
+              {t('auth.register.agreeTo')}
+              <a href="#" style={{ color:C.primary, margin:'0 3px' }}>{t('auth.register.terms')}</a>和
+              <a href="#" style={{ color:C.primary, marginLeft:3 }}>{t('auth.register.privacy')}</a>
             </p>
 
             <button type="submit" disabled={loading === 'register'} style={{
@@ -204,7 +206,7 @@ export function RegisterPage() {
               display:'flex', alignItems:'center', justifyContent:'center', gap:8,
             }}>
               {loading === 'register' && <Spinner />}
-              {loading === 'register' ? '注册中…' : '免费注册'}
+              {loading === 'register' ? t('auth.register.registering') : t('auth.register.register')}
             </button>
           </form>
         </div>
@@ -243,16 +245,18 @@ function Field({ label, hint, children }: { label: string; hint?: string; childr
 }
 
 function Divider() {
+  const { t } = useI18n()
   return (
     <div style={{ display:'flex', alignItems:'center', gap:12, marginBottom:20 }}>
       <div style={{ flex:1, height:1, background:C.border }} />
-      <span style={{ fontSize:11, color:C.muted }}>或填写邮箱注册</span>
+      <span style={{ fontSize:11, color:C.muted }}>{t('auth.register.orEmail')}</span>
       <div style={{ flex:1, height:1, background:C.border }} />
     </div>
   )
 }
 
 function PasswordStrength({ password }: { password: string }) {
+  const { t } = useI18n()
   const score = [
     password.length >= 8,
     /[A-Z]/.test(password),
@@ -260,7 +264,7 @@ function PasswordStrength({ password }: { password: string }) {
     /[^A-Za-z0-9]/.test(password),
   ].filter(Boolean).length
 
-  const labels = ['', '弱', '一般', '较强', '强']
+  const labels = ['', t('auth.register.pwStrength.weak'), t('auth.register.pwStrength.fair'), t('auth.register.pwStrength.good'), t('auth.register.pwStrength.strong')]
   const colors = ['', C.red, '#854F0B', C.primary, C.green]
 
   return (

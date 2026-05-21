@@ -1,6 +1,7 @@
 'use client'
 
 import { useState } from 'react'
+import { useI18n } from '@/lib/i18n'
 import Link from 'next/link'
 
 const C = {
@@ -29,10 +30,11 @@ export function ForgotPasswordPage() {
   const [error, setError] = useState('')
   const [submitting, setSubmitting] = useState(false)
   const [submittedEmail, setSubmittedEmail] = useState('')
+  const { t } = useI18n()
 
   function validateEmail(value: string): string | null {
-    if (!value.trim()) return '请填写邮箱'
-    if (!/\S+@\S+\.\S+/.test(value)) return '邮箱格式不正确'
+    if (!value.trim()) return t('auth.forgotPassword.error.emailRequired')
+    if (!/\S+@\S+\.\S+/.test(value)) return t('auth.forgotPassword.error.emailInvalid')
     return null
   }
 
@@ -57,7 +59,7 @@ export function ForgotPasswordPage() {
 
       const data = await res.json().catch(() => null)
       if (!res.ok) {
-        setError(data?.error ?? '请求失败，请稍后重试')
+        setError(data?.error ?? t('auth.forgotPassword.error.requestFailed'))
         setSubmitting(false)
         return
       }
@@ -65,7 +67,7 @@ export function ForgotPasswordPage() {
       setSubmittedEmail(email.trim())
       setSubmitting(false)
     } catch {
-      setError('网络错误，请稍后重试')
+      setError(t('auth.forgotPassword.error.networkError'))
       setSubmitting(false)
     }
   }
@@ -84,9 +86,9 @@ export function ForgotPasswordPage() {
         {!submittedEmail ? (
           <>
             <div style={{ marginBottom: 24 }}>
-              <h1 style={{ fontSize: 24, fontWeight: 700, color: C.text, marginBottom: 8 }}>Reset your password</h1>
+              <h1 style={{ fontSize: 24, fontWeight: 700, color: C.text, marginBottom: 8 }}>{t('auth.forgotPassword.title')}</h1>
               <p style={{ fontSize: 13, color: C.muted, lineHeight: 1.7 }}>
-                Enter the email address tied to your account and we will send you a reset link.
+                {t('auth.forgotPassword.description')}
               </p>
             </div>
 
@@ -98,7 +100,7 @@ export function ForgotPasswordPage() {
 
             <form onSubmit={handleSubmit} style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
               <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
-                <label style={{ fontSize: 12, fontWeight: 500, color: C.muted }}>Email</label>
+                <label style={{ fontSize: 12, fontWeight: 500, color: C.muted }}>{t('auth.forgotPassword.email')}</label>
                 <input
                   type="email"
                   value={email}
@@ -127,7 +129,7 @@ export function ForgotPasswordPage() {
                   opacity: submitting ? 0.7 : 1,
                 }}
               >
-                {submitting ? 'Sending…' : 'Send reset link'}
+                {submitting ? t('auth.forgotPassword.sending') : t('auth.forgotPassword.sendLink')}
               </button>
             </form>
           </>
@@ -136,9 +138,9 @@ export function ForgotPasswordPage() {
             <div style={{ width: 56, height: 56, borderRadius: 999, background: 'rgba(59,109,17,0.12)', color: C.green, display: 'flex', alignItems: 'center', justifyContent: 'center', margin: '0 auto 18px', fontSize: 28 }}>
               ✓
             </div>
-            <h1 style={{ fontSize: 24, fontWeight: 700, color: C.text, marginBottom: 10 }}>Check your inbox</h1>
+            <h1 style={{ fontSize: 24, fontWeight: 700, color: C.text, marginBottom: 10 }}>{t('auth.forgotPassword.sentTitle')}</h1>
             <p style={{ fontSize: 14, color: C.text, lineHeight: 1.7 }}>
-              {`Check your inbox — we sent a reset link to ${submittedEmail}`}
+              {t('auth.forgotPassword.sentMessage').replace('{email}', submittedEmail)}
             </p>
           </div>
         )}
