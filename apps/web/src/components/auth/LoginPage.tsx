@@ -1,6 +1,8 @@
 'use client'
 
 import { useState, useEffect } from 'react'
+import React from 'react'
+import { useI18n } from '@/lib/i18n'
 import { signIn, getProviders } from 'next-auth/react'
 import { useRouter, useSearchParams } from 'next/navigation'
 import Link from 'next/link'
@@ -35,6 +37,8 @@ export function LoginPage() {
   const [error,    setError]    = useState(urlError ? mapOAuthError(urlError) : '')
   const [loading,  setLoading]  = useState<string | null>(null)  // 'credentials' | 'google' | 'github'
 
+  const { t } = useI18n()
+
   // Detect which OAuth providers are actually configured
   type Providers = Awaited<ReturnType<typeof getProviders>>
   const [oauthProviders, setOauthProviders] = useState<Providers>(null)
@@ -45,13 +49,13 @@ export function LoginPage() {
   // ── Credentials login ────────────────────────────────────────
   async function handleCredentials(e: React.FormEvent) {
     e.preventDefault()
-    if (!email || !password) { setError('请填写邮箱和密码'); return }
+    if (!email || !password) { setError(t('auth.login.error.emailPasswordRequired')); return }
     setError('')
     setLoading('credentials')
     const result = await signIn('credentials', { email, password, redirect: false })
     setLoading(null)
     if (result?.error) {
-      setError('邮箱或密码不正确')
+      setError(t('auth.login.error.invalidCredentials'))
     } else {
       router.push(callbackUrl)
       router.refresh()
@@ -86,10 +90,10 @@ export function LoginPage() {
 
         <div style={{ marginBottom:36 }}>
           <h1 style={{ fontSize:24, fontWeight:700, color:C.text, lineHeight:1.3, marginBottom:10 }}>
-            让 AI 帮你<br />找到理想的工作
+            {t('auth.login.heroTitle').split('\n').map((line, i) => <React.Fragment key={i}>{line}{i === 0 && <br />}</React.Fragment>)}
           </h1>
           <p style={{ fontSize:13, color:C.muted, lineHeight:1.7 }}>
-            ApplyMate AI 自动化你的求职流程——从发现职位到投递简历，全程 AI 驱动。
+            {t('auth.login.heroDesc')}
           </p>
         </div>
 
@@ -112,7 +116,7 @@ export function LoginPage() {
             {/* Large decorative quote mark */}
             <div style={{ fontSize:64, lineHeight:1, color:C.primary, opacity:0.18, fontFamily:'Georgia, serif', marginBottom:-8, userSelect:'none' }}>&ldquo;</div>
             <p style={{ fontSize:13, color:C.text, lineHeight:1.75, margin:'0 0 14px' }}>
-              用 ApplyMate 两周内拿到了 Adyen、Booking.com 的面试，省了我大量整理简历的时间。
+              {t('auth.login.testimonial')}
             </p>
             <div style={{ fontSize:12, color:C.muted, fontStyle:'normal' }}>
               — <span style={{ fontWeight:500, color:C.text }}>Zhang Li</span>, Backend Engineer · Amsterdam
@@ -127,10 +131,10 @@ export function LoginPage() {
 
           {/* Header */}
           <div style={{ marginBottom:32 }}>
-            <h2 style={{ fontSize:22, fontWeight:700, color:C.text, marginBottom:6 }}>欢迎回来 👋</h2>
+            <h2 style={{ fontSize:22, fontWeight:700, color:C.text, marginBottom:6 }}>{t('auth.login.welcomeBack')}</h2>
             <p style={{ fontSize:13, color:C.muted }}>
-              还没有账号？
-              <Link href="/register" style={{ color:C.primary, marginLeft:4, textDecoration:'none', fontWeight:500 }}>免费注册</Link>
+              {t('auth.login.noAccount')}
+              <Link href="/register" style={{ color:C.primary, marginLeft:4, textDecoration:'none', fontWeight:500 }}>{t('auth.login.signUp')}</Link>
             </p>
           </div>
 
@@ -148,7 +152,7 @@ export function LoginPage() {
                 {oauthProviders.google && (
                   <OAuthBtn
                     icon={<GoogleIcon />}
-                    label="使用 Google 登录"
+                    label="{t('auth.login.googleLogin')}"
                     onClick={() => handleOAuth('google')}
                     loading={loading === 'google'}
                   />
@@ -156,7 +160,7 @@ export function LoginPage() {
                 {oauthProviders.github && (
                   <OAuthBtn
                     icon={<GitHubIcon />}
-                    label="使用 GitHub 登录"
+                    label="{t('auth.login.githubLogin')}"
                     onClick={() => handleOAuth('github')}
                     loading={loading === 'github'}
                     dark
@@ -167,7 +171,7 @@ export function LoginPage() {
               {/* Divider */}
               <div style={{ display:'flex', alignItems:'center', gap:12, marginBottom:24 }}>
                 <div style={{ flex:1, height:1, background:C.border }} />
-                <span style={{ fontSize:11, color:C.muted }}>或使用邮箱登录</span>
+                <span style={{ fontSize:11, color:C.muted }}>{t('auth.login.orEmail')}</span>
                 <div style={{ flex:1, height:1, background:C.border }} />
               </div>
             </>
@@ -181,7 +185,7 @@ export function LoginPage() {
 
           {/* Credentials form */}
           <form onSubmit={handleCredentials} style={{ display:'flex', flexDirection:'column', gap:14 }}>
-            <FormField label="邮箱">
+            <FormField label={t("auth.login.email")}>
               <input
                 type="email" value={email} autoComplete="email"
                 placeholder="you@example.com"
@@ -192,8 +196,8 @@ export function LoginPage() {
             </FormField>
 
             <FormField
-              label="密码"
-              right={<Link href="/forgot-password" style={{ fontSize:11, color:C.primary, textDecoration:'none' }}>忘记密码？</Link>}
+              label={t("auth.login.password")}
+              right={<Link href="/forgot-password" style={{ fontSize:11, color:C.primary, textDecoration:'none' }}>{t('auth.login.forgotPassword')}</Link>}
             >
               <input
                 type="password" value={password} autoComplete="current-password"
@@ -204,12 +208,12 @@ export function LoginPage() {
               />
             </FormField>
 
-            <SubmitBtn loading={loading === 'credentials'}>登录</SubmitBtn>
+            <SubmitBtn loading={loading === 'credentials'}>{t('auth.login.login')}</SubmitBtn>
           </form>
 
           {/* Demo hint */}
           <div style={{ marginTop:20, padding:'10px 14px', background:'rgba(24,95,165,0.06)', borderRadius:8, fontSize:11, color:C.muted, lineHeight:1.6 }}>
-            🎮 演示账号：<span style={{ fontFamily:'monospace', color:C.text }}>demo@applymate.ai</span> / <span style={{ fontFamily:'monospace', color:C.text }}>demo1234</span>
+            {t('auth.login.demoAccount')} <span style={{ fontFamily:'monospace', color:C.text }}>demo@applymate.ai</span> / <span style={{ fontFamily:'monospace', color:C.text }}>demo1234</span>
           </div>
 
           {/* Dev hint: OAuth not configured */}
@@ -231,6 +235,7 @@ export function LoginPage() {
 function OAuthBtn({ icon, label, onClick, loading, dark }: {
   icon: React.ReactNode; label: string; onClick: () => void; loading?: boolean; dark?: boolean
 }) {
+  const { t } = useI18n()
   return (
     <button
       type="button" onClick={onClick} disabled={loading}
@@ -245,7 +250,7 @@ function OAuthBtn({ icon, label, onClick, loading, dark }: {
       }}
     >
       {loading ? <Spinner /> : icon}
-      {loading ? '跳转中…' : label}
+      {loading ? t('auth.login.redirecting') : label}
     </button>
   )
 }
@@ -263,6 +268,7 @@ function FormField({ label, children, right }: { label: string; children: React.
 }
 
 function SubmitBtn({ children, loading }: { children: React.ReactNode; loading?: boolean }) {
+  const { t } = useI18n()
   return (
     <button
       type="submit" disabled={loading}
@@ -275,7 +281,7 @@ function SubmitBtn({ children, loading }: { children: React.ReactNode; loading?:
       }}
     >
       {loading && <Spinner light />}
-      {loading ? '登录中…' : children}
+      {loading ? t('auth.login.loggingIn') : children}
     </button>
   )
 }
