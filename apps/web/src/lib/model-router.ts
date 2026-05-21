@@ -456,6 +456,8 @@ export type FeatureId =
   | 'interviewPrep'
   | 'formFill'
   | 'formRevise'
+  | 'autoApply'
+  | 'jobScoring'
 
 export const FEATURE_LABELS: Record<FeatureId, string> = {
   scoring:       '简历评分 / 岗位匹配',
@@ -467,6 +469,8 @@ export const FEATURE_LABELS: Record<FeatureId, string> = {
   interviewPrep: '面试准备',
   formFill:      '表单自动填写',
   formRevise:    '表单填写修改',
+  autoApply:     '自动申请 Agent（无人值守）',
+  jobScoring:    '职位评分 + 关键词提取',
 }
 
 /**
