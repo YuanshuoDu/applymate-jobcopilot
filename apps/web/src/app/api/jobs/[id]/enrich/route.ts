@@ -3,9 +3,10 @@
  * Enriches a saved job with fresh data from job APIs.
  *
  * Enrichment sources (all best-effort, partial results are fine):
- *   1. ATS / LinkedIn search by title+company → description, salary, logo
- *   2. Mantiks company endpoint → hiring manager contact, company intel
- *   3. Salary API → market salary benchmark for the role
+ *   1. Enrichment cascade (T0→T1→T2) — free description extraction from job page
+ *   2. ATS search via RapidAPI — salary + logo if cascade missed description
+ *   3. Mantiks company endpoint — hiring manager contact, company intel
+ *   4. Salary API — market salary benchmark for the role
  *
  * Updates the job record and returns the enriched job + enrichment metadata.
  * Safe to call multiple times — always overwrites with fresher data.
@@ -14,6 +15,7 @@ import { NextRequest } from 'next/server'
 import { requireAuth, isErrorResponse, ok, err } from '@/lib/api-helpers'
 import { db } from '@/lib/db'
 import { truncate } from '@/lib/utils'
+import { enrichJob } from '@/lib/agent/enrich'
 
 type Params = { params: Promise<{ id: string }> }
 
@@ -56,6 +58,25 @@ export async function POST(_req: NextRequest, { params }: Params) {
 
   const result: EnrichmentResult = { sources: [] }
 
+  // ── 0. Enrichment cascade (T0→T1→T2) — free description extraction ───
+  if (job.url && !job.description) {
+    try {
+      const html = await fetch(job.url, {
+        signal: AbortSignal.timeout(8_000),
+        headers: { 'User-Agent': 'ApplyMate/1.0' },
+        cache: 'no-store',
+      }).then(r => r.ok ? r.text() : null)
+
+      if (html) {
+        const enriched = await enrichJob({ html, url: job.url })
+        if (enriched?.description) {
+          result.description = truncate(enriched.description, 2000)
+          result.sources.push(`enrich-${enriched.method}`)
+        }
+      }
+    } catch { /* non-fatal */ }
+  }
+
   // ── 1. Job description + salary via ATS search ────────────────────────────
   if (rapidKey && (!job.description || !job.salary)) {
     try {
@@ -82,24 +103,22 @@ export async function POST(_req: NextRequest, { params }: Params) {
           ) ?? jobs[0]
 
           if (match) {
-            if (!job.description && match.description_text) {
+            if (!job.description && !result.description && match.description_text) {
               result.description = truncate(match.description_text, 2000)
+              result.sources.push('ats')
             }
             if (!job.salary) {
               if (match.salary_raw) {
                 result.salary = match.salary_raw
               } else if (match.ai_salary_minvalue) {
                 const cur = match.ai_salary_currency ?? ''
-                const sym = cur === 'GBP' ? '£' : cur === 'EUR' ? '€' : '$'
-                result.salary = `${sym}${match.ai_salary_minvalue.toLocaleString()}${
-                  match.ai_salary_maxvalue ? `–${match.ai_salary_maxvalue.toLocaleString()}` : ''
-                }/yr`
+                const sym = cur === 'GBP' ? '\u00a3' : cur === 'EUR' ? '\u20ac' : '$'
+                result.salary = `${sym}${match.ai_salary_minvalue.toLocaleString()}${match.ai_salary_maxvalue ? `\u2013${match.ai_salary_maxvalue.toLocaleString()}` : ''}/yr`
               }
             }
             if (!job.logo && match.organization_logo) {
               result.logo = match.organization_logo
             }
-            result.sources.push('ats')
           }
         }
       }
