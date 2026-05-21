@@ -1,0 +1,28 @@
+{
+  "name": "@jobcopilot/worker",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "tsx watch src/index.ts",
+    "start": "node dist/index.js",
+    "build": "tsc",
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "dependencies": {
+    "@jobcopilot/shared": "workspace:*",
+    "bullmq": "^5.52.2",
+    "cloakbrowser": "^0.3.30",
+    "ioredis": "^5.8.2",
+    "pg": "^8.16.3",
+    "playwright-core": "^1.60.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.15.14",
+    "@types/pg": "^8.11.13",
+    "tsx": "^4.19.4",
+    "typescript": "5.9.3",
+    "vitest": "^3.1.4"
+  }
+}
