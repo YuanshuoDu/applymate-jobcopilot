@@ -11,9 +11,13 @@
     "test:watch": "vitest"
   },
   "dependencies": {
+    "@bull-board/api": "^7.1.5",
+    "@bull-board/express": "^7.1.5",
     "@jobcopilot/shared": "workspace:*",
+    "@types/express": "^5.0.6",
     "bullmq": "^5.52.2",
     "cloakbrowser": "^0.3.30",
+    "express": "^5.2.1",
     "ioredis": "^5.8.2",
     "pdfkit": "^0.18.0",
     "pg": "^8.16.3",
@@ -21,10 +25,10 @@
   },
   "devDependencies": {
     "@types/node": "^22.15.14",
+    "@types/pdfkit": "^0.17.6",
     "@types/pg": "^8.11.13",
     "tsx": "^4.19.4",
     "typescript": "5.9.3",
-    "vitest": "^3.1.4",
-    "@types/pdfkit": "^0.17.6"
+    "vitest": "^3.1.4"
   }
 }
