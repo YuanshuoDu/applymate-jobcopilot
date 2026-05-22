@@ -29,8 +29,9 @@ describe('checkRateLimit', () => {
     // 11th request should be blocked
     const blocked = checkRateLimit('test-key-2')
     expect(blocked.ok).toBe(false)
-    expect(blocked.retryAfter).toBeGreaterThan(0)
-    expect(blocked.retryAfter).toBeLessThanOrEqual(60)
+    const blockedResult = blocked as { ok: false; retryAfter: number }
+    expect(blockedResult.retryAfter).toBeGreaterThan(0)
+    expect(blockedResult.retryAfter).toBeLessThanOrEqual(60)
   })
 
   it('respects custom limits', () => {
@@ -67,12 +68,12 @@ describe('checkRateLimit', () => {
     }
     const blocked = checkRateLimit('decay-key')
     expect(blocked.ok).toBe(false)
-    expect(blocked.retryAfter).toBeGreaterThan(55) // within 5s of 60s window
+    expect((blocked as { ok: false; retryAfter: number }).retryAfter).toBeGreaterThan(55) // within 5s of 60s window
 
     vi.advanceTimersByTime(30_000)
 
     const stillBlocked = checkRateLimit('decay-key')
     expect(stillBlocked.ok).toBe(false)
-    expect(stillBlocked.retryAfter).toBeLessThan(31)
+    expect((stillBlocked as { ok: false; retryAfter: number }).retryAfter).toBeLessThan(31)
   })
 })

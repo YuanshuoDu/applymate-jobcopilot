@@ -39,7 +39,7 @@ describe('POST /api/ai/suggest', () => {
     const { POST } = await import('@/app/api/ai/suggest/route')
     const req = fakeNextRequest({ jobTitle: 'Engineer' })
     const res = await POST(req as never)
-    expect(res.status).toBe(400)
+    expect(res!.status).toBe(400)
   })
 
   it('returns 3 suggestions from a successful AI response', async () => {
@@ -59,8 +59,8 @@ describe('POST /api/ai/suggest', () => {
     })
     const res = await POST(req as never)
 
-    expect(res.status).toBe(200)
-    const body = await res.json()
+    expect(res!.status).toBe(200)
+    const body = await res!.json()
     expect(body.suggestions).toHaveLength(3)
     expect(body.suggestions[0].text).toContain('Docker')
     expect(body.suggestions[0].applied).toBe(false)
@@ -78,8 +78,8 @@ describe('POST /api/ai/suggest', () => {
     })
     const res = await POST(req as never)
 
-    expect(res.status).toBe(200)
-    const body = await res.json()
+    expect(res!.status).toBe(200)
+    const body = await res!.json()
     expect(body.suggestions).toHaveLength(3)
   })
 })

@@ -554,10 +554,7 @@ function JobDetailDrawer({ job, onClose, onStatusChange, onUpdate, onDelete }: {
           {/* Auto Apply */}
           {job.url && (
             <div>
-              <AutoApplyButton job={job} onApplied={() => {
-                // Trigger re-fetch of job to get updated status
-                apiMutate(`/api/jobs/${job.id}`, 'GET').catch(() => {})
-              }} />
+              <AutoApplyButton job={job} onApplied={() => onStatusChange(job.id, 'applied')} />
             </div>
           )}
 
@@ -881,23 +878,23 @@ function PaginationBar({
 // ── Auto Apply Button ─────────────────────────────────────────────────────────
 function AutoApplyButton({ job, onApplied }: { job: Job; onApplied?: () => void }) {
   const [loading, setLoading] = useState(false)
-  const { showToast } = useToast()
+  const toast = useToast()
 
   async function handleAutoApply() {
     setLoading(true)
     try {
       const res = await fetch(`/api/jobs/${job.id}/auto-apply`, { method: 'POST' })
       if (res.ok) {
-        showToast('Queued for auto-apply 🤖', 'success')
+        toast.success('Queued for auto-apply 🤖')
         onApplied?.()
       } else {
         const d = await res.json().catch(() => ({}))
-        if (res.status === 409) showToast('Already applied or in progress', 'info')
-        else if (res.status === 429) showToast('Rate limit exceeded — try again later', 'warning')
-        else showToast(d.error ?? 'Failed to queue auto-apply', 'error')
+        if (res.status === 409) toast.info('Already applied or in progress')
+        else if (res.status === 429) toast.warning('Rate limit exceeded — try again later')
+        else toast.error(d.error ?? 'Failed to queue auto-apply')
       }
     } catch {
-      showToast('Network error — try again', 'error')
+      toast.error('Network error — try again')
     } finally {
       setLoading(false)
     }

@@ -18,6 +18,7 @@ interface JobResult {
   title:            string
   company:          string
   location:         string
+  status?:          string | null
   salary?:          string
   description:      string
   url:              string
