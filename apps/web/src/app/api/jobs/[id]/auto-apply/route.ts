@@ -1,7 +1,8 @@
-import { NextRequest } from "next/server";
+import { NextRequest, NextResponse } from "next/server";
 import { requireAuth, isErrorResponse, ok, err } from "@/lib/api-helpers";
 import { db } from "@/lib/db";
 import { enqueueApplyTask } from "@/lib/apply-queue-client";
+import { checkRateLimit } from "@/lib/rate-limit";
 
 type Params = { params: Promise<{ id: string }> };
 
@@ -9,13 +10,22 @@ export async function POST(req: NextRequest, { params }: Params) {
   const auth = await requireAuth(req);
   if (isErrorResponse(auth)) return auth;
 
+  // Rate limit: max 10 auto-apply requests per user per hour
+  const rl = checkRateLimit(`auto-apply:${auth.userId}`, 10, 3_600_000);
+  if (!rl.ok) {
+    return NextResponse.json(
+      { error: "Rate limit exceeded. Try again later." },
+      { status: 429 }
+    );
+  }
+
   const { id: jobId } = await params;
   const job = await db.job.findUnique({ where: { id: jobId } });
   if (!job || job.userId !== auth.userId) return err("Not found", 404);
   if (!job.url) return err("Job has no apply URL", 400);
 
   // DEDUP GUARD: prevent double-apply
-  if (job.status === 'applied') return err('Already applied or in progress', 409)
+  if (job.status === "applied") return err("Already applied or in progress", 409);
 
   const body = await req.json().catch(() => ({})) as { dryRun?: boolean };
 
@@ -27,7 +37,6 @@ export async function POST(req: NextRequest, { params }: Params) {
     resumePath: auth.userId,
     dryRun: body.dryRun ?? false,
   });
-
 
   return ok({ queued: true, taskId });
 }

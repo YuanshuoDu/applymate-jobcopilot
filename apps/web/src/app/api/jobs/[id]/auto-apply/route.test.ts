@@ -25,6 +25,11 @@ vi.mock("@/lib/apply-queue-client", () => ({
   enqueueApplyTask: vi.fn(),
 }));
 
+// Mock rate limiter
+vi.mock("@/lib/rate-limit", () => ({
+  checkRateLimit: vi.fn(),
+}));
+
 function mockReq(body?: unknown): NextRequest {
   return new NextRequest("https://applymate.app/api/jobs/abc/auto-apply", {
     method: "POST",
@@ -37,8 +42,11 @@ async function jsonBody(res: Response) {
 }
 
 describe("POST /api/jobs/[id]/auto-apply", () => {
-  beforeEach(() => {
+  beforeEach(async () => {
     vi.clearAllMocks();
+    // Default: rate limit passes
+    const { checkRateLimit } = vi.mocked(await import("@/lib/rate-limit"));
+    checkRateLimit.mockReturnValue({ ok: true });
   });
 
   it("happy path: returns 200 + queued:true", async () => {
@@ -62,6 +70,46 @@ describe("POST /api/jobs/[id]/auto-apply", () => {
     const body = await jsonBody(res);
     expect(body.queued).toBe(true);
     expect(body.taskId).toBe("bull-task-123");
+  });
+
+  it("rate limit exceeded returns 429", async () => {
+    const { requireAuth } = await import("@/lib/api-helpers");
+    vi.mocked(requireAuth).mockResolvedValue({ userId: "user-1" });
+
+    const { checkRateLimit } = await import("@/lib/rate-limit");
+    vi.mocked(checkRateLimit).mockReturnValue({ ok: false, retryAfter: 3600 });
+
+    const res = await POST(mockReq(), { params: Promise.resolve({ id: "job-1" }) });
+    expect(res.status).toBe(429);
+
+    const body = await jsonBody(res);
+    expect(body.error).toContain("Rate limit exceeded");
+  });
+
+  it("rate limit key is per-user (different users tracked independently)", async () => {
+    const { requireAuth } = await import("@/lib/api-helpers");
+    vi.mocked(requireAuth).mockResolvedValue({ userId: "user-2" });
+
+    const { checkRateLimit } = await import("@/lib/rate-limit");
+    // user-2 is NOT rate-limited
+    vi.mocked(checkRateLimit).mockReturnValue({ ok: true });
+
+    const { db } = await import("@/lib/db");
+    vi.mocked(db.job.findUnique).mockResolvedValue({
+      id: "job-1",
+      userId: "user-2",
+      url: "https://jobs.example.com/apply",
+      status: "saved",
+    });
+
+    const { enqueueApplyTask } = await import("@/lib/apply-queue-client");
+    vi.mocked(enqueueApplyTask).mockResolvedValue("bull-task-456");
+
+    const res = await POST(mockReq(), { params: Promise.resolve({ id: "job-1" }) });
+    expect(res.status).toBe(200);
+
+    // Verify rate limit was checked with user-2's key
+    expect(checkRateLimit).toHaveBeenCalledWith("auto-apply:user-2", 10, 3_600_000);
   });
 
   it("job without URL returns 400", async () => {
@@ -127,7 +175,7 @@ describe("POST /api/jobs/[id]/auto-apply", () => {
       id: "job-1",
       userId: "user-1",
       url: "https://jobs.example.com/apply",
-      status: 'applied',
+      status: "applied",
     });
 
     const res = await POST(mockReq(), { params: Promise.resolve({ id: "job-1" }) });
