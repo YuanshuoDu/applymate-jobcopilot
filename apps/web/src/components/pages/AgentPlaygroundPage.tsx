@@ -859,6 +859,11 @@ export function AgentPlaygroundPage() {
     setCurrentRole(null)
     setRoleStatuses(Object.fromEntries(ROLES.map(r => [r.key, 'idle'])) as Record<RoleKey, RoleStatus>)
 
+    // Fire-and-forget: trigger job discovery before pipeline runs
+    fetch('/api/agent/scout', { method: 'POST' })
+      .then(r => console.log('[agent-run] Scout:', r.status === 200 ? 'queued' : r.status === 409 ? 'skipped (cooldown)' : 'error ' + r.status))
+      .catch(() => console.log('[agent-run] Scout: unavailable'))
+
     const es = new EventSource('/api/agent/run')
     esRef.current = es
 
