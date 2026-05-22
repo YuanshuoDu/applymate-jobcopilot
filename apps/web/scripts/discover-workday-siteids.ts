@@ -1,10 +1,20 @@
 /**
  * discover-workday-siteids.ts
  *
- * Playwright script that navigates to Workday tenant pages and intercepts
- * XHR requests to /wday/cxs/ to extract the correct siteId.
+ * Playwright script that navigates to Workday tenant career portals and
+ * intercepts XHR requests to /wday/cxs/ to extract the correct siteId.
  *
  * Usage: pnpm --filter web exec tsx scripts/discover-workday-siteids.ts
+ *
+ * KNOWN LIMITATION (2026-05-22):
+ * All 33 entries in workday.yaml use the wd3 subdomain (e.g. sap.wd3.myworkdayjobs.com).
+ * Testing shows every wd3 tenant redirects to community.workday.com maintenance/invalid
+ * pages -- the correct wd{N} subdomain varies per employer and must be discovered
+ * manually from each company's public career page redirect. Until the baseUrl is
+ * corrected, CXS interception cannot succeed.
+ *
+ * The script remains as a framework: once correct tenant URLs are provided,
+ * it performs search interaction and intercepts siteId from CXS requests.
  */
 
 import { chromium } from "playwright-core";
@@ -76,16 +86,16 @@ async function main() {
 
   const browser = await chromium.launch({ headless: true });
   const discoveries = new Map<string, string>();
+  const unreachable = new Set<string>();
 
   for (const employer of targets) {
-    // Navigate to the Workday tenant landing page, which loads the job search widget
     const tenantUrl = employer.baseUrl + "/" + employer.tenant;
     console.log("[" + employer.name + "] " + tenantUrl + " ...");
 
     const page = await browser.newPage();
     let discovered: string | null = null;
+    let isUnreachable = false;
 
-    // Intercept XHR/fetch to Workday CXS API
     page.on("request", req => {
       const url = req.url();
       const match = url.match(/\/wday\/cxs\/[^/]+\/([^/]+)\//);
@@ -96,12 +106,32 @@ async function main() {
 
     try {
       await page.goto(tenantUrl, { timeout: 30_000, waitUntil: "domcontentloaded" });
-      await page.waitForTimeout(8000);
+      await page.waitForTimeout(5000);
+
+      // Detect maintenance/unreachable pages
+      const finalUrl = page.url();
+      if (finalUrl.includes("community.workday.com") || finalUrl.includes("maintenance-page")) {
+        isUnreachable = true;
+        unreachable.add(employer.tenant);
+      }
+
+      // Try search interaction to trigger CXS
+      if (!isUnreachable) {
+        const input = page.locator('input[type="text"]').first();
+        if (await input.isVisible({ timeout: 2000 }).catch(() => false)) {
+          await input.fill("engineer");
+          await input.press("Enter");
+          await page.waitForTimeout(4000);
+        }
+      }
     } catch (err: any) {
-      console.log("  (!!) Navigation error: " + err.message);
+      console.log("  (!!) Error: " + err.message);
+      isUnreachable = true;
     }
 
-    if (discovered) {
+    if (isUnreachable) {
+      console.log("  (!!) Unreachable (wd subdomain may be wrong)");
+    } else if (discovered) {
       console.log('  (OK) siteId: "' + discovered + '" (was "' + employer.siteId + '")');
       discoveries.set(employer.tenant, discovered);
     } else {
@@ -116,6 +146,7 @@ async function main() {
 
   console.log("\n=== Results ===");
   console.log("Discovered: " + discoveries.size + " / " + targets.length);
+  console.log("Unreachable: " + unreachable.size);
   if (discoveries.size > 0) {
     console.log("\nUpdating workday.yaml ...");
     updateWorkdayYaml(discoveries);
@@ -123,8 +154,12 @@ async function main() {
     for (const [tenant, siteId] of discoveries) {
       console.log("  " + tenant + ": " + siteId);
     }
+  } else if (unreachable.size > 0) {
+    console.log("\nAll tested tenants appear to use incorrect wd{N} subdomains.");
+    console.log("Workday.yaml baseUrl values need manual correction before this script can discover siteIds.");
+    console.log("Visit each company public career page -> click Jobs -> note the redirect URL to get correct baseUrl.");
   } else {
-    console.log("\nNo siteIds discovered. workday.yaml unchanged.");
+    console.log("\nNo discoveries or errors. Nothing changed.");
   }
 }
 main().catch(err => { console.error("Fatal:", err); process.exit(1); });
