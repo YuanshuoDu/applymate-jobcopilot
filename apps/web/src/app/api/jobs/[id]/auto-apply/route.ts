@@ -24,7 +24,7 @@ export async function POST(req: NextRequest, { params }: Params) {
     userId: auth.userId,
     applyUrl: job.url,
     personaId: auth.userId,
-    resumePath: `db:${auth.userId}`,
+    resumePath: auth.userId,
     dryRun: body.dryRun ?? false,
   });
 
