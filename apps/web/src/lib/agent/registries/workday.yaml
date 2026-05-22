@@ -2,62 +2,67 @@
 # Verified: each entry confirmed via CXS search endpoint (200 + total > 0)
 # Country codes: ISO 3166-1 alpha-2, lowercase
 # Tier: 1=Fortune 500, 2=large multinational, 3=regional
-# baseUrl: includes wd{N} subdomain — never guess wd3 vs wd5 vs wd10
+# baseUrl: includes wd{N} subdomain ? never guess wd3 vs wd5 vs wd10
 #
 # Verification status key:
-#   verified   — CXS search endpoint confirmed (200 + total>0)
-#   pending    — entry not yet verified (best-guess tenant/siteId)
-#   unreachable— endpoint 401/404/422, needs correction
+#   verified   ? CXS search endpoint confirmed (200 + total>0)
+#   pending    ? entry not yet verified (best-guess tenant/siteId)
+#   unreachable? endpoint 401/404/422, needs correction
+#
+# LAST VERIFIED: 2026-05-22 ? most EU tenants return 422 (wrong siteId).
+# To find correct siteIds: visit each career site in a browser, open DevTools,
+# filter network requests for "cxs" and note tenant/siteId from the URL.
 employers:
-  # === DE — Germany ===
-  # VERIFIED entries confirmed via HTTP
-  # PENDING entries: tenant/siteId are best-guess, needs run of verify-workday.ts
+  # === DE ? Germany ===
+  # All 15 German entries tested via HTTP POST to CXS search endpoint.
+  # Every one returned 422 (siteId mismatch) ? siteId values need to be
+  # extracted from each employer's career site via browser DevTools.
 
   # --- Tier 1: Fortune 500 / DAX ---
-  - { name: "SAP",              tenant: "sap",        siteId: "SAPCareers",                 baseUrl: "https://sap.wd3.myworkdayjobs.com",        country: "de", tier: 1, status: "pending" }
-  - { name: "Siemens",          tenant: "siemens",    siteId: "Siemens",                     baseUrl: "https://siemens.wd3.myworkdayjobs.com",    country: "de", tier: 1, status: "pending" }
-  - { name: "BMW Group",        tenant: "bmw",        siteId: "BMW_Group",                   baseUrl: "https://bmw.wd3.myworkdayjobs.com",        country: "de", tier: 1, status: "pending" }
-  - { name: "Mercedes-Benz",    tenant: "daimler",    siteId: "MBAG_External",               baseUrl: "https://daimler.wd3.myworkdayjobs.com",    country: "de", tier: 1, status: "pending" }
-  - { name: "Volkswagen",       tenant: "vw",         siteId: "Volkswagen_Careers",          baseUrl: "https://vw.wd3.myworkdayjobs.com",         country: "de", tier: 1, status: "pending" }
-  - { name: "Adidas",           tenant: "adidas",     siteId: "adidas",                      baseUrl: "https://adidas.wd3.myworkdayjobs.com",     country: "de", tier: 1, status: "pending" }
-  - { name: "Allianz",          tenant: "allianz",    siteId: "Allianz",                     baseUrl: "https://allianz.wd3.myworkdayjobs.com",    country: "de", tier: 1, status: "pending" }
-  - { name: "BASF",             tenant: "basf",       siteId: "BASF_Careers",                baseUrl: "https://basf.wd3.myworkdayjobs.com",       country: "de", tier: 1, status: "pending" }
-  - { name: "Bayer",            tenant: "bayer",      siteId: "bayer",                       baseUrl: "https://bayer.wd3.myworkdayjobs.com",      country: "de", tier: 1, status: "pending" }
-  - { name: "Deutsche Telekom", tenant: "telekom",    siteId: "DTAG_Careers",                baseUrl: "https://telekom.wd3.myworkdayjobs.com",    country: "de", tier: 1, status: "pending" }
+  - { name: "SAP",              tenant: "sap",        siteId: "SAPCareers",                 baseUrl: "https://sap.wd3.myworkdayjobs.com",        country: "de", tier: 1, status: "unreachable" }
+  - { name: "Siemens",          tenant: "siemens",    siteId: "Siemens",                     baseUrl: "https://siemens.wd3.myworkdayjobs.com",    country: "de", tier: 1, status: "unreachable" }
+  - { name: "BMW Group",        tenant: "bmw",        siteId: "BMW_Group",                   baseUrl: "https://bmw.wd3.myworkdayjobs.com",        country: "de", tier: 1, status: "unreachable" }
+  - { name: "Mercedes-Benz",    tenant: "daimler",    siteId: "MBAG_External",               baseUrl: "https://daimler.wd3.myworkdayjobs.com",    country: "de", tier: 1, status: "unreachable" }
+  - { name: "Volkswagen",       tenant: "vw",         siteId: "Volkswagen_Careers",          baseUrl: "https://vw.wd3.myworkdayjobs.com",         country: "de", tier: 1, status: "unreachable" }
+  - { name: "Adidas",           tenant: "adidas",     siteId: "adidas",                      baseUrl: "https://adidas.wd3.myworkdayjobs.com",     country: "de", tier: 1, status: "unreachable" }
+  - { name: "Allianz",          tenant: "allianz",    siteId: "Allianz",                     baseUrl: "https://allianz.wd3.myworkdayjobs.com",    country: "de", tier: 1, status: "unreachable" }
+  - { name: "BASF",             tenant: "basf",       siteId: "BASF_Careers",                baseUrl: "https://basf.wd3.myworkdayjobs.com",       country: "de", tier: 1, status: "unreachable" }
+  - { name: "Bayer",            tenant: "bayer",      siteId: "bayer",                       baseUrl: "https://bayer.wd3.myworkdayjobs.com",      country: "de", tier: 1, status: "unreachable" }
+  - { name: "Deutsche Telekom", tenant: "telekom",    siteId: "DTAG_Careers",                baseUrl: "https://telekom.wd3.myworkdayjobs.com",    country: "de", tier: 1, status: "unreachable" }
 
   # --- Tier 2: Large multinational ---
-  - { name: "Bosch",            tenant: "bosch",      siteId: "Bosch_Careers",               baseUrl: "https://bosch.wd3.myworkdayjobs.com",      country: "de", tier: 2, status: "pending" }
-  - { name: "Continental",      tenant: "continental", siteId: "Continental_Careers",        baseUrl: "https://continental.wd3.myworkdayjobs.com", country: "de", tier: 2, status: "pending" }
-  - { name: "Lufthansa",        tenant: "lufthansa",  siteId: "LHCareerExternalCareerSite",  baseUrl: "https://lufthansa.wd3.myworkdayjobs.com",  country: "de", tier: 2, status: "pending" }
-  - { name: "Delivery Hero",    tenant: "deliveryhero", siteId: "Delivery_Hero",             baseUrl: "https://deliveryhero.wd3.myworkdayjobs.com", country: "de", tier: 2, status: "pending" }
-  - { name: "Zalando",          tenant: "zalando",    siteId: "Zalando",                     baseUrl: "https://zalando.wd3.myworkdayjobs.com",    country: "de", tier: 2, status: "pending" }
+  - { name: "Bosch",            tenant: "bosch",      siteId: "Bosch_Careers",               baseUrl: "https://bosch.wd3.myworkdayjobs.com",      country: "de", tier: 2, status: "unreachable" }
+  - { name: "Continental",      tenant: "continental", siteId: "Continental_Careers",        baseUrl: "https://continental.wd3.myworkdayjobs.com", country: "de", tier: 2, status: "unreachable" }
+  - { name: "Lufthansa",        tenant: "lufthansa",  siteId: "LHCareerExternalCareerSite",  baseUrl: "https://lufthansa.wd3.myworkdayjobs.com",  country: "de", tier: 2, status: "unreachable" }
+  - { name: "Delivery Hero",    tenant: "deliveryhero", siteId: "Delivery_Hero",             baseUrl: "https://deliveryhero.wd3.myworkdayjobs.com", country: "de", tier: 2, status: "unreachable" }
+  - { name: "Zalando",          tenant: "zalando",    siteId: "Zalando",                     baseUrl: "https://zalando.wd3.myworkdayjobs.com",    country: "de", tier: 2, status: "unreachable" }
 
-  # === NL — Netherlands ===
-  - { name: "Philips",          tenant: "philips",    siteId: "Philips",                     baseUrl: "https://philips.wd3.myworkdayjobs.com",    country: "nl", tier: 1, status: "pending" }
-  - { name: "ASML",             tenant: "asml",       siteId: "ASML",                        baseUrl: "https://asml.wd3.myworkdayjobs.com",       country: "nl", tier: 1, status: "pending" }
-  - { name: "ING",              tenant: "ing",        siteId: "ING",                         baseUrl: "https://ing.wd3.myworkdayjobs.com",        country: "nl", tier: 1, status: "pending" }
-  - { name: "Heineken",         tenant: "heineken",   siteId: "Heineken",                    baseUrl: "https://heineken.wd3.myworkdayjobs.com",   country: "nl", tier: 2, status: "pending" }
+  # === NL ? Netherlands ===
+  - { name: "Philips",          tenant: "philips",    siteId: "Philips",                     baseUrl: "https://philips.wd3.myworkdayjobs.com",    country: "nl", tier: 1, status: "unreachable" }
+  - { name: "ASML",             tenant: "asml",       siteId: "ASML",                        baseUrl: "https://asml.wd3.myworkdayjobs.com",       country: "nl", tier: 1, status: "unreachable" }
+  - { name: "ING",              tenant: "ing",        siteId: "ING",                         baseUrl: "https://ing.wd3.myworkdayjobs.com",        country: "nl", tier: 1, status: "unreachable" }
+  - { name: "Heineken",         tenant: "heineken",   siteId: "Heineken",                    baseUrl: "https://heineken.wd3.myworkdayjobs.com",   country: "nl", tier: 2, status: "unreachable" }
 
-  # === CH — Switzerland ===
-  - { name: "Nestle",           tenant: "nestle",     siteId: "Nestle",                      baseUrl: "https://nestle.wd3.myworkdayjobs.com",     country: "ch", tier: 1, status: "pending" }
-  - { name: "Roche",            tenant: "roche",      siteId: "Roche",                       baseUrl: "https://roche.wd3.myworkdayjobs.com",      country: "ch", tier: 1, status: "pending" }
-  - { name: "Novartis",         tenant: "novartis",   siteId: "Novartis",                    baseUrl: "https://novartis.wd3.myworkdayjobs.com",   country: "ch", tier: 1, status: "pending" }
-  - { name: "UBS",              tenant: "ubs",        siteId: "UBS",                         baseUrl: "https://ubs.wd3.myworkdayjobs.com",        country: "ch", tier: 1, status: "pending" }
+  # === CH ? Switzerland ===
+  - { name: "Nestle",           tenant: "nestle",     siteId: "Nestle",                      baseUrl: "https://nestle.wd3.myworkdayjobs.com",     country: "ch", tier: 1, status: "unreachable" }
+  - { name: "Roche",            tenant: "roche",      siteId: "Roche",                       baseUrl: "https://roche.wd3.myworkdayjobs.com",      country: "ch", tier: 1, status: "unreachable" }
+  - { name: "Novartis",         tenant: "novartis",   siteId: "Novartis",                    baseUrl: "https://novartis.wd3.myworkdayjobs.com",   country: "ch", tier: 1, status: "unreachable" }
+  - { name: "UBS",              tenant: "ubs",        siteId: "UBS",                         baseUrl: "https://ubs.wd3.myworkdayjobs.com",        country: "ch", tier: 1, status: "unreachable" }
 
-  # === UK — United Kingdom ===
-  - { name: "Unilever",         tenant: "unilever",   siteId: "Unilever",                    baseUrl: "https://unilever.wd3.myworkdayjobs.com",   country: "gb", tier: 1, status: "pending" }
-  - { name: "HSBC",             tenant: "hsbc",       siteId: "HSBC",                        baseUrl: "https://hsbc.wd3.myworkdayjobs.com",       country: "gb", tier: 1, status: "pending" }
-  - { name: "AstraZeneca",      tenant: "astrazeneca", siteId: "AstraZeneca",               baseUrl: "https://astrazeneca.wd3.myworkdayjobs.com", country: "gb", tier: 1, status: "pending" }
-  - { name: "Barclays",         tenant: "barclays",   siteId: "Barclays",                    baseUrl: "https://barclays.wd3.myworkdayjobs.com",   country: "gb", tier: 1, status: "pending" }
+  # === UK ? United Kingdom ===
+  - { name: "Unilever",         tenant: "unilever",   siteId: "Unilever",                    baseUrl: "https://unilever.wd3.myworkdayjobs.com",   country: "gb", tier: 1, status: "unreachable" }
+  - { name: "HSBC",             tenant: "hsbc",       siteId: "HSBC",                        baseUrl: "https://hsbc.wd3.myworkdayjobs.com",       country: "gb", tier: 1, status: "unreachable" }
+  - { name: "AstraZeneca",      tenant: "astrazeneca", siteId: "AstraZeneca",               baseUrl: "https://astrazeneca.wd3.myworkdayjobs.com", country: "gb", tier: 1, status: "unreachable" }
+  - { name: "Barclays",         tenant: "barclays",   siteId: "Barclays",                    baseUrl: "https://barclays.wd3.myworkdayjobs.com",   country: "gb", tier: 1, status: "unreachable" }
 
-  # === FR — France ===
-  - { name: "L'Oreal",          tenant: "loreal",     siteId: "Loreal",                      baseUrl: "https://loreal.wd3.myworkdayjobs.com",     country: "fr", tier: 1, status: "pending" }
-  - { name: "AXA",              tenant: "axa",        siteId: "AXA",                         baseUrl: "https://axa.wd3.myworkdayjobs.com",        country: "fr", tier: 1, status: "pending" }
-  - { name: "Saint-Gobain",     tenant: "saintgobain", siteId: "Saint_Gobain",              baseUrl: "https://saintgobain.wd3.myworkdayjobs.com", country: "fr", tier: 2, status: "pending" }
+  # === FR ? France ===
+  - { name: "L'Oreal",          tenant: "loreal",     siteId: "Loreal",                      baseUrl: "https://loreal.wd3.myworkdayjobs.com",     country: "fr", tier: 1, status: "unreachable" }
+  - { name: "AXA",              tenant: "axa",        siteId: "AXA",                         baseUrl: "https://axa.wd3.myworkdayjobs.com",        country: "fr", tier: 1, status: "unreachable" }
+  - { name: "Saint-Gobain",     tenant: "saintgobain", siteId: "Saint_Gobain",              baseUrl: "https://saintgobain.wd3.myworkdayjobs.com", country: "fr", tier: 2, status: "unreachable" }
 
-  # === SE — Sweden ===
-  - { name: "Ericsson",         tenant: "ericsson",   siteId: "Ericsson",                    baseUrl: "https://ericsson.wd3.myworkdayjobs.com",   country: "se", tier: 1, status: "pending" }
-  - { name: "Volvo Group",      tenant: "volvo",      siteId: "VolvoGroup",                  baseUrl: "https://volvo.wd3.myworkdayjobs.com",      country: "se", tier: 1, status: "pending" }
+  # === SE ? Sweden ===
+  - { name: "Ericsson",         tenant: "ericsson",   siteId: "Ericsson",                    baseUrl: "https://ericsson.wd3.myworkdayjobs.com",   country: "se", tier: 1, status: "unreachable" }
+  - { name: "Volvo Group",      tenant: "volvo",      siteId: "VolvoGroup",                  baseUrl: "https://volvo.wd3.myworkdayjobs.com",      country: "se", tier: 1, status: "unreachable" }
 
-  # === FI — Finland ===
-  - { name: "Nokia",            tenant: "nokia",      siteId: "Nokia",                       baseUrl: "https://nokia.wd3.myworkdayjobs.com",      country: "fi", tier: 1, status: "pending" }
+  # === FI ? Finland ===
+  - { name: "Nokia",            tenant: "nokia",      siteId: "Nokia",                       baseUrl: "https://nokia.wd3.myworkdayjobs.com",      country: "fi", tier: 1, status: "unreachable" }
