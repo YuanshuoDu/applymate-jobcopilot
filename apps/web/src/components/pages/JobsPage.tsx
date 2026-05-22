@@ -5,6 +5,7 @@ import { TopBar } from '@/components/layout/TopBar'
 import { Btn, Card, CompanyLogo, INPUT_STYLE, ScorePill, StatusBadge, useToast, useConfirm } from '@/components/ui'
 import type { Job, JobStatus, Activity } from '@/lib/types'
 import { apiMutate, fmtDate, fmtRelative } from '@/lib/hooks'
+import ApplyStatusCard from '@/components/jobs/ApplyStatusCard'
 
 const KANBAN_COLS: JobStatus[] = ['saved', 'applied', 'review', 'interview', 'offer', 'rejected']
 const COL_LABELS: Record<JobStatus, string> = {
@@ -550,6 +551,16 @@ function JobDetailDrawer({ job, onClose, onStatusChange, onUpdate, onDelete }: {
             </div>
           )}
 
+          {/* Auto Apply */}
+          {job.url && (
+            <div>
+              <AutoApplyButton job={job} onApplied={() => {
+                // Trigger re-fetch of job to get updated status
+                apiMutate(`/api/jobs/${job.id}`, 'GET').catch(() => {})
+              }} />
+            </div>
+          )}
+
           {/* Description */}
           {job.description && (
             <div>
@@ -863,6 +874,58 @@ function PaginationBar({
         <button onClick={() => onChangePage(page + 1)} disabled={page >= totalPages} style={btnStyle(page >= totalPages)}>›</button>
         <button onClick={() => onChangePage(totalPages)} disabled={page >= totalPages} style={btnStyle(page >= totalPages)}>»</button>
       </div>
+    </div>
+  )
+}
+
+// ── Auto Apply Button ─────────────────────────────────────────────────────────
+function AutoApplyButton({ job, onApplied }: { job: Job; onApplied?: () => void }) {
+  const [loading, setLoading] = useState(false)
+  const { showToast } = useToast()
+
+  async function handleAutoApply() {
+    setLoading(true)
+    try {
+      const res = await fetch(`/api/jobs/${job.id}/auto-apply`, { method: 'POST' })
+      if (res.ok) {
+        showToast('Queued for auto-apply 🤖', 'success')
+        onApplied?.()
+      } else {
+        const d = await res.json().catch(() => ({}))
+        if (res.status === 409) showToast('Already applied or in progress', 'info')
+        else if (res.status === 429) showToast('Rate limit exceeded — try again later', 'warning')
+        else showToast(d.error ?? 'Failed to queue auto-apply', 'error')
+      }
+    } catch {
+      showToast('Network error — try again', 'error')
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  const isApplied = job.status === 'applied'
+
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+      <button
+        onClick={handleAutoApply}
+        disabled={isApplied || loading}
+        style={{
+          padding: '6px 14px', fontSize: 12, borderRadius: 6, fontWeight: 500,
+          background: isApplied ? 'var(--bg-secondary)' : '#185FA5',
+          color: isApplied ? 'var(--text-muted)' : '#fff',
+          border: isApplied ? '1px solid var(--border)' : 'none',
+          cursor: (isApplied || loading) ? 'default' : 'pointer',
+          display: 'flex', alignItems: 'center', gap: 6,
+          opacity: loading ? 0.7 : 1,
+          width: 'fit-content',
+        }}
+      >
+        {loading ? '⏳ Queuing…' : isApplied ? '⏳ Applied' : '🤖 Auto Apply'}
+      </button>
+      {isApplied && (
+        <ApplyStatusCard jobId={job.id} jobUrl={job.url ?? undefined} jobStatus={job.status} />
+      )}
     </div>
   )
 }
