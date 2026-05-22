@@ -18,7 +18,8 @@ const SELECTORS = {
 };
 
 export async function runWorkdayFlow(page: Page, task: ApplyTask): Promise<HarnessResult> {
-  if (task.dryRun) return { status: "dry-run", turns: 1, durationMs: 0, log: [] };
+  const startedAt = Date.now();
+  if (task.dryRun) return { status: "dry-run", turns: 1, durationMs: Date.now() - startedAt, log: [] };
 
   const log: unknown[] = [];
   let step = 1;
@@ -65,14 +66,14 @@ export async function runWorkdayFlow(page: Page, task: ApplyTask): Promise<Harne
     const url = page.url();
     const title = await page.title().catch(() => "");
     const confirmed = /thank|success|confirmation|submitted/i.test(url + " " + title);
-    return { status: confirmed ? "submitted" : "manual", turns: step, durationMs: 0, log };
+    return { status: confirmed ? "submitted" : "manual", turns: step, durationMs: Date.now() - startedAt, log };
 
   } catch (err) {
     return {
       status: "manual",
       turns: step,
       error: `Workday flow failed at step ${step}: ${err instanceof Error ? err.message : String(err)}`,
-      durationMs: 0,
+      durationMs: Date.now() - startedAt,
       log,
     };
   }
@@ -127,3 +128,5 @@ async function fillCustomQuestions(page: Page, persona: Record<string, string>):
     if (key && persona[key]) await field.fill(persona[key]);
   }
 }
+
+
