@@ -11,6 +11,7 @@ import { detectFlow } from "../flows/index.js";
 import { runGreenhouseFlow } from "../flows/greenhouse-flow.js";
 import { runWorkdayFlow } from "../flows/workday-flow.js";
 import { notifyApplyResult } from "../notifications/notify-apply-result.js";
+import { unlinkSync } from "node:fs";
 
 const redisUrl = process.env.REDIS_URL ?? "redis://localhost:6379";
 export const connection = new Redis(redisUrl, { maxRetriesPerRequest: null });
@@ -51,10 +52,11 @@ export const applyWorker = new Worker<ApplyTaskPayload>(
 
     const startedAt = Date.now();
     let resultWritten = false;
+    let ctx: Awaited<ReturnType<typeof loadTaskContext>> | null = null;
 
     try {
       // Load real persona + job data from DB
-      const ctx = await loadTaskContext(getPool(), userId, jobId, applyUrl);
+      ctx = await loadTaskContext(getPool(), userId, jobId, applyUrl);
 
       await Promise.race([
         withCloakContext(userId, async (page) => {
@@ -168,6 +170,11 @@ export const applyWorker = new Worker<ApplyTaskPayload>(
         );
       }
       throw err;
+    } finally {
+      // Clean up temp resume PDF to avoid accumulating files on disk
+      if (ctx?.resumeTempPath) {
+        try { unlinkSync(ctx.resumeTempPath) } catch { /* ENOENT or already gone — ignore */ }
+      }
     }
   },
   {
