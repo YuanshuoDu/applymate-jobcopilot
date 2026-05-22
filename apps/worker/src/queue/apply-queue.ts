@@ -10,6 +10,7 @@ import type { ApplyTask, HarnessResult } from "../harness/agent-harness.js";
 import { detectFlow } from "../flows/index.js";
 import { runGreenhouseFlow } from "../flows/greenhouse-flow.js";
 import { runWorkdayFlow } from "../flows/workday-flow.js";
+import { notifyApplyResult } from "../notifications/notify-apply-result.js";
 
 const redisUrl = process.env.REDIS_URL ?? "redis://localhost:6379";
 export const connection = new Redis(redisUrl, { maxRetriesPerRequest: null });
@@ -113,6 +114,19 @@ export const applyWorker = new Worker<ApplyTaskPayload>(
           durationMs,
         });
         resultWritten = true;
+
+        // Send email notification (non-blocking, non-throwing)
+        if (harnessResult.status !== 'dry-run') {
+          notifyApplyResult({
+            userId,
+            jobTitle:   ctx.jobTitle,
+            jobCompany: ctx.jobCompany,
+            status:     harnessResult.status as 'submitted' | 'manual' | 'failed',
+            error:      harnessResult.error ?? null,
+            flowUsed:   flow ?? null,
+            jobUrl:     ctx.applyUrl,
+          }).catch((e: Error) => console.warn('[notify] email failed:', e.message))
+        }
 
         // Update Job status based on actual outcome
         const newJobStatus =
