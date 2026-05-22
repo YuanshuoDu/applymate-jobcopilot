@@ -250,4 +250,5 @@ export type Page =
   | 'agent'
   | 'animation'
   | 'extension'
+  | 'apply-history'
   | 'settings'
