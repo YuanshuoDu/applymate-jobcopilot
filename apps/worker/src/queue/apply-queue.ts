@@ -9,7 +9,8 @@ import { AgentHarness } from "../harness/agent-harness.js";
 import type { ApplyTask, HarnessResult } from "../harness/agent-harness.js";
 import { detectFlow } from "../flows/index.js";
 import { runGreenhouseFlow } from "../flows/greenhouse-flow.js";
-import { runWorkdayFlow } from "../flows/workday-flow.js";
+import { runWorkdayFlow } from '../flows/workday-flow.js'
+import { runLeverFlow } from '../flows/lever-flow.js'
 import { notifyApplyResult } from "../notifications/notify-apply-result.js";
 import { unlinkSync } from "node:fs";
 
@@ -91,6 +92,9 @@ export const applyWorker = new Worker<ApplyTaskPayload>(
         if (flow === "greenhouse") {
           console.log(`[apply-worker] Using Greenhouse pre-programmed flow`);
           harnessResult = await runGreenhouseFlow(page, applyTask);
+        } else if (flow === "lever") {
+          console.log(`[apply-worker] Using Lever pre-programmed flow`);
+          harnessResult = await runLeverFlow(page, applyTask);
         } else if (flow === "workday") {
           console.log(`[apply-worker] Using Workday pre-programmed flow`);
           harnessResult = await runWorkdayFlow(page, applyTask);
