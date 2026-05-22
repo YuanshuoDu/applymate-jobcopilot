@@ -3,13 +3,12 @@
  */
 import { describe, it, expect, vi, beforeEach } from 'vitest'
 
-// ── Mock Anthropic SDK ──────────────────────────────────────────────────────────
+// ── Mock model-router (routes use modelChat, not SDK directly) ─────────────────
 
-const mockCreate = vi.fn()
-vi.mock('@anthropic-ai/sdk', () => ({
-  default: vi.fn().mockImplementation(() => ({
-    messages: { create: mockCreate },
-  })),
+const mockModelChat = vi.fn()
+vi.mock('@/lib/model-router', () => ({
+  modelChat: mockModelChat,
+  stripFences: (raw: string) => raw.replace(/^```(?:json)?\n?/, '').replace(/\n?```$/, ''),
 }))
 
 // ── Mock Prisma / auth ─────────────────────────────────────────────────────────
@@ -20,6 +19,7 @@ vi.mock('@/lib/api-helpers', () => ({
   isErrorResponse: (val: unknown) => val instanceof Response && (val as Response).status === 401,
   ok: (data: unknown, status = 200) => Response.json(data, { status }),
   err: (message: string, status = 400) => Response.json({ error: message }, { status }),
+  prepareAiRoute: vi.fn().mockResolvedValue({ auth: { userId: 'test-user' }, cfg: { provider: 'anthropic', model: 'claude-sonnet-4-6' } }),
 }))
 vi.mock('@/lib/rate-limit', () => ({
   checkRateLimit: vi.fn().mockReturnValue({ ok: true }),
@@ -47,8 +47,8 @@ describe('POST /api/ai/score', () => {
     const req = fakeNextRequest({ jobTitle: 'Engineer' })
     const res = await POST(req as never)
 
-    expect(res.status).toBe(400)
-    const body = await res.json()
+    expect(res!.status).toBe(400)
+    const body = await res!.json()
     expect(body.error).toContain('resumeContent')
   })
 
@@ -57,8 +57,8 @@ describe('POST /api/ai/score', () => {
     const req = fakeNextRequest({ resumeContent: { summary: 'test' } })
     const res = await POST(req as never)
 
-    expect(res.status).toBe(400)
-    const body = await res.json()
+    expect(res!.status).toBe(400)
+    const body = await res!.json()
     expect(body.error).toContain('jobTitle')
   })
 
@@ -70,22 +70,20 @@ describe('POST /api/ai/score', () => {
       body: 'not-json',
     })
     const res = await POST(req as never)
-    expect(res.status).toBe(400)
+    expect(res!.status).toBe(400)
   })
 
   it('parses AI response correctly', async () => {
     const { POST } = await import('@/app/api/ai/score/route')
 
-    mockCreate.mockResolvedValueOnce({
-      content: [{ type: 'text', text: JSON.stringify({
-        score: 82,
-        keywords: 'React, TypeScript, Node.js, AWS',
-        matchedKeywords: ['react', 'typescript'],
-        missingKeywords: ['docker'],
-        sectionScores: { Summary: 75, Experience: 90, Skills: 80, Education: 70 },
-        sectionTips: { Summary: 'ok', Experience: 'nice', Skills: 'good', Education: 'fine' },
-      }) }],
-    })
+    mockModelChat.mockResolvedValueOnce({ text: JSON.stringify({
+      score: 82,
+      keywords: 'React, TypeScript, Node.js, AWS',
+      matchedKeywords: ['react', 'typescript'],
+      missingKeywords: ['docker'],
+      sectionScores: { Summary: 75, Experience: 90, Skills: 80, Education: 70 },
+      sectionTips: { Summary: 'ok', Experience: 'nice', Skills: 'good', Education: 'fine' },
+    }) })
 
     const req = fakeNextRequest({
       resumeContent: { summary: 'Experienced dev', skills: ['react'], experience: [] },
@@ -94,8 +92,8 @@ describe('POST /api/ai/score', () => {
     })
     const res = await POST(req as never)
 
-    expect(res.status).toBe(200)
-    const body = await res.json()
+    expect(res!.status).toBe(200)
+    const body = await res!.json()
     expect(body.score).toBe(82)
     expect(body.matchedKeywords).toEqual(['react', 'typescript'])
     expect(body.missingKeywords).toEqual(['docker'])
@@ -106,9 +104,7 @@ describe('POST /api/ai/score', () => {
   it('handles AI response wrapped in markdown code fences', async () => {
     const { POST } = await import('@/app/api/ai/score/route')
 
-    mockCreate.mockResolvedValueOnce({
-      content: [{ type: 'text', text: '```json\n{"score": 60, "matchedKeywords": [], "missingKeywords": ["a"], "sectionScores": {}, "sectionTips": {}}\n```' }],
-    })
+    mockModelChat.mockResolvedValueOnce({ text: '```json\n{"score": 60, "matchedKeywords": [], "missingKeywords": ["a"], "sectionScores": {}, "sectionTips": {}}\n```' })
 
     const req = fakeNextRequest({
       resumeContent: { summary: 'test' },
@@ -116,17 +112,15 @@ describe('POST /api/ai/score', () => {
     })
     const res = await POST(req as never)
 
-    expect(res.status).toBe(200)
-    const body = await res.json()
+    expect(res!.status).toBe(200)
+    const body = await res!.json()
     expect(body.score).toBe(60)
   })
 
   it('handles AI returning empty/invalid JSON gracefully', async () => {
     const { POST } = await import('@/app/api/ai/score/route')
 
-    mockCreate.mockResolvedValueOnce({
-      content: [{ type: 'text', text: 'I cannot process this request' }],
-    })
+    mockModelChat.mockResolvedValueOnce({ text: 'I cannot process this request' })
 
     const req = fakeNextRequest({
       resumeContent: { summary: 'test' },
@@ -135,22 +129,20 @@ describe('POST /api/ai/score', () => {
     const res = await POST(req as never)
 
     // Should return 500 on JSON parse error
-    expect(res.status).toBe(500)
+    expect(res!.status).toBe(500)
   })
 
   it('extracts ATS keywords from JD — contains technical terms, not generic words', async () => {
     const { POST } = await import('@/app/api/ai/score/route')
 
-    mockCreate.mockResolvedValueOnce({
-      content: [{ type: 'text', text: JSON.stringify({
-        score: 78,
-        keywords: 'React, TypeScript, Node.js, AWS, PostgreSQL, Docker, Kubernetes, CI/CD, Terraform',
-        matchedKeywords: ['react', 'typescript', 'nodejs'],
-        missingKeywords: ['terraform'],
-        sectionScores: { Summary: 70, Experience: 85, Skills: 75, Education: 65 },
-        sectionTips: { Summary: 'ok', Experience: 'nice', Skills: 'good', Education: 'fine' },
-      }) }],
-    })
+    mockModelChat.mockResolvedValueOnce({ text: JSON.stringify({
+      score: 78,
+      keywords: 'React, TypeScript, Node.js, AWS, PostgreSQL, Docker, Kubernetes, CI/CD, Terraform',
+      matchedKeywords: ['react', 'typescript', 'nodejs'],
+      missingKeywords: ['terraform'],
+      sectionScores: { Summary: 70, Experience: 85, Skills: 75, Education: 65 },
+      sectionTips: { Summary: 'ok', Experience: 'nice', Skills: 'good', Education: 'fine' },
+    }) })
 
     const req = fakeNextRequest({
       resumeContent: { summary: 'Backend engineer', skills: ['nodejs'], experience: [] },
@@ -160,8 +152,8 @@ describe('POST /api/ai/score', () => {
     })
     const res = await POST(req as never)
 
-    expect(res.status).toBe(200)
-    const body = await res.json()
+    expect(res!.status).toBe(200)
+    const body = await res!.json()
     expect(body.keywords).toContain('React')
     expect(body.keywords).toContain('Docker')
     expect(body.keywords).toContain('Terraform')
@@ -177,7 +169,7 @@ describe('POST /api/ai/score', () => {
   it('handles Anthropic API failure', async () => {
     const { POST } = await import('@/app/api/ai/score/route')
 
-    mockCreate.mockRejectedValueOnce(new Error('API key invalid'))
+    mockModelChat.mockRejectedValueOnce(new Error('API key invalid'))
 
     const req = fakeNextRequest({
       resumeContent: { summary: 'test' },
@@ -185,8 +177,8 @@ describe('POST /api/ai/score', () => {
     })
     const res = await POST(req as never)
 
-    expect(res.status).toBe(500)
-    const body = await res.json()
-    expect(body.error).toContain('ANTHROPIC_API_KEY')
+    expect(res!.status).toBe(500)
+    const body = await res!.json()
+    expect(body.error).toContain('AI scoring failed')
   })
 })

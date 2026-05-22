@@ -3,11 +3,10 @@
  */
 import { describe, it, expect, vi, beforeEach } from 'vitest'
 
-const mockCreate = vi.fn()
-vi.mock('@anthropic-ai/sdk', () => ({
-  default: vi.fn().mockImplementation(() => ({
-    messages: { create: mockCreate },
-  })),
+const mockModelChat = vi.fn()
+vi.mock('@/lib/model-router', () => ({
+  modelChat: mockModelChat,
+  stripFences: (raw: string) => raw.replace(/^```(?:json)?\n?/, '').replace(/\n?```$/, ''),
 }))
 
 vi.mock('@/lib/db', () => ({ db: {} }))
@@ -16,6 +15,7 @@ vi.mock('@/lib/api-helpers', () => ({
   isErrorResponse: (val: unknown) => val instanceof Response && (val as Response).status === 401,
   ok: (data: unknown, status = 200) => Response.json(data, { status }),
   err: (message: string, status = 400) => Response.json({ error: message }, { status }),
+  prepareAiRoute: vi.fn().mockResolvedValue({ auth: { userId: 'test-user' }, cfg: { provider: 'anthropic', model: 'claude-sonnet-4-6' } }),
 }))
 vi.mock('@/lib/rate-limit', () => ({
   checkRateLimit: vi.fn().mockReturnValue({ ok: true }),
@@ -38,14 +38,14 @@ describe('POST /api/ai/cover-letter', () => {
     const { POST } = await import('@/app/api/ai/cover-letter/route')
     const req = fakeNextRequest({ jobTitle: 'Engineer', jobCompany: 'Acme' })
     const res = await POST(req as never)
-    expect(res.status).toBe(400)
+    expect(res!.status).toBe(400)
   })
 
   it('returns 400 when jobTitle is missing', async () => {
     const { POST } = await import('@/app/api/ai/cover-letter/route')
     const req = fakeNextRequest({ resumeContent: { summary: 'test' }, jobCompany: 'Acme' })
     const res = await POST(req as never)
-    expect(res.status).toBe(400)
+    expect(res!.status).toBe(400)
   })
 
   it('returns a cover letter on successful generation', async () => {
@@ -58,9 +58,7 @@ I am excited to apply for the Software Engineer role at Acme Corp.
 Sincerely,
 John Doe`
 
-    mockCreate.mockResolvedValueOnce({
-      content: [{ type: 'text', text: mockLetter }],
-    })
+    mockModelChat.mockResolvedValueOnce({ text: mockLetter })
 
     const req = fakeNextRequest({
       resumeContent: {
@@ -74,17 +72,15 @@ John Doe`
     })
     const res = await POST(req as never)
 
-    expect(res.status).toBe(200)
-    const body = await res.json()
+    expect(res!.status).toBe(200)
+    const body = await res!.json()
     expect(body.coverLetter).toBe(mockLetter.trim())
   })
 
   it('includes recipientName in the prompt when provided', async () => {
     const { POST } = await import('@/app/api/ai/cover-letter/route')
 
-    mockCreate.mockResolvedValueOnce({
-      content: [{ type: 'text', text: 'Dear Ms. Smith,\n\n...' }],
-    })
+    mockModelChat.mockResolvedValueOnce({ text: 'Dear Ms. Smith,\n\n...' })
 
     const req = fakeNextRequest({
       resumeContent: { contact: { name: 'Jane', email: 'jane@test.com', location: 'SF' }, summary: '', skills: [], experience: [] },
@@ -94,15 +90,13 @@ John Doe`
     })
     const res = await POST(req as never)
 
-    expect(res.status).toBe(200)
+    expect(res!.status).toBe(200)
   })
 
   it('supports different tones', async () => {
     const { POST } = await import('@/app/api/ai/cover-letter/route')
 
-    mockCreate.mockResolvedValueOnce({
-      content: [{ type: 'text', text: 'Short and punchy letter.' }],
-    })
+    mockModelChat.mockResolvedValueOnce({ text: 'Short and punchy letter.' })
 
     const req = fakeNextRequest({
       resumeContent: { contact: { name: 'A', email: 'a@b.com', location: 'X' }, summary: '', skills: [], experience: [] },
@@ -111,6 +105,6 @@ John Doe`
       tone: 'concise',
     })
     const res = await POST(req as never)
-    expect(res.status).toBe(200)
+    expect(res!.status).toBe(200)
   })
 })

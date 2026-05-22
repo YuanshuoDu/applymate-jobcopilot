@@ -3,11 +3,10 @@
  */
 import { describe, it, expect, vi, beforeEach } from 'vitest'
 
-const mockCreate = vi.fn()
-vi.mock('@anthropic-ai/sdk', () => ({
-  default: vi.fn().mockImplementation(() => ({
-    messages: { create: mockCreate },
-  })),
+const mockModelChat = vi.fn()
+vi.mock('@/lib/model-router', () => ({
+  modelChat: mockModelChat,
+  stripFences: (raw: string) => raw.replace(/^```(?:json)?\n?/, '').replace(/\n?```$/, ''),
 }))
 
 vi.mock('@/lib/db', () => ({ db: {} }))
@@ -16,6 +15,7 @@ vi.mock('@/lib/api-helpers', () => ({
   isErrorResponse: (val: unknown) => val instanceof Response && (val as Response).status === 401,
   ok: (data: unknown, status = 200) => Response.json(data, { status }),
   err: (message: string, status = 400) => Response.json({ error: message }, { status }),
+  prepareAiRoute: vi.fn().mockResolvedValue({ auth: { userId: 'test-user' }, cfg: { provider: 'anthropic', model: 'claude-sonnet-4-6' } }),
 }))
 vi.mock('@/lib/rate-limit', () => ({
   checkRateLimit: vi.fn().mockReturnValue({ ok: true }),
@@ -38,19 +38,17 @@ describe('POST /api/ai/suggest', () => {
     const { POST } = await import('@/app/api/ai/suggest/route')
     const req = fakeNextRequest({ jobTitle: 'Engineer' })
     const res = await POST(req as never)
-    expect(res.status).toBe(400)
+    expect(res!.status).toBe(400)
   })
 
   it('returns 3 suggestions from a successful AI response', async () => {
     const { POST } = await import('@/app/api/ai/suggest/route')
 
-    mockCreate.mockResolvedValueOnce({
-      content: [{ type: 'text', text: JSON.stringify([
-        'Add Docker and Kubernetes to your skills section',
-        'Quantify your experience with numbers and metrics',
-        'Tailor your summary to mention cloud-native development',
-      ]) }],
-    })
+    mockModelChat.mockResolvedValueOnce({ text: JSON.stringify([
+      'Add Docker and Kubernetes to your skills section',
+      'Quantify your experience with numbers and metrics',
+      'Tailor your summary to mention cloud-native development',
+    ]) })
 
     const req = fakeNextRequest({
       resumeContent: { summary: 'Dev', skills: ['js'], experience: [] },
@@ -58,8 +56,8 @@ describe('POST /api/ai/suggest', () => {
     })
     const res = await POST(req as never)
 
-    expect(res.status).toBe(200)
-    const body = await res.json()
+    expect(res!.status).toBe(200)
+    const body = await res!.json()
     expect(body.suggestions).toHaveLength(3)
     expect(body.suggestions[0].text).toContain('Docker')
     expect(body.suggestions[0].applied).toBe(false)
@@ -68,17 +66,15 @@ describe('POST /api/ai/suggest', () => {
   it('handles markdown-wrapped JSON responses', async () => {
     const { POST } = await import('@/app/api/ai/suggest/route')
 
-    mockCreate.mockResolvedValueOnce({
-      content: [{ type: 'text', text: '```json\n["Suggestion one", "Suggestion two", "Suggestion three"]\n```' }],
-    })
+    mockModelChat.mockResolvedValueOnce({ text: '```json\n["Suggestion one", "Suggestion two", "Suggestion three"]\n```' })
 
     const req = fakeNextRequest({
       resumeContent: { summary: 'test' },
     })
     const res = await POST(req as never)
 
-    expect(res.status).toBe(200)
-    const body = await res.json()
+    expect(res!.status).toBe(200)
+    const body = await res!.json()
     expect(body.suggestions).toHaveLength(3)
   })
 })

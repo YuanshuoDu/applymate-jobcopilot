@@ -15,7 +15,7 @@ vi.mock("@/lib/db", () => ({
   db: {
     job: {
       findUnique: vi.fn(),
-      update: vi.fn(),
+      update: vi.fn().mockResolvedValue({}),
     },
   },
 }));
@@ -51,7 +51,7 @@ describe("POST /api/jobs/[id]/auto-apply", () => {
 
   it("happy path: returns 200 + queued:true", async () => {
     const { requireAuth } = await import("@/lib/api-helpers");
-    vi.mocked(requireAuth).mockResolvedValue({ userId: "user-1" });
+    vi.mocked(requireAuth).mockResolvedValue({ userId: "user-1" } as never);
 
     const { db } = await import("@/lib/db");
     vi.mocked(db.job.findUnique).mockResolvedValue({
@@ -59,7 +59,7 @@ describe("POST /api/jobs/[id]/auto-apply", () => {
       userId: "user-1",
       url: "https://jobs.example.com/apply",
       status: "saved",
-    });
+    } as never);
 
     const { enqueueApplyTask } = await import("@/lib/apply-queue-client");
     vi.mocked(enqueueApplyTask).mockResolvedValue("bull-task-123");
@@ -74,7 +74,7 @@ describe("POST /api/jobs/[id]/auto-apply", () => {
 
   it("rate limit exceeded returns 429", async () => {
     const { requireAuth } = await import("@/lib/api-helpers");
-    vi.mocked(requireAuth).mockResolvedValue({ userId: "user-1" });
+    vi.mocked(requireAuth).mockResolvedValue({ userId: "user-1" } as never);
 
     const { checkRateLimit } = await import("@/lib/rate-limit");
     vi.mocked(checkRateLimit).mockReturnValue({ ok: false, retryAfter: 3600 });
@@ -88,7 +88,7 @@ describe("POST /api/jobs/[id]/auto-apply", () => {
 
   it("rate limit key is per-user (different users tracked independently)", async () => {
     const { requireAuth } = await import("@/lib/api-helpers");
-    vi.mocked(requireAuth).mockResolvedValue({ userId: "user-2" });
+    vi.mocked(requireAuth).mockResolvedValue({ userId: "user-2" } as never);
 
     const { checkRateLimit } = await import("@/lib/rate-limit");
     // user-2 is NOT rate-limited
@@ -100,7 +100,7 @@ describe("POST /api/jobs/[id]/auto-apply", () => {
       userId: "user-2",
       url: "https://jobs.example.com/apply",
       status: "saved",
-    });
+    } as never);
 
     const { enqueueApplyTask } = await import("@/lib/apply-queue-client");
     vi.mocked(enqueueApplyTask).mockResolvedValue("bull-task-456");
@@ -114,7 +114,7 @@ describe("POST /api/jobs/[id]/auto-apply", () => {
 
   it("job without URL returns 400", async () => {
     const { requireAuth } = await import("@/lib/api-helpers");
-    vi.mocked(requireAuth).mockResolvedValue({ userId: "user-1" });
+    vi.mocked(requireAuth).mockResolvedValue({ userId: "user-1" } as never);
 
     const { db } = await import("@/lib/db");
     vi.mocked(db.job.findUnique).mockResolvedValue({
@@ -122,7 +122,7 @@ describe("POST /api/jobs/[id]/auto-apply", () => {
       userId: "user-1",
       url: null,
       status: "saved",
-    });
+    } as never);
 
     const res = await POST(mockReq(), { params: Promise.resolve({ id: "job-1" }) });
     expect(res.status).toBe(400);
@@ -130,7 +130,7 @@ describe("POST /api/jobs/[id]/auto-apply", () => {
 
   it("job owned by different user returns 404", async () => {
     const { requireAuth } = await import("@/lib/api-helpers");
-    vi.mocked(requireAuth).mockResolvedValue({ userId: "user-1" });
+    vi.mocked(requireAuth).mockResolvedValue({ userId: "user-1" } as never);
 
     const { db } = await import("@/lib/db");
     vi.mocked(db.job.findUnique).mockResolvedValue({
@@ -138,7 +138,7 @@ describe("POST /api/jobs/[id]/auto-apply", () => {
       userId: "user-2",
       url: "https://jobs.example.com/apply",
       status: "saved",
-    });
+    } as never);
 
     const res = await POST(mockReq(), { params: Promise.resolve({ id: "job-1" }) });
     expect(res.status).toBe(404);
@@ -146,7 +146,7 @@ describe("POST /api/jobs/[id]/auto-apply", () => {
 
   it("dryRun flag passed through", async () => {
     const { requireAuth } = await import("@/lib/api-helpers");
-    vi.mocked(requireAuth).mockResolvedValue({ userId: "user-1" });
+    vi.mocked(requireAuth).mockResolvedValue({ userId: "user-1" } as never);
 
     const { db } = await import("@/lib/db");
     vi.mocked(db.job.findUnique).mockResolvedValue({
@@ -154,7 +154,7 @@ describe("POST /api/jobs/[id]/auto-apply", () => {
       userId: "user-1",
       url: "https://jobs.example.com/apply",
       status: "saved",
-    });
+    } as never);
 
     const { enqueueApplyTask } = await import("@/lib/apply-queue-client");
     vi.mocked(enqueueApplyTask).mockResolvedValue("bull-task-dry");
@@ -168,7 +168,7 @@ describe("POST /api/jobs/[id]/auto-apply", () => {
 
   it("returns 409 when job is already applied", async () => {
     const { requireAuth } = await import("@/lib/api-helpers");
-    vi.mocked(requireAuth).mockResolvedValue({ userId: "user-1" });
+    vi.mocked(requireAuth).mockResolvedValue({ userId: "user-1" } as never);
 
     const { db } = await import("@/lib/db");
     vi.mocked(db.job.findUnique).mockResolvedValue({
@@ -176,7 +176,7 @@ describe("POST /api/jobs/[id]/auto-apply", () => {
       userId: "user-1",
       url: "https://jobs.example.com/apply",
       status: "applied",
-    });
+    } as never);
 
     const res = await POST(mockReq(), { params: Promise.resolve({ id: "job-1" }) });
     expect(res.status).toBe(409);

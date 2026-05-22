@@ -31,12 +31,12 @@ describe("GET /api/jobs/[id]/apply-results", () => {
 
   it("returns results array for valid job", async () => {
     const { requireAuth } = await import("@/lib/api-helpers");
-    vi.mocked(requireAuth).mockResolvedValue({ userId: "user-1" });
+    vi.mocked(requireAuth).mockResolvedValue({ userId: "user-1" } as never);
 
     const { db } = await import("@/lib/db");
     vi.mocked(db.job.findUnique).mockResolvedValue({
       userId: "user-1",
-    });
+    } as never);
 
     vi.mocked(db.$queryRaw).mockResolvedValue([
       { id: 1, status: "submitted", mode: "unattended", atsType: "greenhouse", flowUsed: "programmatic", error: null, durationMs: 5000, createdAt: "2026-05-22T00:00:00Z" },
@@ -53,12 +53,12 @@ describe("GET /api/jobs/[id]/apply-results", () => {
 
   it("returns empty results array when no results exist", async () => {
     const { requireAuth } = await import("@/lib/api-helpers");
-    vi.mocked(requireAuth).mockResolvedValue({ userId: "user-1" });
+    vi.mocked(requireAuth).mockResolvedValue({ userId: "user-1" } as never);
 
     const { db } = await import("@/lib/db");
     vi.mocked(db.job.findUnique).mockResolvedValue({
       userId: "user-1",
-    });
+    } as never);
 
     vi.mocked(db.$queryRaw).mockResolvedValue([]);
 
@@ -71,12 +71,12 @@ describe("GET /api/jobs/[id]/apply-results", () => {
 
   it("returns 404 for wrong user", async () => {
     const { requireAuth } = await import("@/lib/api-helpers");
-    vi.mocked(requireAuth).mockResolvedValue({ userId: "user-1" });
+    vi.mocked(requireAuth).mockResolvedValue({ userId: "user-1" } as never);
 
     const { db } = await import("@/lib/db");
     vi.mocked(db.job.findUnique).mockResolvedValue({
       userId: "user-2",
-    });
+    } as never);
 
     const res = await GET(new NextRequest("https://applymate.app/api/jobs/job-1/apply-results"), { params: Promise.resolve({ id: "job-1" }) });
     expect(res.status).toBe(404);
