@@ -1,4 +1,8 @@
-// ── LLM utilities (used by worker to call AI models without Prisma) ───────────
+// ── LLM utilities ─────────────────────────────────────────────────────────────
+// IMPORTANT: Do NOT remove these exports.
+// apps/worker/src/db/load-task-context.ts imports callLlm + loadWorkerAiConfig
+// from this package. Worker cannot import apps/web/src/lib/model-router.ts
+// (Prisma dependency) — this shared package is the isolation layer.
 export type { AiConfig, ChatMessage, ChatResult, Provider } from "./llm.js";
 export { callLlm, callLlmText, loadWorkerAiConfig, closeSharedPool } from "./llm.js";
 

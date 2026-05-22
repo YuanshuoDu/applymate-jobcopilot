@@ -12,8 +12,12 @@
   "dependencies": {
     "pg": "^8.16.3"
   },
+  "scripts": {
+    "test": "vitest run"
+  },
   "devDependencies": {
     "@types/pg": "^8.11.13",
-    "typescript": "5.9.3"
+    "typescript": "5.9.3",
+    "vitest": "^3.1.4"
   }
 }
