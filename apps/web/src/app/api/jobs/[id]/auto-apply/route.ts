@@ -14,6 +14,9 @@ export async function POST(req: NextRequest, { params }: Params) {
   if (!job || job.userId !== auth.userId) return err("Not found", 404);
   if (!job.url) return err("Job has no apply URL", 400);
 
+  // DEDUP GUARD: prevent double-apply
+  if (job.status === 'applied') return err('Already applied or in progress', 409)
+
   const body = await req.json().catch(() => ({})) as { dryRun?: boolean };
 
   const taskId = await enqueueApplyTask({
