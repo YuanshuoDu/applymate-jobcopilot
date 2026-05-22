@@ -73,32 +73,36 @@ export async function loadTaskContext(
   let coverLetterText: string | null = job.coverLetter ?? null;
 
   if (!coverLetterText && job.description && persona.email) {
-    const aiConfig = await loadWorkerAiConfig(userId);
-    const result = await callLlm(
-      [
-        {
-          role: "user",
-          content: [
-            "Write a concise professional cover letter (150-200 words) for this job.",
-            "CANDIDATE: " + (persona.fullName || ""),
-            "JOB: " + (job.role ?? "") + " at " + (job.company ?? ""),
-            "KEY REQUIREMENTS: " + (job.keywords ?? ""),
-            "JD EXCERPT: " + (job.description ?? "").slice(0, 600),
-            "Start with why excited about the role. No Dear/Subject. Body only.",
-          ].join("\n"),
-        },
-      ],
-      aiConfig
-    ).catch(() => null);
+    try {
+      const aiConfig = await loadWorkerAiConfig(userId);
+      const result = await callLlm(
+        [
+          {
+            role: "user",
+            content: [
+              "Write a concise professional cover letter (150-200 words) for this job.",
+              "CANDIDATE: " + (persona.fullName || ""),
+              "JOB: " + (job.role ?? "") + " at " + (job.company ?? ""),
+              "KEY REQUIREMENTS: " + (job.keywords ?? ""),
+              "JD EXCERPT: " + (job.description ?? "").slice(0, 600),
+              "Start with why excited about the role. No Dear/Subject. Body only.",
+            ].join("\n"),
+          },
+        ],
+        aiConfig
+      ).catch(() => null);
 
-    if (result?.text) {
-      coverLetterText = result.text.trim();
-      await pool
-        .query(
-          `UPDATE "Job" SET "coverLetter" = $1, "updatedAt" = NOW() WHERE id = $2`,
-          [coverLetterText, jobId]
-        )
-        .catch(() => {});
+      if (result?.text) {
+        coverLetterText = result.text.trim();
+        await pool
+          .query(
+            `UPDATE "Job" SET "coverLetter" = $1, "updatedAt" = NOW() WHERE id = $2`,
+            [coverLetterText, jobId]
+          )
+          .catch(() => {});
+      }
+    } catch {
+      // Cover letter generation unavailable — continue without it
     }
   }
 
