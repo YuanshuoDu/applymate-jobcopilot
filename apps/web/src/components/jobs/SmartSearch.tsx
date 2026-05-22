@@ -3,6 +3,7 @@
 import React, { useState, useRef } from 'react'
 import { Btn, CompanyLogo, INPUT_STYLE, ScorePill, useToast } from '@/components/ui'
 import { apiMutate } from '@/lib/hooks'
+import ApplyStatusCard from './ApplyStatusCard'
 import type { Job, ResumeListItem } from '@/lib/types'
 
 // ── Types ────────────────────────────────────────────────────────────────────
@@ -202,6 +203,8 @@ export function SmartSearch({ onJobSaved }: { onJobSaved?: () => void }) {
   const [searched, setSearched] = useState(!!lastSearch.current)
   const [savingIds, setSavingIds] = useState<Set<string>>(new Set())
   const [savedIds, setSavedIds] = useState<Set<string>>(new Set())
+  const [applyingIds, setApplyingIds] = useState<Set<string>>(new Set())
+  const [appliedIds, setAppliedIds] = useState<Set<string>>(new Set())
   const [scoringIds, setScoringIds] = useState<Set<string>>(new Set())
   const [scores, setScores] = useState<Record<string, number>>({})
   const [expandedId, setExpandedId] = useState<string | null>(null)
@@ -270,6 +273,20 @@ export function SmartSearch({ onJobSaved }: { onJobSaved?: () => void }) {
         toast.error('Save failed', msg)
       },
     )
+  }
+
+  async function handleAutoApply(r: JobResult) {
+    setApplyingIds(prev => new Set(prev).add(r.id))
+    try {
+      await fetch(`/api/jobs/${r.id}/auto-apply`, { method: 'POST' })
+      setAppliedIds(prev => new Set(prev).add(r.id))
+      toast.success('Auto-apply started', `${r.title} at ${r.company}`)
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err)
+      toast.error('Auto-apply failed', msg)
+    } finally {
+      setApplyingIds(prev => { const n = new Set(prev); n.delete(r.id); return n })
+    }
   }
 
   async function handleTranslate(r: JobResult) {
@@ -653,7 +670,30 @@ export function SmartSearch({ onJobSaved }: { onJobSaved?: () => void }) {
                                 </span>
                               )}
                             </div>
+                              {/* Auto Apply button */}
+                              {appliedIds.has(r.id) ? (
+                                <span style={{ fontSize: 11, color: '#185FA5', fontWeight: 500 }}>✓ Auto-applied</span>
+                              ) : (
+                                <span onClick={e => e.stopPropagation()}>
+                                  <button
+                                    onClick={e => { e.stopPropagation(); handleAutoApply(r); }}
+                                    disabled={applyingIds.has(r.id)}
+                                    style={{
+                                      padding: '8px 24px', background: applyingIds.has(r.id) ? '#93c5fd' : '#185FA5', color: '#fff',
+                                      borderRadius: 8, fontSize: 13, fontWeight: 600, border: 'none',
+                                      cursor: applyingIds.has(r.id) ? 'not-allowed' : 'pointer',
+                                      display: 'inline-flex', alignItems: 'center', gap: 6, transition: 'background 0.15s'
+                                    }}
+                                  >
+                                    {applyingIds.has(r.id) ? '⏳ Applying…' : '🤖 Auto Apply'}
+                                  </button>
+                                </span>
+                              )}
                           </div>
+                        )}
+                        {/* Apply status card */}
+                        {appliedIds.has(r.id) && (
+                          <ApplyStatusCard jobId={r.id} />
                         )}
                       </div>
 
@@ -753,3 +793,4 @@ export function SmartSearch({ onJobSaved }: { onJobSaved?: () => void }) {
     </div>
   )
 }
+
