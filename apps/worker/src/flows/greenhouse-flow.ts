@@ -15,12 +15,17 @@ export async function runGreenhouseFlow(
   page: Page,
   task: ApplyTask
 ): Promise<HarnessResult> {
+  if (task.dryRun) {
+    console.log("[greenhouse-flow] Dry-run: skipping all fills and submit");
+    return { status: "dry-run", turns: 1, durationMs: 0, log: [] };
+  }
+
   const log: Array<{ field?: string; selector?: string; action: string }> = [];
   let filled = 0;
 
   // Fill personal info fields
   for (const field of PERSONAL_FIELDS) {
-    const value = (task.persona[field.key] as string) ?? "";
+    const value = (task.persona[field.key]) ?? "";
     if (!value) continue;
 
     for (const sel of field.selectors) {

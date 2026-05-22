@@ -70,6 +70,7 @@ export const applyWorker = new Worker<ApplyTaskPayload>(
           jobKeywords: ctx.jobKeywords,
           resumePath,
           coverLetterPath,
+          dryRun: dryRun ?? false,
         };
 
         // Detect ATS → use pre-programmed flow if available, else AI fallback
@@ -95,6 +96,8 @@ export const applyWorker = new Worker<ApplyTaskPayload>(
           jobId,
           status: harnessResult.status,
           mode: "unattended",
+          atsType: flow ?? "unknown",
+          flowUsed: flow ? "programmatic" : "llm",
           error: harnessResult.error ?? null,
           durationMs,
         });
@@ -110,6 +113,8 @@ export const applyWorker = new Worker<ApplyTaskPayload>(
         jobId,
         status: "failed",
         mode: "unattended",
+        atsType: null,
+        flowUsed: null,
         error: message,
         durationMs,
       });

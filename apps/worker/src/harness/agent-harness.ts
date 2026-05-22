@@ -24,12 +24,13 @@ export type HarnessResult = Pick<import("@jobcopilot/shared").ApplyResult, "stat
 export interface ApplyTask {
   jobId: string;
   applyUrl: string;
-  persona: Record<string, unknown>;
+  persona: Record<string, string>;
   jobTitle: string;
   jobCompany: string;
   jobKeywords?: string;
   resumePath: string;
   coverLetterPath?: string;
+  dryRun?: boolean;
 }
 
 const SUCCESS_URL_PATTERNS = [
@@ -73,13 +74,7 @@ export class AgentHarness {
     const startedAt = Date.now();
 
     try {
-      const systemPrompt = buildSystemPrompt(
-        {
-          ...task.persona,
-          fullName: task.persona.fullName as string | undefined,
-          email: task.persona.email as string | undefined,
-          phone: task.persona.phone as string | undefined,
-        },
+      const systemPrompt = buildSystemPrompt(task.persona,
         {
           title: task.jobTitle,
           company: task.jobCompany,
