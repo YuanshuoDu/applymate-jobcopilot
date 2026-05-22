@@ -38,5 +38,11 @@ export async function POST(req: NextRequest, { params }: Params) {
     dryRun: body.dryRun ?? false,
   });
 
+  // Mark job as applied for dedup guard + frontend status badge
+  await db.job.update({
+    where: { id: jobId },
+    data: { status: 'applied', appliedAt: new Date() },
+  }).catch(() => {});
+
   return ok({ queued: true, taskId });
 }
