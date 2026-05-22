@@ -69,7 +69,7 @@ export const applyWorker = new Worker<ApplyTaskPayload>(
           jobTitle: ctx.jobTitle,
           jobCompany: ctx.jobCompany,
           jobKeywords: ctx.jobKeywords,
-          resumePath,
+          resumePath: ctx.resumeTempPath ?? resumePath,
           coverLetterPath,
           dryRun: dryRun ?? false,
         };
