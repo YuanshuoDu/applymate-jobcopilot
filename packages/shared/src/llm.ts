@@ -32,7 +32,7 @@ export const APPLYMATE_BACKING: AiConfig = {
 };
 
 const DEFAULT_API_BASES: Record<Provider, string> = {
-  minimax: "https://api.minimaxi.com/v1",
+  minimax: "https://api.minimax.chat/v1",
   openai: "https://api.openai.com/v1",
   anthropic: "https://api.anthropic.com",
   deepseek: "https://api.deepseek.com/v1",
