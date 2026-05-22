@@ -170,7 +170,12 @@ function RunPanel({ onClose }: { onClose: () => void }) {
       setRunning(false)
       setDone(true)
       es.close()
-      if (d.processed > 0) toast.success('Agent run complete', `Scored ${d.processed} jobs, applied to ${d.applied}`)
+      toast.success(
+        'Agent run complete',
+        d.processed > 0
+          ? `Scored ${d.processed} jobs, applied to ${d.applied}. New jobs from Scout may appear in Jobs list.`
+          : 'Pipeline done. Check Jobs — Scout may have added new discoveries.'
+      )
     })
 
     es.addEventListener('error', e => {

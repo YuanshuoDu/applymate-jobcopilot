@@ -913,7 +913,12 @@ export function AgentPlaygroundPage() {
       addLog({ type: 'done', message: `✅ Pipeline complete — ${d.processed} scored, ${d.applied} applied, ${d.pending} pending, ${d.skipped} skipped`, time: new Date() })
       es.close(); esRef.current = null
       refetchRoles()
-      if (d.processed > 0) toast.success('Pipeline complete', `Scored ${d.processed} jobs, applied to ${d.applied}`)
+      toast.success(
+        'Pipeline complete',
+        d.processed > 0
+          ? `Scored ${d.processed} jobs, applied to ${d.applied}. New jobs from Scout may appear in Jobs list.`
+          : 'Done. Check Jobs — Scout may have added new discoveries.'
+      )
     })
 
     es.addEventListener('error', e => {
