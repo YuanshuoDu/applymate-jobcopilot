@@ -5,6 +5,7 @@
 import { NextRequest } from 'next/server'
 import { requireAuth, isErrorResponse, ok, err } from '@/lib/api-helpers'
 import { db } from '@/lib/db'
+import type { Prisma } from '@prisma/client'
 import { MODEL_CATALOGUE, type UserAiSettings, type AiConfig, type FeatureId, type Provider } from '@/lib/model-router'
 
 /** Mask an API key for safe client display */
@@ -87,7 +88,7 @@ export async function POST(req: NextRequest) {
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   await db.user.update({
     where: { id: auth.userId },
-    data:  { preferences: { ...prefs, aiSettings: { keys: mergedKeys, features: mergedFeatures } } as any },
+    data:  { preferences: { ...prefs, aiSettings: { keys: mergedKeys, features: mergedFeatures } } as Prisma.InputJsonValue },
   })
 
   return ok({ saved: true })
