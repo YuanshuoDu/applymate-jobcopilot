@@ -117,4 +117,20 @@ describe("POST /api/jobs/[id]/auto-apply", () => {
       expect.objectContaining({ dryRun: true })
     );
   });
+
+  it("returns 409 when job is already applied", async () => {
+    const { requireAuth } = await import("@/lib/api-helpers");
+    vi.mocked(requireAuth).mockResolvedValue({ userId: "user-1" });
+
+    const { db } = await import("@/lib/db");
+    vi.mocked(db.job.findUnique).mockResolvedValue({
+      id: "job-1",
+      userId: "user-1",
+      url: "https://jobs.example.com/apply",
+      status: 'applied',
+    });
+
+    const res = await POST(mockReq(), { params: Promise.resolve({ id: "job-1" }) });
+    expect(res.status).toBe(409);
+  });
 });
