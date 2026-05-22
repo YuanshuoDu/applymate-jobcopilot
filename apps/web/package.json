@@ -50,18 +50,20 @@
   "devDependencies": {
     "@tailwindcss/postcss": "^4.1.5",
     "@types/bcryptjs": "^2.4.6",
+    "@types/js-yaml": "^4.0.9",
     "@types/node": "^22.15.14",
     "@types/pdf-parse": "^1.1.5",
     "@types/react": "^19.1.3",
     "@types/react-dom": "^19.1.3",
     "@vitejs/plugin-react": "^4.4.1",
+    "js-yaml": "^4.1.1",
     "playwright-core": "^1.60.0",
-    "vitest": "^3.1.4",
     "prisma": "^6.8.2",
     "rimraf": "^6.1.1",
     "tailwindcss": "^4.1.5",
     "ts-node": "^10.9.2",
     "typescript": "5.9.3",
+    "vitest": "^3.1.4",
     "ws": "^8.20.0"
   }
 }
