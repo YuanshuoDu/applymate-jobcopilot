@@ -28,10 +28,6 @@ export async function POST(req: NextRequest, { params }: Params) {
     dryRun: body.dryRun ?? false,
   });
 
-  await db.job.update({
-    where: { id: jobId },
-    data: { status: "applied", appliedAt: new Date() },
-  });
 
   return ok({ queued: true, taskId });
 }
