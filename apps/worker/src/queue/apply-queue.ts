@@ -4,6 +4,8 @@ import type { ApplyTaskPayload } from "@jobcopilot/shared";
 import { checkRateLimit } from "../rate-limit.js";
 import { withCloakContext } from "../cloak/pool.js";
 import { insertApplyResult } from "../db/apply-results.js";
+import { AgentHarness } from "../harness/agent-harness.js";
+import type { ApplyTask } from "../harness/agent-harness.js";
 
 const redisUrl = process.env.REDIS_URL ?? "redis://localhost:6379";
 export const connection = new Redis(redisUrl, { maxRetriesPerRequest: null });
@@ -53,37 +55,33 @@ export const applyWorker = new Worker<ApplyTaskPayload>(
           timeout: 30_000,
         });
 
-        // DRY-RUN mode: navigate but do NOT submit
-        if (dryRun) {
-          console.log(
-            `[apply-worker] Dry-run: page loaded, not submitting (user=${userId}, job=${jobId})`
-          );
-          const durationMs = Date.now() - startedAt;
-          await insertApplyResult({
-            userId,
-            jobId,
-            status: "dry-run",
-            mode: "unattended",
-            durationMs,
-          });
-          return;
-        }
+        const harness = new AgentHarness({
+          userId,
+          maxTurns: 30,
+          dryRun: dryRun ?? false,
+          mode: "dom",
+        });
 
-        // --- PLACEHOLDER for Phase 4+ (pre-programmed flows) + Phase 5 (AI fallback) ---
-        // In Phase 3, we only navigate and record. Actual form filling
-        // will be added by #36 (AgentHarness) and future ATS flow modules.
-        console.log(
-          `[apply-worker] Page loaded. Form-fill not yet implemented (Phase 4-6). ` +
-          `Recording as manual for user=${userId}, job=${jobId}`
-        );
+        // TODO Phase 5: load real persona + job data from DB by personaId/jobId
+        const applyTask: ApplyTask = {
+          jobId,
+          applyUrl,
+          persona: {},
+          jobTitle: "",
+          jobCompany: "",
+          resumePath,
+          coverLetterPath,
+        };
 
+        const harnessResult = await harness.run(page, applyTask);
         const durationMs = Date.now() - startedAt;
+
         await insertApplyResult({
           userId,
           jobId,
-          status: "manual",
+          status: harnessResult.status,
           mode: "unattended",
-          error: "Form fill not yet implemented (Phase 4-6)",
+          error: harnessResult.error ?? null,
           durationMs,
         });
       });
