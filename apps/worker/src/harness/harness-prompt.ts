@@ -72,7 +72,9 @@ ${personaStr}
 JOB CONTEXT:
 Title: ${job.title}
 Company: ${job.company}
-${keywordsStr ? `Key Requirements: ${keywordsStr}` : ""}`;
+${keywordsStr ? `Key Requirements: ${keywordsStr}` : ""}
+Cover Letter (if field exists): ${persona.coverLetter ?? "not provided"}
+`;
 }
 
 /**
