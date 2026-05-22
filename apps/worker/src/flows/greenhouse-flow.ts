@@ -15,9 +15,10 @@ export async function runGreenhouseFlow(
   page: Page,
   task: ApplyTask
 ): Promise<HarnessResult> {
+  const startedAt = Date.now();
   if (task.dryRun) {
     console.log("[greenhouse-flow] Dry-run: skipping all fills and submit");
-    return { status: "dry-run", turns: 1, durationMs: 0, log: [] };
+    return { status: "dry-run", turns: 1, durationMs: Date.now() - startedAt, log: [] };
   }
 
   const log: Array<{ field?: string; selector?: string; action: string }> = [];
@@ -117,7 +118,7 @@ export async function runGreenhouseFlow(
   }
 
   if (!submitted) {
-    return { status: "manual", error: "No submit button found", durationMs: 0, log };
+    return { status: "manual", error: "No submit button found", durationMs: Date.now() - startedAt, log };
   }
 
   const finalUrl = page.url();
@@ -134,7 +135,8 @@ export async function runGreenhouseFlow(
   return {
     status: confirmed ? "submitted" : "manual",
     turns: 1,
-    durationMs: 0,
+    durationMs: Date.now() - startedAt,
     log,
   };
 }
+

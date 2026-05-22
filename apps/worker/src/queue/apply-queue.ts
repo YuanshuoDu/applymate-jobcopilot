@@ -10,7 +10,6 @@ import type { ApplyTask, HarnessResult } from "../harness/agent-harness.js";
 import { detectFlow } from "../flows/index.js";
 import { runGreenhouseFlow } from "../flows/greenhouse-flow.js";
 import { runWorkdayFlow } from "../flows/workday-flow.js";
-// keep old import "../flows/greenhouse-flow.js";
 
 const redisUrl = process.env.REDIS_URL ?? "redis://localhost:6379";
 export const connection = new Redis(redisUrl, { maxRetriesPerRequest: null });
