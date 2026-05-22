@@ -1,38 +1,16 @@
 /**
  * discover-workday-siteids.ts
  *
- * Playwright script that navigates to company career pages and intercepts
- * XHR requests to /wday/cxs/ to extract the correct Workday siteId.
+ * Playwright script that navigates to Workday tenant pages and intercepts
+ * XHR requests to /wday/cxs/ to extract the correct siteId.
  *
- * Usage: pnpm --filter web exec tsx apps/web/scripts/discover-workday-siteids.ts
+ * Usage: pnpm --filter web exec tsx scripts/discover-workday-siteids.ts
  */
 
 import { chromium } from "playwright-core";
 import { readFileSync, writeFileSync } from "fs";
 import { resolve } from "path";
 
-// ©¤©¤ Career page URLs ©¤©¤
-// Maps tenant (from workday.yaml) ¡ú public career page that loads Workday
-const CAREER_URLS: Record<string, string> = {
-  sap:      "https://www.sap.com/careers.html",
-  adidas:   "https://careers.adidas-group.com/",
-  siemens:  "https://jobs.siemens.com/",
-  bmw:      "https://www.bmwgroup.jobs/",
-  allianz:  "https://careers.allianz.com/",
-  philips:  "https://www.philips.com/a-w/careers.html",
-  asml:     "https://www.asml.com/en/careers",
-  ericsson: "https://jobs.ericsson.com/",
-  nokia:    "https://www.nokia.com/careers/",
-  novartis: "https://www.novartis.com/careers",
-  // Additional targets
-  mercedes: "https://jobs.mercedes-benz.com/",
-  vw:       "https://www.volkswagen-groupservices.com/jobs",
-  basf:     "https://www.basf.com/global/en/careers.html",
-  bayer:    "https://www.bayer.com/en/careers",
-  telekom:  "https://www.telekom.com/en/careers",
-};
-
-// ©¤©¤ YAML I/O ©¤©¤
 const YAML_PATH = resolve(__dirname, "../src/lib/agent/registries/workday.yaml");
 
 interface WorkdayEmployer {
@@ -47,22 +25,15 @@ interface WorkdayEmployer {
 
 function readWorkdayYaml(): WorkdayEmployer[] {
   const raw = readFileSync(YAML_PATH, "utf-8");
-  // Simple regex extraction ¡ª avoids YAML dependency
   const entries: WorkdayEmployer[] = [];
-  const lines = raw.split("\n");
-  let current: Record<string, string> = {};
-
-  for (const line of lines) {
-    const match = line.match(/^\s*-\s*\{\s*name:\s*"([^"]+)",\s*tenant:\s*"([^"]+)",\s*siteId:\s*"([^"]+)",\s*baseUrl:\s*"([^"]+)",\s*country:\s*"([^"]+)",\s*tier:\s*(\d),\s*status:\s*"([^"]+)"\s*\}/);
-    if (match) {
+  const re = /^\s*-\s*\{\s*name:\s*"([^"]+)",\s*tenant:\s*"([^"]+)",\s*siteId:\s*"([^"]+)",\s*baseUrl:\s*"([^"]+)",\s*country:\s*"([^"]+)",\s*tier:\s*(\d),\s*status:\s*"([^"]+)"\s*\}/;
+  for (const line of raw.split("\n")) {
+    const m = line.match(re);
+    if (m) {
       entries.push({
-        name: match[1],
-        tenant: match[2],
-        siteId: match[3],
-        baseUrl: match[4],
-        country: match[5],
-        tier: Number(match[6]) as 1 | 2 | 3,
-        status: match[7] as WorkdayEmployer["status"],
+        name: m[1], tenant: m[2], siteId: m[3], baseUrl: m[4],
+        country: m[5], tier: Number(m[6]) as 1 | 2 | 3,
+        status: m[7] as WorkdayEmployer["status"],
       });
     }
   }
@@ -71,41 +42,35 @@ function readWorkdayYaml(): WorkdayEmployer[] {
 
 function updateWorkdayYaml(discoveries: Map<string, string>): void {
   let raw = readFileSync(YAML_PATH, "utf-8");
-
   for (const [tenant, siteId] of discoveries) {
-    // Pattern: tenant: "tenantName", siteId: "oldValue",
-    const pattern = new RegExp(
-      (tenant:\\s*""\\s*,\\s*siteId:\\s*)"[^"]*",
+    const sitePat = new RegExp(
+      '(tenant:\\s*"' + tenant + '"\\s*,\\s*siteId:\\s*)"[^"]*"',
       "g"
     );
-    raw = raw.replace(pattern, $"");
-
-    // Update status from pending ¡ú verified
-    const statusPattern = new RegExp(
-      (tenant:\\s*""[^}]*status:\\s*)"pending",
+    raw = raw.replace(sitePat, 'TMPL1' + siteId + 'TMPL2');
+    raw = raw.replace(/TMPL1/g, '\x241"');
+    raw = raw.replace(/TMPL2/g, '"');
+    const statusPat = new RegExp(
+      '(tenant:\\s*"' + tenant + '"[^}]*status:\\s*)"pending"',
       "g"
     );
-    raw = raw.replace(statusPattern, $"verified");
+    raw = raw.replace(statusPat, 'TMPL3');
+    raw = raw.replace(/TMPL3/g, '\x241"verified"');
   }
-
   writeFileSync(YAML_PATH, raw, "utf-8");
 }
 
-// ©¤©¤ Main ©¤©¤
 async function main() {
   console.log("=== Workday siteId Discovery ===\n");
-
   const employers = readWorkdayYaml();
-  console.log(Loaded  employers from workday.yaml\n);
+  console.log("Loaded " + employers.length + " employers from workday.yaml\n");
 
-  // Filter: only pending entries that have a known career URL
-  const targets = employers.filter(
-    (e) => e.status === "pending" && CAREER_URLS[e.tenant]
-  );
+  // Target only pending entries
+  const targets = employers.filter(e => e.status === "pending");
+  console.log("Pending targets: " + targets.length + "\n");
 
-  console.log(Targets with career URLs: \n);
   if (targets.length === 0) {
-    console.log("No pending targets with known career URLs. Exiting.");
+    console.log("No pending targets. Exiting.");
     return;
   }
 
@@ -113,60 +78,53 @@ async function main() {
   const discoveries = new Map<string, string>();
 
   for (const employer of targets) {
-    const careerUrl = CAREER_URLS[employer.tenant];
-    console.log([] Opening  ...);
+    // Navigate to the Workday tenant landing page, which loads the job search widget
+    const tenantUrl = employer.baseUrl + "/" + employer.tenant;
+    console.log("[" + employer.name + "] " + tenantUrl + " ...");
 
     const page = await browser.newPage();
     let discovered: string | null = null;
 
-    // Intercept XHR/fetch requests to Workday CXS API
-    page.on("request", (req) => {
+    // Intercept XHR/fetch to Workday CXS API
+    page.on("request", req => {
       const url = req.url();
-      const match = url.match(/\/wday\/cxs\/[^/]+\/([^/]+)\/jobs/);
+      const match = url.match(/\/wday\/cxs\/[^/]+\/([^/]+)\//);
       if (match && match[1] !== employer.siteId) {
         discovered = match[1];
       }
     });
 
     try {
-      await page.goto(careerUrl, { timeout: 30_000, waitUntil: "domcontentloaded" });
-      // Wait for Workday widget to load and fire XHR requests
+      await page.goto(tenantUrl, { timeout: 30_000, waitUntil: "domcontentloaded" });
       await page.waitForTimeout(8000);
-    } catch (err) {
-      console.log(  ? Navigation error: );
+    } catch (err: any) {
+      console.log("  (!!) Navigation error: " + err.message);
     }
 
     if (discovered) {
-      console.log(  ? siteId found: "" (was ""));
+      console.log('  (OK) siteId: "' + discovered + '" (was "' + employer.siteId + '")');
       discoveries.set(employer.tenant, discovered);
     } else {
-      console.log(  ? No Workday XHR intercepted (career page may not load Workday JS));
+      console.log("  (--) No CXS request intercepted");
     }
 
     await page.close();
-    // Rate-limit: 2s between pages
-    await new Promise((r) => setTimeout(r, 2000));
+    await new Promise(r => setTimeout(r, 2000));
   }
 
   await browser.close();
 
-  // ©¤©¤ Report ©¤©¤
-  console.log(\n=== Results ===);
-  console.log(Discovered:  / );
+  console.log("\n=== Results ===");
+  console.log("Discovered: " + discoveries.size + " / " + targets.length);
   if (discoveries.size > 0) {
     console.log("\nUpdating workday.yaml ...");
     updateWorkdayYaml(discoveries);
-    console.log("Done. Run git diff to review changes.\n");
-
+    console.log("Done.\n");
     for (const [tenant, siteId] of discoveries) {
-      console.log(  : );
+      console.log("  " + tenant + ": " + siteId);
     }
   } else {
     console.log("\nNo siteIds discovered. workday.yaml unchanged.");
   }
 }
-
-main().catch((err) => {
-  console.error("Fatal:", err);
-  process.exit(1);
-});
+main().catch(err => { console.error("Fatal:", err); process.exit(1); });
