@@ -1,6 +1,10 @@
 import { ensureApplyResultsTable, closePool } from "./db/apply-results.js";
-import { applyWorker, connection } from "./queue/apply-queue.js";
+import { applyWorker, applyQueue, connection } from "./queue/apply-queue.js";
 import { closeAllSlots } from "./cloak/pool.js";
+import express from "express";
+import { createBullBoard } from "@bull-board/api";
+import { BullMQAdapter } from "@bull-board/api/bullMQAdapter.js";
+import { ExpressAdapter } from "@bull-board/express";
 
 async function main() {
   console.log("[worker] Starting ApplyMate worker...");
@@ -27,6 +31,31 @@ async function main() {
   }
 
   console.log(`[worker] Listening on queue 'apply-tasks' (concurrency: ${process.env.CLOAK_MAX_WORKERS ?? "1"})`);
+
+  // ── Bull Board admin UI ────────────────────────────────────────────────
+  const serverAdapter = new ExpressAdapter();
+  serverAdapter.setBasePath("/admin/queues");
+  createBullBoard({ queues: [new BullMQAdapter(applyQueue)], serverAdapter });
+
+  const adminApp = express();
+
+  // Basic auth when BULL_BOARD_PASSWORD is set
+  adminApp.use("/admin/queues", (req, res, next) => {
+    const pwd = process.env.BULL_BOARD_PASSWORD;
+    if (!pwd) return next();
+    const expected = "Basic " + Buffer.from("admin:" + pwd).toString("base64");
+    if (req.headers.authorization !== expected) {
+      res.setHeader("WWW-Authenticate", 'Basic realm="Bull Board"');
+      return res.status(401).send("Unauthorized");
+    }
+    next();
+  });
+
+  adminApp.use("/admin/queues", serverAdapter.getRouter());
+  const boardPort = Number(process.env.BULL_BOARD_PORT ?? "3001");
+  adminApp.listen(boardPort, () =>
+    console.log(`[bull-board] http://localhost:${boardPort}/admin/queues`)
+  );
 
   // Graceful shutdown
   const shutdown = async (signal: string) => {
