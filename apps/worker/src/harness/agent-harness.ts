@@ -19,6 +19,8 @@ export interface HarnessConfig {
 }
 
 /** Task data passed to harness.run() */
+export type HarnessResult = Pick<import("@jobcopilot/shared").ApplyResult, "status" | "error" | "durationMs"> & { turns?: number; log?: unknown[] };
+
 export interface ApplyTask {
   jobId: string;
   applyUrl: string;
