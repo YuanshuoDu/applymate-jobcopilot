@@ -16,6 +16,7 @@ import { AgentPlaygroundPage } from '@/components/pages/AgentPlaygroundPage'
 import { AgentAnimationPage }  from '@/components/pages/AgentAnimationPage'
 import { ExtensionPage }      from '@/components/pages/ExtensionPage'
 import { SettingsPage }       from '@/components/pages/SettingsPage'
+import { ApplyHistoryPage }  from '@/components/pages/ApplyHistoryPage'
 
 const MOB_NAV: { id: Page; icon: string; label: string; badge?: boolean }[] = [
   { id: 'dashboard', icon: '▦', label: 'Home'    },
@@ -35,6 +36,7 @@ const PAGES: Record<Page, React.ComponentType> = {
   animation: AgentAnimationPage,
   extension: ExtensionPage,
   settings:  SettingsPage,
+  'apply-history': ApplyHistoryPage,
 }
 
 function getInitialPage(): Page {
