@@ -2,22 +2,28 @@
 Closes #
 
 ## What Changed
--
+<!-- 1 paragraph: what this PR does and why -->
 
-## How to Verify
-- [ ]
-- [ ]
+## Layer 1 — Code AC Self-Check
+| AC | Status | Evidence |
+|----|--------|----------|
+| AC1: ... | ✅ / ❌ | file:line |
 
-## Risk & Rollback
-- Risk:
-- Rollback: revert this commit
+## Layer 2 — Goal Alignment
+| Goal | Status | Notes |
+|------|--------|-------|
+| Cost / EU coverage / reliability | ✅ / N/A | |
+
+## Tests
+- [ ] `pnpm --filter <app> test` — N/N pass
+- [ ] `pnpm --filter <app> tsc --noEmit` — 0 errors
+
+## Risks / Follow-ups
 
 ---
-**Reviewer Checklist** (for @claude)
-- [ ] All ACs in the linked Issue are satisfied
-- [ ] Follows design_system conventions (colors, spacing, components)
-- [ ] Follows tech_stack / dev_workflow conventions
-- [ ] No unrelated changes or scope creep
-- [ ] No new dependencies introduced without discussion
-- [ ] No skipped tests or weakened assertions
-- [ ] CI passes
+**@claude Reviewer Checklist**
+- [ ] All ACs satisfied
+- [ ] No scope creep (only files in issue Tech Notes)
+- [ ] Lockfile: only declared deps
+- [ ] Type-safe: no unneeded `as any`
+- [ ] Dry-run paths tested if applicable
