@@ -1,17 +1,21 @@
 # Workday employer registry (Phase 2.1+2.2)
-# Verified: each entry confirmed via CXS search endpoint (200 + total > 0)
 # Country codes: ISO 3166-1 alpha-2, lowercase
 # Tier: 1=Fortune 500, 2=large multinational, 3=regional
 # baseUrl: includes wd{N} subdomain — never guess wd3 vs wd5 vs wd10
 #
 # Verification status key:
-#   verified   — CXS search endpoint confirmed (200 + total>0)
-#   pending    — entry not yet verified (best-guess tenant/siteId)
-#   unreachable— endpoint 401/404/422, needs correction
+#   verified    — CXS search endpoint confirmed (200 + total>0)
+#   pending     — siteId not yet confirmed. HTTP 422 returned on all tested patterns —
+#                 siteId path must be discovered via browser DevTools (intercept XHR to /wday/cxs/).
+#                 The tenant subdomain is correct; only the siteId path component is unknown.
+#   unreachable — company confirmed NOT using Workday ATS at this tenant
+#
+# Phase 8+ TODO: Add Playwright-based siteId discovery script that intercepts
+# XHR requests from the company's public career page to extract the correct siteId.
 employers:
   # === DE — Germany ===
-  # VERIFIED entries confirmed via HTTP
-  # PENDING entries: tenant/siteId are best-guess, needs run of verify-workday.ts
+  # All entries tested 2026-05-22 — tenant subdomains reachable, siteIds return 422.
+  # Correct siteIds require browser DevTools inspection of each career page.
 
   # --- Tier 1: Fortune 500 / DAX ---
   - { name: "SAP",              tenant: "sap",        siteId: "SAPCareers",                 baseUrl: "https://sap.wd3.myworkdayjobs.com",        country: "de", tier: 1, status: "pending" }
