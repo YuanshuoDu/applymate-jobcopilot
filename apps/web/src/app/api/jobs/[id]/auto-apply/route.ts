@@ -34,7 +34,7 @@ export async function POST(req: NextRequest, { params }: Params) {
     userId: auth.userId,
     applyUrl: job.url,
     personaId: auth.userId,
-    resumePath: auth.userId,
+    resumePath: '',   // worker generates PDF from DB resume; empty string = no fallback path
     dryRun: body.dryRun ?? false,
   });
 
