@@ -13,6 +13,8 @@ import { runGreenhouseFlow } from "../flows/greenhouse-flow.js";
 const redisUrl = process.env.REDIS_URL ?? "redis://localhost:6379";
 export const connection = new Redis(redisUrl, { maxRetriesPerRequest: null });
 
+const APPLY_TIMEOUT_MS = Number(process.env.APPLY_TIMEOUT_MS ?? '300000');
+
 export const QUEUE_NAME = "apply-tasks";
 
 /** The queue used to enqueue apply tasks */
@@ -52,7 +54,8 @@ export const applyWorker = new Worker<ApplyTaskPayload>(
       // Load real persona + job data from DB
       const ctx = await loadTaskContext(getPool(), userId, jobId, applyUrl);
 
-      await withCloakContext(userId, async (page) => {
+      await Promise.race([
+        withCloakContext(userId, async (page) => {
         console.log(
           `[apply-worker] Navigating to ${ctx.applyUrl} (user=${userId}, job=${jobId}, dryRun=${dryRun ?? false})`
         );
@@ -115,7 +118,11 @@ export const applyWorker = new Worker<ApplyTaskPayload>(
           [newJobStatus, jobId, userId]
         )
 
-      });
+        }),
+        new Promise<never>((_, reject) =>
+          setTimeout(() => reject(new Error('Apply timeout: exceeded 5 minutes')), APPLY_TIMEOUT_MS)
+        ),
+      ]);
     } catch (err: unknown) {
       const durationMs = Date.now() - startedAt;
       const message = err instanceof Error ? err.message : String(err);
