@@ -2,6 +2,7 @@ import { NextRequest } from 'next/server'
 import { db } from '@/lib/db'
 import { requireAuth, isErrorResponse, ok, err } from '@/lib/api-helpers'
 import type { PersonaField } from '@/lib/persona'
+import type { Prisma } from '@prisma/client'
 
 /**
  * GET /api/me/persona/fields — returns saved persona fields
@@ -53,7 +54,7 @@ export async function POST(req: NextRequest) {
 
   await db.user.update({
     where: { id: auth.userId },
-    data: { personaFields: merged as any },
+    data: { personaFields: merged as unknown as Prisma.InputJsonValue },
   })
 
   return ok({ fields: merged }, 200)
@@ -75,7 +76,7 @@ export async function DELETE(req: NextRequest) {
 
   await db.user.update({
     where: { id: auth.userId },
-    data: { personaFields: filtered as any },
+    data: { personaFields: filtered as unknown as Prisma.InputJsonValue },
   })
 
   return ok({ ok: true })
