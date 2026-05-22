@@ -215,7 +215,14 @@ export function CompanyLogo({ logo, size = 24 }: { logo: string; size?: number }
 }
 
 // ─── ScorePill ───────────────────────────────────────────────────────────────
-export function ScorePill({ score }: { score: number }) {
+export function ScorePill({ score }: { score: number | null }) {
+  if (score === null) {
+    return (
+      <span style={{ fontSize: 11, fontWeight: 500, color: 'var(--text-muted)', background: 'var(--bg-secondary)', borderRadius: 999, padding: '2px 7px' }}>
+        —
+      </span>
+    )
+  }
   const color = score >= 80 ? '#3B6D11' : score >= 60 ? '#854F0B' : '#A32D2D'
   const bg    = score >= 80 ? 'rgba(59,109,17,0.12)' : score >= 60 ? 'rgba(133,79,11,0.12)' : 'rgba(163,45,45,0.12)'
   return (

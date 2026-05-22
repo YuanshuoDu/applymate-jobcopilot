@@ -89,7 +89,7 @@ function ListView({ jobs, onRowClick }: { jobs: Job[]; onRowClick: (job: Job) =>
                 })() : null}
               </td>
               <td style={{ padding: '10px 16px' }}><StatusBadge status={j.status} /></td>
-              <td style={{ padding: '10px 16px' }}><ScorePill score={j.score ?? 0} /></td>
+              <td style={{ padding: '10px 16px' }}><ScorePill score={j.score} /></td>
               <td style={{ padding: '10px 16px', fontSize: 11, color: 'var(--text-muted)' }}>
                 {fmtDate(j.appliedAt ?? j.createdAt)}
               </td>
@@ -276,7 +276,7 @@ function ApplyBasket({ cart, onRemove, onClose, onJobsUpdated }: {
                 <div style={{ fontSize: 12, fontWeight: 500 }}>{j.role}</div>
                 <div style={{ fontSize: 11, color: 'var(--text-muted)' }}>{j.company} · {j.location}</div>
               </div>
-              <ScorePill score={j.score ?? 0} />
+              <ScorePill score={j.score} />
               {tailored.has(j.id) && <span style={{ fontSize: 10, color: '#3B6D11', fontWeight: 500 }}>✓ Tailored</span>}
               {!tailoring && <button onClick={() => onRemove(j.id)} style={{ background: 'none', border: 'none', cursor: 'pointer', color: 'var(--text-muted)', fontSize: 13 }}>✕</button>}
             </div>
@@ -1122,7 +1122,7 @@ export function JobsPage() {
                     <div key={j.id} style={{ display: 'flex', alignItems: 'center', gap: 6, background: 'var(--bg)', border: '0.5px solid var(--border)', borderRadius: 8, padding: '6px 10px' }}>
                       <CompanyLogo logo={j.logo ?? j.company.slice(0, 2).toUpperCase()} size={18} />
                       <span style={{ fontSize: 11 }}>{j.company}</span>
-                      <ScorePill score={j.score ?? 0} />
+                      <ScorePill score={j.score} />
                       <button onClick={() => addToCart(j)} style={{
                         fontSize: 10, padding: '2px 8px', borderRadius: 999, border: '0.5px solid var(--border)',
                         background: cart.find(c => c.id === j.id) ? 'rgba(24,95,165,0.12)' : 'transparent',
