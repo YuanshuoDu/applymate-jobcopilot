@@ -70,7 +70,10 @@ export const applyWorker = new Worker<ApplyTaskPayload>(
         const applyTask: ApplyTask = {
           jobId,
           applyUrl: ctx.applyUrl,
-          persona: ctx.persona,
+          persona: {
+            ...ctx.persona,
+            coverLetter: ctx.coverLetterText ?? "",
+          },
           jobTitle: ctx.jobTitle,
           jobCompany: ctx.jobCompany,
           jobKeywords: ctx.jobKeywords,
