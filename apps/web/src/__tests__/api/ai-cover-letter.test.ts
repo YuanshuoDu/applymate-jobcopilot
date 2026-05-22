@@ -16,6 +16,7 @@ vi.mock('@/lib/api-helpers', () => ({
   isErrorResponse: (val: unknown) => val instanceof Response && (val as Response).status === 401,
   ok: (data: unknown, status = 200) => Response.json(data, { status }),
   err: (message: string, status = 400) => Response.json({ error: message }, { status }),
+  prepareAiRoute: vi.fn().mockResolvedValue({ auth: { userId: 'test-user' }, cfg: { provider: 'anthropic', model: 'claude-sonnet-4-6' } }),
 }))
 vi.mock('@/lib/rate-limit', () => ({
   checkRateLimit: vi.fn().mockReturnValue({ ok: true }),
@@ -38,14 +39,14 @@ describe('POST /api/ai/cover-letter', () => {
     const { POST } = await import('@/app/api/ai/cover-letter/route')
     const req = fakeNextRequest({ jobTitle: 'Engineer', jobCompany: 'Acme' })
     const res = await POST(req as never)
-    expect(res.status).toBe(400)
+    expect(res!.status).toBe(400)
   })
 
   it('returns 400 when jobTitle is missing', async () => {
     const { POST } = await import('@/app/api/ai/cover-letter/route')
     const req = fakeNextRequest({ resumeContent: { summary: 'test' }, jobCompany: 'Acme' })
     const res = await POST(req as never)
-    expect(res.status).toBe(400)
+    expect(res!.status).toBe(400)
   })
 
   it('returns a cover letter on successful generation', async () => {
@@ -74,8 +75,8 @@ John Doe`
     })
     const res = await POST(req as never)
 
-    expect(res.status).toBe(200)
-    const body = await res.json()
+    expect(res!.status).toBe(200)
+    const body = await res!.json()
     expect(body.coverLetter).toBe(mockLetter.trim())
   })
 
@@ -94,7 +95,7 @@ John Doe`
     })
     const res = await POST(req as never)
 
-    expect(res.status).toBe(200)
+    expect(res!.status).toBe(200)
   })
 
   it('supports different tones', async () => {
@@ -111,6 +112,6 @@ John Doe`
       tone: 'concise',
     })
     const res = await POST(req as never)
-    expect(res.status).toBe(200)
+    expect(res!.status).toBe(200)
   })
 })

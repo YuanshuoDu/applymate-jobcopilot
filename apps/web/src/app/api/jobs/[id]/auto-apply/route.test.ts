@@ -15,7 +15,7 @@ vi.mock("@/lib/db", () => ({
   db: {
     job: {
       findUnique: vi.fn(),
-      update: vi.fn(),
+      update: vi.fn().mockResolvedValue({}),
     },
   },
 }));

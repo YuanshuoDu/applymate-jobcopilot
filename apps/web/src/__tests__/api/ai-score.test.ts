@@ -20,6 +20,7 @@ vi.mock('@/lib/api-helpers', () => ({
   isErrorResponse: (val: unknown) => val instanceof Response && (val as Response).status === 401,
   ok: (data: unknown, status = 200) => Response.json(data, { status }),
   err: (message: string, status = 400) => Response.json({ error: message }, { status }),
+  prepareAiRoute: vi.fn().mockResolvedValue({ auth: { userId: 'test-user' }, cfg: { provider: 'anthropic', model: 'claude-sonnet-4-6' } }),
 }))
 vi.mock('@/lib/rate-limit', () => ({
   checkRateLimit: vi.fn().mockReturnValue({ ok: true }),
@@ -47,8 +48,8 @@ describe('POST /api/ai/score', () => {
     const req = fakeNextRequest({ jobTitle: 'Engineer' })
     const res = await POST(req as never)
 
-    expect(res.status).toBe(400)
-    const body = await res.json()
+    expect(res!.status).toBe(400)
+    const body = await res!.json()
     expect(body.error).toContain('resumeContent')
   })
 
@@ -57,8 +58,8 @@ describe('POST /api/ai/score', () => {
     const req = fakeNextRequest({ resumeContent: { summary: 'test' } })
     const res = await POST(req as never)
 
-    expect(res.status).toBe(400)
-    const body = await res.json()
+    expect(res!.status).toBe(400)
+    const body = await res!.json()
     expect(body.error).toContain('jobTitle')
   })
 
@@ -70,7 +71,7 @@ describe('POST /api/ai/score', () => {
       body: 'not-json',
     })
     const res = await POST(req as never)
-    expect(res.status).toBe(400)
+    expect(res!.status).toBe(400)
   })
 
   it('parses AI response correctly', async () => {
@@ -94,8 +95,8 @@ describe('POST /api/ai/score', () => {
     })
     const res = await POST(req as never)
 
-    expect(res.status).toBe(200)
-    const body = await res.json()
+    expect(res!.status).toBe(200)
+    const body = await res!.json()
     expect(body.score).toBe(82)
     expect(body.matchedKeywords).toEqual(['react', 'typescript'])
     expect(body.missingKeywords).toEqual(['docker'])
@@ -116,8 +117,8 @@ describe('POST /api/ai/score', () => {
     })
     const res = await POST(req as never)
 
-    expect(res.status).toBe(200)
-    const body = await res.json()
+    expect(res!.status).toBe(200)
+    const body = await res!.json()
     expect(body.score).toBe(60)
   })
 
@@ -135,7 +136,7 @@ describe('POST /api/ai/score', () => {
     const res = await POST(req as never)
 
     // Should return 500 on JSON parse error
-    expect(res.status).toBe(500)
+    expect(res!.status).toBe(500)
   })
 
   it('extracts ATS keywords from JD — contains technical terms, not generic words', async () => {
@@ -160,8 +161,8 @@ describe('POST /api/ai/score', () => {
     })
     const res = await POST(req as never)
 
-    expect(res.status).toBe(200)
-    const body = await res.json()
+    expect(res!.status).toBe(200)
+    const body = await res!.json()
     expect(body.keywords).toContain('React')
     expect(body.keywords).toContain('Docker')
     expect(body.keywords).toContain('Terraform')
@@ -185,8 +186,8 @@ describe('POST /api/ai/score', () => {
     })
     const res = await POST(req as never)
 
-    expect(res.status).toBe(500)
-    const body = await res.json()
+    expect(res!.status).toBe(500)
+    const body = await res!.json()
     expect(body.error).toContain('ANTHROPIC_API_KEY')
   })
 })
