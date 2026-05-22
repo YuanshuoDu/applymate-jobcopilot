@@ -3,6 +3,7 @@ import { applyWorker, applyQueue, connection } from "./queue/apply-queue.js";
 import { closeAllSlots } from "./cloak/pool.js";
 import express from "express";
 import { createBullBoard } from "@bull-board/api";
+// @ts-ignore — @bull-board/api .js extension import lacks type declarations
 import { BullMQAdapter } from "@bull-board/api/bullMQAdapter.js";
 import { ExpressAdapter } from "@bull-board/express";
 
