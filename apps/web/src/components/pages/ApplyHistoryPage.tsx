@@ -5,6 +5,15 @@ import { TopBar } from '@/components/layout/TopBar'
 import { Btn, Card } from '@/components/ui'
 import { useApi, fmtDate, apiMutate } from '@/lib/hooks'
 
+interface ApplyStats {
+  total: number
+  submitted: number
+  manual: number
+  failed: number
+  dryRun: number
+  avgDurationMs: number | null
+}
+
 // ?? Types ?????????????????????????????????????????????????????????????????
 
 interface ApplyHistoryResult {
@@ -57,7 +66,9 @@ function DurationCell({ ms }: { ms: number | null }) {
 
 export function ApplyHistoryPage() {
   const { data, loading, error, refetch } = useApi<{ results: ApplyHistoryResult[] }>('/api/apply-results')
+  const { data: statsData } = useApi<{ stats: ApplyStats }>('/api/apply-results/stats')
   const [retrying, setRetrying] = useState<Record<number, boolean>>({})
+  const stats = statsData?.stats
 
   async function handleRetry(jobId: string, resultId: number) {
     setRetrying(r => ({ ...r, [resultId]: true }))
@@ -78,7 +89,7 @@ export function ApplyHistoryPage() {
       <div style={{ flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'center', background: 'var(--bg-tertiary)' }}>
         <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 10 }}>
           <div style={{ width: 28, height: 28, border: '2.5px solid rgba(24,95,165,0.2)', borderTopColor: '#185FA5', borderRadius: '50%', animation: 'spin 0.7s linear infinite' }} />
-          <div style={{ fontSize: 12, color: 'var(--text-muted)' }}>Loading apply history?</div>
+          <div style={{ fontSize: 12, color: 'var(--text-muted)' }}>Loading apply history…</div>
         </div>
       </div>
     )
@@ -89,7 +100,7 @@ export function ApplyHistoryPage() {
     return (
       <div style={{ flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'center', background: 'var(--bg-tertiary)' }}>
         <div style={{ textAlign: 'center' }}>
-          <div style={{ fontSize: 24, marginBottom: 10 }}>?</div>
+          <div style={{ fontSize: 24, marginBottom: 10 }}>?</div>  {/* error icon */}
           <div style={{ fontSize: 13, color: '#A32D2D', marginBottom: 14 }}>{error}</div>
           <Btn variant="ghost" onClick={refetch}>Retry</Btn>
         </div>
@@ -100,14 +111,32 @@ export function ApplyHistoryPage() {
   return (
     <div style={{ flex: 1, overflowY: 'auto', background: 'var(--bg-tertiary)' }}>
       <TopBar title="Apply History">
-        <Btn variant="ghost" onClick={refetch}>? Refresh</Btn>
+        <Btn variant="ghost" onClick={refetch}>↻ Refresh</Btn>
       </TopBar>
 
       <div style={{ padding: 20 }}>
+
+        {/* Stats summary row */}
+        {stats && (
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 12, marginBottom: 16 }}>
+            {[
+              { label: 'Total Applied', value: stats.total, color: 'var(--text)' },
+              { label: 'Submitted', value: stats.submitted, color: '#22c55e' },
+              { label: 'Manual / Pending', value: stats.manual, color: '#f59e0b' },
+              { label: 'Failed', value: stats.failed, color: '#ef4444' },
+            ].map(({ label, value, color }) => (
+              <Card key={label} style={{ padding: '14px 16px' }}>
+                <div style={{ fontSize: 10, color: 'var(--text-muted)', fontWeight: 500, textTransform: 'uppercase', letterSpacing: '0.4px', marginBottom: 6 }}>{label}</div>
+                <div style={{ fontSize: 24, fontWeight: 700, color }}>{value}</div>
+              </Card>
+            ))}
+          </div>
+        )}
+
         {/* Empty state */}
         {results.length === 0 ? (
           <Card style={{ padding: '48px 16px', textAlign: 'center' }}>
-            <div style={{ fontSize: 32, marginBottom: 10 }}>??</div>
+            <div style={{ fontSize: 32, marginBottom: 10 }}>📋</div>
             <div style={{ fontSize: 14, fontWeight: 500, marginBottom: 6, color: 'var(--text)' }}>No apply history yet</div>
             <div style={{ fontSize: 12, color: 'var(--text-muted)', lineHeight: 1.6, maxWidth: 360, margin: '0 auto' }}>
               Apply results will appear here after you use Auto Apply or the AI Agent to submit applications.
@@ -184,7 +213,7 @@ export function ApplyHistoryPage() {
                         disabled={!!retrying[r.id]}
                         onClick={() => handleRetry(r.jobId, r.id)}
                       >
-                        {retrying[r.id] ? '?' : '? Retry'}
+                        {retrying[r.id] ? '⏳' : '↻ Retry'}
                       </Btn>
                     )}
                   </div>
@@ -202,9 +231,9 @@ export function ApplyHistoryPage() {
                 fontSize: 11, color: '#ef4444', padding: '4px 0',
                 display: 'flex', gap: 8, alignItems: 'flex-start',
               }}>
-                <span style={{ fontWeight: 500, whiteSpace: 'nowrap' }}>{r.company} ? {r.role}:</span>
+                <span style={{ fontWeight: 500, whiteSpace: 'nowrap' }}>{r.company} → {r.role}:</span>
                 <span style={{ color: 'var(--text-muted)' }}>
-                  {r.error!.length > 200 ? r.error!.slice(0, 200) + '?' : r.error}
+                  {r.error!.length > 200 ? r.error!.slice(0, 200) + '…' : r.error}
                 </span>
               </div>
             ))}
