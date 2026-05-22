@@ -8,7 +8,10 @@ interface Window {
 const userHourly = new Map<string, Window>();
 const userDomain4h = new Map<string, Window>();
 
-const MAX_PER_USER_HOUR = 30;
+// TODO Phase 7: replace with Redis-backed rate limiter to survive restarts
+// Current behavior: limits reset on worker restart. Acceptable for Phase 4 (low volume).
+// Risk: with multiple worker instances, each has independent limits — total throughput = N * 30/hr
+const MAX_PER_USER_HOUR = Number(process.env.RATE_LIMIT_PER_USER_HOUR ?? '30');
 const MAX_PER_DOMAIN_4H = 5;
 const HOUR_MS = 60 * 60 * 1000;
 const FOUR_HOURS_MS = 4 * HOUR_MS;
@@ -64,3 +67,4 @@ export function resetRateLimits(): void {
   userHourly.clear();
   userDomain4h.clear();
 }
+
