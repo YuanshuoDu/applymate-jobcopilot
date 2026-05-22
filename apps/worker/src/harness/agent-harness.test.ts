@@ -1,22 +1,24 @@
-import { describe, it, expect, vi } from "vitest";
+import { describe, it, expect, vi, beforeEach } from "vitest";
 import { AgentHarness } from "./agent-harness.js";
 import type { Page } from "playwright-core";
 
-// ── Helpers ──
+// Mock the shared LLM module
+vi.mock("@jobcopilot/shared/llm", () => ({
+  loadWorkerAiConfig: vi.fn().mockResolvedValue({
+    provider: "minimax",
+    model: "MiniMax-M2.7",
+  }),
+  callLlmText: vi.fn(),
+}));
 
 /** Mock perceived fields */
-const mockFields = (): Array<{
-  selector: string;
-  type: string;
-  label: string;
-  required: boolean;
-  currentValue: string;
-  options?: string[];
-}> => [
-  { selector: "#name", type: "text", label: "Full Name", required: true, currentValue: "" },
-  { selector: "#email", type: "email", label: "Email", required: true, currentValue: "" },
-  { selector: "#resume", type: "file", label: "Upload Resume", required: true, currentValue: "" },
-];
+function mockFields() {
+  return [
+    { selector: "#name", type: "text" as const, label: "Full Name", required: true, currentValue: "" },
+    { selector: "#email", type: "email" as const, label: "Email", required: true, currentValue: "" },
+    { selector: "#resume", type: "file" as const, label: "Upload Resume", required: true, currentValue: "" },
+  ];
+}
 
 /** Create a mock Page */
 function mockPage(url: string = "https://jobs.example.com/apply"): Page {
@@ -34,30 +36,24 @@ function mockPage(url: string = "https://jobs.example.com/apply"): Page {
   } as unknown as Page;
 }
 
-/** Mock LLM that returns a sequence of actions */
-function mockCallLLM(responses: string[]) {
-  let idx = 0;
-  return vi.fn<() => Promise<string>>().mockImplementation(async () => {
-    const r = responses[idx] ?? '{"type": "done"}';
-    idx++;
-    return r;
-  });
-}
-
-// ── Tests ──
-
 describe("AgentHarness", () => {
-  it("happy path: 3 turns → done", async () => {
-    const callLLM = mockCallLLM([
-      '{"type": "fill", "selector": "#name", "value": "John Doe", "reasoning": "Fill name"}',
-      '{"type": "click", "selector": "#next", "reasoning": "Click next"}',
-      '{"type": "done", "reasoning": "Form submitted"}',
-    ]);
+  beforeEach(async () => {
+    vi.clearAllMocks();
+    // Re-mock fields (vi.clearAllMocks clears evaluate return)
+    const { callLlmText } = await import("@jobcopilot/shared/llm");
+    vi.mocked(callLlmText).mockReset();
+  });
 
-    const harness = new AgentHarness(
-      { userId: "user-1", maxTurns: 30, dryRun: false, mode: "dom" },
-      callLLM
-    );
+  it("happy path: 3 turns → done", async () => {
+    const { callLlmText } = await import("@jobcopilot/shared/llm");
+    vi.mocked(callLlmText)
+      .mockResolvedValueOnce('{"type": "fill", "selector": "#name", "value": "John Doe", "reasoning": "Fill name"}')
+      .mockResolvedValueOnce('{"type": "click", "selector": "#next", "reasoning": "Click next"}')
+      .mockResolvedValueOnce('{"type": "done", "reasoning": "Form submitted"}');
+
+    const harness = new AgentHarness({
+      userId: "user-1", maxTurns: 30, dryRun: false, mode: "dom",
+    });
 
     const page = mockPage();
     const result = await harness.run(page, {
@@ -74,14 +70,14 @@ describe("AgentHarness", () => {
   });
 
   it("maxTurns exceeded → failed result", async () => {
-    const callLLM = mockCallLLM(
-      Array(10).fill('{"type": "fill", "selector": "#field", "value": "data", "reasoning": "filling"}')
+    const { callLlmText } = await import("@jobcopilot/shared/llm");
+    vi.mocked(callLlmText).mockResolvedValue(
+      '{"type": "fill", "selector": "#field", "value": "data", "reasoning": "filling"}'
     );
 
-    const harness = new AgentHarness(
-      { userId: "user-1", maxTurns: 3, dryRun: false, mode: "dom" },
-      callLLM
-    );
+    const harness = new AgentHarness({
+      userId: "user-1", maxTurns: 3, dryRun: false, mode: "dom",
+    });
 
     const page = mockPage();
     const result = await harness.run(page, {
@@ -98,15 +94,14 @@ describe("AgentHarness", () => {
   });
 
   it("dry-run: fill action logged, page.fill NOT called", async () => {
-    const callLLM = mockCallLLM([
-      '{"type": "fill", "selector": "#name", "value": "Test", "reasoning": "Fill name"}',
-      '{"type": "done", "reasoning": "Done"}',
-    ]);
+    const { callLlmText } = await import("@jobcopilot/shared/llm");
+    vi.mocked(callLlmText)
+      .mockResolvedValueOnce('{"type": "fill", "selector": "#name", "value": "Test", "reasoning": "Fill name"}')
+      .mockResolvedValueOnce('{"type": "done", "reasoning": "Done"}');
 
-    const harness = new AgentHarness(
-      { userId: "user-1", maxTurns: 10, dryRun: true, mode: "dom" },
-      callLLM
-    );
+    const harness = new AgentHarness({
+      userId: "user-1", maxTurns: 10, dryRun: true, mode: "dom",
+    });
 
     const page = mockPage();
     await harness.run(page, {
@@ -118,20 +113,19 @@ describe("AgentHarness", () => {
       resumePath: "/r.pdf",
     });
 
-    // fill should NOT be called in dry-run
     expect(page.fill).not.toHaveBeenCalled();
     expect(page.type).not.toHaveBeenCalled();
   });
 
   it("manual escalation: LLM returns 'manual' → correct result type", async () => {
-    const callLLM = mockCallLLM([
-      '{"type": "manual", "reasoning": "CAPTCHA detected, cannot proceed"}',
-    ]);
-
-    const harness = new AgentHarness(
-      { userId: "user-1", maxTurns: 30, dryRun: false, mode: "dom" },
-      callLLM
+    const { callLlmText } = await import("@jobcopilot/shared/llm");
+    vi.mocked(callLlmText).mockResolvedValueOnce(
+      '{"type": "manual", "reasoning": "CAPTCHA detected, cannot proceed"}'
     );
+
+    const harness = new AgentHarness({
+      userId: "user-1", maxTurns: 30, dryRun: false, mode: "dom",
+    });
 
     const page = mockPage();
     const result = await harness.run(page, {

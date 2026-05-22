@@ -1,5 +1,6 @@
 import type { Page } from "playwright-core";
 import type { ApplyTaskPayload, ApplyResult } from "@jobcopilot/shared";
+import { loadWorkerAiConfig, callLlmText, type AiConfig } from "@jobcopilot/shared/llm";
 import { perceiveFields, type PerceivedField } from "./dom-extractor.js";
 import {
   buildSystemPrompt,
@@ -16,11 +17,6 @@ export interface HarnessConfig {
   dryRun: boolean;
   mode: "dom" | "vision" | "hybrid";
 }
-
-/** LLM call function injected by the caller */
-export type CallLLM = (
-  messages: Array<{ role: string; content: string }>
-) => Promise<string>;
 
 /** Task data passed to harness.run() */
 export interface ApplyTask {
@@ -43,12 +39,30 @@ const SUCCESS_URL_PATTERNS = [
 
 export class AgentHarness {
   private config: HarnessConfig;
-  private callLLM: CallLLM;
   private turns: TurnLog[] = [];
+  private aiConfig: AiConfig | null = null;
 
-  constructor(config: HarnessConfig, callLLM: CallLLM) {
+  constructor(config: HarnessConfig) {
     this.config = config;
-    this.callLLM = callLLM;
+  }
+
+  /** Resolve AI config lazily (cached per instance) */
+  private async getAiConfig(): Promise<AiConfig> {
+    if (!this.aiConfig) {
+      this.aiConfig = await loadWorkerAiConfig(this.config.userId);
+    }
+    return this.aiConfig;
+  }
+
+  /** Call the LLM with chat messages */
+  private async callLLM(
+    messages: Array<{ role: string; content: string }>
+  ): Promise<string> {
+    const config = await this.getAiConfig();
+    return callLlmText(
+      messages as Array<{ role: "system" | "user" | "assistant"; content: string }>,
+      config
+    );
   }
 
   /** Run the perception-action loop until termination. */
@@ -57,7 +71,6 @@ export class AgentHarness {
     const startedAt = Date.now();
 
     try {
-      // Build system prompt once
       const systemPrompt = buildSystemPrompt(
         {
           ...task.persona,
@@ -84,10 +97,10 @@ export class AgentHarness {
         try {
           fields = await perceiveFields(page);
         } catch (err) {
-          const logEntry = {
+          const logEntry: TurnLog = {
             turn,
-            perceived: [] as PerceivedField[],
-            action: { type: "manual" as const, reasoning: `DOM perception failed: ${err instanceof Error ? err.message : String(err)}` },
+            perceived: [],
+            action: { type: "manual", reasoning: `DOM perception failed: ${err instanceof Error ? err.message : String(err)}` },
             durationMs: Date.now() - turnStart,
           };
           this.turns.push(logEntry);
@@ -99,10 +112,10 @@ export class AgentHarness {
 
         // ── Check URL-based success ──
         if (SUCCESS_URL_PATTERNS.some((p) => p.test(url))) {
-          const logEntry = {
+          const logEntry: TurnLog = {
             turn,
             perceived: fields,
-            action: { type: "done" as const, reasoning: `URL pattern match: ${url}` },
+            action: { type: "done", reasoning: `URL pattern match: ${url}` },
             durationMs: Date.now() - turnStart,
           };
           this.turns.push(logEntry);
@@ -119,10 +132,10 @@ export class AgentHarness {
           rawResponse = await this.callLLM(messages);
         } catch (err) {
           const msg = err instanceof Error ? err.message : String(err);
-          const logEntry = {
+          const logEntry: TurnLog = {
             turn,
             perceived: fields,
-            action: { type: "manual" as const, reasoning: `LLM call failed: ${msg}` },
+            action: { type: "manual", reasoning: `LLM call failed: ${msg}` },
             durationMs: Date.now() - turnStart,
           };
           this.turns.push(logEntry);
@@ -130,15 +143,14 @@ export class AgentHarness {
           return this.buildResult("failed", task.jobId, Date.now() - startedAt, msg);
         }
 
-        // Add assistant response to message history
         messages.push({ role: "assistant", content: rawResponse });
 
         const action = parseAction(rawResponse);
         if (!action) {
-          const logEntry = {
+          const logEntry: TurnLog = {
             turn,
             perceived: fields,
-            action: { type: "manual" as const, reasoning: `Failed to parse LLM response: ${rawResponse.substring(0, 200)}` },
+            action: { type: "manual", reasoning: `Failed to parse LLM response: ${rawResponse.substring(0, 200)}` },
             durationMs: Date.now() - turnStart,
           };
           this.turns.push(logEntry);
@@ -161,11 +173,9 @@ export class AgentHarness {
 
         // ── Execute ──
         if (this.config.dryRun) {
-          // AC6: log but skip write actions
           if (["fill", "click", "select", "upload", "submit"].includes(action.type)) {
             continue;
           }
-          // Navigation-only actions still execute
         }
 
         try {
@@ -184,7 +194,6 @@ export class AgentHarness {
         }
       }
 
-      // maxTurns reached
       return this.buildResult("failed", task.jobId, Date.now() - startedAt, `Max turns (${this.config.maxTurns}) reached`);
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
@@ -192,7 +201,6 @@ export class AgentHarness {
     }
   }
 
-  /** Execute a single action on the page */
   private async executeAction(page: Page, action: AgentAction, task: ApplyTask): Promise<void> {
     switch (action.type) {
       case "fill": {
@@ -232,24 +240,21 @@ export class AgentHarness {
         try {
           await page.waitForURL(SUCCESS_URL_PATTERNS[0], { timeout: 10_000 });
         } catch {
-          // Navigation may take longer — let next turn perceive
+          // Navigation may take longer
         }
         break;
       }
     }
   }
 
-  /** Type text with human-speed delay (50-120ms per character) */
   private async humanType(page: Page, selector: string, text: string): Promise<void> {
     await page.focus(selector);
-    // Clear existing value first
     await page.fill(selector, "");
     for (const ch of text) {
       await page.type(selector, ch, { delay: 50 + Math.random() * 70 });
     }
   }
 
-  /** Build a structured ApplyResult */
   private buildResult(
     status: ApplyResult["status"],
     jobId: string,
@@ -266,7 +271,6 @@ export class AgentHarness {
     };
   }
 
-  /** Log a turn to stdout as JSON */
   private logTurn(log: TurnLog): void {
     console.log(JSON.stringify(log));
   }
