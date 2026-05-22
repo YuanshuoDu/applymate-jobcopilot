@@ -11,7 +11,7 @@ describe('detectFlow — URL routing', () => {
     ['https://boards.greenhouse.io/booking/jobs/123', 'greenhouse'],
     ['https://grnh.se/abc123', 'greenhouse'],
     ['https://sap.wd3.myworkdayjobs.com/SAP', 'workday'],
-    ['https://jobs.lever.co/spotify', null],
+    ['https://jobs.lever.co/spotify', 'lever'],
     ['https://example.com/careers', null],
   ])('detectFlow(%s) → %s', (url, expected) => {
     expect(detectFlow(url)).toBe(expected)

@@ -109,7 +109,8 @@ describe("detectFlow", () => {
   });
 
   it("unknown URL returns null", () => {
-    expect(detectFlow("https://jobs.lever.co/spotify")).toBe(null);
+    // Lever URLs are now handled — returns 'lever', not null
+    expect(detectFlow("https://jobs.lever.co/spotify")).toBe("lever");
     expect(detectFlow("https://example.com")).toBe(null);
   });
 

@@ -17,9 +17,9 @@ jobs:
       - uses: actions/setup-node@v4
         with: { node-version: 20, cache: pnpm }
       - run: pnpm install --frozen-lockfile
-      - run: pnpm --filter web tsc --noEmit --skipLibCheck
-      - run: pnpm --filter worker tsc --noEmit --skipLibCheck
-      - run: pnpm --filter @jobcopilot/shared tsc --noEmit --skipLibCheck
+      - run: pnpm --filter web exec tsc -- --noEmit --skipLibCheck
+      - run: pnpm --filter worker exec tsc -- --noEmit --skipLibCheck
+      - run: pnpm --filter @jobcopilot/shared exec tsc -- --noEmit --skipLibCheck
   test-web:
     name: Web Tests
     runs-on: ubuntu-latest
