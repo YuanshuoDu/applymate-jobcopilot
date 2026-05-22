@@ -46,6 +46,7 @@ export const applyWorker = new Worker<ApplyTaskPayload>(
     }
 
     const startedAt = Date.now();
+    let resultWritten = false;
 
     try {
       // Load real persona + job data from DB
@@ -101,6 +102,19 @@ export const applyWorker = new Worker<ApplyTaskPayload>(
           error: harnessResult.error ?? null,
           durationMs,
         });
+        resultWritten = true;
+
+        // Update Job status based on actual outcome
+        const newJobStatus =
+          harnessResult.status === 'submitted' ? 'applied' :
+          harnessResult.status === 'failed'    ? 'saved'   :
+          'applied';  // manual → keep applied
+
+        await getPool().query(
+          'UPDATE "Job" SET status = $1, "updatedAt" = NOW() WHERE id = $2 AND "userId" = $3',
+          [newJobStatus, jobId, userId]
+        )
+
       });
     } catch (err: unknown) {
       const durationMs = Date.now() - startedAt;
@@ -108,16 +122,23 @@ export const applyWorker = new Worker<ApplyTaskPayload>(
       console.error(
         `[apply-worker] Failed for user=${userId}, job=${jobId}: ${message}`
       );
-      await insertApplyResult({
-        userId,
-        jobId,
-        status: "failed",
-        mode: "unattended",
-        atsType: null,
-        flowUsed: null,
-        error: message,
-        durationMs,
-      });
+
+      if (!resultWritten) {
+        await insertApplyResult({
+          userId,
+          jobId,
+          status: "failed",
+          mode: "unattended",
+          atsType: null,
+          flowUsed: null,
+          error: message,
+          durationMs,
+        });
+        await getPool().query(
+          'UPDATE "Job" SET status = $1, "updatedAt" = NOW() WHERE id = $2 AND "userId" = $3',
+          ['saved', jobId, userId]
+        );
+      }
       throw err;
     }
   },
