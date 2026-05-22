@@ -58,35 +58,36 @@ export const applyWorker = new Worker<ApplyTaskPayload>(
     try {
       // Load real persona + job data from DB
       ctx = await loadTaskContext(getPool(), userId, jobId, applyUrl);
+      const taskCtx = ctx; // non-null const for use inside async callbacks
 
       await Promise.race([
         withCloakContext(userId, async (page) => {
         console.log(
-          `[apply-worker] Navigating to ${ctx.applyUrl} (user=${userId}, job=${jobId}, dryRun=${dryRun ?? false})`
+          `[apply-worker] Navigating to ${taskCtx.applyUrl} (user=${userId}, job=${jobId}, dryRun=${dryRun ?? false})`
         );
 
-        await page.goto(ctx.applyUrl, {
+        await page.goto(taskCtx.applyUrl, {
           waitUntil: "domcontentloaded",
           timeout: 30_000,
         });
 
         const applyTask: ApplyTask = {
           jobId,
-          applyUrl: ctx.applyUrl,
+          applyUrl: taskCtx.applyUrl,
           persona: {
-            ...ctx.persona,
-            coverLetter: ctx.coverLetterText ?? "",
+            ...taskCtx.persona,
+            coverLetter: taskCtx.coverLetterText ?? "",
           },
-          jobTitle: ctx.jobTitle,
-          jobCompany: ctx.jobCompany,
-          jobKeywords: ctx.jobKeywords,
-          resumePath: ctx.resumeTempPath ?? resumePath,
+          jobTitle: taskCtx.jobTitle,
+          jobCompany: taskCtx.jobCompany,
+          jobKeywords: taskCtx.jobKeywords,
+          resumePath: taskCtx.resumeTempPath ?? resumePath,
           coverLetterPath,
           dryRun: dryRun ?? false,
         };
 
         // Detect ATS → use pre-programmed flow if available, else AI fallback
-        const flow = detectFlow(ctx.applyUrl);
+        const flow = detectFlow(taskCtx.applyUrl);
         let harnessResult: HarnessResult;
 
         if (flow === "greenhouse") {
@@ -125,12 +126,12 @@ export const applyWorker = new Worker<ApplyTaskPayload>(
         if (harnessResult.status !== 'dry-run') {
           notifyApplyResult({
             userId,
-            jobTitle:   ctx.jobTitle,
-            jobCompany: ctx.jobCompany,
+            jobTitle:   taskCtx.jobTitle,
+            jobCompany: taskCtx.jobCompany,
             status:     harnessResult.status as 'submitted' | 'manual' | 'failed',
             error:      harnessResult.error ?? null,
             flowUsed:   flow ?? null,
-            jobUrl:     ctx.applyUrl,
+            jobUrl:     taskCtx.applyUrl,
           }).catch((e: Error) => console.warn('[notify] email failed:', e.message))
         }
 
@@ -177,7 +178,7 @@ export const applyWorker = new Worker<ApplyTaskPayload>(
     } finally {
       // Clean up temp resume PDF to avoid accumulating files on disk
       if (ctx?.resumeTempPath) {
-        try { unlinkSync(ctx.resumeTempPath) } catch { /* ENOENT or already gone — ignore */ }
+        try { unlinkSync(ctx.resumeTempPath!) } catch { /* ENOENT or already gone — ignore */ }
       }
     }
   },

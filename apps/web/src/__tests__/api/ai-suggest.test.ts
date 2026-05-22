@@ -45,9 +45,9 @@ describe('POST /api/ai/suggest', () => {
     const { POST } = await import('@/app/api/ai/suggest/route')
 
     mockModelChat.mockResolvedValueOnce({ text: JSON.stringify([
-      'Add Docker and Kubernetes to your skills section',
-      'Quantify your experience with numbers and metrics',
-      'Tailor your summary to mention cloud-native development',
+      { text: 'Add Docker and Kubernetes to your skills section', target: 'skills', action: 'add_keywords', proposed: 'Docker, Kubernetes' },
+      { text: 'Quantify your experience with numbers and metrics', target: 'experience', action: 'enhance', proposed: 'improved bullet' },
+      { text: 'Tailor your summary to mention cloud-native development', target: 'summary', action: 'rewrite', proposed: 'cloud-native summary' },
     ]) })
 
     const req = fakeNextRequest({
