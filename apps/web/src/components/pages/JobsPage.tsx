@@ -551,6 +551,11 @@ function JobDetailDrawer({ job, onClose, onStatusChange, onUpdate, onDelete }: {
             </div>
           )}
 
+          {/* Score Job */}
+          <div style={{ marginBottom: 6 }}>
+            <ScoreJobButton job={job} onUpdate={onUpdate} />
+          </div>
+
           {/* Auto Apply */}
           {job.url && (
             <div>
@@ -924,6 +929,78 @@ function AutoApplyButton({ job, onApplied }: { job: Job; onApplied?: () => void 
         <ApplyStatusCard jobId={job.id} jobUrl={job.url ?? undefined} jobStatus={job.status} />
       )}
     </div>
+  )
+}
+
+function ScoreJobButton({ job, onUpdate }: { job: Job; onUpdate: (updated: Job) => void }) {
+  const [loading, setLoading] = useState(false)
+  const toast = useToast()
+
+  async function handleScore() {
+    setLoading(true)
+    try {
+      const resumeRes = await fetch('/api/resume/default')
+      if (!resumeRes.ok) {
+        toast.error('No default resume', 'Set a default resume first')
+        return
+      }
+      const resumeData = await resumeRes.json()
+      const resumeContent = resumeData.content   // unwrap ok() wrapper
+
+      const scoreRes = await fetch('/api/ai/score', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          resumeContent,
+          jobTitle: job.role,
+          jobCompany: job.company,
+          jobDescription: job.description,
+          keySkills: job.keywords ? job.keywords.split(',').map(s => s.trim()) : undefined,
+        }),
+      })
+      if (!scoreRes.ok) {
+        const d = await scoreRes.json().catch(() => ({}))
+        toast.error(d.error ?? 'Scoring failed')
+        return
+      }
+      const result = await scoreRes.json()
+
+      const patchRes = await fetch('/api/jobs/' + job.id, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ score: result.score, keywords: result.keywords }),
+      })
+      if (patchRes.ok) {
+        const updated = await patchRes.json()
+        onUpdate(updated)
+        toast.success('Scored: ' + result.score + '/100')
+      } else {
+        toast.error('Failed to save score')
+      }
+    } catch {
+      toast.error('Network error — try again')
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  return (
+    <button
+      onClick={handleScore}
+      disabled={loading}
+      style={{
+        padding: '6px 14px', fontSize: 12, borderRadius: 6, fontWeight: 500,
+        background: 'var(--bg-secondary)',
+        color: 'var(--text)',
+        border: '1px solid var(--border)',
+        cursor: loading ? 'default' : 'pointer',
+        display: 'flex', alignItems: 'center', gap: 6,
+        opacity: loading ? 0.7 : 1,
+        width: 'fit-content',
+      }}
+    >
+      {loading ? '⏳ Scoring…' : job.score != null ? '🔄 Re-score' : '📊 Score'}
+    </button>
   )
 }
 
