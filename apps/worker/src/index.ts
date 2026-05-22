@@ -1,5 +1,6 @@
 import { ensureApplyResultsTable, closePool } from "./db/apply-results.js";
 import { applyWorker, applyQueue, connection } from "./queue/apply-queue.js";
+import { scoutWorker, scoutQueue, SCOUT_QUEUE_NAME } from "./queue/scout-queue.js";
 import { closeAllSlots } from "./cloak/pool.js";
 import express from "express";
 import { createBullBoard } from "@bull-board/api";
@@ -32,11 +33,15 @@ async function main() {
   }
 
   console.log(`[worker] Listening on queue 'apply-tasks' (concurrency: ${process.env.CLOAK_MAX_WORKERS ?? "1"})`);
+  console.log(`[worker] Listening on queue '${SCOUT_QUEUE_NAME}' (concurrency: 1)`);
 
-  // ── Bull Board admin UI ────────────────────────────────────────────────
+  // -- Bull Board admin UI ------------------------------------------------
   const serverAdapter = new ExpressAdapter();
   serverAdapter.setBasePath("/admin/queues");
-  createBullBoard({ queues: [new BullMQAdapter(applyQueue)], serverAdapter });
+  createBullBoard({
+    queues: [new BullMQAdapter(applyQueue), new BullMQAdapter(scoutQueue)],
+    serverAdapter,
+  });
 
   const adminApp = express();
 
@@ -61,6 +66,7 @@ async function main() {
   // Graceful shutdown
   const shutdown = async (signal: string) => {
     console.log(`[worker] Received ${signal}, shutting down...`);
+    await scoutWorker.close();
     await applyWorker.close();
     await closeAllSlots();
     await closePool();
