@@ -3,11 +3,10 @@
  */
 import { describe, it, expect, vi, beforeEach } from 'vitest'
 
-const mockCreate = vi.fn()
-vi.mock('@anthropic-ai/sdk', () => ({
-  default: vi.fn().mockImplementation(() => ({
-    messages: { create: mockCreate },
-  })),
+const mockModelChat = vi.fn()
+vi.mock('@/lib/model-router', () => ({
+  modelChat: mockModelChat,
+  stripFences: (raw: string) => raw.replace(/^```(?:json)?\n?/, '').replace(/\n?```$/, ''),
 }))
 
 vi.mock('@/lib/db', () => ({ db: {} }))
@@ -45,13 +44,11 @@ describe('POST /api/ai/suggest', () => {
   it('returns 3 suggestions from a successful AI response', async () => {
     const { POST } = await import('@/app/api/ai/suggest/route')
 
-    mockCreate.mockResolvedValueOnce({
-      content: [{ type: 'text', text: JSON.stringify([
-        'Add Docker and Kubernetes to your skills section',
-        'Quantify your experience with numbers and metrics',
-        'Tailor your summary to mention cloud-native development',
-      ]) }],
-    })
+    mockModelChat.mockResolvedValueOnce({ text: JSON.stringify([
+      'Add Docker and Kubernetes to your skills section',
+      'Quantify your experience with numbers and metrics',
+      'Tailor your summary to mention cloud-native development',
+    ]) })
 
     const req = fakeNextRequest({
       resumeContent: { summary: 'Dev', skills: ['js'], experience: [] },
@@ -69,9 +66,7 @@ describe('POST /api/ai/suggest', () => {
   it('handles markdown-wrapped JSON responses', async () => {
     const { POST } = await import('@/app/api/ai/suggest/route')
 
-    mockCreate.mockResolvedValueOnce({
-      content: [{ type: 'text', text: '```json\n["Suggestion one", "Suggestion two", "Suggestion three"]\n```' }],
-    })
+    mockModelChat.mockResolvedValueOnce({ text: '```json\n["Suggestion one", "Suggestion two", "Suggestion three"]\n```' })
 
     const req = fakeNextRequest({
       resumeContent: { summary: 'test' },

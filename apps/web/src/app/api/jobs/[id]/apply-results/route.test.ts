@@ -76,7 +76,7 @@ describe("GET /api/jobs/[id]/apply-results", () => {
     const { db } = await import("@/lib/db");
     vi.mocked(db.job.findUnique).mockResolvedValue({
       userId: "user-2",
-    });
+    } as never);
 
     const res = await GET(new NextRequest("https://applymate.app/api/jobs/job-1/apply-results"), { params: Promise.resolve({ id: "job-1" }) });
     expect(res.status).toBe(404);

@@ -3,11 +3,10 @@
  */
 import { describe, it, expect, vi, beforeEach } from 'vitest'
 
-const mockCreate = vi.fn()
-vi.mock('@anthropic-ai/sdk', () => ({
-  default: vi.fn().mockImplementation(() => ({
-    messages: { create: mockCreate },
-  })),
+const mockModelChat = vi.fn()
+vi.mock('@/lib/model-router', () => ({
+  modelChat: mockModelChat,
+  stripFences: (raw: string) => raw.replace(/^```(?:json)?\n?/, '').replace(/\n?```$/, ''),
 }))
 
 vi.mock('@/lib/db', () => ({ db: {} }))
@@ -59,9 +58,7 @@ I am excited to apply for the Software Engineer role at Acme Corp.
 Sincerely,
 John Doe`
 
-    mockCreate.mockResolvedValueOnce({
-      content: [{ type: 'text', text: mockLetter }],
-    })
+    mockModelChat.mockResolvedValueOnce({ text: mockLetter })
 
     const req = fakeNextRequest({
       resumeContent: {
@@ -83,9 +80,7 @@ John Doe`
   it('includes recipientName in the prompt when provided', async () => {
     const { POST } = await import('@/app/api/ai/cover-letter/route')
 
-    mockCreate.mockResolvedValueOnce({
-      content: [{ type: 'text', text: 'Dear Ms. Smith,\n\n...' }],
-    })
+    mockModelChat.mockResolvedValueOnce({ text: 'Dear Ms. Smith,\n\n...' })
 
     const req = fakeNextRequest({
       resumeContent: { contact: { name: 'Jane', email: 'jane@test.com', location: 'SF' }, summary: '', skills: [], experience: [] },
@@ -101,9 +96,7 @@ John Doe`
   it('supports different tones', async () => {
     const { POST } = await import('@/app/api/ai/cover-letter/route')
 
-    mockCreate.mockResolvedValueOnce({
-      content: [{ type: 'text', text: 'Short and punchy letter.' }],
-    })
+    mockModelChat.mockResolvedValueOnce({ text: 'Short and punchy letter.' })
 
     const req = fakeNextRequest({
       resumeContent: { contact: { name: 'A', email: 'a@b.com', location: 'X' }, summary: '', skills: [], experience: [] },
