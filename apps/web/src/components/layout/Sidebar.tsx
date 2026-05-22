@@ -39,7 +39,8 @@ export function Sidebar({ active, onNav, session, jobCount }: SidebarProps) {
     { id: 'resume',     label: t('nav.resume'),       icon: '☰' },
     { id: 'gmail',      label: t('nav.gmail'),        icon: '✉' },
     { id: 'agent',      label: t('nav.agent'),        icon: '◉' },    { id: 'extension',  label: t('nav.extension'),    icon: '⊞' },
-    { id: 'settings',   label: t('nav.settings'),     icon: '⚙' },
+    { id: 'apply-history', label: t('nav.applyHistory'), icon: '📋' },
+  { id: 'settings',   label: t('nav.settings'),     icon: '⚙' },
   ]
 
   return (
