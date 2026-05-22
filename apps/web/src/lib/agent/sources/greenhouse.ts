@@ -12,26 +12,10 @@
 
 import type { DiscoveredJob } from "../discover"
 import { acquire } from "../pace/policies"
+import { stripHtml } from "../strip-html"
 
 const BASE = "https://boards-api.greenhouse.io/v1/boards"
 
-/** Strip HTML tags and decode common entities. */
-function stripHtml(html: string): string {
-  return html
-    .replace(/<[^>]+>/g, " ")
-    .replace(/&amp;/g, "&")
-    .replace(/&lt;/g, "<")
-    .replace(/&gt;/g, ">")
-    .replace(/&nbsp;/g, " ")
-    .replace(/&rsquo;/g, "'")
-    .replace(/&lsquo;/g, "'")
-    .replace(/&rdquo;/g, '"')
-    .replace(/&ldquo;/g, '"')
-    .replace(/&mdash;/g, "\u2014")
-    .replace(/&ndash;/g, "\u2013")
-    .replace(/\s+/g, " ")
-    .trim()
-}
 
 interface GreenhouseJob {
   id:           number
