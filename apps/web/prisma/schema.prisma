@@ -1,4 +1,4 @@
-// Prisma Schema â€” ApplyMate AI
+// Prisma Schema â€?ApplyMate AI
 // Database: PostgreSQL (Supabase / Neon / self-hosted)
 
 generator client {
@@ -67,7 +67,7 @@ model User {
   linkedin      String?
   github        String?
   preferences   Json?     // { targetRoles, targetLocations, salaryExpectation, workAuthorization, openToRelocation, aiSettings }
-  personaFields Json?     // PersonaField[] â€” learned answers from form fills
+  personaFields Json?     // PersonaField[] â€?learned answers from form fills
   createdAt     DateTime  @default(now())
   updatedAt     DateTime  @updatedAt
 
@@ -109,7 +109,8 @@ model Job {
   createdAt   DateTime  @default(now())
   updatedAt   DateTime  @updatedAt
 
-  user       User       @relation(fields: [userId], references: [id], onDelete: Cascade)
+  user         User          @relation(fields: [userId], references: [id], onDelete: Cascade)
+  applyResults ApplyResult[]
   activities Activity[]
 
   @@index([userId, status])
@@ -258,4 +259,22 @@ model AtsEmployer {
 
   @@unique([atsType, slug])
   @@map("ats_employers")
+}
+
+model ApplyResult {
+  id         Int      @id @default(autoincrement())
+  userId     String   @map("user_id")
+  jobId      String   @map("job_id")
+  status     String                     // submitted | manual | failed | dry-run
+  mode       String                     // unattended | assisted
+  atsType    String?  @map("ats_type")
+  flowUsed   String?  @map("flow_used")
+  error      String?
+  durationMs Int?     @map("duration_ms")
+  createdAt  DateTime @default(now()) @map("created_at")
+
+  job Job @relation(fields: [jobId], references: [id], onDelete: Cascade)
+
+  @@index([userId, createdAt(sort: Desc)])
+  @@map("apply_results")
 }
