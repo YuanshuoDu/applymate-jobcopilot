@@ -20,7 +20,7 @@ const STATUS_CONFIG: Record<string, { icon: string; label: string; color: string
   "dry-run": { icon: "🔍", label: "Dry run",          color: "#6b7280" },
 };
 
-export default function ApplyStatusCard({ jobId, jobUrl }: { jobId: string; jobUrl?: string }) {
+export default function ApplyStatusCard({ jobId, jobUrl, jobStatus }: { jobId: string; jobUrl?: string; jobStatus?: string }) {
   const [result, setResult] = useState<ApplyResult | null>(null);
   const [loading, setLoading] = useState(true);
   const [applying, setApplying] = useState(false);
@@ -62,7 +62,18 @@ export default function ApplyStatusCard({ jobId, jobUrl }: { jobId: string; jobU
   }
 
   if (loading) return null;
-  if (!result) return null;
+  if (!result) {
+    // Show spinner while task is in-flight (job.status = 'applied' but no result written yet)
+    if (jobStatus === 'applied') {
+      return (
+        <div style={{ marginTop: 8, padding: '8px 12px', borderRadius: 6, background: 'var(--bg-secondary)', border: '1px solid var(--border)', display: 'flex', alignItems: 'center', gap: 8 }}>
+          <div style={{ width: 10, height: 10, borderRadius: '50%', border: '2px solid #185FA5', borderTopColor: 'transparent', animation: 'spin 0.8s linear infinite', flexShrink: 0 }} />
+          <span style={{ fontSize: 13, color: 'var(--text-secondary)' }}>Applying in background…</span>
+        </div>
+      )
+    }
+    return null
+  }
 
   const cfg = STATUS_CONFIG[result.status] ?? { icon: "📋", label: result.status, color: "#6b7280" };
   const flowLabel = result.flowUsed === "programmatic" ? "Pre-programmed flow" : result.flowUsed === "llm" ? "AI agent" : result.flowUsed;
