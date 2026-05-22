@@ -18,7 +18,7 @@ employers:
   # Correct siteIds require browser DevTools inspection of each career page.
 
   # --- Tier 1: Fortune 500 / DAX ---
-  - { name: "SAP",              tenant: "sap",        siteId: "SAPCareers",                 baseUrl: "https://sap.wd3.myworkdayjobs.com",        country: "de", tier: 1, status: "pending" }
+  - { name: "SAP",              tenant: "sap",        siteId: "SAPCareers",                 baseUrl: "https://sap.wd1.myworkdayjobs.com",        country: "de", tier: 1, status: "pending" }
   - { name: "Siemens",          tenant: "siemens",    siteId: "Siemens",                     baseUrl: "https://siemens.wd3.myworkdayjobs.com",    country: "de", tier: 1, status: "pending" }
   - { name: "BMW Group",        tenant: "bmw",        siteId: "BMW_Group",                   baseUrl: "https://bmw.wd3.myworkdayjobs.com",        country: "de", tier: 1, status: "pending" }
   - { name: "Mercedes-Benz",    tenant: "daimler",    siteId: "MBAG_External",               baseUrl: "https://daimler.wd3.myworkdayjobs.com",    country: "de", tier: 1, status: "pending" }
