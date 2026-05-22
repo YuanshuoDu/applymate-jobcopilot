@@ -1,4 +1,5 @@
 import type { Pool } from "pg";
+import { callLlm, loadWorkerAiConfig } from "@jobcopilot/shared";
 import { generateResumePdf, type ResumeContent } from "./resume-pdf.js";
 import { tailorResumeKeywords } from "./tailor-resume.js";
 
@@ -66,13 +67,48 @@ export async function loadTaskContext(
     resumeTempPath = await generateResumePdf(userId, tailored);
   }
 
+  const persona: Record<string, string> = { ...base, ...learned };
+
+  // Generate cover letter via LLM if not saved
+  let coverLetterText: string | null = job.coverLetter ?? null;
+
+  if (!coverLetterText && job.description && persona.email) {
+    const aiConfig = await loadWorkerAiConfig(userId);
+    const result = await callLlm(
+      [
+        {
+          role: "user",
+          content: [
+            "Write a concise professional cover letter (150-200 words) for this job.",
+            "CANDIDATE: " + (persona.fullName || ""),
+            "JOB: " + (job.role ?? "") + " at " + (job.company ?? ""),
+            "KEY REQUIREMENTS: " + (job.keywords ?? ""),
+            "JD EXCERPT: " + (job.description ?? "").slice(0, 600),
+            "Start with why excited about the role. No Dear/Subject. Body only.",
+          ].join("\n"),
+        },
+      ],
+      aiConfig
+    ).catch(() => null);
+
+    if (result?.text) {
+      coverLetterText = result.text.trim();
+      await pool
+        .query(
+          `UPDATE "Job" SET "coverLetter" = $1, "updatedAt" = NOW() WHERE id = $2`,
+          [coverLetterText, jobId]
+        )
+        .catch(() => {});
+    }
+  }
+
   return {
-    persona: { ...base, ...learned },
+    persona,
     jobTitle: job.role ?? "",
     jobCompany: job.company ?? "",
     jobKeywords: job.keywords ?? "",
     applyUrl: job.url?.trim() || fallbackApplyUrl,
-    coverLetterText: job.coverLetter ?? null,
+    coverLetterText,
     resumeTempPath,
   };
 }
