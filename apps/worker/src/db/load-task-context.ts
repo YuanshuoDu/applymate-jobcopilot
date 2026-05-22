@@ -1,5 +1,6 @@
 import type { Pool } from "pg";
 import { generateResumePdf, type ResumeContent } from "./resume-pdf.js";
+import { tailorResumeKeywords } from "./tailor-resume.js";
 
 export interface TaskContext {
   persona: Record<string, string>;
@@ -57,8 +58,12 @@ export async function loadTaskContext(
   // Export default resume to temp PDF file for file uploads
   let resumeTempPath: string | undefined;
   if (resumeRes.rows[0]?.content) {
-    const content = resumeRes.rows[0].content as ResumeContent;
-    resumeTempPath = await generateResumePdf(userId, content);
+    const baseContent = resumeRes.rows[0].content as ResumeContent;
+    // Tailor skills section with missing JD keywords (improves ATS pass rate)
+    const tailored = job.keywords
+      ? tailorResumeKeywords(baseContent, job.keywords)
+      : baseContent;
+    resumeTempPath = await generateResumePdf(userId, tailored);
   }
 
   return {
