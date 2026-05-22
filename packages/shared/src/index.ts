@@ -1,3 +1,7 @@
+// ── LLM utilities (used by worker to call AI models without Prisma) ───────────
+export type { AiConfig, ChatMessage, ChatResult, Provider } from "./llm.js";
+export { callLlm, callLlmText, loadWorkerAiConfig, closeSharedPool } from "./llm.js";
+
 /** Job payload pushed to the apply-tasks queue */
 export interface ApplyTaskPayload {
   jobId: string;
