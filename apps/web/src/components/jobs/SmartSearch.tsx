@@ -693,7 +693,7 @@ export function SmartSearch({ onJobSaved }: { onJobSaved?: () => void }) {
                         )}
                         {/* Apply status card */}
                         {appliedIds.has(r.id) && (
-                          <ApplyStatusCard jobId={r.id} />
+                          <ApplyStatusCard jobId={r.id} jobUrl={r.url} />
                         )}
                       </div>
 

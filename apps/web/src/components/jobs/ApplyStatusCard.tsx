@@ -20,7 +20,7 @@ const STATUS_CONFIG: Record<string, { icon: string; label: string; color: string
   "dry-run": { icon: "🔍", label: "Dry run",          color: "#6b7280" },
 };
 
-export default function ApplyStatusCard({ jobId }: { jobId: string }) {
+export default function ApplyStatusCard({ jobId, jobUrl }: { jobId: string; jobUrl?: string }) {
   const [result, setResult] = useState<ApplyResult | null>(null);
   const [loading, setLoading] = useState(true);
   const [applying, setApplying] = useState(false);
@@ -92,7 +92,7 @@ export default function ApplyStatusCard({ jobId }: { jobId: string }) {
 
       {result.status === "manual" && result.error && (
         <div style={{ marginTop: 8 }}>
-          <a href={result.error} target="_blank" rel="noopener noreferrer" style={{ fontSize: 13, color: "#185FA5" }}>
+          <a href={jobUrl ?? '#'} target="_blank" rel="noopener noreferrer" style={{ fontSize: 13, color: "#185FA5" }}>
             Apply manually ↗
           </a>
         </div>
