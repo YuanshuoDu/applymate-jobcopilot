@@ -6,7 +6,9 @@ import { withCloakContext } from "../cloak/pool.js";
 import { insertApplyResult, getPool } from "../db/apply-results.js";
 import { loadTaskContext } from "../db/load-task-context.js";
 import { AgentHarness } from "../harness/agent-harness.js";
-import type { ApplyTask } from "../harness/agent-harness.js";
+import type { ApplyTask, HarnessResult } from "../harness/agent-harness.js";
+import { detectFlow } from "../flows/index.js";
+import { runGreenhouseFlow } from "../flows/greenhouse-flow.js";
 
 const redisUrl = process.env.REDIS_URL ?? "redis://localhost:6379";
 export const connection = new Redis(redisUrl, { maxRetriesPerRequest: null });
@@ -59,13 +61,6 @@ export const applyWorker = new Worker<ApplyTaskPayload>(
           timeout: 30_000,
         });
 
-        const harness = new AgentHarness({
-          userId,
-          maxTurns: 30,
-          dryRun: dryRun ?? false,
-          mode: "dom",
-        });
-
         const applyTask: ApplyTask = {
           jobId,
           applyUrl: ctx.applyUrl,
@@ -77,9 +72,24 @@ export const applyWorker = new Worker<ApplyTaskPayload>(
           coverLetterPath,
         };
 
-        const harnessResult = await harness.run(page, applyTask);
-        const durationMs = Date.now() - startedAt;
+        // Detect ATS → use pre-programmed flow if available, else AI fallback
+        const flow = detectFlow(ctx.applyUrl);
+        let harnessResult: HarnessResult;
 
+        if (flow === "greenhouse") {
+          console.log(`[apply-worker] Using Greenhouse pre-programmed flow`);
+          harnessResult = await runGreenhouseFlow(page, applyTask);
+        } else {
+          const harness = new AgentHarness({
+            userId,
+            maxTurns: 30,
+            dryRun: dryRun ?? false,
+            mode: "dom",
+          });
+          harnessResult = await harness.run(page, applyTask);
+        }
+
+        const durationMs = Date.now() - startedAt;
         await insertApplyResult({
           userId,
           jobId,
