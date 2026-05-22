@@ -9,6 +9,8 @@ import { AgentHarness } from "../harness/agent-harness.js";
 import type { ApplyTask, HarnessResult } from "../harness/agent-harness.js";
 import { detectFlow } from "../flows/index.js";
 import { runGreenhouseFlow } from "../flows/greenhouse-flow.js";
+import { runWorkdayFlow } from "../flows/workday-flow.js";
+// keep old import "../flows/greenhouse-flow.js";
 
 const redisUrl = process.env.REDIS_URL ?? "redis://localhost:6379";
 export const connection = new Redis(redisUrl, { maxRetriesPerRequest: null });
@@ -84,6 +86,9 @@ export const applyWorker = new Worker<ApplyTaskPayload>(
         if (flow === "greenhouse") {
           console.log(`[apply-worker] Using Greenhouse pre-programmed flow`);
           harnessResult = await runGreenhouseFlow(page, applyTask);
+        } else if (flow === "workday") {
+          console.log(`[apply-worker] Using Workday pre-programmed flow`);
+          harnessResult = await runWorkdayFlow(page, applyTask);
         } else {
           const harness = new AgentHarness({
             userId,
@@ -154,3 +159,5 @@ export const applyWorker = new Worker<ApplyTaskPayload>(
     concurrency: Number(process.env.CLOAK_MAX_WORKERS ?? "1"),
   }
 );
+
+
