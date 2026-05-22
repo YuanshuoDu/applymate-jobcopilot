@@ -3,7 +3,8 @@ import { Redis } from "ioredis";
 import type { ApplyTaskPayload } from "@jobcopilot/shared";
 import { checkRateLimit } from "../rate-limit.js";
 import { withCloakContext } from "../cloak/pool.js";
-import { insertApplyResult } from "../db/apply-results.js";
+import { insertApplyResult, getPool } from "../db/apply-results.js";
+import { loadTaskContext } from "../db/load-task-context.js";
 import { AgentHarness } from "../harness/agent-harness.js";
 import type { ApplyTask } from "../harness/agent-harness.js";
 
@@ -45,12 +46,15 @@ export const applyWorker = new Worker<ApplyTaskPayload>(
     const startedAt = Date.now();
 
     try {
+      // Load real persona + job data from DB
+      const ctx = await loadTaskContext(getPool(), userId, jobId, applyUrl);
+
       await withCloakContext(userId, async (page) => {
         console.log(
-          `[apply-worker] Navigating to ${applyUrl} (user=${userId}, job=${jobId}, dryRun=${dryRun ?? false})`
+          `[apply-worker] Navigating to ${ctx.applyUrl} (user=${userId}, job=${jobId}, dryRun=${dryRun ?? false})`
         );
 
-        await page.goto(applyUrl, {
+        await page.goto(ctx.applyUrl, {
           waitUntil: "domcontentloaded",
           timeout: 30_000,
         });
@@ -62,13 +66,13 @@ export const applyWorker = new Worker<ApplyTaskPayload>(
           mode: "dom",
         });
 
-        // TODO Phase 5: load real persona + job data from DB by personaId/jobId
         const applyTask: ApplyTask = {
           jobId,
-          applyUrl,
-          persona: {},
-          jobTitle: "",
-          jobCompany: "",
+          applyUrl: ctx.applyUrl,
+          persona: ctx.persona,
+          jobTitle: ctx.jobTitle,
+          jobCompany: ctx.jobCompany,
+          jobKeywords: ctx.jobKeywords,
           resumePath,
           coverLetterPath,
         };
