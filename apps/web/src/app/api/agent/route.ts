@@ -57,11 +57,9 @@ export async function PATCH(req: NextRequest) {
     if (field in body) data[field] = body[field]
   }
 
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const config = await db.agentConfig.upsert({
     where:  { userId: auth.userId },
     update: data as any,
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
     create: { userId: auth.userId, ...DEFAULTS, ...data } as any,
   })
 

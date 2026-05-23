@@ -84,7 +84,6 @@ export async function GET(req: NextRequest) {
       )
     )
 
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const emails = details
       .filter((d): d is PromiseFulfilledResult<any> => d.status === 'fulfilled' && d.value !== null)
       .map(d => {

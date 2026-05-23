@@ -1,6 +1,6 @@
 import { NextRequest } from 'next/server'
 import { prepareAiRoute, ok, err } from '@/lib/api-helpers'
-import { modelChat, stripFences } from '@/lib/model-router'
+import { modelChat, parseAiJson } from '@/lib/model-router'
 import { FORM_REVISE_SYSTEM_PROMPT, buildFormRevisePrompt } from '@/lib/form-fill-prompts'
 
 export const maxDuration = 180 // Allow 3 min for AI revision
@@ -59,15 +59,9 @@ export async function POST(req: NextRequest) {
       4096,
     )
 
-    const text = stripFences(result.text).trim()
-    let parsed: { fields: FilledField[] }
-    try {
-      parsed = JSON.parse(text) as { fields: FilledField[] }
-      if (!parsed.fields || !Array.isArray(parsed.fields)) throw new Error('Invalid')
-    } catch {
-      const match = text.match(/\{[\s\S]*"fields"[\s\S]*\}/)
-      if (match) parsed = JSON.parse(match[0]) as { fields: FilledField[] }
-      else throw new Error('AI response could not be parsed')
+    const parsed = parseAiJson<{ fields: FilledField[] }>(result.text)
+    if (!parsed.fields || !Array.isArray(parsed.fields)) {
+      throw new Error('AI response missing fields array')
     }
 
     return ok({ fields: parsed.fields })

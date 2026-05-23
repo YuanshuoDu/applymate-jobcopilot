@@ -5,7 +5,7 @@
  */
 import { NextRequest } from 'next/server'
 import { prepareAiRoute, ok, err } from '@/lib/api-helpers'
-import { modelChat, stripFences } from '@/lib/model-router'
+import { modelChat, parseAiJson } from '@/lib/model-router'
 import type { ResumeContent } from '@/lib/types'
 
 export async function POST(req: NextRequest) {
@@ -36,7 +36,7 @@ ${jobDescription ? `JOB DESCRIPTION:\n${jobDescription.slice(0, 2000)}` : ''}
 CANDIDATE BACKGROUND:
 ${resumeText}
 
-Return ONLY a valid JSON object — no markdown, no explanation:
+Output ONLY valid JSON (no markdown, no explanation):
 {
   "questions": [
     { "question": "<interview question>", "framework": "<how to structure the answer, key points to hit>" }
@@ -53,7 +53,7 @@ Rules:
 
   try {
     const result = await modelChat([{ role: 'user', content: prompt }], cfg, 4096)
-    const parsed = JSON.parse(stripFences(result.text))
+    const parsed = parseAiJson<Record<string, unknown>>(result.text)
     return ok({ ...parsed, _model: `${cfg.provider}/${cfg.model}` })
   } catch (e) {
     console.error('[/api/ai/interview-prep]', e)

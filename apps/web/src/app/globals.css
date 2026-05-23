@@ -1,26 +1,109 @@
 @import "tailwindcss";
 
+/* ═══════════════════════════════════════════════════════════════════════
+   ApplyMate AI — Liquid Glass Design System
+   Style: Liquid Glass (#14) + Glassmorphism (#3) + Premium SaaS
+   ═══════════════════════════════════════════════════════════════════════ */
+
 :root {
-  --bg:           #ffffff;
-  --bg-secondary: #f6f6f7;
-  --bg-tertiary:  #eeeff1;
-  --border:       rgba(0, 0, 0, 0.08);
-  --text:         #0f0f10;
-  --text-muted:   #6b7280;
-  --primary:      #185FA5;
-  --sidebar-w:    200px;
+  /* ── Layout ──────────────────────────────────────────────────────── */
+  --sidebar-w:    220px;
   --bottom-bar:   0px;
+
+  /* ── Brand Colors ────────────────────────────────────────────────── */
+  --primary:           #4F46E5;
+  --primary-light:     #6366F1;
+  --primary-dark:      #3730A3;
+  --primary-rgb:       79, 70, 229;
+  --accent:            #7C3AED;
+  --accent-rgb:        124, 58, 237;
+
+  /* ── Background — subtle indigo/violet mesh ──────────────────────── */
+  --bg-mesh:      linear-gradient(135deg,
+                    #F0F4FF 0%,
+                    #F5F3FF 30%,
+                    #EDE9FE 60%,
+                    #F0F9FF 100%);
+  --bg:           #FFFFFF;
+  --bg-secondary: rgba(248, 248, 255, 0.85);
+  --bg-tertiary:  rgba(240, 242, 255, 0.6);
+
+  /* ── Glass Surfaces ──────────────────────────────────────────────── */
+  --glass-bg:       rgba(255, 255, 255, 0.72);
+  --glass-bg-hover: rgba(255, 255, 255, 0.85);
+  --glass-sidebar:  rgba(255, 255, 255, 0.80);
+  --glass-topbar:   rgba(255, 255, 255, 0.78);
+  --glass-card:     rgba(255, 255, 255, 0.68);
+  --glass-modal:    rgba(255, 255, 255, 0.92);
+  --glass-blur:     blur(20px) saturate(180%);
+  --glass-blur-sm:  blur(12px) saturate(160%);
+
+  /* ── Borders ─────────────────────────────────────────────────────── */
+  --border:         rgba(99, 102, 241, 0.12);
+  --border-glass:   rgba(255, 255, 255, 0.80);
+  --border-strong:  rgba(99, 102, 241, 0.22);
+
+  /* ── Text ────────────────────────────────────────────────────────── */
+  --text:           #0F172A;
+  --text-muted:     #64748B;
+  --text-subtle:    #94A3B8;
+
+  /* ── Shadows ─────────────────────────────────────────────────────── */
+  --shadow-sm:    0 1px 3px rgba(79,70,229,0.06), 0 1px 2px rgba(0,0,0,0.04);
+  --shadow-md:    0 4px 16px rgba(79,70,229,0.10), 0 2px 6px rgba(0,0,0,0.05);
+  --shadow-lg:    0 8px 32px rgba(79,70,229,0.14), 0 4px 12px rgba(0,0,0,0.06);
+  --shadow-glow:  0 0 0 3px rgba(79,70,229,0.15), 0 4px 20px rgba(79,70,229,0.20);
+
+  /* ── Status Colors ───────────────────────────────────────────────── */
+  --c-success:    #059669;
+  --c-warning:    #D97706;
+  --c-danger:     #DC2626;
+  --c-info:       #0284C7;
 }
 
+/* ─── Dark Mode ──────────────────────────────────────────────────────── */
 .dark {
-  --bg:           #111113;
-  --bg-secondary: #1a1a1e;
-  --bg-tertiary:  #0d0d0f;
-  --border:       rgba(255, 255, 255, 0.08);
-  --text:         #e8e8ec;
-  --text-muted:   #6b7280;
+  /* ── Background — deep space mesh ───────────────────────────────── */
+  --bg-mesh:      linear-gradient(135deg,
+                    #080B14 0%,
+                    #0D0E1F 25%,
+                    #0A0B1A 55%,
+                    #07090F 100%);
+  --bg:           #0F1117;
+  --bg-secondary: rgba(16, 18, 32, 0.90);
+  --bg-tertiary:  rgba(8, 10, 20, 0.80);
+
+  /* ── Glass Surfaces (dark) ───────────────────────────────────────── */
+  --glass-bg:       rgba(18, 20, 40, 0.75);
+  --glass-bg-hover: rgba(25, 28, 55, 0.85);
+  --glass-sidebar:  rgba(12, 14, 28, 0.85);
+  --glass-topbar:   rgba(10, 12, 24, 0.82);
+  --glass-card:     rgba(20, 22, 42, 0.70);
+  --glass-modal:    rgba(15, 17, 35, 0.95);
+
+  /* ── Borders (dark) ──────────────────────────────────────────────── */
+  --border:         rgba(99, 102, 241, 0.15);
+  --border-glass:   rgba(255, 255, 255, 0.08);
+  --border-strong:  rgba(99, 102, 241, 0.28);
+
+  /* ── Text (dark) ─────────────────────────────────────────────────── */
+  --text:           #E2E8F0;
+  --text-muted:     #94A3B8;
+  --text-subtle:    #64748B;
+
+  /* ── Shadows (dark) ──────────────────────────────────────────────── */
+  --shadow-sm:    0 1px 3px rgba(0,0,0,0.3), 0 1px 2px rgba(0,0,0,0.2);
+  --shadow-md:    0 4px 16px rgba(0,0,0,0.4), 0 2px 6px rgba(0,0,0,0.25);
+  --shadow-lg:    0 8px 32px rgba(0,0,0,0.5), 0 4px 12px rgba(0,0,0,0.30);
+  --shadow-glow:  0 0 0 3px rgba(99,102,241,0.20), 0 4px 24px rgba(99,102,241,0.25);
+
+  /* ── Brand (dark) ────────────────────────────────────────────────── */
+  --primary:        #818CF8;
+  --primary-light:  #A5B4FC;
+  --primary-dark:   #6366F1;
 }
 
+/* ─── Base Reset ─────────────────────────────────────────────────────── */
 *, *::before, *::after {
   box-sizing: border-box;
   margin: 0;
@@ -28,51 +111,134 @@
 }
 
 body {
-  font-family: 'Inter', system-ui, sans-serif;
+  font-family: 'Inter', system-ui, -apple-system, sans-serif;
   font-size: 13px;
   color: var(--text);
-  background: var(--bg-tertiary);
+  background: var(--bg-mesh);
+  background-attachment: fixed;
   -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  min-height: 100vh;
 }
 
+/* ─── Glass Utility Classes ──────────────────────────────────────────── */
+.glass {
+  background: var(--glass-bg);
+  backdrop-filter: var(--glass-blur);
+  -webkit-backdrop-filter: var(--glass-blur);
+  border: 1px solid var(--border-glass);
+}
+
+.glass-card {
+  background: var(--glass-card);
+  backdrop-filter: var(--glass-blur-sm);
+  -webkit-backdrop-filter: var(--glass-blur-sm);
+  border: 1px solid var(--border-glass);
+  box-shadow: var(--shadow-md);
+  border-radius: 14px;
+}
+
+/* ─── Scrollbar ──────────────────────────────────────────────────────── */
+::-webkit-scrollbar { width: 5px; height: 5px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb {
+  background: rgba(var(--primary-rgb, 79,70,229), 0.20);
+  border-radius: 999px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: rgba(var(--primary-rgb, 79,70,229), 0.35);
+}
+
+/* ─── Keyframe Animations ────────────────────────────────────────────── */
 @keyframes spin {
   to { transform: rotate(360deg); }
 }
 
-/* Auth panel — hidden on mobile */
-@media (max-width: 767px) {
-  .auth-panel { display: none !important; }
+@keyframes slideUp {
+  from { transform: translateY(10px); opacity: 0; }
+  to   { transform: translateY(0);    opacity: 1; }
 }
 
-@keyframes slideUp {
-  from { transform: translateY(8px); opacity: 0; }
-  to   { transform: translateY(0);   opacity: 1; }
+@keyframes slideIn {
+  from { transform: translateX(-6px); opacity: 0; }
+  to   { transform: translateX(0);    opacity: 1; }
 }
 
 @keyframes drain {
   from { width: 100%; }
-  to   { width: 0%; }
+  to   { width: 0%;   }
 }
 
-::-webkit-scrollbar { width: 5px; height: 5px; }
-::-webkit-scrollbar-track { background: transparent; }
-::-webkit-scrollbar-thumb { background: rgba(0,0,0,0.12); border-radius: 3px; }
+@keyframes fadeIn {
+  from { opacity: 0; }
+  to   { opacity: 1; }
+}
 
+@keyframes glowPulse {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(var(--primary-rgb, 79,70,229), 0.0); }
+  50%       { box-shadow: 0 0 0 6px rgba(var(--primary-rgb, 79,70,229), 0.15); }
+}
+
+@keyframes shimmer {
+  0%   { background-position: -200% center; }
+  100% { background-position:  200% center; }
+}
+
+@keyframes floatUp {
+  0%, 100% { transform: translateY(0px); }
+  50%       { transform: translateY(-4px); }
+}
+
+@keyframes ai-flash {
+  0%   { background-color: rgba(99,102,241,0.25); }
+  100% { background-color: transparent; }
+}
+
+.ai-flash-highlight {
+  animation: ai-flash 2s ease-out;
+  border-radius: 4px;
+  padding: 2px 4px;
+  margin: -2px -4px;
+}
+
+/* ─── Auth panel — hidden on mobile ─────────────────────────────────── */
+@media (max-width: 767px) {
+  .auth-panel { display: none !important; }
+}
+
+/* ─── Responsive — Mobile ────────────────────────────────────────────── */
 @media (max-width: 767px) {
   :root {
     --sidebar-w: 0px;
-    --bottom-bar: 56px;
+    --bottom-bar: 60px;
   }
-  #desktop-sidebar { display: none !important; }
+  #desktop-sidebar  { display: none !important; }
   #mobile-bottom-bar { display: flex !important; }
   #main-content { padding-bottom: var(--bottom-bar); }
 }
 
+/* ─── Mobile Bottom Nav ──────────────────────────────────────────────── */
 #mobile-bottom-bar {
   display: none;
-  position: fixed; bottom: 0; left: 0; right: 0; height: 56px; z-index: 50;
-  background: var(--bg); border-top: 0.5px solid var(--border);
+  position: fixed; bottom: 0; left: 0; right: 0; height: 60px; z-index: 50;
+  background: var(--glass-topbar);
+  backdrop-filter: var(--glass-blur);
+  -webkit-backdrop-filter: var(--glass-blur);
+  border-top: 1px solid var(--border-glass);
   align-items: center; justify-content: space-around;
+}
+
+/* ─── Selection ──────────────────────────────────────────────────────── */
+::selection {
+  background: rgba(var(--primary-rgb, 79,70,229), 0.20);
+  color: var(--text);
+}
+
+/* ─── Focus ring ─────────────────────────────────────────────────────── */
+:focus-visible {
+  outline: 2px solid rgba(var(--primary-rgb, 79,70,229), 0.60);
+  outline-offset: 2px;
+  border-radius: 4px;
 }
 
 .input-base:focus-visible {
@@ -82,4 +248,24 @@ body {
 
 .sidebar-logout-btn:hover {
   color: #A32D2D !important;
+}
+
+/* ─── Gradient text utility ──────────────────────────────────────────── */
+.gradient-text {
+  background: linear-gradient(135deg, var(--primary) 0%, var(--accent) 100%);
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+  background-clip: text;
+}
+
+/* ─── Shimmer loading skeleton ───────────────────────────────────────── */
+.skeleton {
+  background: linear-gradient(90deg,
+    var(--bg-secondary) 25%,
+    var(--bg-tertiary)  50%,
+    var(--bg-secondary) 75%
+  );
+  background-size: 200% 100%;
+  animation: shimmer 1.6s infinite;
+  border-radius: 6px;
 }

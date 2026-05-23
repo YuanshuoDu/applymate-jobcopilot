@@ -8,12 +8,77 @@ import { useApi, apiMutate }   from '@/lib/hooks'
 import { MODEL_CATALOGUE, PROVIDER_LABELS } from '@/lib/model-router'
 import type { AiConfig }       from '@/lib/model-router'
 
-// ── CSS-based responsive grid values (no JS needed, no SSR mismatch) ─────────
-// These are used as inline gridTemplateColumns values that use CSS native repeat/minmax
-const CARDS_GRID    = 'repeat(auto-fill, minmax(min(100%, 300px), 1fr))'
-const SETTINGS_GRID = 'repeat(auto-fill, minmax(min(100%, 260px), 1fr))'
+// ── Custom Agent type ─────────────────────────────────────────────────────────
+interface CustomAgentRow {
+  id:          string
+  name:        string
+  icon:        string
+  description: string | null
+  systemPrompt: string | null
+  provider:    string
+  model:       string
+  insertAfter: string
+  enabled:     boolean
+}
 
-// ── Orchestration Chat ────────────────────────────────────────────────────────
+// ── Role metadata ─────────────────────────────────────────────────────────────
+
+type RoleKey = 'scout' | 'analyst' | 'writer' | 'reviewer' | 'executor' | 'auditor'
+
+const BUILTIN_ROLES: { key: RoleKey; icon: string; label: string; zh: string; desc: string }[] = [
+  { key: 'scout',    icon: '🔍', label: 'Scout',    zh: '侦察',  desc: '过滤候选职位' },
+  { key: 'analyst',  icon: '🤖', label: 'Analyst',  zh: '分析',  desc: 'AI 评分匹配' },
+  { key: 'writer',   icon: '✍️', label: 'Writer',   zh: '撰写',  desc: '生成求职信' },
+  { key: 'reviewer', icon: '🔎', label: 'Reviewer', zh: '审核',  desc: '分流决策' },
+  { key: 'executor', icon: '🚀', label: 'Executor', zh: '执行',  desc: '更新申请状态' },
+  { key: 'auditor',  icon: '✅', label: 'Auditor',  zh: '验收',  desc: '生成运行报告' },
+]
+
+type RoleStatus = 'idle' | 'running' | 'done' | 'error'
+
+interface RoleMetric {
+  count: number; durationMs: number; summary: string
+  avgScore?: number; applied?: number; pending?: number; failed?: number
+}
+
+// ── Log entry (per-agent) ─────────────────────────────────────────────────────
+
+interface QuestionOption {
+  label:   string
+  value:   string
+  action?: { field: string; value: unknown }
+}
+
+interface ApplyReadyJob {
+  jobId:           string
+  company:         string
+  role:            string
+  score:           number
+  url:             string | null
+  location?:       string | null
+  coverLetter?:    string
+  matchedKeywords: string[]
+}
+
+interface LogEntry {
+  role?:     string
+  type:      'role_start' | 'role_done' | 'job_done' | 'job_skip' | 'info' | 'done' | 'error' | 'start'
+           | 'agent_plan' | 'agent_action' | 'agent_observation' | 'agent_reflect'
+           | 'agent_question' | 'question_answered'
+           | 'orchestrator_plan' | 'orchestrator_fix' | 'orchestrator_retry'
+           | 'orchestrator_decision' | 'orchestrator_complete'
+           | 'orchestrator_thinking' | 'orchestrator_question' | 'orchestrator_answer'
+           | 'user_message'
+  message:   string
+  score?:    number
+  time:      Date
+  questionId?: string
+  question?:   string
+  options?:    QuestionOption[]
+  answered?:   boolean
+}
+
+// ── Chat types ────────────────────────────────────────────────────────────────
 
 interface ChatMsg {
   role:    'user' | 'assistant'
@@ -22,84 +87,549 @@ interface ChatMsg {
   pending?: boolean
 }
 
-// Context-aware suggestion chips based on app state
-function getSuggestions(savedCount: number, pendingCount: number, lastRan: boolean): string[] {
-  const chips: string[] = []
-  if (savedCount > 0 && !lastRan) chips.push(`🚀 Run pipeline now (${savedCount} jobs waiting)`)
-  if (pendingCount > 0)           chips.push(`📋 Review ${pendingCount} pending jobs`)
-  chips.push('📊 Summarize my job search progress')
-  chips.push('💡 Why am I scoring low on jobs?')
-  chips.push('✍️ Improve my cover letter style')
-  chips.push('⚙️ Set min score to 80%')
-  return chips.slice(0, 4)
+// ── Shared model selector ─────────────────────────────────────────────────────
+
+function ModelSelect({ provider, model, onChange }: {
+  provider: string; model: string; onChange: (p: string, m: string) => void
+}) {
+  const byProvider = MODEL_CATALOGUE.reduce<Record<string, typeof MODEL_CATALOGUE>>((acc, m) => {
+    if (!acc[m.provider]) acc[m.provider] = []
+    acc[m.provider].push(m)
+    return acc
+  }, {})
+  return (
+    <select
+      value={`${provider}::${model}`}
+      onChange={e => { const [p, m] = e.target.value.split('::'); onChange(p, m) }}
+      onClick={e => e.stopPropagation()}
+      style={{ fontSize: 10, padding: '2px 5px', border: '0.5px solid var(--border)', borderRadius: 4, background: 'var(--bg)', color: 'var(--text)', outline: 'none', maxWidth: 170, cursor: 'pointer' }}
+    >
+      {Object.entries(byProvider).map(([prov, models]) => (
+        <optgroup key={prov} label={PROVIDER_LABELS[prov as keyof typeof PROVIDER_LABELS] ?? prov}>
+          {models.map(m => (
+            <option key={`${m.provider}::${m.model}`} value={`${m.provider}::${m.model}`}>{m.label}</option>
+          ))}
+        </optgroup>
+      ))}
+    </select>
+  )
 }
 
-function OrchestrationChat({
+// ── Pipeline Monitor Bar (top, sticky) ───────────────────────────────────────
+
+// Full descriptions for each builtin role
+const ROLE_DESCRIPTIONS: Record<string, string> = {
+  scout:    '扫描已保存职位，过滤排除公司、去重、按每日上限截取',
+  analyst:  '调用 AI 对每个职位与简历评分，提取匹配/缺失关键词',
+  writer:   '为高分职位生成定制求职信，提取简历关键词建议',
+  reviewer: '按自动投递规则分流：批准 / 待审核 / 跳过',
+  executor: '将批准职位状态改为"已投递"，写入申请记录',
+  auditor:  '核验 DB 状态一致性，生成本次运行报告与洞察',
+}
+
+function PipelineMonitorBar({
+  statuses, currentRole, roleMetrics, currentJobs, roles, savingRoles,
+  customAgents, onModelChange, onToggle, onAddAgent, onDeleteCustom,
+}: {
+  statuses:    Record<string, RoleStatus>
+  currentRole: string | null
+  roleMetrics: Partial<Record<string, RoleMetric>>
+  currentJobs: Partial<Record<string, { company: string; role: string; score?: number }>>
+  roles:       AgentRole[]
+  savingRoles: Partial<Record<string, boolean>>
+  customAgents: CustomAgentRow[]
+  onModelChange:  (role: string, p: string, m: string) => void
+  onToggle:       (role: string, enabled: boolean) => void
+  onAddAgent:     () => void
+  onDeleteCustom: (id: string) => void
+}) {
+  return (
+    <div style={{
+      background: 'var(--bg-secondary)', borderBottom: '0.5px solid var(--border)',
+      position: 'sticky', top: 0, zIndex: 20, overflowX: 'auto',
+    }}>
+      <div style={{ display: 'flex', alignItems: 'flex-start', minWidth: 'max-content', padding: '10px 16px', gap: 0 }}>
+        {BUILTIN_ROLES.map((r, i) => {
+          const st      = statuses[r.key] ?? 'idle'
+          const active  = currentRole === r.key
+          const cfg     = roles.find(c => c.role === r.key)
+          const enabled = cfg?.enabled ?? true
+          const metric  = roleMetrics[r.key]
+          const curJob  = currentJobs[r.key]
+          const desc    = ROLE_DESCRIPTIONS[r.key] ?? ''
+
+          const borderColor = !enabled ? 'var(--border)'
+            : st === 'done'  ? 'var(--c-success)'
+            : active         ? 'var(--primary)'
+            : st === 'error' ? 'var(--c-danger)'
+            : 'var(--border)'
+
+          const iconBg = !enabled ? 'var(--bg-tertiary)'
+            : st === 'done'  ? 'rgba(5,150,105,0.10)'
+            : active         ? 'rgba(79,70,229,0.14)'
+            : 'var(--bg-tertiary)'
+
+          return (
+            <React.Fragment key={r.key}>
+              {/* ── Node Card ── */}
+              <div style={{
+                width: 148,
+                background: 'var(--bg)',
+                border: `1.5px solid ${borderColor}`,
+                borderRadius: 10,
+                padding: '10px 10px 8px',
+                display: 'flex', flexDirection: 'column', gap: 6,
+                transition: 'all 0.25s',
+                opacity: enabled ? 1 : 0.6,
+                boxShadow: active ? `0 0 0 3px rgba(79,70,229,0.12)` : 'none',
+              }}>
+
+                {/* Row 1: Icon + Name + Status badge */}
+                <div style={{ display: 'flex', alignItems: 'center', gap: 7 }}>
+                  <div style={{
+                    width: 32, height: 32, borderRadius: 8, flexShrink: 0,
+                    background: iconBg, border: `1.5px solid ${borderColor}`,
+                    display: 'flex', alignItems: 'center', justifyContent: 'center',
+                    fontSize: 14,
+                    animation: active ? 'pulse 1.4s ease-in-out infinite' : 'none',
+                  }}>
+                    {st === 'done' ? '✓' : r.icon}
+                  </div>
+                  <div style={{ flex: 1, minWidth: 0 }}>
+                    <div style={{ fontSize: 11, fontWeight: 700, lineHeight: 1.2, color: 'var(--text)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                      {r.label}
+                    </div>
+                    <div style={{ fontSize: 10, color: 'var(--text-muted)', lineHeight: 1.2 }}>{r.zh}</div>
+                  </div>
+                  {/* Status dot — top right */}
+                  {active && <div style={{ width: 7, height: 7, borderRadius: '50%', background: 'var(--primary)', flexShrink: 0, animation: 'pulse 1s ease-in-out infinite' }} />}
+                  {st === 'done' && !active && <div style={{ width: 7, height: 7, borderRadius: '50%', background: 'var(--c-success)', flexShrink: 0 }} />}
+                </div>
+
+                {/* Row 2: Description */}
+                <div style={{
+                  fontSize: 9, color: 'var(--text-muted)', lineHeight: 1.5,
+                  borderTop: '0.5px solid var(--border)', paddingTop: 5,
+                }}>
+                  {desc}
+                </div>
+
+                {/* Row 3: Running status / metric */}
+                <div style={{ minHeight: 20 }}>
+                  {active && curJob ? (
+                    <div style={{ fontSize: 10, color: 'var(--primary)', display: 'flex', alignItems: 'center', gap: 4, overflow: 'hidden' }}>
+                      <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', flex: 1 }}>
+                        {curJob.company}
+                      </span>
+                      {curJob.score != null && (
+                        <span style={{ fontWeight: 700, flexShrink: 0, color: curJob.score >= 80 ? 'var(--c-success)' : curJob.score >= 60 ? 'var(--c-warning)' : 'var(--text-muted)' }}>
+                          {curJob.score}%
+                        </span>
+                      )}
+                    </div>
+                  ) : metric ? (
+                    <div style={{ fontSize: 10, color: 'var(--c-success)', display: 'flex', gap: 6 }}>
+                      <span>{metric.count ?? 0} 个</span>
+                      <span style={{ color: 'var(--text-muted)' }}>{(metric.durationMs / 1000).toFixed(1)}s</span>
+                    </div>
+                  ) : (
+                    <div style={{ fontSize: 10, color: 'var(--text-muted)' }}>
+                      {!enabled ? '' : st === 'error' ? '执行失败' : '等待中'}
+                    </div>
+                  )}
+                </div>
+
+                {/* Row 4: Model selector */}
+                <ModelSelect
+                  provider={cfg?.provider ?? 'anthropic'}
+                  model={cfg?.model ?? 'claude-haiku-4-5-20251001'}
+                  onChange={(p, m) => onModelChange(r.key, p, m)}
+                />
+
+                {/* Row 5: Enable / Disable button — clear, full-width */}
+                <button
+                  onClick={() => onToggle(r.key, !enabled)}
+                  style={{
+                    width: '100%', padding: '4px 0', borderRadius: 5, cursor: 'pointer',
+                    border: `1px solid ${enabled ? 'rgba(5,150,105,0.35)' : 'rgba(100,116,139,0.4)'}`,
+                    background: enabled ? 'rgba(5,150,105,0.08)' : 'rgba(100,116,139,0.08)',
+                    color: enabled ? 'var(--c-success)' : 'var(--text-muted)',
+                    fontSize: 10, fontWeight: 600, fontFamily: 'inherit',
+                    display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 4,
+                    transition: 'all 0.15s',
+                  }}
+                >
+                  {enabled ? '✓ 已启用' : '○ 已禁用 — 点击启用'}
+                </button>
+              </div>
+
+              {/* Connector arrow */}
+              {i < BUILTIN_ROLES.length - 1 && (
+                <div style={{ display: 'flex', alignItems: 'center', height: 148, margin: '0 3px' }}>
+                  <div style={{ width: 20, height: 2, background: st === 'done' ? 'var(--c-success)' : 'var(--border)', transition: 'background 0.4s', borderRadius: 1 }} />
+                  <div style={{ fontSize: 8, color: st === 'done' ? 'var(--c-success)' : 'var(--border)', marginLeft: -1 }}>▶</div>
+                </div>
+              )}
+            </React.Fragment>
+          )
+        })}
+
+        {/* Custom agent nodes */}
+        {customAgents.map(ca => {
+          const roleKey  = `custom_${ca.id}`
+          const st       = statuses[roleKey] ?? 'idle'
+          const active   = currentRole === roleKey
+          const metric   = roleMetrics[roleKey]
+          const borderC  = active ? '#7C3AED' : st === 'done' ? 'var(--c-success)' : 'rgba(124,58,237,0.35)'
+          return (
+            <React.Fragment key={ca.id}>
+              <div style={{ display: 'flex', alignItems: 'center', height: 148, margin: '0 3px' }}>
+                <div style={{ width: 20, height: 2, background: 'rgba(124,58,237,0.3)', borderRadius: 1, borderTop: '1px dashed rgba(124,58,237,0.4)' }} />
+                <div style={{ fontSize: 8, color: 'rgba(124,58,237,0.5)', marginLeft: -1 }}>▶</div>
+              </div>
+              <div style={{
+                width: 148, background: 'var(--bg)',
+                border: `1.5px dashed ${borderC}`,
+                borderRadius: 10, padding: '10px 10px 8px',
+                display: 'flex', flexDirection: 'column', gap: 6,
+                opacity: ca.enabled ? 1 : 0.55,
+                boxShadow: active ? '0 0 0 3px rgba(124,58,237,0.12)' : 'none',
+              }}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 7 }}>
+                  <div style={{ width: 32, height: 32, borderRadius: 8, flexShrink: 0, background: 'rgba(124,58,237,0.10)', border: `1.5px dashed ${borderC}`, display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 14, animation: active ? 'pulse 1.4s ease-in-out infinite' : 'none' }}>
+                    {ca.icon}
+                  </div>
+                  <div style={{ flex: 1, minWidth: 0 }}>
+                    <div style={{ fontSize: 11, fontWeight: 700, lineHeight: 1.2, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{ca.name}</div>
+                    <div style={{ fontSize: 9, color: '#a78bfa', lineHeight: 1.2 }}>↳ {ca.insertAfter} 之后</div>
+                  </div>
+                </div>
+                <div style={{ fontSize: 9, color: 'var(--text-muted)', lineHeight: 1.5, borderTop: '0.5px solid var(--border)', paddingTop: 5 }}>
+                  {ca.description || '自定义 Agent'}
+                </div>
+                <div style={{ fontSize: 10, color: metric ? 'var(--c-success)' : 'var(--text-muted)' }}>
+                  {metric ? `${metric.count} 个 · ${(metric.durationMs/1000).toFixed(1)}s` : (active ? '运行中…' : '等待中')}
+                </div>
+                <div style={{ fontSize: 9, color: '#a78bfa', background: 'rgba(124,58,237,0.08)', padding: '2px 6px', borderRadius: 4, textAlign: 'center', border: '0.5px solid rgba(124,58,237,0.2)' }}>
+                  ✦ 自定义 Agent
+                </div>
+                <button onClick={() => onDeleteCustom(ca.id)} style={{ width: '100%', padding: '3px 0', borderRadius: 5, cursor: 'pointer', border: '1px solid rgba(239,68,68,0.3)', background: 'rgba(239,68,68,0.06)', color: 'var(--c-danger)', fontSize: 10, fontFamily: 'inherit' }}>
+                  ✕ 删除此 Agent
+                </button>
+              </div>
+            </React.Fragment>
+          )
+        })}
+
+        {/* Add Agent button */}
+        <div style={{ display: 'flex', alignItems: 'center', height: 148, margin: '0 3px' }}>
+          <div style={{ width: 14, height: 2, background: 'var(--border)', borderRadius: 1 }} />
+        </div>
+        <div style={{ display: 'flex', alignItems: 'center', height: 148 }}>
+          <button
+            onClick={onAddAgent}
+            style={{
+              width: 80, height: 80, borderRadius: 10,
+              border: '2px dashed var(--border)', background: 'transparent',
+              cursor: 'pointer', display: 'flex', flexDirection: 'column',
+              alignItems: 'center', justifyContent: 'center', gap: 5,
+              fontSize: 22, color: 'var(--text-muted)', fontFamily: 'inherit',
+              transition: 'all 0.2s',
+            }}
+            onMouseEnter={e => { const b = e.currentTarget; b.style.borderColor = 'var(--primary)'; b.style.color = 'var(--primary)'; b.style.background = 'rgba(79,70,229,0.05)' }}
+            onMouseLeave={e => { const b = e.currentTarget; b.style.borderColor = 'var(--border)'; b.style.color = 'var(--text-muted)'; b.style.background = 'transparent' }}
+            title="添加自定义 Agent"
+          >
+            <span>＋</span>
+            <span style={{ fontSize: 9 }}>添加 Agent</span>
+          </button>
+        </div>
+
+      </div>
+    </div>
+  )
+}
+
+// ── Execution Log Panel (left) ────────────────────────────────────────────────
+
+function ExecutionLogPanel({ log, running, done, summary, onStart, onStop, onAnswerQuestion }: {
+  log: LogEntry[]; running: boolean; done: boolean
+  summary: { processed: number; applied: number; pending: number; skipped: number; failed: number } | null
+  onStart: () => void; onStop: () => void
+  onAnswerQuestion: (entry: LogEntry, opt: QuestionOption) => void
+}) {
+  const logEndRef = useRef<HTMLDivElement>(null)
+  useEffect(() => { logEndRef.current?.scrollIntoView({ behavior: 'smooth' }) }, [log])
+
+  // Group logs by role
+  const grouped: { role: string; icon: string; label: string; entries: LogEntry[] }[] = []
+  for (const entry of log) {
+    const roleKey = entry.role ?? 'orchestrator'
+    const last    = grouped[grouped.length - 1]
+    if (last && last.role === roleKey) {
+      last.entries.push(entry)
+    } else {
+      const meta = BUILTIN_ROLES.find(r => r.key === roleKey)
+      grouped.push({
+        role:    roleKey,
+        icon:    meta?.icon ?? '🧠',
+        label:   meta?.label ?? roleKey,
+        entries: [entry],
+      })
+    }
+  }
+
+  function entryColor(e: LogEntry): string {
+    if (e.type === 'done')               return 'var(--c-success)'
+    if (e.type === 'error')              return 'var(--c-danger)'
+    if (e.type === 'role_start')         return 'var(--primary)'
+    if (e.type === 'role_done')          return 'var(--c-success)'
+    if (e.type === 'job_skip')           return 'var(--text-muted)'
+    if (e.type === 'agent_plan')           return '#818cf8'
+    if (e.type === 'agent_action')         return 'var(--text)'
+    if (e.type === 'agent_observation')    return '#94a3b8'
+    if (e.type === 'agent_reflect')        return 'var(--c-success)'
+    if (e.type === 'orchestrator_plan')    return '#f59e0b'   // amber — master plan
+    if (e.type === 'orchestrator_fix')     return '#f97316'   // orange — fix
+    if (e.type === 'orchestrator_retry')   return '#fb923c'   // light orange — retry
+    if (e.type === 'orchestrator_decision')return '#a78bfa'   // purple — decision
+    if (e.type === 'orchestrator_complete')return '#34d399'   // emerald — done
+    if (e.score != null)                 return e.score >= 80 ? 'var(--c-success)' : e.score >= 60 ? 'var(--c-warning)' : 'var(--text-muted)'
+    return 'var(--text)'
+  }
+
+  function entryPrefix(e: LogEntry): string {
+    if (e.type === 'agent_plan')            return '📋 '
+    if (e.type === 'agent_action')          return '⚡ '
+    if (e.type === 'agent_observation')     return '   👁 '
+    if (e.type === 'agent_reflect')         return '💬 '
+    if (e.type === 'orchestrator_fix')      return '🔧 '
+    if (e.type === 'orchestrator_retry')    return '🔄 '
+    if (e.type === 'orchestrator_decision') return '⚖ '
+    return ''
+  }
+
+  function entryIndent(e: LogEntry): number {
+    if (e.type === 'agent_observation') return 16
+    if (e.type === 'agent_action')      return 8
+    return 0
+  }
+
+
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', height: '100%', overflow: 'hidden' }}>
+      {/* Header */}
+      <div style={{ padding: '10px 14px', background: 'var(--bg-secondary)', borderBottom: '0.5px solid var(--border)', display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexShrink: 0 }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+          <span style={{ fontSize: 12, fontWeight: 500 }}>执行日志</span>
+          {running && (
+            <span style={{ display: 'flex', alignItems: 'center', gap: 4, fontSize: 10, color: 'var(--c-success)' }}>
+              <span style={{ width: 6, height: 6, borderRadius: '50%', background: 'var(--c-success)', display: 'inline-block', animation: 'pulse 1.2s ease-in-out infinite' }} />
+              运行中…
+            </span>
+          )}
+          {done && !running && <span style={{ fontSize: 10, color: 'var(--text-muted)' }}>已完成</span>}
+        </div>
+        <div style={{ display: 'flex', gap: 6 }}>
+          {!running && <Btn small variant="primary" onClick={onStart}>{done ? '↻ 再次运行' : '▶ 开始运行'}</Btn>}
+          {running   && <Btn small variant="danger"  onClick={onStop}>⏹ 停止</Btn>}
+        </div>
+      </div>
+
+      {/* Summary stats */}
+      {summary && (
+        <div style={{ display: 'flex', borderBottom: '0.5px solid var(--border)', flexShrink: 0 }}>
+          {[
+            { label: '已处理', value: summary.processed, color: 'var(--text)'        },
+            { label: '已投递', value: summary.applied,   color: 'var(--c-success)'   },
+            { label: '待审核', value: summary.pending,   color: 'var(--c-warning)'   },
+            { label: '已跳过', value: summary.skipped,   color: 'var(--text-muted)'  },
+            { label: '失败',   value: summary.failed,    color: 'var(--c-danger)'    },
+          ].map((s, i) => (
+            <div key={s.label} style={{ flex: 1, textAlign: 'center', padding: '6px 0', borderRight: i < 4 ? '0.5px solid var(--border)' : 'none' }}>
+              <div style={{ fontSize: 15, fontWeight: 600, color: s.color }}>{s.value}</div>
+              <div style={{ fontSize: 9, color: 'var(--text-muted)' }}>{s.label}</div>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {/* Log body — grouped by agent */}
+      <div style={{ flex: 1, overflowY: 'auto', padding: '8px 0' }}>
+        {log.length === 0 ? (
+          <div style={{ padding: '32px 0', textAlign: 'center', fontSize: 12, color: 'var(--text-muted)' }}>
+            点击「▶ 开始运行」启动 6-Agent 流水线<br />
+            <span style={{ fontSize: 10, marginTop: 6, display: 'block' }}>或通过右侧聊天窗口发出指令</span>
+          </div>
+        ) : grouped.map((group, gi) => (
+          <div key={`${group.role}-${gi}`} style={{ marginBottom: 6 }}>
+            {/* Agent group header */}
+            <div style={{ display: 'flex', alignItems: 'center', gap: 6, padding: '4px 14px', background: 'var(--bg-secondary)', borderTop: gi > 0 ? '0.5px solid var(--border)' : 'none', borderBottom: '0.5px solid var(--border)' }}>
+              <span style={{ fontSize: 13 }}>{group.icon}</span>
+              <span style={{ fontSize: 11, fontWeight: 600, color: 'var(--primary)' }}>{group.label}</span>
+            </div>
+            {/* Entries */}
+            {group.entries.map((entry, ei) => {
+              // Agent question card
+              if (entry.type === 'agent_question') {
+                return (
+                  <div key={ei} style={{ margin: '6px 14px 6px 20px', borderRadius: 8, border: '1px solid rgba(234,179,8,0.35)', background: 'rgba(234,179,8,0.05)', overflow: 'hidden' }}>
+                    <div style={{ padding: '8px 12px', background: 'rgba(234,179,8,0.08)', display: 'flex', alignItems: 'center', gap: 7, borderBottom: '0.5px solid rgba(234,179,8,0.2)' }}>
+                      <span style={{ fontSize: 14 }}>🤔</span>
+                      <span style={{ fontSize: 11, fontWeight: 600, color: '#b45309' }}>
+                        {BUILTIN_ROLES.find(r => r.key === entry.role)?.label ?? 'Agent'} 需要你的决定
+                      </span>
+                      {entry.answered && <span style={{ marginLeft: 'auto', fontSize: 9, color: 'var(--c-success)' }}>✓ 已回答</span>}
+                    </div>
+                    <div style={{ padding: '8px 12px' }}>
+                      <p style={{ fontSize: 11, color: 'var(--text)', lineHeight: 1.6, margin: '0 0 8px' }}>{entry.question}</p>
+                      {!entry.answered && (
+                        <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}>
+                          {entry.options?.map((opt, oi) => (
+                            <button key={oi} onClick={() => onAnswerQuestion(entry, opt)} style={{
+                              padding: '5px 12px', borderRadius: 6, cursor: 'pointer',
+                              border: '1px solid rgba(234,179,8,0.4)', background: 'rgba(234,179,8,0.10)',
+                              color: '#92400e', fontSize: 11, fontFamily: 'inherit', fontWeight: 500,
+                              transition: 'all 0.15s',
+                            }}
+                              onMouseEnter={e => { (e.currentTarget as HTMLButtonElement).style.background = 'rgba(234,179,8,0.22)' }}
+                              onMouseLeave={e => { (e.currentTarget as HTMLButtonElement).style.background = 'rgba(234,179,8,0.10)' }}
+                            >
+                              {opt.label}
+                            </button>
+                          ))}
+                        </div>
+                      )}
+                    </div>
+                  </div>
+                )
+              }
+
+              // question_answered confirmation
+              if (entry.type === 'question_answered') {
+                return (
+                  <div key={ei} style={{ padding: '2px 14px 2px 20px', fontSize: 11, color: 'var(--c-success)', fontStyle: 'italic' }}>
+                    {entry.message}
+                  </div>
+                )
+              }
+
+              // Orchestrator plan — top banner style
+              if (entry.type === 'orchestrator_plan') {
+                return (
+                  <div key={ei} style={{ margin: '6px 14px 2px', padding: '7px 12px', borderRadius: 7, background: 'rgba(245,158,11,0.08)', border: '1px solid rgba(245,158,11,0.25)', display: 'flex', alignItems: 'center', gap: 8 }}>
+                    <span style={{ fontSize: 15 }}>🧠</span>
+                    <span style={{ fontSize: 11, color: '#f59e0b', fontWeight: 500 }}>{entry.message}</span>
+                  </div>
+                )
+              }
+              // Orchestrator complete — summary banner
+              if (entry.type === 'orchestrator_complete') {
+                return (
+                  <div key={ei} style={{ margin: '6px 14px 2px', padding: '7px 12px', borderRadius: 7, background: 'rgba(52,211,153,0.08)', border: '1px solid rgba(52,211,153,0.25)', display: 'flex', alignItems: 'center', gap: 8 }}>
+                    <span style={{ fontSize: 14 }}>✅</span>
+                    <span style={{ fontSize: 11, color: '#34d399', fontWeight: 500 }}>{entry.message}</span>
+                  </div>
+                )
+              }
+
+              // Normal log entry
+              return (
+                <div key={ei} style={{
+                  display: 'flex', gap: 8,
+                  padding: `2px 14px 2px ${20 + entryIndent(entry)}px`,
+                  alignItems: 'flex-start',
+                  background: entry.type === 'agent_plan' ? 'rgba(79,70,229,0.04)' : 'transparent',
+                  borderLeft: entry.type === 'agent_plan' ? '2px solid rgba(129,140,248,0.4)' : 'none',
+                }}>
+                  <span style={{ fontSize: 9, color: 'var(--text-muted)', flexShrink: 0, paddingTop: 2, fontVariantNumeric: 'tabular-nums' }}>
+                    {entry.time.toLocaleTimeString('en', { hour: '2-digit', minute: '2-digit', second: '2-digit' })}
+                  </span>
+                  <span style={{ fontSize: 11, color: entryColor(entry), lineHeight: 1.6, fontFamily: 'monospace' }}>
+                    {entryPrefix(entry)}{entry.message}
+                  </span>
+                </div>
+              )
+            })}
+          </div>
+        ))}
+        {/* Empty-state CTA after run with 0 jobs */}
+        {done && summary?.processed === 0 && (
+          <div style={{ margin: '10px 14px', padding: '10px 12px', background: 'rgba(24,95,165,0.05)', borderRadius: 8, border: '0.5px solid var(--border)', display: 'flex', gap: 10 }}>
+            <span style={{ fontSize: 18 }}>💡</span>
+            <div style={{ fontSize: 11, color: 'var(--text-muted)', lineHeight: 1.5 }}>
+              没有待处理职位。先通过 <strong>Chrome 插件</strong>在 LinkedIn/Indeed 保存职位，或在 <strong>Jobs 页面</strong>手动添加。
+            </div>
+          </div>
+        )}
+        <div ref={logEndRef} />
+      </div>
+    </div>
+  )
+}
+
+// ── Orchestrator Chat Panel (right, inline) ───────────────────────────────────
+
+function OrchestratorChatPanel({
   savedCount, pendingCount, hasRun,
   onAction,
 }: {
-  savedCount:  number
+  savedCount:   number
   pendingCount: number
-  hasRun:      boolean
+  hasRun:       boolean
   onAction: (action: { type: string; [k: string]: unknown }) => void
 }) {
-  const [open,     setOpen]     = useState(false)
   const [messages, setMessages] = useState<ChatMsg[]>([])
   const [input,    setInput]    = useState('')
   const [loading,  setLoading]  = useState(false)
-  const bottomRef = useRef<HTMLDivElement>(null)
-  const inputRef  = useRef<HTMLTextAreaElement>(null)
-
-  const suggestions = getSuggestions(savedCount, pendingCount, hasRun)
+  const bottomRef  = useRef<HTMLDivElement>(null)
+  const inputRef   = useRef<HTMLTextAreaElement>(null)
 
   useEffect(() => { bottomRef.current?.scrollIntoView({ behavior: 'smooth' }) }, [messages])
 
-  // Proactive greeting when chat first opens
+  // Greeting on mount
   useEffect(() => {
-    if (open && messages.length === 0) {
-      const greeting = savedCount > 0
-        ? `你好！我是你的 ApplyMate 工作流协调官 🎯\n\n当前你有 **${savedCount}** 个已保存的职位等待分析${pendingCount > 0 ? `，另有 **${pendingCount}** 个职位待审核` : ''}。\n\n我可以帮你：\n• 启动 6-Agent 流水线分析职位\n• 解释某个职位为什么得分低\n• 调整搜索策略和偏好\n• 分析你的求职进展模式\n\n想从哪里开始？`
-        : `你好！我是你的 ApplyMate 工作流协调官 🎯\n\n目前你还没有保存的职位。建议先通过 **Chrome 插件**在 LinkedIn/Indeed 保存职位，或在 **Jobs 页面**手动添加，然后我来帮你分析和投递。\n\n有什么我可以帮你的？`
-      setMessages([{ role: 'assistant', content: greeting, time: new Date() }])
-    }
-  }, [open])
+    const greeting = savedCount > 0
+      ? `你好！我是 Orchestrator 🧠\n\n当前有 **${savedCount}** 个职位待分析${pendingCount > 0 ? `，**${pendingCount}** 个待审核` : ''}。\n\n我可以：\n• 启动/停止流水线\n• 调整任意 Agent 配置\n• 解释评分结果\n• 管理求职策略\n\n用自然语言告诉我你想做什么。`
+      : `你好！我是 Orchestrator 🧠\n\n暂无待处理职位。先保存一些职位，我来帮你分析。`
+    setMessages([{ role: 'assistant', content: greeting, time: new Date() }])
+  }, [])
+
+  const chips = [
+    savedCount > 0 && !hasRun ? `▶ 开始分析 ${savedCount} 个职位` : null,
+    pendingCount > 0           ? `📋 审核 ${pendingCount} 个待定职位` : null,
+    '📊 分析我的求职进展',
+    '⚙️ 把最低匹配分设为 80%',
+    '🔍 为什么某个职位分低？',
+  ].filter(Boolean) as string[]
 
   async function sendMessage(text: string) {
     if (!text.trim() || loading) return
-    const userMsg: ChatMsg = { role: 'user', content: text, time: new Date() }
+    const userMsg:    ChatMsg = { role: 'user',      content: text, time: new Date() }
     const pendingMsg: ChatMsg = { role: 'assistant', content: '', time: new Date(), pending: true }
-
     setMessages(prev => [...prev, userMsg, pendingMsg])
     setInput('')
     setLoading(true)
 
-    // Build messages for API (exclude system greeting from history)
     const history = [...messages.filter(m => !m.pending), userMsg]
       .map(m => ({ role: m.role, content: m.content }))
 
     try {
       const res = await fetch('/api/agent/chat', {
-        method:  'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body:    JSON.stringify({ messages: history }),
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ messages: history }),
       })
-
       if (!res.ok) throw new Error(await res.text())
-      const reader = res.body!.getReader()
+
+      const reader  = res.body!.getReader()
       const decoder = new TextDecoder()
-      let buffer = ''
-      let fullText = ''
+      let buffer = '', fullText = '', event = ''
 
       while (true) {
         const { done, value } = await reader.read()
         if (done) break
         buffer += decoder.decode(value, { stream: true })
-
-        // Parse SSE lines
-        const lines = buffer.split('\n')
-        buffer = lines.pop() ?? ''
-
-        let event = ''
+        const lines = buffer.split('\n'); buffer = lines.pop() ?? ''
         for (const line of lines) {
           if (line.startsWith('event: '))      event = line.slice(7).trim()
           else if (line.startsWith('data: ')) {
@@ -113,7 +643,7 @@ function OrchestrationChat({
               } else if (event === 'action') {
                 onAction(data)
               }
-            } catch { /* ignore parse errors */ }
+            } catch { /* ignore */ }
             event = ''
           }
         }
@@ -127,494 +657,699 @@ function OrchestrationChat({
     }
   }
 
-  function handleKeyDown(e: React.KeyboardEvent) {
-    if (e.key === 'Enter' && !e.shiftKey) {
-      e.preventDefault()
-      sendMessage(input)
-    }
-  }
-
   function renderContent(text: string) {
-    // Strip ACTION lines before showing
-    const clean = text.replace(/^ACTION:.+$/gm, '').trim()
-    // Bold **text**
-    return clean.replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>')
+    return text.replace(/^ACTION:.+$/gm, '').trim()
+      .replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>')
+      .replace(/\n/g, '<br>')
   }
 
   return (
-    <>
-      {/* ── Floating chat button (always visible) ── */}
-      <div style={{ position: 'fixed', bottom: 24, right: 24, zIndex: 1000, display: 'flex', flexDirection: 'column', alignItems: 'flex-end', gap: 8 }}>
-        {/* Unread badge */}
-        {!open && (savedCount > 0 || pendingCount > 0) && (
-          <div style={{ background: '#185FA5', color: '#fff', borderRadius: 999, padding: '4px 10px', fontSize: 11, fontWeight: 500, boxShadow: '0 2px 8px rgba(24,95,165,0.4)' }}>
-            {savedCount > 0 ? `${savedCount} 个职位待分析` : `${pendingCount} 个待审核`}
-          </div>
-        )}
-        <button
-          onClick={() => setOpen(o => !o)}
-          style={{
-            width: 52, height: 52, borderRadius: '50%',
-            background: loading ? '#854F0B' : '#185FA5',
-            border: 'none', cursor: 'pointer',
-            display: 'flex', alignItems: 'center', justifyContent: 'center',
-            fontSize: 22, boxShadow: '0 4px 16px rgba(24,95,165,0.45)',
-            transition: 'transform 0.2s, background 0.2s',
-            animation: loading ? 'pulse 1.2s ease-in-out infinite' : 'none',
-          }}
-          title="Orchestrator Chat"
-        >
-          {open ? '✕' : '🧠'}
-        </button>
-      </div>
-
-      {/* ── Chat overlay ── */}
-      {open && (
-        <div style={{
-          position: 'fixed', bottom: 88, right: 24, zIndex: 999,
-          width: 380, height: 520,
-          background: 'var(--bg)', border: '0.5px solid var(--border)',
-          borderRadius: 14, boxShadow: '0 8px 32px rgba(0,0,0,0.18)',
-          display: 'flex', flexDirection: 'column', overflow: 'hidden',
-        }}>
-          {/* Header */}
-          <div style={{ padding: '12px 14px', background: '#185FA5', display: 'flex', alignItems: 'center', gap: 10 }}>
-            <span style={{ fontSize: 18 }}>🧠</span>
-            <div style={{ flex: 1 }}>
-              <div style={{ fontSize: 13, fontWeight: 600, color: '#fff', lineHeight: 1.2 }}>Orchestrator</div>
-              <div style={{ fontSize: 10, color: 'rgba(255,255,255,0.75)', lineHeight: 1.2 }}>
-                {loading ? '正在思考…' : '用自然语言控制你的 Agent 团队'}
-              </div>
-            </div>
-            {loading && <div style={{ width: 8, height: 8, borderRadius: '50%', background: '#fff', animation: 'pulse 1s ease-in-out infinite' }} />}
-          </div>
-
-          {/* Messages */}
-          <div style={{ flex: 1, overflowY: 'auto', padding: '12px 14px', display: 'flex', flexDirection: 'column', gap: 10 }}>
-            {messages.map((msg, i) => (
-              <div key={i} style={{ display: 'flex', flexDirection: 'column', alignItems: msg.role === 'user' ? 'flex-end' : 'flex-start', gap: 2 }}>
-                <div style={{
-                  maxWidth: '82%', padding: '8px 11px',
-                  borderRadius: msg.role === 'user' ? '12px 12px 3px 12px' : '12px 12px 12px 3px',
-                  background: msg.role === 'user' ? '#185FA5' : 'var(--bg-secondary)',
-                  color: msg.role === 'user' ? '#fff' : 'var(--text)',
-                  border: msg.role === 'assistant' ? '0.5px solid var(--border)' : 'none',
-                  fontSize: 12, lineHeight: 1.65,
-                  animation: msg.pending ? 'pulse 1s ease-in-out infinite' : 'none',
-                }}>
-                  {msg.pending
-                    ? <span style={{ color: 'var(--text-muted)', letterSpacing: 2 }}>● ● ●</span>
-                    : <span dangerouslySetInnerHTML={{ __html: renderContent(msg.content) }} />
-                  }
-                </div>
-                <span style={{ fontSize: 9, color: 'var(--text-muted)', padding: '0 3px' }}>
-                  {msg.time.toLocaleTimeString('en', { hour: '2-digit', minute: '2-digit' })}
-                </span>
-              </div>
-            ))}
-            <div ref={bottomRef} />
-          </div>
-
-          {/* Suggestion chips */}
-          {messages.length <= 1 && (
-            <div style={{ padding: '4px 10px 6px', display: 'flex', flexWrap: 'wrap', gap: 5 }}>
-              {suggestions.map((s, i) => (
-                <button key={i} onClick={() => sendMessage(s)} style={{
-                  padding: '4px 9px', fontSize: 10, borderRadius: 999,
-                  border: '0.5px solid var(--border)', background: 'var(--bg-secondary)',
-                  cursor: 'pointer', color: 'var(--text)', whiteSpace: 'nowrap',
-                }}>
-                  {s}
-                </button>
-              ))}
-            </div>
-          )}
-
-          {/* Input */}
-          <div style={{ padding: '8px 10px', borderTop: '0.5px solid var(--border)', display: 'flex', gap: 7, alignItems: 'flex-end' }}>
-            <textarea
-              ref={inputRef}
-              value={input}
-              onChange={e => setInput(e.target.value)}
-              onKeyDown={handleKeyDown}
-              placeholder="告诉我你想做什么… (Enter 发送)"
-              rows={2}
-              style={{
-                flex: 1, padding: '7px 9px', fontSize: 12, borderRadius: 8,
-                border: '0.5px solid var(--border)', background: 'var(--bg)',
-                color: 'var(--text)', outline: 'none', resize: 'none',
-                fontFamily: 'inherit', lineHeight: 1.5,
-              }}
-            />
-            <button
-              onClick={() => sendMessage(input)}
-              disabled={!input.trim() || loading}
-              style={{
-                padding: '8px 12px', borderRadius: 8, border: 'none',
-                background: (!input.trim() || loading) ? 'var(--border)' : '#185FA5',
-                color: '#fff', fontSize: 14, cursor: (!input.trim() || loading) ? 'not-allowed' : 'pointer',
-              }}
-            >
-              {loading ? '…' : '→'}
-            </button>
+    <div style={{ display: 'flex', flexDirection: 'column', height: '100%', borderLeft: '0.5px solid var(--border)' }}>
+      {/* Header */}
+      <div style={{ padding: '10px 14px', background: 'var(--primary)', display: 'flex', alignItems: 'center', gap: 10, flexShrink: 0 }}>
+        <span style={{ fontSize: 18 }}>🧠</span>
+        <div style={{ flex: 1 }}>
+          <div style={{ fontSize: 12, fontWeight: 600, color: '#fff', lineHeight: 1.2 }}>Orchestrator</div>
+          <div style={{ fontSize: 10, color: 'rgba(255,255,255,0.7)', lineHeight: 1.2 }}>
+            {loading ? '思考中…' : '自然语言控制 Agent 团队'}
           </div>
         </div>
-      )}
-    </>
-  )
-}
+        {loading && <div style={{ width: 7, height: 7, borderRadius: '50%', background: '#fff', animation: 'pulse 1s ease-in-out infinite' }} />}
+      </div>
 
-// ── Role metadata ─────────────────────────────────────────────────────────────
+      {/* Messages */}
+      <div style={{ flex: 1, overflowY: 'auto', padding: '12px 12px 4px', display: 'flex', flexDirection: 'column', gap: 8 }}>
+        {messages.map((msg, i) => (
+          <div key={i} style={{ display: 'flex', flexDirection: 'column', alignItems: msg.role === 'user' ? 'flex-end' : 'flex-start', gap: 2 }}>
+            <div style={{
+              maxWidth: '88%', padding: '8px 11px',
+              borderRadius: msg.role === 'user' ? '12px 12px 3px 12px' : '12px 12px 12px 3px',
+              background: msg.role === 'user' ? 'var(--primary)' : 'var(--bg-secondary)',
+              color: msg.role === 'user' ? '#fff' : 'var(--text)',
+              border: msg.role === 'assistant' ? '0.5px solid var(--border)' : 'none',
+              fontSize: 12, lineHeight: 1.65,
+              animation: msg.pending ? 'pulse 1s ease-in-out infinite' : 'none',
+            }}>
+              {msg.pending
+                ? <span style={{ color: 'var(--text-muted)', letterSpacing: 3 }}>● ● ●</span>
+                : <span dangerouslySetInnerHTML={{ __html: renderContent(msg.content) }} />
+              }
+            </div>
+            <span style={{ fontSize: 9, color: 'var(--text-muted)', padding: '0 3px' }}>
+              {msg.time.toLocaleTimeString('en', { hour: '2-digit', minute: '2-digit' })}
+            </span>
+          </div>
+        ))}
+        <div ref={bottomRef} />
+      </div>
 
-type RoleKey = 'scout' | 'analyst' | 'writer' | 'reviewer' | 'executor' | 'auditor'
-
-const ROLES: { key: RoleKey; icon: string; label: string; zh: string; desc: string }[] = [
-  { key: 'scout',    icon: '🔍', label: 'Scout',    zh: '侦察员', desc: '过滤候选职位：排除、去重、优先公司、每日上限' },
-  { key: 'analyst',  icon: '🤖', label: 'Analyst',  zh: '分析员', desc: 'AI 评分 resume↔JD，提取匹配/缺失关键词' },
-  { key: 'writer',   icon: '✍️', label: 'Writer',   zh: '撰写员', desc: '生成求职信，定制简历关键词' },
-  { key: 'reviewer', icon: '🔎', label: 'Reviewer', zh: '审核员', desc: '按规则分流：auto-apply / review / skip' },
-  { key: 'executor', icon: '🚀', label: 'Executor', zh: '执行员', desc: '更新 DB job.status=applied，写 Activity' },
-  { key: 'auditor',  icon: '✅', label: 'Auditor',  zh: '验收员', desc: '验证 DB 状态，生成最终运行报告' },
-]
-
-type RoleStatus = 'idle' | 'running' | 'done' | 'error'
-
-interface RoleMetric {
-  count: number; durationMs: number; summary: string
-  avgScore?: number; letters?: number; approved?: number
-  pending?: number; applied?: number; failed?: number; warnings?: number
-}
-
-interface LogEntry {
-  type:    'role_start' | 'role_done' | 'job_done' | 'job_skip' | 'info' | 'done' | 'error' | 'start'
-  role?:   RoleKey
-  message: string
-  score?:  number
-  time:    Date
-}
-
-// ── Model selector ────────────────────────────────────────────────────────────
-
-function InlineModelSelect({ provider, model, onChange }: {
-  provider: string; model: string; onChange: (p: string, m: string) => void
-}) {
-  const byProvider = MODEL_CATALOGUE.reduce<Record<string, typeof MODEL_CATALOGUE>>((acc, m) => {
-    if (!acc[m.provider]) acc[m.provider] = []
-    acc[m.provider].push(m)
-    return acc
-  }, {})
-
-  return (
-    <select
-      value={`${provider}::${model}`}
-      onChange={e => { const [p, m] = e.target.value.split('::'); onChange(p, m) }}
-      onClick={e => e.stopPropagation()}
-      style={{ fontSize: 10, padding: '3px 5px', border: '0.5px solid var(--border)', borderRadius: 4, background: 'var(--bg)', color: 'var(--text)', outline: 'none', width: '100%', cursor: 'pointer', maxWidth: 180 }}
-    >
-      {Object.entries(byProvider).map(([prov, models]) => (
-        <optgroup key={prov} label={PROVIDER_LABELS[prov as keyof typeof PROVIDER_LABELS] ?? prov}>
-          {models.map(m => (
-            <option key={`${m.provider}::${m.model}`} value={`${m.provider}::${m.model}`}>{m.label}</option>
+      {/* Suggestion chips */}
+      {messages.length <= 1 && (
+        <div style={{ padding: '4px 10px 6px', display: 'flex', flexWrap: 'wrap', gap: 5, flexShrink: 0 }}>
+          {chips.slice(0, 4).map((s, i) => (
+            <button key={i} onClick={() => sendMessage(s)} style={{
+              padding: '4px 9px', fontSize: 10, borderRadius: 999,
+              border: '0.5px solid var(--border)', background: 'var(--bg-secondary)',
+              cursor: 'pointer', color: 'var(--text)', whiteSpace: 'nowrap',
+              fontFamily: 'inherit',
+            }}>
+              {s}
+            </button>
           ))}
-        </optgroup>
-      ))}
-    </select>
-  )
-}
+        </div>
+      )}
 
-// ── Pipeline Flow Bar (sticky) ────────────────────────────────────────────────
-
-function PipelineFlowBar({ statuses, currentRole }: {
-  statuses: Record<RoleKey, RoleStatus>; currentRole: RoleKey | null
-}) {
-  return (
-    <div style={{
-      background: 'var(--bg-secondary)', borderBottom: '0.5px solid var(--border)',
-      position: 'sticky', top: 0, zIndex: 10, overflowX: 'auto',
-    }}>
-      {/* Inner: min-width ensures it never wraps, allows horizontal scroll */}
-      <div style={{
-        display: 'flex', alignItems: 'center', padding: '8px 16px',
-        minWidth: 'max-content', gap: 0,
-      }}>
-        {ROLES.map((r, i) => {
-          const st     = statuses[r.key]
-          const active = currentRole === r.key
-          const color  = st === 'done' ? '#3B6D11' : active ? '#185FA5' : st === 'error' ? '#A32D2D' : 'var(--text-muted)'
-          const bg     = st === 'done' ? 'rgba(59,109,17,0.1)' : active ? 'rgba(24,95,165,0.12)' : 'var(--bg-tertiary)'
-          return (
-            <React.Fragment key={r.key}>
-              <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 3, width: 72 }}>
-                <div style={{
-                  width: 30, height: 30, borderRadius: '50%', background: bg,
-                  border: `1.5px solid ${color}`, display: 'flex', alignItems: 'center', justifyContent: 'center',
-                  fontSize: 12, flexShrink: 0,
-                  animation: active ? 'pulse 1.4s ease-in-out infinite' : 'none',
-                }}>
-                  {st === 'done' ? '✓' : r.icon}
-                </div>
-                <div style={{ fontSize: 9, color, fontWeight: active ? 600 : 400, textAlign: 'center', lineHeight: 1.3, whiteSpace: 'nowrap' }}>
-                  <div>{r.label}</div>
-                  <div style={{ opacity: 0.65 }}>{r.zh}</div>
-                </div>
-              </div>
-              {i < ROLES.length - 1 && (
-                <div style={{ width: 32, height: 1.5, background: st === 'done' ? '#3B6D11' : 'var(--border)', transition: 'background 0.4s', margin: '0 2px', marginBottom: 18, flexShrink: 0 }} />
-              )}
-            </React.Fragment>
-          )
-        })}
+      {/* Input */}
+      <div style={{ padding: '8px 10px', borderTop: '0.5px solid var(--border)', display: 'flex', gap: 7, alignItems: 'flex-end', flexShrink: 0 }}>
+        <textarea
+          ref={inputRef}
+          value={input}
+          onChange={e => setInput(e.target.value)}
+          onKeyDown={e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendMessage(input) } }}
+          placeholder="告诉 Orchestrator 你想做什么… (Enter 发送)"
+          rows={2}
+          style={{
+            flex: 1, padding: '7px 9px', fontSize: 12, borderRadius: 8,
+            border: '0.5px solid var(--border)', background: 'var(--bg)',
+            color: 'var(--text)', outline: 'none', resize: 'none',
+            fontFamily: 'inherit', lineHeight: 1.5,
+          }}
+        />
+        <button
+          onClick={() => sendMessage(input)}
+          disabled={!input.trim() || loading}
+          style={{
+            padding: '8px 12px', borderRadius: 8, border: 'none',
+            background: (!input.trim() || loading) ? 'var(--border)' : 'var(--primary)',
+            color: '#fff', fontSize: 14, cursor: (!input.trim() || loading) ? 'not-allowed' : 'pointer',
+          }}
+        >
+          {loading ? '…' : '→'}
+        </button>
       </div>
     </div>
   )
 }
 
-// ── Agent Role Card ───────────────────────────────────────────────────────────
+// ── Smart message renderer ────────────────────────────────────────────────────
 
-function AgentRoleCard({ roleInfo, config, status, metrics, saving, onModelChange, onToggle, onPromptSave }: {
-  roleInfo: typeof ROLES[0]; config: AgentRole | undefined; status: RoleStatus
-  metrics: RoleMetric | undefined; saving: boolean
-  onModelChange:  (role: RoleKey, p: string, m: string) => void
-  onToggle:       (role: RoleKey, enabled: boolean) => void
-  onPromptSave:   (role: RoleKey, prompt: string) => void
-}) {
-  const { key, icon, label, zh, desc } = roleInfo
-  const provider    = config?.provider    ?? 'anthropic'
-  const model       = config?.model       ?? ''
-  const enabled     = config?.enabled     ?? true
-  const totalRuns   = config?.totalRuns   ?? 0
-  const lastResult  = config?.lastResult  as RoleMetric | null | undefined
+function SmartMessage({ text, color }: { text: string; color?: string }) {
+  const lines = text.split('\n').filter(l => l.trim())
 
-  const [promptOpen,   setPromptOpen]   = useState(false)
-  const [promptText,   setPromptText]   = useState(config?.systemPrompt ?? '')
-  const [promptSaving, setPromptSaving] = useState(false)
+  // Detect if message has list items (lines starting with -, •, *, numbers)
+  const listLines = lines.filter(l => /^[-•*·]\s/.test(l.trim()) || /^\d+\.\s/.test(l.trim()))
+  const hasList   = listLines.length >= 2
 
-  // Sync prompt from config when it loads
-  useEffect(() => {
-    if (config?.systemPrompt != null) setPromptText(config.systemPrompt)
-  }, [config?.systemPrompt])
+  // Detect if single line with inline formatting
+  const renderInline = (s: string) =>
+    s.replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>')
+     .replace(/`(.+?)`/g, '<code style="background:rgba(0,0,0,0.1);padding:1px 4px;border-radius:3px;font-size:10px">$1</code>')
 
-  const statusColors: Record<RoleStatus, string> = { idle: 'var(--text-muted)', running: '#185FA5', done: '#3B6D11', error: '#A32D2D' }
-  const statusLabels: Record<RoleStatus, string> = { idle: 'Idle', running: 'Running…', done: 'Done', error: 'Error' }
-  const sc = statusColors[status]
-
-  async function savePrompt() {
-    setPromptSaving(true)
-    await onPromptSave(key, promptText)
-    setPromptSaving(false)
-    setPromptOpen(false)
+  if (hasList) {
+    // Render as structured list
+    const items: React.ReactNode[] = []
+    for (const line of lines) {
+      const isBullet = /^[-•*·]\s/.test(line.trim())
+      const isNum    = /^\d+\.\s/.test(line.trim())
+      if (isBullet || isNum) {
+        const content = line.trim().replace(/^[-•*·\d.]\s+/, '')
+        items.push(
+          <div key={items.length} style={{ display: 'flex', gap: 6, alignItems: 'flex-start', marginBottom: 2 }}>
+            <span style={{ flexShrink: 0, color: 'inherit', opacity: 0.6, marginTop: 1 }}>{isNum ? `${items.length + 1}.` : '•'}</span>
+            <span dangerouslySetInnerHTML={{ __html: renderInline(content) }} />
+          </div>
+        )
+      } else {
+        // Non-list line (header/intro)
+        items.push(
+          <div key={items.length} style={{ marginBottom: 4, fontWeight: 500 }}
+            dangerouslySetInnerHTML={{ __html: renderInline(line.trim()) }} />
+        )
+      }
+    }
+    return <div style={{ fontSize: 11, color: color ?? 'var(--text)', lineHeight: 1.7, fontFamily: 'inherit' }}>{items}</div>
   }
 
+  // Multi-line plain text
+  if (lines.length > 1) {
+    return (
+      <div style={{ fontSize: 11, color: color ?? 'var(--text)', lineHeight: 1.7, fontFamily: 'monospace' }}>
+        {lines.map((l, i) => (
+          <div key={i} dangerouslySetInnerHTML={{ __html: renderInline(l) }} />
+        ))}
+      </div>
+    )
+  }
+
+  // Single line
   return (
-    <Card style={{
-      padding: 0, overflow: 'hidden', opacity: enabled ? 1 : 0.55,
-      border: status === 'running' ? `1.5px solid #185FA5` : status === 'done' ? `1.5px solid rgba(59,109,17,0.4)` : '0.5px solid var(--border)',
-      transition: 'border 0.3s, box-shadow 0.3s',
-      boxShadow: status === 'running' ? '0 0 0 3px rgba(24,95,165,0.12)' : 'none',
-    }}>
-      {/* Header */}
-      <div style={{ padding: '10px 12px', background: 'var(--bg-secondary)', borderBottom: '0.5px solid var(--border)', display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
-        <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-          <span style={{ fontSize: 18 }}>{icon}</span>
-          <div>
-            <div style={{ fontSize: 12, fontWeight: 600, lineHeight: 1.2 }}>{label}</div>
-            <div style={{ fontSize: 10, color: 'var(--text-muted)', lineHeight: 1.2 }}>{zh}</div>
-          </div>
-        </div>
-        <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-          <span style={{
-            width: 6, height: 6, borderRadius: '50%', background: sc, display: 'inline-block',
-            animation: status === 'running' ? 'pulse 1.2s ease-in-out infinite' : 'none',
-          }} />
-          <span style={{ fontSize: 10, color: sc, fontWeight: 500 }}>{statusLabels[status]}</span>
-          <div onClick={() => onToggle(key, !enabled)} style={{ width: 26, height: 14, borderRadius: 7, background: enabled ? '#185FA5' : 'var(--border)', cursor: 'pointer', position: 'relative', flexShrink: 0 }}>
-            <div style={{ width: 10, height: 10, borderRadius: '50%', background: '#fff', position: 'absolute', top: 2, left: enabled ? 14 : 2, transition: 'left 0.2s' }} />
-          </div>
-        </div>
-      </div>
-
-      {/* Body */}
-      <div style={{ padding: '10px 12px', display: 'flex', flexDirection: 'column', gap: 8 }}>
-        <div style={{ fontSize: 10, color: 'var(--text-muted)', lineHeight: 1.5 }}>{desc}</div>
-
-        {/* Model selector */}
-        <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
-          <span style={{ fontSize: 10, color: 'var(--text-muted)', flexShrink: 0 }}>模型</span>
-          <div style={{ flex: 1, minWidth: 120 }}>
-            <InlineModelSelect provider={provider} model={model} onChange={(p, m) => onModelChange(key, p, m)} />
-          </div>
-        </div>
-
-        {/* Run metrics */}
-        {metrics ? (
-          <div style={{ fontSize: 10, background: 'rgba(59,109,17,0.06)', borderRadius: 5, padding: '5px 8px', lineHeight: 1.7 }}>
-            <div style={{ color: '#3B6D11', fontWeight: 500 }}>{metrics.summary}</div>
-            <div style={{ color: 'var(--text-muted)' }}>{(metrics.durationMs / 1000).toFixed(1)}s · 共 {totalRuns + 1} 次运行</div>
-          </div>
-        ) : lastResult && totalRuns > 0 ? (
-          <div style={{ fontSize: 10, color: 'var(--text-muted)', background: 'var(--bg-tertiary)', borderRadius: 5, padding: '5px 8px', lineHeight: 1.7 }}>
-            <div>{lastResult.summary}</div>
-            <div>上次: {config?.lastRunAt ? new Date(config.lastRunAt).toLocaleDateString('zh') : '—'} · 共 {totalRuns} 次</div>
-          </div>
-        ) : null}
-
-        {saving && <div style={{ fontSize: 9, color: '#185FA5', textAlign: 'right' }}>保存中…</div>}
-
-        {/* ── System Prompt (fine-tuning) ── */}
-        <div>
-          <button
-            onClick={() => setPromptOpen(o => !o)}
-            style={{
-              width: '100%', padding: '5px 8px', background: promptOpen ? 'rgba(24,95,165,0.08)' : 'var(--bg-tertiary)',
-              border: '0.5px solid var(--border)', borderRadius: 5, cursor: 'pointer',
-              display: 'flex', alignItems: 'center', justifyContent: 'space-between',
-              fontSize: 10, color: 'var(--text-muted)',
-            }}
-          >
-            <span>✏ Instructions (System Prompt)</span>
-            <span>{promptOpen ? '▲' : '▼'}</span>
-          </button>
-
-          {promptOpen && (
-            <div style={{ marginTop: 6, display: 'flex', flexDirection: 'column', gap: 6 }}>
-              <textarea
-                value={promptText}
-                onChange={e => setPromptText(e.target.value)}
-                placeholder="Customize how this agent thinks and acts…"
-                rows={5}
-                style={{
-                  width: '100%', padding: '7px 9px', resize: 'vertical',
-                  border: '0.5px solid var(--border)', borderRadius: 5,
-                  fontSize: 10, fontFamily: 'inherit', lineHeight: 1.6,
-                  color: 'var(--text)', background: 'var(--bg)', outline: 'none',
-                  boxSizing: 'border-box',
-                }}
-              />
-              <div style={{ display: 'flex', gap: 6, justifyContent: 'flex-end' }}>
-                <button
-                  onClick={() => setPromptOpen(false)}
-                  style={{ padding: '4px 10px', fontSize: 10, border: '0.5px solid var(--border)', borderRadius: 4, background: 'var(--bg)', cursor: 'pointer', color: 'var(--text-muted)' }}
-                >
-                  Cancel
-                </button>
-                <button
-                  onClick={savePrompt}
-                  disabled={promptSaving}
-                  style={{ padding: '4px 10px', fontSize: 10, background: '#185FA5', color: '#fff', border: 'none', borderRadius: 4, cursor: promptSaving ? 'not-allowed' : 'pointer', opacity: promptSaving ? 0.7 : 1 }}
-                >
-                  {promptSaving ? 'Saving…' : '💾 Save'}
-                </button>
-              </div>
-            </div>
-          )}
-        </div>
-      </div>
-    </Card>
+    <span
+      style={{ fontSize: 11, color: color ?? 'var(--text)', lineHeight: 1.6, fontFamily: 'monospace' }}
+      dangerouslySetInnerHTML={{ __html: renderInline(text) }}
+    />
   )
 }
 
-// ── Run Log Panel ─────────────────────────────────────────────────────────────
+// ── Unified Stream (Claude-style: chat + execution in one panel) ──────────────
 
-function RunLogPanel({ log, running, done, summary, onStart, onStop }: {
+function UnifiedStream({
+  log, running, done, summary, applyQueue, waitingQuestion,
+  savedCount, pendingCount, hasRun, autonomousMode,
+  onStart, onStop, onAnswerQuestion, onAnswerOrchestrator, onApplied, onChatAction,
+}: {
   log: LogEntry[]; running: boolean; done: boolean
   summary: { processed: number; applied: number; pending: number; skipped: number; failed: number } | null
+  applyQueue: ApplyReadyJob[]
+  waitingQuestion: { id: string; question: string; options: QuestionOption[] } | null
+  savedCount: number; pendingCount: number; hasRun: boolean; autonomousMode: boolean
   onStart: () => void; onStop: () => void
+  onAnswerQuestion: (entry: LogEntry, opt: QuestionOption) => void
+  onAnswerOrchestrator: (questionId: string, answer: string, options?: QuestionOption[]) => void
+  onApplied: (jobId: string, job: ApplyReadyJob) => void
+  onChatAction: (action: { type: string; [k: string]: unknown }) => void
 }) {
-  const logEndRef = useRef<HTMLDivElement>(null)
-  useEffect(() => { logEndRef.current?.scrollIntoView({ behavior: 'smooth' }) }, [log])
+  const streamEndRef   = useRef<HTMLDivElement>(null)
+  const inputRef       = useRef<HTMLTextAreaElement>(null)
+  const [chatInput, setChatInput] = useState('')
+  const [chatLoading, setChatLoading] = useState(false)
+  const toast = useToast()
+
+  useEffect(() => { streamEndRef.current?.scrollIntoView({ behavior: 'smooth' }) }, [log])
+
+  // Merged stream: convert log entries + apply queue into render items
+  const isEmpty = log.length === 0 && applyQueue.length === 0
 
   function entryColor(e: LogEntry): string {
-    if (e.type === 'done')       return '#3B6D11'
-    if (e.type === 'error')      return '#A32D2D'
-    if (e.type === 'role_start') return '#185FA5'
-    if (e.type === 'role_done')  return '#3B6D11'
-    if (e.type === 'job_skip')   return 'var(--text-muted)'
-    if (e.score != null)         return e.score >= 80 ? '#3B6D11' : e.score >= 60 ? '#854F0B' : 'var(--text-muted)'
+    if (e.type === 'done')                 return 'var(--c-success)'
+    if (e.type === 'error')                return 'var(--c-danger)'
+    if (e.type === 'role_start')           return 'var(--primary)'
+    if (e.type === 'role_done')            return 'var(--c-success)'
+    if (e.type === 'job_skip')             return 'var(--text-muted)'
+    if (e.type === 'agent_plan')           return '#818cf8'
+    if (e.type === 'agent_action')         return 'var(--text)'
+    if (e.type === 'agent_observation')    return '#94a3b8'
+    if (e.type === 'agent_reflect')        return 'var(--c-success)'
+    if (e.type === 'orchestrator_thinking')return '#f59e0b'
+    if (e.type === 'orchestrator_fix')     return '#f97316'
+    if (e.type === 'orchestrator_retry')   return '#fb923c'
+    if (e.type === 'orchestrator_decision')return '#a78bfa'
+    if (e.type === 'orchestrator_complete')return '#34d399'
+    if (e.type === 'orchestrator_answer')  return 'var(--c-success)'
+    if (e.type === 'user_message')         return '#fff'
+    if (e.score != null)                   return e.score >= 80 ? 'var(--c-success)' : e.score >= 60 ? 'var(--c-warning)' : 'var(--text-muted)'
     return 'var(--text)'
   }
 
-  const isEmpty = log.length === 0
+  function entryPrefix(e: LogEntry): string {
+    if (e.type === 'agent_plan')            return '📋 '
+    if (e.type === 'agent_action')          return '⚡ '
+    if (e.type === 'agent_observation')     return '   👁 '
+    if (e.type === 'agent_reflect')         return '💬 '
+    if (e.type === 'orchestrator_fix')      return '🔧 '
+    if (e.type === 'orchestrator_retry')    return '🔄 '
+    if (e.type === 'orchestrator_decision') return '⚖ '
+    return ''
+  }
+
+  async function sendChat(text: string) {
+    if (!text.trim() || chatLoading) return
+    setChatInput('')
+    setChatLoading(true)
+
+    // Add user message to stream
+    log.push({ type: 'user_message', message: text, time: new Date() })
+
+    try {
+      const res = await fetch('/api/agent/chat', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ messages: [{ role: 'user', content: text }] }),
+      })
+      const reader = res.body!.getReader()
+      const decoder = new TextDecoder()
+      let buf = '', full = '', event = ''
+      while (true) {
+        const { done, value } = await reader.read()
+        if (done) break
+        buf += decoder.decode(value, { stream: true })
+        const lines = buf.split('\n'); buf = lines.pop() ?? ''
+        for (const line of lines) {
+          if (line.startsWith('event: '))      event = line.slice(7).trim()
+          else if (line.startsWith('data: ')) {
+            try {
+              const d = JSON.parse(line.slice(6))
+              if (event === 'text' && d.delta) { full += d.delta }
+              else if (event === 'action')     { onChatAction(d) }
+            } catch { }
+            event = ''
+          }
+        }
+      }
+      if (full.trim()) {
+        // Strip ACTION lines, clean thinking preamble
+        const cleaned = full.replace(/^ACTION:.+$/gm, '').trim()
+        // Extract from first meaningful line (skip "Let me..." etc.)
+        const lines = cleaned.split('\n').filter(l => l.trim())
+        const thinkPfx = ['let me', 'i need', 'i will', 'sure,', 'okay,', 'as an']
+        const msgLines = lines.filter(l => !thinkPfx.some(p => l.toLowerCase().trim().startsWith(p)))
+        const message = (msgLines.length > 0 ? msgLines : lines).join('\n').trim()
+        log.push({ type: 'orchestrator_thinking', message, time: new Date() })
+      }
+    } catch (err) {
+      toast.error('Chat failed', (err as Error).message)
+    } finally {
+      setChatLoading(false)
+    }
+  }
+
+  const chips = [
+    savedCount > 0 && !hasRun ? `▶ 开始分析 ${savedCount} 个职位` : null,
+    pendingCount > 0           ? `📋 审核 ${pendingCount} 个待定` : null,
+    '📊 分析求职进展',
+    '⚙️ 把最低匹配分设为 80%',
+  ].filter(Boolean) as string[]
+
+  const applyPending = applyQueue.filter(j => !j.url?.startsWith('_applied'))
 
   return (
-    <Card style={{ padding: 0, overflow: 'hidden' }}>
-      {/* Header */}
-      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '10px 14px', background: 'var(--bg-secondary)', borderBottom: '0.5px solid var(--border)' }}>
+    <div style={{ flex: 1, display: 'flex', flexDirection: 'column', overflow: 'hidden', background: 'var(--bg)' }}>
+      {/* Stream header */}
+      <div style={{ padding: '8px 16px', borderBottom: '0.5px solid var(--border)', display: 'flex', alignItems: 'center', justifyContent: 'space-between', background: 'var(--bg-secondary)', flexShrink: 0 }}>
         <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-          <span style={{ fontSize: 12, fontWeight: 500 }}>Live Run Log</span>
-          {running && (
-            <div style={{ display: 'flex', alignItems: 'center', gap: 5 }}>
-              <div style={{ width: 7, height: 7, borderRadius: '50%', background: '#3B6D11', animation: 'pulse 1.2s ease-in-out infinite' }} />
-              <span style={{ fontSize: 10, color: '#3B6D11' }}>Pipeline 运行中…</span>
-            </div>
+          <span style={{ fontSize: 12, fontWeight: 600 }}>
+            {autonomousMode ? '🤖 自主模式' : '💬 交互模式'} · Orchestrator Stream
+          </span>
+          {running && <span style={{ fontSize: 10, color: 'var(--c-success)', display: 'flex', alignItems: 'center', gap: 4 }}>
+            <span style={{ width: 6, height: 6, borderRadius: '50%', background: 'var(--c-success)', display: 'inline-block', animation: 'pulse 1.2s ease-in-out infinite' }} />运行中
+          </span>}
+          {waitingQuestion && !autonomousMode && (
+            <span style={{ fontSize: 10, color: '#f59e0b', fontWeight: 600, animation: 'pulse 1.5s ease-in-out infinite' }}>⏸ 等待你的回答</span>
           )}
-          {done && !running && <span style={{ fontSize: 10, color: 'var(--text-muted)', marginLeft: 4 }}>Completed</span>}
+          {applyPending.length > 0 && <span style={{ fontSize: 10, padding: '1px 7px', borderRadius: 999, background: 'var(--primary)', color: '#fff', fontWeight: 600 }}>{applyPending.length} 待申请</span>}
         </div>
         <div style={{ display: 'flex', gap: 6 }}>
-          {!running && <Btn small variant="primary" onClick={onStart}>{done ? '↻ Run Again' : '▶ Start Run'}</Btn>}
-          {running   && <Btn small variant="danger"  onClick={onStop}>⏹ Stop</Btn>}
+          {summary && <span style={{ fontSize: 10, color: 'var(--text-muted)' }}>{summary.processed}处理 · {summary.applied}队列 · {summary.pending}待审核</span>}
+          {!running && <Btn small variant="primary" onClick={onStart}>{done ? '↻ 再次运行' : '▶ 开始运行'}</Btn>}
+          {running  && <Btn small variant="danger"  onClick={onStop}>⏹ 停止</Btn>}
         </div>
       </div>
 
-      {/* Summary stats */}
-      {summary && (
-        <div style={{ display: 'flex', borderBottom: '0.5px solid var(--border)' }}>
-          {[
-            { label: 'Processed', value: summary.processed, color: 'var(--text)' },
-            { label: 'Applied',   value: summary.applied,   color: '#3B6D11' },
-            { label: 'Pending',   value: summary.pending,   color: '#854F0B' },
-            { label: 'Skipped',   value: summary.skipped,   color: 'var(--text-muted)' },
-            { label: 'Failed',    value: summary.failed,    color: '#A32D2D' },
-          ].map((s, i) => (
-            <div key={s.label} style={{ flex: 1, textAlign: 'center', padding: '7px 0', borderRight: i < 4 ? '0.5px solid var(--border)' : 'none' }}>
-              <div style={{ fontSize: 16, fontWeight: 600, color: s.color }}>{s.value}</div>
-              <div style={{ fontSize: 9, color: 'var(--text-muted)' }}>{s.label}</div>
-            </div>
-          ))}
-        </div>
-      )}
-
-      {/* Log body — compact when empty, full height when active */}
-      <div style={{
-        height: isEmpty ? 64 : 220, overflowY: 'auto', padding: '8px 14px',
-        fontFamily: 'monospace', transition: 'height 0.3s',
-        display: 'flex', flexDirection: 'column', justifyContent: isEmpty ? 'center' : 'flex-start',
-      }}>
+      {/* Unified scrollable stream */}
+      <div style={{ flex: 1, overflowY: 'auto', padding: '12px 16px', display: 'flex', flexDirection: 'column', gap: 4 }}>
         {isEmpty ? (
-          <div style={{ fontSize: 11, color: 'var(--text-muted)', textAlign: 'center' }}>
-            点击 ▶ Start Run 启动 6-Agent 流水线
+          <div style={{ flex: 1, display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', gap: 16, padding: '40px 0' }}>
+            <div style={{ fontSize: 40 }}>🧠</div>
+            <div style={{ textAlign: 'center' }}>
+              <div style={{ fontSize: 13, fontWeight: 600, color: 'var(--text)', marginBottom: 6 }}>Orchestrator 待命</div>
+              <div style={{ fontSize: 11, color: 'var(--text-muted)', marginBottom: 12 }}>
+                {autonomousMode ? '自主模式：运行时 Orchestrator 自动决策' : '交互模式：Orchestrator 遇到问题会暂停询问你'}
+              </div>
+            </div>
+            {/* Suggestion chips */}
+            <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, justifyContent: 'center', maxWidth: 400 }}>
+              {chips.map((s, i) => (
+                <button key={i} onClick={() => sendChat(s)} style={{
+                  padding: '6px 12px', fontSize: 11, borderRadius: 999,
+                  border: '0.5px solid var(--border)', background: 'var(--bg-secondary)',
+                  cursor: 'pointer', color: 'var(--text)', fontFamily: 'inherit',
+                }}>{s}</button>
+              ))}
+            </div>
           </div>
-        ) : log.map((entry, i) => (
-          <div key={i} style={{ display: 'flex', gap: 8, marginBottom: 2, alignItems: 'flex-start' }}>
-            <span style={{ fontSize: 9, color: 'var(--text-muted)', flexShrink: 0, paddingTop: 1, fontVariantNumeric: 'tabular-nums' }}>
-              {entry.time.toLocaleTimeString('en', { hour: '2-digit', minute: '2-digit', second: '2-digit' })}
-            </span>
-            <span style={{ fontSize: 11, color: entryColor(entry), lineHeight: 1.5 }}>{entry.message}</span>
-          </div>
-        ))}
-        <div ref={logEndRef} />
+        ) : (
+          <>
+            {log.map((entry, i) => {
+              // User message bubble
+              if (entry.type === 'user_message') {
+                return (
+                  <div key={i} style={{ display: 'flex', justifyContent: 'flex-end', margin: '4px 0' }}>
+                    <div style={{ maxWidth: '70%', padding: '8px 12px', borderRadius: '12px 12px 3px 12px', background: 'var(--primary)', color: '#fff', fontSize: 12, lineHeight: 1.6 }}>
+                      {entry.message}
+                    </div>
+                  </div>
+                )
+              }
+
+              // Orchestrator true-pause question (pipeline is WAITING)
+              if (entry.type === 'orchestrator_question') {
+                return (
+                  <div key={i} style={{ margin: '8px 0', borderRadius: 10, border: `2px solid ${entry.answered ? 'rgba(52,211,153,0.3)' : 'rgba(245,158,11,0.5)'}`, background: entry.answered ? 'rgba(52,211,153,0.05)' : 'rgba(245,158,11,0.06)', overflow: 'hidden' }}>
+                    <div style={{ padding: '8px 14px', background: entry.answered ? 'rgba(52,211,153,0.08)' : 'rgba(245,158,11,0.10)', display: 'flex', alignItems: 'center', gap: 8, borderBottom: '0.5px solid rgba(245,158,11,0.2)' }}>
+                      <span style={{ fontSize: 16 }}>{entry.answered ? '✅' : '⏸'}</span>
+                      <span style={{ fontSize: 12, fontWeight: 600, color: entry.answered ? '#34d399' : '#f59e0b' }}>
+                        {entry.answered ? 'Orchestrator 已获得回答，继续执行' : '🧠 Orchestrator 暂停 — 需要你的决定'}
+                      </span>
+                      <span style={{ fontSize: 9, color: 'var(--text-muted)', marginLeft: 'auto' }}>
+                        {entry.time.toLocaleTimeString('en', { hour: '2-digit', minute: '2-digit', second: '2-digit' })}
+                      </span>
+                    </div>
+                    <div style={{ padding: '10px 14px' }}>
+                      <p style={{ fontSize: 12, color: 'var(--text)', lineHeight: 1.7, margin: '0 0 10px' }}>{entry.question}</p>
+                      {!entry.answered && (
+                        <div style={{ display: 'flex', flexWrap: 'wrap', gap: 7 }}>
+                          {entry.options?.map((opt, oi) => (
+                            <button key={oi} onClick={() => onAnswerOrchestrator(entry.questionId!, opt.value, entry.options)} style={{
+                              padding: '7px 14px', borderRadius: 8, cursor: 'pointer',
+                              border: '1.5px solid rgba(245,158,11,0.5)', background: 'rgba(245,158,11,0.10)',
+                              color: '#92400e', fontSize: 12, fontFamily: 'inherit', fontWeight: 500,
+                              transition: 'all 0.15s',
+                            }}
+                              onMouseEnter={e => { (e.currentTarget as HTMLButtonElement).style.background = 'rgba(245,158,11,0.25)' }}
+                              onMouseLeave={e => { (e.currentTarget as HTMLButtonElement).style.background = 'rgba(245,158,11,0.10)' }}
+                            >{opt.label}</button>
+                          ))}
+                        </div>
+                      )}
+                    </div>
+                  </div>
+                )
+              }
+
+              // agent_question (non-pausing, advisory)
+              if (entry.type === 'agent_question') {
+                return (
+                  <div key={i} style={{ margin: '4px 0', borderRadius: 8, border: '1px solid rgba(234,179,8,0.3)', background: 'rgba(234,179,8,0.04)', overflow: 'hidden' }}>
+                    <div style={{ padding: '6px 12px', background: 'rgba(234,179,8,0.07)', display: 'flex', alignItems: 'center', gap: 7, borderBottom: '0.5px solid rgba(234,179,8,0.15)' }}>
+                      <span style={{ fontSize: 13 }}>🤔</span>
+                      <span style={{ fontSize: 11, fontWeight: 600, color: '#b45309' }}>Agent 建议</span>
+                      {entry.answered && <span style={{ fontSize: 9, color: 'var(--c-success)', marginLeft: 'auto' }}>✓ 已回答</span>}
+                    </div>
+                    <div style={{ padding: '7px 12px' }}>
+                      <p style={{ fontSize: 11, color: 'var(--text)', lineHeight: 1.6, margin: '0 0 7px' }}>{entry.question}</p>
+                      {!entry.answered && (
+                        <div style={{ display: 'flex', flexWrap: 'wrap', gap: 5 }}>
+                          {entry.options?.map((opt, oi) => (
+                            <button key={oi} onClick={() => onAnswerQuestion(entry, opt)} style={{
+                              padding: '4px 10px', borderRadius: 6, cursor: 'pointer',
+                              border: '1px solid rgba(234,179,8,0.35)', background: 'rgba(234,179,8,0.08)',
+                              color: '#92400e', fontSize: 11, fontFamily: 'inherit', fontWeight: 500,
+                            }}>{opt.label}</button>
+                          ))}
+                        </div>
+                      )}
+                    </div>
+                  </div>
+                )
+              }
+
+              // Orchestrator plan / complete — special banner
+              if (entry.type === 'orchestrator_plan' || entry.type === 'orchestrator_complete') {
+                const isComplete = entry.type === 'orchestrator_complete'
+                return (
+                  <div key={i} style={{ margin: '6px 0', padding: '8px 12px', borderRadius: 8, background: isComplete ? 'rgba(52,211,153,0.08)' : 'rgba(245,158,11,0.06)', border: `1px solid ${isComplete ? 'rgba(52,211,153,0.25)' : 'rgba(245,158,11,0.2)'}`, display: 'flex', alignItems: 'center', gap: 8 }}>
+                    <span style={{ fontSize: 15 }}>{isComplete ? '✅' : '🧠'}</span>
+                    <span style={{ fontSize: 11, color: isComplete ? '#34d399' : '#f59e0b', fontWeight: 500 }}>{entry.message}</span>
+                  </div>
+                )
+              }
+
+              // Apply ready cards (inline in stream)
+              if (entry.type === 'info' && entry.message.includes('queued for manual')) return null
+
+              // Default entry — use SmartMessage for intelligent formatting
+              const indent = entry.type === 'agent_observation' ? 16 : entry.type === 'agent_plan' ? 8 : 0
+              return (
+                <div key={i} style={{
+                  display: 'flex', gap: 8, alignItems: 'flex-start',
+                  padding: `2px 0`,
+                  paddingLeft: indent,
+                  background: entry.type === 'agent_plan' ? 'rgba(79,70,229,0.03)' : 'transparent',
+                  borderLeft: entry.type === 'agent_plan' ? '2px solid rgba(129,140,248,0.3)' : 'none',
+                }}>
+                  <span style={{ fontSize: 9, color: 'var(--text-muted)', flexShrink: 0, paddingTop: 3, fontVariantNumeric: 'tabular-nums', minWidth: 58 }}>
+                    {entry.time.toLocaleTimeString('en', { hour: '2-digit', minute: '2-digit', second: '2-digit' })}
+                  </span>
+                  <div style={{ flex: 1, minWidth: 0 }}>
+                    {entryPrefix(entry) && (
+                      <span style={{ fontSize: 11, color: entryColor(entry), fontFamily: 'monospace' }}>{entryPrefix(entry)}</span>
+                    )}
+                    <SmartMessage text={entry.message} color={entryColor(entry)} />
+                  </div>
+                </div>
+              )
+            })}
+
+            {/* Apply Queue inline */}
+            {applyQueue.length > 0 && (
+              <div style={{ margin: '8px 0', borderRadius: 10, border: '1px solid var(--border)', overflow: 'hidden' }}>
+                <div style={{ padding: '8px 14px', background: 'var(--bg-secondary)', borderBottom: '0.5px solid var(--border)', display: 'flex', alignItems: 'center', gap: 8 }}>
+                  <span style={{ fontSize: 14 }}>📋</span>
+                  <span style={{ fontSize: 12, fontWeight: 600 }}>待申请队列</span>
+                  <span style={{ fontSize: 10, padding: '1px 7px', borderRadius: 999, background: 'var(--primary)', color: '#fff', fontWeight: 600 }}>{applyPending.length}</span>
+                  <span style={{ fontSize: 10, color: 'var(--text-muted)', marginLeft: 'auto' }}>点击「立即申请」确认投递</span>
+                </div>
+                {applyQueue.map(job => (
+                  <ApplyJobCard key={job.jobId} job={job} onApplied={(id) => onApplied(id, job)} />
+                ))}
+              </div>
+            )}
+          </>
+        )}
+        <div ref={streamEndRef} />
       </div>
 
-      {/* Empty state CTA: no jobs found */}
-      {done && summary?.processed === 0 && (
-        <div style={{ padding: '10px 14px', borderTop: '0.5px solid var(--border)', background: 'rgba(24,95,165,0.04)', display: 'flex', alignItems: 'center', gap: 10 }}>
-          <span style={{ fontSize: 18 }}>💡</span>
-          <div style={{ fontSize: 11, color: 'var(--text-muted)', lineHeight: 1.5 }}>
-            没有待处理的职位。先通过 <strong>Chrome 插件</strong>在 LinkedIn / Indeed 保存职位，或在 <strong>Jobs 页面</strong>点击「+ Add Job」手动添加。
+      {/* Input bar — dual purpose: chat OR answer question */}
+      <div style={{ borderTop: '0.5px solid var(--border)', padding: '10px 14px', background: 'var(--bg-secondary)', flexShrink: 0 }}>
+        {waitingQuestion && !autonomousMode && (
+          <div style={{ marginBottom: 8, padding: '6px 10px', borderRadius: 7, background: 'rgba(245,158,11,0.08)', border: '1px solid rgba(245,158,11,0.25)', fontSize: 11, color: '#b45309' }}>
+            ⏸ Orchestrator 正在等待你回答上方问题，或直接在下方输入指令
           </div>
+        )}
+        <div style={{ display: 'flex', gap: 8, alignItems: 'flex-end' }}>
+          <textarea
+            ref={inputRef}
+            value={chatInput}
+            onChange={e => setChatInput(e.target.value)}
+            onKeyDown={e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendChat(chatInput) } }}
+            placeholder={waitingQuestion && !autonomousMode
+              ? '回答问题或发送指令给 Orchestrator… (Enter 发送)'
+              : '发送指令给 Orchestrator… (Enter 发送)'}
+            rows={2}
+            style={{ flex: 1, padding: '8px 10px', fontSize: 12, borderRadius: 9, border: '0.5px solid var(--border)', background: 'var(--bg)', color: 'var(--text)', outline: 'none', resize: 'none', fontFamily: 'inherit', lineHeight: 1.5 }}
+          />
+          <button onClick={() => sendChat(chatInput)} disabled={!chatInput.trim() || chatLoading}
+            style={{ padding: '10px 14px', borderRadius: 9, border: 'none', background: (!chatInput.trim() || chatLoading) ? 'var(--border)' : 'var(--primary)', color: '#fff', fontSize: 14, cursor: (!chatInput.trim() || chatLoading) ? 'not-allowed' : 'pointer' }}>
+            {chatLoading ? '…' : '→'}
+          </button>
         </div>
-      )}
-    </Card>
+      </div>
+    </div>
   )
 }
 
-// ── Settings helpers ──────────────────────────────────────────────────────────
+// ── Apply Job Card ────────────────────────────────────────────────────────────
 
-function SectionTitle({ children }: { children: React.ReactNode }) {
+function ApplyJobCard({ job, onApplied }: { job: ApplyReadyJob; onApplied: (id: string) => void }) {
+  const [showCL,   setShowCL]   = useState(false)
+  const [applying, setApplying] = useState(false)
+  const isApplied = job.url?.startsWith('_applied')
+
+  async function handleApply() {
+    if (!job.url || isApplied) return
+    setApplying(true)
+    // Open job URL in new tab
+    window.open(job.url, '_blank', 'noopener')
+    // After user confirms they applied
+    await new Promise(r => setTimeout(r, 800))
+    await onApplied(job.jobId)
+    setApplying(false)
+  }
+
   return (
-    <div style={{ fontSize: 10, fontWeight: 700, color: 'var(--text-muted)', textTransform: 'uppercase', letterSpacing: '0.07em', padding: '14px 0 6px', borderBottom: '0.5px solid var(--border)', marginBottom: 4 }}>
-      {children}
+    <div style={{
+      padding: '10px 14px', borderBottom: '0.5px solid var(--border)',
+      opacity: isApplied ? 0.55 : 1, transition: 'opacity 0.3s',
+    }}>
+      <div style={{ display: 'flex', alignItems: 'flex-start', gap: 10 }}>
+        <div style={{ flex: 1, minWidth: 0 }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+            <span style={{ fontSize: 12, fontWeight: 600 }}>{job.company}</span>
+            <span style={{ fontSize: 11, color: 'var(--text-muted)' }}>·</span>
+            <span style={{ fontSize: 11, color: 'var(--text-muted)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', maxWidth: 160 }}>{job.role}</span>
+            {job.location && <span style={{ fontSize: 10, color: 'var(--text-muted)' }}>📍{job.location}</span>}
+            <span style={{
+              fontSize: 10, fontWeight: 700, padding: '1px 6px', borderRadius: 999,
+              background: job.score >= 80 ? 'rgba(5,150,105,0.12)' : 'rgba(234,179,8,0.12)',
+              color: job.score >= 80 ? 'var(--c-success)' : '#b45309',
+            }}>{job.score}%</span>
+          </div>
+          {job.matchedKeywords.length > 0 && (
+            <div style={{ fontSize: 9, color: 'var(--text-muted)', marginTop: 3 }}>
+              匹配：{job.matchedKeywords.slice(0, 5).join(' · ')}
+            </div>
+          )}
+          {job.coverLetter && (
+            <button onClick={() => setShowCL(s => !s)} style={{ marginTop: 4, fontSize: 10, color: 'var(--primary)', background: 'none', border: 'none', cursor: 'pointer', padding: 0, fontFamily: 'inherit' }}>
+              {showCL ? '▲ 收起求职信' : '▼ 查看求职信'}
+            </button>
+          )}
+          {showCL && job.coverLetter && (
+            <div style={{ marginTop: 6, padding: '8px 10px', background: 'var(--bg-secondary)', borderRadius: 6, fontSize: 10, lineHeight: 1.7, color: 'var(--text)', whiteSpace: 'pre-wrap', maxHeight: 120, overflowY: 'auto', border: '0.5px solid var(--border)' }}>
+              {job.coverLetter}
+            </div>
+          )}
+        </div>
+        <div style={{ flexShrink: 0 }}>
+          {isApplied ? (
+            <span style={{ fontSize: 11, color: 'var(--c-success)', fontWeight: 600 }}>✓ 已投递</span>
+          ) : (
+            <button
+              onClick={handleApply}
+              disabled={applying || !job.url}
+              style={{
+                padding: '6px 14px', borderRadius: 7, border: 'none',
+                background: applying ? 'var(--border)' : 'var(--primary)',
+                color: '#fff', fontSize: 11, fontWeight: 600, cursor: applying ? 'not-allowed' : 'pointer',
+                fontFamily: 'inherit',
+              }}
+            >
+              {applying ? '…' : '🚀 立即申请'}
+            </button>
+          )}
+        </div>
+      </div>
     </div>
   )
+}
+
+// ── Add Agent Modal ───────────────────────────────────────────────────────────
+
+const BUILTIN_STAGE_KEYS = ['scout', 'analyst', 'writer', 'reviewer', 'executor', 'auditor']
+const EMOJI_OPTIONS = ['🧩', '🔬', '📌', '🛡', '⚡', '🎯', '🔧', '📊', '🧠', '💡', '🔗', '📋']
+
+function AddAgentModal({ onClose, onCreated }: {
+  onClose:   () => void
+  onCreated: (agent: CustomAgentRow) => void
+}) {
+  const toast = useToast()
+  const [name,         setName]        = useState('')
+  const [icon,         setIcon]        = useState('🧩')
+  const [description,  setDescription] = useState('')
+  const [systemPrompt, setSystemPrompt] = useState('')
+  const [provider,     setProvider]    = useState('anthropic')
+  const [model,        setModel]       = useState('claude-haiku-4-5-20251001')
+  const [insertAfter,  setInsertAfter] = useState('auditor')
+  const [saving,       setSaving]      = useState(false)
+
+  async function handleCreate() {
+    if (!name.trim()) { toast.error('请填写名称', ''); return }
+    setSaving(true)
+    const res = await fetch('/api/agent/roles/custom', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name, icon, description, systemPrompt, provider, model, insertAfter }),
+    })
+    setSaving(false)
+    if (!res.ok) { toast.error('创建失败', await res.text()); return }
+    const data = await res.json()
+    onCreated(data.data ?? data)
+    toast.success('自定义 Agent 已创建', `「${name}」将在 ${insertAfter} 阶段后运行`)
+    onClose()
+  }
+
+  const inputStyle: React.CSSProperties = {
+    width: '100%', padding: '7px 10px', fontSize: 12,
+    border: '0.5px solid var(--border)', borderRadius: 6,
+    background: 'var(--bg)', color: 'var(--text)', outline: 'none',
+    boxSizing: 'border-box', fontFamily: 'inherit',
+  }
+
+  return (
+    <div style={{
+      position: 'fixed', inset: 0, zIndex: 500,
+      background: 'rgba(0,0,0,0.5)', display: 'flex', alignItems: 'center', justifyContent: 'center',
+    }} onClick={onClose}>
+      <div style={{
+        background: 'var(--bg)', border: '0.5px solid var(--border)', borderRadius: 14,
+        width: 480, maxWidth: '95vw', boxShadow: '0 20px 60px rgba(0,0,0,0.3)',
+        overflow: 'hidden',
+      }} onClick={e => e.stopPropagation()}>
+
+        {/* Header */}
+        <div style={{ padding: '14px 18px', background: 'var(--bg-secondary)', borderBottom: '0.5px solid var(--border)', display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+          <div style={{ fontSize: 13, fontWeight: 600 }}>＋ 添加自定义 Agent</div>
+          <button onClick={onClose} style={{ background: 'none', border: 'none', cursor: 'pointer', fontSize: 16, color: 'var(--text-muted)' }}>✕</button>
+        </div>
+
+        {/* Body */}
+        <div style={{ padding: '16px 18px', display: 'flex', flexDirection: 'column', gap: 12 }}>
+
+          {/* Icon picker + Name */}
+          <div style={{ display: 'flex', gap: 10, alignItems: 'flex-start' }}>
+            <div>
+              <div style={{ fontSize: 10, color: 'var(--text-muted)', marginBottom: 5 }}>图标</div>
+              <div style={{ display: 'flex', flexWrap: 'wrap', gap: 4, width: 110 }}>
+                {EMOJI_OPTIONS.map(e => (
+                  <button key={e} onClick={() => setIcon(e)} style={{
+                    width: 28, height: 28, borderRadius: 6, border: icon === e ? '2px solid var(--primary)' : '0.5px solid var(--border)',
+                    background: icon === e ? 'rgba(79,70,229,0.1)' : 'var(--bg-secondary)',
+                    cursor: 'pointer', fontSize: 14, display: 'flex', alignItems: 'center', justifyContent: 'center',
+                  }}>{e}</button>
+                ))}
+              </div>
+            </div>
+            <div style={{ flex: 1 }}>
+              <div style={{ fontSize: 10, color: 'var(--text-muted)', marginBottom: 5 }}>名称 *</div>
+              <input value={name} onChange={e => setName(e.target.value)} placeholder="例如：Remote Filter" style={inputStyle} autoFocus />
+              <div style={{ fontSize: 10, color: 'var(--text-muted)', marginTop: 8, marginBottom: 5 }}>描述（可选）</div>
+              <input value={description} onChange={e => setDescription(e.target.value)} placeholder="简短说明此 Agent 的职责" style={inputStyle} />
+            </div>
+          </div>
+
+          {/* System Prompt */}
+          <div>
+            <div style={{ fontSize: 10, color: 'var(--text-muted)', marginBottom: 5 }}>System Prompt（告诉 Agent 怎么分析）</div>
+            <textarea value={systemPrompt} onChange={e => setSystemPrompt(e.target.value)}
+              placeholder={'例如：\n你是一个远程工作过滤专家。对于每个职位，判断它是否支持远程工作。\n如果不支持，说明原因。'}
+              rows={4}
+              style={{ ...inputStyle, resize: 'vertical', lineHeight: 1.6 }}
+            />
+          </div>
+
+          {/* Model + Insert After */}
+          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10 }}>
+            <div>
+              <div style={{ fontSize: 10, color: 'var(--text-muted)', marginBottom: 5 }}>AI 模型</div>
+              <ModelSelect provider={provider} model={model} onChange={(p, m) => { setProvider(p); setModel(m) }} />
+            </div>
+            <div>
+              <div style={{ fontSize: 10, color: 'var(--text-muted)', marginBottom: 5 }}>插入在哪个阶段之后</div>
+              <select value={insertAfter} onChange={e => setInsertAfter(e.target.value)} style={{ ...inputStyle, cursor: 'pointer' }}>
+                {BUILTIN_STAGE_KEYS.map(k => (
+                  <option key={k} value={k}>{k}</option>
+                ))}
+              </select>
+            </div>
+          </div>
+        </div>
+
+        {/* Footer */}
+        <div style={{ padding: '12px 18px', borderTop: '0.5px solid var(--border)', display: 'flex', gap: 8, justifyContent: 'flex-end' }}>
+          <Btn variant="ghost" onClick={onClose}>取消</Btn>
+          <Btn variant="primary" onClick={handleCreate} disabled={saving || !name.trim()}>
+            {saving ? '创建中…' : '✓ 创建 Agent'}
+          </Btn>
+        </div>
+      </div>
+    </div>
+  )
+}
+
+// ── Global Settings (collapsible) ─────────────────────────────────────────────
+
+type UiCfg = {
+  minScore: number; maxPerDay: number; autoApply: boolean; requireReview: boolean
+  autoCoverLetter: boolean; coverTone: string; useTailoredCV: boolean
+  targetRoles: string[]; targetLocations: string[]
+  excludeCompanies: string[]; priorityCompanies: string[]
+  salaryMin: number; salaryMax: number
+  throttleMs: number
+}
+
+const DEFAULT_CFG: UiCfg = {
+  minScore: 75, maxPerDay: 10, autoApply: false, requireReview: true,
+  autoCoverLetter: false, coverTone: 'professional', useTailoredCV: false,
+  targetRoles: [], targetLocations: [], excludeCompanies: [], priorityCompanies: [],
+  salaryMin: 0, salaryMax: 0,
+  throttleMs: 300,
 }
 
 function Toggle({ value, onChange, label, sub }: { value: boolean; onChange: (v: boolean) => void; label: string; sub?: string }) {
@@ -624,27 +1359,8 @@ function Toggle({ value, onChange, label, sub }: { value: boolean; onChange: (v:
         <div style={{ fontSize: 12 }}>{label}</div>
         {sub && <div style={{ fontSize: 10, color: 'var(--text-muted)', marginTop: 1 }}>{sub}</div>}
       </div>
-      <div onClick={() => onChange(!value)} style={{ width: 32, height: 18, borderRadius: 9, background: value ? '#185FA5' : 'var(--border)', cursor: 'pointer', position: 'relative', flexShrink: 0 }}>
+      <div onClick={() => onChange(!value)} style={{ width: 32, height: 18, borderRadius: 9, background: value ? 'var(--primary)' : 'var(--border)', cursor: 'pointer', position: 'relative', flexShrink: 0 }}>
         <div style={{ width: 14, height: 14, borderRadius: '50%', background: '#fff', position: 'absolute', top: 2, left: value ? 16 : 2, transition: 'left 0.2s' }} />
-      </div>
-    </div>
-  )
-}
-
-function SliderRow({ label, value, min, max, step = 1, onChange, unit = '' }: {
-  label: string; value: number; min: number; max: number; step?: number; onChange: (v: number) => void; unit?: string
-}) {
-  return (
-    <div style={{ padding: '8px 0', borderBottom: '0.5px solid var(--border)' }}>
-      <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 6 }}>
-        <span style={{ fontSize: 12 }}>{label}</span>
-        <span style={{ fontSize: 12, fontWeight: 500, color: '#185FA5' }}>{value}{unit}</span>
-      </div>
-      <input type="range" min={min} max={max} step={step} value={value} onChange={e => onChange(Number(e.target.value))}
-        style={{ width: '100%', accentColor: '#185FA5', cursor: 'pointer' }} />
-      <div style={{ display: 'flex', justifyContent: 'space-between', marginTop: 2 }}>
-        <span style={{ fontSize: 9, color: 'var(--text-muted)' }}>{min}{unit}</span>
-        <span style={{ fontSize: 9, color: 'var(--text-muted)' }}>{max}{unit}</span>
       </div>
     </div>
   )
@@ -656,9 +1372,9 @@ function PillInput({ values, onChange, placeholder }: { values: string[]; onChan
   return (
     <div style={{ display: 'flex', flexWrap: 'wrap', gap: 4, padding: '6px 0', borderBottom: '0.5px solid var(--border)' }}>
       {values.map((v, i) => (
-        <span key={i} style={{ display: 'inline-flex', alignItems: 'center', gap: 3, background: 'rgba(24,95,165,0.1)', color: '#185FA5', borderRadius: 999, padding: '1px 7px', fontSize: 10 }}>
+        <span key={i} style={{ display: 'inline-flex', alignItems: 'center', gap: 3, background: 'rgba(79,70,229,0.10)', color: 'var(--primary)', borderRadius: 999, padding: '1px 7px', fontSize: 10 }}>
           {v}
-          <button onClick={() => onChange(values.filter((_, j) => j !== i))} style={{ background: 'none', border: 'none', cursor: 'pointer', color: '#185FA5', fontSize: 10, padding: 0 }}>✕</button>
+          <button onClick={() => onChange(values.filter((_, j) => j !== i))} style={{ background: 'none', border: 'none', cursor: 'pointer', color: 'var(--primary)', fontSize: 10, padding: 0 }}>✕</button>
         </span>
       ))}
       <input value={input} onChange={e => setInput(e.target.value)}
@@ -669,122 +1385,84 @@ function PillInput({ values, onChange, placeholder }: { values: string[]; onChan
   )
 }
 
-// ── Global Settings Panel ─────────────────────────────────────────────────────
-
-type UiCfg = {
-  minScore: number; maxPerDay: number; autoApply: boolean; requireReview: boolean
-  autoCoverLetter: boolean; coverTone: string; useTailoredCV: boolean
-  targetRoles: string[]; targetLocations: string[]
-  excludeCompanies: string[]; priorityCompanies: string[]
-  salaryMin: number; salaryMax: number
-  notifyApply: boolean; notifyReject: boolean; weeklySummary: boolean
-  followUpReminder: boolean; followUpDays: number
-}
-
-const DEFAULT_CFG: UiCfg = {
-  minScore: 75, maxPerDay: 10, autoApply: false, requireReview: true,
-  autoCoverLetter: false, coverTone: 'professional', useTailoredCV: false,
-  targetRoles: [], targetLocations: [], excludeCompanies: [], priorityCompanies: [],
-  salaryMin: 0, salaryMax: 0,
-  notifyApply: true, notifyReject: true, weeklySummary: false, followUpReminder: true, followUpDays: 7,
-}
-
-function GlobalSettingsPanel({ cfg, set, onSave, onReset, saving, gridCols }: {
+function GlobalSettingsCollapsible({ cfg, set, onSave, onReset, saving }: {
   cfg: UiCfg; set: <K extends keyof UiCfg>(k: K, v: UiCfg[K]) => void
   onSave: () => void; onReset: () => void; saving: boolean
-  gridCols?: string
 }) {
-  const cols = gridCols ?? '1fr 1fr 1fr'
+  const [open, setOpen] = useState(false)
   return (
-    <Card style={{ padding: 0, overflow: 'hidden' }}>
-      <div style={{ padding: '12px 16px 4px', background: 'var(--bg-secondary)', borderBottom: '0.5px solid var(--border)' }}>
-        <span style={{ fontSize: 12, fontWeight: 500 }}>⚙ Global Pipeline Settings</span>
-      </div>
-      <div style={{ padding: '0 16px 16px', display: 'grid', gridTemplateColumns: cols, gap: '0 20px' }}>
+    <div style={{ borderTop: '0.5px solid var(--border)' }}>
+      <button
+        onClick={() => setOpen(o => !o)}
+        style={{
+          width: '100%', padding: '10px 16px', border: 'none', background: 'var(--bg-secondary)',
+          cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+          fontSize: 12, fontWeight: 500, color: 'var(--text)', fontFamily: 'inherit',
+        }}
+      >
+        <span>⚙ 全局流水线设置</span>
+        <span style={{ fontSize: 10, color: 'var(--text-muted)', transition: 'transform 0.2s', transform: open ? 'rotate(180deg)' : 'none' }}>▼</span>
+      </button>
 
-        {/* ── Col 1: Job Matching ── */}
-        <div>
-          <SectionTitle>Job Matching Rules</SectionTitle>
-          <SliderRow label="Minimum match score" value={cfg.minScore} min={40} max={100} onChange={v => set('minScore', v)} unit="%" />
-          <div style={{ padding: '8px 0', borderBottom: '0.5px solid var(--border)' }}>
-            <div style={{ fontSize: 11, color: 'var(--text-muted)', marginBottom: 4 }}>Target roles</div>
-            <PillInput values={cfg.targetRoles} onChange={v => set('targetRoles', v)} placeholder="Add role…" />
-          </div>
-          <div style={{ padding: '8px 0', borderBottom: '0.5px solid var(--border)' }}>
-            <div style={{ fontSize: 11, color: 'var(--text-muted)', marginBottom: 4 }}>Target locations</div>
-            <PillInput values={cfg.targetLocations} onChange={v => set('targetLocations', v)} placeholder="Add location…" />
-          </div>
-          <SliderRow label="Min salary" value={cfg.salaryMin} min={0} max={200000} step={5000} onChange={v => set('salaryMin', v)} unit="€" />
-          <SliderRow label="Max salary" value={cfg.salaryMax} min={0} max={200000} step={5000} onChange={v => set('salaryMax', v)} unit="€" />
-
-          <SectionTitle>Application Limits</SectionTitle>
-          <div style={{ padding: '8px 0', borderBottom: '0.5px solid var(--border)', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-            <span style={{ fontSize: 12 }}>Max applications / day</span>
-            <div style={{ display: 'flex', alignItems: 'center', gap: 5 }}>
-              <button onClick={() => set('maxPerDay', Math.max(1, cfg.maxPerDay - 1))} style={{ width: 22, height: 22, borderRadius: 4, border: '0.5px solid var(--border)', background: 'var(--bg-secondary)', cursor: 'pointer' }}>−</button>
-              <span style={{ fontSize: 12, fontWeight: 500, minWidth: 22, textAlign: 'center' }}>{cfg.maxPerDay}</span>
-              <button onClick={() => set('maxPerDay', Math.min(50, cfg.maxPerDay + 1))} style={{ width: 22, height: 22, borderRadius: 4, border: '0.5px solid var(--border)', background: 'var(--bg-secondary)', cursor: 'pointer' }}>+</button>
+      {open && (
+        <div style={{ padding: '12px 16px 16px', display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(min(100%, 240px), 1fr))', gap: '0 20px' }}>
+          <div>
+            <div style={{ fontSize: 10, fontWeight: 700, color: 'var(--text-muted)', textTransform: 'uppercase', letterSpacing: '0.07em', padding: '6px 0', borderBottom: '0.5px solid var(--border)', marginBottom: 4 }}>职位匹配规则</div>
+            <div style={{ padding: '8px 0', borderBottom: '0.5px solid var(--border)' }}>
+              <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 6 }}>
+                <span style={{ fontSize: 12 }}>最低匹配分</span>
+                <span style={{ fontSize: 12, fontWeight: 500, color: 'var(--primary)' }}>{cfg.minScore}%</span>
+              </div>
+              <input type="range" min={40} max={100} value={cfg.minScore} onChange={e => set('minScore', Number(e.target.value))}
+                style={{ width: '100%', accentColor: 'var(--primary)', cursor: 'pointer' }} />
+            </div>
+            <div style={{ padding: '8px 0', borderBottom: '0.5px solid var(--border)' }}>
+              <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 4 }}>
+                <div>
+                  <span style={{ fontSize: 12 }}>AI 调用间隔</span>
+                  <div style={{ fontSize: 10, color: 'var(--text-muted)' }}>每个职位评分之间的等待时间（避免限流）</div>
+                </div>
+                <span style={{ fontSize: 12, fontWeight: 500, color: 'var(--primary)' }}>{cfg.throttleMs}ms</span>
+              </div>
+              <input type="range" min={100} max={2000} step={100} value={cfg.throttleMs} onChange={e => set('throttleMs', Number(e.target.value))}
+                style={{ width: '100%', accentColor: 'var(--primary)', cursor: 'pointer' }} />
+              <div style={{ display: 'flex', justifyContent: 'space-between', marginTop: 2 }}>
+                <span style={{ fontSize: 9, color: 'var(--text-muted)' }}>100ms（快）</span>
+                <span style={{ fontSize: 9, color: 'var(--text-muted)' }}>2000ms（慢/安全）</span>
+              </div>
+            </div>
+            <div style={{ padding: '8px 0', borderBottom: '0.5px solid var(--border)' }}>
+              <div style={{ fontSize: 11, color: 'var(--text-muted)', marginBottom: 4 }}>目标职位</div>
+              <PillInput values={cfg.targetRoles} onChange={v => set('targetRoles', v)} placeholder="添加职位…" />
+            </div>
+            <div style={{ padding: '8px 0', borderBottom: '0.5px solid var(--border)' }}>
+              <div style={{ fontSize: 11, color: 'var(--text-muted)', marginBottom: 4 }}>目标城市</div>
+              <PillInput values={cfg.targetLocations} onChange={v => set('targetLocations', v)} placeholder="添加城市…" />
             </div>
           </div>
-          <Toggle label="Skip if already processed today" sub="Deduplication across all sources" value={true} onChange={() => {}} />
-        </div>
 
-        {/* ── Col 2: Auto-Apply + Notifications ── */}
-        <div>
-          <SectionTitle>Auto-Apply Settings</SectionTitle>
-          <Toggle label="Auto-apply when match ≥ min score" sub="Applies automatically without review"
-            value={cfg.autoApply} onChange={v => set('autoApply', v)} />
-          <Toggle label="Require manual review" sub="Jobs go to Review column before applying"
-            value={cfg.requireReview} onChange={v => set('requireReview', v)} />
-          <Toggle label="Auto-generate cover letter" sub="AI writes a tailored cover letter per job"
-            value={cfg.autoCoverLetter} onChange={v => set('autoCoverLetter', v)} />
-          {cfg.autoCoverLetter && (
-            <div style={{ padding: '8px 0', borderBottom: '0.5px solid var(--border)', display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
-              <span style={{ fontSize: 12 }}>Cover letter tone</span>
-              <select value={cfg.coverTone} onChange={e => set('coverTone', e.target.value)}
-                style={{ fontSize: 11, padding: '3px 6px', border: '0.5px solid var(--border)', borderRadius: 5, background: 'var(--bg)', color: 'var(--text)', outline: 'none' }}>
-                <option value="professional">Professional</option>
-                <option value="confident">Confident</option>
-                <option value="concise">Concise</option>
-              </select>
+          <div>
+            <div style={{ fontSize: 10, fontWeight: 700, color: 'var(--text-muted)', textTransform: 'uppercase', letterSpacing: '0.07em', padding: '6px 0', borderBottom: '0.5px solid var(--border)', marginBottom: 4 }}>自动投递设置</div>
+            <Toggle label="自动投递（匹配分≥最低分）" sub="无需审核自动投递" value={cfg.autoApply} onChange={v => set('autoApply', v)} />
+            <Toggle label="需要人工审核" sub="职位进入审核列后投递" value={cfg.requireReview} onChange={v => set('requireReview', v)} />
+            <Toggle label="自动生成求职信" sub="AI 为每个职位撰写" value={cfg.autoCoverLetter} onChange={v => set('autoCoverLetter', v)} />
+            <Toggle label="定制简历关键词" sub="记录每个职位缺失关键词" value={cfg.useTailoredCV} onChange={v => set('useTailoredCV', v)} />
+          </div>
+
+          <div>
+            <div style={{ fontSize: 10, fontWeight: 700, color: 'var(--text-muted)', textTransform: 'uppercase', letterSpacing: '0.07em', padding: '6px 0', borderBottom: '0.5px solid var(--border)', marginBottom: 4 }}>公司管理</div>
+            <div style={{ fontSize: 11, color: 'var(--text-muted)', marginBottom: 4 }}>排除公司</div>
+            <PillInput values={cfg.excludeCompanies} onChange={v => set('excludeCompanies', v)} placeholder="添加公司…" />
+            <div style={{ fontSize: 11, color: 'var(--text-muted)', margin: '8px 0 4px' }}>优先公司</div>
+            <PillInput values={cfg.priorityCompanies} onChange={v => set('priorityCompanies', v)} placeholder="添加公司…" />
+            <div style={{ marginTop: 16, display: 'flex', gap: 8 }}>
+              <Btn variant="primary" onClick={onSave} disabled={saving}>{saving ? '保存中…' : '💾 保存设置'}</Btn>
+              <Btn variant="ghost" onClick={onReset}>重置</Btn>
             </div>
-          )}
-          <Toggle label="Use tailored CV per role" sub="Logs missing keywords for each application"
-            value={cfg.useTailoredCV} onChange={v => set('useTailoredCV', v)} />
-
-          <SectionTitle>Notifications</SectionTitle>
-          <Toggle label="Notify on auto-apply"  value={cfg.notifyApply}      onChange={v => set('notifyApply', v)} />
-          <Toggle label="Notify on rejection"    value={cfg.notifyReject}     onChange={v => set('notifyReject', v)} />
-          <Toggle label="Weekly summary email"   value={cfg.weeklySummary}    onChange={v => set('weeklySummary', v)} />
-          <Toggle label="Follow-up reminders"    value={cfg.followUpReminder} onChange={v => set('followUpReminder', v)} />
-          {cfg.followUpReminder && (
-            <div style={{ padding: '8px 0', display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
-              <span style={{ fontSize: 11, color: 'var(--text-muted)' }}>Remind after (days)</span>
-              <input type="number" value={cfg.followUpDays} min={1} max={30} onChange={e => set('followUpDays', Number(e.target.value))}
-                style={{ width: 48, padding: '3px 6px', fontSize: 11, border: '0.5px solid var(--border)', borderRadius: 5, background: 'var(--bg)', color: 'var(--text)', outline: 'none' }} />
-            </div>
-          )}
-        </div>
-
-        {/* ── Col 3: Company Lists ── */}
-        <div>
-          <SectionTitle>Companies to Avoid</SectionTitle>
-          <PillInput values={cfg.excludeCompanies} onChange={v => set('excludeCompanies', v)} placeholder="Add company…" />
-
-          <SectionTitle>Priority Companies (Always Apply)</SectionTitle>
-          <PillInput values={cfg.priorityCompanies} onChange={v => set('priorityCompanies', v)} placeholder="Add company…" />
-
-          {/* Save / Reset */}
-          <div style={{ marginTop: 20, display: 'flex', gap: 8, flexDirection: 'column' }}>
-            <Btn variant="primary" onClick={onSave} disabled={saving}>
-              {saving ? 'Saving…' : '💾 Save Settings'}
-            </Btn>
-            <Btn variant="ghost" onClick={onReset}>Reset to defaults</Btn>
           </div>
         </div>
-
-      </div>
-    </Card>
+      )}
+    </div>
   )
 }
 
@@ -793,31 +1471,34 @@ function GlobalSettingsPanel({ cfg, set, onSave, onReset, saving, gridCols }: {
 export function AgentPlaygroundPage() {
   const toast = useToast()
 
-  const { data: agentData }                             = useApi<AgentConfig>('/api/agent')
-  const { data: rolesData, refetch: refetchRoles }      = useApi<AgentRole[]>('/api/agent/roles')
-  const { data: activityData }                          = useApi<Activity[]>('/api/activity?limit=10')
-  const { data: jobsData }                              = useApi<{ jobs: Array<{ status: string }> }>('/api/jobs?pageSize=100')
+  const { data: agentData }                              = useApi<AgentConfig>('/api/agent')
+  const { data: rolesData, refetch: refetchRoles }       = useApi<AgentRole[]>('/api/agent/roles')
+  const { data: jobsData }                               = useApi<{ jobs: Array<{ status: string }> }>('/api/jobs?pageSize=100')
+  const { data: customData, refetch: refetchCustom }     = useApi<CustomAgentRow[]>('/api/agent/roles/custom')
 
   const [globalRunning, setGlobalRunning] = useState(false)
   const [cfg,           setCfg]           = useState<UiCfg>(DEFAULT_CFG)
   const [saving,        setSaving]        = useState(false)
-  const [savingRoles,   setSavingRoles]   = useState<Partial<Record<RoleKey, boolean>>>({})
-
-  // Track if pipeline has ever run (for chat greeting)
+  const [savingRoles,   setSavingRoles]   = useState<Partial<Record<string, boolean>>>({})
   const [hasRun,        setHasRun]        = useState(false)
+  const [showAddModal,  setShowAddModal]  = useState(false)
+  const [applyQueue,    setApplyQueue]    = useState<ApplyReadyJob[]>([])
+  const [autonomousMode,setAutonomousMode]= useState(false)
+  const [waitingQuestion, setWaitingQuestion] = useState<{ id: string; question: string; options: QuestionOption[] } | null>(null)
 
-  // Run state
-  const [roleStatuses,  setRoleStatuses]  = useState<Record<RoleKey, RoleStatus>>(
-    () => Object.fromEntries(ROLES.map(r => [r.key, 'idle'])) as Record<RoleKey, RoleStatus>
+  // Pipeline run state
+  const [roleStatuses,  setRoleStatuses]  = useState<Record<string, RoleStatus>>(
+    () => Object.fromEntries(BUILTIN_ROLES.map(r => [r.key, 'idle'])) as Record<string, RoleStatus>
   )
-  const [currentRole,   setCurrentRole]   = useState<RoleKey | null>(null)
-  const [roleMetrics,   setRoleMetrics]   = useState<Partial<Record<RoleKey, RoleMetric>>>({})
+  const [currentRole,   setCurrentRole]   = useState<string | null>(null)
+  const [roleMetrics,   setRoleMetrics]   = useState<Partial<Record<string, RoleMetric>>>({})
+  const [currentJobs,   setCurrentJobs]   = useState<Partial<Record<string, { company: string; role: string; score?: number }>>>({})
   const [runLog,        setRunLog]        = useState<LogEntry[]>([])
   const [runDone,       setRunDone]       = useState(false)
   const [runSummary,    setRunSummary]    = useState<{ processed: number; applied: number; pending: number; skipped: number; failed: number } | null>(null)
   const esRef = useRef<EventSource | null>(null)
 
-  // Sync global config from API
+  // Sync config from API
   useEffect(() => {
     if (!agentData) return
     setGlobalRunning(agentData.isRunning)
@@ -827,6 +1508,7 @@ export function AgentPlaygroundPage() {
       maxPerDay:        agentData.dailyLimit,
       autoApply:        agentData.autoApply,
       requireReview:    agentData.requireApproval,
+      throttleMs:       (agentData as any).throttleMs       ?? 300,
       autoCoverLetter:  (agentData as any).autoCoverLetter  ?? false,
       coverTone:        (agentData as any).coverTone        ?? 'professional',
       useTailoredCV:    (agentData as any).useTailoredCV    ?? false,
@@ -834,13 +1516,6 @@ export function AgentPlaygroundPage() {
       targetLocations:  agentData.targetLocations           ?? [],
       excludeCompanies: agentData.excludeCompanies          ?? [],
       priorityCompanies:(agentData as any).priorityCompanies ?? [],
-      salaryMin:        (agentData as any).salaryMin         ?? 0,
-      salaryMax:        (agentData as any).salaryMax         ?? 0,
-      notifyApply:      (agentData as any).notifyApply       ?? true,
-      notifyReject:     (agentData as any).notifyReject      ?? true,
-      weeklySummary:    (agentData as any).weeklySummary     ?? false,
-      followUpReminder: (agentData as any).followUpReminder  ?? true,
-      followUpDays:     (agentData as any).followUpDays      ?? 7,
     }))
   }, [agentData])
 
@@ -856,53 +1531,134 @@ export function AgentPlaygroundPage() {
     setRunDone(false)
     setRunSummary(null)
     setRoleMetrics({})
+    setCurrentJobs({})
     setCurrentRole(null)
-    setRoleStatuses(Object.fromEntries(ROLES.map(r => [r.key, 'idle'])) as Record<RoleKey, RoleStatus>)
+    setApplyQueue([])
+    setRoleStatuses(Object.fromEntries(BUILTIN_ROLES.map(r => [r.key, 'idle'])) as Record<string, RoleStatus>)
 
     // Fire-and-forget: trigger job discovery before pipeline runs
     fetch('/api/agent/scout', { method: 'POST' })
       .then(r => console.log('[agent-run] Scout:', r.status === 200 ? 'queued' : r.status === 409 ? 'skipped (cooldown)' : 'error ' + r.status))
       .catch(() => console.log('[agent-run] Scout: unavailable'))
 
-    const es = new EventSource('/api/agent/run')
+    const url = `/api/agent/run${autonomousMode ? '?autonomous=true' : ''}`
+    const es  = new EventSource(url)
     esRef.current = es
 
-    // Fix #1: Clean log format — role label only once
     es.addEventListener('role_start', e => {
-      const d = JSON.parse(e.data) as { role: RoleKey; label: string; model: string; icon: string }
+      const d = JSON.parse(e.data) as { role: string; label: string; model: string; icon: string }
       setCurrentRole(d.role)
       setRoleStatuses(prev => ({ ...prev, [d.role]: 'running' }))
-      addLog({ type: 'role_start', role: d.role, message: `${d.icon} [${d.role}] ${d.label} 开始… (${d.model})`, time: new Date() })
+      addLog({ role: d.role, type: 'role_start', message: `${d.icon} [${d.role}] ${d.label} 开始… (${d.model})`, time: new Date() })
     })
 
-    // Fix #2: Consistent label format for role_done
     es.addEventListener('role_done', e => {
-      const d = JSON.parse(e.data) as { role: RoleKey; icon: string; summary: string; count: number; durationMs: number } & RoleMetric
+      const d = JSON.parse(e.data) as { role: string; icon: string; summary: string; count: number; durationMs: number } & RoleMetric
       setRoleStatuses(prev => ({ ...prev, [d.role]: 'done' }))
       setRoleMetrics(prev => ({ ...prev, [d.role]: d }))
-      addLog({ type: 'role_done', role: d.role, message: `  ✓ [${d.role}] ${d.summary} (${(d.durationMs / 1000).toFixed(1)}s)`, time: new Date() })
+      setCurrentJobs(prev => { const n = { ...prev }; delete n[d.role]; return n })
+      addLog({ role: d.role, type: 'role_done', message: `✓ ${d.summary} (${(d.durationMs / 1000).toFixed(1)}s)`, time: new Date() })
     })
 
     es.addEventListener('start', e => {
       const d = JSON.parse(e.data)
-      addLog({ type: 'start', message: `🚀 Pipeline started — ${d.total} jobs queued`, time: new Date() })
+      addLog({ type: 'start', message: `🚀 流水线启动 — ${d.total} 个职位待处理`, time: new Date() })
     })
 
     es.addEventListener('job_done', e => {
       const d = JSON.parse(e.data)
-      const applied = d.autoApplied ? ' ✓ Applied' : ''
+      // Update current job for analyst role
+      if (currentRole === 'analyst') {
+        setCurrentJobs(prev => ({ ...prev, analyst: { company: d.company, role: d.role, score: d.score } }))
+      }
+      const applied = d.autoApplied ? ' ✓ 已投递' : ''
       const kws = d.matchedKeywords?.length ? ` [${d.matchedKeywords.slice(0, 3).join(', ')}]` : ''
-      addLog({ type: 'job_done', message: `  ${d.score >= 80 ? '✦' : d.score >= 60 ? '◆' : '◇'} ${d.company} · ${d.role} — ${d.score}%${kws}${applied}`, score: d.score, time: new Date() })
+      addLog({ role: currentRole ?? 'analyst', type: 'job_done', message: `${d.score >= 80 ? '✦' : d.score >= 60 ? '◆' : '◇'} ${d.company} · ${d.role} — ${d.score}%${kws}${applied}`, score: d.score, time: new Date() })
     })
 
     es.addEventListener('job_skip', e => {
       const d = JSON.parse(e.data)
-      addLog({ type: 'job_skip', message: `  — ${d.company} · ${d.role}: ${d.reason}`, time: new Date() })
+      addLog({ role: currentRole ?? 'scout', type: 'job_skip', message: `— ${d.company} · ${d.role}: ${d.reason}`, time: new Date() })
+    })
+
+    es.addEventListener('orchestrator_thinking', e => {
+      const d = JSON.parse(e.data)
+      const modeTag = d.autonomous ? ' [自主模式]' : ''
+      addLog({ type: 'orchestrator_thinking', message: d.thinking + modeTag, time: new Date() })
+    })
+
+    // True pause question — pipeline is waiting for this answer
+    es.addEventListener('orchestrator_question', e => {
+      const d = JSON.parse(e.data) as { id: string; stage: string; question: string; options: QuestionOption[] }
+      setWaitingQuestion({ id: d.id, question: d.question, options: d.options })
+      addLog({ type: 'orchestrator_question', questionId: d.id, question: d.question, options: d.options, answered: false, message: d.question, time: new Date() })
+    })
+
+    es.addEventListener('orchestrator_answer_received', e => {
+      const d = JSON.parse(e.data)
+      setWaitingQuestion(null)
+      setRunLog(prev => prev.map(l => l.questionId === d.id ? { ...l, answered: true } : l))
+      addLog({ type: 'orchestrator_answer', message: `✓ 已回答：${d.label}`, time: new Date() })
+    })
+
+    es.addEventListener('orchestrator_plan', e => {
+      const d = JSON.parse(e.data)
+      addLog({ type: 'orchestrator_plan', message: `🧠 Orchestrator 策略：${d.plan}`, time: new Date() })
+    })
+    es.addEventListener('orchestrator_fix', e => {
+      const d = JSON.parse(e.data)
+      addLog({ role: d.stage, type: 'orchestrator_fix', message: d.message, time: new Date() })
+    })
+    es.addEventListener('orchestrator_retry', e => {
+      const d = JSON.parse(e.data)
+      addLog({ role: d.stage, type: 'orchestrator_retry', message: d.message, time: new Date() })
+    })
+    es.addEventListener('orchestrator_decision', e => {
+      const d = JSON.parse(e.data)
+      addLog({ type: 'orchestrator_decision', message: `⚖ Orchestrator 决策 [${d.stage}]：${d.reason}`, time: new Date() })
+    })
+    es.addEventListener('orchestrator_complete', e => {
+      const d = JSON.parse(e.data)
+      addLog({ type: 'orchestrator_complete', message: `🧠 ${d.message}`, time: new Date() })
+    })
+
+    es.addEventListener('apply_ready', e => {
+      const d = JSON.parse(e.data) as ApplyReadyJob
+      setApplyQueue(prev => [...prev, d])
+    })
+
+    es.addEventListener('agent_question', e => {
+      const d = JSON.parse(e.data)
+      addLog({
+        role: d.role, type: 'agent_question', message: d.question,
+        questionId: d.questionId, question: d.question, options: d.options,
+        answered: false, time: new Date(),
+      })
+    })
+
+    es.addEventListener('agent_plan', e => {
+      const d = JSON.parse(e.data)
+      addLog({ role: d.role, type: 'agent_plan', message: d.plan, time: new Date() })
+    })
+
+    es.addEventListener('agent_action', e => {
+      const d = JSON.parse(e.data)
+      addLog({ role: d.role, type: 'agent_action', message: d.action, time: new Date() })
+    })
+
+    es.addEventListener('agent_observation', e => {
+      const d = JSON.parse(e.data)
+      addLog({ role: d.role, type: 'agent_observation', message: d.observation, time: new Date() })
+    })
+
+    es.addEventListener('agent_reflect', e => {
+      const d = JSON.parse(e.data)
+      addLog({ role: d.role, type: 'agent_reflect', message: d.reflect, time: new Date() })
     })
 
     es.addEventListener('info', e => {
       const d = JSON.parse(e.data)
-      addLog({ type: 'info', message: `  ℹ ${d.message}`, time: new Date() })
+      addLog({ type: 'info', message: `ℹ ${d.message}`, time: new Date() })
     })
 
     es.addEventListener('done', e => {
@@ -910,7 +1666,8 @@ export function AgentPlaygroundPage() {
       setRunSummary(d)
       setRunDone(true)
       setCurrentRole(null)
-      addLog({ type: 'done', message: `✅ Pipeline complete — ${d.processed} scored, ${d.applied} applied, ${d.pending} pending, ${d.skipped} skipped`, time: new Date() })
+      setCurrentJobs({})
+      addLog({ type: 'done', message: `✅ 流水线完成 — ${d.processed} 个评分，${d.applied} 个投递，${d.pending} 个待审核，${d.skipped} 个跳过`, time: new Date() })
       es.close(); esRef.current = null
       refetchRoles()
       toast.success(
@@ -922,8 +1679,8 @@ export function AgentPlaygroundPage() {
     })
 
     es.addEventListener('error', e => {
-      try { const d = JSON.parse((e as MessageEvent).data ?? '{}'); addLog({ type: 'error', message: `✗ ${d.message ?? 'Pipeline error'}`, time: new Date() }) }
-      catch { addLog({ type: 'error', message: '✗ Connection lost', time: new Date() }) }
+      try { const d = JSON.parse((e as MessageEvent).data ?? '{}'); addLog({ type: 'error', message: `✗ ${d.message ?? '流水线错误'}`, time: new Date() }) }
+      catch { addLog({ type: 'error', message: '✗ 连接断开', time: new Date() }) }
       setCurrentRole(null); setRunDone(true)
       es.close(); esRef.current = null
     })
@@ -932,30 +1689,25 @@ export function AgentPlaygroundPage() {
   function stopRun() {
     esRef.current?.close(); esRef.current = null
     setCurrentRole(null); setRunDone(true)
-    addLog({ type: 'info', message: '— Stopped by user', time: new Date() })
+    addLog({ type: 'info', message: '— 用户停止运行', time: new Date() })
   }
 
   const isRunning = !!currentRole || (runLog.length > 0 && !runDone)
 
-  // ── Role model / enable change ─────────────────────────────────────────────
+  // ── Role controls ──────────────────────────────────────────────────────────
 
-  const handleModelChange = useCallback(async (role: RoleKey, provider: string, model: string) => {
+  const handleModelChange = useCallback(async (role: string, provider: string, model: string) => {
     setSavingRoles(prev => ({ ...prev, [role]: true }))
     await apiMutate(`/api/agent/roles/${role}`, 'PATCH', { provider, model })
     await refetchRoles()
     setSavingRoles(prev => ({ ...prev, [role]: false }))
-    toast.success('Model updated', `${role} → ${model}`)
+    toast.success('模型已更新', `${role} → ${model}`)
   }, [refetchRoles, toast])
 
-  const handleRoleToggle = useCallback(async (role: RoleKey, enabled: boolean) => {
+  const handleRoleToggle = useCallback(async (role: string, enabled: boolean) => {
     await apiMutate(`/api/agent/roles/${role}`, 'PATCH', { enabled })
     await refetchRoles()
-  }, [refetchRoles])
-
-  const handlePromptSave = useCallback(async (role: RoleKey, systemPrompt: string) => {
-    await apiMutate(`/api/agent/roles/${role}`, 'PATCH', { systemPrompt })
-    await refetchRoles()
-    toast.success('Instructions saved', `${role} agent will use your custom prompt`)
+    toast.info(enabled ? `${role} 已启用` : `${role} 已禁用`, '')
   }, [refetchRoles, toast])
 
   // ── Chat action handler ────────────────────────────────────────────────────
@@ -964,31 +1716,38 @@ export function AgentPlaygroundPage() {
     switch (action.type) {
       case 'start_run':
         startRun()
-        toast.info('Pipeline started', 'The orchestrator triggered a run')
+        toast.info('流水线已启动', 'Orchestrator 触发运行')
         break
+      case 'stop_run':
+        stopRun()
+        toast.info('流水线已停止', '')
+        break
+      case 'toggle_agent': {
+        const role    = action.role    as string
+        const enabled = action.enabled as boolean
+        await apiMutate(`/api/agent/roles/${role}`, 'PATCH', { enabled })
+        await refetchRoles()
+        toast.info(enabled ? `${role} 已启用` : `${role} 已禁用`, '')
+        break
+      }
       case 'update_config': {
         const field = action.field as string
         const value = action.value
         await apiMutate('/api/agent', 'PATCH', { [field]: value })
-        // Update local cfg state
-        const cfgFieldMap: Record<string, keyof UiCfg> = {
+        const cfgMap: Record<string, keyof UiCfg> = {
           minMatchScore: 'minScore', dailyLimit: 'maxPerDay',
           autoApply: 'autoApply', requireApproval: 'requireReview',
-          autoCoverLetter: 'autoCoverLetter', useTailoredCV: 'useTailoredCV',
         }
-        const uiField = cfgFieldMap[field]
+        const uiField = cfgMap[field]
         if (uiField) setCfg(c => ({ ...c, [uiField]: value }))
-        toast.success('Setting updated', `${field} → ${value}`)
+        toast.success('设置已更新', `${field} → ${value}`)
         break
       }
       case 'navigate':
-        // Signal parent to navigate (handled via window.location or router)
         if (action.path === 'jobs') window.location.href = '/?page=jobs'
         break
-      default:
-        break
     }
-  }, [toast])
+  }, [refetchRoles, toast])
 
   // ── Global config save ─────────────────────────────────────────────────────
 
@@ -1000,98 +1759,160 @@ export function AgentPlaygroundPage() {
       targetLocations: cfg.targetLocations, targetRoles: cfg.targetRoles,
       excludeCompanies: cfg.excludeCompanies, priorityCompanies: cfg.priorityCompanies,
       autoCoverLetter: cfg.autoCoverLetter, coverTone: cfg.coverTone, useTailoredCV: cfg.useTailoredCV,
-      salaryMin: cfg.salaryMin, salaryMax: cfg.salaryMax,
-      notifyApply: cfg.notifyApply, notifyReject: cfg.notifyReject, weeklySummary: cfg.weeklySummary,
-      followUpReminder: cfg.followUpReminder, followUpDays: cfg.followUpDays,
+      throttleMs: cfg.throttleMs,
     })
     setSaving(false)
-    if (error) toast.error('Error', error)
-    else       toast.success('Settings saved', 'Pipeline will use updated config')
+    if (error) toast.error('保存失败', error)
+    else       toast.success('设置已保存', '')
   }
 
   async function toggleGlobalRunning() {
     const next = !globalRunning
     setGlobalRunning(next)
     const { error } = await apiMutate('/api/agent', 'PATCH', { isRunning: next })
-    if (error) { setGlobalRunning(!next); toast.error('Error', error) }
-    else toast.info(next ? 'Agent enabled' : 'Agent paused', '')
+    if (error) { setGlobalRunning(!next); toast.error('操作失败', error) }
+    else toast.info(next ? 'Agent 已开启' : 'Agent 已暂停', '')
   }
 
-  const roles        = rolesData ?? []
+  const handleAnswerQuestion = useCallback(async (entry: LogEntry, opt: QuestionOption) => {
+    // Mark answered
+    setRunLog(prev => prev.map(l =>
+      l.questionId === entry.questionId ? { ...l, answered: true } : l
+    ))
+    // Apply action
+    if (opt.action) {
+      const { field, value } = opt.action
+      if (field === '_navigate') {
+        window.location.href = `/?page=${value}`
+        return
+      }
+      if (field === '_send_email') {
+        const emailData = JSON.parse(value as string) as { to: string; draft: string; subject: string; jobId: string }
+        await apiMutate('/api/gmail/send-draft', 'POST', emailData)
+        toast.success('邮件已发送', `拒信问询已发送至 ${emailData.to}`)
+        return
+      }
+      await apiMutate('/api/agent', 'PATCH', { [field]: value })
+      // Sync local cfg
+      const cfgMap: Record<string, keyof UiCfg> = {
+        minMatchScore: 'minScore', dailyLimit: 'maxPerDay',
+        autoApply: 'autoApply', requireApproval: 'requireReview',
+      }
+      const uiField = cfgMap[field]
+      if (uiField) setCfg(c => ({ ...c, [uiField]: value }))
+    }
+    addLog({
+      type: 'question_answered',
+      message: `✓ 你选择了「${opt.label}」${opt.action ? '，偏好已保存' : ''}`,
+      time: new Date(),
+    })
+    toast.success('偏好已记录', opt.action ? '设置已更新，下次运行生效' : '已知悉，继续运行')
+  }, [toast])
+
+  const handleDeleteCustom = useCallback(async (id: string) => {
+    const res = await fetch(`/api/agent/roles/custom/${id}`, { method: 'DELETE' })
+    if (res.ok) {
+      await refetchCustom()
+      toast.success('自定义 Agent 已删除', '')
+    } else {
+      toast.error('删除失败', '')
+    }
+  }, [refetchCustom, toast])
+
+  const roles        = rolesData   ?? []
+  const customAgents = customData  ?? []
   const savedCount   = (jobsData?.jobs ?? []).filter(j => j.status === 'saved').length
   const pendingCount = (jobsData?.jobs ?? []).filter(j => j.status === 'review').length
 
   return (
-    <div style={{ flex: 1, overflowY: 'auto', background: 'var(--bg-tertiary)', display: 'flex', flexDirection: 'column' }}>
-      <TopBar title="Agent Playground">
+    <div style={{ flex: 1, display: 'flex', flexDirection: 'column', overflow: 'hidden', background: 'var(--bg-tertiary)' }}>
+      {/* TopBar */}
+      <TopBar title="AI Agent">
         <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
-          <span style={{ width: 7, height: 7, borderRadius: '50%', background: globalRunning ? '#3B6D11' : 'var(--text-muted)' }} />
-          <span style={{ fontSize: 11, color: globalRunning ? '#3B6D11' : 'var(--text-muted)', fontWeight: 500 }}>
-            {globalRunning ? 'Enabled' : 'Paused'}
+          <span style={{ width: 7, height: 7, borderRadius: '50%', background: globalRunning ? 'var(--c-success)' : 'var(--text-muted)', boxShadow: globalRunning ? '0 0 6px var(--c-success)' : 'none' }} />
+          <span style={{ fontSize: 11, color: globalRunning ? 'var(--c-success)' : 'var(--text-muted)', fontWeight: 500 }}>
+            {globalRunning ? '运行中' : '已暂停'}
+          </span>
+        </div>
+        {/* Autonomous mode toggle */}
+        <div
+          onClick={() => setAutonomousMode(m => !m)}
+          style={{ display: 'flex', alignItems: 'center', gap: 6, cursor: 'pointer', padding: '4px 10px', borderRadius: 7, background: autonomousMode ? 'rgba(124,58,237,0.12)' : 'var(--bg-secondary)', border: `1px solid ${autonomousMode ? 'rgba(124,58,237,0.35)' : 'var(--border)'}`, transition: 'all 0.2s' }}
+          title={autonomousMode ? '自主模式：Orchestrator 自动决策，不打断你' : '交互模式：Orchestrator 遇到问题会暂停询问你'}
+        >
+          <span style={{ fontSize: 13 }}>{autonomousMode ? '🤖' : '👤'}</span>
+          <span style={{ fontSize: 11, color: autonomousMode ? '#a78bfa' : 'var(--text-muted)', fontWeight: 600 }}>
+            {autonomousMode ? '自主模式' : '交互模式'}
           </span>
         </div>
         <Btn variant={globalRunning ? 'danger' : 'primary'} onClick={toggleGlobalRunning}>
-          {globalRunning ? '⏸ Pause' : '▶ Enable'}
+          {globalRunning ? '⏸ 暂停 Agent' : '▶ 启用 Agent'}
         </Btn>
       </TopBar>
 
-      {/* Sticky Pipeline Flow Bar */}
-      <PipelineFlowBar statuses={roleStatuses} currentRole={currentRole} />
+      {/* Pipeline Monitor Bar (sticky top) */}
+      <PipelineMonitorBar
+        statuses={roleStatuses}
+        currentRole={currentRole}
+        roleMetrics={roleMetrics}
+        currentJobs={currentJobs}
+        roles={roles}
+        savingRoles={savingRoles}
+        customAgents={customAgents}
+        onModelChange={handleModelChange}
+        onToggle={handleRoleToggle}
+        onAddAgent={() => setShowAddModal(true)}
+        onDeleteCustom={handleDeleteCustom}
+      />
 
-      <div style={{ padding: 16, paddingBottom: 90, display: 'flex', flexDirection: 'column', gap: 14 }}>
-
-        {/* 6 Agent Role Cards — auto-fill responsive, min 300px per card */}
-        <div style={{ display: 'grid', gridTemplateColumns: CARDS_GRID, gap: 12 }}>
-          {ROLES.map(r => (
-            <AgentRoleCard
-              key={r.key}
-              roleInfo={r}
-              config={roles.find(c => c.role === r.key)}
-              status={roleStatuses[r.key]}
-              metrics={roleMetrics[r.key]}
-              saving={!!savingRoles[r.key]}
-              onModelChange={handleModelChange}
-              onToggle={handleRoleToggle}
-              onPromptSave={handlePromptSave}
-            />
-          ))}
-        </div>
-
-        {/* Fix #4: Live Run Log with dynamic height + CTA */}
-        <RunLogPanel
-          log={runLog} running={isRunning} done={runDone} summary={runSummary}
-          onStart={startRun} onStop={stopRun}
+      {/* Add Agent Modal */}
+      {showAddModal && (
+        <AddAgentModal
+          onClose={() => setShowAddModal(false)}
+          onCreated={async () => { await refetchCustom() }}
         />
+      )}
 
-        {/* Fix #5: Global Settings — all sections, always visible */}
-        <GlobalSettingsPanel
-          cfg={cfg} set={set} onSave={saveGlobalConfig} onReset={() => setCfg(DEFAULT_CFG)} saving={saving}
-          gridCols={SETTINGS_GRID}
+      {/* Unified Stream — Chat + Execution in one panel (like Claude) */}
+      <div style={{ flex: 1, display: 'flex', overflow: 'hidden' }}>
+        <UnifiedStream
+          log={runLog}
+          running={isRunning}
+          done={runDone}
+          summary={runSummary}
+          applyQueue={applyQueue}
+          waitingQuestion={waitingQuestion}
+          savedCount={savedCount}
+          pendingCount={pendingCount}
+          hasRun={hasRun}
+          autonomousMode={autonomousMode}
+          onStart={startRun}
+          onStop={stopRun}
+          onAnswerQuestion={handleAnswerQuestion}
+          onAnswerOrchestrator={async (questionId, answer, options) => {
+            // Post answer to DB so pipeline can continue
+            await apiMutate('/api/agent/answer', 'POST', { questionId, answer })
+            setWaitingQuestion(null)
+            setRunLog(prev => prev.map(l => l.questionId === questionId ? { ...l, answered: true } : l))
+            addLog({ type: 'user_message', message: options?.find(o => o.value === answer)?.label ?? answer, time: new Date() })
+            // Apply config action if present
+            const opt = options?.find(o => o.value === answer)
+            if (opt?.action && opt.action.field !== '_navigate') {
+              await apiMutate('/api/agent', 'PATCH', { [opt.action.field]: opt.action.value })
+            }
+          }}
+          onApplied={async (jobId, job) => {
+            await apiMutate(`/api/jobs/${jobId}/apply`, 'POST', {})
+            setApplyQueue(prev => prev.map(j => j.jobId === jobId ? { ...j, url: `_applied_${j.url}` } : j))
+            toast.success('已标记为投递', `${job.company} · ${job.role}`)
+          }}
+          onChatAction={handleChatAction}
         />
-
-        {/* Recent Activity */}
-        {activityData && activityData.length > 0 && (
-          <Card style={{ padding: 12 }}>
-            <div style={{ fontSize: 11, fontWeight: 500, marginBottom: 8, color: 'var(--text-muted)' }}>Recent Activity</div>
-            {activityData.slice(0, 8).map(a => (
-              <div key={a.id} style={{ display: 'flex', gap: 8, marginBottom: 4 }}>
-                <span style={{ fontSize: 9, color: 'var(--text-muted)', flexShrink: 0, fontVariantNumeric: 'tabular-nums', paddingTop: 1 }}>
-                  {new Date(a.createdAt).toLocaleTimeString('en', { hour: '2-digit', minute: '2-digit' })}
-                </span>
-                <span style={{ fontSize: 11, color: a.color ?? 'var(--text)', lineHeight: 1.4 }}>{a.text}</span>
-              </div>
-            ))}
-          </Card>
-        )}
-
       </div>
 
-      {/* ── Floating Orchestration Chat (fixed position, always accessible) ── */}
-      <OrchestrationChat
-        savedCount={savedCount}
-        pendingCount={pendingCount}
-        hasRun={hasRun}
-        onAction={handleChatAction}
+      {/* Bottom: Collapsible settings */}
+      <GlobalSettingsCollapsible
+        cfg={cfg} set={set} onSave={saveGlobalConfig} onReset={() => setCfg(DEFAULT_CFG)} saving={saving}
       />
     </div>
   )

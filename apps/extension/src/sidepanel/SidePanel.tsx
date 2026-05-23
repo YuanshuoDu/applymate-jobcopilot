@@ -15,53 +15,92 @@ import { ResumeView } from './ResumeView'
 import type { SavedJob, ExtensionSettings, ScrapedJob } from '@/lib/types'
 import type { FormFieldSchema } from '@/lib/form-filler/types'
 
-// ── Design tokens ─────────────────────────────────────────────────────────────
+// ── Design tokens (aligned with web app brand) ────────────────────────────────
 const C = {
-  primary:  '#185FA5',
-  green:    '#3B6D11',
-  red:      '#A32D2D',
-  amber:    '#854F0B',
-  teal:     '#0E7490',
-  bg:       '#f0f4f8',
-  card:     '#ffffff',
-  border:   '#e2e8f0',
-  text:     '#0f172a',
-  muted:    '#64748b',
-  subtle:   '#94a3b8',
+  primary:     '#4F46E5',
+  accent:      '#7C3AED',
+  green:       '#059669',
+  red:         '#DC2626',
+  amber:       '#D97706',
+  teal:        '#0891B2',
+  bg:          '#F8F9FF',
+  bgSecondary: '#F1F3FF',
+  card:        '#FFFFFF',
+  border:      'rgba(99,102,241,0.15)',
+  text:        '#0F172A',
+  muted:       '#64748B',
+  subtle:      '#94A3B8',
+  gradient:    'linear-gradient(135deg, #4F46E5 0%, #7C3AED 100%)',
 }
 
-const STATUS_OPTS = [
-  { value: 'saved',     label: '已存',   color: C.subtle  },
-  { value: 'applied',   label: '已申请', color: C.primary },
-  { value: 'review',    label: '审核中', color: C.amber   },
-  { value: 'interview', label: '面试',   color: C.teal    },
-  { value: 'offer',     label: 'Offer',  color: C.green   },
-  { value: 'rejected',  label: '已拒绝', color: C.red     },
-]
+// ── i18n — reads same key as web app from localStorage ───────────────────────
+type ExtLang = 'en' | 'de' | 'fr' | 'es' | 'nl' | 'zh'
 
-function statusColor(s: string) { return STATUS_OPTS.find(o => o.value === s)?.color ?? C.subtle }
-function statusLabel(s: string) { return STATUS_OPTS.find(o => o.value === s)?.label ?? s }
+const EXT_LABELS: Record<ExtLang, {
+  saved: string; applied: string; review: string; interview: string; offer: string; rejected: string
+  today: string; yesterday: string; daysAgo: (n: number) => string
+  jobs: string; form: string; persona: string; resume: string
+  noJobs: string; openDashboard: string; notLoggedIn: string; loginPrompt: string
+}> = {
+  en: { saved: 'Saved', applied: 'Applied', review: 'In Review', interview: 'Interview', offer: 'Offer', rejected: 'Rejected', today: 'Today', yesterday: 'Yesterday', daysAgo: n => `${n}d ago`, jobs: 'Jobs', form: 'Form Fill', persona: 'Profile', resume: 'Resume', noJobs: 'No saved jobs yet.', openDashboard: 'Open Dashboard', notLoggedIn: 'Not logged in', loginPrompt: 'Sign in to ApplyMate to use the extension.' },
+  de: { saved: 'Gespeichert', applied: 'Beworben', review: 'In Prüfung', interview: 'Gespräch', offer: 'Angebot', rejected: 'Abgelehnt', today: 'Heute', yesterday: 'Gestern', daysAgo: n => `vor ${n} Tagen`, jobs: 'Jobs', form: 'Formular', persona: 'Profil', resume: 'Lebenslauf', noJobs: 'Noch keine gespeicherten Jobs.', openDashboard: 'Dashboard öffnen', notLoggedIn: 'Nicht eingeloggt', loginPrompt: 'Melde dich bei ApplyMate an.' },
+  fr: { saved: 'Sauvegardé', applied: 'Postulé', review: 'En cours', interview: 'Entretien', offer: 'Offre', rejected: 'Refusé', today: "Aujourd'hui", yesterday: 'Hier', daysAgo: n => `il y a ${n}j`, jobs: 'Offres', form: 'Formulaire', persona: 'Profil', resume: 'CV', noJobs: "Aucune offre sauvegardée.", openDashboard: 'Ouvrir le tableau de bord', notLoggedIn: 'Non connecté', loginPrompt: 'Connectez-vous à ApplyMate.' },
+  es: { saved: 'Guardado', applied: 'Aplicado', review: 'En revisión', interview: 'Entrevista', offer: 'Oferta', rejected: 'Rechazado', today: 'Hoy', yesterday: 'Ayer', daysAgo: n => `hace ${n}d`, jobs: 'Empleos', form: 'Formulario', persona: 'Perfil', resume: 'CV', noJobs: 'No hay empleos guardados.', openDashboard: 'Abrir panel', notLoggedIn: 'No conectado', loginPrompt: 'Inicia sesión en ApplyMate.' },
+  nl: { saved: 'Opgeslagen', applied: 'Gesolliciteerd', review: 'In behandeling', interview: 'Gesprek', offer: 'Aanbod', rejected: 'Afgewezen', today: 'Vandaag', yesterday: 'Gisteren', daysAgo: n => `${n}d geleden`, jobs: 'Vacatures', form: 'Formulier', persona: 'Profiel', resume: 'CV', noJobs: 'Geen opgeslagen vacatures.', openDashboard: 'Dashboard openen', notLoggedIn: 'Niet ingelogd', loginPrompt: 'Meld je aan bij ApplyMate.' },
+  zh: { saved: '已保存', applied: '已申请', review: '审核中', interview: '面试', offer: 'Offer', rejected: '已拒绝', today: '今天', yesterday: '昨天', daysAgo: n => `${n}天前`, jobs: '职位', form: '自动填表', persona: '画像', resume: '简历', noJobs: '暂无保存的职位。', openDashboard: '打开控制台', notLoggedIn: '未登录', loginPrompt: '请登录 ApplyMate 以使用扩展。' },
+}
 
-function formatDate(iso: string): string {
+function getLang(): ExtLang {
+  try {
+    const stored = localStorage.getItem('applymate_lang') as ExtLang | null
+    if (stored && stored in EXT_LABELS) return stored
+    const browser = navigator.language?.slice(0, 2).toLowerCase()
+    if (browser in EXT_LABELS) return browser as ExtLang
+  } catch {}
+  return 'en'
+}
+
+function useExtLang() {
+  const [lang, setLang] = useState<ExtLang>(getLang)
+  useEffect(() => {
+    // Re-check every 2s in case user changes lang in web app
+    const id = setInterval(() => { const l = getLang(); setLang(l) }, 2000)
+    return () => clearInterval(id)
+  }, [])
+  return EXT_LABELS[lang]
+}
+
+function statusColor(s: string): string {
+  return { saved: C.subtle, applied: C.primary, review: C.amber, interview: C.teal, offer: C.green, rejected: C.red }[s] ?? C.subtle
+}
+
+function formatDate(iso: string, L: typeof EXT_LABELS['en']): string {
   const d    = new Date(iso)
   const now  = new Date()
   const diff = Math.floor((now.getTime() - d.getTime()) / 86400000)
-  if (diff === 0) return '今天'
-  if (diff === 1) return '昨天'
-  if (diff < 7)  return `${diff}天前`
-  return d.toLocaleDateString('zh-CN', { month: 'numeric', day: 'numeric' })
+  if (diff === 0) return L.today
+  if (diff === 1) return L.yesterday
+  if (diff < 7)  return L.daysAgo(diff)
+  return d.toLocaleDateString(undefined, { month: 'numeric', day: 'numeric' })
 }
 
 // ── Root ──────────────────────────────────────────────────────────────────────
 
 export function SidePanel() {
+  const L = useExtLang()
   const [settings, setSettings] = useState<ExtensionSettings | null>(null)
   const [activeTab, setActiveTab] = useState<'jobs' | 'form' | 'persona' | 'resume'>('jobs')
   const [personaUpdateTrigger, setPersonaUpdateTrigger] = useState(0)
   const [pendingFormFields, setPendingFormFields] = useState<FormFieldSchema[] | null>(null)
   const [lastTabUrl, setLastTabUrl] = useState('')
   const [scanTrigger, setScanTrigger] = useState(0)
-  useEffect(() => { getSettings().then(setSettings) }, [])
+  useEffect(() => {
+    getSettings().then(setSettings)
+    // Re-read settings whenever chrome.storage.sync changes (e.g. token synced from dashboard)
+    const onChange = () => { getSettings().then(setSettings) }
+    chrome.storage.onChanged.addListener(onChange)
+    return () => chrome.storage.onChanged.removeListener(onChange)
+  }, [])
 
   // Detect tab switches — reset form filler to offer re-scan on new page
   useEffect(() => {
@@ -101,71 +140,50 @@ export function SidePanel() {
   if (!settings) return <Spinner />
   if (!isLoggedIn(settings)) return <NotLoggedIn apiBase={settings.apiBaseUrl} />
 
+  const TABS: { id: 'jobs'|'form'|'resume'|'persona'; label: string }[] = [
+    { id: 'jobs',    label: L.jobs    },
+    { id: 'form',    label: L.form    },
+    { id: 'resume',  label: L.resume  },
+    { id: 'persona', label: L.persona },
+  ]
+
   return (
-    <div style={{ display: 'flex', flexDirection: 'column', height: '100vh' }}>
+    <div style={{ display: 'flex', flexDirection: 'column', height: '100vh', background: C.bg, fontFamily: '-apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif' }}>
+      {/* Header */}
+      <div style={{ padding: '10px 14px', borderBottom: `1px solid ${C.border}`, background: 'linear-gradient(135deg, rgba(79,70,229,0.04) 0%, rgba(124,58,237,0.03) 100%)', display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexShrink: 0 }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+          <div style={{ width: 26, height: 26, borderRadius: 8, background: C.gradient, display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 11, fontWeight: 800, color: '#fff', boxShadow: '0 2px 8px rgba(79,70,229,0.35)', flexShrink: 0 }}>A</div>
+          <div style={{ fontSize: 12, fontWeight: 700, background: C.gradient, WebkitBackgroundClip: 'text', WebkitTextFillColor: 'transparent' }}>ApplyMate AI</div>
+        </div>
+        <button onClick={() => chrome.tabs.create({ url: settings.apiBaseUrl })} style={{ fontSize: 11, color: C.primary, background: 'rgba(79,70,229,0.08)', border: `1px solid rgba(79,70,229,0.20)`, borderRadius: 7, padding: '4px 10px', cursor: 'pointer', fontWeight: 600, fontFamily: 'inherit' }}>
+          {L.openDashboard} ↗
+        </button>
+      </div>
+
       {/* Tab Bar */}
-      <div style={{
-        display: 'flex', borderBottom: `1px solid ${C.border}`,
-        background: C.card, flexShrink: 0,
-      }}>
-        <button
-          onClick={() => setActiveTab('jobs')}
-          style={{
-            flex: 1, padding: '10px 0', border: 'none', background: 'none',
-            fontSize: 13, fontWeight: activeTab === 'jobs' ? 700 : 500,
-            color: activeTab === 'jobs' ? C.primary : C.muted,
-            cursor: 'pointer',
-            borderBottom: activeTab === 'jobs' ? `2px solid ${C.primary}` : '2px solid transparent',
-            transition: 'all 0.15s',
-          }}
-        >
-          Jobs
-        </button>
-        <button
-          onClick={() => setActiveTab('form')}
-          style={{
-            flex: 1, padding: '10px 0', border: 'none', background: 'none',
-            fontSize: 13, fontWeight: activeTab === 'form' ? 700 : 500,
-            color: activeTab === 'form' ? C.primary : C.muted,
-            cursor: 'pointer',
-            borderBottom: activeTab === 'form' ? `2px solid ${C.primary}` : '2px solid transparent',
-            transition: 'all 0.15s',
-          }}
-        >
-          Form Filler
-        </button>
-        <button
-          onClick={() => setActiveTab('resume')}
-          style={{
-            flex: 1, padding: '10px 0', border: 'none', background: 'none',
-            fontSize: 13, fontWeight: activeTab === 'resume' ? 700 : 500,
-            color: activeTab === 'resume' ? C.primary : C.muted,
-            cursor: 'pointer',
-            borderBottom: activeTab === 'resume' ? `2px solid ${C.primary}` : '2px solid transparent',
-            transition: 'all 0.15s',
-          }}
-        >
-          Resume
-        </button>
-        <button
-          onClick={() => setActiveTab('persona')}
-          style={{
-            flex: 1, padding: '10px 0', border: 'none', background: 'none',
-            fontSize: 13, fontWeight: activeTab === 'persona' ? 700 : 500,
-            color: activeTab === 'persona' ? C.primary : C.muted,
-            cursor: 'pointer',
-            borderBottom: activeTab === 'persona' ? `2px solid ${C.primary}` : '2px solid transparent',
-            transition: 'all 0.15s',
-          }}
-        >
-          Persona
-        </button>
+      <div style={{ display: 'flex', borderBottom: `1px solid ${C.border}`, background: C.bg, flexShrink: 0 }}>
+        {TABS.map(tab => (
+          <button
+            key={tab.id}
+            onClick={() => setActiveTab(tab.id)}
+            style={{
+              flex: 1, padding: '9px 4px', border: 'none', background: 'none',
+              fontSize: 11, fontWeight: activeTab === tab.id ? 700 : 500,
+              color: activeTab === tab.id ? C.primary : C.muted,
+              cursor: 'pointer',
+              borderBottom: activeTab === tab.id ? `2px solid ${C.primary}` : '2px solid transparent',
+              transition: 'all 0.15s', fontFamily: 'inherit',
+            }}
+          >
+            {tab.label}
+          </button>
+        ))}
       </div>
 
       {/* Tab Content — all tabs kept mounted to preserve scan/fill state */}
       <div style={{ flex: 1, overflow: 'auto' }}>
         <div style={{ display: activeTab === 'jobs' ? 'block' : 'none' }}>
-          <TrackerPanel settings={settings} />
+          <TrackerPanel settings={settings} L={L} />
         </div>
         <div style={{ display: activeTab === 'form' ? 'block' : 'none' }}>
           <FormFillerView
@@ -219,6 +237,7 @@ function CurrentPageBanner({ settings, onSaved }: { settings: ExtensionSettings;
     setSaving(true)
     try {
       const res = await chrome.runtime.sendMessage({ type: 'SAVE_JOB', job: currentJob })
+        .catch(() => null) // suppress port-closed error
       if (res?.success) {
         setSavedOk(true)
         onSaved()
@@ -283,7 +302,9 @@ function CurrentPageBanner({ settings, onSaved }: { settings: ExtensionSettings;
 
 // ── Main tracker panel ────────────────────────────────────────────────────────
 
-function TrackerPanel({ settings }: { settings: ExtensionSettings }) {
+type LType = ReturnType<typeof useExtLang>
+
+function TrackerPanel({ settings, L }: { settings: ExtensionSettings; L: LType }) {
   const [jobs,         setJobs]     = useState<SavedJob[]>([])
   const [loading,      setLoading]  = useState(true)
   const [expandedId,   setExpanded]  = useState<string | null>(null)
@@ -297,6 +318,7 @@ function TrackerPanel({ settings }: { settings: ExtensionSettings }) {
 
   const loadJobs = () => {
     chrome.runtime.sendMessage({ type: 'GET_RECENT_JOBS' }, r => {
+      void chrome.runtime.lastError // suppress port-closed warning
       setJobs(r?.jobs ?? [])
       setLoading(false)
     })
@@ -447,7 +469,15 @@ function TrackerPanel({ settings }: { settings: ExtensionSettings }) {
         background: C.card, borderBottom: `1px solid ${C.border}`,
         padding: '0 10px', display: 'flex', gap: 1, overflowX: 'auto',
       }}>
-        {[{ value: 'all', label: '全部', color: '' }, ...STATUS_OPTS].map(opt => {
+        {([
+          { value: 'all', label: 'All', color: '' },
+          { value: 'saved',     label: L.saved,     color: C.subtle  },
+          { value: 'applied',   label: L.applied,   color: C.primary },
+          { value: 'review',    label: L.review,    color: C.amber   },
+          { value: 'interview', label: L.interview, color: C.teal    },
+          { value: 'offer',     label: L.offer,     color: C.green   },
+          { value: 'rejected',  label: L.rejected,  color: C.red     },
+        ]).map(opt => {
           const active = filterStatus === opt.value
           const count  = statusCounts[opt.value] ?? 0
           return (
@@ -458,12 +488,8 @@ function TrackerPanel({ settings }: { settings: ExtensionSettings }) {
               borderBottom: active ? `2px solid ${C.primary}` : '2px solid transparent',
               transition: 'all 0.1s', display: 'flex', alignItems: 'center', gap: 4,
             }}>
-              {'color' in opt && opt.color && (
-                <span style={{
-                  width: 5, height: 5, borderRadius: '50%',
-                  background: (opt as typeof STATUS_OPTS[0]).color,
-                  display: 'inline-block', flexShrink: 0,
-                }} />
+              {opt.color && (
+                <span style={{ width: 5, height: 5, borderRadius: '50%', background: opt.color, display: 'inline-block', flexShrink: 0 }} />
               )}
               {opt.label}
               {count > 0 && (
@@ -519,7 +545,7 @@ function TrackerPanel({ settings }: { settings: ExtensionSettings }) {
         {loading ? (
           <Spinner />
         ) : filtered.length === 0 ? (
-          <EmptyState filter={filterStatus} hasSearch={!!search.trim()} onClearSearch={() => setSearch('')} />
+          <EmptyState filter={filterStatus} hasSearch={!!search.trim()} onClearSearch={() => setSearch('')} L={L} />
         ) : (
           <div style={{ display: 'flex', flexDirection: 'column', gap: 7 }}>
             {filtered.map(job => (
@@ -529,10 +555,11 @@ function TrackerPanel({ settings }: { settings: ExtensionSettings }) {
                 expanded={expandedId === job.id}
                 onToggle={() => setExpanded(prev => prev === job.id ? null : job.id)}
                 settings={settings}
+                L={L}
                 onStatusChange={async (id, status) => {
                   await updateJobStatus(settings, id, status)
                   setJobs(prev => prev.map(j => j.id === id ? { ...j, status: status as SavedJob['status'] } : j))
-                  showToast(`状态已更新 → ${statusLabel(status)}`)
+                  showToast(`→ ${({ saved: L.saved, applied: L.applied, review: L.review, interview: L.interview, offer: L.offer, rejected: L.rejected })[status] ?? status}`)
                 }}
                 showToast={showToast}
               />
@@ -551,14 +578,14 @@ function TrackerPanel({ settings }: { settings: ExtensionSettings }) {
           border: `1px solid ${C.border}`, borderRadius: 7,
           fontSize: 11, cursor: 'pointer', color: C.muted, fontFamily: 'inherit',
         }}>
-          ↺ 刷新
+          ↺ Refresh
         </button>
         <button onClick={() => chrome.tabs.create({ url: settings.apiBaseUrl })} style={{
           flex: 2, padding: '7px', background: C.primary, border: 'none',
           borderRadius: 7, fontSize: 11, fontWeight: 600, cursor: 'pointer',
           color: '#fff', fontFamily: 'inherit',
         }}>
-          Dashboard 完整管理 →
+          {L.openDashboard} →
         </button>
       </div>
 
@@ -579,16 +606,17 @@ function TrackerPanel({ settings }: { settings: ExtensionSettings }) {
 
 // ── Job card (expandable) ─────────────────────────────────────────────────────
 
-function JobCard({ job, expanded, onToggle, settings, onStatusChange, showToast }: {
+function JobCard({ job, expanded, onToggle, settings, onStatusChange, showToast, L }: {
   job: SavedJob
   expanded: boolean
   onToggle: () => void
   settings: ExtensionSettings
   onStatusChange: (id: string, status: string) => void
   showToast: (msg: string) => void
+  L: LType
 }) {
   const sColor = statusColor(job.status)
-  const sLabel = statusLabel(job.status)
+  const sLabel = ({ saved: L.saved, applied: L.applied, review: L.review, interview: L.interview, offer: L.offer, rejected: L.rejected })[job.status] ?? job.status
   const [notes,      setNotes]   = useState(job.notes ?? '')
   const [notesSaving, setNSaving] = useState(false)
   const notesTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
@@ -643,7 +671,7 @@ function JobCard({ job, expanded, onToggle, settings, onStatusChange, showToast 
             </span>
             <span style={{ color: C.subtle, flexShrink: 0 }}>·</span>
             <span style={{ color: C.subtle, flexShrink: 0, fontSize: 10 }}>
-              {formatDate(job.createdAt)}
+              {formatDate(job.createdAt, L)}
             </span>
           </div>
         </div>
@@ -664,7 +692,7 @@ function JobCard({ job, expanded, onToggle, settings, onStatusChange, showToast 
               border: `1px solid rgba(24,95,165,0.2)`, borderRadius: 999,
               cursor: 'pointer', fontFamily: 'inherit', lineHeight: '18px',
             }}>
-              已申请 →
+              {L.applied} →
             </button>
           )}
           <span style={{ fontSize: 9, color: C.subtle }}>{expanded ? '▲' : '▼'}</span>
@@ -687,7 +715,14 @@ function JobCard({ job, expanded, onToggle, settings, onStatusChange, showToast 
               申请状态
             </div>
             <div style={{ display: 'flex', flexWrap: 'wrap', gap: 5 }}>
-              {STATUS_OPTS.map(opt => (
+              {([
+                { value: 'saved',     label: L.saved,     color: C.subtle  },
+                { value: 'applied',   label: L.applied,   color: C.primary },
+                { value: 'review',    label: L.review,    color: C.amber   },
+                { value: 'interview', label: L.interview, color: C.teal    },
+                { value: 'offer',     label: L.offer,     color: C.green   },
+                { value: 'rejected',  label: L.rejected,  color: C.red     },
+              ]).map(opt => (
                 <button key={opt.value} onClick={() => onStatusChange(job.id, opt.value)} style={{
                   padding: '4px 10px', borderRadius: 999,
                   border: `1.5px solid ${job.status === opt.value ? opt.color : C.border}`,
@@ -709,21 +744,17 @@ function JobCard({ job, expanded, onToggle, settings, onStatusChange, showToast 
               textTransform: 'uppercase', letterSpacing: '0.06em', marginBottom: 6,
               display: 'flex', justifyContent: 'space-between', alignItems: 'center',
             }}>
-              <span>备注</span>
+              <span>Notes</span>
               {notesSaving ? (
-                <span style={{ textTransform: 'none', fontWeight: 400, color: C.subtle, fontSize: 10 }}>
-                  保存中…
-                </span>
+                <span style={{ textTransform: 'none', fontWeight: 400, color: C.subtle, fontSize: 10 }}>Saving…</span>
               ) : notes ? (
-                <span style={{ textTransform: 'none', fontWeight: 400, color: C.green, fontSize: 10 }}>
-                  ✓ 已保存
-                </span>
+                <span style={{ textTransform: 'none', fontWeight: 400, color: C.green, fontSize: 10 }}>✓ Saved</span>
               ) : null}
             </div>
             <textarea
               value={notes}
               onChange={e => setNotes(e.target.value)}
-              placeholder="记录面试题、薪资、联系人…"
+              placeholder="Notes: interview questions, salary, contact…"
               style={{
                 width: '100%', height: 70, padding: '7px 9px', resize: 'vertical',
                 border: `1px solid ${C.border}`, borderRadius: 7, fontSize: 11,
@@ -752,7 +783,7 @@ function JobCard({ job, expanded, onToggle, settings, onStatusChange, showToast 
                 background: C.bg, border: `1px solid ${C.border}`, borderRadius: 7,
                 fontSize: 11, color: C.primary, textDecoration: 'none', fontWeight: 500,
               }}>
-                原帖 ↗
+                Original ↗
               </a>
             )}
             <a href={`${settings.apiBaseUrl}/jobs?highlight=${job.id}`} target="_blank" rel="noreferrer" style={{
@@ -760,7 +791,7 @@ function JobCard({ job, expanded, onToggle, settings, onStatusChange, showToast 
               background: C.primary, borderRadius: 7,
               fontSize: 11, fontWeight: 600, color: '#fff', textDecoration: 'none',
             }}>
-              Dashboard 完整管理 →
+              {L.openDashboard} →
             </a>
           </div>
         </div>
@@ -771,36 +802,29 @@ function JobCard({ job, expanded, onToggle, settings, onStatusChange, showToast 
 
 // ── Empty state ───────────────────────────────────────────────────────────────
 
-function EmptyState({ filter, hasSearch, onClearSearch }: {
-  filter: string; hasSearch: boolean; onClearSearch: () => void
+function EmptyState({ filter, hasSearch, onClearSearch, L }: {
+  filter: string; hasSearch: boolean; onClearSearch: () => void; L: LType
 }) {
   if (hasSearch) {
     return (
       <div style={{ textAlign: 'center', padding: '44px 16px', color: C.muted }}>
         <div style={{ fontSize: 30, marginBottom: 10 }}>🔍</div>
-        <div style={{ fontSize: 13, fontWeight: 600, color: C.text, marginBottom: 8 }}>没有匹配的职位</div>
+        <div style={{ fontSize: 13, fontWeight: 600, color: C.text, marginBottom: 8 }}>No results</div>
         <button onClick={onClearSearch} style={{
           fontSize: 11, color: C.primary, background: 'rgba(24,95,165,0.08)',
           border: `1px solid rgba(24,95,165,0.2)`, borderRadius: 6,
           cursor: 'pointer', padding: '5px 14px', fontFamily: 'inherit', fontWeight: 500,
         }}>
-          清除搜索
+          Clear search
         </button>
       </div>
     )
   }
   return (
     <div style={{ textAlign: 'center', padding: '48px 16px', color: C.muted }}>
-      <div style={{ fontSize: 32, marginBottom: 12 }}>
-        {filter === 'all' ? '📋' : '🔍'}
-      </div>
+      <div style={{ fontSize: 32, marginBottom: 12 }}>📋</div>
       <div style={{ fontSize: 13, fontWeight: 600, marginBottom: 6, color: C.text }}>
-        {filter === 'all' ? '还没有保存的职位' : `没有「${statusLabel(filter)}」的职位`}
-      </div>
-      <div style={{ fontSize: 11, lineHeight: 1.8 }}>
-        {filter === 'all'
-          ? '悬停在职位卡片上，点击 ⊕ 保存'
-          : '换个状态看看，或保存新职位'}
+        {L.noJobs}
       </div>
     </div>
   )
@@ -809,33 +833,33 @@ function EmptyState({ filter, hasSearch, onClearSearch }: {
 // ── Not logged in ─────────────────────────────────────────────────────────────
 
 function NotLoggedIn({ apiBase }: { apiBase: string }) {
+  const L = useExtLang()
   return (
     <div style={{
       display: 'flex', flexDirection: 'column', alignItems: 'center',
-      justifyContent: 'center', height: '100vh', gap: 16,
-      padding: 28, textAlign: 'center', background: C.bg,
+      justifyContent: 'center', height: '100vh', gap: 18,
+      padding: 28, textAlign: 'center',
+      background: 'linear-gradient(160deg, #F8F9FF 0%, #EEF0FF 100%)',
+      fontFamily: '-apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif',
     }}>
       <div style={{
-        width: 56, height: 56, borderRadius: 16,
-        background: `linear-gradient(135deg, ${C.primary}, #2d88d4)`,
+        width: 60, height: 60, borderRadius: 18,
+        background: C.gradient,
         display: 'flex', alignItems: 'center', justifyContent: 'center',
-        fontSize: 24, color: '#fff',
-        boxShadow: `0 6px 20px rgba(24,95,165,0.3)`,
-      }}>
-        A
-      </div>
+        fontSize: 26, fontWeight: 800, color: '#fff',
+        boxShadow: '0 8px 24px rgba(79,70,229,0.40)',
+      }}>A</div>
       <div>
-        <div style={{ fontSize: 16, fontWeight: 700, marginBottom: 8, color: C.text }}>ApplyMate AI</div>
-        <div style={{ fontSize: 12, color: C.muted, lineHeight: 1.8 }}>
-          请先在插件弹窗中登录<br />才能使用职位跟踪功能
-        </div>
+        <div style={{ fontSize: 16, fontWeight: 700, marginBottom: 6, color: C.text }}>{L.notLoggedIn}</div>
+        <div style={{ fontSize: 12, color: C.muted, lineHeight: 1.75, maxWidth: 220 }}>{L.loginPrompt}</div>
       </div>
       <a href={apiBase} target="_blank" rel="noreferrer" style={{
-        padding: '10px 28px', background: C.primary, color: '#fff',
-        borderRadius: 10, textDecoration: 'none', fontSize: 13,
-        fontWeight: 600, boxShadow: `0 4px 14px rgba(24,95,165,0.3)`,
+        padding: '10px 28px', background: C.gradient, color: '#fff',
+        borderRadius: 11, textDecoration: 'none', fontSize: 13,
+        fontWeight: 700, boxShadow: '0 4px 16px rgba(79,70,229,0.40)',
+        letterSpacing: '0.01em',
       }}>
-        打开 ApplyMate →
+        {L.openDashboard} →
       </a>
     </div>
   )
@@ -845,13 +869,13 @@ function NotLoggedIn({ apiBase }: { apiBase: string }) {
 
 function Spinner() {
   return (
-    <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', height: 160, flexDirection: 'column', gap: 10 }}>
+    <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', height: 200, flexDirection: 'column', gap: 12 }}>
       <div style={{
-        width: 22, height: 22,
-        border: `2.5px solid rgba(24,95,165,0.15)`, borderTopColor: C.primary,
-        borderRadius: '50%', animation: 'spin 0.7s linear infinite',
+        width: 28, height: 28,
+        border: `3px solid rgba(79,70,229,0.12)`, borderTopColor: C.primary,
+        borderRadius: '50%', animation: 'sp-spin 0.7s linear infinite',
       }} />
-      <style>{`@keyframes spin { to { transform: rotate(360deg) } }`}</style>
+      <style>{`@keyframes sp-spin { to { transform: rotate(360deg) } }`}</style>
     </div>
   )
 }

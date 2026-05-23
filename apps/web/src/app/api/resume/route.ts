@@ -13,7 +13,13 @@ export async function GET() {
   const resumes = await db.resume.findMany({
     where: { userId: auth.userId },
     orderBy: [{ isDefault: 'desc' }, { updatedAt: 'desc' }],
-    select: { id: true, name: true, isDefault: true, createdAt: true, updatedAt: true },
+    select: {
+      id: true, name: true, isDefault: true,
+      directionId: true, kind: true, parentResumeId: true,
+      targetJobId: true, origin: true, basicsDetached: true,
+      createdAt: true, updatedAt: true,
+      _count: { select: { finalForJobs: true } },
+    },
   })
 
   return ok(resumes)
@@ -26,8 +32,13 @@ export async function POST(req: NextRequest) {
   const body = await req.json().catch(() => null)
   if (!body) return err('Invalid JSON body')
 
-  const { name, content, templateId, isDefault } = body
+  const { name, content, templateId, isDefault, directionId, kind, origin } = body
   if (!name || !content) return err('name and content are required')
+
+  if (directionId) {
+    const dir = await db.direction.findFirst({ where: { id: directionId, userId: auth.userId } })
+    if (!dir) return err('Invalid directionId', 400)
+  }
 
   // If setting as default, unset others
   if (isDefault) {
@@ -39,11 +50,14 @@ export async function POST(req: NextRequest) {
 
   const resume = await db.resume.create({
     data: {
-      userId:     auth.userId,
+      userId:      auth.userId,
       name,
       content,
-      templateId: templateId ?? null,
-      isDefault:  isDefault  ?? false,
+      templateId:  templateId  ?? null,
+      isDefault:   isDefault   ?? false,
+      directionId: directionId ?? null,
+      kind:        kind        ?? 'base',
+      origin:      origin      ?? 'manual',
     },
   })
 

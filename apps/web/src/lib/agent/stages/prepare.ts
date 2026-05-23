@@ -13,7 +13,6 @@ import type {
 } from '../types'
 import { stageOk } from '../types'
 
-const THROTTLE_MS = 200
 
 export async function runPrepare(
   scoredJobs: ScoredJob[],
@@ -21,6 +20,7 @@ export async function runPrepare(
 ): Promise<StageResult<PrepareOutput>> {
   const t0 = Date.now()
   const { agentCfg, resumeContent, aiConfig, roleConfigs, emit } = ctx
+  const THROTTLE_MS = agentCfg.throttleMs ?? 200
   // Use writer role's configured model
   const writerCfg = roleConfigs.writer
   const effectiveAiConfig: AiConfig = writerCfg

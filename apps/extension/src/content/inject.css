@@ -169,10 +169,15 @@ article:hover > .applymate-card-btn,
 .am-src-stepstone { background: rgba(232,0,30,0.12)  !important; color: #c00019 !important; }
 .am-src-xing      { background: rgba(2,100,102,0.12) !important; color: #026466 !important; }
 .am-src-wellfound { background: rgba(0,0,0,0.07)     !important; color: #333333 !important; }
-.am-src-greenhouse{ background: rgba(59,178,115,0.12)!important; color: #3BB273 !important; }
-.am-src-lever     { background: rgba(0,90,255,0.1)   !important; color: #005AFF !important; }
-.am-src-workday   { background: rgba(245,130,31,0.12)!important; color: #d06818 !important; }
-.am-src-unknown   { background: rgba(24,95,165,0.1)  !important; color: #185FA5 !important; }
+.am-src-greenhouse     { background: rgba(59,178,115,0.12) !important; color: #3BB273 !important; }
+.am-src-lever          { background: rgba(0,90,255,0.1)   !important; color: #005AFF !important; }
+.am-src-workday        { background: rgba(245,130,31,0.12)!important; color: #d06818 !important; }
+.am-src-smartrecruiters{ background: rgba(47,128,237,0.12)!important; color: #2F80ED !important; }
+.am-src-ashby          { background: rgba(98,70,234,0.12) !important; color: #6246EA !important; }
+.am-src-bamboohr       { background: rgba(115,191,115,0.12)!important; color: #3d9a3d !important; }
+.am-src-jobvite        { background: rgba(255,76,0,0.12)  !important; color: #d43a00 !important; }
+.am-src-icims          { background: rgba(0,100,160,0.12) !important; color: #0064A0 !important; }
+.am-src-unknown        { background: rgba(24,95,165,0.1)  !important; color: #185FA5 !important; }
 
 /* ── Salary row ── */
 .am-pop-salary {

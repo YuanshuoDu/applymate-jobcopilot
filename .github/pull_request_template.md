@@ -14,16 +14,23 @@ Closes #
 |------|--------|-------|
 | Cost / EU coverage / reliability | ✅ / N/A | |
 
-## Tests
-- [ ] `pnpm --filter <app> test` — N/N pass
-- [ ] `pnpm --filter <app> tsc --noEmit` — 0 errors
+## How to Verify
+- [ ] `pnpm lint`
+- [ ] `pnpm typecheck`
+- [ ] `pnpm test`
+- [ ] `pnpm build`
 
 ## Risks / Follow-ups
 
+## Risk & Rollback
+- 
+
 ---
-**@claude Reviewer Checklist**
+**Reviewer Checklist (for @claude)**
 - [ ] All ACs satisfied
 - [ ] No scope creep (only files in issue Tech Notes)
 - [ ] Lockfile: only declared deps
 - [ ] Type-safe: no unneeded `as any`
 - [ ] Dry-run paths tested if applicable
+- [ ] No key-path regression from manual check or E2E evidence
+- [ ] Follows repository design system and dev workflow constraints

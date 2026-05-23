@@ -6,6 +6,7 @@ import { TopBar } from '@/components/layout/TopBar'
 import { Btn, Card, useToast, useConfirm, UserAvatar } from '@/components/ui'
 import type { UserProfile, UserPreferences } from '@/lib/types'
 import { useApi, apiMutate } from '@/lib/hooks'
+import { useI18n } from '@/lib/i18n'
 import {
   MODEL_CATALOGUE, PROVIDER_LABELS, FEATURE_LABELS, APPLYMATE_BACKING, APPLYMATE_LABEL,
   type Provider, type AiConfig, type FeatureId, type UserAiSettings,
@@ -29,8 +30,8 @@ const PLANS = [
 ]
 
 const CONNECTED_ACCOUNTS = [
-  { id: 'gmail',    name: 'Gmail',    icon: '✉',  color: '#A32D2D', connected: false, account: null as string | null, desc: 'AI email detection, auto-labeling & follow-up' },
-  { id: 'linkedin', name: 'LinkedIn', icon: 'in', color: '#185FA5', connected: false, account: null as string | null, desc: 'Job search + auto-apply'      },
+  { id: 'gmail',    name: 'Gmail',    icon: '✉',  color: 'var(--c-danger)', connected: false, account: null as string | null, desc: 'AI email detection, auto-labeling & follow-up' },
+  { id: 'linkedin', name: 'LinkedIn', icon: 'in', color: 'var(--primary)', connected: false, account: null as string | null, desc: 'Job search + auto-apply'      },
   { id: 'indeed',   name: 'Indeed',   icon: 'I',  color: '#003A9B', connected: false, account: null as string | null, desc: 'Job aggregation'               },
   { id: 'github',   name: 'GitHub',   icon: '⌥',  color: '#24292f', connected: false, account: null as string | null, desc: 'Pull CV data from repos'       },
 ]
@@ -40,19 +41,19 @@ const CONNECTED_ACCOUNTS = [
 function SettingsSection({ title, children }: { title: string; children: React.ReactNode }) {
   return (
     <Card style={{ overflow: 'hidden' }}>
-      <div style={{ padding: '12px 16px', borderBottom: '0.5px solid var(--border)', background: 'var(--bg-secondary)' }}>
-        <span style={{ fontSize: 12, fontWeight: 500 }}>{title}</span>
+      <div style={{ padding: '10px 16px', borderBottom: '1px solid var(--border)', background: 'var(--bg-secondary)', display: 'flex', alignItems: 'center', gap: 8 }}>
+        <span style={{ fontSize: 12, fontWeight: 600, color: 'var(--text)' }}>{title}</span>
       </div>
-      <div style={{ padding: 16 }}>{children}</div>
+      <div style={{ padding: '4px 16px 16px' }}>{children}</div>
     </Card>
   )
 }
 
 function FieldRow({ label, children }: { label: string; children: React.ReactNode }) {
   return (
-    <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '10px 0', borderBottom: '0.5px solid var(--border)' }}>
-      <span style={{ fontSize: 12, color: 'var(--text-muted)', minWidth: 140 }}>{label}</span>
-      <div style={{ flex: 1, display: 'flex', justifyContent: 'flex-end' }}>{children}</div>
+    <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12, padding: '10px 0', borderBottom: '1px solid var(--border)', flexWrap: 'wrap' }}>
+      <span style={{ fontSize: 12, color: 'var(--text-muted)', flexShrink: 0, minWidth: 130 }}>{label}</span>
+      <div style={{ display: 'flex', justifyContent: 'flex-end', flex: 1, minWidth: 0 }}>{children}</div>
     </div>
   )
 }
@@ -68,14 +69,16 @@ function Input({ value, onChange, type = 'text', placeholder, readOnly, style = 
   return (
     <input
       type={type} value={value} onChange={onChange} placeholder={placeholder} readOnly={readOnly}
-      style={{ padding: '6px 10px', fontSize: 12, border: '0.5px solid var(--border)', borderRadius: 6, background: readOnly ? 'var(--bg-secondary)' : 'var(--bg)', color: 'var(--text)', outline: 'none', width: 220, opacity: readOnly ? 0.7 : 1, ...style }}
+      style={{ padding: '7px 10px', fontSize: 12, border: '1px solid var(--border)', borderRadius: 8, background: readOnly ? 'var(--bg-secondary)' : 'var(--bg)', color: 'var(--text)', outline: 'none', width: '100%', maxWidth: 260, opacity: readOnly ? 0.65 : 1, transition: 'border-color 0.15s, box-shadow 0.15s', ...style }}
+      onFocus={e => { if (!readOnly) { e.currentTarget.style.borderColor = 'rgba(var(--primary-rgb,79,70,229),0.5)'; e.currentTarget.style.boxShadow = '0 0 0 3px rgba(var(--primary-rgb,79,70,229),0.10)' } }}
+      onBlur={e => { e.currentTarget.style.borderColor = ''; e.currentTarget.style.boxShadow = '' }}
     />
   )
 }
 
 function Toggle({ value, onChange }: { value: boolean; onChange: (v: boolean) => void }) {
   return (
-    <div onClick={() => onChange(!value)} style={{ width: 32, height: 18, borderRadius: 9, background: value ? '#185FA5' : 'var(--border)', cursor: 'pointer', position: 'relative', transition: 'background 0.2s', flexShrink: 0 }}>
+    <div onClick={() => onChange(!value)} style={{ width: 32, height: 18, borderRadius: 9, background: value ? 'var(--primary)' : 'var(--border)', cursor: 'pointer', position: 'relative', transition: 'background 0.2s', flexShrink: 0 }}>
       <div style={{ width: 14, height: 14, borderRadius: '50%', background: '#fff', position: 'absolute', top: 2, left: value ? 16 : 2, transition: 'left 0.2s' }} />
     </div>
   )
@@ -87,6 +90,7 @@ type Tab = 'profile' | 'accounts' | 'ai' | 'billing' | 'notifs' | 'privacy'
 
 export function SettingsPage() {
   const toast = useToast()
+  const { t } = useI18n()
   const [confirm, ConfirmDialog] = useConfirm()
 
   // Load user profile
@@ -157,12 +161,12 @@ export function SettingsPage() {
   const [pwSaving,     setPwSaving]     = useState(false)
 
   const TABS: { id: Tab; label: string }[] = [
-    { id: 'profile',  label: 'Profile'        },
-    { id: 'accounts', label: 'Accounts'       },
-    { id: 'ai',       label: 'AI 模型'        },
-    { id: 'billing',  label: 'Plan & Billing' },
-    { id: 'notifs',   label: 'Notifications'  },
-    { id: 'privacy',  label: 'Privacy'        },
+    { id: 'profile',  label: t('settings.profile')  },
+    { id: 'accounts', label: t('settings.accounts') },
+    { id: 'ai',       label: t('settings.ai')       },
+    { id: 'billing',  label: t('settings.billing')  },
+    { id: 'notifs',   label: t('settings.notifs')   },
+    { id: 'privacy',  label: t('settings.privacy')  },
   ]
 
   const planLabel = user?.plan === 'pro' ? 'Pro' : user?.plan === 'enterprise' ? 'Team' : 'Free'
@@ -184,35 +188,72 @@ export function SettingsPage() {
     else       toast.success('Profile saved')
   }
 
+  const TAB_ICONS: Record<Tab, string> = {
+    profile:  '👤',
+    accounts: '🔗',
+    ai:       '🤖',
+    billing:  '💳',
+    notifs:   '🔔',
+    privacy:  '🔒',
+  }
+
   return (
-    <div style={{ flex: 1, overflowY: 'auto', background: 'var(--bg-tertiary)', display: 'flex', flexDirection: 'column' }}>
+    <div style={{ flex: 1, display: 'flex', flexDirection: 'column', overflow: 'hidden', background: 'var(--bg-tertiary)' }}>
       <ConfirmDialog />
-      <TopBar title="Settings">
+      <TopBar title={t('settings.title')}>
         <Btn variant="primary" onClick={saveProfile} disabled={saving}>
-          {saving ? 'Saving…' : 'Save changes'}
+          {saving ? t('settings.saving') : t('settings.save')}
         </Btn>
       </TopBar>
 
       <div style={{ display: 'flex', flex: 1, overflow: 'hidden' }}>
-        {/* Settings sidebar tabs */}
-        <div style={{ width: 180, flexShrink: 0, background: 'var(--bg-secondary)', borderRight: '0.5px solid var(--border)', padding: '12px 8px' }}>
-          {TABS.map(t => (
-            <button key={t.id} onClick={() => setActiveTab(t.id)} style={{
-              display: 'block', width: '100%', padding: '8px 10px', borderRadius: 6, border: 'none', cursor: 'pointer', textAlign: 'left',
-              background: activeTab === t.id ? 'var(--bg)'      : 'transparent',
-              color:      activeTab === t.id ? 'var(--text)'     : 'var(--text-muted)',
-              fontWeight: activeTab === t.id ? 500               : 400,
-              fontSize: 12, marginBottom: 1,
-            }}>{t.label}</button>
-          ))}
+        {/* ── Settings sidebar ── */}
+        <div style={{
+          width: 192, flexShrink: 0,
+          background: 'var(--glass-sidebar)',
+          backdropFilter: 'blur(20px)',
+          WebkitBackdropFilter: 'blur(20px)',
+          borderRight: '1px solid var(--border)',
+          padding: '10px 8px',
+          overflowY: 'auto',
+          display: 'flex', flexDirection: 'column', gap: 2,
+        }}>
+          <div style={{ fontSize: 10, fontWeight: 700, color: 'var(--text-subtle)', letterSpacing: '0.08em', textTransform: 'uppercase', padding: '6px 10px 8px' }}>Settings</div>
+          {TABS.map(tab => {
+            const active = activeTab === tab.id
+            return (
+              <button key={tab.id} onClick={() => setActiveTab(tab.id)} style={{
+                display: 'flex', alignItems: 'center', gap: 9,
+                width: '100%', padding: '8px 10px', borderRadius: 8,
+                border: 'none', cursor: 'pointer', textAlign: 'left',
+                background: active ? 'rgba(var(--primary-rgb,79,70,229),0.10)' : 'transparent',
+                color:      active ? 'var(--primary)'    : 'var(--text-muted)',
+                fontWeight: active ? 600                  : 400,
+                fontSize: 13,
+                transition: 'all 0.14s',
+                position: 'relative',
+              }}
+                onMouseEnter={e => { if (!active) e.currentTarget.style.background = 'rgba(var(--primary-rgb,79,70,229),0.05)' }}
+                onMouseLeave={e => { if (!active) e.currentTarget.style.background = 'transparent' }}
+              >
+                {/* Active left-border indicator */}
+                {active && (
+                  <div style={{ position: 'absolute', left: 0, top: '20%', bottom: '20%', width: 3, borderRadius: '0 2px 2px 0', background: 'var(--primary)' }} />
+                )}
+                <span style={{ fontSize: 15, opacity: active ? 1 : 0.6 }}>{TAB_ICONS[tab.id]}</span>
+                <span>{tab.label}</span>
+              </button>
+            )
+          })}
         </div>
 
-        <div style={{ flex: 1, overflowY: 'auto', padding: 20, display: 'flex', flexDirection: 'column', gap: 16 }}>
+        {/* ── Content area ── */}
+        <div style={{ flex: 1, overflowY: 'auto', padding: '20px 24px', display: 'flex', flexDirection: 'column', gap: 16 }}>
 
           {/* ── Profile ── */}
           {activeTab === 'profile' && (
             <>
-              <SettingsSection title="Personal Information">
+              <SettingsSection title={t('settings.personalInfo')}>
                 {userLoading ? (
                   <div style={{ fontSize: 12, color: 'var(--text-muted)', padding: '12px 0' }}>Loading…</div>
                 ) : (
@@ -249,7 +290,7 @@ export function SettingsPage() {
                 )}
               </SettingsSection>
 
-              <SettingsSection title="Job Preferences">
+              <SettingsSection title={t('settings.jobPrefs')}>
                 <FieldRow label="Target roles">    <Input value={prefRoles}     onChange={e => setPrefRoles(e.target.value)}     placeholder="Backend Engineer, SWE" /></FieldRow>
                 <FieldRow label="Target locations"><Input value={prefLocations} onChange={e => setPrefLocations(e.target.value)} placeholder="Amsterdam, Berlin, Remote" /></FieldRow>
                 <FieldRow label="Salary expectation"><Input value={prefSalary}   onChange={e => setPrefSalary(e.target.value)}    placeholder="€65,000 – €90,000" /></FieldRow>
@@ -263,7 +304,7 @@ export function SettingsPage() {
                 <FieldRow label="Open to relocation"><Toggle value={prefRelocate} onChange={setPrefRelocate} /></FieldRow>
               </SettingsSection>
 
-              <SettingsSection title="Password">
+              <SettingsSection title={t('settings.password')}>
                 <FieldRow label="Current password">
                   <Input type="password" value={passwordCur}  onChange={e => setPasswordCur(e.target.value)}  placeholder="••••••••" />
                 </FieldRow>
@@ -289,6 +330,22 @@ export function SettingsPage() {
                   }}>{pwSaving ? 'Updating…' : 'Update password'}</Btn>
                 </div>
               </SettingsSection>
+
+              <SettingsSection title={t('settings.wizard')}>
+                <div style={{ fontSize: 12, color: 'var(--text-muted)', marginBottom: 12 }}>
+                  Re-run the onboarding setup wizard to update your goals, profile, job directions, and resume preferences.
+                </div>
+                <Btn variant="ghost" onClick={async () => {
+                  const { error } = await apiMutate('/api/me/onboarding', 'PATCH', { reset: true })
+                  if (!error) {
+                    toast.success('Onboarding reset', 'Reload the page to restart the setup wizard')
+                  } else {
+                    toast.error('Failed', error)
+                  }
+                }}>
+                  ↺ Restart Setup Wizard
+                </Btn>
+              </SettingsSection>
             </>
           )}
 
@@ -297,7 +354,8 @@ export function SettingsPage() {
 
           {/* ── Accounts ── */}
           {activeTab === 'accounts' && (
-            <SettingsSection title="Connected Accounts">
+            <>
+            <SettingsSection title={t('settings.connAccounts')}>
               <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
                 {accounts.map(acc => {
                   const isGmail = acc.id === 'gmail'
@@ -311,7 +369,7 @@ export function SettingsPage() {
                         <div style={{ fontSize: 12, fontWeight: 500, display: 'flex', alignItems: 'center', gap: 6 }}>
                           {acc.name}
                           {gmailNeedsFix && (
-                            <span style={{ fontSize: 9, background: 'rgba(163,45,45,0.12)', color: '#A32D2D', borderRadius: 999, padding: '1px 6px' }}>Needs fix</span>
+                            <span style={{ fontSize: 9, background: 'rgba(220,38,38,0.12)', color: 'var(--c-danger)', borderRadius: 999, padding: '1px 6px' }}>Needs fix</span>
                           )}
                         </div>
                         <div style={{ fontSize: 10, color: 'var(--text-muted)' }}>
@@ -322,7 +380,7 @@ export function SettingsPage() {
                             : acc.desc}
                         </div>
                         {gmailNeedsFix && gmailHealth.gmailError && (
-                          <div style={{ fontSize: 9, color: '#A32D2D', marginTop: 4, wordBreak: 'break-all', opacity: 0.7 }}>
+                          <div style={{ fontSize: 9, color: 'var(--c-danger)', marginTop: 4, wordBreak: 'break-all', opacity: 0.7 }}>
                             {gmailHealth.gmailError}
                           </div>
                         )}
@@ -338,7 +396,7 @@ export function SettingsPage() {
                               }).then(() => signIn('google', { callbackUrl: window.location.origin + '/?page=settings' }))
                             }}>Fix Gmail Access</Btn>
                           ) : (
-                            <span style={{ fontSize: 10, color: '#3B6D11', background: 'rgba(59,109,17,0.12)', borderRadius: 999, padding: '2px 8px' }}>● Connected</span>
+                            <span style={{ fontSize: 10, color: 'var(--c-success)', background: 'rgba(5,150,105,0.12)', borderRadius: 999, padding: '2px 8px' }}>● Connected</span>
                           )}
                           <Btn small variant="danger" onClick={async () => {
                             if (isGmail) {
@@ -375,12 +433,53 @@ export function SettingsPage() {
                 })}
               </div>
             </SettingsSection>
+
+            {/* ── Chrome Extension ── */}
+            <SettingsSection title="Chrome 扩展">
+              <div style={{ display: 'flex', alignItems: 'center', gap: 14, padding: 14, background: 'var(--bg-secondary)', borderRadius: 10, border: '0.5px solid var(--border)', marginTop: 4 }}>
+                {/* Chrome puzzle icon */}
+                <div style={{ width: 36, height: 36, borderRadius: 8, background: 'rgba(79,70,229,0.12)', color: 'var(--primary)', display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0 }}>
+                  <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                    <path d="M20.24 12.24a6 6 0 0 0-8.49-8.49L5 10.5V19h8.5z"/><line x1="16" y1="8" x2="2" y2="22"/><line x1="17.5" y1="15" x2="9" y2="15"/>
+                  </svg>
+                </div>
+                <div style={{ flex: 1 }}>
+                  <div style={{ fontSize: 12, fontWeight: 500, color: 'var(--text)', marginBottom: 2 }}>ApplyMate AI for Chrome</div>
+                  <div style={{ fontSize: 10, color: 'var(--text-muted)', lineHeight: 1.5 }}>在 LinkedIn、Indeed 等求职网站上一键保存职位、自动填表、查看简历匹配分</div>
+                </div>
+                <div style={{ display: 'flex', flexDirection: 'column', gap: 6, alignItems: 'flex-end', flexShrink: 0 }}>
+                  <a
+                    href="https://chrome.google.com/webstore"
+                    target="_blank"
+                    rel="noreferrer"
+                    style={{
+                      display: 'inline-flex', alignItems: 'center', gap: 5,
+                      padding: '5px 12px', borderRadius: 7, fontSize: 11, fontWeight: 600,
+                      background: 'var(--primary)', color: '#fff', textDecoration: 'none',
+                      whiteSpace: 'nowrap',
+                    }}
+                  >
+                    <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+                    安装扩展
+                  </a>
+                  <a
+                    href="https://github.com/YuanshuoDu/applymate-jobcopilot"
+                    target="_blank"
+                    rel="noreferrer"
+                    style={{ fontSize: 10, color: 'var(--text-muted)', textDecoration: 'none' }}
+                  >
+                    查看使用说明 →
+                  </a>
+                </div>
+              </div>
+            </SettingsSection>
+            </>
           )}
 
           {/* ── Billing ── */}
           {activeTab === 'billing' && (
             <>
-              <SettingsSection title="Current Plan">
+              <SettingsSection title={t('settings.currentPlan')}>
                 <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginBottom: 16 }}>
                   <div>
                     <div style={{ fontSize: 14, fontWeight: 500 }}>{planLabel} Plan</div>
@@ -388,19 +487,19 @@ export function SettingsPage() {
                       {user?.plan === 'free' ? 'Free forever' : 'Renews monthly'}
                     </div>
                   </div>
-                  <span style={{ marginLeft: 'auto', fontSize: 10, background: 'rgba(24,95,165,0.12)', color: '#185FA5', borderRadius: 999, padding: '3px 10px', fontWeight: 500 }}>Active</span>
+                  <span style={{ marginLeft: 'auto', fontSize: 10, background: 'rgba(79,70,229,0.12)', color: 'var(--primary)', borderRadius: 999, padding: '3px 10px', fontWeight: 500 }}>Active</span>
                 </div>
                 <Btn variant="ghost" onClick={() => toast.info('Opening billing portal')}>Manage billing →</Btn>
               </SettingsSection>
 
-              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3,1fr)', gap: 12 }}>
+              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(min(100%, 200px), 1fr))', gap: 12 }}>
                 {PLANS.map(plan => {
                   const isCurrent = (user?.plan ?? 'free') === plan.id
                   return (
-                    <Card key={plan.id} style={{ padding: 16, border: isCurrent ? '1.5px solid #185FA5' : '0.5px solid var(--border)', background: isCurrent ? 'rgba(24,95,165,0.03)' : 'var(--bg)' }}>
+                    <Card key={plan.id} style={{ padding: 16, border: isCurrent ? '1.5px solid var(--primary)' : '0.5px solid var(--border)', background: isCurrent ? 'rgba(79,70,229,0.03)' : 'var(--bg)' }}>
                       <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 12 }}>
                         <span style={{ fontSize: 13, fontWeight: 500 }}>{plan.name}</span>
-                        {isCurrent && <span style={{ fontSize: 10, background: 'rgba(24,95,165,0.12)', color: '#185FA5', borderRadius: 999, padding: '2px 7px' }}>Current</span>}
+                        {isCurrent && <span style={{ fontSize: 10, background: 'rgba(79,70,229,0.12)', color: 'var(--primary)', borderRadius: 999, padding: '2px 7px' }}>Current</span>}
                       </div>
                       <div style={{ marginBottom: 12 }}>
                         <span style={{ fontSize: 22, fontWeight: 500 }}>{plan.price}</span>
@@ -409,7 +508,7 @@ export function SettingsPage() {
                       <div style={{ display: 'flex', flexDirection: 'column', gap: 5, marginBottom: 14 }}>
                         {plan.features.map(f => (
                           <div key={f} style={{ display: 'flex', gap: 6, fontSize: 11, color: 'var(--text-muted)' }}>
-                            <span style={{ color: '#3B6D11', flexShrink: 0 }}>✓</span>{f}
+                            <span style={{ color: 'var(--c-success)', flexShrink: 0 }}>✓</span>{f}
                           </div>
                         ))}
                       </div>
@@ -426,7 +525,7 @@ export function SettingsPage() {
 
           {/* ── Notifications ── */}
           {activeTab === 'notifs' && (
-            <SettingsSection title="Notification Preferences">
+            <SettingsSection title={t('settings.notifPrefs')}>
               {([
                 { key: 'apply',     label: 'Auto-apply confirmation', sub: 'When agent submits an application' },
                 { key: 'reject',    label: 'Rejection notifications',  sub: 'When you receive a rejection'     },
@@ -449,7 +548,7 @@ export function SettingsPage() {
           {/* ── Privacy ── */}
           {activeTab === 'privacy' && (
             <>
-              <SettingsSection title="Data & Privacy">
+              <SettingsSection title={t('settings.dataPrivacy')}>
                 {[
                   { label: 'Share anonymous usage data',          sub: 'Helps us improve ApplyMate',         value: true  },
                   { label: 'Allow AI training on your CVs',       sub: 'Your data is always anonymised',     value: false },
@@ -470,7 +569,7 @@ export function SettingsPage() {
               </SettingsSection>
 
               <Card style={{ padding: 16, border: '0.5px solid rgba(163,45,45,0.3)', background: 'rgba(163,45,45,0.03)' }}>
-                <div style={{ fontSize: 12, fontWeight: 500, color: '#A32D2D', marginBottom: 8 }}>Danger Zone</div>
+                <div style={{ fontSize: 12, fontWeight: 500, color: 'var(--c-danger)', marginBottom: 8 }}>Danger Zone</div>
                 <div style={{ fontSize: 11, color: 'var(--text-muted)', marginBottom: 12 }}>
                   Once you delete your account, there is no going back. All your data — jobs, resumes, cover letters, settings — will be permanently removed.
                 </div>
@@ -526,7 +625,7 @@ export function SettingsPage() {
 
 // ── AI Model Settings ─────────────────────────────────────────────────────────
 
-const TIER_COLOR = { fast: '#854F0B', standard: '#185FA5', premium: '#5B3DC8' }
+const TIER_COLOR = { fast: 'var(--c-warning)', standard: 'var(--primary)', premium: '#5B3DC8' }
 const TIER_LABEL = { fast: '快速', standard: '标准', premium: '旗舰' }
 
 const KEY_HINTS: Partial<Record<Provider, { href: string }>> = {
@@ -546,6 +645,7 @@ type TestStatus = 'idle' | 'testing' | 'ok' | { error: string }
 
 function AiModelSettings() {
   const toast = useToast()
+  const { t } = useI18n()
   const [settings,  setSettings ] = useState<UserAiSettings>({ keys: {}, features: {} })
   const [draftKeys, setDraftKeys] = useState<Partial<Record<Provider, string>>>({})
   const [saving,    setSaving   ] = useState(false)
@@ -565,7 +665,7 @@ function AiModelSettings() {
 
   async function testKey(p: Provider) {
     const key = draftKeys[p] || settings.keys?.[p] || ''
-    if (!key || key.startsWith('••••')) { toast.info('请先填写 API Key'); return }
+    if (!key || key.startsWith('••••')) { toast.info(t('settings.ai.fillKey')); return }
 
     setKeyTests(prev => ({ ...prev, [p]: 'testing' }))
     const model = MODEL_CATALOGUE.find(m => m.provider === p)
@@ -576,9 +676,9 @@ function AiModelSettings() {
         body: JSON.stringify({ provider: p, model: model?.model, apiKey: key }),
       })
       const data = await res.json()
-      setKeyTests(prev => ({ ...prev, [p]: data.ok ? 'ok' : { error: data.error ?? '连接失败' } }))
+      setKeyTests(prev => ({ ...prev, [p]: data.ok ? 'ok' : { error: data.error ?? t('settings.ai.connFail') } }))
     } catch {
-      setKeyTests(prev => ({ ...prev, [p]: { error: '网络错误' } }))
+      setKeyTests(prev => ({ ...prev, [p]: { error: t('settings.ai.netErr') } }))
     }
   }
 
@@ -590,34 +690,34 @@ function AiModelSettings() {
     }
     const { error } = await apiMutate('/api/me/ai-config', 'POST', body)
     setSaving(false)
-    if (error) toast.error('保存失败', error)
-    else { toast.success('AI 设置已更新'); setDraftKeys({}); setKeyTests({}) }
+    if (error) toast.error(t('settings.ai.saveFail'), error)
+    else { toast.success(t('settings.ai.saveOk')); setDraftKeys({}); setKeyTests({}) }
   }
 
-  if (!loaded) return <div style={{ padding: 24, color: 'var(--text-muted)', fontSize: 13 }}>加载中…</div>
+  if (!loaded) return <div style={{ padding: 24, color: 'var(--text-muted)', fontSize: 13 }}>{t('settings.ai.loading')}</div>
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 20 }}>
 
       {/* ── ApplyMate 说明卡 ── */}
-      <div style={{ padding: '14px 16px', background: 'linear-gradient(135deg,rgba(24,95,165,0.08),rgba(91,61,200,0.06))', border: '1px solid rgba(24,95,165,0.2)', borderRadius: 12 }}>
+      <div style={{ padding: '14px 16px', background: 'linear-gradient(135deg,rgba(79,70,229,0.08),rgba(91,61,200,0.06))', border: '1px solid rgba(79,70,229,0.20)', borderRadius: 12 }}>
         <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 6 }}>
           <span style={{ fontSize: 20 }}>✦</span>
           <span style={{ fontSize: 14, fontWeight: 700, color: 'var(--text)' }}>{APPLYMATE_LABEL}</span>
-          <span style={{ fontSize: 10, background: '#185FA514', color: '#185FA5', border: '0.5px solid #185FA530', borderRadius: 999, padding: '1px 8px', fontWeight: 600 }}>默认</span>
+          <span style={{ fontSize: 10, background: 'rgba(79,70,229,0.08)', color: 'var(--primary)', border: '0.5px solid rgba(79,70,229,0.18)', borderRadius: 999, padding: '1px 8px', fontWeight: 600 }}>{t('settings.ai.badge')}</span>
         </div>
         <div style={{ fontSize: 12, color: 'var(--text-muted)', lineHeight: 1.6 }}>
-          平台内置模型，无需填写 API Key，开箱即用。当前由 <strong style={{ color: 'var(--text)' }}>MiniMax M2.7</strong> 提供支持，适合所有功能的日常使用。
+          {t('settings.ai.desc')}
         </div>
         <div style={{ marginTop: 8, fontSize: 11, color: 'var(--text-muted)' }}>
-          底层模型：{APPLYMATE_BACKING.provider} / {APPLYMATE_BACKING.model}
+          {t('settings.ai.underlying')}{APPLYMATE_BACKING.provider} / {APPLYMATE_BACKING.model}
         </div>
       </div>
 
       {/* ── 分功能模型控制 ── */}
-      <SettingsSection title="各功能模型设置">
+      <SettingsSection title={t('settings.ai.featuresTitle')}>
         <div style={{ fontSize: 11, color: 'var(--text-muted)', marginBottom: 14, lineHeight: 1.6 }}>
-          默认所有功能使用 {APPLYMATE_LABEL}。可为每个功能单独指定模型（需先在下方添加对应 API Key）。
+          {t('settings.ai.featuresDesc').replace('ApplyMate AI', APPLYMATE_LABEL)}
         </div>
         <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
           {FEATURE_IDS.map(id => {
@@ -626,10 +726,10 @@ function AiModelSettings() {
             return (
               <div key={id} style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '10px 12px', background: 'var(--bg-secondary)', borderRadius: 8, border: '0.5px solid var(--border)' }}>
                 <div style={{ flex: 1, minWidth: 0 }}>
-                  <div style={{ fontSize: 12, fontWeight: 500, color: 'var(--text)' }}>{FEATURE_LABELS[id]}</div>
+                  <div style={{ fontSize: 12, fontWeight: 500, color: 'var(--text)' }}>{t(`feature.${id}`)}</div>
                   <div style={{ fontSize: 10, color: 'var(--text-muted)', marginTop: 2 }}>
                     {isDefault
-                      ? `✦ ${APPLYMATE_LABEL}（默认）`
+                      ? `✦ ${APPLYMATE_LABEL} ${t('settings.ai.defaultLabel')}`
                       : `${PROVIDER_LABELS[current!.provider]} · ${current!.model}`
                     }
                   </div>
@@ -642,9 +742,9 @@ function AiModelSettings() {
       </SettingsSection>
 
       {/* ── 提供商 API Key ── */}
-      <SettingsSection title="自定义 API Key（可选）">
+      <SettingsSection title={t('settings.ai.keysTitle')}>
         <div style={{ fontSize: 11, color: 'var(--text-muted)', marginBottom: 14, lineHeight: 1.6 }}>
-          填入各提供商的 API Key 后，选择该提供商模型时将优先使用你的 Key，账单记在你的账户。留空则使用平台共享额度。
+          {t('settings.ai.keysDesc')}
         </div>
         <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
           {PROVIDERS_WITH_MODELS.filter(p => p !== 'custom').map(p => {
@@ -659,17 +759,17 @@ function AiModelSettings() {
                   <span style={{ fontSize: 12, fontWeight: 500, color: 'var(--text)', flex: 1 }}>{PROVIDER_LABELS[p]}</span>
                   {/* Status badge */}
                   {status === 'testing' && (
-                    <span style={{ fontSize: 10, color: 'var(--text-muted)' }}>测试中…</span>
+                    <span style={{ fontSize: 10, color: 'var(--text-muted)' }}>{t('settings.ai.testing')}</span>
                   )}
                   {status === 'ok' && (
-                    <span style={{ fontSize: 10, color: '#3B6D11', background: 'rgba(59,109,17,0.1)', borderRadius: 999, padding: '2px 8px' }}>✓ 连接正常</span>
+                    <span style={{ fontSize: 10, color: 'var(--c-success)', background: 'rgba(5,150,105,0.10)', borderRadius: 999, padding: '2px 8px' }}>{t('settings.ai.connected')}</span>
                   )}
                   {typeof status === 'object' && (
-                    <span style={{ fontSize: 10, color: '#A32D2D', background: 'rgba(163,45,45,0.1)', borderRadius: 999, padding: '2px 8px' }} title={status.error}>✗ {status.error.slice(0, 40)}</span>
+                    <span style={{ fontSize: 10, color: 'var(--c-danger)', background: 'rgba(220,38,38,0.10)', borderRadius: 999, padding: '2px 8px' }} title={status.error}>✗ {status.error.slice(0, 40)}</span>
                   )}
                   {hint && (
                     <a href={hint.href} target="_blank" rel="noreferrer" style={{ fontSize: 10, color: 'var(--primary)' }}>
-                      获取 Key ↗
+                      {t('settings.ai.getKey')}
                     </a>
                   )}
                 </div>
@@ -681,14 +781,14 @@ function AiModelSettings() {
                       setDraftKeys(prev => ({ ...prev, [p]: e.target.value }))
                       setKeyTests(prev => ({ ...prev, [p]: 'idle' }))
                     }}
-                    placeholder={existing ? '已保存（输入新值可覆盖）' : `${PROVIDER_LABELS[p]} API Key`}
+                    placeholder={existing ? t('settings.ai.saved') : `${PROVIDER_LABELS[p]} API Key`}
                     style={{ flex: 1, padding: '8px 10px', border: '1px solid var(--border)', borderRadius: 7, fontSize: 12, color: 'var(--text)', background: 'var(--bg)', outline: 'none' }}
                   />
                   <button
                     onClick={() => testKey(p)}
                     disabled={status === 'testing' || (!display || display.startsWith('••••'))}
                     style={{ padding: '0 14px', fontSize: 11, borderRadius: 7, border: '0.5px solid var(--border)', background: 'var(--bg-secondary)', color: 'var(--text)', cursor: 'pointer', whiteSpace: 'nowrap', opacity: (!display || display.startsWith('••••')) ? 0.4 : 1 }}>
-                    测试
+                    {t('settings.ai.testBtn')}
                   </button>
                 </div>
               </div>
@@ -698,7 +798,7 @@ function AiModelSettings() {
       </SettingsSection>
 
       <Btn variant="primary" onClick={save} disabled={saving}>
-        {saving ? '保存中…' : '保存 AI 设置'}
+        {saving ? t('settings.ai.saving') : t('settings.ai.saveBtn')}
       </Btn>
     </div>
   )
@@ -708,6 +808,7 @@ function FeatureModelPicker({ value, onChange }: {
   value:    AiConfig | null
   onChange: (cfg: AiConfig | null) => void
 }) {
+  const { t } = useI18n()
   const [open, setOpen] = useState(false)
   const isDefault = value === null
 
@@ -715,7 +816,7 @@ function FeatureModelPicker({ value, onChange }: {
     <div style={{ position: 'relative' }}>
       <button
         onClick={() => setOpen(v => !v)}
-        style={{ fontSize: 11, padding: '4px 10px', borderRadius: 6, border: '0.5px solid var(--border)', background: isDefault ? 'rgba(24,95,165,0.06)' : 'var(--bg)', color: isDefault ? '#185FA5' : 'var(--text)', cursor: 'pointer', whiteSpace: 'nowrap' }}>
+        style={{ fontSize: 11, padding: '4px 10px', borderRadius: 6, border: '0.5px solid var(--border)', background: isDefault ? 'rgba(79,70,229,0.06)' : 'var(--bg)', color: isDefault ? 'var(--primary)' : 'var(--text)', cursor: 'pointer', whiteSpace: 'nowrap' }}>
         {isDefault ? `✦ ${APPLYMATE_LABEL} ▾` : `${value!.model.split('-').slice(-1)[0]} ▾`}
       </button>
 
@@ -723,25 +824,25 @@ function FeatureModelPicker({ value, onChange }: {
         <>
           <div style={{ position: 'fixed', inset: 0, zIndex: 49 }} onClick={() => setOpen(false)} />
           <div style={{ position: 'absolute', right: 0, top: '110%', zIndex: 50, background: 'var(--bg)', border: '0.5px solid var(--border)', borderRadius: 10, boxShadow: '0 8px 32px rgba(0,0,0,0.14)', minWidth: 280, maxHeight: 400, overflowY: 'auto' }}>
-            <div style={{ padding: '6px 10px', fontSize: 9, fontWeight: 700, color: 'var(--text-muted)', borderBottom: '0.5px solid var(--border)', letterSpacing: 1 }}>选择模型</div>
+            <div style={{ padding: '6px 10px', fontSize: 9, fontWeight: 700, color: 'var(--text-muted)', borderBottom: '0.5px solid var(--border)', letterSpacing: 1 }}>{t('settings.ai.pickModel').toUpperCase()}</div>
 
             {/* ── ApplyMate default ── */}
             <button onClick={() => { onChange(null); setOpen(false) }} style={{
               display: 'flex', alignItems: 'center', gap: 8, width: '100%', padding: '10px 12px',
-              background: isDefault ? 'rgba(24,95,165,0.06)' : 'none', border: 'none', cursor: 'pointer', textAlign: 'left',
+              background: isDefault ? 'rgba(79,70,229,0.06)' : 'none', border: 'none', cursor: 'pointer', textAlign: 'left',
             }}>
               <span style={{ fontSize: 14 }}>✦</span>
               <div>
                 <div style={{ fontSize: 12, fontWeight: 600, color: 'var(--text)' }}>{APPLYMATE_LABEL}</div>
-                <div style={{ fontSize: 10, color: 'var(--text-muted)' }}>平台默认 · 无需 Key</div>
+                <div style={{ fontSize: 10, color: 'var(--text-muted)' }}>{t('settings.ai.platformDefault')}</div>
               </div>
-              {isDefault && <span style={{ marginLeft: 'auto', fontSize: 10, color: '#185FA5' }}>✓</span>}
+              {isDefault && <span style={{ marginLeft: 'auto', fontSize: 10, color: 'var(--primary)' }}>✓</span>}
             </button>
 
             <div style={{ height: 1, background: 'var(--border)', margin: '2px 0' }} />
 
-            {/* ── 推荐模型 ── */}
-            <div style={{ padding: '5px 12px 3px', fontSize: 9, fontWeight: 700, color: '#185FA5', letterSpacing: 1 }}>★ 推荐</div>
+            {/* ── Recommended ── */}
+            <div style={{ padding: '5px 12px 3px', fontSize: 9, fontWeight: 700, color: 'var(--primary)', letterSpacing: 1 }}>{t('settings.ai.recommended').toUpperCase()}</div>
             {RECOMMENDED_MODELS.map(m => {
               const active = !isDefault && value?.provider === m.provider && value?.model === m.model
               return (
@@ -778,14 +879,14 @@ function ModelOption({ m, active, onSelect }: {
   return (
     <button onClick={onSelect} style={{
       display: 'flex', alignItems: 'center', gap: 8, width: '100%', padding: '8px 12px',
-      background: active ? 'rgba(24,95,165,0.06)' : 'none', border: 'none', cursor: 'pointer', textAlign: 'left',
+      background: active ? 'rgba(79,70,229,0.06)' : 'none', border: 'none', cursor: 'pointer', textAlign: 'left',
     }}>
       <div style={{ flex: 1 }}>
         <div style={{ fontSize: 12, color: 'var(--text)' }}>{m.label}</div>
         <div style={{ fontSize: 10, color: 'var(--text-muted)' }}>{m.description}</div>
       </div>
       <span style={{ fontSize: 10, color: TIER_COLOR[m.tier], background: `${TIER_COLOR[m.tier]}14`, borderRadius: 999, padding: '1px 6px', flexShrink: 0 }}>{TIER_LABEL[m.tier]}</span>
-      {active && <span style={{ fontSize: 10, color: '#185FA5', marginLeft: 4 }}>✓</span>}
+      {active && <span style={{ fontSize: 10, color: 'var(--primary)', marginLeft: 4 }}>✓</span>}
     </button>
   )
 }

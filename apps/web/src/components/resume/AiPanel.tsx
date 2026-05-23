@@ -12,7 +12,7 @@ function SectionHeader({ label, count, collapsed, onToggle }: {
       <span style={{ fontSize: 10, fontWeight: 500, color: 'var(--text-muted)' }}>
         {label}
         {count !== undefined && count > 0 && (
-          <span style={{ marginLeft: 5, background: 'rgba(24,95,165,0.12)', color: '#185FA5', borderRadius: 999, padding: '1px 6px', fontSize: 9, fontWeight: 600 }}>{count}</span>
+          <span style={{ marginLeft: 5, background: 'rgba(79,70,229,0.12)', color: 'var(--primary)', borderRadius: 999, padding: '1px 6px', fontSize: 9, fontWeight: 600 }}>{count}</span>
         )}
       </span>
       <span style={{ fontSize: 9, color: 'var(--text-muted)' }}>{collapsed ? '▶' : '▼'}</span>
@@ -68,7 +68,7 @@ export function AiPanel({ selectedJob, scoreResult, suggestions, scoring, sugges
     <div style={{ width: 280, flexShrink: 0, borderLeft: '0.5px solid var(--border)', background: 'var(--bg-secondary)', overflowY: 'auto', padding: 14, display: 'flex', flexDirection: 'column', gap: 14 }}>
 
       {/* Job context + score */}
-      <div style={{ background: 'rgba(24,95,165,0.06)', border: '0.5px solid rgba(24,95,165,0.2)', borderRadius: 7, padding: 10 }}>
+      <div style={{ background: 'rgba(79,70,229,0.06)', border: '0.5px solid rgba(79,70,229,0.20)', borderRadius: 7, padding: 10 }}>
         <div style={{ fontSize: 10, color: 'var(--text-muted)', marginBottom: 4 }}>TAILORING FOR</div>
         {selectedJob ? (
           <>
@@ -77,7 +77,7 @@ export function AiPanel({ selectedJob, scoreResult, suggestions, scoring, sugges
             <div style={{ marginTop: 8, display: 'flex', alignItems: 'center', gap: 6 }}>
               {scoring ? (
                 <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
-                  <div style={{ width: 16, height: 16, border: '2px solid rgba(24,95,165,0.3)', borderTopColor: '#185FA5', borderRadius: '50%', animation: 'spin 0.7s linear infinite' }} />
+                  <div style={{ width: 16, height: 16, border: '2px solid rgba(79,70,229,0.30)', borderTopColor: 'var(--primary)', borderRadius: '50%', animation: 'spin 0.7s linear infinite' }} />
                   <span style={{ fontSize: 10, color: 'var(--text-muted)' }}>Analyzing…</span>
                 </div>
               ) : scoreResult ? (
@@ -98,15 +98,15 @@ export function AiPanel({ selectedJob, scoreResult, suggestions, scoring, sugges
                       <span style={{ fontSize: 10, color: 'var(--text-muted)' }}>→</span>
                       <div style={{ textAlign: 'center' }}>
                         <MatchScoreRing score={optScore} size="sm" showLabel />
-                        <div style={{ fontSize: 7, color: delta > 0 ? '#3B6D11' : 'var(--text-muted)', marginTop: 1 }}>
+                        <div style={{ fontSize: 7, color: delta > 0 ? 'var(--c-success)' : 'var(--text-muted)', marginTop: 1 }}>
                           CV Optimisation {delta > 0 ? `↑${delta}` : ''}
                         </div>
                       </div>
-                      <button onClick={onAnalyze} title="Re-analyze" style={{ fontSize: 11, color: '#185FA5', background: 'none', border: 'none', cursor: 'pointer', marginLeft: 'auto' }}>↻</button>
+                      <button onClick={onAnalyze} title="Re-analyze" style={{ fontSize: 11, color: 'var(--primary)', background: 'none', border: 'none', cursor: 'pointer', marginLeft: 'auto' }}>↻</button>
                     </div>)})()}
                 </>
               ) : (
-                <button onClick={onAnalyze} style={{ fontSize: 11, color: '#185FA5', background: 'rgba(24,95,165,0.08)', border: '0.5px solid rgba(24,95,165,0.2)', borderRadius: 5, padding: '4px 10px', cursor: 'pointer' }}>
+                <button onClick={onAnalyze} style={{ fontSize: 11, color: 'var(--primary)', background: 'rgba(79,70,229,0.08)', border: '0.5px solid rgba(79,70,229,0.20)', borderRadius: 5, padding: '4px 10px', cursor: 'pointer' }}>
                   ✦ Analyze match
                 </button>
               )}
@@ -114,8 +114,8 @@ export function AiPanel({ selectedJob, scoreResult, suggestions, scoring, sugges
             {/* Stale analysis banner — shown when resume was edited after last analysis */}
             {contentChangedSinceAnalysis && scoreResult && !scoring && (
               <div style={{ marginTop: 8, padding: '5px 8px', background: 'rgba(133,79,11,0.07)', border: '0.5px solid rgba(133,79,11,0.22)', borderRadius: 5, display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 6 }}>
-                <span style={{ fontSize: 9, color: '#854F0B' }}>✎ Resume changed</span>
-                <button onClick={onAnalyze} style={{ fontSize: 9, color: '#854F0B', background: 'rgba(133,79,11,0.1)', border: '0.5px solid rgba(133,79,11,0.25)', borderRadius: 4, padding: '2px 8px', cursor: 'pointer', fontWeight: 600, whiteSpace: 'nowrap' }}>↻ Re-analyze</button>
+                <span style={{ fontSize: 9, color: 'var(--c-warning)' }}>✎ Resume changed</span>
+                <button onClick={onAnalyze} style={{ fontSize: 9, color: 'var(--c-warning)', background: 'rgba(217,119,6,0.10)', border: '0.5px solid rgba(217,119,6,0.25)', borderRadius: 4, padding: '2px 8px', cursor: 'pointer', fontWeight: 600, whiteSpace: 'nowrap' }}>↻ Re-analyze</button>
               </div>
             )}
           </>
@@ -143,12 +143,12 @@ export function AiPanel({ selectedJob, scoreResult, suggestions, scoring, sugges
                       }
                     }}
                       style={{
-                        textAlign: 'left', padding: '6px 8px', borderRadius: 6, border: '0.5px solid rgba(163,45,45,0.2)',
+                        textAlign: 'left', padding: '6px 8px', borderRadius: 6, border: '0.5px solid rgba(220,38,38,0.20)',
                         background: 'rgba(163,45,45,0.04)', cursor: 'pointer', transition: 'all 0.1s',
                       }}
-                      onMouseEnter={e => { (e.currentTarget as HTMLButtonElement).style.background = 'rgba(163,45,45,0.1)' }}
+                      onMouseEnter={e => { (e.currentTarget as HTMLButtonElement).style.background = 'rgba(220,38,38,0.10)' }}
                       onMouseLeave={e => { (e.currentTarget as HTMLButtonElement).style.background = 'rgba(163,45,45,0.04)' }}>
-                      <div style={{ fontSize: 10, fontWeight: 500, color: '#A32D2D' }}>+ {mi.keyword}</div>
+                      <div style={{ fontSize: 10, fontWeight: 500, color: 'var(--c-danger)' }}>+ {mi.keyword}</div>
                       <div style={{ fontSize: 8, color: 'var(--text-muted)', marginTop: 1 }}>
                         {secLabel} — {mi.tip}
                       </div>
@@ -177,25 +177,25 @@ export function AiPanel({ selectedJob, scoreResult, suggestions, scoring, sugges
                   const secSuggestions = suggByTarget[targetKey] ?? []
 
                   return (
-                    <div key={sec} style={{ marginBottom: 12, padding: '8px 10px', background: 'var(--bg)', borderRadius: 7, border: `1px solid ${secSuggestions.some(s => s.applied) ? 'rgba(59,109,17,0.3)' : 'var(--border)'}` }}>
+                    <div key={sec} style={{ marginBottom: 12, padding: '8px 10px', background: 'var(--bg)', borderRadius: 7, border: `1px solid ${secSuggestions.some(s => s.applied) ? 'rgba(5,150,105,0.30)' : 'var(--border)'}` }}>
                       {/* Section header + score bar */}
                       <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 4 }}>
                         <span style={{ fontSize: 11, fontWeight: 500, color: 'var(--text)' }}>
                           {secSuggestions.some(s => s.applied) ? '✓ ' : ''}{SEC_LABELS[sec] ?? sec}
                         </span>
                         {score !== undefined && (
-                          <span style={{ fontSize: 10, fontWeight: 600, color: score >= 80 ? '#3B6D11' : score >= 60 ? '#854F0B' : '#A32D2D' }}>{score}%</span>
+                          <span style={{ fontSize: 10, fontWeight: 600, color: score >= 80 ? 'var(--c-success)' : score >= 60 ? 'var(--c-warning)' : 'var(--c-danger)' }}>{score}%</span>
                         )}
                       </div>
                       <div style={{ height: 3, background: 'var(--border)', borderRadius: 2, overflow: 'hidden', marginBottom: 6 }}>
-                        <div style={{ width: `${score ?? 0}%`, height: '100%', background: (score ?? 0) >= 80 ? '#3B6D11' : (score ?? 0) >= 60 ? '#854F0B' : '#A32D2D', borderRadius: 2, transition: 'width 0.5s' }} />
+                        <div style={{ width: `${score ?? 0}%`, height: '100%', background: (score ?? 0) >= 80 ? 'var(--c-success)' : (score ?? 0) >= 60 ? 'var(--c-warning)' : 'var(--c-danger)', borderRadius: 2, transition: 'width 0.5s' }} />
                       </div>
                       {/* Matched keywords in this section */}
                       {m?.keywords?.length ? (
                         <div style={{ display: 'flex', flexWrap: 'wrap', gap: 3, marginBottom: 4 }}>
                           <span style={{ fontSize: 8, color: 'var(--text-muted)' }}>✓ Matched:</span>
                           {m.keywords.map(k => (
-                            <span key={k} style={{ fontSize: 9, background: 'rgba(59,109,17,0.08)', color: '#3B6D11', borderRadius: 4, padding: '1px 5px' }}>{k}</span>
+                            <span key={k} style={{ fontSize: 9, background: 'rgba(59,109,17,0.08)', color: 'var(--c-success)', borderRadius: 4, padding: '1px 5px' }}>{k}</span>
                           ))}
                         </div>
                       ) : null}
@@ -203,7 +203,7 @@ export function AiPanel({ selectedJob, scoreResult, suggestions, scoring, sugges
                       <div style={{ display: 'flex', alignItems: 'flex-start', gap: 6, marginBottom: 4 }}>
                         {tip && <div style={{ fontSize: 9, color: 'var(--text-muted)', flex: 1 }}>💡 {tip}</div>}
                         <button onClick={() => onEditSection?.(targetKey)}
-                          style={{ fontSize: 9, color: '#185FA5', background: 'rgba(24,95,165,0.06)', border: '0.5px solid rgba(24,95,165,0.2)', borderRadius: 4, padding: '2px 7px', cursor: 'pointer', whiteSpace: 'nowrap', flexShrink: 0, fontWeight: 500 }}>
+                          style={{ fontSize: 9, color: 'var(--primary)', background: 'rgba(79,70,229,0.06)', border: '0.5px solid rgba(79,70,229,0.20)', borderRadius: 4, padding: '2px 7px', cursor: 'pointer', whiteSpace: 'nowrap', flexShrink: 0, fontWeight: 500 }}>
                           ✏️ Edit
                         </button>
                       </div>
@@ -215,12 +215,12 @@ export function AiPanel({ selectedJob, scoreResult, suggestions, scoring, sugges
                           <div key={si} style={{ marginTop: 6, padding: 6, background: '#FFFBEB', borderRadius: 5, border: '0.5px solid rgba(234,179,8,0.3)' }}>
                             <div style={{ fontSize: 10, color: 'var(--text)', marginBottom: 4, lineHeight: 1.4 }}>{s.text}</div>
                             {s.proposed && (
-                              <div style={{ fontSize: 9, color: '#3B6D11', padding: '3px 6px', borderRadius: 4, background: 'rgba(59,109,17,0.04)', borderLeft: '2px solid #EAB308', marginBottom: 4, fontStyle: 'italic', maxHeight: 60, overflow: 'hidden' }}>
+                              <div style={{ fontSize: 9, color: 'var(--c-success)', padding: '3px 6px', borderRadius: 4, background: 'rgba(59,109,17,0.04)', borderLeft: '2px solid #EAB308', marginBottom: 4, fontStyle: 'italic', maxHeight: 60, overflow: 'hidden' }}>
                                 {s.proposed.length > 180 ? s.proposed.slice(0, 180) + '…' : s.proposed}
                               </div>
                             )}
                             <button onClick={() => onApplySuggestion(idx)}
-                              style={{ fontSize: 9, color: '#185FA5', background: 'rgba(24,95,165,0.08)', border: '0.5px solid rgba(24,95,165,0.2)', borderRadius: 4, padding: '2px 8px', cursor: 'pointer', fontWeight: 600 }}>
+                              style={{ fontSize: 9, color: 'var(--primary)', background: 'rgba(79,70,229,0.08)', border: '0.5px solid rgba(79,70,229,0.20)', borderRadius: 4, padding: '2px 8px', cursor: 'pointer', fontWeight: 600 }}>
                               {actionLabel} →
                             </button>
                           </div>
@@ -256,7 +256,7 @@ export function AiPanel({ selectedJob, scoreResult, suggestions, scoring, sugges
                       </div>
                     )}
                     <div style={{ display: 'flex', gap: 10 }}>
-                      <button onClick={() => onApplySuggestion(idx)} style={{ fontSize: 9, color: '#185FA5', background: 'none', border: 'none', cursor: 'pointer', padding: 0, fontWeight: 600 }}>Apply →</button>
+                      <button onClick={() => onApplySuggestion(idx)} style={{ fontSize: 9, color: 'var(--primary)', background: 'none', border: 'none', cursor: 'pointer', padding: 0, fontWeight: 600 }}>Apply →</button>
                       <button onClick={() => copySuggestion(s.text, idx)} style={{ fontSize: 9, color: 'var(--text-muted)', background: 'none', border: 'none', cursor: 'pointer', padding: 0 }}>{copied === idx ? '✓ Copied' : 'Copy'}</button>
                     </div>
                   </div>
@@ -274,7 +274,7 @@ export function AiPanel({ selectedJob, scoreResult, suggestions, scoring, sugges
             Job selected — click below to analyse and get targeted suggestions for each section.
           </div>
           <button onClick={onAnalyze}
-            style={{ fontSize: 11, color: '#185FA5', background: 'rgba(24,95,165,0.08)', border: '1px solid rgba(24,95,165,0.3)', borderRadius: 6, padding: '6px 16px', cursor: 'pointer', fontWeight: 500 }}>
+            style={{ fontSize: 11, color: 'var(--primary)', background: 'rgba(79,70,229,0.08)', border: '1px solid rgba(79,70,229,0.30)', borderRadius: 6, padding: '6px 16px', cursor: 'pointer', fontWeight: 500 }}>
             ✦ Analyze Match
           </button>
         </div>

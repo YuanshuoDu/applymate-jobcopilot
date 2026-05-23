@@ -1,7 +1,7 @@
 'use client'
 import React, { createContext, useContext, useState, useCallback } from 'react'
 
-export type Lang = 'en' | 'zh'
+export type Lang = 'en' | 'de' | 'fr' | 'es' | 'nl' | 'zh'
 
 // ── Translations dictionary ──────────────────────────────────────────────────
 const dict: Record<Lang, Record<string, string>> = {
@@ -14,6 +14,7 @@ const dict: Record<Lang, Record<string, string>> = {
     'nav.agent':         'Agent',
     'nav.extension':     'Extension',
     'nav.settings':      'Settings',
+    'nav.signout':       'Sign Out',
     'nav.applyHistory': 'Apply History',
     'search.title':      'Search Jobs',
     'search.placeholder':'e.g. "React Developer Dublin"',
@@ -157,8 +158,22 @@ const dict: Record<Lang, Record<string, string>> = {
     'auth.forgotPassword.error.requestFailed': 'Request failed, please try again later',
     'auth.forgotPassword.error.networkError': 'Network error, please try again later',
 
+    'settings.privacy':       'Privacy',
+    'settings.personalInfo':  'Personal Information',
+    'settings.jobPrefs':      'Job Preferences',
+    'settings.password':      'Password',
+    'settings.wizard':        'Setup Wizard',
+    'settings.connAccounts':  'Connected Accounts',
+    'settings.currentPlan':   'Current Plan',
+    'settings.notifPrefs':    'Notification Preferences',
+    'settings.dataPrivacy':   'Data & Privacy',
+
     'lang.switch':       '中文',
   },
+  de: {},
+  fr: {},
+  es: {},
+  nl: {},
   zh: {
     'nav.dashboard':     '仪表板',
     'nav.jobs':          '我的职位',
@@ -311,9 +326,45 @@ const dict: Record<Lang, Record<string, string>> = {
     'auth.forgotPassword.error.requestFailed': '请求失败，请稍后重试',
     'auth.forgotPassword.error.networkError': '网络错误，请稍后重试',
 
+    'nav.signout':       '退出登录',
+    'settings.privacy':       '隐私',
+    'settings.personalInfo':  '个人信息',
+    'settings.jobPrefs':      '求职偏好',
+    'settings.password':      '密码',
+    'settings.wizard':        '设置向导',
+    'settings.connAccounts':  '已连接账号',
+    'settings.currentPlan':   '当前套餐',
+    'settings.notifPrefs':    '通知偏好设置',
+    'settings.dataPrivacy':   '数据与隐私',
+
     'lang.switch':       'English',
   },
 }
+
+// ── Language metadata ────────────────────────────────────────────────────────
+
+export const LANGUAGES: { value: Lang; label: string; flag: string; native: string }[] = [
+  { value: 'en', label: 'English',    flag: '🇬🇧', native: 'English'    },
+  { value: 'de', label: 'German',     flag: '🇩🇪', native: 'Deutsch'    },
+  { value: 'fr', label: 'French',     flag: '🇫🇷', native: 'Français'   },
+  { value: 'es', label: 'Spanish',    flag: '🇪🇸', native: 'Español'    },
+  { value: 'nl', label: 'Dutch',      flag: '🇳🇱', native: 'Nederlands' },
+  { value: 'zh', label: 'Chinese',    flag: '🇨🇳', native: '中文'       },
+]
+
+export const LANG_LABELS: Record<string, string> = Object.fromEntries(
+  LANGUAGES.map(l => [l.value, l.native])
+)
+
+export const SEARCH_TARGET_LANGS: { value: string; label: string }[] = [
+  { value: 'en', label: 'English'  },
+  { value: 'de', label: 'Deutsch'  },
+  { value: 'fr', label: 'Français' },
+  { value: 'es', label: 'Español'  },
+  { value: 'nl', label: 'Nederlands'},
+  { value: 'zh', label: '中文'     },
+  { value: 'ja', label: '日本語'   },
+]
 
 // ── Context ──────────────────────────────────────────────────────────────────
 
@@ -353,18 +404,4 @@ export function useI18n() {
   return useContext(I18nContext)
 }
 
-// ── Quick accessors for common lookup ────────────────────────────────────────
-
-export const LANG_LABELS: Record<string, string> = {
-  zh: '中文', en: 'English', de: 'Deutsch', fr: 'Français',
-  es: 'Español', ja: '日本語', ko: '한국어', pt: 'Português',
-}
-
-export const SEARCH_TARGET_LANGS: { value: string; label: string }[] = [
-  { value: 'zh', label: '中文' },
-  { value: 'en', label: 'English' },
-  { value: 'de', label: 'Deutsch' },
-  { value: 'fr', label: 'Français' },
-  { value: 'es', label: 'Español' },
-  { value: 'ja', label: '日本語' },
-]
+// (LANG_LABELS and SEARCH_TARGET_LANGS are declared above with LANGUAGES)

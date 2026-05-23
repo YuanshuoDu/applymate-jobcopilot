@@ -34,7 +34,7 @@ export function ExtensionPage() {
         <div style={{ display:'flex', border:'0.5px solid var(--border)', borderRadius:6, overflow:'hidden' }}>
           {(['popup','sidebar'] as const).map(t => (
             <button key={t} onClick={() => setTab(t)} style={{
-              padding:'5px 12px', background: tab===t ? '#185FA5' : 'var(--bg)',
+              padding:'5px 12px', background: tab===t ? 'var(--primary)' : 'var(--bg)',
               color: tab===t ? '#fff' : 'var(--text-muted)', border:'none', cursor:'pointer', fontSize:11, textTransform:'capitalize',
             }}>{t}</button>
           ))}
@@ -62,14 +62,14 @@ export function ExtensionPage() {
                   {JD_MOCK.tags.map(t => <span key={t} style={{ fontSize:11, background:'#e8f0fe', color:'#1a73e8', borderRadius:4, padding:'2px 8px' }}>{t}</span>)}
                 </div>
                 {/* Injected ApplyMate button */}
-                <div style={{ padding:12, background:'rgba(24,95,165,0.06)', border:'1px solid rgba(24,95,165,0.2)', borderRadius:8, display:'flex', alignItems:'center', gap:10 }}>
-                  <div style={{ width:20, height:20, borderRadius:4, background:'#185FA5', display:'flex', alignItems:'center', justifyContent:'center', color:'#fff', fontSize:10, fontWeight:700 }}>A</div>
+                <div style={{ padding:12, background:'rgba(79,70,229,0.06)', border:'1px solid rgba(79,70,229,0.20)', borderRadius:8, display:'flex', alignItems:'center', gap:10 }}>
+                  <div style={{ width:20, height:20, borderRadius:4, background:'var(--primary)', display:'flex', alignItems:'center', justifyContent:'center', color:'#fff', fontSize:10, fontWeight:700 }}>A</div>
                   <div style={{ flex:1 }}>
-                    <div style={{ fontSize:11, fontWeight:500, color:'#185FA5' }}>ApplyMate AI</div>
-                    <div style={{ fontSize:10, color:'#666' }}>Match score: <strong style={{ color:'#185FA5' }}>91%</strong> · 3 keyword gaps</div>
+                    <div style={{ fontSize:11, fontWeight:500, color:'var(--primary)' }}>ApplyMate AI</div>
+                    <div style={{ fontSize:10, color:'#666' }}>Match score: <strong style={{ color:'var(--primary)' }}>91%</strong> · 3 keyword gaps</div>
                   </div>
                   <button onClick={() => { setAdded(true); toast.success('Added to basket', 'Adyen · Backend Engineer') }}
-                    style={{ padding:'5px 12px', background: added ? '#3B6D11' : '#185FA5', color:'#fff', border:'none', borderRadius:6, fontSize:11, cursor:'pointer', fontWeight:500 }}>
+                    style={{ padding:'5px 12px', background: added ? 'var(--c-success)' : 'var(--primary)', color:'#fff', border:'none', borderRadius:6, fontSize:11, cursor:'pointer', fontWeight:500 }}>
                     {added ? '✓ Added' : '+ Add to Basket'}
                   </button>
                 </div>
@@ -78,7 +78,7 @@ export function ExtensionPage() {
 
             {/* Popup widget */}
             <div style={{ width:300, background:'var(--bg)', border:'0.5px solid var(--border)', borderRadius:12, overflow:'hidden', boxShadow:'0 8px 32px rgba(0,0,0,0.12)' }}>
-              <div style={{ padding:'12px 14px', borderBottom:'0.5px solid var(--border)', background:'#185FA5', display:'flex', alignItems:'center', gap:8 }}>
+              <div style={{ padding:'12px 14px', borderBottom:'0.5px solid var(--border)', background:'var(--primary)', display:'flex', alignItems:'center', gap:8 }}>
                 <div style={{ width:20, height:20, borderRadius:5, background:'rgba(255,255,255,0.2)', display:'flex', alignItems:'center', justifyContent:'center', color:'#fff', fontSize:10, fontWeight:700 }}>A</div>
                 <span style={{ fontSize:13, fontWeight:500, color:'#fff' }}>ApplyMate AI</span>
                 <span style={{ marginLeft:'auto', fontSize:10, color:'rgba(255,255,255,0.7)' }}>Adyen detected</span>
@@ -97,7 +97,7 @@ export function ExtensionPage() {
                 <div style={{ marginBottom:12 }}>
                   <div style={{ fontSize:10, color:'var(--text-muted)', marginBottom:4 }}>KEYWORD GAPS</div>
                   <div style={{ display:'flex', gap:4, flexWrap:'wrap' }}>
-                    {JD_MOCK.missing.map(k => <span key={k} style={{ fontSize:10, background:'rgba(163,45,45,0.1)', color:'#A32D2D', borderRadius:999, padding:'1px 7px' }}>{k}</span>)}
+                    {JD_MOCK.missing.map(k => <span key={k} style={{ fontSize:10, background:'rgba(220,38,38,0.10)', color:'var(--c-danger)', borderRadius:999, padding:'1px 7px' }}>{k}</span>)}
                   </div>
                 </div>
 
@@ -143,7 +143,7 @@ export function ExtensionPage() {
             </div>
 
             <div style={{ width:280, background:'var(--bg)', border:'0.5px solid var(--border)', borderRadius:12, overflow:'hidden' }}>
-              <div style={{ padding:'10px 14px', background:'#185FA5', display:'flex', alignItems:'center', gap:6 }}>
+              <div style={{ padding:'10px 14px', background:'var(--primary)', display:'flex', alignItems:'center', gap:6 }}>
                 <div style={{ width:18, height:18, borderRadius:4, background:'rgba(255,255,255,0.2)', display:'flex', alignItems:'center', justifyContent:'center', color:'#fff', fontSize:9, fontWeight:700 }}>A</div>
                 <span style={{ fontSize:12, fontWeight:500, color:'#fff' }}>ApplyMate Sidebar</span>
               </div>
@@ -168,7 +168,7 @@ export function ExtensionPage() {
                 <div style={{ borderTop:'0.5px solid var(--border)', paddingTop:10 }}>
                   <div style={{ fontSize:10, color:'var(--text-muted)', marginBottom:4 }}>MISSING KEYWORDS</div>
                   <div style={{ display:'flex', gap:4, flexWrap:'wrap' }}>
-                    {JD_MOCK.missing.map(k => <span key={k} style={{ fontSize:10, background:'rgba(163,45,45,0.1)', color:'#A32D2D', borderRadius:999, padding:'2px 7px' }}>{k}</span>)}
+                    {JD_MOCK.missing.map(k => <span key={k} style={{ fontSize:10, background:'rgba(220,38,38,0.10)', color:'var(--c-danger)', borderRadius:999, padding:'2px 7px' }}>{k}</span>)}
                   </div>
                 </div>
               </div>

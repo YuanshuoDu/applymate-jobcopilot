@@ -105,6 +105,33 @@ const SITES: Record<string, SiteConfig> = {
     salary: '[data-cy="result-job-card-salary"], [class*="salary"]',
     link: 'a[href*="/jobsuche/suche/detail/"]',
   },
+  // Greenhouse public job board: boards.greenhouse.io/company
+  'greenhouse.io': {
+    card: '.opening, div[class*="opening"]',
+    title: 'a[href*="/jobs/"]',
+    company: '',   // extracted from page-level heading or URL
+    location: '.location, span[class*="location"]',
+    salary: '',
+    link: 'a[href*="/jobs/"]',
+  },
+  // Lever job board: jobs.lever.co/company
+  'lever.co': {
+    card: '.posting, [data-qa="posting"]',
+    title: '[data-qa="posting-name"], h5.posting-title, .posting-title',
+    company: '',   // extracted from URL path
+    location: '.location, [data-qa="posting-location"]',
+    salary: '',
+    link: '[data-qa="posting-name"], h5.posting-title a, a[href*="lever.co"]',
+  },
+  // SmartRecruiters job board
+  'smartrecruiters.com': {
+    card: '.job-listing, li[class*="job-listing"], [class*="JobCard"]',
+    title: 'a.js-job-link h4, .job-title a, [class*="job-title" i]',
+    company: '[class*="company-name" i]',
+    location: '.job-location, [class*="location" i]',
+    salary: '',
+    link: 'a.js-job-link, a[href*="/jobs/"]',
+  },
   'jobs.de': {
     card: 'li.job-list-item, div[class*="jobCard"], article[class*="job"]',
     title: '.job-list-item__title a, h2[class*="title"] a',
@@ -392,27 +419,37 @@ function attachHoverPopup(card: Element, job: CardJob) {
 }
 
 const SOURCE_CLASS: Record<string, string> = {
-  linkedin:   'am-src-linkedin',
-  indeed:     'am-src-indeed',
-  glassdoor:  'am-src-glassdoor',
-  stepstone:  'am-src-stepstone',
-  xing:       'am-src-xing',
-  wellfound:  'am-src-wellfound',
-  greenhouse: 'am-src-greenhouse',
-  lever:      'am-src-lever',
-  workday:    'am-src-workday',
+  linkedin:        'am-src-linkedin',
+  indeed:          'am-src-indeed',
+  glassdoor:       'am-src-glassdoor',
+  stepstone:       'am-src-stepstone',
+  xing:            'am-src-xing',
+  wellfound:       'am-src-wellfound',
+  greenhouse:      'am-src-greenhouse',
+  lever:           'am-src-lever',
+  workday:         'am-src-workday',
+  smartrecruiters: 'am-src-smartrecruiters',
+  ashby:           'am-src-ashby',
+  bamboohr:        'am-src-bamboohr',
+  jobvite:         'am-src-jobvite',
+  icims:           'am-src-icims',
 }
 
 const SOURCE_LABEL: Record<string, string> = {
-  linkedin:   'LinkedIn',
-  indeed:     'Indeed',
-  glassdoor:  'Glassdoor',
-  stepstone:  'Stepstone',
-  xing:       'Xing',
-  wellfound:  'Wellfound',
-  greenhouse: 'Greenhouse',
-  lever:      'Lever',
-  workday:    'Workday',
+  linkedin:        'LinkedIn',
+  indeed:          'Indeed',
+  glassdoor:       'Glassdoor',
+  stepstone:       'Stepstone',
+  xing:            'Xing',
+  wellfound:       'Wellfound',
+  greenhouse:      'Greenhouse',
+  lever:           'Lever',
+  workday:         'Workday',
+  smartrecruiters: 'SmartRecruiters',
+  ashby:           'Ashby',
+  bamboohr:        'BambooHR',
+  jobvite:         'Jobvite',
+  icims:           'iCIMS',
 }
 
 function showPopup(card: Element, job: CardJob) {
@@ -521,10 +558,41 @@ async function enrichJob(job: CardJob) {
 
 // ── Main observer loop ────────────────────────────────────────────────────────
 
+function scrapeGreenhouseCard(card: Element): CardJob | null {
+  const link = card.querySelector<HTMLAnchorElement>('a[href*="/jobs/"]')
+  const title = link?.innerText?.trim() || ''
+  if (!title) return null
+  // Company from page heading, logo alt, or URL slug
+  const company =
+    document.querySelector<HTMLElement>('.company-name, [class*="company-name"]')?.innerText.trim() ||
+    (document.querySelector<HTMLImageElement>('img.company-logo, img[class*="logo"]')?.alt?.trim().replace(/ logo$/i, '').trim()) ||
+    window.location.pathname.split('/').filter(Boolean)[0] ||
+    'Unknown'
+  const location = card.querySelector<HTMLElement>('.location, span[class*="location"]')?.innerText.trim() || ''
+  const url = link?.href || window.location.href
+  return { title, company, location: location || 'Unknown', salary: '', url, source: 'greenhouse' }
+}
+
+function scrapeLeverCard(card: Element): CardJob | null {
+  const titleEl = card.querySelector<HTMLAnchorElement>('[data-qa="posting-name"], h5.posting-title a, .posting-title a')
+  const title = titleEl?.innerText?.trim() ||
+    card.querySelector<HTMLElement>('h5.posting-title, .posting-title')?.innerText.trim() ||
+    ''
+  if (!title) return null
+  // Company: from URL path (jobs.lever.co/company-slug/uuid)
+  const company = window.location.pathname.split('/').filter(Boolean)[0] || 'Unknown'
+  const location = card.querySelector<HTMLElement>('.location, [data-qa="posting-location"]')?.innerText.trim() || ''
+  const url = (titleEl as HTMLAnchorElement)?.href ||
+    card.querySelector<HTMLAnchorElement>('a[href]')?.href || window.location.href
+  return { title, company, location: location || 'Unknown', salary: '', url, source: 'lever' }
+}
+
 function processCards(cfg: SiteConfig) {
   const host = window.location.hostname
-  const isLinkedIn = host.includes('linkedin')
-  const isIndeed   = host.includes('indeed')
+  const isLinkedIn    = host.includes('linkedin')
+  const isIndeed      = host.includes('indeed')
+  const isGreenhouse  = host.includes('greenhouse.io')
+  const isLever       = host.includes('lever.co')
 
   const cards = document.querySelectorAll<Element>(cfg.card)
   cards.forEach(card => {
@@ -561,7 +629,7 @@ function processCards(cfg: SiteConfig) {
         existingBtn.remove()
       }
     } else {
-      // For other platforms: simple DOM attribute marker is sufficient.
+      // For other platforms (Greenhouse, Lever, Stepstone, etc.): simple attribute marker.
       if (card.getAttribute(ATTR)) return
       card.setAttribute(ATTR, '1')
     }
@@ -571,6 +639,10 @@ function processCards(cfg: SiteConfig) {
       job = scrapeLinkedInCard(card)
     } else if (isIndeed) {
       job = scrapeIndeedCard(card)
+    } else if (isGreenhouse) {
+      job = scrapeGreenhouseCard(card)
+    } else if (isLever) {
+      job = scrapeLeverCard(card)
     } else {
       job = scrapeCard(card, cfg)
     }
@@ -678,6 +750,26 @@ export function isJobListPage(): boolean {
       path.includes('/jobs') ||
       !!document.querySelector('div[class*="JobListingCard"], div[class*="job-listing"]')
     )
+  }
+  if (host.includes('greenhouse.io')) {
+    // Greenhouse public board: boards.greenhouse.io/company (no /jobs/ prefix = list page)
+    // boards.greenhouse.io/company/jobs/123 = detail page
+    const pathParts = window.location.pathname.split('/').filter(Boolean)
+    // List page: /company or /company/ (1 or 0 path parts after stripping slug)
+    // Detail page: /company/jobs/123 (3 parts)
+    if (pathParts.length <= 1) return true
+    if (pathParts.length >= 3 && pathParts[1] === 'jobs') return false
+    return !!document.querySelector('.opening, [class*="opening"]')
+  }
+  if (host.includes('lever.co')) {
+    // Lever list: jobs.lever.co/company (1 path segment = company slug)
+    // Lever detail: jobs.lever.co/company/uuid (2 path segments)
+    const pathParts = window.location.pathname.split('/').filter(Boolean)
+    if (pathParts.length <= 1) return true
+    return false
+  }
+  if (host.includes('smartrecruiters.com')) {
+    return path.includes('/jobs') || !!document.querySelector('.job-listing, [class*="JobCard"]')
   }
   if (host.includes('monster') || host.includes('jobs.de') || host.includes('arbeitsagentur')) {
     // These sites: always try list mode (no reliable URL pattern difference between list/detail)

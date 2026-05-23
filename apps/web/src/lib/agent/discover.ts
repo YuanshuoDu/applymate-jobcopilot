@@ -32,19 +32,56 @@ interface DiscoverParams {
   maxResults:      number    // total cap across all queries
 }
 
-// Simple EU country code detector (subset of unified route's map)
+// EU country code detector — mirrors unified route's EU_COUNTRY_MAP for consistency
 const EU_LOC: Record<string, string> = {
-  germany: 'de', berlin: 'de', munich: 'de', hamburg: 'de', frankfurt: 'de',
-  uk: 'gb', 'united kingdom': 'gb', london: 'gb', manchester: 'gb', edinburgh: 'gb',
-  netherlands: 'nl', amsterdam: 'nl',
-  france: 'fr', paris: 'fr',
-  ireland: 'ie', dublin: 'ie',
-  spain: 'es', madrid: 'es', barcelona: 'es',
-  austria: 'at', vienna: 'at',
-  switzerland: 'ch', zurich: 'ch',
-  belgium: 'be', brussels: 'be',
-  italy: 'it', milan: 'it', rome: 'it',
-  poland: 'pl', warsaw: 'pl',
+  // Germany (DACH)
+  germany: 'de', berlin: 'de', munich: 'de', münchen: 'de', hamburg: 'de',
+  frankfurt: 'de', cologne: 'de', köln: 'de', stuttgart: 'de', dusseldorf: 'de', düsseldorf: 'de',
+  deutschland: 'de',
+  // Austria (DACH)
+  austria: 'at', vienna: 'at', wien: 'at', graz: 'at', linz: 'at', österreich: 'at',
+  // Switzerland (DACH)
+  switzerland: 'ch', zurich: 'ch', zürich: 'ch', bern: 'ch', basel: 'ch',
+  geneva: 'ch', lausanne: 'ch', schweiz: 'ch',
+  // Ireland — full city/region coverage (mirrors unified route exactly)
+  ireland: 'ie', 'republic of ireland': 'ie',
+  dublin: 'ie', cork: 'ie', galway: 'ie', limerick: 'ie', waterford: 'ie',
+  drogheda: 'ie', dundalk: 'ie', kilkenny: 'ie', sligo: 'ie', wexford: 'ie',
+  athlone: 'ie', naas: 'ie', ennis: 'ie', letterkenny: 'ie', swords: 'ie',
+  sandyford: 'ie', leopardstown: 'ie', 'grand canal': 'ie', docklands: 'ie',
+  // UK
+  uk: 'gb', 'united kingdom': 'gb', england: 'gb', britain: 'gb',
+  london: 'gb', manchester: 'gb', edinburgh: 'gb', birmingham: 'gb',
+  leeds: 'gb', glasgow: 'gb', liverpool: 'gb', bristol: 'gb',
+  // Netherlands
+  netherlands: 'nl', amsterdam: 'nl', rotterdam: 'nl', eindhoven: 'nl',
+  utrecht: 'nl', 'the hague': 'nl', delft: 'nl',
+  // France
+  france: 'fr', paris: 'fr', lyon: 'fr', marseille: 'fr', toulouse: 'fr', bordeaux: 'fr',
+  // Belgium
+  belgium: 'be', brussels: 'be', antwerp: 'be', ghent: 'be',
+  // Spain
+  spain: 'es', madrid: 'es', barcelona: 'es', seville: 'es', bilbao: 'es', valencia: 'es',
+  // Italy
+  italy: 'it', rome: 'it', milan: 'it', turin: 'it', florence: 'it',
+  // Poland
+  poland: 'pl', warsaw: 'pl', krakow: 'pl', wroclaw: 'pl', poznan: 'pl', gdansk: 'pl',
+  // Nordics
+  sweden: 'se', stockholm: 'se', gothenburg: 'se',
+  denmark: 'dk', copenhagen: 'dk',
+  finland: 'fi', helsinki: 'fi',
+  norway: 'no', oslo: 'no', bergen: 'no',
+  // Portugal
+  portugal: 'pt', lisbon: 'pt', porto: 'pt', braga: 'pt',
+  // Czech / Hungary / Romania
+  czechia: 'cz', 'czech republic': 'cz', prague: 'cz', brno: 'cz',
+  hungary: 'hu', budapest: 'hu',
+  romania: 'ro', bucharest: 'ro', cluj: 'ro',
+  // Greece / Baltic
+  greece: 'gr', athens: 'gr',
+  lithuania: 'lt', vilnius: 'lt',
+  latvia: 'lv', riga: 'lv',
+  estonia: 'ee', tallinn: 'ee',
 }
 
 function detectEUCountry(loc: string): string | null {
@@ -199,6 +236,43 @@ async function fetchJSearch(q: string, location: string, key: string): Promise<D
   } catch { return [] }
 }
 
+// Indeed IE — mirrors unified route's Ireland strategy (countryCode=ie, verified working)
+async function fetchIndeedIE(q: string, location: string, key: string): Promise<DiscoveredJob[]> {
+  const p = new URLSearchParams({
+    query:       q,
+    countryCode: 'ie',
+    sortType:    'date',
+  })
+  if (location) p.set('location', location || 'Ireland')
+  try {
+    const r = await fetch(`https://jobs-api14.p.rapidapi.com/v2/indeed/search?${p}`, {
+      headers: { 'x-rapidapi-key': key, 'x-rapidapi-host': 'jobs-api14.p.rapidapi.com' },
+      signal: AbortSignal.timeout(5_000), cache: 'no-store',
+    })
+    if (!r.ok) return []
+    const json = await r.json() as {
+      data?: Array<{
+        id: string; title: string
+        company: { name: string; image?: string }
+        location: { location?: string; country?: string }
+        description?: string; applyUrl?: string
+      }>
+      hasError?: boolean
+    }
+    if (json.hasError || !Array.isArray(json.data)) return []
+    return json.data.map(j => ({
+      title:       j.title,
+      company:     j.company?.name ?? '',
+      location:    j.location?.location ?? j.location?.country ?? 'Ireland',
+      url:         j.applyUrl ?? '',
+      description: truncate(j.description ?? ''),
+      salary:      null,
+      logo:        j.company?.image ?? null,
+      source:      'indeed',
+    })).filter(j => j.url)
+  } catch { return [] }
+}
+
 // ── IrishJobs.ie RSS (free, no key needed) ────────────────────────────────────
 
 function slugifyIE(s: string): string {
@@ -274,42 +348,76 @@ export async function discoverJobs(params: DiscoverParams): Promise<DiscoveredJo
       if (results.length >= maxResults) break
 
       const country   = detectEUCountry(loc)
-      const isIreland = country === 'ie' || /\bireland\b|\bdublin\b|\bcork\b|\bgalway\b/i.test(loc)
+      const isIreland = country === 'ie'
+      const isDACH    = country === 'de' || country === 'at' || country === 'ch'
+      const isGB      = country === 'gb'
       const isEU      = country !== null
-      const hasAdzuna = adzunaId && adzunaKey
+      const hasAdzuna = !!(adzunaId && adzunaKey)
 
-      // Build source list — Ireland gets extra dedicated sources
       const fetchTasks: Array<Promise<DiscoveredJob[]>> = []
 
-      // Always: ATS + LinkedIn (location-optimised for Ireland)
-      if (apiKey) {
-        fetchTasks.push(fetchAts(role, loc, apiKey))
-        fetchTasks.push(fetchLinkedIn(
-          role,
-          isIreland ? (loc || 'Ireland') : loc,   // broad "Ireland" for IE
-          apiKey,
-        ))
+      if (isIreland) {
+        // ── Ireland strategy (mirrors unified route exactly) ──────────────────
+        // NOTE: Adzuna returns 404 for country=ie — excluded intentionally.
+        // Verified sources: LinkedIn IE, Indeed IE, ATS, JSearch, IrishJobs RSS
+
+        if (apiKey) {
+          // 1. LinkedIn Ireland — broadened to country level for best coverage
+          fetchTasks.push(fetchLinkedIn(role, loc ? `${loc}, Ireland` : 'Ireland', apiKey))
+          // 2. Indeed IE — direct Irish listings via countryCode=ie
+          fetchTasks.push(fetchIndeedIE(role, loc || 'Ireland', apiKey))
+          // 3. ATS — career sites (Google IE, Meta IE, Stripe, HubSpot...)
+          fetchTasks.push(fetchAts(role, loc || 'Ireland OR Dublin', apiKey))
+        }
+        // 4. IrishJobs.ie RSS — free, native, no key needed
+        fetchTasks.push(fetchIrishJobsRss(role, loc || 'ireland'))
+
+      } else if (isDACH) {
+        // DACH: LinkedIn + Adzuna (strong in DE/AT/CH)
+        if (apiKey)  fetchTasks.push(fetchLinkedIn(role, loc, apiKey))
+        if (hasAdzuna) fetchTasks.push(fetchAdzuna(role, loc, adzunaId, adzunaKey, country!))
+        if (apiKey)  fetchTasks.push(fetchAts(role, loc, apiKey))
+
+      } else if (isGB) {
+        // UK: Adzuna (best UK coverage) + LinkedIn + ATS
+        if (hasAdzuna) fetchTasks.push(fetchAdzuna(role, loc, adzunaId, adzunaKey, 'gb'))
+        if (apiKey)  fetchTasks.push(fetchLinkedIn(role, loc || 'United Kingdom', apiKey))
+        if (apiKey)  fetchTasks.push(fetchAts(role, loc || 'United Kingdom', apiKey))
+
+      } else if (isEU && hasAdzuna) {
+        // Other EU: Adzuna + LinkedIn + ATS
+        fetchTasks.push(fetchAdzuna(role, loc, adzunaId, adzunaKey, country!))
+        if (apiKey) fetchTasks.push(fetchLinkedIn(role, loc, apiKey))
+        if (apiKey) fetchTasks.push(fetchAts(role, loc, apiKey))
+
+      } else {
+        // Global / no location: ATS + LinkedIn + JSearch
+        if (apiKey) {
+          fetchTasks.push(fetchAts(role, loc, apiKey))
+          fetchTasks.push(fetchLinkedIn(role, loc, apiKey))
+          fetchTasks.push(fetchJSearch(role, loc, apiKey))
+        }
       }
 
-      // Third+ source based on geography
-      if (isIreland) {
-        // NOTE: Adzuna does NOT support IE (404). Use JSearch + IrishJobs RSS instead.
-        // JSearch aggregates Google Jobs, which includes IrishJobs.ie and Jobs.ie
-        if (apiKey) fetchTasks.push(fetchJSearch(role, loc || 'Ireland', apiKey))
-        // IrishJobs.ie RSS — free, native, best-effort
+      // Free-source guarantee: no API keys configured → IrishJobs RSS as baseline
+      if (!apiKey && !hasAdzuna) {
         fetchTasks.push(fetchIrishJobsRss(role, loc || 'ireland'))
-      } else if (isEU && hasAdzuna) {
-        // Other EU: Adzuna works fine (de/gb/fr/nl/es/it etc.)
-        fetchTasks.push(fetchAdzuna(role, loc, adzunaId, adzunaKey, country!))
-      } else if (apiKey) {
-        fetchTasks.push(fetchJSearch(role, loc, apiKey))
       }
 
       const allResults = await Promise.all(fetchTasks)
 
-      for (const job of allResults.flat()) {
-        if (!job.url || seen.has(job.url)) continue
-        if (!job.title || !job.company)    continue
+      // Score and sort by location relevance before deduplication
+      const locL = loc.toLowerCase()
+      const scored = allResults.flat()
+        .filter(j => j.url && j.title && j.company)
+        .map(j => ({
+          job:   j,
+          score: (locL && j.location.toLowerCase().includes(locL)) ? 1 : 0,
+        }))
+        .sort((a, b) => b.score - a.score)
+
+      for (const { job } of scored) {
+        if (seen.has(job.url)) continue
         seen.add(job.url)
         results.push(job)
         if (results.length >= maxResults) break

@@ -1,0 +1,354 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Landing Page 设计方向</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: 'Inter', system-ui, sans-serif;
+    background: #0A0B14;
+    color: #E2E8F0;
+    min-height: 100vh;
+    padding: 32px 24px;
+  }
+  h2 { font-size: 20px; font-weight: 700; color: #fff; margin-bottom: 6px; text-align: center; }
+  .subtitle { font-size: 13px; color: #94A3B8; text-align: center; margin-bottom: 32px; }
+
+  .cards { display: grid; grid-template-columns: repeat(3, 1fr); gap: 20px; max-width: 1100px; margin: 0 auto; }
+
+  /* Card wrapper */
+  .card {
+    border-radius: 18px;
+    overflow: hidden;
+    cursor: pointer;
+    border: 2px solid rgba(255,255,255,0.08);
+    transition: border-color 0.2s, transform 0.2s, box-shadow 0.2s;
+    background: rgba(255,255,255,0.04);
+    position: relative;
+  }
+  .card:hover { transform: translateY(-3px); box-shadow: 0 12px 40px rgba(79,70,229,0.25); border-color: rgba(79,70,229,0.4); }
+  .card.selected { border-color: #6366F1; box-shadow: 0 0 0 3px rgba(99,102,241,0.2), 0 12px 40px rgba(79,70,229,0.30); }
+  .card.selected::after {
+    content: '✓ 已选';
+    position: absolute; top: 12px; right: 12px;
+    background: #6366F1; color: #fff; font-size: 10px; font-weight: 700;
+    padding: 3px 8px; border-radius: 999px; letter-spacing: 0.03em;
+  }
+
+  /* Mini landing page mockups */
+  .mockup { height: 300px; position: relative; overflow: hidden; }
+
+  /* Option A: Dark Glass (深色毛玻璃) */
+  .mockup-a {
+    background: linear-gradient(135deg, #080B14 0%, #0D0E1F 50%, #10091A 100%);
+  }
+  .mockup-a::before {
+    content: '';
+    position: absolute;
+    width: 400px; height: 400px;
+    border-radius: 50%;
+    background: radial-gradient(circle, rgba(124,58,237,0.25) 0%, transparent 70%);
+    top: -80px; left: 50%; transform: translateX(-50%);
+  }
+  .mockup-a .nav {
+    position: absolute; top: 14px; left: 50%; transform: translateX(-50%);
+    width: calc(100% - 24px);
+    background: rgba(255,255,255,0.06);
+    backdrop-filter: blur(12px);
+    border: 1px solid rgba(255,255,255,0.10);
+    border-radius: 12px;
+    padding: 8px 16px;
+    display: flex; align-items: center; justify-content: space-between;
+    font-size: 10px; color: rgba(255,255,255,0.7);
+  }
+  .mockup-a .logo { font-weight: 700; font-size: 11px; color: #fff; display: flex; align-items: center; gap: 6px; }
+  .mockup-a .logo-dot { width: 16px; height: 16px; border-radius: 5px; background: linear-gradient(135deg, #4F46E5, #7C3AED); display: inline-flex; align-items: center; justify-content: center; font-size: 7px; color: #fff; font-weight: 800; }
+  .mockup-a .hero { position: absolute; top: 70px; left: 0; right: 0; text-align: center; padding: 0 20px; }
+  .mockup-a .hero-title { font-size: 22px; font-weight: 800; line-height: 1.2; letter-spacing: -0.03em; }
+  .mockup-a .hero-title span { background: linear-gradient(135deg, #818CF8 0%, #C084FC 100%); -webkit-background-clip: text; -webkit-text-fill-color: transparent; }
+  .mockup-a .hero-sub { font-size: 9px; color: rgba(255,255,255,0.45); margin-top: 8px; line-height: 1.5; }
+  .mockup-a .hero-btns { display: flex; gap: 6px; justify-content: center; margin-top: 14px; }
+  .mockup-a .btn-primary {
+    background: linear-gradient(135deg, #4F46E5, #7C3AED);
+    border-radius: 8px; padding: 5px 14px; font-size: 9px; color: #fff; font-weight: 600;
+    box-shadow: 0 4px 14px rgba(79,70,229,0.5);
+  }
+  .mockup-a .btn-ghost {
+    background: rgba(255,255,255,0.08); border: 1px solid rgba(255,255,255,0.15);
+    border-radius: 8px; padding: 5px 14px; font-size: 9px; color: rgba(255,255,255,0.7);
+  }
+  .mockup-a .glass-cards {
+    position: absolute; bottom: 10px; left: 50%; transform: translateX(-50%);
+    width: calc(100% - 24px);
+    display: grid; grid-template-columns: repeat(3, 1fr); gap: 6px;
+  }
+  .mockup-a .glass-mini {
+    background: rgba(255,255,255,0.05);
+    backdrop-filter: blur(8px);
+    border: 1px solid rgba(255,255,255,0.08);
+    border-radius: 8px; padding: 6px 8px;
+  }
+  .mockup-a .glass-mini-icon { font-size: 12px; margin-bottom: 3px; }
+  .mockup-a .glass-mini-text { font-size: 7px; color: rgba(255,255,255,0.55); }
+
+  /* Option B: Light Glass (浅色毛玻璃) */
+  .mockup-b {
+    background: linear-gradient(135deg, #F0F4FF 0%, #F5F0FF 50%, #EEF4FF 100%);
+  }
+  .mockup-b::before {
+    content: '';
+    position: absolute;
+    width: 300px; height: 300px;
+    border-radius: 50%;
+    background: radial-gradient(circle, rgba(99,102,241,0.15) 0%, transparent 70%);
+    top: -60px; right: -40px;
+  }
+  .mockup-b .nav {
+    position: absolute; top: 14px; left: 50%; transform: translateX(-50%);
+    width: calc(100% - 24px);
+    background: rgba(255,255,255,0.75);
+    backdrop-filter: blur(16px);
+    border: 1px solid rgba(255,255,255,0.9);
+    border-radius: 12px;
+    padding: 8px 16px;
+    display: flex; align-items: center; justify-content: space-between;
+    font-size: 10px; color: #4F46E5;
+    box-shadow: 0 2px 12px rgba(79,70,229,0.08);
+  }
+  .mockup-b .logo { font-weight: 700; font-size: 11px; color: #0F172A; display: flex; align-items: center; gap: 6px; }
+  .mockup-b .logo-dot { width: 16px; height: 16px; border-radius: 5px; background: linear-gradient(135deg, #4F46E5, #7C3AED); display: inline-flex; align-items: center; justify-content: center; font-size: 7px; color: #fff; font-weight: 800; }
+  .mockup-b .hero { position: absolute; top: 70px; left: 0; right: 0; text-align: center; padding: 0 20px; }
+  .mockup-b .hero-title { font-size: 22px; font-weight: 800; line-height: 1.2; letter-spacing: -0.03em; color: #0F172A; }
+  .mockup-b .hero-title span { background: linear-gradient(135deg, #4F46E5 0%, #7C3AED 100%); -webkit-background-clip: text; -webkit-text-fill-color: transparent; }
+  .mockup-b .hero-sub { font-size: 9px; color: #64748B; margin-top: 8px; line-height: 1.5; }
+  .mockup-b .hero-btns { display: flex; gap: 6px; justify-content: center; margin-top: 14px; }
+  .mockup-b .btn-primary {
+    background: linear-gradient(135deg, #4F46E5, #7C3AED);
+    border-radius: 8px; padding: 5px 14px; font-size: 9px; color: #fff; font-weight: 600;
+    box-shadow: 0 4px 14px rgba(79,70,229,0.35);
+  }
+  .mockup-b .btn-ghost {
+    background: rgba(79,70,229,0.06); border: 1px solid rgba(79,70,229,0.2);
+    border-radius: 8px; padding: 5px 14px; font-size: 9px; color: #4F46E5;
+  }
+  .mockup-b .glass-cards {
+    position: absolute; bottom: 10px; left: 50%; transform: translateX(-50%);
+    width: calc(100% - 24px);
+    display: grid; grid-template-columns: repeat(3, 1fr); gap: 6px;
+  }
+  .mockup-b .glass-mini {
+    background: rgba(255,255,255,0.72);
+    backdrop-filter: blur(12px);
+    border: 1px solid rgba(255,255,255,0.9);
+    border-radius: 8px; padding: 6px 8px;
+    box-shadow: 0 2px 8px rgba(79,70,229,0.08);
+  }
+  .mockup-b .glass-mini-icon { font-size: 12px; margin-bottom: 3px; }
+  .mockup-b .glass-mini-text { font-size: 7px; color: #64748B; }
+
+  /* Option C: Dark + Warm Glow (深色暖调毛玻璃，类似截图) */
+  .mockup-c {
+    background: radial-gradient(ellipse at 60% 80%, rgba(180,60,10,0.30) 0%, transparent 55%),
+                radial-gradient(ellipse at 30% 20%, rgba(79,70,229,0.25) 0%, transparent 55%),
+                #080B14;
+  }
+  .mockup-c .nav {
+    position: absolute; top: 14px; left: 50%; transform: translateX(-50%);
+    width: calc(100% - 24px);
+    background: rgba(255,255,255,0.07);
+    backdrop-filter: blur(12px);
+    border: 1px solid rgba(255,255,255,0.10);
+    border-radius: 12px;
+    padding: 8px 16px;
+    display: flex; align-items: center; justify-content: space-between;
+    font-size: 10px; color: rgba(255,255,255,0.7);
+  }
+  .mockup-c .logo { font-weight: 700; font-size: 11px; color: #fff; display: flex; align-items: center; gap: 6px; }
+  .mockup-c .logo-dot { width: 16px; height: 16px; border-radius: 5px; background: linear-gradient(135deg, #4F46E5, #7C3AED); display: inline-flex; align-items: center; justify-content: center; font-size: 7px; color: #fff; font-weight: 800; }
+  .mockup-c .badges {
+    position: absolute; top: 56px; left: 50%; transform: translateX(-50%);
+    display: flex; gap: 4px; width: max-content;
+  }
+  .mockup-c .badge { background: rgba(255,255,255,0.08); border: 1px solid rgba(255,255,255,0.12); border-radius: 999px; padding: 2px 7px; font-size: 7px; color: rgba(255,255,255,0.65); }
+  .mockup-c .hero { position: absolute; top: 80px; left: 0; right: 0; text-align: center; padding: 0 20px; }
+  .mockup-c .hero-title { font-size: 21px; font-weight: 800; line-height: 1.2; letter-spacing: -0.03em; }
+  .mockup-c .hero-title .blue { color: #818CF8; }
+  .mockup-c .hero-title .orange { color: #FB923C; }
+  .mockup-c .hero-title .white { color: #FFFFFF; }
+  .mockup-c .hero-sub { font-size: 8.5px; color: rgba(255,255,255,0.42); margin-top: 8px; line-height: 1.55; max-width: 220px; margin-left: auto; margin-right: auto; }
+  .mockup-c .hero-btns { display: flex; gap: 6px; justify-content: center; margin-top: 12px; }
+  .mockup-c .btn-primary {
+    background: linear-gradient(135deg, #4F46E5, #7C3AED);
+    border-radius: 8px; padding: 5px 14px; font-size: 9px; color: #fff; font-weight: 600;
+    box-shadow: 0 4px 14px rgba(79,70,229,0.5);
+  }
+  .mockup-c .btn-ghost {
+    background: rgba(255,255,255,0.08); border: 1px solid rgba(255,255,255,0.15);
+    border-radius: 8px; padding: 5px 14px; font-size: 9px; color: rgba(255,255,255,0.7);
+  }
+  .mockup-c .feat-row {
+    position: absolute; bottom: 10px; left: 50%; transform: translateX(-50%);
+    width: calc(100% - 24px);
+    display: grid; grid-template-columns: repeat(3, 1fr); gap: 5px;
+  }
+  .mockup-c .feat-card {
+    background: rgba(255,255,255,0.05);
+    border: 1px solid rgba(255,255,255,0.08);
+    border-radius: 8px; padding: 6px 8px;
+    text-align: center;
+  }
+  .mockup-c .feat-icon { font-size: 13px; margin-bottom: 3px; }
+  .mockup-c .feat-text { font-size: 7px; color: rgba(255,255,255,0.50); }
+
+  /* Card body */
+  .card-body { padding: 16px; }
+  .card-label { font-size: 13px; font-weight: 700; color: #fff; margin-bottom: 4px; }
+  .card-desc { font-size: 11px; color: #94A3B8; line-height: 1.5; margin-bottom: 12px; }
+  .pros-cons { display: flex; gap: 10px; font-size: 10px; }
+  .pros { color: #34D399; }
+  .cons { color: #F87171; }
+  .pros ul, .cons ul { padding-left: 12px; }
+  .pros li, .cons li { margin-bottom: 2px; }
+
+  .rec-badge {
+    display: inline-block; background: linear-gradient(135deg, #4F46E5, #7C3AED);
+    color: #fff; font-size: 9px; font-weight: 700; padding: 2px 8px;
+    border-radius: 999px; margin-bottom: 6px; letter-spacing: 0.03em;
+  }
+
+  /* Footer */
+  .footer { text-align: center; margin-top: 24px; font-size: 11px; color: #64748B; }
+</style>
+<script>
+function toggleSelect(card) {
+  document.querySelectorAll('.card').forEach(c => c.classList.remove('selected'));
+  card.classList.add('selected');
+  const choice = card.dataset.choice;
+  const text = card.querySelector('.card-label').textContent;
+  if (window.parent && window.parent !== window) {
+    window.parent.postMessage({ type: 'select', choice, text }, '*');
+  }
+  if (window.__recordClick) window.__recordClick(choice, text);
+}
+</script>
+</head>
+<body>
+
+<h2>落地页风格方向选择</h2>
+<p class="subtitle">选择最适合 ApplyMate AI 的视觉方向 · 三个方案都支持毛玻璃效果</p>
+
+<div class="cards">
+
+  <!-- Option A: Dark Glass -->
+  <div class="card" data-choice="a" onclick="toggleSelect(this)">
+    <div class="mockup mockup-a">
+      <div class="nav">
+        <span class="logo"><span class="logo-dot">A</span> ApplyMate AI</span>
+        <span style="display:flex;gap:10px;font-size:8.5px;color:rgba(255,255,255,0.5)"><span>Features</span><span>Pricing</span><span style="background:linear-gradient(135deg,#4F46E5,#7C3AED);-webkit-background-clip:text;-webkit-text-fill-color:transparent;font-weight:700">Login →</span></span>
+      </div>
+      <div class="hero">
+        <div class="hero-title"><span>AI 驱动</span><br><span style="color:#fff">求职自动化平台</span></div>
+        <div class="hero-sub">自动投递 · 简历定制 · 面试准备<br>覆盖欧洲 50,000+ 职位</div>
+        <div class="hero-btns">
+          <div class="btn-primary">免费开始</div>
+          <div class="btn-ghost">查看演示</div>
+        </div>
+      </div>
+      <div class="glass-cards">
+        <div class="glass-mini"><div class="glass-mini-icon">🤖</div><div class="glass-mini-text">AI 自动投递</div></div>
+        <div class="glass-mini"><div class="glass-mini-icon">📄</div><div class="glass-mini-text">智能简历</div></div>
+        <div class="glass-mini"><div class="glass-mini-icon">📊</div><div class="glass-mini-text">求职追踪</div></div>
+      </div>
+    </div>
+    <div class="card-body">
+      <div class="card-label">A · 深色毛玻璃</div>
+      <div class="card-desc">深邃宇宙背景 + 紫色光晕，纯暗色系，Premium & Tech 质感最强</div>
+      <div class="pros-cons">
+        <div class="pros"><ul><li>科技感顶级</li><li>对比度强</li><li>夜间友好</li></ul></div>
+        <div class="cons"><ul><li>不跟随系统主题</li><li>白天稍显压抑</li></ul></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Option B: Light Glass -->
+  <div class="card" data-choice="b" onclick="toggleSelect(this)">
+    <div class="mockup mockup-b">
+      <div class="nav">
+        <span class="logo"><span class="logo-dot">A</span> ApplyMate AI</span>
+        <span style="display:flex;gap:10px;font-size:8.5px;color:#64748B"><span>Features</span><span>Pricing</span><span style="color:#4F46E5;font-weight:700">Login →</span></span>
+      </div>
+      <div class="hero">
+        <div class="hero-title"><span>AI 驱动</span><br><span style="color:#0F172A">求职自动化平台</span></div>
+        <div class="hero-sub">自动投递 · 简历定制 · 面试准备<br>覆盖欧洲 50,000+ 职位</div>
+        <div class="hero-btns">
+          <div class="btn-primary">免费开始</div>
+          <div class="btn-ghost">查看演示</div>
+        </div>
+      </div>
+      <div class="glass-cards">
+        <div class="glass-mini"><div class="glass-mini-icon">🤖</div><div class="glass-mini-text" style="color:#475569">AI 自动投递</div></div>
+        <div class="glass-mini"><div class="glass-mini-icon">📄</div><div class="glass-mini-text" style="color:#475569">智能简历</div></div>
+        <div class="glass-mini"><div class="glass-mini-icon">📊</div><div class="glass-mini-text" style="color:#475569">求职追踪</div></div>
+      </div>
+    </div>
+    <div class="card-body">
+      <div class="card-label">B · 浅色毛玻璃</div>
+      <div class="card-desc">浅紫渐变背景 + 白色玻璃卡片，清新专业，Apple 官网风格</div>
+      <div class="pros-cons">
+        <div class="pros"><ul><li>苹果感最强</li><li>白天舒适</li><li>信任感高</li></ul></div>
+        <div class="cons"><ul><li>暗黑用户需切换</li><li>对比度略低</li></ul></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Option C: Dark + Warm Glow (Recommended) -->
+  <div class="card" data-choice="c" onclick="toggleSelect(this)">
+    <div class="card-body" style="position:absolute;top:4px;left:4px;padding:0;z-index:2">
+      <span class="rec-badge" style="font-size:8px;padding:2px 7px">★ 推荐</span>
+    </div>
+    <div class="mockup mockup-c">
+      <div class="nav">
+        <span class="logo"><span class="logo-dot">A</span> ApplyMate AI</span>
+        <span style="display:flex;gap:10px;font-size:8.5px;color:rgba(255,255,255,0.5)"><span>Features</span><span>Pricing</span><span style="color:#818CF8;font-weight:700">Login →</span></span>
+      </div>
+      <div class="badges">
+        <span class="badge">🤖 AI 投递</span>
+        <span class="badge">📄 智能简历</span>
+        <span class="badge">🌍 欧洲职位</span>
+      </div>
+      <div class="hero">
+        <div class="hero-title">
+          <span class="blue">AI 驱动</span> <span class="orange">求职</span><br>
+          <span class="white">自动化平台</span>
+        </div>
+        <div class="hero-sub">一键投递 · 简历定制 · 面试准备 · 邮件管理<br>覆盖欧洲 50,000+ 职位机会</div>
+        <div class="hero-btns">
+          <div class="btn-primary">免费开始</div>
+          <div class="btn-ghost">查看演示</div>
+        </div>
+      </div>
+      <div class="feat-row">
+        <div class="feat-card"><div class="feat-icon">🤖</div><div class="feat-text">AI 自动投递</div></div>
+        <div class="feat-card"><div class="feat-icon">📄</div><div class="feat-text">简历定制</div></div>
+        <div class="feat-card"><div class="feat-icon">📊</div><div class="feat-text">求职追踪</div></div>
+      </div>
+    </div>
+    <div class="card-body">
+      <div class="rec-badge">★ 推荐方案</div>
+      <div class="card-label">C · 深色暖调毛玻璃</div>
+      <div class="card-desc">深色底 + 橙紫双色光晕，最接近截图风格，视觉冲击力最强，与竞品差异最大</div>
+      <div class="pros-cons">
+        <div class="pros"><ul><li>与截图最匹配</li><li>视觉张力强</li><li>独特品牌感</li></ul></div>
+        <div class="cons"><ul><li>转化率需验证</li><li>浅色用户需适应</li></ul></div>
+      </div>
+    </div>
+  </div>
+
+</div>
+
+<div class="footer">点击卡片选择方向 · 在终端告诉我你的选择和任何补充需求</div>
+
+</body>
+</html>

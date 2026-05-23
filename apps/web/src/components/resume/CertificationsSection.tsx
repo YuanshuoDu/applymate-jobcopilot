@@ -51,7 +51,7 @@ export function CertificationsSection({ certifications, onChange, dragHandleProp
 
           {certifications.map((c, i) => (
             editIdx === i ? (
-              <div key={i} style={{ border: '0.5px solid #185FA5', borderRadius: 6, padding: 10, marginBottom: 8 }}>
+              <div key={i} style={{ border: '0.5px solid var(--primary)', borderRadius: 6, padding: 10, marginBottom: 8 }}>
                 <InlineInput value={c.name}   onChange={v => { const n=[...certifications]; n[i]={...n[i],name:v};   onChange(n) }} placeholder="Certification Name" style={{ marginBottom: 6 }} />
                 <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 6, marginBottom: 6 }}>
                   <InlineInput value={c.issuer} onChange={v => { const n=[...certifications]; n[i]={...n[i],issuer:v}; onChange(n) }} placeholder="Issuing Organization" />
@@ -60,7 +60,7 @@ export function CertificationsSection({ certifications, onChange, dragHandleProp
                 <InlineInput value={c.url??''} onChange={v => { const n=[...certifications]; n[i]={...n[i],url:v||undefined}; onChange(n) }} placeholder="Credential URL (optional)" />
                 <div style={{ display: 'flex', justifyContent: 'space-between', marginTop: 8 }}>
                   <button onClick={() => { onChange(certifications.filter((_,xi)=>xi!==i)); setEditIdx(null) }}
-                    style={{ fontSize: 10, color: '#A32D2D', background: 'none', border: 'none', cursor: 'pointer' }}>Delete</button>
+                    style={{ fontSize: 10, color: 'var(--c-danger)', background: 'none', border: 'none', cursor: 'pointer' }}>Delete</button>
                   <Btn small variant="primary" onClick={() => setEditIdx(null)}>Done</Btn>
                 </div>
               </div>
@@ -71,7 +71,7 @@ export function CertificationsSection({ certifications, onChange, dragHandleProp
                 onDragLeave={() => setDragOver(null)}
                 onDrop={() => handleDrop(i)}
                 style={{ display: 'flex', gap: 4, cursor: 'pointer', padding: '4px 4px 4px 0', borderRadius: 4, marginBottom: 6,
-                  border: dragOver===i ? '0.5px dashed #185FA5' : '0.5px solid transparent',
+                  border: dragOver===i ? '0.5px dashed var(--primary)' : '0.5px solid transparent',
                   background: dragOver===i ? 'rgba(24,95,165,0.03)' : 'transparent' }}
                 onMouseEnter={e => { if(dragOver!==i)(e.currentTarget as HTMLDivElement).style.background='var(--bg-secondary)' }}
                 onMouseLeave={e => { if(dragOver!==i)(e.currentTarget as HTMLDivElement).style.background='transparent' }}>
@@ -80,7 +80,7 @@ export function CertificationsSection({ certifications, onChange, dragHandleProp
                   <div>
                     <span style={{ fontSize: 12, fontWeight: 500 }}>{c.name || <em style={{ color: 'var(--text-muted)' }}>Untitled</em>}</span>
                     {c.issuer && <span style={{ fontSize: 12, color: 'var(--text-muted)' }}> · {c.issuer}</span>}
-                    {c.url && <a href={c.url} target="_blank" rel="noreferrer" onClick={e => e.stopPropagation()} style={{ fontSize: 10, color: '#185FA5', marginLeft: 8 }}>↗ verify</a>}
+                    {c.url && <a href={c.url} target="_blank" rel="noreferrer" onClick={e => e.stopPropagation()} style={{ fontSize: 10, color: 'var(--primary)', marginLeft: 8 }}>↗ verify</a>}
                   </div>
                   <span style={{ fontSize: 11, color: 'var(--text-muted)', flexShrink: 0 }}>{c.date}</span>
                 </div>

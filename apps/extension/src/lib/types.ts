@@ -17,7 +17,7 @@ export interface ScrapedJob {
   description: string
   salary:      string | null
   url:         string
-  source:      'linkedin' | 'indeed' | 'glassdoor' | 'wellfound' | 'greenhouse' | 'lever' | 'workday' | 'stepstone' | 'xing' | 'unknown'
+  source:      'linkedin' | 'indeed' | 'glassdoor' | 'wellfound' | 'greenhouse' | 'lever' | 'workday' | 'stepstone' | 'xing' | 'smartrecruiters' | 'ashby' | 'bamboohr' | 'jobvite' | 'icims' | 'unknown'
 }
 
 export interface SavedJob {

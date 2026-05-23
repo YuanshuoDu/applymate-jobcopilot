@@ -1,10 +1,10 @@
 'use client'
 
 import React, { useState, useEffect, useCallback, useRef } from 'react'
-import { signIn } from 'next-auth/react'
 import { useSession } from 'next-auth/react'
 import { TopBar }              from '@/components/layout/TopBar'
 import { Btn, Card, useToast } from '@/components/ui'
+import { useI18n }             from '@/lib/i18n'
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
@@ -26,11 +26,11 @@ type GmailStatus = 'loading' | 'no_google' | 'no_gmail' | 'ready' | 'error'
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 const TAG_CONFIG: Record<string, { label: string; color: string; bg: string }> = {
-  interview: { label: 'Interview',  color: '#3B6D11', bg: 'rgba(59,109,17,0.12)'   },
-  offer:     { label: 'Offer 🎉',  color: '#0E7490', bg: 'rgba(14,116,144,0.12)'  },
-  rejected:  { label: 'Rejected',   color: '#A32D2D', bg: 'rgba(163,45,45,0.12)'   },
-  review:    { label: 'In Review',  color: '#854F0B', bg: 'rgba(133,79,11,0.12)'   },
-  received:  { label: 'Received',   color: '#185FA5', bg: 'rgba(24,95,165,0.12)'   },
+  interview: { label: 'Interview',  color: 'var(--c-success)', bg: 'rgba(5,150,105,0.12)'   },
+  offer:     { label: 'Offer 🎉',  color: 'var(--c-info)', bg: 'rgba(2,132,199,0.12)'  },
+  rejected:  { label: 'Rejected',   color: 'var(--c-danger)', bg: 'rgba(220,38,38,0.12)'   },
+  review:    { label: 'In Review',  color: 'var(--c-warning)', bg: 'rgba(217,119,6,0.12)'   },
+  received:  { label: 'Received',   color: 'var(--primary)', bg: 'rgba(79,70,229,0.12)'   },
   viewed:    { label: 'Viewed',     color: '#6B7280', bg: 'rgba(107,114,128,0.12)' },
 }
 
@@ -162,11 +162,11 @@ function ReplyModal({ email, body, onClose }: ReplyModalProps) {
         <div style={{ flex: 1, overflowY: 'auto', padding: 20 }}>
           {loading ? (
             <div style={{ display: 'flex', alignItems: 'center', gap: 8, color: 'var(--text-muted)', fontSize: 12 }}>
-              <div style={{ width: 14, height: 14, border: '2px solid rgba(24,95,165,0.2)', borderTopColor: '#185FA5', borderRadius: '50%', animation: 'spin 0.7s linear infinite' }} />
+              <div style={{ width: 14, height: 14, border: '2px solid rgba(79,70,229,0.15)', borderTopColor: 'var(--primary)', borderRadius: '50%', animation: 'spin 0.7s linear infinite' }} />
               Generating reply with AI…
             </div>
           ) : error ? (
-            <div style={{ fontSize: 12, color: '#A32D2D' }}>{error}</div>
+            <div style={{ fontSize: 12, color: 'var(--c-danger)' }}>{error}</div>
           ) : (
             <textarea
               value={reply}
@@ -201,6 +201,62 @@ function ReplyModal({ email, body, onClose }: ReplyModalProps) {
   )
 }
 
+// ── RichEmailBody ─────────────────────────────────────────────────────────────
+
+const URL_RE = /(https?:\/\/[^\s<>"]+)/g
+
+function RichEmailBody({ text }: { text: string }) {
+  const lines = text.split('\n')
+  const nodes: React.ReactNode[] = []
+
+  let inSignature = false
+
+  for (let i = 0; i < lines.length; i++) {
+    const raw = lines[i]
+    const trimmed = raw.trim()
+
+    // Signature block (-- alone on a line)
+    if (trimmed === '--' || trimmed === '—') { inSignature = true }
+
+    // Separator line
+    if (/^[-=_*]{3,}$/.test(trimmed)) {
+      nodes.push(<hr key={i} style={{ border: 'none', borderTop: '0.5px solid var(--border)', margin: '10px 0' }} />)
+      continue
+    }
+
+    // Detect heading: short line (≤60 chars), ALL-CAPS with letters, or ends with ':'
+    const isHeading = !inSignature && trimmed.length > 0 && trimmed.length <= 60
+      && trimmed === trimmed.toUpperCase() && /[A-Z]/.test(trimmed)
+
+    // Build inline content (linkify URLs)
+    const parts = raw.split(URL_RE)
+    const inline = parts.map((part, j) =>
+      URL_RE.test(part)
+        ? <a key={j} href={part} target="_blank" rel="noopener noreferrer"
+            style={{ color: 'var(--primary)', textDecoration: 'underline', wordBreak: 'break-all' }}>
+            {part.length > 60 ? part.slice(0, 57) + '…' : part}
+          </a>
+        : part
+    )
+
+    nodes.push(
+      <div key={i} style={{
+        fontSize: isHeading ? 11 : 12,
+        fontWeight: isHeading ? 700 : inSignature ? 400 : 400,
+        color: isHeading ? 'var(--text)' : inSignature ? 'var(--text-muted)' : 'var(--text)',
+        letterSpacing: isHeading ? 0.4 : 0,
+        marginTop: isHeading ? 14 : 0,
+        lineHeight: 1.75,
+        opacity: inSignature ? 0.7 : 1,
+      }}>
+        {inline.length === 1 && inline[0] === '' ? <>&nbsp;</> : inline}
+      </div>
+    )
+  }
+
+  return <div style={{ fontFamily: 'inherit' }}>{nodes}</div>
+}
+
 // ── EmailBody ─────────────────────────────────────────────────────────────────
 
 function EmailBody({ email, onClose, onStar, onMarkRead }: {
@@ -209,12 +265,17 @@ function EmailBody({ email, onClose, onStar, onMarkRead }: {
   onStar:     (id: string) => void
   onMarkRead: (id: string) => void
 }) {
-  const [body,        setBody]        = useState<string | null>(null)
-  const [loading,     setLoading]     = useState(true)
-  const [showReply,   setShowReply]   = useState(false)
+  const [body,          setBody]          = useState<string | null>(null)
+  const [loading,       setLoading]       = useState(true)
+  const [showReply,     setShowReply]     = useState(false)
+  const [translated,    setTranslated]    = useState<string | null>(null)
+  const [translating,   setTranslating]   = useState(false)
+  const [showTranslated,setShowTranslated]= useState(false)
+  const { lang } = useI18n()
   const toast = useToast()
 
   useEffect(() => {
+    setTranslated(null); setShowTranslated(false)
     onMarkRead(email.id)
     fetch(`/api/gmail/message/${email.id}`)
       .then(r => r.json())
@@ -223,7 +284,33 @@ function EmailBody({ email, onClose, onStar, onMarkRead }: {
       .finally(() => setLoading(false))
   }, [email.id, email.preview, onMarkRead])
 
-  const canReply = ['interview', 'offer', 'rejected', 'review', 'received', 'viewed'].includes(email.tag)
+  async function handleTranslate() {
+    if (translated) { setShowTranslated(v => !v); return }
+    if (!body) return
+    setTranslating(true)
+    try {
+      const targetLang = lang === 'zh' ? 'en' : 'zh'
+      const res = await fetch('/api/ai/translate', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ text: body.slice(0, 3500), targetLang }),
+      })
+      const data = await res.json()
+      if (data.translated) {
+        setTranslated(data.translated)
+        setShowTranslated(true)
+      } else {
+        toast.error('Translation failed', 'Please try again')
+      }
+    } catch {
+      toast.error('Network error', 'Could not reach translation service')
+    } finally {
+      setTranslating(false)
+    }
+  }
+
+  const canReply   = ['interview', 'offer', 'rejected', 'review', 'received', 'viewed'].includes(email.tag)
+  const displayBody = showTranslated && translated ? translated : body
 
   return (
     <>
@@ -251,27 +338,49 @@ function EmailBody({ email, onClose, onStar, onMarkRead }: {
         </div>
       </div>
 
+      {/* Translate banner */}
+      {showTranslated && (
+        <div style={{ padding: '4px 18px', background: 'rgba(79,70,229,0.06)', borderBottom: '0.5px solid var(--border)', display: 'flex', alignItems: 'center', gap: 6 }}>
+          <span style={{ fontSize: 10, color: 'var(--primary)' }}>🌐 {lang === 'zh' ? 'Translated to English' : '已翻译为中文'}</span>
+          <button onClick={() => setShowTranslated(false)}
+            style={{ marginLeft: 'auto', fontSize: 10, color: 'var(--text-muted)', background: 'none', border: 'none', cursor: 'pointer' }}>
+            Show original
+          </button>
+        </div>
+      )}
+
       {/* Body */}
-      <div style={{ flex: 1, overflowY: 'auto', padding: '20px 24px' }}>
+      <div style={{ flex: 1, overflowY: 'auto', padding: '16px 24px' }}>
         {loading ? (
           <div style={{ display: 'flex', alignItems: 'center', gap: 8, color: 'var(--text-muted)', fontSize: 12 }}>
-            <div style={{ width: 14, height: 14, border: '2px solid rgba(24,95,165,0.2)', borderTopColor: '#185FA5', borderRadius: '50%', animation: 'spin 0.7s linear infinite' }} />
+            <div style={{ width: 14, height: 14, border: '2px solid rgba(79,70,229,0.15)', borderTopColor: 'var(--primary)', borderRadius: '50%', animation: 'spin 0.7s linear infinite' }} />
             Loading message…
           </div>
-        ) : (
-          <pre style={{ fontSize: 12, lineHeight: 1.75, color: 'var(--text)', whiteSpace: 'pre-wrap', wordBreak: 'break-word', margin: 0, fontFamily: 'inherit' }}>
-            {body}
-          </pre>
-        )}
+        ) : displayBody ? (
+          <RichEmailBody text={displayBody} />
+        ) : null}
       </div>
 
       {/* Footer */}
-      <div style={{ padding: '10px 18px', borderTop: '0.5px solid var(--border)', display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+      <div style={{ padding: '10px 18px', borderTop: '0.5px solid var(--border)', display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'center' }}>
         <Btn variant="ghost" onClick={() => window.open(`https://mail.google.com/mail/#inbox/${email.threadId}`, '_blank')}>
           Open in Gmail ↗
         </Btn>
+        {!loading && body && (
+          <button onClick={handleTranslate} disabled={translating}
+            style={{
+              padding: '5px 12px', fontSize: 11, borderRadius: 6,
+              border: `0.5px solid ${showTranslated ? 'var(--primary)' : 'var(--border)'}`,
+              background: showTranslated ? 'rgba(79,70,229,0.08)' : 'var(--bg-secondary)',
+              color: showTranslated ? 'var(--primary)' : 'var(--text-muted)',
+              cursor: translating ? 'default' : 'pointer', opacity: translating ? 0.6 : 1,
+              display: 'flex', alignItems: 'center', gap: 4,
+            }}>
+            {translating ? '⏳' : '🌐'} {translating ? (lang === 'zh' ? '翻译中…' : 'Translating…') : showTranslated ? (lang === 'zh' ? '显示原文' : 'Show original') : (lang === 'zh' ? '翻译' : 'Translate')}
+          </button>
+        )}
         {canReply && !loading && (
-          <Btn variant="primary" onClick={() => setShowReply(true)}>
+          <Btn variant="primary" onClick={() => setShowReply(true)} style={{ marginLeft: 'auto' }}>
             ✨ AI Reply
           </Btn>
         )}
@@ -302,12 +411,7 @@ export function GmailPage() {
   const [search,     setSearch]     = useState('')
   const [refreshing, setRefreshing] = useState(false)
 
-  // Detect return from Gmail OAuth flow
-  const gmailCallbackUrl = typeof window !== 'undefined'
-    ? `${window.location.origin}/?page=gmail&gmailAuth=1`
-    : '/?page=gmail&gmailAuth=1'
-
-  // Prevent double-auth-redirect: track if we already triggered signIn this session
+  // Prevent double-auth-redirect: track if we already triggered the OAuth flow
   const authTriggeredRef = useRef(false)
 
   const loadEmails = useCallback(async (silent = false) => {
@@ -355,13 +459,24 @@ export function GmailPage() {
       window.history.replaceState({}, '', url)
       toast.success('Google account connected!', 'Loading your Gmail…')
     }
+    const gErr = params.get('gmailError')
+    if (gErr) {
+      const url = new URL(window.location.href)
+      url.searchParams.delete('gmailError')
+      window.history.replaceState({}, '', url)
+      toast.error('Gmail connection failed', gErr)
+    }
     loadEmails()
   }, [loadEmails, toast])
 
   function connectGoogle() {
-    if (authTriggeredRef.current) return   // Prevent duplicate triggers
+    if (authTriggeredRef.current) return
     authTriggeredRef.current = true
-    signIn('google', { callbackUrl: gmailCallbackUrl })
+    // Use the dedicated Gmail OAuth flow rather than NextAuth's signIn — that one
+    // would change the session identity and refuses to link a Google account whose
+    // email differs from the current user's email. Our flow attaches Google tokens
+    // to the existing user without touching the session.
+    window.location.href = '/api/gmail/oauth/start'
   }
 
   const toggleStar = useCallback((id: string) => {
@@ -398,7 +513,7 @@ export function GmailPage() {
       <TopBar title="Gmail Tracker" />
       <div style={{ flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
         <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 10 }}>
-          <div style={{ width: 24, height: 24, border: '2.5px solid rgba(24,95,165,0.2)', borderTopColor: '#185FA5', borderRadius: '50%', animation: 'spin 0.7s linear infinite' }} />
+          <div style={{ width: 24, height: 24, border: '2.5px solid rgba(79,70,229,0.15)', borderTopColor: 'var(--primary)', borderRadius: '50%', animation: 'spin 0.7s linear infinite' }} />
           <div style={{ fontSize: 12, color: 'var(--text-muted)' }}>Loading Gmail…</div>
         </div>
       </div>
@@ -417,7 +532,7 @@ export function GmailPage() {
       <TopBar title="Gmail Tracker" />
       <div style={{ flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
         <Card style={{ padding: 32, textAlign: 'center', maxWidth: 360 }}>
-          <div style={{ fontSize: 13, color: '#A32D2D', marginBottom: 12 }}>Failed to load Gmail</div>
+          <div style={{ fontSize: 13, color: 'var(--c-danger)', marginBottom: 12 }}>Failed to load Gmail</div>
           <div style={{ display: 'flex', gap: 8, justifyContent: 'center' }}>
             <Btn variant="ghost"   onClick={connectGoogle}>Reconnect Google</Btn>
             <Btn variant="primary" onClick={() => { authTriggeredRef.current = false; loadEmails() }}>Retry</Btn>
@@ -433,7 +548,7 @@ export function GmailPage() {
     <div style={{ flex: 1, display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
       <TopBar title="Gmail Tracker">
         {unreadCount > 0 && (
-          <span style={{ fontSize: 11, background: '#185FA5', color: '#fff', borderRadius: 999, padding: '2px 8px', fontWeight: 500 }}>
+          <span style={{ fontSize: 11, background: 'var(--primary)', color: '#fff', borderRadius: 999, padding: '2px 8px', fontWeight: 500 }}>
             {unreadCount} unread
           </span>
         )}
@@ -460,8 +575,8 @@ export function GmailPage() {
             <button key={f.key} onClick={() => setFilter(f.key)} style={{
               width: '100%', display: 'flex', alignItems: 'center', justifyContent: 'space-between',
               padding: '7px 10px', borderRadius: 6, border: 'none', cursor: 'pointer', marginBottom: 2,
-              background: filter === f.key ? 'rgba(24,95,165,0.12)' : 'transparent',
-              color: filter === f.key ? '#185FA5' : 'var(--text)',
+              background: filter === f.key ? 'rgba(79,70,229,0.12)' : 'transparent',
+              color: filter === f.key ? 'var(--primary)' : 'var(--text)',
               fontSize: 12, fontWeight: filter === f.key ? 500 : 400,
             }}>
               <span>{f.label}</span>
@@ -512,14 +627,14 @@ export function GmailPage() {
               onClick={() => setSelected(email)}
               style={{
                 padding: '11px 14px', borderBottom: '0.5px solid var(--border)', cursor: 'pointer',
-                background: selected?.id === email.id ? 'rgba(24,95,165,0.06)' : email.read ? 'var(--bg)' : 'rgba(24,95,165,0.03)',
+                background: selected?.id === email.id ? 'rgba(79,70,229,0.06)' : email.read ? 'var(--bg)' : 'rgba(24,95,165,0.03)',
               }}
               onMouseEnter={e => { if (selected?.id !== email.id) (e.currentTarget as HTMLDivElement).style.background = 'var(--bg-secondary)' }}
               onMouseLeave={e => { if (selected?.id !== email.id) (e.currentTarget as HTMLDivElement).style.background = email.read ? 'var(--bg)' : 'rgba(24,95,165,0.03)' }}>
 
               <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 3 }}>
                 <div style={{ display: 'flex', alignItems: 'center', gap: 5, minWidth: 0 }}>
-                  {!email.read && <span style={{ width: 6, height: 6, borderRadius: '50%', background: '#185FA5', flexShrink: 0 }} />}
+                  {!email.read && <span style={{ width: 6, height: 6, borderRadius: '50%', background: 'var(--primary)', flexShrink: 0 }} />}
                   <span style={{ fontSize: 12, fontWeight: email.read ? 400 : 600, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
                     {email.name}
                   </span>

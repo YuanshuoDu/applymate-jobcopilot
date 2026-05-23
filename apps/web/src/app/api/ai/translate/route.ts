@@ -38,20 +38,18 @@ export async function POST(req: NextRequest) {
   const trimmed = text.length > MAX_CHARS ? text.slice(0, MAX_CHARS) + '\n\n[...truncated...]' : text
 
   const prompt = src === 'auto'
-    ? `Translate the following job description to ${tgtName}. Detect the source language automatically. Preserve the original formatting, line breaks, and technical terms (do not translate company names, software names, or programming languages). Only output the translated text — no preamble, no explanation.
+    ? `Translate the text below to ${tgtName}. Detect the source language automatically. Preserve the original formatting, line breaks, and technical terms (do not translate company names, software names, or programming languages). Output ONLY the translated text — no preamble, no label, no explanation.
 
-JOB DESCRIPTION:
 ${trimmed}`
-    : `Translate the following job description from ${LANG_NAMES[src] ?? src} to ${tgtName}. Preserve the original formatting, line breaks, and technical terms (do not translate company names, software names, or programming languages). Only output the translated text — no preamble, no explanation.
+    : `Translate the text below from ${LANG_NAMES[src] ?? src} to ${tgtName}. Preserve the original formatting, line breaks, and technical terms (do not translate company names, software names, or programming languages). Output ONLY the translated text — no preamble, no label, no explanation.
 
-JOB DESCRIPTION:
 ${trimmed}`
 
   try {
     const cfg    = prep.cfg
     const result = await modelChat([{ role: 'user', content: prompt }], cfg, 2048)
     return ok({
-      translated:  result.text,
+      translated:  stripFences(result.text).trim(),
       sourceLang:  src,
       targetLang:  tgt,
       _model:      `${cfg.provider}/${cfg.model}`,

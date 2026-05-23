@@ -41,7 +41,7 @@ export function SectionHeader({ title, count, collapsed, onToggle, onAdd, addLab
       <div style={{ display: 'flex', alignItems: 'center', gap: 5 }}>
         {!collapsed && onAdd && (
           <button onClick={e => { e.stopPropagation(); onAdd() }}
-            style={{ fontSize: 10, color: '#185FA5', background: 'none', border: 'none', cursor: 'pointer' }}>
+            style={{ fontSize: 10, color: 'var(--primary)', background: 'none', border: 'none', cursor: 'pointer' }}>
             + {addLabel ?? 'Add'}
           </button>
         )}

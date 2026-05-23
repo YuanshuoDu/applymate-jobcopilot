@@ -2,6 +2,7 @@
 
 import React, { useState, useEffect, useRef } from 'react'
 import { TopBar } from '@/components/layout/TopBar'
+import { useI18n } from '@/lib/i18n'
 
 // Module-level analysis cache — survives component unmount/remount during tab navigation
 const LS_KEY = 'applymate_last_analysis'
@@ -18,8 +19,8 @@ function saveCache(data: { resumeId: string | null; jobId: string | null; score:
 }
 import { Btn, useToast, useConfirm } from '@/components/ui'
 import { useApi, apiMutate, fmtDate, fmtRelative } from '@/lib/hooks'
-import type { ResumeListItem, ResumeContent, Resume, Job, ScoreResult, Suggestion, TemplateOptions } from '@/lib/types'
-import { CoverLetterModal } from '@/components/resume/CoverLetterModal'
+import type { ResumeListItem, ResumeContent, Resume, Job, ScoreResult, Suggestion, TemplateOptions, Direction } from '@/lib/types'
+import { CoverLetterPanel } from '@/components/coverletter/CoverLetterPanel'
 import { TemplateModal, TEMPLATES } from '@/components/resume/TemplateModal'
 import { ResumeRenderer } from '@/components/resume/ResumeRenderer'
 import { ContactSection } from '@/components/resume/ContactSection'
@@ -33,6 +34,7 @@ import { CertificationsSection } from '@/components/resume/CertificationsSection
 import { CustomSection } from '@/components/resume/CustomSection'
 import { AiPanel } from '@/components/resume/AiPanel'
 import { UploadResumeModal } from '@/components/resume/UploadResumeModal'
+import { ResumeIntakeDialog } from '@/components/resume/ResumeIntakeDialog'
 import type { DragHandleProps } from '@/components/resume/SectionHeader'
 import type { AiFieldContext } from '@/components/resume/AiFieldSuggestion'
 
@@ -80,7 +82,7 @@ function calcCompleteness(c: ResumeContent): { score: number; tips: string[] } {
 
 function CompletenessBar({ content }: { content: ResumeContent }) {
   const { score, tips } = calcCompleteness(content)
-  const color = score >= 80 ? '#3B6D11' : score >= 50 ? '#185FA5' : '#854F0B'
+  const color = score >= 80 ? 'var(--c-success)' : score >= 50 ? 'var(--primary)' : 'var(--c-warning)'
   const [showTips, setShowTips] = useState(false)
   return (
     <div style={{ marginBottom: 12, padding: '8px 12px', background: 'var(--bg)', border: '0.5px solid var(--border)', borderRadius: 8 }}>
@@ -90,11 +92,11 @@ function CompletenessBar({ content }: { content: ResumeContent }) {
           <span style={{ fontSize: 11, fontWeight: 600, color }}>{score}%</span>
           {tips.length > 0 && (
             <button onClick={() => setShowTips(v => !v)}
-              style={{ fontSize: 9, color: '#185FA5', background: 'rgba(24,95,165,0.08)', border: '0.5px solid rgba(24,95,165,0.2)', borderRadius: 10, padding: '1px 7px', cursor: 'pointer' }}>
+              style={{ fontSize: 9, color: 'var(--primary)', background: 'rgba(79,70,229,0.08)', border: '0.5px solid rgba(79,70,229,0.20)', borderRadius: 10, padding: '1px 7px', cursor: 'pointer' }}>
               {showTips ? 'Hide tips' : `${tips.length} tip${tips.length > 1 ? 's' : ''}`}
             </button>
           )}
-          {score === 100 && <span style={{ fontSize: 10, color: '#3B6D11' }}>✓ Complete</span>}
+          {score === 100 && <span style={{ fontSize: 10, color: 'var(--c-success)' }}>✓ Complete</span>}
         </div>
       </div>
       <div style={{ height: 5, background: 'var(--border)', borderRadius: 3, overflow: 'hidden' }}>
@@ -103,7 +105,7 @@ function CompletenessBar({ content }: { content: ResumeContent }) {
       {showTips && tips.length > 0 && (
         <div style={{ marginTop: 8, display: 'flex', flexWrap: 'wrap', gap: 4 }}>
           {tips.map(t => (
-            <span key={t} style={{ fontSize: 9, background: 'rgba(133,79,11,0.08)', color: '#854F0B', border: '0.5px solid rgba(133,79,11,0.2)', borderRadius: 10, padding: '2px 8px' }}>{t}</span>
+            <span key={t} style={{ fontSize: 9, background: 'rgba(217,119,6,0.08)', color: 'var(--c-warning)', border: '0.5px solid rgba(217,119,6,0.20)', borderRadius: 10, padding: '2px 8px' }}>{t}</span>
           ))}
         </div>
       )}
@@ -123,11 +125,62 @@ function NewResumeModal({ onClose, onCreate }: { onClose: () => void; onCreate: 
         <input autoFocus value={name} onChange={e => setName(e.target.value)}
           onKeyDown={e => { if (e.key === 'Enter' && name.trim()) onCreate(name.trim()); if (e.key === 'Escape') onClose() }}
           placeholder="Resume name…"
-          style={{ width: '100%', fontSize: 13, padding: '8px 10px', border: '0.5px solid #185FA5', borderRadius: 6, outline: 'none', boxSizing: 'border-box', color: 'var(--text)', background: 'var(--bg)' }}
+          style={{ width: '100%', fontSize: 13, padding: '8px 10px', border: '0.5px solid var(--primary)', borderRadius: 6, outline: 'none', boxSizing: 'border-box', color: 'var(--text)', background: 'var(--bg)' }}
         />
         <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 8, marginTop: 14 }}>
           <Btn small variant="ghost" onClick={onClose}>Cancel</Btn>
           <Btn small variant="primary" onClick={() => { if (name.trim()) onCreate(name.trim()) }} disabled={!name.trim()}>Create</Btn>
+        </div>
+      </div>
+    </div>
+  )
+}
+
+// ── AddDirectionDialog ────────────────────────────────────────────────────────
+
+const DIRECTION_COLORS = ['var(--primary)','var(--c-success)','var(--c-warning)','var(--c-danger)','#6B3F9E','#0F7A8C','#B5591A','#2D6B4F']
+
+function AddDirectionDialog({ onClose, onCreate }: {
+  onClose: () => void
+  onCreate: (d: { name: string; color: string | null; icon: string | null }) => void
+}) {
+  const { t } = useI18n()
+  const [name,  setName]  = useState('')
+  const [color, setColor] = useState<string | null>(DIRECTION_COLORS[0])
+  const [icon,  setIcon]  = useState('')
+  return (
+    <div style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.3)', zIndex: 200, display: 'flex', alignItems: 'center', justifyContent: 'center' }}
+      onClick={e => { if (e.target === e.currentTarget) onClose() }}>
+      <div style={{ background: 'var(--bg)', border: '0.5px solid var(--border)', borderRadius: 10, padding: 20, width: 360, boxShadow: '0 8px 32px rgba(0,0,0,0.15)' }}>
+        <div style={{ fontSize: 14, fontWeight: 500, marginBottom: 14 }}>{t('direction.addTitle')}</div>
+        <div style={{ marginBottom: 10 }}>
+          <div style={{ fontSize: 11, color: 'var(--text-muted)', marginBottom: 4 }}>{t('direction.nameLabel')}</div>
+          <input autoFocus value={name} onChange={e => setName(e.target.value)}
+            onKeyDown={e => { if (e.key === 'Enter' && name.trim()) onCreate({ name: name.trim(), color, icon: icon.trim() || null }); if (e.key === 'Escape') onClose() }}
+            placeholder={t('direction.namePlaceholder')}
+            style={{ width: '100%', fontSize: 13, padding: '7px 10px', border: '0.5px solid var(--primary)', borderRadius: 6, outline: 'none', boxSizing: 'border-box', color: 'var(--text)', background: 'var(--bg)' }}
+          />
+        </div>
+        <div style={{ marginBottom: 10 }}>
+          <div style={{ fontSize: 11, color: 'var(--text-muted)', marginBottom: 4 }}>{t('direction.color')}</div>
+          <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap' }}>
+            {DIRECTION_COLORS.map(c => (
+              <button key={c} onClick={() => setColor(c)}
+                style={{ width: 22, height: 22, borderRadius: '50%', background: c, border: color === c ? '2px solid var(--text)' : '2px solid transparent', cursor: 'pointer', padding: 0 }} />
+            ))}
+            <button onClick={() => setColor(null)}
+              style={{ width: 22, height: 22, borderRadius: '50%', background: 'var(--border)', border: color === null ? '2px solid var(--text)' : '2px solid transparent', cursor: 'pointer', padding: 0, fontSize: 12, color: 'var(--text-muted)' }}>∅</button>
+          </div>
+        </div>
+        <div style={{ marginBottom: 14 }}>
+          <div style={{ fontSize: 11, color: 'var(--text-muted)', marginBottom: 4 }}>{t('direction.icon')}</div>
+          <input value={icon} onChange={e => setIcon(e.target.value)} placeholder={t('direction.iconPlaceholder')}
+            style={{ width: 60, fontSize: 18, padding: '4px 8px', border: '0.5px solid var(--border)', borderRadius: 6, outline: 'none', textAlign: 'center', background: 'var(--bg)', color: 'var(--text)' }}
+          />
+        </div>
+        <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 8 }}>
+          <Btn small variant="ghost" onClick={onClose}>Cancel</Btn>
+          <Btn small variant="primary" onClick={() => { if (name.trim()) onCreate({ name: name.trim(), color, icon: icon.trim() || null }) }} disabled={!name.trim()}>Create</Btn>
         </div>
       </div>
     </div>
@@ -186,26 +239,26 @@ function ResumePreview({ content, templateId, templateOptions }: {
             <div style={{ padding: '10px 14px', background: 'rgba(163,45,45,0.06)', border: '0.5px solid rgba(163,45,45,0.25)', borderRadius: 8, display: 'flex', alignItems: 'flex-start', gap: 10 }}>
               <span style={{ fontSize: 18, lineHeight: 1 }}>📝</span>
               <div>
-                <div style={{ fontSize: 12, fontWeight: 600, color: '#A32D2D' }}>Resume is too sparse — {Math.round(fit.ratio * 100)}% of a page</div>
-                <div style={{ fontSize: 11, color: '#A32D2D', opacity: 0.75, marginTop: 2 }}>Add more experience bullets, skills, or expand your summary to fill the page</div>
+                <div style={{ fontSize: 12, fontWeight: 600, color: 'var(--c-danger)' }}>Resume is too sparse — {Math.round(fit.ratio * 100)}% of a page</div>
+                <div style={{ fontSize: 11, color: 'var(--c-danger)', opacity: 0.75, marginTop: 2 }}>Add more experience bullets, skills, or expand your summary to fill the page</div>
               </div>
             </div>
           )}
           {fit.type === 'too-long' && (
-            <div style={{ padding: '8px 14px', background: 'rgba(133,79,11,0.06)', border: '0.5px solid rgba(133,79,11,0.25)', borderRadius: 8, fontSize: 11, color: '#854F0B' }}>
+            <div style={{ padding: '8px 14px', background: 'rgba(217,119,6,0.06)', border: '0.5px solid rgba(217,119,6,0.25)', borderRadius: 8, fontSize: 11, color: 'var(--c-warning)' }}>
               ⚠ Content spans {(fit as {pages:number}).pages} pages — switch to Compact spacing or shorten some sections
             </div>
           )}
           {(fit.type === 'one-page' || fit.type === 'two-page') && (
             <div style={{ padding: '7px 12px', background: 'rgba(24,95,165,0.05)', border: '0.5px solid rgba(24,95,165,0.18)', borderRadius: 8, display: 'flex', alignItems: 'center', gap: 12 }}>
-              <span style={{ fontSize: 11, fontWeight: 500, color: '#185FA5' }}>
+              <span style={{ fontSize: 11, fontWeight: 500, color: 'var(--primary)' }}>
                 {fit.type === 'one-page' ? '1 page' : '2 pages'}
               </span>
               {/* Fill bar */}
-              <div style={{ flex: 1, height: 5, background: 'rgba(24,95,165,0.12)', borderRadius: 3, overflow: 'hidden' }}>
+              <div style={{ flex: 1, height: 5, background: 'rgba(79,70,229,0.12)', borderRadius: 3, overflow: 'hidden' }}>
                 <div style={{
                   height: '100%', borderRadius: 3, transition: 'width 0.4s ease',
-                  background: '#185FA5',
+                  background: 'var(--primary)',
                   width: fit.type === 'one-page'
                     ? `${Math.min(100, Math.round(fit.ratio * 100))}%`
                     : `${Math.round((fit.ratio - 1) * 100)}%`,
@@ -281,7 +334,7 @@ function AddSectionMenu({ sectionOrder, onAdd, onAddCustom, onClose }: {
       ))}
       <div style={{ borderTop: '0.5px solid var(--border)' }}>
         <button onClick={() => { onAddCustom(); onClose() }}
-          style={{ display: 'block', width: '100%', textAlign: 'left', padding: '7px 12px', fontSize: 12, color: '#185FA5', background: 'none', border: 'none', cursor: 'pointer' }}
+          style={{ display: 'block', width: '100%', textAlign: 'left', padding: '7px 12px', fontSize: 12, color: 'var(--primary)', background: 'none', border: 'none', cursor: 'pointer' }}
           onMouseEnter={e => ((e.currentTarget as HTMLButtonElement).style.background = 'var(--bg-secondary)')}
           onMouseLeave={e => ((e.currentTarget as HTMLButtonElement).style.background = 'none')}>
           + Custom Section…
@@ -291,15 +344,158 @@ function AddSectionMenu({ sectionOrder, onAdd, onAddCustom, onClose }: {
   )
 }
 
+// ── ResumeLibraryPanel ────────────────────────────────────────────────────────
+
+function ResumeLibraryPanel({
+  resumes,
+  directions,
+  selectedId,
+  onSelect,
+}: {
+  resumes:    ResumeListItem[]
+  directions: Direction[]
+  selectedId: string | null
+  onSelect:   (id: string) => void
+}) {
+  const { t } = useI18n()
+  const [openPopoverId, setOpenPopoverId] = useState<string | null>(null)
+  const [popoverJobs,   setPopoverJobs]   = useState<Array<{ id: string; company: string; role: string }>>([])
+  const [loadingPop,    setLoadingPop]    = useState(false)
+  const popoverRef = useRef<HTMLDivElement>(null)
+
+  useEffect(() => {
+    function handleMouseDown(e: MouseEvent) {
+      if (popoverRef.current && !popoverRef.current.contains(e.target as Node)) {
+        setOpenPopoverId(null)
+      }
+    }
+    if (openPopoverId) {
+      document.addEventListener('mousedown', handleMouseDown)
+    }
+    return () => { document.removeEventListener('mousedown', handleMouseDown) }
+  }, [openPopoverId])
+
+  async function openUsedByPopover(resumeId: string) {
+    if (openPopoverId === resumeId) { setOpenPopoverId(null); return }
+    setOpenPopoverId(resumeId)
+    setLoadingPop(true)
+    try {
+      const res  = await fetch(`/api/jobs?finalResumeId=${resumeId}&pageSize=20`)
+      if (!res.ok) throw new Error('Failed to fetch jobs')
+      const data = await res.json()
+      setPopoverJobs(Array.isArray(data.jobs) ? data.jobs : [])
+    } catch { setPopoverJobs([]) }
+    finally { setLoadingPop(false) }
+  }
+
+  if (resumes.length === 0) return (
+    <div style={{ padding: '10px 0', fontSize: 12, color: 'var(--text-muted)' }}>
+      No resumes in this direction yet.
+    </div>
+  )
+
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+      {resumes.map(r => {
+        const dir = directions.find(d => d.id === r.directionId)
+        const jobCount = r._count?.finalForJobs ?? 0
+        const isSelected = r.id === selectedId
+        return (
+          <div key={r.id}
+            onClick={() => onSelect(r.id)}
+            style={{
+              display: 'flex', alignItems: 'center', gap: 8, padding: '7px 10px',
+              borderRadius: 7, cursor: 'pointer',
+              background: isSelected ? 'rgba(79,70,229,0.08)' : 'var(--bg)',
+              border: `0.5px solid ${isSelected ? 'var(--primary)' : 'var(--border)'}`,
+              transition: 'border-color 0.15s',
+            }}>
+            {/* Icon */}
+            <span style={{ fontSize: 16 }}>📄</span>
+
+            {/* Name + direction */}
+            <div style={{ flex: 1, minWidth: 0 }}>
+              <div style={{ fontSize: 12, fontWeight: 500, color: 'var(--text)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                {r.name}
+              </div>
+              {dir && (
+                <div style={{ fontSize: 10, color: 'var(--text-muted)', marginTop: 1 }}>
+                  <span style={{ background: dir.color ?? 'var(--bg-secondary)', color: dir.color ? '#fff' : 'var(--text-muted)', borderRadius: 8, padding: '1px 6px', fontSize: 9 }}>
+                    {dir.icon ? `${dir.icon} ` : ''}{dir.name}
+                  </span>
+                </div>
+              )}
+            </div>
+
+            {/* Badges */}
+            <div style={{ display: 'flex', gap: 4, alignItems: 'center', flexShrink: 0 }}>
+              {r.kind === 'base' && (
+                <span style={{ fontSize: 9, padding: '2px 6px', borderRadius: 8, background: 'rgba(5,150,105,0.10)', color: 'var(--c-success)', border: '0.5px solid rgba(5,150,105,0.30)', fontWeight: 500 }}>{t('resume.lineage.base')}</span>
+              )}
+              {r.kind === 'adapted' && (
+                <span style={{ fontSize: 9, padding: '2px 6px', borderRadius: 8, background: 'rgba(217,119,6,0.10)', color: 'var(--c-warning)', border: '0.5px solid rgba(217,119,6,0.30)', fontWeight: 500 }}>{t('resume.lineage.adapted')}</span>
+              )}
+              {jobCount > 0 && (
+                <span style={{ fontSize: 9, padding: '2px 6px', borderRadius: 8, background: 'rgba(79,70,229,0.10)', color: 'var(--primary)', border: '0.5px solid rgba(79,70,229,0.30)', fontWeight: 500 }}>⭐ {t('resume.lineage.final')}</span>
+              )}
+              {r.isDefault && (
+                <span style={{ fontSize: 9, padding: '2px 6px', borderRadius: 8, background: 'rgba(79,70,229,0.10)', color: 'var(--primary)', border: '0.5px solid rgba(79,70,229,0.30)', fontWeight: 500 }}>Default</span>
+              )}
+            </div>
+
+            {/* Used by N jobs popover trigger */}
+            {jobCount > 0 && (
+              <div ref={openPopoverId === r.id ? popoverRef : undefined}
+                style={{ position: 'relative', flexShrink: 0 }}
+                onClick={e => { e.stopPropagation(); openUsedByPopover(r.id) }}>
+                <span style={{ fontSize: 10, color: 'var(--primary)', cursor: 'pointer', textDecoration: 'underline', textDecorationStyle: 'dotted' }}>
+                  {t('resume.lineage.usedBy').replace('{n}', String(jobCount)).replace('{s}', jobCount !== 1 ? 's' : '')}
+                </span>
+                {openPopoverId === r.id && (
+                  <div style={{
+                    position: 'absolute', right: 0, top: '100%', marginTop: 4, zIndex: 50,
+                    background: 'var(--bg)', border: '0.5px solid var(--border)', borderRadius: 8,
+                    boxShadow: '0 4px 16px rgba(0,0,0,0.12)', padding: 8, minWidth: 180, maxWidth: 260,
+                  }}>
+                    <div style={{ fontSize: 10, fontWeight: 500, color: 'var(--text-muted)', marginBottom: 6 }}>{t('resume.lineage.usedByTitle')}</div>
+                    {loadingPop ? (
+                      <div style={{ fontSize: 11, color: 'var(--text-muted)' }}>Loading…</div>
+                    ) : popoverJobs.length === 0 ? (
+                      <div style={{ fontSize: 11, color: 'var(--text-muted)' }}>No jobs found</div>
+                    ) : (
+                      popoverJobs.map(j => (
+                        <div key={j.id} style={{ fontSize: 11, padding: '3px 0', color: 'var(--text)', borderBottom: '0.5px solid var(--border)' }}>
+                          {j.company} · {j.role}
+                        </div>
+                      ))
+                    )}
+                  </div>
+                )}
+              </div>
+            )}
+          </div>
+        )
+      })}
+    </div>
+  )
+}
+
 // ── ResumePage ────────────────────────────────────────────────────────────────
 
 export function ResumePage() {
   const toast = useToast()
   const [confirm, ConfirmDialog] = useConfirm()
+  const { t } = useI18n()
 
   const { data: resumeList, loading: loadingList } = useApi<ResumeListItem[]>('/api/resume')
   const [resumes,          setResumes]          = useState<ResumeListItem[]>([])
   const [selectedResumeId, setSelectedResumeId] = useState<string | null>(null)
+
+  const { data: directionList, refetch: refetchDirections } = useApi<Direction[]>('/api/directions')
+  const [directions,       setDirections]       = useState<Direction[]>([])
+  const [selectedDirId,    setSelectedDirId]    = useState<string | null>(null)
+  const [showAddDirection, setShowAddDirection] = useState(false)
+  const [editingDirId,     setEditingDirId]     = useState<string | null>(null)
 
   const [content,         setContent]         = useState<ResumeContent | null>(null)
   const [resumeName,      setResumeName]      = useState('My Resume')
@@ -336,7 +532,8 @@ export function ResumePage() {
   const [showTemplates,   setShowTemplates]   = useState(false)
   const [showCoverLetter, setShowCoverLetter] = useState(false)
   const [showNewResume,   setShowNewResume]   = useState(false)
-  const [showUploadModal, setShowUploadModal] = useState(false)
+  const [showUploadModal,   setShowUploadModal]   = useState(false)
+  const [showIntakeDialog,  setShowIntakeDialog]  = useState(false)
   const [creatingResume,  setCreatingResume]  = useState(false)
   const [showAddSection,  setShowAddSection]  = useState(false)
   const [showVersions,    setShowVersions]    = useState(false)
@@ -361,6 +558,10 @@ export function ResumePage() {
   }, [resumeList])
 
   useEffect(() => {
+    if (directionList) setDirections(directionList)
+  }, [directionList])
+
+  useEffect(() => {
     if (loadingList || initDone.current) return
     if (!resumeList) return
     initDone.current = true
@@ -369,7 +570,7 @@ export function ResumePage() {
         name: 'My Resume', content: EMPTY_CONTENT, isDefault: true,
       }).then(({ data, error }) => {
         if (data) {
-          setResumes([{ id: data.id, name: data.name, isDefault: data.isDefault, createdAt: data.createdAt, updatedAt: data.updatedAt }])
+          setResumes([{ id: data.id, name: data.name, isDefault: data.isDefault, directionId: null, kind: 'base' as const, parentResumeId: null, targetJobId: null, origin: 'manual' as const, basicsDetached: false, createdAt: data.createdAt, updatedAt: data.updatedAt }])
           setSelectedResumeId(data.id)
           setContent(EMPTY_CONTENT)
           setResumeName(data.name)
@@ -574,7 +775,7 @@ export function ResumePage() {
       const { data, error } = await apiMutate<Resume>('/api/resume', 'POST', { name, content: imported, isDefault: false })
       setCreatingResume(false)
       if (data) {
-        const item: ResumeListItem = { id: data.id, name: data.name, isDefault: data.isDefault, createdAt: data.createdAt, updatedAt: data.updatedAt }
+        const item: ResumeListItem = { id: data.id, name: data.name, isDefault: data.isDefault, directionId: null, kind: 'base' as const, parentResumeId: null, targetJobId: null, origin: 'manual' as const, basicsDetached: false, createdAt: data.createdAt, updatedAt: data.updatedAt }
         setResumes(prev => [...prev, item])
         setSelectedResumeId(data.id)
         toast.success('Resume imported', `"${name}" created`)
@@ -587,7 +788,7 @@ export function ResumePage() {
     const { data, error } = await apiMutate<Resume>('/api/resume', 'POST', { name, content: EMPTY_CONTENT, isDefault: false })
     setCreatingResume(false)
     if (data) {
-      const item: ResumeListItem = { id: data.id, name: data.name, isDefault: data.isDefault, createdAt: data.createdAt, updatedAt: data.updatedAt }
+      const item: ResumeListItem = { id: data.id, name: data.name, isDefault: data.isDefault, directionId: null, kind: 'base' as const, parentResumeId: null, targetJobId: null, origin: 'manual' as const, basicsDetached: false, createdAt: data.createdAt, updatedAt: data.updatedAt }
       setResumes(prev => [...prev, item]); setSelectedResumeId(data.id)
       toast.success('Resume created', `"${name}" is ready to edit`)
     } else toast.error('Error', error ?? 'Could not create resume')
@@ -764,6 +965,12 @@ export function ResumePage() {
     }
   }
 
+  // ── Direction filter ──────────────────────────────────────────────────────
+
+  const filteredResumes = selectedDirId
+    ? resumes.filter(r => r.directionId === selectedDirId)
+    : resumes
+
   // ── Job context for AI ────────────────────────────────────────────────────
 
   const selectedJob  = jobs.find(j => j.id === selectedJobId) ?? null
@@ -872,6 +1079,76 @@ export function ResumePage() {
     <div style={{ flex: 1, display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
       <ConfirmDialog />
       <TopBar title="Resume">
+        {/* Direction chips */}
+        <div style={{ display: 'flex', gap: 4, overflowX: 'auto', flexShrink: 0, maxWidth: 320, alignItems: 'center' }}>
+          <button
+            onClick={() => setSelectedDirId(null)}
+            style={{
+              fontSize: 10, padding: '3px 8px', borderRadius: 10, border: '0.5px solid var(--border)',
+              background: selectedDirId === null ? 'var(--primary)' : 'var(--bg)',
+              color: selectedDirId === null ? '#fff' : 'var(--text)',
+              cursor: 'pointer', whiteSpace: 'nowrap', flexShrink: 0,
+            }}>All</button>
+          {directions.map(d => (
+            <div key={d.id} style={{ position: 'relative', flexShrink: 0, display: 'inline-flex', alignItems: 'center' }}>
+              {editingDirId === d.id ? (
+                <input
+                  autoFocus
+                  defaultValue={d.name}
+                  onBlur={async (e) => {
+                    const newName = e.currentTarget.value.trim()
+                    setEditingDirId(null)
+                    if (!newName || newName === d.name) return
+                    const { data, error } = await apiMutate<Direction>(`/api/directions/${d.id}`, 'PATCH', { name: newName })
+                    if (data) setDirections(prev => prev.map(x => x.id === d.id ? data : x))
+                    else toast.error('Rename failed', error ?? 'Could not rename direction')
+                  }}
+                  onKeyDown={(e) => {
+                    if (e.key === 'Enter') e.currentTarget.blur()
+                    if (e.key === 'Escape') setEditingDirId(null)
+                  }}
+                  style={{ fontSize: 10, padding: '2px 6px', borderRadius: 10, border: '1px solid var(--primary)', outline: 'none', width: 120, background: 'var(--bg)', color: 'var(--text)' }}
+                />
+              ) : (
+                <button
+                  onClick={() => setSelectedDirId(d.id === selectedDirId ? null : d.id)}
+                  style={{
+                    fontSize: 10, padding: '3px 8px', borderRadius: 10, border: `0.5px solid ${d.color ?? 'var(--border)'}`,
+                    background: selectedDirId === d.id ? (d.color ?? 'var(--primary)') : 'var(--bg)',
+                    color: selectedDirId === d.id ? '#fff' : 'var(--text)',
+                    cursor: 'pointer', whiteSpace: 'nowrap',
+                  }}>
+                  {d.icon ? `${d.icon} ` : ''}{d.name}
+                </button>
+              )}
+              <div style={{ display: 'inline-flex', gap: 1, marginLeft: 1 }}>
+                <button
+                  onClick={() => setEditingDirId(d.id)}
+                  title="Rename"
+                  style={{ fontSize: 9, padding: '1px 3px', border: '0.5px solid var(--border)', borderRadius: 4, background: 'var(--bg)', color: 'var(--text-muted)', cursor: 'pointer', lineHeight: 1 }}>✎</button>
+                <button
+                  onClick={async () => {
+                    const ok = await confirm({ title: 'Delete direction?', message: `"${d.name}" will be unlinked from its resumes. Resumes will not be deleted.`, danger: true, confirmLabel: 'Delete' })
+                    if (!ok) return
+                    const { error } = await apiMutate(`/api/directions/${d.id}`, 'DELETE')
+                    if (error) { toast.error('Delete failed', error); return }
+                    setDirections(prev => prev.filter(x => x.id !== d.id))
+                    setEditingDirId(null)
+                    if (selectedDirId === d.id) setSelectedDirId(null)
+                    toast.info('Deleted', `Direction "${d.name}" removed`)
+                  }}
+                  title="Delete"
+                  style={{ fontSize: 9, padding: '1px 3px', border: '0.5px solid var(--border)', borderRadius: 4, background: 'var(--bg)', color: 'var(--c-danger)', cursor: 'pointer', lineHeight: 1 }}>×</button>
+              </div>
+            </div>
+          ))}
+          <button
+            onClick={() => setShowAddDirection(true)}
+            style={{
+              fontSize: 10, padding: '3px 8px', borderRadius: 10, border: '0.5px dashed var(--border)',
+              background: 'transparent', color: 'var(--text-muted)', cursor: 'pointer', whiteSpace: 'nowrap', flexShrink: 0,
+            }}>{t('direction.add')}</button>
+        </div>
         <div style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
           <select value={selectedResumeId ?? ''} onChange={async e => {
             const next = e.target.value
@@ -881,15 +1158,19 @@ export function ResumePage() {
             }
             setSelectedResumeId(next)
           }} style={{ fontSize: 11, padding: '4px 8px', border: '0.5px solid var(--border)', borderRadius: 6, background: 'var(--bg)', color: 'var(--text)', outline: 'none', maxWidth: 160 }}>
-            {resumes.map(r => <option key={r.id} value={r.id}>{r.name}{r.isDefault ? ' ★' : ''}</option>)}
+            {filteredResumes.map(r => (
+              <option key={r.id} value={r.id}>
+                {r.isDefault ? '★ ' : ''}{r.name}{r.kind === 'adapted' ? ' (Adapted)' : ''}
+              </option>
+            ))}
           </select>
           <button onClick={() => setShowNewResume(true)} disabled={creatingResume} title="New resume"
-            style={{ fontSize: 13, lineHeight: 1, padding: '3px 7px', border: '0.5px solid var(--border)', borderRadius: 6, background: 'var(--bg)', color: '#185FA5', cursor: 'pointer' }}>
+            style={{ fontSize: 13, lineHeight: 1, padding: '3px 7px', border: '0.5px solid var(--border)', borderRadius: 6, background: 'var(--bg)', color: 'var(--primary)', cursor: 'pointer' }}>
             {creatingResume ? '…' : '+'}
           </button>
-          <button onClick={() => setShowUploadModal(true)} title="Import resume from PDF/DOCX"
-            style={{ fontSize: 11, lineHeight: 1, padding: '3px 8px', border: '0.5px solid var(--border)', borderRadius: 6, background: 'var(--bg)', color: '#185FA5', cursor: 'pointer' }}>
-            ↑ Import
+          <button onClick={() => setShowIntakeDialog(true)} title="Import resume via upload, paste or screenshot"
+            style={{ fontSize: 11, lineHeight: 1, padding: '3px 8px', border: '0.5px solid var(--border)', borderRadius: 6, background: 'var(--bg)', color: 'var(--primary)', cursor: 'pointer' }}>
+            ↑ Intake
           </button>
           <button
             title="Delete this resume"
@@ -915,7 +1196,7 @@ export function ResumePage() {
               fontSize: 13, lineHeight: 1, padding: '3px 7px',
               border: '0.5px solid var(--border)', borderRadius: 6,
               background: 'var(--bg)', cursor: resumes.length <= 1 ? 'not-allowed' : 'pointer',
-              color: resumes.length <= 1 ? 'var(--text-muted)' : '#A32D2D',
+              color: resumes.length <= 1 ? 'var(--text-muted)' : 'var(--c-danger)',
               opacity: resumes.length <= 1 ? 0.4 : 1,
             }}>
             ✕
@@ -957,7 +1238,7 @@ export function ResumePage() {
       {loadingCont ? (
         <div style={{ flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'center', background: 'var(--bg-tertiary)' }}>
           <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 10 }}>
-            <div style={{ width: 28, height: 28, border: '2.5px solid rgba(24,95,165,0.2)', borderTopColor: '#185FA5', borderRadius: '50%', animation: 'spin 0.7s linear infinite' }} />
+            <div style={{ width: 28, height: 28, border: '2.5px solid rgba(79,70,229,0.20)', borderTopColor: 'var(--primary)', borderRadius: '50%', animation: 'spin 0.7s linear infinite' }} />
             <div style={{ fontSize: 12, color: 'var(--text-muted)' }}>Loading resume…</div>
           </div>
         </div>
@@ -968,6 +1249,36 @@ export function ResumePage() {
       ) : (
         <div style={{ flex: 1, display: 'flex', overflow: 'hidden', background: 'var(--bg-tertiary)' }}>
           <div style={{ flex: 1, overflowY: 'auto', padding: 24 }}>
+            {/* Empty-state banner: no directions set up */}
+            {directions.length === 0 && (
+              <div style={{ padding: '8px 12px', background: 'rgba(217,119,6,0.06)', border: '0.5px solid rgba(217,119,6,0.20)', borderRadius: 7, marginBottom: 12, fontSize: 11, color: 'var(--c-warning)', display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+                <span>Looks like you haven&apos;t set up your directions yet.</span>
+                <button
+                  onClick={() => toast.info('Setup', 'Go to Settings → Profile to restart onboarding')}
+                  style={{ fontSize: 10, color: 'var(--primary)', background: 'none', border: 'none', cursor: 'pointer', textDecoration: 'underline' }}
+                >
+                  Start setup
+                </button>
+              </div>
+            )}
+            {/* Resume Library Panel */}
+            {resumes.length > 1 && (
+              <div style={{ marginBottom: 16, padding: '10px 12px', background: 'var(--bg)', border: '0.5px solid var(--border)', borderRadius: 8 }}>
+                <div style={{ fontSize: 10, fontWeight: 500, color: 'var(--text-muted)', marginBottom: 8, letterSpacing: '0.05em' }}>RESUME LIBRARY</div>
+                <ResumeLibraryPanel
+                  resumes={filteredResumes}
+                  directions={directions}
+                  selectedId={selectedResumeId}
+                  onSelect={async (id) => {
+                    if (dirty) {
+                      const ok = await confirm({ title: 'Discard changes?', message: 'You have unsaved changes. Switching will discard them.', danger: true, confirmLabel: 'Discard' })
+                      if (!ok) return
+                    }
+                    setSelectedResumeId(id)
+                  }}
+                />
+              </div>
+            )}
             {/* ── PREVIEW MODE ── */}
             {previewMode && <ResumePreview content={{ ...content, sectionOrder }} templateId={templateId} templateOptions={templateOptions} />}
             {/* Format toolbar + Editor (hidden in preview mode) */}
@@ -990,7 +1301,7 @@ export function ResumePage() {
                 }}>{f.label}</button>
               ))}
               <div style={{ width: 1, height: 18, background: 'var(--border)', margin: '0 2px' }} />
-              <span style={{ fontSize: 10, color: dirty ? '#854F0B' : 'var(--text-muted)' }}>
+              <span style={{ fontSize: 10, color: dirty ? 'var(--c-warning)' : 'var(--text-muted)' }}>
                 {dirty ? '● Unsaved' : '✓ Saved'}
               </span>
             </div>
@@ -1041,7 +1352,7 @@ export function ResumePage() {
                   </>
                 )}
                 <button onClick={() => setShowAddSection(v => !v)}
-                  style={{ fontSize: 11, color: '#185FA5', background: 'rgba(24,95,165,0.06)', border: '0.5px dashed rgba(24,95,165,0.3)', borderRadius: 6, padding: '6px 20px', cursor: 'pointer' }}>
+                  style={{ fontSize: 11, color: 'var(--primary)', background: 'rgba(79,70,229,0.06)', border: '0.5px dashed rgba(79,70,229,0.30)', borderRadius: 6, padding: '6px 20px', cursor: 'pointer' }}>
                   + Add Section
                 </button>
               </div>
@@ -1082,7 +1393,13 @@ export function ResumePage() {
         />
       )}
       {showCoverLetter && content && selectedJob && (
-        <CoverLetterModal resumeContent={content} job={selectedJob} onClose={() => setShowCoverLetter(false)} />
+        <CoverLetterPanel
+          job={selectedJob}
+          resumeContent={content}
+          resumeName={resumeName}
+          templateName={templateId}
+          onClose={() => setShowCoverLetter(false)}
+        />
       )}
       {showVersions && (
         <div style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.3)', zIndex: 100, display: 'flex', alignItems: 'center', justifyContent: 'center' }}
@@ -1103,7 +1420,7 @@ export function ResumePage() {
               ) : (
                 <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
                   {versions.map((v, i) => (
-                    <div key={v.id} style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '8px 10px', background: i === 0 ? 'rgba(24,95,165,0.06)' : 'var(--bg-secondary)', borderRadius: 6, border: i === 0 ? '0.5px solid rgba(24,95,165,0.2)' : '0.5px solid var(--border)' }}>
+                    <div key={v.id} style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '8px 10px', background: i === 0 ? 'rgba(79,70,229,0.06)' : 'var(--bg-secondary)', borderRadius: 6, border: i === 0 ? '0.5px solid rgba(79,70,229,0.20)' : '0.5px solid var(--border)' }}>
                       <div>
                         <div style={{ fontSize: 12, fontWeight: 500, color: 'var(--text)' }}>{v.name}</div>
                         <div style={{ fontSize: 10, color: 'var(--text-muted)' }}>{fmtDate(v.createdAt)} · {fmtRelative(v.createdAt)}</div>
@@ -1124,6 +1441,39 @@ export function ResumePage() {
       )}
       {showUploadModal && (
         <UploadResumeModal onClose={() => setShowUploadModal(false)} onImport={handleImportResume} />
+      )}
+      {showIntakeDialog && (
+        <ResumeIntakeDialog
+          onClose={() => setShowIntakeDialog(false)}
+          onSaved={(resume) => {
+            const item: ResumeListItem = {
+              id: resume.id, name: resume.name, isDefault: resume.isDefault,
+              directionId: resume.directionId, kind: resume.kind,
+              parentResumeId: resume.parentResumeId, targetJobId: resume.targetJobId,
+              origin: resume.origin, basicsDetached: resume.basicsDetached,
+              createdAt: resume.createdAt, updatedAt: resume.updatedAt,
+            }
+            setResumes(prev => [...prev, item])
+            setSelectedResumeId(resume.id)
+            toast.success('Resume saved', `"${resume.name}" added to your library`)
+            setShowIntakeDialog(false)
+          }}
+          directions={directions}
+          initialDirId={selectedDirId}
+        />
+      )}
+      {showAddDirection && (
+        <AddDirectionDialog
+          onClose={() => setShowAddDirection(false)}
+          onCreate={async ({ name, color, icon }) => {
+            const { data, error } = await apiMutate<Direction>('/api/directions', 'POST', { name, color, icon })
+            if (data) {
+              setDirections(prev => [...prev, data])
+              setSelectedDirId(data.id)
+              setShowAddDirection(false)
+            } else toast.error('Error', error ?? 'Could not create direction')
+          }}
+        />
       )}
     </div>
   )

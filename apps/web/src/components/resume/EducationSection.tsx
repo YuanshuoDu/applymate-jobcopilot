@@ -50,13 +50,13 @@ export function EducationSection({ education, onChange, dragHandleProps, onRemov
 
           {education.map((e, i) => (
             editIdx === i ? (
-              <div key={i} style={{ border: '0.5px solid #185FA5', borderRadius: 6, padding: 10, marginBottom: 8 }}>
+              <div key={i} style={{ border: '0.5px solid var(--primary)', borderRadius: 6, padding: 10, marginBottom: 8 }}>
                 <InlineInput value={e.degree}      onChange={v => { const n=[...education]; n[i]={...n[i],degree:v};      onChange(n) }} placeholder="Degree (e.g. BSc Computer Science)" style={{ marginBottom: 6 }} />
                 <InlineInput value={e.institution} onChange={v => { const n=[...education]; n[i]={...n[i],institution:v}; onChange(n) }} placeholder="Institution" style={{ marginBottom: 6 }} />
                 <InlineInput value={e.year}        onChange={v => { const n=[...education]; n[i]={...n[i],year:v};        onChange(n) }} placeholder="Year (e.g. 2020)" />
                 <div style={{ display: 'flex', justifyContent: 'space-between', marginTop: 8 }}>
                   <button onClick={() => { onChange(education.filter((_,xi)=>xi!==i)); setEditIdx(null) }}
-                    style={{ fontSize: 10, color: '#A32D2D', background: 'none', border: 'none', cursor: 'pointer' }}>Delete</button>
+                    style={{ fontSize: 10, color: 'var(--c-danger)', background: 'none', border: 'none', cursor: 'pointer' }}>Delete</button>
                   <Btn small variant="primary" onClick={() => setEditIdx(null)}>Done</Btn>
                 </div>
               </div>
@@ -68,7 +68,7 @@ export function EducationSection({ education, onChange, dragHandleProps, onRemov
                 onDragLeave={() => setDragOver(null)}
                 onDrop={() => handleDrop(i)}
                 style={{ display: 'flex', alignItems: 'flex-start', gap: 4, cursor: 'pointer', padding: '4px 4px 4px 0', borderRadius: 4, marginBottom: 4,
-                  border: dragOver===i ? '0.5px dashed #185FA5' : '0.5px solid transparent',
+                  border: dragOver===i ? '0.5px dashed var(--primary)' : '0.5px solid transparent',
                   background: dragOver===i ? 'rgba(24,95,165,0.03)' : 'transparent' }}
                 onMouseEnter={e => { if(dragOver!==i)(e.currentTarget as HTMLDivElement).style.background='var(--bg-secondary)' }}
                 onMouseLeave={e => { if(dragOver!==i)(e.currentTarget as HTMLDivElement).style.background='transparent' }}>

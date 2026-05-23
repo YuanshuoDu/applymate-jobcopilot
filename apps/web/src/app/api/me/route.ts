@@ -15,7 +15,7 @@ export async function GET() {
     select: {
       id: true, email: true, name: true, image: true, plan: true,
       phone: true, location: true, linkedin: true, github: true,
-      preferences: true, createdAt: true,
+      preferences: true, createdAt: true, onboardedAt: true, onboardingGoals: true,
     },
   })
 
@@ -45,6 +45,7 @@ export async function PATCH(req: NextRequest) {
       id: true, email: true, name: true, image: true, plan: true,
       phone: true, location: true, linkedin: true, github: true,
       preferences: true, createdAt: true,
+      onboardedAt: true, onboardingGoals: true,
     },
   })
 

@@ -1,37 +1,98 @@
----
 name: Bug Report
-about: Report a bug for Codex to fix
-title: "fix: "
-labels: ["type:bug", "spec-ready", "assignee:codex"]
-assignees: ""
----
-
-## Summary
-<!-- One-line description of the bug -->
-
-## Reproduction Steps
-1.
-2.
-3.
-
-## Expected Behavior
-
-## Actual Behavior
-
-## Environment
-- Browser/OS:
-- Branch/commit:
-
-## Logs / Screenshots
-<!-- Paste error messages, stack traces, or screenshots -->
-
-## Acceptance Criteria
-- [ ] Bug no longer reproduces with repro steps above
-- [ ] No regression on related flows
-- [ ] Relevant test added / updated
-
-## Tech Notes
-<!-- Suspect files, related code areas -->
-
----
-@codex Please fix per the ACs above. Branch naming: fix/ISSUE_ID-slug. Open a PR with "Closes #ISSUE_ID" when ready.
+description: Capture a reproducible bug for Claude triage and Codex debugging.
+title: "[Bug]: "
+labels:
+  - "type:bug"
+  - "P1"
+  - "spec-ready"
+  - "assignee:codex"
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Use this template for defects that need a reproducible report before implementation begins.
+  - type: textarea
+    id: repro
+    attributes:
+      label: Repro Steps
+      description: Numbered steps that reliably reproduce the issue.
+      placeholder: |
+        1. Open ...
+        2. Click ...
+        3. Observe ...
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected Result
+      placeholder: The app should...
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual Result
+      placeholder: Instead, the app...
+    validations:
+      required: true
+  - type: textarea
+    id: impact
+    attributes:
+      label: User Impact
+      description: Who is blocked and how severe is it?
+      placeholder: Blocks resume creation for...
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs / Screenshots
+      description: Paste relevant stack traces, screenshots, or failing CI log URLs.
+      placeholder: |
+        - Console:
+        - Server log:
+        - CI run:
+    validations:
+      required: false
+  - type: textarea
+    id: env
+    attributes:
+      label: Environment
+      description: Browser, OS, branch, commit, or deployment URL.
+      placeholder: |
+        - Env:
+        - Browser:
+        - Commit:
+    validations:
+      required: true
+  - type: textarea
+    id: acceptance_criteria
+    attributes:
+      label: Fix Acceptance Criteria
+      description: Use a checkbox list for the bugfix definition of done.
+      placeholder: |
+        - [ ] Original repro no longer fails
+        - [ ] Regression test covers the bug
+        - [ ] Related flow still works
+    validations:
+      required: true
+  - type: textarea
+    id: tech_notes
+    attributes:
+      label: Tech Notes
+      description: Suspected files, constraints, rollback notes, or prior attempts.
+      placeholder: |
+        - Suspected files: ...
+        - Keep auth/session behavior unchanged
+    validations:
+      required: true
+  - type: textarea
+    id: codex_handoff
+    attributes:
+      label: Codex Handoff
+      description: Paste the final debugging instruction for Codex.
+      value: |
+        @codex 请先按上述 repro 复现，再定位根因并做最小修复。禁止通过跳过测试、弱化断言或绕过 CI 来“修复”问题。完成后开 PR，并在评论中先给出根因分析。
+    validations:
+      required: true

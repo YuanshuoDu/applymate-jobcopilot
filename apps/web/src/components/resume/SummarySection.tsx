@@ -18,7 +18,7 @@ export function SummarySection({ summary, matchedKeywords, editing, onEdit, onBl
 }) {
   const [collapsed, setCollapsed] = useState(false)
   const wordCount   = summary.trim() ? summary.trim().split(/\s+/).filter(Boolean).length : 0
-  const wColor      = wordCount === 0 ? 'var(--text-muted)' : wordCount < 20 ? '#A32D2D' : wordCount <= 80 ? '#3B6D11' : '#854F0B'
+  const wColor      = wordCount === 0 ? 'var(--text-muted)' : wordCount < 20 ? 'var(--c-danger)' : wordCount <= 80 ? 'var(--c-success)' : 'var(--c-warning)'
 
   return (
     <div style={{ marginBottom: 20 }}>
@@ -43,7 +43,7 @@ export function SummarySection({ summary, matchedKeywords, editing, onEdit, onBl
             <textarea value={summary} onChange={e => onChange(e.target.value)}
               onBlur={onBlur} autoFocus placeholder="Write a brief professional summary (20–80 words)…"
               className={flash ? 'ai-flash-highlight' : ''}
-              style={{ width: '100%', minHeight: 80, fontSize: 12, lineHeight: 1.7, border: '0.5px solid #185FA5', borderRadius: 5, padding: 8, resize: 'vertical', outline: 'none', color: 'var(--text)', background: 'var(--bg)', boxSizing: 'border-box' }} />
+              style={{ width: '100%', minHeight: 80, fontSize: 12, lineHeight: 1.7, border: '0.5px solid var(--primary)', borderRadius: 5, padding: 8, resize: 'vertical', outline: 'none', color: 'var(--text)', background: 'var(--bg)', boxSizing: 'border-box' }} />
             <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginTop: 4 }}>
               <span style={{ fontSize: 9, color: wColor }}>
                 {wordCount === 0 ? 'Start typing…' : wordCount < 20 ? `${wordCount} words — aim for 20+` : wordCount <= 80 ? `${wordCount} words — good length` : `${wordCount} words — consider trimming`}
@@ -63,7 +63,7 @@ export function SummarySection({ summary, matchedKeywords, editing, onEdit, onBl
             {summary
               ? summary.split(' ').map((word, i) => {
                   const isKw = matchedKeywords.some(k => word.toLowerCase().includes(k.toLowerCase()))
-                  return <span key={i} style={isKw ? { background: 'rgba(24,95,165,0.12)', borderRadius: 2, padding: '0 1px' } : {}}>{word} </span>
+                  return <span key={i} style={isKw ? { background: 'rgba(79,70,229,0.12)', borderRadius: 2, padding: '0 1px' } : {}}>{word} </span>
                 })
               : <span style={{ color: 'var(--text-muted)' }}>Click to add a summary…</span>
             }

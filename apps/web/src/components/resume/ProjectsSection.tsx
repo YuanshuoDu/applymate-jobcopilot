@@ -54,7 +54,7 @@ export function ProjectsSection({ projects, jobContext, onChange, dragHandleProp
 
           {projects.map((p, i) => (
             editIdx === i ? (
-              <div key={i} style={{ border: '0.5px solid #185FA5', borderRadius: 6, padding: 10, marginBottom: 10 }}>
+              <div key={i} style={{ border: '0.5px solid var(--primary)', borderRadius: 6, padding: 10, marginBottom: 10 }}>
                 <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 6, marginBottom: 6 }}>
                   <InlineInput value={p.name}    onChange={v => { const n=[...projects]; n[i]={...n[i],name:v};    onChange(n) }} placeholder="Project Name" />
                   <InlineInput value={p.role??''} onChange={v => { const n=[...projects]; n[i]={...n[i],role:v||undefined}; onChange(n) }} placeholder="Your Role (optional)" />
@@ -71,7 +71,7 @@ export function ProjectsSection({ projects, jobContext, onChange, dragHandleProp
                         const n=[...projects]; n[i]={...n[i],bullets:n[i].bullets.map((x,xi)=>xi===bi?v:x)}; onChange(n)
                       }} multiline placeholder="Describe what you built…" style={{ minHeight: 36 }} />
                       <button onClick={() => { const n=[...projects]; n[i]={...n[i],bullets:n[i].bullets.filter((_,xi)=>xi!==bi)}; onChange(n) }}
-                        style={{ fontSize: 11, color: '#A32D2D', background: 'none', border: 'none', cursor: 'pointer', marginTop: 7, flexShrink: 0 }}>✕</button>
+                        style={{ fontSize: 11, color: 'var(--c-danger)', background: 'none', border: 'none', cursor: 'pointer', marginTop: 7, flexShrink: 0 }}>✕</button>
                     </div>
                   ))}
                   {p.bullets.map((b, bi) => bi === p.bullets.length - 1 && (
@@ -83,13 +83,13 @@ export function ProjectsSection({ projects, jobContext, onChange, dragHandleProp
                     />
                   ))}
                   <button onClick={() => { const n=[...projects]; n[i]={...n[i],bullets:[...n[i].bullets,'']}; onChange(n) }}
-                    style={{ fontSize: 10, color: '#185FA5', background: 'none', border: 'none', cursor: 'pointer', marginTop: 4 }}>
+                    style={{ fontSize: 10, color: 'var(--primary)', background: 'none', border: 'none', cursor: 'pointer', marginTop: 4 }}>
                     + Add bullet
                   </button>
                 </div>
                 <div style={{ display: 'flex', justifyContent: 'space-between', marginTop: 8 }}>
                   <button onClick={() => { onChange(projects.filter((_,xi)=>xi!==i)); setEditIdx(null) }}
-                    style={{ fontSize: 10, color: '#A32D2D', background: 'none', border: 'none', cursor: 'pointer' }}>Delete</button>
+                    style={{ fontSize: 10, color: 'var(--c-danger)', background: 'none', border: 'none', cursor: 'pointer' }}>Delete</button>
                   <Btn small variant="primary" onClick={() => setEditIdx(null)}>Done</Btn>
                 </div>
               </div>
@@ -100,7 +100,7 @@ export function ProjectsSection({ projects, jobContext, onChange, dragHandleProp
                 onDragLeave={() => setDragOver(null)}
                 onDrop={() => handleDrop(i)}
                 style={{ display: 'flex', gap: 4, cursor: 'pointer', padding: '4px 4px 4px 0', borderRadius: 4, marginBottom: 10,
-                  border: dragOver===i ? '0.5px dashed #185FA5' : '0.5px solid transparent',
+                  border: dragOver===i ? '0.5px dashed var(--primary)' : '0.5px solid transparent',
                   background: dragOver===i ? 'rgba(24,95,165,0.03)' : 'transparent' }}
                 onMouseEnter={e => { if(dragOver!==i)(e.currentTarget as HTMLDivElement).style.background='var(--bg-secondary)' }}
                 onMouseLeave={e => { if(dragOver!==i)(e.currentTarget as HTMLDivElement).style.background='transparent' }}>
@@ -110,7 +110,7 @@ export function ProjectsSection({ projects, jobContext, onChange, dragHandleProp
                     <div>
                       <span style={{ fontSize: 12, fontWeight: 500 }}>{p.name || <em style={{ color: 'var(--text-muted)' }}>Untitled</em>}</span>
                       {p.role && <span style={{ fontSize: 12, color: 'var(--text-muted)' }}> · {p.role}</span>}
-                      {p.url && <a href={p.url} target="_blank" rel="noreferrer" onClick={e => e.stopPropagation()} style={{ fontSize: 10, color: '#185FA5', marginLeft: 8 }}>↗ link</a>}
+                      {p.url && <a href={p.url} target="_blank" rel="noreferrer" onClick={e => e.stopPropagation()} style={{ fontSize: 10, color: 'var(--primary)', marginLeft: 8 }}>↗ link</a>}
                     </div>
                     <span style={{ fontSize: 11, color: 'var(--text-muted)' }}>{p.period}</span>
                   </div>

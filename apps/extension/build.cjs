@@ -7,6 +7,18 @@ const path = require('path')
 const ROOT = __dirname
 const DIST = path.join(ROOT, 'dist')
 
+// Guard: Vite calls closeBundle once per entry point.
+// We only want to inline on the FIRST call. Detect by checking if background.js
+// still starts with ES import statements (not yet inlined → first call).
+// After inlining, background.js starts with "const DEFAULTS" → subsequent calls skip.
+const bgCheckPath = path.join(DIST, 'background.js')
+if (!fs.existsSync(bgCheckPath)) process.exit(0)
+const bgFirstLine = fs.readFileSync(bgCheckPath, 'utf-8').split('\n')[0]
+if (!bgFirstLine.startsWith('import ')) {
+  // Already inlined — skip
+  process.exit(0)
+}
+
 // Read source manifest
 const manifest = JSON.parse(fs.readFileSync(path.join(ROOT, 'manifest.json'), 'utf-8'))
 
@@ -14,13 +26,32 @@ const manifest = JSON.parse(fs.readFileSync(path.join(ROOT, 'manifest.json'), 'u
 const srcDir = path.join(DIST, 'src')
 if (fs.existsSync(srcDir)) fs.rmSync(srcDir, { recursive: true, force: true })
 
-// ── Inline background.js ─────────────────────────────────────
-// Service workers in MV3 work best with all code in one file
-const apiJs   = fs.readFileSync(path.join(DIST, 'chunks/api.js'), 'utf-8')
-const bgJs    = fs.readFileSync(path.join(DIST, 'background.js'), 'utf-8')
-// Remove the import line and prepend the API code
-const inlined = bgJs.replace(/^import .+ from "\.\/chunks\/api\.js";\n/, '') + '\n' + apiJs
-fs.writeFileSync(path.join(DIST, 'background.js'), inlined)
+// ── Inline background.js (self-contained, no chunk imports) ──
+// Read all dependency chunks
+const chunkDir = path.join(DIST, 'chunks')
+let bgJs = fs.readFileSync(path.join(DIST, 'background.js'), 'utf-8')
+
+// Strip all relative chunk import lines
+bgJs = bgJs.replace(/^import [^\n]+ from "\.\/chunks\/[^"]+\.js";\n/gm, '')
+
+// Collect and inline all chunks referenced by background (storage, api, etc.)
+const chunksToInline = ['storage', 'api']
+let inlinedChunks = ''
+for (const name of chunksToInline) {
+  const chunkPath = path.join(chunkDir, `${name}.js`)
+  if (fs.existsSync(chunkPath)) {
+    let chunk = fs.readFileSync(chunkPath, 'utf-8')
+    // Strip inter-chunk import lines
+    chunk = chunk.replace(/^import [^\n]+ from "\.\/[^"]+\.js";\n/gm, '')
+    // Strip export { ... } blocks (not needed in self-contained SW)
+    chunk = chunk.replace(/^export \{[\s\S]*?\};\s*/gm, '')
+    inlinedChunks += chunk + '\n'
+  }
+}
+
+// Prepend chunks, then background code
+const finalBg = inlinedChunks + bgJs
+fs.writeFileSync(path.join(DIST, 'background.js'), finalBg)
 
 // popup.js and sidepanel.js keep their ESM imports — loaded as type="module"
 
@@ -50,7 +81,7 @@ if (fs.existsSync(cssSrc)) fs.copyFileSync(cssSrc, path.join(cssDir, 'inject.css
 
 // ── Create popup.html ───────────────────────────────────────
 fs.writeFileSync(path.join(DIST, 'popup.html'), `<!DOCTYPE html>
-<html lang="zh">
+<html lang="en">
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
@@ -68,7 +99,7 @@ fs.writeFileSync(path.join(DIST, 'popup.html'), `<!DOCTYPE html>
 
 // ── Create sidepanel.html ───────────────────────────────────
 fs.writeFileSync(path.join(DIST, 'sidepanel.html'), `<!DOCTYPE html>
-<html lang="zh">
+<html lang="en">
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />

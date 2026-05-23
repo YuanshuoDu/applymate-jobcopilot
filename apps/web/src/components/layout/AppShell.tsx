@@ -7,24 +7,32 @@ import { Sidebar } from './Sidebar'
 import { ToastProvider } from '@/components/ui'
 import type { DashboardData, JobStatus, Page } from '@/lib/types'
 import { NavContext } from '@/lib/nav-context'
+import { OnboardingFlow } from '@/components/onboarding/OnboardingFlow'
 import { DashboardPage }      from '@/components/pages/DashboardPage'
 import { JobsPage }           from '@/components/pages/JobsPage'
 import { SearchPage }         from '@/components/pages/SearchPage'
 import { ResumePage }         from '@/components/pages/ResumePage'
 import { GmailPage }          from '@/components/pages/GmailPage'
 import { AgentPlaygroundPage } from '@/components/pages/AgentPlaygroundPage'
-import { AgentAnimationPage }  from '@/components/pages/AgentAnimationPage'
 import { ExtensionPage }      from '@/components/pages/ExtensionPage'
 import { SettingsPage }       from '@/components/pages/SettingsPage'
 import { ApplyHistoryPage }  from '@/components/pages/ApplyHistoryPage'
 
-const MOB_NAV: { id: Page; icon: string; label: string; badge?: boolean }[] = [
-  { id: 'dashboard', icon: '▦', label: 'Home'    },
-  { id: 'jobs',      icon: '◈', label: 'Jobs',    badge: true },
-  { id: 'gmail',     icon: '✉', label: 'Gmail',   badge: true },
-  { id: 'agent',     icon: '◉', label: 'Agent'    },
-  { id: 'settings',  icon: '⚙', label: 'Settings' },
+const MOB_NAV: { id: Page; label: string }[] = [
+  { id: 'dashboard', label: 'Home'     },
+  { id: 'jobs',      label: 'Jobs'     },
+  { id: 'gmail',     label: 'Gmail'    },
+  { id: 'agent',     label: 'Agent'    },
+  { id: 'settings',  label: 'More'     },
 ]
+
+const MOB_ICONS: Record<string, React.ReactNode> = {
+  dashboard: <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></svg>,
+  jobs:      <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><rect x="2" y="7" width="20" height="14" rx="2"/><path d="M16 7V5a2 2 0 0 0-2-2h-4a2 2 0 0 0-2 2v2"/></svg>,
+  gmail:     <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M4 4h16c1.1 0 2 .9 2 2v12c0 1.1-.9 2-2 2H4c-1.1 0-2-.9-2-2V6c0-1.1.9-2 2-2z"/><polyline points="22,6 12,13 2,6"/></svg>,
+  agent:     <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="12" r="3"/><path d="M12 1v4M12 19v4M4.22 4.22l2.83 2.83M16.95 16.95l2.83 2.83M1 12h4M19 12h4M4.22 19.78l2.83-2.83M16.95 7.05l2.83-2.83"/></svg>,
+  settings:  <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>,
+}
 
 const PAGES: Record<Page, React.ComponentType> = {
   dashboard: DashboardPage,
@@ -33,7 +41,6 @@ const PAGES: Record<Page, React.ComponentType> = {
   resume:    ResumePage,
   gmail:     GmailPage,
   agent:     AgentPlaygroundPage,
-  animation: AgentAnimationPage,
   extension: ExtensionPage,
   settings:  SettingsPage,
   'apply-history': ApplyHistoryPage,
@@ -55,6 +62,17 @@ export function AppShell() {
   const router = useRouter()
   const loginSyncInProgress = useRef<boolean>(false)
   const PageComp = PAGES[page]
+
+  const [checkingOnboard, setCheckingOnboard] = useState(true)
+  const [needsOnboarding, setNeedsOnboarding] = useState(false)
+
+  useEffect(() => {
+    if (status !== 'authenticated') { setCheckingOnboard(false); return }
+    fetch('/api/me')
+      .then(r => r.json())
+      .then((u) => { setNeedsOnboarding(!u.onboardedAt); setCheckingOnboard(false) })
+      .catch(() => setCheckingOnboard(false))
+  }, [status])
 
   // Clean up ?page= query param after reading it
   useEffect(() => {
@@ -86,7 +104,6 @@ export function AppShell() {
       }
       meta.content = session.user.email
     } else if (status === 'unauthenticated') {
-      // Remove meta tag so extension knows dashboard logged out
       document.querySelector('meta[name="applymate:user"]')?.remove()
     }
   }, [status, session])
@@ -96,7 +113,6 @@ export function AppShell() {
     function handleMessage(e: MessageEvent) {
       if (e.origin !== window.location.origin) return
 
-      // Extension logged in → auto-login dashboard
       if (e.data?.type === 'APPLYMATE_TOKEN' && e.data?.token) {
         if (status === 'authenticated') return // already logged in
         if (loginSyncInProgress.current) return
@@ -111,7 +127,6 @@ export function AppShell() {
         }
       }
 
-      // Extension logged out → auto-logout dashboard
       if (e.data?.type === 'APPLYMATE_LOGOUT') {
         if (status !== 'authenticated') return
         signOut({ redirect: false })
@@ -168,12 +183,27 @@ export function AppShell() {
   }
 
   // Show loading skeleton
-  if (status === 'loading') {
+  if (status === 'loading' || checkingOnboard) {
     return (
-      <div style={{ display:'flex', height:'100vh', alignItems:'center', justifyContent:'center', background:'var(--bg-tertiary)' }}>
-        <div style={{ display:'flex', flexDirection:'column', alignItems:'center', gap:12 }}>
-          <div style={{ width:32, height:32, borderRadius:8, background:'#185FA5', display:'flex', alignItems:'center', justifyContent:'center', color:'#fff', fontSize:15, fontWeight:700 }}>A</div>
-          <div style={{ fontSize:12, color:'var(--text-muted)' }}>Loading…</div>
+      <div style={{
+        display: 'flex', height: '100vh', alignItems: 'center', justifyContent: 'center',
+        background: 'var(--bg-mesh)', backgroundAttachment: 'fixed',
+      }}>
+        <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 16 }}>
+          <div style={{
+            width: 52, height: 52, borderRadius: 16,
+            background: 'linear-gradient(135deg, #4F46E5 0%, #7C3AED 100%)',
+            display: 'flex', alignItems: 'center', justifyContent: 'center',
+            color: '#fff', fontSize: 22, fontWeight: 700,
+            boxShadow: '0 8px 32px rgba(79,70,229,0.40), inset 0 1px 0 rgba(255,255,255,0.25)',
+          }}>A</div>
+          <div style={{
+            width: 28, height: 28, borderRadius: '50%',
+            border: '2.5px solid rgba(79,70,229,0.15)',
+            borderTopColor: '#4F46E5',
+            animation: 'spin 0.7s linear infinite',
+          }} />
+          <div style={{ fontSize: 12, color: 'var(--text-muted)', letterSpacing: '0.02em' }}>Loading…</div>
         </div>
       </div>
     )
@@ -182,6 +212,7 @@ export function AppShell() {
   return (
     <>
       <style>{`
+        @keyframes spin { to { transform: rotate(360deg); } }
         @keyframes ai-flash {
           0%   { background-color: rgba(234,179,8,0.35); }
           100% { background-color: transparent; }
@@ -195,35 +226,39 @@ export function AppShell() {
       `}</style>
       <ToastProvider>
       <NavContext.Provider value={{ navigate: setPage }}>
-        <div style={{ display: 'flex', height: '100vh', overflow: 'hidden' }}>
-          <div id="desktop-sidebar">
-            <Sidebar active={page} onNav={setPage} session={session} jobCount={jobCount} />
-          </div>
-          <div id="main-content" style={{ flex: 1, display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
-            <PageComp />
-          </div>
-        </div>
+        {/* Onboarding sits inside ToastProvider so useToast works */}
+        {needsOnboarding ? (
+          <OnboardingFlow onComplete={() => setNeedsOnboarding(false)} />
+        ) : (
+          <>
+            <div style={{ display: 'flex', height: '100vh', overflow: 'hidden' }}>
+              <div id="desktop-sidebar">
+                <Sidebar active={page} onNav={setPage} session={session} jobCount={jobCount} />
+              </div>
+              <div id="main-content" style={{ flex: 1, display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
+                <PageComp />
+              </div>
+            </div>
 
-        {/* Mobile bottom bar */}
-        <div id="mobile-bottom-bar">
-          {MOB_NAV.map(item => (
-            <button key={item.id}
-              aria-label={item.label}
-              onClick={() => setPage(item.id)}
-              style={{
-                display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 3,
-                flex: 1, padding: '6px 0', border: 'none', background: 'transparent', cursor: 'pointer',
-                color: page === item.id ? 'var(--primary)' : 'var(--text-muted)',
-                fontSize: 10, fontFamily: 'inherit', position: 'relative',
-              }}>
-              <span aria-hidden="true" style={{ fontSize: 18 }}>{item.icon}</span>
-              <span>{item.label}</span>
-              {item.badge && item.id === 'gmail' && (
-                <span style={{ position: 'absolute', top: 4, right: 18, width: 6, height: 6, borderRadius: '50%', background: '#A32D2D' }} />
-              )}
-            </button>
-          ))}
-        </div>
+            {/* Mobile bottom bar */}
+            <div id="mobile-bottom-bar">
+              {MOB_NAV.map(item => (
+                <button key={item.id}
+                  aria-label={item.label}
+                  onClick={() => setPage(item.id)}
+                  style={{
+                    display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 3,
+                    flex: 1, padding: '6px 0', border: 'none', background: 'transparent', cursor: 'pointer',
+                    color: page === item.id ? 'var(--primary)' : 'var(--text-muted)',
+                    fontSize: 10, fontFamily: 'inherit', position: 'relative',
+                  }}>
+                  <span aria-hidden="true" style={{ fontSize: 18 }}>{MOB_ICONS[item.id]}</span>
+                  <span>{item.label}</span>
+                </button>
+              ))}
+            </div>
+          </>
+        )}
       </NavContext.Provider>
     </ToastProvider>
     </>

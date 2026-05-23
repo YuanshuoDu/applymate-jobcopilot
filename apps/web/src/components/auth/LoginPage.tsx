@@ -1,305 +1,53 @@
 'use client'
 
-import { useState, useEffect } from 'react'
-import React from 'react'
-import { useI18n } from '@/lib/i18n'
+import React, { useState, useEffect } from 'react'
 import { signIn, getProviders } from 'next-auth/react'
 import { useRouter, useSearchParams } from 'next/navigation'
 import Link from 'next/link'
 
-// ── Colour tokens ─────────────────────────────────────────────
+// ── Design tokens ─────────────────────────────────────────────────────────────
 const C = {
-  primary:  '#185FA5',
-  green:    '#3B6D11',
-  red:      '#A32D2D',
-  border:   'rgba(0,0,0,0.08)',
-  text:     '#0f0f10',
-  muted:    '#6b7280',
-  bg:       '#ffffff',
-  bgSide:   '#f0f5fb',
+  primary:    '#4F46E5',
+  text:       '#0F172A',
+  muted:      '#64748B',
+  subtle:     '#94A3B8',
+  border:     'rgba(79,70,229,0.12)',
+  red:        '#DC2626',
 }
 
 const FEATURES = [
-  { icon: '🎯', title: '智能职位匹配',    desc: 'AI 实时评估每个职位与你简历的匹配程度' },
-  { icon: '📄', title: '简历自动定制',    desc: '针对每个 JD 一键优化简历关键词与格式' },
-  { icon: '🤖', title: 'AI Agent 自动投递', desc: '设置规则后，Agent 24h 自动发现并申请职位' },
-  { icon: '📬', title: 'Gmail 一站跟踪',  desc: '自动识别 HR 回复，汇总申请进度' },
+  {
+    icon: <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="12" r="3"/><path d="M12 1v4M12 19v4M4.22 4.22l2.83 2.83M16.95 16.95l2.83 2.83M1 12h4M19 12h4M4.22 19.78l2.83-2.83M16.95 7.05l2.83-2.83"/></svg>,
+    title: '智能职位匹配',
+    desc:  'AI 实时评估每个职位与你简历的匹配程度',
+  },
+  {
+    icon: <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></svg>,
+    title: '简历自动定制',
+    desc:  '针对每个 JD 一键优化简历关键词与格式',
+  },
+  {
+    icon: <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><rect x="2" y="7" width="20" height="14" rx="2"/><path d="M16 7V5a2 2 0 0 0-2-2h-4a2 2 0 0 0-2 2v2"/></svg>,
+    title: 'AI Agent 自动投递',
+    desc:  '设置规则后，Agent 24h 自动发现并申请职位',
+  },
+  {
+    icon: <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M4 4h16c1.1 0 2 .9 2 2v12c0 1.1-.9 2-2 2H4c-1.1 0-2-.9-2-2V6c0-1.1.9-2 2-2z"/><polyline points="22,6 12,13 2,6"/></svg>,
+    title: 'Gmail 一站跟踪',
+    desc:  '自动识别 HR 回复，汇总申请进度',
+  },
 ]
 
-export function LoginPage() {
-  const router      = useRouter()
-  const searchParams = useSearchParams()
-  const callbackUrl = searchParams.get('callbackUrl') ?? '/'
-  const urlError    = searchParams.get('error')
-
-  const [email,    setEmail]    = useState('')
-  const [password, setPassword] = useState('')
-  const [error,    setError]    = useState(urlError ? mapOAuthError(urlError) : '')
-  const [loading,  setLoading]  = useState<string | null>(null)  // 'credentials' | 'google' | 'github'
-
-  const { t } = useI18n()
-
-  // Detect which OAuth providers are actually configured
-  type Providers = Awaited<ReturnType<typeof getProviders>>
-  const [oauthProviders, setOauthProviders] = useState<Providers>(null)
-  useEffect(() => {
-    getProviders().then(setOauthProviders)
-  }, [])
-
-  // ── Credentials login ────────────────────────────────────────
-  async function handleCredentials(e: React.FormEvent) {
-    e.preventDefault()
-    if (!email || !password) { setError(t('auth.login.error.emailPasswordRequired')); return }
-    setError('')
-    setLoading('credentials')
-    const result = await signIn('credentials', { email, password, redirect: false })
-    setLoading(null)
-    if (result?.error) {
-      setError(t('auth.login.error.invalidCredentials'))
-    } else {
-      router.push(callbackUrl)
-      router.refresh()
-    }
-  }
-
-  // ── OAuth ─────────────────────────────────────────────────────
-  async function handleOAuth(provider: 'google' | 'github') {
-    setLoading(provider)
-    await signIn(provider, { callbackUrl })
-  }
-
+// ── Helper components ─────────────────────────────────────────────────────────
+function Spinner() {
   return (
-    <div style={{ display:'flex', minHeight:'100vh', background: C.bg }}>
-
-      {/* ── Left brand panel ────────────────────────────────── */}
-      <div style={{
-        width: 440, flexShrink: 0, background: C.bgSide,
-        borderRight: `1px solid ${C.border}`,
-        display: 'flex', flexDirection: 'column', padding: '48px 40px',
-        // hide on small screens via class
-      }} className="auth-panel">
-
-        {/* Logo */}
-        <div style={{ display:'flex', alignItems:'center', gap:10, marginBottom:48 }}>
-          <div style={{ width:32, height:32, borderRadius:8, background:C.primary, display:'flex', alignItems:'center', justifyContent:'center', color:'#fff', fontSize:15, fontWeight:700 }}>A</div>
-          <div>
-            <div style={{ fontSize:15, fontWeight:600, color:C.text }}>ApplyMate AI</div>
-            <div style={{ fontSize:11, color:C.muted }}>Job Copilot</div>
-          </div>
-        </div>
-
-        <div style={{ marginBottom:36 }}>
-          <h1 style={{ fontSize:24, fontWeight:700, color:C.text, lineHeight:1.3, marginBottom:10 }}>
-            {t('auth.login.heroTitle').split('\n').map((line, i) => <React.Fragment key={i}>{line}{i === 0 && <br />}</React.Fragment>)}
-          </h1>
-          <p style={{ fontSize:13, color:C.muted, lineHeight:1.7 }}>
-            {t('auth.login.heroDesc')}
-          </p>
-        </div>
-
-        {/* Feature list */}
-        <div style={{ display:'flex', flexDirection:'column', gap:20 }}>
-          {FEATURES.map(f => (
-            <div key={f.title} style={{ display:'flex', gap:14 }}>
-              <div style={{ fontSize:20, flexShrink:0, marginTop:1 }}>{f.icon}</div>
-              <div>
-                <div style={{ fontSize:13, fontWeight:500, color:C.text, marginBottom:3 }}>{f.title}</div>
-                <div style={{ fontSize:11, color:C.muted, lineHeight:1.6 }}>{f.desc}</div>
-              </div>
-            </div>
-          ))}
-        </div>
-
-        {/* Testimonial */}
-        <div style={{ marginTop:'auto', paddingTop:28, borderTop:`1px solid ${C.border}` }}>
-          <blockquote style={{ margin:0 }}>
-            {/* Large decorative quote mark */}
-            <div style={{ fontSize:64, lineHeight:1, color:C.primary, opacity:0.18, fontFamily:'Georgia, serif', marginBottom:-8, userSelect:'none' }}>&ldquo;</div>
-            <p style={{ fontSize:13, color:C.text, lineHeight:1.75, margin:'0 0 14px' }}>
-              {t('auth.login.testimonial')}
-            </p>
-            <div style={{ fontSize:12, color:C.muted, fontStyle:'normal' }}>
-              — <span style={{ fontWeight:500, color:C.text }}>Zhang Li</span>, Backend Engineer · Amsterdam
-            </div>
-          </blockquote>
-        </div>
-      </div>
-
-      {/* ── Right form panel ────────────────────────────────── */}
-      <div style={{ flex:1, display:'flex', alignItems:'center', justifyContent:'center', padding:'32px 24px' }}>
-        <div style={{ width:'100%', maxWidth:400 }}>
-
-          {/* Header */}
-          <div style={{ marginBottom:32 }}>
-            <h2 style={{ fontSize:22, fontWeight:700, color:C.text, marginBottom:6 }}>{t('auth.login.welcomeBack')}</h2>
-            <p style={{ fontSize:13, color:C.muted }}>
-              {t('auth.login.noAccount')}
-              <Link href="/register" style={{ color:C.primary, marginLeft:4, textDecoration:'none', fontWeight:500 }}>{t('auth.login.signUp')}</Link>
-            </p>
-          </div>
-
-          {/* Error banner */}
-          {error && (
-            <div style={{ padding:'10px 14px', background:'rgba(163,45,45,0.08)', border:`1px solid rgba(163,45,45,0.2)`, borderRadius:8, marginBottom:20, fontSize:12, color:C.red }}>
-              ⚠ {error}
-            </div>
-          )}
-
-          {/* OAuth buttons — only show configured providers */}
-          {oauthProviders && (oauthProviders.google || oauthProviders.github) ? (
-            <>
-              <div style={{ display:'flex', flexDirection:'column', gap:10, marginBottom:24 }}>
-                {oauthProviders.google && (
-                  <OAuthBtn
-                    icon={<GoogleIcon />}
-                    label={t('auth.login.googleLogin')}
-                    onClick={() => handleOAuth('google')}
-                    loading={loading === 'google'}
-                  />
-                )}
-                {oauthProviders.github && (
-                  <OAuthBtn
-                    icon={<GitHubIcon />}
-                    label={t('auth.login.githubLogin')}
-                    onClick={() => handleOAuth('github')}
-                    loading={loading === 'github'}
-                    dark
-                  />
-                )}
-              </div>
-
-              {/* Divider */}
-              <div style={{ display:'flex', alignItems:'center', gap:12, marginBottom:24 }}>
-                <div style={{ flex:1, height:1, background:C.border }} />
-                <span style={{ fontSize:11, color:C.muted }}>{t('auth.login.orEmail')}</span>
-                <div style={{ flex:1, height:1, background:C.border }} />
-              </div>
-            </>
-          ) : oauthProviders === null ? (
-            /* Still loading providers — show skeleton */
-            <div style={{ marginBottom:24 }}>
-              <div style={{ height:44, background:C.border, borderRadius:8, opacity:0.3, marginBottom:10 }} />
-              <div style={{ height:44, background:C.border, borderRadius:8, opacity:0.2 }} />
-            </div>
-          ) : null /* No OAuth providers configured — skip directly to email form */}
-
-          {/* Credentials form */}
-          <form onSubmit={handleCredentials} style={{ display:'flex', flexDirection:'column', gap:14 }}>
-            <FormField label={t("auth.login.email")}>
-              <input
-                type="email" value={email} autoComplete="email"
-                placeholder="you@example.com"
-                onChange={e => setEmail(e.target.value)}
-                className="input-base"
-                style={inputStyle}
-              />
-            </FormField>
-
-            <FormField
-              label={t("auth.login.password")}
-              right={<Link href="/forgot-password" style={{ fontSize:11, color:C.primary, textDecoration:'none' }}>{t('auth.login.forgotPassword')}</Link>}
-            >
-              <input
-                type="password" value={password} autoComplete="current-password"
-                placeholder="••••••••"
-                onChange={e => setPassword(e.target.value)}
-                className="input-base"
-                style={inputStyle}
-              />
-            </FormField>
-
-            <SubmitBtn loading={loading === 'credentials'}>{t('auth.login.login')}</SubmitBtn>
-          </form>
-
-          {/* Demo hint */}
-          <div style={{ marginTop:20, padding:'10px 14px', background:'rgba(24,95,165,0.06)', borderRadius:8, fontSize:11, color:C.muted, lineHeight:1.6 }}>
-            {t('auth.login.demoAccount')} <span style={{ fontFamily:'monospace', color:C.text }}>demo@applymate.ai</span> / <span style={{ fontFamily:'monospace', color:C.text }}>demo1234</span>
-          </div>
-
-          {/* Dev hint: OAuth not configured */}
-          {oauthProviders && !oauthProviders.google && !oauthProviders.github && (
-            <div style={{ marginTop:12, padding:'10px 14px', background:'rgba(133,79,11,0.08)', border:'1px solid rgba(133,79,11,0.2)', borderRadius:8, fontSize:11, color:'#854F0B', lineHeight:1.6 }}>
-              ⚙ Google / GitHub 登录未启用<br />
-              <span style={{ fontSize:10, opacity:0.75 }}>在 <code style={{ background:'rgba(0,0,0,0.06)', padding:'1px 4px', borderRadius:3 }}>.env.local</code> 中配置 <code style={{ background:'rgba(0,0,0,0.06)', padding:'1px 4px', borderRadius:3 }}>AUTH_GOOGLE_ID</code> / <code style={{ background:'rgba(0,0,0,0.06)', padding:'1px 4px', borderRadius:3 }}>AUTH_GITHUB_ID</code></span>
-            </div>
-          )}
-
-        </div>
-      </div>
-    </div>
-  )
-}
-
-// ── Shared sub-components ────────────────────────────────────
-
-function OAuthBtn({ icon, label, onClick, loading, dark }: {
-  icon: React.ReactNode; label: string; onClick: () => void; loading?: boolean; dark?: boolean
-}) {
-  const { t } = useI18n()
-  return (
-    <button
-      type="button" onClick={onClick} disabled={loading}
-      style={{
-        display:'flex', alignItems:'center', justifyContent:'center', gap:10,
-        width:'100%', padding:'10px 16px',
-        background: dark ? '#24292e' : C.bg,
-        color: dark ? '#fff' : C.text,
-        border: `1px solid ${dark ? '#24292e' : C.border}`,
-        borderRadius:8, fontSize:13, fontWeight:500, cursor: loading ? 'not-allowed' : 'pointer',
-        opacity: loading ? 0.7 : 1, transition:'all 0.15s',
-      }}
-    >
-      {loading ? <Spinner /> : icon}
-      {loading ? t('auth.login.redirecting') : label}
-    </button>
-  )
-}
-
-function FormField({ label, children, right }: { label: string; children: React.ReactNode; right?: React.ReactNode }) {
-  return (
-    <div style={{ display:'flex', flexDirection:'column', gap:6 }}>
-      <div style={{ display:'flex', justifyContent:'space-between', alignItems:'center' }}>
-        <label style={{ fontSize:12, fontWeight:500, color:C.muted }}>{label}</label>
-        {right}
-      </div>
-      {children}
-    </div>
-  )
-}
-
-function SubmitBtn({ children, loading }: { children: React.ReactNode; loading?: boolean }) {
-  const { t } = useI18n()
-  return (
-    <button
-      type="submit" disabled={loading}
-      style={{
-        width:'100%', padding:'11px', marginTop:4,
-        background: C.primary, color:'#fff', border:'none', borderRadius:8,
-        fontSize:13, fontWeight:600, cursor: loading ? 'not-allowed' : 'pointer',
-        opacity: loading ? 0.7 : 1, transition:'all 0.15s',
-        display:'flex', alignItems:'center', justifyContent:'center', gap:8,
-      }}
-    >
-      {loading && <Spinner light />}
-      {loading ? t('auth.login.loggingIn') : children}
-    </button>
-  )
-}
-
-function Spinner({ light }: { light?: boolean }) {
-  return (
-    <span style={{
-      width:14, height:14, border:`2px solid ${light ? 'rgba(255,255,255,0.3)' : 'rgba(0,0,0,0.15)'}`,
-      borderTopColor: light ? '#fff' : C.primary,
-      borderRadius:'50%', display:'inline-block',
-      animation:'spin 0.7s linear infinite',
-    }} />
+    <div style={{ width: 14, height: 14, borderRadius: '50%', border: '2px solid rgba(255,255,255,0.3)', borderTopColor: '#fff', animation: 'spin 0.7s linear infinite' }} />
   )
 }
 
 function GoogleIcon() {
   return (
-    <svg width="18" height="18" viewBox="0 0 24 24">
+    <svg width="17" height="17" viewBox="0 0 24 24">
       <path fill="#4285F4" d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92c-.26 1.37-1.04 2.53-2.21 3.31v2.77h3.57c2.08-1.92 3.28-4.74 3.28-8.09z"/>
       <path fill="#34A853" d="M12 23c2.97 0 5.46-.98 7.28-2.66l-3.57-2.77c-.98.66-2.23 1.06-3.71 1.06-2.86 0-5.29-1.93-6.16-4.53H2.18v2.84C3.99 20.53 7.7 23 12 23z"/>
       <path fill="#FBBC05" d="M5.84 14.09c-.22-.66-.35-1.36-.35-2.09s.13-1.43.35-2.09V7.07H2.18C1.43 8.55 1 10.22 1 12s.43 3.45 1.18 4.93l2.85-2.22.81-.62z"/>
@@ -310,28 +58,306 @@ function GoogleIcon() {
 
 function GitHubIcon() {
   return (
-    <svg width="18" height="18" viewBox="0 0 24 24" fill="#fff">
-      <path d="M12 0C5.374 0 0 5.373 0 12c0 5.302 3.438 9.8 8.207 11.387.599.111.793-.261.793-.577v-2.234c-3.338.726-4.033-1.416-4.033-1.416-.546-1.387-1.333-1.756-1.333-1.756-1.089-.745.083-.729.083-.729 1.205.084 1.839 1.237 1.839 1.237 1.07 1.834 2.807 1.304 3.492.997.107-.775.418-1.305.762-1.604-2.665-.305-5.467-1.334-5.467-5.931 0-1.311.469-2.381 1.236-3.221-.124-.303-.535-1.524.117-3.176 0 0 1.008-.322 3.301 1.23A11.509 11.509 0 0112 5.803c1.02.005 2.047.138 3.006.404 2.291-1.552 3.297-1.23 3.297-1.23.653 1.653.242 2.874.118 3.176.77.84 1.235 1.911 1.235 3.221 0 4.609-2.807 5.624-5.479 5.921.43.372.823 1.102.823 2.222v3.293c0 .319.192.694.801.576C20.566 21.797 24 17.3 24 12c0-6.627-5.373-12-12-12z"/>
+    <svg width="17" height="17" viewBox="0 0 24 24" fill="currentColor">
+      <path d="M12 2C6.477 2 2 6.484 2 12.017c0 4.425 2.865 8.18 6.839 9.504.5.092.682-.217.682-.483 0-.237-.008-.868-.013-1.703-2.782.605-3.369-1.343-3.369-1.343-.454-1.158-1.11-1.466-1.11-1.466-.908-.62.069-.608.069-.608 1.003.07 1.531 1.032 1.531 1.032.892 1.53 2.341 1.088 2.91.832.092-.647.35-1.088.636-1.338-2.22-.253-4.555-1.113-4.555-4.951 0-1.093.39-1.988 1.029-2.688-.103-.253-.446-1.272.098-2.65 0 0 .84-.27 2.75 1.026A9.564 9.564 0 0112 6.844c.85.004 1.705.115 2.504.337 1.909-1.296 2.747-1.027 2.747-1.027.546 1.379.202 2.398.1 2.651.64.7 1.028 1.595 1.028 2.688 0 3.848-2.339 4.695-4.566 4.943.359.309.678.92.678 1.855 0 1.338-.012 2.419-.012 2.747 0 .268.18.58.688.482A10.019 10.019 0 0022 12.017C22 6.484 17.522 2 12 2z"/>
     </svg>
   )
 }
 
-const inputStyle: React.CSSProperties = {
-  width:'100%', padding:'10px 12px',
-  border:`1px solid ${C.border}`, borderRadius:8,
-  fontSize:13, color:C.text, background:C.bg,
-  transition:'border-color 0.15s',
+function OAuthBtn({ icon, label, onClick, loading, dark }: {
+  icon: React.ReactNode; label: string; onClick: () => void; loading?: boolean; dark?: boolean
+}) {
+  const [hov, setHov] = React.useState(false)
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      disabled={loading}
+      onMouseEnter={() => setHov(true)}
+      onMouseLeave={() => setHov(false)}
+      style={{
+        display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 10,
+        width: '100%', padding: '11px 16px',
+        background: dark
+          ? (hov ? '#1a1a1a' : '#24292e')
+          : (hov ? 'rgba(255,255,255,0.98)' : 'rgba(255,255,255,0.90)'),
+        border: dark ? 'none' : '1px solid rgba(79,70,229,0.18)',
+        borderRadius: 10, fontSize: 13, fontWeight: 500,
+        color: dark ? '#fff' : '#0F172A',
+        cursor: loading ? 'not-allowed' : 'pointer',
+        opacity: loading ? 0.7 : 1,
+        transition: 'all 0.15s',
+        boxShadow: dark
+          ? '0 2px 8px rgba(0,0,0,0.25)'
+          : '0 1px 4px rgba(79,70,229,0.08)',
+      }}
+    >
+      {loading ? <Spinner /> : icon}
+      {label}
+    </button>
+  )
 }
 
-function mapOAuthError(code: string): string {
-  const map: Record<string, string> = {
-    OAuthSignin:       'OAuth 登录初始化失败，请重试',
-    OAuthCallback:     'OAuth 回调出错，请重试',
-    OAuthCreateAccount:'无法创建账号，该邮箱可能已注册',
-    OAuthAccountNotLinked:'该邮箱已绑定其他登录方式',
-    Callback:          '登录过程出错，请重试',
-    AccessDenied:      '访问被拒绝',
-    Verification:      '验证链接已过期，请重新请求',
+function mapOAuthError(err: string): string {
+  const MAP: Record<string, string> = {
+    OAuthAccountNotLinked: '该邮箱已用其他方式注册，请使用原登录方式',
+    OAuthCallbackError:    'OAuth 登录失败，请重试',
+    AccessDenied:          '登录被拒绝',
+    Verification:          '验证链接已过期',
   }
-  return map[code] ?? '登录出错，请重试'
+  return MAP[err] ?? `登录出错：${err}`
+}
+
+export function LoginPage() {
+  const router       = useRouter()
+  const searchParams = useSearchParams()
+  const callbackUrl  = searchParams.get('callbackUrl') ?? '/'
+  const urlError     = searchParams.get('error')
+
+  const [email,    setEmail]    = useState('')
+  const [password, setPassword] = useState('')
+  const [error,    setError]    = useState(urlError ? mapOAuthError(urlError) : '')
+  const [loading,  setLoading]  = useState<string | null>(null)
+  const [focused,  setFocused]  = useState<string | null>(null)
+
+  type Providers = Awaited<ReturnType<typeof getProviders>>
+  const [oauthProviders, setOauthProviders] = useState<Providers>(null)
+  useEffect(() => { getProviders().then(setOauthProviders) }, [])
+
+  async function handleCredentials(e: React.FormEvent) {
+    e.preventDefault()
+    if (!email || !password) { setError('请填写邮箱和密码'); return }
+    setError('')
+    setLoading('credentials')
+    const result = await signIn('credentials', { email, password, redirect: false })
+    setLoading(null)
+    if (result?.error) { setError('邮箱或密码不正确') }
+    else { router.push(callbackUrl); router.refresh() }
+  }
+
+  async function handleOAuth(provider: 'google' | 'github') {
+    setLoading(provider)
+    await signIn(provider, { callbackUrl })
+  }
+
+  return (
+    <div style={{
+      display: 'flex', minHeight: '100vh',
+      background: 'linear-gradient(135deg, #EEF2FF 0%, #F5F3FF 35%, #EDE9FE 65%, #F0F9FF 100%)',
+      backgroundAttachment: 'fixed', position: 'relative', overflow: 'hidden',
+    }}>
+      {/* Decorative blobs */}
+      <div style={{ position:'absolute', top:'-15%', left:'-10%', width:600, height:600, borderRadius:'50%', background:'radial-gradient(circle, rgba(79,70,229,0.18) 0%, transparent 70%)', pointerEvents:'none', filter:'blur(40px)' }} />
+      <div style={{ position:'absolute', bottom:'-20%', right:'-5%', width:700, height:700, borderRadius:'50%', background:'radial-gradient(circle, rgba(124,58,237,0.14) 0%, transparent 70%)', pointerEvents:'none', filter:'blur(50px)' }} />
+      <div style={{ position:'absolute', top:'40%', left:'35%', width:400, height:400, borderRadius:'50%', background:'radial-gradient(circle, rgba(2,132,199,0.08) 0%, transparent 70%)', pointerEvents:'none', filter:'blur(30px)' }} />
+
+      {/* ── Left brand panel ────────────────────────────────── */}
+      <div className="auth-panel" style={{
+        width: 460, flexShrink: 0,
+        background: 'rgba(255,255,255,0.76)',
+        backdropFilter: 'blur(24px) saturate(180%)',
+        WebkitBackdropFilter: 'blur(24px) saturate(180%)',
+        borderRight: '1px solid rgba(255,255,255,0.85)',
+        display: 'flex', flexDirection: 'column', padding: '48px 44px',
+        position: 'relative', zIndex: 1,
+      }}>
+        {/* Logo — clickable */}
+        <Link href="/" style={{ display:'flex', alignItems:'center', gap:12, marginBottom:52, textDecoration:'none' }}>
+          <div style={{
+            width:38, height:38, borderRadius:11,
+            background:'linear-gradient(135deg, #4F46E5 0%, #7C3AED 100%)',
+            display:'flex', alignItems:'center', justifyContent:'center',
+            color:'#fff', fontSize:16, fontWeight:700,
+            boxShadow:'0 4px 14px rgba(79,70,229,0.40), inset 0 1px 0 rgba(255,255,255,0.25)',
+          }}>A</div>
+          <div>
+            <div style={{
+              fontSize:16, fontWeight:700,
+              background:'linear-gradient(135deg, #4F46E5 0%, #7C3AED 100%)',
+              WebkitBackgroundClip:'text', WebkitTextFillColor:'transparent', backgroundClip:'text',
+            }}>ApplyMate AI</div>
+            <div style={{ fontSize:11, color:C.subtle }}>Job Copilot · Europe</div>
+          </div>
+        </Link>
+
+        {/* Hero text */}
+        <div style={{ marginBottom:40 }}>
+          <h1 style={{ fontSize:28, fontWeight:800, color:C.text, lineHeight:1.25, marginBottom:14, letterSpacing:'-0.02em' }}>
+            让 AI 帮你<br />找到理想的工作
+          </h1>
+          <p style={{ fontSize:13, color:C.muted, lineHeight:1.75 }}>
+            ApplyMate AI 自动化你的求职流程——从发现职位到投递简历，全程 AI 驱动。
+          </p>
+        </div>
+
+        {/* Features */}
+        <div style={{ display:'flex', flexDirection:'column', gap:22 }}>
+          {FEATURES.map(f => (
+            <div key={f.title} style={{ display:'flex', gap:14, alignItems:'flex-start' }}>
+              <div style={{
+                width:36, height:36, borderRadius:10, flexShrink:0,
+                background:'linear-gradient(135deg, rgba(79,70,229,0.09) 0%, rgba(124,58,237,0.07) 100%)',
+                border:'1px solid rgba(79,70,229,0.15)',
+                display:'flex', alignItems:'center', justifyContent:'center',
+                color:C.primary,
+              }}>{f.icon}</div>
+              <div>
+                <div style={{ fontSize:13, fontWeight:600, color:C.text, marginBottom:3 }}>{f.title}</div>
+                <div style={{ fontSize:11, color:C.muted, lineHeight:1.65 }}>{f.desc}</div>
+              </div>
+            </div>
+          ))}
+        </div>
+
+        {/* Testimonial */}
+        <div style={{ marginTop:'auto', paddingTop:28, borderTop:`1px solid ${C.border}` }}>
+          <div style={{
+            background:'linear-gradient(135deg, rgba(79,70,229,0.06) 0%, rgba(124,58,237,0.04) 100%)',
+            border:'1px solid rgba(79,70,229,0.12)', borderRadius:12, padding:'16px 18px',
+          }}>
+            <div style={{ fontSize:24, lineHeight:1, color:C.primary, opacity:0.28, fontFamily:'Georgia,serif', marginBottom:4, userSelect:'none' }}>&ldquo;</div>
+            <p style={{ fontSize:12, color:C.text, lineHeight:1.80, margin:'0 0 12px' }}>
+              用 ApplyMate 两周内拿到了 Adyen、Booking.com 的面试，省了我大量整理简历的时间。
+            </p>
+            <div style={{ fontSize:11, color:C.muted }}>
+              — <span style={{ fontWeight:600, color:C.text }}>Zhang Li</span>，Backend Engineer · Amsterdam
+            </div>
+          </div>
+        </div>
+      </div>
+
+      {/* ── Right form panel ────────────────────────────────── */}
+      <div style={{
+        flex:1, display:'flex', alignItems:'center', justifyContent:'center',
+        padding:'32px 24px', position:'relative', zIndex:1,
+      }}>
+        <div style={{
+          width:'100%', maxWidth:420,
+          background:'rgba(255,255,255,0.80)',
+          backdropFilter:'blur(24px) saturate(200%)',
+          WebkitBackdropFilter:'blur(24px) saturate(200%)',
+          border:'1px solid rgba(255,255,255,0.92)',
+          borderRadius:20, padding:'36px 32px',
+          boxShadow:'0 8px 40px rgba(79,70,229,0.12), 0 2px 8px rgba(0,0,0,0.06), inset 0 1px 0 rgba(255,255,255,0.95)',
+        }}>
+          {/* Header */}
+          <div style={{ marginBottom:28 }}>
+            <h2 style={{ fontSize:22, fontWeight:800, color:C.text, marginBottom:6, letterSpacing:'-0.02em' }}>欢迎回来 👋</h2>
+            <p style={{ fontSize:13, color:C.muted }}>
+              还没有账号？{' '}
+              <Link href="/register" style={{
+                color:C.primary, textDecoration:'none', fontWeight:600,
+                background:'linear-gradient(135deg, #4F46E5, #7C3AED)',
+                WebkitBackgroundClip:'text', WebkitTextFillColor:'transparent', backgroundClip:'text',
+              }}>免费注册</Link>
+            </p>
+          </div>
+
+          {/* Error */}
+          {error && (
+            <div style={{
+              padding:'10px 14px', background:'rgba(220,38,38,0.08)',
+              border:'1px solid rgba(220,38,38,0.22)', borderRadius:10, marginBottom:20,
+              fontSize:12, color:C.red, display:'flex', alignItems:'center', gap:8,
+            }}>
+              <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>
+              {error}
+            </div>
+          )}
+
+          {/* OAuth */}
+          {oauthProviders && (oauthProviders.google || oauthProviders.github) ? (
+            <>
+              <div style={{ display:'flex', flexDirection:'column', gap:10, marginBottom:22 }}>
+                {oauthProviders.google && <OAuthBtn icon={<GoogleIcon />} label="使用 Google 登录" onClick={() => handleOAuth('google')} loading={loading === 'google'} />}
+                {oauthProviders.github && <OAuthBtn icon={<GitHubIcon />} label="使用 GitHub 登录" onClick={() => handleOAuth('github')} loading={loading === 'github'} dark />}
+              </div>
+              <div style={{ display:'flex', alignItems:'center', gap:14, marginBottom:22 }}>
+                <div style={{ flex:1, height:1, background:'linear-gradient(90deg, transparent, rgba(79,70,229,0.20), transparent)' }} />
+                <span style={{ fontSize:11, color:C.subtle, whiteSpace:'nowrap' }}>或使用邮箱登录</span>
+                <div style={{ flex:1, height:1, background:'linear-gradient(90deg, transparent, rgba(79,70,229,0.20), transparent)' }} />
+              </div>
+            </>
+          ) : oauthProviders === null ? (
+            <div style={{ marginBottom:22 }}>
+              <div style={{ height:46, borderRadius:10, marginBottom:10, background:'rgba(79,70,229,0.06)' }} />
+              <div style={{ height:46, borderRadius:10, background:'rgba(79,70,229,0.04)' }} />
+            </div>
+          ) : null}
+
+          {/* Credentials form */}
+          <form onSubmit={handleCredentials} style={{ display:'flex', flexDirection:'column', gap:15 }}>
+            {/* Email */}
+            <div style={{ display:'flex', flexDirection:'column', gap:7 }}>
+              <label style={{ fontSize:12, fontWeight:500, color:C.muted }}>邮箱</label>
+              <input
+                type="email" value={email} autoComplete="email" placeholder="you@example.com"
+                onFocus={() => setFocused('email')} onBlur={() => setFocused(null)}
+                onChange={e => setEmail(e.target.value)}
+                style={{
+                  width:'100%', padding:'10px 13px',
+                  background: focused === 'email' ? 'rgba(255,255,255,0.95)' : 'rgba(255,255,255,0.65)',
+                  border: focused === 'email' ? '1.5px solid rgba(79,70,229,0.55)' : '1px solid rgba(79,70,229,0.18)',
+                  borderRadius:9, fontSize:13, color:C.text, outline:'none',
+                  boxShadow: focused === 'email' ? '0 0 0 3px rgba(79,70,229,0.12)' : '0 1px 2px rgba(0,0,0,0.04)',
+                  transition:'all 0.18s', backdropFilter:'blur(8px)',
+                }}
+              />
+            </div>
+            {/* Password */}
+            <div style={{ display:'flex', flexDirection:'column', gap:7 }}>
+              <div style={{ display:'flex', justifyContent:'space-between', alignItems:'center' }}>
+                <label style={{ fontSize:12, fontWeight:500, color:C.muted }}>密码</label>
+                <Link href="/forgot-password" style={{ fontSize:11, color:C.primary, textDecoration:'none', fontWeight:500 }}>忘记密码？</Link>
+              </div>
+              <input
+                type="password" value={password} autoComplete="current-password" placeholder="••••••••"
+                onFocus={() => setFocused('password')} onBlur={() => setFocused(null)}
+                onChange={e => setPassword(e.target.value)}
+                style={{
+                  width:'100%', padding:'10px 13px',
+                  background: focused === 'password' ? 'rgba(255,255,255,0.95)' : 'rgba(255,255,255,0.65)',
+                  border: focused === 'password' ? '1.5px solid rgba(79,70,229,0.55)' : '1px solid rgba(79,70,229,0.18)',
+                  borderRadius:9, fontSize:13, color:C.text, outline:'none',
+                  boxShadow: focused === 'password' ? '0 0 0 3px rgba(79,70,229,0.12)' : '0 1px 2px rgba(0,0,0,0.04)',
+                  transition:'all 0.18s', backdropFilter:'blur(8px)',
+                }}
+              />
+            </div>
+            {/* Submit */}
+            <button
+              type="submit" disabled={!!loading}
+              style={{
+                width:'100%', padding:'12px', marginTop:4, border:'none',
+                background:'linear-gradient(135deg, #4F46E5 0%, #7C3AED 100%)',
+                color:'#fff', borderRadius:10, fontSize:13, fontWeight:600,
+                cursor: loading ? 'not-allowed' : 'pointer',
+                opacity: loading ? 0.85 : 1,
+                transition:'all 0.18s cubic-bezier(.4,0,.2,1)',
+                display:'flex', alignItems:'center', justifyContent:'center', gap:8,
+                boxShadow:'0 4px 14px rgba(79,70,229,0.38), inset 0 1px 0 rgba(255,255,255,0.20)',
+                letterSpacing:'0.01em',
+              }}
+            >
+              {loading === 'credentials' && <Spinner />}
+              {loading === 'credentials' ? '登录中…' : '登录'}
+            </button>
+          </form>
+
+          {/* Demo hint */}
+          <div style={{
+            marginTop: 20, padding: '10px 14px',
+            background: 'rgba(79,70,229,0.05)', borderRadius: 10,
+            border: '1px solid rgba(79,70,229,0.12)',
+          }}>
+            <div style={{ fontSize: 11, color: C.muted, lineHeight: 1.6 }}>
+              <span style={{ fontWeight: 600, color: C.primary }}>Demo：</span>
+              {' '}使用 <code style={{ background: 'rgba(79,70,229,0.08)', padding: '1px 5px', borderRadius: 4, fontFamily: 'monospace' }}>demo@applymate.ai</code>
+              {' '}+ 任意密码体验完整功能。
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  )
 }

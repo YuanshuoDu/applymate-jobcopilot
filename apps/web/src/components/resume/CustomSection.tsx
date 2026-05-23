@@ -60,11 +60,11 @@ export function CustomSection({ entry, jobContext, onChange, onRemove, dragHandl
               onBlur={() => setEditTitle(false)}
               onKeyDown={e => { if (e.key === 'Enter' || e.key === 'Escape') setEditTitle(false) }}
               placeholder="SECTION TITLE"
-              style={{ fontSize: 11, fontWeight: 500, width: '100%', border: '0.5px solid #185FA5', borderRadius: 4, padding: '3px 6px', outline: 'none', marginBottom: 8, color: 'var(--text)', background: 'var(--bg)', boxSizing: 'border-box' }}
+              style={{ fontSize: 11, fontWeight: 500, width: '100%', border: '0.5px solid var(--primary)', borderRadius: 4, padding: '3px 6px', outline: 'none', marginBottom: 8, color: 'var(--text)', background: 'var(--bg)', boxSizing: 'border-box' }}
             />
           ) : (
             <button onClick={() => setEditTitle(true)}
-              style={{ fontSize: 9, color: '#185FA5', background: 'none', border: 'none', cursor: 'pointer', marginBottom: 6, padding: 0 }}>
+              style={{ fontSize: 9, color: 'var(--primary)', background: 'none', border: 'none', cursor: 'pointer', marginBottom: 6, padding: 0 }}>
               Edit title
             </button>
           )}
@@ -75,7 +75,7 @@ export function CustomSection({ entry, jobContext, onChange, onRemove, dragHandl
 
           {entry.items.map((item, i) => (
             editIdx === i ? (
-              <div key={i} style={{ border: '0.5px solid #185FA5', borderRadius: 6, padding: 10, marginBottom: 8 }}>
+              <div key={i} style={{ border: '0.5px solid var(--primary)', borderRadius: 6, padding: 10, marginBottom: 8 }}>
                 <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 6, marginBottom: 6 }}>
                   <InlineInput value={item.title??''}    onChange={v => updateItem(i, { title: v||undefined })}    placeholder="Title (optional)" />
                   <InlineInput value={item.subtitle??''} onChange={v => updateItem(i, { subtitle: v||undefined })} placeholder="Subtitle (optional)" />
@@ -89,7 +89,7 @@ export function CustomSection({ entry, jobContext, onChange, onRemove, dragHandl
                         updateItem(i, { bullets: item.bullets.map((x, xi) => xi === bi ? v : x) })
                       }} multiline placeholder="Detail…" style={{ minHeight: 36 }} />
                       <button onClick={() => updateItem(i, { bullets: item.bullets.filter((_, xi) => xi !== bi) })}
-                        style={{ fontSize: 11, color: '#A32D2D', background: 'none', border: 'none', cursor: 'pointer', marginTop: 7, flexShrink: 0 }}>✕</button>
+                        style={{ fontSize: 11, color: 'var(--c-danger)', background: 'none', border: 'none', cursor: 'pointer', marginTop: 7, flexShrink: 0 }}>✕</button>
                     </div>
                   ))}
                   {item.bullets.map((b, bi) => bi === item.bullets.length - 1 && (
@@ -101,13 +101,13 @@ export function CustomSection({ entry, jobContext, onChange, onRemove, dragHandl
                     />
                   ))}
                   <button onClick={() => updateItem(i, { bullets: [...item.bullets, ''] })}
-                    style={{ fontSize: 10, color: '#185FA5', background: 'none', border: 'none', cursor: 'pointer', marginTop: 4 }}>
+                    style={{ fontSize: 10, color: 'var(--primary)', background: 'none', border: 'none', cursor: 'pointer', marginTop: 4 }}>
                     + Add bullet
                   </button>
                 </div>
                 <div style={{ display: 'flex', justifyContent: 'space-between', marginTop: 8 }}>
                   <button onClick={() => { onChange({ ...entry, items: entry.items.filter((_, xi) => xi !== i) }); setEditIdx(null) }}
-                    style={{ fontSize: 10, color: '#A32D2D', background: 'none', border: 'none', cursor: 'pointer' }}>Delete</button>
+                    style={{ fontSize: 10, color: 'var(--c-danger)', background: 'none', border: 'none', cursor: 'pointer' }}>Delete</button>
                   <Btn small variant="primary" onClick={() => setEditIdx(null)}>Done</Btn>
                 </div>
               </div>
@@ -118,7 +118,7 @@ export function CustomSection({ entry, jobContext, onChange, onRemove, dragHandl
                 onDragLeave={() => setDragOver(null)}
                 onDrop={() => handleDrop(i)}
                 style={{ display: 'flex', gap: 4, cursor: 'pointer', padding: '4px 4px 4px 0', borderRadius: 4, marginBottom: 8,
-                  border: dragOver===i ? '0.5px dashed #185FA5' : '0.5px solid transparent',
+                  border: dragOver===i ? '0.5px dashed var(--primary)' : '0.5px solid transparent',
                   background: dragOver===i ? 'rgba(24,95,165,0.03)' : 'transparent' }}
                 onMouseEnter={e => { if(dragOver!==i)(e.currentTarget as HTMLDivElement).style.background='var(--bg-secondary)' }}
                 onMouseLeave={e => { if(dragOver!==i)(e.currentTarget as HTMLDivElement).style.background='transparent' }}>

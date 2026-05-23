@@ -8,7 +8,12 @@
 import { NextRequest } from 'next/server'
 import { requireAuth, isErrorResponse, ok, err } from '@/lib/api-helpers'
 import { checkRateLimit } from '@/lib/rate-limit'
-import { modelChat, stripFences, loadUserAiConfig } from '@/lib/model-router'
+import { modelChat, parseAiJson, loadUserAiConfig, type AiConfig } from '@/lib/model-router'
+
+const PARSE_FALLBACKS: AiConfig[] = [
+  { provider: 'deepseek', model: 'deepseek-chat' },
+  { provider: 'minimax',  model: 'MiniMax-M2.7'  },
+]
 import type { ResumeContent } from '@/lib/types'
 
 const MAX_BYTES = 5 * 1024 * 1024 // 5 MB
@@ -64,8 +69,8 @@ export async function POST(req: NextRequest) {
   // Truncate to avoid token overflow (~12 000 chars ≈ 3 000 tokens)
   if (rawText.length > 12_000) rawText = rawText.slice(0, 12_000) + '\n[... truncated]'
 
-  // ── 2. Claude parse ───────────────────────────────────────────────────────
-  const cfg = await loadUserAiConfig(auth.userId, 'parsing')
+  // ── 2. AI parse ───────────────────────────────────────────────────────────
+  const primaryCfg = await loadUserAiConfig(auth.userId, 'parsing')
 
   const systemPrompt = `You are an expert resume parser. Extract structured data from the raw resume text below and return ONLY valid JSON matching this TypeScript interface (no markdown fences, no explanation):
 
@@ -116,22 +121,35 @@ Rules:
 - Return [] for sections with no data, not null
 - summary: if absent, write a concise 2-sentence professional summary derived from the resume`
 
+  const messages = [
+    { role: 'system' as const, content: systemPrompt },
+    { role: 'user'   as const, content: `Parse this resume:\n\n${rawText}` },
+  ]
+
+  // Try primary model then fallbacks
+  async function tryParse(): Promise<string> {
+    const attempts = [primaryCfg, ...PARSE_FALLBACKS.filter(f =>
+      !(f.provider === primaryCfg.provider && f.model === primaryCfg.model)
+    )]
+    let lastErr: unknown
+    for (const attempt of attempts) {
+      try {
+        const result = await modelChat(messages, attempt, 4096)
+        return result.text
+      } catch (e) {
+        lastErr = e
+        console.warn(`[resume/parse] ${attempt.provider}/${attempt.model} failed:`, (e as Error).message?.slice(0, 100))
+      }
+    }
+    throw lastErr
+  }
+
   let parsed: ResumeContent
   try {
-    const result = await modelChat([
-      { role: 'system', content: systemPrompt },
-      { role: 'user',   content: `Parse this resume:\n\n${rawText}` },
-    ], cfg, 4096)
-
-    let json = stripFences(result.text)
-    // Fallback: extract first {...} block if model added extra text
-    if (!json.startsWith('{')) {
-      const m = json.match(/\{[\s\S]*\}/)
-      if (m) json = m[0]
-    }
-    parsed = JSON.parse(json) as ResumeContent
+    const rawResponse = await tryParse()
+    parsed = parseAiJson<ResumeContent>(rawResponse)
   } catch (e) {
-    console.error('[resume/parse] Claude error', e)
+    console.error('[resume/parse] AI error', e)
     return err('AI parsing failed — please try again or fill in manually')
   }
 

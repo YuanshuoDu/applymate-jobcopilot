@@ -24,7 +24,7 @@ export function decodeEntities(text: string): string {
 }
 
 /** Truncate text to max length, decoding HTML entities and appending "…" if truncated */
-export function truncate(text: string, max = 2000): string {
+export function truncate(text: string, max = 6000): string {
   const clean = decodeEntities(text)
   if (!clean || clean.length <= max) return clean
   return clean.slice(0, max).trimEnd() + '…'
