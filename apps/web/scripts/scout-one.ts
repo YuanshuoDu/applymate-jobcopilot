@@ -4,10 +4,12 @@
  * Single slug mode:
  *   pnpm --filter web exec tsx scripts/scout-one.ts greenhouse booking
  *   pnpm --filter web exec tsx scripts/scout-one.ts lever spotify
+ *   pnpm --filter web exec tsx scripts/scout-one.ts smartrecruiters SmartRecruiters
  *
  * Registry mode (batch all employers in the registry):
  *   pnpm --filter web exec tsx scripts/scout-one.ts --registry greenhouse
  *   pnpm --filter web exec tsx scripts/scout-one.ts --registry lever
+ *   pnpm --filter web exec tsx scripts/scout-one.ts --registry smartrecruiters
  *
  * Prints discovered jobs to stdout. No DB writes.
  */
@@ -15,9 +17,10 @@
 import { fetchGreenhouse } from "../src/lib/agent/sources/greenhouse"
 import { fetchWorkday } from "../src/lib/agent/sources/workday"
 import { fetchLever } from "../src/lib/agent/sources/lever"
+import { fetchSmartRecruiters } from "../src/lib/agent/sources/smartrecruiters"
 import { loadRegistry, loadWorkdayRegistry, type Employer, type WorkdayEmployer } from "../src/lib/agent/registries"
 
-type Ats = "greenhouse" | "lever" | "workday"
+type Ats = "greenhouse" | "lever" | "workday" | "smartrecruiters"
 
 async function main() {
   const args = process.argv.slice(2)
@@ -25,8 +28,8 @@ async function main() {
   // Registry mode: --registry <ats>
   if (args[0] === "--registry") {
     const ats = args[1] as Ats | undefined
-    if (!ats || !["greenhouse", "lever", "workday"].includes(ats)) {
-      console.error("Usage: pnpm --filter web exec tsx scripts/scout-one.ts --registry <greenhouse|lever|workday>")
+    if (!ats || !["greenhouse", "lever", "workday", "smartrecruiters"].includes(ats)) {
+      console.error("Usage: pnpm --filter web exec tsx scripts/scout-one.ts --registry <greenhouse|lever|workday|smartrecruiters>")
       process.exit(1)
     }
     await runRegistry(ats)
@@ -36,7 +39,7 @@ async function main() {
   // Single slug mode: <ats> <slug>
   if (args.length < 2) {
     console.error("Usage: pnpm --filter web exec tsx scripts/scout-one.ts <ats> <slug>")
-    console.error("       pnpm --filter web exec tsx scripts/scout-one.ts --registry <greenhouse|lever>")
+    console.error("       pnpm --filter web exec tsx scripts/scout-one.ts --registry <greenhouse|lever|workday|smartrecruiters>")
     process.exit(1)
   }
 
@@ -49,7 +52,10 @@ async function main() {
   } else if (ats === "lever") {
     console.log(`Scouting lever / ${slug} ...`)
     jobs = await fetchLever([slug])
-    } else if (ats === "workday") {
+  } else if (ats === "smartrecruiters") {
+    console.log(`Scouting smartrecruiters / ${slug} ...`)
+    jobs = await fetchSmartRecruiters(slug)
+  } else if (ats === "workday") {
     const employers = loadWorkdayRegistry()
     const employer = employers.find((e: WorkdayEmployer) => e.tenant === slug)
     if (!employer) {
@@ -59,7 +65,7 @@ async function main() {
     console.log(`Scouting workday / ${employer.name} (${employer.tenant}) ...`)
     jobs = await fetchWorkday([employer])
   } else {
-    console.error(`Unknown ATS: ${ats}. Supported: greenhouse, lever`)
+    console.error(`Unknown ATS: ${ats}. Supported: greenhouse, lever, workday, smartrecruiters`)
     process.exit(1)
   }
 
@@ -108,7 +114,11 @@ async function runRegistry(ats: Ats) {
   console.log(`Registry ${ats}: ${employers.length} employers`)
 
   const slugs = employers.map((e: Employer) => e.slug)
-  const fetcher = ats === "greenhouse" ? fetchGreenhouse : fetchLever
+  const fetcher = ats === "greenhouse"
+    ? fetchGreenhouse
+    : ats === "lever"
+      ? fetchLever
+      : async (slugs: string[]) => (await Promise.all(slugs.map(fetchSmartRecruiters))).flat()
 
   console.log(`Fetching ${slugs.length} employers (${ats})...\n`)
   const jobs = await fetcher(slugs)
