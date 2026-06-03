@@ -1,16 +1,6 @@
 import type { Page } from "playwright-core";
 import type { ApplyTask, HarnessResult } from "../harness/agent-harness.js";
-
-/** Get persona value with firstName/lastName fallback from fullName */
-function getPersonaValue(persona: Record<string, string>, key: string): string {
-  if (persona[key]) return persona[key]
-  if (key === 'firstName' && persona.fullName) return persona.fullName.trim().split(/\s+/)[0]
-  if (key === 'lastName' && persona.fullName) {
-    const parts = persona.fullName.trim().split(/\s+/)
-    return parts.length > 1 ? parts.slice(1).join(' ') : ''
-  }
-  return ''
-}
+import { getPersonaValue } from "./helpers.js";
 
 /** Field map: try each selector in order, fill from persona if found */
 const PERSONAL_FIELDS = [
@@ -150,4 +140,3 @@ export async function runGreenhouseFlow(
     log,
   };
 }
-
