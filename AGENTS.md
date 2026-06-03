@@ -376,6 +376,10 @@ When implementing any feature, ask yourself:
 - **#162** — SmartRecruiters apply flow ✅ done (PR #165)
 - **#163** — ATS detector ✅ done (PR #166)
 - **#164** — Dry-run verification harness ✅ done (PR #167)
+- **#168** — Personio apply flow 🔄 in-progress (just dispatched)
+
+**Phase 5 护城河 (待创建):**
+- Form-pattern cache, Pattern replay, Confidence decay, Budget cap
 
 **Phase 5 护城河 (待创建):**
 - Form-pattern cache, Pattern replay, Confidence decay, Budget cap
