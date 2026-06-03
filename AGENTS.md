@@ -375,11 +375,16 @@ When implementing any feature, ask yourself:
 - Workday apply flow ✅, Greenhouse apply flow ✅, Lever apply flow ✅
 - **#162** — SmartRecruiters apply flow ✅ done (PR #165)
 - **#163** — ATS detector ✅ done (PR #166)
-- **#164** — Dry-run verification harness ✅ done (PR #167)
-- **#168** — Personio apply flow 🔄 in-progress (just dispatched)
+- **#168** — Personio apply flow ✅ done (PR #170)
+- **#169** — Shared flow helpers ✅ done (PR #172)
+- **#171** — verify-flow Personio support ✅ done (PR #173)
 
-**Phase 5 护城河 (待创建):**
-- Form-pattern cache, Pattern replay, Confidence decay, Budget cap
+**Phase 5 — Form-Pattern Cache 护城河:**
+- **#174** — FormPattern model + CRUD 🔄 in-progress (just dispatched)
+- **#175** — Pattern replay engine ⏳ spec-ready
+- **#176** — Confidence decay ⏳ spec-ready
+- **#177** — AI budget cap ⏳ spec-ready
+- **#178** — Phase 5 integration wiring ⏳ spec-ready (P0, depends on #174-177)
 
 **Phase 5 护城河 (待创建):**
 - Form-pattern cache, Pattern replay, Confidence decay, Budget cap
