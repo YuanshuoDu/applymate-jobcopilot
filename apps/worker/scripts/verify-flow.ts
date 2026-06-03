@@ -7,6 +7,7 @@
  * Usage:
  *   pnpm --filter worker exec tsx scripts/verify-flow.ts greenhouse https://boards.greenhouse.io/booking/jobs/123456
  *   pnpm --filter worker exec tsx scripts/verify-flow.ts smartrecruiters https://jobs.smartrecruiters.com/Visa/744000129815717
+ *   pnpm --filter worker exec tsx scripts/verify-flow.ts personio https://flixbus.jobs.personio.com/job/123
  *   pnpm --filter worker exec tsx scripts/verify-flow.ts lever https://jobs.lever.co/spotify/abc123
  *   pnpm --filter worker exec tsx scripts/verify-flow.ts workday https://siemens.wd3.myworkdayjobs.com/Siemens/job/123
  */
@@ -15,11 +16,12 @@ import { withCloakContext } from "../src/cloak/pool.js";
 import { detectFlow } from "../src/flows/index.js";
 import { runGreenhouseFlow } from "../src/flows/greenhouse-flow.js";
 import { runLeverFlow } from "../src/flows/lever-flow.js";
+import { runPersonioFlow } from "../src/flows/personio-flow.js";
 import { runSmartRecruitersFlow } from "../src/flows/smartrecruiters-flow.js";
 import { runWorkdayFlow } from "../src/flows/workday-flow.js";
 import type { ApplyTask, HarnessResult } from "../src/harness/agent-harness.js";
 
-const VALID_ATS = ["greenhouse", "lever", "workday", "smartrecruiters"] as const;
+const VALID_ATS = ["greenhouse", "lever", "workday", "smartrecruiters", "personio"] as const;
 type VerifiableAts = (typeof VALID_ATS)[number];
 
 function mockPersona(): Record<string, string> {
@@ -47,6 +49,7 @@ function usage(): void {
   console.error("Examples:");
   console.error("  pnpm --filter worker exec tsx scripts/verify-flow.ts greenhouse https://boards.greenhouse.io/booking/jobs/123");
   console.error("  pnpm --filter worker exec tsx scripts/verify-flow.ts smartrecruiters https://jobs.smartrecruiters.com/Visa/744000129815717");
+  console.error("  pnpm --filter worker exec tsx scripts/verify-flow.ts personio https://flixbus.jobs.personio.com/job/123");
 }
 
 async function runFlow(
@@ -57,6 +60,7 @@ async function runFlow(
   if (ats === "greenhouse") return runGreenhouseFlow(page, task);
   if (ats === "lever") return runLeverFlow(page, task);
   if (ats === "workday") return runWorkdayFlow(page, task);
+  if (ats === "personio") return runPersonioFlow(page, task);
   return runSmartRecruitersFlow(page, task);
 }
 
