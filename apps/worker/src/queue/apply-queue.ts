@@ -5,6 +5,7 @@ import { checkRateLimit } from "../rate-limit.js";
 import { withCloakContext } from "../cloak/pool.js";
 import { insertApplyResult, getPool } from "../db/apply-results.js";
 import { checkBudget, incrementBudget } from "../db/budget.js";
+import { findFormPattern, recordPatternFailure } from "../db/form-patterns.js";
 import { loadTaskContext } from "../db/load-task-context.js";
 import { AgentHarness } from "../harness/agent-harness.js";
 import type { ApplyTask, HarnessResult } from "../harness/agent-harness.js";
@@ -14,6 +15,8 @@ import { runWorkdayFlow } from '../flows/workday-flow.js'
 import { runLeverFlow } from '../flows/lever-flow.js'
 import { runPersonioFlow } from '../flows/personio-flow.js'
 import { notifyApplyResult } from "../notifications/notify-apply-result.js";
+import { shouldUsePattern } from "../patterns/confidence.js";
+import { replayPattern } from "../patterns/replay.js";
 import { unlinkSync } from "node:fs";
 
 const redisUrl = process.env.REDIS_URL ?? "redis://localhost:6379";
@@ -105,6 +108,7 @@ export const applyWorker = new Worker<ApplyTaskPayload>(
           console.log(`[apply-worker] Using Personio pre-programmed flow`);
           harnessResult = await runPersonioFlow(page, applyTask);
         } else {
+          // Phase 5: pattern cache -> replay -> AI fallback with budget cap.
           const budget = await checkBudget(userId);
           if (!budget.allowed) {
             console.log(`[apply-worker] AI budget exceeded: ${budget.used}/${budget.limit}`);
@@ -116,18 +120,55 @@ export const applyWorker = new Worker<ApplyTaskPayload>(
               log: [],
             };
           } else {
-            console.log(`[apply-worker] AI fallback: budget ${budget.used}/${budget.limit}`);
-            const harness = new AgentHarness({
-              userId,
-              maxTurns: 30,
-              dryRun: dryRun ?? false,
-              mode: "dom",
+            let host = "unknown";
+            try { host = new URL(taskCtx.applyUrl).hostname; } catch { /* invalid URL: cache miss */ }
+            const pathParts = taskCtx.applyUrl.replace(/^https?:\/\/[^/]+\//, "").split("/");
+            const urlPattern = pathParts.slice(0, 2).join("/") + "/";
+
+            const pattern = await findFormPattern(host, urlPattern).catch((e: Error) => {
+              console.warn("[apply-worker] Pattern lookup failed:", e.message);
+              return null;
             });
-            harnessResult = await harness.run(page, applyTask);
-            if (harnessResult.status === "submitted") {
-              await incrementBudget(userId).catch((e: Error) =>
-                console.warn("[apply-worker] Budget increment failed:", e.message)
+
+            if (pattern && shouldUsePattern(pattern)) {
+              const attempts = pattern.successCount + pattern.failureCount;
+              console.log(
+                `[apply-worker] Pattern cache hit: ${host}/${urlPattern} (confidence=${pattern.successCount}/${attempts})`
               );
+              harnessResult = await replayPattern(page, pattern, applyTask.persona);
+
+              if (harnessResult.status !== "submitted") {
+                await recordPatternFailure(pattern.id).catch((e: Error) =>
+                  console.warn("[apply-worker] Pattern failure record failed:", e.message)
+                );
+                console.log("[apply-worker] Pattern replay failed, falling back to AgentHarness");
+                const harness = new AgentHarness({
+                  userId,
+                  maxTurns: 30,
+                  dryRun: dryRun ?? false,
+                  mode: "dom",
+                });
+                harnessResult = await harness.run(page, applyTask);
+                if (harnessResult.status === "submitted") {
+                  await incrementBudget(userId).catch((e: Error) =>
+                    console.warn("[apply-worker] Budget increment failed:", e.message)
+                  );
+                }
+              }
+            } else {
+              console.log(`[apply-worker] AI fallback: budget ${budget.used}/${budget.limit}`);
+              const harness = new AgentHarness({
+                userId,
+                maxTurns: 30,
+                dryRun: dryRun ?? false,
+                mode: "dom",
+              });
+              harnessResult = await harness.run(page, applyTask);
+              if (harnessResult.status === "submitted") {
+                await incrementBudget(userId).catch((e: Error) =>
+                  console.warn("[apply-worker] Budget increment failed:", e.message)
+                );
+              }
             }
           }
         }
