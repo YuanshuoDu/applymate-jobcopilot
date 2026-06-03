@@ -11,6 +11,7 @@ import { detectFlow } from "../flows/index.js";
 import { runGreenhouseFlow } from "../flows/greenhouse-flow.js";
 import { runWorkdayFlow } from '../flows/workday-flow.js'
 import { runLeverFlow } from '../flows/lever-flow.js'
+import { runPersonioFlow } from '../flows/personio-flow.js'
 import { notifyApplyResult } from "../notifications/notify-apply-result.js";
 import { unlinkSync } from "node:fs";
 
@@ -99,6 +100,9 @@ export const applyWorker = new Worker<ApplyTaskPayload>(
         } else if (flow === "workday") {
           console.log(`[apply-worker] Using Workday pre-programmed flow`);
           harnessResult = await runWorkdayFlow(page, applyTask);
+        } else if (flow === "personio") {
+          console.log(`[apply-worker] Using Personio pre-programmed flow`);
+          harnessResult = await runPersonioFlow(page, applyTask);
         } else {
           const harness = new AgentHarness({
             userId,
