@@ -330,6 +330,19 @@ model FormPattern {
   @@map("form_patterns")
 }
 
+model AiBudget {
+  id        String   @id @default(cuid())
+  userId    String   @map("user_id")
+  month     String                                // "2026-06"
+  used      Int      @default(0)
+  limit     Int      @default(30)
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  @@unique([userId, month])
+  @@map("ai_budgets")
+}
+
 // ─────────────────────────────────────────────
 // Agent Run Questions (pause/resume queue)
 // ─────────────────────────────────────────────
