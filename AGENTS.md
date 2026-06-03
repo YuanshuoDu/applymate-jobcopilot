@@ -379,12 +379,21 @@ When implementing any feature, ask yourself:
 - **#169** — Shared flow helpers ✅ done (PR #172)
 - **#171** — verify-flow Personio support ✅ done (PR #173)
 
-**Phase 5 — Form-Pattern Cache 护城河:**
-- **#174** — FormPattern model + CRUD 🔄 in-progress (just dispatched)
-- **#175** — Pattern replay engine ⏳ spec-ready
-- **#176** — Confidence decay ⏳ spec-ready
-- **#177** — AI budget cap ⏳ spec-ready
-- **#178** — Phase 5 integration wiring ⏳ spec-ready (P0, depends on #174-177)
+**Phase 5 — Form-Pattern Cache 护城河 ✅ 全部完成:**
+- **#174** — FormPattern model + CRUD ✅ done
+- **#175** — Pattern replay engine ✅ done
+- **#176** — Confidence decay ✅ done
+- **#177** — AI budget cap ✅ done
+- **#178** — Phase 5 integration wiring ✅ done
+
+**Phase 6 直接 HTML 抓取 (待创建):**
+- Compliance review, StepStone DE/AT, Xing, Welcome to the Jungle, decommission RapidAPI
+
+**Phase 7 生产加固 (待创建):**
+- Proxy pool, CAPTCHA fallback, push notifications, observability dashboard, runbook
+
+**Phase 5.7 已知 Gap:**
+- AgentHarness 成功后写入 FormPattern（等 AgentHarness 暴露 field→selector 映射）
 
 **Phase 5 护城河 (待创建):**
 - Form-pattern cache, Pattern replay, Confidence decay, Budget cap
