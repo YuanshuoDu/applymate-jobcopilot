@@ -13,6 +13,7 @@
  *   3. Adzuna (EU) or JSearch (US/global) based on location
  */
 import { truncate } from '@/lib/utils'
+import { dedupJobs } from './dedup'
 
 export interface DiscoveredJob {
   title:       string
@@ -425,5 +426,12 @@ export async function discoverJobs(params: DiscoverParams): Promise<DiscoveredJo
     }
   }
 
-  return results
+  // Deduplicate across sources before returning
+  const beforeCount = results.length
+  const deduped = dedupJobs(results)
+  const removed = beforeCount - deduped.length
+  if (removed > 0) {
+    console.log(`[dedup] removed ${removed} duplicates, kept ${deduped.length} unique`)
+  }
+  return deduped
 }
