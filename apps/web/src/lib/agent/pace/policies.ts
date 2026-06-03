@@ -1,4 +1,4 @@
-/**
+﻿/**
  * Rate-limit policy registry for ATS discovery sources.
  *
  * Every ATS source must have an entry here. CI rejects PRs adding
@@ -18,6 +18,7 @@ export const POLICIES: Record<string, RatePolicy> = {
   lever:            { host: "api.lever.co",             rps: 5 },
   workday:          { host: "myworkdayjobs.com",         rps: 1 },
   smartrecruiters:  { host: "api.smartrecruiters.com",  rps: 5 },
+    personio:        { host: "jobs.personio.com",       rps: 5 },
 }
 
 /**

@@ -1,0 +1,118 @@
+# Personio employer registry — German SMB market
+# Phase 2.4: Personio XML feed discovery source
+#
+# Personio is the dominant HR/ATS for German SMBs (10-500 employees).
+# Each entry below publishes a public XML feed at:
+#   https://{slug}.jobs.personio.com/xml
+#
+# Format: one employer per line with ats, slug, name, country
+
+- ats: personio
+  slug: flixbus
+  name: Flix SE
+  country: DE
+
+- ats: personio
+  slug: traderepublic
+  name: Trade Republic
+  country: DE
+
+- ats: personio
+  slug: n26
+  name: N26
+  country: DE
+
+- ats: personio
+  slug: celonis
+  name: Celonis
+  country: DE
+
+- ats: personio
+  slug: personio
+  name: Personio
+  country: DE
+
+- ats: personio
+  slug: getyourguide
+  name: GetYourGuide
+  country: DE
+
+- ats: personio
+  slug: flink
+  name: Flink
+  country: DE
+
+- ats: personio
+  slug: wefox
+  name: Wefox
+  country: DE
+
+- ats: personio
+  slug: sumup
+  name: SumUp
+  country: DE
+
+- ats: personio
+  slug: solaris
+  name: Solarisbank
+  country: DE
+
+- ats: personio
+  slug: raisin
+  name: Raisin DS
+  country: DE
+
+- ats: personio
+  slug: omio
+  name: Omio
+  country: DE
+
+- ats: personio
+  slug: sennder
+  name: Sennder
+  country: DE
+
+- ats: personio
+  slug: enpal
+  name: Enpal
+  country: DE
+
+- ats: personio
+  slug: grover
+  name: Grover
+  country: DE
+
+- ats: personio
+  slug: taxfix
+  name: Taxfix
+  country: DE
+
+- ats: personio
+  slug: contentful
+  name: Contentful
+  country: DE
+
+- ats: personio
+  slug: here
+  name: HERE Technologies
+  country: DE
+
+- ats: personio
+  slug: vay
+  name: Vay
+  country: DE
+
+- ats: personio
+  slug: ada
+  name: Ada Health
+  country: DE
+
+- ats: personio
+  slug: mambu
+  name: Mambu
+  country: DE
+
+- ats: personio
+  slug: mollie
+  name: Mollie
+  country: DE
