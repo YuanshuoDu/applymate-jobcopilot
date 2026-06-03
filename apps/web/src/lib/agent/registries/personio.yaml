@@ -1,118 +1,33 @@
-# Personio employer registry — German SMB market
-# Phase 2.4: Personio XML feed discovery source
-#
+﻿# Personio employer registry (Phase 2.4)
 # Personio is the dominant HR/ATS for German SMBs (10-500 employees).
-# Each entry below publishes a public XML feed at:
-#   https://{slug}.jobs.personio.com/xml
-#
-# Format: one employer per line with ats, slug, name, country
+# Each employer publishes a public XML feed at https://{slug}.jobs.personio.com/xml
+# Country codes: ISO 3166-1 alpha-2, lowercase
+# Tier: 1=household name, 2=mid-size, 3=long-tail
+employers:
+  # --- Tier 1: household names ---
+  - { slug: "personio",       name: "Personio SE",       country: "de", tier: 1 }
+  - { slug: "flixbus",        name: "Flix SE",           country: "de", tier: 1 }
+  - { slug: "traderepublic",  name: "Trade Republic",    country: "de", tier: 1 }
+  - { slug: "n26",            name: "N26",               country: "de", tier: 1 }
+  - { slug: "celonis",        name: "Celonis",           country: "de", tier: 1 }
+  - { slug: "contentful",     name: "Contentful",        country: "de", tier: 1 }
+  - { slug: "here",           name: "HERE Technologies", country: "de", tier: 1 }
 
-- ats: personio
-  slug: flixbus
-  name: Flix SE
-  country: DE
+  # --- Tier 2: well-known mid-size ---
+  - { slug: "getyourguide",   name: "GetYourGuide",      country: "de", tier: 2 }
+  - { slug: "flink",          name: "Flink",             country: "de", tier: 2 }
+  - { slug: "wefox",          name: "Wefox",             country: "de", tier: 2 }
+  - { slug: "sumup",          name: "SumUp",             country: "de", tier: 2 }
+  - { slug: "solaris",        name: "Solarisbank",       country: "de", tier: 2 }
+  - { slug: "raisin",         name: "Raisin DS",         country: "de", tier: 2 }
+  - { slug: "omio",           name: "Omio",              country: "de", tier: 2 }
+  - { slug: "sennder",        name: "Sennder",           country: "de", tier: 2 }
+  - { slug: "enpal",          name: "Enpal",             country: "de", tier: 2 }
+  - { slug: "grover",         name: "Grover",            country: "de", tier: 2 }
+  - { slug: "taxfix",         name: "Taxfix",            country: "de", tier: 2 }
+  - { slug: "mambu",          name: "Mambu",             country: "de", tier: 2 }
+  - { slug: "mollie",         name: "Mollie",            country: "de", tier: 2 }
 
-- ats: personio
-  slug: traderepublic
-  name: Trade Republic
-  country: DE
-
-- ats: personio
-  slug: n26
-  name: N26
-  country: DE
-
-- ats: personio
-  slug: celonis
-  name: Celonis
-  country: DE
-
-- ats: personio
-  slug: personio
-  name: Personio
-  country: DE
-
-- ats: personio
-  slug: getyourguide
-  name: GetYourGuide
-  country: DE
-
-- ats: personio
-  slug: flink
-  name: Flink
-  country: DE
-
-- ats: personio
-  slug: wefox
-  name: Wefox
-  country: DE
-
-- ats: personio
-  slug: sumup
-  name: SumUp
-  country: DE
-
-- ats: personio
-  slug: solaris
-  name: Solarisbank
-  country: DE
-
-- ats: personio
-  slug: raisin
-  name: Raisin DS
-  country: DE
-
-- ats: personio
-  slug: omio
-  name: Omio
-  country: DE
-
-- ats: personio
-  slug: sennder
-  name: Sennder
-  country: DE
-
-- ats: personio
-  slug: enpal
-  name: Enpal
-  country: DE
-
-- ats: personio
-  slug: grover
-  name: Grover
-  country: DE
-
-- ats: personio
-  slug: taxfix
-  name: Taxfix
-  country: DE
-
-- ats: personio
-  slug: contentful
-  name: Contentful
-  country: DE
-
-- ats: personio
-  slug: here
-  name: HERE Technologies
-  country: DE
-
-- ats: personio
-  slug: vay
-  name: Vay
-  country: DE
-
-- ats: personio
-  slug: ada
-  name: Ada Health
-  country: DE
-
-- ats: personio
-  slug: mambu
-  name: Mambu
-  country: DE
-
-- ats: personio
-  slug: mollie
-  name: Mollie
-  country: DE
+  # --- Tier 3: long tail ---
+  - { slug: "vay",            name: "Vay",               country: "de", tier: 3 }
+  - { slug: "ada",            name: "Ada Health",        country: "de", tier: 3 }

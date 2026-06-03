@@ -122,7 +122,9 @@ async function runRegistry(ats: Ats) {
     ? fetchGreenhouse
     : ats === "lever"
       ? fetchLever
-      : async (slugs: string[]) => (await Promise.all(slugs.map(fetchSmartRecruiters))).flat()
+      : ats === "personio"
+        ? async (slugs: string[]) => (await Promise.all(slugs.map(fetchPersonio))).flat()
+        : async (slugs: string[]) => (await Promise.all(slugs.map(fetchSmartRecruiters))).flat()
 
   console.log(`Fetching ${slugs.length} employers (${ats})...\n`)
   const jobs = await fetcher(slugs)
