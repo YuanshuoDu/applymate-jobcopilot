@@ -1,4 +1,4 @@
-/**
+﻿/**
  * EU employer registries for Greenhouse and Lever ATS sources.
  *
  * Loads YAML files containing curated, verified employer slugs.
@@ -50,7 +50,7 @@ const workdayCache = new Map<string, WorkdayEmployer[]>();
  * YAML is read synchronously — the files are small and this runs
  * server-side at import time or on first call.
  */
-export function loadRegistry(ats: "greenhouse" | "lever" | "smartrecruiters"): Employer[] {
+export function loadRegistry(ats: "greenhouse" | "lever" | "smartrecruiters" | "personio"): Employer[] {
   const cached = employerCache.get(ats);
   if (cached) return cached;
 
