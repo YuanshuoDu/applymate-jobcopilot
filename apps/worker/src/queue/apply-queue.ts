@@ -4,6 +4,7 @@ import type { ApplyTaskPayload } from "@jobcopilot/shared";
 import { checkRateLimit } from "../rate-limit.js";
 import { withCloakContext } from "../cloak/pool.js";
 import { insertApplyResult, getPool } from "../db/apply-results.js";
+import { checkBudget, incrementBudget } from "../db/budget.js";
 import { loadTaskContext } from "../db/load-task-context.js";
 import { AgentHarness } from "../harness/agent-harness.js";
 import type { ApplyTask, HarnessResult } from "../harness/agent-harness.js";
@@ -104,13 +105,31 @@ export const applyWorker = new Worker<ApplyTaskPayload>(
           console.log(`[apply-worker] Using Personio pre-programmed flow`);
           harnessResult = await runPersonioFlow(page, applyTask);
         } else {
-          const harness = new AgentHarness({
-            userId,
-            maxTurns: 30,
-            dryRun: dryRun ?? false,
-            mode: "dom",
-          });
-          harnessResult = await harness.run(page, applyTask);
+          const budget = await checkBudget(userId);
+          if (!budget.allowed) {
+            console.log(`[apply-worker] AI budget exceeded: ${budget.used}/${budget.limit}`);
+            harnessResult = {
+              status: "manual",
+              turns: 0,
+              error: `AI fallback budget exceeded (${budget.used}/${budget.limit} this month)`,
+              durationMs: 0,
+              log: [],
+            };
+          } else {
+            console.log(`[apply-worker] AI fallback: budget ${budget.used}/${budget.limit}`);
+            const harness = new AgentHarness({
+              userId,
+              maxTurns: 30,
+              dryRun: dryRun ?? false,
+              mode: "dom",
+            });
+            harnessResult = await harness.run(page, applyTask);
+            if (harnessResult.status === "submitted") {
+              await incrementBudget(userId).catch((e: Error) =>
+                console.warn("[apply-worker] Budget increment failed:", e.message)
+              );
+            }
+          }
         }
 
         const durationMs = Date.now() - startedAt;
