@@ -315,6 +315,21 @@ model ApplyResult {
   @@map("apply_results")
 }
 
+model FormPattern {
+  id            String   @id @default(cuid())
+  atsHost       String   @map("ats_host")       // "jobs.lever.co"
+  urlPattern    String   @map("url_pattern")    // "spotify/" for matching
+  fieldMapping  Json     @map("field_mapping")  // {"input[name='first_name']": "firstName", ...}
+  successCount  Int      @default(1) @map("success_count")
+  failureCount  Int      @default(0) @map("failure_count")
+  lastSuccessAt DateTime @default(now()) @map("last_success_at")
+  createdAt     DateTime @default(now()) @map("created_at")
+  updatedAt     DateTime @updatedAt @map("updated_at")
+
+  @@unique([atsHost, urlPattern])
+  @@map("form_patterns")
+}
+
 // ─────────────────────────────────────────────
 // Agent Run Questions (pause/resume queue)
 // ─────────────────────────────────────────────
