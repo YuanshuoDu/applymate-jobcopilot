@@ -365,24 +365,21 @@ When implementing any feature, ask yourself:
 
 ---
 
-## Part 10 — Current Issue Queue (as of 2026-05-21)
+## Part 10 — Current Issue Queue (as of 2026-06-03)
 
-Read the roadmap doc for the full plan. Summary:
+**Phase 1-2 ✅ 完成** — Greenhouse, Lever, Workday CXS, SmartRecruiters, Personio, Multi-source Dedup, registries, enrichment cascade.
 
-**In progress:**
-- **#17** — Lever public API source (your current task if unassigned)
+**Phase 3 ✅ 完成** — Worker skeleton, CloakBrowser pool, AgentHarness.
 
-**Next in line (spec-ready, P1):**
-- **#18** — EU employer seed registry (greenhouse.yaml + lever.yaml, ≥30 each)
-- **#19** — JSON-LD T1 enrichment extractor (saves LLM calls)
-- **#20** — CSS T2 enrichment selector library
-- **#21** — Wire 3-tier cascade into enrich endpoint
-- **#35** — Job scoring KEYWORDS field + jobScoring FeatureId
+**Phase 4 🔄 进行中:**
+- Workday apply flow ✅, Greenhouse apply flow ✅, Lever apply flow ✅
+- **#162** — SmartRecruiters apply flow ✅ done (PR #165)
+- **#163** — ATS detector ✅ done (PR #166)
+- **#164** — Dry-run verification harness ✅ done (PR #167)
 
-**Later (spec-ready, waiting on infrastructure):**
-- **#30** — Workday CXS API (high value, covers SAP/Siemens/VW/Adidas)
-- **#31** — CloakBrowser PoC (GO/NO-GO for all auto-apply work)
-- **#32** — Worker skeleton (BullMQ + CloakBrowser pool)
-- **#36** — AgentHarness (the autonomous apply brain)
+**Phase 5 护城河 (待创建):**
+- Form-pattern cache, Pattern replay, Confidence decay, Budget cap
 
-Each issue has a complete spec. Read it fully before starting.
+**Later:**
+- Personio apply flow, SmartRecruiters/Personio add to ATS detector
+- Phase 6: Direct HTML scraping, Phase 7: Production hardening
