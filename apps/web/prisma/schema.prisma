@@ -91,6 +91,7 @@ model User {
   resumeVersions ResumeVersion[]
   directions     Direction[]
   coverLetters   CoverLetter[]
+  notifications  Notification[]
 }
 
 enum Plan {
@@ -341,6 +342,22 @@ model AiBudget {
 
   @@unique([userId, month])
   @@map("ai_budgets")
+}
+
+model Notification {
+  id        String   @id @default(cuid())
+  userId    String   @map("user_id")
+  type      String
+  title     String
+  body      String?
+  read      Boolean  @default(false)
+  jobId     String?  @map("job_id")
+  createdAt DateTime @default(now()) @map("created_at")
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, createdAt(sort: Desc)])
+  @@map("notifications")
 }
 
 // ─────────────────────────────────────────────

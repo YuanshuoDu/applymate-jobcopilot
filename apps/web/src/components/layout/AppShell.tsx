@@ -3,6 +3,7 @@
 import React, { useState, useEffect, useRef } from 'react'
 import { useSession, signIn, signOut } from 'next-auth/react'
 import { useRouter } from 'next/navigation'
+import { Bell } from 'lucide-react'
 import { Sidebar } from './Sidebar'
 import { ToastProvider } from '@/components/ui'
 import type { DashboardData, JobStatus, Page } from '@/lib/types'
@@ -17,6 +18,16 @@ import { AgentPlaygroundPage } from '@/components/pages/AgentPlaygroundPage'
 import { ExtensionPage }      from '@/components/pages/ExtensionPage'
 import { SettingsPage }       from '@/components/pages/SettingsPage'
 import { ApplyHistoryPage }  from '@/components/pages/ApplyHistoryPage'
+
+interface NotificationItem {
+  id: string
+  type: string
+  title: string
+  body: string | null
+  read: boolean
+  jobId: string | null
+  createdAt: string
+}
 
 const MOB_NAV: { id: Page; label: string }[] = [
   { id: 'dashboard', label: 'Home'     },
@@ -65,6 +76,9 @@ export function AppShell() {
 
   const [checkingOnboard, setCheckingOnboard] = useState(true)
   const [needsOnboarding, setNeedsOnboarding] = useState(false)
+  const [notifications, setNotifications] = useState<NotificationItem[]>([])
+  const [unreadCount, setUnreadCount] = useState(0)
+  const [notificationsOpen, setNotificationsOpen] = useState(false)
 
   useEffect(() => {
     if (status !== 'authenticated') { setCheckingOnboard(false); return }
@@ -172,6 +186,56 @@ export function AppShell() {
   }, [status])
 
   useEffect(() => {
+    if (status !== 'authenticated') return
+
+    let cancelled = false
+    const loadNotifications = () => {
+      fetch('/api/notifications')
+        .then(r => r.ok ? r.json() : Promise.reject(new Error('notifications fetch failed')))
+        .then((data: { notifications?: NotificationItem[]; unreadCount?: number }) => {
+          if (cancelled) return
+          setNotifications(data.notifications ?? [])
+          setUnreadCount(data.unreadCount ?? 0)
+        })
+        .catch(() => {
+          if (!cancelled) {
+            setNotifications([])
+            setUnreadCount(0)
+          }
+        })
+    }
+
+    loadNotifications()
+    const interval = window.setInterval(loadNotifications, 60_000)
+    return () => {
+      cancelled = true
+      window.clearInterval(interval)
+    }
+  }, [status])
+
+  async function markNotificationRead(id?: string) {
+    await fetch('/api/notifications/mark-read', {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(id ? { id } : {}),
+    }).catch(() => null)
+
+    setNotifications(prev =>
+      prev.map(n => (!id || n.id === id) ? { ...n, read: true } : n)
+    )
+    setUnreadCount(prev => id
+      ? Math.max(prev - (notifications.find(n => n.id === id && !n.read) ? 1 : 0), 0)
+      : 0
+    )
+  }
+
+  async function openNotification(n: NotificationItem) {
+    await markNotificationRead(n.id)
+    setNotificationsOpen(false)
+    if (n.type.startsWith('apply_')) setPage('apply-history')
+  }
+
+  useEffect(() => {
     if (status === 'unauthenticated' || timedOut) {
       router.push('/login?callbackUrl=/')
     }
@@ -236,6 +300,118 @@ export function AppShell() {
                 <Sidebar active={page} onNav={setPage} session={session} jobCount={jobCount} />
               </div>
               <div id="main-content" style={{ flex: 1, display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
+                <div style={{ position: 'fixed', top: 8, right: 20, zIndex: 80 }}>
+                  <button
+                    type="button"
+                    aria-label="Notifications"
+                    onClick={() => setNotificationsOpen(v => !v)}
+                    style={{
+                      width: 36, height: 36, borderRadius: 8,
+                      border: '1px solid var(--border-glass)',
+                      background: 'var(--glass-bg)',
+                      color: 'var(--text)',
+                      display: 'flex', alignItems: 'center', justifyContent: 'center',
+                      cursor: 'pointer',
+                      boxShadow: '0 4px 18px rgba(15,23,42,0.10)',
+                      position: 'relative',
+                    }}
+                  >
+                    <Bell size={18} aria-hidden="true" />
+                    {unreadCount > 0 && (
+                      <span
+                        aria-label={`${unreadCount} unread notifications`}
+                        style={{
+                          position: 'absolute', top: -5, right: -5,
+                          minWidth: 18, height: 18, padding: '0 5px',
+                          borderRadius: 999,
+                          background: 'var(--c-danger)',
+                          color: '#fff',
+                          fontSize: 10,
+                          fontWeight: 700,
+                          display: 'flex', alignItems: 'center', justifyContent: 'center',
+                          border: '2px solid var(--bg)',
+                          lineHeight: 1,
+                        }}
+                      >
+                        {unreadCount > 9 ? '9+' : unreadCount}
+                      </span>
+                    )}
+                  </button>
+                  {notificationsOpen && (
+                    <div
+                      style={{
+                        position: 'absolute', top: 44, right: 0,
+                        width: 320, maxWidth: 'calc(100vw - 32px)',
+                        background: 'var(--bg)',
+                        border: '1px solid var(--border)',
+                        borderRadius: 8,
+                        boxShadow: '0 14px 40px rgba(15,23,42,0.18)',
+                        overflow: 'hidden',
+                      }}
+                    >
+                      <div style={{
+                        padding: '10px 12px',
+                        display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+                        borderBottom: '1px solid var(--border)',
+                      }}>
+                        <span style={{ fontSize: 12, fontWeight: 700 }}>Notifications</span>
+                        {unreadCount > 0 && (
+                          <button
+                            type="button"
+                            onClick={() => markNotificationRead()}
+                            style={{
+                              border: 'none', background: 'transparent',
+                              color: 'var(--primary)', fontSize: 11,
+                              cursor: 'pointer', padding: 0,
+                            }}
+                          >
+                            Mark read
+                          </button>
+                        )}
+                      </div>
+                      <div style={{ maxHeight: 320, overflowY: 'auto' }}>
+                        {notifications.length === 0 ? (
+                          <div style={{ padding: 16, fontSize: 12, color: 'var(--text-muted)' }}>No notifications</div>
+                        ) : notifications.slice(0, 5).map(n => (
+                          <button
+                            key={n.id}
+                            type="button"
+                            onClick={() => openNotification(n)}
+                            style={{
+                              width: '100%',
+                              border: 'none',
+                              borderBottom: '1px solid var(--border)',
+                              background: n.read ? 'var(--bg)' : 'var(--bg-secondary)',
+                              padding: '10px 12px',
+                              display: 'flex', alignItems: 'flex-start', gap: 8,
+                              textAlign: 'left',
+                              cursor: 'pointer',
+                            }}
+                          >
+                            <span
+                              aria-hidden="true"
+                              style={{
+                                width: 7, height: 7, borderRadius: '50%',
+                                background: n.read ? 'var(--text-muted)' : 'var(--c-success)',
+                                marginTop: 5, flexShrink: 0,
+                              }}
+                            />
+                            <span style={{ minWidth: 0, flex: 1 }}>
+                              <span style={{ display: 'block', fontSize: 12, fontWeight: 600, color: 'var(--text)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                                {n.title}
+                              </span>
+                              {n.body && (
+                                <span style={{ display: 'block', fontSize: 11, color: 'var(--text-muted)', marginTop: 2, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                                  {n.body}
+                                </span>
+                              )}
+                            </span>
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+                </div>
                 <PageComp />
               </div>
             </div>

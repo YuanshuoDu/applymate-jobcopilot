@@ -12,6 +12,7 @@ const mocks = vi.hoisted(() => ({
   solveCaptcha: vi.fn(),
   detectFlow: vi.fn(),
   runGreenhouseFlow: vi.fn(),
+  createNotification: vi.fn().mockResolvedValue(undefined),
   notifyApplyResult: vi.fn().mockResolvedValue(undefined),
 }));
 
@@ -64,6 +65,9 @@ vi.mock("../flows/lever-flow.js", () => ({ runLeverFlow: vi.fn() }));
 vi.mock("../flows/personio-flow.js", () => ({ runPersonioFlow: vi.fn() }));
 vi.mock("../notifications/notify-apply-result.js", () => ({
   notifyApplyResult: mocks.notifyApplyResult,
+}));
+vi.mock("../notifications/create-notification.js", () => ({
+  createNotification: mocks.createNotification,
 }));
 vi.mock("../patterns/confidence.js", () => ({ shouldUsePattern: vi.fn(() => false) }));
 vi.mock("../patterns/replay.js", () => ({ replayPattern: vi.fn() }));
@@ -118,6 +122,12 @@ describe("apply-queue CAPTCHA handling", () => {
         error: "CAPTCHA detected and could not be solved automatically",
       })
     );
+    expect(mocks.createNotification).toHaveBeenCalledWith("user-1", {
+      type: "apply_manual",
+      title: "Example ⚠️",
+      body: "Engineer",
+      jobId: "job-1",
+    });
     expect(mocks.runGreenhouseFlow).not.toHaveBeenCalled();
   });
 
@@ -133,5 +143,11 @@ describe("apply-queue CAPTCHA handling", () => {
     expect(mocks.insertApplyResult).toHaveBeenCalledWith(
       expect.objectContaining({ status: "submitted" })
     );
+    expect(mocks.createNotification).toHaveBeenCalledWith("user-1", {
+      type: "apply_submitted",
+      title: "Example ✅",
+      body: "Engineer",
+      jobId: "job-1",
+    });
   });
 });
