@@ -386,10 +386,11 @@ When implementing any feature, ask yourself:
 - **#177** — AI budget cap ✅ done
 - **#178** — Phase 5 integration wiring ✅ done
 
-**Phase 5 收尾（本轮验证发现）:**
-- **#184** — fix: set flowUsed="pattern-cache" on replay success + Dashboard label
-- **#185** — test: add unit tests for Phase 5 modules (replay, budget, form-patterns)
-- **#186** — feat: display AI budget remaining on Dashboard
+**Phase 5 收尾 ✅ 全部完成:**
+- **#184** — flowUsed="pattern-cache" ✅ done
+- **#185** — Phase 5 单元测试 ✅ done (9 tests, 3 files)
+- **#186** — Dashboard AI budget 显示 ✅ done
+- **#189** — Vercel build fix ✅ done
 
 **Phase 6 直接 HTML 抓取 (待创建):**
 - Compliance review, StepStone DE/AT, Xing, Welcome to the Jungle, decommission RapidAPI
