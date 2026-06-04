@@ -76,7 +76,7 @@ export default function ApplyStatusCard({ jobId, jobUrl, jobStatus }: { jobId: s
   }
 
   const cfg = STATUS_CONFIG[result.status] ?? { icon: "📋", label: result.status, color: "#6b7280" };
-  const flowLabel = result.flowUsed === "programmatic" ? "Pre-programmed flow" : result.flowUsed === "llm" ? "AI agent" : result.flowUsed;
+  const flowLabel = result.flowUsed === "pattern-cache" ? "Pattern Replay" : result.flowUsed === "programmatic" ? "Pre-programmed flow" : result.flowUsed === "llm" ? "AI agent" : result.flowUsed;
   const durationSec = Math.round(result.durationMs / 1000);
 
   return (

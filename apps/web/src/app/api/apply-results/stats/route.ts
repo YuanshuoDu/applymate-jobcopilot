@@ -18,6 +18,7 @@ export async function GET(req: NextRequest) {
       COUNT(*) FILTER (WHERE status = 'failed')::int           AS failed,
       COUNT(*) FILTER (WHERE status = 'dry-run')::int          AS "dryRun",
       COUNT(*) FILTER (WHERE flow_used = 'programmatic')::int  AS programmatic,
+      COUNT(*) FILTER (WHERE flow_used = 'pattern-cache')::int AS "patternCache",
       COUNT(*) FILTER (WHERE flow_used = 'llm')::int           AS llm,
       ROUND(AVG(duration_ms) FILTER (WHERE status = 'submitted'))::int AS "avgDurationMs"
     FROM apply_results
@@ -26,7 +27,7 @@ export async function GET(req: NextRequest) {
 
   const stats = (rows as unknown[])[0] ?? {
     total: 0, submitted: 0, manual: 0, failed: 0, dryRun: 0,
-    programmatic: 0, llm: 0, avgDurationMs: null,
+    programmatic: 0, patternCache: 0, llm: 0, avgDurationMs: null,
   }
 
   return ok({ stats })
