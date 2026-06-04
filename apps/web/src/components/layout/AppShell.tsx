@@ -18,6 +18,7 @@ import { AgentPlaygroundPage } from '@/components/pages/AgentPlaygroundPage'
 import { ExtensionPage }      from '@/components/pages/ExtensionPage'
 import { SettingsPage }       from '@/components/pages/SettingsPage'
 import { ApplyHistoryPage }  from '@/components/pages/ApplyHistoryPage'
+import { ObservabilityPage } from '@/components/pages/ObservabilityPage'
 
 interface NotificationItem {
   id: string
@@ -55,6 +56,7 @@ const PAGES: Record<Page, React.ComponentType> = {
   extension: ExtensionPage,
   settings:  SettingsPage,
   'apply-history': ApplyHistoryPage,
+  observability: ObservabilityPage,
 }
 
 function getInitialPage(): Page {

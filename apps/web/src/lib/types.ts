@@ -315,4 +315,5 @@ export type Page =
   | 'agent'
   | 'extension'
   | 'apply-history'
+  | 'observability'
   | 'settings'
