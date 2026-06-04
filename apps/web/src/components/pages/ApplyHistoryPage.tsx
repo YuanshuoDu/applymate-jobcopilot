@@ -160,7 +160,7 @@ export function ApplyHistoryPage() {
             {/* Rows */}
             {results.map((r, i) => {
               const hasError = r.status === 'failed' || r.status === 'manual'
-              const flowLabel = r.flowUsed === 'pattern-cache' ? 'Pattern Replay' : r.flowUsed === 'programmatic' ? 'Pre-programmed' : r.flowUsed === 'llm' ? 'AI agent' : (r.flowUsed ?? '--')
+              const flowLabel = r.flowUsed === 'pattern-cache' ? 'Pattern Replay (cached)' : r.flowUsed === 'programmatic' ? 'Pre-programmed' : r.flowUsed === 'llm' ? 'AI agent' : (r.flowUsed ?? '--')
 
               return (
                 <div key={r.id} style={{
