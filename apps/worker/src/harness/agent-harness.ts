@@ -19,7 +19,12 @@ export interface HarnessConfig {
 }
 
 /** Task data passed to harness.run() */
-export type HarnessResult = Pick<import("@jobcopilot/shared").ApplyResult, "status" | "error" | "durationMs"> & { turns?: number; log?: unknown[] };
+export type HarnessResult = Pick<ApplyResult, "status" | "error" | "durationMs"> &
+  Partial<Pick<ApplyResult, "id" | "userId" | "jobId" | "mode" | "atsType" | "flowUsed" | "createdAt">> & {
+  turns?: number;
+  log?: unknown[];
+  fieldMappings?: Record<string, string>;
+};
 
 export interface ApplyTask {
   jobId: string;
@@ -69,7 +74,7 @@ export class AgentHarness {
   }
 
   /** Run the perception-action loop until termination. */
-  async run(page: Page, task: ApplyTask): Promise<ApplyResult> {
+  async run(page: Page, task: ApplyTask): Promise<HarnessResult> {
     this.turns = [];
     const startedAt = Date.now();
 
@@ -109,6 +114,7 @@ export class AgentHarness {
 
         // ── Check URL-based success ──
         if (SUCCESS_URL_PATTERNS.some((p) => p.test(url))) {
+          const fieldMappings = this.collectFieldMappings();
           const logEntry: TurnLog = {
             turn,
             perceived: fields,
@@ -117,7 +123,7 @@ export class AgentHarness {
           };
           this.turns.push(logEntry);
           this.logTurn(logEntry);
-          return this.buildResult("submitted", task.jobId, Date.now() - startedAt);
+          return this.buildResult("submitted", task.jobId, Date.now() - startedAt, undefined, fieldMappings);
         }
 
         // ── Decide ──
@@ -162,7 +168,7 @@ export class AgentHarness {
 
         // ── Terminal actions ──
         if (action.type === "done") {
-          return this.buildResult("submitted", task.jobId, Date.now() - startedAt);
+          return this.buildResult("submitted", task.jobId, Date.now() - startedAt, undefined, this.collectFieldMappings());
         }
         if (action.type === "manual") {
           return this.buildResult("manual", task.jobId, Date.now() - startedAt, action.reasoning);
@@ -256,8 +262,9 @@ export class AgentHarness {
     status: ApplyResult["status"],
     jobId: string,
     durationMs: number,
-    error?: string
-  ): ApplyResult {
+    error?: string,
+    fieldMappings?: Record<string, string>
+  ): HarnessResult {
     return {
       userId: this.config.userId,
       jobId,
@@ -265,7 +272,19 @@ export class AgentHarness {
       status,
       error: error ?? null,
       durationMs,
+      ...(fieldMappings && Object.keys(fieldMappings).length > 0 ? { fieldMappings } : {}),
     };
+  }
+
+  private collectFieldMappings(): Record<string, string> {
+    const fieldMappings: Record<string, string> = {};
+    for (const turn of this.turns) {
+      const action = turn.action;
+      if (action.type === "fill" && action.selector && action.field) {
+        fieldMappings[action.selector] = action.field;
+      }
+    }
+    return fieldMappings;
   }
 
   private logTurn(log: TurnLog): void {

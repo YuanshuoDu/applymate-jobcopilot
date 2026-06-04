@@ -6,7 +6,7 @@ import { withCloakContext } from "../cloak/pool.js";
 import { detectCaptcha, solveCaptcha } from "../cloak/captcha.js";
 import { insertApplyResult, getPool } from "../db/apply-results.js";
 import { checkBudget, incrementBudget } from "../db/budget.js";
-import { findFormPattern, recordPatternFailure } from "../db/form-patterns.js";
+import { findFormPattern, recordPatternFailure, upsertFormPattern } from "../db/form-patterns.js";
 import { loadTaskContext } from "../db/load-task-context.js";
 import { AgentHarness } from "../harness/agent-harness.js";
 import type { ApplyTask, HarnessResult } from "../harness/agent-harness.js";
@@ -180,6 +180,7 @@ export const applyWorker = new Worker<ApplyTaskPayload>(
                   await incrementBudget(userId).catch((e: Error) =>
                     console.warn("[apply-worker] Budget increment failed:", e.message)
                   );
+                  writeFormPattern(taskCtx.applyUrl, harnessResult);
                 }
               } else {
                 usedFlow = "pattern-cache";
@@ -198,9 +199,14 @@ export const applyWorker = new Worker<ApplyTaskPayload>(
                 await incrementBudget(userId).catch((e: Error) =>
                   console.warn("[apply-worker] Budget increment failed:", e.message)
                 );
+                writeFormPattern(taskCtx.applyUrl, harnessResult);
               }
             }
           }
+        }
+
+        if (!harnessResult) {
+          throw new Error("Apply completed without a harness result");
         }
 
         const durationMs = Date.now() - startedAt;
@@ -316,6 +322,23 @@ async function createApplyResultNotification(params: {
     body: params.jobTitle,
     jobId: params.jobId,
   });
+}
+
+function writeFormPattern(applyUrl: string, harnessResult: HarnessResult): void {
+  if (!harnessResult.fieldMappings || Object.keys(harnessResult.fieldMappings).length === 0) {
+    return;
+  }
+
+  let host = "unknown";
+  try { host = new URL(applyUrl).hostname; } catch { /* invalid URL: write unknown host */ }
+  const pathParts = applyUrl.replace(/^https?:\/\/[^/]+\//, "").split("/");
+  const urlPattern = pathParts.slice(0, 2).join("/") + "/";
+
+  upsertFormPattern({
+    atsHost: host,
+    urlPattern,
+    fieldMapping: harnessResult.fieldMappings,
+  }).catch((e: Error) => console.warn("[apply-worker] Pattern write failed:", e.message));
 }
 
 function notificationTypeForStatus(
