@@ -1,5 +1,6 @@
 import type { BrowserContext, Page } from "playwright-core";
 import { ensureProfileDir, storageStatePath } from "./profiles.js";
+import { getProxy } from "./proxy.js";
 
 const MAX_WORKERS = Number(process.env.CLOAK_MAX_WORKERS ?? "1");
 
@@ -26,12 +27,14 @@ async function launchContext(
   const { launchPersistentContext } = await import("cloakbrowser");
   const profileDir = ensureProfileDir(userId);
   const statePath = storageStatePath(userId);
+  const proxy = getProxy(userId);
 
   const context = await launchPersistentContext({
     headless,
     humanize: true,
     userDataDir: profileDir,
     args: ["--no-sandbox", "--disable-setuid-sandbox"],
+    ...(proxy ? { proxy: { server: proxy } } : {}),
   });
 
   // Restore previous storage state if available
