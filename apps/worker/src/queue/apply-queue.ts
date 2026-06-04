@@ -94,6 +94,7 @@ export const applyWorker = new Worker<ApplyTaskPayload>(
         // Detect ATS → use pre-programmed flow if available, else AI fallback
         const flow = detectFlow(taskCtx.applyUrl);
         let harnessResult: HarnessResult;
+        let usedFlow: string | null = flow ? "programmatic" : null;
 
         if (flow === "greenhouse") {
           console.log(`[apply-worker] Using Greenhouse pre-programmed flow`);
@@ -142,6 +143,7 @@ export const applyWorker = new Worker<ApplyTaskPayload>(
                   console.warn("[apply-worker] Pattern failure record failed:", e.message)
                 );
                 console.log("[apply-worker] Pattern replay failed, falling back to AgentHarness");
+                usedFlow = "llm";
                 const harness = new AgentHarness({
                   userId,
                   maxTurns: 30,
@@ -154,9 +156,12 @@ export const applyWorker = new Worker<ApplyTaskPayload>(
                     console.warn("[apply-worker] Budget increment failed:", e.message)
                   );
                 }
+              } else {
+                usedFlow = "pattern-cache";
               }
             } else {
               console.log(`[apply-worker] AI fallback: budget ${budget.used}/${budget.limit}`);
+              usedFlow = "llm";
               const harness = new AgentHarness({
                 userId,
                 maxTurns: 30,
@@ -180,7 +185,7 @@ export const applyWorker = new Worker<ApplyTaskPayload>(
           status: harnessResult.status,
           mode: "unattended",
           atsType: flow ?? "unknown",
-          flowUsed: flow ? "programmatic" : "llm",
+          flowUsed: usedFlow,
           error: harnessResult.error ?? null,
           durationMs,
         });
