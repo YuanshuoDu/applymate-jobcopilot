@@ -392,14 +392,19 @@ When implementing any feature, ask yourself:
 - **#186** — Dashboard AI budget 显示 ✅ done
 - **#189** — Vercel build fix ✅ done
 
-**Phase 6 直接 HTML 抓取 (待创建):**
-- Compliance review, StepStone DE/AT, Xing, Welcome to the Jungle, decommission RapidAPI
-
-**Phase 7 生产加固 (待创建):**
-- Proxy pool, CAPTCHA fallback, push notifications, observability dashboard, runbook
-
 **Phase 5.7 已知 Gap:**
 - AgentHarness 成功后写入 FormPattern（等 AgentHarness 暴露 field→selector 映射）
+
+**Phase 6 — 直接 HTML 抓取:**
+- 合规审查完成: StepStone ⚠️ (robots.txt blocks search), Xing 🔴 (blocked), WTTJ 🔴 (ToS prohibits scraping)
+- **判定: 跳过** — 3 个目标站点均不可行
+
+**Phase 7 — 生产加固 🔄 进行中:**
+- **#191** — Redis rate limiter + proxy rotation 🔄 in-progress (just dispatched)
+- **#192** — CAPTCHA detection + CapSolver ⏳ spec-ready (P0)
+- **#193** — In-app notification system ⏳ spec-ready
+- **#194** — Observability dashboard ⏳ spec-ready (P0)
+- **#195** — On-call runbook ⏳ spec-ready
 
 **Phase 5 护城河 (待创建):**
 - Form-pattern cache, Pattern replay, Confidence decay, Budget cap
