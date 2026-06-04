@@ -9,7 +9,12 @@ vi.mock('@/lib/model-router', () => ({
   stripFences: (raw: string) => raw.replace(/^```(?:json)?\n?/, '').replace(/\n?```$/, ''),
 }))
 
-vi.mock('@/lib/db', () => ({ db: {} }))
+vi.mock('@/lib/db', () => ({
+  db: {
+    agentRole: { findFirst: vi.fn().mockResolvedValue(null) },
+    coverLetter: { create: vi.fn() },
+  },
+}))
 vi.mock('@/lib/api-helpers', () => ({
   requireAuth: vi.fn().mockResolvedValue({ userId: 'test-user', userEmail: 'test@test.com' }),
   isErrorResponse: (val: unknown) => val instanceof Response && (val as Response).status === 401,
