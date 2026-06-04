@@ -636,7 +636,7 @@ function JobDetailDrawer({ job, onClose, onStatusChange, onUpdate, onDelete }: {
               </div>
             ) : (
               <div style={{ fontSize: 11, color: 'var(--text-muted)', fontStyle: 'italic', padding: '8px 0' }}>
-                No cover letter yet. Click "+ Add" above or use the Apply Basket to generate one.
+                No cover letter yet. Click &quot;+ Add&quot; above or use the Apply Basket to generate one.
               </div>
             )}
           </div>
