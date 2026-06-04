@@ -7,6 +7,7 @@ const mockModelChat = vi.fn()
 vi.mock('@/lib/model-router', () => ({
   modelChat: mockModelChat,
   stripFences: (raw: string) => raw.replace(/^```(?:json)?\n?/, '').replace(/\n?```$/, ''),
+  parseAiJson: (raw: string) => JSON.parse(raw.replace(/^```(?:json)?\n?/, '').replace(/\n?```$/, '')),
 }))
 
 vi.mock('@/lib/db', () => ({ db: {} }))
