@@ -15,6 +15,13 @@ interface ApplyStats {
   avgDurationMs: number | null
 }
 
+interface AiBudget {
+  used: number
+  limit: number
+  remaining: number
+  hasBudget: boolean
+}
+
 // ?? Types ?????????????????????????????????????????????????????????????????
 
 interface ApplyHistoryResult {
@@ -63,11 +70,33 @@ function DurationCell({ ms }: { ms: number | null }) {
   return <span>{Math.floor(sec / 60)}m {sec % 60}s</span>
 }
 
+function AiBudgetChip({ budget }: { budget: AiBudget }) {
+  const tone = budget.remaining <= 0
+    ? { color: '#ef4444', bg: 'rgba(239,68,68,0.12)', border: 'rgba(239,68,68,0.28)' }
+    : budget.remaining < 10
+      ? { color: '#f59e0b', bg: 'rgba(245,158,11,0.12)', border: 'rgba(245,158,11,0.28)' }
+      : { color: '#185FA5', bg: 'rgba(24,95,165,0.10)', border: 'rgba(24,95,165,0.22)' }
+
+  return (
+    <span style={{
+      display: 'inline-flex', alignItems: 'center', gap: 6,
+      borderRadius: 999, border: `0.5px solid ${tone.border}`,
+      background: tone.bg, color: tone.color,
+      padding: '5px 10px', fontSize: 11, fontWeight: 600,
+      whiteSpace: 'nowrap',
+    }}>
+      AI Budget: {budget.remaining}/{budget.limit}
+      {budget.remaining <= 0 ? ' 🔴' : budget.remaining < 10 ? ' 🟠' : ''}
+    </span>
+  )
+}
+
 // ?? Page ???????????????????????????????????????????????????????????????????
 
 export function ApplyHistoryPage() {
   const { data, loading, error, refetch } = useApi<{ results: ApplyHistoryResult[] }>('/api/apply-results')
   const { data: statsData } = useApi<{ stats: ApplyStats }>('/api/apply-results/stats')
+  const { data: budget } = useApi<AiBudget>('/api/me/ai-budget')
   const [retrying, setRetrying] = useState<Record<number, boolean>>({})
   const stats = statsData?.stats
 
@@ -119,18 +148,25 @@ export function ApplyHistoryPage() {
 
         {/* Stats summary row */}
         {stats && (
-          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 12, marginBottom: 16 }}>
-            {[
-              { label: 'Total Applied', value: stats.total, color: 'var(--text)' },
-              { label: 'Submitted', value: stats.submitted, color: '#22c55e' },
-              { label: 'Manual / Pending', value: stats.manual, color: '#f59e0b' },
-              { label: 'Failed', value: stats.failed, color: '#ef4444' },
-            ].map(({ label, value, color }) => (
-              <Card key={label} style={{ padding: '14px 16px' }}>
-                <div style={{ fontSize: 10, color: 'var(--text-muted)', fontWeight: 500, textTransform: 'uppercase', letterSpacing: '0.4px', marginBottom: 6 }}>{label}</div>
-                <div style={{ fontSize: 24, fontWeight: 700, color }}>{value}</div>
-              </Card>
-            ))}
+          <div style={{ marginBottom: 16 }}>
+            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 12 }}>
+              {[
+                { label: 'Total Applied', value: stats.total, color: 'var(--text)' },
+                { label: 'Submitted', value: stats.submitted, color: '#22c55e' },
+                { label: 'Manual / Pending', value: stats.manual, color: '#f59e0b' },
+                { label: 'Failed', value: stats.failed, color: '#ef4444' },
+              ].map(({ label, value, color }) => (
+                <Card key={label} style={{ padding: '14px 16px' }}>
+                  <div style={{ fontSize: 10, color: 'var(--text-muted)', fontWeight: 500, textTransform: 'uppercase', letterSpacing: '0.4px', marginBottom: 6 }}>{label}</div>
+                  <div style={{ fontSize: 24, fontWeight: 700, color }}>{value}</div>
+                </Card>
+              ))}
+            </div>
+            {budget?.hasBudget && (
+              <div style={{ display: 'flex', justifyContent: 'flex-end', marginTop: 10 }}>
+                <AiBudgetChip budget={budget} />
+              </div>
+            )}
           </div>
         )}
 
