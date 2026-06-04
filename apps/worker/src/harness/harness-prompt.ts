@@ -54,6 +54,7 @@ ACTION SCHEMA (return exactly this JSON):
   "type": "fill" | "click" | "select" | "upload" | "scroll" | "wait" | "submit" | "done" | "manual",
   "selector": "CSS selector for the target element (required for fill/click/select/upload/submit)",
   "value": "value to fill/select (required for fill/select/upload)",
+  "field": "candidate data key used for fill actions, e.g. fullName, email, phone, location, summary",
   "reasoning": "brief explanation of why you chose this action"
 }`;
 
@@ -121,6 +122,7 @@ export function parseAction(raw: string): AgentAction | null {
       type: parsed.type,
       selector: parsed.selector,
       value: parsed.value,
+      field: parsed.field,
       filePath: parsed.filePath,
       reasoning: parsed.reasoning ?? "",
     };
@@ -134,6 +136,7 @@ export interface AgentAction {
   type: "fill" | "click" | "select" | "upload" | "scroll" | "wait" | "submit" | "done" | "manual";
   selector?: string;
   value?: string;
+  field?: string;
   filePath?: string;
   reasoning: string;
 }

@@ -47,7 +47,7 @@ describe("AgentHarness", () => {
   it("happy path: 3 turns → done", async () => {
     const { callLlmText } = await import("@jobcopilot/shared/llm");
     vi.mocked(callLlmText)
-      .mockResolvedValueOnce('{"type": "fill", "selector": "#name", "value": "John Doe", "reasoning": "Fill name"}')
+      .mockResolvedValueOnce('{"type": "fill", "selector": "#name", "value": "John Doe", "field": "fullName", "reasoning": "Fill name"}')
       .mockResolvedValueOnce('{"type": "click", "selector": "#next", "reasoning": "Click next"}')
       .mockResolvedValueOnce('{"type": "done", "reasoning": "Form submitted"}');
 
@@ -67,6 +67,7 @@ describe("AgentHarness", () => {
 
     expect(result.status).toBe("submitted");
     expect(result.error).toBeNull();
+    expect(result.fieldMappings).toEqual({ "#name": "fullName" });
   });
 
   it("maxTurns exceeded → failed result", async () => {
