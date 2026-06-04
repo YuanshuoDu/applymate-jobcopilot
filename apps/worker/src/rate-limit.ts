@@ -1,37 +1,28 @@
+import { Redis } from "ioredis";
 import type { RateLimitResult } from "@jobcopilot/shared";
 
-interface Window {
-  count: number;
-  resetAt: number;
-}
+const redis = new Redis(process.env.REDIS_URL ?? "redis://localhost:6379");
 
-const userHourly = new Map<string, Window>();
-const userDomain4h = new Map<string, Window>();
-
-// TODO Phase 7: replace with Redis-backed rate limiter to survive restarts
-// Current behavior: limits reset on worker restart. Acceptable for Phase 4 (low volume).
-// Risk: with multiple worker instances, each has independent limits — total throughput = N * 30/hr
-const MAX_PER_USER_HOUR = Number(process.env.RATE_LIMIT_PER_USER_HOUR ?? '30');
+const MAX_PER_USER_HOUR = Number(process.env.RATE_LIMIT_PER_USER_HOUR ?? "30");
 const MAX_PER_DOMAIN_4H = 5;
-const HOUR_MS = 60 * 60 * 1000;
-const FOUR_HOURS_MS = 4 * HOUR_MS;
+const HOUR_SECONDS = 60 * 60;
+const FOUR_HOURS_SECONDS = 4 * HOUR_SECONDS;
 
-function checkOrInit(
-  map: Map<string, Window>,
+async function checkRedisLimit(
   key: string,
   max: number,
-  windowMs: number
-): RateLimitResult {
-  const now = Date.now();
-  let w = map.get(key);
-  if (!w || now >= w.resetAt) {
-    w = { count: 0, resetAt: now + windowMs };
-    map.set(key, w);
+  windowSeconds: number
+): Promise<RateLimitResult> {
+  const count = await redis.incr(key);
+  if (count === 1) {
+    await redis.expire(key, windowSeconds);
   }
-  if (w.count >= max) {
-    return { allowed: false, retryAfterMs: w.resetAt - now };
+
+  if (count > max) {
+    const ttl = await redis.ttl(key);
+    return { allowed: false, retryAfterMs: Math.max(ttl * 1000, 1000) };
   }
-  w.count++;
+
   return { allowed: true };
 }
 
@@ -40,31 +31,32 @@ function checkOrInit(
  *  @param userId - The user to check
  *  @param domain  - The company/ATS domain to check per-domain limit
  */
-export function checkRateLimit(
+export async function checkRateLimit(
   userId: string,
   domain: string | null
-): RateLimitResult {
-  const userKey = `user:${userId}`;
-  const userResult = checkOrInit(userHourly, userKey, MAX_PER_USER_HOUR, HOUR_MS);
+): Promise<RateLimitResult> {
+  const userResult = await checkRedisLimit(
+    `ratelimit:user:${userId}`,
+    MAX_PER_USER_HOUR,
+    HOUR_SECONDS
+  );
   if (!userResult.allowed) return userResult;
 
   if (domain) {
-    const domainKey = `domain:${userId}:${domain}`;
-    const domainResult = checkOrInit(
-      userDomain4h,
-      domainKey,
+    return checkRedisLimit(
+      `ratelimit:domain:${userId}:${domain}`,
       MAX_PER_DOMAIN_4H,
-      FOUR_HOURS_MS
+      FOUR_HOURS_SECONDS
     );
-    if (!domainResult.allowed) return domainResult;
   }
 
   return { allowed: true };
 }
 
 /** Reset all rate-limit state (for tests only) */
-export function resetRateLimits(): void {
-  userHourly.clear();
-  userDomain4h.clear();
+export async function resetRateLimits(): Promise<void> {
+  const keys = await redis.keys("ratelimit:*");
+  if (keys.length > 0) {
+    await redis.del(...keys);
+  }
 }
-

@@ -47,7 +47,7 @@ export const applyWorker = new Worker<ApplyTaskPayload>(
     }
 
     // Rate limit check
-    const limit = checkRateLimit(userId, domain);
+    const limit = await checkRateLimit(userId, domain);
     if (!limit.allowed) {
       const retryMs = limit.retryAfterMs ?? 60_000;
       console.warn(
