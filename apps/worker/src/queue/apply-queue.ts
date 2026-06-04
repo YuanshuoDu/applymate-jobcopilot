@@ -3,6 +3,7 @@ import { Redis } from "ioredis";
 import type { ApplyTaskPayload } from "@jobcopilot/shared";
 import { checkRateLimit } from "../rate-limit.js";
 import { withCloakContext } from "../cloak/pool.js";
+import { detectCaptcha, solveCaptcha } from "../cloak/captcha.js";
 import { insertApplyResult, getPool } from "../db/apply-results.js";
 import { checkBudget, incrementBudget } from "../db/budget.js";
 import { findFormPattern, recordPatternFailure } from "../db/form-patterns.js";
@@ -93,10 +94,33 @@ export const applyWorker = new Worker<ApplyTaskPayload>(
 
         // Detect ATS → use pre-programmed flow if available, else AI fallback
         const flow = detectFlow(taskCtx.applyUrl);
-        let harnessResult: HarnessResult;
+        let harnessResult: HarnessResult | null = null;
         let usedFlow: string | null = flow ? "programmatic" : null;
 
-        if (flow === "greenhouse") {
+        const hasCaptcha = await detectCaptcha(page).catch(() => false);
+        if (hasCaptcha) {
+          console.log("[apply-worker] CAPTCHA detected, attempting solve...");
+          const solved = await solveCaptcha(page).catch(() => false);
+          if (solved) {
+            await page.goto(taskCtx.applyUrl, {
+              waitUntil: "domcontentloaded",
+              timeout: 30_000,
+            });
+          } else {
+            harnessResult = {
+              status: "manual",
+              turns: 0,
+              error: "CAPTCHA detected and could not be solved automatically",
+              durationMs: 0,
+              log: [],
+            };
+            usedFlow = null;
+          }
+        }
+
+        if (harnessResult) {
+          // CAPTCHA branch already decided the outcome.
+        } else if (flow === "greenhouse") {
           console.log(`[apply-worker] Using Greenhouse pre-programmed flow`);
           harnessResult = await runGreenhouseFlow(page, applyTask);
         } else if (flow === "lever") {
