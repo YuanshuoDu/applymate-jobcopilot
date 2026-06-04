@@ -15,6 +15,7 @@ import { runGreenhouseFlow } from "../flows/greenhouse-flow.js";
 import { runWorkdayFlow } from '../flows/workday-flow.js'
 import { runLeverFlow } from '../flows/lever-flow.js'
 import { runPersonioFlow } from '../flows/personio-flow.js'
+import { createNotification } from "../notifications/create-notification.js";
 import { notifyApplyResult } from "../notifications/notify-apply-result.js";
 import { shouldUsePattern } from "../patterns/confidence.js";
 import { replayPattern } from "../patterns/replay.js";
@@ -215,6 +216,20 @@ export const applyWorker = new Worker<ApplyTaskPayload>(
         });
         resultWritten = true;
 
+        if (
+          harnessResult.status === "submitted" ||
+          harnessResult.status === "manual" ||
+          harnessResult.status === "failed"
+        ) {
+          createApplyResultNotification({
+            userId,
+            jobId,
+            jobTitle: taskCtx.jobTitle,
+            jobCompany: taskCtx.jobCompany,
+            status: harnessResult.status,
+          }).catch((e: Error) => console.warn("[notify] in-app notification failed:", e.message));
+        }
+
         // Send email notification (non-blocking, non-throwing)
         if (harnessResult.status !== 'dry-run') {
           notifyApplyResult({
@@ -266,6 +281,13 @@ export const applyWorker = new Worker<ApplyTaskPayload>(
           'UPDATE "Job" SET status = $1, "updatedAt" = NOW() WHERE id = $2 AND "userId" = $3',
           ['saved', jobId, userId]
         );
+        createApplyResultNotification({
+          userId,
+          jobId,
+          jobTitle: ctx?.jobTitle ?? null,
+          jobCompany: ctx?.jobCompany ?? "Application",
+          status: "failed",
+        }).catch((e: Error) => console.warn("[notify] in-app notification failed:", e.message));
       }
       throw err;
     } finally {
@@ -280,5 +302,38 @@ export const applyWorker = new Worker<ApplyTaskPayload>(
     concurrency: Number(process.env.CLOAK_MAX_WORKERS ?? "1"),
   }
 );
+
+async function createApplyResultNotification(params: {
+  userId: string;
+  jobId: string;
+  jobTitle: string | null;
+  jobCompany: string;
+  status: "submitted" | "manual" | "failed";
+}): Promise<void> {
+  await createNotification(params.userId, {
+    type: notificationTypeForStatus(params.status),
+    title: notificationTitle(params.jobCompany, params.status),
+    body: params.jobTitle,
+    jobId: params.jobId,
+  });
+}
+
+function notificationTypeForStatus(
+  status: "submitted" | "manual" | "failed"
+): "apply_submitted" | "apply_manual" | "apply_failed" {
+  return status === "submitted"
+    ? "apply_submitted"
+    : status === "manual"
+      ? "apply_manual"
+      : "apply_failed";
+}
+
+function notificationTitle(company: string, status: "submitted" | "manual" | "failed"): string {
+  return status === "submitted"
+    ? `${company} ✅`
+    : status === "manual"
+      ? `${company} ⚠️`
+      : `${company} ❌`;
+}
 
 
