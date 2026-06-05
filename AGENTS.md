@@ -411,9 +411,11 @@ When implementing any feature, ask yourself:
 **全部 Phase 完成。队列清空，仓库干净。**
 
 **收尾 Issue 🔄:**
-- **#202** — AgentHarness field mappings → upsertFormPattern 闭环 (P0) 🔄 in-progress
-- **#203** — lever-flow 切到共享 helpers ⏳ spec-ready
-- **#204** — Phase 5 流水线 e2e 集成测试 ⏳ spec-ready
+- **#202** — AgentHarness field mappings → upsertFormPattern 闭环 ✅ done (PR #205)
+- **#203** — lever-flow 切到共享 helpers ✅ done (PR #206)
+- **#204** — Phase 5 流水线 e2e 集成测试 ✅ done (PR #207)
+
+**🎉 全部完成。队列清空，仓库干净。Web 26/26 绿， Worker 23/23 绿。**
 
 **Phase 5 护城河 (待创建):**
 - Form-pattern cache, Pattern replay, Confidence decay, Budget cap
