@@ -13,6 +13,7 @@
  *   3. Adzuna (EU) or JSearch (US/global) based on location
  */
 import { truncate } from '@/lib/utils'
+import { db } from '@/lib/db'
 import { dedupJobs } from './dedup'
 
 export interface DiscoveredJob {
@@ -27,6 +28,7 @@ export interface DiscoveredJob {
 }
 
 interface DiscoverParams {
+  userId?:          string
   targetRoles:     string[]
   targetLocations: string[]  // empty → global search
   existingUrls:    Set<string>
@@ -328,11 +330,16 @@ async function fetchIrishJobsRss(q: string, location: string): Promise<Discovere
 // ── Main discovery function ───────────────────────────────────────────────────
 
 export async function discoverJobs(params: DiscoverParams): Promise<DiscoveredJob[]> {
-  const { targetRoles, targetLocations, existingUrls, maxResults } = params
+  const { userId, targetRoles, targetLocations, existingUrls, maxResults } = params
 
-  const apiKey    = process.env.RAPIDAPI_KEY   ?? ''
-  const adzunaId  = process.env.ADZUNA_APP_ID  ?? ''
-  const adzunaKey = process.env.ADZUNA_APP_KEY ?? ''
+  const userKeys = userId ? await db.userApiKeys.findUnique({
+    where:  { userId },
+    select: { rapidapiKey: true, adzunaAppId: true, adzunaAppKey: true },
+  }).catch(() => null) : null
+
+  const apiKey    = userKeys?.rapidapiKey?.trim()  || process.env.RAPIDAPI_KEY   || ''
+  const adzunaId  = userKeys?.adzunaAppId?.trim()  || process.env.ADZUNA_APP_ID  || ''
+  const adzunaKey = userKeys?.adzunaAppKey?.trim() || process.env.ADZUNA_APP_KEY || ''
 
   const seen    = new Set(existingUrls)
   const results: DiscoveredJob[] = []
