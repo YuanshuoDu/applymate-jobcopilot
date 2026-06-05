@@ -3,8 +3,8 @@
 import React, { useMemo, useState, useEffect, useRef, useCallback } from 'react'
 import { TopBar } from '@/components/layout/TopBar'
 import { Btn, Card, CompanyLogo, INPUT_STYLE, ScorePill, StatusBadge, useToast, useConfirm } from '@/components/ui'
-import type { Job, JobStatus, Activity } from '@/lib/types'
-import { apiMutate, fmtDate, fmtRelative } from '@/lib/hooks'
+import type { Job, JobStatus, Activity, ResumeListItem } from '@/lib/types'
+import { apiMutate, fmtDate, fmtRelative, useApi } from '@/lib/hooks'
 import ApplyStatusCard from '@/components/jobs/ApplyStatusCard'
 
 const KANBAN_COLS: JobStatus[] = ['saved', 'applied', 'review', 'interview', 'offer', 'rejected']
@@ -15,6 +15,14 @@ const COL_LABELS: Record<JobStatus, string> = {
 const COL_COLORS: Record<JobStatus, string> = {
   saved: '#6B7280', applied: '#185FA5', review: '#854F0B',
   interview: '#3B6D11', offer: '#0E7490', rejected: '#A32D2D',
+}
+
+type ResumeTailorChange = {
+  section: string
+  field: string
+  before: string
+  after: string
+  reason: string
 }
 
 // ── ListView ──────────────────────────────────────────────────────────────────
@@ -411,6 +419,13 @@ function JobDetailDrawer({ job, onClose, onStatusChange, onUpdate, onDelete }: {
   const [coverText,    setCoverText]    = useState(job.coverLetter ?? '')
   const [savingCover,  setSavingCover]  = useState(false)
   const [descExpanded, setDescExpanded] = useState(false)
+  const { data: resumeList } = useApi<ResumeListItem[]>('/api/resume')
+  const [selectedResumeId, setSelectedResumeId] = useState('')
+  const [tailoringLoading, setTailoringLoading] = useState(false)
+  const [savingTailoredResume, setSavingTailoredResume] = useState(false)
+  const [tailorResult, setTailorResult] = useState<{ adaptedResumeId: string; changes: ResumeTailorChange[] } | null>(null)
+  const [acceptedChanges, setAcceptedChanges] = useState<Record<string, boolean>>({})
+  const [collapsedChanges, setCollapsedChanges] = useState<Record<string, boolean>>({})
 
   // Load per-job activity on mount; reset interview prep when job changes
   useEffect(() => {
@@ -427,6 +442,16 @@ function JobDetailDrawer({ job, onClose, onStatusChange, onUpdate, onDelete }: {
   useEffect(() => { setNotes(job.notes ?? '') }, [job.notes])
   useEffect(() => { setFollowUpAt(job.followUpAt ? job.followUpAt.slice(0, 10) : '') }, [job.followUpAt])
   useEffect(() => { setCoverText(job.coverLetter ?? ''); setEditingCover(false) }, [job.coverLetter])
+  useEffect(() => {
+    if (!resumeList?.length) return
+    const preferred = resumeList.find(r => r.isDefault) ?? resumeList[0]
+    setSelectedResumeId(prev => prev && resumeList.some(r => r.id === prev) ? prev : preferred.id)
+  }, [resumeList])
+  useEffect(() => {
+    setTailorResult(null)
+    setAcceptedChanges({})
+    setCollapsedChanges({})
+  }, [job.id])
 
   async function saveNotes() {
     if (notes === (job.notes ?? '')) return
@@ -495,8 +520,77 @@ function JobDetailDrawer({ job, onClose, onStatusChange, onUpdate, onDelete }: {
     }
   }
 
+  async function handleTailorResume() {
+    if (!selectedResumeId) {
+      toast.error('No resume selected', 'Create or import a resume first')
+      return
+    }
+
+    setTailoringLoading(true)
+    const { data, error } = await apiMutate<{ adaptedResumeId: string; changes: ResumeTailorChange[] }>(
+      `/api/jobs/${job.id}/tailor-resume`,
+      'POST',
+      { resumeId: selectedResumeId },
+    )
+    setTailoringLoading(false)
+
+    if (error) {
+      toast.error('Tailoring failed', error)
+      return
+    }
+    if (!data) return
+
+    setTailorResult(data)
+    setAcceptedChanges(Object.fromEntries(data.changes.map(c => [c.section, true])))
+    setCollapsedChanges({})
+    toast.success('Tailored resume created', `${data.changes.length} section${data.changes.length === 1 ? '' : 's'} changed`)
+  }
+
+  function toggleAccepted(section: string) {
+    setAcceptedChanges(prev => ({ ...prev, [section]: !prev[section] }))
+  }
+
+  function toggleCollapsed(section: string) {
+    setCollapsedChanges(prev => ({ ...prev, [section]: !prev[section] }))
+  }
+
+  async function confirmTailoredResume() {
+    if (!tailorResult) return
+    const accepted = tailorResult.changes.filter(c => acceptedChanges[c.section]).length
+    const rejected = tailorResult.changes.filter(c => !acceptedChanges[c.section])
+
+    if (rejected.length > 0) {
+      setSavingTailoredResume(true)
+      try {
+        const [baseRes, adaptedRes] = await Promise.all([
+          fetch(`/api/resume/${selectedResumeId}`),
+          fetch(`/api/resume/${tailorResult.adaptedResumeId}`),
+        ])
+        const [baseResume, adaptedResume] = await Promise.all([baseRes.json(), adaptedRes.json()])
+        if (!baseRes.ok || !adaptedRes.ok) throw new Error(baseResume.error ?? adaptedResume.error ?? 'Could not load resume content')
+
+        const content = { ...(adaptedResume.content as Record<string, unknown>) }
+        for (const change of rejected) {
+          content[change.section] = (baseResume.content as Record<string, unknown>)[change.section]
+        }
+
+        const { error } = await apiMutate(`/api/resume/${tailorResult.adaptedResumeId}`, 'PATCH', { content })
+        if (error) throw new Error(error)
+      } catch (e) {
+        toast.error('Save failed', e instanceof Error ? e.message : 'Could not save selected changes')
+        setSavingTailoredResume(false)
+        return
+      }
+      setSavingTailoredResume(false)
+    }
+
+    toast.success('Tailored resume saved', `${accepted}/${tailorResult.changes.length} changes accepted`)
+  }
+
   // Drawer uses a slightly more compact variant of the shared INPUT_STYLE
   const drawerInputSt: React.CSSProperties = { ...INPUT_STYLE, fontSize: 11, padding: '5px 8px', borderRadius: 5 }
+  const hasResumes = Boolean(resumeList?.length)
+  const canTailorResume = Boolean(job.description && hasResumes)
 
   return (
     <>
@@ -555,6 +649,84 @@ function JobDetailDrawer({ job, onClose, onStatusChange, onUpdate, onDelete }: {
           <div style={{ marginBottom: 6 }}>
             <ScoreJobButton job={job} onUpdate={onUpdate} />
           </div>
+
+          {/* Tailor Resume */}
+          {canTailorResume && (
+            <Card style={{ padding: 12, display: 'flex', flexDirection: 'column', gap: 8 }}>
+              <div style={{ display: 'flex', justifyContent: 'space-between', gap: 8, alignItems: 'center' }}>
+                <div>
+                  <div style={{ fontSize: 10, color: '#3B6D11', fontWeight: 500 }}>RESUME TAILORING</div>
+                  <div style={{ fontSize: 11, color: 'var(--text-muted)', marginTop: 2 }}>
+                    Adapt a base resume for this job description.
+                  </div>
+                </div>
+                <Btn small onClick={handleTailorResume} disabled={tailoringLoading}>
+                  {tailoringLoading ? 'Tailoring...' : 'Tailor Resume'}
+                </Btn>
+              </div>
+              {resumeList && resumeList.length > 1 && (
+                <select
+                  value={selectedResumeId}
+                  onChange={e => setSelectedResumeId(e.target.value)}
+                  style={{ ...drawerInputSt, width: '100%' }}>
+                  {resumeList.map(r => (
+                    <option key={r.id} value={r.id}>{r.isDefault ? 'Default - ' : ''}{r.name}</option>
+                  ))}
+                </select>
+              )}
+            </Card>
+          )}
+
+          {tailorResult && (
+            <Card style={{ padding: 12, display: 'flex', flexDirection: 'column', gap: 10 }}>
+              <div style={{ display: 'flex', justifyContent: 'space-between', gap: 8, alignItems: 'center' }}>
+                <div>
+                  <div style={{ fontSize: 10, color: '#3B6D11', fontWeight: 500 }}>TAILORED RESUME DIFF</div>
+                  <div style={{ fontSize: 11, color: 'var(--text-muted)', marginTop: 2 }}>
+                    Review each section before saving the tailored version.
+                  </div>
+                </div>
+                <Btn small onClick={confirmTailoredResume} disabled={savingTailoredResume}>
+                  {savingTailoredResume ? 'Saving...' : 'Save'}
+                </Btn>
+              </div>
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 8, maxHeight: 360, overflowY: 'auto' }}>
+                {tailorResult.changes.map(c => {
+                  const accepted = acceptedChanges[c.section] !== false
+                  const collapsed = Boolean(collapsedChanges[c.section])
+                  return (
+                    <div key={c.section} style={{ border: '0.5px solid var(--border)', borderRadius: 6, overflow: 'hidden', opacity: accepted ? 1 : 0.62 }}>
+                      <button
+                        onClick={() => toggleCollapsed(c.section)}
+                        style={{ width: '100%', padding: '7px 9px', display: 'flex', justifyContent: 'space-between', alignItems: 'center', background: 'var(--bg-secondary)', border: 'none', cursor: 'pointer', color: 'var(--text)' }}>
+                        <span style={{ fontSize: 11, fontWeight: 600, textTransform: 'capitalize' }}>{c.section}</span>
+                        <span style={{ fontSize: 10, color: 'var(--text-muted)' }}>{collapsed ? 'Show' : 'Hide'}</span>
+                      </button>
+                      {!collapsed && (
+                        <div style={{ padding: 9, display: 'flex', flexDirection: 'column', gap: 8 }}>
+                          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8 }}>
+                            <div>
+                              <div style={{ fontSize: 9, color: 'var(--c-danger)', fontWeight: 600, marginBottom: 4 }}>BEFORE</div>
+                              <pre style={{ margin: 0, whiteSpace: 'pre-wrap', wordBreak: 'break-word', fontSize: 10, lineHeight: 1.55, color: 'var(--text-muted)', background: 'rgba(163,45,45,0.06)', border: '0.5px solid rgba(163,45,45,0.16)', borderRadius: 5, padding: 7, maxHeight: 150, overflowY: 'auto' }}>{c.before}</pre>
+                            </div>
+                            <div>
+                              <div style={{ fontSize: 9, color: 'var(--c-success)', fontWeight: 600, marginBottom: 4 }}>AFTER</div>
+                              <pre style={{ margin: 0, whiteSpace: 'pre-wrap', wordBreak: 'break-word', fontSize: 10, lineHeight: 1.55, color: 'var(--text)', background: 'rgba(217,119,6,0.10)', border: '0.5px solid rgba(217,119,6,0.22)', borderRadius: 5, padding: 7, maxHeight: 150, overflowY: 'auto' }}>{c.after}</pre>
+                            </div>
+                          </div>
+                          <div style={{ fontSize: 10, color: 'var(--text-muted)', lineHeight: 1.5 }}>{c.reason}</div>
+                          <label style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 10, color: 'var(--text)', cursor: 'pointer' }}>
+                            <input type="checkbox" checked={accepted} onChange={() => toggleAccepted(c.section)} />
+                            Accept this change
+                          </label>
+                        </div>
+                      )}
+                    </div>
+                  )
+                })}
+              </div>
+            </Card>
+          )}
 
           {/* Auto Apply */}
           {job.url && (
