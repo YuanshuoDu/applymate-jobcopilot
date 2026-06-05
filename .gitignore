@@ -1,0 +1,21 @@
+# Secrets
+.claude/settings.local.json
+client_secret_*.json
+
+# Codex worktree artifacts (30+ dirs)
+jobcopilot-issue*/
+jobcopilot-vercel-fix/
+
+# Runtime lock files
+.claude/scheduled_tasks.lock
+
+# Nested repos
+jobcopilot/
+
+# Temp
+_tmp_*
+.playwright-mcp/
+
+# PoC
+cloak-poc/
+applymate/

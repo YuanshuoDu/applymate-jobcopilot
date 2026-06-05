@@ -1,0 +1,385 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>方案 B vs C 对比</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: #0f0f13; color: #e2e8f0; }
+
+  .page { display: flex; flex-direction: column; height: 100vh; }
+  .header { padding: 16px 24px; background: #1a1a2e; border-bottom: 1px solid #2d2d44; display: flex; align-items: center; gap: 12px; }
+  .header h1 { font-size: 15px; font-weight: 600; color: #a78bfa; }
+  .header p { font-size: 12px; color: #64748b; }
+
+  .cols { display: flex; flex: 1; overflow: hidden; }
+  .col { flex: 1; display: flex; flex-direction: column; overflow: hidden; border-right: 1px solid #2d2d44; }
+  .col:last-child { border-right: none; }
+  .col-header { padding: 14px 20px; background: #161624; border-bottom: 1px solid #2d2d44; display: flex; align-items: center; gap: 10px; }
+  .badge { padding: 3px 10px; border-radius: 999px; font-size: 11px; font-weight: 600; }
+  .badge-b { background: rgba(124,58,237,0.2); color: #a78bfa; border: 1px solid rgba(124,58,237,0.3); }
+  .badge-c { background: rgba(6,182,212,0.15); color: #67e8f9; border: 1px solid rgba(6,182,212,0.25); }
+  .col-title { font-size: 13px; font-weight: 600; }
+  .col-sub { font-size: 11px; color: #64748b; margin-left: auto; }
+
+  .canvas { flex: 1; overflow: auto; position: relative; }
+
+  /* ─── PLAN B: Free canvas with edges ─── */
+  .plan-b { padding: 24px; position: relative; min-height: 500px; }
+  .plan-b svg.edges { position: absolute; top: 0; left: 0; width: 100%; height: 100%; pointer-events: none; }
+
+  .node { position: absolute; background: #1e1e32; border: 1.5px solid #3d3d5c; border-radius: 12px; padding: 14px 16px; width: 148px; cursor: grab; transition: box-shadow 0.2s, border-color 0.2s; user-select: none; }
+  .node:hover { border-color: #7c3aed; box-shadow: 0 0 0 3px rgba(124,58,237,0.15); }
+  .node.running { border-color: #4f46e5; box-shadow: 0 0 0 3px rgba(79,70,229,0.2), 0 0 16px rgba(79,70,229,0.15); }
+  .node.done { border-color: #059669; box-shadow: 0 0 0 2px rgba(5,150,105,0.15); }
+  .node.custom { border-color: #d97706; box-shadow: 0 0 0 2px rgba(217,119,6,0.15); }
+  .node-icon { font-size: 20px; margin-bottom: 6px; }
+  .node-label { font-size: 12px; font-weight: 600; margin-bottom: 2px; }
+  .node-sub { font-size: 10px; color: #64748b; margin-bottom: 8px; }
+  .node-status { font-size: 10px; display: flex; align-items: center; gap: 5px; }
+  .dot { width: 6px; height: 6px; border-radius: 50%; flex-shrink: 0; }
+  .dot-run { background: #4f46e5; animation: pulse 1.2s ease-in-out infinite; }
+  .dot-done { background: #059669; }
+  .dot-idle { background: #475569; }
+  .dot-custom { background: #d97706; }
+  .job-tag { margin-top: 7px; padding: 4px 7px; background: rgba(79,70,229,0.12); border-radius: 5px; font-size: 9px; color: #818cf8; line-height: 1.4; }
+
+  /* Add node button */
+  .add-node { position: absolute; bottom: 20px; right: 20px; width: 36px; height: 36px; border-radius: 50%; background: rgba(124,58,237,0.25); border: 1.5px dashed #7c3aed; display: flex; align-items: center; justify-content: center; font-size: 18px; cursor: pointer; color: #a78bfa; }
+
+  /* Custom node (user-added) */
+  .node-custom-badge { font-size: 9px; background: rgba(217,119,6,0.15); color: #fbbf24; padding: 2px 6px; border-radius: 999px; margin-bottom: 6px; display: inline-block; }
+
+  /* ─── PLAN C: Fixed horizontal pipeline ─── */
+  .plan-c { padding: 24px 16px; }
+  .pipeline-row { display: flex; align-items: flex-start; gap: 0; overflow-x: auto; padding-bottom: 8px; }
+  .pipe-node { flex-shrink: 0; display: flex; flex-direction: column; align-items: center; width: 130px; }
+  .pipe-circle { width: 52px; height: 52px; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 20px; border: 2px solid #3d3d5c; background: #1e1e32; cursor: grab; transition: all 0.2s; position: relative; }
+  .pipe-circle.running { border-color: #4f46e5; box-shadow: 0 0 0 4px rgba(79,70,229,0.2); animation: pulse 1.4s ease-in-out infinite; }
+  .pipe-circle.done { border-color: #059669; background: rgba(5,150,105,0.1); }
+  .pipe-circle.disabled { opacity: 0.35; filter: grayscale(1); cursor: not-allowed; }
+  .pipe-circle .toggle-hint { position: absolute; top: -8px; right: -8px; width: 16px; height: 16px; border-radius: 50%; background: #2d2d44; border: 1px solid #3d3d5c; display: flex; align-items: center; justify-content: center; font-size: 8px; cursor: pointer; }
+  .pipe-circle .toggle-hint.on { background: rgba(5,150,105,0.2); border-color: #059669; color: #34d399; }
+  .pipe-circle .toggle-hint.off { background: rgba(239,68,68,0.15); border-color: #ef4444; color: #f87171; }
+  .pipe-label { font-size: 11px; font-weight: 600; margin-top: 8px; text-align: center; }
+  .pipe-sub { font-size: 9px; color: #64748b; text-align: center; margin-top: 2px; }
+  .pipe-metric { font-size: 10px; color: #22c55e; text-align: center; margin-top: 4px; font-weight: 500; }
+  .pipe-arrow { flex: 1; display: flex; align-items: center; margin-top: 24px; }
+  .arrow-line { flex: 1; height: 2px; background: #2d2d44; position: relative; }
+  .arrow-line.active { background: linear-gradient(90deg, #059669, #4f46e5); }
+  .arrow-line::after { content: '▶'; position: absolute; right: -6px; top: 50%; transform: translateY(-50%); font-size: 10px; color: #2d2d44; }
+  .arrow-line.active::after { color: #4f46e5; }
+
+  .pipe-detail { margin-top: 12px; padding: 10px 14px; background: #161624; border: 1px solid #2d2d44; border-radius: 8px; font-size: 10px; color: #94a3b8; line-height: 1.7; }
+  .pipe-detail .job-row { display: flex; align-items: center; gap: 6px; padding: 3px 0; border-bottom: 1px solid #1e1e32; }
+  .pipe-detail .job-row:last-child { border-bottom: none; }
+  .score { font-size: 10px; padding: 1px 6px; border-radius: 999px; font-weight: 600; }
+  .score-hi { background: rgba(5,150,105,0.15); color: #34d399; }
+  .score-mid { background: rgba(234,179,8,0.12); color: #fbbf24; }
+
+  /* Drag zone for C */
+  .drop-zone { margin-top: 14px; padding: 10px 16px; border: 1.5px dashed #3d3d5c; border-radius: 8px; display: flex; align-items: center; gap: 10px; font-size: 11px; color: #64748b; }
+  .drop-zone .dz-icon { font-size: 18px; }
+
+  /* Feature comparison */
+  .compare-table { margin: 14px 16px; background: #161624; border: 1px solid #2d2d44; border-radius: 8px; overflow: hidden; }
+  .compare-row { display: flex; align-items: center; padding: 8px 14px; border-bottom: 1px solid #1e1e32; font-size: 11px; }
+  .compare-row:last-child { border-bottom: none; }
+  .compare-feat { flex: 1; color: #94a3b8; }
+  .check { font-size: 12px; }
+  .check-yes { color: #34d399; }
+  .check-no { color: #ef4444; }
+  .check-par { color: #fbbf24; }
+
+  @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:0.55} }
+
+  /* Drag cursor feedback */
+  .dragging { cursor: grabbing !important; opacity: 0.85; }
+</style>
+</head>
+<body>
+<div class="page">
+  <div class="header">
+    <h1>方案对比：B vs C</h1>
+    <p>拖拽节点体验两种交互方式的区别</p>
+  </div>
+  <div class="cols">
+
+    <!-- ─── PLAN B ─── -->
+    <div class="col">
+      <div class="col-header">
+        <span class="badge badge-b">方案 B</span>
+        <span class="col-title">自由画布 Workflow Builder</span>
+        <span class="col-sub">像 n8n / Langflow</span>
+      </div>
+      <div class="canvas">
+        <div class="plan-b" id="canvas-b">
+          <svg class="edges" id="edges-svg"></svg>
+
+          <!-- Nodes -->
+          <div class="node" id="nb-scout"  style="left:30px;top:40px" data-node="scout">
+            <div class="node-icon">🔍</div>
+            <div class="node-label">Scout</div>
+            <div class="node-sub">侦察员</div>
+            <div class="node-status"><span class="dot dot-done"></span> Done · 42 jobs</div>
+          </div>
+
+          <div class="node running" id="nb-analyst" style="left:210px;top:40px" data-node="analyst">
+            <div class="node-icon">🤖</div>
+            <div class="node-label">Analyst</div>
+            <div class="node-sub">分析员</div>
+            <div class="node-status"><span class="dot dot-run"></span> Running…</div>
+            <div class="job-tag">Booking.com · Backend Eng<br>Scoring: 84%</div>
+          </div>
+
+          <div class="node" id="nb-writer" style="left:390px;top:40px" data-node="writer">
+            <div class="node-icon">✍️</div>
+            <div class="node-label">Writer</div>
+            <div class="node-sub">撰写员</div>
+            <div class="node-status"><span class="dot dot-idle"></span> Waiting</div>
+          </div>
+
+          <div class="node" id="nb-reviewer" style="left:30px;top:220px" data-node="reviewer">
+            <div class="node-icon">🔎</div>
+            <div class="node-label">Reviewer</div>
+            <div class="node-sub">审核员</div>
+            <div class="node-status"><span class="dot dot-idle"></span> Waiting</div>
+          </div>
+
+          <div class="node" id="nb-executor" style="left:210px;top:220px" data-node="executor">
+            <div class="node-icon">🚀</div>
+            <div class="node-label">Executor</div>
+            <div class="node-sub">执行员</div>
+            <div class="node-status"><span class="dot dot-idle"></span> Waiting</div>
+          </div>
+
+          <div class="node custom" id="nb-custom" style="left:390px;top:220px" data-node="custom">
+            <div class="node-custom-badge">✦ 用户自定义</div>
+            <div class="node-icon">🧩</div>
+            <div class="node-label">Custom Filter</div>
+            <div class="node-sub">自定义节点</div>
+            <div class="node-status"><span class="dot dot-custom"></span> 用户添加</div>
+          </div>
+
+          <div class="node" id="nb-auditor" style="left:210px;top:390px" data-node="auditor">
+            <div class="node-icon">✅</div>
+            <div class="node-label">Auditor</div>
+            <div class="node-sub">验收员</div>
+            <div class="node-status"><span class="dot dot-idle"></span> Waiting</div>
+          </div>
+
+          <div class="add-node" title="添加自定义节点">+</div>
+        </div>
+      </div>
+      <div class="compare-table">
+        <div class="compare-row"><span class="compare-feat">自由拖拽节点位置</span><span class="check check-yes">✓</span></div>
+        <div class="compare-row"><span class="compare-feat">自定义连线/改变执行顺序</span><span class="check check-yes">✓</span></div>
+        <div class="compare-row"><span class="compare-feat">添加/删除 Agent 节点</span><span class="check check-yes">✓</span></div>
+        <div class="compare-row"><span class="compare-feat">实时运行状态显示</span><span class="check check-yes">✓</span></div>
+        <div class="compare-row"><span class="compare-feat">开发工作量</span><span class="check" style="color:#f97316">大 (~3周)</span></div>
+      </div>
+    </div>
+
+    <!-- ─── PLAN C ─── -->
+    <div class="col">
+      <div class="col-header">
+        <span class="badge badge-c">方案 C</span>
+        <span class="col-title">可交互流水线监控</span>
+        <span class="col-sub">拖拽排序 + 点击配置</span>
+      </div>
+      <div class="canvas">
+        <div class="plan-c">
+          <div class="pipeline-row" id="pipeline-c">
+            <!-- Scout -->
+            <div class="pipe-node" draggable="true" data-role="scout">
+              <div class="pipe-circle done">🔍<span class="toggle-hint on">✓</span></div>
+              <div class="pipe-label">Scout</div>
+              <div class="pipe-sub">侦察员</div>
+              <div class="pipe-metric">42 jobs</div>
+            </div>
+            <div class="pipe-arrow"><div class="arrow-line active"></div></div>
+            <!-- Analyst -->
+            <div class="pipe-node" draggable="true" data-role="analyst">
+              <div class="pipe-circle running">🤖<span class="toggle-hint on">✓</span></div>
+              <div class="pipe-label">Analyst</div>
+              <div class="pipe-sub">分析员</div>
+              <div class="pipe-metric" style="color:#818cf8">18/42…</div>
+            </div>
+            <div class="pipe-arrow"><div class="arrow-line"></div></div>
+            <!-- Writer -->
+            <div class="pipe-node" draggable="true" data-role="writer">
+              <div class="pipe-circle">✍️<span class="toggle-hint on">✓</span></div>
+              <div class="pipe-label">Writer</div>
+              <div class="pipe-sub">撰写员</div>
+              <div class="pipe-metric" style="color:#475569">等待中</div>
+            </div>
+            <div class="pipe-arrow"><div class="arrow-line"></div></div>
+            <!-- Reviewer — disabled -->
+            <div class="pipe-node" draggable="true" data-role="reviewer">
+              <div class="pipe-circle disabled">🔎<span class="toggle-hint off">✕</span></div>
+              <div class="pipe-label" style="color:#475569">Reviewer</div>
+              <div class="pipe-sub">已禁用</div>
+              <div class="pipe-metric" style="color:#475569">跳过</div>
+            </div>
+            <div class="pipe-arrow"><div class="arrow-line"></div></div>
+            <!-- Executor -->
+            <div class="pipe-node" draggable="true" data-role="executor">
+              <div class="pipe-circle">🚀<span class="toggle-hint on">✓</span></div>
+              <div class="pipe-label">Executor</div>
+              <div class="pipe-sub">执行员</div>
+              <div class="pipe-metric" style="color:#475569">等待中</div>
+            </div>
+            <div class="pipe-arrow"><div class="arrow-line"></div></div>
+            <!-- Auditor -->
+            <div class="pipe-node" draggable="true" data-role="auditor">
+              <div class="pipe-circle">✅<span class="toggle-hint on">✓</span></div>
+              <div class="pipe-label">Auditor</div>
+              <div class="pipe-sub">验收员</div>
+              <div class="pipe-metric" style="color:#475569">等待中</div>
+            </div>
+          </div>
+
+          <!-- Currently processing detail -->
+          <div class="pipe-detail">
+            <div style="font-size:10px;font-weight:600;color:#818cf8;margin-bottom:6px">🤖 Analyst 当前处理中</div>
+            <div class="job-row">
+              <span style="flex:1">Booking.com · Backend Engineer</span>
+              <span class="score score-hi">84%</span>
+            </div>
+            <div class="job-row">
+              <span style="flex:1">Adyen · Data Engineer</span>
+              <span class="score score-hi">91%</span>
+            </div>
+            <div class="job-row">
+              <span style="flex:1">Zalando · Platform Eng</span>
+              <span class="score score-mid">71%</span>
+            </div>
+            <div style="font-size:9px;color:#475569;margin-top:5px">拖动节点可调整在流水线中的顺序 · 点击 ✓/✕ 启用/禁用</div>
+          </div>
+
+          <!-- Drag to disable zone -->
+          <div class="drop-zone">
+            <span class="dz-icon">🗑</span>
+            <span>将节点拖到此处可<strong style="color:#f87171">禁用</strong>该 Agent</span>
+          </div>
+        </div>
+      </div>
+      <div class="compare-table">
+        <div class="compare-row"><span class="compare-feat">拖拽调整执行顺序</span><span class="check check-yes">✓</span></div>
+        <div class="compare-row"><span class="compare-feat">点击启用/禁用 Agent</span><span class="check check-yes">✓</span></div>
+        <div class="compare-row"><span class="compare-feat">实时查看各 Agent 正在处理的职位</span><span class="check check-yes">✓</span></div>
+        <div class="compare-row"><span class="compare-feat">自定义连线/添加节点</span><span class="check check-no">✕</span></div>
+        <div class="compare-row"><span class="compare-feat">开发工作量</span><span class="check check-yes">小 (~2天)</span></div>
+      </div>
+    </div>
+
+  </div>
+</div>
+
+<script>
+// ── Plan B: Drag nodes freely ──
+(function(){
+  const canvas = document.getElementById('canvas-b')
+  let dragging = null, ox = 0, oy = 0
+
+  canvas.querySelectorAll('.node').forEach(node => {
+    node.addEventListener('mousedown', e => {
+      if(e.button !== 0) return
+      dragging = node
+      const r = node.getBoundingClientRect()
+      const cr = canvas.getBoundingClientRect()
+      ox = e.clientX - (r.left - cr.left)
+      oy = e.clientY - (r.top - cr.top)
+      node.classList.add('dragging')
+      e.preventDefault()
+    })
+  })
+
+  document.addEventListener('mousemove', e => {
+    if(!dragging) return
+    const cr = canvas.getBoundingClientRect()
+    dragging.style.left = Math.max(0, e.clientX - cr.left - ox) + 'px'
+    dragging.style.top  = Math.max(0, e.clientY - cr.top  - oy) + 'px'
+    drawEdges()
+  })
+
+  document.addEventListener('mouseup', () => {
+    if(dragging){ dragging.classList.remove('dragging'); dragging = null }
+  })
+
+  function getCenter(el){
+    const r = el.getBoundingClientRect()
+    const cr = canvas.getBoundingClientRect()
+    return { x: r.left - cr.left + r.width/2, y: r.top - cr.top + r.height/2 }
+  }
+
+  const EDGES = [
+    ['nb-scout','nb-analyst'],
+    ['nb-analyst','nb-writer'],
+    ['nb-analyst','nb-reviewer'],
+    ['nb-writer','nb-executor'],
+    ['nb-reviewer','nb-executor'],
+    ['nb-custom','nb-executor'],
+    ['nb-executor','nb-auditor'],
+  ]
+
+  function drawEdges(){
+    const svg = document.getElementById('edges-svg')
+    svg.innerHTML = ''
+    for(const [a,b] of EDGES){
+      const na = document.getElementById(a)
+      const nb = document.getElementById(b)
+      if(!na||!nb) continue
+      const ca = getCenter(na), cb = getCenter(nb)
+      const path = document.createElementNS('http://www.w3.org/2000/svg','path')
+      const cx = (ca.x+cb.x)/2
+      path.setAttribute('d',`M${ca.x},${ca.y} C${cx},${ca.y} ${cx},${cb.y} ${cb.x},${cb.y}`)
+      path.setAttribute('fill','none')
+      path.setAttribute('stroke', a==='nb-scout'&&b==='nb-analyst' ? '#059669' : a.includes('analyst')&&b.includes('writer') ? '#4f46e5' : '#3d3d5c')
+      path.setAttribute('stroke-width','1.5')
+      path.setAttribute('stroke-dasharray', a.includes('analyst')&&b.includes('writer') ? 'none' : '4,3')
+      path.setAttribute('opacity','0.7')
+      svg.appendChild(path)
+    }
+  }
+
+  drawEdges()
+})();
+
+// ── Plan C: Drag to reorder pipeline ──
+(function(){
+  const pipeline = document.getElementById('pipeline-c')
+  let dragSrc = null
+
+  pipeline.querySelectorAll('.pipe-node').forEach(node => {
+    node.addEventListener('dragstart', e => {
+      dragSrc = node
+      node.style.opacity = '0.45'
+    })
+    node.addEventListener('dragend', () => {
+      node.style.opacity = '1'
+      dragSrc = null
+    })
+    node.addEventListener('dragover', e => {
+      e.preventDefault()
+      if(!dragSrc || dragSrc === node) return
+      node.style.background = 'rgba(79,70,229,0.08)'
+    })
+    node.addEventListener('dragleave', () => { node.style.background = '' })
+    node.addEventListener('drop', e => {
+      e.preventDefault()
+      node.style.background = ''
+      if(!dragSrc || dragSrc === node) return
+      // Swap in DOM — find arrows
+      const nodes = [...pipeline.children]
+      const srcIdx = nodes.indexOf(dragSrc)
+      const tgtIdx = nodes.indexOf(node)
+      if(srcIdx < tgtIdx) pipeline.insertBefore(dragSrc, node.nextSibling)
+      else pipeline.insertBefore(dragSrc, node)
+    })
+  })
+})();
+</script>
+</body>
+</html>
