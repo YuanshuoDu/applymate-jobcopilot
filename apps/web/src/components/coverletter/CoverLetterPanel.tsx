@@ -16,6 +16,8 @@ interface Props {
 
 const TONES = ['professional', 'enthusiastic', 'concise'] as const
 type Tone = typeof TONES[number]
+const LANGUAGES = ['en', 'de', 'fr', 'nl', 'es'] as const
+type CoverLetterLanguage = typeof LANGUAGES[number]
 
 export function CoverLetterPanel({ job, resumeContent, resumeName, templateName, onClose, onSaved }: Props) {
   const { t } = useI18n()
@@ -26,6 +28,7 @@ export function CoverLetterPanel({ job, resumeContent, resumeName, templateName,
   const [activeId,     setActiveId]       = useState<string | null>(null)
   const [localContent, setLocalContent]   = useState('')
   const [localTone,    setLocalTone]      = useState<Tone>('professional')
+  const [localLanguage, setLocalLanguage] = useState<CoverLetterLanguage>('en')
   const [loading,      setLoading]        = useState(true)
   const [saving,       setSaving]         = useState(false)
   const [generating,   setGenerating]     = useState(false)
@@ -145,6 +148,7 @@ export function CoverLetterPanel({ job, resumeContent, resumeName, templateName,
         jobCompany:     job.company,
         jobDescription: job.description ?? undefined,
         tone:           localTone,
+        language:       localLanguage,
       })
       if (!data?.coverLetter) {
         setGenerating(false)
@@ -284,6 +288,22 @@ export function CoverLetterPanel({ job, resumeContent, resumeName, templateName,
               </button>
             ))}
           </div>
+
+          <label style={{ display: 'flex', alignItems: 'center', gap: 5, fontSize: 10, color: 'var(--text-muted)' }}>
+            {t('coverLetter.language.label')}
+            <select
+              value={localLanguage}
+              onChange={e => setLocalLanguage(e.target.value as CoverLetterLanguage)}
+              style={{
+                fontSize: 11, padding: '4px 8px',
+                border: '0.5px solid var(--border)', borderRadius: 6,
+                background: 'var(--bg)', color: 'var(--text)', outline: 'none',
+              }}>
+              {LANGUAGES.map(lang => (
+                <option key={lang} value={lang}>{t(`coverLetter.language.${lang}`)}</option>
+              ))}
+            </select>
+          </label>
 
           <div style={{ flex: 1 }} />
 
