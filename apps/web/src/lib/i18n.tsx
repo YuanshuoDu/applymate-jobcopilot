@@ -74,6 +74,12 @@ const dict: Record<Lang, Record<string, string>> = {
     'common.saved':      'Saved',
     'common.cancel':     'Cancel',
     'common.retry':      'Retry',
+    'coverLetter.language.label': 'Language',
+    'coverLetter.language.en':    'English',
+    'coverLetter.language.de':    'German',
+    'coverLetter.language.fr':    'French',
+    'coverLetter.language.nl':    'Dutch',
+    'coverLetter.language.es':    'Spanish',
     
     // ── Auth pages ──────────────────────────────────────────
     'auth.login.feature1.title': 'Smart Job Matching',
@@ -243,6 +249,12 @@ const dict: Record<Lang, Record<string, string>> = {
     'common.saved':      '已保存',
     'common.cancel':     '取消',
     'common.retry':      '重试',
+    'coverLetter.language.label': '语言',
+    'coverLetter.language.en':    '英语',
+    'coverLetter.language.de':    '德语',
+    'coverLetter.language.fr':    '法语',
+    'coverLetter.language.nl':    '荷兰语',
+    'coverLetter.language.es':    '西班牙语',
     
     // ── Auth pages ──────────────────────────────────────────
     'auth.login.feature1.title': '智能职位匹配',

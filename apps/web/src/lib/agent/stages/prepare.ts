@@ -13,6 +13,37 @@ import type {
 } from '../types'
 import { stageOk } from '../types'
 
+const COVER_LETTER_LANGUAGE_NAMES = {
+  en: 'English',
+  de: 'German',
+  fr: 'French',
+  nl: 'Dutch',
+  es: 'Spanish',
+} as const
+
+const COVER_LETTER_FORMALITY_GUIDES: Record<keyof typeof COVER_LETTER_LANGUAGE_NAMES, string> = {
+  en: 'Use polished business English and a professional European application style.',
+  de: 'Use formal German business conventions, including Sie/Ihnen where appropriate.',
+  fr: 'Use formal French business conventions, including vous/votre where appropriate.',
+  nl: 'Use formal Dutch business conventions, including u/uw where appropriate.',
+  es: 'Use formal Spanish business conventions, including usted/su where appropriate.',
+}
+
+type CoverLetterLanguage = keyof typeof COVER_LETTER_LANGUAGE_NAMES
+
+function inferCoverLetterLanguage(sj: ScoredJob): CoverLetterLanguage {
+  const haystack = [
+    sj.job.location,
+    sj.job.url,
+    sj.job.description,
+  ].filter(Boolean).join(' ').toLowerCase()
+
+  if (/\b(deutschland|germany|berlin|munich|muenchen|hamburg|frankfurt|cologne|köln|\.de\b)/i.test(haystack)) return 'de'
+  if (/\b(france|paris|lyon|marseille|toulouse|lille|\.fr\b)/i.test(haystack)) return 'fr'
+  if (/\b(netherlands|nederland|amsterdam|rotterdam|utrecht|eindhoven|\.nl\b)/i.test(haystack)) return 'nl'
+  if (/\b(spain|españa|espana|madrid|barcelona|valencia|sevilla|\.es\b)/i.test(haystack)) return 'es'
+  return 'en'
+}
 
 export async function runPrepare(
   scoredJobs: ScoredJob[],
@@ -104,6 +135,9 @@ async function generateCoverLetter(
     concise:      'direct and punchy — no filler',
   }
   const toneGuide = toneMap[cfg.coverTone] ?? toneMap.professional
+  const languageCode = inferCoverLetterLanguage(sj)
+  const languageName = COVER_LETTER_LANGUAGE_NAMES[languageCode]
+  const languageGuide = COVER_LETTER_FORMALITY_GUIDES[languageCode]
 
   const prompt = `Write a cover letter for a job applicant.
 
@@ -115,12 +149,13 @@ TARGET: ${sj.job.role} at ${sj.job.company}${sj.job.location ? ` (${sj.job.locat
 ${sj.job.description ? `JD EXCERPT:\n${sj.job.description.slice(0, 1000)}` : ''}
 
 Tone: ${toneGuide}
+Language: Write this cover letter in ${languageName}. ${languageGuide}
 Structure: ${greeting} | hook | why this role | 2-3 achievements | CTA | Sincerely, ${name}
 Rules: 220-280 words, no filler like "I am writing to express", quantify where possible.
 Return ONLY the cover letter text.`
 
   const messages = systemPrompt
-    ? [{ role: 'system' as const, content: systemPrompt }, { role: 'user' as const, content: prompt }]
+    ? [{ role: 'system' as const, content: `${systemPrompt}\nWrite in ${languageName}. ${languageGuide}` }, { role: 'user' as const, content: prompt }]
     : [{ role: 'user' as const, content: prompt }]
 
   const result = await modelChat(messages, aiConfig, 800)

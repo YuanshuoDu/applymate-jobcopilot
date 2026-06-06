@@ -1,6 +1,6 @@
 /**
  * POST /api/ai/cover-letter
- * Body: { resumeContent, jobTitle, jobCompany, jobDescription?, tone?, recipientName? }
+ * Body: { resumeContent, jobTitle, jobCompany, jobDescription?, tone?, language?, recipientName? }
  * Returns: { coverLetter: string }
  */
 import { NextRequest } from 'next/server'
@@ -14,6 +14,30 @@ const COVER_FALLBACKS: AiConfig[] = [
 ]
 import type { ResumeContent } from '@/lib/types'
 
+const LANGUAGE_NAMES = {
+  en: 'English',
+  de: 'German',
+  fr: 'French',
+  nl: 'Dutch',
+  es: 'Spanish',
+} as const
+
+const LANGUAGE_FORMALITY_GUIDES: Record<keyof typeof LANGUAGE_NAMES, string> = {
+  en: 'Use polished business English and a professional European application style.',
+  de: 'Use formal German business conventions, including Sie/Ihnen where appropriate.',
+  fr: 'Use formal French business conventions, including vous/votre where appropriate.',
+  nl: 'Use formal Dutch business conventions, including u/uw where appropriate.',
+  es: 'Use formal Spanish business conventions, including usted/su where appropriate.',
+}
+
+type CoverLetterLanguage = keyof typeof LANGUAGE_NAMES
+
+function normalizeLanguage(language: unknown): CoverLetterLanguage {
+  return typeof language === 'string' && language in LANGUAGE_NAMES
+    ? language as CoverLetterLanguage
+    : 'en'
+}
+
 export async function POST(req: NextRequest) {
   const prep = await prepareAiRoute(req, 'coverLetter')
   if ('error' in prep) return prep.error
@@ -21,8 +45,8 @@ export async function POST(req: NextRequest) {
   const body = await req.json().catch(() => null)
   if (!body) return err('Invalid JSON body')
 
-  const { resumeContent, jobTitle, jobCompany, jobDescription, tone = 'professional', recipientName } = body as {
-    resumeContent: ResumeContent; jobTitle: string; jobCompany: string; jobDescription?: string; tone?: string; recipientName?: string
+  const { resumeContent, jobTitle, jobCompany, jobDescription, tone = 'professional', language = 'en', recipientName } = body as {
+    resumeContent: ResumeContent; jobTitle: string; jobCompany: string; jobDescription?: string; tone?: string; language?: string; recipientName?: string
   }
 
   if (!resumeContent) return err('resumeContent is required')
@@ -51,6 +75,9 @@ export async function POST(req: NextRequest) {
     enthusiastic: 'warm, energetic, and genuine',
     concise:      'direct and punchy — no filler',
   }[tone] ?? 'professional'
+  const languageCode = normalizeLanguage(language)
+  const languageName = LANGUAGE_NAMES[languageCode]
+  const languageGuide = LANGUAGE_FORMALITY_GUIDES[languageCode]
 
   const prompt = `Write a cover letter for a job applicant.
 
@@ -62,13 +89,14 @@ TARGET: ${jobTitle} at ${jobCompany}
 ${jobDescription ? `JD EXCERPT:\n${jobDescription.slice(0, 1500)}` : ''}
 
 Tone: ${toneGuide}
+Language: Write this cover letter in ${languageName}. ${languageGuide}
 Structure: ${greeting} | hook | why this role | 2-3 achievements | CTA | Sincerely, / ${name}
 Rules: 220–280 words, no filler like "I am writing to express my interest", quantify achievements.
 Return ONLY the cover letter text.`
 
   // Use Writer Agent's system prompt if configured, otherwise default
   const messages = [
-    { role: 'system' as const, content: writerSystemPrompt },
+    { role: 'system' as const, content: `${writerSystemPrompt}\nWrite in ${languageName}. ${languageGuide}` },
     { role: 'user' as const, content: prompt },
   ]
 
