@@ -55,6 +55,7 @@ export async function runScout(ctx: PipelineCtx): Promise<StageResult<ScoutOutpu
 
       // First attempt: search with location
       let candidates = await discoverJobs({
+        userId,
         targetRoles:     agentCfg.targetRoles,
         targetLocations: agentCfg.targetLocations,
         existingUrls,
@@ -73,6 +74,7 @@ export async function runScout(ctx: PipelineCtx): Promise<StageResult<ScoutOutpu
           observation: `⚠ 在指定地点未找到职位，尝试扩大搜索范围（不限地点）…`,
         })
         candidates = await discoverJobs({
+          userId,
           targetRoles:     agentCfg.targetRoles,
           targetLocations: [],   // no location filter
           existingUrls,
