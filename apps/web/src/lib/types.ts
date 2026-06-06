@@ -313,6 +313,7 @@ export type Page =
   | 'resume'
   | 'gmail'
   | 'agent'
+  | 'agent-history'
   | 'extension'
   | 'apply-history'
   | 'observability'
