@@ -40,6 +40,13 @@ employers:
   - { slug: "trivago",       name: "Trivago",         country: "de", tier: 2 }
   - { slug: "algolia",       name: "Algolia",         country: "fr", tier: 2 }
   - { slug: "dataiku",       name: "Dataiku",         country: "fr", tier: 2 }
+  - { slug: "bookingcom",    name: "Booking.com",     country: "nl", tier: 2 }
+  - { slug: "mollie",        name: "Mollie",          country: "nl", tier: 2 }
+  - { slug: "miro",          name: "Miro",            country: "nl", tier: 2 }
+  - { slug: "typeform",      name: "Typeform",        country: "es", tier: 2 }
+  - { slug: "cabify",        name: "Cabify",          country: "es", tier: 2 }
+  - { slug: "wallapop",      name: "Wallapop",        country: "es", tier: 2 }
+  - { slug: "shifttechnology", name: "Shift Technology", country: "fr", tier: 2 }
 
   # --- Tier 3: long tail ---
   - { slug: "cleo",          name: "Cleo",            country: "gb", tier: 3 }

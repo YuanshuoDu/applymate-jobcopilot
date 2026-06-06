@@ -15,6 +15,19 @@ employers:
   - { slug: "EcoVadis",              name: "EcoVadis",              country: "fr", tier: 2 }
   - { slug: "ubisoft2",              name: "Ubisoft",               country: "fr", tier: 2 }
   - { slug: "redbull",               name: "Red Bull",              country: "at", tier: 2 }
+  - { slug: "Believe",               name: "Believe",               country: "fr", tier: 2 }
+  - { slug: "Sodexo",                name: "Sodexo",                country: "fr", tier: 2 }
+  - { slug: "AUTO1",                 name: "AUTO1 Group",           country: "de", tier: 2 }
+  - { slug: "DeliveryHero",          name: "Delivery Hero",         country: "de", tier: 2 }
+  - { slug: "StepStone",             name: "StepStone",             country: "de", tier: 2 }
+  - { slug: "ASOS",                  name: "ASOS",                  country: "gb", tier: 2 }
+  - { slug: "FrasersGroup",          name: "Frasers Group",         country: "gb", tier: 2 }
+  - { slug: "NBCUniversal3",         name: "NBCUniversal",          country: "gb", tier: 2 }
+  - { slug: "Entain",                name: "Entain",                country: "gb", tier: 2 }
+  - { slug: "InformaGroupPlc",       name: "Informa",               country: "gb", tier: 2 }
+  - { slug: "TurnerTownsend",        name: "Turner & Townsend",     country: "gb", tier: 2 }
+  - { slug: "Version1",              name: "Version 1",             country: "gb", tier: 2 }
+  - { slug: "JYSK",                  name: "JYSK",                  country: "dk", tier: 2 }
 
   # --- Tier 3: long tail / regional coverage ---
   - { slug: "Cint",                  name: "Cint",                  country: "se", tier: 3 }

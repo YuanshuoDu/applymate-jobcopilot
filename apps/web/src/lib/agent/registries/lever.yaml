@@ -28,6 +28,16 @@ employers:
   - { slug: "kavak",                 name: "Kavak",                country: "es", tier: 2 }
   - { slug: "wealthfront",           name: "Wealthfront",          country: "us", tier: 2 }
   - { slug: "zoox",                  name: "Zoox",                 country: "us", tier: 2 }
+  - { slug: "malt",                  name: "Malt",                 country: "fr", tier: 2 }
+  - { slug: "mistral",               name: "Mistral AI",           country: "fr", tier: 2 }
+  - { slug: "pennylane",             name: "Pennylane",            country: "fr", tier: 2 }
+  - { slug: "pigment",               name: "Pigment",              country: "fr", tier: 2 }
+  - { slug: "agicap",                name: "Agicap",               country: "fr", tier: 2 }
+  - { slug: "trustly",               name: "Trustly",              country: "se", tier: 2 }
+  - { slug: "360learning",           name: "360Learning",          country: "fr", tier: 2 }
+  - { slug: "weloglobal",            name: "Welo Global",          country: "se", tier: 2 }
+  - { slug: "emburse",               name: "Emburse",              country: "se", tier: 2 }
+  - { slug: "Civitta",               name: "Civitta",              country: "ee", tier: 2 }
 
   # --- Tier 3: long tail ---
   - { slug: "finn",                  name: "Finn",                 country: "no", tier: 3 }
