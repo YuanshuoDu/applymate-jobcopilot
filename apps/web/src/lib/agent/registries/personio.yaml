@@ -27,7 +27,20 @@ employers:
   - { slug: "taxfix",         name: "Taxfix",            country: "de", tier: 2 }
   - { slug: "mambu",          name: "Mambu",             country: "de", tier: 2 }
   - { slug: "mollie",         name: "Mollie",            country: "de", tier: 2 }
+  - { slug: "sevdesk",        name: "sevDesk",           country: "de", tier: 2 }
+  - { slug: "everphone",      name: "Everphone",         country: "de", tier: 2 }
+  - { slug: "finoa",          name: "Finoa",             country: "de", tier: 2 }
+  - { slug: "acto",           name: "Acto",              country: "de", tier: 2 }
+  - { slug: "vara",           name: "Vara",              country: "de", tier: 2 }
+  - { slug: "hr-system",      name: "hr-system",         country: "at", tier: 2 }
+  - { slug: "govtech",        name: "GovTech Campus Deutschland", country: "de", tier: 2 }
+  - { slug: "envelio",        name: "envelio",           country: "de", tier: 2 }
+  - { slug: "wire-1",         name: "Wire",              country: "de", tier: 2 }
+  - { slug: "getsafe",        name: "Getsafe",           country: "de", tier: 2 }
 
   # --- Tier 3: long tail ---
   - { slug: "vay",            name: "Vay",               country: "de", tier: 3 }
   - { slug: "ada",            name: "Ada Health",        country: "de", tier: 3 }
+  - { slug: "workidentity",   name: "workidentity",      country: "de", tier: 3 }
+  - { slug: "turbalance",     name: "Turbalance",        country: "de", tier: 3 }
+  - { slug: "autonomous-teaming", name: "Autonomous Teaming", country: "de", tier: 3 }

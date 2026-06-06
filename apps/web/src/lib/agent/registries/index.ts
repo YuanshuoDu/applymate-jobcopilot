@@ -1,5 +1,8 @@
 ﻿/**
- * EU employer registries for Greenhouse and Lever ATS sources.
+ * EU employer registries for ATS sources.
+ *
+ * Count summary (Issue #212): Greenhouse 45, Lever 45, Personio 35,
+ * SmartRecruiters 25, Workday 33 active entries.
  *
  * Loads YAML files containing curated, verified employer slugs.
  * Each entry maps to a real company with >= 1 active job posting.
