@@ -1,6 +1,7 @@
 import type { Page } from "playwright-core";
 import type { ApplyTask } from "../harness/agent-harness.js";
 import type { HarnessResult } from "../harness/agent-harness.js";
+import { humanType, uploadResume, type FlowLogEntry } from "./helpers.js";
 
 const SELECTORS = {
   // Step 1 — Personal info
@@ -36,8 +37,7 @@ export async function runWorkdayFlow(page: Page, task: ApplyTask): Promise<Harne
 
     // Step 2: My Experience — resume upload
     if (task.resumePath && !task.resumePath.startsWith("db:")) {
-      await uploadFile(page, SELECTORS.resumeUpload, task.resumePath);
-      log.push({ step: 2, action: "resume uploaded" });
+      await uploadResume(page, SELECTORS.resumeUpload, task.resumePath, log as FlowLogEntry[]);
     }
     await clickNext(page, SELECTORS.nextBtn);
     step = 3;
@@ -84,19 +84,9 @@ async function fillField(page: Page, selectors: string[], value: string): Promis
   for (const sel of selectors) {
     const el = page.locator(sel).first();
     if (await el.isVisible().catch(() => false)) {
-      await el.fill("");
-      for (const ch of value) await page.keyboard.type(ch, { delay: 40 + Math.random() * 60 });
+      await humanType(page, sel, value);
       return;
     }
-  }
-}
-
-async function uploadFile(page: Page, selectors: string[], path: string): Promise<void> {
-  for (const sel of selectors) {
-    try {
-      await page.setInputFiles(sel, path);
-      return;
-    } catch { continue; }
   }
 }
 
