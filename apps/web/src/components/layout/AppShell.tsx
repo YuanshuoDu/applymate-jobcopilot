@@ -15,6 +15,7 @@ import { SearchPage }         from '@/components/pages/SearchPage'
 import { ResumePage }         from '@/components/pages/ResumePage'
 import { GmailPage }          from '@/components/pages/GmailPage'
 import { AgentPlaygroundPage } from '@/components/pages/AgentPlaygroundPage'
+import { AgentHistoryPage }   from '@/components/pages/AgentHistoryPage'
 import { ExtensionPage }      from '@/components/pages/ExtensionPage'
 import { SettingsPage }       from '@/components/pages/SettingsPage'
 import { ApplyHistoryPage }  from '@/components/pages/ApplyHistoryPage'
@@ -53,6 +54,7 @@ const PAGES: Record<Page, React.ComponentType> = {
   resume:    ResumePage,
   gmail:     GmailPage,
   agent:     AgentPlaygroundPage,
+  'agent-history': AgentHistoryPage,
   extension: ExtensionPage,
   settings:  SettingsPage,
   'apply-history': ApplyHistoryPage,
