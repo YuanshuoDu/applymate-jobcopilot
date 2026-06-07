@@ -8,7 +8,7 @@
     "typecheck": "turbo typecheck",
     "test": "turbo test",
     "test:e2e": "playwright test",
-    "test:all": "turbo test && (playwright test || true)",
+    "test:all": "pnpm --filter web exec prisma generate && turbo test && (playwright test || true)",
     "build:all": "turbo build",
     "typecheck:all": "turbo typecheck && pnpm --filter @jobcopilot/worker exec tsc --noEmit --skipLibCheck && pnpm --filter @jobcopilot/shared exec tsc --noEmit --skipLibCheck"
   },
