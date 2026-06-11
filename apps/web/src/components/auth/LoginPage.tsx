@@ -353,7 +353,7 @@ export function LoginPage() {
             <div style={{ fontSize: 11, color: C.muted, lineHeight: 1.6 }}>
               <span style={{ fontWeight: 600, color: C.primary }}>Demo：</span>
               {' '}使用 <code style={{ background: 'rgba(79,70,229,0.08)', padding: '1px 5px', borderRadius: 4, fontFamily: 'monospace' }}>demo@applymate.ai</code>
-              {' '}+ 任意密码体验完整功能。
+              {' '}+ 密码 <code style={{ background: 'rgba(79,70,229,0.08)', padding: '1px 5px', borderRadius: 4, fontFamily: 'monospace' }}>demo1234</code> 体验完整功能。
             </div>
           </div>
         </div>

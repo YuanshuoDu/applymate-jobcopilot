@@ -60,7 +60,7 @@ describe("notifications API", () => {
         createdAt: new Date("2026-06-04T09:00:00Z"),
       },
     ];
-    mocks.queryRaw.mockResolvedValueOnce(rows);
+    mocks.queryRaw.mockResolvedValueOnce([{ exists: true }]).mockResolvedValueOnce(rows);
     const { GET } = await import("@/app/api/notifications/route");
 
     const res = await GET(getRequest() as never);
@@ -76,6 +76,7 @@ describe("notifications API", () => {
   });
 
   it("marks a specific notification as read", async () => {
+    mocks.queryRaw.mockResolvedValueOnce([{ exists: true }]);
     mocks.executeRaw.mockResolvedValueOnce(1);
     const { PATCH } = await import("@/app/api/notifications/mark-read/route");
 
@@ -87,6 +88,7 @@ describe("notifications API", () => {
   });
 
   it("marks all notifications as read when no id is provided", async () => {
+    mocks.queryRaw.mockResolvedValueOnce([{ exists: true }]);
     mocks.executeRaw.mockResolvedValueOnce(3);
     const { PATCH } = await import("@/app/api/notifications/mark-read/route");
 
@@ -95,6 +97,27 @@ describe("notifications API", () => {
     expect(res.status).toBe(200);
     await expect(res.json()).resolves.toEqual({ ok: true });
     expect(mocks.executeRaw).toHaveBeenCalledOnce();
+  });
+
+  it("returns an empty list when the notifications table is not migrated yet", async () => {
+    mocks.queryRaw.mockResolvedValueOnce([{ exists: false }]);
+    const { GET } = await import("@/app/api/notifications/route");
+
+    const res = await GET(getRequest() as never);
+
+    expect(res.status).toBe(200);
+    await expect(res.json()).resolves.toEqual({ notifications: [], unreadCount: 0 });
+  });
+
+  it("marks notifications as read successfully when the table is not migrated yet", async () => {
+    mocks.queryRaw.mockResolvedValueOnce([{ exists: false }]);
+    const { PATCH } = await import("@/app/api/notifications/mark-read/route");
+
+    const res = await PATCH(patchRequest({ id: "notif-1" }) as never);
+
+    expect(res.status).toBe(200);
+    await expect(res.json()).resolves.toEqual({ ok: true });
+    expect(mocks.executeRaw).not.toHaveBeenCalled();
   });
 
   it("returns auth errors without querying", async () => {
