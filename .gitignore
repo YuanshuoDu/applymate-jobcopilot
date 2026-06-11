@@ -1,11 +1,13 @@
 # Dependencies
 node_modules/
 .pnpm-store/
+package-lock.json
 
 # Build output
 .next/
 dist/
 out/
+*.tsbuildinfo
 
 # Environment
 .env
