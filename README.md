@@ -14,6 +14,10 @@
 
 ApplyMate AI is a **Chrome Extension + Web Dashboard** combo that acts as your personal job application assistant. It discovers relevant jobs, tailors your CV and cover letter for each role, and — with your approval — auto-fills application forms. Think of it as a shopping cart for job applications: browse JDs → one-click save → AI optimises → you review → auto-submit.
 
+Production: [applymate.dev](https://applymate.dev)
+
+Repository: [github.com/YuanshuoDu/applymate-jobcopilot](https://github.com/YuanshuoDu/applymate-jobcopilot)
+
 ### Key Principles
 - **Human-in-the-loop**: AI handles preparation; you make every application decision.
 - **Europe-first**: GDPR-compliant, deep ATS support (Workday EMEA, Personio, SmartRecruiters), multi-language cover letters (EN/DE/FR/NL/ES).
@@ -107,15 +111,31 @@ jobcopilot/
 │       │   ├── sidebar/      # React sidebar app
 │       │   └── background/   # Service worker (JWT bridge, message routing)
 │       └── vite.config.ts
+│   └── worker/               # BullMQ worker + ATS auto-apply flows
+│       └── src/
+│           ├── flows/        # Workday, Greenhouse, Lever, SmartRecruiters, Personio
+│           └── integration/  # Pipeline and harness tests
 ├── packages/
 │   ├── shared/               # Types, Zod schemas, utilities
 │   ├── ui/                   # Shared React components
 │   ├── ai-prompts/           # Versioned prompt templates
 │   └── eslint-config/
+├── docs/                     # API reference, runbooks, architecture docs
 ├── e2e/                      # Playwright end-to-end tests
 ├── turbo.json
 └── pnpm-workspace.yaml
 ```
+
+---
+
+## Documentation
+
+- [API Reference](docs/api-reference.md) — route-by-route request, response, auth, and curl examples.
+- [Auto-Apply Runbook](docs/runbook.md) — production incident response for queues, workers, CAPTCHA, and rate limits.
+- [Scraping & Auto-Apply Design](docs/scraping-autoapply-design.md) — architecture and flow design notes.
+- [Scraping & Auto-Apply Developer Guide](docs/scraping-autoapply-dev-guide.md) — implementation guidance for worker and ATS flows.
+- [GitHub Collaboration](docs/github-collaboration.md) — issue, PR, review, and CI workflow.
+- [Docs Index](docs/README.md) — quick map of maintained documentation.
 
 ---
 
@@ -131,8 +151,8 @@ jobcopilot/
 ### 1. Clone & install
 
 ```bash
-git clone https://github.com/your-org/applymate-ai.git
-cd applymate-ai/jobcopilot
+git clone https://github.com/YuanshuoDu/applymate-jobcopilot.git
+cd applymate-jobcopilot
 pnpm install
 ```
 
@@ -229,11 +249,26 @@ For the Chrome Extension, submit the output of `pnpm --filter extension build` t
 
 ---
 
+## Validation
+
+Use these root-level commands before merging changes:
+
+```bash
+pnpm lint
+pnpm typecheck
+pnpm test
+pnpm build
+```
+
+For worker or E2E-heavy changes, also run the targeted commands documented in the relevant PR or issue.
+
+---
+
 ## Roadmap
 
 - [ ] LinkedIn / Indeed direct API key configuration page
-- [ ] Agent run history browser (per-day pipeline results)
-- [ ] Resume tailoring wizard (AI Adapt — per-job CV customisation)
+- [x] Agent run history browser (per-day pipeline results)
+- [x] Resume tailoring wizard (AI Adapt — per-job CV customisation)
 - [ ] Extension + Executor bidirectional apply (auto form-fill triggered by pipeline)
 - [ ] Screenshot OCR for non-parseable JDs
 - [ ] AI Auto-Pilot `full` mode (end-to-end autonomous application)
