@@ -51,7 +51,7 @@ function SettingsSection({ title, children }: { title: string; children: React.R
 
 function FieldRow({ label, children }: { label: string; children: React.ReactNode }) {
   return (
-    <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12, padding: '10px 0', borderBottom: '1px solid var(--border)', flexWrap: 'wrap' }}>
+    <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12, padding: '8px 0', borderBottom: '1px solid var(--border)', flexWrap: 'wrap' }}>
       <span style={{ fontSize: 12, color: 'var(--text-muted)', flexShrink: 0, minWidth: 130 }}>{label}</span>
       <div style={{ display: 'flex', justifyContent: 'flex-end', flex: 1, minWidth: 0 }}>{children}</div>
     </div>
@@ -255,99 +255,87 @@ export function SettingsPage() {
           {/* ── Profile ── */}
           {activeTab === 'profile' && (
             <>
-              <SettingsSection title={t('settings.personalInfo')}>
-                {userLoading ? (
-                  <div style={{ fontSize: 12, color: 'var(--text-muted)', padding: '12px 0' }}>Loading…</div>
-                ) : (
-                  <>
-                    {/* Avatar */}
-                    <div style={{ display: 'flex', alignItems: 'center', gap: 16, marginBottom: 16, paddingBottom: 16, borderBottom: '0.5px solid var(--border)' }}>
-                      <UserAvatar src={user?.image} name={user?.name} email={user?.email} size={60} />
-                      <div>
-                        <Btn small variant="ghost" onClick={() => toast.info('Upload photo')}>Upload photo</Btn>
-                        <div style={{ fontSize: 10, color: 'var(--text-muted)', marginTop: 4 }}>JPG, PNG up to 2MB</div>
+              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(420px, 1fr))', gap: 16, alignItems: 'start' }}>
+                <SettingsSection title={t('settings.personalInfo')}>
+                  {userLoading ? (
+                    <div style={{ fontSize: 12, color: 'var(--text-muted)', padding: '12px 0' }}>Loading...</div>
+                  ) : (
+                    <>
+                      <div style={{ display: 'flex', alignItems: 'center', gap: 16, marginBottom: 12, paddingBottom: 12, borderBottom: '0.5px solid var(--border)' }}>
+                        <UserAvatar src={user?.image} name={user?.name} email={user?.email} size={56} />
+                        <div>
+                          <Btn small variant="ghost" onClick={() => toast.info('Upload photo')}>Upload photo</Btn>
+                          <div style={{ fontSize: 10, color: 'var(--text-muted)', marginTop: 4 }}>JPG, PNG up to 2MB</div>
+                        </div>
                       </div>
-                    </div>
 
-                    {/* Editable fields */}
-                    <FieldRow label="Full name">
-                      <Input value={name} onChange={e => setName(e.target.value)} placeholder="Your name" />
-                    </FieldRow>
-                    <FieldRow label="Email">
-                      <Input value={user?.email ?? ''} readOnly placeholder="email@example.com" />
-                    </FieldRow>
-                    <FieldRow label="Phone">
-                      <Input type="tel" value={phone} onChange={e => setPhone(e.target.value)} placeholder="+1 555 000 0000" />
-                    </FieldRow>
-                    <FieldRow label="Location">
-                      <Input value={location} onChange={e => setLocation(e.target.value)} placeholder="City, Country" />
-                    </FieldRow>
-                    <FieldRow label="LinkedIn">
-                      <Input value={linkedin} onChange={e => setLinkedin(e.target.value)} placeholder="linkedin.com/in/you" />
-                    </FieldRow>
-                    <FieldRow label="GitHub">
-                      <Input value={github} onChange={e => setGithub(e.target.value)} placeholder="github.com/you" />
-                    </FieldRow>
-                  </>
-                )}
-              </SettingsSection>
+                      <FieldRow label="Full name"><Input value={name} onChange={e => setName(e.target.value)} placeholder="Your name" /></FieldRow>
+                      <FieldRow label="Email"><Input value={user?.email ?? ''} readOnly placeholder="email@example.com" /></FieldRow>
+                      <FieldRow label="Phone"><Input type="tel" value={phone} onChange={e => setPhone(e.target.value)} placeholder="+1 555 000 0000" /></FieldRow>
+                      <FieldRow label="Location"><Input value={location} onChange={e => setLocation(e.target.value)} placeholder="City, Country" /></FieldRow>
+                      <FieldRow label="LinkedIn"><Input value={linkedin} onChange={e => setLinkedin(e.target.value)} placeholder="linkedin.com/in/you" /></FieldRow>
+                      <FieldRow label="GitHub"><Input value={github} onChange={e => setGithub(e.target.value)} placeholder="github.com/you" /></FieldRow>
+                    </>
+                  )}
+                </SettingsSection>
 
-              <SettingsSection title={t('settings.jobPrefs')}>
-                <FieldRow label="Target roles">    <Input value={prefRoles}     onChange={e => setPrefRoles(e.target.value)}     placeholder="Backend Engineer, SWE" /></FieldRow>
-                <FieldRow label="Target locations"><Input value={prefLocations} onChange={e => setPrefLocations(e.target.value)} placeholder="Amsterdam, Berlin, Remote" /></FieldRow>
-                <FieldRow label="Salary expectation"><Input value={prefSalary}   onChange={e => setPrefSalary(e.target.value)}    placeholder="€65,000 – €90,000" /></FieldRow>
-                <FieldRow label="Work authorisation">
-                  <select value={prefVisa} onChange={e => setPrefVisa(e.target.value)} style={{ padding: '6px 10px', fontSize: 12, border: '0.5px solid var(--border)', borderRadius: 6, background: 'var(--bg)', color: 'var(--text)', outline: 'none' }}>
-                    <option>EU citizen / no visa required</option>
-                    <option>Requires sponsorship</option>
-                    <option>Open work permit</option>
-                  </select>
-                </FieldRow>
-                <FieldRow label="Open to relocation"><Toggle value={prefRelocate} onChange={setPrefRelocate} /></FieldRow>
-              </SettingsSection>
+                <SettingsSection title={t('settings.jobPrefs')}>
+                  <FieldRow label="Target roles">    <Input value={prefRoles}     onChange={e => setPrefRoles(e.target.value)}     placeholder="Backend Engineer, SWE" /></FieldRow>
+                  <FieldRow label="Target locations"><Input value={prefLocations} onChange={e => setPrefLocations(e.target.value)} placeholder="Amsterdam, Berlin, Remote" /></FieldRow>
+                  <FieldRow label="Salary expectation"><Input value={prefSalary}   onChange={e => setPrefSalary(e.target.value)}    placeholder="EUR65,000 - EUR90,000" /></FieldRow>
+                  <FieldRow label="Work authorisation">
+                    <select value={prefVisa} onChange={e => setPrefVisa(e.target.value)} style={{ padding: '6px 10px', fontSize: 12, border: '0.5px solid var(--border)', borderRadius: 6, background: 'var(--bg)', color: 'var(--text)', outline: 'none', maxWidth: 260, width: '100%' }}>
+                      <option>EU citizen / no visa required</option>
+                      <option>Requires sponsorship</option>
+                      <option>Open work permit</option>
+                    </select>
+                  </FieldRow>
+                  <FieldRow label="Open to relocation"><Toggle value={prefRelocate} onChange={setPrefRelocate} /></FieldRow>
+                </SettingsSection>
 
-              <SettingsSection title={t('settings.password')}>
-                <FieldRow label="Current password">
-                  <Input type="password" value={passwordCur}  onChange={e => setPasswordCur(e.target.value)}  placeholder="••••••••" />
-                </FieldRow>
-                <FieldRow label="New password">
-                  <Input type="password" value={passwordNew}  onChange={e => setPasswordNew(e.target.value)}  placeholder="••••••••" />
-                </FieldRow>
-                <FieldRow label="Confirm password">
-                  <Input type="password" value={passwordConf} onChange={e => setPasswordConf(e.target.value)} placeholder="••••••••" />
-                </FieldRow>
-                <div style={{ marginTop: 12 }}>
-                  <Btn variant="ghost" disabled={pwSaving} onClick={async () => {
-                    if (!passwordCur || !passwordNew) { toast.info('Enter current and new password'); return }
-                    if (passwordNew !== passwordConf) { toast.error('Mismatch', 'New password and confirmation do not match'); return }
-                    if (passwordNew.length < 8) { toast.error('Too short', 'Password must be at least 8 characters'); return }
-                    setPwSaving(true)
-                    const { error } = await apiMutate('/api/me/password', 'PATCH', { currentPassword: passwordCur, newPassword: passwordNew })
-                    setPwSaving(false)
-                    if (error) { toast.error('Password change failed', error) }
-                    else {
-                      toast.success('Password updated')
-                      setPasswordCur(''); setPasswordNew(''); setPasswordConf('')
+                <SettingsSection title={t('settings.password')}>
+                  <FieldRow label="Current password">
+                    <Input type="password" value={passwordCur}  onChange={e => setPasswordCur(e.target.value)}  placeholder="Password" />
+                  </FieldRow>
+                  <FieldRow label="New password">
+                    <Input type="password" value={passwordNew}  onChange={e => setPasswordNew(e.target.value)}  placeholder="At least 8 characters" />
+                  </FieldRow>
+                  <FieldRow label="Confirm password">
+                    <Input type="password" value={passwordConf} onChange={e => setPasswordConf(e.target.value)} placeholder="Repeat new password" />
+                  </FieldRow>
+                  <div style={{ marginTop: 12, display: 'flex', justifyContent: 'flex-end' }}>
+                    <Btn variant="ghost" disabled={pwSaving} onClick={async () => {
+                      if (!passwordCur || !passwordNew) { toast.info('Enter current and new password'); return }
+                      if (passwordNew !== passwordConf) { toast.error('Mismatch', 'New password and confirmation do not match'); return }
+                      if (passwordNew.length < 8) { toast.error('Too short', 'Password must be at least 8 characters'); return }
+                      setPwSaving(true)
+                      const { error } = await apiMutate('/api/me/password', 'PATCH', { currentPassword: passwordCur, newPassword: passwordNew })
+                      setPwSaving(false)
+                      if (error) { toast.error('Password change failed', error) }
+                      else {
+                        toast.success('Password updated')
+                        setPasswordCur(''); setPasswordNew(''); setPasswordConf('')
+                      }
+                    }}>{pwSaving ? 'Updating...' : 'Update password'}</Btn>
+                  </div>
+                </SettingsSection>
+
+                <SettingsSection title={t('settings.wizard')}>
+                  <div style={{ fontSize: 12, color: 'var(--text-muted)', margin: '10px 0 14px', lineHeight: 1.7 }}>
+                    Re-run onboarding to update goals, profile, job directions, and resume preferences.
+                  </div>
+                  <Btn variant="ghost" onClick={async () => {
+                    const { error } = await apiMutate('/api/me/onboarding', 'PATCH', { reset: true })
+                    if (!error) {
+                      toast.success('Onboarding reset', 'Reload the page to restart the setup wizard')
+                    } else {
+                      toast.error('Failed', error)
                     }
-                  }}>{pwSaving ? 'Updating…' : 'Update password'}</Btn>
-                </div>
-              </SettingsSection>
-
-              <SettingsSection title={t('settings.wizard')}>
-                <div style={{ fontSize: 12, color: 'var(--text-muted)', marginBottom: 12 }}>
-                  Re-run the onboarding setup wizard to update your goals, profile, job directions, and resume preferences.
-                </div>
-                <Btn variant="ghost" onClick={async () => {
-                  const { error } = await apiMutate('/api/me/onboarding', 'PATCH', { reset: true })
-                  if (!error) {
-                    toast.success('Onboarding reset', 'Reload the page to restart the setup wizard')
-                  } else {
-                    toast.error('Failed', error)
-                  }
-                }}>
-                  ↺ Restart Setup Wizard
-                </Btn>
-              </SettingsSection>
+                  }}>
+                    Restart Setup Wizard
+                  </Btn>
+                </SettingsSection>
+              </div>
             </>
           )}
 
@@ -769,6 +757,7 @@ function AiModelSettings() {
   const [saving,    setSaving   ] = useState(false)
   const [loaded,    setLoaded   ] = useState(false)
   const [keyTests,  setKeyTests ] = useState<Partial<Record<Provider, TestStatus>>>({})
+  const [allTesting, setAllTesting] = useState(false)
 
   useEffect(() => {
     fetch('/api/me/ai-config').then(r => r.json()).then((data: UserAiSettings) => {
@@ -783,7 +772,6 @@ function AiModelSettings() {
 
   async function testKey(p: Provider) {
     const key = draftKeys[p] || settings.keys?.[p] || ''
-    if (!key || key.startsWith('••••')) { toast.info(t('settings.ai.fillKey')); return }
 
     setKeyTests(prev => ({ ...prev, [p]: 'testing' }))
     const model = MODEL_CATALOGUE.find(m => m.provider === p)
@@ -791,13 +779,25 @@ function AiModelSettings() {
       const res = await fetch('/api/me/ai-test', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ provider: p, model: model?.model, apiKey: key }),
+        body: JSON.stringify({
+          provider: p,
+          model: model?.model,
+          apiKey: key && !key.startsWith('••••') ? key : undefined,
+        }),
       })
       const data = await res.json()
       setKeyTests(prev => ({ ...prev, [p]: data.ok ? 'ok' : { error: data.error ?? t('settings.ai.connFail') } }))
     } catch {
       setKeyTests(prev => ({ ...prev, [p]: { error: t('settings.ai.netErr') } }))
     }
+  }
+
+  async function testAllProviders() {
+    setAllTesting(true)
+    for (const p of PROVIDERS_WITH_MODELS.filter(p => p !== 'custom')) {
+      await testKey(p)
+    }
+    setAllTesting(false)
   }
 
   async function save() {
@@ -861,8 +861,17 @@ function AiModelSettings() {
 
       {/* ── 提供商 API Key ── */}
       <SettingsSection title={t('settings.ai.keysTitle')}>
-        <div style={{ fontSize: 11, color: 'var(--text-muted)', marginBottom: 14, lineHeight: 1.6 }}>
-          {t('settings.ai.keysDesc')}
+        <div style={{ display: 'flex', alignItems: 'flex-start', gap: 12, justifyContent: 'space-between', marginBottom: 14 }}>
+          <div style={{ fontSize: 11, color: 'var(--text-muted)', lineHeight: 1.6 }}>
+            {t('settings.ai.keysDesc')}
+          </div>
+          <button
+            type="button"
+            onClick={testAllProviders}
+            disabled={allTesting}
+            style={{ padding: '6px 12px', fontSize: 11, borderRadius: 7, border: '0.5px solid var(--border)', background: 'var(--bg-secondary)', color: 'var(--text)', cursor: allTesting ? 'default' : 'pointer', whiteSpace: 'nowrap', opacity: allTesting ? 0.65 : 1 }}>
+            {allTesting ? 'Testing...' : 'Test all'}
+          </button>
         </div>
         <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
           {PROVIDERS_WITH_MODELS.filter(p => p !== 'custom').map(p => {
@@ -904,8 +913,8 @@ function AiModelSettings() {
                   />
                   <button
                     onClick={() => testKey(p)}
-                    disabled={status === 'testing' || (!display || display.startsWith('••••'))}
-                    style={{ padding: '0 14px', fontSize: 11, borderRadius: 7, border: '0.5px solid var(--border)', background: 'var(--bg-secondary)', color: 'var(--text)', cursor: 'pointer', whiteSpace: 'nowrap', opacity: (!display || display.startsWith('••••')) ? 0.4 : 1 }}>
+                    disabled={status === 'testing'}
+                    style={{ padding: '0 14px', fontSize: 11, borderRadius: 7, border: '0.5px solid var(--border)', background: 'var(--bg-secondary)', color: 'var(--text)', cursor: status === 'testing' ? 'default' : 'pointer', whiteSpace: 'nowrap', opacity: status === 'testing' ? 0.65 : 1 }}>
                     {t('settings.ai.testBtn')}
                   </button>
                 </div>

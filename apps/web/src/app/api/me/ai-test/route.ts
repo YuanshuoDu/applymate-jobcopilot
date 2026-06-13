@@ -6,7 +6,8 @@
  */
 import { NextRequest }             from 'next/server'
 import { requireAuth, isErrorResponse } from '@/lib/api-helpers'
-import { modelChat, resolveConfig, type AiConfig } from '@/lib/model-router'
+import { db } from '@/lib/db'
+import { modelChat, resolveConfig, type AiConfig, type UserAiSettings } from '@/lib/model-router'
 
 export async function POST(req: NextRequest) {
   const auth = await requireAuth(req)
@@ -17,10 +18,19 @@ export async function POST(req: NextRequest) {
     return Response.json({ ok: false, error: 'Missing provider or model' }, { status: 400 })
   }
 
+  const provider = body.provider as AiConfig['provider']
+  let savedKey: string | undefined
+  if (!body.apiKey) {
+    const user = await db.user.findUnique({ where: { id: auth.userId }, select: { preferences: true } })
+    const prefs = (user?.preferences ?? {}) as Record<string, unknown>
+    const settings = (prefs.aiSettings ?? {}) as UserAiSettings
+    savedKey = settings.keys?.[provider]
+  }
+
   const cfg: AiConfig = {
     provider: body.provider,
     model:    body.model,
-    apiKey:   body.apiKey  ?? undefined,
+    apiKey:   body.apiKey  ?? savedKey ?? undefined,
     apiBase:  body.apiBase ?? undefined,
   }
 
@@ -36,7 +46,7 @@ export async function POST(req: NextRequest) {
       cfg,
       10,
     )
-    return Response.json({ ok: true })
+    return Response.json({ ok: true, provider: cfg.provider, model: cfg.model })
   } catch (e) {
     return Response.json({ ok: false, error: (e as Error).message.slice(0, 300) })
   }

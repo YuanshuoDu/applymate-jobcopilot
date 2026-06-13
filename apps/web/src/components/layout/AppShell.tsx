@@ -18,7 +18,6 @@ import { AgentPlaygroundPage } from '@/components/pages/AgentPlaygroundPage'
 import { AgentHistoryPage }   from '@/components/pages/AgentHistoryPage'
 import { ExtensionPage }      from '@/components/pages/ExtensionPage'
 import { SettingsPage }       from '@/components/pages/SettingsPage'
-import { ApplyHistoryPage }  from '@/components/pages/ApplyHistoryPage'
 import { ObservabilityPage } from '@/components/pages/ObservabilityPage'
 
 interface NotificationItem {
@@ -57,8 +56,11 @@ const PAGES: Record<Page, React.ComponentType> = {
   'agent-history': AgentHistoryPage,
   extension: ExtensionPage,
   settings:  SettingsPage,
-  'apply-history': ApplyHistoryPage,
   observability: ObservabilityPage,
+}
+
+export function getNotificationTargetPage(type: string): Page | null {
+  return type.startsWith('apply_') ? 'jobs' : null
 }
 
 function getInitialPage(): Page {
@@ -236,7 +238,8 @@ export function AppShell() {
   async function openNotification(n: NotificationItem) {
     await markNotificationRead(n.id)
     setNotificationsOpen(false)
-    if (n.type.startsWith('apply_')) setPage('apply-history')
+    const target = getNotificationTargetPage(n.type)
+    if (target) setPage(target)
   }
 
   useEffect(() => {
@@ -304,7 +307,7 @@ export function AppShell() {
                 <Sidebar active={page} onNav={setPage} session={session} jobCount={jobCount} />
               </div>
               <div id="main-content" style={{ flex: 1, display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
-                <div style={{ position: 'fixed', top: 8, right: 20, zIndex: 80 }}>
+                <div style={{ position: 'fixed', top: 10, right: 20, zIndex: 80 }}>
                   <button
                     type="button"
                     aria-label="Notifications"
@@ -312,11 +315,11 @@ export function AppShell() {
                     style={{
                       width: 36, height: 36, borderRadius: 8,
                       border: '1px solid var(--border-glass)',
-                      background: 'var(--glass-bg)',
+                      background: 'var(--surface-raised)',
                       color: 'var(--text)',
                       display: 'flex', alignItems: 'center', justifyContent: 'center',
                       cursor: 'pointer',
-                      boxShadow: '0 4px 18px rgba(15,23,42,0.10)',
+                      boxShadow: '0 6px 20px rgba(15,23,42,0.12)',
                       position: 'relative',
                     }}
                   >

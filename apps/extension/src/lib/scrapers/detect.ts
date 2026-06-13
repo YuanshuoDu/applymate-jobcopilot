@@ -13,10 +13,7 @@ export function detectAndScrape(): ScrapedJob | null {
   let job: ScrapedJob | null = null
 
   if (host.includes('linkedin.com'))          job = scrapeLinkedIn()
-  else if (host.includes('indeed.com') ||
-           host.includes('indeed.de') ||
-           host.includes('indeed.co.uk') ||
-           host.includes('indeed.fr'))        job = scrapeIndeed()
+  else if (/(^|\.)indeed\./i.test(host))     job = scrapeIndeed()
   else if (host.includes('glassdoor.com'))    job = scrapeGlassdoor()
   else if (host.includes('stepstone'))        job = scrapeStepstone()
   else if (host.includes('xing.com'))         job = scrapeXing()
@@ -50,7 +47,7 @@ export function detectAndScrape(): ScrapedJob | null {
 
 function detectSourceFromHost(host: string): ScrapedJob['source'] {
   if (host.includes('linkedin.com'))      return 'linkedin'
-  if (host.includes('indeed'))            return 'indeed'
+  if (/(^|\.)indeed\./i.test(host))       return 'indeed'
   if (host.includes('glassdoor.com'))     return 'glassdoor'
   if (host.includes('stepstone'))         return 'stepstone'
   if (host.includes('xing.com'))          return 'xing'

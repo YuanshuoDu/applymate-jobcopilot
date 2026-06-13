@@ -2,17 +2,17 @@
  * ApplyMate AI — Content Script
  * Two modes:
  *  • List page  → per-card ⊕ button + hover popup
- *  • Detail page → fixed bottom-right save + sidebar buttons
+ *  • Detail page → inline Save to ApplyMate near the job action buttons
  */
 import { detectAndScrape } from '@/lib/scrapers/detect'
 import { startListModeInjector, isJobListPage } from './list-injector'
 import { tryInjectAutoFillButton, removeAutoFillButton, applyFieldValues, updateButtonState } from './form-injector'
+import { mountDetailButtonContainer } from './detail-button-placement'
 import { detectAndScanForms } from '../lib/form-filler/detectors/detect'
 import { generateId } from '../lib/form-filler/form-scanner'
 import type { ScrapedJob } from '@/lib/types'
 
 const BUTTON_ID   = 'applymate-save-btn'
-const SIDEBAR_BTN = 'applymate-sidebar-btn'
 const TOAST_ID    = 'applymate-toast'
 
 const DEBUG = true
@@ -92,7 +92,7 @@ async function init() {
   }
 }
 
-// LinkedIn SPA: inject the top-right detail button when a job panel is open
+// LinkedIn SPA: inject the detail save button when a job panel is open
 // within a search-results page (URL contains currentJobId).
 function tryInjectPanelDetail() {
   if (!location.search.includes('currentJobId')) return
@@ -322,7 +322,7 @@ chrome.storage.onChanged.addListener((changes, area) => {
     const saveBtn = document.getElementById(BUTTON_ID)
     if (saveBtn) {
       saveBtn.innerHTML = `<span style="font-size:13px">⊕</span><span>Save to ApplyMate</span>`
-      ;(saveBtn as HTMLButtonElement).style.background = '#185FA5'
+      ;(saveBtn as HTMLButtonElement).style.background = '#4F46E5'
       ;(saveBtn as HTMLButtonElement).style.opacity = '1'
     }
     pushLogoutToDashboard()
@@ -337,7 +337,56 @@ chrome.storage.onChanged.addListener((changes, area) => {
   }
 })
 
-// ── Detail mode: top-right floating action group ──────────────────────────────
+// ── Detail mode: inline action near the job action controls ───────────────────
+
+function applySaveButtonStyle(btn: HTMLButtonElement, mode: 'inline' | 'floating') {
+  Object.assign(btn.style, {
+    display: 'inline-flex',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: '6px',
+    height: mode === 'inline' ? '40px' : undefined,
+    padding: mode === 'inline' ? '0 16px' : '9px 14px 9px 12px',
+    background: '#4F46E5',
+    color: '#fff',
+    border: 'none',
+    borderRadius: mode === 'inline' ? '999px' : '8px 0 0 8px',
+    fontSize: '12px',
+    fontWeight: '600',
+    cursor: 'pointer',
+    boxShadow: mode === 'inline' ? '0 2px 8px rgba(79,70,229,0.22)' : '-2px 2px 12px rgba(79,70,229,0.35)',
+    transition: 'all 0.15s',
+    whiteSpace: 'nowrap',
+    fontFamily: '-apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif',
+    lineHeight: '1',
+  })
+}
+
+function styleDetailContainer(el: HTMLElement, mode: 'inline' | 'floating') {
+  Object.assign(el.style, mode === 'inline'
+    ? {
+        display: 'inline-flex',
+        alignItems: 'center',
+        marginLeft: '8px',
+        verticalAlign: 'middle',
+        fontFamily: '-apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif',
+      }
+    : {
+        position: 'fixed',
+        top: '72px',
+        right: '0px',
+        zIndex: '2147483647',
+        display: 'flex',
+        fontFamily: '-apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif',
+      })
+}
+
+function setSaveButtonIdle(btn: HTMLButtonElement, mode: 'inline' | 'floating') {
+  btn.innerHTML = `<span style="font-size:14px;line-height:1">⊕</span><span>Save to ApplyMate</span>`
+  btn.style.background = '#4F46E5'
+  btn.style.opacity = '1'
+  btn.style.paddingRight = mode === 'inline' ? '16px' : '14px'
+}
 
 // Lazy save button for high-risk platforms (LinkedIn, Indeed):
 // injects UI first, only scrapes on explicit user click — no automatic scraping.
@@ -347,19 +396,11 @@ function injectLazySaveButton() {
   const btn = document.createElement('button')
   btn.id = 'am-lazy-btn'
   btn.innerHTML = `<span style="font-size:14px;line-height:1">⊕</span><span>Save to ApplyMate</span>`
-  Object.assign(btn.style, {
-    position: 'fixed', top: '72px', right: '0px', zIndex: '2147483647',
-    display: 'flex', alignItems: 'center', gap: '6px',
-    padding: '9px 14px 9px 12px',
-    background: '#185FA5', color: '#fff', border: 'none',
-    borderRadius: '8px 0 0 8px',
-    fontSize: '12px', fontWeight: '600',
-    cursor: 'pointer', boxShadow: '-2px 2px 12px rgba(24,95,165,0.35)',
-    transition: 'all 0.15s', whiteSpace: 'nowrap',
-    fontFamily: '-apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif',
-  })
-  btn.addEventListener('mouseenter', () => { btn.style.background = '#1a6dbf'; btn.style.paddingRight = '18px' })
-  btn.addEventListener('mouseleave', () => { btn.style.background = '#185FA5'; btn.style.paddingRight = '14px' })
+  const mode = mountDetailButtonContainer(btn)
+  styleDetailContainer(btn, mode)
+  applySaveButtonStyle(btn, mode)
+  btn.addEventListener('mouseenter', () => { btn.style.background = '#4338CA'; btn.style.paddingRight = mode === 'inline' ? '18px' : '18px' })
+  btn.addEventListener('mouseleave', () => { btn.style.background = '#4F46E5'; btn.style.paddingRight = mode === 'inline' ? '16px' : '14px' })
 
   btn.addEventListener('click', async (e) => {
     e.preventDefault(); e.stopPropagation()
@@ -372,7 +413,7 @@ function injectLazySaveButton() {
     if (!currentJob) {
       btn.innerHTML = '✗ No job found'
       btn.style.background = '#A32D2D'
-      setTimeout(() => { btn.innerHTML = `<span style="font-size:14px;line-height:1">⊕</span><span>Save to ApplyMate</span>`; btn.style.background = '#185FA5' }, 3000)
+      setTimeout(() => setSaveButtonIdle(btn, mode), 3000)
       btn.style.opacity = '1'
       return
     }
@@ -401,52 +442,40 @@ function injectLazySaveButton() {
           btn.style.background = '#A32D2D'
         }
         btn.style.opacity = '1'
-        setTimeout(() => { btn.innerHTML = `<span style="font-size:14px;line-height:1">⊕</span><span>Save to ApplyMate</span>`; btn.style.background = '#185FA5' }, 4000)
+        setTimeout(() => setSaveButtonIdle(btn, mode), 4000)
       }
     } catch (err: unknown) {
       btn.innerHTML = '💥 No connection'
       btn.style.background = '#A32D2D'
       btn.style.opacity = '1'
-      setTimeout(() => { btn.innerHTML = `<span style="font-size:14px;line-height:1">⊕</span><span>Save to ApplyMate</span>`; btn.style.background = '#185FA5' }, 4000)
+      setTimeout(() => setSaveButtonIdle(btn, mode), 4000)
     }
   })
 
-  document.body.appendChild(btn)
-  log('Lazy save button injected (user-triggered scraping)')
+  log('Lazy save button injected (user-triggered scraping)', mode)
 }
 
 function injectDetailButtons() {
   if (document.getElementById(BUTTON_ID)) return
   if (!currentJob) return
 
-  // Container: vertical pill stack anchored to right edge, top area
   const wrap = document.createElement('div')
   wrap.id = BUTTON_ID // use same ID so duplicate-guard works
-  Object.assign(wrap.style, {
-    position: 'fixed', top: '72px', right: '0px', zIndex: '2147483647',
-    display: 'flex', flexDirection: 'column', gap: '2px',
-    fontFamily: '-apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif',
-  })
 
   // ── Save button ──
   const saveBtn = document.createElement('button')
   saveBtn.innerHTML = `<span style="font-size:14px;line-height:1">⊕</span><span>Save to ApplyMate</span>`
-  Object.assign(saveBtn.style, {
-    display: 'flex', alignItems: 'center', gap: '6px',
-    padding: '9px 14px 9px 12px',
-    background: '#185FA5', color: '#fff', border: 'none',
-    borderRadius: '8px 0 0 8px',
-    fontSize: '12px', fontWeight: '600',
-    cursor: 'pointer', boxShadow: '-2px 2px 12px rgba(24,95,165,0.35)',
-    transition: 'all 0.15s', whiteSpace: 'nowrap',
-  })
+  wrap.appendChild(saveBtn)
+  const mode = mountDetailButtonContainer(wrap)
+  styleDetailContainer(wrap, mode)
+  applySaveButtonStyle(saveBtn, mode)
   saveBtn.addEventListener('mouseenter', () => {
-    saveBtn.style.background = '#1a6dbf'
-    saveBtn.style.paddingRight = '18px'
+    saveBtn.style.background = '#4338CA'
+    saveBtn.style.paddingRight = mode === 'inline' ? '18px' : '18px'
   })
   saveBtn.addEventListener('mouseleave', () => {
-    saveBtn.style.background = '#185FA5'
-    saveBtn.style.paddingRight = '14px'
+    saveBtn.style.background = '#4F46E5'
+    saveBtn.style.paddingRight = mode === 'inline' ? '16px' : '14px'
   })
   saveBtn.addEventListener('click', (e) => {
     e.preventDefault(); e.stopPropagation()
@@ -454,39 +483,7 @@ function injectDetailButtons() {
     saveDetailJob(saveBtn, wrap)
   })
 
-  // ── Sidebar button ──
-  const sidebarBtn = document.createElement('button')
-  sidebarBtn.id = SIDEBAR_BTN
-  sidebarBtn.innerHTML = `<span style="font-size:13px;line-height:1">📋</span><span>Track</span>`
-  Object.assign(sidebarBtn.style, {
-    display: 'flex', alignItems: 'center', gap: '5px',
-    padding: '7px 14px 7px 10px',
-    background: '#fff', color: '#185FA5',
-    border: '1.5px solid rgba(24,95,165,0.3)', borderRight: 'none',
-    borderRadius: '8px 0 0 8px',
-    fontSize: '11px', fontWeight: '600',
-    cursor: 'pointer', boxShadow: '-2px 2px 8px rgba(0,0,0,0.08)',
-    transition: 'all 0.15s', whiteSpace: 'nowrap',
-  })
-  sidebarBtn.title = 'Open ApplyMate Tracker'
-  sidebarBtn.addEventListener('mouseenter', () => {
-    sidebarBtn.style.background = '#f0f6ff'
-    sidebarBtn.style.paddingRight = '18px'
-  })
-  sidebarBtn.addEventListener('mouseleave', () => {
-    sidebarBtn.style.background = '#fff'
-    sidebarBtn.style.paddingRight = '14px'
-  })
-  sidebarBtn.addEventListener('click', (e) => {
-    e.preventDefault(); e.stopPropagation()
-    log('Detail Sidebar button clicked')
-    openSidebar()
-  })
-
-  wrap.appendChild(saveBtn)
-  wrap.appendChild(sidebarBtn)
-  document.body.appendChild(wrap)
-  log('Detail buttons injected (top-right)')
+  log('Detail save button injected', mode)
 }
 
 async function saveDetailJob(btn: HTMLButtonElement, wrap: HTMLElement) {
@@ -532,25 +529,7 @@ async function saveDetailJob(btn: HTMLButtonElement, wrap: HTMLElement) {
     showToast('Cannot reach extension. Try reloading at chrome://extensions/ (error: ' + message + ')')
   }
   btn.style.opacity = '1'
-  setTimeout(() => { btn.innerHTML = original; btn.style.background = '#185FA5' }, 4000)
-}
-
-async function openSidebar() {
-  try {
-    const res = await chrome.runtime.sendMessage({ type: 'OPEN_SIDE_PANEL' })
-    log('OPEN_SIDE_PANEL response:', res)
-    if (!res?.ok && res?.error) {
-      showToast('Cannot open sidebar: ' + res.error)
-    }
-  } catch (err: unknown) {
-    log('OPEN_SIDE_PANEL failed:', err)
-    const message = err instanceof Error ? err.message : String(err)
-    if (message.includes('Receiving end does not exist')) {
-      showToast('Extension background not ready. Reload at chrome://extensions/')
-    } else {
-      showToast('Failed to open sidebar: ' + message)
-    }
-  }
+  setTimeout(() => { btn.innerHTML = original; btn.style.background = '#4F46E5' }, 4000)
 }
 
 function showToast(message: string, duration = 4000) {

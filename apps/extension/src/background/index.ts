@@ -122,7 +122,7 @@ async function handleMessage(
 
     case 'JOB_SCRAPED': {
       await setCurrentJob(msg.job)
-      setBadge('1', '#185FA5')
+      setBadge('1', '#4F46E5')
 
       // Auto-enrich: if we previously saved this job from a list page (no description),
       // patch it now that the user has visited the detail page.
@@ -253,8 +253,8 @@ chrome.tabs.onUpdated.addListener(async (tabId, info, tab) => {
 
   const JOB_PATTERNS = [
     /linkedin\.com\/jobs/,
-    /indeed\.com\/(viewjob|jobs)/,
-    /indeed\.com\/\?q=/,
+    /indeed\.[^/]+\/(viewjob|jobs)/,
+    /indeed\.[^/]+\/\?q=/,
     /glassdoor\.com\/(Job|job-listing|Jobs)/,
     /stepstone\.(de|at|ch|be|nl|fr)\//,
     /xing\.com\/jobs\//,

@@ -11,6 +11,10 @@ const HOVER_DELAY = 500   // ms before popup appears (reduced for snappier previ
 const DEBUG = true
 function log(...args: unknown[]) { if (DEBUG) console.log('[ApplyMate:list]', ...args) }
 
+function isIndeedHost(host = window.location.hostname): boolean {
+  return /(^|\.)indeed\./i.test(host)
+}
+
 interface CardJob {
   title:    string
   company:  string
@@ -47,9 +51,9 @@ const SITES: Record<string, SiteConfig> = {
     link:     'a.base-card__full-link',
   },
   'indeed.com': {
-    // slider_item is Indeed's 2024+ card wrapper — use alone to avoid overlap
-    // with the deprecated td.resultContent (both match the same cards today).
-    card: '[data-testid="slider_item"]',
+    // Indeed ships different wrappers by market and experiment bucket.
+    // Keep selectors broad, then de-dupe nested matches in processCards().
+    card: '[data-testid="slider_item"], #mosaic-provider-jobcards > ul > li, div.job_seen_beacon, td.resultContent',
     // These selectors are used by scrapeIndeedCard() directly.
     title:    '',
     company:  '',
@@ -152,6 +156,7 @@ const SITES: Record<string, SiteConfig> = {
 
 function getSiteConfig(): SiteConfig | null {
   const host = window.location.hostname
+  if (isIndeedHost(host)) return SITES['indeed.com']
   for (const [key, cfg] of Object.entries(SITES)) {
     if (host.includes(key)) return cfg
   }
@@ -215,8 +220,12 @@ function scrapeIndeedCard(card: Element): CardJob | null {
 
   // Build canonical URL from data-jk if available (more reliable than link href)
   const jk = el.dataset.jk ||
-    card.querySelector<HTMLElement>('[data-jk]')?.getAttribute('data-jk') || ''
-  const link = card.querySelector<HTMLAnchorElement>('h2.jobTitle a, a[data-jk]')
+    card.querySelector<HTMLElement>('[data-jk]')?.getAttribute('data-jk') ||
+    new URL(card.querySelector<HTMLAnchorElement>('a[href*="jk="]')?.href ?? window.location.href).searchParams.get('jk') ||
+    ''
+  const link = card.querySelector<HTMLAnchorElement>(
+    'a[data-jk], a.jcs-JobTitle, h2.jobTitle a, a[data-testid="job-title"], a[href*="/viewjob"], a[href*="jk="]'
+  )
   const url = link?.href ||
     (jk ? `${window.location.origin}/viewjob?jk=${jk}` : window.location.href)
 
@@ -225,24 +234,37 @@ function scrapeIndeedCard(card: Element): CardJob | null {
   const titleEl =
     card.querySelector<HTMLElement>('h2.jobTitle span[title]') ||
     card.querySelector<HTMLElement>('h2.jobTitle a span[title]') ||
+    card.querySelector<HTMLElement>('a.jcs-JobTitle span[title]') ||
+    card.querySelector<HTMLElement>('a[data-testid="job-title"] span[title]') ||
     card.querySelector<HTMLElement>('[data-testid="jobTitle"] span') ||
+    card.querySelector<HTMLElement>('[data-testid="jobTitle"]') ||
+    card.querySelector<HTMLElement>('[data-testid="job-title"]') ||
     null
   const title =
     titleEl?.getAttribute('title')?.trim() ||
     titleEl?.innerText?.trim() ||
+    link?.getAttribute('aria-label')?.trim() ||
+    link?.innerText?.trim() ||
     card.querySelector<HTMLElement>('h2.jobTitle')?.innerText?.trim() ||
     ''
 
   // Company: data-testid is consistent across Indeed's SPA versions.
   const company =
     card.querySelector<HTMLElement>('[data-testid="company-name"]')?.innerText?.trim() ||
+    card.querySelector<HTMLElement>('[data-testid="companyName"]')?.innerText?.trim() ||
+    card.querySelector<HTMLElement>('[data-testid="company-name"] a')?.innerText?.trim() ||
+    card.querySelector<HTMLElement>('[data-company-name]')?.innerText?.trim() ||
     card.querySelector<HTMLElement>('.companyName')?.innerText?.trim() ||
+    card.querySelector<HTMLElement>('[class*="companyName"]')?.innerText?.trim() ||
     ''
 
   // Location: data-testid is stable.
   const location =
     card.querySelector<HTMLElement>('[data-testid="text-location"]')?.innerText?.trim() ||
+    card.querySelector<HTMLElement>('[data-testid="job-location"]')?.innerText?.trim() ||
+    card.querySelector<HTMLElement>('[data-testid="jobLocation"]')?.innerText?.trim() ||
     card.querySelector<HTMLElement>('.companyLocation')?.innerText?.trim() ||
+    card.querySelector<HTMLElement>('[class*="companyLocation"]')?.innerText?.trim() ||
     ''
 
   // Salary: attribute_snippet contains compensation info when available.
@@ -590,12 +612,13 @@ function scrapeLeverCard(card: Element): CardJob | null {
 function processCards(cfg: SiteConfig) {
   const host = window.location.hostname
   const isLinkedIn    = host.includes('linkedin')
-  const isIndeed      = host.includes('indeed')
+  const isIndeed      = isIndeedHost(host)
   const isGreenhouse  = host.includes('greenhouse.io')
   const isLever       = host.includes('lever.co')
 
   const cards = document.querySelectorAll<Element>(cfg.card)
   cards.forEach(card => {
+    if (isIndeed && card.parentElement?.closest(`[${ATTR}="indeed"]`)) return
 
     if (isLinkedIn) {
       // LinkedIn 2026: use data-entity-urn as stable unique identifier.
@@ -653,6 +676,7 @@ function processCards(cfg: SiteConfig) {
     }
 
     log('Processing card:', job.title, '@', job.company)
+    if (isIndeed) (card as HTMLElement).setAttribute(ATTR, 'indeed')
     injectCardButton(card, job)
     attachHoverPopup(card, job)
   })
@@ -719,10 +743,10 @@ export function isJobListPage(): boolean {
       ))
     )
   }
-  if (host.includes('indeed.com')) {
+  if (isIndeedHost(host)) {
     return (
       path.startsWith('/jobs') ||
-      !!document.querySelector('.jobsearch-ResultsList, #mosaic-jobResults, [data-testid="slider_item"], td.resultContent')
+      !!document.querySelector('.jobsearch-ResultsList, #mosaic-jobResults, #mosaic-provider-jobcards, [data-testid="slider_item"], div.job_seen_beacon, td.resultContent')
     )
   }
   if (host.includes('glassdoor.com')) {

@@ -143,7 +143,7 @@ export function App() {
 function LoadingScreen() {
   return (
     <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', height: 240, gap: 10 }}>
-      <div style={{ width: 22, height: 22, border: `2.5px solid rgba(24,95,165,0.15)`, borderTopColor: C.primary, borderRadius: '50%', animation: 'am-spin 0.7s linear infinite' }} />
+      <div style={{ width: 22, height: 22, border: `2.5px solid rgba(79,70,229,0.15)`, borderTopColor: C.primary, borderRadius: '50%', animation: 'am-spin 0.7s linear infinite' }} />
       <span style={{ color: C.subtle, fontSize: 11 }}>Loading…</span>
     </div>
   )
@@ -678,7 +678,7 @@ function SettingsView({ settings, L, refresh, onBack }: {
 
       <Input label={L.apiUrl} type="url" value={apiUrl} onChange={setApiUrl} placeholder="http://localhost:3000" />
 
-      <div style={{ fontSize: 11, color: C.muted, background: 'rgba(24,95,165,0.05)', padding: '9px 11px', borderRadius: 7, lineHeight: 1.8, border: `1px solid rgba(24,95,165,0.12)` }}>
+      <div style={{ fontSize: 11, color: C.muted, background: 'rgba(79,70,229,0.05)', padding: '9px 11px', borderRadius: 7, lineHeight: 1.8, border: `1px solid rgba(79,70,229,0.12)` }}>
         <span style={{ color: C.text, fontWeight: 600 }}>Dev:</span>{' '}
         <code style={{ fontFamily: 'monospace', background: 'rgba(0,0,0,0.04)', padding: '0 4px', borderRadius: 3 }}>http://localhost:3000</code><br />
         <span style={{ color: C.text, fontWeight: 600 }}>Prod:</span>{' '}

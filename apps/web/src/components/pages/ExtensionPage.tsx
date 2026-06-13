@@ -2,7 +2,7 @@
 
 import React, { useState } from 'react'
 import { TopBar } from '@/components/layout/TopBar'
-import { Btn, Card, CompanyLogo, MatchScoreRing, ScorePill, StatusBadge, useToast } from '@/components/ui'
+import { Btn, CompanyLogo, MatchScoreRing, ScorePill, StatusBadge, useToast } from '@/components/ui'
 
 const JD_MOCK = {
   company: 'Adyen',
@@ -31,23 +31,22 @@ export function ExtensionPage() {
   return (
     <div style={{ flex:1, overflowY:'auto', background:'var(--bg-tertiary)' }}>
       <TopBar title="Extension — Chrome Preview">
-        <div style={{ display:'flex', border:'0.5px solid var(--border)', borderRadius:6, overflow:'hidden' }}>
+        <div style={{ display:'flex', border:'1px solid var(--border)', borderRadius:8, overflow:'hidden', background:'var(--surface-raised)' }}>
           {(['popup','sidebar'] as const).map(t => (
             <button key={t} onClick={() => setTab(t)} style={{
-              padding:'5px 12px', background: tab===t ? 'var(--primary)' : 'var(--bg)',
-              color: tab===t ? '#fff' : 'var(--text-muted)', border:'none', cursor:'pointer', fontSize:11, textTransform:'capitalize',
+              padding:'7px 14px', background: tab===t ? 'var(--brand-gradient)' : 'transparent',
+              color: tab===t ? '#fff' : 'var(--text-muted)', border:'none', cursor:'pointer', fontSize:12, fontWeight:600, textTransform:'capitalize',
             }}>{t}</button>
           ))}
         </div>
-        <span style={{ fontSize:11, color:'var(--text-muted)' }}>Simulated chrome extension UI</span>
       </TopBar>
 
-      <div style={{ padding:24, display:'flex', gap:20, alignItems:'flex-start' }}>
+      <div style={{ padding:24, display:'flex', gap:24, alignItems:'flex-start', flexWrap:'wrap' }}>
         {tab === 'popup' ? (
           /* ── Popup view ── */
-          <div style={{ display:'flex', gap:24, alignItems:'flex-start' }}>
+          <div style={{ display:'flex', gap:24, alignItems:'flex-start', flexWrap:'wrap', width:'100%' }}>
             {/* Fake browser frame */}
-            <div style={{ background:'var(--bg-secondary)', border:'0.5px solid var(--border)', borderRadius:12, overflow:'hidden', width:640 }}>
+            <div style={{ background:'var(--surface-raised)', border:'1px solid var(--border-glass)', borderRadius:12, overflow:'hidden', width:'min(680px, 100%)', boxShadow:'var(--shadow-md)' }}>
               <div style={{ padding:'10px 14px', borderBottom:'0.5px solid var(--border)', display:'flex', alignItems:'center', gap:8, background:'#f1f3f4' }}>
                 <div style={{ display:'flex', gap:5 }}>
                   {['#FF5F57','#FEBC2E','#28C840'].map(c => <div key={c} style={{ width:10, height:10, borderRadius:'50%', background:c }} />)}
@@ -63,13 +62,13 @@ export function ExtensionPage() {
                 </div>
                 {/* Injected ApplyMate button */}
                 <div style={{ padding:12, background:'rgba(79,70,229,0.06)', border:'1px solid rgba(79,70,229,0.20)', borderRadius:8, display:'flex', alignItems:'center', gap:10 }}>
-                  <div style={{ width:20, height:20, borderRadius:4, background:'var(--primary)', display:'flex', alignItems:'center', justifyContent:'center', color:'#fff', fontSize:10, fontWeight:700 }}>A</div>
+                  <div style={{ width:20, height:20, borderRadius:6, background:'var(--brand-gradient)', display:'flex', alignItems:'center', justifyContent:'center', color:'#fff', fontSize:10, fontWeight:700 }}>A</div>
                   <div style={{ flex:1 }}>
                     <div style={{ fontSize:11, fontWeight:500, color:'var(--primary)' }}>ApplyMate AI</div>
                     <div style={{ fontSize:10, color:'#666' }}>Match score: <strong style={{ color:'var(--primary)' }}>91%</strong> · 3 keyword gaps</div>
                   </div>
                   <button onClick={() => { setAdded(true); toast.success('Added to basket', 'Adyen · Backend Engineer') }}
-                    style={{ padding:'5px 12px', background: added ? 'var(--c-success)' : 'var(--primary)', color:'#fff', border:'none', borderRadius:6, fontSize:11, cursor:'pointer', fontWeight:500 }}>
+                    style={{ padding:'6px 12px', background: added ? 'var(--c-success)' : 'var(--brand-gradient)', color:'#fff', border:'none', borderRadius:7, fontSize:11, cursor:'pointer', fontWeight:600 }}>
                     {added ? '✓ Added' : '+ Add to Basket'}
                   </button>
                 </div>
@@ -77,8 +76,8 @@ export function ExtensionPage() {
             </div>
 
             {/* Popup widget */}
-            <div style={{ width:300, background:'var(--bg)', border:'0.5px solid var(--border)', borderRadius:12, overflow:'hidden', boxShadow:'0 8px 32px rgba(0,0,0,0.12)' }}>
-              <div style={{ padding:'12px 14px', borderBottom:'0.5px solid var(--border)', background:'var(--primary)', display:'flex', alignItems:'center', gap:8 }}>
+            <div style={{ width:320, background:'var(--surface-raised)', border:'1px solid var(--border-glass)', borderRadius:12, overflow:'hidden', boxShadow:'var(--shadow-lg)' }}>
+              <div style={{ padding:'12px 14px', borderBottom:'1px solid var(--border)', background:'var(--brand-gradient)', display:'flex', alignItems:'center', gap:8 }}>
                 <div style={{ width:20, height:20, borderRadius:5, background:'rgba(255,255,255,0.2)', display:'flex', alignItems:'center', justifyContent:'center', color:'#fff', fontSize:10, fontWeight:700 }}>A</div>
                 <span style={{ fontSize:13, fontWeight:500, color:'#fff' }}>ApplyMate AI</span>
                 <span style={{ marginLeft:'auto', fontSize:10, color:'rgba(255,255,255,0.7)' }}>Adyen detected</span>
@@ -124,8 +123,8 @@ export function ExtensionPage() {
           </div>
         ) : (
           /* ── Sidebar view ── */
-          <div style={{ display:'flex', gap:24, alignItems:'flex-start' }}>
-            <div style={{ background:'var(--bg-secondary)', border:'0.5px solid var(--border)', borderRadius:12, overflow:'hidden', width:480 }}>
+          <div style={{ display:'flex', gap:24, alignItems:'flex-start', flexWrap:'wrap', width:'100%' }}>
+            <div style={{ background:'var(--surface-raised)', border:'1px solid var(--border-glass)', borderRadius:12, overflow:'hidden', width:'min(520px, 100%)', boxShadow:'var(--shadow-md)' }}>
               <div style={{ padding:'10px 14px', borderBottom:'0.5px solid var(--border)', display:'flex', alignItems:'center', gap:8, background:'#f1f3f4' }}>
                 <div style={{ display:'flex', gap:5 }}>
                   {['#FF5F57','#FEBC2E','#28C840'].map(c => <div key={c} style={{ width:10, height:10, borderRadius:'50%', background:c }} />)}
@@ -142,8 +141,8 @@ export function ExtensionPage() {
               </div>
             </div>
 
-            <div style={{ width:280, background:'var(--bg)', border:'0.5px solid var(--border)', borderRadius:12, overflow:'hidden' }}>
-              <div style={{ padding:'10px 14px', background:'var(--primary)', display:'flex', alignItems:'center', gap:6 }}>
+            <div style={{ width:320, background:'var(--surface-raised)', border:'1px solid var(--border-glass)', borderRadius:12, overflow:'hidden', boxShadow:'var(--shadow-lg)' }}>
+              <div style={{ padding:'10px 14px', background:'var(--brand-gradient)', display:'flex', alignItems:'center', gap:6 }}>
                 <div style={{ width:18, height:18, borderRadius:4, background:'rgba(255,255,255,0.2)', display:'flex', alignItems:'center', justifyContent:'center', color:'#fff', fontSize:9, fontWeight:700 }}>A</div>
                 <span style={{ fontSize:12, fontWeight:500, color:'#fff' }}>ApplyMate Sidebar</span>
               </div>

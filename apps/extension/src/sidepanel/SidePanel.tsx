@@ -384,9 +384,9 @@ function TrackerPanel({ settings, L }: { settings: ExtensionSettings; L: LType }
 
       {/* ── Header ── */}
       <div style={{
-        background: `linear-gradient(135deg, ${C.primary} 0%, #1e7abf 100%)`,
+        background: `linear-gradient(135deg, ${C.primary} 0%, #7C3AED 100%)`,
         padding: '12px 14px',
-        boxShadow: '0 2px 10px rgba(24,95,165,0.25)',
+        boxShadow: '0 2px 10px rgba(79,70,229,0.25)',
       }}>
         <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 10 }}>
           <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
@@ -495,7 +495,7 @@ function TrackerPanel({ settings, L }: { settings: ExtensionSettings; L: LType }
               {count > 0 && (
                 <span style={{
                   fontSize: 9, fontWeight: 600, lineHeight: '14px', padding: '0 4px',
-                  background: active ? `rgba(24,95,165,0.12)` : C.bg,
+                  background: active ? `rgba(79,70,229,0.12)` : C.bg,
                   color: active ? C.primary : C.subtle,
                   borderRadius: 999,
                 }}>
@@ -688,8 +688,8 @@ function JobCard({ job, expanded, onToggle, settings, onStatusChange, showToast,
           {job.status === 'saved' && (
             <button onClick={e => { e.stopPropagation(); onStatusChange(job.id, 'applied') }} style={{
               fontSize: 9, fontWeight: 600, padding: '1px 7px',
-              background: 'rgba(24,95,165,0.1)', color: C.primary,
-              border: `1px solid rgba(24,95,165,0.2)`, borderRadius: 999,
+              background: 'rgba(79,70,229,0.1)', color: C.primary,
+              border: `1px solid rgba(79,70,229,0.2)`, borderRadius: 999,
               cursor: 'pointer', fontFamily: 'inherit', lineHeight: '18px',
             }}>
               {L.applied} →
@@ -811,8 +811,8 @@ function EmptyState({ filter, hasSearch, onClearSearch, L }: {
         <div style={{ fontSize: 30, marginBottom: 10 }}>🔍</div>
         <div style={{ fontSize: 13, fontWeight: 600, color: C.text, marginBottom: 8 }}>No results</div>
         <button onClick={onClearSearch} style={{
-          fontSize: 11, color: C.primary, background: 'rgba(24,95,165,0.08)',
-          border: `1px solid rgba(24,95,165,0.2)`, borderRadius: 6,
+          fontSize: 11, color: C.primary, background: 'rgba(79,70,229,0.08)',
+          border: `1px solid rgba(79,70,229,0.2)`, borderRadius: 6,
           cursor: 'pointer', padding: '5px 14px', fontFamily: 'inherit', fontWeight: 500,
         }}>
           Clear search

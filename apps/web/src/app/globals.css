@@ -7,7 +7,7 @@
 
 :root {
   /* ── Layout ──────────────────────────────────────────────────────── */
-  --sidebar-w:    220px;
+  --sidebar-w:    236px;
   --bottom-bar:   0px;
 
   /* ── Brand Colors ────────────────────────────────────────────────── */
@@ -17,6 +17,8 @@
   --primary-rgb:       79, 70, 229;
   --accent:            #7C3AED;
   --accent-rgb:        124, 58, 237;
+  --brand-gradient:    linear-gradient(135deg, #4F46E5 0%, #0891B2 100%);
+  --brand-gradient-hover: linear-gradient(135deg, #4338CA 0%, #0E7490 100%);
 
   /* ── Background — subtle indigo/violet mesh ──────────────────────── */
   --bg-mesh:      linear-gradient(135deg,
@@ -37,6 +39,8 @@
   --glass-modal:    rgba(255, 255, 255, 0.92);
   --glass-blur:     blur(20px) saturate(180%);
   --glass-blur-sm:  blur(12px) saturate(160%);
+  --surface-raised:  rgba(255, 255, 255, 0.88);
+  --nav-active:      rgba(79, 70, 229, 0.10);
 
   /* ── Borders ─────────────────────────────────────────────────────── */
   --border:         rgba(99, 102, 241, 0.12);
@@ -80,6 +84,8 @@
   --glass-topbar:   rgba(10, 12, 24, 0.82);
   --glass-card:     rgba(20, 22, 42, 0.70);
   --glass-modal:    rgba(15, 17, 35, 0.95);
+  --surface-raised:  rgba(20, 22, 42, 0.88);
+  --nav-active:      rgba(129, 140, 248, 0.14);
 
   /* ── Borders (dark) ──────────────────────────────────────────────── */
   --border:         rgba(99, 102, 241, 0.15);
@@ -136,6 +142,43 @@ body {
   border: 1px solid var(--border-glass);
   box-shadow: var(--shadow-md);
   border-radius: 14px;
+}
+
+/* ─── App chrome primitives ─────────────────────────────────────────── */
+.app-sidebar {
+  width: var(--sidebar-w);
+}
+
+.app-nav-button {
+  position: relative;
+}
+
+.app-nav-button:hover {
+  background: var(--surface-raised) !important;
+  color: var(--text) !important;
+  transform: translateX(1px);
+}
+
+.app-nav-button[data-active="true"] {
+  background: var(--nav-active) !important;
+  color: var(--primary) !important;
+}
+
+.app-nav-button[data-active="true"]::before {
+  content: "";
+  position: absolute;
+  left: 4px;
+  top: 8px;
+  bottom: 8px;
+  width: 3px;
+  border-radius: 999px;
+  background: var(--brand-gradient);
+}
+
+.app-icon-button:hover {
+  background: var(--nav-active) !important;
+  color: var(--primary) !important;
+  box-shadow: var(--shadow-sm);
 }
 
 /* ─── Scrollbar ──────────────────────────────────────────────────────── */

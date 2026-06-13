@@ -8,8 +8,11 @@ export function scrapeIndeed(): ScrapedJob | null {
   // For international TLDs, also try [data-testid="jobTitle"] (used on .de/.co.uk).
   const title =
     document.querySelector<HTMLElement>('[data-testid="jobsearch-JobInfoHeader-title"]')?.innerText.trim() ||
+    document.querySelector<HTMLElement>('[data-testid="simpler-jobTitle"]')?.innerText.trim() ||
     document.querySelector<HTMLElement>('[data-testid="job-title"]')?.innerText.trim() ||
     document.querySelector<HTMLElement>('[data-testid="jobTitle"]')?.innerText.trim() ||
+    document.querySelector<HTMLElement>('[data-testid*="jobTitle" i]')?.innerText.trim() ||
+    document.querySelector<HTMLElement>('[data-testid*="job-title" i]')?.innerText.trim() ||
     document.querySelector<HTMLElement>('h1[class*="jobTitle"]')?.innerText.trim() ||
     // Fallback for Indeed's embedded SPA view
     document.querySelector<HTMLElement>('.jobsearch-JobInfoHeader-title span')?.innerText.trim() ||
@@ -25,6 +28,10 @@ export function scrapeIndeed(): ScrapedJob | null {
     document.querySelector<HTMLElement>('[data-testid="inlineHeader-companyName"]')?.innerText.trim() ||
     document.querySelector<HTMLElement>('[data-testid="company-name"]')?.innerText.trim() ||
     document.querySelector<HTMLElement>('[data-testid="jobCompany"]')?.innerText.trim() ||
+    document.querySelector<HTMLElement>('[data-testid*="companyName" i]')?.innerText.trim() ||
+    document.querySelector<HTMLElement>('[data-testid*="company-name" i]')?.innerText.trim() ||
+    document.querySelector<HTMLElement>('[data-company-name]')?.innerText.trim() ||
+    document.querySelector<HTMLElement>('[data-testid="jobsearch-CompanyInfoContainer"] a')?.innerText.trim() ||
     document.querySelector<HTMLElement>('a[href*="/cmp/"]')?.innerText.trim() ||
     document.querySelector<HTMLElement>('[class*="companyName"]')?.innerText.trim() ||
     document.querySelector<HTMLElement>('[class*="company-name"]')?.innerText.trim() ||
@@ -36,6 +43,8 @@ export function scrapeIndeed(): ScrapedJob | null {
     document.querySelector<HTMLElement>('[data-testid="inlineHeader-companyLocation"]')?.innerText.trim() ||
     document.querySelector<HTMLElement>('[data-testid="jobsearch-JobInfoHeader-companyLocation"]')?.innerText.trim() ||
     document.querySelector<HTMLElement>('[data-testid="jobLocation"]')?.innerText.trim() ||
+    document.querySelector<HTMLElement>('[data-testid*="companyLocation" i]')?.innerText.trim() ||
+    document.querySelector<HTMLElement>('[data-testid*="location" i]')?.innerText.trim() ||
     document.querySelector<HTMLElement>('.jobsearch-JobInfoHeader-companyLocation')?.innerText.trim() ||
     null
 
@@ -55,6 +64,7 @@ export function scrapeIndeed(): ScrapedJob | null {
   const description =
     document.querySelector<HTMLElement>('#jobDescriptionText')?.innerText.trim() ||
     document.querySelector<HTMLElement>('[data-testid="jobDescriptionText"]')?.innerText.trim() ||
+    document.querySelector<HTMLElement>('[data-testid*="jobDescription" i]')?.innerText.trim() ||
     document.querySelector<HTMLElement>('.jobsearch-jobDescriptionText')?.innerText.trim() ||
     document.querySelector<HTMLElement>('#job-description')?.innerText.trim() ||
     document.querySelector<HTMLElement>('#job-content-text')?.innerText.trim() ||
