@@ -1,0 +1,55 @@
+# Greenhouse employer registry (Phase 1.3)
+# Verified: each slug returns >=1 job posting on boards-api.greenhouse.io
+# Country codes: ISO 3166-1 alpha-2, lowercase
+# Tier: 1=household name, 2=mid-size, 3=long-tail
+employers:
+  # --- Tier 1: household names ---
+  - { slug: "gitlab",        name: "GitLab",          country: "us", tier: 1 }
+  - { slug: "airbnb",        name: "Airbnb",          country: "us", tier: 1 }
+  - { slug: "stripe",        name: "Stripe",          country: "ie", tier: 1 }
+  - { slug: "datadog",       name: "Datadog",         country: "us", tier: 1 }
+  - { slug: "figma",         name: "Figma",           country: "us", tier: 1 }
+  - { slug: "linkedin",      name: "LinkedIn",        country: "us", tier: 1 }
+  - { slug: "anthropic",     name: "Anthropic",       country: "us", tier: 1 }
+  - { slug: "intercom",      name: "Intercom",        country: "ie", tier: 1 }
+  - { slug: "adyen",         name: "Adyen",           country: "nl", tier: 1 }
+  - { slug: "hellofresh",    name: "HelloFresh",      country: "de", tier: 1 }
+  - { slug: "n26",           name: "N26",             country: "de", tier: 1 }
+  - { slug: "celonis",       name: "Celonis",         country: "de", tier: 1 }
+  - { slug: "sumup",         name: "SumUp",           country: "de", tier: 1 }
+  - { slug: "doctolib",      name: "Doctolib",        country: "fr", tier: 1 }
+  - { slug: "wolt",          name: "Wolt",            country: "fi", tier: 1 }
+  - { slug: "twilio",        name: "Twilio",          country: "us", tier: 1 }
+  - { slug: "dropbox",       name: "Dropbox",         country: "us", tier: 1 }
+  - { slug: "pinterest",     name: "Pinterest",       country: "us", tier: 1 }
+  - { slug: "robinhood",     name: "Robinhood",       country: "us", tier: 1 }
+  - { slug: "asana",         name: "Asana",           country: "us", tier: 1 }
+
+  # --- Tier 2: well-known mid-size ---
+  - { slug: "vercel",        name: "Vercel",          country: "us", tier: 2 }
+  - { slug: "netlify",       name: "Netlify",         country: "us", tier: 2 }
+  - { slug: "tide",          name: "Tide",            country: "gb", tier: 2 }
+  - { slug: "monzo",         name: "Monzo",           country: "gb", tier: 2 }
+  - { slug: "gocardless",    name: "GoCardless",      country: "gb", tier: 2 }
+  - { slug: "truelayer",     name: "TrueLayer",       country: "gb", tier: 2 }
+  - { slug: "graphcore",     name: "Graphcore",       country: "gb", tier: 2 }
+  - { slug: "solarisbank",   name: "Solarisbank",     country: "de", tier: 2 }
+  - { slug: "raisin",        name: "Raisin",          country: "de", tier: 2 }
+  - { slug: "staffbase",     name: "Staffbase",       country: "de", tier: 2 }
+  - { slug: "getyourguide",  name: "GetYourGuide",    country: "de", tier: 2 }
+  - { slug: "trivago",       name: "Trivago",         country: "de", tier: 2 }
+  - { slug: "algolia",       name: "Algolia",         country: "fr", tier: 2 }
+  - { slug: "dataiku",       name: "Dataiku",         country: "fr", tier: 2 }
+  - { slug: "bookingcom",    name: "Booking.com",     country: "nl", tier: 2 }
+  - { slug: "mollie",        name: "Mollie",          country: "nl", tier: 2 }
+  - { slug: "miro",          name: "Miro",            country: "nl", tier: 2 }
+  - { slug: "typeform",      name: "Typeform",        country: "es", tier: 2 }
+  - { slug: "cabify",        name: "Cabify",          country: "es", tier: 2 }
+  - { slug: "wallapop",      name: "Wallapop",        country: "es", tier: 2 }
+  - { slug: "shifttechnology", name: "Shift Technology", country: "fr", tier: 2 }
+
+  # --- Tier 3: long tail ---
+  - { slug: "cleo",          name: "Cleo",            country: "gb", tier: 3 }
+  - { slug: "wooga",         name: "Wooga",           country: "de", tier: 3 }
+  - { slug: "greenhouse",    name: "Greenhouse",      country: "us", tier: 3 }
+  - { slug: "remote",        name: "Remote",          country: "us", tier: 3 }

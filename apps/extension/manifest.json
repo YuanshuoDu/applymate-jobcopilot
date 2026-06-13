@@ -1,0 +1,136 @@
+{
+  "manifest_version": 3,
+  "name": "ApplyMate AI",
+  "version": "0.1.0",
+  "description": "AI-powered job application copilot — save jobs, match resumes, track progress",
+  "icons": {
+    "16":  "icons/icon16.png",
+    "32":  "icons/icon32.png",
+    "48":  "icons/icon48.png",
+    "128": "icons/icon128.png"
+  },
+  "action": {
+    "default_popup": "src/popup/index.html",
+    "default_title": "ApplyMate AI",
+    "default_icon": {
+      "16":  "icons/icon16.png",
+      "32":  "icons/icon32.png",
+      "48":  "icons/icon48.png",
+      "128": "icons/icon128.png"
+    }
+  },
+  "side_panel": {
+    "default_path": "src/sidepanel/index.html"
+  },
+  "background": {
+    "service_worker": "src/background/index.ts",
+    "type": "module"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "*://*.linkedin.com/jobs/*",
+        "*://*.linkedin.com/jobs*",
+        "*://*.indeed.com/viewjob*",
+        "*://*.indeed.com/jobs*",
+        "*://*.indeed.com/*?q=*",
+        "*://*.indeed.de/*",
+        "*://*.indeed.co.uk/*",
+        "*://*.indeed.fr/*",
+        "*://*.glassdoor.com/Job/*",
+        "*://*.glassdoor.com/job-listing/*",
+        "*://*.glassdoor.com/Jobs/*",
+        "*://*.stepstone.de/*",
+        "*://*.stepstone.at/*",
+        "*://*.stepstone.ch/*",
+        "*://*.stepstone.be/*",
+        "*://*.stepstone.nl/*",
+        "*://*.stepstone.fr/*",
+        "*://*.xing.com/jobs/*",
+        "*://*.wellfound.com/jobs/*",
+        "*://*.wellfound.com/*",
+        "*://*.greenhouse.io/*",
+        "*://*.lever.co/*",
+        "*://*.myworkdayjobs.com/*",
+        "*://*.workday.com/*",
+        "*://*.smartrecruiters.com/*",
+        "*://jobs.ashbyhq.com/*",
+        "*://*.bamboohr.com/jobs/*",
+        "*://jobs.jobvite.com/*",
+        "*://*.icims.com/*",
+        "*://*.monster.de/*",
+        "*://*.monster.com/*",
+        "*://*.monster.co.uk/*",
+        "*://*.arbeitsagentur.de/jobsuche/*",
+        "*://*.jobs.de/*",
+        "http://localhost:3000/*",
+        "http://localhost:5173/*",
+        "*://web-delta-ruddy-29.vercel.app/*"
+      ],
+      "js":       ["src/content/index.ts"],
+      "css":      ["src/content/inject.css"],
+      "run_at":   "document_idle",
+      "all_frames": false
+    }
+  ],
+  "permissions": [
+    "storage",
+    "sidePanel",
+    "activeTab",
+    "scripting",
+    "tabs",
+    "contextMenus"
+  ],
+  "commands": {
+    "_execute_action": {
+      "suggested_key": { "default": "Ctrl+Shift+Y", "mac": "Command+Shift+Y" },
+      "description": "Open ApplyMate popup"
+    },
+    "open_tracker": {
+      "suggested_key": { "default": "Ctrl+Shift+U", "mac": "Command+Shift+U" },
+      "description": "Open ApplyMate AI sidebar"
+    }
+  },
+  "host_permissions": [
+    "*://*.linkedin.com/*",
+    "*://*.indeed.com/*",
+    "*://*.indeed.de/*",
+    "*://*.indeed.co.uk/*",
+    "*://*.indeed.fr/*",
+    "*://*.glassdoor.com/*",
+    "*://*.stepstone.de/*",
+    "*://*.stepstone.at/*",
+    "*://*.stepstone.ch/*",
+    "*://*.stepstone.be/*",
+    "*://*.stepstone.nl/*",
+    "*://*.stepstone.fr/*",
+    "*://*.xing.com/*",
+    "*://*.wellfound.com/*",
+    "*://*.greenhouse.io/*",
+    "*://*.lever.co/*",
+    "*://*.myworkdayjobs.com/*",
+    "*://*.workday.com/*",
+    "*://*.smartrecruiters.com/*",
+    "*://jobs.ashbyhq.com/*",
+    "*://*.bamboohr.com/*",
+    "*://jobs.jobvite.com/*",
+    "*://*.icims.com/*",
+    "*://*.monster.de/*",
+    "*://*.monster.com/*",
+    "*://*.monster.co.uk/*",
+    "*://*.arbeitsagentur.de/*",
+    "*://*.jobs.de/*",
+    "http://localhost:3000/*",
+    "https://*.vercel.app/*",
+    "https://*.applymate.ai/*"
+  ],
+  "optional_host_permissions": [
+    "<all_urls>"
+  ],
+  "web_accessible_resources": [
+    {
+      "resources": ["icons/*", "chunks/*.js"],
+      "matches":   ["<all_urls>"]
+    }
+  ]
+}

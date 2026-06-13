@@ -1,0 +1,47 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>ApplyMate AI — Extension Test Pages</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #f0f4f8; color: #1a1a2e; padding: 40px; }
+    h1 { font-size: 24px; margin-bottom: 8px; }
+    p { color: #64748b; margin-bottom: 24px; }
+    .cards { display: flex; gap: 16px; flex-wrap: wrap; }
+    .card { background: #fff; border-radius: 12px; padding: 24px; box-shadow: 0 1px 3px rgba(0,0,0,0.1); min-width: 280px; flex: 1; text-decoration: none; color: inherit; transition: box-shadow 0.15s; }
+    .card:hover { box-shadow: 0 4px 12px rgba(0,0,0,0.15); }
+    .card h2 { font-size: 18px; margin-bottom: 8px; color: #185FA5; }
+    .card p { font-size: 13px; color: #64748b; margin-bottom: 0; }
+    .badge { display: inline-block; background: #185FA5; color: #fff; padding: 3px 8px; border-radius: 4px; font-size: 11px; margin-bottom: 12px; }
+    .warning { background: #fff3cd; border: 1px solid #ffc107; border-radius: 8px; padding: 16px; margin-bottom: 24px; font-size: 13px; }
+  </style>
+</head>
+<body>
+  <h1>🧪 ApplyMate Extension Test</h1>
+  <p>These pages simulate recruitment website DOM structures for local testing.</p>
+
+  <div class="warning">
+    <strong>⚠️ Before testing:</strong>
+    <ol style="margin: 8px 0 0 16px; line-height: 1.8;">
+      <li>Load the extension from <code>jobcopilot/apps/extension/dist</code> in Chrome</li>
+      <li>Make sure the API server is running on <code>localhost:3000</code></li>
+      <li>Open the extension popup and log in (demo@applymate.ai / demo1234)</li>
+    </ol>
+  </div>
+
+  <div class="cards">
+    <a class="card" href="list.html">
+      <span class="badge">List Mode</span>
+      <h2>Job Search Results →</h2>
+      <p>Simulates LinkedIn/Indeed job cards. Hover to see ⊕ buttons and the preview popup with AI score and sidebar trigger.</p>
+    </a>
+    <a class="card" href="detail.html">
+      <span class="badge">Detail Mode</span>
+      <h2>Job Detail Page →</h2>
+      <p>Simulates a single job posting page. Look for the Save and Sidebar buttons at bottom-right.</p>
+    </a>
+  </div>
+</body>
+</html>

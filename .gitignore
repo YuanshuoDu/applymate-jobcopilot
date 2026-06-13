@@ -9,13 +9,53 @@ jobcopilot-vercel-fix/
 # Runtime lock files
 .claude/scheduled_tasks.lock
 
-# Nested repos
-jobcopilot/
+# Dependencies
+node_modules/
+.pnpm-store/
+package-lock.json
 
-# Temp
-_tmp_*
-.playwright-mcp/
+# Build output
+.next/
+dist/
+out/
+*.tsbuildinfo
+
+# Environment
+.env
+.env.local
+.env*.local
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Debug
+npm-debug.log*
+pnpm-debug.log*
+
+# Prisma
+prisma/*.db
+
+# Turbo
+.turbo/
+
+# Temporary
+*.tmp
+tmp/
+
+# Chrome test profile
+.chrome-test-profile/
 
 # PoC
 cloak-poc/
 applymate/
+
+# Temp files
+_tmp_*/
+.playwright-mcp/

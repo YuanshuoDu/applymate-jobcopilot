@@ -1,0 +1,34 @@
+# SmartRecruiters employer registry (Phase 2.3)
+# Country codes: ISO 3166-1 alpha-2, lowercase
+# Tier: 1=household name, 2=mid-size, 3=long-tail
+employers:
+  # --- Tier 1: household names / large platforms ---
+  - { slug: "SmartRecruiters",        name: "SmartRecruiters",       country: "pl", tier: 1 }
+  - { slug: "visa",                  name: "Visa",                  country: "gb", tier: 1 }
+  - { slug: "boschgroup",            name: "Bosch",                 country: "de", tier: 1 }
+  - { slug: "AccorHotel",            name: "Accor",                 country: "fr", tier: 1 }
+
+  # --- Tier 2: EU employers and tech-forward operators ---
+  - { slug: "NielsenIQ",             name: "NielsenIQ",             country: "gb", tier: 2 }
+  - { slug: "Wise",                  name: "Wise",                  country: "gb", tier: 2 }
+  - { slug: "Devoteam",              name: "Devoteam",              country: "fr", tier: 2 }
+  - { slug: "EcoVadis",              name: "EcoVadis",              country: "fr", tier: 2 }
+  - { slug: "ubisoft2",              name: "Ubisoft",               country: "fr", tier: 2 }
+  - { slug: "redbull",               name: "Red Bull",              country: "at", tier: 2 }
+  - { slug: "Believe",               name: "Believe",               country: "fr", tier: 2 }
+  - { slug: "Sodexo",                name: "Sodexo",                country: "fr", tier: 2 }
+  - { slug: "AUTO1",                 name: "AUTO1 Group",           country: "de", tier: 2 }
+  - { slug: "DeliveryHero",          name: "Delivery Hero",         country: "de", tier: 2 }
+  - { slug: "StepStone",             name: "StepStone",             country: "de", tier: 2 }
+  - { slug: "ASOS",                  name: "ASOS",                  country: "gb", tier: 2 }
+  - { slug: "FrasersGroup",          name: "Frasers Group",         country: "gb", tier: 2 }
+  - { slug: "NBCUniversal3",         name: "NBCUniversal",          country: "gb", tier: 2 }
+  - { slug: "Entain",                name: "Entain",                country: "gb", tier: 2 }
+  - { slug: "InformaGroupPlc",       name: "Informa",               country: "gb", tier: 2 }
+  - { slug: "TurnerTownsend",        name: "Turner & Townsend",     country: "gb", tier: 2 }
+  - { slug: "Version1",              name: "Version 1",             country: "gb", tier: 2 }
+  - { slug: "JYSK",                  name: "JYSK",                  country: "dk", tier: 2 }
+
+  # --- Tier 3: long tail / regional coverage ---
+  - { slug: "Cint",                  name: "Cint",                  country: "se", tier: 3 }
+  - { slug: "Sportradar",            name: "Sportradar",            country: "ch", tier: 3 }

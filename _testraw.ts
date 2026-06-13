@@ -1,0 +1,1 @@
+const x = /hello\s+world/g; console.log(x)

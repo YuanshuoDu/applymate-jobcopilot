@@ -1,0 +1,179 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Senior Frontend Engineer at Google — Test Detail Page</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #f4f2ee; }
+
+    /* ── Header ── */
+    .mock-header { background: #fff; border-bottom: 1px solid #e0dfdc; padding: 12px 24px; display: flex; align-items: center; gap: 16px; }
+    .mock-logo { background: #0a66c2; color: #fff; font-weight: 700; font-size: 20px; width: 34px; height: 34px; display: flex; align-items: center; justify-content: center; border-radius: 4px; }
+
+    /* ── Layout ── */
+    .layout { max-width: 808px; margin: 0 auto; padding: 24px; display: flex; gap: 24px; }
+    .main-col { flex: 1; }
+
+    /* ── Job header ── */
+    .job-header { background: #fff; border: 1px solid #e0dfdc; border-radius: 8px; padding: 24px; margin-bottom: 8px; }
+    .am-test-detail-title { font-size: 24px; font-weight: 600; color: #1a1a2e; margin-bottom: 8px; }
+    .am-test-detail-company { font-size: 16px; color: #0a66c2; margin-bottom: 4px; font-weight: 600; }
+    .am-test-detail-location { font-size: 14px; color: #666; margin-bottom: 16px; }
+    .job-meta { display: flex; gap: 16px; flex-wrap: wrap; }
+    .job-meta-chip { background: #eef3f8; padding: 6px 12px; border-radius: 16px; font-size: 13px; color: #333; }
+    .job-meta-chip.salary { background: #e8f5e9; color: #2e7d32; font-weight: 600; }
+
+    /* ── Job description ── */
+    .job-body { background: #fff; border: 1px solid #e0dfdc; border-radius: 8px; padding: 24px; margin-bottom: 8px; }
+    .section-title { font-size: 18px; font-weight: 600; margin: 20px 0 12px 0; color: #1a1a2e; }
+    .section-title:first-child { margin-top: 0; }
+
+    .am-test-detail-desc { font-size: 14px; line-height: 1.7; color: #333; }
+    .am-test-detail-desc p { margin-bottom: 12px; }
+    .am-test-detail-desc ul { padding-left: 24px; margin-bottom: 12px; }
+    .am-test-detail-desc li { margin-bottom: 6px; }
+
+    /* ── Sidebar ── */
+    .right-col { width: 320px; flex-shrink: 0; }
+    .side-card { background: #fff; border: 1px solid #e0dfdc; border-radius: 8px; padding: 20px; margin-bottom: 8px; }
+    .side-card h3 { font-size: 14px; font-weight: 600; margin-bottom: 12px; color: #1a1a2e; }
+    .company-logo { width: 72px; height: 72px; border-radius: 8px; background: #eef3f8; display: flex; align-items: center; justify-content: center; font-size: 28px; font-weight: 700; color: #666; margin: 0 auto 12px; }
+    .company-name-lg { text-align: center; font-size: 18px; font-weight: 600; margin-bottom: 4px; }
+    .company-link { text-align: center; font-size: 13px; color: #0a66c2; margin-bottom: 16px; cursor: pointer; }
+
+    /* ── Apply button ── */
+    .apply-btn { display: block; width: 100%; padding: 12px; background: #0a66c2; color: #fff; border: none; border-radius: 24px; font-size: 16px; font-weight: 600; cursor: pointer; text-align: center; margin-bottom: 16px; }
+    .easy-apply { background: #fff; color: #0a66c2; border: 2px solid #0a66c2; }
+
+    /* ── Event log ── */
+    .event-log { position: fixed; bottom: 0; left: 0; right: 0; background: #1a1a2e; color: #fff; padding: 12px 24px; font-size: 12px; display: none; z-index: 99999; }
+    .event-log.visible { display: block; }
+
+    .test-hint { background: #fff3cd; border: 1px solid #ffc107; border-radius: 6px; padding: 12px; font-size: 12px; margin-bottom: 8px; line-height: 1.6; }
+  </style>
+</head>
+<body>
+  <div class="mock-header">
+    <div class="mock-logo">in</div>
+    <span style="font-size:14px;">← Back to search results</span>
+  </div>
+
+  <div class="layout">
+    <div class="main-col">
+      <!-- Job header -->
+      <div class="job-header">
+        <div class="am-test-detail-title">Senior Frontend Engineer</div>
+        <div class="am-test-detail-company">Google</div>
+        <div class="am-test-detail-location">Mountain View, CA · Remote · Full-time</div>
+        <div class="job-meta">
+          <span class="job-meta-chip">🎯 Senior level</span>
+          <span class="job-meta-chip">🏠 Remote</span>
+          <span class="job-meta-chip">👥 10,001+ employees</span>
+          <span class="job-meta-chip salary">💰 $150K - $220K</span>
+          <span class="job-meta-chip">🕐 Posted 2 days ago</span>
+        </div>
+      </div>
+
+      <!-- Job description -->
+      <div class="job-body">
+        <div class="am-test-detail-desc">
+          <div class="section-title">About the job</div>
+          <p>
+            Google is looking for a Senior Frontend Engineer to join our Cloud Console team.
+            You will build and maintain user interfaces that help millions of developers
+            manage their cloud infrastructure efficiently.
+          </p>
+
+          <div class="section-title">Requirements</div>
+          <ul>
+            <li>5+ years of professional experience with modern JavaScript/TypeScript and React</li>
+            <li>Strong understanding of web performance, accessibility, and responsive design</li>
+            <li>Experience with design systems and component libraries at scale</li>
+            <li>Familiarity with cloud platforms (GCP, AWS, or Azure)</li>
+            <li>Excellent communication and collaboration skills</li>
+          </ul>
+
+          <div class="section-title">Nice to have</div>
+          <ul>
+            <li>Experience with WebAssembly or Web Workers</li>
+            <li>Contributions to open-source projects</li>
+            <li>Knowledge of Go or Python for backend tooling</li>
+            <li>Experience building Chrome Extensions</li>
+          </ul>
+
+          <div class="section-title">Benefits</div>
+          <ul>
+            <li>Competitive salary + equity + annual bonus</li>
+            <li>Full medical, dental, and vision coverage</li>
+            <li>401(k) matching</li>
+            <li>Flexible PTO and work-from-home options</li>
+            <li>Free meals, gym, and wellness programs on campus</li>
+            <li>Learning and development budget ($5K/year)</li>
+          </ul>
+        </div>
+      </div>
+    </div>
+
+    <!-- Right sidebar -->
+    <div class="right-col">
+      <div class="side-card">
+        <div class="test-hint">
+          <strong>🧪 Expected behavior:</strong><br>
+          1. Bottom-right: Blue "Save to ApplyMate" button<br>
+          2. Above it: 📋 Sidebar toggle button<br>
+          3. Click Save → should save to API<br>
+          4. Click 📋 → opens Chrome side panel
+        </div>
+
+        <div class="company-logo">Go</div>
+        <div class="company-name-lg">Google</div>
+        <div class="company-link">google.com · 10,001+ employees</div>
+
+        <button class="apply-btn" onclick="alert('This is a mock apply button')">Apply Now</button>
+        <button class="apply-btn easy-apply" onclick="alert('This is a mock Easy Apply button')">Easy Apply</button>
+
+        <p style="text-align:center;font-size:11px;color:#999;">This is a mock page — clicking these does nothing real.</p>
+      </div>
+    </div>
+  </div>
+
+  <div class="event-log" id="event-log"></div>
+
+  <script>
+    const log = document.getElementById('event-log');
+    function showLog(msg) {
+      log.textContent = '🔔 ' + msg + ' (time: ' + new Date().toLocaleTimeString() + ')';
+      log.classList.add('visible');
+      setTimeout(() => log.classList.remove('visible'), 4000);
+    }
+
+    const observer = new MutationObserver((mutations) => {
+      for (const m of mutations) {
+        for (const node of m.addedNodes) {
+          if (node.nodeType === 1) {
+            const el = /** @type {Element} */ (node);
+            if (el.id === 'applymate-save-btn') {
+              showLog('✅ Extension injected Save button');
+            }
+            if (el.id === 'applymate-sidebar-btn') {
+              showLog('✅ Extension injected Sidebar button');
+            }
+          }
+        }
+      }
+    });
+    observer.observe(document.body, { childList: true, subtree: true });
+
+    setTimeout(() => {
+      const saveBtn = document.getElementById('applymate-save-btn');
+      const sidebarBtn = document.getElementById('applymate-sidebar-btn');
+      if (saveBtn) showLog('✅ Save button ACTIVE');
+      else showLog('❌ Save button NOT found — check extension');
+      if (sidebarBtn) showLog('✅ Sidebar button ACTIVE');
+      else showLog('❌ Sidebar button NOT found');
+    }, 3000);
+  </script>
+</body>
+</html>

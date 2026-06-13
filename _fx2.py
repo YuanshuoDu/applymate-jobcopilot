@@ -1,0 +1,1 @@
+print(open(_fx.py).read())
