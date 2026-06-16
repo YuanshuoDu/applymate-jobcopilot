@@ -46,3 +46,5 @@ tmp/
 
 # Temp files
 _tmp_*/
+
+.vercel
