@@ -123,6 +123,8 @@ export function LoginPage() {
   type Providers = Awaited<ReturnType<typeof getProviders>>
   const [oauthProviders, setOauthProviders] = useState<Providers>(null)
   useEffect(() => { getProviders().then(setOauthProviders) }, [])
+  const providersLoaded = oauthProviders !== null
+  const googleAvailable = Boolean(oauthProviders?.google)
 
   async function handleCredentials(e: React.FormEvent) {
     e.preventDefault()
@@ -138,6 +140,10 @@ export function LoginPage() {
   async function handleOAuth(provider: 'google' | 'github') {
     setLoading(provider)
     await signIn(provider, { callbackUrl })
+  }
+
+  function handleUnavailableGoogle() {
+    setError('Google 登录尚未配置，请先使用邮箱登录。')
   }
 
   return (
@@ -266,10 +272,15 @@ export function LoginPage() {
           )}
 
           {/* OAuth */}
-          {oauthProviders && (oauthProviders.google || oauthProviders.github) ? (
+          {providersLoaded ? (
             <>
               <div style={{ display:'flex', flexDirection:'column', gap:10, marginBottom:22 }}>
-                {oauthProviders.google && <OAuthBtn icon={<GoogleIcon />} label="使用 Google 登录" onClick={() => handleOAuth('google')} loading={loading === 'google'} />}
+                <OAuthBtn
+                  icon={<GoogleIcon />}
+                  label={googleAvailable ? '使用 Google 登录' : 'Google 登录未配置'}
+                  onClick={() => googleAvailable ? handleOAuth('google') : handleUnavailableGoogle()}
+                  loading={loading === 'google'}
+                />
                 {oauthProviders.github && <OAuthBtn icon={<GitHubIcon />} label="使用 GitHub 登录" onClick={() => handleOAuth('github')} loading={loading === 'github'} dark />}
               </div>
               <div style={{ display:'flex', alignItems:'center', gap:14, marginBottom:22 }}>
@@ -278,12 +289,12 @@ export function LoginPage() {
                 <div style={{ flex:1, height:1, background:'linear-gradient(90deg, transparent, rgba(79,70,229,0.20), transparent)' }} />
               </div>
             </>
-          ) : oauthProviders === null ? (
+          ) : (
             <div style={{ marginBottom:22 }}>
               <div style={{ height:46, borderRadius:10, marginBottom:10, background:'rgba(79,70,229,0.06)' }} />
               <div style={{ height:46, borderRadius:10, background:'rgba(79,70,229,0.04)' }} />
             </div>
-          ) : null}
+          )}
 
           {/* Credentials form */}
           <form onSubmit={handleCredentials} style={{ display:'flex', flexDirection:'column', gap:15 }}>

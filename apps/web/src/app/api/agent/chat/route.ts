@@ -1,56 +1,66 @@
 /**
  * POST /api/agent/chat
  *
- * Streaming chat with the Pipeline Orchestrator.
  * Returns SSE:
  *   event: text   data: { delta: "..." }   — streaming text token
  *   event: action data: { type, ...params } — action to execute on client
  *   event: done   data: {}
- *
  * Actions the orchestrator can trigger:
  *   start_run                     — launch the pipeline
  *   update_config  field  value   — change a pipeline setting
  *   navigate       path           — navigate to a page
- *   open_job       jobId          — open a specific job
  */
 import { NextRequest }                                from 'next/server'
+import type { Prisma }                                from '@prisma/client'
 import { db }                                          from '@/lib/db'
-import { prepareAiRoute, sseResponse, isErrorResponse } from '@/lib/api-helpers'
-import { modelChatStream }                              from '@/lib/model-router'
+import { prepareAiRoute, sseResponse, err }             from '@/lib/api-helpers'
+import { modelChatStream } from '@/lib/model-router'
+import { appendTranscriptEvent, createAgentSession, updateAgentSession } from '@/lib/agent/session/repository'
+import { approvalRequestFrom, automationDraftFrom } from './blocks'
+import {
+  SYSTEM_PROMPT,
+  agentActionFromText,
+  latestUserMessage,
+  readChatMessages,
+  readSessionId,
+  resolveRequestedModel,
+  responseMemory,
+  sessionGoalFrom,
+  type ChatRequestBody,
+} from './route-helpers'
 
-const SYSTEM_PROMPT = (ctx: {
-  jobCount: number; savedCount: number; pendingCount: number
-  config: Record<string, unknown> | null; resumeName: string | null
-  recentJobs: Array<{ company: string; role: string; score: number | null; status: string }>
-  lastRunAt: string | null
-}): string => `You are the ApplyMate AI Pipeline Orchestrator — a smart career assistant coordinating a team of 6 specialized AI agents.
+async function resolveChatSession(userId: string, body: ChatRequestBody, goal: string) {
+  const sessionId = readSessionId(body)
+  if (sessionId) {
+    const existing = await db.agentSession.findFirst({
+      where: { id: sessionId, userId },
+      select: { id: true },
+    })
+    if (!existing) return err('Session not found', 404)
+    return { id: existing.id, created: false }
+  }
 
-## Current Status
-- Total jobs: ${ctx.jobCount} | Saved: ${ctx.savedCount} | Pending review: ${ctx.pendingCount}
-- Active resume: ${ctx.resumeName ?? 'None'}
-- Pipeline last run: ${ctx.lastRunAt ?? 'Never'}
-- Min match score: ${ctx.config?.minMatchScore ?? 75}% | Auto-apply: ${ctx.config?.autoApply ? 'ON' : 'OFF'}
-- Daily limit: ${ctx.config?.dailyLimit ?? 10} applications/day
-
-## Recent Jobs
-${ctx.recentJobs.length === 0 ? 'No jobs yet.' : ctx.recentJobs.map(j => `- ${j.company} · ${j.role} | Score: ${j.score != null ? j.score + '%' : '-'} | ${j.status}`).join('\n')}
-
-Action commands (at END of response, on its own line):
-  ACTION:start_run
-  ACTION:stop_run
-  ACTION:update_config:key:value
-  ACTION:navigate:path
-  ACTION:open_job:<jobId>
-  ACTION:toggle_agent:roleName:true/false
-
-Rules: max 1 action per response, only when asked or obviously needed, be helpful in Chinese or English, use real data from context.`
+  const created = await createAgentSession(db, {
+    userId,
+    goal: sessionGoalFrom(goal),
+    source: 'chat',
+  }) as { id: string }
+  return { id: created.id, created: true }
+}
 
 export async function POST(req: NextRequest) {
   const prep = await prepareAiRoute(req, 'agent')
   if ('error' in prep) return prep.error
 
-  const body = await req.json().catch(() => null)
-  if (!body?.messages) return new Response('Missing messages', { status: 400 })
+  const body = (await req.json().catch(() => null)) as ChatRequestBody | null
+  if (!body) return new Response('Missing messages', { status: 400 })
+
+  const bodyMessages = readChatMessages(body)
+  if (!bodyMessages) return new Response('Missing messages', { status: 400 })
+
+  const userMessage = latestUserMessage(bodyMessages)
+  const session = await resolveChatSession(prep.userId, body, userMessage)
+  if (session instanceof Response) return session
 
   const [agentCfg, jobs, resume, lastActivity] = await Promise.all([
     db.agentConfig.findUnique({ where: { userId: prep.userId } }),
@@ -68,33 +78,115 @@ export async function POST(req: NextRequest) {
     lastRunAt: lastActivity?.createdAt.toLocaleDateString('zh') ?? null,
   }
 
-  const messages = [{ role: 'system' as const, content: SYSTEM_PROMPT(ctxData) }, ...body.messages]
+  const messages = [{ role: 'system' as const, content: SYSTEM_PROMPT(ctxData) }, ...bodyMessages]
+
+  if (userMessage) {
+    await appendTranscriptEvent(db, {
+      sessionId: session.id,
+      type: 'user_message',
+      speaker: 'You',
+      title: 'Message',
+      body: userMessage,
+    })
+  }
 
   return sseResponse(async send => {
+    send('session', { sessionId: session.id, created: session.created })
+
     let fullText = ''
-    for await (const delta of modelChatStream(messages, prep.cfg, 4096)) {
-      fullText += delta
-      send('text', { delta })
+    try {
+      for await (const delta of modelChatStream(messages, resolveRequestedModel(body, prep.cfg), 4096)) {
+        fullText += delta
+        send('text', { delta })
+      }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Agent chat failed.'
+      send('error', { message })
+      await appendTranscriptEvent(db, {
+        sessionId: session.id,
+        type: 'error',
+        speaker: 'System',
+        title: 'Chat failed',
+        body: message,
+        data: { reason: 'model_stream_error' },
+      })
+      await updateAgentSession(db, {
+        sessionId: session.id,
+        status: 'failed',
+        memorySummary: responseMemory(message),
+      })
+      return
     }
 
-    const actionMatch = fullText.match(/^ACTION:(.+)$/m)
-    if (actionMatch) {
-      const parts = actionMatch[1].split(':')
-      const type = parts[0]
-      if (type === 'start_run') send('action', { type: 'start_run' })
-      else if (type === 'stop_run') send('action', { type: 'stop_run' })
-      else if (type === 'toggle_agent' && parts.length >= 3) {
-        const enabled = parts[2] === 'true'
-        send('action', { type: 'toggle_agent', role: parts[1], enabled })
-      }
-      else if (type === 'update_config' && parts.length >= 3) {
-        let value: unknown = parts[2]
-        if (value === 'true') value = true; else if (value === 'false') value = false; else if (!isNaN(Number(value))) value = Number(value)
-        send('action', { type: 'update_config', field: parts[1], value })
-      }
-      else if (type === 'navigate' && parts[1]) send('action', { type: 'navigate', path: parts[1] })
-      else if (type === 'open_job' && parts[1]) send('action', { type: 'open_job', jobId: parts[1] })
+    const automationDraft = automationDraftFrom(userMessage)
+    if (automationDraft) {
+      const body = 'I drafted an automation from your request. Please confirm before I save it.'
+      send('block', { type: 'automation_draft', draft: automationDraft })
+      await appendTranscriptEvent(db, {
+        sessionId: session.id,
+        type: 'automation_draft',
+        speaker: 'Orchestrator',
+        title: 'Automation draft',
+        body,
+        data: { draft: automationDraft },
+      })
     }
+
+    const approvalDraft = approvalRequestFrom(userMessage, ctxData)
+    if (approvalDraft) {
+      const approval = await db.agentApproval.create({
+        data: {
+          sessionId: session.id,
+          userId: prep.userId,
+          type: approvalDraft.type,
+          status: 'pending',
+          title: approvalDraft.title,
+          body: approvalDraft.body,
+          impact: approvalDraft.impact as Prisma.InputJsonValue,
+          payload: approvalDraft.payload as Prisma.InputJsonValue,
+        },
+      })
+      const approvalPayload = { id: approval.id, ...approvalDraft, status: 'pending' }
+      send('block', { type: 'approval_request', approval: approvalPayload })
+      await appendTranscriptEvent(db, {
+        sessionId: session.id,
+        type: 'approval_request',
+        speaker: 'Executor',
+        title: approvalDraft.title,
+        body: approvalDraft.body,
+        data: { approval: approvalPayload },
+      })
+    }
+
+    const action = agentActionFromText(fullText)
+    if (action) {
+      const { command, ...clientAction } = action
+      send('action', clientAction)
+      await appendTranscriptEvent(db, {
+        sessionId: session.id,
+        type: 'orchestrator_plan',
+        speaker: 'Orchestrator',
+        title: 'Action',
+        body: `ACTION:${command}`,
+        data: { action: command },
+      })
+    }
+
+    const assistantText = fullText.replace(/^ACTION:.+$/gm, '').trim()
+    if (assistantText) {
+      await appendTranscriptEvent(db, {
+        sessionId: session.id,
+        type: 'orchestrator_plan',
+        speaker: 'Orchestrator',
+        title: 'Response',
+        body: assistantText,
+      })
+    }
+    await updateAgentSession(db, {
+      sessionId: session.id,
+      status: 'running',
+      memorySummary: responseMemory(fullText),
+    })
     send('done', {})
   })
 }

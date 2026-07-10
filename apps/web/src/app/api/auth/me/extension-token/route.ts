@@ -4,7 +4,7 @@
  * Requires a valid NextAuth session. Returns a 30-day JWT for the extension.
  */
 import { NextResponse } from 'next/server'
-import { auth } from '@/lib/auth'
+import { safeAuth } from '@/lib/safe-auth'
 import { SignJWT } from 'jose'
 import { db } from '@/lib/db'
 
@@ -13,7 +13,7 @@ const JWT_SECRET = new TextEncoder().encode(
 )
 
 export async function GET() {
-  const session = await auth()
+  const session = await safeAuth()
   if (!session?.user?.email) {
     return NextResponse.json({ error: 'Not authenticated' }, { status: 401 })
   }

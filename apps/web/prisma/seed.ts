@@ -14,12 +14,18 @@ async function main() {
   const password = await bcrypt.hash('demo1234', 12)
   const user = await db.user.upsert({
     where: { email: 'demo@applymate.ai' },
-    update: {},
+    update: {
+      name: 'Zhang Li',
+      plan: 'pro',
+      password,
+      onboardedAt: new Date(),
+    },
     create: {
       email: 'demo@applymate.ai',
       name: 'Zhang Li',
       plan: 'pro',
       password,
+      onboardedAt: new Date(),
     },
   })
   console.log(`✓ User: ${user.email}`)
@@ -112,8 +118,20 @@ async function main() {
   console.log('✓ Resume')
 
   // ── Agent Config ──────────────────────────────────────────
-  await db.agentConfig.create({
-    data: {
+  await db.agentConfig.upsert({
+    where: { userId: user.id },
+    update: {
+      isRunning: true,
+      dailyLimit: 10,
+      minMatchScore: 75,
+      autoApply: false,
+      requireApproval: true,
+      targetLocations: ['Amsterdam, NL', 'Remote'],
+      targetRoles: ['Backend Engineer', 'Software Engineer', 'Systems Engineer'],
+      excludeCompanies: [],
+      model: 'claude-3-5-sonnet',
+    },
+    create: {
       userId: user.id,
       isRunning: true,
       dailyLimit: 10,

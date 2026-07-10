@@ -3,5 +3,11 @@
   "buildCommand": "pnpm --filter @jobcopilot/web exec prisma generate && pnpm --filter @jobcopilot/web build",
   "outputDirectory": "apps/web/.next",
   "installCommand": "pnpm install --ignore-scripts",
-  "devCommand": "pnpm --filter @jobcopilot/web dev"
+  "devCommand": "pnpm --filter @jobcopilot/web dev",
+  "crons": [
+    {
+      "path": "/api/agent/automations/due",
+      "schedule": "*/5 * * * *"
+    }
+  ]
 }

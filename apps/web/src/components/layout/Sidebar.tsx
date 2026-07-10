@@ -82,9 +82,7 @@ export function Sidebar({ active, onNav, session, jobCount: jobCountProp }: Side
     { id: 'resume',    label: t('nav.resume')    },
     { id: 'gmail',     label: t('nav.gmail')     },
     { id: 'agent',     label: t('nav.agent')     },
-    { id: 'agent-history', label: t('nav.agentHistory') },
     { id: 'apply-history', label: t('nav.applyHistory') },
-    { id: 'observability', label: 'Observability' },
     { id: 'settings',  label: t('nav.settings')  },
   ]
 

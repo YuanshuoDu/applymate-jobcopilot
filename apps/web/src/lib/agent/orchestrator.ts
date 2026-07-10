@@ -20,6 +20,7 @@
 import { modelChat }        from '@/lib/model-router'
 import { db }               from '@/lib/db'
 import type { PipelineCtx } from './types'
+import { agentConfigPatchFrom, applyAgentConfigPatch, prismaAgentConfigPatch } from './orchestrator-config'
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
@@ -321,13 +322,7 @@ Respond ONLY in valid JSON (no markdown):
       }
       return
     }
-    const changes: string[] = []
-    for (const [key, value] of Object.entries(fix)) {
-      if (value !== undefined) {
-        (this.ctx.agentCfg as any)[key] = value
-        changes.push(`${key}=${JSON.stringify(value)}`)
-      }
-    }
+    const changes = applyAgentConfigPatch(this.ctx.agentCfg, agentConfigPatchFrom(fix))
     if (changes.length > 0) {
       this.emit('orchestrator_fix', {
         stage, fix: changes.join(', '),
@@ -344,12 +339,15 @@ Respond ONLY in valid JSON (no markdown):
     if (!opt?.action) return
     const { field, value } = opt.action
     if (field === '_navigate') return // handled by frontend
+    const patch = agentConfigPatchFrom({ [field]: value })
+    const data = prismaAgentConfigPatch(patch)
+    if (Object.keys(data).length === 0 && Object.keys(patch).length === 0) return
     try {
       await db.agentConfig.updateMany({
         where: { userId: this.ctx.userId },
-        data:  { [field]: value } as any,
+        data,
       });
-      (this.ctx.agentCfg as any)[field] = value
+      applyAgentConfigPatch(this.ctx.agentCfg, patch)
     } catch { /* non-fatal */ }
   }
 
