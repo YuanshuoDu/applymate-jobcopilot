@@ -95,6 +95,7 @@ export function AppShell() {
   const { data: session, status } = useSession()
   const router = useRouter()
   const loginSyncInProgress = useRef<boolean>(false)
+  const initialPageRef = useRef(page)
   const PageComp = PAGES[page]
 
   const [checkingOnboard, setCheckingOnboard] = useState(true)
@@ -117,7 +118,7 @@ export function AppShell() {
   }, [status])
 
   useEffect(() => {
-    writePageToUrl(page, 'replace')
+    writePageToUrl(initialPageRef.current, 'replace')
 
     function handlePopState() {
       const params = new URLSearchParams(window.location.search)

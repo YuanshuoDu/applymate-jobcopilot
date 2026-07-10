@@ -35,7 +35,7 @@ export function AgentSessionTranscript({ sessionId, onBackToLive }: {
 }) {
   const { data: detailData, loading: detailLoading, refetch: refetchDetail } = useApi<DetailResponse>(`/api/agent/sessions/${sessionId}`)
   const { data: eventsData, loading: eventsLoading, refetch } = useApi<EventsResponse>(`/api/agent/sessions/${sessionId}/events`)
-  const events = eventsData?.events ?? []
+  const events = React.useMemo(() => eventsData?.events ?? [], [eventsData?.events])
   const session = detailData?.session
   const bottomRef = useRef<HTMLDivElement>(null)
   const [localEvents, setLocalEvents] = useState<AgentTranscriptEvent[]>([])
