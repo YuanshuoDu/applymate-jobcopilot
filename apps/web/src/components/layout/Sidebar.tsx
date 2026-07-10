@@ -15,6 +15,8 @@ interface SidebarProps {
   jobCount?: number
 }
 
+export type SidebarNavItem = { id: Page; label: string }
+
 // ── Nav SVG icons ─────────────────────────────────────────────────────────────
 const NavIcon = ({ id }: { id: string }) => {
   const icons: Record<string, React.ReactNode> = {
@@ -25,11 +27,24 @@ const NavIcon = ({ id }: { id: string }) => {
     gmail:     <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M4 4h16c1.1 0 2 .9 2 2v12c0 1.1-.9 2-2 2H4c-1.1 0-2-.9-2-2V6c0-1.1.9-2 2-2z"/><polyline points="22,6 12,13 2,6"/></svg>,
     agent:     <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="12" r="3"/><path d="M12 1v4M12 19v4M4.22 4.22l2.83 2.83M16.95 16.95l2.83 2.83M1 12h4M19 12h4M4.22 19.78l2.83-2.83M16.95 7.05l2.83-2.83"/></svg>,
     'agent-history': <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M3 3v18h18"/><path d="M7 14l3-3 3 2 4-6"/><circle cx="7" cy="14" r="1"/><circle cx="10" cy="11" r="1"/><circle cx="13" cy="13" r="1"/><circle cx="17" cy="7" r="1"/></svg>,
-    'apply-history': <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M16 4h2a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h2"/><rect x="8" y="2" width="8" height="4" rx="1"/><path d="M9 14l2 2 4-4"/></svg>,
+    extension: <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><rect x="4" y="3" width="14" height="18" rx="2"/><path d="M8 7h6"/><path d="M8 11h4"/><path d="M18 8l3 3-3 3"/></svg>,
     observability: <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M3 3v18h18"/><rect x="7" y="12" width="3" height="5" rx="1"/><rect x="12" y="8" width="3" height="9" rx="1"/><rect x="17" y="5" width="3" height="12" rx="1"/></svg>,
     settings:  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>,
   }
   return <span style={{ display: 'flex', alignItems: 'center', flexShrink: 0 }}>{icons[id] ?? null}</span>
+}
+
+export function getSidebarNavItems(t: (key: string) => string): SidebarNavItem[] {
+  return [
+    { id: 'dashboard', label: t('nav.dashboard') },
+    { id: 'jobs',      label: t('nav.jobs')      },
+    { id: 'search',    label: t('nav.search')    },
+    { id: 'resume',    label: t('nav.resume')    },
+    { id: 'gmail',     label: t('nav.gmail')     },
+    { id: 'agent',     label: t('nav.agent')     },
+    { id: 'extension', label: t('nav.extension') },
+    { id: 'settings',  label: t('nav.settings')  },
+  ]
 }
 
 // ── Theme mode icons ──────────────────────────────────────────────────────────
@@ -75,20 +90,11 @@ export function Sidebar({ active, onNav, session, jobCount: jobCountProp }: Side
 
   const currentLang = LANGUAGES.find(l => l.value === lang) ?? LANGUAGES[0]
 
-  const NAV_ITEMS: { id: Page; label: string }[] = [
-    { id: 'dashboard', label: t('nav.dashboard') },
-    { id: 'jobs',      label: t('nav.jobs')      },
-    { id: 'search',    label: t('nav.search')    },
-    { id: 'resume',    label: t('nav.resume')    },
-    { id: 'gmail',     label: t('nav.gmail')     },
-    { id: 'agent',     label: t('nav.agent')     },
-    { id: 'apply-history', label: t('nav.applyHistory') },
-    { id: 'settings',  label: t('nav.settings')  },
-  ]
+  const NAV_ITEMS = getSidebarNavItems(t)
 
   return (
-    <div style={{
-      width: 220, flexShrink: 0,
+    <div className="app-sidebar" style={{
+      flexShrink: 0,
       background: 'var(--glass-sidebar)',
       backdropFilter: 'blur(24px) saturate(180%)',
       WebkitBackdropFilter: 'blur(24px) saturate(180%)',
@@ -102,7 +108,7 @@ export function Sidebar({ active, onNav, session, jobCount: jobCountProp }: Side
         <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
           <div style={{
             width: 30, height: 30, borderRadius: 9,
-            background: 'linear-gradient(135deg, #4F46E5 0%, #7C3AED 100%)',
+            background: 'var(--brand-gradient)',
             display: 'flex', alignItems: 'center', justifyContent: 'center',
             color: '#fff', fontSize: 13, fontWeight: 700, flexShrink: 0,
             boxShadow: '0 3px 10px rgba(79,70,229,0.40)',
@@ -110,7 +116,7 @@ export function Sidebar({ active, onNav, session, jobCount: jobCountProp }: Side
           <div>
             <div style={{
               fontSize: 13, fontWeight: 700, lineHeight: 1.2,
-              background: 'linear-gradient(135deg, #4F46E5 0%, #7C3AED 100%)',
+              background: 'var(--brand-gradient)',
               WebkitBackgroundClip: 'text', WebkitTextFillColor: 'transparent', backgroundClip: 'text',
             }}>ApplyMate AI</div>
             <div style={{ fontSize: 10, color: 'var(--text-subtle)', lineHeight: 1.2, marginTop: 1 }}>Job Copilot · Europe</div>
@@ -119,14 +125,12 @@ export function Sidebar({ active, onNav, session, jobCount: jobCountProp }: Side
       </div>
 
       {/* ── Nav ── */}
-      <nav style={{ flex: 1, padding: '8px', display: 'flex', flexDirection: 'column', gap: 1, overflowY: 'auto' }}>
+      <nav style={{ flex: 1, padding: '10px 8px', display: 'flex', flexDirection: 'column', gap: 2, overflowY: 'auto' }}>
         {NAV_ITEMS.map(item => (
-          <button key={item.id} onClick={() => onNav(item.id)} style={{
+          <button key={item.id} className="app-nav-button" data-active={active === item.id} onClick={() => onNav(item.id)} style={{
             display: 'flex', alignItems: 'center', gap: 9,
-            padding: '7px 10px', borderRadius: 8, border: 'none', cursor: 'pointer',
-            background: active === item.id
-              ? 'linear-gradient(135deg, rgba(79,70,229,0.12) 0%, rgba(124,58,237,0.08) 100%)'
-              : 'transparent',
+            padding: '8px 10px 8px 14px', borderRadius: 8, border: 'none', cursor: 'pointer',
+            background: 'transparent',
             color: active === item.id ? 'var(--primary)' : 'var(--text-muted)',
             fontWeight: active === item.id ? 600 : 400,
             fontSize: 13, textAlign: 'left', width: '100%', transition: 'all 0.15s',

@@ -41,7 +41,7 @@ export async function getCurrentJob(): Promise<ScrapedJob | null> {
 
 // ── Badge helpers ─────────────────────────────────────────────
 
-export function setBadge(text: string, color = '#185FA5') {
+export function setBadge(text: string, color = '#4F46E5') {
   chrome.action.setBadgeText({ text })
   chrome.action.setBadgeBackgroundColor({ color })
 }

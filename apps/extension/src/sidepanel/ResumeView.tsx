@@ -21,7 +21,7 @@ import type { ExtensionSettings, ScrapedJob, ResumeListItem, Resume, ResumeConte
 
 // ── Design tokens ────────────────────────────────────────────────────────────────
 const C = {
-  primary:  '#185FA5',
+  primary:  '#4F46E5',
   green:    '#3B6D11',
   red:      '#A32D2D',
   amber:    '#854F0B',
@@ -48,7 +48,7 @@ const TEMPLATE_NAMES: Record<string, string> = {
 }
 
 const ACCENT_COLORS = [
-  { v: '#185FA5', n: 'Blue' }, { v: '#475569', n: 'Slate' },
+  { v: '#4F46E5', n: 'Blue' }, { v: '#475569', n: 'Slate' },
   { v: '#2E6B4F', n: 'Forest' }, { v: '#C2410C', n: 'Terracotta' },
   { v: '#7C3AED', n: 'Violet' }, { v: '#374151', n: 'Graphite' },
 ]
@@ -401,7 +401,7 @@ export function ResumeView({ settings }: Props) {
                   <div key={i} style={{ padding: '8px 10px', borderRadius: 8, marginBottom: 6, background: C.bg, border: `0.5px solid ${C.border}` }}>
                     <div style={{ fontSize: 10, color: C.text, marginBottom: 4, lineHeight: 1.4 }}>{s.text}</div>
                     <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
-                      <span style={{ fontSize: 9, padding: '1px 6px', borderRadius: 999, background: 'rgba(24,95,165,0.08)', color: C.primary }}>{s.target}</span>
+                      <span style={{ fontSize: 9, padding: '1px 6px', borderRadius: 999, background: 'rgba(79,70,229,0.08)', color: C.primary }}>{s.target}</span>
                       <span style={{ fontSize: 9, color: C.subtle }}>{s.action}</span>
                       <button onClick={() => applySuggestion(s)} style={{ fontSize: 9, padding: '3px 12px', borderRadius: 999, background: C.green, color: '#fff', border: 'none', cursor: 'pointer', fontFamily: 'inherit', fontWeight: 600, marginLeft: 'auto' }}>Apply</button>
                     </div>
@@ -1009,7 +1009,7 @@ function TemplateThumbnail({ id, accent, font }: { id: string; accent: string; f
 function Spinner() {
   return (
     <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 10 }}>
-      <div style={{ width: 22, height: 22, border: '2.5px solid rgba(24,95,165,0.15)', borderTopColor: C.primary, borderRadius: '50%', animation: 'rv-spin 0.7s linear infinite' }} />
+      <div style={{ width: 22, height: 22, border: '2.5px solid rgba(79,70,229,0.15)', borderTopColor: C.primary, borderRadius: '50%', animation: 'rv-spin 0.7s linear infinite' }} />
       <style>{'@keyframes rv-spin{to{transform:rotate(360deg)}}'}</style>
     </div>
   )

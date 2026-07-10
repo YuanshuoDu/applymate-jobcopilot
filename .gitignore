@@ -58,4 +58,7 @@ applymate/
 
 # Temp files
 _tmp_*/
+_tmp_*
 .playwright-mcp/
+.vercel
+dev-agent*.log

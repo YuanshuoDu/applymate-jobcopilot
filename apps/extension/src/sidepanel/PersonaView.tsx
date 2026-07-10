@@ -9,7 +9,7 @@ import type { ExtensionSettings } from '@/lib/types'
 import type { PersonaField } from '@/lib/api'
 
 const C = {
-  primary:  '#185FA5',
+  primary:  '#4F46E5',
   green:    '#3B6D11',
   red:      '#A32D2D',
   amber:    '#854F0B',
@@ -304,7 +304,7 @@ function Spinner() {
     <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', height: 160, flexDirection: 'column', gap: 10 }}>
       <div style={{
         width: 22, height: 22,
-        border: `2.5px solid rgba(24,95,165,0.15)`, borderTopColor: C.primary,
+        border: `2.5px solid rgba(79,70,229,0.15)`, borderTopColor: C.primary,
         borderRadius: '50%', animation: 'spin 0.7s linear infinite',
       }} />
       <style>{`@keyframes spin { to { transform: rotate(360deg) } }`}</style>

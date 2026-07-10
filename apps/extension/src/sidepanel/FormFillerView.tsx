@@ -9,7 +9,7 @@ import type { FormFieldSchema, FilledField, FormFillResponse } from '@/lib/form-
 import type { PersonaField } from '@/lib/api'
 
 const C = {
-  primary:  '#185FA5',
+  primary:  '#4F46E5',
   green:    '#3B6D11',
   red:      '#A32D2D',
   amber:    '#854F0B',

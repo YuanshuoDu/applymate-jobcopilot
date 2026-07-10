@@ -4,8 +4,15 @@
  */
 import { NextRequest } from 'next/server'
 import { prepareAiRoute, ok, err } from '@/lib/api-helpers'
-import { modelChat, stripFences } from '@/lib/model-router'
+import { APPLYMATE_BACKING, modelChat, stripFences, type AiConfig, type ChatResult } from '@/lib/model-router'
 import type { ResumeContent } from '@/lib/types'
+
+const SCORE_FALLBACKS: AiConfig[] = [
+  APPLYMATE_BACKING,
+  { provider: 'deepseek', model: 'deepseek-chat' },
+  { provider: 'deepseek', model: 'deepseek-v4-flash' },
+  { provider: 'minimax', model: 'MiniMax-Text-01' },
+]
 
 export async function POST(req: NextRequest) {
   const prep = await prepareAiRoute(req, 'jobScoring')
@@ -53,7 +60,7 @@ ${keySkills?.length ? `KEY SKILLS: ${keySkills.join(', ')}` : ''}
 ${jobDescription ? `DESCRIPTION:\n${jobDescription.slice(0, 2000)}` : ''}`
 
   try {
-    const result = await modelChat([{ role: 'user', content: prompt }], cfg, 3000)
+    const { result, usedFallback } = await scoreWithFallback(prompt, cfg)
     const text = stripFences(result.text)
     let parsed: Record<string, unknown>
     try { parsed = JSON.parse(text) } catch {
@@ -93,11 +100,41 @@ ${jobDescription ? `DESCRIPTION:\n${jobDescription.slice(0, 2000)}` : ''}`
       skillsGap:        Array.isArray(parsed.skillsGap) ? parsed.skillsGap as string[] : [],
       strengthSummary:  String(parsed.strengthSummary ?? ''),
       _model:           `${cfg.provider}/${cfg.model}`,
+      _actualModel:      `${result.provider}/${result.model}`,
+      _fallback:         usedFallback,
     })
   } catch (e) {
     console.error('[/api/ai/score]', e)
     return err(`AI scoring failed: ${(e as Error).message}`, 500)
   }
+}
+
+async function scoreWithFallback(prompt: string, primary: AiConfig): Promise<{ result: ChatResult; usedFallback: boolean }> {
+  const attempts = dedupeConfigs([primary, ...SCORE_FALLBACKS])
+  const errors: string[] = []
+
+  for (let i = 0; i < attempts.length; i++) {
+    const cfg = attempts[i]
+    try {
+      const result = await modelChat([{ role: 'user', content: prompt }], cfg, 3000)
+      if (!result?.text) throw new Error('empty AI response')
+      return { result, usedFallback: i > 0 }
+    } catch (e) {
+      errors.push(`${cfg.provider}/${cfg.model}: ${(e as Error).message}`)
+    }
+  }
+
+  throw new Error(`当前 AI 配置不可用，备用模型也不可用。${errors.join(' | ')}`)
+}
+
+function dedupeConfigs(configs: AiConfig[]): AiConfig[] {
+  const seen = new Set<string>()
+  return configs.filter(cfg => {
+    const key = `${cfg.provider}::${cfg.model}::${cfg.apiBase ?? ''}`
+    if (seen.has(key)) return false
+    seen.add(key)
+    return true
+  })
 }
 
 function resumeToText(r: ResumeContent): string {

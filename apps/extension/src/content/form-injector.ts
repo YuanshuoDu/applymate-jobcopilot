@@ -28,7 +28,7 @@ function isJobListPage(): boolean {
   if (host.includes('linkedin.com') && path.startsWith('/jobs/')) {
     return !path.includes('/view/') && !path.includes('/jobs/view/')
   }
-  if (host.includes('indeed.com')) {
+  if (/(^|\.)indeed\./i.test(host)) {
     return path.includes('/jobs') && !path.includes('viewjob')
   }
   return false
