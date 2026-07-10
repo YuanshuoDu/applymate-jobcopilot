@@ -7,7 +7,7 @@
   "crons": [
     {
       "path": "/api/agent/automations/due",
-      "schedule": "*/5 * * * *"
+      "schedule": "0 8 * * *"
     }
   ]
 }
