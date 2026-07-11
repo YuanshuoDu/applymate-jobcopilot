@@ -17,6 +17,15 @@ const COL_COLORS: Record<JobStatus, string> = {
   interview: '#3B6D11', offer: '#0E7490', rejected: '#A32D2D',
 }
 
+interface JobsPageCache {
+  jobs: Job[]
+  total: number
+}
+
+// Preserve the default list while the latest version is fetched after returning
+// to this section. Searches and filters intentionally remain uncached.
+let defaultJobsCache: JobsPageCache | null = null
+
 type ResumeTailorChange = {
   section: string
   field: string
@@ -1186,9 +1195,9 @@ export function JobsPage() {
   const [showAdd,      setShowAdd     ] = useState(false)
   const [prefillStatus, setPrefillStatus] = useState<JobStatus | null>(null)
   const [cart,         setCart        ] = useState<Job[]>([])
-  const [jobs,         setJobs        ] = useState<Job[]>([])
-  const [total,        setTotal       ] = useState(0)
-  const [loading,      setLoading     ] = useState(true)
+  const [jobs,         setJobs        ] = useState<Job[]>(() => defaultJobsCache?.jobs ?? [])
+  const [total,        setTotal       ] = useState(() => defaultJobsCache?.total ?? 0)
+  const [loading,      setLoading     ] = useState(() => defaultJobsCache === null)
   const [fetchError,   setFetchError  ] = useState<string | null>(null)
   const [selectedJob,  setSelectedJob ] = useState<Job | null>(null)
   const [page,         setPage        ] = useState(1)
@@ -1208,7 +1217,8 @@ export function JobsPage() {
   useEffect(() => {
     let cancelled = false
     const timer = setTimeout(async () => {
-      setLoading(true)
+      const isDefaultView = !search && filterStatus === 'all' && page === 1 && pageSize === 20
+      setLoading(!isDefaultView || defaultJobsCache === null)
       setFetchError(null)
       try {
         const params = new URLSearchParams({ page: String(page), pageSize: String(pageSize) })
@@ -1234,8 +1244,10 @@ export function JobsPage() {
             }
             return sortDir === 'desc' ? cmp : -cmp
           })
+          const nextTotal = json.total ?? 0
+          if (isDefaultView) defaultJobsCache = { jobs: sorted, total: nextTotal }
           setJobs(sorted)
-          setTotal(json.total ?? 0)
+          setTotal(nextTotal)
         }
       } catch {
         if (!cancelled) setFetchError('Failed to load jobs')
