@@ -285,7 +285,7 @@ export function DashboardPage() {
 
         {/* Onboarding */}
         {(stats?.total ?? 0) === 0 && (
-          <OnboardingChecklist hasResume={data?.hasResume ?? false} hasJobs={false} hasExtension={false} hasRunAgent={false} />
+          <OnboardingChecklist hasResume={data?.hasResume ?? false} hasJobs={false} hasRunAgent={false} />
         )}
 
         {/* Stats — 5 real metrics */}

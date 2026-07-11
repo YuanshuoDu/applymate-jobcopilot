@@ -7,7 +7,6 @@ import { useNav } from '@/lib/nav-context'
 interface Props {
   hasResume: boolean
   hasJobs: boolean
-  hasExtension: boolean
   hasRunAgent: boolean
 }
 
@@ -29,15 +28,6 @@ const STEPS = [
     action: 'Add Jobs',
     page: 'jobs' as const,
     check: (p: Props) => p.hasJobs,
-  },
-  {
-    key: 'extension',
-    icon: '🧩',
-    title: 'Install Chrome Extension',
-    desc: 'One-click save jobs while browsing. Works on LinkedIn, Indeed, and StepStone.',
-    action: 'Install Extension',
-    page: 'extension' as const,
-    check: (p: Props) => p.hasExtension,
   },
   {
     key: 'agent',
