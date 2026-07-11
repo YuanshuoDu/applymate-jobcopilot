@@ -6,7 +6,8 @@ import { TopBar } from '@/components/layout/TopBar'
 import { Btn, Card, useToast, useConfirm, UserAvatar } from '@/components/ui'
 import type { UserProfile, UserPreferences } from '@/lib/types'
 import { useApi, apiMutate } from '@/lib/hooks'
-import { useI18n } from '@/lib/i18n'
+import { useI18n, LANGUAGES, type Lang } from '@/lib/i18n'
+import { useTheme, type ThemeMode } from '@/components/ThemeProvider'
 import {
   MODEL_CATALOGUE, PROVIDER_LABELS, FEATURE_LABELS, APPLYMATE_BACKING, APPLYMATE_LABEL,
   type Provider, type AiConfig, type FeatureId, type UserAiSettings,
@@ -86,11 +87,18 @@ function Toggle({ value, onChange }: { value: boolean; onChange: (v: boolean) =>
 
 // ── SettingsPage ──────────────────────────────────────────────────────────────
 
-type Tab = 'profile' | 'accounts' | 'apiKeys' | 'ai' | 'billing' | 'notifs' | 'privacy'
+type Tab = 'profile' | 'appearance' | 'accounts' | 'apiKeys' | 'ai' | 'billing' | 'notifs' | 'privacy'
+
+const THEME_OPTIONS: { mode: ThemeMode; icon: string }[] = [
+  { mode: 'light', icon: '☀' },
+  { mode: 'system', icon: '💻' },
+  { mode: 'dark', icon: '🌙' },
+]
 
 export function SettingsPage() {
   const toast = useToast()
-  const { t } = useI18n()
+  const { lang, t, setLang } = useI18n()
+  const { mode, setMode } = useTheme()
   const [confirm, ConfirmDialog] = useConfirm()
 
   // Load user profile
@@ -162,6 +170,7 @@ export function SettingsPage() {
 
   const TABS: { id: Tab; label: string }[] = [
     { id: 'profile',  label: t('settings.profile')  },
+    { id: 'appearance', label: t('settings.appearance') },
     { id: 'accounts', label: t('settings.accounts') },
     { id: 'apiKeys',  label: 'API Keys'             },
     { id: 'ai',       label: t('settings.ai')       },
@@ -191,6 +200,7 @@ export function SettingsPage() {
 
   const TAB_ICONS: Record<Tab, string> = {
     profile:  '👤',
+    appearance: '🎨',
     accounts: '🔗',
     apiKeys:  '🔑',
     ai:       '🤖',
@@ -337,6 +347,29 @@ export function SettingsPage() {
                 </SettingsSection>
               </div>
             </>
+          )}
+
+          {/* ── Appearance & language ── */}
+          {activeTab === 'appearance' && (
+            <SettingsSection title={t('settings.appearance')}>
+              <FieldRow label={t('settings.theme')}>
+                <div style={{ display: 'flex', border: '1px solid var(--border)', borderRadius: 9, overflow: 'hidden', background: 'var(--bg-secondary)' }}>
+                  {THEME_OPTIONS.map(option => {
+                    const selected = mode === option.mode
+                    return (
+                      <button key={option.mode} type="button" onClick={() => setMode(option.mode)} style={{ minWidth: 88, padding: '7px 10px', border: 'none', borderRight: option.mode === 'dark' ? 'none' : '1px solid var(--border)', cursor: 'pointer', background: selected ? 'rgba(79,70,229,0.14)' : 'transparent', color: selected ? 'var(--primary)' : 'var(--text-muted)', fontFamily: 'inherit', fontSize: 12, fontWeight: selected ? 600 : 400 }}>
+                        {option.icon} {t(`theme.${option.mode}`)}
+                      </button>
+                    )
+                  })}
+                </div>
+              </FieldRow>
+              <FieldRow label={t('lang.label')}>
+                <select value={lang} onChange={event => setLang(event.target.value as Lang)} style={{ minWidth: 210, padding: '7px 10px', border: '1px solid var(--border)', borderRadius: 8, background: 'var(--bg)', color: 'var(--text)', fontFamily: 'inherit', fontSize: 12 }}>
+                  {LANGUAGES.map(language => <option key={language.value} value={language.value}>{language.flag} {language.native}</option>)}
+                </select>
+              </FieldRow>
+            </SettingsSection>
           )}
 
           {/* ── AI 模型 ── */}
