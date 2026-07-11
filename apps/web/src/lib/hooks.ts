@@ -1,31 +1,46 @@
 'use client'
 
-import { useState, useEffect, useCallback } from 'react'
+import { useState, useEffect, useCallback, useRef } from 'react'
+import { getCachedApiResponse, setCachedApiResponse } from './api-cache'
 
 // ── Generic GET hook ──────────────────────────────────────────────────────────
 
-/** SWR-style hook: fetches `url` on mount and when `url` changes */
+/**
+ * SWR-style GET hook. Cached data is displayed immediately after tab navigation
+ * while a fresh request runs in the background; explicit refetches still show
+ * the existing loading state.
+ */
 export function useApi<T>(url: string) {
-  const [data,    setData   ] = useState<T | null>(null)
-  const [loading, setLoading] = useState(true)
+  const initialCache = useRef(getCachedApiResponse<T>(url))
+  const [data,    setData   ] = useState<T | null>(initialCache.current)
+  const [loading, setLoading] = useState(initialCache.current === null)
   const [error,   setError  ] = useState<string | null>(null)
 
-  const refetch = useCallback(async () => {
-    setLoading(true)
+  const load = useCallback(async (showLoading: boolean) => {
+    if (showLoading) setLoading(true)
     setError(null)
     try {
       const res  = await fetch(url)
       const json = await res.json().catch(() => ({}))
       if (!res.ok) throw new Error((json as { error?: string }).error ?? 'Request failed')
-      setData(json as T)
+      const nextData = json as T
+      setCachedApiResponse(url, nextData)
+      setData(nextData)
     } catch (e) {
-      setError(e instanceof Error ? e.message : 'Unknown error')
+      // Preserve usable cached data if a background refresh temporarily fails.
+      if (getCachedApiResponse<T>(url) === null) {
+        setError(e instanceof Error ? e.message : 'Unknown error')
+      }
     } finally {
       setLoading(false)
     }
   }, [url])
 
-  useEffect(() => { refetch() }, [refetch])
+  const refetch = useCallback(() => load(true), [load])
+
+  useEffect(() => {
+    void load(initialCache.current === null)
+  }, [load])
 
   return { data, loading, error, refetch }
 }
