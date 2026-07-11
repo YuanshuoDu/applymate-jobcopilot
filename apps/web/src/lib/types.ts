@@ -314,6 +314,5 @@ export type Page =
   | 'gmail'
   | 'agent'
   | 'agent-history'
-  | 'extension'
   | 'observability'
   | 'settings'
