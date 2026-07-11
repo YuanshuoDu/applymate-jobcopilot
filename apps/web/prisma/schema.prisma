@@ -89,6 +89,8 @@ model User {
   customAgentRoles   CustomAgentRole[]
   agentRunQuestions  AgentRunQuestion[]
   agentRuns          AgentRun[]
+  agentSessions      AgentSession[]
+  agentAutomations   AgentAutomation[]
   resumeVersions ResumeVersion[]
   directions     Direction[]
   coverLetters   CoverLetter[]
@@ -414,6 +416,122 @@ model AgentRun {
 
   @@index([userId, createdAt(sort: Desc)])
   @@map("agent_runs")
+}
+
+model AgentSession {
+  id            String    @id @default(cuid())
+  userId        String
+  goal          String    @db.Text
+  status        String
+  source        String
+  memorySummary String    @default("") @db.Text
+  qualityScore  Float?
+  currentTaskId String?
+  completedAt   DateTime?
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+
+  user       User                   @relation(fields: [userId], references: [id], onDelete: Cascade)
+  tasks      SubAgentTask[]
+  transcript AgentTranscriptEvent[]
+  approvals  AgentApproval[]
+
+  @@index([userId, createdAt(sort: Desc)])
+  @@index([userId, status])
+  @@map("agent_sessions")
+}
+
+model SubAgentTask {
+  id                   String   @id @default(cuid())
+  sessionId            String
+  role                 String
+  taskType             String
+  status               String
+  goal                 String   @db.Text
+  constraints          Json
+  successCriteria      Json
+  allowedActions       Json
+  context              Json
+  expectedOutputSchema Json
+  result               Json?
+  confidence           Float?
+  failureReason        String?  @db.Text
+  qualityGateResult    Json?
+  createdAt            DateTime @default(now())
+  updatedAt            DateTime @updatedAt
+
+  session AgentSession @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+
+  @@index([sessionId, status])
+  @@index([sessionId, role])
+  @@map("sub_agent_tasks")
+}
+
+model AgentTranscriptEvent {
+  id         String   @id @default(cuid())
+  sessionId  String
+  taskId     String?
+  type       String
+  speaker    String
+  title      String?
+  body       String   @db.Text
+  data       Json?
+  durationMs Int?
+  createdAt  DateTime @default(now())
+
+  session AgentSession @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+
+  @@index([sessionId, createdAt])
+  @@index([sessionId, type])
+  @@map("agent_transcript_events")
+}
+
+model AgentApproval {
+  id        String    @id @default(cuid())
+  sessionId String
+  taskId    String?
+  userId    String
+  type      String
+  status    String    @default("pending")
+  title     String
+  body      String    @db.Text
+  impact    Json?
+  payload   Json
+  decidedAt DateTime?
+  createdAt DateTime  @default(now())
+
+  session AgentSession @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+
+  @@index([userId, status, createdAt])
+  @@index([sessionId, status])
+  @@map("agent_approvals")
+}
+
+model AgentAutomation {
+  id              String    @id @default(cuid())
+  userId          String
+  name            String
+  enabled         Boolean   @default(true)
+  triggerType     String
+  cron            String?
+  timezone        String    @default("Europe/Berlin")
+  targetRoles     String[]
+  targetLocations String[]
+  minScore        Int       @default(85)
+  dailyCap        Int       @default(8)
+  requireApproval Boolean   @default(true)
+  autoApply       Boolean   @default(false)
+  createdBy       String    @default("user")
+  lastRunAt       DateTime?
+  nextRunAt       DateTime?
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, enabled, createdAt])
+  @@index([userId, nextRunAt])
+  @@map("agent_automations")
 }
 
 // ─────────────────────────────────────────────

@@ -1,9 +1,9 @@
-import { auth } from '@/lib/auth'
 import { NextRequest, NextResponse } from 'next/server'
 import { jwtVerify } from 'jose'
 import { checkRateLimit } from '@/lib/rate-limit'
 import { resolveFeatureConfig, type UserAiSettings, type FeatureId } from '@/lib/model-router'
 import { db } from '@/lib/db'
+import { safeAuth } from '@/lib/safe-auth'
 
 const JWT_SECRET = new TextEncoder().encode(
   process.env.AUTH_SECRET ?? 'fallback-secret-change-this',
@@ -34,7 +34,7 @@ export async function requireAuth(
   }
 
   // 3. NextAuth session (web app)
-  const session = await auth()
+  const session = await safeAuth()
   if (session?.user?.id) return { userId: session.user.id }
 
   return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })

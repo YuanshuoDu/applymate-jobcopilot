@@ -67,8 +67,25 @@ function getInitialPage(): Page {
   if (typeof window === 'undefined') return 'dashboard'
   const params = new URLSearchParams(window.location.search)
   const pageParam = params.get('page')
-  if (pageParam && pageParam in PAGES) return pageParam as Page
+  if (isPage(pageParam)) return pageParam
   return 'dashboard'
+}
+
+function isPage(value: string | null): value is Page {
+  return Boolean(value && value in PAGES)
+}
+
+function writePageToUrl(nextPage: Page, mode: 'push' | 'replace' = 'push') {
+  if (typeof window === 'undefined') return
+  const url = new URL(window.location.href)
+  if (nextPage === 'dashboard') {
+    url.searchParams.delete('page')
+  } else {
+    url.searchParams.set('page', nextPage)
+  }
+  const nextUrl = `${url.pathname}${url.search}${url.hash}`
+  if (nextUrl === `${window.location.pathname}${window.location.search}${window.location.hash}`) return
+  window.history[mode === 'replace' ? 'replaceState' : 'pushState']({}, '', nextUrl)
 }
 
 export function AppShell() {
@@ -78,6 +95,7 @@ export function AppShell() {
   const { data: session, status } = useSession()
   const router = useRouter()
   const loginSyncInProgress = useRef<boolean>(false)
+  const initialPageRef = useRef(page)
   const PageComp = PAGES[page]
 
   const [checkingOnboard, setCheckingOnboard] = useState(true)
@@ -85,6 +103,11 @@ export function AppShell() {
   const [notifications, setNotifications] = useState<NotificationItem[]>([])
   const [unreadCount, setUnreadCount] = useState(0)
   const [notificationsOpen, setNotificationsOpen] = useState(false)
+
+  function navigatePage(nextPage: Page, mode: 'push' | 'replace' = 'push') {
+    setPage(nextPage)
+    writePageToUrl(nextPage, mode)
+  }
 
   useEffect(() => {
     if (status !== 'authenticated') { setCheckingOnboard(false); return }
@@ -94,14 +117,17 @@ export function AppShell() {
       .catch(() => setCheckingOnboard(false))
   }, [status])
 
-  // Clean up ?page= query param after reading it
   useEffect(() => {
-    const params = new URLSearchParams(window.location.search)
-    if (params.has('page')) {
-      const url = new URL(window.location.href)
-      url.searchParams.delete('page')
-      window.history.replaceState({}, '', url)
+    writePageToUrl(initialPageRef.current, 'replace')
+
+    function handlePopState() {
+      const params = new URLSearchParams(window.location.search)
+      const pageParam = params.get('page')
+      setPage(isPage(pageParam) ? pageParam : 'dashboard')
     }
+
+    window.addEventListener('popstate', handlePopState)
+    return () => window.removeEventListener('popstate', handlePopState)
   }, [])
 
   // Safety timeout
@@ -239,7 +265,7 @@ export function AppShell() {
     await markNotificationRead(n.id)
     setNotificationsOpen(false)
     const target = getNotificationTargetPage(n.type)
-    if (target) setPage(target)
+    if (target) navigatePage(target)
   }
 
   useEffect(() => {
@@ -296,7 +322,7 @@ export function AppShell() {
         }
       `}</style>
       <ToastProvider>
-      <NavContext.Provider value={{ navigate: setPage }}>
+      <NavContext.Provider value={{ navigate: navigatePage }}>
         {/* Onboarding sits inside ToastProvider so useToast works */}
         {needsOnboarding ? (
           <OnboardingFlow onComplete={() => setNeedsOnboarding(false)} />
@@ -304,7 +330,7 @@ export function AppShell() {
           <>
             <div style={{ display: 'flex', height: '100vh', overflow: 'hidden' }}>
               <div id="desktop-sidebar">
-                <Sidebar active={page} onNav={setPage} session={session} jobCount={jobCount} />
+                <Sidebar active={page} onNav={navigatePage} session={session} jobCount={jobCount} />
               </div>
               <div id="main-content" style={{ flex: 1, display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
                 <div style={{ position: 'fixed', top: 10, right: 20, zIndex: 80 }}>
@@ -428,7 +454,7 @@ export function AppShell() {
               {MOB_NAV.map(item => (
                 <button key={item.id}
                   aria-label={item.label}
-                  onClick={() => setPage(item.id)}
+                  onClick={() => navigatePage(item.id)}
                   style={{
                     display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 3,
                     flex: 1, padding: '6px 0', border: 'none', background: 'transparent', cursor: 'pointer',

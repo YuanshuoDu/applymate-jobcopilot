@@ -12,7 +12,7 @@
  */
 import { NextRequest, NextResponse } from 'next/server'
 import { SignJWT } from 'jose'
-import { auth } from '@/lib/auth'
+import { safeAuth } from '@/lib/safe-auth'
 
 const JWT_SECRET = new TextEncoder().encode(
   process.env.AUTH_SECRET ?? 'fallback-secret-change-this',
@@ -27,7 +27,7 @@ const SCOPES = [
 ].join(' ')
 
 export async function GET(req: NextRequest) {
-  const session = await auth()
+  const session = await safeAuth()
   if (!session?.user?.id) {
     return NextResponse.redirect(new URL('/login', req.url))
   }

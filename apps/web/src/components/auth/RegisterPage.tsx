@@ -1,7 +1,7 @@
 'use client'
 
-import React, { useState } from 'react'
-import { signIn } from 'next-auth/react'
+import React, { useEffect, useState } from 'react'
+import { getProviders, signIn } from 'next-auth/react'
 import { useRouter } from 'next/navigation'
 import Link from 'next/link'
 
@@ -93,6 +93,12 @@ export function RegisterPage() {
   const [focused,  setFocused]  = useState<string | null>(null)
   const [step,     setStep]     = useState<'form' | 'success'>('form')
 
+  type Providers = Awaited<ReturnType<typeof getProviders>>
+  const [oauthProviders, setOauthProviders] = useState<Providers>(null)
+  useEffect(() => { getProviders().then(setOauthProviders) }, [])
+  const providersLoaded = oauthProviders !== null
+  const googleAvailable = Boolean(oauthProviders?.google)
+
   function validate(): string | null {
     if (!name.trim())                  return '请填写姓名'
     if (!email.trim())                 return '请填写邮箱'
@@ -114,8 +120,12 @@ export function RegisterPage() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ name, email, password }),
       })
-      const data = await res.json()
-      if (!res.ok) { setError(data.error ?? '注册失败'); setLoading(null); return }
+      const data = await res.json().catch(() => ({} as { error?: string }))
+      if (!res.ok) {
+        setError(data.error ?? (res.status >= 500 ? '服务器配置错误，请检查数据库连接' : '注册失败'))
+        setLoading(null)
+        return
+      }
       const login = await signIn('credentials', { email, password, redirect: false })
       setLoading(null)
       if (login?.error) { router.push('/login') }
@@ -127,6 +137,10 @@ export function RegisterPage() {
   }
 
   async function handleGoogle() {
+    if (!googleAvailable) {
+      setError('Google 登录尚未配置，请先使用邮箱注册或登录。')
+      return
+    }
     setLoading('google')
     await signIn('google', { callbackUrl: '/' })
   }
@@ -279,35 +293,43 @@ export function RegisterPage() {
             </div>
           )}
 
-          {/* Google OAuth */}
-          <div style={{ marginBottom: 22 }}>
-            <button
-              type="button"
-              onClick={handleGoogle}
-              disabled={loading === 'google'}
-              style={{
-                display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 10,
-                width: '100%', padding: '11px 16px',
-                background: loading === 'google' ? 'rgba(255,255,255,0.70)' : 'rgba(255,255,255,0.90)',
-                border: '1px solid rgba(79,70,229,0.18)',
-                borderRadius: 10, fontSize: 13, fontWeight: 500,
-                color: C.text, cursor: loading === 'google' ? 'not-allowed' : 'pointer',
-                opacity: loading === 'google' ? 0.7 : 1,
-                transition: 'all 0.15s',
-                boxShadow: '0 1px 4px rgba(79,70,229,0.08)',
-              }}
-            >
-              {loading === 'google' ? <Spinner /> : <GoogleIcon />}
-              使用 Google 注册
-            </button>
-          </div>
+          {providersLoaded ? (
+            <>
+              {/* Google OAuth */}
+              <div style={{ marginBottom: 22 }}>
+                <button
+                  type="button"
+                  onClick={handleGoogle}
+                  disabled={loading === 'google'}
+                  style={{
+                    display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 10,
+                    width: '100%', padding: '11px 16px',
+                    background: loading === 'google' ? 'rgba(255,255,255,0.70)' : 'rgba(255,255,255,0.90)',
+                    border: '1px solid rgba(79,70,229,0.18)',
+                    borderRadius: 10, fontSize: 13, fontWeight: 500,
+                    color: C.text, cursor: loading === 'google' ? 'not-allowed' : 'pointer',
+                    opacity: loading === 'google' ? 0.7 : 1,
+                    transition: 'all 0.15s',
+                    boxShadow: '0 1px 4px rgba(79,70,229,0.08)',
+                  }}
+                >
+                  {loading === 'google' ? <Spinner /> : <GoogleIcon />}
+                  {googleAvailable ? '使用 Google 登录' : 'Google 登录未配置'}
+                </button>
+              </div>
 
-          {/* Divider */}
-          <div style={{ display: 'flex', alignItems: 'center', gap: 14, marginBottom: 22 }}>
-            <div style={{ flex: 1, height: 1, background: 'linear-gradient(90deg, transparent, rgba(79,70,229,0.20), transparent)' }} />
-            <span style={{ fontSize: 11, color: C.subtle, whiteSpace: 'nowrap' }}>或填写邮箱注册</span>
-            <div style={{ flex: 1, height: 1, background: 'linear-gradient(90deg, transparent, rgba(79,70,229,0.20), transparent)' }} />
-          </div>
+              {/* Divider */}
+              <div style={{ display: 'flex', alignItems: 'center', gap: 14, marginBottom: 22 }}>
+                <div style={{ flex: 1, height: 1, background: 'linear-gradient(90deg, transparent, rgba(79,70,229,0.20), transparent)' }} />
+                <span style={{ fontSize: 11, color: C.subtle, whiteSpace: 'nowrap' }}>或填写邮箱注册</span>
+                <div style={{ flex: 1, height: 1, background: 'linear-gradient(90deg, transparent, rgba(79,70,229,0.20), transparent)' }} />
+              </div>
+            </>
+          ) : (
+            <div style={{ marginBottom: 22 }}>
+              <div style={{ height: 46, borderRadius: 10, background: 'rgba(79,70,229,0.06)' }} />
+            </div>
+          )}
 
           {/* Register form */}
           <form onSubmit={handleRegister} style={{ display: 'flex', flexDirection: 'column', gap: 15 }}>

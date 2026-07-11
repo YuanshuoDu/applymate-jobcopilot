@@ -42,9 +42,7 @@ export function getSidebarNavItems(t: (key: string) => string): SidebarNavItem[]
     { id: 'resume',    label: t('nav.resume')    },
     { id: 'gmail',     label: t('nav.gmail')     },
     { id: 'agent',     label: t('nav.agent')     },
-    { id: 'agent-history', label: t('nav.agentHistory') },
     { id: 'extension', label: t('nav.extension') },
-    { id: 'observability', label: 'Observability' },
     { id: 'settings',  label: t('nav.settings')  },
   ]
 }

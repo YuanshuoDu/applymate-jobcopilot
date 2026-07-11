@@ -144,7 +144,7 @@ export async function runPipeline(ctx: PipelineCtx): Promise<RunReport> {
     const a2 = acceptAnalyze(s2)
 
     if (!a2.ok || !s2.data) {
-      orch.recordFailure('analyst', a2.ok ? 'No data' : (a2 as any).reason ?? 'Analyze failed')
+      orch.recordFailure('analyst', a2.ok ? 'No data' : a2.reason)
       if (orch.isExhausted('analyst')) {
         const decision = await orch.decideOnExhaustion('analyst', 'All scoring failed', { jobsProcessed: 0 })
         if (decision === 'abort') { emit('done', emptyReport(Date.now() - t0)); return emptyReport(Date.now() - t0) }
@@ -225,7 +225,7 @@ export async function runPipeline(ctx: PipelineCtx): Promise<RunReport> {
   emit('agent_plan', {
     role: 'writer',
     plan: ctx.agentCfg.autoCoverLetter
-      ? `计划：为 ${qualifiedCount} 个达标职位生成定制求职信（语调：${(ctx.agentCfg as any).coverTone ?? 'professional'}）`
+      ? `计划：为 ${qualifiedCount} 个达标职位生成定制求职信（语调：${ctx.agentCfg.coverTone || 'professional'}）`
       : `计划：为 ${qualifiedCount} 个达标职位准备申请材料`,
   })
 

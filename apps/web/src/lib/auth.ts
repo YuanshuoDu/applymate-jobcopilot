@@ -8,9 +8,8 @@ import bcrypt from 'bcryptjs'
 import { jwtVerify } from 'jose'
 import { db } from '@/lib/db'
 
-const JWT_SECRET = new TextEncoder().encode(
-  process.env.AUTH_SECRET ?? 'fallback-secret-change-this',
-)
+const AUTH_SECRET = process.env.AUTH_SECRET ?? 'fallback-secret-change-this'
+const JWT_SECRET = new TextEncoder().encode(AUTH_SECRET)
 
 // Build provider list dynamically — OAuth only enabled when keys are set
 const providers: Provider[] = []
@@ -78,6 +77,7 @@ if (process.env.AUTH_GITHUB_ID && process.env.AUTH_GITHUB_SECRET) {
 export const { handlers, signIn, signOut, auth } = NextAuth({
   adapter: PrismaAdapter(db),
   providers,
+  secret: AUTH_SECRET,
   trustHost: true,
   session: { strategy: 'jwt' },
   callbacks: {
