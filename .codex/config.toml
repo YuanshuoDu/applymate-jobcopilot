@@ -1,5 +1,0 @@
-[shell_environment_policy]
-inherit = "core"
-
-[shell_environment_policy.set]
-CLAUDE_CODE_GIT_BASH_PATH = 'D:\Develop Software\Git\Git\bin\bash.exe'

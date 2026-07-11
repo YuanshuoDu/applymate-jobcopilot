@@ -1,14 +1,3 @@
-# Secrets
-.claude/settings.local.json
-client_secret_*.json
-
-# Codex worktree artifacts (30+ dirs)
-jobcopilot-issue*/
-jobcopilot-vercel-fix/
-
-# Runtime lock files
-.claude/scheduled_tasks.lock
-
 # Dependencies
 node_modules/
 .pnpm-store/
@@ -52,13 +41,10 @@ tmp/
 # Chrome test profile
 .chrome-test-profile/
 
-# PoC
-cloak-poc/
-applymate/
+# Claude Code config
+.claude/
 
 # Temp files
 _tmp_*/
-_tmp_*
-.playwright-mcp/
+
 .vercel
-dev-agent*.log
