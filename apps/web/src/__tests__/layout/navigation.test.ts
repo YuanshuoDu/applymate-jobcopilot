@@ -15,6 +15,12 @@ describe('app navigation', () => {
     expect(items.map((item) => item.id)).not.toContain('extension')
   })
 
+  it('keeps settings out of the primary navigation', () => {
+    const items = getSidebarNavItems((key) => key)
+
+    expect(items.map((item) => item.id)).not.toContain('settings')
+  })
+
   it('routes apply notifications to jobs instead of the removed apply history page', () => {
     expect(getNotificationTargetPage('apply_submitted')).toBe('jobs')
     expect(getNotificationTargetPage('message_received')).toBeNull()

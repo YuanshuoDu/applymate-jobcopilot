@@ -1,12 +1,11 @@
 'use client'
 
-import { useState, useEffect, useRef } from 'react'
+import { useState, useEffect } from 'react'
 import { signOut } from 'next-auth/react'
 import type { Session } from 'next-auth'
 import type { Page } from '@/lib/types'
-import { useTheme, type ThemeMode } from '@/components/ThemeProvider'
 import { UserAvatar } from '@/components/ui'
-import { useI18n, LANGUAGES, type Lang } from '@/lib/i18n'
+import { useI18n } from '@/lib/i18n'
 
 interface SidebarProps {
   active:  Page
@@ -41,28 +40,17 @@ export function getSidebarNavItems(t: (key: string) => string): SidebarNavItem[]
     { id: 'resume',    label: t('nav.resume')    },
     { id: 'gmail',     label: t('nav.gmail')     },
     { id: 'agent',     label: t('nav.agent')     },
-    { id: 'settings',  label: t('nav.settings')  },
   ]
 }
 
-// ── Theme mode icons ──────────────────────────────────────────────────────────
-const THEME_OPTIONS: { mode: ThemeMode; icon: string; label: string }[] = [
-  { mode: 'light',  icon: '☀', label: 'Light'  },
-  { mode: 'system', icon: '💻', label: 'System' },
-  { mode: 'dark',   icon: '🌙', label: 'Dark'   },
-]
-
 export function Sidebar({ active, onNav, session, jobCount: jobCountProp }: SidebarProps) {
   const user = session?.user
-  const { theme, mode, setMode } = useTheme()
-  const { lang, t, setLang } = useI18n()
+  const { t } = useI18n()
 
   const [gmailUnread, setGmailUnread] = useState<number | null>(null)
   const [jobCount,    setJobCount]    = useState<number | null>(null)
   const [userPlan,    setUserPlan]    = useState<string | null>(null)
   const [logoutHov,   setLogoutHov]   = useState(false)
-  const [langOpen,    setLangOpen]    = useState(false)
-  const langRef = useRef<HTMLDivElement>(null)
 
   useEffect(() => {
     fetch('/api/gmail/unread').then(r => r.json()).then(d => { if (d.hasGmail) setGmailUnread(d.unread) }).catch(() => {})
@@ -70,23 +58,10 @@ export function Sidebar({ active, onNav, session, jobCount: jobCountProp }: Side
     fetch('/api/me').then(r => r.json()).then(d => { if (d.plan) setUserPlan(d.plan) }).catch(() => {})
   }, [])
 
-  // Close lang dropdown on outside click
-  useEffect(() => {
-    function handler(e: MouseEvent) {
-      if (langRef.current && !langRef.current.contains(e.target as Node)) {
-        setLangOpen(false)
-      }
-    }
-    document.addEventListener('mousedown', handler)
-    return () => document.removeEventListener('mousedown', handler)
-  }, [])
-
   const plan = userPlan ?? (user as { plan?: string } | undefined)?.plan ?? 'free'
   const planLabel = plan === 'enterprise' ? 'Team Plan' : plan === 'pro' ? 'Pro Plan' : 'Free Plan'
   const planColor = plan === 'enterprise' ? '#0284C7' : plan === 'pro' ? '#7C3AED' : '#64748B'
   const planBg    = plan === 'enterprise' ? 'rgba(2,132,199,0.10)' : plan === 'pro' ? 'rgba(124,58,237,0.10)' : 'rgba(100,116,139,0.10)'
-
-  const currentLang = LANGUAGES.find(l => l.value === lang) ?? LANGUAGES[0]
 
   const NAV_ITEMS = getSidebarNavItems(t)
 
@@ -153,94 +128,6 @@ export function Sidebar({ active, onNav, session, jobCount: jobCountProp }: Side
       {/* ── Bottom panel ── */}
       <div style={{ borderTop: '1px solid var(--border)', padding: '10px 10px 12px', display: 'flex', flexDirection: 'column', gap: 8 }}>
 
-        {/* ── Theme mode picker ── */}
-        <div>
-          <div style={{ fontSize: 10, fontWeight: 600, color: 'var(--text-subtle)', letterSpacing: '0.06em', textTransform: 'uppercase', marginBottom: 6, paddingLeft: 2 }}>
-            Appearance
-          </div>
-          <div style={{
-            display: 'flex', borderRadius: 9, overflow: 'hidden',
-            border: '1px solid var(--border)',
-            background: 'var(--bg-secondary)',
-          }}>
-            {THEME_OPTIONS.map(opt => {
-              const active = mode === opt.mode
-              return (
-                <button key={opt.mode} onClick={() => setMode(opt.mode)} title={t(`theme.${opt.mode}`) || opt.label} style={{
-                  flex: 1, padding: '6px 4px', border: 'none', cursor: 'pointer',
-                  display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 2,
-                  background: active
-                    ? 'linear-gradient(135deg, rgba(79,70,229,0.18) 0%, rgba(124,58,237,0.12) 100%)'
-                    : 'transparent',
-                  color: active ? 'var(--primary)' : 'var(--text-muted)',
-                  transition: 'all 0.15s',
-                  borderRight: opt.mode !== 'dark' ? '1px solid var(--border)' : 'none',
-                  fontFamily: 'inherit',
-                }}>
-                  <span style={{ fontSize: 14, lineHeight: 1 }}>{opt.icon}</span>
-                  <span style={{ fontSize: 9, fontWeight: active ? 700 : 400, letterSpacing: '0.02em' }}>
-                    {t(`theme.${opt.mode}`) || opt.label}
-                  </span>
-                </button>
-              )
-            })}
-          </div>
-        </div>
-
-        {/* ── Language picker ── */}
-        <div ref={langRef} style={{ position: 'relative' }}>
-          <div style={{ fontSize: 10, fontWeight: 600, color: 'var(--text-subtle)', letterSpacing: '0.06em', textTransform: 'uppercase', marginBottom: 6, paddingLeft: 2 }}>
-            {t('lang.label')}
-          </div>
-          <button onClick={() => setLangOpen(v => !v)} style={{
-            width: '100%', padding: '7px 10px',
-            border: '1px solid var(--border)', borderRadius: 9,
-            background: langOpen ? 'rgba(79,70,229,0.08)' : 'var(--bg-secondary)',
-            color: 'var(--text)', fontSize: 12, cursor: 'pointer',
-            display: 'flex', alignItems: 'center', gap: 7,
-            transition: 'all 0.15s', fontFamily: 'inherit',
-          }}>
-            <span style={{ fontSize: 15 }}>{currentLang.flag}</span>
-            <span style={{ flex: 1, textAlign: 'left', fontWeight: 500 }}>{currentLang.native}</span>
-            <span style={{ fontSize: 10, color: 'var(--text-muted)', transition: 'transform 0.2s', transform: langOpen ? 'rotate(180deg)' : 'none' }}>▾</span>
-          </button>
-
-          {langOpen && (
-            <>
-              <div style={{ position: 'fixed', inset: 0, zIndex: 99 }} onClick={() => setLangOpen(false)} />
-              <div style={{
-                position: 'absolute', bottom: '110%', left: 0, right: 0, zIndex: 100,
-                background: 'var(--glass-modal)',
-                backdropFilter: 'blur(20px)',
-                WebkitBackdropFilter: 'blur(20px)',
-                border: '1px solid var(--border-glass)',
-                borderRadius: 12,
-                boxShadow: '0 8px 32px rgba(0,0,0,0.20)',
-                overflow: 'hidden',
-              }}>
-                {LANGUAGES.map(l => {
-                  const selected = l.value === lang
-                  return (
-                    <button key={l.value} onClick={() => { setLang(l.value as Lang); setLangOpen(false) }} style={{
-                      display: 'flex', alignItems: 'center', gap: 9,
-                      width: '100%', padding: '9px 12px', border: 'none', cursor: 'pointer',
-                      background: selected ? 'rgba(79,70,229,0.10)' : 'transparent',
-                      color: selected ? 'var(--primary)' : 'var(--text)',
-                      fontSize: 13, textAlign: 'left', fontFamily: 'inherit',
-                      transition: 'background 0.12s',
-                    }}>
-                      <span style={{ fontSize: 16 }}>{l.flag}</span>
-                      <span style={{ flex: 1 }}>{l.native}</span>
-                      <span style={{ fontSize: 11, color: 'var(--text-subtle)' }}>{l.label}</span>
-                      {selected && <span style={{ fontSize: 11, color: 'var(--primary)' }}>✓</span>}
-                    </button>
-                  )
-                })}
-              </div>
-            </>
-          )}
-        </div>
-
         {/* ── User info + sign out ── */}
         <div style={{ borderTop: '1px solid var(--border)', paddingTop: 8 }}>
           {/* Plan badge */}
@@ -249,7 +136,7 @@ export function Sidebar({ active, onNav, session, jobCount: jobCountProp }: Side
           </div>
 
           {/* User row */}
-          <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 6 }}>
+          <button onClick={() => onNav('settings')} title={t('nav.settings')} style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 6, width: '100%', padding: 4, border: 'none', borderRadius: 8, background: active === 'settings' ? 'rgba(79,70,229,0.10)' : 'transparent', cursor: 'pointer', textAlign: 'left', fontFamily: 'inherit' }}>
             <UserAvatar src={user?.image} name={user?.name} email={user?.email} size={26} />
             <div style={{ flex: 1, minWidth: 0 }}>
               <div style={{ fontSize: 12, fontWeight: 500, color: 'var(--text)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
@@ -259,7 +146,8 @@ export function Sidebar({ active, onNav, session, jobCount: jobCountProp }: Side
                 {user?.email ?? ''}
               </div>
             </div>
-          </div>
+            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" style={{ color: active === 'settings' ? 'var(--primary)' : 'var(--text-muted)', flexShrink: 0 }}><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 15a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
+          </button>
 
           {/* Sign out */}
           <button
