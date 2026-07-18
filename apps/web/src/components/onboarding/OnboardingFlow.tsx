@@ -1,18 +1,31 @@
 'use client'
 import React, { useState } from 'react'
+import {
+  BriefcaseBusiness, Check, FileText, Globe2, GraduationCap, Rocket,
+  Settings2, Sparkles, Target, UserRound, WandSparkles,
+} from 'lucide-react'
 import { Btn, useToast } from '@/components/ui'
 import { apiMutate } from '@/lib/hooks'
 import { useI18n } from '@/lib/i18n'
 import type { Direction } from '@/lib/types'
 import { ResumeIntakeDialog } from '@/components/resume/ResumeIntakeDialog'
+import './OnboardingFlow.css'
 
 // ── Constants ──────────────────────────────────────────────────────────────────
 
 const GOAL_CHIPS = [
-  { id: 'abroad', label: '🌍 Studying abroad job hunt' },
-  { id: 'grad',   label: '🎓 New grad' },
-  { id: 'switch', label: '🔄 Career switch' },
-  { id: 'intern', label: '💼 Internship' },
+  { id: 'abroad', label: 'International job search', description: 'Find work in a new country.', icon: Globe2 },
+  { id: 'grad',   label: 'New graduate', description: 'Start your first role with confidence.', icon: GraduationCap },
+  { id: 'switch', label: 'Career change', description: 'Move into a new field or industry.', icon: WandSparkles },
+  { id: 'intern', label: 'Internship', description: 'Discover hands-on early-career roles.', icon: BriefcaseBusiness },
+]
+
+const STEPS = [
+  { label: 'Your goal', detail: 'Why you’re here', icon: Target },
+  { label: 'About you', detail: 'Your background', icon: UserRound },
+  { label: 'Preferences', detail: 'Roles and locations', icon: Sparkles },
+  { label: 'Your resume', detail: 'Ready to tailor', icon: FileText },
+  { label: 'Launch', detail: 'Review and start', icon: Rocket },
 ]
 
 const STARTER_GROUPS = [
@@ -48,52 +61,48 @@ function StepLayout({ step, title, desc, children, onBack, onContinue, onSkip, c
   t: (k: string) => string
 }) {
   return (
-    <div style={{ display: 'flex', flexDirection: 'column', height: '100%' }}>
-      {/* Progress */}
-      <div style={{ padding: '20px 32px 0', display: 'flex', alignItems: 'center', gap: 8 }}>
-        {Array.from({ length: TOTAL_STEPS }, (_, i) => (
-          <div key={i} style={{
-            width: i === step - 1 ? 20 : 8, height: 8, borderRadius: 4, transition: 'width 0.2s',
-            background: i < step ? 'var(--primary)' : i === step - 1 ? 'var(--primary)' : 'var(--border)',
-          }} />
-        ))}
-        <span style={{ fontSize: 11, color: 'var(--text-muted)', marginLeft: 8 }}>
-          {t('onboarding.step' + step + '.title') !== ('onboarding.step' + step + '.title')
-            ? `Step ${step} ${t('onboarding.of')} ${TOTAL_STEPS}`
-            : `Step ${step} ${t('onboarding.of')} ${TOTAL_STEPS}`
-          }
-        </span>
-      </div>
-
-      {/* Header */}
-      <div style={{ padding: '24px 32px 16px' }}>
-        <h2 style={{ margin: 0, fontSize: 22, fontWeight: 700, color: 'var(--text)' }}>{title}</h2>
-        <p style={{ margin: '6px 0 0', fontSize: 13, color: 'var(--text-muted)' }}>{desc}</p>
-      </div>
-
-      {/* Content */}
-      <div style={{ flex: 1, overflowY: 'auto', padding: '0 32px' }}>
-        {children}
-      </div>
-
-      {/* Footer */}
-      <div style={{ padding: '16px 32px 28px', display: 'flex', alignItems: 'center', justifyContent: 'space-between', borderTop: '0.5px solid var(--border)', marginTop: 16 }}>
-        <div>
-          {onBack && (
-            <Btn variant="ghost" onClick={onBack}>{t('onboarding.back')}</Btn>
-          )}
+    <div className="onboarding-layout">
+      <aside className="onboarding-rail" aria-label="Onboarding progress">
+        <div className="onboarding-wordmark"><Sparkles size={21} /> ApplyMate <b>AI</b></div>
+        <div className="onboarding-steps">
+          {STEPS.map((item, index) => {
+            const Icon = item.icon
+            const active = index + 1 === step
+            const complete = index + 1 < step
+            return <div className={`onboarding-rail-step ${active ? 'is-active' : ''} ${complete ? 'is-complete' : ''}`} key={item.label}>
+              <div className="onboarding-step-dot">{complete ? <Check size={14} /> : index + 1}</div>
+              <div><strong>{item.label}</strong><span>{item.detail}</span></div>
+              {active && <Icon size={16} />}
+            </div>
+          })}
         </div>
-        <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
-          {onSkip && (
-            <button onClick={onSkip} style={{ fontSize: 12, color: 'var(--text-muted)', background: 'none', border: 'none', cursor: 'pointer', textDecoration: 'underline', padding: '0 4px' }}>
-              {t('onboarding.step1.skip')}
-            </button>
-          )}
-          <Btn variant="primary" onClick={onContinue} disabled={disableContinue}>
-            {continueLabel ?? t('onboarding.continue')}
-          </Btn>
-        </div>
-      </div>
+        <div className="onboarding-rail-note"><Sparkles size={18} /><p>We’ll personalise your search, save time, and improve each match.</p></div>
+      </aside>
+
+      <section className="onboarding-main">
+        <div className="onboarding-progress"><div className="onboarding-progress-dots">{Array.from({ length: TOTAL_STEPS }, (_, i) => <i className={i < step ? 'done' : ''} key={i} />)}</div><span>Step {step} of {TOTAL_STEPS}</span></div>
+        <header className="onboarding-heading"><h2>{title}</h2><p>{desc}</p></header>
+        <div className="onboarding-content">{children}</div>
+        <footer className="onboarding-footer">
+          {onBack ? <Btn variant="ghost" onClick={onBack}>Back</Btn> : <span />}
+          <div>{onSkip && <button className="onboarding-skip" onClick={onSkip}>Skip for now</button>}<Btn variant="primary" onClick={onContinue} disabled={disableContinue}>{continueLabel ?? 'Continue'}</Btn></div>
+        </footer>
+      </section>
+
+      <aside className="onboarding-plan">
+        <div className="onboarding-plan-label">YOUR LAUNCH PLAN <span>Preview</span></div>
+        {STEPS.slice(0, 4).map((item, index) => {
+          const Icon = item.icon
+          const complete = index + 1 < step
+          const active = index + 1 === step
+          return <div className={`onboarding-plan-item ${active ? 'is-active' : ''}`} key={item.label}>
+            <div className="onboarding-plan-icon"><Icon size={22} /></div>
+            <div><strong>{item.label}</strong><p>{complete ? 'Ready to power better matches.' : active ? 'We’re setting this up now.' : 'Unlock this in the next step.'}</p></div>
+            {complete && <Check size={18} className="onboarding-check" />}
+          </div>
+        })}
+        <div className="onboarding-dashboard-preview"><span>WHAT YOU’LL UNLOCK</span><strong>Personalised job matches</strong><p>AI will identify the best roles and prepare your applications.</p><div><i /><i /><i /><i /></div></div>
+      </aside>
     </div>
   )
 }
@@ -110,45 +119,28 @@ function Step1({ goals, onToggle, onContinue, onSkipAll, t }: {
   return (
     <StepLayout
       step={1}
-      title={t('onboarding.step1.title')}
-      desc={t('onboarding.step1.desc')}
+      title="What brings you here?"
+      desc="We’ll build a job-search launch plan around your goals. You can change this any time."
       onContinue={onContinue}
       onSkip={onSkipAll}
       t={t}
     >
-      <div style={{ display: 'flex', flexWrap: 'wrap', gap: 12, paddingTop: 8 }}>
+      <div className="onboarding-goal-grid">
         {GOAL_CHIPS.map(chip => {
           const selected = goals.includes(chip.id)
+          const Icon = chip.icon
           return (
             <button
               key={chip.id}
               onClick={() => onToggle(chip.id)}
-              style={{
-                padding: '10px 18px',
-                borderRadius: 999,
-                border: `1.5px solid ${selected ? 'var(--primary)' : 'var(--border)'}`,
-                background: selected ? 'rgba(79,70,229,0.08)' : 'var(--bg)',
-                color: selected ? 'var(--primary)' : 'var(--text)',
-                fontSize: 13,
-                fontFamily: 'inherit',
-                cursor: 'pointer',
-                transition: 'all 0.15s',
-                fontWeight: selected ? 600 : 400,
-              }}
+              className={`onboarding-goal-card ${selected ? 'is-selected' : ''}`}
             >
-              {chip.label}
+              <Icon size={26} strokeWidth={1.7} /><strong>{chip.label}</strong><span>{chip.description}</span>{selected && <Check size={17} className="onboarding-goal-check" />}
             </button>
           )
         })}
       </div>
-      <div style={{ marginTop: 24 }}>
-        <button
-          onClick={onSkipAll}
-          style={{ fontSize: 11, color: 'var(--text-muted)', background: 'none', border: 'none', cursor: 'pointer', textDecoration: 'underline' }}
-        >
-          {t('onboarding.skipAll')}
-        </button>
-      </div>
+      <button className="onboarding-skip-all" onClick={onSkipAll}>I’ll set this up later</button>
     </StepLayout>
   )
 }
@@ -188,18 +180,19 @@ function Step2({ persona, onChange, onBack, onContinue, onSkip, t }: {
   return (
     <StepLayout
       step={2}
-      title={t('onboarding.step2.title')}
-      desc={t('onboarding.step2.desc')}
+      title="Let’s get the basics right"
+      desc="This information lets ApplyMate tailor your materials and spot the right opportunities."
       onBack={onBack}
       onContinue={onContinue}
       onSkip={onSkip}
       disableContinue={!persona.name || !persona.email}
       t={t}
     >
-      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '14px 20px', paddingTop: 8 }}>
+      <div className="onboarding-profile-note"><UserRound size={18} />The basics help us tailor every job, resume, and application. You can refine these later.</div>
+      <div className="onboarding-profile-grid">
         {fields.map(f => (
-          <div key={f.key} style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
-            <label style={{ fontSize: 11, color: 'var(--text-muted)', fontWeight: 500 }}>
+          <div key={f.key} className="onboarding-field">
+            <label>
               {f.label}{f.required && <span style={{ color: 'var(--c-danger)' }}> *</span>}
             </label>
             <input
@@ -207,16 +200,7 @@ function Step2({ persona, onChange, onBack, onContinue, onSkip, t }: {
               value={persona[f.key]}
               onChange={e => onChange(f.key, e.target.value)}
               placeholder={f.placeholder}
-              style={{
-                padding: '8px 10px',
-                borderRadius: 7,
-                border: '0.5px solid var(--border)',
-                background: 'var(--bg)',
-                color: 'var(--text)',
-                fontSize: 13,
-                fontFamily: 'inherit',
-                outline: 'none',
-              }}
+              className="onboarding-input"
             />
           </div>
         ))}
@@ -248,8 +232,8 @@ function Step3({ directions, onAdd, onRemove, onBack, onContinue, onSkip, t }: {
   return (
     <StepLayout
       step={3}
-      title={t('onboarding.step3.title')}
-      desc={t('onboarding.step3.desc')}
+      title="Choose your target directions"
+      desc="Add the roles or career paths you want ApplyMate to prioritise."
       onBack={onBack}
       onContinue={onContinue}
       onSkip={onSkip}
@@ -348,8 +332,8 @@ function Step4({ directions, doneSet, onOpen, onBack, onContinue, onSkip, t }: {
   return (
     <StepLayout
       step={4}
-      title={t('onboarding.step4.title')}
-      desc={t('onboarding.step4.desc')}
+      title="Add a resume to tailor"
+      desc="We’ll extract your strongest experience and adapt it to every high-match role."
       onBack={onBack}
       onContinue={onContinue}
       onSkip={onSkip}
@@ -405,14 +389,14 @@ function Step5({ templateId, accentColor, fontFamily, onTemplate, onColor, onFon
   return (
     <StepLayout
       step={5}
-      title={t('onboarding.step5.title')}
-      desc={t('onboarding.step5.desc')}
+      title="You’re ready to launch"
+      desc="Choose a default presentation style, connect your tools, and start your job search."
       onBack={onBack}
       onContinue={onFinish}
-      continueLabel={t('onboarding.step5.finish')}
+      continueLabel="Start exploring jobs"
       t={t}
     >
-      <div style={{ display: 'flex', flexDirection: 'column', gap: 24, paddingTop: 8 }}>
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 20, paddingTop: 8 }}>
         {/* Template picker */}
         <div>
           <div style={{ fontSize: 11, fontWeight: 600, color: 'var(--text-muted)', marginBottom: 10, textTransform: 'uppercase', letterSpacing: '0.05em' }}>Default Template</div>
@@ -471,7 +455,7 @@ function Step5({ templateId, accentColor, fontFamily, onTemplate, onColor, onFon
         </div>
 
         {/* Connect cards */}
-        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: 12 }}>
+        <div className="onboarding-connect-grid">
           <div style={{ padding: 16, borderRadius: 10, border: '0.5px solid var(--border)', background: 'var(--bg-secondary)', display: 'flex', flexDirection: 'column', gap: 8 }}>
             <span style={{ fontSize: 18 }}>🧩</span>
             <div style={{ fontSize: 12, fontWeight: 600 }}>Chrome Extension</div>
@@ -632,14 +616,15 @@ export function OnboardingFlow({ onComplete }: Props) {
   return (
     <div style={{
       position: 'fixed', inset: 0, zIndex: 400,
-      background: 'var(--bg)',
-      display: 'flex', alignItems: 'center', justifyContent: 'center',
+      background: 'var(--bg-mesh)',
+        display: 'flex', alignItems: 'center', justifyContent: 'center',
+      padding: 28,
     }}>
       <div style={{
-        width: '100%', maxWidth: 680, height: '100%', maxHeight: 680,
-        display: 'flex', flexDirection: 'column',
-        border: '0.5px solid var(--border)', borderRadius: 16,
-        boxShadow: '0 8px 32px rgba(0,0,0,0.12)',
+        width: '100%', maxWidth: 1360, height: '100%', maxHeight: 840,
+        display: 'flex', flexDirection: 'column', minHeight: 0,
+        border: '1px solid rgba(99,102,241,0.16)', borderRadius: 22,
+        boxShadow: '0 22px 60px rgba(57,50,135,0.18)',
         background: 'var(--bg)', overflow: 'hidden',
       }}>
         {step === 1 && (

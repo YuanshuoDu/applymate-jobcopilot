@@ -230,12 +230,32 @@ export async function runPipeline(ctx: PipelineCtx): Promise<RunReport> {
   })
 
   let preparedPackages: Awaited<ReturnType<typeof runPrepare>>['data'] extends { packages: infer P } | undefined ? P : never = []
+  let allowResumeTailoring = true
+
+  // Resume tailoring creates a new candidate artifact. Keep that mutation behind
+  // an explicit user gate; the Reviewer remains a separate final approval gate.
+  if (ctx.agentCfg.requireApproval) {
+    const decision = await orch.ask('writer',
+      `Writer 准备为 ${qualifiedCount} 个达标职位应用 AI 修改，生成定制简历并保留职位与模板连接。是否继续？`,
+      [
+        { label: '应用 AI 修改并生成定制简历', value: 'apply_ai_changes' },
+        { label: '仅生成求职信，简历保持不变', value: 'keep_resume' },
+      ],
+    )
+    allowResumeTailoring = decision === 'apply_ai_changes'
+    if (!allowResumeTailoring) {
+      emit('agent_observation', {
+        role: 'writer',
+        observation: '已保留原简历；Writer 只会准备不修改简历的申请材料。',
+      })
+    }
+  }
 
   prepareLoop: while (true) {
     const attempt = orch.nextAttempt('writer')
     if (attempt > 1) orch.emitRetry('writer', attempt, 2, '使用简化模板重新生成求职信…')
 
-    const s3 = await runPrepare(scoredJobs, ctx)
+    const s3 = await runPrepare(scoredJobs, ctx, { allowResumeTailoring })
     // Prepare is non-fatal; acceptPrepare returns ok=true even with partial failures
     const lettersCount = s3.data!.packages.filter(p => p.coverLetter).length
     const writerSummary = ctx.agentCfg.autoCoverLetter

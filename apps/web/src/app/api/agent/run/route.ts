@@ -19,7 +19,7 @@
 import { NextRequest }                              from 'next/server'
 import { Prisma }                                   from '@prisma/client'
 import { db }                                       from '@/lib/db'
-import { prepareAiRoute, sseResponse }               from '@/lib/api-helpers'
+import { err, prepareAiRoute, sseResponse }          from '@/lib/api-helpers'
 import { runPipeline }                               from '@/lib/agent/pipeline'
 import { createRunSessionRecorder }                  from '@/lib/agent/session/run-recorder'
 import { resumeToText }                              from '@/lib/agent/types'
@@ -102,13 +102,24 @@ export async function GET(req: NextRequest) {
 
   // autonomous=true → never pause, make all decisions automatically
   const autonomous = req.nextUrl.searchParams.get('autonomous') === 'true'
+  const requestedSessionId = req.nextUrl.searchParams.get('sessionId')
+  let sessionId: string | undefined
+  if (requestedSessionId) {
+    const existing = await db.agentSession.findFirst({
+      where: { id: requestedSessionId, userId: prep.userId },
+      select: { id: true },
+    })
+    if (!existing) return err('Session not found', 404)
+    sessionId = existing.id
+  }
 
   return sseResponse(async emit => {
     const startedAt = Date.now()
     const events: AgentHistoryEvent[] = []
     const recorder = await createRunSessionRecorder(db, {
       userId: prep.userId,
-      goal: 'Manual Agent Pipeline Run',
+      goal: sessionId ? 'Chat Agent Pipeline Run' : 'Manual Agent Pipeline Run',
+      sessionId,
     })
     const sessionWrites: Promise<unknown>[] = []
     async function finalizeSession(status: 'completed' | 'failed', report: RunReport | null) {
@@ -154,6 +165,11 @@ export async function GET(req: NextRequest) {
       roleConfigs,
       resumeText: resumeToText(resume.content as unknown as ResumeContent).slice(0, 2500),
       resumeContent: resume.content as unknown as ResumeContent,
+      defaultResume: {
+        id: resume.id, name: resume.name, templateId: resume.templateId ?? null,
+        templateOptions: resume.templateOptions, directionId: resume.directionId ?? null,
+        basicsDetached: resume.basicsDetached ?? false,
+      },
       aiConfig:  prep.cfg,
       autonomous,
       emit: emitHistory,

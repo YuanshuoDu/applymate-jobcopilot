@@ -4,7 +4,7 @@ import React from 'react'
 import { SmartMessage } from './SmartMessage'
 import { TranscriptSpecialContent, type TranscriptAction } from './TranscriptSpecialBlocks'
 import type { AgentTranscriptEvent, EventTone } from './session-view-model'
-import { eventChrome, eventSubtitle, shouldCollapseByDefault } from './session-view-model'
+import { EVENT_TONE_COLOR, eventChrome, eventSubtitle, shouldCollapseByDefault } from './session-view-model'
 
 export { SmartMessage } from './SmartMessage'
 
@@ -23,17 +23,18 @@ interface LogEntryLike {
   answered?: boolean
 }
 
-export function LiveLogTranscriptBlock({ entry, speaker, accent }: {
+export function LiveLogTranscriptBlock({ entry, speaker, accent, title }: {
   entry: LogEntryLike
   speaker: string
   accent: string
+  title?: string
 }) {
   return (
     <article style={transcriptArticleStyle(accent)}>
-      <div style={{ display: 'flex', alignItems: 'baseline', gap: 7, marginBottom: 7 }}>
-        <div style={{ fontSize: 12, fontWeight: 760, color: accent }}>{speaker}</div>
-        <div style={{ fontSize: 10, color: 'var(--text-muted)' }}>
-          {entry.type === 'user_message' ? 'Message' : entry.type === 'error' ? 'Error' : 'Thinking summary'}
+      <div style={{ display: 'flex', alignItems: 'baseline', gap: 10, marginBottom: 12 }}>
+        <div style={{ fontSize: 13, fontWeight: 750, color: accent }}>{speaker}</div>
+        <div style={{ fontSize: 11, color: 'var(--text-muted)' }}>
+          {title ?? (entry.type === 'user_message' ? 'Message' : entry.type === 'error' ? 'Error' : 'Thinking summary')}
         </div>
       </div>
       <SmartMessage text={entry.message} color="var(--text)" />
@@ -67,15 +68,15 @@ export function LiveQuestionTranscriptBlock({ entry, speaker, title, accent, onS
 
   return (
     <article style={transcriptArticleStyle(accent)}>
-      <div style={{ display: 'flex', alignItems: 'baseline', gap: 7, marginBottom: 7 }}>
-        <div style={{ fontSize: 12, fontWeight: 760, color: accent }}>{speaker}</div>
-        <div style={{ fontSize: 10, color: 'var(--text-muted)' }}>{title}</div>
+      <div style={{ display: 'flex', alignItems: 'baseline', gap: 10, marginBottom: 12 }}>
+        <div style={{ fontSize: 13, fontWeight: 750, color: accent }}>{speaker}</div>
+        <div style={{ fontSize: 11, color: 'var(--text-muted)' }}>{title}</div>
       </div>
-      <div style={{ fontSize: 12, color: 'var(--text)', lineHeight: 1.7, marginBottom: entry.answered ? 0 : 9 }}>
+      <div style={{ fontSize: 12, color: 'var(--text)', lineHeight: 1.7, marginBottom: entry.answered ? 0 : 12 }}>
         {entry.question ?? entry.message}
       </div>
       {!entry.answered && entry.options && entry.options.length > 0 && (
-        <div style={{ display: 'grid', gap: 6 }}>
+        <div style={{ display: 'grid', gap: 8 }}>
           {entry.options.map((option, index) => (
             <button
               key={`${option.value}-${index}`}
@@ -89,12 +90,12 @@ export function LiveQuestionTranscriptBlock({ entry, speaker, title, accent, onS
                 justifyContent: 'space-between',
                 gap: 10,
                 border: `1px solid ${accent}`,
-                borderRadius: 7,
+                borderRadius: 8,
                 background: 'var(--bg-secondary)',
                 color: pendingValue ? 'var(--text-muted)' : 'var(--text)',
                 cursor: pendingValue ? 'wait' : 'pointer',
                 opacity: pendingValue && pendingValue !== option.value ? 0.62 : 1,
-                padding: '7px 10px',
+                padding: '10px 12px',
                 textAlign: 'left',
                 fontFamily: 'inherit',
                 fontSize: 11,
@@ -137,38 +138,31 @@ export function LiveTranscriptBlock({ event, actedApprovalIds, revealThinkingVer
   }, [event.type, revealThinkingVersion])
 
   return (
-    <article data-agent-event-type={event.type} style={{ border: `1px solid ${style.border}`, borderRadius: 8, background: style.bg, overflow: 'hidden', margin: '6px 0' }}>
+    <article data-agent-event-type={event.type} style={transcriptArticleStyle(style.text)}>
       <button
         onClick={() => shouldCollapseByDefault(event.type) && setExpanded(value => !value)}
         style={{
           width: '100%',
           display: 'flex',
           alignItems: 'center',
-          justifyContent: 'space-between',
-          gap: 12,
-          padding: '9px 12px',
-          background: 'rgba(255,255,255,0.35)',
+          justifyContent: 'flex-start',
+          gap: 10,
+          padding: 0,
+          background: 'transparent',
           border: 'none',
-          borderBottom: expanded ? `1px solid ${style.border}` : 'none',
           cursor: shouldCollapseByDefault(event.type) ? 'pointer' : 'default',
           fontFamily: 'inherit',
           textAlign: 'left',
         }}
       >
-        <div style={{ minWidth: 0 }}>
-          <div style={{ fontSize: 12, fontWeight: 750, color: style.text, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-            {event.speaker}
-          </div>
-          <div style={{ fontSize: 10, color: 'var(--text-muted)', marginTop: 2 }}>{event.title ?? chrome.label}</div>
-        </div>
-        {shouldCollapseByDefault(event.type) && (
-          <span style={{ fontSize: 10, color: style.text, fontWeight: 650 }}>{expanded ? 'Hide' : 'Show'}</span>
-        )}
+        {shouldCollapseByDefault(event.type) && <span style={{ color: 'var(--text-muted)', fontSize: 12 }}>{expanded ? '▼' : '▶'}</span>}
+        <div style={{ fontSize: 13, fontWeight: 750, color: style.text, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{event.speaker}</div>
+        <div style={{ fontSize: 11, color: 'var(--text-muted)' }}>{event.title ?? chrome.label}</div>
       </button>
       {expanded && (
-        <div style={{ padding: '11px 13px 10px' }}>
+        <div style={{ marginTop: 12 }}>
           <TranscriptSpecialContent event={event} border={style.border} actedApprovalIds={actedApprovalIds} onAction={onAction} />
-          <div style={{ marginTop: 10, fontSize: 10, color: 'var(--text-muted)', borderTop: `1px solid ${style.border}`, paddingTop: 7 }}>
+          <div style={{ marginTop: 12, fontSize: 10, color: 'var(--text-muted)', borderTop: '1px solid var(--border)', paddingTop: 9 }}>
             {eventSubtitle(event)}
           </div>
         </div>
@@ -184,8 +178,8 @@ export function shouldRevealThinkingBlock(eventType: string, revealThinkingVersi
 function TranscriptTime({ time }: { time: Date }) {
   return (
     <div style={{
-      marginTop: 8,
-      paddingTop: 7,
+      marginTop: 12,
+      paddingTop: 9,
       borderTop: '1px solid var(--border)',
       fontSize: 10,
       color: 'var(--text-muted)',
@@ -197,22 +191,18 @@ function TranscriptTime({ time }: { time: Date }) {
 
 function transcriptArticleStyle(accent: string): React.CSSProperties {
   return {
+    flexShrink: 0,
     border: '1px solid var(--border)',
-    borderLeft: `3px solid ${accent}`,
-    borderRadius: 8,
+    borderLeft: `4px solid ${accent}`,
+    borderRadius: 10,
     background: 'var(--bg)',
-    margin: '6px 0',
-    padding: '10px 12px',
-    boxShadow: '0 1px 4px rgba(15,23,42,0.04)',
+    margin: 0,
+    padding: '15px 18px',
+    boxShadow: 'var(--shadow-sm)',
   }
 }
 
 function liveToneStyle(tone: EventTone) {
-  if (tone === 'user') return { border: 'rgba(99,102,241,0.32)', bg: 'rgba(99,102,241,0.05)', text: 'var(--primary)' }
-  if (tone === 'orchestrator') return { border: 'rgba(79,70,229,0.35)', bg: 'rgba(79,70,229,0.05)', text: 'var(--primary)' }
-  if (tone === 'subagent') return { border: 'rgba(14,165,233,0.32)', bg: 'rgba(14,165,233,0.05)', text: '#0369a1' }
-  if (tone === 'approval') return { border: 'rgba(245,158,11,0.46)', bg: 'rgba(245,158,11,0.08)', text: '#92400e' }
-  if (tone === 'success') return { border: 'rgba(34,197,94,0.35)', bg: 'rgba(34,197,94,0.06)', text: 'var(--c-success)' }
-  if (tone === 'error') return { border: 'rgba(239,68,68,0.38)', bg: 'rgba(239,68,68,0.07)', text: 'var(--c-danger)' }
-  return { border: 'var(--border)', bg: 'var(--bg)', text: 'var(--text)' }
+  const text = EVENT_TONE_COLOR[tone]
+  return { border: `${text}55`, text }
 }

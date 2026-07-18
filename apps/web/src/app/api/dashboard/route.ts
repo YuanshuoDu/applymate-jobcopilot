@@ -4,7 +4,16 @@
 import { requireAuth, isErrorResponse, ok } from '@/lib/api-helpers'
 import { db } from '@/lib/db'
 
-export async function GET() {
+function getDateParam(value: string | null, fallback: Date, endOfDay = false) {
+  if (!value) return fallback
+  const date = new Date(value)
+  if (Number.isNaN(date.getTime())) return fallback
+  if (endOfDay) date.setHours(23, 59, 59, 999)
+  else date.setHours(0, 0, 0, 0)
+  return date
+}
+
+export async function GET(request: Request) {
   const auth = await requireAuth()
   if (isErrorResponse(auth)) return auth
 
@@ -30,11 +39,16 @@ export async function GET() {
   const offers     = pipeline.offer      ?? 0
   const rejected   = pipeline.rejected   ?? 0
 
-  // Jobs applied this week
-  const weekStart = new Date()
-  weekStart.setDate(weekStart.getDate() - 7)
+  // Jobs applied inside the selected dashboard week. Defaults to the last 7 days
+  // to preserve the original dashboard behaviour for existing callers.
+  const params = new URL(request.url).searchParams
+  const defaultStart = new Date()
+  defaultStart.setDate(defaultStart.getDate() - 7)
+  const defaultEnd = new Date()
+  const rangeStart = getDateParam(params.get('from'), defaultStart)
+  const rangeEnd = getDateParam(params.get('to'), defaultEnd, true)
   const thisWeek = await db.job.count({
-    where: { userId, appliedAt: { gte: weekStart } },
+    where: { userId, appliedAt: { gte: rangeStart, lte: rangeEnd } },
   })
 
   // Follow-ups due today or overdue (followUpAt <= end of today)
@@ -47,11 +61,13 @@ export async function GET() {
     take: 10,
   })
 
-  // Saved jobs awaiting decision (saved for 7+ days)
-  const staleCutoff = new Date()
-  staleCutoff.setDate(staleCutoff.getDate() - 7)
+  // Agent settings control which saved roles are genuinely high-match.
+  const agentConfig = await db.agentConfig.findUnique({ where: { userId } })
+  const minMatchScore = agentConfig?.minMatchScore ?? 75
+
+  // Saved roles that meet the user's configured match threshold.
   const savedJobs = await db.job.findMany({
-    where: { userId, status: 'saved' },
+    where: { userId, status: 'saved', score: { gte: minMatchScore } },
     select: { id: true, company: true, role: true, score: true, createdAt: true, url: true },
     orderBy: { score: { sort: 'desc', nulls: 'last' } },
     take: 8,
@@ -74,9 +90,6 @@ export async function GET() {
     take: 8,
   })
 
-  // Agent config
-  const agentConfig = await db.agentConfig.findUnique({ where: { userId } })
-
   // First-resume check (for onboarding)
   const resumeCount = await db.resume.count({ where: { userId } })
 
@@ -88,6 +101,7 @@ export async function GET() {
     recentJobs,
     activity,
     agentConfig,
+    minMatchScore,
     hasResume: resumeCount > 0,
   })
 }

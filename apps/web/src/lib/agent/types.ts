@@ -48,6 +48,7 @@ export interface PipelineCtx {
   roleConfigs:   RoleConfigMap  // per-role model configs
   resumeText:    string         // plain-text resume, truncated to 2500 chars
   resumeContent: ResumeContent  // structured resume for cover-letter generation
+  defaultResume: { id: string; name: string; templateId: string | null; templateOptions: unknown; directionId: string | null; basicsDetached: boolean }
   aiConfig:      AiConfig       // fallback global config
   autonomous:    boolean        // true = never pause, make all decisions automatically
   emit:          (event: string, data: unknown) => void
@@ -92,6 +93,8 @@ export interface AnalyzeOutput {
 export interface ApplicationPackage extends ScoredJob {
   coverLetter?:      string
   tailoredKeywords?: string[]
+  tailoredResumeId?: string
+  tailoredResumeName?: string
 }
 
 export interface PrepareOutput {

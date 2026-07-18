@@ -2,6 +2,9 @@ export const DETAIL_ACTION_HOST_SELECTORS = [
   '.jobs-unified-top-card__content--two-pane .jobs-s-apply',
   '.jobs-unified-top-card__content .jobs-s-apply',
   '.jobs-details__main-content .jobs-s-apply',
+  '.jobs-details__main-content .jobs-apply-button',
+  '.jobs-unified-top-card__content .jobs-apply-button',
+  '[data-live-test-job-apply-button]',
   '.jobs-apply-button--top-card',
   '.jobs-save-button',
 ]

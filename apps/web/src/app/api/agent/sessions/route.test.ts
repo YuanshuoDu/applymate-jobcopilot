@@ -3,6 +3,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest"
 const mocks = vi.hoisted(() => ({
   requireAuth: vi.fn(),
   findMany: vi.fn(),
+  updateMany: vi.fn(),
   create: vi.fn(),
 }))
 
@@ -17,6 +18,7 @@ vi.mock("@/lib/db", () => ({
   db: {
     agentSession: {
       findMany: mocks.findMany,
+      updateMany: mocks.updateMany,
       create: mocks.create,
     },
   },
@@ -38,8 +40,10 @@ describe("agent sessions API", () => {
     vi.resetModules()
     mocks.requireAuth.mockReset()
     mocks.findMany.mockReset()
+    mocks.updateMany.mockReset()
     mocks.create.mockReset()
     mocks.requireAuth.mockResolvedValue({ userId: "user_1" })
+    mocks.updateMany.mockResolvedValue({ count: 0 })
   })
 
   it("lists recent sessions for the authenticated user", async () => {
@@ -90,6 +94,15 @@ describe("agent sessions API", () => {
         completedAt: true,
       },
     })
+    expect(mocks.updateMany).toHaveBeenCalledWith(expect.objectContaining({
+      where: expect.objectContaining({
+        userId: "user_1",
+        source: "chat",
+        status: "running",
+        approvals: { none: { status: "pending" } },
+      }),
+      data: expect.objectContaining({ status: "completed", completedAt: expect.any(Date) }),
+    }))
   })
 
   it("creates a chat session with trimmed goal text", async () => {

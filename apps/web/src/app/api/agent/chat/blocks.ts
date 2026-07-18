@@ -72,6 +72,25 @@ export function approvalRequestFrom(
   }
 }
 
+export function resumeTailoringApprovalFrom(
+  text: string,
+  context: { resumeId: string | null; jobs: Array<{ id: string; company: string; role: string }> },
+): ApprovalRequestDraft | null {
+  const asksForTailoring = /tailor|tailored|优化.*简历|定制.*简历|修改.*简历|针对.*简历/i.test(text)
+  if (!asksForTailoring || !context.resumeId) return null
+  const lower = text.toLowerCase()
+  const explicitJob = context.jobs.find(job => lower.includes(job.company.toLowerCase()) || lower.includes(job.role.toLowerCase()))
+  const job = explicitJob ?? (context.jobs.length === 1 ? context.jobs[0] : null)
+  if (!job) return null
+  return {
+    type: 'tailor_resume',
+    title: 'Apply AI resume changes',
+    body: `Writer will tailor your resume for ${job.company} · ${job.role}, preserve truthful facts, keep the selected template, and create a reviewable version. Continue?`,
+    impact: { resumeChanges: true, job: `${job.company} · ${job.role}`, externalSubmission: false },
+    payload: { resumeId: context.resumeId, jobId: job.id, requireApproval: true },
+  }
+}
+
 function countFrom(text: string): number | null {
   const match = text.match(/(\d{1,2})\s*(?:个|份|applications?|jobs?)/i)
   if (!match) return null

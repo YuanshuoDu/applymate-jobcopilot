@@ -71,7 +71,9 @@ export async function runAnalyze(
       const messages = systemPrompt
         ? [{ role: 'system' as const, content: systemPrompt }, { role: 'user' as const, content: prompt }]
         : [{ role: 'user' as const, content: prompt }]
-      const result = await modelChat(messages, scoringConfig, 512)
+      // Reasoning models such as MiniMax M2.7 need enough completion budget to
+      // finish their reasoning and return the required JSON payload.
+      const result = await modelChat(messages, scoringConfig, 1600)
       const parsed = parseScoreResult(result.text)
 
       const color = SCORE_COLOR(parsed.score)
@@ -100,11 +102,12 @@ export async function runAnalyze(
     } catch (err) {
       failed++
       console.error('[analyze] scoring error:', err)
+      const message = err instanceof Error ? err.message : 'Unknown AI scoring error'
       emit('agent_observation', {
         role:        'analyst',
-        observation: `✗ ${job.company} · ${job.role} 评分失败：AI 调用异常`,
+        observation: `✗ ${job.company} · ${job.role} 评分失败：${message}`,
       })
-      emit('job_error', { jobId: job.id, company: job.company, role: job.role, error: 'AI scoring failed' })
+      emit('job_error', { jobId: job.id, company: job.company, role: job.role, error: message })
     }
   }
 
@@ -162,32 +165,29 @@ Now output the JSON for this specific job:`
 }
 
 function parseScoreResult(raw: string): Omit<ScoredJob, 'job'> {
+  const stripped = stripFences(raw)
+  const start = stripped.indexOf('{')
+  const end = stripped.lastIndexOf('}')
+  if (start === -1 || end === -1) {
+    throw new Error('AI returned no JSON score')
+  }
+
+  let result: Record<string, unknown>
   try {
-    const stripped = stripFences(raw)
-    // Find JSON object robustly (handles thinking preamble from non-Claude models)
-    const start  = stripped.indexOf('{')
-    const end    = stripped.lastIndexOf('}')
-    if (start === -1 || end === -1) throw new Error('no JSON')
-    const result = JSON.parse(stripped.slice(start, end + 1))
-
-    const score = Math.min(100, Math.max(0, Number(result.score) || 0))
-    // If score parsed as 0 but looks like there's valid content, check for number in text
-    let finalScore = score
-    if (score === 0) {
-      const numMatch = stripped.match(/"score"\s*:\s*(\d+)/)
-      if (numMatch) finalScore = Math.min(100, Math.max(0, Number(numMatch[1])))
-    }
-
-    return {
-      score:           finalScore,
-      matchedKeywords: Array.isArray(result.matchedKeywords) ? result.matchedKeywords : [],
-      missingKeywords: Array.isArray(result.missingKeywords) ? result.missingKeywords : [],
-      recommendation:  typeof result.recommendation === 'string' ? result.recommendation : '',
-    }
+    result = JSON.parse(stripped.slice(start, end + 1)) as Record<string, unknown>
   } catch {
-    // Last resort: try to extract score from plain text (e.g. "Score: 72%")
-    const scoreMatch = raw.match(/\bscore[:\s]+(\d{1,3})/i)
-    const score = scoreMatch ? Math.min(100, Math.max(0, Number(scoreMatch[1]))) : 0
-    return { score, matchedKeywords: [], missingKeywords: [], recommendation: '' }
+    throw new Error('AI returned malformed score JSON')
+  }
+
+  const score = Number(result.score)
+  if (!Number.isFinite(score) || score < 0 || score > 100) {
+    throw new Error('AI returned an invalid match score')
+  }
+
+  return {
+    score: Math.round(score),
+    matchedKeywords: Array.isArray(result.matchedKeywords) ? result.matchedKeywords.filter((value): value is string => typeof value === 'string') : [],
+    missingKeywords: Array.isArray(result.missingKeywords) ? result.missingKeywords.filter((value): value is string => typeof value === 'string') : [],
+    recommendation: typeof result.recommendation === 'string' ? result.recommendation : '',
   }
 }

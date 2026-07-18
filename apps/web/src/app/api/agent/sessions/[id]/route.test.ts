@@ -3,6 +3,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest"
 const mocks = vi.hoisted(() => ({
   requireAuth: vi.fn(),
   findFirst: vi.fn(),
+  deleteMany: vi.fn(),
 }))
 
 vi.mock("@/lib/api-helpers", () => ({
@@ -16,6 +17,7 @@ vi.mock("@/lib/db", () => ({
   db: {
     agentSession: {
       findFirst: mocks.findFirst,
+      deleteMany: mocks.deleteMany,
     },
   },
 }))
@@ -31,7 +33,9 @@ describe("agent session detail API", () => {
     vi.resetModules()
     mocks.requireAuth.mockReset()
     mocks.findFirst.mockReset()
+    mocks.deleteMany.mockReset()
     mocks.requireAuth.mockResolvedValue({ userId: "user_1" })
+    mocks.deleteMany.mockResolvedValue({ count: 1 })
   })
 
   it("returns a session with task and approval summaries for the owner", async () => {
@@ -153,6 +157,27 @@ describe("agent session detail API", () => {
     const { GET } = await import("./route")
 
     const res = await GET(getRequest() as never, params)
+
+    expect(res.status).toBe(404)
+    await expect(res.json()).resolves.toEqual({ error: "Session not found" })
+  })
+
+  it("deletes an owned session", async () => {
+    const { DELETE } = await import("./route")
+
+    const res = await DELETE(getRequest() as never, params)
+
+    expect(res.status).toBe(204)
+    expect(mocks.deleteMany).toHaveBeenCalledWith({
+      where: { id: "session_1", userId: "user_1" },
+    })
+  })
+
+  it("does not delete a session outside the current user", async () => {
+    mocks.deleteMany.mockResolvedValueOnce({ count: 0 })
+    const { DELETE } = await import("./route")
+
+    const res = await DELETE(getRequest() as never, params)
 
     expect(res.status).toBe(404)
     await expect(res.json()).resolves.toEqual({ error: "Session not found" })

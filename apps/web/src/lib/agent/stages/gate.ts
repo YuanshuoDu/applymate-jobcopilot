@@ -128,11 +128,27 @@ export async function runGate(
       }
     }
 
-    if (pkg.score < minMatchScore) {
+    // A Writer-produced tailored resume is a reviewable application artifact.
+    // Keep 65–(threshold-1) matches in the human-review path instead of
+    // discarding them before the user can inspect the generated resume.
+    if (pkg.score < minMatchScore && !pkg.tailoredResumeId) {
       skipped.push(pkg)
       emit('agent_observation', {
         role:        'reviewer',
         observation: `✕ 跳过：${pkg.score}% < 阈值 ${minMatchScore}%`,
+      })
+      continue
+    }
+
+    if (pkg.tailoredResumeId) {
+      pending.push(pkg)
+      emit('agent_question', {
+        role: 'reviewer', questionId: `resume_review_${pkg.job.id}`,
+        question: `${pkg.job.company} · ${pkg.job.role} 的定制简历已生成并通过材料审核。请查看简历后确认是否进入申请。`,
+        options: [
+          { label: '查看定制简历', value: 'view_resume', action: { field: '_navigate', value: `resume&resumeId=${pkg.tailoredResumeId}` } },
+          { label: '保留待审核', value: 'review' },
+        ],
       })
       continue
     }

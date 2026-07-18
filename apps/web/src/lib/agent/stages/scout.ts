@@ -99,8 +99,21 @@ export async function runScout(ctx: PipelineCtx): Promise<StageResult<ScoutOutpu
           source:      j.source      || 'agent',
           status:      'saved' as const,
         }))
-        await db.job.createMany({ data: rows, skipDuplicates: true })
-        discovered = rows.length
+        // External job APIs can return a malformed record among otherwise valid
+        // results. Persist independently so one bad record cannot abort Scout
+        // and make the Orchestrator retry the same successful search.
+        const writes = await Promise.allSettled(
+          rows.map(data => db.job.create({ data })),
+        )
+        discovered = writes.filter(write => write.status === 'fulfilled').length
+        const failedWrites = writes.length - discovered
+
+        if (discovered === 0) {
+          const firstFailure = writes.find(
+            (write): write is PromiseRejectedResult => write.status === 'rejected',
+          )
+          throw firstFailure?.reason ?? new Error('No discovered jobs could be saved')
+        }
 
         // Format discovered jobs as a list
         const listText = candidates.slice(0, 8).map(j =>
@@ -109,7 +122,7 @@ export async function runScout(ctx: PipelineCtx): Promise<StageResult<ScoutOutpu
 
         emit('agent_observation', {
           role:        'scout',
-          observation: `✓ 发现并保存了 ${discovered} 个新职位：\n${listText}`,
+          observation: `✓ 发现并保存了 ${discovered} 个新职位${failedWrites > 0 ? `（${failedWrites} 条无效记录已跳过）` : ''}：\n${listText}`,
         })
 
         await db.activity.create({

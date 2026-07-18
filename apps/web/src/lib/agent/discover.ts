@@ -15,6 +15,7 @@
 import { truncate } from '@/lib/utils'
 import { db } from '@/lib/db'
 import { dedupJobs } from './dedup'
+import { resolveLocation } from './location-resolver'
 
 export interface DiscoveredJob {
   title:       string
@@ -407,17 +408,19 @@ export async function discoverJobs(params: DiscoverParams): Promise<DiscoveredJo
         }
       }
 
-      // Free-source guarantee: no API keys configured → IrishJobs RSS as baseline
-      if (!apiKey && !hasAdzuna) {
+      // IrishJobs is a useful free fallback only for Irish or unrestricted
+      // searches. It must not pollute a London/Berlin request with Irish jobs.
+      if (!apiKey && !hasAdzuna && (isIreland || !loc)) {
         fetchTasks.push(fetchIrishJobsRss(role, loc || 'ireland'))
       }
 
       const allResults = await Promise.all(fetchTasks)
 
-      // Score and sort by location relevance before deduplication
+      // Enforce the requested location before ranking. Source-side location
+      // filters are advisory, so without this a fallback can leak other cities.
       const locL = loc.toLowerCase()
       const scored = allResults.flat()
-        .filter(j => j.url && j.title && j.company)
+        .filter(j => j.url && j.title && j.company && (!loc || matchesTargetLocation(j.location, loc)))
         .map(j => ({
           job:   j,
           score: (locL && j.location.toLowerCase().includes(locL)) ? 1 : 0,
@@ -441,4 +444,13 @@ export async function discoverJobs(params: DiscoverParams): Promise<DiscoveredJo
     console.log(`[dedup] removed ${removed} duplicates, kept ${deduped.length} unique`)
   }
   return deduped
+}
+
+function matchesTargetLocation(jobLocation: string, targetLocation: string) {
+  const job = jobLocation.trim().toLowerCase()
+  if (!job) return false
+  const target = targetLocation.trim().toLowerCase()
+  if (job.includes(target)) return true
+  const resolved = resolveLocation(targetLocation)
+  return resolved.isCountry && resolved.dbTerms.some(term => job.includes(term))
 }

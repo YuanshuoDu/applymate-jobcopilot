@@ -18,6 +18,7 @@ export function ReplayBanner({
   return (
     <div style={{
       display: 'flex',
+      flexShrink: 0,
       alignItems: 'center',
       justifyContent: 'space-between',
       gap: 12,

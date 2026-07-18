@@ -235,6 +235,7 @@ export interface DashboardData {
   recentJobs:   Job[]
   activity:     Activity[]
   agentConfig:  AgentConfig | null
+  minMatchScore: number
   hasResume:    boolean
 }
 

@@ -7,12 +7,15 @@
 import { NextRequest } from 'next/server'
 import { requireAuth, isErrorResponse, ok, err } from '@/lib/api-helpers'
 import { db } from '@/lib/db'
+import { getDiscoveryApiKeys } from '@/lib/discovery-api-keys'
 
 type ApiKeyPatch = {
   adzunaAppId?: string | null
   adzunaAppKey?: string | null
   rapidapiKey?: string | null
 }
+
+type ApiKeyTestRequest = { action?: 'test'; provider?: 'adzuna' | 'rapidapi' }
 
 function normalize(value: unknown): string | null | undefined {
   if (value === null) return null
@@ -51,6 +54,29 @@ async function save(req: NextRequest) {
   })
 }
 
+async function testConnection(req: NextRequest, body: ApiKeyTestRequest) {
+  const auth = await requireAuth(req)
+  if (isErrorResponse(auth)) return auth
+  if (body.provider !== 'adzuna' && body.provider !== 'rapidapi') return err('Choose Adzuna or RapidAPI to test')
+
+  const keys = await getDiscoveryApiKeys(auth.userId)
+  if (body.provider === 'adzuna') {
+    if (!keys.adzunaAppId || !keys.adzunaAppKey) return err('Save both Adzuna credentials before testing')
+    const params = new URLSearchParams({ app_id: keys.adzunaAppId, app_key: keys.adzunaAppKey, results_per_page: '1', what: 'software engineer' })
+    const response = await fetch(`https://api.adzuna.com/v1/api/jobs/gb/search/1?${params}`, { cache: 'no-store' }).catch(() => null)
+    if (!response?.ok) return err(`Adzuna rejected the credentials (${response?.status ?? 'network error'})`)
+  } else {
+    if (!keys.rapidapiKey) return err('Save your RapidAPI key before testing')
+    const response = await fetch('https://jsearch.p.rapidapi.com/search?query=software%20engineer&page=1&num_pages=1', {
+      headers: { 'X-RapidAPI-Key': keys.rapidapiKey, 'X-RapidAPI-Host': 'jsearch.p.rapidapi.com' },
+      cache: 'no-store',
+    }).catch(() => null)
+    if (!response?.ok) return err(`RapidAPI rejected the credentials (${response?.status ?? 'network error'})`)
+  }
+
+  return ok({ ok: true })
+}
+
 export async function GET(req: NextRequest) {
   const auth = await requireAuth(req)
   if (isErrorResponse(auth)) return auth
@@ -71,5 +97,7 @@ export async function PUT(req: NextRequest) {
 }
 
 export async function POST(req: NextRequest) {
+  const body = await req.clone().json().catch(() => null) as ApiKeyTestRequest | null
+  if (body?.action === 'test') return testConnection(req, body)
   return save(req)
 }

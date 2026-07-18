@@ -3,7 +3,7 @@
 import React from 'react'
 import { useApi } from '@/lib/hooks'
 import type { AgentSessionSummary } from './session-view-model'
-import { sessionStatusLabel, sessionSubtitle } from './session-view-model'
+import { sessionHeaderSubtitle, sessionStatusLabel, sessionSubtitle } from './session-view-model'
 import { AgentTeamList } from './AgentTeamList'
 import { HealthStrip } from './HealthStrip'
 import { AutomationList } from './AutomationList'
@@ -25,19 +25,21 @@ export function AgentSessionConsole({
   selectedSessionId,
   onSelectSession,
   onNewChat,
-  onBackToLive,
+  onDeletedSession,
   onAddAgent,
   refreshVersion = 0,
 }: {
   selectedSessionId: string | null
-  onSelectSession: (id: string) => void
+  onSelectSession: (id: string, goal?: string, subtitle?: string) => void
   onNewChat: () => void
-  onBackToLive: () => void
+  onDeletedSession: (id: string) => void
   onAddAgent?: () => void
   refreshVersion?: number
 }) {
   const { data, loading, error, refetch } = useApi<SessionsResponse>('/api/agent/sessions')
   const [statusFilter, setStatusFilter] = React.useState('all')
+  const [confirmingDeleteId, setConfirmingDeleteId] = React.useState<string | null>(null)
+  const [deletingSessionId, setDeletingSessionId] = React.useState<string | null>(null)
   const sessions = data?.sessions ?? []
   const visibleSessions = statusFilter === 'all' ? sessions : sessions.filter(session => session.status === statusFilter)
   const pendingApprovals = sessions.filter(s => s.status === 'waiting_user').length
@@ -51,6 +53,19 @@ export function AgentSessionConsole({
     window.addEventListener('applymate:sessions-changed', refresh)
     return () => window.removeEventListener('applymate:sessions-changed', refresh)
   }, [refetch])
+
+  async function deleteSession(session: AgentSessionSummary) {
+    setDeletingSessionId(session.id)
+    try {
+      const response = await fetch(`/api/agent/sessions/${session.id}`, { method: 'DELETE' })
+      if (!response.ok) return
+      onDeletedSession(session.id)
+      setConfirmingDeleteId(null)
+      await refetch()
+    } finally {
+      setDeletingSessionId(null)
+    }
+  }
 
   return (
     <aside className="agent-session-console" style={{
@@ -105,44 +120,6 @@ export function AgentSessionConsole({
             <option value="failed">Fail</option>
           </select>
         </div>
-        {selectedSessionId && (
-          <div style={{
-            marginTop: 9,
-            border: '1px solid rgba(79,70,229,0.20)',
-            borderRadius: 8,
-            background: 'rgba(79,70,229,0.06)',
-            padding: '8px 9px',
-            display: 'flex',
-            alignItems: 'center',
-            justifyContent: 'space-between',
-            gap: 8,
-          }}>
-            <div style={{ minWidth: 0 }}>
-              <div style={{ fontSize: 10, fontWeight: 750, color: 'var(--primary)' }}>Viewing replay</div>
-              <div style={{ fontSize: 9, color: 'var(--text-muted)', marginTop: 2, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                Live composer is paused for this session.
-              </div>
-            </div>
-            <button
-              onClick={onBackToLive}
-              style={{
-                flexShrink: 0,
-                height: 24,
-                borderRadius: 7,
-                border: '1px solid rgba(79,70,229,0.24)',
-                background: 'var(--bg)',
-                color: 'var(--primary)',
-                fontSize: 10,
-                fontWeight: 700,
-                fontFamily: 'inherit',
-                cursor: 'pointer',
-                padding: '0 8px',
-              }}
-            >
-              Live
-            </button>
-          </div>
-        )}
       </div>
 
       <div style={{ padding: '10px 10px 8px', display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8 }}>
@@ -167,24 +144,28 @@ export function AgentSessionConsole({
           {!loading && !error && sessions.length > 0 && visibleSessions.length === 0 && <EmptyText>No sessions match this filter.</EmptyText>}
           {visibleSessions.map(session => {
             const selected = selectedSessionId === session.id
+            const confirmingDelete = confirmingDeleteId === session.id
+            const deleting = deletingSessionId === session.id
             const color = statusColor(session.status)
             return (
-              <button
+              <div
                 key={session.id}
-                onClick={() => onSelectSession(session.id)}
                 style={{
                   width: '100%',
-                  padding: 10,
-                  borderRadius: 8,
-                  border: selected ? `1px solid ${color}` : '1px solid var(--border)',
-                  background: selected ? 'var(--bg)' : 'transparent',
-                  boxShadow: selected ? '0 3px 10px rgba(15,23,42,0.06)' : 'none',
-                  cursor: 'pointer',
-                  textAlign: 'left',
-                  fontFamily: 'inherit',
+                  position: 'relative',
                 }}
               >
-                <div style={{ display: 'flex', alignItems: 'flex-start', gap: 8 }}>
+                <button
+                  onClick={() => onSelectSession(session.id, session.goal, sessionHeaderSubtitle(session))}
+                  style={{
+                    width: '100%', padding: 10, paddingRight: confirmingDelete ? 96 : 34, borderRadius: 8,
+                    border: selected ? `1px solid ${color}` : '1px solid var(--border)',
+                    background: selected ? 'var(--bg)' : 'transparent',
+                    boxShadow: selected ? '0 3px 10px rgba(15,23,42,0.06)' : 'none',
+                    cursor: 'pointer', textAlign: 'left', fontFamily: 'inherit',
+                  }}
+                >
+                  <div style={{ display: 'flex', alignItems: 'flex-start', gap: 8 }}>
                   <span style={{ width: 7, height: 7, borderRadius: '50%', background: color, marginTop: 5, flexShrink: 0 }} />
                   <div style={{ minWidth: 0, flex: 1 }}>
                     <div style={{ display: 'flex', justifyContent: 'space-between', gap: 8 }}>
@@ -202,15 +183,47 @@ export function AgentSessionConsole({
                       </div>
                     )}
                   </div>
-                </div>
-              </button>
+                  </div>
+                </button>
+                {confirmingDelete ? (
+                  <div style={{ position: 'absolute', top: 8, right: 7, display: 'flex', alignItems: 'center', gap: 3 }}>
+                    <button
+                      type="button"
+                      onClick={() => { void deleteSession(session) }}
+                      disabled={deleting}
+                      style={{ height: 22, border: 'none', borderRadius: 6, background: 'rgba(220,38,38,0.10)', color: 'var(--c-danger)', cursor: deleting ? 'wait' : 'pointer', fontSize: 9, fontWeight: 750, fontFamily: 'inherit', padding: '0 6px' }}
+                    >
+                      {deleting ? '…' : 'Delete?'}
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setConfirmingDeleteId(null)}
+                      disabled={deleting}
+                      aria-label="Cancel delete"
+                      style={{ width: 22, height: 22, border: 'none', borderRadius: 6, background: 'transparent', color: 'var(--text-muted)', cursor: deleting ? 'wait' : 'pointer', fontSize: 14, lineHeight: 1, fontFamily: 'inherit' }}
+                    >
+                      ×
+                    </button>
+                  </div>
+                ) : (
+                  <button
+                    type="button"
+                    aria-label={`Delete ${session.goal}`}
+                    title="Delete conversation"
+                    onClick={() => setConfirmingDeleteId(session.id)}
+                    style={{ position: 'absolute', top: 8, right: 7, width: 22, height: 22, border: 'none', borderRadius: 6, background: 'transparent', color: 'var(--text-muted)', cursor: 'pointer', fontSize: 15, lineHeight: 1, fontFamily: 'inherit' }}
+                  >
+                    ×
+                  </button>
+                )}
+              </div>
             )
           })}
         </div>
         <SessionFocusPanel sessionId={selectedSessionId} />
         <AgentTeamList onAddAgent={onAddAgent} />
         <AutomationList
-          onCreate={onBackToLive}
+          onCreate={onNewChat}
           onSessionStarted={sessionId => {
             void refetch()
             onSelectSession(sessionId)

@@ -2,6 +2,10 @@ import { NextRequest } from "next/server"
 import { db } from "@/lib/db"
 import { err, isErrorResponse, ok, requireAuth } from "@/lib/api-helpers"
 import { nextRunAtFromCron } from "@/lib/agent/automation-schedule"
+import { updateAgentSession } from "@/lib/agent/session/repository"
+import { loadUserAiConfig } from "@/lib/model-router"
+import { tailorResumeForAgent } from "@/lib/agent/resume-tailoring"
+import { enqueueApplyTask } from "@/lib/apply-queue-client"
 
 interface RouteCtx {
   params: Promise<{ id: string }>
@@ -195,7 +199,13 @@ export async function POST(req: NextRequest, ctx: RouteCtx) {
     })
   }
 
+  let approval: { type: string; payload: unknown } | null = null
   if (action.approvalId) {
+    approval = await db.agentApproval.findFirst({
+      where: { id: action.approvalId, sessionId: id, userId: auth.userId, status: 'pending' },
+      select: { type: true, payload: true },
+    })
+    if (!approval) return err("Approval is no longer pending", 409)
     const result = await db.agentApproval.updateMany({
       where: {
         id: action.approvalId,
@@ -209,6 +219,82 @@ export async function POST(req: NextRequest, ctx: RouteCtx) {
       },
     })
     if (result.count === 0) return err("Approval is no longer pending", 409)
+  }
+
+  if (action.decision === 'approved' && approval?.type === 'tailor_resume') {
+    const payload = resumeTailoringPayload(approval.payload)
+    if (!payload) return err('Resume tailoring approval is missing its job or resume.', 400)
+    try {
+      const artifact = await tailorResumeForAgent({
+        userId: auth.userId,
+        resumeId: payload.resumeId,
+        jobId: payload.jobId,
+        aiConfig: await loadUserAiConfig(auth.userId, 'agent'),
+      })
+      const tailoredEvent = await db.agentTranscriptEvent.create({
+        data: {
+          sessionId: id, taskId: null, type: 'resume_tailored', speaker: 'Writer',
+          title: 'Tailored resume ready',
+          body: `${artifact.name} is ready for Reviewer and your final confirmation.`,
+          data: { resume: { ...artifact } }, durationMs: null,
+        },
+      })
+      const finalApproval = await db.agentApproval.create({
+        data: {
+          sessionId: id, userId: auth.userId, type: 'confirm_tailored_resume', status: 'pending',
+          title: 'Confirm tailored resume',
+          body: `Reviewer: confirm ${artifact.name} as the final resume for ${artifact.company} · ${artifact.role} before handing it to Executor.`,
+          impact: { resume: artifact.name, company: artifact.company, role: artifact.role },
+          payload: { resumeId: artifact.id, jobId: artifact.jobId },
+        },
+      })
+      const reviewEvent = await db.agentTranscriptEvent.create({
+        data: {
+          sessionId: id, taskId: null, type: 'approval_request', speaker: 'Reviewer',
+          title: 'Final resume review', body: finalApproval.body,
+          data: { approval: { id: finalApproval.id, type: finalApproval.type, title: finalApproval.title, body: finalApproval.body, impact: finalApproval.impact, payload: finalApproval.payload, status: finalApproval.status } }, durationMs: null,
+        },
+      })
+      await updateAgentSession(db, { sessionId: id, status: 'waiting_for_user', completedAt: null })
+      return ok({ events: [serializeEvent(tailoredEvent), serializeEvent(reviewEvent)] })
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Could not tailor the resume.'
+      const event = await db.agentTranscriptEvent.create({
+        data: { sessionId: id, taskId: null, type: 'error', speaker: 'Writer', title: 'Tailoring failed', body: message, data: { approvalId: action.approvalId }, durationMs: null },
+      })
+      return ok({ event: serializeEvent(event) })
+    }
+  }
+
+  if (action.decision === 'approved' && approval?.type === 'confirm_tailored_resume') {
+    const payload = resumeTailoringPayload(approval.payload)
+    if (!payload) return err('Final resume approval is missing its job or resume.', 400)
+    const resume = await db.resume.findFirst({ where: { id: payload.resumeId, userId: auth.userId, targetJobId: payload.jobId }, select: { id: true, name: true } })
+    const job = await db.job.findFirst({ where: { id: payload.jobId, userId: auth.userId }, select: { id: true, company: true, role: true, url: true, status: true } })
+    if (!resume || !job) return err('The tailored resume or job is no longer available.', 404)
+    if (job.status === 'applied') return err('This job has already been submitted.', 409)
+    let applyTaskId: string | null = null
+    if (job.url) {
+      applyTaskId = await enqueueApplyTask({
+        jobId: job.id, userId: auth.userId, applyUrl: job.url, personaId: auth.userId, resumePath: '', dryRun: false,
+      })
+    }
+    await db.job.update({ where: { id: job.id }, data: {
+      finalResumeId: resume.id,
+      status: 'review',
+      analysisNote: applyTaskId ? `[Executor queued] Apply task ${applyTaskId}; waiting for Auditor result.` : '[Executor blocked] Missing application URL.',
+    } })
+    const event = await db.agentTranscriptEvent.create({
+      data: {
+        sessionId: id, taskId: null, type: applyTaskId ? 'application_queued' : 'resume_finalized', speaker: applyTaskId ? 'Executor' : 'Reviewer', title: applyTaskId ? 'Application queued' : 'Resume confirmed',
+        body: applyTaskId
+          ? `${resume.name} is confirmed for ${job.company} · ${job.role}. Executor queued autonomous form filling; Auditor will report the worker result.`
+          : `${resume.name} is confirmed and linked to ${job.company} · ${job.role}, but this job has no application URL for Executor.`,
+        data: { resume: { id: resume.id, name: resume.name }, job, applyTaskId }, durationMs: null,
+      },
+    })
+    await updateAgentSession(db, { sessionId: id, status: 'completed', completedAt: new Date() })
+    return ok({ event: serializeEvent(event) })
   }
 
   const event = await db.agentTranscriptEvent.create({
@@ -227,5 +313,18 @@ export async function POST(req: NextRequest, ctx: RouteCtx) {
     },
   })
 
+  await updateAgentSession(db, {
+    sessionId: id,
+    status: "completed",
+    completedAt: new Date(),
+  })
+
   return ok({ event: serializeEvent(event as Parameters<typeof serializeEvent>[0]) })
+}
+
+function resumeTailoringPayload(value: unknown) {
+  const payload = value && typeof value === 'object' ? value as Record<string, unknown> : {}
+  const resumeId = text(payload.resumeId)
+  const jobId = text(payload.jobId)
+  return resumeId && jobId ? { resumeId, jobId } : null
 }

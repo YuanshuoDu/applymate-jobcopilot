@@ -103,3 +103,16 @@ export async function GET(req: NextRequest, ctx: RouteCtx) {
   if (!session) return err("Session not found", 404)
   return ok({ session: serializeSession(session) })
 }
+
+export async function DELETE(req: NextRequest, ctx: RouteCtx) {
+  const auth = await requireAuth(req)
+  if (isErrorResponse(auth)) return auth
+
+  const { id } = await ctx.params
+  const result = await db.agentSession.deleteMany({
+    where: { id, userId: auth.userId },
+  })
+  if (result.count === 0) return err("Session not found", 404)
+
+  return new Response(null, { status: 204 })
+}

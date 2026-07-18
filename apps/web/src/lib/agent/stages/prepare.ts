@@ -6,6 +6,8 @@
  *   - Packages job + score + materials into ApplicationPackage
  */
 import { modelChat, stripFences } from '@/lib/model-router'
+import { db } from '@/lib/db'
+import { Prisma } from '@prisma/client'
 import type { AiConfig } from '@/lib/model-router'
 import type {
   PipelineCtx, ScoredJob, ApplicationPackage, PrepareOutput,
@@ -48,9 +50,10 @@ function inferCoverLetterLanguage(sj: ScoredJob): CoverLetterLanguage {
 export async function runPrepare(
   scoredJobs: ScoredJob[],
   ctx: PipelineCtx,
+  options: { allowResumeTailoring?: boolean } = {},
 ): Promise<StageResult<PrepareOutput>> {
   const t0 = Date.now()
-  const { agentCfg, resumeContent, aiConfig, roleConfigs, emit } = ctx
+  const { agentCfg, resumeContent, aiConfig, roleConfigs, emit, userId, defaultResume } = ctx
   const THROTTLE_MS = agentCfg.throttleMs ?? 200
   // Use writer role's configured model
   const writerCfg = roleConfigs.writer
@@ -59,12 +62,34 @@ export async function runPrepare(
     : aiConfig
   const writerSystemPrompt = writerCfg?.systemPrompt ?? undefined
 
-  const aboveThreshold = scoredJobs.filter(sj => sj.score >= agentCfg.minMatchScore)
+  const aboveThreshold = scoredJobs.filter(sj => sj.score >= 65)
+  const allowResumeTailoring = options.allowResumeTailoring ?? true
   const packages: ApplicationPackage[] = []
   const pendingLetters: Array<{ jobId: string; coverLetter: string }> = []
 
   for (const sj of aboveThreshold) {
     let coverLetter: string | undefined
+    let tailoredResumeId: string | undefined
+    let tailoredResumeName: string | undefined
+
+    if (allowResumeTailoring) {
+      try {
+        const tailored = await generateTailoredResume(sj, resumeContent, effectiveAiConfig, writerSystemPrompt)
+        const saved = await db.resume.create({ data: {
+          userId, name: `Tailored for ${sj.job.company} - ${sj.job.role}`,
+          content: tailored as Prisma.InputJsonValue, templateId: defaultResume.templateId,
+          templateOptions: defaultResume.templateOptions as Prisma.InputJsonValue | undefined,
+          isDefault: false, directionId: defaultResume.directionId, kind: 'adapted',
+          parentResumeId: defaultResume.id, targetJobId: sj.job.id, origin: 'ai-adapted',
+          basicsDetached: defaultResume.basicsDetached,
+        } })
+        tailoredResumeId = saved.id
+        tailoredResumeName = saved.name
+        emit('agent_observation', { role: 'writer', observation: `✓ 已基于默认简历生成 ${sj.job.company} 的定制简历，保留职位连接和模板；等待 Reviewer 审核及你的最终确认。` })
+      } catch (err) {
+        emit('agent_observation', { role: 'writer', observation: `✗ ${sj.job.company} 简历优化失败：${err instanceof Error ? err.message : 'Unknown error'}` })
+      }
+    }
 
     if (agentCfg.autoCoverLetter) {
       try {
@@ -80,6 +105,7 @@ export async function runPrepare(
     packages.push({
       ...sj,
       ...(coverLetter ? { coverLetter } : {}),
+      ...(tailoredResumeId ? { tailoredResumeId, tailoredResumeName } : {}),
       tailoredKeywords: sj.missingKeywords.length ? sj.missingKeywords : undefined,
     })
   }
@@ -95,6 +121,18 @@ export async function runPrepare(
   }
 
   return stageOk('prepare', { packages }, packages.length, Date.now() - t0)
+}
+
+async function generateTailoredResume(sj: ScoredJob, resume: unknown, aiConfig: AiConfig, systemPrompt?: string) {
+  const prompt = `Tailor this resume for the target job. Preserve truthful facts; only improve positioning and add JD keywords supported by the source resume. Return ONLY the complete resume JSON object, with the same structure.\n\nRESUME JSON:\n${JSON.stringify(resume)}\n\nTARGET: ${sj.job.role} at ${sj.job.company}\nJOB DESCRIPTION:\n${sj.job.description?.slice(0, 1800) ?? ''}\nMATCHED: ${sj.matchedKeywords.join(', ')}\nMISSING: ${sj.missingKeywords.join(', ')}`
+  const messages = systemPrompt
+    ? [{ role: 'system' as const, content: systemPrompt }, { role: 'user' as const, content: prompt }]
+    : [{ role: 'user' as const, content: prompt }]
+  const result = await modelChat(messages, aiConfig, 2200)
+  const raw = stripFences(result.text)
+  const start = raw.indexOf('{'), end = raw.lastIndexOf('}')
+  if (start < 0 || end < 0) throw new Error('AI returned no resume JSON')
+  return JSON.parse(raw.slice(start, end + 1))
 }
 
 export function acceptPrepare(

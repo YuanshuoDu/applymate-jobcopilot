@@ -1,21 +1,43 @@
 'use client'
 
 import React, { useState, useEffect, useRef } from 'react'
-import { TopBar } from '@/components/layout/TopBar'
 import { useI18n } from '@/lib/i18n'
+import { FileDown, FileText, History, LayoutTemplate, PanelLeftClose, PanelLeftOpen, Plus, ShieldCheck, Upload } from 'lucide-react'
+import './ResumePage.css'
 
-// Module-level analysis cache — survives component unmount/remount during tab navigation
+// Analysis cache is keyed by resume + job so switching versions never discards a
+// completed result or accidentally displays another resume's result.
 const LS_KEY = 'applymate_last_analysis'
-let _cachedAnalysis: { resumeId: string; jobId: string; score: ScoreResult | null; suggs: Suggestion[] } | null = null
-function loadCache() {
-  if (_cachedAnalysis) return _cachedAnalysis
+type AnalysisCacheEntry = { resumeId: string; jobId: string; score: ScoreResult | null; suggs: Suggestion[] }
+let _cachedAnalyses: Record<string, AnalysisCacheEntry> | null = null
+
+function cacheKey(resumeId: string, jobId: string) { return `${resumeId}:${jobId}` }
+
+function loadAnalysisCache() {
+  if (_cachedAnalyses) return _cachedAnalyses
   if (typeof window === 'undefined') return null
-  try { _cachedAnalysis = JSON.parse(localStorage.getItem(LS_KEY) ?? 'null'); return _cachedAnalysis } catch { return null }
+  try {
+    const parsed: unknown = JSON.parse(localStorage.getItem(LS_KEY) ?? 'null')
+    if (!parsed || typeof parsed !== 'object') return null
+    if ('resumeId' in parsed && 'jobId' in parsed) {
+      const legacy = parsed as AnalysisCacheEntry
+      _cachedAnalyses = { [cacheKey(legacy.resumeId, legacy.jobId)]: legacy }
+    } else {
+      _cachedAnalyses = parsed as Record<string, AnalysisCacheEntry>
+    }
+    return _cachedAnalyses
+  } catch { return null }
+}
+function getAnalysisCache(resumeId: string | null, jobId: string | null) {
+  if (!resumeId || !jobId) return null
+  return loadAnalysisCache()?.[cacheKey(resumeId, jobId)] ?? null
 }
 function saveCache(data: { resumeId: string | null; jobId: string | null; score: ScoreResult | null; suggs: Suggestion[]; [k: string]: unknown }) {
   if (!data.jobId || !data.resumeId) return
-  _cachedAnalysis = { resumeId: data.resumeId, jobId: data.jobId, score: data.score, suggs: data.suggs }
-  try { localStorage.setItem(LS_KEY, JSON.stringify(_cachedAnalysis)) } catch {}
+  const entries = loadAnalysisCache() ?? {}
+  entries[cacheKey(data.resumeId, data.jobId)] = { resumeId: data.resumeId, jobId: data.jobId, score: data.score, suggs: data.suggs }
+  _cachedAnalyses = entries
+  try { localStorage.setItem(LS_KEY, JSON.stringify(entries)) } catch {}
 }
 import { Btn, useToast, useConfirm } from '@/components/ui'
 import { useApi, apiMutate, fmtDate, fmtRelative } from '@/lib/hooks'
@@ -33,10 +55,12 @@ import { ProjectsSection } from '@/components/resume/ProjectsSection'
 import { CertificationsSection } from '@/components/resume/CertificationsSection'
 import { CustomSection } from '@/components/resume/CustomSection'
 import { AiPanel } from '@/components/resume/AiPanel'
+import { FinalConfirmDialog } from '@/components/resume/FinalConfirmDialog'
 import { UploadResumeModal } from '@/components/resume/UploadResumeModal'
 import { ResumeIntakeDialog } from '@/components/resume/ResumeIntakeDialog'
 import type { DragHandleProps } from '@/components/resume/SectionHeader'
 import type { AiFieldContext } from '@/components/resume/AiFieldSuggestion'
+import { downloadJobBundle } from '@/lib/bundle'
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
@@ -134,6 +158,18 @@ function NewResumeModal({ onClose, onCreate }: { onClose: () => void; onCreate: 
       </div>
     </div>
   )
+}
+
+function RenameResumeModal({ resume, onClose, onRename }: { resume: ResumeListItem; onClose: () => void; onRename: (name: string) => void }) {
+  const [name, setName] = useState(resume.name)
+  return <div style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.3)', zIndex: 200, display: 'flex', alignItems: 'center', justifyContent: 'center' }} onClick={e => { if (e.target === e.currentTarget) onClose() }}>
+    <div style={{ background: 'var(--bg)', border: '0.5px solid var(--border)', borderRadius: 10, padding: 20, width: 340, boxShadow: '0 8px 32px rgba(0,0,0,0.15)' }}>
+      <div style={{ fontSize: 14, fontWeight: 600, marginBottom: 6 }}>Rename resume</div>
+      <div style={{ color: 'var(--text-muted)', fontSize: 11, marginBottom: 12 }}>Choose a clear name for this version.</div>
+      <input autoFocus value={name} onChange={e => setName(e.target.value)} onKeyDown={e => { if (e.key === 'Enter' && name.trim()) onRename(name.trim()); if (e.key === 'Escape') onClose() }} style={{ width: '100%', fontSize: 13, padding: '8px 10px', border: '0.5px solid var(--primary)', borderRadius: 6, outline: 'none', boxSizing: 'border-box', color: 'var(--text)', background: 'var(--bg)' }} />
+      <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 8, marginTop: 14 }}><Btn small variant="ghost" onClick={onClose}>Cancel</Btn><Btn small variant="primary" onClick={() => name.trim() && onRename(name.trim())} disabled={!name.trim()}>Save name</Btn></div>
+    </div>
+  </div>
 }
 
 // ── AddDirectionDialog ────────────────────────────────────────────────────────
@@ -351,16 +387,25 @@ function ResumeLibraryPanel({
   directions,
   selectedId,
   onSelect,
+  onRename,
+  onDelete,
+  onSetDefault,
+  onUnlink,
 }: {
   resumes:    ResumeListItem[]
   directions: Direction[]
   selectedId: string | null
   onSelect:   (id: string) => void
+  onRename: (resume: ResumeListItem) => void
+  onDelete: (resume: ResumeListItem) => void
+  onSetDefault: (resume: ResumeListItem) => void
+  onUnlink: (resume: ResumeListItem) => void
 }) {
   const { t } = useI18n()
   const [openPopoverId, setOpenPopoverId] = useState<string | null>(null)
   const [popoverJobs,   setPopoverJobs]   = useState<Array<{ id: string; company: string; role: string }>>([])
   const [loadingPop,    setLoadingPop]    = useState(false)
+  const [openMenuId,    setOpenMenuId]    = useState<string | null>(null)
   const popoverRef = useRef<HTMLDivElement>(null)
 
   useEffect(() => {
@@ -395,84 +440,54 @@ function ResumeLibraryPanel({
   )
 
   return (
-    <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+    <div className="resume-library-list">
       {resumes.map(r => {
         const dir = directions.find(d => d.id === r.directionId)
         const jobCount = r._count?.finalForJobs ?? 0
         const isSelected = r.id === selectedId
         return (
           <div key={r.id}
+            className={`resume-library-item${isSelected ? ' is-selected' : ''}`}
             onClick={() => onSelect(r.id)}
             style={{
-              display: 'flex', alignItems: 'center', gap: 8, padding: '7px 10px',
+              display: 'flex', alignItems: 'flex-start', gap: 8, padding: '7px 10px',
               borderRadius: 7, cursor: 'pointer',
               background: isSelected ? 'rgba(79,70,229,0.08)' : 'var(--bg)',
               border: `0.5px solid ${isSelected ? 'var(--primary)' : 'var(--border)'}`,
               transition: 'border-color 0.15s',
             }}>
-            {/* Icon */}
-            <span style={{ fontSize: 16 }}>📄</span>
+            <span className="resume-library-file-icon"><FileText size={18} strokeWidth={1.7} /></span>
 
             {/* Name + direction */}
-            <div style={{ flex: 1, minWidth: 0 }}>
-              <div style={{ fontSize: 12, fontWeight: 500, color: 'var(--text)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+            <div className="resume-library-item-copy" style={{ flex: 1, minWidth: 0 }}>
+              <div className="resume-library-item-name" style={{ fontSize: 12, fontWeight: 500, color: 'var(--text)' }}>
                 {r.name}
               </div>
-              {dir && (
-                <div style={{ fontSize: 10, color: 'var(--text-muted)', marginTop: 1 }}>
-                  <span style={{ background: dir.color ?? 'var(--bg-secondary)', color: dir.color ? '#fff' : 'var(--text-muted)', borderRadius: 8, padding: '1px 6px', fontSize: 9 }}>
-                    {dir.icon ? `${dir.icon} ` : ''}{dir.name}
-                  </span>
-                </div>
-              )}
-            </div>
-
-            {/* Badges */}
-            <div style={{ display: 'flex', gap: 4, alignItems: 'center', flexShrink: 0 }}>
-              {r.kind === 'base' && (
-                <span style={{ fontSize: 9, padding: '2px 6px', borderRadius: 8, background: 'rgba(5,150,105,0.10)', color: 'var(--c-success)', border: '0.5px solid rgba(5,150,105,0.30)', fontWeight: 500 }}>{t('resume.lineage.base')}</span>
-              )}
-              {r.kind === 'adapted' && (
-                <span style={{ fontSize: 9, padding: '2px 6px', borderRadius: 8, background: 'rgba(217,119,6,0.10)', color: 'var(--c-warning)', border: '0.5px solid rgba(217,119,6,0.30)', fontWeight: 500 }}>{t('resume.lineage.adapted')}</span>
-              )}
-              {jobCount > 0 && (
-                <span style={{ fontSize: 9, padding: '2px 6px', borderRadius: 8, background: 'rgba(79,70,229,0.10)', color: 'var(--primary)', border: '0.5px solid rgba(79,70,229,0.30)', fontWeight: 500 }}>⭐ {t('resume.lineage.final')}</span>
-              )}
-              {r.isDefault && (
-                <span style={{ fontSize: 9, padding: '2px 6px', borderRadius: 8, background: 'rgba(79,70,229,0.10)', color: 'var(--primary)', border: '0.5px solid rgba(79,70,229,0.30)', fontWeight: 500 }}>Default</span>
-              )}
-            </div>
-
-            {/* Used by N jobs popover trigger */}
-            {jobCount > 0 && (
-              <div ref={openPopoverId === r.id ? popoverRef : undefined}
-                style={{ position: 'relative', flexShrink: 0 }}
-                onClick={e => { e.stopPropagation(); openUsedByPopover(r.id) }}>
-                <span style={{ fontSize: 10, color: 'var(--primary)', cursor: 'pointer', textDecoration: 'underline', textDecorationStyle: 'dotted' }}>
-                  {t('resume.lineage.usedBy').replace('{n}', String(jobCount)).replace('{s}', jobCount !== 1 ? 's' : '')}
-                </span>
-                {openPopoverId === r.id && (
-                  <div style={{
-                    position: 'absolute', right: 0, top: '100%', marginTop: 4, zIndex: 50,
-                    background: 'var(--bg)', border: '0.5px solid var(--border)', borderRadius: 8,
-                    boxShadow: '0 4px 16px rgba(0,0,0,0.12)', padding: 8, minWidth: 180, maxWidth: 260,
-                  }}>
-                    <div style={{ fontSize: 10, fontWeight: 500, color: 'var(--text-muted)', marginBottom: 6 }}>{t('resume.lineage.usedByTitle')}</div>
-                    {loadingPop ? (
-                      <div style={{ fontSize: 11, color: 'var(--text-muted)' }}>Loading…</div>
-                    ) : popoverJobs.length === 0 ? (
-                      <div style={{ fontSize: 11, color: 'var(--text-muted)' }}>No jobs found</div>
-                    ) : (
-                      popoverJobs.map(j => (
-                        <div key={j.id} style={{ fontSize: 11, padding: '3px 0', color: 'var(--text)', borderBottom: '0.5px solid var(--border)' }}>
-                          {j.company} · {j.role}
-                        </div>
-                      ))
-                    )}
-                  </div>
-                )}
+              {dir && <div className="resume-library-item-detail">{dir.name}</div>}
+              {jobCount > 0 && <div ref={openPopoverId === r.id ? popoverRef : undefined} className="resume-library-item-detail is-link" onClick={e => { e.stopPropagation(); openUsedByPopover(r.id) }}>
+                Linked to {jobCount} saved job{jobCount === 1 ? '' : 's'}
+                {openPopoverId === r.id && <div className="resume-library-lineage-popover">
+                  <div style={{ fontSize: 10, fontWeight: 500, color: 'var(--text-muted)', marginBottom: 6 }}>Used by saved jobs</div>
+                  {loadingPop ? <div style={{ fontSize: 11, color: 'var(--text-muted)' }}>Loading…</div> : popoverJobs.length === 0 ? <div style={{ fontSize: 11, color: 'var(--text-muted)' }}>No jobs found</div> : popoverJobs.map(j => <div key={j.id} style={{ fontSize: 11, padding: '3px 0', color: 'var(--text)', borderBottom: '0.5px solid var(--border)' }}>{j.company} · {j.role}</div>)}
+                </div>}
+              </div>}
+              <div className="resume-library-item-meta">Last edited: {fmtDate(r.updatedAt)}</div>
+              <div className="resume-library-item-badges" style={{ display: 'flex', gap: 4, alignItems: 'center' }}>
+                {r.origin === 'upload' && <span className="resume-tag base">Base</span>}
+                {r.kind === 'adapted' && <span className="resume-tag tailored">Tailored</span>}
+                {jobCount > 0 && <span className="resume-tag final">Final</span>}
+                {r.isDefault && <span className="resume-tag default">Default</span>}
               </div>
-            )}
+            </div>
+            <div className="resume-library-more" onClick={e => e.stopPropagation()}>
+              <button type="button" aria-label={`More actions for ${r.name}`} onClick={() => setOpenMenuId(value => value === r.id ? null : r.id)}>⋮</button>
+              {openMenuId === r.id && <div role="menu" className="resume-library-item-menu">
+                {!r.isDefault && <button type="button" onClick={() => { setOpenMenuId(null); onSetDefault(r) }}>Set as default</button>}
+                <button type="button" onClick={() => { setOpenMenuId(null); onRename(r) }}>Rename</button>
+                {(r.targetJobId || jobCount > 0) && <button type="button" onClick={() => { setOpenMenuId(null); onUnlink(r) }}>Cancel link</button>}
+                <button type="button" className="danger" onClick={() => { setOpenMenuId(null); onDelete(r) }}>Delete</button>
+              </div>}
+            </div>
           </div>
         )
       })}
@@ -490,6 +505,7 @@ export function ResumePage() {
   const { data: resumeList, loading: loadingList } = useApi<ResumeListItem[]>('/api/resume')
   const [resumes,          setResumes]          = useState<ResumeListItem[]>([])
   const [selectedResumeId, setSelectedResumeId] = useState<string | null>(null)
+  const [libraryCollapsed, setLibraryCollapsed] = useState(false)
 
   const { data: directionList, refetch: refetchDirections } = useApi<Direction[]>('/api/directions')
   const [directions,       setDirections]       = useState<Direction[]>([])
@@ -504,21 +520,26 @@ export function ResumePage() {
   const [previewMode,     setPreviewMode]     = useState(false)
   const [loadingCont,     setLoadingCont]     = useState(false)
   const [saving,      setSaving]      = useState(false)
+  const [lastSavedAt, setLastSavedAt] = useState<Date | null>(null)
+
+  useEffect(() => {
+    const timer = window.setInterval(() => setLastSavedAt(value => value ? new Date(value) : value), 60_000)
+    return () => window.clearInterval(timer)
+  }, [])
   const [dirty,       setDirty]       = useState(false)
   const [editSection, setEditSection] = useState<string | null>(null)
 
   const { data: jobData } = useApi<{ jobs: Job[] }>('/api/jobs?pageSize=30')
   const [jobs,          setJobs]          = useState<Job[]>([])
 
-  const cache = loadCache()
-  const [selectedJobId, setSelectedJobId] = useState<string | null>(cache?.jobId ?? null)
-  const [scoreResult, setScoreResult] = useState<ScoreResult | null>(cache?.score ?? null)
-  const [suggestions, setSuggestions] = useState<Suggestion[]>(cache?.suggs ?? [])
+  const [selectedJobId, setSelectedJobId] = useState<string | null>(null)
+  const [scoreResult, setScoreResult] = useState<ScoreResult | null>(null)
+  const [suggestions, setSuggestions] = useState<Suggestion[]>([])
   const [scoring,     setScoring]     = useState(false)
   const [suggesting,  setSuggesting]  = useState(false)
   // Tracks which jobId the current analysis belongs to — used to skip redundant re-runs
   // after tab navigation (component remount) when cache has already been restored.
-  const analysisJobIdRef  = useRef<string | null>(cache?.jobId ?? null)
+  const analysisJobIdRef  = useRef<string | null>(null)
   // True only on the very first resume load (initial mount / tab-remount).
   // Prevents the selectedResumeId effect from wiping cached analysis on remount.
   const isFirstResumeLoad = useRef(true)
@@ -531,7 +552,12 @@ export function ResumePage() {
 
   const [showTemplates,   setShowTemplates]   = useState(false)
   const [showCoverLetter, setShowCoverLetter] = useState(false)
+  const [showFinalConfirm, setShowFinalConfirm] = useState(false)
+  // Confirmation is scoped to a resume. A global boolean made the previously
+  // confirmed resume look ready after the user selected a different version.
+  const [applicationPackReadyResumeId, setApplicationPackReadyResumeId] = useState<string | null>(null)
   const [showNewResume,   setShowNewResume]   = useState(false)
+  const [renamingResume,  setRenamingResume]  = useState<ResumeListItem | null>(null)
   const [showUploadModal,   setShowUploadModal]   = useState(false)
   const [showIntakeDialog,  setShowIntakeDialog]  = useState(false)
   const [creatingResume,  setCreatingResume]  = useState(false)
@@ -582,20 +608,18 @@ export function ResumePage() {
 
   useEffect(() => {
     if (!selectedResumeId) return
+    const controller = new AbortController()
     setLoadingCont(true); setDirty(false); setContentChangedSinceAnalysis(false)
     if (!isFirstResumeLoad.current) {
       // User actively switched to a different resume — clear stale analysis
       setScoreResult(null); setSuggestions([])
       analysisJobIdRef.current = null
-    } else if (cache?.resumeId && cache.resumeId !== selectedResumeId) {
-      // Cache was written for a different resume — don't show its results here
-      setScoreResult(null); setSuggestions([])
-      analysisJobIdRef.current = null
     }
     isFirstResumeLoad.current = false
-    fetch(`/api/resume/${selectedResumeId}`)
+    fetch(`/api/resume/${selectedResumeId}`, { signal: controller.signal })
       .then(r => r.json())
       .then((r: Resume) => {
+        if (controller.signal.aborted) return
         const c = (r.content ?? EMPTY_CONTENT) as ResumeContent
         setContent(c)
         setResumeName(r.name)
@@ -603,20 +627,53 @@ export function ResumePage() {
         setTemplateOptions((r.templateOptions ?? {}) as TemplateOptions)
         setSectionOrder(c.sectionOrder ?? DEFAULT_ORDER)
       })
-      .catch(() => toast.error('Error', 'Could not load resume'))
-      .finally(() => setLoadingCont(false))
+      .catch(error => {
+        if (error instanceof DOMException && error.name === 'AbortError') return
+        toast.error('Error', 'Could not load resume')
+      })
+      .finally(() => { if (!controller.signal.aborted) setLoadingCont(false) })
+    return () => controller.abort()
   }, [selectedResumeId])
 
   useEffect(() => { if (jobData?.jobs) setJobs(jobData.jobs) }, [jobData])
 
   useEffect(() => {
+    if (!selectedResumeId || jobs.length === 0) return
+    const resume = resumes.find(item => item.id === selectedResumeId)
+    const linkedJobId = resume?.targetJobId ?? jobs.find(job => job.finalResumeId === selectedResumeId)?.id ?? null
+    if (linkedJobId) setSelectedJobId(linkedJobId)
+  }, [jobs, resumes, selectedResumeId])
+
+  useEffect(() => {
+    const cached = getAnalysisCache(selectedResumeId, selectedJobId)
+    if (cached) {
+      setScoreResult(cached.score)
+      setSuggestions(cached.suggs)
+      analysisJobIdRef.current = cached.jobId
+      return
+    }
+    setScoreResult(null)
+    setSuggestions([])
+    analysisJobIdRef.current = null
+  }, [selectedJobId, selectedResumeId])
+
+  useEffect(() => {
     if (!selectedJobId || !content || jobs.length === 0) return
     // Skip if we already have analysis results for this exact job (e.g. restored from
     // cache after tab navigation). The user can still force a re-run via the ↻ button.
+    const cached = getAnalysisCache(selectedResumeId, selectedJobId)
+    if (cached) {
+      if (analysisJobIdRef.current !== selectedJobId) {
+        setScoreResult(cached.score)
+        setSuggestions(cached.suggs)
+        analysisJobIdRef.current = selectedJobId
+      }
+      return
+    }
     if (scoreResult && analysisJobIdRef.current === selectedJobId) return
     runAnalysis(content, selectedJobId)
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [selectedJobId, jobs])
+  }, [selectedJobId, selectedResumeId, jobs])
 
   const [flashField, setFlashField] = useState('')
 
@@ -744,6 +801,7 @@ export function ResumePage() {
       toast.error('Save failed', error)
     } else {
       setDirty(false)
+      setLastSavedAt(new Date())
       toast.success('Saved', 'Resume updated successfully')
       // Re-analysis is intentionally NOT triggered here — the AiPanel stale indicator
       // prompts the user to re-analyse when ready, avoiding a token burn on every save.
@@ -974,11 +1032,125 @@ export function ResumePage() {
   // ── Job context for AI ────────────────────────────────────────────────────
 
   const selectedJob  = jobs.find(j => j.id === selectedJobId) ?? null
+  const selectedResume = resumes.find(r => r.id === selectedResumeId) ?? null
+  const resumeLinkedJob = jobs.find(j => j.id === selectedResume?.targetJobId)
+    ?? jobs.find(j => j.finalResumeId === selectedResumeId)
+    ?? null
+  const confirmedJob = jobs.find(j => j.finalResumeId === selectedResumeId) ?? null
+  // The sidebar must only describe an actual resume ↔ job link. Falling back to
+  // a previously selected job kept stale opportunity details visible after a
+  // resume switch or after cancelling a link.
+  const linkedJob = resumeLinkedJob
+  const templateName = TEMPLATES.find(template => template.id === templateId)?.name ?? templateId
+  const pendingSuggestions = suggestions.filter(suggestion => !suggestion.applied).length
   const jobContext: AiFieldContext = selectedJob ? {
     jobTitle:       selectedJob.role,
     jobCompany:     selectedJob.company,
     jobDescription: selectedJob.description ?? undefined,
   } : {}
+
+  async function linkResumeToJob(jobId: string) {
+    if (!selectedResumeId) return
+    const { data, error } = await apiMutate<Resume>(`/api/resume/${selectedResumeId}`, 'PATCH', { targetJobId: jobId })
+    if (!data || error) { toast.error('Could not link resume', error ?? 'Please try again'); return }
+    setResumes(prev => prev.map(resume => resume.id === selectedResumeId ? { ...resume, targetJobId: jobId, updatedAt: data.updatedAt } : resume))
+    setSelectedJobId(jobId)
+    const job = jobs.find(item => item.id === jobId)
+    toast.success('Resume linked', `This version is linked to ${job?.company ?? 'the saved job'} — confirm it when ready`)
+  }
+
+  async function confirmApplicationPack(): Promise<boolean> {
+    if (!selectedResumeId || !resumeLinkedJob) {
+      toast.info('Link a saved job first', 'Choose an opportunity in My Jobs before final confirmation')
+      return false
+    }
+    if (dirty) {
+      toast.info('Saving latest edits', 'Your resume is saving. Run final confirm again in a moment.')
+      handleSave()
+      return false
+    }
+    const { data, error } = await apiMutate<Job>(`/api/jobs/${resumeLinkedJob.id}/assign`, 'PATCH', { finalResumeId: selectedResumeId })
+    if (!data || error) {
+      toast.error('Could not confirm application pack', error ?? 'Please try again')
+      return false
+    }
+    setJobs(previous => previous.map(job => job.id === data.id ? data : job))
+    setResumes(previous => previous.map(resume => {
+      if (resume.id === selectedResumeId) {
+        return { ...resume, _count: { finalForJobs: Math.max(1, resume._count?.finalForJobs ?? 0) } }
+      }
+      if (resume.id === resumeLinkedJob.finalResumeId) {
+        return { ...resume, _count: { finalForJobs: 0 } }
+      }
+      return resume
+    }))
+    setApplicationPackReadyResumeId(selectedResumeId)
+    toast.success('Application pack confirmed', 'Your final resume is now ready for the writer agent and PDF export')
+    return true
+  }
+
+  async function downloadApplicationPack() {
+    if (!confirmedJob) return
+    try {
+      await downloadJobBundle(confirmedJob.id)
+      toast.success('Application pack downloaded', 'Your PDF files and application metadata are ready')
+    } catch (error) {
+      toast.error('Could not create application pack', error instanceof Error ? error.message : 'Please try again')
+    }
+  }
+
+  async function handleRenameResume(resume: ResumeListItem, name: string) {
+    if (!name || name === resume.name) { setRenamingResume(null); return }
+    const { data, error } = await apiMutate<Resume>(`/api/resume/${resume.id}`, 'PATCH', { name })
+    if (!data) return toast.error('Rename failed', error ?? 'Could not rename resume')
+    setResumes(prev => prev.map(item => item.id === resume.id ? { ...item, name: data.name, updatedAt: data.updatedAt } : item))
+    if (resume.id === selectedResumeId) setResumeName(data.name)
+    toast.success('Resume renamed', data.name)
+    setRenamingResume(null)
+  }
+
+  async function handleSetDefaultResume(resume: ResumeListItem) {
+    const { data, error } = await apiMutate<Resume>(`/api/resume/${resume.id}`, 'PATCH', { isDefault: true })
+    if (!data || error) { toast.error('Could not set default', error ?? 'Please try again'); return }
+    setResumes(previous => previous.map(item => ({ ...item, isDefault: item.id === resume.id })))
+    toast.success('Default resume updated', `${data.name} is now your default resume`)
+  }
+
+  async function handleUnlinkResume(resume: ResumeListItem) {
+    const ok = await confirm({
+      title: 'Cancel job link?',
+      message: 'This will remove the job connection and clear its Final status. Your resume and cover letter files will stay intact.',
+      danger: true,
+      confirmLabel: 'Cancel link',
+    })
+    if (!ok) return
+
+    const { data, error } = await apiMutate<Resume>(`/api/resume/${resume.id}`, 'PATCH', { unlinkJob: true })
+    if (!data || error) { toast.error('Could not cancel link', error ?? 'Please try again'); return }
+    setResumes(previous => previous.map(item => item.id === resume.id
+      ? { ...item, targetJobId: null, _count: { finalForJobs: 0 }, updatedAt: data.updatedAt }
+      : item))
+    setJobs(previous => previous.map(job => job.finalResumeId === resume.id ? { ...job, finalResumeId: null } : job))
+    if (resume.id === selectedResumeId) {
+      setSelectedJobId(null)
+      setScoreResult(null)
+      setSuggestions([])
+      analysisJobIdRef.current = null
+    }
+    toast.success('Job link removed', 'The resume is no longer marked as Final for that job')
+  }
+
+  async function handleDeleteResume(resume: ResumeListItem) {
+    if (resumes.length <= 1) return toast.error('Keep one resume', 'Create another version before deleting this resume.')
+    const approved = await confirm({ title: 'Delete resume?', message: `Delete “${resume.name}”? This cannot be undone.`, danger: true, confirmLabel: 'Delete' })
+    if (!approved) return
+    const { error } = await apiMutate(`/api/resume/${resume.id}`, 'DELETE')
+    if (error) return toast.error('Delete failed', error)
+    const next = resumes.filter(item => item.id !== resume.id)
+    setResumes(next)
+    if (resume.id === selectedResumeId) setSelectedResumeId(next[0]?.id ?? null)
+    toast.success('Resume deleted', resume.name)
+  }
 
   // ── Render section ────────────────────────────────────────────────────────
 
@@ -1076,145 +1248,21 @@ export function ResumePage() {
   // ── Render ────────────────────────────────────────────────────────────────
 
   return (
-    <div style={{ flex: 1, display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
+    <div className="resume-library-page" style={{ flex: 1, display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
       <ConfirmDialog />
-      <TopBar title="Resume">
-        {/* Direction chips */}
-        <div style={{ display: 'flex', gap: 4, overflowX: 'auto', flexShrink: 0, maxWidth: 320, alignItems: 'center' }}>
-          <button
-            onClick={() => setSelectedDirId(null)}
-            style={{
-              fontSize: 10, padding: '3px 8px', borderRadius: 10, border: '0.5px solid var(--border)',
-              background: selectedDirId === null ? 'var(--primary)' : 'var(--bg)',
-              color: selectedDirId === null ? '#fff' : 'var(--text)',
-              cursor: 'pointer', whiteSpace: 'nowrap', flexShrink: 0,
-            }}>All</button>
-          {directions.map(d => (
-            <div key={d.id} style={{ position: 'relative', flexShrink: 0, display: 'inline-flex', alignItems: 'center' }}>
-              {editingDirId === d.id ? (
-                <input
-                  autoFocus
-                  defaultValue={d.name}
-                  onBlur={async (e) => {
-                    const newName = e.currentTarget.value.trim()
-                    setEditingDirId(null)
-                    if (!newName || newName === d.name) return
-                    const { data, error } = await apiMutate<Direction>(`/api/directions/${d.id}`, 'PATCH', { name: newName })
-                    if (data) setDirections(prev => prev.map(x => x.id === d.id ? data : x))
-                    else toast.error('Rename failed', error ?? 'Could not rename direction')
-                  }}
-                  onKeyDown={(e) => {
-                    if (e.key === 'Enter') e.currentTarget.blur()
-                    if (e.key === 'Escape') setEditingDirId(null)
-                  }}
-                  style={{ fontSize: 10, padding: '2px 6px', borderRadius: 10, border: '1px solid var(--primary)', outline: 'none', width: 120, background: 'var(--bg)', color: 'var(--text)' }}
-                />
-              ) : (
-                <button
-                  onClick={() => setSelectedDirId(d.id === selectedDirId ? null : d.id)}
-                  style={{
-                    fontSize: 10, padding: '3px 8px', borderRadius: 10, border: `0.5px solid ${d.color ?? 'var(--border)'}`,
-                    background: selectedDirId === d.id ? (d.color ?? 'var(--primary)') : 'var(--bg)',
-                    color: selectedDirId === d.id ? '#fff' : 'var(--text)',
-                    cursor: 'pointer', whiteSpace: 'nowrap',
-                  }}>
-                  {d.icon ? `${d.icon} ` : ''}{d.name}
-                </button>
-              )}
-              <div style={{ display: 'inline-flex', gap: 1, marginLeft: 1 }}>
-                <button
-                  onClick={() => setEditingDirId(d.id)}
-                  title="Rename"
-                  style={{ fontSize: 9, padding: '1px 3px', border: '0.5px solid var(--border)', borderRadius: 4, background: 'var(--bg)', color: 'var(--text-muted)', cursor: 'pointer', lineHeight: 1 }}>✎</button>
-                <button
-                  onClick={async () => {
-                    const ok = await confirm({ title: 'Delete direction?', message: `"${d.name}" will be unlinked from its resumes. Resumes will not be deleted.`, danger: true, confirmLabel: 'Delete' })
-                    if (!ok) return
-                    const { error } = await apiMutate(`/api/directions/${d.id}`, 'DELETE')
-                    if (error) { toast.error('Delete failed', error); return }
-                    setDirections(prev => prev.filter(x => x.id !== d.id))
-                    setEditingDirId(null)
-                    if (selectedDirId === d.id) setSelectedDirId(null)
-                    toast.info('Deleted', `Direction "${d.name}" removed`)
-                  }}
-                  title="Delete"
-                  style={{ fontSize: 9, padding: '1px 3px', border: '0.5px solid var(--border)', borderRadius: 4, background: 'var(--bg)', color: 'var(--c-danger)', cursor: 'pointer', lineHeight: 1 }}>×</button>
-              </div>
-            </div>
-          ))}
-          <button
-            onClick={() => setShowAddDirection(true)}
-            style={{
-              fontSize: 10, padding: '3px 8px', borderRadius: 10, border: '0.5px dashed var(--border)',
-              background: 'transparent', color: 'var(--text-muted)', cursor: 'pointer', whiteSpace: 'nowrap', flexShrink: 0,
-            }}>{t('direction.add')}</button>
+      <header className="resume-library-heading">
+        <div>
+          <h1>Resume library</h1>
         </div>
-        <div style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
-          <select value={selectedResumeId ?? ''} onChange={async e => {
-            const next = e.target.value
-            if (dirty) {
-              const ok = await confirm({ title: 'Discard changes?', message: 'You have unsaved changes. Switching will discard them.', danger: true, confirmLabel: 'Discard' })
-              if (!ok) return
-            }
-            setSelectedResumeId(next)
-          }} style={{ fontSize: 11, padding: '4px 8px', border: '0.5px solid var(--border)', borderRadius: 6, background: 'var(--bg)', color: 'var(--text)', outline: 'none', maxWidth: 160 }}>
-            {filteredResumes.map(r => (
-              <option key={r.id} value={r.id}>
-                {r.isDefault ? '★ ' : ''}{r.name}{r.kind === 'adapted' ? ' (Adapted)' : ''}
-              </option>
-            ))}
-          </select>
-          <button onClick={() => setShowNewResume(true)} disabled={creatingResume} title="New resume"
-            style={{ fontSize: 13, lineHeight: 1, padding: '3px 7px', border: '0.5px solid var(--border)', borderRadius: 6, background: 'var(--bg)', color: 'var(--primary)', cursor: 'pointer' }}>
-            {creatingResume ? '…' : '+'}
-          </button>
-          <button onClick={() => setShowIntakeDialog(true)} title="Import resume via upload, paste or screenshot"
-            style={{ fontSize: 11, lineHeight: 1, padding: '3px 8px', border: '0.5px solid var(--border)', borderRadius: 6, background: 'var(--bg)', color: 'var(--primary)', cursor: 'pointer' }}>
-            ↑ Intake
-          </button>
-          <button
-            title="Delete this resume"
-            disabled={resumes.length <= 1}
-            onClick={async () => {
-              if (!selectedResumeId) return
-              const name = resumes.find(r => r.id === selectedResumeId)?.name ?? 'this resume'
-              const ok = await confirm({
-                title: 'Delete resume?',
-                message: `"${name}" will be permanently deleted. This cannot be undone.`,
-                danger: true,
-                confirmLabel: 'Delete',
-              })
-              if (!ok) return
-              const { error } = await apiMutate(`/api/resume/${selectedResumeId}`, 'DELETE', undefined)
-              if (error) { toast.error('Delete failed', error); return }
-              const remaining = resumes.filter(r => r.id !== selectedResumeId)
-              setResumes(remaining)
-              setSelectedResumeId(remaining[0]?.id ?? null)
-              toast.info('Deleted', `"${name}" has been removed`)
-            }}
-            style={{
-              fontSize: 13, lineHeight: 1, padding: '3px 7px',
-              border: '0.5px solid var(--border)', borderRadius: 6,
-              background: 'var(--bg)', cursor: resumes.length <= 1 ? 'not-allowed' : 'pointer',
-              color: resumes.length <= 1 ? 'var(--text-muted)' : 'var(--c-danger)',
-              opacity: resumes.length <= 1 ? 0.4 : 1,
-            }}>
-            ✕
-          </button>
+      <div className="resume-library-toolbar">
+        <div className="resume-library-toolbar-actions">
+          <Btn variant="primary" onClick={() => setShowIntakeDialog(true)}><Upload size={15} />Import &amp; parse</Btn>
         </div>
-        <Btn variant={previewMode ? 'primary' : 'ghost'} onClick={() => setPreviewMode(v => !v)}>
-          {previewMode ? '✎ Edit' : '◻ Preview'}
-        </Btn>
-        <Btn variant="ghost" onClick={() => setShowTemplates(true)}>⊞ Templates</Btn>
-        <select value={selectedJobId ?? ''} onChange={e => setSelectedJobId(e.target.value || null)}
-          style={{ fontSize: 11, padding: '4px 8px', border: '0.5px solid var(--border)', borderRadius: 6, background: 'var(--bg)', color: 'var(--text)', outline: 'none', maxWidth: 200 }}>
-          <option value="">— No tailoring —</option>
-          {jobs.map(j => <option key={j.id} value={j.id}>{j.company} · {j.role}</option>)}
-        </select>
-        <Btn variant="ghost" onClick={() => {
-          if (!selectedJobId) { toast.info('Select a job first', 'Choose a job from the dropdown'); return }
-          setShowCoverLetter(true)
-        }}>✉ Cover Letter</Btn>
+        <span className="resume-toolbar-divider" />
+        <Btn variant="ghost" onClick={() => setShowTemplates(true)}><LayoutTemplate size={15} />Templates</Btn>
+        <span className="resume-toolbar-divider" />
+        <Btn variant="ghost" onClick={() => { if (!selectedResumeId) { toast.info('Select a resume first'); return }; fetchVersions(); setShowVersions(true) }}><History size={15} />History</Btn>
+        <span className="resume-toolbar-divider" />
         <Btn variant="ghost" onClick={() => {
           if (!selectedResumeId || !content) { toast.info('Select a resume first'); return }
           // Snapshot current state into localStorage — print page reads this directly,
@@ -1228,12 +1276,14 @@ export function ResumePage() {
           // Also persist to DB in the background (non-blocking)
           if (dirty) handleSave()
           window.open(`/resume/${selectedResumeId}/print`, '_blank')
-        }}>↓ PDF</Btn>
-        <Btn variant="ghost" onClick={() => { if (!selectedResumeId) { toast.info('Select a resume first'); return }; fetchVersions(); setShowVersions(true) }}>🕐 History</Btn>
-        <Btn variant="primary" onClick={handleSave} disabled={!dirty || saving}>
-          {saving ? 'Saving…' : dirty ? 'Save*' : 'Saved'}
-        </Btn>
-      </TopBar>
+        }}><FileDown size={15} />Export PDF</Btn>
+        <div className="resume-final-confirm-trigger"><Btn variant="ghost" onClick={() => {
+          if (!selectedResumeId || !content) { toast.info('Select a resume first'); return }
+          setShowFinalConfirm(true)
+        }}><ShieldCheck size={15} />Final confirm</Btn></div>
+        <span className={`resume-top-save${dirty ? ' is-unsaved' : ''}`}>{saving ? 'Saving…' : dirty ? 'Saving soon' : lastSavedAt && Date.now() - lastSavedAt.getTime() >= 5 * 60_000 ? `Saved ${lastSavedAt.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}` : 'Saved just now'}</span>
+      </div>
+      </header>
 
       {loadingCont ? (
         <div style={{ flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'center', background: 'var(--bg-tertiary)' }}>
@@ -1247,8 +1297,48 @@ export function ResumePage() {
           <div style={{ textAlign: 'center', color: 'var(--text-muted)', fontSize: 13 }}>Select or create a resume to get started.</div>
         </div>
       ) : (
-        <div style={{ flex: 1, display: 'flex', overflow: 'hidden', background: 'var(--bg-tertiary)' }}>
-          <div style={{ flex: 1, overflowY: 'auto', padding: 24 }}>
+        <div className={`resume-library-layout${libraryCollapsed ? ' is-library-collapsed' : ''}`} style={{ flex: 1, display: 'flex', overflow: 'hidden', background: 'var(--bg-tertiary)' }}>
+          <aside className="resume-library-sidebar">
+            <button className="resume-library-collapse" onClick={() => setLibraryCollapsed(value => !value)} aria-label={libraryCollapsed ? 'Show resume library' : 'Hide resume library'}>
+              {libraryCollapsed ? <PanelLeftOpen size={17} /> : <PanelLeftClose size={17} />}
+            </button>
+            {!libraryCollapsed && <>
+            <div className="resume-library-sidebar-head">
+              <div>
+                <span>My resumes</span>
+                <small>{resumes.length} version{resumes.length === 1 ? '' : 's'}</small>
+              </div>
+              <button onClick={() => setShowNewResume(true)} disabled={creatingResume}><Plus size={13} />New version</button>
+            </div>
+            <ResumeLibraryPanel
+              resumes={filteredResumes}
+              directions={directions}
+              selectedId={selectedResumeId}
+              onSelect={async (id) => {
+                if (dirty) {
+                  const ok = await confirm({ title: 'Discard changes?', message: 'You have unsaved changes. Switching will discard them.', danger: true, confirmLabel: 'Discard' })
+                  if (!ok) return
+                }
+                const target = resumes.find(r => r.id === id)
+                setShowFinalConfirm(false)
+                // Update the visible context immediately; the full content then
+                // follows from the selectedResumeId fetch below.
+                if (target) setResumeName(target.name)
+                setSelectedResumeId(id)
+                // Do not retain the prior resume's job context. A finalised
+                // resume is also linked through finalResumeId; otherwise this
+                // version deliberately has no AI/job context.
+                setSelectedJobId(target?.targetJobId ?? jobs.find(job => job.finalResumeId === id)?.id ?? null)
+              }}
+              onRename={resume => setRenamingResume(resume)}
+              onDelete={handleDeleteResume}
+              onSetDefault={handleSetDefaultResume}
+              onUnlink={handleUnlinkResume}
+            />
+            <button className="resume-library-import" onClick={() => setShowIntakeDialog(true)}>Import & parse a resume</button>
+            </>}
+          </aside>
+          <div className="resume-workspace" style={{ flex: 1, overflowY: 'auto', padding: 24 }}>
             {/* Empty-state banner: no directions set up */}
             {directions.length === 0 && (
               <div style={{ padding: '8px 12px', background: 'rgba(217,119,6,0.06)', border: '0.5px solid rgba(217,119,6,0.20)', borderRadius: 7, marginBottom: 12, fontSize: 11, color: 'var(--c-warning)', display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
@@ -1261,24 +1351,16 @@ export function ResumePage() {
                 </button>
               </div>
             )}
-            {/* Resume Library Panel */}
-            {resumes.length > 1 && (
-              <div style={{ marginBottom: 16, padding: '10px 12px', background: 'var(--bg)', border: '0.5px solid var(--border)', borderRadius: 8 }}>
-                <div style={{ fontSize: 10, fontWeight: 500, color: 'var(--text-muted)', marginBottom: 8, letterSpacing: '0.05em' }}>RESUME LIBRARY</div>
-                <ResumeLibraryPanel
-                  resumes={filteredResumes}
-                  directions={directions}
-                  selectedId={selectedResumeId}
-                  onSelect={async (id) => {
-                    if (dirty) {
-                      const ok = await confirm({ title: 'Discard changes?', message: 'You have unsaved changes. Switching will discard them.', danger: true, confirmLabel: 'Discard' })
-                      if (!ok) return
-                    }
-                    setSelectedResumeId(id)
-                  }}
-                />
+            <div className="resume-workspace-head">
+              <div>
+                <h2>{resumeName}<span>{selectedResume?.kind === 'adapted' ? 'Tailored resume' : 'Resume editor'}</span></h2>
               </div>
-            )}
+              <div className="resume-workspace-actions">
+                <button onClick={() => setPreviewMode(value => !value)}>
+                  {previewMode ? 'Edit resume' : 'Preview'}
+                </button>
+              </div>
+            </div>
             {/* ── PREVIEW MODE ── */}
             {previewMode && <ResumePreview content={{ ...content, sectionOrder }} templateId={templateId} templateOptions={templateOptions} />}
             {/* Format toolbar + Editor (hidden in preview mode) */}
@@ -1300,17 +1382,13 @@ export function ResumePage() {
                   fontSize: 11, cursor: 'pointer', color: 'var(--text)', ...f.style,
                 }}>{f.label}</button>
               ))}
-              <div style={{ width: 1, height: 18, background: 'var(--border)', margin: '0 2px' }} />
-              <span style={{ fontSize: 10, color: dirty ? 'var(--c-warning)' : 'var(--text-muted)' }}>
-                {dirty ? '● Unsaved' : '✓ Saved'}
-              </span>
             </div>
 
             {/* Completeness bar */}
             <CompletenessBar content={content} />
 
             {/* Resume paper */}
-            <div style={{ maxWidth: 680, margin: '0 auto', background: 'var(--bg)', border: '0.5px solid var(--border)', borderRadius: 10, padding: '32px 36px' }}>
+            <div className="resume-paper" style={{ maxWidth: 680, margin: '0 auto', background: 'var(--bg)', border: '0.5px solid var(--border)', borderRadius: 10, padding: '32px 36px' }}>
               {/* Contact (fixed, not draggable) */}
               <ContactSection
                 contact={content.contact}
@@ -1360,6 +1438,31 @@ export function ResumePage() {
             </>)}
           </div>
 
+          <aside className="resume-ai-column">
+          <div className="resume-ai-title">AI insights <span>i</span></div>
+          <div className="resume-opportunity-card">
+            <span className="resume-opportunity-eyebrow">LINKED OPPORTUNITY</span>
+            {linkedJob ? <>
+              <strong>{linkedJob.role}</strong>
+              <span>{linkedJob.company}</span>
+              <small>{selectedResume?.targetJobId ? 'Tailored version linked' : 'Selected resume linked'}</small>
+              <div className="resume-opportunity-actions">
+                <button onClick={() => setShowCoverLetter(true)}>Cover letter</button>
+                <button onClick={() => toast.info('Saved job', `${linkedJob.company} · ${linkedJob.role} is linked to this resume`)}>View job</button>
+              </div>
+            </> : <>
+              <strong>Link a saved job</strong>
+              <span>AI will tailor this resume to the opportunity you choose.</span>
+              <select value={selectedJobId ?? ''} onChange={e => setSelectedJobId(e.target.value || null)}>
+                <option value="">Choose a saved job</option>
+                {jobs.map(job => <option key={job.id} value={job.id}>{job.company} · {job.role}</option>)}
+              </select>
+              <button className="resume-opportunity-link" onClick={() => {
+                if (!selectedJobId) { toast.info('Select a saved job first', 'Choose the opportunity this resume should be used for'); return }
+                linkResumeToJob(selectedJobId)
+              }}>Link resume</button>
+            </>}
+          </div>
           <AiPanel
             selectedJob={selectedJob}
             scoreResult={scoreResult}
@@ -1376,6 +1479,7 @@ export function ResumePage() {
             currentSkills={content?.skills}
             contentChangedSinceAnalysis={contentChangedSinceAnalysis}
           />
+          </aside>
         </div>
       )}
 
@@ -1397,7 +1501,9 @@ export function ResumePage() {
           job={selectedJob}
           resumeContent={content}
           resumeName={resumeName}
-          templateName={templateId}
+          templateId={templateId}
+          templateName={templateName}
+          templateOptions={templateOptions}
           onClose={() => setShowCoverLetter(false)}
         />
       )}
@@ -1439,6 +1545,28 @@ export function ResumePage() {
       {showNewResume && (
         <NewResumeModal onClose={() => setShowNewResume(false)} onCreate={handleCreateResume} />
       )}
+      {showFinalConfirm && (
+        <FinalConfirmDialog
+          key={selectedResumeId}
+          job={resumeLinkedJob}
+          resumeName={resumeName}
+          templateName={templateName}
+          pendingSuggestions={pendingSuggestions}
+          isDirty={dirty || saving}
+          packReady={applicationPackReadyResumeId === selectedResumeId || Boolean(confirmedJob && !dirty)}
+          onClose={() => setShowFinalConfirm(false)}
+          onReviewSuggestions={() => { setShowFinalConfirm(false); toast.info('Review AI suggestions', 'Apply the remaining suggestions in the AI insights panel') }}
+          onCreateCoverLetter={() => { setShowFinalConfirm(false); setShowCoverLetter(true) }}
+          onLinkJob={() => {
+            setShowFinalConfirm(false)
+            if (selectedJobId) { void linkResumeToJob(selectedJobId); return }
+            toast.info('Link a saved job', 'Choose a job in the Linked opportunity panel')
+          }}
+          onConfirm={confirmApplicationPack}
+          onDownload={downloadApplicationPack}
+        />
+      )}
+      {renamingResume && <RenameResumeModal resume={renamingResume} onClose={() => setRenamingResume(null)} onRename={name => handleRenameResume(renamingResume, name)} />}
       {showUploadModal && (
         <UploadResumeModal onClose={() => setShowUploadModal(false)} onImport={handleImportResume} />
       )}

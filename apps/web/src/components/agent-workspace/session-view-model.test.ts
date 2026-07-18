@@ -5,7 +5,9 @@ import {
   eventSubtitle,
   formatSessionClock,
   confidenceLabel,
+  EVENT_TONE_COLOR,
   sessionStatusLabel,
+  sessionHeaderSubtitle,
   sessionSubtitle,
   shouldCollapseByDefault,
   taskStatusColor,
@@ -13,6 +15,12 @@ import {
 } from "./session-view-model"
 
 describe("agent session view model", () => {
+  it("uses distinct colors for the user and the primary agent", () => {
+    expect(EVENT_TONE_COLOR.user).toBe("#4F46E5")
+    expect(EVENT_TONE_COLOR.orchestrator).toBe("#0F766E")
+    expect(EVENT_TONE_COLOR.user).not.toBe(EVENT_TONE_COLOR.orchestrator)
+  })
+
   it("labels session statuses for the left console", () => {
     expect(sessionStatusLabel("running")).toBe("Running")
     expect(sessionStatusLabel("waiting_user")).toBe("Approval")
@@ -31,6 +39,14 @@ describe("agent session view model", () => {
       qualityScore: null,
       updatedAt: "2026-06-18T09:42:00.000Z",
     })).toContain("Chat")
+  })
+
+  it("builds a status-aware conversation header subtitle", () => {
+    expect(sessionHeaderSubtitle({
+      source: "chat",
+      status: "completed",
+      updatedAt: "2026-06-18T09:42:00.000Z",
+    })).toContain("Done")
   })
 
   it("labels task status and confidence for the session focus panel", () => {

@@ -3,8 +3,8 @@
 import React, { useEffect, useRef, useState } from 'react'
 import { Btn } from '@/components/ui'
 import { useApi } from '@/lib/hooks'
-import type { AgentSessionDetail, AgentTranscriptEvent, EventTone } from './session-view-model'
-import { approvalResponseIds, eventChrome, eventSubtitle, sessionStatusLabel, shouldCollapseByDefault } from './session-view-model'
+import type { AgentSessionDetail, AgentTranscriptEvent } from './session-view-model'
+import { approvalResponseIds, EVENT_TONE_COLOR, eventChrome, eventSubtitle, sessionStatusLabel, shouldCollapseByDefault } from './session-view-model'
 import { ReplayBanner } from './ReplayBanner'
 import { TranscriptSpecialContent, type TranscriptAction } from './TranscriptSpecialBlocks'
 
@@ -14,19 +14,6 @@ interface DetailResponse {
 
 interface EventsResponse {
   events: AgentTranscriptEvent[]
-}
-
-function toneStyle(tone: EventTone): { border: string; bg: string; text: string } {
-  const styles: Record<EventTone, { border: string; bg: string; text: string }> = {
-    user: { border: 'rgba(79,70,229,0.35)', bg: 'rgba(79,70,229,0.07)', text: 'var(--primary)' },
-    orchestrator: { border: 'rgba(217,119,6,0.30)', bg: 'rgba(217,119,6,0.06)', text: '#b45309' },
-    subagent: { border: 'rgba(2,132,199,0.24)', bg: 'rgba(2,132,199,0.05)', text: '#0369a1' },
-    approval: { border: 'rgba(245,158,11,0.46)', bg: 'rgba(245,158,11,0.08)', text: '#92400e' },
-    success: { border: 'rgba(5,150,105,0.30)', bg: 'rgba(5,150,105,0.07)', text: 'var(--c-success)' },
-    error: { border: 'rgba(220,38,38,0.30)', bg: 'rgba(220,38,38,0.06)', text: 'var(--c-danger)' },
-    system: { border: 'var(--border)', bg: 'var(--bg-secondary)', text: 'var(--text-muted)' },
-  }
-  return styles[tone]
 }
 
 export function AgentSessionTranscript({ sessionId, onBackToLive }: {
@@ -82,7 +69,7 @@ export function AgentSessionTranscript({ sessionId, onBackToLive }: {
   }
 
   return (
-    <section className="agent-transcript-pane" style={{ flex: 1, minWidth: 0, display: 'flex', flexDirection: 'column', background: 'var(--bg)' }}>
+    <section className="agent-transcript-pane" style={{ flex: 1, minWidth: 0, minHeight: 0, display: 'flex', flexDirection: 'column', background: 'var(--bg)' }}>
       <div style={{
         padding: '12px 16px',
         borderBottom: '1px solid var(--border)',
@@ -120,7 +107,7 @@ export function AgentSessionTranscript({ sessionId, onBackToLive }: {
         </div>
       </div>
 
-      <div style={{ flex: 1, overflowY: 'auto', padding: '18px 20px', display: 'flex', flexDirection: 'column', gap: 12 }}>
+      <div style={{ flex: 1, minHeight: 0, overflowY: 'auto', overscrollBehavior: 'contain', padding: '18px 20px', display: 'flex', flexDirection: 'column', gap: 12 }}>
         {session && (
           <ReplayBanner
             source={session.source}
@@ -159,51 +146,24 @@ function TranscriptBlock({ event, actedApprovalIds, onAction }: {
   onAction: (action: TranscriptAction) => Promise<void> | void
 }) {
   const chrome = eventChrome(event.type)
-  const style = toneStyle(chrome.tone)
+  const accent = EVENT_TONE_COLOR[chrome.tone]
   const [expanded, setExpanded] = useState(!shouldCollapseByDefault(event.type))
   const title = event.title ?? chrome.label
+  const collapsible = shouldCollapseByDefault(event.type)
+  const header = <><span style={{ fontSize: 13, fontWeight: 750, color: accent }}>{event.speaker}</span><span style={{ fontSize: 11, color: 'var(--text-muted)' }}>{title}</span></>
 
   return (
     <article style={{
-      border: `1px solid ${style.border}`,
-      borderRadius: 8,
-      background: style.bg,
-      overflow: 'hidden',
+      flexShrink: 0,
+      border: '1px solid var(--border)', borderLeft: `4px solid ${accent}`,
+      borderRadius: 10, background: 'var(--bg)', padding: '15px 18px', boxShadow: 'var(--shadow-sm)',
     }}>
-      <button
-        onClick={() => shouldCollapseByDefault(event.type) && setExpanded(v => !v)}
-        style={{
-          width: '100%',
-          display: 'flex',
-          alignItems: 'center',
-          justifyContent: 'space-between',
-          gap: 12,
-          padding: '9px 12px',
-          background: 'rgba(255,255,255,0.35)',
-          border: 'none',
-          borderBottom: expanded ? `1px solid ${style.border}` : 'none',
-          cursor: shouldCollapseByDefault(event.type) ? 'pointer' : 'default',
-          fontFamily: 'inherit',
-          textAlign: 'left',
-        }}
-      >
-        <div style={{ minWidth: 0 }}>
-          <div style={{ fontSize: 12, fontWeight: 750, color: style.text, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-            {event.speaker}
-          </div>
-          <div style={{ fontSize: 10, color: 'var(--text-muted)', marginTop: 2 }}>
-            {title}
-          </div>
-        </div>
-        {shouldCollapseByDefault(event.type) && (
-          <span style={{ fontSize: 10, color: style.text, fontWeight: 650 }}>{expanded ? 'Hide' : 'Show'}</span>
-        )}
-      </button>
+      {collapsible ? <button onClick={() => setExpanded(v => !v)} style={{ display: 'flex', alignItems: 'center', gap: 10, width: '100%', border: 0, padding: 0, color: 'var(--text)', background: 'transparent', cursor: 'pointer', font: 'inherit', textAlign: 'left' }}><span style={{ color: 'var(--text-muted)', fontSize: 12 }}>{expanded ? '▼' : '▶'}</span>{header}</button> : <div style={{ display: 'flex', alignItems: 'baseline', gap: 10 }}>{header}</div>}
 
       {expanded && (
-        <div style={{ padding: '11px 13px 10px' }}>
-          <TranscriptSpecialContent event={event} border={style.border} actedApprovalIds={actedApprovalIds} onAction={onAction} />
-          <div style={{ marginTop: 10, fontSize: 10, color: 'var(--text-muted)', borderTop: `1px solid ${style.border}`, paddingTop: 7 }}>
+        <div style={{ marginTop: 12 }}>
+          <TranscriptSpecialContent event={event} border="var(--border)" actedApprovalIds={actedApprovalIds} onAction={onAction} />
+          <div style={{ marginTop: 12, fontSize: 10, color: 'var(--text-muted)', borderTop: '1px solid var(--border)', paddingTop: 9 }}>
             {eventSubtitle(event)}
           </div>
         </div>

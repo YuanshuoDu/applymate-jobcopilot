@@ -1,8 +1,9 @@
 'use client'
 
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useRef } from 'react'
 import { signOut } from 'next-auth/react'
 import type { Session } from 'next-auth'
+import { ChevronDown, CreditCard, LogOut, Settings, UserRound } from 'lucide-react'
 import type { Page } from '@/lib/types'
 import { UserAvatar } from '@/components/ui'
 import { useI18n } from '@/lib/i18n'
@@ -12,6 +13,11 @@ interface SidebarProps {
   onNav:   (p: Page) => void
   session: Session | null
   jobCount?: number
+  notificationControl?: React.ReactNode
+  notificationPanel?: React.ReactNode
+  accountMenuOpen?: boolean
+  onAccountMenuToggle?: () => void
+  onDismissSidebarPopovers?: () => void
 }
 
 export type SidebarNavItem = { id: Page; label: string }
@@ -43,14 +49,14 @@ export function getSidebarNavItems(t: (key: string) => string): SidebarNavItem[]
   ]
 }
 
-export function Sidebar({ active, onNav, session, jobCount: jobCountProp }: SidebarProps) {
+export function Sidebar({ active, onNav, session, jobCount: jobCountProp, notificationControl, notificationPanel, accountMenuOpen = false, onAccountMenuToggle = () => {}, onDismissSidebarPopovers = () => {} }: SidebarProps) {
   const user = session?.user
   const { t } = useI18n()
 
   const [gmailUnread, setGmailUnread] = useState<number | null>(null)
   const [jobCount,    setJobCount]    = useState<number | null>(null)
   const [userPlan,    setUserPlan]    = useState<string | null>(null)
-  const [logoutHov,   setLogoutHov]   = useState(false)
+  const accountAreaRef = useRef<HTMLDivElement>(null)
 
   useEffect(() => {
     fetch('/api/gmail/unread').then(r => r.json()).then(d => { if (d.hasGmail) setGmailUnread(d.unread) }).catch(() => {})
@@ -58,11 +64,17 @@ export function Sidebar({ active, onNav, session, jobCount: jobCountProp }: Side
     fetch('/api/me').then(r => r.json()).then(d => { if (d.plan) setUserPlan(d.plan) }).catch(() => {})
   }, [])
 
+  useEffect(() => {
+    if (!accountMenuOpen) return
+    const closeOnOutsidePointer = (event: MouseEvent) => {
+      if (!accountAreaRef.current?.contains(event.target as Node)) onDismissSidebarPopovers()
+    }
+    document.addEventListener('mousedown', closeOnOutsidePointer)
+    return () => document.removeEventListener('mousedown', closeOnOutsidePointer)
+  }, [accountMenuOpen, onDismissSidebarPopovers])
+
   const plan = userPlan ?? (user as { plan?: string } | undefined)?.plan ?? 'free'
   const planLabel = plan === 'enterprise' ? 'Team Plan' : plan === 'pro' ? 'Pro Plan' : 'Free Plan'
-  const planColor = plan === 'enterprise' ? '#0284C7' : plan === 'pro' ? '#7C3AED' : '#64748B'
-  const planBg    = plan === 'enterprise' ? 'rgba(2,132,199,0.10)' : plan === 'pro' ? 'rgba(124,58,237,0.10)' : 'rgba(100,116,139,0.10)'
-
   const NAV_ITEMS = getSidebarNavItems(t)
 
   return (
@@ -129,44 +141,45 @@ export function Sidebar({ active, onNav, session, jobCount: jobCountProp }: Side
       <div style={{ borderTop: '1px solid var(--border)', padding: '10px 10px 12px', display: 'flex', flexDirection: 'column', gap: 8 }}>
 
         {/* ── User info + sign out ── */}
-        <div style={{ borderTop: '1px solid var(--border)', paddingTop: 8 }}>
-          {/* Plan badge */}
-          <div style={{ paddingLeft: 2, marginBottom: 6 }}>
-            <span style={{ fontSize: 10, fontWeight: 600, padding: '2px 8px', borderRadius: 999, background: planBg, color: planColor }}>{planLabel}</span>
-          </div>
+        <div ref={accountAreaRef} style={{ borderTop: '1px solid var(--border)', paddingTop: 8, position: 'relative' }}>
+          {notificationPanel}
+          {accountMenuOpen && <div role="menu" aria-label="Account menu" style={{ position: 'absolute', left: 0, right: 0, bottom: 'calc(100% + 8px)', padding: 6, border: '1px solid var(--border)', borderRadius: 12, background: 'var(--bg)', boxShadow: '0 16px 36px rgba(15,23,42,0.16)', zIndex: 110 }}>
+            <div style={{ padding: '7px 8px 8px', marginBottom: 3, borderBottom: '1px solid var(--border)' }}>
+              <div style={{ fontSize: 11, fontWeight: 700, color: 'var(--text)' }}>{user?.name ?? user?.email?.split('@')[0] ?? 'User'}</div>
+              <div style={{ fontSize: 10, color: 'var(--text-muted)', marginTop: 2, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{user?.email ?? ''}</div>
+            </div>
+            <AccountMenuItem icon={<UserRound size={14} />} label="Profile & preferences" onClick={() => { onNav('settings'); onDismissSidebarPopovers() }} />
+            <AccountMenuItem icon={<CreditCard size={14} />} label="Plan & billing" badge={planLabel} onClick={() => { onNav('settings'); onDismissSidebarPopovers() }} />
+            <AccountMenuItem icon={<Settings size={14} />} label={t('nav.settings')} onClick={() => { onNav('settings'); onDismissSidebarPopovers() }} />
+            <div style={{ height: 1, background: 'var(--border)', margin: '5px 3px' }} />
+            <AccountMenuItem icon={<LogOut size={14} />} label={t('nav.signout')} danger onClick={() => signOut({ callbackUrl: '/login' })} />
+          </div>}
 
           {/* User row */}
-          <button onClick={() => onNav('settings')} title={t('nav.settings')} style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 6, width: '100%', padding: 4, border: 'none', borderRadius: 8, background: active === 'settings' ? 'rgba(79,70,229,0.10)' : 'transparent', cursor: 'pointer', textAlign: 'left', fontFamily: 'inherit' }}>
-            <UserAvatar src={user?.image} name={user?.name} email={user?.email} size={26} />
-            <div style={{ flex: 1, minWidth: 0 }}>
-              <div style={{ fontSize: 12, fontWeight: 500, color: 'var(--text)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                {user?.name ?? user?.email?.split('@')[0] ?? 'User'}
-              </div>
-              <div style={{ fontSize: 10, color: 'var(--text-muted)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                {user?.email ?? ''}
-              </div>
-            </div>
-            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" style={{ color: active === 'settings' ? 'var(--primary)' : 'var(--text-muted)', flexShrink: 0 }}><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 15a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
-          </button>
-
-          {/* Sign out */}
-          <button
-            onClick={() => signOut({ callbackUrl: '/login' })}
-            onMouseEnter={() => setLogoutHov(true)}
-            onMouseLeave={() => setLogoutHov(false)}
-            style={{
-              width: '100%', padding: '6px 10px', border: 'none', borderRadius: 7,
-              background: logoutHov ? 'rgba(163,45,45,0.10)' : 'transparent',
-              color: logoutHov ? '#DC2626' : 'var(--text-muted)',
-              fontSize: 12, textAlign: 'left', cursor: 'pointer',
-              display: 'flex', alignItems: 'center', gap: 7,
-              transition: 'all 0.12s', fontFamily: 'inherit',
-            }}>
-            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><polyline points="16 17 21 12 16 7"/><line x1="21" y1="12" x2="9" y2="12"/></svg>
-            {t('nav.signout')}
-          </button>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 4, marginBottom: 6 }}>
+            <button type="button" onClick={onAccountMenuToggle} aria-expanded={accountMenuOpen} aria-haspopup="menu" title="Open account menu" style={{ display: 'flex', flex: 1, minWidth: 0, alignItems: 'center', gap: 8, padding: '5px 6px', border: '1px solid transparent', borderRadius: 8, background: accountMenuOpen ? 'var(--nav-active)' : 'transparent', cursor: 'pointer', textAlign: 'left', fontFamily: 'inherit' }}>
+              <UserAvatar src={user?.image} name={user?.name} email={user?.email} size={26} />
+              <span style={{ flex: 1, minWidth: 0 }}>
+                <span style={{ display: 'block', fontSize: 12, fontWeight: 500, color: 'var(--text)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{user?.name ?? user?.email?.split('@')[0] ?? 'User'}</span>
+                <span style={{ display: 'block', fontSize: 10, color: 'var(--text-muted)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{user?.email ?? ''}</span>
+              </span>
+              <ChevronDown size={14} aria-hidden="true" style={{ color: 'var(--text-muted)', transform: accountMenuOpen ? 'rotate(180deg)' : undefined, transition: 'transform 0.15s' }} />
+            </button>
+            {notificationControl}
+            <button tabIndex={-1} aria-hidden="true" style={{ display: 'none' }}>
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 15a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
+            </button>
+          </div>
         </div>
       </div>
     </div>
   )
+}
+
+function AccountMenuItem({ icon, label, badge, danger = false, onClick }: { icon: React.ReactNode; label: string; badge?: string; danger?: boolean; onClick: () => void }) {
+  const [hovered, setHovered] = useState(false)
+
+  return <button type="button" role="menuitem" onClick={onClick} onMouseEnter={() => setHovered(true)} onMouseLeave={() => setHovered(false)} style={{ width: '100%', border: 'none', borderRadius: 7, padding: '7px 8px', background: hovered ? (danger ? 'rgba(220,38,38,0.08)' : 'var(--nav-active)') : 'transparent', color: danger ? '#DC2626' : 'var(--text)', display: 'flex', alignItems: 'center', gap: 8, cursor: 'pointer', fontFamily: 'inherit', fontSize: 11, textAlign: 'left' }}>
+    {icon}<span style={{ flex: 1 }}>{label}</span>{badge && <span style={{ fontSize: 9, fontWeight: 600, color: 'var(--primary)', background: 'rgba(79,70,229,0.10)', borderRadius: 999, padding: '1px 5px' }}>{badge}</span>}
+  </button>
 }

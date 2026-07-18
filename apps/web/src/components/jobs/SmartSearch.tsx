@@ -4,6 +4,7 @@ import React, { useState, useRef, useCallback, useEffect } from 'react'
 import { CompanyLogo, ScorePill, useToast } from '@/components/ui'
 import { apiMutate } from '@/lib/hooks'
 import type { Job, ResumeListItem } from '@/lib/types'
+import { extractSearchQuery } from './search-query'
 
 // ── Types ────────────────────────────────────────────────────────────────────
 
@@ -104,39 +105,6 @@ function fmtPosted(iso?: string | null): string {
   if (d < 7)  return `${d}d ago`
   if (d < 30) return `${Math.floor(d / 7)}w ago`
   return `${Math.floor(d / 30)}mo ago`
-}
-
-// ── City extraction (NLP) ─────────────────────────────────────────────────────
-
-const CITY_HINTS: Record<string, string> = {
-  dublin: 'Dublin', cork: 'Cork', galway: 'Galway', limerick: 'Limerick',
-  amsterdam: 'Amsterdam', rotterdam: 'Rotterdam', eindhoven: 'Eindhoven', utrecht: 'Utrecht',
-  berlin: 'Berlin', munich: 'Munich', münchen: 'Munich', hamburg: 'Hamburg',
-  frankfurt: 'Frankfurt', cologne: 'Cologne', köln: 'Cologne', stuttgart: 'Stuttgart',
-  vienna: 'Vienna', wien: 'Vienna', graz: 'Graz',
-  zurich: 'Zurich', zürich: 'Zurich', bern: 'Bern', geneva: 'Geneva', basel: 'Basel',
-  london: 'London', manchester: 'Manchester', edinburgh: 'Edinburgh', birmingham: 'Birmingham',
-  paris: 'Paris', lyon: 'Lyon', marseille: 'Marseille',
-  brussels: 'Brussels', antwerp: 'Antwerp',
-  madrid: 'Madrid', barcelona: 'Barcelona', valencia: 'Valencia', seville: 'Seville',
-  rome: 'Rome', milan: 'Milan', turin: 'Turin',
-  warsaw: 'Warsaw', krakow: 'Krakow', wroclaw: 'Wroclaw',
-  stockholm: 'Stockholm', gothenburg: 'Gothenburg',
-  copenhagen: 'Copenhagen', oslo: 'Oslo', helsinki: 'Helsinki',
-  lisbon: 'Lisbon', porto: 'Porto',
-  prague: 'Prague', budapest: 'Budapest', bucharest: 'Bucharest',
-  athens: 'Athens', sofia: 'Sofia', zagreb: 'Zagreb',
-}
-
-function extractCityFromQuery(q: string): { cleanQ: string; city: string } | null {
-  for (const [key, city] of Object.entries(CITY_HINTS)) {
-    const match = q.match(new RegExp(`(?:^|\\s|,)${key}(?:\\s|,|$)`, 'i'))
-    if (match) {
-      const clean = q.replace(new RegExp(`[,\\s]*\\b${key}\\b[,\\s]*`, 'i'), ' ').replace(/\s+/g, ' ').trim()
-      return { cleanQ: clean || q, city }
-    }
-  }
-  return null
 }
 
 // ── Region display helper ─────────────────────────────────────────────────────
@@ -294,15 +262,14 @@ export function SmartSearch({ onJobSaved }: { onJobSaved?: () => void }) {
     let searchQ = q.trim()
     let searchFilters = filters
 
-    // Auto-extract city from query if no location filter is set
-    if (!searchFilters.location.trim() && searchQ) {
-      const extracted = extractCityFromQuery(searchQ)
-      if (extracted) {
+    if (searchQ) {
+      const extracted = extractSearchQuery(searchQ)
+      if (Object.keys(extracted.filters).length > 0) {
         searchQ = extracted.cleanQ
-        searchFilters = { ...filters, location: extracted.city }
+        searchFilters = { ...DEFAULT_FILTERS, ...extracted.filters }
         setQ(extracted.cleanQ)
         setFilters(searchFilters)
-        toast.success(`📍 Location detected`, `Searching in ${extracted.city}`)
+        toast.success('Filters detected', `Using this search's filters: ${Object.entries(extracted.filters).map(([key, value]) => `${key}: ${value}`).join(' · ')}`)
       }
     }
     runSearch(searchQ, searchFilters)
