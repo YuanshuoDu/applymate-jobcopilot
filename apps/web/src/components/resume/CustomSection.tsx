@@ -17,7 +17,9 @@ export function CustomSection({ entry, jobContext, onChange, onRemove, dragHandl
   onRemove?:        () => void
   dragHandleProps?: DragHandleProps
 }) {
-  const [editTitle, setEditTitle] = useState(false)
+  // A newly-created custom section opens directly in title-edit mode so it
+  // never looks like the default name is fixed.
+  const [editTitle, setEditTitle] = useState(() => !entry.title || entry.title === 'CUSTOM SECTION')
   const [editIdx,   setEditIdx]   = useState<number | null>(null)
   const [collapsed, setCollapsed] = useState(false)
   const [dragOver,  setDragOver]  = useState<number | null>(null)
@@ -49,6 +51,7 @@ export function CustomSection({ entry, jobContext, onChange, onRemove, dragHandl
         onAdd={addItem}
         onRemove={onRemove}
         dragHandleProps={dragHandleProps}
+        onTitleClick={() => setEditTitle(true)}
       />
 
       {/* Editable section title */}

@@ -10,7 +10,6 @@ import { AddAgentModal, type CustomAgentRow } from '@/components/agent-workspace
 import { AgentUnifiedStream } from '@/components/agent-workspace/AgentUnifiedStream'
 import type { ApplyReadyJob } from '@/components/agent-workspace/ApplyJobCard'
 import { AgentSessionConsole } from '@/components/agent-workspace/AgentSessionConsole'
-import { AgentSessionTranscript } from '@/components/agent-workspace/AgentSessionTranscript'
 import type { AgentChatAction } from '@/components/agent-workspace/agent-chat-stream'
 import type { LogEntry, QuestionOption, RunSummary } from '@/components/agent-workspace/live-run-types'
 
@@ -33,6 +32,9 @@ export function AgentPlaygroundPage() {
   const [applyQueue,    setApplyQueue]    = useState<ApplyReadyJob[]>([])
   const [autonomousMode,setAutonomousMode]= useState(false)
   const [selectedSessionId, setSelectedSessionId] = useState<string | null>(null)
+  const [liveSessionId, setLiveSessionId] = useState<string | null>(null)
+  const [conversationTitle, setConversationTitle] = useState<string | null>(null)
+  const [conversationSubtitle, setConversationSubtitle] = useState<string | null>(null)
   const [sessionsRefreshVersion, setSessionsRefreshVersion] = useState(0)
   const [chatResetVersion, setChatResetVersion] = useState(0)
   const [waitingQuestion, setWaitingQuestion] = useState<{ id: string; question: string; options: QuestionOption[] } | null>(null)
@@ -60,6 +62,9 @@ export function AgentPlaygroundPage() {
     esRef.current?.close()
     esRef.current = null
     setSelectedSessionId(null)
+    setLiveSessionId(null)
+    setConversationTitle(null)
+    setConversationSubtitle(null)
     currentRoleRef.current = null
     setCurrentRole(null)
     setRunLog([])
@@ -69,7 +74,7 @@ export function AgentPlaygroundPage() {
     setWaitingQuestion(null)
     setChatResetVersion(v => v + 1)
   }, [])
-  const selectReplaySession = useCallback((sessionId: string) => {
+  const selectSession = useCallback((sessionId: string, goal = 'Automation run', subtitle = 'Automation run') => {
     runIdRef.current += 1
     esRef.current?.close()
     esRef.current = null
@@ -77,18 +82,40 @@ export function AgentPlaygroundPage() {
     setCurrentRole(null)
     setWaitingQuestion(null)
     setRunDone(true)
+    setRunLog([])
+    setApplyQueue([])
+    setRunSummary(null)
+    setLiveSessionId(sessionId)
     setSelectedSessionId(sessionId)
+    setConversationTitle(goal)
+    setConversationSubtitle(subtitle)
   }, [])
+
+  const handleDeletedSession = useCallback((sessionId: string) => {
+    // A chat session is writable through liveSessionId even when it was never
+    // selected in the sidebar. Clear either reference before another message
+    // can reuse the deleted ID.
+    if (sessionId === selectedSessionId || sessionId === liveSessionId) {
+      resetLiveWorkspace()
+    }
+    setSessionsRefreshVersion(v => v + 1)
+  }, [liveSessionId, resetLiveWorkspace, selectedSessionId])
 
   // ── SSE Run ────────────────────────────────────────────────────────────────
 
-  const startRun = useCallback(() => {
+  const startRun = useCallback((initialChatMessage?: string, sessionId?: string) => {
     const runId = runIdRef.current + 1
     runIdRef.current = runId
     if (esRef.current) esRef.current.close()
-    setRunLog([])
+    setRunLog(initialChatMessage
+      ? [{ type: 'user_message', message: initialChatMessage, time: new Date() }]
+      : [])
     setRunDone(false)
     setRunSummary(null)
+    // A previous pipeline may have left a paused question behind. A new run
+    // must not show the composer as blocked until this run emits its own
+    // visible `orchestrator_question` event.
+    setWaitingQuestion(null)
     currentRoleRef.current = null
     setCurrentRole(null)
     setApplyQueue([])
@@ -96,7 +123,10 @@ export function AgentPlaygroundPage() {
     // Fire-and-forget: warm the discovery queue before the pipeline runs.
     void fetch('/api/agent/scout', { method: 'POST' }).catch(() => undefined)
 
-    const url = `/api/agent/run${autonomousMode ? '?autonomous=true' : ''}`
+    const query = new URLSearchParams()
+    if (autonomousMode) query.set('autonomous', 'true')
+    if (sessionId) query.set('sessionId', sessionId)
+    const url = `/api/agent/run${query.size > 0 ? `?${query.toString()}` : ''}`
     const es  = new EventSource(url)
     esRef.current = es
     const isCurrentRun = () => esRef.current === es && runIdRef.current === runId
@@ -252,14 +282,32 @@ export function AgentPlaygroundPage() {
   }, [addLog])
 
   const isRunning = !!currentRole || (runLog.length > 0 && !runDone)
+  const visibleWaitingQuestion = waitingQuestion && runLog.some(entry =>
+    entry.type === 'orchestrator_question'
+      && entry.questionId === waitingQuestion.id
+      && !entry.answered,
+  ) ? waitingQuestion : null
 
   // ── Chat action handler ────────────────────────────────────────────────────
 
   const handleChatAction = useCallback(async (action: { type: string; [k: string]: unknown }) => {
     switch (action.type) {
       case 'start_run':
-        startRun()
-        toast.info('流水线已启动', 'Orchestrator 触发运行')
+        if (typeof action.minMatchScore === 'number' && Number.isInteger(action.minMatchScore)
+          && action.minMatchScore >= 0 && action.minMatchScore <= 100) {
+          const { error } = await apiMutate('/api/agent', 'PATCH', { minMatchScore: action.minMatchScore })
+          if (error) {
+            toast.error('匹配阈值更新失败', error)
+            throw new Error(error)
+          }
+        }
+        startRun(
+          typeof action.chatMessage === 'string' ? action.chatMessage : undefined,
+          typeof action.sessionId === 'string' ? action.sessionId : undefined,
+        )
+        toast.info('流水线已启动', typeof action.minMatchScore === 'number'
+          ? `匹配阈值：≥${action.minMatchScore}%`
+          : 'Orchestrator 触发运行')
         break
       case 'stop_run':
         stopRun()
@@ -377,28 +425,25 @@ export function AgentPlaygroundPage() {
       <div className="agent-workspace-layout" style={{ flex: 1, display: 'flex', overflow: 'hidden' }}>
         <AgentSessionConsole
           selectedSessionId={selectedSessionId}
-          onSelectSession={selectReplaySession}
+          onSelectSession={selectSession}
           onAddAgent={() => setShowAddModal(true)}
           onNewChat={resetLiveWorkspace}
-          onBackToLive={() => setSelectedSessionId(null)}
+          onDeletedSession={handleDeletedSession}
           refreshVersion={sessionsRefreshVersion}
         />
-        {selectedSessionId ? (
-          <AgentSessionTranscript
-            sessionId={selectedSessionId}
-            onBackToLive={() => setSelectedSessionId(null)}
-          />
-        ) : (
-          <AgentUnifiedStream
+        <AgentUnifiedStream
             log={runLog}
             running={isRunning}
             summary={runSummary}
             applyQueue={applyQueue}
-            waitingQuestion={waitingQuestion}
+            waitingQuestion={visibleWaitingQuestion}
             savedCount={savedCount}
             pendingCount={pendingCount}
             autonomousMode={autonomousMode}
             resetVersion={chatResetVersion}
+            resumeSessionId={liveSessionId}
+            conversationTitle={conversationTitle}
+            conversationSubtitle={conversationSubtitle}
             onAnswerQuestion={handleAnswerQuestion}
             onAnswerOrchestrator={async (questionId, answer, options) => {
               const opt = options?.find(o => o.value === answer)
@@ -430,9 +475,14 @@ export function AgentPlaygroundPage() {
             }}
             onChatAction={handleChatAction}
             onAppendLog={addLog}
-            onSessionRecorded={() => setSessionsRefreshVersion(v => v + 1)}
-          />
-        )}
+            onSessionRecorded={(sessionId, goal, subtitle) => {
+              setLiveSessionId(sessionId)
+              setSelectedSessionId(sessionId)
+              if (goal) setConversationTitle(goal)
+              if (subtitle) setConversationSubtitle(subtitle)
+              setSessionsRefreshVersion(v => v + 1)
+            }}
+        />
       </div>
     </div>
   )

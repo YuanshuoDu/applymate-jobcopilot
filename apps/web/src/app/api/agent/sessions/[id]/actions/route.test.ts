@@ -3,11 +3,20 @@ import { beforeEach, describe, expect, it, vi } from "vitest"
 const mocks = vi.hoisted(() => ({
   requireAuth: vi.fn(),
   sessionFindFirst: vi.fn(),
+  sessionUpdate: vi.fn(),
+  approvalFindFirst: vi.fn(),
   approvalUpdateMany: vi.fn(),
+  approvalCreate: vi.fn(),
   automationFindFirst: vi.fn(),
   automationCreate: vi.fn(),
   automationUpdate: vi.fn(),
   transcriptCreate: vi.fn(),
+  resumeFindFirst: vi.fn(),
+  jobFindFirst: vi.fn(),
+  jobUpdate: vi.fn(),
+  tailorResumeForAgent: vi.fn(),
+  loadUserAiConfig: vi.fn(),
+  enqueueApplyTask: vi.fn(),
 }))
 
 vi.mock("@/lib/api-helpers", () => ({
@@ -19,16 +28,22 @@ vi.mock("@/lib/api-helpers", () => ({
 
 vi.mock("@/lib/db", () => ({
   db: {
-    agentSession: { findFirst: mocks.sessionFindFirst },
-    agentApproval: { updateMany: mocks.approvalUpdateMany },
+    agentSession: { findFirst: mocks.sessionFindFirst, update: mocks.sessionUpdate },
+    agentApproval: { findFirst: mocks.approvalFindFirst, updateMany: mocks.approvalUpdateMany, create: mocks.approvalCreate },
     agentAutomation: {
       findFirst: mocks.automationFindFirst,
       create: mocks.automationCreate,
       update: mocks.automationUpdate,
     },
     agentTranscriptEvent: { create: mocks.transcriptCreate },
+    resume: { findFirst: mocks.resumeFindFirst },
+    job: { findFirst: mocks.jobFindFirst, update: mocks.jobUpdate },
   },
 }))
+
+vi.mock("@/lib/model-router", () => ({ loadUserAiConfig: mocks.loadUserAiConfig }))
+vi.mock("@/lib/agent/resume-tailoring", () => ({ tailorResumeForAgent: mocks.tailorResumeForAgent }))
+vi.mock("@/lib/apply-queue-client", () => ({ enqueueApplyTask: mocks.enqueueApplyTask }))
 
 function postRequest(body: unknown) {
   return new Request("http://localhost/api/agent/sessions/session_1/actions", {
@@ -44,14 +59,26 @@ describe("agent session actions API", () => {
     vi.resetModules()
     mocks.requireAuth.mockReset()
     mocks.sessionFindFirst.mockReset()
+    mocks.sessionUpdate.mockReset()
+    mocks.approvalFindFirst.mockReset()
     mocks.approvalUpdateMany.mockReset()
+    mocks.approvalCreate.mockReset()
     mocks.automationFindFirst.mockReset()
     mocks.automationCreate.mockReset()
     mocks.automationUpdate.mockReset()
     mocks.transcriptCreate.mockReset()
+    mocks.resumeFindFirst.mockReset()
+    mocks.jobFindFirst.mockReset()
+    mocks.jobUpdate.mockReset()
     mocks.requireAuth.mockResolvedValue({ userId: "user_1" })
     mocks.sessionFindFirst.mockResolvedValue({ id: "session_1" })
+    mocks.sessionUpdate.mockResolvedValue({})
+    mocks.approvalFindFirst.mockResolvedValue({ type: 'apply_jobs', payload: {} })
     mocks.approvalUpdateMany.mockResolvedValue({ count: 1 })
+    mocks.approvalCreate.mockResolvedValue({ id: 'approval_review', type: 'confirm_tailored_resume', title: 'Confirm tailored resume', body: 'Review it', impact: {}, payload: {}, status: 'pending' })
+    mocks.loadUserAiConfig.mockResolvedValue({ provider: 'openai', model: 'test' })
+    mocks.tailorResumeForAgent.mockResolvedValue({ id: 'resume_tailored', name: 'Tailored for N26', jobId: 'job_1', company: 'N26', role: 'Backend Engineer', reused: false })
+    mocks.enqueueApplyTask.mockResolvedValue('apply_task_1')
     mocks.automationFindFirst.mockResolvedValue(null)
     mocks.transcriptCreate.mockResolvedValue({
       id: "event_1",
@@ -276,6 +303,13 @@ describe("agent session actions API", () => {
         durationMs: null,
       },
     })
+    expect(mocks.sessionUpdate).toHaveBeenCalledWith({
+      where: { id: "session_1" },
+      data: {
+        status: "completed",
+        completedAt: expect.any(Date),
+      },
+    })
   })
 
   it("rejects stale approval responses without writing transcript events", async () => {
@@ -292,6 +326,38 @@ describe("agent session actions API", () => {
     expect(res.status).toBe(409)
     await expect(res.json()).resolves.toEqual({ error: "Approval is no longer pending" })
     expect(mocks.transcriptCreate).not.toHaveBeenCalled()
+  })
+
+  it('turns approved Writer tailoring into a resume artifact and a separate Reviewer gate', async () => {
+    mocks.approvalFindFirst.mockResolvedValueOnce({ type: 'tailor_resume', payload: { resumeId: 'resume_1', jobId: 'job_1' } })
+    mocks.transcriptCreate
+      .mockResolvedValueOnce({ id: 'event_tailored', sessionId: 'session_1', taskId: null, type: 'resume_tailored', speaker: 'Writer', title: 'Tailored resume ready', body: 'Ready', data: {}, durationMs: null, createdAt: new Date('2026-06-18T10:01:00Z') })
+      .mockResolvedValueOnce({ id: 'event_review', sessionId: 'session_1', taskId: null, type: 'approval_request', speaker: 'Reviewer', title: 'Final resume review', body: 'Review it', data: {}, durationMs: null, createdAt: new Date('2026-06-18T10:02:00Z') })
+    const { POST } = await import('./route')
+
+    const res = await POST(postRequest({ type: 'approval_response', approvalId: 'approval_writer', decision: 'approved' }) as never, ctx)
+
+    expect(res.status).toBe(200)
+    await expect(res.json()).resolves.toMatchObject({ events: [{ type: 'resume_tailored' }, { type: 'approval_request' }] })
+    expect(mocks.tailorResumeForAgent).toHaveBeenCalledWith(expect.objectContaining({ userId: 'user_1', resumeId: 'resume_1', jobId: 'job_1' }))
+    expect(mocks.approvalCreate).toHaveBeenCalledWith({ data: expect.objectContaining({ type: 'confirm_tailored_resume', sessionId: 'session_1' }) })
+    expect(mocks.sessionUpdate).toHaveBeenCalledWith({ where: { id: 'session_1' }, data: { status: 'waiting_for_user', completedAt: null } })
+  })
+
+  it('queues Executor only after the Reviewer confirmation binds the final resume', async () => {
+    mocks.approvalFindFirst.mockResolvedValueOnce({ type: 'confirm_tailored_resume', payload: { resumeId: 'resume_tailored', jobId: 'job_1' } })
+    mocks.resumeFindFirst.mockResolvedValueOnce({ id: 'resume_tailored', name: 'Tailored for N26' })
+    mocks.jobFindFirst.mockResolvedValueOnce({ id: 'job_1', company: 'N26', role: 'Backend Engineer', url: 'https://jobs.example/apply', status: 'review' })
+    mocks.jobUpdate.mockResolvedValue({})
+    mocks.transcriptCreate.mockResolvedValueOnce({ id: 'event_queued', sessionId: 'session_1', taskId: null, type: 'application_queued', speaker: 'Executor', title: 'Application queued', body: 'Queued', data: {}, durationMs: null, createdAt: new Date('2026-06-18T10:03:00Z') })
+    const { POST } = await import('./route')
+
+    const res = await POST(postRequest({ type: 'approval_response', approvalId: 'approval_reviewer', decision: 'approved' }) as never, ctx)
+
+    expect(res.status).toBe(200)
+    await expect(res.json()).resolves.toMatchObject({ event: { type: 'application_queued' } })
+    expect(mocks.enqueueApplyTask).toHaveBeenCalledWith(expect.objectContaining({ jobId: 'job_1', userId: 'user_1', applyUrl: 'https://jobs.example/apply', dryRun: false }))
+    expect(mocks.jobUpdate).toHaveBeenCalledWith({ where: { id: 'job_1' }, data: expect.objectContaining({ finalResumeId: 'resume_tailored', status: 'review' }) })
   })
 
   it("rejects unsupported action types", async () => {

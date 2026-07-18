@@ -1,0 +1,113 @@
+.momentum-dashboard { flex: 1; min-width: 0; overflow-y: auto; background: #fcfcff; }
+.momentum-content { width: min(1060px, 100%); margin: 0 auto; padding: 42px 28px 56px; }
+.momentum-loading { display: grid; place-content: center; gap: 14px; min-height: 100%; color: var(--text-muted); text-align: center; }
+.momentum-header, .momentum-header > div, .momentum-header > div > div, .momentum-layout, .momentum-week-goal, .momentum-week-copy, .momentum-days, .momentum-goal-legend, .momentum-coach-card, .momentum-side-title, .momentum-match, .momentum-row, .momentum-glance-line, .momentum-profile-prompt { display: flex; }
+.momentum-header { align-items: center; justify-content: space-between; gap: 20px; margin: 0 0 30px; }
+.momentum-header > div { align-items: flex-start; gap: 13px; }
+.momentum-header > div > span { display: grid; place-items: center; color: var(--primary); padding-top: 4px; }
+.momentum-header h1 { margin: 0; font-size: 30px; font-weight: 750; letter-spacing: -.05em; line-height: 1.1; }
+.momentum-header p { margin-top: 7px; color: var(--text-muted); font-size: 12px; }
+.momentum-date-picker { display: inline-flex; align-items: center; gap: 11px; padding: 12px 15px; border: 1px solid var(--border); border-radius: 10px; color: var(--text-muted); background: #fff; font: inherit; font-size: 12px; cursor: pointer; }
+.momentum-date-picker svg:last-child { margin-left: 15px; }
+.momentum-date-control { position: relative; }
+.momentum-date-menu { position: absolute; top: calc(100% + 7px); right: 0; z-index: 10; width: 220px; padding: 5px; border: 1px solid #e3e2f5; border-radius: 10px; background: #fff; box-shadow: var(--shadow-md); }
+.momentum-date-menu button { display: grid; width: 100%; gap: 3px; padding: 9px 10px; border: 0; border-radius: 7px; color: #37405e; background: transparent; font: inherit; font-size: 11px; font-weight: 600; text-align: left; cursor: pointer; }
+.momentum-date-menu button:hover, .momentum-date-menu button.is-selected { color: #4a33f3; background: #f4f2ff; }
+.momentum-date-menu small { color: #77809d; font-size: 10px; font-weight: 400; }
+.momentum-layout { align-items: flex-start; gap: 28px; }
+.momentum-primary-column { display: flex; flex: 1; min-width: 0; flex-direction: column; gap: 20px; }
+.momentum-secondary-column { display: flex; width: 304px; flex: 0 0 304px; flex-direction: column; gap: 20px; }
+
+.momentum-week-goal, .momentum-coach-card, .momentum-side-card { border: 1px solid #e5e4fa; border-radius: 14px; background: #fff; }
+.momentum-week-goal { align-items: center; gap: 34px; min-height: 268px; padding: 28px 34px; }
+.momentum-ring { display: grid; place-items: center; width: 188px; height: 188px; flex: 0 0 188px; border-radius: 50%; background: conic-gradient(from 9deg, #4e36ef 0 var(--progress), #e7e7fb var(--progress) 360deg); box-shadow: inset 0 0 0 11px #fbfbff; position: relative; }
+.momentum-ring::after { position: absolute; width: 145px; height: 145px; border-radius: 50%; background: #fff; content: ''; }
+.momentum-ring > div { z-index: 1; display: grid; place-items: center; text-align: center; }
+.momentum-ring strong { color: #131a3c; font-size: 39px; line-height: .95; letter-spacing: -.05em; }
+.momentum-ring span { margin: 5px 0 8px; color: #4b5372; font-size: 12px; }
+.momentum-ring small { color: #5e6688; font-size: 10px; line-height: 1.55; }
+.momentum-week-copy { align-self: stretch; flex: 1; min-width: 0; flex-direction: column; justify-content: center; }
+.momentum-section-kicker { display: flex; align-items: center; gap: 6px; color: #4a33f3; font-size: 13px; font-weight: 700; }
+.momentum-week-copy h2 { margin: 9px 0 8px; color: #161b36; font-size: 16px; letter-spacing: -.025em; }
+.momentum-week-copy p { max-width: 365px; color: #68708f; font-size: 12px; line-height: 1.55; }
+.momentum-days { justify-content: space-between; gap: 9px; margin-top: 27px; }
+.momentum-days div { display: grid; gap: 9px; justify-items: center; flex: 1; color: #646b8b; }
+.momentum-days small { font-size: 9px; }
+.momentum-days span { display: grid; place-items: center; width: 18px; height: 18px; border: 1px solid #ddddf5; border-radius: 50%; color: #fff; background: #f5f5fc; }
+.momentum-days span.is-done { border-color: #5136f4; background: #5136f4; }
+.momentum-days span.is-next { border-color: #9a8cff; background: #fff; }
+.momentum-goal-legend { gap: 18px; margin-top: 18px; color: #737b98; font-size: 10px; }
+.momentum-goal-legend span { display: inline-flex; align-items: center; gap: 6px; }
+.momentum-goal-legend i { display: grid; place-items: center; width: 13px; height: 13px; border: 1px solid #d9d8ef; border-radius: 50%; font-style: normal; }
+.momentum-goal-legend i.is-done { color: #fff; border-color: #5136f4; background: #5136f4; }
+
+.momentum-coach-card { align-items: center; gap: 22px; min-height: 144px; padding: 24px 20px; }
+.momentum-coach-icon { display: grid; place-items: center; width: 48px; height: 48px; flex: 0 0 48px; color: #5136f4; background: #f1efff; border-radius: 50%; }
+.momentum-coach-card > div { flex: 1; }
+.momentum-coach-card small { color: #3c4567; font-size: 10px; }
+.momentum-coach-card h2 { margin: 7px 0; color: #131936; font-size: 15px; letter-spacing: -.025em; }
+.momentum-coach-card p { color: #68708f; font-size: 11px; line-height: 1.5; }
+.momentum-coach-card button, .momentum-link { display: inline-flex; align-items: center; gap: 7px; border: 0; color: #4a33f3; background: transparent; font: inherit; font-size: 11px; font-weight: 700; cursor: pointer; }
+.momentum-coach-card button { margin-top: 11px; padding: 0; }
+.momentum-coach-document { display: grid; place-items: center; width: 86px; height: 92px; flex: 0 0 86px; color: #8474ff; background: #fafaff; border: 1px solid #e2e1f8; border-radius: 7px; position: relative; }
+.momentum-coach-document svg:last-child { position: absolute; right: -10px; bottom: 4px; display: grid; padding: 7px; width: 38px; height: 38px; color: #fff; background: #4c2cf3; border-radius: 50%; box-shadow: 0 7px 13px rgba(75,46,236,.35); }
+
+.momentum-timeline-card { padding: 3px 2px 0; }
+.momentum-timeline-heading { display: flex; align-items: center; justify-content: space-between; margin-bottom: 10px; }
+.momentum-timeline-heading h2 { color: #161b36; font-size: 14px; letter-spacing: -.025em; }
+.momentum-sort { position: relative; }
+.momentum-timeline-heading > .momentum-sort > button { display: inline-flex; align-items: center; gap: 9px; padding: 8px 10px; border: 1px solid #e6e5f6; border-radius: 8px; color: #5e6687; background: #fff; font: inherit; font-size: 10px; cursor: pointer; }
+.momentum-sort > div { position: absolute; top: calc(100% + 5px); right: 0; z-index: 3; width: 112px; padding: 4px; border: 1px solid #e6e5f6; border-radius: 8px; background: #fff; box-shadow: var(--shadow-md); }
+.momentum-sort > div button { display: block; width: 100%; padding: 7px 8px; border: 0; border-radius: 5px; color: #4d5676; background: transparent; font: inherit; font-size: 10px; text-align: left; cursor: pointer; }
+.momentum-sort > div button:hover { color: #4a33f3; background: #f4f2ff; }
+.momentum-table { border-bottom: 1px solid #ebeaf5; }
+.momentum-row { align-items: center; min-height: 58px; gap: 11px; border-top: 1px solid #ebeaf5; }
+.momentum-row-status { display: grid; place-items: center; width: 18px; height: 18px; flex: 0 0 18px; color: #adb2cc; }
+.momentum-row-status.is-complete { color: #fff; background: #5136f4; border-radius: 50%; }
+.momentum-company-logo { display: grid; place-items: center; width: 31px; height: 31px; flex: 0 0 31px; object-fit: contain; border-radius: 6px; background: #f2f2ff; }
+.momentum-logo-fallback { color: #4b35e9; }
+.momentum-row-role { display: grid; gap: 3px; flex: 1; min-width: 0; }
+.momentum-row-role strong, .momentum-match-copy strong { overflow: hidden; color: #202641; font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
+.momentum-row-role span, .momentum-match-copy span, .momentum-match-copy small { color: #78809d; font-size: 10px; }
+.momentum-row time { width: 78px; color: #78809d; font-size: 10px; text-align: right; }
+.momentum-row button { display: inline-flex; align-items: center; gap: 5px; padding: 6px 8px; border: 1px solid #e4e3f3; border-radius: 7px; color: #5c6585; background: #fff; font: inherit; font-size: 10px; cursor: pointer; }
+.momentum-row-more { color: #68708f; }
+.momentum-center-link { justify-content: center; width: 100%; margin: 20px 0 0; }
+.momentum-timeline-empty { display: flex; align-items: center; justify-content: center; gap: 8px; min-height: 160px; color: #78809d; border-top: 1px solid #ebeaf5; border-bottom: 1px solid #ebeaf5; font-size: 11px; }
+
+.momentum-side-card { padding: 26px 16px 18px; }
+.momentum-side-title { align-items: flex-start; gap: 12px; color: #4a33f3; }
+.momentum-side-title h2 { color: #4531e9; font-size: 15px; letter-spacing: -.03em; }
+.momentum-side-title p { margin-top: 5px; color: #67708f; font-size: 10px; }
+.momentum-match-list { display: grid; gap: 9px; margin: 20px 0 16px; }
+.momentum-match { align-items: flex-start; gap: 10px; padding: 12px; border: 1px solid #e9e8f8; border-radius: 9px; background: #fff; position: relative; }
+.momentum-match-copy { display: grid; gap: 3px; flex: 1; min-width: 0; }
+.momentum-match .score-pill { position: absolute; top: 13px; right: 12px; font-size: 9px; }
+.momentum-match > button { position: absolute; right: 10px; bottom: 10px; display: inline-flex; align-items: center; gap: 4px; padding: 5px 7px; border: 0; color: #5136f4; background: #f6f5ff; font: inherit; font-size: 9px; font-weight: 700; cursor: pointer; }
+.momentum-match-copy small { margin-top: 2px; }
+.momentum-side-empty { display: flex; align-items: center; gap: 9px; min-height: 150px; color: #78809d; font-size: 11px; line-height: 1.5; }
+.momentum-matches-card > .momentum-link { padding: 0 2px; }
+.momentum-glance-card { padding-bottom: 20px; }
+.momentum-glance-card .momentum-side-title { margin-bottom: 22px; }
+.momentum-glance-line { align-items: center; gap: 13px; margin: 14px 0; }
+.momentum-glance-icon { display: grid; place-items: center; width: 40px; height: 40px; color: #573bf2; background: #f2f0ff; border-radius: 9px; }
+.momentum-glance-line > div { display: grid; flex: 1; grid-template-columns: 1fr auto; gap: 4px; }
+.momentum-glance-line small { color: #69718e; font-size: 10px; }
+.momentum-glance-line strong { color: #313953; font-size: 13px; text-align: right; }
+.momentum-glance-line i { grid-column: 1 / -1; height: 4px; overflow: hidden; background: #e8e7f5; border-radius: 999px; }
+.momentum-glance-line i b { display: block; height: 100%; background: #5136f4; border-radius: inherit; }
+.momentum-glance-card > .momentum-link { margin-top: 15px; }
+.momentum-actions-card { display: grid; gap: 14px; }
+.momentum-follow-up { display: flex; align-items: center; gap: 9px; width: 100%; padding: 10px; border: 1px solid #e9e8f8; border-radius: 9px; color: #4a33f3; background: #fafaff; text-align: left; cursor: pointer; }
+.momentum-follow-up span { display: grid; gap: 3px; flex: 1; min-width: 0; }
+.momentum-follow-up strong, .momentum-follow-up small { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.momentum-follow-up strong { color: #313953; font-size: 11px; }.momentum-follow-up small { color: #78809d; font-size: 10px; }
+.momentum-agent-control { display: flex; align-items: center; justify-content: space-between; padding-top: 2px; color: #59617e; font-size: 11px; }
+.momentum-agent-control span { display: inline-flex; align-items: center; gap: 6px; }.momentum-agent-control i { width: 7px; height: 7px; border-radius: 50%; background: #a7adc1; }.momentum-agent-control i.is-running { background: #22a06b; box-shadow: 0 0 0 3px #e4f7ed; }
+.momentum-agent-control button { padding: 5px 9px; border: 1px solid #dedcf4; border-radius: 7px; color: #4a33f3; background: #fff; font: inherit; font-size: 10px; font-weight: 700; cursor: pointer; }.momentum-agent-control button:disabled { cursor: wait; opacity: .6; }
+.momentum-profile-prompt { align-items: center; gap: 10px; margin: 0 0 18px; padding: 10px 12px; color: #4a33f3; background: #f6f5ff; border: 1px solid #dfddff; border-radius: 10px; font-size: 12px; }
+.momentum-profile-prompt span { flex: 1; }
+.momentum-profile-prompt button { border: 0; color: #4a33f3; background: transparent; font: inherit; font-weight: 700; cursor: pointer; }
+
+@media (max-width: 900px) { .momentum-layout { flex-direction: column; } .momentum-secondary-column { display: grid; width: 100%; flex-basis: auto; grid-template-columns: 1fr 1fr; } }
+@media (max-width: 650px) { .momentum-content { padding: 24px 16px 40px; } .momentum-header { align-items: flex-start; } .momentum-header h1 { font-size: 24px; } .momentum-date-picker { padding: 9px; font-size: 0; } .momentum-date-picker svg:last-child { margin-left: 0; } .momentum-date-menu { right: 0; } .momentum-week-goal { align-items: center; flex-direction: column; padding: 25px 20px; } .momentum-week-copy { width: 100%; } .momentum-secondary-column { display: flex; } .momentum-coach-document { display: none; } .momentum-row time, .momentum-row-more { display: none; } }

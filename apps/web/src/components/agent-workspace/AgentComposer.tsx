@@ -1,7 +1,7 @@
 'use client'
 
 import React from 'react'
-import { MODEL_CATALOGUE } from '@/lib/model-router'
+import { MODEL_CATALOGUE, PROVIDER_LABELS } from '@/lib/model-router'
 import { ComposerMenuButton, ComposerMenuEmpty, ComposerMenuSection, formatBytes } from '@/components/agent-workspace/ComposerParts'
 
 export interface ComposerJob {
@@ -81,6 +81,8 @@ export function AgentComposer({
   onAppendComposerContext,
 }: AgentComposerProps) {
   const canSend = chatInput.trim().length > 0 && !chatLoading
+  const [modelMenuOpen, setModelMenuOpen] = React.useState(false)
+  const activeModel = MODEL_CATALOGUE.find(model => `${model.provider}::${model.model}` === selectedModel) ?? MODEL_CATALOGUE[0]
 
   return (
     <div style={{ borderTop: '0.5px solid var(--border)', padding: '10px 14px', background: 'var(--bg-secondary)', flexShrink: 0 }}>
@@ -113,7 +115,7 @@ export function AgentComposer({
         borderRadius: 12,
         background: 'var(--bg)',
         boxShadow: '0 2px 10px rgba(15,23,42,0.04)',
-        overflow: 'hidden',
+        overflow: 'visible',
       }}>
         {attachedFiles.length > 0 && (
           <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, padding: '8px 10px 0' }}>
@@ -168,14 +170,17 @@ export function AgentComposer({
               }}
             />
             <button
-              onClick={() => onAddMenuOpenChange(open => !open)}
+              onClick={() => {
+                setModelMenuOpen(false)
+                onAddMenuOpenChange(open => !open)
+              }}
               title="Add context"
               style={{ width: 28, height: 28, borderRadius: 7, border: '1px solid var(--border)', background: 'var(--bg-secondary)', color: 'var(--text)', cursor: 'pointer', fontSize: 16, lineHeight: 1 }}
             >
               +
             </button>
             {addMenuOpen && (
-              <div style={{ position: 'absolute', bottom: 54, left: 22, width: 268, maxHeight: 360, overflowY: 'auto', border: '1px solid var(--border)', borderRadius: 8, background: 'var(--bg)', boxShadow: '0 12px 30px rgba(15,23,42,0.16)', padding: 6, zIndex: 40 }}>
+              <div style={{ position: 'absolute', bottom: 'calc(100% + 8px)', left: 0, width: 280, maxHeight: 'min(420px, 60vh)', overflowY: 'auto', border: '1px solid var(--border)', borderRadius: 10, background: 'var(--bg)', boxShadow: '0 16px 36px rgba(15,23,42,0.18)', padding: 7, zIndex: 100 }}>
                 <ComposerMenuSection title="Jobs">
                   {composerJobs.length === 0 && <ComposerMenuEmpty>No saved jobs yet</ComposerMenuEmpty>}
                   {composerJobs.slice(0, 4).map(job => (
@@ -220,17 +225,51 @@ export function AgentComposer({
                 </ComposerMenuSection>
               </div>
             )}
-            <select
-              value={selectedModel}
-              onChange={e => onSelectedModelChange(e.target.value)}
-              style={{ height: 28, maxWidth: 210, borderRadius: 7, border: '1px solid var(--border)', background: 'var(--bg-secondary)', color: 'var(--text)', fontSize: 11, padding: '0 8px', outline: 'none' }}
-            >
-              {MODEL_CATALOGUE.map(model => (
-                <option key={`${model.provider}::${model.model}`} value={`${model.provider}::${model.model}`}>
-                  {model.label}
-                </option>
-              ))}
-            </select>
+            <div style={{ position: 'relative' }}>
+              <button
+                type="button"
+                onClick={() => {
+                  onAddMenuOpenChange(false)
+                  setModelMenuOpen(open => !open)
+                }}
+                aria-expanded={modelMenuOpen}
+                aria-haspopup="listbox"
+                style={{ height: 30, minWidth: 178, maxWidth: 230, borderRadius: 8, border: '1px solid rgba(79,70,229,0.22)', background: 'rgba(79,70,229,0.05)', color: 'var(--text)', cursor: 'pointer', padding: '0 9px', fontFamily: 'inherit', display: 'flex', alignItems: 'center', gap: 7 }}
+              >
+                <span style={{ width: 7, height: 7, borderRadius: '50%', background: 'var(--primary)', flexShrink: 0 }} />
+                <span style={{ minWidth: 0, flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', textAlign: 'left', fontSize: 11, fontWeight: 700 }}>{activeModel.label}</span>
+                <span aria-hidden="true" style={{ color: 'var(--text-muted)', fontSize: 13 }}>⌄</span>
+              </button>
+              {modelMenuOpen && (
+                <div role="listbox" aria-label="Choose AI model" style={{ position: 'absolute', bottom: 'calc(100% + 8px)', left: 0, width: 330, maxHeight: 'min(420px, 60vh)', overflowY: 'auto', border: '1px solid rgba(79,70,229,0.22)', borderRadius: 10, background: 'var(--bg)', boxShadow: '0 16px 36px rgba(15,23,42,0.18)', padding: 7, zIndex: 100 }}>
+                  <div style={{ padding: '5px 7px 7px', fontSize: 10, fontWeight: 750, color: 'var(--text-muted)' }}>Choose a model</div>
+                  {MODEL_CATALOGUE.map(model => {
+                    const value = `${model.provider}::${model.model}`
+                    const selected = value === selectedModel
+                    return (
+                      <button
+                        key={value}
+                        type="button"
+                        role="option"
+                        aria-selected={selected}
+                        onClick={() => {
+                          onSelectedModelChange(value)
+                          setModelMenuOpen(false)
+                        }}
+                        style={{ width: '100%', padding: '9px 10px', border: selected ? '1px solid rgba(79,70,229,0.28)' : '1px solid transparent', borderRadius: 8, background: selected ? 'rgba(79,70,229,0.08)' : 'transparent', color: 'var(--text)', cursor: 'pointer', fontFamily: 'inherit', textAlign: 'left', display: 'flex', alignItems: 'center', gap: 9 }}
+                      >
+                        <span style={{ width: 8, height: 8, borderRadius: '50%', background: selected ? 'var(--primary)' : 'var(--border)', flexShrink: 0 }} />
+                        <span style={{ minWidth: 0, flex: 1 }}>
+                          <span style={{ display: 'block', fontSize: 11, fontWeight: 700 }}>{model.label}</span>
+                          <span style={{ display: 'block', marginTop: 2, fontSize: 9, lineHeight: 1.35, color: 'var(--text-muted)' }}>{model.description}</span>
+                        </span>
+                        <span style={{ flexShrink: 0, fontSize: 9, color: selected ? 'var(--primary)' : 'var(--text-muted)', fontWeight: 700 }}>{PROVIDER_LABELS[model.provider]}</span>
+                      </button>
+                    )
+                  })}
+                </div>
+              )}
+            </div>
           </div>
           <button onClick={() => onSendChat(chatInput)} disabled={!canSend}
             title="Send message"

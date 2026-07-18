@@ -1,7 +1,7 @@
 'use client'
 
 import React, { useMemo, useState, useEffect, useRef, useCallback } from 'react'
-import { TopBar } from '@/components/layout/TopBar'
+import { Bookmark, Clock3, LayoutGrid, List, LoaderCircle, Search, Sparkles, Trash2, UsersRound } from 'lucide-react'
 import { Btn, Card, CompanyLogo, INPUT_STYLE, ScorePill, StatusBadge, useToast, useConfirm } from '@/components/ui'
 import type { Job, JobStatus, Activity, ResumeListItem } from '@/lib/types'
 import { apiMutate, fmtDate, fmtRelative, useApi } from '@/lib/hooks'
@@ -35,7 +35,13 @@ type ResumeTailorChange = {
 }
 
 // ── ListView ──────────────────────────────────────────────────────────────────
-function ListView({ jobs, onRowClick }: { jobs: Job[]; onRowClick: (job: Job) => void }) {
+function ListView({ jobs, onRowClick, selectedIds, onToggle, onToggleAll }: {
+  jobs: Job[]
+  onRowClick: (job: Job) => void
+  selectedIds: Set<string>
+  onToggle: (id: string) => void
+  onToggleAll: (ids: string[]) => void
+}) {
   const [sort, setSort] = useState<{ col: string; dir: 'asc' | 'desc' }>({ col: 'date', dir: 'desc' })
 
   const sorted = useMemo(() => [...jobs].sort((a, b) => {
@@ -62,11 +68,17 @@ function ListView({ jobs, onRowClick }: { jobs: Job[]; onRowClick: (job: Job) =>
     )
   }
 
+  const visibleIds = sorted.map(job => job.id)
+  const allVisibleSelected = visibleIds.length > 0 && visibleIds.every(id => selectedIds.has(id))
+
   return (
-    <Card style={{ overflow: 'hidden' }}>
+    <Card style={{ overflow: 'hidden', borderRadius: '0 0 14px 14px' }}>
       <table style={{ width: '100%', borderCollapse: 'collapse' }}>
         <thead>
           <tr style={{ background: 'var(--bg-secondary)' }}>
+            <th style={{ width: 42, padding: '8px 12px', borderBottom: '0.5px solid var(--border)' }}>
+              <input type="checkbox" aria-label="Select all visible jobs" checked={allVisibleSelected} onChange={() => onToggleAll(visibleIds)} />
+            </th>
             <SortTh col="company" label="Company" />
             <th style={{ padding: '8px 16px', textAlign: 'left', fontSize: 10, color: 'var(--text-muted)', fontWeight: 500, borderBottom: '0.5px solid var(--border)' }}>Role</th>
             <th style={{ padding: '8px 16px', textAlign: 'left', fontSize: 10, color: 'var(--text-muted)', fontWeight: 500, borderBottom: '0.5px solid var(--border)' }}>Status</th>
@@ -83,6 +95,9 @@ function ListView({ jobs, onRowClick }: { jobs: Job[]; onRowClick: (job: Job) =>
               style={{ borderBottom: i < sorted.length - 1 ? '0.5px solid var(--border)' : 'none', cursor: 'pointer' }}
               onMouseEnter={e => (e.currentTarget.style.background = 'var(--bg-secondary)')}
               onMouseLeave={e => (e.currentTarget.style.background = '')}>
+              <td style={{ padding: '10px 12px', textAlign: 'center' }} onClick={e => e.stopPropagation()}>
+                <input type="checkbox" aria-label={`Select ${j.role} at ${j.company}`} checked={selectedIds.has(j.id)} onChange={() => onToggle(j.id)} />
+              </td>
               <td style={{ padding: '10px 16px' }}>
                 <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
                   <CompanyLogo logo={j.logo ?? j.company.slice(0, 2).toUpperCase()} />
@@ -216,107 +231,6 @@ function KanbanView({ jobs, onStatusChange, onAddClick }: {
           </button>
         </div>
       ))}
-    </div>
-  )
-}
-
-// ── ApplyBasket ───────────────────────────────────────────────────────────────
-function ApplyBasket({ cart, onRemove, onClose, onJobsUpdated }: {
-  cart: Job[]
-  onRemove: (id: string) => void
-  onClose: () => void
-  onJobsUpdated: (jobs: Job[]) => void
-}) {
-  const toast = useToast()
-  const [tailoring, setTailoring] = useState(false)
-  const [tailored, setTailored] = useState<Set<string>>(new Set())
-  const [applying, setApplying] = useState(false)
-
-  async function handleTailor() {
-    setTailoring(true)
-    let count = 0
-    for (const job of cart) {
-      try {
-        const res = await fetch('/api/ai/cover-letter', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ jobTitle: job.role, jobCompany: job.company, jobDescription: job.description }),
-        })
-        const data = await res.json()
-        if (res.ok && data.coverLetter) {
-          const { error } = await apiMutate(`/api/jobs/${job.id}`, 'PATCH', { coverLetter: data.coverLetter })
-          if (!error) {
-            setTailored(prev => new Set(prev).add(job.id))
-            count++
-          }
-        }
-      } catch { /* skip failed items */ }
-    }
-    setTailoring(false)
-    if (count > 0) {
-      toast.success('Cover letters ready', `${count}/${cart.length} generated and saved to job details`)
-    } else {
-      toast.error('Generation failed', 'Could not generate cover letters. Check your AI config in Settings.')
-    }
-  }
-
-  async function handleApply() {
-    setApplying(true)
-    const now = new Date().toISOString()
-    let applied = 0
-    for (const job of cart) {
-      const { error } = await apiMutate(`/api/jobs/${job.id}`, 'PATCH', { status: 'applied', appliedAt: now })
-      if (!error) applied++
-    }
-    setApplying(false)
-    toast.success('Applications sent', `${applied}/${cart.length} jobs marked as applied`)
-    onJobsUpdated(cart.map(j => ({ ...j, status: 'applied' as const })))
-    onClose()
-  }
-
-  return (
-    <div style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.3)', zIndex: 100, display: 'flex', alignItems: 'center', justifyContent: 'center' }}
-      onClick={e => { if (e.target === e.currentTarget) onClose() }}>
-      <Card style={{ width: 520, maxHeight: '80vh', overflow: 'hidden', display: 'flex', flexDirection: 'column' }}>
-        <div style={{ padding: '14px 16px', borderBottom: '0.5px solid var(--border)', display: 'flex', alignItems: 'center', gap: 10 }}>
-          <span style={{ fontSize: 14, fontWeight: 500 }}>🛒 Apply Basket</span>
-          <span style={{ fontSize: 11, color: 'var(--text-muted)' }}>{cart.length} jobs queued</span>
-          <Btn small variant="ghost" style={{ marginLeft: 'auto' }} onClick={onClose}>✕</Btn>
-        </div>
-        <div style={{ flex: 1, overflowY: 'auto', padding: 16, display: 'flex', flexDirection: 'column', gap: 8 }}>
-          {cart.length === 0 ? (
-            <div style={{ textAlign: 'center', padding: 40, color: 'var(--text-muted)', fontSize: 12 }}>No jobs in basket yet</div>
-          ) : cart.map(j => (
-            <div key={j.id} style={{ display: 'flex', alignItems: 'center', gap: 10, padding: 10, background: 'var(--bg-secondary)', borderRadius: 8 }}>
-              <CompanyLogo logo={j.logo ?? j.company.slice(0, 2).toUpperCase()} />
-              <div style={{ flex: 1 }}>
-                <div style={{ fontSize: 12, fontWeight: 500 }}>{j.role}</div>
-                <div style={{ fontSize: 11, color: 'var(--text-muted)' }}>{j.company} · {j.location}</div>
-              </div>
-              <ScorePill score={j.score} />
-              {tailored.has(j.id) && <span style={{ fontSize: 10, color: '#3B6D11', fontWeight: 500 }}>✓ Tailored</span>}
-              {!tailoring && <button onClick={() => onRemove(j.id)} style={{ background: 'none', border: 'none', cursor: 'pointer', color: 'var(--text-muted)', fontSize: 13 }}>✕</button>}
-            </div>
-          ))}
-        </div>
-        {cart.length > 0 && (
-          <div style={{ padding: '12px 16px', borderTop: '0.5px solid var(--border)', background: 'var(--bg-secondary)', display: 'flex', flexDirection: 'column', gap: 8 }}>
-            <div style={{ fontSize: 11, color: 'var(--text-muted)' }}>
-              {tailored.size > 0
-                ? `${tailored.size}/${cart.length} cover letters generated. Review and apply when ready.`
-                : 'AI will generate a cover letter for each job, then mark them as applied.'}
-            </div>
-            <div style={{ display: 'flex', gap: 8 }}>
-              <Btn variant="ghost" style={{ flex: 1 }} disabled={tailoring} onClick={handleTailor}>
-                {tailoring ? 'Generating…' : '✦ Tailor CVs'}
-              </Btn>
-              <Btn variant="primary" style={{ flex: 1 }} disabled={applying} onClick={handleApply}>
-                {applying ? 'Applying…' : 'Review & Apply →'}
-              </Btn>
-            </div>
-          </div>
-        )}
-      </Card>
     </div>
   )
 }
@@ -817,7 +731,7 @@ function JobDetailDrawer({ job, onClose, onStatusChange, onUpdate, onDelete }: {
               </div>
             ) : (
               <div style={{ fontSize: 11, color: 'var(--text-muted)', fontStyle: 'italic', padding: '8px 0' }}>
-                No cover letter yet. Click &quot;+ Add&quot; above or use the Apply Basket to generate one.
+                No cover letter yet. Use the tailor-resume workspace to create one for this job.
               </div>
             )}
           </div>
@@ -1188,13 +1102,12 @@ function ScoreJobButton({ job, onUpdate }: { job: Job; onUpdate: (updated: Job) 
 // ── JobsPage ──────────────────────────────────────────────────────────────────
 export function JobsPage() {
   const toast = useToast()
+  const [confirm, ConfirmDialog] = useConfirm()
   const [view,         setView        ] = useState<'list' | 'kanban'>('list')
   const [search,       setSearch      ] = useState('')
   const [filterStatus, setFilterStatus] = useState<'all' | JobStatus>('all')
-  const [showCart,     setShowCart    ] = useState(false)
   const [showAdd,      setShowAdd     ] = useState(false)
   const [prefillStatus, setPrefillStatus] = useState<JobStatus | null>(null)
-  const [cart,         setCart        ] = useState<Job[]>([])
   const [jobs,         setJobs        ] = useState<Job[]>(() => defaultJobsCache?.jobs ?? [])
   const [total,        setTotal       ] = useState(() => defaultJobsCache?.total ?? 0)
   const [loading,      setLoading     ] = useState(() => defaultJobsCache === null)
@@ -1204,6 +1117,9 @@ export function JobsPage() {
   const [pageSize,     setPageSize    ] = useState(20)
   const [sortBy,       setSortBy      ] = useState<'createdAt' | 'score' | 'company' | 'role'>('createdAt')
   const [sortDir,      setSortDir     ] = useState<'asc' | 'desc'>('desc')
+  const [selectedIds,  setSelectedIds ] = useState<Set<string>>(() => new Set())
+  const [bulkDeleting, setBulkDeleting] = useState(false)
+  const [scoringAll,   setScoringAll   ] = useState(false)
 
   // When navigating from Search page after a job save+score, force refresh
   const [refreshTick, setRefreshTick] = useState(0)
@@ -1304,51 +1220,119 @@ export function JobsPage() {
     }
   }
 
-  function addToCart(job: Job) {
-    if (cart.find(c => c.id === job.id)) return
-    setCart(c => [...c, job])
-    toast.success('Added to Apply Basket', `${job.role} at ${job.company}`)
+  function toggleSelected(id: string) {
+    setSelectedIds(previous => {
+      const next = new Set(previous)
+      if (next.has(id)) next.delete(id)
+      else next.add(id)
+      return next
+    })
   }
 
-  const savedApplied = jobs.filter(j => j.status === 'saved' || j.status === 'applied').slice(0, 4)
+  function toggleAllVisible(ids: string[]) {
+    setSelectedIds(previous => {
+      const next = new Set(previous)
+      const selectAll = !ids.every(id => next.has(id))
+      ids.forEach(id => selectAll ? next.add(id) : next.delete(id))
+      return next
+    })
+  }
 
+  async function deleteSelectedJobs() {
+    const ids = [...selectedIds]
+    if (!ids.length) return
+    const approved = await confirm({
+      title: 'Delete selected jobs?',
+      message: `${ids.length} job${ids.length === 1 ? '' : 's'} will be permanently removed. This cannot be undone.`,
+      danger: true,
+      confirmLabel: `Delete ${ids.length}`,
+    })
+    if (!approved) return
+
+    setBulkDeleting(true)
+    const { data, error } = await apiMutate<{ deleted: number }>('/api/jobs', 'DELETE', { ids })
+    setBulkDeleting(false)
+    if (error) { toast.error('Delete failed', error); return }
+
+    const deletedCount = data?.deleted ?? ids.length
+    const deleted = new Set(ids)
+    const remainingTotal = Math.max(0, total - deletedCount)
+    const lastPage = Math.max(1, Math.ceil(remainingTotal / pageSize))
+
+    setSelectedIds(new Set())
+    defaultJobsCache = null
+    window.dispatchEvent(new Event('applymate:jobs-changed'))
+    if (page > lastPage) setPage(lastPage)
+    else triggerRefresh()
+    toast.success('Jobs deleted', `${deletedCount} job${deletedCount === 1 ? '' : 's'} removed`)
+  }
+
+  async function scoreAllJobs() {
+    setScoringAll(true)
+    const { data, error } = await apiMutate<{ scored: number; failed: number; remaining: number }>('/api/jobs/score-all', 'POST')
+    setScoringAll(false)
+    if (error) { toast.error('Scoring failed', error); return }
+
+    triggerRefresh()
+    if (!data?.scored) {
+      toast.success('All jobs are already scored')
+      return
+    }
+    toast.success('Match scores ready', `${data.scored} job${data.scored === 1 ? '' : 's'} scored${data.failed ? `; ${data.failed} failed` : ''}${data.remaining ? `; ${data.remaining} remaining` : ''}`)
+  }
+
+  const statusCounts = useMemo(() => ({
+    saved: jobs.filter(job => job.status === 'saved').length,
+    review: jobs.filter(job => job.status === 'review').length,
+    interview: jobs.filter(job => job.status === 'interview').length,
+  }), [jobs])
   return (
     <div style={{ flex: 1, overflowY: 'auto', background: 'var(--bg-tertiary)', display: 'flex', flexDirection: 'column' }}>
-      <TopBar title="Jobs">
-        {/* Total count */}
-        <div style={{ display: 'flex', alignItems: 'center', gap: 8, flex: 1 }}>
-          <span style={{ fontSize: 11, color: 'var(--text-muted)', background: 'var(--bg-secondary)', border: '0.5px solid var(--border)', borderRadius: 999, padding: '2px 8px' }}>
-            {total}
-          </span>
+      <header style={{ padding: '28px 30px 18px', background: 'var(--bg-tertiary)' }}>
+        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 24, flexWrap: 'wrap' }}>
+          <div>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+              <h1 style={{ margin: 0, fontSize: 28, letterSpacing: '-0.03em' }}>My Jobs</h1>
+              <span style={{ fontSize: 12, color: 'var(--primary)', background: 'rgba(79,70,229,0.09)', borderRadius: 999, padding: '4px 9px', fontWeight: 600 }}>{total}</span>
+            </div>
+            <p style={{ margin: '7px 0 0', fontSize: 14, color: 'var(--text-muted)' }}>Track your applications and move closer to your next opportunity.</p>
+          </div>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 12, flexWrap: 'wrap' }}>
+            {([
+              [Bookmark, 'Saved', statusCounts.saved, '#6D5DFB'],
+              [Clock3, 'In review', statusCounts.review, '#C27A12'],
+              [UsersRound, 'Interviews', statusCounts.interview, '#3B6D11'],
+            ] as const).map(([Icon, label, count, color]) => (
+              <div key={label} style={{ minWidth: 148, padding: '11px 14px', display: 'flex', alignItems: 'center', gap: 10, background: 'var(--bg)', border: '0.5px solid var(--border)', borderRadius: 10 }}>
+                <Icon size={18} color={color} strokeWidth={1.8} /><span style={{ fontSize: 13, color: 'var(--text-muted)' }}>{label}</span><strong style={{ marginLeft: 'auto', fontSize: 16 }}>{count}</strong>
+              </div>
+            ))}
+            <Btn variant="primary" onClick={() => { setPrefillStatus(null); setShowAdd(true) }} style={{ minWidth: 148, height: 46, justifyContent: 'center' }}>+ Add job</Btn>
+          </div>
         </div>
-        {/* Search */}
-        <input value={search} onChange={e => setSearch(e.target.value)} placeholder="Search jobs…"
-          style={{ width: 220, padding: '5px 10px', fontSize: 12, border: '0.5px solid var(--border)', borderRadius: 6, background: 'var(--bg)', color: 'var(--text)', outline: 'none' }} />
-        {/* Status filter */}
-        <select value={filterStatus} onChange={e => setFilterStatus(e.target.value as 'all' | JobStatus)}
-          style={{ padding: '5px 8px', fontSize: 11, border: '0.5px solid var(--border)', borderRadius: 6, background: 'var(--bg)', color: 'var(--text)', outline: 'none' }}>
-          <option value="all">All Status</option>
-          {KANBAN_COLS.map(c => <option key={c} value={c}>{COL_LABELS[c]}</option>)}
-        </select>
-        {/* View toggle */}
-        <div style={{ display: 'flex', border: '0.5px solid var(--border)', borderRadius: 6, overflow: 'hidden' }}>
-          {([['list', '☰'], ['kanban', '⊞']] as const).map(([v, icon]) => (
-            <button key={v} onClick={() => setView(v)} style={{
-              padding: '5px 10px',
-              background: view === v ? '#185FA5' : 'var(--bg)',
-              color:      view === v ? '#fff'     : 'var(--text-muted)',
-              border: 'none', cursor: 'pointer', fontSize: 13,
-            }}>{icon}</button>
-          ))}
-        </div>
-        {/* Basket */}
-        <Btn variant={cart.length ? 'primary' : 'ghost'} onClick={() => setShowCart(true)}>
-          🛒 Basket {cart.length > 0 && <span style={{ background: 'rgba(255,255,255,0.25)', borderRadius: 999, padding: '1px 6px', fontSize: 10, marginLeft: 4 }}>{cart.length}</span>}
-        </Btn>
-<Btn variant="ghost" onClick={() => { setPrefillStatus(null); setShowAdd(true) }}>+ Add Job</Btn>
-      </TopBar>
+      </header>
 
-      <div style={{ padding: 20, flex: 1 }}>
+      <div style={{ padding: '0 30px 30px', flex: 1 }}>
+        <div style={{ padding: 14, marginBottom: 0, background: 'var(--bg)', border: '0.5px solid var(--border)', borderBottom: 'none', borderRadius: '12px 12px 0 0', display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' }}>
+          <div style={{ width: 420, maxWidth: '100%', display: 'flex', alignItems: 'center', gap: 8, padding: '0 12px', border: '0.5px solid var(--border)', borderRadius: 8, background: 'var(--bg)' }}>
+            <Search size={17} color="var(--text-muted)" />
+            <input value={search} onChange={e => doSearch(e.target.value)} placeholder="Search jobs…"
+              style={{ width: '100%', padding: '10px 0', fontSize: 13, border: 'none', background: 'transparent', color: 'var(--text)', outline: 'none' }} />
+          </div>
+          <button onClick={scoreAllJobs} disabled={scoringAll} style={{ height: 38, padding: '0 12px', display: 'inline-flex', alignItems: 'center', gap: 7, border: scoringAll || selectedIds.size ? '1px solid rgba(79,70,229,0.38)' : '0.5px solid var(--border)', borderRadius: 8, background: scoringAll || selectedIds.size ? 'rgba(79,70,229,0.08)' : 'var(--bg)', color: scoringAll || selectedIds.size ? 'var(--primary)' : 'var(--text)', cursor: scoringAll ? 'wait' : 'pointer', fontSize: 12, fontWeight: 600, opacity: scoringAll ? 0.9 : 1, animation: scoringAll ? 'glowPulse 1.3s ease-in-out infinite' : 'none', transition: 'background 0.18s, border-color 0.18s, color 0.18s' }}>
+            {scoringAll ? <LoaderCircle size={15} style={{ animation: 'spin 0.8s linear infinite' }} /> : <Sparkles size={15} />} {scoringAll ? 'Scoring…' : selectedIds.size ? `Score ${selectedIds.size}` : 'Score'}
+          </button>
+          <button onClick={deleteSelectedJobs} disabled={!selectedIds.size || bulkDeleting} style={{ height: 38, padding: '0 12px', display: 'inline-flex', alignItems: 'center', gap: 7, border: '0.5px solid', borderColor: selectedIds.size ? '#E5A5A5' : 'var(--border)', borderRadius: 8, background: selectedIds.size ? '#FFF7F7' : 'var(--bg)', color: selectedIds.size ? '#A32D2D' : 'var(--text-muted)', cursor: selectedIds.size && !bulkDeleting ? 'pointer' : 'default', fontSize: 12, fontWeight: 500, opacity: bulkDeleting ? 0.65 : 1 }}>
+            <Trash2 size={15} /> {bulkDeleting ? 'Deleting…' : selectedIds.size ? `Delete ${selectedIds.size}` : 'Delete'}
+          </button>
+          <select value={filterStatus} onChange={e => doFilter(e.target.value)} style={{ marginLeft: 'auto', padding: '10px 12px', fontSize: 12, border: '0.5px solid var(--border)', borderRadius: 8, background: 'var(--bg)', color: 'var(--text)', outline: 'none' }}>
+            <option value="all">All statuses</option>
+            {KANBAN_COLS.map(c => <option key={c} value={c}>{COL_LABELS[c]}</option>)}
+          </select>
+          <div style={{ display: 'flex', border: '0.5px solid var(--border)', borderRadius: 8, overflow: 'hidden' }}>
+            {([['list', List], ['kanban', LayoutGrid]] as const).map(([v, Icon]) => <button key={v} onClick={() => setView(v)} aria-label={`${v} view`} style={{ padding: '8px 12px', background: view === v ? '#185FA5' : 'var(--bg)', color: view === v ? '#fff' : 'var(--text-muted)', border: 'none', cursor: 'pointer', display: 'inline-flex' }}><Icon size={17} /></button>)}
+          </div>
+        </div>
 {loading ? (
           <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 60 }}>
             <div style={{ display: 'flex', alignItems: 'center', gap: 10, color: 'var(--text-muted)', fontSize: 12 }}>
@@ -1372,33 +1356,8 @@ export function JobsPage() {
           </Card>
         ) : (
           <>
-            {/* Quick-add to basket bar (list view only) */}
-            {view === 'list' && savedApplied.length > 0 && (
-              <div style={{ marginBottom: 12 }}>
-                <div style={{ fontSize: 11, color: 'var(--text-muted)', marginBottom: 8 }}>
-                  Click &quot;Add to Basket&quot; to queue jobs for AI-optimized batch apply
-                </div>
-                <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
-                  {savedApplied.map(j => (
-                    <div key={j.id} style={{ display: 'flex', alignItems: 'center', gap: 6, background: 'var(--bg)', border: '0.5px solid var(--border)', borderRadius: 8, padding: '6px 10px' }}>
-                      <CompanyLogo logo={j.logo ?? j.company.slice(0, 2).toUpperCase()} size={18} />
-                      <span style={{ fontSize: 11 }}>{j.company}</span>
-                      <ScorePill score={j.score} />
-                      <button onClick={() => addToCart(j)} style={{
-                        fontSize: 10, padding: '2px 8px', borderRadius: 999, border: '0.5px solid var(--border)',
-                        background: cart.find(c => c.id === j.id) ? 'rgba(24,95,165,0.12)' : 'transparent',
-                        color:      cart.find(c => c.id === j.id) ? '#185FA5'              : 'var(--text-muted)',
-                        cursor: 'pointer',
-                      }}>
-                        {cart.find(c => c.id === j.id) ? '✓ Added' : '+ Basket'}
-                      </button>
-                    </div>
-                  ))}
-                </div>
-              </div>
-            )}
             {view === 'list'
-              ? <ListView jobs={jobs} onRowClick={setSelectedJob} />
+              ? <ListView jobs={jobs} onRowClick={setSelectedJob} selectedIds={selectedIds} onToggle={toggleSelected} onToggleAll={toggleAllVisible} />
               : <KanbanView jobs={jobs} onStatusChange={handleStatusChange} onAddClick={col => { setPrefillStatus(col); setShowAdd(true) }} />}
 
             {/* ── Pagination bar ── */}
@@ -1412,25 +1371,17 @@ export function JobsPage() {
         )}
       </div>
 
-      {showCart && (
-        <ApplyBasket
-          cart={cart}
-          onRemove={id => setCart(c => c.filter(x => x.id !== id))}
-          onClose={() => setShowCart(false)}
-          onJobsUpdated={updated => {
-            setJobs(prev => prev.map(j => {
-              const u = updated.find(x => x.id === j.id)
-              return u ?? j
-            }))
-            setCart([])
-          }}
-        />
-      )}
       {showAdd && (
         <AddJobModal
           prefillStatus={prefillStatus}
           onClose={() => { setShowAdd(false); setPrefillStatus(null) }}
-          onAdded={job => { setJobs(prev => [job, ...prev]); setTotal(t => t + 1); setPrefillStatus(null) }}
+          onAdded={job => {
+            setJobs(prev => [job, ...prev])
+            setTotal(t => t + 1)
+            defaultJobsCache = null
+            window.dispatchEvent(new Event('applymate:jobs-changed'))
+            setPrefillStatus(null)
+          }}
         />
       )}
 
@@ -1449,9 +1400,17 @@ export function JobsPage() {
           onDelete={id => {
             setJobs(prev => prev.filter(j => j.id !== id))
             setTotal(t => t - 1)
+            setSelectedIds(prev => {
+              const next = new Set(prev)
+              next.delete(id)
+              return next
+            })
+            defaultJobsCache = null
+            window.dispatchEvent(new Event('applymate:jobs-changed'))
           }}
         />
       )}
+      <ConfirmDialog />
     </div>
   )
 }

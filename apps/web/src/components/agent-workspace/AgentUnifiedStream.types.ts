@@ -17,10 +17,13 @@ export interface AgentUnifiedStreamProps {
   pendingCount: number
   autonomousMode: boolean
   resetVersion: number
+  resumeSessionId?: string | null
   onAnswerQuestion: (entry: LogEntry, opt: QuestionOption) => Promise<void> | void
   onAnswerOrchestrator: (questionId: string, answer: string, options?: QuestionOption[]) => Promise<void> | void
   onApplied: (jobId: string, job: ApplyReadyJob) => void
-  onChatAction: (action: AgentChatAction) => void
+  onChatAction: (action: AgentChatAction) => void | Promise<void>
   onAppendLog: (entry: LogEntry) => void
-  onSessionRecorded: (sessionId: string) => void
+  onSessionRecorded: (sessionId: string, goal?: string, subtitle?: string) => void
+  conversationTitle?: string | null
+  conversationSubtitle?: string | null
 }

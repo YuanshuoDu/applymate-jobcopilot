@@ -65,7 +65,7 @@ export function AiPanel({ selectedJob, scoreResult, suggestions, scoring, sugges
   }
 
   return (
-    <div style={{ width: 280, flexShrink: 0, borderLeft: '0.5px solid var(--border)', background: 'var(--bg-secondary)', overflowY: 'auto', padding: 14, display: 'flex', flexDirection: 'column', gap: 14 }}>
+    <div className="resume-ai-panel" style={{ width: 280, flexShrink: 0, borderLeft: '0.5px solid var(--border)', background: 'var(--bg-secondary)', overflowY: 'auto', padding: 14, display: 'flex', flexDirection: 'column', gap: 14 }}>
 
       {/* Job context + score */}
       <div style={{ background: 'rgba(79,70,229,0.06)', border: '0.5px solid rgba(79,70,229,0.20)', borderRadius: 7, padding: 10 }}>
@@ -277,6 +277,14 @@ export function AiPanel({ selectedJob, scoreResult, suggestions, scoring, sugges
             style={{ fontSize: 11, color: 'var(--primary)', background: 'rgba(79,70,229,0.08)', border: '1px solid rgba(79,70,229,0.30)', borderRadius: 6, padding: '6px 16px', cursor: 'pointer', fontWeight: 500 }}>
             ✦ Analyze Match
           </button>
+        </div>
+      )}
+
+      {!hasJob && (
+        <div className="resume-ai-empty-state">
+          <div className="resume-ai-empty-icon">✦</div>
+          <strong>Ready to tailor this version</strong>
+          <span>Link a saved job in the editor, then AI will score the match and suggest improvements section by section.</span>
         </div>
       )}
     </div>

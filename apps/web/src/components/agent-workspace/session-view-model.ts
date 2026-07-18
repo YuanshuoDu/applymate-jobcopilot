@@ -103,6 +103,22 @@ export function formatSessionClock(value: string, locale = "en"): string {
 
 export type EventTone = "user" | "orchestrator" | "subagent" | "approval" | "success" | "error" | "system"
 
+/** Shared transcript palette: user, main agent, specialist, approval, success, error, system. */
+export const EVENT_TONE_COLOR: Record<EventTone, string> = {
+  user: '#4F46E5',
+  orchestrator: '#0F766E',
+  subagent: '#64748B',
+  approval: '#D97706',
+  success: '#059669',
+  error: '#DC2626',
+  system: '#64748B',
+}
+
+export function sessionHeaderSubtitle(session: Pick<AgentSessionSummary, "source" | "status" | "updatedAt">): string {
+  const source = session.source === "manual_run" ? "Manual run" : session.source === "chat" ? "Chat" : session.source
+  return `${source} · ${sessionStatusLabel(session.status)} · updated ${formatSessionClock(session.updatedAt)}`
+}
+
 export function eventChrome(type: string): { tone: EventTone; label: string } {
   if (type === "user_message") return { tone: "user", label: "You" }
   if (type === "approval_request") return { tone: "approval", label: "Approval required" }

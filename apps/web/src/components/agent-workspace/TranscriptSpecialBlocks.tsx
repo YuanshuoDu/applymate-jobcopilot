@@ -35,10 +35,26 @@ export function TranscriptSpecialContent({ event, border, actedApprovalIds, onAc
   if (event.type === 'automation_draft') return <AutomationDraftBlock event={event} border={border} onAction={onAction} />
   if (event.type === 'quality_gate') return <QualityGateBlock event={event} border={border} />
   if (event.type === 'job_results') return <JobResultsBlock event={event} border={border} />
+  if (event.type === 'resume_tailored' || event.type === 'resume_finalized') return <ResumeArtifactBlock event={event} border={border} />
 
   return (
     <div style={{ whiteSpace: 'pre-wrap', fontSize: 12, lineHeight: 1.7, color: 'var(--text)' }}>
       {event.body || '(empty event)'}
+    </div>
+  )
+}
+
+function ResumeArtifactBlock({ event, border }: { event: AgentTranscriptEvent; border: string }) {
+  const artifact = nestedRecord(event, 'resume')
+  const job = nestedRecord(event, 'job')
+  return (
+    <div>
+      <BodyText>{event.body}</BodyText>
+      <KeyValueGrid border={border} rows={[
+        ['Resume', text(artifact.name) ?? 'Tailored resume'],
+        ['Job', [text(job.company) ?? text(artifact.company), text(job.role) ?? text(artifact.role)].filter(Boolean).join(' · ') || 'Linked job'],
+        ['Status', event.type === 'resume_finalized' ? 'Confirmed for Executor' : 'Waiting for Reviewer'],
+      ]} />
     </div>
   )
 }

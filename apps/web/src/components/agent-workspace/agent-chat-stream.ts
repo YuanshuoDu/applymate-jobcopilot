@@ -5,15 +5,17 @@ export interface AgentChatAction {
 
 interface StreamAgentChatOptions {
   sessionId: string | null
+  signal?: AbortSignal
   messages: Array<{ role: 'user'; content: string }>
   model: string
   onSession: (sessionId: string) => void
   onBlock: (type: string, data: unknown) => void
-  onAction: (action: AgentChatAction) => void
+  onAction: (action: AgentChatAction) => void | Promise<void>
 }
 
 export async function streamAgentChat({
   sessionId,
+  signal,
   messages,
   model,
   onSession,
@@ -22,6 +24,7 @@ export async function streamAgentChat({
 }: StreamAgentChatOptions) {
   const res = await fetch('/api/agent/chat', {
     method: 'POST', headers: { 'Content-Type': 'application/json' },
+    signal,
     body: JSON.stringify({
       sessionId: sessionId ?? undefined,
       messages,
@@ -43,7 +46,7 @@ export async function readAgentChatStream(
   let buf = ''
   let full = ''
   let event = ''
-  const processLine = (line: string) => {
+  const processLine = async (line: string) => {
     if (line.startsWith('event: ')) {
       event = line.slice(7).trim()
       return
@@ -60,7 +63,7 @@ export async function readAgentChatStream(
       } else if (event === 'block' && typeof d.type === 'string') {
         handlers.onBlock(d.type, d)
       } else if (event === 'action' && typeof d.type === 'string') {
-        handlers.onAction(d)
+        await handlers.onAction(d)
       } else if (event === 'error') {
         streamError = typeof d.message === 'string' ? d.message : 'Agent chat failed.'
       }
@@ -75,11 +78,11 @@ export async function readAgentChatStream(
     buf += decoder.decode(value, { stream: true })
     const lines = buf.split('\n'); buf = lines.pop() ?? ''
     for (const line of lines) {
-      processLine(line)
+      await processLine(line)
     }
   }
   buf += decoder.decode()
-  if (buf.trim()) processLine(buf)
+  if (buf.trim()) await processLine(buf)
   return displayTextFromAgentStream(full)
 }
 

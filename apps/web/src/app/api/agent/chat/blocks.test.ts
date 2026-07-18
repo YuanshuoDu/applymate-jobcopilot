@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { approvalRequestFrom, automationDraftFrom } from './blocks'
+import { approvalRequestFrom, automationDraftFrom, resumeTailoringApprovalFrom } from './blocks'
 
 describe('agent chat structured blocks', () => {
   it('extracts automation draft details from a natural-language request', () => {
@@ -37,5 +37,23 @@ describe('agent chat structured blocks', () => {
 
   it('ignores non-sensitive chat prompts', () => {
     expect(approvalRequestFrom('帮我解释评分', { pendingCount: 3, savedCount: 6 })).toBeNull()
+  })
+
+  it('asks for consent before the Writer changes a resume for a named job', () => {
+    expect(resumeTailoringApprovalFrom('请为 N26 的 Backend Engineer 定制并优化我的简历', {
+      resumeId: 'resume_1',
+      jobs: [{ id: 'job_1', company: 'N26', role: 'Backend Engineer' }],
+    })).toMatchObject({
+      type: 'tailor_resume',
+      payload: { resumeId: 'resume_1', jobId: 'job_1', requireApproval: true },
+      impact: { externalSubmission: false },
+    })
+  })
+
+  it('does not guess a job when multiple jobs exist and none is named', () => {
+    expect(resumeTailoringApprovalFrom('优化我的简历', {
+      resumeId: 'resume_1',
+      jobs: [{ id: 'job_1', company: 'N26', role: 'Backend Engineer' }, { id: 'job_2', company: 'Spotify', role: 'Data Engineer' }],
+    })).toBeNull()
   })
 })

@@ -37,18 +37,14 @@ type SiteConfig = {
 
 const SITES: Record<string, SiteConfig> = {
   'linkedin.com': {
-    // LinkedIn 2026 DOM: div.base-card inside li inside ul.jobs-search__results-list
-    // Title: h3.base-search-card__title (clean text, no sr-only wrapping)
-    // Company: h4.base-search-card__subtitle
-    // Location: span.job-search-card__location
-    // Link: a.base-card__full-link
-    // Identifier: data-entity-urn on div.base-card
-    card: 'div.base-card',
+    // LinkedIn has two layouts: public search uses base-card; signed-in search
+    // uses job-card-container and Art Deco entity lockups.
+    card: 'div.base-card, div.job-card-container',
     title:    '',
     company:  '',
     location: '',
     salary:   '',
-    link:     'a.base-card__full-link',
+    link:     'a.base-card__full-link, a.job-card-container__link, a[href*="/jobs/view/"]',
   },
   'indeed.com': {
     // Indeed ships different wrappers by market and experiment bucket.
@@ -177,6 +173,7 @@ function scrapeLinkedInCard(card: Element): CardJob | null {
   //                    div.base-search-card__metadata > span.job-search-card__location (location)
   const url =
     card.querySelector<HTMLAnchorElement>('a.base-card__full-link')?.href ||
+    card.querySelector<HTMLAnchorElement>('a.job-card-container__link')?.href ||
     card.querySelector<HTMLAnchorElement>('a[href*="/jobs/view/"]')?.href ||
     ''
   if (!url) return null
@@ -184,6 +181,8 @@ function scrapeLinkedInCard(card: Element): CardJob | null {
   const title =
     card.querySelector<HTMLElement>('h3.base-search-card__title')?.innerText?.trim() ||
     card.querySelector<HTMLElement>('.base-search-card__title')?.innerText?.trim() ||
+    card.querySelector<HTMLElement>('.artdeco-entity-lockup__title strong')?.innerText?.trim() ||
+    card.querySelector<HTMLElement>('.job-card-list__title')?.innerText?.trim() ||
     // fallback: sr-only span on the overlay link
     card.querySelector<HTMLElement>('a.base-card__full-link .sr-only')?.innerText?.trim() ||
     ''
@@ -192,11 +191,13 @@ function scrapeLinkedInCard(card: Element): CardJob | null {
     card.querySelector<HTMLElement>('h4.base-search-card__subtitle')?.innerText?.trim() ||
     card.querySelector<HTMLElement>('a.hidden-nested-link')?.innerText?.trim() ||
     card.querySelector<HTMLElement>('.base-search-card__subtitle')?.innerText?.trim() ||
+    card.querySelector<HTMLElement>('.artdeco-entity-lockup__subtitle')?.innerText?.trim() ||
     ''
 
   const location =
     card.querySelector<HTMLElement>('span.job-search-card__location')?.innerText?.trim() ||
     card.querySelector<HTMLElement>('.job-search-card__location')?.innerText?.trim() ||
+    card.querySelector<HTMLElement>('.artdeco-entity-lockup__caption')?.innerText?.trim() ||
     card.querySelector<HTMLElement>('.base-search-card__metadata')?.innerText?.trim()?.split('\n')[0] ||
     ''
 

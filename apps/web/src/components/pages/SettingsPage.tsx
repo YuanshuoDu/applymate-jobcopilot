@@ -87,7 +87,7 @@ function Toggle({ value, onChange }: { value: boolean; onChange: (v: boolean) =>
 
 // ── SettingsPage ──────────────────────────────────────────────────────────────
 
-type Tab = 'profile' | 'appearance' | 'accounts' | 'apiKeys' | 'ai' | 'billing' | 'notifs' | 'privacy'
+type Tab = 'profile' | 'appearance' | 'accounts' | 'apiKeys' | 'billing' | 'notifs' | 'privacy'
 
 const THEME_OPTIONS: { mode: ThemeMode; icon: string }[] = [
   { mode: 'light', icon: '☀' },
@@ -172,8 +172,7 @@ export function SettingsPage() {
     { id: 'profile',  label: t('settings.profile')  },
     { id: 'appearance', label: t('settings.appearance') },
     { id: 'accounts', label: t('settings.accounts') },
-    { id: 'apiKeys',  label: 'API Keys'             },
-    { id: 'ai',       label: t('settings.ai')       },
+    { id: 'apiKeys',  label: 'Keys & connections'   },
     { id: 'billing',  label: t('settings.billing')  },
     { id: 'notifs',   label: t('settings.notifs')   },
     { id: 'privacy',  label: t('settings.privacy')  },
@@ -203,7 +202,6 @@ export function SettingsPage() {
     appearance: '🎨',
     accounts: '🔗',
     apiKeys:  '🔑',
-    ai:       '🤖',
     billing:  '💳',
     notifs:   '🔔',
     privacy:  '🔒',
@@ -213,9 +211,11 @@ export function SettingsPage() {
     <div style={{ flex: 1, display: 'flex', flexDirection: 'column', overflow: 'hidden', background: 'var(--bg-tertiary)' }}>
       <ConfirmDialog />
       <TopBar title={t('settings.title')}>
-        <Btn variant="primary" onClick={saveProfile} disabled={saving}>
-          {saving ? t('settings.saving') : t('settings.save')}
-        </Btn>
+        {activeTab === 'profile' && (
+          <Btn variant="primary" onClick={saveProfile} disabled={saving}>
+            {saving ? t('settings.saving') : t('settings.save')}
+          </Btn>
+        )}
       </TopBar>
 
       <div style={{ display: 'flex', flex: 1, overflow: 'hidden' }}>
@@ -372,11 +372,8 @@ export function SettingsPage() {
             </SettingsSection>
           )}
 
-          {/* ── AI 模型 ── */}
-          {activeTab === 'ai' && <AiModelSettings />}
-
-          {/* ── API Keys ── */}
-          {activeTab === 'apiKeys' && <ApiKeysSettings />}
+          {/* ── Keys & connections ── */}
+          {activeTab === 'apiKeys' && <KeyManagementSettings />}
 
           {/* ── Accounts ── */}
           {activeTab === 'accounts' && (
@@ -656,6 +653,22 @@ type ApiKeyStatus = {
   hasRapidapi: boolean
 }
 
+type DiscoveryTestStatus = 'idle' | 'testing' | 'ok' | { error: string }
+
+function KeyManagementSettings() {
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 20 }}>
+      <SettingsSection title="Keys & connections">
+        <div style={{ padding: '10px 0 2px', fontSize: 12, color: 'var(--text-muted)', lineHeight: 1.65 }}>
+          Keep every credential in one place. <strong style={{ color: 'var(--text)' }}>AI model keys</strong> power resume parsing, tailoring, and writing. <strong style={{ color: 'var(--text)' }}>Job discovery keys</strong> only fetch job listings and use your own provider quota.
+        </div>
+      </SettingsSection>
+      <AiModelSettings />
+      <ApiKeysSettings />
+    </div>
+  )
+}
+
 function ApiKeysSettings() {
   const toast = useToast()
   const [status, setStatus] = useState<ApiKeyStatus>({ hasAdzuna: false, hasRapidapi: false })
@@ -665,6 +678,7 @@ function ApiKeysSettings() {
   const [visible, setVisible] = useState<Record<string, boolean>>({})
   const [loading, setLoading] = useState(true)
   const [saving, setSaving] = useState(false)
+  const [tests, setTests] = useState<Record<'adzuna' | 'rapidapi', DiscoveryTestStatus>>({ adzuna: 'idle', rapidapi: 'idle' })
 
   useEffect(() => {
     fetch('/api/me/api-keys')
@@ -700,7 +714,21 @@ function ApiKeysSettings() {
     setAdzunaAppId('')
     setAdzunaAppKey('')
     setRapidapiKey('')
-    toast.success('API keys saved', 'Discovery will use your keys before platform fallback')
+    toast.success('Job discovery keys saved', 'Adzuna and JSearch will use your credentials before the platform fallback')
+  }
+
+  async function testConnection(provider: 'adzuna' | 'rapidapi') {
+    setTests(prev => ({ ...prev, [provider]: 'testing' }))
+    try {
+      const res = await fetch('/api/me/api-keys', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ action: 'test', provider }),
+      })
+      const data = await res.json()
+      setTests(prev => ({ ...prev, [provider]: data.ok ? 'ok' : { error: data.error ?? 'Connection failed' } }))
+    } catch {
+      setTests(prev => ({ ...prev, [provider]: { error: 'Network error — try again' } }))
+    }
   }
 
   function SecretField({ id, label, value, onChange, saved }: {
@@ -718,7 +746,7 @@ function ApiKeysSettings() {
             type={isVisible ? 'text' : 'password'}
             value={value}
             onChange={e => onChange(e.target.value)}
-            placeholder={saved ? 'Saved - enter a new value to replace' : label}
+            placeholder={saved ? 'Saved — paste a new value to replace it' : `Paste your ${label}`}
             style={{ maxWidth: 'none' }}
           />
           <button
@@ -737,26 +765,50 @@ function ApiKeysSettings() {
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
-      <SettingsSection title="Bring Your Own API Keys">
+      <SettingsSection title="Job discovery APIs">
         <div style={{ fontSize: 11, color: 'var(--text-muted)', lineHeight: 1.6, padding: '10px 0 4px' }}>
-          Use your own Adzuna and RapidAPI quota for discovery. Saved keys are masked here and override platform keys during agent search.
+          These keys only search job boards. They do not run AI features or parse your resume. Save first, then test the provider; saved values stay masked.
         </div>
         <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', padding: '8px 0 4px' }}>
           <span style={{ fontSize: 10, borderRadius: 999, padding: '2px 8px', color: status.hasAdzuna ? 'var(--c-success)' : 'var(--text-muted)', background: status.hasAdzuna ? 'rgba(5,150,105,0.10)' : 'var(--bg-secondary)' }}>
-            Adzuna {status.hasAdzuna ? 'saved' : 'not set'}
+            Adzuna {status.hasAdzuna ? 'saved · ready to test' : 'not configured'}
           </span>
           <span style={{ fontSize: 10, borderRadius: 999, padding: '2px 8px', color: status.hasRapidapi ? 'var(--c-success)' : 'var(--text-muted)', background: status.hasRapidapi ? 'rgba(5,150,105,0.10)' : 'var(--bg-secondary)' }}>
-            RapidAPI {status.hasRapidapi ? 'saved' : 'not set'}
+            RapidAPI {status.hasRapidapi ? 'saved · ready to test' : 'not configured'}
           </span>
+        </div>
+        <div style={{ display: 'grid', gap: 10, padding: '8px 0 4px', fontSize: 11, color: 'var(--text-muted)', lineHeight: 1.55 }}>
+          <div><strong style={{ color: 'var(--text)' }}>Adzuna</strong> — direct European job listings. Requires an App ID and App Key.</div>
+          <div><strong style={{ color: 'var(--text)' }}>RapidAPI</strong> — provider marketplace used for JSearch and other job sources. Requires one API Key.</div>
         </div>
         <SecretField id="adzunaAppId" label="Adzuna App ID" value={adzunaAppId} onChange={setAdzunaAppId} saved={status.hasAdzuna} />
         <SecretField id="adzunaAppKey" label="Adzuna App Key" value={adzunaAppKey} onChange={setAdzunaAppKey} saved={status.hasAdzuna} />
         <SecretField id="rapidapiKey" label="RapidAPI Key" value={rapidapiKey} onChange={setRapidapiKey} saved={status.hasRapidapi} />
-        <div style={{ display: 'flex', justifyContent: 'flex-end', paddingTop: 12 }}>
+        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8, flexWrap: 'wrap', paddingTop: 12 }}>
+          <div style={{ display: 'flex', gap: 8 }}>
+            {(['adzuna', 'rapidapi'] as const).map(provider => {
+              const configured = provider === 'adzuna' ? status.hasAdzuna : status.hasRapidapi
+              const test = tests[provider]
+              const label = provider === 'adzuna' ? 'Test Adzuna' : 'Test RapidAPI'
+              return (
+                <button key={provider} type="button" onClick={() => testConnection(provider)} disabled={!configured || test === 'testing'} style={{ padding: '7px 10px', fontSize: 11, borderRadius: 7, border: '0.5px solid var(--border)', background: 'var(--bg-secondary)', color: test === 'ok' ? 'var(--c-success)' : 'var(--text)', cursor: configured && test !== 'testing' ? 'pointer' : 'default', opacity: configured ? 1 : 0.5 }} title={typeof test === 'object' ? test.error : undefined}>
+                  {test === 'testing' ? 'Testing…' : test === 'ok' ? 'Connected ✓' : label}
+                </button>
+              )
+            })}
+          </div>
           <Btn variant="primary" onClick={saveKeys} disabled={saving}>
-            {saving ? 'Saving...' : 'Save API Keys'}
+            {saving ? 'Saving...' : 'Save discovery keys'}
           </Btn>
         </div>
+        {(['adzuna', 'rapidapi'] as const).map(provider => {
+          const test = tests[provider]
+          return typeof test === 'object' ? (
+            <div key={`${provider}-error`} style={{ marginTop: 8, fontSize: 11, color: 'var(--c-danger)' }}>
+              {provider === 'adzuna' ? 'Adzuna' : 'RapidAPI'}: {test.error}
+            </div>
+          ) : null
+        })}
       </SettingsSection>
     </div>
   )

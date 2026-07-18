@@ -38,6 +38,27 @@ describe("run session recorder", () => {
     })
   })
 
+  it("binds pipeline events to an existing chat session instead of creating another session", async () => {
+    const db = mockDb()
+    const recorder = await createRunSessionRecorder(db, {
+      userId: "user_1",
+      goal: "Chat Agent Pipeline Run",
+      sessionId: "chat_session_1",
+    })
+
+    expect(recorder.sessionId).toBe("chat_session_1")
+    expect(db.agentSession.create).not.toHaveBeenCalled()
+    expect(db.agentSession.update).toHaveBeenCalledWith({
+      where: { id: "chat_session_1" },
+      data: { status: "running", completedAt: null },
+    })
+
+    await recorder.record("agent_plan", { role: "scout", plan: "Find matching jobs" })
+    expect(db.agentTranscriptEvent.create).toHaveBeenCalledWith({
+      data: expect.objectContaining({ sessionId: "chat_session_1" }),
+    })
+  })
+
   it("maps orchestrator and agent events to transcript event types", () => {
     expect(mapPipelineEventToTranscript("orchestrator_plan", { plan: "Run gates first" })).toMatchObject({
       type: "orchestrator_plan",

@@ -3,6 +3,8 @@ import { db } from "@/lib/db"
 import { err, isErrorResponse, ok, requireAuth } from "@/lib/api-helpers"
 import { createAgentSession } from "@/lib/agent/session/repository"
 
+const STALE_CHAT_SESSION_MS = 30 * 60 * 1000
+
 function serializeSession(session: {
   id: string
   goal: string
@@ -32,6 +34,19 @@ function readGoal(body: unknown) {
 export async function GET(req: NextRequest) {
   const auth = await requireAuth(req)
   if (isErrorResponse(auth)) return auth
+
+  const completedAt = new Date()
+  await db.agentSession.updateMany({
+    where: {
+      userId: auth.userId,
+      source: "chat",
+      status: "running",
+      updatedAt: { lt: new Date(completedAt.getTime() - STALE_CHAT_SESSION_MS) },
+      approvals: { none: { status: "pending" } },
+      tasks: { none: { status: { in: ["queued", "running", "retrying", "waiting_for_user"] } } },
+    },
+    data: { status: "completed", completedAt },
+  })
 
   const sessions = await db.agentSession.findMany({
     where: { userId: auth.userId },

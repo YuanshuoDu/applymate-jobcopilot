@@ -44,14 +44,16 @@ export function fallbackActionEvent(action: TranscriptAction): AgentTranscriptEv
 
 export function liveBlockEvent(type: string, data: unknown, index: number): AgentTranscriptEvent {
   const chrome = eventChrome(type)
+  const payload = data && typeof data === 'object' ? data as Record<string, unknown> : {}
+  const eventData = payload.data && typeof payload.data === 'object' ? payload.data : data
   return {
     id: `live-${Date.now()}-${index}`,
     taskId: null,
     type,
-    speaker: type === 'automation_draft' ? 'Orchestrator' : chrome.label,
-    title: chrome.label,
-    body: type === 'automation_draft' ? 'I drafted an automation from your request. Please confirm before I save it.' : '',
-    data,
+    speaker: typeof payload.speaker === 'string' ? payload.speaker : type === 'automation_draft' ? 'Orchestrator' : chrome.label,
+    title: typeof payload.title === 'string' ? payload.title : chrome.label,
+    body: typeof payload.body === 'string' ? payload.body : type === 'automation_draft' ? 'I drafted an automation from your request. Please confirm before I save it.' : '',
+    data: eventData,
     durationMs: null,
     createdAt: new Date().toISOString(),
   }
@@ -80,4 +82,11 @@ export function attachmentComposerContext(attachedFiles: ComposerAttachment[]) {
     '附件上下文（文件内容尚未上传解析，仅提供文件名和类型供你决定下一步）：',
     ...attachedFiles.map(file => `- ${file.name} (${formatBytes(file.size)} · ${file.type})`),
   ].join('\n')
+}
+
+export function shouldStickToBottom(
+  metrics: { scrollHeight: number; scrollTop: number; clientHeight: number },
+  threshold = 120,
+) {
+  return metrics.scrollHeight - metrics.scrollTop - metrics.clientHeight <= threshold
 }

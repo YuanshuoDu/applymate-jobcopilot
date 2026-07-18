@@ -284,7 +284,7 @@ export function ResumeIntakeDialog({ onClose, onSaved, directions: initialDirect
 
         {/* Header */}
         <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 16 }}>
-          <div style={{ fontSize: 15, fontWeight: 600, color: 'var(--text)' }}>{t('resume.intake.title')}</div>
+          <div style={{ fontSize: 15, fontWeight: 600, color: 'var(--text)' }}>Add your resume</div>
           {!isLoading && !saving && (
             <button onClick={onClose} style={{ background: 'none', border: 'none', cursor: 'pointer', color: 'var(--text-muted)', fontSize: 16, padding: 4, lineHeight: 1 }}>✕</button>
           )}
@@ -293,7 +293,7 @@ export function ResumeIntakeDialog({ onClose, onSaved, directions: initialDirect
         {/* Direction select */}
         <div style={{ marginBottom: 16 }}>
           <label style={{ fontSize: 11, color: 'var(--text-muted)', display: 'block', marginBottom: 4 }}>
-            {t('resume.intake.direction')}
+            Choose a direction (optional)
           </label>
           <select
             value={selectedDirId ?? ''}
@@ -304,11 +304,11 @@ export function ResumeIntakeDialog({ onClose, onSaved, directions: initialDirect
               background: 'var(--bg)', color: 'var(--text)', outline: 'none',
             }}
           >
-            <option value="">{t('resume.intake.noDirection')}</option>
+            <option value="">General resume</option>
             {directions.map(d => (
               <option key={d.id} value={d.id}>{d.name}</option>
             ))}
-            <option value="__new__">{t('resume.intake.newDirection')}</option>
+            <option value="__new__">Create a new direction…</option>
           </select>
           {showNewDirInput && (
             <div style={{ display: 'flex', gap: 6, marginTop: 6, alignItems: 'center' }}>
@@ -360,9 +360,9 @@ export function ResumeIntakeDialog({ onClose, onSaved, directions: initialDirect
                   marginBottom: -1,
                 }}
               >
-                {tab === 'upload'     ? t('resume.intake.tabUpload')
-               : tab === 'paste'      ? t('resume.intake.tabPaste')
-               :                        `${t('resume.intake.tabScreenshot')} 🔒`}
+                {tab === 'upload'     ? 'Upload file'
+               : tab === 'paste'      ? 'Paste text'
+               :                        'Screenshot (coming soon)'}
               </button>
             )
           })}
@@ -386,9 +386,9 @@ export function ResumeIntakeDialog({ onClose, onSaved, directions: initialDirect
             >
               <div style={{ fontSize: 28, marginBottom: 10 }}>📄</div>
               <div style={{ fontSize: 13, fontWeight: 500, color: 'var(--text)', marginBottom: 4 }}>
-                {t('resume.intake.dropzone')}
+                Drop your resume here, or click to browse
               </div>
-              <div style={{ fontSize: 11, color: 'var(--text-muted)' }}>{t('resume.intake.accepts')}</div>
+              <div style={{ fontSize: 11, color: 'var(--text-muted)' }}>PDF or DOCX · up to 5 MB</div>
               <input
                 ref={inputRef}
                 type="file"
@@ -409,7 +409,7 @@ export function ResumeIntakeDialog({ onClose, onSaved, directions: initialDirect
             <textarea
               value={pasteText}
               onChange={e => setPasteText(e.target.value)}
-              placeholder={t('resume.intake.pastePlaceholder')}
+              placeholder="Paste your resume text here…"
               style={{
                 width: '100%', minHeight: 180, fontSize: 12, lineHeight: 1.6,
                 padding: '10px 12px', border: '0.5px solid var(--border)', borderRadius: 8,
@@ -424,7 +424,7 @@ export function ResumeIntakeDialog({ onClose, onSaved, directions: initialDirect
             )}
             <div style={{ marginTop: 10, display: 'flex', justifyContent: 'flex-end' }}>
               <Btn small variant="primary" onClick={handleParse} disabled={isLoading || pasteText.trim().length < 50}>
-                {t('resume.intake.parseBtn')}
+                Parse resume
               </Btn>
             </div>
           </div>

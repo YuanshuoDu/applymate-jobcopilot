@@ -7,7 +7,7 @@ export type DragHandleProps = {
   onDragStart: (e: React.DragEvent) => void
 }
 
-export function SectionHeader({ title, count, collapsed, onToggle, onAdd, addLabel, onRemove, dragHandleProps }: {
+export function SectionHeader({ title, count, collapsed, onToggle, onAdd, addLabel, onRemove, dragHandleProps, onTitleClick }: {
   title:            string
   count?:           number
   collapsed:        boolean
@@ -16,6 +16,7 @@ export function SectionHeader({ title, count, collapsed, onToggle, onAdd, addLab
   addLabel?:        string
   onRemove?:        () => void
   dragHandleProps?: DragHandleProps
+  onTitleClick?:    () => void
 }) {
   return (
     <div style={{
@@ -33,7 +34,12 @@ export function SectionHeader({ title, count, collapsed, onToggle, onAdd, addLab
             ⠿
           </span>
         )}
-        {title}
+        {onTitleClick ? (
+          <button onClick={e => { e.stopPropagation(); onTitleClick() }} title="Edit section title"
+            style={{ padding: 0, border: 'none', background: 'none', color: 'inherit', font: 'inherit', cursor: 'text', textAlign: 'left' }}>
+            {title}
+          </button>
+        ) : title}
         {count !== undefined && count > 0 && (
           <span style={{ fontSize: 9, color: 'var(--text-muted)', fontWeight: 400 }}>({count})</span>
         )}

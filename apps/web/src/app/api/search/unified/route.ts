@@ -18,6 +18,7 @@
 import { NextRequest } from 'next/server'
 import { requireAuth, isErrorResponse, ok, err } from '@/lib/api-helpers'
 import { truncate, fmtSalary } from '@/lib/utils'
+import { cleanSearchTitle, postFilter, queryKeywords, scoreSearchJobs, smartDedup, type SearchFilters, type SearchJob } from './search-quality'
 
 // ── Infrastructure ────────────────────────────────────────────────────────────
 
@@ -26,7 +27,6 @@ const SOURCE_TIMEOUT_MS       = 5_000             // drop a source after 5 s
 const MIN_RESULTS_FOR_FALLBACK = 5                // expand sources when < 5 results
 
 // Sources that guarantee remote=true on every returned job
-const REMOTE_VERIFIED_SOURCES = new Set<string>(['jobicy', 'remotive', 'ats', 'internships'])
 
 // ── Simple in-memory result cache ────────────────────────────────────────────
 // Works for single-instance Next.js. Swap for Redis/KV in multi-instance deploys.
@@ -54,46 +54,7 @@ async function withTimeout<T>(p: Promise<T>, ms: number, fallback: T): Promise<T
   return Promise.race([p, new Promise<T>(res => setTimeout(() => res(fallback), ms))])
 }
 
-interface HiringManager {
-  name:        string
-  title:       string
-  linkedinUrl: string
-  email:       string | null
-  phone:       string | null
-}
-
-interface JobResult {
-  id:               string
-  title:            string
-  company:          string
-  location:         string
-  salary?:          string
-  description:      string
-  url:              string
-  postedAt?:        string | null
-  jobType?:         string | null
-  logo?:            string | null
-  seniority?:       string | null
-  directApply?:     boolean
-  keySkills?:       string[]
-  workArrangement?: string | null  // "Remote Solely"|"Remote OK"|"Hybrid"|"On-site"
-  experienceLevel?: string | null  // "0-2"|"2-5"|"5-10"|"10+"
-  hiringManager?:   HiringManager | null
-  source:           'adzuna' | 'jsearch' | 'linkedin' | 'jobicy' | 'ats' | 'internships' | 'irishjobs'
-                  | 'xing' | 'indeed' | 'remotive' | 'bundesagentur' | 'reed' | 'careerjet'
-                  | 'mantiks' | 'reed' | 'careerjet'
-  score:            number
-}
-
-interface SearchFilters {
-  location:    string
-  remote:      boolean
-  jobType:     string
-  datePosted:  string
-  experience:  string
-  salaryMin?:  number
-  salaryMax?:  number
-}
+type JobResult = SearchJob
 
 type SourceId = JobResult['source']
 
@@ -250,11 +211,6 @@ function detectCountry(text: string): string | null {
   return null
 }
 
-function cleanTitle(q: string): string {
-  return q.replace(/\b(remote|hybrid|onsite|senior|sr|junior|jr|lead|principal|staff)\b/gi, '')
-          .replace(/\b[A-Z]{2}\b/g, '').replace(/\s+/g, ' ').trim()
-}
-
 function smartRouter(q: string, f: SearchFilters, qa?: QueryAnalysis): RouterDecision {
   const ql           = (q + ' ' + f.location).toLowerCase()
   const isRem        = f.remote || /\b(remote|anywhere|worldwide|distributed)\b/.test(ql)
@@ -269,7 +225,7 @@ function smartRouter(q: string, f: SearchFilters, qa?: QueryAnalysis): RouterDec
   const hasMantiks   = !!process.env.MANTIKS_API_KEY
 
   const loc   = f.location || ''
-  const title = cleanTitle(q)
+  const title = cleanSearchTitle(q)
   const sources: SourceCall[] = []
 
   // Shared params builder — only include non-empty filter values
@@ -1238,86 +1194,11 @@ async function fetchInternships(p: Record<string, string>, filters: SearchFilter
   })
 }
 
-// ── Deduplication (two-pass: URL fingerprint → fuzzy title+company) ──────────
-
-function normalizeUrl(url: string): string {
-  if (!url) return ''
-  try {
-    const u = new URL(url)
-    // Strip common tracking params so the same job from different referrers deduplicates
-    const TRACKING = ['utm_source', 'utm_medium', 'utm_campaign', 'utm_content',
-                      'utm_term', 'trk', 'ref', 'source', 'origin', 'referer',
-                      'viewId', 'trackingId', 'sid', 'cid']
-    TRACKING.forEach(p => u.searchParams.delete(p))
-    return (u.origin + u.pathname).toLowerCase().replace(/\/$/, '')
-  } catch {
-    return url.toLowerCase().split('?')[0].replace(/\/$/, '')
-  }
-}
-
-const STRIP_TITLE = /\b(senior|sr\.?|junior|jr\.?|lead|principal|staff|mid|i|ii|iii|iv|remote|hybrid|onsite|contract|temp|interim)\b/gi
-
-function fuzzyJobKey(title: string, company: string): string {
-  const clean = (s: string) => s.toLowerCase()
-    .replace(/[^a-z0-9 ]/g, ' ')
-    .replace(STRIP_TITLE, '')
-    .replace(/\s+/g, ' ').trim().slice(0, 45)
-  return `${clean(title)}||${clean(company)}`
-}
-
-// Ranks two JobResult copies to pick the richer one
-function isBetter(candidate: JobResult, existing: JobResult): boolean {
-  if (!existing.salary && candidate.salary)      return true
-  if (!existing.description && candidate.description) return true
-  if (!existing.logo && candidate.logo)          return true
-  // Prefer direct-apply sources
-  if (!existing.directApply && candidate.directApply) return true
-  // Prefer sources with AI skills data
-  if (!(existing.keySkills?.length) && candidate.keySkills?.length) return true
-  return false
-}
-
-function smartDedup(jobs: JobResult[]): JobResult[] {
-  const byUrl   = new Map<string, number>()   // normalized URL → index in results
-  const byFuzzy = new Map<string, number>()   // title+company key → index
-  const results: JobResult[] = []
-
-  for (const job of jobs) {
-    const nUrl = normalizeUrl(job.url)
-    const fKey = fuzzyJobKey(job.title, job.company)
-
-    // Pass 1: URL fingerprint (strongest signal — identical job)
-    if (nUrl) {
-      const idx = byUrl.get(nUrl)
-      if (idx !== undefined) {
-        if (isBetter(job, results[idx])) results[idx] = { ...job, score: results[idx].score }
-        continue
-      }
-    }
-
-    // Pass 2: Fuzzy title+company (same role on multiple boards)
-    if (fKey) {
-      const idx = byFuzzy.get(fKey)
-      if (idx !== undefined) {
-        if (isBetter(job, results[idx])) results[idx] = { ...job, score: results[idx].score }
-        continue
-      }
-    }
-
-    const newIdx = results.length
-    results.push(job)
-    if (nUrl)  byUrl.set(nUrl, newIdx)
-    if (fKey)  byFuzzy.set(fKey, newIdx)
-  }
-
-  return results
-}
-
 // ── Relevance scoring ─────────────────────────────────────────────────────────
 
 function scoreJobs(jobs: JobResult[], q: string, f: SearchFilters): JobResult[] {
   const ql       = q.toLowerCase()
-  const words    = ql.split(/\s+/).filter(w => w.length > 2)
+  const words    = queryKeywords(ql)
   const isRemote = f.remote || /\b(remote|wfh|distributed)\b/.test(ql)
 
   const EXP_PATTERNS: Record<string, RegExp> = {
@@ -1406,41 +1287,6 @@ function scoreJobs(jobs: JobResult[], q: string, f: SearchFilters): JobResult[] 
   })
 }
 
-// ── Post-fetch filters ────────────────────────────────────────────────────────
-
-function parseSalaryNum(salary?: string): { min: number; max: number } | null {
-  if (!salary) return null
-  const nums = salary.match(/\d[\d,.]*/g)?.map(n => parseFloat(n.replace(/,/g, ''))) ?? []
-  if (!nums.length) return null
-  // Scale up if values look like thousands (e.g. "65k" → 65000)
-  const scaled = nums.map(n => n < 1000 ? n * 1000 : n)
-  const [a, b] = scaled
-  return { min: a, max: b ?? a }
-}
-
-function postFilter(jobs: JobResult[], f: SearchFilters): JobResult[] {
-  return jobs.filter(j => {
-    if (f.salaryMin || f.salaryMax) {
-      const sal = parseSalaryNum(j.salary)
-      if (sal) {
-        if (f.salaryMin && sal.max < f.salaryMin) return false
-        if (f.salaryMax && sal.min > f.salaryMax) return false
-      }
-    }
-    // Remote-verified sources don't need location-text check
-    if (f.remote && !/(remote|anywhere|worldwide)/i.test(j.location)) {
-      if (!REMOTE_VERIFIED_SOURCES.has(j.source)) {
-        const isRemoteInText = /(remote|anywhere|worldwide)/i.test(
-          j.location + ' ' + j.description.slice(0, 150)
-        )
-        const isRemoteByArrangement = j.workArrangement === 'Remote Solely' || j.workArrangement === 'Remote OK'
-        if (!isRemoteInText && !isRemoteByArrangement) return false
-      }
-    }
-    return true
-  })
-}
-
 // ── Metadata helpers ──────────────────────────────────────────────────────────
 
 function buildSourceBreakdown(jobs: JobResult[]): Record<string, number> {
@@ -1499,7 +1345,7 @@ async function tryFallback(
   filters: SearchFilters,
 ): Promise<JobResult[]> {
   if (existing.length >= MIN_RESULTS_FOR_FALLBACK) return []
-  const fallbackParams = { titleFilter: q, locationFilter: '' }
+  const fallbackParams = { titleFilter: q, locationFilter: filters.location }
   return withTimeout(fetchLinkedIn(fallbackParams, filters), SOURCE_TIMEOUT_MS, [])
 }
 
@@ -1587,7 +1433,7 @@ export async function GET(req: NextRequest) {
   // ⑥b Zero-result guarantee: if STILL 0 results, try free-tier sources that need no API key.
   // This ensures search always returns something even when RAPIDAPI_KEY is missing/expired.
   // Free sources: Remotive (remote jobs), Jobicy (remote jobs), IrishJobs (Ireland RSS).
-  if (raw.length === 0) {
+  if (raw.length === 0 && (!filters.location || filters.remote)) {
     const hasRapidKey = !!(process.env.RAPIDAPI_KEY)
     const freeFallbacks: Array<Promise<JobResult[]>> = [
       withTimeout(fetchRemotive({ q }, filters), SOURCE_TIMEOUT_MS, []),
@@ -1607,7 +1453,7 @@ export async function GET(req: NextRequest) {
   }
 
   // ⑦ Score → smart dedup → post-filter → sort
-  const scored   = scoreJobs(raw, q, filters)
+  const scored   = scoreSearchJobs(raw, q, filters)
   const deduped  = smartDedup(scored)
   const filtered = postFilter(deduped, filters)
   const sorted   = filtered.sort((a, b) => b.score - a.score)

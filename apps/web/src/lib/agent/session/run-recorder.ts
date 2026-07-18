@@ -12,6 +12,8 @@ import type { AgentSessionStatus, SubAgentRole, TranscriptEventType } from "./ty
 interface RunSessionRecorderInput {
   userId: string
   goal: string
+  /** Bind a pipeline to an existing, already-authorized conversation. */
+  sessionId?: string
 }
 
 interface FinalizeInput {
@@ -161,11 +163,20 @@ function qualityScore(report: RunReport | null, status: AgentSessionStatus) {
 }
 
 export async function createRunSessionRecorder(db: AgentSessionDb, input: RunSessionRecorderInput) {
-  const session = await createAgentSession(db, {
-    userId: input.userId,
-    goal: input.goal,
-    source: "manual_run",
-  }) as { id: string }
+  const session = input.sessionId
+    ? { id: input.sessionId }
+    : await createAgentSession(db, {
+      userId: input.userId,
+      goal: input.goal,
+      source: "manual_run",
+    }) as { id: string }
+  if (input.sessionId) {
+    await updateAgentSession(db, {
+      sessionId: input.sessionId,
+      status: "running",
+      completedAt: null,
+    })
+  }
   const taskIdsByRole = new Map<PipelineSubAgentRole, string>()
 
   return {

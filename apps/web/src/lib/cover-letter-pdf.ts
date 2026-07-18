@@ -20,9 +20,15 @@ export async function renderCoverLetterDoc(
         ? 'minimal'
         : 'modern'
 
+  // CSS variables work in the HTML preview but are not valid color values for
+  // @react-pdf/renderer. Fall back to the product's exported blue instead.
+  const accentColor = resumeOptions?.accentColor?.startsWith('var(')
+    ? '#185FA5'
+    : resumeOptions?.accentColor ?? '#185FA5'
+
   const props: CoverLetterDocProps = {
     content:         clContent,
-    accentColor:     resumeOptions?.accentColor ?? '#185FA5',
+    accentColor,
     fontFamily:      resumeOptions?.fontFamily  ?? 'sans',
     density:         resumeOptions?.density     ?? 'comfortable',
     applicant,

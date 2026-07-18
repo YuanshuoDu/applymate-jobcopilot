@@ -3,13 +3,15 @@ import React, { useState, useEffect, useRef } from 'react'
 import { Btn, useToast, useConfirm } from '@/components/ui'
 import { apiMutate } from '@/lib/hooks'
 import { useI18n } from '@/lib/i18n'
-import type { CoverLetter, Job, ResumeContent } from '@/lib/types'
+import type { CoverLetter, Job, ResumeContent, TemplateOptions } from '@/lib/types'
 
 interface Props {
   job:           Job
   resumeContent: ResumeContent | null
   resumeName:    string
+  templateId:    string
   templateName?: string
+  templateOptions: TemplateOptions
   onClose:       () => void
   onSaved?:      (cl: CoverLetter) => void
 }
@@ -19,7 +21,7 @@ type Tone = typeof TONES[number]
 const LANGUAGES = ['en', 'de', 'fr', 'nl', 'es'] as const
 type CoverLetterLanguage = typeof LANGUAGES[number]
 
-export function CoverLetterPanel({ job, resumeContent, resumeName, templateName, onClose, onSaved }: Props) {
+export function CoverLetterPanel({ job, resumeContent, resumeName, templateId, templateName, templateOptions, onClose, onSaved }: Props) {
   const { t } = useI18n()
   const toast = useToast()
   const [confirm, ConfirmDialog] = useConfirm()
@@ -33,6 +35,8 @@ export function CoverLetterPanel({ job, resumeContent, resumeName, templateName,
   const [saving,       setSaving]         = useState(false)
   const [generating,   setGenerating]     = useState(false)
   const [assigning,    setAssigning]      = useState(false)
+  const [downloading,  setDownloading]    = useState(false)
+  const [previewing,   setPreviewing]     = useState(false)
   const [visible,      setVisible]        = useState(false)
   const textareaRef = useRef<HTMLTextAreaElement>(null)
 
@@ -183,6 +187,47 @@ export function CoverLetterPanel({ job, resumeContent, resumeName, templateName,
     }
   }
 
+  async function handlePdfDownload() {
+    if (!activeCL?.content || downloading) return
+    setDownloading(true)
+    try {
+      const { pdf } = await import('@react-pdf/renderer')
+      const { renderCoverLetterDoc } = await import('@/lib/cover-letter-pdf')
+      const applicant = resumeContent?.contact
+        ? {
+            name: resumeContent.contact.name || resumeName,
+            email: resumeContent.contact.email,
+            phone: resumeContent.contact.phone,
+            location: resumeContent.contact.location,
+            linkedin: resumeContent.contact.linkedin,
+          }
+        : { name: resumeName || 'Applicant' }
+      const document = await renderCoverLetterDoc(
+        activeCL.content,
+        templateId,
+        templateOptions,
+        applicant,
+        { company: job.company, role: job.role },
+      )
+      const blob = await pdf(document as never).toBlob()
+      const safeName = `${job.company}_${job.role}`.replace(/[\\/:*?"<>|]/g, '_')
+      const url = URL.createObjectURL(blob)
+      const anchor = window.document.createElement('a')
+      anchor.href = url
+      anchor.download = `CoverLetter_${safeName}.pdf`
+      window.document.body.appendChild(anchor)
+      anchor.click()
+      anchor.remove()
+      window.setTimeout(() => URL.revokeObjectURL(url), 0)
+      toast.success('PDF downloaded', 'Cover letter saved as PDF')
+    } catch (error) {
+      console.error('[cover-letter] PDF export failed', error)
+      toast.error('PDF error', error instanceof Error ? error.message : 'Could not render cover letter PDF')
+    } finally {
+      setDownloading(false)
+    }
+  }
+
   function handleClose() {
     setVisible(false)
     setTimeout(onClose, 220)
@@ -328,29 +373,14 @@ export function CoverLetterPanel({ job, resumeContent, resumeName, templateName,
           <Btn small variant="success" onClick={handleSetFinal} disabled={!activeId || assigning}>
             {assigning ? 'Setting…' : t('coverLetter.panel.setFinal')}
           </Btn>
+          <Btn small variant="glass" onClick={() => setPreviewing(value => !value)} disabled={!activeCL}>
+            {previewing ? t('coverLetter.panel.edit') : t('coverLetter.panel.preview')}
+          </Btn>
 
           {/* PDF export — M9 */}
           <button
-            onClick={async () => {
-              if (!activeCL || !activeCL.content) return
-              try {
-                const { pdf } = await import('@react-pdf/renderer')
-                const { saveAs } = await import('file-saver')
-                const { renderCoverLetterDoc } = await import('@/lib/cover-letter-pdf')
-                const CLDoc = await renderCoverLetterDoc(
-                  activeCL.content,
-                  undefined,
-                  undefined,
-                  { name: 'Applicant' },
-                  { company: job.company, role: job.role },
-                )
-                const blob = await pdf(CLDoc as never).toBlob()
-                saveAs(blob, `CoverLetter_${job.company}_${job.role}.pdf`)
-                toast.success('PDF downloaded', 'Cover letter saved as PDF')
-              } catch {
-                toast.error('PDF error', 'Could not render cover letter PDF')
-              }
-            }}
+            onClick={handlePdfDownload}
+            disabled={!activeCL || downloading}
             style={{
               fontSize:     10,
               padding:      '4px 9px',
@@ -358,10 +388,10 @@ export function CoverLetterPanel({ job, resumeContent, resumeName, templateName,
               borderRadius: 6,
               background:   'var(--bg)',
               color:        'var(--text-muted)',
-              cursor:       activeCL ? 'pointer' : 'not-allowed',
-              opacity:      activeCL ? 1 : 0.5,
+              cursor:       activeCL && !downloading ? 'pointer' : 'not-allowed',
+              opacity:      activeCL && !downloading ? 1 : 0.5,
             }}>
-            ⬇ PDF
+            {downloading ? 'Preparing…' : t('coverLetter.panel.downloadPdf')}
           </button>
 
           <div style={{ flex: 1 }} />
@@ -386,6 +416,16 @@ export function CoverLetterPanel({ job, resumeContent, resumeName, templateName,
               <div style={{ width: 20, height: 20, border: '2.5px solid rgba(79,70,229,0.20)', borderTopColor: 'var(--primary)', borderRadius: '50%', animation: 'spin 0.7s linear infinite' }} />
               <span style={{ fontSize: 12, color: 'var(--text-muted)' }}>{t('coverLetter.panel.generating')}</span>
             </div>
+          ) : previewing ? (
+            <CoverLetterPreview
+              content={localContent}
+              applicant={resumeContent?.contact}
+              fallbackName={resumeName}
+              company={job.company}
+              role={job.role}
+              templateId={templateId}
+              templateOptions={templateOptions}
+            />
           ) : (
             <textarea
               ref={textareaRef}
@@ -422,26 +462,8 @@ export function CoverLetterPanel({ job, resumeContent, resumeName, templateName,
             </div>
             {activeCL && (
               <button
-                onClick={async () => {
-                  if (!activeCL.content) return
-                  try {
-                    const { pdf } = await import('@react-pdf/renderer')
-                    const { saveAs } = await import('file-saver')
-                    const { renderCoverLetterDoc } = await import('@/lib/cover-letter-pdf')
-                    const CLDoc = await renderCoverLetterDoc(
-                      activeCL.content,
-                      undefined,
-                      undefined,
-                      { name: 'Applicant' },
-                      { company: job.company, role: job.role },
-                    )
-                    const blob = await pdf(CLDoc as never).toBlob()
-                    saveAs(blob, `CoverLetter_${job.company}_${job.role}.pdf`)
-                    toast.success('PDF downloaded', 'Cover letter saved as PDF')
-                  } catch {
-                    toast.error('PDF error', 'Could not render cover letter PDF')
-                  }
-                }}
+                onClick={handlePdfDownload}
+                disabled={downloading}
                 style={{
                   fontSize:     10,
                   padding:      '3px 8px',
@@ -449,15 +471,82 @@ export function CoverLetterPanel({ job, resumeContent, resumeName, templateName,
                   borderRadius: 5,
                   background:   'var(--bg)',
                   color:        'var(--text-muted)',
-                  cursor:       'pointer',
+                  cursor:       downloading ? 'wait' : 'pointer',
+                  opacity:      downloading ? 0.65 : 1,
                   flexShrink:   0,
                 }}>
-                ⬇ Download PDF
+                {downloading ? 'Preparing…' : t('coverLetter.panel.downloadPdf')}
               </button>
             )}
           </div>
         </div>
       </div>
     </>
+  )
+}
+
+function CoverLetterPreview({
+  content, applicant, fallbackName, company, role, templateId, templateOptions,
+}: {
+  content: string
+  applicant?: ResumeContent['contact']
+  fallbackName: string
+  company: string
+  role: string
+  templateId: string
+  templateOptions: TemplateOptions
+}) {
+  const accent = templateOptions.accentColor || 'var(--primary)'
+  const fontFamily = templateOptions.fontFamily === 'serif'
+    ? "Georgia, 'Times New Roman', serif"
+    : templateOptions.fontFamily === 'mono'
+      ? "'Courier New', Consolas, monospace"
+      : "Inter, 'Segoe UI', Arial, sans-serif"
+  const padding = templateOptions.density === 'compact' ? 28 : templateOptions.density === 'spacious' ? 42 : 34
+  const name = applicant?.name || fallbackName || 'Applicant'
+  const contact = [applicant?.email, applicant?.phone, applicant?.location, applicant?.linkedin].filter(Boolean).join(' · ')
+  const paragraphs = content.split(/\n\s*\n/).filter(Boolean)
+  const executive = templateId === 'executive'
+  const sidebar = templateId === 'sidebar'
+  const timeline = templateId === 'timeline'
+  const compact = templateId === 'compact'
+
+  const letter = (
+    <div style={{ flex: 1, padding, color: '#1F2937', fontSize: compact ? 11 : 12, lineHeight: 1.7 }}>
+      {!sidebar && !executive && (
+        <div style={{ display: 'flex', gap: timeline ? 12 : 0, alignItems: 'stretch', borderBottom: compact ? `2px solid ${accent}` : `2px solid ${accent}`, paddingBottom: 10, marginBottom: 18 }}>
+          {timeline && <div style={{ width: 5, borderRadius: 3, background: accent }} />}
+          <div>
+            <div style={{ color: compact ? '#111827' : accent, fontSize: compact ? 20 : 23, fontWeight: 700, letterSpacing: '-0.4px' }}>{name}</div>
+            {contact && <div style={{ color: '#64748B', fontSize: 10, marginTop: 3 }}>{contact}</div>}
+          </div>
+        </div>
+      )}
+      <div style={{ fontSize: 11, color: '#475569', marginBottom: 14 }}>{new Date().toLocaleDateString('en-GB', { day: 'numeric', month: 'long', year: 'numeric' })}</div>
+      <div style={{ marginBottom: 18, fontSize: 11 }}><strong>{company}</strong><br />{role}</div>
+      <div style={{ whiteSpace: 'pre-wrap' }}>
+        {paragraphs.map((paragraph, index) => <p key={index} style={{ margin: index ? '0 0 15px' : '0 0 15px' }}>{paragraph}</p>)}
+      </div>
+    </div>
+  )
+
+  return (
+    <div style={{ minHeight: 420, border: '0.5px solid var(--border)', borderRadius: 7, overflow: 'hidden', background: '#fff', boxShadow: '0 4px 16px rgba(15,23,42,0.08)', fontFamily }}>
+      {executive && (
+        <div style={{ background: accent, padding: `${padding - 4}px ${padding}px 22px`, color: '#fff' }}>
+          <div style={{ fontSize: 25, fontWeight: 800, letterSpacing: '-0.5px' }}>{name}</div>
+          {contact && <div style={{ marginTop: 5, fontSize: 10, color: 'rgba(255,255,255,0.82)' }}>{contact}</div>}
+        </div>
+      )}
+      {sidebar ? (
+        <div style={{ display: 'flex', minHeight: 420 }}>
+          <aside style={{ width: 132, flexShrink: 0, background: accent, color: '#fff', padding: '24px 14px' }}>
+            <div style={{ fontSize: 16, fontWeight: 700, lineHeight: 1.2 }}>{name}</div>
+            <div style={{ marginTop: 18, paddingTop: 7, borderTop: '1px solid rgba(255,255,255,0.25)', fontSize: 9, lineHeight: 1.6, color: 'rgba(255,255,255,0.85)', wordBreak: 'break-word' }}>{contact}</div>
+          </aside>
+          {letter}
+        </div>
+      ) : letter}
+    </div>
   )
 }

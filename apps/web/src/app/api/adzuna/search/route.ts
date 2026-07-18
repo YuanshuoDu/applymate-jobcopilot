@@ -5,6 +5,7 @@
  */
 import { NextRequest } from 'next/server'
 import { requireAuth, isErrorResponse, ok, err } from '@/lib/api-helpers'
+import { getDiscoveryApiKeys } from '@/lib/discovery-api-keys'
 import { truncate, fmtSalary as fmtSal } from '@/lib/utils'
 
 const ADZUNA_BASE = 'https://api.adzuna.com/v1/api/jobs'
@@ -19,10 +20,9 @@ export async function GET(req: NextRequest) {
   const auth = await requireAuth(req)
   if (isErrorResponse(auth)) return auth
 
-  const appId  = process.env.ADZUNA_APP_ID
-  const appKey = process.env.ADZUNA_APP_KEY
+  const { adzunaAppId: appId, adzunaAppKey: appKey } = await getDiscoveryApiKeys(auth.userId)
   if (!appId || !appKey) {
-    return err('Adzuna API not configured. Add ADZUNA_APP_ID and ADZUNA_APP_KEY to .env.local.', 501)
+    return err('Adzuna is not configured. Add credentials in Settings → Keys & connections.', 501)
   }
 
   const { searchParams } = req.nextUrl

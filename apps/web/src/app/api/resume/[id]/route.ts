@@ -31,7 +31,12 @@ export async function PATCH(req: NextRequest, { params }: Params) {
   const body = await req.json().catch(() => null)
   if (!body) return err('Invalid JSON body')
 
-  const { name, content, templateId, templateOptions, isDefault } = body
+  const { name, content, templateId, templateOptions, isDefault, targetJobId, unlinkJob } = body
+
+  if (targetJobId !== undefined && targetJobId !== null) {
+    const job = await db.job.findFirst({ where: { id: targetJobId, userId: auth.userId } })
+    if (!job) return err('Invalid job', 400)
+  }
 
   // Auto-create a version snapshot only if content actually changed
   const contentChanged = content !== undefined && JSON.stringify(content) !== JSON.stringify(existing.content)
@@ -65,6 +70,13 @@ export async function PATCH(req: NextRequest, { params }: Params) {
     })
   }
 
+  if (unlinkJob) {
+    await db.job.updateMany({
+      where: { userId: auth.userId, finalResumeId: id },
+      data:  { finalResumeId: null },
+    })
+  }
+
   const resume = await db.resume.update({
     where: { id },
     data: {
@@ -73,6 +85,7 @@ export async function PATCH(req: NextRequest, { params }: Params) {
       ...(templateId      !== undefined ? { templateId }      : {}),
       ...(templateOptions !== undefined ? { templateOptions } : {}),
       ...(isDefault       !== undefined ? { isDefault }       : {}),
+      ...(unlinkJob || targetJobId !== undefined ? { targetJobId: unlinkJob ? null : targetJobId } : {}),
     },
   })
 
