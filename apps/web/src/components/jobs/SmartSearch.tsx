@@ -3,7 +3,7 @@
 import React, { useState, useRef, useCallback, useEffect } from 'react'
 import { CompanyLogo, ScorePill, useToast } from '@/components/ui'
 import { apiMutate } from '@/lib/hooks'
-import type { Job, ResumeListItem } from '@/lib/types'
+import type { Job } from '@/lib/types'
 import { extractSearchQuery } from './search-query'
 
 // ── Types ────────────────────────────────────────────────────────────────────
@@ -144,11 +144,10 @@ async function saveAndScore(r: JobResult, onSaved: (id: string, dbId: string) =>
   onSaved(r.id, job.id)
   if (!r.description) return
   try {
-    const lr = await fetch('/api/resume'); if (!lr.ok) return
-    const resumes: ResumeListItem[] = await lr.json(); if (!resumes.length) return
-    const pick = resumes.find(v => v.isDefault) ?? resumes[0]
-    const fr = await fetch(`/api/resume/${pick.id}`); if (!fr.ok) return
-    const full = await fr.json(); if (!full?.content) return
+    // The default endpoint already falls back to a user's latest resume, so
+    // avoid serially loading the list and then the selected document.
+    const resumeResponse = await fetch('/api/resume/default'); if (!resumeResponse.ok) return
+    const full = await resumeResponse.json(); if (!full?.content) return
     const sr = await fetch('/api/ai/score', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ resumeContent: full.content, jobTitle: r.title, jobDescription: r.description.slice(0, 2000), keySkills: r.keySkills ?? [] }) })
     if (!sr.ok) return
     const sd = await sr.json() as { score: number; matchedKeywords: string[]; missingKeywords: string[] }
@@ -180,6 +179,8 @@ export function SmartSearch({ onJobSaved }: { onJobSaved?: () => void }) {
   const toast = useToast()
   const inputRef = useRef<HTMLInputElement>(null)
   const lastSearch = useRef(loadLast())
+  const searchControllerRef = useRef<AbortController | null>(null)
+  const searchRequestRef = useRef(0)
 
   const [q,           setQ]           = useState(lastSearch.current?.q ?? '')
   const [filters,     setFilters]     = useState<Filters>(lastSearch.current?.filters ?? DEFAULT_FILTERS)
@@ -213,6 +214,8 @@ export function SmartSearch({ onJobSaved }: { onJobSaved?: () => void }) {
     JSON.stringify(filters) !== JSON.stringify(lastSearchedRef.current.filters)
   )
 
+  useEffect(() => () => searchControllerRef.current?.abort(), [])
+
   function setFilter<K extends keyof Filters>(k: K, v: Filters[K]) { setFilters(p => ({ ...p, [k]: v })) }
 
   const hasFilters = !!(filters.location || filters.remote || filters.jobType || filters.datePosted !== 'any' || filters.experience || filters.salaryMin || filters.salaryMax)
@@ -228,6 +231,11 @@ export function SmartSearch({ onJobSaved }: { onJobSaved?: () => void }) {
 
   const runSearch = useCallback(async (query: string, f: Filters) => {
     if (!query.trim()) return
+    const requestId = searchRequestRef.current + 1
+    searchRequestRef.current = requestId
+    searchControllerRef.current?.abort()
+    const controller = new AbortController()
+    searchControllerRef.current = controller
     setSearching(true); setSearched(true); setSavedIds(new Set()); setScores({}); setExpandedId(null); setPage(1)
     const p = new URLSearchParams({ q: query })
     if (f.location)           p.set('location', f.location)
@@ -238,9 +246,10 @@ export function SmartSearch({ onJobSaved }: { onJobSaved?: () => void }) {
     if (f.salaryMin)          p.set('salaryMin', f.salaryMin)
     if (f.salaryMax)          p.set('salaryMax', f.salaryMax)
     try {
-      const res = await fetch(`/api/search/unified?${p}`)
+      const res = await fetch(`/api/search/unified?${p}`, { signal: controller.signal })
       const json = await res.json()
       if (!res.ok) throw new Error(json.error ?? 'Search failed')
+      if (requestId !== searchRequestRef.current) return
       setResults(json.jobs ?? [])
       setMeta(json.meta ?? null)
       lastSearchedRef.current = { q: query.trim(), filters: f }
@@ -248,9 +257,13 @@ export function SmartSearch({ onJobSaved }: { onJobSaved?: () => void }) {
       addRecent(query.trim())
       setRecent(loadRecent())
     } catch (e) {
+      if (e instanceof DOMException && e.name === 'AbortError') return
+      if (requestId !== searchRequestRef.current) return
       toast.error('Search failed', (e as Error).message)
       setResults([])
-    } finally { setSearching(false) }
+    } finally {
+      if (requestId === searchRequestRef.current) setSearching(false)
+    }
   }, [toast])
 
   // triggerSearch: stable reference used by pill removal callbacks

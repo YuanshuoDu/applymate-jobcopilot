@@ -3,7 +3,7 @@
 import React, { useState } from 'react'
 import { Btn, CompanyLogo, INPUT_STYLE, ScorePill, useToast } from '@/components/ui'
 import { apiMutate } from '@/lib/hooks'
-import type { Job, ResumeListItem } from '@/lib/types'
+import type { Job } from '@/lib/types'
 
 interface AdzunaResult {
   id:            string
@@ -56,15 +56,9 @@ async function runAiScore(
   jobDescription: string,
 ): Promise<number | null> {
   try {
-    // 1. Get resume list, pick default
-    const listRes = await fetch('/api/resume')
-    if (!listRes.ok) return null
-    const resumes: ResumeListItem[] = await listRes.json()
-    if (!resumes.length) return null
-    const pick = resumes.find(r => r.isDefault) ?? resumes[0]
-
-    // 2. Get full resume content
-    const resumeRes = await fetch(`/api/resume/${pick.id}`)
+    // The endpoint resolves the user's default resume (or latest fallback)
+    // directly, avoiding a serial list-then-detail request pair.
+    const resumeRes = await fetch('/api/resume/default')
     if (!resumeRes.ok) return null
     const resumeFull = await resumeRes.json()
     if (!resumeFull?.content) return null

@@ -11,6 +11,7 @@ import { useI18n } from '@/lib/i18n'
 interface SidebarProps {
   active:  Page
   onNav:   (p: Page) => void
+  onNavIntent?: (p: Page) => void
   session: Session | null
   jobCount?: number
   notificationControl?: React.ReactNode
@@ -49,7 +50,7 @@ export function getSidebarNavItems(t: (key: string) => string): SidebarNavItem[]
   ]
 }
 
-export function Sidebar({ active, onNav, session, jobCount: jobCountProp, notificationControl, notificationPanel, accountMenuOpen = false, onAccountMenuToggle = () => {}, onDismissSidebarPopovers = () => {} }: SidebarProps) {
+export function Sidebar({ active, onNav, onNavIntent, session, jobCount: jobCountProp, notificationControl, notificationPanel, accountMenuOpen = false, onAccountMenuToggle = () => {}, onDismissSidebarPopovers = () => {} }: SidebarProps) {
   const user = session?.user
   const { t } = useI18n()
 
@@ -60,9 +61,22 @@ export function Sidebar({ active, onNav, session, jobCount: jobCountProp, notifi
 
   useEffect(() => {
     fetch('/api/gmail/unread').then(r => r.json()).then(d => { if (d.hasGmail) setGmailUnread(d.unread) }).catch(() => {})
-    fetch('/api/jobs?pageSize=1').then(r => r.json()).then(d => { if (typeof d.total === 'number') setJobCount(d.total) }).catch(() => {})
-    fetch('/api/me').then(r => r.json()).then(d => { if (d.plan) setUserPlan(d.plan) }).catch(() => {})
   }, [])
+
+  useEffect(() => {
+    // AppShell owns the shared count and keeps it fresh on job changes/focus.
+    // Only fetch here when Sidebar is reused without that prop.
+    if (jobCountProp === undefined) {
+      fetch('/api/jobs?pageSize=1').then(r => r.json()).then(d => { if (typeof d.total === 'number') setJobCount(d.total) }).catch(() => {})
+    }
+  }, [jobCountProp])
+
+  useEffect(() => {
+    // Plan information is only visible in the account menu, so avoid placing a
+    // second /api/me request on the critical page-navigation path.
+    if (!accountMenuOpen || userPlan) return
+    fetch('/api/me').then(r => r.json()).then(d => { if (d.plan) setUserPlan(d.plan) }).catch(() => {})
+  }, [accountMenuOpen, userPlan])
 
   useEffect(() => {
     if (!accountMenuOpen) return
@@ -112,7 +126,7 @@ export function Sidebar({ active, onNav, session, jobCount: jobCountProp, notifi
       {/* ── Nav ── */}
       <nav style={{ flex: 1, padding: '10px 8px', display: 'flex', flexDirection: 'column', gap: 2, overflowY: 'auto' }}>
         {NAV_ITEMS.map(item => (
-          <button key={item.id} className="app-nav-button" data-active={active === item.id} onClick={() => onNav(item.id)} style={{
+          <button key={item.id} className="app-nav-button" data-active={active === item.id} onClick={() => onNav(item.id)} onMouseEnter={() => onNavIntent?.(item.id)} onFocus={() => onNavIntent?.(item.id)} style={{
             display: 'flex', alignItems: 'center', gap: 9,
             padding: '8px 10px 8px 14px', borderRadius: 8, border: 'none', cursor: 'pointer',
             background: 'transparent',

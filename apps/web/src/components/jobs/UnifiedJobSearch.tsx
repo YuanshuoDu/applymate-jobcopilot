@@ -1,9 +1,9 @@
 'use client'
 
-import React, { useState, useCallback } from 'react'
+import React, { useState, useCallback, useMemo } from 'react'
 import { Btn, CompanyLogo, INPUT_STYLE, ScorePill, useToast } from '@/components/ui'
 import { apiMutate } from '@/lib/hooks'
-import type { Job, ResumeListItem } from '@/lib/types'
+import type { Job } from '@/lib/types'
 
 // ── Shared types ──────────────────────────────────────────────────────────────
 
@@ -45,12 +45,7 @@ async function saveAndScore(
 
   if (!r.description) return
   try {
-    const listRes = await fetch('/api/resume')
-    if (!listRes.ok) return
-    const resumes: ResumeListItem[] = await listRes.json()
-    if (!resumes.length) return
-    const pick      = resumes.find(rv => rv.isDefault) ?? resumes[0]
-    const resumeRes = await fetch(`/api/resume/${pick.id}`)
+    const resumeRes = await fetch('/api/resume/default')
     if (!resumeRes.ok) return
     const full = await resumeRes.json()
     if (!full?.content) return
@@ -232,9 +227,10 @@ function SourcePanel({ fetchJobs, formFields, placeholder, q: qProp, onJobSaved,
   const updateForm = useCallback((key: string, val: string) => {
     setFormState(prev => ({ ...prev, [key]: val }))
   }, [])
+  const formContextValue = useMemo(() => ({ formState, updateForm }), [formState, updateForm])
 
   return (
-    <FormStateContext.Provider value={{ formState, updateForm }}>
+    <FormStateContext.Provider value={formContextValue}>
       <form onSubmit={handleSearch} style={{ padding: '0 0 16px', display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'flex-end' }}>
         {formFields}
         <button type="submit" disabled={searching || !qProp.trim()} style={{

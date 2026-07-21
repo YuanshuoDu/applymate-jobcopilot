@@ -5,7 +5,6 @@ import { nextRunAtFromCron } from "@/lib/agent/automation-schedule"
 import { updateAgentSession } from "@/lib/agent/session/repository"
 import { loadUserAiConfig } from "@/lib/model-router"
 import { tailorResumeForAgent } from "@/lib/agent/resume-tailoring"
-import { enqueueApplyTask } from "@/lib/apply-queue-client"
 
 interface RouteCtx {
   params: Promise<{ id: string }>
@@ -273,24 +272,20 @@ export async function POST(req: NextRequest, ctx: RouteCtx) {
     const job = await db.job.findFirst({ where: { id: payload.jobId, userId: auth.userId }, select: { id: true, company: true, role: true, url: true, status: true } })
     if (!resume || !job) return err('The tailored resume or job is no longer available.', 404)
     if (job.status === 'applied') return err('This job has already been submitted.', 409)
-    let applyTaskId: string | null = null
-    if (job.url) {
-      applyTaskId = await enqueueApplyTask({
-        jobId: job.id, userId: auth.userId, applyUrl: job.url, personaId: auth.userId, resumePath: '', dryRun: false,
-      })
-    }
     await db.job.update({ where: { id: job.id }, data: {
       finalResumeId: resume.id,
       status: 'review',
-      analysisNote: applyTaskId ? `[Executor queued] Apply task ${applyTaskId}; waiting for Auditor result.` : '[Executor blocked] Missing application URL.',
+      analysisNote: job.url
+        ? '[Application ready] Open the employer form, use the ApplyMate extension to fill it, then review and submit it yourself.'
+        : '[Application ready] Missing application URL.',
     } })
     const event = await db.agentTranscriptEvent.create({
       data: {
-        sessionId: id, taskId: null, type: applyTaskId ? 'application_queued' : 'resume_finalized', speaker: applyTaskId ? 'Executor' : 'Reviewer', title: applyTaskId ? 'Application queued' : 'Resume confirmed',
-        body: applyTaskId
-          ? `${resume.name} is confirmed for ${job.company} · ${job.role}. Executor queued autonomous form filling; Auditor will report the worker result.`
-          : `${resume.name} is confirmed and linked to ${job.company} · ${job.role}, but this job has no application URL for Executor.`,
-        data: { resume: { id: resume.id, name: resume.name }, job, applyTaskId }, durationMs: null,
+        sessionId: id, taskId: null, type: 'resume_finalized', speaker: 'Reviewer', title: 'Application pack ready',
+        body: job.url
+          ? `${resume.name} is confirmed for ${job.company} · ${job.role}. Open the employer form, let the extension fill the fields, review everything, then submit it yourself.`
+          : `${resume.name} is confirmed and linked to ${job.company} · ${job.role}, but this job has no application URL.`,
+        data: { resume: { id: resume.id, name: resume.name }, job }, durationMs: null,
       },
     })
     await updateAgentSession(db, { sessionId: id, status: 'completed', completedAt: new Date() })

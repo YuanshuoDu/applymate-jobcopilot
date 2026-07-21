@@ -1,6 +1,6 @@
 'use client'
 
-import React, { useEffect, useState } from 'react'
+import React, { useEffect, useMemo, useState } from 'react'
 import {
   ArrowRight, BriefcaseBusiness, CalendarDays, Check, ChevronDown, Circle,
   Eye, FileText, MoreVertical, Send, Sparkles, Target, X,
@@ -170,8 +170,13 @@ export function DashboardPage() {
   const { navigate } = useNav()
   const [weekOffset, setWeekOffset] = useState(0)
   const [dateMenuOpen, setDateMenuOpen] = useState(false)
-  const selectedRange = getWeekRange(weekOffset)
-  const dashboardUrl = `/api/dashboard?from=${selectedRange.start.toISOString()}&to=${selectedRange.end.toISOString()}`
+  // Keep the request key stable across renders. Recreating dates here caused
+  // a new URL (and therefore a new dashboard request) after every state update.
+  const selectedRange = useMemo(() => getWeekRange(weekOffset), [weekOffset])
+  const dashboardUrl = useMemo(
+    () => `/api/dashboard?from=${selectedRange.start.toISOString()}&to=${selectedRange.end.toISOString()}`,
+    [selectedRange],
+  )
   const { data, loading, error, refetch } = useApi<DashboardData>(dashboardUrl)
   const [profilePromptDismissed, setProfilePromptDismissed] = useState(false)
 

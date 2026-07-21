@@ -19,12 +19,39 @@ export async function GET(request: Request) {
 
   const userId = auth.userId
 
-  // Pipeline counts grouped by status
-  const statusGroups = await db.job.groupBy({
-    by: ['status'],
-    where: { userId },
-    _count: { status: true },
-  })
+  // These queries do not depend on each other. Running them concurrently keeps
+  // dashboard navigation bounded by the slowest query instead of their sum.
+  const params = new URL(request.url).searchParams
+  const defaultStart = new Date()
+  defaultStart.setDate(defaultStart.getDate() - 7)
+  const defaultEnd = new Date()
+  const rangeStart = getDateParam(params.get('from'), defaultStart)
+  const rangeEnd = getDateParam(params.get('to'), defaultEnd, true)
+  const todayEnd = new Date()
+  todayEnd.setHours(23, 59, 59, 999)
+
+  const [statusGroups, thisWeek, followUpsDue, agentConfig, recentJobs, activity, resumeCount] = await Promise.all([
+    db.job.groupBy({
+      by: ['status'],
+      where: { userId },
+      _count: { status: true },
+    }),
+    db.job.count({ where: { userId, appliedAt: { gte: rangeStart, lte: rangeEnd } } }),
+    db.job.findMany({
+      where: { userId, followUpAt: { lte: todayEnd } },
+      select: { id: true, company: true, role: true, status: true, followUpAt: true },
+      orderBy: { followUpAt: 'asc' },
+      take: 10,
+    }),
+    db.agentConfig.findUnique({ where: { userId } }),
+    db.job.findMany({
+      where: { userId, status: { in: ['applied', 'review', 'interview', 'offer', 'rejected'] } },
+      orderBy: { updatedAt: 'desc' },
+      take: 5,
+    }),
+    db.activity.findMany({ where: { userId }, orderBy: { createdAt: 'desc' }, take: 8 }),
+    db.resume.count({ where: { userId } }),
+  ])
 
   const pipeline: Record<string, number> = {}
   for (const g of statusGroups) {
@@ -39,30 +66,7 @@ export async function GET(request: Request) {
   const offers     = pipeline.offer      ?? 0
   const rejected   = pipeline.rejected   ?? 0
 
-  // Jobs applied inside the selected dashboard week. Defaults to the last 7 days
-  // to preserve the original dashboard behaviour for existing callers.
-  const params = new URL(request.url).searchParams
-  const defaultStart = new Date()
-  defaultStart.setDate(defaultStart.getDate() - 7)
-  const defaultEnd = new Date()
-  const rangeStart = getDateParam(params.get('from'), defaultStart)
-  const rangeEnd = getDateParam(params.get('to'), defaultEnd, true)
-  const thisWeek = await db.job.count({
-    where: { userId, appliedAt: { gte: rangeStart, lte: rangeEnd } },
-  })
-
-  // Follow-ups due today or overdue (followUpAt <= end of today)
-  const todayEnd = new Date()
-  todayEnd.setHours(23, 59, 59, 999)
-  const followUpsDue = await db.job.findMany({
-    where: { userId, followUpAt: { lte: todayEnd } },
-    select: { id: true, company: true, role: true, status: true, followUpAt: true },
-    orderBy: { followUpAt: 'asc' },
-    take: 10,
-  })
-
   // Agent settings control which saved roles are genuinely high-match.
-  const agentConfig = await db.agentConfig.findUnique({ where: { userId } })
   const minMatchScore = agentConfig?.minMatchScore ?? 75
 
   // Saved roles that meet the user's configured match threshold.
@@ -72,26 +76,6 @@ export async function GET(request: Request) {
     orderBy: { score: { sort: 'desc', nulls: 'last' } },
     take: 8,
   })
-
-  // Recent jobs (last 5 non-saved changes)
-  const recentJobs = await db.job.findMany({
-    where: {
-      userId,
-      status: { in: ['applied', 'review', 'interview', 'offer', 'rejected'] },
-    },
-    orderBy: { updatedAt: 'desc' },
-    take: 5,
-  })
-
-  // Recent activity
-  const activity = await db.activity.findMany({
-    where: { userId },
-    orderBy: { createdAt: 'desc' },
-    take: 8,
-  })
-
-  // First-resume check (for onboarding)
-  const resumeCount = await db.resume.count({ where: { userId } })
 
   return ok({
     stats: { total, saved, applied, inProgress, interviews, offers, rejected, thisWeek },

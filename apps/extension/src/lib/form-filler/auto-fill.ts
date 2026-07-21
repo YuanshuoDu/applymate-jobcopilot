@@ -52,6 +52,27 @@ export function fillFields(fields: FilledField[]): { success: boolean; failed: s
   return { success: failed.length === 0, failed, filled }
 }
 
+/**
+ * Opens the browser's native file picker for a scanned upload field. Browsers
+ * deliberately do not let extensions select a local file programmatically, so
+ * the candidate chooses the reviewed PDF in this picker.
+ */
+export function openUploadPicker(fieldId: string, onSelected: (fileName: string) => void): FillResult {
+  const cleanId = fieldId.replace(/^iframe\|[^|]+\|/, '')
+  for (const doc of getAllDocs()) {
+    for (const candidate of Array.from(doc.querySelectorAll('input[type="file"]'))) {
+      const input = candidate as HTMLInputElement
+      const id = generateId(input)
+      if (id !== fieldId && id !== cleanId) continue
+      input.addEventListener('change', () => onSelected(input.files?.[0]?.name ?? ''), { once: true })
+      input.click()
+      highlightElement(input)
+      return { fieldId, success: true }
+    }
+  }
+  return { fieldId, success: false, error: 'Upload field not found' }
+}
+
 // ── Element Resolution ────────────────────────────────────────
 
 /**

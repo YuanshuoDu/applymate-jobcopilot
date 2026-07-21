@@ -30,7 +30,7 @@ const SEC_LABELS: Record<string, string> = {
 }
 const SEC_ORDER = ['Summary', 'Skills', 'Experience', 'Education', 'Projects']
 
-export function AiPanel({ selectedJob, scoreResult, suggestions, scoring, suggesting, noJobSelected, onApplySuggestion, onAnalyze, onAddKeyword, onApplyTargeted, onEditSection, currentSummary, currentSkills, contentChangedSinceAnalysis }: {
+export function AiPanel({ selectedJob, scoreResult, suggestions, scoring, suggesting, noJobSelected, onApplySuggestion, onAnalyze, onAddKeyword, onApplyTargeted, onEditSection, currentSummary, currentSkills, contentChangedSinceAnalysis, onAudit }: {
   selectedJob:       Job | null
   scoreResult:                  ScoreResult | null
   suggestions:                  Suggestion[]
@@ -45,6 +45,7 @@ export function AiPanel({ selectedJob, scoreResult, suggestions, scoring, sugges
   currentSummary?:              string
   currentSkills?:               string[]
   contentChangedSinceAnalysis?: boolean
+  onAudit?:                     () => void
 }) {
   const [suggestCollapsed, setSuggestCollapsed] = useState(false)
   const [scoresCollapsed,  setScoresCollapsed]  = useState(false)
@@ -287,6 +288,9 @@ export function AiPanel({ selectedJob, scoreResult, suggestions, scoring, sugges
           <span>Link a saved job in the editor, then AI will score the match and suggest improvements section by section.</span>
         </div>
       )}
+      <button onClick={onAudit} style={{ width: '100%', marginTop: 14, display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 6, fontSize: 11, color: 'var(--primary)', background: 'rgba(79,70,229,0.08)', border: '1px solid rgba(79,70,229,0.25)', borderRadius: 7, padding: '8px 10px', cursor: 'pointer', fontWeight: 600 }}>
+        ✓ Audit &amp; save resume
+      </button>
     </div>
   )
 }

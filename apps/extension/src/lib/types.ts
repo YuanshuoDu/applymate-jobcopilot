@@ -32,6 +32,10 @@ export interface SavedJob {
   source:    string | null
   createdAt: string
   url:       string | null
+  // The audited application package selected in My Jobs. The side panel uses
+  // this to avoid falling back to an unrelated, last-opened resume.
+  finalResumeId: string | null
+  finalCoverLetterId: string | null
 }
 
 export interface DashboardStats {
@@ -176,3 +180,6 @@ export type ExtMessage =
   | { type: 'REVISE_FORM'; instruction: string }
   | { type: 'APPLY_FIELD_VALUES'; fields: import('./form-filler/types').FilledField[] }
   | { type: 'APPLY_RESULT'; success: boolean; failedFields: string[] }
+  | { type: 'OPEN_UPLOAD_PICKER'; fieldId: string }
+  | { type: 'UPLOAD_PICKER_OPENED'; success: boolean; error?: string }
+  | { type: 'FILE_UPLOAD_CHANGED'; fieldId: string; fileName: string }

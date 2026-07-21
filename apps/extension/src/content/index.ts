@@ -10,6 +10,7 @@ import { tryInjectAutoFillButton, removeAutoFillButton, applyFieldValues, update
 import { mountDetailButtonContainer } from './detail-button-placement'
 import { detectAndScanForms } from '../lib/form-filler/detectors/detect'
 import { generateId } from '../lib/form-filler/form-scanner'
+import { openUploadPicker } from '../lib/form-filler/auto-fill'
 import type { ScrapedJob } from '@/lib/types'
 
 const BUTTON_ID   = 'applymate-save-btn'
@@ -207,6 +208,14 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (msg.type === 'READ_FIELD_VALUES') {
     const values = readCurrentFieldValues(msg.fieldIds ?? [])
     sendResponse({ type: 'FIELD_VALUES_RESULT', values })
+    return true
+  }
+
+  if (msg.type === 'OPEN_UPLOAD_PICKER') {
+    const result = openUploadPicker(msg.fieldId, (fileName) => {
+      chrome.runtime.sendMessage({ type: 'FILE_UPLOAD_CHANGED', fieldId: msg.fieldId, fileName }).catch(() => {})
+    })
+    sendResponse({ type: 'UPLOAD_PICKER_OPENED', success: result.success, error: result.error })
     return true
   }
 

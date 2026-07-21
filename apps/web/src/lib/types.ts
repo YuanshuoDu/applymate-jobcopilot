@@ -306,6 +306,28 @@ export interface Suggestion {
   applied:  boolean
 }
 
+// ── Application audit ───────────────────────────────────────────────────────
+
+export type ApplicationAuditSeverity = 'pass' | 'warning' | 'critical'
+export type ApplicationAuditVerdict = 'pass' | 'needs_review' | 'blocked'
+
+export interface ApplicationAuditFinding {
+  area: 'resume' | 'cover_letter' | 'job_match'
+  severity: ApplicationAuditSeverity
+  title: string
+  evidence: string
+  action: string
+}
+
+export interface ApplicationAudit {
+  verdict: ApplicationAuditVerdict
+  summary: string
+  matchScore: number
+  findings: ApplicationAuditFinding[]
+  source: 'parent_resume' | 'previous_version' | 'current_resume'
+  auditedAt: string
+}
+
 // ── UI-only ────────────────────────────────────────────────────────────────────
 export type Page =
   | 'dashboard'

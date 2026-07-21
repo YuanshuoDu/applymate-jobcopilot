@@ -41,6 +41,7 @@ export function FormFillerView({ settings, pendingFields, onFieldsConsumed, scan
   const [reviseInstruction, setReviseInstruction] = useState('')
   const [revising, setRevising] = useState(false)
   const [injectPermissionHost, setInjectPermissionHost] = useState<string | null>(null)
+  const [uploadedFiles, setUploadedFiles] = useState<Record<string, string>>({})
 
   // ── Persona Save Prompt ──────────────────────────────────────
   const [personaMatches, setPersonaMatches] = useState<Array<{
@@ -177,6 +178,16 @@ export function FormFillerView({ settings, pendingFields, onFieldsConsumed, scan
     setErrorMsg('')
     setInjectPermissionHost(null)
   }, [scanTrigger])
+
+  useEffect(() => {
+    const listener = (message: { type?: string; fieldId?: string; fileName?: string }) => {
+      if (message.type === 'FILE_UPLOAD_CHANGED' && message.fieldId) {
+        setUploadedFiles(files => ({ ...files, [message.fieldId!]: message.fileName || 'File selected' }))
+      }
+    }
+    chrome.runtime.onMessage.addListener(listener)
+    return () => chrome.runtime.onMessage.removeListener(listener)
+  }, [])
 
   // Process pending fields passed from SidePanel (avoids race condition on mount)
   useEffect(() => {
@@ -386,6 +397,13 @@ export function FormFillerView({ settings, pendingFields, onFieldsConsumed, scan
       })
     })
   }, [filledFields])
+
+  const handleUpload = useCallback(async (fieldId: string) => {
+    const [tab] = await chrome.tabs.query({ active: true, currentWindow: true })
+    if (!tab?.id) return
+    const response = await chrome.tabs.sendMessage(tab.id, { type: 'OPEN_UPLOAD_PICKER', fieldId }) as { success?: boolean; error?: string } | undefined
+    if (!response?.success) setErrorMsg(response?.error ?? 'Could not open the file picker.')
+  }, [])
 
   const handleRequestPermission = useCallback(async () => {
     try {
@@ -668,6 +686,7 @@ export function FormFillerView({ settings, pendingFields, onFieldsConsumed, scan
   }
 
   if (viewState === 'done') {
+    const uploadFields = fields.filter(field => field.type === 'file')
     return (
       <div style={{ padding: 16 }}>
         <div style={{ textAlign: 'center', padding: '24px 0' }}>
@@ -677,6 +696,25 @@ export function FormFillerView({ settings, pendingFields, onFieldsConsumed, scan
             {appliedCount} fields filled — review and submit manually.
           </div>
         </div>
+
+        {uploadFields.length > 0 && (
+          <div style={{ background: C.card, border: `1px solid ${C.primary}35`, borderRadius: 10, padding: 12, marginBottom: 12 }}>
+            <div style={{ fontSize: 12, fontWeight: 700, color: C.text, marginBottom: 4 }}>Attach reviewed documents</div>
+            <div style={{ fontSize: 10, color: C.muted, lineHeight: 1.5, marginBottom: 10 }}>
+              Choose your audited resume or cover-letter PDF in Chrome&apos;s file picker. ApplyMate cannot select local files for you.
+            </div>
+            {uploadFields.map(field => (
+              <div key={field.id} style={{ display: 'flex', alignItems: 'center', gap: 8, marginTop: 8 }}>
+                <span style={{ flex: 1, fontSize: 11, color: C.text }}>{field.label || 'Document upload'}{field.required ? ' *' : ''}</span>
+                {uploadedFiles[field.id] ? (
+                  <span style={{ fontSize: 10, color: C.green, maxWidth: 120, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>✓ {uploadedFiles[field.id]}</span>
+                ) : (
+                  <button onClick={() => handleUpload(field.id)} style={{ ...btnStyle(C.primary), fontSize: 10, padding: '6px 9px' }}>Choose file</button>
+                )}
+              </div>
+            ))}
+          </div>
+        )}
 
         {/* Persona Save Prompt */}
         {personaMatches.length > 0 && (

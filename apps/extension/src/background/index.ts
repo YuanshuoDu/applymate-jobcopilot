@@ -200,6 +200,9 @@ async function handleMessage(
       return { ok: true }
     }
 
+    case 'FILE_UPLOAD_CHANGED':
+      return { ok: true }
+
     default:
       return { error: 'Unknown message type' }
   }

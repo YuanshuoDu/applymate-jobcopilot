@@ -2,10 +2,11 @@
 
 import { useEffect, useMemo, useState } from 'react'
 import { AlertTriangle, Check, FileCheck2, FileText, Link2, LoaderCircle, Sparkles, X } from 'lucide-react'
-import type { Job } from '@/lib/types'
+import { ResumeRenderer } from '@/components/resume/ResumeRenderer'
+import type { ApplicationAudit, Job, ResumeContent, TemplateOptions } from '@/lib/types'
 
 type ReadinessItem = {
-  id: 'suggestions' | 'template' | 'cover-letter' | 'job' | 'copy'
+  id: 'suggestions' | 'template' | 'cover-letter' | 'job' | 'audit' | 'copy'
   label: string
   detail: string
   complete: boolean
@@ -20,11 +21,16 @@ type Props = {
   pendingSuggestions: number
   isDirty: boolean
   packReady: boolean
+  resumeContent: ResumeContent
+  templateId: string
+  templateOptions: TemplateOptions
+  coverLetterContent: string | null
   onClose: () => void
   onReviewSuggestions: () => void
   onCreateCoverLetter: () => void
   onLinkJob: () => void
-  onConfirm: () => Promise<boolean>
+  onAudit: () => Promise<ApplicationAudit | null>
+  onConfirm: (audit: ApplicationAudit) => Promise<boolean>
   onDownload: () => Promise<void>
 }
 
@@ -33,13 +39,15 @@ const icons = {
   template: FileText,
   'cover-letter': FileCheck2,
   job: Link2,
+  audit: FileCheck2,
   copy: FileCheck2,
 }
 
 export function FinalConfirmDialog({
-  job, resumeName, templateName, pendingSuggestions, isDirty, packReady,
-  onClose, onReviewSuggestions, onCreateCoverLetter, onLinkJob, onConfirm, onDownload,
+  job, resumeName, templateName, pendingSuggestions, isDirty, packReady, resumeContent, templateId, templateOptions, coverLetterContent,
+  onClose, onReviewSuggestions, onCreateCoverLetter, onLinkJob, onAudit, onConfirm, onDownload,
 }: Props) {
+  const [audit, setAudit] = useState<ApplicationAudit | null>(null)
   const items = useMemo<ReadinessItem[]>(() => [
     {
       id: 'suggestions',
@@ -56,11 +64,17 @@ export function FinalConfirmDialog({
     },
     {
       id: 'cover-letter',
-      label: 'Checking cover letter (optional)',
-      detail: job?.finalCoverLetterId ? 'A final cover letter is linked to this role' : job ? 'Optional — create one if this application asks for it' : 'Optional — link a job to create one for this role',
-      // A cover letter is useful but not required to make a resume application-ready.
-      complete: true,
-      action: job && !job.finalCoverLetterId ? 'Create now' : undefined,
+      label: 'Checking final cover letter',
+      detail: coverLetterContent ? 'A matching final cover letter is linked and will be audited against this resume.' : job ? 'Select a final cover letter made for this resume version before confirming.' : 'Link a job to create and select a cover letter.',
+      complete: Boolean(coverLetterContent),
+      action: job && !coverLetterContent ? 'Create now' : undefined,
+    },
+    {
+      id: 'audit',
+      label: 'Independent Auditor review',
+      detail: audit ? audit.summary : 'Compares the final resume and cover letter with the pre-tailoring resume and job description.',
+      complete: audit?.verdict === 'pass',
+      blocking: true,
     },
     {
       id: 'job',
@@ -76,7 +90,7 @@ export function FinalConfirmDialog({
       complete: packReady,
       blocking: false,
     },
-  ], [isDirty, job, packReady, pendingSuggestions, templateName])
+  ], [audit, coverLetterContent, isDirty, job, packReady, pendingSuggestions, templateName])
 
   const [checkedCount, setCheckedCount] = useState(0)
   const [confirming, setConfirming] = useState(false)
@@ -90,12 +104,18 @@ export function FinalConfirmDialog({
 
   useEffect(() => setConfirmed(packReady), [packReady])
 
-  const unresolved = items.filter(item => !item.complete && item.blocking !== false)
-  const ready = checkedCount === items.length && unresolved.length === 0
+  const unresolvedBeforeAudit = items.filter(item => item.id !== 'audit' && !item.complete && item.blocking !== false)
+  const ready = checkedCount === items.length && unresolvedBeforeAudit.length === 0
 
   async function handleConfirm() {
     setConfirming(true)
-    const success = await onConfirm()
+    const nextAudit = await onAudit()
+    setAudit(nextAudit)
+    if (!nextAudit || nextAudit.verdict !== 'pass') {
+      setConfirming(false)
+      return
+    }
+    const success = await onConfirm(nextAudit)
     setConfirming(false)
     if (success) setConfirmed(true)
   }
@@ -134,7 +154,7 @@ export function FinalConfirmDialog({
                   <span>{item.detail}</span>
                 </div>
                 {checked && item.action && <button onClick={() => runAction(item)}>{item.action}</button>}
-                {checked && !item.action && <span className="final-confirm-status">{item.complete ? 'Completed' : item.blocking === false ? 'After confirm' : 'Needs review'}</span>}
+                {checked && !item.action && <span className="final-confirm-status">{item.id === 'audit' && confirming ? 'Auditing…' : item.complete ? 'Completed' : item.blocking === false ? 'After confirm' : 'Needs review'}</span>}
               </div>
             )
           })}
@@ -153,10 +173,22 @@ export function FinalConfirmDialog({
             <button className="final-confirm-secondary" onClick={onClose}>Back to edit</button>
             <button className="final-confirm-primary" disabled={!ready || confirming} onClick={() => void handleConfirm()}>
               {confirming ? <LoaderCircle size={16} /> : <Check size={16} />}
-              {confirming ? 'Confirming…' : 'Confirm & mark ready'}
+              {confirming ? 'Auditing final materials…' : audit?.verdict === 'needs_review' || audit?.verdict === 'blocked' ? 'Audit again' : 'Audit & confirm package'}
             </button>
           </>}
         </div>
+        {audit && audit.verdict !== 'pass' && (
+          <div className="final-confirm-audit-results">
+            <strong>{audit.verdict === 'blocked' ? 'Audit blocked confirmation' : 'Audit needs review'}</strong>
+            {audit.findings.filter(finding => finding.severity !== 'pass').map((finding, index) => (
+              <div key={`${finding.title}-${index}`}><b>{finding.title}</b><span>{finding.evidence} — {finding.action}</span></div>
+            ))}
+          </div>
+        )}
+        {confirmed && <div className="final-material-preview">
+          <div><strong>Final resume</strong><div className="final-material-preview-resume"><ResumeRenderer content={resumeContent} templateId={templateId} templateOptions={templateOptions} scale={0.42} /></div></div>
+          <div><strong>Final cover letter</strong><div className="final-material-preview-letter">{coverLetterContent ?? 'No final cover letter selected.'}</div></div>
+        </div>}
         {!confirmed && <p className="final-confirm-note">A confirmed copy is available to the writer agent and can be exported as PDF whenever you&apos;re ready to apply.</p>}
         <span className="final-confirm-resume-name">{resumeName}</span>
       </section>

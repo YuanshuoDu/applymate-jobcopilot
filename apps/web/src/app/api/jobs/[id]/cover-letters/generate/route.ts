@@ -7,7 +7,7 @@ import { NextRequest } from 'next/server'
 import { db } from '@/lib/db'
 import { prepareAiRoute, isErrorResponse, ok, err } from '@/lib/api-helpers'
 import { modelChat, stripFences, type AiConfig } from '@/lib/model-router'
-import type { ResumeContent } from '@/lib/types'
+import type { ApplicationAuditFinding, ResumeContent } from '@/lib/types'
 
 type Params = { params: Promise<{ id: string }> }
 
@@ -29,15 +29,17 @@ export async function POST(req: NextRequest, { params }: Params) {
   const body = await req.json().catch(() => null)
   if (!body) return err('Invalid JSON body')
 
-  const { resumeId, tone = 'professional' } = body as {
+  const { resumeId, tone = 'professional', preferProvidedResume = false, auditFindings = [] } = body as {
     resumeId: string
     tone?: string
+    preferProvidedResume?: boolean
+    auditFindings?: ApplicationAuditFinding[]
   }
 
   if (!resumeId) return err('resumeId is required')
 
   // Prefer finalResume if job has one, otherwise use provided resumeId
-  const effectiveResumeId = job.finalResumeId ?? resumeId
+  const effectiveResumeId = preferProvidedResume ? resumeId : (job.finalResumeId ?? resumeId)
 
   const resume = await db.resume.findFirst({
     where: { id: effectiveResumeId, userId: prep.userId },
@@ -70,6 +72,10 @@ export async function POST(req: NextRequest, { params }: Params) {
   const jobRole    = job.role
   const jobCompany = job.company
   const jobDesc    = job.description
+  const auditCorrections = Array.isArray(auditFindings)
+    ? auditFindings.filter(finding => finding.severity !== 'pass').slice(0, 6)
+      .map(finding => `- ${finding.area}: ${finding.title}. Required correction: ${finding.action}`)
+    : []
 
   const prompt = [
     'Write a cover letter for a job applicant.',
@@ -83,7 +89,8 @@ export async function POST(req: NextRequest, { params }: Params) {
     '',
     'Tone: ' + toneGuide,
     'Structure: ' + greeting + ' | hook | why this role | 2-3 achievements | CTA | Sincerely, / ' + name,
-    'Rules: 220–280 words, no filler like "I am writing to express my interest", quantify achievements.',
+    'Rules: 220–280 words, no filler like "I am writing to express my interest". Include a metric only when it is explicitly supported by the resume; never invent an achievement, qualification, or outcome.',
+    auditCorrections.length ? `AUDIT REPAIR NOTES (follow these while staying truthful):\n${auditCorrections.join('\n')}` : '',
     'Return ONLY the cover letter text.',
   ].filter(line => line !== undefined).join('\n')
 

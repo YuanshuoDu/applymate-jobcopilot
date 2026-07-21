@@ -15,7 +15,7 @@ import { useState, useEffect, useRef, useCallback } from 'react'
 import { getCurrentResumeId, setCurrentResumeId, setResumeDraft, clearResumeDraft } from '@/lib/storage'
 import {
   listResumes, getResume, updateResume, createResume,
-  scoreResume, suggestResume,
+  scoreResume, suggestResume, getRecentJobs,
 } from '@/lib/api'
 import type { ExtensionSettings, ScrapedJob, ResumeListItem, Resume, ResumeContent, TemplateOptions, ScoreResult, Suggestion } from '@/lib/types'
 
@@ -68,6 +68,18 @@ const ALL_SECTION_IDS = ['summary','experience','skills','education','languages'
 // ── Props ────────────────────────────────────────────────────────────────────────
 interface Props { settings: ExtensionSettings }
 
+function sameJobUrl(left: string, right: string): boolean {
+  try {
+    const normalize = (value: string) => {
+      const url = new URL(value)
+      return `${url.origin}${url.pathname.replace(/\/$/, '')}`
+    }
+    return normalize(left) === normalize(right)
+  } catch {
+    return left === right
+  }
+}
+
 // ── Root ─────────────────────────────────────────────────────────────────────────
 export function ResumeView({ settings }: Props) {
   const [resumes, setResumes] = useState<ResumeListItem[]>([])
@@ -82,6 +94,8 @@ export function ResumeView({ settings }: Props) {
   const [toast, setToast] = useState('')
   const [editMode, setEditMode] = useState(false)
   const [currentJob, setCurrentJob] = useState<ScrapedJob | null>(null)
+  const [auditedResumeId, setAuditedResumeId] = useState<string | null>(null)
+  const [packageStatus, setPackageStatus] = useState<'audited' | 'missing' | null>(null)
   const [scoreResult, setScoreResult] = useState<ScoreResult | null>(null)
   const [suggestions, setSuggestions] = useState<Suggestion[]>([])
   const [analyzing, setAnalyzing] = useState(false)
@@ -102,6 +116,31 @@ export function ResumeView({ settings }: Props) {
     chrome.runtime.onMessage.addListener(handler)
     return () => chrome.runtime.onMessage.removeListener(handler)
   }, [])
+
+  useEffect(() => { setAuditedResumeId(null); setPackageStatus(null) }, [currentJob?.url])
+
+  // A job opened in Chrome may have a different reviewed application package
+  // from the last resume viewed in the extension. Prefer the final, audited
+  // resume selected in My Jobs whenever the current page belongs to that job.
+  useEffect(() => {
+    if (!currentJob?.url || resumes.length === 0) return
+    void getRecentJobs(settings).then(jobs => {
+      const savedJob = jobs.find(job => job.url && sameJobUrl(job.url, currentJob.url))
+      const auditedResumeId = savedJob?.finalResumeId
+      if (!auditedResumeId || !resumes.some(item => item.id === auditedResumeId)) {
+        setPackageStatus('missing')
+        return
+      }
+      setAuditedResumeId(auditedResumeId)
+      setPackageStatus('audited')
+      if (auditedResumeId === activeId) return
+      setActiveId(auditedResumeId)
+      void loadResume(auditedResumeId)
+      showToast('Using this job’s audited resume')
+    }).catch(() => {
+      // The extension remains usable offline or before a job has been saved.
+    })
+  }, [currentJob?.url, resumes, activeId, settings])
 
   async function loadResumeList() {
     setLoadError('')
@@ -355,6 +394,8 @@ export function ResumeView({ settings }: Props) {
                 <div style={{ fontSize: 10, color: C.muted }}>{currentJob.company}{currentJob.location ? ` · ${currentJob.location}` : ''}</div>
               </div>
             </div>
+            {auditedResumeId === activeId && <div style={{ margin: '0 0 9px', fontSize: 10, fontWeight: 600, color: C.green }}>✓ Using the audited resume selected in My Jobs</div>}
+            {packageStatus === 'missing' && <div style={{ margin: '0 0 9px', fontSize: 10, fontWeight: 600, color: C.amber }}>No audited package for this job yet — the displayed resume is not ready to submit.</div>}
             <button onClick={handleAnalyze} disabled={analyzing} style={{ width: '100%', padding: '8px', borderRadius: 7, border: 'none', background: analyzing ? `${C.primary}80` : C.primary, color: '#fff', fontSize: 11, fontWeight: 600, cursor: analyzing ? 'default' : 'pointer', fontFamily: 'inherit' }}>
               {analyzing ? 'Analyzing...' : scoreResult ? 'Re-analyze Match' : 'Analyze Match'}
             </button>
