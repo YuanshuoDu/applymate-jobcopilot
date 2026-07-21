@@ -14,6 +14,7 @@ interface Props {
   templateOptions: TemplateOptions
   onClose:       () => void
   onSaved?:      (cl: CoverLetter) => void
+  onFinalized?:  (job: Job) => void
 }
 
 const TONES = ['professional', 'enthusiastic', 'concise'] as const
@@ -21,7 +22,7 @@ type Tone = typeof TONES[number]
 const LANGUAGES = ['en', 'de', 'fr', 'nl', 'es'] as const
 type CoverLetterLanguage = typeof LANGUAGES[number]
 
-export function CoverLetterPanel({ job, resumeContent, resumeName, templateId, templateName, templateOptions, onClose, onSaved }: Props) {
+export function CoverLetterPanel({ job, resumeContent, resumeName, templateId, templateName, templateOptions, onClose, onSaved, onFinalized }: Props) {
   const { t } = useI18n()
   const toast = useToast()
   const [confirm, ConfirmDialog] = useConfirm()
@@ -110,6 +111,7 @@ export function CoverLetterPanel({ job, resumeContent, resumeName, templateId, t
     const { data, error } = await apiMutate<Job>(`/api/jobs/${job.id}/assign`, 'PATCH', { finalCoverLetterId: activeId })
     setAssigning(false)
     if (data) {
+      onFinalized?.(data)
       toast.success(t('coverLetter.panel.setFinal'), `v${total - coverLetters.findIndex(c => c.id === activeId)} set as final`)
     } else {
       toast.error('Failed', error ?? 'Could not set as final')
@@ -485,7 +487,7 @@ export function CoverLetterPanel({ job, resumeContent, resumeName, templateId, t
   )
 }
 
-function CoverLetterPreview({
+export function CoverLetterPreview({
   content, applicant, fallbackName, company, role, templateId, templateOptions,
 }: {
   content: string

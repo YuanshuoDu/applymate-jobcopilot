@@ -1,11 +1,15 @@
 'use client'
 
 import React, { useMemo, useState, useEffect, useRef, useCallback } from 'react'
-import { Bookmark, Clock3, LayoutGrid, List, LoaderCircle, Search, Sparkles, Trash2, UsersRound } from 'lucide-react'
+import { Bookmark, Check, ChevronDown, ChevronRight, Clock3, FileText, Info, LayoutGrid, Link2, List, LoaderCircle, Lock, Search, Sparkles, Trash2, UsersRound, X } from 'lucide-react'
 import { Btn, Card, CompanyLogo, INPUT_STYLE, ScorePill, StatusBadge, useToast, useConfirm } from '@/components/ui'
-import type { Job, JobStatus, Activity, ResumeListItem } from '@/lib/types'
+import { ResumeRenderer } from '@/components/resume/ResumeRenderer'
+import { CoverLetterPreview } from '@/components/coverletter/CoverLetterPanel'
+import type { ApplicationAudit, CoverLetter, Job, JobStatus, Activity, Resume, ResumeListItem } from '@/lib/types'
 import { apiMutate, fmtDate, fmtRelative, useApi } from '@/lib/hooks'
-import ApplyStatusCard from '@/components/jobs/ApplyStatusCard'
+import { setCachedApiResponse } from '@/lib/api-cache'
+import { useNav } from '@/lib/nav-context'
+import { downloadJobBundle } from '@/lib/bundle'
 
 const KANBAN_COLS: JobStatus[] = ['saved', 'applied', 'review', 'interview', 'offer', 'rejected']
 const COL_LABELS: Record<JobStatus, string> = {
@@ -26,12 +30,18 @@ interface JobsPageCache {
 // to this section. Searches and filters intentionally remain uncached.
 let defaultJobsCache: JobsPageCache | null = null
 
-type ResumeTailorChange = {
-  section: string
-  field: string
-  before: string
-  after: string
-  reason: string
+function sortJobs(jobs: Job[], sortBy: 'createdAt' | 'score' | 'company' | 'role', sortDir: 'asc' | 'desc') {
+  return [...jobs].sort((a, b) => {
+    let comparison = 0
+    if (sortBy === 'score') comparison = (a.score ?? -1) - (b.score ?? -1)
+    else if (sortBy === 'company') comparison = a.company.localeCompare(b.company)
+    else if (sortBy === 'role') comparison = a.role.localeCompare(b.role)
+
+    if (sortBy === 'createdAt' || comparison === 0) {
+      comparison = new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime()
+    }
+    return sortDir === 'desc' ? comparison : -comparison
+  })
 }
 
 // ── ListView ──────────────────────────────────────────────────────────────────
@@ -317,12 +327,13 @@ function AddJobModal({ onClose, onAdded, prefillStatus }: {
 }
 
 // ── JobDetailDrawer ───────────────────────────────────────────────────────────
-function JobDetailDrawer({ job, onClose, onStatusChange, onUpdate, onDelete }: {
+function JobDetailDrawer({ job, onClose, onStatusChange, onUpdate, onDelete, onOpenTailoredResume }: {
   job:            Job
   onClose:        () => void
   onStatusChange: (id: string, status: JobStatus) => void
   onUpdate:       (updated: Job) => void
   onDelete:       (id: string) => void
+  onOpenTailoredResume: (resumeId: string) => void
 }) {
   const toast = useToast()
   const [confirm, ConfirmDialog] = useConfirm()
@@ -338,17 +349,20 @@ function JobDetailDrawer({ job, onClose, onStatusChange, onUpdate, onDelete }: {
     followUpEmail: string
   } | null>(null)
   const [loadingPrep, setLoadingPrep] = useState(false)
-  const [editingCover, setEditingCover] = useState(false)
-  const [coverText,    setCoverText]    = useState(job.coverLetter ?? '')
-  const [savingCover,  setSavingCover]  = useState(false)
   const [descExpanded, setDescExpanded] = useState(false)
   const { data: resumeList } = useApi<ResumeListItem[]>('/api/resume')
   const [selectedResumeId, setSelectedResumeId] = useState('')
   const [tailoringLoading, setTailoringLoading] = useState(false)
-  const [savingTailoredResume, setSavingTailoredResume] = useState(false)
-  const [tailorResult, setTailorResult] = useState<{ adaptedResumeId: string; changes: ResumeTailorChange[] } | null>(null)
-  const [acceptedChanges, setAcceptedChanges] = useState<Record<string, boolean>>({})
-  const [collapsedChanges, setCollapsedChanges] = useState<Record<string, boolean>>({})
+  const [downloadingPack, setDownloadingPack] = useState(false)
+  const [autoPreparing, setAutoPreparing] = useState(false)
+  const [packStage, setPackStage] = useState<'idle' | 'resume' | 'coverLetter' | 'audit' | 'review'>('idle')
+  const [auditedPackKey, setAuditedPackKey] = useState<string | null>(null)
+  const [openPackItem, setOpenPackItem] = useState<'resume' | 'coverLetter' | 'audit' | null>(null)
+  const [resumePreview, setResumePreview] = useState<Resume | null>(null)
+  const [generatedCoverLetter, setGeneratedCoverLetter] = useState<CoverLetter | null>(null)
+  const [latestAudit, setLatestAudit] = useState<ApplicationAudit | null>(null)
+  const [documentPreview, setDocumentPreview] = useState<'resume' | 'coverLetter' | null>(null)
+  const { data: coverLetters, refetch: refetchCoverLetters } = useApi<CoverLetter[]>(`/api/jobs/${job.id}/cover-letters`)
 
   // Load per-job activity on mount; reset interview prep when job changes
   useEffect(() => {
@@ -364,17 +378,40 @@ function JobDetailDrawer({ job, onClose, onStatusChange, onUpdate, onDelete }: {
   // Sync local state when parent job changes
   useEffect(() => { setNotes(job.notes ?? '') }, [job.notes])
   useEffect(() => { setFollowUpAt(job.followUpAt ? job.followUpAt.slice(0, 10) : '') }, [job.followUpAt])
-  useEffect(() => { setCoverText(job.coverLetter ?? ''); setEditingCover(false) }, [job.coverLetter])
+  const baseResumes = useMemo(() => resumeList?.filter(r => r.kind === 'base') ?? [], [resumeList])
+  const existingTailoredResume = useMemo(
+    () => resumeList?.find(r => r.kind === 'adapted' && r.targetJobId === job.id) ?? null,
+    [job.id, resumeList],
+  )
+
   useEffect(() => {
-    if (!resumeList?.length) return
-    const preferred = resumeList.find(r => r.isDefault) ?? resumeList[0]
-    setSelectedResumeId(prev => prev && resumeList.some(r => r.id === prev) ? prev : preferred.id)
-  }, [resumeList])
+    if (!baseResumes.length) return
+    const preferred = baseResumes.find(r => r.isDefault) ?? baseResumes[0]
+    setSelectedResumeId(prev => prev && baseResumes.some(r => r.id === prev) ? prev : preferred.id)
+  }, [baseResumes, resumeList])
   useEffect(() => {
-    setTailorResult(null)
-    setAcceptedChanges({})
-    setCollapsedChanges({})
+    setAuditedPackKey(null)
+    setOpenPackItem(null)
+    setResumePreview(null)
+    setGeneratedCoverLetter(null)
+    setLatestAudit(null)
+    setDocumentPreview(null)
+    setPackStage('idle')
   }, [job.id])
+
+  const previewResumeId = job.finalResumeId ?? existingTailoredResume?.id ?? null
+  useEffect(() => {
+    if (!previewResumeId) return
+    fetch(`/api/resume/${previewResumeId}`).then(response => response.ok ? response.json() : null)
+      .then((resume: Resume | null) => setResumePreview(resume))
+      .catch(() => setResumePreview(null))
+  }, [previewResumeId])
+
+  const selectedCoverLetter = generatedCoverLetter
+    ?? coverLetters?.find(letter => letter.id === job.finalCoverLetterId && (!previewResumeId || letter.resumeId === previewResumeId))
+    ?? coverLetters?.find(letter => letter.resumeId === previewResumeId)
+  const persistedAudit = useMemo(() => findLatestApplicationAudit(activity), [activity])
+  const displayedAudit = latestAudit ?? persistedAudit?.audit ?? null
 
   async function saveNotes() {
     if (notes === (job.notes ?? '')) return
@@ -395,15 +432,6 @@ function JobDetailDrawer({ job, onClose, onStatusChange, onUpdate, onDelete }: {
     )
     if (error) { toast.error('Save failed', error); return }
     if (data)  { onUpdate(data); toast.success(value ? 'Follow-up date set' : 'Follow-up date cleared') }
-  }
-
-  async function saveCover() {
-    if (coverText === (job.coverLetter ?? '')) return
-    setSavingCover(true)
-    const { data, error } = await apiMutate<Job>(`/api/jobs/${job.id}`, 'PATCH', { coverLetter: coverText })
-    setSavingCover(false)
-    if (error) { toast.error('Save failed', error); return }
-    if (data) { onUpdate(data); setEditingCover(false); toast.success('Cover letter saved') }
   }
 
   async function handleDelete() {
@@ -444,13 +472,17 @@ function JobDetailDrawer({ job, onClose, onStatusChange, onUpdate, onDelete }: {
   }
 
   async function handleTailorResume() {
+    if (existingTailoredResume) {
+      onOpenTailoredResume(existingTailoredResume.id)
+      return
+    }
     if (!selectedResumeId) {
       toast.error('No resume selected', 'Create or import a resume first')
       return
     }
 
     setTailoringLoading(true)
-    const { data, error } = await apiMutate<{ adaptedResumeId: string; changes: ResumeTailorChange[] }>(
+    const { data, error } = await apiMutate<{ adaptedResumeId: string; reused?: boolean }>(
       `/api/jobs/${job.id}/tailor-resume`,
       'POST',
       { resumeId: selectedResumeId },
@@ -463,57 +495,149 @@ function JobDetailDrawer({ job, onClose, onStatusChange, onUpdate, onDelete }: {
     }
     if (!data) return
 
-    setTailorResult(data)
-    setAcceptedChanges(Object.fromEntries(data.changes.map(c => [c.section, true])))
-    setCollapsedChanges({})
-    toast.success('Tailored resume created', `${data.changes.length} section${data.changes.length === 1 ? '' : 's'} changed`)
-  }
-
-  function toggleAccepted(section: string) {
-    setAcceptedChanges(prev => ({ ...prev, [section]: !prev[section] }))
-  }
-
-  function toggleCollapsed(section: string) {
-    setCollapsedChanges(prev => ({ ...prev, [section]: !prev[section] }))
-  }
-
-  async function confirmTailoredResume() {
-    if (!tailorResult) return
-    const accepted = tailorResult.changes.filter(c => acceptedChanges[c.section]).length
-    const rejected = tailorResult.changes.filter(c => !acceptedChanges[c.section])
-
-    if (rejected.length > 0) {
-      setSavingTailoredResume(true)
-      try {
-        const [baseRes, adaptedRes] = await Promise.all([
-          fetch(`/api/resume/${selectedResumeId}`),
-          fetch(`/api/resume/${tailorResult.adaptedResumeId}`),
-        ])
-        const [baseResume, adaptedResume] = await Promise.all([baseRes.json(), adaptedRes.json()])
-        if (!baseRes.ok || !adaptedRes.ok) throw new Error(baseResume.error ?? adaptedResume.error ?? 'Could not load resume content')
-
-        const content = { ...(adaptedResume.content as Record<string, unknown>) }
-        for (const change of rejected) {
-          content[change.section] = (baseResume.content as Record<string, unknown>)[change.section]
-        }
-
-        const { error } = await apiMutate(`/api/resume/${tailorResult.adaptedResumeId}`, 'PATCH', { content })
-        if (error) throw new Error(error)
-      } catch (e) {
-        toast.error('Save failed', e instanceof Error ? e.message : 'Could not save selected changes')
-        setSavingTailoredResume(false)
-        return
-      }
-      setSavingTailoredResume(false)
+    if (data.reused) {
+      onOpenTailoredResume(data.adaptedResumeId)
+      return
     }
 
-    toast.success('Tailored resume saved', `${accepted}/${tailorResult.changes.length} changes accepted`)
+    toast.success('Tailored resume created', 'Review and confirm it in Resume before returning here.')
+    onOpenTailoredResume(data.adaptedResumeId)
+  }
+
+  async function downloadFinalPack() {
+    setDownloadingPack(true)
+    try {
+      await downloadJobBundle(job.id)
+      toast.success('Application pack downloaded', 'Your final resume and cover letter are in the ZIP file.')
+    } catch (error) {
+      toast.error('Could not download application pack', error instanceof Error ? error.message : 'Please try again')
+    } finally {
+      setDownloadingPack(false)
+    }
+  }
+
+  async function autoTailorAndAudit() {
+    if (!selectedResumeId && !existingTailoredResume) {
+      toast.error('No base resume selected', 'Create or import a resume first.')
+      return
+    }
+    setAutoPreparing(true)
+    setPackStage('resume')
+    try {
+      let adaptedResumeId = existingTailoredResume?.id
+      if (!adaptedResumeId) {
+        const { data, error } = await apiMutate<{ adaptedResumeId: string }>(`/api/jobs/${job.id}/tailor-resume`, 'POST', { resumeId: selectedResumeId })
+        if (!data || error) throw new Error(error ?? 'Could not tailor the resume')
+        adaptedResumeId = data.adaptedResumeId
+        const response = await fetch(`/api/resume/${adaptedResumeId}`)
+        if (response.ok) {
+          const tailored = await response.json() as Resume
+          setResumePreview(tailored)
+          setCachedApiResponse(`/api/resume/${adaptedResumeId}`, tailored)
+        }
+      }
+
+      let revisionFindings: ApplicationAudit['findings'] = []
+      for (let attempt = 0; attempt < 2; attempt++) {
+        setPackStage('coverLetter')
+        // Reuse a manually prepared (or previously generated) letter for this
+        // tailored resume. A new letter is necessary only when one is missing,
+        // or after a failed audit triggers an AI resume revision.
+        const assignedCoverLetter = job.finalCoverLetterId
+          ? coverLetters?.find(letter => letter.id === job.finalCoverLetterId)
+          : undefined
+        // A final letter is reusable only when it was written for this exact
+        // resume version. This prevents an older letter silently travelling
+        // with a revised resume after an audit failure.
+        let coverLetter = attempt === 0
+          ? (assignedCoverLetter?.resumeId === adaptedResumeId ? assignedCoverLetter : undefined)
+            ?? coverLetters?.find(letter => letter.resumeId === adaptedResumeId)
+          : undefined
+        if (!coverLetter) {
+          const result = await apiMutate<CoverLetter>(
+            `/api/jobs/${job.id}/cover-letters/generate`, 'POST',
+            { resumeId: adaptedResumeId, preferProvidedResume: true, auditFindings: revisionFindings },
+          )
+          if (!result.data || result.error) throw new Error(result.error ?? 'Could not generate the cover letter')
+          coverLetter = result.data
+        }
+        setGeneratedCoverLetter(coverLetter)
+        void refetchCoverLetters()
+
+        const { data: coverAssigned, error: coverAssignError } = await apiMutate<Job>(
+          `/api/jobs/${job.id}/assign`, 'PATCH', { finalCoverLetterId: coverLetter.id },
+        )
+        if (!coverAssigned || coverAssignError) throw new Error(coverAssignError ?? 'Could not select the cover letter')
+
+        setPackStage('audit')
+        let audit: ApplicationAudit | null = null
+        let auditError: string | null = null
+        for (let auditAttempt = 0; auditAttempt < 2; auditAttempt++) {
+          const result = await apiMutate<ApplicationAudit>(`/api/jobs/${job.id}/audit-application`, 'POST', { resumeId: adaptedResumeId, coverLetterId: coverLetter.id })
+          audit = result.data
+          auditError = result.error
+          if (audit || !auditError?.toLowerCase().includes('aborted')) break
+          await new Promise(resolve => setTimeout(resolve, 500))
+        }
+        if (!audit || auditError) throw new Error(auditError ?? 'Independent audit could not run')
+        setLatestAudit(audit)
+
+        if (audit.verdict === 'pass') {
+          setPackStage('review')
+          const { data: confirmed, error: confirmError } = await apiMutate<Job>(
+            `/api/jobs/${job.id}/assign`, 'PATCH', { finalResumeId: adaptedResumeId, finalCoverLetterId: coverLetter.id },
+          )
+          if (!confirmed || confirmError) throw new Error(confirmError ?? 'Could not confirm the audited package')
+          setAuditedPackKey(`${adaptedResumeId}:${coverLetter.id}`)
+          onUpdate(confirmed)
+          toast.success('Audited application pack ready', 'The final resume and cover letter are now available in this job.')
+          return
+        }
+
+        if (attempt === 0) {
+          revisionFindings = audit.findings
+          // The just-audited letter failed. Remove it from the selected
+          // package before generating a revised pair so no other surface can
+          // treat the failed letter as the current final document.
+          const { error: clearFailedLetterError } = await apiMutate(
+            `/api/jobs/${job.id}/assign`, 'PATCH', { finalCoverLetterId: null },
+          )
+          if (clearFailedLetterError) throw new Error(clearFailedLetterError)
+          setPackStage('resume')
+          const revisionResponse: { data: { adaptedResumeId: string } | null; error: string | null } = await apiMutate<{ adaptedResumeId: string }>(
+            `/api/jobs/${job.id}/tailor-resume`, 'POST',
+            { resumeId: adaptedResumeId, forceRetailor: true, auditFindings: audit.findings },
+          )
+          if (!revisionResponse.data || revisionResponse.error) throw new Error(revisionResponse.error ?? 'Could not revise the tailored resume after audit feedback')
+          adaptedResumeId = revisionResponse.data.adaptedResumeId
+          const response = await fetch(`/api/resume/${adaptedResumeId}`)
+          if (response.ok) {
+            const revised = await response.json() as Resume
+            setResumePreview(revised)
+            setCachedApiResponse(`/api/resume/${adaptedResumeId}`, revised)
+          }
+          continue
+        }
+
+        await apiMutate(`/api/jobs/${job.id}/assign`, 'PATCH', { finalCoverLetterId: null })
+        setOpenPackItem('audit')
+        toast.warning('Automatic revision needs your review', audit.summary)
+      }
+    } catch (error) {
+      setPackStage('idle')
+      toast.error('Preparation could not finish', error instanceof Error ? error.message : 'Please try again')
+    } finally {
+      setAutoPreparing(false)
+    }
   }
 
   // Drawer uses a slightly more compact variant of the shared INPUT_STYLE
   const drawerInputSt: React.CSSProperties = { ...INPUT_STYLE, fontSize: 11, padding: '5px 8px', borderRadius: 5 }
-  const hasResumes = Boolean(resumeList?.length)
-  const canTailorResume = Boolean(job.description && hasResumes)
+  const canTailorResume = Boolean(job.description && (baseResumes.length || existingTailoredResume))
+  const currentPackAudited = auditedPackKey === `${job.finalResumeId}:${job.finalCoverLetterId}`
+    || (persistedAudit?.audit.verdict === 'pass'
+      && persistedAudit.resumeId === job.finalResumeId
+      && persistedAudit.coverLetterId === job.finalCoverLetterId)
 
   return (
     <>
@@ -523,140 +647,64 @@ function JobDetailDrawer({ job, onClose, onStatusChange, onUpdate, onDelete }: {
 
       {/* Drawer panel */}
       <div style={{
-        position: 'fixed', top: 0, right: 0, bottom: 0, width: 380, zIndex: 91,
+        position: 'fixed', top: 0, right: 0, bottom: 0, width: 460, maxWidth: '100vw', zIndex: 91,
         background: 'var(--bg)', borderLeft: '0.5px solid var(--border)',
-        display: 'flex', flexDirection: 'column', overflowY: 'auto',
+        display: 'flex', flexDirection: 'column', overflowY: 'auto', overflowX: 'hidden', overscrollBehaviorX: 'contain',
         boxShadow: '-4px 0 20px rgba(0,0,0,0.12)',
       }}>
         {/* Header */}
-        <div style={{ padding: '16px 18px', borderBottom: '0.5px solid var(--border)', display: 'flex', alignItems: 'flex-start', gap: 12 }}>
-          <CompanyLogo logo={job.logo ?? job.company.slice(0, 2).toUpperCase()} size={36} />
+        <div style={{ padding: '24px 28px 20px', borderBottom: '0.5px solid var(--border)', display: 'flex', alignItems: 'flex-start', gap: 12 }}>
           <div style={{ flex: 1 }}>
-            <div style={{ fontSize: 14, fontWeight: 500, lineHeight: 1.3 }}>{job.company}</div>
-            <div style={{ fontSize: 12, color: 'var(--text-muted)', marginTop: 2 }}>{job.role}</div>
-            {job.location && <div style={{ fontSize: 11, color: 'var(--text-muted)', marginTop: 1 }}>📍 {job.location}</div>}
+            <div style={{ fontSize: 24, fontWeight: 700, lineHeight: 1.2, letterSpacing: '-0.03em' }}>{job.role}</div>
+            <div style={{ fontSize: 15, color: 'var(--text-muted)', marginTop: 7 }}>{job.source ? `${job.source} job` : job.company}{job.createdAt ? ` · Posted ${fmtDate(job.createdAt)}` : ''}</div>
           </div>
           <button onClick={onClose} style={{ background: 'none', border: 'none', cursor: 'pointer', fontSize: 16, color: 'var(--text-muted)', lineHeight: 1, padding: 0, marginTop: 2 }}>✕</button>
         </div>
 
-        {/* Meta row */}
-        <div style={{ padding: '12px 18px', borderBottom: '0.5px solid var(--border)', display: 'flex', flexWrap: 'wrap', gap: 8, alignItems: 'center' }}>
-          <StatusBadge status={job.status} />
-          {job.score != null && <ScorePill score={job.score} />}
-          {job.salary && <span style={{ fontSize: 11, color: 'var(--text-muted)', background: 'var(--bg-secondary)', border: '0.5px solid var(--border)', borderRadius: 5, padding: '2px 7px' }}>{renderSalary(job.salary)}</span>}
-          {/* Status change */}
-          <select
-            value={job.status}
-            onChange={e => onStatusChange(job.id, e.target.value as JobStatus)}
-            onClick={e => e.stopPropagation()}
-            style={{ ...drawerInputSt, width: 'auto', marginLeft: 'auto' }}>
-            {KANBAN_COLS.map(c => <option key={c} value={c}>{COL_LABELS[c]}</option>)}
-          </select>
-        </div>
+        <ReferenceProgress ready={currentPackAudited} />
 
         {/* Body */}
-        <div style={{ flex: 1, padding: 18, display: 'flex', flexDirection: 'column', gap: 16 }}>
+        <div style={{ flex: 1, padding: '26px 28px', display: 'flex', flexDirection: 'column', gap: 24 }}>
 
-          {/* URL */}
-          {job.url && (
-            <div>
-              <div style={{ fontSize: 10, color: 'var(--text-muted)', fontWeight: 500, marginBottom: 4 }}>JOB POSTING</div>
-              <a href={job.url} target="_blank" rel="noopener noreferrer"
-                style={{ fontSize: 11, color: '#185FA5', wordBreak: 'break-all' }}>
-                {job.url.length > 55 ? job.url.slice(0, 52) + '…' : job.url}
-              </a>
+          <section style={{ borderBottom: '1px solid var(--border)', padding: '18px 0 22px' }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 9, fontSize: 11, fontWeight: 700, letterSpacing: '0.03em', color: '#64748b', marginBottom: 18 }}><Sparkles size={16} strokeWidth={2.4} style={{ color: '#2563eb', flexShrink: 0 }} />NEXT BEST ACTION</div>
+            <div style={{ fontSize: 20, lineHeight: 1.25, fontWeight: 700, letterSpacing: '-0.025em' }}>{existingTailoredResume ? 'Resume is tailored for this job' : 'Tailor your resume for this job'}</div>
+            <div style={{ fontSize: 14, lineHeight: 1.5, color: 'var(--text-muted)', margin: '7px 0 16px' }}>{existingTailoredResume ? 'Review the AI-tailored version before preparing the application pack.' : 'Create a role-specific version, review it in Resume, then return here.'}</div>
+
+            {existingTailoredResume ? (
+              <button onClick={() => onOpenTailoredResume(existingTailoredResume.id)} style={workflowDocumentButton}>
+                <span style={{ width: 48, height: 48, display: 'grid', placeItems: 'center', borderRadius: 10, background: '#eff6ff', color: '#2563eb' }}><FileText size={27} /></span>
+                <span style={{ flex: 1, textAlign: 'left' }}><span style={{ display: 'block', fontSize: 15, fontWeight: 700 }}>{existingTailoredResume.name}</span><span style={{ display: 'block', fontSize: 13, marginTop: 5, color: 'var(--text-muted)', fontWeight: 400 }}>Tailored resume · ready to review</span></span>
+                <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6, color: '#2563eb', fontSize: 14, whiteSpace: 'nowrap' }}>Review in Resume <ChevronRight size={19} /></span>
+              </button>
+            ) : <div style={{ border: '1px solid #dbe1ea', borderRadius: 12, padding: 18 }}>
+              <div style={{ fontSize: 14, color: 'var(--text-muted)', lineHeight: 1.55, marginBottom: 14 }}>Choose a base resume and create a tailored version. You’ll review it in Resume before returning here.</div>
+              {baseResumes.length > 1 && <select value={selectedResumeId} onChange={e => setSelectedResumeId(e.target.value)} style={{ ...drawerInputSt, width: '100%', marginBottom: 12 }}>{baseResumes.map(r => <option key={r.id} value={r.id}>{r.isDefault ? 'Default — ' : ''}{r.name}</option>)}</select>}
+              <Btn small onClick={handleTailorResume} disabled={tailoringLoading}>{tailoringLoading ? 'Creating tailored resume…' : 'Tailor in Resume'}</Btn>
+            </div>}
+            <div style={{ display: 'flex', alignItems: 'center', gap: 12, color: 'var(--text-muted)', margin: '4px 0 20px' }}><span style={{ height: 1, background: 'var(--border)', flex: 1 }} /><span>OR</span><span style={{ height: 1, background: 'var(--border)', flex: 1 }} /></div>
+            <button onClick={() => void autoTailorAndAudit()} disabled={autoPreparing || !canTailorResume} style={{ width: '100%', minHeight: 56, padding: '14px', border: '2px solid #2563eb', borderRadius: 9, background: '#fff', color: '#2563eb', fontSize: 15, fontWeight: 700, cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 10, textAlign: 'center' }}><Sparkles size={19} style={{ flexShrink: 0 }} />{autoPreparing ? 'Preparing application pack…' : 'Prepare full application pack automatically'}</button>
+            <div style={{ textAlign: 'center', fontSize: 13, lineHeight: 1.55, color: 'var(--text-muted)', margin: '12px 28px 28px' }}>We’ll tailor your resume (if needed), generate a cover letter, and run an independent audit.</div>
+            <div style={{ borderTop: '1px solid var(--border)', paddingTop: 22, fontSize: 12, fontWeight: 700, letterSpacing: '0.03em', color: '#64748b' }}>APPLICATION PACK</div>
+            <style>{`@keyframes pack-line-grow { from { transform: scaleY(0) } to { transform: scaleY(1) } } @keyframes pack-pulse { 0%,100% { box-shadow: 0 0 0 0 rgba(37,99,235,.35) } 50% { box-shadow: 0 0 0 7px rgba(37,99,235,0) } }`}</style>
+            <PackRow number="1" title="Resume" detail={packStage === 'resume' ? 'AI tailoring this resume…' : 'Tailored for this role'} done={Boolean(previewResumeId)} active={packStage === 'resume'} open={openPackItem === 'resume'} onToggle={() => setOpenPackItem(current => current === 'resume' ? null : 'resume')}>
+              <ResumePackPreview resume={resumePreview} onReview={() => setDocumentPreview('resume')} />
+            </PackRow>
+            <PackRow number="2" title="Cover letter" detail={packStage === 'coverLetter' ? 'AI writing a tailored cover letter…' : selectedCoverLetter ? 'Generated for this job' : 'Created during automatic preparation'} done={Boolean(selectedCoverLetter)} active={packStage === 'coverLetter'} open={openPackItem === 'coverLetter'} onToggle={() => setOpenPackItem(current => current === 'coverLetter' ? null : 'coverLetter')}>
+              <CoverLetterPackPreview coverLetter={selectedCoverLetter ?? null} applicant={resumePreview?.content.contact} fallbackName={resumePreview?.name ?? 'Applicant'} company={job.company} role={job.role} templateId={resumePreview?.templateId ?? undefined} templateOptions={resumePreview?.templateOptions ?? undefined} onReview={() => setDocumentPreview('coverLetter')} />
+            </PackRow>
+            <PackRow number="3" title="Independent audit" detail={packStage === 'audit' ? 'Checking changes against your original resume…' : displayedAudit ? displayedAudit.summary : 'Runs after the resume and cover letter are ready'} done={currentPackAudited} active={packStage === 'audit'} open={openPackItem === 'audit'} onToggle={() => setOpenPackItem(current => current === 'audit' ? null : 'audit')}>
+              <AuditPackPreview audit={displayedAudit} />
+            </PackRow>
+            <PackRow number="4" title="Open & fill application" detail="Available after all items are complete" done={false} locked={!currentPackAudited} last onClick={currentPackAudited && job.url ? () => window.open(job.url!, '_blank', 'noopener,noreferrer') : undefined} />
+            <div style={{ borderTop: '1px solid var(--border)', marginTop: 8, paddingTop: 22 }}><div style={{ fontSize: 12, fontWeight: 700, color: '#64748b', marginBottom: 12 }}>REVIEW &amp; SUBMIT</div><div style={{ border: '1px solid #bfdbfe', background: '#f8fbff', borderRadius: 9, padding: '14px 16px', display: 'flex', gap: 12, fontSize: 13, lineHeight: 1.55 }}><Info size={22} color="#2563eb" style={{ flexShrink: 0, marginTop: 1 }} /><span><strong>You’ll review and submit on the employer site</strong><br /><span style={{ color: 'var(--text-muted)' }}>We’ll open the job in a new tab when your application pack is ready.</span></span></div></div>
+            <div style={{ borderTop: '1px solid var(--border)', marginTop: 28, paddingTop: 22 }}>
+              <div style={{ fontSize: 12, fontWeight: 700, color: '#64748b', marginBottom: 16 }}>JOB DETAILS</div>
+              <JobDetail label="Company" value={job.company} />
+              {job.location && <JobDetail label="Location" value={job.location} />}
+              {job.url && <JobDetail label="Job posting" value="View original posting" href={job.url} />}
             </div>
-          )}
-
-          {/* Score Job */}
-          <div style={{ marginBottom: 6 }}>
-            <ScoreJobButton job={job} onUpdate={onUpdate} />
-          </div>
-
-          {/* Tailor Resume */}
-          {canTailorResume && (
-            <Card style={{ padding: 12, display: 'flex', flexDirection: 'column', gap: 8 }}>
-              <div style={{ display: 'flex', justifyContent: 'space-between', gap: 8, alignItems: 'center' }}>
-                <div>
-                  <div style={{ fontSize: 10, color: '#3B6D11', fontWeight: 500 }}>RESUME TAILORING</div>
-                  <div style={{ fontSize: 11, color: 'var(--text-muted)', marginTop: 2 }}>
-                    Adapt a base resume for this job description.
-                  </div>
-                </div>
-                <Btn small onClick={handleTailorResume} disabled={tailoringLoading}>
-                  {tailoringLoading ? 'Tailoring...' : 'Tailor Resume'}
-                </Btn>
-              </div>
-              {resumeList && resumeList.length > 1 && (
-                <select
-                  value={selectedResumeId}
-                  onChange={e => setSelectedResumeId(e.target.value)}
-                  style={{ ...drawerInputSt, width: '100%' }}>
-                  {resumeList.map(r => (
-                    <option key={r.id} value={r.id}>{r.isDefault ? 'Default - ' : ''}{r.name}</option>
-                  ))}
-                </select>
-              )}
-            </Card>
-          )}
-
-          {tailorResult && (
-            <Card style={{ padding: 12, display: 'flex', flexDirection: 'column', gap: 10 }}>
-              <div style={{ display: 'flex', justifyContent: 'space-between', gap: 8, alignItems: 'center' }}>
-                <div>
-                  <div style={{ fontSize: 10, color: '#3B6D11', fontWeight: 500 }}>TAILORED RESUME DIFF</div>
-                  <div style={{ fontSize: 11, color: 'var(--text-muted)', marginTop: 2 }}>
-                    Review each section before saving the tailored version.
-                  </div>
-                </div>
-                <Btn small onClick={confirmTailoredResume} disabled={savingTailoredResume}>
-                  {savingTailoredResume ? 'Saving...' : 'Save'}
-                </Btn>
-              </div>
-              <div style={{ display: 'flex', flexDirection: 'column', gap: 8, maxHeight: 360, overflowY: 'auto' }}>
-                {tailorResult.changes.map(c => {
-                  const accepted = acceptedChanges[c.section] !== false
-                  const collapsed = Boolean(collapsedChanges[c.section])
-                  return (
-                    <div key={c.section} style={{ border: '0.5px solid var(--border)', borderRadius: 6, overflow: 'hidden', opacity: accepted ? 1 : 0.62 }}>
-                      <button
-                        onClick={() => toggleCollapsed(c.section)}
-                        style={{ width: '100%', padding: '7px 9px', display: 'flex', justifyContent: 'space-between', alignItems: 'center', background: 'var(--bg-secondary)', border: 'none', cursor: 'pointer', color: 'var(--text)' }}>
-                        <span style={{ fontSize: 11, fontWeight: 600, textTransform: 'capitalize' }}>{c.section}</span>
-                        <span style={{ fontSize: 10, color: 'var(--text-muted)' }}>{collapsed ? 'Show' : 'Hide'}</span>
-                      </button>
-                      {!collapsed && (
-                        <div style={{ padding: 9, display: 'flex', flexDirection: 'column', gap: 8 }}>
-                          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8 }}>
-                            <div>
-                              <div style={{ fontSize: 9, color: 'var(--c-danger)', fontWeight: 600, marginBottom: 4 }}>BEFORE</div>
-                              <pre style={{ margin: 0, whiteSpace: 'pre-wrap', wordBreak: 'break-word', fontSize: 10, lineHeight: 1.55, color: 'var(--text-muted)', background: 'rgba(163,45,45,0.06)', border: '0.5px solid rgba(163,45,45,0.16)', borderRadius: 5, padding: 7, maxHeight: 150, overflowY: 'auto' }}>{c.before}</pre>
-                            </div>
-                            <div>
-                              <div style={{ fontSize: 9, color: 'var(--c-success)', fontWeight: 600, marginBottom: 4 }}>AFTER</div>
-                              <pre style={{ margin: 0, whiteSpace: 'pre-wrap', wordBreak: 'break-word', fontSize: 10, lineHeight: 1.55, color: 'var(--text)', background: 'rgba(217,119,6,0.10)', border: '0.5px solid rgba(217,119,6,0.22)', borderRadius: 5, padding: 7, maxHeight: 150, overflowY: 'auto' }}>{c.after}</pre>
-                            </div>
-                          </div>
-                          <div style={{ fontSize: 10, color: 'var(--text-muted)', lineHeight: 1.5 }}>{c.reason}</div>
-                          <label style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 10, color: 'var(--text)', cursor: 'pointer' }}>
-                            <input type="checkbox" checked={accepted} onChange={() => toggleAccepted(c.section)} />
-                            Accept this change
-                          </label>
-                        </div>
-                      )}
-                    </div>
-                  )
-                })}
-              </div>
-            </Card>
-          )}
-
-          {/* Auto Apply */}
-          {job.url && (
-            <div>
-              <AutoApplyButton job={job} onApplied={() => onStatusChange(job.id, 'applied')} />
-            </div>
-          )}
+          </section>
 
           {/* Description */}
           {job.description && (
@@ -699,42 +747,6 @@ function JobDetailDrawer({ job, onClose, onStatusChange, onUpdate, onDelete }: {
               </div>
             </div>
           )}
-
-          {/* Cover Letter */}
-          <div>
-            <div style={{ fontSize: 10, color: '#3B6D11', fontWeight: 500, marginBottom: 6, display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-              <span>COVER LETTER</span>
-              <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
-                {savingCover && <span style={{ fontSize: 9, color: 'var(--text-muted)' }}>Saving…</span>}
-                {editingCover ? (
-                  <>
-                    <button onClick={saveCover} style={{ fontSize: 9, color: '#3B6D11', background: 'rgba(59,109,17,0.1)', border: '0.5px solid rgba(59,109,17,0.25)', borderRadius: 4, padding: '2px 6px', cursor: 'pointer' }}>Save</button>
-                    <button onClick={() => { setEditingCover(false); setCoverText(job.coverLetter ?? '') }} style={{ fontSize: 9, color: 'var(--text-muted)', background: 'none', border: 'none', cursor: 'pointer', padding: '2px 4px' }}>Cancel</button>
-                  </>
-                ) : job.coverLetter ? (
-                  <button onClick={() => setEditingCover(true)} style={{ fontSize: 9, color: '#185FA5', background: 'rgba(24,95,165,0.08)', border: '0.5px solid rgba(24,95,165,0.2)', borderRadius: 4, padding: '2px 6px', cursor: 'pointer' }}>Edit</button>
-                ) : (
-                  <button onClick={() => { setCoverText(''); setEditingCover(true) }} style={{ fontSize: 9, color: '#3B6D11', background: 'rgba(59,109,17,0.1)', border: '0.5px solid rgba(59,109,17,0.25)', borderRadius: 4, padding: '2px 6px', cursor: 'pointer' }}>+ Add</button>
-                )}
-              </div>
-            </div>
-            {editingCover ? (
-              <textarea
-                value={coverText}
-                onChange={e => setCoverText(e.target.value)}
-                onKeyDown={e => { if ((e.metaKey || e.ctrlKey) && e.key === 's') { e.preventDefault(); saveCover() } }}
-                style={{ ...drawerInputSt, width: '100%', minHeight: 120, resize: 'vertical', lineHeight: 1.6, padding: '7px 9px', fontSize: 11, boxSizing: 'border-box' }}
-              />
-            ) : job.coverLetter ? (
-              <div style={{ fontSize: 11, color: 'var(--text)', lineHeight: 1.7, whiteSpace: 'pre-wrap', background: 'rgba(59,109,17,0.06)', border: '0.5px solid rgba(59,109,17,0.15)', borderRadius: 6, padding: '8px 10px', maxHeight: 200, overflowY: 'auto' }}>
-                {job.coverLetter}
-              </div>
-            ) : (
-              <div style={{ fontSize: 11, color: 'var(--text-muted)', fontStyle: 'italic', padding: '8px 0' }}>
-                No cover letter yet. Use the tailor-resume workspace to create one for this job.
-              </div>
-            )}
-          </div>
 
           {/* Dates */}
           <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10 }}>
@@ -878,6 +890,9 @@ function JobDetailDrawer({ job, onClose, onStatusChange, onUpdate, onDelete }: {
           )}
         </div>
 
+        {documentPreview === 'resume' && resumePreview && <DocumentPreviewModal title={resumePreview.name} onClose={() => setDocumentPreview(null)}><ResumeRenderer content={resumePreview.content} templateId={resumePreview.templateId} templateOptions={resumePreview.templateOptions} /></DocumentPreviewModal>}
+        {documentPreview === 'coverLetter' && selectedCoverLetter && <DocumentPreviewModal title="AI-generated cover letter" onClose={() => setDocumentPreview(null)}><CoverLetterPreview content={selectedCoverLetter.content} applicant={resumePreview?.content.contact} fallbackName={resumePreview?.name ?? 'Applicant'} company={job.company} role={job.role} templateId={resumePreview?.templateId ?? selectedCoverLetter.templateId ?? 'clean'} templateOptions={resumePreview?.templateOptions ?? selectedCoverLetter.templateOptions ?? {}} /></DocumentPreviewModal>}
+
         {/* Footer */}
         <div style={{ padding: '12px 18px', borderTop: '0.5px solid var(--border)', display: 'flex', gap: 8 }}>
           <Btn variant="danger" small disabled={deleting} onClick={handleDelete} style={{ flex: 1 }}>
@@ -895,6 +910,104 @@ function renderSalary(salary: unknown): string {
   if (!salary) return ''
   if (typeof salary === 'string') return salary
   return String(salary)
+}
+
+type StoredApplicationAudit = {
+  resumeId: string
+  coverLetterId: string
+  audit: ApplicationAudit
+}
+
+function findLatestApplicationAudit(activity: Activity[]): StoredApplicationAudit | null {
+  for (const item of activity) {
+    const prefix = '[Auditor] application-audit '
+    if (!item.text.startsWith(prefix)) continue
+    try {
+      const parsed = JSON.parse(item.text.slice(prefix.length)) as StoredApplicationAudit
+      if (parsed.resumeId && parsed.coverLetterId && parsed.audit?.verdict && Array.isArray(parsed.audit.findings)) return parsed
+    } catch {
+      // Ignore legacy or malformed activity entries rather than breaking the job drawer.
+    }
+  }
+  return null
+}
+
+const workflowDocumentButton: React.CSSProperties = {
+  width: '100%', display: 'flex', alignItems: 'center', gap: 12, padding: '16px',
+  border: '1px solid #dbe1ea', background: '#fff', borderRadius: 12,
+  color: 'var(--text)', cursor: 'pointer', fontSize: 14,
+}
+
+function ReferenceProgress({ ready }: { ready: boolean }) {
+  const steps = ['Prepare', 'Pack', 'Review', 'Apply']
+  const active = ready ? 3 : 0
+  return <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 8, padding: '22px 28px 25px', borderBottom: '1px solid var(--border)' }}>{steps.map((label, index) => <div key={label} style={{ textAlign: 'center', position: 'relative' }}>{index < 3 && <span style={{ position: 'absolute', height: 2, background: index < active ? '#2563eb' : '#dbe1ea', top: 18, left: '62%', right: '-38%' }} />}<span style={{ position: 'relative', zIndex: 1, margin: '0 auto 8px', display: 'grid', placeItems: 'center', width: 36, height: 36, borderRadius: '50%', border: `2px solid ${index === active ? '#2563eb' : '#dbe1ea'}`, color: index === active ? '#2563eb' : '#64748b', background: '#fff', fontSize: 15 }}>{index + 1}</span><div style={{ color: index === active ? '#2563eb' : '#64748b', fontSize: 12, fontWeight: index === active ? 700 : 500 }}>{label}</div></div>)}</div>
+}
+
+function PackRow({ number, title, detail, done, active = false, locked, onClick, onToggle, open, children, last = false }: {
+  number: string; title: string; detail: string; done: boolean; locked?: boolean; onClick?: () => void
+  active?: boolean; onToggle?: () => void; open?: boolean; children?: React.ReactNode; last?: boolean
+}) {
+  const status = locked ? 'Locked' : active ? 'In progress' : done ? (title === 'Independent audit' ? 'Passed' : 'Completed') : 'Pending'
+  return <div style={{ display: 'grid', gridTemplateColumns: '42px 1fr', gap: 12, position: 'relative' }}>
+    <div style={{ position: 'relative', display: 'flex', justifyContent: 'center' }}>
+      {!last && <span style={{ position: 'absolute', top: 32, bottom: 0, width: 2, background: done ? '#75b85a' : active ? '#60a5fa' : '#dbe1ea', transformOrigin: 'top', animation: 'pack-line-grow .42s ease-out both' }} />}
+      <span style={{ position: 'relative', zIndex: 1, marginTop: 15, width: 32, height: 32, display: 'grid', placeItems: 'center', borderRadius: '50%', background: done ? '#3b8c1a' : active ? '#2563eb' : '#eef1f6', color: done || active ? '#fff' : '#64748b', fontWeight: 700, animation: active ? 'pack-pulse 1.15s ease-in-out infinite' : undefined }}>{done ? <Check size={18} strokeWidth={3} /> : number}</span>
+    </div>
+    <div style={{ borderBottom: last ? 'none' : '1px solid var(--border)', padding: '15px 0' }}>
+      <div style={{ display: 'grid', gridTemplateColumns: '1fr auto', gap: 10, alignItems: 'center' }}>
+        <button onClick={onClick ?? onToggle} disabled={!onClick && !onToggle} style={{ border: 'none', padding: 0, background: 'transparent', color: 'var(--text)', textAlign: 'left', cursor: onClick || onToggle ? 'pointer' : 'default' }}>
+          <span style={{ display: 'block', fontSize: 15, fontWeight: 700 }}>{title}</span><span style={{ display: 'block', marginTop: 3, fontSize: 13, color: 'var(--text-muted)', fontWeight: 400, lineHeight: 1.4 }}>{detail}</span>
+        </button>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}><span style={{ display: 'inline-flex', alignItems: 'center', gap: 4, borderRadius: 999, padding: '5px 10px', fontSize: 11, color: done ? '#3b8c1a' : active ? '#2563eb' : '#64748b', background: done ? '#e9f7e5' : active ? '#eff6ff' : '#eef1f6' }}>{locked && <Lock size={12} />}{status}</span>{onToggle && <button aria-label={`Show ${title} details`} onClick={onToggle} style={{ border: 'none', padding: 3, color: '#334155', background: 'transparent', cursor: 'pointer' }}><ChevronDown size={18} style={{ transform: open ? 'rotate(180deg)' : 'none', transition: 'transform .18s ease' }} /></button>}</div>
+      </div>
+      {open && children && <div style={{ marginTop: 14, padding: 14, borderRadius: 10, background: '#f8fafc', border: '1px solid #e5eaf1', animation: 'pack-line-grow .2s ease-out both', transformOrigin: 'top' }}>{children}</div>}
+    </div>
+  </div>
+}
+
+function ResumePackPreview({ resume, onReview }: { resume: Resume | null; onReview: () => void }) {
+  if (!resume) return <div style={{ fontSize: 13, color: 'var(--text-muted)' }}>The tailored resume will appear here once AI tailoring finishes.</div>
+  const templateLabel = resume.templateId ? `${resume.templateId[0].toUpperCase()}${resume.templateId.slice(1)} template` : 'Clean template'
+  return <div>
+    <button onClick={onReview} aria-label="Open the full tailored resume preview" style={{ display: 'block', position: 'relative', width: '100%', height: 420, padding: 0, overflow: 'hidden', contain: 'layout paint', border: '1px solid #dbe1ea', borderRadius: 8, background: '#e9eef5', cursor: 'zoom-in', textAlign: 'left' }}>
+      <div style={{ position: 'absolute', inset: 0, width: '222.23%', transform: 'scale(.45)', transformOrigin: 'top left', pointerEvents: 'none', background: '#fff' }}>
+        <ResumeRenderer content={resume.content} templateId={resume.templateId} templateOptions={resume.templateOptions} />
+      </div>
+      <span style={{ position: 'absolute', right: 12, bottom: 12, display: 'inline-flex', alignItems: 'center', gap: 5, padding: '8px 10px', borderRadius: 7, background: 'rgba(15,23,42,.86)', color: '#fff', fontSize: 12, fontWeight: 700 }}>View full resume <ChevronRight size={15} /></span>
+    </button>
+    <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12, marginTop: 10, fontSize: 12, color: '#64748b' }}><span>AI tailored for this job</span><span>{templateLabel}</span></div>
+  </div>
+}
+
+function CoverLetterPackPreview({ coverLetter, applicant, fallbackName, company, role, templateId, templateOptions, onReview }: {
+  coverLetter: CoverLetter | null; applicant?: Resume['content']['contact']; fallbackName: string; company: string; role: string
+  templateId?: string | null; templateOptions?: Resume['templateOptions']; onReview: () => void
+}) {
+  return coverLetter
+    ? <button onClick={onReview} aria-label="Open the full generated cover letter" style={{ display: 'block', position: 'relative', width: '100%', height: 260, padding: 0, overflow: 'hidden', contain: 'layout paint', border: '1px solid #dbe1ea', borderRadius: 8, background: '#e9eef5', cursor: 'zoom-in', textAlign: 'left' }}><div style={{ position: 'absolute', inset: 0, width: '200%', transform: 'scale(.5)', transformOrigin: 'top left', pointerEvents: 'none' }}><CoverLetterPreview content={coverLetter.content} applicant={applicant} fallbackName={fallbackName} company={company} role={role} templateId={templateId ?? coverLetter.templateId ?? 'clean'} templateOptions={templateOptions ?? coverLetter.templateOptions ?? {}} /></div><span style={{ position: 'absolute', right: 12, bottom: 12, display: 'inline-flex', alignItems: 'center', gap: 4, padding: '7px 9px', borderRadius: 6, background: 'rgba(15,23,42,.86)', color: '#fff', fontSize: 11, fontWeight: 700 }}>View full letter <ChevronRight size={14} /></span></button>
+    : <div style={{ fontSize: 13, color: 'var(--text-muted)' }}>The generated cover letter will appear here after automatic preparation.</div>
+}
+
+function DocumentPreviewModal({ title, onClose, children }: { title: string; onClose: () => void; children: React.ReactNode }) {
+  return <div role="dialog" aria-modal="true" aria-label={title} style={{ position: 'fixed', inset: 0, zIndex: 130, display: 'grid', placeItems: 'center', padding: 24, background: 'rgba(15,23,42,.62)' }} onMouseDown={onClose}>
+    <div style={{ width: 'min(920px, calc(100vw - 48px))', maxHeight: 'calc(100vh - 48px)', display: 'flex', flexDirection: 'column', overflow: 'hidden', background: '#f1f5f9', borderRadius: 14, boxShadow: '0 24px 80px rgba(15,23,42,.42)' }} onMouseDown={event => event.stopPropagation()}>
+      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 16, padding: '15px 20px', background: '#fff', borderBottom: '1px solid #dbe1ea' }}><div><div style={{ fontSize: 15, fontWeight: 700, color: '#0f172a' }}>{title}</div><div style={{ marginTop: 2, fontSize: 12, color: '#64748b' }}>Full application document preview</div></div><button onClick={onClose} aria-label="Close preview" style={{ display: 'grid', placeItems: 'center', width: 32, height: 32, border: 'none', borderRadius: 8, color: '#475569', background: '#f1f5f9', cursor: 'pointer' }}><X size={18} /></button></div>
+      <div style={{ flex: 1, overflow: 'auto', padding: 24 }}>{children}</div>
+    </div>
+  </div>
+}
+
+function AuditPackPreview({ audit }: { audit: ApplicationAudit | null }) {
+  if (!audit) return <div style={{ fontSize: 13, color: 'var(--text-muted)' }}>No audit result yet. The audit checks the tailored resume and cover letter against the original resume before the application can be opened.</div>
+  return <div><div style={{ display: 'flex', justifyContent: 'space-between', gap: 10, fontSize: 13, fontWeight: 700 }}><span>{audit.summary}</span><span style={{ color: audit.verdict === 'pass' ? '#3b8c1a' : audit.verdict === 'blocked' ? '#b42318' : '#a16207', whiteSpace: 'nowrap' }}>{audit.matchScore}% match</span></div><div style={{ marginTop: 10, display: 'grid', gap: 8 }}>{audit.findings.map((finding, index) => <div key={`${finding.title}-${index}`} style={{ fontSize: 12, lineHeight: 1.5 }}><strong style={{ color: finding.severity === 'pass' ? '#3b8c1a' : finding.severity === 'critical' ? '#b42318' : '#a16207' }}>{finding.severity === 'pass' ? 'Passed' : finding.severity === 'critical' ? 'Blocked' : 'Review'} · {finding.title}</strong><div style={{ color: '#64748b' }}>{finding.action}</div></div>)}</div></div>
+}
+
+function JobDetail({ label, value, href }: { label: string; value: string; href?: string }) {
+  return <div style={{ display: 'grid', gridTemplateColumns: '30px 1fr', gap: 12, alignItems: 'center', marginBottom: 16 }}>
+    <span style={{ width: 30, height: 30, display: 'grid', placeItems: 'center', borderRadius: 8, background: '#f3f6fb', color: '#64748b' }}>{href ? <Link2 size={16} /> : <FileText size={16} />}</span>
+    <span><span style={{ display: 'block', fontSize: 13, fontWeight: 700 }}>{label}</span>{href ? <a href={href} target="_blank" rel="noopener noreferrer" style={{ display: 'inline-flex', alignItems: 'center', gap: 4, marginTop: 2, color: '#2563eb', fontSize: 13, textDecoration: 'none' }}>{value} <ChevronRight size={14} /></a> : <span style={{ display: 'block', marginTop: 2, color: 'var(--text-muted)', fontSize: 13 }}>{value}</span>}</span>
+  </div>
 }
 
 // ── PaginationBar ────────────────────────────────────────────────────────────
@@ -975,58 +1088,6 @@ function PaginationBar({
   )
 }
 
-// ── Auto Apply Button ─────────────────────────────────────────────────────────
-function AutoApplyButton({ job, onApplied }: { job: Job; onApplied?: () => void }) {
-  const [loading, setLoading] = useState(false)
-  const toast = useToast()
-
-  async function handleAutoApply() {
-    setLoading(true)
-    try {
-      const res = await fetch(`/api/jobs/${job.id}/auto-apply`, { method: 'POST' })
-      if (res.ok) {
-        toast.success('Queued for auto-apply 🤖')
-        onApplied?.()
-      } else {
-        const d = await res.json().catch(() => ({}))
-        if (res.status === 409) toast.info('Already applied or in progress')
-        else if (res.status === 429) toast.warning('Rate limit exceeded — try again later')
-        else toast.error(d.error ?? 'Failed to queue auto-apply')
-      }
-    } catch {
-      toast.error('Network error — try again')
-    } finally {
-      setLoading(false)
-    }
-  }
-
-  const isApplied = job.status === 'applied'
-
-  return (
-    <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
-      <button
-        onClick={handleAutoApply}
-        disabled={isApplied || loading}
-        style={{
-          padding: '6px 14px', fontSize: 12, borderRadius: 6, fontWeight: 500,
-          background: isApplied ? 'var(--bg-secondary)' : '#185FA5',
-          color: isApplied ? 'var(--text-muted)' : '#fff',
-          border: isApplied ? '1px solid var(--border)' : 'none',
-          cursor: (isApplied || loading) ? 'default' : 'pointer',
-          display: 'flex', alignItems: 'center', gap: 6,
-          opacity: loading ? 0.7 : 1,
-          width: 'fit-content',
-        }}
-      >
-        {loading ? '⏳ Queuing…' : isApplied ? '⏳ Applied' : '🤖 Auto Apply'}
-      </button>
-      {isApplied && (
-        <ApplyStatusCard jobId={job.id} jobUrl={job.url ?? undefined} jobStatus={job.status} />
-      )}
-    </div>
-  )
-}
-
 function ScoreJobButton({ job, onUpdate }: { job: Job; onUpdate: (updated: Job) => void }) {
   const [loading, setLoading] = useState(false)
   const toast = useToast()
@@ -1102,6 +1163,7 @@ function ScoreJobButton({ job, onUpdate }: { job: Job; onUpdate: (updated: Job) 
 // ── JobsPage ──────────────────────────────────────────────────────────────────
 export function JobsPage() {
   const toast = useToast()
+  const { navigate } = useNav()
   const [confirm, ConfirmDialog] = useConfirm()
   const [view,         setView        ] = useState<'list' | 'kanban'>('list')
   const [search,       setSearch      ] = useState('')
@@ -1117,6 +1179,8 @@ export function JobsPage() {
   const [pageSize,     setPageSize    ] = useState(20)
   const [sortBy,       setSortBy      ] = useState<'createdAt' | 'score' | 'company' | 'role'>('createdAt')
   const [sortDir,      setSortDir     ] = useState<'asc' | 'desc'>('desc')
+  const sortByRef = useRef(sortBy)
+  const sortDirRef = useRef(sortDir)
   const [selectedIds,  setSelectedIds ] = useState<Set<string>>(() => new Set())
   const [bulkDeleting, setBulkDeleting] = useState(false)
   const [scoringAll,   setScoringAll   ] = useState(false)
@@ -1132,6 +1196,7 @@ export function JobsPage() {
   // Debounced fetch
   useEffect(() => {
     let cancelled = false
+    const controller = new AbortController()
     const timer = setTimeout(async () => {
       const isDefaultView = !search && filterStatus === 'all' && page === 1 && pageSize === 20
       setLoading(!isDefaultView || defaultJobsCache === null)
@@ -1140,39 +1205,33 @@ export function JobsPage() {
         const params = new URLSearchParams({ page: String(page), pageSize: String(pageSize) })
         if (search)                params.set('q',      search)
         if (filterStatus !== 'all') params.set('status', filterStatus)
-        const res  = await fetch(`/api/jobs?${params}`)
+        const res  = await fetch(`/api/jobs?${params}`, { signal: controller.signal })
         const json = await res.json()
         if (!cancelled) {
           const rawJobs: Job[] = json.jobs ?? []
-          // Client-side sort (API returns createdAt desc by default; override for other sorts)
-          const sorted = [...rawJobs].sort((a, b) => {
-            let cmp = 0
-            if (sortBy === 'score') {
-              cmp = (a.score ?? -1) - (b.score ?? -1)
-            } else if (sortBy === 'company') {
-              cmp = a.company.localeCompare(b.company)
-            } else if (sortBy === 'role') {
-              cmp = a.role.localeCompare(b.role)
-            }
-            // createdAt is default from API, no extra sort needed
-            if (sortBy === 'createdAt' || cmp === 0) {
-              cmp = new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime()
-            }
-            return sortDir === 'desc' ? cmp : -cmp
-          })
+          const sorted = sortJobs(rawJobs, sortByRef.current, sortDirRef.current)
           const nextTotal = json.total ?? 0
           if (isDefaultView) defaultJobsCache = { jobs: sorted, total: nextTotal }
           setJobs(sorted)
           setTotal(nextTotal)
         }
-      } catch {
+      } catch (error) {
+        if (error instanceof DOMException && error.name === 'AbortError') return
         if (!cancelled) setFetchError('Failed to load jobs')
       } finally {
         if (!cancelled) setLoading(false)
       }
     }, search ? 300 : 0)
-    return () => { cancelled = true; clearTimeout(timer) }
-  }, [search, filterStatus, page, pageSize, sortBy, sortDir, refreshTick])
+    return () => { cancelled = true; controller.abort(); clearTimeout(timer) }
+  }, [search, filterStatus, page, pageSize, refreshTick])
+
+  // Sorting is entirely local: avoid turning a simple UI operation into a
+  // round-trip to the jobs API.
+  useEffect(() => {
+    sortByRef.current = sortBy
+    sortDirRef.current = sortDir
+    setJobs(previous => sortJobs(previous, sortBy, sortDir))
+  }, [sortBy, sortDir])
 
   // When the component gains focus (user navigates back from Search), refresh
   useEffect(() => {
@@ -1407,6 +1466,15 @@ export function JobsPage() {
             })
             defaultJobsCache = null
             window.dispatchEvent(new Event('applymate:jobs-changed'))
+          }}
+          onOpenTailoredResume={resumeId => {
+            sessionStorage.setItem('applymate:resume-return', JSON.stringify({ resumeId, jobId: selectedJob.id }))
+            const url = new URL(window.location.href)
+            url.searchParams.set('resumeId', resumeId)
+            url.searchParams.set('returnToJobs', '1')
+            url.searchParams.set('returnJobId', selectedJob.id)
+            window.history.replaceState({}, '', url.toString())
+            navigate('resume')
           }}
         />
       )}

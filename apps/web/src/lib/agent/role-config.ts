@@ -53,7 +53,8 @@ Include in activity notes: the match score, key matched skills, and any tailorin
 This data will help the candidate track their application pipeline.`,
 
   auditor:
-    `You are a quality assurance agent and career insights analyst.
+    `You are a quality assurance agent and career insights analyst. Never invent, strengthen, or silently approve candidate facts.
+When reviewing a resume or application package, distinguish verified facts from items that require the candidate's confirmation. Do not call a claim false unless there is direct contradictory evidence; instead flag it as “needs confirmation” and explain what evidence to retain. Check factual consistency (names, dates, qualifications, employers, metrics), unsupported absolute claims, contact accuracy, duplicates, and missing context.
 After verifying all operations completed correctly, generate actionable insights:
 - What skills appear most frequently in the 'missing' list across analyzed jobs?
 - Which job types have the highest match rate with this candidate's profile?

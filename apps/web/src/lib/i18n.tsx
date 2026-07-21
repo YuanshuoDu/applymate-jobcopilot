@@ -1,5 +1,5 @@
 'use client'
-import React, { createContext, useContext, useState, useCallback } from 'react'
+import React, { createContext, useContext, useState, useCallback, useMemo } from 'react'
 
 export type Lang = 'en' | 'de' | 'fr' | 'es' | 'nl' | 'zh'
 
@@ -563,7 +563,8 @@ export function I18nProvider({ children }: { children: React.ReactNode }) {
     return dict[lang]?.[key] ?? dict.en?.[key] ?? key
   }, [lang])
 
-  return React.createElement(I18nContext.Provider, { value: { lang, t, setLang } }, children)
+  const value = useMemo(() => ({ lang, t, setLang }), [lang, t, setLang])
+  return React.createElement(I18nContext.Provider, { value }, children)
 }
 
 export function useI18n() {

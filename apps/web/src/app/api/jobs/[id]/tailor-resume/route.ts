@@ -8,6 +8,7 @@ import { Prisma } from '@prisma/client'
 import { db } from '@/lib/db'
 import { prepareAiRoute, ok, err } from '@/lib/api-helpers'
 import { modelChat, parseAiJson } from '@/lib/model-router'
+import type { ApplicationAuditFinding } from '@/lib/types'
 
 type Params = { params: Promise<{ id: string }> }
 
@@ -52,21 +53,40 @@ export async function POST(req: NextRequest, { params }: Params) {
   const body = await req.json().catch(() => null)
   if (!body) return err('Invalid JSON body')
 
-  const { resumeId } = body as { resumeId?: string }
+  const { resumeId, forceRetailor = false, auditFindings = [] } = body as {
+    resumeId?: string
+    forceRetailor?: boolean
+    auditFindings?: ApplicationAuditFinding[]
+  }
   if (!resumeId) return err('resumeId is required')
 
-  const [resume, job] = await Promise.all([
+  const [resume, job, existing] = await Promise.all([
     db.resume.findFirst({ where: { id: resumeId, userId: prep.userId } }),
     db.job.findFirst({ where: { id: jobId, userId: prep.userId } }),
+    db.resume.findFirst({
+      where: { userId: prep.userId, targetJobId: jobId, kind: 'adapted', origin: 'ai-adapted' },
+      orderBy: { updatedAt: 'desc' },
+      select: { id: true, parentResumeId: true, content: true, name: true },
+    }),
   ])
 
   if (!resume) return err('Resume not found', 404)
   if (!job) return err('Job not found', 404)
   if (!job.description) return err('Job description is required')
+  if (existing && !forceRetailor) return ok({ adaptedResumeId: existing.id, changes: [], reused: true })
 
-  const resumeContent = resume.content as Record<string, unknown>
+  const sourceResume = forceRetailor && existing?.parentResumeId
+    ? await db.resume.findFirst({ where: { id: existing.parentResumeId, userId: prep.userId } })
+    : resume
+  if (!sourceResume) return err('The original resume for this tailored version could not be found', 404)
+
+  const resumeContent = sourceResume.content as Record<string, unknown>
   const adaptedContent = cloneJson(resumeContent)
   const changes: ChangeDetail[] = []
+  const corrections = Array.isArray(auditFindings)
+    ? auditFindings.filter(finding => finding.severity !== 'pass').slice(0, 6)
+      .map(finding => `- ${finding.area}: ${finding.title}. Required correction: ${finding.action}`)
+    : []
 
   for (const section of SECTIONS) {
     const currentValue = resumeContent[section]
@@ -84,6 +104,7 @@ export async function POST(req: NextRequest, { params }: Params) {
       `TARGET JOB: ${job.role} at ${job.company}`,
       job.keywords ? `KNOWN KEYWORDS: ${job.keywords}` : '',
       `JOB DESCRIPTION:\n${job.description.slice(0, 1800)}`,
+      corrections.length ? `AUDIT CORRECTIONS (remove or rewrite unsupported claims; never invent evidence):\n${corrections.join('\n')}` : '',
       '',
       'Return ONLY JSON in this shape:',
       '{"after": <the tailored section value, same JSON type as the current section>, "reason": "brief explanation of the keyword/positioning changes"}',
@@ -110,20 +131,27 @@ export async function POST(req: NextRequest, { params }: Params) {
 
   if (changes.length === 0) return err('No resume sections could be tailored', 502)
 
-  const adapted = await db.resume.create({
-    data: {
+  const adapted = existing && forceRetailor
+    ? await (async () => {
+      await db.resumeVersion.create({
+        data: { resumeId: existing.id, userId: prep.userId, content: existing.content as Prisma.InputJsonValue, name: existing.name },
+      })
+      return db.resume.update({ where: { id: existing.id }, data: { content: adaptedContent as Prisma.InputJsonValue } })
+    })()
+    : await db.resume.create({
+      data: {
       userId:          prep.userId,
       name:            `Tailored for ${job.company} - ${job.role}`,
       content:         adaptedContent as Prisma.InputJsonValue,
-      templateId:      resume.templateId ?? null,
-      templateOptions: resume.templateOptions ?? undefined,
+      templateId:      sourceResume.templateId ?? null,
+      templateOptions: sourceResume.templateOptions ?? undefined,
       isDefault:       false,
-      directionId:     resume.directionId ?? null,
+      directionId:     sourceResume.directionId ?? null,
       kind:            'adapted',
-      parentResumeId:  resume.id,
+      parentResumeId:  sourceResume.id,
       targetJobId:     job.id,
       origin:          'ai-adapted',
-      basicsDetached:  resume.basicsDetached ?? false,
+      basicsDetached:  sourceResume.basicsDetached ?? false,
     },
   })
 
@@ -132,10 +160,10 @@ export async function POST(req: NextRequest, { params }: Params) {
       userId: prep.userId,
       jobId:  job.id,
       type:   'resume_tailored',
-      text:   `Created tailored resume "${adapted.name}"`,
+      text:   `${forceRetailor ? 'Revised' : 'Created'} tailored resume "${adapted.name}"`,
       color:  '#3B6D11',
     },
   }).catch(() => null)
 
-  return ok({ adaptedResumeId: adapted.id, changes })
+  return ok({ adaptedResumeId: adapted.id, changes, revised: Boolean(existing && forceRetailor) })
 }

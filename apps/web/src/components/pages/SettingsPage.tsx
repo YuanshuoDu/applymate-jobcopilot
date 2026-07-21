@@ -142,8 +142,10 @@ export function SettingsPage() {
   const [connectedProviders, setConnectedProviders] = useState<{ provider: string; account: string }[]>([])
   const [gmailHealth, setGmailHealth] = useState<{ hasGmail: boolean; reason: string | null; scopes?: string; gmailError?: string }>({ hasGmail: true, reason: null })
 
-  // Fetch real OAuth connections + gmail health
+  // OAuth state is only shown on the Accounts tab. Deferring these requests
+  // keeps the common Profile/Appearance visits responsive.
   useEffect(() => {
+    if (activeTab !== 'accounts') return
     fetch('/api/me/accounts')
       .then(r => r.json())
       .then(d => setConnectedProviders(d.accounts ?? []))
@@ -152,7 +154,7 @@ export function SettingsPage() {
       .then(r => r.json())
       .then(d => setGmailHealth({ hasGmail: d.hasGmail, reason: d.reason, scopes: d.scopes, gmailError: d.gmailError }))
       .catch(() => {})
-  }, [])
+  }, [activeTab])
 
   // Merge real connections with static config
   const accounts = useMemo(() => {

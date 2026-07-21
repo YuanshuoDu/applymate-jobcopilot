@@ -1,6 +1,6 @@
 'use client'
 
-import React, { createContext, useCallback, useContext, useState } from 'react'
+import React, { createContext, useCallback, useContext, useMemo, useState } from 'react'
 import type { JobStatus } from '@/lib/types'
 
 export { UserAvatar } from './UserAvatar'
@@ -95,12 +95,15 @@ export function ToastProvider({ children }: { children: React.ReactNode }) {
     setToasts(t => [...t, { id, variant, title, description }])
     setTimeout(() => setToasts(t => t.filter(x => x.id !== id)), 4200)
   }, [])
-  const ctx: ToastCtx = {
+  // Keep the context value stable while the toast list changes. Consumers such
+  // as Gmail use it in effects, so a new object here could trigger avoidable
+  // reloads after every notification.
+  const ctx = useMemo<ToastCtx>(() => ({
     success: (t, d) => add('success', t, d),
     info:    (t, d) => add('info', t, d),
     warning: (t, d) => add('warning', t, d),
     error:   (t, d) => add('error', t, d),
-  }
+  }), [add])
   const variantStyle = {
     success: { icon: '✓', color: '#059669', bg: 'rgba(5,150,105,0.12)',  border: 'rgba(5,150,105,0.25)',  glow: 'rgba(5,150,105,0.15)'  },
     info:    { icon: 'i', color: '#4F46E5', bg: 'rgba(79,70,229,0.12)',  border: 'rgba(79,70,229,0.25)',  glow: 'rgba(79,70,229,0.15)'  },

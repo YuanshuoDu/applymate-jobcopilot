@@ -3,10 +3,8 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react'
 import { TopBar }              from '@/components/layout/TopBar'
 import { useToast } from '@/components/ui'
-import type { AgentRole } from '@/lib/types'
 import { useApi, apiMutate }   from '@/lib/hooks'
-import type { AiConfig }       from '@/lib/model-router'
-import { AddAgentModal, type CustomAgentRow } from '@/components/agent-workspace/AddAgentModal'
+import { AddAgentModal } from '@/components/agent-workspace/AddAgentModal'
 import { AgentUnifiedStream } from '@/components/agent-workspace/AgentUnifiedStream'
 import type { ApplyReadyJob } from '@/components/agent-workspace/ApplyJobCard'
 import { AgentSessionConsole } from '@/components/agent-workspace/AgentSessionConsole'
@@ -24,9 +22,7 @@ import type { LogEntry, QuestionOption, RunSummary } from '@/components/agent-wo
 export function AgentPlaygroundPage() {
   const toast = useToast()
 
-  const { refetch: refetchRoles }                        = useApi<AgentRole[]>('/api/agent/roles')
   const { data: jobsData }                               = useApi<{ jobs: Array<{ status: string }> }>('/api/jobs?pageSize=100')
-  const { refetch: refetchCustom }                       = useApi<CustomAgentRow[]>('/api/agent/roles/custom')
 
   const [showAddModal,  setShowAddModal]  = useState(false)
   const [applyQueue,    setApplyQueue]    = useState<ApplyReadyJob[]>([])
@@ -255,7 +251,6 @@ export function AgentPlaygroundPage() {
       addLog({ type: 'done', message: `✅ 流水线完成 — ${d.processed} 个评分，${d.applied} 个投递，${d.pending} 个待审核，${d.skipped} 个跳过`, time: new Date() })
       es.close(); esRef.current = null
       setSessionsRefreshVersion(v => v + 1)
-      refetchRoles()
       toast.success(
         'Pipeline complete',
         d.processed > 0
@@ -271,7 +266,7 @@ export function AgentPlaygroundPage() {
       setCurrentRole(null); setRunDone(true)
       es.close(); esRef.current = null
     })
-  }, [addLog, autonomousMode, refetchRoles, toast])
+  }, [addLog, autonomousMode, toast])
 
   const stopRun = useCallback(() => {
     runIdRef.current += 1
@@ -321,7 +316,6 @@ export function AgentPlaygroundPage() {
           toast.error('Agent 更新失败', error)
           throw new Error(error)
         }
-        await refetchRoles()
         window.dispatchEvent(new Event('applymate:agents-changed'))
         toast.info(enabled ? `${role} 已启用` : `${role} 已禁用`, '')
         break
@@ -341,7 +335,7 @@ export function AgentPlaygroundPage() {
         if (action.path === 'jobs') window.location.href = '/?page=jobs'
         break
     }
-  }, [refetchRoles, startRun, stopRun, toast])
+  }, [startRun, stopRun, toast])
 
   const handleAnswerQuestion = useCallback(async (entry: LogEntry, opt: QuestionOption) => {
     // Apply action
@@ -414,8 +408,7 @@ export function AgentPlaygroundPage() {
       {showAddModal && (
         <AddAgentModal
           onClose={() => setShowAddModal(false)}
-          onCreated={async () => {
-            await refetchCustom()
+          onCreated={() => {
             window.dispatchEvent(new Event('applymate:agents-changed'))
           }}
         />

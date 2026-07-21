@@ -1,6 +1,6 @@
 'use client'
 
-import React, { useState, useEffect, useCallback, useRef } from 'react'
+import React, { useState, useEffect, useCallback, useMemo, useRef } from 'react'
 import { useSession } from 'next-auth/react'
 import { TopBar }              from '@/components/layout/TopBar'
 import { Btn, Card, useToast } from '@/components/ui'
@@ -414,12 +414,12 @@ export function GmailPage() {
   // Prevent double-auth-redirect: track if we already triggered the OAuth flow
   const authTriggeredRef = useRef(false)
 
-  const loadEmails = useCallback(async (silent = false) => {
+  const loadEmails = useCallback(async (silent = false, signal?: AbortSignal) => {
     if (!silent) setStatus('loading')
     else         setRefreshing(true)
 
     try {
-      const res  = await fetch('/api/gmail/threads')
+      const res  = await fetch('/api/gmail/threads', { signal })
       const body = await res.json()
 
       if (!res.ok) {
@@ -443,7 +443,8 @@ export function GmailPage() {
       setEmails(body.emails ?? [])
       setStatus('ready')
       if (silent) toast.success('Refreshed', `${(body.emails ?? []).length} emails loaded`)
-    } catch {
+    } catch (error) {
+      if (error instanceof DOMException && error.name === 'AbortError') return
       setStatus('error')
     } finally {
       setRefreshing(false)
@@ -451,6 +452,7 @@ export function GmailPage() {
   }, [toast])
 
   useEffect(() => {
+    const controller = new AbortController()
     // Detect if returning from Gmail OAuth — show success toast and force reload
     const params = new URLSearchParams(window.location.search)
     if (params.get('gmailAuth') === '1') {
@@ -466,7 +468,8 @@ export function GmailPage() {
       window.history.replaceState({}, '', url)
       toast.error('Gmail connection failed', gErr)
     }
-    loadEmails()
+    void loadEmails(false, controller.signal)
+    return () => controller.abort()
   }, [loadEmails, toast])
 
   function connectGoogle() {
@@ -490,21 +493,26 @@ export function GmailPage() {
 
   // ── Derived lists ─────────────────────────────────────────────────────────
 
-  const filtered = emails.filter(e => {
-    const matchesFilter =
-      filter === 'all'     ? true :
-      filter === 'starred' ? e.starred :
-      filter === 'unread'  ? !e.read :
-      e.tag === filter
-    const matchesSearch = !search ||
-      [e.subject, e.name, e.from].some(t => t.toLowerCase().includes(search.toLowerCase()))
-    return matchesFilter && matchesSearch
-  })
+  const { filtered, unreadCount, starredCount, tagCounts } = useMemo(() => {
+    const nextTagCounts: Record<string, number> = {}
+    const normalizedSearch = search.toLowerCase()
+    let nextUnreadCount = 0
+    let nextStarredCount = 0
+    const nextFiltered = emails.filter(email => {
+      if (!email.read) nextUnreadCount += 1
+      if (email.starred) nextStarredCount += 1
+      nextTagCounts[email.tag] = (nextTagCounts[email.tag] ?? 0) + 1
 
-  const unreadCount = emails.filter(e => !e.read).length
-  const tagCounts   = emails.reduce<Record<string, number>>((acc, e) => {
-    acc[e.tag] = (acc[e.tag] ?? 0) + 1; return acc
-  }, {})
+      const matchesFilter = filter === 'all'
+        || (filter === 'starred' && email.starred)
+        || (filter === 'unread' && !email.read)
+        || email.tag === filter
+      const matchesSearch = !normalizedSearch
+        || [email.subject, email.name, email.from].some(text => text.toLowerCase().includes(normalizedSearch))
+      return matchesFilter && matchesSearch
+    })
+    return { filtered: nextFiltered, unreadCount: nextUnreadCount, starredCount: nextStarredCount, tagCounts: nextTagCounts }
+  }, [emails, filter, search])
 
   // ── Loading / error / connect states ──────────────────────────────────────
 
@@ -570,7 +578,7 @@ export function GmailPage() {
           {[
             { key: 'all',     label: 'All Emails', count: emails.length      },
             { key: 'unread',  label: 'Unread',      count: unreadCount         },
-            { key: 'starred', label: 'Starred',     count: emails.filter(e => e.starred).length },
+            { key: 'starred', label: 'Starred',     count: starredCount },
           ].map(f => (
             <button key={f.key} onClick={() => setFilter(f.key)} style={{
               width: '100%', display: 'flex', alignItems: 'center', justifyContent: 'space-between',

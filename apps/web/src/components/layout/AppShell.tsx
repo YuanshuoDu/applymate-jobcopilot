@@ -1,6 +1,7 @@
 'use client'
 
-import React, { useState, useEffect, useRef } from 'react'
+import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react'
+import dynamic from 'next/dynamic'
 import { useSession, signIn, signOut } from 'next-auth/react'
 import { useRouter } from 'next/navigation'
 import { Bell } from 'lucide-react'
@@ -9,15 +10,32 @@ import { ToastProvider } from '@/components/ui'
 import type { Page } from '@/lib/types'
 import { NavContext } from '@/lib/nav-context'
 import { OnboardingFlow } from '@/components/onboarding/OnboardingFlow'
-import { DashboardPage }      from '@/components/pages/DashboardPage'
-import { JobsPage }           from '@/components/pages/JobsPage'
-import { SearchPage }         from '@/components/pages/SearchPage'
-import { ResumePage }         from '@/components/pages/ResumePage'
-import { GmailPage }          from '@/components/pages/GmailPage'
-import { AgentPlaygroundPage } from '@/components/pages/AgentPlaygroundPage'
-import { AgentHistoryPage }   from '@/components/pages/AgentHistoryPage'
-import { SettingsPage }       from '@/components/pages/SettingsPage'
-import { ObservabilityPage } from '@/components/pages/ObservabilityPage'
+
+function PageLoading() {
+  return <div style={{ flex: 1, display: 'grid', placeItems: 'center', color: 'var(--text-muted)', fontSize: 13 }}>Loading page…</div>
+}
+
+const DashboardPage = dynamic(() => import('@/components/pages/DashboardPage').then(module => module.DashboardPage), { loading: PageLoading })
+const JobsPage = dynamic(() => import('@/components/pages/JobsPage').then(module => module.JobsPage), { loading: PageLoading })
+const SearchPage = dynamic(() => import('@/components/pages/SearchPage').then(module => module.SearchPage), { loading: PageLoading })
+const ResumePage = dynamic(() => import('@/components/pages/ResumePage').then(module => module.ResumePage), { loading: PageLoading })
+const GmailPage = dynamic(() => import('@/components/pages/GmailPage').then(module => module.GmailPage), { loading: PageLoading })
+const AgentPlaygroundPage = dynamic(() => import('@/components/pages/AgentPlaygroundPage').then(module => module.AgentPlaygroundPage), { loading: PageLoading })
+const AgentHistoryPage = dynamic(() => import('@/components/pages/AgentHistoryPage').then(module => module.AgentHistoryPage), { loading: PageLoading })
+const SettingsPage = dynamic(() => import('@/components/pages/SettingsPage').then(module => module.SettingsPage), { loading: PageLoading })
+const ObservabilityPage = dynamic(() => import('@/components/pages/ObservabilityPage').then(module => module.ObservabilityPage), { loading: PageLoading })
+
+const PAGE_PRELOADERS: Record<Page, () => Promise<unknown>> = {
+  dashboard: () => import('@/components/pages/DashboardPage'),
+  jobs: () => import('@/components/pages/JobsPage'),
+  search: () => import('@/components/pages/SearchPage'),
+  resume: () => import('@/components/pages/ResumePage'),
+  gmail: () => import('@/components/pages/GmailPage'),
+  agent: () => import('@/components/pages/AgentPlaygroundPage'),
+  'agent-history': () => import('@/components/pages/AgentHistoryPage'),
+  settings: () => import('@/components/pages/SettingsPage'),
+  observability: () => import('@/components/pages/ObservabilityPage'),
+}
 
 interface NotificationItem {
   id: string
@@ -143,11 +161,19 @@ export function AppShell() {
   const [unreadCount, setUnreadCount] = useState(0)
   const [sidebarPopover, setSidebarPopover] = useState<'account' | 'notifications' | null>(null)
 
-  function navigatePage(nextPage: Page, mode: 'push' | 'replace' = 'push') {
+  const prefetchPage = useCallback((nextPage: Page) => {
+    // A speculative prefetch must never surface an unhandled rejection; the
+    // dynamic component will still load normally if a transient request fails.
+    void PAGE_PRELOADERS[nextPage]().catch(() => undefined)
+  }, [])
+
+  const navigatePage = useCallback((nextPage: Page, mode: 'push' | 'replace' = 'push') => {
+    prefetchPage(nextPage)
     setSidebarPopover(null)
     setPage(nextPage)
     writePageToUrl(nextPage, mode)
-  }
+  }, [prefetchPage])
+  const navContextValue = useMemo(() => ({ navigate: navigatePage }), [navigatePage])
 
   useEffect(() => {
     if (!sidebarPopover) return
@@ -365,7 +391,7 @@ export function AppShell() {
         }
       `}</style>
       <ToastProvider>
-      <NavContext.Provider value={{ navigate: navigatePage }}>
+      <NavContext.Provider value={navContextValue}>
         {/* Onboarding sits inside ToastProvider so useToast works */}
         {needsOnboarding ? (
           <OnboardingFlow onComplete={() => setNeedsOnboarding(false)} />
@@ -376,6 +402,7 @@ export function AppShell() {
                 <Sidebar
                   active={page}
                   onNav={navigatePage}
+                  onNavIntent={prefetchPage}
                   session={session}
                   jobCount={jobCount}
                   accountMenuOpen={sidebarPopover === 'account'}
@@ -408,6 +435,7 @@ export function AppShell() {
                 <button key={item.id}
                   aria-label={item.label}
                   onClick={() => navigatePage(item.id)}
+                  onPointerEnter={() => prefetchPage(item.id)}
                   style={{
                     display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 3,
                     flex: 1, padding: '6px 0', border: 'none', background: 'transparent', cursor: 'pointer',
