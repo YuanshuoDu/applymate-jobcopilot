@@ -1,31 +1,105 @@
 /* ApplyMate AI — injected styles (scoped to our elements only) */
 
-/* ── Reset for all ApplyMate injected elements ────────────────── */
+/* ── Reset for all ApplyMate injected elements ──────────────────
+   REPLACED all:initial with targeted properties because the former
+   can interact unpredictably with host-page CSS on LinkedIn / Indeed
+   and cause the button to be sized as 0×0 or invisible. */
 #applymate-save-btn,
 #am-lazy-btn,
 #applymate-toast {
-  all: initial;
+  margin: 0;
+  padding: 0;
+  border: none;
+  outline: none;
+  background: none;
+  color: inherit;
+  font-size: inherit;
+  font-weight: inherit;
+  line-height: inherit;
+  text-decoration: none;
+  text-transform: none;
+  letter-spacing: normal;
+  white-space: normal;
+  box-shadow: none;
+  list-style: none;
+  cursor: default;
+  user-select: auto;
+  pointer-events: auto;
+  overflow: visible;
+  opacity: 1;
+  visibility: visible;
   box-sizing: border-box;
   font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  /* Ensure the button is always visible regardless of host CSS */
+  min-width: 0 !important;
+  min-height: 0 !important;
+  position: static;
+  display: inline;
 }
+
 #applymate-save-btn *,
 #am-lazy-btn *,
 #applymate-toast * {
-  all: unset;
+  margin: 0;
+  padding: 0;
+  border: none;
+  outline: none;
+  background: none;
+  color: inherit;
+  font-size: inherit;
+  font-weight: inherit;
+  line-height: inherit;
+  text-decoration: none;
+  text-transform: none;
+  letter-spacing: normal;
+  box-shadow: none;
+  list-style: none;
+  pointer-events: auto;
+  overflow: visible;
   box-sizing: border-box;
 }
 
 /* ── Detail page: inline/fallback action group (wrapper = #applymate-save-btn) ── */
 #applymate-save-btn button {
-  all: unset;
-  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+  border: none;
+  outline: none;
+  background: none;
+  color: inherit;
+  font-size: inherit;
+  font-weight: inherit;
+  line-height: inherit;
+  text-decoration: none;
+  text-transform: none;
+  letter-spacing: normal;
+  box-shadow: none;
   cursor: pointer;
   font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  box-sizing: border-box;
 }
 
 /* ── List-mode: per-card ⊕ button ────────────────────────────── */
 .applymate-card-btn {
-  all: initial;
+  margin: 0;
+  padding: 0;
+  border: none;
+  outline: none;
+  background: none;
+  color: inherit;
+  font-size: inherit;
+  font-weight: inherit;
+  line-height: inherit;
+  text-decoration: none;
+  text-transform: none;
+  letter-spacing: normal;
+  box-shadow: none;
+  list-style: none;
+  cursor: pointer;
+  user-select: auto;
+  pointer-events: auto;
+  overflow: visible;
+  box-sizing: border-box;
   position: absolute !important;
   top: 10px !important;
   right: 10px !important;
@@ -35,8 +109,6 @@
   border-radius: 50% !important;
   background: #4F46E5 !important;
   color: #fff !important;
-  border: none !important;
-  cursor: pointer !important;
   font-size: 15px !important;
   line-height: 1 !important;
   display: flex !important;
@@ -66,9 +138,19 @@ article:hover > .applymate-card-btn,
 }
 
 .applymate-card-btn span {
-  all: unset;
+  margin: 0;
+  padding: 0;
+  border: none;
+  background: none;
+  color: inherit;
+  font-size: inherit;
+  font-weight: inherit;
+  line-height: inherit;
+  text-decoration: none;
+  box-shadow: none;
   display: block;
   line-height: 1;
+  box-sizing: border-box;
 }
 
 /* ── List-mode: hover popup ─────────────────────────────────────
@@ -77,7 +159,25 @@ article:hover > .applymate-card-btn,
    Shows on hover with 500ms delay, dismisses on mouseleave.
 ────────────────────────────────────────────────────────────────── */
 #applymate-popup {
-  all: initial;
+  margin: 0;
+  padding: 0;
+  border: none;
+  outline: none;
+  background: none;
+  color: inherit;
+  font-size: inherit;
+  font-weight: inherit;
+  line-height: inherit;
+  text-decoration: none;
+  text-transform: none;
+  letter-spacing: normal;
+  box-shadow: none;
+  list-style: none;
+  cursor: default;
+  user-select: auto;
+  pointer-events: auto;
+  overflow: visible;
+  box-sizing: border-box;
   position: absolute !important;
   z-index: 2147483646 !important;
   width: 260px !important;
@@ -103,7 +203,16 @@ article:hover > .applymate-card-btn,
 }
 
 #applymate-popup * {
-  all: unset;
+  margin: 0;
+  padding: 0;
+  border: none;
+  background: none;
+  color: inherit;
+  font-size: inherit;
+  font-weight: inherit;
+  line-height: inherit;
+  text-decoration: none;
+  box-shadow: none;
   display: revert;
   box-sizing: border-box;
 }

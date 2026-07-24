@@ -54,12 +54,19 @@ async function checkBackground(): Promise<boolean> {
 // ── Entry point ───────────────────────────────────────────────────────────────
 
 async function init() {
+  log('🚀 init() START — host:', window.location.hostname, 'path:', window.location.pathname, 'search:', window.location.search)
+  log('🚀 SHOULD_BOOTSTRAP_JOB_UI:', SHOULD_BOOTSTRAP_JOB_UI)
+
   backgroundReady = await checkBackground()
+  log('🚀 checkBackground result:', backgroundReady)
   if (!backgroundReady) {
     showToast('⚠ Extension background not ready. Try reloading the extension at chrome://extensions.')
   }
 
-  if (isJobListPage()) {
+  const isList = isJobListPage()
+  log('🚀 isJobListPage():', isList)
+
+  if (isList) {
     log('Detected LIST page — starting card injector')
     startListModeInjector()
     // LinkedIn SPA: search results can show a detail panel at the same time.
@@ -83,6 +90,8 @@ async function init() {
       host.includes('jobvite.com') ||
       host.includes('icims.com')
 
+    log('🚀 isHighRisk:', isHighRisk, 'host:', host)
+
     if (isHighRisk) {
       log('Detected HIGH-RISK / SPA detail page — injecting lazy button (scrape on click)')
       injectLazySaveButton()
@@ -103,6 +112,8 @@ async function init() {
   if (!isJobListPage()) {
     setTimeout(() => tryInjectAutoFillButton(), 2000)
   }
+
+  log('🚀 init() DONE')
 }
 
 // LinkedIn SPA: inject the detail save button when a job panel is open
@@ -374,45 +385,50 @@ chrome.storage.onChanged.addListener((changes, area) => {
 // ── Detail mode: inline action near the job action controls ───────────────────
 
 function applySaveButtonStyle(btn: HTMLButtonElement, mode: 'inline' | 'floating') {
-  Object.assign(btn.style, {
-    display: 'inline-flex',
-    alignItems: 'center',
-    justifyContent: 'center',
-    gap: '6px',
-    height: mode === 'inline' ? '40px' : undefined,
-    padding: mode === 'inline' ? '0 16px' : '9px 14px 9px 12px',
-    background: '#4F46E5',
-    color: '#fff',
-    border: 'none',
-    borderRadius: mode === 'inline' ? '999px' : '8px 0 0 8px',
-    fontSize: '12px',
-    fontWeight: '600',
-    cursor: 'pointer',
-    boxShadow: mode === 'inline' ? '0 2px 8px rgba(79,70,229,0.22)' : '-2px 2px 12px rgba(79,70,229,0.35)',
-    transition: 'all 0.15s',
-    whiteSpace: 'nowrap',
-    fontFamily: '-apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif',
-    lineHeight: '1',
-  })
+  const s = btn.style
+  // Use setProperty with 'important' so host-page CSS cannot override critical visibility
+  s.setProperty('display', 'inline-flex', 'important')
+  s.setProperty('align-items', 'center', 'important')
+  s.setProperty('justify-content', 'center', 'important')
+  s.setProperty('gap', '6px', 'important')
+  if (mode === 'inline') s.setProperty('height', '40px', 'important')
+  if (mode === 'inline') s.setProperty('padding', '0 16px', 'important')
+  else s.setProperty('padding', '9px 14px 9px 12px', 'important')
+  s.setProperty('background', '#4F46E5', 'important')
+  s.setProperty('color', '#fff', 'important')
+  s.setProperty('border', 'none', 'important')
+  s.setProperty('border-radius', mode === 'inline' ? '999px' : '8px 0 0 8px', 'important')
+  s.setProperty('font-size', '12px', 'important')
+  s.setProperty('font-weight', '600', 'important')
+  s.setProperty('cursor', 'pointer', 'important')
+  s.setProperty('box-shadow', mode === 'inline' ? '0 2px 8px rgba(79,70,229,0.22)' : '-2px 2px 12px rgba(79,70,229,0.35)', 'important')
+  s.setProperty('transition', 'all 0.15s', 'important')
+  s.setProperty('white-space', 'nowrap', 'important')
+  s.setProperty('font-family', '-apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif', 'important')
+  s.setProperty('line-height', '1', 'important')
+  s.setProperty('opacity', '1', 'important')
+  s.setProperty('visibility', 'visible', 'important')
+  s.setProperty('pointer-events', 'auto', 'important')
 }
 
 function styleDetailContainer(el: HTMLElement, mode: 'inline' | 'floating') {
-  Object.assign(el.style, mode === 'inline'
-    ? {
-        display: 'inline-flex',
-        alignItems: 'center',
-        marginLeft: '8px',
-        verticalAlign: 'middle',
-        fontFamily: '-apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif',
-      }
-    : {
-        position: 'fixed',
-        top: '72px',
-        right: '0px',
-        zIndex: '2147483647',
-        display: 'flex',
-        fontFamily: '-apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif',
-      })
+  const s = el.style
+  if (mode === 'inline') {
+    s.setProperty('display', 'inline-flex', 'important')
+    s.setProperty('align-items', 'center', 'important')
+    s.setProperty('margin-left', '8px', 'important')
+    s.setProperty('vertical-align', 'middle', 'important')
+    s.setProperty('font-family', '-apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif', 'important')
+  } else {
+    s.setProperty('position', 'fixed', 'important')
+    s.setProperty('top', '72px', 'important')
+    s.setProperty('right', '0', 'important')
+    s.setProperty('z-index', '2147483647', 'important')
+    s.setProperty('display', 'flex', 'important')
+    s.setProperty('font-family', '-apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif', 'important')
+    s.setProperty('visibility', 'visible', 'important')
+    s.setProperty('pointer-events', 'auto', 'important')
+  }
 }
 
 function setSaveButtonIdle(btn: HTMLButtonElement, mode: 'inline' | 'floating') {
@@ -425,14 +441,22 @@ function setSaveButtonIdle(btn: HTMLButtonElement, mode: 'inline' | 'floating') 
 // Lazy save button for high-risk platforms (LinkedIn, Indeed):
 // injects UI first, only scrapes on explicit user click — no automatic scraping.
 function injectLazySaveButton() {
-  if (document.getElementById('am-lazy-btn')) return
+  log('🔵 injectLazySaveButton called — checking DOM for existing button...')
+  if (document.getElementById('am-lazy-btn')) {
+    log('🔵 Button already exists, skipping')
+    return
+  }
 
+  log('🔵 Creating button element...')
   const btn = document.createElement('button')
   btn.id = 'am-lazy-btn'
   btn.innerHTML = `<span style="font-size:14px;line-height:1">⊕</span><span>Save to ApplyMate</span>`
+  log('🔵 Placing button via mountDetailButtonContainer...')
   const mode = mountDetailButtonContainer(btn)
+  log('🔵 Button placement mode:', mode)
   styleDetailContainer(btn, mode)
   applySaveButtonStyle(btn, mode)
+  log('🔵 Button styled, width:', btn.offsetWidth, 'height:', btn.offsetHeight, 'rect:', JSON.stringify(btn.getBoundingClientRect()))
   btn.addEventListener('mouseenter', () => { btn.style.background = '#4338CA'; btn.style.paddingRight = mode === 'inline' ? '18px' : '18px' })
   btn.addEventListener('mouseleave', () => { btn.style.background = '#4F46E5'; btn.style.paddingRight = mode === 'inline' ? '16px' : '14px' })
 
@@ -486,7 +510,16 @@ function injectLazySaveButton() {
     }
   })
 
-  log('Lazy save button injected (user-triggered scraping)', mode)
+  // Verify button is actually in DOM
+  const inDOM = document.getElementById('am-lazy-btn')
+  if (!inDOM) {
+    console.error('[ApplyMate] ❌ Button NOT in DOM after injection! Forcing body append...')
+    document.body.appendChild(btn)
+    log('🔵 Force-appended to body, now in DOM:', !!document.getElementById('am-lazy-btn'))
+  }
+
+  log('🔵 Lazy save button injected (user-triggered scraping). Mode:', mode, '| Visible:',
+    btn.offsetWidth > 0 && btn.offsetHeight > 0, '|', btn.offsetWidth, '×', btn.offsetHeight)
 }
 
 function injectDetailButtons() {
