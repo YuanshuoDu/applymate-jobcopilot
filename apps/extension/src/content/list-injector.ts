@@ -735,10 +735,10 @@ export function isJobListPage(): boolean {
   const path = window.location.pathname
 
   if (host.includes('linkedin.com')) {
-    // Detail page: /jobs/view/NUMBER/ — never a list page (related jobs
-    // section at the bottom contains base-card elements which would fool
-    // the DOM check below, so reject these paths first).
-    if (/\/jobs\/view\/\d+/.test(path)) return false
+    // Detail page: /jobs/view/... (with or without slug) — never a list page
+    // (related jobs section at the bottom contains base-card elements which
+    // would fool the DOM check below, so reject these paths first).
+    if (path.startsWith('/jobs/view/')) return false
     return (
       path.startsWith('/jobs/search') ||
       path.startsWith('/jobs/collections') ||

@@ -35,6 +35,47 @@ let currentJob: ScrapedJob | null = null
 let injectAttempts = 0
 let backgroundReady = false
 
+// ── Visible diagnostic badge (appears bottom-right, shows init status) ───
+let diagnosticLabel = ''
+
+function showDiagnosticBadge(label: string) {
+  diagnosticLabel = label
+  const existing = document.getElementById('applymate-diag')
+  if (existing) existing.remove()
+  if (!document.body) return
+
+  const badge = document.createElement('div')
+  badge.id = 'applymate-diag'
+  badge.textContent = 'AM:' + label
+  Object.assign(badge.style, {
+    position: 'fixed', bottom: '8px', right: '8px', zIndex: '2147483646',
+    padding: '4px 10px', background: '#1a1a2e', color: '#fff',
+    borderRadius: '6px', fontSize: '10px',
+    fontFamily: 'monospace',
+    boxShadow: '0 2px 6px rgba(0,0,0,0.3)',
+    opacity: '0.85',
+    pointerEvents: 'none',
+  })
+  document.body.appendChild(badge)
+  // Fade out after 8s
+  setTimeout(() => {
+    badge.style.transition = 'opacity 1s'
+    badge.style.opacity = '0'
+    setTimeout(() => badge.remove(), 1000)
+  }, 8000)
+}
+
+function updateDiagnosticBadge() {
+  const lazyBtn = document.getElementById('am-lazy-btn')
+  const saveBtn = document.getElementById(BUTTON_ID)
+  if (lazyBtn) {
+    const rect = lazyBtn.getBoundingClientRect()
+    showDiagnosticBadge('ok:' + diagnosticLabel + '|visible=' + (rect.width > 0 && rect.height > 0) + '|' + Math.round(rect.width) + 'x' + Math.round(rect.height))
+  } else {
+    showDiagnosticBadge('missing:' + diagnosticLabel)
+  }
+}
+
 // ── Diagnostic: verify background connectivity (with retry) ──────────────────
 
 async function checkBackground(): Promise<boolean> {
@@ -54,66 +95,98 @@ async function checkBackground(): Promise<boolean> {
 // ── Entry point ───────────────────────────────────────────────────────────────
 
 async function init() {
-  log('🚀 init() START — host:', window.location.hostname, 'path:', window.location.pathname, 'search:', window.location.search)
-  log('🚀 SHOULD_BOOTSTRAP_JOB_UI:', SHOULD_BOOTSTRAP_JOB_UI)
+  try {
+    log('🚀 init() START — host:', window.location.hostname, 'path:', window.location.pathname, 'search:', window.location.search)
+    log('🚀 SHOULD_BOOTSTRAP_JOB_UI:', SHOULD_BOOTSTRAP_JOB_UI)
 
-  backgroundReady = await checkBackground()
-  log('🚀 checkBackground result:', backgroundReady)
-  if (!backgroundReady) {
-    showToast('⚠ Extension background not ready. Try reloading the extension at chrome://extensions.')
-  }
+    // Ensure document.body exists (SPAs may defer it)
+    if (!document.body) {
+      log('⚠ document.body is null — waiting for DOM...')
+      await new Promise<void>(resolve => {
+        const obs = new MutationObserver(() => {
+          if (document.body) { obs.disconnect(); resolve() }
+        })
+        obs.observe(document.documentElement, { childList: true, subtree: true })
+        // Fallback: resolve after 5s anyway
+        setTimeout(() => { obs.disconnect(); resolve() }, 5000)
+      })
+      log('document.body now:', !!document.body)
+    }
 
-  const isList = isJobListPage()
-  log('🚀 isJobListPage():', isList)
+    backgroundReady = await checkBackground()
+    log('🚀 checkBackground result:', backgroundReady)
+    if (!backgroundReady) {
+      showToast('⚠ Extension background not ready. Try reloading the extension at chrome://extensions.')
+    }
 
-  if (isList) {
-    log('Detected LIST page — starting card injector')
-    startListModeInjector()
-    // LinkedIn SPA: search results can show a detail panel at the same time.
-    // Schedule a deferred attempt to inject the detail button for the visible panel.
-    setTimeout(tryInjectPanelDetail, 1500)
-  } else {
-    // Safety: for LinkedIn and Indeed detail pages, only scrape on user click.
-    // This significantly reduces detectable scraping patterns on these platforms.
-    const host = window.location.hostname
-    // High-risk: LinkedIn/Indeed (detection risk) + SPA platforms where content loads async
-    const isHighRisk =
-      host.includes('linkedin.com') ||
-      host.includes('indeed') ||
-      host.includes('workday.com') ||
-      host.includes('myworkdayjobs') ||
-      host.includes('greenhouse.io') ||
-      host.includes('lever.co') ||
-      host.includes('ashbyhq.com') ||
-      host.includes('smartrecruiters.com') ||
-      host.includes('bamboohr.com') ||
-      host.includes('jobvite.com') ||
-      host.includes('icims.com')
+    const isList = isJobListPage()
+    log('🚀 isJobListPage():', isList)
 
-    log('🚀 isHighRisk:', isHighRisk, 'host:', host)
-
-    if (isHighRisk) {
-      log('Detected HIGH-RISK / SPA detail page — injecting lazy button (scrape on click)')
-      injectLazySaveButton()
+    if (isList) {
+      log('Detected LIST page — starting card injector')
+      startListModeInjector()
+      setTimeout(tryInjectPanelDetail, 1500)
+      showDiagnosticBadge('list')
     } else {
-      currentJob = detectAndScrape()
-      if (currentJob) {
-        log('Detected DETAIL page — job scraped:', currentJob.title, '@', currentJob.company)
-        chrome.runtime.sendMessage({ type: 'JOB_SCRAPED', job: currentJob }).catch(() => {})
-        chrome.storage.local.set({ currentJob }).catch(() => {})
-        injectDetailButtons()
+      const host = window.location.hostname
+      const isHighRisk =
+        host.includes('linkedin.com') ||
+        host.includes('indeed') ||
+        host.includes('workday.com') ||
+        host.includes('myworkdayjobs') ||
+        host.includes('greenhouse.io') ||
+        host.includes('lever.co') ||
+        host.includes('ashbyhq.com') ||
+        host.includes('smartrecruiters.com') ||
+        host.includes('bamboohr.com') ||
+        host.includes('jobvite.com') ||
+        host.includes('icims.com')
+
+      log('🚀 isHighRisk:', isHighRisk, 'host:', host)
+
+      if (isHighRisk) {
+        log('Detected HIGH-RISK / SPA detail page — injecting lazy button (scrape on click)')
+        injectLazySaveButton()
+        showDiagnosticBadge('detail-lazy')
       } else {
-        log('No job detected on this page')
+        currentJob = detectAndScrape()
+        if (currentJob) {
+          log('Detected DETAIL page — job scraped:', currentJob.title, '@', currentJob.company)
+          chrome.runtime.sendMessage({ type: 'JOB_SCRAPED', job: currentJob }).catch(() => {})
+          chrome.storage.local.set({ currentJob }).catch(() => {})
+          injectDetailButtons()
+          showDiagnosticBadge('detail-scraped')
+        } else {
+          log('No job detected on this page')
+          showDiagnosticBadge('no-job')
+        }
       }
     }
-  }
 
-  // After job detection on detail pages, also try to inject auto-fill button
-  if (!isJobListPage()) {
-    setTimeout(() => tryInjectAutoFillButton(), 2000)
-  }
+    if (!isJobListPage()) {
+      setTimeout(() => tryInjectAutoFillButton(), 2000)
+    }
 
-  log('🚀 init() DONE')
+    log('🚀 init() DONE')
+
+    // Self-diagnostic: check 3s later whether button actually made it
+    setTimeout(() => {
+      const lazyBtn = document.getElementById('am-lazy-btn')
+      const saveBtn = document.getElementById(BUTTON_ID)
+      if (!lazyBtn && !saveBtn && !isJobListPage()) {
+        const host = window.location.hostname
+        const isHighRisk = host.includes('linkedin.com') || host.includes('indeed')
+        if (isHighRisk) {
+          console.error('[ApplyMate] ❌ DIAGNOSTIC: No save button 3s after init! Forcing injection...')
+          injectLazySaveButton()
+        }
+      }
+      updateDiagnosticBadge()
+    }, 3000)
+  } catch (err) {
+    console.error('[ApplyMate] ❌ init() CRASHED:', err)
+    showDiagnosticBadge('crash: ' + String(err).slice(0, 40))
+  }
 }
 
 // LinkedIn SPA: inject the detail save button when a job panel is open
@@ -182,29 +255,41 @@ function scheduleRetry() {
 // not observe Workday's frequently-changing application form after the side
 // panel manually injects this script for a fill action.
 if (SHOULD_BOOTSTRAP_JOB_UI) {
-  let lastUrl = location.href
-  new MutationObserver(() => {
-    if (location.href !== lastUrl) {
-      lastUrl = location.href
-      document.getElementById(BUTTON_ID)?.remove()   // removes the wrap div (BUTTON_ID is on the wrap)
-      document.getElementById('am-lazy-btn')?.remove()
-      document.getElementById(TOAST_ID)?.remove()
-      currentJob = null
-      backgroundReady = false
-      checkBackground().then(ok => { backgroundReady = ok })
-      scheduleRetry()
-      // LinkedIn SPA: currentJobId in URL means a new job panel just opened.
-      // Give the panel 1.5s to render before trying to inject the detail button.
-      if (location.search.includes('currentJobId')) {
-        setTimeout(tryInjectPanelDetail, 1500)
-      }
+  // Guard: document.body may not exist yet in some SPA boot sequences.
+  // Retry observation setup until body is available (max 10s).
+  function setupMutationObserver() {
+    if (!document.body) {
+      setTimeout(setupMutationObserver, 200)
+      return
     }
-  }).observe(document.body, { subtree: true, childList: true })
+    let lastUrl = location.href
+    new MutationObserver(() => {
+      if (location.href !== lastUrl) {
+        lastUrl = location.href
+        document.getElementById(BUTTON_ID)?.remove()
+        document.getElementById('am-lazy-btn')?.remove()
+        document.getElementById(TOAST_ID)?.remove()
+        currentJob = null
+        backgroundReady = false
+        checkBackground().then(ok => { backgroundReady = ok })
+        scheduleRetry()
+        if (location.search.includes('currentJobId')) {
+          setTimeout(tryInjectPanelDetail, 1500)
+        }
+      }
+    }).observe(document.body, { subtree: true, childList: true })
+  }
+  setupMutationObserver()
 }
 
 if (SHOULD_BOOTSTRAP_JOB_UI) {
-  void init()
-  setTimeout(scheduleRetry, 1500)
+  try {
+    void init()
+    setTimeout(scheduleRetry, 1500)
+  } catch (err) {
+    console.error('[ApplyMate] ❌ Bootstrap CRASHED:', err)
+    showDiagnosticBadge('bootstrap-crash')
+  }
 }
 
 // ── Form Filler: Listen for scan & fill commands ──────────────────
@@ -520,6 +605,7 @@ function injectLazySaveButton() {
 
   log('🔵 Lazy save button injected (user-triggered scraping). Mode:', mode, '| Visible:',
     btn.offsetWidth > 0 && btn.offsetHeight > 0, '|', btn.offsetWidth, '×', btn.offsetHeight)
+  updateDiagnosticBadge()
 }
 
 function injectDetailButtons() {
