@@ -125,7 +125,11 @@ async function init() {
     if (isList) {
       log('Detected LIST page — starting card injector')
       startListModeInjector()
+      // Immediately try panel detection, then retry on a timer
+      // (LinkedIn/Indeed open job panels without URL changes)
       setTimeout(tryInjectPanelDetail, 1500)
+      setTimeout(tryInjectPanelDetail, 3000)
+      setTimeout(tryInjectPanelDetail, 6000)
       showDiagnosticBadge('list')
     } else {
       const host = window.location.hostname
@@ -173,12 +177,18 @@ async function init() {
     setTimeout(() => {
       const lazyBtn = document.getElementById('am-lazy-btn')
       const saveBtn = document.getElementById(BUTTON_ID)
-      if (!lazyBtn && !saveBtn && !isJobListPage()) {
+      if (!lazyBtn && !saveBtn) {
         const host = window.location.hostname
         const isHighRisk = host.includes('linkedin.com') || host.includes('indeed')
         if (isHighRisk) {
           console.error('[ApplyMate] ❌ DIAGNOSTIC: No save button 3s after init! Forcing injection...')
-          injectLazySaveButton()
+          // Try panel detection one more time, then fall back to lazy button
+          tryInjectPanelDetail()
+          setTimeout(() => {
+            if (!document.getElementById('am-lazy-btn') && !document.getElementById(BUTTON_ID)) {
+              injectLazySaveButton()
+            }
+          }, 2000)
         }
       }
       updateDiagnosticBadge()
@@ -189,18 +199,68 @@ async function init() {
   }
 }
 
-// LinkedIn SPA: inject the detail save button when a job panel is open
-// within a search-results page (URL contains currentJobId).
+// LinkedIn / Indeed SPA: inject the detail save button when a job detail panel
+// is open within a search-results page. Uses DOM-based detection instead of
+// relying on URL parameters (which change between LinkedIn/Indeed redesigns).
 function tryInjectPanelDetail() {
-  if (!location.search.includes('currentJobId')) return
-  if (document.getElementById(BUTTON_ID)) return   // already injected
+  // Already have a save/lazy button — don't duplicate
+  if (document.getElementById(BUTTON_ID) || document.getElementById('am-lazy-btn')) return
+
+  // DOM-based panel detection: look for job title in a side panel or main content
+  const host = window.location.hostname
+  let hasPanel = false
+
+  if (host.includes('linkedin.com')) {
+    // LinkedIn detail panel signs (any of these means a job panel is visible):
+    // - h1 with job title class anywhere on page
+    // - Apply button visible (Easy Apply / external apply)
+    // - Unified top card (standalone detail page or panel)
+    hasPanel = !!(
+      document.querySelector('h1.job-details-jobs-unified-top-card__job-title') ||
+      document.querySelector('h1.t-24.t-bold, h1[class*="title"]') ||
+      document.querySelector('.jobs-s-apply, .jobs-apply-button') ||
+      document.querySelector('[data-job-name], [data-test-job-title]') ||
+      document.querySelector('.job-details-jobs-unified-top-card__content')
+    )
+    // Also check URL: standalone detail or panel with currentJobId
+    if (!hasPanel && (location.pathname.startsWith('/jobs/view/') || location.search.includes('currentJobId'))) {
+      hasPanel = true
+    }
+  } else if (host.includes('indeed')) {
+    hasPanel = !!(
+      document.querySelector('[data-testid="jobDetailHeader"]') ||
+      document.querySelector('#jobDescriptionText') ||
+      document.querySelector('.jobsearch-JobInfoHeader, .jobsearch-DesktopStickyContainer') ||
+      document.querySelector('#viewJobSSRRoot, [data-testid="viewJobSSR"]') ||
+      location.pathname.startsWith('/viewjob') ||
+      location.search.includes('jk=')
+    )
+    // Indeed's sidebar/panel in search results
+    if (!hasPanel) {
+      const sidebarTitle = document.querySelector('#vjs-details [data-testid="jobTitle"], #vjs-jobtitle')
+      if (sidebarTitle) hasPanel = true
+    }
+  }
+
+  if (!hasPanel) {
+    log('🔎 Panel check: no job detail panel detected')
+    return
+  }
+
+  log('🔎 Job detail panel detected — scraping for save button')
   const job = detectAndScrape()
   if (job) {
     currentJob = job
     chrome.runtime.sendMessage({ type: 'JOB_SCRAPED', job }).catch(() => {})
     chrome.storage.local.set({ currentJob: job }).catch(() => {})
     injectDetailButtons()
+    showDiagnosticBadge('panel-injected')
     log('Panel detail injected:', job.title, '@', job.company)
+  } else {
+    log('🔎 Panel detected but scraping returned null')
+    // Lazy fallback: inject a click-to-scrape button
+    injectLazySaveButton()
+    showDiagnosticBadge('panel-lazy')
   }
 }
 
@@ -227,8 +287,11 @@ function scheduleRetry() {
     if (isJobListPage()) {
       clearInterval(interval)
       startListModeInjector()
-      // LinkedIn SPA: also try to inject detail button for visible panel
+      // LinkedIn/Indeed SPA: retry panel detection at staggered intervals
+      // (panel DOM may take several seconds to render after user clicks a job)
       setTimeout(tryInjectPanelDetail, 1000)
+      setTimeout(tryInjectPanelDetail, 3000)
+      setTimeout(tryInjectPanelDetail, 6000)
       return
     }
 
@@ -273,9 +336,9 @@ if (SHOULD_BOOTSTRAP_JOB_UI) {
         backgroundReady = false
         checkBackground().then(ok => { backgroundReady = ok })
         scheduleRetry()
-        if (location.search.includes('currentJobId')) {
-          setTimeout(tryInjectPanelDetail, 1500)
-        }
+        // LinkedIn/Indeed SPA: try injecting detail button after any navigation
+        setTimeout(tryInjectPanelDetail, 1500)
+        setTimeout(tryInjectPanelDetail, 4000)
       }
     }).observe(document.body, { subtree: true, childList: true })
   }
