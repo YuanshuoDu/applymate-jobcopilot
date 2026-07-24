@@ -56,22 +56,17 @@ fs.writeFileSync(path.join(DIST, 'background.js'), finalBg)
 // Vite emits the content entry as a flat script. Chrome can execute it both
 // declaratively and through the side panel's manual injection. Without an
 // outer function, a second execution redeclares top-level constants such as
-// ATTR before any runtime guard can run. Wrap the final bundle and expose a
-// state before its declarations are evaluated, making current, stale, and
-// manually injected page contexts safe.
+// ATTR before any runtime guard can run. Wrap in an IIFE for try-catch
+// protection only — no state guard, because extension reload preserves the
+// isolated world's globalThis and a stale 'ready' flag would skip execution.
 const contentPath = path.join(DIST, 'content.js')
 if (fs.existsSync(contentPath)) {
   const contentJs = fs.readFileSync(contentPath, 'utf-8')
   const wrappedContent = `;(() => {\n` +
-    `  const key = '__applyMateContentScriptState';\n` +
-    `  if (globalThis[key] === 'loading' || globalThis[key] === 'ready') return;\n` +
-    `  globalThis[key] = 'loading';\n` +
     `  try {\n` +
     contentJs.split('\n').map(line => `    ${line}`).join('\n') +
-    `\n    globalThis[key] = 'ready';\n` +
     `  } catch (error) {\n` +
-    `    delete globalThis[key];\n` +
-    `    throw error;\n` +
+    `    console.error('[ApplyMate] Content script crash:', error);\n` +
     `  }\n` +
     `})();\n`
   fs.writeFileSync(contentPath, wrappedContent)
