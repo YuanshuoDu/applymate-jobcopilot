@@ -4,6 +4,19 @@ import type { Resume, CoverLetter, Job } from '@/lib/types'
 
 export class BundleError extends Error {}
 
+export type LocalApplicationPack = { folderPath: string; opened: boolean; resumeFile?: string; coverLetterFile?: string }
+
+/** Creates the audited PDFs on the desktop host, rather than a browser ZIP. */
+export async function exportApplicationPackLocally(jobId: string, openFolder = false): Promise<LocalApplicationPack> {
+  const response = await fetch(`/api/jobs/${jobId}/export-local`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ openFolder, openOnly: openFolder }),
+  })
+  const data = await response.json().catch(() => ({})) as Partial<LocalApplicationPack> & { error?: string }
+  if (!response.ok || !data.folderPath) throw new BundleError(data.error ?? 'Could not create the local application pack')
+  return { folderPath: data.folderPath, opened: Boolean(data.opened) }
+}
+
 function safe(s: string): string {
   return (s.replace(/[<>:"/\\|?*\x00-\x1f]/g, '-').trim().slice(0, 80)) || 'Untitled'
 }

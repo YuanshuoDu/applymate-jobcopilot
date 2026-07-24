@@ -16,6 +16,18 @@ import type { ScrapedJob } from '@/lib/types'
 const BUTTON_ID   = 'applymate-save-btn'
 const TOAST_ID    = 'applymate-toast'
 
+// The dashboard only needs auth synchronisation, and Workday is injected on
+// demand for form fill. Running the job-board bootstrap on either page starts
+// repeated DOM scans and retry timers that provide no value there.
+const IS_DASHBOARD_PAGE =
+  window.location.hostname === 'localhost' ||
+  window.location.hostname === 'web-delta-ruddy-29.vercel.app' ||
+  window.location.hostname.endsWith('.applymate.ai')
+const IS_FORM_FILL_ONLY_PAGE =
+  window.location.hostname.includes('workday.com') ||
+  window.location.hostname.includes('myworkdayjobs.com')
+const SHOULD_BOOTSTRAP_JOB_UI = !IS_DASHBOARD_PAGE && !IS_FORM_FILL_ONLY_PAGE
+
 const DEBUG = true
 function log(...args: unknown[]) { if (DEBUG) console.log('[ApplyMate]', ...args) }
 
@@ -155,35 +167,41 @@ function scheduleRetry() {
   }, 800)
 }
 
-// SPA navigation detection
-let lastUrl = location.href
-new MutationObserver(() => {
-  if (location.href !== lastUrl) {
-    lastUrl = location.href
-    document.getElementById(BUTTON_ID)?.remove()   // removes the wrap div (BUTTON_ID is on the wrap)
-    document.getElementById('am-lazy-btn')?.remove()
-    document.getElementById(TOAST_ID)?.remove()
-    currentJob = null
-    backgroundReady = false
-    checkBackground().then(ok => { backgroundReady = ok })
-    scheduleRetry()
-    // LinkedIn SPA: currentJobId in URL means a new job panel just opened.
-    // Give the panel 1.5s to render before trying to inject the detail button.
-    if (location.search.includes('currentJobId')) {
-      setTimeout(tryInjectPanelDetail, 1500)
+// SPA navigation detection is needed for job boards only. In particular, do
+// not observe Workday's frequently-changing application form after the side
+// panel manually injects this script for a fill action.
+if (SHOULD_BOOTSTRAP_JOB_UI) {
+  let lastUrl = location.href
+  new MutationObserver(() => {
+    if (location.href !== lastUrl) {
+      lastUrl = location.href
+      document.getElementById(BUTTON_ID)?.remove()   // removes the wrap div (BUTTON_ID is on the wrap)
+      document.getElementById('am-lazy-btn')?.remove()
+      document.getElementById(TOAST_ID)?.remove()
+      currentJob = null
+      backgroundReady = false
+      checkBackground().then(ok => { backgroundReady = ok })
+      scheduleRetry()
+      // LinkedIn SPA: currentJobId in URL means a new job panel just opened.
+      // Give the panel 1.5s to render before trying to inject the detail button.
+      if (location.search.includes('currentJobId')) {
+        setTimeout(tryInjectPanelDetail, 1500)
+      }
     }
-  }
-}).observe(document.body, { subtree: true, childList: true })
+  }).observe(document.body, { subtree: true, childList: true })
+}
 
-init()
-setTimeout(scheduleRetry, 1500)
+if (SHOULD_BOOTSTRAP_JOB_UI) {
+  void init()
+  setTimeout(scheduleRetry, 1500)
+}
 
 // ── Form Filler: Listen for scan & fill commands ──────────────────
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (msg.type === 'APPLY_FIELD_VALUES') {
     log('APPLY_FIELD_VALUES received —', msg.fields?.length, 'fields to fill')
     try {
-      const result = applyFieldValues(msg.fields)
+      const result = applyFieldValues(msg.fields, msg.schemas)
       log('Fill result:', result.failed.length === 0 ? 'all ok' : `${result.failed.length} failed`)
       if (result.failed.length > 0) {
         log('Failed field IDs:', result.failed.join(', '))
@@ -278,10 +296,14 @@ async function syncFromDashboard() {
   }
 }
 
-// Watch for meta tag appearing (user logs in after page load)
-new MutationObserver(() => syncFromDashboard()).observe(document.head, {
-  childList: true, subtree: true,
-})
+// Watch for meta tag appearing (user logs in after page load). This belongs
+// exclusively to dashboard pages; observing arbitrary job sites was needless
+// work on every DOM change.
+if (IS_DASHBOARD_PAGE) {
+  new MutationObserver(() => { void syncFromDashboard() }).observe(document.head, {
+    childList: true, subtree: true,
+  })
+}
 
 // Direction 2: Extension ↔ Dashboard (bidirectional via postMessage)
 
@@ -311,9 +333,12 @@ window.addEventListener('message', (e) => {
   }
 })
 
-// Run dashboard sync on init and periodically
-syncFromDashboard()
-setTimeout(syncFromDashboard, 3000) // re-check after page fully loads
+// Run dashboard sync only on the dashboard; job pages never expose its user
+// meta tag and do not need an additional storage read/fetch during startup.
+if (IS_DASHBOARD_PAGE) {
+  void syncFromDashboard()
+  setTimeout(() => { void syncFromDashboard() }, 3000)
+}
 
 // ── Listen for login/logout changes from popup ──────────────────────────────
 

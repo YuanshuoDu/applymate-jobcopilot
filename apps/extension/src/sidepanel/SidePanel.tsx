@@ -88,16 +88,21 @@ function formatDate(iso: string, L: typeof EXT_LABELS['en']): string {
 
 export function SidePanel() {
   const L = useExtLang()
+  type TabId = 'jobs' | 'form' | 'persona' | 'resume'
   const [settings, setSettings] = useState<ExtensionSettings | null>(null)
-  const [activeTab, setActiveTab] = useState<'jobs' | 'form' | 'persona' | 'resume'>('jobs')
+  const [activeTab, setActiveTab] = useState<TabId>('jobs')
+  const [mountedTabs, setMountedTabs] = useState<Set<TabId>>(() => new Set(['jobs']))
   const [personaUpdateTrigger, setPersonaUpdateTrigger] = useState(0)
   const [pendingFormFields, setPendingFormFields] = useState<FormFieldSchema[] | null>(null)
   const [lastTabUrl, setLastTabUrl] = useState('')
   const [scanTrigger, setScanTrigger] = useState(0)
   useEffect(() => {
     getSettings().then(setSettings)
-    // Re-read settings whenever chrome.storage.sync changes (e.g. token synced from dashboard)
-    const onChange = () => { getSettings().then(setSettings) }
+    // Re-read only when the settings record changes. Local job writes must not
+    // trigger a redundant sync-storage read and full side-panel re-render.
+    const onChange = (changes: { settings?: chrome.storage.StorageChange }, area: string) => {
+      if (area === 'sync' && changes.settings) getSettings().then(setSettings)
+    }
     chrome.storage.onChanged.addListener(onChange)
     return () => chrome.storage.onChanged.removeListener(onChange)
   }, [])
@@ -130,6 +135,12 @@ export function SidePanel() {
     const handler = (msg: any) => {
       if (msg.type === 'FORM_DETECTED' && msg.fields) {
         setPendingFormFields(msg.fields)
+        setMountedTabs(previous => {
+          if (previous.has('form')) return previous
+          const next = new Set(previous)
+          next.add('form')
+          return next
+        })
         setActiveTab('form')
       }
     }
@@ -140,7 +151,7 @@ export function SidePanel() {
   if (!settings) return <Spinner />
   if (!isLoggedIn(settings)) return <NotLoggedIn apiBase={settings.apiBaseUrl} />
 
-  const TABS: { id: 'jobs'|'form'|'resume'|'persona'; label: string }[] = [
+  const TABS: { id: TabId; label: string }[] = [
     { id: 'jobs',    label: L.jobs    },
     { id: 'form',    label: L.form    },
     { id: 'resume',  label: L.resume  },
@@ -165,7 +176,15 @@ export function SidePanel() {
         {TABS.map(tab => (
           <button
             key={tab.id}
-            onClick={() => setActiveTab(tab.id)}
+            onClick={() => {
+              setMountedTabs(previous => {
+                if (previous.has(tab.id)) return previous
+                const next = new Set(previous)
+                next.add(tab.id)
+                return next
+              })
+              setActiveTab(tab.id)
+            }}
             style={{
               flex: 1, padding: '9px 4px', border: 'none', background: 'none',
               fontSize: 11, fontWeight: activeTab === tab.id ? 700 : 500,
@@ -180,27 +199,35 @@ export function SidePanel() {
         ))}
       </div>
 
-      {/* Tab Content — all tabs kept mounted to preserve scan/fill state */}
+      {/* Mount tabs on first visit, then keep them mounted to preserve state. */}
       <div style={{ flex: 1, overflow: 'auto' }}>
-        <div style={{ display: activeTab === 'jobs' ? 'block' : 'none' }}>
-          <TrackerPanel settings={settings} L={L} />
-        </div>
-        <div style={{ display: activeTab === 'form' ? 'block' : 'none' }}>
-          <FormFillerView
-            settings={settings}
-            pendingFields={pendingFormFields}
-            onFieldsConsumed={() => setPendingFormFields(null)}
-            scanTrigger={scanTrigger}
-            personaUpdateTrigger={personaUpdateTrigger}
-            onPersonaUpdated={() => setPersonaUpdateTrigger(t => t + 1)}
-          />
-        </div>
-        <div style={{ display: activeTab === 'resume' ? 'block' : 'none' }}>
-          <ResumeView settings={settings} />
-        </div>
-        <div style={{ display: activeTab === 'persona' ? 'block' : 'none' }}>
-          <PersonaView settings={settings} personaUpdateTrigger={personaUpdateTrigger} />
-        </div>
+        {mountedTabs.has('jobs') && (
+          <div style={{ display: activeTab === 'jobs' ? 'block' : 'none' }}>
+            <TrackerPanel settings={settings} L={L} />
+          </div>
+        )}
+        {mountedTabs.has('form') && (
+          <div style={{ display: activeTab === 'form' ? 'block' : 'none' }}>
+            <FormFillerView
+              settings={settings}
+              pendingFields={pendingFormFields}
+              onFieldsConsumed={() => setPendingFormFields(null)}
+              scanTrigger={scanTrigger}
+              personaUpdateTrigger={personaUpdateTrigger}
+              onPersonaUpdated={() => setPersonaUpdateTrigger(t => t + 1)}
+            />
+          </div>
+        )}
+        {mountedTabs.has('resume') && (
+          <div style={{ display: activeTab === 'resume' ? 'block' : 'none' }}>
+            <ResumeView settings={settings} />
+          </div>
+        )}
+        {mountedTabs.has('persona') && (
+          <div style={{ display: activeTab === 'persona' ? 'block' : 'none' }}>
+            <PersonaView settings={settings} personaUpdateTrigger={personaUpdateTrigger} />
+          </div>
+        )}
       </div>
     </div>
   )
@@ -306,7 +333,7 @@ type LType = ReturnType<typeof useExtLang>
 
 function TrackerPanel({ settings, L }: { settings: ExtensionSettings; L: LType }) {
   const [jobs,         setJobs]     = useState<SavedJob[]>([])
-  const [loading,      setLoading]  = useState(true)
+  const [loading,      setLoading]  = useState(false)
   const [expandedId,   setExpanded]  = useState<string | null>(null)
   const [filterStatus, setFilter]   = useState<string>('all')
   const [filterSource, setSource]   = useState<string>('all')
@@ -316,8 +343,13 @@ function TrackerPanel({ settings, L }: { settings: ExtensionSettings; L: LType }
 
   function showToast(msg: string) { setToast(msg); setTimeout(() => setToast(''), 2500) }
 
-  const loadJobs = () => {
+  const loadJobs = (showSpinner = false) => {
+    if (showSpinner) setLoading(true)
+    const timeout = setTimeout(() => {
+      setLoading(false)
+    }, 5000)
     chrome.runtime.sendMessage({ type: 'GET_RECENT_JOBS' }, r => {
+      clearTimeout(timeout)
       void chrome.runtime.lastError // suppress port-closed warning
       setJobs(r?.jobs ?? [])
       setLoading(false)
@@ -325,9 +357,12 @@ function TrackerPanel({ settings, L }: { settings: ExtensionSettings; L: LType }
   }
 
   useEffect(() => {
-    loadJobs()
+    // Do not block the side panel's first paint on the API. The list fills in
+    // when the background response arrives, while Scan and the other tabs are
+    // immediately usable even if the API is slow or temporarily unavailable.
+    loadJobs(false)
     const handler = (msg: { type: string }) => {
-      if (msg.type === 'JOB_SCRAPED' || msg.type === 'JOB_SAVED') loadJobs()
+          if (msg.type === 'JOB_SCRAPED' || msg.type === 'JOB_SAVED') loadJobs(false)
     }
     chrome.runtime.onMessage.addListener(handler)
     return () => chrome.runtime.onMessage.removeListener(handler)
@@ -538,7 +573,7 @@ function TrackerPanel({ settings, L }: { settings: ExtensionSettings; L: LType }
       </div>
 
       {/* ── Current page job banner ── */}
-      <CurrentPageBanner settings={settings} onSaved={loadJobs} />
+          <CurrentPageBanner settings={settings} onSaved={() => loadJobs(false)} />
 
       {/* ── Job list ── */}
       <div style={{ flex: 1, overflowY: 'auto', padding: '10px' }}>
@@ -573,7 +608,7 @@ function TrackerPanel({ settings, L }: { settings: ExtensionSettings; L: LType }
         background: C.card, borderTop: `1px solid ${C.border}`,
         padding: '8px 12px', display: 'flex', gap: 8,
       }}>
-        <button onClick={loadJobs} style={{
+        <button onClick={() => loadJobs(true)} style={{
           flex: 1, padding: '7px', background: C.bg,
           border: `1px solid ${C.border}`, borderRadius: 7,
           fontSize: 11, cursor: 'pointer', color: C.muted, fontFamily: 'inherit',

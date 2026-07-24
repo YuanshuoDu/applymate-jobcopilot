@@ -81,7 +81,7 @@ import { UploadResumeModal } from '@/components/resume/UploadResumeModal'
 import { ResumeIntakeDialog } from '@/components/resume/ResumeIntakeDialog'
 import type { DragHandleProps } from '@/components/resume/SectionHeader'
 import type { AiFieldContext } from '@/components/resume/AiFieldSuggestion'
-import { downloadJobBundle } from '@/lib/bundle'
+import { exportApplicationPackLocally } from '@/lib/bundle'
 import { auditResume, type ResumeAuditResult } from '@/lib/resume-audit'
 
 // ── Constants ─────────────────────────────────────────────────────────────────
@@ -593,6 +593,7 @@ export function ResumePage() {
   // Confirmation is scoped to a resume. A global boolean made the previously
   // confirmed resume look ready after the user selected a different version.
   const [applicationPackReadyResumeId, setApplicationPackReadyResumeId] = useState<string | null>(null)
+  const [exportedPackFolder, setExportedPackFolder] = useState<string | null>(null)
   const [showNewResume,   setShowNewResume]   = useState(false)
   const [renamingResume,  setRenamingResume]  = useState<ResumeListItem | null>(null)
   const [showUploadModal,   setShowUploadModal]   = useState(false)
@@ -888,6 +889,26 @@ export function ResumePage() {
     if (saving) { toast.info('Saving in progress', 'Wait a moment, then start the audit again.'); return null }
     if (dirty && !(await handleSave())) return null
     if (!latestContent.current) return null
+    // Reuse the same evidence-based Auditor whenever this resume is attached to
+    // a complete application. The standalone fallback remains intentionally
+    // local: without a source version and matching cover letter it cannot
+    // honestly verify whether a fact is true.
+    if (resumeLinkedJob && finalCoverLetter) {
+      const independent = await auditApplicationPack()
+      if (independent) {
+        return {
+          ready: independent.verdict === 'pass',
+          findings: independent.findings
+            .filter(finding => finding.area !== 'job_match')
+            .map((finding, index) => ({
+              id: `independent-${index}`,
+              severity: finding.severity === 'pass' ? 'pass' : 'attention',
+              title: finding.title,
+              detail: `${finding.evidence} ${finding.action}`,
+            })),
+        }
+      }
+    }
     return auditResume({ ...latestContent.current, sectionOrder: latestSectionOrder.current })
   }
 
@@ -1243,8 +1264,9 @@ export function ResumePage() {
   async function downloadApplicationPack() {
     if (!confirmedJob) return
     try {
-      await downloadJobBundle(confirmedJob.id)
-      toast.success('Application pack downloaded', 'Your PDF files and application metadata are ready')
+      const result = await exportApplicationPackLocally(confirmedJob.id, Boolean(exportedPackFolder))
+      setExportedPackFolder(result.folderPath)
+      toast.success(exportedPackFolder ? 'Job folder opened' : 'Application PDFs saved', result.folderPath)
     } catch (error) {
       toast.error('Could not create application pack', error instanceof Error ? error.message : 'Please try again')
     }
@@ -1723,6 +1745,7 @@ export function ResumePage() {
           onAudit={auditApplicationPack}
           onConfirm={confirmApplicationPack}
           onDownload={downloadApplicationPack}
+          exportedPackFolder={exportedPackFolder}
         />
       )}
       {showResumeAudit && <ResumeAuditDialog resumeName={resumeName} onClose={() => setShowResumeAudit(false)} onSaveAndAudit={saveAndAuditResume} />}

@@ -2,7 +2,7 @@
  * FormFillerView — Sidepanel tab for reviewing & applying AI-generated form answers.
  */
 import { useState, useEffect, useCallback, useRef } from 'react'
-import { getSettings } from '@/lib/storage'
+import { getSettings, saveSettings } from '@/lib/storage'
 import { getPersona, analyzeForm, reviseFormFields, getPersonaFields, savePersonaFields } from '@/lib/api'
 import type { ExtensionSettings } from '@/lib/types'
 import type { FormFieldSchema, FilledField, FormFillResponse } from '@/lib/form-filler/types'
@@ -25,6 +25,197 @@ const C = {
 type ViewState = 'idle' | 'scanning' | 'aiThinking' | 'review' | 'applying' | 'done' | 'error'
 type AnalysisPhase = 'fetchingPersona' | 'preparingPrompt' | 'waitingForAI' | 'processingResult'
 
+const contentScriptLoads = new Map<number, Promise<void>>()
+
+async function ensureContentScript(tabId: number): Promise<void> {
+  const pending = contentScriptLoads.get(tabId)
+  if (pending) return pending
+
+  const load = (async () => {
+    const probe = await chrome.scripting.executeScript({
+      target: { tabId },
+      world: 'ISOLATED',
+      func: () => {
+        const state = (globalThis as typeof globalThis & {
+          __applyMateContentScriptState?: 'loading' | 'ready'
+        }).__applyMateContentScriptState
+        return state === 'loading' || state === 'ready'
+      },
+    })
+
+    if (probe.some(result => result.result === true)) return
+
+    await chrome.scripting.executeScript({
+      target: { tabId },
+      files: ['content.js'],
+      world: 'ISOLATED',
+    })
+  })()
+
+  contentScriptLoads.set(tabId, load)
+  try {
+    await load
+  } finally {
+    contentScriptLoads.delete(tabId)
+  }
+}
+
+async function scanFormDirectly(tabId: number): Promise<FormFieldSchema[]> {
+  const results = await chrome.scripting.executeScript({
+    target: { tabId },
+    world: 'ISOLATED',
+    func: () => {
+      const hash = (value: string) => {
+        let result = 0
+        for (let index = 0; index < value.length; index++) {
+          result = ((result << 5) - result) + value.charCodeAt(index)
+          result |= 0
+        }
+        return Math.abs(result).toString(36)
+      }
+      const clean = (value: string) => value.replace(/\s+/g, ' ').replace(/\*/g, '').trim()
+      const humanize = (value: string) => clean(value
+        .replace(/[-_.:[\]]+/g, ' ')
+        .replace(/([a-z])([A-Z])/g, '$1 $2'))
+      const labelFor = (element: HTMLElement) => {
+        const id = element.getAttribute('id')
+        if (id) {
+          const label = document.querySelector<HTMLLabelElement>(`label[for="${CSS.escape(id)}"]`)
+          if (label?.textContent) return clean(label.textContent)
+        }
+        const aria = element.getAttribute('aria-label')
+        if (aria) return clean(aria)
+        const labelledBy = element.getAttribute('aria-labelledby')
+        if (labelledBy) {
+          const label = document.getElementById(labelledBy.split(/\s+/)[0])
+          if (label?.textContent) return clean(label.textContent)
+        }
+        const container = element.closest(
+          '[data-automation-id^="formField-"], label, fieldset, [class*="form-field"], [class*="fieldWrapper"]',
+        )
+        const nearbyLabel = container?.querySelector('label, legend, [data-automation-id*="label"]')
+        if (nearbyLabel?.textContent) return clean(nearbyLabel.textContent)
+        const name = element.getAttribute('name')
+        if (name) return humanize(name)
+        const placeholder = element.getAttribute('placeholder')
+        return placeholder ? clean(placeholder) : ''
+      }
+
+      const selector =
+        'input:not([type="hidden"]):not([type="submit"]):not([type="button"]):not([type="reset"]), ' +
+        'textarea, select, [contenteditable="true"], [role="combobox"], [role="textbox"], ' +
+        '[role="radiogroup"], [role="checkbox"], [role="switch"]'
+      const elements = Array.from(document.querySelectorAll<HTMLElement>(selector))
+      const seen = new Set<string>()
+
+      return elements.flatMap(element => {
+        const tag = element.tagName.toLowerCase()
+        const inputType = (element.getAttribute('type') ?? '').toLowerCase()
+        const role = (element.getAttribute('role') ?? '').toLowerCase()
+        const label = labelFor(element)
+        const name = element.getAttribute('name') ?? ''
+        const elementId = element.getAttribute('id') ?? ''
+        const rawId = name
+          ? `n-${hash(name)}`
+          : `l-${hash([elementId, label, inputType || tag].filter(Boolean).join('|'))}`
+        if (seen.has(rawId)) return []
+        seen.add(rawId)
+
+        let type = 'text'
+        if (tag === 'textarea' || role === 'textbox' || element.getAttribute('contenteditable') === 'true') type = 'textarea'
+        else if (tag === 'select' || role === 'combobox') type = 'select'
+        else if (role === 'radiogroup' || inputType === 'radio') type = 'radio'
+        else if (role === 'checkbox' || role === 'switch' || inputType === 'checkbox') type = 'checkbox'
+        else if (['email', 'tel', 'url', 'number', 'date', 'file'].includes(inputType)) type = inputType
+
+        let options: string[] | undefined
+        if (tag === 'select') {
+          options = Array.from((element as HTMLSelectElement).options)
+            .map(option => clean(option.textContent ?? option.value))
+            .filter(Boolean)
+        } else if (inputType === 'radio' && name) {
+          options = Array.from(document.querySelectorAll<HTMLInputElement>('input[type="radio"]'))
+            .filter(input => input.name === name)
+            .map(input => labelFor(input) || input.value)
+            .filter(Boolean)
+        }
+
+        const input = element as HTMLInputElement
+        const currentValue = inputType === 'checkbox' || inputType === 'radio'
+          ? (input.checked ? input.value || 'true' : undefined)
+          : (input.value || element.textContent?.trim() || undefined)
+
+        return [{
+          id: rawId,
+          type,
+          label,
+          placeholder: element.getAttribute('placeholder') ?? undefined,
+          options,
+          required: element.hasAttribute('required') || element.getAttribute('aria-required') === 'true',
+          surroundingText: clean(element.closest(
+            '[data-automation-id^="formField-"], label, fieldset, [class*="field"], [class*="form"]',
+          )?.textContent ?? '').slice(0, 250),
+          groupName: name || undefined,
+          currentValue,
+        }]
+      })
+    },
+  })
+
+  const fields = results[0]?.result
+  return Array.isArray(fields) ? fields as FormFieldSchema[] : []
+}
+
+async function refreshAuthFromDashboard(
+  current: ExtensionSettings,
+): Promise<ExtensionSettings | null> {
+  const tabs = await chrome.tabs.query({})
+  const dashboard = tabs.find(tab => {
+    if (!tab.id || !tab.url) return false
+    try {
+      const url = new URL(tab.url)
+      return url.hostname === 'localhost' ||
+        url.hostname === 'web-delta-ruddy-29.vercel.app' ||
+        url.hostname.endsWith('.applymate.ai')
+    } catch {
+      return false
+    }
+  })
+  if (!dashboard?.id || !dashboard.url) return null
+
+  const result = await chrome.scripting.executeScript({
+    target: { tabId: dashboard.id },
+    world: 'MAIN',
+    func: async () => {
+      try {
+        const response = await fetch('/api/auth/me/extension-token', {
+          credentials: 'include',
+        })
+        if (!response.ok) return { ok: false }
+        const data = await response.json()
+        return { ok: true, data }
+      } catch {
+        return { ok: false }
+      }
+    },
+  })
+  const auth = result[0]?.result as {
+    ok?: boolean
+    data?: { token?: string; user?: { email?: string; name?: string } }
+  } | undefined
+  if (!auth?.ok || !auth.data?.token) return null
+
+  const refreshed: ExtensionSettings = {
+    ...current,
+    apiBaseUrl: new URL(dashboard.url).origin,
+    apiToken: auth.data.token,
+    userEmail: auth.data.user?.email ?? current.userEmail,
+    userName: auth.data.user?.name ?? current.userName,
+  }
+  await saveSettings(refreshed)
+  return refreshed
+}
+
 export function FormFillerView({ settings, pendingFields, onFieldsConsumed, scanTrigger, onPersonaUpdated }: {
   settings: ExtensionSettings
   pendingFields?: FormFieldSchema[] | null
@@ -42,6 +233,12 @@ export function FormFillerView({ settings, pendingFields, onFieldsConsumed, scan
   const [revising, setRevising] = useState(false)
   const [injectPermissionHost, setInjectPermissionHost] = useState<string | null>(null)
   const [uploadedFiles, setUploadedFiles] = useState<Record<string, string>>({})
+  const [failedFieldIds, setFailedFieldIds] = useState<string[]>([])
+  const analyzeFieldsRef = useRef<(
+    fields: FormFieldSchema[],
+    overrideSettings?: ExtensionSettings,
+    allowAuthRefresh?: boolean,
+  ) => Promise<void>>(async () => {})
 
   // ── Persona Save Prompt ──────────────────────────────────────
   const [personaMatches, setPersonaMatches] = useState<Array<{
@@ -208,7 +405,12 @@ export function FormFillerView({ settings, pendingFields, onFieldsConsumed, scan
     })
   }, [])
 
-  const analyzeFields = useCallback(async (formFields: FormFieldSchema[]) => {
+  const analyzeFields = useCallback(async (
+    formFields: FormFieldSchema[],
+    overrideSettings?: ExtensionSettings,
+    allowAuthRefresh = true,
+  ) => {
+    const activeSettings = overrideSettings ?? settings
     try {
       setViewState('aiThinking')
       setErrorMsg('')
@@ -244,8 +446,8 @@ export function FormFillerView({ settings, pendingFields, onFieldsConsumed, scan
       let personaFields: PersonaField[] = []
       try {
         const [personaResult, pFieldsResult] = await Promise.all([
-          getPersona(settings),
-          getPersonaFields(settings).catch(() => ({ fields: [] })),
+          getPersona(activeSettings),
+          getPersonaFields(activeSettings).catch(() => ({ fields: [] })),
         ])
         persona = personaResult.persona
         personaFields = pFieldsResult.fields ?? []
@@ -309,14 +511,12 @@ export function FormFillerView({ settings, pendingFields, onFieldsConsumed, scan
 
       setAnalysisPhase('preparingPrompt')
 
-      // Brief pause
-      await new Promise(r => setTimeout(r, 400))
       setAnalysisPhase('waitingForAI')
 
       // Phase 3: AI model call — only for truly unknown fields
       let result: FormFillResponse
       try {
-        result = await analyzeForm(settings, { fields: needsAi, persona, jobContext })
+        result = await analyzeForm(activeSettings, { fields: needsAi, persona, jobContext })
       } catch (e) {
         const msg = (e as Error).message
         if (msg.includes('timed out')) throw new Error(`AI analysis timed out after 3 min for ${needsAi.length} fields. Try with fewer fields or a faster model.`)
@@ -325,7 +525,6 @@ export function FormFillerView({ settings, pendingFields, onFieldsConsumed, scan
       setAnalysisPhase('processingResult')
 
       // Phase 4: Merge prefilled + persona-matched + AI results (preserving original order)
-      await new Promise(r => setTimeout(r, 300))
       const fieldMap = new Map<string, FilledField>()
       for (const f of prefilledFields) fieldMap.set(f.fieldId, f)
       for (const f of personaMatchedFields) fieldMap.set(f.fieldId, f)
@@ -335,11 +534,22 @@ export function FormFillerView({ settings, pendingFields, onFieldsConsumed, scan
       setViewState('review')
       notifyContentScript(true)
     } catch (e) {
-      setErrorMsg((e as Error).message)
+      const message = e instanceof Error ? e.message : String(e)
+      if (allowAuthRefresh && /unauthorized|401/i.test(message)) {
+        const refreshed = await refreshAuthFromDashboard(activeSettings).catch(() => null)
+        if (refreshed) {
+          await analyzeFieldsRef.current(formFields, refreshed, false)
+          return
+        }
+        setErrorMsg('ApplyMate session expired. Open or refresh the Dashboard, then click Retry.')
+      } else {
+        setErrorMsg(message)
+      }
       setViewState('error')
       notifyContentScript(false)
     }
   }, [settings, notifyContentScript])
+  analyzeFieldsRef.current = analyzeFields
 
   const handleRevise = useCallback(async () => {
     if (!reviseInstruction.trim()) return
@@ -361,46 +571,49 @@ export function FormFillerView({ settings, pendingFields, onFieldsConsumed, scan
     }
   }, [settings, fields, filledFields, reviseInstruction])
 
-  const handleApplyAll = useCallback(() => {
+  const handleApplyAll = useCallback(async () => {
     setViewState('applying')
     setAppliedCount(0)
+    setFailedFieldIds([])
 
-    chrome.tabs.query({ active: true, currentWindow: true }, ([tab]) => {
+    try {
+      const [tab] = await chrome.tabs.query({ active: true, currentWindow: true })
       if (!tab?.id) {
         setErrorMsg('Cannot access current tab for form filling.')
         setViewState('error')
         return
       }
-      chrome.tabs.sendMessage(tab.id, {
+      await ensureContentScript(tab.id)
+      const response = await chrome.tabs.sendMessage(tab.id, {
         type: 'APPLY_FIELD_VALUES',
         fields: filledFields,
-      }, (response) => {
-        const lastErr = chrome.runtime.lastError
-        if (lastErr) {
-          console.error('[FormFiller] APPLY_FIELD_VALUES failed:', lastErr.message)
-          setErrorMsg(`Could not reach page: ${lastErr.message}. Try scanning again.`)
-          setViewState('error')
-          return
-        }
-        if (response?.type === 'APPLY_RESULT') {
-          const skipped = filledFields.filter(f => f.skip).length
-          const applied = filledFields.length - skipped - (response.failed?.length ?? 0)
-          setAppliedCount(applied)
-          setViewState(response.success ? 'done' : 'error')
-          if (!response.success) {
-            setErrorMsg(`${applied} fields filled, ${response.failed?.length ?? 0} failed.`)
-          } else {
-            // Analyze filled fields for persona-saving opportunities
-            analyzePersonaMatches()
-          }
-        }
+        schemas: fields,
       })
-    })
+      if (response?.type === 'APPLY_RESULT') {
+        const skipped = filledFields.filter(f => f.skip).length
+        const failed = response.failed ?? []
+        const applied = filledFields.length - skipped - failed.length
+        setAppliedCount(applied)
+        setFailedFieldIds(failed)
+        // A partially completed form is still useful. Keep the successful
+        // values on the page and show the remaining fields as a warning rather
+        // than replacing the review flow with a blocking error screen.
+        setViewState('done')
+        setErrorMsg(failed.length ? `${applied} fields filled; ${failed.length} need review.` : '')
+        analyzePersonaMatches()
+      }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error)
+      console.error('[FormFiller] APPLY_FIELD_VALUES failed:', message)
+      setErrorMsg(`Could not reach page: ${message}. Try scanning again.`)
+      setViewState('error')
+    }
   }, [filledFields])
 
   const handleUpload = useCallback(async (fieldId: string) => {
     const [tab] = await chrome.tabs.query({ active: true, currentWindow: true })
     if (!tab?.id) return
+    await ensureContentScript(tab.id)
     const response = await chrome.tabs.sendMessage(tab.id, { type: 'OPEN_UPLOAD_PICKER', fieldId }) as { success?: boolean; error?: string } | undefined
     if (!response?.success) setErrorMsg(response?.error ?? 'Could not open the file picker.')
   }, [])
@@ -413,21 +626,26 @@ export function FormFillerView({ settings, pendingFields, onFieldsConsumed, scan
         setViewState('idle')
         // Re-scan after a short delay (permission just granted)
         setTimeout(() => {
-          // Direct scan: inject + send SCAN_FORM
+          // Ensure the content script exists once, then send SCAN_FORM.
           ;(async () => {
             const tabs = await chrome.tabs.query({ active: true, currentWindow: true })
             const tabId = tabs[0]?.id
             if (!tabId) return
             try {
               setViewState('scanning')
-              await chrome.scripting.executeScript({ target: { tabId }, files: ['content.js'], world: 'ISOLATED' })
-              await new Promise(r => setTimeout(r, 700))
+              await ensureContentScript(tabId)
               const response = await chrome.tabs.sendMessage(tabId, { type: 'SCAN_FORM' })
               if (response?.type === 'FORM_DETECTED' && response.fields?.length > 0) {
                 setFields(response.fields)
                 analyzeFields(response.fields)
+              } else {
+                setErrorMsg('No form fields detected on this page.')
+                setViewState('error')
               }
-            } catch { /* fall through */ }
+            } catch (error) {
+              setErrorMsg(`Could not connect to this page: ${(error as Error).message}`)
+              setViewState('error')
+            }
           })()
         }, 500)
       } else {
@@ -490,54 +708,18 @@ export function FormFillerView({ settings, pendingFields, onFieldsConsumed, scan
       }
     }
 
-    /** Inject content script + send SCAN_FORM. Returns true if scan succeeded. */
-    async function tryScan(attemptInject = false): Promise<{ ok: boolean; injectError?: string }> {
-      if (attemptInject) {
-        // --- Approach A: file injection in ISOLATED world (Chrome 111+) ---
-        try {
-          await chrome.scripting.executeScript({
-            target: { tabId: tab.id! },
-            files: ['content.js'],
-            world: 'ISOLATED',
-          })
-          await new Promise(r => setTimeout(r, 700))
-        } catch (e: unknown) {
-          const msg = (e as Error)?.message ?? String(e)
-          console.warn('[FormFiller] executeScript ISOLATED failed:', msg)
-
-          // --- Approach B: func injection in MAIN world (older Chrome fallback) ---
-          try {
-            await chrome.scripting.executeScript({
-              target: { tabId: tab.id! },
-              world: 'MAIN',
-              func: () => {
-                // Minimal inline form scanner – sets a DOM marker so an ISOLATED
-                // listener can relay the results. This runs in the MAIN world
-                // so it can see the real DOM but can't access chrome.* APIs.
-                const el = document.createElement('meta')
-                el.name = 'applymate:scan-trigger'
-                el.content = '1'
-                document.head.appendChild(el)
-              },
-            })
-            await new Promise(r => setTimeout(r, 400))
-            // Now inject the real content script in ISOLATED world
-            try {
-              await chrome.scripting.executeScript({
-                target: { tabId: tab.id! },
-                files: ['content.js'],
-                world: 'ISOLATED',
-              })
-              await new Promise(r => setTimeout(r, 700))
-            } catch (e2: unknown) {
-              console.error('[FormFiller] ISOLATED retry also failed:', (e2 as Error)?.message)
-              return { ok: false, injectError: msg }
-            }
-          } catch (e2: unknown) {
-            console.error('[FormFiller] executeScript MAIN also failed:', (e2 as Error)?.message)
-            return { ok: false, injectError: msg }
-          }
-        }
+    /**
+     * Use the content scanner first so the scan IDs and the subsequent fill
+     * IDs come from the same implementation. The direct scanner remains an
+     * escape hatch for pages that reject content-script messaging.
+     */
+    async function tryScan(): Promise<{ ok: boolean; injectError?: string }> {
+      try {
+        await ensureContentScript(tab.id!)
+      } catch (e: unknown) {
+        const msg = (e as Error)?.message ?? String(e)
+        console.warn('[FormFiller] content script ensure failed:', msg)
+        return { ok: false, injectError: msg }
       }
       try {
         const response = await chrome.tabs.sendMessage(tab.id!, { type: 'SCAN_FORM' })
@@ -547,15 +729,24 @@ export function FormFillerView({ settings, pendingFields, onFieldsConsumed, scan
           return { ok: true }
         }
       } catch { /* content script not available yet */ }
+
+      try {
+        const directFields = await scanFormDirectly(tab.id!)
+        if (directFields.length > 0) {
+          console.log('[FormFiller] Direct scan found', directFields.length, 'fields')
+          setFields(directFields)
+          analyzeFields(directFields)
+          return { ok: true }
+        }
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error)
+        console.warn('[FormFiller] Direct scan failed:', message)
+        return { ok: false, injectError: message }
+      }
       return { ok: false }
     }
 
-    // First attempt: content script may already be injected
-    const r1 = await tryScan(false)
-    if (r1.ok) return
-
-    // Second attempt: inject content script programmatically
-    const r2 = await tryScan(true)
+    const r2 = await tryScan()
     if (r2.ok) return
 
     // Build a diagnostic error message
@@ -687,15 +878,34 @@ export function FormFillerView({ settings, pendingFields, onFieldsConsumed, scan
 
   if (viewState === 'done') {
     const uploadFields = fields.filter(field => field.type === 'file')
+    const failedFields = fields.filter(field => failedFieldIds.includes(field.id))
     return (
       <div style={{ padding: 16 }}>
         <div style={{ textAlign: 'center', padding: '24px 0' }}>
           <div style={{ fontSize: 40, marginBottom: 8 }}>&#9989;</div>
           <div style={{ fontSize: 14, fontWeight: 600, color: C.green }}>Form Filled!</div>
           <div style={{ fontSize: 12, color: C.muted, marginTop: 4 }}>
-            {appliedCount} fields filled — review and submit manually.
+            {failedFields.length
+              ? `${appliedCount} fields filled — ${failedFields.length} still need your review.`
+              : `${appliedCount} fields filled — review and submit manually.`}
           </div>
         </div>
+
+        {failedFields.length > 0 && (
+          <div style={{ background: '#FFF8E8', border: `1px solid ${C.amber}45`, borderRadius: 10, padding: 12, marginBottom: 12 }}>
+            <div style={{ fontSize: 12, fontWeight: 700, color: C.amber, marginBottom: 4 }}>Review these fields manually</div>
+            <div style={{ fontSize: 10, color: C.muted, lineHeight: 1.5 }}>
+              Workday custom dropdowns can require a manual selection. Your other answers have already been filled and remain on the form.
+            </div>
+            <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, marginTop: 9 }}>
+              {failedFields.map(field => (
+                <span key={field.id} style={{ fontSize: 10, color: C.text, background: C.card, border: `1px solid ${C.border}`, borderRadius: 999, padding: '4px 7px' }}>
+                  {field.label || 'Unmatched field'}
+                </span>
+              ))}
+            </div>
+          </div>
+        )}
 
         {uploadFields.length > 0 && (
           <div style={{ background: C.card, border: `1px solid ${C.primary}35`, borderRadius: 10, padding: 12, marginBottom: 12 }}>

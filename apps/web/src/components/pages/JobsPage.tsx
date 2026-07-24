@@ -9,7 +9,7 @@ import type { ApplicationAudit, CoverLetter, Job, JobStatus, Activity, Resume, R
 import { apiMutate, fmtDate, fmtRelative, useApi } from '@/lib/hooks'
 import { setCachedApiResponse } from '@/lib/api-cache'
 import { useNav } from '@/lib/nav-context'
-import { downloadJobBundle } from '@/lib/bundle'
+import { exportApplicationPackLocally } from '@/lib/bundle'
 
 const KANBAN_COLS: JobStatus[] = ['saved', 'applied', 'review', 'interview', 'offer', 'rejected']
 const COL_LABELS: Record<JobStatus, string> = {
@@ -354,6 +354,7 @@ function JobDetailDrawer({ job, onClose, onStatusChange, onUpdate, onDelete, onO
   const [selectedResumeId, setSelectedResumeId] = useState('')
   const [tailoringLoading, setTailoringLoading] = useState(false)
   const [downloadingPack, setDownloadingPack] = useState(false)
+  const [exportedPackFolder, setExportedPackFolder] = useState<string | null>(null)
   const [autoPreparing, setAutoPreparing] = useState(false)
   const [packStage, setPackStage] = useState<'idle' | 'resume' | 'coverLetter' | 'audit' | 'review'>('idle')
   const [auditedPackKey, setAuditedPackKey] = useState<string | null>(null)
@@ -390,6 +391,7 @@ function JobDetailDrawer({ job, onClose, onStatusChange, onUpdate, onDelete, onO
     setSelectedResumeId(prev => prev && baseResumes.some(r => r.id === prev) ? prev : preferred.id)
   }, [baseResumes, resumeList])
   useEffect(() => {
+    const exportKey = `applymate:exported-pack:${job.id}`
     setAuditedPackKey(null)
     setOpenPackItem(null)
     setResumePreview(null)
@@ -397,6 +399,7 @@ function JobDetailDrawer({ job, onClose, onStatusChange, onUpdate, onDelete, onO
     setLatestAudit(null)
     setDocumentPreview(null)
     setPackStage('idle')
+    try { setExportedPackFolder(window.sessionStorage.getItem(exportKey)) } catch { setExportedPackFolder(null) }
   }, [job.id])
 
   const previewResumeId = job.finalResumeId ?? existingTailoredResume?.id ?? null
@@ -407,11 +410,17 @@ function JobDetailDrawer({ job, onClose, onStatusChange, onUpdate, onDelete, onO
       .catch(() => setResumePreview(null))
   }, [previewResumeId])
 
-  const selectedCoverLetter = generatedCoverLetter
-    ?? coverLetters?.find(letter => letter.id === job.finalCoverLetterId && (!previewResumeId || letter.resumeId === previewResumeId))
-    ?? coverLetters?.find(letter => letter.resumeId === previewResumeId)
+  // Once a package has been confirmed, every surface must show the exact
+  // resume/letter pair that is exported. Do not let an in-memory draft letter
+  // replace the confirmed version in the Application Pack preview.
+  const selectedCoverLetter = job.finalCoverLetterId && job.finalResumeId
+    ? coverLetters?.find(letter => letter.id === job.finalCoverLetterId && letter.resumeId === job.finalResumeId)
+    : generatedCoverLetter
+      ?? coverLetters?.find(letter => letter.resumeId === previewResumeId)
   const persistedAudit = useMemo(() => findLatestApplicationAudit(activity), [activity])
   const displayedAudit = latestAudit ?? persistedAudit?.audit ?? null
+  const factualAuditFindings = (displayedAudit?.findings ?? []).filter(finding => finding.area !== 'job_match' && finding.severity !== 'pass')
+  const auditNeedsRepair = Boolean(displayedAudit && displayedAudit.verdict !== 'pass')
 
   async function saveNotes() {
     if (notes === (job.notes ?? '')) return
@@ -507,9 +516,15 @@ function JobDetailDrawer({ job, onClose, onStatusChange, onUpdate, onDelete, onO
   async function downloadFinalPack() {
     setDownloadingPack(true)
     try {
-      await downloadJobBundle(job.id)
-      toast.success('Application pack downloaded', 'Your final resume and cover letter are in the ZIP file.')
+      const result = await exportApplicationPackLocally(job.id, Boolean(exportedPackFolder))
+      setExportedPackFolder(result.folderPath)
+      try { window.sessionStorage.setItem(`applymate:exported-pack:${job.id}`, result.folderPath) } catch { /* browser storage is optional */ }
+      toast.success(exportedPackFolder ? 'Folder opened' : 'Application PDFs saved', result.folderPath)
     } catch (error) {
+      if (exportedPackFolder) {
+        setExportedPackFolder(null)
+        try { window.sessionStorage.removeItem(`applymate:exported-pack:${job.id}`) } catch { /* browser storage is optional */ }
+      }
       toast.error('Could not download application pack', error instanceof Error ? error.message : 'Please try again')
     } finally {
       setDownloadingPack(false)
@@ -668,8 +683,10 @@ function JobDetailDrawer({ job, onClose, onStatusChange, onUpdate, onDelete, onO
 
           <section style={{ borderBottom: '1px solid var(--border)', padding: '18px 0 22px' }}>
             <div style={{ display: 'flex', alignItems: 'center', gap: 9, fontSize: 11, fontWeight: 700, letterSpacing: '0.03em', color: '#64748b', marginBottom: 18 }}><Sparkles size={16} strokeWidth={2.4} style={{ color: '#2563eb', flexShrink: 0 }} />NEXT BEST ACTION</div>
-            <div style={{ fontSize: 20, lineHeight: 1.25, fontWeight: 700, letterSpacing: '-0.025em' }}>{existingTailoredResume ? 'Resume is tailored for this job' : 'Tailor your resume for this job'}</div>
-            <div style={{ fontSize: 14, lineHeight: 1.5, color: 'var(--text-muted)', margin: '7px 0 16px' }}>{existingTailoredResume ? 'Review the AI-tailored version before preparing the application pack.' : 'Create a role-specific version, review it in Resume, then return here.'}</div>
+            <div style={{ fontSize: 20, lineHeight: 1.25, fontWeight: 700, letterSpacing: '-0.025em' }}>{auditNeedsRepair ? 'Correct factual issues before applying' : existingTailoredResume ? 'Resume is tailored for this job' : 'Tailor your resume for this job'}</div>
+            <div style={{ fontSize: 14, lineHeight: 1.5, color: 'var(--text-muted)', margin: '7px 0 16px' }}>{auditNeedsRepair ? 'The Auditor found unsupported claims. AI will rewrite both documents from your original resume, then run the audit again.' : existingTailoredResume ? 'Review the AI-tailored version before preparing the application pack.' : 'Create a role-specific version, review it in Resume, then return here.'}</div>
+
+            {auditNeedsRepair && <div style={{ marginBottom: 16, padding: '12px 14px', border: '1px solid #fecaca', background: '#fff7f7', borderRadius: 9 }}><div style={{ fontSize: 12, fontWeight: 800, color: '#b42318', marginBottom: 7 }}>FACTUAL ISSUES TO FIX</div>{factualAuditFindings.slice(0, 2).map((finding, index) => <div key={`${finding.title}-${index}`} style={{ color: '#7f1d1d', fontSize: 12, lineHeight: 1.45, marginTop: index ? 6 : 0 }}><strong>{finding.title}</strong><br />{finding.action}</div>)}</div>}
 
             {existingTailoredResume ? (
               <button onClick={() => onOpenTailoredResume(existingTailoredResume.id)} style={workflowDocumentButton}>
@@ -683,8 +700,8 @@ function JobDetailDrawer({ job, onClose, onStatusChange, onUpdate, onDelete, onO
               <Btn small onClick={handleTailorResume} disabled={tailoringLoading}>{tailoringLoading ? 'Creating tailored resume…' : 'Tailor in Resume'}</Btn>
             </div>}
             <div style={{ display: 'flex', alignItems: 'center', gap: 12, color: 'var(--text-muted)', margin: '4px 0 20px' }}><span style={{ height: 1, background: 'var(--border)', flex: 1 }} /><span>OR</span><span style={{ height: 1, background: 'var(--border)', flex: 1 }} /></div>
-            <button onClick={() => void autoTailorAndAudit()} disabled={autoPreparing || !canTailorResume} style={{ width: '100%', minHeight: 56, padding: '14px', border: '2px solid #2563eb', borderRadius: 9, background: '#fff', color: '#2563eb', fontSize: 15, fontWeight: 700, cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 10, textAlign: 'center' }}><Sparkles size={19} style={{ flexShrink: 0 }} />{autoPreparing ? 'Preparing application pack…' : 'Prepare full application pack automatically'}</button>
-            <div style={{ textAlign: 'center', fontSize: 13, lineHeight: 1.55, color: 'var(--text-muted)', margin: '12px 28px 28px' }}>We’ll tailor your resume (if needed), generate a cover letter, and run an independent audit.</div>
+            <button onClick={() => void autoTailorAndAudit()} disabled={autoPreparing || !canTailorResume} style={{ width: '100%', minHeight: 56, padding: '14px', border: `2px solid ${auditNeedsRepair ? '#dc2626' : '#2563eb'}`, borderRadius: 9, background: auditNeedsRepair ? '#fff7f7' : '#fff', color: auditNeedsRepair ? '#b42318' : '#2563eb', fontSize: 15, fontWeight: 700, cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 10, textAlign: 'center' }}><Sparkles size={19} style={{ flexShrink: 0 }} />{autoPreparing ? 'Correcting facts and re-auditing…' : auditNeedsRepair ? 'Fix with AI and re-audit' : 'Prepare full application pack automatically'}</button>
+            <div style={{ textAlign: 'center', fontSize: 13, lineHeight: 1.55, color: 'var(--text-muted)', margin: '12px 28px 28px' }}>{auditNeedsRepair ? 'This replaces unsupported claims; it does not invent experience, dates, or metrics.' : 'We’ll tailor your resume (if needed), generate a cover letter, and run an independent audit.'}</div>
             <div style={{ borderTop: '1px solid var(--border)', paddingTop: 22, fontSize: 12, fontWeight: 700, letterSpacing: '0.03em', color: '#64748b' }}>APPLICATION PACK</div>
             <style>{`@keyframes pack-line-grow { from { transform: scaleY(0) } to { transform: scaleY(1) } } @keyframes pack-pulse { 0%,100% { box-shadow: 0 0 0 0 rgba(37,99,235,.35) } 50% { box-shadow: 0 0 0 7px rgba(37,99,235,0) } }`}</style>
             <PackRow number="1" title="Resume" detail={packStage === 'resume' ? 'AI tailoring this resume…' : 'Tailored for this role'} done={Boolean(previewResumeId)} active={packStage === 'resume'} open={openPackItem === 'resume'} onToggle={() => setOpenPackItem(current => current === 'resume' ? null : 'resume')}>
@@ -693,9 +710,10 @@ function JobDetailDrawer({ job, onClose, onStatusChange, onUpdate, onDelete, onO
             <PackRow number="2" title="Cover letter" detail={packStage === 'coverLetter' ? 'AI writing a tailored cover letter…' : selectedCoverLetter ? 'Generated for this job' : 'Created during automatic preparation'} done={Boolean(selectedCoverLetter)} active={packStage === 'coverLetter'} open={openPackItem === 'coverLetter'} onToggle={() => setOpenPackItem(current => current === 'coverLetter' ? null : 'coverLetter')}>
               <CoverLetterPackPreview coverLetter={selectedCoverLetter ?? null} applicant={resumePreview?.content.contact} fallbackName={resumePreview?.name ?? 'Applicant'} company={job.company} role={job.role} templateId={resumePreview?.templateId ?? undefined} templateOptions={resumePreview?.templateOptions ?? undefined} onReview={() => setDocumentPreview('coverLetter')} />
             </PackRow>
-            <PackRow number="3" title="Independent audit" detail={packStage === 'audit' ? 'Checking changes against your original resume…' : displayedAudit ? displayedAudit.summary : 'Runs after the resume and cover letter are ready'} done={currentPackAudited} active={packStage === 'audit'} open={openPackItem === 'audit'} onToggle={() => setOpenPackItem(current => current === 'audit' ? null : 'audit')}>
-              <AuditPackPreview audit={displayedAudit} />
+            <PackRow number="3" title="Independent audit" detail={packStage === 'audit' ? 'Checking changes against your original resume…' : auditNeedsRepair ? `${factualAuditFindings.length} factual issue${factualAuditFindings.length === 1 ? '' : 's'} need correction` : displayedAudit ? 'Facts verified against the original resume' : 'Runs after the resume and cover letter are ready'} done={currentPackAudited} failed={auditNeedsRepair} active={packStage === 'audit'} open={openPackItem === 'audit'} onToggle={() => setOpenPackItem(current => current === 'audit' ? null : 'audit')}>
+              <AuditPackPreview audit={displayedAudit} onRepair={() => void autoTailorAndAudit()} repairing={autoPreparing} />
             </PackRow>
+            {currentPackAudited && <button onClick={() => void downloadFinalPack()} disabled={downloadingPack} style={{ width: '100%', minHeight: 46, border: 0, borderRadius: 9, background: '#2563eb', color: '#fff', fontWeight: 700, cursor: 'pointer' }}>{downloadingPack ? (exportedPackFolder ? 'Opening job folder…' : 'Saving PDFs…') : exportedPackFolder ? 'Open job folder' : 'Save audited PDFs to D:\\My Jobs resume'}</button>}
             <PackRow number="4" title="Open & fill application" detail="Available after all items are complete" done={false} locked={!currentPackAudited} last onClick={currentPackAudited && job.url ? () => window.open(job.url!, '_blank', 'noopener,noreferrer') : undefined} />
             <div style={{ borderTop: '1px solid var(--border)', marginTop: 8, paddingTop: 22 }}><div style={{ fontSize: 12, fontWeight: 700, color: '#64748b', marginBottom: 12 }}>REVIEW &amp; SUBMIT</div><div style={{ border: '1px solid #bfdbfe', background: '#f8fbff', borderRadius: 9, padding: '14px 16px', display: 'flex', gap: 12, fontSize: 13, lineHeight: 1.55 }}><Info size={22} color="#2563eb" style={{ flexShrink: 0, marginTop: 1 }} /><span><strong>You’ll review and submit on the employer site</strong><br /><span style={{ color: 'var(--text-muted)' }}>We’ll open the job in a new tab when your application pack is ready.</span></span></div></div>
             <div style={{ borderTop: '1px solid var(--border)', marginTop: 28, paddingTop: 22 }}>
@@ -944,22 +962,22 @@ function ReferenceProgress({ ready }: { ready: boolean }) {
   return <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 8, padding: '22px 28px 25px', borderBottom: '1px solid var(--border)' }}>{steps.map((label, index) => <div key={label} style={{ textAlign: 'center', position: 'relative' }}>{index < 3 && <span style={{ position: 'absolute', height: 2, background: index < active ? '#2563eb' : '#dbe1ea', top: 18, left: '62%', right: '-38%' }} />}<span style={{ position: 'relative', zIndex: 1, margin: '0 auto 8px', display: 'grid', placeItems: 'center', width: 36, height: 36, borderRadius: '50%', border: `2px solid ${index === active ? '#2563eb' : '#dbe1ea'}`, color: index === active ? '#2563eb' : '#64748b', background: '#fff', fontSize: 15 }}>{index + 1}</span><div style={{ color: index === active ? '#2563eb' : '#64748b', fontSize: 12, fontWeight: index === active ? 700 : 500 }}>{label}</div></div>)}</div>
 }
 
-function PackRow({ number, title, detail, done, active = false, locked, onClick, onToggle, open, children, last = false }: {
-  number: string; title: string; detail: string; done: boolean; locked?: boolean; onClick?: () => void
+function PackRow({ number, title, detail, done, failed = false, active = false, locked, onClick, onToggle, open, children, last = false }: {
+  number: string; title: string; detail: string; done: boolean; failed?: boolean; locked?: boolean; onClick?: () => void
   active?: boolean; onToggle?: () => void; open?: boolean; children?: React.ReactNode; last?: boolean
 }) {
-  const status = locked ? 'Locked' : active ? 'In progress' : done ? (title === 'Independent audit' ? 'Passed' : 'Completed') : 'Pending'
+  const status = locked ? 'Locked' : active ? 'In progress' : failed ? 'Needs correction' : done ? (title === 'Independent audit' ? 'Passed' : 'Completed') : 'Pending'
   return <div style={{ display: 'grid', gridTemplateColumns: '42px 1fr', gap: 12, position: 'relative' }}>
     <div style={{ position: 'relative', display: 'flex', justifyContent: 'center' }}>
       {!last && <span style={{ position: 'absolute', top: 32, bottom: 0, width: 2, background: done ? '#75b85a' : active ? '#60a5fa' : '#dbe1ea', transformOrigin: 'top', animation: 'pack-line-grow .42s ease-out both' }} />}
-      <span style={{ position: 'relative', zIndex: 1, marginTop: 15, width: 32, height: 32, display: 'grid', placeItems: 'center', borderRadius: '50%', background: done ? '#3b8c1a' : active ? '#2563eb' : '#eef1f6', color: done || active ? '#fff' : '#64748b', fontWeight: 700, animation: active ? 'pack-pulse 1.15s ease-in-out infinite' : undefined }}>{done ? <Check size={18} strokeWidth={3} /> : number}</span>
+      <span style={{ position: 'relative', zIndex: 1, marginTop: 15, width: 32, height: 32, display: 'grid', placeItems: 'center', borderRadius: '50%', background: done ? '#3b8c1a' : failed ? '#dc2626' : active ? '#2563eb' : '#eef1f6', color: done || active || failed ? '#fff' : '#64748b', fontWeight: 700, animation: active ? 'pack-pulse 1.15s ease-in-out infinite' : undefined }}>{done ? <Check size={18} strokeWidth={3} /> : number}</span>
     </div>
     <div style={{ borderBottom: last ? 'none' : '1px solid var(--border)', padding: '15px 0' }}>
       <div style={{ display: 'grid', gridTemplateColumns: '1fr auto', gap: 10, alignItems: 'center' }}>
         <button onClick={onClick ?? onToggle} disabled={!onClick && !onToggle} style={{ border: 'none', padding: 0, background: 'transparent', color: 'var(--text)', textAlign: 'left', cursor: onClick || onToggle ? 'pointer' : 'default' }}>
           <span style={{ display: 'block', fontSize: 15, fontWeight: 700 }}>{title}</span><span style={{ display: 'block', marginTop: 3, fontSize: 13, color: 'var(--text-muted)', fontWeight: 400, lineHeight: 1.4 }}>{detail}</span>
         </button>
-        <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}><span style={{ display: 'inline-flex', alignItems: 'center', gap: 4, borderRadius: 999, padding: '5px 10px', fontSize: 11, color: done ? '#3b8c1a' : active ? '#2563eb' : '#64748b', background: done ? '#e9f7e5' : active ? '#eff6ff' : '#eef1f6' }}>{locked && <Lock size={12} />}{status}</span>{onToggle && <button aria-label={`Show ${title} details`} onClick={onToggle} style={{ border: 'none', padding: 3, color: '#334155', background: 'transparent', cursor: 'pointer' }}><ChevronDown size={18} style={{ transform: open ? 'rotate(180deg)' : 'none', transition: 'transform .18s ease' }} /></button>}</div>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}><span style={{ display: 'inline-flex', alignItems: 'center', gap: 4, borderRadius: 999, padding: '5px 10px', fontSize: 11, color: done ? '#3b8c1a' : failed ? '#b42318' : active ? '#2563eb' : '#64748b', background: done ? '#e9f7e5' : failed ? '#fee2e2' : active ? '#eff6ff' : '#eef1f6' }}>{locked && <Lock size={12} />}{status}</span>{onToggle && <button aria-label={`Show ${title} details`} onClick={onToggle} style={{ border: 'none', padding: 3, color: '#334155', background: 'transparent', cursor: 'pointer' }}><ChevronDown size={18} style={{ transform: open ? 'rotate(180deg)' : 'none', transition: 'transform .18s ease' }} /></button>}</div>
       </div>
       {open && children && <div style={{ marginTop: 14, padding: 14, borderRadius: 10, background: '#f8fafc', border: '1px solid #e5eaf1', animation: 'pack-line-grow .2s ease-out both', transformOrigin: 'top' }}>{children}</div>}
     </div>
@@ -998,9 +1016,11 @@ function DocumentPreviewModal({ title, onClose, children }: { title: string; onC
   </div>
 }
 
-function AuditPackPreview({ audit }: { audit: ApplicationAudit | null }) {
+function AuditPackPreview({ audit, onRepair, repairing }: { audit: ApplicationAudit | null; onRepair: () => void; repairing: boolean }) {
   if (!audit) return <div style={{ fontSize: 13, color: 'var(--text-muted)' }}>No audit result yet. The audit checks the tailored resume and cover letter against the original resume before the application can be opened.</div>
-  return <div><div style={{ display: 'flex', justifyContent: 'space-between', gap: 10, fontSize: 13, fontWeight: 700 }}><span>{audit.summary}</span><span style={{ color: audit.verdict === 'pass' ? '#3b8c1a' : audit.verdict === 'blocked' ? '#b42318' : '#a16207', whiteSpace: 'nowrap' }}>{audit.matchScore}% match</span></div><div style={{ marginTop: 10, display: 'grid', gap: 8 }}>{audit.findings.map((finding, index) => <div key={`${finding.title}-${index}`} style={{ fontSize: 12, lineHeight: 1.5 }}><strong style={{ color: finding.severity === 'pass' ? '#3b8c1a' : finding.severity === 'critical' ? '#b42318' : '#a16207' }}>{finding.severity === 'pass' ? 'Passed' : finding.severity === 'critical' ? 'Blocked' : 'Review'} · {finding.title}</strong><div style={{ color: '#64748b' }}>{finding.action}</div></div>)}</div></div>
+  const issues = audit.findings.filter(finding => finding.area !== 'job_match' && finding.severity !== 'pass')
+  const passed = audit.findings.filter(finding => finding.severity === 'pass').length
+  return <div><div style={{ display: 'flex', justifyContent: 'space-between', gap: 10, fontSize: 13, fontWeight: 700 }}><span>{audit.verdict === 'pass' ? 'Factual integrity passed' : `${issues.length} factual issue${issues.length === 1 ? '' : 's'} need correction`}</span><span style={{ color: audit.verdict === 'pass' ? '#3b8c1a' : audit.verdict === 'blocked' ? '#b42318' : '#a16207', whiteSpace: 'nowrap' }}>Role match {audit.matchScore}%</span></div>{issues.length > 0 && <div style={{ marginTop: 10, display: 'grid', gap: 8 }}>{issues.map((finding, index) => <div key={`${finding.title}-${index}`} style={{ padding: '9px 10px', borderLeft: `3px solid ${finding.severity === 'critical' ? '#dc2626' : '#d97706'}`, background: finding.severity === 'critical' ? '#fff7f7' : '#fffbeb', fontSize: 12, lineHeight: 1.45 }}><strong style={{ color: finding.severity === 'critical' ? '#b42318' : '#a16207' }}>{finding.title}</strong><div style={{ color: '#475569', marginTop: 3 }}>{finding.action}</div></div>)}</div>}{passed > 0 && <div style={{ marginTop: 10, color: '#3b8c1a', fontSize: 12 }}>{passed} supported check{passed === 1 ? '' : 's'} passed</div>}{audit.verdict !== 'pass' && <button onClick={onRepair} disabled={repairing} style={{ marginTop: 12, border: '1px solid #2563eb', background: '#fff', color: '#2563eb', borderRadius: 7, padding: '8px 10px', fontWeight: 700, cursor: 'pointer' }}>{repairing ? 'Correcting facts and re-auditing…' : 'Fix with AI and re-audit'}</button>}</div>
 }
 
 function JobDetail({ label, value, href }: { label: string; value: string; href?: string }) {

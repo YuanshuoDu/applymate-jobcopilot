@@ -2,9 +2,9 @@
  * ApplyMate AI — Background Service Worker
  * Handles: message routing, API calls, badge updates, side panel
  */
-import { getSettings, saveSettings, setCurrentJob, setBadge, clearBadge } from '@/lib/storage'
+import { getSettings, setCurrentJob, setBadge, clearBadge } from '@/lib/storage'
 import { login, saveJob, getRecentJobs, getStats, updateJob } from '@/lib/api'
-import type { ExtMessage, ExtensionSettings, ScrapedJob } from '@/lib/types'
+import type { ExtMessage, ScrapedJob } from '@/lib/types'
 
 // ── Simple rate limiter (prevent excessive API calls) ──────────────
 const RATE_LIMIT_WINDOW = 2000 // 2 seconds between same-type operations
@@ -48,6 +48,54 @@ async function lookupCachedJobId(url: string): Promise<string | null> {
   return cache[url] ?? null
 }
 
+// Chrome removes content scripts from already-open tabs when an unpacked
+// extension is reloaded. Restore the Save UI only when the user activates a
+// supported job board. The content bundle has its own duplicate-load guard,
+// so this is safe after normal page navigation too.
+function shouldRestoreSaveUi(url?: string): boolean {
+  if (!url) return false
+  try {
+    const host = new URL(url).hostname
+    if (host.includes('workday.com') || host.includes('myworkdayjobs.com')) return false
+    return host.includes('linkedin.com') ||
+      host.includes('indeed.') ||
+      host.includes('glassdoor.com') ||
+      host.includes('stepstone.') ||
+      host.includes('xing.com') ||
+      host.includes('wellfound.com') ||
+      host.includes('greenhouse.io') ||
+      host.includes('lever.co') ||
+      host.includes('smartrecruiters.com') ||
+      host.includes('ashbyhq.com') ||
+      host.includes('bamboohr.com') ||
+      host.includes('jobvite.com') ||
+      host.includes('icims.com') ||
+      host.includes('monster.') ||
+      host.includes('arbeitsagentur.de') ||
+      host.includes('jobs.de')
+  } catch {
+    return false
+  }
+}
+
+async function restoreSaveUi(tabId: number, url?: string): Promise<void> {
+  if (!shouldRestoreSaveUi(url)) return
+  try {
+    await chrome.scripting.executeScript({
+      target: { tabId },
+      files: ['content.js'],
+      world: 'ISOLATED',
+    })
+  } catch {
+    // The tab may be a restricted browser page or may have navigated away.
+  }
+}
+
+async function restoreActiveSaveUi(): Promise<void> {
+  const [tab] = await chrome.tabs.query({ active: true, currentWindow: true })
+  if (tab?.id) await restoreSaveUi(tab.id, tab.url)
+}
+
 // ── Lifecycle ─────────────────────────────────────────────────
 
 chrome.runtime.onInstalled.addListener(async ({ reason }) => {
@@ -59,6 +107,16 @@ chrome.runtime.onInstalled.addListener(async ({ reason }) => {
   try {
     await chrome.sidePanel.setPanelBehavior({ openPanelOnActionClick: false })
   } catch { /* Chrome < 116 doesn't support setPanelBehavior */ }
+
+  await restoreActiveSaveUi()
+})
+
+chrome.runtime.onStartup.addListener(() => { void restoreActiveSaveUi() })
+
+chrome.tabs.onActivated.addListener(({ tabId }) => {
+  chrome.tabs.get(tabId)
+    .then(tab => restoreSaveUi(tabId, tab.url))
+    .catch(() => {})
 })
 
 // ── Keyboard shortcut Ctrl+Shift+U → open tracker ─────────
@@ -92,23 +150,10 @@ async function handleMessage(
 ): Promise<unknown> {
   let settings = await getSettings()
 
-  // Auto-detect environment: switch API URL based on where the request comes from.
-  const senderUrl = sender.url ?? sender.origin ?? ''
-  const isLocalhost = senderUrl.includes('localhost') || senderUrl.includes('127.0.0.1')
-  const PROD_URL = 'https://web-delta-ruddy-29.vercel.app'
-
-  if (isLocalhost && settings.apiBaseUrl !== 'http://localhost:3000') {
-    // Visiting localhost dashboard → switch API base (keep token; syncFromDashboard will refresh it)
-    console.log('[ApplyMate] Localhost detected, switching API base to http://localhost:3000')
-    settings = { ...settings, apiBaseUrl: 'http://localhost:3000' }
-    await saveSettings({ apiBaseUrl: 'http://localhost:3000' })
-  } else if (!isLocalhost && settings.apiBaseUrl.includes('localhost') && !senderUrl.includes('localhost')) {
-    // On a real job site but API still points to localhost → switch to production
-    // Keep existing token; if it's stale the popup will prompt re-login
-    console.log('[ApplyMate] Production site detected, switching API base to', PROD_URL)
-    settings = { ...settings, apiBaseUrl: PROD_URL }
-    await saveSettings({ apiBaseUrl: PROD_URL })
-  }
+  // The Dashboard owns the API endpoint and token. A job-site message (for
+  // example Workday's PING) must never overwrite that authenticated setting:
+  // doing so sent local users to production, where the platform model may not
+  // be configured, and made form filling appear randomly unavailable.
 
   switch (msg.type) {
     case 'PING':
@@ -253,6 +298,8 @@ async function openTrackerWindow(): Promise<{ ok: boolean; error?: string }> {
 chrome.tabs.onUpdated.addListener(async (tabId, info, tab) => {
   if (info.status !== 'complete') return
   if (!tab.url) return
+
+  void restoreSaveUi(tabId, tab.url)
 
   const JOB_PATTERNS = [
     /linkedin\.com\/jobs/,

@@ -15,7 +15,7 @@ import { useState, useEffect, useRef, useCallback } from 'react'
 import { getCurrentResumeId, setCurrentResumeId, setResumeDraft, clearResumeDraft } from '@/lib/storage'
 import {
   listResumes, getResume, updateResume, createResume,
-  scoreResume, suggestResume, getRecentJobs,
+  scoreResume, suggestResume, getRecentJobs, exportApplicationPackLocally,
 } from '@/lib/api'
 import type { ExtensionSettings, ScrapedJob, ResumeListItem, Resume, ResumeContent, TemplateOptions, ScoreResult, Suggestion } from '@/lib/types'
 
@@ -96,6 +96,9 @@ export function ResumeView({ settings }: Props) {
   const [currentJob, setCurrentJob] = useState<ScrapedJob | null>(null)
   const [auditedResumeId, setAuditedResumeId] = useState<string | null>(null)
   const [packageStatus, setPackageStatus] = useState<'audited' | 'missing' | null>(null)
+  const [savedJobId, setSavedJobId] = useState<string | null>(null)
+  const [exportedPackFolder, setExportedPackFolder] = useState<string | null>(null)
+  const [exportingPack, setExportingPack] = useState(false)
   const [scoreResult, setScoreResult] = useState<ScoreResult | null>(null)
   const [suggestions, setSuggestions] = useState<Suggestion[]>([])
   const [analyzing, setAnalyzing] = useState(false)
@@ -117,7 +120,7 @@ export function ResumeView({ settings }: Props) {
     return () => chrome.runtime.onMessage.removeListener(handler)
   }, [])
 
-  useEffect(() => { setAuditedResumeId(null); setPackageStatus(null) }, [currentJob?.url])
+  useEffect(() => { setAuditedResumeId(null); setPackageStatus(null); setSavedJobId(null); setExportedPackFolder(null) }, [currentJob?.url])
 
   // A job opened in Chrome may have a different reviewed application package
   // from the last resume viewed in the extension. Prefer the final, audited
@@ -126,6 +129,7 @@ export function ResumeView({ settings }: Props) {
     if (!currentJob?.url || resumes.length === 0) return
     void getRecentJobs(settings).then(jobs => {
       const savedJob = jobs.find(job => job.url && sameJobUrl(job.url, currentJob.url))
+      setSavedJobId(savedJob?.id ?? null)
       const auditedResumeId = savedJob?.finalResumeId
       if (!auditedResumeId || !resumes.some(item => item.id === auditedResumeId)) {
         setPackageStatus('missing')
@@ -306,6 +310,20 @@ export function ResumeView({ settings }: Props) {
   function handleOpenPrint() {
     if (!activeId) return
     chrome.tabs.create({ url: `${apiBase}/resume/${activeId}/print` })
+  }
+
+  async function handleExportApplicationPack() {
+    if (!savedJobId || packageStatus !== 'audited') return handleOpenPrint()
+    setExportingPack(true)
+    try {
+      const result = await exportApplicationPackLocally(settings, savedJobId, Boolean(exportedPackFolder))
+      setExportedPackFolder(result.folderPath)
+      showToast(exportedPackFolder ? 'Opened job folder' : 'Audited PDFs saved to D:')
+    } catch (error) {
+      showToast(error instanceof Error ? error.message : 'Could not save application PDFs')
+    } finally {
+      setExportingPack(false)
+    }
   }
 
   // ── Resolved template options ──────────────────────────────────────────────────
@@ -525,9 +543,9 @@ export function ResumeView({ settings }: Props) {
            ═══════════════════════════════════════════════════════════════════════ */}
         <div style={{ background: `linear-gradient(135deg, ${C.green}06, ${C.green}02)`, borderRadius: 10, border: `1.5px solid ${C.green}20`, padding: '14px', marginBottom: 10 }}>
           <div style={{ fontSize: 11, fontWeight: 600, color: C.text, marginBottom: 2 }}>Download PDF</div>
-          <div style={{ fontSize: 9, color: C.muted, marginBottom: 10 }}>Opens print view → save as PDF → drag to upload portal</div>
-          <button onClick={handleOpenPrint} disabled={!activeId} style={{ width: '100%', padding: '10px', borderRadius: 8, background: activeId ? C.green : `${C.green}60`, color: '#fff', border: 'none', fontSize: 12, fontWeight: 600, cursor: activeId ? 'pointer' : 'default', fontFamily: 'inherit' }}>
-            Print & Download PDF →
+          <div style={{ fontSize: 9, color: C.muted, marginBottom: 10 }}>{packageStatus === 'audited' ? 'Saves the audited resume and cover letter into this job’s D: folder' : 'Opens print view → save as PDF → drag to upload portal'}</div>
+          <button onClick={handleExportApplicationPack} disabled={!activeId || exportingPack} style={{ width: '100%', padding: '10px', borderRadius: 8, background: activeId ? C.green : `${C.green}60`, color: '#fff', border: 'none', fontSize: 12, fontWeight: 600, cursor: activeId ? 'pointer' : 'default', fontFamily: 'inherit' }}>
+            {exportingPack ? 'Saving audited PDFs…' : exportedPackFolder ? 'Open job folder →' : packageStatus === 'audited' ? 'Save audited application PDFs →' : 'Print & Download PDF →'}
           </button>
         </div>
 

@@ -43,17 +43,21 @@ function normalize(raw: RawAudit, source: ApplicationAudit['source']): Applicati
     action: String(finding.action ?? 'Review and correct this item before confirming.').slice(0, 300),
   }))
   const auditedAreas = new Set(findings.map(finding => finding.area))
-  const incomplete = (['resume', 'cover_letter', 'job_match'] as const).filter(area => !auditedAreas.has(area))
+  // The audit gate verifies factual integrity of the submitted documents.
+  // Job-fit gaps are useful advice, but absence of a requested skill is never
+  // evidence that the candidate fabricated a claim.
+  const incomplete = (['resume', 'cover_letter'] as const).filter(area => !auditedAreas.has(area))
   if (incomplete.length) findings.push({
     area: incomplete[0], severity: 'warning', title: 'Incomplete independent audit',
     evidence: `The Auditor did not return a result for: ${incomplete.join(', ')}.`,
     action: 'Run the audit again before confirming the application package.',
   })
-  const hasCritical = findings.some(finding => finding.severity === 'critical')
+  const hasCritical = findings.some(finding => finding.area !== 'job_match' && finding.severity === 'critical')
+  const hasFactualWarning = findings.some(finding => finding.area !== 'job_match' && finding.severity === 'warning')
   const requestedVerdict = raw.verdict === 'pass' || raw.verdict === 'blocked' || raw.verdict === 'needs_review'
     ? raw.verdict : 'needs_review'
   return {
-    verdict: hasCritical ? 'blocked' : incomplete.length ? 'needs_review' : requestedVerdict,
+    verdict: hasCritical ? 'blocked' : (hasFactualWarning || incomplete.length) ? 'needs_review' : 'pass',
     summary: String(raw.summary ?? 'Independent audit completed. Review all findings before final confirmation.').slice(0, 600),
     matchScore: Math.max(0, Math.min(100, Number(raw.matchScore) || 0)),
     findings: findings.length ? findings : [{ area: 'resume', severity: 'warning', title: 'Audit needs review', evidence: 'The auditor returned no structured findings.', action: 'Run the audit again before final confirmation.' }],
@@ -140,9 +144,13 @@ export async function POST(req: NextRequest, { params }: Params) {
   const prompt = `${rolePrompt}
 
 You are auditing, not rewriting. The SOURCE RESUME is the candidate's evidence baseline. The FINAL RESUME and COVER LETTER may contain AI edits.
-Only mark a claim critical when the final material asserts a concrete employer, role, date, qualification, metric, project, skill, or outcome that is not supported by the source resume, or directly contradicts it. Do not call a claim false when evidence is merely absent; state that it is unsupported and needs candidate confirmation. Check that the cover letter uses only supported experience and that the final resume fits the job without keyword stuffing.
+Your only release gate is factual integrity. The SOURCE RESUME is the evidence baseline. Verify every concrete employer, current employment status or location, role, date or duration, credential, project, skill, metric, and outcome in the FINAL RESUME and COVER LETTER against that baseline.
 
-Return ONLY JSON. Always return at least one finding for EACH area: resume, cover_letter, and job_match. Use severity "pass" when an area is supported and safe.
+Mark "critical" only for a specific unsupported or contradictory claim (including stale/current-status claims such as saying the candidate currently works in Shanghai when the source dates ended). Mark "warning" only when a claim might be supported but needs the candidate to confirm the precise evidence. Quote the exact final claim and the source fact or absence in "evidence", and state a precise correction in "action".
+
+Do not treat a missing job requirement, indirect experience, a different presentation order, or lack of Copilot/MLOps exposure as a factual issue. Those are optional fit notes only: put them in "job_match" with severity "pass" and wording like "Optional future emphasis", and never downgrade the verdict for them. Do not infer LLM automation from a general AI or Q&A project. Do not infer security-threat detection metrics from cybersecurity work.
+
+Return ONLY JSON. Always return at least one finding for EACH area: resume, cover_letter, and job_match. Use severity "pass" when an area is supported and safe. A pass verdict is valid only when resume and cover-letter claims are supported with no unresolved factual warnings.
 {"verdict":"pass|needs_review|blocked","summary":"...","matchScore":0,"findings":[{"area":"resume|cover_letter|job_match","severity":"pass|warning|critical","title":"...","evidence":"quote or precise comparison","action":"..."}]}
 
 SOURCE RESUME (truth baseline):

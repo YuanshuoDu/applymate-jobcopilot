@@ -111,6 +111,12 @@ export async function getRecentJobs(settings: ExtensionSettings): Promise<SavedJ
   return data.jobs
 }
 
+export async function exportApplicationPackLocally(settings: ExtensionSettings, jobId: string, openFolder = false): Promise<{ folderPath: string; opened: boolean }> {
+  return request(settings, `/api/jobs/${jobId}/export-local`, {
+    method: 'POST', body: JSON.stringify({ openFolder, openOnly: openFolder }), _timeoutMs: 120_000, _retry: false,
+  })
+}
+
 export async function updateJobStatus(
   settings: ExtensionSettings,
   jobId: string,

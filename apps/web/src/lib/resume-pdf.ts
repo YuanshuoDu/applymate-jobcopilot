@@ -15,18 +15,27 @@ export async function renderResumeDoc(resume: Resume): Promise<React.ReactElemen
 
   const content = resume.content as ResumeContent
   const opts    = (resume.templateOptions ?? {}) as TemplateOptions
-  const accent  = opts.accentColor ?? '#185FA5'
+  // CSS variables are valid in the browser preview but invalid in a PDF.
+  // Convert the default preview token to the equivalent exported blue.
+  const accent  = opts.accentColor?.startsWith('var(') ? '#185FA5' : (opts.accentColor ?? '#185FA5')
   const font    = opts.fontFamily === 'serif' ? 'Times-Roman' : 'Helvetica'
   const bold    = opts.fontFamily === 'serif' ? 'Times-Bold'  : 'Helvetica-Bold'
   const d       = getDensity(opts.density)
+  const template = resume.templateId ?? 'clean'
+  const executive = template === 'executive'
+  const sidebar = template === 'sidebar'
+  const timeline = template === 'timeline'
+  const compact = template === 'compact'
+  const pageMargin = compact ? 22 : d.margin
 
   const styles = StyleSheet.create({
-    page:      { padding: d.margin, fontFamily: font, fontSize: d.body, color: '#1a1a1a', lineHeight: 1.45 },
-    name:      { fontFamily: bold, fontSize: d.h3 + 4, color: accent, marginBottom: 2 },
-    contact:   { fontSize: d.body - 1.5, color: '#555', marginBottom: 10, flexDirection: 'row', flexWrap: 'wrap' },
+    page:      { padding: pageMargin, fontFamily: font, fontSize: compact ? 8.8 : d.body, color: '#1a1a1a', lineHeight: compact ? 1.3 : 1.45 },
+    header:    { marginHorizontal: sidebar ? -pageMargin : 0, marginTop: sidebar ? -pageMargin : 0, marginBottom: compact ? 8 : 14, padding: executive || sidebar ? pageMargin : 0, paddingBottom: executive || sidebar ? 16 : compact ? 7 : 10, backgroundColor: executive || sidebar ? accent : '#fff', borderBottomWidth: executive || sidebar ? 0 : compact ? 2 : 3, borderBottomColor: accent, borderLeftWidth: timeline ? 5 : 0, borderLeftColor: accent, paddingLeft: timeline ? 12 : executive || sidebar ? pageMargin : 0 },
+    name:      { fontFamily: bold, fontSize: compact ? 17 : d.h3 + 5, color: executive || sidebar ? '#fff' : '#1a1a1a', marginBottom: 2 },
+    contact:   { fontSize: compact ? 7.5 : d.body - 1.5, color: executive || sidebar ? '#eef6ff' : '#555', flexDirection: 'row', flexWrap: 'wrap' },
     contactSep:{ marginHorizontal: 4, color: '#bbb' },
-    section:   { marginTop: d.gap + 4 },
-    secTitle:  { fontFamily: bold, fontSize: d.h3, color: accent, marginBottom: 3, borderBottomWidth: 0.5, borderBottomColor: accent, paddingBottom: 2 },
+    section:   { marginTop: compact ? 7 : d.gap + 4, borderLeftWidth: timeline ? 1 : 0, borderLeftColor: timeline ? `${accent}55` : '#fff', paddingLeft: timeline ? 10 : 0 },
+    secTitle:  { fontFamily: bold, fontSize: compact ? 8.8 : d.h3, color: accent, marginBottom: 3, borderBottomWidth: compact ? 1 : 0.5, borderBottomColor: accent, paddingBottom: 2 },
     expRow:    { marginBottom: d.gap },
     expHead:   { flexDirection: 'row', justifyContent: 'space-between' },
     expRole:   { fontFamily: bold, fontSize: d.body },
@@ -53,22 +62,23 @@ export async function renderResumeDoc(resume: Resume): Promise<React.ReactElemen
       Page,
       { size: 'A4', style: styles.page },
 
-      // Name
-      React.createElement(Text, { style: styles.name }, c.contact?.name || 'Resume'),
-
-      // Contact row
       React.createElement(
         View,
-        { style: styles.contact },
-        ...contactItems.map((item, i) =>
-          i === 0
-            ? React.createElement(Text, { key: i }, item)
-            : React.createElement(
-                React.Fragment,
-                { key: i },
-                React.createElement(Text, { style: styles.contactSep }, '·'),
-                React.createElement(Text, null, item),
-              )
+        { style: styles.header },
+        React.createElement(Text, { style: styles.name }, c.contact?.name || 'Resume'),
+        React.createElement(
+          View,
+          { style: styles.contact },
+          ...contactItems.map((item, i) =>
+            i === 0
+              ? React.createElement(Text, { key: i }, item)
+              : React.createElement(
+                  React.Fragment,
+                  { key: i },
+                  React.createElement(Text, { style: styles.contactSep }, '·'),
+                  React.createElement(Text, null, item),
+                )
+          )
         )
       ),
 
@@ -106,11 +116,51 @@ export async function renderResumeDoc(resume: Resume): Promise<React.ReactElemen
           )
         : null,
 
+      // Projects
+      c.projects && c.projects.length > 0
+        ? React.createElement(
+            View,
+            { style: styles.section },
+            React.createElement(Text, { style: styles.secTitle }, 'Projects'),
+            ...c.projects.map((project, i) =>
+              React.createElement(
+                View,
+                { key: i, style: styles.expRow },
+                React.createElement(
+                  View,
+                  { style: styles.expHead },
+                  React.createElement(Text, { style: styles.expRole }, project.role ? `${project.name} — ${project.role}` : project.name),
+                  React.createElement(Text, { style: styles.expPeriod }, project.period ?? ''),
+                ),
+                ...(project.bullets ?? []).map((bullet, j) => React.createElement(Text, { key: j, style: styles.bullet }, `• ${bullet}`)),
+              )
+            ),
+          )
+        : null,
+
+      // Certifications
+      c.certifications && c.certifications.length > 0
+        ? React.createElement(
+            View,
+            { style: styles.section },
+            React.createElement(Text, { style: styles.secTitle }, 'Certifications'),
+            ...c.certifications.map((certification, i) => React.createElement(
+              View,
+              { key: i, style: styles.expHead },
+              React.createElement(Text, { style: styles.expRole }, certification.issuer ? `${certification.name} — ${certification.issuer}` : certification.name),
+              React.createElement(Text, { style: styles.expPeriod }, certification.date ?? ''),
+            )),
+          )
+        : null,
+
       // Education
       c.education && c.education.length > 0
         ? React.createElement(
             View,
-            { style: styles.section },
+            // A long resume must never be visually clipped at the foot of page
+            // one. Education starts a clean continuation page; subsequent
+            // skills and language sections flow on the same page.
+            { style: styles.section, break: true },
             React.createElement(Text, { style: styles.secTitle }, 'Education'),
             ...c.education.map((edu, i) =>
               React.createElement(

@@ -32,6 +32,7 @@ type Props = {
   onAudit: () => Promise<ApplicationAudit | null>
   onConfirm: (audit: ApplicationAudit) => Promise<boolean>
   onDownload: () => Promise<void>
+  exportedPackFolder: string | null
 }
 
 const icons = {
@@ -45,7 +46,7 @@ const icons = {
 
 export function FinalConfirmDialog({
   job, resumeName, templateName, pendingSuggestions, isDirty, packReady, resumeContent, templateId, templateOptions, coverLetterContent,
-  onClose, onReviewSuggestions, onCreateCoverLetter, onLinkJob, onAudit, onConfirm, onDownload,
+  onClose, onReviewSuggestions, onCreateCoverLetter, onLinkJob, onAudit, onConfirm, onDownload, exportedPackFolder,
 }: Props) {
   const [audit, setAudit] = useState<ApplicationAudit | null>(null)
   const items = useMemo<ReadinessItem[]>(() => [
@@ -168,7 +169,7 @@ export function FinalConfirmDialog({
         <div className="final-confirm-footer">
           {confirmed ? <>
             <div className="final-confirm-ready"><Check size={15} /> Application pack confirmed</div>
-            <button className="final-confirm-primary" onClick={() => void onDownload()}><FileCheck2 size={16} /> Download application pack</button>
+            <button className="final-confirm-primary" onClick={() => void onDownload()}><FileCheck2 size={16} /> {exportedPackFolder ? 'Open job folder' : 'Save PDFs to D:\\My Jobs resume'}</button>
           </> : <>
             <button className="final-confirm-secondary" onClick={onClose}>Back to edit</button>
             <button className="final-confirm-primary" disabled={!ready || confirming} onClick={() => void handleConfirm()}>

@@ -8,11 +8,32 @@ const DEFAULTS: ExtensionSettings = {
   autoSave:   true,
 }
 
+const STORAGE_TIMEOUT_MS = 2000
+
+async function within<T>(promise: Promise<T>, timeoutMs: number): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<T>((_, reject) => {
+        timer = setTimeout(() => reject(new Error('Chrome storage timed out')), timeoutMs)
+      }),
+    ])
+  } finally {
+    if (timer) clearTimeout(timer)
+  }
+}
+
 // ── Settings (sync — shared across devices) ───────────────────
 
 export async function getSettings(): Promise<ExtensionSettings> {
-  const result = await chrome.storage.sync.get('settings')
-  return { ...DEFAULTS, ...(result.settings ?? {}) }
+  try {
+    const result = await within(chrome.storage.sync.get('settings'), STORAGE_TIMEOUT_MS)
+    return { ...DEFAULTS, ...(result.settings ?? {}) }
+  } catch (error) {
+    console.warn('[ApplyMate] Settings load failed; using defaults:', error)
+    return { ...DEFAULTS }
+  }
 }
 
 export async function saveSettings(partial: Partial<ExtensionSettings>): Promise<void> {

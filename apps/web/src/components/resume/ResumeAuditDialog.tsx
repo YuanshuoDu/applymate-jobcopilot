@@ -27,7 +27,7 @@ export function ResumeAuditDialog({ resumeName, onClose, onSaveAndAudit }: Props
       <button className="final-confirm-close" onClick={onClose} aria-label="Close resume audit"><X size={18} /></button>
       <div className="final-confirm-heading">
         <span className="final-confirm-shield"><ShieldCheck size={17} /></span>
-        <div><h2 id="resume-audit-title">Resume audit</h2><p>{result ? 'Review each finding before you use this version to apply.' : 'Confirm that your edits are ready. We will save this version, then run the audit.'}</p></div>
+        <div><h2 id="resume-audit-title">Resume audit</h2><p>{result ? 'Review each finding before you use this version to apply.' : 'When a job and matching cover letter are linked, this runs the same evidence-based audit used for the final application pack.'}</p></div>
       </div>
 
       {!result ? <>
@@ -35,7 +35,7 @@ export function ResumeAuditDialog({ resumeName, onClose, onSaveAndAudit }: Props
           <input type="checkbox" checked={confirmed} onChange={event => setConfirmed(event.target.checked)} style={{ marginTop: 3 }} />
           <span>I confirm that I have reviewed and optimized this resume. All facts, dates, qualifications, and achievements are truthful and can be supported if asked.</span>
         </label>
-        <p className="final-confirm-note">The audit flags items for review; it cannot independently prove that a claim is true or false.</p>
+        <p className="final-confirm-note">Without a linked job, original source version, and matching cover letter, only local quality checks are available; factual verification happens in the independent audit.</p>
         <div className="final-confirm-footer"><button className="final-confirm-secondary" onClick={onClose}>Back to edit</button><button className="final-confirm-primary" disabled={!confirmed || running} onClick={() => void startAudit()}>{running ? <LoaderCircle size={16} /> : <ShieldCheck size={16} />}{running ? 'Saving & auditing…' : 'Confirm, save & audit'}</button></div>
       </> : <>
         <div className="resume-audit-findings" aria-live="polite">

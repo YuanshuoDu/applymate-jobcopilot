@@ -1,7 +1,8 @@
 {
   "manifest_version": 3,
   "name": "ApplyMate AI",
-  "version": "0.1.0",
+  "version": "0.1.7",
+  "version_name": "0.1.7-stable-form-fill",
   "description": "AI-powered job application copilot — save jobs, match resumes, track progress",
   "icons": {
     "16":  "icons/icon16.png",
@@ -60,8 +61,6 @@
         "*://*.wellfound.com/*",
         "*://*.greenhouse.io/*",
         "*://*.lever.co/*",
-        "*://*.myworkdayjobs.com/*",
-        "*://*.workday.com/*",
         "*://*.smartrecruiters.com/*",
         "*://jobs.ashbyhq.com/*",
         "*://*.bamboohr.com/jobs/*",

@@ -57,6 +57,8 @@ describe('POST /api/jobs/[id]/audit-application', () => {
     expect(body.source).toBe('parent_resume')
     expect(body.verdict).toBe('pass')
     expect(mocks.modelChat.mock.calls[0][0][0].content).toContain('SOURCE RESUME')
+    expect(mocks.modelChat.mock.calls[0][0][0].content).toContain('current employment status or location')
+    expect(mocks.modelChat.mock.calls[0][0][0].content).toContain('security-threat detection metrics')
     expect(mocks.activityCreate.mock.calls[0][0].data.text).toContain('[Auditor] application-audit')
   })
 
@@ -69,6 +71,19 @@ describe('POST /api/jobs/[id]/audit-application', () => {
     const body = await response.json()
     expect(body.source).toBe('previous_version')
     expect(body.verdict).toBe('blocked')
+  })
+
+  it('does not block a truthful package merely because the job asks for missing tooling', async () => {
+    mocks.resumeFindFirst.mockResolvedValueOnce({ id: 'resume_final', parentResumeId: null, content: { contact: {}, summary: 'Final', experience: [], education: [], skills: [] } })
+    mocks.resumeVersionFindFirst.mockResolvedValue({ content: { contact: {}, summary: 'Original', experience: [], education: [], skills: [] } })
+    mocks.modelChat.mockResolvedValue({ provider: 'minimax', model: 'MiniMax-M2.7', text: JSON.stringify({ verdict: 'needs_review', findings: [
+      { area: 'resume', severity: 'pass', title: 'Facts supported', evidence: 'All dates and employers match the source.', action: 'None.' },
+      { area: 'cover_letter', severity: 'pass', title: 'Facts supported', evidence: 'No unsupported claims.', action: 'None.' },
+      { area: 'job_match', severity: 'critical', title: 'MLOps missing', evidence: 'The resume does not claim MLOps.', action: 'Optional future emphasis only.' },
+    ] }) })
+    const { POST } = await import('./route')
+    const response = (await POST(request({ resumeId: 'resume_final', coverLetterId: 'cover_1' }) as never, { params: Promise.resolve({ id: 'job_1' }) }))!
+    await expect(response.json()).resolves.toMatchObject({ verdict: 'pass' })
   })
 
   it('refuses to pass when no source resume exists for an independent comparison', async () => {

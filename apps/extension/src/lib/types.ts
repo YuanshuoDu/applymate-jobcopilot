@@ -178,7 +178,7 @@ export type ExtMessage =
   | { type: 'READ_FIELD_VALUES'; fieldIds: string[] }
   | { type: 'FIELD_VALUES_RESULT'; values: Array<{ fieldId: string; value: string }> }
   | { type: 'REVISE_FORM'; instruction: string }
-  | { type: 'APPLY_FIELD_VALUES'; fields: import('./form-filler/types').FilledField[] }
+  | { type: 'APPLY_FIELD_VALUES'; fields: import('./form-filler/types').FilledField[]; schemas?: import('./form-filler/types').FormFieldSchema[] }
   | { type: 'APPLY_RESULT'; success: boolean; failedFields: string[] }
   | { type: 'OPEN_UPLOAD_PICKER'; fieldId: string }
   | { type: 'UPLOAD_PICKER_OPENED'; success: boolean; error?: string }

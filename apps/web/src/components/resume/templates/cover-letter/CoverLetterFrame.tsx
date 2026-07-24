@@ -47,6 +47,7 @@ export function CoverLetterDoc({
 
   const isModern  = templateVariant === 'modern'
   const isClassic = templateVariant === 'classic'
+  const isMinimal = templateVariant === 'minimal'
 
   const pdfFontFamily = fontFamily === 'serif' ? 'Times-Roman' : 'Helvetica'
   const pdfFontBold   = fontFamily === 'serif' ? 'Times-Bold'  : 'Helvetica-Bold'
@@ -62,7 +63,8 @@ export function CoverLetterDoc({
     header: {
       marginBottom:      20,
       ...(isModern  ? { borderBottomWidth: 2,   borderBottomColor: color, paddingBottom: 10 } : {}),
-      ...(isClassic ? { borderBottomWidth: 0.5, borderBottomColor: '#999', paddingBottom: 8 } : {}),
+      ...(isClassic ? { backgroundColor: '#f4f4f5', borderLeftWidth: 5, borderLeftColor: color, padding: 12 } : {}),
+      ...(isMinimal ? { borderBottomWidth: 1, borderBottomColor: '#d4d4d8', paddingBottom: 6 } : {}),
     },
     name: {
       fontSize:   d.heading + 2,
@@ -99,6 +101,7 @@ export function CoverLetterDoc({
     body: {
       fontSize:   d.body,
       lineHeight: d.line,
+      ...(isMinimal ? { color: '#333' } : {}),
     },
     signature: {
       marginTop: 20,

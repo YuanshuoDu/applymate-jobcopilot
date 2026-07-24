@@ -24,7 +24,10 @@ export function fillField(field: FormFieldSchema, value: string): FillResult {
   }
 }
 
-export function fillFields(fields: FilledField[]): { success: boolean; failed: string[]; filled: number } {
+export function fillFields(
+  fields: FilledField[],
+  schemas: FormFieldSchema[] = [],
+): { success: boolean; failed: string[]; filled: number } {
   const failed: string[] = []
   let filled = 0
 
@@ -36,7 +39,13 @@ export function fillFields(fields: FilledField[]): { success: boolean; failed: s
     if (field.skip) continue
 
     try {
-      const result = fillFieldById(field.fieldId, field.value)
+      // Workday rebuilds dependent controls (such as County) while values are
+      // applied. Its generated id can therefore change between Scan and Apply.
+      // Retain the scanned schema so we can find the rebuilt control by label.
+      const schema = schemas.find(candidate => candidate.id === field.fieldId)
+      const result = schema
+        ? fillField(schema, field.value)
+        : fillFieldById(field.fieldId, field.value)
       if (result.success) filled++
       else {
         console.warn('[ApplyMate] fillFieldById failed:', field.fieldId, result.error)
@@ -91,7 +100,7 @@ function getAllDocs(): Document[] {
 }
 
 const INPUT_SELECTOR = 'input:not([type="hidden"]):not([type="submit"]):not([type="button"]):not([type="reset"]), ' +
-  'textarea, select, [contenteditable="true"]'
+  'textarea, select, [contenteditable="true"], [role="combobox"], [role="textbox"]'
 
 function resolveElement(field: FormFieldSchema): HTMLElement | null {
   // Strip iframe prefix from ID if present (fields scanned in iframes)
@@ -165,10 +174,16 @@ export function setElementValue(el: HTMLElement, value: string, field?: FormFiel
     return
   }
 
-  if (el.getAttribute('contenteditable') === 'true' || tag === 'div') {
+  if (el.getAttribute('contenteditable') === 'true') {
     el.textContent = value
     el.dispatchEvent(new Event('input', { bubbles: true }))
     el.dispatchEvent(new Event('change', { bubbles: true }))
+    return
+  }
+
+  const nestedInput = el.querySelector('input, textarea, select') as HTMLElement | null
+  if (nestedInput && nestedInput !== el) {
+    setElementValue(nestedInput, value, field)
     return
   }
 
@@ -191,6 +206,14 @@ function setElementValueGeneric(el: HTMLElement, value: string): void {
     el.textContent = value
     el.dispatchEvent(new Event('input', { bubbles: true }))
   } else {
+    const nestedInput = el.querySelector('input, textarea, select') as HTMLElement | null
+    if (nestedInput && nestedInput !== el) {
+      setElementValueGeneric(nestedInput, value)
+      return
+    }
+    if (el.getAttribute('role') === 'combobox' || el.getAttribute('role') === 'textbox') {
+      throw new Error('Custom form control needs review')
+    }
     fillTextInput(el as HTMLInputElement | HTMLTextAreaElement, value)
   }
 }
