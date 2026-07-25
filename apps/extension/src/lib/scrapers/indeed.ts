@@ -6,7 +6,7 @@ export function scrapeIndeed(): ScrapedJob | null {
   // h1 fallbacks handle the newer single-page job view (/viewjob?jk=...).
   // We deliberately avoid hash class names — Indeed hashes them per deploy.
   // For international TLDs, also try [data-testid="jobTitle"] (used on .de/.co.uk).
-  const title =
+  let title =
     document.querySelector<HTMLElement>('[data-testid="jobsearch-JobInfoHeader-title"]')?.innerText.trim() ||
     document.querySelector<HTMLElement>('[data-testid="simpler-jobTitle"]')?.innerText.trim() ||
     document.querySelector<HTMLElement>('[data-testid="job-title"]')?.innerText.trim() ||
@@ -23,7 +23,7 @@ export function scrapeIndeed(): ScrapedJob | null {
   // ── Company ──
   // Prefer the data-testid link (stable) over class-based fallbacks.
   // International TLDs sometimes use [data-testid="jobCompany"] variant.
-  const company =
+  let company =
     document.querySelector<HTMLElement>('[data-testid="inlineHeader-companyName"] a')?.innerText.trim() ||
     document.querySelector<HTMLElement>('[data-testid="inlineHeader-companyName"]')?.innerText.trim() ||
     document.querySelector<HTMLElement>('[data-testid="company-name"]')?.innerText.trim() ||
@@ -71,6 +71,17 @@ export function scrapeIndeed(): ScrapedJob | null {
     document.querySelector<HTMLElement>('.jobsearch-JobComponent-description')?.innerText.trim() ||
     ''
 
+  // ── Last resort: extract from document.title ──
+  if (!title || !company) {
+    const parsed = parseIndeedPageTitle(document.title)
+    if (parsed) {
+      if (!title) title = parsed.title
+      if (!company) company = parsed.company
+      // Title-based location is more reliable than "Unknown" when DOM selectors fail
+      if (!location && parsed.location) location = parsed.location
+    }
+  }
+
   if (!title || !company) return null
 
   return {
@@ -82,4 +93,55 @@ export function scrapeIndeed(): ScrapedJob | null {
     url:    window.location.href,
     source: 'indeed',
   }
+}
+
+/** Extract job title, company, and location from Indeed's <title> text. */
+function parseIndeedPageTitle(t: string): { title: string; company: string; location?: string } | null {
+  if (!t || t.length < 3) return null
+
+  // Strip Indeed.com suffix
+  const clean = t
+    .replace(/\s*[-–—|]\s*Indeed(?:\.com)?\s*$/i, '')
+    .replace(/\s*\|\s*Indeed\s*$/i, '')
+    .trim()
+  if (!clean) return null
+
+  // Indeed format: "Job Title - Company - Location"
+  // or: "Job Title - Company" or "Job Title at Company"
+  const parts = clean.split(/\s+[-–—]\s+/)
+  if (parts.length >= 3) {
+    // "Job Title - Company - Location"
+    return {
+      title: parts[0].trim(),
+      company: parts[1].trim(),
+      location: parts.slice(2).join(', ').trim(),
+    }
+  }
+  if (parts.length === 2) {
+    return {
+      title: parts[0].trim(),
+      company: parts[1].trim(),
+    }
+  }
+
+  // "Job Title at Company"
+  for (const sep of [' at ', ' - ', ' – ', ' — ', ' | ']) {
+    const idx = clean.indexOf(sep)
+    if (idx > 0) {
+      const title = clean.slice(0, idx).trim()
+      const rest = clean.slice(idx + sep.length).trim()
+      // Rest might be "Company - Location" or just "Company"
+      const restParts = rest.split(/\s+[-–—]\s+/)
+      if (restParts.length >= 2) {
+        return {
+          title,
+          company: restParts[0].trim(),
+          location: restParts.slice(1).join(', ').trim(),
+        }
+      }
+      return { title, company: rest }
+    }
+  }
+
+  return null
 }

@@ -42,6 +42,11 @@ export function detectAndScrape(): ScrapedJob | null {
     }
   }
 
+  // Last resort: extract from document.title (always available)
+  if (!job) {
+    job = scrapeTitleBased(host)
+  }
+
   return job
 }
 
@@ -62,6 +67,93 @@ function detectSourceFromHost(host: string): ScrapedJob['source'] {
   if (host.includes('icims.com'))           return 'icims'
   if (host.includes('localhost'))           return 'linkedin' // test mode
   return 'unknown'
+}
+
+// ── Title-based fallback (last resort) ─────────────────────
+// Extracts job info from document.title when all DOM selectors fail.
+// Handles common patterns: "Title at Company", "Title - Company", etc.
+
+function scrapeTitleBased(host: string): ScrapedJob | null {
+  const t = document.title?.trim()
+  if (!t || t.length < 3) return null
+
+  // LinkedIn: "Job Title | LinkedIn" or "Company hiring Job Title | LinkedIn"
+  // Indeed: "Job Title - Company - City, State | Indeed.com"
+  // Generic: "Job Title at Company" or "Job Title - Company"
+
+  let title: string | null = null
+  let company: string | null = null
+
+  // Strip known site suffixes
+  const clean = t
+    .replace(/\s*\|\s*LinkedIn\s*$/i, '')
+    .replace(/\s*\|\s*Indeed\.com\s*$/i, '')
+    .replace(/\s*\|\s*Indeed.*$/i, '')
+    .replace(/\s*\|\s*Glassdoor\s*$/i, '')
+    .replace(/\s*\|\s*StepStone.*$/i, '')
+    .trim()
+
+  // LinkedIn patterns
+  if (host.includes('linkedin.com')) {
+    // "Company is hiring a Job Title on LinkedIn" or "Company hiring Job Title"
+    const hiring = clean.match(/^(.+?)\s+(?:is\s+)?hir(?:es|ing)\s+(?:a\s+|an\s+|for\s+)?(.+?)$/i)
+    if (hiring) {
+      company = hiring[1].trim()
+      title = hiring[2].replace(/\s*on\s+LinkedIn\s*$/i, '').trim()
+    } else {
+      // "Job Title | Company" or "Job Title at Company" or "Job Title - Company"
+      const parts = clean.split(/\s*\|\s*/)
+      if (parts.length >= 2) {
+        // First part is title, last known part is company
+        title = parts[0].trim()
+        company = parts[1].trim()
+      }
+    }
+  }
+
+  // Indeed patterns
+  if (/indeed/i.test(host)) {
+    // "Job Title - Company - Location | Indeed.com" → "Job Title - Company - Location"
+    // "Job Title - Company" or "Job Title at Company"
+    const parts = clean.split(/\s+[-–—]\s+/)
+    if (parts.length >= 2) {
+      title = parts[0].trim()
+      company = parts[1].trim()
+      // Remove location suffixes from company: "Company - City, ST"
+      const companyOnly = company.split(/\s+[-–—]\s+/)[0].trim()
+      if (companyOnly) company = companyOnly
+    }
+  }
+
+  // Generic fallback
+  if (!title || !company) {
+    // "Title at Company" or "Title - Company"
+    for (const sep of [' at ', ' - ', ' – ', ' — ', ' | ']) {
+      const idx = clean.indexOf(sep)
+      if (idx > 0) {
+        title = clean.slice(0, idx).trim()
+        company = clean.slice(idx + sep.length).trim()
+        // If company still has a pipe/at/dash, take first segment
+        const parts = company.split(/\s+(?:at|-|–|—|\|)\s+/)
+        company = parts[0].trim()
+        break
+      }
+    }
+  }
+
+  if (!title || !company || title.length <= 1 || company.length <= 1) return null
+
+  const source = detectSourceFromHost(host)
+
+  return {
+    title,
+    company,
+    location: 'Unknown',
+    description: '',
+    salary: null,
+    url: window.location.href,
+    source,
+  }
 }
 
 // ── Test-mode scraper (localhost) ─────────────────────────────

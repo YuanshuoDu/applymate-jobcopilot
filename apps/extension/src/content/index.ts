@@ -797,3 +797,73 @@ function readCurrentFieldValues(fieldIds: string[]): Array<{ fieldId: string; va
   }
   return results
 }
+
+// ── Debug tool injected into MAIN world (accessible from devtools console) ──
+
+function installDebugTool() {
+  const script = document.createElement('script')
+  script.textContent = `
+    window.__amDebug = function () {
+      var r = ['=== ApplyMate Page Debug ===', ''];
+      r.push('📄 title: ' + JSON.stringify(document.title));
+      r.push('🌐 URL: ' + location.href);
+      r.push('');
+
+      // Meta tags
+      var ogT = document.querySelector('meta[property="og:title"]')?.content;
+      var ogS = document.querySelector('meta[property="og:site_name"]')?.content;
+      var metaD = document.querySelector('meta[name="description"]')?.content;
+      r.push('🏷 Meta:');
+      r.push('  og:title=' + JSON.stringify(ogT) + '  og:site_name=' + JSON.stringify(ogS));
+      r.push('  description=' + JSON.stringify(metaD)?.slice(0, 100));
+      r.push('');
+
+      // All headings
+      r.push('📋 Headings (h1-h3):');
+      var hs = document.querySelectorAll('h1,h2,h3');
+      for (var i = 0; i < Math.min(hs.length, 8); i++) {
+        r.push('  ' + hs[i].tagName + ': ' + JSON.stringify(hs[i].textContent.trim().slice(0, 80)));
+      }
+      r.push('');
+
+      // Job-related element counts
+      r.push('🔍 Element counts:');
+      var tests = [
+        '[data-entity-urn]', '[data-job-id]', '[data-job-name]',
+        'div.base-card', 'div.job-card-container',
+        'li.jobs-search-results__list-item',
+        'a[href*="/jobs/view/"]', 'a[href*="/company/"]',
+        'img[alt*="logo" i]', 'img[alt*="company" i]',
+        '[data-test-employer-name]',
+        '.job-details-jobs-unified-top-card__company-name a',
+        'h1[class*="title"]', '[class*="company-name"]',
+        '#jobDescriptionText'
+      ];
+      for (var i = 0; i < tests.length; i++) {
+        try {
+          var n = document.querySelectorAll(tests[i]).length;
+          r.push('  ' + tests[i].padEnd(55) + ' = ' + n);
+        } catch(e) { r.push('  ' + tests[i].padEnd(55) + ' = ERROR'); }
+      }
+      r.push('');
+
+      // JSON-LD
+      var jsonld = document.querySelectorAll('script[type="application/ld+json"]');
+      r.push('📋 JSON-LD: ' + jsonld.length + ' scripts');
+      for (var i = 0; i < jsonld.length; i++) {
+        try {
+          var d = JSON.parse(jsonld[i].textContent);
+          var types = [d['@type']].concat((d['@graph']||[]).map(function(g){return g['@type']})).filter(Boolean);
+          r.push('  ['+i+'] @type: ' + types.join(', '));
+        } catch(e) { r.push('  ['+i+'] parse error'); }
+      }
+
+      var out = r.join('\\n');
+      console.log(out);
+      return out;
+    };
+  `
+  script.id = 'applymate-debug-tool'
+  document.documentElement.appendChild(script)
+  log('Debug tool installed: run __amDebug() in console')
+}

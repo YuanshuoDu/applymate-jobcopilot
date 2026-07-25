@@ -4,7 +4,7 @@ export function scrapeLinkedIn(): ScrapedJob | null {
   // ── Title ──
   // Stable attribute-based selectors first (LinkedIn internal attributes don't change with UI refreshes),
   // then class-based fallbacks for legacy layouts.
-  const title =
+  let title =
     // 2026+: internal data attributes
     document.querySelector<HTMLElement>('[data-job-name]')?.innerText.trim() ||
     document.querySelector<HTMLElement>('[aria-label*="job title" i]')?.innerText.trim() ||
@@ -24,22 +24,24 @@ export function scrapeLinkedIn(): ScrapedJob | null {
     null
 
   // ── Company ──
-  const company =
-    // 2025-2026: stable attributes and data-testid
+  // Order: targeted selectors first, then DOM-text selectors, then alt-text
+  // fallbacks. a[href*="/company/"] is used first because it's the most
+  // reliable — img alt selectors can match unrelated elements on panel pages.
+  let company =
     document.querySelector<HTMLElement>('[data-test-employer-name]')?.innerText.trim() ||
     document.querySelector<HTMLElement>('[data-company-name]')?.innerText.trim() ||
-    // Company logo alt attribute (stable — LinkedIn uses company name in alt)
-    (document.querySelector<HTMLImageElement>('img[alt*="logo" i]')?.alt?.trim().replace(/\s*logo\s*/i, '').trim()) ||
-    (document.querySelector<HTMLImageElement>('img[alt*="company" i]')?.alt?.trim()) ||
-    // Company name link in top card
-    document.querySelector<HTMLElement>('a[href*="/company/"]')?.innerText.trim() ||
-    document.querySelector<HTMLElement>('[class*="company-name"] a')?.innerText.trim() ||
+    // Company name link in top card — most reliable DOM-text selector
     document.querySelector<HTMLElement>('.job-details-jobs-unified-top-card__company-name a')?.innerText.trim() ||
     document.querySelector<HTMLElement>('.jobs-unified-top-card__company-name a')?.innerText.trim() ||
     document.querySelector<HTMLElement>('a.topcard__org-name-link')?.innerText.trim() ||
     document.querySelector<HTMLElement>('.topcard__flavor a')?.innerText.trim() ||
+    document.querySelector<HTMLElement>('[class*="company-name"] a')?.innerText.trim() ||
+    document.querySelector<HTMLElement>('a[href*="/company/"]')?.innerText.trim() ||
     // Fallback: any company link near the h1
     document.querySelector<HTMLElement>('h1 ~ div a[href*="/company/"]')?.innerText.trim() ||
+    // Company logo alt attribute — only within job-top-card, not page-wide
+    (document.querySelector<HTMLImageElement>('.jobs-unified-top-card img[alt*="logo" i]')?.alt?.trim().replace(/\s*logo\s*/i, '').trim()) ||
+    (document.querySelector<HTMLImageElement>('.job-details-jobs-unified-top-card img[alt*="logo" i]')?.alt?.trim().replace(/\s*logo\s*/i, '').trim()) ||
     null
 
   // ── Location ──
@@ -125,6 +127,15 @@ export function scrapeLinkedIn(): ScrapedJob | null {
     } catch { /* JSON-LD parse failed, skip */ }
   }
 
+  // ── Last resort: extract from document.title ──
+  if (!title || !company) {
+    const parsed = parseLinkedInPageTitle(document.title)
+    if (parsed) {
+      if (!title) title = parsed.title
+      if (!company) company = parsed.company
+    }
+  }
+
   if (!title || !company) return null
 
   return {
@@ -136,4 +147,37 @@ export function scrapeLinkedIn(): ScrapedJob | null {
     url:    window.location.href,
     source: 'linkedin',
   }
+}
+
+/** Extract job title and company from LinkedIn's <title> text. */
+function parseLinkedInPageTitle(t: string): { title: string; company: string } | null {
+  if (!t || t.length < 3) return null
+
+  // Strip known suffixes
+  const clean = t.replace(/\s*\|\s*LinkedIn\s*$/i, '').trim()
+  if (!clean) return null
+
+  // "Company is hiring a Job Title" or "Company hiring Job Title"
+  const hiring = clean.match(/^(.+?)\s+(?:is\s+)?hir(?:es|ing)\s+(?:a\s+|an\s+|for\s+)?(.+)$/i)
+  if (hiring) {
+    return {
+      title: hiring[2].replace(/\s*on\s+LinkedIn\s*$/i, '').trim(),
+      company: hiring[1].trim(),
+    }
+  }
+
+  // "Job Title at Company" or "Job Title - Company" or "Job Title | Company"
+  for (const sep of [' at ', ' - ', ' – ', ' — ', ' | ']) {
+    const idx = clean.indexOf(sep)
+    if (idx > 0) {
+      const title = clean.slice(0, idx).trim()
+      let company = clean.slice(idx + sep.length).trim()
+      // Remove any secondary separators from company
+      const parts = company.split(/\s+(?:at|-|–|—|\|)\s+/)
+      company = parts[0].trim()
+      if (title && company) return { title, company }
+    }
+  }
+
+  return null
 }

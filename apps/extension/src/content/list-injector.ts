@@ -37,9 +37,10 @@ type SiteConfig = {
 
 const SITES: Record<string, SiteConfig> = {
   'linkedin.com': {
-    // LinkedIn has two layouts: public search uses base-card; signed-in search
-    // uses job-card-container and Art Deco entity lockups.
-    card: 'div.base-card, div.job-card-container',
+    // LinkedIn changes class names every 3-6 months. Use attribute-based
+    // selectors (data-entity-urn, data-job-id) as primary anchors, plus a
+    // broad link-based fallback for any layout we haven't seen yet.
+    card: '[data-entity-urn], [data-job-id], div.base-card, div.job-card-container, li.jobs-search-results__list-item, li:has(a[href*="/jobs/view/"])',
     title:    '',
     company:  '',
     location: '',
@@ -165,26 +166,26 @@ function getSiteConfig(): SiteConfig | null {
 // child elements rather than using the link's full text.
 
 function scrapeLinkedInCard(card: Element): CardJob | null {
-  // LinkedIn 2026 DOM structure:
-  //   div.base-card > a.base-card__full-link (overlay link) +
-  //                  div.base-search-card__info >
-  //                    h3.base-search-card__title (title)
-  //                    h4.base-search-card__subtitle > a.hidden-nested-link (company)
-  //                    div.base-search-card__metadata > span.job-search-card__location (location)
-  const url =
-    card.querySelector<HTMLAnchorElement>('a.base-card__full-link')?.href ||
-    card.querySelector<HTMLAnchorElement>('a.job-card-container__link')?.href ||
-    card.querySelector<HTMLAnchorElement>('a[href*="/jobs/view/"]')?.href ||
-    ''
+  // LinkedIn 2026 DOM: varies by rollout group.
+  // Primary anchors: a[href*="/jobs/view/"] link and data-entity-urn attribute.
+  const linkEl =
+    card.querySelector<HTMLAnchorElement>('a[href*="/jobs/view/"]') ||
+    card.querySelector<HTMLAnchorElement>('a.base-card__full-link') ||
+    card.querySelector<HTMLAnchorElement>('a.job-card-container__link')
+  const url = linkEl?.href || ''
   if (!url) return null
 
   const title =
+    (linkEl?.getAttribute('aria-label')?.trim()) ||
     card.querySelector<HTMLElement>('h3.base-search-card__title')?.innerText?.trim() ||
     card.querySelector<HTMLElement>('.base-search-card__title')?.innerText?.trim() ||
     card.querySelector<HTMLElement>('.artdeco-entity-lockup__title strong')?.innerText?.trim() ||
     card.querySelector<HTMLElement>('.job-card-list__title')?.innerText?.trim() ||
-    // fallback: sr-only span on the overlay link
+    card.querySelector<HTMLElement>('a[href*="/jobs/view/"] span[aria-hidden="true"]')?.innerText?.trim() ||
+    // sr-only span on overlay link (fallback)
     card.querySelector<HTMLElement>('a.base-card__full-link .sr-only')?.innerText?.trim() ||
+    // Generic: first heading or strong inside card
+    card.querySelector<HTMLElement>('h3, h2, strong')?.innerText?.trim() ||
     ''
 
   const company =
@@ -192,6 +193,8 @@ function scrapeLinkedInCard(card: Element): CardJob | null {
     card.querySelector<HTMLElement>('a.hidden-nested-link')?.innerText?.trim() ||
     card.querySelector<HTMLElement>('.base-search-card__subtitle')?.innerText?.trim() ||
     card.querySelector<HTMLElement>('.artdeco-entity-lockup__subtitle')?.innerText?.trim() ||
+    // Generic: any link with /company/ path inside card
+    card.querySelector<HTMLElement>('a[href*="/company/"]')?.innerText?.trim() ||
     ''
 
   const location =
@@ -209,6 +212,65 @@ function scrapeLinkedInCard(card: Element): CardJob | null {
 
   if (!title || !company) return null
   return { title, company, location: location || 'Unknown', salary, url, source: 'linkedin' }
+}
+
+// ── Debug helper for list pages (injects into MAIN world so console can access) ──
+
+function installListDebugTool() {
+  const script = document.createElement('script')
+  script.textContent = `
+    window.__amListDebug = function () {
+      var r = ['=== ApplyMate List Card Debug ===', ''];
+      r.push('📍 URL: ' + location.pathname + location.search);
+
+      // Test each card selector
+      var sels = [
+        '[data-entity-urn]', '[data-job-id]',
+        'div.base-card', 'div.job-card-container',
+        'li.jobs-search-results__list-item',
+        'li:has(a[href*="/jobs/view/"])'
+      ];
+      r.push('');
+      r.push('🔍 Card selectors:');
+      for (var i = 0; i < sels.length; i++) {
+        try {
+          r.push('  ' + sels[i].padEnd(52) + ' = ' + document.querySelectorAll(sels[i]).length);
+        } catch(e) { r.push('  ' + sels[i].padEnd(52) + ' = ERROR: ' + e.message); }
+      }
+
+      r.push('');
+      r.push('🔗 a[href*="/jobs/view/"] total: ' + document.querySelectorAll('a[href*="/jobs/view/"]').length);
+      r.push('🏢 a[href*="/company/"] total: ' + document.querySelectorAll('a[href*="/company/"]').length);
+
+      // Sample first few cards
+      var cards = document.querySelectorAll('[data-entity-urn]');
+      if (cards.length === 0) cards = document.querySelectorAll('div.base-card');
+      if (cards.length === 0) cards = document.querySelectorAll('div.job-card-container');
+      if (cards.length === 0) cards = document.querySelectorAll('li:has(a[href*="/jobs/view/"])');
+
+      r.push('');
+      r.push('🧩 First cards (found via best-match selector, ' + cards.length + ' total):');
+      for (var i = 0; i < Math.min(cards.length, 5); i++) {
+        var c = cards[i];
+        var cls = (c.className || c.getAttribute('class') || '').toString().slice(0, 60);
+        var urn = c.getAttribute('data-entity-urn') || '';
+        var link = c.querySelector('a[href*="/jobs/view/"]');
+        var h3 = c.querySelector('h3');
+        var companyEl = c.querySelector('a[href*="/company/"]');
+        r.push('  [' + i + '] tag=' + c.tagName.toLowerCase() + ' class="' + cls + '"');
+        r.push('      urn=' + urn + '  link=' + (link ? link.href.slice(0, 70) : 'none'));
+        r.push('      h3=' + JSON.stringify(h3 ? h3.textContent.trim().slice(0, 60) : null));
+        r.push('      company=' + JSON.stringify(companyEl ? companyEl.textContent.trim().slice(0, 40) : null));
+      }
+
+      var out = r.join('\\n');
+      console.log(out);
+      return out;
+    };
+  `
+  script.id = 'applymate-list-debug'
+  document.documentElement.appendChild(script)
+  log('List debug tool installed: run __amListDebug() in console')
 }
 
 // ── Indeed-specific card extraction ──────────────────────────────────────────
@@ -618,23 +680,27 @@ function processCards(cfg: SiteConfig) {
   const isLever       = host.includes('lever.co')
 
   const cards = document.querySelectorAll<Element>(cfg.card)
+  if (cards.length === 0 && isLinkedIn) {
+    // Fallback: find cards via job links (always works on LinkedIn)
+    processCardsViaJobLinks()
+    return
+  }
+
+  let processed = 0
   cards.forEach(card => {
     if (isIndeed && card.parentElement?.closest(`[${ATTR}="indeed"]`)) return
 
     if (isLinkedIn) {
-      // LinkedIn 2026: use data-entity-urn as stable unique identifier.
-      // div.base-card elements are recycled by React virtual scrolling.
       const urn = (card as HTMLElement).getAttribute('data-entity-urn') ||
                   card.querySelector<HTMLElement>('[data-entity-urn]')?.getAttribute('data-entity-urn')
       if (urn) {
         const existingBtn = card.querySelector<HTMLButtonElement>(`.${BTN_CLASS}`)
         if (existingBtn) {
           const storedUrn = existingBtn.getAttribute('data-applymate-urn')
-          if (storedUrn === urn) return // same job, already processed
-          existingBtn.remove() // different job recycled into same element
+          if (storedUrn === urn) return
+          existingBtn.remove()
         }
       } else {
-        // Fallback: check by URL
         const existingBtn = card.querySelector<HTMLButtonElement>(`.${BTN_CLASS}`)
         if (existingBtn) {
           const storedUrl = existingBtn.getAttribute('data-applymate-job-url')
@@ -644,7 +710,6 @@ function processCards(cfg: SiteConfig) {
         }
       }
     } else if (isIndeed) {
-      // For Indeed: use injected button as processed marker.
       const existingBtn = card.querySelector<HTMLButtonElement>(`.${BTN_CLASS}`)
       if (existingBtn) {
         const storedUrl = existingBtn.getAttribute('data-applymate-job-url')
@@ -653,7 +718,6 @@ function processCards(cfg: SiteConfig) {
         existingBtn.remove()
       }
     } else {
-      // For other platforms (Greenhouse, Lever, Stepstone, etc.): simple attribute marker.
       if (card.getAttribute(ATTR)) return
       card.setAttribute(ATTR, '1')
     }
@@ -680,7 +744,54 @@ function processCards(cfg: SiteConfig) {
     if (isIndeed) (card as HTMLElement).setAttribute(ATTR, 'indeed')
     injectCardButton(card, job)
     attachHoverPopup(card, job)
+    processed++
   })
+  if (processed > 0) log(`✅ Injected ${processed} card buttons`)
+}
+
+// ── Fallback: find cards via job view links (always works on LinkedIn) ────
+
+function processCardsViaJobLinks() {
+  const host = window.location.hostname
+  const isLinkedIn = host.includes('linkedin')
+  const links = document.querySelectorAll<HTMLAnchorElement>('a[href*="/jobs/view/"]')
+  log(`processCardsViaJobLinks: found ${links.length} job links`)
+
+  const seenUrns = new Set<string>()
+  let processed = 0
+
+  links.forEach(link => {
+    // Walk up to find the card container (up to 5 levels)
+    let card: Element | null = link
+    for (let i = 0; i < 5 && card; i++) {
+      const el = card as HTMLElement
+      const urn = el.getAttribute('data-entity-urn')
+      if (urn) {
+        if (seenUrns.has(urn)) return
+        seenUrns.add(urn)
+
+        // Already has button?
+        if (el.querySelector(`.${BTN_CLASS}`)) return
+
+        // Already a known <a> — need to go one more parent up
+        if (card.tagName === 'A') {
+          card = card.parentElement
+          if (!card) return
+        }
+
+        const job = scrapeLinkedInCard(card)
+        if (job) {
+          injectCardButton(card, job)
+          attachHoverPopup(card, job)
+          processed++
+        }
+        return
+      }
+      card = card.parentElement
+    }
+  })
+
+  if (processed > 0) log(`✅ processCardsViaJobLinks: injected ${processed} card buttons`)
 }
 
 export function startListModeInjector() {
@@ -705,6 +816,15 @@ export function startListModeInjector() {
     })
   })
   observer.observe(document.body, { childList: true, subtree: true })
+
+  // Staggered retries: LinkedIn loads cards via AJAX, sometimes after our first scan.
+  // Re-scanning at increasing intervals catches late-loading cards reliably.
+  for (const delay of [2000, 5000, 10000]) {
+    setTimeout(() => {
+      log(`Retry scan at ${delay}ms...`)
+      processCards(cfg)
+    }, delay)
+  }
 }
 
 // ── Listen for login/logout from popup ──────────────────────────────────────
@@ -744,7 +864,7 @@ export function isJobListPage(): boolean {
       path.startsWith('/jobs/collections') ||
       path.startsWith('/jobs/recommended') ||
       (path.startsWith('/jobs/') && !!document.querySelector(
-        'div.base-card, ul.jobs-search__results-list, [data-entity-urn]'
+        'div.base-card, ul.jobs-search__results-list, [data-entity-urn], [data-job-id]'
       ))
     )
   }
