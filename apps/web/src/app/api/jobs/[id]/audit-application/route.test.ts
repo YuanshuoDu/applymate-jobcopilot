@@ -24,6 +24,8 @@ vi.mock('@/lib/api-helpers', () => ({
 vi.mock('@/lib/model-router', () => ({
   modelChat: mocks.modelChat,
   parseAiJson: (raw: string) => JSON.parse(raw),
+  APPLYMATE_BACKING: { provider: 'minimax', model: 'MiniMax-M2.7' },
+  resolveConfig: (config: { provider: string; model: string; apiKey?: string }) => ({ ...config, resolvedKey: config.apiKey ?? (config.provider === 'minimax' ? 'test-key' : '') }),
 }))
 
 function request(body: unknown) {
@@ -71,6 +73,21 @@ describe('POST /api/jobs/[id]/audit-application', () => {
     const body = await response.json()
     expect(body.source).toBe('previous_version')
     expect(body.verdict).toBe('blocked')
+  })
+
+  it('falls back to the platform MiniMax model when the auditor role has no key', async () => {
+    mocks.resumeFindFirst.mockResolvedValueOnce({ id: 'resume_final', parentResumeId: 'resume_base', content: { contact: {}, summary: 'Final', experience: [], education: [], skills: [] } })
+      .mockResolvedValueOnce({ content: { contact: {}, summary: 'Original', experience: [], education: [], skills: [] } })
+    mocks.agentRoleFindFirst.mockResolvedValue({ provider: 'anthropic', model: 'claude-sonnet-4-6', apiKey: null, systemPrompt: 'Auditor' })
+    mocks.modelChat.mockResolvedValue({ provider: 'minimax', model: 'MiniMax-M2.7', text: JSON.stringify({ verdict: 'pass', findings: [
+      { area: 'resume', severity: 'pass', title: 'Supported', evidence: 'Matches.', action: 'None.' },
+      { area: 'cover_letter', severity: 'pass', title: 'Supported', evidence: 'Matches.', action: 'None.' },
+      { area: 'job_match', severity: 'pass', title: 'Relevant', evidence: 'Relevant.', action: 'None.' },
+    ] }) })
+    const { POST } = await import('./route')
+    const response = (await POST(request({ resumeId: 'resume_final', coverLetterId: 'cover_1' }) as never, { params: Promise.resolve({ id: 'job_1' }) }))!
+    expect(response.status).toBe(200)
+    expect(mocks.modelChat).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({ provider: 'minimax', model: 'MiniMax-M2.7' }), 3000)
   })
 
   it('does not block a truthful package merely because the job asks for missing tooling', async () => {
