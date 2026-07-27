@@ -4,13 +4,16 @@
  */
 import { getSettings, setCurrentJob, setBadge, clearBadge } from '@/lib/storage'
 import { login, saveJob, getRecentJobs, getStats, updateJob } from '@/lib/api'
-import type { ExtMessage, ScrapedJob } from '@/lib/types'
+import { getJobIdentity } from '@/lib/job-identity'
+import type { ExtMessage, SavedJob, ScrapedJob } from '@/lib/types'
 
 // ── Simple rate limiter (prevent excessive API calls) ──────────────
 const RATE_LIMIT_WINDOW = 2000 // 2 seconds between same-type operations
 const rateLimitMap = new Map<string, number>()
 let latestJobDetectedAt = 0
 const styledSaveUiTabs = new Set<number>()
+const savedJobsByKey = new Map<string, SavedJob>()
+const pendingSavesByKey = new Map<string, Promise<SavedJob>>()
 
 function checkRateLimit(key: string): boolean {
   const now = Date.now()
@@ -27,6 +30,17 @@ setInterval(() => {
     if (now - time > 60000) rateLimitMap.delete(key)
   }
 }, 60000)
+
+// A service worker can survive an account switch. Saved-state memory belongs to
+// the authenticated user, so never let it leak into the next account.
+chrome.storage.onChanged.addListener((changes, area) => {
+  if (area !== 'sync' || !changes.settings) return
+  const before = changes.settings.oldValue as { apiToken?: unknown } | undefined
+  const after = changes.settings.newValue as { apiToken?: unknown } | undefined
+  if (before?.apiToken === after?.apiToken) return
+  savedJobsByKey.clear()
+  pendingSavesByKey.clear()
+})
 
 // ── URL → saved job ID cache (for auto-enrichment) ────────────────
 async function cacheJobUrl(url: string, jobId: string) {
@@ -209,12 +223,21 @@ async function handleMessage(
       if (!settings.apiToken) {
         return { type: 'SAVE_JOB_RESULT', success: false, error: 'Not logged in — open the extension popup to log in first' }
       }
-      // Rate limit: prevent duplicate saves for same URL within 2s
-      if (msg.job?.url && !checkRateLimit(`save:${msg.job.url}`)) {
-        return { type: 'SAVE_JOB_RESULT', success: false, error: 'Rate limited — please wait a moment' }
-      }
       try {
-        const savedJob = await saveJob(settings, msg.job)
+        const key = getJobIdentity(msg.job)
+        const cached = savedJobsByKey.get(key)
+        if (cached) {
+          return { type: 'SAVE_JOB_RESULT', success: true, alreadySaved: true, savedJob: cached }
+        }
+
+        let pending = pendingSavesByKey.get(key)
+        if (!pending) {
+          pending = saveJob(settings, msg.job)
+          pendingSavesByKey.set(key, pending)
+        }
+        const savedJob = await pending
+        savedJobsByKey.set(key, savedJob)
+        pendingSavesByKey.delete(key)
         // Cache URL→jobId for later auto-enrichment when user visits the detail page
         if (savedJob?.id && msg.job.url) {
           await cacheJobUrl(msg.job.url, savedJob.id)
@@ -223,6 +246,7 @@ async function handleMessage(
         setTimeout(clearBadge, 3000)
         return { type: 'SAVE_JOB_RESULT', success: true, savedJob }
       } catch (err) {
+        pendingSavesByKey.delete(getJobIdentity(msg.job))
         const error = err instanceof Error ? err.message : String(err)
         return { type: 'SAVE_JOB_RESULT', success: false, error }
       }

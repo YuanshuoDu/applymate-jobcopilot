@@ -5,6 +5,7 @@
 import { detectAndScrape } from '@/lib/scrapers/detect'
 import { scrapeIndeedFromDocument } from '@/lib/scrapers/indeed'
 import { hasUsableDescription, isJobReadyForTailoring, mergeJobDetails } from '@/lib/job-quality'
+import { getJobIdentity } from '@/lib/job-identity'
 import type { ScrapedJob } from '@/lib/types'
 
 const ATTR        = 'data-applymate'
@@ -447,7 +448,7 @@ function scrapeCard(card: Element, cfg: SiteConfig): CardJob | null {
 
 // ── Saved-jobs cache (shared between card ⊕ and popup Save button) ──────────
 
-const savedJobUrls = new Set<string>()
+const savedJobKeys = new Set<string>()
 
 type CardButtonState = 'idle' | 'loading' | 'saved' | 'error'
 
@@ -727,25 +728,26 @@ function restoreCardButton(btn: HTMLButtonElement) {
   renderCardButtonState(btn, 'idle')
 }
 
-function markSaved(job: CardJob) {
-  savedJobUrls.add(job.url)
+function markSavedByKey(key: string) {
+  if (!key) return
+  savedJobKeys.add(key)
   document.querySelectorAll<HTMLButtonElement>(`.${BTN_CLASS}`).forEach(btn => {
-    const data = btn.getAttribute('data-applymate-job')
-    if (data) {
-      try {
-        const parsed: CardJob = JSON.parse(data)
-        if (parsed.url === job.url) {
-          btn.disabled = true
-          delete btn.dataset.applymateBusy
-          renderCardButtonState(btn, 'saved')
-        }
-      } catch { /* ignore */ }
+    if (btn.dataset.applymateSaveKey === key) {
+      btn.disabled = true
+      delete btn.dataset.applymateBusy
+      renderCardButtonState(btn, 'saved')
     }
   })
 }
 
+export function markJobSaved(job: Pick<ScrapedJob, 'source' | 'url' | 'title' | 'company' | 'location'>) {
+  const key = getJobIdentity(job)
+  markSavedByKey(key)
+  window.dispatchEvent(new CustomEvent('applymate:job-saved', { detail: { key } }))
+}
+
 function isAlreadySaved(job: CardJob): boolean {
-  return savedJobUrls.has(job.url)
+  return savedJobKeys.has(getJobIdentity(job))
 }
 
 // ── Per-card button ───────────────────────────────────────────────────────────
@@ -763,6 +765,7 @@ function injectCardButton(card: Element, job: CardJob, jobKey = job.url): HTMLBu
   // Store URL for element-recycling detection in processCards()
   btn.setAttribute('data-applymate-job-url', job.url)
   btn.setAttribute('data-applymate-job-key', jobKey)
+  btn.dataset.applymateSaveKey = getJobIdentity(job)
 
   btn.addEventListener('click', async (e) => {
     e.stopPropagation()
@@ -790,7 +793,7 @@ function injectCardButton(card: Element, job: CardJob, jobKey = job.url): HTMLBu
       log('SAVE_JOB response:', res)
 
       if (res?.success) {
-        markSaved(job)
+        markJobSaved(fullJob)
       } else {
         const msg = res?.error ?? 'Save failed'
         log('Save failed:', msg)
@@ -1232,13 +1235,18 @@ export function startListModeInjector() {
 
 window.addEventListener('applymate:logout', () => {
   log('Logout event — clearing saved state')
-  savedJobUrls.clear()
+  savedJobKeys.clear()
   document.querySelectorAll<HTMLButtonElement>(`.${BTN_CLASS}`).forEach(btn => {
     btn.innerHTML = `<span>⊕</span>`
     btn.style.background = ''
   })
   getPopup()?.remove()
   currentPopupJob = null
+})
+
+window.addEventListener('applymate:job-saved', (event) => {
+  const key = (event as CustomEvent<{ key?: unknown }>).detail?.key
+  if (typeof key === 'string') markSavedByKey(key)
 })
 
 window.addEventListener('applymate:login', () => {
