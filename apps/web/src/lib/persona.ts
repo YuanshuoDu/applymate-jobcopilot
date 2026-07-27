@@ -9,6 +9,7 @@ export interface PersonaField {
   confidence: number
   source:     string  // "resume" | "ai_derived" | "manual" | "form_scan"
   updatedAt:  string
+  consentAt?: string  // explicit user confirmation before saving an application answer
 }
 
 export const PERSONA_CATEGORIES = ['personal', 'work', 'contact', 'education', 'preferences'] as const
@@ -17,6 +18,7 @@ export type PersonaCategory = typeof PERSONA_CATEGORIES[number]
 // Special-category data is not needed to tailor a job application. Keeping it
 // out of the profile is the safest default under GDPR's data-minimisation rule.
 const SENSITIVE_FIELD = /(?:gender|sex|pronoun|birth|date[_ ]?of[_ ]?birth|age|race|ethnic|religion|faith|politic|union|health|medical|disab|veteran|criminal|passport|national[_ ]?id)/i
+const UNNECESSARY_IDENTIFIER = /(?:bank|iban|swift|bic|tax|social[_ ]?security|ssn|national[_ ]?insurance)/i
 
 export function validatePersonaField(value: unknown): string | null {
   if (!value || typeof value !== 'object') return 'Each persona field must be an object.'
@@ -26,6 +28,7 @@ export function validatePersonaField(value: unknown): string | null {
   if (!field.value || typeof field.value !== 'string' || field.value.length > 2_000) return 'Persona field value is required and must be 2,000 characters or fewer.'
   if (!PERSONA_CATEGORIES.includes(field.category as PersonaCategory)) return 'Persona field category is invalid.'
   if (SENSITIVE_FIELD.test(`${field.key} ${field.label}`)) return 'Sensitive personal data is not stored in Persona.'
+  if (UNNECESSARY_IDENTIFIER.test(`${field.key} ${field.label}`)) return 'Financial and government identifiers are not stored in Persona.'
   return null
 }
 

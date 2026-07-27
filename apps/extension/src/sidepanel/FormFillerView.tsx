@@ -338,6 +338,7 @@ export function FormFillerView({ settings, pendingFields, onFieldsConsumed, scan
         confidence: 1.0,
         source:     'form_scan',
         updatedAt:  new Date().toISOString(),
+        consentAt:  new Date().toISOString(),
       }))
       await savePersonaFields(settings, fields)
       setPersonaMatches([])

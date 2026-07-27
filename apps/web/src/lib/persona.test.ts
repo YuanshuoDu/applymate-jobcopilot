@@ -12,6 +12,10 @@ describe('validatePersonaField', () => {
     expect(validatePersonaField({ ...valid, key: 'disability_status', label: 'Disability status' })).toContain('Sensitive')
   })
 
+  it('rejects financial and government identifiers that are not needed for applications', () => {
+    expect(validatePersonaField({ ...valid, key: 'iban', label: 'IBAN' })).toContain('identifiers')
+  })
+
   it('rejects invalid categories and oversized values', () => {
     expect(validatePersonaField({ ...valid, category: 'other' })).toContain('category')
     expect(validatePersonaField({ ...valid, value: 'a'.repeat(2_001) })).toContain('2,000')

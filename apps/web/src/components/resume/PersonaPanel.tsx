@@ -11,7 +11,7 @@ const labels: Record<(typeof categories)[number], string> = {
   education: 'Education & qualifications', preferences: 'Job preferences',
 }
 
-export function PersonaPanel({ content, onEditResume }: { content: ResumeContent; onEditResume: (section: string) => void }) {
+export function PersonaPanel({ content, isDefault, onEditResume, onUseAsProfile }: { content: ResumeContent; isDefault: boolean; onEditResume: (section: string) => void; onUseAsProfile: () => void }) {
   const [fields, setFields] = useState<PersonaField[]>([])
   const [loading, setLoading] = useState(true)
   const [draft, setDraft] = useState<Partial<PersonaField> | null>(null)
@@ -28,17 +28,13 @@ export function PersonaPanel({ content, onEditResume }: { content: ResumeContent
   useEffect(() => { void load() }, [load])
 
   const groups = useMemo(() => categories.map(category => ({ category, fields: fields.filter(field => field.category === category) })), [fields])
-  const resumeFacts = [
-    { title: 'Contact', detail: [content.contact.name, content.contact.email, content.contact.location].filter(Boolean).join(' · '), section: 'contact' },
-    { title: 'Experience', detail: `${content.experience.length} role${content.experience.length === 1 ? '' : 's'} · ${content.skills.length} skill${content.skills.length === 1 ? '' : 's'}`, section: 'experience' },
-    { title: 'Qualifications', detail: `${content.education.length} education · ${(content.certifications ?? []).length} certification${(content.certifications ?? []).length === 1 ? '' : 's'}`, section: 'education' },
-  ]
+  const contactDetails = [content.contact.name, content.contact.email, content.contact.phone, content.contact.location, content.contact.linkedin, content.contact.github, content.contact.website].filter((value): value is string => Boolean(value))
 
   async function save() {
     if (!draft?.key || !draft.label || !draft.value) { setError('Add a label and value before saving.'); return }
     const field: PersonaField = {
       key: draft.key.toLowerCase().trim().replace(/[^a-z0-9_]/g, '_'), label: draft.label.trim(), value: draft.value.trim(),
-      category: draft.category ?? 'personal', confidence: 1, source: 'manual', updatedAt: new Date().toISOString(),
+      category: draft.category ?? 'personal', confidence: 1, source: 'manual', updatedAt: new Date().toISOString(), consentAt: new Date().toISOString(),
     }
     const response = await fetch('/api/me/persona/fields', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ fields: [field] }) })
     const payload = await response.json().catch(() => null)
@@ -67,9 +63,15 @@ export function PersonaPanel({ content, onEditResume }: { content: ResumeContent
     </div>
 
     <div style={privacyStyle}><ShieldCheck size={16} /><span><strong>You stay in control.</strong> Resume facts are read in place; application answers are saved only after you confirm. Sensitive data is not stored here.</span></div>
+    {isDefault ? <div style={sharedProfileStyle}>This is your shared profile resume. The extension uses it for future application forms.</div> : <div style={sharedProfileStyle}>The extension currently uses your default resume. <button onClick={onUseAsProfile} style={profileButton}>Use this resume as the shared Persona base</button></div>}
 
     <PanelTitle title="From this resume" />
-    {resumeFacts.map(fact => <button key={fact.title} onClick={() => onEditResume(fact.section)} style={factButton}><span><strong>{fact.title}</strong><small>{fact.detail || 'Add details'}</small></span><Pencil size={13} /></button>)}
+    <ResumeDetailCard title="Contact" details={contactDetails} onEdit={() => onEditResume('contact')} />
+    <ResumeDetailCard title="Professional summary" details={content.summary ? [content.summary] : []} onEdit={() => onEditResume('summary')} />
+    <ResumeDetailCard title="Experience" details={content.experience.flatMap(item => [`${item.role} · ${item.company}${item.period ? ` (${item.period})` : ''}`, ...item.bullets.map(bullet => `↳ ${bullet}`)])} onEdit={() => onEditResume('experience')} />
+    <ResumeDetailCard title="Skills & languages" details={[...content.skills, ...(content.languages ?? []).map(language => `${language.lang} · ${language.level}`)]} onEdit={() => onEditResume('skills')} />
+    <ResumeDetailCard title="Education & qualifications" details={[...content.education.map(item => `${item.degree} · ${item.institution}${item.year ? ` (${item.year})` : ''}`), ...(content.certifications ?? []).map(item => `${item.name} · ${item.issuer}${item.date ? ` (${item.date})` : ''}`)]} onEdit={() => onEditResume('education')} />
+    <ResumeDetailCard title="Projects" details={(content.projects ?? []).flatMap(item => [`${item.name}${item.role ? ` · ${item.role}` : ''}`, ...item.bullets.map(bullet => `↳ ${bullet}`)])} onEdit={() => onEditResume('projects')} />
 
     <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginTop: 18 }}><PanelTitle title="Saved application answers" /><button onClick={() => { setDraft({ category: 'personal' }); setError('') }} style={addButton}><Plus size={13} /> Add</button></div>
     {draft && <div style={editorStyle}>
@@ -85,10 +87,15 @@ export function PersonaPanel({ content, onEditResume }: { content: ResumeContent
 }
 
 function PanelTitle({ title }: { title: string }) { return <div style={{ fontSize: 10, color: 'var(--text-muted)', fontWeight: 700, letterSpacing: '.06em', textTransform: 'uppercase', margin: '10px 0 6px' }}>{title}</div> }
+function ResumeDetailCard({ title, details, onEdit }: { title: string; details: string[]; onEdit: () => void }) {
+  return <div style={resumeDetailStyle}><div style={{ display: 'flex', justifyContent: 'space-between', gap: 8 }}><strong>{title}</strong><button onClick={onEdit} title={`Edit ${title}`} style={iconButton}><Pencil size={13} /></button></div>{details.length ? <div style={{ display: 'grid', gap: 3, marginTop: 5 }}>{details.map((detail, index) => <small key={`${detail}-${index}`} style={{ lineHeight: 1.4 }}>{detail}</small>)}</div> : <small style={{ display: 'block', marginTop: 4 }}>No details added yet</small>}</div>
+}
 const iconButton = { border: 'none', background: 'transparent', color: 'var(--text-muted)', padding: 4, cursor: 'pointer' }
 const inputStyle = { width: '100%', boxSizing: 'border-box' as const, padding: '7px 8px', border: '1px solid var(--border)', borderRadius: 6, font: 'inherit', fontSize: 12, background: 'var(--bg)' }
 const privacyStyle = { display: 'flex', gap: 7, padding: '9px 10px', borderRadius: 8, fontSize: 11, lineHeight: 1.45, background: 'rgba(16, 185, 129, .08)', color: 'var(--text)', marginBottom: 12 }
-const factButton = { width: '100%', display: 'flex', alignItems: 'center', justifyContent: 'space-between', textAlign: 'left' as const, padding: '8px 9px', marginBottom: 5, border: '1px solid var(--border)', borderRadius: 7, background: 'var(--bg)', cursor: 'pointer', color: 'var(--text)' }
+const sharedProfileStyle = { padding: '8px 10px', borderRadius: 8, fontSize: 11, lineHeight: 1.45, background: 'rgba(79, 70, 229, .07)', color: 'var(--text)', marginBottom: 12 }
+const profileButton = { display: 'block', border: 'none', background: 'transparent', color: 'var(--primary)', padding: 0, marginTop: 4, font: 'inherit', fontWeight: 700, cursor: 'pointer', textAlign: 'left' as const }
+const resumeDetailStyle = { padding: '8px 9px', marginBottom: 5, border: '1px solid var(--border)', borderRadius: 7, background: 'var(--bg)', color: 'var(--text)' }
 const fieldStyle = { display: 'flex', alignItems: 'start', justifyContent: 'space-between', gap: 6, padding: '8px 9px', border: '1px solid var(--border)', borderRadius: 7, background: 'var(--bg)', marginBottom: 5 }
 const editorStyle = { padding: 9, border: '1px solid rgba(79,70,229,.3)', borderRadius: 8, display: 'grid', gap: 7, background: 'var(--bg)' }
 const addButton = { display: 'inline-flex', alignItems: 'center', gap: 3, border: 'none', background: 'transparent', color: 'var(--primary)', cursor: 'pointer', fontSize: 11, fontWeight: 600 }

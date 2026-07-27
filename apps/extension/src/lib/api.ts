@@ -171,6 +171,7 @@ export interface PersonaField {
   confidence: number
   source:     string  // "resume" | "ai_derived" | "manual" | "form_scan"
   updatedAt:  string
+  consentAt?: string
 }
 
 export interface PersonaFieldsResult {

@@ -93,6 +93,7 @@ export function PersonaView({ settings, personaUpdateTrigger }: Props) {
         confidence: 1.0,
         source:     'manual',
         updatedAt:  new Date().toISOString(),
+        consentAt:  new Date().toISOString(),
       }
       await savePersonaFields(settings, [field])
       await loadFields()

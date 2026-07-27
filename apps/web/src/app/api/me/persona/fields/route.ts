@@ -51,7 +51,7 @@ export async function POST(req: NextRequest) {
   for (const f of existing) map.set(f.key, f)
   for (const f of incoming) {
     const now = new Date().toISOString()
-    map.set(f.key, { ...f, updatedAt: now })
+    map.set(f.key, { ...f, updatedAt: now, consentAt: now })
   }
 
   const merged = Array.from(map.values())
