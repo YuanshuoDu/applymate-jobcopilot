@@ -175,7 +175,7 @@ ${coverLetter.content.slice(0, 8_000)}`
         color: audit.verdict === 'pass' ? '#059669' : audit.verdict === 'blocked' ? '#dc2626' : '#d97706',
         text: auditActivityText(resume.id, coverLetterId, audit),
       },
-    }).catch(() => {})
+    })
     return ok({ ...audit, _model: `${result.provider}/${result.model}` })
   } catch (error) {
     console.error('[/api/jobs/audit-application]', error)

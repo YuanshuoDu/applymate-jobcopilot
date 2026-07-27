@@ -102,4 +102,19 @@ describe('POST /api/jobs/[id]/audit-application', () => {
     await expect(response.json()).resolves.toMatchObject({ resumeId: 'resume_final', coverLetterId: 'cover_1', audit: { verdict: 'needs_review' } })
     expect(mocks.activityFindFirst).toHaveBeenCalledWith(expect.objectContaining({ where: expect.objectContaining({ jobId: 'job_1' }) }))
   })
+
+  it('does not report a completed audit when its canonical record could not be saved', async () => {
+    mocks.resumeFindFirst.mockResolvedValueOnce({ id: 'resume_final', parentResumeId: 'resume_base', content: { contact: {}, summary: 'Final', experience: [], education: [], skills: [] } })
+      .mockResolvedValueOnce({ content: { contact: {}, summary: 'Original', experience: [], education: [], skills: [] } })
+    mocks.modelChat.mockResolvedValue({ provider: 'minimax', model: 'MiniMax-M2.7', text: JSON.stringify({ verdict: 'pass', findings: [
+      { area: 'resume', severity: 'pass', title: 'Supported facts', evidence: 'Matches source.', action: 'None.' },
+      { area: 'cover_letter', severity: 'pass', title: 'Supported letter', evidence: 'Matches source.', action: 'None.' },
+      { area: 'job_match', severity: 'pass', title: 'Role fit', evidence: 'Relevant.', action: 'None.' },
+    ] }) })
+    mocks.activityCreate.mockRejectedValue(new Error('Activity database unavailable'))
+    const { POST } = await import('./route')
+    const response = (await POST(request({ resumeId: 'resume_final', coverLetterId: 'cover_1' }) as never, { params: Promise.resolve({ id: 'job_1' }) }))!
+    await expect(response.json()).resolves.toMatchObject({ error: 'Application audit failed: Activity database unavailable' })
+    expect(response.status).toBe(502)
+  })
 })

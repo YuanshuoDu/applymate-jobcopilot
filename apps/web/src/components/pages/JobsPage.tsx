@@ -366,6 +366,9 @@ function JobDetailDrawer({ job, onClose, onStatusChange, onUpdate, onDelete, onO
   const [latestAudit, setLatestAudit] = useState<ApplicationAudit | null>(null)
   const [documentPreview, setDocumentPreview] = useState<'resume' | 'coverLetter' | null>(null)
   const { data: coverLetters, refetch: refetchCoverLetters } = useApi<CoverLetter[]>(`/api/jobs/${job.id}/cover-letters`)
+  // The audit route is the canonical source because the activity feed is
+  // paginated and can omit an older audit after other job events are added.
+  const { data: canonicalAudit } = useApi<StoredApplicationAudit | null>(`/api/jobs/${job.id}/audit-application`)
 
   // Load per-job activity on mount; reset interview prep when job changes
   useEffect(() => {
@@ -420,7 +423,8 @@ function JobDetailDrawer({ job, onClose, onStatusChange, onUpdate, onDelete, onO
     : generatedCoverLetter
       ?? coverLetters?.find(letter => letter.resumeId === previewResumeId)
   const persistedAudit = useMemo(() => findLatestApplicationAudit(activity), [activity])
-  const displayedAudit = latestAudit ?? persistedAudit?.audit ?? null
+  const storedAudit = canonicalAudit ?? persistedAudit
+  const displayedAudit = latestAudit ?? storedAudit?.audit ?? null
   const factualAuditFindings = (displayedAudit?.findings ?? []).filter(finding => finding.area !== 'job_match' && finding.severity !== 'pass')
   const auditNeedsRepair = Boolean(displayedAudit && displayedAudit.verdict !== 'pass')
 
@@ -652,9 +656,9 @@ function JobDetailDrawer({ job, onClose, onStatusChange, onUpdate, onDelete, onO
   const drawerInputSt: React.CSSProperties = { ...INPUT_STYLE, fontSize: 11, padding: '5px 8px', borderRadius: 5 }
   const canTailorResume = Boolean(job.description && (baseResumes.length || existingTailoredResume))
   const currentPackAudited = auditedPackKey === `${job.finalResumeId}:${job.finalCoverLetterId}`
-    || (persistedAudit?.audit.verdict === 'pass'
-      && persistedAudit.resumeId === job.finalResumeId
-      && persistedAudit.coverLetterId === job.finalCoverLetterId)
+    || (storedAudit?.audit.verdict === 'pass'
+      && storedAudit.resumeId === job.finalResumeId
+      && storedAudit.coverLetterId === job.finalCoverLetterId)
 
   return (
     <>
