@@ -418,8 +418,8 @@ function JobDetailDrawer({ job, onClose, onStatusChange, onUpdate, onDelete, onO
   // Once a package has been confirmed, every surface must show the exact
   // resume/letter pair that is exported. Do not let an in-memory draft letter
   // replace the confirmed version in the Application Pack preview.
-  const selectedCoverLetter = job.finalCoverLetterId && job.finalResumeId
-    ? coverLetters?.find(letter => letter.id === job.finalCoverLetterId && letter.resumeId === job.finalResumeId)
+  const selectedCoverLetter = job.finalCoverLetterId
+    ? coverLetters?.find(letter => letter.id === job.finalCoverLetterId)
     : generatedCoverLetter
       ?? coverLetters?.find(letter => letter.resumeId === previewResumeId)
   const persistedAudit = useMemo(() => findLatestApplicationAudit(activity), [activity])
@@ -538,112 +538,87 @@ function JobDetailDrawer({ job, onClose, onStatusChange, onUpdate, onDelete, onO
   }
 
   async function autoTailorAndAudit() {
-    if (!selectedResumeId && !existingTailoredResume) {
+    if (!selectedResumeId && !existingTailoredResume && !job.finalResumeId) {
       toast.error('No base resume selected', 'Create or import a resume first.')
       return
     }
+    const resumeRepairs = auditNeedsRepair ? factualAuditFindings.filter(finding => finding.area === 'resume') : []
+    const coverLetterRepairs = auditNeedsRepair ? factualAuditFindings.filter(finding => finding.area === 'cover_letter') : []
     setAutoPreparing(true)
-    setPackStage('resume')
     try {
-      let adaptedResumeId = existingTailoredResume?.id
+      // Existing job documents are reused. A retry changes only the document
+      // area explicitly flagged by the independent audit.
+      let adaptedResumeId = job.finalResumeId ?? existingTailoredResume?.id
       if (!adaptedResumeId) {
+        setPackStage('resume')
         const { data, error } = await apiMutate<{ adaptedResumeId: string }>(`/api/jobs/${job.id}/tailor-resume`, 'POST', { resumeId: selectedResumeId })
         if (!data || error) throw new Error(error ?? 'Could not tailor the resume')
         adaptedResumeId = data.adaptedResumeId
-        const response = await fetch(`/api/resume/${adaptedResumeId}`)
-        if (response.ok) {
-          const tailored = await response.json() as Resume
-          setResumePreview(tailored)
-          setCachedApiResponse(`/api/resume/${adaptedResumeId}`, tailored)
-        }
+      } else if (resumeRepairs.length) {
+        setPackStage('resume')
+        const { data, error } = await apiMutate<{ adaptedResumeId: string }>(
+          `/api/jobs/${job.id}/tailor-resume`, 'POST',
+          { resumeId: adaptedResumeId, forceRetailor: true, auditFindings: resumeRepairs },
+        )
+        if (!data || error) throw new Error(error ?? 'Could not repair the flagged resume section')
+        adaptedResumeId = data.adaptedResumeId
+      }
+      const response = await fetch(`/api/resume/${adaptedResumeId}`)
+      if (response.ok) {
+        const tailored = await response.json() as Resume
+        setResumePreview(tailored)
+        setCachedApiResponse(`/api/resume/${adaptedResumeId}`, tailored)
       }
 
-      let revisionFindings: ApplicationAudit['findings'] = []
-      for (let attempt = 0; attempt < 2; attempt++) {
+      let coverLetter = job.finalCoverLetterId
+        ? coverLetters?.find(letter => letter.id === job.finalCoverLetterId)
+        : generatedCoverLetter ?? coverLetters?.find(letter => letter.resumeId === adaptedResumeId)
+      if (!coverLetter || coverLetterRepairs.length) {
         setPackStage('coverLetter')
-        // Reuse a manually prepared (or previously generated) letter for this
-        // tailored resume. A new letter is necessary only when one is missing,
-        // or after a failed audit triggers an AI resume revision.
-        const assignedCoverLetter = job.finalCoverLetterId
-          ? coverLetters?.find(letter => letter.id === job.finalCoverLetterId)
-          : undefined
-        // A final letter is reusable only when it was written for this exact
-        // resume version. This prevents an older letter silently travelling
-        // with a revised resume after an audit failure.
-        let coverLetter = attempt === 0
-          ? (assignedCoverLetter?.resumeId === adaptedResumeId ? assignedCoverLetter : undefined)
-            ?? coverLetters?.find(letter => letter.resumeId === adaptedResumeId)
-          : undefined
-        if (!coverLetter) {
-          const result = await apiMutate<CoverLetter>(
-            `/api/jobs/${job.id}/cover-letters/generate`, 'POST',
-            { resumeId: adaptedResumeId, preferProvidedResume: true, auditFindings: revisionFindings },
-          )
-          if (!result.data || result.error) throw new Error(result.error ?? 'Could not generate the cover letter')
-          coverLetter = result.data
-        }
-        setGeneratedCoverLetter(coverLetter)
-        void refetchCoverLetters()
+        const result = await apiMutate<CoverLetter>(
+          `/api/jobs/${job.id}/cover-letters/generate`, 'POST',
+          {
+            resumeId: adaptedResumeId,
+            preferProvidedResume: true,
+            auditFindings: coverLetterRepairs,
+            ...(coverLetter && coverLetterRepairs.length ? { repairCoverLetterId: coverLetter.id } : {}),
+          },
+        )
+        if (!result.data || result.error) throw new Error(result.error ?? 'Could not prepare the cover letter')
+        coverLetter = result.data
+      }
+      setGeneratedCoverLetter(coverLetter)
+      void refetchCoverLetters()
 
-        const { data: coverAssigned, error: coverAssignError } = await apiMutate<Job>(
+      if (job.finalCoverLetterId !== coverLetter.id) {
+        const { data: assigned, error: assignError } = await apiMutate<Job>(
           `/api/jobs/${job.id}/assign`, 'PATCH', { finalCoverLetterId: coverLetter.id },
         )
-        if (!coverAssigned || coverAssignError) throw new Error(coverAssignError ?? 'Could not select the cover letter')
-
-        setPackStage('audit')
-        let audit: ApplicationAudit | null = null
-        let auditError: string | null = null
-        for (let auditAttempt = 0; auditAttempt < 2; auditAttempt++) {
-          const result = await apiMutate<ApplicationAudit>(`/api/jobs/${job.id}/audit-application`, 'POST', { resumeId: adaptedResumeId, coverLetterId: coverLetter.id })
-          audit = result.data
-          auditError = result.error
-          if (audit || !auditError?.toLowerCase().includes('aborted')) break
-          await new Promise(resolve => setTimeout(resolve, 500))
-        }
-        if (!audit || auditError) throw new Error(auditError ?? 'Independent audit could not run')
-        setLatestAudit(audit)
-
-        if (audit.verdict === 'pass') {
-          setPackStage('review')
-          const { data: confirmed, error: confirmError } = await apiMutate<Job>(
-            `/api/jobs/${job.id}/assign`, 'PATCH', { finalResumeId: adaptedResumeId, finalCoverLetterId: coverLetter.id },
-          )
-          if (!confirmed || confirmError) throw new Error(confirmError ?? 'Could not confirm the audited package')
-          setAuditedPackKey(`${adaptedResumeId}:${coverLetter.id}`)
-          onUpdate(confirmed)
-          toast.success('Audited application pack ready', 'The final resume and cover letter are now available in this job.')
-          return
-        }
-
-        if (attempt === 0) {
-          revisionFindings = audit.findings
-          // The just-audited letter failed. Remove it from the selected
-          // package before generating a revised pair so no other surface can
-          // treat the failed letter as the current final document.
-          const { error: clearFailedLetterError } = await apiMutate(
-            `/api/jobs/${job.id}/assign`, 'PATCH', { finalCoverLetterId: null },
-          )
-          if (clearFailedLetterError) throw new Error(clearFailedLetterError)
-          setPackStage('resume')
-          const revisionResponse: { data: { adaptedResumeId: string } | null; error: string | null } = await apiMutate<{ adaptedResumeId: string }>(
-            `/api/jobs/${job.id}/tailor-resume`, 'POST',
-            { resumeId: adaptedResumeId, forceRetailor: true, auditFindings: audit.findings },
-          )
-          if (!revisionResponse.data || revisionResponse.error) throw new Error(revisionResponse.error ?? 'Could not revise the tailored resume after audit feedback')
-          adaptedResumeId = revisionResponse.data.adaptedResumeId
-          const response = await fetch(`/api/resume/${adaptedResumeId}`)
-          if (response.ok) {
-            const revised = await response.json() as Resume
-            setResumePreview(revised)
-            setCachedApiResponse(`/api/resume/${adaptedResumeId}`, revised)
-          }
-          continue
-        }
-
-        await apiMutate(`/api/jobs/${job.id}/assign`, 'PATCH', { finalCoverLetterId: null })
-        setOpenPackItem('audit')
-        toast.warning('Automatic revision needs your review', audit.summary)
+        if (!assigned || assignError) throw new Error(assignError ?? 'Could not select the cover letter')
+        onUpdate(assigned)
       }
+
+      setPackStage('audit')
+      const { data: audit, error: auditError } = await apiMutate<ApplicationAudit>(
+        `/api/jobs/${job.id}/audit-application`, 'POST', { resumeId: adaptedResumeId, coverLetterId: coverLetter.id },
+      )
+      if (!audit || auditError) throw new Error(auditError ?? 'Independent audit could not run')
+      setLatestAudit(audit)
+      if (audit.verdict !== 'pass') {
+        setPackStage('idle')
+        setOpenPackItem('audit')
+        toast.warning('Audit needs targeted corrections', audit.summary)
+        return
+      }
+
+      setPackStage('review')
+      const { data: confirmed, error: confirmError } = await apiMutate<Job>(
+        `/api/jobs/${job.id}/assign`, 'PATCH', { finalResumeId: adaptedResumeId, finalCoverLetterId: coverLetter.id },
+      )
+      if (!confirmed || confirmError) throw new Error(confirmError ?? 'Could not confirm the audited package')
+      setAuditedPackKey(`${adaptedResumeId}:${coverLetter.id}`)
+      onUpdate(confirmed)
+      toast.success('Audited application pack ready', 'The final resume and cover letter are now available in this job.')
     } catch (error) {
       setPackStage('idle')
       toast.error('Preparation could not finish', error instanceof Error ? error.message : 'Please try again')

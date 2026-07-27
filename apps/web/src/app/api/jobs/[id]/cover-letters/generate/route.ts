@@ -29,14 +29,20 @@ export async function POST(req: NextRequest, { params }: Params) {
   const body = await req.json().catch(() => null)
   if (!body) return err('Invalid JSON body')
 
-  const { resumeId, tone = 'professional', preferProvidedResume = false, auditFindings = [] } = body as {
+  const { resumeId, tone = 'professional', preferProvidedResume = false, auditFindings = [], repairCoverLetterId } = body as {
     resumeId: string
     tone?: string
     preferProvidedResume?: boolean
     auditFindings?: ApplicationAuditFinding[]
+    repairCoverLetterId?: string
   }
 
   if (!resumeId) return err('resumeId is required')
+
+  const existingLetter = repairCoverLetterId
+    ? await db.coverLetter.findFirst({ where: { id: repairCoverLetterId, jobId, userId: prep.userId } })
+    : null
+  if (repairCoverLetterId && !existingLetter) return err('Cover letter to repair was not found for this job', 404)
 
   // Prefer finalResume if job has one, otherwise use provided resumeId
   const effectiveResumeId = preferProvidedResume ? resumeId : (job.finalResumeId ?? resumeId)
@@ -73,7 +79,7 @@ export async function POST(req: NextRequest, { params }: Params) {
   const jobCompany = job.company
   const jobDesc    = job.description
   const auditCorrections = Array.isArray(auditFindings)
-    ? auditFindings.filter(finding => finding.severity !== 'pass').slice(0, 6)
+    ? auditFindings.filter(finding => finding.area === 'cover_letter' && finding.severity !== 'pass').slice(0, 6)
       .map(finding => `- ${finding.area}: ${finding.title}. Required correction: ${finding.action}`)
     : []
 
@@ -91,6 +97,7 @@ export async function POST(req: NextRequest, { params }: Params) {
     'Structure: ' + greeting + ' | hook | why this role | 2-3 achievements | CTA | Sincerely, / ' + name,
     'Rules: 220–280 words, no filler like "I am writing to express my interest". Include a metric only when it is explicitly supported by the resume; never invent an achievement, qualification, or outcome.',
     auditCorrections.length ? `AUDIT REPAIR NOTES (follow these while staying truthful):\n${auditCorrections.join('\n')}` : '',
+    existingLetter ? `EXISTING COVER LETTER:\n${existingLetter.content}\n\nReturn the full corrected letter, but preserve all supported wording and structure. Only change the claim(s) identified in the audit repair notes.` : '',
     'Return ONLY the cover letter text.',
   ].filter(line => line !== undefined).join('\n')
 
@@ -124,8 +131,9 @@ export async function POST(req: NextRequest, { params }: Params) {
     const content = letter.trim()
 
     // Persist CoverLetter row, snapshotting template from resume
-    const cl = await db.coverLetter.create({
-      data: {
+    const cl = existingLetter
+      ? await db.coverLetter.update({ where: { id: existingLetter.id }, data: { content, resumeId: effectiveResumeId, templateId: resume.templateId ?? null, templateOptions: resume.templateOptions ?? undefined } })
+      : await db.coverLetter.create({ data: {
         userId:          prep.userId,
         jobId,
         resumeId:        effectiveResumeId,
@@ -135,10 +143,9 @@ export async function POST(req: NextRequest, { params }: Params) {
         templateOptions: resume.templateOptions ?? undefined,
         origin:          'ai-generated',
         isFinal:         false,
-      },
-    })
+      } })
 
-    return ok({ ...cl, _model: model }, 201)
+    return ok({ ...cl, _model: model }, existingLetter ? 200 : 201)
   } catch (e) {
     console.error('[/api/jobs/' + jobId + '/cover-letters/generate]', e)
     return err('Cover letter generation failed (' + cfg.provider + '/' + cfg.model + '): ' + (e as Error).message, 500)

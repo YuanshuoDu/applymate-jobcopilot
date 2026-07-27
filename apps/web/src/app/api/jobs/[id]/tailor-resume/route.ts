@@ -46,6 +46,26 @@ function parseAfterValue(after: unknown): unknown {
   }
 }
 
+function sectionsForAuditRepair(findings: ApplicationAuditFinding[]) {
+  const text = findings
+    .filter(finding => finding.area === 'resume' && finding.severity !== 'pass')
+    .map(finding => `${finding.title} ${finding.evidence} ${finding.action}`.toLowerCase())
+    .join(' ')
+  const matches: Array<typeof SECTIONS[number]> = []
+  const add = (section: typeof SECTIONS[number], terms: string[]) => {
+    if (terms.some(term => text.includes(term))) matches.push(section)
+  }
+  add('experience', ['experience', 'employer', 'employment', 'company', 'role', 'title', 'date', 'duration'])
+  add('summary', ['summary', 'profile', 'headline'])
+  add('skills', ['skill', 'technology', 'tooling'])
+  add('education', ['education', 'degree', 'university'])
+  add('projects', ['project', 'portfolio'])
+  add('certifications', ['certification', 'certificate', 'credential'])
+  // When the auditor cannot identify a section, restrict the repair to the
+  // summary instead of re-writing every part of the candidate's resume.
+  return matches.length ? [...new Set(matches)] : ['summary']
+}
+
 export async function POST(req: NextRequest, { params }: Params) {
   const prep = await prepareAiRoute(req, 'suggest')
   if ('error' in prep) return prep.error
@@ -86,11 +106,14 @@ export async function POST(req: NextRequest, { params }: Params) {
   const adaptedContent = cloneJson(resumeContent)
   const changes: ChangeDetail[] = []
   const corrections = Array.isArray(auditFindings)
-    ? auditFindings.filter(finding => finding.severity !== 'pass').slice(0, 6)
+    ? auditFindings.filter(finding => finding.area === 'resume' && finding.severity !== 'pass').slice(0, 6)
       .map(finding => `- ${finding.area}: ${finding.title}. Required correction: ${finding.action}`)
     : []
+  const sectionsToTailor = forceRetailor && corrections.length
+    ? sectionsForAuditRepair(auditFindings)
+    : SECTIONS
 
-  for (const section of SECTIONS) {
+  for (const section of sectionsToTailor) {
     const currentValue = resumeContent[section]
     if (currentValue === undefined || currentValue === null) continue
 

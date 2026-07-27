@@ -9,6 +9,8 @@ const mocks = vi.hoisted(() => ({
   buildPersona: vi.fn(),
   parseAiJson: vi.fn(),
   resumeCreate: vi.fn(),
+  resumeUpdate: vi.fn(),
+  resumeVersionCreate: vi.fn(),
   activityCreate: vi.fn(),
 }))
 
@@ -20,7 +22,8 @@ vi.mock('@/lib/api-helpers', () => ({
 
 vi.mock('@/lib/db', () => ({
   db: {
-    resume: { findFirst: mocks.resumeFindFirst, create: mocks.resumeCreate },
+    resume: { findFirst: mocks.resumeFindFirst, create: mocks.resumeCreate, update: mocks.resumeUpdate },
+    resumeVersion: { create: mocks.resumeVersionCreate },
     job: { findFirst: mocks.jobFindFirst },
     activity: { create: mocks.activityCreate },
   },
@@ -42,6 +45,8 @@ describe('tailor resume API', () => {
     mocks.buildPersona.mockReset()
     mocks.parseAiJson.mockReset()
     mocks.resumeCreate.mockReset()
+    mocks.resumeUpdate.mockReset()
+    mocks.resumeVersionCreate.mockReset()
     mocks.activityCreate.mockReset()
     mocks.prepareAiRoute.mockResolvedValue({ userId: 'user_1', cfg: { provider: 'test', model: 'm1' } })
     mocks.buildPersona.mockResolvedValue('EXPERIENCE:\n- Backend engineer')
@@ -86,5 +91,28 @@ describe('tailor resume API', () => {
     if (!response) throw new Error('Expected a response')
     expect(response.status).toBe(200)
     expect(mocks.modelChat).toHaveBeenCalledWith(expect.arrayContaining([expect.objectContaining({ content: expect.stringContaining('CONFIRMED PERSONA') })]), expect.any(Object), 2000)
+  })
+
+  it('repairs only the experience section when the audit flags an unsupported role claim', async () => {
+    mocks.resumeFindFirst
+      .mockResolvedValueOnce({ id: 'resume_tailored', content: { summary: 'Engineer', experience: [{ role: 'Invented title' }], skills: ['TypeScript'] } })
+      .mockResolvedValueOnce({ id: 'resume_tailored', parentResumeId: 'resume_base', content: { summary: 'Engineer', experience: [{ role: 'Invented title' }], skills: ['TypeScript'] }, name: 'Tailored' })
+      .mockResolvedValueOnce({ id: 'resume_base', content: { summary: 'Engineer', experience: [{ role: 'Developer' }], skills: ['TypeScript'] } })
+    mocks.jobFindFirst.mockResolvedValue({ id: 'job_1', company: 'N26', role: 'Backend Engineer', description: 'Build reliable systems.', keywords: '' })
+    mocks.modelChat.mockResolvedValue({ text: '{"after":[{"role":"Developer"}],"reason":"Removed unsupported title"}' })
+    mocks.parseAiJson.mockReturnValue({ after: [{ role: 'Developer' }], reason: 'Removed unsupported title' })
+    mocks.resumeVersionCreate.mockResolvedValue({})
+    mocks.resumeUpdate.mockResolvedValue({ id: 'resume_tailored' })
+    mocks.activityCreate.mockResolvedValue({})
+    const { POST } = await import('./route')
+    const response = await POST(new NextRequest('http://localhost/api/jobs/job_1/tailor-resume', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ resumeId: 'resume_tailored', forceRetailor: true, auditFindings: [{ area: 'resume', severity: 'critical', title: 'Unsupported role title', evidence: 'The experience title is not in the source.', action: 'Restore the source role.' }] }),
+    }) as never, { params: Promise.resolve({ id: 'job_1' }) })
+
+    if (!response) throw new Error('Expected a response')
+    expect(response.status).toBe(200)
+    expect(mocks.modelChat).toHaveBeenCalledTimes(1)
+    expect(mocks.modelChat.mock.calls[0][0][0].content).toContain('SECTION: experience')
   })
 })
