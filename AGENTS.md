@@ -204,6 +204,15 @@ When you need PM response, mention `@claude` in a GitHub issue or PR comment:
 
 Claude checks for `@claude` mentions at the start of every PM monitoring tick (every 4–30 min depending on activity). Always include the issue number.
 
+### GitHub Commit Requirement (Project-wide)
+
+Every ApplyMate development change must be recorded in a Git commit and pushed
+to the configured GitHub `origin` repository before the work is handed off. Keep
+commits scoped to the requested change, preserve unrelated working-tree edits,
+and report the commit hash and push result in the final response. If pushing is
+blocked by authentication, permissions, or remote conflicts, report the exact
+blocker instead of claiming completion.
+
 ### PR Body (Required Format)
 
 ```markdown
