@@ -5,11 +5,74 @@ import { db } from '@/lib/db'
 
 // ── Token management ─────────────────────────────────────────────────────────
 
-export async function getGoogleAccessToken(userId: string): Promise<string | null> {
-  const account = await db.account.findFirst({
-    where:  { userId, provider: 'google' },
-    select: { access_token: true, refresh_token: true, expires_at: true, scope: true },
+/** Keep Gmail integration credentials separate from Auth.js Google sign-in rows. */
+export const GMAIL_ACCOUNT_PROVIDER = 'gmail'
+
+export async function findGmailConnection(userId: string) {
+  const select = {
+    id: true,
+    providerAccountId: true,
+    access_token: true,
+    refresh_token: true,
+    expires_at: true,
+    scope: true,
+    token_type: true,
+    id_token: true,
+    session_state: true,
+  } as const
+
+  const connection = await db.account.findFirst({
+    where: { userId, provider: GMAIL_ACCOUNT_PROVIDER },
+    select,
   })
+  if (connection) return connection
+
+  // One-time compatibility path for credentials created before Gmail was split
+  // from the Auth.js `google` identity provider. Copying preserves login
+  // identity and never transfers a connection between users.
+  const legacy = await db.account.findFirst({
+    where: { userId, provider: 'google', scope: { contains: 'gmail' } },
+    select,
+  })
+  if (!legacy) return null
+
+  const existingForGoogleAccount = await db.account.findUnique({
+    where: {
+      provider_providerAccountId: {
+        provider: GMAIL_ACCOUNT_PROVIDER,
+        providerAccountId: legacy.providerAccountId,
+      },
+    },
+    select: { userId: true },
+  })
+  if (existingForGoogleAccount && existingForGoogleAccount.userId !== userId) return null
+
+  return db.account.upsert({
+    where: {
+      provider_providerAccountId: {
+        provider: GMAIL_ACCOUNT_PROVIDER,
+        providerAccountId: legacy.providerAccountId,
+      },
+    },
+    create: {
+      userId,
+      type: 'oauth',
+      provider: GMAIL_ACCOUNT_PROVIDER,
+      providerAccountId: legacy.providerAccountId,
+      access_token: legacy.access_token,
+      refresh_token: legacy.refresh_token,
+      expires_at: legacy.expires_at,
+      token_type: legacy.token_type,
+      scope: legacy.scope,
+      id_token: legacy.id_token,
+      session_state: legacy.session_state,
+    },
+    update: {},
+  })
+}
+
+export async function getGoogleAccessToken(userId: string): Promise<string | null> {
+  const account = await findGmailConnection(userId)
   if (!account?.access_token) {
     console.error('[gmail] getGoogleAccessToken: no access_token in DB for user', userId)
     return null
@@ -37,8 +100,8 @@ export async function getGoogleAccessToken(userId: string): Promise<string | nul
       const data = await res.json()
       console.log('[gmail] token refresh response:', JSON.stringify({ ok: res.ok, status: res.status, hasToken: !!data.access_token, error: data.error }))
       if (data.access_token) {
-        await db.account.updateMany({
-          where: { userId, provider: 'google' },
+        await db.account.update({
+          where: { id: account.id },
           data:  {
             access_token: data.access_token,
             expires_at:   Math.floor(Date.now() / 1000) + (data.expires_in ?? 3600),

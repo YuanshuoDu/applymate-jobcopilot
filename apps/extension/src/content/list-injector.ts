@@ -2,11 +2,30 @@
  * List-page injector: injects per-card ⊕ button and hover popup
  * on LinkedIn, Indeed, Glassdoor, Stepstone, Xing, Wellfound, Monster, Arbeitsagentur search-result pages.
  */
+import { detectAndScrape } from '@/lib/scrapers/detect'
+import { scrapeIndeedFromDocument } from '@/lib/scrapers/indeed'
+import { hasUsableDescription, isJobReadyForTailoring, mergeJobDetails } from '@/lib/job-quality'
+import type { ScrapedJob } from '@/lib/types'
 
 const ATTR        = 'data-applymate'
 const POPUP_ID    = 'applymate-popup'
 const BTN_CLASS   = 'applymate-card-btn'
 const HOVER_DELAY = 500   // ms before popup appears (reduced for snappier preview)
+
+// Logged-in LinkedIn has begun rolling out result cards that are plain
+// `div[role="button"]` controls. They contain neither a job URL nor any of the
+// historical data-* identifiers, but retain this accessible dismiss control.
+// Keep this narrow: it is only used as an additional card anchor, not as a
+// global generic button selector.
+const LINKEDIN_DISMISS_JOB_SELECTOR = 'button[aria-label^="Dismiss "][aria-label$=" job"]'
+const LINKEDIN_DETAIL_SELECTOR =
+  '.jobs-details__main-content, .jobs-search__job-details--container, .scaffold-layout__detail, .job-view-layout'
+
+type ListRuntimeGlobal = typeof globalThis & {
+  __applyMateListInjectorCleanup?: () => void
+}
+
+const listRuntimeGlobal = globalThis as ListRuntimeGlobal
 
 const DEBUG = true
 function log(...args: unknown[]) { if (DEBUG) console.log('[ApplyMate:list]', ...args) }
@@ -40,7 +59,7 @@ const SITES: Record<string, SiteConfig> = {
     // LinkedIn changes class names every 3-6 months. Use attribute-based
     // selectors (data-entity-urn, data-job-id) as primary anchors, plus a
     // broad link-based fallback for any layout we haven't seen yet.
-    card: '[data-entity-urn], [data-job-id], div.base-card, div.job-card-container, li.jobs-search-results__list-item, li:has(a[href*="/jobs/view/"])',
+    card: '[data-occludable-job-id], [data-entity-urn], [data-job-id], div.base-card, div.job-card-container, li.jobs-search-results__list-item, li:has(a[href*="/jobs/view/"]), div[role="button"]:has(> button[aria-label^="Dismiss "][aria-label$=" job"])',
     title:    '',
     company:  '',
     location: '',
@@ -172,8 +191,6 @@ function scrapeLinkedInCard(card: Element): CardJob | null {
     card.querySelector<HTMLAnchorElement>('a[href*="/jobs/view/"]') ||
     card.querySelector<HTMLAnchorElement>('a.base-card__full-link') ||
     card.querySelector<HTMLAnchorElement>('a.job-card-container__link')
-  const url = linkEl?.href || ''
-  if (!url) return null
 
   const title =
     (linkEl?.getAttribute('aria-label')?.trim()) ||
@@ -186,6 +203,8 @@ function scrapeLinkedInCard(card: Element): CardJob | null {
     card.querySelector<HTMLElement>('a.base-card__full-link .sr-only')?.innerText?.trim() ||
     // Generic: first heading or strong inside card
     card.querySelector<HTMLElement>('h3, h2, strong')?.innerText?.trim() ||
+    // New logged-in cards expose the title through their dismiss control.
+    getLinkedInDismissTitle(card) ||
     ''
 
   const company =
@@ -195,6 +214,7 @@ function scrapeLinkedInCard(card: Element): CardJob | null {
     card.querySelector<HTMLElement>('.artdeco-entity-lockup__subtitle')?.innerText?.trim() ||
     // Generic: any link with /company/ path inside card
     card.querySelector<HTMLElement>('a[href*="/company/"]')?.innerText?.trim() ||
+    getLinkedInFallbackCompany(card, title) ||
     ''
 
   const location =
@@ -202,6 +222,7 @@ function scrapeLinkedInCard(card: Element): CardJob | null {
     card.querySelector<HTMLElement>('.job-search-card__location')?.innerText?.trim() ||
     card.querySelector<HTMLElement>('.artdeco-entity-lockup__caption')?.innerText?.trim() ||
     card.querySelector<HTMLElement>('.base-search-card__metadata')?.innerText?.trim()?.split('\n')[0] ||
+    getLinkedInFallbackLocation(card, title, company) ||
     ''
 
   // Salary: not typically shown on LinkedIn list cards
@@ -211,7 +232,45 @@ function scrapeLinkedInCard(card: Element): CardJob | null {
     ''
 
   if (!title || !company) return null
+  const rawUrl = linkEl?.href || ''
+  const jobId = getLinkedInJobId(card, rawUrl)
+  const url = jobId
+    ? `${window.location.origin}/jobs/view/${jobId}/`
+    : getLinkedInFallbackUrl(card, title, company, location)
   return { title, company, location: location || 'Unknown', salary, url, source: 'linkedin' }
+}
+
+function asScrapedJob(job: CardJob, description = ''): ScrapedJob {
+  const sources: ScrapedJob['source'][] = [
+    'linkedin', 'indeed', 'glassdoor', 'wellfound', 'greenhouse', 'lever',
+    'workday', 'stepstone', 'xing', 'smartrecruiters', 'ashby', 'bamboohr',
+    'jobvite', 'icims', 'unknown',
+  ]
+  const source = sources.includes(job.source as ScrapedJob['source'])
+    ? job.source as ScrapedJob['source']
+    : 'unknown'
+  return {
+    title: job.title,
+    company: job.company,
+    location: job.location,
+    description,
+    salary: job.salary || null,
+    url: job.url,
+    source,
+  }
+}
+
+function normalizedCardText(value: string): string {
+  return value.replace(/\s+/g, ' ').trim().toLowerCase()
+}
+
+function matchesCardJob(card: CardJob, detail: ScrapedJob): boolean {
+  return normalizedCardText(card.title) === normalizedCardText(detail.title) &&
+    normalizedCardText(card.company) === normalizedCardText(detail.company)
+}
+
+function waitForDetail(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms))
 }
 
 // ── Debug helper for list pages (injects into MAIN world so console can access) ──
@@ -289,8 +348,9 @@ function scrapeIndeedCard(card: Element): CardJob | null {
   const link = card.querySelector<HTMLAnchorElement>(
     'a[data-jk], a.jcs-JobTitle, h2.jobTitle a, a[data-testid="job-title"], a[href*="/viewjob"], a[href*="jk="]'
   )
-  const url = link?.href ||
-    (jk ? `${window.location.origin}/viewjob?jk=${jk}` : window.location.href)
+  const url = jk
+    ? `${window.location.origin}/viewjob?jk=${encodeURIComponent(jk)}`
+    : (link?.href || window.location.href)
 
   // Title: span[title] attribute is the most stable — Indeed has used it since 2019.
   // Do NOT use innerText of the full h2 as it may include "new" badge, "sponsored", etc.
@@ -389,6 +449,284 @@ function scrapeCard(card: Element, cfg: SiteConfig): CardJob | null {
 
 const savedJobUrls = new Set<string>()
 
+type CardButtonState = 'idle' | 'loading' | 'saved' | 'error'
+
+function setImportantStyle(el: HTMLElement, property: string, value: string) {
+  el.style.setProperty(property, value, 'important')
+}
+
+function normalizeLinkedInText(value: string): string {
+  return value.replace(/\s+/g, ' ').trim().toLowerCase()
+}
+
+function getLinkedInDismissTitle(card: Element): string {
+  const label = card.querySelector<HTMLButtonElement>(LINKEDIN_DISMISS_JOB_SELECTOR)?.getAttribute('aria-label')?.trim() || ''
+  return /^Dismiss\s+(.+?)\s+job$/i.exec(label)?.[1]?.trim() || ''
+}
+
+function isLinkedInDetailElement(element: Element): boolean {
+  return !!element.closest(LINKEDIN_DETAIL_SELECTOR)
+}
+
+function findLinkedInCardForDismissButton(dismissButton: HTMLButtonElement): Element | null {
+  const title = /^Dismiss\s+(.+?)\s+job$/i.exec(dismissButton.getAttribute('aria-label') || '')?.[1]?.trim()
+  let candidate: Element | null = dismissButton.parentElement
+
+  while (candidate && candidate !== document.body) {
+    if (
+      candidate.matches('[role="button"]') &&
+      !isLinkedInDetailElement(candidate) &&
+      candidate.querySelector(LINKEDIN_DISMISS_JOB_SELECTOR) === dismissButton &&
+      (!title || (candidate.textContent || '').includes(title))
+    ) {
+      return candidate
+    }
+    candidate = candidate.parentElement
+  }
+  return null
+}
+
+function getLinkedInCardTextFragments(card: Element): string[] {
+  const fragments: string[] = []
+  const seen = new Set<string>()
+
+  // Read only leaf text nodes so an outer card's aggregate text does not
+  // swallow title, company, location, and status into one unusable string.
+  card.querySelectorAll<HTMLElement>('span, a, strong, h2, h3, h4, p, div').forEach(element => {
+    if (element.closest(`.${BTN_CLASS}`) || element.matches(LINKEDIN_DISMISS_JOB_SELECTOR)) return
+    if (Array.from(element.children).some(child => (child.textContent || '').trim())) return
+    const value = (element.innerText || element.textContent || '').replace(/\s+/g, ' ').trim()
+    if (!value || value.length > 160) return
+    const key = normalizeLinkedInText(value)
+    if (seen.has(key)) return
+    seen.add(key)
+    fragments.push(value)
+  })
+
+  return fragments
+}
+
+function isLikelyLinkedInLocation(value: string): boolean {
+  return /\b(remote|hybrid|on[ -]?site|dublin|ireland|united kingdom|uk|germany|france|netherlands|belgium|sweden|denmark|norway|finland|spain|italy|poland|austria|switzerland|portugal)\b/i.test(value)
+}
+
+function isLinkedInCardMetadata(value: string, title: string): boolean {
+  const normalized = normalizeLinkedInText(value)
+  const normalizedTitle = normalizeLinkedInText(title)
+  if (!normalized || normalized.length > 160) return true
+  if (normalizedTitle && (normalized === normalizedTitle || normalized.startsWith(`${normalizedTitle} `))) return true
+  return /(verified job|promoted|easy apply|saved|viewed|reposted|posted|applicants|alumni|work here|connections|\bago\b)/i.test(value)
+}
+
+function getLinkedInFallbackCompany(card: Element, title: string): string {
+  const fragments = getLinkedInCardTextFragments(card)
+  const normalizedTitle = normalizeLinkedInText(title)
+  const titleIndex = fragments.findIndex(value => {
+    const normalized = normalizeLinkedInText(value)
+    return normalized === normalizedTitle || normalized.startsWith(`${normalizedTitle} `)
+  })
+  const candidates = titleIndex >= 0 ? fragments.slice(titleIndex + 1) : fragments
+
+  return candidates.find(value =>
+    !isLinkedInCardMetadata(value, title) && !isLikelyLinkedInLocation(value)
+  ) || ''
+}
+
+function getLinkedInFallbackLocation(card: Element, title: string, company: string): string {
+  const companyIndex = normalizeLinkedInText(company)
+  const fragments = getLinkedInCardTextFragments(card)
+  const afterCompany = companyIndex
+    ? fragments.slice(Math.max(0, fragments.findIndex(value => normalizeLinkedInText(value) === companyIndex) + 1))
+    : fragments
+  return afterCompany.find(isLikelyLinkedInLocation) ||
+    fragments.find(value => isLikelyLinkedInLocation(value) && !isLinkedInCardMetadata(value, title)) ||
+    ''
+}
+
+function getLinkedInCardFingerprint(card: Element): string {
+  const fragments = getLinkedInCardTextFragments(card)
+  const parts = [getLinkedInDismissTitle(card), ...fragments.slice(0, 8)]
+    .map(normalizeLinkedInText)
+    .filter(Boolean)
+  return parts.join('|').slice(0, 360)
+}
+
+function findLinkedInCardForLink(link: HTMLAnchorElement): Element | null {
+  if (isLinkedInDetailElement(link)) {
+    return null
+  }
+  const stableCard = link.closest(
+    'li[data-occludable-job-id], li.jobs-search-results__list-item, div.job-card-container, div.base-card'
+  )
+  if (stableCard) return stableCard
+  const attributedCard = link.closest('[data-job-id], [data-entity-urn]')
+  if (attributedCard && attributedCard.tagName !== 'A') return attributedCard
+  if (attributedCard?.parentElement && attributedCard.parentElement.tagName !== 'A') {
+    return attributedCard.parentElement
+  }
+  const listItem = link.closest('li')
+  return listItem?.querySelectorAll('a[href*="/jobs/view/"]').length === 1 ? listItem : null
+}
+
+function getLinkedInJobId(card: Element, url: string): string {
+  const idSelector = '[data-occludable-job-id], [data-job-id], [data-entity-urn*="jobPosting"]'
+  const attributed = card.matches(idSelector)
+    ? card
+    : card.querySelector(idSelector)
+  const directId = attributed?.getAttribute('data-occludable-job-id') ||
+    attributed?.getAttribute('data-job-id')
+  if (directId) return directId
+  const urn = attributed?.getAttribute('data-entity-urn') || ''
+  const urnId = urn.match(/(?:jobPosting:|:)(\d{5,})/i)?.[1]
+  if (urnId) return urnId
+  return url.match(/\/jobs\/view\/(?:[^/?#]*-)?(\d{5,})(?:[/?#]|$)/i)?.[1] || ''
+}
+
+function getLinkedInJobKey(card: Element, url: string): string {
+  const urlId = getLinkedInJobId(card, url)
+  if (urlId) return `linkedin:${urlId}`
+  const fingerprint = getLinkedInCardFingerprint(card)
+  return fingerprint ? `linkedin:card:${fingerprint}` : `linkedin:${url}`
+}
+
+function getCurrentLinkedInJobId(): string {
+  const currentJobId = new URLSearchParams(window.location.search).get('currentJobId')
+  if (currentJobId) return currentJobId
+  const pathId = window.location.pathname.match(/\/jobs\/view\/(?:[^/?#]*-)?(\d{5,})(?:[/?#]|$)/i)?.[1]
+  if (pathId) return pathId
+  const detailRoot = document.querySelector<HTMLElement>(LINKEDIN_DETAIL_SELECTOR)
+  const linkedId = detailRoot?.querySelector<HTMLAnchorElement>('a[href*="/jobs/view/"]')?.href || ''
+  return getLinkedInJobId(detailRoot || document.documentElement, linkedId)
+}
+
+function isSelectedLinkedInCard(card: Element, title: string): boolean {
+  if (card.matches('[aria-selected="true"], [aria-current="true"]') ||
+      card.querySelector('[aria-selected="true"], [aria-current="true"]')) {
+    return true
+  }
+  const detailTitle = document.querySelector<HTMLElement>(
+    `${LINKEDIN_DETAIL_SELECTOR} h1.job-details-jobs-unified-top-card__job-title, ` +
+    `${LINKEDIN_DETAIL_SELECTOR} h1.t-24.t-bold, ${LINKEDIN_DETAIL_SELECTOR} h1[class*="title"]`
+  )?.innerText?.trim() || ''
+  return Boolean(detailTitle && normalizeLinkedInText(detailTitle) === normalizeLinkedInText(title))
+}
+
+function getLinkedInFallbackUrl(card: Element, title: string, company: string, location: string): string {
+  const selectedJobId = getCurrentLinkedInJobId()
+  if (selectedJobId && isSelectedLinkedInCard(card, title)) {
+    return `${window.location.origin}/jobs/view/${selectedJobId}/`
+  }
+
+  // The current rollout exposes no per-card href. Preserve the actual search
+  // page and give each card a stable fragment so saved jobs remain distinct
+  // instead of every plus button saving the same selected job.
+  const fallback = new URL(window.location.href)
+  const fingerprint = getLinkedInCardFingerprint(card) || `${title}|${company}|${location}`
+  fallback.hash = `applymate-card=${encodeURIComponent(fingerprint.slice(0, 360))}`
+  return fallback.href
+}
+
+function collectLinkedInCards(): Element[] {
+  const cards: Element[] = []
+  const seen = new Set<Element>()
+  const addCard = (card: Element | null) => {
+    if (!card || seen.has(card)) return
+    seen.add(card)
+    cards.push(card)
+  }
+  document.querySelectorAll<HTMLAnchorElement>('a[href*="/jobs/view/"]').forEach(link => {
+    addCard(findLinkedInCardForLink(link))
+  })
+  document.querySelectorAll<HTMLButtonElement>(LINKEDIN_DISMISS_JOB_SELECTOR).forEach(dismissButton => {
+    addCard(findLinkedInCardForDismissButton(dismissButton))
+  })
+  return cards
+}
+
+function collectIndeedCards(): Element[] {
+  const cards: Element[] = []
+  const seen = new Set<Element>()
+  document.querySelectorAll<HTMLAnchorElement>('a[data-jk], a[href*="/viewjob"]').forEach(link => {
+    if (link.closest('#jobsearch-ViewjobPaneWrapper, #vjs-container, #vjs-details, #viewJobSSRRoot')) return
+    const card = link.closest('[data-testid="slider_item"]') ||
+      link.closest('#mosaic-provider-jobcards > ul > li') ||
+      link.closest('div.job_seen_beacon') ||
+      link.closest('td.resultContent')
+    if (!card || seen.has(card)) return
+    seen.add(card)
+    cards.push(card)
+  })
+  return cards
+}
+
+function getIndeedJobKey(card: Element, url: string): string {
+  const cardJobKey = (card as HTMLElement).dataset.jk ||
+    card.querySelector<HTMLElement>('[data-jk]')?.getAttribute('data-jk') || ''
+  if (cardJobKey) return `indeed:${cardJobKey}`
+  try {
+    const parsed = new URL(url, window.location.origin)
+    const jobKey = parsed.searchParams.get('jk') || parsed.searchParams.get('vjk')
+    if (jobKey) return `indeed:${jobKey}`
+  } catch { /* fall through to URL identity */ }
+  return `indeed:${url}`
+}
+
+function styleCardButton(btn: HTMLButtonElement) {
+  const isLinkedIn = window.location.hostname.includes('linkedin')
+  const isIndeed = isIndeedHost()
+  const styles: Record<string, string> = {
+    position: 'absolute',
+    top: isIndeed ? 'auto' : '50%',
+    bottom: isIndeed ? '12px' : 'auto',
+    right: isLinkedIn ? '42px' : '12px',
+    transform: isIndeed ? 'none' : 'translateY(-50%)',
+    'z-index': '2147483646',
+    width: '30px',
+    height: '30px',
+    margin: '0',
+    padding: '0',
+    border: 'none',
+    'border-radius': '9999px',
+    color: '#fff',
+    display: 'flex',
+    'align-items': 'center',
+    'justify-content': 'center',
+    'font-size': '17px',
+    'line-height': '1',
+    'font-family': '-apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif',
+    'box-shadow': '0 2px 10px rgba(79, 70, 229, 0.42)',
+    cursor: 'pointer',
+    opacity: '1',
+    visibility: 'visible',
+    'pointer-events': 'auto',
+  }
+  for (const [property, value] of Object.entries(styles)) {
+    setImportantStyle(btn, property, value)
+  }
+}
+
+function renderCardButtonState(btn: HTMLButtonElement, state: CardButtonState) {
+  const visuals: Record<CardButtonState, { icon: string; background: string; opacity: string; title: string }> = {
+    idle: { icon: '＋', background: '#4F46E5', opacity: '1', title: 'Save to ApplyMate' },
+    loading: { icon: '…', background: '#4F46E5', opacity: '0.68', title: 'Saving to ApplyMate' },
+    saved: { icon: '✓', background: '#3B6D11', opacity: '1', title: 'Saved to ApplyMate' },
+    error: { icon: '!', background: '#A32D2D', opacity: '1', title: 'Save failed — click to retry' },
+  }
+  const visual = visuals[state]
+  btn.innerHTML = `<span aria-hidden="true">${visual.icon}</span>`
+  btn.title = visual.title
+  btn.setAttribute('aria-label', visual.title)
+  btn.dataset.applymateState = state
+  setImportantStyle(btn, 'background', visual.background)
+  setImportantStyle(btn, 'opacity', visual.opacity)
+}
+
+function restoreCardButton(btn: HTMLButtonElement) {
+  btn.disabled = false
+  delete btn.dataset.applymateBusy
+  renderCardButtonState(btn, 'idle')
+}
+
 function markSaved(job: CardJob) {
   savedJobUrls.add(job.url)
   document.querySelectorAll<HTMLButtonElement>(`.${BTN_CLASS}`).forEach(btn => {
@@ -397,8 +735,9 @@ function markSaved(job: CardJob) {
       try {
         const parsed: CardJob = JSON.parse(data)
         if (parsed.url === job.url) {
-          btn.innerHTML = `<span>✓</span>`
-          btn.style.background = '#3B6D11'
+          btn.disabled = true
+          delete btn.dataset.applymateBusy
+          renderCardButtonState(btn, 'saved')
         }
       } catch { /* ignore */ }
     }
@@ -411,28 +750,42 @@ function isAlreadySaved(job: CardJob): boolean {
 
 // ── Per-card button ───────────────────────────────────────────────────────────
 
-function injectCardButton(card: Element, job: CardJob): HTMLButtonElement {
+function injectCardButton(card: Element, job: CardJob, jobKey = job.url): HTMLButtonElement {
   const btn = document.createElement('button')
   btn.className = BTN_CLASS
-  btn.title = 'Save to ApplyMate'
-  btn.innerHTML = `<span>⊕</span>`
+  btn.type = 'button'
+  btn.dataset.applymateRole = 'list-save'
+  if (isIndeedHost()) btn.dataset.applymateSite = 'indeed'
+  styleCardButton(btn)
+  renderCardButtonState(btn, isAlreadySaved(job) ? 'saved' : 'idle')
+  btn.disabled = isAlreadySaved(job)
   btn.setAttribute('data-applymate-job', JSON.stringify(job))
   // Store URL for element-recycling detection in processCards()
   btn.setAttribute('data-applymate-job-url', job.url)
-  // LinkedIn: also store entity URN for stable element-recycling detection
-  const urn = (card as HTMLElement).getAttribute('data-entity-urn')
-  if (urn) btn.setAttribute('data-applymate-urn', urn)
+  btn.setAttribute('data-applymate-job-key', jobKey)
 
   btn.addEventListener('click', async (e) => {
     e.stopPropagation()
+    e.stopImmediatePropagation()
     e.preventDefault()
+    if (btn.dataset.applymateBusy === 'true' || isAlreadySaved(job)) return
     log('Card button clicked:', job.title)
 
-    btn.innerHTML = `<span>…</span>`
-    btn.style.opacity = '0.6'
+    btn.dataset.applymateBusy = 'true'
+    btn.disabled = true
+    renderCardButtonState(btn, 'loading')
 
     try {
-      const fullJob = await enrichJob(job)
+      const fullJob = await resolveJobForSave(card, job)
+      if (!fullJob) {
+        renderCardButtonState(btn, 'error')
+        showInlineError(
+          card as HTMLElement,
+          'Could not read the full job description. This job was not saved — open its details and retry.',
+        )
+        setTimeout(() => restoreCardButton(btn), 3_500)
+        return
+      }
       const res = await chrome.runtime.sendMessage({ type: 'SAVE_JOB', job: fullJob })
       log('SAVE_JOB response:', res)
 
@@ -442,21 +795,19 @@ function injectCardButton(card: Element, job: CardJob): HTMLButtonElement {
         const msg = res?.error ?? 'Save failed'
         log('Save failed:', msg)
         if (msg.includes('Not logged in') || msg.includes('login') || msg.includes('logged') || msg.includes('Unauthorized')) {
-          btn.innerHTML = `<span>⚡</span>`
           showInlineError(card as HTMLElement, 'Not logged in — click the ApplyMate icon in the toolbar to log in.')
         } else {
-          btn.innerHTML = `<span>✗</span>`
+          showInlineError(card as HTMLElement, msg)
         }
-        btn.style.background = '#A32D2D'
-        setTimeout(() => { btn.innerHTML = `<span>⊕</span>`; btn.style.background = '' }, 2000)
+        renderCardButtonState(btn, 'error')
+        setTimeout(() => restoreCardButton(btn), 2000)
       }
     } catch (err: unknown) {
       log('SAVE_JOB threw:', err)
       const message = err instanceof Error ? err.message : String(err)
-      btn.innerHTML = `<span>💥</span>`
-      btn.style.background = '#A32D2D'
+      renderCardButtonState(btn, 'error')
       showInlineError(card as HTMLElement, 'Extension error: ' + message + '. Try reloading the extension.')
-      setTimeout(() => { btn.innerHTML = `<span>⊕</span>`; btn.style.background = '' }, 3000)
+      setTimeout(() => restoreCardButton(btn), 3000)
     }
   })
 
@@ -469,8 +820,10 @@ function injectCardButton(card: Element, job: CardJob): HTMLButtonElement {
   }
   el.appendChild(btn)
 
-  function showBtn() { btn.style.opacity = '1' }
-  function hideBtn() { btn.style.opacity = '' }
+  function showBtn() { setImportantStyle(btn, 'opacity', '1') }
+  function hideBtn() {
+    setImportantStyle(btn, 'opacity', btn.dataset.applymateState === 'loading' ? '0.68' : '1')
+  }
 
   el.addEventListener('mouseenter', showBtn)
   el.addEventListener('mouseleave', hideBtn)
@@ -629,16 +982,67 @@ function escHtml(s: string): string {
   return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;')
 }
 
-async function enrichJob(job: CardJob) {
-  return new Promise<CardJob & { description: string }>((resolve) => {
-    chrome.storage.local.get('currentJob', (r) => {
-      const stored = r.currentJob
-      const description = (stored?.url === job.url || stored?.title === job.title)
-        ? (stored?.description ?? '')
-        : ''
-      resolve({ ...job, description })
+async function fetchIndeedDetails(job: CardJob): Promise<ScrapedJob | null> {
+  if (job.source !== 'indeed' || !/\/viewjob/i.test(job.url)) return null
+  try {
+    const response = await fetch(job.url, {
+      credentials: 'include',
+      cache: 'no-store',
+      signal: AbortSignal.timeout(8_000),
     })
-  })
+    if (!response.ok) return null
+    const html = await response.text()
+    const parsed = new DOMParser().parseFromString(html, 'text/html')
+    const scraped = scrapeIndeedFromDocument(parsed, response.url)
+    if (!scraped) return null
+    return mergeJobDetails(asScrapedJob(job), scraped)
+  } catch (error) {
+    log('Indeed detail fetch failed:', error)
+    return null
+  }
+}
+
+async function readCurrentMatchingDetail(job: CardJob): Promise<ScrapedJob | null> {
+  const detail = detectAndScrape()
+  if (!detail || !matchesCardJob(job, detail)) return null
+  return mergeJobDetails(asScrapedJob(job), detail)
+}
+
+async function selectLinkedInCardAndReadDetails(card: Element, job: CardJob): Promise<ScrapedJob | null> {
+  // The newest LinkedIn result cards intentionally omit their job IDs and
+  // links. The only reliable way to associate a JD with that card is to open
+  // its own detail pane, then verify both title and company before saving.
+  const target = card.matches('[role="button"]') ? card : card.querySelector('[role="button"]') ?? card
+  target.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }))
+
+  let best: ScrapedJob | null = null
+  for (const delay of [250, 400, 650, 900, 1_200]) {
+    await waitForDetail(delay)
+    const detail = await readCurrentMatchingDetail(job)
+    if (!detail) continue
+    best = best ? mergeJobDetails(best, detail) : detail
+    if (isJobReadyForTailoring(best)) return best
+  }
+  return best
+}
+
+/**
+ * A list card only has summary data. Resolve a verified detail record before
+ * saving so a successful checkmark never masks a job that cannot be tailored.
+ */
+async function resolveJobForSave(card: Element, job: CardJob): Promise<ScrapedJob | null> {
+  const currentDetail = await readCurrentMatchingDetail(job)
+  if (currentDetail && isJobReadyForTailoring(currentDetail)) return currentDetail
+
+  const fetchedIndeed = await fetchIndeedDetails(job)
+  if (fetchedIndeed && isJobReadyForTailoring(fetchedIndeed)) return fetchedIndeed
+
+  if (job.source === 'linkedin') {
+    const selectedDetail = await selectLinkedInCardAndReadDetails(card, job)
+    if (selectedDetail && isJobReadyForTailoring(selectedDetail)) return selectedDetail
+  }
+
+  return null
 }
 
 // ── Main observer loop ────────────────────────────────────────────────────────
@@ -679,7 +1083,11 @@ function processCards(cfg: SiteConfig) {
   const isGreenhouse  = host.includes('greenhouse.io')
   const isLever       = host.includes('lever.co')
 
-  const cards = document.querySelectorAll<Element>(cfg.card)
+  const cards = isLinkedIn
+    ? collectLinkedInCards()
+    : isIndeed
+      ? collectIndeedCards()
+      : Array.from(document.querySelectorAll<Element>(cfg.card))
   if (cards.length === 0 && isLinkedIn) {
     // Fallback: find cards via job links (always works on LinkedIn)
     processCardsViaJobLinks()
@@ -687,38 +1095,37 @@ function processCards(cfg: SiteConfig) {
   }
 
   let processed = 0
+  let covered = 0
   cards.forEach(card => {
     if (isIndeed && card.parentElement?.closest(`[${ATTR}="indeed"]`)) return
 
     if (isLinkedIn) {
-      const urn = (card as HTMLElement).getAttribute('data-entity-urn') ||
-                  card.querySelector<HTMLElement>('[data-entity-urn]')?.getAttribute('data-entity-urn')
-      if (urn) {
-        const existingBtn = card.querySelector<HTMLButtonElement>(`.${BTN_CLASS}`)
-        if (existingBtn) {
-          const storedUrn = existingBtn.getAttribute('data-applymate-urn')
-          if (storedUrn === urn) return
-          existingBtn.remove()
+      const currentLink = card.querySelector<HTMLAnchorElement>(cfg.link)
+      const currentKey = getLinkedInJobKey(card, currentLink?.href || '')
+      const existingBtn = card.querySelector<HTMLButtonElement>(`.${BTN_CLASS}`)
+      if (existingBtn) {
+        if (existingBtn.getAttribute('data-applymate-job-key') === currentKey) {
+          covered++
+          return
         }
-      } else {
-        const existingBtn = card.querySelector<HTMLButtonElement>(`.${BTN_CLASS}`)
-        if (existingBtn) {
-          const storedUrl = existingBtn.getAttribute('data-applymate-job-url')
-          const currentLink = card.querySelector<HTMLAnchorElement>(cfg.link)
-          if (storedUrl && currentLink && storedUrl === currentLink.href) return
-          existingBtn.remove()
-        }
+        existingBtn.remove()
       }
     } else if (isIndeed) {
       const existingBtn = card.querySelector<HTMLButtonElement>(`.${BTN_CLASS}`)
       if (existingBtn) {
-        const storedUrl = existingBtn.getAttribute('data-applymate-job-url')
         const currentLink = card.querySelector<HTMLAnchorElement>(cfg.link)
-        if (storedUrl && currentLink && storedUrl === currentLink.href) return
+        const currentKey = getIndeedJobKey(card, currentLink?.href || '')
+        if (existingBtn.getAttribute('data-applymate-job-key') === currentKey) {
+          covered++
+          return
+        }
         existingBtn.remove()
       }
     } else {
-      if (card.getAttribute(ATTR)) return
+      if (card.getAttribute(ATTR)) {
+        covered++
+        return
+      }
       card.setAttribute(ATTR, '1')
     }
 
@@ -742,59 +1149,47 @@ function processCards(cfg: SiteConfig) {
 
     log('Processing card:', job.title, '@', job.company)
     if (isIndeed) (card as HTMLElement).setAttribute(ATTR, 'indeed')
-    injectCardButton(card, job)
+    const jobKey = isLinkedIn
+      // Reuse the card's DOM identity rather than the scraped URL: the
+      // current selected card may borrow `currentJobId` while linkless cards
+      // use a stable fingerprint, and mixing the two causes observer loops.
+      ? getLinkedInJobKey(card, card.querySelector<HTMLAnchorElement>(cfg.link)?.href || '')
+      : isIndeed
+        ? getIndeedJobKey(card, job.url)
+        : job.url
+    injectCardButton(card, job, jobKey)
     attachHoverPopup(card, job)
     processed++
   })
   if (processed > 0) log(`✅ Injected ${processed} card buttons`)
+  if (processed === 0 && covered === 0 && isLinkedIn) processCardsViaJobLinks()
 }
 
 // ── Fallback: find cards via job view links (always works on LinkedIn) ────
 
 function processCardsViaJobLinks() {
-  const host = window.location.hostname
-  const isLinkedIn = host.includes('linkedin')
-  const links = document.querySelectorAll<HTMLAnchorElement>('a[href*="/jobs/view/"]')
-  log(`processCardsViaJobLinks: found ${links.length} job links`)
-
-  const seenUrns = new Set<string>()
+  const cards = collectLinkedInCards()
+  log(`processCardsViaJobLinks: found ${cards.length} canonical cards`)
   let processed = 0
 
-  links.forEach(link => {
-    // Walk up to find the card container (up to 5 levels)
-    let card: Element | null = link
-    for (let i = 0; i < 5 && card; i++) {
-      const el = card as HTMLElement
-      const urn = el.getAttribute('data-entity-urn')
-      if (urn) {
-        if (seenUrns.has(urn)) return
-        seenUrns.add(urn)
-
-        // Already has button?
-        if (el.querySelector(`.${BTN_CLASS}`)) return
-
-        // Already a known <a> — need to go one more parent up
-        if (card.tagName === 'A') {
-          card = card.parentElement
-          if (!card) return
-        }
-
-        const job = scrapeLinkedInCard(card)
-        if (job) {
-          injectCardButton(card, job)
-          attachHoverPopup(card, job)
-          processed++
-        }
-        return
-      }
-      card = card.parentElement
-    }
+  cards.forEach(card => {
+    const link = card.querySelector<HTMLAnchorElement>('a[href*="/jobs/view/"]')
+    const key = getLinkedInJobKey(card, link?.href || '')
+    const existing = card.querySelector<HTMLButtonElement>(`.${BTN_CLASS}`)
+    if (existing?.getAttribute('data-applymate-job-key') === key) return
+    existing?.remove()
+    const job = scrapeLinkedInCard(card)
+    if (!job) return
+    injectCardButton(card, job, key)
+    attachHoverPopup(card, job)
+    processed++
   })
 
   if (processed > 0) log(`✅ processCardsViaJobLinks: injected ${processed} card buttons`)
 }
 
 export function startListModeInjector() {
+  listRuntimeGlobal.__applyMateListInjectorCleanup?.()
   const cfg = getSiteConfig()
   if (!cfg) {
     log('No site config for host:', window.location.hostname)
@@ -808,6 +1203,7 @@ export function startListModeInjector() {
   // (virtual scrolling, ad injection, lazy-loaded images). Without debounce,
   // processCards() would run on every micro-change, wasting CPU.
   let rafId: number | null = null
+  let disposed = false
   const observer = new MutationObserver(() => {
     if (rafId !== null) return
     rafId = requestAnimationFrame(() => {
@@ -819,11 +1215,16 @@ export function startListModeInjector() {
 
   // Staggered retries: LinkedIn loads cards via AJAX, sometimes after our first scan.
   // Re-scanning at increasing intervals catches late-loading cards reliably.
-  for (const delay of [2000, 5000, 10000]) {
-    setTimeout(() => {
+  const retryTimers = [2000, 5000, 10000].map(delay => setTimeout(() => {
+      if (disposed) return
       log(`Retry scan at ${delay}ms...`)
       processCards(cfg)
-    }, delay)
+    }, delay))
+  listRuntimeGlobal.__applyMateListInjectorCleanup = () => {
+    disposed = true
+    observer.disconnect()
+    if (rafId !== null) cancelAnimationFrame(rafId)
+    retryTimers.forEach(timer => clearTimeout(timer))
   }
 }
 
@@ -863,8 +1264,8 @@ export function isJobListPage(): boolean {
       path.startsWith('/jobs/search') ||
       path.startsWith('/jobs/collections') ||
       path.startsWith('/jobs/recommended') ||
-      (path.startsWith('/jobs/') && !!document.querySelector(
-        'div.base-card, ul.jobs-search__results-list, [data-entity-urn], [data-job-id]'
+      ((path === '/jobs' || path.startsWith('/jobs/')) && !!document.querySelector(
+        `div.base-card, ul.jobs-search__results-list, [data-entity-urn], [data-job-id], ${LINKEDIN_DISMISS_JOB_SELECTOR}`
       ))
     )
   }

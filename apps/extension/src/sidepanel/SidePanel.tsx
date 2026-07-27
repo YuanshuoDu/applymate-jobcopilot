@@ -239,16 +239,34 @@ function CurrentPageBanner({ settings, onSaved }: { settings: ExtensionSettings;
   const [currentJob, setCurrentJob] = useState<ScrapedJob | null>(null)
   const [saving,     setSaving]     = useState(false)
   const [savedOk,    setSavedOk]    = useState(false)
+  const latestDetectedAt = useRef(0)
+  const activeJobKeyRef = useRef('')
 
   useEffect(() => {
-    chrome.storage.local.get('currentJob', r => setCurrentJob(r.currentJob ?? null))
+    const acceptJob = (job?: ScrapedJob | null) => {
+      const detectedAt = job?.detectedAt ?? 0
+      if (detectedAt < latestDetectedAt.current) return
+      latestDetectedAt.current = detectedAt
+      setCurrentJob(job ?? null)
+    }
+
+    chrome.storage.local.get('currentJob', r => acceptJob(r.currentJob ?? null))
 
     const handler = (msg: { type: string; job?: ScrapedJob }) => {
-      if (msg.type === 'JOB_SCRAPED') setCurrentJob(msg.job ?? null)
+      if (msg.type === 'JOB_SCRAPED') acceptJob(msg.job ?? null)
     }
     chrome.runtime.onMessage.addListener(handler)
     return () => chrome.runtime.onMessage.removeListener(handler)
   }, [])
+
+  const currentJobKey = currentJob
+    ? `${currentJob.source}|${currentJob.url}|${currentJob.title}|${currentJob.company}`
+    : ''
+  useEffect(() => {
+    activeJobKeyRef.current = currentJobKey
+    setSavedOk(false)
+    setSaving(false)
+  }, [currentJobKey])
 
   if (!currentJob) return null
 
@@ -261,16 +279,17 @@ function CurrentPageBanner({ settings, onSaved }: { settings: ExtensionSettings;
   const srcColor = sourceColors[currentJob.source] ?? C.primary
 
   async function handleSave() {
+    const requestJobKey = currentJobKey
     setSaving(true)
     try {
       const res = await chrome.runtime.sendMessage({ type: 'SAVE_JOB', job: currentJob })
         .catch(() => null) // suppress port-closed error
       if (res?.success) {
-        setSavedOk(true)
+        if (activeJobKeyRef.current === requestJobKey) setSavedOk(true)
         onSaved()
       }
     } finally {
-      setSaving(false)
+      if (activeJobKeyRef.current === requestJobKey) setSaving(false)
     }
   }
 

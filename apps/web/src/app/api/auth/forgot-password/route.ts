@@ -1,16 +1,63 @@
 import { NextRequest } from 'next/server'
+import { db } from '@/lib/db'
 import { err, ok } from '@/lib/api-helpers'
+import {
+  createPasswordResetToken,
+  isValidEmail,
+  normalizeEmail,
+  passwordResetEmailConfigurationError,
+  passwordResetExpiry,
+  passwordResetIdentifier,
+  passwordResetUrl,
+  sendPasswordResetEmail,
+  hashPasswordResetToken,
+} from '@/lib/password-reset'
+
+function emailFromBody(body: unknown): string {
+  if (!body || typeof body !== 'object') return ''
+  return normalizeEmail((body as Record<string, unknown>).email)
+}
 
 export async function POST(req: NextRequest) {
-  const body = await req.json().catch(() => null)
-  if (!body) return err('Invalid JSON body')
-
-  const email = typeof body.email === 'string' ? body.email.trim() : ''
+  const email = emailFromBody(await req.json().catch(() => null))
   if (!email) return err('email is required')
-  if (!/\S+@\S+\.\S+/.test(email)) return err('Invalid email address')
+  if (!isValidEmail(email)) return err('Invalid email address')
 
-  console.log('[forgot-password] reset requested for', email)
-  // TODO: wire up email sending
+  const configurationError = passwordResetEmailConfigurationError()
+  if (configurationError) return err(configurationError, 503)
 
-  return ok({ ok: true })
+  try {
+    const user = await db.user.findFirst({
+      where: { email: { equals: email, mode: 'insensitive' } },
+      select: { id: true },
+    })
+
+    // Keep the response identical for known and unknown accounts.
+    if (!user) return ok({ ok: true })
+
+    const token = createPasswordResetToken()
+    const tokenHash = hashPasswordResetToken(token)
+    const identifier = passwordResetIdentifier(user.id)
+
+    await db.verificationToken.deleteMany({ where: { identifier } })
+    await db.verificationToken.create({
+      data: {
+        identifier,
+        token: tokenHash,
+        expires: passwordResetExpiry(),
+      },
+    })
+
+    const delivered = await sendPasswordResetEmail(email, passwordResetUrl(req.url, token))
+    if (!delivered) {
+      await db.verificationToken.deleteMany({
+        where: { identifier, token: tokenHash },
+      })
+      return ok({ ok: true })
+    }
+
+    return ok({ ok: true })
+  } catch {
+    return err('Unable to create password reset request. Please try again later.', 500)
+  }
 }

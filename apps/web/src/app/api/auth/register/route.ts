@@ -5,12 +5,14 @@ import { NextRequest } from 'next/server'
 import bcrypt from 'bcryptjs'
 import { db } from '@/lib/db'
 import { ok, err } from '@/lib/api-helpers'
+import { normalizeEmail } from '@/lib/auth-identifiers'
 
 export async function POST(req: NextRequest) {
   const body = await req.json().catch(() => null)
   if (!body) return err('Invalid JSON body')
 
-  const { email, password, name } = body
+  const { password, name } = body
+  const email = typeof body.email === 'string' ? normalizeEmail(body.email) : ''
   if (!email || !password) return err('email and password are required')
   if (password.length < 8)  return err('Password must be at least 8 characters')
 

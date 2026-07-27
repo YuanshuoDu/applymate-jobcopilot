@@ -10,6 +10,15 @@ const DEFAULTS: ExtensionSettings = {
 
 const STORAGE_TIMEOUT_MS = 2000
 
+function getSyncStorage(): chrome.storage.StorageArea | null {
+  try {
+    if (typeof chrome === 'undefined' || !chrome.storage?.sync) return null
+    return chrome.storage.sync
+  } catch {
+    return null
+  }
+}
+
 async function within<T>(promise: Promise<T>, timeoutMs: number): Promise<T> {
   let timer: ReturnType<typeof setTimeout> | undefined
   try {
@@ -28,7 +37,9 @@ async function within<T>(promise: Promise<T>, timeoutMs: number): Promise<T> {
 
 export async function getSettings(): Promise<ExtensionSettings> {
   try {
-    const result = await within(chrome.storage.sync.get('settings'), STORAGE_TIMEOUT_MS)
+    const syncStorage = getSyncStorage()
+    if (!syncStorage) return { ...DEFAULTS }
+    const result = await within(syncStorage.get('settings'), STORAGE_TIMEOUT_MS)
     return { ...DEFAULTS, ...(result.settings ?? {}) }
   } catch (error) {
     console.warn('[ApplyMate] Settings load failed; using defaults:', error)
@@ -38,7 +49,13 @@ export async function getSettings(): Promise<ExtensionSettings> {
 
 export async function saveSettings(partial: Partial<ExtensionSettings>): Promise<void> {
   const current = await getSettings()
-  await chrome.storage.sync.set({ settings: { ...current, ...partial } })
+  const syncStorage = getSyncStorage()
+  if (!syncStorage) return
+  try {
+    await syncStorage.set({ settings: { ...current, ...partial } })
+  } catch (error) {
+    console.warn('[ApplyMate] Settings save skipped:', error)
+  }
 }
 
 export async function clearAuth(): Promise<void> {

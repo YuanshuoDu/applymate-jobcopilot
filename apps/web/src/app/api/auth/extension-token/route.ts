@@ -7,6 +7,7 @@ import { NextRequest, NextResponse } from 'next/server'
 import bcrypt from 'bcryptjs'
 import { SignJWT } from 'jose'
 import { db } from '@/lib/db'
+import { normalizeEmail } from '@/lib/auth-identifiers'
 
 const JWT_SECRET = new TextEncoder().encode(
   process.env.AUTH_SECRET ?? 'fallback-secret-change-this',
@@ -18,7 +19,10 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({ error: 'email and password required' }, { status: 400 })
   }
 
-  const user = await db.user.findUnique({ where: { email: body.email } })
+  const email = typeof body.email === 'string' ? normalizeEmail(body.email) : ''
+  if (!email) return NextResponse.json({ error: 'email and password required' }, { status: 400 })
+
+  const user = await db.user.findUnique({ where: { email } })
   if (!user?.password) {
     return NextResponse.json({ error: 'Invalid credentials' }, { status: 401 })
   }

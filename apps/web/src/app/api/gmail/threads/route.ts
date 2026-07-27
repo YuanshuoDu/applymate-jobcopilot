@@ -11,9 +11,8 @@
  *   GMAIL_ERROR         — other Gmail API error
  */
 import { NextRequest } from 'next/server'
-import { db } from '@/lib/db'
 import { requireAuth, isErrorResponse, ok, err } from '@/lib/api-helpers'
-import { getGoogleAccessToken, classifyEmail } from '@/lib/gmail-helpers'
+import { findGmailConnection, getGoogleAccessToken, classifyEmail } from '@/lib/gmail-helpers'
 
 export async function GET(req: NextRequest) {
   const auth = await requireAuth(req)
@@ -22,10 +21,7 @@ export async function GET(req: NextRequest) {
   console.log('[gmail/threads] === /api/gmail/threads called, userId=', auth.userId)
 
   // 1. Check Google account exists
-  const account = await db.account.findFirst({
-    where:  { userId: auth.userId, provider: 'google' },
-    select: { access_token: true },
-  })
+  const account = await findGmailConnection(auth.userId)
   if (!account) {
     console.error('[gmail/threads] no Google account in DB → NO_GOOGLE_ACCOUNT')
     return err('NO_GOOGLE_ACCOUNT', 403)

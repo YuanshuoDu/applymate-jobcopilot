@@ -201,41 +201,71 @@ function OAuthExtBtn({ icon, label, onClick, dark }: {
 }
 
 type LType = typeof POPUP_LABELS['en']
+type OAuthAttempt = {
+  provider: 'google' | 'github'
+  startingToken: string
+  startingEmail: string
+}
 
 function LoginView({ settings, L, onLogin }: { settings: ExtensionSettings; L: LType; onLogin: (s: ExtensionSettings) => void }) {
   const [email,        setEmail]        = useState('')
   const [password,     setPassword]     = useState('')
   const [error,        setError]        = useState('')
   const [loading,      setLoading]      = useState(false)
-  const [oauthPending, setOauthPending] = useState<'google' | 'github' | null>(null)
+  const [oauthAttempt, setOauthAttempt] = useState<OAuthAttempt | null>(null)
 
-  // Poll chrome.storage.sync for token appearing after OAuth on dashboard tab
+  // Wait for a new dashboard-issued token. A stale demo token is not proof
+  // that the account-switch OAuth flow completed.
   useEffect(() => {
-    if (!oauthPending) return
+    if (!oauthAttempt) return
     let stopped = false
     const deadline = Date.now() + 30_000
 
+    const acceptFreshSettings = (candidate: Partial<ExtensionSettings>) => {
+      if (stopped || !candidate.apiToken || !candidate.userEmail) return false
+      const tokenChanged = candidate.apiToken !== oauthAttempt.startingToken
+      const identityChanged = candidate.userEmail !== oauthAttempt.startingEmail
+      if (!tokenChanged && !identityChanged) return false
+
+      stopped = true
+      setOauthAttempt(null)
+      onLogin({ ...settings, ...candidate } as ExtensionSettings)
+      return true
+    }
+
     const poll = async () => {
       if (stopped) return
-      if (Date.now() > deadline) { setOauthPending(null); return }
-      const result = await chrome.storage.sync.get('settings')
-      const s = result.settings ?? {}
-      if (s.apiToken && s.userEmail) {
-        stopped = true
-        setOauthPending(null)
-        onLogin({ ...settings, ...s })
+      if (Date.now() > deadline) {
+        setOauthAttempt(null)
+        setError('OAuth sign-in timed out. Your previous extension session was kept.')
         return
       }
+      const result = await chrome.storage.sync.get('settings')
+      if (acceptFreshSettings((result.settings ?? {}) as Partial<ExtensionSettings>)) return
       setTimeout(poll, 1500)
     }
 
+    const onStorageChange = (changes: { settings?: { newValue?: ExtensionSettings } }, area: string) => {
+      if (area !== 'sync') return
+      acceptFreshSettings(changes.settings?.newValue ?? {})
+    }
+
+    chrome.storage.onChanged.addListener(onStorageChange)
     const t = setTimeout(poll, 1500)
-    return () => { stopped = true; clearTimeout(t) }
-  }, [oauthPending])
+    return () => {
+      stopped = true
+      clearTimeout(t)
+      chrome.storage.onChanged.removeListener(onStorageChange)
+    }
+  }, [oauthAttempt, onLogin, settings])
 
   function openOAuth(provider: 'google' | 'github') {
-    chrome.tabs.create({ url: `${settings.apiBaseUrl}/login`, active: true })
-    setOauthPending(provider)
+    setError('')
+    setOauthAttempt({ provider, startingToken: settings.apiToken, startingEmail: settings.userEmail })
+    const url = new URL('/login', settings.apiBaseUrl)
+    url.searchParams.set('switchAccount', '1')
+    url.searchParams.set('callbackUrl', '/')
+    chrome.tabs.create({ url: url.toString(), active: true })
   }
 
   async function handleLogin(e: React.FormEvent) {
@@ -272,7 +302,7 @@ function LoginView({ settings, L, onLogin }: { settings: ExtensionSettings; L: L
         </div>
 
         {/* OAuth pending state */}
-        {oauthPending ? (
+        {oauthAttempt ? (
           <div style={{
             textAlign: 'center', padding: '14px 12px',
             background: 'rgba(79,70,229,0.06)', borderRadius: 10,
@@ -288,7 +318,7 @@ function LoginView({ settings, L, onLogin }: { settings: ExtensionSettings; L: L
             Waiting for login in browser tab…
             <br />
             <button
-              onClick={() => setOauthPending(null)}
+              onClick={() => setOauthAttempt(null)}
               style={{ marginTop: 8, fontSize: 11, color: C.subtle, background: 'none', border: 'none', cursor: 'pointer', textDecoration: 'underline', fontFamily: 'inherit' }}
             >
               Cancel

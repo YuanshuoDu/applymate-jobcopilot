@@ -1,18 +1,14 @@
 /**
  * GET /api/gmail/unread — lightweight endpoint returning unread count for sidebar badge
  */
-import { db } from '@/lib/db'
 import { requireAuth, isErrorResponse, ok } from '@/lib/api-helpers'
-import { getGoogleAccessToken } from '@/lib/gmail-helpers'
+import { findGmailConnection, getGoogleAccessToken } from '@/lib/gmail-helpers'
 
 export async function GET() {
   const auth = await requireAuth()
   if (isErrorResponse(auth)) return auth
 
-  const account = await db.account.findFirst({
-    where: { userId: auth.userId, provider: 'google' },
-    select: { access_token: true },
-  })
+  const account = await findGmailConnection(auth.userId)
   if (!account) return ok({ unread: 0, hasGmail: false })
 
   const token = await getGoogleAccessToken(auth.userId)

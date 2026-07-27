@@ -5,6 +5,7 @@ import { scrapeGlassdoor }  from './glassdoor'
 import { scrapeStepstone }  from './stepstone'
 import { scrapeXing }       from './xing'
 import { scrapeSchemaOrg }  from './schema-org'
+import { mergeJobDetails } from '../job-quality'
 
 export function detectAndScrape(): ScrapedJob | null {
   const host = window.location.hostname
@@ -32,14 +33,18 @@ export function detectAndScrape(): ScrapedJob | null {
   else if (host.includes('jobs.de'))             job = scrapeJobsDe()
   else if (host.includes('localhost'))           job = scrapeTestMode()
 
-  // If site-specific scraper failed, try schema.org structured data
+  // Schema.org is a useful second source even when the platform-specific
+  // scraper found a title. Modern job boards often hydrate the description
+  // after the header, while their JobPosting JSON-LD is already present.
+  const schemaJob = scrapeSchemaOrg()
   if (!job) {
-    job = scrapeSchemaOrg()
+    job = schemaJob
     if (job) {
-      // Override source with detected platform
       const source = detectSourceFromHost(host)
       if (source !== 'unknown') job.source = source
     }
+  } else if (schemaJob) {
+    job = mergeJobDetails(job, schemaJob)
   }
 
   // Last resort: extract from document.title (always available)

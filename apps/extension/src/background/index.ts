@@ -9,6 +9,8 @@ import type { ExtMessage, ScrapedJob } from '@/lib/types'
 // ── Simple rate limiter (prevent excessive API calls) ──────────────
 const RATE_LIMIT_WINDOW = 2000 // 2 seconds between same-type operations
 const rateLimitMap = new Map<string, number>()
+let latestJobDetectedAt = 0
+const styledSaveUiTabs = new Set<number>()
 
 function checkRateLimit(key: string): boolean {
   const now = Date.now()
@@ -72,7 +74,8 @@ function shouldRestoreSaveUi(url?: string): boolean {
       host.includes('icims.com') ||
       host.includes('monster.') ||
       host.includes('arbeitsagentur.de') ||
-      host.includes('jobs.de')
+      host.includes('jobs.de') ||
+      host.includes('irishjobs.ie')
   } catch {
     return false
   }
@@ -81,6 +84,16 @@ function shouldRestoreSaveUi(url?: string): boolean {
 async function restoreSaveUi(tabId: number, url?: string): Promise<void> {
   if (!shouldRestoreSaveUi(url)) return
   try {
+    // executeScript() does not apply the declarative content-script CSS. This
+    // path is used after extension reloads, so inject the stylesheet first or
+    // the list buttons exist in the DOM but are effectively unstyled/invisible.
+    if (!styledSaveUiTabs.has(tabId)) {
+      await chrome.scripting.insertCSS({
+        target: { tabId },
+        files: ['assets/content/inject.css'],
+      })
+      styledSaveUiTabs.add(tabId)
+    }
     await chrome.scripting.executeScript({
       target: { tabId },
       files: ['content.js'],
@@ -117,6 +130,10 @@ chrome.tabs.onActivated.addListener(({ tabId }) => {
   chrome.tabs.get(tabId)
     .then(tab => restoreSaveUi(tabId, tab.url))
     .catch(() => {})
+})
+
+chrome.tabs.onRemoved.addListener(tabId => {
+  styledSaveUiTabs.delete(tabId)
 })
 
 // ── Keyboard shortcut Ctrl+Shift+U → open tracker ─────────
@@ -166,6 +183,9 @@ async function handleMessage(
     }
 
     case 'JOB_SCRAPED': {
+      const detectedAt = msg.job.detectedAt ?? Date.now()
+      if (detectedAt < latestJobDetectedAt) return { ok: true, stale: true }
+      latestJobDetectedAt = detectedAt
       await setCurrentJob(msg.job)
       setBadge('1', '#4F46E5')
 
@@ -296,6 +316,7 @@ async function openTrackerWindow(): Promise<{ ok: boolean; error?: string }> {
 // ── Tab navigation ────────────────────────────────────────────
 
 chrome.tabs.onUpdated.addListener(async (tabId, info, tab) => {
+  if (info.status === 'loading') styledSaveUiTabs.delete(tabId)
   if (info.status !== 'complete') return
   if (!tab.url) return
 
@@ -321,6 +342,7 @@ chrome.tabs.onUpdated.addListener(async (tabId, info, tab) => {
     /monster\.(com|de|co\.uk)\//,
     /arbeitsagentur\.de\/jobsuche\//,
     /jobs\.de\//,
+    /irishjobs\.ie\//,
   ]
   const isJobPage = JOB_PATTERNS.some(p => p.test(tab.url!))
 

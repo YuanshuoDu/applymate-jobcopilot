@@ -479,7 +479,10 @@ export function GmailPage() {
     // would change the session identity and refuses to link a Google account whose
     // email differs from the current user's email. Our flow attaches Google tokens
     // to the existing user without touching the session.
-    window.location.href = '/api/gmail/oauth/start'
+    // Connecting is an explicit user action. If this Gmail account was
+    // attached to a previous ApplyMate account, the signed OAuth state allows
+    // the user to move it to the account currently in session.
+    window.location.href = '/api/gmail/oauth/start?transfer=1'
   }
 
   const toggleStar = useCallback((id: string) => {

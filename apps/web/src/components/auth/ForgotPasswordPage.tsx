@@ -29,7 +29,7 @@ export function ForgotPasswordPage() {
   const [email, setEmail] = useState('')
   const [error, setError] = useState('')
   const [submitting, setSubmitting] = useState(false)
-  const [submittedEmail, setSubmittedEmail] = useState('')
+  const [submitted, setSubmitted] = useState(false)
   const { t } = useI18n()
 
   function validateEmail(value: string): string | null {
@@ -64,7 +64,7 @@ export function ForgotPasswordPage() {
         return
       }
 
-      setSubmittedEmail(email.trim())
+      setSubmitted(true)
       setSubmitting(false)
     } catch {
       setError(t('auth.forgotPassword.error.networkError'))
@@ -83,7 +83,7 @@ export function ForgotPasswordPage() {
           </div>
         </div>
 
-        {!submittedEmail ? (
+        {!submitted ? (
           <>
             <div style={{ marginBottom: 24 }}>
               <h1 style={{ fontSize: 24, fontWeight: 700, color: C.text, marginBottom: 8 }}>{t('auth.forgotPassword.title')}</h1>
@@ -140,7 +140,7 @@ export function ForgotPasswordPage() {
             </div>
             <h1 style={{ fontSize: 24, fontWeight: 700, color: C.text, marginBottom: 10 }}>{t('auth.forgotPassword.sentTitle')}</h1>
             <p style={{ fontSize: 14, color: C.text, lineHeight: 1.7 }}>
-              {t('auth.forgotPassword.sentMessage').replace('{email}', submittedEmail)}
+              {t('auth.forgotPassword.sentMessage')}
             </p>
           </div>
         )}

@@ -26,6 +26,18 @@ const SCOPES = [
   'https://www.googleapis.com/auth/gmail.send',
 ].join(' ')
 
+function safeReturnTo(value: string | null): string {
+  if (!value || !value.startsWith('/')) return '/?page=gmail'
+  try {
+    const base = 'https://applymate.invalid'
+    const parsed = new URL(value, base)
+    if (parsed.origin !== base) return '/?page=gmail'
+    return `${parsed.pathname}${parsed.search}${parsed.hash}`
+  } catch {
+    return '/?page=gmail'
+  }
+}
+
 export async function GET(req: NextRequest) {
   const session = await safeAuth()
   if (!session?.user?.id) {
@@ -37,8 +49,11 @@ export async function GET(req: NextRequest) {
     return NextResponse.json({ error: 'Google OAuth not configured' }, { status: 500 })
   }
 
-  // Sign userId into state so the callback can verify and use it.
-  const state = await new SignJWT({ uid: session.user.id, nonce: crypto.randomUUID() })
+  // Sign both user and a same-origin return location into state. The callback
+  // can then attach Gmail without changing the active application identity.
+  const returnTo = safeReturnTo(req.nextUrl.searchParams.get('returnTo'))
+  const transfer = req.nextUrl.searchParams.get('transfer') === '1'
+  const state = await new SignJWT({ uid: session.user.id, nonce: crypto.randomUUID(), returnTo, transfer })
     .setProtectedHeader({ alg: 'HS256' })
     .setExpirationTime('10m')
     .sign(JWT_SECRET)

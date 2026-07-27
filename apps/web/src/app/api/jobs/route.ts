@@ -7,6 +7,8 @@ import { db } from '@/lib/db'
 import { requireAuth, isErrorResponse, ok, err } from '@/lib/api-helpers'
 import type { JobStatus } from '@prisma/client'
 
+const MIN_EXTENSION_DESCRIPTION_LENGTH = 80
+
 // ── GET ───────────────────────────────────────────────────────────────────────
 export async function GET(req: NextRequest) {
   const auth = await requireAuth(req)
@@ -66,6 +68,12 @@ export async function POST(req: NextRequest) {
   const { company, role, location, url, description, salary, source, score, status, logo } = body
 
   if (!company || !role) return err('company and role are required')
+  if (isExtensionSaveRequest(req) && !hasMinimumDescription(description)) {
+    return err(
+      'Job description could not be captured. Wait for the full job details to load, then retry Save to ApplyMate.',
+      422,
+    )
+  }
 
   if (url) {
     const existing = await db.job.findFirst({ where: { userId: auth.userId, url } })
@@ -76,7 +84,7 @@ export async function POST(req: NextRequest) {
           ...(shouldRepairCompany(existing.company, role, company) ? { company } : {}),
           ...(shouldRepairRole(existing.role, company, role) ? { role } : {}),
           ...(description ? { description } : {}),
-          ...(location ? { location } : {}),
+          ...(shouldUpdateLocation(existing.location, location) ? { location } : {}),
           ...(salary ? { salary } : {}),
           ...(score != null ? { score } : {}),
         },
@@ -152,6 +160,26 @@ function shouldRepairRole(existingRole: string | null, incomingCompany: unknown,
 
 function normalizedText(value: unknown): string {
   return typeof value === 'string' ? value.toLowerCase().replace(/[^a-z0-9]+/g, '') : ''
+}
+
+function isExtensionSaveRequest(req: NextRequest): boolean {
+  return /^Bearer\s+/i.test(req.headers.get('authorization') ?? '')
+}
+
+function hasMinimumDescription(value: unknown): value is string {
+  return typeof value === 'string'
+    && value.replace(/\s/g, '').length >= MIN_EXTENSION_DESCRIPTION_LENGTH
+}
+
+function shouldUpdateLocation(existingLocation: string | null, incomingLocation: unknown): incomingLocation is string {
+  if (typeof incomingLocation !== 'string' || !incomingLocation.trim()) return false
+  return !isMeaningfulLocation(existingLocation) || isMeaningfulLocation(incomingLocation)
+}
+
+function isMeaningfulLocation(value: unknown): value is string {
+  return typeof value === 'string'
+    && Boolean(value.trim())
+    && !/^(unknown|n\/?a|not specified|unspecified)$/i.test(value.trim())
 }
 
 function repairLinkedInDismissRole(role: string, source: string | null): string | null {

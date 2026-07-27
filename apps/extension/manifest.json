@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "ApplyMate AI",
-  "version": "0.1.7",
-  "version_name": "0.1.7-stable-form-fill",
+  "version": "0.1.14",
+  "version_name": "0.1.14-reliable-job-data",
   "description": "AI-powered job application copilot — save jobs, match resumes, track progress",
   "icons": {
     "16":  "icons/icon16.png",
@@ -71,6 +71,7 @@
         "*://*.monster.co.uk/*",
         "*://*.arbeitsagentur.de/jobsuche/*",
         "*://*.jobs.de/*",
+        "*://*.irishjobs.ie/*",
         "http://localhost:3000/*",
         "http://localhost:5173/*",
         "*://web-delta-ruddy-29.vercel.app/*"
@@ -137,6 +138,7 @@
     "*://*.monster.co.uk/*",
     "*://*.arbeitsagentur.de/*",
     "*://*.jobs.de/*",
+    "*://*.irishjobs.ie/*",
     "http://localhost:3000/*",
     "https://*.vercel.app/*",
     "https://*.applymate.ai/*"

@@ -1,7 +1,7 @@
 'use client'
 
 import React, { useState, useEffect } from 'react'
-import { signIn, getProviders } from 'next-auth/react'
+import { signIn, signOut, getProviders } from 'next-auth/react'
 import { useRouter, useSearchParams } from 'next/navigation'
 import Link from 'next/link'
 
@@ -104,14 +104,27 @@ function mapOAuthError(err: string): string {
     OAuthCallbackError:    'OAuth 登录失败，请重试',
     AccessDenied:          '登录被拒绝',
     Verification:          '验证链接已过期',
+    OAuthIdentityMismatch: 'Google 账号与原有登录记录不一致，请重新选择正确的账号或联系支持。',
   }
   return MAP[err] ?? `登录出错：${err}`
 }
 
-export function LoginPage() {
+export function safeCallbackUrl(value: string | null): string {
+  if (!value || !value.startsWith('/')) return '/'
+  try {
+    const base = 'https://applymate.invalid'
+    const parsed = new URL(value, base)
+    if (parsed.origin !== base) return '/'
+    return `${parsed.pathname}${parsed.search}${parsed.hash}`
+  } catch {
+    return '/'
+  }
+}
+
+export function LoginPage({ switchAccount = false }: { switchAccount?: boolean }) {
   const router       = useRouter()
   const searchParams = useSearchParams()
-  const callbackUrl  = searchParams.get('callbackUrl') ?? '/'
+  const callbackUrl  = safeCallbackUrl(searchParams.get('callbackUrl'))
   const urlError     = searchParams.get('error')
 
   const [email,    setEmail]    = useState('')
@@ -131,6 +144,7 @@ export function LoginPage() {
     if (!email || !password) { setError('请填写邮箱和密码'); return }
     setError('')
     setLoading('credentials')
+    if (switchAccount) await signOut({ redirect: false })
     const result = await signIn('credentials', { email, password, redirect: false })
     setLoading(null)
     if (result?.error) { setError('邮箱或密码不正确') }
@@ -139,6 +153,7 @@ export function LoginPage() {
 
   async function handleOAuth(provider: 'google' | 'github') {
     setLoading(provider)
+    if (switchAccount) await signOut({ redirect: false })
     await signIn(provider, { callbackUrl })
   }
 
