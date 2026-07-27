@@ -2,21 +2,34 @@ import { db } from '@/lib/db'
 import type { ResumeContent } from '@/lib/types'
 
 export interface PersonaField {
-  key:        string
-  category:   string  // "personal" | "work" | "contact" | "education" | "preferences"
-  label:      string
-  value:      string
+  key: string
+  category: string
+  label: string
+  value: string
   confidence: number
-  source:     string  // "resume" | "ai_derived" | "manual" | "form_scan"
-  updatedAt:  string
-  consentAt?: string  // explicit user confirmation before saving an application answer
+  source: string
+  updatedAt: string
+  consentAt?: string
 }
 
 export const PERSONA_CATEGORIES = ['personal', 'work', 'contact', 'education', 'preferences'] as const
 export type PersonaCategory = typeof PERSONA_CATEGORIES[number]
 
-// Special-category data is not needed to tailor a job application. Keeping it
-// out of the profile is the safest default under GDPR's data-minimisation rule.
+export interface PersonaProfile {
+  identity: string[]
+  preferences: string[]
+  summaries: string[]
+  experience: string[]
+  skills: string[]
+  languages: string[]
+  education: string[]
+  certifications: string[]
+  projects: string[]
+  applicationAnswers: PersonaField[]
+  sourceResumeCount: number
+  updatedAt: string | null
+}
+
 const SENSITIVE_FIELD = /(?:gender|sex|pronoun|birth|date[_ ]?of[_ ]?birth|age|race|ethnic|religion|faith|politic|union|health|medical|disab|veteran|criminal|passport|national[_ ]?id)/i
 const UNNECESSARY_IDENTIFIER = /(?:bank|iban|swift|bic|tax|social[_ ]?security|ssn|national[_ ]?insurance)/i
 
@@ -32,93 +45,66 @@ export function validatePersonaField(value: unknown): string | null {
   return null
 }
 
-export async function buildPersona(userId: string): Promise<string> {
-  const user = await db.user.findUnique({
-    where: { id: userId },
-    select: {
-      name: true, email: true, phone: true, location: true,
-      linkedin: true, github: true, preferences: true,
-      personaFields: true,
-    },
-  })
+function unique(values: Array<string | undefined | null>): string[] {
+  return [...new Set(values.map(value => value?.trim()).filter((value): value is string => Boolean(value)))]
+}
 
+function labeled(label: string, value?: string | null): string | undefined {
+  return value?.trim() ? `${label}: ${value.trim()}` : undefined
+}
+
+function factsFromResume(content: ResumeContent) {
+  return {
+    identity: [labeled('NAME', content.contact.name), labeled('EMAIL', content.contact.email), labeled('PHONE', content.contact.phone), labeled('LOCATION', content.contact.location), labeled('LINKEDIN', content.contact.linkedin), labeled('GITHUB', content.contact.github), labeled('WEBSITE', content.contact.website)],
+    summaries: [content.summary],
+    experience: content.experience.flatMap(item => [`${item.role} · ${item.company}${item.period ? ` (${item.period})` : ''}`, ...item.bullets.map(bullet => `↳ ${bullet}`)]),
+    skills: content.skills,
+    languages: (content.languages ?? []).map(item => `${item.lang} · ${item.level}`),
+    education: content.education.map(item => `${item.degree} · ${item.institution}${item.year ? ` (${item.year})` : ''}`),
+    certifications: (content.certifications ?? []).map(item => `${item.name} · ${item.issuer}${item.date ? ` (${item.date})` : ''}`),
+    projects: (content.projects ?? []).flatMap(item => [`${item.name}${item.role ? ` · ${item.role}` : ''}${item.period ? ` (${item.period})` : ''}`, ...item.bullets.map(bullet => `↳ ${bullet}`)]),
+  }
+}
+
+/**
+ * Persona's factual base intentionally uses every original/base resume, never
+ * AI-adapted copies. This prevents a previous tailoring hallucination from
+ * becoming evidence for later applications.
+ */
+export async function getPersonaProfile(userId: string): Promise<PersonaProfile> {
+  const [user, resumes] = await Promise.all([
+    db.user.findUnique({ where: { id: userId }, select: { name: true, email: true, phone: true, location: true, linkedin: true, github: true, preferences: true, personaFields: true } }),
+    db.resume.findMany({ where: { userId, kind: 'base' }, select: { content: true, updatedAt: true } }),
+  ])
   if (!user) throw new Error('User not found')
 
-  const resume = await db.resume.findFirst({
-    where: { userId, isDefault: true },
-    select: { content: true },
-  })
+  const resumeFacts = resumes.map(resume => factsFromResume(resume.content as unknown as ResumeContent))
+  const preferences = user.preferences as Record<string, unknown> | null
+  const answers = ((user.personaFields ?? []) as unknown as PersonaField[]).filter(field => !validatePersonaField(field))
+  const latest = resumes.reduce<Date | null>((value, resume) => !value || resume.updatedAt > value ? resume.updatedAt : value, null)
 
-  const lines: string[] = []
-  const personaFields = (user.personaFields ?? []) as unknown as PersonaField[]
-
-  // Contact
-  lines.push(`NAME: ${user.name || 'N/A'}`)
-  lines.push(`EMAIL: ${user.email}`)
-  if (user.phone) lines.push(`PHONE: ${user.phone}`)
-  if (user.location) lines.push(`LOCATION: ${user.location}`)
-  if (user.linkedin) lines.push(`LINKEDIN: ${user.linkedin}`)
-  if (user.github) lines.push(`GITHUB: ${user.github}`)
-
-  // Preferences (skip fields already covered by personaFields)
-  const prefs = user.preferences as Record<string, unknown> | null
-  if (prefs) {
-    lines.push('')
-    lines.push('PREFERENCES:')
-    if (prefs.targetRoles) lines.push(`Target Roles: ${prefs.targetRoles}`)
-    if (prefs.targetLocations) lines.push(`Target Locations: ${prefs.targetLocations}`)
-    if (prefs.salaryExpectation) lines.push(`Salary Expectation: ${prefs.salaryExpectation}`)
-    if (prefs.workAuthorization) lines.push(`Work Authorization: ${prefs.workAuthorization}`)
-    if (prefs.openToRelocation !== undefined) lines.push(`Open to Relocation: ${prefs.openToRelocation ? 'Yes' : 'No'}`)
+  return {
+    identity: unique([labeled('NAME', user.name), labeled('EMAIL', user.email), labeled('PHONE', user.phone), labeled('LOCATION', user.location), labeled('LINKEDIN', user.linkedin), labeled('GITHUB', user.github), ...resumeFacts.flatMap(fact => fact.identity)]),
+    preferences: unique([preferences?.targetRoles as string | undefined, preferences?.targetLocations as string | undefined, preferences?.salaryExpectation as string | undefined, preferences?.workAuthorization as string | undefined, preferences?.openToRelocation === true ? 'Open to relocation' : undefined]),
+    summaries: unique(resumeFacts.flatMap(fact => fact.summaries)),
+    experience: unique(resumeFacts.flatMap(fact => fact.experience)), skills: unique(resumeFacts.flatMap(fact => fact.skills)), languages: unique(resumeFacts.flatMap(fact => fact.languages)),
+    education: unique(resumeFacts.flatMap(fact => fact.education)), certifications: unique(resumeFacts.flatMap(fact => fact.certifications)), projects: unique(resumeFacts.flatMap(fact => fact.projects)),
+    applicationAnswers: answers, sourceResumeCount: resumes.length, updatedAt: latest?.toISOString() ?? null,
   }
+}
 
-  // Persona Fields (learned from previous form fills — deduplicated vs preferences)
-  if (personaFields.length > 0) {
-    const prefKeys = new Set(['salaryExpectation', 'workAuthorization', 'openToRelocation'])
-    const newFields = personaFields.filter(f => !prefKeys.has(f.key))
-    if (newFields.length > 0) {
-      lines.push('')
-      lines.push('KNOWN ANSWERS (from previous applications):')
-      for (const f of newFields) {
-        lines.push(`- [${f.category}] ${f.label}: ${f.value}`)
-      }
-    }
-  }
+export function personaContext(profile: PersonaProfile): string {
+  const sections: Array<[string, string[]]> = [
+    ['JOB PREFERENCES', profile.preferences], ['SUMMARIES', profile.summaries], ['EXPERIENCE', profile.experience], ['LANGUAGES', profile.languages], ['EDUCATION', profile.education], ['CERTIFICATIONS', profile.certifications], ['PROJECTS', profile.projects],
+    ['CONFIRMED APPLICATION ANSWERS', profile.applicationAnswers.map(field => `[${field.category}] ${field.label}: ${field.value}`)],
+  ]
+  return [
+    ...profile.identity,
+    profile.skills.length ? `SKILLS: ${profile.skills.join(', ')}` : '',
+    ...sections.filter(([, values]) => values.length > 0).map(([title, values]) => `${title}:\n${values.map(value => `- ${value}`).join('\n')}`),
+  ].filter(Boolean).join('\n\n')
+}
 
-  // Resume
-  if (resume?.content) {
-    const r = resume.content as unknown as ResumeContent
-    lines.push('')
-    lines.push('RESUME:')
-    if (r.summary) lines.push(`SUMMARY: ${r.summary}`)
-    if (r.skills?.length) lines.push(`SKILLS: ${r.skills.join(', ')}`)
-    if (r.experience?.length) {
-      lines.push('EXPERIENCE:')
-      for (const e of r.experience) {
-        lines.push(`- ${e.role} at ${e.company} (${e.period})`)
-        for (const b of (e.bullets ?? [])) lines.push(`  • ${b}`)
-      }
-    }
-    if (r.education?.length) {
-      lines.push('EDUCATION:')
-      for (const e of r.education) lines.push(`- ${e.degree} — ${e.institution} (${e.year})`)
-    }
-    if (r.languages?.length) {
-      lines.push('LANGUAGES:')
-      for (const l of r.languages) lines.push(`- ${l.lang}: ${l.level}`)
-    }
-    if (r.projects?.length) {
-      lines.push('PROJECTS:')
-      for (const p of r.projects) {
-        lines.push(`- ${p.name}${p.role ? ` / ${p.role}` : ''}${p.period ? ` (${p.period})` : ''}`)
-        for (const b of p.bullets ?? []) lines.push(`  • ${b}`)
-      }
-    }
-    if (r.certifications?.length) {
-      lines.push('CERTIFICATIONS:')
-      for (const c of r.certifications) lines.push(`- ${c.name} — ${c.issuer} (${c.date})`)
-    }
-  }
-
-  return lines.join('\n')
+export async function buildPersona(userId: string): Promise<string> {
+  return personaContext(await getPersonaProfile(userId))
 }

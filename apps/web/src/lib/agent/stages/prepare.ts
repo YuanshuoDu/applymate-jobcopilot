@@ -8,6 +8,7 @@
 import { modelChat, stripFences } from '@/lib/model-router'
 import { db } from '@/lib/db'
 import { Prisma } from '@prisma/client'
+import { buildPersona } from '@/lib/persona'
 import type { AiConfig } from '@/lib/model-router'
 import type {
   PipelineCtx, ScoredJob, ApplicationPackage, PrepareOutput,
@@ -61,6 +62,7 @@ export async function runPrepare(
     ? { provider: writerCfg.provider as AiConfig['provider'], model: writerCfg.model, apiKey: writerCfg.apiKey }
     : aiConfig
   const writerSystemPrompt = writerCfg?.systemPrompt ?? undefined
+  const persona = await buildPersona(userId).catch(() => '')
 
   const aboveThreshold = scoredJobs.filter(sj => sj.score >= 65)
   const allowResumeTailoring = options.allowResumeTailoring ?? true
@@ -74,7 +76,7 @@ export async function runPrepare(
 
     if (allowResumeTailoring) {
       try {
-        const tailored = await generateTailoredResume(sj, resumeContent, effectiveAiConfig, writerSystemPrompt)
+        const tailored = await generateTailoredResume(sj, resumeContent, effectiveAiConfig, writerSystemPrompt, persona)
         const saved = await db.resume.create({ data: {
           userId, name: `Tailored for ${sj.job.company} - ${sj.job.role}`,
           content: tailored as Prisma.InputJsonValue, templateId: defaultResume.templateId,
@@ -93,7 +95,7 @@ export async function runPrepare(
 
     if (agentCfg.autoCoverLetter) {
       try {
-        coverLetter = await generateCoverLetter(sj, agentCfg, resumeContent, effectiveAiConfig, writerSystemPrompt)
+        coverLetter = await generateCoverLetter(sj, agentCfg, resumeContent, effectiveAiConfig, writerSystemPrompt, persona)
         pendingLetters.push({ jobId: sj.job.id, coverLetter })
         await new Promise(r => setTimeout(r, THROTTLE_MS))
       } catch (err) {
@@ -123,8 +125,8 @@ export async function runPrepare(
   return stageOk('prepare', { packages }, packages.length, Date.now() - t0)
 }
 
-async function generateTailoredResume(sj: ScoredJob, resume: unknown, aiConfig: AiConfig, systemPrompt?: string) {
-  const prompt = `Tailor this resume for the target job. Preserve truthful facts; only improve positioning and add JD keywords supported by the source resume. Return ONLY the complete resume JSON object, with the same structure.\n\nRESUME JSON:\n${JSON.stringify(resume)}\n\nTARGET: ${sj.job.role} at ${sj.job.company}\nJOB DESCRIPTION:\n${sj.job.description?.slice(0, 1800) ?? ''}\nMATCHED: ${sj.matchedKeywords.join(', ')}\nMISSING: ${sj.missingKeywords.join(', ')}`
+async function generateTailoredResume(sj: ScoredJob, resume: unknown, aiConfig: AiConfig, systemPrompt?: string, persona = '') {
+  const prompt = `Tailor this resume for the target job. Preserve truthful facts; only improve positioning and add JD keywords supported by the source resume or confirmed Persona. Persona is a hard fact boundary: do not add unsupported employers, education, dates, metrics, tools, achievements, or biography. Return ONLY the complete resume JSON object, with the same structure.\n\nRESUME JSON:\n${JSON.stringify(resume)}\n\nCONFIRMED PERSONA:\n${persona.slice(0, 9000)}\n\nTARGET: ${sj.job.role} at ${sj.job.company}\nJOB DESCRIPTION:\n${sj.job.description?.slice(0, 1800) ?? ''}\nMATCHED: ${sj.matchedKeywords.join(', ')}\nMISSING: ${sj.missingKeywords.join(', ')}`
   const messages = systemPrompt
     ? [{ role: 'system' as const, content: systemPrompt }, { role: 'user' as const, content: prompt }]
     : [{ role: 'user' as const, content: prompt }]
@@ -163,6 +165,7 @@ async function generateCoverLetter(
   resume: { contact?: { name?: string }; summary?: string; experience?: { role: string; company: string; period: string }[] },
   aiConfig: ReturnType<typeof import('@/lib/model-router')['resolveConfig']> extends never ? never : Parameters<typeof modelChat>[1],
   systemPrompt?: string,
+  persona = '',
 ): Promise<string> {
   const name       = resume.contact?.name ?? 'the applicant'
   const latestRole = resume.experience?.[0]
@@ -189,7 +192,8 @@ ${sj.job.description ? `JD EXCERPT:\n${sj.job.description.slice(0, 1000)}` : ''}
 Tone: ${toneGuide}
 Language: Write this cover letter in ${languageName}. ${languageGuide}
 Structure: ${greeting} | hook | why this role | 2-3 achievements | CTA | Sincerely, ${name}
-Rules: 220-280 words, no filler like "I am writing to express", quantify where possible.
+Rules: 220-280 words, no filler like "I am writing to express", quantify only claims supported by the confirmed Persona below. Never invent experience or qualifications.
+CONFIRMED PERSONA:\n${persona.slice(0, 7000)}
 Return ONLY the cover letter text.`
 
   const messages = systemPrompt

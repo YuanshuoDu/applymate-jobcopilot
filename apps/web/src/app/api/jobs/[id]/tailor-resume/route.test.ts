@@ -6,6 +6,7 @@ const mocks = vi.hoisted(() => ({
   resumeFindFirst: vi.fn(),
   jobFindFirst: vi.fn(),
   modelChat: vi.fn(),
+  buildPersona: vi.fn(),
 }))
 
 vi.mock('@/lib/api-helpers', () => ({
@@ -26,6 +27,7 @@ vi.mock('@/lib/model-router', () => ({
   modelChat: mocks.modelChat,
   parseAiJson: vi.fn(),
 }))
+vi.mock('@/lib/persona', () => ({ buildPersona: mocks.buildPersona }))
 
 describe('tailor resume API', () => {
   beforeEach(() => {
@@ -34,7 +36,9 @@ describe('tailor resume API', () => {
     mocks.resumeFindFirst.mockReset()
     mocks.jobFindFirst.mockReset()
     mocks.modelChat.mockReset()
+    mocks.buildPersona.mockReset()
     mocks.prepareAiRoute.mockResolvedValue({ userId: 'user_1', cfg: { provider: 'test', model: 'm1' } })
+    mocks.buildPersona.mockResolvedValue('EXPERIENCE:\n- Backend engineer')
   })
 
   it('reuses the tailored resume already linked to the job without calling the AI', async () => {

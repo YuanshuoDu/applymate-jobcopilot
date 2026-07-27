@@ -2,8 +2,7 @@
 
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import { Download, Pencil, Plus, ShieldCheck, Trash2 } from 'lucide-react'
-import type { ResumeContent } from '@/lib/types'
-import type { PersonaField } from '@/lib/persona'
+import type { PersonaField, PersonaProfile } from '@/lib/persona'
 
 const categories = ['personal', 'contact', 'work', 'education', 'preferences'] as const
 const labels: Record<(typeof categories)[number], string> = {
@@ -11,24 +10,23 @@ const labels: Record<(typeof categories)[number], string> = {
   education: 'Education & qualifications', preferences: 'Job preferences',
 }
 
-export function PersonaPanel({ content, isDefault, onEditResume, onUseAsProfile }: { content: ResumeContent; isDefault: boolean; onEditResume: (section: string) => void; onUseAsProfile: () => void }) {
-  const [fields, setFields] = useState<PersonaField[]>([])
+export function PersonaPanel({ isDefault, onEditResume, onUseAsProfile }: { isDefault: boolean; onEditResume: (section: string) => void; onUseAsProfile: () => void }) {
+  const [profile, setProfile] = useState<PersonaProfile | null>(null)
   const [loading, setLoading] = useState(true)
   const [draft, setDraft] = useState<Partial<PersonaField> | null>(null)
   const [error, setError] = useState('')
 
   const load = useCallback(async () => {
     setLoading(true)
-    const response = await fetch('/api/me/persona/fields')
+    const response = await fetch('/api/me/persona')
     const payload = await response.json().catch(() => null)
-    if (response.ok) setFields(payload?.fields ?? [])
+    if (response.ok) setProfile(payload?.profile ?? null)
     else setError(payload?.error ?? 'Could not load Persona.')
     setLoading(false)
   }, [])
   useEffect(() => { void load() }, [load])
 
-  const groups = useMemo(() => categories.map(category => ({ category, fields: fields.filter(field => field.category === category) })), [fields])
-  const contactDetails = [content.contact.name, content.contact.email, content.contact.phone, content.contact.location, content.contact.linkedin, content.contact.github, content.contact.website].filter((value): value is string => Boolean(value))
+  const groups = useMemo(() => categories.map(category => ({ category, fields: (profile?.applicationAnswers ?? []).filter(field => field.category === category) })), [profile])
 
   async function save() {
     if (!draft?.key || !draft.label || !draft.value) { setError('Add a label and value before saving.'); return }
@@ -39,13 +37,12 @@ export function PersonaPanel({ content, isDefault, onEditResume, onUseAsProfile 
     const response = await fetch('/api/me/persona/fields', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ fields: [field] }) })
     const payload = await response.json().catch(() => null)
     if (!response.ok) { setError(payload?.error ?? 'Could not save Persona field.'); return }
-    setFields(payload.fields ?? [])
-    setDraft(null); setError('')
+    setDraft(null); setError(''); await load()
   }
 
   async function remove(key: string) {
     const response = await fetch('/api/me/persona/fields', { method: 'DELETE', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ key }) })
-    if (response.ok) setFields(current => current.filter(field => field.key !== key))
+    if (response.ok) await load()
     else setError('Could not delete Persona field.')
   }
 
@@ -65,13 +62,14 @@ export function PersonaPanel({ content, isDefault, onEditResume, onUseAsProfile 
     <div style={privacyStyle}><ShieldCheck size={16} /><span><strong>You stay in control.</strong> Resume facts are read in place; application answers are saved only after you confirm. Sensitive data is not stored here.</span></div>
     {isDefault ? <div style={sharedProfileStyle}>This is your shared profile resume. The extension uses it for future application forms.</div> : <div style={sharedProfileStyle}>The extension currently uses your default resume. <button onClick={onUseAsProfile} style={profileButton}>Use this resume as the shared Persona base</button></div>}
 
-    <PanelTitle title="From this resume" />
-    <ResumeDetailCard title="Contact" details={contactDetails} onEdit={() => onEditResume('contact')} />
-    <ResumeDetailCard title="Professional summary" details={content.summary ? [content.summary] : []} onEdit={() => onEditResume('summary')} />
-    <ResumeDetailCard title="Experience" details={content.experience.flatMap(item => [`${item.role} · ${item.company}${item.period ? ` (${item.period})` : ''}`, ...item.bullets.map(bullet => `↳ ${bullet}`)])} onEdit={() => onEditResume('experience')} />
-    <ResumeDetailCard title="Skills & languages" details={[...content.skills, ...(content.languages ?? []).map(language => `${language.lang} · ${language.level}`)]} onEdit={() => onEditResume('skills')} />
-    <ResumeDetailCard title="Education & qualifications" details={[...content.education.map(item => `${item.degree} · ${item.institution}${item.year ? ` (${item.year})` : ''}`), ...(content.certifications ?? []).map(item => `${item.name} · ${item.issuer}${item.date ? ` (${item.date})` : ''}`)]} onEdit={() => onEditResume('education')} />
-    <ResumeDetailCard title="Projects" details={(content.projects ?? []).flatMap(item => [`${item.name}${item.role ? ` · ${item.role}` : ''}`, ...item.bullets.map(bullet => `↳ ${bullet}`)])} onEdit={() => onEditResume('projects')} />
+    <PanelTitle title={`Confirmed facts · ${profile?.sourceResumeCount ?? 0} base resume${profile?.sourceResumeCount === 1 ? '' : 's'}`} />
+    <ResumeDetailCard title="Identity & contact" details={profile?.identity ?? []} onEdit={() => onEditResume('contact')} />
+    <ResumeDetailCard title="Job preferences" details={profile?.preferences ?? []} onEdit={() => onEditResume('summary')} />
+    <ResumeDetailCard title="Professional summary" details={profile?.summaries ?? []} onEdit={() => onEditResume('summary')} />
+    <ResumeDetailCard title="Experience" details={profile?.experience ?? []} onEdit={() => onEditResume('experience')} />
+    <ResumeDetailCard title="Skills & languages" details={[...(profile?.skills ?? []), ...(profile?.languages ?? [])]} onEdit={() => onEditResume('skills')} />
+    <ResumeDetailCard title="Education & qualifications" details={[...(profile?.education ?? []), ...(profile?.certifications ?? [])]} onEdit={() => onEditResume('education')} />
+    <ResumeDetailCard title="Projects" details={profile?.projects ?? []} onEdit={() => onEditResume('projects')} />
 
     <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginTop: 18 }}><PanelTitle title="Saved application answers" /><button onClick={() => { setDraft({ category: 'personal' }); setError('') }} style={addButton}><Plus size={13} /> Add</button></div>
     {draft && <div style={editorStyle}>
@@ -81,7 +79,7 @@ export function PersonaPanel({ content, isDefault, onEditResume, onUseAsProfile 
       <div style={{ display: 'flex', gap: 6 }}><button onClick={() => void save()} style={saveButton}>Save to Persona</button><button onClick={() => setDraft(null)} style={cancelButton}>Cancel</button></div>
     </div>}
     {loading ? <div style={{ color: 'var(--text-muted)', fontSize: 12 }}>Loading Persona…</div> : groups.map(group => group.fields.length > 0 && <section key={group.category} style={{ marginTop: 12 }}><PanelTitle title={labels[group.category]} />{group.fields.map(field => <div key={field.key} style={fieldStyle}><div><strong>{field.label}</strong><small>{field.value}</small><em>{field.source === 'form_scan' ? 'Saved from an application' : 'Added by you'}</em></div><button onClick={() => void remove(field.key)} title={`Delete ${field.label}`} style={iconButton}><Trash2 size={14} /></button></div>)}</section>)}
-    {!loading && fields.length === 0 && !draft && <div style={{ color: 'var(--text-muted)', fontSize: 12, lineHeight: 1.5, padding: '10px 0' }}>Add answers that you want to reuse across applications, such as work authorisation or notice period.</div>}
+    {!loading && (profile?.applicationAnswers.length ?? 0) === 0 && !draft && <div style={{ color: 'var(--text-muted)', fontSize: 12, lineHeight: 1.5, padding: '10px 0' }}>Add answers that you want to reuse across applications, such as work authorisation or notice period.</div>}
     {error && <div role="alert" style={{ color: '#b42318', fontSize: 11, marginTop: 10 }}>{error}</div>}
   </div>
 }

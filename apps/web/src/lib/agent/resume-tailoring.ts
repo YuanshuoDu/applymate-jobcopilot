@@ -1,6 +1,7 @@
 import { Prisma } from '@prisma/client'
 import { db } from '@/lib/db'
 import { modelChat, parseAiJson, type AiConfig } from '@/lib/model-router'
+import { buildPersona } from '@/lib/persona'
 
 export interface TailoredResumeArtifact {
   id: string
@@ -23,9 +24,10 @@ type TailoringInput = {
  * assign Job.finalResumeId: that is the separate Reviewer/user confirmation.
  */
 export async function tailorResumeForAgent(input: TailoringInput): Promise<TailoredResumeArtifact> {
-  const [resume, job] = await Promise.all([
+  const [resume, job, persona] = await Promise.all([
     db.resume.findFirst({ where: { id: input.resumeId, userId: input.userId } }),
     db.job.findFirst({ where: { id: input.jobId, userId: input.userId } }),
+    buildPersona(input.userId),
   ])
   if (!resume) throw new Error('Selected resume was not found.')
   if (!job) throw new Error('Selected job was not found.')
@@ -37,7 +39,7 @@ export async function tailorResumeForAgent(input: TailoringInput): Promise<Tailo
   })
   if (existing) return artifact(existing, job, true)
 
-  const result = await modelChat([{ role: 'user', content: prompt(resume.content, job) }], input.aiConfig, 2400)
+  const result = await modelChat([{ role: 'user', content: prompt(resume.content, job, persona) }], input.aiConfig, 2400)
   const content = parseAiJson<Record<string, unknown>>(result.text)
   if (!content || Array.isArray(content)) throw new Error('The writer returned an invalid resume document.')
 
@@ -73,14 +75,15 @@ function artifact(resume: { id: string; name: string }, job: { id: string; compa
   return { id: resume.id, name: resume.name, jobId: job.id, company: job.company, role: job.role, reused }
 }
 
-function prompt(content: unknown, job: { company: string; role: string; description: string | null; keywords: string | null }) {
+function prompt(content: unknown, job: { company: string; role: string; description: string | null; keywords: string | null }, persona: string) {
   return [
     'You are the ApplyMate Writer. Return ONLY a complete JSON resume object with the same structure as the source.',
-    'Preserve truthful candidate facts. Do not invent employers, education, dates, metrics, tools, or achievements.',
-    'Improve wording and add only job-description keywords supported by the source resume.',
+    'The confirmed Persona below is the candidate fact boundary. Do not invent or infer employers, education, dates, metrics, tools, achievements, work authorisation, or other biographical facts.',
+    'Improve wording and add only job-description keywords supported by the source resume or confirmed Persona. If the two sources conflict, preserve the source resume and flag nothing new.',
     `TARGET JOB: ${job.role} at ${job.company}`,
     job.keywords ? `KNOWN ATS KEYWORDS: ${job.keywords}` : '',
     `JOB DESCRIPTION:\n${job.description?.slice(0, 5000) ?? ''}`,
+    `CONFIRMED PERSONA (base resumes and user-confirmed application answers only):\n${persona.slice(0, 9000)}`,
     `SOURCE RESUME JSON:\n${JSON.stringify(content)}`,
   ].filter(Boolean).join('\n\n')
 }

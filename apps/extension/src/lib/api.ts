@@ -161,6 +161,20 @@ export async function getStats(settings: ExtensionSettings): Promise<DashboardSt
 
 export interface PersonaResult {
   persona: string
+  profile: PersonaProfile
+}
+
+export interface PersonaProfile {
+  identity: string[]
+  preferences: string[]
+  summaries: string[]
+  experience: string[]
+  skills: string[]
+  languages: string[]
+  education: string[]
+  certifications: string[]
+  projects: string[]
+  sourceResumeCount: number
 }
 
 export interface PersonaField {

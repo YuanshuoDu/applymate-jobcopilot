@@ -8,6 +8,7 @@ import { Prisma } from '@prisma/client'
 import { db } from '@/lib/db'
 import { prepareAiRoute, ok, err } from '@/lib/api-helpers'
 import { modelChat, parseAiJson } from '@/lib/model-router'
+import { buildPersona } from '@/lib/persona'
 import type { ApplicationAuditFinding } from '@/lib/types'
 
 type Params = { params: Promise<{ id: string }> }
@@ -81,6 +82,7 @@ export async function POST(req: NextRequest, { params }: Params) {
   if (!sourceResume) return err('The original resume for this tailored version could not be found', 404)
 
   const resumeContent = sourceResume.content as Record<string, unknown>
+  const persona = await buildPersona(prep.userId)
   const adaptedContent = cloneJson(resumeContent)
   const changes: ChangeDetail[] = []
   const corrections = Array.isArray(auditFindings)
@@ -96,7 +98,8 @@ export async function POST(req: NextRequest, { params }: Params) {
     const prompt = [
       'You are an expert ATS resume editor.',
       'Tailor the provided resume section to the target job while preserving truthful candidate facts.',
-      'Use job-description keywords only where they are supported by the resume content.',
+      'The confirmed Persona is a hard factual boundary. Do not add facts that are unsupported by BOTH the source resume and Persona. If there is any conflict, preserve the source resume.',
+      'Use job-description keywords only where they are supported by the resume content or Persona.',
       '',
       `SECTION: ${section}`,
       `CURRENT SECTION JSON:\n${before}`,
@@ -104,6 +107,7 @@ export async function POST(req: NextRequest, { params }: Params) {
       `TARGET JOB: ${job.role} at ${job.company}`,
       job.keywords ? `KNOWN KEYWORDS: ${job.keywords}` : '',
       `JOB DESCRIPTION:\n${job.description.slice(0, 1800)}`,
+      `CONFIRMED PERSONA:\n${persona.slice(0, 9000)}`,
       corrections.length ? `AUDIT CORRECTIONS (remove or rewrite unsupported claims; never invent evidence):\n${corrections.join('\n')}` : '',
       '',
       'Return ONLY JSON in this shape:',

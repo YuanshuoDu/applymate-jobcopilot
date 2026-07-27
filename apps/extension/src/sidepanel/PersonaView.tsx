@@ -4,9 +4,10 @@
  * Supports inline editing, deletion, and adding custom fields.
  */
 import { useState, useEffect, useCallback } from 'react'
-import { getPersonaFields, savePersonaFields, deletePersonaField } from '@/lib/api'
+import { getPersona, getPersonaFields, savePersonaFields, deletePersonaField } from '@/lib/api'
 import type { ExtensionSettings } from '@/lib/types'
 import type { PersonaField } from '@/lib/api'
+import type { PersonaProfile } from '@/lib/api'
 
 const C = {
   primary:  '#4F46E5',
@@ -30,6 +31,12 @@ const CATEGORY_META: Record<string, { icon: string; label: string }> = {
 }
 
 const CATEGORIES = ['personal', 'contact', 'work', 'education', 'preferences']
+const PROFILE_GROUPS: Array<{ key: keyof PersonaProfile; label: string }> = [
+  { key: 'identity', label: 'Identity & contact' }, { key: 'preferences', label: 'Job preferences' },
+  { key: 'experience', label: 'Experience' }, { key: 'skills', label: 'Skills' },
+  { key: 'languages', label: 'Languages' }, { key: 'education', label: 'Education' },
+  { key: 'certifications', label: 'Certifications' }, { key: 'projects', label: 'Projects' },
+]
 
 interface Props {
   settings: ExtensionSettings
@@ -41,6 +48,7 @@ type ViewMode = 'view' | 'editing' | 'adding'
 
 export function PersonaView({ settings, personaUpdateTrigger }: Props) {
   const [fields, setFields] = useState<PersonaField[]>([])
+  const [profile, setProfile] = useState<PersonaProfile | null>(null)
   const [loading, setLoading] = useState(true)
   const [mode, setMode] = useState<ViewMode>('view')
   const [editingField, setEditingField] = useState<PersonaField | null>(null)
@@ -50,8 +58,9 @@ export function PersonaView({ settings, personaUpdateTrigger }: Props) {
 
   const loadFields = useCallback(async () => {
     try {
-      const result = await getPersonaFields(settings)
-      setFields(result.fields)
+      const [fieldsResult, personaResult] = await Promise.all([getPersonaFields(settings), getPersona(settings)])
+      setFields(fieldsResult.fields)
+      setProfile(personaResult.profile)
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err)
       showToast(`Load failed: ${msg}`)
@@ -118,9 +127,21 @@ export function PersonaView({ settings, personaUpdateTrigger }: Props) {
           Persona Profile
         </div>
         <div style={{ fontSize: 11, color: C.muted }}>
-          Answers learned from your job applications. Used to auto-fill future forms.
+          Confirmed facts from your base resumes and job applications. Used to auto-fill future forms.
         </div>
       </div>
+
+      {profile && <div style={{ marginBottom: 14 }}>
+        <div style={{ fontSize: 10, fontWeight: 700, color: C.subtle, letterSpacing: '.05em', textTransform: 'uppercase', marginBottom: 6 }}>Unified profile · {profile.sourceResumeCount} base resume{profile.sourceResumeCount === 1 ? '' : 's'}</div>
+        {PROFILE_GROUPS.map(group => {
+          const values = profile[group.key]
+          if (!Array.isArray(values) || values.length === 0) return null
+          return <div key={group.key} style={{ background: C.card, border: `1px solid ${C.border}`, borderRadius: 8, padding: '8px 10px', marginBottom: 6 }}>
+            <div style={{ fontSize: 11, fontWeight: 600, color: C.text, marginBottom: 3 }}>{group.label}</div>
+            {values.map((value, index) => <div key={`${value}-${index}`} style={{ fontSize: 10.5, color: C.muted, lineHeight: 1.45 }}>{value}</div>)}
+          </div>
+        })}
+      </div>}
 
       {/* Add New Field */}
       {mode === 'adding' ? (

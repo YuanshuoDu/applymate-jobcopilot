@@ -1619,7 +1619,7 @@ export function ResumePage() {
             <button onClick={() => setRightPanel('insights')} style={{ border: 0, background: 'transparent', color: rightPanel === 'insights' ? 'var(--text)' : 'var(--text-muted)', font: 'inherit', fontWeight: 700, cursor: 'pointer', padding: 0 }}>AI insights</button>
             <button onClick={() => setRightPanel('persona')} style={{ border: 0, background: 'transparent', color: rightPanel === 'persona' ? 'var(--primary)' : 'var(--text-muted)', font: 'inherit', fontWeight: 700, cursor: 'pointer', padding: 0 }}>Persona</button>
           </div>
-          {rightPanel === 'persona' ? <PersonaPanel content={content} isDefault={selectedResume?.isDefault ?? false} onEditResume={setEditSection} onUseAsProfile={() => { if (selectedResume) void handleSetDefaultResume(selectedResume) }} /> : <>
+          {rightPanel === 'persona' ? <PersonaPanel isDefault={selectedResume?.isDefault ?? false} onEditResume={setEditSection} onUseAsProfile={() => { if (selectedResume) void handleSetDefaultResume(selectedResume) }} /> : <>
           <div className="resume-opportunity-card">
             <span className="resume-opportunity-eyebrow">LINKED OPPORTUNITY</span>
             {linkedJob ? <>
