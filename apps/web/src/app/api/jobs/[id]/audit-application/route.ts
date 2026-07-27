@@ -70,6 +70,24 @@ function auditActivityText(resumeId: string, coverLetterId: string, audit: Appli
   return `${AUDIT_ACTIVITY_PREFIX}${JSON.stringify({ resumeId, coverLetterId, audit })}`
 }
 
+function isAbortError(error: unknown) {
+  return error instanceof Error && error.name === 'AbortError'
+}
+
+async function runAuditModel(prompt: string, cfg: AiConfig) {
+  let lastError: unknown
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      return await modelChat([{ role: 'user', content: prompt }], cfg, 1_400)
+    } catch (error) {
+      lastError = error
+      if (!isAbortError(error) || attempt === 1) throw error
+      await new Promise(resolve => setTimeout(resolve, 750))
+    }
+  }
+  throw lastError
+}
+
 function parseStoredAudit(text: string): StoredApplicationAudit | null {
   if (!text.startsWith(AUDIT_ACTIVITY_PREFIX)) return null
   try {
@@ -170,7 +188,7 @@ FINAL COVER LETTER TO AUDIT:
 ${coverLetter.content.slice(0, 8_000)}`
 
   try {
-    const result = await modelChat([{ role: 'user', content: prompt }], cfg, 3_000)
+    const result = await runAuditModel(prompt, cfg)
     const audit = normalize(parseAiJson<RawAudit>(result.text), source)
     await db.activity.create({
       data: {

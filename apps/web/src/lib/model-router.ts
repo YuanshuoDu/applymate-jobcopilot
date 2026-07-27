@@ -301,7 +301,7 @@ function oaiFetch(c: OaiRequestConfig): Promise<Response> {
   // Audits compare two full documents and can legitimately take longer than a
   // short suggestion request. Keep a bounded timeout, but avoid aborting a
   // valid independent-audit response halfway through generation.
-  const timer = setTimeout(() => controller.abort(), 60_000)
+  const timer = setTimeout(() => controller.abort(), 120_000)
   return fetch(`${c.base}/chat/completions`, {
     method:  'POST',
     headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${c.key}` },
