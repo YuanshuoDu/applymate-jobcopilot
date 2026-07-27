@@ -3,7 +3,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest'
 const mocks = vi.hoisted(() => ({ findUser: vi.fn(), findResumes: vi.fn() }))
 vi.mock('@/lib/db', () => ({ db: { user: { findUnique: mocks.findUser }, resume: { findMany: mocks.findResumes } } }))
 
-import { getPersonaProfile, validatePersonaField } from './persona'
+import { buildPersona, getPersonaProfile, validatePersonaField } from './persona'
 
 describe('validatePersonaField', () => {
   const valid = { key: 'notice_period', label: 'Notice period', value: 'One month', category: 'work' }
@@ -45,5 +45,10 @@ describe('getPersonaProfile', () => {
     expect(profile).toMatchObject({ sourceResumeCount: 1, skills: ['TypeScript'], certifications: ['AWS · Amazon (2025)'] })
     expect(profile.experience).toContain('Engineer · ApplyMate (2024-now)')
     expect(profile.applicationAnswers).toEqual([expect.objectContaining({ key: 'notice_period' })])
+  })
+
+  it('keeps labelled contact and skill lines for extension auto-fill', async () => {
+    await expect(buildPersona('user_1')).resolves.toContain('NAME: Ada Lovelace')
+    await expect(buildPersona('user_1')).resolves.toContain('SKILLS: TypeScript')
   })
 })
