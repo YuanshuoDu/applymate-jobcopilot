@@ -302,10 +302,16 @@ function oaiFetch(c: OaiRequestConfig): Promise<Response> {
   // short suggestion request. Keep a bounded timeout, but avoid aborting a
   // valid independent-audit response halfway through generation.
   const timer = setTimeout(() => controller.abort(), 120_000)
+  // MiniMax M2 reasoning can consume the entire completion budget before it
+  // emits the final answer. Its OpenAI-compatible endpoint supports splitting
+  // that reasoning from message.content and requires max_completion_tokens.
+  const providerOptions = c.provider === 'minimax'
+    ? { max_completion_tokens: c.maxTokens, reasoning_split: true }
+    : { max_tokens: c.maxTokens }
   return fetch(`${c.base}/chat/completions`, {
     method:  'POST',
     headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${c.key}` },
-    body:    JSON.stringify({ model: c.model, max_tokens: c.maxTokens, messages: c.messages, stream: c.stream }),
+    body:    JSON.stringify({ model: c.model, ...providerOptions, messages: c.messages, stream: c.stream }),
     signal:  controller.signal,
   }).finally(() => clearTimeout(timer))
 }
@@ -325,9 +331,15 @@ async function callOpenAICompat(
   if (!config.apiBase) throw new Error(`No API base URL for provider "${config.provider}"`)
   const resp = await oaiFetch({ base: config.apiBase, provider: config.provider, model: config.model, key: config.resolvedKey, messages, maxTokens, stream: false })
   await oaiCheck(resp, config.provider)
-  const data = await resp.json()
-  const text: string = data.choices?.[0]?.message?.content ?? ''
-  return { text, inputTokens: data.usage?.prompt_tokens, outputTokens: data.usage?.completion_tokens, provider: config.provider, model: config.model }
+  const data: unknown = await resp.json()
+  const response = data as { choices?: Array<{ finish_reason?: string; message?: { content?: unknown } }>; usage?: { prompt_tokens?: number; completion_tokens?: number } }
+  const choice = response.choices?.[0]
+  const text = typeof choice?.message?.content === 'string' ? choice.message.content : ''
+  if (!text.trim()) {
+    const finish = choice?.finish_reason ? ` (finish reason: ${choice.finish_reason})` : ''
+    throw new Error(`${config.provider} returned no final content${finish}`)
+  }
+  return { text, inputTokens: response.usage?.prompt_tokens, outputTokens: response.usage?.completion_tokens, provider: config.provider, model: config.model }
 }
 
 async function* streamOpenAICompat(

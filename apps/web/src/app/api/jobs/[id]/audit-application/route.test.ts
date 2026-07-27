@@ -87,7 +87,7 @@ describe('POST /api/jobs/[id]/audit-application', () => {
     const { POST } = await import('./route')
     const response = (await POST(request({ resumeId: 'resume_final', coverLetterId: 'cover_1' }) as never, { params: Promise.resolve({ id: 'job_1' }) }))!
     expect(response.status).toBe(200)
-    expect(mocks.modelChat).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({ provider: 'minimax', model: 'MiniMax-M2.7' }), 1400)
+    expect(mocks.modelChat).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({ provider: 'minimax', model: 'MiniMax-M2.7' }), 2048)
   })
 
   it('retries one aborted model call before failing the audit', async () => {

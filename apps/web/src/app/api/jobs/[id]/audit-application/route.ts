@@ -78,7 +78,10 @@ async function runAuditModel(prompt: string, cfg: AiConfig) {
   let lastError: unknown
   for (let attempt = 0; attempt < 2; attempt++) {
     try {
-      return await modelChat([{ role: 'user', content: prompt }], cfg, 1_400)
+      // MiniMax M2.7 uses part of its completion budget for private reasoning.
+      // Its OpenAI-compatible endpoint caps max_completion_tokens at 2048, so
+      // use that full allowance to ensure an audit reaches its final JSON.
+      return await modelChat([{ role: 'user', content: prompt }], cfg, 2_048)
     } catch (error) {
       lastError = error
       if (!isAbortError(error) || attempt === 1) throw error
