@@ -75,6 +75,7 @@ import { ProjectsSection } from '@/components/resume/ProjectsSection'
 import { CertificationsSection } from '@/components/resume/CertificationsSection'
 import { CustomSection } from '@/components/resume/CustomSection'
 import { AiPanel } from '@/components/resume/AiPanel'
+import { PersonaPanel } from '@/components/resume/PersonaPanel'
 import { FinalConfirmDialog } from '@/components/resume/FinalConfirmDialog'
 import { ResumeAuditDialog } from '@/components/resume/ResumeAuditDialog'
 import { UploadResumeModal } from '@/components/resume/UploadResumeModal'
@@ -549,6 +550,7 @@ export function ResumePage() {
   const [templateId,      setTemplateId]      = useState('clean')
   const [templateOptions, setTemplateOptions] = useState<TemplateOptions>({})
   const [previewMode,     setPreviewMode]     = useState(false)
+  const [rightPanel,      setRightPanel]      = useState<'insights' | 'persona'>('insights')
   const [loadingCont,     setLoadingCont]     = useState(false)
   const [saving,      setSaving]      = useState(false)
   const [lastSavedAt, setLastSavedAt] = useState<Date | null>(null)
@@ -1613,7 +1615,11 @@ export function ResumePage() {
           </div>
 
           <aside className="resume-ai-column">
-          <div className="resume-ai-title">AI insights <span>i</span></div>
+          <div className="resume-ai-title" style={{ display: 'flex', gap: 6 }}>
+            <button onClick={() => setRightPanel('insights')} style={{ border: 0, background: 'transparent', color: rightPanel === 'insights' ? 'var(--text)' : 'var(--text-muted)', font: 'inherit', fontWeight: 700, cursor: 'pointer', padding: 0 }}>AI insights</button>
+            <button onClick={() => setRightPanel('persona')} style={{ border: 0, background: 'transparent', color: rightPanel === 'persona' ? 'var(--primary)' : 'var(--text-muted)', font: 'inherit', fontWeight: 700, cursor: 'pointer', padding: 0 }}>Persona</button>
+          </div>
+          {rightPanel === 'persona' ? <PersonaPanel content={content} onEditResume={setEditSection} /> : <>
           <div className="resume-opportunity-card">
             <span className="resume-opportunity-eyebrow">LINKED OPPORTUNITY</span>
             {linkedJob ? <>
@@ -1654,6 +1660,7 @@ export function ResumePage() {
             contentChangedSinceAnalysis={contentChangedSinceAnalysis}
             onAudit={() => { if (!content) { toast.info('Select a resume first'); return }; setShowResumeAudit(true) }}
           />
+          </>}
           </aside>
         </div>
       )}

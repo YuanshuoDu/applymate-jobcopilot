@@ -251,6 +251,12 @@ export function FormFillerView({ settings, pendingFields, onFieldsConsumed, scan
     return label.toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_|_$/g, '').slice(0, 50)
   }
 
+  // GDPR data minimisation: these answers are never offered for Persona
+  // storage, even if a site form or model marks them as reusable.
+  function isPersonaSafe(label: string): boolean {
+    return !/(gender|sex|pronoun|birth|age|race|ethnic|religion|faith|politic|union|health|medical|disab|veteran|criminal|passport|national[_ ]?id)/i.test(label)
+  }
+
   function guessCategoryFromLabel(label: string): string {
     const l = label.toLowerCase()
     if (/name|gender|sex|pronoun|birth|age|race|ethnic|veteran|disability/i.test(l)) return 'personal'
@@ -276,6 +282,7 @@ export function FormFillerView({ settings, pendingFields, onFieldsConsumed, scan
       if (!currentValue.trim()) continue
       const schema = fields.find(s => s.id === f.fieldId)
       const label = schema?.label ?? f.fieldId
+      if (!isPersonaSafe(label)) continue
       const personaKey = fieldToPersonaKey(label)
 
       const existing = existingMap.get(personaKey)
@@ -325,7 +332,7 @@ export function FormFillerView({ settings, pendingFields, onFieldsConsumed, scan
     try {
       const fields: PersonaField[] = personaMatches.map(m => ({
         key:        m.personaKey,
-        category:   guessCategory(m.personaKey),
+        category:   guessCategoryFromLabel(m.label),
         label:      m.label,
         value:      m.value,
         confidence: 1.0,

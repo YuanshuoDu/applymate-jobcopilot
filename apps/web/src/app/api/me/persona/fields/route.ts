@@ -1,7 +1,7 @@
 import { NextRequest } from 'next/server'
 import { db } from '@/lib/db'
 import { requireAuth, isErrorResponse, ok, err } from '@/lib/api-helpers'
-import type { PersonaField } from '@/lib/persona'
+import { validatePersonaField, type PersonaField } from '@/lib/persona'
 import type { Prisma } from '@prisma/client'
 
 /**
@@ -32,7 +32,12 @@ export async function POST(req: NextRequest) {
     return err('fields array is required')
   }
 
+  if (body.fields.length > 100) return err('A Persona can contain at most 100 saved fields.')
   const incoming: PersonaField[] = body.fields
+  for (const field of incoming) {
+    const validationError = validatePersonaField(field)
+    if (validationError) return err(validationError)
+  }
 
   // Fetch existing fields
   const user = await db.user.findUnique({
@@ -45,7 +50,6 @@ export async function POST(req: NextRequest) {
   const map = new Map<string, PersonaField>()
   for (const f of existing) map.set(f.key, f)
   for (const f of incoming) {
-    if (!f.key || !f.value) continue
     const now = new Date().toISOString()
     map.set(f.key, { ...f, updatedAt: now })
   }

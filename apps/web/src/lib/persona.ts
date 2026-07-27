@@ -11,6 +11,24 @@ export interface PersonaField {
   updatedAt:  string
 }
 
+export const PERSONA_CATEGORIES = ['personal', 'work', 'contact', 'education', 'preferences'] as const
+export type PersonaCategory = typeof PERSONA_CATEGORIES[number]
+
+// Special-category data is not needed to tailor a job application. Keeping it
+// out of the profile is the safest default under GDPR's data-minimisation rule.
+const SENSITIVE_FIELD = /(?:gender|sex|pronoun|birth|date[_ ]?of[_ ]?birth|age|race|ethnic|religion|faith|politic|union|health|medical|disab|veteran|criminal|passport|national[_ ]?id)/i
+
+export function validatePersonaField(value: unknown): string | null {
+  if (!value || typeof value !== 'object') return 'Each persona field must be an object.'
+  const field = value as Partial<PersonaField>
+  if (!field.key || !/^[a-z0-9_]{1,80}$/i.test(field.key)) return 'Persona field key must use letters, numbers, or underscores.'
+  if (!field.label || typeof field.label !== 'string' || field.label.length > 120) return 'Persona field label is required and must be 120 characters or fewer.'
+  if (!field.value || typeof field.value !== 'string' || field.value.length > 2_000) return 'Persona field value is required and must be 2,000 characters or fewer.'
+  if (!PERSONA_CATEGORIES.includes(field.category as PersonaCategory)) return 'Persona field category is invalid.'
+  if (SENSITIVE_FIELD.test(`${field.key} ${field.label}`)) return 'Sensitive personal data is not stored in Persona.'
+  return null
+}
+
 export async function buildPersona(userId: string): Promise<string> {
   const user = await db.user.findUnique({
     where: { id: userId },
