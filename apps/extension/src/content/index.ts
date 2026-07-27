@@ -7,11 +7,38 @@
 import { detectAndScrape } from '@/lib/scrapers/detect'
 import { startListModeInjector, isJobListPage } from './list-injector'
 import { tryInjectAutoFillButton, removeAutoFillButton, applyFieldValues, updateButtonState } from './form-injector'
-import { mountDetailButtonContainer } from './detail-button-placement'
+import { findDetailActionHost, mountDetailButtonContainer } from './detail-button-placement'
 import { detectAndScanForms } from '../lib/form-filler/detectors/detect'
 import { generateId } from '../lib/form-filler/form-scanner'
 import { openUploadPicker } from '../lib/form-filler/auto-fill'
-import type { ScrapedJob } from '@/lib/types'
+import type { ExtensionSettings, ScrapedJob } from '@/lib/types'
+import { isJobReadyForTailoring, mergeJobDetails } from '@/lib/job-quality'
+
+type ContentRuntime = {
+  marker?: string
+  isAlive: () => boolean
+  dispose: () => void
+}
+
+type ContentRuntimeGlobal = typeof globalThis & {
+  __applyMateContentBuild?: string
+  __applyMateContentRuntime?: ContentRuntime
+  __applyMateListInjectorCleanup?: () => void
+  __applyMateJobUiCleanup?: () => void
+}
+
+const contentRuntimeGlobal = globalThis as ContentRuntimeGlobal
+const contentRuntime: ContentRuntime = {
+  marker: contentRuntimeGlobal.__applyMateContentBuild,
+  isAlive: () => {
+    try { return Boolean(chrome.runtime.id && chrome.runtime.getManifest().version) } catch { return false }
+  },
+  dispose: () => {
+    contentRuntimeGlobal.__applyMateListInjectorCleanup?.()
+    contentRuntimeGlobal.__applyMateJobUiCleanup?.()
+  },
+}
+contentRuntimeGlobal.__applyMateContentRuntime = contentRuntime
 
 const BUTTON_ID   = 'applymate-save-btn'
 const TOAST_ID    = 'applymate-toast'
@@ -34,6 +61,131 @@ function log(...args: unknown[]) { if (DEBUG) console.log('[ApplyMate]', ...args
 let currentJob: ScrapedJob | null = null
 let injectAttempts = 0
 let backgroundReady = false
+let lastPanelSignature = ''
+let lastSavedPanelSignature = ''
+let panelRefreshTimer: ReturnType<typeof setTimeout> | null = null
+
+function publishJob(job: ScrapedJob) {
+  const stamped = { ...job, detectedAt: Date.now() }
+  currentJob = stamped
+  chrome.runtime.sendMessage({ type: 'JOB_SCRAPED', job: stamped }).catch(() => {})
+}
+
+type DetailReadResult = {
+  job: ScrapedJob | null
+  ready: boolean
+}
+
+const DETAIL_SCRAPE_DELAYS_MS = [0, 200, 350, 550, 800, 1_000]
+
+function waitFor(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms))
+}
+
+/**
+ * Job boards hydrate the header before the description. A save must sample
+ * the live detail pane rather than the possibly stale `currentJob` snapshot.
+ */
+async function readReadyDetailJob(): Promise<DetailReadResult> {
+  let best: ScrapedJob | null = null
+
+  for (const delay of DETAIL_SCRAPE_DELAYS_MS) {
+    if (delay > 0) await waitFor(delay)
+    const candidate = detectAndScrape()
+    if (!candidate) continue
+    best = best ? mergeJobDetails(best, candidate) : candidate
+    if (isJobReadyForTailoring(best)) return { job: best, ready: true }
+  }
+
+  return { job: best, ready: false }
+}
+
+function setIncompleteJobSaveState(btn: HTMLButtonElement, mode: 'inline' | 'floating') {
+  btn.innerHTML = '<span>⚠ Details still loading</span>'
+  btn.style.setProperty('background', '#854F0B', 'important')
+  btn.style.setProperty('opacity', '1', 'important')
+  btn.disabled = false
+  delete btn.dataset.applymateBusy
+  showToast('The job description is not ready yet. Wait for the detail panel to finish loading, then try Save again.')
+  setTimeout(() => {
+    if (btn.isConnected && btn.dataset.applymateBusy !== 'true') setSaveButtonIdle(btn, mode)
+  }, 4_000)
+}
+
+function getVisibleDetailRoot(): HTMLElement | null {
+  const host = window.location.hostname
+  if (host.includes('linkedin.com')) {
+    const legacyRoot = document.querySelector<HTMLElement>(
+      '.jobs-search__job-details--container, .scaffold-layout__detail, .job-view-layout, .jobs-details__main-content'
+    )
+    // Current logged-in LinkedIn rolls out obfuscated detail-pane classes.
+    // Its native Saved/Unsave action remains a reliable detail anchor, and
+    // using its action row keeps SPA panel-refresh detection alive.
+    return legacyRoot ?? findDetailActionHost(document)
+  }
+  if (/indeed\./i.test(host)) {
+    const title = document.querySelector<HTMLElement>(
+      '[data-testid="jobsearch-JobInfoHeader-title"], #vjs-jobtitle, [data-testid="jobTitle"]'
+    )
+    return title?.closest<HTMLElement>(
+      '#jobsearch-ViewjobPaneWrapper, .jobsearch-ViewJobLayout--embedded, .jobsearch-JobComponent, #vjs-container, #vjs-details, #viewJobSSRRoot'
+    ) ?? document.querySelector<HTMLElement>(
+      '#jobsearch-ViewjobPaneWrapper, #vjs-container, #vjs-details, #viewJobSSRRoot, [data-testid="viewJobSSR"]'
+    )
+  }
+  return null
+}
+
+function getPanelSignature(): string {
+  const host = window.location.hostname
+  const root = getVisibleDetailRoot()
+  if (!root) return ''
+  const selector = host.includes('linkedin.com')
+    ? 'h1.job-details-jobs-unified-top-card__job-title, h1.t-24.t-bold, h1[class*="title"], [data-test-job-title], [data-job-name]'
+    : '[data-testid="jobsearch-JobInfoHeader-title"], [data-testid="jobDetailHeader"] h1, #vjs-jobtitle, [data-testid="jobTitle"]'
+  const title = root.querySelector<HTMLElement>(selector)?.innerText?.trim() ?? ''
+  const idEl = root.querySelector<HTMLElement>('[data-job-id], [data-occludable-job-id], [data-jk]')
+  const urlParams = new URLSearchParams(location.search)
+  const urlId = host.includes('linkedin.com')
+    ? (urlParams.get('currentJobId') || location.pathname.match(/\/jobs\/view\/(?:[^/?#]*-)?(\d{5,})(?:\/|$)/i)?.[1] || '')
+    : (urlParams.get('vjk') || urlParams.get('jk') || '')
+  const id = urlId || (
+    idEl?.getAttribute('data-job-id') ??
+    idEl?.getAttribute('data-occludable-job-id') ??
+    idEl?.getAttribute('data-jk') ?? ''
+  )
+  return `${location.href}|${id}|${title}`
+}
+
+function refreshVisiblePanelJob() {
+  if (!SHOULD_BOOTSTRAP_JOB_UI || !isJobListPage()) return
+  const signature = getPanelSignature()
+  const hasSaveButton = !!(
+    document.getElementById(BUTTON_ID) || document.getElementById('am-lazy-btn')
+  )
+  if (!signature || signature === lastSavedPanelSignature) return
+  if (signature === lastPanelSignature && hasSaveButton) return
+  if (signature !== lastPanelSignature) lastSavedPanelSignature = ''
+  lastPanelSignature = signature
+  if (panelRefreshTimer) clearTimeout(panelRefreshTimer)
+  panelRefreshTimer = setTimeout(() => {
+    panelRefreshTimer = null
+    if (getPanelSignature() !== signature) {
+      refreshVisiblePanelJob()
+      return
+    }
+    document.getElementById(BUTTON_ID)?.remove()
+    document.getElementById('am-lazy-btn')?.remove()
+    const job = detectAndScrape()
+    if (job) {
+      publishJob(job)
+      injectDetailButtons()
+      showDiagnosticBadge('panel-updated')
+    } else {
+      injectLazySaveButton()
+    }
+  }, 450)
+}
 
 // ── Visible diagnostic badge (appears bottom-right, shows init status) ───
 let diagnosticLabel = ''
@@ -125,6 +277,17 @@ async function init() {
     if (isList) {
       log('Detected LIST page — starting card injector')
       startListModeInjector()
+      // A board can change its card DOM without changing the URL. Keep a
+      // reliable page-level fallback so the user can still save the visible
+      // job even when no card selector matches the current experiment.
+      setTimeout(() => {
+        if (!document.querySelector('.applymate-card-btn') &&
+            !document.getElementById('am-lazy-btn') &&
+            !document.getElementById(BUTTON_ID)) {
+          log('List cards not matched — injecting fallback save button')
+          injectLazySaveButton()
+        }
+      }, 2500)
       // Immediately try panel detection, then retry on a timer
       // (LinkedIn/Indeed open job panels without URL changes)
       setTimeout(tryInjectPanelDetail, 1500)
@@ -145,6 +308,7 @@ async function init() {
         host.includes('bamboohr.com') ||
         host.includes('jobvite.com') ||
         host.includes('icims.com')
+        || host.includes('irishjobs.ie')
 
       log('🚀 isHighRisk:', isHighRisk, 'host:', host)
 
@@ -156,8 +320,7 @@ async function init() {
         currentJob = detectAndScrape()
         if (currentJob) {
           log('Detected DETAIL page — job scraped:', currentJob.title, '@', currentJob.company)
-          chrome.runtime.sendMessage({ type: 'JOB_SCRAPED', job: currentJob }).catch(() => {})
-          chrome.storage.local.set({ currentJob }).catch(() => {})
+          publishJob(currentJob)
           injectDetailButtons()
           showDiagnosticBadge('detail-scraped')
         } else {
@@ -251,8 +414,8 @@ function tryInjectPanelDetail() {
   const job = detectAndScrape()
   if (job) {
     currentJob = job
-    chrome.runtime.sendMessage({ type: 'JOB_SCRAPED', job }).catch(() => {})
-    chrome.storage.local.set({ currentJob: job }).catch(() => {})
+    publishJob(job)
+    lastPanelSignature = getPanelSignature()
     injectDetailButtons()
     showDiagnosticBadge('panel-injected')
     log('Panel detail injected:', job.title, '@', job.company)
@@ -306,8 +469,7 @@ function scheduleRetry() {
 
     currentJob = detectAndScrape()
     if (currentJob) {
-      chrome.runtime.sendMessage({ type: 'JOB_SCRAPED', job: currentJob }).catch(() => {})
-      chrome.storage.local.set({ currentJob }).catch(() => {})
+      publishJob(currentJob)
       injectDetailButtons()
       clearInterval(interval)
     }
@@ -326,7 +488,8 @@ if (SHOULD_BOOTSTRAP_JOB_UI) {
       return
     }
     let lastUrl = location.href
-    new MutationObserver(() => {
+    contentRuntimeGlobal.__applyMateJobUiCleanup?.()
+    const observer = new MutationObserver(() => {
       if (location.href !== lastUrl) {
         lastUrl = location.href
         document.getElementById(BUTTON_ID)?.remove()
@@ -340,7 +503,12 @@ if (SHOULD_BOOTSTRAP_JOB_UI) {
         setTimeout(tryInjectPanelDetail, 1500)
         setTimeout(tryInjectPanelDetail, 4000)
       }
-    }).observe(document.body, { subtree: true, childList: true })
+      // LinkedIn/Indeed can replace only the detail panel while keeping the
+      // same URL. Refresh only when the visible title/job id changes.
+      refreshVisiblePanelJob()
+    })
+    observer.observe(document.body, { subtree: true, childList: true })
+    contentRuntimeGlobal.__applyMateJobUiCleanup = () => observer.disconnect()
   }
   setupMutationObserver()
 }
@@ -421,12 +589,32 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 
 // Simplified: content script directly fetches the token from the same-origin API.
 // No more MAIN-world injection / DOM attribute dance — just one fetch call.
+function getSyncStorage(): chrome.storage.StorageArea | null {
+  try {
+    if (typeof chrome === 'undefined' || !chrome.storage?.sync) return null
+    return chrome.storage.sync
+  } catch {
+    // Content scripts can briefly outlive an extension reload, or be executed
+    // in a page context without the extension storage API. Treat that as a
+    // missing optional sync channel instead of throwing from a Promise.
+    return null
+  }
+}
+
 async function syncFromDashboard() {
   const meta = document.querySelector('meta[name="applymate:user"]') as HTMLMetaElement | null
   if (!meta?.content) return
 
   const currentOrigin = window.location.origin // e.g. http://localhost:3000
-  const result = await chrome.storage.sync.get('settings')
+  const syncStorage = getSyncStorage()
+  if (!syncStorage) return
+
+  let result: { settings?: Partial<ExtensionSettings> }
+  try {
+    result = await syncStorage.get('settings') as typeof result
+  } catch {
+    return
+  }
   const s = result.settings ?? {}
 
   // Only skip if token exists AND email matches AND stored apiBaseUrl matches current origin
@@ -439,7 +627,7 @@ async function syncFromDashboard() {
     const res = await fetch('/api/auth/me/extension-token')
     if (!res.ok) throw new Error(`HTTP ${res.status}`)
     const data = await res.json()
-    await chrome.storage.sync.set({
+    await syncStorage.set({
       settings: {
         ...s,
         apiBaseUrl: currentOrigin,
@@ -464,31 +652,23 @@ if (IS_DASHBOARD_PAGE) {
   })
 }
 
-// Direction 2: Extension ↔ Dashboard (bidirectional via postMessage)
-
-function pushToDashboard(token: string, email: string) {
-  window.postMessage({ type: 'APPLYMATE_TOKEN', token, email }, window.location.origin)
-  log('Pushed extension token to dashboard')
-}
-
-function pushLogoutToDashboard() {
-  window.postMessage({ type: 'APPLYMATE_LOGOUT' }, window.location.origin)
-  log('Pushed extension logout to dashboard')
-}
-
-// Listen for dashboard logout → clear extension auth
+// Dashboard logout clears extension auth. Login is intentionally one-way:
+// an old extension token must never replace the active dashboard account.
 window.addEventListener('message', (e) => {
   if (e.origin !== window.location.origin) return
   if (e.data?.type === 'DASHBOARD_LOGOUT') {
     log('Dashboard logged out — clearing extension auth')
-    chrome.storage.sync.get('settings', (result) => {
+    const syncStorage = getSyncStorage()
+    if (!syncStorage) return
+    void syncStorage.get('settings').then((result) => {
       const s = result.settings ?? {}
       if (s.apiToken) {
-        chrome.storage.sync.set({
+        return syncStorage.set({
           settings: { ...s, apiToken: '', userEmail: '', userName: '' }
         })
       }
-    })
+      return undefined
+    }).catch(() => undefined)
   }
 })
 
@@ -501,7 +681,15 @@ if (IS_DASHBOARD_PAGE) {
 
 // ── Listen for login/logout changes from popup ──────────────────────────────
 
-chrome.storage.onChanged.addListener((changes, area) => {
+const syncStorageEvents = (() => {
+  try {
+    return typeof chrome !== 'undefined' ? chrome.storage?.onChanged ?? null : null
+  } catch {
+    return null
+  }
+})()
+
+syncStorageEvents?.addListener((changes, area) => {
   if (area !== 'sync') return
   const settingsChange = changes.settings
   if (!settingsChange) return
@@ -518,14 +706,13 @@ chrome.storage.onChanged.addListener((changes, area) => {
       ;(saveBtn as HTMLButtonElement).style.background = '#4F46E5'
       ;(saveBtn as HTMLButtonElement).style.opacity = '1'
     }
-    pushLogoutToDashboard()
     window.dispatchEvent(new CustomEvent('applymate:logout'))
   }
 
-  // User logged in via extension popup → push to dashboard
+  // The popup can change extension credentials, but the dashboard keeps its
+  // own explicit session so a stale token cannot silently switch users.
   if (!oldToken && newToken) {
     log('Extension logged in as:', settingsChange.newValue?.userEmail)
-    pushToDashboard(newToken, settingsChange.newValue?.userEmail ?? '')
     window.dispatchEvent(new CustomEvent('applymate:login'))
   }
 })
@@ -581,9 +768,11 @@ function styleDetailContainer(el: HTMLElement, mode: 'inline' | 'floating') {
 
 function setSaveButtonIdle(btn: HTMLButtonElement, mode: 'inline' | 'floating') {
   btn.innerHTML = `<span style="font-size:14px;line-height:1">⊕</span><span>Save to ApplyMate</span>`
-  btn.style.background = '#4F46E5'
-  btn.style.opacity = '1'
-  btn.style.paddingRight = mode === 'inline' ? '16px' : '14px'
+  btn.style.setProperty('background', '#4F46E5', 'important')
+  btn.style.setProperty('opacity', '1', 'important')
+  btn.style.setProperty('padding-right', mode === 'inline' ? '16px' : '14px', 'important')
+  btn.disabled = false
+  delete btn.dataset.applymateBusy
 }
 
 // Lazy save button for high-risk platforms (LinkedIn, Indeed):
@@ -598,6 +787,8 @@ function injectLazySaveButton() {
   log('🔵 Creating button element...')
   const btn = document.createElement('button')
   btn.id = 'am-lazy-btn'
+  btn.type = 'button'
+  btn.dataset.applymateRole = 'detail-save'
   btn.innerHTML = `<span style="font-size:14px;line-height:1">⊕</span><span>Save to ApplyMate</span>`
   log('🔵 Placing button via mountDetailButtonContainer...')
   const mode = mountDetailButtonContainer(btn)
@@ -605,28 +796,43 @@ function injectLazySaveButton() {
   styleDetailContainer(btn, mode)
   applySaveButtonStyle(btn, mode)
   log('🔵 Button styled, width:', btn.offsetWidth, 'height:', btn.offsetHeight, 'rect:', JSON.stringify(btn.getBoundingClientRect()))
-  btn.addEventListener('mouseenter', () => { btn.style.background = '#4338CA'; btn.style.paddingRight = mode === 'inline' ? '18px' : '18px' })
-  btn.addEventListener('mouseleave', () => { btn.style.background = '#4F46E5'; btn.style.paddingRight = mode === 'inline' ? '16px' : '14px' })
+  btn.addEventListener('mouseenter', () => {
+    btn.style.setProperty('background', '#4338CA', 'important')
+    btn.style.setProperty('padding-right', '18px', 'important')
+  })
+  btn.addEventListener('mouseleave', () => {
+    if (btn.dataset.applymateBusy === 'true') return
+    btn.style.setProperty('background', '#4F46E5', 'important')
+    btn.style.setProperty('padding-right', mode === 'inline' ? '16px' : '14px', 'important')
+  })
 
   btn.addEventListener('click', async (e) => {
     e.preventDefault(); e.stopPropagation()
+    if (btn.dataset.applymateBusy === 'true') return
+    btn.dataset.applymateBusy = 'true'
+    btn.disabled = true
     log('Lazy save button clicked — scraping on demand')
     btn.innerHTML = '<span>Scanning…</span>'
-    btn.style.opacity = '0.7'
+    btn.style.setProperty('opacity', '0.7', 'important')
 
-    // Scrape ONLY on user click — no pre-load scraping
-    currentJob = detectAndScrape()
-    if (!currentJob) {
+    // Scrape on user click, then wait for the asynchronously hydrated job
+    // description instead of persisting the earlier header-only snapshot.
+    const detailRead = await readReadyDetailJob()
+    if (!detailRead.job) {
       btn.innerHTML = '✗ No job found'
-      btn.style.background = '#A32D2D'
+      btn.style.setProperty('background', '#A32D2D', 'important')
       setTimeout(() => setSaveButtonIdle(btn, mode), 3000)
-      btn.style.opacity = '1'
+      btn.style.setProperty('opacity', '1', 'important')
       return
     }
+    if (!detailRead.ready) {
+      setIncompleteJobSaveState(btn, mode)
+      return
+    }
+    currentJob = detailRead.job
 
     log('Job scraped on demand:', currentJob.title, '@', currentJob.company)
-    chrome.runtime.sendMessage({ type: 'JOB_SCRAPED', job: currentJob }).catch(() => {})
-    chrome.storage.local.set({ currentJob }).catch(() => {})
+    publishJob(currentJob)
 
     // Now save
     btn.innerHTML = '<span>Saving…</span>'
@@ -634,26 +840,27 @@ function injectLazySaveButton() {
       const response = await chrome.runtime.sendMessage({ type: 'SAVE_JOB', job: currentJob })
       if (response?.success) {
         btn.innerHTML = '✓ Saved!'
-        btn.style.background = '#3B6D11'
-        btn.style.opacity = '1'
+        btn.style.setProperty('background', '#3B6D11', 'important')
+        btn.style.setProperty('opacity', '1', 'important')
         showToast(`Saved: ${currentJob.title} @ ${currentJob.company}`)
+        lastSavedPanelSignature = getPanelSignature()
         setTimeout(() => btn.remove(), 2500)
       } else {
         const msg = response?.error ?? 'Save failed'
         if (msg.includes('Not logged in') || msg.includes('login') || msg.includes('Unauthorized')) {
           btn.innerHTML = '⚡ Log in first'
-          btn.style.background = '#854F0B'
+          btn.style.setProperty('background', '#854F0B', 'important')
         } else {
           btn.innerHTML = '✗ Error'
-          btn.style.background = '#A32D2D'
+          btn.style.setProperty('background', '#A32D2D', 'important')
         }
-        btn.style.opacity = '1'
+        btn.style.setProperty('opacity', '1', 'important')
         setTimeout(() => setSaveButtonIdle(btn, mode), 4000)
       }
     } catch (err: unknown) {
       btn.innerHTML = '💥 No connection'
-      btn.style.background = '#A32D2D'
-      btn.style.opacity = '1'
+      btn.style.setProperty('background', '#A32D2D', 'important')
+      btn.style.setProperty('opacity', '1', 'important')
       setTimeout(() => setSaveButtonIdle(btn, mode), 4000)
     }
   })
@@ -680,72 +887,102 @@ function injectDetailButtons() {
 
   // ── Save button ──
   const saveBtn = document.createElement('button')
+  saveBtn.type = 'button'
+  saveBtn.dataset.applymateRole = 'detail-save'
   saveBtn.innerHTML = `<span style="font-size:14px;line-height:1">⊕</span><span>Save to ApplyMate</span>`
   wrap.appendChild(saveBtn)
   const mode = mountDetailButtonContainer(wrap)
   styleDetailContainer(wrap, mode)
   applySaveButtonStyle(saveBtn, mode)
   saveBtn.addEventListener('mouseenter', () => {
-    saveBtn.style.background = '#4338CA'
-    saveBtn.style.paddingRight = mode === 'inline' ? '18px' : '18px'
+    saveBtn.style.setProperty('background', '#4338CA', 'important')
+    saveBtn.style.setProperty('padding-right', '18px', 'important')
   })
   saveBtn.addEventListener('mouseleave', () => {
-    saveBtn.style.background = '#4F46E5'
-    saveBtn.style.paddingRight = mode === 'inline' ? '16px' : '14px'
+    if (saveBtn.dataset.applymateBusy === 'true') return
+    saveBtn.style.setProperty('background', '#4F46E5', 'important')
+    saveBtn.style.setProperty('padding-right', mode === 'inline' ? '16px' : '14px', 'important')
   })
   saveBtn.addEventListener('click', (e) => {
     e.preventDefault(); e.stopPropagation()
+    if (saveBtn.dataset.applymateBusy === 'true') return
     log('Detail Save button clicked')
-    saveDetailJob(saveBtn, wrap)
+    saveDetailJob(saveBtn, wrap, mode)
   })
 
   log('Detail save button injected', mode)
 }
 
-async function saveDetailJob(btn: HTMLButtonElement, wrap: HTMLElement) {
-  if (!currentJob) return
-  log('Saving detail job:', currentJob.title)
-
+async function saveDetailJob(btn: HTMLButtonElement, wrap: HTMLElement, mode: 'inline' | 'floating') {
   const original = btn.innerHTML
-  btn.innerHTML = '<span>Saving…</span>'
-  btn.style.opacity = '0.7'
+  btn.dataset.applymateBusy = 'true'
+  btn.disabled = true
+  btn.innerHTML = '<span>Reading job details…</span>'
+  btn.style.setProperty('opacity', '0.7', 'important')
 
   try {
+    const detailRead = await readReadyDetailJob()
+    if (!detailRead.job) {
+      btn.innerHTML = '✗ No job found'
+      btn.style.setProperty('background', '#A32D2D', 'important')
+      btn.disabled = false
+      delete btn.dataset.applymateBusy
+      return
+    }
+    if (!detailRead.ready) {
+      setIncompleteJobSaveState(btn, mode)
+      return
+    }
+    currentJob = detailRead.job
+    publishJob(currentJob)
+    log('Saving fresh detail job:', currentJob.title)
+    btn.innerHTML = '<span>Saving…</span>'
     const response = await chrome.runtime.sendMessage({ type: 'SAVE_JOB', job: currentJob })
     log('SAVE_JOB response:', response)
 
     if (response?.success) {
       btn.innerHTML = '✓ Saved!'
-      btn.style.background = '#3B6D11'
-      btn.style.opacity    = '1'
+      btn.style.setProperty('background', '#3B6D11', 'important')
+      btn.style.setProperty('opacity', '1', 'important')
       showToast(`Saved: ${currentJob.title} @ ${currentJob.company}`)
+      lastSavedPanelSignature = getPanelSignature()
       setTimeout(() => wrap.remove(), 2500)
     } else {
       const msg = response?.error ?? 'Save failed'
       log('Save failed:', msg)
       if (msg.includes('Not logged in') || msg.includes('login') || msg.includes('logged') || msg.includes('Unauthorized')) {
         btn.innerHTML = '⚡ Log in first'
-        btn.style.background = '#854F0B'
+        btn.style.setProperty('background', '#854F0B', 'important')
         showToast('Not logged in — click the ApplyMate icon in the toolbar to log in.')
       } else if (msg.includes('fetch') || msg.includes('network') || msg.includes('Failed to fetch')) {
         btn.innerHTML = '🔌 API offline'
-        btn.style.background = '#A32D2D'
+        btn.style.setProperty('background', '#A32D2D', 'important')
         showToast('Cannot reach ApplyMate server. Is the backend running?')
       } else {
         btn.innerHTML = '✗ Error'
-        btn.style.background = '#A32D2D'
+        btn.style.setProperty('background', '#A32D2D', 'important')
         showToast('Error: ' + msg)
       }
+      btn.disabled = false
+      delete btn.dataset.applymateBusy
     }
   } catch (err: unknown) {
     log('SAVE_JOB threw:', err)
     const message = err instanceof Error ? err.message : String(err)
     btn.innerHTML = '💥 No connection'
-    btn.style.background = '#A32D2D'
+    btn.style.setProperty('background', '#A32D2D', 'important')
+    btn.disabled = false
+    delete btn.dataset.applymateBusy
     showToast('Cannot reach extension. Try reloading at chrome://extensions/ (error: ' + message + ')')
   }
-  btn.style.opacity = '1'
-  setTimeout(() => { btn.innerHTML = original; btn.style.background = '#4F46E5' }, 4000)
+  btn.style.setProperty('opacity', '1', 'important')
+  setTimeout(() => {
+    // A successful save keeps the busy marker until the wrapper is removed.
+    // Failed saves clear it above and become reusable after this short status.
+    if (!btn.isConnected || btn.dataset.applymateBusy === 'true') return
+    btn.innerHTML = original
+    btn.style.setProperty('background', '#4F46E5', 'important')
+  }, 4000)
 }
 
 function showToast(message: string, duration = 4000) {

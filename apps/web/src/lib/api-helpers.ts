@@ -1,4 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server'
+import { headers } from 'next/headers'
 import { jwtVerify } from 'jose'
 import { checkRateLimit } from '@/lib/rate-limit'
 import { resolveFeatureConfig, type UserAiSettings, type FeatureId } from '@/lib/model-router'
@@ -13,27 +14,26 @@ const JWT_SECRET = new TextEncoder().encode(
 export async function requireAuth(
   req?: NextRequest,
 ): Promise<{ userId: string } | NextResponse> {
-  // 1. Extension Bearer token (x-user-id header set by middleware)
-  if (req) {
-    const uid = req.headers.get('x-user-id')
-    if (uid) return { userId: uid }
-
-    // 2. Extension Bearer token (direct verification — fallback)
-    const authHeader = req.headers.get('authorization')
-    if (authHeader?.startsWith('Bearer ')) {
-      const token = authHeader.slice(7)
-      try {
-        const { payload } = await jwtVerify(token, JWT_SECRET)
-        if (payload.sub) {
-          return { userId: payload.sub as string }
-        }
-      } catch {
-        // token invalid — fall through to session check
+  // Extension Bearer token. Do not trust x-user-id: it is a client-settable
+  // header unless every proxy strips it before the request reaches this route.
+  // `headers()` keeps token auth working for GET handlers that do not declare
+  // a NextRequest parameter.
+  const authHeader = req
+    ? req.headers.get('authorization')
+    : (await headers()).get('authorization')
+  if (authHeader?.startsWith('Bearer ')) {
+    const token = authHeader.slice(7)
+    try {
+      const { payload } = await jwtVerify(token, JWT_SECRET)
+      if (payload.sub) {
+        return { userId: payload.sub as string }
       }
+    } catch {
+      // Token invalid — fall through to session check.
     }
   }
 
-  // 3. NextAuth session (web app)
+  // NextAuth session (web app)
   const session = await safeAuth()
   if (session?.user?.id) return { userId: session.user.id }
 

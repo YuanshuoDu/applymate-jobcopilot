@@ -21,4 +21,13 @@ describe('API response cache', () => {
 
     expect(getCachedApiResponse<{ total: number }>('/api/dashboard')).toEqual({ total: 5 })
   })
+
+  it('keeps the same endpoint isolated between users', () => {
+    setCachedApiResponse('/api/jobs', { total: 4 }, 'user-a')
+    setCachedApiResponse('/api/jobs', { total: 1 }, 'user-b')
+
+    expect(getCachedApiResponse<{ total: number }>('/api/jobs', 'user-a')).toEqual({ total: 4 })
+    expect(getCachedApiResponse<{ total: number }>('/api/jobs', 'user-b')).toEqual({ total: 1 })
+    expect(getCachedApiResponse('/api/jobs')).toBeNull()
+  })
 })

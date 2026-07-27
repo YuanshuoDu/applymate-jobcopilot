@@ -1,6 +1,7 @@
 'use client'
 
 import React, { useMemo, useState, useEffect, useRef, useCallback } from 'react'
+import { useSession } from 'next-auth/react'
 import { Bookmark, Check, ChevronDown, ChevronRight, Clock3, FileText, Info, LayoutGrid, Link2, List, LoaderCircle, Lock, Search, Sparkles, Trash2, UsersRound, X } from 'lucide-react'
 import { Btn, Card, CompanyLogo, INPUT_STYLE, ScorePill, StatusBadge, useToast, useConfirm } from '@/components/ui'
 import { ResumeRenderer } from '@/components/resume/ResumeRenderer'
@@ -22,6 +23,7 @@ const COL_COLORS: Record<JobStatus, string> = {
 }
 
 interface JobsPageCache {
+  userId: string
   jobs: Job[]
   total: number
 }
@@ -1184,15 +1186,18 @@ function ScoreJobButton({ job, onUpdate }: { job: Job; onUpdate: (updated: Job) 
 export function JobsPage() {
   const toast = useToast()
   const { navigate } = useNav()
+  const { data: session } = useSession()
+  const userId = session?.user?.id ?? ''
+  const cachedJobs = defaultJobsCache?.userId === userId ? defaultJobsCache : null
   const [confirm, ConfirmDialog] = useConfirm()
   const [view,         setView        ] = useState<'list' | 'kanban'>('list')
   const [search,       setSearch      ] = useState('')
   const [filterStatus, setFilterStatus] = useState<'all' | JobStatus>('all')
   const [showAdd,      setShowAdd     ] = useState(false)
   const [prefillStatus, setPrefillStatus] = useState<JobStatus | null>(null)
-  const [jobs,         setJobs        ] = useState<Job[]>(() => defaultJobsCache?.jobs ?? [])
-  const [total,        setTotal       ] = useState(() => defaultJobsCache?.total ?? 0)
-  const [loading,      setLoading     ] = useState(() => defaultJobsCache === null)
+  const [jobs,         setJobs        ] = useState<Job[]>(() => cachedJobs?.jobs ?? [])
+  const [total,        setTotal       ] = useState(() => cachedJobs?.total ?? 0)
+  const [loading,      setLoading     ] = useState(() => cachedJobs === null)
   const [fetchError,   setFetchError  ] = useState<string | null>(null)
   const [selectedJob,  setSelectedJob ] = useState<Job | null>(null)
   const [page,         setPage        ] = useState(1)
@@ -1219,7 +1224,7 @@ export function JobsPage() {
     const controller = new AbortController()
     const timer = setTimeout(async () => {
       const isDefaultView = !search && filterStatus === 'all' && page === 1 && pageSize === 20
-      setLoading(!isDefaultView || defaultJobsCache === null)
+      setLoading(!isDefaultView || defaultJobsCache?.userId !== userId)
       setFetchError(null)
       try {
         const params = new URLSearchParams({ page: String(page), pageSize: String(pageSize) })
@@ -1231,7 +1236,7 @@ export function JobsPage() {
           const rawJobs: Job[] = json.jobs ?? []
           const sorted = sortJobs(rawJobs, sortByRef.current, sortDirRef.current)
           const nextTotal = json.total ?? 0
-          if (isDefaultView) defaultJobsCache = { jobs: sorted, total: nextTotal }
+          if (isDefaultView) defaultJobsCache = { userId, jobs: sorted, total: nextTotal }
           setJobs(sorted)
           setTotal(nextTotal)
         }
@@ -1243,7 +1248,7 @@ export function JobsPage() {
       }
     }, search ? 300 : 0)
     return () => { cancelled = true; controller.abort(); clearTimeout(timer) }
-  }, [search, filterStatus, page, pageSize, refreshTick])
+  }, [search, filterStatus, page, pageSize, refreshTick, userId])
 
   // Sorting is entirely local: avoid turning a simple UI operation into a
   // round-trip to the jobs API.

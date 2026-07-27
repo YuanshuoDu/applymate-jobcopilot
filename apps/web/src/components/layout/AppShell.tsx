@@ -2,7 +2,7 @@
 
 import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react'
 import dynamic from 'next/dynamic'
-import { useSession, signIn, signOut } from 'next-auth/react'
+import { useSession, signOut } from 'next-auth/react'
 import { useRouter } from 'next/navigation'
 import { Bell } from 'lucide-react'
 import { Sidebar } from './Sidebar'
@@ -10,6 +10,7 @@ import { ToastProvider } from '@/components/ui'
 import type { Page } from '@/lib/types'
 import { NavContext } from '@/lib/nav-context'
 import { OnboardingFlow } from '@/components/onboarding/OnboardingFlow'
+import { clearCachedApiResponses } from '@/lib/api-cache'
 
 function PageLoading() {
   return <div style={{ flex: 1, display: 'grid', placeItems: 'center', color: 'var(--text-muted)', fontSize: 13 }}>Loading page…</div>
@@ -151,9 +152,10 @@ export function AppShell() {
   const [jobCount, setJobCount] = useState(0)
   const { data: session, status } = useSession()
   const router = useRouter()
-  const loginSyncInProgress = useRef<boolean>(false)
   const initialPageRef = useRef(page)
+  const previousUserIdRef = useRef<string | null>(null)
   const PageComp = PAGES[page]
+  const activeUserId = session?.user?.id ?? null
 
   const [checkingOnboard, setCheckingOnboard] = useState(true)
   const [needsOnboarding, setNeedsOnboarding] = useState(false)
@@ -230,33 +232,17 @@ export function AppShell() {
     }
   }, [status, session])
 
-  // Listen for extension messages (login / logout)
+  // A client-side account switch must never reuse another user's cached API
+  // response or mounted page state. The extension is deliberately one-way
+  // synced from this authoritative web session, never the other direction.
   useEffect(() => {
-    function handleMessage(e: MessageEvent) {
-      if (e.origin !== window.location.origin) return
-
-      if (e.data?.type === 'APPLYMATE_TOKEN' && e.data?.token) {
-        if (status === 'authenticated') return // already logged in
-        if (loginSyncInProgress.current) return
-        loginSyncInProgress.current = true
-
-        try {
-          signIn('credentials', { token: e.data.token as string, redirect: false })
-            .then(() => { loginSyncInProgress.current = false })
-            .catch(() => { loginSyncInProgress.current = false })
-        } catch {
-          loginSyncInProgress.current = false
-        }
-      }
-
-      if (e.data?.type === 'APPLYMATE_LOGOUT') {
-        if (status !== 'authenticated') return
-        signOut({ redirect: false })
-      }
+    const previousUserId = previousUserIdRef.current
+    if (previousUserId && previousUserId !== activeUserId) {
+      clearCachedApiResponses()
+      window.dispatchEvent(new Event('applymate:identity-changed'))
     }
-    window.addEventListener('message', handleMessage)
-    return () => window.removeEventListener('message', handleMessage)
-  }, [status])
+    previousUserIdRef.current = activeUserId
+  }, [activeUserId])
 
   // Notify extension when dashboard logs out
   useEffect(() => {
@@ -425,7 +411,7 @@ export function AppShell() {
                 />
               </div>
               <div id="main-content" style={{ flex: 1, display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
-                <PageComp />
+                <PageComp key={activeUserId ?? 'anonymous'} />
               </div>
             </div>
 

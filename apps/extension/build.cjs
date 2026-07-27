@@ -53,16 +53,26 @@ for (const name of chunksToInline) {
 const finalBg = inlinedChunks + bgJs
 fs.writeFileSync(path.join(DIST, 'background.js'), finalBg)
 
-// Vite emits the content entry as a flat script. Chrome can execute it both
-// declaratively and through the side panel's manual injection. Without an
-// outer function, a second execution redeclares top-level constants such as
-// ATTR before any runtime guard can run. Wrap in an IIFE for try-catch
-// protection only — no state guard, because extension reload preserves the
-// isolated world's globalThis and a stale 'ready' flag would skip execution.
+// Vite emits the content entry as a flat script. Chrome executes this file
+// declaratively and also manually when the user opens a supported tab. Guard
+// same-version reinjection so old observers/listeners cannot accumulate.
 const contentPath = path.join(DIST, 'content.js')
 if (fs.existsSync(contentPath)) {
   const contentJs = fs.readFileSync(contentPath, 'utf-8')
+  // A reload of an unpacked extension can keep the page's isolated-world
+  // globals while replacing chrome.runtime. Give each build a fresh marker so
+  // the new script can replace that invalidated context even if the manifest
+  // version has not changed.
+  const buildMarker = JSON.stringify(`${manifest.version_name || manifest.version}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`)
   const wrappedContent = `;(() => {\n` +
+    `  const existing = globalThis.__applyMateContentRuntime;\n` +
+    `  if (existing?.marker === ${buildMarker}) {\n` +
+    `    try { if (existing.isAlive?.()) return; } catch {}\n` +
+    `  }\n` +
+    `  try { existing?.dispose?.(); } catch (error) {\n` +
+    `    console.warn('[ApplyMate] Previous content cleanup failed:', error);\n` +
+    `  }\n` +
+    `  globalThis.__applyMateContentBuild = ${buildMarker};\n` +
     `  try {\n` +
     contentJs.split('\n').map(line => `    ${line}`).join('\n') +
     `  } catch (error) {\n` +

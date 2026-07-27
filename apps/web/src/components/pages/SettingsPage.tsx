@@ -159,7 +159,7 @@ export function SettingsPage() {
   // Merge real connections with static config
   const accounts = useMemo(() => {
     return CONNECTED_ACCOUNTS.map(acc => {
-      const conn = connectedProviders.find(c => c.provider === acc.id || (acc.id === 'gmail' && c.provider === 'google'))
+      const conn = connectedProviders.find(c => c.provider === acc.id)
       return conn ? { ...acc, connected: true, account: conn.account } : acc
     })
   }, [connectedProviders])
@@ -417,8 +417,8 @@ export function SettingsPage() {
                               fetch('/api/me/accounts', {
                                 method: 'DELETE',
                                 headers: { 'Content-Type': 'application/json' },
-                                body: JSON.stringify({ provider: 'google' }),
-                              }).then(() => signIn('google', { callbackUrl: window.location.origin + '/?page=settings' }))
+                                body: JSON.stringify({ provider: 'gmail' }),
+                              }).then(() => { window.location.assign('/api/gmail/oauth/start?returnTo=/?page=settings&transfer=1') })
                             }}>Fix Gmail Access</Btn>
                           ) : (
                             <span style={{ fontSize: 10, color: 'var(--c-success)', background: 'rgba(5,150,105,0.12)', borderRadius: 999, padding: '2px 8px' }}>● Connected</span>
@@ -428,7 +428,7 @@ export function SettingsPage() {
                               await fetch('/api/me/accounts', {
                                 method: 'DELETE',
                                 headers: { 'Content-Type': 'application/json' },
-                                body: JSON.stringify({ provider: 'google' }),
+                                body: JSON.stringify({ provider: 'gmail' }),
                               })
                               fetch('/api/me/accounts')
                                 .then(r => r.json())
@@ -445,7 +445,7 @@ export function SettingsPage() {
                       ) : (
                         <Btn small variant="primary" onClick={() => {
                           if (isGmail) {
-                            signIn('google', { callbackUrl: window.location.origin + '/?page=settings' })
+                            window.location.assign('/api/gmail/oauth/start?returnTo=/?page=settings&transfer=1')
                           } else if (acc.id === 'github') {
                             signIn('github', { callbackUrl: window.location.origin + '/?page=settings' })
                           } else {

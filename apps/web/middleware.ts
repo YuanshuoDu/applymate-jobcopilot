@@ -4,7 +4,7 @@ import { jwtVerify } from 'jose'
 import { auth } from '@/lib/auth'
 
 const API_PROTECTED = ['/api/jobs', '/api/dashboard', '/api/resume', '/api/activity', '/api/agent', '/api/me']
-const PUBLIC_ROUTES = ['/login', '/register', '/forgot-password', '/api/auth']
+const PUBLIC_ROUTES = ['/login', '/register', '/forgot-password', '/reset-password', '/api/auth']
 
 const JWT_SECRET = new TextEncoder().encode(
   process.env.AUTH_SECRET ?? 'fallback-secret-change-this',

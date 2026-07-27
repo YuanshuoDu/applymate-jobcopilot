@@ -29,6 +29,9 @@ export async function DELETE(req: NextRequest) {
 
   const { provider } = await req.json().catch(() => ({}))
   if (!provider) return err('provider is required', 400)
+  if (provider === 'google') {
+    return err('Google sign-in identity cannot be disconnected from Gmail settings', 400)
+  }
 
   await db.account.deleteMany({
     where: { userId: auth.userId, provider },

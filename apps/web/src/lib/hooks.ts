@@ -1,6 +1,7 @@
 'use client'
 
 import { useState, useEffect, useCallback } from 'react'
+import { useSession } from 'next-auth/react'
 import { getCachedApiResponse, setCachedApiResponse } from './api-cache'
 
 // ── Generic GET hook ──────────────────────────────────────────────────────────
@@ -11,8 +12,10 @@ import { getCachedApiResponse, setCachedApiResponse } from './api-cache'
  * the existing loading state.
  */
 export function useApi<T>(url: string) {
-  const [data,    setData   ] = useState<T | null>(() => getCachedApiResponse<T>(url))
-  const [loading, setLoading] = useState(() => getCachedApiResponse<T>(url) === null)
+  const { data: session, status } = useSession()
+  const userId = status === 'authenticated' ? session.user?.id ?? null : null
+  const [data,    setData   ] = useState<T | null>(() => getCachedApiResponse<T>(url, userId))
+  const [loading, setLoading] = useState(() => getCachedApiResponse<T>(url, userId) === null)
   const [error,   setError  ] = useState<string | null>(null)
 
   const load = useCallback(async (showLoading: boolean, signal?: AbortSignal) => {
@@ -23,23 +26,23 @@ export function useApi<T>(url: string) {
       const json = await res.json().catch(() => ({}))
       if (!res.ok) throw new Error((json as { error?: string }).error ?? 'Request failed')
       const nextData = json as T
-      setCachedApiResponse(url, nextData)
+      setCachedApiResponse(url, nextData, userId)
       setData(nextData)
     } catch (e) {
       if (e instanceof DOMException && e.name === 'AbortError') return
       // Preserve usable cached data if a background refresh temporarily fails.
-      if (getCachedApiResponse<T>(url) === null) {
+      if (getCachedApiResponse<T>(url, userId) === null) {
         setError(e instanceof Error ? e.message : 'Unknown error')
       }
     } finally {
       if (!signal?.aborted) setLoading(false)
     }
-  }, [url])
+  }, [url, userId])
 
   const refetch = useCallback(() => load(true), [load])
 
   useEffect(() => {
-    const cached = getCachedApiResponse<T>(url)
+    const cached = getCachedApiResponse<T>(url, userId)
     const controller = new AbortController()
     // URLs can change while a page remains mounted (for example the Dashboard
     // week picker). Reset to that URL's cached response rather than retaining
@@ -48,7 +51,7 @@ export function useApi<T>(url: string) {
     setLoading(cached === null)
     void load(cached === null, controller.signal)
     return () => controller.abort()
-  }, [load])
+  }, [load, url, userId])
 
   return { data, loading, error, refetch }
 }

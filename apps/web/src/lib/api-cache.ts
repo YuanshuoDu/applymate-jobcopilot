@@ -6,12 +6,18 @@ interface ApiCacheEntry {
 // across browser sessions. Callers still revalidate every time they mount.
 const apiCache = new Map<string, ApiCacheEntry>()
 
-export function getCachedApiResponse<T>(url: string): T | null {
-  return (apiCache.get(url)?.value as T | undefined) ?? null
+function cacheKey(url: string, userId?: string | null): string {
+  // API routes are almost all user-specific. Keep anonymous responses separate
+  // as well so a response cannot survive a sign-in or account switch.
+  return `${userId ?? 'anonymous'}\u0000${url}`
 }
 
-export function setCachedApiResponse<T>(url: string, value: T) {
-  apiCache.set(url, { value })
+export function getCachedApiResponse<T>(url: string, userId?: string | null): T | null {
+  return (apiCache.get(cacheKey(url, userId))?.value as T | undefined) ?? null
+}
+
+export function setCachedApiResponse<T>(url: string, value: T, userId?: string | null) {
+  apiCache.set(cacheKey(url, userId), { value })
 }
 
 export function clearCachedApiResponses() {

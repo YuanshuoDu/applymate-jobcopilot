@@ -8,17 +8,29 @@
  * Key difference from NextAuth's /api/auth/callback/google: this never changes
  * the session identity. It just attaches Google tokens to the existing user.
  *
- * Handles the unique([provider, providerAccountId]) conflict: if the Google
- * account is already linked to a *different* user record, that stale row is
- * removed first so the current user can take ownership of the tokens.
+ * A Gmail integration belongs to one ApplyMate user at a time. A user may
+ * explicitly move it by starting OAuth with transfer=1 and authorizing Google.
  */
 import { NextRequest, NextResponse } from 'next/server'
 import { jwtVerify } from 'jose'
 import { db } from '@/lib/db'
+import { GMAIL_ACCOUNT_PROVIDER } from '@/lib/gmail-helpers'
+import { canRecoverStaleGmailConnection } from '@/lib/gmail-connection-recovery'
 
 const JWT_SECRET = new TextEncoder().encode(
   process.env.AUTH_SECRET ?? 'fallback-secret-change-this',
 )
+
+function safeReturnTo(value: unknown): string | null {
+  if (typeof value !== 'string' || !value.startsWith('/')) return null
+  try {
+    const base = 'https://applymate.invalid'
+    const parsed = new URL(value, base)
+    return parsed.origin === base ? `${parsed.pathname}${parsed.search}${parsed.hash}` : null
+  } catch {
+    return null
+  }
+}
 
 export async function GET(req: NextRequest) {
   const url   = new URL(req.url)
@@ -26,9 +38,10 @@ export async function GET(req: NextRequest) {
   const state = url.searchParams.get('state')
   const errParam = url.searchParams.get('error')
 
+  let returnTo = '/?page=gmail'
+  let transferRequested = false
   const back = (msg: string) => {
-    const u = new URL('/', req.url)
-    u.searchParams.set('page', 'gmail')
+    const u = new URL(returnTo, req.url)
     u.searchParams.set('gmailError', msg)
     return NextResponse.redirect(u)
   }
@@ -45,6 +58,8 @@ export async function GET(req: NextRequest) {
     const { payload } = await jwtVerify(state, JWT_SECRET)
     if (!payload.uid || typeof payload.uid !== 'string') return back('invalid_state')
     userId = payload.uid
+    returnTo = safeReturnTo(payload.returnTo) ?? returnTo
+    transferRequested = payload.transfer === true
   } catch (e) {
     console.error('[gmail/oauth/callback] state verify failed:', e)
     return back('invalid_state')
@@ -84,23 +99,48 @@ export async function GET(req: NextRequest) {
     ? Math.floor(Date.now() / 1000) + Number(tokens.expires_in)
     : null
 
-  // If the same Google account is currently linked to a DIFFERENT user, remove
-  // that stale link so the current user can take ownership.
+  // Gmail integration credentials use their own provider namespace. Never
+  // overwrite an Auth.js Google identity row.
   const existing = await db.account.findUnique({
-    where: { provider_providerAccountId: { provider: 'google', providerAccountId } },
+    where: { provider_providerAccountId: { provider: GMAIL_ACCOUNT_PROVIDER, providerAccountId } },
+    select: { id: true, userId: true },
   })
+  let recoveredLegacyConnection = false
+  let transferredConnection = false
   if (existing && existing.userId !== userId) {
-    console.log('[gmail/oauth/callback] removing stale Google link for user', existing.userId)
-    await db.account.delete({ where: { id: existing.id } })
+    // The previous implementation stored Gmail credentials on a `google`
+    // login row. When that identity is later repaired from a demo user to its
+    // verified owner, its separately migrated Gmail row can be left behind.
+    // Recover a legacy row when the same Google subject is already the current
+    // user's Auth.js identity, or honor an explicit transfer request signed
+    // into the OAuth state after the user clicked Connect.
+    const googleLogin = await db.account.findUnique({
+      where: { provider_providerAccountId: { provider: 'google', providerAccountId } },
+      select: { userId: true },
+    })
+    if (!canRecoverStaleGmailConnection({
+      existingConnectionUserId: existing.userId,
+      currentUserId: userId,
+      googleLoginUserId: googleLogin?.userId,
+      transferRequested,
+    })) {
+      return back('google_account_already_connected')
+    }
+    recoveredLegacyConnection = googleLogin?.userId === userId
+    transferredConnection = transferRequested
   }
 
-  // Upsert the current user's Google account row
+  await db.account.deleteMany({
+    where: { userId, provider: GMAIL_ACCOUNT_PROVIDER, NOT: { providerAccountId } },
+  })
+
+  // Upsert the current user's isolated Gmail connection.
   await db.account.upsert({
-    where: { provider_providerAccountId: { provider: 'google', providerAccountId } },
+    where: { provider_providerAccountId: { provider: GMAIL_ACCOUNT_PROVIDER, providerAccountId } },
     create: {
       userId,
       type:              'oauth',
-      provider:          'google',
+      provider:          GMAIL_ACCOUNT_PROVIDER,
       providerAccountId,
       access_token:      tokens.access_token,
       refresh_token:     tokens.refresh_token ?? null,
@@ -110,7 +150,7 @@ export async function GET(req: NextRequest) {
       id_token:          tokens.id_token ?? null,
     },
     update: {
-      userId,
+      ...(recoveredLegacyConnection || transferredConnection ? { userId } : {}),
       access_token:  tokens.access_token,
       ...(tokens.refresh_token ? { refresh_token: tokens.refresh_token } : {}),
       ...(expires_at != null   ? { expires_at }                          : {}),
@@ -119,10 +159,15 @@ export async function GET(req: NextRequest) {
     },
   })
 
-  console.log('[gmail/oauth/callback] linked Google account', providerAccountId, 'to user', userId, 'scope=', tokens.scope)
+  console.log(
+    transferredConnection
+      ? '[gmail/oauth/callback] transferred Gmail connection to current user'
+      : recoveredLegacyConnection
+        ? '[gmail/oauth/callback] recovered stale Gmail connection for current user'
+      : '[gmail/oauth/callback] linked Gmail integration to current user',
+  )
 
-  const success = new URL('/', req.url)
-  success.searchParams.set('page', 'gmail')
+  const success = new URL(returnTo, req.url)
   success.searchParams.set('gmailAuth', '1')
   return NextResponse.redirect(success)
 }

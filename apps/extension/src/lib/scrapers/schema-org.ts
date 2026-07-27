@@ -5,21 +5,21 @@ import type { ScrapedJob } from '../types'
  * Many job sites (LinkedIn, Indeed, Greenhouse, Lever, etc.) embed schema.org markup.
  * This is the most reliable extraction method when available.
  */
-export function scrapeSchemaOrg(): ScrapedJob | null {
+export function scrapeSchemaOrg(doc: Document = document, pageUrl = window.location.href): ScrapedJob | null {
   // Try JSON-LD first (most common)
-  const scripts = document.querySelectorAll<HTMLScriptElement>('script[type="application/ld+json"]')
+  const scripts = doc.querySelectorAll<HTMLScriptElement>('script[type="application/ld+json"]')
   for (const script of scripts) {
     try {
       const data = JSON.parse(script.textContent ?? '{}')
-      const job = extractFromJsonLd(data)
+      const job = extractFromJsonLd(data, pageUrl)
       if (job) return job
     } catch { /* invalid JSON, skip */ }
   }
 
   // Try meta tags as fallback
-  const metaTitle = document.querySelector<HTMLMetaElement>('meta[property="og:title"]')?.content?.trim()
-  const metaDesc  = document.querySelector<HTMLMetaElement>('meta[name="description"]')?.content?.trim()
-  const metaCompany = document.querySelector<HTMLMetaElement>('meta[property="og:site_name"]')?.content?.trim()
+  const metaTitle = doc.querySelector<HTMLMetaElement>('meta[property="og:title"]')?.content?.trim()
+  const metaDesc  = doc.querySelector<HTMLMetaElement>('meta[name="description"]')?.content?.trim()
+  const metaCompany = doc.querySelector<HTMLMetaElement>('meta[property="og:site_name"]')?.content?.trim()
 
   if (metaTitle && metaCompany) {
     return {
@@ -28,7 +28,7 @@ export function scrapeSchemaOrg(): ScrapedJob | null {
       location:    'Unknown',
       description: metaDesc ?? '',
       salary:      null,
-      url:         window.location.href,
+      url:         pageUrl,
       source:      'unknown',
     }
   }
@@ -36,7 +36,7 @@ export function scrapeSchemaOrg(): ScrapedJob | null {
   return null
 }
 
-function extractFromJsonLd(data: unknown): ScrapedJob | null {
+function extractFromJsonLd(data: unknown, pageUrl: string): ScrapedJob | null {
   if (!data || typeof data !== 'object') return null
 
   const obj = data as Record<string, unknown>
@@ -44,7 +44,7 @@ function extractFromJsonLd(data: unknown): ScrapedJob | null {
   // Handle @graph array (multiple entities)
   if (Array.isArray(obj['@graph'])) {
     for (const item of obj['@graph']) {
-      const job = extractFromJsonLd(item)
+      const job = extractFromJsonLd(item, pageUrl)
       if (job) return job
     }
     return null
@@ -92,7 +92,7 @@ function extractFromJsonLd(data: unknown): ScrapedJob | null {
     location,
     description: stripHtml(description),
     salary,
-    url:         stringOrNull(obj, 'url') ?? window.location.href,
+    url:         stringOrNull(obj, 'url') ?? pageUrl,
     source:      'unknown',
   }
 }

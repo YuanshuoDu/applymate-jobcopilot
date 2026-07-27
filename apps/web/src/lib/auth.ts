@@ -7,6 +7,8 @@ import Credentials from 'next-auth/providers/credentials'
 import bcrypt from 'bcryptjs'
 import { jwtVerify } from 'jose'
 import { db } from '@/lib/db'
+import { normalizeEmail } from '@/lib/auth-identifiers'
+import { reconcileGoogleLoginIdentity } from '@/lib/google-identity'
 
 const AUTH_SECRET = process.env.AUTH_SECRET ?? 'fallback-secret-change-this'
 const JWT_SECRET = new TextEncoder().encode(AUTH_SECRET)
@@ -38,8 +40,10 @@ providers.push(Credentials({
 
     // ── Email+password auth ──
     if (!credentials?.email || !credentials?.password) return null
+    const email = normalizeEmail(credentials.email as string)
+    if (!email) return null
     const user = await db.user.findUnique({
-      where: { email: credentials.email as string },
+      where: { email },
     })
     if (!user?.password) return null
     const valid = await bcrypt.compare(credentials.password as string, user.password)
@@ -53,14 +57,15 @@ if (process.env.AUTH_GOOGLE_ID && process.env.AUTH_GOOGLE_SECRET) {
   providers.push(Google({
     clientId:     process.env.AUTH_GOOGLE_ID,
     clientSecret: process.env.AUTH_GOOGLE_SECRET,
-    // Allows a Credentials (email/password) user to later link their Google account
-    // with the same email — without this NextAuth throws OAuthAccountNotLinked.
+    // Credentials users may choose Google later. The signIn callback above
+    // rejects an unverified Google email before Auth.js can link by email.
     allowDangerousEmailAccountLinking: true,
+    // Gmail access is deliberately requested by the separate Gmail integration
+    // flow. A sign-in must only establish the ApplyMate identity.
     authorization: {
       params: {
-        scope:       'openid email profile https://www.googleapis.com/auth/gmail.readonly https://www.googleapis.com/auth/gmail.send',
-        access_type: 'offline',
-        prompt:      'consent',
+        scope:  'openid email profile',
+        prompt: 'select_account',
       },
     },
   }))
@@ -81,13 +86,18 @@ export const { handlers, signIn, signOut, auth } = NextAuth({
   trustHost: true,
   session: { strategy: 'jwt' },
   callbacks: {
-    async signIn({ user, account }) {
+    async signIn({ user, account, profile }) {
+      if (account?.provider === 'google') {
+        const validIdentity = await reconcileGoogleLoginIdentity({ user, account, profile })
+        if (!validIdentity) return '/login?error=OAuthIdentityMismatch'
+      }
+
       // PrismaAdapter only INSERTS account rows via linkAccount on first OAuth;
       // it never updates them on subsequent sign-ins. Patch the existing row here so
       // a freshly issued access_token / refresh_token / scope replaces the stale data.
       // For first-time OAuth this is a no-op (0 rows) and linkAccount will handle it.
-      if (account?.provider === 'google' && user.id) {
-        console.log('[auth] signIn google for user', user.id, {
+      if (account?.provider === 'google' && account.providerAccountId) {
+        console.log('[auth] signIn google account', {
           hasAccess:  !!account.access_token,
           hasRefresh: !!account.refresh_token,
           expires_at: account.expires_at,
@@ -96,7 +106,7 @@ export const { handlers, signIn, signOut, auth } = NextAuth({
         if (account.access_token) {
           try {
             const updated = await db.account.updateMany({
-              where: { userId: user.id, provider: 'google' },
+              where: { provider: 'google', providerAccountId: account.providerAccountId },
               data: {
                 access_token:  account.access_token,
                 ...(account.refresh_token ? { refresh_token: account.refresh_token } : {}),
