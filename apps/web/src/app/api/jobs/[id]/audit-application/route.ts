@@ -88,6 +88,36 @@ async function runAuditModel(prompt: string, cfg: AiConfig) {
   throw lastError
 }
 
+function unavailableAudit(source: ApplicationAudit['source']): ApplicationAudit {
+  return {
+    verdict: 'needs_review',
+    summary: 'The auditor did not return a structured result. No application documents were changed; retry the independent audit.',
+    matchScore: 0,
+    findings: [{
+      area: 'job_match', severity: 'warning', title: 'Audit response needs retry',
+      evidence: 'The AI response was not valid structured audit data.',
+      action: 'Retry the independent audit. The existing resume and cover letter will be reused unchanged.',
+    }],
+    source,
+    auditedAt: new Date().toISOString(),
+  }
+}
+
+async function runParsedAudit(prompt: string, cfg: AiConfig, source: ApplicationAudit['source']) {
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const retryInstruction = attempt
+      ? '\n\nYour previous response was invalid. Return only the JSON object — no prose, markdown, or reasoning.'
+      : ''
+    const result = await runAuditModel(prompt + retryInstruction, cfg)
+    try {
+      return { result, audit: normalize(parseAiJson<RawAudit>(result.text), source) }
+    } catch {
+      if (attempt === 1) return { result, audit: unavailableAudit(source) }
+    }
+  }
+  throw new Error('Independent audit did not produce a result')
+}
+
 function parseStoredAudit(text: string): StoredApplicationAudit | null {
   if (!text.startsWith(AUDIT_ACTIVITY_PREFIX)) return null
   try {
@@ -188,8 +218,7 @@ FINAL COVER LETTER TO AUDIT:
 ${coverLetter.content.slice(0, 8_000)}`
 
   try {
-    const result = await runAuditModel(prompt, cfg)
-    const audit = normalize(parseAiJson<RawAudit>(result.text), source)
+    const { result, audit } = await runParsedAudit(prompt, cfg, source)
     await db.activity.create({
       data: {
         userId: prep.userId, jobId, type: 'agent_action',
