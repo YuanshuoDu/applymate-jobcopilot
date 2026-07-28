@@ -16,7 +16,12 @@ vi.mock('@/lib/api-helpers', () => ({
   err: (error: string, status = 400) => Response.json({ error }, { status }),
 }))
 vi.mock('@/lib/db', () => ({ db: { user: { findUnique: mocks.findUnique, update: mocks.update } } }))
-vi.mock('@/lib/persona-facts', () => ({ confirmPersonaFacts: mocks.confirm, listConfirmedPersonaFacts: mocks.list, revokePersonaFact: mocks.revoke }))
+vi.mock('@/lib/persona-facts', () => ({
+  confirmPersonaFacts: mocks.confirm,
+  isPersonaAllowedUse: (value: string | null) => value === 'form_fill' || value === 'tailor' || value === 'cover_letter',
+  listConfirmedPersonaFacts: mocks.list,
+  revokePersonaFact: mocks.revoke,
+}))
 
 describe('POST /api/me/persona/fields', () => {
   beforeEach(() => {
@@ -53,5 +58,14 @@ describe('POST /api/me/persona/fields', () => {
     expect(response.status).toBe(400)
     await expect(response.json()).resolves.toMatchObject({ error: expect.stringContaining('Sensitive') })
     expect(mocks.update).not.toHaveBeenCalled()
+  })
+
+  it('scopes the fact-store query for form-fill callers', async () => {
+    const { GET } = await import('./route')
+    const response = await GET(new Request('http://localhost/api/me/persona/fields?use=form_fill') as never)
+
+    expect(response.status).toBe(200)
+    expect(mocks.list).toHaveBeenCalledWith('user_1', 'form_fill')
+    expect(response.headers.get('Cache-Control')).toBe('private, no-store')
   })
 })

@@ -2,7 +2,7 @@ import { NextRequest } from 'next/server'
 import { db } from '@/lib/db'
 import { requireAuth, isErrorResponse, ok, err } from '@/lib/api-helpers'
 import { validatePersonaField, type PersonaField } from '@/lib/persona'
-import { confirmPersonaFacts, listConfirmedPersonaFacts, revokePersonaFact } from '@/lib/persona-facts'
+import { confirmPersonaFacts, isPersonaAllowedUse, listConfirmedPersonaFacts, revokePersonaFact } from '@/lib/persona-facts'
 import type { Prisma } from '@prisma/client'
 
 /**
@@ -15,13 +15,19 @@ export async function GET(req: NextRequest) {
   const auth = await requireAuth(req)
   if (isErrorResponse(auth)) return auth
 
+  const requestedUse = new URL(req.url).searchParams.get('use')
+  const allowedUse = isPersonaAllowedUse(requestedUse) ? requestedUse : undefined
+  if (requestedUse && !allowedUse) {
+    return err('use must be form_fill, tailor, or cover_letter')
+  }
+
   const [user, confirmedFacts] = await Promise.all([db.user.findUnique({
     where: { id: auth.userId },
     select: { personaFields: true },
-  }), listConfirmedPersonaFacts(auth.userId)])
+  }), listConfirmedPersonaFacts(auth.userId, allowedUse)])
   const fields = mergeFields((user?.personaFields ?? []) as unknown as PersonaField[], confirmedFacts)
 
-  return ok({ fields })
+  return privateOk({ fields })
 }
 
 export async function POST(req: NextRequest) {
@@ -63,7 +69,7 @@ export async function POST(req: NextRequest) {
     data: { personaFields: merged as unknown as Prisma.InputJsonValue },
   })
 
-  return ok({ fields: mergeFields(merged, confirmedFacts) }, 200)
+  return privateOk({ fields: mergeFields(merged, confirmedFacts) })
 }
 
 export async function DELETE(req: NextRequest) {
@@ -86,7 +92,7 @@ export async function DELETE(req: NextRequest) {
   })
   await revokePersonaFact(auth.userId, body.key)
 
-  return ok({ ok: true })
+  return privateOk({ ok: true })
 }
 
 /** New facts win on the same key while legacy JSON remains readable during rollout. */
@@ -94,4 +100,10 @@ function mergeFields(legacy: PersonaField[], facts: PersonaField[]) {
   const byKey = new Map(legacy.map(field => [field.key, field]))
   for (const fact of facts) byKey.set(fact.key, fact)
   return [...byKey.values()]
+}
+
+function privateOk<T>(data: T) {
+  const response = ok(data)
+  response.headers.set('Cache-Control', 'private, no-store')
+  return response
 }

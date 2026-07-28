@@ -17,5 +17,7 @@ export async function GET(req: NextRequest) {
   })
   if (!user) return err('User not found', 404)
 
-  return ok({ exportedAt: new Date().toISOString(), profile: user })
+  const response = ok({ exportedAt: new Date().toISOString(), profile: user })
+  response.headers.set('Cache-Control', 'private, no-store')
+  return response
 }

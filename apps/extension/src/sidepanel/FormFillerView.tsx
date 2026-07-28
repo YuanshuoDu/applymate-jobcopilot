@@ -454,8 +454,8 @@ export function FormFillerView({ settings, pendingFields, onFieldsConsumed, scan
       let personaFields: PersonaField[] = []
       try {
         const [personaResult, pFieldsResult] = await Promise.all([
-          getPersona(activeSettings),
-          getPersonaFields(activeSettings).catch(() => ({ fields: [] })),
+          getPersona(activeSettings, 'form_fill'),
+          getPersonaFields(activeSettings, 'form_fill').catch(() => ({ fields: [] })),
         ])
         persona = personaResult.persona
         personaFields = pFieldsResult.fields ?? []

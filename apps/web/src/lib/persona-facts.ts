@@ -3,6 +3,10 @@ import type { PersonaField } from '@/lib/persona'
 
 export type PersonaAllowedUse = 'form_fill' | 'tailor' | 'cover_letter'
 
+export function isPersonaAllowedUse(value: string | null): value is PersonaAllowedUse {
+  return value === 'form_fill' || value === 'tailor' || value === 'cover_letter'
+}
+
 function normalized(value: string) {
   return value.trim().toLowerCase()
 }
