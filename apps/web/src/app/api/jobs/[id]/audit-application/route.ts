@@ -9,6 +9,7 @@ import { NextRequest } from 'next/server'
 import { db } from '@/lib/db'
 import { prepareAiRoute, requireAuth, isErrorResponse, ok, err } from '@/lib/api-helpers'
 import { modelChat, parseAiJson, resolveConfig, type AiConfig } from '@/lib/model-router'
+import { buildPersona } from '@/lib/persona'
 import type { ApplicationAudit, ApplicationAuditFinding, ResumeContent } from '@/lib/types'
 
 type Params = { params: Promise<{ id: string }> }
@@ -35,9 +36,10 @@ function toText(content: ResumeContent): string {
 }
 
 function normalize(raw: RawAudit, source: ApplicationAudit['source']): ApplicationAudit {
-  const findings = (Array.isArray(raw.findings) ? raw.findings : []).slice(0, 12).map(finding => ({
+  const findings: ApplicationAuditFinding[] = (Array.isArray(raw.findings) ? raw.findings : []).slice(0, 12).map(finding => ({
     area: AREAS.has(finding.area as ApplicationAuditFinding['area']) ? finding.area as ApplicationAuditFinding['area'] : 'resume',
     severity: SEVERITIES.has(finding.severity as ApplicationAuditFinding['severity']) ? finding.severity as ApplicationAuditFinding['severity'] : 'warning',
+    resolution: finding.resolution === 'evidence_needed' ? 'evidence_needed' : 'contradiction',
     title: String(finding.title ?? 'Review application material').slice(0, 120),
     evidence: String(finding.evidence ?? 'The auditor could not establish enough evidence.').slice(0, 500),
     action: String(finding.action ?? 'Review and correct this item before confirming.').slice(0, 300),
@@ -49,6 +51,7 @@ function normalize(raw: RawAudit, source: ApplicationAudit['source']): Applicati
   const incomplete = (['resume', 'cover_letter'] as const).filter(area => !auditedAreas.has(area))
   if (incomplete.length) findings.push({
     area: incomplete[0], severity: 'warning', title: 'Incomplete independent audit',
+    resolution: 'evidence_needed',
     evidence: `The Auditor did not return a result for: ${incomplete.join(', ')}.`,
     action: 'Run the audit again before confirming the application package.',
   })
@@ -154,9 +157,10 @@ export async function POST(req: NextRequest, { params }: Params) {
   const { resumeId, coverLetterId } = body as { resumeId?: string; coverLetterId?: string }
   if (!resumeId) return err('resumeId is required')
 
-  const [job, resume] = await Promise.all([
+  const [job, resume, persona] = await Promise.all([
     db.job.findFirst({ where: { id: jobId, userId: prep.userId } }),
     db.resume.findFirst({ where: { id: resumeId, userId: prep.userId } }),
+    buildPersona(prep.userId, 'tailor'),
   ])
   if (!job) return err('Job not found', 404)
   if (!resume) return err('Resume not found', 404)
@@ -198,17 +202,20 @@ export async function POST(req: NextRequest, { params }: Params) {
   const prompt = `${rolePrompt}
 
 You are auditing, not rewriting. The SOURCE RESUME is the candidate's evidence baseline. The FINAL RESUME and COVER LETTER may contain AI edits.
-Your only release gate is factual integrity. The SOURCE RESUME is the evidence baseline. Verify every concrete employer, current employment status or location, role, date or duration, credential, project, skill, metric, and outcome in the FINAL RESUME and COVER LETTER against that baseline.
+Your only release gate is factual integrity. The SOURCE RESUME and CONFIRMED PERSONA are the evidence baseline. Verify every concrete employer, current employment status or location, role, date or duration, credential, project, skill, metric, and outcome in the FINAL RESUME and COVER LETTER against that baseline.
 
-Mark "critical" only for a specific unsupported or contradictory claim (including stale/current-status claims such as saying the candidate currently works in Shanghai when the source dates ended). Mark "warning" only when a claim might be supported but needs the candidate to confirm the precise evidence. Quote the exact final claim and the source fact or absence in "evidence", and state a precise correction in "action".
+Use "resolution":"contradiction" and severity "critical" only when a source explicitly contradicts the final claim (including stale/current-status claims such as saying the candidate currently works in Shanghai when the source dates ended). Use "resolution":"evidence_needed" and severity "warning" when the source simply does not contain enough evidence to verify a claim: this is not fabrication, and the candidate may add a confirmed Persona fact or remove/soften the claim. Quote the exact final claim and the source fact or absence in "evidence", and state a precise correction in "action".
 
 Do not treat a missing job requirement, indirect experience, a different presentation order, or lack of Copilot/MLOps exposure as a factual issue. Those are optional fit notes only: put them in "job_match" with severity "pass" and wording like "Optional future emphasis", and never downgrade the verdict for them. Do not infer LLM automation from a general AI or Q&A project. Do not infer security-threat detection metrics from cybersecurity work.
 
 Return ONLY JSON. Always return at least one finding for EACH area: resume, cover_letter, and job_match. Use severity "pass" when an area is supported and safe. A pass verdict is valid only when resume and cover-letter claims are supported with no unresolved factual warnings.
-{"verdict":"pass|needs_review|blocked","summary":"...","matchScore":0,"findings":[{"area":"resume|cover_letter|job_match","severity":"pass|warning|critical","title":"...","evidence":"quote or precise comparison","action":"..."}]}
+{"verdict":"pass|needs_review|blocked","summary":"...","matchScore":0,"findings":[{"area":"resume|cover_letter|job_match","severity":"pass|warning|critical","resolution":"contradiction|evidence_needed","title":"...","evidence":"quote or precise comparison","action":"..."}]}
 
 SOURCE RESUME (truth baseline):
 ${toText(sourceContent)}
+
+CONFIRMED PERSONA (user-confirmed facts, also valid evidence):
+${persona.slice(0, 10_000)}
 
 FINAL RESUME TO AUDIT:
 ${toText(resume.content as unknown as ResumeContent)}

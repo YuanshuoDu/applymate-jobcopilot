@@ -314,6 +314,8 @@ export type ApplicationAuditVerdict = 'pass' | 'needs_review' | 'blocked'
 export interface ApplicationAuditFinding {
   area: 'resume' | 'cover_letter' | 'job_match'
   severity: ApplicationAuditSeverity
+  /** A missing Persona fact needs user input; it is not evidence of fabrication. */
+  resolution?: 'contradiction' | 'evidence_needed'
   title: string
   evidence: string
   action: string

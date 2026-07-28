@@ -4,6 +4,7 @@ const mocks = {
   jobFindFirst: vi.fn(), resumeFindFirst: vi.fn(), coverLetterFindFirst: vi.fn(),
   resumeVersionFindFirst: vi.fn(), agentRoleFindFirst: vi.fn(), modelChat: vi.fn(),
   activityCreate: vi.fn(), activityFindFirst: vi.fn(),
+  buildPersona: vi.fn(),
 }
 
 vi.mock('@/lib/db', () => ({ db: {
@@ -27,6 +28,7 @@ vi.mock('@/lib/model-router', () => ({
   APPLYMATE_BACKING: { provider: 'minimax', model: 'MiniMax-M2.7' },
   resolveConfig: (config: { provider: string; model: string; apiKey?: string }) => ({ ...config, resolvedKey: config.apiKey ?? (config.provider === 'minimax' ? 'test-key' : '') }),
 }))
+vi.mock('@/lib/persona', () => ({ buildPersona: mocks.buildPersona }))
 
 function request(body: unknown) {
   return new Request('http://localhost/api/jobs/job_1/audit-application', {
@@ -42,6 +44,7 @@ describe('POST /api/jobs/[id]/audit-application', () => {
     mocks.coverLetterFindFirst.mockResolvedValue({ content: 'Dear Acme, I built TypeScript systems.' })
     mocks.agentRoleFindFirst.mockResolvedValue(null)
     mocks.activityCreate.mockResolvedValue({ id: 'activity_1' })
+    mocks.buildPersona.mockResolvedValue('CONFIRMED APPLICATION ANSWERS:\n- [work] API delivery: Confirmed by candidate')
   })
 
   it('audits final material against the tailored resume parent', async () => {
@@ -118,6 +121,23 @@ describe('POST /api/jobs/[id]/audit-application', () => {
       findings: [expect.objectContaining({ title: 'Audit response needs retry' })],
     })
     expect(mocks.modelChat).toHaveBeenCalledTimes(2)
+  })
+
+  it('keeps missing Persona evidence distinct from a factual contradiction', async () => {
+    mocks.resumeFindFirst.mockResolvedValueOnce({ id: 'resume_final', parentResumeId: 'resume_base', content: { contact: {}, summary: 'Final', experience: [], education: [], skills: [] } })
+      .mockResolvedValueOnce({ content: { contact: {}, summary: 'Original', experience: [], education: [], skills: [] } })
+    mocks.modelChat.mockResolvedValue({ provider: 'minimax', model: 'MiniMax-M2.7', text: JSON.stringify({ verdict: 'needs_review', findings: [
+      { area: 'resume', severity: 'warning', resolution: 'evidence_needed', title: 'API delivery scope', evidence: 'No source fact confirms the stated API ownership.', action: 'Ask the candidate to confirm the accurate scope or soften the claim.' },
+      { area: 'cover_letter', severity: 'pass', title: 'Supported', evidence: 'Matches.', action: 'None.' },
+      { area: 'job_match', severity: 'pass', title: 'Relevant', evidence: 'Relevant.', action: 'None.' },
+    ] }) })
+    const { POST } = await import('./route')
+    const response = (await POST(request({ resumeId: 'resume_final', coverLetterId: 'cover_1' }) as never, { params: Promise.resolve({ id: 'job_1' }) }))!
+    await expect(response.json()).resolves.toMatchObject({
+      verdict: 'needs_review',
+      findings: expect.arrayContaining([expect.objectContaining({ title: 'API delivery scope', resolution: 'evidence_needed' })]),
+    })
+    expect(mocks.modelChat.mock.calls[0][0][0].content).toContain('CONFIRMED PERSONA')
   })
 
   it('does not block a truthful package merely because the job asks for missing tooling', async () => {
