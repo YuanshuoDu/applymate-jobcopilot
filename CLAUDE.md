@@ -329,4 +329,4 @@ gh pr comment N --repo $REPO --body "..."
 **正在执行的 Phase 1（Greenhouse/Lever/Registry/Enrichment）**完成后：
 - Phase 2：Workday CXS API (#30)，CloakBrowser PoC (#31)
 - Phase 3：Server-side AgentHarness worker (#32)
-- **终极目标**：无人值守自动申请（CloakBrowser + AgentHarness + MiniMax M2.7/ModelRouter）
+- **终极目标**：无人值守自动申请（CloakBrowser + AgentHarness + MiniMax M3/ModelRouter）

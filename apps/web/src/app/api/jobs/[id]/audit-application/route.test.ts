@@ -4,6 +4,7 @@ const mocks = {
   jobFindFirst: vi.fn(), resumeFindFirst: vi.fn(), coverLetterFindFirst: vi.fn(),
   resumeVersionFindFirst: vi.fn(), agentRoleFindFirst: vi.fn(), modelChat: vi.fn(),
   activityCreate: vi.fn(), activityFindFirst: vi.fn(),
+  buildPersona: vi.fn(),
 }
 
 vi.mock('@/lib/db', () => ({ db: {
@@ -15,7 +16,7 @@ vi.mock('@/lib/db', () => ({ db: {
   activity: { create: mocks.activityCreate, findFirst: mocks.activityFindFirst },
 } }))
 vi.mock('@/lib/api-helpers', () => ({
-  prepareAiRoute: vi.fn().mockResolvedValue({ userId: 'user_1', cfg: { provider: 'minimax', model: 'MiniMax-M2.7' } }),
+  prepareAiRoute: vi.fn().mockResolvedValue({ userId: 'user_1', cfg: { provider: 'minimax', model: 'MiniMax-M3', thinking: 'adaptive' } }),
   requireAuth: vi.fn().mockResolvedValue({ userId: 'user_1' }),
   isErrorResponse: () => false,
   ok: (data: unknown, status = 200) => Response.json(data, { status }),
@@ -24,7 +25,12 @@ vi.mock('@/lib/api-helpers', () => ({
 vi.mock('@/lib/model-router', () => ({
   modelChat: mocks.modelChat,
   parseAiJson: (raw: string) => JSON.parse(raw),
+  APPLYMATE_BACKING: { provider: 'minimax', model: 'MiniMax-M3', thinking: 'adaptive' },
+  resolveConfig: (config: { provider: string; model: string; apiKey?: string }) => ({ ...config, resolvedKey: config.apiKey ?? (config.provider === 'minimax' ? 'test-key' : '') }),
+  withMiniMaxThinking: (config: { provider: string; model: string }, thinking: 'adaptive' | 'disabled') =>
+    config.provider === 'minimax' && config.model === 'MiniMax-M3' ? { ...config, thinking } : config,
 }))
+vi.mock('@/lib/persona', () => ({ buildPersona: mocks.buildPersona }))
 
 function request(body: unknown) {
   return new Request('http://localhost/api/jobs/job_1/audit-application', {
@@ -40,12 +46,13 @@ describe('POST /api/jobs/[id]/audit-application', () => {
     mocks.coverLetterFindFirst.mockResolvedValue({ content: 'Dear Acme, I built TypeScript systems.' })
     mocks.agentRoleFindFirst.mockResolvedValue(null)
     mocks.activityCreate.mockResolvedValue({ id: 'activity_1' })
+    mocks.buildPersona.mockResolvedValue('CONFIRMED APPLICATION ANSWERS:\n- [work] API delivery: Confirmed by candidate')
   })
 
   it('audits final material against the tailored resume parent', async () => {
     mocks.resumeFindFirst.mockResolvedValueOnce({ id: 'resume_final', parentResumeId: 'resume_base', content: { contact: {}, summary: 'Final', experience: [], education: [], skills: [] } })
       .mockResolvedValueOnce({ content: { contact: {}, summary: 'Original', experience: [], education: [], skills: [] } })
-    mocks.modelChat.mockResolvedValue({ provider: 'minimax', model: 'MiniMax-M2.7', text: JSON.stringify({ verdict: 'pass', matchScore: 82, summary: 'Supported and relevant.', findings: [
+    mocks.modelChat.mockResolvedValue({ provider: 'minimax', model: 'MiniMax-M3', text: JSON.stringify({ verdict: 'pass', matchScore: 82, summary: 'Supported and relevant.', findings: [
       { area: 'resume', severity: 'pass', title: 'Supported facts', evidence: 'Matches source.', action: 'None.' },
       { area: 'cover_letter', severity: 'pass', title: 'Supported letter', evidence: 'Uses source experience.', action: 'None.' },
       { area: 'job_match', severity: 'pass', title: 'Relevant match', evidence: 'TypeScript is required.', action: 'None.' },
@@ -65,7 +72,7 @@ describe('POST /api/jobs/[id]/audit-application', () => {
   it('blocks confirmation when the independent auditor finds an unsupported concrete claim', async () => {
     mocks.resumeFindFirst.mockResolvedValueOnce({ id: 'resume_final', parentResumeId: null, content: { contact: {}, summary: 'Final', experience: [], education: [], skills: [] } })
     mocks.resumeVersionFindFirst.mockResolvedValue({ content: { contact: {}, summary: 'Original', experience: [], education: [], skills: [] } })
-    mocks.modelChat.mockResolvedValue({ provider: 'minimax', model: 'MiniMax-M2.7', text: JSON.stringify({ verdict: 'pass', findings: [{ area: 'cover_letter', severity: 'critical', title: 'Unsupported metric', evidence: 'Claims 50% growth absent from source.', action: 'Remove or substantiate it.' }] }) })
+    mocks.modelChat.mockResolvedValue({ provider: 'minimax', model: 'MiniMax-M3', text: JSON.stringify({ verdict: 'pass', findings: [{ area: 'cover_letter', severity: 'critical', title: 'Unsupported metric', evidence: 'Claims 50% growth absent from source.', action: 'Remove or substantiate it.' }] }) })
     const { POST } = await import('./route')
     const response = (await POST(request({ resumeId: 'resume_final', coverLetterId: 'cover_1' }) as never, { params: Promise.resolve({ id: 'job_1' }) }))!
     const body = await response.json()
@@ -73,10 +80,86 @@ describe('POST /api/jobs/[id]/audit-application', () => {
     expect(body.verdict).toBe('blocked')
   })
 
+  it('falls back to the platform MiniMax model when the auditor role has no key', async () => {
+    mocks.resumeFindFirst.mockResolvedValueOnce({ id: 'resume_final', parentResumeId: 'resume_base', content: { contact: {}, summary: 'Final', experience: [], education: [], skills: [] } })
+      .mockResolvedValueOnce({ content: { contact: {}, summary: 'Original', experience: [], education: [], skills: [] } })
+    mocks.agentRoleFindFirst.mockResolvedValue({ provider: 'anthropic', model: 'claude-sonnet-4-6', apiKey: null, systemPrompt: 'Auditor' })
+    mocks.modelChat.mockResolvedValue({ provider: 'minimax', model: 'MiniMax-M3', text: JSON.stringify({ verdict: 'pass', findings: [
+      { area: 'resume', severity: 'pass', title: 'Supported', evidence: 'Matches.', action: 'None.' },
+      { area: 'cover_letter', severity: 'pass', title: 'Supported', evidence: 'Matches.', action: 'None.' },
+      { area: 'job_match', severity: 'pass', title: 'Relevant', evidence: 'Relevant.', action: 'None.' },
+    ] }) })
+    const { POST } = await import('./route')
+    const response = (await POST(request({ resumeId: 'resume_final', coverLetterId: 'cover_1' }) as never, { params: Promise.resolve({ id: 'job_1' }) }))!
+    expect(response.status).toBe(200)
+    expect(mocks.modelChat).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({ provider: 'minimax', model: 'MiniMax-M3', thinking: 'adaptive' }), 2048)
+  })
+
+  it('retries one aborted model call before failing the audit', async () => {
+    mocks.resumeFindFirst.mockResolvedValueOnce({ id: 'resume_final', parentResumeId: 'resume_base', content: { contact: {}, summary: 'Final', experience: [], education: [], skills: [] } })
+      .mockResolvedValueOnce({ content: { contact: {}, summary: 'Original', experience: [], education: [], skills: [] } })
+    const aborted = Object.assign(new Error('This operation was aborted'), { name: 'AbortError' })
+    mocks.modelChat.mockRejectedValueOnce(aborted).mockResolvedValueOnce({ provider: 'minimax', model: 'MiniMax-M3', text: JSON.stringify({ verdict: 'pass', findings: [
+      { area: 'resume', severity: 'pass', title: 'Supported', evidence: 'Matches.', action: 'None.' },
+      { area: 'cover_letter', severity: 'pass', title: 'Supported', evidence: 'Matches.', action: 'None.' },
+      { area: 'job_match', severity: 'pass', title: 'Relevant', evidence: 'Relevant.', action: 'None.' },
+    ] }) })
+    const { POST } = await import('./route')
+    const response = (await POST(request({ resumeId: 'resume_final', coverLetterId: 'cover_1' }) as never, { params: Promise.resolve({ id: 'job_1' }) }))!
+    expect(response.status).toBe(200)
+    expect(mocks.modelChat).toHaveBeenCalledTimes(2)
+  })
+
+  it('retries M3 without private reasoning when its adaptive response reaches the limit', async () => {
+    mocks.resumeFindFirst.mockResolvedValueOnce({ id: 'resume_final', parentResumeId: 'resume_base', content: { contact: {}, summary: 'Final', experience: [], education: [], skills: [] } })
+      .mockResolvedValueOnce({ content: { contact: {}, summary: 'Original', experience: [], education: [], skills: [] } })
+    mocks.modelChat.mockRejectedValueOnce(new Error('minimax returned no final content (finish reason: length)')).mockResolvedValueOnce({ provider: 'minimax', model: 'MiniMax-M3', text: JSON.stringify({ verdict: 'pass', findings: [
+      { area: 'resume', severity: 'pass', title: 'Supported', evidence: 'Matches.', action: 'None.' },
+      { area: 'cover_letter', severity: 'pass', title: 'Supported', evidence: 'Matches.', action: 'None.' },
+      { area: 'job_match', severity: 'pass', title: 'Relevant', evidence: 'Relevant.', action: 'None.' },
+    ] }) })
+    const { POST } = await import('./route')
+    const response = (await POST(request({ resumeId: 'resume_final', coverLetterId: 'cover_1' }) as never, { params: Promise.resolve({ id: 'job_1' }) }))!
+    expect(response.status).toBe(200)
+    expect(mocks.modelChat).toHaveBeenLastCalledWith(expect.anything(), expect.objectContaining({ provider: 'minimax', model: 'MiniMax-M3', thinking: 'disabled' }), 2048)
+  })
+
+  it('returns a retryable audit state when both model responses are malformed', async () => {
+    mocks.resumeFindFirst.mockResolvedValueOnce({ id: 'resume_final', parentResumeId: 'resume_base', content: { contact: {}, summary: 'Final', experience: [], education: [], skills: [] } })
+      .mockResolvedValueOnce({ content: { contact: {}, summary: 'Original', experience: [], education: [], skills: [] } })
+    mocks.modelChat.mockResolvedValue({ provider: 'minimax', model: 'MiniMax-M3', text: '' })
+    const { POST } = await import('./route')
+    const response = (await POST(request({ resumeId: 'resume_final', coverLetterId: 'cover_1' }) as never, { params: Promise.resolve({ id: 'job_1' }) }))!
+    expect(response.status).toBe(200)
+    await expect(response.json()).resolves.toMatchObject({
+      verdict: 'needs_review',
+      summary: expect.stringContaining('did not return a structured result'),
+      findings: [expect.objectContaining({ title: 'Audit response needs retry' })],
+    })
+    expect(mocks.modelChat).toHaveBeenCalledTimes(2)
+  })
+
+  it('keeps missing Persona evidence distinct from a factual contradiction', async () => {
+    mocks.resumeFindFirst.mockResolvedValueOnce({ id: 'resume_final', parentResumeId: 'resume_base', content: { contact: {}, summary: 'Final', experience: [], education: [], skills: [] } })
+      .mockResolvedValueOnce({ content: { contact: {}, summary: 'Original', experience: [], education: [], skills: [] } })
+    mocks.modelChat.mockResolvedValue({ provider: 'minimax', model: 'MiniMax-M3', text: JSON.stringify({ verdict: 'needs_review', findings: [
+      { area: 'resume', severity: 'warning', resolution: 'evidence_needed', title: 'API delivery scope', evidence: 'No source fact confirms the stated API ownership.', action: 'Ask the candidate to confirm the accurate scope or soften the claim.' },
+      { area: 'cover_letter', severity: 'pass', title: 'Supported', evidence: 'Matches.', action: 'None.' },
+      { area: 'job_match', severity: 'pass', title: 'Relevant', evidence: 'Relevant.', action: 'None.' },
+    ] }) })
+    const { POST } = await import('./route')
+    const response = (await POST(request({ resumeId: 'resume_final', coverLetterId: 'cover_1' }) as never, { params: Promise.resolve({ id: 'job_1' }) }))!
+    await expect(response.json()).resolves.toMatchObject({
+      verdict: 'needs_review',
+      findings: expect.arrayContaining([expect.objectContaining({ title: 'API delivery scope', resolution: 'evidence_needed' })]),
+    })
+    expect(mocks.modelChat.mock.calls[0][0][0].content).toContain('CONFIRMED PERSONA')
+  })
+
   it('does not block a truthful package merely because the job asks for missing tooling', async () => {
     mocks.resumeFindFirst.mockResolvedValueOnce({ id: 'resume_final', parentResumeId: null, content: { contact: {}, summary: 'Final', experience: [], education: [], skills: [] } })
     mocks.resumeVersionFindFirst.mockResolvedValue({ content: { contact: {}, summary: 'Original', experience: [], education: [], skills: [] } })
-    mocks.modelChat.mockResolvedValue({ provider: 'minimax', model: 'MiniMax-M2.7', text: JSON.stringify({ verdict: 'needs_review', findings: [
+    mocks.modelChat.mockResolvedValue({ provider: 'minimax', model: 'MiniMax-M3', text: JSON.stringify({ verdict: 'needs_review', findings: [
       { area: 'resume', severity: 'pass', title: 'Facts supported', evidence: 'All dates and employers match the source.', action: 'None.' },
       { area: 'cover_letter', severity: 'pass', title: 'Facts supported', evidence: 'No unsupported claims.', action: 'None.' },
       { area: 'job_match', severity: 'critical', title: 'MLOps missing', evidence: 'The resume does not claim MLOps.', action: 'Optional future emphasis only.' },
@@ -101,5 +184,20 @@ describe('POST /api/jobs/[id]/audit-application', () => {
     const response = (await GET(new Request('http://localhost/api/jobs/job_1/audit-application') as never, { params: Promise.resolve({ id: 'job_1' }) }))!
     await expect(response.json()).resolves.toMatchObject({ resumeId: 'resume_final', coverLetterId: 'cover_1', audit: { verdict: 'needs_review' } })
     expect(mocks.activityFindFirst).toHaveBeenCalledWith(expect.objectContaining({ where: expect.objectContaining({ jobId: 'job_1' }) }))
+  })
+
+  it('does not report a completed audit when its canonical record could not be saved', async () => {
+    mocks.resumeFindFirst.mockResolvedValueOnce({ id: 'resume_final', parentResumeId: 'resume_base', content: { contact: {}, summary: 'Final', experience: [], education: [], skills: [] } })
+      .mockResolvedValueOnce({ content: { contact: {}, summary: 'Original', experience: [], education: [], skills: [] } })
+    mocks.modelChat.mockResolvedValue({ provider: 'minimax', model: 'MiniMax-M3', text: JSON.stringify({ verdict: 'pass', findings: [
+      { area: 'resume', severity: 'pass', title: 'Supported facts', evidence: 'Matches source.', action: 'None.' },
+      { area: 'cover_letter', severity: 'pass', title: 'Supported letter', evidence: 'Matches source.', action: 'None.' },
+      { area: 'job_match', severity: 'pass', title: 'Role fit', evidence: 'Relevant.', action: 'None.' },
+    ] }) })
+    mocks.activityCreate.mockRejectedValue(new Error('Activity database unavailable'))
+    const { POST } = await import('./route')
+    const response = (await POST(request({ resumeId: 'resume_final', coverLetterId: 'cover_1' }) as never, { params: Promise.resolve({ id: 'job_1' }) }))!
+    await expect(response.json()).resolves.toMatchObject({ error: 'Application audit failed: Activity database unavailable' })
+    expect(response.status).toBe(502)
   })
 })

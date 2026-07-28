@@ -9,7 +9,9 @@ const mockModelChat = vi.fn()
 vi.mock('@/lib/model-router', () => ({
   modelChat: mockModelChat,
   stripFences: (raw: string) => raw.replace(/^```(?:json)?\n?/, '').replace(/\n?```$/, ''),
-  APPLYMATE_BACKING: { provider: 'minimax', model: 'MiniMax-M2.7' },
+  APPLYMATE_BACKING: { provider: 'minimax', model: 'MiniMax-M3', thinking: 'adaptive' },
+  withMiniMaxThinking: (config: { provider: string; model: string }, thinking: 'adaptive' | 'disabled') =>
+    config.provider === 'minimax' && config.model === 'MiniMax-M3' ? { ...config, thinking } : config,
 }))
 
 // ── Mock Prisma / auth ─────────────────────────────────────────────────────────

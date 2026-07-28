@@ -35,7 +35,7 @@ let bgJs = fs.readFileSync(path.join(DIST, 'background.js'), 'utf-8')
 bgJs = bgJs.replace(/^import [^\n]+ from "\.\/chunks\/[^"]+\.js";\n/gm, '')
 
 // Collect and inline all chunks referenced by background (storage, api, etc.)
-const chunksToInline = ['storage', 'api']
+const chunksToInline = ['storage', 'api', 'job-identity']
 let inlinedChunks = ''
 for (const name of chunksToInline) {
   const chunkPath = path.join(chunkDir, `${name}.js`)
@@ -58,7 +58,20 @@ fs.writeFileSync(path.join(DIST, 'background.js'), finalBg)
 // same-version reinjection so old observers/listeners cannot accumulate.
 const contentPath = path.join(DIST, 'content.js')
 if (fs.existsSync(contentPath)) {
-  const contentJs = fs.readFileSync(contentPath, 'utf-8')
+  let contentJs = fs.readFileSync(contentPath, 'utf-8')
+  // Content scripts are classic scripts, not ES modules. When a utility is
+  // shared with background Vite emits it as a chunk, leaving an `import` here
+  // that Chrome rejects before any ApplyMate UI can run. Inline it explicitly.
+  const jobIdentityPath = path.join(chunkDir, 'job-identity.js')
+  if (fs.existsSync(jobIdentityPath)) {
+    let jobIdentity = fs.readFileSync(jobIdentityPath, 'utf-8')
+    jobIdentity = jobIdentity.replace(/^export \{[\s\S]*?\};\s*/gm, '')
+    contentJs = contentJs.replace(/^import [^\n]+ from "\.\/chunks\/job-identity\.js";\n/gm, '')
+    contentJs = `${jobIdentity}\n${contentJs}`
+  }
+  if (/^\s*import\s/m.test(contentJs)) {
+    throw new Error('content.js still contains an ES module import after post-build inlining')
+  }
   // A reload of an unpacked extension can keep the page's isolated-world
   // globals while replacing chrome.runtime. Give each build a fresh marker so
   // the new script can replace that invalidated context even if the manifest

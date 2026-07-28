@@ -251,6 +251,12 @@ export function FormFillerView({ settings, pendingFields, onFieldsConsumed, scan
     return label.toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_|_$/g, '').slice(0, 50)
   }
 
+  // GDPR data minimisation: these answers are never offered for Persona
+  // storage, even if a site form or model marks them as reusable.
+  function isPersonaSafe(label: string): boolean {
+    return !/(gender|sex|pronoun|birth|age|race|ethnic|religion|faith|politic|union|health|medical|disab|veteran|criminal|passport|national[_ ]?id)/i.test(label)
+  }
+
   function guessCategoryFromLabel(label: string): string {
     const l = label.toLowerCase()
     if (/name|gender|sex|pronoun|birth|age|race|ethnic|veteran|disability/i.test(l)) return 'personal'
@@ -276,6 +282,7 @@ export function FormFillerView({ settings, pendingFields, onFieldsConsumed, scan
       if (!currentValue.trim()) continue
       const schema = fields.find(s => s.id === f.fieldId)
       const label = schema?.label ?? f.fieldId
+      if (!isPersonaSafe(label)) continue
       const personaKey = fieldToPersonaKey(label)
 
       const existing = existingMap.get(personaKey)
@@ -325,12 +332,13 @@ export function FormFillerView({ settings, pendingFields, onFieldsConsumed, scan
     try {
       const fields: PersonaField[] = personaMatches.map(m => ({
         key:        m.personaKey,
-        category:   guessCategory(m.personaKey),
+        category:   guessCategoryFromLabel(m.label),
         label:      m.label,
         value:      m.value,
         confidence: 1.0,
         source:     'form_scan',
         updatedAt:  new Date().toISOString(),
+        consentAt:  new Date().toISOString(),
       }))
       await savePersonaFields(settings, fields)
       setPersonaMatches([])
@@ -446,8 +454,8 @@ export function FormFillerView({ settings, pendingFields, onFieldsConsumed, scan
       let personaFields: PersonaField[] = []
       try {
         const [personaResult, pFieldsResult] = await Promise.all([
-          getPersona(activeSettings),
-          getPersonaFields(activeSettings).catch(() => ({ fields: [] })),
+          getPersona(activeSettings, 'form_fill'),
+          getPersonaFields(activeSettings, 'form_fill').catch(() => ({ fields: [] })),
         ])
         persona = personaResult.persona
         personaFields = pFieldsResult.fields ?? []
@@ -1178,7 +1186,7 @@ const PHASE_INFO: Record<AnalysisPhase, { icon: string; label: string; subLabel:
 function AnalysisProgressView({ phase, totalFields, aiFieldCount, elapsed }: { phase: AnalysisPhase; totalFields: number; aiFieldCount: number; elapsed: number }) {
   const info = PHASE_INFO[phase]
   const elapsedStr = elapsed < 60 ? `${elapsed}s` : `${Math.floor(elapsed / 60)}m ${elapsed % 60}s`
-  // Rough estimate: ~3s per AI field (MiniMax M2.7 average)
+  // Rough estimate: ~3s per AI field (MiniMax M3 average)
   const estSeconds = Math.max(10, Math.min(180, aiFieldCount * 3))
   const estStr = estSeconds < 60 ? `~${estSeconds}s` : `~${Math.round(estSeconds / 60)}min`
 

@@ -71,7 +71,7 @@ export async function runAnalyze(
       const messages = systemPrompt
         ? [{ role: 'system' as const, content: systemPrompt }, { role: 'user' as const, content: prompt }]
         : [{ role: 'user' as const, content: prompt }]
-      // Reasoning models such as MiniMax M2.7 need enough completion budget to
+      // Reasoning models such as MiniMax M3 need enough completion budget to
       // finish their reasoning and return the required JSON payload.
       const result = await modelChat(messages, scoringConfig, 1600)
       const parsed = parseScoreResult(result.text)

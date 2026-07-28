@@ -6,7 +6,7 @@ import { Bookmark, Check, ChevronDown, ChevronRight, Clock3, FileText, Info, Lay
 import { Btn, Card, CompanyLogo, INPUT_STYLE, ScorePill, StatusBadge, useToast, useConfirm } from '@/components/ui'
 import { ResumeRenderer } from '@/components/resume/ResumeRenderer'
 import { CoverLetterPreview } from '@/components/coverletter/CoverLetterPanel'
-import type { ApplicationAudit, CoverLetter, Job, JobStatus, Activity, Resume, ResumeListItem } from '@/lib/types'
+import type { ApplicationAudit, ApplicationAuditFinding, CoverLetter, Job, JobStatus, Activity, Resume, ResumeListItem } from '@/lib/types'
 import { apiMutate, fmtDate, fmtRelative, useApi } from '@/lib/hooks'
 import { setCachedApiResponse } from '@/lib/api-cache'
 import { useNav } from '@/lib/nav-context'
@@ -44,6 +44,12 @@ function sortJobs(jobs: Job[], sortBy: 'createdAt' | 'score' | 'company' | 'role
     }
     return sortDir === 'desc' ? comparison : -comparison
   })
+}
+
+function formatDuration(seconds: number) {
+  const minutes = Math.floor(seconds / 60)
+  const remainder = seconds % 60
+  return minutes ? `${minutes}m ${remainder}s` : `${remainder}s`
 }
 
 // ── ListView ──────────────────────────────────────────────────────────────────
@@ -358,6 +364,8 @@ function JobDetailDrawer({ job, onClose, onStatusChange, onUpdate, onDelete, onO
   const [downloadingPack, setDownloadingPack] = useState(false)
   const [exportedPackFolder, setExportedPackFolder] = useState<string | null>(null)
   const [autoPreparing, setAutoPreparing] = useState(false)
+  const [preparationStartedAt, setPreparationStartedAt] = useState<number | null>(null)
+  const [preparationElapsed, setPreparationElapsed] = useState(0)
   const [packStage, setPackStage] = useState<'idle' | 'resume' | 'coverLetter' | 'audit' | 'review'>('idle')
   const [auditedPackKey, setAuditedPackKey] = useState<string | null>(null)
   const [openPackItem, setOpenPackItem] = useState<'resume' | 'coverLetter' | 'audit' | null>(null)
@@ -365,7 +373,13 @@ function JobDetailDrawer({ job, onClose, onStatusChange, onUpdate, onDelete, onO
   const [generatedCoverLetter, setGeneratedCoverLetter] = useState<CoverLetter | null>(null)
   const [latestAudit, setLatestAudit] = useState<ApplicationAudit | null>(null)
   const [documentPreview, setDocumentPreview] = useState<'resume' | 'coverLetter' | null>(null)
+  const [evidenceFinding, setEvidenceFinding] = useState<ApplicationAuditFinding | null>(null)
+  const [evidenceText, setEvidenceText] = useState('')
+  const [savingEvidence, setSavingEvidence] = useState(false)
   const { data: coverLetters, refetch: refetchCoverLetters } = useApi<CoverLetter[]>(`/api/jobs/${job.id}/cover-letters`)
+  // The audit route is the canonical source because the activity feed is
+  // paginated and can omit an older audit after other job events are added.
+  const { data: canonicalAudit } = useApi<StoredApplicationAudit | null>(`/api/jobs/${job.id}/audit-application`)
 
   // Load per-job activity on mount; reset interview prep when job changes
   useEffect(() => {
@@ -403,6 +417,13 @@ function JobDetailDrawer({ job, onClose, onStatusChange, onUpdate, onDelete, onO
     setPackStage('idle')
     try { setExportedPackFolder(window.sessionStorage.getItem(exportKey)) } catch { setExportedPackFolder(null) }
   }, [job.id])
+  useEffect(() => {
+    if (!preparationStartedAt) { setPreparationElapsed(0); return }
+    const update = () => setPreparationElapsed(Math.floor((Date.now() - preparationStartedAt) / 1000))
+    update()
+    const timer = window.setInterval(update, 1_000)
+    return () => window.clearInterval(timer)
+  }, [preparationStartedAt])
 
   const previewResumeId = job.finalResumeId ?? existingTailoredResume?.id ?? null
   useEffect(() => {
@@ -415,14 +436,18 @@ function JobDetailDrawer({ job, onClose, onStatusChange, onUpdate, onDelete, onO
   // Once a package has been confirmed, every surface must show the exact
   // resume/letter pair that is exported. Do not let an in-memory draft letter
   // replace the confirmed version in the Application Pack preview.
-  const selectedCoverLetter = job.finalCoverLetterId && job.finalResumeId
-    ? coverLetters?.find(letter => letter.id === job.finalCoverLetterId && letter.resumeId === job.finalResumeId)
+  const selectedCoverLetter = job.finalCoverLetterId
+    ? coverLetters?.find(letter => letter.id === job.finalCoverLetterId)
     : generatedCoverLetter
       ?? coverLetters?.find(letter => letter.resumeId === previewResumeId)
   const persistedAudit = useMemo(() => findLatestApplicationAudit(activity), [activity])
-  const displayedAudit = latestAudit ?? persistedAudit?.audit ?? null
-  const factualAuditFindings = (displayedAudit?.findings ?? []).filter(finding => finding.area !== 'job_match' && finding.severity !== 'pass')
-  const auditNeedsRepair = Boolean(displayedAudit && displayedAudit.verdict !== 'pass')
+  const storedAudit = canonicalAudit ?? persistedAudit
+  const displayedAudit = latestAudit ?? storedAudit?.audit ?? null
+  const evidenceGapFindings = (displayedAudit?.findings ?? []).filter(finding => finding.area !== 'job_match' && finding.resolution === 'evidence_needed')
+  const factualAuditFindings = (displayedAudit?.findings ?? []).filter(finding => finding.area !== 'job_match' && finding.severity !== 'pass' && finding.resolution !== 'evidence_needed')
+  const auditRetryOnly = displayedAudit?.findings.some(finding => finding.title === 'Audit response needs retry') ?? false
+  const auditNeedsRepair = factualAuditFindings.length > 0 && !auditRetryOnly
+  const auditNeedsEvidence = evidenceGapFindings.length > 0 && !auditRetryOnly
 
   async function saveNotes() {
     if (notes === (job.notes ?? '')) return
@@ -533,128 +558,132 @@ function JobDetailDrawer({ job, onClose, onStatusChange, onUpdate, onDelete, onO
     }
   }
 
-  async function autoTailorAndAudit() {
-    if (!selectedResumeId && !existingTailoredResume) {
+  async function autoTailorAndAudit(evidenceRepairs: ApplicationAuditFinding[] = []) {
+    if (!selectedResumeId && !existingTailoredResume && !job.finalResumeId) {
       toast.error('No base resume selected', 'Create or import a resume first.')
       return
     }
+    const resumeRepairs = [
+      ...(auditNeedsRepair ? factualAuditFindings.filter(finding => finding.area === 'resume') : []),
+      ...evidenceRepairs.filter(finding => finding.area === 'resume'),
+    ]
+    const coverLetterRepairs = [
+      ...(auditNeedsRepair ? factualAuditFindings.filter(finding => finding.area === 'cover_letter') : []),
+      ...evidenceRepairs.filter(finding => finding.area === 'cover_letter'),
+    ]
     setAutoPreparing(true)
-    setPackStage('resume')
+    setPreparationStartedAt(Date.now())
     try {
-      let adaptedResumeId = existingTailoredResume?.id
+      // Existing job documents are reused. A retry changes only the document
+      // area explicitly flagged by the independent audit.
+      let adaptedResumeId = job.finalResumeId ?? existingTailoredResume?.id
       if (!adaptedResumeId) {
+        setPackStage('resume')
         const { data, error } = await apiMutate<{ adaptedResumeId: string }>(`/api/jobs/${job.id}/tailor-resume`, 'POST', { resumeId: selectedResumeId })
         if (!data || error) throw new Error(error ?? 'Could not tailor the resume')
         adaptedResumeId = data.adaptedResumeId
-        const response = await fetch(`/api/resume/${adaptedResumeId}`)
-        if (response.ok) {
-          const tailored = await response.json() as Resume
-          setResumePreview(tailored)
-          setCachedApiResponse(`/api/resume/${adaptedResumeId}`, tailored)
-        }
+      } else if (resumeRepairs.length) {
+        setPackStage('resume')
+        const { data, error } = await apiMutate<{ adaptedResumeId: string }>(
+          `/api/jobs/${job.id}/tailor-resume`, 'POST',
+          { resumeId: adaptedResumeId, forceRetailor: true, auditFindings: resumeRepairs },
+        )
+        if (!data || error) throw new Error(error ?? 'Could not repair the flagged resume section')
+        adaptedResumeId = data.adaptedResumeId
+      }
+      const response = await fetch(`/api/resume/${adaptedResumeId}`)
+      if (response.ok) {
+        const tailored = await response.json() as Resume
+        setResumePreview(tailored)
+        setCachedApiResponse(`/api/resume/${adaptedResumeId}`, tailored)
       }
 
-      let revisionFindings: ApplicationAudit['findings'] = []
-      for (let attempt = 0; attempt < 2; attempt++) {
+      let coverLetter = job.finalCoverLetterId
+        ? coverLetters?.find(letter => letter.id === job.finalCoverLetterId)
+        : generatedCoverLetter ?? coverLetters?.find(letter => letter.resumeId === adaptedResumeId)
+      if (!coverLetter || coverLetterRepairs.length) {
         setPackStage('coverLetter')
-        // Reuse a manually prepared (or previously generated) letter for this
-        // tailored resume. A new letter is necessary only when one is missing,
-        // or after a failed audit triggers an AI resume revision.
-        const assignedCoverLetter = job.finalCoverLetterId
-          ? coverLetters?.find(letter => letter.id === job.finalCoverLetterId)
-          : undefined
-        // A final letter is reusable only when it was written for this exact
-        // resume version. This prevents an older letter silently travelling
-        // with a revised resume after an audit failure.
-        let coverLetter = attempt === 0
-          ? (assignedCoverLetter?.resumeId === adaptedResumeId ? assignedCoverLetter : undefined)
-            ?? coverLetters?.find(letter => letter.resumeId === adaptedResumeId)
-          : undefined
-        if (!coverLetter) {
-          const result = await apiMutate<CoverLetter>(
-            `/api/jobs/${job.id}/cover-letters/generate`, 'POST',
-            { resumeId: adaptedResumeId, preferProvidedResume: true, auditFindings: revisionFindings },
-          )
-          if (!result.data || result.error) throw new Error(result.error ?? 'Could not generate the cover letter')
-          coverLetter = result.data
-        }
-        setGeneratedCoverLetter(coverLetter)
-        void refetchCoverLetters()
+        const result = await apiMutate<CoverLetter>(
+          `/api/jobs/${job.id}/cover-letters/generate`, 'POST',
+          {
+            resumeId: adaptedResumeId,
+            preferProvidedResume: true,
+            auditFindings: coverLetterRepairs,
+            ...(coverLetter && coverLetterRepairs.length ? { repairCoverLetterId: coverLetter.id } : {}),
+          },
+        )
+        if (!result.data || result.error) throw new Error(result.error ?? 'Could not prepare the cover letter')
+        coverLetter = result.data
+      }
+      setGeneratedCoverLetter(coverLetter)
+      void refetchCoverLetters()
 
-        const { data: coverAssigned, error: coverAssignError } = await apiMutate<Job>(
+      if (job.finalCoverLetterId !== coverLetter.id) {
+        const { data: assigned, error: assignError } = await apiMutate<Job>(
           `/api/jobs/${job.id}/assign`, 'PATCH', { finalCoverLetterId: coverLetter.id },
         )
-        if (!coverAssigned || coverAssignError) throw new Error(coverAssignError ?? 'Could not select the cover letter')
-
-        setPackStage('audit')
-        let audit: ApplicationAudit | null = null
-        let auditError: string | null = null
-        for (let auditAttempt = 0; auditAttempt < 2; auditAttempt++) {
-          const result = await apiMutate<ApplicationAudit>(`/api/jobs/${job.id}/audit-application`, 'POST', { resumeId: adaptedResumeId, coverLetterId: coverLetter.id })
-          audit = result.data
-          auditError = result.error
-          if (audit || !auditError?.toLowerCase().includes('aborted')) break
-          await new Promise(resolve => setTimeout(resolve, 500))
-        }
-        if (!audit || auditError) throw new Error(auditError ?? 'Independent audit could not run')
-        setLatestAudit(audit)
-
-        if (audit.verdict === 'pass') {
-          setPackStage('review')
-          const { data: confirmed, error: confirmError } = await apiMutate<Job>(
-            `/api/jobs/${job.id}/assign`, 'PATCH', { finalResumeId: adaptedResumeId, finalCoverLetterId: coverLetter.id },
-          )
-          if (!confirmed || confirmError) throw new Error(confirmError ?? 'Could not confirm the audited package')
-          setAuditedPackKey(`${adaptedResumeId}:${coverLetter.id}`)
-          onUpdate(confirmed)
-          toast.success('Audited application pack ready', 'The final resume and cover letter are now available in this job.')
-          return
-        }
-
-        if (attempt === 0) {
-          revisionFindings = audit.findings
-          // The just-audited letter failed. Remove it from the selected
-          // package before generating a revised pair so no other surface can
-          // treat the failed letter as the current final document.
-          const { error: clearFailedLetterError } = await apiMutate(
-            `/api/jobs/${job.id}/assign`, 'PATCH', { finalCoverLetterId: null },
-          )
-          if (clearFailedLetterError) throw new Error(clearFailedLetterError)
-          setPackStage('resume')
-          const revisionResponse: { data: { adaptedResumeId: string } | null; error: string | null } = await apiMutate<{ adaptedResumeId: string }>(
-            `/api/jobs/${job.id}/tailor-resume`, 'POST',
-            { resumeId: adaptedResumeId, forceRetailor: true, auditFindings: audit.findings },
-          )
-          if (!revisionResponse.data || revisionResponse.error) throw new Error(revisionResponse.error ?? 'Could not revise the tailored resume after audit feedback')
-          adaptedResumeId = revisionResponse.data.adaptedResumeId
-          const response = await fetch(`/api/resume/${adaptedResumeId}`)
-          if (response.ok) {
-            const revised = await response.json() as Resume
-            setResumePreview(revised)
-            setCachedApiResponse(`/api/resume/${adaptedResumeId}`, revised)
-          }
-          continue
-        }
-
-        await apiMutate(`/api/jobs/${job.id}/assign`, 'PATCH', { finalCoverLetterId: null })
-        setOpenPackItem('audit')
-        toast.warning('Automatic revision needs your review', audit.summary)
+        if (!assigned || assignError) throw new Error(assignError ?? 'Could not select the cover letter')
+        onUpdate(assigned)
       }
+
+      setPackStage('audit')
+      const { data: audit, error: auditError } = await apiMutate<ApplicationAudit>(
+        `/api/jobs/${job.id}/audit-application`, 'POST', { resumeId: adaptedResumeId, coverLetterId: coverLetter.id },
+      )
+      if (!audit || auditError) throw new Error(auditError ?? 'Independent audit could not run')
+      setLatestAudit(audit)
+      if (audit.verdict !== 'pass') {
+        setPackStage('idle')
+        setOpenPackItem('audit')
+        toast.warning('Audit needs targeted corrections', audit.summary)
+        return
+      }
+
+      setPackStage('review')
+      const { data: confirmed, error: confirmError } = await apiMutate<Job>(
+        `/api/jobs/${job.id}/assign`, 'PATCH', { finalResumeId: adaptedResumeId, finalCoverLetterId: coverLetter.id },
+      )
+      if (!confirmed || confirmError) throw new Error(confirmError ?? 'Could not confirm the audited package')
+      setAuditedPackKey(`${adaptedResumeId}:${coverLetter.id}`)
+      onUpdate(confirmed)
+      toast.success('Audited application pack ready', 'The final resume and cover letter are now available in this job.')
     } catch (error) {
       setPackStage('idle')
       toast.error('Preparation could not finish', error instanceof Error ? error.message : 'Please try again')
     } finally {
       setAutoPreparing(false)
+      setPreparationStartedAt(null)
+    }
+  }
+
+  async function saveEvidenceAndRewrite() {
+    if (!evidenceFinding || !evidenceText.trim()) return
+    setSavingEvidence(true)
+    try {
+      const key = `audit_evidence_${Date.now()}`
+      const { error } = await apiMutate('/api/me/persona/fields', 'POST', {
+        fields: [{ key, category: 'work', label: `Audit evidence: ${evidenceFinding.title}`.slice(0, 120), value: evidenceText.trim(), confidence: 1, source: 'user_confirmed_audit' }],
+      })
+      if (error) throw new Error(error)
+      const finding = evidenceFinding
+      setEvidenceFinding(null)
+      setEvidenceText('')
+      toast.success('Evidence saved to Persona', 'AI is rewriting only the affected application content.')
+      await autoTailorAndAudit([finding])
+    } catch (error) {
+      toast.error('Could not save evidence', error instanceof Error ? error.message : 'Please try again')
+    } finally {
+      setSavingEvidence(false)
     }
   }
 
   // Drawer uses a slightly more compact variant of the shared INPUT_STYLE
   const drawerInputSt: React.CSSProperties = { ...INPUT_STYLE, fontSize: 11, padding: '5px 8px', borderRadius: 5 }
-  const canTailorResume = Boolean(job.description && (baseResumes.length || existingTailoredResume))
+  const canTailorResume = Boolean(job.description && (baseResumes.length || existingTailoredResume || job.finalResumeId))
   const currentPackAudited = auditedPackKey === `${job.finalResumeId}:${job.finalCoverLetterId}`
-    || (persistedAudit?.audit.verdict === 'pass'
-      && persistedAudit.resumeId === job.finalResumeId
-      && persistedAudit.coverLetterId === job.finalCoverLetterId)
+    || (storedAudit?.audit.verdict === 'pass'
+      && storedAudit.resumeId === job.finalResumeId
+      && storedAudit.coverLetterId === job.finalCoverLetterId)
 
   return (
     <>
@@ -685,8 +714,8 @@ function JobDetailDrawer({ job, onClose, onStatusChange, onUpdate, onDelete, onO
 
           <section style={{ borderBottom: '1px solid var(--border)', padding: '18px 0 22px' }}>
             <div style={{ display: 'flex', alignItems: 'center', gap: 9, fontSize: 11, fontWeight: 700, letterSpacing: '0.03em', color: '#64748b', marginBottom: 18 }}><Sparkles size={16} strokeWidth={2.4} style={{ color: '#2563eb', flexShrink: 0 }} />NEXT BEST ACTION</div>
-            <div style={{ fontSize: 20, lineHeight: 1.25, fontWeight: 700, letterSpacing: '-0.025em' }}>{auditNeedsRepair ? 'Correct factual issues before applying' : existingTailoredResume ? 'Resume is tailored for this job' : 'Tailor your resume for this job'}</div>
-            <div style={{ fontSize: 14, lineHeight: 1.5, color: 'var(--text-muted)', margin: '7px 0 16px' }}>{auditNeedsRepair ? 'The Auditor found unsupported claims. AI will rewrite both documents from your original resume, then run the audit again.' : existingTailoredResume ? 'Review the AI-tailored version before preparing the application pack.' : 'Create a role-specific version, review it in Resume, then return here.'}</div>
+            <div style={{ fontSize: 20, lineHeight: 1.25, fontWeight: 700, letterSpacing: '-0.025em' }}>{auditRetryOnly ? 'Retry the independent audit' : auditNeedsEvidence ? 'Confirm the missing evidence' : auditNeedsRepair ? 'Correct factual issues before applying' : existingTailoredResume ? 'Resume is tailored for this job' : 'Tailor your resume for this job'}</div>
+            <div style={{ fontSize: 14, lineHeight: 1.5, color: 'var(--text-muted)', margin: '7px 0 16px' }}>{auditRetryOnly ? 'Your resume and cover letter are unchanged. The auditor needs to return a structured result before you can continue.' : auditNeedsEvidence ? 'The auditor could not verify a claim from the current Persona. Add the accurate fact below; this is not a finding of fabrication.' : auditNeedsRepair ? 'The Auditor found unsupported claims. AI will rewrite only the affected document sections, then run the audit again.' : existingTailoredResume ? 'Review the AI-tailored version before preparing the application pack.' : 'Create a role-specific version, review it in Resume, then return here.'}</div>
 
             {auditNeedsRepair && <div style={{ marginBottom: 16, padding: '12px 14px', border: '1px solid #fecaca', background: '#fff7f7', borderRadius: 9 }}><div style={{ fontSize: 12, fontWeight: 800, color: '#b42318', marginBottom: 7 }}>FACTUAL ISSUES TO FIX</div>{factualAuditFindings.slice(0, 2).map((finding, index) => <div key={`${finding.title}-${index}`} style={{ color: '#7f1d1d', fontSize: 12, lineHeight: 1.45, marginTop: index ? 6 : 0 }}><strong>{finding.title}</strong><br />{finding.action}</div>)}</div>}
 
@@ -702,8 +731,9 @@ function JobDetailDrawer({ job, onClose, onStatusChange, onUpdate, onDelete, onO
               <Btn small onClick={handleTailorResume} disabled={tailoringLoading}>{tailoringLoading ? 'Creating tailored resume…' : 'Tailor in Resume'}</Btn>
             </div>}
             <div style={{ display: 'flex', alignItems: 'center', gap: 12, color: 'var(--text-muted)', margin: '4px 0 20px' }}><span style={{ height: 1, background: 'var(--border)', flex: 1 }} /><span>OR</span><span style={{ height: 1, background: 'var(--border)', flex: 1 }} /></div>
-            <button onClick={() => void autoTailorAndAudit()} disabled={autoPreparing || !canTailorResume} style={{ width: '100%', minHeight: 56, padding: '14px', border: `2px solid ${auditNeedsRepair ? '#dc2626' : '#2563eb'}`, borderRadius: 9, background: auditNeedsRepair ? '#fff7f7' : '#fff', color: auditNeedsRepair ? '#b42318' : '#2563eb', fontSize: 15, fontWeight: 700, cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 10, textAlign: 'center' }}><Sparkles size={19} style={{ flexShrink: 0 }} />{autoPreparing ? 'Correcting facts and re-auditing…' : auditNeedsRepair ? 'Fix with AI and re-audit' : 'Prepare full application pack automatically'}</button>
-            <div style={{ textAlign: 'center', fontSize: 13, lineHeight: 1.55, color: 'var(--text-muted)', margin: '12px 28px 28px' }}>{auditNeedsRepair ? 'This replaces unsupported claims; it does not invent experience, dates, or metrics.' : 'We’ll tailor your resume (if needed), generate a cover letter, and run an independent audit.'}</div>
+            <button onClick={() => auditNeedsEvidence ? setOpenPackItem('audit') : void autoTailorAndAudit()} disabled={autoPreparing || !canTailorResume} style={{ width: '100%', minHeight: 56, padding: '14px', border: `2px solid ${auditNeedsRepair ? '#dc2626' : '#2563eb'}`, borderRadius: 9, background: auditNeedsRepair ? '#fff7f7' : '#fff', color: auditNeedsRepair ? '#b42318' : '#2563eb', fontSize: 15, fontWeight: 700, cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 10, textAlign: 'center' }}><Sparkles size={19} style={{ flexShrink: 0 }} />{autoPreparing ? 'Preparing application pack…' : auditNeedsEvidence ? 'Review evidence needed' : auditRetryOnly ? 'Retry independent audit' : auditNeedsRepair ? 'Fix with AI and re-audit' : 'Prepare full application pack automatically'}</button>
+            {autoPreparing && <PreparationProgress stage={packStage} elapsed={preparationElapsed} />}
+            <div style={{ textAlign: 'center', fontSize: 13, lineHeight: 1.55, color: 'var(--text-muted)', margin: '12px 28px 28px' }}>{auditRetryOnly ? 'Retrying the audit reuses your current resume and cover letter; it does not create new documents.' : auditNeedsEvidence ? 'Adding a confirmed fact saves it to Persona, then rewrites only the affected content.' : auditNeedsRepair ? 'This replaces unsupported claims; it does not invent experience, dates, or metrics.' : 'We’ll tailor your resume (if needed), generate a cover letter, and run an independent audit.'}</div>
             <div style={{ borderTop: '1px solid var(--border)', paddingTop: 22, fontSize: 12, fontWeight: 700, letterSpacing: '0.03em', color: '#64748b' }}>APPLICATION PACK</div>
             <style>{`@keyframes pack-line-grow { from { transform: scaleY(0) } to { transform: scaleY(1) } } @keyframes pack-pulse { 0%,100% { box-shadow: 0 0 0 0 rgba(37,99,235,.35) } 50% { box-shadow: 0 0 0 7px rgba(37,99,235,0) } }`}</style>
             <PackRow number="1" title="Resume" detail={packStage === 'resume' ? 'AI tailoring this resume…' : 'Tailored for this role'} done={Boolean(previewResumeId)} active={packStage === 'resume'} open={openPackItem === 'resume'} onToggle={() => setOpenPackItem(current => current === 'resume' ? null : 'resume')}>
@@ -712,8 +742,8 @@ function JobDetailDrawer({ job, onClose, onStatusChange, onUpdate, onDelete, onO
             <PackRow number="2" title="Cover letter" detail={packStage === 'coverLetter' ? 'AI writing a tailored cover letter…' : selectedCoverLetter ? 'Generated for this job' : 'Created during automatic preparation'} done={Boolean(selectedCoverLetter)} active={packStage === 'coverLetter'} open={openPackItem === 'coverLetter'} onToggle={() => setOpenPackItem(current => current === 'coverLetter' ? null : 'coverLetter')}>
               <CoverLetterPackPreview coverLetter={selectedCoverLetter ?? null} applicant={resumePreview?.content.contact} fallbackName={resumePreview?.name ?? 'Applicant'} company={job.company} role={job.role} templateId={resumePreview?.templateId ?? undefined} templateOptions={resumePreview?.templateOptions ?? undefined} onReview={() => setDocumentPreview('coverLetter')} />
             </PackRow>
-            <PackRow number="3" title="Independent audit" detail={packStage === 'audit' ? 'Checking changes against your original resume…' : auditNeedsRepair ? `${factualAuditFindings.length} factual issue${factualAuditFindings.length === 1 ? '' : 's'} need correction` : displayedAudit ? 'Facts verified against the original resume' : 'Runs after the resume and cover letter are ready'} done={currentPackAudited} failed={auditNeedsRepair} active={packStage === 'audit'} open={openPackItem === 'audit'} onToggle={() => setOpenPackItem(current => current === 'audit' ? null : 'audit')}>
-              <AuditPackPreview audit={displayedAudit} onRepair={() => void autoTailorAndAudit()} repairing={autoPreparing} />
+            <PackRow number="3" title="Independent audit" detail={packStage === 'audit' ? 'Checking changes against your original resume…' : auditRetryOnly ? 'Audit response needs a retry' : auditNeedsEvidence ? `${evidenceGapFindings.length} fact${evidenceGapFindings.length === 1 ? '' : 's'} need your confirmation` : auditNeedsRepair ? `${factualAuditFindings.length} factual issue${factualAuditFindings.length === 1 ? '' : 's'} need correction` : displayedAudit ? 'Facts verified against the original resume' : 'Runs after the resume and cover letter are ready'} done={currentPackAudited} failed={auditNeedsRepair || auditNeedsEvidence || auditRetryOnly} active={packStage === 'audit'} open={openPackItem === 'audit'} onToggle={() => setOpenPackItem(current => current === 'audit' ? null : 'audit')}>
+              <AuditPackPreview audit={displayedAudit} onRepair={() => void autoTailorAndAudit()} onAddEvidence={finding => { setEvidenceFinding(finding); setEvidenceText('') }} repairing={autoPreparing} />
             </PackRow>
             {currentPackAudited && <button onClick={() => void downloadFinalPack()} disabled={downloadingPack} style={{ width: '100%', minHeight: 46, border: 0, borderRadius: 9, background: '#2563eb', color: '#fff', fontWeight: 700, cursor: 'pointer' }}>{downloadingPack ? (exportedPackFolder ? 'Opening job folder…' : 'Saving PDFs…') : exportedPackFolder ? 'Open job folder' : 'Save audited PDFs to D:\\My Jobs resume'}</button>}
             <PackRow number="4" title="Open & fill application" detail="Available after all items are complete" done={false} locked={!currentPackAudited} last onClick={currentPackAudited && job.url ? () => window.open(job.url!, '_blank', 'noopener,noreferrer') : undefined} />
@@ -912,6 +942,7 @@ function JobDetailDrawer({ job, onClose, onStatusChange, onUpdate, onDelete, onO
 
         {documentPreview === 'resume' && resumePreview && <DocumentPreviewModal title={resumePreview.name} onClose={() => setDocumentPreview(null)}><ResumeRenderer content={resumePreview.content} templateId={resumePreview.templateId} templateOptions={resumePreview.templateOptions} /></DocumentPreviewModal>}
         {documentPreview === 'coverLetter' && selectedCoverLetter && <DocumentPreviewModal title="AI-generated cover letter" onClose={() => setDocumentPreview(null)}><CoverLetterPreview content={selectedCoverLetter.content} applicant={resumePreview?.content.contact} fallbackName={resumePreview?.name ?? 'Applicant'} company={job.company} role={job.role} templateId={resumePreview?.templateId ?? selectedCoverLetter.templateId ?? 'clean'} templateOptions={resumePreview?.templateOptions ?? selectedCoverLetter.templateOptions ?? {}} /></DocumentPreviewModal>}
+        {evidenceFinding && <EvidenceCaptureModal finding={evidenceFinding} value={evidenceText} saving={savingEvidence} onChange={setEvidenceText} onClose={() => !savingEvidence && setEvidenceFinding(null)} onSave={() => void saveEvidenceAndRewrite()} />}
 
         {/* Footer */}
         <div style={{ padding: '12px 18px', borderTop: '0.5px solid var(--border)', display: 'flex', gap: 8 }}>
@@ -986,6 +1017,16 @@ function PackRow({ number, title, detail, done, failed = false, active = false, 
   </div>
 }
 
+function PreparationProgress({ stage, elapsed }: { stage: 'idle' | 'resume' | 'coverLetter' | 'audit' | 'review'; elapsed: number }) {
+  const current = stage === 'audit' ? 3 : stage === 'coverLetter' ? 2 : 1
+  const labels = ['Preparing resume', 'Preparing cover letter', 'Running independent audit']
+  return <div role="status" style={{ marginTop: 12, padding: '12px 14px', border: '1px solid #bfdbfe', borderRadius: 9, background: '#f8fbff' }}>
+    <div style={{ display: 'flex', justifyContent: 'space-between', gap: 12, fontSize: 12, fontWeight: 700, color: '#1d4ed8' }}><span>{labels[current - 1]}…</span><span style={{ fontVariantNumeric: 'tabular-nums' }}>{formatDuration(elapsed)}</span></div>
+    <div style={{ height: 6, overflow: 'hidden', marginTop: 9, borderRadius: 999, background: '#dbeafe' }}><div style={{ width: `${Math.max(12, current * 30)}%`, height: '100%', borderRadius: 999, background: '#2563eb', transition: 'width .35s ease' }} /></div>
+    <div style={{ marginTop: 8, fontSize: 11, color: '#64748b' }}>Usually 1–3 minutes. You can keep this panel open while we work.</div>
+  </div>
+}
+
 function ResumePackPreview({ resume, onReview }: { resume: Resume | null; onReview: () => void }) {
   if (!resume) return <div style={{ fontSize: 13, color: 'var(--text-muted)' }}>The tailored resume will appear here once AI tailoring finishes.</div>
   const templateLabel = resume.templateId ? `${resume.templateId[0].toUpperCase()}${resume.templateId.slice(1)} template` : 'Clean template'
@@ -1018,11 +1059,25 @@ function DocumentPreviewModal({ title, onClose, children }: { title: string; onC
   </div>
 }
 
-function AuditPackPreview({ audit, onRepair, repairing }: { audit: ApplicationAudit | null; onRepair: () => void; repairing: boolean }) {
+function EvidenceCaptureModal({ finding, value, saving, onChange, onClose, onSave }: { finding: ApplicationAuditFinding; value: string; saving: boolean; onChange: (value: string) => void; onClose: () => void; onSave: () => void }) {
+  return <div role="dialog" aria-modal="true" aria-label="Add Persona evidence" style={{ position: 'fixed', inset: 0, zIndex: 140, display: 'grid', placeItems: 'center', padding: 24, background: 'rgba(15,23,42,.62)' }} onMouseDown={onClose}>
+    <div style={{ width: 'min(560px, calc(100vw - 40px))', padding: 22, borderRadius: 14, background: '#fff', boxShadow: '0 24px 80px rgba(15,23,42,.42)' }} onMouseDown={event => event.stopPropagation()}>
+      <div style={{ display: 'flex', justifyContent: 'space-between', gap: 16 }}><div><div style={{ fontSize: 17, fontWeight: 750, color: '#0f172a' }}>Add verified Persona evidence</div><div style={{ marginTop: 5, fontSize: 13, lineHeight: 1.5, color: '#64748b' }}>This is missing evidence, not a finding of fabrication. Your confirmed fact will be saved to Persona and used only to rewrite the affected content.</div></div><button onClick={onClose} disabled={saving} aria-label="Close" style={{ alignSelf: 'start', border: 0, background: 'transparent', color: '#475569', cursor: 'pointer' }}><X size={20} /></button></div>
+      <div style={{ marginTop: 16, padding: '10px 12px', borderLeft: '3px solid #d97706', background: '#fffbeb', fontSize: 12, lineHeight: 1.5, color: '#475569' }}><strong style={{ color: '#92400e' }}>{finding.title}</strong><br />{finding.evidence}</div>
+      <label style={{ display: 'block', marginTop: 16, fontSize: 13, fontWeight: 700, color: '#1e293b' }}>What is the accurate, confirmed fact?<textarea value={value} onChange={event => onChange(event.target.value)} placeholder="Example: At InsightSec (Apr 2021–Dec 2022), I designed REST APIs for the internal risk platform. I did not manage Azure or Kubernetes deployments." autoFocus style={{ display: 'block', width: '100%', minHeight: 116, marginTop: 7, padding: 10, resize: 'vertical', border: '1px solid #cbd5e1', borderRadius: 8, color: '#0f172a', font: 'inherit', fontSize: 13, lineHeight: 1.5 }} /></label>
+      <div style={{ marginTop: 8, fontSize: 11, lineHeight: 1.45, color: '#64748b' }}>Only enter facts you can personally confirm. Do not add passwords, financial identifiers, government IDs, or sensitive personal data.</div>
+      <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 10, marginTop: 18 }}><button onClick={onClose} disabled={saving} style={{ border: '1px solid #cbd5e1', borderRadius: 8, padding: '8px 12px', background: '#fff', color: '#475569', fontWeight: 700, cursor: 'pointer' }}>Cancel</button><button onClick={onSave} disabled={saving || !value.trim()} style={{ border: 0, borderRadius: 8, padding: '8px 12px', background: saving || !value.trim() ? '#93c5fd' : '#2563eb', color: '#fff', fontWeight: 700, cursor: saving || !value.trim() ? 'default' : 'pointer' }}>{saving ? 'Saving evidence…' : 'Save evidence & rewrite'}</button></div>
+    </div>
+  </div>
+}
+
+function AuditPackPreview({ audit, onRepair, onAddEvidence, repairing }: { audit: ApplicationAudit | null; onRepair: () => void; onAddEvidence: (finding: ApplicationAuditFinding) => void; repairing: boolean }) {
   if (!audit) return <div style={{ fontSize: 13, color: 'var(--text-muted)' }}>No audit result yet. The audit checks the tailored resume and cover letter against the original resume before the application can be opened.</div>
-  const issues = audit.findings.filter(finding => finding.area !== 'job_match' && finding.severity !== 'pass')
+  const retryOnly = audit.findings.some(finding => finding.title === 'Audit response needs retry')
+  const evidenceGaps = audit.findings.filter(finding => finding.area !== 'job_match' && finding.resolution === 'evidence_needed')
+  const issues = audit.findings.filter(finding => finding.area !== 'job_match' && finding.severity !== 'pass' && finding.resolution !== 'evidence_needed')
   const passed = audit.findings.filter(finding => finding.severity === 'pass').length
-  return <div><div style={{ display: 'flex', justifyContent: 'space-between', gap: 10, fontSize: 13, fontWeight: 700 }}><span>{audit.verdict === 'pass' ? 'Factual integrity passed' : `${issues.length} factual issue${issues.length === 1 ? '' : 's'} need correction`}</span><span style={{ color: audit.verdict === 'pass' ? '#3b8c1a' : audit.verdict === 'blocked' ? '#b42318' : '#a16207', whiteSpace: 'nowrap' }}>Role match {audit.matchScore}%</span></div>{issues.length > 0 && <div style={{ marginTop: 10, display: 'grid', gap: 8 }}>{issues.map((finding, index) => <div key={`${finding.title}-${index}`} style={{ padding: '9px 10px', borderLeft: `3px solid ${finding.severity === 'critical' ? '#dc2626' : '#d97706'}`, background: finding.severity === 'critical' ? '#fff7f7' : '#fffbeb', fontSize: 12, lineHeight: 1.45 }}><strong style={{ color: finding.severity === 'critical' ? '#b42318' : '#a16207' }}>{finding.title}</strong><div style={{ color: '#475569', marginTop: 3 }}>{finding.action}</div></div>)}</div>}{passed > 0 && <div style={{ marginTop: 10, color: '#3b8c1a', fontSize: 12 }}>{passed} supported check{passed === 1 ? '' : 's'} passed</div>}{audit.verdict !== 'pass' && <button onClick={onRepair} disabled={repairing} style={{ marginTop: 12, border: '1px solid #2563eb', background: '#fff', color: '#2563eb', borderRadius: 7, padding: '8px 10px', fontWeight: 700, cursor: 'pointer' }}>{repairing ? 'Correcting facts and re-auditing…' : 'Fix with AI and re-audit'}</button>}</div>
+  return <div><div style={{ display: 'flex', justifyContent: 'space-between', gap: 10, fontSize: 13, fontWeight: 700 }}><span>{audit.verdict === 'pass' ? 'Factual integrity passed' : retryOnly ? 'Audit response needs retry' : evidenceGaps.length ? `${evidenceGaps.length} fact${evidenceGaps.length === 1 ? '' : 's'} need your confirmation` : `${issues.length} factual issue${issues.length === 1 ? '' : 's'} need correction`}</span><span style={{ color: audit.verdict === 'pass' ? '#3b8c1a' : audit.verdict === 'blocked' ? '#b42318' : '#a16207', whiteSpace: 'nowrap' }}>Role match {audit.matchScore}%</span></div>{evidenceGaps.length > 0 && <div style={{ marginTop: 10, display: 'grid', gap: 8 }}>{evidenceGaps.map((finding, index) => <div key={`${finding.title}-${index}`} style={{ padding: '10px', borderLeft: '3px solid #2563eb', background: '#f8fbff', fontSize: 12, lineHeight: 1.45 }}><strong style={{ color: '#1d4ed8' }}>Evidence needed · {finding.title}</strong><div style={{ marginTop: 3, color: '#475569' }}>{finding.action}</div><button onClick={() => onAddEvidence(finding)} disabled={repairing} style={{ marginTop: 8, border: '1px solid #2563eb', borderRadius: 7, padding: '6px 8px', background: '#fff', color: '#2563eb', fontWeight: 700, cursor: 'pointer' }}>Add evidence & rewrite</button></div>)}</div>}{issues.length > 0 && <div style={{ marginTop: 10, display: 'grid', gap: 8 }}>{issues.map((finding, index) => <div key={`${finding.title}-${index}`} style={{ padding: '9px 10px', borderLeft: `3px solid ${finding.severity === 'critical' ? '#dc2626' : '#d97706'}`, background: finding.severity === 'critical' ? '#fff7f7' : '#fffbeb', fontSize: 12, lineHeight: 1.45 }}><strong style={{ color: finding.severity === 'critical' ? '#b42318' : '#a16207' }}>{finding.title}</strong><div style={{ color: '#475569', marginTop: 3 }}>{finding.action}</div></div>)}</div>}{retryOnly && <div style={{ marginTop: 10, fontSize: 12, lineHeight: 1.5, color: 'var(--text-muted)' }}>{audit.summary}</div>}{passed > 0 && <div style={{ marginTop: 10, color: '#3b8c1a', fontSize: 12 }}>{passed} supported check{passed === 1 ? '' : 's'} passed</div>}{issues.length > 0 && <button onClick={onRepair} disabled={repairing} style={{ marginTop: 12, border: '1px solid #dc2626', background: '#fff', color: '#b42318', borderRadius: 7, padding: '8px 10px', fontWeight: 700, cursor: 'pointer' }}>{repairing ? 'Correcting facts and re-auditing…' : 'Fix with AI and re-audit'}</button>}{retryOnly && <button onClick={onRepair} disabled={repairing} style={{ marginTop: 12, border: '1px solid #2563eb', background: '#fff', color: '#2563eb', borderRadius: 7, padding: '8px 10px', fontWeight: 700, cursor: 'pointer' }}>{repairing ? 'Retrying independent audit…' : 'Retry independent audit'}</button>}</div>
 }
 
 function JobDetail({ label, value, href }: { label: string; value: string; href?: string }) {

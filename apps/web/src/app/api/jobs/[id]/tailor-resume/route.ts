@@ -8,6 +8,8 @@ import { Prisma } from '@prisma/client'
 import { db } from '@/lib/db'
 import { prepareAiRoute, ok, err } from '@/lib/api-helpers'
 import { modelChat, parseAiJson } from '@/lib/model-router'
+import { buildPersona } from '@/lib/persona'
+import { personaEvidenceContext } from '@/lib/persona-evidence'
 import type { ApplicationAuditFinding } from '@/lib/types'
 
 type Params = { params: Promise<{ id: string }> }
@@ -43,6 +45,26 @@ function parseAfterValue(after: unknown): unknown {
   } catch {
     return after
   }
+}
+
+function sectionsForAuditRepair(findings: ApplicationAuditFinding[]) {
+  const text = findings
+    .filter(finding => finding.area === 'resume' && finding.severity !== 'pass')
+    .map(finding => `${finding.title} ${finding.evidence} ${finding.action}`.toLowerCase())
+    .join(' ')
+  const matches: Array<typeof SECTIONS[number]> = []
+  const add = (section: typeof SECTIONS[number], terms: string[]) => {
+    if (terms.some(term => text.includes(term))) matches.push(section)
+  }
+  add('experience', ['experience', 'employer', 'employment', 'company', 'role', 'title', 'date', 'duration'])
+  add('summary', ['summary', 'profile', 'headline'])
+  add('skills', ['skill', 'technology', 'tooling'])
+  add('education', ['education', 'degree', 'university'])
+  add('projects', ['project', 'portfolio'])
+  add('certifications', ['certification', 'certificate', 'credential'])
+  // When the auditor cannot identify a section, restrict the repair to the
+  // summary instead of re-writing every part of the candidate's resume.
+  return matches.length ? [...new Set(matches)] : ['summary']
 }
 
 export async function POST(req: NextRequest, { params }: Params) {
@@ -81,14 +103,19 @@ export async function POST(req: NextRequest, { params }: Params) {
   if (!sourceResume) return err('The original resume for this tailored version could not be found', 404)
 
   const resumeContent = sourceResume.content as Record<string, unknown>
+  const persona = await buildPersona(prep.userId, 'tailor')
+  const evidence = await personaEvidenceContext(prep.userId, 'tailor', `${job.role} ${job.description}`).catch(() => '')
   const adaptedContent = cloneJson(resumeContent)
   const changes: ChangeDetail[] = []
   const corrections = Array.isArray(auditFindings)
-    ? auditFindings.filter(finding => finding.severity !== 'pass').slice(0, 6)
+    ? auditFindings.filter(finding => finding.area === 'resume' && finding.severity !== 'pass').slice(0, 6)
       .map(finding => `- ${finding.area}: ${finding.title}. Required correction: ${finding.action}`)
     : []
+  const sectionsToTailor = forceRetailor && corrections.length
+    ? sectionsForAuditRepair(auditFindings)
+    : SECTIONS
 
-  for (const section of SECTIONS) {
+  for (const section of sectionsToTailor) {
     const currentValue = resumeContent[section]
     if (currentValue === undefined || currentValue === null) continue
 
@@ -96,7 +123,8 @@ export async function POST(req: NextRequest, { params }: Params) {
     const prompt = [
       'You are an expert ATS resume editor.',
       'Tailor the provided resume section to the target job while preserving truthful candidate facts.',
-      'Use job-description keywords only where they are supported by the resume content.',
+      'The confirmed Persona is a hard factual boundary. Do not add facts that are unsupported by BOTH the source resume and Persona. If there is any conflict, preserve the source resume.',
+      'Use job-description keywords only where they are supported by the resume content or Persona.',
       '',
       `SECTION: ${section}`,
       `CURRENT SECTION JSON:\n${before}`,
@@ -104,6 +132,8 @@ export async function POST(req: NextRequest, { params }: Params) {
       `TARGET JOB: ${job.role} at ${job.company}`,
       job.keywords ? `KNOWN KEYWORDS: ${job.keywords}` : '',
       `JOB DESCRIPTION:\n${job.description.slice(0, 1800)}`,
+      `CONFIRMED PERSONA:\n${persona.slice(0, 9000)}`,
+      evidence,
       corrections.length ? `AUDIT CORRECTIONS (remove or rewrite unsupported claims; never invent evidence):\n${corrections.join('\n')}` : '',
       '',
       'Return ONLY JSON in this shape:',

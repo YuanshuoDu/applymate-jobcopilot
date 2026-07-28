@@ -3,6 +3,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest'
 const mocks = vi.hoisted(() => ({
   resumeFindFirst: vi.fn(), jobFindFirst: vi.fn(), resumeCreate: vi.fn(), activityCreate: vi.fn(),
   modelChat: vi.fn(), parseAiJson: vi.fn(),
+  buildPersona: vi.fn(),
 }))
 
 vi.mock('@/lib/db', () => ({
@@ -13,6 +14,7 @@ vi.mock('@/lib/db', () => ({
   },
 }))
 vi.mock('@/lib/model-router', () => ({ modelChat: mocks.modelChat, parseAiJson: mocks.parseAiJson }))
+vi.mock('@/lib/persona', () => ({ buildPersona: mocks.buildPersona }))
 
 import { tailorResumeForAgent } from './resume-tailoring'
 
@@ -28,6 +30,7 @@ describe('tailorResumeForAgent', () => {
     mocks.parseAiJson.mockReturnValue({ summary: 'Backend engineer building TypeScript APIs', skills: ['TypeScript', 'APIs'] })
     mocks.resumeCreate.mockResolvedValue({ id: 'resume_tailored', name: 'Tailored for N26 - Backend Engineer' })
     mocks.activityCreate.mockResolvedValue({})
+    mocks.buildPersona.mockResolvedValue('EXPERIENCE:\n- Backend engineer at ApplyMate')
   })
 
   it('creates a reviewable, job-linked resume while preserving the base template', async () => {
@@ -37,7 +40,7 @@ describe('tailorResumeForAgent', () => {
     expect(mocks.resumeCreate).toHaveBeenCalledWith({ data: expect.objectContaining({
       userId: 'user_1', parentResumeId: 'resume_1', targetJobId: 'job_1', templateId: 'modern', kind: 'adapted', origin: 'ai-adapted',
     }) })
-    expect(mocks.modelChat).toHaveBeenCalledWith(expect.arrayContaining([expect.objectContaining({ content: expect.stringContaining('Preserve truthful candidate facts') })]), expect.any(Object), 2400)
+    expect(mocks.modelChat).toHaveBeenCalledWith(expect.arrayContaining([expect.objectContaining({ content: expect.stringContaining('CONFIRMED PERSONA') })]), expect.any(Object), 2400)
   })
 
   it('reuses an existing candidate artifact rather than creating a duplicate', async () => {

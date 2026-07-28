@@ -7,6 +7,8 @@ const mockModelChat = vi.fn()
 vi.mock('@/lib/model-router', () => ({
   modelChat: mockModelChat,
   stripFences: (raw: string) => raw.replace(/^```(?:json)?\n?/, '').replace(/\n?```$/, ''),
+  withMiniMaxThinking: (config: { provider: string; model: string }, thinking: 'adaptive' | 'disabled') =>
+    config.provider === 'minimax' && config.model === 'MiniMax-M3' ? { ...config, thinking } : config,
 }))
 
 vi.mock('@/lib/db', () => ({

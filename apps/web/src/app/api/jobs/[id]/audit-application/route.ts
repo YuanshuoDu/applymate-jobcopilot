@@ -8,7 +8,8 @@
 import { NextRequest } from 'next/server'
 import { db } from '@/lib/db'
 import { prepareAiRoute, requireAuth, isErrorResponse, ok, err } from '@/lib/api-helpers'
-import { modelChat, parseAiJson, type AiConfig } from '@/lib/model-router'
+import { modelChat, parseAiJson, resolveConfig, withMiniMaxThinking, type AiConfig } from '@/lib/model-router'
+import { buildPersona } from '@/lib/persona'
 import type { ApplicationAudit, ApplicationAuditFinding, ResumeContent } from '@/lib/types'
 
 type Params = { params: Promise<{ id: string }> }
@@ -35,9 +36,10 @@ function toText(content: ResumeContent): string {
 }
 
 function normalize(raw: RawAudit, source: ApplicationAudit['source']): ApplicationAudit {
-  const findings = (Array.isArray(raw.findings) ? raw.findings : []).slice(0, 12).map(finding => ({
+  const findings: ApplicationAuditFinding[] = (Array.isArray(raw.findings) ? raw.findings : []).slice(0, 12).map(finding => ({
     area: AREAS.has(finding.area as ApplicationAuditFinding['area']) ? finding.area as ApplicationAuditFinding['area'] : 'resume',
     severity: SEVERITIES.has(finding.severity as ApplicationAuditFinding['severity']) ? finding.severity as ApplicationAuditFinding['severity'] : 'warning',
+    resolution: finding.resolution === 'evidence_needed' ? 'evidence_needed' : 'contradiction',
     title: String(finding.title ?? 'Review application material').slice(0, 120),
     evidence: String(finding.evidence ?? 'The auditor could not establish enough evidence.').slice(0, 500),
     action: String(finding.action ?? 'Review and correct this item before confirming.').slice(0, 300),
@@ -49,6 +51,7 @@ function normalize(raw: RawAudit, source: ApplicationAudit['source']): Applicati
   const incomplete = (['resume', 'cover_letter'] as const).filter(area => !auditedAreas.has(area))
   if (incomplete.length) findings.push({
     area: incomplete[0], severity: 'warning', title: 'Incomplete independent audit',
+    resolution: 'evidence_needed',
     evidence: `The Auditor did not return a result for: ${incomplete.join(', ')}.`,
     action: 'Run the audit again before confirming the application package.',
   })
@@ -68,6 +71,70 @@ function normalize(raw: RawAudit, source: ApplicationAudit['source']): Applicati
 
 function auditActivityText(resumeId: string, coverLetterId: string, audit: ApplicationAudit) {
   return `${AUDIT_ACTIVITY_PREFIX}${JSON.stringify({ resumeId, coverLetterId, audit })}`
+}
+
+function isAbortError(error: unknown) {
+  return error instanceof Error && error.name === 'AbortError'
+}
+
+function isMiniMaxReasoningExhausted(error: unknown, cfg: AiConfig) {
+  return cfg.provider === 'minimax'
+    && error instanceof Error
+    && error.message.includes('minimax returned no final content (finish reason: length)')
+}
+
+async function runAuditModel(prompt: string, cfg: AiConfig) {
+  let lastError: unknown
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      // Keep the audit output bounded; M3 uses adaptive reasoning by default.
+      return await modelChat([{ role: 'user', content: prompt }], cfg, 2_048)
+    } catch (error) {
+      lastError = error
+      if (isMiniMaxReasoningExhausted(error, cfg)) {
+        // M3 can retry the same evidence audit without private reasoning. This
+        // preserves its factual-audit capability while guaranteeing final JSON.
+        if (cfg.model === 'MiniMax-M3') {
+          return modelChat([{ role: 'user', content: prompt }], withMiniMaxThinking(cfg, 'disabled'), 2_048)
+        }
+        // Keep a direct-answer fallback for users who explicitly retain M2.x.
+        return modelChat([{ role: 'user', content: prompt }], { ...cfg, model: 'MiniMax-Text-01' }, 1_800)
+      }
+      if (!isAbortError(error) || attempt === 1) throw error
+      await new Promise(resolve => setTimeout(resolve, 750))
+    }
+  }
+  throw lastError
+}
+
+function unavailableAudit(source: ApplicationAudit['source']): ApplicationAudit {
+  return {
+    verdict: 'needs_review',
+    summary: 'The auditor did not return a structured result. No application documents were changed; retry the independent audit.',
+    matchScore: 0,
+    findings: [{
+      area: 'job_match', severity: 'warning', title: 'Audit response needs retry',
+      evidence: 'The AI response was not valid structured audit data.',
+      action: 'Retry the independent audit. The existing resume and cover letter will be reused unchanged.',
+    }],
+    source,
+    auditedAt: new Date().toISOString(),
+  }
+}
+
+async function runParsedAudit(prompt: string, cfg: AiConfig, source: ApplicationAudit['source']) {
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const retryInstruction = attempt
+      ? '\n\nYour previous response was invalid. Return only the JSON object — no prose, markdown, or reasoning.'
+      : ''
+    const result = await runAuditModel(prompt + retryInstruction, cfg)
+    try {
+      return { result, audit: normalize(parseAiJson<RawAudit>(result.text), source) }
+    } catch {
+      if (attempt === 1) return { result, audit: unavailableAudit(source) }
+    }
+  }
+  throw new Error('Independent audit did not produce a result')
 }
 
 function parseStoredAudit(text: string): StoredApplicationAudit | null {
@@ -103,9 +170,10 @@ export async function POST(req: NextRequest, { params }: Params) {
   const { resumeId, coverLetterId } = body as { resumeId?: string; coverLetterId?: string }
   if (!resumeId) return err('resumeId is required')
 
-  const [job, resume] = await Promise.all([
+  const [job, resume, persona] = await Promise.all([
     db.job.findFirst({ where: { id: jobId, userId: prep.userId } }),
     db.resume.findFirst({ where: { id: resumeId, userId: prep.userId } }),
+    buildPersona(prep.userId, 'tailor'),
   ])
   if (!job) return err('Job not found', 404)
   if (!resume) return err('Resume not found', 404)
@@ -136,25 +204,31 @@ export async function POST(req: NextRequest, { params }: Params) {
   const auditorRole = await db.agentRole.findFirst({
     where: { userId: prep.userId, role: 'auditor' }, select: { provider: true, model: true, apiKey: true, systemPrompt: true },
   }).catch(() => null)
-  const cfg: AiConfig = auditorRole
+  const configuredAuditor: AiConfig | null = auditorRole
     ? { provider: auditorRole.provider as AiConfig['provider'], model: auditorRole.model, apiKey: auditorRole.apiKey ?? undefined }
+    : null
+  const cfg: AiConfig = configuredAuditor && resolveConfig(configuredAuditor).resolvedKey
+    ? configuredAuditor
     : prep.cfg
   const rolePrompt = auditorRole?.systemPrompt ?? 'You are an independent application auditor. Be conservative and evidence-based.'
 
   const prompt = `${rolePrompt}
 
 You are auditing, not rewriting. The SOURCE RESUME is the candidate's evidence baseline. The FINAL RESUME and COVER LETTER may contain AI edits.
-Your only release gate is factual integrity. The SOURCE RESUME is the evidence baseline. Verify every concrete employer, current employment status or location, role, date or duration, credential, project, skill, metric, and outcome in the FINAL RESUME and COVER LETTER against that baseline.
+Your only release gate is factual integrity. The SOURCE RESUME and CONFIRMED PERSONA are the evidence baseline. Verify every concrete employer, current employment status or location, role, date or duration, credential, project, skill, metric, and outcome in the FINAL RESUME and COVER LETTER against that baseline.
 
-Mark "critical" only for a specific unsupported or contradictory claim (including stale/current-status claims such as saying the candidate currently works in Shanghai when the source dates ended). Mark "warning" only when a claim might be supported but needs the candidate to confirm the precise evidence. Quote the exact final claim and the source fact or absence in "evidence", and state a precise correction in "action".
+Use "resolution":"contradiction" and severity "critical" only when a source explicitly contradicts the final claim (including stale/current-status claims such as saying the candidate currently works in Shanghai when the source dates ended). Use "resolution":"evidence_needed" and severity "warning" when the source simply does not contain enough evidence to verify a claim: this is not fabrication, and the candidate may add a confirmed Persona fact or remove/soften the claim. Quote the exact final claim and the source fact or absence in "evidence", and state a precise correction in "action".
 
 Do not treat a missing job requirement, indirect experience, a different presentation order, or lack of Copilot/MLOps exposure as a factual issue. Those are optional fit notes only: put them in "job_match" with severity "pass" and wording like "Optional future emphasis", and never downgrade the verdict for them. Do not infer LLM automation from a general AI or Q&A project. Do not infer security-threat detection metrics from cybersecurity work.
 
 Return ONLY JSON. Always return at least one finding for EACH area: resume, cover_letter, and job_match. Use severity "pass" when an area is supported and safe. A pass verdict is valid only when resume and cover-letter claims are supported with no unresolved factual warnings.
-{"verdict":"pass|needs_review|blocked","summary":"...","matchScore":0,"findings":[{"area":"resume|cover_letter|job_match","severity":"pass|warning|critical","title":"...","evidence":"quote or precise comparison","action":"..."}]}
+{"verdict":"pass|needs_review|blocked","summary":"...","matchScore":0,"findings":[{"area":"resume|cover_letter|job_match","severity":"pass|warning|critical","resolution":"contradiction|evidence_needed","title":"...","evidence":"quote or precise comparison","action":"..."}]}
 
 SOURCE RESUME (truth baseline):
 ${toText(sourceContent)}
+
+CONFIRMED PERSONA (user-confirmed facts, also valid evidence):
+${persona.slice(0, 10_000)}
 
 FINAL RESUME TO AUDIT:
 ${toText(resume.content as unknown as ResumeContent)}
@@ -167,15 +241,14 @@ FINAL COVER LETTER TO AUDIT:
 ${coverLetter.content.slice(0, 8_000)}`
 
   try {
-    const result = await modelChat([{ role: 'user', content: prompt }], cfg, 3_000)
-    const audit = normalize(parseAiJson<RawAudit>(result.text), source)
+    const { result, audit } = await runParsedAudit(prompt, cfg, source)
     await db.activity.create({
       data: {
         userId: prep.userId, jobId, type: 'agent_action',
         color: audit.verdict === 'pass' ? '#059669' : audit.verdict === 'blocked' ? '#dc2626' : '#d97706',
         text: auditActivityText(resume.id, coverLetterId, audit),
       },
-    }).catch(() => {})
+    })
     return ok({ ...audit, _model: `${result.provider}/${result.model}` })
   } catch (error) {
     console.error('[/api/jobs/audit-application]', error)

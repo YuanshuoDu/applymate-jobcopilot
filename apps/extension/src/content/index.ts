@@ -5,7 +5,7 @@
  *  • Detail page → inline Save to ApplyMate near the job action buttons
  */
 import { detectAndScrape } from '@/lib/scrapers/detect'
-import { startListModeInjector, isJobListPage } from './list-injector'
+import { startListModeInjector, isJobListPage, markJobSaved } from './list-injector'
 import { tryInjectAutoFillButton, removeAutoFillButton, applyFieldValues, updateButtonState } from './form-injector'
 import { findDetailActionHost, mountDetailButtonContainer } from './detail-button-placement'
 import { detectAndScanForms } from '../lib/form-filler/detectors/detect'
@@ -13,6 +13,7 @@ import { generateId } from '../lib/form-filler/form-scanner'
 import { openUploadPicker } from '../lib/form-filler/auto-fill'
 import type { ExtensionSettings, ScrapedJob } from '@/lib/types'
 import { isJobReadyForTailoring, mergeJobDetails } from '@/lib/job-quality'
+import { getJobIdentity } from '@/lib/job-identity'
 
 type ContentRuntime = {
   marker?: string
@@ -70,6 +71,26 @@ function publishJob(job: ScrapedJob) {
   currentJob = stamped
   chrome.runtime.sendMessage({ type: 'JOB_SCRAPED', job: stamped }).catch(() => {})
 }
+
+function renderVisibleDetailSaved() {
+  const btn = document.querySelector<HTMLButtonElement>(
+    `#${BUTTON_ID} button, #am-lazy-btn`,
+  )
+  if (!btn) return
+  btn.disabled = true
+  delete btn.dataset.applymateBusy
+  btn.innerHTML = '<span>✓ Saved to ApplyMate</span>'
+  btn.title = 'Saved to ApplyMate'
+  btn.style.setProperty('background', '#3B6D11', 'important')
+  btn.style.setProperty('opacity', '1', 'important')
+}
+
+window.addEventListener('applymate:job-saved', (event) => {
+  const key = (event as CustomEvent<{ key?: unknown }>).detail?.key
+  if (!currentJob || typeof key !== 'string' || key !== getJobIdentity(currentJob)) return
+  lastSavedPanelSignature = getPanelSignature()
+  renderVisibleDetailSaved()
+})
 
 type DetailReadResult = {
   job: ScrapedJob | null
@@ -839,6 +860,7 @@ function injectLazySaveButton() {
     try {
       const response = await chrome.runtime.sendMessage({ type: 'SAVE_JOB', job: currentJob })
       if (response?.success) {
+        markJobSaved(currentJob)
         btn.innerHTML = '✓ Saved!'
         btn.style.setProperty('background', '#3B6D11', 'important')
         btn.style.setProperty('opacity', '1', 'important')
@@ -941,6 +963,7 @@ async function saveDetailJob(btn: HTMLButtonElement, wrap: HTMLElement, mode: 'i
     log('SAVE_JOB response:', response)
 
     if (response?.success) {
+      markJobSaved(currentJob)
       btn.innerHTML = '✓ Saved!'
       btn.style.setProperty('background', '#3B6D11', 'important')
       btn.style.setProperty('opacity', '1', 'important')

@@ -1,7 +1,8 @@
 import { NextRequest } from 'next/server'
 import { db } from '@/lib/db'
 import { requireAuth, isErrorResponse, ok, err } from '@/lib/api-helpers'
-import type { PersonaField } from '@/lib/persona'
+import { validatePersonaField, type PersonaField } from '@/lib/persona'
+import { confirmPersonaFacts, isPersonaAllowedUse, listConfirmedPersonaFacts, revokePersonaFact } from '@/lib/persona-facts'
 import type { Prisma } from '@prisma/client'
 
 /**
@@ -14,13 +15,19 @@ export async function GET(req: NextRequest) {
   const auth = await requireAuth(req)
   if (isErrorResponse(auth)) return auth
 
-  const user = await db.user.findUnique({
+  const requestedUse = new URL(req.url).searchParams.get('use')
+  const allowedUse = isPersonaAllowedUse(requestedUse) ? requestedUse : undefined
+  if (requestedUse && !allowedUse) {
+    return err('use must be form_fill, tailor, or cover_letter')
+  }
+
+  const [user, confirmedFacts] = await Promise.all([db.user.findUnique({
     where: { id: auth.userId },
     select: { personaFields: true },
-  })
-  const fields = (user?.personaFields ?? []) as unknown as PersonaField[]
+  }), listConfirmedPersonaFacts(auth.userId, allowedUse)])
+  const fields = mergeFields((user?.personaFields ?? []) as unknown as PersonaField[], confirmedFacts)
 
-  return ok({ fields })
+  return privateOk({ fields })
 }
 
 export async function POST(req: NextRequest) {
@@ -32,7 +39,12 @@ export async function POST(req: NextRequest) {
     return err('fields array is required')
   }
 
+  if (body.fields.length > 100) return err('A Persona can contain at most 100 saved fields.')
   const incoming: PersonaField[] = body.fields
+  for (const field of incoming) {
+    const validationError = validatePersonaField(field)
+    if (validationError) return err(validationError)
+  }
 
   // Fetch existing fields
   const user = await db.user.findUnique({
@@ -45,19 +57,19 @@ export async function POST(req: NextRequest) {
   const map = new Map<string, PersonaField>()
   for (const f of existing) map.set(f.key, f)
   for (const f of incoming) {
-    if (!f.key || !f.value) continue
     const now = new Date().toISOString()
-    map.set(f.key, { ...f, updatedAt: now })
+    map.set(f.key, { ...f, updatedAt: now, consentAt: now })
   }
 
   const merged = Array.from(map.values())
 
+  const confirmedFacts = await confirmPersonaFacts(auth.userId, incoming)
   await db.user.update({
     where: { id: auth.userId },
     data: { personaFields: merged as unknown as Prisma.InputJsonValue },
   })
 
-  return ok({ fields: merged }, 200)
+  return privateOk({ fields: mergeFields(merged, confirmedFacts) })
 }
 
 export async function DELETE(req: NextRequest) {
@@ -78,6 +90,20 @@ export async function DELETE(req: NextRequest) {
     where: { id: auth.userId },
     data: { personaFields: filtered as unknown as Prisma.InputJsonValue },
   })
+  await revokePersonaFact(auth.userId, body.key)
 
-  return ok({ ok: true })
+  return privateOk({ ok: true })
+}
+
+/** New facts win on the same key while legacy JSON remains readable during rollout. */
+function mergeFields(legacy: PersonaField[], facts: PersonaField[]) {
+  const byKey = new Map(legacy.map(field => [field.key, field]))
+  for (const fact of facts) byKey.set(fact.key, fact)
+  return [...byKey.values()]
+}
+
+function privateOk<T>(data: T) {
+  const response = ok(data)
+  response.headers.set('Cache-Control', 'private, no-store')
+  return response
 }

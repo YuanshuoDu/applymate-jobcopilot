@@ -8,9 +8,9 @@ Ask yourself: "Would this answer stay the same if the candidate applied to a DIF
 
 Set personaRelevant: true if the answer describes the CANDIDATE THEMSELVES — information that is true regardless of which job/company they apply to. This is the candidate's permanent profile.
 
-EXPLICITLY set personaRelevant: true for ALL of these categories:
+EXPLICITLY set personaRelevant: true only for the permitted categories below. A later user confirmation is required before any answer can be saved.
 
-• IDENTITY: name (first, last, full), gender, sex, pronouns, date of birth, age, ethnicity, race
+• IDENTITY: name (first, last, full)
 • LEGAL STATUS: work authorization, visa status, sponsorship needed, citizenship, right to work
 • CONTACT: phone, mobile, email, home address, city, state/province, region, country, ZIP/postal code
 • COMPENSATION: current salary, desired salary, expected salary, minimum salary, salary range, hourly rate, compensation expectations
@@ -21,7 +21,7 @@ EXPLICITLY set personaRelevant: true for ALL of these categories:
 • LANGUAGES: spoken/written languages and proficiency levels
 • AWARDS & HONORS: scholarships, awards, honors, achievements
 • PROFESSIONAL PROFILES: LinkedIn URL, GitHub URL, portfolio website, personal website
-• MILITARY: veteran status, military service
+EXPLICITLY set personaRelevant: false for special-category or high-risk data, even if a form asks for it: gender, sex, pronouns, date of birth, age, ethnicity, race, religion, health, disability, veteran/military status, criminal history, passport/national ID, bank details, tax IDs, or social-security identifiers. Do not suggest saving these answers to Persona.
 
 EXPLICITLY set personaRelevant: false for:
 • Job-specific questions: "Why this company?", "Why this role?", "What makes you a good fit?"

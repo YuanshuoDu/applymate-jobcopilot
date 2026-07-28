@@ -111,8 +111,9 @@ export function buildUserMessage(
  */
 export function parseAction(raw: string): AgentAction | null {
   try {
-    // Strip markdown fences if present
-    let cleaned = raw.trim();
+    // Keep MiniMax's full response in multi-turn history, but remove private
+    // reasoning before parsing the JSON action for this turn.
+    let cleaned = raw.replace(/<think>[\s\S]*?<\/think>/gi, "").trim();
     if (cleaned.startsWith("```")) {
       cleaned = cleaned.replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/, "");
     }

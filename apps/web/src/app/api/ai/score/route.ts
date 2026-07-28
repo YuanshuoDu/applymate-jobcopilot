@@ -4,11 +4,11 @@
  */
 import { NextRequest } from 'next/server'
 import { prepareAiRoute, ok, err } from '@/lib/api-helpers'
-import { APPLYMATE_BACKING, modelChat, stripFences, type AiConfig, type ChatResult } from '@/lib/model-router'
+import { APPLYMATE_BACKING, modelChat, stripFences, withMiniMaxThinking, type AiConfig, type ChatResult } from '@/lib/model-router'
 import type { ResumeContent } from '@/lib/types'
 
 const SCORE_FALLBACKS: AiConfig[] = [
-  APPLYMATE_BACKING,
+  withMiniMaxThinking(APPLYMATE_BACKING, 'disabled'),
   { provider: 'deepseek', model: 'deepseek-chat' },
   { provider: 'deepseek', model: 'deepseek-v4-flash' },
   { provider: 'minimax', model: 'MiniMax-Text-01' },
@@ -27,7 +27,7 @@ export async function POST(req: NextRequest) {
   }
   if (!jobTitle && !jobDescription) return err('jobTitle or jobDescription is required')
 
-  const cfg        = prep.cfg
+  const cfg        = withMiniMaxThinking(prep.cfg, 'disabled')
   const resumeText = resumeContent ? resumeToText(resumeContent) : '(no resume)'
 
   const prompt = `Rate this resume against the job. Output ONLY this JSON (no other text):
@@ -130,7 +130,7 @@ async function scoreWithFallback(prompt: string, primary: AiConfig): Promise<{ r
 function dedupeConfigs(configs: AiConfig[]): AiConfig[] {
   const seen = new Set<string>()
   return configs.filter(cfg => {
-    const key = `${cfg.provider}::${cfg.model}::${cfg.apiBase ?? ''}`
+    const key = `${cfg.provider}::${cfg.model}::${cfg.apiBase ?? ''}::${cfg.thinking ?? ''}`
     if (seen.has(key)) return false
     seen.add(key)
     return true

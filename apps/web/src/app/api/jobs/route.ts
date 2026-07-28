@@ -66,6 +66,7 @@ export async function POST(req: NextRequest) {
   if (!body) return err('Invalid JSON body')
 
   const { company, role, location, url, description, salary, source, score, status, logo } = body
+  const canonicalUrl = canonicalizeJobUrl(url, source)
 
   if (!company || !role) return err('company and role are required')
   if (isExtensionSaveRequest(req) && !hasMinimumDescription(description)) {
@@ -75,8 +76,8 @@ export async function POST(req: NextRequest) {
     )
   }
 
-  if (url) {
-    const existing = await db.job.findFirst({ where: { userId: auth.userId, url } })
+  if (canonicalUrl) {
+    const existing = await db.job.findFirst({ where: { userId: auth.userId, url: canonicalUrl } })
     if (existing) {
       const job = await db.job.update({
         where: { id: existing.id },
@@ -99,7 +100,7 @@ export async function POST(req: NextRequest) {
       company,
       role,
       location:    location    ?? null,
-      url:         url         ?? null,
+      url:         canonicalUrl ?? null,
       description: description ?? null,
       salary:      salary      ?? null,
       source:      source      ?? 'manual',
@@ -160,6 +161,35 @@ function shouldRepairRole(existingRole: string | null, incomingCompany: unknown,
 
 function normalizedText(value: unknown): string {
   return typeof value === 'string' ? value.toLowerCase().replace(/[^a-z0-9]+/g, '') : ''
+}
+
+/**
+ * List and detail pages often use different tracking URLs for the same job.
+ * Store the provider's vacancy ID when available so the POST dedupe remains
+ * effective after an extension restart or a page refresh.
+ */
+function canonicalizeJobUrl(value: unknown, source: unknown): string | null {
+  if (typeof value !== 'string' || !value.trim()) return null
+  try {
+    const url = new URL(value)
+    const provider = typeof source === 'string' ? source.toLowerCase() : ''
+    if (provider === 'linkedin') {
+      const id = url.searchParams.get('currentJobId') ||
+        url.pathname.match(/\/jobs\/view\/(?:[^/?#]*-)?(\d{5,})(?:[/?#]|$)/i)?.[1]
+      if (id) return `${url.origin}/jobs/view/${id}/`
+    }
+    if (provider === 'indeed') {
+      const id = url.searchParams.get('jk') || url.searchParams.get('vjk')
+      if (id) return `${url.origin}/viewjob?jk=${encodeURIComponent(id)}`
+    }
+    url.hash = ''
+    for (const key of [...url.searchParams.keys()]) {
+      if (/^(utm_|trk|ref|source|campaign)/i.test(key)) url.searchParams.delete(key)
+    }
+    return url.href
+  } catch {
+    return value.trim()
+  }
 }
 
 function isExtensionSaveRequest(req: NextRequest): boolean {

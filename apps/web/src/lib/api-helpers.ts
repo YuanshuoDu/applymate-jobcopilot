@@ -2,7 +2,7 @@ import { NextRequest, NextResponse } from 'next/server'
 import { headers } from 'next/headers'
 import { jwtVerify } from 'jose'
 import { checkRateLimit } from '@/lib/rate-limit'
-import { resolveFeatureConfig, type UserAiSettings, type FeatureId } from '@/lib/model-router'
+import { APPLYMATE_BACKING, resolveConfig, resolveFeatureConfig, type UserAiSettings, type FeatureId } from '@/lib/model-router'
 import { db } from '@/lib/db'
 import { safeAuth } from '@/lib/safe-auth'
 
@@ -64,7 +64,10 @@ export async function prepareAiRoute(req: NextRequest, featureId: FeatureId) {
 
   const user  = await db.user.findUnique({ where: { id: auth.userId }, select: { preferences: true } })
   const prefs = (user?.preferences ?? {}) as Record<string, unknown>
-  const cfg   = resolveFeatureConfig(featureId, (prefs.aiSettings ?? null) as UserAiSettings | null)
+  const configured = resolveFeatureConfig(featureId, (prefs.aiSettings ?? null) as UserAiSettings | null)
+  // A stale feature override must not make the application flow unusable when
+  // its provider has no key. Fall back to the platform MiniMax model.
+  const cfg = configured.resolvedKey ? configured : resolveConfig(APPLYMATE_BACKING)
 
   return { userId: auth.userId, cfg }
 }

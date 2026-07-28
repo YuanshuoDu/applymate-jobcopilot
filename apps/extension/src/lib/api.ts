@@ -161,6 +161,20 @@ export async function getStats(settings: ExtensionSettings): Promise<DashboardSt
 
 export interface PersonaResult {
   persona: string
+  profile: PersonaProfile
+}
+
+export interface PersonaProfile {
+  identity: string[]
+  preferences: string[]
+  summaries: string[]
+  experience: string[]
+  skills: string[]
+  languages: string[]
+  education: string[]
+  certifications: string[]
+  projects: string[]
+  sourceResumeCount: number
 }
 
 export interface PersonaField {
@@ -171,18 +185,23 @@ export interface PersonaField {
   confidence: number
   source:     string  // "resume" | "ai_derived" | "manual" | "form_scan"
   updatedAt:  string
+  consentAt?: string
 }
 
 export interface PersonaFieldsResult {
   fields: PersonaField[]
 }
 
-export async function getPersona(settings: ExtensionSettings): Promise<PersonaResult> {
-  return request<PersonaResult>(settings, '/api/me/persona')
+export type PersonaAllowedUse = 'form_fill' | 'tailor' | 'cover_letter'
+
+export async function getPersona(settings: ExtensionSettings, allowedUse?: PersonaAllowedUse): Promise<PersonaResult> {
+  const suffix = allowedUse ? `?use=${allowedUse}` : ''
+  return request<PersonaResult>(settings, `/api/me/persona${suffix}`)
 }
 
-export async function getPersonaFields(settings: ExtensionSettings): Promise<PersonaFieldsResult> {
-  return request<PersonaFieldsResult>(settings, '/api/me/persona/fields')
+export async function getPersonaFields(settings: ExtensionSettings, allowedUse?: PersonaAllowedUse): Promise<PersonaFieldsResult> {
+  const suffix = allowedUse ? `?use=${allowedUse}` : ''
+  return request<PersonaFieldsResult>(settings, `/api/me/persona/fields${suffix}`)
 }
 
 export async function savePersonaFields(settings: ExtensionSettings, fields: PersonaField[]): Promise<PersonaFieldsResult> {
