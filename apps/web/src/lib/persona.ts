@@ -1,4 +1,5 @@
 import { db } from '@/lib/db'
+import { listConfirmedPersonaFacts, type PersonaAllowedUse } from '@/lib/persona-facts'
 import type { ResumeContent } from '@/lib/types'
 
 export interface PersonaField {
@@ -71,16 +72,20 @@ function factsFromResume(content: ResumeContent) {
  * AI-adapted copies. This prevents a previous tailoring hallucination from
  * becoming evidence for later applications.
  */
-export async function getPersonaProfile(userId: string): Promise<PersonaProfile> {
-  const [user, resumes] = await Promise.all([
+export async function getPersonaProfile(userId: string, allowedUse?: PersonaAllowedUse): Promise<PersonaProfile> {
+  const [user, resumes, confirmedFacts] = await Promise.all([
     db.user.findUnique({ where: { id: userId }, select: { name: true, email: true, phone: true, location: true, linkedin: true, github: true, preferences: true, personaFields: true } }),
     db.resume.findMany({ where: { userId, kind: 'base' }, select: { content: true, updatedAt: true } }),
+    listConfirmedPersonaFacts(userId, allowedUse),
   ])
   if (!user) throw new Error('User not found')
 
   const resumeFacts = resumes.map(resume => factsFromResume(resume.content as unknown as ResumeContent))
   const preferences = user.preferences as Record<string, unknown> | null
-  const answers = ((user.personaFields ?? []) as unknown as PersonaField[]).filter(field => !validatePersonaField(field))
+  const legacyAnswers = ((user.personaFields ?? []) as unknown as PersonaField[]).filter(field => !validatePersonaField(field))
+  const answersByKey = new Map(legacyAnswers.map(field => [field.key, field]))
+  for (const fact of confirmedFacts) answersByKey.set(fact.key, fact)
+  const answers = [...answersByKey.values()]
   const latest = resumes.reduce<Date | null>((value, resume) => !value || resume.updatedAt > value ? resume.updatedAt : value, null)
 
   return {
@@ -105,6 +110,6 @@ export function personaContext(profile: PersonaProfile): string {
   ].filter(Boolean).join('\n\n')
 }
 
-export async function buildPersona(userId: string): Promise<string> {
-  return personaContext(await getPersonaProfile(userId))
+export async function buildPersona(userId: string, allowedUse?: PersonaAllowedUse): Promise<string> {
+  return personaContext(await getPersonaProfile(userId, allowedUse))
 }

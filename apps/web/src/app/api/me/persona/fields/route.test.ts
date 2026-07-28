@@ -4,6 +4,9 @@ const mocks = vi.hoisted(() => ({
   requireAuth: vi.fn(),
   findUnique: vi.fn(),
   update: vi.fn(),
+  confirm: vi.fn(),
+  list: vi.fn(),
+  revoke: vi.fn(),
 }))
 
 vi.mock('@/lib/api-helpers', () => ({
@@ -13,6 +16,7 @@ vi.mock('@/lib/api-helpers', () => ({
   err: (error: string, status = 400) => Response.json({ error }, { status }),
 }))
 vi.mock('@/lib/db', () => ({ db: { user: { findUnique: mocks.findUnique, update: mocks.update } } }))
+vi.mock('@/lib/persona-facts', () => ({ confirmPersonaFacts: mocks.confirm, listConfirmedPersonaFacts: mocks.list, revokePersonaFact: mocks.revoke }))
 
 describe('POST /api/me/persona/fields', () => {
   beforeEach(() => {
@@ -20,9 +24,12 @@ describe('POST /api/me/persona/fields', () => {
     mocks.requireAuth.mockReset()
     mocks.findUnique.mockReset()
     mocks.update.mockReset()
+    mocks.confirm.mockReset(); mocks.list.mockReset(); mocks.revoke.mockReset()
     mocks.requireAuth.mockResolvedValue({ userId: 'user_1' })
     mocks.findUnique.mockResolvedValue({ personaFields: [] })
     mocks.update.mockImplementation(async ({ data }: { data: { personaFields: unknown } }) => ({ personaFields: data.personaFields }))
+    mocks.confirm.mockImplementation(async (_userId: string, fields: Array<Record<string, unknown>>) => fields.map(field => ({ ...field, consentAt: '2026-07-28T09:00:00.000Z', updatedAt: '2026-07-28T09:00:00.000Z' })))
+    mocks.list.mockResolvedValue([])
   })
 
   it('stores only a valid user-confirmed field and records the save time', async () => {
@@ -34,6 +41,7 @@ describe('POST /api/me/persona/fields', () => {
     expect(response.status).toBe(200)
     const payload = await response.json()
     expect(payload.fields[0]).toMatchObject({ key: 'notice_period', consentAt: expect.any(String) })
+    expect(mocks.confirm).toHaveBeenCalledWith('user_1', [expect.objectContaining({ key: 'notice_period' })])
   })
 
   it('does not persist sensitive data', async () => {

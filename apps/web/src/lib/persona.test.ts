@@ -1,7 +1,8 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
-const mocks = vi.hoisted(() => ({ findUser: vi.fn(), findResumes: vi.fn() }))
+const mocks = vi.hoisted(() => ({ findUser: vi.fn(), findResumes: vi.fn(), listFacts: vi.fn() }))
 vi.mock('@/lib/db', () => ({ db: { user: { findUnique: mocks.findUser }, resume: { findMany: mocks.findResumes } } }))
+vi.mock('@/lib/persona-facts', () => ({ listConfirmedPersonaFacts: mocks.listFacts }))
 
 import { buildPersona, getPersonaProfile, validatePersonaField } from './persona'
 
@@ -28,7 +29,8 @@ describe('validatePersonaField', () => {
 
 describe('getPersonaProfile', () => {
   beforeEach(() => {
-    mocks.findUser.mockReset(); mocks.findResumes.mockReset()
+    mocks.findUser.mockReset(); mocks.findResumes.mockReset(); mocks.listFacts.mockReset()
+    mocks.listFacts.mockResolvedValue([])
     mocks.findUser.mockResolvedValue({ name: 'Ada Lovelace', email: 'ada@example.com', phone: null, location: 'London', linkedin: null, github: null, preferences: { workAuthorization: 'UK right to work' }, personaFields: [
       { key: 'notice_period', label: 'Notice period', value: 'One month', category: 'work', confidence: 1, source: 'form_scan', updatedAt: '2026-07-01' },
       { key: 'gender', label: 'Gender', value: 'Female', category: 'personal', confidence: 1, source: 'form_scan', updatedAt: '2026-07-01' },
@@ -50,5 +52,13 @@ describe('getPersonaProfile', () => {
   it('keeps labelled contact and skill lines for extension auto-fill', async () => {
     await expect(buildPersona('user_1')).resolves.toContain('NAME: Ada Lovelace')
     await expect(buildPersona('user_1')).resolves.toContain('SKILLS: TypeScript')
+  })
+
+  it('prefers a confirmed fact over a legacy field with the same key', async () => {
+    mocks.listFacts.mockResolvedValue([{ key: 'notice_period', label: 'Notice period', value: 'Two months', category: 'work', confidence: 1, source: 'manual', updatedAt: '2026-07-03' }])
+
+    await expect(getPersonaProfile('user_1')).resolves.toMatchObject({
+      applicationAnswers: [expect.objectContaining({ key: 'notice_period', value: 'Two months' })],
+    })
   })
 })

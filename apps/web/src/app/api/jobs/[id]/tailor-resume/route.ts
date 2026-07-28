@@ -102,7 +102,7 @@ export async function POST(req: NextRequest, { params }: Params) {
   if (!sourceResume) return err('The original resume for this tailored version could not be found', 404)
 
   const resumeContent = sourceResume.content as Record<string, unknown>
-  const persona = await buildPersona(prep.userId)
+  const persona = await buildPersona(prep.userId, 'tailor')
   const adaptedContent = cloneJson(resumeContent)
   const changes: ChangeDetail[] = []
   const corrections = Array.isArray(auditFindings)

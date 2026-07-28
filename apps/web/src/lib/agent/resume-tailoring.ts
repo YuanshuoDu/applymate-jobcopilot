@@ -27,7 +27,7 @@ export async function tailorResumeForAgent(input: TailoringInput): Promise<Tailo
   const [resume, job, persona] = await Promise.all([
     db.resume.findFirst({ where: { id: input.resumeId, userId: input.userId } }),
     db.job.findFirst({ where: { id: input.jobId, userId: input.userId } }),
-    buildPersona(input.userId),
+    buildPersona(input.userId, 'tailor'),
   ])
   if (!resume) throw new Error('Selected resume was not found.')
   if (!job) throw new Error('Selected job was not found.')

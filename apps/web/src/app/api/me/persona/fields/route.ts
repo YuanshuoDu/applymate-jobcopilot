@@ -2,6 +2,7 @@ import { NextRequest } from 'next/server'
 import { db } from '@/lib/db'
 import { requireAuth, isErrorResponse, ok, err } from '@/lib/api-helpers'
 import { validatePersonaField, type PersonaField } from '@/lib/persona'
+import { confirmPersonaFacts, listConfirmedPersonaFacts, revokePersonaFact } from '@/lib/persona-facts'
 import type { Prisma } from '@prisma/client'
 
 /**
@@ -14,11 +15,11 @@ export async function GET(req: NextRequest) {
   const auth = await requireAuth(req)
   if (isErrorResponse(auth)) return auth
 
-  const user = await db.user.findUnique({
+  const [user, confirmedFacts] = await Promise.all([db.user.findUnique({
     where: { id: auth.userId },
     select: { personaFields: true },
-  })
-  const fields = (user?.personaFields ?? []) as unknown as PersonaField[]
+  }), listConfirmedPersonaFacts(auth.userId)])
+  const fields = mergeFields((user?.personaFields ?? []) as unknown as PersonaField[], confirmedFacts)
 
   return ok({ fields })
 }
@@ -56,12 +57,13 @@ export async function POST(req: NextRequest) {
 
   const merged = Array.from(map.values())
 
+  const confirmedFacts = await confirmPersonaFacts(auth.userId, incoming)
   await db.user.update({
     where: { id: auth.userId },
     data: { personaFields: merged as unknown as Prisma.InputJsonValue },
   })
 
-  return ok({ fields: merged }, 200)
+  return ok({ fields: mergeFields(merged, confirmedFacts) }, 200)
 }
 
 export async function DELETE(req: NextRequest) {
@@ -82,6 +84,14 @@ export async function DELETE(req: NextRequest) {
     where: { id: auth.userId },
     data: { personaFields: filtered as unknown as Prisma.InputJsonValue },
   })
+  await revokePersonaFact(auth.userId, body.key)
 
   return ok({ ok: true })
+}
+
+/** New facts win on the same key while legacy JSON remains readable during rollout. */
+function mergeFields(legacy: PersonaField[], facts: PersonaField[]) {
+  const byKey = new Map(legacy.map(field => [field.key, field]))
+  for (const fact of facts) byKey.set(fact.key, fact)
+  return [...byKey.values()]
 }

@@ -96,6 +96,7 @@ model User {
   coverLetters   CoverLetter[]
   notifications  Notification[]
   apiKeys        UserApiKeys?
+  personaFacts   PersonaFact[]
 }
 
 enum Plan {
@@ -197,6 +198,37 @@ model ResumeVersion {
 
   @@index([resumeId, createdAt(sort: Desc)])
   @@index([userId])
+}
+
+// ─────────────────────────────────────────────
+// Persona Knowledge Base — confirmed, auditable candidate facts
+// ─────────────────────────────────────────────
+
+model PersonaFact {
+  id              String   @id @default(cuid())
+  userId          String
+  key             String
+  category        String
+  value           String   @db.Text
+  normalizedValue String   @map("normalized_value")
+  source          String   // manual | form_scan | resume | ai_derived
+  sourceRef       String?  @map("source_ref")
+  evidence        Json?    // { label, applicationUrl?, resumeId?, excerpt? }
+  confidence      Float    @default(1)
+  status          String   @default("confirmed") // pending | confirmed | superseded | rejected | revoked
+  allowedUses     String[] @default(["form_fill", "tailor", "cover_letter"])
+  consentAt       DateTime? @map("consent_at")
+  expiresAt       DateTime? @map("expires_at")
+  revokedAt       DateTime? @map("revoked_at")
+  createdAt       DateTime @default(now()) @map("created_at")
+  updatedAt       DateTime @updatedAt @map("updated_at")
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, key, normalizedValue])
+  @@index([userId, status, updatedAt(sort: Desc)])
+  @@index([userId, category, status])
+  @@map("persona_facts")
 }
 
 model Activity {

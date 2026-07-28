@@ -11,7 +11,7 @@ export async function GET(req: NextRequest) {
     where: { id: auth.userId },
     select: {
       name: true, email: true, phone: true, location: true, linkedin: true, github: true,
-      preferences: true, personaFields: true,
+      preferences: true, personaFields: true, personaFacts: true,
       resumes: { select: { id: true, name: true, content: true, updatedAt: true } },
     },
   })

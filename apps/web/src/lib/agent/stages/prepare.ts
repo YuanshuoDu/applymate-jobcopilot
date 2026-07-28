@@ -62,7 +62,10 @@ export async function runPrepare(
     ? { provider: writerCfg.provider as AiConfig['provider'], model: writerCfg.model, apiKey: writerCfg.apiKey }
     : aiConfig
   const writerSystemPrompt = writerCfg?.systemPrompt ?? undefined
-  const persona = await buildPersona(userId).catch(() => '')
+  const [tailorPersona, coverLetterPersona] = await Promise.all([
+    buildPersona(userId, 'tailor').catch(() => ''),
+    buildPersona(userId, 'cover_letter').catch(() => ''),
+  ])
 
   const aboveThreshold = scoredJobs.filter(sj => sj.score >= 65)
   const allowResumeTailoring = options.allowResumeTailoring ?? true
@@ -76,7 +79,7 @@ export async function runPrepare(
 
     if (allowResumeTailoring) {
       try {
-        const tailored = await generateTailoredResume(sj, resumeContent, effectiveAiConfig, writerSystemPrompt, persona)
+        const tailored = await generateTailoredResume(sj, resumeContent, effectiveAiConfig, writerSystemPrompt, tailorPersona)
         const saved = await db.resume.create({ data: {
           userId, name: `Tailored for ${sj.job.company} - ${sj.job.role}`,
           content: tailored as Prisma.InputJsonValue, templateId: defaultResume.templateId,
@@ -95,7 +98,7 @@ export async function runPrepare(
 
     if (agentCfg.autoCoverLetter) {
       try {
-        coverLetter = await generateCoverLetter(sj, agentCfg, resumeContent, effectiveAiConfig, writerSystemPrompt, persona)
+        coverLetter = await generateCoverLetter(sj, agentCfg, resumeContent, effectiveAiConfig, writerSystemPrompt, coverLetterPersona)
         pendingLetters.push({ jobId: sj.job.id, coverLetter })
         await new Promise(r => setTimeout(r, THROTTLE_MS))
       } catch (err) {
