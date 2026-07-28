@@ -12,14 +12,12 @@
 
 ## What is ApplyMate AI?
 
-ApplyMate AI is a **Chrome Extension + Web Dashboard** combo that acts as your personal job application assistant. It discovers relevant jobs, tailors your CV and cover letter for each role, and — with your approval — auto-fills application forms. Think of it as a shopping cart for job applications: browse JDs → one-click save → AI optimises → you review → auto-submit.
-
-Production: [applymate.dev](https://applymate.dev)
+ApplyMate AI is a **Chrome Extension + Web Dashboard** combo that acts as your personal job application assistant. It discovers relevant jobs, tailors your CV and cover letter for each role, and supports both reviewable form filling and autonomous ATS application workflows. Think of it as a shopping cart for job applications: browse JDs → one-click save → AI optimises → you review → apply.
 
 Repository: [github.com/YuanshuoDu/applymate-jobcopilot](https://github.com/YuanshuoDu/applymate-jobcopilot)
 
 ### Key Principles
-- **Human-in-the-loop**: AI handles preparation; you make every application decision.
+- **User-controlled automation**: AI prepares applications and can automate supported ATS workflows; you choose what enters the application queue.
 - **Europe-first**: GDPR-compliant, deep ATS support (Workday EMEA, Personio, SmartRecruiters), multi-language cover letters (EN/DE/FR/NL/ES).
 - **Model-agnostic**: Switch between Claude, GPT-4o, or Ollama via the built-in ModelRouter without changing any code.
 
@@ -238,7 +236,7 @@ NEXT_PUBLIC_POSTHOG_KEY=
 
 ## Deployment
 
-The production build is deployed on **Vercel** at [applymate.dev](https://applymate.dev).
+The web dashboard is designed for deployment on **Vercel**. `applymate.dev` is retired and is not a current production endpoint.
 
 ```bash
 pnpm build        # Build all apps
