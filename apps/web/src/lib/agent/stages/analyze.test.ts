@@ -39,15 +39,15 @@ function context(emit = vi.fn()): PipelineCtx {
       minMatchScore: 70, autoApply: false, requireApproval: true,
       targetLocations: ['Dublin'], targetRoles: ['Software Engineer'],
       excludeCompanies: [], priorityCompanies: [], autoCoverLetter: false,
-      coverTone: 'professional', useTailoredCV: true, model: 'MiniMax-M2.7', throttleMs: 0,
+      coverTone: 'professional', useTailoredCV: true, model: 'MiniMax-M3', throttleMs: 0,
     },
     roleConfigs: {
-      analyst: { provider: 'minimax', model: 'MiniMax-M2.7', enabled: true },
+      analyst: { provider: 'minimax', model: 'MiniMax-M3', enabled: true },
     } as PipelineCtx['roleConfigs'],
     resumeText: 'TypeScript developer with Node.js experience.',
     resumeContent: {} as PipelineCtx['resumeContent'],
     defaultResume: { id: 'resume_1', name: 'Base resume', templateId: null, templateOptions: null, directionId: null, basicsDetached: false },
-    aiConfig: { provider: 'minimax', model: 'MiniMax-M2.7' }, autonomous: false, emit,
+    aiConfig: { provider: 'minimax', model: 'MiniMax-M3' }, autonomous: false, emit,
   }
 }
 

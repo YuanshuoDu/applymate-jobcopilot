@@ -1186,7 +1186,7 @@ const PHASE_INFO: Record<AnalysisPhase, { icon: string; label: string; subLabel:
 function AnalysisProgressView({ phase, totalFields, aiFieldCount, elapsed }: { phase: AnalysisPhase; totalFields: number; aiFieldCount: number; elapsed: number }) {
   const info = PHASE_INFO[phase]
   const elapsedStr = elapsed < 60 ? `${elapsed}s` : `${Math.floor(elapsed / 60)}m ${elapsed % 60}s`
-  // Rough estimate: ~3s per AI field (MiniMax M2.7 average)
+  // Rough estimate: ~3s per AI field (MiniMax M3 average)
   const estSeconds = Math.max(10, Math.min(180, aiFieldCount * 3))
   const estStr = estSeconds < 60 ? `~${estSeconds}s` : `~${Math.round(estSeconds / 60)}min`
 

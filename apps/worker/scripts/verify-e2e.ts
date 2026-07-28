@@ -112,7 +112,7 @@ const harness = new AgentHarness({
 // Override getAiConfig to skip DB
 (harness as any).getAiConfig = async () => ({
   provider: "minimax",
-  model: "MiniMax-M2.7",
+  model: "MiniMax-M3",
 });
 
 const result = await harness.run(mockPage(), {

@@ -50,7 +50,7 @@ ApplyMate automates all of this.
 
 - **Free plan**: limited AI credits, manual apply
 - **Pro plan**: unlimited discovery, auto-apply, full AI features
-- Platform provides MiniMax M2.7 API as the default AI (our cost)
+- Platform provides MiniMax M3 API as the default AI (our cost)
 - Users can bring their own API keys (Claude, GPT-4o, etc.) in Settings → AI Models
 
 ---
@@ -92,7 +92,7 @@ applymate-jobcopilot/
 
 ```
 ModelRouter resolves: user setting → platform default → nothing
-Platform default: MiniMax M2.7 (our MINIMAX_API_KEY, ~$0.001 per task)
+Platform default: MiniMax M3 (our MINIMAX_API_KEY, ~$0.001 per task)
 Per-feature config in Settings:
   - scoring/jobScoring: job match scoring (1-10) + keyword extraction
   - autoApply: autonomous form-filling agent
@@ -141,7 +141,7 @@ When these sources return full JDs, we skip the entire enrichment LLM call (savi
 ```
 CloakBrowser (stealth headless Chrome)
     + AgentHarness (LLM perception-action loop, like Claude Code)
-    + ModelRouter (MiniMax M2.7 by default)
+    + ModelRouter (MiniMax M3 by default)
     + Pre-programmed ATS flows (for Workday/Greenhouse/Lever specifically)
     → Fully autonomous form fill + submit
 ```

@@ -5,12 +5,12 @@
  */
 import { NextRequest } from 'next/server'
 import { prepareAiRoute, ok, err } from '@/lib/api-helpers'
-import { modelChat, stripFences, type AiConfig } from '@/lib/model-router'
+import { modelChat, stripFences, withMiniMaxThinking, type AiConfig } from '@/lib/model-router'
 import { db } from '@/lib/db'
 
 const COVER_FALLBACKS: AiConfig[] = [
   { provider: 'deepseek', model: 'deepseek-chat' },
-  { provider: 'minimax',  model: 'MiniMax-M2.7'  },
+  { provider: 'minimax',  model: 'MiniMax-M3', thinking: 'disabled' },
 ]
 import type { ResumeContent } from '@/lib/types'
 
@@ -59,9 +59,12 @@ export async function POST(req: NextRequest) {
     select: { provider: true, model: true, apiKey: true, systemPrompt: true },
   }).catch(() => null)
 
-  const cfg: import('@/lib/model-router').AiConfig = writerRole
+  const selectedCfg: import('@/lib/model-router').AiConfig = writerRole
     ? { provider: writerRole.provider as any, model: writerRole.model, apiKey: writerRole.apiKey ?? undefined }
     : prep.cfg
+  // A cover letter is a bounded rewrite; M3's direct mode is faster and keeps
+  // the answer focused without exposing or spending on private reasoning.
+  const cfg = withMiniMaxThinking(selectedCfg, 'disabled')
 
   const writerSystemPrompt = writerRole?.systemPrompt
     ?? 'You are a professional cover letter writer. Output ONLY the cover letter text — no preamble, no meta-commentary, no explanation. Start directly with the greeting.'

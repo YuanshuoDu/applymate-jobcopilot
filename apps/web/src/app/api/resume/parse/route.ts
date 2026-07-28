@@ -8,11 +8,11 @@
 import { NextRequest } from 'next/server'
 import { requireAuth, isErrorResponse, ok, err } from '@/lib/api-helpers'
 import { checkRateLimit } from '@/lib/rate-limit'
-import { modelChat, parseAiJson, loadUserAiConfig, type AiConfig } from '@/lib/model-router'
+import { modelChat, parseAiJson, loadUserAiConfig, withMiniMaxThinking, type AiConfig } from '@/lib/model-router'
 
 const PARSE_FALLBACKS: AiConfig[] = [
   { provider: 'deepseek', model: 'deepseek-chat' },
-  { provider: 'minimax',  model: 'MiniMax-M2.7'  },
+  { provider: 'minimax',  model: 'MiniMax-M3', thinking: 'disabled' },
 ]
 import type { ResumeContent } from '@/lib/types'
 
@@ -70,7 +70,7 @@ export async function POST(req: NextRequest) {
   if (rawText.length > 12_000) rawText = rawText.slice(0, 12_000) + '\n[... truncated]'
 
   // ── 2. AI parse ───────────────────────────────────────────────────────────
-  const primaryCfg = await loadUserAiConfig(auth.userId, 'parsing')
+  const primaryCfg = withMiniMaxThinking(await loadUserAiConfig(auth.userId, 'parsing'), 'disabled')
 
   const systemPrompt = `You are an expert resume parser. Extract structured data from the raw resume text below and return ONLY valid JSON matching this TypeScript interface (no markdown fences, no explanation):
 

@@ -9,6 +9,7 @@ export interface AiConfig {
   model: string;
   apiKey?: string;
   apiBase?: string;
+  thinking?: "adaptive" | "disabled";
 }
 
 export interface ChatMessage {
@@ -28,7 +29,8 @@ export interface ChatResult {
 
 export const APPLYMATE_BACKING: AiConfig = {
   provider: "minimax",
-  model: "MiniMax-M2.7",
+  model: "MiniMax-M3",
+  thinking: "adaptive",
 };
 
 const DEFAULT_API_BASES: Record<Provider, string> = {
@@ -137,6 +139,18 @@ async function callOpenAICompat(
   const key = config.apiKey || getServerKey(config.provider);
   if (!key) throw new Error(`No API key for provider "${config.provider}"`);
 
+  // Keep MiniMax reasoning in message.content for the harness's multi-turn
+  // history. The MiniMax docs require that chain to be sent back on later
+  // tool turns, so this worker intentionally does not enable reasoning_split.
+  const providerOptions = config.provider === "minimax"
+    ? {
+        max_completion_tokens: 4096,
+        ...(config.model === "MiniMax-M3"
+          ? { thinking: { type: config.thinking ?? "adaptive" } }
+          : {}),
+      }
+    : { max_tokens: 4096 };
+
   const res = await fetch(`${base}/chat/completions`, {
     method: "POST",
     headers: {
@@ -146,7 +160,7 @@ async function callOpenAICompat(
     body: JSON.stringify({
       model: config.model,
       messages,
-      max_tokens: 4096,
+      ...providerOptions,
       temperature: 0.3,
     }),
   });

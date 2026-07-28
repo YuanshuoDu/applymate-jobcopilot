@@ -86,8 +86,15 @@ export const MODEL_CATALOGUE: ModelOption[] = [
 
   // ── MiniMax ───────────────────────────────────────────────
   {
+    provider: 'minimax', model: 'MiniMax-M3',
+    label: 'MiniMax M3 ★', description: '平台默认，1M 上下文，最长 512K 输出',
+    tier: 'standard', priceIn: 0.3, priceOut: 1.2, contextK: 1000,
+    // The provisioned platform key currently authorizes the .chat endpoint.
+    defaultBase: 'https://api.minimax.chat/v1',
+  },
+  {
     provider: 'minimax', model: 'MiniMax-M2.7',
-    label: 'MiniMax M2.7 ★', description: '平台默认，强推理，200K 上下文',
+    label: 'MiniMax M2.7', description: '旧版兼容，200K 上下文',
     tier: 'standard', priceIn: 0.3, priceOut: 1.2, contextK: 200,
     defaultBase: 'https://api.minimax.chat/v1',
   },
@@ -129,11 +136,22 @@ export interface AiConfig {
   model:      string
   apiKey?:    string   // user's own key; falls back to server env var
   apiBase?:   string   // override base URL (required for custom)
+  thinking?:  MiniMaxThinkingMode
 }
+
+export type MiniMaxThinkingMode = 'adaptive' | 'disabled'
 
 export const DEFAULT_AI_CONFIG: AiConfig = {
   provider: 'minimax',
-  model:    'MiniMax-M2.7',
+  model:    'MiniMax-M3',
+  thinking: 'adaptive',
+}
+
+/** Apply an M3 thinking policy without changing another provider or legacy model. */
+export function withMiniMaxThinking(config: AiConfig, thinking: MiniMaxThinkingMode): AiConfig {
+  return config.provider === 'minimax' && config.model === 'MiniMax-M3'
+    ? { ...config, thinking }
+    : config
 }
 
 // ── Resolve effective config ──────────────────────────────────────────────────
@@ -211,7 +229,7 @@ export async function modelChat(
 
 /**
  * Streaming chat — yields text deltas one by one.
- * <think>…</think> reasoning blocks (MiniMax M2.7 / DeepSeek R1) are filtered out.
+ * <think>…</think> reasoning blocks (MiniMax / DeepSeek R1) are filtered out.
  */
 export async function* modelChatStream(
   messages:  ChatMessage[],
@@ -294,6 +312,7 @@ interface OaiRequestConfig {
   messages:  ChatMessage[]
   maxTokens: number
   stream:    boolean
+  thinking?: MiniMaxThinkingMode
 }
 
 function oaiFetch(c: OaiRequestConfig): Promise<Response> {
@@ -302,11 +321,14 @@ function oaiFetch(c: OaiRequestConfig): Promise<Response> {
   // short suggestion request. Keep a bounded timeout, but avoid aborting a
   // valid independent-audit response halfway through generation.
   const timer = setTimeout(() => controller.abort(), 120_000)
-  // MiniMax M2 reasoning can consume the entire completion budget before it
-  // emits the final answer. Its OpenAI-compatible endpoint supports splitting
-  // that reasoning from message.content and requires max_completion_tokens.
+  // MiniMax models use a provider-specific completion field. M3 also lets us
+  // choose adaptive reasoning (quality) or disable it for short, bounded work.
   const providerOptions = c.provider === 'minimax'
-    ? { max_completion_tokens: c.maxTokens, reasoning_split: true }
+    ? {
+        max_completion_tokens: c.maxTokens,
+        reasoning_split: true,
+        ...(c.model === 'MiniMax-M3' ? { thinking: { type: c.thinking ?? 'adaptive' } } : {}),
+      }
     : { max_tokens: c.maxTokens }
   return fetch(`${c.base}/chat/completions`, {
     method:  'POST',
@@ -329,7 +351,7 @@ async function callOpenAICompat(
   maxTokens: number,
 ): Promise<ChatResult> {
   if (!config.apiBase) throw new Error(`No API base URL for provider "${config.provider}"`)
-  const resp = await oaiFetch({ base: config.apiBase, provider: config.provider, model: config.model, key: config.resolvedKey, messages, maxTokens, stream: false })
+  const resp = await oaiFetch({ base: config.apiBase, provider: config.provider, model: config.model, key: config.resolvedKey, messages, maxTokens, stream: false, thinking: config.thinking })
   await oaiCheck(resp, config.provider)
   const data: unknown = await resp.json()
   const response = data as { choices?: Array<{ finish_reason?: string; message?: { content?: unknown } }>; usage?: { prompt_tokens?: number; completion_tokens?: number } }
@@ -348,7 +370,7 @@ async function* streamOpenAICompat(
   maxTokens: number,
 ): AsyncGenerator<string> {
   if (!config.apiBase) throw new Error(`No API base URL for provider "${config.provider}"`)
-  const resp = await oaiFetch({ base: config.apiBase, provider: config.provider, model: config.model, key: config.resolvedKey, messages, maxTokens, stream: true })
+  const resp = await oaiFetch({ base: config.apiBase, provider: config.provider, model: config.model, key: config.resolvedKey, messages, maxTokens, stream: true, thinking: config.thinking })
   await oaiCheck(resp, config.provider)
 
   const reader  = resp.body!.getReader()
@@ -375,7 +397,7 @@ async function* streamOpenAICompat(
   } finally { reader.releaseLock() }
 }
 
-// ── Think-block filter (MiniMax M2.7 / DeepSeek R1 reasoning tokens) ──────────
+// ── Think-block filter (MiniMax / DeepSeek R1 reasoning tokens) ───────────────
 
 async function* stripThinkStream(source: AsyncGenerator<string>): AsyncGenerator<string> {
   let buf     = ''
@@ -477,7 +499,8 @@ export const APPLYMATE_LABEL = 'ApplyMate'
 /** The real config behind the "ApplyMate" virtual model */
 export const APPLYMATE_BACKING: AiConfig = {
   provider: 'minimax',
-  model:    'MiniMax-M2.7',
+  model:    'MiniMax-M3',
+  thinking: 'adaptive',
 }
 
 // ── Per-feature AI settings ───────────────────────────────────────────────────
@@ -512,7 +535,7 @@ export const FEATURE_LABELS: Record<FeatureId, string> = {
 /**
  * Per-user AI settings stored in User.preferences.aiSettings
  *
- * features[featureId] = null  →  use ApplyMate AI (MiniMax M2.7, server key)
+ * features[featureId] = null  →  use ApplyMate AI (MiniMax M3, server key)
  * features[featureId] = AiConfig  →  use that specific model
  * keys[provider] = string  →  user-supplied API key for that provider
  */

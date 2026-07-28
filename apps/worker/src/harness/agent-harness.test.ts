@@ -6,7 +6,7 @@ import type { Page } from "playwright-core";
 vi.mock("@jobcopilot/shared/llm", () => ({
   loadWorkerAiConfig: vi.fn().mockResolvedValue({
     provider: "minimax",
-    model: "MiniMax-M2.7",
+    model: "MiniMax-M3",
   }),
   callLlmText: vi.fn(),
 }));

@@ -8,7 +8,7 @@
 import { NextRequest } from 'next/server'
 import { db } from '@/lib/db'
 import { prepareAiRoute, requireAuth, isErrorResponse, ok, err } from '@/lib/api-helpers'
-import { modelChat, parseAiJson, resolveConfig, type AiConfig } from '@/lib/model-router'
+import { modelChat, parseAiJson, resolveConfig, withMiniMaxThinking, type AiConfig } from '@/lib/model-router'
 import { buildPersona } from '@/lib/persona'
 import type { ApplicationAudit, ApplicationAuditFinding, ResumeContent } from '@/lib/types'
 
@@ -87,16 +87,17 @@ async function runAuditModel(prompt: string, cfg: AiConfig) {
   let lastError: unknown
   for (let attempt = 0; attempt < 2; attempt++) {
     try {
-      // MiniMax M2.7 uses part of its completion budget for private reasoning.
-      // Its OpenAI-compatible endpoint caps max_completion_tokens at 2048, so
-      // use that full allowance to ensure an audit reaches its final JSON.
+      // Keep the audit output bounded; M3 uses adaptive reasoning by default.
       return await modelChat([{ role: 'user', content: prompt }], cfg, 2_048)
     } catch (error) {
       lastError = error
-      // Long evidence comparisons can consume M2.7's entire completion budget
-      // in private reasoning. MiniMax Text-01 uses the same platform key but
-      // emits a direct answer, making it a reliable structured-audit fallback.
       if (isMiniMaxReasoningExhausted(error, cfg)) {
+        // M3 can retry the same evidence audit without private reasoning. This
+        // preserves its factual-audit capability while guaranteeing final JSON.
+        if (cfg.model === 'MiniMax-M3') {
+          return modelChat([{ role: 'user', content: prompt }], withMiniMaxThinking(cfg, 'disabled'), 2_048)
+        }
+        // Keep a direct-answer fallback for users who explicitly retain M2.x.
         return modelChat([{ role: 'user', content: prompt }], { ...cfg, model: 'MiniMax-Text-01' }, 1_800)
       }
       if (!isAbortError(error) || attempt === 1) throw error
