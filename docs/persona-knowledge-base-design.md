@@ -61,6 +61,11 @@ Use Postgres + pgvector where available. Embeddings, chunks and source links are
 all personal data and must be deleted or revoked together. Do not embed raw
 special-category data. RAG is not used for phone/email/select fields.
 
+Semantic retrieval is enabled only when the server has an `OPENAI_API_KEY` for
+the embedding provider. Without that configuration, the same approved chunks
+remain available through lexical retrieval; the UI must describe this mode
+accurately rather than claiming semantic retrieval is active.
+
 ## Security and GDPR controls
 
 - Default-deny special-category, financial and government-ID fields.

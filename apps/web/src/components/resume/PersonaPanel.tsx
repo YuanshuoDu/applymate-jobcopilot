@@ -58,7 +58,10 @@ export function PersonaPanel({ isDefault, onEditResume, onUseAsProfile }: { isDe
     setIndexing(true); setError('')
     const response = await fetch('/api/me/persona/knowledge-index', { method: 'POST' })
     if (!response.ok) setError('Could not build the knowledge index.')
-    else setError('Knowledge index is ready for relevant AI tasks.')
+    else {
+      const payload = await response.json().catch(() => null)
+      setError(payload?.semanticEnabled ? 'Semantic knowledge index is ready for relevant AI tasks.' : 'Knowledge index is ready with lexical retrieval. Configure OPENAI_API_KEY to enable semantic retrieval.')
+    }
     setIndexing(false)
   }
 

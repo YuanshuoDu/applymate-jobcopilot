@@ -38,12 +38,14 @@ export async function syncPersonaEvidence(userId: string) {
   })) })
 
   const pending = await db.personaEvidenceChunk.findMany({ where: { userId, status: 'confirmed', embeddedAt: null }, select: { id: true, content: true } })
+  let embedded = 0
   for (const chunk of pending) {
     const embedding = await embedPersonaText(chunk.content)
     if (!embedding) break
     await db.$executeRaw`UPDATE "persona_evidence_chunks" SET "embedding" = ${vectorLiteral(embedding)}::vector, "embedding_model" = ${PERSONA_EMBEDDING_MODEL}, "embedded_at" = NOW() WHERE "id" = ${chunk.id}`
+    embedded++
   }
-  return { candidates: candidates.length, indexed: fresh.length }
+  return { candidates: candidates.length, indexed: fresh.length, embedded, semanticEnabled: Boolean(process.env.OPENAI_API_KEY?.trim()) }
 }
 
 export async function retrievePersonaEvidence(userId: string, use: PersonaAllowedUse, query: string, limit = 5): Promise<PersonaEvidence[]> {
