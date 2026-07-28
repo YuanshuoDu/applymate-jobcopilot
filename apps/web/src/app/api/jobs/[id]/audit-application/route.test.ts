@@ -108,6 +108,20 @@ describe('POST /api/jobs/[id]/audit-application', () => {
     expect(mocks.modelChat).toHaveBeenCalledTimes(2)
   })
 
+  it('falls back to MiniMax Text-01 when M2.7 spends its completion on reasoning', async () => {
+    mocks.resumeFindFirst.mockResolvedValueOnce({ id: 'resume_final', parentResumeId: 'resume_base', content: { contact: {}, summary: 'Final', experience: [], education: [], skills: [] } })
+      .mockResolvedValueOnce({ content: { contact: {}, summary: 'Original', experience: [], education: [], skills: [] } })
+    mocks.modelChat.mockRejectedValueOnce(new Error('minimax returned no final content (finish reason: length)')).mockResolvedValueOnce({ provider: 'minimax', model: 'MiniMax-Text-01', text: JSON.stringify({ verdict: 'pass', findings: [
+      { area: 'resume', severity: 'pass', title: 'Supported', evidence: 'Matches.', action: 'None.' },
+      { area: 'cover_letter', severity: 'pass', title: 'Supported', evidence: 'Matches.', action: 'None.' },
+      { area: 'job_match', severity: 'pass', title: 'Relevant', evidence: 'Relevant.', action: 'None.' },
+    ] }) })
+    const { POST } = await import('./route')
+    const response = (await POST(request({ resumeId: 'resume_final', coverLetterId: 'cover_1' }) as never, { params: Promise.resolve({ id: 'job_1' }) }))!
+    expect(response.status).toBe(200)
+    expect(mocks.modelChat).toHaveBeenLastCalledWith(expect.anything(), expect.objectContaining({ provider: 'minimax', model: 'MiniMax-Text-01' }), 1800)
+  })
+
   it('returns a retryable audit state when both model responses are malformed', async () => {
     mocks.resumeFindFirst.mockResolvedValueOnce({ id: 'resume_final', parentResumeId: 'resume_base', content: { contact: {}, summary: 'Final', experience: [], education: [], skills: [] } })
       .mockResolvedValueOnce({ content: { contact: {}, summary: 'Original', experience: [], education: [], skills: [] } })

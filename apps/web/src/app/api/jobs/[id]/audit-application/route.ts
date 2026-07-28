@@ -77,6 +77,12 @@ function isAbortError(error: unknown) {
   return error instanceof Error && error.name === 'AbortError'
 }
 
+function isMiniMaxReasoningExhausted(error: unknown, cfg: AiConfig) {
+  return cfg.provider === 'minimax'
+    && error instanceof Error
+    && error.message.includes('minimax returned no final content (finish reason: length)')
+}
+
 async function runAuditModel(prompt: string, cfg: AiConfig) {
   let lastError: unknown
   for (let attempt = 0; attempt < 2; attempt++) {
@@ -87,6 +93,12 @@ async function runAuditModel(prompt: string, cfg: AiConfig) {
       return await modelChat([{ role: 'user', content: prompt }], cfg, 2_048)
     } catch (error) {
       lastError = error
+      // Long evidence comparisons can consume M2.7's entire completion budget
+      // in private reasoning. MiniMax Text-01 uses the same platform key but
+      // emits a direct answer, making it a reliable structured-audit fallback.
+      if (isMiniMaxReasoningExhausted(error, cfg)) {
+        return modelChat([{ role: 'user', content: prompt }], { ...cfg, model: 'MiniMax-Text-01' }, 1_800)
+      }
       if (!isAbortError(error) || attempt === 1) throw error
       await new Promise(resolve => setTimeout(resolve, 750))
     }
