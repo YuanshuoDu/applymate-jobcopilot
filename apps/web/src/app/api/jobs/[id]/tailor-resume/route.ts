@@ -9,6 +9,7 @@ import { db } from '@/lib/db'
 import { prepareAiRoute, ok, err } from '@/lib/api-helpers'
 import { modelChat, parseAiJson } from '@/lib/model-router'
 import { buildPersona } from '@/lib/persona'
+import { personaEvidenceContext } from '@/lib/persona-evidence'
 import type { ApplicationAuditFinding } from '@/lib/types'
 
 type Params = { params: Promise<{ id: string }> }
@@ -103,6 +104,7 @@ export async function POST(req: NextRequest, { params }: Params) {
 
   const resumeContent = sourceResume.content as Record<string, unknown>
   const persona = await buildPersona(prep.userId, 'tailor')
+  const evidence = await personaEvidenceContext(prep.userId, 'tailor', `${job.role} ${job.description}`).catch(() => '')
   const adaptedContent = cloneJson(resumeContent)
   const changes: ChangeDetail[] = []
   const corrections = Array.isArray(auditFindings)
@@ -131,6 +133,7 @@ export async function POST(req: NextRequest, { params }: Params) {
       job.keywords ? `KNOWN KEYWORDS: ${job.keywords}` : '',
       `JOB DESCRIPTION:\n${job.description.slice(0, 1800)}`,
       `CONFIRMED PERSONA:\n${persona.slice(0, 9000)}`,
+      evidence,
       corrections.length ? `AUDIT CORRECTIONS (remove or rewrite unsupported claims; never invent evidence):\n${corrections.join('\n')}` : '',
       '',
       'Return ONLY JSON in this shape:',

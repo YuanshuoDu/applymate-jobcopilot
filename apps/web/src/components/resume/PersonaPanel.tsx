@@ -15,6 +15,7 @@ export function PersonaPanel({ isDefault, onEditResume, onUseAsProfile }: { isDe
   const [loading, setLoading] = useState(true)
   const [draft, setDraft] = useState<Partial<PersonaField> | null>(null)
   const [error, setError] = useState('')
+  const [indexing, setIndexing] = useState(false)
 
   const load = useCallback(async () => {
     setLoading(true)
@@ -53,6 +54,14 @@ export function PersonaPanel({ isDefault, onEditResume, onUseAsProfile }: { isDe
     const link = document.createElement('a'); link.href = URL.createObjectURL(blob); link.download = 'applymate-persona-export.json'; link.click(); URL.revokeObjectURL(link.href)
   }
 
+  async function buildKnowledgeIndex() {
+    setIndexing(true); setError('')
+    const response = await fetch('/api/me/persona/knowledge-index', { method: 'POST' })
+    if (!response.ok) setError('Could not build the knowledge index.')
+    else setError('Knowledge index is ready for relevant AI tasks.')
+    setIndexing(false)
+  }
+
   return <div style={{ padding: 14, overflowY: 'auto', height: '100%', boxSizing: 'border-box' }}>
     <div style={{ display: 'flex', justifyContent: 'space-between', gap: 8, alignItems: 'start', marginBottom: 12 }}>
       <div><div style={{ fontWeight: 700, fontSize: 15 }}>Persona</div><div style={{ color: 'var(--text-muted)', fontSize: 11, lineHeight: 1.45, marginTop: 3 }}>Your reusable application profile, shared with the extension.</div></div>
@@ -60,6 +69,8 @@ export function PersonaPanel({ isDefault, onEditResume, onUseAsProfile }: { isDe
     </div>
 
     <div style={privacyStyle}><ShieldCheck size={16} /><span><strong>You stay in control.</strong> Resume facts are read in place; application answers are saved only after you confirm. Sensitive data is not stored here.</span></div>
+    <button onClick={() => void buildKnowledgeIndex()} disabled={indexing} style={indexButton}>{indexing ? 'Building knowledge index…' : 'Build knowledge index'}</button>
+    <div style={{ fontSize: 10, color: 'var(--text-muted)', lineHeight: 1.4, margin: '-7px 0 12px' }}>Indexes approved resume evidence for relevant AI answers. This uses the configured embedding provider.</div>
     {isDefault ? <div style={sharedProfileStyle}>This is your shared profile resume. The extension uses it for future application forms.</div> : <div style={sharedProfileStyle}>The extension currently uses your default resume. <button onClick={onUseAsProfile} style={profileButton}>Use this resume as the shared Persona base</button></div>}
 
     <PanelTitle title={`Confirmed facts · ${profile?.sourceResumeCount ?? 0} base resume${profile?.sourceResumeCount === 1 ? '' : 's'}`} />
@@ -99,3 +110,4 @@ const editorStyle = { padding: 9, border: '1px solid rgba(79,70,229,.3)', border
 const addButton = { display: 'inline-flex', alignItems: 'center', gap: 3, border: 'none', background: 'transparent', color: 'var(--primary)', cursor: 'pointer', fontSize: 11, fontWeight: 600 }
 const saveButton = { border: 'none', borderRadius: 6, background: 'var(--primary)', color: '#fff', padding: '6px 9px', cursor: 'pointer', fontSize: 11, fontWeight: 600 }
 const cancelButton = { border: '1px solid var(--border)', borderRadius: 6, background: 'transparent', color: 'var(--text-muted)', padding: '6px 9px', cursor: 'pointer', fontSize: 11 }
+const indexButton = { width: '100%', border: '1px solid var(--primary)', borderRadius: 6, background: 'transparent', color: 'var(--primary)', padding: '7px 9px', cursor: 'pointer', fontSize: 11, fontWeight: 700, marginBottom: 9 }

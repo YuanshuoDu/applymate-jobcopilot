@@ -97,6 +97,7 @@ model User {
   notifications  Notification[]
   apiKeys        UserApiKeys?
   personaFacts   PersonaFact[]
+  personaEvidenceChunks PersonaEvidenceChunk[]
 }
 
 enum Plan {
@@ -224,11 +225,36 @@ model PersonaFact {
   updatedAt       DateTime @updatedAt @map("updated_at")
 
   user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+  evidenceChunks PersonaEvidenceChunk[]
 
   @@unique([userId, key, normalizedValue])
   @@index([userId, status, updatedAt(sort: Desc)])
   @@index([userId, category, status])
   @@map("persona_facts")
+}
+
+model PersonaEvidenceChunk {
+  id                String   @id @default(cuid())
+  userId            String
+  factId            String?  @map("fact_id")
+  sourceType        String   @map("source_type") // resume | persona_fact
+  sourceRef         String   @map("source_ref")
+  content           String   @db.Text
+  contentHash       String   @map("content_hash")
+  status            String   @default("confirmed")
+  allowedUses       String[] @default(["form_fill", "tailor", "cover_letter"])
+  embeddingModel    String?  @map("embedding_model")
+  embeddedAt        DateTime? @map("embedded_at")
+  createdAt         DateTime @default(now()) @map("created_at")
+  updatedAt         DateTime @updatedAt @map("updated_at")
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+  fact PersonaFact? @relation(fields: [factId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, sourceRef, contentHash])
+  @@index([userId, status, updatedAt(sort: Desc)])
+  @@index([userId, sourceType, status])
+  @@map("persona_evidence_chunks")
 }
 
 model Activity {
