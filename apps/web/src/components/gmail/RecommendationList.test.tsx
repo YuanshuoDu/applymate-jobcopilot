@@ -16,7 +16,7 @@ describe('RecommendationList', () => {
 
     expect(html).toContain('<table')
     expect(html).toContain('Senior Support Engineer')
-    expect(html).toContain('Open source email')
+    expect(html).toContain('Indeed logo')
     expect(html).toContain('Save')
     expect(html).toContain('Dismiss')
   })
@@ -25,6 +25,7 @@ describe('RecommendationList', () => {
     const html = renderToString(<RecommendationList recommendations={[recommendation]} selectedIds={new Set()} expandedId={recommendation.id} busyIds={new Set()} onToggle={vi.fn()} onToggleAll={vi.fn()} onExpand={vi.fn()} onAction={vi.fn()} />)
 
     expect(html).toContain('Email subject:')
+    expect(html).toContain('Open source email')
     expect(html).toContain('Salary:')
     expect(html).toContain('Help customers troubleshoot technical issues.')
   })

@@ -30,8 +30,8 @@
 .recommendation-check input { width: 15px; height: 15px; accent-color: #4c32ef; cursor: pointer; }
 .recommendation-group th { height: 36px; padding: 0 10px; border-bottom: 1px solid #e4e2f1; color: #606887; background: #f8f7ff; font-size: 11px; letter-spacing: 0; text-align: left; text-transform: none; }
 .recommendation-group th span { color: #989fba; font-weight: 500; }
-.recommendation-source a { display: inline-flex; align-items: center; justify-content: center; width: 28px; height: 28px; border-radius: 6px; color: #4c32ef; background: #f4f1ff; text-decoration: none; }
-.recommendation-source a:hover { background: #eae5ff; }
+.recommendation-source img, .recommendation-source-fallback { display: inline-flex; align-items: center; justify-content: center; width: 22px; height: 22px; border-radius: 5px; object-fit: contain; }
+.recommendation-source-fallback { color: #69718d; background: #f2f1f8; }
 .recommendation-match { width: 72px; color: #159768; font-size: 10px; font-weight: 750; }
 .recommendation-match strong { color: #159768 !important; font-size: 10px !important; }
 .recommendation-match i { display: block; height: 3px; min-width: 8px; margin-top: 5px; border-radius: 999px; background: #16a36d; }
@@ -45,6 +45,7 @@
 .recommendation-expanded span { display: inline-flex; align-items: center; gap: 6px; min-width: 0; white-space: nowrap; }
 .recommendation-expanded p { flex: 1; margin: 0; overflow: hidden; line-height: 1.45; text-overflow: ellipsis; white-space: nowrap; }
 .recommendation-expanded a { display: inline-flex; align-items: center; gap: 4px; color: #4c32ef; font-size: 10px; font-weight: 750; text-decoration: none; white-space: nowrap; }
+.recommendation-expanded span a { margin-left: 2px; }
 .recommendation-expanded button { display: inline-flex; align-items: center; justify-content: center; width: 25px; height: 25px; margin-left: auto; border: 1px solid #e3e0f4; border-radius: 5px; }
 .recommendation-empty { padding: 52px !important; color: #7a819d !important; text-align: center; }
 @media (max-width: 850px) { .job-recommendations-heading { display: flex; align-items: flex-start; flex-direction: column; padding: 10px 16px; } .job-recommendations-content { padding: 0 16px 18px; } .job-recommendations-toolbar { width: 100%; justify-content: stretch; } .job-recommendations-toolbar button { flex: 1; } .job-recommendations-filters { gap: 16px; overflow-x: auto; } .job-recommendations-heading-link { display: none; } }

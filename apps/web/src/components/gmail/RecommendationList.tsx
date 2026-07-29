@@ -1,7 +1,7 @@
 'use client'
 
 import React from 'react'
-import { ExternalLink, Mail, X } from 'lucide-react'
+import { BriefcaseBusiness, ExternalLink, Mail, X } from 'lucide-react'
 import type { GmailRecommendation } from './types'
 import { groupRecommendations } from './recommendations-model'
 
@@ -66,7 +66,7 @@ function RecommendationRow({ item, selected, expanded, busy, onToggle, onExpand,
     <tr className={`${expanded ? 'is-expanded ' : ''}${selected ? 'is-selected' : ''}`.trim() || undefined} onClick={() => onExpand(item.id)}>
       <td className="recommendation-check" onClick={event => event.stopPropagation()}><input aria-label={`Select ${item.role ?? 'job'}`} type="checkbox" checked={selected} disabled={!canSave} onChange={() => onToggle(item.id)} /></td>
       <td><strong>{item.role ?? 'Role details needed'}</strong><span>{item.company ?? 'Details fetched when saved'}</span></td>
-      <td className="recommendation-source" onClick={event => event.stopPropagation()}><a href={sourceEmailHref(item.sourceMessage.gmailMessageId)} target="_blank" rel="noreferrer" aria-label="Open source email" title={item.sourceMessage.senderEmail || item.sourceMessage.subject}><Mail size={15} /></a></td>
+      <td className="recommendation-source"><PlatformIcon platform={item.platform} /></td>
       <td>{item.location ?? '—'}</td><td>{employmentType(item.description)}</td><td>{experience(item.description)}</td>
       <td><MatchValue value={item.sourceMessage.matchConfidence} /></td>
       <td className="recommendation-actions" onClick={event => event.stopPropagation()}>
@@ -76,7 +76,7 @@ function RecommendationRow({ item, selected, expanded, busy, onToggle, onExpand,
       </td>
     </tr>
     {expanded && <tr className="recommendation-expanded"><td /><td colSpan={7}><div>
-      <span><Mail size={14} /> Email subject: {item.sourceMessage.subject}</span><span>Salary: {item.salary || 'Not provided'}</span>
+      <span><Mail size={14} /> Email subject: <a href={sourceEmailHref(item.sourceMessage.gmailMessageId)} target="_blank" rel="noreferrer">Open source email</a></span><span>Salary: {item.salary || 'Not provided'}</span>
       {item.description && <p>{item.description}</p>}
       {item.url && <a href={item.url} target="_blank" rel="noreferrer">View job <ExternalLink size={13} /></a>}
       <button type="button" aria-label="Close job details" disabled={busy} onClick={() => onExpand(item.id)}><X size={14} /></button>
@@ -86,6 +86,24 @@ function RecommendationRow({ item, selected, expanded, busy, onToggle, onExpand,
 
 function sourceEmailHref(messageId: string) {
   return `https://mail.google.com/mail/u/0/#all/${encodeURIComponent(messageId)}`
+}
+
+function PlatformIcon({ platform }: { platform: string | null }) {
+  const source = platformSource(platform)
+  if (!source) return <span className="recommendation-source-fallback" title={platform ?? 'Job platform'}><BriefcaseBusiness size={15} /></span>
+  // eslint-disable-next-line @next/next/no-img-element -- fixed third-party favicon domains avoid Next image host configuration.
+  return <img src={`https://www.google.com/s2/favicons?domain=${source.domain}&sz=64`} alt={`${source.label} logo`} title={source.label} />
+}
+
+function platformSource(platform: string | null) {
+  const value = platform?.toLowerCase().replace(/[^a-z]/g, '') ?? ''
+  if (value.includes('linkedin')) return { label: 'LinkedIn', domain: 'linkedin.com' }
+  if (value.includes('indeed')) return { label: 'Indeed', domain: 'indeed.com' }
+  if (value.includes('gradireland')) return { label: 'GradIreland', domain: 'gradireland.com' }
+  if (value.includes('irishjobs')) return { label: 'IrishJobs', domain: 'irishjobs.ie' }
+  if (value === 'jobsie') return { label: 'Jobs.ie', domain: 'jobs.ie' }
+  if (value.includes('stepstone')) return { label: 'StepStone', domain: 'stepstone.de' }
+  return null
 }
 
 function MatchValue({ value }: { value: number | null }) {
