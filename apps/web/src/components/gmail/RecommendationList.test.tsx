@@ -25,9 +25,9 @@ describe('RecommendationList', () => {
   it('renders source email detail inside the expanded list row', () => {
     const html = renderToString(<RecommendationList recommendations={[recommendation]} selectedIds={new Set()} expandedId={recommendation.id} busyIds={new Set()} onToggle={vi.fn()} onToggleAll={vi.fn()} onExpand={vi.fn()} onAction={vi.fn()} />)
 
-    expect(html).toContain('Email subject:')
+    expect(html).toContain('Source email')
     expect(html).toContain('Open source email')
-    expect(html).toContain('Salary:')
+    expect(html).toContain('Salary')
     expect(html).toContain('Help customers troubleshoot technical issues.')
   })
 })
