@@ -76,11 +76,11 @@ function RecommendationRow({ item, selected, expanded, busy, onToggle, onExpand,
       </td>
     </tr>
     {expanded && <tr className="recommendation-expanded"><td /><td colSpan={7}><div>
-      <a className="recommendation-expanded-email" href={sourceEmailHref(item.sourceMessage.gmailMessageId)} target="_blank" rel="noreferrer"><Mail size={14} /><span><small>Source email</small><strong>Open source email</strong></span></a>
+      <a className="recommendation-expanded-email" href={sourceEmailHref(item.sourceMessage.gmailMessageId)} target="_blank" rel="noreferrer"><Mail size={14} /><small>Source email</small><strong>Open source email</strong></a>
       <span className="recommendation-expanded-meta"><small>Salary</small><strong>{item.salary || 'Not provided'}</strong></span>
-      {item.url && <a className="recommendation-expanded-job" href={item.url} target="_blank" rel="noreferrer"><span><small>Job page</small><strong>View job <ExternalLink size={13} /></strong></span></a>}
-      <button type="button" aria-label="Close job details" disabled={busy} onClick={() => onExpand(item.id)}><X size={14} /></button>
+      {item.url && <a className="recommendation-expanded-job" href={item.url} target="_blank" rel="noreferrer"><small>Job page</small><strong>View job <ExternalLink size={13} /></strong></a>}
       {item.description && <p>{item.description}</p>}
+      <button type="button" aria-label="Close job details" disabled={busy} onClick={() => onExpand(item.id)}><X size={14} /></button>
     </div></td></tr>}
   </>
 }
