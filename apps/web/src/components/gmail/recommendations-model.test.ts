@@ -17,6 +17,17 @@ describe('recommendations model', () => {
   it('groups recommendations by the date their source email arrived', () => {
     const groups = groupRecommendations(recommendations, new Date('2026-07-29T12:00:00.000Z'))
     expect(groups.map(group => group.label)).toEqual(['Today — Jul 29', 'Yesterday — Jul 28'])
+    expect(new Set(groups.map(group => group.id)).size).toBe(groups.length)
+  })
+
+  it('uses the date as the group identity when display labels are shared', () => {
+    const grouped = groupRecommendations([
+      recommendation('one', 'Indeed', 'Dublin, Ireland', 'Support Engineer', '2026-07-26T08:00:00.000Z'),
+      recommendation('two', 'Indeed', 'Dublin, Ireland', 'Data Engineer', '2026-07-25T08:00:00.000Z'),
+    ], new Date('2026-07-29T12:00:00.000Z'))
+
+    expect(grouped.map(group => group.label)).toEqual(['Earlier this week', 'Earlier this week'])
+    expect(grouped.map(group => group.id)).not.toEqual([grouped[1].id, grouped[0].id])
   })
 
   it('uses candidate-facing status labels', () => {
@@ -29,6 +40,6 @@ describe('recommendations model', () => {
 function recommendation(id: string, platform: string, location: string, role: string, receivedAt: string): GmailRecommendation {
   return {
     id, platform, location, role, company: 'Example Co', salary: null, url: null, description: null, status: 'pending', createdAt: receivedAt,
-    sourceMessage: { subject: `New roles for you: ${role}`, receivedAt }, savedJob: null,
+    sourceMessage: { subject: `New roles for you: ${role}`, receivedAt, senderName: null, senderEmail: null, matchConfidence: null }, savedJob: null,
   }
 }

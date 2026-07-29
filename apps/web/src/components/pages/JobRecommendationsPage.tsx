@@ -1,18 +1,20 @@
 'use client'
 
 import { useCallback, useEffect, useMemo, useState } from 'react'
-import { CheckSquare, RefreshCw } from 'lucide-react'
+import { CheckSquare, Mail, RefreshCw } from 'lucide-react'
 import { Btn, useToast } from '@/components/ui'
 import { GmailConnectionScreen, type GmailConnectionState } from '@/components/gmail/GmailConnectionState'
 import { RecommendationList } from '@/components/gmail/RecommendationList'
 import { DEFAULT_RECOMMENDATION_FILTERS, filterRecommendations, type RecommendationFilters } from '@/components/gmail/recommendations-model'
 import type { GmailRecommendation, GmailTrackingResponse } from '@/components/gmail/types'
+import { useNav } from '@/lib/nav-context'
 import './JobRecommendationsPage.css'
 
 type ConnectionState = GmailConnectionState | 'ready'
 const REAUTH_ERRORS = new Set(['GMAIL_REAUTH', 'GMAIL_SCOPE_MISSING', 'GMAIL_PERMISSION', 'TOKEN_EXPIRED'])
 
 export function JobRecommendationsPage() {
+  const { navigate } = useNav()
   const toast = useToast()
   const [connection, setConnection] = useState<ConnectionState>('loading')
   const [recommendations, setRecommendations] = useState<GmailRecommendation[]>([])
@@ -21,6 +23,7 @@ export function JobRecommendationsPage() {
   const [expandedId, setExpandedId] = useState<string | null>(null)
   const [busyIds, setBusyIds] = useState<Set<string>>(() => new Set())
   const [refreshing, setRefreshing] = useState(false)
+  const [showMoreFilters, setShowMoreFilters] = useState(false)
 
   const loadRecommendations = useCallback(async (silent = false, signal?: AbortSignal) => {
     if (!silent) setConnection('loading')
@@ -99,6 +102,7 @@ export function JobRecommendationsPage() {
   return <div className="job-recommendations-page">
     <header className="job-recommendations-heading">
       <div><h1>Job recommendations</h1><p>Jobs parsed from your subscription emails. Review and decide which jobs to save.</p></div>
+      <button type="button" className="job-recommendations-heading-link" onClick={() => navigate('gmail')}><Mail size={14} />Gmail · Job recommendations</button>
       <div className="job-recommendations-toolbar">
         <Btn variant="ghost" onClick={() => void loadRecommendations(true)} disabled={refreshing}><RefreshCw size={15} />{refreshing ? 'Refreshing…' : 'Refresh inbox'}</Btn>
         <Btn variant="primary" onClick={() => void saveSelected()} disabled={selectedCount === 0 || busyIds.size > 0}><CheckSquare size={15} />Save selected{selectedCount ? ` · ${selectedCount}` : ''}</Btn>
@@ -106,11 +110,12 @@ export function JobRecommendationsPage() {
     </header>
     <main className="job-recommendations-content">
       <section className="job-recommendations-filters" aria-label="Filter job recommendations">
-        <input value={filters.search} onChange={event => updateFilters({ search: event.target.value })} placeholder="Search jobs, companies, or keywords" aria-label="Search recommendations" />
         <FilterSelect value={filters.platform} label="All sources" options={platforms} onChange={platform => updateFilters({ platform })} />
         <FilterSelect value={filters.status} label="All statuses" options={['all', 'pending', 'saved', 'dismissed']} onChange={status => updateFilters({ status: status as RecommendationFilters['status'] })} />
         <FilterSelect value={filters.location} label="All locations" options={locations} onChange={location => updateFilters({ location })} />
+        <button type="button" className="job-recommendations-more" onClick={() => setShowMoreFilters(value => !value)}>More filters</button>
       </section>
+      {showMoreFilters && <div className="job-recommendations-search"><input value={filters.search} onChange={event => updateFilters({ search: event.target.value })} placeholder="Search jobs, companies, or keywords" aria-label="Search recommendations" /></div>}
       {selectedCount > 0 && <div className="job-recommendations-selection"><span>{selectedCount} selected</span><button type="button" onClick={() => setSelectedIds(new Set())}>Clear selection</button></div>}
       <RecommendationList recommendations={visible} selectedIds={selectedIds} expandedId={expandedId} busyIds={busyIds} onToggle={id => setSelectedIds(current => { const next = new Set(current); next.has(id) ? next.delete(id) : next.add(id); return next })} onToggleAll={toggleAll} onExpand={id => setExpandedId(current => current === id ? null : id)} onAction={updateRecommendation} />
     </main>

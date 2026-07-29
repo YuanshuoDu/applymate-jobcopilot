@@ -34,6 +34,7 @@ export function groupRecommendations(items: GmailRecommendation[], now = new Dat
     else groups.set(key, [item])
   }
   return [...groups.entries()].map(([key, recommendations]) => ({
+    id: key,
     label: recommendationGroupLabel(new Date(key), now),
     recommendations,
   }))

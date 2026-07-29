@@ -35,7 +35,7 @@ export interface GmailRecommendation {
   description: string | null
   status: 'pending' | 'saved' | 'dismissed'
   createdAt: string
-  sourceMessage: { subject: string; receivedAt: string }
+  sourceMessage: { subject: string; receivedAt: string; senderName: string | null; senderEmail: string | null; matchConfidence: number | null }
   savedJob: { id: string; company: string; role: string } | null
 }
 

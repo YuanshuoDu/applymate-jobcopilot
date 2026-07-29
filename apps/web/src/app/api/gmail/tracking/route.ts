@@ -27,7 +27,7 @@ export async function GET(req: NextRequest) {
       orderBy: { createdAt: 'desc' },
       take: 100,
       include: {
-        sourceMessage: { select: { subject: true, receivedAt: true } },
+        sourceMessage: { select: { subject: true, receivedAt: true, senderName: true, senderEmail: true, matchConfidence: true } },
         savedJob: { select: { id: true, company: true, role: true } },
       },
     }),
