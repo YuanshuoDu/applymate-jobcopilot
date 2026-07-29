@@ -17,6 +17,7 @@ describe('RecommendationList', () => {
     expect(html).toContain('<table')
     expect(html).toContain('Senior Support Engineer')
     expect(html).toContain('Indeed logo')
+    expect(html).toContain('recommendation-save')
     expect(html).toContain('Save')
     expect(html).toContain('Dismiss')
   })

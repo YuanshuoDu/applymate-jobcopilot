@@ -70,8 +70,8 @@ function RecommendationRow({ item, selected, expanded, busy, onToggle, onExpand,
       <td>{item.location ?? '—'}</td><td>{employmentType(item.description)}</td><td>{experience(item.description)}</td>
       <td><MatchValue value={item.sourceMessage.matchConfidence} /></td>
       <td className="recommendation-actions" onClick={event => event.stopPropagation()}>
-        {canSave && <button type="button" disabled={busy} onClick={() => onAction(item.id, 'save')}>{busy ? 'Saving…' : 'Save'}</button>}
-        {item.status === 'pending' && <button type="button" disabled={busy} onClick={() => onAction(item.id, 'dismiss')}>Dismiss</button>}
+        {canSave && <button className="recommendation-save" type="button" disabled={busy} onClick={() => onAction(item.id, 'save')}>{busy ? 'Saving…' : 'Save'}</button>}
+        {item.status === 'pending' && <button className="recommendation-dismiss" type="button" disabled={busy} onClick={() => onAction(item.id, 'dismiss')}>Dismiss</button>}
         {item.status === 'saved' && <span>Saved</span>}
       </td>
     </tr>
