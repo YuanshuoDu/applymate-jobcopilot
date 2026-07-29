@@ -2,11 +2,11 @@
 
 import React, { useEffect, useMemo, useState } from 'react'
 import {
-  ArrowRight, BriefcaseBusiness, CalendarDays, Check, ChevronDown, Circle,
-  Eye, FileText, MoreVertical, Send, Sparkles, Target, X,
+  ArrowRight, BriefcaseBusiness, CalendarDays, Check, ChevronDown,
+  Eye, FileText, MailCheck, MoreVertical, Send, Sparkles, Target, X,
 } from 'lucide-react'
-import { Btn, ScorePill, StatusBadge, useToast } from '@/components/ui'
-import type { DashboardData, DashboardSavedJob, Job, JobStatus } from '@/lib/types'
+import { Btn, ScorePill, useToast } from '@/components/ui'
+import type { Activity, DashboardData, DashboardSavedJob } from '@/lib/types'
 import { apiMutate, fmtDate, useApi } from '@/lib/hooks'
 import { useNav } from '@/lib/nav-context'
 import './DashboardPage.css'
@@ -65,7 +65,7 @@ function CoachCard({ hasResume, savedJobs, onAction }: { hasResume: boolean; sav
   const detail = !hasResume
     ? 'Upload your resume and the agent will tailor every recommendation to your experience.'
     : savedJobs > 0
-      ? `${savedJobs} high-match role${savedJobs === 1 ? '' : 's'} are waiting for your review.`
+      ? `${savedJobs} high-match role${savedJobs === 1 ? '' : 's'} are ready for your next step.`
       : 'Add 2–3 quantified achievements to make your experience easier for recruiters to scan.'
 
   return (
@@ -82,12 +82,12 @@ function MatchList({ jobs, threshold, onReview }: { jobs: DashboardSavedJob[]; t
     <section className="momentum-side-card momentum-matches-card">
       <div className="momentum-side-title"><Sparkles size={18} /><div><h2>High-match roles</h2><p>{jobs.length > 0 ? `${jobs.length} roles at ${threshold}%+ waiting for approval` : `Saved roles scoring ${threshold}%+ appear here`}</p></div></div>
       <div className="momentum-match-list">
-        {jobs.length === 0 ? <div className="momentum-side-empty"><BriefcaseBusiness size={19} /> Save promising roles to review them here.</div> : jobs.slice(0, 3).map(job => (
+        {jobs.length === 0 ? <div className="momentum-side-empty"><BriefcaseBusiness size={19} /> Save promising roles to compare them here.</div> : jobs.slice(0, 3).map(job => (
           <article className="momentum-match" key={job.id}>
             <CompanyBadge company={job.company} />
-            <div className="momentum-match-copy"><strong>{job.role}</strong><span>{job.company}</span><small>Ready for review</small></div>
+            <div className="momentum-match-copy"><strong>{job.role}</strong><span>{job.company}</span><small>Saved match</small></div>
             <ScorePill score={job.score} />
-            <button onClick={onReview} aria-label={`Review ${job.role} at ${job.company}`}>Review <ArrowRight size={15} /></button>
+            <button onClick={onReview} aria-label={`View ${job.role} at ${job.company}`}>View <ArrowRight size={15} /></button>
           </article>
         ))}
       </div>
@@ -96,27 +96,27 @@ function MatchList({ jobs, threshold, onReview }: { jobs: DashboardSavedJob[]; t
   )
 }
 
-function Timeline({ jobs, onJobs }: { jobs: Job[]; onJobs: () => void }) {
+function Timeline({ activities, onJobs }: { activities: Activity[]; onJobs: () => void }) {
   const [sortBy, setSortBy] = useState<'recent' | 'company'>('recent')
   const [sortOpen, setSortOpen] = useState(false)
-  const sortedJobs = [...jobs].sort((a, b) => sortBy === 'company'
-    ? a.company.localeCompare(b.company)
-    : new Date(b.appliedAt ?? b.createdAt).getTime() - new Date(a.appliedAt ?? a.createdAt).getTime())
+  const sortedActivities = [...activities].sort((a, b) => sortBy === 'company'
+    ? (a.job?.company ?? '').localeCompare(b.job?.company ?? '')
+    : new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime())
 
   return (
     <section className="momentum-timeline-card">
       <div className="momentum-timeline-heading"><h2>Your application timeline</h2><div className="momentum-sort"><button onClick={() => setSortOpen(open => !open)} aria-expanded={sortOpen}>{sortBy === 'recent' ? 'Most recent' : 'Company'} <ChevronDown size={14} /></button>{sortOpen && <div><button onClick={() => { setSortBy('recent'); setSortOpen(false) }}>Most recent</button><button onClick={() => { setSortBy('company'); setSortOpen(false) }}>Company</button></div>}</div></div>
-      {jobs.length === 0 ? (
+      {activities.length === 0 ? (
         <div className="momentum-timeline-empty"><Target size={20} /> Your application activity will appear here.</div>
       ) : (
         <div className="momentum-table">
-          {sortedJobs.slice(0, 5).map(job => (
-            <div className="momentum-row" key={job.id}>
-              <span className={`momentum-row-status ${job.status === 'rejected' ? 'is-rejected' : job.status !== 'review' ? 'is-complete' : ''}`}>{job.status === 'review' ? <Circle size={15} /> : job.status === 'rejected' ? <X size={11} /> : <Check size={11} />}</span>
-              <CompanyBadge company={job.company} logo={job.logo} />
-              <div className="momentum-row-role"><strong>{job.role}</strong><span>{job.company}</span></div>
-              <StatusBadge status={job.status} />
-              <time>{fmtDate(job.appliedAt ?? job.createdAt)}</time>
+          {sortedActivities.slice(0, 5).map(activity => (
+            <div className="momentum-row" key={activity.id}>
+              <span className={`momentum-row-status ${activity.type === 'rejected' ? 'is-rejected' : 'is-complete'}`}>{activity.type === 'rejected' ? <X size={11} /> : <Check size={11} />}</span>
+              <CompanyBadge company={activity.job?.company ?? 'Gmail'} />
+              <div className="momentum-row-role"><strong>{activity.job?.role ?? 'Application update'}</strong><span>{activity.text}</span></div>
+              <span style={{ fontSize: 11, color: 'var(--text-muted)', whiteSpace: 'nowrap' }}>{activityLabel(activity.type)}</span>
+              <time>{fmtDate(activity.createdAt)}</time>
               <button onClick={onJobs}>View <ArrowRight size={12} /></button>
               <MoreVertical size={16} className="momentum-row-more" />
             </div>
@@ -126,6 +126,14 @@ function Timeline({ jobs, onJobs }: { jobs: Job[]; onJobs: () => void }) {
       <button className="momentum-link momentum-center-link" onClick={onJobs}>View full application history <ArrowRight size={15} /></button>
     </section>
   )
+}
+
+function activityLabel(type: Activity['type']): string {
+  if (type === 'interview_scheduled') return 'Interview'
+  if (type === 'offer_received') return 'Offer'
+  if (type === 'rejected') return 'Rejected'
+  if (type === 'status_changed') return 'Status update'
+  return 'Activity'
 }
 
 function WeekAtAGlance({ stats, onJobs }: { stats: DashboardData['stats']; onJobs: () => void }) {
@@ -199,13 +207,17 @@ export function DashboardPage() {
 
   const stats = data?.stats ?? { total: 0, saved: 0, applied: 0, inProgress: 0, interviews: 0, offers: 0, rejected: 0, thisWeek: 0 }
   const savedJobs = data?.savedJobs ?? []
-  const recentJobs = data?.recentJobs ?? []
+  const activities = data?.activity ?? []
+  const pendingRecommendations = data?.pendingRecommendationCount ?? 0
 
   return (
     <div className="momentum-dashboard">
       <main className="momentum-content">
         {!data?.hasResume && !profilePromptDismissed && (
           <section className="momentum-profile-prompt"><FileText size={18} /><span>Add your resume to unlock tailored matches.</span><button onClick={() => navigate('resume')}>Add resume</button><button aria-label="Dismiss resume reminder" onClick={dismissProfilePrompt}><X size={15} /></button></section>
+        )}
+        {pendingRecommendations > 0 && (
+          <section className="momentum-profile-prompt"><MailCheck size={18} /><span>{pendingRecommendations} new job recommendation{pendingRecommendations === 1 ? '' : 's'} arrived in Gmail.</span><button onClick={() => navigate('gmail')}>Review jobs</button></section>
         )}
         <header className="momentum-header">
           <div><span><Sparkles size={23} /></span><div><h1>Application Momentum</h1><p>Stay consistent, focus on quality, and keep moving forward.</p></div></div>
@@ -220,7 +232,7 @@ export function DashboardPage() {
           </div>
         </header>
         <div className="momentum-layout">
-          <div className="momentum-primary-column"><WeekGoal completed={stats.thisWeek} /><CoachCard hasResume={data?.hasResume ?? false} savedJobs={savedJobs.length} onAction={() => navigate(data?.hasResume ? 'jobs' : 'resume')} /><Timeline jobs={recentJobs} onJobs={() => navigate('jobs')} /></div>
+          <div className="momentum-primary-column"><WeekGoal completed={stats.thisWeek} /><CoachCard hasResume={data?.hasResume ?? false} savedJobs={savedJobs.length} onAction={() => navigate(data?.hasResume ? 'jobs' : 'resume')} /><Timeline activities={activities} onJobs={() => navigate('jobs')} /></div>
           <aside className="momentum-secondary-column"><MatchList jobs={savedJobs} threshold={data?.minMatchScore ?? 75} onReview={() => navigate('jobs')} /><WeekAtAGlance stats={stats} onJobs={() => navigate('jobs')} /><ActionCard followUps={data?.followUpsDue ?? []} agentConfig={data?.agentConfig ?? null} onJobs={() => navigate('jobs')} onSettings={() => navigate('settings')} onUpdated={refetch} /></aside>
         </div>
       </main>

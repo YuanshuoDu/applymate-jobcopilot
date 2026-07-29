@@ -329,8 +329,8 @@ describe("agent chat API session recording", () => {
 
   it("emits and records an approval request block for sensitive apply actions", async () => {
     mocks.findMany.mockResolvedValueOnce([
-      { id: "job_1", company: "N26", role: "SWE", score: 94, status: "review" },
-      { id: "job_2", company: "Spotify", role: "Backend Engineer", score: 88, status: "review" },
+      { id: "job_1", company: "N26", role: "SWE", score: 94, status: "saved", workflowState: "ready_to_apply" },
+      { id: "job_2", company: "Spotify", role: "Backend Engineer", score: 88, status: "saved", workflowState: "ready_to_apply" },
     ])
     const { POST } = await import("./route")
 

@@ -2,7 +2,12 @@
 // Domain types — kept in sync with prisma/schema.prisma
 // ─────────────────────────────────────────────────────────────────────────────
 
-export type JobStatus     = 'saved' | 'applied' | 'review' | 'interview' | 'offer' | 'rejected'
+// Candidate-facing application lifecycle. We only surface statuses that can be
+// confirmed by the candidate or a reliable application email.
+export const JOB_STATUSES = ['saved', 'applied', 'interview', 'offer', 'rejected'] as const
+export type JobStatus = (typeof JOB_STATUSES)[number]
+export type JobStatusCounts = Record<JobStatus, number>
+export type JobWorkflowState = 'draft' | 'ready_to_apply' | 'submitted'
 export type Plan          = 'free' | 'pro' | 'enterprise'
 export type AgentRoleType = 'scout' | 'analyst' | 'writer' | 'reviewer' | 'executor' | 'auditor'
 
@@ -86,6 +91,7 @@ export interface Job {
   keywords:     string | null  // ATS keywords from JD scoring, comma-separated
   appliedAt:    string | null  // ISO date string from API
   followUpAt:   string | null
+  workflowState: JobWorkflowState
   createdAt:    string
   updatedAt:    string
   // M1 extensions
@@ -234,6 +240,7 @@ export interface DashboardData {
   savedJobs:    DashboardSavedJob[]
   recentJobs:   Job[]
   activity:     Activity[]
+  pendingRecommendationCount: number
   agentConfig:  AgentConfig | null
   minMatchScore: number
   hasResume:    boolean

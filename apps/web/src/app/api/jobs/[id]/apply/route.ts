@@ -20,7 +20,7 @@ export async function POST(
 
   await db.job.update({
     where: { id },
-    data:  { status: 'applied', appliedAt: new Date() },
+    data:  { status: 'applied', workflowState: 'submitted', appliedAt: new Date() },
   })
 
   await db.activity.create({

@@ -10,6 +10,12 @@ import type { JobStatus } from '@prisma/client'
 
 type Params = { params: Promise<{ id: string }> }
 
+const JOB_STATUSES: JobStatus[] = ['saved', 'applied', 'interview', 'offer', 'rejected']
+
+function isJobStatus(value: unknown): value is JobStatus {
+  return typeof value === 'string' && JOB_STATUSES.includes(value as JobStatus)
+}
+
 // ── GET ───────────────────────────────────────────────────────────────────────
 export async function GET(_req: NextRequest, { params }: Params) {
   const auth = await requireAuth()
@@ -40,12 +46,21 @@ export async function PATCH(req: NextRequest, { params }: Params) {
     if (field in body) data[field] = body[field]
   }
 
+  if ('status' in data && !isJobStatus(data.status)) {
+    return err('Invalid job status')
+  }
+
+  if (data.status === 'applied' && !existing.appliedAt) {
+    data.appliedAt = new Date()
+  }
+  if (data.status) data.workflowState = data.status === 'saved' ? 'draft' : 'submitted'
+
   const job = await db.job.update({ where: { id }, data })
 
   // Log status change
   if ('status' in data && data.status !== existing.status) {
     const statusLabels: Record<JobStatus, string> = {
-      saved: 'Saved', applied: 'Applied', review: 'In Review',
+      saved: 'Saved', applied: 'Applied',
       interview: 'Interview', offer: 'Offer received', rejected: 'Rejected',
     }
     await db.activity.create({
@@ -57,11 +72,6 @@ export async function PATCH(req: NextRequest, { params }: Params) {
         color:  '#854F0B',
       },
     })
-
-    // Set appliedAt when status becomes 'applied'
-    if (data.status === 'applied' && !existing.appliedAt) {
-      await db.job.update({ where: { id }, data: { appliedAt: new Date() } })
-    }
   }
 
   return ok(job)

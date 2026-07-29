@@ -68,7 +68,7 @@ export async function POST(req: NextRequest) {
 
   const [agentCfg, jobs, resume, lastActivity] = await Promise.all([
     db.agentConfig.findUnique({ where: { userId: prep.userId } }),
-    db.job.findMany({ where: { userId: prep.userId }, orderBy: { updatedAt: 'desc' }, take: 15, select: { id: true, company: true, role: true, score: true, status: true, url: true } }),
+    db.job.findMany({ where: { userId: prep.userId }, orderBy: { updatedAt: 'desc' }, take: 15, select: { id: true, company: true, role: true, score: true, status: true, workflowState: true, url: true } }),
     db.resume.findFirst({ where: { userId: prep.userId, isDefault: true }, select: { id: true, name: true } })
       ?? db.resume.findFirst({ where: { userId: prep.userId }, orderBy: { createdAt: 'desc' }, select: { id: true, name: true } }),
     db.activity.findFirst({ where: { userId: prep.userId, type: 'agent_action' }, orderBy: { createdAt: 'desc' }, select: { createdAt: true } }),
@@ -76,7 +76,7 @@ export async function POST(req: NextRequest) {
 
   const ctxData = {
     jobCount: jobs.length, savedCount: jobs.filter(j => j.status === 'saved').length,
-    pendingCount: jobs.filter(j => j.status === 'review').length,
+    pendingCount: jobs.filter(j => j.workflowState === 'ready_to_apply').length,
     config: agentCfg as Record<string, unknown> | null, resumeName: resume?.name ?? null,
     recentJobs: jobs.slice(0, 8).map(j => ({ company: j.company, role: j.role, score: j.score, status: j.status })),
     lastRunAt: lastActivity?.createdAt.toLocaleDateString('zh') ?? null,

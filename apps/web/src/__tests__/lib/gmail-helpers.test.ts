@@ -14,43 +14,43 @@ describe('classifyEmail', () => {
   })
 
   it('detects rejection emails', () => {
-    expect(classifyEmail('Unfortunately we are not moving forward', '')).toBe('rejected')
-    expect(classifyEmail('', 'regret to inform you')).toBe('rejected')
-    expect(classifyEmail('Your application was unsuccessful', '')).toBe('rejected')
-    expect(classifyEmail('We have decided not to proceed', 'with other candidates')).toBe('rejected')
+    expect(classifyEmail('Unfortunately we are not moving forward', '')).toBe('rejection')
+    expect(classifyEmail('', 'regret to inform you')).toBe('rejection')
+    expect(classifyEmail('Your application was unsuccessful', '')).toBe('rejection')
+    expect(classifyEmail('We have decided not to proceed', 'with other candidates')).toBe('rejection')
   })
 
   it('detects interview invitations', () => {
-    expect(classifyEmail('Interview invitation for Monday', '')).toBe('interview')
-    expect(classifyEmail('', 'Next step: schedule a call')).toBe('interview')
-    expect(classifyEmail('Phone screen with the team', '')).toBe('interview')
-    expect(classifyEmail('We would like to invite you', 'for a video call')).toBe('interview')
+    expect(classifyEmail('Interview invitation for Monday', '')).toBe('interview_invitation')
+    expect(classifyEmail('', 'Next step: schedule a call')).toBe('interview_invitation')
+    expect(classifyEmail('Phone screen with the team', '')).toBe('interview_invitation')
+    expect(classifyEmail('We would like to invite you', 'for a video call')).toBe('interview_invitation')
   })
 
   it('detects application received confirmations', () => {
-    expect(classifyEmail('Thank you for applying', '')).toBe('received')
-    expect(classifyEmail('', 'Application received - we have received your CV')).toBe('received')
+    expect(classifyEmail('Thank you for applying', '')).toBe('application_received')
+    expect(classifyEmail('', 'Application received - we have received your CV')).toBe('application_received')
   })
 
-  it('detects profile views', () => {
-    expect(classifyEmail('', 'A recruiter viewed your profile on LinkedIn')).toBe('viewed')
+  it('does not promote profile views to an application state', () => {
+    expect(classifyEmail('', 'A recruiter viewed your profile on LinkedIn')).toBe('other')
   })
 
-  it('defaults to "received" for unrecognized content', () => {
-    expect(classifyEmail('Weekly job alert', 'new positions this week')).toBe('received')
+  it('recognizes job-platform recommendation digests', () => {
+    expect(classifyEmail('Weekly job alert', 'new positions this week')).toBe('recommendation_digest')
   })
 
   it('case-insensitive matching', () => {
-    expect(classifyEmail('UNFORTUNATELY', '')).toBe('rejected')
+    expect(classifyEmail('UNFORTUNATELY', '')).toBe('rejection')
     expect(classifyEmail('OFFER LETTER', '')).toBe('offer')
-    expect(classifyEmail('INTERVIEW INVITATION', '')).toBe('interview')
+    expect(classifyEmail('INTERVIEW INVITATION', '')).toBe('interview_invitation')
   })
 
   it('searches both subject and snippet', () => {
     // Only in snippet
-    expect(classifyEmail('Hello', 'we regret to inform you')).toBe('rejected')
+    expect(classifyEmail('Hello', 'we regret to inform you')).toBe('rejection')
     // Only in subject
-    expect(classifyEmail('Congratulations!', '')).toBe('offer')
+    expect(classifyEmail('Congratulations!', '')).toBe('other')
   })
 })
 

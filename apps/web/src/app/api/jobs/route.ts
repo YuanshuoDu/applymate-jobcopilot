@@ -5,7 +5,7 @@
 import { NextRequest } from 'next/server'
 import { db } from '@/lib/db'
 import { requireAuth, isErrorResponse, ok, err } from '@/lib/api-helpers'
-import type { JobStatus } from '@prisma/client'
+import { JOB_STATUSES, type JobStatus, type JobStatusCounts } from '@/lib/types'
 
 const MIN_EXTENSION_DESCRIPTION_LENGTH = 80
 
@@ -15,7 +15,9 @@ export async function GET(req: NextRequest) {
   if (isErrorResponse(auth)) return auth
 
   const { searchParams } = req.nextUrl
-  const status        = searchParams.get('status') as JobStatus | null
+  const requestedStatus = searchParams.get('status')
+  if (requestedStatus && !isJobStatus(requestedStatus)) return err('Invalid job status')
+  const status        = requestedStatus as JobStatus | null
   const source        = searchParams.get('source')
   const q             = searchParams.get('q')              // text search
   const finalResumeId = searchParams.get('finalResumeId')  // M4: reverse-link filter
@@ -38,7 +40,7 @@ export async function GET(req: NextRequest) {
       : {}),
   }
 
-  const [jobs, total] = await Promise.all([
+  const [jobs, total, groupedStatusCounts] = await Promise.all([
     db.job.findMany({
       where,
       orderBy: { createdAt: 'desc' },
@@ -46,7 +48,23 @@ export async function GET(req: NextRequest) {
       take: pageSize,
     }),
     db.job.count({ where }),
+    db.job.groupBy({
+      by: ['status'],
+      where: { userId: auth.userId },
+      _count: { _all: true },
+    }),
   ])
+
+  const statusCounts: JobStatusCounts = {
+    saved: 0,
+    applied: 0,
+    interview: 0,
+    offer: 0,
+    rejected: 0,
+  }
+  for (const group of groupedStatusCounts) {
+    if (isJobStatus(group.status)) statusCounts[group.status] = group._count._all
+  }
 
   const repairedJobs = await Promise.all(jobs.map(async job => {
     const repairedRole = repairLinkedInDismissRole(job.role, job.source)
@@ -54,7 +72,7 @@ export async function GET(req: NextRequest) {
     return db.job.update({ where: { id: job.id }, data: { role: repairedRole } })
   }))
 
-  return ok({ jobs: repairedJobs, total, page, pageSize })
+  return ok({ jobs: repairedJobs, total, page, pageSize, statusCounts })
 }
 
 // ── POST ──────────────────────────────────────────────────────────────────────
@@ -69,6 +87,7 @@ export async function POST(req: NextRequest) {
   const canonicalUrl = canonicalizeJobUrl(url, source)
 
   if (!company || !role) return err('company and role are required')
+  if (status !== undefined && !isJobStatus(status)) return err('Invalid job status')
   if (isExtensionSaveRequest(req) && !hasMinimumDescription(description)) {
     return err(
       'Job description could not be captured. Wait for the full job details to load, then retry Save to ApplyMate.',
@@ -106,6 +125,7 @@ export async function POST(req: NextRequest) {
       source:      source      ?? 'manual',
       score:       score       ?? null,
       status:      status      ?? 'saved',
+      workflowState: status && status !== 'saved' ? 'submitted' : 'draft',
       logo:        logo ?? company.slice(0, 2).toUpperCase(),
     },
   })
@@ -115,8 +135,8 @@ export async function POST(req: NextRequest) {
     data: {
       userId: auth.userId,
       jobId:  job.id,
-      type:   'applied',
-      text:   `Added ${company} · ${role}`,
+      type:   'note_added',
+      text:   `Saved ${company} · ${role}`,
       color:  '#185FA5',
     },
   })
@@ -194,6 +214,10 @@ function canonicalizeJobUrl(value: unknown, source: unknown): string | null {
 
 function isExtensionSaveRequest(req: NextRequest): boolean {
   return /^Bearer\s+/i.test(req.headers.get('authorization') ?? '')
+}
+
+function isJobStatus(value: unknown): value is JobStatus {
+  return typeof value === 'string' && JOB_STATUSES.includes(value as JobStatus)
 }
 
 function hasMinimumDescription(value: unknown): value is string {

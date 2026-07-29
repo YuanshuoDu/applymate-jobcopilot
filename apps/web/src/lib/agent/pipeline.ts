@@ -322,12 +322,13 @@ export async function runPipeline(ctx: PipelineCtx): Promise<RunReport> {
   await recordRoleRun(ctx.userId, 'reviewer', { count: s4.data!.approved.length + s4.data!.pending.length, durationMs: s4.metrics.durationMs, summary: reviewerSummary }).catch(() => {})
   await runCustomAgents(ctx, scoutedJobs, 'reviewer')
 
-  // Mark pending jobs in DB
+  // Persist the internal readiness signal without inventing an employer-facing
+  // "in review" application status.
   if (s4.data!.pending.length > 0) {
-    emit('info', { message: `${s4.data!.pending.length} job(s) queued for manual review in your Jobs dashboard` })
+    emit('info', { message: `${s4.data!.pending.length} job(s) are ready for your review in Saved jobs` })
     const { db } = await import('@/lib/db')
     for (const pkg of s4.data!.pending) {
-      await db.job.update({ where: { id: pkg.job.id }, data: { status: 'review' } }).catch(() => {})
+      await db.job.update({ where: { id: pkg.job.id }, data: { status: 'saved', workflowState: 'ready_to_apply' } }).catch(() => {})
     }
   }
 

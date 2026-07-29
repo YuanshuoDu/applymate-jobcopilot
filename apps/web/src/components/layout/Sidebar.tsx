@@ -142,7 +142,7 @@ export function Sidebar({ active, onNav, onNavIntent, session, jobCount: jobCoun
               </span>
             )}
             {item.id === 'gmail' && gmailUnread != null && gmailUnread > 0 && (
-              <span style={{ marginLeft: 'auto', fontSize: 10, background: 'rgba(163,45,45,0.12)', color: '#A32D2D', borderRadius: 999, padding: '1px 6px', fontWeight: 600 }}>{gmailUnread}</span>
+              <span style={{ marginLeft: 'auto', fontSize: 10, background: 'rgba(79,70,229,0.12)', color: 'var(--primary)', borderRadius: 999, padding: '1px 6px', fontWeight: 600 }}>{gmailUnread}</span>
             )}
             {item.id === 'agent' && (
               <span style={{ marginLeft: 'auto', width: 6, height: 6, borderRadius: '50%', background: '#22C55E', flexShrink: 0 }} />

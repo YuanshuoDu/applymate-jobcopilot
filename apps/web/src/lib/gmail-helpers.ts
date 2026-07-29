@@ -2,6 +2,7 @@
  * Shared Gmail helpers — token refresh and email body extraction.
  */
 import { db } from '@/lib/db'
+import { classifyGmailMessage, type GmailMessageKind } from '@/lib/gmail-tracking'
 
 // ── Token management ─────────────────────────────────────────────────────────
 
@@ -122,64 +123,46 @@ export async function getGoogleAccessToken(userId: string): Promise<string | nul
 
 // ── Email classification ─────────────────────────────────────────────────────
 
-export function classifyEmail(subject: string, snippet: string): string {
-  const t = (subject + ' ' + snippet).toLowerCase()
-  if (
-    t.includes('congratulations') ||
-    (t.includes('offer') && (t.includes('congratulation') || t.includes('pleased') || t.includes('extend'))) ||
-    t.includes('offer letter') || t.includes('job offer')
-  ) return 'offer'
-
-  if (
-    t.includes('unfortunately') || t.includes('regret') || t.includes('not moving forward') ||
-    t.includes('unsuccessful') || t.includes('not selected') || t.includes('decided not') ||
-    t.includes('other candidates') || t.includes('rejection')
-  ) return 'rejected'
-
-  if (
-    t.includes('interview') || t.includes('technical assessment') || t.includes('coding challenge') ||
-    t.includes('take-home') || t.includes('schedule a call') || t.includes('next step') ||
-    t.includes('video call') || t.includes('phone screen') || t.includes('invite you')
-  ) return 'interview'
-
-  if (
-    t.includes('thank you for applying') || t.includes('application received') ||
-    t.includes('we have received') || t.includes('confirm your application')
-  ) return 'received'
-
-  if (t.includes('viewed your profile') || t.includes('viewed your application')) return 'viewed'
-
-  if (
-    t.includes('under review') || t.includes('reviewing your') || t.includes('being reviewed') ||
-    t.includes('application under consideration') || t.includes('assessment in progress') ||
-    t.includes('we are reviewing')
-  ) return 'review'
-
-  return 'received'
+export function classifyEmail(subject: string, snippet: string): GmailMessageKind {
+  return classifyGmailMessage({ subject, excerpt: snippet })
 }
 
 // ── MIME body extraction ─────────────────────────────────────────────────────
 
 export function extractPlainText(payload: Record<string, unknown>): string {
-  const body = payload.body as Record<string, unknown> | undefined
-  if (body?.data && typeof body.data === 'string') {
-    if (!/^[A-Za-z0-9+/\-_=\s]*$/.test(body.data)) return ''
-    try { return Buffer.from(body.data, 'base64').toString('utf-8') } catch { return '' }
-  }
-  const parts = payload.parts as Record<string, unknown>[] | undefined
-  if (parts) {
-    for (const part of parts) {
-      if ((part.mimeType as string) === 'text/plain') {
-        const pb = part.body as Record<string, unknown> | undefined
-        if (pb?.data) {
-          try { return Buffer.from(pb.data as string, 'base64').toString('utf-8') } catch { return '' }
-        }
-      }
-      if (part.parts) {
-        const nested = extractPlainText(part as Record<string, unknown>)
-        if (nested) return nested
-      }
-    }
+  return extractMimeText(payload, 'text/plain')
+}
+
+/** Extract the HTML part of a Gmail message for job-digest link parsing. */
+export function extractHtml(payload: Record<string, unknown>): string {
+  return extractMimeText(payload, 'text/html')
+}
+
+function extractMimeText(payload: Record<string, unknown>, expectedMimeType: string): string {
+  const mimeType = typeof payload.mimeType === 'string' ? payload.mimeType : ''
+  const body = isRecord(payload.body) ? payload.body : undefined
+  const direct = mimeType === expectedMimeType || (!mimeType && expectedMimeType === 'text/plain')
+  if (direct && typeof body?.data === 'string') return decodeGmailBody(body.data)
+
+  const parts = Array.isArray(payload.parts) ? payload.parts : []
+  for (const part of parts) {
+    if (!isRecord(part)) continue
+    const extracted = extractMimeText(part, expectedMimeType)
+    if (extracted) return extracted
   }
   return ''
+}
+
+function decodeGmailBody(value: string): string {
+  if (!/^[A-Za-z0-9+/\-_=\s]*$/.test(value)) return ''
+  try {
+    const normalized = value.replace(/-/g, '+').replace(/_/g, '/')
+    return Buffer.from(normalized, 'base64').toString('utf-8')
+  } catch {
+    return ''
+  }
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
 }

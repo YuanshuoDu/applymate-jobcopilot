@@ -22,7 +22,7 @@ import type { LogEntry, QuestionOption, RunSummary } from '@/components/agent-wo
 export function AgentPlaygroundPage() {
   const toast = useToast()
 
-  const { data: jobsData }                               = useApi<{ jobs: Array<{ status: string }> }>('/api/jobs?pageSize=100')
+  const { data: jobsData }                               = useApi<{ jobs: Array<{ status: string; workflowState: string }> }>('/api/jobs?pageSize=100')
 
   const [showAddModal,  setShowAddModal]  = useState(false)
   const [applyQueue,    setApplyQueue]    = useState<ApplyReadyJob[]>([])
@@ -374,7 +374,7 @@ export function AgentPlaygroundPage() {
   }, [addLog, toast])
 
   const savedCount   = (jobsData?.jobs ?? []).filter(j => j.status === 'saved').length
-  const pendingCount = (jobsData?.jobs ?? []).filter(j => j.status === 'review').length
+  const pendingCount = (jobsData?.jobs ?? []).filter(j => j.workflowState === 'ready_to_apply').length
 
   return (
     <div style={{ flex: 1, display: 'flex', flexDirection: 'column', overflow: 'hidden', background: 'var(--bg-tertiary)' }}>

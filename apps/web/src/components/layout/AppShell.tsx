@@ -77,6 +77,7 @@ const PAGES: Record<Page, React.ComponentType> = {
 }
 
 export function getNotificationTargetPage(type: string): Page | null {
+  if (type.startsWith('gmail_')) return 'gmail'
   return type.startsWith('apply_') ? 'jobs' : null
 }
 

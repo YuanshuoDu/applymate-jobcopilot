@@ -2,7 +2,7 @@
  * Prisma seed script — ApplyMate AI
  * Run: pnpm prisma db seed
  */
-import { PrismaClient, JobStatus, ActivityType } from '@prisma/client'
+import { PrismaClient, JobStatus, JobWorkflowState, ActivityType } from '@prisma/client'
 import bcrypt from 'bcryptjs'
 
 const db = new PrismaClient()
@@ -33,7 +33,7 @@ async function main() {
   // ── Jobs ──────────────────────────────────────────────────
   const jobsData = [
     { company: 'Adyen',       logo: 'AD', role: 'Backend Engineer',         location: 'Amsterdam, NL', status: 'interview' as JobStatus, score: 91, salary: '€70k–90k', source: 'linkedin',  appliedAt: daysAgo(4) },
-    { company: 'Booking.com', logo: 'BK', role: 'Software Engineer',        location: 'Amsterdam, NL', status: 'review'    as JobStatus, score: 84, salary: '€65k–85k', source: 'indeed',    appliedAt: daysAgo(6) },
+    { company: 'Booking.com', logo: 'BK', role: 'Software Engineer',        location: 'Amsterdam, NL', status: 'saved'     as JobStatus, workflowState: 'ready_to_apply' as JobWorkflowState, score: 84, salary: '€65k–85k', source: 'indeed' },
     { company: 'ASML',        logo: 'AS', role: 'Systems Engineer',         location: 'Eindhoven, NL', status: 'applied'   as JobStatus, score: 76, salary: '€60k–80k', source: 'agent',     appliedAt: daysAgo(7) },
     { company: 'Philips',     logo: 'PH', role: 'Data Engineer',            location: 'Amsterdam, NL', status: 'rejected'  as JobStatus, score: 62, salary: '€55k–75k', source: 'linkedin',  appliedAt: daysAgo(11) },
     { company: 'Uber',        logo: 'UB', role: 'SWE Intern',               location: 'Amsterdam, NL', status: 'offer'     as JobStatus, score: 95, salary: '€45k',     source: 'manual',    appliedAt: daysAgo(16) },
@@ -41,7 +41,7 @@ async function main() {
     { company: 'Netflix',     logo: 'NF', role: 'Senior Backend Engineer',  location: 'Amsterdam, NL', status: 'saved'     as JobStatus, score: 79, salary: '€90k–120k',source: 'linkedin' },
     { company: 'Cloudflare',  logo: 'CF', role: 'Systems Engineer',         location: 'Remote',        status: 'saved'     as JobStatus, score: 83, salary: '€80k–100k',source: 'agent' },
     { company: 'Mollie',      logo: 'ML', role: 'Backend Engineer',         location: 'Amsterdam, NL', status: 'applied'   as JobStatus, score: 80, salary: '€60k–80k', source: 'indeed',    appliedAt: daysAgo(3) },
-    { company: 'Elastic',     logo: 'EL', role: 'Software Engineer II',     location: 'Amsterdam, NL', status: 'review'    as JobStatus, score: 85, salary: '€70k–90k', source: 'linkedin',  appliedAt: daysAgo(5) },
+    { company: 'Elastic',     logo: 'EL', role: 'Software Engineer II',     location: 'Amsterdam, NL', status: 'saved'     as JobStatus, workflowState: 'ready_to_apply' as JobWorkflowState, score: 85, salary: '€70k–90k', source: 'linkedin' },
   ]
 
   const jobs = []
