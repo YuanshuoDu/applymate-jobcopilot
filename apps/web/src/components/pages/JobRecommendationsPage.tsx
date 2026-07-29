@@ -1,6 +1,6 @@
 'use client'
 
-import { useCallback, useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { CheckSquare, Mail, RefreshCw } from 'lucide-react'
 import { Btn, useToast } from '@/components/ui'
 import { GmailConnectionScreen, type GmailConnectionState } from '@/components/gmail/GmailConnectionState'
@@ -12,12 +12,14 @@ import './JobRecommendationsPage.css'
 
 type ConnectionState = GmailConnectionState | 'ready'
 const REAUTH_ERRORS = new Set(['GMAIL_REAUTH', 'GMAIL_SCOPE_MISSING', 'GMAIL_PERMISSION', 'TOKEN_EXPIRED'])
+const RECOMMENDATIONS_CACHE_KEY = 'applymate:gmail-recommendations'
 
 export function JobRecommendationsPage() {
   const { navigate } = useNav()
   const toast = useToast()
-  const [connection, setConnection] = useState<ConnectionState>('loading')
-  const [recommendations, setRecommendations] = useState<GmailRecommendation[]>([])
+  const cachedRecommendations = useRef(readRecommendationCache())
+  const [connection, setConnection] = useState<ConnectionState>(() => cachedRecommendations.current ? 'ready' : 'loading')
+  const [recommendations, setRecommendations] = useState<GmailRecommendation[]>(() => cachedRecommendations.current ?? [])
   const [filters, setFilters] = useState<RecommendationFilters>(DEFAULT_RECOMMENDATION_FILTERS)
   const [selectedIds, setSelectedIds] = useState<Set<string>>(() => new Set())
   const [expandedId, setExpandedId] = useState<string | null>(null)
@@ -25,11 +27,11 @@ export function JobRecommendationsPage() {
   const [refreshing, setRefreshing] = useState(false)
   const [showMoreFilters, setShowMoreFilters] = useState(false)
 
-  const loadRecommendations = useCallback(async (silent = false, signal?: AbortSignal) => {
+  const loadRecommendations = useCallback(async (silent = false, signal?: AbortSignal, notify = silent, refresh = false) => {
     if (!silent) setConnection('loading')
     else setRefreshing(true)
     try {
-      const response = await fetch('/api/gmail/tracking', { signal })
+      const response = await fetch(`/api/gmail/tracking${refresh ? '?refresh=1' : ''}`, { signal })
       const body = await response.json() as GmailTrackingResponse & { error?: string }
       if (!response.ok) {
         if (body.error === 'NO_GOOGLE_ACCOUNT') setConnection('no_google')
@@ -38,8 +40,9 @@ export function JobRecommendationsPage() {
         return
       }
       setRecommendations(body.recommendations ?? [])
+      writeRecommendationCache(body.recommendations ?? [])
       setConnection('ready')
-      if (silent) toast.success('Inbox refreshed', `${body.pendingRecommendationCount ?? 0} jobs ready to review.`)
+      if (notify) toast.success('Inbox refreshed', `${body.pendingRecommendationCount ?? 0} jobs ready to review.`)
     } catch (error) {
       if (!(error instanceof DOMException && error.name === 'AbortError')) setConnection('error')
     } finally {
@@ -49,7 +52,7 @@ export function JobRecommendationsPage() {
 
   useEffect(() => {
     const controller = new AbortController()
-    void loadRecommendations(false, controller.signal)
+    void loadRecommendations(Boolean(cachedRecommendations.current), controller.signal, false)
     return () => controller.abort()
   }, [loadRecommendations])
 
@@ -104,7 +107,7 @@ export function JobRecommendationsPage() {
       <div><h1>Job recommendations</h1><p>Jobs parsed from your subscription emails. Review and decide which jobs to save.</p></div>
       <button type="button" className="job-recommendations-heading-link" onClick={() => navigate('gmail')}><Mail size={14} />Gmail · Job recommendations</button>
       <div className="job-recommendations-toolbar">
-        <Btn variant="ghost" onClick={() => void loadRecommendations(true)} disabled={refreshing}><RefreshCw size={15} />{refreshing ? 'Refreshing…' : 'Refresh inbox'}</Btn>
+        <Btn variant="ghost" onClick={() => void loadRecommendations(true, undefined, true, true)} disabled={refreshing}><RefreshCw size={15} />{refreshing ? 'Refreshing…' : 'Refresh inbox'}</Btn>
         <Btn variant="primary" onClick={() => void saveSelected()} disabled={selectedCount === 0 || busyIds.size > 0}><CheckSquare size={15} />Save selected{selectedCount ? ` · ${selectedCount}` : ''}</Btn>
       </div>
     </header>
@@ -131,4 +134,16 @@ function FilterSelect({ value, label, options, onChange }: { value: string; labe
 
 function uniqueValues(values: Array<string | null>) {
   return [...new Set(values.filter((value): value is string => Boolean(value?.trim())))].sort((left, right) => left.localeCompare(right))
+}
+
+function readRecommendationCache(): GmailRecommendation[] | null {
+  if (typeof window === 'undefined') return null
+  try {
+    const value: unknown = JSON.parse(window.sessionStorage.getItem(RECOMMENDATIONS_CACHE_KEY) ?? 'null')
+    return Array.isArray(value) ? value as GmailRecommendation[] : null
+  } catch { return null }
+}
+
+function writeRecommendationCache(recommendations: GmailRecommendation[]) {
+  try { window.sessionStorage.setItem(RECOMMENDATIONS_CACHE_KEY, JSON.stringify(recommendations)) } catch { /* Storage is optional. */ }
 }

@@ -1,7 +1,7 @@
 import { enrichJob } from '@/lib/agent/enrich'
 import { fetchGmailMessage } from './gmail-client'
 import { extractRecommendationCards, type GmailRecommendationCard } from './recommendations'
-import { isLikelyJobDetailUrl, simplifyRecommendationLocation } from './recommendation-utils'
+import { isLikelyJobDetailUrl, recommendationIdentityKey, simplifyRecommendationLocation } from './recommendation-utils'
 
 export interface RecommendationDetails {
   platform: string | null
@@ -41,11 +41,17 @@ export async function hydrateRecommendationDetails(input: SourceRecommendation, 
 }
 
 export function matchingCard(input: RecommendationDetails, cards: GmailRecommendationCard[]): GmailRecommendationCard | null {
+  const inputUrlKey = recommendationIdentityKey(input)
+  if (inputUrlKey.startsWith('url:')) {
+    const urlMatch = cards.find(card => recommendationIdentityKey(card) === inputUrlKey)
+    if (urlMatch) return urlMatch
+  }
   const role = normalise(input.role)
   if (!role) return null
-  return cards.find(card => normalise(card.role) === role)
-    ?? cards.find(card => normalise(card.role).includes(role) || role.includes(normalise(card.role)))
-    ?? null
+  const roleMatches = cards.filter(card => normalise(card.role) === role || normalise(card.role).includes(role) || role.includes(normalise(card.role)))
+  if (roleMatches.length === 1) return roleMatches[0]
+  const contextualMatch = roleMatches.filter(card => compatible(input.company, card.company) && compatible(input.location, card.location))
+  return contextualMatch.length === 1 ? contextualMatch[0] : null
 }
 
 function mergeDetails(input: RecommendationDetails, card: GmailRecommendationCard | null): RecommendationDetails {
@@ -62,6 +68,10 @@ function mergeDetails(input: RecommendationDetails, card: GmailRecommendationCar
 
 function normalise(value?: string | null): string {
   return (value ?? '').toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim()
+}
+
+function compatible(left: string | null, right: string | null): boolean {
+  return Boolean(left && right && normalise(left) === normalise(right))
 }
 
 function truncate(value: string, length: number): string {

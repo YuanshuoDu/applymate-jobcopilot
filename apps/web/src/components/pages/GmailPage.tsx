@@ -17,6 +17,7 @@ interface GmailThreadsResponse {
 }
 
 const GMAIL_REAUTH_ERRORS = new Set(['GMAIL_REAUTH', 'GMAIL_SCOPE_MISSING', 'GMAIL_PERMISSION', 'TOKEN_EXPIRED'])
+const GMAIL_INBOX_CACHE_KEY = 'applymate:gmail-inbox'
 type InboxConnectionState = GmailConnectionState | 'ready'
 
 /** The original Gmail inbox: filters, message list, and reading pane. */
@@ -25,8 +26,9 @@ export function GmailPage() {
   const { navigate } = useNav()
   const toast = useToast()
   const authTriggeredRef = useRef(false)
-  const [connection, setConnection] = useState<InboxConnectionState>('loading')
-  const [emails, setEmails] = useState<GmailEmail[]>([])
+  const cachedEmails = useRef(readInboxCache())
+  const [connection, setConnection] = useState<InboxConnectionState>(() => cachedEmails.current ? 'ready' : 'loading')
+  const [emails, setEmails] = useState<GmailEmail[]>(() => cachedEmails.current ?? [])
   const [selected, setSelected] = useState<GmailEmail | null>(null)
   const [filter, setFilter] = useState<GmailInboxFilter>('all')
   const [search, setSearch] = useState('')
@@ -45,6 +47,7 @@ export function GmailPage() {
         return
       }
       setEmails(body.emails ?? [])
+      writeInboxCache(body.emails ?? [])
       setConnection('ready')
       if (silent) toast.success('Refreshed', `${body.emails?.length ?? 0} emails loaded`)
     } catch (error) {
@@ -67,7 +70,7 @@ export function GmailPage() {
       removeGmailQueryParam('gmailError')
       toast.error('Gmail connection failed', gmailError)
     }
-    void loadEmails(false, controller.signal)
+    if (!cachedEmails.current) void loadEmails(false, controller.signal)
     return () => controller.abort()
   }, [loadEmails, toast])
 
@@ -115,3 +118,15 @@ function removeGmailQueryParam(name: string) {
 
 const searchStyle = { width: 200, padding: '5px 10px', fontSize: 12, border: '0.5px solid var(--border)', borderRadius: 6, background: 'var(--bg)', color: 'var(--text)', outline: 'none' }
 const recommendationsEntryStyle = { border: '1px solid #dedbfa', borderRadius: 7, padding: '5px 9px', background: '#fff', color: '#4c32ef', fontSize: 11, fontWeight: 700, cursor: 'pointer', whiteSpace: 'nowrap' }
+
+function readInboxCache(): GmailEmail[] | null {
+  if (typeof window === 'undefined') return null
+  try {
+    const value: unknown = JSON.parse(window.sessionStorage.getItem(GMAIL_INBOX_CACHE_KEY) ?? 'null')
+    return Array.isArray(value) ? value as GmailEmail[] : null
+  } catch { return null }
+}
+
+function writeInboxCache(emails: GmailEmail[]) {
+  try { window.sessionStorage.setItem(GMAIL_INBOX_CACHE_KEY, JSON.stringify(emails)) } catch { /* Storage is optional. */ }
+}

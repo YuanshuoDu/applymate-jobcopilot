@@ -14,7 +14,8 @@ export async function GET(req: NextRequest) {
   const connection = await findGmailConnection(auth.userId)
   if (!connection) return err('NO_GOOGLE_ACCOUNT', 403)
 
-  const sync = await syncGmailForUser(auth.userId)
+  const refresh = new URL(req.url).searchParams.get('refresh') === '1'
+  const sync = refresh ? await syncGmailForUser(auth.userId) : { connected: true, importedMessages: 0, matchedMessages: 0, statusUpdates: 0, newRecommendations: 0, error: null }
   if (!sync.connected) return err('GMAIL_REAUTH', 401)
   if (sync.error) return err('GMAIL_ERROR', 502)
 
@@ -36,7 +37,7 @@ export async function GET(req: NextRequest) {
     }),
   ])
 
-  const repairedRecommendations = await Promise.all(recommendations.map(repairRecommendationFromExcerpt))
+  const repairedRecommendations = refresh ? await Promise.all(recommendations.map(repairRecommendationFromExcerpt)) : recommendations
   const uniqueRecommendations = dedupeRecommendations(repairedRecommendations).map((item) => ({
     ...item,
     location: simplifyRecommendationLocation(item.location),

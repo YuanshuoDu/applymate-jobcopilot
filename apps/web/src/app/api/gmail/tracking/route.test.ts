@@ -50,17 +50,17 @@ describe('GET /api/gmail/tracking', () => {
     mocks.requireAuth.mockResolvedValueOnce(Response.json({ error: 'Unauthorized' }, { status: 401 }))
     const { GET } = await import('./route')
 
-    const response = await GET(new Request('http://localhost/api/gmail/tracking') as never)
+    const response = await GET(new Request('http://localhost/api/gmail/tracking?refresh=1') as never)
 
     expect(response.status).toBe(401)
     expect(mocks.findGmailConnection).not.toHaveBeenCalled()
     expect(mocks.syncGmailForUser).not.toHaveBeenCalled()
   })
 
-  it('syncs the signed-in account and returns tracked email evidence with global pending recommendations', async () => {
+  it('syncs only when the caller explicitly refreshes and returns tracked email evidence', async () => {
     const { GET } = await import('./route')
 
-    const response = await GET(new Request('http://localhost/api/gmail/tracking') as never)
+    const response = await GET(new Request('http://localhost/api/gmail/tracking?refresh=1') as never)
 
     expect(response.status).toBe(200)
     const body = await response.json()
@@ -74,6 +74,16 @@ describe('GET /api/gmail/tracking', () => {
     expect(mocks.syncGmailForUser).toHaveBeenCalledWith('user-1')
     expect(mocks.messagesFindMany).toHaveBeenCalledWith(expect.objectContaining({ where: { userId: 'user-1' }, take: 80 }))
     expect(mocks.recommendationsFindMany).toHaveBeenCalledWith(expect.objectContaining({ where: { userId: 'user-1' }, take: 100 }))
+  }, 10_000)
+
+  it('returns stored Gmail data without a remote sync during navigation', async () => {
+    const { GET } = await import('./route')
+    mocks.syncGmailForUser.mockClear()
+
+    const response = await GET(new Request('http://localhost/api/gmail/tracking') as never)
+
+    expect(response.status).toBe(200)
+    expect(mocks.syncGmailForUser).not.toHaveBeenCalled()
   })
 
   it('returns one visible row for repeated alerts of the same job', async () => {
@@ -102,7 +112,7 @@ describe('GET /api/gmail/tracking', () => {
     }])
     const { GET } = await import('./route')
 
-    const response = await GET(new Request('http://localhost/api/gmail/tracking') as never)
+    const response = await GET(new Request('http://localhost/api/gmail/tracking?refresh=1') as never)
 
     await expect(response.json()).resolves.toMatchObject({
       recommendations: [expect.objectContaining({ company: 'Trinity College Dublin Students Union', location: 'Dublin, County Dublin' })],
