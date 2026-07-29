@@ -1,46 +1,50 @@
 'use client'
 
-import { useCallback, useEffect, useRef, useState } from 'react'
-import { MailCheck, RefreshCw, Sparkles } from 'lucide-react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { useSession } from 'next-auth/react'
 import { TopBar } from '@/components/layout/TopBar'
-import { ApplicationUpdatesPanel } from '@/components/gmail/ApplicationUpdatesPanel'
-import { RecommendedJobsPanel } from '@/components/gmail/RecommendedJobsPanel'
-import type { GmailRecommendation, GmailTrackingResponse, LinkableJob, TrackedGmailMessage } from '@/components/gmail/types'
-import { Btn, Card, useToast } from '@/components/ui'
+import { Btn, useToast } from '@/components/ui'
+import { GmailConnectionScreen, type GmailConnectionState } from '@/components/gmail/GmailConnectionState'
+import { GmailInboxList } from '@/components/gmail/GmailInboxList'
+import { GmailInboxSidebar } from '@/components/gmail/GmailInboxSidebar'
+import { GmailMessageReader } from '@/components/gmail/GmailMessageReader'
+import { countInboxEmails, filterInboxEmails, type GmailEmail, type GmailInboxFilter } from '@/components/gmail/inbox-model'
 
-type ConnectionState = 'loading' | 'no_google' | 'reauth' | 'ready' | 'error'
-type GmailView = 'updates' | 'recommendations'
+interface GmailThreadsResponse {
+  emails?: GmailEmail[]
+  error?: string
+}
 
+const GMAIL_REAUTH_ERRORS = new Set(['GMAIL_REAUTH', 'GMAIL_SCOPE_MISSING', 'GMAIL_PERMISSION', 'TOKEN_EXPIRED'])
+type InboxConnectionState = GmailConnectionState | 'ready'
+
+/** The original Gmail inbox: filters, message list, and reading pane. */
 export function GmailPage() {
+  const { data: session } = useSession()
   const toast = useToast()
   const authTriggeredRef = useRef(false)
-  const [connection, setConnection] = useState<ConnectionState>('loading')
-  const [view, setView] = useState<GmailView>('updates')
-  const [messages, setMessages] = useState<TrackedGmailMessage[]>([])
-  const [recommendations, setRecommendations] = useState<GmailRecommendation[]>([])
-  const [jobs, setJobs] = useState<LinkableJob[]>([])
+  const [connection, setConnection] = useState<InboxConnectionState>('loading')
+  const [emails, setEmails] = useState<GmailEmail[]>([])
+  const [selected, setSelected] = useState<GmailEmail | null>(null)
+  const [filter, setFilter] = useState<GmailInboxFilter>('all')
+  const [search, setSearch] = useState('')
   const [refreshing, setRefreshing] = useState(false)
 
-  const loadTracking = useCallback(async (silent = false, signal?: AbortSignal) => {
+  const loadEmails = useCallback(async (silent = false, signal?: AbortSignal) => {
     if (!silent) setConnection('loading')
     else setRefreshing(true)
     try {
-      const response = await fetch('/api/gmail/tracking', { signal })
-      const body = await response.json() as GmailTrackingResponse & { error?: string }
+      const response = await fetch('/api/gmail/threads', { signal })
+      const body = await response.json() as GmailThreadsResponse
       if (!response.ok) {
-        setConnection(body.error === 'NO_GOOGLE_ACCOUNT' ? 'no_google' : body.error === 'GMAIL_REAUTH' ? 'reauth' : 'error')
+        if (body.error === 'NO_GOOGLE_ACCOUNT') setConnection('no_google')
+        else if (GMAIL_REAUTH_ERRORS.has(body.error ?? '')) setConnection('no_gmail')
+        else setConnection('error')
         return
       }
-      const jobsResponse = await fetch('/api/jobs?pageSize=100', { signal })
-      const jobsBody = await jobsResponse.json() as { jobs?: LinkableJob[] }
-      setMessages(body.messages ?? [])
-      setRecommendations(body.recommendations ?? [])
-      setJobs(jobsBody.jobs ?? [])
+      setEmails(body.emails ?? [])
       setConnection('ready')
-      if (silent) {
-        const added = body.sync?.newRecommendations ?? 0
-        toast.success('Gmail is up to date', added ? `${added} new recommendation${added === 1 ? '' : 's'} ready to review.` : 'No new job updates.')
-      }
+      if (silent) toast.success('Refreshed', `${body.emails?.length ?? 0} emails loaded`)
     } catch (error) {
       if (error instanceof DOMException && error.name === 'AbortError') return
       setConnection('error')
@@ -51,9 +55,22 @@ export function GmailPage() {
 
   useEffect(() => {
     const controller = new AbortController()
-    void loadTracking(false, controller.signal)
+    const params = new URLSearchParams(window.location.search)
+    if (params.get('gmailAuth') === '1') {
+      removeGmailQueryParam('gmailAuth')
+      toast.success('Google account connected!', 'Loading your Gmail…')
+    }
+    const gmailError = params.get('gmailError')
+    if (gmailError) {
+      removeGmailQueryParam('gmailError')
+      toast.error('Gmail connection failed', gmailError)
+    }
+    void loadEmails(false, controller.signal)
     return () => controller.abort()
-  }, [loadTracking])
+  }, [loadEmails, toast])
+
+  const counts = useMemo(() => countInboxEmails(emails), [emails])
+  const filteredEmails = useMemo(() => filterInboxEmails(emails, filter, search), [emails, filter, search])
 
   function connectGoogle() {
     if (authTriggeredRef.current) return
@@ -61,48 +78,35 @@ export function GmailPage() {
     window.location.href = '/api/gmail/oauth/start?transfer=1'
   }
 
-  if (connection !== 'ready') return <GmailConnectionState state={connection} onConnect={connectGoogle} onRetry={() => { authTriggeredRef.current = false; void loadTracking() }} />
+  const toggleStar = useCallback((id: string) => {
+    setEmails(current => current.map(email => email.id === id ? { ...email, starred: !email.starred } : email))
+    setSelected(current => current?.id === id ? { ...current, starred: !current.starred } : current)
+  }, [])
 
-  const pending = recommendations.filter((item) => item.status === 'pending').length
+  const markRead = useCallback((id: string) => {
+    setEmails(current => current.map(email => email.id === id ? { ...email, read: true } : email))
+  }, [])
+
+  if (connection !== 'ready') return <GmailConnectionScreen state={connection} onConnect={connectGoogle} onRetry={() => { authTriggeredRef.current = false; void loadEmails() }} />
+
   return <div style={{ flex: 1, display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
-    <TopBar title="Gmail job tracker">
-      {pending > 0 && <span style={{ fontSize: 11, background: 'rgba(79,70,229,0.12)', color: 'var(--primary)', borderRadius: 999, padding: '3px 8px', fontWeight: 700 }}>{pending} jobs to review</span>}
-      <Btn small variant="ghost" disabled={refreshing} onClick={() => void loadTracking(true)}><RefreshCw size={14} /> {refreshing ? 'Syncing…' : 'Sync Gmail'}</Btn>
+    <TopBar title="Gmail Tracker">
+      {counts.unread > 0 && <span style={{ fontSize: 11, background: 'var(--primary)', color: '#fff', borderRadius: 999, padding: '2px 8px', fontWeight: 500 }}>{counts.unread} unread</span>}
+      <input value={search} onChange={event => setSearch(event.target.value)} placeholder="Search emails…" aria-label="Search emails" style={searchStyle} />
+      <Btn variant="ghost" onClick={() => void loadEmails(true)} disabled={refreshing}>{refreshing ? '…' : '⟳ Refresh'}</Btn>
     </TopBar>
-    <main style={{ flex: 1, overflowY: 'auto', padding: '24px clamp(18px, 3vw, 36px)', background: 'var(--bg-tertiary)' }}>
-      <section style={{ maxWidth: 1120, margin: '0 auto' }}>
-        <div style={{ display: 'flex', gap: 8, borderBottom: '1px solid var(--border)', marginBottom: 22 }}>
-          <TabButton active={view === 'updates'} onClick={() => setView('updates')} label="Application updates" />
-          <TabButton active={view === 'recommendations'} onClick={() => setView('recommendations')} label={`Recommended jobs${pending ? ` · ${pending}` : ''}`} />
-        </div>
-        {view === 'updates'
-          ? <ApplicationUpdatesPanel messages={messages} jobs={jobs} onChanged={() => void loadTracking(true)} />
-          : <RecommendedJobsPanel recommendations={recommendations} onChanged={() => void loadTracking(true)} />}
-      </section>
-    </main>
-  </div>
-}
-
-function GmailConnectionState({ state, onConnect, onRetry }: { state: ConnectionState; onConnect: () => void; onRetry: () => void }) {
-  const loading = state === 'loading'
-  const needsConnection = state === 'no_google' || state === 'reauth'
-  const title = state === 'no_google' ? 'Connect Gmail to track applications' : state === 'reauth' ? 'Gmail access needs to be renewed' : 'Could not load Gmail tracking'
-  const body = state === 'no_google'
-    ? 'ApplyMate reads job-related email evidence only. It never sends or changes your inbox without your confirmation.'
-    : state === 'reauth' ? 'Reconnect the Gmail account that receives your application updates and job-platform recommendations.' : 'Try again, or reconnect Gmail if the problem continues.'
-  return <div style={{ flex: 1, display: 'flex', flexDirection: 'column' }}>
-    <TopBar title="Gmail job tracker" />
-    <div style={{ flex: 1, display: 'grid', placeItems: 'center', padding: 24, background: 'var(--bg-tertiary)' }}>
-      <Card style={{ width: '100%', maxWidth: 440, padding: 34, textAlign: 'center' }}>
-        <span style={{ margin: '0 auto 16px', width: 48, height: 48, borderRadius: 14, display: 'grid', placeItems: 'center', background: 'rgba(79,70,229,0.10)', color: 'var(--primary)' }}>{loading ? <RefreshCw size={22} className="gmail-spin" /> : <MailCheck size={22} />}</span>
-        <h1 style={{ margin: 0, fontSize: 17 }}>{loading ? 'Checking Gmail…' : title}</h1>
-        {!loading && <p style={{ margin: '9px 0 22px', color: 'var(--text-muted)', fontSize: 12, lineHeight: 1.6 }}>{body}</p>}
-        {!loading && (needsConnection ? <Btn variant="primary" onClick={onConnect}><Sparkles size={15} /> Connect Gmail</Btn> : <Btn variant="primary" onClick={onRetry}>Try again</Btn>)}
-      </Card>
+    <div style={{ flex: 1, display: 'flex', overflow: 'hidden' }}>
+      <GmailInboxSidebar activeFilter={filter} counts={counts} email={session?.user?.email} onFilterChange={setFilter} />
+      <GmailInboxList emails={filteredEmails} selectedId={selected?.id ?? null} onSelect={setSelected} />
+      {selected && <GmailMessageReader email={selected} onClose={() => setSelected(null)} onStar={toggleStar} onMarkRead={markRead} />}
     </div>
   </div>
 }
 
-function TabButton({ active, label, onClick }: { active: boolean; label: string; onClick: () => void }) {
-  return <button type="button" onClick={onClick} style={{ border: 'none', borderBottom: active ? '2px solid var(--primary)' : '2px solid transparent', background: 'transparent', padding: '8px 3px', color: active ? 'var(--primary)' : 'var(--text-muted)', fontSize: 13, fontWeight: active ? 700 : 500, cursor: 'pointer' }}>{label}</button>
+function removeGmailQueryParam(name: string) {
+  const url = new URL(window.location.href)
+  url.searchParams.delete(name)
+  window.history.replaceState({}, '', url)
 }
+
+const searchStyle = { width: 200, padding: '5px 10px', fontSize: 12, border: '0.5px solid var(--border)', borderRadius: 6, background: 'var(--bg)', color: 'var(--text)', outline: 'none' }
