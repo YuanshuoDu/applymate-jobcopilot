@@ -27,7 +27,8 @@ describe('RecommendationList', () => {
 
     expect(html).toContain('Source email')
     expect(html).toContain('Open source email')
-    expect(html).toContain('Salary')
-    expect(html).toContain('Help customers troubleshoot technical issues.')
+    expect(html).toContain('Salary (est.)')
+    expect(html).toContain('Job page')
+    expect(html).toContain('View job')
   })
 })

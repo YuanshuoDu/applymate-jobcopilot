@@ -44,15 +44,14 @@
 .recommendation-actions .recommendation-dismiss { margin-left: 18px; color: #7b829b; }
 .recommendation-actions button:disabled, .recommendation-expanded button:disabled { opacity: .5; cursor: default; }
 .recommendation-expanded td { padding: 0 10px 10px; border-bottom: 1px solid #ecebf5; background: #faf9ff; }
-.recommendation-expanded td > div { display: grid; grid-template-areas: "email salary job close" "description description description close"; grid-template-columns: minmax(260px, 1.55fr) minmax(126px, .7fr) minmax(120px, .68fr) 26px; column-gap: 30px; row-gap: 4px; align-items: center; min-height: 48px; padding: 8px 12px; border: 1px solid #e4e0fb; border-radius: 7px; color: #707895; background: #fff; }
-.recommendation-expanded-email { grid-area: email; display: inline-flex; align-items: center; gap: 8px; min-width: 0; color: #4c32ef; text-decoration: none; white-space: nowrap; }
-.recommendation-expanded-meta { grid-area: salary; display: grid; gap: 2px; align-self: stretch; align-content: center; min-width: 0; }
-.recommendation-expanded-job { grid-area: job; display: grid; gap: 2px; align-self: stretch; align-content: center; min-width: 0; color: #4c32ef; text-decoration: none; }
+.recommendation-expanded td > div { display: flex; align-items: center; gap: 15px; min-height: 40px; padding: 7px 12px; border: 1px solid #e4e0fb; border-radius: 7px; color: #707895; background: #fff; }
+.recommendation-expanded-salary, .recommendation-expanded-email, .recommendation-expanded-job { display: inline-flex; align-items: center; gap: 7px; min-width: 0; text-decoration: none; white-space: nowrap; }
+.recommendation-expanded-salary { color: #4c32ef; }
+.recommendation-expanded-email, .recommendation-expanded-job { color: #4c32ef; }
 .recommendation-expanded small { color: #8a91aa; font-size: 9px; font-weight: 650; letter-spacing: .01em; }
-.recommendation-expanded strong { display: inline-flex; align-items: center; gap: 5px; min-width: 0; overflow: hidden; color: #4c32ef; font-size: 12px; font-weight: 750; line-height: 1.2; text-overflow: ellipsis; white-space: nowrap; }
-.recommendation-expanded-email strong { font-size: 12px; }
-.recommendation-expanded-meta strong { color: #222a47; }
-.recommendation-expanded p { grid-area: description; min-width: 0; margin: 1px 0 0; overflow: hidden; color: #707895; font-size: 10px; line-height: 1.4; text-overflow: ellipsis; white-space: nowrap; }
-.recommendation-expanded button { grid-area: close; display: inline-flex; align-items: center; justify-content: center; width: 25px; height: 25px; margin-left: auto; border: 1px solid #e3e0f4; border-radius: 5px; }
+.recommendation-expanded strong { display: inline-flex; align-items: center; min-width: 0; overflow: hidden; color: #4c32ef; font-size: 11px; font-weight: 750; line-height: 1.2; text-overflow: ellipsis; white-space: nowrap; }
+.recommendation-expanded-salary strong { color: #222a47; }
+.recommendation-expanded-divider { width: 1px; height: 20px; flex: 0 0 1px; background: #e7e4f5; }
+.recommendation-expanded button { display: inline-flex; align-items: center; justify-content: center; width: 25px; height: 25px; margin-left: auto; border: 1px solid #e3e0f4; border-radius: 5px; }
 .recommendation-empty { padding: 52px !important; color: #7a819d !important; text-align: center; }
 @media (max-width: 850px) { .job-recommendations-heading { align-items: flex-start; flex-direction: column; padding: 10px 16px; } .job-recommendations-heading > div:first-child { min-width: 0; } .job-recommendations-content { padding: 0 16px 18px; } .job-recommendations-toolbar { width: 100%; margin-left: 0; justify-content: stretch; } .job-recommendations-toolbar button { flex: 1; } .job-recommendations-filters { display: flex; gap: 10px; overflow-x: auto; } .job-recommendations-filters select { min-width: 150px; } .job-recommendations-heading-link { display: none; } }

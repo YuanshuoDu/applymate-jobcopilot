@@ -1,7 +1,7 @@
 'use client'
 
 import React from 'react'
-import { BriefcaseBusiness, ExternalLink, Mail, X } from 'lucide-react'
+import { BriefcaseBusiness, Euro, ExternalLink, Mail, X } from 'lucide-react'
 import type { GmailRecommendation } from './types'
 import { groupRecommendations } from './recommendations-model'
 
@@ -76,10 +76,10 @@ function RecommendationRow({ item, selected, expanded, busy, onToggle, onExpand,
       </td>
     </tr>
     {expanded && <tr className="recommendation-expanded"><td /><td colSpan={7}><div>
+      <span className="recommendation-expanded-salary"><Euro size={14} /><small>Salary (est.)</small><strong>{item.salary || 'Not provided'}</strong></span>
+      <i className="recommendation-expanded-divider" aria-hidden="true" />
       <a className="recommendation-expanded-email" href={sourceEmailHref(item.sourceMessage.gmailMessageId)} target="_blank" rel="noreferrer"><Mail size={14} /><small>Source email</small><strong>Open source email</strong></a>
-      <span className="recommendation-expanded-meta"><small>Salary</small><strong>{item.salary || 'Not provided'}</strong></span>
-      {item.url && <a className="recommendation-expanded-job" href={item.url} target="_blank" rel="noreferrer"><small>Job page</small><strong>View job <ExternalLink size={13} /></strong></a>}
-      {item.description && <p>{item.description}</p>}
+      {item.url && <><i className="recommendation-expanded-divider" aria-hidden="true" /><a className="recommendation-expanded-job" href={item.url} target="_blank" rel="noreferrer"><ExternalLink size={14} /><small>Job page</small><strong>View job</strong></a></>}
       <button type="button" aria-label="Close job details" disabled={busy} onClick={() => onExpand(item.id)}><X size={14} /></button>
     </div></td></tr>}
   </>
