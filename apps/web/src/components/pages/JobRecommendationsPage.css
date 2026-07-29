@@ -1,0 +1,45 @@
+.job-recommendations-page { flex: 1; display: flex; flex-direction: column; min-width: 0; overflow: hidden; background: #fcfcff; color: #151a35; }
+.job-recommendations-heading { display: flex; min-height: 62px; align-items: center; justify-content: space-between; gap: 20px; padding: 8px 28px; border-bottom: 1px solid #ebeaf6; background: #fff; }
+.job-recommendations-heading h1 { margin: 0; color: #141a36; font-size: 24px; font-weight: 760; letter-spacing: -.05em; }
+.job-recommendations-heading p { margin: 3px 0 0; color: #737b98; font-size: 11px; }
+.job-recommendations-toolbar { display: flex; align-items: center; gap: 10px; }
+.job-recommendations-toolbar button { min-height: 38px; border-radius: 7px !important; font-size: 11px !important; }
+.job-recommendations-content { flex: 1; min-width: 0; overflow: auto; padding: 0 28px 24px; }
+.job-recommendations-filters { display: flex; align-items: center; gap: 12px; min-height: 58px; border-bottom: 1px solid #ebeaf6; }
+.job-recommendations-filters input, .job-recommendations-filters select { height: 34px; border: 1px solid #e2e0f2; border-radius: 7px; color: #424965; background: #fff; font: inherit; font-size: 11px; outline: none; }
+.job-recommendations-filters input { width: min(300px, 30vw); padding: 0 11px; }
+.job-recommendations-filters select { min-width: 132px; padding: 0 28px 0 10px; }
+.job-recommendations-filters input:focus, .job-recommendations-filters select:focus { border-color: #8c7eff; box-shadow: 0 0 0 3px rgba(76,50,239,.10); }
+.job-recommendations-selection { display: flex; align-items: center; gap: 14px; min-height: 42px; padding: 0 12px; border-bottom: 1px solid #e5e3f4; color: #4c32ef; background: #faf9ff; font-size: 11px; font-weight: 700; }
+.job-recommendations-selection button { border: 0; color: #4c32ef; background: transparent; font: inherit; font-size: 11px; cursor: pointer; }
+.recommendation-table-wrap { min-width: 930px; }
+.recommendation-table { width: 100%; border-spacing: 0; font-size: 11px; text-align: left; }
+.recommendation-table th { height: 45px; padding: 0 10px; color: #6b7391; font-size: 9px; font-weight: 750; letter-spacing: .03em; text-transform: uppercase; white-space: nowrap; }
+.recommendation-table thead th { border-bottom: 1px solid #dfe0ef; }
+.recommendation-table td { padding: 12px 10px; border-bottom: 1px solid #ecebf5; color: #59617d; vertical-align: middle; }
+.recommendation-table tbody > tr:not(.recommendation-group):not(.recommendation-expanded) { cursor: pointer; }
+.recommendation-table tbody > tr:not(.recommendation-group):not(.recommendation-expanded):hover td { background: #faf9ff; }
+.recommendation-table tr.is-expanded td { border-bottom-color: transparent; background: #faf9ff; }
+.recommendation-table td strong, .recommendation-table td span { display: block; }
+.recommendation-table td strong { color: #1c2340; font-size: 11px; line-height: 1.4; }
+.recommendation-table td > span:not(.recommendation-status):not(.recommendation-platform) { margin-top: 2px; color: #8087a3; font-size: 10px; }
+.recommendation-check { width: 34px; text-align: center; }
+.recommendation-check input { width: 15px; height: 15px; accent-color: #4c32ef; cursor: pointer; }
+.recommendation-group th { height: 36px; padding: 0 10px; border-bottom: 1px solid #e4e2f1; color: #606887; background: #f8f7ff; font-size: 11px; letter-spacing: 0; text-align: left; text-transform: none; }
+.recommendation-group th span { color: #989fba; font-weight: 500; }
+.recommendation-sender { max-width: 200px; overflow: hidden; color: #6f7795 !important; text-overflow: ellipsis; white-space: nowrap; }
+.recommendation-platform { display: inline-block !important; color: #4c32ef; font-size: 10px; font-weight: 750; }
+.recommendation-status { display: inline-block !important; padding: 4px 7px; border: 1px solid #dedbfa; border-radius: 7px; color: #5140b7; background: #f6f4ff; font-size: 10px; font-weight: 700; }
+.recommendation-status.is-saved { border-color: #ccebdc; color: #168b60; background: #effaf4; }
+.recommendation-status.is-dismissed { border-color: #e5e6ee; color: #78809a; background: #f6f7fa; }
+.recommendation-actions { white-space: nowrap; }
+.recommendation-actions button, .recommendation-expanded button { border: 0; color: #4c32ef; background: transparent; font: inherit; font-size: 10px; font-weight: 750; cursor: pointer; }
+.recommendation-actions button + button { margin-left: 10px; color: #7b829b; }
+.recommendation-actions button:disabled, .recommendation-expanded button:disabled { opacity: .5; cursor: default; }
+.recommendation-expanded td { padding: 0 10px 10px; border-bottom: 1px solid #ecebf5; background: #faf9ff; }
+.recommendation-expanded td > div { display: flex; align-items: center; gap: 14px; min-height: 38px; padding: 7px 10px; border: 1px solid #e4e0fb; border-radius: 7px; color: #707895; background: #fff; font-size: 10px; }
+.recommendation-expanded span { display: inline-flex; align-items: center; gap: 6px; min-width: 0; }
+.recommendation-expanded p { flex: 1; margin: 0; overflow: hidden; line-height: 1.45; text-overflow: ellipsis; white-space: nowrap; }
+.recommendation-expanded a { display: inline-flex; align-items: center; gap: 4px; color: #4c32ef; font-size: 10px; font-weight: 750; text-decoration: none; white-space: nowrap; }
+.recommendation-empty { padding: 52px !important; color: #7a819d !important; text-align: center; }
+@media (max-width: 850px) { .job-recommendations-heading { padding: 10px 16px; align-items: flex-start; flex-direction: column; } .job-recommendations-content { padding: 0 16px 18px; } .job-recommendations-filters { align-items: stretch; flex-wrap: wrap; height: auto; padding: 10px 0; } .job-recommendations-filters input { width: 100%; } .job-recommendations-toolbar { width: 100%; } .job-recommendations-toolbar button { flex: 1; } }

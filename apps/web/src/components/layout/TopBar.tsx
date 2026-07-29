@@ -1,6 +1,6 @@
 import React from 'react'
 
-export function TopBar({ title, children }: { title: string; children?: React.ReactNode }) {
+export function TopBar({ title, titleAccessory, children }: { title: string; titleAccessory?: React.ReactNode; children?: React.ReactNode }) {
   return (
     <div style={{
       minHeight: 52, flexShrink: 0,
@@ -13,7 +13,10 @@ export function TopBar({ title, children }: { title: string; children?: React.Re
       position: 'sticky', top: 0, zIndex: 20,
       boxShadow: '0 1px 0 var(--border), 0 2px 12px rgba(79,70,229,0.04)',
     }}>
-      <span style={{ fontSize: 14, fontWeight: 600, color: 'var(--text)', flex: 1, minWidth: 80, letterSpacing: '-0.01em' }}>{title}</span>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 10, flex: 1, minWidth: 80 }}>
+        <span style={{ fontSize: 14, fontWeight: 600, color: 'var(--text)', letterSpacing: '-0.01em', whiteSpace: 'nowrap' }}>{title}</span>
+        {titleAccessory}
+      </div>
       <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
         {children}
       </div>

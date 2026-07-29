@@ -1,4 +1,5 @@
 import { MailCheck, RefreshCw } from 'lucide-react'
+import type { ReactNode } from 'react'
 import { TopBar } from '@/components/layout/TopBar'
 import { Btn, Card } from '@/components/ui'
 
@@ -8,11 +9,13 @@ interface GmailConnectionScreenProps {
   state: GmailConnectionState
   onConnect: () => void
   onRetry: () => void
+  pageTitle?: string
+  titleAccessory?: ReactNode
 }
 
-export function GmailConnectionScreen({ state, onConnect, onRetry }: GmailConnectionScreenProps) {
+export function GmailConnectionScreen({ state, onConnect, onRetry, pageTitle = 'Gmail Tracker', titleAccessory }: GmailConnectionScreenProps) {
   if (state === 'loading') return <div style={{ flex: 1, display: 'flex', flexDirection: 'column' }}>
-    <TopBar title="Gmail Tracker" />
+    <TopBar title={pageTitle} titleAccessory={titleAccessory} />
     <div style={centered}><div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 10 }}><RefreshCw size={24} className="gmail-spin" /><div style={{ fontSize: 12, color: 'var(--text-muted)' }}>Loading Gmail…</div></div></div>
   </div>
 
@@ -26,7 +29,7 @@ export function GmailConnectionScreen({ state, onConnect, onRetry }: GmailConnec
       : 'Try again, or reconnect Gmail if the problem continues.'
 
   return <div style={{ flex: 1, display: 'flex', flexDirection: 'column' }}>
-    <TopBar title="Gmail Tracker" />
+    <TopBar title={pageTitle} titleAccessory={titleAccessory} />
     <div style={{ ...centered, background: 'var(--bg-tertiary)' }}>
       <Card style={{ padding: 40, maxWidth: 440, textAlign: 'center' }}>
         <span style={{ margin: '0 auto 16px', width: 48, height: 48, borderRadius: 14, display: 'grid', placeItems: 'center', background: 'rgba(79,70,229,0.10)', color: 'var(--primary)' }}><MailCheck size={22} /></span>

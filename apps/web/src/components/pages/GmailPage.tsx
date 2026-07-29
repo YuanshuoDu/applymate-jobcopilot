@@ -9,6 +9,7 @@ import { GmailInboxList } from '@/components/gmail/GmailInboxList'
 import { GmailInboxSidebar } from '@/components/gmail/GmailInboxSidebar'
 import { GmailMessageReader } from '@/components/gmail/GmailMessageReader'
 import { countInboxEmails, filterInboxEmails, type GmailEmail, type GmailInboxFilter } from '@/components/gmail/inbox-model'
+import { useNav } from '@/lib/nav-context'
 
 interface GmailThreadsResponse {
   emails?: GmailEmail[]
@@ -21,6 +22,7 @@ type InboxConnectionState = GmailConnectionState | 'ready'
 /** The original Gmail inbox: filters, message list, and reading pane. */
 export function GmailPage() {
   const { data: session } = useSession()
+  const { navigate } = useNav()
   const toast = useToast()
   const authTriggeredRef = useRef(false)
   const [connection, setConnection] = useState<InboxConnectionState>('loading')
@@ -87,10 +89,12 @@ export function GmailPage() {
     setEmails(current => current.map(email => email.id === id ? { ...email, read: true } : email))
   }, [])
 
-  if (connection !== 'ready') return <GmailConnectionScreen state={connection} onConnect={connectGoogle} onRetry={() => { authTriggeredRef.current = false; void loadEmails() }} />
+  const recommendationsEntry = <button type="button" onClick={() => navigate('gmail-recommendations')} style={recommendationsEntryStyle}>Job recommendations</button>
+
+  if (connection !== 'ready') return <GmailConnectionScreen state={connection} titleAccessory={recommendationsEntry} onConnect={connectGoogle} onRetry={() => { authTriggeredRef.current = false; void loadEmails() }} />
 
   return <div style={{ flex: 1, display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
-    <TopBar title="Gmail Tracker">
+    <TopBar title="Gmail Tracker" titleAccessory={recommendationsEntry}>
       {counts.unread > 0 && <span style={{ fontSize: 11, background: 'var(--primary)', color: '#fff', borderRadius: 999, padding: '2px 8px', fontWeight: 500 }}>{counts.unread} unread</span>}
       <input value={search} onChange={event => setSearch(event.target.value)} placeholder="Search emails…" aria-label="Search emails" style={searchStyle} />
       <Btn variant="ghost" onClick={() => void loadEmails(true)} disabled={refreshing}>{refreshing ? '…' : '⟳ Refresh'}</Btn>
@@ -110,3 +114,4 @@ function removeGmailQueryParam(name: string) {
 }
 
 const searchStyle = { width: 200, padding: '5px 10px', fontSize: 12, border: '0.5px solid var(--border)', borderRadius: 6, background: 'var(--bg)', color: 'var(--text)', outline: 'none' }
+const recommendationsEntryStyle = { border: '1px solid #dedbfa', borderRadius: 7, padding: '5px 9px', background: '#fff', color: '#4c32ef', fontSize: 11, fontWeight: 700, cursor: 'pointer', whiteSpace: 'nowrap' }

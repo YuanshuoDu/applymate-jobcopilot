@@ -217,7 +217,7 @@ export function DashboardPage() {
           <section className="momentum-profile-prompt"><FileText size={18} /><span>Add your resume to unlock tailored matches.</span><button onClick={() => navigate('resume')}>Add resume</button><button aria-label="Dismiss resume reminder" onClick={dismissProfilePrompt}><X size={15} /></button></section>
         )}
         {pendingRecommendations > 0 && (
-          <section className="momentum-profile-prompt"><MailCheck size={18} /><span>{pendingRecommendations} new job recommendation{pendingRecommendations === 1 ? '' : 's'} arrived in Gmail.</span><button onClick={() => navigate('gmail')}>Review jobs</button></section>
+          <section className="momentum-profile-prompt"><MailCheck size={18} /><span>{pendingRecommendations} new job recommendation{pendingRecommendations === 1 ? '' : 's'} arrived in Gmail.</span><button onClick={() => navigate('gmail-recommendations')}>Review jobs</button></section>
         )}
         <header className="momentum-header">
           <div><span><Sparkles size={23} /></span><div><h1>Application Momentum</h1><p>Stay consistent, focus on quality, and keep moving forward.</p></div></div>

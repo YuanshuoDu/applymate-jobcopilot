@@ -344,6 +344,7 @@ export type Page =
   | 'search'
   | 'resume'
   | 'gmail'
+  | 'gmail-recommendations'
   | 'agent'
   | 'agent-history'
   | 'observability'
