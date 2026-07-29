@@ -40,6 +40,6 @@ describe('recommendations model', () => {
 function recommendation(id: string, platform: string, location: string, role: string, receivedAt: string): GmailRecommendation {
   return {
     id, platform, location, role, company: 'Example Co', salary: null, url: null, description: null, status: 'pending', createdAt: receivedAt,
-    sourceMessage: { subject: `New roles for you: ${role}`, receivedAt, senderName: null, senderEmail: null, matchConfidence: null }, savedJob: null,
+    sourceMessage: { gmailMessageId: `gmail-${id}`, gmailThreadId: null, subject: `New roles for you: ${role}`, receivedAt, senderName: null, senderEmail: null, matchConfidence: null }, savedJob: null,
   }
 }

@@ -36,7 +36,7 @@ export async function fetchRecentGmailMessages(
 
   const listPayload = await listResponse.json() as unknown
   const ids = messageIds(listPayload)
-  const settled = await Promise.allSettled(ids.map((id) => fetchMessage(accessToken, id)))
+  const settled = await Promise.allSettled(ids.map((id) => fetchGmailMessage(accessToken, id)))
   return settled.flatMap((result) => result.status === 'fulfilled' && result.value ? [result.value] : [])
 }
 
@@ -62,7 +62,7 @@ function messageIds(payload: unknown): string[] {
   })
 }
 
-async function fetchMessage(accessToken: string, id: string): Promise<GmailRemoteMessage | null> {
+export async function fetchGmailMessage(accessToken: string, id: string): Promise<GmailRemoteMessage | null> {
   const response = await fetch(
     `https://gmail.googleapis.com/gmail/v1/users/me/messages/${encodeURIComponent(id)}?format=full`,
     { headers: { Authorization: `Bearer ${accessToken}` }, signal: AbortSignal.timeout(8_000) },

@@ -7,7 +7,7 @@ import type { GmailRecommendation } from './types'
 const recommendation: GmailRecommendation = {
   id: 'recommendation-1', platform: 'Indeed', company: 'HubSpot', role: 'Senior Support Engineer', location: 'Dublin, Ireland', salary: '€55k–€65k',
   url: 'https://example.com/job', description: 'Help customers troubleshoot technical issues.', status: 'pending', createdAt: '2026-07-29T08:00:00.000Z',
-  sourceMessage: { subject: 'New jobs from Indeed', receivedAt: '2026-07-29T08:00:00.000Z', senderName: 'Indeed Jobs', senderEmail: 'jobs@indeed.com', matchConfidence: null }, savedJob: null,
+  sourceMessage: { gmailMessageId: 'gmail-1', gmailThreadId: 'thread-1', subject: 'New jobs from Indeed', receivedAt: '2026-07-29T08:00:00.000Z', senderName: 'Indeed Jobs', senderEmail: 'jobs@indeed.com', matchConfidence: null }, savedJob: null,
 }
 
 describe('RecommendationList', () => {
@@ -16,7 +16,7 @@ describe('RecommendationList', () => {
 
     expect(html).toContain('<table')
     expect(html).toContain('Senior Support Engineer')
-    expect(html).toContain('Indeed')
+    expect(html).toContain('Open source email')
     expect(html).toContain('Save')
     expect(html).toContain('Dismiss')
   })

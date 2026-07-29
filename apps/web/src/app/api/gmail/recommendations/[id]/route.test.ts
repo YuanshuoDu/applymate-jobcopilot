@@ -4,8 +4,11 @@ const mocks = vi.hoisted(() => ({
   requireAuth: vi.fn(),
   recommendationFindFirst: vi.fn(),
   recommendationUpdate: vi.fn(),
+  jobFindFirst: vi.fn(),
   jobCreate: vi.fn(),
   activityCreate: vi.fn(),
+  getGoogleAccessToken: vi.fn(),
+  hydrateRecommendationDetails: vi.fn(),
 }))
 
 vi.mock('@/lib/api-helpers', () => ({
@@ -17,10 +20,12 @@ vi.mock('@/lib/api-helpers', () => ({
 vi.mock('@/lib/db', () => ({
   db: {
     gmailRecommendation: { findFirst: mocks.recommendationFindFirst, update: mocks.recommendationUpdate },
-    job: { create: mocks.jobCreate },
+    job: { findFirst: mocks.jobFindFirst, create: mocks.jobCreate },
     activity: { create: mocks.activityCreate },
   },
 }))
+vi.mock('@/lib/gmail-helpers', () => ({ getGoogleAccessToken: mocks.getGoogleAccessToken }))
+vi.mock('@/lib/gmail-tracking/recommendation-details', () => ({ hydrateRecommendationDetails: mocks.hydrateRecommendationDetails }))
 
 const params = { params: Promise.resolve({ id: 'recommendation-1' }) }
 
@@ -37,6 +42,8 @@ describe('PATCH /api/gmail/recommendations/[id]', () => {
     vi.resetModules()
     Object.values(mocks).forEach(mock => mock.mockReset())
     mocks.requireAuth.mockResolvedValue({ userId: 'user-1' })
+    mocks.getGoogleAccessToken.mockResolvedValue('token')
+    mocks.jobFindFirst.mockResolvedValue(null)
   })
 
   it('returns an auth error before looking up a recommendation', async () => {
@@ -59,7 +66,13 @@ describe('PATCH /api/gmail/recommendations/[id]', () => {
       location: 'Berlin',
       salary: '€80k',
       url: 'https://jobs.acme.example/1',
-      description: 'Build reliable products.',
+      description: 'Build reliable products with a resilient and well-documented engineering platform for our customers.',
+      platform: 'Example',
+      sourceMessage: { gmailMessageId: 'gmail-1' },
+    })
+    mocks.hydrateRecommendationDetails.mockResolvedValue({
+      platform: 'Example', company: 'Acme', role: 'Senior Engineer', location: 'Berlin', salary: '€80k',
+      url: 'https://jobs.acme.example/1', description: 'Build reliable products with a resilient and well-documented engineering platform for our customers.',
     })
     mocks.jobCreate.mockResolvedValue({ id: 'job-1', company: 'Acme', role: 'Senior Engineer' })
     mocks.recommendationUpdate.mockResolvedValue({ id: 'recommendation-1', status: 'saved', savedJobId: 'job-1' })
@@ -78,7 +91,7 @@ describe('PATCH /api/gmail/recommendations/[id]', () => {
     })
     expect(mocks.recommendationUpdate).toHaveBeenCalledWith({
       where: { id: 'recommendation-1' },
-      data: { status: 'saved', savedJobId: 'job-1' },
+      data: expect.objectContaining({ status: 'saved', savedJobId: 'job-1', company: 'Acme', role: 'Senior Engineer' }),
     })
     expect(mocks.activityCreate).toHaveBeenCalledWith(expect.objectContaining({ data: expect.objectContaining({ userId: 'user-1', jobId: 'job-1' }) }))
   })

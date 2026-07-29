@@ -1,9 +1,9 @@
 'use client'
 
 import React from 'react'
-import { ChevronDown, ExternalLink, Mail, X } from 'lucide-react'
+import { ExternalLink, Mail, X } from 'lucide-react'
 import type { GmailRecommendation } from './types'
-import { displayPlatform, groupRecommendations } from './recommendations-model'
+import { groupRecommendations } from './recommendations-model'
 
 interface RecommendationListProps {
   recommendations: GmailRecommendation[]
@@ -17,21 +17,21 @@ interface RecommendationListProps {
 }
 
 export function RecommendationList({ recommendations, selectedIds, expandedId, busyIds, onToggle, onToggleAll, onExpand, onAction }: RecommendationListProps) {
-  const selectable = recommendations.filter(item => item.status === 'pending' && item.company && item.role)
+  const selectable = recommendations.filter(item => item.status === 'pending')
   const allSelected = selectable.length > 0 && selectable.every(item => selectedIds.has(item.id))
 
   return <div className="recommendation-table-wrap">
     <table className="recommendation-table">
       <colgroup>
-        <col className="recommendation-col-check" /><col className="recommendation-col-role" /><col className="recommendation-col-sender" />
-        <col className="recommendation-col-source" /><col className="recommendation-col-location" /><col className="recommendation-col-type" />
+        <col className="recommendation-col-check" /><col className="recommendation-col-role" /><col className="recommendation-col-source" />
+        <col className="recommendation-col-location" /><col className="recommendation-col-type" />
         <col className="recommendation-col-experience" /><col className="recommendation-col-match" /><col className="recommendation-col-actions" />
       </colgroup>
       <thead><tr>
         <th className="recommendation-check"><input aria-label="Select all visible jobs" type="checkbox" checked={allSelected} onChange={onToggleAll} /></th>
-        <th>Role &amp; company</th><th>Source (email sender)</th><th>Source</th><th>Location</th><th>Type</th><th>Experience</th><th>Match</th><th>Actions</th>
+        <th>Role &amp; company</th><th>Source</th><th>Location</th><th>Type</th><th>Experience</th><th>Match</th><th>Actions</th>
       </tr></thead>
-      <tbody>{recommendations.length === 0 ? <tr><td colSpan={9} className="recommendation-empty">No jobs match these filters.</td></tr>
+      <tbody>{recommendations.length === 0 ? <tr><td colSpan={8} className="recommendation-empty">No jobs match these filters.</td></tr>
         : groupRecommendations(recommendations).map(group => <RecommendationGroup key={group.id} {...{ group, selectedIds, expandedId, busyIds, onToggle, onExpand, onAction }} />)}</tbody>
     </table>
   </div>
@@ -47,7 +47,7 @@ function RecommendationGroup({ group, selectedIds, expandedId, busyIds, onToggle
   onAction: (id: string, action: 'save' | 'dismiss') => void
 }) {
   return <>
-    <tr className="recommendation-group"><th colSpan={9}>{group.label} <span>({group.recommendations.length})</span></th></tr>
+    <tr className="recommendation-group"><th colSpan={8}>{group.label} <span>({group.recommendations.length})</span></th></tr>
     {group.recommendations.map(item => <RecommendationRow key={item.id} item={item} selected={selectedIds.has(item.id)} expanded={expandedId === item.id} busy={busyIds.has(item.id)} {...{ onToggle, onExpand, onAction }} />)}
   </>
 }
@@ -61,13 +61,12 @@ function RecommendationRow({ item, selected, expanded, busy, onToggle, onExpand,
   onExpand: (id: string) => void
   onAction: (id: string, action: 'save' | 'dismiss') => void
 }) {
-  const canSave = Boolean(item.company && item.role && item.status === 'pending')
+  const canSave = item.status === 'pending'
   return <>
     <tr className={`${expanded ? 'is-expanded ' : ''}${selected ? 'is-selected' : ''}`.trim() || undefined} onClick={() => onExpand(item.id)}>
       <td className="recommendation-check" onClick={event => event.stopPropagation()}><input aria-label={`Select ${item.role ?? 'job'}`} type="checkbox" checked={selected} disabled={!canSave} onChange={() => onToggle(item.id)} /></td>
-      <td><strong>{item.role ?? 'Role details needed'}</strong><span>{item.company ?? 'Company details needed'}</span></td>
-      <td><span className="recommendation-sender">{item.sourceMessage.senderName || item.sourceMessage.subject}</span><small>{item.sourceMessage.senderEmail || item.sourceMessage.subject}</small></td>
-      <td><span className="recommendation-platform">{displayPlatform(item.platform)}</span></td>
+      <td><strong>{item.role ?? 'Role details needed'}</strong><span>{item.company ?? 'Details fetched when saved'}</span></td>
+      <td className="recommendation-source" onClick={event => event.stopPropagation()}><a href={sourceEmailHref(item.sourceMessage.gmailMessageId)} target="_blank" rel="noreferrer" aria-label="Open source email" title={item.sourceMessage.senderEmail || item.sourceMessage.subject}><Mail size={15} /></a></td>
       <td>{item.location ?? '—'}</td><td>{employmentType(item.description)}</td><td>{experience(item.description)}</td>
       <td><MatchValue value={item.sourceMessage.matchConfidence} /></td>
       <td className="recommendation-actions" onClick={event => event.stopPropagation()}>
@@ -76,13 +75,17 @@ function RecommendationRow({ item, selected, expanded, busy, onToggle, onExpand,
         {item.status === 'saved' && <span>Saved</span>}
       </td>
     </tr>
-    {expanded && <tr className="recommendation-expanded"><td /><td colSpan={8}><div>
-      <span><ChevronDown size={14} /> Salary: {item.salary || 'Not provided'}</span><span><Mail size={14} /> Email subject: {item.sourceMessage.subject}</span>
+    {expanded && <tr className="recommendation-expanded"><td /><td colSpan={7}><div>
+      <span><Mail size={14} /> Email subject: {item.sourceMessage.subject}</span><span>Salary: {item.salary || 'Not provided'}</span>
       {item.description && <p>{item.description}</p>}
       {item.url && <a href={item.url} target="_blank" rel="noreferrer">View job <ExternalLink size={13} /></a>}
-      {item.status === 'pending' && <button type="button" disabled={busy} onClick={() => onAction(item.id, 'dismiss')}><X size={13} /> Dismiss job</button>}
+      <button type="button" aria-label="Close job details" disabled={busy} onClick={() => onExpand(item.id)}><X size={14} /></button>
     </div></td></tr>}
   </>
+}
+
+function sourceEmailHref(messageId: string) {
+  return `https://mail.google.com/mail/u/0/#all/${encodeURIComponent(messageId)}`
 }
 
 function MatchValue({ value }: { value: number | null }) {

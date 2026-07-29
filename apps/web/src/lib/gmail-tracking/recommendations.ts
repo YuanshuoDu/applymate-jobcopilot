@@ -1,6 +1,7 @@
 /** Pure extraction for job-platform recommendation emails. */
 
 import { createRecommendationFingerprint } from './fingerprint'
+import { simplifyRecommendationLocation } from './recommendation-utils'
 
 export { createRecommendationFingerprint } from './fingerprint'
 export type { RecommendationFingerprintInput } from './fingerprint'
@@ -43,14 +44,11 @@ export function extractRecommendationCards(input: RecommendationExtractionInput)
   const html = input.html ?? ''
   const text = input.text ?? ''
   const candidates = [...extractHtmlLinks(html), ...extractTextLinks(text)]
-  const cards: GmailRecommendationCard[] = []
-  const seen = new Set<string>()
+  const cards = new Map<string, GmailRecommendationCard>()
 
   for (const candidate of candidates) {
     const card = parseCandidate(candidate, input.platform)
-    if (!card || seen.has(card.fingerprint)) continue
-    seen.add(card.fingerprint)
-    cards.push(card)
+    if (card) keepRicherCard(cards, card)
   }
 
   // Some providers send text-only cards without a separate job URL.
@@ -58,11 +56,15 @@ export function extractRecommendationCards(input: RecommendationExtractionInput)
   for (const [index, line] of textLines.entries()) {
     if (containsUrl(line) || containsUrl(textLines[index - 1] ?? '') || containsUrl(textLines[index + 1] ?? '')) continue
     const card = parseCandidate({ label: line, context: line, url: '' }, input.platform)
-    if (!card || seen.has(card.fingerprint)) continue
-    seen.add(card.fingerprint)
-    cards.push(card)
+    if (card && ![...cards.values()].some(existing => existing.role?.toLowerCase() === card.role?.toLowerCase())) keepRicherCard(cards, card)
   }
-  return cards
+  return [...cards.values()]
+}
+
+function keepRicherCard(cards: Map<string, GmailRecommendationCard>, candidate: GmailRecommendationCard) {
+  const existing = cards.get(candidate.fingerprint)
+  const score = (card: GmailRecommendationCard) => [card.company, card.location, card.salary, card.description].filter(Boolean).length
+  if (!existing || score(candidate) > score(existing)) cards.set(candidate.fingerprint, candidate)
 }
 
 function extractHtmlLinks(html: string): LinkCandidate[] {
@@ -89,10 +91,11 @@ function extractTextLinks(text: string): LinkCandidate[] {
     const url = sanitiseUrl(rawUrl)
     if (!url) continue
     const index = match.index ?? 0
+    const preceding = toText(text.slice(Math.max(0, index - 700), index)).split('\n').slice(-6).join('\n')
     result.push({
-      label: '',
+      label: preceding,
       url,
-      context: toText(text.slice(Math.max(0, index - 240), Math.min(text.length, index + rawUrl.length + 180))),
+      context: `${preceding}\n${toText(text.slice(Math.max(0, index - 240), Math.min(text.length, index + rawUrl.length + 180)))}`,
     })
   }
   return result
@@ -121,7 +124,15 @@ function parseCandidate(candidate: LinkCandidate, requestedPlatform?: string | n
 }
 
 function findRoleAndCompany(parts: string[]): { role: string | null; company: string | null } {
+  for (let index = 0; index < parts.length - 1; index += 1) {
+    const companyLine = parts[index + 1].match(/^(.+?)\s+-\s+(.+)$/)
+    if (looksLikeRole(parts[index]) && companyLine && isLocation(companyLine[2])) {
+      return { role: clean(parts[index]), company: cleanCompany(companyLine[1]) }
+    }
+  }
   for (const part of parts) {
+    const hiringMatch = part.match(/^(.+?)\s+is\s+hiring\s+(?:for\s+)?(.+?)(?:\s+\+\s+\d+\s+new\b|$)/i)
+    if (hiringMatch && looksLikeRole(hiringMatch[2])) return { role: clean(hiringMatch[2]), company: cleanCompany(hiringMatch[1]) }
     const atMatch = part.match(/^(.+?)\s+(?:at|@|with)\s+(.+?)(?:\s+[|·•–—]\s+.*)?$/i)
     if (atMatch && looksLikeRole(atMatch[1])) return { role: clean(atMatch[1]), company: cleanCompany(atMatch[2]) }
     const columns = part.split(/[|·•]/).map(clean).filter(Boolean)
@@ -136,7 +147,12 @@ function findRoleAndCompany(parts: string[]): { role: string | null; company: st
 }
 
 function findLocation(parts: string[], role: string, company: string | null): string | null {
-  return parts.find((part) => part !== role && part !== company && isLocation(part) && !looksLikeRole(part)) ?? null
+  for (const part of parts) {
+    if (part === role || part === company || looksLikeRole(part)) continue
+    const location = simplifyRecommendationLocation(part)
+    if (location && isLocation(part)) return location
+  }
+  return null
 }
 
 function findSalary(text: string): string | null {
@@ -144,14 +160,14 @@ function findSalary(text: string): string | null {
 }
 
 function findDescription(parts: string[], role: string, company: string | null): string | null {
-  const description = parts.find((part) => part.length > 55 && part !== role && part !== company && !part.includes('http'))
+  const description = parts.find((part) => part.length > 55 && part !== role && part !== company && !part.includes('http') && !isLocation(part))
   return description ? description.slice(0, 500) : null
 }
 
 function isJobLike(candidate: LinkCandidate, text: string): boolean {
   if (IGNORED_TEXT.test(clean(candidate.label))) return false
   const lowerUrl = candidate.url.toLowerCase()
-  return /\b(job|jobs|career|position|posting|vacanc|apply)\b/.test(lowerUrl) || looksLikeRole(text)
+  return /\b(job|jobs|career|position|posting|vacanc|apply)\b|viewjob|\/rc\/clk\/|\/jobs\/view/i.test(lowerUrl) || looksLikeRole(text)
 }
 
 function looksLikeRole(value: string): boolean {
@@ -195,7 +211,7 @@ function toText(value: string): string {
 }
 
 function clean(value: string): string {
-  return value.replace(/\s+/g, ' ').replace(/^[\s:|·•–—-]+|[\s:|·•–—-]+$/g, '').trim()
+  return value.replace(/\s+/g, ' ').replace(/\s+(?:view job|apply now)$/i, '').replace(/^[\s:|·•–—-]+|[\s:|·•–—-]+$/g, '').trim()
 }
 
 function cleanCompany(value: string): string | null {

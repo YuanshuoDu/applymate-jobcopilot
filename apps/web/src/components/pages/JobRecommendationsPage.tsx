@@ -80,7 +80,7 @@ export function JobRecommendationsPage() {
   }
 
   async function saveSelected() {
-    const candidates = visible.filter(item => selectedIds.has(item.id) && item.status === 'pending' && item.company && item.role)
+    const candidates = visible.filter(item => selectedIds.has(item.id) && item.status === 'pending')
     for (const item of candidates) await updateRecommendation(item.id, 'save')
   }
 
@@ -90,7 +90,7 @@ export function JobRecommendationsPage() {
   }
 
   function toggleAll() {
-    const candidates = visible.filter(item => item.status === 'pending' && item.company && item.role)
+    const candidates = visible.filter(item => item.status === 'pending')
     const everySelected = candidates.length > 0 && candidates.every(item => selectedIds.has(item.id))
     setSelectedIds(everySelected ? new Set() : new Set(candidates.map(item => item.id)))
   }

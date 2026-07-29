@@ -1,6 +1,8 @@
 import { NextRequest } from 'next/server'
 import { db } from '@/lib/db'
 import { err, isErrorResponse, ok, requireAuth } from '@/lib/api-helpers'
+import { getGoogleAccessToken } from '@/lib/gmail-helpers'
+import { hydrateRecommendationDetails } from '@/lib/gmail-tracking/recommendation-details'
 
 type Params = { params: Promise<{ id: string }> }
 
@@ -13,7 +15,10 @@ export async function PATCH(req: NextRequest, { params }: Params) {
   const action = isAction(body?.action) ? body.action : null
   if (!action) return err('Expected action "save" or "dismiss"')
 
-  const recommendation = await db.gmailRecommendation.findFirst({ where: { id, userId: auth.userId } })
+  const recommendation = await db.gmailRecommendation.findFirst({
+    where: { id, userId: auth.userId },
+    include: { sourceMessage: { select: { gmailMessageId: true } } },
+  })
   if (!recommendation) return err('Recommendation not found', 404)
 
   if (action === 'dismiss') {
@@ -27,26 +32,23 @@ export async function PATCH(req: NextRequest, { params }: Params) {
   if (recommendation.status === 'saved' && recommendation.savedJobId) {
     return ok({ recommendation })
   }
-  if (!recommendation.company || !recommendation.role) {
-    return err('This recommendation needs a company and role before it can be saved', 422)
+  const token = await getGoogleAccessToken(auth.userId).catch(() => null)
+  if (!token || !recommendation.sourceMessage?.gmailMessageId) return err('Reconnect Gmail to retrieve the job details before saving', 401)
+  const details = await hydrateRecommendationDetails({ ...recommendation, gmailMessageId: recommendation.sourceMessage.gmailMessageId }, token)
+  if (!details.company || !details.role || !hasJobDescription(details.description)) {
+    return err('We could not retrieve a complete job description from the source email. Open the source email and retry after the job details are available.', 422)
   }
 
-  const job = await db.job.create({
+  const existingJob = details.url ? await db.job.findFirst({ where: { userId: auth.userId, url: details.url } }) : null
+  const job = existingJob ?? await db.job.create({
     data: {
-      userId: auth.userId,
-      company: recommendation.company,
-      role: recommendation.role,
-      location: recommendation.location,
-      salary: recommendation.salary,
-      url: recommendation.url,
-      description: recommendation.description,
-      source: 'gmail',
-      status: 'saved',
+      userId: auth.userId, company: details.company, role: details.role, location: details.location,
+      salary: details.salary, url: details.url, description: details.description, source: 'gmail', status: 'saved',
     },
   })
   const updated = await db.gmailRecommendation.update({
     where: { id: recommendation.id },
-    data: { status: 'saved', savedJobId: job.id },
+    data: { ...details, status: 'saved', savedJobId: job.id },
   })
   await db.activity.create({
     data: {
@@ -63,4 +65,8 @@ export async function PATCH(req: NextRequest, { params }: Params) {
 
 function isAction(value: unknown): value is 'save' | 'dismiss' {
   return value === 'save' || value === 'dismiss'
+}
+
+function hasJobDescription(value: string | null): value is string {
+  return Boolean(value && value.replace(/\s/g, '').length >= 80)
 }

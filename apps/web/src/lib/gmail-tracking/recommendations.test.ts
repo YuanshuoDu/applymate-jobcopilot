@@ -35,4 +35,17 @@ describe('extractRecommendationCards', () => {
       salary: '€60k–€75k',
     })
   })
+
+  it('keeps the richer card when an email repeats the same job link', () => {
+    const url = 'https://ie.indeed.com/rc/clk/dl?jk=123'
+    const cards = extractRecommendationCards({
+      html: `<div>Creative Design Intern <a href="${url}">View job</a></div>`,
+      text: `Creative Design Intern\nTrinity College Dublin Students Union - Dublin, County Dublin\nExperience designing for both digital and print media while supporting marketing and communications work.\n${url}`,
+      platform: 'Indeed',
+    })
+
+    expect(cards).toEqual([expect.objectContaining({
+      role: 'Creative Design Intern', company: 'Trinity College Dublin Students Union', location: 'Dublin, County Dublin',
+    })])
+  })
 })

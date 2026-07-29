@@ -6,6 +6,7 @@ const mocks = vi.hoisted(() => ({
   syncGmailForUser: vi.fn(),
   messagesFindMany: vi.fn(),
   recommendationsFindMany: vi.fn(),
+  recommendationsUpdate: vi.fn(),
 }))
 
 vi.mock('@/lib/api-helpers', () => ({
@@ -19,7 +20,7 @@ vi.mock('@/lib/gmail-tracking/sync', () => ({ syncGmailForUser: mocks.syncGmailF
 vi.mock('@/lib/db', () => ({
   db: {
     gmailMessage: { findMany: mocks.messagesFindMany },
-    gmailRecommendation: { findMany: mocks.recommendationsFindMany },
+    gmailRecommendation: { findMany: mocks.recommendationsFindMany, update: mocks.recommendationsUpdate },
   },
 }))
 
@@ -38,9 +39,10 @@ describe('GET /api/gmail/tracking', () => {
       error: null,
     })
     mocks.messagesFindMany.mockResolvedValue([{ id: 'message-1', subject: 'Application received', job: null }])
+    mocks.recommendationsUpdate.mockResolvedValue({})
     mocks.recommendationsFindMany.mockResolvedValue([
-      { id: 'recommendation-1', status: 'pending', savedJob: null },
-      { id: 'recommendation-2', status: 'saved', savedJob: { id: 'job-1', company: 'Acme', role: 'Engineer' } },
+      { id: 'recommendation-1', status: 'pending', platform: 'Indeed', company: 'Acme', role: 'Data Engineer', location: 'Dublin, County Dublin', savedJob: null },
+      { id: 'recommendation-2', status: 'saved', platform: 'Indeed', company: 'Acme', role: 'Senior Engineer', location: 'Berlin', savedJob: { id: 'job-1', company: 'Acme', role: 'Senior Engineer' } },
     ])
   })
 
@@ -72,5 +74,42 @@ describe('GET /api/gmail/tracking', () => {
     expect(mocks.syncGmailForUser).toHaveBeenCalledWith('user-1')
     expect(mocks.messagesFindMany).toHaveBeenCalledWith(expect.objectContaining({ where: { userId: 'user-1' }, take: 80 }))
     expect(mocks.recommendationsFindMany).toHaveBeenCalledWith(expect.objectContaining({ where: { userId: 'user-1' }, take: 100 }))
+  })
+
+  it('returns one visible row for repeated alerts of the same job', async () => {
+    mocks.recommendationsFindMany.mockResolvedValue([
+      { id: 'older', status: 'pending', platform: 'Indeed', company: null, role: 'Data Engineer', location: null, description: null, url: 'https://ie.indeed.com/jobs?q=data+engineer', savedJob: null },
+      { id: 'newer', status: 'pending', platform: 'Indeed', company: 'Acme', role: 'Data Engineer', location: 'Dublin, County Dublin', description: 'Full role description', url: 'https://ie.indeed.com/viewjob?jk=2', savedJob: null },
+    ])
+    const { GET } = await import('./route')
+
+    const response = await GET(new Request('http://localhost/api/gmail/tracking') as never)
+
+    await expect(response.json()).resolves.toMatchObject({
+      pendingRecommendationCount: 1,
+      recommendations: [expect.objectContaining({ id: 'newer', location: 'Dublin, County Dublin' })],
+    })
+  })
+
+  it('repairs older recommendation fields from its captured email excerpt', async () => {
+    mocks.recommendationsFindMany.mockResolvedValue([{
+      id: 'legacy', status: 'pending', platform: 'Indeed', company: null, role: 'Creative Design Intern', location: null, salary: null,
+      description: null, url: 'https://ie.indeed.com/rc/clk/dl?jk=role-1', savedJob: null,
+      sourceMessage: {
+        gmailMessageId: 'gmail-1', gmailThreadId: null, subject: 'Your Indeed job alert', excerpt: 'Creative Design Intern\nTrinity College Dublin Students Union - Dublin, County Dublin\nExperience designing digital campaigns, social media assets, and print materials for a growing student-led organisation.\nhttps://ie.indeed.com/rc/clk/dl?jk=role-1',
+        receivedAt: new Date('2026-07-29'), senderName: 'Indeed', senderEmail: 'alerts@indeed.com', matchConfidence: 1,
+      },
+    }])
+    const { GET } = await import('./route')
+
+    const response = await GET(new Request('http://localhost/api/gmail/tracking') as never)
+
+    await expect(response.json()).resolves.toMatchObject({
+      recommendations: [expect.objectContaining({ company: 'Trinity College Dublin Students Union', location: 'Dublin, County Dublin' })],
+    })
+    expect(mocks.recommendationsUpdate).toHaveBeenCalledWith(expect.objectContaining({
+      where: { id: 'legacy' },
+      data: expect.objectContaining({ company: 'Trinity College Dublin Students Union', location: 'Dublin, County Dublin' }),
+    }))
   })
 })

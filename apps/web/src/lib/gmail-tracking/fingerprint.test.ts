@@ -5,11 +5,11 @@ describe('createRecommendationFingerprint', () => {
   it('is deterministic and ignores URL tracking parameters', () => {
     const first = createRecommendationFingerprint({
       platform: 'Indeed', company: 'Acme', role: 'Data Engineer', location: 'Berlin',
-      url: 'https://example.com/jobs/42?utm_source=email&b=2',
+      url: 'https://ie.indeed.com/viewjob?jk=42&utm_source=email',
     })
     const second = createRecommendationFingerprint({
-      platform: 'ignored', company: 'different', role: 'different', location: 'different',
-      url: 'https://example.com/jobs/42?b=2&utm_campaign=daily',
+      platform: 'Indeed', company: 'Acme', role: 'Data Engineer', location: 'Berlin',
+      url: 'https://ie.indeed.com/viewjob?vjk=42&utm_campaign=daily',
     })
     expect(first).toBe(second)
   })
