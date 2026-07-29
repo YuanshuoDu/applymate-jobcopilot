@@ -22,6 +22,11 @@ export function RecommendationList({ recommendations, selectedIds, expandedId, b
 
   return <div className="recommendation-table-wrap">
     <table className="recommendation-table">
+      <colgroup>
+        <col className="recommendation-col-check" /><col className="recommendation-col-role" /><col className="recommendation-col-sender" />
+        <col className="recommendation-col-source" /><col className="recommendation-col-location" /><col className="recommendation-col-type" />
+        <col className="recommendation-col-experience" /><col className="recommendation-col-match" /><col className="recommendation-col-actions" />
+      </colgroup>
       <thead><tr>
         <th className="recommendation-check"><input aria-label="Select all visible jobs" type="checkbox" checked={allSelected} onChange={onToggleAll} /></th>
         <th>Role &amp; company</th><th>Source (email sender)</th><th>Source</th><th>Location</th><th>Type</th><th>Experience</th><th>Match</th><th>Actions</th>

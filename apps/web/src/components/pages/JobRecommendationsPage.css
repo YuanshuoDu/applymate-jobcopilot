@@ -14,16 +14,17 @@
 .job-recommendations-search input { width: min(360px, 100%); height: 34px; padding: 0 11px; border: 1px solid #e2e0f2; border-radius: 7px; color: #424965; background: #fff; font: inherit; font-size: 11px; outline: none; }
 .job-recommendations-selection { display: flex; align-items: center; gap: 14px; min-height: 42px; padding: 0 12px; border-bottom: 1px solid #e5e3f4; color: #4c32ef; background: #faf9ff; font-size: 11px; font-weight: 700; }
 .job-recommendations-selection button { border: 0; color: #4c32ef; background: transparent; font: inherit; font-size: 11px; cursor: pointer; }
-.recommendation-table-wrap { min-width: 1060px; }
-.recommendation-table { width: 100%; border-spacing: 0; font-size: 11px; text-align: left; }
+.recommendation-table-wrap { min-width: 1080px; }
+.recommendation-table { width: 1080px; table-layout: fixed; border-spacing: 0; font-size: 11px; text-align: left; }
+.recommendation-col-check { width: 36px; }.recommendation-col-role { width: 210px; }.recommendation-col-sender { width: 175px; }.recommendation-col-source { width: 100px; }.recommendation-col-location { width: 190px; }.recommendation-col-type { width: 78px; }.recommendation-col-experience { width: 86px; }.recommendation-col-match { width: 80px; }.recommendation-col-actions { width: 125px; }
 .recommendation-table th { height: 45px; padding: 0 10px; color: #6b7391; font-size: 9px; font-weight: 750; letter-spacing: .03em; text-transform: uppercase; white-space: nowrap; }
 .recommendation-table thead th { border-bottom: 1px solid #dfe0ef; }
-.recommendation-table td { padding: 10px; border-bottom: 1px solid #ecebf5; color: #59617d; vertical-align: middle; }
+.recommendation-table td { overflow: hidden; padding: 10px; border-bottom: 1px solid #ecebf5; color: #59617d; text-overflow: ellipsis; vertical-align: middle; }
 .recommendation-table tbody > tr:not(.recommendation-group):not(.recommendation-expanded) { cursor: pointer; }
 .recommendation-table tbody > tr:not(.recommendation-group):not(.recommendation-expanded):hover td, .recommendation-table tr.is-expanded td { background: #faf9ff; }
 .recommendation-table tr.is-selected td { background: #f7f5ff; }
 .recommendation-table td strong, .recommendation-table td span { display: block; }
-.recommendation-table td strong { color: #1c2340; font-size: 11px; line-height: 1.4; }
+.recommendation-table td strong { overflow: hidden; color: #1c2340; font-size: 11px; line-height: 1.4; text-overflow: ellipsis; }
 .recommendation-table td > span:not(.recommendation-platform):not(.recommendation-match):not(.recommendation-no-match) { margin-top: 2px; color: #8087a3; font-size: 10px; }
 .recommendation-check { width: 34px; text-align: center; }
 .recommendation-check input { width: 15px; height: 15px; accent-color: #4c32ef; cursor: pointer; }
