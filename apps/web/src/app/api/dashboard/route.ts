@@ -28,9 +28,11 @@ export async function GET(request: Request) {
   const rangeStart = getDateParam(params.get('from'), defaultStart)
   const rangeEnd = getDateParam(params.get('to'), defaultEnd, true)
   const todayEnd = new Date()
+  const todayStart = new Date()
+  todayStart.setHours(0, 0, 0, 0)
   todayEnd.setHours(23, 59, 59, 999)
 
-  const [statusGroups, thisWeek, followUpsDue, agentConfig, recentJobs, activity, resumeCount, pendingRecommendationCount] = await Promise.all([
+  const [statusGroups, thisWeek, followUpsDue, agentConfig, recentJobs, activity, resumeCount, pendingRecommendationCount, todayRecommendations] = await Promise.all([
     db.job.groupBy({
       by: ['status'],
       where: { userId },
@@ -52,11 +54,17 @@ export async function GET(request: Request) {
     db.activity.findMany({
       where: { userId },
       orderBy: { createdAt: 'desc' },
-      take: 8,
+      take: 100,
       include: { job: { select: { company: true, role: true } } },
     }),
     db.resume.count({ where: { userId } }),
     db.gmailRecommendation.count({ where: { userId, status: 'pending' } }).catch(() => 0),
+    db.gmailRecommendation.findMany({
+      where: { userId, status: 'pending', sourceMessage: { receivedAt: { gte: todayStart, lte: todayEnd } } },
+      select: { id: true, platform: true, company: true, role: true, location: true, createdAt: true },
+      orderBy: { createdAt: 'desc' },
+      take: 4,
+    }).catch(() => []),
   ])
 
   const pipeline: Record<string, number> = {}
@@ -91,6 +99,7 @@ export async function GET(request: Request) {
     recentJobs,
     activity,
     pendingRecommendationCount,
+    todayRecommendations,
     agentConfig,
     minMatchScore,
     hasResume: resumeCount > 0,

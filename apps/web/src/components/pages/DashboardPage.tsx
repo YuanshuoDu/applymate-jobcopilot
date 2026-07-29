@@ -2,11 +2,11 @@
 
 import React, { useEffect, useMemo, useState } from 'react'
 import {
-  ArrowRight, BriefcaseBusiness, CalendarDays, Check, ChevronDown,
+  ArrowRight, BriefcaseBusiness, CalendarDays, Check, ChevronDown, ChevronLeft, ChevronRight,
   Eye, FileText, MailCheck, MoreVertical, Send, Sparkles, Target, X,
 } from 'lucide-react'
 import { Btn, ScorePill, useToast } from '@/components/ui'
-import type { Activity, DashboardData, DashboardSavedJob } from '@/lib/types'
+import type { Activity, DashboardData, DashboardRecommendation, DashboardSavedJob } from '@/lib/types'
 import { apiMutate, fmtDate, useApi } from '@/lib/hooks'
 import { useNav } from '@/lib/nav-context'
 import './DashboardPage.css'
@@ -99,18 +99,24 @@ function MatchList({ jobs, threshold, onReview }: { jobs: DashboardSavedJob[]; t
 function Timeline({ activities, onJobs }: { activities: Activity[]; onJobs: () => void }) {
   const [sortBy, setSortBy] = useState<'recent' | 'company'>('recent')
   const [sortOpen, setSortOpen] = useState(false)
-  const sortedActivities = [...activities].sort((a, b) => sortBy === 'company'
+  const [page, setPage] = useState(0)
+  const applicationActivities = activities.filter(activity => ['applied', 'interview_scheduled', 'offer_received', 'rejected', 'status_changed'].includes(activity.type))
+  const sortedActivities = [...applicationActivities].sort((a, b) => sortBy === 'company'
     ? (a.job?.company ?? '').localeCompare(b.job?.company ?? '')
     : new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime())
+  const pageSize = 10
+  const pageCount = Math.max(1, Math.ceil(sortedActivities.length / pageSize))
+  const currentPage = Math.min(page, pageCount - 1)
+  const pageActivities = sortedActivities.slice(currentPage * pageSize, (currentPage + 1) * pageSize)
 
   return (
     <section className="momentum-timeline-card">
-      <div className="momentum-timeline-heading"><h2>Your application timeline</h2><div className="momentum-sort"><button onClick={() => setSortOpen(open => !open)} aria-expanded={sortOpen}>{sortBy === 'recent' ? 'Most recent' : 'Company'} <ChevronDown size={14} /></button>{sortOpen && <div><button onClick={() => { setSortBy('recent'); setSortOpen(false) }}>Most recent</button><button onClick={() => { setSortBy('company'); setSortOpen(false) }}>Company</button></div>}</div></div>
+      <div className="momentum-timeline-heading"><h2>Your application timeline</h2><div className="momentum-sort"><button onClick={() => setSortOpen(open => !open)} aria-expanded={sortOpen}>{sortBy === 'recent' ? 'Most recent' : 'Company'} <ChevronDown size={14} /></button>{sortOpen && <div><button onClick={() => { setSortBy('recent'); setPage(0); setSortOpen(false) }}>Most recent</button><button onClick={() => { setSortBy('company'); setPage(0); setSortOpen(false) }}>Company</button></div>}</div></div>
       {activities.length === 0 ? (
         <div className="momentum-timeline-empty"><Target size={20} /> Your application activity will appear here.</div>
       ) : (
         <div className="momentum-table">
-          {sortedActivities.slice(0, 5).map(activity => (
+          {pageActivities.map(activity => (
             <div className="momentum-row" key={activity.id}>
               <span className={`momentum-row-status ${activity.type === 'rejected' ? 'is-rejected' : 'is-complete'}`}>{activity.type === 'rejected' ? <X size={11} /> : <Check size={11} />}</span>
               <CompanyBadge company={activity.job?.company ?? 'Gmail'} />
@@ -123,6 +129,7 @@ function Timeline({ activities, onJobs }: { activities: Activity[]; onJobs: () =
           ))}
         </div>
       )}
+      {sortedActivities.length > pageSize && <div className="momentum-timeline-pagination"><button aria-label="Previous timeline page" disabled={currentPage === 0} onClick={() => setPage(value => Math.max(0, value - 1))}><ChevronLeft size={14} /></button><span>{currentPage + 1} / {pageCount}</span><button aria-label="Next timeline page" disabled={currentPage >= pageCount - 1} onClick={() => setPage(value => Math.min(pageCount - 1, value + 1))}><ChevronRight size={14} /></button></div>}
       <button className="momentum-link momentum-center-link" onClick={onJobs}>View full application history <ArrowRight size={15} /></button>
     </section>
   )
@@ -148,6 +155,14 @@ function WeekAtAGlance({ stats, onJobs }: { stats: DashboardData['stats']; onJob
       <button className="momentum-link" onClick={onJobs}>View full insights <ArrowRight size={15} /></button>
     </section>
   )
+}
+
+function JobNotifications({ recommendations, onReview }: { recommendations: DashboardRecommendation[]; onReview: () => void }) {
+  return <section className="momentum-side-card momentum-notifications-card">
+    <div className="momentum-side-title"><MailCheck size={19} /><div><h2>Job notifications</h2><p>{recommendations.length ? `${recommendations.length} new role${recommendations.length === 1 ? '' : 's'} from today’s subscriptions` : 'Today’s subscription emails appear here'}</p></div></div>
+    {recommendations.length === 0 ? <div className="momentum-side-empty"><MailCheck size={19} /> No new job subscriptions today.</div> : <div className="momentum-notification-list">{recommendations.map(job => <button className="momentum-notification" key={job.id} onClick={onReview}><span className="momentum-notification-icon"><BriefcaseBusiness size={15} /></span><span><strong>{job.role ?? 'Job recommendation'}</strong><small>{[job.company, job.location, job.platform].filter(Boolean).join(' · ') || 'Subscription job alert'}</small></span><ArrowRight size={14} /></button>)}</div>}
+    <button className="momentum-link" onClick={onReview}>Review job recommendations <ArrowRight size={15} /></button>
+  </section>
 }
 
 function ActionCard({ followUps, agentConfig, onJobs, onSettings, onUpdated }: {
@@ -208,16 +223,13 @@ export function DashboardPage() {
   const stats = data?.stats ?? { total: 0, saved: 0, applied: 0, inProgress: 0, interviews: 0, offers: 0, rejected: 0, thisWeek: 0 }
   const savedJobs = data?.savedJobs ?? []
   const activities = data?.activity ?? []
-  const pendingRecommendations = data?.pendingRecommendationCount ?? 0
+  const todayRecommendations = data?.todayRecommendations ?? []
 
   return (
     <div className="momentum-dashboard">
       <main className="momentum-content">
         {!data?.hasResume && !profilePromptDismissed && (
           <section className="momentum-profile-prompt"><FileText size={18} /><span>Add your resume to unlock tailored matches.</span><button onClick={() => navigate('resume')}>Add resume</button><button aria-label="Dismiss resume reminder" onClick={dismissProfilePrompt}><X size={15} /></button></section>
-        )}
-        {pendingRecommendations > 0 && (
-          <section className="momentum-profile-prompt"><MailCheck size={18} /><span>{pendingRecommendations} new job recommendation{pendingRecommendations === 1 ? '' : 's'} arrived in Gmail.</span><button onClick={() => navigate('gmail-recommendations')}>Review jobs</button></section>
         )}
         <header className="momentum-header">
           <div><span><Sparkles size={23} /></span><div><h1>Application Momentum</h1><p>Stay consistent, focus on quality, and keep moving forward.</p></div></div>
@@ -233,7 +245,7 @@ export function DashboardPage() {
         </header>
         <div className="momentum-layout">
           <div className="momentum-primary-column"><WeekGoal completed={stats.thisWeek} /><CoachCard hasResume={data?.hasResume ?? false} savedJobs={savedJobs.length} onAction={() => navigate(data?.hasResume ? 'jobs' : 'resume')} /><Timeline activities={activities} onJobs={() => navigate('jobs')} /></div>
-          <aside className="momentum-secondary-column"><MatchList jobs={savedJobs} threshold={data?.minMatchScore ?? 75} onReview={() => navigate('jobs')} /><WeekAtAGlance stats={stats} onJobs={() => navigate('jobs')} /><ActionCard followUps={data?.followUpsDue ?? []} agentConfig={data?.agentConfig ?? null} onJobs={() => navigate('jobs')} onSettings={() => navigate('settings')} onUpdated={refetch} /></aside>
+          <aside className="momentum-secondary-column"><MatchList jobs={savedJobs} threshold={data?.minMatchScore ?? 75} onReview={() => navigate('jobs')} /><JobNotifications recommendations={todayRecommendations} onReview={() => navigate('gmail-recommendations')} /><WeekAtAGlance stats={stats} onJobs={() => navigate('jobs')} /><ActionCard followUps={data?.followUpsDue ?? []} agentConfig={data?.agentConfig ?? null} onJobs={() => navigate('jobs')} onSettings={() => navigate('settings')} onUpdated={refetch} /></aside>
         </div>
       </main>
     </div>

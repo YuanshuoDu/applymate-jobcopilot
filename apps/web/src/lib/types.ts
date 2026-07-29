@@ -224,6 +224,15 @@ export interface DashboardSavedJob {
   url:       string | null
 }
 
+export interface DashboardRecommendation {
+  id:       string
+  platform: string | null
+  company:  string | null
+  role:     string | null
+  location: string | null
+  createdAt: string
+}
+
 export interface DashboardData {
   stats: {
     total:      number
@@ -241,6 +250,7 @@ export interface DashboardData {
   recentJobs:   Job[]
   activity:     Activity[]
   pendingRecommendationCount: number
+  todayRecommendations: DashboardRecommendation[]
   agentConfig:  AgentConfig | null
   minMatchScore: number
   hasResume:    boolean

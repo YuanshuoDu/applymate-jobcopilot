@@ -72,6 +72,9 @@
 .momentum-row time { width: 78px; color: #78809d; font-size: 10px; text-align: right; }
 .momentum-row button { display: inline-flex; align-items: center; gap: 5px; padding: 6px 8px; border: 1px solid #e4e3f3; border-radius: 7px; color: #5c6585; background: #fff; font: inherit; font-size: 10px; cursor: pointer; }
 .momentum-row-more { color: #68708f; }
+.momentum-timeline-pagination { display: flex; align-items: center; justify-content: flex-end; gap: 7px; margin-top: 12px; color: #727b99; font-size: 10px; }
+.momentum-timeline-pagination button { display: grid; place-items: center; width: 27px; height: 27px; padding: 0; border: 1px solid #e3e2f2; border-radius: 7px; color: #4a33f3; background: #fff; cursor: pointer; }
+.momentum-timeline-pagination button:disabled { color: #c2c5d5; cursor: default; }
 .momentum-center-link { justify-content: center; width: 100%; margin: 20px 0 0; }
 .momentum-timeline-empty { display: flex; align-items: center; justify-content: center; gap: 8px; min-height: 160px; color: #78809d; border-top: 1px solid #ebeaf5; border-bottom: 1px solid #ebeaf5; font-size: 11px; }
 
@@ -87,6 +90,17 @@
 .momentum-match-copy small { margin-top: 2px; }
 .momentum-side-empty { display: flex; align-items: center; gap: 9px; min-height: 150px; color: #78809d; font-size: 11px; line-height: 1.5; }
 .momentum-matches-card > .momentum-link { padding: 0 2px; }
+.momentum-notifications-card { display: grid; gap: 14px; }
+.momentum-notification-list { display: grid; gap: 7px; }
+.momentum-notification { display: flex; align-items: center; gap: 8px; width: 100%; padding: 8px; border: 1px solid #e9e8f8; border-radius: 8px; color: #4a33f3; background: #fff; font: inherit; text-align: left; cursor: pointer; }
+.momentum-notification:hover { border-color: #cbc5ff; background: #faf9ff; }
+.momentum-notification-icon { display: grid; place-items: center; width: 28px; height: 28px; flex: 0 0 28px; color: #573bf2; background: #f2f0ff; border-radius: 7px; }
+.momentum-notification > span:nth-child(2) { display: grid; min-width: 0; flex: 1; gap: 2px; }
+.momentum-notification strong, .momentum-notification small { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.momentum-notification strong { color: #303854; font-size: 10px; }
+.momentum-notification small { color: #78809d; font-size: 9px; }
+.momentum-notifications-card .momentum-side-empty { min-height: 56px; }
+.momentum-notifications-card > .momentum-link { margin-top: 1px; }
 .momentum-glance-card { padding-bottom: 20px; }
 .momentum-glance-card .momentum-side-title { margin-bottom: 22px; }
 .momentum-glance-line { align-items: center; gap: 13px; margin: 14px 0; }
