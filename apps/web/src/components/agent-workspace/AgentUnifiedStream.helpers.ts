@@ -61,25 +61,25 @@ export function liveBlockEvent(type: string, data: unknown, index: number): Agen
 
 export function jobComposerContext(job: ComposerJob) {
   return [
-    `使用这个职位作为上下文：${job.company} · ${job.role}`,
-    `地点：${job.location ?? '未填写'}；状态：${job.status}；评分：${job.score ?? '未评分'}`,
-    job.url ? `链接：${job.url}` : null,
-    '请基于这个职位继续分析、评分、准备申请或创建自动化。',
+    `Use this role as context: ${job.company} · ${job.role}`,
+    `Location: ${job.location ?? 'Not provided'}; status: ${job.status}; score: ${job.score ?? 'Not scored'}`,
+    job.url ? `Link: ${job.url}` : null,
+    'Use this role to continue analysis, scoring, application preparation, or automation setup.',
   ].filter(Boolean).join('\n')
 }
 
 export function resumeComposerContext(resume: ComposerResume) {
   return [
-    `使用这份简历作为上下文：${resume.name}${resume.isDefault ? '（默认）' : ''}`,
-    `简历类型：${resume.kind ?? 'base'}；更新时间：${new Date(resume.updatedAt).toLocaleDateString('en', { month: 'short', day: 'numeric' })}`,
-    '请结合这份简历评估职位匹配、生成求职材料或解释分数。',
+    `Use this resume as context: ${resume.name}${resume.isDefault ? ' (default)' : ''}`,
+    `Resume type: ${resume.kind ?? 'base'}; updated ${new Date(resume.updatedAt).toLocaleDateString('en', { month: 'short', day: 'numeric' })}`,
+    'Use this resume to evaluate a role match, generate application materials, or explain a score.',
   ].join('\n')
 }
 
 export function attachmentComposerContext(attachedFiles: ComposerAttachment[]) {
   if (attachedFiles.length === 0) return ''
   return [
-    '附件上下文（文件内容尚未上传解析，仅提供文件名和类型供你决定下一步）：',
+    'Attachment context (file contents have not been uploaded or parsed; file names and types are provided for your next step):',
     ...attachedFiles.map(file => `- ${file.name} (${formatBytes(file.size)} · ${file.type})`),
   ].join('\n')
 }

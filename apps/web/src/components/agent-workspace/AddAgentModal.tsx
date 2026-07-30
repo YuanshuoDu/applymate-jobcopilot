@@ -79,7 +79,7 @@ export function AddAgentModal({ onClose, onCreated }: {
 
   async function handleCreate() {
     if (!name.trim()) {
-      toast.error('请填写名称', '')
+      toast.error('Name required', 'Give this Agent a clear name before creating it.')
       return
     }
 
@@ -92,16 +92,16 @@ export function AddAgentModal({ onClose, onCreated }: {
       })
 
       if (!res.ok) {
-        toast.error('创建失败', await res.text())
+        toast.error('Could not create Agent', await res.text())
         return
       }
 
       const data = await res.json()
       onCreated(data.data ?? data)
-      toast.success('自定义 Agent 已创建', `「${name}」将在 ${insertAfter} 阶段后运行`)
+      toast.success('Custom Agent created', `${name} will run after the ${insertAfter} stage.`)
       onClose()
     } catch (error) {
-      toast.error('创建失败', (error as Error).message || 'Network request failed.')
+      toast.error('Could not create Agent', (error as Error).message || 'Network request failed.')
     } finally {
       setSaving(false)
     }
@@ -140,14 +140,14 @@ export function AddAgentModal({ onClose, onCreated }: {
         overflow: 'hidden',
       }} onClick={event => event.stopPropagation()}>
         <div style={{ padding: '14px 18px', background: 'var(--bg-secondary)', borderBottom: '0.5px solid var(--border)', display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
-          <div style={{ fontSize: 13, fontWeight: 600 }}>＋ 添加自定义 Agent</div>
+          <div style={{ fontSize: 13, fontWeight: 600 }}>＋ Add custom Agent</div>
           <button onClick={onClose} style={{ background: 'none', border: 'none', cursor: 'pointer', fontSize: 16, color: 'var(--text-muted)' }}>✕</button>
         </div>
 
         <div style={{ padding: '16px 18px', display: 'flex', flexDirection: 'column', gap: 12 }}>
           <div style={{ display: 'flex', gap: 10, alignItems: 'flex-start' }}>
             <div>
-              <div style={{ fontSize: 10, color: 'var(--text-muted)', marginBottom: 5 }}>图标</div>
+              <div style={{ fontSize: 10, color: 'var(--text-muted)', marginBottom: 5 }}>Icon</div>
               <div style={{ display: 'flex', flexWrap: 'wrap', gap: 4, width: 110 }}>
                 {EMOJI_OPTIONS.map(option => (
                   <button key={option} onClick={() => setIcon(option)} style={{
@@ -168,19 +168,19 @@ export function AddAgentModal({ onClose, onCreated }: {
               </div>
             </div>
             <div style={{ flex: 1 }}>
-              <div style={{ fontSize: 10, color: 'var(--text-muted)', marginBottom: 5 }}>名称 *</div>
-              <input value={name} onChange={event => setName(event.target.value)} placeholder="例如：Remote Filter" style={inputStyle} autoFocus />
-              <div style={{ fontSize: 10, color: 'var(--text-muted)', marginTop: 8, marginBottom: 5 }}>描述（可选）</div>
-              <input value={description} onChange={event => setDescription(event.target.value)} placeholder="简短说明此 Agent 的职责" style={inputStyle} />
+              <div style={{ fontSize: 10, color: 'var(--text-muted)', marginBottom: 5 }}>Name *</div>
+              <input value={name} onChange={event => setName(event.target.value)} placeholder="e.g. Remote Filter" style={inputStyle} autoFocus />
+              <div style={{ fontSize: 10, color: 'var(--text-muted)', marginTop: 8, marginBottom: 5 }}>Description (optional)</div>
+              <input value={description} onChange={event => setDescription(event.target.value)} placeholder="A short description of this Agent's responsibility" style={inputStyle} />
             </div>
           </div>
 
           <div>
-            <div style={{ fontSize: 10, color: 'var(--text-muted)', marginBottom: 5 }}>System Prompt（告诉 Agent 怎么分析）</div>
+            <div style={{ fontSize: 10, color: 'var(--text-muted)', marginBottom: 5 }}>System prompt (how the Agent should reason)</div>
             <textarea
               value={systemPrompt}
               onChange={event => setSystemPrompt(event.target.value)}
-              placeholder={'例如：\n你是一个远程工作过滤专家。对于每个职位，判断它是否支持远程工作。\n如果不支持，说明原因。'}
+              placeholder={'e.g.\nYou are a remote-work screening specialist. For every role, decide whether it supports remote work.\nIf it does not, explain why.'}
               rows={4}
               style={{ ...inputStyle, resize: 'vertical', lineHeight: 1.6 }}
             />
@@ -188,11 +188,11 @@ export function AddAgentModal({ onClose, onCreated }: {
 
           <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10 }}>
             <div>
-              <div style={{ fontSize: 10, color: 'var(--text-muted)', marginBottom: 5 }}>AI 模型</div>
+              <div style={{ fontSize: 10, color: 'var(--text-muted)', marginBottom: 5 }}>AI model</div>
               <ModelSelect provider={provider} model={model} onChange={(nextProvider, nextModel) => { setProvider(nextProvider); setModel(nextModel) }} />
             </div>
             <div>
-              <div style={{ fontSize: 10, color: 'var(--text-muted)', marginBottom: 5 }}>插入在哪个阶段之后</div>
+              <div style={{ fontSize: 10, color: 'var(--text-muted)', marginBottom: 5 }}>Run after stage</div>
               <select value={insertAfter} onChange={event => setInsertAfter(event.target.value)} style={{ ...inputStyle, cursor: 'pointer' }}>
                 {BUILTIN_STAGE_KEYS.map(key => (
                   <option key={key} value={key}>{key}</option>
@@ -203,9 +203,9 @@ export function AddAgentModal({ onClose, onCreated }: {
         </div>
 
         <div style={{ padding: '12px 18px', borderTop: '0.5px solid var(--border)', display: 'flex', gap: 8, justifyContent: 'flex-end' }}>
-          <Btn variant="ghost" onClick={onClose}>取消</Btn>
+          <Btn variant="ghost" onClick={onClose}>Cancel</Btn>
           <Btn variant="primary" onClick={handleCreate} disabled={saving || !name.trim()}>
-            {saving ? '创建中…' : '✓ 创建 Agent'}
+            {saving ? 'Creating…' : '✓ Create Agent'}
           </Btn>
         </div>
       </div>

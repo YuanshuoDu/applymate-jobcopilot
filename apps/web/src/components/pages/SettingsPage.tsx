@@ -52,9 +52,9 @@ function SettingsSection({ title, children }: { title: string; children: React.R
 
 function FieldRow({ label, children }: { label: string; children: React.ReactNode }) {
   return (
-    <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12, padding: '8px 0', borderBottom: '1px solid var(--border)', flexWrap: 'wrap' }}>
+    <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'flex-start', gap: 12, padding: '8px 0', borderBottom: '1px solid var(--border)', flexWrap: 'wrap' }}>
       <span style={{ fontSize: 12, color: 'var(--text-muted)', flexShrink: 0, minWidth: 130 }}>{label}</span>
-      <div style={{ display: 'flex', justifyContent: 'flex-end', flex: 1, minWidth: 0 }}>{children}</div>
+      <div style={{ display: 'flex', justifyContent: 'flex-start', flex: 1, minWidth: 0 }}>{children}</div>
     </div>
   )
 }
