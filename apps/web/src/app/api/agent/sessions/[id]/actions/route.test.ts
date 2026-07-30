@@ -347,7 +347,7 @@ describe("agent session actions API", () => {
   it('prepares the assisted application only after the Reviewer confirmation binds the final resume', async () => {
     mocks.approvalFindFirst.mockResolvedValueOnce({ type: 'confirm_tailored_resume', payload: { resumeId: 'resume_tailored', jobId: 'job_1' } })
     mocks.resumeFindFirst.mockResolvedValueOnce({ id: 'resume_tailored', name: 'Tailored for N26' })
-    mocks.jobFindFirst.mockResolvedValueOnce({ id: 'job_1', company: 'N26', role: 'Backend Engineer', url: 'https://jobs.example/apply', status: 'review' })
+    mocks.jobFindFirst.mockResolvedValueOnce({ id: 'job_1', company: 'N26', role: 'Backend Engineer', url: 'https://jobs.example/apply', status: 'saved' })
     mocks.jobUpdate.mockResolvedValue({})
     mocks.transcriptCreate.mockResolvedValueOnce({ id: 'event_ready', sessionId: 'session_1', taskId: null, type: 'resume_finalized', speaker: 'Reviewer', title: 'Application pack ready', body: 'Ready', data: {}, durationMs: null, createdAt: new Date('2026-06-18T10:03:00Z') })
     const { POST } = await import('./route')
@@ -358,7 +358,7 @@ describe("agent session actions API", () => {
     await expect(res.json()).resolves.toMatchObject({ event: { type: 'resume_finalized', title: 'Application pack ready' } })
     expect(mocks.enqueueApplyTask).not.toHaveBeenCalled()
     expect(mocks.jobUpdate).toHaveBeenCalledWith({ where: { id: 'job_1' }, data: expect.objectContaining({
-      finalResumeId: 'resume_tailored', status: 'review', analysisNote: expect.stringContaining('extension'),
+      finalResumeId: 'resume_tailored', status: 'saved', workflowState: 'ready_to_apply', analysisNote: expect.stringContaining('extension'),
     }) })
   })
 

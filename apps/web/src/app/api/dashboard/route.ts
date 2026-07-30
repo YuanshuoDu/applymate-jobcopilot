@@ -28,15 +28,20 @@ export async function GET(request: Request) {
   const rangeStart = getDateParam(params.get('from'), defaultStart)
   const rangeEnd = getDateParam(params.get('to'), defaultEnd, true)
   const todayEnd = new Date()
+  const todayStart = new Date()
+  todayStart.setHours(0, 0, 0, 0)
   todayEnd.setHours(23, 59, 59, 999)
 
-  const [statusGroups, thisWeek, followUpsDue, agentConfig, recentJobs, activity, resumeCount] = await Promise.all([
+  const [statusGroups, applicationRows, followUpsDue, agentConfig, recentJobs, activity, resumeCount, pendingRecommendationCount, todayRecommendations, interviewsScheduled] = await Promise.all([
     db.job.groupBy({
       by: ['status'],
       where: { userId },
       _count: { status: true },
     }),
-    db.job.count({ where: { userId, appliedAt: { gte: rangeStart, lte: rangeEnd } } }),
+    db.job.findMany({
+      where: { userId, appliedAt: { gte: rangeStart, lte: rangeEnd } },
+      select: { appliedAt: true },
+    }),
     db.job.findMany({
       where: { userId, followUpAt: { lte: todayEnd } },
       select: { id: true, company: true, role: true, status: true, followUpAt: true },
@@ -45,12 +50,35 @@ export async function GET(request: Request) {
     }),
     db.agentConfig.findUnique({ where: { userId } }),
     db.job.findMany({
-      where: { userId, status: { in: ['applied', 'review', 'interview', 'offer', 'rejected'] } },
+      where: { userId, status: { in: ['applied', 'interview', 'offer', 'rejected'] } },
       orderBy: { updatedAt: 'desc' },
       take: 5,
     }),
-    db.activity.findMany({ where: { userId }, orderBy: { createdAt: 'desc' }, take: 8 }),
+    db.activity.findMany({
+      where: { userId },
+      orderBy: { createdAt: 'desc' },
+      take: 100,
+      include: { job: { select: { company: true, role: true } } },
+    }),
     db.resume.count({ where: { userId } }),
+    db.gmailRecommendation.count({ where: { userId, status: 'pending' } }).catch(() => 0),
+    db.gmailRecommendation.findMany({
+      where: { userId, status: 'pending', sourceMessage: { receivedAt: { gte: todayStart, lte: todayEnd } } },
+      select: { id: true, platform: true, company: true, role: true, location: true, createdAt: true },
+      orderBy: { createdAt: 'desc' },
+      take: 4,
+    }).catch(() => []),
+    db.gmailMessage.findMany({
+      where: { userId, kind: 'interview_invitation', scheduledAt: { gte: rangeStart, lte: rangeEnd } },
+      select: { id: true, inferredCompany: true, inferredRole: true, scheduledAt: true, job: { select: { company: true, role: true } } },
+      orderBy: { scheduledAt: 'asc' },
+      take: 8,
+    }).then(messages => messages.flatMap(message => message.scheduledAt ? [{
+      id: message.id,
+      company: message.job?.company ?? message.inferredCompany,
+      role: message.job?.role ?? message.inferredRole,
+      scheduledAt: message.scheduledAt,
+    }] : [])).catch(() => []),
   ])
 
   const pipeline: Record<string, number> = {}
@@ -59,9 +87,16 @@ export async function GET(request: Request) {
   }
 
   const total      = Object.values(pipeline).reduce((a, b) => a + b, 0)
+  const applicationDays = [...applicationRows.reduce((days, job) => {
+    if (!job.appliedAt) return days
+    const date = job.appliedAt.toISOString().slice(0, 10)
+    days.set(date, (days.get(date) ?? 0) + 1)
+    return days
+  }, new Map<string, number>())].map(([date, count]) => ({ date, count }))
+  const thisWeek   = applicationRows.length
   const saved      = pipeline.saved      ?? 0
   const applied    = pipeline.applied    ?? 0
-  const inProgress = (pipeline.review ?? 0) + (pipeline.interview ?? 0)
+  const inProgress = applied + (pipeline.interview ?? 0)
   const interviews = pipeline.interview  ?? 0
   const offers     = pipeline.offer      ?? 0
   const rejected   = pipeline.rejected   ?? 0
@@ -84,6 +119,10 @@ export async function GET(request: Request) {
     savedJobs,
     recentJobs,
     activity,
+    applicationDays,
+    interviewsScheduled,
+    pendingRecommendationCount,
+    todayRecommendations,
     agentConfig,
     minMatchScore,
     hasResume: resumeCount > 0,

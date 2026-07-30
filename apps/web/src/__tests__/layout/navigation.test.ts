@@ -25,4 +25,9 @@ describe('app navigation', () => {
     expect(getNotificationTargetPage('apply_submitted')).toBe('jobs')
     expect(getNotificationTargetPage('message_received')).toBeNull()
   })
+
+  it('routes Gmail recommendations to their review queue and application alerts to Gmail', () => {
+    expect(getNotificationTargetPage('gmail_recommendations')).toBe('gmail-recommendations')
+    expect(getNotificationTargetPage('gmail_application_update')).toBe('gmail')
+  })
 })

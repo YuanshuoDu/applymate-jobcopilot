@@ -21,6 +21,7 @@ const JobsPage = dynamic(() => import('@/components/pages/JobsPage').then(module
 const SearchPage = dynamic(() => import('@/components/pages/SearchPage').then(module => module.SearchPage), { loading: PageLoading })
 const ResumePage = dynamic(() => import('@/components/pages/ResumePage').then(module => module.ResumePage), { loading: PageLoading })
 const GmailPage = dynamic(() => import('@/components/pages/GmailPage').then(module => module.GmailPage), { loading: PageLoading })
+const JobRecommendationsPage = dynamic(() => import('@/components/pages/JobRecommendationsPage').then(module => module.JobRecommendationsPage), { loading: PageLoading })
 const AgentPlaygroundPage = dynamic(() => import('@/components/pages/AgentPlaygroundPage').then(module => module.AgentPlaygroundPage), { loading: PageLoading })
 const AgentHistoryPage = dynamic(() => import('@/components/pages/AgentHistoryPage').then(module => module.AgentHistoryPage), { loading: PageLoading })
 const SettingsPage = dynamic(() => import('@/components/pages/SettingsPage').then(module => module.SettingsPage), { loading: PageLoading })
@@ -32,6 +33,7 @@ const PAGE_PRELOADERS: Record<Page, () => Promise<unknown>> = {
   search: () => import('@/components/pages/SearchPage'),
   resume: () => import('@/components/pages/ResumePage'),
   gmail: () => import('@/components/pages/GmailPage'),
+  'gmail-recommendations': () => import('@/components/pages/JobRecommendationsPage'),
   agent: () => import('@/components/pages/AgentPlaygroundPage'),
   'agent-history': () => import('@/components/pages/AgentHistoryPage'),
   settings: () => import('@/components/pages/SettingsPage'),
@@ -70,6 +72,7 @@ const PAGES: Record<Page, React.ComponentType> = {
   search:    SearchPage,
   resume:    ResumePage,
   gmail:     GmailPage,
+  'gmail-recommendations': JobRecommendationsPage,
   agent:     AgentPlaygroundPage,
   'agent-history': AgentHistoryPage,
   settings:  SettingsPage,
@@ -77,6 +80,8 @@ const PAGES: Record<Page, React.ComponentType> = {
 }
 
 export function getNotificationTargetPage(type: string): Page | null {
+  if (type === 'gmail_recommendations') return 'gmail-recommendations'
+  if (type.startsWith('gmail_')) return 'gmail'
   return type.startsWith('apply_') ? 'jobs' : null
 }
 
@@ -176,16 +181,6 @@ export function AppShell() {
     writePageToUrl(nextPage, mode)
   }, [prefetchPage])
   const navContextValue = useMemo(() => ({ navigate: navigatePage }), [navigatePage])
-
-  useEffect(() => {
-    if (!sidebarPopover) return
-    const dismissOutsideSidebar = (event: MouseEvent) => {
-      const target = event.target
-      if (!(target instanceof Element) || !target.closest('#desktop-sidebar')) setSidebarPopover(null)
-    }
-    document.addEventListener('mousedown', dismissOutsideSidebar)
-    return () => document.removeEventListener('mousedown', dismissOutsideSidebar)
-  }, [sidebarPopover])
 
   useEffect(() => {
     if (status !== 'authenticated') { setCheckingOnboard(false); return }
@@ -386,7 +381,7 @@ export function AppShell() {
             <div style={{ display: 'flex', height: '100vh', overflow: 'hidden' }}>
               <div id="desktop-sidebar">
                 <Sidebar
-                  active={page}
+                  active={page === 'gmail-recommendations' ? 'gmail' : page}
                   onNav={navigatePage}
                   onNavIntent={prefetchPage}
                   session={session}
@@ -425,7 +420,7 @@ export function AppShell() {
                   style={{
                     display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 3,
                     flex: 1, padding: '6px 0', border: 'none', background: 'transparent', cursor: 'pointer',
-                    color: page === item.id ? 'var(--primary)' : 'var(--text-muted)',
+                    color: (page === 'gmail-recommendations' ? 'gmail' : page) === item.id ? 'var(--primary)' : 'var(--text-muted)',
                     fontSize: 10, fontFamily: 'inherit', position: 'relative',
                   }}>
                   <span aria-hidden="true" style={{ fontSize: 18 }}>{MOB_ICONS[item.id]}</span>

@@ -98,6 +98,9 @@ model User {
   apiKeys        UserApiKeys?
   personaFacts   PersonaFact[]
   personaEvidenceChunks PersonaEvidenceChunk[]
+  gmailSyncState GmailSyncState?
+  gmailMessages  GmailMessage[]
+  gmailRecommendations GmailRecommendation[]
 }
 
 enum Plan {
@@ -125,6 +128,7 @@ model Job {
   keywords     String?   @db.Text  // ATS keywords extracted from JD during scoring
   appliedAt    DateTime?
   followUpAt  DateTime?
+  workflowState JobWorkflowState @default(draft)
   createdAt   DateTime  @default(now())
   updatedAt   DateTime  @updatedAt
 
@@ -139,6 +143,8 @@ model Job {
   finalCoverLetter CoverLetter?  @relation("JobFinalCL",       fields: [finalCoverLetterId], references: [id], onDelete: SetNull)
   adaptedResumes   Resume[]      @relation("JobAdaptedResumes")
   coverLetters     CoverLetter[]
+  gmailMessages    GmailMessage[]
+  savedRecommendations GmailRecommendation[] @relation("SavedGmailRecommendations")
 
   @@index([userId, status])
   @@index([userId, createdAt(sort: Desc)])
@@ -147,10 +153,17 @@ model Job {
 enum JobStatus {
   saved
   applied
-  review
   interview
   offer
   rejected
+}
+
+// Internal preparation state. This is deliberately separate from the
+// candidate-facing lifecycle in JobStatus.
+enum JobWorkflowState {
+  draft
+  ready_to_apply
+  submitted
 }
 
 model Resume {
@@ -434,6 +447,97 @@ model Notification {
 
   @@index([userId, createdAt(sort: Desc)])
   @@map("notifications")
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Gmail application evidence and recommendation inbox
+// ─────────────────────────────────────────────────────────────────────────────
+
+model GmailSyncState {
+  id           String   @id @default(cuid())
+  userId       String   @unique @map("user_id")
+  lastSyncedAt DateTime? @map("last_synced_at")
+  lastError    String?  @db.Text @map("last_error")
+  createdAt    DateTime @default(now()) @map("created_at")
+  updatedAt    DateTime @updatedAt @map("updated_at")
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@map("gmail_sync_states")
+}
+
+enum GmailMessageKind {
+  application_received
+  interview_invitation
+  offer
+  rejection
+  application_update
+  recommendation_digest
+  other
+}
+
+model GmailMessage {
+  id              String           @id @default(cuid())
+  userId          String           @map("user_id")
+  gmailMessageId  String           @map("gmail_message_id")
+  gmailThreadId   String?          @map("gmail_thread_id")
+  kind            GmailMessageKind
+  senderEmail     String?          @map("sender_email")
+  senderName      String?          @map("sender_name")
+  subject         String
+  excerpt         String?          @db.Text
+  inferredCompany String?          @map("inferred_company")
+  inferredRole    String?          @map("inferred_role")
+  receivedAt      DateTime         @map("received_at")
+  scheduledAt     DateTime?        @map("scheduled_at")
+  jobId           String?          @map("job_id")
+  matchConfidence Float?           @map("match_confidence")
+  manuallyLinked  Boolean          @default(false) @map("manually_linked")
+  processedAt     DateTime?        @map("processed_at")
+  createdAt       DateTime         @default(now()) @map("created_at")
+  updatedAt       DateTime         @updatedAt @map("updated_at")
+
+  user            User                  @relation(fields: [userId], references: [id], onDelete: Cascade)
+  job             Job?                  @relation(fields: [jobId], references: [id], onDelete: SetNull)
+  recommendations GmailRecommendation[]
+
+  @@unique([userId, gmailMessageId])
+  @@index([userId, receivedAt(sort: Desc)])
+  @@index([userId, kind, scheduledAt])
+  @@index([userId, jobId, receivedAt(sort: Desc)])
+  @@map("gmail_messages")
+}
+
+enum GmailRecommendationStatus {
+  pending
+  saved
+  dismissed
+}
+
+model GmailRecommendation {
+  id              String                    @id @default(cuid())
+  userId          String                    @map("user_id")
+  sourceMessageId String                    @map("source_message_id")
+  platform        String?
+  company         String?
+  role            String?
+  location        String?
+  salary          String?
+  url             String?                   @db.Text
+  description     String?                   @db.Text
+  fingerprint     String
+  status          GmailRecommendationStatus @default(pending)
+  savedJobId      String?                   @map("saved_job_id")
+  createdAt       DateTime                  @default(now()) @map("created_at")
+  updatedAt       DateTime                  @updatedAt @map("updated_at")
+
+  user          User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+  sourceMessage GmailMessage @relation(fields: [sourceMessageId], references: [id], onDelete: Cascade)
+  savedJob      Job?         @relation("SavedGmailRecommendations", fields: [savedJobId], references: [id], onDelete: SetNull)
+
+  @@unique([userId, fingerprint])
+  @@index([userId, status, createdAt(sort: Desc)])
+  @@map("gmail_recommendations")
 }
 
 // ─────────────────────────────────────────────

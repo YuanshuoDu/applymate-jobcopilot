@@ -43,11 +43,13 @@ export async function runExecute(
     })
 
     try {
-      // Mark as 'review' so it appears in the user's queue (not auto-marked 'applied')
+      // Preparation is internal workflow state, not evidence that an employer
+      // reviewed or received an application.
       await db.job.update({
         where: { id: pkg.job.id },
         data:  {
-          status:       'review',
+          status:       'saved',
+          workflowState: 'ready_to_apply',
           analysisNote: `[申请就绪] 匹配分 ${pkg.score}%。${pkg.recommendation ?? ''}`,
         },
       })

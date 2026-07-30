@@ -9,7 +9,6 @@ export { UserAvatar } from './UserAvatar'
 export const STATUS_CONFIG: Record<JobStatus, { label: string; color: string; bg: string; glow: string }> = {
   saved:     { label: 'Saved',      color: '#64748B', bg: 'rgba(100,116,139,0.12)', glow: 'rgba(100,116,139,0.20)' },
   applied:   { label: 'Applied',    color: '#4F46E5', bg: 'rgba(79,70,229,0.12)',   glow: 'rgba(79,70,229,0.22)'  },
-  review:    { label: 'In Review',  color: '#D97706', bg: 'rgba(217,119,6,0.12)',   glow: 'rgba(217,119,6,0.22)'  },
   interview: { label: 'Interview',  color: '#059669', bg: 'rgba(5,150,105,0.12)',   glow: 'rgba(5,150,105,0.22)'  },
   offer:     { label: 'Offer',      color: '#0284C7', bg: 'rgba(2,132,199,0.12)',   glow: 'rgba(2,132,199,0.22)'  },
   rejected:  { label: 'Rejected',   color: '#DC2626', bg: 'rgba(220,38,38,0.10)',   glow: 'rgba(220,38,38,0.20)'  },

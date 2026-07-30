@@ -274,7 +274,8 @@ export async function POST(req: NextRequest, ctx: RouteCtx) {
     if (job.status === 'applied') return err('This job has already been submitted.', 409)
     await db.job.update({ where: { id: job.id }, data: {
       finalResumeId: resume.id,
-      status: 'review',
+      status: 'saved',
+      workflowState: 'ready_to_apply',
       analysisNote: job.url
         ? '[Application ready] Open the employer form, use the ApplyMate extension to fill it, then review and submit it yourself.'
         : '[Application ready] Missing application URL.',

@@ -29,12 +29,11 @@ export async function POST(req: NextRequest) {
   if (!subject && !emailBody) return err('subject or emailBody is required')
 
   const contextHints: Record<string, string> = {
-    interview: 'The sender has invited me to an interview or wants to schedule a call. I want to confirm availability and express enthusiasm.',
+    interview_invitation: 'The sender has invited me to an interview or wants to schedule a call. I want to confirm availability and express enthusiasm.',
     offer:     'I received a job offer. I want to express gratitude, enthusiasm, and ask about next steps.',
-    rejected:  'I received a rejection. I want to respond graciously, thank them for their consideration, and optionally ask for feedback.',
-    review:    'My application is under review. I want to politely follow up on my application status.',
-    received:  'My application was acknowledged. I want to follow up and reiterate my strong interest in the position.',
-    viewed:    'My profile was viewed. I want to proactively reach out and express interest.',
+    rejection:  'I received a rejection. I want to respond graciously, thank them for their consideration, and optionally ask for feedback.',
+    application_update: 'The employer sent an application update. I want to politely follow up on my application status.',
+    application_received: 'My application was acknowledged. I want to follow up and reiterate my strong interest in the position.',
   }
   const context = contextHints[tag] ?? 'This is a job-related email. I want to send a professional follow-up reply.'
 

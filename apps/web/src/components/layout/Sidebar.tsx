@@ -79,13 +79,20 @@ export function Sidebar({ active, onNav, onNavIntent, session, jobCount: jobCoun
   }, [accountMenuOpen, userPlan])
 
   useEffect(() => {
-    if (!accountMenuOpen) return
-    const closeOnOutsidePointer = (event: MouseEvent) => {
+    if (!accountMenuOpen && !notificationPanel) return
+    const closeOnOutsidePointer = (event: PointerEvent) => {
       if (!accountAreaRef.current?.contains(event.target as Node)) onDismissSidebarPopovers()
     }
-    document.addEventListener('mousedown', closeOnOutsidePointer)
-    return () => document.removeEventListener('mousedown', closeOnOutsidePointer)
-  }, [accountMenuOpen, onDismissSidebarPopovers])
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') onDismissSidebarPopovers()
+    }
+    document.addEventListener('pointerdown', closeOnOutsidePointer)
+    document.addEventListener('keydown', closeOnEscape)
+    return () => {
+      document.removeEventListener('pointerdown', closeOnOutsidePointer)
+      document.removeEventListener('keydown', closeOnEscape)
+    }
+  }, [accountMenuOpen, notificationPanel, onDismissSidebarPopovers])
 
   const plan = userPlan ?? (user as { plan?: string } | undefined)?.plan ?? 'free'
   const planLabel = plan === 'enterprise' ? 'Team Plan' : plan === 'pro' ? 'Pro Plan' : 'Free Plan'
@@ -142,7 +149,7 @@ export function Sidebar({ active, onNav, onNavIntent, session, jobCount: jobCoun
               </span>
             )}
             {item.id === 'gmail' && gmailUnread != null && gmailUnread > 0 && (
-              <span style={{ marginLeft: 'auto', fontSize: 10, background: 'rgba(163,45,45,0.12)', color: '#A32D2D', borderRadius: 999, padding: '1px 6px', fontWeight: 600 }}>{gmailUnread}</span>
+              <span style={{ marginLeft: 'auto', fontSize: 10, background: 'rgba(79,70,229,0.12)', color: 'var(--primary)', borderRadius: 999, padding: '1px 6px', fontWeight: 600 }}>{gmailUnread}</span>
             )}
             {item.id === 'agent' && (
               <span style={{ marginLeft: 'auto', width: 6, height: 6, borderRadius: '50%', background: '#22C55E', flexShrink: 0 }} />

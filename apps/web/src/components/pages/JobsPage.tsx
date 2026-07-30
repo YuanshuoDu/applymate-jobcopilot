@@ -2,30 +2,45 @@
 
 import React, { useMemo, useState, useEffect, useRef, useCallback } from 'react'
 import { useSession } from 'next-auth/react'
-import { Bookmark, Check, ChevronDown, ChevronRight, Clock3, FileText, Info, LayoutGrid, Link2, List, LoaderCircle, Lock, Search, Sparkles, Trash2, UsersRound, X } from 'lucide-react'
+import { Bookmark, Check, ChevronDown, ChevronRight, FileText, Info, LayoutGrid, Link2, List, LoaderCircle, Lock, Search, Sparkles, Trash2, UsersRound, X } from 'lucide-react'
 import { Btn, Card, CompanyLogo, INPUT_STYLE, ScorePill, StatusBadge, useToast, useConfirm } from '@/components/ui'
 import { ResumeRenderer } from '@/components/resume/ResumeRenderer'
 import { CoverLetterPreview } from '@/components/coverletter/CoverLetterPanel'
-import type { ApplicationAudit, ApplicationAuditFinding, CoverLetter, Job, JobStatus, Activity, Resume, ResumeListItem } from '@/lib/types'
+import type { ApplicationAudit, ApplicationAuditFinding, CoverLetter, Job, JobStatus, JobStatusCounts, Activity, Resume, ResumeListItem } from '@/lib/types'
 import { apiMutate, fmtDate, fmtRelative, useApi } from '@/lib/hooks'
 import { setCachedApiResponse } from '@/lib/api-cache'
 import { useNav } from '@/lib/nav-context'
 import { exportApplicationPackLocally } from '@/lib/bundle'
 
-const KANBAN_COLS: JobStatus[] = ['saved', 'applied', 'review', 'interview', 'offer', 'rejected']
+const KANBAN_COLS: JobStatus[] = ['saved', 'applied', 'interview', 'offer', 'rejected']
 const COL_LABELS: Record<JobStatus, string> = {
-  saved: 'Saved', applied: 'Applied', review: 'In Review',
+  saved: 'Saved', applied: 'Applied',
   interview: 'Interview', offer: 'Offer', rejected: 'Rejected',
 }
 const COL_COLORS: Record<JobStatus, string> = {
-  saved: '#6B7280', applied: '#185FA5', review: '#854F0B',
+  saved: '#6B7280', applied: '#185FA5',
   interview: '#3B6D11', offer: '#0E7490', rejected: '#A32D2D',
+}
+
+const EMPTY_STATUS_COUNTS: JobStatusCounts = {
+  saved: 0,
+  applied: 0,
+  interview: 0,
+  offer: 0,
+  rejected: 0,
 }
 
 interface JobsPageCache {
   userId: string
   jobs: Job[]
   total: number
+  statusCounts: JobStatusCounts
+}
+
+interface JobsListResponse {
+  jobs?: Job[]
+  total?: number
+  statusCounts?: JobStatusCounts
 }
 
 // Preserve the default list while the latest version is fetched after returning
@@ -126,7 +141,7 @@ function ListView({ jobs, onRowClick, selectedIds, onToggle, onToggleAll }: {
                 </div>
               </td>
               <td style={{ padding: '10px 16px' }}>
-                <div style={{ fontSize: 12, color: 'var(--text-muted)' }}>{j.role}</div>
+                <div style={{ fontSize: 15, fontWeight: 700, lineHeight: 1.3, letterSpacing: '-0.01em', color: 'var(--text)' }}>{j.role}</div>
                 {j.keywords ? (() => {
                   const kws = j.keywords.split(',').map(k => k.trim()).filter(Boolean).slice(0, 8)
                   return kws.length > 0 ? (
@@ -228,7 +243,7 @@ function KanbanView({ jobs, onStatusChange, onAddClick }: {
                 </div>
                 {job.score != null && <ScorePill score={job.score} />}
               </div>
-              <div style={{ fontSize: 11, color: 'var(--text-muted)', marginBottom: 4 }}>{job.role}</div>
+              <div style={{ marginBottom: 6, color: 'var(--text)', fontSize: 14, fontWeight: 700, lineHeight: 1.3, letterSpacing: '-0.01em' }}>{job.role}</div>
               {job.keywords ? (() => {
                 const kws = job.keywords.split(',').map(k => k.trim()).filter(Boolean).slice(0, 6)
                 return kws.length > 0 ? (
@@ -1252,6 +1267,7 @@ export function JobsPage() {
   const [prefillStatus, setPrefillStatus] = useState<JobStatus | null>(null)
   const [jobs,         setJobs        ] = useState<Job[]>(() => cachedJobs?.jobs ?? [])
   const [total,        setTotal       ] = useState(() => cachedJobs?.total ?? 0)
+  const [statusCounts, setStatusCounts] = useState<JobStatusCounts>(() => cachedJobs?.statusCounts ?? EMPTY_STATUS_COUNTS)
   const [loading,      setLoading     ] = useState(() => cachedJobs === null)
   const [fetchError,   setFetchError  ] = useState<string | null>(null)
   const [selectedJob,  setSelectedJob ] = useState<Job | null>(null)
@@ -1286,14 +1302,16 @@ export function JobsPage() {
         if (search)                params.set('q',      search)
         if (filterStatus !== 'all') params.set('status', filterStatus)
         const res  = await fetch(`/api/jobs?${params}`, { signal: controller.signal })
-        const json = await res.json()
+        const json = await res.json() as JobsListResponse
         if (!cancelled) {
           const rawJobs: Job[] = json.jobs ?? []
           const sorted = sortJobs(rawJobs, sortByRef.current, sortDirRef.current)
           const nextTotal = json.total ?? 0
-          if (isDefaultView) defaultJobsCache = { userId, jobs: sorted, total: nextTotal }
+          const nextStatusCounts = json.statusCounts ?? EMPTY_STATUS_COUNTS
+          if (isDefaultView) defaultJobsCache = { userId, jobs: sorted, total: nextTotal, statusCounts: nextStatusCounts }
           setJobs(sorted)
           setTotal(nextTotal)
+          setStatusCounts(nextStatusCounts)
         }
       } catch (error) {
         if (error instanceof DOMException && error.name === 'AbortError') return
@@ -1341,8 +1359,16 @@ export function JobsPage() {
   }, [loading, jobs])
 
   async function handleStatusChange(jobId: string, newStatus: JobStatus) {
+    const previousStatus = jobs.find(job => job.id === jobId)?.status
     // Optimistic update
     setJobs(prev => prev.map(j => j.id === jobId ? { ...j, status: newStatus } : j))
+    if (previousStatus && previousStatus !== newStatus) {
+      setStatusCounts(previous => ({
+        ...previous,
+        [previousStatus]: Math.max(0, previous[previousStatus] - 1),
+        [newStatus]: previous[newStatus] + 1,
+      }))
+    }
     const { error } = await apiMutate(`/api/jobs/${jobId}`, 'PATCH', { status: newStatus })
     if (error) {
       toast.error('Error', error)
@@ -1350,11 +1376,13 @@ export function JobsPage() {
       const params = new URLSearchParams({ pageSize: '100' })
       if (search)                params.set('q',      search)
       if (filterStatus !== 'all') params.set('status', filterStatus)
-      fetch(`/api/jobs?${params}`).then(r => r.json()).then(json => {
+      fetch(`/api/jobs?${params}`).then(r => r.json()).then((json: JobsListResponse) => {
         setJobs(json.jobs ?? [])
         setTotal(json.total ?? 0)
+        setStatusCounts(json.statusCounts ?? EMPTY_STATUS_COUNTS)
       })
     } else {
+      defaultJobsCache = null
       toast.success('Moved', `Job moved to ${COL_LABELS[newStatus]}`)
     }
   }
@@ -1420,11 +1448,6 @@ export function JobsPage() {
     toast.success('Match scores ready', `${data.scored} job${data.scored === 1 ? '' : 's'} scored${data.failed ? `; ${data.failed} failed` : ''}${data.remaining ? `; ${data.remaining} remaining` : ''}`)
   }
 
-  const statusCounts = useMemo(() => ({
-    saved: jobs.filter(job => job.status === 'saved').length,
-    review: jobs.filter(job => job.status === 'review').length,
-    interview: jobs.filter(job => job.status === 'interview').length,
-  }), [jobs])
   return (
     <div style={{ flex: 1, overflowY: 'auto', background: 'var(--bg-tertiary)', display: 'flex', flexDirection: 'column' }}>
       <header style={{ padding: '28px 30px 18px', background: 'var(--bg-tertiary)' }}>
@@ -1439,7 +1462,7 @@ export function JobsPage() {
           <div style={{ display: 'flex', alignItems: 'center', gap: 12, flexWrap: 'wrap' }}>
             {([
               [Bookmark, 'Saved', statusCounts.saved, '#6D5DFB'],
-              [Clock3, 'In review', statusCounts.review, '#C27A12'],
+              [Check, 'Applied', statusCounts.applied, '#185FA5'],
               [UsersRound, 'Interviews', statusCounts.interview, '#3B6D11'],
             ] as const).map(([Icon, label, count, color]) => (
               <div key={label} style={{ minWidth: 148, padding: '11px 14px', display: 'flex', alignItems: 'center', gap: 10, background: 'var(--bg)', border: '0.5px solid var(--border)', borderRadius: 10 }}>
@@ -1517,6 +1540,7 @@ export function JobsPage() {
           onAdded={job => {
             setJobs(prev => [job, ...prev])
             setTotal(t => t + 1)
+            setStatusCounts(previous => ({ ...previous, [job.status]: previous[job.status] + 1 }))
             defaultJobsCache = null
             window.dispatchEvent(new Event('applymate:jobs-changed'))
             setPrefillStatus(null)
@@ -1537,8 +1561,15 @@ export function JobsPage() {
             setSelectedJob(updated)
           }}
           onDelete={id => {
+            const deletedJob = jobs.find(job => job.id === id)
             setJobs(prev => prev.filter(j => j.id !== id))
             setTotal(t => t - 1)
+            if (deletedJob) {
+              setStatusCounts(previous => ({
+                ...previous,
+                [deletedJob.status]: Math.max(0, previous[deletedJob.status] - 1),
+              }))
+            }
             setSelectedIds(prev => {
               const next = new Set(prev)
               next.delete(id)

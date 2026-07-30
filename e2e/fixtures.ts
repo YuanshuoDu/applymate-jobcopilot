@@ -11,7 +11,8 @@ type Job = {
   logo: string;
   role: string;
   location: string;
-  status: "saved" | "applied" | "review" | "interview" | "offer" | "rejected";
+  status: "saved" | "applied" | "interview" | "offer" | "rejected";
+  workflowState: "draft" | "ready_to_apply" | "submitted";
   score: number | null;
   url: string;
   description: string;
@@ -49,6 +50,7 @@ function makeSeedJobs(): Job[] {
       role: "Systems Engineer",
       location: "Remote",
       status: "saved",
+      workflowState: "draft",
       score: null,
       url: "https://example.com/cloudflare-systems",
       description: "Build distributed systems with TypeScript, Go, PostgreSQL, and observability.",
@@ -77,7 +79,7 @@ function statsFromJobs(jobs: Job[]) {
     total: jobs.length,
     saved: jobs.filter(job => job.status === "saved").length,
     applied: jobs.filter(job => job.status === "applied").length,
-    inProgress: jobs.filter(job => job.status === "review").length,
+    inProgress: jobs.filter(job => job.status === "applied" || job.status === "interview").length,
     interviews: jobs.filter(job => job.status === "interview").length,
     offers: jobs.filter(job => job.status === "offer").length,
     thisWeek: 0,
@@ -89,6 +91,16 @@ function pipelineFromJobs(jobs: Job[]) {
     acc[job.status] = (acc[job.status] ?? 0) + 1;
     return acc;
   }, {});
+}
+
+function statusCountsFromJobs(jobs: Job[]) {
+  return {
+    saved: jobs.filter(job => job.status === "saved").length,
+    applied: jobs.filter(job => job.status === "applied").length,
+    interview: jobs.filter(job => job.status === "interview").length,
+    offer: jobs.filter(job => job.status === "offer").length,
+    rejected: jobs.filter(job => job.status === "rejected").length,
+  };
 }
 
 function agentConfig() {
@@ -150,6 +162,7 @@ async function installAppMocks(page: Page, jobs: Job[]) {
       })),
       recentJobs: jobs,
       activity: [],
+      pendingRecommendationCount: 0,
       agentConfig: agentConfig(),
       hasResume: true,
     }),
@@ -168,6 +181,7 @@ async function installAppMocks(page: Page, jobs: Job[]) {
       total: filtered.length,
       page: Number(url.searchParams.get("page") ?? 1),
       pageSize: Number(url.searchParams.get("pageSize") ?? 50),
+      statusCounts: statusCountsFromJobs(jobs),
     });
   });
 
@@ -181,6 +195,7 @@ async function installAppMocks(page: Page, jobs: Job[]) {
       role: body.role,
       location: body.location ?? "",
       status: body.status ?? "saved",
+      workflowState: body.status && body.status !== "saved" ? "submitted" : "draft",
       score: null,
       url: body.url ?? "",
       description: body.description ?? "",
