@@ -233,6 +233,11 @@ export interface DashboardRecommendation {
   createdAt: string
 }
 
+export interface DashboardApplicationDay {
+  date:  string
+  count: number
+}
+
 export interface DashboardData {
   stats: {
     total:      number
@@ -249,6 +254,7 @@ export interface DashboardData {
   savedJobs:    DashboardSavedJob[]
   recentJobs:   Job[]
   activity:     Activity[]
+  applicationDays: DashboardApplicationDay[]
   pendingRecommendationCount: number
   todayRecommendations: DashboardRecommendation[]
   agentConfig:  AgentConfig | null

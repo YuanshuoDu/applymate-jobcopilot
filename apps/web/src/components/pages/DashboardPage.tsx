@@ -6,7 +6,7 @@ import {
   Eye, FileText, MailCheck, MoreVertical, Send, Sparkles, Target, X,
 } from 'lucide-react'
 import { Btn, ScorePill, useToast } from '@/components/ui'
-import type { Activity, DashboardData, DashboardRecommendation, DashboardSavedJob } from '@/lib/types'
+import type { Activity, DashboardApplicationDay, DashboardData, DashboardRecommendation, DashboardSavedJob } from '@/lib/types'
 import { apiMutate, fmtDate, useApi } from '@/lib/hooks'
 import { useNav } from '@/lib/nav-context'
 import './DashboardPage.css'
@@ -29,16 +29,21 @@ function formatWeekRange(range: { start: Date; end: Date }) {
   return `${range.start.toLocaleDateString('en-GB', options)} – ${range.end.toLocaleDateString('en-GB', { ...options, year: 'numeric' })}`
 }
 
+function dateKey(date: Date) {
+  return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`
+}
+
 function CompanyBadge({ company, logo }: { company: string; logo?: string | null }) {
   if (logo?.startsWith('http')) return <img className="momentum-company-logo" src={logo} alt="" />
   return <span className="momentum-company-logo momentum-logo-fallback"><BriefcaseBusiness size={15} /></span>
 }
 
-function WeekGoal({ completed }: { completed: number }) {
+function WeekGoal({ completed, applicationDays, range }: { completed: number; applicationDays: DashboardApplicationDay[]; range: { start: Date; end: Date } }) {
   const target = 12
   const value = Math.min(completed, target)
   const progress = Math.round((value / target) * 100)
-  const completedDays = Math.min(Math.ceil(value / 2), 5)
+  const applicationsByDay = new Map(applicationDays.map(day => [day.date, day.count]))
+  const todayKey = dateKey(new Date())
 
   return (
     <section className="momentum-week-goal">
@@ -50,11 +55,17 @@ function WeekGoal({ completed }: { completed: number }) {
         <h2>You&apos;re building real momentum.</h2>
         <p>Aim for {target} quality applications this week to maximise your chances and keep your pipeline strong.</p>
         <div className="momentum-days" aria-label={`${progress}% of weekly goal complete`}>
-          {WEEK_DAYS.map((day, index) => (
-            <div key={day}><small>{day}</small><span className={index < completedDays ? 'is-done' : index === completedDays ? 'is-next' : ''}>{index < completedDays && <Check size={11} />}</span></div>
-          ))}
+          {WEEK_DAYS.map((day, index) => {
+            const date = new Date(range.start)
+            date.setDate(range.start.getDate() + index)
+            const key = dateKey(date)
+            const applicationCount = applicationsByDay.get(key) ?? 0
+            const state = applicationCount > 0 ? 'is-done' : key < todayKey ? 'is-missed' : key === todayKey ? 'is-today' : ''
+            const label = applicationCount > 0 ? `${applicationCount} application${applicationCount === 1 ? '' : 's'} submitted` : state === 'is-missed' ? 'No application submitted' : state === 'is-today' ? 'Today' : 'Upcoming day'
+            return <div key={key}><small>{day}</small><span className={state} title={label}>{applicationCount > 0 ? <Check size={11} /> : state === 'is-missed' ? <X size={11} /> : null}</span></div>
+          })}
         </div>
-        <div className="momentum-goal-legend"><span><i className="is-done"><Check size={9} /></i> Applied</span><span><i /> Planned</span></div>
+        <div className="momentum-goal-legend"><span><i className="is-done"><Check size={9} /></i> Applied</span><span><i className="is-missed"><X size={9} /></i> Missed</span></div>
       </div>
     </section>
   )
@@ -136,6 +147,7 @@ function Timeline({ activities, onJobs }: { activities: Activity[]; onJobs: () =
 }
 
 function activityLabel(type: Activity['type']): string {
+  if (type === 'applied') return 'Applied'
   if (type === 'interview_scheduled') return 'Interview'
   if (type === 'offer_received') return 'Offer'
   if (type === 'rejected') return 'Rejected'
@@ -244,7 +256,7 @@ export function DashboardPage() {
           </div>
         </header>
         <div className="momentum-layout">
-          <div className="momentum-primary-column"><WeekGoal completed={stats.thisWeek} /><CoachCard hasResume={data?.hasResume ?? false} savedJobs={savedJobs.length} onAction={() => navigate(data?.hasResume ? 'jobs' : 'resume')} /><Timeline activities={activities} onJobs={() => navigate('jobs')} /></div>
+          <div className="momentum-primary-column"><WeekGoal completed={stats.thisWeek} applicationDays={data?.applicationDays ?? []} range={selectedRange} /><CoachCard hasResume={data?.hasResume ?? false} savedJobs={savedJobs.length} onAction={() => navigate(data?.hasResume ? 'jobs' : 'resume')} /><Timeline activities={activities} onJobs={() => navigate('jobs')} /></div>
           <aside className="momentum-secondary-column"><MatchList jobs={savedJobs} threshold={data?.minMatchScore ?? 75} onReview={() => navigate('jobs')} /><JobNotifications recommendations={todayRecommendations} onReview={() => navigate('gmail-recommendations')} /><WeekAtAGlance stats={stats} onJobs={() => navigate('jobs')} /><ActionCard followUps={data?.followUpsDue ?? []} agentConfig={data?.agentConfig ?? null} onJobs={() => navigate('jobs')} onSettings={() => navigate('settings')} onUpdated={refetch} /></aside>
         </div>
       </main>

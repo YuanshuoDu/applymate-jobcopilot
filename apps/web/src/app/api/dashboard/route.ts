@@ -32,13 +32,16 @@ export async function GET(request: Request) {
   todayStart.setHours(0, 0, 0, 0)
   todayEnd.setHours(23, 59, 59, 999)
 
-  const [statusGroups, thisWeek, followUpsDue, agentConfig, recentJobs, activity, resumeCount, pendingRecommendationCount, todayRecommendations] = await Promise.all([
+  const [statusGroups, applicationRows, followUpsDue, agentConfig, recentJobs, activity, resumeCount, pendingRecommendationCount, todayRecommendations] = await Promise.all([
     db.job.groupBy({
       by: ['status'],
       where: { userId },
       _count: { status: true },
     }),
-    db.job.count({ where: { userId, appliedAt: { gte: rangeStart, lte: rangeEnd } } }),
+    db.job.findMany({
+      where: { userId, appliedAt: { gte: rangeStart, lte: rangeEnd } },
+      select: { appliedAt: true },
+    }),
     db.job.findMany({
       where: { userId, followUpAt: { lte: todayEnd } },
       select: { id: true, company: true, role: true, status: true, followUpAt: true },
@@ -73,6 +76,13 @@ export async function GET(request: Request) {
   }
 
   const total      = Object.values(pipeline).reduce((a, b) => a + b, 0)
+  const applicationDays = [...applicationRows.reduce((days, job) => {
+    if (!job.appliedAt) return days
+    const date = job.appliedAt.toISOString().slice(0, 10)
+    days.set(date, (days.get(date) ?? 0) + 1)
+    return days
+  }, new Map<string, number>())].map(([date, count]) => ({ date, count }))
+  const thisWeek   = applicationRows.length
   const saved      = pipeline.saved      ?? 0
   const applied    = pipeline.applied    ?? 0
   const inProgress = applied + (pipeline.interview ?? 0)
@@ -98,6 +108,7 @@ export async function GET(request: Request) {
     savedJobs,
     recentJobs,
     activity,
+    applicationDays,
     pendingRecommendationCount,
     todayRecommendations,
     agentConfig,
