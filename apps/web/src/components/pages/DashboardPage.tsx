@@ -6,7 +6,7 @@ import {
   Eye, FileText, MailCheck, MoreVertical, Send, Sparkles, Target, X,
 } from 'lucide-react'
 import { Btn, ScorePill, useToast } from '@/components/ui'
-import type { Activity, DashboardApplicationDay, DashboardData, DashboardRecommendation, DashboardSavedJob } from '@/lib/types'
+import type { Activity, DashboardApplicationDay, DashboardData, DashboardInterview, DashboardRecommendation, DashboardSavedJob } from '@/lib/types'
 import { apiMutate, fmtDate, useApi } from '@/lib/hooks'
 import { useNav } from '@/lib/nav-context'
 import './DashboardPage.css'
@@ -33,16 +33,26 @@ function dateKey(date: Date) {
   return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`
 }
 
+function formatInterviewSlot(value: string) {
+  const date = new Date(value)
+  return `${date.toLocaleDateString('en-IE', { weekday: 'short', day: 'numeric', month: 'short' })} · ${date.toLocaleTimeString('en-IE', { hour: '2-digit', minute: '2-digit', hour12: false })}`
+}
+
 function CompanyBadge({ company, logo }: { company: string; logo?: string | null }) {
   if (logo?.startsWith('http')) return <img className="momentum-company-logo" src={logo} alt="" />
   return <span className="momentum-company-logo momentum-logo-fallback"><BriefcaseBusiness size={15} /></span>
 }
 
-function WeekGoal({ completed, applicationDays, range }: { completed: number; applicationDays: DashboardApplicationDay[]; range: { start: Date; end: Date } }) {
+function WeekGoal({ completed, applicationDays, interviews, range }: { completed: number; applicationDays: DashboardApplicationDay[]; interviews: DashboardInterview[]; range: { start: Date; end: Date } }) {
   const target = 12
   const value = Math.min(completed, target)
   const progress = Math.round((value / target) * 100)
   const applicationsByDay = new Map(applicationDays.map(day => [day.date, day.count]))
+  const interviewsByDay = new Map<string, DashboardInterview[]>()
+  for (const interview of interviews) {
+    const key = dateKey(new Date(interview.scheduledAt))
+    interviewsByDay.set(key, [...(interviewsByDay.get(key) ?? []), interview])
+  }
   const todayKey = dateKey(new Date())
 
   return (
@@ -60,12 +70,14 @@ function WeekGoal({ completed, applicationDays, range }: { completed: number; ap
             date.setDate(range.start.getDate() + index)
             const key = dateKey(date)
             const applicationCount = applicationsByDay.get(key) ?? 0
-            const state = applicationCount > 0 ? 'is-done' : key < todayKey ? 'is-missed' : key === todayKey ? 'is-today' : ''
-            const label = applicationCount > 0 ? `${applicationCount} application${applicationCount === 1 ? '' : 's'} submitted` : state === 'is-missed' ? 'No application submitted' : state === 'is-today' ? 'Today' : 'Upcoming day'
-            return <div key={key}><small>{day}</small><span className={state} title={label}>{applicationCount > 0 ? <Check size={11} /> : state === 'is-missed' ? <X size={11} /> : null}</span></div>
+            const interview = interviewsByDay.get(key)?.[0]
+            const state = interview ? 'is-interview' : applicationCount > 0 ? 'is-done' : key < todayKey ? 'is-missed' : key === todayKey ? 'is-today' : ''
+            const label = interview ? `Interview · ${formatInterviewSlot(interview.scheduledAt)}` : applicationCount > 0 ? `${applicationCount} application${applicationCount === 1 ? '' : 's'} submitted` : state === 'is-missed' ? 'No application submitted' : state === 'is-today' ? 'Today' : 'Upcoming day'
+            return <div key={key}><small>{day}</small><span className={state} title={label}>{interview ? <CalendarDays size={11} /> : applicationCount > 0 ? <Check size={11} /> : state === 'is-missed' ? <X size={11} /> : null}</span></div>
           })}
         </div>
-        <div className="momentum-goal-legend"><span><i className="is-done"><Check size={9} /></i> Applied</span><span><i className="is-missed"><X size={9} /></i> Missed</span></div>
+        <div className="momentum-goal-legend"><span><i className="is-done"><Check size={9} /></i> Applied</span><span><i className="is-interview"><CalendarDays size={9} /></i> Interview</span><span><i className="is-missed"><X size={9} /></i> Missed</span></div>
+        {interviews.length > 0 && <div className="momentum-interview-list">{interviews.slice(0, 2).map(interview => <span key={interview.id}><CalendarDays size={12} /><strong>Interview</strong> {formatInterviewSlot(interview.scheduledAt)}{interview.role ? ` · ${interview.role}` : ''}</span>)}</div>}
       </div>
     </section>
   )
@@ -256,7 +268,7 @@ export function DashboardPage() {
           </div>
         </header>
         <div className="momentum-layout">
-          <div className="momentum-primary-column"><WeekGoal completed={stats.thisWeek} applicationDays={data?.applicationDays ?? []} range={selectedRange} /><CoachCard hasResume={data?.hasResume ?? false} savedJobs={savedJobs.length} onAction={() => navigate(data?.hasResume ? 'jobs' : 'resume')} /><Timeline activities={activities} onJobs={() => navigate('jobs')} /></div>
+          <div className="momentum-primary-column"><WeekGoal completed={stats.thisWeek} applicationDays={data?.applicationDays ?? []} interviews={data?.interviewsScheduled ?? []} range={selectedRange} /><CoachCard hasResume={data?.hasResume ?? false} savedJobs={savedJobs.length} onAction={() => navigate(data?.hasResume ? 'jobs' : 'resume')} /><Timeline activities={activities} onJobs={() => navigate('jobs')} /></div>
           <aside className="momentum-secondary-column"><MatchList jobs={savedJobs} threshold={data?.minMatchScore ?? 75} onReview={() => navigate('jobs')} /><JobNotifications recommendations={todayRecommendations} onReview={() => navigate('gmail-recommendations')} /><WeekAtAGlance stats={stats} onJobs={() => navigate('jobs')} /><ActionCard followUps={data?.followUpsDue ?? []} agentConfig={data?.agentConfig ?? null} onJobs={() => navigate('jobs')} onSettings={() => navigate('settings')} onUpdated={refetch} /></aside>
         </div>
       </main>

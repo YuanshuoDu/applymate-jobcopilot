@@ -489,6 +489,7 @@ model GmailMessage {
   inferredCompany String?          @map("inferred_company")
   inferredRole    String?          @map("inferred_role")
   receivedAt      DateTime         @map("received_at")
+  scheduledAt     DateTime?        @map("scheduled_at")
   jobId           String?          @map("job_id")
   matchConfidence Float?           @map("match_confidence")
   manuallyLinked  Boolean          @default(false) @map("manually_linked")
@@ -502,6 +503,7 @@ model GmailMessage {
 
   @@unique([userId, gmailMessageId])
   @@index([userId, receivedAt(sort: Desc)])
+  @@index([userId, kind, scheduledAt])
   @@index([userId, jobId, receivedAt(sort: Desc)])
   @@map("gmail_messages")
 }

@@ -238,6 +238,13 @@ export interface DashboardApplicationDay {
   count: number
 }
 
+export interface DashboardInterview {
+  id:          string
+  company:     string | null
+  role:        string | null
+  scheduledAt: string
+}
+
 export interface DashboardData {
   stats: {
     total:      number
@@ -255,6 +262,7 @@ export interface DashboardData {
   recentJobs:   Job[]
   activity:     Activity[]
   applicationDays: DashboardApplicationDay[]
+  interviewsScheduled: DashboardInterview[]
   pendingRecommendationCount: number
   todayRecommendations: DashboardRecommendation[]
   agentConfig:  AgentConfig | null

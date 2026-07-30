@@ -5,6 +5,7 @@ import type { GmailMessageKind } from './classification'
 import { fetchRecentGmailMessages, type GmailRemoteMessage } from './gmail-client'
 import { activityTypeForGmailMessage, canApplyGmailStatus, gmailEventLabel, statusForGmailMessage } from './lifecycle'
 import { findConfidentGmailJobMatch, type GmailMatchableJob } from './matching'
+import { extractInterviewSchedule } from './interview-schedule'
 
 export interface GmailSyncResult {
   connected: boolean
@@ -33,6 +34,7 @@ export async function syncGmailForUser(userId: string, now = new Date()): Promis
     create: { userId },
     update: {},
   })
+  await backfillInterviewSchedules(userId)
   const since = syncState.lastSyncedAt
     ? new Date(syncState.lastSyncedAt.getTime() - 86_400_000)
     : null
@@ -77,9 +79,15 @@ async function processMessage(
 ) {
   const existing = await db.gmailMessage.findUnique({
     where: { userId_gmailMessageId: { userId, gmailMessageId: message.id } },
-    select: { id: true },
+    select: { id: true, kind: true, scheduledAt: true },
   })
-  if (existing) return { imported: false, matched: false, statusUpdated: false, recommendations: 0 }
+  if (existing) {
+    if (existing.kind === 'interview_invitation' && !existing.scheduledAt) {
+      const scheduledAt = extractInterviewSchedule(`${message.subject}\n${message.text}`, message.receivedAt)
+      if (scheduledAt) await db.gmailMessage.update({ where: { id: existing.id }, data: { scheduledAt } })
+    }
+    return { imported: false, matched: false, statusUpdated: false, recommendations: 0 }
+  }
 
   const kind = classifyGmailMessage({ subject: message.subject, excerpt: message.snippet, body: message.text })
   if (kind === 'other') return { imported: false, matched: false, statusUpdated: false, recommendations: 0 }
@@ -90,7 +98,10 @@ async function processMessage(
     subject: message.subject,
     senderEmail: message.senderEmail,
   })
-  const tracked = await createTrackedMessage(userId, message, kind, inferred, match?.job.id ?? null, match?.confidence ?? null, now)
+  const scheduledAt = kind === 'interview_invitation'
+    ? extractInterviewSchedule(`${message.subject}\n${message.text}`, message.receivedAt)
+    : null
+  const tracked = await createTrackedMessage(userId, message, kind, inferred, match?.job.id ?? null, match?.confidence ?? null, scheduledAt, now)
   if (!tracked) return { imported: false, matched: false, statusUpdated: false, recommendations: 0 }
 
   const recommendations = kind === 'recommendation_digest'
@@ -109,6 +120,7 @@ async function createTrackedMessage(
   inferred: { company: string | null; role: string | null },
   jobId: string | null,
   matchConfidence: number | null,
+  scheduledAt: Date | null,
   now: Date,
 ) {
   try {
@@ -125,6 +137,7 @@ async function createTrackedMessage(
         inferredCompany: inferred.company,
         inferredRole: inferred.role,
         receivedAt: message.receivedAt,
+        scheduledAt,
         jobId,
         matchConfidence,
         processedAt: now,
@@ -154,6 +167,19 @@ async function persistRecommendations(userId: string, sourceMessageId: string, m
     }
   }
   return created
+}
+
+async function backfillInterviewSchedules(userId: string) {
+  const messages = await db.gmailMessage.findMany({
+    where: { userId, kind: 'interview_invitation', scheduledAt: null },
+    select: { id: true, subject: true, excerpt: true, receivedAt: true },
+    orderBy: { receivedAt: 'desc' },
+    take: 100,
+  })
+  await Promise.all(messages.map(async message => {
+    const scheduledAt = extractInterviewSchedule(`${message.subject}\n${message.excerpt ?? ''}`, message.receivedAt)
+    if (scheduledAt) await db.gmailMessage.update({ where: { id: message.id }, data: { scheduledAt } })
+  }))
 }
 
 async function projectLinkedMessage(

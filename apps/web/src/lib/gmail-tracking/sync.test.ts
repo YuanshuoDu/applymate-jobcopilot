@@ -9,7 +9,9 @@ const mocks = vi.hoisted(() => ({
   jobsFindMany: vi.fn(),
   jobsUpdate: vi.fn(),
   messagesFindUnique: vi.fn(),
+  messagesFindMany: vi.fn(),
   messagesCreate: vi.fn(),
+  messagesUpdate: vi.fn(),
   recommendationsCreate: vi.fn(),
   activitiesCreate: vi.fn(),
   notificationsFindFirst: vi.fn(),
@@ -22,7 +24,7 @@ vi.mock('@/lib/db', () => ({
   db: {
     gmailSyncState: { upsert: mocks.syncStateUpsert, update: mocks.syncStateUpdate },
     job: { findMany: mocks.jobsFindMany, update: mocks.jobsUpdate },
-    gmailMessage: { findUnique: mocks.messagesFindUnique, create: mocks.messagesCreate },
+    gmailMessage: { findUnique: mocks.messagesFindUnique, findMany: mocks.messagesFindMany, create: mocks.messagesCreate, update: mocks.messagesUpdate },
     gmailRecommendation: { create: mocks.recommendationsCreate },
     activity: { create: mocks.activitiesCreate },
     notification: { findFirst: mocks.notificationsFindFirst, create: mocks.notificationsCreate },
@@ -57,7 +59,9 @@ beforeEach(() => {
   mocks.jobsFindMany.mockResolvedValue([])
   mocks.jobsUpdate.mockResolvedValue({})
   mocks.messagesFindUnique.mockResolvedValue(null)
+  mocks.messagesFindMany.mockResolvedValue([])
   mocks.messagesCreate.mockResolvedValue({ id: 'tracked-1' })
+  mocks.messagesUpdate.mockResolvedValue({})
   mocks.recommendationsCreate.mockResolvedValue({})
   mocks.activitiesCreate.mockResolvedValue({})
   mocks.notificationsFindFirst.mockResolvedValue(null)
@@ -104,6 +108,22 @@ describe('syncGmailForUser', () => {
     expect(result).toEqual({ connected: true, importedMessages: 0, matchedMessages: 0, statusUpdates: 0, newRecommendations: 0, error: null })
     expect(mocks.messagesCreate).not.toHaveBeenCalled()
     expect(mocks.jobsUpdate).not.toHaveBeenCalled()
+  })
+
+  it('backfills a concrete interview schedule from an already tracked email', async () => {
+    mocks.messagesFindMany.mockResolvedValue([{
+      id: 'tracked-interview',
+      subject: 'Interview invitation',
+      excerpt: 'Your interview is on 31 July 2026 at 10:30 AM.',
+      receivedAt,
+    }])
+
+    await syncGmailForUser('user-1', receivedAt)
+
+    expect(mocks.messagesUpdate).toHaveBeenCalledWith(expect.objectContaining({
+      where: { id: 'tracked-interview' },
+      data: { scheduledAt: new Date(2026, 6, 31, 10, 30) },
+    }))
   })
 
   it('persists daily recommendation cards and emits one dashboard notification', async () => {

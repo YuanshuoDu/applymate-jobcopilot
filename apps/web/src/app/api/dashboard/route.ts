@@ -32,7 +32,7 @@ export async function GET(request: Request) {
   todayStart.setHours(0, 0, 0, 0)
   todayEnd.setHours(23, 59, 59, 999)
 
-  const [statusGroups, applicationRows, followUpsDue, agentConfig, recentJobs, activity, resumeCount, pendingRecommendationCount, todayRecommendations] = await Promise.all([
+  const [statusGroups, applicationRows, followUpsDue, agentConfig, recentJobs, activity, resumeCount, pendingRecommendationCount, todayRecommendations, interviewsScheduled] = await Promise.all([
     db.job.groupBy({
       by: ['status'],
       where: { userId },
@@ -68,6 +68,17 @@ export async function GET(request: Request) {
       orderBy: { createdAt: 'desc' },
       take: 4,
     }).catch(() => []),
+    db.gmailMessage.findMany({
+      where: { userId, kind: 'interview_invitation', scheduledAt: { gte: rangeStart, lte: rangeEnd } },
+      select: { id: true, inferredCompany: true, inferredRole: true, scheduledAt: true, job: { select: { company: true, role: true } } },
+      orderBy: { scheduledAt: 'asc' },
+      take: 8,
+    }).then(messages => messages.flatMap(message => message.scheduledAt ? [{
+      id: message.id,
+      company: message.job?.company ?? message.inferredCompany,
+      role: message.job?.role ?? message.inferredRole,
+      scheduledAt: message.scheduledAt,
+    }] : [])).catch(() => []),
   ])
 
   const pipeline: Record<string, number> = {}
@@ -109,6 +120,7 @@ export async function GET(request: Request) {
     recentJobs,
     activity,
     applicationDays,
+    interviewsScheduled,
     pendingRecommendationCount,
     todayRecommendations,
     agentConfig,
