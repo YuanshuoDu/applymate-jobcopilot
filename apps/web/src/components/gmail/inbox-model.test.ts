@@ -49,12 +49,14 @@ const emails: GmailEmail[] = [
 ]
 
 describe('Gmail inbox model', () => {
-  it('maps only evidence-based lifecycle labels and never review or viewed', () => {
+  it('maps only evidence-based lifecycle labels and keeps recommendations out of the inbox filters', () => {
     expect(GMAIL_TAG_DISPLAY.application_received.label).toBe('Applied')
     expect(GMAIL_TAG_DISPLAY.interview_invitation.label).toBe('Interview')
+    expect(GMAIL_TAG_DISPLAY.application_update.label).toBe('Application update')
     expect(Object.keys(GMAIL_TAG_DISPLAY)).not.toContain('review')
     expect(Object.keys(GMAIL_TAG_DISPLAY)).not.toContain('viewed')
     expect(GMAIL_INBOX_FILTER_KINDS).not.toContain('other')
+    expect(GMAIL_INBOX_FILTER_KINDS).not.toContain('recommendation_digest')
   })
 
   it('formats today, recent, older, and invalid message dates', () => {

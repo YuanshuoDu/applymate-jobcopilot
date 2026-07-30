@@ -44,7 +44,7 @@ export const GMAIL_TAG_DISPLAY: Record<GmailMessageKind, GmailTagDisplay> = {
     background: 'rgba(220,38,38,0.12)',
   },
   application_update: {
-    label: 'Employer update',
+    label: 'Application update',
     color: 'var(--c-warning)',
     background: 'rgba(217,119,6,0.12)',
   },
@@ -66,7 +66,6 @@ export const GMAIL_INBOX_FILTER_KINDS: readonly GmailMessageKind[] = [
   'offer',
   'rejection',
   'application_update',
-  'recommendation_digest',
 ]
 
 export interface GmailInboxCounts {
