@@ -1,7 +1,7 @@
 /**
  * POST /api/gmail/send-draft
- * Sends a pre-drafted email via Gmail API (user-confirmed rejection follow-up).
- * Body: { to, subject, draft, jobId }
+ * Sends a user-confirmed follow-up via Gmail and records it against a matched job.
+ * Body: { to, subject, draft, gmailMessageId?, threadId?, jobId? }
  */
 import { NextRequest }                          from 'next/server'
 import { requireAuth, isErrorResponse, ok, err } from '@/lib/api-helpers'
@@ -15,8 +15,8 @@ export async function POST(req: NextRequest) {
   const body = await req.json().catch(() => null)
   if (!body?.to || !body?.draft) return err('Missing to or draft')
 
-  const { to, subject, draft, jobId } = body as {
-    to: string; subject: string; draft: string; jobId?: string
+  const { to, subject, draft, jobId, gmailMessageId, threadId, messageKind } = body as {
+    to: string; subject: string; draft: string; jobId?: string; gmailMessageId?: string; threadId?: string; messageKind?: string
   }
 
   const token = await getGoogleAccessToken(auth.userId)
@@ -43,7 +43,7 @@ export async function POST(req: NextRequest) {
   const sendRes = await fetch('https://gmail.googleapis.com/gmail/v1/users/me/messages/send', {
     method:  'POST',
     headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
-    body:    JSON.stringify({ raw }),
+    body:    JSON.stringify({ raw, ...(typeof threadId === 'string' && threadId ? { threadId } : {}) }),
   })
 
   if (!sendRes.ok) {
@@ -51,18 +51,31 @@ export async function POST(req: NextRequest) {
     return err(`Gmail send failed: ${errText}`, 500)
   }
 
-  // Log the send
-  if (jobId) {
-    await db.activity.create({
+  const matchedJob = await findFollowUpJob(auth.userId, jobId, gmailMessageId)
+  if (matchedJob) await db.$transaction([
+    db.job.update({ where: { id: matchedJob.id }, data: { followUpAt: null } }),
+    db.activity.create({
       data: {
         userId: auth.userId,
-        jobId,
-        type:   'agent_action',
-        text:   `拒信问询邮件已发送至 ${to}`,
-        color:  '#7C3AED',
+        jobId: matchedJob.id,
+        type: 'email_sent',
+        text: `Follow-up email sent to ${to}${messageKind ? ` · ${messageKind.replace(/_/g, ' ')}` : ''}`,
+        color: '#7C3AED',
       },
-    }).catch(() => {})
-  }
+    }),
+  ])
 
-  return ok({ sent: true, to })
+  return ok({ sent: true, to, tracked: Boolean(matchedJob), jobId: matchedJob?.id ?? null })
+}
+
+async function findFollowUpJob(userId: string, requestedJobId: unknown, gmailMessageId: unknown) {
+  if (typeof requestedJobId === 'string' && requestedJobId) {
+    return db.job.findFirst({ where: { id: requestedJobId, userId }, select: { id: true } })
+  }
+  if (typeof gmailMessageId !== 'string' || !gmailMessageId) return null
+  const message = await db.gmailMessage.findFirst({
+    where: { userId, gmailMessageId, jobId: { not: null } },
+    select: { job: { select: { id: true } } },
+  })
+  return message?.job ?? null
 }

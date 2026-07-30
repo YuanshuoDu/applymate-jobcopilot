@@ -12,6 +12,7 @@ export function GmailReplyModal({ email, body, onClose }: GmailReplyModalProps) 
   const toast = useToast()
   const [reply, setReply] = useState('')
   const [loading, setLoading] = useState(true)
+  const [sending, setSending] = useState(false)
   const [error, setError] = useState('')
   const [copied, setCopied] = useState(false)
 
@@ -53,18 +54,30 @@ export function GmailReplyModal({ email, body, onClose }: GmailReplyModalProps) 
     }
   }
 
-  function openGmail() {
-    const subject = encodeURIComponent(`Re: ${email.subject}`)
-    const bodyText = encodeURIComponent(reply)
-    const recipient = encodeURIComponent(email.from)
-    window.open(`https://mail.google.com/mail/?view=cm&to=${recipient}&su=${subject}&body=${bodyText}`, '_blank')
+  async function sendFollowUp() {
+    setSending(true)
+    try {
+      const response = await fetch('/api/gmail/send-draft', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ to: email.from, subject: `Re: ${email.subject}`, draft: reply, gmailMessageId: email.id, threadId: email.threadId, messageKind: email.tag }),
+      })
+      const result = await response.json() as { error?: string; tracked?: boolean }
+      if (!response.ok) throw new Error(result.error ?? 'Could not send follow-up')
+      window.dispatchEvent(new Event('applymate:jobs-changed'))
+      toast.success('Follow-up sent', result.tracked ? 'My Jobs and the activity timeline were updated.' : 'The email was sent. Link it to My Jobs to track future follow-ups.')
+      onClose()
+    } catch (error) {
+      toast.error('Could not send follow-up', error instanceof Error ? error.message : 'Try again')
+    } finally {
+      setSending(false)
+    }
   }
 
-  return <div role="dialog" aria-modal="true" aria-label="AI Reply Draft" style={overlayStyle}>
+  return <div role="dialog" aria-modal="true" aria-label="AI follow-up draft" style={overlayStyle}>
     <div style={modalStyle}>
       <header style={headerStyle}>
         <div style={{ flex: 1 }}>
-          <div style={{ fontSize: 14, fontWeight: 500 }}>AI Reply Draft</div>
+          <div style={{ fontSize: 14, fontWeight: 500 }}>AI Follow-up Draft</div>
           <div style={subheaderStyle}>To: <strong>{email.name}</strong> &lt;{email.from}&gt;</div>
           <div style={subheaderStyle}>Re: {email.subject}</div>
         </div>
@@ -75,7 +88,7 @@ export function GmailReplyModal({ email, body, onClose }: GmailReplyModalProps) 
       </div>
       <footer style={footerStyle}>
         <Btn variant="ghost" onClick={onClose}>Cancel</Btn>
-        {!loading && !error && <><Btn variant="ghost" onClick={() => void copyToClipboard()}>{copied ? '✓ Copied' : '📋 Copy Text'}</Btn><Btn variant="primary" onClick={openGmail}>✉ Open in Gmail</Btn></>}
+        {!loading && !error && <><Btn variant="ghost" onClick={() => void copyToClipboard()}>{copied ? '✓ Copied' : '📋 Copy Text'}</Btn><Btn variant="primary" disabled={sending || !reply.trim()} onClick={() => void sendFollowUp()}>{sending ? 'Sending…' : '✉ Send follow-up'}</Btn></>}
       </footer>
     </div>
   </div>

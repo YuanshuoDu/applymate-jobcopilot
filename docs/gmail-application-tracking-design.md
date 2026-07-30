@@ -66,6 +66,13 @@ Save or Dismiss each job. Saving creates one normal My Jobs record in `saved`
 state, so subsequent scoring and application work use the same path as
 discovered jobs.
 
+For Applied, Interview, Offer, Rejected and Application update messages, the
+mail reader offers an editable **AI follow-up** draft. Sending it uses the
+connected Gmail account, keeps the application lifecycle unchanged, clears the
+linked My Jobs follow-up due date, and records a dated “Follow-up sent” event
+in the application timeline. If an email has not yet been confidently linked
+to a job, it can still be sent but is explicitly not marked as tracked.
+
 ### My Jobs
 
 My Jobs exposes the same lifecycle everywhere: filters, badges, manual status

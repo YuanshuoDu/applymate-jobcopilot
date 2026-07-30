@@ -142,7 +142,7 @@ function Timeline({ activities, onJobs }: { activities: Activity[]; onJobs: () =
   const [sortBy, setSortBy] = useState<'recent' | 'company'>('recent')
   const [sortOpen, setSortOpen] = useState(false)
   const [page, setPage] = useState(0)
-  const applicationActivities = activities.filter(activity => ['applied', 'interview_scheduled', 'offer_received', 'rejected', 'status_changed'].includes(activity.type))
+  const applicationActivities = activities.filter(activity => ['applied', 'interview_scheduled', 'offer_received', 'rejected', 'status_changed', 'email_sent'].includes(activity.type))
   const sortedActivities = [...applicationActivities].sort((a, b) => sortBy === 'company'
     ? (a.job?.company ?? '').localeCompare(b.job?.company ?? '')
     : new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime())
@@ -182,6 +182,7 @@ function activityLabel(type: Activity['type']): string {
   if (type === 'interview_scheduled') return 'Interview'
   if (type === 'offer_received') return 'Offer'
   if (type === 'rejected') return 'Rejected'
+  if (type === 'email_sent') return 'Follow-up sent'
   if (type === 'status_changed') return 'Status update'
   return 'Activity'
 }
