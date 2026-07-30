@@ -4,6 +4,7 @@
 .momentum-header, .momentum-header > div:not(.momentum-date-control), .momentum-header > div:not(.momentum-date-control) > div, .momentum-layout, .momentum-week-goal, .momentum-week-copy, .momentum-days, .momentum-goal-legend, .momentum-coach-card, .momentum-side-title, .momentum-match, .momentum-row, .momentum-glance-line, .momentum-profile-prompt { display: flex; }
 .momentum-header { align-items: center; justify-content: space-between; gap: 20px; margin: 0 0 30px; }
 .momentum-header > div { align-items: flex-start; gap: 13px; }
+.momentum-header > div:not(.momentum-date-control) > div { flex-direction: column; }
 .momentum-header > div > span { display: grid; place-items: center; color: var(--primary); padding-top: 4px; }
 .momentum-header h1 { margin: 0; font-size: 30px; font-weight: 750; letter-spacing: -.05em; line-height: 1.1; }
 .momentum-header p { margin-top: 7px; color: var(--text-muted); font-size: 12px; }

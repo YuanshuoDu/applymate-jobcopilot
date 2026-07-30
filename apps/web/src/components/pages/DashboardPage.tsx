@@ -107,7 +107,7 @@ function CoachCard({ hasResume, savedJobs, onAction }: { hasResume: boolean; sav
   const detail = !hasResume
     ? 'Upload your resume and the agent will tailor every recommendation to your experience.'
     : savedJobs > 0
-      ? `${savedJobs} high-match role${savedJobs === 1 ? '' : 's'} are ready for your next step.`
+      ? `${savedJobs} high-match role${savedJobs === 1 ? '' : 's'} ${savedJobs === 1 ? 'is' : 'are'} ready for your next step.`
       : 'Add 2–3 quantified achievements to make your experience easier for recruiters to scan.'
 
   return (
@@ -122,7 +122,7 @@ function CoachCard({ hasResume, savedJobs, onAction }: { hasResume: boolean; sav
 function MatchList({ jobs, threshold, onReview }: { jobs: DashboardSavedJob[]; threshold: number; onReview: () => void }) {
   return (
     <section className="momentum-side-card momentum-matches-card">
-      <div className="momentum-side-title"><Sparkles size={18} /><div><h2>High-match roles</h2><p>{jobs.length > 0 ? `${jobs.length} roles at ${threshold}%+ waiting for approval` : `Saved roles scoring ${threshold}%+ appear here`}</p></div></div>
+      <div className="momentum-side-title"><Sparkles size={18} /><div><h2>High-match roles</h2><p>{jobs.length > 0 ? `${jobs.length} role${jobs.length === 1 ? '' : 's'} at ${threshold}%+ waiting for approval` : `Saved roles scoring ${threshold}%+ appear here`}</p></div></div>
       <div className="momentum-match-list">
         {jobs.length === 0 ? <div className="momentum-side-empty"><BriefcaseBusiness size={19} /> Save promising roles to compare them here.</div> : jobs.slice(0, 3).map(job => (
           <article className="momentum-match" key={job.id}>
