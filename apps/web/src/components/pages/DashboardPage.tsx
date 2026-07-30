@@ -29,6 +29,25 @@ function formatWeekRange(range: { start: Date; end: Date }) {
   return `${range.start.toLocaleDateString('en-GB', options)} – ${range.end.toLocaleDateString('en-GB', { ...options, year: 'numeric' })}`
 }
 
+function getWeekOffsetForDate(date: Date) {
+  const currentWeek = getWeekRange(0).start
+  const dateWeek = new Date(date)
+  const day = dateWeek.getDay() || 7
+  dateWeek.setDate(dateWeek.getDate() - day + 1)
+  dateWeek.setHours(0, 0, 0, 0)
+  return Math.round((dateWeek.getTime() - currentWeek.getTime()) / (7 * 24 * 60 * 60 * 1000))
+}
+
+function getMonthCalendar(month: Date) {
+  const start = new Date(month.getFullYear(), month.getMonth(), 1)
+  start.setDate(start.getDate() - ((start.getDay() + 6) % 7))
+  return Array.from({ length: 42 }, (_, index) => {
+    const date = new Date(start)
+    date.setDate(start.getDate() + index)
+    return date
+  })
+}
+
 function dateKey(date: Date) {
   return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`
 }
@@ -217,6 +236,7 @@ export function DashboardPage() {
   const { navigate } = useNav()
   const [weekOffset, setWeekOffset] = useState(0)
   const [dateMenuOpen, setDateMenuOpen] = useState(false)
+  const [calendarMonth, setCalendarMonth] = useState(() => new Date())
   // Keep the request key stable across renders. Recreating dates here caused
   // a new URL (and therefore a new dashboard request) after every state update.
   const selectedRange = useMemo(() => getWeekRange(weekOffset), [weekOffset])
@@ -258,12 +278,18 @@ export function DashboardPage() {
         <header className="momentum-header">
           <div><span><Sparkles size={23} /></span><div><h1>Application Momentum</h1><p>Stay consistent, focus on quality, and keep moving forward.</p></div></div>
           <div className="momentum-date-control">
-            <button className="momentum-date-picker" onClick={() => setDateMenuOpen(open => !open)} aria-expanded={dateMenuOpen}><CalendarDays size={17} /> {formatWeekRange(selectedRange)} <ChevronDown size={15} /></button>
-            {dateMenuOpen && <div className="momentum-date-menu">
-              {[0, -1, -2, -3].map(offset => {
-                const range = getWeekRange(offset)
-                return <button className={offset === weekOffset ? 'is-selected' : ''} key={offset} onClick={() => { setWeekOffset(offset); setDateMenuOpen(false) }}>{offset === 0 ? 'This week' : `${Math.abs(offset)} week${offset === -1 ? '' : 's'} ago`}<small>{formatWeekRange(range)}</small></button>
-              })}
+            <button className="momentum-date-picker" onClick={() => { setCalendarMonth(new Date(selectedRange.start)); setDateMenuOpen(open => !open) }} aria-expanded={dateMenuOpen}><CalendarDays size={16} /> <span>{formatWeekRange(selectedRange)}</span> <ChevronDown size={14} /></button>
+            {dateMenuOpen && <div className="momentum-date-menu" role="dialog" aria-label="Choose dashboard week">
+              <div className="momentum-mini-calendar-heading"><button aria-label="Previous month" onClick={() => setCalendarMonth(month => new Date(month.getFullYear(), month.getMonth() - 1, 1))}><ChevronLeft size={14} /></button><strong>{calendarMonth.toLocaleDateString('en-GB', { month: 'long', year: 'numeric' })}</strong><button aria-label="Next month" onClick={() => setCalendarMonth(month => new Date(month.getFullYear(), month.getMonth() + 1, 1))}><ChevronRight size={14} /></button></div>
+              <div className="momentum-mini-calendar-weekdays">{WEEK_DAYS.map(day => <span key={day}>{day.slice(0, 2)}</span>)}</div>
+              <div className="momentum-mini-calendar-days">{getMonthCalendar(calendarMonth).map(date => {
+                const offset = getWeekOffsetForDate(date)
+                const isSelectedWeek = offset === weekOffset
+                const isToday = dateKey(date) === dateKey(new Date())
+                const isCurrentMonth = date.getMonth() === calendarMonth.getMonth()
+                return <button key={dateKey(date)} className={`${isSelectedWeek ? 'is-week-selected ' : ''}${isToday ? 'is-today ' : ''}${!isCurrentMonth ? 'is-outside' : ''}`} disabled={offset > 0} onClick={() => { setWeekOffset(offset); setDateMenuOpen(false) }}>{date.getDate()}</button>
+              })}</div>
+              <button className="momentum-date-current-week" onClick={() => { setWeekOffset(0); setCalendarMonth(new Date()); setDateMenuOpen(false) }}>This week</button>
             </div>}
           </div>
         </header>

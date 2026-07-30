@@ -7,13 +7,26 @@
 .momentum-header > div > span { display: grid; place-items: center; color: var(--primary); padding-top: 4px; }
 .momentum-header h1 { margin: 0; font-size: 30px; font-weight: 750; letter-spacing: -.05em; line-height: 1.1; }
 .momentum-header p { margin-top: 7px; color: var(--text-muted); font-size: 12px; }
-.momentum-date-picker { display: inline-flex; align-items: center; gap: 11px; padding: 12px 15px; border: 1px solid var(--border); border-radius: 10px; color: var(--text-muted); background: #fff; font: inherit; font-size: 12px; cursor: pointer; }
-.momentum-date-picker svg:last-child { margin-left: 15px; }
+.momentum-date-picker { display: inline-flex; align-items: center; gap: 8px; padding: 8px 10px; border: 1px solid #e2e0f4; border-radius: 8px; color: #5e6886; background: #fff; font: inherit; font-size: 11px; cursor: pointer; }
+.momentum-date-picker svg:first-child { color: #4a33f3; }
+.momentum-date-picker svg:last-child { margin-left: 3px; }
 .momentum-date-control { position: relative; }
-.momentum-date-menu { position: absolute; top: calc(100% + 7px); right: 0; z-index: 10; width: 220px; padding: 5px; border: 1px solid #e3e2f5; border-radius: 10px; background: #fff; box-shadow: var(--shadow-md); }
-.momentum-date-menu button { display: grid; width: 100%; gap: 3px; padding: 9px 10px; border: 0; border-radius: 7px; color: #37405e; background: transparent; font: inherit; font-size: 11px; font-weight: 600; text-align: left; cursor: pointer; }
-.momentum-date-menu button:hover, .momentum-date-menu button.is-selected { color: #4a33f3; background: #f4f2ff; }
-.momentum-date-menu small { color: #77809d; font-size: 10px; font-weight: 400; }
+.momentum-date-menu { position: absolute; top: calc(100% + 7px); right: 0; z-index: 10; width: 230px; padding: 10px; border: 1px solid #e3e2f5; border-radius: 10px; background: #fff; box-shadow: var(--shadow-md); }
+.momentum-mini-calendar-heading { display: flex; align-items: center; justify-content: space-between; padding: 0 1px 9px; color: #2b3350; font-size: 11px; }
+.momentum-mini-calendar-heading button { display: grid; place-items: center; width: 25px; height: 25px; padding: 0; border: 0; border-radius: 6px; color: #4a33f3; background: transparent; cursor: pointer; }
+.momentum-mini-calendar-heading button:hover { background: #f3f1ff; }
+.momentum-mini-calendar-weekdays, .momentum-mini-calendar-days { display: grid; grid-template-columns: repeat(7, 1fr); }
+.momentum-mini-calendar-weekdays { margin-bottom: 3px; color: #8a91aa; font-size: 9px; text-align: center; }
+.momentum-mini-calendar-days { gap: 2px; }
+.momentum-mini-calendar-days button { width: 100%; height: 25px; padding: 0; border: 0; border-radius: 5px; color: #4b5474; background: transparent; font: inherit; font-size: 10px; cursor: pointer; }
+.momentum-mini-calendar-days button:hover:not(:disabled) { color: #4a33f3; background: #f2f0ff; }
+.momentum-mini-calendar-days button.is-week-selected { color: #4a33f3; background: #eeecff; }
+.momentum-mini-calendar-days button.is-week-selected:nth-child(7n + 1) { border-radius: 6px 0 0 6px; }
+.momentum-mini-calendar-days button.is-week-selected:nth-child(7n) { border-radius: 0 6px 6px 0; }
+.momentum-mini-calendar-days button.is-today { box-shadow: inset 0 0 0 1px #7967ff; font-weight: 700; }
+.momentum-mini-calendar-days button.is-outside { color: #c4c8d8; }
+.momentum-mini-calendar-days button:disabled { cursor: default; opacity: .55; }
+.momentum-date-current-week { width: 100%; margin-top: 9px; padding-top: 8px; border: 0; border-top: 1px solid #efeff7; color: #4a33f3; background: transparent; font: inherit; font-size: 10px; font-weight: 700; cursor: pointer; }
 .momentum-layout { align-items: flex-start; gap: 28px; }
 .momentum-primary-column { display: flex; flex: 1; min-width: 0; flex-direction: column; gap: 20px; }
 .momentum-secondary-column { display: flex; width: 304px; flex: 0 0 304px; flex-direction: column; gap: 20px; }
