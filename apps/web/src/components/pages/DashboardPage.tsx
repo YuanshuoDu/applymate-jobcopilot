@@ -1,6 +1,6 @@
 'use client'
 
-import React, { useEffect, useMemo, useState } from 'react'
+import React, { useEffect, useMemo, useRef, useState } from 'react'
 import {
   ArrowRight, BriefcaseBusiness, CalendarDays, Check, ChevronDown, ChevronLeft, ChevronRight,
   Eye, FileText, MailCheck, MoreVertical, Send, Sparkles, Target, X,
@@ -237,6 +237,7 @@ export function DashboardPage() {
   const [weekOffset, setWeekOffset] = useState(0)
   const [dateMenuOpen, setDateMenuOpen] = useState(false)
   const [calendarMonth, setCalendarMonth] = useState(() => new Date())
+  const dateControlRef = useRef<HTMLDivElement>(null)
   // Keep the request key stable across renders. Recreating dates here caused
   // a new URL (and therefore a new dashboard request) after every state update.
   const selectedRange = useMemo(() => getWeekRange(weekOffset), [weekOffset])
@@ -250,6 +251,22 @@ export function DashboardPage() {
   useEffect(() => {
     setProfilePromptDismissed(window.sessionStorage.getItem('applymate-dismissed-resume-reminder') === 'true')
   }, [])
+
+  useEffect(() => {
+    if (!dateMenuOpen) return
+    const closeDateMenu = (event: PointerEvent) => {
+      if (!dateControlRef.current?.contains(event.target as Node)) setDateMenuOpen(false)
+    }
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') setDateMenuOpen(false)
+    }
+    document.addEventListener('pointerdown', closeDateMenu)
+    document.addEventListener('keydown', closeOnEscape)
+    return () => {
+      document.removeEventListener('pointerdown', closeDateMenu)
+      document.removeEventListener('keydown', closeOnEscape)
+    }
+  }, [dateMenuOpen])
 
   function dismissProfilePrompt() {
     window.sessionStorage.setItem('applymate-dismissed-resume-reminder', 'true')
@@ -277,7 +294,7 @@ export function DashboardPage() {
         )}
         <header className="momentum-header">
           <div><span><Sparkles size={23} /></span><div><h1>Application Momentum</h1><p>Stay consistent, focus on quality, and keep moving forward.</p></div></div>
-          <div className="momentum-date-control">
+          <div className="momentum-date-control" ref={dateControlRef}>
             <button className="momentum-date-picker" onClick={() => { setCalendarMonth(new Date(selectedRange.start)); setDateMenuOpen(open => !open) }} aria-expanded={dateMenuOpen}><CalendarDays size={16} /> <span>{formatWeekRange(selectedRange)}</span> <ChevronDown size={14} /></button>
             {dateMenuOpen && <div className="momentum-date-menu" role="dialog" aria-label="Choose dashboard week">
               <div className="momentum-mini-calendar-heading"><button aria-label="Previous month" onClick={() => setCalendarMonth(month => new Date(month.getFullYear(), month.getMonth() - 1, 1))}><ChevronLeft size={14} /></button><strong>{calendarMonth.toLocaleDateString('en-GB', { month: 'long', year: 'numeric' })}</strong><button aria-label="Next month" onClick={() => setCalendarMonth(month => new Date(month.getFullYear(), month.getMonth() + 1, 1))}><ChevronRight size={14} /></button></div>

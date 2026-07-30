@@ -79,13 +79,20 @@ export function Sidebar({ active, onNav, onNavIntent, session, jobCount: jobCoun
   }, [accountMenuOpen, userPlan])
 
   useEffect(() => {
-    if (!accountMenuOpen) return
-    const closeOnOutsidePointer = (event: MouseEvent) => {
+    if (!accountMenuOpen && !notificationPanel) return
+    const closeOnOutsidePointer = (event: PointerEvent) => {
       if (!accountAreaRef.current?.contains(event.target as Node)) onDismissSidebarPopovers()
     }
-    document.addEventListener('mousedown', closeOnOutsidePointer)
-    return () => document.removeEventListener('mousedown', closeOnOutsidePointer)
-  }, [accountMenuOpen, onDismissSidebarPopovers])
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') onDismissSidebarPopovers()
+    }
+    document.addEventListener('pointerdown', closeOnOutsidePointer)
+    document.addEventListener('keydown', closeOnEscape)
+    return () => {
+      document.removeEventListener('pointerdown', closeOnOutsidePointer)
+      document.removeEventListener('keydown', closeOnEscape)
+    }
+  }, [accountMenuOpen, notificationPanel, onDismissSidebarPopovers])
 
   const plan = userPlan ?? (user as { plan?: string } | undefined)?.plan ?? 'free'
   const planLabel = plan === 'enterprise' ? 'Team Plan' : plan === 'pro' ? 'Pro Plan' : 'Free Plan'

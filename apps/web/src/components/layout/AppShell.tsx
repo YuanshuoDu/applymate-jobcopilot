@@ -183,16 +183,6 @@ export function AppShell() {
   const navContextValue = useMemo(() => ({ navigate: navigatePage }), [navigatePage])
 
   useEffect(() => {
-    if (!sidebarPopover) return
-    const dismissOutsideSidebar = (event: MouseEvent) => {
-      const target = event.target
-      if (!(target instanceof Element) || !target.closest('#desktop-sidebar')) setSidebarPopover(null)
-    }
-    document.addEventListener('mousedown', dismissOutsideSidebar)
-    return () => document.removeEventListener('mousedown', dismissOutsideSidebar)
-  }, [sidebarPopover])
-
-  useEffect(() => {
     if (status !== 'authenticated') { setCheckingOnboard(false); return }
     fetch('/api/me')
       .then(r => r.json())
