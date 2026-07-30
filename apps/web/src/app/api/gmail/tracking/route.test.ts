@@ -4,7 +4,6 @@ const mocks = vi.hoisted(() => ({
   requireAuth: vi.fn(),
   findGmailConnection: vi.fn(),
   syncGmailForUser: vi.fn(),
-  messagesFindMany: vi.fn(),
   recommendationsFindMany: vi.fn(),
   recommendationsUpdate: vi.fn(),
 }))
@@ -19,7 +18,6 @@ vi.mock('@/lib/gmail-helpers', () => ({ findGmailConnection: mocks.findGmailConn
 vi.mock('@/lib/gmail-tracking/sync', () => ({ syncGmailForUser: mocks.syncGmailForUser }))
 vi.mock('@/lib/db', () => ({
   db: {
-    gmailMessage: { findMany: mocks.messagesFindMany },
     gmailRecommendation: { findMany: mocks.recommendationsFindMany, update: mocks.recommendationsUpdate },
   },
 }))
@@ -38,7 +36,6 @@ describe('GET /api/gmail/tracking', () => {
       newRecommendations: 2,
       error: null,
     })
-    mocks.messagesFindMany.mockResolvedValue([{ id: 'message-1', subject: 'Application received', job: null }])
     mocks.recommendationsUpdate.mockResolvedValue({})
     mocks.recommendationsFindMany.mockResolvedValue([
       { id: 'recommendation-1', status: 'pending', platform: 'Indeed', company: 'Acme', role: 'Data Engineer', location: 'Dublin, County Dublin', savedJob: null },
@@ -57,7 +54,7 @@ describe('GET /api/gmail/tracking', () => {
     expect(mocks.syncGmailForUser).not.toHaveBeenCalled()
   })
 
-  it('syncs only when the caller explicitly refreshes and returns tracked email evidence', async () => {
+  it('syncs only when the caller explicitly refreshes and returns the recommendation queue', async () => {
     const { GET } = await import('./route')
 
     const response = await GET(new Request('http://localhost/api/gmail/tracking?refresh=1') as never)
@@ -68,11 +65,9 @@ describe('GET /api/gmail/tracking', () => {
       sync: { importedMessages: 2, statusUpdates: 1, newRecommendations: 2 },
       pendingRecommendationCount: 1,
     })
-    expect(body.messages).toEqual(expect.arrayContaining([expect.objectContaining({ id: 'message-1' })]))
     expect(body.recommendations).toEqual(expect.arrayContaining([expect.objectContaining({ id: 'recommendation-1' })]))
     expect(mocks.findGmailConnection).toHaveBeenCalledWith('user-1')
     expect(mocks.syncGmailForUser).toHaveBeenCalledWith('user-1')
-    expect(mocks.messagesFindMany).toHaveBeenCalledWith(expect.objectContaining({ where: { userId: 'user-1' }, take: 80 }))
     expect(mocks.recommendationsFindMany).toHaveBeenCalledWith(expect.objectContaining({ where: { userId: 'user-1' }, take: 100 }))
   }, 10_000)
 

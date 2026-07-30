@@ -19,23 +19,15 @@ export async function GET(req: NextRequest) {
   if (!sync.connected) return err('GMAIL_REAUTH', 401)
   if (sync.error) return err('GMAIL_ERROR', 502)
 
-  const [messages, recommendations] = await Promise.all([
-    db.gmailMessage.findMany({
-      where: { userId: auth.userId },
-      orderBy: { receivedAt: 'desc' },
-      take: 80,
-      include: { job: { select: { id: true, company: true, role: true, status: true } } },
-    }),
-    db.gmailRecommendation.findMany({
-      where: { userId: auth.userId },
-      orderBy: { createdAt: 'desc' },
-      take: 100,
-      include: {
-        sourceMessage: { select: { gmailMessageId: true, gmailThreadId: true, subject: true, excerpt: true, receivedAt: true, senderName: true, senderEmail: true, matchConfidence: true } },
-        savedJob: { select: { id: true, company: true, role: true } },
-      },
-    }),
-  ])
+  const recommendations = await db.gmailRecommendation.findMany({
+    where: { userId: auth.userId },
+    orderBy: { createdAt: 'desc' },
+    take: 100,
+    include: {
+      sourceMessage: { select: { gmailMessageId: true, gmailThreadId: true, subject: true, excerpt: true, receivedAt: true, senderName: true, senderEmail: true, matchConfidence: true } },
+      savedJob: { select: { id: true, company: true, role: true } },
+    },
+  })
 
   const repairedRecommendations = refresh ? await Promise.all(recommendations.map(repairRecommendationFromExcerpt)) : recommendations
   const uniqueRecommendations = dedupeRecommendations(repairedRecommendations).map((item) => ({
@@ -45,7 +37,6 @@ export async function GET(req: NextRequest) {
 
   return ok({
     sync,
-    messages,
     recommendations: uniqueRecommendations,
     pendingRecommendationCount: uniqueRecommendations.filter((item) => item.status === 'pending').length,
   })

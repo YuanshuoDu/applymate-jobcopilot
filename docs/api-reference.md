@@ -204,6 +204,8 @@ Gmail routes require user auth. Routes that call Gmail also require a linked Goo
 | `POST` | `/api/gmail/send-draft` | Session or Bearer | JSON `{ to, subject?, draft, jobId? }` | `{ sent: true, to }` | [C93](#c93-gmail-send-draft) |
 | `GET` | `/api/gmail/threads` | Session or Bearer | none | `{ emails, hasGmail: true }`; body error codes `NO_GOOGLE_ACCOUNT`, `TOKEN_EXPIRED`, `GMAIL_REAUTH`, `GMAIL_SCOPE_MISSING`, `GMAIL_ERROR` | [C94](#c94-gmail-threads) |
 | `GET` | `/api/gmail/unread` | Session cookie | none | `{ unread, hasGmail }`; returns zero if unavailable | [C95](#c95-gmail-unread) |
+| `GET` | `/api/gmail/tracking` | Session cookie | Query `refresh=1` optionally syncs Gmail first | `{ recommendations, pendingRecommendationCount, sync }` | — |
+| `PATCH` | `/api/gmail/recommendations/:id` | Session cookie | JSON `{ action: "save" | "dismiss" }` | Updated recommendation and, for Save, a My Jobs record | — |
 
 ## Dashboard
 

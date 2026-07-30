@@ -39,7 +39,7 @@ Email classifications are intentionally separate from job status:
 | Interview invitation | Move Saved/Applied to Interview; add timeline evidence |
 | Offer | Move active application to Offer; add timeline evidence |
 | Rejection | Move active application to Rejected; add timeline evidence |
-| Employer update | Add timeline evidence only |
+| Application update | Add timeline evidence only |
 | Recommendation digest | Create reviewable recommendation cards |
 | Other | Ignore; it is not job-application evidence |
 
@@ -52,16 +52,19 @@ or leave it unlinked.
 
 ### Gmail
 
-The Gmail page has two task-focused views:
+The Gmail page remains a familiar three-pane inbox: filter application evidence
+in the left sidebar, select a message in the list, and read it in the original
+mail reader. Its evidence filters are **Applied**, **Interview**, **Offer**,
+**Rejected**, and **Application update**. A recommendation digest may appear in
+the inbox but is managed from the dedicated entry beside the Gmail title, not
+from a second sidebar filter.
 
-1. **Application updates** groups persisted application evidence by type. Each
-   card names the linked job and its outcome, or clearly says that it needs
-   matching. A link to Gmail remains available for the original message.
-2. **Recommended jobs** contains jobs extracted from job-platform digest emails.
-   A card shows the available role, company, location, source platform and
-   application link. The user can Save to My Jobs or Dismiss it. Saving creates
-   one normal My Jobs record in `saved` state, so subsequent scoring and
-   application work use the same path as discovered jobs.
+**Job recommendations** is a separate list-management page for roles extracted
+from Indeed, LinkedIn, GradIreland, IrishJobs and similar subscription emails.
+It deduplicates repeated roles, displays the source platform, and lets the user
+Save or Dismiss each job. Saving creates one normal My Jobs record in `saved`
+state, so subsequent scoring and application work use the same path as
+discovered jobs.
 
 ### My Jobs
 
@@ -77,13 +80,16 @@ The dashboard timeline is projected from persisted Activity events rather than
 from the current row state of five jobs. It can consequently show an
 application receipt followed by an interview invitation and a later outcome.
 When a daily sync finds new, unsaved recommendations, the Dashboard displays a
-clear count and the notification bell opens the Gmail view.
+Job notifications panel and the notification bell deep-links to Job
+recommendations.
 
 ## Sync and notification behaviour
 
 `syncGmailForUser` is the sole writer for Gmail-derived state. It is used by
-the Gmail page refresh, the daily protected cron endpoint, and the agent audit
-stage. For each new message it does the following in order:
+the Job recommendations refresh, the daily protected cron endpoint, and the
+agent audit stage. The inbox itself reads Gmail directly so it can retain the
+original mail experience. For each newly persisted message, sync does the
+following in order:
 
 1. classify the message and persist it with a unique Gmail id;
 2. extract and score a job match;
@@ -119,4 +125,4 @@ notification migration.
   saved into My Jobs or dismissed.
 - My Jobs counts are server aggregates and do not change because of pagination
   or a local filter.
-- Daily recommendation notifications deep-link to Gmail.
+- Daily recommendation notifications deep-link to Job recommendations.

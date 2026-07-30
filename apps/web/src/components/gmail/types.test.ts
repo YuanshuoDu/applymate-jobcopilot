@@ -1,25 +1,17 @@
 import { describe, expect, it } from 'vitest'
 
-import type { GmailTrackingResponse, TrackedGmailMessage } from './types'
+import type { GmailRecommendation, GmailTrackingResponse } from './types'
 
 describe('Gmail tracker view types', () => {
-  it('represents persisted application evidence with an optional linked job', () => {
-    const message: TrackedGmailMessage = {
-      id: 'message-1',
-      gmailMessageId: 'gmail-1',
-      gmailThreadId: null,
-      kind: 'interview_invitation',
-      senderEmail: 'talent@example.com',
-      senderName: 'Talent team',
-      subject: 'Interview invitation',
-      excerpt: 'Choose a time for your interview.',
-      inferredCompany: 'Example',
-      inferredRole: 'Product Designer',
-      receivedAt: '2026-07-29T08:00:00.000Z',
-      job: { id: 'job-1', company: 'Example', role: 'Product Designer', status: 'interview' },
+  it('represents the recommendation queue returned to the management page', () => {
+    const recommendation: GmailRecommendation = {
+      id: 'recommendation-1', platform: 'Indeed', company: 'Example', role: 'Product Designer', location: 'Dublin', salary: null, url: null, description: null,
+      status: 'pending', createdAt: '2026-07-29T08:00:00.000Z',
+      sourceMessage: { gmailMessageId: 'gmail-1', gmailThreadId: null, subject: 'Job alert', receivedAt: '2026-07-29T08:00:00.000Z', senderName: 'Indeed', senderEmail: 'alerts@example.com', matchConfidence: null },
+      savedJob: null,
     }
-    const response: GmailTrackingResponse = { messages: [message], pendingRecommendationCount: 0 }
+    const response: GmailTrackingResponse = { recommendations: [recommendation], pendingRecommendationCount: 1 }
 
-    expect(response.messages?.[0].job?.status).toBe('interview')
+    expect(response.recommendations?.[0].status).toBe('pending')
   })
 })
