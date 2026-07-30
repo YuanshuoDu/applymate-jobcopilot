@@ -237,13 +237,13 @@ function KanbanView({ jobs, onStatusChange, onAddClick }: {
               onMouseLeave={e => { e.currentTarget.style.borderColor = 'var(--border)'; e.currentTarget.style.boxShadow = 'none' }}
               style={{ background: 'var(--bg)', border: '0.5px solid var(--border)', borderRadius: 8, padding: 12, marginBottom: 8, cursor: 'grab', transition: 'border-color 0.15s, box-shadow 0.15s, transform 0.12s', touchAction: 'none', userSelect: 'none' }}>
               <div style={{ display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between', marginBottom: 6 }}>
-                <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 6, minWidth: 0, flex: 1 }}>
                   <CompanyLogo logo={job.logo ?? job.company.slice(0, 2).toUpperCase()} size={20} />
-                  <span style={{ fontSize: 12, fontWeight: 500, color: 'var(--text)' }}>{job.company}</span>
+                  <span title={job.company} style={{ minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', fontSize: 12, fontWeight: 500, color: 'var(--text)' }}>{job.company}</span>
                 </div>
                 {job.score != null && <ScorePill score={job.score} />}
               </div>
-              <div style={{ marginBottom: 6, color: 'var(--text)', fontSize: 14, fontWeight: 700, lineHeight: 1.3, letterSpacing: '-0.01em' }}>{job.role}</div>
+              <div title={job.role} style={{ display: '-webkit-box', WebkitBoxOrient: 'vertical', WebkitLineClamp: 3, overflow: 'hidden', marginBottom: 6, color: 'var(--text)', fontSize: 14, fontWeight: 700, lineHeight: 1.3, letterSpacing: '-0.01em' }}>{job.role}</div>
               {job.keywords ? (() => {
                 const kws = job.keywords.split(',').map(k => k.trim()).filter(Boolean).slice(0, 6)
                 return kws.length > 0 ? (
