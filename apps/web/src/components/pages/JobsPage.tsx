@@ -296,15 +296,16 @@ function AddJobModal({ onClose, onAdded, prefillStatus }: {
   }
 
   return (
-    <div style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.3)', zIndex: 100, display: 'flex', alignItems: 'center', justifyContent: 'center' }}
+    <div style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.3)', zIndex: 100, display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 16 }}
       onClick={e => { if (e.target === e.currentTarget) onClose() }}>
-      <Card style={{ width: 460, padding: 24 }}>
+      <div role="dialog" aria-modal="true" aria-labelledby="add-job-title">
+      <Card style={{ width: 'min(460px, calc(100vw - 32px))', maxHeight: 'calc(100dvh - 32px)', overflowY: 'auto', padding: 24 }}>
         <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 20 }}>
-          <span style={{ fontSize: 14, fontWeight: 500 }}>Add Job</span>
+          <h2 id="add-job-title" style={{ margin: 0, fontSize: 16, fontWeight: 600 }}>Add job</h2>
           <Btn small variant="ghost" onClick={onClose}>✕</Btn>
         </div>
         <form onSubmit={handleSubmit} style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
-          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12 }}>
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(180px, 1fr))', gap: 12 }}>
             <div>
               <label style={labelSt}>Company *</label>
               <input style={INPUT_STYLE} value={form.company} onChange={e => setForm(f => ({ ...f, company: e.target.value }))} placeholder="e.g. Stripe" />
@@ -314,7 +315,7 @@ function AddJobModal({ onClose, onAdded, prefillStatus }: {
               <input style={INPUT_STYLE} value={form.role} onChange={e => setForm(f => ({ ...f, role: e.target.value }))} placeholder="e.g. Backend Engineer" />
             </div>
           </div>
-          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12 }}>
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(180px, 1fr))', gap: 12 }}>
             <div>
               <label style={labelSt}>Location</label>
               <input style={INPUT_STYLE} value={form.location} onChange={e => setForm(f => ({ ...f, location: e.target.value }))} placeholder="e.g. Amsterdam, NL" />
@@ -345,6 +346,7 @@ function AddJobModal({ onClose, onAdded, prefillStatus }: {
           </div>
         </form>
       </Card>
+      </div>
     </div>
   )
 }
