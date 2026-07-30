@@ -80,6 +80,7 @@ export function GmailMessageReader({ email, onClose, onStar, onMarkRead }: Gmail
       <footer style={{ padding: '10px 18px', borderTop: '0.5px solid var(--border)', display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'center' }}>
         <Btn variant="ghost" onClick={() => window.open(`https://mail.google.com/mail/#inbox/${email.threadId}`, '_blank')}>Open in Gmail ↗</Btn>
         {!loading && body && <button type="button" onClick={() => void translateMessage()} disabled={translating} style={translateButton(showTranslated, translating)}>{translating ? '⏳ Translating…' : showTranslated ? (lang === 'zh' ? '显示原文' : 'Show original') : (lang === 'zh' ? '🌐 翻译' : '🌐 Translate')}</button>}
+        {!loading && !canReply && <span style={{ marginLeft: 'auto', color: 'var(--text-muted)', fontSize: 11 }}>AI follow-up is available for application emails.</span>}
         {canReply && !loading && <Btn variant="primary" onClick={() => setShowReply(true)} style={{ marginLeft: 'auto' }}>✨ AI follow-up</Btn>}
       </footer>
     </article>
