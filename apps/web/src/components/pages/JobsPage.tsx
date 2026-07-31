@@ -1455,23 +1455,27 @@ export function JobsPage() {
     <div style={{ flex: 1, overflowY: 'auto', background: 'var(--bg-tertiary)', display: 'flex', flexDirection: 'column' }}>
       <header style={{ minHeight: 62, padding: '8px 30px', background: 'var(--bg-tertiary)' }}>
         <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 24, flexWrap: 'wrap' }}>
-          <div style={{ display: 'flex', alignItems: 'center', gap: 10, minWidth: 0 }}>
+          <div style={{ flex: '1 1 360px', display: 'flex', alignItems: 'center', gap: 10, minWidth: 0 }}>
             <h1 style={{ margin: 0, flexShrink: 0, fontSize: 22, fontWeight: 760, lineHeight: 1.1, letterSpacing: '-0.05em' }}>My Jobs</h1>
             <span style={{ flexShrink: 0, fontSize: 12, color: 'var(--primary)', background: 'rgba(79,70,229,0.09)', borderRadius: 999, padding: '4px 9px', fontWeight: 600 }}>{total}</span>
             <span style={{ minWidth: 0, overflow: 'hidden', color: 'var(--text-muted)', fontSize: 12, textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>Track your applications and move closer to your next opportunity.</span>
           </div>
-          <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' }}>
             {([
               [Bookmark, 'Saved', statusCounts.saved, '#6D5DFB'],
               [Check, 'Applied', statusCounts.applied, '#185FA5'],
               [UsersRound, 'Interviews', statusCounts.interview, '#3B6D11'],
-            ] as const).map(([Icon, label, count, color]) => (
-              <div key={label} style={{ height: 38, minWidth: 96, padding: '0 10px', display: 'inline-flex', alignItems: 'center', gap: 6, border: '1px solid var(--border)', borderRadius: 7, background: 'var(--bg)' }}>
-                <Icon size={14} color={color} strokeWidth={1.8} />
-                <span style={{ color: 'var(--text-muted)', fontSize: 11 }}>{label}</span>
-                <strong style={{ marginLeft: 'auto', color: 'var(--text)', fontSize: 12, fontWeight: 700 }}>{count}</strong>
-              </div>
+            ] as const).map(([Icon, label, count, color], index) => (
+              <React.Fragment key={label}>
+                {index > 0 && <span aria-hidden="true" style={{ width: 1, height: 28, margin: '0 2px', background: 'var(--border)' }} />}
+                <div style={{ height: 38, minWidth: 96, padding: '0 10px', display: 'inline-flex', alignItems: 'center', gap: 6, border: '1px solid var(--border)', borderRadius: 7, background: 'var(--bg)' }}>
+                  <Icon size={14} color={color} strokeWidth={1.8} />
+                  <span style={{ color: 'var(--text-muted)', fontSize: 11 }}>{label}</span>
+                  <strong style={{ marginLeft: 'auto', color: 'var(--text)', fontSize: 12, fontWeight: 700 }}>{count}</strong>
+                </div>
+              </React.Fragment>
             ))}
+            <span aria-hidden="true" style={{ width: 1, height: 28, margin: '0 2px', background: 'var(--border)' }} />
             <Btn variant="primary" onClick={() => { setPrefillStatus(null); setShowAdd(true) }} style={{ width: 116, height: 38, justifyContent: 'center', padding: 0, borderRadius: 7, fontSize: 11 }}>+ Add job</Btn>
           </div>
         </div>
