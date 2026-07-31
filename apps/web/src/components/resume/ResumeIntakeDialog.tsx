@@ -13,6 +13,7 @@ interface Props {
   onSaved:      (resume: Resume) => void
   directions:   Direction[]
   initialDirId?: string | null
+  initialFile?:  File | null
 }
 
 type TabId   = 'upload' | 'paste' | 'screenshot'
@@ -28,10 +29,11 @@ interface PersonaFields {
 
 // ── Component ─────────────────────────────────────────────────────────────────
 
-export function ResumeIntakeDialog({ onClose, onSaved, directions: initialDirections, initialDirId }: Props) {
+export function ResumeIntakeDialog({ onClose, onSaved, directions: initialDirections, initialDirId, initialFile }: Props) {
   const { t } = useI18n()
   const toast = useToast()
   const inputRef = useRef<HTMLInputElement>(null)
+  const processedInitialFileRef = useRef<File | null>(null)
 
   const [activeTab,      setActiveTab]      = useState<TabId>('upload')
   const [stage,          setStage]          = useState<Stage>('idle')
@@ -179,6 +181,14 @@ export function ResumeIntakeDialog({ onClose, onSaved, directions: initialDirect
       setStage('error')
     }
   }
+
+  useEffect(() => {
+    if (!initialFile || processedInitialFileRef.current === initialFile) return
+    processedInitialFileRef.current = initialFile
+    void processFile(initialFile)
+  // processFile intentionally uses the dialog's initial direction selection.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [initialFile])
 
   const onDrop = useCallback((e: React.DragEvent) => {
     e.preventDefault(); setDragOver(false)

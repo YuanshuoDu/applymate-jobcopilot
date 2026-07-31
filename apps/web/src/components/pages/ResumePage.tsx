@@ -600,6 +600,8 @@ export function ResumePage() {
   const [renamingResume,  setRenamingResume]  = useState<ResumeListItem | null>(null)
   const [showUploadModal,   setShowUploadModal]   = useState(false)
   const [showIntakeDialog,  setShowIntakeDialog]  = useState(false)
+  const [intakeFile,        setIntakeFile]        = useState<File | null>(null)
+  const [libraryImportDragOver, setLibraryImportDragOver] = useState(false)
   const [creatingResume,  setCreatingResume]  = useState(false)
   const [showAddSection,  setShowAddSection]  = useState(false)
   const [showVersions,    setShowVersions]    = useState(false)
@@ -1420,6 +1422,18 @@ export function ResumePage() {
     return null
   }
 
+  function openIntake(file: File | null = null) {
+    setIntakeFile(file)
+    setShowIntakeDialog(true)
+  }
+
+  function handleLibraryImportDrop(event: React.DragEvent<HTMLButtonElement>) {
+    event.preventDefault()
+    setLibraryImportDragOver(false)
+    const file = event.dataTransfer.files.item(0)
+    if (file) openIntake(file)
+  }
+
   // ── Render ────────────────────────────────────────────────────────────────
 
   return (
@@ -1432,7 +1446,7 @@ export function ResumePage() {
         </div>
       <div className="resume-library-toolbar">
         <div className="resume-library-toolbar-actions">
-          <Btn variant="primary" onClick={() => setShowIntakeDialog(true)}><Upload size={15} />Import &amp; parse</Btn>
+          <Btn variant="primary" onClick={() => openIntake()}><Upload size={15} />Import &amp; parse</Btn>
         </div>
         <span className="resume-toolbar-divider" />
         <Btn variant="ghost" onClick={() => setShowTemplates(true)}><LayoutTemplate size={15} />Templates</Btn>
@@ -1511,7 +1525,15 @@ export function ResumePage() {
               onSetDefault={handleSetDefaultResume}
               onUnlink={handleUnlinkResume}
             />
-            <button className="resume-library-import" onClick={() => setShowIntakeDialog(true)}>Import & parse a resume</button>
+            <button
+              className={`resume-library-import${libraryImportDragOver ? ' is-drag-over' : ''}`}
+              onClick={() => openIntake()}
+              onDragOver={event => { event.preventDefault(); event.dataTransfer.dropEffect = 'copy'; setLibraryImportDragOver(true) }}
+              onDragLeave={event => { if (!event.currentTarget.contains(event.relatedTarget as Node)) setLibraryImportDragOver(false) }}
+              onDrop={handleLibraryImportDrop}
+            >
+              {libraryImportDragOver ? 'Drop to import your resume' : 'Import & parse a resume'}
+            </button>
             </>}
           </aside>
           <div className="resume-workspace" style={{ flex: 1, overflowY: 'auto', padding: 24 }}>
@@ -1762,7 +1784,7 @@ export function ResumePage() {
       )}
       {showIntakeDialog && (
         <ResumeIntakeDialog
-          onClose={() => setShowIntakeDialog(false)}
+          onClose={() => { setShowIntakeDialog(false); setIntakeFile(null) }}
           onSaved={(resume) => {
             const item: ResumeListItem = {
               id: resume.id, name: resume.name, isDefault: resume.isDefault,
@@ -1774,10 +1796,12 @@ export function ResumePage() {
             setResumes(prev => [...prev, item])
             setSelectedResumeId(resume.id)
             toast.success('Resume saved', `"${resume.name}" added to your library`)
+            setIntakeFile(null)
             setShowIntakeDialog(false)
           }}
           directions={directions}
           initialDirId={selectedDirId}
+          initialFile={intakeFile}
         />
       )}
       {showAddDirection && (

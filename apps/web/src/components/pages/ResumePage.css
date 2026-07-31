@@ -107,6 +107,7 @@
 .resume-library-item-menu button:hover { background: #f3f1ff; }
 .resume-library-item-menu .danger { color: #c23636; }
 .resume-library-import { width: 100%; padding: 15px 10px; border: 1px dashed #b9b3e7; border-radius: 9px; background: #fbfaff; text-align: left; }
+.resume-library-import.is-drag-over { border-color: #5a40ee; background: #f1efff; }
 .resume-workspace { min-width: 0; padding: 16px 24px 28px !important; background: #fcfcff; }
 .resume-workspace-head { display: flex; align-items: center; justify-content: space-between; max-width: 760px; margin: 0 auto 13px; }
 .resume-workspace-head h2 { display: flex; align-items: baseline; gap: 9px; margin: 0; color: #151a35; font-size: 18px; letter-spacing: -.03em; }
