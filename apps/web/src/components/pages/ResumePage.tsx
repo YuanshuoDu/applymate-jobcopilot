@@ -1427,7 +1427,7 @@ export function ResumePage() {
     setShowIntakeDialog(true)
   }
 
-  function handleLibraryImportDrop(event: React.DragEvent<HTMLButtonElement>) {
+  function handleLibraryImportDrop(event: React.DragEvent<HTMLDivElement>) {
     event.preventDefault()
     setLibraryImportDragOver(false)
     const file = event.dataTransfer.files.item(0)
@@ -1525,15 +1525,15 @@ export function ResumePage() {
               onSetDefault={handleSetDefaultResume}
               onUnlink={handleUnlinkResume}
             />
-            <button
+            <div
               className={`resume-library-import${libraryImportDragOver ? ' is-drag-over' : ''}`}
-              onClick={() => openIntake()}
+              aria-label="Drop a PDF or DOCX resume to import"
               onDragOver={event => { event.preventDefault(); event.dataTransfer.dropEffect = 'copy'; setLibraryImportDragOver(true) }}
               onDragLeave={event => { if (!event.currentTarget.contains(event.relatedTarget as Node)) setLibraryImportDragOver(false) }}
               onDrop={handleLibraryImportDrop}
             >
-              {libraryImportDragOver ? 'Drop to import your resume' : 'Import & parse a resume'}
-            </button>
+              {libraryImportDragOver ? 'Drop to import your resume' : 'Drop a PDF or DOCX to import'}
+            </div>
             </>}
           </aside>
           <div className="resume-workspace" style={{ flex: 1, overflowY: 'auto', padding: 24 }}>
