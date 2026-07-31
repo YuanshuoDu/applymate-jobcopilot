@@ -1457,7 +1457,7 @@ export function JobsPage() {
         <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 24, flexWrap: 'wrap' }}>
           <div>
             <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
-              <h1 style={{ margin: 0, fontSize: 28, letterSpacing: '-0.03em' }}>My Jobs</h1>
+              <h1 style={{ margin: 0, fontSize: 22, fontWeight: 760, lineHeight: 1.1, letterSpacing: '-0.05em' }}>My Jobs</h1>
               <span style={{ fontSize: 12, color: 'var(--primary)', background: 'rgba(79,70,229,0.09)', borderRadius: 999, padding: '4px 9px', fontWeight: 600 }}>{total}</span>
             </div>
             <p style={{ margin: '7px 0 0', fontSize: 14, color: 'var(--text-muted)' }}>Track your applications and move closer to your next opportunity.</p>

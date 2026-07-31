@@ -14,7 +14,7 @@ export function TopBar({ title, titleAccessory, children }: { title: string; tit
       boxShadow: '0 1px 0 var(--border), 0 2px 12px rgba(79,70,229,0.04)',
     }}>
       <div style={{ display: 'flex', alignItems: 'center', gap: 10, flex: 1, minWidth: 80 }}>
-        <span style={{ fontSize: 14, fontWeight: 600, color: 'var(--text)', letterSpacing: '-0.01em', whiteSpace: 'nowrap' }}>{title}</span>
+        <span style={{ fontSize: 22, fontWeight: 760, lineHeight: 1.1, color: 'var(--text)', letterSpacing: '-0.05em', whiteSpace: 'nowrap' }}>{title}</span>
         {titleAccessory}
       </div>
       <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
