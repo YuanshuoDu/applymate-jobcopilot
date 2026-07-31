@@ -2,7 +2,7 @@
 
 import React, { useMemo, useState, useEffect, useRef, useCallback } from 'react'
 import { useSession } from 'next-auth/react'
-import { AlertCircle, Check, ChevronDown, ChevronRight, FileText, Info, LayoutGrid, Link2, List, LoaderCircle, Lock, Search, Sparkles, Trash2, X } from 'lucide-react'
+import { AlertCircle, Bookmark, Check, ChevronDown, ChevronRight, FileText, Info, LayoutGrid, Link2, List, LoaderCircle, Lock, Search, Sparkles, Trash2, UsersRound, X } from 'lucide-react'
 import { Btn, Card, CompanyLogo, INPUT_STYLE, ScorePill, StatusBadge, useToast, useConfirm } from '@/components/ui'
 import { ResumeRenderer } from '@/components/resume/ResumeRenderer'
 import { CoverLetterPreview } from '@/components/coverletter/CoverLetterPanel'
@@ -1460,21 +1460,19 @@ export function JobsPage() {
             <span style={{ flexShrink: 0, fontSize: 12, color: 'var(--primary)', background: 'rgba(79,70,229,0.09)', borderRadius: 999, padding: '4px 9px', fontWeight: 600 }}>{total}</span>
             <span style={{ minWidth: 0, overflow: 'hidden', color: 'var(--text-muted)', fontSize: 12, textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>Track your applications and move closer to your next opportunity.</span>
           </div>
-          <div style={{ display: 'flex', alignItems: 'center', gap: 0, flexWrap: 'wrap' }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
             {([
-              ['Saved', statusCounts.saved],
-              ['Applied', statusCounts.applied],
-              ['Interviews', statusCounts.interview],
-            ] as const).map(([label, count], index) => (
-              <React.Fragment key={label}>
-                {index > 0 && <span aria-hidden="true" style={{ width: 1, height: 28, margin: '0 2px', background: 'var(--border)' }} />}
-                <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6, minHeight: 38, padding: '0 10px', color: 'var(--text-muted)', fontSize: 11 }}>
-                  {label}<strong style={{ color: 'var(--text)', fontSize: 12, fontWeight: 700 }}>{count}</strong>
-                </span>
-              </React.Fragment>
+              [Bookmark, 'Saved', statusCounts.saved, '#6D5DFB'],
+              [Check, 'Applied', statusCounts.applied, '#185FA5'],
+              [UsersRound, 'Interviews', statusCounts.interview, '#3B6D11'],
+            ] as const).map(([Icon, label, count, color]) => (
+              <div key={label} style={{ height: 38, minWidth: 96, padding: '0 10px', display: 'inline-flex', alignItems: 'center', gap: 6, border: '1px solid var(--border)', borderRadius: 7, background: 'var(--bg)' }}>
+                <Icon size={14} color={color} strokeWidth={1.8} />
+                <span style={{ color: 'var(--text-muted)', fontSize: 11 }}>{label}</span>
+                <strong style={{ marginLeft: 'auto', color: 'var(--text)', fontSize: 12, fontWeight: 700 }}>{count}</strong>
+              </div>
             ))}
-            <span aria-hidden="true" style={{ width: 1, height: 28, margin: '0 8px', background: 'var(--border)' }} />
-            <Btn variant="primary" onClick={() => { setPrefillStatus(null); setShowAdd(true) }} style={{ minHeight: 38, padding: '0 12px', borderRadius: 7, fontSize: 11 }}>+ Add job</Btn>
+            <Btn variant="primary" onClick={() => { setPrefillStatus(null); setShowAdd(true) }} style={{ width: 116, height: 38, justifyContent: 'center', padding: 0, borderRadius: 7, fontSize: 11 }}>+ Add job</Btn>
           </div>
         </div>
       </header>
