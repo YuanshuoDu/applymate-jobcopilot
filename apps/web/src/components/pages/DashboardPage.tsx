@@ -2,7 +2,7 @@
 
 import React, { useEffect, useMemo, useRef, useState } from 'react'
 import {
-  ArrowRight, BriefcaseBusiness, CalendarDays, Check, ChevronDown, ChevronLeft, ChevronRight,
+  AlertCircle, ArrowRight, BriefcaseBusiness, CalendarDays, Check, ChevronDown, ChevronLeft, ChevronRight,
   Eye, FileText, MailCheck, MoreVertical, Send, Sparkles, Target, X,
 } from 'lucide-react'
 import { Btn, ScorePill, useToast } from '@/components/ui'
@@ -280,7 +280,7 @@ export function DashboardPage() {
   }, [refetch])
 
   if (loading) return <div className="momentum-loading">Loading your momentum dashboard…</div>
-  if (error) return <div className="momentum-loading"><p>{error}</p><Btn variant="ghost" onClick={refetch}>Retry</Btn></div>
+  if (error) return <div className="momentum-loading"><div className="momentum-error-state"><span><AlertCircle size={21} /></span><strong>Couldn’t load your dashboard</strong><p>Your application data is unchanged. Check your connection and try again.</p><Btn variant="primary" onClick={refetch}>Try again</Btn></div></div>
 
   const stats = data?.stats ?? { total: 0, saved: 0, applied: 0, inProgress: 0, interviews: 0, offers: 0, rejected: 0, thisWeek: 0 }
   const savedJobs = data?.savedJobs ?? []
