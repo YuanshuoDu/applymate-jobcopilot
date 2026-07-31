@@ -2,7 +2,7 @@
 
 import React, { useMemo, useState, useEffect, useRef, useCallback } from 'react'
 import { useSession } from 'next-auth/react'
-import { Bookmark, Check, ChevronDown, ChevronRight, FileText, Info, LayoutGrid, Link2, List, LoaderCircle, Lock, Search, Sparkles, Trash2, UsersRound, X } from 'lucide-react'
+import { AlertCircle, Bookmark, Check, ChevronDown, ChevronRight, FileText, Info, LayoutGrid, Link2, List, LoaderCircle, Lock, Search, Sparkles, Trash2, UsersRound, X } from 'lucide-react'
 import { Btn, Card, CompanyLogo, INPUT_STYLE, ScorePill, StatusBadge, useToast, useConfirm } from '@/components/ui'
 import { ResumeRenderer } from '@/components/resume/ResumeRenderer'
 import { CoverLetterPreview } from '@/components/coverletter/CoverLetterPanel'
@@ -237,13 +237,13 @@ function KanbanView({ jobs, onStatusChange, onAddClick }: {
               onMouseLeave={e => { e.currentTarget.style.borderColor = 'var(--border)'; e.currentTarget.style.boxShadow = 'none' }}
               style={{ background: 'var(--bg)', border: '0.5px solid var(--border)', borderRadius: 8, padding: 12, marginBottom: 8, cursor: 'grab', transition: 'border-color 0.15s, box-shadow 0.15s, transform 0.12s', touchAction: 'none', userSelect: 'none' }}>
               <div style={{ display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between', marginBottom: 6 }}>
-                <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 6, minWidth: 0, flex: 1 }}>
                   <CompanyLogo logo={job.logo ?? job.company.slice(0, 2).toUpperCase()} size={20} />
-                  <span style={{ fontSize: 12, fontWeight: 500, color: 'var(--text)' }}>{job.company}</span>
+                  <span title={job.company} style={{ minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', fontSize: 12, fontWeight: 500, color: 'var(--text)' }}>{job.company}</span>
                 </div>
                 {job.score != null && <ScorePill score={job.score} />}
               </div>
-              <div style={{ marginBottom: 6, color: 'var(--text)', fontSize: 14, fontWeight: 700, lineHeight: 1.3, letterSpacing: '-0.01em' }}>{job.role}</div>
+              <div title={job.role} style={{ display: '-webkit-box', WebkitBoxOrient: 'vertical', WebkitLineClamp: 3, overflow: 'hidden', marginBottom: 6, color: 'var(--text)', fontSize: 14, fontWeight: 700, lineHeight: 1.3, letterSpacing: '-0.01em' }}>{job.role}</div>
               {job.keywords ? (() => {
                 const kws = job.keywords.split(',').map(k => k.trim()).filter(Boolean).slice(0, 6)
                 return kws.length > 0 ? (
@@ -296,48 +296,49 @@ function AddJobModal({ onClose, onAdded, prefillStatus }: {
   }
 
   return (
-    <div style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.3)', zIndex: 100, display: 'flex', alignItems: 'center', justifyContent: 'center' }}
+    <div style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.3)', zIndex: 100, display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 16 }}
       onClick={e => { if (e.target === e.currentTarget) onClose() }}>
-      <Card style={{ width: 460, padding: 24 }}>
+      <div role="dialog" aria-modal="true" aria-labelledby="add-job-title">
+      <Card style={{ width: 'min(460px, calc(100vw - 32px))', maxHeight: 'calc(100dvh - 32px)', overflowY: 'auto', padding: 24 }}>
         <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 20 }}>
-          <span style={{ fontSize: 14, fontWeight: 500 }}>Add Job</span>
+          <h2 id="add-job-title" style={{ margin: 0, fontSize: 16, fontWeight: 600 }}>Add job</h2>
           <Btn small variant="ghost" onClick={onClose}>✕</Btn>
         </div>
         <form onSubmit={handleSubmit} style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
-          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12 }}>
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(180px, 1fr))', gap: 12 }}>
             <div>
-              <label style={labelSt}>Company *</label>
-              <input style={INPUT_STYLE} value={form.company} onChange={e => setForm(f => ({ ...f, company: e.target.value }))} placeholder="e.g. Stripe" />
+              <label htmlFor="add-job-company" style={labelSt}>Company *</label>
+              <input id="add-job-company" style={INPUT_STYLE} value={form.company} onChange={e => setForm(f => ({ ...f, company: e.target.value }))} placeholder="e.g. Stripe" />
             </div>
             <div>
-              <label style={labelSt}>Role *</label>
-              <input style={INPUT_STYLE} value={form.role} onChange={e => setForm(f => ({ ...f, role: e.target.value }))} placeholder="e.g. Backend Engineer" />
-            </div>
-          </div>
-          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12 }}>
-            <div>
-              <label style={labelSt}>Location</label>
-              <input style={INPUT_STYLE} value={form.location} onChange={e => setForm(f => ({ ...f, location: e.target.value }))} placeholder="e.g. Amsterdam, NL" />
-            </div>
-            <div>
-              <label style={labelSt}>Salary</label>
-              <input style={INPUT_STYLE} value={form.salary} onChange={e => setForm(f => ({ ...f, salary: e.target.value }))} placeholder="e.g. €70k–90k" />
+              <label htmlFor="add-job-role" style={labelSt}>Role *</label>
+              <input id="add-job-role" style={INPUT_STYLE} value={form.role} onChange={e => setForm(f => ({ ...f, role: e.target.value }))} placeholder="e.g. Backend Engineer" />
             </div>
           </div>
-          <div>
-            <label style={labelSt}>Job URL</label>
-            <input style={INPUT_STYLE} value={form.url} onChange={e => setForm(f => ({ ...f, url: e.target.value }))} placeholder="https://…" />
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(180px, 1fr))', gap: 12 }}>
+            <div>
+              <label htmlFor="add-job-location" style={labelSt}>Location</label>
+              <input id="add-job-location" style={INPUT_STYLE} value={form.location} onChange={e => setForm(f => ({ ...f, location: e.target.value }))} placeholder="e.g. Amsterdam, NL" />
+            </div>
+            <div>
+              <label htmlFor="add-job-salary" style={labelSt}>Salary</label>
+              <input id="add-job-salary" style={INPUT_STYLE} value={form.salary} onChange={e => setForm(f => ({ ...f, salary: e.target.value }))} placeholder="e.g. €70k–90k" />
+            </div>
           </div>
           <div>
-            <label style={labelSt}>Initial status</label>
-            <select style={INPUT_STYLE} value={form.status} onChange={e => setForm(f => ({ ...f, status: e.target.value as JobStatus }))}>
+            <label htmlFor="add-job-url" style={labelSt}>Job URL</label>
+            <input id="add-job-url" style={INPUT_STYLE} value={form.url} onChange={e => setForm(f => ({ ...f, url: e.target.value }))} placeholder="https://…" />
+          </div>
+          <div>
+            <label htmlFor="add-job-status" style={labelSt}>Initial status</label>
+            <select id="add-job-status" style={INPUT_STYLE} value={form.status} onChange={e => setForm(f => ({ ...f, status: e.target.value as JobStatus }))}>
               {KANBAN_COLS.map(c => <option key={c} value={c}>{COL_LABELS[c]}</option>)}
             </select>
           </div>
           <div style={{ display: 'flex', gap: 8, justifyContent: 'flex-end', marginTop: 4 }}>
             <Btn variant="ghost" onClick={onClose}>Cancel</Btn>
             <button type="submit" disabled={saving} style={{
-              padding: '7px 16px', background: '#185FA5', color: '#fff', border: 'none', borderRadius: 6,
+              padding: '7px 16px', background: 'var(--primary)', color: '#fff', border: 'none', borderRadius: 6,
               fontSize: 12, fontWeight: 500, cursor: saving ? 'not-allowed' : 'pointer', opacity: saving ? 0.7 : 1,
             }}>
               {saving ? 'Adding…' : 'Add Job'}
@@ -345,6 +346,7 @@ function AddJobModal({ onClose, onAdded, prefillStatus }: {
           </div>
         </form>
       </Card>
+      </div>
     </div>
   )
 }
@@ -695,6 +697,7 @@ function JobDetailDrawer({ job, onClose, onStatusChange, onUpdate, onDelete, onO
   // Drawer uses a slightly more compact variant of the shared INPUT_STYLE
   const drawerInputSt: React.CSSProperties = { ...INPUT_STYLE, fontSize: 11, padding: '5px 8px', borderRadius: 5 }
   const canTailorResume = Boolean(job.description && (baseResumes.length || existingTailoredResume || job.finalResumeId))
+  const packActionDisabled = autoPreparing || !canTailorResume
   const currentPackAudited = auditedPackKey === `${job.finalResumeId}:${job.finalCoverLetterId}`
     || (storedAudit?.audit.verdict === 'pass'
       && storedAudit.resumeId === job.finalResumeId
@@ -743,10 +746,10 @@ function JobDetailDrawer({ job, onClose, onStatusChange, onUpdate, onDelete, onO
             ) : <div style={{ border: '1px solid #dbe1ea', borderRadius: 12, padding: 18 }}>
               <div style={{ fontSize: 14, color: 'var(--text-muted)', lineHeight: 1.55, marginBottom: 14 }}>Choose a base resume and create a tailored version. You’ll review it in Resume before returning here.</div>
               {baseResumes.length > 1 && <select value={selectedResumeId} onChange={e => setSelectedResumeId(e.target.value)} style={{ ...drawerInputSt, width: '100%', marginBottom: 12 }}>{baseResumes.map(r => <option key={r.id} value={r.id}>{r.isDefault ? 'Default — ' : ''}{r.name}</option>)}</select>}
-              <Btn small onClick={handleTailorResume} disabled={tailoringLoading}>{tailoringLoading ? 'Creating tailored resume…' : 'Tailor in Resume'}</Btn>
+              <Btn variant="primary" onClick={handleTailorResume} disabled={tailoringLoading}>{tailoringLoading ? 'Creating tailored resume…' : 'Tailor in Resume'}</Btn>
             </div>}
             <div style={{ display: 'flex', alignItems: 'center', gap: 12, color: 'var(--text-muted)', margin: '4px 0 20px' }}><span style={{ height: 1, background: 'var(--border)', flex: 1 }} /><span>OR</span><span style={{ height: 1, background: 'var(--border)', flex: 1 }} /></div>
-            <button onClick={() => auditNeedsEvidence ? setOpenPackItem('audit') : void autoTailorAndAudit()} disabled={autoPreparing || !canTailorResume} style={{ width: '100%', minHeight: 56, padding: '14px', border: `2px solid ${auditNeedsRepair ? '#dc2626' : '#2563eb'}`, borderRadius: 9, background: auditNeedsRepair ? '#fff7f7' : '#fff', color: auditNeedsRepair ? '#b42318' : '#2563eb', fontSize: 15, fontWeight: 700, cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 10, textAlign: 'center' }}><Sparkles size={19} style={{ flexShrink: 0 }} />{autoPreparing ? 'Preparing application pack…' : auditNeedsEvidence ? 'Review evidence needed' : auditRetryOnly ? 'Retry independent audit' : auditNeedsRepair ? 'Fix with AI and re-audit' : 'Prepare full application pack automatically'}</button>
+            <button onClick={() => auditNeedsEvidence ? setOpenPackItem('audit') : void autoTailorAndAudit()} disabled={packActionDisabled} style={{ width: '100%', minHeight: 56, padding: '14px', border: `2px solid ${packActionDisabled ? '#e2e8f0' : auditNeedsRepair ? '#dc2626' : '#2563eb'}`, borderRadius: 9, background: packActionDisabled ? '#f8fafc' : auditNeedsRepair ? '#fff7f7' : '#fff', color: packActionDisabled ? '#94a3b8' : auditNeedsRepair ? '#b42318' : '#2563eb', fontSize: 15, fontWeight: 700, cursor: packActionDisabled ? 'not-allowed' : 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 10, textAlign: 'center' }}><Sparkles size={19} style={{ flexShrink: 0 }} />{autoPreparing ? 'Preparing application pack…' : auditNeedsEvidence ? 'Review evidence needed' : auditRetryOnly ? 'Retry independent audit' : auditNeedsRepair ? 'Fix with AI and re-audit' : 'Prepare full application pack automatically'}</button>
             {autoPreparing && <PreparationProgress stage={packStage} elapsed={preparationElapsed} />}
             <div style={{ textAlign: 'center', fontSize: 13, lineHeight: 1.55, color: 'var(--text-muted)', margin: '12px 28px 28px' }}>{auditRetryOnly ? 'Retrying the audit reuses your current resume and cover letter; it does not create new documents.' : auditNeedsEvidence ? 'Adding a confirmed fact saves it to Persona, then rewrites only the affected content.' : auditNeedsRepair ? 'This replaces unsupported claims; it does not invent experience, dates, or metrics.' : 'We’ll tailor your resume (if needed), generate a cover letter, and run an independent audit.'}</div>
             <div style={{ borderTop: '1px solid var(--border)', paddingTop: 22, fontSize: 12, fontWeight: 700, letterSpacing: '0.03em', color: '#64748b' }}>APPLICATION PACK</div>
@@ -1169,7 +1172,7 @@ function PaginationBar({
         <button onClick={() => onChangePage(page - 1)} disabled={page <= 1} style={btnStyle(page <= 1)}>‹</button>
         {pageNums.map(p => (
           <button key={p} onClick={() => onChangePage(p)}
-            style={{ ...btnStyle(false), minWidth: 28, textAlign: 'center', fontWeight: p === page ? 700 : 400, background: p === page ? 'rgba(24,95,165,0.08)' : 'var(--bg)', color: p === page ? '#185FA5' : 'var(--text)' }}>
+            style={{ ...btnStyle(false), minWidth: 28, textAlign: 'center', fontWeight: p === page ? 700 : 400, background: p === page ? 'rgba(79,70,229,0.08)' : 'var(--bg)', color: p === page ? 'var(--primary)' : 'var(--text)' }}>
             {p}
           </button>
         ))}
@@ -1492,20 +1495,24 @@ export function JobsPage() {
             {KANBAN_COLS.map(c => <option key={c} value={c}>{COL_LABELS[c]}</option>)}
           </select>
           <div style={{ display: 'flex', border: '0.5px solid var(--border)', borderRadius: 8, overflow: 'hidden' }}>
-            {([['list', List], ['kanban', LayoutGrid]] as const).map(([v, Icon]) => <button key={v} onClick={() => setView(v)} aria-label={`${v} view`} style={{ padding: '8px 12px', background: view === v ? '#185FA5' : 'var(--bg)', color: view === v ? '#fff' : 'var(--text-muted)', border: 'none', cursor: 'pointer', display: 'inline-flex' }}><Icon size={17} /></button>)}
+            {([['list', List], ['kanban', LayoutGrid]] as const).map(([v, Icon]) => <button key={v} onClick={() => setView(v)} aria-label={`${v} view`} style={{ padding: '8px 12px', background: view === v ? 'var(--primary)' : 'var(--bg)', color: view === v ? '#fff' : 'var(--text-muted)', border: 'none', cursor: 'pointer', display: 'inline-flex' }}><Icon size={17} /></button>)}
           </div>
         </div>
 {loading ? (
           <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 60 }}>
             <div style={{ display: 'flex', alignItems: 'center', gap: 10, color: 'var(--text-muted)', fontSize: 12 }}>
-              <div style={{ width: 20, height: 20, border: '2px solid rgba(24,95,165,0.2)', borderTopColor: '#185FA5', borderRadius: '50%', animation: 'spin 0.7s linear infinite' }} />
+              <div style={{ width: 20, height: 20, border: '2px solid rgba(79,70,229,0.2)', borderTopColor: 'var(--primary)', borderRadius: '50%', animation: 'spin 0.7s linear infinite' }} />
               Loading jobs…
             </div>
           </div>
         ) : fetchError ? (
-          <Card style={{ padding: 32, textAlign: 'center' }}>
-            <div style={{ fontSize: 13, color: '#A32D2D', marginBottom: 12 }}>{fetchError}</div>
-            <Btn variant="ghost" onClick={() => setSearch(s => s)}>Retry</Btn>
+          <Card style={{ display: 'grid', minHeight: 200, placeItems: 'center', padding: 32, textAlign: 'center' }}>
+            <div style={{ display: 'grid', justifyItems: 'center', maxWidth: 310 }}>
+              <span style={{ display: 'grid', width: 42, height: 42, marginBottom: 13, placeItems: 'center', borderRadius: 12, color: '#6b58ed', background: '#f1efff' }}><AlertCircle size={21} /></span>
+              <strong style={{ color: 'var(--text)', fontSize: 14 }}>Couldn’t load your jobs</strong>
+              <p style={{ margin: '8px 0 18px', color: 'var(--text-muted)', fontSize: 12, lineHeight: 1.5 }}>Your applications are unchanged. Check your connection and try again.</p>
+              <Btn variant="primary" onClick={triggerRefresh}>Try again</Btn>
+            </div>
           </Card>
         ) : jobs.length === 0 ? (
           <Card style={{ padding: 48, textAlign: 'center' }}>

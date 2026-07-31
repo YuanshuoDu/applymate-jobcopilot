@@ -18,6 +18,7 @@ export function AgentUnifiedStreamHeader({
   conversationSubtitle?: string | null
 }) {
   if (hideForNewChat) return null
+  const hasDistinctSubtitle = Boolean(conversationSubtitle && conversationSubtitle !== conversationTitle)
 
   return (
     <div style={{ padding: '12px 18px', borderBottom: '0.5px solid var(--border)', display: 'flex', alignItems: 'center', justifyContent: 'space-between', background: 'var(--bg)', flexShrink: 0 }}>
@@ -26,7 +27,9 @@ export function AgentUnifiedStreamHeader({
           {conversationTitle ?? 'Agent workspace'}
         </div>
         <div style={{ fontSize: 11, color: 'var(--text-muted)', marginTop: 3 }}>
-          {conversationTitle ? conversationSubtitle ?? 'Chat session' : `Agent workspace${summary ? ` · ${summary.processed} scored · ${summary.applied} applied` : ''}`}
+          {conversationTitle
+            ? (hasDistinctSubtitle ? conversationSubtitle : 'Chat session')
+            : (summary ? `${summary.processed} scored · ${summary.applied} applied` : 'Plan, review, and apply from one workspace.')}
         </div>
       </div>
       <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-end', gap: 3 }}>

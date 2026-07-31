@@ -217,12 +217,12 @@ export function AgentUnifiedStream({
       const existing = new Set(current.map(file => file.id))
       return [...current, ...next.filter(file => !existing.has(file.id))].slice(0, 6)
     })
-    toast.info('附件已添加', `${next.length} 个文件会作为上下文提示给 Agent`)
+    toast.info('Files attached', `${next.length} file${next.length === 1 ? '' : 's'} will be added as context for the Agent.`)
   }
 
   async function handleLiveBlockAction(action: TranscriptAction) {
     if (action.type === 'edit_automation_draft') {
-      setChatInput(action.prompt ?? '请编辑这个自动化草稿：')
+      setChatInput(action.prompt ?? 'Edit this automation draft:')
       setTimeout(() => inputRef.current?.focus(), 0)
       return
     }
@@ -307,15 +307,15 @@ export function AgentUnifiedStream({
   }
 
   const chips = [
-    { label: 'Create automation', prompt: '创建一个工作日 09:00 的自动化任务，帮我搜索并评分合适职位。' },
-    { label: 'Review pending', prompt: `审核 ${pendingCount} 个待定职位，并给出批准/跳过建议。` },
-    { label: 'Explain score', prompt: '解释最近高分职位的评分依据和缺口。' },
+    { label: 'Create automation', prompt: 'Create a weekday 09:00 automation to find and score suitable roles.' },
+    { label: 'Review pending', prompt: `Review the ${pendingCount} pending role${pendingCount === 1 ? '' : 's'} and recommend approve or skip.` },
+    { label: 'Explain score', prompt: 'Explain the latest high-match role, including scoring evidence and resume gaps.' },
     {
       label: 'Show thinking',
-      prompt: '展示本次 agent 判断的思考摘要和证据。',
+      prompt: 'Show a reasoning summary and the supporting evidence for this Agent decision.',
       onClick: () => liveBlocks.some(block => block.type === 'thinking_summary')
         ? setRevealThinkingVersion(v => v + 1)
-        : appendComposerContext('展示本次 agent 判断的思考摘要和证据。'),
+        : appendComposerContext('Show a reasoning summary and the supporting evidence for this Agent decision.'),
     },
   ]
 

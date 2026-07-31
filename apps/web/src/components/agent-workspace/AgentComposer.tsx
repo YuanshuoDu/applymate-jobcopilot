@@ -88,7 +88,7 @@ export function AgentComposer({
     <div style={{ borderTop: '0.5px solid var(--border)', padding: '10px 14px', background: 'var(--bg-secondary)', flexShrink: 0 }}>
       {waitingForAnswer && (
         <div style={{ marginBottom: 8, padding: '6px 10px', borderRadius: 7, background: 'rgba(245,158,11,0.08)', border: '1px solid rgba(245,158,11,0.25)', fontSize: 11, color: '#b45309' }}>
-          ⏸ Orchestrator 正在等待你回答上方问题，或直接在下方输入指令
+          ⏸ The Orchestrator is waiting for your answer above, or you can send a new instruction below.
         </div>
       )}
       <div style={{ display: 'flex', flexWrap: 'wrap', gap: 7, marginBottom: 8 }}>
@@ -152,8 +152,8 @@ export function AgentComposer({
           onChange={e => onChatInputChange(e.target.value)}
           onKeyDown={e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); onSendChat(chatInput) } }}
           placeholder={waitingForAnswer
-            ? '回答问题或发送指令给 Orchestrator… (Enter 发送)'
-            : '发送指令给 Orchestrator… (Enter 发送)'}
+            ? 'Answer the question or message the Orchestrator… (Enter to send)'
+            : 'Message the Orchestrator… (Enter to send)'}
           rows={2}
           style={{ width: '100%', boxSizing: 'border-box', padding: '10px 12px 6px', fontSize: 12, border: 'none', background: 'transparent', color: 'var(--text)', outline: 'none', resize: 'none', fontFamily: 'inherit', lineHeight: 1.55 }}
         />
@@ -194,7 +194,7 @@ export function AgentComposer({
                   <ComposerMenuButton
                     label="Paste job URL"
                     meta="Add a new link manually"
-                    onClick={() => onAppendComposerContext('请基于这个职位链接分析并准备申请：')}
+                    onClick={() => onAppendComposerContext('Analyse and prepare an application for this job link:')}
                   />
                 </ComposerMenuSection>
                 <ComposerMenuSection title="Resumes">
@@ -212,7 +212,7 @@ export function AgentComposer({
                   <ComposerMenuButton
                     label="Create automation"
                     meta="Start an agent-created routine"
-                    onClick={() => onAppendComposerContext('帮我创建一个新的自动化任务：')}
+                    onClick={() => onAppendComposerContext('Create a new automation for me:')}
                   />
                   <ComposerMenuButton
                     label="Attach files"

@@ -160,9 +160,9 @@
   .resume-library-layout.is-library-collapsed { grid-template-columns: 54px minmax(0, 1fr); min-width: 0; }
 }
 @media (max-width: 680px) {
-  .resume-library-heading { min-height: 54px; gap: 12px; padding: 8px 14px; }
+  .resume-library-heading { grid-template-columns: minmax(0, 1fr); min-height: 54px; gap: 8px; padding: 8px 14px; }
   .resume-library-heading h1 { font-size: 21px; }
-  .resume-library-toolbar { gap: 7px; overflow-x: auto; }
+  .resume-library-toolbar { width: 100%; gap: 7px; overflow-x: auto; padding-bottom: 2px; }
   .resume-library-layout { display: flex !important; flex-direction: column; }
   .resume-library-layout.is-library-collapsed { min-width: 0; }
   .resume-library-sidebar { width: auto; flex-basis: auto; border-right: 0; border-bottom: 1px solid #ebeaf6; }

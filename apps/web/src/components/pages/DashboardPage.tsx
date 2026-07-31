@@ -2,7 +2,7 @@
 
 import React, { useEffect, useMemo, useRef, useState } from 'react'
 import {
-  ArrowRight, BriefcaseBusiness, CalendarDays, Check, ChevronDown, ChevronLeft, ChevronRight,
+  AlertCircle, ArrowRight, BriefcaseBusiness, CalendarDays, Check, ChevronDown, ChevronLeft, ChevronRight,
   Eye, FileText, MailCheck, MoreVertical, Send, Sparkles, Target, X,
 } from 'lucide-react'
 import { Btn, ScorePill, useToast } from '@/components/ui'
@@ -107,7 +107,7 @@ function CoachCard({ hasResume, savedJobs, onAction }: { hasResume: boolean; sav
   const detail = !hasResume
     ? 'Upload your resume and the agent will tailor every recommendation to your experience.'
     : savedJobs > 0
-      ? `${savedJobs} high-match role${savedJobs === 1 ? '' : 's'} are ready for your next step.`
+      ? `${savedJobs} high-match role${savedJobs === 1 ? '' : 's'} ${savedJobs === 1 ? 'is' : 'are'} ready for your next step.`
       : 'Add 2–3 quantified achievements to make your experience easier for recruiters to scan.'
 
   return (
@@ -122,7 +122,7 @@ function CoachCard({ hasResume, savedJobs, onAction }: { hasResume: boolean; sav
 function MatchList({ jobs, threshold, onReview }: { jobs: DashboardSavedJob[]; threshold: number; onReview: () => void }) {
   return (
     <section className="momentum-side-card momentum-matches-card">
-      <div className="momentum-side-title"><Sparkles size={18} /><div><h2>High-match roles</h2><p>{jobs.length > 0 ? `${jobs.length} roles at ${threshold}%+ waiting for approval` : `Saved roles scoring ${threshold}%+ appear here`}</p></div></div>
+      <div className="momentum-side-title"><Sparkles size={18} /><div><h2>High-match roles</h2><p>{jobs.length > 0 ? `${jobs.length} role${jobs.length === 1 ? '' : 's'} at ${threshold}%+ waiting for approval` : `Saved roles scoring ${threshold}%+ appear here`}</p></div></div>
       <div className="momentum-match-list">
         {jobs.length === 0 ? <div className="momentum-side-empty"><BriefcaseBusiness size={19} /> Save promising roles to compare them here.</div> : jobs.slice(0, 3).map(job => (
           <article className="momentum-match" key={job.id}>
@@ -280,7 +280,7 @@ export function DashboardPage() {
   }, [refetch])
 
   if (loading) return <div className="momentum-loading">Loading your momentum dashboard…</div>
-  if (error) return <div className="momentum-loading"><p>{error}</p><Btn variant="ghost" onClick={refetch}>Retry</Btn></div>
+  if (error) return <div className="momentum-loading"><div className="momentum-error-state"><span><AlertCircle size={21} /></span><strong>Couldn’t load your dashboard</strong><p>Your application data is unchanged. Check your connection and try again.</p><Btn variant="primary" onClick={refetch}>Try again</Btn></div></div>
 
   const stats = data?.stats ?? { total: 0, saved: 0, applied: 0, inProgress: 0, interviews: 0, offers: 0, rejected: 0, thisWeek: 0 }
   const savedJobs = data?.savedJobs ?? []

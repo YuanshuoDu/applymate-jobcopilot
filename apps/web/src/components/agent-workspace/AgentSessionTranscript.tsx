@@ -37,7 +37,7 @@ export function AgentSessionTranscript({ sessionId, onBackToLive }: {
 
   async function handleAction(action: TranscriptAction) {
     if (action.type === 'edit_automation_draft') {
-      window.dispatchEvent(new CustomEvent('applymate:composer-prefill', { detail: action.prompt ?? '请编辑这个自动化草稿：' }))
+      window.dispatchEvent(new CustomEvent('applymate:composer-prefill', { detail: action.prompt ?? 'Edit this automation draft:' }))
       onBackToLive()
       return
     }

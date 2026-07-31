@@ -258,6 +258,36 @@ body {
   #desktop-sidebar  { display: none !important; }
   #mobile-bottom-bar { display: flex !important; }
   #main-content { padding-bottom: var(--bottom-bar); }
+
+  .settings-workspace {
+    flex-direction: column !important;
+    overflow-y: auto !important;
+  }
+
+  .settings-sidebar {
+    width: 100% !important;
+    min-height: 0;
+    flex-direction: row !important;
+    gap: 4px !important;
+    overflow-x: auto !important;
+    overflow-y: hidden !important;
+    border-right: 0 !important;
+    border-bottom: 1px solid var(--border) !important;
+    padding: 8px !important;
+  }
+
+  .settings-sidebar > div:first-child { display: none; }
+
+  .settings-sidebar button {
+    width: auto !important;
+    flex: 0 0 auto;
+    white-space: nowrap;
+  }
+
+  .settings-content {
+    overflow: visible !important;
+    padding: 16px !important;
+  }
 }
 
 /* ─── Mobile Bottom Nav ──────────────────────────────────────────────── */
@@ -285,7 +315,7 @@ body {
 }
 
 .input-base:focus-visible {
-  outline: 2px solid #185FA5;
+  outline: 2px solid var(--primary);
   outline-offset: 2px;
 }
 

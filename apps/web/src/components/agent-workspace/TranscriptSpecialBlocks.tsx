@@ -100,7 +100,7 @@ function AutomationDraftBlock({ event, border, onAction }: {
 function draftPrompt(draft: AutomationDraftAction) {
   const roles = draft.targetRoles.join(', ') || 'target roles'
   const locations = draft.targetLocations.join(', ') || 'target locations'
-  return `请编辑这个自动化草稿：名称 ${draft.name}；触发 ${draft.triggerType}${draft.cron ? ` (${draft.cron})` : ''}；目标 ${locations} 的 ${roles}；最低分 ${draft.minScore}+；每日上限 ${draft.dailyCap}；${draft.requireApproval ? '提交前需要审批' : '不需要审批'}。`
+  return `Edit this automation draft: name ${draft.name}; trigger ${draft.triggerType}${draft.cron ? ` (${draft.cron})` : ''}; target ${roles} roles in ${locations}; minimum score ${draft.minScore}+; daily limit ${draft.dailyCap}; ${draft.requireApproval ? 'approval required before submission' : 'no approval required before submission'}.`
 }
 
 function toAutomationDraftAction(draft: Record<string, unknown>): AutomationDraftAction {

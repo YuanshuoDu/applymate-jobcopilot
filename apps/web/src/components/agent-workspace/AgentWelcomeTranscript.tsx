@@ -24,8 +24,8 @@ export function AgentWelcomeTranscript({
         time={now}
       >
         <div style={bodyStyle}>
-          我已准备好接管这次求职任务。当前有 {savedCount} 个已保存职位
-          {pendingCount > 0 ? `，${pendingCount} 个待审核职位` : ''}；敏感动作会先请求确认。
+          I&apos;m ready to take over this job search. You currently have {savedCount} saved role{savedCount === 1 ? '' : 's'}
+          {pendingCount > 0 ? ` and ${pendingCount} waiting for review` : ''}. Sensitive actions will always ask for confirmation first.
         </div>
       </WelcomeBlock>
 
@@ -37,12 +37,12 @@ export function AgentWelcomeTranscript({
       >
         <details style={{ fontSize: 12, color: 'var(--text)', lineHeight: 1.65 }}>
           <summary style={{ cursor: 'pointer', color: 'var(--text-muted)', fontWeight: 650 }}>
-            查看当前判断摘要
+            View the current reasoning summary
           </summary>
           <div style={{ marginTop: 8, display: 'grid', gap: 5 }}>
-            <span>审批策略：{autonomousMode ? '自动决策开启，但外部提交仍需过安全门' : '交互确认优先'}</span>
-            <span>可用上下文：已保存职位、简历、Agent 配置、自动化规则。</span>
-            <span>下一步建议：创建自动化、审核待定职位，或解释最近的评分。</span>
+            <span>Approval policy: {autonomousMode ? 'autonomous decisions are enabled, but external submissions still pass a safety gate' : 'interactive confirmation comes first'}</span>
+            <span>Available context: saved roles, resume, Agent settings, and automation rules.</span>
+            <span>Suggested next step: create an automation, review pending roles, or explain a recent score.</span>
           </div>
         </details>
       </WelcomeBlock>
@@ -114,18 +114,18 @@ function WelcomeBlock({
 const STARTER_OPTIONS = [
   {
     label: 'Create automation',
-    description: '工作日自动搜索、评分，并按审批规则推进。',
-    prompt: '创建一个工作日 09:00 的自动化任务，帮我搜索 Berlin 软件工程职位，85 分以上进入审批。',
+    description: 'Search and score roles on weekdays, then follow your approval rules.',
+    prompt: 'Create a weekday 09:00 automation to find software engineering roles in Berlin and send matches above 85% for approval.',
   },
   {
     label: 'Review pending',
-    description: '查看待审核职位，并给出批准、跳过或补充信息建议。',
-    prompt: '审核当前待定职位，并按匹配度、风险和申请准备度给出建议。',
+    description: 'Review pending roles and recommend approve, skip, or follow-up actions.',
+    prompt: 'Review the pending roles and recommend an action based on match, risk, and application readiness.',
   },
   {
     label: 'Explain score',
-    description: '解释最近高分职位为什么值得投，以及缺口在哪里。',
-    prompt: '解释最近高分职位的评分依据、证据和简历缺口。',
+    description: 'Explain why the latest high-match role is worth applying for and identify gaps.',
+    prompt: 'Explain the latest high-match role, including scoring evidence and resume gaps.',
   },
 ]
 

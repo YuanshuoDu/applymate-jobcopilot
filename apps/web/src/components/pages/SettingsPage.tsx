@@ -52,9 +52,9 @@ function SettingsSection({ title, children }: { title: string; children: React.R
 
 function FieldRow({ label, children }: { label: string; children: React.ReactNode }) {
   return (
-    <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12, padding: '8px 0', borderBottom: '1px solid var(--border)', flexWrap: 'wrap' }}>
+    <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'flex-start', gap: 12, padding: '8px 0', borderBottom: '1px solid var(--border)', flexWrap: 'wrap' }}>
       <span style={{ fontSize: 12, color: 'var(--text-muted)', flexShrink: 0, minWidth: 130 }}>{label}</span>
-      <div style={{ display: 'flex', justifyContent: 'flex-end', flex: 1, minWidth: 0 }}>{children}</div>
+      <div style={{ display: 'flex', justifyContent: 'flex-start', flex: 1, minWidth: 0 }}>{children}</div>
     </div>
   )
 }
@@ -220,9 +220,9 @@ export function SettingsPage() {
         )}
       </TopBar>
 
-      <div style={{ display: 'flex', flex: 1, overflow: 'hidden' }}>
+      <div className="settings-workspace" style={{ display: 'flex', flex: 1, overflow: 'hidden' }}>
         {/* ── Settings sidebar ── */}
-        <div style={{
+        <div className="settings-sidebar" style={{
           width: 192, flexShrink: 0,
           background: 'var(--glass-sidebar)',
           backdropFilter: 'blur(20px)',
@@ -262,7 +262,7 @@ export function SettingsPage() {
         </div>
 
         {/* ── Content area ── */}
-        <div style={{ flex: 1, overflowY: 'auto', padding: '20px 24px', display: 'flex', flexDirection: 'column', gap: 16 }}>
+        <div className="settings-content" style={{ flex: 1, overflowY: 'auto', padding: '20px 24px', display: 'flex', flexDirection: 'column', gap: 16 }}>
 
           {/* ── Profile ── */}
           {activeTab === 'profile' && (
