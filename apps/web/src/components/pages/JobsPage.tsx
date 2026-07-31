@@ -2,7 +2,7 @@
 
 import React, { useMemo, useState, useEffect, useRef, useCallback } from 'react'
 import { useSession } from 'next-auth/react'
-import { Bookmark, Check, ChevronDown, ChevronRight, FileText, Info, LayoutGrid, Link2, List, LoaderCircle, Lock, Search, Sparkles, Trash2, UsersRound, X } from 'lucide-react'
+import { AlertCircle, Bookmark, Check, ChevronDown, ChevronRight, FileText, Info, LayoutGrid, Link2, List, LoaderCircle, Lock, Search, Sparkles, Trash2, UsersRound, X } from 'lucide-react'
 import { Btn, Card, CompanyLogo, INPUT_STYLE, ScorePill, StatusBadge, useToast, useConfirm } from '@/components/ui'
 import { ResumeRenderer } from '@/components/resume/ResumeRenderer'
 import { CoverLetterPreview } from '@/components/coverletter/CoverLetterPanel'
@@ -1506,9 +1506,13 @@ export function JobsPage() {
             </div>
           </div>
         ) : fetchError ? (
-          <Card style={{ padding: 32, textAlign: 'center' }}>
-            <div style={{ fontSize: 13, color: '#A32D2D', marginBottom: 12 }}>{fetchError}</div>
-            <Btn variant="ghost" onClick={() => setSearch(s => s)}>Retry</Btn>
+          <Card style={{ display: 'grid', minHeight: 200, placeItems: 'center', padding: 32, textAlign: 'center' }}>
+            <div style={{ display: 'grid', justifyItems: 'center', maxWidth: 310 }}>
+              <span style={{ display: 'grid', width: 42, height: 42, marginBottom: 13, placeItems: 'center', borderRadius: 12, color: '#6b58ed', background: '#f1efff' }}><AlertCircle size={21} /></span>
+              <strong style={{ color: 'var(--text)', fontSize: 14 }}>Couldn’t load your jobs</strong>
+              <p style={{ margin: '8px 0 18px', color: 'var(--text-muted)', fontSize: 12, lineHeight: 1.5 }}>Your applications are unchanged. Check your connection and try again.</p>
+              <Btn variant="primary" onClick={triggerRefresh}>Try again</Btn>
+            </div>
           </Card>
         ) : jobs.length === 0 ? (
           <Card style={{ padding: 48, textAlign: 'center' }}>
