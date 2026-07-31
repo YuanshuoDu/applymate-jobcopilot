@@ -1532,7 +1532,11 @@ export function ResumePage() {
               onDragLeave={event => { if (!event.currentTarget.contains(event.relatedTarget as Node)) setLibraryImportDragOver(false) }}
               onDrop={handleLibraryImportDrop}
             >
-              {libraryImportDragOver ? 'Drop to import your resume' : 'Drop a PDF or DOCX to import'}
+              <span className="resume-library-file-icon"><Upload size={18} strokeWidth={1.7} /></span>
+              <span className="resume-library-import-copy">
+                <strong>{libraryImportDragOver ? 'Drop to import your resume' : 'Drop a PDF or DOCX to import'}</strong>
+                <small>PDF or DOCX · up to 5 MB</small>
+              </span>
             </div>
             </>}
           </aside>
