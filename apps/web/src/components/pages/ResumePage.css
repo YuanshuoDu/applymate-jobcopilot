@@ -1,6 +1,6 @@
 .resume-library-page { background: #fcfcff; color: #151a35; }
 .resume-library-heading { display: grid; grid-template-columns: minmax(210px, 230px) minmax(0, 1fr); align-items: center; gap: 0; min-height: 62px; padding: 8px 28px; border-bottom: 1px solid #ebeaf6; background: #fff; }
-.resume-library-heading h1 { margin: 0; color: #141a36; font-size: 24px; font-weight: 760; letter-spacing: -.05em; white-space: nowrap; }
+.resume-library-heading h1 { margin: 0; color: #141a36; font-size: 22px; font-weight: 760; line-height: 1.1; letter-spacing: -.05em; white-space: nowrap; }
 .resume-library-toolbar { display: flex; flex: 1; align-items: center; min-width: 0; min-height: 42px; gap: 10px; margin-left: 0; padding: 0; background: transparent; }
 .resume-library-toolbar > button { min-height: 38px; gap: 8px !important; border: 0 !important; border-radius: 7px !important; background: transparent !important; font-size: 11px !important; }
 .resume-library-toolbar-actions { display: inline-flex; border-radius: 7px; }
@@ -74,6 +74,9 @@
 .resume-library-layout.is-library-collapsed { grid-template-columns: 54px minmax(0, 1fr) minmax(270px, 300px); min-width: 0; }
 .resume-library-sidebar { position: relative; min-width: 0; width: auto; display: flex; flex-direction: column; gap: 15px; padding: 20px 16px; overflow-x: hidden; overflow-y: auto; border-right: 1px solid #ebeaf6; background: #fff; }
 .resume-library-layout.is-library-collapsed .resume-library-sidebar { align-items: center; padding: 12px 8px; }
+.resume-library-collapsed-list { display: grid; align-content: start; gap: 8px; width: 100%; padding-top: 50px; }
+.resume-library-collapsed-item { display: grid; place-items: center; width: 100%; height: 36px; padding: 4px; border: 1px solid transparent; border-radius: 7px; color: #837aa8; background: transparent; cursor: pointer; }
+.resume-library-collapsed-item:hover, .resume-library-collapsed-item.is-selected { border-color: #cfcaf8; color: #4c32ef; background: #f1efff; }
 .resume-library-collapse { position: absolute; z-index: 4; top: 54px; right: -1px; display: inline-flex; align-items: center; justify-content: center; width: 25px; height: 32px; padding: 0; border: 1px solid #e4e3f4; border-right: 0; border-radius: 7px 0 0 7px; color: #5a4bcf; background: #fff; box-shadow: -2px 2px 7px rgba(41,31,130,.06); cursor: pointer; }
 .resume-library-layout.is-library-collapsed .resume-library-collapse { top: 18px; right: -1px; }
 .resume-library-sidebar-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
@@ -106,7 +109,11 @@
 .resume-library-item-menu button { padding: 6px 7px; border: 0; border-radius: 4px; color: #333858; background: transparent; font: inherit; font-size: 10px; text-align: left; cursor: pointer; }
 .resume-library-item-menu button:hover { background: #f3f1ff; }
 .resume-library-item-menu .danger { color: #c23636; }
-.resume-library-import { width: 100%; padding: 15px 10px; border: 1px dashed #b9b3e7; border-radius: 9px; background: #fbfaff; text-align: left; }
+.resume-library-import { box-sizing: border-box; display: flex; align-items: flex-start; gap: 8px; width: 100%; min-height: 108px; padding: 13px; border: 1px dashed #b9b3e7; border-radius: 7px; background: #fbfaff; cursor: default; text-align: left; }
+.resume-library-import.is-drag-over { border-color: #5a40ee; background: #f1efff; }
+.resume-library-import-copy { display: grid; gap: 4px; min-width: 0; padding: 1px 18px 0 2px; }
+.resume-library-import-copy strong { color: #4c32ef; font-size: 12px; font-weight: 700; line-height: 1.28; }
+.resume-library-import-copy small { color: #7a819e; font-size: 10px; }
 .resume-workspace { min-width: 0; padding: 16px 24px 28px !important; background: #fcfcff; }
 .resume-workspace-head { display: flex; align-items: center; justify-content: space-between; max-width: 760px; margin: 0 auto 13px; }
 .resume-workspace-head h2 { display: flex; align-items: baseline; gap: 9px; margin: 0; color: #151a35; font-size: 18px; letter-spacing: -.03em; }
@@ -161,7 +168,7 @@
 }
 @media (max-width: 680px) {
   .resume-library-heading { grid-template-columns: minmax(0, 1fr); min-height: 54px; gap: 8px; padding: 8px 14px; }
-  .resume-library-heading h1 { font-size: 21px; }
+  .resume-library-heading h1 { font-size: 19px; }
   .resume-library-toolbar { width: 100%; gap: 7px; overflow-x: auto; padding-bottom: 2px; }
   .resume-library-layout { display: flex !important; flex-direction: column; }
   .resume-library-layout.is-library-collapsed { min-width: 0; }

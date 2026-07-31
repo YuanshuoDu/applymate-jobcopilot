@@ -159,7 +159,7 @@ export function useToast() {
 }
 
 // ─── Btn — Premium Glass Button ───────────────────────────────────────────────
-type BtnVariant = 'primary' | 'ghost' | 'danger' | 'success' | 'glass'
+type BtnVariant = 'primary' | 'ghost' | 'danger' | 'success' | 'glass' | 'toolbar'
 
 export function Btn({
   variant = 'ghost',
@@ -216,6 +216,14 @@ export function Btn({
       color: '#059669',
       border: '1px solid rgba(5,150,105,0.25)',
       boxShadow: hovered ? '0 2px 8px rgba(5,150,105,0.15)' : 'none',
+    },
+    toolbar: {
+      minHeight: 34,
+      padding: '0 11px',
+      background: hovered ? '#f7f5ff' : '#fff',
+      color: '#4c32ef',
+      border: `1px solid ${hovered ? '#8c7eff' : '#dcd8fa'}`,
+      boxShadow: '0 2px 5px rgba(67,46,196,.05)',
     },
   }
 
