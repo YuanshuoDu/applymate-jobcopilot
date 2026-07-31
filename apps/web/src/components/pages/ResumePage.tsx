@@ -1453,7 +1453,7 @@ export function ResumePage() {
           if (dirty) handleSave()
           window.open(`/resume/${selectedResumeId}/print`, '_blank')
         }}><FileDown size={15} />Export PDF</Btn>
-        <div className="resume-final-confirm-trigger"><Btn variant="ghost" onClick={() => {
+        <div className="resume-final-confirm-trigger"><Btn variant="toolbar" onClick={() => {
           if (!selectedResumeId || !content) { toast.info('Select a resume first'); return }
           setShowFinalConfirm(true)
         }}><ShieldCheck size={15} />Final confirm</Btn></div>

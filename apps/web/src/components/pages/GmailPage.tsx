@@ -100,7 +100,7 @@ export function GmailPage() {
     <TopBar title="Gmail Tracker" titleAccessory={recommendationsEntry}>
       {counts.unread > 0 && <span style={{ fontSize: 11, background: 'var(--primary)', color: '#fff', borderRadius: 999, padding: '2px 8px', fontWeight: 500 }}>{counts.unread} unread</span>}
       <input value={search} onChange={event => setSearch(event.target.value)} placeholder="Search emails…" aria-label="Search emails" style={searchStyle} />
-      <Btn variant="ghost" onClick={() => void loadEmails(true)} disabled={refreshing}>{refreshing ? '…' : '⟳ Refresh'}</Btn>
+      <Btn variant="toolbar" onClick={() => void loadEmails(true)} disabled={refreshing}>{refreshing ? '…' : '⟳ Refresh'}</Btn>
     </TopBar>
     <div style={{ flex: 1, display: 'flex', overflow: 'hidden' }}>
       <GmailInboxSidebar activeFilter={filter} counts={counts} email={session?.user?.email} onFilterChange={setFilter} />
