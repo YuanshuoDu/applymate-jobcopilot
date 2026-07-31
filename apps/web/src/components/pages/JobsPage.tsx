@@ -307,38 +307,38 @@ function AddJobModal({ onClose, onAdded, prefillStatus }: {
         <form onSubmit={handleSubmit} style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
           <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(180px, 1fr))', gap: 12 }}>
             <div>
-              <label style={labelSt}>Company *</label>
-              <input style={INPUT_STYLE} value={form.company} onChange={e => setForm(f => ({ ...f, company: e.target.value }))} placeholder="e.g. Stripe" />
+              <label htmlFor="add-job-company" style={labelSt}>Company *</label>
+              <input id="add-job-company" style={INPUT_STYLE} value={form.company} onChange={e => setForm(f => ({ ...f, company: e.target.value }))} placeholder="e.g. Stripe" />
             </div>
             <div>
-              <label style={labelSt}>Role *</label>
-              <input style={INPUT_STYLE} value={form.role} onChange={e => setForm(f => ({ ...f, role: e.target.value }))} placeholder="e.g. Backend Engineer" />
+              <label htmlFor="add-job-role" style={labelSt}>Role *</label>
+              <input id="add-job-role" style={INPUT_STYLE} value={form.role} onChange={e => setForm(f => ({ ...f, role: e.target.value }))} placeholder="e.g. Backend Engineer" />
             </div>
           </div>
           <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(180px, 1fr))', gap: 12 }}>
             <div>
-              <label style={labelSt}>Location</label>
-              <input style={INPUT_STYLE} value={form.location} onChange={e => setForm(f => ({ ...f, location: e.target.value }))} placeholder="e.g. Amsterdam, NL" />
+              <label htmlFor="add-job-location" style={labelSt}>Location</label>
+              <input id="add-job-location" style={INPUT_STYLE} value={form.location} onChange={e => setForm(f => ({ ...f, location: e.target.value }))} placeholder="e.g. Amsterdam, NL" />
             </div>
             <div>
-              <label style={labelSt}>Salary</label>
-              <input style={INPUT_STYLE} value={form.salary} onChange={e => setForm(f => ({ ...f, salary: e.target.value }))} placeholder="e.g. €70k–90k" />
+              <label htmlFor="add-job-salary" style={labelSt}>Salary</label>
+              <input id="add-job-salary" style={INPUT_STYLE} value={form.salary} onChange={e => setForm(f => ({ ...f, salary: e.target.value }))} placeholder="e.g. €70k–90k" />
             </div>
           </div>
           <div>
-            <label style={labelSt}>Job URL</label>
-            <input style={INPUT_STYLE} value={form.url} onChange={e => setForm(f => ({ ...f, url: e.target.value }))} placeholder="https://…" />
+            <label htmlFor="add-job-url" style={labelSt}>Job URL</label>
+            <input id="add-job-url" style={INPUT_STYLE} value={form.url} onChange={e => setForm(f => ({ ...f, url: e.target.value }))} placeholder="https://…" />
           </div>
           <div>
-            <label style={labelSt}>Initial status</label>
-            <select style={INPUT_STYLE} value={form.status} onChange={e => setForm(f => ({ ...f, status: e.target.value as JobStatus }))}>
+            <label htmlFor="add-job-status" style={labelSt}>Initial status</label>
+            <select id="add-job-status" style={INPUT_STYLE} value={form.status} onChange={e => setForm(f => ({ ...f, status: e.target.value as JobStatus }))}>
               {KANBAN_COLS.map(c => <option key={c} value={c}>{COL_LABELS[c]}</option>)}
             </select>
           </div>
           <div style={{ display: 'flex', gap: 8, justifyContent: 'flex-end', marginTop: 4 }}>
             <Btn variant="ghost" onClick={onClose}>Cancel</Btn>
             <button type="submit" disabled={saving} style={{
-              padding: '7px 16px', background: '#185FA5', color: '#fff', border: 'none', borderRadius: 6,
+              padding: '7px 16px', background: 'var(--primary)', color: '#fff', border: 'none', borderRadius: 6,
               fontSize: 12, fontWeight: 500, cursor: saving ? 'not-allowed' : 'pointer', opacity: saving ? 0.7 : 1,
             }}>
               {saving ? 'Adding…' : 'Add Job'}
@@ -1172,7 +1172,7 @@ function PaginationBar({
         <button onClick={() => onChangePage(page - 1)} disabled={page <= 1} style={btnStyle(page <= 1)}>‹</button>
         {pageNums.map(p => (
           <button key={p} onClick={() => onChangePage(p)}
-            style={{ ...btnStyle(false), minWidth: 28, textAlign: 'center', fontWeight: p === page ? 700 : 400, background: p === page ? 'rgba(24,95,165,0.08)' : 'var(--bg)', color: p === page ? '#185FA5' : 'var(--text)' }}>
+            style={{ ...btnStyle(false), minWidth: 28, textAlign: 'center', fontWeight: p === page ? 700 : 400, background: p === page ? 'rgba(79,70,229,0.08)' : 'var(--bg)', color: p === page ? 'var(--primary)' : 'var(--text)' }}>
             {p}
           </button>
         ))}
@@ -1495,13 +1495,13 @@ export function JobsPage() {
             {KANBAN_COLS.map(c => <option key={c} value={c}>{COL_LABELS[c]}</option>)}
           </select>
           <div style={{ display: 'flex', border: '0.5px solid var(--border)', borderRadius: 8, overflow: 'hidden' }}>
-            {([['list', List], ['kanban', LayoutGrid]] as const).map(([v, Icon]) => <button key={v} onClick={() => setView(v)} aria-label={`${v} view`} style={{ padding: '8px 12px', background: view === v ? '#185FA5' : 'var(--bg)', color: view === v ? '#fff' : 'var(--text-muted)', border: 'none', cursor: 'pointer', display: 'inline-flex' }}><Icon size={17} /></button>)}
+            {([['list', List], ['kanban', LayoutGrid]] as const).map(([v, Icon]) => <button key={v} onClick={() => setView(v)} aria-label={`${v} view`} style={{ padding: '8px 12px', background: view === v ? 'var(--primary)' : 'var(--bg)', color: view === v ? '#fff' : 'var(--text-muted)', border: 'none', cursor: 'pointer', display: 'inline-flex' }}><Icon size={17} /></button>)}
           </div>
         </div>
 {loading ? (
           <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 60 }}>
             <div style={{ display: 'flex', alignItems: 'center', gap: 10, color: 'var(--text-muted)', fontSize: 12 }}>
-              <div style={{ width: 20, height: 20, border: '2px solid rgba(24,95,165,0.2)', borderTopColor: '#185FA5', borderRadius: '50%', animation: 'spin 0.7s linear infinite' }} />
+              <div style={{ width: 20, height: 20, border: '2px solid rgba(79,70,229,0.2)', borderTopColor: 'var(--primary)', borderRadius: '50%', animation: 'spin 0.7s linear infinite' }} />
               Loading jobs…
             </div>
           </div>
