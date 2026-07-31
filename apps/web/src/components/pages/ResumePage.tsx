@@ -1434,6 +1434,18 @@ export function ResumePage() {
     if (file) openIntake(file)
   }
 
+  async function selectResume(id: string) {
+    if (dirty) {
+      const ok = await confirm({ title: 'Discard changes?', message: 'You have unsaved changes. Switching will discard them.', danger: true, confirmLabel: 'Discard' })
+      if (!ok) return
+    }
+    const target = resumes.find(r => r.id === id)
+    setShowFinalConfirm(false)
+    if (target) setResumeName(target.name)
+    setSelectedResumeId(id)
+    setSelectedJobId(target?.targetJobId ?? jobs.find(job => job.finalResumeId === id)?.id ?? null)
+  }
+
   // ── Render ────────────────────────────────────────────────────────────────
 
   return (
@@ -1492,7 +1504,25 @@ export function ResumePage() {
             <button className="resume-library-collapse" onClick={() => setLibraryCollapsed(value => !value)} aria-label={libraryCollapsed ? 'Show resume library' : 'Hide resume library'}>
               {libraryCollapsed ? <PanelLeftOpen size={17} /> : <PanelLeftClose size={17} />}
             </button>
-            {!libraryCollapsed && <>
+            {libraryCollapsed ? (
+              <div className="resume-library-collapsed-list" aria-label="Resume thumbnails">
+                {filteredResumes.map(resume => {
+                  const isSelected = resume.id === selectedResumeId
+                  return (
+                    <button
+                      key={resume.id}
+                      type="button"
+                      className={`resume-library-collapsed-item${isSelected ? ' is-selected' : ''}`}
+                      aria-label={resume.name}
+                      title={resume.name}
+                      onClick={() => { void selectResume(resume.id) }}
+                    >
+                      <FileText size={18} strokeWidth={1.7} />
+                    </button>
+                  )
+                })}
+              </div>
+            ) : <>
             <div className="resume-library-sidebar-head">
               <div>
                 <span>My resumes</span>
@@ -1504,22 +1534,7 @@ export function ResumePage() {
               resumes={filteredResumes}
               directions={directions}
               selectedId={selectedResumeId}
-              onSelect={async (id) => {
-                if (dirty) {
-                  const ok = await confirm({ title: 'Discard changes?', message: 'You have unsaved changes. Switching will discard them.', danger: true, confirmLabel: 'Discard' })
-                  if (!ok) return
-                }
-                const target = resumes.find(r => r.id === id)
-                setShowFinalConfirm(false)
-                // Update the visible context immediately; the full content then
-                // follows from the selectedResumeId fetch below.
-                if (target) setResumeName(target.name)
-                setSelectedResumeId(id)
-                // Do not retain the prior resume's job context. A finalised
-                // resume is also linked through finalResumeId; otherwise this
-                // version deliberately has no AI/job context.
-                setSelectedJobId(target?.targetJobId ?? jobs.find(job => job.finalResumeId === id)?.id ?? null)
-              }}
+              onSelect={selectResume}
               onRename={resume => setRenamingResume(resume)}
               onDelete={handleDeleteResume}
               onSetDefault={handleSetDefaultResume}

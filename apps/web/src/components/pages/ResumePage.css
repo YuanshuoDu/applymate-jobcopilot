@@ -74,6 +74,9 @@
 .resume-library-layout.is-library-collapsed { grid-template-columns: 54px minmax(0, 1fr) minmax(270px, 300px); min-width: 0; }
 .resume-library-sidebar { position: relative; min-width: 0; width: auto; display: flex; flex-direction: column; gap: 15px; padding: 20px 16px; overflow-x: hidden; overflow-y: auto; border-right: 1px solid #ebeaf6; background: #fff; }
 .resume-library-layout.is-library-collapsed .resume-library-sidebar { align-items: center; padding: 12px 8px; }
+.resume-library-collapsed-list { display: grid; align-content: start; gap: 8px; width: 100%; padding-top: 50px; }
+.resume-library-collapsed-item { display: grid; place-items: center; width: 100%; height: 36px; padding: 4px; border: 1px solid transparent; border-radius: 7px; color: #837aa8; background: transparent; cursor: pointer; }
+.resume-library-collapsed-item:hover, .resume-library-collapsed-item.is-selected { border-color: #cfcaf8; color: #4c32ef; background: #f1efff; }
 .resume-library-collapse { position: absolute; z-index: 4; top: 54px; right: -1px; display: inline-flex; align-items: center; justify-content: center; width: 25px; height: 32px; padding: 0; border: 1px solid #e4e3f4; border-right: 0; border-radius: 7px 0 0 7px; color: #5a4bcf; background: #fff; box-shadow: -2px 2px 7px rgba(41,31,130,.06); cursor: pointer; }
 .resume-library-layout.is-library-collapsed .resume-library-collapse { top: 18px; right: -1px; }
 .resume-library-sidebar-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
