@@ -2,7 +2,7 @@
 
 import React, { useMemo, useState, useEffect, useRef, useCallback } from 'react'
 import { useSession } from 'next-auth/react'
-import { AlertCircle, Bookmark, Check, ChevronDown, ChevronRight, FileText, Info, LayoutGrid, Link2, List, LoaderCircle, Lock, Search, Sparkles, Trash2, UsersRound, X } from 'lucide-react'
+import { AlertCircle, Check, ChevronDown, ChevronRight, FileText, Info, LayoutGrid, Link2, List, LoaderCircle, Lock, Search, Sparkles, Trash2, X } from 'lucide-react'
 import { Btn, Card, CompanyLogo, INPUT_STYLE, ScorePill, StatusBadge, useToast, useConfirm } from '@/components/ui'
 import { ResumeRenderer } from '@/components/resume/ResumeRenderer'
 import { CoverLetterPreview } from '@/components/coverletter/CoverLetterPanel'
@@ -1455,29 +1455,31 @@ export function JobsPage() {
     <div style={{ flex: 1, overflowY: 'auto', background: 'var(--bg-tertiary)', display: 'flex', flexDirection: 'column' }}>
       <header style={{ minHeight: 62, padding: '8px 30px', background: 'var(--bg-tertiary)' }}>
         <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 24, flexWrap: 'wrap' }}>
-          <div>
-            <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
-              <h1 style={{ margin: 0, fontSize: 22, fontWeight: 760, lineHeight: 1.1, letterSpacing: '-0.05em' }}>My Jobs</h1>
-              <span style={{ fontSize: 12, color: 'var(--primary)', background: 'rgba(79,70,229,0.09)', borderRadius: 999, padding: '4px 9px', fontWeight: 600 }}>{total}</span>
-            </div>
-            <p style={{ margin: '2px 0 0', fontSize: 14, color: 'var(--text-muted)' }}>Track your applications and move closer to your next opportunity.</p>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 10, minWidth: 0 }}>
+            <h1 style={{ margin: 0, flexShrink: 0, fontSize: 22, fontWeight: 760, lineHeight: 1.1, letterSpacing: '-0.05em' }}>My Jobs</h1>
+            <span style={{ flexShrink: 0, fontSize: 12, color: 'var(--primary)', background: 'rgba(79,70,229,0.09)', borderRadius: 999, padding: '4px 9px', fontWeight: 600 }}>{total}</span>
+            <span style={{ minWidth: 0, overflow: 'hidden', color: 'var(--text-muted)', fontSize: 12, textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>Track your applications and move closer to your next opportunity.</span>
           </div>
-          <div style={{ display: 'flex', alignItems: 'center', gap: 12, flexWrap: 'wrap' }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 0, flexWrap: 'wrap' }}>
             {([
-              [Bookmark, 'Saved', statusCounts.saved, '#6D5DFB'],
-              [Check, 'Applied', statusCounts.applied, '#185FA5'],
-              [UsersRound, 'Interviews', statusCounts.interview, '#3B6D11'],
-            ] as const).map(([Icon, label, count, color]) => (
-              <div key={label} style={{ minWidth: 148, padding: '11px 14px', display: 'flex', alignItems: 'center', gap: 10, background: 'var(--bg)', border: '0.5px solid var(--border)', borderRadius: 10 }}>
-                <Icon size={18} color={color} strokeWidth={1.8} /><span style={{ fontSize: 13, color: 'var(--text-muted)' }}>{label}</span><strong style={{ marginLeft: 'auto', fontSize: 16 }}>{count}</strong>
-              </div>
+              ['Saved', statusCounts.saved],
+              ['Applied', statusCounts.applied],
+              ['Interviews', statusCounts.interview],
+            ] as const).map(([label, count], index) => (
+              <React.Fragment key={label}>
+                {index > 0 && <span aria-hidden="true" style={{ width: 1, height: 28, margin: '0 2px', background: 'var(--border)' }} />}
+                <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6, minHeight: 38, padding: '0 10px', color: 'var(--text-muted)', fontSize: 11 }}>
+                  {label}<strong style={{ color: 'var(--text)', fontSize: 12, fontWeight: 700 }}>{count}</strong>
+                </span>
+              </React.Fragment>
             ))}
-            <Btn variant="primary" onClick={() => { setPrefillStatus(null); setShowAdd(true) }} style={{ minWidth: 148, height: 46, justifyContent: 'center' }}>+ Add job</Btn>
+            <span aria-hidden="true" style={{ width: 1, height: 28, margin: '0 8px', background: 'var(--border)' }} />
+            <Btn variant="primary" onClick={() => { setPrefillStatus(null); setShowAdd(true) }} style={{ minHeight: 38, padding: '0 12px', borderRadius: 7, fontSize: 11 }}>+ Add job</Btn>
           </div>
         </div>
       </header>
 
-      <div style={{ padding: '0 30px 30px', flex: 1 }}>
+      <div style={{ padding: '16px 30px 30px', flex: 1 }}>
         <div style={{ padding: 14, marginBottom: 0, background: 'var(--bg)', border: '0.5px solid var(--border)', borderBottom: 'none', borderRadius: '12px 12px 0 0', display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' }}>
           <div style={{ width: 420, maxWidth: '100%', display: 'flex', alignItems: 'center', gap: 8, padding: '0 12px', border: '0.5px solid var(--border)', borderRadius: 8, background: 'var(--bg)' }}>
             <Search size={17} color="var(--text-muted)" />
