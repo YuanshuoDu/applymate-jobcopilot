@@ -92,7 +92,7 @@ export function GmailPage() {
     setEmails(current => current.map(email => email.id === id ? { ...email, read: true } : email))
   }, [])
 
-  const recommendationsEntry = <button type="button" onClick={() => navigate('gmail-recommendations')} style={recommendationsEntryStyle}>Job recommendations</button>
+  const recommendationsEntry = <Btn variant="toolbar" onClick={() => navigate('gmail-recommendations')} style={{ marginLeft: 34 }}>Job recommendations</Btn>
 
   if (connection !== 'ready') return <GmailConnectionScreen state={connection} titleAccessory={recommendationsEntry} onConnect={connectGoogle} onRetry={() => { authTriggeredRef.current = false; void loadEmails() }} />
 
@@ -117,7 +117,6 @@ function removeGmailQueryParam(name: string) {
 }
 
 const searchStyle = { width: 200, padding: '5px 10px', fontSize: 12, border: '0.5px solid var(--border)', borderRadius: 6, background: 'var(--bg)', color: 'var(--text)', outline: 'none' }
-const recommendationsEntryStyle = { border: '1px solid #dedbfa', borderRadius: 7, padding: '5px 9px', background: '#fff', color: '#4c32ef', fontSize: 11, fontWeight: 700, cursor: 'pointer', whiteSpace: 'nowrap' }
 
 function readInboxCache(): GmailEmail[] | null {
   if (typeof window === 'undefined') return null
