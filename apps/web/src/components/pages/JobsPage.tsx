@@ -141,7 +141,7 @@ function ListView({ jobs, onRowClick, selectedIds, onToggle, onToggleAll }: {
                 </div>
               </td>
               <td style={{ padding: '10px 16px' }}>
-                <div style={{ fontSize: 15, fontWeight: 700, lineHeight: 1.3, letterSpacing: '-0.01em', color: 'var(--text)' }}>{j.role}</div>
+                <div style={{ fontSize: 14, fontWeight: 600, lineHeight: 1.45, letterSpacing: '0', color: 'var(--text)' }}>{j.role}</div>
                 {j.keywords ? (() => {
                   const kws = j.keywords.split(',').map(k => k.trim()).filter(Boolean).slice(0, 8)
                   return kws.length > 0 ? (
@@ -243,7 +243,7 @@ function KanbanView({ jobs, onStatusChange, onAddClick }: {
                 </div>
                 {job.score != null && <ScorePill score={job.score} />}
               </div>
-              <div title={job.role} style={{ display: '-webkit-box', WebkitBoxOrient: 'vertical', WebkitLineClamp: 3, overflow: 'hidden', marginBottom: 6, color: 'var(--text)', fontSize: 14, fontWeight: 700, lineHeight: 1.3, letterSpacing: '-0.01em' }}>{job.role}</div>
+              <div title={job.role} style={{ display: '-webkit-box', WebkitBoxOrient: 'vertical', WebkitLineClamp: 3, overflow: 'hidden', marginBottom: 6, color: 'var(--text)', fontSize: 14, fontWeight: 600, lineHeight: 1.45, letterSpacing: '0' }}>{job.role}</div>
               {job.keywords ? (() => {
                 const kws = job.keywords.split(',').map(k => k.trim()).filter(Boolean).slice(0, 6)
                 return kws.length > 0 ? (
