@@ -15,6 +15,7 @@ import { runGreenhouseFlow } from "../flows/greenhouse-flow.js";
 import { runWorkdayFlow } from '../flows/workday-flow.js'
 import { runLeverFlow } from '../flows/lever-flow.js'
 import { runPersonioFlow } from '../flows/personio-flow.js'
+import { runSmartRecruitersFlow } from '../flows/smartrecruiters-flow.js'
 import { createNotification } from "../notifications/create-notification.js";
 import { notifyApplyResult } from "../notifications/notify-apply-result.js";
 import { shouldUsePattern } from "../patterns/confidence.js";
@@ -133,6 +134,9 @@ export const applyWorker = new Worker<ApplyTaskPayload>(
         } else if (flow === "personio") {
           console.log(`[apply-worker] Using Personio pre-programmed flow`);
           harnessResult = await runPersonioFlow(page, applyTask);
+        } else if (flow === "smartrecruiters") {
+          console.log(`[apply-worker] Using SmartRecruiters pre-programmed flow`);
+          harnessResult = await runSmartRecruitersFlow(page, applyTask);
         } else {
           // Phase 5: pattern cache -> replay -> AI fallback with budget cap.
           const budget = await checkBudget(userId);
@@ -244,20 +248,19 @@ export const applyWorker = new Worker<ApplyTaskPayload>(
             jobCompany: taskCtx.jobCompany,
             status:     harnessResult.status as 'submitted' | 'manual' | 'failed',
             error:      harnessResult.error ?? null,
-            flowUsed:   flow ?? null,
+            flowUsed:   usedFlow,
             jobUrl:     taskCtx.applyUrl,
           }).catch((e: Error) => console.warn('[notify] email failed:', e.message))
         }
 
         // Update Job status based on actual outcome
-        const newJobStatus =
-          harnessResult.status === 'submitted' ? 'applied' :
-          harnessResult.status === 'failed'    ? 'saved'   :
-          'applied';  // manual → keep applied
+        const isSubmitted = harnessResult.status === 'submitted';
+        const newJobStatus = isSubmitted ? 'applied' : 'saved';
+        const newWorkflowState = isSubmitted ? 'submitted' : 'ready_to_apply';
 
         await getPool().query(
-          'UPDATE "Job" SET status = $1, "updatedAt" = NOW() WHERE id = $2 AND "userId" = $3',
-          [newJobStatus, jobId, userId]
+          'UPDATE "Job" SET status = $1, "workflowState" = $2, "appliedAt" = CASE WHEN $1 = \'applied\' THEN NOW() ELSE "appliedAt" END, "updatedAt" = NOW() WHERE id = $3 AND "userId" = $4',
+          [newJobStatus, newWorkflowState, jobId, userId]
         )
 
         }),
@@ -284,8 +287,8 @@ export const applyWorker = new Worker<ApplyTaskPayload>(
           durationMs,
         });
         await getPool().query(
-          'UPDATE "Job" SET status = $1, "updatedAt" = NOW() WHERE id = $2 AND "userId" = $3',
-          ['saved', jobId, userId]
+          'UPDATE "Job" SET status = $1, "workflowState" = $2, "updatedAt" = NOW() WHERE id = $3 AND "userId" = $4',
+          ['saved', 'ready_to_apply', jobId, userId]
         );
         createApplyResultNotification({
           userId,

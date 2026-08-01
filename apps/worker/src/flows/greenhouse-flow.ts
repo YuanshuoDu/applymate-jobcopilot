@@ -1,6 +1,6 @@
 import type { Page } from "playwright-core";
 import type { ApplyTask, HarnessResult } from "../harness/agent-harness.js";
-import { getPersonaValue } from "./helpers.js";
+import { getPersonaValue, tryFill, uploadResume } from "./helpers.js";
 
 /** Field map: try each selector in order, fill from persona if found */
 const PERSONAL_FIELDS = [
@@ -10,6 +10,18 @@ const PERSONAL_FIELDS = [
   { selectors: ["#phone",      '[name*="phone"]',       '[type="tel"]'],                  key: "phone"     },
   { selectors: ['[name*="location"]', '[id*="location"]', '[placeholder*="ity"]'],        key: "location"  },
   { selectors: ['[name*="linkedin"]', '[id*="linkedin"]', '[placeholder*="inkedIn"]'],    key: "linkedinUrl" },
+];
+
+const RESUME_SELECTORS = [
+  "#resume",
+  "input[name*='resume' i][type='file']",
+  "input[type='file']",
+];
+
+const COVER_LETTER_SELECTORS = [
+  "textarea[name*='cover' i]",
+  "textarea[id*='cover' i]",
+  "textarea[placeholder*='cover' i]",
 ];
 
 export async function runGreenhouseFlow(
@@ -50,8 +62,13 @@ export async function runGreenhouseFlow(
     }
   }
 
-  // Skip resume upload (Phase 5)
-  // Skip cover letter upload (Phase 5)
+  if (task.resumePath && !task.resumePath.startsWith("db:")) {
+    if (await uploadResume(page, RESUME_SELECTORS, task.resumePath, log)) filled++;
+  }
+
+  if (task.persona.coverLetter) {
+    if (await tryFill(page, COVER_LETTER_SELECTORS, task.persona.coverLetter.slice(0, 2000), "coverLetter", log)) filled++;
+  }
 
   // Custom questions — fill any visible, unfilled textarea/text inputs
   try {

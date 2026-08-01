@@ -4,6 +4,7 @@ import React, { useState, useEffect, useRef, useCallback } from 'react'
 import { TopBar }              from '@/components/layout/TopBar'
 import { useToast } from '@/components/ui'
 import { useApi, apiMutate }   from '@/lib/hooks'
+import type { AgentConfig } from '@/lib/types'
 import { AddAgentModal } from '@/components/agent-workspace/AddAgentModal'
 import { AgentUnifiedStream } from '@/components/agent-workspace/AgentUnifiedStream'
 import type { ApplyReadyJob } from '@/components/agent-workspace/ApplyJobCard'
@@ -23,10 +24,10 @@ export function AgentPlaygroundPage() {
   const toast = useToast()
 
   const { data: jobsData }                               = useApi<{ jobs: Array<{ status: string; workflowState: string }> }>('/api/jobs?pageSize=100')
+  const { data: agentConfig, refetch: refetchAgentConfig } = useApi<AgentConfig>('/api/agent')
 
   const [showAddModal,  setShowAddModal]  = useState(false)
   const [applyQueue,    setApplyQueue]    = useState<ApplyReadyJob[]>([])
-  const [autonomousMode,setAutonomousMode]= useState(false)
   const [selectedSessionId, setSelectedSessionId] = useState<string | null>(null)
   const [liveSessionId, setLiveSessionId] = useState<string | null>(null)
   const [conversationTitle, setConversationTitle] = useState<string | null>(null)
@@ -42,6 +43,7 @@ export function AgentPlaygroundPage() {
   const esRef = useRef<EventSource | null>(null)
   const currentRoleRef = useRef<string | null>(null)
   const runIdRef = useRef(0)
+  const autonomousMode = Boolean(agentConfig?.autoApply && !agentConfig?.requireApproval)
 
   const addLog = useCallback((entry: LogEntry) => { setRunLog(prev => [...prev, entry]) }, [])
   useEffect(() => {
@@ -208,6 +210,14 @@ export function AgentPlaygroundPage() {
       setApplyQueue(prev => [...prev, d])
     })
 
+    listen('application_queued', e => {
+      const d = JSON.parse(e.data) as ApplyReadyJob
+      setApplyQueue(prev => prev.some(job => job.jobId === d.jobId)
+        ? prev
+        : [...prev, { ...d, mode: 'queued' }])
+      addLog({ role: 'executor', type: 'application_queued', message: `⏳ ${d.company} · ${d.role} 已交给后台 Agent 投递`, time: new Date() })
+    })
+
     listen('agent_question', e => {
       const d = JSON.parse(e.data)
       addLog({
@@ -248,13 +258,13 @@ export function AgentPlaygroundPage() {
       setRunDone(true)
       currentRoleRef.current = null
       setCurrentRole(null)
-      addLog({ type: 'done', message: `✅ 流水线完成 — ${d.processed} 个评分，${d.applied} 个投递，${d.pending} 个待审核，${d.skipped} 个跳过`, time: new Date() })
+      addLog({ type: 'done', message: `✅ 流水线完成 — ${d.processed} 个评分，${d.queued ?? 0} 个已派发，${d.applied} 个确认投递，${d.pending} 个待审核，${d.skipped} 个跳过`, time: new Date() })
       es.close(); esRef.current = null
       setSessionsRefreshVersion(v => v + 1)
       toast.success(
         'Pipeline complete',
         d.processed > 0
-          ? `Scored ${d.processed} jobs, applied to ${d.applied}. New jobs from Scout may appear in Jobs list.`
+          ? `Scored ${d.processed} jobs, dispatched ${d.queued ?? 0}; confirmed submissions are reported by the worker.`
           : 'Done. Check Jobs — Scout may have added new discoveries.'
       )
     })
@@ -328,6 +338,7 @@ export function AgentPlaygroundPage() {
           toast.error('设置更新失败', error)
           throw new Error(error)
         }
+        await refetchAgentConfig()
         toast.success('设置已更新', `${field} → ${value}`)
         break
       }
@@ -335,7 +346,7 @@ export function AgentPlaygroundPage() {
         if (action.path === 'jobs') window.location.href = '/?page=jobs'
         break
     }
-  }, [startRun, stopRun, toast])
+  }, [refetchAgentConfig, startRun, stopRun, toast])
 
   const handleAnswerQuestion = useCallback(async (entry: LogEntry, opt: QuestionOption) => {
     // Apply action

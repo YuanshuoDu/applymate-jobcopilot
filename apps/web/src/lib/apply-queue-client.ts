@@ -18,13 +18,20 @@ export interface EnqueueApplyInput {
   jobId: string;
   userId: string;
   applyUrl: string;
-  personaId: string;
-  resumePath: string;
+  /** The worker loads the canonical persona from Postgres. Kept for callers
+   * that already provide a persona identifier. */
+  personaId?: string;
+  /** The worker generates an ephemeral PDF from the selected resume. */
+  resumePath?: string;
   dryRun?: boolean;
 }
 
 export async function enqueueApplyTask(input: EnqueueApplyInput): Promise<string> {
-  const job = await getApplyQueue().add("apply", input, {
+  const job = await getApplyQueue().add("apply", {
+    ...input,
+    personaId: input.personaId ?? "server-side",
+    resumePath: input.resumePath ?? "",
+  }, {
     attempts: 3,
     backoff: { type: "exponential", delay: 60_000 },
     removeOnComplete: 100,

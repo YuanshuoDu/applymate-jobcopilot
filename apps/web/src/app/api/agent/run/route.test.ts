@@ -16,6 +16,15 @@ vi.mock('@/lib/db', () => ({
   db: { agentSession: { findFirst: mocks.findFirst } },
 }))
 
+// This test exits before the SSE callback runs. Mock its heavy dependencies so
+// the session-ownership assertion stays isolated when the full suite is busy.
+vi.mock('@/lib/agent/pipeline', () => ({ runPipeline: vi.fn() }))
+vi.mock('@/lib/agent/session/run-recorder', () => ({ createRunSessionRecorder: vi.fn() }))
+vi.mock('@/lib/agent/role-config', () => ({
+  loadRoleConfigs: vi.fn(),
+  toRoleConfigMap: vi.fn(),
+}))
+
 describe('agent run API session binding', () => {
   beforeEach(() => {
     mocks.prepareAiRoute.mockReset()

@@ -154,9 +154,14 @@ export function AgentUnifiedStream({
   useEffect(() => {
     const queued = liveBlocks.filter(block => block.type === 'application_queued')
     for (const block of queued) {
-      const data = block.data && typeof block.data === 'object' ? block.data as Record<string, unknown> : {}
-      const job = data.job && typeof data.job === 'object' ? data.job as Record<string, unknown> : {}
-      const jobId = typeof job.id === 'string' ? job.id : null
+      const rawData = block.data && typeof block.data === 'object' ? block.data as Record<string, unknown> : {}
+      const data = rawData.payload && typeof rawData.payload === 'object'
+        ? rawData.payload as Record<string, unknown>
+        : rawData
+      const job = data.job && typeof data.job === 'object' ? data.job as Record<string, unknown> : data
+      const jobId = typeof data.jobId === 'string'
+        ? data.jobId
+        : typeof job.id === 'string' ? job.id : null
       if (!jobId || auditedJobIdsRef.current.has(jobId)) continue
       auditedJobIdsRef.current.add(jobId)
       void pollForAuditResult(jobId, job, setLiveBlocks)
@@ -326,6 +331,7 @@ export function AgentUnifiedStream({
         running={running}
         summary={summary}
         approvalRequired={Boolean(waitingQuestion && !autonomousMode)}
+        autonomousMode={autonomousMode}
         conversationTitle={conversationTitle}
         conversationSubtitle={conversationSubtitle}
       />

@@ -24,6 +24,7 @@ export default function ApplyStatusCard({ jobId, jobUrl, jobStatus }: { jobId: s
   const [result, setResult] = useState<ApplyResult | null>(null);
   const [loading, setLoading] = useState(true);
   const [applying, setApplying] = useState(false);
+  const [retryError, setRetryError] = useState<string | null>(null);
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   async function fetchResult() {
@@ -54,8 +55,15 @@ export default function ApplyStatusCard({ jobId, jobUrl, jobStatus }: { jobId: s
 
   async function handleRetry() {
     setApplying(true);
+    setRetryError(null);
     try {
-      await fetch(`/api/jobs/${jobId}/auto-apply`, { method: "POST" });
+      const response = await fetch(`/api/jobs/${jobId}/auto-apply`, { method: "POST" });
+      const payload = await response.json().catch(() => ({})) as { error?: string };
+      if (!response.ok) throw new Error(payload.error ?? "Could not queue the application.");
+      setResult(null);
+      void fetchResult();
+    } catch (error) {
+      setRetryError(error instanceof Error ? error.message : "Could not queue the application.");
     } finally {
       setApplying(false);
     }
@@ -110,23 +118,26 @@ export default function ApplyStatusCard({ jobId, jobUrl, jobStatus }: { jobId: s
       )}
 
       {result.status === "failed" && (
-        <button
-          onClick={handleRetry}
-          disabled={applying}
-          style={{
-            marginTop: 8,
-            padding: "6px 16px",
-            fontSize: 13,
-            background: "#ef4444",
-            color: "#fff",
-            border: "none",
-            borderRadius: 6,
-            cursor: applying ? "not-allowed" : "pointer",
-            opacity: applying ? 0.6 : 1,
-          }}
-        >
-          {applying ? "Retrying…" : "🔄 Retry"}
-        </button>
+        <>
+          <button
+            onClick={handleRetry}
+            disabled={applying}
+            style={{
+              marginTop: 8,
+              padding: "6px 16px",
+              fontSize: 13,
+              background: "#ef4444",
+              color: "#fff",
+              border: "none",
+              borderRadius: 6,
+              cursor: applying ? "not-allowed" : "pointer",
+              opacity: applying ? 0.6 : 1,
+            }}
+          >
+            {applying ? "Queueing…" : "🔄 Queue retry"}
+          </button>
+          {retryError && <div style={{ marginTop: 6, fontSize: 12, color: "#ef4444" }}>{retryError}</div>}
+        </>
       )}
     </div>
   );

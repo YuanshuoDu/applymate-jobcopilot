@@ -19,6 +19,7 @@ interface AgentRunHistory {
 interface AgentRunReport {
   processed?: number
   applied?: number
+  queued?: number
   pending?: number
   skipped?: number
   failed?: number
@@ -98,13 +99,14 @@ function dataLabel(data: AgentRunEvent['data']) {
 function ReportStrip({ report }: { report: AgentRunReport | null }) {
   const items = [
     ['Processed', report?.processed ?? 0],
-    ['Applied', report?.applied ?? 0],
+    ['Dispatched', report?.queued ?? 0],
+    ['Confirmed', report?.applied ?? 0],
     ['Pending', report?.pending ?? 0],
     ['Skipped', report?.skipped ?? 0],
     ['Failed', report?.failed ?? 0],
   ]
   return (
-    <div style={{ display: 'grid', gridTemplateColumns: 'repeat(5, minmax(80px, 1fr))', gap: 8, marginTop: 12 }}>
+    <div style={{ display: 'grid', gridTemplateColumns: 'repeat(6, minmax(80px, 1fr))', gap: 8, marginTop: 12 }}>
       {items.map(([label, value]) => (
         <div key={label} style={{
           border: '1px solid var(--border)', borderRadius: 8,
@@ -159,6 +161,7 @@ export function AgentHistoryPage() {
   const totals = useMemo(() => ({
     runs: runs.length,
     jobs: runs.reduce((sum, run) => sum + run.jobsFound, 0),
+    queued: runs.reduce((sum, run) => sum + (run.report?.queued ?? 0), 0),
     applied: runs.reduce((sum, run) => sum + (run.report?.applied ?? 0), 0),
     failed: runs.filter(run => run.status === 'failed').length,
   }), [runs])
@@ -192,10 +195,11 @@ export function AgentHistoryPage() {
       </TopBar>
 
       <div style={{ padding: 20 }}>
-        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, minmax(120px, 1fr))', gap: 12, marginBottom: 16 }}>
+        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(5, minmax(120px, 1fr))', gap: 12, marginBottom: 16 }}>
           {[
             ['Runs', totals.runs],
             ['Jobs Found', totals.jobs],
+            ['Dispatched', totals.queued],
             ['Applied', totals.applied],
             ['Failed Runs', totals.failed],
           ].map(([label, value]) => (

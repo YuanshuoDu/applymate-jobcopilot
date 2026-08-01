@@ -7,6 +7,7 @@ export function AgentUnifiedStreamHeader({
   running,
   summary,
   approvalRequired,
+  autonomousMode,
   conversationTitle,
   conversationSubtitle,
 }: {
@@ -14,6 +15,7 @@ export function AgentUnifiedStreamHeader({
   running: boolean
   summary: RunSummary | null
   approvalRequired: boolean
+  autonomousMode: boolean
   conversationTitle?: string | null
   conversationSubtitle?: string | null
 }) {
@@ -29,11 +31,14 @@ export function AgentUnifiedStreamHeader({
         <div style={{ fontSize: 11, color: 'var(--text-muted)', marginTop: 3 }}>
           {conversationTitle
             ? (hasDistinctSubtitle ? conversationSubtitle : 'Chat session')
-            : (summary ? `${summary.processed} scored · ${summary.applied} applied` : 'Plan, review, and apply from one workspace.')}
+            : (summary ? `${summary.processed} scored · ${summary.queued} dispatched · ${summary.applied} confirmed` : 'Plan, review, and apply from one workspace.')}
         </div>
       </div>
       <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-end', gap: 3 }}>
         {running && <span style={{ fontSize: 10, color: 'var(--primary)', fontWeight: 700 }}>Running</span>}
+        <span style={{ fontSize: 10, color: autonomousMode ? 'var(--c-success)' : 'var(--text-muted)', fontWeight: 700 }}>
+          {autonomousMode ? 'Autopilot enabled' : 'Review mode'}
+        </span>
         {approvalRequired && <span style={{ fontSize: 10, color: '#d97706', fontWeight: 700 }}>Approval required</span>}
       </div>
     </div>

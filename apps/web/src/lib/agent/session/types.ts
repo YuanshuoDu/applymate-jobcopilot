@@ -42,6 +42,7 @@ export type TranscriptEventType =
   | "automation_updated"
   | "automation_cancelled"
   | "job_results"
+  | "application_queued"
   | "session_memory"
   | "final_report"
   | "error"

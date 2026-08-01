@@ -1,6 +1,6 @@
 'use client'
 
-import React, { useState } from 'react'
+import React, { useEffect, useState } from 'react'
 
 export interface ApplyReadyJob {
   jobId:           string
@@ -11,6 +11,8 @@ export interface ApplyReadyJob {
   location?:       string | null
   coverLetter?:    string
   matchedKeywords: string[]
+  mode?:           'manual' | 'queued'
+  taskId?:         string
 }
 
 interface ApplyJobCardProps {
@@ -21,7 +23,33 @@ interface ApplyJobCardProps {
 export function ApplyJobCard({ job, onApplied }: ApplyJobCardProps) {
   const [showCL,   setShowCL]   = useState(false)
   const [applying, setApplying] = useState(false)
+  const [workerStatus, setWorkerStatus] = useState<'submitted' | 'manual' | 'failed' | null>(null)
   const isApplied = job.url?.startsWith('_applied')
+  const isQueued = job.mode === 'queued'
+
+  useEffect(() => {
+    if (!isQueued || workerStatus) return
+    let active = true
+    const checkResult = async () => {
+      try {
+        const response = await fetch(`/api/jobs/${job.jobId}/apply-results`)
+        if (!response.ok) return
+        const payload = await response.json() as { results?: Array<{ status?: unknown }> }
+        const status = payload.results?.[0]?.status
+        if (active && (status === 'submitted' || status === 'manual' || status === 'failed')) {
+          setWorkerStatus(status)
+        }
+      } catch {
+        // The worker can be unavailable temporarily; keep the queued status visible.
+      }
+    }
+    void checkResult()
+    const interval = window.setInterval(() => void checkResult(), 5_000)
+    return () => {
+      active = false
+      window.clearInterval(interval)
+    }
+  }, [isQueued, job.jobId, workerStatus])
 
   async function handleApply() {
     if (!job.url || isApplied) return
@@ -70,7 +98,9 @@ export function ApplyJobCard({ job, onApplied }: ApplyJobCardProps) {
           )}
         </div>
         <div style={{ flexShrink: 0 }}>
-          {isApplied ? (
+          {isQueued ? (
+            <WorkerState status={workerStatus} />
+          ) : isApplied ? (
             <span style={{ fontSize: 11, color: 'var(--c-success)', fontWeight: 600 }}>✓ 已投递</span>
           ) : (
             <button
@@ -90,4 +120,15 @@ export function ApplyJobCard({ job, onApplied }: ApplyJobCardProps) {
       </div>
     </div>
   )
+}
+
+function WorkerState({ status }: { status: 'submitted' | 'manual' | 'failed' | null }) {
+  const states = {
+    submitted: { label: '✓ 已确认投递', color: 'var(--c-success)' },
+    manual: { label: '⚠ 需要人工处理', color: '#b45309' },
+    failed: { label: '✕ 投递失败', color: 'var(--c-danger)' },
+    queued: { label: '⏳ 后台投递中', color: 'var(--primary)' },
+  }
+  const state = status ? states[status] : states.queued
+  return <span style={{ fontSize: 11, color: state.color, fontWeight: 600 }}>{state.label}</span>
 }

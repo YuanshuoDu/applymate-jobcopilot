@@ -363,7 +363,7 @@ Respond ONLY in valid JSON (no markdown):
 
   // ── Complete ──────────────────────────────────────────────────────────────
 
-  complete(report: { processed: number; applied: number; pending: number; skipped: number }): void {
+  complete(report: { processed: number; applied: number; queued: number; pending: number; skipped: number }): void {
     const retries = this.history.filter(h => h.includes('[Fix/')).length
     this.emit('orchestrator_complete', {
       thinking:   this.history.slice(-3).join(' → '),

@@ -137,6 +137,7 @@ export function eventChrome(type: string): { tone: EventTone; label: string } {
   if (type === "subagent_task_started") return { tone: "subagent", label: "Agent started" }
   if (type === "subagent_result") return { tone: "subagent", label: "Agent result" }
   if (type === "job_results") return { tone: "subagent", label: "Job result" }
+  if (type === "application_queued") return { tone: "success", label: "Application queued" }
   return { tone: "system", label: "System" }
 }
 

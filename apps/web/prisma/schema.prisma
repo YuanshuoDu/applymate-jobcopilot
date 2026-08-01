@@ -163,6 +163,7 @@ enum JobStatus {
 enum JobWorkflowState {
   draft
   ready_to_apply
+  queued
   submitted
 }
 
