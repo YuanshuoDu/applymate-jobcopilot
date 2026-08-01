@@ -4,6 +4,8 @@ const mocks = vi.hoisted(() => ({
   requireAuth: vi.fn(),
   findFirst: vi.fn(),
   questionFindMany: vi.fn(),
+  applicationTaskFindMany: vi.fn(),
+  executionFindFirst: vi.fn(),
   deleteMany: vi.fn(),
 }))
 
@@ -21,6 +23,8 @@ vi.mock("@/lib/db", () => ({
       deleteMany: mocks.deleteMany,
     },
     agentRunQuestion: { findMany: mocks.questionFindMany },
+    applicationTask: { findMany: mocks.applicationTaskFindMany },
+    agentExecution: { findFirst: mocks.executionFindFirst },
   },
 }))
 
@@ -36,10 +40,14 @@ describe("agent session detail API", () => {
     mocks.requireAuth.mockReset()
     mocks.findFirst.mockReset()
     mocks.questionFindMany.mockReset()
+    mocks.applicationTaskFindMany.mockReset()
+    mocks.executionFindFirst.mockReset()
     mocks.deleteMany.mockReset()
     mocks.requireAuth.mockResolvedValue({ userId: "user_1" })
     mocks.deleteMany.mockResolvedValue({ count: 1 })
     mocks.questionFindMany.mockResolvedValue([])
+    mocks.applicationTaskFindMany.mockResolvedValue([])
+    mocks.executionFindFirst.mockResolvedValue(null)
   })
 
   it("returns a session with task and approval summaries for the owner", async () => {
@@ -75,9 +83,6 @@ describe("agent session detail API", () => {
           createdAt: new Date("2026-06-18T08:03:00Z"),
         },
       ],
-      applicationTasks: [],
-      execution: null,
-      questions: [],
     })
     const { GET } = await import("./route")
 
@@ -158,20 +163,25 @@ describe("agent session detail API", () => {
             createdAt: true,
           },
         },
-        applicationTasks: {
-          orderBy: { updatedAt: "desc" },
-          take: 20,
-          select: {
-            id: true,
-            status: true,
-            checkpoint: true,
-            error: true,
-            question: true,
-            job: { select: { company: true, role: true } },
-          },
-        },
-        execution: { select: { id: true, status: true, checkpoint: true, error: true, attemptCount: true } },
       },
+    })
+  })
+
+  it("replays historical sessions when optional control-plane tables are not migrated yet", async () => {
+    mocks.findFirst.mockResolvedValueOnce({
+      id: "session_1", goal: "Historical run", status: "completed", source: "manual_run", memorySummary: "Done",
+      qualityScore: 100, currentTaskId: null, createdAt: new Date("2026-06-18T08:00:00Z"), updatedAt: new Date("2026-06-18T08:05:00Z"), completedAt: new Date("2026-06-18T08:05:00Z"), tasks: [], approvals: [],
+    })
+    mocks.applicationTaskFindMany.mockRejectedValueOnce({ code: "P2021" })
+    mocks.executionFindFirst.mockRejectedValueOnce({ code: "P2021" })
+    mocks.questionFindMany.mockRejectedValueOnce({ code: "P2021" })
+    const { GET } = await import("./route")
+
+    const res = await GET(getRequest() as never, params)
+
+    expect(res.status).toBe(200)
+    await expect(res.json()).resolves.toMatchObject({
+      session: { id: "session_1", questions: [], applicationTasks: [], execution: null },
     })
   })
 

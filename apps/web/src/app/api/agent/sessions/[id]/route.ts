@@ -10,6 +10,24 @@ function iso(date: Date | null) {
   return date?.toISOString() ?? null
 }
 
+function missingControlPlaneTable(error: unknown) {
+  if (!error || typeof error !== "object") return false
+  const code = (error as { code?: unknown }).code
+  return code === "P2021" || code === "P2022"
+}
+
+async function optionalControlPlane<T>(query: () => Promise<T>, fallback: T) {
+  try {
+    return await query()
+  } catch (error) {
+    // Existing installations can temporarily run a newer web build before the
+    // latest worker-control migration. Historical session replay must still
+    // work even when optional execution metadata is unavailable.
+    if (missingControlPlaneTable(error)) return fallback
+    throw error
+  }
+}
+
 function serializeSession(session: {
   id: string
   goal: string
@@ -109,22 +127,37 @@ export async function GET(req: NextRequest, ctx: RouteCtx) {
           createdAt: true,
         },
       },
-      applicationTasks: {
-        orderBy: { updatedAt: "desc" },
-        take: 20,
-        select: { id: true, status: true, checkpoint: true, error: true, question: true, job: { select: { company: true, role: true } } },
-      },
-      execution: { select: { id: true, status: true, checkpoint: true, error: true, attemptCount: true } },
     },
   })
 
   if (!session) return err("Session not found", 404)
-  const questions = await db.agentRunQuestion.findMany({
-    where: { userId: auth.userId, runId: id, answer: null },
-    orderBy: { createdAt: "asc" },
-    select: { id: true, stage: true, question: true, options: true },
-  })
-  return ok({ session: serializeSession({ ...session, questions }) })
+  const [questions, applicationTasks, execution] = await Promise.all([
+    optionalControlPlane(
+      () => db.agentRunQuestion.findMany({
+        where: { userId: auth.userId, runId: id, answer: null },
+        orderBy: { createdAt: "asc" },
+        select: { id: true, stage: true, question: true, options: true },
+      }),
+      [],
+    ),
+    optionalControlPlane(
+      () => db.applicationTask.findMany({
+        where: { userId: auth.userId, sessionId: id },
+        orderBy: { updatedAt: "desc" },
+        take: 20,
+        select: { id: true, status: true, checkpoint: true, error: true, question: true, job: { select: { company: true, role: true } } },
+      }),
+      [],
+    ),
+    optionalControlPlane(
+      () => db.agentExecution.findFirst({
+        where: { userId: auth.userId, sessionId: id },
+        select: { id: true, status: true, checkpoint: true, error: true, attemptCount: true },
+      }),
+      null,
+    ),
+  ])
+  return ok({ session: serializeSession({ ...session, questions, applicationTasks, execution }) })
 }
 
 export async function DELETE(req: NextRequest, ctx: RouteCtx) {
