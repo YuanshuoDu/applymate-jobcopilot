@@ -64,7 +64,7 @@ describe('runAudit', () => {
     }))
   })
 
-  it('verifies that dispatched jobs remain queued or become confirmed submissions', async () => {
+  it('verifies that dispatched jobs remain queued, submitting, or confirmed submissions', async () => {
     mocks.findMany.mockResolvedValue([{
       company: 'Example Co',
       role: 'Engineer',
@@ -82,8 +82,22 @@ describe('runAudit', () => {
     }))
     expect(result).toMatchObject({ ok: true, data: { warnings: [] } })
     expect(emit).toHaveBeenCalledWith('agent_observation', expect.objectContaining({
-      observation: expect.stringContaining('queued or already confirmed submitted'),
+      observation: expect.stringContaining('queued, submitting, or already confirmed submitted'),
     }))
+  })
+
+  it('accepts a job that the worker has already locked for submission', async () => {
+    mocks.findMany.mockResolvedValue([{
+      company: 'Example Co',
+      role: 'Engineer',
+      status: 'saved',
+      workflowState: 'submitting',
+    }])
+    mocks.syncGmailForUser.mockResolvedValue({ ...synced, importedMessages: 0, newRecommendations: 0 })
+
+    const result = await runAudit({ queued: ['job_1'], failed: [] }, [] as Job[], context())
+
+    expect(result).toMatchObject({ ok: true, data: { warnings: [] } })
   })
 
   it('records a sync failure as an audit warning without changing jobs directly', async () => {

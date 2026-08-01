@@ -5,6 +5,11 @@ import { checkRateLimit } from "../rate-limit.js";
 import { withCloakContext } from "../cloak/pool.js";
 import { detectCaptcha, solveCaptcha } from "../cloak/captcha.js";
 import { insertApplyResult, getPool } from "../db/apply-results.js";
+import {
+  claimUnattendedSubmission,
+  releaseUncertainSubmission,
+  UNCONFIRMED_SUBMISSION_MESSAGE,
+} from "../db/submission-guard.js";
 import { checkBudget, incrementBudget } from "../db/budget.js";
 import { findFormPattern, recordPatternFailure, upsertFormPattern } from "../db/form-patterns.js";
 import { loadTaskContext } from "../db/load-task-context.js";
@@ -61,6 +66,7 @@ export const applyWorker = new Worker<ApplyTaskPayload>(
 
     const startedAt = Date.now();
     let resultWritten = false;
+    let browserAttemptStarted = false;
     let ctx: Awaited<ReturnType<typeof loadTaskContext>> | null = null;
 
     try {
@@ -70,6 +76,35 @@ export const applyWorker = new Worker<ApplyTaskPayload>(
 
       await Promise.race([
         withCloakContext(userId, async (page) => {
+        const submissionClaim = await claimUnattendedSubmission(getPool(), userId, jobId);
+        if (submissionClaim === "unavailable") {
+          console.warn(`[apply-worker] Skipping duplicate task for job=${jobId}; it is no longer queued.`);
+          return;
+        }
+
+        if (submissionClaim === "uncertain") {
+          await insertApplyResult({
+            userId,
+            jobId,
+            status: "manual",
+            mode: "unattended",
+            atsType: null,
+            flowUsed: null,
+            error: UNCONFIRMED_SUBMISSION_MESSAGE,
+            durationMs: Date.now() - startedAt,
+          });
+          resultWritten = true;
+          createApplyResultNotification({
+            userId,
+            jobId,
+            jobTitle: taskCtx.jobTitle,
+            jobCompany: taskCtx.jobCompany,
+            status: "manual",
+          }).catch((e: Error) => console.warn("[notify] in-app notification failed:", e.message));
+          return;
+        }
+
+        browserAttemptStarted = true;
         console.log(
           `[apply-worker] Navigating to ${taskCtx.applyUrl} (user=${userId}, job=${jobId}, dryRun=${dryRun ?? false})`
         );
@@ -276,29 +311,40 @@ export const applyWorker = new Worker<ApplyTaskPayload>(
       );
 
       if (!resultWritten) {
+        const status = browserAttemptStarted ? "manual" : "failed";
+        const safeMessage = browserAttemptStarted
+          ? `${UNCONFIRMED_SUBMISSION_MESSAGE} Original error: ${message}`
+          : message;
         await insertApplyResult({
           userId,
           jobId,
-          status: "failed",
+          status,
           mode: "unattended",
           atsType: null,
           flowUsed: null,
-          error: message,
+          error: safeMessage,
           durationMs,
         });
-        await getPool().query(
-          'UPDATE "Job" SET status = $1, "workflowState" = $2, "updatedAt" = NOW() WHERE id = $3 AND "userId" = $4',
-          ['saved', 'ready_to_apply', jobId, userId]
-        );
+        if (browserAttemptStarted) {
+          await releaseUncertainSubmission(getPool(), userId, jobId);
+        } else {
+          await getPool().query(
+            'UPDATE "Job" SET status = $1, "workflowState" = $2, "updatedAt" = NOW() WHERE id = $3 AND "userId" = $4',
+            ['saved', 'ready_to_apply', jobId, userId]
+          );
+        }
         createApplyResultNotification({
           userId,
           jobId,
           jobTitle: ctx?.jobTitle ?? null,
           jobCompany: ctx?.jobCompany ?? "Application",
-          status: "failed",
+          status,
         }).catch((e: Error) => console.warn("[notify] in-app notification failed:", e.message));
       }
-      throw err;
+      // Once a browser has started, BullMQ must not replay the task. A form
+      // submit may have reached the ATS even when the worker lost its result.
+      // Fail-safe review is preferable to an accidental duplicate application.
+      return;
     } finally {
       // Clean up temp resume PDF to avoid accumulating files on disk
       if (ctx?.resumeTempPath) {

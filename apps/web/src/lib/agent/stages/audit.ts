@@ -56,9 +56,10 @@ async function verifyDispatchedJobs(jobIds: string[], ctx: PipelineCtx): Promise
   for (const job of jobs) {
     const dispatched =
       (job.status === 'saved' && job.workflowState === 'queued') ||
+      (job.status === 'saved' && job.workflowState === 'submitting') ||
       (job.status === 'applied' && job.workflowState === 'submitted')
     if (!dispatched) {
-      warnings.push(`${job.company} · ${job.role}: expected queued or confirmed-submitted workflow`)
+      warnings.push(`${job.company} · ${job.role}: expected queued, submitting, or confirmed-submitted workflow`)
     }
   }
 
@@ -70,7 +71,7 @@ async function verifyDispatchedJobs(jobIds: string[], ctx: PipelineCtx): Promise
     role: 'auditor',
     observation: warnings.length
       ? `DB verification: ${jobs.length} dispatched job(s), ${warnings.length} warning(s)`
-      : `DB verification: ${jobs.length} job(s) are queued or already confirmed submitted`,
+      : `DB verification: ${jobs.length} job(s) are queued, submitting, or already confirmed submitted`,
   })
   return warnings
 }

@@ -7,7 +7,7 @@
 export const JOB_STATUSES = ['saved', 'applied', 'interview', 'offer', 'rejected'] as const
 export type JobStatus = (typeof JOB_STATUSES)[number]
 export type JobStatusCounts = Record<JobStatus, number>
-export type JobWorkflowState = 'draft' | 'ready_to_apply' | 'submitted'
+export type JobWorkflowState = 'draft' | 'ready_to_apply' | 'queued' | 'submitting' | 'submitted'
 export type Plan          = 'free' | 'pro' | 'enterprise'
 export type AgentRoleType = 'scout' | 'analyst' | 'writer' | 'reviewer' | 'executor' | 'auditor'
 

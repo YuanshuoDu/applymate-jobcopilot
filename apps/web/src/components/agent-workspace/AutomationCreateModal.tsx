@@ -201,7 +201,7 @@ export function AutomationCreateModal({
           </label>
           <div role="status" aria-live="polite" style={policyNoteStyle}>
             {policy === 'autopilot'
-              ? `Eligible jobs are submitted without another review, up to ${form.dailyCap} per day. LinkedIn and Indeed stay excluded.`
+              ? `Eligible jobs are submitted without another review, up to ${form.dailyCap} per day. If a started attempt cannot be confirmed, it is held for review and never retried automatically. LinkedIn and Indeed stay excluded.`
               : 'Jobs are prepared and held for your review; nothing is submitted automatically.'}
           </div>
         </fieldset>

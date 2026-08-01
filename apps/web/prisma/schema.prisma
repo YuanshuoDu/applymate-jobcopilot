@@ -164,6 +164,7 @@ enum JobWorkflowState {
   draft
   ready_to_apply
   queued
+  submitting
   submitted
 }
 
