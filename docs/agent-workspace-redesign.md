@@ -775,7 +775,7 @@ Completed in the Agent workspace implementation:
 - `/api/agent/chat` can create live `approval_request` blocks for sensitive apply/submit requests and persist `AgentApproval` rows.
 - Automation Draft `Edit` returns users to the live composer with an editable prompt; `Cancel` records a local transcript acknowledgement.
 - Scheduled automations can now be picked up through `POST /api/agent/automations/due`, which creates `AgentSession` runs and advances `nextRunAt`.
-- Vercel Cron is configured to call `GET /api/agent/automations/due` every 5 minutes; the endpoint also keeps `POST` for worker/manual scheduler callers and accepts `CRON_SECRET` or `AGENT_AUTOMATION_CRON_SECRET`.
+- The long-running Worker calls `POST /api/agent/automations/due` every five minutes; the endpoint also keeps `GET` compatibility for Vercel Cron and accepts `CRON_SECRET` or `AGENT_AUTOMATION_CRON_SECRET`.
 - Scheduler pickup uses an atomic claim step (`enabled=true` and `nextRunAt <= now`) before creating the session, so overlapping cron calls do not duplicate runs.
 - Automation rows now expose run cadence more clearly in the left console by showing next run and last run metadata.
 - Paused automations cannot be started manually; the run endpoint returns a conflict instead of creating a session.
