@@ -1,8 +1,7 @@
 import { db } from "@/lib/db";
 import { Prisma } from "@prisma/client";
 import { enqueueApplyTask } from "@/lib/apply-queue-client";
-
-const BLOCKED_HOSTS = ["linkedin.com", "indeed.com"];
+import { assessApplicationPreflight, isSupportedAutomatedApplyUrl } from "@/lib/agent/application-preflight";
 
 export class AutoApplyError extends Error {}
 
@@ -21,12 +20,21 @@ export function validateAutoApplyUrl(rawUrl: string | null | undefined): string 
     throw new AutoApplyError("The application URL must use HTTP or HTTPS.");
   }
 
-  const host = parsed.hostname.toLowerCase();
-  if (BLOCKED_HOSTS.some(blocked => host === blocked || host.endsWith(`.${blocked}`))) {
-    throw new AutoApplyError("Automatic submission is not supported on this job board.");
+  if (!isSupportedAutomatedApplyUrl(parsed.toString())) {
+    throw new AutoApplyError("Automatic application requires a direct supported ATS link, not a job-board or unknown destination.");
   }
 
   return parsed.toString();
+}
+
+async function assertJobPreflight(input: { userId: string; jobId: string }) {
+  const job = await db.job.findFirst({
+    where: { id: input.jobId, userId: input.userId },
+    select: { company: true, description: true, source: true, url: true },
+  })
+  if (!job) throw new AutoApplyError("The job could not be found for application preflight.")
+  const preflight = assessApplicationPreflight(job)
+  if (!preflight.canAutomate) throw new AutoApplyError(preflight.issues.map(issue => issue.message).join(" "))
 }
 
 /** Dispatches the safe first browser pass: fill fields, then stop for review. */
@@ -38,6 +46,7 @@ export async function queueApplicationFill(input: {
   resumeAfterUserInput?: boolean;
 }): Promise<{ taskId: string }> {
   const applyUrl = validateAutoApplyUrl(input.applyUrl);
+  await assertJobPreflight(input)
   const claimed = await db.applicationTask.updateMany({
     where: {
       id: input.applicationTaskId,
@@ -70,6 +79,7 @@ export async function queueAutonomousApplication(input: {
   approvalId: string;
 }): Promise<{ taskId: string }> {
   const applyUrl = validateAutoApplyUrl(input.applyUrl);
+  await assertJobPreflight(input)
   const approval = await db.agentApproval.findFirst({
     where: { id: input.approvalId, userId: input.userId, status: "approved", type: "submit_application" },
     select: { payload: true },

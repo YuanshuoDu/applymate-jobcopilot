@@ -11,6 +11,7 @@ import { apiMutate, fmtDate, fmtRelative, useApi } from '@/lib/hooks'
 import { setCachedApiResponse } from '@/lib/api-cache'
 import { useNav } from '@/lib/nav-context'
 import { exportApplicationPackLocally } from '@/lib/bundle'
+import { assessApplicationPreflight } from '@/lib/agent/application-preflight'
 
 const KANBAN_COLS: JobStatus[] = ['saved', 'applied', 'interview', 'offer', 'rejected']
 const COL_LABELS: Record<JobStatus, string> = {
@@ -460,6 +461,7 @@ function JobDetailDrawer({ job, onClose, onStatusChange, onUpdate, onDelete, onO
   const persistedAudit = useMemo(() => findLatestApplicationAudit(activity), [activity])
   const storedAudit = canonicalAudit ?? persistedAudit
   const displayedAudit = latestAudit ?? storedAudit?.audit ?? null
+  const applicationPreflight = useMemo(() => assessApplicationPreflight(job), [job])
   const evidenceGapFindings = (displayedAudit?.findings ?? []).filter(finding => finding.area !== 'job_match' && finding.resolution === 'evidence_needed')
   const factualAuditFindings = (displayedAudit?.findings ?? []).filter(finding => finding.area !== 'job_match' && finding.severity !== 'pass' && finding.resolution !== 'evidence_needed')
   const auditRetryOnly = displayedAudit?.findings.some(finding => finding.title === 'Audit response needs retry') ?? false
@@ -696,7 +698,7 @@ function JobDetailDrawer({ job, onClose, onStatusChange, onUpdate, onDelete, onO
 
   // Drawer uses a slightly more compact variant of the shared INPUT_STYLE
   const drawerInputSt: React.CSSProperties = { ...INPUT_STYLE, fontSize: 11, padding: '5px 8px', borderRadius: 5 }
-  const canTailorResume = Boolean(job.description && (baseResumes.length || existingTailoredResume || job.finalResumeId))
+  const canTailorResume = Boolean(applicationPreflight.canPrepare && job.description && (baseResumes.length || existingTailoredResume || job.finalResumeId))
   const packActionDisabled = autoPreparing || !canTailorResume
   const currentPackAudited = auditedPackKey === `${job.finalResumeId}:${job.finalCoverLetterId}`
     || (storedAudit?.audit.verdict === 'pass'
@@ -720,12 +722,18 @@ function JobDetailDrawer({ job, onClose, onStatusChange, onUpdate, onDelete, onO
         <div style={{ padding: '24px 28px 20px', borderBottom: '0.5px solid var(--border)', display: 'flex', alignItems: 'flex-start', gap: 12 }}>
           <div style={{ flex: 1 }}>
             <div style={{ fontSize: 24, fontWeight: 700, lineHeight: 1.2, letterSpacing: '-0.03em' }}>{job.role}</div>
-            <div style={{ fontSize: 15, color: 'var(--text-muted)', marginTop: 7 }}>{job.source ? `${job.source} job` : job.company}{job.createdAt ? ` · Posted ${fmtDate(job.createdAt)}` : ''}</div>
+            <div style={{ fontSize: 15, color: 'var(--text-muted)', marginTop: 7 }}>{job.source ? `${job.source} job` : job.company}{job.createdAt ? ` · Added ${fmtDate(job.createdAt)}` : ''}</div>
           </div>
           <button onClick={onClose} style={{ background: 'none', border: 'none', cursor: 'pointer', fontSize: 16, color: 'var(--text-muted)', lineHeight: 1, padding: 0, marginTop: 2 }}>✕</button>
         </div>
 
         <ReferenceProgress ready={currentPackAudited} />
+
+        {applicationPreflight.issues.length > 0 && <div style={{ margin: '18px 28px 0', padding: '12px 14px', borderRadius: 9, border: '1px solid #fbbf24', background: '#fffbeb', color: '#78350f', fontSize: 12, lineHeight: 1.5 }}>
+          <strong>{applicationPreflight.canPrepare ? 'Manual-only listing' : 'Application data needs correction'}</strong>
+          <div style={{ marginTop: 4 }}>{applicationPreflight.issues.map(issue => issue.message).join(' ')}</div>
+          <div style={{ marginTop: 5, color: '#92400e' }}>{applicationPreflight.canPrepare ? 'You may prepare materials, but the Agent will not fill or submit this destination.' : 'Materials and form filling are paused until the company and job description are corrected.'}</div>
+        </div>}
 
         {/* Body */}
         <div style={{ flex: 1, padding: '26px 28px', display: 'flex', flexDirection: 'column', gap: 24 }}>
@@ -764,7 +772,7 @@ function JobDetailDrawer({ job, onClose, onStatusChange, onUpdate, onDelete, onO
               <AuditPackPreview audit={displayedAudit} onRepair={() => void autoTailorAndAudit()} onAddEvidence={finding => { setEvidenceFinding(finding); setEvidenceText('') }} repairing={autoPreparing} />
             </PackRow>
             {currentPackAudited && <button onClick={() => void downloadFinalPack()} disabled={downloadingPack} style={{ width: '100%', minHeight: 46, border: 0, borderRadius: 9, background: '#2563eb', color: '#fff', fontWeight: 700, cursor: 'pointer' }}>{downloadingPack ? (exportedPackFolder ? 'Opening job folder…' : 'Saving PDFs…') : exportedPackFolder ? 'Open job folder' : 'Save audited PDFs to D:\\My Jobs resume'}</button>}
-            <PackRow number="4" title="Open & fill application" detail="Available after all items are complete" done={false} locked={!currentPackAudited} last onClick={currentPackAudited && job.url ? () => window.open(job.url!, '_blank', 'noopener,noreferrer') : undefined} />
+            <PackRow number="4" title="Open & fill application" detail={applicationPreflight.canAutomate ? 'Available after all items are complete' : 'Requires a verified direct ATS application link'} done={false} locked={!currentPackAudited || !applicationPreflight.canAutomate} last onClick={currentPackAudited && applicationPreflight.canAutomate && job.url ? () => window.open(job.url!, '_blank', 'noopener,noreferrer') : undefined} />
             <div style={{ borderTop: '1px solid var(--border)', marginTop: 8, paddingTop: 22 }}><div style={{ fontSize: 12, fontWeight: 700, color: '#64748b', marginBottom: 12 }}>REVIEW &amp; SUBMIT</div><div style={{ border: '1px solid #bfdbfe', background: '#f8fbff', borderRadius: 9, padding: '14px 16px', display: 'flex', gap: 12, fontSize: 13, lineHeight: 1.55 }}><Info size={22} color="#2563eb" style={{ flexShrink: 0, marginTop: 1 }} /><span><strong>You’ll review and submit on the employer site</strong><br /><span style={{ color: 'var(--text-muted)' }}>We’ll open the job in a new tab when your application pack is ready.</span></span></div></div>
             <div style={{ borderTop: '1px solid var(--border)', marginTop: 28, paddingTop: 22 }}>
               <div style={{ fontSize: 12, fontWeight: 700, color: '#64748b', marginBottom: 16 }}>JOB DETAILS</div>

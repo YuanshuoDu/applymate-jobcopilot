@@ -14,6 +14,7 @@ import type {
 import { stageOk, stageFail } from '../types'
 import { roleAiConfig } from '../role-config'
 import { forEachConcurrent } from '../concurrency'
+import { assessApplicationPreflight } from '../application-preflight'
 
 const SCORE_COLOR = (s: number) => s >= 80 ? '#3B6D11' : s >= 60 ? '#854F0B' : '#6B7280'
 
@@ -53,6 +54,8 @@ export async function runAnalyze(
   }
 
   await forEachConcurrent(jobs, 3, async job => {
+    const preflight = assessApplicationPreflight(job)
+    const hardPreflightIssues = preflight.issues.filter(issue => issue.code !== "missing_description")
     await db.applicationTask?.upsert({
       where: { userId_jobId: { userId, jobId: job.id } },
       create: { userId, jobId: job.id, sessionId: ctx.sessionId ?? null, status: "analyzing", checkpoint: "match_analysis" },
@@ -63,6 +66,23 @@ export async function runAnalyze(
       role:   'analyst',
       action: `评分 ${job.company} · ${job.role}${job.location ? ` (${job.location})` : ''}`,
     })
+
+    // Reject automation-ineligible records before an LLM scores them or the
+    // writer creates job-specific documents. This avoids spending credits on a
+    // job-board redirect or conflicting employer data.
+    if (hardPreflightIssues.length > 0) {
+      const reason = hardPreflightIssues.map(issue => issue.message).join(" ")
+      await db.applicationTask?.updateMany({
+        where: { userId, jobId: job.id, status: 'analyzing' },
+        data: { status: 'skipped', checkpoint: 'job_preflight_failed', error: reason, completedAt: new Date() },
+      })
+      emit('job_skip', { jobId: job.id, company: job.company, role: job.role, reason })
+      emit('agent_observation', {
+        role: 'analyst',
+        observation: `⚠ 跳过 ${job.company} · ${job.role}：申请前校验未通过。${reason}`,
+      })
+      return
+    }
 
     if (!job.description && !job.role) {
       await db.applicationTask?.updateMany({

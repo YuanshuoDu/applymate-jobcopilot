@@ -9,6 +9,7 @@ const mocks = vi.hoisted(() => ({
   resumeFindFirst: vi.fn(),
   coverLetterFindFirst: vi.fn(),
   jobUpdateMany: vi.fn(),
+  jobFindFirst: vi.fn(),
   activityCreate: vi.fn(),
   enqueueApplyTask: vi.fn(),
 }));
@@ -21,7 +22,7 @@ vi.mock("@/lib/db", () => ({
     resume: { findFirst: mocks.resumeFindFirst },
     coverLetter: { findFirst: mocks.coverLetterFindFirst },
     applicationTaskEvent: { create: mocks.taskEventCreate },
-    job: { updateMany: mocks.jobUpdateMany },
+    job: { findFirst: mocks.jobFindFirst, updateMany: mocks.jobUpdateMany },
     activity: { create: mocks.activityCreate },
   },
 }));
@@ -41,6 +42,9 @@ describe("auto-apply authorization", () => {
     mocks.taskFindFirst.mockResolvedValue({ resumeId: "resume_1", coverLetterId: null });
     mocks.resumeFindFirst.mockResolvedValue({ id: "resume_1" });
     mocks.coverLetterFindFirst.mockResolvedValue({ id: "cover_1" });
+    mocks.jobFindFirst.mockResolvedValue({
+      company: "Acme", description: "Join the platform team with Acme. Build products.", source: "lever", url: input.applyUrl,
+    });
     mocks.transaction.mockImplementation(async (callback: (tx: unknown) => unknown) => {
       if (typeof callback === "function") {
         return callback({
@@ -105,7 +109,17 @@ describe("auto-apply authorization", () => {
 
   it("rejects blocked job-board URLs before reading or changing state", async () => {
     const { queueAutonomousApplication } = await import("./auto-apply");
-    await expect(queueAutonomousApplication({ ...input, applyUrl: "https://www.linkedin.com/jobs/view/123" })).rejects.toThrow("not supported");
+    await expect(queueAutonomousApplication({ ...input, applyUrl: "https://www.linkedin.com/jobs/view/123" })).rejects.toThrow("direct supported ATS");
+    expect(mocks.approvalFindFirst).not.toHaveBeenCalled();
+  });
+
+  it("rejects a direct ATS URL when the saved job identity conflicts with its description", async () => {
+    mocks.jobFindFirst.mockResolvedValueOnce({
+      company: "Questionmark", description: "Join Future of EdTech with Learnosity. At Learnosity, build products.", source: "lever", url: input.applyUrl,
+    });
+    const { queueAutonomousApplication } = await import("./auto-apply");
+
+    await expect(queueAutonomousApplication(input)).rejects.toThrow("does not match")
     expect(mocks.approvalFindFirst).not.toHaveBeenCalled();
   });
 });
