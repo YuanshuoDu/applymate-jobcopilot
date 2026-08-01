@@ -32,9 +32,11 @@ export async function queueAutonomousApplication(input: {
   userId: string;
   jobId: string;
   applyUrl: string | null | undefined;
+  /** A pipeline may carry a validated per-run automation policy. */
+  approvalPolicy?: { autoApply: boolean; requireApproval: boolean };
 }): Promise<{ taskId: string }> {
   const applyUrl = validateAutoApplyUrl(input.applyUrl);
-  const config = await db.agentConfig.findUnique({
+  const config = input.approvalPolicy ?? await db.agentConfig.findUnique({
     where: { userId: input.userId },
     select: { autoApply: true, requireApproval: true },
   });

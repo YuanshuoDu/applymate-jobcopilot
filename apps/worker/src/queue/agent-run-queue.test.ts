@@ -1,0 +1,39 @@
+import { beforeEach, describe, expect, it, vi } from "vitest";
+
+const mocks = vi.hoisted(() => ({ handler: undefined as undefined | ((job: { data: unknown }) => Promise<unknown>) }));
+
+vi.mock("bullmq", () => ({
+  Queue: vi.fn(),
+  Worker: vi.fn().mockImplementation((_name, handler) => {
+    mocks.handler = handler;
+    return {};
+  }),
+}));
+vi.mock("ioredis", () => ({ Redis: vi.fn().mockImplementation(() => ({ disconnect: vi.fn() })) }));
+
+describe("agent-run queue", () => {
+  beforeEach(() => {
+    vi.resetModules();
+    mocks.handler = undefined;
+    vi.stubEnv("AGENT_WEB_URL", "https://app.applymate.test/");
+    vi.stubEnv("AGENT_WORKER_SECRET", "worker-secret");
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response(JSON.stringify({ status: "completed" }))));
+  });
+
+  it("calls the authenticated internal pipeline endpoint for a scheduled session", async () => {
+    await import("./agent-run-queue.js");
+    await mocks.handler?.({ data: { userId: "user_1", sessionId: "session_1" } });
+
+    expect(fetch).toHaveBeenCalledWith("https://app.applymate.test/api/internal/agent-run", expect.objectContaining({
+      method: "POST",
+      headers: expect.objectContaining({ "x-agent-worker-secret": "worker-secret" }),
+      body: JSON.stringify({ userId: "user_1", sessionId: "session_1" }),
+    }));
+  });
+
+  it("rejects a task when the worker URL is not configured", async () => {
+    vi.stubEnv("AGENT_WEB_URL", "");
+    await import("./agent-run-queue.js");
+    await expect(mocks.handler?.({ data: { userId: "user_1", sessionId: "session_1" } })).rejects.toThrow("AGENT_WEB_URL");
+  });
+});

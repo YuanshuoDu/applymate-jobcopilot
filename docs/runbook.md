@@ -13,12 +13,23 @@ Use it to stabilize incidents first, then gather evidence for Claude/PM or a Cod
 - Bull Board: `/admin/queues`
 - Apply queue: `apply-tasks`
 - Scout queue: `scout-tasks`
+- Scheduled Agent queue: `agent-runs`
 - Results table: `apply_results`
 - Key columns: `user_id`, `job_id`, `ats_type`, `flow_used`, `status`, `error`, `duration_ms`, `created_at`
 - Redis env: `REDIS_URL`
 - Database env: `DATABASE_URL`
-- Worker env: `CLOAK_MAX_WORKERS`, `APPLY_TIMEOUT_MS`, `CAPSOLVER_API_KEY`, `RATE_LIMIT_PER_USER_HOUR`
-- Bull Board env: `BULL_BOARD_PASSWORD`, `BULL_BOARD_PORT`
+- Worker env: `CLOAK_MAX_WORKERS`, `APPLY_TIMEOUT_MS`, `CAPSOLVER_API_KEY`, `RATE_LIMIT_PER_USER_HOUR`, `AGENT_WEB_URL`, `AGENT_WORKER_SECRET`
+- Bull Board env: `ENABLE_BULL_BOARD=1`, `BULL_BOARD_PASSWORD`, `BULL_BOARD_PORT`
+- Worker health endpoint: `GET /healthz` on `BULL_BOARD_PORT` (default `3001`)
+
+Bull Board is disabled by default. Only enable it on a private network with a
+strong `BULL_BOARD_PASSWORD`; do not expose it as a public worker endpoint.
+
+Scheduled Agent runs travel through `agent-runs`: Vercel Cron creates a session,
+the Worker calls the protected internal pipeline endpoint, and the original
+session receives the transcript and final report. The Web and Worker deployments
+must share `REDIS_URL` and `AGENT_WORKER_SECRET`; set `AGENT_WEB_URL` on the
+Worker to the public Web origin.
 
 ## First Five Minutes
 

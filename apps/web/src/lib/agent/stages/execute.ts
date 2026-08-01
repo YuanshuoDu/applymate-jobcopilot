@@ -40,6 +40,10 @@ export async function runExecute(
         userId: ctx.userId,
         jobId: pkg.job.id,
         applyUrl: pkg.job.url,
+        approvalPolicy: {
+          autoApply: ctx.agentCfg.autoApply,
+          requireApproval: ctx.agentCfg.requireApproval,
+        },
       });
       queued.push(pkg.job.id);
 

@@ -24,6 +24,7 @@ function statusColor(status: string): string {
 export function AgentSessionConsole({
   selectedSessionId,
   onSelectSession,
+  onRunSession,
   onNewChat,
   onDeletedSession,
   onAddAgent,
@@ -31,6 +32,7 @@ export function AgentSessionConsole({
 }: {
   selectedSessionId: string | null
   onSelectSession: (id: string, goal?: string, subtitle?: string) => void
+  onRunSession?: (id: string) => void
   onNewChat: () => void
   onDeletedSession: (id: string) => void
   onAddAgent?: () => void
@@ -226,7 +228,8 @@ export function AgentSessionConsole({
           onCreate={onNewChat}
           onSessionStarted={sessionId => {
             void refetch()
-            onSelectSession(sessionId)
+            if (onRunSession) onRunSession(sessionId)
+            else onSelectSession(sessionId)
           }}
         />
         <HealthStrip />

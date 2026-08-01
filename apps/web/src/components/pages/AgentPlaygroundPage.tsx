@@ -430,6 +430,10 @@ export function AgentPlaygroundPage() {
         <AgentSessionConsole
           selectedSessionId={selectedSessionId}
           onSelectSession={selectSession}
+          onRunSession={sessionId => {
+            selectSession(sessionId)
+            startRun(undefined, sessionId)
+          }}
           onAddAgent={() => setShowAddModal(true)}
           onNewChat={resetLiveWorkspace}
           onDeletedSession={handleDeletedSession}

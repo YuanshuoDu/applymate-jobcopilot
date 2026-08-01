@@ -4,10 +4,13 @@
   "private": true,
   "type": "module",
   "scripts": {
+    "predev": "pnpm --filter @jobcopilot/shared build",
     "dev": "tsx watch src/index.ts",
     "start": "node dist/index.js",
-    "build": "tsc",
+    "build": "pnpm --filter @jobcopilot/shared build && tsc",
+    "pretsc": "pnpm --filter @jobcopilot/shared build",
     "tsc": "tsc",
+    "pretest": "pnpm --filter @jobcopilot/shared build",
     "test": "vitest run",
     "test:watch": "vitest"
   },

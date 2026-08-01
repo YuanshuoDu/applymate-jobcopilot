@@ -1,6 +1,7 @@
 import { ensureApplyResultsTable, closePool } from "./db/apply-results.js";
 import { applyWorker, applyQueue, connection } from "./queue/apply-queue.js";
 import { scoutWorker, scoutQueue, SCOUT_QUEUE_NAME } from "./queue/scout-queue.js";
+import { agentRunQueue, AGENT_RUN_QUEUE_NAME, closeAgentRunResources } from "./queue/agent-run-queue.js";
 import { closeAllSlots } from "./cloak/pool.js";
 import express from "express";
 import { createBullBoard } from "@bull-board/api";
@@ -34,33 +35,39 @@ async function main() {
 
   console.log(`[worker] Listening on queue 'apply-tasks' (concurrency: ${process.env.CLOAK_MAX_WORKERS ?? "1"})`);
   console.log(`[worker] Listening on queue '${SCOUT_QUEUE_NAME}' (concurrency: 1)`);
-
-  // -- Bull Board admin UI ------------------------------------------------
-  const serverAdapter = new ExpressAdapter();
-  serverAdapter.setBasePath("/admin/queues");
-  createBullBoard({
-    queues: [new BullMQAdapter(applyQueue), new BullMQAdapter(scoutQueue)],
-    serverAdapter,
-  });
+  console.log(`[worker] Listening on queue '${AGENT_RUN_QUEUE_NAME}' (concurrency: 1)`);
 
   const adminApp = express();
+  adminApp.get("/healthz", (_req, res) => res.status(200).json({ status: "ok" }));
 
-  // Basic auth when BULL_BOARD_PASSWORD is set
-  adminApp.use("/admin/queues", (req, res, next) => {
-    const pwd = process.env.BULL_BOARD_PASSWORD;
-    if (!pwd) return next();
-    const expected = "Basic " + Buffer.from("admin:" + pwd).toString("base64");
-    if (req.headers.authorization !== expected) {
-      res.setHeader("WWW-Authenticate", 'Basic realm="Bull Board"');
-      return res.status(401).send("Unauthorized");
-    }
-    next();
-  });
+  // Bull Board contains task and application metadata. It is disabled unless
+  // explicitly enabled, including in production, and is always password-gated.
+  if (process.env.ENABLE_BULL_BOARD === "1") {
+    const password = process.env.BULL_BOARD_PASSWORD;
+    if (!password) throw new Error("BULL_BOARD_PASSWORD is required when ENABLE_BULL_BOARD=1");
 
-  adminApp.use("/admin/queues", serverAdapter.getRouter());
+    const serverAdapter = new ExpressAdapter();
+    serverAdapter.setBasePath("/admin/queues");
+    createBullBoard({
+      queues: [new BullMQAdapter(applyQueue), new BullMQAdapter(scoutQueue), new BullMQAdapter(agentRunQueue)],
+      serverAdapter,
+    });
+
+    adminApp.use("/admin/queues", (req, res, next) => {
+      const expected = "Basic " + Buffer.from("admin:" + password).toString("base64");
+      if (req.headers.authorization !== expected) {
+        res.setHeader("WWW-Authenticate", 'Basic realm="Bull Board"');
+        return res.status(401).send("Unauthorized");
+      }
+      next();
+    });
+    adminApp.use("/admin/queues", serverAdapter.getRouter());
+    console.log("[bull-board] Enabled at /admin/queues");
+  }
+
   const boardPort = Number(process.env.BULL_BOARD_PORT ?? "3001");
   adminApp.listen(boardPort, () =>
-    console.log(`[bull-board] http://localhost:${boardPort}/admin/queues`)
+    console.log(`[worker-health] http://localhost:${boardPort}/healthz`)
   );
 
   // Graceful shutdown
@@ -68,6 +75,7 @@ async function main() {
     console.log(`[worker] Received ${signal}, shutting down...`);
     await scoutWorker.close();
     await applyWorker.close();
+    await closeAgentRunResources();
     await closeAllSlots();
     await closePool();
     connection.disconnect();

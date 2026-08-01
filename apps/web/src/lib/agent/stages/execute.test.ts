@@ -16,6 +16,7 @@ vi.mock("@/lib/db", () => ({
 function context(events: Array<{ event: string; data: unknown }>) {
   return {
     userId: "user_1",
+    agentCfg: { autoApply: true, requireApproval: false },
     emit: (event: string, data: unknown) => events.push({ event, data }),
   } as never;
 }
@@ -46,6 +47,7 @@ describe("runExecute", () => {
       userId: "user_1",
       jobId: "job_1",
       applyUrl: "https://jobs.lever.co/acme/1",
+      approvalPolicy: { autoApply: true, requireApproval: false },
     });
     expect(events).toContainEqual(expect.objectContaining({ event: "application_queued" }));
   });
