@@ -12,6 +12,7 @@ export interface LogEntry {
            | 'orchestrator_plan' | 'orchestrator_fix' | 'orchestrator_retry'
            | 'orchestrator_decision' | 'orchestrator_complete'
            | 'orchestrator_thinking' | 'orchestrator_question' | 'orchestrator_answer'
+           | 'application_queued'
            | 'user_message'
   message:   string
   time:      Date
@@ -25,6 +26,7 @@ export interface LogEntry {
 export interface RunSummary {
   processed: number
   applied:   number
+  queued:    number
   pending:   number
   skipped:   number
   failed:    number

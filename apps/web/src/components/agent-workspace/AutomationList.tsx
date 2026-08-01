@@ -11,7 +11,7 @@ interface AutomationsResponse {
 
 export function AutomationList({ onCreate, onSessionStarted }: {
   onCreate: () => void
-  onSessionStarted?: (sessionId: string) => void
+  onSessionStarted?: (sessionId: string, policy: Pick<AgentAutomation, 'autoApply' | 'requireApproval'>) => void
 }) {
   const { data, loading, error, refetch } = useApi<AutomationsResponse>('/api/agent/automations')
   const [pendingId, setPendingId] = React.useState<string | null>(null)
@@ -55,8 +55,9 @@ export function AutomationList({ onCreate, onSessionStarted }: {
     window.dispatchEvent(new Event('applymate:sessions-changed'))
     await refetch()
     const sessionId = runData?.session?.id
-    setNotice({ tone: 'success', message: sessionId ? 'Automation run started.' : 'Automation run queued.' })
-    if (sessionId) onSessionStarted?.(sessionId)
+    const isAutopilot = row.autoApply && !row.requireApproval
+    setNotice({ tone: 'success', message: sessionId ? `${isAutopilot ? 'Autopilot' : 'Review'} run started.` : 'Automation run queued.' })
+    if (sessionId) onSessionStarted?.(sessionId, row)
   }
 
   async function handleSaved() {
@@ -110,6 +111,7 @@ export function AutomationList({ onCreate, onSessionStarted }: {
         <button
           onClick={openCreate}
           title="Create automation"
+          aria-label="Create automation"
           style={{ width: 24, height: 24, borderRadius: 7, border: '1px solid var(--border)', background: 'var(--bg)', color: 'var(--primary)', cursor: 'pointer', fontSize: 16, lineHeight: 1 }}
         >
           +

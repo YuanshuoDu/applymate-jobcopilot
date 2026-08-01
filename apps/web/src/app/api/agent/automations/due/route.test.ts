@@ -3,9 +3,14 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 const mocks = vi.hoisted(() => ({
   automationFindMany: vi.fn(),
   automationUpdateMany: vi.fn(),
+  automationUpdate: vi.fn(),
   sessionCreate: vi.fn(),
+  sessionUpdate: vi.fn(),
   transcriptCreate: vi.fn(),
+  enqueueAgentRun: vi.fn(),
 }))
+
+vi.mock("@/lib/agent-run-queue-client", () => ({ enqueueAgentRun: mocks.enqueueAgentRun }))
 
 vi.mock("@/lib/api-helpers", () => ({
   ok: (data: unknown, status = 200) => Response.json(data, { status }),
@@ -17,8 +22,9 @@ vi.mock("@/lib/db", () => ({
     agentAutomation: {
       findMany: mocks.automationFindMany,
       updateMany: mocks.automationUpdateMany,
+      update: mocks.automationUpdate,
     },
-    agentSession: { create: mocks.sessionCreate },
+    agentSession: { create: mocks.sessionCreate, update: mocks.sessionUpdate },
     agentTranscriptEvent: { create: mocks.transcriptCreate },
   },
 }))
@@ -54,7 +60,10 @@ describe("agent automation due scheduler API", () => {
     ])
     mocks.sessionCreate.mockResolvedValue({ id: "session_1" })
     mocks.transcriptCreate.mockResolvedValue({ id: "event_1" })
+    mocks.enqueueAgentRun.mockResolvedValue("task_1")
     mocks.automationUpdateMany.mockResolvedValue({ count: 1 })
+    mocks.automationUpdate.mockResolvedValue({})
+    mocks.sessionUpdate.mockResolvedValue({})
   })
 
   afterEach(() => {
@@ -68,7 +77,7 @@ describe("agent automation due scheduler API", () => {
 
     expect(res.status).toBe(200)
     await expect(res.json()).resolves.toMatchObject({
-      started: [{ automationId: "automation_1", sessionId: "session_1" }],
+      started: [{ automationId: "automation_1", sessionId: "session_1", taskId: "task_1" }],
     })
     expect(mocks.automationFindMany).toHaveBeenCalledWith({
       where: { enabled: true, nextRunAt: { lte: expect.any(Date) } },
@@ -100,6 +109,7 @@ describe("agent automation due scheduler API", () => {
       },
       data: { lastRunAt: expect.any(Date), nextRunAt: expect.any(Date) },
     })
+    expect(mocks.enqueueAgentRun).toHaveBeenCalledWith({ userId: "user_1", sessionId: "session_1" })
   })
 
   it("skips session creation when another scheduler already claimed the automation", async () => {
@@ -148,5 +158,18 @@ describe("agent automation due scheduler API", () => {
         status: "running",
       }),
     })
+  })
+
+  it("records a failed session and makes the automation due again when queueing fails", async () => {
+    mocks.enqueueAgentRun.mockRejectedValueOnce(new Error("Redis unavailable"))
+    const { POST } = await import("./route")
+
+    await expect(POST(postRequest() as never)).rejects.toThrow("Redis unavailable")
+    expect(mocks.sessionUpdate).toHaveBeenCalledWith(expect.objectContaining({
+      where: { id: "session_1" }, data: expect.objectContaining({ status: "failed" }),
+    }))
+    expect(mocks.automationUpdate).toHaveBeenCalledWith(expect.objectContaining({
+      where: { id: "automation_1" }, data: { nextRunAt: expect.any(Date) },
+    }))
   })
 })

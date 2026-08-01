@@ -1,0 +1,28 @@
+# Dependencies are installed inside the Docker build.
+node_modules/
+**/node_modules/
+.pnpm-store/
+
+# Local build products and tool caches.
+**/dist/
+**/.next/
+**/.turbo/
+**/coverage/
+.vercel/
+.git/
+
+# The Worker image only needs apps/worker and packages/shared.
+apps/web/
+apps/extension/
+packages/ui/
+cloak-poc/
+
+# Local runtime configuration and transient artifacts never belong in the image.
+.env
+.env.*
+*.log
+tmp/
+_tmp_*/
+.chrome-test-profile/
+.playwright-mcp/
+.claude/

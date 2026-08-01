@@ -34,8 +34,10 @@ COPY apps/worker/package.json apps/worker/
 
 RUN pnpm install --frozen-lockfile --prod
 
-# Copy built output
+# Copy built output, including the runtime JavaScript for the shared worker
+# contract. Node cannot execute the workspace's TypeScript source directly.
 COPY --from=builder /app/apps/worker/dist apps/worker/dist/
+COPY --from=builder /app/packages/shared/dist packages/shared/dist/
 
 # CloakBrowser will be downloaded at first launch via the cloakbrowser npm postinstall
 ENV CLOAK_MAX_WORKERS=1

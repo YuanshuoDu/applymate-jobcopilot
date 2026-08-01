@@ -24,6 +24,7 @@ function statusColor(status: string): string {
 export function AgentSessionConsole({
   selectedSessionId,
   onSelectSession,
+  onRunSession,
   onNewChat,
   onDeletedSession,
   onAddAgent,
@@ -31,6 +32,7 @@ export function AgentSessionConsole({
 }: {
   selectedSessionId: string | null
   onSelectSession: (id: string, goal?: string, subtitle?: string) => void
+  onRunSession?: (id: string, policy: { autoApply: boolean; requireApproval: boolean }) => void
   onNewChat: () => void
   onDeletedSession: (id: string) => void
   onAddAgent?: () => void
@@ -224,9 +226,10 @@ export function AgentSessionConsole({
         <AgentTeamList onAddAgent={onAddAgent} />
         <AutomationList
           onCreate={onNewChat}
-          onSessionStarted={sessionId => {
+          onSessionStarted={(sessionId, policy) => {
             void refetch()
-            onSelectSession(sessionId)
+            if (onRunSession) onRunSession(sessionId, policy)
+            else onSelectSession(sessionId)
           }}
         />
         <HealthStrip />

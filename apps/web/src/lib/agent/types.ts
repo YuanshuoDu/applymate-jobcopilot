@@ -112,15 +112,18 @@ export interface GateOutput {
 // ── Stage 5: Execute ──────────────────────────────────────────────────────────
 
 export interface ExecuteOutput {
-  applied: string[]  // job IDs successfully applied
-  failed:  string[]  // job IDs that failed to update
+  queued: string[]  // job IDs dispatched to the unattended worker
+  failed: string[]  // job IDs that could not be queued
 }
 
 // ── Stage 6: Audit ────────────────────────────────────────────────────────────
 
 export interface RunReport {
   processed:  number
+  /** Confirmed submissions are recorded asynchronously by the worker. */
   applied:    number
+  /** Jobs accepted by the unattended worker during this pipeline run. */
+  queued:     number
   pending:    number
   skipped:    number
   failed:     number
@@ -135,7 +138,7 @@ export interface AuditOutput {
 // ── Utility ───────────────────────────────────────────────────────────────────
 
 export function emptyReport(durationMs = 0): RunReport {
-  return { processed: 0, applied: 0, pending: 0, skipped: 0, failed: 0, durationMs }
+  return { processed: 0, applied: 0, queued: 0, pending: 0, skipped: 0, failed: 0, durationMs }
 }
 
 export function stageOk<T>(stage: string, data: T, count: number, durationMs: number): StageResult<T> {

@@ -1,0 +1,69 @@
+import { describe, expect, it, vi } from "vitest";
+import {
+  automationSchedulerConfig,
+  createAutomationScheduler,
+  startAutomationScheduler,
+} from "./automation-scheduler.js";
+
+describe("automation scheduler", () => {
+  it("uses the worker web origin and dedicated scheduler secret", () => {
+    expect(automationSchedulerConfig({
+      AGENT_WEB_URL: "https://app.applymate.test/",
+      AGENT_AUTOMATION_CRON_SECRET: "scheduler-secret",
+      AGENT_SCHEDULER_INTERVAL_MS: "5000",
+    })).toEqual({
+      endpoint: "https://app.applymate.test/api/agent/automations/due",
+      secret: "scheduler-secret",
+      intervalMs: 60_000,
+    });
+  });
+
+  it("requires the production web origin and secret", () => {
+    expect(() => automationSchedulerConfig({ AGENT_AUTOMATION_CRON_SECRET: "secret" }))
+      .toThrow("AGENT_WEB_URL");
+    expect(() => automationSchedulerConfig({ AGENT_WEB_URL: "https://app.applymate.test" }))
+      .toThrow("AGENT_AUTOMATION_CRON_SECRET");
+  });
+
+  it("calls the protected due endpoint and records success", async () => {
+    const request = vi.fn().mockResolvedValue(new Response(JSON.stringify({ started: [] })));
+    const scheduler = createAutomationScheduler({
+      endpoint: "https://app.applymate.test/api/agent/automations/due",
+      secret: "scheduler-secret",
+      intervalMs: 300_000,
+      request,
+    });
+
+    await scheduler.run();
+
+    expect(request).toHaveBeenCalledWith(
+      "https://app.applymate.test/api/agent/automations/due",
+      expect.objectContaining({
+        method: "POST",
+        headers: { Authorization: "Bearer scheduler-secret" },
+      }),
+    );
+    expect(scheduler.status()).toMatchObject({ running: false, lastError: null });
+    expect(scheduler.status().lastSuccessAt).not.toBeNull();
+  });
+
+  it("keeps the worker alive and reports a failed scheduler request", async () => {
+    const request = vi.fn().mockResolvedValue(new Response("Unavailable", { status: 503 }));
+    const scheduler = createAutomationScheduler({
+      endpoint: "https://app.applymate.test/api/agent/automations/due",
+      secret: "scheduler-secret",
+      intervalMs: 300_000,
+      request,
+    });
+
+    await scheduler.run();
+
+    expect(scheduler.status()).toMatchObject({ running: false, lastSuccessAt: null });
+    expect(scheduler.status().lastError).toContain("503");
+  });
+
+  it("can be explicitly disabled for local worker usage", () => {
+    const scheduler = startAutomationScheduler({ AGENT_SCHEDULER_ENABLED: "0" });
+    expect(scheduler.status().enabled).toBe(false);
+  });
+});

@@ -138,9 +138,11 @@ export function AgentLiveStreamBody({
             <div style={{ flexShrink: 0, margin: '8px 0', borderRadius: 10, border: '1px solid var(--border)', overflow: 'hidden' }}>
               <div style={{ padding: '8px 14px', background: 'var(--bg-secondary)', borderBottom: '0.5px solid var(--border)', display: 'flex', alignItems: 'center', gap: 8 }}>
                 <span style={{ fontSize: 14 }}>📋</span>
-                <span style={{ fontSize: 12, fontWeight: 600 }}>待申请队列</span>
+                <span style={{ fontSize: 12, fontWeight: 600 }}>申请队列</span>
                 <span style={{ fontSize: 10, padding: '1px 7px', borderRadius: 999, background: 'var(--primary)', color: '#fff', fontWeight: 600 }}>{applyPending.length}</span>
-                <span style={{ fontSize: 10, color: 'var(--text-muted)', marginLeft: 'auto' }}>点击「立即申请」确认投递</span>
+                <span style={{ fontSize: 10, color: 'var(--text-muted)', marginLeft: 'auto' }}>
+                  {applyQueue.some(job => job.mode === 'queued') ? '后台提交结果会自动更新' : '点击「立即申请」确认投递'}
+                </span>
               </div>
               {applyQueue.map(job => (
                 <ApplyJobCard key={job.jobId} job={job} onApplied={(id) => onApplied(id, job)} />

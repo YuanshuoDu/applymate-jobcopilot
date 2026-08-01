@@ -53,7 +53,7 @@ describe('runAudit', () => {
 
   it('delegates Gmail tracking to the shared durable sync service', async () => {
     const emit = vi.fn()
-    const result = await runAudit({ applied: [], failed: [] }, [] as Job[], context(emit))
+    const result = await runAudit({ queued: [], failed: [] }, [] as Job[], context(emit))
 
     expect(mocks.syncGmailForUser).toHaveBeenCalledWith('user_1')
     expect(mocks.findMany).not.toHaveBeenCalled()
@@ -64,17 +64,17 @@ describe('runAudit', () => {
     }))
   })
 
-  it('verifies the internal ready-to-apply workflow without reintroducing an employer lifecycle state', async () => {
+  it('verifies that dispatched jobs remain queued, submitting, or confirmed submissions', async () => {
     mocks.findMany.mockResolvedValue([{
       company: 'Example Co',
       role: 'Engineer',
       status: 'saved',
-      workflowState: 'ready_to_apply',
+      workflowState: 'queued',
     }])
     mocks.syncGmailForUser.mockResolvedValue({ ...synced, importedMessages: 0, newRecommendations: 0 })
     const emit = vi.fn()
 
-    const result = await runAudit({ applied: ['job_1'], failed: [] }, [] as Job[], context(emit))
+    const result = await runAudit({ queued: ['job_1'], failed: [] }, [] as Job[], context(emit))
 
     expect(mocks.findMany).toHaveBeenCalledWith(expect.objectContaining({
       where: { id: { in: ['job_1'] } },
@@ -82,14 +82,28 @@ describe('runAudit', () => {
     }))
     expect(result).toMatchObject({ ok: true, data: { warnings: [] } })
     expect(emit).toHaveBeenCalledWith('agent_observation', expect.objectContaining({
-      observation: expect.stringContaining('saved and ready to apply'),
+      observation: expect.stringContaining('queued, submitting, or already confirmed submitted'),
     }))
+  })
+
+  it('accepts a job that the worker has already locked for submission', async () => {
+    mocks.findMany.mockResolvedValue([{
+      company: 'Example Co',
+      role: 'Engineer',
+      status: 'saved',
+      workflowState: 'submitting',
+    }])
+    mocks.syncGmailForUser.mockResolvedValue({ ...synced, importedMessages: 0, newRecommendations: 0 })
+
+    const result = await runAudit({ queued: ['job_1'], failed: [] }, [] as Job[], context())
+
+    expect(result).toMatchObject({ ok: true, data: { warnings: [] } })
   })
 
   it('records a sync failure as an audit warning without changing jobs directly', async () => {
     mocks.syncGmailForUser.mockRejectedValue(new Error('network unavailable'))
 
-    const result = await runAudit({ applied: [], failed: [] }, [] as Job[], context())
+    const result = await runAudit({ queued: [], failed: [] }, [] as Job[], context())
 
     expect(result.data?.warnings).toEqual(['Gmail sync failed: network unavailable'])
     expect(mocks.findMany).not.toHaveBeenCalled()

@@ -213,7 +213,7 @@ export async function runPipeline(ctx: PipelineCtx): Promise<RunReport> {
 
   if (scoredJobs.length === 0) {
     emit('info', { message: 'No jobs scored successfully. Check AI API keys.' })
-    orch.complete({ processed: scoutedJobs.length, applied: 0, pending: 0, skipped: scoutedJobs.length })
+    orch.complete({ processed: scoutedJobs.length, applied: 0, queued: 0, pending: 0, skipped: scoutedJobs.length })
     emit('done', emptyReport(Date.now() - t0))
     return emptyReport(Date.now() - t0)
   }
@@ -350,7 +350,7 @@ export async function runPipeline(ctx: PipelineCtx): Promise<RunReport> {
       : `计划：无批准职位，${s4.data!.pending.length} 个在待审核队列等待人工操作`,
   })
 
-  let executorApplied: string[] = []
+  let executorQueued: string[] = []
   let executorFailed: string[] = []
 
   executeLoop: while (true) {
@@ -363,37 +363,37 @@ export async function runPipeline(ctx: PipelineCtx): Promise<RunReport> {
 
     const s5 = await runExecute(s4.data!.approved, ctx)
 
-    // If partial failures on DB writes, retry the failed ones
+    // If the queue was temporarily unavailable, retry only the failed packages.
     if (s5.data!.failed.length > 0 && attempt < 3) {
-      orch.recordFailure('executor', `${s5.data!.failed.length} DB updates failed`)
+      orch.recordFailure('executor', `${s5.data!.failed.length} queue operations failed`)
       // Re-run with only the failed jobs
       const failedPkgs = s4.data!.approved.filter(p => s5.data!.failed.includes(p.job.id))
       if (failedPkgs.length > 0) {
         emit('orchestrator_fix', {
           stage: 'executor', fix: 'retry_failed_db_writes',
-          message: `${s5.data!.failed.length} 个 DB 写入失败，正在重试…`,
+          message: `${s5.data!.failed.length} 个投递任务入队失败，正在重试…`,
         })
         // Merge results
-        executorApplied = [...executorApplied, ...s5.data!.applied]
+        executorQueued = [...executorQueued, ...s5.data!.queued]
         // Override approved list to only retry failed ones
         s4.data!.approved = failedPkgs
         continue
       }
     }
 
-    executorApplied = [...executorApplied, ...s5.data!.applied]
+    executorQueued = [...executorQueued, ...s5.data!.queued]
     executorFailed  = [...executorFailed,  ...s5.data!.failed]
 
     emit('agent_reflect', {
       role: 'executor',
-      reflect: executorApplied.length > 0
-        ? `准备完成：${executorApplied.length} 个职位已加入「待申请队列」，请在下方点击「🚀 立即申请」逐一确认投递${executorFailed.length > 0 ? `（${executorFailed.length} 个处理失败）` : ''}（耗时 ${(s5.metrics.durationMs / 1000).toFixed(1)}s）`
-        : `准备完成：无高分职位进入申请队列，所有职位在 Jobs 页面待审核`,
+      reflect: executorQueued.length > 0
+        ? `已派发：${executorQueued.length} 个职位已加入无人值守投递队列。提交确认会由 Worker 回写${executorFailed.length > 0 ? `（${executorFailed.length} 个入队失败）` : ''}（耗时 ${(s5.metrics.durationMs / 1000).toFixed(1)}s）`
+        : `准备完成：无高分职位进入无人值守投递队列，所有职位仍在待审核`,
     })
-    const executorSummary = `${executorApplied.length} queued for manual apply, ${executorFailed.length} failed`
-    emitRole(ctx, 'executor', 'done', { count: executorApplied.length, durationMs: s5.metrics.durationMs, summary: executorSummary, applied: executorApplied.length, failed: executorFailed.length })
-    emit('stage_done', { stage: 'execute', applied: executorApplied.length, durationMs: s5.metrics.durationMs })
-    await recordRoleRun(ctx.userId, 'executor', { count: executorApplied.length, durationMs: s5.metrics.durationMs, summary: executorSummary }).catch(() => {})
+    const executorSummary = `${executorQueued.length} queued for unattended submission, ${executorFailed.length} failed`
+    emitRole(ctx, 'executor', 'done', { count: executorQueued.length, durationMs: s5.metrics.durationMs, summary: executorSummary, queued: executorQueued.length, failed: executorFailed.length })
+    emit('stage_done', { stage: 'execute', queued: executorQueued.length, durationMs: s5.metrics.durationMs })
+    await recordRoleRun(ctx.userId, 'executor', { count: executorQueued.length, durationMs: s5.metrics.durationMs, summary: executorSummary }).catch(() => {})
     await runCustomAgents(ctx, scoutedJobs, 'executor')
     break executeLoop
   }
@@ -403,7 +403,7 @@ export async function runPipeline(ctx: PipelineCtx): Promise<RunReport> {
   emitRole(ctx, 'auditor', 'start')
   emit('agent_plan', {
     role: 'auditor',
-    plan: `计划：核查 DB 状态，统计结果（${executorApplied.length} 进入手动申请队列 / ${s4.data!.pending.length} 待审核 / ${s4.data!.skipped.length} 跳过），扫描 Gmail 邮件`,
+    plan: `计划：核查 DB 状态，统计结果（${executorQueued.length} 已派发到无人值守 Worker / ${s4.data!.pending.length} 待审核 / ${s4.data!.skipped.length} 跳过），扫描 Gmail 邮件`,
   })
 
   let auditWarnings: string[] = []
@@ -414,7 +414,7 @@ export async function runPipeline(ctx: PipelineCtx): Promise<RunReport> {
       orch.emitRetry('auditor', attempt, 2, '跳过 Gmail 扫描，仅做 DB 核验…')
     }
 
-    const fakeExecuteOutput = { applied: executorApplied, failed: executorFailed }
+    const fakeExecuteOutput = { queued: executorQueued, failed: executorFailed }
     const s6 = await runAudit(fakeExecuteOutput, scoutedJobs, ctx)
     auditWarnings = s6.data!.warnings ?? []
 
@@ -424,17 +424,18 @@ export async function runPipeline(ctx: PipelineCtx): Promise<RunReport> {
 
     const report: RunReport = {
       processed:  scoutedJobs.length,
-      applied:    executorApplied.length,
+      applied:    0,
+      queued:     executorQueued.length,
       pending:    s4.data!.pending.length,
       skipped:    s4.data!.skipped.length + analysisFailed,
       failed:     executorFailed.length,
       durationMs: Date.now() - t0,
     }
 
-    const auditorSummary = `${report.applied} queued, ${report.pending} pending, ${auditWarnings.length} warnings`
+    const auditorSummary = `${report.queued} dispatched, ${report.pending} pending, ${auditWarnings.length} warnings`
     emit('agent_reflect', {
       role: 'auditor',
-      reflect: `✅ 本次运行报告：处理 ${report.processed} 个职位 · 📋 待手动申请 ${report.applied} 个 · ⏳ 待审核 ${report.pending} 个 · ⏭ 跳过 ${report.skipped} 个 · ❌ 失败 ${report.failed} 个${auditWarnings.length > 0 ? ` · ⚠ ${auditWarnings.length} 个警告` : ''} · 总耗时 ${((Date.now() - t0) / 1000).toFixed(1)}s`,
+      reflect: `✅ 本次运行报告：处理 ${report.processed} 个职位 · 🚀 已派发 ${report.queued} 个 · ✅ 已确认提交 ${report.applied} 个 · ⏳ 待审核 ${report.pending} 个 · ⏭ 跳过 ${report.skipped} 个 · ❌ 失败 ${report.failed} 个${auditWarnings.length > 0 ? ` · ⚠ ${auditWarnings.length} 个警告` : ''} · 总耗时 ${((Date.now() - t0) / 1000).toFixed(1)}s`,
     })
     emitRole(ctx, 'auditor', 'done', { count: report.processed, durationMs: s6.metrics.durationMs, summary: auditorSummary, warnings: auditWarnings.length })
     emit('stage_done', { stage: 'audit', durationMs: s6.metrics.durationMs })
@@ -446,8 +447,8 @@ export async function runPipeline(ctx: PipelineCtx): Promise<RunReport> {
       ? Math.round(scoredJobs.reduce((s, j) => s + j.score, 0) / scoredJobs.length)
       : 0
     const decPost = await orch.evaluate('post-run',
-      `Complete: ${report.processed} processed, ${report.applied} queued for apply, ${report.pending} pending review, ${report.skipped} skipped, avg score ${postRunAvg}%`,
-      { processed: report.processed, applied: report.applied, pending: report.pending, skipped: report.skipped, avgScore: postRunAvg, threshold: ctx.agentCfg.minMatchScore, autoApply: ctx.agentCfg.autoApply },
+      `Complete: ${report.processed} processed, ${report.queued} dispatched, ${report.applied} confirmed submitted, ${report.pending} pending review, ${report.skipped} skipped, avg score ${postRunAvg}%`,
+      { processed: report.processed, queued: report.queued, applied: report.applied, pending: report.pending, skipped: report.skipped, avgScore: postRunAvg, threshold: ctx.agentCfg.minMatchScore, autoApply: ctx.agentCfg.autoApply },
     )
     if (decPost.decision === 'ask_user' && decPost.ask_question) {
       const options = decPost.ask_options ?? [{ label: '✓ 了解', value: 'ok' }]
@@ -462,6 +463,7 @@ export async function runPipeline(ctx: PipelineCtx): Promise<RunReport> {
     orch.complete({
       processed: report.processed,
       applied:   report.applied,
+      queued:    report.queued,
       pending:   report.pending,
       skipped:   report.skipped,
     })

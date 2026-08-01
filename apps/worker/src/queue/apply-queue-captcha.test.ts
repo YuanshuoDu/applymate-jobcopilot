@@ -12,6 +12,7 @@ const mocks = vi.hoisted(() => ({
   solveCaptcha: vi.fn(),
   detectFlow: vi.fn(),
   runGreenhouseFlow: vi.fn(),
+  runSmartRecruitersFlow: vi.fn(),
   createNotification: vi.fn().mockResolvedValue(undefined),
   notifyApplyResult: vi.fn().mockResolvedValue(undefined),
 }));
@@ -63,6 +64,9 @@ vi.mock("../flows/greenhouse-flow.js", () => ({
 vi.mock("../flows/workday-flow.js", () => ({ runWorkdayFlow: vi.fn() }));
 vi.mock("../flows/lever-flow.js", () => ({ runLeverFlow: vi.fn() }));
 vi.mock("../flows/personio-flow.js", () => ({ runPersonioFlow: vi.fn() }));
+vi.mock("../flows/smartrecruiters-flow.js", () => ({
+  runSmartRecruitersFlow: mocks.runSmartRecruitersFlow,
+}));
 vi.mock("../notifications/notify-apply-result.js", () => ({
   notifyApplyResult: mocks.notifyApplyResult,
 }));
@@ -104,6 +108,7 @@ describe("apply-queue CAPTCHA handling", () => {
     mocks.solveCaptcha.mockResolvedValue(false);
     mocks.detectFlow.mockReturnValue(null);
     mocks.runGreenhouseFlow.mockResolvedValue({ status: "submitted", durationMs: 1 });
+    mocks.runSmartRecruitersFlow.mockResolvedValue({ status: "submitted", durationMs: 1 });
     await import("./apply-queue.js");
   });
 
@@ -129,6 +134,10 @@ describe("apply-queue CAPTCHA handling", () => {
       jobId: "job-1",
     });
     expect(mocks.runGreenhouseFlow).not.toHaveBeenCalled();
+    expect(mocks.query).toHaveBeenLastCalledWith(
+      expect.stringContaining('"workflowState" = $2'),
+      ["saved", "ready_to_apply", "job-1", "user-1"]
+    );
   });
 
   it("retries navigation once when CapSolver returns a token", async () => {
@@ -149,5 +158,23 @@ describe("apply-queue CAPTCHA handling", () => {
       body: "Engineer",
       jobId: "job-1",
     });
+    expect(mocks.query).toHaveBeenLastCalledWith(
+      expect.stringContaining('"workflowState" = $2'),
+      ["applied", "submitted", "job-1", "user-1"]
+    );
+  });
+
+  it("uses the SmartRecruiters flow instead of the generic fallback", async () => {
+    mocks.detectFlow.mockReturnValueOnce("smartrecruiters");
+
+    await expect(mocks.workerHandler?.({ data: payload })).resolves.toBeUndefined();
+
+    expect(mocks.runSmartRecruitersFlow).toHaveBeenCalledWith(
+      mocks.fakePage,
+      expect.objectContaining({ jobId: "job-1" })
+    );
+    expect(mocks.insertApplyResult).toHaveBeenCalledWith(
+      expect.objectContaining({ atsType: "smartrecruiters", flowUsed: "programmatic" })
+    );
   });
 });

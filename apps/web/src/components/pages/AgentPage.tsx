@@ -80,7 +80,7 @@ function RunPanel({ onClose }: { onClose: () => void }) {
   const [log,      setLog]      = useState<LogEntry[]>([])
   const [running,  setRunning]  = useState(false)
   const [done,     setDone]     = useState(false)
-  const [summary,  setSummary]  = useState<{ processed: number; applied: number; pending: number; skipped: number; failed: number } | null>(null)
+  const [summary,  setSummary]  = useState<{ processed: number; applied: number; queued: number; pending: number; skipped: number; failed: number } | null>(null)
   const [stageStatuses, setStageStatuses] = useState<Record<StageKey, StageStatus>>(
     () => Object.fromEntries(STAGES.map(s => [s.key, 'idle'])) as Record<StageKey, StageStatus>
   )
@@ -115,9 +115,9 @@ function RunPanel({ onClose }: { onClose: () => void }) {
     })
 
     es.addEventListener('stage_done', e => {
-      const d = JSON.parse(e.data) as { stage: StageKey; count?: number; applied?: number; pending?: number }
+      const d = JSON.parse(e.data) as { stage: StageKey; count?: number; applied?: number; queued?: number; pending?: number }
       setStageStatuses(prev => ({ ...prev, [d.stage]: 'done' }))
-      const detail = d.count != null ? ` (${d.count})` : d.applied != null ? ` applied: ${d.applied}, pending: ${d.pending ?? 0}` : ''
+      const detail = d.count != null ? ` (${d.count})` : d.queued != null ? ` dispatched: ${d.queued}, pending: ${d.pending ?? 0}` : ''
       addLog({ type: 'stage_done', message: `  ✓ ${d.stage}${detail}`, time: new Date() })
     })
 
@@ -164,7 +164,7 @@ function RunPanel({ onClose }: { onClose: () => void }) {
       setCurrentStage(null)
       addLog({
         type: 'done',
-        message: `✓ Pipeline complete — ${d.processed} scored, ${d.applied} applied, ${d.pending} pending review, ${d.skipped} skipped`,
+        message: `✓ Pipeline complete — ${d.processed} scored, ${d.queued ?? 0} dispatched, ${d.applied} confirmed, ${d.pending} pending review, ${d.skipped} skipped`,
         time: new Date(),
       })
       setRunning(false)
@@ -173,7 +173,7 @@ function RunPanel({ onClose }: { onClose: () => void }) {
       toast.success(
         'Agent run complete',
         d.processed > 0
-          ? `Scored ${d.processed} jobs, applied to ${d.applied}. New jobs from Scout may appear in Jobs list.`
+          ? `Scored ${d.processed} jobs, dispatched ${d.queued ?? 0}. Confirmed submissions are reported by the worker.`
           : 'Pipeline done. Check Jobs — Scout may have added new discoveries.'
       )
     })
@@ -246,7 +246,8 @@ function RunPanel({ onClose }: { onClose: () => void }) {
         <div style={{ display: 'flex', gap: 0, borderBottom: '0.5px solid var(--border)' }}>
           {[
             { label: 'Scored',   value: summary.processed, color: 'var(--primary)'   },
-            { label: 'Applied',  value: summary.applied,   color: 'var(--c-success)' },
+            { label: 'Dispatched', value: summary.queued, color: 'var(--primary)' },
+            { label: 'Confirmed', value: summary.applied, color: 'var(--c-success)' },
             { label: 'Review',   value: summary.pending,   color: 'var(--c-warning)' },
             { label: 'Skipped',  value: summary.skipped,   color: 'var(--text-muted)' },
           ].map((s, i) => (
@@ -601,8 +602,8 @@ export function AgentPage() {
 
           <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
             <ConfigCard title="Auto-Apply Settings">
-              <Toggle label="Auto-apply when match ≥ min score" sub="Applies automatically without review" value={cfg.autoApply} onChange={v => set('autoApply', v)} />
-              <Toggle label="Require manual review" sub="Jobs go to Review column before applying" value={cfg.requireReview} onChange={v => set('requireReview', v)} />
+              <Toggle label="Auto-apply when match ≥ min score" sub="Queues a background application only when manual review is off; LinkedIn and Indeed stay excluded." value={cfg.autoApply} onChange={v => set('autoApply', v)} />
+              <Toggle label="Require manual review" sub="When enabled, jobs stay in Review and unattended submission is disabled." value={cfg.requireReview} onChange={v => set('requireReview', v)} />
               <Toggle label="Auto-generate cover letter" sub="AI writes a tailored cover letter per job" value={cfg.autoCoverLetter} onChange={v => set('autoCoverLetter', v)} />
               {cfg.autoCoverLetter && (
                 <div style={{ padding: '10px 0', borderBottom: '0.5px solid var(--border)', display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>

@@ -121,6 +121,17 @@ export function mapPipelineEventToTranscript(event: string, data: unknown): Tran
     }
   }
 
+  if (event === "application_queued") {
+    const company = textField(data, "company") ?? "Application"
+    const role = textField(data, "role") ?? ""
+    return {
+      type: "application_queued",
+      speaker: "Executor",
+      title: "Unattended submission queued",
+      body: `${company}${role ? ` · ${role}` : ""} is queued for background submission.`,
+    }
+  }
+
   if (event === "done") {
     return {
       type: "final_report",
@@ -153,7 +164,7 @@ export function mapPipelineEventToTranscript(event: string, data: unknown): Tran
 
 function summarizeReport(report: Partial<RunReport> | null) {
   if (!report) return "Agent run completed."
-  return `Processed ${report.processed ?? 0} jobs · applied ${report.applied ?? 0} · pending ${report.pending ?? 0} · skipped ${report.skipped ?? 0} · failed ${report.failed ?? 0}`
+  return `Processed ${report.processed ?? 0} jobs · dispatched ${report.queued ?? 0} · confirmed ${report.applied ?? 0} · pending ${report.pending ?? 0} · skipped ${report.skipped ?? 0} · failed ${report.failed ?? 0}`
 }
 
 function qualityScore(report: RunReport | null, status: AgentSessionStatus) {

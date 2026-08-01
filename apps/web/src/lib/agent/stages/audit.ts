@@ -19,16 +19,17 @@ export async function runAudit(
   ctx: PipelineCtx,
 ): Promise<StageResult<AuditOutput>> {
   const startedAt = Date.now()
-  const warnings = await verifyReadyToApplyJobs(executeOutput.applied, ctx)
+  const warnings = await verifyDispatchedJobs(executeOutput.queued, ctx)
   await syncGmailTracking(ctx, warnings)
 
   const processed = originalJobs.length
-  const applied = executeOutput.applied.length
+  const queued = executeOutput.queued.length
   const failed = executeOutput.failed.length
-  const skipped = Math.max(0, processed - applied - failed)
+  const skipped = Math.max(0, processed - queued - failed)
   const report: RunReport = {
     processed,
-    applied,
+    applied: 0,
+    queued,
     pending: 0,
     skipped,
     failed,
@@ -38,7 +39,7 @@ export async function runAudit(
   return stageOk('audit', { report, warnings }, 1, report.durationMs)
 }
 
-async function verifyReadyToApplyJobs(jobIds: string[], ctx: PipelineCtx): Promise<string[]> {
+async function verifyDispatchedJobs(jobIds: string[], ctx: PipelineCtx): Promise<string[]> {
   if (jobIds.length === 0) return []
 
   const jobs = await db.job.findMany({
@@ -53,9 +54,12 @@ async function verifyReadyToApplyJobs(jobIds: string[], ctx: PipelineCtx): Promi
   const warnings: string[] = []
 
   for (const job of jobs) {
-    const isReadyToApply = job.status === 'saved' && job.workflowState === 'ready_to_apply'
-    if (!isReadyToApply) {
-      warnings.push(`${job.company} · ${job.role}: expected Saved + ready-to-apply workflow`)
+    const dispatched =
+      (job.status === 'saved' && job.workflowState === 'queued') ||
+      (job.status === 'saved' && job.workflowState === 'submitting') ||
+      (job.status === 'applied' && job.workflowState === 'submitted')
+    if (!dispatched) {
+      warnings.push(`${job.company} · ${job.role}: expected queued, submitting, or confirmed-submitted workflow`)
     }
   }
 
@@ -66,8 +70,8 @@ async function verifyReadyToApplyJobs(jobIds: string[], ctx: PipelineCtx): Promi
   ctx.emit('agent_observation', {
     role: 'auditor',
     observation: warnings.length
-      ? `DB verification: ${jobs.length} queued job(s), ${warnings.length} warning(s)`
-      : `DB verification: ${jobs.length} job(s) are saved and ready to apply`,
+      ? `DB verification: ${jobs.length} dispatched job(s), ${warnings.length} warning(s)`
+      : `DB verification: ${jobs.length} job(s) are queued, submitting, or already confirmed submitted`,
   })
   return warnings
 }

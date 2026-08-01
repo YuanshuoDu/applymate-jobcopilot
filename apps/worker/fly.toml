@@ -1,0 +1,37 @@
+app = "applymate-worker"
+primary_region = "lhr"
+kill_signal = "SIGTERM"
+kill_timeout = 30
+
+[build]
+  dockerfile = "Dockerfile"
+
+[env]
+  AGENT_SCHEDULER_ENABLED = "0"
+  BULL_BOARD_PORT = "3001"
+  CLOAK_MAX_WORKERS = "1"
+  CLOAK_PROFILES_DIR = "/data/cloak-profiles"
+  ENABLE_BULL_BOARD = "0"
+
+[http_service]
+  internal_port = 3001
+  force_https = true
+  auto_stop_machines = "off"
+  auto_start_machines = true
+  min_machines_running = 1
+
+  [http_service.concurrency]
+    type = "requests"
+    soft_limit = 25
+    hard_limit = 50
+
+  [[http_service.checks]]
+    grace_period = "30s"
+    interval = "30s"
+    method = "GET"
+    timeout = "5s"
+    path = "/healthz"
+
+[[mounts]]
+  source = "cloak_profiles"
+  destination = "/data"

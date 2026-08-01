@@ -2,6 +2,7 @@ import { NextRequest } from "next/server"
 import { db } from "@/lib/db"
 import { err, ok } from "@/lib/api-helpers"
 import { nextRunAfterCurrent } from "@/lib/agent/automation-schedule"
+import { enqueueAgentRun } from "@/lib/agent-run-queue-client"
 
 type AutomationForRun = {
   id: string
@@ -71,7 +72,38 @@ async function startAutomation(automation: AutomationForRun, now: Date) {
     },
   })
 
-  return { automationId: automation.id, sessionId: session.id }
+  try {
+    const taskId = await enqueueAgentRun({ userId: automation.userId, sessionId: session.id })
+    await db.agentTranscriptEvent.create({
+      data: {
+        sessionId: session.id,
+        taskId: null,
+        type: "subagent_result",
+        speaker: "Scheduler",
+        title: "Automation dispatched",
+        body: "The unattended Agent worker accepted this scheduled run.",
+        data: { automationId: automation.id, taskId },
+        durationMs: null,
+      },
+    })
+    return { automationId: automation.id, sessionId: session.id, taskId }
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "Could not dispatch automation"
+    await Promise.allSettled([
+      db.agentSession.update({
+        where: { id: session.id },
+        data: { status: "failed", completedAt: new Date(), memorySummary: `Dispatch failed: ${message}` },
+      }),
+      db.agentTranscriptEvent.create({
+        data: {
+          sessionId: session.id, taskId: null, type: "error", speaker: "Scheduler",
+          title: "Automation dispatch failed", body: message, data: { automationId: automation.id }, durationMs: null,
+        },
+      }),
+      db.agentAutomation.update({ where: { id: automation.id }, data: { nextRunAt: now } }),
+    ])
+    throw error
+  }
 }
 
 async function runDueAutomations(req: NextRequest) {

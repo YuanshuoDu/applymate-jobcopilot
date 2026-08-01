@@ -213,4 +213,22 @@ describe("apply-queue Phase 5 pipeline", () => {
       })
     );
   });
+
+  it("does not open a second browser when a previous attempt is uncertain", async () => {
+    mocks.query
+      .mockResolvedValueOnce({ rowCount: 0, rows: [] })
+      .mockResolvedValueOnce({ rowCount: 1, rows: [{ workflowState: "submitting" }] })
+      .mockResolvedValueOnce({ rowCount: 1, rows: [] });
+
+    await expect(runApplyJob()).resolves.toBeUndefined();
+
+    expect(mocks.fakePage.goto).not.toHaveBeenCalled();
+    expect(mocks.AgentHarness).not.toHaveBeenCalled();
+    expect(mocks.insertApplyResult).toHaveBeenCalledWith(
+      expect.objectContaining({
+        status: "manual",
+        error: expect.stringContaining("did not retry"),
+      }),
+    );
+  });
 });

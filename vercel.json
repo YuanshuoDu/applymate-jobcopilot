@@ -6,10 +6,6 @@
   "devCommand": "pnpm --filter @jobcopilot/web dev",
   "crons": [
     {
-      "path": "/api/agent/automations/due",
-      "schedule": "0 8 * * *"
-    },
-    {
       "path": "/api/gmail/sync/daily",
       "schedule": "15 8 * * *"
     }

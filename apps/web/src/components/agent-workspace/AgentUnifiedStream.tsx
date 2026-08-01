@@ -17,6 +17,7 @@ import {
   shouldStickToBottom,
 } from './AgentUnifiedStream.helpers'
 import { AgentUnifiedStreamHeader } from './AgentUnifiedStreamHeader'
+import { sessionSubmissionPolicy } from './automation-policy'
 import type { TranscriptAction } from './TranscriptSpecialBlocks'
 import { streamAgentChat } from './agent-chat-stream'
 import type { AgentTranscriptEvent } from './session-view-model'
@@ -154,9 +155,14 @@ export function AgentUnifiedStream({
   useEffect(() => {
     const queued = liveBlocks.filter(block => block.type === 'application_queued')
     for (const block of queued) {
-      const data = block.data && typeof block.data === 'object' ? block.data as Record<string, unknown> : {}
-      const job = data.job && typeof data.job === 'object' ? data.job as Record<string, unknown> : {}
-      const jobId = typeof job.id === 'string' ? job.id : null
+      const rawData = block.data && typeof block.data === 'object' ? block.data as Record<string, unknown> : {}
+      const data = rawData.payload && typeof rawData.payload === 'object'
+        ? rawData.payload as Record<string, unknown>
+        : rawData
+      const job = data.job && typeof data.job === 'object' ? data.job as Record<string, unknown> : data
+      const jobId = typeof data.jobId === 'string'
+        ? data.jobId
+        : typeof job.id === 'string' ? job.id : null
       if (!jobId || auditedJobIdsRef.current.has(jobId)) continue
       auditedJobIdsRef.current.add(jobId)
       void pollForAuditResult(jobId, job, setLiveBlocks)
@@ -176,6 +182,10 @@ export function AgentUnifiedStream({
 
   const isEmpty = log.length === 0 && applyQueue.length === 0 && liveBlocks.length === 0
   const isNewChatDraft = resetVersion > 0 && isEmpty
+  const restoredPolicy = sessionSubmissionPolicy(liveBlocks)
+  const effectiveAutonomousMode = restoredPolicy
+    ? restoredPolicy === 'autopilot'
+    : autonomousMode
 
   useEffect(() => {
     if (!isEmpty) return
@@ -325,7 +335,8 @@ export function AgentUnifiedStream({
         hideForNewChat={isNewChatDraft}
         running={running}
         summary={summary}
-        approvalRequired={Boolean(waitingQuestion && !autonomousMode)}
+        approvalRequired={Boolean(waitingQuestion && !effectiveAutonomousMode)}
+        autonomousMode={effectiveAutonomousMode}
         conversationTitle={conversationTitle}
         conversationSubtitle={conversationSubtitle}
       />
@@ -338,7 +349,7 @@ export function AgentUnifiedStream({
         showWelcome={!isNewChatDraft}
         savedCount={savedCount}
         pendingCount={pendingCount}
-        autonomousMode={autonomousMode}
+        autonomousMode={effectiveAutonomousMode}
         revealThinkingVersion={revealThinkingVersion}
         streamScrollRef={streamScrollRef}
         streamEndRef={streamEndRef}

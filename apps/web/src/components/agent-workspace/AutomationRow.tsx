@@ -34,7 +34,7 @@ function automationSubMeta(row: AgentAutomation) {
     return `Last run: ${new Date(row.lastRunAt).toLocaleString('en', { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' })}`
   }
   if (row.requireApproval) return 'Approval required before submit'
-  return row.autoApply ? 'Auto-apply enabled' : 'Review queue only'
+  return row.autoApply ? 'Autopilot · one attempt per job' : 'Review queue only'
 }
 
 function automationIcon(row: AgentAutomation) {

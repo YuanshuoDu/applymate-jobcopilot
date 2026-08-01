@@ -80,6 +80,13 @@ describe("run session recorder", () => {
       title: "Job Result",
       body: "N26 · Software Engineer — 94%",
     })
+
+    expect(mapPipelineEventToTranscript("application_queued", { company: "N26", role: "Software Engineer" })).toMatchObject({
+      type: "application_queued",
+      speaker: "Executor",
+      title: "Unattended submission queued",
+      body: "N26 · Software Engineer is queued for background submission.",
+    })
   })
 
   it("records mapped pipeline events as transcript rows", async () => {
@@ -170,7 +177,7 @@ describe("run session recorder", () => {
 
     await recorder.finalize({
       status: "completed",
-      report: { processed: 10, applied: 4, pending: 2, skipped: 4, failed: 0, durationMs: 120000 },
+      report: { processed: 10, applied: 4, queued: 0, pending: 2, skipped: 4, failed: 0, durationMs: 120000 },
     })
 
     expect(db.agentSession.update).toHaveBeenCalledWith({
@@ -179,7 +186,7 @@ describe("run session recorder", () => {
         status: "completed",
         completedAt: expect.any(Date),
         qualityScore: 100,
-        memorySummary: "Processed 10 jobs · applied 4 · pending 2 · skipped 4 · failed 0",
+        memorySummary: "Processed 10 jobs · dispatched 0 · confirmed 4 · pending 2 · skipped 4 · failed 0",
       },
     })
   })

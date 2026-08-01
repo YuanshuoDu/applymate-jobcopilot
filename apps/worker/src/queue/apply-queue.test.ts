@@ -42,7 +42,7 @@ vi.mock("../cloak/pool.js", () => ({
 
 vi.mock("../db/apply-results.js", () => ({
   insertApplyResult: mockInsertApplyResult,
-  getPool: vi.fn().mockReturnValue({ query: vi.fn().mockResolvedValue({ rows: [] }) }),
+  getPool: vi.fn().mockReturnValue({ query: vi.fn().mockResolvedValue({ rowCount: 1, rows: [] }) }),
 }));
 
 vi.mock("../rate-limit.js", () => ({
