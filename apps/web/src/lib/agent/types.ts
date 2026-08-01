@@ -72,6 +72,7 @@ export interface PipelineCheckpointState {
   executeOutput?: ExecuteOutput
   analysisFailed?: number
   report?: RunReport
+  autonomous?: boolean
   startedAt?: string
 }
 

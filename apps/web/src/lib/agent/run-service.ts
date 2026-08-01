@@ -84,7 +84,7 @@ export async function runAgentPipeline(input: AgentPipelineRunInput): Promise<Ru
   });
   const execution = input.executionId
     ? await db.agentExecution.findFirst({ where: { id: input.executionId, userId: input.userId, sessionId: recorder.sessionId } })
-    : await ensureAgentExecution({ userId: input.userId, sessionId: recorder.sessionId })
+    : await ensureAgentExecution({ userId: input.userId, sessionId: recorder.sessionId, autonomous: input.autonomous })
   if (!execution) {
     console.warn("Agent execution was not found for the requested session")
     return null

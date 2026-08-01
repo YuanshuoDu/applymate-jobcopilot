@@ -9,7 +9,7 @@ describe("agent execution control plane", () => {
   it("creates one durable execution per session", async () => {
     mocks.upsert.mockResolvedValue({ id: "execution_1" })
     const { ensureAgentExecution } = await import("./execution-control")
-    await expect(ensureAgentExecution({ userId: "user_1", sessionId: "session_1" })).resolves.toEqual({ id: "execution_1" })
+    await expect(ensureAgentExecution({ userId: "user_1", sessionId: "session_1", autonomous: false })).resolves.toEqual({ id: "execution_1" })
     expect(mocks.upsert).toHaveBeenCalledWith(expect.objectContaining({ where: { sessionId: "session_1" } }))
   })
 

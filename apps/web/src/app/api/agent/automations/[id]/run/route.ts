@@ -120,7 +120,7 @@ export async function POST(req: NextRequest, ctx: RouteCtx) {
   })
 
   try {
-    const execution = await ensureAgentExecution({ userId: auth.userId, sessionId: session.id })
+    const execution = await ensureAgentExecution({ userId: auth.userId, sessionId: session.id, autonomous: true })
     const taskId = await enqueueAgentRun({ userId: auth.userId, sessionId: session.id })
     await db.agentExecution.update({ where: { id: execution.id }, data: { workerTaskId: taskId } })
     return ok({ session: serializeSession(session as SessionRow), event: serializeEvent(event), executionId: execution.id, taskId }, 201)

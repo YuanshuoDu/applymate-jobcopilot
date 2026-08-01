@@ -8,10 +8,10 @@ const EXECUTION_STALE_MS = Number(process.env.AGENT_EXECUTION_STALE_MS ?? 15_000
 
 export type { PipelineCheckpointState } from "@/lib/agent/types"
 
-export async function ensureAgentExecution(input: { userId: string; sessionId: string }) {
+export async function ensureAgentExecution(input: { userId: string; sessionId: string; autonomous?: boolean }) {
   return db.agentExecution.upsert({
     where: { sessionId: input.sessionId },
-    create: { userId: input.userId, sessionId: input.sessionId, status: "queued", checkpoint: "scout", state: { nextStage: "scout", startedAt: new Date().toISOString() } },
+    create: { userId: input.userId, sessionId: input.sessionId, status: "queued", checkpoint: "scout", state: { nextStage: "scout", startedAt: new Date().toISOString(), autonomous: input.autonomous ?? false } },
     update: {},
   })
 }

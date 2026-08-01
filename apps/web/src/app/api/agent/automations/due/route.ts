@@ -74,7 +74,7 @@ async function startAutomation(automation: AutomationForRun, now: Date) {
   })
 
   try {
-    const execution = await ensureAgentExecution({ userId: automation.userId, sessionId: session.id })
+    const execution = await ensureAgentExecution({ userId: automation.userId, sessionId: session.id, autonomous: true })
     const taskId = await enqueueAgentRun({ userId: automation.userId, sessionId: session.id })
     await db.agentExecution.update({ where: { id: execution.id }, data: { workerTaskId: taskId } })
     await db.agentTranscriptEvent.create({

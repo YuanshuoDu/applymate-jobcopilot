@@ -36,13 +36,20 @@ export async function POST(req: NextRequest) {
   });
   if (!session) return err("Agent session not found", 404);
 
+  const execution = await db.agentExecution.findFirst({
+    where: { userId: input.userId, sessionId: session.id },
+    select: { state: true },
+  });
+  const state = execution?.state
+  const autonomous = Boolean(state && typeof state === "object" && !Array.isArray(state) && (state as { autonomous?: unknown }).autonomous === true)
+
   const configured = await loadUserAiConfig(input.userId, "autoApply");
   const aiConfig = configured.resolvedKey ? configured : resolveConfig(APPLYMATE_BACKING);
   const report = await runAgentPipeline({
     userId: input.userId,
     sessionId: session.id,
     aiConfig,
-    autonomous: true,
+    autonomous,
   });
 
   return ok({ status: report ? "completed" : "failed", report });
