@@ -19,6 +19,7 @@ import type {
   PipelineCtx, ApplicationPackage, GateOutput, StageResult,
 } from '../types'
 import { stageOk } from '../types'
+import { roleAiConfig } from '../role-config'
 
 // ── AI Quality Review ─────────────────────────────────────────────────────────
 
@@ -37,9 +38,7 @@ async function reviewApplicationQuality(
   if (!pkg.coverLetter && !pkg.job.description) return null
 
   const reviewerCfg = ctx.roleConfigs.reviewer
-  const aiConfig: AiConfig = reviewerCfg
-    ? { provider: reviewerCfg.provider as AiConfig['provider'], model: reviewerCfg.model, apiKey: reviewerCfg.apiKey }
-    : ctx.aiConfig
+  const aiConfig: AiConfig = roleAiConfig('reviewer', reviewerCfg, ctx.aiConfig)
 
   const prompt = `You are a hiring quality reviewer. Assess this application package.
 
@@ -128,14 +127,36 @@ export async function runGate(
       }
     }
 
-    // A Writer-produced tailored resume is a reviewable application artifact.
-    // Keep 65–(threshold-1) matches in the human-review path instead of
-    // discarding them before the user can inspect the generated resume.
-    if (pkg.score < minMatchScore && !pkg.tailoredResumeId) {
+    const autopilot = autoApply && !requireApproval
+
+    // In autopilot mode, the configured threshold applies equally to base and
+    // tailored resumes. A tailored resume must not silently bypass it.
+    if (pkg.score < minMatchScore) {
+      if (pkg.tailoredResumeId && !autopilot) {
+        pending.push(pkg)
+        emit('agent_question', {
+          role: 'reviewer', questionId: `resume_review_${pkg.job.id}`,
+          question: `${pkg.job.company} · ${pkg.job.role} 的定制简历已生成。请查看简历后确认是否进入申请。`,
+          options: [
+            { label: '查看定制简历', value: 'view_resume', action: { field: '_navigate', value: `resume&resumeId=${pkg.tailoredResumeId}` } },
+            { label: '保留待审核', value: 'review' },
+          ],
+        })
+        continue
+      }
       skipped.push(pkg)
       emit('agent_observation', {
         role:        'reviewer',
         observation: `✕ 跳过：${pkg.score}% < 阈值 ${minMatchScore}%`,
+      })
+      continue
+    }
+
+    if (autopilot) {
+      approved.push(pkg)
+      emit('agent_observation', {
+        role:        'reviewer',
+        observation: `✓ 批准自动投递：分 ${pkg.score}% ≥ ${minMatchScore}%，autoApply=true`,
       })
       continue
     }
@@ -153,20 +174,12 @@ export async function runGate(
       continue
     }
 
-    if (autoApply && !requireApproval) {
-      approved.push(pkg)
-      emit('agent_observation', {
-        role:        'reviewer',
-        observation: `✓ 批准自动投递：分 ${pkg.score}% ≥ ${minMatchScore}%，autoApply=true`,
-      })
-    } else {
-      pending.push(pkg)
-      const reason = !autoApply ? 'autoApply=false' : 'requireApproval=true'
-      emit('agent_observation', {
-        role:        'reviewer',
-        observation: `⏳ 进入待审核：${reason}，需人工确认`,
-      })
-    }
+    pending.push(pkg)
+    const reason = !autoApply ? 'autoApply=false' : 'requireApproval=true'
+    emit('agent_observation', {
+      role:        'reviewer',
+      observation: `⏳ 进入待审核：${reason}，需人工确认`,
+    })
   }
 
   const total = Date.now() - t0

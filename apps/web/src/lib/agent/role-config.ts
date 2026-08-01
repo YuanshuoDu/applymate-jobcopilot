@@ -5,12 +5,22 @@
  */
 import { db } from '@/lib/db'
 import type { RoleConfigMap } from './types'
+import type { AiConfig, Provider } from '@/lib/model-router'
 
 export type AgentRoleType = 'scout' | 'analyst' | 'writer' | 'reviewer' | 'executor' | 'auditor'
 
 export const AGENT_ROLES: AgentRoleType[] = ['scout', 'analyst', 'writer', 'reviewer', 'executor', 'auditor']
 
 export const ROLE_DEFAULTS: Record<AgentRoleType, { provider: string; model: string }> = {
+  scout:    { provider: 'minimax', model: 'MiniMax-M3' },
+  analyst:  { provider: 'minimax', model: 'MiniMax-M3' },
+  writer:   { provider: 'minimax', model: 'MiniMax-M3' },
+  reviewer: { provider: 'minimax', model: 'MiniMax-M3' },
+  executor: { provider: 'minimax', model: 'MiniMax-M3' },
+  auditor:  { provider: 'minimax', model: 'MiniMax-M3' },
+}
+
+const LEGACY_ROLE_DEFAULTS: Record<AgentRoleType, { provider: string; model: string }> = {
   scout:    { provider: 'anthropic', model: 'claude-haiku-4-5'  },
   analyst:  { provider: 'anthropic', model: 'claude-haiku-4-5'  },
   writer:   { provider: 'anthropic', model: 'claude-sonnet-4-6' },
@@ -88,6 +98,36 @@ export interface AgentRoleConfig {
 }
 
 export type { RoleConfigMap }
+
+const PROVIDERS = new Set<Provider>(['anthropic', 'openai', 'deepseek', 'minimax', 'qwen', 'zhipu', 'custom'])
+
+/**
+ * Resolves a per-role override without bypassing the user's feature-level AI
+ * setting or ApplyMate's MiniMax platform default. Legacy, keyless Claude
+ * defaults are treated as platform defaults rather than failed overrides.
+ */
+export function roleAiConfig(
+  role: AgentRoleType,
+  config: RoleConfigMap[AgentRoleType] | undefined,
+  fallback: AiConfig,
+): AiConfig {
+  if (!config?.enabled || !PROVIDERS.has(config.provider as Provider)) return fallback
+
+  const legacy = LEGACY_ROLE_DEFAULTS[role]
+  const isLegacyDefault = !config.apiKey
+    && config.provider === legacy.provider
+    && config.model === legacy.model
+  const isPlatformDefault = !config.apiKey
+    && config.provider === 'minimax'
+    && config.model === 'MiniMax-M3'
+  if (isLegacyDefault || isPlatformDefault) return fallback
+
+  const provider = config.provider as Provider
+  if (provider === fallback.provider) {
+    return { ...fallback, model: config.model, apiKey: config.apiKey ?? fallback.apiKey }
+  }
+  return { provider, model: config.model, ...(config.apiKey ? { apiKey: config.apiKey } : {}) }
+}
 
 /** Load all 6 role configs for a user, creating defaults for any missing ones. */
 export async function loadRoleConfigs(userId: string): Promise<AgentRoleConfig[]> {
