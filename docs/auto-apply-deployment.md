@@ -60,6 +60,11 @@ It creates one always-on Worker Machine in London (`lhr`), keeps the Bull Board
 disabled, and uses `/healthz` for the Fly health check. The `cloak_profiles`
 volume preserves per-user browser state between Machine restarts.
 
+Because the Web app runs on Vercel, `REDIS_URL` must be a public TLS Redis
+endpoint (`rediss://...`) that both Vercel and Fly can reach. Do not use the
+private URL produced by `fly redis create`: Fly restricts that endpoint to its
+own private network, so it cannot serve as the shared BullMQ queue.
+
 Create the volume and deploy from the repository root:
 
 ```powershell
