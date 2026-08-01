@@ -160,6 +160,7 @@ export async function runGate(
       jobId: pkg.job.id,
       sessionId: ctx.sessionId,
       resumeId: pkg.tailoredResumeId ?? ctx.defaultResume.id,
+      coverLetterId: pkg.coverLetterId,
     })
     const approval = ctx.sessionId
       ? await db.agentApproval.create({

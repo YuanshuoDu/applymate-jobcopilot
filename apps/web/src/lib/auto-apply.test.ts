@@ -4,7 +4,10 @@ const mocks = vi.hoisted(() => ({
   approvalFindFirst: vi.fn(),
   transaction: vi.fn(),
   taskUpdate: vi.fn(),
+  taskFindFirst: vi.fn(),
   taskEventCreate: vi.fn(),
+  resumeFindFirst: vi.fn(),
+  coverLetterFindFirst: vi.fn(),
   jobUpdateMany: vi.fn(),
   activityCreate: vi.fn(),
   enqueueApplyTask: vi.fn(),
@@ -14,7 +17,9 @@ vi.mock("@/lib/db", () => ({
   db: {
     agentApproval: { findFirst: mocks.approvalFindFirst },
     $transaction: mocks.transaction,
-    applicationTask: { update: mocks.taskUpdate, updateMany: mocks.taskUpdate },
+    applicationTask: { findFirst: mocks.taskFindFirst, update: mocks.taskUpdate, updateMany: mocks.taskUpdate },
+    resume: { findFirst: mocks.resumeFindFirst },
+    coverLetter: { findFirst: mocks.coverLetterFindFirst },
     applicationTaskEvent: { create: mocks.taskEventCreate },
     job: { updateMany: mocks.jobUpdateMany },
     activity: { create: mocks.activityCreate },
@@ -33,9 +38,17 @@ describe("auto-apply authorization", () => {
     vi.resetModules();
     Object.values(mocks).forEach(mock => mock.mockReset());
     mocks.approvalFindFirst.mockResolvedValue({ payload: { applicationTaskId: "application_1", jobId: "job_1" } });
+    mocks.taskFindFirst.mockResolvedValue({ resumeId: "resume_1", coverLetterId: null });
+    mocks.resumeFindFirst.mockResolvedValue({ id: "resume_1" });
+    mocks.coverLetterFindFirst.mockResolvedValue({ id: "cover_1" });
     mocks.transaction.mockImplementation(async (callback: (tx: unknown) => unknown) => {
       if (typeof callback === "function") {
-        return callback({ applicationTask: { updateMany: vi.fn().mockResolvedValue({ count: 1 }) }, job: { updateMany: vi.fn().mockResolvedValue({ count: 1 }) } });
+        return callback({
+          applicationTask: { findFirst: mocks.taskFindFirst, updateMany: vi.fn().mockResolvedValue({ count: 1 }) },
+          resume: { findFirst: mocks.resumeFindFirst },
+          coverLetter: { findFirst: mocks.coverLetterFindFirst },
+          job: { updateMany: vi.fn().mockResolvedValue({ count: 1 }) },
+        });
       }
       return Promise.all(callback);
     });
@@ -68,6 +81,25 @@ describe("auto-apply authorization", () => {
     mocks.approvalFindFirst.mockResolvedValue({ payload: { applicationTaskId: "other", jobId: "job_1" } });
     const { queueAutonomousApplication } = await import("./auto-apply");
     await expect(queueAutonomousApplication(input)).rejects.toThrow("explicit approval");
+    expect(mocks.enqueueApplyTask).not.toHaveBeenCalled();
+  });
+
+  it("rejects a stale task whose resume does not belong to this job or the current default", async () => {
+    mocks.resumeFindFirst.mockResolvedValueOnce(null);
+    const { queueAutonomousApplication } = await import("./auto-apply");
+
+    await expect(queueAutonomousApplication(input)).rejects.toThrow("no longer ready");
+
+    expect(mocks.enqueueApplyTask).not.toHaveBeenCalled();
+  });
+
+  it("rejects a task whose stored cover letter belongs to a different application", async () => {
+    mocks.taskFindFirst.mockResolvedValueOnce({ resumeId: "resume_1", coverLetterId: "cover_other" });
+    mocks.coverLetterFindFirst.mockResolvedValueOnce(null);
+    const { queueAutonomousApplication } = await import("./auto-apply");
+
+    await expect(queueAutonomousApplication(input)).rejects.toThrow("no longer ready");
+
     expect(mocks.enqueueApplyTask).not.toHaveBeenCalled();
   });
 

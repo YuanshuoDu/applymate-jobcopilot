@@ -122,6 +122,7 @@ export interface AnalyzeOutput {
 
 export interface ApplicationPackage extends ScoredJob {
   coverLetter?:      string
+  coverLetterId?:    string
   tailoredKeywords?: string[]
   tailoredResumeId?: string
   tailoredResumeName?: string

@@ -80,6 +80,47 @@ export async function queueAutonomousApplication(input: {
   }
 
   const claimed = await db.$transaction(async tx => {
+    const material = await tx.applicationTask.findFirst({
+      where: {
+        id: input.applicationTaskId,
+        userId: input.userId,
+        jobId: input.jobId,
+        status: "waiting_for_authorization",
+        checkpoint: "form_filled",
+        resumeId: { not: null },
+        question: { equals: Prisma.DbNull },
+      },
+      select: { resumeId: true, coverLetterId: true },
+    });
+    if (!material?.resumeId) return false;
+
+    // A stale task must not submit a resume from another job. A candidate's
+    // current default resume is valid fallback material; any adapted resume
+    // must be explicitly linked to this job.
+    const resume = await tx.resume.findFirst({
+      where: {
+        id: material.resumeId,
+        userId: input.userId,
+        OR: [{ targetJobId: input.jobId }, { isDefault: true }],
+      },
+      select: { id: true },
+    });
+    if (!resume) return false;
+
+    // Cover letters are optional, but when a task has one it must be the
+    // current user's artifact for this exact job and selected resume.
+    if (material.coverLetterId) {
+      const coverLetter = await tx.coverLetter.findFirst({
+        where: {
+          id: material.coverLetterId,
+          userId: input.userId,
+          jobId: input.jobId,
+          resumeId: material.resumeId,
+        },
+        select: { id: true },
+      });
+      if (!coverLetter) return false;
+    }
     const task = await tx.applicationTask.updateMany({
       where: {
         id: input.applicationTaskId,

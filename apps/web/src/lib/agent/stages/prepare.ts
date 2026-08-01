@@ -100,6 +100,7 @@ export async function runPrepare(
       data: { status: "generating_materials", checkpoint: "tailoring_and_cover_letter" },
     })
     let coverLetter: string | undefined
+    let coverLetterId: string | undefined
     let tailoredResumeId: string | undefined
     let tailoredResumeName: string | undefined
     const [tailorEvidence, coverEvidence] = await Promise.all([
@@ -129,6 +130,14 @@ export async function runPrepare(
     if (agentCfg.autoCoverLetter) {
       try {
         coverLetter = await generateCoverLetter(sj, agentCfg, resumeContent, effectiveAiConfig, writerSystemPrompt, coverLetterPersona, coverEvidence)
+        const saved = await saveAgentCoverLetter({
+          userId,
+          jobId: sj.job.id,
+          resumeId: tailoredResumeId ?? defaultResume.id,
+          content: coverLetter,
+          tone: agentCfg.coverTone,
+        })
+        coverLetterId = saved.id
         pendingLetters.push({ jobId: sj.job.id, coverLetter })
         await new Promise(r => setTimeout(r, THROTTLE_MS))
       } catch (err) {
@@ -140,6 +149,7 @@ export async function runPrepare(
     packages.push({
       ...sj,
       ...(coverLetter ? { coverLetter } : {}),
+      ...(coverLetterId ? { coverLetterId } : {}),
       ...(tailoredResumeId ? { tailoredResumeId, tailoredResumeName } : {}),
       tailoredKeywords: sj.missingKeywords.length ? sj.missingKeywords : undefined,
     })
@@ -156,6 +166,38 @@ export async function runPrepare(
   }
 
   return stageOk('prepare', { packages }, packages.length, Date.now() - t0)
+}
+
+async function saveAgentCoverLetter(input: {
+  userId: string
+  jobId: string
+  resumeId: string
+  content: string
+  tone: string
+}) {
+  const existing = await db.coverLetter.findFirst({
+    where: { userId: input.userId, jobId: input.jobId, resumeId: input.resumeId, origin: 'agent' },
+    select: { id: true },
+  })
+  if (existing) {
+    return db.coverLetter.update({
+      where: { id: existing.id },
+      data: { content: input.content, tone: input.tone, isFinal: false },
+      select: { id: true },
+    })
+  }
+  return db.coverLetter.create({
+    data: {
+      userId: input.userId,
+      jobId: input.jobId,
+      resumeId: input.resumeId,
+      content: input.content,
+      tone: input.tone,
+      origin: 'agent',
+      isFinal: false,
+    },
+    select: { id: true },
+  })
 }
 
 async function generateTailoredResume(sj: ScoredJob, resume: unknown, aiConfig: AiConfig, systemPrompt?: string, persona = '', evidence = '') {
