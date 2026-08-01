@@ -13,13 +13,14 @@
 - 用户与订阅管理；
 - 作业、自动投递、队列和通知的受限排障；
 - ATS 来源、系统开关、AI 配额与运营配置管理；
+- 平台公告广播，并投递到目标用户的站内 `Notification`；
 - 平台指标、异常告警和完整审计；
 - 多位内部员工按职责协作，且权限和可见数据严格隔离。
 
 ### 1.2 不在首期范围
 
 - 企业客户（B2B）自助创建组织、邀请成员；
-- 让管理员读取候选人的 API Key、密码哈希、OAuth refresh token、完整简历或邮件正文；
+- 让任何管理员（包括 `super_admin`）读取候选人的 API Key、密码哈希、OAuth refresh token、完整简历或邮件正文；
 - 用前端路由守卫、隐藏菜单或 `plan = enterprise` 代替服务端授权；
 - 将 Bull Board 作为正式管理后台，或把它公开暴露到互联网。
 
@@ -76,8 +77,8 @@ flowchart LR
 
 | 角色 | 典型使用者 | 权限边界 |
 |---|---|---|
-| `support` | 客服 | 查看脱敏用户资料、工单相关作业与通知；可发送模板化站内通知；不能查看内容、改订阅、运行队列。 |
-| `operations` | 平台运营 | 用户与订阅只读、作业/投递排障、ATS 来源状态、受限重试；不能改权限、密钥或安全策略。 |
+| `support` | 客服 | 查看脱敏用户资料、工单相关作业与通知；不能查看内容、改订阅、运行队列或发起广播。 |
+| `operations` | 平台运营 | 用户与订阅只读、作业/投递排障、ATS 来源状态、受限重试；可草拟运营广播，不能自行发布。 |
 | `analyst` | 数据/产品 | 只读聚合指标和已匿名化导出；不能按用户浏览私密数据。 |
 | `billing` | 财务 | 管理订阅状态、退款标记与账单备注；无简历、邮箱、AI Key、投递详情访问权。 |
 | `security_admin` | 安全负责人 | 管理内部成员、角色、会话吊销、审计检索和 break-glass 审批；不默认拥有业务写权限。 |
@@ -97,11 +98,13 @@ flowchart LR
 | 作业与投递 | `jobs.read_metadata`, `jobs.read_content_masked`, `applications.read`, `applications.retry`, `applications.cancel`, `applications.manual_review` |
 | 运营配置 | `ats.read`, `ats.update`, `feature_flags.read`, `feature_flags.update`, `ai_budget.read`, `ai_budget.update` |
 | Worker | `queues.read`, `queues.retry`, `queues.pause`, `queues.resume` |
-| 通知 | `notifications.send_template`, `notifications.read_metadata` |
+| 通知 | `notifications.read_metadata`, `broadcasts.create`, `broadcasts.update`, `broadcasts.preview`, `broadcasts.approve`, `broadcasts.publish`, `broadcasts.cancel` |
 | 安全 | `admin_members.read`, `admin_members.manage`, `admin_roles.manage`, `sessions.revoke`, `audit.read`, `break_glass.request`, `break_glass.approve` |
 | 系统 | `observability.read`, `incidents.manage` |
 
-`*.delete`、任意凭证读取、完整简历下载、完整 Gmail 内容读取均不在普通角色字典中；如未来确有合规需求，应新建单独权限、数据访问理由、双人审批和专用审计事件。
+任意凭证读取、完整简历下载、完整 Gmail 内容读取**永远不属于管理员能力范围**，不为普通角色、`super_admin` 或 break-glass 提供例外。该限制由 DTO、数据库访问封装、日志脱敏规则和自动化测试共同强制；不得以“排障”“合规”或“紧急事件”为由绕过。
+
+广播职责分离：`operations` 拥有 `broadcasts.create/update/preview`，`platform_admin` 或 `super_admin` 才拥有 `broadcasts.approve/publish/cancel`；创建人不得审批或发布自己的广播。
 
 ## 5. 数据模型与迁移
 
@@ -175,16 +178,50 @@ model AdminBreakGlassGrant {
   createdAt   DateTime @default(now())
   @@index([requesterId, expiresAt])
 }
+
+enum BroadcastStatus { draft pending_approval scheduled publishing published cancelled failed }
+enum BroadcastAudienceType { all_active_users plan location explicit_user_ids }
+
+model AdminBroadcast {
+  id             String                @id @default(cuid())
+  title          String
+  body           String                @db.Text
+  audienceType   BroadcastAudienceType
+  audience       Json                  // allow-list 筛选条件或 userId 列表；不存 PII 快照
+  status         BroadcastStatus       @default(draft)
+  scheduledAt    DateTime?
+  approvedById   String?
+  publishedById  String?
+  createdById    String
+  recipientCount Int                   @default(0)
+  deliveredCount Int                   @default(0)
+  failedCount    Int                   @default(0)
+  createdAt      DateTime              @default(now())
+  updatedAt      DateTime              @updatedAt
+  notifications  Notification[]
+  @@index([status, scheduledAt])
+}
+
+// 对现有 Notification 的增量字段/关系；保留现有 userId、type、title、body、read、jobId。
+model Notification {
+  // ...现有字段...
+  broadcastId String?         @map("broadcast_id")
+  broadcast   AdminBroadcast? @relation(fields: [broadcastId], references: [id], onDelete: Restrict)
+  @@unique([broadcastId, userId]) // 同一广播对同一用户只投递一次；NULL 不影响非广播通知
+  @@index([broadcastId])
+}
 ```
 
 为 `User` 增加反向关系 `adminMembership AdminMembership? @relation("AdminUser")`。不添加 `isAdmin Boolean`；它无法表达角色、禁用、MFA 与撤销语义。
+
+`AdminBroadcast` 是广播命令与审计对象；投递结果使用现有 `Notification` 表，每位收件人生成一行：`type = "platform_broadcast"`、`title`、`body`、`userId`、`broadcastId`、`createdAt`。`@@unique([broadcastId, userId])` 让发布任务可安全重试。绝不通过查询或复制用户的邮件正文、简历、Persona、API Key、密码/OAuth 信息来构建广播人群。
 
 ### 5.2 数据敏感度与 DTO
 
 | 分类 | 示例 | 管理后台规则 |
 |---|---|---|
 | 严禁返回 | `User.password`、`Account.access_token`、`refresh_token`、`UserApiKeys`、浏览器 profile/cookie | 永不进入 API select、日志、审计 before/after 或导出。 |
-| 高敏感 | 简历正文、PersonaFact、Gmail 正文、求职信 | 默认不返回；仅显示“是否存在/长度/状态”等元数据。 |
+| 高敏感 | 简历正文、PersonaFact、Gmail 正文、求职信 | 管理员永不返回；仅显示“是否存在/长度/状态”等元数据。 |
 | PII | email、姓名、电话、location、LinkedIn/GitHub | Support 默认掩码（如 `s***@example.com`）；查看明文必须有专门权限与理由。 |
 | 普通运营 | plan、创建时间、作业状态、错误码、计数 | 按角色返回。 |
 
@@ -210,6 +247,7 @@ model AdminBreakGlassGrant {
 | ATS 与发现 | `/admin/ats` | `ats.read` | 来源健康、速率、最近抓取、注册表启停。 |
 | 队列 | `/admin/queues` | `queues.read` | 指标与任务摘要；操作走受控 API，不嵌入 Bull Board。 |
 | AI 与开关 | `/admin/platform` | `feature_flags.read` | 配额、模型健康、feature flag；写操作必须二次确认。 |
+| 广播 | `/admin/broadcasts` | `broadcasts.create` | 草稿、受众预览、审批、定时发布、投递结果；仅写入用户站内 Notification。 |
 | 审计与安全 | `/admin/audit` | `audit.read` | 可筛选的不可编辑审计事件。 |
 | 内部成员 | `/admin/access` | `admin_members.manage` | 成员、角色、MFA、会话撤销、break-glass。 |
 
@@ -241,6 +279,11 @@ model AdminBreakGlassGrant {
 | GET | `/queues/summary` | `queues.read` | 从 Worker 聚合只读指标。 |
 | POST | `/queues/:name/pause` | `queues.pause` | 高危，理由+二次确认+审计。 |
 | POST | `/queues/:name/resume` | `queues.resume` | 同上。 |
+| GET/POST | `/broadcasts` | `broadcasts.create` | 创建草稿、查看自身草稿；输入仅为标题、正文、允许的受众条件。 |
+| POST | `/broadcasts/:id/preview` | `broadcasts.preview` | 返回数量与匿名分布，不返回收件人名单或 PII。 |
+| POST | `/broadcasts/:id/approve` | `broadcasts.approve` | 审批他人草稿；创建人不能审批。 |
+| POST | `/broadcasts/:id/publish` | `broadcasts.publish` | 写入 `Notification`，要求已审批、幂等键和二次确认。 |
+| POST | `/broadcasts/:id/cancel` | `broadcasts.cancel` | 仅取消尚未开始投递的广播。 |
 | GET | `/audit` | `audit.read` | 审计检索；不可修改、不可删除。 |
 | POST | `/members` | `admin_members.manage` | 邀请/授予角色；强制 WebAuthn 注册。 |
 | PATCH | `/members/:id` | `admin_members.manage` | 变更角色或状态，吊销旧会话。 |
@@ -253,6 +296,16 @@ model AdminBreakGlassGrant {
 Web 不得直连 Redis 或暴露 Bull Board。Worker 只接受来自 Web server 的 mTLS/签名服务凭证，并验证时间戳、nonce、操作 allow-list 和 `requestId`。接口仅支持汇总、暂停、恢复、任务重试等明确动作；不支持任意执行脚本、查询 Redis 或下载浏览器资料。
 
 生产 Bull Board 的要求：`BULL_BOARD_PASSWORD` 缺失时进程必须拒绝启动该管理路由；服务绑定 loopback/私有网络，禁止公网 ingress；在 Nginx/Cloudflare Access/VPN 后再加独立身份认证，并记录访问日志。
+
+### 7.4 广播投递规则
+
+广播只是一种平台站内消息：发布服务分批创建 `Notification` 记录，不发送候选人邮件，也不读取 Gmail、简历、Persona 或任何凭证。可选受众仅为 allow-list 条件：`all_active_users`、`plan`、`location` 或显式 `userId` 列表；禁止按邮箱、求职内容、Persona、投递失败原因等敏感属性定向。
+
+- 标题最多 120 字符、正文最多 2,000 字符；仅允许经过净化的 Markdown/plain text，禁止原始 HTML、脚本与追踪像素。
+- 预览只返回收件人数量，以及按 plan/location 聚合且达到 k-anonymity（建议 k >= 20）的分布；不得返回名单或邮箱。
+- 发布任务以固定批次执行，可重试但以 `(broadcastId, userId)` 唯一约束去重；部分失败保留计数、错误码和可恢复状态，不记录收件人 PII 快照。
+- 已开始投递的广播不能撤回已创建的 `Notification`；取消只阻止剩余批次。发布前须在 UI 明确显示这个不可逆语义。
+- 用户可在其通知中心将单条广播标为已读；对于产品更新/营销信息，后续应接入用户通知偏好与退订规则。安全、服务中断和法律要求的消息可由政策配置为不可退订。
 
 ## 8. 授权实现规范
 
@@ -299,6 +352,7 @@ getJobForUser({ userId, jobId })
 | 改订阅/配额 | 乐观锁、原因、前后快照、幂等键；退款需 Billing 角色。 |
 | 重试/取消投递 | 校验当前状态、用户/域名限额、ATS 合规规则；不得重试已提交项。 |
 | 暂停全局队列/关闭 ATS | 双人审批或 `super_admin` break-glass、自动过期、告警。 |
+| 发布平台广播 | 草拟人与审批/发布人不同；预览只给数量与匿名分布；内容净化、幂等、速率限制、审计以及停止/取消机制。 |
 | 改管理员角色 | 申请人与审批人不同；修改后撤销目标会话；禁止删除最后两个 super admin。 |
 | 导出数据 | 默认匿名聚合；任何用户级导出要异步生成、加密、短时签名 URL、下载审计与保留期。 |
 
@@ -334,8 +388,8 @@ getJobForUser({ userId, jobId })
 
 | 层级 | 必测项 |
 |---|---|
-| 单元 | 权限矩阵、角色禁用、sessionVersion、MFA、break-glass 过期/自批拒绝、PII 掩码、审计脱敏。 |
-| API 集成 | 每个端点的 401/403/成功、写操作审计、幂等、CSRF、分页上限、错误码不泄密。 |
+| 单元 | 权限矩阵、角色禁用、sessionVersion、MFA、break-glass 过期/自批拒绝、PII 掩码、审计脱敏；断言所有管理员角色都不能请求 API Key、密码哈希、OAuth refresh token、完整简历或 Gmail 正文。 |
+| API 集成 | 每个端点的 401/403/成功、写操作审计、幂等、CSRF、分页上限、错误码不泄密；广播的自审批拒绝、匿名预览、`Notification` 去重投递与取消。 |
 | 租户隔离 | 用户 A 不能读取/更新/删除用户 B 的每类资源；嵌套资源 ID 猜测同样失败。 |
 | RLS（启用后） | 用候选人 DB 角色进行跨 tenant 查询必须返回 0；管理员受限视图不返回禁读字段。 |
 | E2E | Support、Ops、Billing、Security、Super Admin 五种会话的导航与 API 行为；前端篡改请求也不得越权。 |
@@ -347,6 +401,8 @@ getJobForUser({ userId, jobId })
 - [ ] `plan` 与内部管理员资格没有任何授权耦合。
 - [ ] 所有候选人表在应用层都有 userId 强制过滤；RLS 迁移计划与测试已批准。
 - [ ] DTO、审计日志和错误响应均不含密码、token、API Key、完整简历/Gmail 内容。
+- [ ] 任一管理员（含 `super_admin` 与 break-glass）均无法通过 API、导出、日志或数据库 repository 读取 API Key、密码哈希、OAuth refresh token、完整简历或邮件正文。
+- [ ] 已审批的平台广播只能投递到现有 `Notification`，不读取候选人私密内容；发布者与审批者不同且投递可幂等恢复。
 - [ ] 每个写操作有 `reason`、审计记录、幂等与 CSRF 防护；高风险操作满足二次确认/双人审批。
 - [ ] 内部成员禁用或角色变更能在 5 分钟内使旧会话失效。
 - [ ] Bull Board 默认不暴露；生产环境经过私网与独立认证保护。
@@ -369,7 +425,7 @@ getJobForUser({ userId, jobId })
 
 ### Phase 2：受控写操作与 Worker 集成
 
-1. 用户暂停、订阅变更、投递重试/取消、ATS 管理与通知模板。
+1. 用户暂停、订阅变更、投递重试/取消、ATS 管理与平台广播（写入用户 Notification）。
 2. 实现签名的 Web-to-Worker 管理 API，替换公开 Bull Board 操作路径。
 3. 加入幂等、二次确认、告警和 break-glass 流程。
 
