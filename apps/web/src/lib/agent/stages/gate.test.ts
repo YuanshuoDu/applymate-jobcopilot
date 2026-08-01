@@ -40,15 +40,19 @@ describe('runGate', () => {
     expect(result.data?.pending).toHaveLength(1)
   })
 
-  it('keeps a below-threshold tailored resume available for review', async () => {
+  it('marks a below-threshold package as skipped by default', async () => {
     const result = await runGate([packageFor(49, 'tailored_1')], context())
     expect(result.data?.approved).toHaveLength(0)
-    expect(result.data?.pending).toHaveLength(1)
+    expect(result.data?.pending).toHaveLength(0)
+    expect(result.data?.skipped).toHaveLength(1)
   })
 
-  it('keeps a below-threshold tailored resume available for review outside autopilot', async () => {
-    const result = await runGate([packageFor(49, 'tailored_1')], context({ autoApply: false, requireApproval: true }))
+  it('pauses for a candidate-approved borderline exception before holding it for review', async () => {
+    const ctx = context({ autoApply: false, requireApproval: true })
+    ctx.askUser = vi.fn().mockResolvedValue('add_to_pending')
+    const result = await runGate([packageFor(49, 'tailored_1')], ctx)
     expect(result.data?.pending).toHaveLength(1)
     expect(result.data?.skipped).toHaveLength(0)
+    expect(ctx.askUser).toHaveBeenCalledWith('reviewer', expect.any(String), expect.any(Array))
   })
 })

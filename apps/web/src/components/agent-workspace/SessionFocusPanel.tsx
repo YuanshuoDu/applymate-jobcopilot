@@ -117,7 +117,7 @@ function SessionFocusPanelInner({ sessionId }: { sessionId: string }) {
               ))}
               {fields.length > 0 && <button onClick={() => { void answerAndResume(task.id, fields) }} style={resumeButtonStyle}>Confirm answers & resume</button>}
             </div>
-            {!['submitted', 'cancelled'].includes(task.status) && (
+            {!['submitted', 'skipped', 'cancelled'].includes(task.status) && (
               <button onClick={() => { void cancelApplicationTask(task.id) }} style={{ fontSize: 9, color: '#b91c1c', border: '1px solid var(--border)', background: 'transparent', borderRadius: 5, padding: '3px 5px', cursor: 'pointer' }}>Cancel</button>
             )}
           </div>

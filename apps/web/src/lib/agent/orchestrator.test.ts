@@ -21,4 +21,17 @@ describe("OrchestratorAgent durable questions", () => {
     const agent = new OrchestratorAgent({ userId: "user_1", sessionId: "session_1", agentCfg: {} as never, roleConfigs: {} as never, resumeText: "", resumeContent: {} as never, defaultResume: {} as never, aiConfig: {} as never, autonomous: false, emit: vi.fn() })
     await expect(agent.ask("writer", "Tailor resume?", [{ label: "Keep", value: "keep_resume" }])).resolves.toBe("keep_resume")
   })
+
+  it("does not reuse an answer from a different question in the same stage", async () => {
+    mocks.findFirst.mockResolvedValue(null)
+    mocks.create.mockResolvedValue({ id: "question_2" })
+    const { AgentPauseError, OrchestratorAgent } = await import("./orchestrator")
+    const agent = new OrchestratorAgent({ userId: "user_1", sessionId: "session_1", agentCfg: {} as never, roleConfigs: {} as never, resumeText: "", resumeContent: {} as never, defaultResume: {} as never, aiConfig: {} as never, autonomous: false, emit: vi.fn() })
+
+    await expect(agent.ask("writer", "Use a different template?", [{ label: "No", value: "no" }])).rejects.toBeInstanceOf(AgentPauseError)
+
+    expect(mocks.findFirst).toHaveBeenCalledWith(expect.objectContaining({
+      where: expect.objectContaining({ stage: "writer", question: "Use a different template?" }),
+    }))
+  })
 })

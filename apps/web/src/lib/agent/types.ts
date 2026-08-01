@@ -58,6 +58,14 @@ export interface PipelineCtx {
   resumeState?:  PipelineCheckpointState
   /** Program-owned persistence hook; models never receive or control it. */
   checkpoint?:   (state: PipelineCheckpointState) => Promise<void>
+  /** Durable human-decision boundary supplied by the Orchestrator. */
+  askUser?: (stage: string, question: string, options: AgentQuestionOption[]) => Promise<string>
+}
+
+export type AgentQuestionOption = {
+  label: string
+  value: string
+  action?: { field: string; value: unknown }
 }
 
 export type PipelineStage = "scout" | "analyze" | "prepare" | "gate" | "execute" | "audit" | "completed"

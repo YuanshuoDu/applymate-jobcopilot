@@ -55,4 +55,15 @@ describe("DELETE /api/agent/application-tasks", () => {
       data: expect.objectContaining({ status: "cancelled" }),
     }))
   })
+
+  it("does not mutate an already screened-out task", async () => {
+    mocks.findFirst.mockResolvedValueOnce({ id: "task_1", sessionId: "session_1", status: "skipped" })
+    const { DELETE } = await import("./route")
+    const request = new Request("http://localhost/api/agent/application-tasks?id=task_1", { method: "DELETE" })
+
+    const response = await DELETE(request as never)
+
+    expect(response.status).toBe(409)
+    expect(mocks.transaction).not.toHaveBeenCalled()
+  })
 })

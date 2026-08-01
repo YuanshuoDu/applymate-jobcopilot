@@ -37,6 +37,10 @@ const COVER_LETTER_FORMALITY_GUIDES: Record<keyof typeof COVER_LETTER_LANGUAGE_N
 
 type CoverLetterLanguage = keyof typeof COVER_LETTER_LANGUAGE_NAMES
 
+export function preparationFloor(minMatchScore: number): number {
+  return Math.max(0, minMatchScore - 5)
+}
+
 function inferCoverLetterLanguage(sj: ScoredJob): CoverLetterLanguage {
   const haystack = [
     sj.job.location,
@@ -68,10 +72,27 @@ export async function runPrepare(
     buildPersona(userId, 'cover_letter').catch(() => ''),
   ])
 
-  const aboveThreshold = scoredJobs.filter(sj => sj.score >= 65)
+  // Prepare only jobs that meet the candidate's threshold, plus a narrow
+  // borderline band that the Reviewer will explicitly ask about. This keeps
+  // expensive generation from turning into indiscriminate mass application.
+  const scoreFloor = preparationFloor(agentCfg.minMatchScore)
+  const aboveThreshold = scoredJobs.filter(sj => sj.score >= scoreFloor)
+  const screenedOut = scoredJobs.filter(sj => sj.score < scoreFloor)
   const allowResumeTailoring = options.allowResumeTailoring ?? true
   const packages: ApplicationPackage[] = []
   const pendingLetters: Array<{ jobId: string; coverLetter: string }> = []
+
+  await Promise.all(screenedOut.map(sj =>
+    db.applicationTask.updateMany({
+      where: { userId, jobId: sj.job.id, status: 'analyzing' },
+      data: {
+        status: 'skipped',
+        checkpoint: 'below_match_threshold',
+        error: `Match score ${sj.score}% is below the preparation threshold of ${scoreFloor}%.`,
+        completedAt: new Date(),
+      },
+    }),
+  ))
 
   await forEachConcurrent(aboveThreshold, 2, async sj => {
     await db.applicationTask?.updateMany({

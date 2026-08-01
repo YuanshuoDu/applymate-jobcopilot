@@ -44,6 +44,14 @@ function needsStage(state: PipelineCheckpointState, stage: keyof typeof STAGE_OR
 export async function runPipeline(ctx: PipelineCtx): Promise<RunReport> {
   const t0   = Date.now()
   const orch = new OrchestratorAgent(ctx, ctx.autonomous ?? false)
+  const controlledCtx: PipelineCtx = {
+    ...ctx,
+    askUser: async (stage, question, options) => {
+      const answer = await orch.ask(stage, question, options)
+      await orch.applyOptionAction(answer, options)
+      return answer
+    },
+  }
   const { emit } = ctx
   let state: PipelineCheckpointState = ctx.resumeState ?? { nextStage: 'scout', startedAt: new Date().toISOString() }
   const persist = async (nextStage: PipelineCheckpointState['nextStage'], patch: Partial<PipelineCheckpointState> = {}) => {
@@ -157,7 +165,7 @@ export async function runPipeline(ctx: PipelineCtx): Promise<RunReport> {
     const attempt = orch.nextAttempt('analyst')
     if (attempt > 1) orch.emitRetry('analyst', attempt, 2, '切换备用模型重新评分…')
 
-    const s2 = await runAnalyze(scoutedJobs, ctx)
+    const s2 = await runAnalyze(scoutedJobs, controlledCtx)
     const a2 = acceptAnalyze(s2)
 
     if (!a2.ok || !s2.data) {
@@ -278,7 +286,7 @@ export async function runPipeline(ctx: PipelineCtx): Promise<RunReport> {
     const attempt = orch.nextAttempt('writer')
     if (attempt > 1) orch.emitRetry('writer', attempt, 2, '使用简化模板重新生成求职信…')
 
-    const s3 = await runPrepare(scoredJobs, ctx, { allowResumeTailoring })
+    const s3 = await runPrepare(scoredJobs, controlledCtx, { allowResumeTailoring })
     // Prepare is non-fatal; acceptPrepare returns ok=true even with partial failures
     const lettersCount = s3.data!.packages.filter(p => p.coverLetter).length
     const writerSummary = ctx.agentCfg.autoCoverLetter
@@ -326,7 +334,7 @@ export async function runPipeline(ctx: PipelineCtx): Promise<RunReport> {
   })
   await persist('gate', { scoutedJobs, scoredJobs, analysisFailed, preparedPackages })
 
-  const s4 = await runGate(preparedPackages, ctx)
+    const s4 = await runGate(preparedPackages, controlledCtx)
   gateOutput = s4.data ?? gateOutput
 
   // Borderline jobs question

@@ -9,6 +9,7 @@ export const APPLICATION_TASK_STATUSES = [
   "waiting_for_user",
   "waiting_for_authorization",
   "submitted",
+  "skipped",
   "failed",
   "cancelled",
 ] as const

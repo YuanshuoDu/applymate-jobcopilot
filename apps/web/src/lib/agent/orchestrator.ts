@@ -18,7 +18,7 @@
 
 import { modelChat }        from '@/lib/model-router'
 import { db }               from '@/lib/db'
-import type { PipelineCtx } from './types'
+import type { AgentQuestionOption, PipelineCtx } from './types'
 import { agentConfigPatchFrom, applyAgentConfigPatch, prismaAgentConfigPatch } from './orchestrator-config'
 
 // ── Types ─────────────────────────────────────────────────────────────────────
@@ -33,11 +33,7 @@ export interface OrchestratorDecision {
   retry_fix?:    Record<string, unknown>
 }
 
-export interface QuestionOption {
-  label:   string
-  value:   string
-  action?: { field: string; value: unknown }
-}
+export type QuestionOption = AgentQuestionOption
 
 /** Signals a durable pause to the program control plane; never an LLM decision. */
 export class AgentPauseError extends Error {
@@ -256,7 +252,11 @@ Respond ONLY in valid JSON (no markdown):
     options:  QuestionOption[],
   ): Promise<string> {
     const existing = await db.agentRunQuestion.findFirst({
-      where: { userId: this.ctx.userId, runId: this.runId, stage },
+      // One stage can legitimately ask several questions (for example a
+      // threshold exception followed by a weak-material review). Reuse only
+      // the exact durable prompt on restart; never apply a prior answer to a
+      // different decision in the same stage.
+      where: { userId: this.ctx.userId, runId: this.runId, stage, question },
       orderBy: { createdAt: "desc" },
     })
     if (existing?.answer) {

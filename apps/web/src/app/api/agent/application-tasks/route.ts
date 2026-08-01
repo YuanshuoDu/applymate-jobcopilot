@@ -31,7 +31,7 @@ export async function DELETE(req: NextRequest) {
     select: { id: true, sessionId: true, status: true },
   })
   if (!task) return err("Application task not found", 404)
-  if (["submitted", "cancelled"].includes(task.status)) return err("This application task cannot be cancelled", 409)
+  if (["submitted", "skipped", "cancelled"].includes(task.status)) return err("This application task cannot be cancelled", 409)
   const cancellation: Array<Prisma.PrismaPromise<unknown>> = [
     db.applicationTask.update({ where: { id }, data: { status: "cancelled", checkpoint: "cancelled_by_user", completedAt: new Date() } }),
     db.applicationTaskEvent.create({ data: { taskId: id, type: "cancelled", actor: "user", body: "User cancelled the application task." } }),

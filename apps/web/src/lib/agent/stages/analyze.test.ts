@@ -5,6 +5,7 @@ import type { PipelineCtx } from '../types'
 const mocks = vi.hoisted(() => ({
   update: vi.fn(),
   activityCreate: vi.fn(),
+  applicationTaskUpdateMany: vi.fn(),
   modelChat: vi.fn(),
 }))
 
@@ -12,6 +13,7 @@ vi.mock('@/lib/db', () => ({
   db: {
     job: { update: mocks.update },
     activity: { create: mocks.activityCreate },
+    applicationTask: { upsert: vi.fn(), updateMany: mocks.applicationTaskUpdateMany },
   },
 }))
 
@@ -56,6 +58,7 @@ describe('runAnalyze', () => {
     vi.resetAllMocks()
     mocks.update.mockResolvedValue({})
     mocks.activityCreate.mockResolvedValue({})
+    mocks.applicationTaskUpdateMany.mockResolvedValue({ count: 1 })
   })
 
   it('persists a structured AI score using a completion budget that supports reasoning models', async () => {
@@ -78,6 +81,24 @@ describe('runAnalyze', () => {
 
     expect(result).toMatchObject({ ok: false, error: 'All jobs failed to score' })
     expect(mocks.update).not.toHaveBeenCalled()
+    expect(mocks.applicationTaskUpdateMany).toHaveBeenCalledWith(expect.objectContaining({
+      data: expect.objectContaining({ status: 'failed', checkpoint: 'match_analysis_failed' }),
+    }))
     expect(emit).toHaveBeenCalledWith('job_error', expect.objectContaining({ error: 'AI returned no JSON score' }))
+  })
+
+  it('pauses for the candidate decision and records skipped jobs with no description', async () => {
+    const noDescriptionJob = { ...job, description: null }
+    const ctx = context()
+    ctx.askUser = vi.fn().mockResolvedValue('skip_no_desc')
+
+    const result = await runAnalyze([noDescriptionJob], ctx)
+
+    expect(result).toMatchObject({ ok: false, error: 'All jobs failed to score' })
+    expect(ctx.askUser).toHaveBeenCalledWith('analyst', expect.any(String), expect.any(Array))
+    expect(mocks.modelChat).not.toHaveBeenCalled()
+    expect(mocks.applicationTaskUpdateMany).toHaveBeenCalledWith(expect.objectContaining({
+      data: expect.objectContaining({ status: 'skipped', checkpoint: 'job_description_required' }),
+    }))
   })
 })
