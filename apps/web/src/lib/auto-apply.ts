@@ -81,7 +81,15 @@ export async function queueAutonomousApplication(input: {
 
   const claimed = await db.$transaction(async tx => {
     const task = await tx.applicationTask.updateMany({
-      where: { id: input.applicationTaskId, userId: input.userId, jobId: input.jobId, status: "waiting_for_authorization" },
+      where: {
+        id: input.applicationTaskId,
+        userId: input.userId,
+        jobId: input.jobId,
+        status: "waiting_for_authorization",
+        checkpoint: "form_filled",
+        resumeId: { not: null },
+        question: { equals: Prisma.DbNull },
+      },
       data: { status: "filling", checkpoint: "submission_authorized", question: Prisma.DbNull, startedAt: new Date() },
     });
     if (task.count !== 1) return false;

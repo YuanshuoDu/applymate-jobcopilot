@@ -1,7 +1,9 @@
 import { NextRequest } from "next/server"
 import { err, isErrorResponse, ok, requireAuth } from "@/lib/api-helpers"
+import { Prisma } from "@prisma/client"
 import { db } from "@/lib/db"
 import { applicationTaskSummary } from "@/lib/agent/application-task-view"
+import { sanitizeConfirmedAnswers } from "@/lib/agent/application-task-input"
 import { queueApplicationFill } from "@/lib/auto-apply"
 
 export async function GET(req: NextRequest) {
@@ -38,14 +40,26 @@ export async function DELETE(req: NextRequest) {
 export async function PATCH(req: NextRequest) {
   const auth = await requireAuth(req)
   if (isErrorResponse(auth)) return auth
-  const body = await req.json().catch(() => null) as { id?: unknown; action?: unknown } | null
+  const body = await req.json().catch(() => null) as { id?: unknown; action?: unknown; answers?: unknown } | null
   const id = typeof body?.id === "string" ? body.id : ""
-  if (!id || body?.action !== "resume_after_input") return err("A task id and resume_after_input action are required", 400)
+  const action = body?.action
+  if (!id || (action !== "resume_after_input" && action !== "answer_and_resume")) return err("A task id and supported resume action are required", 400)
   const task = await db.applicationTask.findFirst({
     where: { id, userId: auth.userId, status: "waiting_for_user", checkpoint: "form_answer_required" },
     include: { job: { select: { id: true, url: true } } },
   })
   if (!task) return err("This task is not waiting for new form information", 409)
+  if (action === "answer_and_resume") {
+    const answers = sanitizeConfirmedAnswers(task.question, body?.answers)
+    if (!answers) return err("Provide a concise answer for at least one requested field", 400)
+    const existing = task.confirmedAnswers && typeof task.confirmedAnswers === "object" && !Array.isArray(task.confirmedAnswers)
+      ? task.confirmedAnswers as Record<string, string>
+      : {}
+    await db.$transaction([
+      db.applicationTask.update({ where: { id: task.id }, data: { confirmedAnswers: { ...existing, ...answers } as Prisma.InputJsonValue } }),
+      db.applicationTaskEvent.create({ data: { taskId: task.id, type: "user_answers_confirmed", actor: "user", body: "Candidate explicitly confirmed application-specific form answers.", data: answers as Prisma.InputJsonValue } }),
+    ])
+  }
   try {
     const queued = await queueApplicationFill({ userId: auth.userId, jobId: task.job.id, applyUrl: task.job.url, applicationTaskId: task.id, resumeAfterUserInput: true })
     return ok({ resumed: true, ...queued })

@@ -77,7 +77,7 @@ export const applyWorker = new Worker<ApplyTaskPayload>(
         return;
       }
       // Load real persona + job data from DB
-      ctx = await loadTaskContext(getPool(), userId, jobId, applyUrl);
+      ctx = await loadTaskContext(getPool(), userId, jobId, applyUrl, applicationTaskId);
       const taskCtx = ctx; // non-null const for use inside async callbacks
 
       await Promise.race([
@@ -126,6 +126,7 @@ export const applyWorker = new Worker<ApplyTaskPayload>(
           coverLetterPath,
           dryRun: dryRun ?? false,
           allowSubmit: operation === "submit",
+          confirmedAnswers: taskCtx.confirmedAnswers,
         };
 
         // Detect ATS → use pre-programmed flow if available, else AI fallback
@@ -247,7 +248,7 @@ export const applyWorker = new Worker<ApplyTaskPayload>(
           if (needMessage) {
             await insertApplyResult({ userId, jobId, status: "manual", mode: "unattended", atsType: flow ?? "unknown", flowUsed: usedFlow, error: needMessage, durationMs: Date.now() - startedAt });
             resultWritten = true;
-            await pauseForFormInput(getPool(), applicationTaskId, needMessage);
+            await pauseForFormInput(getPool(), applicationTaskId, needMessage, needs);
             createApplyResultNotification({ userId, jobId, jobTitle: taskCtx.jobTitle, jobCompany: taskCtx.jobCompany, status: "manual" })
               .catch((e: Error) => console.warn("[notify] in-app notification failed:", e.message));
             return;

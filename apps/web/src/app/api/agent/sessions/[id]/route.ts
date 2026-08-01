@@ -43,6 +43,7 @@ function serializeSession(session: {
     status: string
     checkpoint: string | null
     error: string | null
+    question: unknown | null
     job: { company: string; role: string }
   }>
 }) {
@@ -108,7 +109,7 @@ export async function GET(req: NextRequest, ctx: RouteCtx) {
       applicationTasks: {
         orderBy: { updatedAt: "desc" },
         take: 20,
-        select: { id: true, status: true, checkpoint: true, error: true, job: { select: { company: true, role: true } } },
+        select: { id: true, status: true, checkpoint: true, error: true, question: true, job: { select: { company: true, role: true } } },
       },
     },
   })

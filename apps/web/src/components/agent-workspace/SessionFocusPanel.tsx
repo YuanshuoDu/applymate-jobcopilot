@@ -4,6 +4,7 @@ import React from 'react'
 import { useApi } from '@/lib/hooks'
 import type { AgentSessionDetail } from './session-view-model'
 import { confidenceLabel, sessionStatusLabel, taskStatusColor, taskStatusLabel } from './session-view-model'
+import { formQuestionFields } from '@/lib/agent/application-task-input'
 
 interface DetailResponse {
   session: AgentSessionDetail
@@ -30,6 +31,7 @@ function SessionFocusPanelInner({ sessionId }: { sessionId: string }) {
   const queuedTasks = tasks.filter(task => ['queued', 'running', 'retrying', 'waiting_for_user'].includes(task.status))
   const visibleTasks = queuedTasks.length > 0 ? queuedTasks : tasks.slice(-4)
   const pendingApprovals = approvals.filter(approval => approval.status === 'pending')
+  const [answers, setAnswers] = React.useState<Record<string, string>>({})
 
   React.useEffect(() => {
     const refresh = () => { void refetch() }
@@ -39,6 +41,18 @@ function SessionFocusPanelInner({ sessionId }: { sessionId: string }) {
 
   async function cancelApplicationTask(id: string) {
     const response = await fetch(`/api/agent/application-tasks?id=${encodeURIComponent(id)}`, { method: 'DELETE' })
+    if (response.ok) {
+      await refetch()
+      window.dispatchEvent(new Event('applymate:sessions-changed'))
+    }
+  }
+
+  async function answerAndResume(id: string, fields: string[]) {
+    const submittedAnswers = Object.fromEntries(fields.map(field => [field, answers[`${id}:${field}`] ?? '']).filter(([, value]) => value.trim()))
+    const response = await fetch('/api/agent/application-tasks', {
+      method: 'PATCH', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ id, action: 'answer_and_resume', answers: submittedAnswers }),
+    })
     if (response.ok) {
       await refetch()
       window.dispatchEvent(new Event('applymate:sessions-changed'))
@@ -69,18 +83,25 @@ function SessionFocusPanelInner({ sessionId }: { sessionId: string }) {
 
       <Section title="Application Tasks">
         {!loading && applicationTasks.length === 0 && <EmptyText>No application tasks yet.</EmptyText>}
-        {applicationTasks.slice(0, 5).map(task => (
+        {applicationTasks.slice(0, 5).map(task => {
+          const fields = task.status === 'waiting_for_user' && task.checkpoint === 'form_answer_required' ? formQuestionFields(task.question) : []
+          return (
           <div key={task.id} style={rowStyle}>
             <div style={{ minWidth: 0, flex: 1 }}>
               <div style={rowTitleStyle}>{task.job.company} · {task.job.role}</div>
               <div style={rowMetaStyle}>{task.status}{task.checkpoint ? ` · ${task.checkpoint}` : ''}</div>
               {task.error && <div style={{ ...rowMetaStyle, color: '#d97706' }}>{task.error}</div>}
+              {fields.map(field => (
+                <input key={field} value={answers[`${task.id}:${field}`] ?? ''} onChange={event => setAnswers(current => ({ ...current, [`${task.id}:${field}`]: event.target.value }))} placeholder={field} style={answerInputStyle} />
+              ))}
+              {fields.length > 0 && <button onClick={() => { void answerAndResume(task.id, fields) }} style={resumeButtonStyle}>Confirm answers & resume</button>}
             </div>
             {!['submitted', 'cancelled'].includes(task.status) && (
               <button onClick={() => { void cancelApplicationTask(task.id) }} style={{ fontSize: 9, color: '#b91c1c', border: '1px solid var(--border)', background: 'transparent', borderRadius: 5, padding: '3px 5px', cursor: 'pointer' }}>Cancel</button>
             )}
           </div>
-        ))}
+          )
+        })}
       </Section>
 
       <Section title="Session Quality">
@@ -185,3 +206,6 @@ const badgeStyle: React.CSSProperties = {
   fontWeight: 650,
   flexShrink: 0,
 }
+
+const answerInputStyle: React.CSSProperties = { display: 'block', width: '100%', boxSizing: 'border-box', marginTop: 6, padding: '5px 6px', fontSize: 10, border: '1px solid var(--border)', borderRadius: 5, background: 'var(--bg)' }
+const resumeButtonStyle: React.CSSProperties = { marginTop: 6, fontSize: 9, color: '#0f766e', border: '1px solid var(--border)', background: 'transparent', borderRadius: 5, padding: '3px 5px', cursor: 'pointer' }

@@ -51,6 +51,7 @@ describe("auto-apply authorization", () => {
     expect(mocks.enqueueApplyTask).toHaveBeenCalledWith({
       applicationTaskId: "application_1", jobId: "job_1", userId: "user_1", applyUrl: input.applyUrl, operation: "submit",
     });
+    expect(mocks.transaction).toHaveBeenCalled();
   });
 
   it("queues a fill-only pass without changing the job into a submission", async () => {

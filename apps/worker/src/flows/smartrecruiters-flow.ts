@@ -72,7 +72,7 @@ export async function runSmartRecruitersFlow(
     await tryFill(page, SELECTORS.coverLetter, task.persona.coverLetter.slice(0, 2000), "coverLetter", log);
   }
 
-  await fillCustomQuestions(page, task.persona, log);
+  await fillCustomQuestions(page, task.persona, log, task.confirmedAnswers);
 
   if (task.allowSubmit === false) {
     return { status: "manual", turns: 1, error: "Form filled and ready for user review.", durationMs: Date.now() - startedAt, log, reviewReady: true };

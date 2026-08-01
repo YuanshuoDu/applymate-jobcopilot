@@ -141,4 +141,19 @@ describe("AgentHarness", () => {
     expect(result.status).toBe("manual");
     expect(result.error).toContain("CAPTCHA");
   });
+
+  it("does not let the model fill a sensitive answer without a matching user confirmation", async () => {
+    const { callLlmText } = await import("@jobcopilot/shared/llm");
+    vi.mocked(callLlmText).mockResolvedValueOnce(
+      '{"type":"fill","selector":"#visa","value":"No","field":"visaSponsorship","reasoning":"answer"}'
+    );
+    const page = mockPage();
+    const result = await new AgentHarness({ userId: "user-1", maxTurns: 2, dryRun: false, mode: "dom" }).run(page, {
+      jobId: "job-5", applyUrl: "https://jobs.example.com/apply", persona: {},
+      jobTitle: "Dev", jobCompany: "Inc", resumePath: "/r.pdf",
+    });
+
+    expect(result.status).toBe("manual");
+    expect(page.fill).not.toHaveBeenCalled();
+  });
 });

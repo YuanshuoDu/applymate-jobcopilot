@@ -1,6 +1,6 @@
 import type { Page } from "playwright-core";
 import type { ApplyTask, HarnessResult } from "../harness/agent-harness.js";
-import { getPersonaValue, isSensitiveQuestion, tryFill, uploadResume } from "./helpers.js";
+import { fillCustomQuestions, getPersonaValue, tryFill, uploadResume } from "./helpers.js";
 
 /** Field map: try each selector in order, fill from persona if found */
 const PERSONAL_FIELDS = [
@@ -70,48 +70,9 @@ export async function runGreenhouseFlow(
     if (await tryFill(page, COVER_LETTER_SELECTORS, task.persona.coverLetter.slice(0, 2000), "coverLetter", log)) filled++;
   }
 
-  // Custom questions — fill any visible, unfilled textarea/text inputs
-  try {
-    const customHandles = await page.$$("textarea:not([disabled]), input[type=\"text\"]:not([disabled])");
-    for (const handle of customHandles) {
-      try {
-        const visible = await handle.isVisible().catch(() => false);
-        if (!visible) continue;
-        const currentVal = await handle.inputValue().catch(() => "");
-        if (currentVal) continue;
-
-        const nameAttr = (await handle.getAttribute("name")) ?? "";
-        const idAttr = (await handle.getAttribute("id")) ?? "";
-        const label = nameAttr.replace(/[-_[\]]/g, " ").toLowerCase().trim();
-        if (isSensitiveQuestion(label)) continue;
-
-        // Find matching persona key (case-insensitive partial match)
-        const matchKey = Object.keys(task.persona).find(
-          (k) =>
-            label.includes(k.toLowerCase()) || k.toLowerCase().includes(label)
-        );
-        if (!matchKey || !task.persona[matchKey]) continue;
-
-        const sel = idAttr
-          ? `#${idAttr.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`
-          : nameAttr
-            ? `[name="${nameAttr.replace(/"/g, '\\"')}"]`
-            : null;
-        if (!sel) continue;
-
-        const text = String(task.persona[matchKey]);
-        for (const ch of text) {
-          await page.type(sel, ch, { delay: 40 + Math.random() * 60 });
-        }
-        log.push({ selector: sel, action: "fill-custom" });
-        filled++;
-      } catch {
-        continue;
-      }
-    }
-  } catch {
-    // Best-effort custom field scan
-  }
+  // Sensitive custom questions are only filled from answers explicitly
+  // confirmed for this application task, never from the shared Persona.
+  await fillCustomQuestions(page, task.persona, log, task.confirmedAnswers);
 
   // Submit
   if (task.allowSubmit === false) {

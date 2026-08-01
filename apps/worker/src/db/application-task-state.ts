@@ -1,4 +1,5 @@
 import type { Pool } from "pg";
+import type { FormReviewNeeds } from "../harness/form-review.js";
 
 type TerminalStatus = "submitted" | "failed" | "waiting_for_user";
 
@@ -113,15 +114,16 @@ export async function pauseForFormInput(
   pool: Pool,
   taskId: string,
   detail: string,
+  needs: FormReviewNeeds,
 ): Promise<void> {
   const current = await pool.query(`SELECT "sessionId" FROM application_tasks WHERE id = $1`, [taskId]);
   const sessionId = current.rows[0]?.sessionId as string | null | undefined;
   await pool.query(
     `UPDATE application_tasks
        SET status = 'waiting_for_user', "checkpoint" = 'form_answer_required', error = $2,
-           question = jsonb_build_object('detail', $2), "updatedAt" = NOW()
+           question = jsonb_build_object('detail', $2, 'missing', $3::jsonb, 'sensitive', $4::jsonb), "updatedAt" = NOW()
      WHERE id = $1`,
-    [taskId, detail],
+    [taskId, detail, JSON.stringify(needs.missing), JSON.stringify(needs.sensitive)],
   );
   await pool.query(
     `INSERT INTO application_task_events (id, "taskId", type, actor, body, "createdAt") VALUES ($1, $2, 'form_answer_required', 'worker', $3, NOW())`,

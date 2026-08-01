@@ -47,7 +47,8 @@ RULES:
 5. If you see a CAPTCHA, login-wall, or error message you cannot resolve, return type: 'manual'.
 6. Work ONE page at a time. Each turn you see only the current page's fields.
 7. Return ONLY valid JSON matching the exact AgentAction schema below.
-8. For select/dropdown fields, choose the option that BEST matches the candidate's data.
+8. For select/dropdown fields, choose the option that EXACTLY matches the candidate's data; do not infer.
+9. Salary, compensation, visa/work authorization, legal declarations, demographics, criminal history, and signatures are sensitive. Fill them only when an exact value appears in EXPLICITLY CONFIRMED APPLICATION ANSWERS; otherwise return type: 'manual'.
 
 ACTION SCHEMA (return exactly this JSON):
 {
@@ -61,7 +62,7 @@ ACTION SCHEMA (return exactly this JSON):
 /**
  * Build the system prompt with the candidate's persona and job context.
  */
-export function buildSystemPrompt(persona: PersonaData, job: JobContext): string {
+export function buildSystemPrompt(persona: PersonaData, job: JobContext, confirmedAnswers: Record<string, string> = {}): string {
   const personaStr = JSON.stringify(persona, null, 2);
   const keywordsStr = job.keywords ?? "";
 
@@ -75,6 +76,8 @@ Title: ${job.title}
 Company: ${job.company}
 ${keywordsStr ? `Key Requirements: ${keywordsStr}` : ""}
 Cover Letter (if field exists): ${persona.coverLetter ?? "not provided"}
+EXPLICITLY CONFIRMED APPLICATION ANSWERS (may be used only for their matching field):
+${JSON.stringify(confirmedAnswers, null, 2)}
 `;
 }
 

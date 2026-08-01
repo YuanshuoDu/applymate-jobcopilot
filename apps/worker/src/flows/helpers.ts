@@ -20,6 +20,19 @@ export function isSensitiveQuestion(value: string): boolean {
   return /salary|compensation|pay|visa|sponsor|work.?authori[sz]|citizen|nationality|legal|criminal|disability|gender|race|ethnic|signature|e-?sign/i.test(value)
 }
 
+export function confirmedAnswerForLabel(
+  answers: Record<string, string> | undefined,
+  label: string,
+): string {
+  if (!answers) return "";
+  const normalizedLabel = normalizeLabel(label);
+  const match = Object.entries(answers).find(([key, value]) => {
+    const normalizedKey = normalizeLabel(key);
+    return Boolean(value && normalizedKey && (normalizedKey === normalizedLabel || normalizedKey.includes(normalizedLabel) || normalizedLabel.includes(normalizedKey)));
+  });
+  return match?.[1] ?? "";
+}
+
 export function escapeSelectorValue(value: string): string {
   return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&").replace(/"/g, '\\"');
 }
@@ -81,7 +94,8 @@ export async function uploadResume(
 export async function fillCustomQuestions(
   page: Page,
   persona: Record<string, string>,
-  log: FlowLogEntry[]
+  log: FlowLogEntry[],
+  confirmedAnswers?: Record<string, string>,
 ): Promise<void> {
   try {
     const handles = await page.$$("textarea:not([disabled]), input[type='text']:not([disabled])");
@@ -96,9 +110,10 @@ export async function fillCustomQuestions(
         if (!label) continue;
         // These require an explicit user decision, even when an old Persona
         // happens to contain a similarly named value.
-        if (isSensitiveQuestion(label)) continue;
+        const confirmed = confirmedAnswerForLabel(confirmedAnswers, label);
+        if (isSensitiveQuestion(label) && !confirmed) continue;
 
-        const matchKey = Object.keys(persona).find((key) => {
+        const matchKey = confirmed ? "candidate_confirmed" : Object.keys(persona).find((key) => {
           const normalizedKey = normalizeLabel(key);
           return Boolean(
             normalizedKey &&
@@ -115,7 +130,7 @@ export async function fillCustomQuestions(
             : null;
         if (!selector) continue;
 
-        await humanType(page, selector, String(persona[matchKey]));
+        await humanType(page, selector, confirmed || String(persona[matchKey]));
         log.push({ field: matchKey, selector, action: "fill-custom" });
       } catch {
         continue;

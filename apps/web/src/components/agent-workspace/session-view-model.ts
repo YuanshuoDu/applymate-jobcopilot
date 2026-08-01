@@ -56,6 +56,7 @@ export interface AgentSessionDetail {
     status: string
     checkpoint: string | null
     error: string | null
+    question: unknown | null
     job: { company: string; role: string }
   }>
 }

@@ -57,7 +57,7 @@ export async function runLeverFlow(
   }
 
   // 4. Custom questions
-  await fillCustomQuestions(page, task.persona, log);
+  await fillCustomQuestions(page, task.persona, log, task.confirmedAnswers);
 
   // 5. Submit
   if (task.allowSubmit === false) {

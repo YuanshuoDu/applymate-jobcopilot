@@ -158,6 +158,7 @@ describe("agent session detail API", () => {
             status: true,
             checkpoint: true,
             error: true,
+            question: true,
             job: { select: { company: true, role: true } },
           },
         },

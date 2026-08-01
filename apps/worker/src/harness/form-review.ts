@@ -26,7 +26,9 @@ export async function inspectFormReviewNeeds(page: Page): Promise<FormReviewNeed
           ? field.checked ? "checked" : ""
           : field.value.trim();
         if ((field.required || field.getAttribute("aria-required") === "true") && !value) missing.push(label);
-        if (SENSITIVE.test(label)) sensitive.push(label);
+        // A sensitive answer is acceptable only after the candidate has
+        // explicitly supplied it and the browser shows that it was filled.
+        if (SENSITIVE.test(label) && !value) sensitive.push(label);
       }
       return { missing: [...new Set(missing)].slice(0, 10), sensitive: [...new Set(sensitive)].slice(0, 10) };
     });

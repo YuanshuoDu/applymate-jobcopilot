@@ -163,6 +163,9 @@ model ApplicationTask {
   checkpoint      String?
   question        Json?
   sensitiveFlags  Json?
+  // Answers the candidate explicitly supplied for this application only.
+  // Never inferred from a model or promoted into the shared Persona automatically.
+  confirmedAnswers Json?
   resumeId        String?
   coverLetterId   String?
   workerTaskId    String?
