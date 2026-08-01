@@ -3,6 +3,7 @@
 import React from 'react'
 import { apiMutate } from '@/lib/hooks'
 import type { AgentAutomation } from './AutomationRow'
+import { submissionPolicy, submissionPolicyValues, type SubmissionPolicy } from './automation-policy'
 
 interface FormState {
   name: string
@@ -96,6 +97,11 @@ export function AutomationCreateModal({
     setForm(current => ({ ...current, [key]: value }))
   }
 
+  const policy = submissionPolicy(form)
+  function choosePolicy(nextPolicy: SubmissionPolicy) {
+    setForm(current => ({ ...current, ...submissionPolicyValues(nextPolicy) }))
+  }
+
   async function submit(event: React.FormEvent) {
     event.preventDefault()
     const name = form.name.trim()
@@ -115,8 +121,7 @@ export function AutomationCreateModal({
       targetLocations: csv(form.targetLocations),
       minScore: form.minScore,
       dailyCap: form.dailyCap,
-      requireApproval: form.requireApproval,
-      autoApply: form.autoApply,
+      ...submissionPolicyValues(policy),
       createdBy: 'user',
     }
     try {
@@ -184,14 +189,22 @@ export function AutomationCreateModal({
           </Field>
         </div>
 
-        <label style={checkStyle}>
-          <input type="checkbox" checked={form.requireApproval} onChange={e => update('requireApproval', e.target.checked)} />
-          Require approval before external actions
-        </label>
-        <label style={checkStyle}>
-          <input type="checkbox" checked={form.autoApply} onChange={e => update('autoApply', e.target.checked)} />
-          Allow auto-apply after approval gates
-        </label>
+        <fieldset style={policyFieldsetStyle}>
+          <legend style={policyLegendStyle}>Submission policy</legend>
+          <label style={checkStyle}>
+            <input type="radio" name="submission-policy" checked={policy === 'review'} onChange={() => choosePolicy('review')} />
+            Review every application before submission
+          </label>
+          <label style={checkStyle}>
+            <input type="radio" name="submission-policy" checked={policy === 'autopilot'} onChange={() => choosePolicy('autopilot')} />
+            Unattended auto-apply for eligible roles
+          </label>
+          <div role="status" aria-live="polite" style={policyNoteStyle}>
+            {policy === 'autopilot'
+              ? `Eligible jobs are submitted without another review, up to ${form.dailyCap} per day. LinkedIn and Indeed stay excluded.`
+              : 'Jobs are prepared and held for your review; nothing is submitted automatically.'}
+          </div>
+        </fieldset>
 
         {error && <div style={errorStyle}>{error}</div>}
 
@@ -223,6 +236,9 @@ const backdropStyle: React.CSSProperties = { position: 'fixed', inset: 0, zIndex
 const modalStyle: React.CSSProperties = { width: 420, maxWidth: '100%', border: '1px solid var(--border)', borderRadius: 10, background: 'var(--bg)', boxShadow: '0 24px 70px rgba(15,23,42,0.28)', padding: 16 }
 const inputStyle: React.CSSProperties = { width: '100%', boxSizing: 'border-box', height: 32, borderRadius: 7, border: '1px solid var(--border)', background: 'var(--bg-secondary)', color: 'var(--text)', padding: '0 9px', fontSize: 11, fontFamily: 'inherit' }
 const checkStyle: React.CSSProperties = { display: 'flex', alignItems: 'center', gap: 8, fontSize: 11, color: 'var(--text)', marginTop: 8 }
+const policyFieldsetStyle: React.CSSProperties = { margin: '10px 0 0', padding: '8px 9px', border: '1px solid var(--border)', borderRadius: 7 }
+const policyLegendStyle: React.CSSProperties = { padding: '0 3px', color: 'var(--text-muted)', fontSize: 10, fontWeight: 700 }
+const policyNoteStyle: React.CSSProperties = { marginTop: 8, color: 'var(--text-muted)', fontSize: 10, lineHeight: 1.4 }
 const iconButtonStyle: React.CSSProperties = { width: 26, height: 26, borderRadius: 7, border: '1px solid var(--border)', background: 'var(--bg-secondary)', color: 'var(--text)', cursor: 'pointer' }
 const primaryButtonStyle: React.CSSProperties = { height: 32, border: 'none', borderRadius: 7, background: 'var(--primary)', color: '#fff', padding: '0 14px', fontSize: 11, fontWeight: 700, cursor: 'pointer' }
 const secondaryButtonStyle: React.CSSProperties = { height: 32, border: '1px solid var(--border)', borderRadius: 7, background: 'var(--bg-secondary)', color: 'var(--text)', padding: '0 12px', fontSize: 11, cursor: 'pointer' }

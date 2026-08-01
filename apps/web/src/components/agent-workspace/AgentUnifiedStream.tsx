@@ -17,6 +17,7 @@ import {
   shouldStickToBottom,
 } from './AgentUnifiedStream.helpers'
 import { AgentUnifiedStreamHeader } from './AgentUnifiedStreamHeader'
+import { sessionSubmissionPolicy } from './automation-policy'
 import type { TranscriptAction } from './TranscriptSpecialBlocks'
 import { streamAgentChat } from './agent-chat-stream'
 import type { AgentTranscriptEvent } from './session-view-model'
@@ -181,6 +182,10 @@ export function AgentUnifiedStream({
 
   const isEmpty = log.length === 0 && applyQueue.length === 0 && liveBlocks.length === 0
   const isNewChatDraft = resetVersion > 0 && isEmpty
+  const restoredPolicy = sessionSubmissionPolicy(liveBlocks)
+  const effectiveAutonomousMode = restoredPolicy
+    ? restoredPolicy === 'autopilot'
+    : autonomousMode
 
   useEffect(() => {
     if (!isEmpty) return
@@ -330,8 +335,8 @@ export function AgentUnifiedStream({
         hideForNewChat={isNewChatDraft}
         running={running}
         summary={summary}
-        approvalRequired={Boolean(waitingQuestion && !autonomousMode)}
-        autonomousMode={autonomousMode}
+        approvalRequired={Boolean(waitingQuestion && !effectiveAutonomousMode)}
+        autonomousMode={effectiveAutonomousMode}
         conversationTitle={conversationTitle}
         conversationSubtitle={conversationSubtitle}
       />
@@ -344,7 +349,7 @@ export function AgentUnifiedStream({
         showWelcome={!isNewChatDraft}
         savedCount={savedCount}
         pendingCount={pendingCount}
-        autonomousMode={autonomousMode}
+        autonomousMode={effectiveAutonomousMode}
         revealThinkingVersion={revealThinkingVersion}
         streamScrollRef={streamScrollRef}
         streamEndRef={streamEndRef}

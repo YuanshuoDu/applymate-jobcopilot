@@ -11,6 +11,7 @@ import type { ApplyReadyJob } from '@/components/agent-workspace/ApplyJobCard'
 import { AgentSessionConsole } from '@/components/agent-workspace/AgentSessionConsole'
 import type { AgentChatAction } from '@/components/agent-workspace/agent-chat-stream'
 import type { LogEntry, QuestionOption, RunSummary } from '@/components/agent-workspace/live-run-types'
+import type { SubmissionPolicySettings } from '@/components/agent-workspace/automation-policy'
 
 // ── Role metadata ─────────────────────────────────────────────────────────────
 
@@ -35,6 +36,7 @@ export function AgentPlaygroundPage() {
   const [sessionsRefreshVersion, setSessionsRefreshVersion] = useState(0)
   const [chatResetVersion, setChatResetVersion] = useState(0)
   const [waitingQuestion, setWaitingQuestion] = useState<{ id: string; question: string; options: QuestionOption[] } | null>(null)
+  const [activeRunPolicy, setActiveRunPolicy] = useState<SubmissionPolicySettings | null>(null)
 
   const [currentRole,   setCurrentRole]   = useState<string | null>(null)
   const [runLog,        setRunLog]        = useState<LogEntry[]>([])
@@ -43,7 +45,9 @@ export function AgentPlaygroundPage() {
   const esRef = useRef<EventSource | null>(null)
   const currentRoleRef = useRef<string | null>(null)
   const runIdRef = useRef(0)
-  const autonomousMode = Boolean(agentConfig?.autoApply && !agentConfig?.requireApproval)
+  const autonomousMode = Boolean(
+    (activeRunPolicy ?? agentConfig)?.autoApply && !(activeRunPolicy ?? agentConfig)?.requireApproval,
+  )
 
   const addLog = useCallback((entry: LogEntry) => { setRunLog(prev => [...prev, entry]) }, [])
   useEffect(() => {
@@ -70,6 +74,7 @@ export function AgentPlaygroundPage() {
     setRunDone(false)
     setRunSummary(null)
     setWaitingQuestion(null)
+    setActiveRunPolicy(null)
     setChatResetVersion(v => v + 1)
   }, [])
   const selectSession = useCallback((sessionId: string, goal = 'Automation run', subtitle = 'Automation run') => {
@@ -83,6 +88,7 @@ export function AgentPlaygroundPage() {
     setRunLog([])
     setApplyQueue([])
     setRunSummary(null)
+    setActiveRunPolicy(null)
     setLiveSessionId(sessionId)
     setSelectedSessionId(sessionId)
     setConversationTitle(goal)
@@ -101,7 +107,7 @@ export function AgentPlaygroundPage() {
 
   // ── SSE Run ────────────────────────────────────────────────────────────────
 
-  const startRun = useCallback((initialChatMessage?: string, sessionId?: string) => {
+  const startRun = useCallback((initialChatMessage?: string, sessionId?: string, policy?: SubmissionPolicySettings) => {
     const runId = runIdRef.current + 1
     runIdRef.current = runId
     if (esRef.current) esRef.current.close()
@@ -110,6 +116,7 @@ export function AgentPlaygroundPage() {
       : [])
     setRunDone(false)
     setRunSummary(null)
+    setActiveRunPolicy(policy ?? null)
     // A previous pipeline may have left a paused question behind. A new run
     // must not show the composer as blocked until this run emits its own
     // visible `orchestrator_question` event.
@@ -122,7 +129,10 @@ export function AgentPlaygroundPage() {
     void fetch('/api/agent/scout', { method: 'POST' }).catch(() => undefined)
 
     const query = new URLSearchParams()
-    if (autonomousMode) query.set('autonomous', 'true')
+    const runAutonomously = Boolean(
+      (policy ?? agentConfig)?.autoApply && !(policy ?? agentConfig)?.requireApproval,
+    )
+    if (runAutonomously) query.set('autonomous', 'true')
     if (sessionId) query.set('sessionId', sessionId)
     const url = `/api/agent/run${query.size > 0 ? `?${query.toString()}` : ''}`
     const es  = new EventSource(url)
@@ -276,7 +286,7 @@ export function AgentPlaygroundPage() {
       setCurrentRole(null); setRunDone(true)
       es.close(); esRef.current = null
     })
-  }, [addLog, autonomousMode, toast])
+  }, [addLog, agentConfig, toast])
 
   const stopRun = useCallback(() => {
     runIdRef.current += 1
@@ -430,9 +440,9 @@ export function AgentPlaygroundPage() {
         <AgentSessionConsole
           selectedSessionId={selectedSessionId}
           onSelectSession={selectSession}
-          onRunSession={sessionId => {
+          onRunSession={(sessionId, policy) => {
             selectSession(sessionId)
-            startRun(undefined, sessionId)
+            startRun(undefined, sessionId, policy)
           }}
           onAddAgent={() => setShowAddModal(true)}
           onNewChat={resetLiveWorkspace}
