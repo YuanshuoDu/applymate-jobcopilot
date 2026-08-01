@@ -37,7 +37,7 @@ async function main() {
   console.log(`[worker] Listening on queue '${SCOUT_QUEUE_NAME}' (concurrency: 1)`);
   console.log(`[worker] Listening on queue '${AGENT_RUN_QUEUE_NAME}' (concurrency: 1)`);
   const automationScheduler = startAutomationScheduler();
-  console.log("[worker] Automation scheduler started");
+  console.log(`[worker] Automation scheduler ${automationScheduler.status().enabled ? "started" : "disabled"}`);
 
   const adminApp = express();
   adminApp.get("/healthz", (_req, res) => res.status(200).json({
