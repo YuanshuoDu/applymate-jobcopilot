@@ -16,6 +16,7 @@ import type {
   AgentConfigFull, StageResult, AcceptResult,
 } from '../types'
 import { stageOk } from '../types'
+import { roleAiConfig } from '../role-config'
 
 const COVER_LETTER_LANGUAGE_NAMES = {
   en: 'English',
@@ -59,9 +60,7 @@ export async function runPrepare(
   const THROTTLE_MS = agentCfg.throttleMs ?? 200
   // Use writer role's configured model
   const writerCfg = roleConfigs.writer
-  const effectiveAiConfig: AiConfig = writerCfg
-    ? { provider: writerCfg.provider as AiConfig['provider'], model: writerCfg.model, apiKey: writerCfg.apiKey }
-    : aiConfig
+  const effectiveAiConfig: AiConfig = roleAiConfig('writer', writerCfg, aiConfig)
   const writerSystemPrompt = writerCfg?.systemPrompt ?? undefined
   const [tailorPersona, coverLetterPersona] = await Promise.all([
     buildPersona(userId, 'tailor').catch(() => ''),

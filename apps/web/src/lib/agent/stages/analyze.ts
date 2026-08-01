@@ -8,11 +8,11 @@
 import type { Job }     from '@prisma/client'
 import { db }           from '@/lib/db'
 import { modelChat, stripFences } from '@/lib/model-router'
-import type { AiConfig } from '@/lib/model-router'
 import type {
   PipelineCtx, ScoredJob, AnalyzeOutput, StageResult, AcceptResult,
 } from '../types'
 import { stageOk, stageFail } from '../types'
+import { roleAiConfig } from '../role-config'
 
 const SCORE_COLOR = (s: number) => s >= 80 ? '#3B6D11' : s >= 60 ? '#854F0B' : '#6B7280'
 
@@ -26,9 +26,7 @@ export async function runAnalyze(
 
   // Use analyst role's configured model; fall back to global aiConfig
   const analystCfg = roleConfigs.analyst
-  const scoringConfig = analystCfg
-    ? { provider: analystCfg.provider as AiConfig['provider'], model: analystCfg.model, apiKey: analystCfg.apiKey }
-    : aiConfig
+  const scoringConfig = roleAiConfig('analyst', analystCfg, aiConfig)
 
   const scoredJobs: ScoredJob[] = []
   let failed = 0
