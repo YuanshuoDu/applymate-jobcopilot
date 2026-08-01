@@ -11,9 +11,8 @@
  *   1. Stage runs and returns output
  *   2. Orchestrator LLM analyzes output in context
  *   3. LLM decides: proceed | retry(fix) | ask_user | abort
- *   4. If ask_user:
- *      - autonomous=true → auto-select best option, continue
- *      - autonomous=false → write to DB, emit SSE, POLL for answer (true pause)
+ *   4. If ask_user: write to DB, emit SSE, then wait for the candidate. A
+ *      timeout is never treated as consent for a mutating choice.
  *   5. Apply decision and continue or retry
  */
 
@@ -246,17 +245,6 @@ Respond ONLY in valid JSON (no markdown):
     question: string,
     options:  QuestionOption[],
   ): Promise<string> {
-    if (this.autonomous) {
-      // Never block in autonomous mode — pick first option
-      const chosen = options[0]?.value ?? 'continue'
-      this.emit('orchestrator_thinking', {
-        stage,
-        thinking: `[自主模式] 自动选择：「${options[0]?.label ?? chosen}」`,
-      })
-      this.history.push(`[Ask/${stage}] AUTO: ${chosen}`)
-      return chosen
-    }
-
     // Write to DB for frontend to pick up
     const q = await db.agentRunQuestion.create({
       data: {
@@ -297,11 +285,13 @@ Respond ONLY in valid JSON (no markdown):
       }
     }
 
-    // Timeout — pick first option as default
-    const fallback = options[0]?.value ?? 'continue'
+    // Timeout is an explicit non-decision. Callers can safely carry on with
+    // non-mutating work, but must never treat this as authorization.
+    const fallback = 'defer'
     this.emit('orchestrator_thinking', {
-      stage, thinking: `等待超时，自动选择默认选项：「${options[0]?.label ?? fallback}」`,
+      stage, thinking: '等待用户回复超时；保留为待处理，未执行任何授权操作。',
     })
+    this.history.push(`[Ask/${stage}] DEFERRED`)
     return fallback
   }
 
