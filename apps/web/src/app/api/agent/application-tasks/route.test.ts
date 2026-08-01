@@ -27,7 +27,6 @@ vi.mock("@/lib/db", () => ({
 
 describe("DELETE /api/agent/application-tasks", () => {
   beforeEach(() => {
-    vi.resetModules()
     Object.values(mocks).forEach(mock => mock.mockReset())
     mocks.requireAuth.mockResolvedValue({ userId: "user_1" })
     mocks.findFirst.mockResolvedValue({ id: "task_1", sessionId: "session_1", status: "waiting_for_authorization" })

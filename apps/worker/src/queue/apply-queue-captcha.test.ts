@@ -13,6 +13,10 @@ const mocks = vi.hoisted(() => ({
   detectFlow: vi.fn(),
   runGreenhouseFlow: vi.fn(),
   runSmartRecruitersFlow: vi.fn(),
+  claimApplicationTask: vi.fn().mockResolvedValue(true),
+  completeFillForReview: vi.fn().mockResolvedValue(true),
+  finishApplicationTask: vi.fn().mockResolvedValue(undefined),
+  pauseForFormInput: vi.fn().mockResolvedValue(undefined),
   createNotification: vi.fn().mockResolvedValue(undefined),
   notifyApplyResult: vi.fn().mockResolvedValue(undefined),
 }));
@@ -75,9 +79,18 @@ vi.mock("../notifications/create-notification.js", () => ({
 }));
 vi.mock("../patterns/confidence.js", () => ({ shouldUsePattern: vi.fn(() => false) }));
 vi.mock("../patterns/replay.js", () => ({ replayPattern: vi.fn() }));
+vi.mock("../db/application-task-state.js", () => ({
+  claimApplicationTask: mocks.claimApplicationTask,
+  completeFillForReview: mocks.completeFillForReview,
+  finishApplicationTask: mocks.finishApplicationTask,
+  pauseForFormInput: mocks.pauseForFormInput,
+  needsUserTakeover: vi.fn(() => false),
+}));
 vi.mock("node:fs", () => ({ unlinkSync: vi.fn() }));
 
 const payload = {
+  applicationTaskId: "application-task-1",
+  operation: "submit",
   userId: "user-1",
   jobId: "job-1",
   applyUrl: "https://jobs.example/apply",
@@ -112,19 +125,18 @@ describe("apply-queue CAPTCHA handling", () => {
     await import("./apply-queue.js");
   });
 
-  it("writes a manual result when CAPTCHA is detected but cannot be solved", async () => {
+  it("stops for human takeover without trying to bypass a CAPTCHA", async () => {
     mocks.detectCaptcha.mockResolvedValueOnce(true);
-    mocks.solveCaptcha.mockResolvedValueOnce(false);
 
     await expect(mocks.workerHandler?.({ data: payload })).resolves.toBeUndefined();
 
-    expect(mocks.solveCaptcha).toHaveBeenCalledWith(mocks.fakePage);
+    expect(mocks.solveCaptcha).not.toHaveBeenCalled();
     expect(mocks.insertApplyResult).toHaveBeenCalledWith(
       expect.objectContaining({
         userId: "user-1",
         jobId: "job-1",
         status: "manual",
-        error: "CAPTCHA detected and could not be solved automatically",
+        error: "CAPTCHA detected. User takeover is required; no bypass was attempted.",
       })
     );
     expect(mocks.createNotification).toHaveBeenCalledWith("user-1", {
@@ -134,20 +146,18 @@ describe("apply-queue CAPTCHA handling", () => {
       jobId: "job-1",
     });
     expect(mocks.runGreenhouseFlow).not.toHaveBeenCalled();
-    expect(mocks.query).toHaveBeenLastCalledWith(
-      expect.stringContaining('"workflowState" = $2'),
-      ["saved", "ready_to_apply", "job-1", "user-1"]
+    expect(mocks.finishApplicationTask).toHaveBeenCalledWith(
+      expect.anything(), "application-task-1", "waiting_for_user", "user_takeover",
+      "CAPTCHA detected. User takeover is required; no bypass was attempted.",
     );
   });
 
-  it("retries navigation once when CapSolver returns a token", async () => {
-    mocks.detectCaptcha.mockResolvedValueOnce(true);
-    mocks.solveCaptcha.mockResolvedValueOnce(true);
+  it("uses the Greenhouse flow when no human-handoff condition is found", async () => {
     mocks.detectFlow.mockReturnValueOnce("greenhouse");
 
     await expect(mocks.workerHandler?.({ data: payload })).resolves.toBeUndefined();
 
-    expect(mocks.fakePage.goto).toHaveBeenCalledTimes(2);
+    expect(mocks.fakePage.goto).toHaveBeenCalledTimes(1);
     expect(mocks.runGreenhouseFlow).toHaveBeenCalled();
     expect(mocks.insertApplyResult).toHaveBeenCalledWith(
       expect.objectContaining({ status: "submitted" })
