@@ -12,6 +12,10 @@ Web manual run -> Agent pipeline -> Redis apply-tasks -> Worker -> ATS
 
 ## Required production configuration
 
+Configuration templates are available at `apps/web/.env.example` and
+`apps/worker/.env.example`. Populate them only through your host's encrypted
+environment-variable store; never commit the resulting values.
+
 Apply the pending Prisma migration before deploying this version. It adds the
 `queued` workflow state, which prevents a job from being shown as submitted
 before a Worker has confirmed the ATS submission.
