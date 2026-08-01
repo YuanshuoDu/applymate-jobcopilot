@@ -53,6 +53,27 @@ This avoids Vercel Hobby Cron's daily-only restriction while retaining a secured
 private scheduler. Set `AGENT_SCHEDULER_ENABLED=0` only for a Worker instance that
 must not schedule automations.
 
+## Fly.io Worker deployment
+
+The repository includes the production configuration at `apps/worker/fly.toml`.
+It creates one always-on Worker Machine in London (`lhr`), keeps the Bull Board
+disabled, and uses `/healthz` for the Fly health check. The `cloak_profiles`
+volume preserves per-user browser state between Machine restarts.
+
+Create the volume and deploy from the repository root:
+
+```powershell
+fly volumes create cloak_profiles --app applymate-worker --region lhr --size 1
+fly secrets set --app applymate-worker DATABASE_URL=... REDIS_URL=... AGENT_WEB_URL=https://web-stevens-projects-894c8977.vercel.app AGENT_WORKER_SECRET=... AGENT_AUTOMATION_CRON_SECRET=...
+fly deploy --config apps/worker/fly.toml --remote-only
+```
+
+Use the stable Vercel project alias for `AGENT_WEB_URL`, rather than a custom
+public domain. This Worker-to-Web callback remains valid if the customer-facing
+domain changes later. Set `AGENT_SCHEDULER_ENABLED=1` only after the Web deployment
+containing the due-automation endpoint has reached production and the Worker health
+check is green.
+
 ## First verification
 
 1. Deploy the Web app after the migration, then deploy the Worker image.
