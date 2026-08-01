@@ -20,7 +20,7 @@
 ### 1.2 不在首期范围
 
 - 企业客户（B2B）自助创建组织、邀请成员；
-- 让任何管理员（包括 `super_admin`）读取候选人的 API Key、密码哈希、OAuth refresh token、完整简历或邮件正文；
+- 管理员无权读取候选人的 API Key、密码哈希、OAuth refresh token、完整简历或邮件正文；该限制同样适用于 `super_admin`。
 - 用前端路由守卫、隐藏菜单或 `plan = enterprise` 代替服务端授权；
 - 将 Bull Board 作为正式管理后台，或把它公开暴露到互联网。
 
