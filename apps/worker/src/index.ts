@@ -2,6 +2,7 @@ import { ensureApplyResultsTable, closePool } from "./db/apply-results.js";
 import { applyWorker, applyQueue, connection } from "./queue/apply-queue.js";
 import { scoutWorker, scoutQueue, SCOUT_QUEUE_NAME } from "./queue/scout-queue.js";
 import { agentRunQueue, AGENT_RUN_QUEUE_NAME, closeAgentRunResources } from "./queue/agent-run-queue.js";
+import { startAutomationScheduler } from "./queue/automation-scheduler.js";
 import { closeAllSlots } from "./cloak/pool.js";
 import express from "express";
 import { createBullBoard } from "@bull-board/api";
@@ -36,9 +37,14 @@ async function main() {
   console.log(`[worker] Listening on queue 'apply-tasks' (concurrency: ${process.env.CLOAK_MAX_WORKERS ?? "1"})`);
   console.log(`[worker] Listening on queue '${SCOUT_QUEUE_NAME}' (concurrency: 1)`);
   console.log(`[worker] Listening on queue '${AGENT_RUN_QUEUE_NAME}' (concurrency: 1)`);
+  const automationScheduler = startAutomationScheduler();
+  console.log("[worker] Automation scheduler started");
 
   const adminApp = express();
-  adminApp.get("/healthz", (_req, res) => res.status(200).json({ status: "ok" }));
+  adminApp.get("/healthz", (_req, res) => res.status(200).json({
+    status: "ok",
+    automationScheduler: automationScheduler.status(),
+  }));
 
   // Bull Board contains task and application metadata. It is disabled unless
   // explicitly enabled, including in production, and is always password-gated.
@@ -76,6 +82,7 @@ async function main() {
     await scoutWorker.close();
     await applyWorker.close();
     await closeAgentRunResources();
+    automationScheduler.close();
     await closeAllSlots();
     await closePool();
     connection.disconnect();

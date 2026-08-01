@@ -1,12 +1,12 @@
 # Deploying unattended auto-apply
 
 The auto-apply feature has two separate runtime components. The Web app accepts
-user approval, starts manual Agent runs, and accepts Vercel Cron. The Worker owns
-the browser automation and the durable BullMQ queues.
+user approval and starts manual Agent runs. The Worker owns the browser
+automation, the durable BullMQ queues, and the high-frequency automation scheduler.
 
 ```
-Vercel Cron -> /api/agent/automations/due -> Redis agent-runs
-                                               |
+Worker scheduler -> /api/agent/automations/due -> Redis agent-runs
+                                                     |
 Web manual run -> Agent pipeline -> Redis apply-tasks -> Worker -> ATS
 ```
 
@@ -26,7 +26,8 @@ Set the following Web environment variables in Vercel:
 | --- | --- |
 | `DATABASE_URL` | Production Neon/Postgres database |
 | `REDIS_URL` | Same Redis instance used by the Worker |
-| `CRON_SECRET` | Vercel Cron authentication secret |
+| `CRON_SECRET` | Vercel's daily Gmail-sync Cron authentication secret |
+| `AGENT_AUTOMATION_CRON_SECRET` | Shared secret for the Worker to invoke due automations |
 | `AGENT_WORKER_SECRET` | Shared secret used only by the Worker internal callback |
 | `MINIMAX_API_KEY` | Platform default model, unless every user brings a key |
 
@@ -38,13 +39,15 @@ Set the following Worker secrets in Fly.io (or the chosen long-running host):
 | `REDIS_URL` | Same Redis instance as the Web app |
 | `AGENT_WEB_URL` | Public Web origin, for example `https://app.example.com` |
 | `AGENT_WORKER_SECRET` | Exact same value as the Web app |
+| `AGENT_AUTOMATION_CRON_SECRET` | Exact same value as the Web app |
+| `AGENT_SCHEDULER_INTERVAL_MS` | Optional due-check interval; defaults to `300000` (five minutes) |
 | `CLOAK_MAX_WORKERS` | Start at `1` to respect ATS rate limits |
 | `CAPSOLVER_API_KEY` | Optional CAPTCHA solver |
 
-Vercel invokes `/api/agent/automations/due` every five minutes through the root
-`vercel.json`. A five-minute cron schedule requires a Vercel plan that permits
-high-frequency Cron Jobs; otherwise use a secured external scheduler to call the
-same endpoint with `Authorization: Bearer $CRON_SECRET`.
+The Worker invokes `/api/agent/automations/due` every five minutes by default.
+This avoids Vercel Hobby Cron's daily-only restriction while retaining a secured,
+private scheduler. Set `AGENT_SCHEDULER_ENABLED=0` only for a Worker instance that
+must not schedule automations.
 
 ## First verification
 
@@ -54,7 +57,7 @@ same endpoint with `Authorization: Bearer $CRON_SECRET`.
    This checks discovery, scoring, material preparation, and session history
    without sending an application.
 4. Run it manually from the Agent console and confirm its session completes.
-5. Wait for the next Cron window and confirm the scheduled session records an
+5. Within the next scheduler interval, confirm the scheduled session records an
    `Automation dispatched` event and reaches a terminal state.
 6. Only then enable `autoApply=true` and `requireApproval=false` for a test job
    whose ATS application may safely be submitted.
