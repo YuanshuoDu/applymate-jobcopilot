@@ -25,8 +25,21 @@ export async function GET(req: NextRequest) {
 export async function DELETE(req: NextRequest) {
   const auth = await requireAuth(req)
   if (isErrorResponse(auth)) return auth
-  const id = new URL(req.url).searchParams.get("id")
-  if (!id) return err("Execution id is required", 400)
+  const params = new URL(req.url).searchParams
+  let id = params.get("id")
+  const sessionId = params.get("sessionId")
+  if (!id && sessionId) {
+    const execution = await db.agentExecution.findFirst({
+      where: {
+        userId: auth.userId,
+        sessionId,
+        status: { notIn: ["completed", "failed", "cancelled"] },
+      },
+      select: { id: true },
+    })
+    id = execution?.id ?? null
+  }
+  if (!id) return err(sessionId ? "No active execution found for this session" : "Execution id is required", 404)
   const cancelled = await cancelAgentExecution({ id, userId: auth.userId })
   if (!cancelled) return err("Execution cannot be cancelled", 409)
   await db.agentSession.updateMany({

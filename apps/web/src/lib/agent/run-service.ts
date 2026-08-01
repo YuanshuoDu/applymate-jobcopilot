@@ -7,7 +7,7 @@ import { resumeToText, type RunReport } from "@/lib/agent/types";
 import { loadRoleConfigs, toRoleConfigMap } from "@/lib/agent/role-config";
 import { pipelineAgentConfigFrom } from "@/app/api/agent/run/run-helpers";
 import { automationRunOverrides, withAutomationOverrides } from "@/lib/agent/automation-overrides";
-import { claimAgentExecution, ensureAgentExecution, finishAgentExecution, saveExecutionCheckpoint, type PipelineCheckpointState } from "@/lib/agent/execution-control";
+import { AgentExecutionCancelledError, claimAgentExecution, ensureAgentExecution, finishAgentExecution, saveExecutionCheckpoint, type PipelineCheckpointState } from "@/lib/agent/execution-control";
 import type { AiConfig } from "@/lib/model-router";
 import type { ResumeContent } from "@/lib/types";
 
@@ -112,8 +112,9 @@ export async function runAgentPipeline(input: AgentPipelineRunInput): Promise<Ru
   const agentConfig = await db.agentConfig.findUnique({ where: { userId: input.userId } });
   if (!agentConfig) {
     emit("error", { message: "Agent not configured. Save settings first." });
+    const failed = await finishAgentExecution({ id: execution.id, userId: input.userId, status: "failed", error: "Agent not configured" })
+    if (!failed) return null
     await finalize("failed", null);
-    await finishAgentExecution({ id: execution.id, userId: input.userId, status: "failed", error: "Agent not configured" })
     await saveHistory(input.userId, events, startedAt, null, true);
     return null;
   }
@@ -133,8 +134,9 @@ export async function runAgentPipeline(input: AgentPipelineRunInput): Promise<Ru
 
   if (!resume) {
     emit("error", { message: "No resume found. Create a resume first." });
+    const failed = await finishAgentExecution({ id: execution.id, userId: input.userId, status: "failed", error: "No resume found" })
+    if (!failed) return null
     await finalize("failed", null);
-    await finishAgentExecution({ id: execution.id, userId: input.userId, status: "failed", error: "No resume found" })
     await saveHistory(input.userId, events, startedAt, null, true);
     return null;
   }
@@ -159,22 +161,45 @@ export async function runAgentPipeline(input: AgentPipelineRunInput): Promise<Ru
       autonomous: input.autonomous,
       emit,
       resumeState: checkpointState(execution.state),
-      checkpoint: async state => { await saveExecutionCheckpoint({ id: execution.id, userId: input.userId, state }) },
+      checkpoint: async state => {
+        const saved = await saveExecutionCheckpoint({ id: execution.id, userId: input.userId, state })
+        if (!saved) throw new AgentExecutionCancelledError()
+      },
     });
-    await finalize("completed", report);
-    await finishAgentExecution({ id: execution.id, userId: input.userId, status: "completed" })
+    // Finish the durable control row before publishing a completed session.
+    // If the user cancelled while a stage was running, cancellation wins and
+    // must never be overwritten by this runner's stale success result.
+    const finished = await finishAgentExecution({ id: execution.id, userId: input.userId, status: "completed" })
+    if (!finished) return null
+    if (report.pending > 0) {
+      await recorder.pause(
+        `${report.pending} application package${report.pending === 1 ? " is" : "s are"} ready for your review and final submit authorization.`,
+        "reviewer",
+      )
+    } else {
+      await finalize("completed", report);
+    }
     await saveHistory(input.userId, events, startedAt, report);
     return report;
   } catch (error) {
+    if (error instanceof AgentExecutionCancelledError) {
+      // The cancel endpoint already marked the session as aborted. Do not
+      // replace that user decision with a late failure/completion update.
+      await Promise.allSettled(writes)
+      return null
+    }
     if (error instanceof AgentPauseError) {
       await Promise.allSettled(writes)
-      await recorder.pause(`Waiting for your answer at ${error.stage}.`, error.stage as "scout" | "analyst" | "writer" | "reviewer" | "executor" | "auditor")
-      await finishAgentExecution({ id: execution.id, userId: input.userId, status: "waiting_for_user", error: null })
+      const paused = await finishAgentExecution({ id: execution.id, userId: input.userId, status: "waiting_for_user", error: null })
+      if (paused) {
+        await recorder.pause(`Waiting for your answer at ${error.stage}.`, error.stage as "scout" | "analyst" | "writer" | "reviewer" | "executor" | "auditor")
+      }
       return null
     }
     emit("error", { message: error instanceof Error ? error.message : "Agent run failed" });
+    const failed = await finishAgentExecution({ id: execution.id, userId: input.userId, status: "failed", error: error instanceof Error ? error.message : "Agent run failed" })
+    if (!failed) return null
     await finalize("failed", null);
-    await finishAgentExecution({ id: execution.id, userId: input.userId, status: "failed", error: error instanceof Error ? error.message : "Agent run failed" })
     await saveHistory(input.userId, events, startedAt, null, true);
     return null;
   }

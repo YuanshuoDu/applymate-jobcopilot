@@ -11,6 +11,7 @@ const mocks = vi.hoisted(() => ({
   finalize: vi.fn(),
   loadRoleConfigs: vi.fn(),
   record: vi.fn(),
+  pause: vi.fn(),
   runPipeline: vi.fn(),
 }));
 
@@ -25,7 +26,7 @@ vi.mock("@/lib/db", () => ({
 }));
 vi.mock("@/lib/agent/pipeline", () => ({ runPipeline: mocks.runPipeline }));
 vi.mock("@/lib/agent/session/run-recorder", () => ({
-  createRunSessionRecorder: vi.fn().mockResolvedValue({ sessionId: "session_1", record: mocks.record, finalize: mocks.finalize }),
+  createRunSessionRecorder: vi.fn().mockResolvedValue({ sessionId: "session_1", record: mocks.record, finalize: mocks.finalize, pause: mocks.pause }),
 }));
 vi.mock("@/lib/agent/role-config", () => ({
   loadRoleConfigs: mocks.loadRoleConfigs,
@@ -49,6 +50,7 @@ describe("runAgentPipeline", () => {
     mocks.executionUpdateMany.mockResolvedValue({ count: 1 });
     mocks.record.mockResolvedValue({});
     mocks.finalize.mockResolvedValue({});
+    mocks.pause.mockResolvedValue({});
     mocks.findConfig.mockResolvedValue(config);
     mocks.findTranscript.mockResolvedValue({ data: {
       automation: { targetRoles: ["Backend Engineer"], targetLocations: ["Berlin"], minScore: 85,
@@ -91,5 +93,32 @@ describe("runAgentPipeline", () => {
 
     expect(mocks.record).toHaveBeenCalledWith("error", expect.objectContaining({ message: expect.stringContaining("not configured") }));
     expect(mocks.finalize).toHaveBeenCalledWith({ status: "failed", report: null });
+  });
+
+  it("keeps a user-cancelled execution cancelled when the pipeline returns late", async () => {
+    mocks.executionUpdateMany
+      .mockResolvedValueOnce({ count: 1 })
+      .mockResolvedValueOnce({ count: 0 });
+    const { runAgentPipeline } = await import("./run-service");
+
+    await expect(runAgentPipeline({
+      userId: "user_1", autonomous: false,
+      aiConfig: { provider: "minimax", model: "MiniMax-M3", apiKey: "key" },
+    })).resolves.toBeNull();
+
+    expect(mocks.finalize).not.toHaveBeenCalledWith(expect.objectContaining({ status: "completed" }));
+  });
+
+  it("keeps a completed run visible for review when application packages are pending", async () => {
+    mocks.runPipeline.mockResolvedValue({ processed: 2, queued: 0, applied: 0, pending: 2, skipped: 0, failed: 0, durationMs: 10 });
+    const { runAgentPipeline } = await import("./run-service");
+
+    await expect(runAgentPipeline({
+      userId: "user_1", autonomous: false,
+      aiConfig: { provider: "minimax", model: "MiniMax-M3", apiKey: "key" },
+    })).resolves.toMatchObject({ pending: 2 });
+
+    expect(mocks.pause).toHaveBeenCalledWith(expect.stringContaining("2 application packages"), "reviewer");
+    expect(mocks.finalize).not.toHaveBeenCalledWith(expect.objectContaining({ status: "completed" }));
   });
 });

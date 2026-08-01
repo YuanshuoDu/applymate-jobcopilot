@@ -67,7 +67,8 @@ export function sessionStatusLabel(status: string): string {
   const labels: Record<string, string> = {
     queued: "Queued",
     running: "Running",
-    waiting_user: "Approval",
+    waiting_for_user: "Needs review",
+    paused: "Paused",
     completed: "Done",
     failed: "Failed",
     aborted: "Aborted",

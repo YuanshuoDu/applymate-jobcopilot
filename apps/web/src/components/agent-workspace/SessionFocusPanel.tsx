@@ -84,7 +84,9 @@ function SessionFocusPanelInner({ sessionId }: { sessionId: string }) {
     <>
       <Section title="Queued Tasks">
         {loading && <EmptyText>Loading tasks...</EmptyText>}
-        {error && <EmptyText>{error}</EmptyText>}
+        {error && <EmptyText>
+          Couldn&apos;t refresh this session&apos;s side-panel details. <button type="button" onClick={() => { void refetch() }} style={retryButtonStyle}>Retry</button>
+        </EmptyText>}
         {!loading && !error && visibleTasks.length === 0 && <EmptyText>No task records yet.</EmptyText>}
         {visibleTasks.map(task => <TaskRow key={task.id} task={task} />)}
       </Section>
@@ -258,6 +260,7 @@ const badgeStyle: React.CSSProperties = {
 
 const answerInputStyle: React.CSSProperties = { display: 'block', width: '100%', boxSizing: 'border-box', marginTop: 6, padding: '5px 6px', fontSize: 10, border: '1px solid var(--border)', borderRadius: 5, background: 'var(--bg)' }
 const resumeButtonStyle: React.CSSProperties = { marginTop: 6, fontSize: 9, color: '#0f766e', border: '1px solid var(--border)', background: 'transparent', borderRadius: 5, padding: '3px 5px', cursor: 'pointer' }
+const retryButtonStyle: React.CSSProperties = { marginLeft: 4, padding: 0, border: 0, color: 'var(--primary)', background: 'transparent', cursor: 'pointer', font: 'inherit', fontWeight: 700, textDecoration: 'underline' }
 
 function questionOptions(value: unknown): Array<{ label: string; value: string }> {
   if (!Array.isArray(value)) return []

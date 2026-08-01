@@ -8,6 +8,14 @@ const EXECUTION_STALE_MS = Number(process.env.AGENT_EXECUTION_STALE_MS ?? 15_000
 
 export type { PipelineCheckpointState } from "@/lib/agent/types"
 
+/** Raised in the runner when the control plane revoked an in-flight run. */
+export class AgentExecutionCancelledError extends Error {
+  constructor() {
+    super("Agent execution was cancelled")
+    this.name = "AgentExecutionCancelledError"
+  }
+}
+
 export async function ensureAgentExecution(input: { userId: string; sessionId: string; autonomous?: boolean }) {
   return db.agentExecution.upsert({
     where: { sessionId: input.sessionId },

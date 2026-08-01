@@ -319,8 +319,8 @@ export async function runPipeline(ctx: PipelineCtx): Promise<RunReport> {
   orch.beginStage('reviewer', 1)
   emitRole(ctx, 'reviewer', 'start')
   const gateRule = ctx.agentCfg.autoApply && !ctx.agentCfg.requireApproval
-    ? `自动投递模式：分 ≥ ${ctx.agentCfg.minMatchScore}% → 直接投递，否则待审核`
-    : '手动审核模式：所有职位进入待审核队列'
+    ? `自动准备模式：分 ≥ ${ctx.agentCfg.minMatchScore}% → 自动完成材料与表单准备；每份申请仍须用户审核并单独授权提交`
+    : '审核模式：所有职位进入待审核队列；提交前需要逐职位授权'
   emit('agent_plan', {
     role: 'reviewer',
     plan: `计划：对 ${preparedPackages.length} 个申请包执行 AI 质量审查 + 分流决策。规则：${gateRule}`,
@@ -411,10 +411,10 @@ export async function runPipeline(ctx: PipelineCtx): Promise<RunReport> {
     emit('agent_reflect', {
       role: 'executor',
       reflect: executorQueued.length > 0
-        ? `已派发：${executorQueued.length} 个职位已加入无人值守投递队列。提交确认会由 Worker 回写${executorFailed.length > 0 ? `（${executorFailed.length} 个入队失败）` : ''}（耗时 ${(s5.metrics.durationMs / 1000).toFixed(1)}s）`
-        : `准备完成：无高分职位进入无人值守投递队列，所有职位仍在待审核`,
+        ? `已派发：${executorQueued.length} 个已获逐职位最终授权的申请进入后台执行。提交确认会由 Worker 回写${executorFailed.length > 0 ? `（${executorFailed.length} 个入队失败）` : ''}（耗时 ${(s5.metrics.durationMs / 1000).toFixed(1)}s）`
+        : `准备完成：本轮没有任何申请被派发；所有合格职位仍在待审核，等待你的明确授权`,
     })
-    const executorSummary = `${executorQueued.length} queued for unattended submission, ${executorFailed.length} failed`
+    const executorSummary = `${executorQueued.length} explicitly authorized application(s) queued, ${executorFailed.length} failed`
     emitRole(ctx, 'executor', 'done', { count: executorQueued.length, durationMs: s5.metrics.durationMs, summary: executorSummary, queued: executorQueued.length, failed: executorFailed.length })
     emit('stage_done', { stage: 'execute', queued: executorQueued.length, durationMs: s5.metrics.durationMs })
     await recordRoleRun(ctx.userId, 'executor', { count: executorQueued.length, durationMs: s5.metrics.durationMs, summary: executorSummary }).catch(() => {})

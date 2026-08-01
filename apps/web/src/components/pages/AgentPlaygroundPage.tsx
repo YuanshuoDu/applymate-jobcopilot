@@ -288,13 +288,25 @@ export function AgentPlaygroundPage() {
     })
   }, [addLog, agentConfig, toast])
 
-  const stopRun = useCallback(() => {
+  const stopRun = useCallback(async () => {
     runIdRef.current += 1
     esRef.current?.close(); esRef.current = null
     currentRoleRef.current = null
     setCurrentRole(null); setRunDone(true)
-    addLog({ type: 'info', message: '— 用户停止运行', time: new Date() })
-  }, [addLog])
+    const sessionId = liveSessionId ?? selectedSessionId
+    if (!sessionId) {
+      addLog({ type: 'info', message: '— 已停止前端流；本次运行尚未创建可取消的会话。', time: new Date() })
+      return
+    }
+
+    const response = await fetch(`/api/agent/executions?sessionId=${encodeURIComponent(sessionId)}`, { method: 'DELETE' })
+    if (!response.ok && response.status !== 404) {
+      const body = await response.json().catch(() => ({})) as { error?: string }
+      throw new Error(body.error ?? 'Could not cancel the Agent execution.')
+    }
+    addLog({ type: 'info', message: '— 已取消 Agent 运行；后台不会继续处理或提交新的申请。', time: new Date() })
+    window.dispatchEvent(new Event('applymate:sessions-changed'))
+  }, [addLog, liveSessionId, selectedSessionId])
 
   const isRunning = !!currentRole || (runLog.length > 0 && !runDone)
   const visibleWaitingQuestion = waitingQuestion && runLog.some(entry =>
@@ -325,8 +337,12 @@ export function AgentPlaygroundPage() {
           : 'Orchestrator 触发运行')
         break
       case 'stop_run':
-        stopRun()
-        toast.info('流水线已停止', '')
+        try {
+          await stopRun()
+          toast.info('流水线已取消', '后台执行已停止，不会继续处理新的申请。')
+        } catch (error) {
+          toast.error('取消运行失败', error instanceof Error ? error.message : 'Could not cancel the Agent execution.')
+        }
         break
       case 'toggle_agent': {
         const role    = action.role    as string
