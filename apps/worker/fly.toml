@@ -4,7 +4,7 @@ kill_signal = "SIGTERM"
 kill_timeout = 30
 
 [build]
-  dockerfile = "apps/worker/Dockerfile"
+  dockerfile = "Dockerfile"
 
 [env]
   AGENT_SCHEDULER_ENABLED = "0"
