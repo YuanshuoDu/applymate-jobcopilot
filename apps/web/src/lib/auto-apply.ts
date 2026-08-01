@@ -29,6 +29,38 @@ export function validateAutoApplyUrl(rawUrl: string | null | undefined): string 
   return parsed.toString();
 }
 
+/** Dispatches the safe first browser pass: fill fields, then stop for review. */
+export async function queueApplicationFill(input: {
+  userId: string;
+  jobId: string;
+  applyUrl: string | null | undefined;
+  applicationTaskId: string;
+  resumeAfterUserInput?: boolean;
+}): Promise<{ taskId: string }> {
+  const applyUrl = validateAutoApplyUrl(input.applyUrl);
+  const claimed = await db.applicationTask.updateMany({
+    where: {
+      id: input.applicationTaskId,
+      userId: input.userId,
+      jobId: input.jobId,
+      status: "waiting_for_user",
+      checkpoint: input.resumeAfterUserInput ? "form_answer_required" : "materials_ready",
+    },
+    data: { status: "filling", checkpoint: "form_fill_queued", question: Prisma.DbNull, startedAt: new Date() },
+  });
+  if (claimed.count !== 1) throw new AutoApplyError("This application is no longer ready for the form-fill review pass.");
+
+  try {
+    const taskId = await enqueueApplyTask({ applicationTaskId: input.applicationTaskId, jobId: input.jobId, userId: input.userId, applyUrl, operation: "fill" });
+    await db.applicationTask.update({ where: { id: input.applicationTaskId }, data: { workerTaskId: taskId } });
+    await db.applicationTaskEvent.create({ data: { taskId: input.applicationTaskId, type: "form_fill_queued", actor: "reviewer", body: "Material review approved; worker will fill the form without submitting it.", data: { workerTaskId: taskId } } });
+    return { taskId };
+  } catch (error) {
+    await db.applicationTask.updateMany({ where: { id: input.applicationTaskId, status: "filling", checkpoint: "form_fill_queued" }, data: { status: "waiting_for_user", checkpoint: "materials_ready" } }).catch(() => undefined);
+    throw error;
+  }
+}
+
 export async function queueAutonomousApplication(input: {
   userId: string;
   jobId: string;
@@ -69,6 +101,7 @@ export async function queueAutonomousApplication(input: {
       jobId: input.jobId,
       userId: input.userId,
       applyUrl,
+      operation: "submit",
     });
     await db.activity.create({
       data: {

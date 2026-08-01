@@ -13,6 +13,7 @@ import type {
 } from '../types'
 import { stageOk, stageFail } from '../types'
 import { roleAiConfig } from '../role-config'
+import { forEachConcurrent } from '../concurrency'
 
 const SCORE_COLOR = (s: number) => s >= 80 ? '#3B6D11' : s >= 60 ? '#854F0B' : '#6B7280'
 
@@ -47,7 +48,12 @@ export async function runAnalyze(
     })
   }
 
-  for (const job of jobs) {
+  await forEachConcurrent(jobs, 3, async job => {
+    await db.applicationTask?.upsert({
+      where: { userId_jobId: { userId, jobId: job.id } },
+      create: { userId, jobId: job.id, sessionId: ctx.sessionId ?? null, status: "analyzing", checkpoint: "match_analysis" },
+      update: { sessionId: ctx.sessionId ?? undefined, status: "analyzing", checkpoint: "match_analysis", error: null, completedAt: null },
+    })
     emit('job_start', { jobId: job.id, company: job.company, role: job.role })
     emit('agent_action', {
       role:   'analyst',
@@ -60,7 +66,7 @@ export async function runAnalyze(
         role:        'analyst',
         observation: `⚠ 跳过 ${job.company} · ${job.role}：无职位描述，无法评分`,
       })
-      continue
+      return
     }
 
     try {
@@ -107,7 +113,7 @@ export async function runAnalyze(
       })
       emit('job_error', { jobId: job.id, company: job.company, role: job.role, error: message })
     }
-  }
+  })
 
   // Batch persist scores and activities
   if (pendingUpdates.length > 0) {

@@ -49,8 +49,18 @@ describe("auto-apply authorization", () => {
     const { queueAutonomousApplication } = await import("./auto-apply");
     await expect(queueAutonomousApplication(input)).resolves.toEqual({ taskId: "worker_1" });
     expect(mocks.enqueueApplyTask).toHaveBeenCalledWith({
-      applicationTaskId: "application_1", jobId: "job_1", userId: "user_1", applyUrl: input.applyUrl,
+      applicationTaskId: "application_1", jobId: "job_1", userId: "user_1", applyUrl: input.applyUrl, operation: "submit",
     });
+  });
+
+  it("queues a fill-only pass without changing the job into a submission", async () => {
+    mocks.taskUpdate.mockResolvedValueOnce({ count: 1 }).mockResolvedValue({});
+    const { queueApplicationFill } = await import("./auto-apply");
+    await expect(queueApplicationFill({
+      userId: "user_1", jobId: "job_1", applicationTaskId: "application_1", applyUrl: input.applyUrl,
+    })).resolves.toEqual({ taskId: "worker_1" });
+    expect(mocks.enqueueApplyTask).toHaveBeenCalledWith(expect.objectContaining({ operation: "fill" }));
+    expect(mocks.jobUpdateMany).not.toHaveBeenCalled();
   });
 
   it("rejects a global setting or unrelated approval as submission consent", async () => {

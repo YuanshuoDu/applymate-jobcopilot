@@ -74,6 +74,10 @@ export async function runSmartRecruitersFlow(
 
   await fillCustomQuestions(page, task.persona, log);
 
+  if (task.allowSubmit === false) {
+    return { status: "manual", turns: 1, error: "Form filled and ready for user review.", durationMs: Date.now() - startedAt, log, reviewReady: true };
+  }
+
   const submitted = await clickSubmit(page, SELECTORS.submit);
   if (!submitted) {
     return {

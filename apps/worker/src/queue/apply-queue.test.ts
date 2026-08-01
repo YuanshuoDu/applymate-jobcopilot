@@ -4,6 +4,8 @@ const mockProcessor = vi.fn();
 const mockUpsertFormPattern = vi.fn().mockResolvedValue(undefined);
 const mockIncrementBudget = vi.fn().mockResolvedValue(undefined);
 const mockInsertApplyResult = vi.fn().mockResolvedValue(1);
+const mockCompleteFillForReview = vi.fn().mockResolvedValue(undefined);
+const mockHarnessRun = vi.fn();
 
 vi.mock("ioredis", () => ({
   Redis: vi.fn().mockImplementation(() => ({
@@ -55,6 +57,7 @@ vi.mock("../cloak/captcha.js", () => ({
 
 vi.mock("../db/application-task-state.js", () => ({
   claimApplicationTask: vi.fn().mockResolvedValue(true),
+  completeFillForReview: mockCompleteFillForReview,
   finishApplicationTask: vi.fn().mockResolvedValue(undefined),
   needsUserTakeover: vi.fn().mockReturnValue(false),
 }));
@@ -97,18 +100,16 @@ vi.mock("../notifications/notify-apply-result.js", () => ({ notifyApplyResult: v
 
 vi.mock("../harness/agent-harness.js", () => ({
   AgentHarness: vi.fn().mockImplementation(() => ({
-    run: vi.fn().mockResolvedValue({
-      status: "submitted",
-      error: null,
-      durationMs: 123,
-      fieldMappings: { "#name": "fullName" },
-    }),
+    run: mockHarnessRun,
   })),
 }));
 
 describe("apply-queue (unit — mocked)", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    mockHarnessRun.mockImplementation(async (_page: unknown, task: { allowSubmit?: boolean }) => task.allowSubmit === false
+      ? { status: "manual", error: "Form filled and ready for user review.", durationMs: 123, reviewReady: true }
+      : { status: "submitted", error: null, durationMs: 123, fieldMappings: { "#name": "fullName" } });
   });
 
   it("creates a worker on the apply-tasks queue", async () => {
@@ -121,6 +122,7 @@ describe("apply-queue (unit — mocked)", () => {
     const mod = await import("./apply-queue.js");
     const job = await mod.applyQueue.add("test", {
       applicationTaskId: "application-task-1",
+      operation: "submit",
       jobId: "job-1",
       userId: "user-1",
       applyUrl: "https://example.com/jobs/1",
@@ -137,6 +139,7 @@ describe("apply-queue (unit — mocked)", () => {
     await mockProcessor({
       data: {
         applicationTaskId: "application-task-1",
+        operation: "submit",
         jobId: "job-1",
         userId: "user-1",
         applyUrl: "https://example.com/jobs/123/apply",
@@ -156,5 +159,17 @@ describe("apply-queue (unit — mocked)", () => {
       status: "submitted",
       flowUsed: "llm",
     }));
+  });
+
+  it("fills without submission, then creates the durable final-review checkpoint", async () => {
+    await import("./apply-queue.js");
+    await mockProcessor({
+      data: {
+        applicationTaskId: "application-task-1", operation: "fill", jobId: "job-1", userId: "user-1",
+        applyUrl: "https://example.com/jobs/123/apply", personaId: "persona-1", resumePath: "/resume.pdf", dryRun: false,
+      },
+    });
+    expect(mockCompleteFillForReview).toHaveBeenCalledWith(expect.anything(), "application-task-1", "user-1", "job-1");
+    expect(mockInsertApplyResult).toHaveBeenCalledWith(expect.objectContaining({ status: "manual", error: expect.stringContaining("ready for user review") }));
   });
 });

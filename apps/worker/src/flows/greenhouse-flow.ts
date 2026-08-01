@@ -113,6 +113,9 @@ export async function runGreenhouseFlow(
   }
 
   // Submit
+  if (task.allowSubmit === false) {
+    return { status: "manual", turns: 1, error: "Form filled and ready for user review.", durationMs: Date.now() - startedAt, log, reviewReady: true };
+  }
   const submitSelectors = [
     'input[type="submit"]',
     'button[type="submit"]',

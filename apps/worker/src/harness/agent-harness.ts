@@ -24,6 +24,8 @@ export type HarnessResult = Pick<ApplyResult, "status" | "error" | "durationMs">
   turns?: number;
   log?: unknown[];
   fieldMappings?: Record<string, string>;
+  /** The form was filled but intentionally not submitted. */
+  reviewReady?: boolean;
 };
 
 export interface ApplyTask {
@@ -36,6 +38,7 @@ export interface ApplyTask {
   resumePath: string;
   coverLetterPath?: string;
   dryRun?: boolean;
+  allowSubmit?: boolean;
 }
 
 const SUCCESS_URL_PATTERNS = [
@@ -168,10 +171,16 @@ export class AgentHarness {
 
         // ── Terminal actions ──
         if (action.type === "done") {
+          if (task.allowSubmit === false) {
+            return this.buildReviewResult(task.jobId, Date.now() - startedAt);
+          }
           return this.buildResult("submitted", task.jobId, Date.now() - startedAt, undefined, this.collectFieldMappings());
         }
         if (action.type === "manual") {
           return this.buildResult("manual", task.jobId, Date.now() - startedAt, action.reasoning);
+        }
+        if (action.type === "submit" && task.allowSubmit === false) {
+          return this.buildReviewResult(task.jobId, Date.now() - startedAt);
         }
 
         // ── Execute ──
@@ -273,6 +282,13 @@ export class AgentHarness {
       error: error ?? null,
       durationMs,
       ...(fieldMappings && Object.keys(fieldMappings).length > 0 ? { fieldMappings } : {}),
+    };
+  }
+
+  private buildReviewResult(jobId: string, durationMs: number): HarnessResult {
+    return {
+      ...this.buildResult("manual", jobId, durationMs, "Form filled and ready for user review.", this.collectFieldMappings()),
+      reviewReady: true,
     };
   }
 

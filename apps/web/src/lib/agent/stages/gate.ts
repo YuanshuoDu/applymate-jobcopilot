@@ -143,6 +143,10 @@ export async function runGate(
         continue
       }
       skipped.push(pkg)
+      await db.applicationTask?.updateMany({
+        where: { userId: ctx.userId, jobId: pkg.job.id, status: { in: ["analyzing", "generating_materials"] } },
+        data: { status: "cancelled", checkpoint: "below_match_threshold", completedAt: new Date() },
+      })
       emit('agent_observation', {
         role:        'reviewer',
         observation: `✕ 跳过：${pkg.score}% < 阈值 ${minMatchScore}%`,

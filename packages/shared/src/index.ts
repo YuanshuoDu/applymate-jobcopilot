@@ -10,6 +10,8 @@ export { callLlm, callLlmText, loadWorkerAiConfig, closeSharedPool } from "./llm
 export interface ApplyTaskPayload {
   /** Durable control-plane record. Worker refuses a missing or revoked task. */
   applicationTaskId: string;
+  /** First pass fills only; submit requires a second, explicit authorization. */
+  operation: "fill" | "submit";
   jobId: string;
   userId: string;
   applyUrl: string;

@@ -26,7 +26,8 @@ import { notifyApplyResult } from "../notifications/notify-apply-result.js";
 import { shouldUsePattern } from "../patterns/confidence.js";
 import { replayPattern } from "../patterns/replay.js";
 import { unlinkSync } from "node:fs";
-import { claimApplicationTask, finishApplicationTask, needsUserTakeover } from "../db/application-task-state.js";
+import { claimApplicationTask, completeFillForReview, finishApplicationTask, needsUserTakeover, pauseForFormInput } from "../db/application-task-state.js";
+import { formNeedsMessage, inspectFormReviewNeeds } from "../harness/form-review.js";
 
 const redisUrl = process.env.REDIS_URL ?? "redis://localhost:6379";
 export const connection = new Redis(redisUrl, { maxRetriesPerRequest: null });
@@ -43,7 +44,7 @@ export const applyQueue = new Queue<ApplyTaskPayload>(QUEUE_NAME, {
 export const applyWorker = new Worker<ApplyTaskPayload>(
   QUEUE_NAME,
   async (job) => {
-    const { applicationTaskId, userId, jobId, applyUrl, personaId, resumePath, coverLetterPath, dryRun } =
+    const { applicationTaskId, operation, userId, jobId, applyUrl, personaId, resumePath, coverLetterPath, dryRun } =
       job.data;
 
     // Extract domain from applyUrl for per-domain rate limiting
@@ -71,7 +72,7 @@ export const applyWorker = new Worker<ApplyTaskPayload>(
     let ctx: Awaited<ReturnType<typeof loadTaskContext>> | null = null;
 
     try {
-      if (!applicationTaskId || !await claimApplicationTask(getPool(), applicationTaskId, userId, jobId)) {
+      if (!applicationTaskId || !operation || !await claimApplicationTask(getPool(), applicationTaskId, userId, jobId)) {
         console.warn(`[apply-worker] Skipping stale or revoked application task for job=${jobId}`);
         return;
       }
@@ -81,32 +82,24 @@ export const applyWorker = new Worker<ApplyTaskPayload>(
 
       await Promise.race([
         withCloakContext(userId, async (page) => {
-        const submissionClaim = await claimUnattendedSubmission(getPool(), userId, jobId);
-        if (submissionClaim === "unavailable") {
-          console.warn(`[apply-worker] Skipping duplicate task for job=${jobId}; it is no longer queued.`);
-          return;
-        }
+        if (operation === "submit") {
+          const submissionClaim = await claimUnattendedSubmission(getPool(), userId, jobId);
+          if (submissionClaim === "unavailable") {
+            console.warn(`[apply-worker] Skipping duplicate task for job=${jobId}; it is no longer queued.`);
+            return;
+          }
 
-        if (submissionClaim === "uncertain") {
-          await insertApplyResult({
-            userId,
-            jobId,
-            status: "manual",
-            mode: "unattended",
-            atsType: null,
-            flowUsed: null,
-            error: UNCONFIRMED_SUBMISSION_MESSAGE,
-            durationMs: Date.now() - startedAt,
-          });
-          resultWritten = true;
-          createApplyResultNotification({
-            userId,
-            jobId,
-            jobTitle: taskCtx.jobTitle,
-            jobCompany: taskCtx.jobCompany,
-            status: "manual",
-          }).catch((e: Error) => console.warn("[notify] in-app notification failed:", e.message));
-          return;
+          if (submissionClaim === "uncertain") {
+            await insertApplyResult({
+              userId, jobId, status: "manual", mode: "unattended", atsType: null, flowUsed: null,
+              error: UNCONFIRMED_SUBMISSION_MESSAGE, durationMs: Date.now() - startedAt,
+            });
+            resultWritten = true;
+            await finishApplicationTask(getPool(), applicationTaskId, "waiting_for_user", "submission_uncertain", UNCONFIRMED_SUBMISSION_MESSAGE);
+            createApplyResultNotification({ userId, jobId, jobTitle: taskCtx.jobTitle, jobCompany: taskCtx.jobCompany, status: "manual" })
+              .catch((e: Error) => console.warn("[notify] in-app notification failed:", e.message));
+            return;
+          }
         }
 
         browserAttemptStarted = true;
@@ -132,6 +125,7 @@ export const applyWorker = new Worker<ApplyTaskPayload>(
           resumePath: taskCtx.resumeTempPath ?? resumePath,
           coverLetterPath,
           dryRun: dryRun ?? false,
+          allowSubmit: operation === "submit",
         };
 
         // Detect ATS → use pre-programmed flow if available, else AI fallback
@@ -194,7 +188,7 @@ export const applyWorker = new Worker<ApplyTaskPayload>(
               return null;
             });
 
-            if (pattern && shouldUsePattern(pattern)) {
+            if (operation === "submit" && pattern && shouldUsePattern(pattern)) {
               const attempts = pattern.successCount + pattern.failureCount;
               console.log(
                 `[apply-worker] Pattern cache hit: ${host}/${urlPattern} (confidence=${pattern.successCount}/${attempts})`
@@ -245,6 +239,28 @@ export const applyWorker = new Worker<ApplyTaskPayload>(
 
         if (!harnessResult) {
           throw new Error("Apply completed without a harness result");
+        }
+
+        if (operation === "fill" && harnessResult.reviewReady) {
+          const needs = await inspectFormReviewNeeds(page);
+          const needMessage = formNeedsMessage(needs);
+          if (needMessage) {
+            await insertApplyResult({ userId, jobId, status: "manual", mode: "unattended", atsType: flow ?? "unknown", flowUsed: usedFlow, error: needMessage, durationMs: Date.now() - startedAt });
+            resultWritten = true;
+            await pauseForFormInput(getPool(), applicationTaskId, needMessage);
+            createApplyResultNotification({ userId, jobId, jobTitle: taskCtx.jobTitle, jobCompany: taskCtx.jobCompany, status: "manual" })
+              .catch((e: Error) => console.warn("[notify] in-app notification failed:", e.message));
+            return;
+          }
+          await insertApplyResult({
+            userId, jobId, status: "manual", mode: "unattended", atsType: flow ?? "unknown", flowUsed: usedFlow,
+            error: harnessResult.error ?? "Form filled and ready for user review.", durationMs: Date.now() - startedAt,
+          });
+          resultWritten = true;
+          await completeFillForReview(getPool(), applicationTaskId, userId, jobId);
+          createApplyResultNotification({ userId, jobId, jobTitle: taskCtx.jobTitle, jobCompany: taskCtx.jobCompany, status: "manual" })
+            .catch((e: Error) => console.warn("[notify] in-app notification failed:", e.message));
+          return;
         }
 
         const durationMs = Date.now() - startedAt;

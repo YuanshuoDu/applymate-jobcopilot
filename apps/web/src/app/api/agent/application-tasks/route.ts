@@ -2,6 +2,7 @@ import { NextRequest } from "next/server"
 import { err, isErrorResponse, ok, requireAuth } from "@/lib/api-helpers"
 import { db } from "@/lib/db"
 import { applicationTaskSummary } from "@/lib/agent/application-task-view"
+import { queueApplicationFill } from "@/lib/auto-apply"
 
 export async function GET(req: NextRequest) {
   const auth = await requireAuth(req)
@@ -31,4 +32,24 @@ export async function DELETE(req: NextRequest) {
     db.applicationTaskEvent.create({ data: { taskId: id, type: "cancelled", actor: "user", body: "User cancelled the application task." } }),
   ])
   return ok({ cancelled: true })
+}
+
+/** Resume a paused fill pass after the user has supplied the requested facts. */
+export async function PATCH(req: NextRequest) {
+  const auth = await requireAuth(req)
+  if (isErrorResponse(auth)) return auth
+  const body = await req.json().catch(() => null) as { id?: unknown; action?: unknown } | null
+  const id = typeof body?.id === "string" ? body.id : ""
+  if (!id || body?.action !== "resume_after_input") return err("A task id and resume_after_input action are required", 400)
+  const task = await db.applicationTask.findFirst({
+    where: { id, userId: auth.userId, status: "waiting_for_user", checkpoint: "form_answer_required" },
+    include: { job: { select: { id: true, url: true } } },
+  })
+  if (!task) return err("This task is not waiting for new form information", 409)
+  try {
+    const queued = await queueApplicationFill({ userId: auth.userId, jobId: task.job.id, applyUrl: task.job.url, applicationTaskId: task.id, resumeAfterUserInput: true })
+    return ok({ resumed: true, ...queued })
+  } catch (error) {
+    return err(error instanceof Error ? error.message : "Could not resume the application fill pass", 409)
+  }
 }

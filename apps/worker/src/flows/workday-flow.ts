@@ -54,6 +54,9 @@ export async function runWorkdayFlow(page: Page, task: ApplyTask): Promise<Harne
 
     // Step 5: Review & Submit
     await page.waitForTimeout(2000);
+    if (task.allowSubmit === false) {
+      return { status: "manual", turns: step, error: "Form filled and ready for user review.", durationMs: Date.now() - startedAt, log, reviewReady: true };
+    }
     for (const sel of SELECTORS.submitBtn) {
       const btn = page.locator(sel).first();
       if (await btn.isVisible().catch(() => false)) {

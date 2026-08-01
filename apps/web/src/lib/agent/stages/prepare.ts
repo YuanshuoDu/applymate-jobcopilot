@@ -17,6 +17,7 @@ import type {
 } from '../types'
 import { stageOk } from '../types'
 import { roleAiConfig } from '../role-config'
+import { forEachConcurrent } from '../concurrency'
 
 const COVER_LETTER_LANGUAGE_NAMES = {
   en: 'English',
@@ -72,7 +73,11 @@ export async function runPrepare(
   const packages: ApplicationPackage[] = []
   const pendingLetters: Array<{ jobId: string; coverLetter: string }> = []
 
-  for (const sj of aboveThreshold) {
+  await forEachConcurrent(aboveThreshold, 2, async sj => {
+    await db.applicationTask?.updateMany({
+      where: { userId, jobId: sj.job.id, status: { in: ["analyzing", "discovered"] } },
+      data: { status: "generating_materials", checkpoint: "tailoring_and_cover_letter" },
+    })
     let coverLetter: string | undefined
     let tailoredResumeId: string | undefined
     let tailoredResumeName: string | undefined
@@ -117,7 +122,7 @@ export async function runPrepare(
       ...(tailoredResumeId ? { tailoredResumeId, tailoredResumeName } : {}),
       tailoredKeywords: sj.missingKeywords.length ? sj.missingKeywords : undefined,
     })
-  }
+  })
 
   // Batch persist cover letters
   if (pendingLetters.length > 0) {

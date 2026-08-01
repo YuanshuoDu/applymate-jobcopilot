@@ -90,6 +90,17 @@ describe("runLeverFlow", () => {
     expect(result.turns).toBe(1);
   });
 
+  it("fills fields but stops before submit in review mode", async () => {
+    const page = mockLeverPage();
+    const result = await runLeverFlow(page, {
+      jobId: "job-review", applyUrl: "https://jobs.lever.co/spotify/abc123/apply",
+      persona: { fullName: "Jean Dupont", email: "jean@example.com" },
+      jobTitle: "Engineer", jobCompany: "Spotify", resumePath: "/resume.pdf", allowSubmit: false,
+    });
+    expect(result.status).toBe("manual");
+    expect(result.reviewReady).toBe(true);
+  });
+
   it("no submit button found", async () => {
     const page = mockLeverPageNoSubmit();
     const result = await runLeverFlow(page, {
