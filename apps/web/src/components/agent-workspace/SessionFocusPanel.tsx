@@ -29,6 +29,7 @@ function SessionFocusPanelInner({ sessionId }: { sessionId: string }) {
   const approvals = session?.approvals ?? []
   const applicationTasks = session?.applicationTasks ?? []
   const execution = session?.execution
+  const questions = session?.questions ?? []
   const queuedTasks = tasks.filter(task => ['queued', 'running', 'retrying', 'waiting_for_user'].includes(task.status))
   const visibleTasks = queuedTasks.length > 0 ? queuedTasks : tasks.slice(-4)
   const pendingApprovals = approvals.filter(approval => approval.status === 'pending')
@@ -61,6 +62,17 @@ function SessionFocusPanelInner({ sessionId }: { sessionId: string }) {
     const response = await fetch('/api/agent/application-tasks', {
       method: 'PATCH', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ id, action: 'answer_and_resume', answers: submittedAnswers }),
+    })
+    if (response.ok) {
+      await refetch()
+      window.dispatchEvent(new Event('applymate:sessions-changed'))
+    }
+  }
+
+  async function answerQuestion(questionId: string, answer: string) {
+    const response = await fetch('/api/agent/answer', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ questionId, answer }),
     })
     if (response.ok) {
       await refetch()
@@ -123,6 +135,22 @@ function SessionFocusPanelInner({ sessionId }: { sessionId: string }) {
           </div>
           {!['completed', 'failed', 'cancelled'].includes(execution.status) && <button onClick={() => { void cancelExecution(execution.id) }} style={{ fontSize: 9, color: '#b91c1c', border: '1px solid var(--border)', background: 'transparent', borderRadius: 5, padding: '3px 5px', cursor: 'pointer' }}>Cancel run</button>}
         </div>}
+      </Section>
+
+      <Section title="Questions Waiting for You">
+        {!loading && questions.length === 0 && <EmptyText>No unanswered Agent questions.</EmptyText>}
+        {questions.map(question => {
+          const options = questionOptions(question.options)
+          return <div key={question.id} style={rowStyle}>
+            <div style={{ minWidth: 0, flex: 1 }}>
+              <div style={rowTitleStyle}>{question.stage}</div>
+              <div style={{ ...rowMetaStyle, whiteSpace: 'normal' }}>{question.question}</div>
+              <div style={{ display: 'flex', flexWrap: 'wrap', gap: 5, marginTop: 7 }}>
+                {options.map(option => <button key={option.value} onClick={() => { void answerQuestion(question.id, option.value) }} style={resumeButtonStyle}>{option.label}</button>)}
+              </div>
+            </div>
+          </div>
+        })}
       </Section>
 
       <Section title="Session Quality">
@@ -230,3 +258,12 @@ const badgeStyle: React.CSSProperties = {
 
 const answerInputStyle: React.CSSProperties = { display: 'block', width: '100%', boxSizing: 'border-box', marginTop: 6, padding: '5px 6px', fontSize: 10, border: '1px solid var(--border)', borderRadius: 5, background: 'var(--bg)' }
 const resumeButtonStyle: React.CSSProperties = { marginTop: 6, fontSize: 9, color: '#0f766e', border: '1px solid var(--border)', background: 'transparent', borderRadius: 5, padding: '3px 5px', cursor: 'pointer' }
+
+function questionOptions(value: unknown): Array<{ label: string; value: string }> {
+  if (!Array.isArray(value)) return []
+  return value.flatMap(option => {
+    if (!option || typeof option !== 'object') return []
+    const record = option as { label?: unknown; value?: unknown }
+    return typeof record.label === 'string' && typeof record.value === 'string' ? [{ label: record.label, value: record.value }] : []
+  })
+}

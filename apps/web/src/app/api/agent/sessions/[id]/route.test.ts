@@ -3,6 +3,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest"
 const mocks = vi.hoisted(() => ({
   requireAuth: vi.fn(),
   findFirst: vi.fn(),
+  questionFindMany: vi.fn(),
   deleteMany: vi.fn(),
 }))
 
@@ -19,6 +20,7 @@ vi.mock("@/lib/db", () => ({
       findFirst: mocks.findFirst,
       deleteMany: mocks.deleteMany,
     },
+    agentRunQuestion: { findMany: mocks.questionFindMany },
   },
 }))
 
@@ -33,9 +35,11 @@ describe("agent session detail API", () => {
     vi.resetModules()
     mocks.requireAuth.mockReset()
     mocks.findFirst.mockReset()
+    mocks.questionFindMany.mockReset()
     mocks.deleteMany.mockReset()
     mocks.requireAuth.mockResolvedValue({ userId: "user_1" })
     mocks.deleteMany.mockResolvedValue({ count: 1 })
+    mocks.questionFindMany.mockResolvedValue([])
   })
 
   it("returns a session with task and approval summaries for the owner", async () => {
@@ -73,6 +77,7 @@ describe("agent session detail API", () => {
       ],
       applicationTasks: [],
       execution: null,
+      questions: [],
     })
     const { GET } = await import("./route")
 
@@ -114,6 +119,7 @@ describe("agent session detail API", () => {
         ],
         applicationTasks: [],
         execution: null,
+        questions: [],
       },
     })
     expect(mocks.findFirst).toHaveBeenCalledWith({

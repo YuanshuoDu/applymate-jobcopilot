@@ -47,6 +47,7 @@ function serializeSession(session: {
     job: { company: string; role: string }
   }>
   execution: { id: string; status: string; checkpoint: string; error: string | null; attemptCount: number } | null
+  questions: Array<{ id: string; stage: string; question: string; options: unknown }>
 }) {
   return {
     ...session,
@@ -118,7 +119,12 @@ export async function GET(req: NextRequest, ctx: RouteCtx) {
   })
 
   if (!session) return err("Session not found", 404)
-  return ok({ session: serializeSession(session) })
+  const questions = await db.agentRunQuestion.findMany({
+    where: { userId: auth.userId, runId: id, answer: null },
+    orderBy: { createdAt: "asc" },
+    select: { id: true, stage: true, question: true, options: true },
+  })
+  return ok({ session: serializeSession({ ...session, questions }) })
 }
 
 export async function DELETE(req: NextRequest, ctx: RouteCtx) {

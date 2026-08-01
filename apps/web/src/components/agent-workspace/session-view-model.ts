@@ -60,6 +60,7 @@ export interface AgentSessionDetail {
     job: { company: string; role: string }
   }>
   execution: { id: string; status: string; checkpoint: string; error: string | null; attemptCount: number } | null
+  questions: Array<{ id: string; stage: string; question: string; options: unknown }>
 }
 
 export function sessionStatusLabel(status: string): string {
