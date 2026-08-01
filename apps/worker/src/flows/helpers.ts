@@ -16,6 +16,10 @@ export function normalizeLabel(value: string): string {
   return value.replace(/[-_[\]]/g, " ").toLowerCase().trim();
 }
 
+export function isSensitiveQuestion(value: string): boolean {
+  return /salary|compensation|pay|visa|sponsor|work.?authori[sz]|citizen|nationality|legal|criminal|disability|gender|race|ethnic|signature|e-?sign/i.test(value)
+}
+
 export function escapeSelectorValue(value: string): string {
   return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&").replace(/"/g, '\\"');
 }
@@ -90,6 +94,9 @@ export async function fillCustomQuestions(
         const idAttr = (await handle.getAttribute("id")) ?? "";
         const label = normalizeLabel(`${nameAttr} ${idAttr}`);
         if (!label) continue;
+        // These require an explicit user decision, even when an old Persona
+        // happens to contain a similarly named value.
+        if (isSensitiveQuestion(label)) continue;
 
         const matchKey = Object.keys(persona).find((key) => {
           const normalizedKey = normalizeLabel(key);

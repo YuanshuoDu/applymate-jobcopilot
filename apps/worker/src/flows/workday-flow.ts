@@ -1,7 +1,7 @@
 import type { Page } from "playwright-core";
 import type { ApplyTask } from "../harness/agent-harness.js";
 import type { HarnessResult } from "../harness/agent-harness.js";
-import { humanType, uploadResume, type FlowLogEntry } from "./helpers.js";
+import { humanType, isSensitiveQuestion, uploadResume, type FlowLogEntry } from "./helpers.js";
 
 const SELECTORS = {
   // Step 1 — Personal info
@@ -118,6 +118,7 @@ async function fillCustomQuestions(page: Page, persona: Record<string, string>):
     const key = Object.keys(persona).find((k) =>
       label.includes(k.toLowerCase()) || k.toLowerCase().includes(label)
     );
+    if (isSensitiveQuestion(label)) continue;
     if (key && persona[key]) await field.fill(persona[key]);
   }
 }

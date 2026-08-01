@@ -1,6 +1,6 @@
 import type { Page } from "playwright-core";
 import type { ApplyTask, HarnessResult } from "../harness/agent-harness.js";
-import { getPersonaValue, tryFill, uploadResume } from "./helpers.js";
+import { getPersonaValue, isSensitiveQuestion, tryFill, uploadResume } from "./helpers.js";
 
 /** Field map: try each selector in order, fill from persona if found */
 const PERSONAL_FIELDS = [
@@ -83,6 +83,7 @@ export async function runGreenhouseFlow(
         const nameAttr = (await handle.getAttribute("name")) ?? "";
         const idAttr = (await handle.getAttribute("id")) ?? "";
         const label = nameAttr.replace(/[-_[\]]/g, " ").toLowerCase().trim();
+        if (isSensitiveQuestion(label)) continue;
 
         // Find matching persona key (case-insensitive partial match)
         const matchKey = Object.keys(task.persona).find(
