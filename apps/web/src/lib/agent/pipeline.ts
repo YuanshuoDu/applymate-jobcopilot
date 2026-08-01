@@ -18,9 +18,9 @@ import { runGate                   } from './stages/gate'
 import { runExecute, acceptExecute } from './stages/execute'
 import { runAudit                  } from './stages/audit'
 import { recordRoleRun, ROLE_META  } from './role-config'
-import { runCustomAgents           } from './stages/custom'
+import { runCustomAgents, summarizeCustomAgentResults } from './stages/custom'
 import { OrchestratorAgent         } from './orchestrator'
-import type { ApplicationPackage, ExecuteOutput, GateOutput, PipelineCheckpointState, PipelineCtx, RunReport, ScoredJob } from './types'
+import type { ApplicationPackage, CustomAgentRunResult, ExecuteOutput, GateOutput, PipelineCheckpointState, PipelineCtx, RunReport, ScoredJob } from './types'
 import { emptyReport } from './types'
 
 export type { PipelineCtx }
@@ -54,9 +54,14 @@ export async function runPipeline(ctx: PipelineCtx): Promise<RunReport> {
   }
   const { emit } = ctx
   let state: PipelineCheckpointState = ctx.resumeState ?? { nextStage: 'scout', startedAt: new Date().toISOString() }
+  let customAgentResults: CustomAgentRunResult[] = state.customAgentResults ?? []
   const persist = async (nextStage: PipelineCheckpointState['nextStage'], patch: Partial<PipelineCheckpointState> = {}) => {
-    state = { ...state, ...patch, nextStage }
+    state = { ...state, ...patch, customAgentResults, nextStage }
     await ctx.checkpoint?.(state)
+  }
+  const collectCustomResults = async (jobs: Parameters<typeof runCustomAgents>[1], afterStage: string) => {
+    const results = await runCustomAgents(controlledCtx, jobs, afterStage)
+    if (Array.isArray(results)) customAgentResults = [...customAgentResults, ...results]
   }
 
   // ── Orchestrator: plan ─────────────────────────────────────────────────────
@@ -130,7 +135,7 @@ export async function runPipeline(ctx: PipelineCtx): Promise<RunReport> {
     emitRole(ctx, 'scout', 'done', { count: scoutedJobs.length, discovered: scoutDiscovered, durationMs: s1.metrics.durationMs, summary: scoutSummary })
     emit('stage_done', { stage: 'scout', count: scoutedJobs.length, durationMs: s1.metrics.durationMs })
     await recordRoleRun(ctx.userId, 'scout', { count: scoutedJobs.length, durationMs: s1.metrics.durationMs, summary: scoutSummary }).catch(() => {})
-    await runCustomAgents(ctx, scoutedJobs, 'scout')
+    await collectCustomResults(scoutedJobs, 'scout')
     await persist('analyze', { scoutedJobs })
     break scoutLoop
   }
@@ -219,7 +224,7 @@ export async function runPipeline(ctx: PipelineCtx): Promise<RunReport> {
     emitRole(ctx, 'analyst', 'done', { count: scoredJobs.length, durationMs: s2.metrics.durationMs, summary: analystSummary, avgScore })
     emit('stage_done', { stage: 'analyze', count: scoredJobs.length, durationMs: s2.metrics.durationMs })
     await recordRoleRun(ctx.userId, 'analyst', { count: scoredJobs.length, durationMs: s2.metrics.durationMs, summary: analystSummary }).catch(() => {})
-    await runCustomAgents(ctx, scoutedJobs, 'analyst')
+    await collectCustomResults(scoutedJobs, 'analyst')
 
     await persist('prepare', { scoutedJobs, scoredJobs, analysisFailed })
     break analyzeLoop
@@ -300,7 +305,7 @@ export async function runPipeline(ctx: PipelineCtx): Promise<RunReport> {
     emitRole(ctx, 'writer', 'done', { count: preparedPackages.length, durationMs: s3.metrics.durationMs, summary: writerSummary, letters: lettersCount })
     emit('stage_done', { stage: 'prepare', count: preparedPackages.length, durationMs: s3.metrics.durationMs })
     await recordRoleRun(ctx.userId, 'writer', { count: preparedPackages.length, durationMs: s3.metrics.durationMs, summary: writerSummary }).catch(() => {})
-    await runCustomAgents(ctx, scoutedJobs, 'writer')
+    await collectCustomResults(scoutedJobs, 'writer')
     await persist('gate', { scoutedJobs, scoredJobs, analysisFailed, preparedPackages })
     break prepareLoop
   }
@@ -333,7 +338,7 @@ export async function runPipeline(ctx: PipelineCtx): Promise<RunReport> {
   emitRole(ctx, 'reviewer', 'done', { count: gateOutput.approved.length + gateOutput.pending.length, durationMs: s4.metrics.durationMs, summary: reviewerSummary, approved: gateOutput.approved.length, pending: gateOutput.pending.length })
   emit('stage_done', { stage: 'gate', approved: gateOutput.approved.length, pending: gateOutput.pending.length, skipped: gateOutput.skipped.length, durationMs: s4.metrics.durationMs })
   await recordRoleRun(ctx.userId, 'reviewer', { count: gateOutput.approved.length + gateOutput.pending.length, durationMs: s4.metrics.durationMs, summary: reviewerSummary }).catch(() => {})
-  await runCustomAgents(ctx, scoutedJobs, 'reviewer')
+  await collectCustomResults(scoutedJobs, 'reviewer')
 
   // Persist the internal readiness signal without inventing an employer-facing
   // "in review" application status.
@@ -413,7 +418,7 @@ export async function runPipeline(ctx: PipelineCtx): Promise<RunReport> {
     emitRole(ctx, 'executor', 'done', { count: executorQueued.length, durationMs: s5.metrics.durationMs, summary: executorSummary, queued: executorQueued.length, failed: executorFailed.length })
     emit('stage_done', { stage: 'execute', queued: executorQueued.length, durationMs: s5.metrics.durationMs })
     await recordRoleRun(ctx.userId, 'executor', { count: executorQueued.length, durationMs: s5.metrics.durationMs, summary: executorSummary }).catch(() => {})
-    await runCustomAgents(ctx, scoutedJobs, 'executor')
+    await collectCustomResults(scoutedJobs, 'executor')
     executeOutput = { queued: executorQueued, failed: executorFailed }
     await persist('audit', { scoutedJobs, scoredJobs, analysisFailed, preparedPackages, gateOutput, executeOutput })
     break executeLoop
@@ -470,7 +475,11 @@ export async function runPipeline(ctx: PipelineCtx): Promise<RunReport> {
     emitRole(ctx, 'auditor', 'done', { count: report.processed, durationMs: s6.metrics.durationMs, summary: auditorSummary, warnings: auditWarnings.length })
     emit('stage_done', { stage: 'audit', durationMs: s6.metrics.durationMs })
     await recordRoleRun(ctx.userId, 'auditor', { count: report.processed, durationMs: s6.metrics.durationMs, summary: auditorSummary }).catch(() => {})
-    await runCustomAgents(ctx, scoutedJobs, 'auditor')
+    await collectCustomResults(scoutedJobs, 'auditor')
+    const customSummary = summarizeCustomAgentResults(customAgentResults)
+    if (customSummary.length > 0) {
+      emit('custom_agent_summary', { findings: customSummary })
+    }
 
     // ── Post-run LLM evaluation (true Orchestrator decision, not hardcoded) ──
     const postRunAvg = scoredJobs.length

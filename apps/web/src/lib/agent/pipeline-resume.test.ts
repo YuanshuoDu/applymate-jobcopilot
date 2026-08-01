@@ -12,7 +12,10 @@ vi.mock("./stages/gate", () => ({ runGate: mocks.gate }))
 vi.mock("./stages/execute", () => ({ runExecute: mocks.execute, acceptExecute: vi.fn(() => ({ ok: true })) }))
 vi.mock("./stages/audit", () => ({ runAudit: mocks.audit }))
 vi.mock("./role-config", () => ({ ROLE_META: {}, recordRoleRun: vi.fn().mockResolvedValue(undefined) }))
-vi.mock("./stages/custom", () => ({ runCustomAgents: vi.fn().mockResolvedValue(undefined) }))
+vi.mock("./stages/custom", () => ({
+  runCustomAgents: vi.fn().mockResolvedValue([]),
+  summarizeCustomAgentResults: vi.fn(() => []),
+}))
 vi.mock("./orchestrator", () => ({
   OrchestratorAgent: class {
     plan = vi.fn().mockResolvedValue("plan")

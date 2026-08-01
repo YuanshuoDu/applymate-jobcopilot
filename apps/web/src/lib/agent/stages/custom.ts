@@ -15,7 +15,7 @@
 import type { Job }       from '@prisma/client'
 import { db }             from '@/lib/db'
 import { modelChat }      from '@/lib/model-router'
-import type { PipelineCtx } from '../types'
+import type { CustomAgentObservation, CustomAgentRunResult, PipelineCtx } from '../types'
 
 interface CustomAgentRow {
   id:           string
@@ -33,7 +33,7 @@ export async function runCustomAgents(
   ctx:       PipelineCtx,
   jobs:      Job[],
   afterStage: string,
-): Promise<void> {
+): Promise<CustomAgentRunResult[]> {
   const { emit, userId } = ctx
 
   const customAgents = await db.customAgentRole.findMany({
@@ -41,8 +41,8 @@ export async function runCustomAgents(
     orderBy: [{ sortOrder: 'asc' }, { createdAt: 'asc' }],
   }) as CustomAgentRow[]
 
-  if (customAgents.length === 0) return
-  if (jobs.length === 0) return
+  if (customAgents.length === 0 || jobs.length === 0) return []
+  const results: CustomAgentRunResult[] = []
 
   for (const agent of customAgents) {
     const roleKey = `custom_${agent.id}`
@@ -62,7 +62,7 @@ export async function runCustomAgents(
       plan: `计划：对 ${jobs.length} 个职位运行自定义分析「${agent.name}」${agent.description ? `（${agent.description}）` : ''}`,
     })
 
-    const observations: string[] = []
+    const observations: CustomAgentObservation[] = []
     let processed = 0
 
     for (const job of jobs) {
@@ -84,13 +84,13 @@ export async function runCustomAgents(
           256,
         )
 
-        const observation = result.text.trim().slice(0, 200)
+        const observation = parseCustomObservation(result.text, job)
         observations.push(observation)
         processed++
 
         emit('agent_observation', {
           role:        roleKey,
-          observation: observation || '（无输出）',
+          observation: observation.summary || '（无输出）',
         })
 
         // Write to activity log
@@ -99,7 +99,7 @@ export async function runCustomAgents(
             userId,
             jobId: job.id,
             type:  'agent_action',
-            text:  `[${agent.name}] ${job.company} · ${job.role}: ${observation.slice(0, 120)}`,
+            text:  `[${agent.name}] ${job.company} · ${job.role}: ${observation.summary.slice(0, 120)}`,
             color: '#7C3AED',
           },
         }).catch(() => {})
@@ -128,7 +128,11 @@ export async function runCustomAgents(
       durationMs,
       custom:    true,
     })
+    const runResult = { agentId: agent.id, agentName: agent.name, afterStage, observations }
+    results.push(runResult)
+    emit('custom_agent_result', runResult)
   }
+  return results
 }
 
 function buildCustomPrompt(agent: CustomAgentRow, job: Job): string {
@@ -140,5 +144,56 @@ Current score: ${job.score ?? 'not scored'}
 
 ${agent.description ? `Your focus: ${agent.description}` : 'Provide a brief, actionable insight about this job.'}
 
-Respond in 1-2 sentences. Be specific and actionable.`
+Return ONLY JSON in this exact shape:
+{"summary":"one concise factual observation","risks":["zero to three concrete risks"],"recommendation":"one actionable recommendation","confidence":0.0}
+
+Do not invent company facts or candidate facts. Use confidence 0-1 and leave risks empty when unsupported.`
+}
+
+function parseCustomObservation(raw: string, job: Job): CustomAgentObservation {
+  const fallback = {
+    jobId: job.id,
+    company: job.company,
+    role: job.role,
+    summary: raw.trim().slice(0, 200) || 'No structured observation returned.',
+    risks: [],
+    recommendation: '',
+    confidence: 0,
+  }
+  const start = raw.indexOf('{')
+  const end = raw.lastIndexOf('}')
+  if (start < 0 || end < start) return fallback
+  try {
+    const parsed = JSON.parse(raw.slice(start, end + 1)) as Record<string, unknown>
+    return {
+      ...fallback,
+      summary: typeof parsed.summary === 'string' ? parsed.summary.slice(0, 200) : fallback.summary,
+      risks: Array.isArray(parsed.risks) ? parsed.risks.filter((risk): risk is string => typeof risk === 'string').slice(0, 3) : [],
+      recommendation: typeof parsed.recommendation === 'string' ? parsed.recommendation.slice(0, 200) : '',
+      confidence: typeof parsed.confidence === 'number' && Number.isFinite(parsed.confidence)
+        ? Math.max(0, Math.min(1, parsed.confidence))
+        : 0,
+    }
+  } catch {
+    return fallback
+  }
+}
+
+export function summarizeCustomAgentResults(results: CustomAgentRunResult[]) {
+  const byJob = new Map<string, {
+    jobId: string; company: string; role: string; confidence: number; risks: Set<string>; recommendations: Set<string>
+  }>()
+  for (const result of results) for (const observation of result.observations) {
+    const existing = byJob.get(observation.jobId) ?? {
+      jobId: observation.jobId, company: observation.company, role: observation.role,
+      confidence: 0, risks: new Set<string>(), recommendations: new Set<string>(),
+    }
+    existing.confidence = Math.max(existing.confidence, observation.confidence)
+    observation.risks.forEach(risk => existing.risks.add(risk))
+    if (observation.recommendation) existing.recommendations.add(observation.recommendation)
+    byJob.set(observation.jobId, existing)
+  }
+  return [...byJob.values()]
+    .map(row => ({ ...row, risks: [...row.risks], recommendations: [...row.recommendations] }))
+    .sort((a, b) => b.confidence - a.confidence || a.company.localeCompare(b.company))
 }

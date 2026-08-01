@@ -80,8 +80,26 @@ export interface PipelineCheckpointState {
   executeOutput?: ExecuteOutput
   analysisFailed?: number
   report?: RunReport
+  customAgentResults?: CustomAgentRunResult[]
   autonomous?: boolean
   startedAt?: string
+}
+
+export type CustomAgentObservation = {
+  jobId: string
+  company: string
+  role: string
+  summary: string
+  risks: string[]
+  recommendation: string
+  confidence: number
+}
+
+export type CustomAgentRunResult = {
+  agentId: string
+  agentName: string
+  afterStage: string
+  observations: CustomAgentObservation[]
 }
 
 // ── Generic stage result ──────────────────────────────────────────────────────

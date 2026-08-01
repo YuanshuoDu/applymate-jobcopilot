@@ -144,6 +144,29 @@ export function mapPipelineEventToTranscript(event: string, data: unknown): Tran
     }
   }
 
+  if (event === "custom_agent_result") {
+    const row = data && typeof data === "object" ? data as { agentName?: unknown; observations?: unknown[] } : {}
+    const agentName = typeof row.agentName === "string" ? row.agentName : "Custom agent"
+    const count = Array.isArray(row.observations) ? row.observations.length : 0
+    return {
+      type: "subagent_result",
+      speaker: agentName,
+      title: "Structured findings",
+      body: `${count} structured job finding${count === 1 ? "" : "s"} recorded for the final review.`,
+    }
+  }
+
+  if (event === "custom_agent_summary") {
+    const row = data && typeof data === "object" ? data as { findings?: unknown[] } : {}
+    const count = Array.isArray(row.findings) ? row.findings.length : 0
+    return {
+      type: "thinking_summary",
+      speaker: "Orchestrator",
+      title: "Custom-agent summary",
+      body: `${count} de-duplicated custom-agent finding${count === 1 ? "" : "s"} included in the final audit.`,
+    }
+  }
+
   if (event === "done") {
     return {
       type: "final_report",
@@ -279,4 +302,5 @@ export async function createRunSessionRecorder(db: AgentSessionDb, input: RunSes
       })
     },
   }
+
 }
