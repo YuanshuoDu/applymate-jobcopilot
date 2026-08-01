@@ -14,12 +14,14 @@
  *     skipped  — below minMatchScore
  */
 import { modelChat } from '@/lib/model-router'
+import { db } from '@/lib/db'
 import type { AiConfig } from '@/lib/model-router'
 import type {
   PipelineCtx, ApplicationPackage, GateOutput, StageResult,
 } from '../types'
 import { stageOk } from '../types'
 import { roleAiConfig } from '../role-config'
+import { holdForApplicationReview } from '../application-control'
 
 // ── AI Quality Review ─────────────────────────────────────────────────────────
 
@@ -73,7 +75,7 @@ export async function runGate(
   ctx: PipelineCtx,
 ): Promise<StageResult<GateOutput>> {
   const t0 = Date.now()
-  const { autoApply, requireApproval, minMatchScore } = ctx.agentCfg
+  const { minMatchScore } = ctx.agentCfg
 
   const approved: ApplicationPackage[] = []
   const pending:  ApplicationPackage[] = []
@@ -127,12 +129,8 @@ export async function runGate(
       }
     }
 
-    const autopilot = autoApply && !requireApproval
-
-    // In autopilot mode, the configured threshold applies equally to base and
-    // tailored resumes. A tailored resume must not silently bypass it.
     if (pkg.score < minMatchScore) {
-      if (pkg.tailoredResumeId && !autopilot) {
+      if (pkg.tailoredResumeId) {
         pending.push(pkg)
         emit('agent_question', {
           role: 'reviewer', questionId: `resume_review_${pkg.job.id}`,
@@ -152,34 +150,51 @@ export async function runGate(
       continue
     }
 
-    if (autopilot) {
-      approved.push(pkg)
-      emit('agent_observation', {
-        role:        'reviewer',
-        observation: `✓ 批准自动投递：分 ${pkg.score}% ≥ ${minMatchScore}%，autoApply=true`,
-      })
-      continue
-    }
-
-    if (pkg.tailoredResumeId) {
-      pending.push(pkg)
-      emit('agent_question', {
-        role: 'reviewer', questionId: `resume_review_${pkg.job.id}`,
-        question: `${pkg.job.company} · ${pkg.job.role} 的定制简历已生成并通过材料审核。请查看简历后确认是否进入申请。`,
-        options: [
-          { label: '查看定制简历', value: 'view_resume', action: { field: '_navigate', value: `resume&resumeId=${pkg.tailoredResumeId}` } },
-          { label: '保留待审核', value: 'review' },
-        ],
-      })
-      continue
-    }
-
     pending.push(pkg)
-    const reason = !autoApply ? 'autoApply=false' : 'requireApproval=true'
+    const task = await holdForApplicationReview({
+      userId: ctx.userId,
+      jobId: pkg.job.id,
+      sessionId: ctx.sessionId,
+      resumeId: pkg.tailoredResumeId ?? ctx.defaultResume.id,
+    })
+    const approval = ctx.sessionId
+      ? await db.agentApproval.create({
+          data: {
+            sessionId: ctx.sessionId,
+            userId: ctx.userId,
+            type: "review_application",
+            status: "pending",
+            title: `Review application: ${pkg.job.company} · ${pkg.job.role}`,
+            body: "Review the job, tailored materials, and every proposed answer. Approval here only unlocks the final submit authorization; it never submits by itself.",
+            impact: { externalSubmission: false, jobId: pkg.job.id },
+            payload: { applicationTaskId: task.id, jobId: pkg.job.id },
+          },
+        })
+      : null
     emit('agent_observation', {
       role:        'reviewer',
-      observation: `⏳ 进入待审核：${reason}，需人工确认`,
+      observation: `⏳ 进入待审核：材料已保存，必须由你逐个审核并明确授权后才会提交。`,
     })
+    emit('agent_question', {
+      role: 'reviewer', questionId: `application_review_${pkg.job.id}`,
+      question: `${pkg.job.company} · ${pkg.job.role} 的申请材料已就绪。请审核材料与职位是否对应、所有答案是否真实；确认后才可授权提交。`,
+      options: [
+        { label: '保留待审核', value: 'review' },
+      ],
+    })
+    if (approval) {
+      emit("application_review_ready", {
+        approval: {
+          id: approval.id,
+          type: approval.type,
+          title: approval.title,
+          body: approval.body,
+          impact: approval.impact,
+          payload: approval.payload,
+          status: approval.status,
+        },
+      })
+    }
   }
 
   const total = Date.now() - t0

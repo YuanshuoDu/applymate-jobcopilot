@@ -90,6 +90,7 @@ model User {
   agentRunQuestions  AgentRunQuestion[]
   agentRuns          AgentRun[]
   agentSessions      AgentSession[]
+  applicationTasks  ApplicationTask[]
   agentAutomations   AgentAutomation[]
   resumeVersions ResumeVersion[]
   directions     Direction[]
@@ -138,6 +139,7 @@ model Job {
 
   user             User          @relation(fields: [userId], references: [id], onDelete: Cascade)
   applyResults     ApplyResult[]
+  applicationTasks ApplicationTask[]
   activities       Activity[]
   finalResume      Resume?       @relation("JobFinalResume",   fields: [finalResumeId],      references: [id], onDelete: SetNull)
   finalCoverLetter CoverLetter?  @relation("JobFinalCL",       fields: [finalCoverLetterId], references: [id], onDelete: SetNull)
@@ -148,6 +150,52 @@ model Job {
 
   @@index([userId, status])
   @@index([userId, createdAt(sort: Desc)])
+}
+
+// Durable control-plane record for one candidate/job application.  Job keeps
+// the candidate-facing lifecycle; this model owns resumable agent execution.
+model ApplicationTask {
+  id              String   @id @default(cuid())
+  userId          String
+  jobId           String
+  sessionId       String?
+  status          String   @default("discovered")
+  checkpoint      String?
+  question        Json?
+  sensitiveFlags  Json?
+  resumeId        String?
+  coverLetterId   String?
+  workerTaskId    String?
+  error           String?  @db.Text
+  startedAt       DateTime?
+  completedAt     DateTime?
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  user     User          @relation(fields: [userId], references: [id], onDelete: Cascade)
+  job      Job           @relation(fields: [jobId], references: [id], onDelete: Cascade)
+  session  AgentSession? @relation(fields: [sessionId], references: [id], onDelete: SetNull)
+  events   ApplicationTaskEvent[]
+
+  @@unique([userId, jobId])
+  @@index([userId, status, updatedAt(sort: Desc)])
+  @@index([sessionId, status])
+  @@map("application_tasks")
+}
+
+model ApplicationTaskEvent {
+  id        String   @id @default(cuid())
+  taskId    String
+  type      String
+  actor     String
+  body      String   @db.Text
+  data      Json?
+  createdAt DateTime @default(now())
+
+  task ApplicationTask @relation(fields: [taskId], references: [id], onDelete: Cascade)
+
+  @@index([taskId, createdAt])
+  @@map("application_task_events")
 }
 
 enum JobStatus {
@@ -599,6 +647,7 @@ model AgentSession {
   tasks      SubAgentTask[]
   transcript AgentTranscriptEvent[]
   approvals  AgentApproval[]
+  applicationTasks ApplicationTask[]
 
   @@index([userId, createdAt(sort: Desc)])
   @@index([userId, status])

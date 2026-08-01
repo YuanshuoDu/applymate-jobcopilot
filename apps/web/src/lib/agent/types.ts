@@ -44,6 +44,8 @@ export interface AgentConfigFull {
 
 export interface PipelineCtx {
   userId:        string
+  /** Durable session that owns approvals and resumable application checkpoints. */
+  sessionId?:     string
   agentCfg:      AgentConfigFull
   roleConfigs:   RoleConfigMap  // per-role model configs
   resumeText:    string         // plain-text resume, truncated to 2500 chars
@@ -104,8 +106,8 @@ export interface PrepareOutput {
 // ── Stage 4: Gate ─────────────────────────────────────────────────────────────
 
 export interface GateOutput {
-  approved: ApplicationPackage[]  // auto-apply or above threshold with no review req
-  pending:  ApplicationPackage[]  // needs human review
+  approved: ApplicationPackage[]  // reserved for a future post-fill, user-approved dispatch
+  pending:  ApplicationPackage[]  // always needs human review before submission
   skipped:  ApplicationPackage[]  // below minMatchScore
 }
 

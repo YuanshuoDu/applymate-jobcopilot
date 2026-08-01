@@ -51,7 +51,12 @@ vi.mock("../rate-limit.js", () => ({
 
 vi.mock("../cloak/captcha.js", () => ({
   detectCaptcha: vi.fn().mockResolvedValue(false),
-  solveCaptcha: vi.fn().mockResolvedValue(false),
+}));
+
+vi.mock("../db/application-task-state.js", () => ({
+  claimApplicationTask: vi.fn().mockResolvedValue(true),
+  finishApplicationTask: vi.fn().mockResolvedValue(undefined),
+  needsUserTakeover: vi.fn().mockReturnValue(false),
 }));
 
 vi.mock("../db/budget.js", () => ({
@@ -115,6 +120,7 @@ describe("apply-queue (unit — mocked)", () => {
   it("can enqueue a task", async () => {
     const mod = await import("./apply-queue.js");
     const job = await mod.applyQueue.add("test", {
+      applicationTaskId: "application-task-1",
       jobId: "job-1",
       userId: "user-1",
       applyUrl: "https://example.com/jobs/1",
@@ -130,6 +136,7 @@ describe("apply-queue (unit — mocked)", () => {
 
     await mockProcessor({
       data: {
+        applicationTaskId: "application-task-1",
         jobId: "job-1",
         userId: "user-1",
         applyUrl: "https://example.com/jobs/123/apply",

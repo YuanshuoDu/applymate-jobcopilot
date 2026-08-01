@@ -2,6 +2,9 @@ import { describe, expect, it, vi } from 'vitest'
 import type { ApplicationPackage, PipelineCtx } from '../types'
 
 vi.mock('@/lib/db', () => ({ db: {} }))
+vi.mock('../application-control', () => ({
+  holdForApplicationReview: vi.fn().mockResolvedValue({ id: 'application_task_1' }),
+}))
 
 import { runGate } from './gate'
 
@@ -31,16 +34,16 @@ function packageFor(score: number, tailoredResumeId?: string): ApplicationPackag
 }
 
 describe('runGate', () => {
-  it('approves a threshold-matching tailored resume in unattended autopilot mode', async () => {
+  it('keeps a threshold-matching tailored resume in review even when autopilot is configured', async () => {
     const result = await runGate([packageFor(75, 'tailored_1')], context())
-    expect(result.data?.approved).toHaveLength(1)
-    expect(result.data?.pending).toHaveLength(0)
+    expect(result.data?.approved).toHaveLength(0)
+    expect(result.data?.pending).toHaveLength(1)
   })
 
-  it('does not let a below-threshold tailored resume bypass an unattended policy', async () => {
+  it('keeps a below-threshold tailored resume available for review', async () => {
     const result = await runGate([packageFor(49, 'tailored_1')], context())
     expect(result.data?.approved).toHaveLength(0)
-    expect(result.data?.skipped).toHaveLength(1)
+    expect(result.data?.pending).toHaveLength(1)
   })
 
   it('keeps a below-threshold tailored resume available for review outside autopilot', async () => {

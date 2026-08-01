@@ -15,6 +15,7 @@ function getApplyQueue(): Queue {
 }
 
 export interface EnqueueApplyInput {
+  applicationTaskId: string;
   jobId: string;
   userId: string;
   applyUrl: string;

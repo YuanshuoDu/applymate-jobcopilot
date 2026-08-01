@@ -115,6 +115,7 @@ export async function runAgentPipeline(input: AgentPipelineRunInput): Promise<Ru
   try {
     const report = await runPipeline({
       userId: input.userId,
+      sessionId: recorder.sessionId,
       agentCfg: effectiveConfig,
       roleConfigs,
       resumeText: resumeToText(resume.content as unknown as ResumeContent).slice(0, 2500),
@@ -125,7 +126,9 @@ export async function runAgentPipeline(input: AgentPipelineRunInput): Promise<Ru
         basicsDetached: resume.basicsDetached ?? false,
       },
       aiConfig: input.aiConfig,
-      autonomous: input.autonomous || Boolean(overrides?.autoApply && !overrides.requireApproval),
+      // Automation can discover and prepare unattended, but may never bypass
+      // the per-application review and submit authorization checkpoints.
+      autonomous: input.autonomous,
       emit,
     });
     await finalize("completed", report);

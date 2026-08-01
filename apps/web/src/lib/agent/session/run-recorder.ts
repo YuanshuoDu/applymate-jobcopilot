@@ -82,6 +82,18 @@ export function mapPipelineEventToTranscript(event: string, data: unknown): Tran
     }
   }
 
+  if (event === "application_review_ready") {
+    const approval = data && typeof data === "object"
+      ? (data as { approval?: { title?: string; body?: string } }).approval
+      : undefined
+    return {
+      type: "approval_request",
+      speaker: "Reviewer",
+      title: approval?.title ?? "Application review required",
+      body: approval?.body ?? "Review this application before requesting submission authorization.",
+    }
+  }
+
   if (event === "agent_plan") {
     return {
       type: "orchestrator_plan",

@@ -530,7 +530,7 @@ export function AgentPage() {
                 {[
                   { label: 'Daily limit',   value: String(cfg.maxPerDay) },
                   { label: 'Min score',     value: `${cfg.minScore}%` },
-                  { label: 'Auto-apply',    value: cfg.autoApply ? 'On' : 'Off' },
+                  { label: 'Auto-prepare',  value: cfg.autoApply ? 'On' : 'Off' },
                   { label: 'Cover letter',  value: cfg.autoCoverLetter ? 'On' : 'Off' },
                 ].map((s, i) => (
                   <div key={s.label} style={{ textAlign: 'center', padding: '0 16px', borderRight: i < 3 ? '0.5px solid var(--border)' : 'none' }}>
@@ -601,9 +601,9 @@ export function AgentPage() {
           </div>
 
           <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
-            <ConfigCard title="Auto-Apply Settings">
-              <Toggle label="Auto-apply when match ≥ min score" sub="Queues a background application only when manual review is off; LinkedIn and Indeed stay excluded." value={cfg.autoApply} onChange={v => set('autoApply', v)} />
-              <Toggle label="Require manual review" sub="When enabled, jobs stay in Review and unattended submission is disabled." value={cfg.requireReview} onChange={v => set('requireReview', v)} />
+            <ConfigCard title="Application Agent Settings">
+              <Toggle label="Auto-prepare when match ≥ min score" sub="Searches, scores, and prepares materials in parallel; it never submits a job." value={cfg.autoApply} onChange={v => set('autoApply', v)} />
+              <Toggle label="Review and final authorization" sub="Always required before a browser task starts. CAPTCHA, login, and MFA require your takeover." value={true} onChange={() => {}} />
               <Toggle label="Auto-generate cover letter" sub="AI writes a tailored cover letter per job" value={cfg.autoCoverLetter} onChange={v => set('autoCoverLetter', v)} />
               {cfg.autoCoverLetter && (
                 <div style={{ padding: '10px 0', borderBottom: '0.5px solid var(--border)', display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>

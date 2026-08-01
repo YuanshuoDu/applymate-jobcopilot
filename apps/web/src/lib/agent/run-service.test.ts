@@ -21,7 +21,7 @@ vi.mock("@/lib/db", () => ({
 }));
 vi.mock("@/lib/agent/pipeline", () => ({ runPipeline: mocks.runPipeline }));
 vi.mock("@/lib/agent/session/run-recorder", () => ({
-  createRunSessionRecorder: vi.fn().mockResolvedValue({ record: mocks.record, finalize: mocks.finalize }),
+  createRunSessionRecorder: vi.fn().mockResolvedValue({ sessionId: "session_1", record: mocks.record, finalize: mocks.finalize }),
 }));
 vi.mock("@/lib/agent/role-config", () => ({
   loadRoleConfigs: mocks.loadRoleConfigs,
@@ -56,7 +56,7 @@ describe("runAgentPipeline", () => {
     mocks.runPipeline.mockResolvedValue({ processed: 1, queued: 1, applied: 0, pending: 0, skipped: 0, failed: 0, durationMs: 10 });
   });
 
-  it("uses the saved automation snapshot and authorizes its unattended policy", async () => {
+  it("uses the saved automation snapshot but preserves the per-job authorization boundary", async () => {
     const { runAgentPipeline } = await import("./run-service");
     await runAgentPipeline({
       userId: "user_1", sessionId: "session_1", autonomous: false,
@@ -64,7 +64,8 @@ describe("runAgentPipeline", () => {
     });
 
     expect(mocks.runPipeline).toHaveBeenCalledWith(expect.objectContaining({
-      autonomous: true,
+      autonomous: false,
+      sessionId: "session_1",
       agentCfg: expect.objectContaining({
         targetRoles: ["Backend Engineer"], targetLocations: ["Berlin"], minMatchScore: 85,
         dailyLimit: 4, autoApply: true, requireApproval: false,

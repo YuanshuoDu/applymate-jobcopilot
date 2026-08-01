@@ -1,10 +1,12 @@
 import { NextRequest } from "next/server"
+import { Prisma } from "@prisma/client"
 import { db } from "@/lib/db"
 import { err, isErrorResponse, ok, requireAuth } from "@/lib/api-helpers"
 import { nextRunAtFromCron } from "@/lib/agent/automation-schedule"
 import { updateAgentSession } from "@/lib/agent/session/repository"
 import { loadUserAiConfig } from "@/lib/model-router"
 import { tailorResumeForAgent } from "@/lib/agent/resume-tailoring"
+import { queueAutonomousApplication } from "@/lib/auto-apply"
 
 interface RouteCtx {
   params: Promise<{ id: string }>
@@ -293,6 +295,94 @@ export async function POST(req: NextRequest, ctx: RouteCtx) {
     return ok({ event: serializeEvent(event) })
   }
 
+  if (approval?.type === "review_application") {
+    const payload = applicationPayload(approval.payload)
+    if (!payload) return err("Application review is missing its task.", 400)
+    if (action.decision !== "approved") {
+      await db.applicationTask.updateMany({
+        where: { id: payload.applicationTaskId, userId: auth.userId, jobId: payload.jobId },
+        data: { status: "cancelled", checkpoint: "review_declined", completedAt: new Date() },
+      })
+      await db.applicationTaskEvent.create({
+        data: { taskId: payload.applicationTaskId, type: "review_declined", actor: "user", body: action.body },
+      })
+    } else {
+      const task = await db.applicationTask.updateMany({
+        where: { id: payload.applicationTaskId, userId: auth.userId, jobId: payload.jobId, status: "waiting_for_user" },
+        data: { status: "waiting_for_authorization", checkpoint: "final_submit_authorization", question: Prisma.DbNull },
+      })
+      if (task.count !== 1) return err("Application is no longer at the review checkpoint.", 409)
+      const job = await db.job.findFirst({ where: { id: payload.jobId, userId: auth.userId }, select: { company: true, role: true } })
+      if (!job) return err("Job not found", 404)
+      const submitApproval = await db.agentApproval.create({
+        data: {
+          sessionId: id,
+          userId: auth.userId,
+          type: "submit_application",
+          status: "pending",
+          title: `Final submission authorization: ${job.company} · ${job.role}`,
+          body: "This is the final external action. Approve only if this job is correct, the materials match it, and every answer is true and complete.",
+          impact: { externalSubmission: true, jobId: payload.jobId },
+          payload,
+        },
+      })
+      const reviewEvent = await db.agentTranscriptEvent.create({
+        data: {
+          sessionId: id, taskId: null, type: "approval_request", speaker: "Executor",
+          title: submitApproval.title, body: submitApproval.body,
+          data: { approval: submitApproval }, durationMs: null,
+        },
+      })
+      await db.applicationTaskEvent.create({
+        data: { taskId: payload.applicationTaskId, type: "final_authorization_requested", actor: "reviewer", body: submitApproval.body },
+      })
+      await updateAgentSession(db, { sessionId: id, status: "waiting_for_user", completedAt: null })
+      return ok({ event: serializeEvent(reviewEvent) })
+    }
+  }
+
+  if (action.decision === "approved" && approval?.type === "submit_application") {
+    const payload = applicationPayload(approval.payload)
+    if (!payload) return err("Submission authorization is missing its task.", 400)
+    const job = await db.job.findFirst({ where: { id: payload.jobId, userId: auth.userId }, select: { url: true } })
+    if (!job) return err("Job not found", 404)
+    try {
+      const queued = await queueAutonomousApplication({
+        userId: auth.userId,
+        jobId: payload.jobId,
+        applyUrl: job.url,
+        applicationTaskId: payload.applicationTaskId,
+        approvalId: action.approvalId!,
+      })
+      const event = await db.agentTranscriptEvent.create({
+        data: { sessionId: id, taskId: null, type: "application_queued", speaker: "Executor", title: "Submission queued", body: "Your approved application was queued for background execution.", data: { ...queued, jobId: payload.jobId }, durationMs: null },
+      })
+      await updateAgentSession(db, { sessionId: id, status: "completed", completedAt: new Date() })
+      return ok({ event: serializeEvent(event) })
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Could not queue the approved application."
+      await db.applicationTask.updateMany({ where: { id: payload.applicationTaskId, userId: auth.userId }, data: { status: "waiting_for_authorization", checkpoint: "queue_retry", error: message } })
+      return err(message, 409)
+    }
+  }
+
+  if (approval?.type === "submit_application") {
+    const payload = applicationPayload(approval.payload)
+    if (payload) {
+      await db.applicationTask.updateMany({
+        where: { id: payload.applicationTaskId, userId: auth.userId, jobId: payload.jobId, status: "waiting_for_authorization" },
+        data: {
+          status: action.decision === "cancelled" ? "cancelled" : "waiting_for_user",
+          checkpoint: action.decision === "cancelled" ? "submission_cancelled" : "review_requested",
+          completedAt: action.decision === "cancelled" ? new Date() : null,
+        },
+      })
+      await db.applicationTaskEvent.create({
+        data: { taskId: payload.applicationTaskId, type: `submission_${action.decision}`, actor: "user", body: action.body },
+      })
+    }
+  }
+
   const event = await db.agentTranscriptEvent.create({
     data: {
       sessionId: id,
@@ -323,4 +413,11 @@ function resumeTailoringPayload(value: unknown) {
   const resumeId = text(payload.resumeId)
   const jobId = text(payload.jobId)
   return resumeId && jobId ? { resumeId, jobId } : null
+}
+
+function applicationPayload(value: unknown) {
+  const payload = value && typeof value === "object" ? value as Record<string, unknown> : {}
+  const applicationTaskId = text(payload.applicationTaskId)
+  const jobId = text(payload.jobId)
+  return applicationTaskId && jobId ? { applicationTaskId, jobId } : null
 }
