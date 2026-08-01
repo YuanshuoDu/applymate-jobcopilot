@@ -46,6 +46,7 @@ function serializeSession(session: {
     question: unknown | null
     job: { company: string; role: string }
   }>
+  execution: { id: string; status: string; checkpoint: string; error: string | null; attemptCount: number } | null
 }) {
   return {
     ...session,
@@ -62,6 +63,7 @@ function serializeSession(session: {
       createdAt: approval.createdAt.toISOString(),
     })),
     applicationTasks: session.applicationTasks,
+    execution: session.execution,
   }
 }
 
@@ -111,6 +113,7 @@ export async function GET(req: NextRequest, ctx: RouteCtx) {
         take: 20,
         select: { id: true, status: true, checkpoint: true, error: true, question: true, job: { select: { company: true, role: true } } },
       },
+      execution: { select: { id: true, status: true, checkpoint: true, error: true, attemptCount: true } },
     },
   })
 

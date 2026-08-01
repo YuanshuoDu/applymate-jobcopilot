@@ -52,8 +52,27 @@ export interface PipelineCtx {
   resumeContent: ResumeContent  // structured resume for cover-letter generation
   defaultResume: { id: string; name: string; templateId: string | null; templateOptions: unknown; directionId: string | null; basicsDetached: boolean }
   aiConfig:      AiConfig       // fallback global config
-  autonomous:    boolean        // true = never pause, make all decisions automatically
+  autonomous:    boolean        // may work unattended, but never bypasses a required user decision
   emit:          (event: string, data: unknown) => void
+  /** Last durable stage snapshot, loaded after a worker/service restart. */
+  resumeState?:  PipelineCheckpointState
+  /** Program-owned persistence hook; models never receive or control it. */
+  checkpoint?:   (state: PipelineCheckpointState) => Promise<void>
+}
+
+export type PipelineStage = "scout" | "analyze" | "prepare" | "gate" | "execute" | "audit" | "completed"
+
+/** Serializable stage boundary. All values are saved only after a stage succeeds. */
+export interface PipelineCheckpointState {
+  nextStage: PipelineStage
+  scoutedJobs?: Job[]
+  scoredJobs?: ScoredJob[]
+  preparedPackages?: ApplicationPackage[]
+  gateOutput?: GateOutput
+  executeOutput?: ExecuteOutput
+  analysisFailed?: number
+  report?: RunReport
+  startedAt?: string
 }
 
 // ── Generic stage result ──────────────────────────────────────────────────────

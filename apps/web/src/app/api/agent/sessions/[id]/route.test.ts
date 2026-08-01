@@ -72,6 +72,7 @@ describe("agent session detail API", () => {
         },
       ],
       applicationTasks: [],
+      execution: null,
     })
     const { GET } = await import("./route")
 
@@ -112,6 +113,7 @@ describe("agent session detail API", () => {
           },
         ],
         applicationTasks: [],
+        execution: null,
       },
     })
     expect(mocks.findFirst).toHaveBeenCalledWith({
@@ -162,6 +164,7 @@ describe("agent session detail API", () => {
             job: { select: { company: true, role: true } },
           },
         },
+        execution: { select: { id: true, status: true, checkpoint: true, error: true, attemptCount: true } },
       },
     })
   })

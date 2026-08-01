@@ -3,6 +3,7 @@ import { db } from "@/lib/db"
 import { err, ok } from "@/lib/api-helpers"
 import { nextRunAfterCurrent } from "@/lib/agent/automation-schedule"
 import { enqueueAgentRun } from "@/lib/agent-run-queue-client"
+import { ensureAgentExecution } from "@/lib/agent/execution-control"
 
 type AutomationForRun = {
   id: string
@@ -73,7 +74,9 @@ async function startAutomation(automation: AutomationForRun, now: Date) {
   })
 
   try {
+    const execution = await ensureAgentExecution({ userId: automation.userId, sessionId: session.id })
     const taskId = await enqueueAgentRun({ userId: automation.userId, sessionId: session.id })
+    await db.agentExecution.update({ where: { id: execution.id }, data: { workerTaskId: taskId } })
     await db.agentTranscriptEvent.create({
       data: {
         sessionId: session.id,
@@ -86,7 +89,7 @@ async function startAutomation(automation: AutomationForRun, now: Date) {
         durationMs: null,
       },
     })
-    return { automationId: automation.id, sessionId: session.id, taskId }
+    return { automationId: automation.id, sessionId: session.id, executionId: execution.id, taskId }
   } catch (error) {
     const message = error instanceof Error ? error.message : "Could not dispatch automation"
     await Promise.allSettled([

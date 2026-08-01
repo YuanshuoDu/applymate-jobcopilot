@@ -28,6 +28,7 @@ function SessionFocusPanelInner({ sessionId }: { sessionId: string }) {
   const tasks = session?.tasks ?? []
   const approvals = session?.approvals ?? []
   const applicationTasks = session?.applicationTasks ?? []
+  const execution = session?.execution
   const queuedTasks = tasks.filter(task => ['queued', 'running', 'retrying', 'waiting_for_user'].includes(task.status))
   const visibleTasks = queuedTasks.length > 0 ? queuedTasks : tasks.slice(-4)
   const pendingApprovals = approvals.filter(approval => approval.status === 'pending')
@@ -41,6 +42,14 @@ function SessionFocusPanelInner({ sessionId }: { sessionId: string }) {
 
   async function cancelApplicationTask(id: string) {
     const response = await fetch(`/api/agent/application-tasks?id=${encodeURIComponent(id)}`, { method: 'DELETE' })
+    if (response.ok) {
+      await refetch()
+      window.dispatchEvent(new Event('applymate:sessions-changed'))
+    }
+  }
+
+  async function cancelExecution(id: string) {
+    const response = await fetch(`/api/agent/executions?id=${encodeURIComponent(id)}`, { method: 'DELETE' })
     if (response.ok) {
       await refetch()
       window.dispatchEvent(new Event('applymate:sessions-changed'))
@@ -102,6 +111,18 @@ function SessionFocusPanelInner({ sessionId }: { sessionId: string }) {
           </div>
           )
         })}
+      </Section>
+
+      <Section title="Execution Control">
+        {!loading && !execution && <EmptyText>No durable execution has started for this session.</EmptyText>}
+        {execution && <div style={rowStyle}>
+          <div style={{ minWidth: 0, flex: 1 }}>
+            <div style={rowTitleStyle}>{execution.status} · {execution.checkpoint}</div>
+            <div style={rowMetaStyle}>attempt {execution.attemptCount}</div>
+            {execution.error && <div style={{ ...rowMetaStyle, color: '#b91c1c' }}>{execution.error}</div>}
+          </div>
+          {!['completed', 'failed', 'cancelled'].includes(execution.status) && <button onClick={() => { void cancelExecution(execution.id) }} style={{ fontSize: 9, color: '#b91c1c', border: '1px solid var(--border)', background: 'transparent', borderRadius: 5, padding: '3px 5px', cursor: 'pointer' }}>Cancel run</button>}
+        </div>}
       </Section>
 
       <Section title="Session Quality">

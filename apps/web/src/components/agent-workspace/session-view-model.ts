@@ -59,6 +59,7 @@ export interface AgentSessionDetail {
     question: unknown | null
     job: { company: string; role: string }
   }>
+  execution: { id: string; status: string; checkpoint: string; error: string | null; attemptCount: number } | null
 }
 
 export function sessionStatusLabel(status: string): string {

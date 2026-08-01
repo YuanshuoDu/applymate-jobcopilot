@@ -42,13 +42,13 @@ describe("POST /api/internal/agent-run", () => {
     expect(mocks.runAgentPipeline).not.toHaveBeenCalled();
   });
 
-  it("runs only the named automation session with the auto-apply model configuration", async () => {
+  it("runs the named owned session with the auto-apply model configuration", async () => {
     const { POST } = await import("./route");
     const response = await POST(request({ "x-agent-worker-secret": "worker-secret" }) as never);
 
     expect(response.status).toBe(200);
     expect(mocks.findFirst).toHaveBeenCalledWith({
-      where: { id: "session_1", userId: "user_1", source: "automation" }, select: { id: true },
+      where: { id: "session_1", userId: "user_1" }, select: { id: true },
     });
     expect(mocks.runAgentPipeline).toHaveBeenCalledWith(expect.objectContaining({
       userId: "user_1", sessionId: "session_1", autonomous: true,

@@ -2,6 +2,9 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const mocks = vi.hoisted(() => ({
   createHistory: vi.fn(),
+  executionFindFirst: vi.fn(),
+  executionUpdateMany: vi.fn(),
+  executionUpsert: vi.fn(),
   findConfig: vi.fn(),
   findTranscript: vi.fn(),
   findResume: vi.fn(),
@@ -15,6 +18,7 @@ vi.mock("@/lib/db", () => ({
   db: {
     agentConfig: { findUnique: mocks.findConfig },
     agentRun: { create: mocks.createHistory },
+    agentExecution: { findFirst: mocks.executionFindFirst, updateMany: mocks.executionUpdateMany, upsert: mocks.executionUpsert },
     agentTranscriptEvent: { findFirst: mocks.findTranscript },
     resume: { findFirst: mocks.findResume },
   },
@@ -41,6 +45,8 @@ describe("runAgentPipeline", () => {
     vi.resetModules();
     Object.values(mocks).forEach(mock => mock.mockReset());
     mocks.createHistory.mockResolvedValue({});
+    mocks.executionUpsert.mockResolvedValue({ id: "execution_1" });
+    mocks.executionUpdateMany.mockResolvedValue({ count: 1 });
     mocks.record.mockResolvedValue({});
     mocks.finalize.mockResolvedValue({});
     mocks.findConfig.mockResolvedValue(config);

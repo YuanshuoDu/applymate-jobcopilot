@@ -1,11 +1,13 @@
 import { Prisma } from "@prisma/client";
 import { db } from "@/lib/db";
 import { runPipeline } from "@/lib/agent/pipeline";
+import { AgentPauseError } from "@/lib/agent/orchestrator";
 import { createRunSessionRecorder } from "@/lib/agent/session/run-recorder";
 import { resumeToText, type RunReport } from "@/lib/agent/types";
 import { loadRoleConfigs, toRoleConfigMap } from "@/lib/agent/role-config";
 import { pipelineAgentConfigFrom } from "@/app/api/agent/run/run-helpers";
 import { automationRunOverrides, withAutomationOverrides } from "@/lib/agent/automation-overrides";
+import { claimAgentExecution, ensureAgentExecution, finishAgentExecution, saveExecutionCheckpoint, type PipelineCheckpointState } from "@/lib/agent/execution-control";
 import type { AiConfig } from "@/lib/model-router";
 import type { ResumeContent } from "@/lib/types";
 
@@ -15,6 +17,8 @@ export interface AgentPipelineRunInput {
   userId: string;
   aiConfig: AiConfig;
   sessionId?: string;
+  /** Optional durable control-plane row supplied by the background worker. */
+  executionId?: string;
   autonomous: boolean;
   emit?: (event: string, data: unknown) => void;
 }
@@ -32,6 +36,15 @@ function pickNumber(data: unknown, keys: string[]): number | null {
 function historyStatus(report: RunReport | null, failed = false) {
   if (failed || !report) return "failed";
   return report.failed > 0 ? "partial" : "completed";
+}
+
+function checkpointState(value: unknown): PipelineCheckpointState | undefined {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined
+  const state = value as Partial<PipelineCheckpointState>
+  const stages = ["scout", "analyze", "prepare", "gate", "execute", "audit", "completed"]
+  return typeof state.nextStage === "string" && stages.includes(state.nextStage)
+    ? state as PipelineCheckpointState
+    : undefined
 }
 
 async function saveHistory(
@@ -69,6 +82,19 @@ export async function runAgentPipeline(input: AgentPipelineRunInput): Promise<Ru
     goal: input.sessionId ? "Agent Pipeline Run" : "Manual Agent Pipeline Run",
     sessionId: input.sessionId,
   });
+  const execution = input.executionId
+    ? await db.agentExecution.findFirst({ where: { id: input.executionId, userId: input.userId, sessionId: recorder.sessionId } })
+    : await ensureAgentExecution({ userId: input.userId, sessionId: recorder.sessionId })
+  if (!execution) {
+    console.warn("Agent execution was not found for the requested session")
+    return null
+  }
+  const claimed = await claimAgentExecution({ id: execution.id, userId: input.userId })
+  if (!claimed) {
+    // Duplicate BullMQ delivery, cancellation, or an already-finished session.
+    // Never run another copy of the same agent session.
+    return null
+  }
   const writes: Promise<unknown>[] = [];
   const emit = (event: string, data: unknown) => {
     events.push({ event, data, at: new Date().toISOString() });
@@ -87,6 +113,7 @@ export async function runAgentPipeline(input: AgentPipelineRunInput): Promise<Ru
   if (!agentConfig) {
     emit("error", { message: "Agent not configured. Save settings first." });
     await finalize("failed", null);
+    await finishAgentExecution({ id: execution.id, userId: input.userId, status: "failed", error: "Agent not configured" })
     await saveHistory(input.userId, events, startedAt, null, true);
     return null;
   }
@@ -107,6 +134,7 @@ export async function runAgentPipeline(input: AgentPipelineRunInput): Promise<Ru
   if (!resume) {
     emit("error", { message: "No resume found. Create a resume first." });
     await finalize("failed", null);
+    await finishAgentExecution({ id: execution.id, userId: input.userId, status: "failed", error: "No resume found" })
     await saveHistory(input.userId, events, startedAt, null, true);
     return null;
   }
@@ -130,13 +158,23 @@ export async function runAgentPipeline(input: AgentPipelineRunInput): Promise<Ru
       // the per-application review and submit authorization checkpoints.
       autonomous: input.autonomous,
       emit,
+      resumeState: checkpointState(execution.state),
+      checkpoint: async state => { await saveExecutionCheckpoint({ id: execution.id, userId: input.userId, state }) },
     });
     await finalize("completed", report);
+    await finishAgentExecution({ id: execution.id, userId: input.userId, status: "completed" })
     await saveHistory(input.userId, events, startedAt, report);
     return report;
   } catch (error) {
+    if (error instanceof AgentPauseError) {
+      await Promise.allSettled(writes)
+      await recorder.pause(`Waiting for your answer at ${error.stage}.`, error.stage as "scout" | "analyst" | "writer" | "reviewer" | "executor" | "auditor")
+      await finishAgentExecution({ id: execution.id, userId: input.userId, status: "waiting_for_user", error: null })
+      return null
+    }
     emit("error", { message: error instanceof Error ? error.message : "Agent run failed" });
     await finalize("failed", null);
+    await finishAgentExecution({ id: execution.id, userId: input.userId, status: "failed", error: error instanceof Error ? error.message : "Agent run failed" })
     await saveHistory(input.userId, events, startedAt, null, true);
     return null;
   }

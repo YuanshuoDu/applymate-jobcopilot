@@ -89,6 +89,7 @@ model User {
   customAgentRoles   CustomAgentRole[]
   agentRunQuestions  AgentRunQuestion[]
   agentRuns          AgentRun[]
+  agentExecutions    AgentExecution[]
   agentSessions      AgentSession[]
   applicationTasks  ApplicationTask[]
   agentAutomations   AgentAutomation[]
@@ -633,6 +634,33 @@ model AgentRun {
   @@map("agent_runs")
 }
 
+// Durable control plane for a multi-stage Agent run.  Unlike AgentRun (the
+// historical summary), this row owns cancellation, retries and the exact
+// stage snapshot required to resume after a worker or web-process restart.
+model AgentExecution {
+  id             String   @id @default(cuid())
+  userId         String
+  sessionId      String   @unique
+  status         String   @default("queued") // queued | running | waiting_for_user | paused | completed | failed | cancelled
+  checkpoint     String   @default("scout")
+  state          Json?
+  error          String?  @db.Text
+  workerTaskId   String?
+  attemptCount   Int      @default(0)
+  startedAt      DateTime?
+  completedAt    DateTime?
+  cancelledAt    DateTime?
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  user    User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+  session AgentSession @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+
+  @@index([userId, status, updatedAt(sort: Desc)])
+  @@index([status, updatedAt])
+  @@map("agent_executions")
+}
+
 model AgentSession {
   id            String    @id @default(cuid())
   userId        String
@@ -651,6 +679,7 @@ model AgentSession {
   transcript AgentTranscriptEvent[]
   approvals  AgentApproval[]
   applicationTasks ApplicationTask[]
+  execution AgentExecution?
 
   @@index([userId, createdAt(sort: Desc)])
   @@index([userId, status])

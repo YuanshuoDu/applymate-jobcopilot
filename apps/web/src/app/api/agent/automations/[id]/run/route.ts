@@ -2,6 +2,8 @@ import { NextRequest } from "next/server"
 import { db } from "@/lib/db"
 import { err, isErrorResponse, ok, requireAuth } from "@/lib/api-helpers"
 import { nextRunAfterCurrent } from "@/lib/agent/automation-schedule"
+import { enqueueAgentRun } from "@/lib/agent-run-queue-client"
+import { ensureAgentExecution } from "@/lib/agent/execution-control"
 
 type RouteCtx = { params: Promise<{ id: string }> }
 
@@ -117,8 +119,15 @@ export async function POST(req: NextRequest, ctx: RouteCtx) {
     },
   })
 
-  return ok({
-    session: serializeSession(session as SessionRow),
-    event: serializeEvent(event),
-  }, 201)
+  try {
+    const execution = await ensureAgentExecution({ userId: auth.userId, sessionId: session.id })
+    const taskId = await enqueueAgentRun({ userId: auth.userId, sessionId: session.id })
+    await db.agentExecution.update({ where: { id: execution.id }, data: { workerTaskId: taskId } })
+    return ok({ session: serializeSession(session as SessionRow), event: serializeEvent(event), executionId: execution.id, taskId }, 201)
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "Could not dispatch automation"
+    await db.agentSession.update({ where: { id: session.id }, data: { status: "failed", completedAt: new Date(), memorySummary: `Dispatch failed: ${message}` } })
+    return err(message, 503)
+  }
+
 }

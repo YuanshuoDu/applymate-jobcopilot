@@ -39,6 +39,14 @@ export interface QuestionOption {
   action?: { field: string; value: unknown }
 }
 
+/** Signals a durable pause to the program control plane; never an LLM decision. */
+export class AgentPauseError extends Error {
+  constructor(readonly questionId: string, readonly stage: string) {
+    super(`Agent is waiting for a user answer at ${stage}`)
+    this.name = "AgentPauseError"
+  }
+}
+
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 /**
@@ -96,7 +104,9 @@ export class OrchestratorAgent {
   constructor(ctx: PipelineCtx, autonomous = false) {
     this.ctx        = ctx
     this.emit       = ctx.emit
-    this.runId      = `run_${Date.now()}`
+    // A session is the durable run identity. It lets a restarted worker find
+    // the same unanswered question instead of creating another one.
+    this.runId      = ctx.sessionId ?? `run_${Date.now()}`
     this.autonomous = autonomous
   }
 
@@ -238,15 +248,27 @@ Respond ONLY in valid JSON (no markdown):
     }
   }
 
-  // ── Ask: true pause, waits for user answer ────────────────────────────────
+  // ── Ask: durable pause — worker exits and the answer endpoint requeues it ──
 
   async ask(
     stage:    string,
     question: string,
     options:  QuestionOption[],
   ): Promise<string> {
-    // Write to DB for frontend to pick up
-    const q = await db.agentRunQuestion.create({
+    const existing = await db.agentRunQuestion.findFirst({
+      where: { userId: this.ctx.userId, runId: this.runId, stage },
+      orderBy: { createdAt: "desc" },
+    })
+    if (existing?.answer) {
+      this.emit('orchestrator_answer_received', {
+        id: existing.id, stage, answer: existing.answer,
+        label: options.find(option => option.value === existing.answer)?.label ?? existing.answer,
+      })
+      this.history.push(`[Ask/${stage}] USER: ${existing.answer}`)
+      return existing.answer
+    }
+
+    const q = existing ?? await db.agentRunQuestion.create({
       data: {
         userId:    this.ctx.userId,
         runId:     this.runId,
@@ -265,34 +287,7 @@ Respond ONLY in valid JSON (no markdown):
       options,
     })
 
-    // True pause: poll DB until answered or 5 min timeout
-    const deadline = Date.now() + 5 * 60_000
-    while (Date.now() < deadline) {
-      await new Promise(r => setTimeout(r, 2000)) // poll every 2s
-      const updated = await db.agentRunQuestion.findUnique({
-        where:  { id: q.id },
-        select: { answer: true },
-      })
-      if (updated?.answer) {
-        this.emit('orchestrator_answer_received', {
-          id:       q.id,
-          stage,
-          answer:   updated.answer,
-          label:    options.find(o => o.value === updated.answer)?.label ?? updated.answer,
-        })
-        this.history.push(`[Ask/${stage}] USER: ${updated.answer}`)
-        return updated.answer
-      }
-    }
-
-    // Timeout is an explicit non-decision. Callers can safely carry on with
-    // non-mutating work, but must never treat this as authorization.
-    const fallback = 'defer'
-    this.emit('orchestrator_thinking', {
-      stage, thinking: '等待用户回复超时；保留为待处理，未执行任何授权操作。',
-    })
-    this.history.push(`[Ask/${stage}] DEFERRED`)
-    return fallback
+    throw new AgentPauseError(q.id, stage)
   }
 
   // ── Apply fix from retry decision ──────────────────────────────────────────

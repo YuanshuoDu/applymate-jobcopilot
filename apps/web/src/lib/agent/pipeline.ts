@@ -20,7 +20,7 @@ import { runAudit                  } from './stages/audit'
 import { recordRoleRun, ROLE_META  } from './role-config'
 import { runCustomAgents           } from './stages/custom'
 import { OrchestratorAgent         } from './orchestrator'
-import type { PipelineCtx, RunReport, ScoredJob } from './types'
+import type { ApplicationPackage, ExecuteOutput, GateOutput, PipelineCheckpointState, PipelineCtx, RunReport, ScoredJob } from './types'
 import { emptyReport } from './types'
 
 export type { PipelineCtx }
@@ -35,27 +35,39 @@ function emitRole(ctx: PipelineCtx, role: string, event: 'start' | 'done', extra
   }
 }
 
+const STAGE_ORDER = { scout: 0, analyze: 1, prepare: 2, gate: 3, execute: 4, audit: 5, completed: 6 } as const
+
+function needsStage(state: PipelineCheckpointState, stage: keyof typeof STAGE_ORDER) {
+  return STAGE_ORDER[state.nextStage] <= STAGE_ORDER[stage]
+}
+
 export async function runPipeline(ctx: PipelineCtx): Promise<RunReport> {
   const t0   = Date.now()
   const orch = new OrchestratorAgent(ctx, ctx.autonomous ?? false)
   const { emit } = ctx
+  let state: PipelineCheckpointState = ctx.resumeState ?? { nextStage: 'scout', startedAt: new Date().toISOString() }
+  const persist = async (nextStage: PipelineCheckpointState['nextStage'], patch: Partial<PipelineCheckpointState> = {}) => {
+    state = { ...state, ...patch, nextStage }
+    await ctx.checkpoint?.(state)
+  }
 
   // ── Orchestrator: plan ─────────────────────────────────────────────────────
   await orch.plan()
 
   // ── Stage 1: Scout ─────────────────────────────────────────────────────────
+  const hasTargets = ctx.agentCfg.targetRoles.length > 0
+  let scoutedJobs = state.scoutedJobs ?? []
+  let scoutDiscovered = 0
+  if (needsStage(state, 'scout')) {
   orch.beginStage('scout', 3)
   emitRole(ctx, 'scout', 'start')
-  const hasTargets = ctx.agentCfg.targetRoles.length > 0
   emit('agent_plan', {
     role: 'scout',
     plan: hasTargets
       ? `计划：发现匹配 [${ctx.agentCfg.targetRoles.slice(0, 3).join(', ')}] 的新职位，然后加载已保存职位，应用过滤条件（排除 ${ctx.agentCfg.excludeCompanies.length} 家公司，每日上限 ${ctx.agentCfg.dailyLimit} 条）`
       : `计划：加载所有已保存职位，应用排除/去重/每日上限过滤条件`,
   })
-
-  let scoutedJobs: Awaited<ReturnType<typeof runScout>>['data'] extends { jobs: infer J } | undefined ? J : never = []
-  let scoutDiscovered = 0
+  await persist('scout')
 
   scoutLoop: while (true) {
     const attempt = orch.nextAttempt('scout')
@@ -111,7 +123,11 @@ export async function runPipeline(ctx: PipelineCtx): Promise<RunReport> {
     emit('stage_done', { stage: 'scout', count: scoutedJobs.length, durationMs: s1.metrics.durationMs })
     await recordRoleRun(ctx.userId, 'scout', { count: scoutedJobs.length, durationMs: s1.metrics.durationMs, summary: scoutSummary }).catch(() => {})
     await runCustomAgents(ctx, scoutedJobs, 'scout')
+    await persist('analyze', { scoutedJobs })
     break scoutLoop
+  }
+  } else {
+    emit('info', { message: `Resuming from ${state.nextStage}; Scout result restored (${scoutedJobs.length} jobs).` })
   }
 
   if (scoutedJobs.length === 0) {
@@ -126,15 +142,16 @@ export async function runPipeline(ctx: PipelineCtx): Promise<RunReport> {
   emit('start', { total: scoutedJobs.length })
 
   // ── Stage 2: Analyze ───────────────────────────────────────────────────────
+  let scoredJobs: ScoredJob[] = state.scoredJobs ?? []
+  let analysisFailed = state.analysisFailed ?? 0
+  if (needsStage(state, 'analyze')) {
   orch.beginStage('analyst', 2)
   emitRole(ctx, 'analyst', 'start')
   emit('agent_plan', {
     role: 'analyst',
     plan: `计划：对 ${scoutedJobs.length} 个职位逐一进行 AI 匹配评分，提取匹配/缺失关键词（最低分阈值：${ctx.agentCfg.minMatchScore}%）`,
   })
-
-  let scoredJobs: ScoredJob[] = []
-  let analysisFailed = 0
+  await persist('analyze', { scoutedJobs })
 
   analyzeLoop: while (true) {
     const attempt = orch.nextAttempt('analyst')
@@ -208,7 +225,11 @@ export async function runPipeline(ctx: PipelineCtx): Promise<RunReport> {
         ],
       })
     }
+    await persist('prepare', { scoutedJobs, scoredJobs, analysisFailed })
     break analyzeLoop
+  }
+  } else {
+    emit('info', { message: `Resuming from ${state.nextStage}; match analysis restored (${scoredJobs.length} jobs).` })
   }
 
   if (scoredJobs.length === 0) {
@@ -219,6 +240,8 @@ export async function runPipeline(ctx: PipelineCtx): Promise<RunReport> {
   }
 
   // ── Stage 3: Prepare (Writer) ──────────────────────────────────────────────
+  let preparedPackages: ApplicationPackage[] = state.preparedPackages ?? []
+  if (needsStage(state, 'prepare')) {
   orch.beginStage('writer', 2)
   emitRole(ctx, 'writer', 'start')
   const qualifiedCount = scoredJobs.filter(j => j.score >= ctx.agentCfg.minMatchScore).length
@@ -228,8 +251,8 @@ export async function runPipeline(ctx: PipelineCtx): Promise<RunReport> {
       ? `计划：为 ${qualifiedCount} 个达标职位生成定制求职信（语调：${ctx.agentCfg.coverTone || 'professional'}）`
       : `计划：为 ${qualifiedCount} 个达标职位准备申请材料`,
   })
+  await persist('prepare', { scoutedJobs, scoredJobs, analysisFailed })
 
-  let preparedPackages: Awaited<ReturnType<typeof runPrepare>>['data'] extends { packages: infer P } | undefined ? P : never = []
   let allowResumeTailoring = true
 
   // Resume tailoring creates a new candidate artifact. Keep that mutation behind
@@ -282,10 +305,16 @@ export async function runPipeline(ctx: PipelineCtx): Promise<RunReport> {
     emit('stage_done', { stage: 'prepare', count: preparedPackages.length, durationMs: s3.metrics.durationMs })
     await recordRoleRun(ctx.userId, 'writer', { count: preparedPackages.length, durationMs: s3.metrics.durationMs, summary: writerSummary }).catch(() => {})
     await runCustomAgents(ctx, scoutedJobs, 'writer')
+    await persist('gate', { scoutedJobs, scoredJobs, analysisFailed, preparedPackages })
     break prepareLoop
+  }
+  } else {
+    emit('info', { message: `Resuming from ${state.nextStage}; application materials restored (${preparedPackages.length} packages).` })
   }
 
   // ── Stage 4: Gate (Reviewer) ───────────────────────────────────────────────
+  let gateOutput: GateOutput = state.gateOutput ?? { approved: [], pending: [], skipped: [] }
+  if (needsStage(state, 'gate')) {
   orch.beginStage('reviewer', 1)
   emitRole(ctx, 'reviewer', 'start')
   const gateRule = ctx.agentCfg.autoApply && !ctx.agentCfg.requireApproval
@@ -295,8 +324,10 @@ export async function runPipeline(ctx: PipelineCtx): Promise<RunReport> {
     role: 'reviewer',
     plan: `计划：对 ${preparedPackages.length} 个申请包执行 AI 质量审查 + 分流决策。规则：${gateRule}`,
   })
+  await persist('gate', { scoutedJobs, scoredJobs, analysisFailed, preparedPackages })
 
   const s4 = await runGate(preparedPackages, ctx)
+  gateOutput = s4.data ?? gateOutput
 
   // Borderline jobs question
   const borderline = preparedPackages.filter(p => p.score >= ctx.agentCfg.minMatchScore - 5 && p.score < ctx.agentCfg.minMatchScore)
@@ -312,46 +343,52 @@ export async function runPipeline(ctx: PipelineCtx): Promise<RunReport> {
     })
   }
 
-  const reviewerSummary = `${s4.data!.approved.length} approved, ${s4.data!.pending.length} pending, ${s4.data!.skipped.length} skipped`
+  const reviewerSummary = `${gateOutput.approved.length} approved, ${gateOutput.pending.length} pending, ${gateOutput.skipped.length} skipped`
   emit('agent_reflect', {
     role: 'reviewer',
-    reflect: `审核完成：${s4.data!.approved.length} 个批准进入申请队列，${s4.data!.pending.length} 个待审核，${s4.data!.skipped.length} 个低于阈值跳过（耗时 ${(s4.metrics.durationMs / 1000).toFixed(1)}s）`,
+    reflect: `审核完成：${gateOutput.approved.length} 个批准进入申请队列，${gateOutput.pending.length} 个待审核，${gateOutput.skipped.length} 个低于阈值跳过（耗时 ${(s4.metrics.durationMs / 1000).toFixed(1)}s）`,
   })
-  emitRole(ctx, 'reviewer', 'done', { count: s4.data!.approved.length + s4.data!.pending.length, durationMs: s4.metrics.durationMs, summary: reviewerSummary, approved: s4.data!.approved.length, pending: s4.data!.pending.length })
-  emit('stage_done', { stage: 'gate', approved: s4.data!.approved.length, pending: s4.data!.pending.length, skipped: s4.data!.skipped.length, durationMs: s4.metrics.durationMs })
-  await recordRoleRun(ctx.userId, 'reviewer', { count: s4.data!.approved.length + s4.data!.pending.length, durationMs: s4.metrics.durationMs, summary: reviewerSummary }).catch(() => {})
+  emitRole(ctx, 'reviewer', 'done', { count: gateOutput.approved.length + gateOutput.pending.length, durationMs: s4.metrics.durationMs, summary: reviewerSummary, approved: gateOutput.approved.length, pending: gateOutput.pending.length })
+  emit('stage_done', { stage: 'gate', approved: gateOutput.approved.length, pending: gateOutput.pending.length, skipped: gateOutput.skipped.length, durationMs: s4.metrics.durationMs })
+  await recordRoleRun(ctx.userId, 'reviewer', { count: gateOutput.approved.length + gateOutput.pending.length, durationMs: s4.metrics.durationMs, summary: reviewerSummary }).catch(() => {})
   await runCustomAgents(ctx, scoutedJobs, 'reviewer')
 
   // Persist the internal readiness signal without inventing an employer-facing
   // "in review" application status.
-  if (s4.data!.pending.length > 0) {
-    emit('info', { message: `${s4.data!.pending.length} job(s) are ready for your review in Saved jobs` })
+  if (gateOutput.pending.length > 0) {
+    emit('info', { message: `${gateOutput.pending.length} job(s) are ready for your review in Saved jobs` })
     const { db } = await import('@/lib/db')
-    for (const pkg of s4.data!.pending) {
+    for (const pkg of gateOutput.pending) {
       await db.job.update({ where: { id: pkg.job.id }, data: { status: 'saved', workflowState: 'ready_to_apply' } }).catch(() => {})
     }
   }
 
   // Orchestrator: if nothing approved AND nothing pending, flag it
-  if (s4.data!.approved.length === 0 && s4.data!.pending.length === 0) {
+  if (gateOutput.approved.length === 0 && gateOutput.pending.length === 0) {
     emit('orchestrator_decision', {
       stage: 'reviewer', decision: 'all_skipped',
-      reason: `所有 ${s4.data!.skipped.length} 个职位均低于阈值 ${ctx.agentCfg.minMatchScore}%。建议降低阈值或完善简历。`,
+      reason: `所有 ${gateOutput.skipped.length} 个职位均低于阈值 ${ctx.agentCfg.minMatchScore}%。建议降低阈值或完善简历。`,
     })
+  }
+  await persist('execute', { scoutedJobs, scoredJobs, analysisFailed, preparedPackages, gateOutput })
+  } else {
+    emit('info', { message: `Resuming from ${state.nextStage}; review routing restored.` })
   }
 
   // ── Stage 5: Execute ───────────────────────────────────────────────────────
+  let executeOutput: ExecuteOutput = state.executeOutput ?? { queued: [], failed: [] }
+  let executorQueued: string[] = executeOutput.queued
+  let executorFailed: string[] = executeOutput.failed
+  if (needsStage(state, 'execute')) {
   orch.beginStage('executor', 3)
   emitRole(ctx, 'executor', 'start')
   emit('agent_plan', {
     role: 'executor',
-    plan: s4.data!.approved.length > 0
-      ? `计划：为 ${s4.data!.approved.length} 个批准职位准备「立即申请」队列，等待你手动确认投递`
-      : `计划：无批准职位，${s4.data!.pending.length} 个在待审核队列等待人工操作`,
+    plan: gateOutput.approved.length > 0
+      ? `计划：为 ${gateOutput.approved.length} 个批准职位准备「立即申请」队列，等待你手动确认投递`
+      : `计划：无批准职位，${gateOutput.pending.length} 个在待审核队列等待人工操作`,
   })
-
-  let executorQueued: string[] = []
-  let executorFailed: string[] = []
+  await persist('execute', { scoutedJobs, scoredJobs, analysisFailed, preparedPackages, gateOutput })
 
   executeLoop: while (true) {
     const attempt = orch.nextAttempt('executor')
@@ -361,13 +398,13 @@ export async function runPipeline(ctx: PipelineCtx): Promise<RunReport> {
       orch.emitRetry('executor', attempt, 3, `DB 写入重试（等待 ${backoffMs}ms）…`)
     }
 
-    const s5 = await runExecute(s4.data!.approved, ctx)
+    const s5 = await runExecute(gateOutput.approved, ctx)
 
     // If the queue was temporarily unavailable, retry only the failed packages.
     if (s5.data!.failed.length > 0 && attempt < 3) {
       orch.recordFailure('executor', `${s5.data!.failed.length} queue operations failed`)
       // Re-run with only the failed jobs
-      const failedPkgs = s4.data!.approved.filter(p => s5.data!.failed.includes(p.job.id))
+      const failedPkgs = gateOutput.approved.filter(p => s5.data!.failed.includes(p.job.id))
       if (failedPkgs.length > 0) {
         emit('orchestrator_fix', {
           stage: 'executor', fix: 'retry_failed_db_writes',
@@ -376,7 +413,7 @@ export async function runPipeline(ctx: PipelineCtx): Promise<RunReport> {
         // Merge results
         executorQueued = [...executorQueued, ...s5.data!.queued]
         // Override approved list to only retry failed ones
-        s4.data!.approved = failedPkgs
+        gateOutput.approved = failedPkgs
         continue
       }
     }
@@ -395,16 +432,27 @@ export async function runPipeline(ctx: PipelineCtx): Promise<RunReport> {
     emit('stage_done', { stage: 'execute', queued: executorQueued.length, durationMs: s5.metrics.durationMs })
     await recordRoleRun(ctx.userId, 'executor', { count: executorQueued.length, durationMs: s5.metrics.durationMs, summary: executorSummary }).catch(() => {})
     await runCustomAgents(ctx, scoutedJobs, 'executor')
+    executeOutput = { queued: executorQueued, failed: executorFailed }
+    await persist('audit', { scoutedJobs, scoredJobs, analysisFailed, preparedPackages, gateOutput, executeOutput })
     break executeLoop
+  }
+  } else {
+    emit('info', { message: `Resuming from ${state.nextStage}; executor outcome restored.` })
   }
 
   // ── Stage 6: Audit ─────────────────────────────────────────────────────────
+  if (!needsStage(state, 'audit')) {
+    const restored = state.report ?? emptyReport(Date.now() - t0)
+    emit('info', { message: 'Agent run was already audited; returning the persisted final report.' })
+    return restored
+  }
   orch.beginStage('auditor', 2)
   emitRole(ctx, 'auditor', 'start')
   emit('agent_plan', {
     role: 'auditor',
-    plan: `计划：核查 DB 状态，统计结果（${executorQueued.length} 已派发到无人值守 Worker / ${s4.data!.pending.length} 待审核 / ${s4.data!.skipped.length} 跳过），扫描 Gmail 邮件`,
+    plan: `计划：核查 DB 状态，统计结果（${executorQueued.length} 已派发到无人值守 Worker / ${gateOutput.pending.length} 待审核 / ${gateOutput.skipped.length} 跳过），扫描 Gmail 邮件`,
   })
+  await persist('audit', { scoutedJobs, scoredJobs, analysisFailed, preparedPackages, gateOutput, executeOutput })
 
   let auditWarnings: string[] = []
 
@@ -426,8 +474,8 @@ export async function runPipeline(ctx: PipelineCtx): Promise<RunReport> {
       processed:  scoutedJobs.length,
       applied:    0,
       queued:     executorQueued.length,
-      pending:    s4.data!.pending.length,
-      skipped:    s4.data!.skipped.length + analysisFailed,
+      pending:    gateOutput.pending.length,
+      skipped:    gateOutput.skipped.length + analysisFailed,
       failed:     executorFailed.length,
       durationMs: Date.now() - t0,
     }
@@ -469,6 +517,7 @@ export async function runPipeline(ctx: PipelineCtx): Promise<RunReport> {
     })
 
     emit('done', report)
+    await persist('completed', { scoutedJobs, scoredJobs, analysisFailed, preparedPackages, gateOutput, executeOutput, report })
     return report
   }
 

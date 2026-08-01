@@ -261,5 +261,22 @@ export async function createRunSessionRecorder(db: AgentSessionDb, input: RunSes
         memorySummary: summarizeReport(input.report),
       })
     },
+    async pause(message: string, role?: PipelineSubAgentRole) {
+      const taskId = role ? taskIdsByRole.get(role) : undefined
+      if (taskId) {
+        await completeSubAgentTask(db, {
+          taskId,
+          status: "waiting_for_user",
+          failureReason: message,
+        })
+      }
+      return updateAgentSession(db, {
+        sessionId: session.id,
+        status: "waiting_for_user",
+        ...(taskId ? { currentTaskId: taskId } : {}),
+        completedAt: null,
+        memorySummary: message,
+      })
+    },
   }
 }
