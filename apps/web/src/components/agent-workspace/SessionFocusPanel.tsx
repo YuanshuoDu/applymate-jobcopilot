@@ -26,6 +26,7 @@ function SessionFocusPanelInner({ sessionId }: { sessionId: string }) {
   const session = data?.session
   const tasks = session?.tasks ?? []
   const approvals = session?.approvals ?? []
+  const applicationTasks = session?.applicationTasks ?? []
   const queuedTasks = tasks.filter(task => ['queued', 'running', 'retrying', 'waiting_for_user'].includes(task.status))
   const visibleTasks = queuedTasks.length > 0 ? queuedTasks : tasks.slice(-4)
   const pendingApprovals = approvals.filter(approval => approval.status === 'pending')
@@ -35,6 +36,14 @@ function SessionFocusPanelInner({ sessionId }: { sessionId: string }) {
     window.addEventListener('applymate:sessions-changed', refresh)
     return () => window.removeEventListener('applymate:sessions-changed', refresh)
   }, [refetch])
+
+  async function cancelApplicationTask(id: string) {
+    const response = await fetch(`/api/agent/application-tasks?id=${encodeURIComponent(id)}`, { method: 'DELETE' })
+    if (response.ok) {
+      await refetch()
+      window.dispatchEvent(new Event('applymate:sessions-changed'))
+    }
+  }
 
   return (
     <>
@@ -54,6 +63,22 @@ function SessionFocusPanelInner({ sessionId }: { sessionId: string }) {
               <div style={rowMetaStyle}>{approval.type} · {sessionStatusLabel(approval.status)}</div>
             </div>
             <span style={{ ...badgeStyle, color: '#d97706' }}>waiting</span>
+          </div>
+        ))}
+      </Section>
+
+      <Section title="Application Tasks">
+        {!loading && applicationTasks.length === 0 && <EmptyText>No application tasks yet.</EmptyText>}
+        {applicationTasks.slice(0, 5).map(task => (
+          <div key={task.id} style={rowStyle}>
+            <div style={{ minWidth: 0, flex: 1 }}>
+              <div style={rowTitleStyle}>{task.job.company} · {task.job.role}</div>
+              <div style={rowMetaStyle}>{task.status}{task.checkpoint ? ` · ${task.checkpoint}` : ''}</div>
+              {task.error && <div style={{ ...rowMetaStyle, color: '#d97706' }}>{task.error}</div>}
+            </div>
+            {!['submitted', 'cancelled'].includes(task.status) && (
+              <button onClick={() => { void cancelApplicationTask(task.id) }} style={{ fontSize: 9, color: '#b91c1c', border: '1px solid var(--border)', background: 'transparent', borderRadius: 5, padding: '3px 5px', cursor: 'pointer' }}>Cancel</button>
+            )}
           </div>
         ))}
       </Section>

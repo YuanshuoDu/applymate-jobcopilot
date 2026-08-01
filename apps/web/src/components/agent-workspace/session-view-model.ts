@@ -51,6 +51,13 @@ export interface AgentSessionDetail {
     title: string
     createdAt: string
   }>
+  applicationTasks: Array<{
+    id: string
+    status: string
+    checkpoint: string | null
+    error: string | null
+    job: { company: string; role: string }
+  }>
 }
 
 export function sessionStatusLabel(status: string): string {

@@ -71,6 +71,7 @@ describe("agent session detail API", () => {
           createdAt: new Date("2026-06-18T08:03:00Z"),
         },
       ],
+      applicationTasks: [],
     })
     const { GET } = await import("./route")
 
@@ -110,6 +111,7 @@ describe("agent session detail API", () => {
             createdAt: "2026-06-18T08:03:00.000Z",
           },
         ],
+        applicationTasks: [],
       },
     })
     expect(mocks.findFirst).toHaveBeenCalledWith({
@@ -146,6 +148,17 @@ describe("agent session detail API", () => {
             status: true,
             title: true,
             createdAt: true,
+          },
+        },
+        applicationTasks: {
+          orderBy: { updatedAt: "desc" },
+          take: 20,
+          select: {
+            id: true,
+            status: true,
+            checkpoint: true,
+            error: true,
+            job: { select: { company: true, role: true } },
           },
         },
       },

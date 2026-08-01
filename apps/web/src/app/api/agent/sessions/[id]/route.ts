@@ -38,6 +38,13 @@ function serializeSession(session: {
     title: string
     createdAt: Date
   }>
+  applicationTasks: Array<{
+    id: string
+    status: string
+    checkpoint: string | null
+    error: string | null
+    job: { company: string; role: string }
+  }>
 }) {
   return {
     ...session,
@@ -53,6 +60,7 @@ function serializeSession(session: {
       ...approval,
       createdAt: approval.createdAt.toISOString(),
     })),
+    applicationTasks: session.applicationTasks,
   }
 }
 
@@ -96,6 +104,11 @@ export async function GET(req: NextRequest, ctx: RouteCtx) {
           title: true,
           createdAt: true,
         },
+      },
+      applicationTasks: {
+        orderBy: { updatedAt: "desc" },
+        take: 20,
+        select: { id: true, status: true, checkpoint: true, error: true, job: { select: { company: true, role: true } } },
       },
     },
   })
