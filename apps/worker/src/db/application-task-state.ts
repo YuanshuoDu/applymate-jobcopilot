@@ -69,20 +69,17 @@ export async function completeFillForReview(
   taskId: string,
   userId: string,
   jobId: string,
-): Promise<void> {
-  const current = await pool.query(
-    `SELECT "sessionId" FROM application_tasks WHERE id = $1 AND "userId" = $2 AND "jobId" = $3 AND status = 'filling'`,
-    [taskId, userId, jobId],
-  );
-  const sessionId = current.rows[0]?.sessionId as string | null | undefined;
-  if (!sessionId) throw new Error("Filled application is missing its Agent session");
-
-  await pool.query(
+): Promise<boolean> {
+  const transitioned = await pool.query<{ sessionId: string | null }>(
     `UPDATE application_tasks
        SET status = 'waiting_for_authorization', "checkpoint" = 'form_filled', error = NULL, "updatedAt" = NOW()
-     WHERE id = $1 AND "userId" = $2 AND "jobId" = $3 AND status = 'filling'`,
+     WHERE id = $1 AND "userId" = $2 AND "jobId" = $3 AND status = 'filling'
+     RETURNING "sessionId"`,
     [taskId, userId, jobId],
   );
+  if (transitioned.rowCount !== 1) return false;
+  const sessionId = transitioned.rows[0]?.sessionId;
+  if (!sessionId) throw new Error("Filled application is missing its Agent session");
   const approvalId = `approval_${randomId()}`;
   const title = "Final submission authorization";
   const body = "The form was filled without submission. Review the current job, material alignment, required answers, and any sensitive declarations before authorizing this external submission.";
@@ -108,6 +105,7 @@ export async function completeFillForReview(
     `UPDATE agent_sessions SET status = 'waiting_for_user', "completedAt" = NULL, "updatedAt" = NOW() WHERE id = $1`,
     [sessionId],
   );
+  return true;
 }
 
 export async function pauseForFormInput(

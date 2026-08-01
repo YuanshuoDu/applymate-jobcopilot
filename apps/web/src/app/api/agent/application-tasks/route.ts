@@ -26,13 +26,29 @@ export async function DELETE(req: NextRequest) {
   if (isErrorResponse(auth)) return auth
   const id = new URL(req.url).searchParams.get("id")
   if (!id) return err("Task id is required", 400)
-  const task = await db.applicationTask.findFirst({ where: { id, userId: auth.userId }, select: { id: true, status: true } })
+  const task = await db.applicationTask.findFirst({
+    where: { id, userId: auth.userId },
+    select: { id: true, sessionId: true, status: true },
+  })
   if (!task) return err("Application task not found", 404)
   if (["submitted", "cancelled"].includes(task.status)) return err("This application task cannot be cancelled", 409)
-  await db.$transaction([
+  const cancellation: Array<Prisma.PrismaPromise<unknown>> = [
     db.applicationTask.update({ where: { id }, data: { status: "cancelled", checkpoint: "cancelled_by_user", completedAt: new Date() } }),
     db.applicationTaskEvent.create({ data: { taskId: id, type: "cancelled", actor: "user", body: "User cancelled the application task." } }),
-  ])
+  ]
+  if (task.sessionId) {
+    cancellation.push(db.agentApproval.updateMany({
+      where: {
+        sessionId: task.sessionId,
+        userId: auth.userId,
+        type: "submit_application",
+        status: "pending",
+        payload: { path: ["applicationTaskId"], equals: id },
+      },
+      data: { status: "cancelled", decidedAt: new Date() },
+    }))
+  }
+  await db.$transaction(cancellation)
   return ok({ cancelled: true })
 }
 

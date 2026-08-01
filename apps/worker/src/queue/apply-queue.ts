@@ -258,7 +258,8 @@ export const applyWorker = new Worker<ApplyTaskPayload>(
             error: harnessResult.error ?? "Form filled and ready for user review.", durationMs: Date.now() - startedAt,
           });
           resultWritten = true;
-          await completeFillForReview(getPool(), applicationTaskId, userId, jobId);
+          const reviewReady = await completeFillForReview(getPool(), applicationTaskId, userId, jobId);
+          if (!reviewReady) return;
           createApplyResultNotification({ userId, jobId, jobTitle: taskCtx.jobTitle, jobCompany: taskCtx.jobCompany, status: "manual" })
             .catch((e: Error) => console.warn("[notify] in-app notification failed:", e.message));
           return;
