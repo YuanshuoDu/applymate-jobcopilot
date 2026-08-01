@@ -221,18 +221,6 @@ export async function runPipeline(ctx: PipelineCtx): Promise<RunReport> {
     await recordRoleRun(ctx.userId, 'analyst', { count: scoredJobs.length, durationMs: s2.metrics.durationMs, summary: analystSummary }).catch(() => {})
     await runCustomAgents(ctx, scoutedJobs, 'analyst')
 
-    // Orchestrator post-run question: low avg score
-    const noDescCount = scoutedJobs.filter(j => !j.description && !!j.role).length
-    if (noDescCount > 0) {
-      emit('agent_question', {
-        role: 'analyst', questionId: 'no_description_jobs',
-        question: `发现 ${noDescCount} 个职位没有职位描述，基于职位名称评分，准确度可能偏低。建议在 Jobs 页面手动添加描述。`,
-        options: [
-          { label: '✓ 继续', value: 'continue' },
-          { label: '↩ 跳过无描述职位', value: 'skip_no_desc', action: { field: 'skipNoDescription', value: true } },
-        ],
-      })
-    }
     await persist('prepare', { scoutedJobs, scoredJobs, analysisFailed })
     break analyzeLoop
   }
@@ -336,20 +324,6 @@ export async function runPipeline(ctx: PipelineCtx): Promise<RunReport> {
 
     const s4 = await runGate(preparedPackages, controlledCtx)
   gateOutput = s4.data ?? gateOutput
-
-  // Borderline jobs question
-  const borderline = preparedPackages.filter(p => p.score >= ctx.agentCfg.minMatchScore - 5 && p.score < ctx.agentCfg.minMatchScore)
-  if (borderline.length > 0) {
-    emit('agent_question', {
-      role: 'reviewer', questionId: 'borderline_threshold',
-      question: `${borderline.length} 个职位评分刚好低于阈值 ${ctx.agentCfg.minMatchScore}%（差距 1-5 分）：${borderline.slice(0, 3).map(p => `${p.job.company}(${p.score}%)`).join('、')}。是否纳入待审核？`,
-      options: [
-        { label: '⏳ 纳入待审核（推荐）', value: 'add_to_pending' },
-        { label: '✕ 跳过', value: 'skip' },
-        { label: '⬇ 降低阈值 5%', value: 'lower_threshold', action: { field: 'minMatchScore', value: Math.max(40, ctx.agentCfg.minMatchScore - 5) } },
-      ],
-    })
-  }
 
   const reviewerSummary = `${gateOutput.approved.length} approved, ${gateOutput.pending.length} pending, ${gateOutput.skipped.length} skipped`
   emit('agent_reflect', {
