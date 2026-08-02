@@ -8,6 +8,7 @@
  *   • MiniMax (MiniMax-*)    — OpenAI-compatible
  *   • Qwen (qwen*)           — OpenAI-compatible (DashScope)
  *   • Z.ai / Zhipu (glm-*)   — OpenAI-compatible
+ *   • Kimi (kimi-*)           — OpenAI-compatible (Moonshot)
  *   • Custom                 — user-supplied base URL
  */
 
@@ -23,6 +24,7 @@ export type Provider =
   | 'minimax'
   | 'qwen'
   | 'zhipu'
+  | 'kimi'
   | 'custom'
 
 export interface ModelOption {
@@ -40,85 +42,104 @@ export interface ModelOption {
 export const MODEL_CATALOGUE: ModelOption[] = [
   // ── Anthropic ──────────────────────────────────────────────
   {
-    provider: 'anthropic', model: 'claude-sonnet-4-6',
-    label: 'Claude Sonnet 4.6 ★', description: '质量与速度最均衡',
-    tier: 'standard', priceIn: 3, priceOut: 15, contextK: 200,
+    provider: 'anthropic', model: 'claude-sonnet-5',
+    label: 'Claude Sonnet 5', description: '当前速度与能力的均衡选择',
+    tier: 'premium', priceIn: 3, priceOut: 15, contextK: 1000,
   },
   {
-    provider: 'anthropic', model: 'claude-opus-4-7',
-    label: 'Claude Opus 4.7', description: '最强推理，适合复杂任务',
-    tier: 'premium', priceIn: 5, priceOut: 25, contextK: 200,
+    provider: 'anthropic', model: 'claude-fable-5',
+    label: 'Claude Fable 5', description: '当前最高能力，适合长程复杂任务',
+    tier: 'premium', priceIn: 10, priceOut: 50, contextK: 1000,
   },
 
   // ── OpenAI ────────────────────────────────────────────────
   {
     provider: 'openai', model: 'gpt-5.5',
-    label: 'GPT-5.5 ★', description: '最新旗舰，1M 上下文，强编程推理',
+    label: 'GPT-5.5', description: '稳定可用的旗舰选择',
+    tier: 'premium', priceIn: 5, priceOut: 30, contextK: 1000,
+    defaultBase: 'https://api.openai.com/v1',
+  },
+  {
+    provider: 'openai', model: 'gpt-5.6-sol',
+    label: 'GPT-5.6 Sol', description: '最新前沿能力，复杂推理与编码',
     tier: 'premium', priceIn: 5, priceOut: 30, contextK: 1050,
     defaultBase: 'https://api.openai.com/v1',
   },
   {
-    provider: 'openai', model: 'gpt-5',
-    label: 'GPT-5 ★', description: '旗舰性价比，比 5.5 便宜 4x',
-    tier: 'standard', priceIn: 1.25, priceOut: 10, contextK: 200,
+    provider: 'openai', model: 'gpt-5.6-terra',
+    label: 'GPT-5.6 Terra', description: '当前旗舰的能力与成本平衡款',
+    tier: 'premium', priceIn: 2.5, priceOut: 15, contextK: 1050,
     defaultBase: 'https://api.openai.com/v1',
   },
   {
-    provider: 'openai', model: 'gpt-5-mini',
-    label: 'GPT-5 Mini', description: '轻量快速，日常任务首选',
-    tier: 'fast', priceIn: 0.25, priceOut: 2, contextK: 200,
+    provider: 'openai', model: 'gpt-5.6-luna',
+    label: 'GPT-5.6 Luna', description: '面向高吞吐和成本敏感任务',
+    tier: 'standard', priceIn: 1, priceOut: 6, contextK: 1050,
     defaultBase: 'https://api.openai.com/v1',
   },
 
   // ── DeepSeek ──────────────────────────────────────────────
   {
     provider: 'deepseek', model: 'deepseek-v4-pro',
-    label: 'DeepSeek V4 Pro ★', description: '旗舰推理，1M 上下文，性价比极高',
-    tier: 'standard', priceIn: 0.27, priceOut: 1.1, contextK: 1000,
+    label: 'DeepSeek V4 Pro', description: '当前旗舰推理，1M 上下文',
+    tier: 'standard', priceIn: 0.435, priceOut: 0.87, contextK: 1000,
     defaultBase: 'https://api.deepseek.com/v1',
   },
   {
     provider: 'deepseek', model: 'deepseek-v4-flash',
-    label: 'DeepSeek V4 Flash', description: '极速版，1M 上下文，低延迟',
-    tier: 'fast', priceIn: 0.07, priceOut: 0.28, contextK: 1000,
+    label: 'DeepSeek V4 Flash', description: '当前低延迟版本，1M 上下文',
+    tier: 'fast', priceIn: 0.14, priceOut: 0.28, contextK: 1000,
     defaultBase: 'https://api.deepseek.com/v1',
   },
 
   // ── MiniMax ───────────────────────────────────────────────
   {
     provider: 'minimax', model: 'MiniMax-M3',
-    label: 'MiniMax M3 ★', description: '平台默认，1M 上下文，最长 512K 输出',
-    tier: 'standard', priceIn: 0.3, priceOut: 1.2, contextK: 1000,
-    // The provisioned platform key currently authorizes the .chat endpoint.
-    defaultBase: 'https://api.minimax.chat/v1',
+    label: 'MiniMax M3', description: '平台默认，当前文本旗舰',
+    tier: 'standard', priceIn: 0.6, priceOut: 2.4, contextK: 512,
+    defaultBase: 'https://api.minimax.io/v1',
   },
   {
-    provider: 'minimax', model: 'MiniMax-M2.7',
-    label: 'MiniMax M2.7', description: '旧版兼容，200K 上下文',
-    tier: 'standard', priceIn: 0.3, priceOut: 1.2, contextK: 200,
-    defaultBase: 'https://api.minimax.chat/v1',
+    provider: 'minimax', model: 'MiniMax-M2.7-highspeed',
+    label: 'MiniMax M2.7 Highspeed', description: '同等能力的低延迟版本',
+    tier: 'fast', priceIn: 0.6, priceOut: 2.4, contextK: 200,
+    defaultBase: 'https://api.minimax.io/v1',
   },
 
   // ── Qwen / 通义千问 ───────────────────────────────────────
   {
-    provider: 'qwen', model: 'qwen3-max',
-    label: 'Qwen3 Max ★', description: '阿里旗舰，256K 上下文，强推理',
-    tier: 'standard', priceIn: 0.78, priceOut: 3.9, contextK: 256,
+    provider: 'qwen', model: 'qwen3.7-plus',
+    label: 'Qwen3.7 Plus', description: '当前均衡款，支持工具调用与 1M 上下文',
+    tier: 'standard', priceIn: 0.28, priceOut: 1.12, contextK: 1000,
     defaultBase: 'https://dashscope.aliyuncs.com/compatible-mode/v1',
   },
   {
-    provider: 'qwen', model: 'qwen3.6-plus',
-    label: 'Qwen3.6 Plus', description: '新一代，面向 Agent 场景',
-    tier: 'fast', priceIn: 0.33, priceOut: 1.95, contextK: 128,
+    provider: 'qwen', model: 'qwen3.7-flash',
+    label: 'Qwen3.7 Flash', description: '当前快速经济款，适合高频任务',
+    tier: 'fast', priceIn: 0, priceOut: 0, contextK: 1000,
     defaultBase: 'https://dashscope.aliyuncs.com/compatible-mode/v1',
   },
 
   // ── Z.ai / 智谱 ───────────────────────────────────────────
   {
     provider: 'zhipu', model: 'glm-5.1',
-    label: 'GLM-5.1 ★', description: 'SWE-Bench 全球第一，200K 上下文',
+    label: 'GLM-5.1', description: '当前长程 Agent 旗舰，200K 上下文',
     tier: 'standard', priceIn: 1.05, priceOut: 3.5, contextK: 200,
-    defaultBase: 'https://open.bigmodel.cn/api/paas/v4',
+    defaultBase: 'https://api.z.ai/api/paas/v4',
+  },
+  {
+    provider: 'zhipu', model: 'glm-5-turbo',
+    label: 'GLM-5 Turbo', description: 'GLM 5 当前高速 Agent 版本',
+    tier: 'fast', priceIn: 0, priceOut: 0, contextK: 200,
+    defaultBase: 'https://api.z.ai/api/paas/v4',
+  },
+
+  // ── Kimi / Moonshot ───────────────────────────────────────
+  {
+    provider: 'kimi', model: 'kimi-k2.5',
+    label: 'Kimi K2.5', description: '当前多模态 Kimi 模型，适合复杂中文与 Agent 任务',
+    tier: 'premium', priceIn: 0, priceOut: 0, contextK: 256,
+    defaultBase: 'https://api.moonshot.ai/v1',
   },
 
   // ── Custom ────────────────────────────────────────────────
@@ -144,10 +165,9 @@ export type MiniMaxThinkingMode = 'adaptive' | 'disabled'
 export const DEFAULT_AI_CONFIG: AiConfig = {
   provider: 'minimax',
   model:    'MiniMax-M3',
-  thinking: 'adaptive',
 }
 
-/** Apply an M3 thinking policy without changing another provider or legacy model. */
+/** Apply a MiniMax M3 thinking policy without changing another provider or model. */
 export function withMiniMaxThinking(config: AiConfig, thinking: MiniMaxThinkingMode): AiConfig {
   return config.provider === 'minimax' && config.model === 'MiniMax-M3'
     ? { ...config, thinking }
@@ -158,10 +178,18 @@ export function withMiniMaxThinking(config: AiConfig, thinking: MiniMaxThinkingM
 
 /** Merge user config with server env-var fallbacks */
 export function resolveConfig(userConfig?: AiConfig | null): AiConfig & { resolvedKey: string } {
-  const cfg    = userConfig ?? DEFAULT_AI_CONFIG
-  const option = MODEL_CATALOGUE.find(m => m.provider === cfg.provider && m.model === cfg.model)
-    ?? MODEL_CATALOGUE.find(m => m.provider === cfg.provider)
-    ?? MODEL_CATALOGUE[1]  // fallback to Sonnet
+  const input  = userConfig ?? DEFAULT_AI_CONFIG
+  const exact  = MODEL_CATALOGUE.find(m => m.provider === input.provider && m.model === input.model)
+  const option = exact
+    ?? MODEL_CATALOGUE.find(m => m.provider === input.provider)
+    ?? MODEL_CATALOGUE.find(m => m.provider === 'minimax' && m.model === 'MiniMax-M3')
+    ?? MODEL_CATALOGUE[0]
+
+  // Saved settings can outlive a provider model. Do not send a retired model
+  // identifier to the provider; retain custom model IDs because they are user-owned.
+  const cfg = !exact && input.provider !== 'custom'
+    ? { ...input, provider: option.provider, model: option.model }
+    : input
 
   // API key: user's key > server env var
   const resolvedKey = cfg.apiKey?.trim()
@@ -181,6 +209,7 @@ function getServerKey(provider: Provider): string {
     case 'minimax':   return process.env.MINIMAX_API_KEY   ?? ''
     case 'qwen':      return process.env.QWEN_API_KEY      ?? ''
     case 'zhipu':     return process.env.ZHIPU_API_KEY     ?? ''
+    case 'kimi':      return process.env.KIMI_API_KEY      ?? ''
     case 'custom':    return process.env.CUSTOM_API_KEY    ?? ''
     default:          return ''
   }
@@ -302,7 +331,7 @@ async function* streamAnthropic(
   }
 }
 
-// ── OpenAI-compatible (DeepSeek / MiniMax / Qwen / Zhipu / OpenAI / Custom) ──
+// ── OpenAI-compatible (DeepSeek / MiniMax / Qwen / Z.ai / Kimi / OpenAI / Custom) ──
 
 interface OaiRequestConfig {
   base:      string
@@ -488,6 +517,7 @@ export const PROVIDER_LABELS: Record<Provider, string> = {
   minimax:   'MiniMax',
   qwen:      'Qwen / 通义千问',
   zhipu:     'Z.ai / 智谱',
+  kimi:      'Kimi / Moonshot',
   custom:    '自定义',
 }
 

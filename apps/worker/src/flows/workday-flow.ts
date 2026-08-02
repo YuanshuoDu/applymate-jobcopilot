@@ -1,7 +1,7 @@
 import type { Page } from "playwright-core";
 import type { ApplyTask } from "../harness/agent-harness.js";
 import type { HarnessResult } from "../harness/agent-harness.js";
-import { humanType, uploadResume, type FlowLogEntry } from "./helpers.js";
+import { confirmedAnswerForLabel, humanType, isSensitiveQuestion, uploadResume, type FlowLogEntry } from "./helpers.js";
 
 const SELECTORS = {
   // Step 1 — Personal info
@@ -43,7 +43,7 @@ export async function runWorkdayFlow(page: Page, task: ApplyTask): Promise<Harne
     step = 3;
 
     // Step 3: Application Questions — fill visible text inputs with persona data
-    await fillCustomQuestions(page, task.persona);
+    await fillCustomQuestions(page, task.persona, task.confirmedAnswers);
     await clickNext(page, SELECTORS.nextBtn);
     step = 4;
 
@@ -54,6 +54,9 @@ export async function runWorkdayFlow(page: Page, task: ApplyTask): Promise<Harne
 
     // Step 5: Review & Submit
     await page.waitForTimeout(2000);
+    if (task.allowSubmit === false) {
+      return { status: "manual", turns: step, error: "Form filled and ready for user review.", durationMs: Date.now() - startedAt, log, reviewReady: true };
+    }
     for (const sel of SELECTORS.submitBtn) {
       const btn = page.locator(sel).first();
       if (await btn.isVisible().catch(() => false)) {
@@ -101,7 +104,7 @@ async function clickNext(page: Page, selectors: string[]): Promise<void> {
   }
 }
 
-async function fillCustomQuestions(page: Page, persona: Record<string, string>): Promise<void> {
+async function fillCustomQuestions(page: Page, persona: Record<string, string>, confirmedAnswers?: Record<string, string>): Promise<void> {
   const fields = await page.locator('input[type="text"]:not([disabled]), textarea:not([disabled])').all();
   for (const field of fields) {
     if (!await field.isVisible().catch(() => false)) continue;
@@ -112,10 +115,13 @@ async function fillCustomQuestions(page: Page, persona: Record<string, string>):
       const lbl = id ? document.getElementById(id) : el.closest("label");
       return (lbl?.textContent ?? (el as HTMLInputElement).getAttribute("aria-label") ?? "").trim().toLowerCase();
     });
+    const confirmed = confirmedAnswerForLabel(confirmedAnswers, label);
     const key = Object.keys(persona).find((k) =>
       label.includes(k.toLowerCase()) || k.toLowerCase().includes(label)
     );
-    if (key && persona[key]) await field.fill(persona[key]);
+    if (isSensitiveQuestion(label) && !confirmed) continue;
+    const personaValue = key ? persona[key] : "";
+    if (confirmed || personaValue) await field.fill(confirmed || personaValue);
   }
 }
 

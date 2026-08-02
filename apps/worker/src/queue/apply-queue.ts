@@ -3,7 +3,7 @@ import { Redis } from "ioredis";
 import type { ApplyTaskPayload } from "@jobcopilot/shared";
 import { checkRateLimit } from "../rate-limit.js";
 import { withCloakContext } from "../cloak/pool.js";
-import { detectCaptcha, solveCaptcha } from "../cloak/captcha.js";
+import { detectCaptcha } from "../cloak/captcha.js";
 import { insertApplyResult, getPool } from "../db/apply-results.js";
 import {
   claimUnattendedSubmission,
@@ -26,6 +26,8 @@ import { notifyApplyResult } from "../notifications/notify-apply-result.js";
 import { shouldUsePattern } from "../patterns/confidence.js";
 import { replayPattern } from "../patterns/replay.js";
 import { unlinkSync } from "node:fs";
+import { claimApplicationTask, completeFillForReview, finishApplicationTask, needsUserTakeover, pauseForFormInput } from "../db/application-task-state.js";
+import { formNeedsMessage, inspectFormReviewNeeds } from "../harness/form-review.js";
 
 const redisUrl = process.env.REDIS_URL ?? "redis://localhost:6379";
 export const connection = new Redis(redisUrl, { maxRetriesPerRequest: null });
@@ -42,7 +44,7 @@ export const applyQueue = new Queue<ApplyTaskPayload>(QUEUE_NAME, {
 export const applyWorker = new Worker<ApplyTaskPayload>(
   QUEUE_NAME,
   async (job) => {
-    const { userId, jobId, applyUrl, personaId, resumePath, coverLetterPath, dryRun } =
+    const { applicationTaskId, operation, userId, jobId, applyUrl, personaId, resumePath, coverLetterPath, dryRun } =
       job.data;
 
     // Extract domain from applyUrl for per-domain rate limiting
@@ -70,38 +72,34 @@ export const applyWorker = new Worker<ApplyTaskPayload>(
     let ctx: Awaited<ReturnType<typeof loadTaskContext>> | null = null;
 
     try {
+      if (!applicationTaskId || !operation || !await claimApplicationTask(getPool(), applicationTaskId, userId, jobId)) {
+        console.warn(`[apply-worker] Skipping stale or revoked application task for job=${jobId}`);
+        return;
+      }
       // Load real persona + job data from DB
-      ctx = await loadTaskContext(getPool(), userId, jobId, applyUrl);
+      ctx = await loadTaskContext(getPool(), userId, jobId, applyUrl, applicationTaskId);
       const taskCtx = ctx; // non-null const for use inside async callbacks
 
       await Promise.race([
         withCloakContext(userId, async (page) => {
-        const submissionClaim = await claimUnattendedSubmission(getPool(), userId, jobId);
-        if (submissionClaim === "unavailable") {
-          console.warn(`[apply-worker] Skipping duplicate task for job=${jobId}; it is no longer queued.`);
-          return;
-        }
+        if (operation === "submit") {
+          const submissionClaim = await claimUnattendedSubmission(getPool(), userId, jobId);
+          if (submissionClaim === "unavailable") {
+            console.warn(`[apply-worker] Skipping duplicate task for job=${jobId}; it is no longer queued.`);
+            return;
+          }
 
-        if (submissionClaim === "uncertain") {
-          await insertApplyResult({
-            userId,
-            jobId,
-            status: "manual",
-            mode: "unattended",
-            atsType: null,
-            flowUsed: null,
-            error: UNCONFIRMED_SUBMISSION_MESSAGE,
-            durationMs: Date.now() - startedAt,
-          });
-          resultWritten = true;
-          createApplyResultNotification({
-            userId,
-            jobId,
-            jobTitle: taskCtx.jobTitle,
-            jobCompany: taskCtx.jobCompany,
-            status: "manual",
-          }).catch((e: Error) => console.warn("[notify] in-app notification failed:", e.message));
-          return;
+          if (submissionClaim === "uncertain") {
+            await insertApplyResult({
+              userId, jobId, status: "manual", mode: "unattended", atsType: null, flowUsed: null,
+              error: UNCONFIRMED_SUBMISSION_MESSAGE, durationMs: Date.now() - startedAt,
+            });
+            resultWritten = true;
+            await finishApplicationTask(getPool(), applicationTaskId, "waiting_for_user", "submission_uncertain", UNCONFIRMED_SUBMISSION_MESSAGE);
+            createApplyResultNotification({ userId, jobId, jobTitle: taskCtx.jobTitle, jobCompany: taskCtx.jobCompany, status: "manual" })
+              .catch((e: Error) => console.warn("[notify] in-app notification failed:", e.message));
+            return;
+          }
         }
 
         browserAttemptStarted = true;
@@ -127,6 +125,8 @@ export const applyWorker = new Worker<ApplyTaskPayload>(
           resumePath: taskCtx.resumeTempPath ?? resumePath,
           coverLetterPath,
           dryRun: dryRun ?? false,
+          allowSubmit: operation === "submit",
+          confirmedAnswers: taskCtx.confirmedAnswers,
         };
 
         // Detect ATS → use pre-programmed flow if available, else AI fallback
@@ -136,23 +136,17 @@ export const applyWorker = new Worker<ApplyTaskPayload>(
 
         const hasCaptcha = await detectCaptcha(page).catch(() => false);
         if (hasCaptcha) {
-          console.log("[apply-worker] CAPTCHA detected, attempting solve...");
-          const solved = await solveCaptcha(page).catch(() => false);
-          if (solved) {
-            await page.goto(taskCtx.applyUrl, {
-              waitUntil: "domcontentloaded",
-              timeout: 30_000,
-            });
-          } else {
-            harnessResult = {
-              status: "manual",
-              turns: 0,
-              error: "CAPTCHA detected and could not be solved automatically",
-              durationMs: 0,
-              log: [],
-            };
-            usedFlow = null;
-          }
+          // CAPTCHA, login and MFA are explicit human handoff boundaries.
+          // Do not use third-party solvers or attempt to bypass platform controls.
+          console.log("[apply-worker] CAPTCHA detected; requesting user takeover.");
+          harnessResult = {
+            status: "manual",
+            turns: 0,
+            error: "CAPTCHA detected. User takeover is required; no bypass was attempted.",
+            durationMs: 0,
+            log: [],
+          };
+          usedFlow = null;
         }
 
         if (harnessResult) {
@@ -195,7 +189,7 @@ export const applyWorker = new Worker<ApplyTaskPayload>(
               return null;
             });
 
-            if (pattern && shouldUsePattern(pattern)) {
+            if (operation === "submit" && pattern && shouldUsePattern(pattern)) {
               const attempts = pattern.successCount + pattern.failureCount;
               console.log(
                 `[apply-worker] Pattern cache hit: ${host}/${urlPattern} (confidence=${pattern.successCount}/${attempts})`
@@ -248,6 +242,29 @@ export const applyWorker = new Worker<ApplyTaskPayload>(
           throw new Error("Apply completed without a harness result");
         }
 
+        if (operation === "fill" && harnessResult.reviewReady) {
+          const needs = await inspectFormReviewNeeds(page);
+          const needMessage = formNeedsMessage(needs);
+          if (needMessage) {
+            await insertApplyResult({ userId, jobId, status: "manual", mode: "unattended", atsType: flow ?? "unknown", flowUsed: usedFlow, error: needMessage, durationMs: Date.now() - startedAt });
+            resultWritten = true;
+            await pauseForFormInput(getPool(), applicationTaskId, needMessage, needs);
+            createApplyResultNotification({ userId, jobId, jobTitle: taskCtx.jobTitle, jobCompany: taskCtx.jobCompany, status: "manual" })
+              .catch((e: Error) => console.warn("[notify] in-app notification failed:", e.message));
+            return;
+          }
+          await insertApplyResult({
+            userId, jobId, status: "manual", mode: "unattended", atsType: flow ?? "unknown", flowUsed: usedFlow,
+            error: harnessResult.error ?? "Form filled and ready for user review.", durationMs: Date.now() - startedAt,
+          });
+          resultWritten = true;
+          const reviewReady = await completeFillForReview(getPool(), applicationTaskId, userId, jobId);
+          if (!reviewReady) return;
+          createApplyResultNotification({ userId, jobId, jobTitle: taskCtx.jobTitle, jobCompany: taskCtx.jobCompany, status: "manual" })
+            .catch((e: Error) => console.warn("[notify] in-app notification failed:", e.message));
+          return;
+        }
+
         const durationMs = Date.now() - startedAt;
         await insertApplyResult({
           userId,
@@ -297,6 +314,14 @@ export const applyWorker = new Worker<ApplyTaskPayload>(
           'UPDATE "Job" SET status = $1, "workflowState" = $2, "appliedAt" = CASE WHEN $1 = \'applied\' THEN NOW() ELSE "appliedAt" END, "updatedAt" = NOW() WHERE id = $3 AND "userId" = $4',
           [newJobStatus, newWorkflowState, jobId, userId]
         )
+        const requiresUserTakeover = harnessResult.status === "manual" || needsUserTakeover(harnessResult.error);
+        await finishApplicationTask(
+          getPool(),
+          applicationTaskId,
+          isSubmitted ? "submitted" : requiresUserTakeover ? "waiting_for_user" : "failed",
+          isSubmitted ? "submission_verified" : requiresUserTakeover ? "user_takeover" : "execution_failed",
+          harnessResult.error ?? null,
+        );
 
         }),
         new Promise<never>((_, reject) =>
@@ -340,6 +365,15 @@ export const applyWorker = new Worker<ApplyTaskPayload>(
           jobCompany: ctx?.jobCompany ?? "Application",
           status,
         }).catch((e: Error) => console.warn("[notify] in-app notification failed:", e.message));
+      }
+      if (applicationTaskId) {
+        await finishApplicationTask(
+          getPool(),
+          applicationTaskId,
+          browserAttemptStarted ? "waiting_for_user" : "failed",
+          browserAttemptStarted ? "execution_interrupted" : "worker_failed",
+          message,
+        ).catch((stateError: Error) => console.warn("[apply-worker] Could not persist task failure:", stateError.message));
       }
       // Once a browser has started, BullMQ must not replay the task. A form
       // submit may have reached the ATS even when the worker lost its result.

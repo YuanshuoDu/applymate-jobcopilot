@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest'
-import { displayTextFromAgentStream, readAgentChatStream, readableResponseError } from './agent-chat-stream'
+import { displayTextFromAgentStream, readAgentChatStream, readableResponseError, streamAgentChat } from './agent-chat-stream'
 
 function streamFrom(text: string) {
   return new ReadableStream<Uint8Array>({
@@ -99,5 +99,25 @@ describe('agent chat stream helpers', () => {
       JSON.stringify({ error: 'Missing model' }),
       { status: 400 },
     ))).resolves.toBe('Missing model')
+  })
+
+  it('does not send a client-selected model with a normal chat request', async () => {
+    const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValueOnce(new Response(
+      streamFrom('event: text\ndata: {"delta":"Ready"}\n\n'),
+      { status: 200 },
+    ))
+
+    await streamAgentChat({
+      sessionId: null,
+      messages: [{ role: 'user', content: 'Find roles' }],
+      onSession: vi.fn(),
+      onBlock: vi.fn(),
+      onAction: vi.fn(),
+    })
+
+    expect(JSON.parse(String(fetchMock.mock.calls[0]?.[1]?.body))).toEqual({
+      messages: [{ role: 'user', content: 'Find roles' }],
+    })
+    fetchMock.mockRestore()
   })
 })

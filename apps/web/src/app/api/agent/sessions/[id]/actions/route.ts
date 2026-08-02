@@ -5,6 +5,7 @@ import { nextRunAtFromCron } from "@/lib/agent/automation-schedule"
 import { updateAgentSession } from "@/lib/agent/session/repository"
 import { loadUserAiConfig } from "@/lib/model-router"
 import { tailorResumeForAgent } from "@/lib/agent/resume-tailoring"
+import { queueApplicationFill, queueAutonomousApplication } from "@/lib/auto-apply"
 
 interface RouteCtx {
   params: Promise<{ id: string }>
@@ -293,6 +294,75 @@ export async function POST(req: NextRequest, ctx: RouteCtx) {
     return ok({ event: serializeEvent(event) })
   }
 
+  if (approval?.type === "review_application") {
+    const payload = applicationPayload(approval.payload)
+    if (!payload) return err("Application review is missing its task.", 400)
+    if (action.decision !== "approved") {
+      await db.applicationTask.updateMany({
+        where: { id: payload.applicationTaskId, userId: auth.userId, jobId: payload.jobId },
+        data: { status: "cancelled", checkpoint: "review_declined", completedAt: new Date() },
+      })
+      await db.applicationTaskEvent.create({
+        data: { taskId: payload.applicationTaskId, type: "review_declined", actor: "user", body: action.body },
+      })
+    } else {
+      const job = await db.job.findFirst({ where: { id: payload.jobId, userId: auth.userId }, select: { company: true, role: true, url: true } })
+      if (!job) return err("Job not found", 404)
+      try {
+        const queued = await queueApplicationFill({ userId: auth.userId, jobId: payload.jobId, applyUrl: job.url, applicationTaskId: payload.applicationTaskId })
+        const event = await db.agentTranscriptEvent.create({
+          data: { sessionId: id, taskId: null, type: "application_queued", speaker: "Executor", title: "Form fill queued", body: "The worker will fill this form without submitting it. Refresh this session when it is ready for final review.", data: { ...queued, jobId: payload.jobId, operation: "fill" }, durationMs: null },
+        })
+        await updateAgentSession(db, { sessionId: id, status: "running", completedAt: null })
+        return ok({ event: serializeEvent(event) })
+      } catch (error) {
+        return err(error instanceof Error ? error.message : "Could not queue the form-fill review pass.", 409)
+      }
+    }
+  }
+
+  if (action.decision === "approved" && approval?.type === "submit_application") {
+    const payload = applicationPayload(approval.payload)
+    if (!payload) return err("Submission authorization is missing its task.", 400)
+    const job = await db.job.findFirst({ where: { id: payload.jobId, userId: auth.userId }, select: { url: true } })
+    if (!job) return err("Job not found", 404)
+    try {
+      const queued = await queueAutonomousApplication({
+        userId: auth.userId,
+        jobId: payload.jobId,
+        applyUrl: job.url,
+        applicationTaskId: payload.applicationTaskId,
+        approvalId: action.approvalId!,
+      })
+      const event = await db.agentTranscriptEvent.create({
+        data: { sessionId: id, taskId: null, type: "application_queued", speaker: "Executor", title: "Submission queued", body: "Your approved application was queued for background execution.", data: { ...queued, jobId: payload.jobId }, durationMs: null },
+      })
+      await updateAgentSession(db, { sessionId: id, status: "running", completedAt: null })
+      return ok({ event: serializeEvent(event) })
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Could not queue the approved application."
+      await db.applicationTask.updateMany({ where: { id: payload.applicationTaskId, userId: auth.userId }, data: { status: "waiting_for_authorization", checkpoint: "queue_retry", error: message } })
+      return err(message, 409)
+    }
+  }
+
+  if (approval?.type === "submit_application") {
+    const payload = applicationPayload(approval.payload)
+    if (payload) {
+      await db.applicationTask.updateMany({
+        where: { id: payload.applicationTaskId, userId: auth.userId, jobId: payload.jobId, status: "waiting_for_authorization" },
+        data: {
+          status: action.decision === "cancelled" ? "cancelled" : "waiting_for_user",
+          checkpoint: action.decision === "cancelled" ? "submission_cancelled" : "review_requested",
+          completedAt: action.decision === "cancelled" ? new Date() : null,
+        },
+      })
+      await db.applicationTaskEvent.create({
+        data: { taskId: payload.applicationTaskId, type: `submission_${action.decision}`, actor: "user", body: action.body },
+      })
+    }
+  }
+
   const event = await db.agentTranscriptEvent.create({
     data: {
       sessionId: id,
@@ -323,4 +393,11 @@ function resumeTailoringPayload(value: unknown) {
   const resumeId = text(payload.resumeId)
   const jobId = text(payload.jobId)
   return resumeId && jobId ? { resumeId, jobId } : null
+}
+
+function applicationPayload(value: unknown) {
+  const payload = value && typeof value === "object" ? value as Record<string, unknown> : {}
+  const applicationTaskId = text(payload.applicationTaskId)
+  const jobId = text(payload.jobId)
+  return applicationTaskId && jobId ? { applicationTaskId, jobId } : null
 }

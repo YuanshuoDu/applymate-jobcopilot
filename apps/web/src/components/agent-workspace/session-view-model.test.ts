@@ -23,7 +23,7 @@ describe("agent session view model", () => {
 
   it("labels session statuses for the left console", () => {
     expect(sessionStatusLabel("running")).toBe("Running")
-    expect(sessionStatusLabel("waiting_user")).toBe("Approval")
+    expect(sessionStatusLabel("waiting_for_user")).toBe("Needs review")
     expect(sessionStatusLabel("completed")).toBe("Done")
     expect(sessionStatusLabel("failed")).toBe("Failed")
   })

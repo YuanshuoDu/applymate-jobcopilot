@@ -11,15 +11,14 @@
  *   1. Stage runs and returns output
  *   2. Orchestrator LLM analyzes output in context
  *   3. LLM decides: proceed | retry(fix) | ask_user | abort
- *   4. If ask_user:
- *      - autonomous=true → auto-select best option, continue
- *      - autonomous=false → write to DB, emit SSE, POLL for answer (true pause)
+ *   4. If ask_user: write to DB, emit SSE, then wait for the candidate. A
+ *      timeout is never treated as consent for a mutating choice.
  *   5. Apply decision and continue or retry
  */
 
 import { modelChat }        from '@/lib/model-router'
 import { db }               from '@/lib/db'
-import type { PipelineCtx } from './types'
+import type { AgentQuestionOption, PipelineCtx } from './types'
 import { agentConfigPatchFrom, applyAgentConfigPatch, prismaAgentConfigPatch } from './orchestrator-config'
 
 // ── Types ─────────────────────────────────────────────────────────────────────
@@ -34,10 +33,14 @@ export interface OrchestratorDecision {
   retry_fix?:    Record<string, unknown>
 }
 
-export interface QuestionOption {
-  label:   string
-  value:   string
-  action?: { field: string; value: unknown }
+export type QuestionOption = AgentQuestionOption
+
+/** Signals a durable pause to the program control plane; never an LLM decision. */
+export class AgentPauseError extends Error {
+  constructor(readonly questionId: string, readonly stage: string) {
+    super(`Agent is waiting for a user answer at ${stage}`)
+    this.name = "AgentPauseError"
+  }
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -97,7 +100,9 @@ export class OrchestratorAgent {
   constructor(ctx: PipelineCtx, autonomous = false) {
     this.ctx        = ctx
     this.emit       = ctx.emit
-    this.runId      = `run_${Date.now()}`
+    // A session is the durable run identity. It lets a restarted worker find
+    // the same unanswered question instead of creating another one.
+    this.runId      = ctx.sessionId ?? `run_${Date.now()}`
     this.autonomous = autonomous
   }
 
@@ -239,26 +244,31 @@ Respond ONLY in valid JSON (no markdown):
     }
   }
 
-  // ── Ask: true pause, waits for user answer ────────────────────────────────
+  // ── Ask: durable pause — worker exits and the answer endpoint requeues it ──
 
   async ask(
     stage:    string,
     question: string,
     options:  QuestionOption[],
   ): Promise<string> {
-    if (this.autonomous) {
-      // Never block in autonomous mode — pick first option
-      const chosen = options[0]?.value ?? 'continue'
-      this.emit('orchestrator_thinking', {
-        stage,
-        thinking: `[自主模式] 自动选择：「${options[0]?.label ?? chosen}」`,
+    const existing = await db.agentRunQuestion.findFirst({
+      // One stage can legitimately ask several questions (for example a
+      // threshold exception followed by a weak-material review). Reuse only
+      // the exact durable prompt on restart; never apply a prior answer to a
+      // different decision in the same stage.
+      where: { userId: this.ctx.userId, runId: this.runId, stage, question },
+      orderBy: { createdAt: "desc" },
+    })
+    if (existing?.answer) {
+      this.emit('orchestrator_answer_received', {
+        id: existing.id, stage, answer: existing.answer,
+        label: options.find(option => option.value === existing.answer)?.label ?? existing.answer,
       })
-      this.history.push(`[Ask/${stage}] AUTO: ${chosen}`)
-      return chosen
+      this.history.push(`[Ask/${stage}] USER: ${existing.answer}`)
+      return existing.answer
     }
 
-    // Write to DB for frontend to pick up
-    const q = await db.agentRunQuestion.create({
+    const q = existing ?? await db.agentRunQuestion.create({
       data: {
         userId:    this.ctx.userId,
         runId:     this.runId,
@@ -277,32 +287,7 @@ Respond ONLY in valid JSON (no markdown):
       options,
     })
 
-    // True pause: poll DB until answered or 5 min timeout
-    const deadline = Date.now() + 5 * 60_000
-    while (Date.now() < deadline) {
-      await new Promise(r => setTimeout(r, 2000)) // poll every 2s
-      const updated = await db.agentRunQuestion.findUnique({
-        where:  { id: q.id },
-        select: { answer: true },
-      })
-      if (updated?.answer) {
-        this.emit('orchestrator_answer_received', {
-          id:       q.id,
-          stage,
-          answer:   updated.answer,
-          label:    options.find(o => o.value === updated.answer)?.label ?? updated.answer,
-        })
-        this.history.push(`[Ask/${stage}] USER: ${updated.answer}`)
-        return updated.answer
-      }
-    }
-
-    // Timeout — pick first option as default
-    const fallback = options[0]?.value ?? 'continue'
-    this.emit('orchestrator_thinking', {
-      stage, thinking: `等待超时，自动选择默认选项：「${options[0]?.label ?? fallback}」`,
-    })
-    return fallback
+    throw new AgentPauseError(q.id, stage)
   }
 
   // ── Apply fix from retry decision ──────────────────────────────────────────
@@ -311,8 +296,8 @@ Respond ONLY in valid JSON (no markdown):
     if (typeof fix === 'string') {
       const named: Record<string, Record<string, unknown>> = {
         'no_jobs_found':              { dailyLimit: Math.min((this.ctx.agentCfg.dailyLimit ?? 10) * 2, 50) },
-        'all_scoring_failed':         { model: 'claude-haiku-4-5-20251001' },
-        'too_many_scoring_failures':  { model: 'claude-haiku-4-5-20251001' },
+        'all_scoring_failed':         { model: 'claude-sonnet-5' },
+        'too_many_scoring_failures':  { model: 'claude-sonnet-5' },
       }
       const resolved = named[fix]
       if (resolved) { this.applyFix(resolved, stage) }

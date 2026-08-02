@@ -87,18 +87,17 @@ async function runAuditModel(prompt: string, cfg: AiConfig) {
   let lastError: unknown
   for (let attempt = 0; attempt < 2; attempt++) {
     try {
-      // Keep the audit output bounded; M3 uses adaptive reasoning by default.
+      // Keep the audit output bounded for factual evidence review.
       return await modelChat([{ role: 'user', content: prompt }], cfg, 2_048)
     } catch (error) {
       lastError = error
       if (isMiniMaxReasoningExhausted(error, cfg)) {
-        // M3 can retry the same evidence audit without private reasoning. This
-        // preserves its factual-audit capability while guaranteeing final JSON.
+        // Retained M3 configurations can retry without private reasoning.
         if (cfg.model === 'MiniMax-M3') {
           return modelChat([{ role: 'user', content: prompt }], withMiniMaxThinking(cfg, 'disabled'), 2_048)
         }
-        // Keep a direct-answer fallback for users who explicitly retain M2.x.
-        return modelChat([{ role: 'user', content: prompt }], { ...cfg, model: 'MiniMax-Text-01' }, 1_800)
+        // Retry through the platform's M3 direct-answer mode.
+        return modelChat([{ role: 'user', content: prompt }], { ...cfg, model: 'MiniMax-M3', thinking: 'disabled' }, 1_800)
       }
       if (!isAbortError(error) || attempt === 1) throw error
       await new Promise(resolve => setTimeout(resolve, 750))

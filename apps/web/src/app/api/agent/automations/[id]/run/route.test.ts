@@ -5,8 +5,15 @@ const mocks = vi.hoisted(() => ({
   automationFindFirst: vi.fn(),
   automationUpdateMany: vi.fn(),
   sessionCreate: vi.fn(),
+  sessionUpdate: vi.fn(),
   transcriptCreate: vi.fn(),
+  executionUpdate: vi.fn(),
+  ensureExecution: vi.fn(),
+  enqueueAgentRun: vi.fn(),
 }))
+
+vi.mock("@/lib/agent/execution-control", () => ({ ensureAgentExecution: mocks.ensureExecution }))
+vi.mock("@/lib/agent-run-queue-client", () => ({ enqueueAgentRun: mocks.enqueueAgentRun }))
 
 vi.mock("@/lib/api-helpers", () => ({
   requireAuth: mocks.requireAuth,
@@ -21,7 +28,8 @@ vi.mock("@/lib/db", () => ({
       findFirst: mocks.automationFindFirst,
       updateMany: mocks.automationUpdateMany,
     },
-    agentSession: { create: mocks.sessionCreate },
+    agentSession: { create: mocks.sessionCreate, update: mocks.sessionUpdate },
+    agentExecution: { update: mocks.executionUpdate },
     agentTranscriptEvent: { create: mocks.transcriptCreate },
   },
 }))
@@ -79,6 +87,9 @@ describe("agent automation run API", () => {
       createdAt: new Date("2026-06-18T08:00:00Z"),
     })
     mocks.automationUpdateMany.mockResolvedValue({ count: 1 })
+    mocks.ensureExecution.mockResolvedValue({ id: "execution_1" })
+    mocks.enqueueAgentRun.mockResolvedValue("task_1")
+    mocks.executionUpdate.mockResolvedValue({})
   })
 
   it("creates an AgentSession for an owned automation run", async () => {
@@ -131,6 +142,7 @@ describe("agent automation run API", () => {
       where: { id: "automation_1", userId: "user_1", enabled: true },
       data: { lastRunAt: expect.any(Date), nextRunAt: expect.any(Date) },
     })
+    expect(mocks.enqueueAgentRun).toHaveBeenCalledWith({ userId: "user_1", sessionId: "session_1" })
   })
 
   it("returns 404 for a missing or unowned automation", async () => {

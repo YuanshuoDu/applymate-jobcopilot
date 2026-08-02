@@ -12,7 +12,7 @@ import type { ApplicationAuditFinding, ResumeContent } from '@/lib/types'
 type Params = { params: Promise<{ id: string }> }
 
 const COVER_FALLBACKS: AiConfig[] = [
-  { provider: 'deepseek', model: 'deepseek-chat' },
+  { provider: 'deepseek', model: 'deepseek-v4-pro' },
   { provider: 'minimax',  model: 'MiniMax-M3', thinking: 'disabled' },
 ]
 

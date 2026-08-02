@@ -8,9 +8,12 @@ const mocks = vi.hoisted(() => ({
   sessionUpdate: vi.fn(),
   transcriptCreate: vi.fn(),
   enqueueAgentRun: vi.fn(),
+  executionUpdate: vi.fn(),
+  ensureExecution: vi.fn(),
 }))
 
 vi.mock("@/lib/agent-run-queue-client", () => ({ enqueueAgentRun: mocks.enqueueAgentRun }))
+vi.mock("@/lib/agent/execution-control", () => ({ ensureAgentExecution: mocks.ensureExecution }))
 
 vi.mock("@/lib/api-helpers", () => ({
   ok: (data: unknown, status = 200) => Response.json(data, { status }),
@@ -25,6 +28,7 @@ vi.mock("@/lib/db", () => ({
       update: mocks.automationUpdate,
     },
     agentSession: { create: mocks.sessionCreate, update: mocks.sessionUpdate },
+    agentExecution: { update: mocks.executionUpdate },
     agentTranscriptEvent: { create: mocks.transcriptCreate },
   },
 }))
@@ -64,6 +68,8 @@ describe("agent automation due scheduler API", () => {
     mocks.automationUpdateMany.mockResolvedValue({ count: 1 })
     mocks.automationUpdate.mockResolvedValue({})
     mocks.sessionUpdate.mockResolvedValue({})
+    mocks.ensureExecution.mockResolvedValue({ id: "execution_1" })
+    mocks.executionUpdate.mockResolvedValue({})
   })
 
   afterEach(() => {

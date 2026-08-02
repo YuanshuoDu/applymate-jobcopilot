@@ -44,14 +44,62 @@ export interface AgentConfigFull {
 
 export interface PipelineCtx {
   userId:        string
+  /** Durable session that owns approvals and resumable application checkpoints. */
+  sessionId?:     string
   agentCfg:      AgentConfigFull
   roleConfigs:   RoleConfigMap  // per-role model configs
   resumeText:    string         // plain-text resume, truncated to 2500 chars
   resumeContent: ResumeContent  // structured resume for cover-letter generation
   defaultResume: { id: string; name: string; templateId: string | null; templateOptions: unknown; directionId: string | null; basicsDetached: boolean }
   aiConfig:      AiConfig       // fallback global config
-  autonomous:    boolean        // true = never pause, make all decisions automatically
+  autonomous:    boolean        // may work unattended, but never bypasses a required user decision
   emit:          (event: string, data: unknown) => void
+  /** Last durable stage snapshot, loaded after a worker/service restart. */
+  resumeState?:  PipelineCheckpointState
+  /** Program-owned persistence hook; models never receive or control it. */
+  checkpoint?:   (state: PipelineCheckpointState) => Promise<void>
+  /** Durable human-decision boundary supplied by the Orchestrator. */
+  askUser?: (stage: string, question: string, options: AgentQuestionOption[]) => Promise<string>
+}
+
+export type AgentQuestionOption = {
+  label: string
+  value: string
+  action?: { field: string; value: unknown }
+}
+
+export type PipelineStage = "scout" | "analyze" | "prepare" | "gate" | "execute" | "audit" | "completed"
+
+/** Serializable stage boundary. All values are saved only after a stage succeeds. */
+export interface PipelineCheckpointState {
+  nextStage: PipelineStage
+  scoutedJobs?: Job[]
+  scoredJobs?: ScoredJob[]
+  preparedPackages?: ApplicationPackage[]
+  gateOutput?: GateOutput
+  executeOutput?: ExecuteOutput
+  analysisFailed?: number
+  report?: RunReport
+  customAgentResults?: CustomAgentRunResult[]
+  autonomous?: boolean
+  startedAt?: string
+}
+
+export type CustomAgentObservation = {
+  jobId: string
+  company: string
+  role: string
+  summary: string
+  risks: string[]
+  recommendation: string
+  confidence: number
+}
+
+export type CustomAgentRunResult = {
+  agentId: string
+  agentName: string
+  afterStage: string
+  observations: CustomAgentObservation[]
 }
 
 // ── Generic stage result ──────────────────────────────────────────────────────
@@ -92,6 +140,7 @@ export interface AnalyzeOutput {
 
 export interface ApplicationPackage extends ScoredJob {
   coverLetter?:      string
+  coverLetterId?:    string
   tailoredKeywords?: string[]
   tailoredResumeId?: string
   tailoredResumeName?: string
@@ -104,8 +153,8 @@ export interface PrepareOutput {
 // ── Stage 4: Gate ─────────────────────────────────────────────────────────────
 
 export interface GateOutput {
-  approved: ApplicationPackage[]  // auto-apply or above threshold with no review req
-  pending:  ApplicationPackage[]  // needs human review
+  approved: ApplicationPackage[]  // reserved for a future post-fill, user-approved dispatch
+  pending:  ApplicationPackage[]  // always needs human review before submission
   skipped:  ApplicationPackage[]  // below minMatchScore
 }
 

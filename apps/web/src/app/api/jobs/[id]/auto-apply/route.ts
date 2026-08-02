@@ -1,7 +1,6 @@
 import { NextRequest } from "next/server";
 import { requireAuth, isErrorResponse, err } from "@/lib/api-helpers";
 import { db } from "@/lib/db";
-import { AutoApplyError, queueAutonomousApplication } from "@/lib/auto-apply";
 
 type Params = { params: Promise<{ id: string }> };
 
@@ -12,19 +11,11 @@ export async function POST(_req: NextRequest, { params }: Params) {
   const { id: jobId } = await params;
   const job = await db.job.findUnique({
     where: { id: jobId },
-    select: { userId: true, url: true },
+    select: { userId: true },
   });
   if (!job || job.userId !== auth.userId) return err("Not found", 404);
 
-  try {
-    const { taskId } = await queueAutonomousApplication({
-      userId: auth.userId,
-      jobId,
-      applyUrl: job.url,
-    });
-    return Response.json({ queued: true, taskId }, { status: 202 });
-  } catch (error) {
-    const message = error instanceof Error ? error.message : "Could not queue automatic submission.";
-    return err(message, error instanceof AutoApplyError ? 409 : 503);
-  }
+  // A job-page click cannot be treated as final external consent. The Agent
+  // session creates a review record and a distinct submit authorization first.
+  return err("Review and explicitly authorize this application from the Agent session before queuing it.", 409);
 }

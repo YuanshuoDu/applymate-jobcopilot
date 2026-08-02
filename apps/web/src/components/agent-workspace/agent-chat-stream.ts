@@ -7,7 +7,6 @@ interface StreamAgentChatOptions {
   sessionId: string | null
   signal?: AbortSignal
   messages: Array<{ role: 'user'; content: string }>
-  model: string
   onSession: (sessionId: string) => void
   onBlock: (type: string, data: unknown) => void
   onAction: (action: AgentChatAction) => void | Promise<void>
@@ -17,7 +16,6 @@ export async function streamAgentChat({
   sessionId,
   signal,
   messages,
-  model,
   onSession,
   onBlock,
   onAction,
@@ -28,7 +26,6 @@ export async function streamAgentChat({
     body: JSON.stringify({
       sessionId: sessionId ?? undefined,
       messages,
-      model,
     }),
   })
   if (!res.ok || !res.body) {

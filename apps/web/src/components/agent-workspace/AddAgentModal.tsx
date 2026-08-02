@@ -73,7 +73,7 @@ export function AddAgentModal({ onClose, onCreated }: {
   const [description, setDescription] = useState('')
   const [systemPrompt, setSystemPrompt] = useState('')
   const [provider, setProvider] = useState('anthropic')
-  const [model, setModel] = useState('claude-haiku-4-5-20251001')
+  const [model, setModel] = useState('claude-sonnet-5')
   const [insertAfter, setInsertAfter] = useState('auditor')
   const [saving, setSaving] = useState(false)
 

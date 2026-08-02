@@ -15,7 +15,7 @@ interface SessionsResponse {
 
 function statusColor(status: string): string {
   if (status === 'running') return 'var(--primary)'
-  if (status === 'waiting_user') return '#d97706'
+  if (status === 'waiting_for_user' || status === 'paused') return '#d97706'
   if (status === 'completed') return 'var(--c-success)'
   if (status === 'failed') return 'var(--c-danger)'
   return 'var(--text-muted)'
@@ -44,7 +44,7 @@ export function AgentSessionConsole({
   const [deletingSessionId, setDeletingSessionId] = React.useState<string | null>(null)
   const sessions = data?.sessions ?? []
   const visibleSessions = statusFilter === 'all' ? sessions : sessions.filter(session => session.status === statusFilter)
-  const pendingApprovals = sessions.filter(s => s.status === 'waiting_user').length
+  const pendingApprovals = sessions.filter(s => s.status === 'waiting_for_user').length
 
   React.useEffect(() => {
     if (refreshVersion > 0) void refetch()
@@ -117,7 +117,7 @@ export function AgentSessionConsole({
           >
             <option value="all">All</option>
             <option value="running">Run</option>
-            <option value="waiting_user">Ask</option>
+            <option value="waiting_for_user">Ask</option>
             <option value="completed">Done</option>
             <option value="failed">Fail</option>
           </select>

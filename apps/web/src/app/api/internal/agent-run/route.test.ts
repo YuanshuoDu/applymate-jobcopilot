@@ -2,11 +2,12 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const mocks = vi.hoisted(() => ({
   findFirst: vi.fn(),
+  executionFindFirst: vi.fn(),
   loadUserAiConfig: vi.fn(),
   runAgentPipeline: vi.fn(),
 }));
 
-vi.mock("@/lib/db", () => ({ db: { agentSession: { findFirst: mocks.findFirst } } }));
+vi.mock("@/lib/db", () => ({ db: { agentSession: { findFirst: mocks.findFirst }, agentExecution: { findFirst: mocks.executionFindFirst } } }));
 vi.mock("@/lib/api-helpers", () => ({
   err: (message: string, status = 400) => Response.json({ error: message }, { status }),
   ok: (data: unknown, status = 200) => Response.json(data, { status }),
@@ -30,6 +31,7 @@ describe("POST /api/internal/agent-run", () => {
     Object.values(mocks).forEach(mock => mock.mockReset());
     vi.stubEnv("AGENT_WORKER_SECRET", "worker-secret");
     mocks.findFirst.mockResolvedValue({ id: "session_1" });
+    mocks.executionFindFirst.mockResolvedValue({ state: { autonomous: true } });
     mocks.loadUserAiConfig.mockResolvedValue({ provider: "minimax", model: "MiniMax-M3", resolvedKey: "platform-key" });
     mocks.runAgentPipeline.mockResolvedValue({ processed: 1, queued: 1, applied: 0, pending: 0, skipped: 0, failed: 0, durationMs: 10 });
   });
@@ -42,13 +44,13 @@ describe("POST /api/internal/agent-run", () => {
     expect(mocks.runAgentPipeline).not.toHaveBeenCalled();
   });
 
-  it("runs only the named automation session with the auto-apply model configuration", async () => {
+  it("runs the named owned session with the auto-apply model configuration", async () => {
     const { POST } = await import("./route");
     const response = await POST(request({ "x-agent-worker-secret": "worker-secret" }) as never);
 
     expect(response.status).toBe(200);
     expect(mocks.findFirst).toHaveBeenCalledWith({
-      where: { id: "session_1", userId: "user_1", source: "automation" }, select: { id: true },
+      where: { id: "session_1", userId: "user_1" }, select: { id: true },
     });
     expect(mocks.runAgentPipeline).toHaveBeenCalledWith(expect.objectContaining({
       userId: "user_1", sessionId: "session_1", autonomous: true,

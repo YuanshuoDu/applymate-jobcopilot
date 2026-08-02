@@ -10,6 +10,8 @@ import {
   type TurnLog,
 } from "./harness-prompt.js";
 
+const SENSITIVE_FIELD = /salary|compensation|pay|visa|sponsor|work.?authori[sz]|citizen|nationality|legal|criminal|disability|gender|race|ethnic|signature|e-?sign/i;
+
 /** Config passed to AgentHarness constructor */
 export interface HarnessConfig {
   userId: string;
@@ -24,6 +26,8 @@ export type HarnessResult = Pick<ApplyResult, "status" | "error" | "durationMs">
   turns?: number;
   log?: unknown[];
   fieldMappings?: Record<string, string>;
+  /** The form was filled but intentionally not submitted. */
+  reviewReady?: boolean;
 };
 
 export interface ApplyTask {
@@ -36,6 +40,9 @@ export interface ApplyTask {
   resumePath: string;
   coverLetterPath?: string;
   dryRun?: boolean;
+  allowSubmit?: boolean;
+  /** Per-application values explicitly entered by the candidate after a pause. */
+  confirmedAnswers?: Record<string, string>;
 }
 
 const SUCCESS_URL_PATTERNS = [
@@ -84,7 +91,8 @@ export class AgentHarness {
           title: task.jobTitle,
           company: task.jobCompany,
           keywords: task.jobKeywords,
-        }
+        },
+        task.confirmedAnswers ?? {},
       );
 
       const messages: Array<{ role: string; content: string }> = [
@@ -168,10 +176,25 @@ export class AgentHarness {
 
         // ── Terminal actions ──
         if (action.type === "done") {
+          if (task.allowSubmit === false) {
+            return this.buildReviewResult(task.jobId, Date.now() - startedAt);
+          }
           return this.buildResult("submitted", task.jobId, Date.now() - startedAt, undefined, this.collectFieldMappings());
+        }
+
+        if (!isAllowedSensitiveAction(action, task.confirmedAnswers)) {
+          return this.buildResult(
+            "manual",
+            task.jobId,
+            Date.now() - startedAt,
+            "A sensitive form answer needs an explicit, matching candidate confirmation.",
+          );
         }
         if (action.type === "manual") {
           return this.buildResult("manual", task.jobId, Date.now() - startedAt, action.reasoning);
+        }
+        if (action.type === "submit" && task.allowSubmit === false) {
+          return this.buildReviewResult(task.jobId, Date.now() - startedAt);
         }
 
         // ── Execute ──
@@ -276,6 +299,13 @@ export class AgentHarness {
     };
   }
 
+  private buildReviewResult(jobId: string, durationMs: number): HarnessResult {
+    return {
+      ...this.buildResult("manual", jobId, durationMs, "Form filled and ready for user review.", this.collectFieldMappings()),
+      reviewReady: true,
+    };
+  }
+
   private collectFieldMappings(): Record<string, string> {
     const fieldMappings: Record<string, string> = {};
     for (const turn of this.turns) {
@@ -290,4 +320,12 @@ export class AgentHarness {
   private logTurn(log: TurnLog): void {
     console.log(JSON.stringify(log));
   }
+}
+
+function isAllowedSensitiveAction(action: AgentAction, confirmedAnswers: Record<string, string> | undefined): boolean {
+  if (!SENSITIVE_FIELD.test(action.field ?? "")) return true;
+  if (action.type !== "fill" && action.type !== "select") return true;
+  return Object.entries(confirmedAnswers ?? {}).some(([label, value]) =>
+    SENSITIVE_FIELD.test(label) && value === action.value,
+  );
 }

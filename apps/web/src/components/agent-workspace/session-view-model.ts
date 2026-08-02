@@ -51,13 +51,24 @@ export interface AgentSessionDetail {
     title: string
     createdAt: string
   }>
+  applicationTasks: Array<{
+    id: string
+    status: string
+    checkpoint: string | null
+    error: string | null
+    question: unknown | null
+    job: { company: string; role: string }
+  }>
+  execution: { id: string; status: string; checkpoint: string; error: string | null; attemptCount: number } | null
+  questions: Array<{ id: string; stage: string; question: string; options: unknown }>
 }
 
 export function sessionStatusLabel(status: string): string {
   const labels: Record<string, string> = {
     queued: "Queued",
     running: "Running",
-    waiting_user: "Approval",
+    waiting_for_user: "Needs review",
+    paused: "Paused",
     completed: "Done",
     failed: "Failed",
     aborted: "Aborted",

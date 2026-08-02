@@ -13,6 +13,8 @@ import type {
 } from '../types'
 import { stageOk, stageFail } from '../types'
 import { roleAiConfig } from '../role-config'
+import { forEachConcurrent } from '../concurrency'
+import { assessApplicationPreflight } from '../application-preflight'
 
 const SCORE_COLOR = (s: number) => s >= 80 ? '#3B6D11' : s >= 60 ? '#854F0B' : '#6B7280'
 
@@ -33,34 +35,75 @@ export async function runAnalyze(
   const pendingUpdates: Array<{ jobId: string; score: number; recommendation?: string }> = []
   const pendingActivities: Array<{ jobId: string; text: string; color: string }> = []
 
-  // Proactive question: jobs without descriptions
+  // A missing description weakens match quality enough that the candidate gets
+  // a durable choice. The program owns the pause; the model never assumes it
+  // may score incomplete evidence on the candidate's behalf.
   const noDescCount = jobs.filter(j => !j.description && !!j.role).length
+  let skipNoDescription = false
   if (noDescCount > 0) {
-    emit('agent_question', {
-      role:       'analyst',
-      questionId: 'no_description_jobs',
-      question:   `发现 ${noDescCount} 个职位没有职位描述。我会尝试根据职位名称和公司评分，但准确度可能偏低。建议：在 Jobs 页面为这些职位手动添加描述后再运行。是否继续？`,
-      options: [
-        { label: '✓ 继续（用职位名称评分）',   value: 'continue' },
-        { label: '↩ 跳过无描述职位',            value: 'skip_no_desc',  action: { field: 'skipNoDescription', value: true } },
-      ],
-    })
+    const question = `发现 ${noDescCount} 个职位没有职位描述。我会尝试根据职位名称和公司评分，但准确度可能偏低。建议：在 Jobs 页面为这些职位手动添加描述后再运行。是否继续？`
+    const options = [
+      { label: '✓ 继续（用职位名称评分）', value: 'continue' },
+      { label: '↩ 跳过无描述职位', value: 'skip_no_desc' },
+    ]
+    if (ctx.askUser) {
+      skipNoDescription = await ctx.askUser('analyst', question, options) === 'skip_no_desc'
+    } else {
+      emit('agent_question', { role: 'analyst', questionId: 'no_description_jobs', question, options })
+    }
   }
 
-  for (const job of jobs) {
+  await forEachConcurrent(jobs, 3, async job => {
+    const preflight = assessApplicationPreflight(job)
+    const hardPreflightIssues = preflight.issues.filter(issue => issue.code !== "missing_description")
+    await db.applicationTask?.upsert({
+      where: { userId_jobId: { userId, jobId: job.id } },
+      create: { userId, jobId: job.id, sessionId: ctx.sessionId ?? null, status: "analyzing", checkpoint: "match_analysis" },
+      update: { sessionId: ctx.sessionId ?? undefined, status: "analyzing", checkpoint: "match_analysis", error: null, completedAt: null },
+    })
     emit('job_start', { jobId: job.id, company: job.company, role: job.role })
     emit('agent_action', {
       role:   'analyst',
       action: `评分 ${job.company} · ${job.role}${job.location ? ` (${job.location})` : ''}`,
     })
 
+    // Reject automation-ineligible records before an LLM scores them or the
+    // writer creates job-specific documents. This avoids spending credits on a
+    // job-board redirect or conflicting employer data.
+    if (hardPreflightIssues.length > 0) {
+      const reason = hardPreflightIssues.map(issue => issue.message).join(" ")
+      await db.applicationTask?.updateMany({
+        where: { userId, jobId: job.id, status: 'analyzing' },
+        data: { status: 'skipped', checkpoint: 'job_preflight_failed', error: reason, completedAt: new Date() },
+      })
+      emit('job_skip', { jobId: job.id, company: job.company, role: job.role, reason })
+      emit('agent_observation', {
+        role: 'analyst',
+        observation: `⚠ 跳过 ${job.company} · ${job.role}：申请前校验未通过。${reason}`,
+      })
+      return
+    }
+
     if (!job.description && !job.role) {
+      await db.applicationTask?.updateMany({
+        where: { userId, jobId: job.id, status: 'analyzing' },
+        data: { status: 'skipped', checkpoint: 'job_data_insufficient', error: 'No job title or description available.', completedAt: new Date() },
+      })
       emit('job_skip', { jobId: job.id, company: job.company, role: job.role, reason: 'No job description available' })
       emit('agent_observation', {
         role:        'analyst',
         observation: `⚠ 跳过 ${job.company} · ${job.role}：无职位描述，无法评分`,
       })
-      continue
+      return
+    }
+
+    if (skipNoDescription && !job.description) {
+      await db.applicationTask?.updateMany({
+        where: { userId, jobId: job.id, status: 'analyzing' },
+        data: { status: 'skipped', checkpoint: 'job_description_required', error: 'Candidate chose not to score this job without a description.', completedAt: new Date() },
+      })
+      emit('job_skip', { jobId: job.id, company: job.company, role: job.role, reason: 'Candidate chose to skip jobs without descriptions' })
+      return
     }
 
     try {
@@ -101,13 +144,17 @@ export async function runAnalyze(
       failed++
       console.error('[analyze] scoring error:', err)
       const message = err instanceof Error ? err.message : 'Unknown AI scoring error'
+      await db.applicationTask?.updateMany({
+        where: { userId, jobId: job.id, status: 'analyzing' },
+        data: { status: 'failed', checkpoint: 'match_analysis_failed', error: message, completedAt: new Date() },
+      })
       emit('agent_observation', {
         role:        'analyst',
         observation: `✗ ${job.company} · ${job.role} 评分失败：${message}`,
       })
       emit('job_error', { jobId: job.id, company: job.company, role: job.role, error: message })
     }
-  }
+  })
 
   // Batch persist scores and activities
   if (pendingUpdates.length > 0) {

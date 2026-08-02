@@ -14,12 +14,14 @@
  *     skipped  — below minMatchScore
  */
 import { modelChat } from '@/lib/model-router'
+import { db } from '@/lib/db'
 import type { AiConfig } from '@/lib/model-router'
 import type {
   PipelineCtx, ApplicationPackage, GateOutput, StageResult,
 } from '../types'
 import { stageOk } from '../types'
 import { roleAiConfig } from '../role-config'
+import { holdForApplicationReview } from '../application-control'
 
 // ── AI Quality Review ─────────────────────────────────────────────────────────
 
@@ -73,7 +75,7 @@ export async function runGate(
   ctx: PipelineCtx,
 ): Promise<StageResult<GateOutput>> {
   const t0 = Date.now()
-  const { autoApply, requireApproval, minMatchScore } = ctx.agentCfg
+  let minMatchScore = ctx.agentCfg.minMatchScore
 
   const approved: ApplicationPackage[] = []
   const pending:  ApplicationPackage[] = []
@@ -81,19 +83,23 @@ export async function runGate(
 
   const { emit } = ctx
 
-  // Proactive question: borderline jobs (within 5% of threshold)
+  // Proactive question: borderline jobs (within 5% of threshold). In a
+  // controlled run this is a durable pause, not a best-effort UI suggestion.
+  let includeBorderline = false
   const borderline = packages.filter(p => p.score >= minMatchScore - 5 && p.score < minMatchScore)
   if (borderline.length > 0) {
-    emit('agent_question', {
-      role:       'reviewer',
-      questionId: 'borderline_threshold',
-      question:   `${borderline.length} 个职位评分刚好低于阈值 ${minMatchScore}%（差距 1-5 分）：${borderline.slice(0, 3).map(p => `${p.job.company}(${p.score}%)`).join('、')}${borderline.length > 3 ? '…' : ''}。是否将它们纳入待审核？`,
-      options: [
-        { label: '⏳ 纳入待审核（推荐）', value: 'add_to_pending' },
-        { label: '✕ 跳过（保持现有阈值）', value: 'skip'          },
-        { label: '⬇ 降低阈值 5%',         value: 'lower_threshold', action: { field: 'minMatchScore', value: Math.max(40, minMatchScore - 5) } },
-      ],
-    })
+    const question = `${borderline.length} 个职位评分刚好低于阈值 ${minMatchScore}%（差距 1-5 分）：${borderline.slice(0, 3).map(p => `${p.job.company}(${p.score}%)`).join('、')}${borderline.length > 3 ? '…' : ''}。是否将它们纳入待审核？`
+    const options = [
+      { label: '⏳ 纳入待审核（推荐）', value: 'add_to_pending' },
+      { label: '✕ 跳过（保持现有阈值）', value: 'skip' },
+      { label: '⬇ 降低阈值 5%', value: 'lower_threshold', action: { field: 'minMatchScore', value: Math.max(40, minMatchScore - 5) } },
+    ]
+    if (ctx.askUser) {
+      includeBorderline = await ctx.askUser('reviewer', question, options) === 'add_to_pending'
+      minMatchScore = ctx.agentCfg.minMatchScore
+    } else {
+      emit('agent_question', { role: 'reviewer', questionId: 'borderline_threshold', question, options })
+    }
   }
 
   for (const pkg of packages) {
@@ -112,39 +118,35 @@ export async function runGate(
         observation: `求职信质量 ${clTag}（${quality.clScore}/10）${readyTag}${quality.fitGap ? ` · 缺口：${quality.fitGap}` : ''} → ${quality.recommendation}`,
       })
 
-      // If CL quality is poor, ask user
+      // Weak materials are not silently allowed through a queued review. Ask
+      // the candidate to decide whether this job remains eligible for review.
       if (quality.clScore < 6 && pkg.coverLetter) {
-        emit('agent_question', {
-          role:       'reviewer',
-          questionId: `poor_cl_${pkg.job.id}`,
-          question:   `${pkg.job.company} · ${pkg.job.role} 的求职信质量偏低（${quality.clScore}/10）：${quality.recommendation}。是否继续投递还是跳过？`,
-          options: [
-            { label: '📤 继续投递（现有材料）', value: 'continue' },
-            { label: '⏳ 放入待审核',           value: 'review'   },
-            { label: '✕ 跳过此职位',            value: 'skip'     },
-          ],
-        })
+        const question = `${pkg.job.company} · ${pkg.job.role} 的求职信质量偏低（${quality.clScore}/10）：${quality.recommendation}。是否继续投递还是跳过？`
+        const options = [
+          { label: '📤 继续投递（现有材料）', value: 'continue' },
+          { label: '⏳ 放入待审核', value: 'review' },
+          { label: '✕ 跳过此职位', value: 'skip' },
+        ]
+        const decision = ctx.askUser
+          ? await ctx.askUser('reviewer', question, options)
+          : (emit('agent_question', { role: 'reviewer', questionId: `poor_cl_${pkg.job.id}`, question, options }), 'review')
+        if (decision === 'skip') {
+          skipped.push(pkg)
+          await db.applicationTask?.updateMany({
+            where: { userId: ctx.userId, jobId: pkg.job.id, status: { in: ['analyzing', 'generating_materials'] } },
+            data: { status: 'skipped', checkpoint: 'review_quality_declined', completedAt: new Date() },
+          })
+          continue
+        }
       }
     }
 
-    const autopilot = autoApply && !requireApproval
-
-    // In autopilot mode, the configured threshold applies equally to base and
-    // tailored resumes. A tailored resume must not silently bypass it.
-    if (pkg.score < minMatchScore) {
-      if (pkg.tailoredResumeId && !autopilot) {
-        pending.push(pkg)
-        emit('agent_question', {
-          role: 'reviewer', questionId: `resume_review_${pkg.job.id}`,
-          question: `${pkg.job.company} · ${pkg.job.role} 的定制简历已生成。请查看简历后确认是否进入申请。`,
-          options: [
-            { label: '查看定制简历', value: 'view_resume', action: { field: '_navigate', value: `resume&resumeId=${pkg.tailoredResumeId}` } },
-            { label: '保留待审核', value: 'review' },
-          ],
-        })
-        continue
-      }
+    if (pkg.score < minMatchScore && !includeBorderline) {
       skipped.push(pkg)
+      await db.applicationTask?.updateMany({
+        where: { userId: ctx.userId, jobId: pkg.job.id, status: { in: ["analyzing", "generating_materials"] } },
+        data: { status: "skipped", checkpoint: "below_match_threshold", completedAt: new Date() },
+      })
       emit('agent_observation', {
         role:        'reviewer',
         observation: `✕ 跳过：${pkg.score}% < 阈值 ${minMatchScore}%`,
@@ -152,34 +154,52 @@ export async function runGate(
       continue
     }
 
-    if (autopilot) {
-      approved.push(pkg)
-      emit('agent_observation', {
-        role:        'reviewer',
-        observation: `✓ 批准自动投递：分 ${pkg.score}% ≥ ${minMatchScore}%，autoApply=true`,
-      })
-      continue
-    }
-
-    if (pkg.tailoredResumeId) {
-      pending.push(pkg)
-      emit('agent_question', {
-        role: 'reviewer', questionId: `resume_review_${pkg.job.id}`,
-        question: `${pkg.job.company} · ${pkg.job.role} 的定制简历已生成并通过材料审核。请查看简历后确认是否进入申请。`,
-        options: [
-          { label: '查看定制简历', value: 'view_resume', action: { field: '_navigate', value: `resume&resumeId=${pkg.tailoredResumeId}` } },
-          { label: '保留待审核', value: 'review' },
-        ],
-      })
-      continue
-    }
-
     pending.push(pkg)
-    const reason = !autoApply ? 'autoApply=false' : 'requireApproval=true'
+    const task = await holdForApplicationReview({
+      userId: ctx.userId,
+      jobId: pkg.job.id,
+      sessionId: ctx.sessionId,
+      resumeId: pkg.tailoredResumeId ?? ctx.defaultResume.id,
+      coverLetterId: pkg.coverLetterId,
+    })
+    const approval = ctx.sessionId
+      ? await db.agentApproval.create({
+          data: {
+            sessionId: ctx.sessionId,
+            userId: ctx.userId,
+            type: "review_application",
+            status: "pending",
+            title: `Review application: ${pkg.job.company} · ${pkg.job.role}`,
+            body: "Review the job, tailored materials, and every proposed answer. Approval here only unlocks the final submit authorization; it never submits by itself.",
+            impact: { externalSubmission: false, jobId: pkg.job.id },
+            payload: { applicationTaskId: task.id, jobId: pkg.job.id },
+          },
+        })
+      : null
     emit('agent_observation', {
       role:        'reviewer',
-      observation: `⏳ 进入待审核：${reason}，需人工确认`,
+      observation: `⏳ 进入待审核：材料已保存，必须由你逐个审核并明确授权后才会提交。`,
     })
+    emit('agent_question', {
+      role: 'reviewer', questionId: `application_review_${pkg.job.id}`,
+      question: `${pkg.job.company} · ${pkg.job.role} 的申请材料已就绪。请审核材料与职位是否对应、所有答案是否真实；确认后才可授权提交。`,
+      options: [
+        { label: '保留待审核', value: 'review' },
+      ],
+    })
+    if (approval) {
+      emit("application_review_ready", {
+        approval: {
+          id: approval.id,
+          type: approval.type,
+          title: approval.title,
+          body: approval.body,
+          impact: approval.impact,
+          payload: approval.payload,
+          status: approval.status,
+        },
+      })
+    }
   }
 
   const total = Date.now() - t0

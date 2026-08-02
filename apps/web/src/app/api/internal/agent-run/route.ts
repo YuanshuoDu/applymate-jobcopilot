@@ -27,10 +27,21 @@ export async function POST(req: NextRequest) {
   if (!input) return err("Invalid agent run task", 400);
 
   const session = await db.agentSession.findFirst({
-    where: { id: input.sessionId, userId: input.userId, source: "automation" },
+    // A user can begin in the interactive Agent UI and later answer a durable
+    // question after the original SSE request has ended. The worker is already
+    // authenticated with a server secret, so any owned Agent session is safe
+    // to resume here; authorization still happens at session/question level.
+    where: { id: input.sessionId, userId: input.userId },
     select: { id: true },
   });
-  if (!session) return err("Automation session not found", 404);
+  if (!session) return err("Agent session not found", 404);
+
+  const execution = await db.agentExecution.findFirst({
+    where: { userId: input.userId, sessionId: session.id },
+    select: { state: true },
+  });
+  const state = execution?.state
+  const autonomous = Boolean(state && typeof state === "object" && !Array.isArray(state) && (state as { autonomous?: unknown }).autonomous === true)
 
   const configured = await loadUserAiConfig(input.userId, "autoApply");
   const aiConfig = configured.resolvedKey ? configured : resolveConfig(APPLYMATE_BACKING);
@@ -38,7 +49,7 @@ export async function POST(req: NextRequest) {
     userId: input.userId,
     sessionId: session.id,
     aiConfig,
-    autonomous: true,
+    autonomous,
   });
 
   return ok({ status: report ? "completed" : "failed", report });

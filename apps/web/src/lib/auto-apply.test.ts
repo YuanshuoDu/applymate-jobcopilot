@@ -1,82 +1,125 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const mocks = vi.hoisted(() => ({
-  agentConfigFindUnique: vi.fn(),
+  approvalFindFirst: vi.fn(),
+  transaction: vi.fn(),
+  taskUpdate: vi.fn(),
+  taskFindFirst: vi.fn(),
+  taskEventCreate: vi.fn(),
+  resumeFindFirst: vi.fn(),
+  coverLetterFindFirst: vi.fn(),
   jobUpdateMany: vi.fn(),
+  jobFindFirst: vi.fn(),
   activityCreate: vi.fn(),
   enqueueApplyTask: vi.fn(),
 }));
 
 vi.mock("@/lib/db", () => ({
   db: {
-    agentConfig: { findUnique: mocks.agentConfigFindUnique },
-    job: { updateMany: mocks.jobUpdateMany },
+    agentApproval: { findFirst: mocks.approvalFindFirst },
+    $transaction: mocks.transaction,
+    applicationTask: { findFirst: mocks.taskFindFirst, update: mocks.taskUpdate, updateMany: mocks.taskUpdate },
+    resume: { findFirst: mocks.resumeFindFirst },
+    coverLetter: { findFirst: mocks.coverLetterFindFirst },
+    applicationTaskEvent: { create: mocks.taskEventCreate },
+    job: { findFirst: mocks.jobFindFirst, updateMany: mocks.jobUpdateMany },
     activity: { create: mocks.activityCreate },
   },
 }));
 
-vi.mock("@/lib/apply-queue-client", () => ({
-  enqueueApplyTask: mocks.enqueueApplyTask,
-}));
+vi.mock("@/lib/apply-queue-client", () => ({ enqueueApplyTask: mocks.enqueueApplyTask }));
 
-describe("auto-apply", () => {
+describe("auto-apply authorization", () => {
+  const input = {
+    userId: "user_1", jobId: "job_1", applicationTaskId: "application_1", approvalId: "approval_1",
+    applyUrl: "https://jobs.lever.co/acme/123",
+  };
+
   beforeEach(() => {
     vi.resetModules();
     Object.values(mocks).forEach(mock => mock.mockReset());
-    mocks.agentConfigFindUnique.mockResolvedValue({ autoApply: true, requireApproval: false });
-    mocks.jobUpdateMany.mockResolvedValueOnce({ count: 1 }).mockResolvedValue({ count: 1 });
-    mocks.enqueueApplyTask.mockResolvedValue("task_1");
+    mocks.approvalFindFirst.mockResolvedValue({ payload: { applicationTaskId: "application_1", jobId: "job_1" } });
+    mocks.taskFindFirst.mockResolvedValue({ resumeId: "resume_1", coverLetterId: null });
+    mocks.resumeFindFirst.mockResolvedValue({ id: "resume_1" });
+    mocks.coverLetterFindFirst.mockResolvedValue({ id: "cover_1" });
+    mocks.jobFindFirst.mockResolvedValue({
+      company: "Acme", description: "Join the platform team with Acme. Build products.", source: "lever", url: input.applyUrl,
+    });
+    mocks.transaction.mockImplementation(async (callback: (tx: unknown) => unknown) => {
+      if (typeof callback === "function") {
+        return callback({
+          applicationTask: { findFirst: mocks.taskFindFirst, updateMany: vi.fn().mockResolvedValue({ count: 1 }) },
+          resume: { findFirst: mocks.resumeFindFirst },
+          coverLetter: { findFirst: mocks.coverLetterFindFirst },
+          job: { updateMany: vi.fn().mockResolvedValue({ count: 1 }) },
+        });
+      }
+      return Promise.all(callback);
+    });
+    mocks.enqueueApplyTask.mockResolvedValue("worker_1");
     mocks.activityCreate.mockResolvedValue({});
+    mocks.taskUpdate.mockResolvedValue({});
+    mocks.taskEventCreate.mockResolvedValue({});
   });
 
-  it("queues an eligible job after atomically claiming it", async () => {
+  it("queues only after matching explicit per-job authorization", async () => {
     const { queueAutonomousApplication } = await import("./auto-apply");
-
-    await expect(queueAutonomousApplication({
-      userId: "user_1",
-      jobId: "job_1",
-      applyUrl: "https://jobs.lever.co/acme/123",
-    })).resolves.toEqual({ taskId: "task_1" });
-
-    expect(mocks.jobUpdateMany).toHaveBeenNthCalledWith(1, {
-      where: expect.objectContaining({
-        id: "job_1",
-        userId: "user_1",
-        status: "saved",
-        workflowState: { in: ["draft", "ready_to_apply"] },
-      }),
-      data: expect.objectContaining({ workflowState: "queued" }),
-    });
+    await expect(queueAutonomousApplication(input)).resolves.toEqual({ taskId: "worker_1" });
     expect(mocks.enqueueApplyTask).toHaveBeenCalledWith({
-      jobId: "job_1",
-      userId: "user_1",
-      applyUrl: "https://jobs.lever.co/acme/123",
+      applicationTaskId: "application_1", jobId: "job_1", userId: "user_1", applyUrl: input.applyUrl, operation: "submit",
     });
+    expect(mocks.transaction).toHaveBeenCalled();
   });
 
-  it("rejects blocked job-board URLs before changing state", async () => {
-    const { queueAutonomousApplication } = await import("./auto-apply");
-
-    await expect(queueAutonomousApplication({
-      userId: "user_1",
-      jobId: "job_1",
-      applyUrl: "https://www.linkedin.com/jobs/view/123",
-    })).rejects.toThrow("not supported");
+  it("queues a fill-only pass without changing the job into a submission", async () => {
+    mocks.taskUpdate.mockResolvedValueOnce({ count: 1 }).mockResolvedValue({});
+    const { queueApplicationFill } = await import("./auto-apply");
+    await expect(queueApplicationFill({
+      userId: "user_1", jobId: "job_1", applicationTaskId: "application_1", applyUrl: input.applyUrl,
+    })).resolves.toEqual({ taskId: "worker_1" });
+    expect(mocks.enqueueApplyTask).toHaveBeenCalledWith(expect.objectContaining({ operation: "fill" }));
     expect(mocks.jobUpdateMany).not.toHaveBeenCalled();
   });
 
-  it("restores the ready state when the queue cannot accept a task", async () => {
-    mocks.enqueueApplyTask.mockRejectedValueOnce(new Error("Redis unavailable"));
+  it("rejects a global setting or unrelated approval as submission consent", async () => {
+    mocks.approvalFindFirst.mockResolvedValue({ payload: { applicationTaskId: "other", jobId: "job_1" } });
+    const { queueAutonomousApplication } = await import("./auto-apply");
+    await expect(queueAutonomousApplication(input)).rejects.toThrow("explicit approval");
+    expect(mocks.enqueueApplyTask).not.toHaveBeenCalled();
+  });
+
+  it("rejects a stale task whose resume does not belong to this job or the current default", async () => {
+    mocks.resumeFindFirst.mockResolvedValueOnce(null);
     const { queueAutonomousApplication } = await import("./auto-apply");
 
-    await expect(queueAutonomousApplication({
-      userId: "user_1",
-      jobId: "job_1",
-      applyUrl: "https://boards.greenhouse.io/acme/jobs/123",
-    })).rejects.toThrow("Redis unavailable");
-    expect(mocks.jobUpdateMany).toHaveBeenLastCalledWith({
-      where: { id: "job_1", userId: "user_1", workflowState: "queued" },
-      data: { workflowState: "ready_to_apply" },
+    await expect(queueAutonomousApplication(input)).rejects.toThrow("no longer ready");
+
+    expect(mocks.enqueueApplyTask).not.toHaveBeenCalled();
+  });
+
+  it("rejects a task whose stored cover letter belongs to a different application", async () => {
+    mocks.taskFindFirst.mockResolvedValueOnce({ resumeId: "resume_1", coverLetterId: "cover_other" });
+    mocks.coverLetterFindFirst.mockResolvedValueOnce(null);
+    const { queueAutonomousApplication } = await import("./auto-apply");
+
+    await expect(queueAutonomousApplication(input)).rejects.toThrow("no longer ready");
+
+    expect(mocks.enqueueApplyTask).not.toHaveBeenCalled();
+  });
+
+  it("rejects blocked job-board URLs before reading or changing state", async () => {
+    const { queueAutonomousApplication } = await import("./auto-apply");
+    await expect(queueAutonomousApplication({ ...input, applyUrl: "https://www.linkedin.com/jobs/view/123" })).rejects.toThrow("direct supported ATS");
+    expect(mocks.approvalFindFirst).not.toHaveBeenCalled();
+  });
+
+  it("rejects a direct ATS URL when the saved job identity conflicts with its description", async () => {
+    mocks.jobFindFirst.mockResolvedValueOnce({
+      company: "Questionmark", description: "Join Future of EdTech with Learnosity. At Learnosity, build products.", source: "lever", url: input.applyUrl,
     });
+    const { queueAutonomousApplication } = await import("./auto-apply");
+
+    await expect(queueAutonomousApplication(input)).rejects.toThrow("does not match")
+    expect(mocks.approvalFindFirst).not.toHaveBeenCalled();
   });
 });

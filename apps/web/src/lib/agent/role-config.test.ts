@@ -20,7 +20,7 @@ describe('Agent role model resolution', () => {
   })
 
   it('keeps a feature-level AI configuration for a keyless platform role', () => {
-    const userChoice = { provider: 'openai' as const, model: 'gpt-5-mini', apiKey: 'user-key' }
+    const userChoice = { provider: 'openai' as const, model: 'gpt-5.6-terra', apiKey: 'user-key' }
     expect(roleAiConfig('analyst', role(), userChoice)).toEqual(userChoice)
   })
 
@@ -29,10 +29,15 @@ describe('Agent role model resolution', () => {
     expect(roleAiConfig('analyst', legacy, fallback)).toEqual(fallback)
   })
 
+  it('upgrades a keyless M2.7 platform role to the current M3 default', () => {
+    const legacy = role({ model: 'MiniMax-M2.7' })
+    expect(roleAiConfig('analyst', legacy, fallback)).toEqual(fallback)
+  })
+
   it('honors a role-level model override and preserves a same-provider fallback key', () => {
-    const custom = role({ model: 'MiniMax-M2.7' })
+    const custom = role({ model: 'MiniMax-M2.5' })
     expect(roleAiConfig('analyst', custom, fallback)).toEqual({
-      provider: 'minimax', model: 'MiniMax-M2.7', apiKey: 'platform-key',
+      provider: 'minimax', model: 'MiniMax-M2.5', apiKey: 'platform-key',
     })
   })
 })

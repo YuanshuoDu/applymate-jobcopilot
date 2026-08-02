@@ -1,4 +1,4 @@
-import { MODEL_CATALOGUE, type AiConfig, type ChatMessage } from '@/lib/model-router'
+import type { ChatMessage } from '@/lib/model-router'
 
 export const SYSTEM_PROMPT = (ctx: {
   jobCount: number
@@ -33,7 +33,6 @@ Rules: max 1 action per response, only when asked or obviously needed, be helpfu
 export interface ChatRequestBody {
   sessionId?: unknown
   messages?: unknown
-  model?: unknown
 }
 
 export type ParsedAgentAction =
@@ -76,14 +75,6 @@ export function responseMemory(text: string): string {
   const clean = text.replace(/^ACTION:.+$/gm, '').replace(/\s+/g, ' ').trim()
   if (!clean) return 'Waiting for the next user instruction.'
   return clean.length > 240 ? `${clean.slice(0, 237)}...` : clean
-}
-
-export function resolveRequestedModel(body: ChatRequestBody, fallback: AiConfig): AiConfig {
-  if (typeof body.model !== 'string') return fallback
-  const [provider, model] = body.model.split('::')
-  const option = MODEL_CATALOGUE.find(item => item.provider === provider && item.model === model)
-  if (!option) return fallback
-  return { provider: option.provider, model: option.model }
 }
 
 export function agentActionFromText(text: string): ParsedAgentAction | null {

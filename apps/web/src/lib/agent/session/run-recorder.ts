@@ -82,6 +82,18 @@ export function mapPipelineEventToTranscript(event: string, data: unknown): Tran
     }
   }
 
+  if (event === "application_review_ready") {
+    const approval = data && typeof data === "object"
+      ? (data as { approval?: { title?: string; body?: string } }).approval
+      : undefined
+    return {
+      type: "approval_request",
+      speaker: "Reviewer",
+      title: approval?.title ?? "Application review required",
+      body: approval?.body ?? "Review this application before requesting submission authorization.",
+    }
+  }
+
   if (event === "agent_plan") {
     return {
       type: "orchestrator_plan",
@@ -129,6 +141,29 @@ export function mapPipelineEventToTranscript(event: string, data: unknown): Tran
       speaker: "Executor",
       title: "Unattended submission queued",
       body: `${company}${role ? ` · ${role}` : ""} is queued for background submission.`,
+    }
+  }
+
+  if (event === "custom_agent_result") {
+    const row = data && typeof data === "object" ? data as { agentName?: unknown; observations?: unknown[] } : {}
+    const agentName = typeof row.agentName === "string" ? row.agentName : "Custom agent"
+    const count = Array.isArray(row.observations) ? row.observations.length : 0
+    return {
+      type: "subagent_result",
+      speaker: agentName,
+      title: "Structured findings",
+      body: `${count} structured job finding${count === 1 ? "" : "s"} recorded for the final review.`,
+    }
+  }
+
+  if (event === "custom_agent_summary") {
+    const row = data && typeof data === "object" ? data as { findings?: unknown[] } : {}
+    const count = Array.isArray(row.findings) ? row.findings.length : 0
+    return {
+      type: "thinking_summary",
+      speaker: "Orchestrator",
+      title: "Custom-agent summary",
+      body: `${count} de-duplicated custom-agent finding${count === 1 ? "" : "s"} included in the final audit.`,
     }
   }
 
@@ -249,5 +284,23 @@ export async function createRunSessionRecorder(db: AgentSessionDb, input: RunSes
         memorySummary: summarizeReport(input.report),
       })
     },
+    async pause(message: string, role?: PipelineSubAgentRole) {
+      const taskId = role ? taskIdsByRole.get(role) : undefined
+      if (taskId) {
+        await completeSubAgentTask(db, {
+          taskId,
+          status: "waiting_for_user",
+          failureReason: message,
+        })
+      }
+      return updateAgentSession(db, {
+        sessionId: session.id,
+        status: "waiting_for_user",
+        ...(taskId ? { currentTaskId: taskId } : {}),
+        completedAt: null,
+        memorySummary: message,
+      })
+    },
   }
+
 }

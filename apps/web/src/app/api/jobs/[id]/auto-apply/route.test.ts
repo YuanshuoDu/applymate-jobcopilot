@@ -12,34 +12,21 @@ vi.mock("@/lib/db", () => ({
   db: { job: { findUnique: vi.fn() } },
 }));
 
-vi.mock("@/lib/auto-apply", () => ({
-  AutoApplyError: class AutoApplyError extends Error {},
-  queueAutonomousApplication: vi.fn(),
-}));
-
 const request = () => new NextRequest("https://applymate.app/api/jobs/job-1/auto-apply", { method: "POST" });
 const ctx = { params: Promise.resolve({ id: "job-1" }) };
 
 describe("POST /api/jobs/[id]/auto-apply", () => {
   beforeEach(() => vi.clearAllMocks());
 
-  it("queues an owned job for unattended submission", async () => {
+  it("refuses a direct job-page request until the Agent session grants final authorization", async () => {
     const { requireAuth } = await import("@/lib/api-helpers");
     vi.mocked(requireAuth).mockResolvedValue({ userId: "user-1" } as never);
     const { db } = await import("@/lib/db");
     vi.mocked(db.job.findUnique).mockResolvedValue({ id: "job-1", userId: "user-1", url: "https://jobs.example.com/apply" } as never);
-    const { queueAutonomousApplication } = await import("@/lib/auto-apply");
-    vi.mocked(queueAutonomousApplication).mockResolvedValue({ taskId: "task-1" });
-
     const response = await POST(request(), ctx);
 
-    expect(response.status).toBe(202);
-    await expect(response.json()).resolves.toEqual({ queued: true, taskId: "task-1" });
-    expect(queueAutonomousApplication).toHaveBeenCalledWith({
-      userId: "user-1",
-      jobId: "job-1",
-      applyUrl: "https://jobs.example.com/apply",
-    });
+    expect(response.status).toBe(409);
+    await expect(response.json()).resolves.toEqual({ error: expect.stringContaining("explicitly authorize") });
   });
 
   it("keeps ownership checks", async () => {

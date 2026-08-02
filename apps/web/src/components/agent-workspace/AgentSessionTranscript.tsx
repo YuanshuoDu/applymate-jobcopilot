@@ -30,6 +30,11 @@ export function AgentSessionTranscript({ sessionId, onBackToLive }: {
 
   useEffect(() => { setLocalEvents([]) }, [sessionId])
   useEffect(() => { bottomRef.current?.scrollIntoView({ behavior: 'smooth' }) }, [events.length, localEvents.length])
+  useEffect(() => {
+    if (session?.status !== 'running') return
+    const timer = window.setInterval(() => { void refreshTranscript() }, 4_000)
+    return () => window.clearInterval(timer)
+  }, [session?.status, sessionId])
 
   async function refreshTranscript() {
     await Promise.all([refetchDetail(), refetch()])

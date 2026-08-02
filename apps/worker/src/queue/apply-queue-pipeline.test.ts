@@ -25,6 +25,10 @@ const mocks = vi.hoisted(() => {
     upsertFormPattern: vi.fn().mockResolvedValue(undefined),
     shouldUsePattern: vi.fn().mockReturnValue(false),
     replayPattern: vi.fn(),
+    claimApplicationTask: vi.fn().mockResolvedValue(true),
+    completeFillForReview: vi.fn().mockResolvedValue(true),
+    finishApplicationTask: vi.fn().mockResolvedValue(undefined),
+    pauseForFormInput: vi.fn().mockResolvedValue(undefined),
     agentRun,
     AgentHarness: vi.fn().mockImplementation(() => ({ run: agentRun })),
     createNotification: vi.fn().mockResolvedValue(undefined),
@@ -78,9 +82,18 @@ vi.mock("../notifications/notify-apply-result.js", () => ({
 }));
 vi.mock("../patterns/confidence.js", () => ({ shouldUsePattern: mocks.shouldUsePattern }));
 vi.mock("../patterns/replay.js", () => ({ replayPattern: mocks.replayPattern }));
+vi.mock("../db/application-task-state.js", () => ({
+  claimApplicationTask: mocks.claimApplicationTask,
+  completeFillForReview: mocks.completeFillForReview,
+  finishApplicationTask: mocks.finishApplicationTask,
+  pauseForFormInput: mocks.pauseForFormInput,
+  needsUserTakeover: vi.fn(() => false),
+}));
 vi.mock("node:fs", () => ({ unlinkSync: vi.fn() }));
 
 const payload = {
+  applicationTaskId: "application-task-1",
+  operation: "submit",
   userId: "user-1",
   jobId: "job-1",
   applyUrl: "https://jobs.example/apply/start/123",

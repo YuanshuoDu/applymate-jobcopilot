@@ -99,7 +99,7 @@ export interface AgentRoleConfig {
 
 export type { RoleConfigMap }
 
-const PROVIDERS = new Set<Provider>(['anthropic', 'openai', 'deepseek', 'minimax', 'qwen', 'zhipu', 'custom'])
+const PROVIDERS = new Set<Provider>(['anthropic', 'openai', 'deepseek', 'minimax', 'qwen', 'zhipu', 'kimi', 'custom'])
 
 /**
  * Resolves a per-role override without bypassing the user's feature-level AI
@@ -117,10 +117,13 @@ export function roleAiConfig(
   const isLegacyDefault = !config.apiKey
     && config.provider === legacy.provider
     && config.model === legacy.model
-  const isPlatformDefault = !config.apiKey
+  const isRetiredPlatformDefault = !config.apiKey
+    && config.provider === 'minimax'
+    && config.model === 'MiniMax-M2.7'
+  const isCurrentPlatformDefault = !config.apiKey
     && config.provider === 'minimax'
     && config.model === 'MiniMax-M3'
-  if (isLegacyDefault || isPlatformDefault) return fallback
+  if (isLegacyDefault || isRetiredPlatformDefault || isCurrentPlatformDefault) return fallback
 
   const provider = config.provider as Provider
   if (provider === fallback.provider) {

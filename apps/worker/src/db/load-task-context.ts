@@ -11,6 +11,7 @@ export interface TaskContext {
   applyUrl: string;
   coverLetterText: string | null;
   resumeTempPath?: string;
+  confirmedAnswers: Record<string, string>;
 }
 
 export async function loadTaskContext(
@@ -18,6 +19,7 @@ export async function loadTaskContext(
   userId: string,
   jobId: string,
   fallbackApplyUrl: string,
+  applicationTaskId?: string,
 ): Promise<TaskContext> {
   const [userRes, jobRes, resumeRes] = await Promise.all([
     pool.query(
@@ -68,6 +70,9 @@ export async function loadTaskContext(
   }
 
   const persona: Record<string, string> = { ...base, ...learned };
+  const confirmedAnswers = applicationTaskId
+    ? await loadConfirmedAnswers(pool, applicationTaskId, userId, jobId)
+    : {};
 
   // Generate cover letter via LLM if not saved
   let coverLetterText: string | null = job.coverLetter ?? null;
@@ -114,5 +119,26 @@ export async function loadTaskContext(
     applyUrl: job.url?.trim() || fallbackApplyUrl,
     coverLetterText,
     resumeTempPath,
+    confirmedAnswers,
   };
+}
+
+async function loadConfirmedAnswers(
+  pool: Pool,
+  taskId: string,
+  userId: string,
+  jobId: string,
+): Promise<Record<string, string>> {
+  const result = await pool.query(
+    `SELECT "confirmedAnswers" FROM application_tasks
+      WHERE id = $1 AND "userId" = $2 AND "jobId" = $3`,
+    [taskId, userId, jobId],
+  );
+  const value: unknown = result.rows[0]?.confirmedAnswers;
+  if (!value || typeof value !== "object" || Array.isArray(value)) return {};
+  return Object.fromEntries(
+    Object.entries(value).filter((entry): entry is [string, string] =>
+      typeof entry[0] === "string" && typeof entry[1] === "string" && entry[1].trim().length > 0,
+    ),
+  );
 }
