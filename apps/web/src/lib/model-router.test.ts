@@ -13,23 +13,23 @@ import {
 describe('model catalogue and MiniMax compatibility', () => {
   afterEach(() => vi.restoreAllMocks())
 
-  it('uses MiniMax completion tokens and reasoning split for the current default', async () => {
+  it('uses MiniMax M3 completion tokens and adaptive reasoning for the current default', async () => {
     const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response(JSON.stringify({
       choices: [{ finish_reason: 'stop', message: { content: '{"verdict":"pass"}' } }],
       usage: { prompt_tokens: 12, completion_tokens: 34 },
     })))
 
     const result = await modelChat([{ role: 'user', content: 'Return JSON.' }], {
-      provider: 'minimax', model: 'MiniMax-M2.7', apiKey: 'test-key',
+      provider: 'minimax', model: 'MiniMax-M3', apiKey: 'test-key',
     }, 2048)
 
     expect(result.text).toBe('{"verdict":"pass"}')
     const request = fetchMock.mock.calls[0][1] as RequestInit
     expect(JSON.parse(String(request.body))).toMatchObject({
-      model: 'MiniMax-M2.7', max_completion_tokens: 2048, reasoning_split: true,
+      model: 'MiniMax-M3', max_completion_tokens: 2048, reasoning_split: true,
     })
     expect(JSON.parse(String(request.body))).not.toHaveProperty('max_tokens')
-    expect(JSON.parse(String(request.body))).not.toHaveProperty('thinking')
+    expect(JSON.parse(String(request.body))).toMatchObject({ thinking: { type: 'adaptive' } })
   })
 
   it('reports an empty final answer with the provider finish reason', async () => {
@@ -38,13 +38,13 @@ describe('model catalogue and MiniMax compatibility', () => {
     })))
 
     await expect(modelChat([{ role: 'user', content: 'Return JSON.' }], {
-      provider: 'minimax', model: 'MiniMax-M2.7', apiKey: 'test-key',
+      provider: 'minimax', model: 'MiniMax-M3', apiKey: 'test-key',
     })).rejects.toThrow('minimax returned no final content (finish reason: length)')
   })
 
-  it('uses M2.7 as both platform defaults', () => {
-    expect(DEFAULT_AI_CONFIG).toMatchObject({ provider: 'minimax', model: 'MiniMax-M2.7' })
-    expect(APPLYMATE_BACKING).toMatchObject({ provider: 'minimax', model: 'MiniMax-M2.7' })
+  it('uses M3 as both platform defaults', () => {
+    expect(DEFAULT_AI_CONFIG).toMatchObject({ provider: 'minimax', model: 'MiniMax-M3' })
+    expect(APPLYMATE_BACKING).toMatchObject({ provider: 'minimax', model: 'MiniMax-M3', thinking: 'adaptive' })
   })
 
   it('keeps the curated provider catalogue compact, with four OpenAI options', () => {

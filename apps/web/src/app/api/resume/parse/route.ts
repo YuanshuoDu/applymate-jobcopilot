@@ -12,7 +12,7 @@ import { modelChat, parseAiJson, loadUserAiConfig, withMiniMaxThinking, type AiC
 
 const PARSE_FALLBACKS: AiConfig[] = [
   { provider: 'deepseek', model: 'deepseek-v4-pro' },
-  { provider: 'minimax',  model: 'MiniMax-M2.7' },
+  { provider: 'minimax',  model: 'MiniMax-M3', thinking: 'disabled' },
 ]
 import type { ResumeContent } from '@/lib/types'
 

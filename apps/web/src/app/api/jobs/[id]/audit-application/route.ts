@@ -96,8 +96,8 @@ async function runAuditModel(prompt: string, cfg: AiConfig) {
         if (cfg.model === 'MiniMax-M3') {
           return modelChat([{ role: 'user', content: prompt }], withMiniMaxThinking(cfg, 'disabled'), 2_048)
         }
-        // Current MiniMax M2.7 is the direct-answer fallback.
-        return modelChat([{ role: 'user', content: prompt }], { ...cfg, model: 'MiniMax-M2.7' }, 1_800)
+        // Retry through the platform's M3 direct-answer mode.
+        return modelChat([{ role: 'user', content: prompt }], { ...cfg, model: 'MiniMax-M3', thinking: 'disabled' }, 1_800)
       }
       if (!isAbortError(error) || attempt === 1) throw error
       await new Promise(resolve => setTimeout(resolve, 750))

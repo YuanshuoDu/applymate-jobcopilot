@@ -94,9 +94,9 @@ export const MODEL_CATALOGUE: ModelOption[] = [
 
   // ── MiniMax ───────────────────────────────────────────────
   {
-    provider: 'minimax', model: 'MiniMax-M2.7',
-    label: 'MiniMax M2.7', description: '平台默认，当前文本旗舰',
-    tier: 'standard', priceIn: 0.3, priceOut: 1.2, contextK: 200,
+    provider: 'minimax', model: 'MiniMax-M3',
+    label: 'MiniMax M3', description: '平台默认，当前文本旗舰',
+    tier: 'standard', priceIn: 0.6, priceOut: 2.4, contextK: 512,
     defaultBase: 'https://api.minimax.io/v1',
   },
   {
@@ -164,7 +164,7 @@ export type MiniMaxThinkingMode = 'adaptive' | 'disabled'
 
 export const DEFAULT_AI_CONFIG: AiConfig = {
   provider: 'minimax',
-  model:    'MiniMax-M2.7',
+  model:    'MiniMax-M3',
 }
 
 /** Apply a MiniMax M3 thinking policy without changing another provider or model. */
@@ -182,7 +182,8 @@ export function resolveConfig(userConfig?: AiConfig | null): AiConfig & { resolv
   const exact  = MODEL_CATALOGUE.find(m => m.provider === input.provider && m.model === input.model)
   const option = exact
     ?? MODEL_CATALOGUE.find(m => m.provider === input.provider)
-    ?? MODEL_CATALOGUE[1]  // fallback to Sonnet
+    ?? MODEL_CATALOGUE.find(m => m.provider === 'minimax' && m.model === 'MiniMax-M3')
+    ?? MODEL_CATALOGUE[0]
 
   // Saved settings can outlive a provider model. Do not send a retired model
   // identifier to the provider; retain custom model IDs because they are user-owned.
@@ -528,7 +529,8 @@ export const APPLYMATE_LABEL = 'ApplyMate'
 /** The real config behind the "ApplyMate" virtual model */
 export const APPLYMATE_BACKING: AiConfig = {
   provider: 'minimax',
-  model:    'MiniMax-M2.7',
+  model:    'MiniMax-M3',
+  thinking: 'adaptive',
 }
 
 // ── Per-feature AI settings ───────────────────────────────────────────────────
@@ -563,7 +565,7 @@ export const FEATURE_LABELS: Record<FeatureId, string> = {
 /**
  * Per-user AI settings stored in User.preferences.aiSettings
  *
- * features[featureId] = null  →  use ApplyMate AI (MiniMax M2.7, server key)
+ * features[featureId] = null  →  use ApplyMate AI (MiniMax M3, server key)
  * features[featureId] = AiConfig  →  use that specific model
  * keys[provider] = string  →  user-supplied API key for that provider
  */

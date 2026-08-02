@@ -12,12 +12,12 @@ export type AgentRoleType = 'scout' | 'analyst' | 'writer' | 'reviewer' | 'execu
 export const AGENT_ROLES: AgentRoleType[] = ['scout', 'analyst', 'writer', 'reviewer', 'executor', 'auditor']
 
 export const ROLE_DEFAULTS: Record<AgentRoleType, { provider: string; model: string }> = {
-  scout:    { provider: 'minimax', model: 'MiniMax-M2.7' },
-  analyst:  { provider: 'minimax', model: 'MiniMax-M2.7' },
-  writer:   { provider: 'minimax', model: 'MiniMax-M2.7' },
-  reviewer: { provider: 'minimax', model: 'MiniMax-M2.7' },
-  executor: { provider: 'minimax', model: 'MiniMax-M2.7' },
-  auditor:  { provider: 'minimax', model: 'MiniMax-M2.7' },
+  scout:    { provider: 'minimax', model: 'MiniMax-M3' },
+  analyst:  { provider: 'minimax', model: 'MiniMax-M3' },
+  writer:   { provider: 'minimax', model: 'MiniMax-M3' },
+  reviewer: { provider: 'minimax', model: 'MiniMax-M3' },
+  executor: { provider: 'minimax', model: 'MiniMax-M3' },
+  auditor:  { provider: 'minimax', model: 'MiniMax-M3' },
 }
 
 const LEGACY_ROLE_DEFAULTS: Record<AgentRoleType, { provider: string; model: string }> = {
@@ -119,10 +119,10 @@ export function roleAiConfig(
     && config.model === legacy.model
   const isRetiredPlatformDefault = !config.apiKey
     && config.provider === 'minimax'
-    && config.model === 'MiniMax-M3'
+    && config.model === 'MiniMax-M2.7'
   const isCurrentPlatformDefault = !config.apiKey
     && config.provider === 'minimax'
-    && config.model === 'MiniMax-M2.7'
+    && config.model === 'MiniMax-M3'
   if (isLegacyDefault || isRetiredPlatformDefault || isCurrentPlatformDefault) return fallback
 
   const provider = config.provider as Provider

@@ -5,18 +5,18 @@ vi.mock('@/lib/db', () => ({ db: {} }))
 
 import { ROLE_DEFAULTS, roleAiConfig } from './role-config'
 
-const fallback = { provider: 'minimax' as const, model: 'MiniMax-M2.7', apiKey: 'platform-key' }
+const fallback = { provider: 'minimax' as const, model: 'MiniMax-M3', apiKey: 'platform-key' }
 
 function role(config: Partial<RoleConfigMap['analyst']> = {}): RoleConfigMap['analyst'] {
   return {
-    provider: 'minimax', model: 'MiniMax-M2.7', enabled: true, systemPrompt: null,
+    provider: 'minimax', model: 'MiniMax-M3', enabled: true, systemPrompt: null,
     ...config,
   }
 }
 
 describe('Agent role model resolution', () => {
   it('uses the platform MiniMax configuration for every newly-created role', () => {
-    expect(Object.values(ROLE_DEFAULTS)).toEqual(Array(6).fill({ provider: 'minimax', model: 'MiniMax-M2.7' }))
+    expect(Object.values(ROLE_DEFAULTS)).toEqual(Array(6).fill({ provider: 'minimax', model: 'MiniMax-M3' }))
   })
 
   it('keeps a feature-level AI configuration for a keyless platform role', () => {
@@ -26,6 +26,11 @@ describe('Agent role model resolution', () => {
 
   it('falls back from legacy keyless Claude role defaults instead of requiring an Anthropic key', () => {
     const legacy = role({ provider: 'anthropic', model: 'claude-haiku-4-5' })
+    expect(roleAiConfig('analyst', legacy, fallback)).toEqual(fallback)
+  })
+
+  it('upgrades a keyless M2.7 platform role to the current M3 default', () => {
+    const legacy = role({ model: 'MiniMax-M2.7' })
     expect(roleAiConfig('analyst', legacy, fallback)).toEqual(fallback)
   })
 
