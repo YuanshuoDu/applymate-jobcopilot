@@ -6,11 +6,13 @@
 
 ## 1. Purpose and non-negotiable boundaries
 
-ApplyMate needs an internal console for platform operations: user support, ATS source health, feature controls, AI-budget operations, queue health, platform broadcasts, and security review. It is not a candidate-facing feature and must not share the candidate application shell or authorization model.
+ApplyMate needs an internal console for platform operations: customer support, ATS source health, feature controls, AI-budget operations, queue health, platform broadcasts, and security review. It is not a candidate-facing feature and must not share the candidate application shell or authorization model.
 
 The following rule is absolute: **no administrator, including `super_admin` or a break-glass operator, may read a candidate's API keys, password hash, OAuth refresh token, full resume, or email body.** These fields must never be selected, serialized, logged, audited, exported, or made available through a support tool. Operational pages may expose only approved metadata such as “resume exists”, a document size, a Gmail sync status, or a job count.
 
 The console may publish platform messages to users' in-app `Notification` records. It must not inspect private candidate content in order to compose, target, or deliver a broadcast.
+
+The Contact us service is an in-app customer-support system. Support staff may read and respond to messages a candidate intentionally submits through Contact us. Those messages are not Gmail data and are not a reason to access candidate profile documents. The service must reject or redact secrets submitted by mistake and show staff only a safe operational context.
 
 Out of scope for v1: B2B organizations, self-service internal-user invitations, arbitrary database queries, arbitrary Redis commands, direct Bull Board access, and sending broadcasts by email.
 
@@ -25,6 +27,7 @@ Existing resources that the console must adapt rather than replace:
 | `User`, `Job`, `Resume`, Persona/Gmail Prisma models | Candidate data is owned by `userId`. | Keep ownership model. Add separate admin tables and use admin-only, metadata-only DTOs. |
 | `/api/notifications` | Reads the authenticated candidate's last 30 days of `notifications`; `/mark-read` updates only that user's rows. | Broadcast deliveries are standard `Notification` rows, so they appear and can be marked read without changing candidate authorization. |
 | `/api/me/ai-budget` | Reads the caller's `ai_budgets` row for the current month. | Keep it candidate-only. The console gets a separate aggregate/read/write admin API with reason and audit controls. |
+| Existing in-app notifications | The `Notification` model has a generic `type`, `title`, `body`, `userId`, `read`, and optional `jobId`. | Use it for support-reply notifications with a new `contact_us_reply` type; do not create a parallel candidate inbox. |
 | `/api/admin/observability` | Currently reads all `apply_results` without an admin check. | Treat as a security defect: move/replace with `/api/admin/v1/observability`, require `observability.read`, and remove unauthenticated access before console launch. |
 | `AtsEmployer`, `ApplyResult`, `FormPattern`, `AiBudget` | Existing Prisma models support ATS registry sightings, apply outcomes, pattern cache, and monthly budget. | Do not duplicate them. Add controlled operational configuration and expose only safe aggregates. |
 | Worker queues | BullMQ queues: `apply-tasks` and `scout-tasks`; Worker currently starts Bull Board at `/admin/queues`. | The web app calls a signed, allow-listed Worker control API. Bull Board is private, disabled by default, and never embedded in the console. |
@@ -60,7 +63,7 @@ An identifier alone never authorizes access. For example, a candidate job lookup
 
 | Role | Intended use | Boundary |
 |---|---|---|
-| `support` | Candidate support | Masked user metadata and relevant operational status only. No broadcasts, subscription changes, queue actions, or private content. |
+| `support` | Candidate support | Own/assigned Contact us cases, deliberately submitted support messages, masked user metadata, and relevant operational status only. No broadcasts, subscription changes, queue actions, Gmail, documents, or secrets. |
 | `operations` | Day-to-day platform operations | Source/queue/apply diagnostics and retry requests; can draft a broadcast but cannot approve or publish it. |
 | `analyst` | Product/data analysis | Read-only aggregates and anonymized exports. No individual candidate browsing. |
 | `billing` | Commercial support | Plans and billing annotations only. No jobs, applications, resumes, Gmail, or secrets. |
@@ -82,6 +85,7 @@ Roles do not inherit by default. A role is an explicit allow-list of permissions
 | AI budgets | `ai_budget.read`, `ai_budget.update`, `ai_budget.reset` |
 | Worker | `queues.read`, `queues.retry`, `queues.pause`, `queues.resume` |
 | Broadcasts | `broadcasts.create`, `broadcasts.update`, `broadcasts.preview`, `broadcasts.approve`, `broadcasts.publish`, `broadcasts.cancel` |
+| Customer support | `support_cases.read`, `support_cases.assign`, `support_cases.reply`, `support_cases.note`, `support_cases.resolve`, `support_cases.escalate`, `support_sla.manage`, `support_macros.manage` |
 | Security | `admin_members.read`, `admin_members.manage`, `admin_roles.manage`, `sessions.revoke`, `audit.read`, `break_glass.request`, `break_glass.approve` |
 | System | `observability.read`, `incidents.manage` |
 
@@ -95,7 +99,7 @@ Add these Prisma models to `apps/web/prisma/schema.prisma`. Do not add `User.isA
 enum AdminMembershipStatus { active suspended revoked }
 enum AdminMfaLevel { none totp webauthn }
 enum AdminAuditOutcome { success denied failed }
-enum AdminTargetType { user job application ats_source feature_flag ai_budget queue broadcast admin_member }
+enum AdminTargetType { user job application ats_source feature_flag ai_budget queue broadcast support_case admin_member }
 enum BroadcastStatus { draft pending_approval scheduled publishing published cancelled failed }
 enum BroadcastAudienceType { all_active_users plan location explicit_user_ids }
 
@@ -179,9 +183,46 @@ model AdminBroadcast {
   notifications  Notification[]
   @@index([status, scheduledAt])
 }
+
+enum SupportCaseStatus { open in_progress waiting_on_customer resolved closed }
+enum SupportCasePriority { low normal high urgent }
+enum SupportCaseMessageKind { customer_reply staff_reply internal_note system_event }
+
+model SupportCase {
+  id               String            @id @default(cuid())
+  requesterUserId  String            @map("requester_user_id")
+  subject          String
+  category         String            // allow-listed: account, billing, technical, auto_apply, feedback, other
+  status           SupportCaseStatus @default(open)
+  priority         SupportCasePriority @default(normal)
+  assignedAdminId  String?           @map("assigned_admin_id")
+  slaDueAt         DateTime?         @map("sla_due_at")
+  firstRespondedAt DateTime?         @map("first_responded_at")
+  resolvedAt       DateTime?         @map("resolved_at")
+  safeContext      Json?             @map("safe_context") // allow-listed counts/statuses only
+  createdAt        DateTime          @default(now())
+  updatedAt        DateTime          @updatedAt
+  messages         SupportCaseMessage[]
+  @@index([status, priority, slaDueAt])
+  @@index([requesterUserId, updatedAt(sort: Desc)])
+  @@map("support_cases")
+}
+
+model SupportCaseMessage {
+  id          String                 @id @default(cuid())
+  caseId      String                 @map("case_id")
+  authorType  SupportCaseMessageKind @map("author_type")
+  authorUserId String?                @map("author_user_id")
+  body        String                 @db.Text
+  redacted    Boolean                @default(false)
+  createdAt   DateTime               @default(now())
+  supportCase SupportCase            @relation(fields: [caseId], references: [id], onDelete: Cascade)
+  @@index([caseId, createdAt])
+  @@map("support_case_messages")
+}
 ```
 
-Add `adminMembership AdminMembership? @relation("AdminUser")` to `User`. Extend the existing `Notification` model—not a parallel delivery table—with `broadcastId String?`, an `AdminBroadcast?` relation, `@@unique([broadcastId, userId])`, and an index on `broadcastId`. PostgreSQL permits multiple null values in that composite unique index, so existing non-broadcast notifications remain unaffected.
+Add `adminMembership AdminMembership? @relation("AdminUser")` and `supportCases SupportCase[]` to `User`. Extend the existing `Notification` model—not a parallel delivery table—with `broadcastId String?`, an `AdminBroadcast?` relation, `@@unique([broadcastId, userId])`, and an index on `broadcastId`. PostgreSQL permits multiple null values in that composite unique index, so existing non-broadcast notifications remain unaffected.
 
 Use a distinct migration for each concern: admin identity/audit, broadcast delivery, and RLS. Seed roles through a one-time controlled script; it must require a specific initial super-admin email and refuse to run in production when a super admin already exists.
 
@@ -203,6 +244,7 @@ Use a separate `AdminShell` and routes below `/admin`.
 | Page | Route | Permission | Content |
 |---|---|---|---|
 | Overview | `/admin` | `observability.read` | Registration, plan, source, queue, and application aggregates; alerts. |
+| Contact us | `/admin/contact-us` | `support_cases.read` | SLA-prioritized customer-support queue, assignments, safe case context, replies, internal notes, and escalation. |
 | Users | `/admin/users` | `users.read` | Search and masked metadata; no private documents or emails. |
 | User detail | `/admin/users/[id]` | `users.read` | Metadata, job/apply counts, sync status, notification metadata, audit timeline. |
 | ATS sources | `/admin/ats` | `ats.read` | Registry, source health, rate limit, error class, lag, and controlled actions. |
@@ -270,7 +312,65 @@ Existing `AiBudget` is per user/month (`used`, `limit`) and the Worker increment
 - `POST /api/admin/v1/ai/budgets/:userId/:month/reset` requires `ai_budget.reset`, second approval, and creates an immutable adjustment record rather than overwriting usage silently.
 - Worker `checkBudget` and `incrementBudget` remain the source for actual consumption. Admin mutations must use the same transaction/locking mechanism so a console update cannot race an apply worker.
 
-## 10. Broadcasts to existing notifications
+## 10. Contact us customer-support system
+
+### 10.1 Scope and privacy boundary
+
+Contact us provides authenticated candidates an in-app route to open, follow, and reply to a support case. It is deliberately separate from Gmail integration: the support console must never ingest Gmail messages, OAuth mailbox data, email bodies, attachments, or candidate resumes. A Contact us message is visible only because the candidate consciously submitted it to support.
+
+Before persisting a message, the server enforces a 5,000-character limit, strips HTML, scans for common secret patterns (API keys, access tokens, private keys, and card numbers), and replaces detected values with `[REDACTED]`. It records only a boolean/redaction reason code in the case audit event. File attachments are out of scope for v1; candidates receive an explanation and a secure product-specific alternative where needed.
+
+The case context panel is generated by a safe DTO and may contain only masked email, display name, plan, account state, notification preference, aggregate job/application counts, Gmail connection status, and recent non-sensitive error codes. It must not include resume/cover-letter text, Persona values, job descriptions, full application URLs, Gmail content, API keys, password data, tokens, or raw logs.
+
+### 10.2 Case lifecycle, SLA, and ownership
+
+```mermaid
+stateDiagram-v2
+  [*] --> open: candidate submits Contact us form
+  open --> in_progress: staff assigns or replies
+  in_progress --> waiting_on_customer: staff requests information
+  waiting_on_customer --> in_progress: candidate replies
+  in_progress --> resolved: staff records resolution
+  resolved --> closed: closure delay expires or candidate confirms
+  resolved --> in_progress: candidate reopens within policy window
+```
+
+SLA is calculated from an allow-listed policy keyed by priority and category. The server owns due dates; clients only render them. A scheduler creates non-content system events and in-app alerts at warning/breach thresholds. Urgent cases may page Operations, but page payloads contain only case ID, category, priority, and safe error code.
+
+Assignment follows least privilege: Support can assign to self or another active Support member; a Support Lead or Operations can reassign across queues. Only Operations can accept an escalation to a technical/ATS/Worker incident. Billing cases can be assigned to Billing but do not grant that role access to unrelated technical cases.
+
+### 10.3 Staff workspace UX and responsive behavior
+
+The `/admin/contact-us` desktop workspace uses a three-pane layout: a filterable case queue, selected conversation, and safe context/SLA panel. Customer replies and internal notes are visibly different in colour, icon, label, and screen-reader text. The reply composer defaults to a customer-visible reply; changing to internal note requires an explicit tab selection. High-risk actions (escalate, merge, close) show a concise confirmation that names the effect.
+
+On screens below 1024px, the queue remains the primary list and opening a case shows the conversation full-screen; safe context opens as a bottom sheet. On screens below 768px, filters are a modal sheet, the composer remains sticky above the bottom navigation, table columns become labelled summary rows, and all primary actions retain a 44px touch target. SLA severity must never rely on colour alone: include a text label and remaining/overdue time.
+
+Accessibility requirements: keyboard navigation through queue, messages, composer, and actions; focus returns to the selected queue row after closing a panel; announcements for case assignment/SLA changes; visible focus; semantic headings; and an ARIA live region for new case messages. The privacy guardrail is persistent but concise, not a dismissible warning.
+
+### 10.4 API contract and existing-system integration
+
+Candidate routes remain separate from administrator routes:
+
+| Method | Endpoint | Actor | Rule |
+|---|---|---|---|
+| GET/POST | `/api/contact-us/cases` | authenticated candidate | Lists only `requesterUserId = auth.userId`; creates a sanitized case and initial customer message. |
+| GET/POST | `/api/contact-us/cases/:id/messages` | authenticated candidate | Reads/replies only to own case; never returns internal notes or staff-only context. |
+| GET | `/api/admin/v1/support/cases` | `support_cases.read` | Cursor-paginated operational queue with safe DTOs and case messages. |
+| PATCH | `/api/admin/v1/support/cases/:id` | `support_cases.assign` or `support_cases.resolve` | Versioned status/priority/assignment update with reason and audit. |
+| POST | `/api/admin/v1/support/cases/:id/reply` | `support_cases.reply` | Sanitizes response, writes a staff reply, sends an in-app `contact_us_reply` notification. |
+| POST | `/api/admin/v1/support/cases/:id/notes` | `support_cases.note` | Internal note only; it is excluded from candidate queries and notifications. |
+| POST | `/api/admin/v1/support/cases/:id/escalate` | `support_cases.escalate` | Creates a safe incident handoff and audit event; no candidate content in the handoff. |
+| GET/PATCH | `/api/admin/v1/support/sla-policies` | `support_sla.manage` | Versioned allow-listed category/priority durations and warning thresholds. |
+
+All staff writes require `reason`, CSRF validation, `Idempotency-Key`, optimistic versioning, and an `AdminAuditLog` entry. Existing `notifications` APIs need no ownership change: staff reply creates the standard row `{ type: 'contact_us_reply', userId, title, body }`; candidate `GET /api/notifications` and `PATCH /api/notifications/mark-read` continue to filter by the authenticated user ID.
+
+### 10.5 Support audit events and acceptance tests
+
+Audit actions include `support.case_created`, `support.case_viewed`, `support.case_assigned`, `support.reply_sent`, `support.internal_note_added`, `support.case_escalated`, `support.case_resolved`, `support.sla_breached`, and `support.redaction_applied`. `support.case_viewed` records a case ID and staff actor but never copies message body into the audit log.
+
+Tests must prove that a candidate cannot access another candidate's case; a Support member cannot access prohibited private fields; candidate routes cannot receive internal notes; a staff reply creates only one notification per idempotency key; secret-like text is redacted before storage/display; SLA calculations use server time; and a technical escalation contains no message body or candidate PII beyond the approved safe context.
+
+## 11. Broadcasts to existing notifications
 
 An approved platform broadcast writes a row per recipient to the existing `notifications` table using `type = 'platform_broadcast'`, `title`, `body`, `user_id`, and `broadcast_id`. It is an in-app message only. Existing `GET /api/notifications` already filters by the authenticated `user_id`, so the candidate can see their message; `PATCH /api/notifications/mark-read` continues to enforce that same ownership condition.
 
@@ -286,7 +386,7 @@ Allowed audience selectors are `all_active_users`, plan, location, and an explic
 
 The broadcast worker uses `(broadcast_id, user_id)` uniqueness to make batch retries idempotent. It records counts and classified errors, not a PII recipient snapshot. Product/marketing broadcasts must respect future notification preferences; service outage, legal, and security messages can be policy-defined as mandatory.
 
-## 11. API, authorization, and Worker control contract
+## 12. API, authorization, and Worker control contract
 
 All new admin endpoints live under `/api/admin/v1`. They use cursor pagination, maximum limit 100, `x-request-id`, and `Cache-Control: no-store`. Every write requires CSRF validation, an `Idempotency-Key`, validated input, and a 10–500 character `reason`.
 
@@ -311,7 +411,7 @@ The Worker control plane must never expose Redis, Bull Board, arbitrary job payl
 
 `apps/worker/src/index.ts` must change so Bull Board does not start unless an explicit development-only flag is enabled. In production it must bind to loopback/private network and sit behind an identity-aware proxy; missing `BULL_BOARD_PASSWORD` must deny access, never permit it.
 
-## 12. Audit and observability
+## 13. Audit and observability
 
 Every admin authentication, authorization denial, read of controlled PII metadata, write, export, configuration change, broadcast state change, queue action, role change, session revocation, and break-glass event is written to `AdminAuditLog`.
 
@@ -319,7 +419,7 @@ Audit records contain actor, role, request ID, target type/ID, candidate `userId
 
 The existing observability aggregation over `apply_results` is useful, but must be authenticated and extended safely. It may expose totals, success rate, flow distribution (`programmatic`, `pattern-cache`, `llm`), duration, CAPTCHA rate, and ATS aggregates. It must not expose job URLs, error text containing candidate content, screenshots, HAR files, or worker raw payloads. Add alerts for audit-write failures, unauthorized-admin spikes, use of super-admin/break-glass, source/queue pause, flag change, bulk broadcast, Worker command verification failure, and abnormal AI-budget changes.
 
-## 13. Security controls
+## 14. Security controls
 
 - Administrators require WebAuthn where possible; `super_admin` requires WebAuthn and reauthentication within 15 minutes for high-risk actions.
 - Use secure, HttpOnly, SameSite cookies, CSRF tokens, Origin/Referer validation, strict CSP, dual user/IP rate limits, and no-store caching for admin pages.
@@ -328,7 +428,7 @@ The existing observability aggregation over `apply_results` is useful, but must 
 - Store screenshots/HARs in private storage, authorize per object, and enforce lifecycle deletion. They are never shown in the standard console.
 - RLS rollout must set `SET LOCAL app.user_id` only inside a transaction. Restricted admin views/functions return safe metadata; an admin DB role is not an unrestricted RLS bypass.
 
-## 14. Tests and release acceptance
+## 15. Tests and release acceptance
 
 | Test level | Required coverage |
 |---|---|
@@ -336,6 +436,7 @@ The existing observability aggregation over `apply_results` is useful, but must 
 | API integration | 401/403/success for every endpoint; CSRF; idempotency; pagination cap; version conflict; audit success/denial; no secret/content in payloads or errors. |
 | Tenant isolation | Candidate A cannot read/update/delete candidate B resources, including guessed nested IDs. |
 | Broadcast | Creator cannot approve/publish; preview is anonymous; duplicate batch retry creates one notification; candidate can read/mark only their own delivery. |
+| Contact us | Candidate case isolation; staff DTO redaction; internal-note exclusion; response notification idempotency; secret redaction; server-time SLA; safe escalation handoff; keyboard and mobile workspace flows. |
 | ATS/AI/flags | State transitions, rate-limit ceiling, worker version acknowledgement, budget race safety, flag approval/rollback. |
 | Worker | Signed command verification, nonce replay rejection, allowed-command enforcement, Bull Board disabled in production. |
 | RLS | Cross-tenant SQL under candidate DB identity returns no rows; restricted admin view excludes forbidden fields. |
@@ -346,10 +447,11 @@ Release is blocked until all of these are true:
 - No administrator, including super admin and break-glass, can obtain API keys, password hashes, refresh tokens, full resumes, or email bodies via API, export, log, audit, repository, or database view.
 - Every admin write has reason, idempotency, CSRF, audit, and appropriate approval; audit failure blocks the write.
 - Broadcasts produce only `Notification` rows, use recipient deduplication, and cannot use private content for targeting.
+- Contact us exposes only deliberately submitted support messages and safe context; it never reads Gmail, documents, API keys, OAuth data, or password material.
 - The unauthenticated observability route and publicly reachable Bull Board are removed/secured.
 - Candidate ownership filters and the RLS migration plan are tested and approved.
 
-## 15. Delivery plan
+## 16. Delivery plan
 
 1. **Security baseline:** secure Bull Board, protect current observability, inventory and test candidate `userId` filters.
 2. **Identity and audit:** migrations, role seeds, `requireAdmin`, MFA/session revocation, append-only audit library, safe DTOs.
