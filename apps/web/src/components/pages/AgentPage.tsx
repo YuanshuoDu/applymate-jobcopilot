@@ -414,7 +414,7 @@ const DEFAULT_CFG: UiCfg = {
   followUpDays: 7,
   targetRoles: [], targetLocations: [], excludeCompanies: [], priorityCompanies: [],
   salaryMin: 55000, salaryMax: 90000,
-  aiProvider: 'anthropic', aiModel: 'claude-sonnet-4-6', aiApiKey: '',
+  aiProvider: 'anthropic', aiModel: 'claude-sonnet-5', aiApiKey: '',
 }
 
 export function AgentPage() {

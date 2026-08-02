@@ -2,28 +2,35 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 
 vi.mock('@/lib/db', () => ({ db: {} }))
 
-import { APPLYMATE_BACKING, DEFAULT_AI_CONFIG, modelChat } from './model-router'
+import {
+  APPLYMATE_BACKING,
+  DEFAULT_AI_CONFIG,
+  FEATURE_ROUTING_MODELS,
+  MODEL_CATALOGUE,
+  modelChat,
+  resolveConfig,
+} from './model-router'
 
-describe('modelChat MiniMax M3 compatibility', () => {
+describe('model catalogue and MiniMax compatibility', () => {
   afterEach(() => vi.restoreAllMocks())
 
-  it('uses M3 completion tokens, reasoning split, and an explicit thinking policy', async () => {
+  it('uses MiniMax completion tokens and reasoning split for the current default', async () => {
     const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response(JSON.stringify({
       choices: [{ finish_reason: 'stop', message: { content: '{"verdict":"pass"}' } }],
       usage: { prompt_tokens: 12, completion_tokens: 34 },
     })))
 
     const result = await modelChat([{ role: 'user', content: 'Return JSON.' }], {
-      provider: 'minimax', model: 'MiniMax-M3', apiKey: 'test-key', thinking: 'disabled',
+      provider: 'minimax', model: 'MiniMax-M2.7', apiKey: 'test-key',
     }, 2048)
 
     expect(result.text).toBe('{"verdict":"pass"}')
     const request = fetchMock.mock.calls[0][1] as RequestInit
     expect(JSON.parse(String(request.body))).toMatchObject({
-      model: 'MiniMax-M3', max_completion_tokens: 2048, reasoning_split: true,
-      thinking: { type: 'disabled' },
+      model: 'MiniMax-M2.7', max_completion_tokens: 2048, reasoning_split: true,
     })
     expect(JSON.parse(String(request.body))).not.toHaveProperty('max_tokens')
+    expect(JSON.parse(String(request.body))).not.toHaveProperty('thinking')
   })
 
   it('reports an empty final answer with the provider finish reason', async () => {
@@ -32,12 +39,38 @@ describe('modelChat MiniMax M3 compatibility', () => {
     })))
 
     await expect(modelChat([{ role: 'user', content: 'Return JSON.' }], {
-      provider: 'minimax', model: 'MiniMax-M3', apiKey: 'test-key',
+      provider: 'minimax', model: 'MiniMax-M2.7', apiKey: 'test-key',
     })).rejects.toThrow('minimax returned no final content (finish reason: length)')
   })
 
-  it('uses M3 as both platform defaults', () => {
-    expect(DEFAULT_AI_CONFIG).toMatchObject({ provider: 'minimax', model: 'MiniMax-M3', thinking: 'adaptive' })
-    expect(APPLYMATE_BACKING).toMatchObject({ provider: 'minimax', model: 'MiniMax-M3', thinking: 'adaptive' })
+  it('uses M2.7 as both platform defaults', () => {
+    expect(DEFAULT_AI_CONFIG).toMatchObject({ provider: 'minimax', model: 'MiniMax-M2.7' })
+    expect(APPLYMATE_BACKING).toMatchObject({ provider: 'minimax', model: 'MiniMax-M2.7' })
+  })
+
+  it('keeps only three feature-routing choices including the ApplyMate default', () => {
+    expect(FEATURE_ROUTING_MODELS.map(m => `${m.provider}/${m.model}`)).toEqual([
+      'anthropic/claude-sonnet-5',
+      'kimi/kimi-k2.5',
+    ])
+    expect(MODEL_CATALOGUE.some(m => m.provider === 'kimi' && m.defaultBase === 'https://api.moonshot.ai/v1')).toBe(true)
+  })
+
+  it('calls Kimi through Moonshot’s OpenAI-compatible endpoint', async () => {
+    const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response(JSON.stringify({
+      choices: [{ message: { content: 'ok' } }],
+    })))
+
+    await expect(modelChat([{ role: 'user', content: 'Ping' }], {
+      provider: 'kimi', model: 'kimi-k2.5', apiKey: 'test-key',
+    })).resolves.toMatchObject({ provider: 'kimi', model: 'kimi-k2.5', text: 'ok' })
+
+    expect(fetchMock.mock.calls[0][0]).toBe('https://api.moonshot.ai/v1/chat/completions')
+  })
+
+  it('normalizes a retired saved model to its provider current model', () => {
+    expect(resolveConfig({ provider: 'openai', model: 'gpt-4o', apiKey: 'test-key' })).toMatchObject({
+      provider: 'openai', model: 'gpt-5.6-terra', apiKey: 'test-key',
+    })
   })
 })

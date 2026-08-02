@@ -9,8 +9,8 @@ import { modelChat, stripFences, withMiniMaxThinking, type AiConfig } from '@/li
 import { db } from '@/lib/db'
 
 const COVER_FALLBACKS: AiConfig[] = [
-  { provider: 'deepseek', model: 'deepseek-chat' },
-  { provider: 'minimax',  model: 'MiniMax-M3', thinking: 'disabled' },
+  { provider: 'deepseek', model: 'deepseek-v4-pro' },
+  { provider: 'minimax',  model: 'MiniMax-M2.7' },
 ]
 import type { ResumeContent } from '@/lib/types'
 

@@ -296,8 +296,8 @@ Respond ONLY in valid JSON (no markdown):
     if (typeof fix === 'string') {
       const named: Record<string, Record<string, unknown>> = {
         'no_jobs_found':              { dailyLimit: Math.min((this.ctx.agentCfg.dailyLimit ?? 10) * 2, 50) },
-        'all_scoring_failed':         { model: 'claude-haiku-4-5-20251001' },
-        'too_many_scoring_failures':  { model: 'claude-haiku-4-5-20251001' },
+        'all_scoring_failed':         { model: 'claude-sonnet-5' },
+        'too_many_scoring_failures':  { model: 'claude-sonnet-5' },
       }
       const resolved = named[fix]
       if (resolved) { this.applyFix(resolved, stage) }

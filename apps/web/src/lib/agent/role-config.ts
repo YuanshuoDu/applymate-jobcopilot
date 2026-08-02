@@ -12,12 +12,12 @@ export type AgentRoleType = 'scout' | 'analyst' | 'writer' | 'reviewer' | 'execu
 export const AGENT_ROLES: AgentRoleType[] = ['scout', 'analyst', 'writer', 'reviewer', 'executor', 'auditor']
 
 export const ROLE_DEFAULTS: Record<AgentRoleType, { provider: string; model: string }> = {
-  scout:    { provider: 'minimax', model: 'MiniMax-M3' },
-  analyst:  { provider: 'minimax', model: 'MiniMax-M3' },
-  writer:   { provider: 'minimax', model: 'MiniMax-M3' },
-  reviewer: { provider: 'minimax', model: 'MiniMax-M3' },
-  executor: { provider: 'minimax', model: 'MiniMax-M3' },
-  auditor:  { provider: 'minimax', model: 'MiniMax-M3' },
+  scout:    { provider: 'minimax', model: 'MiniMax-M2.7' },
+  analyst:  { provider: 'minimax', model: 'MiniMax-M2.7' },
+  writer:   { provider: 'minimax', model: 'MiniMax-M2.7' },
+  reviewer: { provider: 'minimax', model: 'MiniMax-M2.7' },
+  executor: { provider: 'minimax', model: 'MiniMax-M2.7' },
+  auditor:  { provider: 'minimax', model: 'MiniMax-M2.7' },
 }
 
 const LEGACY_ROLE_DEFAULTS: Record<AgentRoleType, { provider: string; model: string }> = {
@@ -99,7 +99,7 @@ export interface AgentRoleConfig {
 
 export type { RoleConfigMap }
 
-const PROVIDERS = new Set<Provider>(['anthropic', 'openai', 'deepseek', 'minimax', 'qwen', 'zhipu', 'custom'])
+const PROVIDERS = new Set<Provider>(['anthropic', 'openai', 'deepseek', 'minimax', 'qwen', 'zhipu', 'kimi', 'custom'])
 
 /**
  * Resolves a per-role override without bypassing the user's feature-level AI
@@ -117,10 +117,13 @@ export function roleAiConfig(
   const isLegacyDefault = !config.apiKey
     && config.provider === legacy.provider
     && config.model === legacy.model
-  const isPlatformDefault = !config.apiKey
+  const isRetiredPlatformDefault = !config.apiKey
     && config.provider === 'minimax'
     && config.model === 'MiniMax-M3'
-  if (isLegacyDefault || isPlatformDefault) return fallback
+  const isCurrentPlatformDefault = !config.apiKey
+    && config.provider === 'minimax'
+    && config.model === 'MiniMax-M2.7'
+  if (isLegacyDefault || isRetiredPlatformDefault || isCurrentPlatformDefault) return fallback
 
   const provider = config.provider as Provider
   if (provider === fallback.provider) {

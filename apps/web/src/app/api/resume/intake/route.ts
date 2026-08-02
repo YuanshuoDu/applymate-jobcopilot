@@ -18,8 +18,8 @@ import { modelChat, parseAiJson, loadUserAiConfig, withMiniMaxThinking, type AiC
 import type { ResumeContent } from '@/lib/types'
 
 const PARSE_FALLBACKS: AiConfig[] = [
-  { provider: 'deepseek', model: 'deepseek-chat' },
-  { provider: 'minimax',  model: 'MiniMax-M3', thinking: 'disabled' },
+  { provider: 'deepseek', model: 'deepseek-v4-pro' },
+  { provider: 'minimax',  model: 'MiniMax-M2.7' },
 ]
 
 const MAX_BYTES = 5 * 1024 * 1024 // 5 MB

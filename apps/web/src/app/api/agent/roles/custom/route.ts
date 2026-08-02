@@ -41,7 +41,7 @@ export async function POST(req: NextRequest) {
       description: description?.trim()  || null,
       systemPrompt: systemPrompt?.trim() || null,
       provider:    provider             || 'anthropic',
-      model:       model                || 'claude-haiku-4-5-20251001',
+      model:       model                || 'claude-sonnet-5',
       insertAfter: after,
       enabled:     true,
     },

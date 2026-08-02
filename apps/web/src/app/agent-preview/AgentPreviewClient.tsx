@@ -129,7 +129,7 @@ export function AgentPreviewClient() {
           <div style={composerBox}>
             <textarea placeholder="Ask ApplyMate to search, score, apply, or create an automation..." style={textareaStyle} />
             <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
-              <div style={{ display: 'flex', gap: 8 }}><button style={iconButton}>+</button><button style={selectButton}>MiniMax M3 ▾</button></div>
+              <div style={{ display: 'flex', gap: 8 }}><button style={iconButton}>+</button><button style={selectButton}>MiniMax M2.7 ▾</button></div>
               <button style={sendButton}>↑</button>
             </div>
           </div>

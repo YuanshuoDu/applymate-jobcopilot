@@ -12,8 +12,8 @@ import type { ApplicationAuditFinding, ResumeContent } from '@/lib/types'
 type Params = { params: Promise<{ id: string }> }
 
 const COVER_FALLBACKS: AiConfig[] = [
-  { provider: 'deepseek', model: 'deepseek-chat' },
-  { provider: 'minimax',  model: 'MiniMax-M3', thinking: 'disabled' },
+  { provider: 'deepseek', model: 'deepseek-v4-pro' },
+  { provider: 'minimax',  model: 'MiniMax-M2.7' },
 ]
 
 export async function POST(req: NextRequest, { params }: Params) {

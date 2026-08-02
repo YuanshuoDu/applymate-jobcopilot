@@ -26,7 +26,7 @@ const DEFAULTS = {
   weeklySummary:     false,
   followUpReminder:  true,
   followUpDays:      7,
-  model:             'claude-sonnet-4-6',
+  model:             'claude-sonnet-5',
 }
 
 const BOOLEAN_FIELDS = [

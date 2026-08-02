@@ -9,7 +9,7 @@ import { useApi, apiMutate } from '@/lib/hooks'
 import { useI18n, LANGUAGES, type Lang } from '@/lib/i18n'
 import { useTheme, type ThemeMode } from '@/components/ThemeProvider'
 import {
-  MODEL_CATALOGUE, PROVIDER_LABELS, FEATURE_LABELS, APPLYMATE_BACKING, APPLYMATE_LABEL,
+  MODEL_CATALOGUE, FEATURE_ROUTING_MODELS, PROVIDER_LABELS, FEATURE_LABELS, APPLYMATE_BACKING, APPLYMATE_LABEL,
   type Provider, type AiConfig, type FeatureId, type UserAiSettings,
 } from '@/lib/model-router'
 
@@ -834,11 +834,11 @@ const KEY_HINTS: Partial<Record<Provider, { href: string }>> = {
   minimax:   { href: 'https://platform.minimax.chat/user-center/basic-information/interface-key' },
   qwen:      { href: 'https://bailian.console.aliyun.com/api-key' },
   zhipu:     { href: 'https://bigmodel.cn/usercenter/apikeys' },
+  kimi:      { href: 'https://platform.moonshot.ai/console/api-keys' },
 }
 
 const PROVIDERS_WITH_MODELS = Array.from(new Set(MODEL_CATALOGUE.map(m => m.provider))) as Provider[]
 const FEATURE_IDS = Object.keys(FEATURE_LABELS) as FeatureId[]
-const RECOMMENDED_MODELS = MODEL_CATALOGUE.filter(m => m.label.includes('★'))
 
 type TestStatus = 'idle' | 'testing' | 'ok' | { error: string }
 
@@ -928,7 +928,7 @@ function AiModelSettings() {
       {/* ── 分功能模型控制 ── */}
       <SettingsSection title={t('settings.ai.featuresTitle')}>
         <div style={{ fontSize: 11, color: 'var(--text-muted)', marginBottom: 14, lineHeight: 1.6 }}>
-          {t('settings.ai.featuresDesc').replace('ApplyMate AI', APPLYMATE_LABEL)}
+          {t('settings.ai.featuresDesc').replace('ApplyMate AI', APPLYMATE_LABEL)} 仅提供 3 个统一选项，避免每个工作流出现冗长且不一致的型号列表。
         </div>
         <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
           {FEATURE_IDS.map(id => {
@@ -1061,29 +1061,13 @@ function FeatureModelPicker({ value, onChange }: {
 
             <div style={{ height: 1, background: 'var(--border)', margin: '2px 0' }} />
 
-            {/* ── Recommended ── */}
             <div style={{ padding: '5px 12px 3px', fontSize: 9, fontWeight: 700, color: 'var(--primary)', letterSpacing: 1 }}>{t('settings.ai.recommended').toUpperCase()}</div>
-            {RECOMMENDED_MODELS.map(m => {
+            {FEATURE_ROUTING_MODELS.map(m => {
               const active = !isDefault && value?.provider === m.provider && value?.model === m.model
               return (
-                <ModelOption key={`rec-${m.model}`} m={m} active={active} onSelect={() => { onChange({ provider: m.provider, model: m.model }); setOpen(false) }} />
+                <ModelOption key={m.model} m={m} active={active} onSelect={() => { onChange({ provider: m.provider, model: m.model }); setOpen(false) }} />
               )
             })}
-
-            <div style={{ height: 1, background: 'var(--border)', margin: '4px 0' }} />
-
-            {/* ── 按提供商分组完整列表 ── */}
-            {PROVIDERS_WITH_MODELS.map(p => (
-              <div key={p}>
-                <div style={{ padding: '5px 12px', fontSize: 9, fontWeight: 700, color: 'var(--text-muted)', letterSpacing: 1 }}>{PROVIDER_LABELS[p].toUpperCase()}</div>
-                {MODEL_CATALOGUE.filter(m => m.provider === p).map(m => {
-                  const active = !isDefault && value?.provider === p && value?.model === m.model
-                  return (
-                    <ModelOption key={m.model} m={m} active={active} onSelect={() => { onChange({ provider: p, model: m.model }); setOpen(false) }} />
-                  )
-                })}
-              </div>
-            ))}
           </div>
         </>
       )}

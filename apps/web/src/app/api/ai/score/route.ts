@@ -9,9 +9,8 @@ import type { ResumeContent } from '@/lib/types'
 
 const SCORE_FALLBACKS: AiConfig[] = [
   withMiniMaxThinking(APPLYMATE_BACKING, 'disabled'),
-  { provider: 'deepseek', model: 'deepseek-chat' },
-  { provider: 'deepseek', model: 'deepseek-v4-flash' },
-  { provider: 'minimax', model: 'MiniMax-Text-01' },
+  { provider: 'deepseek', model: 'deepseek-v4-pro' },
+  { provider: 'minimax', model: 'MiniMax-M2.7' },
 ]
 
 export async function POST(req: NextRequest) {
