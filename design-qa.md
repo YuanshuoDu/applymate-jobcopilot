@@ -3,36 +3,37 @@
 ## Evidence
 
 - New-chat reference: `C:\Users\Steven.du\AppData\Local\Temp\codex-clipboard-7f876dab-aaf3-45ab-be79-a53f3d0052b3.png`.
-- Default-model composer reference: `C:\Users\Steven.du\AppData\Local\Temp\codex-clipboard-ebb6702b-c0f2-4df2-82cd-3f8e09881b25.png`.
-- Implementation: in-app browser capture at `http://localhost:3001/?page=agent`, desktop viewport `1280 × 720`, captured 2026-08-02. The visible implementation is rendered at the same desktop density (`1×`) and the tab remains open as the local deliverable.
+- Composer reference: `C:\Users\Steven.du\AppData\Local\Temp\codex-clipboard-ebb6702b-c0f2-4df2-82cd-3f8e09881b25.png`.
+- Implementation: in-app browser capture at `http://localhost:3001/?page=agent`, desktop viewport `1280 × 720`, captured 2026-08-02 at `1×` density. The local Agent tab remains open as the deliverable.
 
 ## Comparison scope
 
-The supplied composer image identifies a control to remove rather than a layout to reproduce: basic Agent chat must use its server-resolved default model and must not expose a per-message selector. The implementation was compared at the same composer state (empty input, no menu open); the app shell and new-chat content are intentionally outside the source crop.
+The reference shows the composer’s model-selector position. The required variation keeps that position visible, but turns it into a neutral, locked advanced-feature affordance. Basic chat remains tied to the server-resolved Agent default rather than a temporary per-message choice.
 
 ## Findings
 
 - No actionable P0/P1/P2 findings.
-- The large model selector shown in the source crop is absent from the rendered composer. The composer now keeps only context attachment and send controls, producing the requested direct-chat state.
-- The source does not specify an alternative in-chat advanced-model UI. ApplyMate's existing Settings → AI Models feature-level picker remains the advanced, persisted place to choose a model for the `agent` feature; it is intentionally not duplicated in the composer.
+- The composer displays a compact grey `Lock` + `Model selection` + `Advanced` control in the former selector position. It is visually subordinate to the context and send actions.
+- Activating the control reveals an accessible explanation and a functional route to `/?page=settings&tab=apiKeys`, where the existing Feature Model Routing picker opens with the `AI Agent` model override available.
+- The first implementation iteration had removed the selector area completely. It was corrected to the locked, grey advanced prompt described above; browser verification confirmed the revised state and destination.
 
 ## Required fidelity surfaces
 
 | Surface | Result | Evidence |
 | --- | --- | --- |
-| Fonts and typography | Pass | Composer continues to inherit existing ApplyMate font, input sizing, and button weight. |
-| Spacing and layout rhythm | Pass | Removing the wide selector leaves the established 28px context control aligned with the send control; no composer overflow or shifted input. |
-| Colors and visual tokens | Pass | Existing background, border, primary send state, and muted disabled state are unchanged. |
-| Image and asset fidelity | Pass | Neither target requires raster assets. Existing product icons remain unchanged. |
-| Copy and content | Pass | The generic model label is removed; the input remains focused on the user task. |
+| Fonts and typography | Pass | The compact label and badge inherit the existing ApplyMate composer scale and weight hierarchy. |
+| Spacing and layout rhythm | Pass | The lock entry follows the existing 28px composer-control rhythm and does not shift the input or send action. |
+| Colors and visual tokens | Pass | Grey border, secondary surface, muted label, and subdued badge communicate a locked non-default capability without imitating an enabled model picker. |
+| Image and asset fidelity | Pass | The target contains standard UI controls only. The existing lucide icon library supplies the lock glyph; no raster or custom-drawn assets are required. |
+| Copy and content | Pass | The control says `Model selection` and `Advanced`; the prompt states that basic chat keeps the default Agent model. |
 
 ## Functional checks
 
-- Normal chat request body contains only `sessionId` and `messages`; it cannot supply a client-selected model.
-- Server ignores a legacy client `model` value and uses the authenticated user's resolved `agent` feature configuration.
-- Targeted tests: 17 tests passed.
-- Full Web suite passed; TypeScript check passed.
-- Browser-rendered Agent page confirms the selector is absent and the composer remains usable.
+- Basic chat requests omit the client model field, and the API rejects legacy client model overrides in favor of the authenticated Agent feature configuration.
+- Locked entry → advanced explanation → `Open advanced settings` reaches Settings → Keys & connections with Feature Model Routing and the AI Agent picker visible.
+- Targeted tests: 18 tests passed.
+- TypeScript check passed.
+- Browser-rendered Agent and Settings states were verified; no console errors on the clean Agent preview.
 
 ## Final result
 

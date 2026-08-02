@@ -89,6 +89,12 @@ function Toggle({ value, onChange }: { value: boolean; onChange: (v: boolean) =>
 
 type Tab = 'profile' | 'appearance' | 'accounts' | 'apiKeys' | 'billing' | 'notifs' | 'privacy'
 
+function initialSettingsTab(): Tab {
+  if (typeof window === 'undefined') return 'profile'
+  const value = new URLSearchParams(window.location.search).get('tab')
+  return value === 'apiKeys' ? 'apiKeys' : 'profile'
+}
+
 const THEME_OPTIONS: { mode: ThemeMode; icon: string }[] = [
   { mode: 'light', icon: '☀' },
   { mode: 'system', icon: '💻' },
@@ -136,7 +142,7 @@ export function SettingsPage() {
     }
   }, [user])
 
-  const [activeTab,      setActiveTab     ] = useState<Tab>('profile')
+  const [activeTab,      setActiveTab     ] = useState<Tab>(initialSettingsTab)
   const [notifs,         setNotifs        ] = useState({ apply: true, reject: true, interview: true, offer: true, weekly: false, followUp: true })
   const [showCancelModal,   setShowCancelModal]   = useState(false)
   const [connectedProviders, setConnectedProviders] = useState<{ provider: string; account: string }[]>([])

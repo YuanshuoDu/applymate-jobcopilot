@@ -1,6 +1,7 @@
 'use client'
 
 import React from 'react'
+import { LockKeyhole } from 'lucide-react'
 import { ComposerMenuButton, ComposerMenuEmpty, ComposerMenuSection, formatBytes } from '@/components/agent-workspace/ComposerParts'
 
 export interface ComposerJob {
@@ -76,6 +77,7 @@ export function AgentComposer({
   onAppendComposerContext,
 }: AgentComposerProps) {
   const canSend = chatInput.trim().length > 0 && !chatLoading
+  const [advancedModelOpen, setAdvancedModelOpen] = React.useState(false)
 
   return (
     <div style={{ borderTop: '0.5px solid var(--border)', padding: '10px 14px', background: 'var(--bg-secondary)', flexShrink: 0 }}>
@@ -164,6 +166,7 @@ export function AgentComposer({
             />
             <button
               onClick={() => {
+                setAdvancedModelOpen(false)
                 onAddMenuOpenChange(open => !open)
               }}
               title="Add context"
@@ -217,6 +220,41 @@ export function AgentComposer({
                 </ComposerMenuSection>
               </div>
             )}
+            <div style={{ position: 'relative' }}>
+              <button
+                type="button"
+                onClick={() => {
+                  onAddMenuOpenChange(false)
+                  setAdvancedModelOpen(open => !open)
+                }}
+                aria-expanded={advancedModelOpen}
+                aria-haspopup="dialog"
+                title="Model selection is an advanced feature"
+                style={{ height: 28, display: 'inline-flex', alignItems: 'center', gap: 6, padding: '0 9px', borderRadius: 7, border: '1px solid var(--border)', background: 'var(--bg-secondary)', color: 'var(--text-muted)', cursor: 'pointer', fontFamily: 'inherit', fontSize: 11, fontWeight: 650 }}
+              >
+                <LockKeyhole size={13} aria-hidden="true" />
+                <span>Model selection</span>
+                <span style={{ padding: '1px 5px', borderRadius: 999, background: 'var(--border)', color: 'var(--text-subtle)', fontSize: 9, fontWeight: 750 }}>Advanced</span>
+              </button>
+              {advancedModelOpen && (
+                <div role="dialog" aria-label="Advanced model selection" style={{ position: 'absolute', bottom: 'calc(100% + 8px)', left: 0, width: 276, padding: 12, border: '1px solid var(--border)', borderRadius: 10, background: 'var(--bg)', boxShadow: '0 16px 36px rgba(15,23,42,0.18)', zIndex: 100 }}>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 7, fontSize: 12, fontWeight: 700, color: 'var(--text)' }}>
+                    <LockKeyhole size={14} color="var(--text-muted)" aria-hidden="true" />
+                    Advanced model settings
+                  </div>
+                  <p style={{ margin: '6px 0 10px', fontSize: 11, lineHeight: 1.5, color: 'var(--text-muted)' }}>
+                    Basic chat uses your default Agent model. Configure an advanced override in Settings.
+                  </p>
+                  <button
+                    type="button"
+                    onClick={() => { window.location.assign('/?page=settings&tab=apiKeys') }}
+                    style={{ width: '100%', minHeight: 30, border: '1px solid var(--border)', borderRadius: 7, background: 'var(--bg-secondary)', color: 'var(--text)', cursor: 'pointer', fontFamily: 'inherit', fontSize: 11, fontWeight: 650 }}
+                  >
+                    Open advanced settings
+                  </button>
+                </div>
+              )}
+            </div>
           </div>
           <button onClick={() => onSendChat(chatInput)} disabled={!canSend}
             title="Send message"
