@@ -6,6 +6,13 @@ import {
 } from "./automation-scheduler.js";
 
 describe("automation scheduler", () => {
+  it("checks for due automations every 15 minutes by default", () => {
+    expect(automationSchedulerConfig({
+      AGENT_WEB_URL: "https://app.applymate.test",
+      AGENT_AUTOMATION_CRON_SECRET: "scheduler-secret",
+    }).intervalMs).toBe(15 * 60_000);
+  });
+
   it("uses the worker web origin and dedicated scheduler secret", () => {
     expect(automationSchedulerConfig({
       AGENT_WEB_URL: "https://app.applymate.test/",

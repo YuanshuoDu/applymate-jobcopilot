@@ -9,6 +9,7 @@ import { Queue, Worker } from "bullmq"
 import { Redis } from "ioredis"
 import { randomUUID } from "node:crypto"
 import { getPool } from "../db/apply-results.js"
+import { workerPollingOptions } from "./worker-polling-options.js"
 
 const redisUrl = process.env.REDIS_URL ?? "redis://localhost:6379"
 const connection = new Redis(redisUrl, { maxRetriesPerRequest: null })
@@ -259,6 +260,7 @@ export const scoutWorker = new Worker<ScoutTaskPayload>(
   },
   {
     connection,
+    ...workerPollingOptions(),
     concurrency: 1,
   }
 )

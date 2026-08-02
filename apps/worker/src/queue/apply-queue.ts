@@ -28,6 +28,7 @@ import { replayPattern } from "../patterns/replay.js";
 import { unlinkSync } from "node:fs";
 import { claimApplicationTask, completeFillForReview, finishApplicationTask, needsUserTakeover, pauseForFormInput } from "../db/application-task-state.js";
 import { formNeedsMessage, inspectFormReviewNeeds } from "../harness/form-review.js";
+import { workerPollingOptions } from "./worker-polling-options.js";
 
 const redisUrl = process.env.REDIS_URL ?? "redis://localhost:6379";
 export const connection = new Redis(redisUrl, { maxRetriesPerRequest: null });
@@ -388,6 +389,7 @@ export const applyWorker = new Worker<ApplyTaskPayload>(
   },
   {
     connection,
+    ...workerPollingOptions(),
     concurrency: Number(process.env.CLOAK_MAX_WORKERS ?? "1"),
   }
 );

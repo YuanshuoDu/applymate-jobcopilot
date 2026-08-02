@@ -1,5 +1,6 @@
 import { Queue, Worker } from "bullmq";
 import { Redis } from "ioredis";
+import { workerPollingOptions } from "./worker-polling-options.js";
 
 export const AGENT_RUN_QUEUE_NAME = "agent-runs";
 
@@ -45,7 +46,7 @@ export const agentRunWorker = new Worker<AgentRunTaskPayload>(
     console.log(`[agent-run-worker] Session ${task.data.sessionId}: ${result?.status ?? "completed"}`);
     return result;
   },
-  { connection, concurrency: 1 },
+  { connection, ...workerPollingOptions(), concurrency: 1 },
 );
 
 export async function closeAgentRunResources() {

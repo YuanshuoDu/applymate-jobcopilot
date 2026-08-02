@@ -1,4 +1,4 @@
-const DEFAULT_INTERVAL_MS = 5 * 60_000;
+const DEFAULT_INTERVAL_MS = 15 * 60_000;
 const MINIMUM_INTERVAL_MS = 60_000;
 
 export interface AutomationSchedulerStatus {
