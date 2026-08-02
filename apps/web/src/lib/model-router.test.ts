@@ -5,7 +5,6 @@ vi.mock('@/lib/db', () => ({ db: {} }))
 import {
   APPLYMATE_BACKING,
   DEFAULT_AI_CONFIG,
-  FEATURE_ROUTING_MODELS,
   MODEL_CATALOGUE,
   modelChat,
   resolveConfig,
@@ -48,11 +47,13 @@ describe('model catalogue and MiniMax compatibility', () => {
     expect(APPLYMATE_BACKING).toMatchObject({ provider: 'minimax', model: 'MiniMax-M2.7' })
   })
 
-  it('keeps only three feature-routing choices including the ApplyMate default', () => {
-    expect(FEATURE_ROUTING_MODELS.map(m => `${m.provider}/${m.model}`)).toEqual([
-      'anthropic/claude-sonnet-5',
-      'kimi/kimi-k2.5',
-    ])
+  it('keeps the curated provider catalogue compact, with four OpenAI options', () => {
+    expect(MODEL_CATALOGUE.filter(m => m.provider === 'openai')).toHaveLength(4)
+    expect(MODEL_CATALOGUE.filter(m => m.provider === 'anthropic')).toHaveLength(2)
+    expect(MODEL_CATALOGUE.filter(m => m.provider === 'deepseek')).toHaveLength(2)
+    expect(MODEL_CATALOGUE.filter(m => m.provider === 'minimax')).toHaveLength(2)
+    expect(MODEL_CATALOGUE.filter(m => m.provider === 'qwen')).toHaveLength(2)
+    expect(MODEL_CATALOGUE.filter(m => m.provider === 'zhipu')).toHaveLength(2)
     expect(MODEL_CATALOGUE.some(m => m.provider === 'kimi' && m.defaultBase === 'https://api.moonshot.ai/v1')).toBe(true)
   })
 
@@ -70,7 +71,7 @@ describe('model catalogue and MiniMax compatibility', () => {
 
   it('normalizes a retired saved model to its provider current model', () => {
     expect(resolveConfig({ provider: 'openai', model: 'gpt-4o', apiKey: 'test-key' })).toMatchObject({
-      provider: 'openai', model: 'gpt-5.6-terra', apiKey: 'test-key',
+      provider: 'openai', model: 'gpt-5.5', apiKey: 'test-key',
     })
   })
 })

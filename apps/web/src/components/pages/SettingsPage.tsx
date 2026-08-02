@@ -9,7 +9,7 @@ import { useApi, apiMutate } from '@/lib/hooks'
 import { useI18n, LANGUAGES, type Lang } from '@/lib/i18n'
 import { useTheme, type ThemeMode } from '@/components/ThemeProvider'
 import {
-  MODEL_CATALOGUE, FEATURE_ROUTING_MODELS, PROVIDER_LABELS, FEATURE_LABELS, APPLYMATE_BACKING, APPLYMATE_LABEL,
+  MODEL_CATALOGUE, PROVIDER_LABELS, APPLYMATE_BACKING, APPLYMATE_LABEL,
   type Provider, type AiConfig, type FeatureId, type UserAiSettings,
 } from '@/lib/model-router'
 
@@ -838,7 +838,30 @@ const KEY_HINTS: Partial<Record<Provider, { href: string }>> = {
 }
 
 const PROVIDERS_WITH_MODELS = Array.from(new Set(MODEL_CATALOGUE.map(m => m.provider))) as Provider[]
-const FEATURE_IDS = Object.keys(FEATURE_LABELS) as FeatureId[]
+
+const FEATURE_GROUPS: Array<{ label: string; description: string; features: FeatureId[] }> = [
+  {
+    label: '简历与岗位分析',
+    description: '简历评分、简历解析、改进建议、面试准备、职位评分与关键词提取',
+    features: ['scoring', 'parsing', 'suggest', 'interviewPrep', 'jobScoring'],
+  },
+  {
+    label: '申请材料生成',
+    description: '求职信、字段建议与表单答案修改',
+    features: ['coverLetter', 'fieldSuggest', 'formRevise'],
+  },
+  {
+    label: 'Agent 自动化',
+    description: 'AI Agent、表单自动填写与无人值守自动申请',
+    features: ['agent', 'formFill', 'autoApply'],
+  },
+]
+
+function groupConfig(settings: UserAiSettings, group: (typeof FEATURE_GROUPS)[number]): AiConfig | null | undefined {
+  const configs = group.features.map(id => settings.features?.[id] ?? null)
+  const signature = (cfg: AiConfig | null) => cfg ? `${cfg.provider}/${cfg.model}` : 'default'
+  return configs.every(cfg => signature(cfg) === signature(configs[0])) ? configs[0] : undefined
+}
 
 type TestStatus = 'idle' | 'testing' | 'ok' | { error: string }
 
@@ -859,8 +882,14 @@ function AiModelSettings() {
     }).catch(() => setLoaded(true))
   }, [])
 
-  function setFeatureCfg(id: FeatureId, cfg: AiConfig | null) {
-    setSettings(prev => ({ ...prev, features: { ...prev.features, [id]: cfg } }))
+  function setFeatureGroupCfg(group: (typeof FEATURE_GROUPS)[number], cfg: AiConfig | null) {
+    setSettings(prev => ({
+      ...prev,
+      features: {
+        ...prev.features,
+        ...Object.fromEntries(group.features.map(id => [id, cfg])),
+      },
+    }))
   }
 
   async function testKey(p: Provider) {
@@ -928,24 +957,28 @@ function AiModelSettings() {
       {/* ── 分功能模型控制 ── */}
       <SettingsSection title={t('settings.ai.featuresTitle')}>
         <div style={{ fontSize: 11, color: 'var(--text-muted)', marginBottom: 14, lineHeight: 1.6 }}>
-          {t('settings.ai.featuresDesc').replace('ApplyMate AI', APPLYMATE_LABEL)} 仅提供 3 个统一选项，避免每个工作流出现冗长且不一致的型号列表。
+          {t('settings.ai.featuresDesc').replace('ApplyMate AI', APPLYMATE_LABEL)} 已汇总为三类工作流；选择一个模型会同步应用到该类全部功能。
         </div>
         <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
-          {FEATURE_IDS.map(id => {
-            const current   = settings.features?.[id] ?? null
+          {FEATURE_GROUPS.map(group => {
+            const current = groupConfig(settings, group)
+            const mixed = current === undefined
             const isDefault = current === null
             return (
-              <div key={id} style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '10px 12px', background: 'var(--bg-secondary)', borderRadius: 8, border: '0.5px solid var(--border)' }}>
+              <div key={group.label} style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '10px 12px', background: 'var(--bg-secondary)', borderRadius: 8, border: '0.5px solid var(--border)' }}>
                 <div style={{ flex: 1, minWidth: 0 }}>
-                  <div style={{ fontSize: 12, fontWeight: 500, color: 'var(--text)' }}>{t(`feature.${id}`)}</div>
+                  <div style={{ fontSize: 12, fontWeight: 500, color: 'var(--text)' }}>{group.label}</div>
                   <div style={{ fontSize: 10, color: 'var(--text-muted)', marginTop: 2 }}>
-                    {isDefault
+                    {mixed
+                      ? '当前存在不同设置；重新选择会统一覆盖本组。'
+                      : isDefault
                       ? `✦ ${APPLYMATE_LABEL} ${t('settings.ai.defaultLabel')}`
-                      : `${PROVIDER_LABELS[current!.provider]} · ${current!.model}`
+                      : `${PROVIDER_LABELS[current.provider]} · ${current.model}`
                     }
                   </div>
+                  <div style={{ fontSize: 10, color: 'var(--text-muted)', marginTop: 3 }}>{group.description}</div>
                 </div>
-                <FeatureModelPicker value={current} onChange={cfg => setFeatureCfg(id, cfg)} />
+                <FeatureModelPicker value={current ?? null} mixed={mixed} onChange={cfg => setFeatureGroupCfg(group, cfg)} />
               </div>
             )
           })}
@@ -1024,20 +1057,21 @@ function AiModelSettings() {
   )
 }
 
-function FeatureModelPicker({ value, onChange }: {
+function FeatureModelPicker({ value, mixed, onChange }: {
   value:    AiConfig | null
+  mixed?:   boolean
   onChange: (cfg: AiConfig | null) => void
 }) {
   const { t } = useI18n()
   const [open, setOpen] = useState(false)
-  const isDefault = value === null
+  const isDefault = value === null && !mixed
 
   return (
     <div style={{ position: 'relative' }}>
       <button
         onClick={() => setOpen(v => !v)}
         style={{ fontSize: 11, padding: '4px 10px', borderRadius: 6, border: '0.5px solid var(--border)', background: isDefault ? 'rgba(79,70,229,0.06)' : 'var(--bg)', color: isDefault ? 'var(--primary)' : 'var(--text)', cursor: 'pointer', whiteSpace: 'nowrap' }}>
-        {isDefault ? `✦ ${APPLYMATE_LABEL} ▾` : `${value!.model.split('-').slice(-1)[0]} ▾`}
+        {mixed ? 'Mixed ▾' : isDefault ? `✦ ${APPLYMATE_LABEL} ▾` : `${value!.model.split('-').slice(-1)[0]} ▾`}
       </button>
 
       {open && (
@@ -1061,13 +1095,15 @@ function FeatureModelPicker({ value, onChange }: {
 
             <div style={{ height: 1, background: 'var(--border)', margin: '2px 0' }} />
 
-            <div style={{ padding: '5px 12px 3px', fontSize: 9, fontWeight: 700, color: 'var(--primary)', letterSpacing: 1 }}>{t('settings.ai.recommended').toUpperCase()}</div>
-            {FEATURE_ROUTING_MODELS.map(m => {
-              const active = !isDefault && value?.provider === m.provider && value?.model === m.model
-              return (
-                <ModelOption key={m.model} m={m} active={active} onSelect={() => { onChange({ provider: m.provider, model: m.model }); setOpen(false) }} />
-              )
-            })}
+            {PROVIDERS_WITH_MODELS.filter(p => p !== 'custom').map(provider => (
+              <div key={provider}>
+                <div style={{ padding: '5px 12px 3px', fontSize: 9, fontWeight: 700, color: 'var(--text-muted)', letterSpacing: 1 }}>{PROVIDER_LABELS[provider].toUpperCase()}</div>
+                {MODEL_CATALOGUE.filter(m => m.provider === provider).map(m => {
+                  const active = !isDefault && !mixed && value?.provider === m.provider && value?.model === m.model
+                  return <ModelOption key={m.model} m={m} active={active} onSelect={() => { onChange({ provider: m.provider, model: m.model }); setOpen(false) }} />
+                })}
+              </div>
+            ))}
           </div>
         </>
       )}
