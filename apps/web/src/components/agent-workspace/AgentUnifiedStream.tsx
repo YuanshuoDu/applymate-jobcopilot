@@ -181,7 +181,7 @@ export function AgentUnifiedStream({
   }, [])
 
   const isEmpty = log.length === 0 && applyQueue.length === 0 && liveBlocks.length === 0
-  const isNewChatDraft = resetVersion > 0 && isEmpty
+  const isNewChatDraft = isEmpty
   const restoredPolicy = sessionSubmissionPolicy(liveBlocks)
   const effectiveAutonomousMode = restoredPolicy
     ? restoredPolicy === 'autopilot'
@@ -346,10 +346,6 @@ export function AgentUnifiedStream({
         liveBlocks={liveBlocks}
         applyQueue={applyQueue}
         isEmpty={isEmpty}
-        showWelcome={!isNewChatDraft}
-        savedCount={savedCount}
-        pendingCount={pendingCount}
-        autonomousMode={effectiveAutonomousMode}
         revealThinkingVersion={revealThinkingVersion}
         streamScrollRef={streamScrollRef}
         streamEndRef={streamEndRef}

@@ -1,7 +1,7 @@
 'use client'
 
 import React from 'react'
-import { AgentWelcomeTranscript } from '@/components/agent-workspace/AgentWelcomeTranscript'
+import { AgentNewChatWelcome } from '@/components/agent-workspace/AgentNewChatWelcome'
 import { ApplyJobCard, type ApplyReadyJob } from '@/components/agent-workspace/ApplyJobCard'
 import { LiveLogTranscriptBlock, LiveQuestionTranscriptBlock, LiveTranscriptBlock } from '@/components/agent-workspace/LiveTranscriptBlocks'
 import type { TranscriptAction } from '@/components/agent-workspace/TranscriptSpecialBlocks'
@@ -14,10 +14,6 @@ interface AgentLiveStreamBodyProps {
   liveBlocks: AgentTranscriptEvent[]
   applyQueue: ApplyReadyJob[]
   isEmpty: boolean
-  showWelcome: boolean
-  savedCount: number
-  pendingCount: number
-  autonomousMode: boolean
   revealThinkingVersion: number
   streamScrollRef: React.RefObject<HTMLDivElement | null>
   streamEndRef: React.RefObject<HTMLDivElement | null>
@@ -34,10 +30,6 @@ export function AgentLiveStreamBody({
   liveBlocks,
   applyQueue,
   isEmpty,
-  showWelcome,
-  savedCount,
-  pendingCount,
-  autonomousMode,
   revealThinkingVersion,
   streamScrollRef,
   streamEndRef,
@@ -64,16 +56,7 @@ export function AgentLiveStreamBody({
       style={{ flex: 1, minHeight: 0, overflowY: 'auto', overscrollBehavior: 'contain', padding: '18px 20px', display: 'flex', flexDirection: 'column', gap: 12 }}
     >
       {isEmpty ? (
-        showWelcome ? (
-          <div style={{ flex: 1, padding: '4px 0 24px' }}>
-            <AgentWelcomeTranscript
-              savedCount={savedCount}
-              pendingCount={pendingCount}
-              autonomousMode={autonomousMode}
-              onSelectPrompt={onSelectPrompt}
-            />
-          </div>
-        ) : <div style={{ flex: 1 }} aria-label="New chat" />
+        <AgentNewChatWelcome onSelectPrompt={onSelectPrompt} />
       ) : (
         <>
           {log.map((entry, i) => {

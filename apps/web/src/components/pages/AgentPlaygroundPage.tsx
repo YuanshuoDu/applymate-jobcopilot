@@ -436,6 +436,10 @@ export function AgentPlaygroundPage() {
             min-height: 620px !important;
             width: 100% !important;
           }
+
+          .agent-new-chat-starters {
+            grid-template-columns: repeat(2, minmax(0, 1fr)) !important;
+          }
         }
       `}</style>
       {/* TopBar */}
