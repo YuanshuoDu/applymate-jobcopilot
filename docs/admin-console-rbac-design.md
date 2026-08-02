@@ -25,6 +25,8 @@ Existing resources that the console must adapt rather than replace:
 | `User`, `Job`, `Resume`, Persona/Gmail Prisma models | Candidate data is owned by `userId`. | Keep ownership model. Add separate admin tables and use admin-only, metadata-only DTOs. |
 | `/api/notifications` | Reads the authenticated candidate's last 30 days of `notifications`; `/mark-read` updates only that user's rows. | Broadcast deliveries are standard `Notification` rows, so they appear and can be marked read without changing candidate authorization. |
 | `/api/me/ai-budget` | Reads the caller's `ai_budgets` row for the current month. | Keep it candidate-only. The console gets a separate aggregate/read/write admin API with reason and audit controls. |
+| `src/lib/model-router.ts` | Contains a static `MODEL_CATALOGUE` and a hard-coded `APPLYMATE_BACKING` default; user overrides are in `User.preferences.aiSettings`. | Replace the static platform catalogue/default with a versioned, cached server-side control plane. Preserve user BYOK overrides and validate them against provider capabilities. |
+| `SettingsPage.tsx` billing cards | Prices and plan feature lists are currently hard-coded in the client; its `team` card also does not match the `Plan.enterprise` database enum. | Replace with server-provided published plan/entitlement data. The database `Plan` enum remains the source of a user's subscribed plan key. |
 | `/api/admin/observability` | Currently reads all `apply_results` without an admin check. | Treat as a security defect: move/replace with `/api/admin/v1/observability`, require `observability.read`, and remove unauthenticated access before console launch. |
 | `AtsEmployer`, `ApplyResult`, `FormPattern`, `AiBudget` | Existing Prisma models support ATS registry sightings, apply outcomes, pattern cache, and monthly budget. | Do not duplicate them. Add controlled operational configuration and expose only safe aggregates. |
 | Worker queues | BullMQ queues: `apply-tasks` and `scout-tasks`; Worker currently starts Bull Board at `/admin/queues`. | The web app calls a signed, allow-listed Worker control API. Bull Board is private, disabled by default, and never embedded in the console. |
@@ -80,6 +82,8 @@ Roles do not inherit by default. A role is an explicit allow-list of permissions
 | ATS operations | `ats.read`, `ats.update`, `ats.pause`, `ats.resume`, `ats.test`, `ats.registry.manage` |
 | Feature controls | `feature_flags.read`, `feature_flags.update`, `feature_flags.approve` |
 | AI budgets | `ai_budget.read`, `ai_budget.update`, `ai_budget.reset` |
+| AI model control | `ai_models.read`, `ai_models.manage`, `ai_defaults.update`, `ai_defaults.approve`, `ai_catalogue.publish` |
+| Plans and entitlements | `plans.read`, `plans.manage`, `plans.publish`, `entitlements.read`, `entitlements.manage`, `subscriptions.read`, `subscriptions.update` |
 | Worker | `queues.read`, `queues.retry`, `queues.pause`, `queues.resume` |
 | Broadcasts | `broadcasts.create`, `broadcasts.update`, `broadcasts.preview`, `broadcasts.approve`, `broadcasts.publish`, `broadcasts.cancel` |
 | Security | `admin_members.read`, `admin_members.manage`, `admin_roles.manage`, `sessions.revoke`, `audit.read`, `break_glass.request`, `break_glass.approve` |
@@ -185,6 +189,83 @@ Add `adminMembership AdminMembership? @relation("AdminUser")` to `User`. Extend 
 
 Use a distinct migration for each concern: admin identity/audit, broadcast delivery, and RLS. Seed roles through a one-time controlled script; it must require a specific initial super-admin email and refuse to run in production when a super admin already exists.
 
+Add the following versioned control-plane models in separate migrations. Values such as API keys, provider base URLs containing credentials, prompts, and candidate requests must never be stored here.
+
+```prisma
+enum PlatformModelStatus { draft active deprecated retired disabled }
+enum ModelCapability { text chat structured_output streaming vision tool_calling computer_use }
+enum PlanStatus { draft active retired }
+enum BillingInterval { month year }
+
+model PlatformAiModel {
+  id              String              @id @default(cuid())
+  provider        String
+  modelId         String              @map("model_id")
+  displayName     String
+  capabilities    ModelCapability[]
+  inputPriceUsd   Decimal?            @map("input_price_usd") @db.Decimal(12, 6)
+  outputPriceUsd  Decimal?            @map("output_price_usd") @db.Decimal(12, 6)
+  contextTokens   Int?
+  status          PlatformModelStatus @default(draft)
+  supportsByok    Boolean             @default(false)
+  lastVerifiedAt  DateTime?
+  retiredAt       DateTime?
+  version         Int                 @default(1)
+  createdAt       DateTime            @default(now())
+  updatedAt       DateTime            @updatedAt
+  @@unique([provider, modelId])
+  @@index([status, provider])
+  @@map("platform_ai_models")
+}
+
+model PlatformAiRoute {
+  id              String   @id @default(cuid())
+  featureKey      String   @map("feature_key") // must map to an existing FeatureId
+  primaryModelId  String   @map("primary_model_id")
+  fallbackModelId String?  @map("fallback_model_id")
+  enabled         Boolean  @default(true)
+  version         Int      @default(1)
+  changedById     String
+  approvedById    String?
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+  @@unique([featureKey])
+  @@map("platform_ai_routes")
+}
+
+model ProductPlan {
+  id              String      @id @default(cuid())
+  planKey         Plan        @unique
+  displayName     String
+  status          PlanStatus  @default(draft)
+  currency        String      @default("EUR")
+  monthlyAmount   Int?        @map("monthly_amount") // minor currency units
+  annualAmount    Int?        @map("annual_amount")
+  externalPriceId String?     @unique @map("external_price_id")
+  version         Int         @default(1)
+  publishedAt     DateTime?
+  retiredAt       DateTime?
+  createdAt       DateTime    @default(now())
+  updatedAt       DateTime    @updatedAt
+  entitlements    PlanEntitlement[]
+  @@map("product_plans")
+}
+
+model PlanEntitlement {
+  id        String      @id @default(cuid())
+  planId    String
+  key       String      // e.g. auto_apply, ai_credit_monthly, job_tracker_limit
+  value     Json        // typed by the entitlement registry, never arbitrary executable rules
+  createdAt DateTime    @default(now())
+  updatedAt DateTime    @updatedAt
+  plan      ProductPlan @relation(fields: [planId], references: [id], onDelete: Cascade)
+  @@unique([planId, key])
+  @@map("plan_entitlements")
+}
+```
+
+`PlatformAiRoute` needs foreign-key relations to `PlatformAiModel` in the final Prisma schema; the abbreviated example leaves them out only to keep the primary/fallback field names clear. Both model IDs must be different, active, capability-compatible, and server-key-enabled before an admin can publish the route.
+
 ## 6. Sensitive-data contract
 
 | Classification | Examples | Admin API rule |
@@ -209,6 +290,8 @@ Use a separate `AdminShell` and routes below `/admin`.
 | Applications | `/admin/applications` | `applications.read` | Outcome/error metadata and allowed retry/cancel/manual-review actions. |
 | Queues | `/admin/queues` | `queues.read` | Queue aggregates and controlled queue actions, not Bull Board. |
 | AI operations | `/admin/ai` | `ai_budget.read` | Aggregate spend/usage, exceptions, monthly limits, model health. |
+| AI models | `/admin/ai/models` | `ai_models.read` | Model catalogue, provider health, default/backup routes, feature assignments, and retirement history. |
+| Plans and pricing | `/admin/plans` | `plans.read` | Published prices, billing intervals, entitlements, subscription counts, and scheduled changes. |
 | Feature flags | `/admin/platform` | `feature_flags.read` | Environment-scoped flags, rollout state, approval history. |
 | Broadcasts | `/admin/broadcasts` | `broadcasts.create` | Draft, anonymous audience preview, approval, scheduling, delivery results. |
 | Audit/security | `/admin/audit` | `audit.read` | Append-only events, access denials, break-glass, config changes. |
@@ -270,7 +353,105 @@ Existing `AiBudget` is per user/month (`used`, `limit`) and the Worker increment
 - `POST /api/admin/v1/ai/budgets/:userId/:month/reset` requires `ai_budget.reset`, second approval, and creates an immutable adjustment record rather than overwriting usage silently.
 - Worker `checkBudget` and `incrementBudget` remain the source for actual consumption. Admin mutations must use the same transaction/locking mechanism so a console update cannot race an apply worker.
 
-## 10. Broadcasts to existing notifications
+## 10. AI model catalogue, primary default, and fallback default
+
+### 10.1 Runtime resolution order
+
+The console controls the platform-supplied route for each existing `FeatureId` (`scoring`, `parsing`, `suggest`, `coverLetter`, `agent`, `fieldSuggest`, `interviewPrep`, `formFill`, `formRevise`, `autoApply`, and `jobScoring`). It does not overwrite a user's valid BYOK preference.
+
+The effective model resolution order is:
+
+```text
+valid user per-feature BYOK model
+  -> active platform primary model for the feature
+  -> active platform fallback model for the feature
+  -> fail safely with a typed AI-unavailable error
+```
+
+The current `APPLYMATE_BACKING` MiniMax configuration becomes the seeded primary route during migration. A fallback is mandatory for every enabled platform feature. It must be a different model and, where provider failover is needed, preferably a different provider. For provider-specific capabilities such as Anthropic computer use, the fallback must advertise the same required capability; the system must not silently substitute a text-only model.
+
+`resolveFeatureConfig()` is refactored behind a server-side `resolvePlatformAiRoute(featureId)` provider. It reads a versioned cached snapshot of `PlatformAiRoute` and `PlatformAiModel`; it does not import a mutable client-side catalogue. User `preferences.aiSettings` remains a candidate-controlled override, but a retired or invalid override falls through to the platform route rather than sending an obsolete model ID to a provider.
+
+### 10.2 Catalogue lifecycle and admin actions
+
+Models are database records, not TypeScript constants edited on the client. The catalogue can be refreshed when providers release, rename, price-change, deprecate, or retire models.
+
+| Action | Permission | Validation and result |
+|---|---|---|
+| Add/import draft model | `ai_models.manage` | Validate `provider/modelId` format, capabilities, price units, context limit, and provider health. No traffic is sent. |
+| Verify model | `ai_models.manage` | Run a bounded non-candidate health request using platform credentials; store result/timestamp/error class only. |
+| Activate model | `ai_catalogue.publish` | Requires successful verification and audit; makes the model selectable in the user model dropdown only if `supportsByok` is true. |
+| Set primary/fallback route | `ai_defaults.update` + `ai_defaults.approve` | Creator cannot approve; validates distinct active models, required capabilities, provider-key availability, and a rollback route. |
+| Deprecate model | `ai_models.manage` | Removes it from new dropdown selections but preserves existing references long enough to migrate users. |
+| Retire/disable model | `ai_catalogue.publish` | Requires a replacement route and migration preview; existing users fall back safely. |
+
+The admin UI must show the primary and fallback model for every feature, current route version, last successful verification, last failure, token price, and count of users with an affected BYOK selection. It must not show any user API key or prompt content.
+
+### 10.3 Endpoints, cache, and audit
+
+| Method | Endpoint | Permission | Rule |
+|---|---|---|---|
+| GET | `/api/admin/v1/ai/models` | `ai_models.read` | Catalogue, status, capability, price, and health metadata. |
+| POST | `/api/admin/v1/ai/models` | `ai_models.manage` | Create draft only. |
+| POST | `/api/admin/v1/ai/models/:id/verify` | `ai_models.manage` | Bounded health check; no candidate data. |
+| PATCH | `/api/admin/v1/ai/models/:id` | `ai_models.manage` | Edit draft/deprecate metadata with optimistic version. |
+| POST | `/api/admin/v1/ai/routes/:featureKey` | `ai_defaults.update` | Propose a primary/fallback route change. |
+| POST | `/api/admin/v1/ai/routes/:featureKey/approve` | `ai_defaults.approve` | Approve and publish another operator's proposal. |
+| GET | `/api/public/v1/model-catalogue` | candidate session | Returns only active `supportsByok` models and safe display metadata for the dropdown. |
+
+Route changes invalidate the server cache by version and are propagated to the Worker before display as active. The Worker receives only model IDs and a configuration version; provider keys stay in the secret manager. Every request records model/provider/version, feature, token usage, latency, final error class, and fallback occurrence—not prompts, responses, or keys. Where an AI gateway is adopted, attach user/feature/environment tags and use its failover telemetry; direct-provider calls retain the same internal audit schema.
+
+## 11. Product plans, prices, subscriptions, and entitlement scope
+
+### 11.1 Source of truth and compatibility
+
+The existing `Plan` enum (`free`, `pro`, `enterprise`) remains the canonical plan key assigned to `User.plan`. The present client-side `team` display plan must be removed or mapped explicitly to `enterprise`; it must never create a fourth unsupported plan key.
+
+`ProductPlan` and `PlanEntitlement` become the server source of truth for the pricing page, settings billing card, candidate feature gates, and admin console. Prices are stored as integers in minor units, e.g. EUR 12.00 is `1200`, never floating-point values. `externalPriceId` is an opaque payment-provider reference; the console does not store card data, invoices, or payment secrets.
+
+### 11.2 Entitlement registry
+
+Entitlement keys are a compile-time registry with typed values. The database can set values only for registered keys; it cannot invent a permission or execute an expression. Initial keys should include:
+
+| Key | Value type | Example use |
+|---|---|---|
+| `ai_credit_monthly` | integer | Monthly AI credit allowance. |
+| `job_tracker_limit` | integer or `null` | Maximum saved jobs; `null` means unlimited. |
+| `cover_letters_monthly` | integer or `null` | Generation allowance. |
+| `auto_apply_enabled` | boolean | Enables unattended application queueing. |
+| `auto_apply_daily_limit` | integer | Hard candidate-level apply ceiling; never exceeds compliance ceiling. |
+| `gmail_integration_enabled` | boolean | Gmail integration access. |
+| `byok_enabled` | boolean | User may configure their own supported model/API key. |
+| `priority_support` | boolean | Support routing only. |
+
+Feature code calls `resolveEntitlement(user.plan, key)` on the server. The UI may use the same published snapshot for presentation, but never enforces access by itself. Per-user entitlement overrides require a future dedicated model with expiry, reason, and audit; do not change `User.preferences` to grant commercial features.
+
+### 11.3 Pricing, subscription, and change workflow
+
+| Action | Permission | Required control |
+|---|---|---|
+| Create/edit plan draft | `plans.manage` | Versioned draft; plan key cannot change. |
+| Edit entitlement draft | `entitlements.manage` | Validate typed registry and compliance ceilings. |
+| Edit price draft | `plans.manage` | Currency, minor-unit amount, interval, tax-display policy, effective date. |
+| Publish plan/price/entitlements | `plans.publish` | Second approver; scheduled effective date; rollback version. |
+| View subscriptions | `subscriptions.read` | Plan/status/period/payment-provider customer reference only; no card/payment method data. |
+| Change one user plan | `subscriptions.update` | Reason, idempotency, payment-provider synchronization, audit, and user notification. |
+
+Published prices and plan limits are immutable versions. A price change creates a new version/external price and applies only according to the configured effective date and payment-provider policy; it never silently rewrites a customer's committed subscription. Before publishing a lower entitlement, the console shows aggregate impact and migration behavior (grace period, disable-on-renewal, or immediate safety restriction). Auto-apply limits cannot be raised above platform compliance ceilings even for enterprise users.
+
+Add the following endpoints:
+
+| Method | Endpoint | Permission | Rule |
+|---|---|---|---|
+| GET | `/api/admin/v1/plans` | `plans.read` | Draft and published versions, prices, entitlement values, usage aggregates. |
+| POST/PATCH | `/api/admin/v1/plans/:planKey` | `plans.manage` | Draft-only change, optimistic version, reason. |
+| POST | `/api/admin/v1/plans/:planKey/publish` | `plans.publish` | Second approval, effective date, audit and rollback reference. |
+| PATCH | `/api/admin/v1/users/:userId/subscription` | `subscriptions.update` | Changes `User.plan` only after payment-provider state succeeds or an approved manual-grant path is recorded. |
+| GET | `/api/public/v1/plans` | public/candidate | Published display name, price, interval, and safe feature summary only. |
+
+For a payment provider such as Stripe, checkout and billing state are updated only through verified provider webhooks. Webhook signatures are verified against a secret from the secret manager; incoming events are idempotent and update a subscription record before updating `User.plan`. The admin console is not a payment webhook and cannot mark a payment successful.
+
+## 12. Broadcasts to existing notifications
 
 An approved platform broadcast writes a row per recipient to the existing `notifications` table using `type = 'platform_broadcast'`, `title`, `body`, `user_id`, and `broadcast_id`. It is an in-app message only. Existing `GET /api/notifications` already filters by the authenticated `user_id`, so the candidate can see their message; `PATCH /api/notifications/mark-read` continues to enforce that same ownership condition.
 
@@ -286,7 +467,7 @@ Allowed audience selectors are `all_active_users`, plan, location, and an explic
 
 The broadcast worker uses `(broadcast_id, user_id)` uniqueness to make batch retries idempotent. It records counts and classified errors, not a PII recipient snapshot. Product/marketing broadcasts must respect future notification preferences; service outage, legal, and security messages can be policy-defined as mandatory.
 
-## 11. API, authorization, and Worker control contract
+## 13. API, authorization, and Worker control contract
 
 All new admin endpoints live under `/api/admin/v1`. They use cursor pagination, maximum limit 100, `x-request-id`, and `Cache-Control: no-store`. Every write requires CSRF validation, an `Idempotency-Key`, validated input, and a 10–500 character `reason`.
 
@@ -311,7 +492,7 @@ The Worker control plane must never expose Redis, Bull Board, arbitrary job payl
 
 `apps/worker/src/index.ts` must change so Bull Board does not start unless an explicit development-only flag is enabled. In production it must bind to loopback/private network and sit behind an identity-aware proxy; missing `BULL_BOARD_PASSWORD` must deny access, never permit it.
 
-## 12. Audit and observability
+## 14. Audit and observability
 
 Every admin authentication, authorization denial, read of controlled PII metadata, write, export, configuration change, broadcast state change, queue action, role change, session revocation, and break-glass event is written to `AdminAuditLog`.
 
@@ -319,7 +500,7 @@ Audit records contain actor, role, request ID, target type/ID, candidate `userId
 
 The existing observability aggregation over `apply_results` is useful, but must be authenticated and extended safely. It may expose totals, success rate, flow distribution (`programmatic`, `pattern-cache`, `llm`), duration, CAPTCHA rate, and ATS aggregates. It must not expose job URLs, error text containing candidate content, screenshots, HAR files, or worker raw payloads. Add alerts for audit-write failures, unauthorized-admin spikes, use of super-admin/break-glass, source/queue pause, flag change, bulk broadcast, Worker command verification failure, and abnormal AI-budget changes.
 
-## 13. Security controls
+## 15. Security controls
 
 - Administrators require WebAuthn where possible; `super_admin` requires WebAuthn and reauthentication within 15 minutes for high-risk actions.
 - Use secure, HttpOnly, SameSite cookies, CSRF tokens, Origin/Referer validation, strict CSP, dual user/IP rate limits, and no-store caching for admin pages.
@@ -328,7 +509,7 @@ The existing observability aggregation over `apply_results` is useful, but must 
 - Store screenshots/HARs in private storage, authorize per object, and enforce lifecycle deletion. They are never shown in the standard console.
 - RLS rollout must set `SET LOCAL app.user_id` only inside a transaction. Restricted admin views/functions return safe metadata; an admin DB role is not an unrestricted RLS bypass.
 
-## 14. Tests and release acceptance
+## 16. Tests and release acceptance
 
 | Test level | Required coverage |
 |---|---|
@@ -337,6 +518,8 @@ The existing observability aggregation over `apply_results` is useful, but must 
 | Tenant isolation | Candidate A cannot read/update/delete candidate B resources, including guessed nested IDs. |
 | Broadcast | Creator cannot approve/publish; preview is anonymous; duplicate batch retry creates one notification; candidate can read/mark only their own delivery. |
 | ATS/AI/flags | State transitions, rate-limit ceiling, worker version acknowledgement, budget race safety, flag approval/rollback. |
+| AI catalogue | Primary/fallback capability validation, model retirement migration, dropdown only returns active BYOK-allowed models, cache version propagation, and no key/prompt exposure. |
+| Plans/entitlements | Typed entitlement validation, server-side gate enforcement, price version/effective-date behavior, enterprise mapping, webhook idempotency, and compliance-ceiling enforcement. |
 | Worker | Signed command verification, nonce replay rejection, allowed-command enforcement, Bull Board disabled in production. |
 | RLS | Cross-tenant SQL under candidate DB identity returns no rows; restricted admin view excludes forbidden fields. |
 | E2E/security | Each role's UI and forged API requests; IDOR, CSRF, session invalidation after role change, OWASP access-control regression. |
@@ -346,10 +529,12 @@ Release is blocked until all of these are true:
 - No administrator, including super admin and break-glass, can obtain API keys, password hashes, refresh tokens, full resumes, or email bodies via API, export, log, audit, repository, or database view.
 - Every admin write has reason, idempotency, CSRF, audit, and appropriate approval; audit failure blocks the write.
 - Broadcasts produce only `Notification` rows, use recipient deduplication, and cannot use private content for targeting.
+- Every enabled AI feature has a verified, active primary and different capability-compatible fallback; the candidate model dropdown contains only published eligible models.
+- Plan prices and entitlement scope are versioned server data; changing a plan cannot silently alter an active paid subscription or bypass an auto-apply compliance ceiling.
 - The unauthenticated observability route and publicly reachable Bull Board are removed/secured.
 - Candidate ownership filters and the RLS migration plan are tested and approved.
 
-## 15. Delivery plan
+## 17. Delivery plan
 
 1. **Security baseline:** secure Bull Board, protect current observability, inventory and test candidate `userId` filters.
 2. **Identity and audit:** migrations, role seeds, `requireAdmin`, MFA/session revocation, append-only audit library, safe DTOs.
