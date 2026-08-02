@@ -22,7 +22,6 @@ import {
   latestUserMessage,
   readChatMessages,
   readSessionId,
-  resolveRequestedModel,
   responseMemory,
   sessionGoalFrom,
   type ChatRequestBody,
@@ -98,7 +97,9 @@ export async function POST(req: NextRequest) {
 
     let fullText = ''
     try {
-      const model = resolveRequestedModel(body, prep.cfg)
+      // Basic chat always uses the server-resolved Agent configuration. Model
+      // choice belongs to the feature-level settings, never a chat request.
+      const model = prep.cfg
       const workflowRequested = requestsFullWorkflow(userMessage)
       if (workflowRequested) {
         const requestedScore = requestedMinMatchScore(userMessage)

@@ -3,7 +3,6 @@
 import React, { useEffect, useRef, useState } from 'react'
 import { useToast } from '@/components/ui'
 import { useApi, apiMutate } from '@/lib/hooks'
-import { MODEL_CATALOGUE } from '@/lib/model-router'
 import { AgentComposer, type ComposerAttachment, type ComposerJob, type ComposerResume } from './AgentComposer'
 import { AgentLiveStreamBody } from './AgentLiveStreamBody'
 import {
@@ -75,8 +74,6 @@ export function AgentUnifiedStream({
   const auditedJobIdsRef = useRef(new Set<string>())
   const [chatInput, setChatInput] = useState('')
   const [chatLoading, setChatLoading] = useState(false)
-  const defaultModel = MODEL_CATALOGUE[0]
-  const [selectedModel, setSelectedModel] = useState(`${defaultModel.provider}::${defaultModel.model}`)
   const [chatSessionId, setChatSessionId] = useState<string | null>(null)
   const [addMenuOpen, setAddMenuOpen] = useState(false)
   const [liveBlocks, setLiveBlocks] = useState<AgentTranscriptEvent[]>([])
@@ -278,7 +275,6 @@ export function AgentUnifiedStream({
         sessionId: chatSessionId,
         signal: controller.signal,
         messages: [{ role: 'user', content: outgoing }],
-        model: selectedModel,
         onSession: sessionId => {
           if (controller.signal.aborted || requestVersion !== chatRequestVersionRef.current) return
           shouldFollowScrollRef.current = true
@@ -369,7 +365,6 @@ export function AgentUnifiedStream({
         chips={chips}
         chatInput={chatInput}
         chatLoading={chatLoading}
-        selectedModel={selectedModel}
         addMenuOpen={addMenuOpen}
         attachedFiles={attachedFiles}
         composerJobs={composerJobs}
@@ -377,7 +372,6 @@ export function AgentUnifiedStream({
         inputRef={inputRef}
         fileInputRef={fileInputRef}
         onChatInputChange={setChatInput}
-        onSelectedModelChange={setSelectedModel}
         onAddMenuOpenChange={setAddMenuOpen}
         onSendChat={sendChat}
         onRemoveAttachedFile={id => setAttachedFiles(current => current.filter(file => file.id !== id))}

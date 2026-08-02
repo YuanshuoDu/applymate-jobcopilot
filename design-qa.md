@@ -1,31 +1,39 @@
-# Agent new-chat design QA
+# Agent workspace design QA
 
 ## Evidence
 
-- Reference: `C:\Users\Steven.du\AppData\Local\Temp\codex-clipboard-7f876dab-aaf3-45ab-be79-a53f3d0052b3.png` — Codex-style new-chat landing state.
-- Implementation: verified in the in-app browser at `http://localhost:3000/?page=agent` on 2026-08-02. The verified tab remains open as the local deliverable.
+- New-chat reference: `C:\Users\Steven.du\AppData\Local\Temp\codex-clipboard-7f876dab-aaf3-45ab-be79-a53f3d0052b3.png`.
+- Default-model composer reference: `C:\Users\Steven.du\AppData\Local\Temp\codex-clipboard-ebb6702b-c0f2-4df2-82cd-3f8e09881b25.png`.
+- Implementation: in-app browser capture at `http://localhost:3001/?page=agent`, desktop viewport `1280 × 720`, captured 2026-08-02. The visible implementation is rendered at the same desktop density (`1×`) and the tab remains open as the local deliverable.
 
-## Comparison
+## Comparison scope
 
-| Check | Result | Notes |
+The supplied composer image identifies a control to remove rather than a layout to reproduce: basic Agent chat must use its server-resolved default model and must not expose a per-message selector. The implementation was compared at the same composer state (empty input, no menu open); the app shell and new-chat content are intentionally outside the source crop.
+
+## Findings
+
+- No actionable P0/P1/P2 findings.
+- The large model selector shown in the source crop is absent from the rendered composer. The composer now keeps only context attachment and send controls, producing the requested direct-chat state.
+- The source does not specify an alternative in-chat advanced-model UI. ApplyMate's existing Settings → AI Models feature-level picker remains the advanced, persisted place to choose a model for the `agent` feature; it is intentionally not duplicated in the composer.
+
+## Required fidelity surfaces
+
+| Surface | Result | Evidence |
 | --- | --- | --- |
-| Empty-state purpose | Pass | A new Agent conversation now opens an actionable, centered workspace instead of an empty pane. |
-| Hierarchy | Pass | A primary question, short safety explanation, then four task starters match the reference interaction pattern. |
-| Layout | Pass | The landing content is centered in the stream, constrained to a readable width, and the cards use a four-column desktop grid with a two-column mobile fallback. |
-| Existing product language | Pass | ApplyMate tokens, typography, lucide icons, shell navigation, and composer are retained rather than introducing a separate visual system. |
-| Interaction | Pass | Each starter only pre-fills a truthful, reviewable task in the composer. It does not start a job search or submit an application. `+ New chat` clears the draft and restores the same landing state. |
-| Accessibility | Pass | The welcome area is named, task starters are semantic buttons, and the existing composer remains keyboard-accessible. |
+| Fonts and typography | Pass | Composer continues to inherit existing ApplyMate font, input sizing, and button weight. |
+| Spacing and layout rhythm | Pass | Removing the wide selector leaves the established 28px context control aligned with the send control; no composer overflow or shifted input. |
+| Colors and visual tokens | Pass | Existing background, border, primary send state, and muted disabled state are unchanged. |
+| Image and asset fidelity | Pass | Neither target requires raster assets. Existing product icons remain unchanged. |
+| Copy and content | Pass | The generic model label is removed; the input remains focused on the user task. |
 
-## Intentional differences
+## Functional checks
 
-The reference is a general-purpose code-agent landing screen. This implementation uses ApplyMate-specific job-search actions and keeps the product's persistent left session rail and bottom composer, so it fits the existing Agent workflow rather than cloning Codex chrome.
-
-## Verification
-
-- `pnpm --filter web test -- src/components/agent-workspace/AgentNewChatWelcome.test.tsx src/components/agent-workspace/AgentUnifiedStream.helpers.test.ts` — 3 tests passed.
-- `pnpm --filter web exec tsc --noEmit --skipLibCheck` — passed.
-- Browser flow: initial empty state → task starter pre-fills composer → `+ New chat` restores the landing state — passed.
+- Normal chat request body contains only `sessionId` and `messages`; it cannot supply a client-selected model.
+- Server ignores a legacy client `model` value and uses the authenticated user's resolved `agent` feature configuration.
+- Targeted tests: 17 tests passed.
+- Full Web suite passed; TypeScript check passed.
+- Browser-rendered Agent page confirms the selector is absent and the composer remains usable.
 
 ## Final result
 
-**passed**
+passed

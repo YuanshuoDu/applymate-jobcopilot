@@ -210,7 +210,7 @@ describe("agent chat API session recording", () => {
     expect(mocks.runChatWorker).toHaveBeenCalledTimes(1)
   })
 
-  it("uses a valid composer model override for the chat call", async () => {
+  it("ignores a client model override and keeps the configured Agent model", async () => {
     const { POST } = await import("./route")
 
     const res = expectResponse(await POST(postRequest({
@@ -220,7 +220,7 @@ describe("agent chat API session recording", () => {
 
     expect(res.status).toBe(200)
     expect(mocks.createChatPlan).toHaveBeenCalledWith(expect.objectContaining({
-      model: { provider: 'openai', model: 'gpt-test' },
+      model: { provider: 'test', model: 'm1' },
     }))
   })
 
