@@ -537,6 +537,13 @@ enum BroadcastAudienceType {
   explicit_user_ids
 }
 
+enum FeatureFlagStatus {
+  draft
+  pending_approval
+  active
+  retired
+}
+
 enum SupportCaseStatus {
   open
   in_progress
@@ -631,6 +638,8 @@ model AdminBroadcast {
   createdById    String
   approvedById   String?
   publishedById  String?
+  createIdempotencyKey String?        @unique
+  publishIdempotencyKey String?       @unique
   recipientCount Int                   @default(0)
   deliveredCount Int                   @default(0)
   failedCount    Int                   @default(0)
@@ -638,6 +647,26 @@ model AdminBroadcast {
   updatedAt      DateTime              @updatedAt
   notifications  Notification[]
   @@index([status, scheduledAt])
+}
+
+model PlatformFeatureFlag {
+  id            String            @id @default(cuid())
+  key           String
+  environment   String
+  enabled       Boolean           @default(false)
+  rolloutPercent Int              @default(0)
+  targetPlans   Plan[]
+  targetUserIds String[]
+  status        FeatureFlagStatus @default(draft)
+  version       Int               @default(1)
+  createdById   String
+  approvedById  String?
+  updatedById   String
+  rollbackAt    DateTime?
+  createdAt     DateTime          @default(now())
+  updatedAt     DateTime          @updatedAt
+  @@unique([key, environment])
+  @@index([environment, status])
 }
 
 model SupportCase {

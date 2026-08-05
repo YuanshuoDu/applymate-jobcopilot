@@ -19,9 +19,10 @@ export async function requireAdminMembership(request?: Request): Promise<AdminAc
   if (!userId) return denied(requestId, 'observability.read', 'unauthenticated', request)
   const membership = await db.adminMembership.findUnique({
     where: { userId },
-    select: { status: true, mfaLevel: true, role: { select: { key: true, permissions: true } } },
+    select: { status: true, mfaLevel: true, sessionVersion: true, role: { select: { key: true, permissions: true } } },
   })
-  if (membership?.status !== AdminMembershipStatus.active || (membership.role.key === 'super_admin' && membership.mfaLevel !== AdminMfaLevel.webauthn)) {
+  const sessionValid = session?.user?.adminSessionVersion === membership?.sessionVersion
+  if (membership?.status !== AdminMembershipStatus.active || !sessionValid || (membership.role.key === 'super_admin' && membership.mfaLevel !== AdminMfaLevel.webauthn)) {
     return denied(requestId, 'observability.read', 'membership_inactive', request, userId)
   }
   return Object.freeze({ userId, roleKey: membership.role.key, permissions: Object.freeze([...membership.role.permissions]), requestId })
@@ -44,7 +45,8 @@ export async function requireAdmin(permission: Permission, request?: Request): P
   })
   const allowed = membership?.status === AdminMembershipStatus.active && membership.role.permissions.includes(permission)
   const needsWebauthn = membership?.role.key === 'super_admin'
-  if (!allowed || (needsWebauthn && membership?.mfaLevel !== AdminMfaLevel.webauthn)) {
+  const sessionValid = session?.user?.adminSessionVersion === membership?.sessionVersion
+  if (!allowed || !sessionValid || (needsWebauthn && membership?.mfaLevel !== AdminMfaLevel.webauthn)) {
     return denied(requestId, permission, 'permission_denied', request, userId)
   }
 

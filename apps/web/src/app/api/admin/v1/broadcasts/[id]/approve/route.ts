@@ -1,0 +1,23 @@
+import { NextRequest, NextResponse } from 'next/server'
+import { isAdminResponse, requireAdmin } from '@/lib/admin/authorization'
+import { writeAdminAudit } from '@/lib/admin/audit'
+import { validateAdminWrite } from '@/lib/admin/csrf'
+import { db } from '@/lib/db'
+
+export async function POST(request: NextRequest, context: { params: Promise<{ id: string }> }) {
+  const actor = await requireAdmin('broadcasts.approve', request)
+  if (isAdminResponse(actor)) return actor
+  const writeError = validateAdminWrite(request)
+  if (writeError) return writeError
+  const { id } = await context.params
+  const payload = await request.json().catch(() => null) as { reason?: unknown } | null
+  const reason = typeof payload?.reason === 'string' ? payload.reason.trim() : ''
+  if (reason.length < 10 || reason.length > 500 || !request.headers.get('idempotency-key')) return NextResponse.json({ error: 'Invalid approval request' }, { status: 400 })
+  const broadcast = await db.adminBroadcast.findUnique({ where: { id }, select: { createdById: true, approvedById: true, status: true } })
+  if (!broadcast) return NextResponse.json({ error: 'Not found' }, { status: 404 })
+  if (broadcast.createdById === actor.userId) return NextResponse.json({ error: 'Creator cannot approve this broadcast' }, { status: 403 })
+  if (broadcast.approvedById || broadcast.status !== 'draft') return NextResponse.json({ error: 'Broadcast is not awaiting approval' }, { status: 409 })
+  await writeAdminAudit({ requestId: actor.requestId, actorUserId: actor.userId, actorRoleKey: actor.roleKey, action: 'broadcast.approved', targetType: 'broadcast', targetId: id, reason, outcome: 'success' })
+  const updated = await db.adminBroadcast.update({ where: { id }, data: { approvedById: actor.userId }, select: { id: true, approvedById: true } })
+  return NextResponse.json({ broadcast: updated }, { headers: { 'Cache-Control': 'no-store', 'x-request-id': actor.requestId } })
+}

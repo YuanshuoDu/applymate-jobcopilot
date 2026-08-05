@@ -2,7 +2,7 @@
 
 import Link from 'next/link'
 import { usePathname } from 'next/navigation'
-import { Activity, BarChart3, Bell, Bot, FileText, Home, Inbox, Radio, ShieldCheck, Users } from 'lucide-react'
+import { Activity, Bell, Bot, FileText, Flag, Home, Inbox, Radio, ShieldCheck, Users } from 'lucide-react'
 import type { ReactNode } from 'react'
 
 const navigation = [
@@ -12,9 +12,10 @@ const navigation = [
   { href: '/admin/ats', label: 'ATS sources', icon: Radio, permission: 'ats.read' },
   { href: '/admin/applications', label: 'Applications', icon: Activity, permission: 'applications.read' },
   { href: '/admin/ai', label: 'AI operations', icon: Bot, permission: 'ai_budget.read' },
+  { href: '/admin/platform', label: 'Feature flags', icon: Flag, permission: 'feature_flags.read' },
   { href: '/admin/broadcasts', label: 'Broadcasts', icon: Bell, permission: 'broadcasts.create' },
   { href: '/admin/audit', label: 'Audit', icon: FileText, permission: 'audit.read' },
-  { href: '/admin/access', label: 'Access', icon: ShieldCheck, permission: 'admin_members.manage' },
+  { href: '/admin/access', label: 'Access', icon: ShieldCheck, permission: 'admin_members.read' },
 ]
 
 export function AdminShell({ children, permissions, roleKey }: { children: ReactNode; permissions: readonly string[]; roleKey: string }) {

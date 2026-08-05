@@ -15,13 +15,18 @@ function maskEmail(email: string) {
   return `${localMask}@${domain}`
 }
 
+function maskLocation(location: string | null) {
+  if (!location) return null
+  return `${location.slice(0, 1)}***`
+}
+
 export function toAdminUserMetadata(user: UserMetadataRecord) {
   return {
     id: user.id,
     name: user.name,
     email: maskEmail(user.email),
     plan: user.plan,
-    location: user.location,
+    location: maskLocation(user.location),
     createdAt: user.createdAt,
     jobsCount: user._count?.jobs ?? 0,
     resumeExists: (user._count?.resumes ?? 0) > 0,
