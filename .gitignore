@@ -5,6 +5,7 @@ package-lock.json
 
 # Build output
 .next/
+apps/*/.next-recovery-*/
 dist/
 out/
 *.tsbuildinfo
