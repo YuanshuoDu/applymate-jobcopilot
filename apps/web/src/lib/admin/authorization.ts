@@ -43,14 +43,18 @@ export async function requireAdmin(permission: Permission, request?: Request): P
       role: { select: { key: true, permissions: true } },
     },
   })
-  const allowed = membership?.status === AdminMembershipStatus.active && membership.role.permissions.includes(permission)
+  const grant = membership?.status === AdminMembershipStatus.active && !membership.role.permissions.includes(permission)
+    ? await db.adminBreakGlassGrant.findFirst({ where: { requesterId: userId, permission, approverId: { not: null }, revokedAt: null, expiresAt: { gt: new Date() } }, select: { id: true } })
+    : null
+  const allowed = membership?.status === AdminMembershipStatus.active && (membership.role.permissions.includes(permission) || Boolean(grant))
   const needsWebauthn = membership?.role.key === 'super_admin'
   const sessionValid = session?.user?.adminSessionVersion === membership?.sessionVersion
   if (!allowed || !sessionValid || (needsWebauthn && membership?.mfaLevel !== AdminMfaLevel.webauthn)) {
     return denied(requestId, permission, 'permission_denied', request, userId)
   }
 
-  return Object.freeze({ userId, roleKey: membership.role.key, permissions: Object.freeze([...membership.role.permissions]), requestId })
+  if (grant) await writeAdminAudit({ requestId, actorUserId: userId, actorRoleKey: membership.role.key, action: 'break_glass.used', targetId: grant.id, outcome: 'success' })
+  return Object.freeze({ userId, roleKey: membership.role.key, permissions: Object.freeze([...membership.role.permissions, ...(grant ? [permission] : [])]), requestId })
 }
 
 async function denied(requestId: string, permission: Permission, errorCode: string, request?: Request, userId?: string) {

@@ -486,6 +486,7 @@ model AiBudget {
   createdAt DateTime @default(now()) @map("created_at")
   updatedAt DateTime @updatedAt @map("updated_at")
   adjustments AiBudgetAdjustment[]
+  resetRequests AiBudgetResetRequest[]
 
   @@unique([userId, month])
   @@map("ai_budgets")
@@ -498,6 +499,8 @@ model AiBudgetAdjustment {
   kind           String
   previousLimit  Int      @map("previous_limit")
   nextLimit      Int      @map("next_limit")
+  previousUsed   Int?     @map("previous_used")
+  nextUsed       Int?     @map("next_used")
   reason         String
   idempotencyKey String   @unique @map("idempotency_key")
   createdAt      DateTime @default(now()) @map("created_at")
@@ -505,6 +508,32 @@ model AiBudgetAdjustment {
 
   @@index([budgetId, createdAt(sort: Desc)])
   @@map("ai_budget_adjustments")
+}
+
+enum AiBudgetResetStatus {
+  pending
+  approved
+  expired
+  cancelled
+}
+
+model AiBudgetResetRequest {
+  id                String              @id @default(cuid())
+  budgetId          String              @map("budget_id")
+  requesterId       String              @map("requester_id")
+  approverId        String?             @map("approver_id")
+  reason            String
+  status            AiBudgetResetStatus @default(pending)
+  budgetVersion     Int                 @map("budget_version")
+  createIdempotencyKey String           @unique @map("create_idempotency_key")
+  approveIdempotencyKey String?         @unique @map("approve_idempotency_key")
+  expiresAt         DateTime            @map("expires_at")
+  createdAt         DateTime            @default(now()) @map("created_at")
+  approvedAt        DateTime?           @map("approved_at")
+  budget            AiBudget            @relation(fields: [budgetId], references: [id], onDelete: Restrict)
+
+  @@index([status, expiresAt])
+  @@map("ai_budget_reset_requests")
 }
 
 enum AdminMembershipStatus {
