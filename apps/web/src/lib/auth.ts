@@ -9,9 +9,10 @@ import { jwtVerify } from 'jose'
 import { db } from '@/lib/db'
 import { normalizeEmail } from '@/lib/auth-identifiers'
 import { reconcileGoogleLoginIdentity } from '@/lib/google-identity'
+import { getAuthJwtSecret, getAuthSecret } from '@/lib/auth-secret'
 
-const AUTH_SECRET = process.env.AUTH_SECRET ?? 'fallback-secret-change-this'
-const JWT_SECRET = new TextEncoder().encode(AUTH_SECRET)
+const AUTH_SECRET = getAuthSecret()
+const JWT_SECRET = getAuthJwtSecret()
 
 // Build provider list dynamically — OAuth only enabled when keys are set
 const providers: Provider[] = []

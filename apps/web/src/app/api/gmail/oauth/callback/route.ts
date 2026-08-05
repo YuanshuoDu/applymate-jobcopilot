@@ -16,10 +16,9 @@ import { jwtVerify } from 'jose'
 import { db } from '@/lib/db'
 import { GMAIL_ACCOUNT_PROVIDER } from '@/lib/gmail-helpers'
 import { canRecoverStaleGmailConnection } from '@/lib/gmail-connection-recovery'
+import { getAuthJwtSecret } from '@/lib/auth-secret'
 
-const JWT_SECRET = new TextEncoder().encode(
-  process.env.AUTH_SECRET ?? 'fallback-secret-change-this',
-)
+const JWT_SECRET = getAuthJwtSecret()
 
 function safeReturnTo(value: unknown): string | null {
   if (typeof value !== 'string' || !value.startsWith('/')) return null
