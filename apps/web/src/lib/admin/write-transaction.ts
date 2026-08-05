@@ -3,12 +3,19 @@ import type { Prisma as PrismaTypes } from '@prisma/client'
 import { db } from '@/lib/db'
 import { createAdminAuditData, type AuditInput } from './audit'
 
+export class AdminMutationConflict extends Error {
+  constructor(message = 'The requested admin mutation could not be applied') {
+    super(message)
+    this.name = 'AdminMutationConflict'
+  }
+}
+
 export async function runAdminMutation<T>(input: {
   actorUserId: string
   action: string
   idempotencyKey: string
   targetId?: string
-  audit: Omit<AuditInput, 'actorUserId' | 'action'>
+  audit: Omit<AuditInput, 'actorUserId' | 'action'> | ((value: T) => Omit<AuditInput, 'actorUserId' | 'action'>)
   mutate: (tx: PrismaTypes.TransactionClient) => Promise<T>
 }) {
   return db.$transaction(async (tx) => {
@@ -27,9 +34,10 @@ export async function runAdminMutation<T>(input: {
     }
 
     const value = await input.mutate(tx)
+    const audit = typeof input.audit === 'function' ? input.audit(value) : input.audit
     await tx.adminAuditLog.create({
       data: createAdminAuditData({
-        ...input.audit,
+        ...audit,
         actorUserId: input.actorUserId,
         action: input.action,
       }),

@@ -1,9 +1,10 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { isAdminResponse, requireAdmin } from '@/lib/admin/authorization'
-import { writeAdminAudit } from '@/lib/admin/audit'
 import { validateAdminWrite } from '@/lib/admin/csrf'
-import { claimAdminIdempotencyKey } from '@/lib/admin/idempotency'
+import { AdminMutationConflict, runAdminMutation } from '@/lib/admin/write-transaction'
 import { db } from '@/lib/db'
+
+type BreakGlassApprovalResult = { permission: string; expiresAt: Date }
 
 export async function POST(request: NextRequest, context: { params: Promise<{ id: string }> }) {
   const actor = await requireAdmin('break_glass.approve', request)
@@ -18,11 +19,26 @@ export async function POST(request: NextRequest, context: { params: Promise<{ id
   const grant = await db.adminBreakGlassGrant.findUnique({ where: { id }, select: { requesterId: true, expiresAt: true, approverId: true, permission: true } })
   if (!grant) return NextResponse.json({ error: 'Not found' }, { status: 404 })
   if (grant.requesterId === actor.userId) return NextResponse.json({ error: 'Requester cannot approve their own grant' }, { status: 403 })
-  if (!await claimAdminIdempotencyKey(actor.userId, 'break_glass.approved', key, id)) return NextResponse.json({ duplicate: true }, { headers: { 'Cache-Control': 'no-store' } })
   if (grant.expiresAt <= new Date() || grant.approverId) return NextResponse.json({ error: 'Grant expired or was already approved' }, { status: 409 })
-  await writeAdminAudit({ requestId: actor.requestId, actorUserId: actor.userId, actorRoleKey: actor.roleKey, action: 'break_glass.approval_requested', targetId: id, reason, outcome: 'success' })
-  const approved = await db.adminBreakGlassGrant.updateMany({ where: { id, approverId: null, revokedAt: null, expiresAt: { gt: new Date() } }, data: { approverId: actor.userId } })
-  if (!approved.count) return NextResponse.json({ error: 'Grant changed' }, { status: 409 })
-  await writeAdminAudit({ requestId: actor.requestId, actorUserId: actor.userId, actorRoleKey: actor.roleKey, action: 'break_glass.approved', targetId: id, reason, after: { permission: grant.permission }, outcome: 'success' })
-  return NextResponse.json({ id, permission: grant.permission, expiresAt: grant.expiresAt }, { headers: { 'Cache-Control': 'no-store', 'x-request-id': actor.requestId } })
+  try {
+    const result = await runAdminMutation<BreakGlassApprovalResult>({
+      actorUserId: actor.userId,
+      action: 'break_glass.approved',
+      idempotencyKey: key,
+      targetId: id,
+      audit: { requestId: actor.requestId, actorRoleKey: actor.roleKey, targetId: id, reason, after: { permission: grant.permission }, outcome: 'success' },
+      mutate: async (tx) => {
+        const current = await tx.adminBreakGlassGrant.findUnique({ where: { id }, select: { permission: true, expiresAt: true, approverId: true } })
+        if (!current || current.expiresAt <= new Date() || current.approverId) throw new AdminMutationConflict('Grant expired, changed, or was already approved')
+        const approved = await tx.adminBreakGlassGrant.updateMany({ where: { id, approverId: null, revokedAt: null, expiresAt: { gt: new Date() } }, data: { approverId: actor.userId } })
+        if (!approved.count) throw new AdminMutationConflict('Grant changed')
+        return { permission: current.permission, expiresAt: current.expiresAt }
+      },
+    })
+    if (result.duplicate) return NextResponse.json({ duplicate: true }, { headers: { 'Cache-Control': 'no-store' } })
+    return NextResponse.json({ id, permission: result.value.permission, expiresAt: result.value.expiresAt }, { headers: { 'Cache-Control': 'no-store', 'x-request-id': actor.requestId } })
+  } catch (error) {
+    if (error instanceof AdminMutationConflict) return NextResponse.json({ error: error.message }, { status: 409 })
+    throw error
+  }
 }

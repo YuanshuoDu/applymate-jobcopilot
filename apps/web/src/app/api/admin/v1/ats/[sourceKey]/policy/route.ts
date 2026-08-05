@@ -1,11 +1,11 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { isAdminResponse, requireAdmin } from '@/lib/admin/authorization'
-import { writeAdminAudit } from '@/lib/admin/audit'
 import { hardRpsLimit, isAtsSourceKey, parseAtsPolicy } from '@/lib/admin/ats-service'
 import { validateAdminWrite } from '@/lib/admin/csrf'
-import { claimAdminIdempotencyKey } from '@/lib/admin/idempotency'
 import { sendWorkerCommand } from '@/lib/admin/worker-client'
-import { db } from '@/lib/db'
+import { AdminMutationConflict, runAdminMutation } from '@/lib/admin/write-transaction'
+
+type AtsPolicyResult = { version: number; propagation: string }
 
 export async function PATCH(request: NextRequest, context: { params: Promise<{ sourceKey: string }> }) {
   const actor = await requireAdmin('ats.update', request)
@@ -18,20 +18,39 @@ export async function PATCH(request: NextRequest, context: { params: Promise<{ s
   const reason = typeof payload?.reason === 'string' ? payload.reason.trim() : ''
   const key = request.headers.get('idempotency-key')
   if (!isAtsSourceKey(sourceKey) || !input || input.globalRpsLimit > hardRpsLimit(sourceKey) || reason.length < 10 || reason.length > 500 || !key) return NextResponse.json({ error: 'Invalid ATS policy update' }, { status: 400 })
-  if (!await claimAdminIdempotencyKey(actor.userId, 'ats.policy_updated', key, sourceKey)) return NextResponse.json({ duplicate: true }, { headers: { 'Cache-Control': 'no-store' } })
-  await writeAdminAudit({ requestId: actor.requestId, actorUserId: actor.userId, actorRoleKey: actor.roleKey, action: 'ats.policy_update_requested', targetType: 'ats_source', targetId: sourceKey, reason, outcome: 'success' })
-  const existing = await db.atsSourcePolicy.findUnique({ where: { sourceKey }, select: { id: true } })
-  const policy = existing
-    ? await db.atsSourcePolicy.updateMany({ where: { sourceKey, version: input.version, state: { in: ['enabled', 'degraded'] } }, data: { ...input, version: { increment: 1 }, lastChangedById: actor.userId, lastAcknowledgedVersion: null } })
-    : input.version === 1 ? { count: await db.atsSourcePolicy.create({ data: { sourceKey, ...input, lastChangedById: actor.userId } }).then(() => 1) } : { count: 0 }
-  if (!policy.count) return NextResponse.json({ error: 'Policy changed or source is not editable' }, { status: 409 })
-  const nextVersion = existing ? input.version + 1 : 1
-  let propagation = 'pending'
   try {
-    await sendWorkerCommand({ requestId: actor.requestId, actorId: actor.userId, action: 'apply_ats_policy', reason, params: { sourceKey, version: nextVersion } })
-    await db.atsSourcePolicy.update({ where: { sourceKey }, data: { lastAcknowledgedVersion: nextVersion } })
-    propagation = 'acknowledged'
-  } catch { /* Policy remains safe and visibly pending until the worker reconnects. */ }
-  await writeAdminAudit({ requestId: actor.requestId, actorUserId: actor.userId, actorRoleKey: actor.roleKey, action: 'ats.policy_updated', targetType: 'ats_source', targetId: sourceKey, reason, after: { version: nextVersion, propagation }, outcome: 'success' })
-  return NextResponse.json({ sourceKey, version: nextVersion, propagation }, { headers: { 'Cache-Control': 'no-store', 'x-request-id': actor.requestId } })
+    const result = await runAdminMutation<AtsPolicyResult>({
+      actorUserId: actor.userId,
+      action: 'ats.policy_updated',
+      idempotencyKey: key,
+      targetId: sourceKey,
+      audit: (value) => ({ requestId: actor.requestId, actorRoleKey: actor.roleKey, targetType: 'ats_source', targetId: sourceKey, reason, after: { version: value.version, propagation: value.propagation }, outcome: 'success' }),
+      mutate: async (tx) => {
+        const existing = await tx.atsSourcePolicy.findUnique({ where: { sourceKey }, select: { version: true, state: true } })
+        let nextVersion: number
+        if (!existing) {
+          if (input.version !== 1) throw new AdminMutationConflict('Policy changed or source is not editable')
+          await tx.atsSourcePolicy.create({ data: { sourceKey, ...input, lastChangedById: actor.userId } })
+          nextVersion = 1
+        } else {
+          if (!['enabled', 'degraded'].includes(existing.state) || existing.version !== input.version) throw new AdminMutationConflict('Policy changed or source is not editable')
+          const updated = await tx.atsSourcePolicy.updateMany({ where: { sourceKey, version: input.version, state: { in: ['enabled', 'degraded'] } }, data: { ...input, version: { increment: 1 }, lastChangedById: actor.userId, lastAcknowledgedVersion: null } })
+          if (!updated.count) throw new AdminMutationConflict('Policy changed or source is not editable')
+          nextVersion = input.version + 1
+        }
+        let propagation = 'pending'
+        try {
+          await sendWorkerCommand({ requestId: actor.requestId, actorId: actor.userId, action: 'apply_ats_policy', reason, params: { sourceKey, version: nextVersion } })
+          await tx.atsSourcePolicy.update({ where: { sourceKey }, data: { lastAcknowledgedVersion: nextVersion } })
+          propagation = 'acknowledged'
+        } catch { /* Policy remains safe and visibly pending until the worker reconnects. */ }
+        return { version: nextVersion, propagation }
+      },
+    })
+    if (result.duplicate) return NextResponse.json({ duplicate: true }, { headers: { 'Cache-Control': 'no-store' } })
+    return NextResponse.json({ sourceKey, ...result.value }, { headers: { 'Cache-Control': 'no-store', 'x-request-id': actor.requestId } })
+  } catch (error) {
+    if (error instanceof AdminMutationConflict) return NextResponse.json({ error: error.message }, { status: 409 })
+    throw error
+  }
 }

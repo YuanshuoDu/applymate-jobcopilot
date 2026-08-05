@@ -1,9 +1,11 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { isAdminResponse, requireAdmin } from '@/lib/admin/authorization'
-import { writeAdminAudit } from '@/lib/admin/audit'
-import { approveBudgetReset } from '@/lib/admin/budget-service'
+import { approveBudgetResetInTransaction } from '@/lib/admin/budget-service'
 import { validateAdminWrite } from '@/lib/admin/csrf'
+import { AdminMutationConflict, runAdminMutation } from '@/lib/admin/write-transaction'
 import { db } from '@/lib/db'
+
+type BudgetResetResult = { budgetId: string; version: number; previousUsed: number }
 
 export async function POST(request: NextRequest, context: { params: Promise<{ id: string }> }) {
   const actor = await requireAdmin('ai_budget.reset', request)
@@ -20,9 +22,23 @@ export async function POST(request: NextRequest, context: { params: Promise<{ id
   const resetRequest = await db.aiBudgetResetRequest.findUnique({ where: { id }, select: { requesterId: true, budget: { select: { userId: true, month: true } } } })
   if (!resetRequest) return NextResponse.json({ error: 'Not found' }, { status: 404 })
   if (resetRequest.requesterId === actor.userId) return NextResponse.json({ error: 'Requester cannot approve this reset' }, { status: 403 })
-  await writeAdminAudit({ requestId: actor.requestId, actorUserId: actor.userId, actorRoleKey: actor.roleKey, action: 'ai_budget.reset_approval_requested', targetType: 'ai_budget', targetId: `${resetRequest.budget.userId}:${resetRequest.budget.month}`, tenantUserId: resetRequest.budget.userId, reason, outcome: 'success' })
-  const result = await approveBudgetReset({ requestId: id, approverId: actor.userId, idempotencyKey: key })
-  if (!result) return NextResponse.json({ error: 'Reset expired, changed, or already approved' }, { status: 409 })
-  await writeAdminAudit({ requestId: actor.requestId, actorUserId: actor.userId, actorRoleKey: actor.roleKey, action: 'ai_budget.reset_approved', targetType: 'ai_budget', targetId: `${resetRequest.budget.userId}:${resetRequest.budget.month}`, tenantUserId: resetRequest.budget.userId, reason, after: { previousUsed: result.previousUsed, version: result.version }, outcome: 'success' })
-  return NextResponse.json({ reset: result }, { headers: { 'Cache-Control': 'no-store', 'x-request-id': actor.requestId } })
+  try {
+    const result = await runAdminMutation<BudgetResetResult>({
+      actorUserId: actor.userId,
+      action: 'ai_budget.reset_approved',
+      idempotencyKey: key,
+      targetId: id,
+      audit: (value) => ({ requestId: actor.requestId, actorRoleKey: actor.roleKey, targetType: 'ai_budget', targetId: `${resetRequest.budget.userId}:${resetRequest.budget.month}`, tenantUserId: resetRequest.budget.userId, reason, after: { previousUsed: value.previousUsed, version: value.version }, outcome: 'success' }),
+      mutate: async (tx) => {
+        const approved = await approveBudgetResetInTransaction(tx, { requestId: id, approverId: actor.userId, idempotencyKey: key })
+        if (!approved) throw new AdminMutationConflict('Reset expired, changed, or already approved')
+        return approved
+      },
+    })
+    if (result.duplicate) return NextResponse.json({ duplicate: true }, { headers: { 'Cache-Control': 'no-store' } })
+    return NextResponse.json({ reset: result.value }, { headers: { 'Cache-Control': 'no-store', 'x-request-id': actor.requestId } })
+  } catch (error) {
+    if (error instanceof AdminMutationConflict) return NextResponse.json({ error: error.message }, { status: 409 })
+    throw error
+  }
 }
