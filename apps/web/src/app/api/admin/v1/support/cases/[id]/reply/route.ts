@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { isAdminResponse, requireAdmin } from '@/lib/admin/authorization'
-import { writeAdminAudit } from '@/lib/admin/audit'
+import { runAdminMutation } from '@/lib/admin/write-transaction'
 import { validateAdminWrite } from '@/lib/admin/csrf'
 import { parseReply } from '@/lib/contact-us'
 import { db } from '@/lib/db'
@@ -16,16 +16,15 @@ export async function POST(request: NextRequest, context: { params: Promise<{ id
   const reason = typeof payload?.reason === 'string' ? payload.reason.trim() : ''
   const idempotencyKey = request.headers.get('idempotency-key')
   if (!message || reason.length < 10 || reason.length > 500 || !idempotencyKey) return NextResponse.json({ error: 'Invalid support reply' }, { status: 400 })
-  const existing = await db.supportCaseMessage.findUnique({ where: { idempotencyKey }, select: { id: true, caseId: true } })
-  if (existing) return NextResponse.json({ message: existing, duplicate: true })
   const supportCase = await db.supportCase.findUnique({ where: { id }, select: { requesterUserId: true } })
   if (!supportCase) return NextResponse.json({ error: 'Not found' }, { status: 404 })
-  await writeAdminAudit({ requestId: actor.requestId, actorUserId: actor.userId, actorRoleKey: actor.roleKey, action: 'support.reply_sent', targetType: 'support_case', targetId: id, tenantUserId: supportCase.requesterUserId, reason, outcome: 'success' })
-  const created = await db.$transaction(async (tx) => {
+  const result = await runAdminMutation({ actorUserId: actor.userId, action: 'support.reply_sent', idempotencyKey, targetId: id, audit: { requestId: actor.requestId, actorRoleKey: actor.roleKey, targetType: 'support_case', targetId: id, tenantUserId: supportCase.requesterUserId, reason, outcome: 'success' }, mutate: async (tx) => {
     const staffReply = await tx.supportCaseMessage.create({ data: { caseId: id, authorType: 'staff_reply', authorUserId: actor.userId, idempotencyKey, body: message.body, redacted: message.redacted } })
     await tx.supportCase.update({ where: { id }, data: { status: 'waiting_on_customer', assignedAdminId: actor.userId, firstRespondedAt: new Date(), version: { increment: 1 } } })
     await tx.notification.create({ data: { userId: supportCase.requesterUserId, type: 'contact_us_reply', title: 'New support reply', body: 'A support team member replied to your case.' } })
     return staffReply
-  })
+  } })
+  if (result.duplicate) return NextResponse.json({ duplicate: true })
+  const created = result.value
   return NextResponse.json({ message: created }, { status: 201, headers: { 'Cache-Control': 'no-store' } })
 }

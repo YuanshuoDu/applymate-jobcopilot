@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { isAdminResponse, requireAdmin } from '@/lib/admin/authorization'
-import { writeAdminAudit } from '@/lib/admin/audit'
+import { runAdminMutation } from '@/lib/admin/write-transaction'
 import { validateAdminWrite } from '@/lib/admin/csrf'
 import { parseReply } from '@/lib/contact-us'
 import { db } from '@/lib/db'
@@ -16,11 +16,10 @@ export async function POST(request: NextRequest, context: { params: Promise<{ id
   const reason = typeof payload?.reason === 'string' ? payload.reason.trim() : ''
   const idempotencyKey = request.headers.get('idempotency-key')
   if (!note || reason.length < 10 || reason.length > 500 || !idempotencyKey) return NextResponse.json({ error: 'Invalid internal note' }, { status: 400 })
-  const existing = await db.supportCaseMessage.findUnique({ where: { idempotencyKey }, select: { id: true, caseId: true } })
-  if (existing) return NextResponse.json({ message: existing, duplicate: true })
   const supportCase = await db.supportCase.findUnique({ where: { id }, select: { requesterUserId: true } })
   if (!supportCase) return NextResponse.json({ error: 'Not found' }, { status: 404 })
-  await writeAdminAudit({ requestId: actor.requestId, actorUserId: actor.userId, actorRoleKey: actor.roleKey, action: 'support.internal_note_added', targetType: 'support_case', targetId: id, tenantUserId: supportCase.requesterUserId, reason, outcome: 'success' })
-  const created = await db.supportCaseMessage.create({ data: { caseId: id, authorType: 'internal_note', authorUserId: actor.userId, idempotencyKey, body: note.body, redacted: note.redacted } })
+  const result = await runAdminMutation({ actorUserId: actor.userId, action: 'support.internal_note_added', idempotencyKey, targetId: id, audit: { requestId: actor.requestId, actorRoleKey: actor.roleKey, targetType: 'support_case', targetId: id, tenantUserId: supportCase.requesterUserId, reason, outcome: 'success' }, mutate: (tx) => tx.supportCaseMessage.create({ data: { caseId: id, authorType: 'internal_note', authorUserId: actor.userId, idempotencyKey, body: note.body, redacted: note.redacted } }) })
+  if (result.duplicate) return NextResponse.json({ duplicate: true })
+  const created = result.value
   return NextResponse.json({ message: created }, { status: 201, headers: { 'Cache-Control': 'no-store' } })
 }

@@ -1,11 +1,11 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
-const mocks = vi.hoisted(() => ({ requireAdmin: vi.fn(), audit: vi.fn(), validate: vi.fn(), claim: vi.fn(), findCase: vi.fn(), updateCase: vi.fn(), findMember: vi.fn() }))
+const mocks = vi.hoisted(() => ({ requireAdmin: vi.fn(), auditLog: vi.fn(), validate: vi.fn(), claim: vi.fn(), idempotency: vi.fn(), findCase: vi.fn(), updateCase: vi.fn(), findMember: vi.fn(), transaction: vi.fn() }))
 vi.mock('@/lib/admin/authorization', () => ({ requireAdmin: mocks.requireAdmin, isAdminResponse: (value: unknown) => value instanceof Response }))
-vi.mock('@/lib/admin/audit', () => ({ writeAdminAudit: mocks.audit }))
+vi.mock('@/lib/admin/audit', () => ({ writeAdminAudit: vi.fn(), createAdminAuditData: (input: Record<string, unknown>) => input }))
 vi.mock('@/lib/admin/csrf', () => ({ validateAdminWrite: mocks.validate }))
 vi.mock('@/lib/admin/idempotency', () => ({ claimAdminIdempotencyKey: mocks.claim }))
-vi.mock('@/lib/db', () => ({ db: { supportCase: { findUnique: mocks.findCase, updateMany: mocks.updateCase }, adminMembership: { findUnique: mocks.findMember } } }))
+vi.mock('@/lib/db', () => ({ db: { supportCase: { findUnique: mocks.findCase, updateMany: mocks.updateCase }, adminMembership: { findUnique: mocks.findMember }, adminIdempotencyKey: { create: mocks.idempotency }, adminAuditLog: { create: mocks.auditLog }, $transaction: mocks.transaction } }))
 
 describe('PATCH /api/admin/v1/support/cases/:id', () => {
   beforeEach(() => {
@@ -13,6 +13,8 @@ describe('PATCH /api/admin/v1/support/cases/:id', () => {
     mocks.requireAdmin.mockResolvedValue({ userId: 'support-user', roleKey: 'support', permissions: ['support_cases.assign', 'support_cases.resolve'], requestId: 'request' })
     mocks.validate.mockReturnValue(null); mocks.claim.mockResolvedValue(true)
     mocks.findCase.mockResolvedValue({ requesterUserId: 'candidate-user' }); mocks.updateCase.mockResolvedValue({ count: 1 })
+    mocks.idempotency.mockResolvedValue({ id: 'idem-1' })
+    mocks.transaction.mockImplementation(async (callback: (tx: unknown) => Promise<unknown>) => callback({ adminIdempotencyKey: { create: mocks.idempotency }, supportCase: { updateMany: mocks.updateCase }, adminAuditLog: { create: mocks.auditLog } }))
   })
 
   it('uses the supplied case version when updating an assigned support case', async () => {

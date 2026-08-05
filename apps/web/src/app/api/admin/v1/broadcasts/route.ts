@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { isAdminResponse, requireAdmin } from '@/lib/admin/authorization'
+import { runAdminMutation } from '@/lib/admin/write-transaction'
 import { writeAdminAudit } from '@/lib/admin/audit'
 import { parseBroadcastInput } from '@/lib/admin/broadcast-service'
 import { validateAdminWrite } from '@/lib/admin/csrf'
@@ -30,12 +31,8 @@ export async function POST(request: NextRequest) {
   const input = parseBroadcastInput(payload)
   const reason = typeof payload?.reason === 'string' ? payload.reason.trim() : ''
   if (!input || !idempotencyKey || reason.length < 10 || reason.length > 500) return NextResponse.json({ error: 'Invalid broadcast draft' }, { status: 400 })
-  const existing = await db.adminBroadcast.findUnique({ where: { createIdempotencyKey: idempotencyKey }, select: { id: true } })
-  if (existing) return NextResponse.json({ broadcast: existing, duplicate: true })
-  await writeAdminAudit({ requestId: actor.requestId, actorUserId: actor.userId, actorRoleKey: actor.roleKey, action: 'broadcast.created', targetType: 'broadcast', reason, outcome: 'success' })
-  const broadcast = await db.adminBroadcast.create({
-    data: { title: input.title, body: input.body, audienceType: input.audience.type, audience: input.audience.value, createdById: actor.userId, createIdempotencyKey: idempotencyKey },
-    select: { id: true, status: true, createdAt: true },
-  })
+  const result = await runAdminMutation({ actorUserId: actor.userId, action: 'broadcast.created', idempotencyKey, audit: { requestId: actor.requestId, actorRoleKey: actor.roleKey, targetType: 'broadcast', reason, outcome: 'success' }, mutate: (tx) => tx.adminBroadcast.create({ data: { title: input.title, body: input.body, audienceType: input.audience.type, audience: input.audience.value, createdById: actor.userId, createIdempotencyKey: idempotencyKey }, select: { id: true, status: true, createdAt: true } }) })
+  if (result.duplicate) return NextResponse.json({ duplicate: true })
+  const broadcast = result.value
   return NextResponse.json({ broadcast }, { status: 201, headers: { 'Cache-Control': 'no-store', 'x-request-id': actor.requestId } })
 }

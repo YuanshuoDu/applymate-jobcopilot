@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { isAdminResponse, requireAdmin } from '@/lib/admin/authorization'
-import { writeAdminAudit } from '@/lib/admin/audit'
+import { runAdminMutation } from '@/lib/admin/write-transaction'
 import { validateAdminWrite } from '@/lib/admin/csrf'
 import { db } from '@/lib/db'
 
@@ -14,8 +14,10 @@ export async function POST(request: NextRequest, context: { params: Promise<{ id
   const reason = typeof payload?.reason === 'string' ? payload.reason.trim() : ''
   const version = typeof payload?.version === 'number' ? payload.version : -1
   if (reason.length < 10 || reason.length > 500 || !Number.isInteger(version) || !request.headers.get('idempotency-key')) return NextResponse.json({ error: 'Invalid approval submission' }, { status: 400 })
-  const updated = await db.platformFeatureFlag.updateMany({ where: { id, status: 'draft', version }, data: { status: 'pending_approval', version: { increment: 1 }, updatedById: actor.userId } })
+  const key = request.headers.get('idempotency-key') as string
+  const result = await runAdminMutation({ actorUserId: actor.userId, action: 'feature_flag.submitted', idempotencyKey: key, targetId: id, audit: { requestId: actor.requestId, actorRoleKey: actor.roleKey, targetType: 'feature_flag', targetId: id, reason, outcome: 'success' }, mutate: (tx) => tx.platformFeatureFlag.updateMany({ where: { id, status: 'draft', version }, data: { status: 'pending_approval', version: { increment: 1 }, updatedById: actor.userId } }) })
+  if (result.duplicate) return NextResponse.json({ duplicate: true }, { headers: { 'Cache-Control': 'no-store' } })
+  const updated = result.value
   if (!updated.count) return NextResponse.json({ error: 'Flag changed or is not a draft' }, { status: 409 })
-  await writeAdminAudit({ requestId: actor.requestId, actorUserId: actor.userId, actorRoleKey: actor.roleKey, action: 'feature_flag.submitted', targetType: 'feature_flag', targetId: id, reason, outcome: 'success' })
   return NextResponse.json({ flag: { id, status: 'pending_approval', version: version + 1 } }, { headers: { 'Cache-Control': 'no-store', 'x-request-id': actor.requestId } })
 }

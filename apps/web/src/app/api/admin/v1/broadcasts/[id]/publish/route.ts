@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { isAdminResponse, requireAdmin } from '@/lib/admin/authorization'
-import { writeAdminAudit } from '@/lib/admin/audit'
+import { runAdminMutation } from '@/lib/admin/write-transaction'
 import { audienceWhere, storedAudience } from '@/lib/admin/broadcast-service'
 import { validateAdminWrite } from '@/lib/admin/csrf'
 import { db } from '@/lib/db'
@@ -24,8 +24,9 @@ export async function POST(request: NextRequest, context: { params: Promise<{ id
   if (!audience || !broadcast.approvedById || broadcast.status !== 'draft') return NextResponse.json({ error: 'Broadcast must be approved before publishing' }, { status: 409 })
   const where = audienceWhere(audience)
   const recipientCount = await db.user.count({ where })
-  await writeAdminAudit({ requestId: actor.requestId, actorUserId: actor.userId, actorRoleKey: actor.roleKey, action: 'broadcast.publish_started', targetType: 'broadcast', targetId: id, reason, outcome: 'success' })
-  const claimed = await db.adminBroadcast.updateMany({ where: { id, status: 'draft', approvedById: { not: null } }, data: { status: 'publishing', publishIdempotencyKey: idempotencyKey, publishedById: actor.userId, recipientCount } })
+  const claimResult = await runAdminMutation({ actorUserId: actor.userId, action: 'broadcast.publish_started', idempotencyKey, targetId: id, audit: { requestId: actor.requestId, actorRoleKey: actor.roleKey, targetType: 'broadcast', targetId: id, reason, outcome: 'success' }, mutate: (tx) => tx.adminBroadcast.updateMany({ where: { id, status: 'draft', approvedById: { not: null } }, data: { status: 'publishing', publishIdempotencyKey: idempotencyKey, publishedById: actor.userId, recipientCount } }) })
+  if (claimResult.duplicate) return NextResponse.json({ duplicate: true }, { headers: { 'Cache-Control': 'no-store' } })
+  const claimed = claimResult.value
   if (!claimed.count) return NextResponse.json({ error: 'Broadcast is already being processed' }, { status: 409 })
   let cursor: string | undefined
   let deliveredCount = 0

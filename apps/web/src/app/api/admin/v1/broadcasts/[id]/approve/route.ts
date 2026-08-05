@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { isAdminResponse, requireAdmin } from '@/lib/admin/authorization'
-import { writeAdminAudit } from '@/lib/admin/audit'
+import { runAdminMutation } from '@/lib/admin/write-transaction'
 import { validateAdminWrite } from '@/lib/admin/csrf'
 import { db } from '@/lib/db'
 
@@ -17,7 +17,9 @@ export async function POST(request: NextRequest, context: { params: Promise<{ id
   if (!broadcast) return NextResponse.json({ error: 'Not found' }, { status: 404 })
   if (broadcast.createdById === actor.userId) return NextResponse.json({ error: 'Creator cannot approve this broadcast' }, { status: 403 })
   if (broadcast.approvedById || broadcast.status !== 'draft') return NextResponse.json({ error: 'Broadcast is not awaiting approval' }, { status: 409 })
-  await writeAdminAudit({ requestId: actor.requestId, actorUserId: actor.userId, actorRoleKey: actor.roleKey, action: 'broadcast.approved', targetType: 'broadcast', targetId: id, reason, outcome: 'success' })
-  const updated = await db.adminBroadcast.update({ where: { id }, data: { approvedById: actor.userId }, select: { id: true, approvedById: true } })
+  const key = request.headers.get('idempotency-key') as string
+  const result = await runAdminMutation({ actorUserId: actor.userId, action: 'broadcast.approved', idempotencyKey: key, targetId: id, audit: { requestId: actor.requestId, actorRoleKey: actor.roleKey, targetType: 'broadcast', targetId: id, reason, outcome: 'success' }, mutate: (tx) => tx.adminBroadcast.update({ where: { id }, data: { approvedById: actor.userId }, select: { id: true, approvedById: true } }) })
+  if (result.duplicate) return NextResponse.json({ duplicate: true }, { headers: { 'Cache-Control': 'no-store' } })
+  const updated = result.value
   return NextResponse.json({ broadcast: updated }, { headers: { 'Cache-Control': 'no-store', 'x-request-id': actor.requestId } })
 }

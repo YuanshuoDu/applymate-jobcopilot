@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { isAdminResponse, requireAdmin } from '@/lib/admin/authorization'
 import { writeAdminAudit } from '@/lib/admin/audit'
+import { runAdminMutation } from '@/lib/admin/write-transaction'
 import { validateAdminWrite } from '@/lib/admin/csrf'
 import { parseFeatureFlag } from '@/lib/admin/feature-flags'
 import { adminPageLimit, pageResult } from '@/lib/admin/pagination'
@@ -30,7 +31,9 @@ export async function POST(request: NextRequest) {
   if (!input || reason.length < 10 || reason.length > 500 || !request.headers.get('idempotency-key')) return NextResponse.json({ error: 'Invalid feature flag' }, { status: 400 })
   const existing = await db.platformFeatureFlag.findUnique({ where: { key_environment: { key: input.key, environment: input.environment } }, select: { id: true } })
   if (existing) return NextResponse.json({ error: 'A flag already exists for this environment' }, { status: 409 })
-  await writeAdminAudit({ requestId: actor.requestId, actorUserId: actor.userId, actorRoleKey: actor.roleKey, action: 'feature_flag.created', targetType: 'feature_flag', reason, outcome: 'success' })
-  const flag = await db.platformFeatureFlag.create({ data: { ...input, createdById: actor.userId, updatedById: actor.userId }, select: flagSelect })
+  const key = request.headers.get('idempotency-key') as string
+  const result = await runAdminMutation({ actorUserId: actor.userId, action: 'feature_flag.created', idempotencyKey: key, audit: { requestId: actor.requestId, actorRoleKey: actor.roleKey, targetType: 'feature_flag', reason, outcome: 'success' }, mutate: (tx) => tx.platformFeatureFlag.create({ data: { ...input, createdById: actor.userId, updatedById: actor.userId }, select: flagSelect }) })
+  if (result.duplicate) return NextResponse.json({ duplicate: true }, { headers: { 'Cache-Control': 'no-store' } })
+  const flag = result.value
   return NextResponse.json({ flag }, { status: 201, headers: { 'Cache-Control': 'no-store', 'x-request-id': actor.requestId } })
 }
