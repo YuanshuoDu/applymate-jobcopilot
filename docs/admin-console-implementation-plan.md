@@ -22,13 +22,14 @@ Initialize roles once a staff user exists with `INITIAL_SUPER_ADMIN_EMAIL=<staff
 - Queue summary/pause/resume through a HMAC-signed, short-lived, replay-protected Worker command endpoint. The console does not access Redis or Bull Board.
 - Budget overrides use optimistic versions and immutable adjustment records. Usage reset is a short-lived, independent-approver workflow.
 - Role/status changes revoke existing admin sessions. Break-glass grants are short-lived, independently approved, audited, and resolved by `requireAdmin` without changing a standing role.
+- The audit table has a database-level append-only trigger and revokes public UPDATE/DELETE/TRUNCATE privileges.
 
 ## Release-gate work requiring deployment coordination
 
 1. Deploy Prisma migrations using an application database credential, then seed the initial super-admin in a controlled environment.
 2. Provide a real WebAuthn enrollment and recent-reauthentication ceremony. The current model enforces stored MFA level for `super_admin`; it does not perform the ceremony.
 3. Roll out PostgreSQL RLS only with a candidate-service credential and transaction-scoped `SET LOCAL app.user_id`. Enable it after tenant-query inventory and cross-tenant SQL tests; enabling it against the current shared Prisma connection would break candidate traffic.
-4. Restrict the application database role to `INSERT`/`SELECT` on `AdminAuditLog`, add an isolated daily hash-chain checkpoint job, and verify audit-write failure alerts.
+4. Restrict the application database role to `INSERT`/`SELECT` on `AdminAuditLog`, add an isolated daily hash-chain checkpoint job, and verify audit-write failure alerts. The migration already blocks normal row updates/deletes and revokes public mutation privileges; role-specific grants still require deployment ownership.
 5. Configure `WORKER_CONTROL_URL`, `WORKER_CONTROL_SECRET`, and a loopback/private `WORKER_ADMIN_HOST`; validate the private network path in the target deployment.
 6. Run the full Web and Worker suites, a migration smoke test against an ephemeral PostgreSQL instance, and the external access-control/security review before production rollout.
 
