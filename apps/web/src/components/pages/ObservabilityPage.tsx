@@ -80,7 +80,7 @@ function flowLabel(key: string) {
 }
 
 export function ObservabilityPage() {
-  const { data, loading, error, refetch } = useApi<ObservabilityData>('/api/admin/observability')
+  const { data, loading, error, refetch } = useApi<ObservabilityData>('/api/admin/v1/observability')
   const overall = data?.overall
   const flowEntries = overall
     ? Object.entries(overall.byFlowUsed).map(([key, value]) => ({ key, value }))

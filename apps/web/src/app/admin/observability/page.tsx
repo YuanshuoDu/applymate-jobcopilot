@@ -1,10 +1,5 @@
-import { ErrorBoundary } from '@/components/ErrorBoundary'
-import { ObservabilityPage } from '@/components/pages/ObservabilityPage'
+import { redirect } from 'next/navigation'
 
 export default function AdminObservabilityRoute() {
-  return (
-    <ErrorBoundary>
-      <ObservabilityPage />
-    </ErrorBoundary>
-  )
+  redirect('/admin')
 }

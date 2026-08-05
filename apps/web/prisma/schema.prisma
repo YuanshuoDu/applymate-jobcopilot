@@ -103,6 +103,8 @@ model User {
   gmailSyncState GmailSyncState?
   gmailMessages  GmailMessage[]
   gmailRecommendations GmailRecommendation[]
+  adminMembership AdminMembership? @relation("AdminUser")
+  supportCases SupportCase[] @relation("SupportRequester")
 }
 
 enum Plan {
@@ -487,6 +489,192 @@ model AiBudget {
   @@map("ai_budgets")
 }
 
+enum AdminMembershipStatus {
+  active
+  suspended
+  revoked
+}
+
+enum AdminMfaLevel {
+  none
+  totp
+  webauthn
+}
+
+enum AdminAuditOutcome {
+  success
+  denied
+  failed
+}
+
+enum AdminTargetType {
+  user
+  job
+  application
+  ats_source
+  feature_flag
+  ai_budget
+  queue
+  broadcast
+  support_case
+  admin_member
+}
+
+enum BroadcastStatus {
+  draft
+  pending_approval
+  scheduled
+  publishing
+  published
+  cancelled
+  failed
+}
+
+enum BroadcastAudienceType {
+  all_active_users
+  plan
+  location
+  explicit_user_ids
+}
+
+enum SupportCaseStatus {
+  open
+  in_progress
+  waiting_on_customer
+  resolved
+  closed
+}
+
+enum SupportCasePriority {
+  low
+  normal
+  high
+  urgent
+}
+
+enum SupportCaseMessageKind {
+  customer_reply
+  staff_reply
+  internal_note
+  system_event
+}
+
+model AdminRole {
+  id          String   @id @default(cuid())
+  key         String   @unique
+  name        String
+  description String?
+  permissions String[]
+  system      Boolean  @default(true)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+  memberships AdminMembership[]
+}
+
+model AdminMembership {
+  id             String                @id @default(cuid())
+  userId         String                @unique
+  roleId         String
+  status         AdminMembershipStatus @default(active)
+  mfaLevel       AdminMfaLevel         @default(none)
+  sessionVersion Int                   @default(1)
+  grantedById    String?
+  grantedAt      DateTime              @default(now())
+  revokedAt      DateTime?
+  user           User                  @relation("AdminUser", fields: [userId], references: [id], onDelete: Restrict)
+  role           AdminRole             @relation(fields: [roleId], references: [id], onDelete: Restrict)
+  @@index([status, roleId])
+}
+
+model AdminAuditLog {
+  id            String            @id @default(cuid())
+  requestId     String
+  actorUserId   String?
+  actorRoleKey  String?
+  action        String
+  targetType    AdminTargetType?
+  targetId      String?
+  tenantUserId  String?
+  reason        String?
+  outcome       AdminAuditOutcome
+  ipHash        String?
+  userAgentHash String?
+  before        Json?
+  after         Json?
+  errorCode     String?
+  createdAt     DateTime          @default(now())
+  @@index([actorUserId, createdAt(sort: Desc)])
+  @@index([tenantUserId, createdAt(sort: Desc)])
+  @@index([action, createdAt(sort: Desc)])
+}
+
+model AdminBreakGlassGrant {
+  id          String   @id @default(cuid())
+  requesterId String
+  approverId  String?
+  permission  String
+  reason      String
+  expiresAt   DateTime
+  revokedAt   DateTime?
+  createdAt   DateTime @default(now())
+  @@index([requesterId, expiresAt])
+}
+
+model AdminBroadcast {
+  id             String                @id @default(cuid())
+  title          String
+  body           String                @db.Text
+  audienceType   BroadcastAudienceType
+  audience       Json
+  status         BroadcastStatus       @default(draft)
+  scheduledAt    DateTime?
+  createdById    String
+  approvedById   String?
+  publishedById  String?
+  recipientCount Int                   @default(0)
+  deliveredCount Int                   @default(0)
+  failedCount    Int                   @default(0)
+  createdAt      DateTime              @default(now())
+  updatedAt      DateTime              @updatedAt
+  notifications  Notification[]
+  @@index([status, scheduledAt])
+}
+
+model SupportCase {
+  id               String            @id @default(cuid())
+  requesterUserId  String            @map("requester_user_id")
+  subject          String
+  category         String
+  status           SupportCaseStatus @default(open)
+  priority         SupportCasePriority @default(normal)
+  assignedAdminId  String?           @map("assigned_admin_id")
+  slaDueAt         DateTime?         @map("sla_due_at")
+  firstRespondedAt DateTime?         @map("first_responded_at")
+  resolvedAt       DateTime?         @map("resolved_at")
+  safeContext      Json?             @map("safe_context")
+  createdAt        DateTime          @default(now())
+  updatedAt        DateTime          @updatedAt
+  requester        User              @relation("SupportRequester", fields: [requesterUserId], references: [id], onDelete: Cascade)
+  messages         SupportCaseMessage[]
+  @@index([status, priority, slaDueAt])
+  @@index([requesterUserId, updatedAt(sort: Desc)])
+  @@map("support_cases")
+}
+
+model SupportCaseMessage {
+  id           String                 @id @default(cuid())
+  caseId       String                 @map("case_id")
+  authorType   SupportCaseMessageKind @map("author_type")
+  authorUserId String?                @map("author_user_id")
+  idempotencyKey String?              @unique @map("idempotency_key")
+  body         String                 @db.Text
+  redacted     Boolean                @default(false)
+  createdAt    DateTime               @default(now())
+  supportCase  SupportCase            @relation(fields: [caseId], references: [id], onDelete: Cascade)
+  @@index([caseId, createdAt])
+  @@map("support_case_messages")
+}
+
 model Notification {
   id        String   @id @default(cuid())
   userId    String   @map("user_id")
@@ -495,11 +683,15 @@ model Notification {
   body      String?
   read      Boolean  @default(false)
   jobId     String?  @map("job_id")
+  broadcastId String? @map("broadcast_id")
   createdAt DateTime @default(now()) @map("created_at")
 
   user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+  broadcast AdminBroadcast? @relation(fields: [broadcastId], references: [id], onDelete: SetNull)
 
   @@index([userId, createdAt(sort: Desc)])
+  @@index([broadcastId])
+  @@unique([broadcastId, userId])
   @@map("notifications")
 }
 
