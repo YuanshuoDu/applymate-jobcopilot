@@ -9,15 +9,19 @@ import { DEFAULT_RECOMMENDATION_FILTERS, filterRecommendations, type Recommendat
 import type { GmailRecommendation, GmailTrackingResponse } from '@/components/gmail/types'
 import { useNav } from '@/lib/nav-context'
 import './JobRecommendationsPage.css'
+import { useSession } from 'next-auth/react'
+import { userScopedStorageKey } from '@/lib/user-scoped-storage'
 
 type ConnectionState = GmailConnectionState | 'ready'
 const REAUTH_ERRORS = new Set(['GMAIL_REAUTH', 'GMAIL_SCOPE_MISSING', 'GMAIL_PERMISSION', 'TOKEN_EXPIRED'])
 const RECOMMENDATIONS_CACHE_KEY = 'applymate:gmail-recommendations'
 
 export function JobRecommendationsPage() {
+  const { data: session } = useSession()
+  const userId = session?.user?.id ?? null
   const { navigate } = useNav()
   const toast = useToast()
-  const cachedRecommendations = useRef(readRecommendationCache())
+  const cachedRecommendations = useRef(readRecommendationCache(userId))
   const [connection, setConnection] = useState<ConnectionState>(() => cachedRecommendations.current ? 'ready' : 'loading')
   const [recommendations, setRecommendations] = useState<GmailRecommendation[]>(() => cachedRecommendations.current ?? [])
   const [filters, setFilters] = useState<RecommendationFilters>(DEFAULT_RECOMMENDATION_FILTERS)
@@ -40,7 +44,7 @@ export function JobRecommendationsPage() {
         return
       }
       setRecommendations(body.recommendations ?? [])
-      writeRecommendationCache(body.recommendations ?? [])
+      writeRecommendationCache(body.recommendations ?? [], userId)
       setConnection('ready')
       if (notify) toast.success('Inbox refreshed', `${body.pendingRecommendationCount ?? 0} jobs ready to review.`)
     } catch (error) {
@@ -48,7 +52,7 @@ export function JobRecommendationsPage() {
     } finally {
       setRefreshing(false)
     }
-  }, [toast])
+  }, [toast, userId])
 
   useEffect(() => {
     const controller = new AbortController()
@@ -136,14 +140,18 @@ function uniqueValues(values: Array<string | null>) {
   return [...new Set(values.filter((value): value is string => Boolean(value?.trim())))].sort((left, right) => left.localeCompare(right))
 }
 
-function readRecommendationCache(): GmailRecommendation[] | null {
+function readRecommendationCache(userId: string | null): GmailRecommendation[] | null {
   if (typeof window === 'undefined') return null
   try {
-    const value: unknown = JSON.parse(window.sessionStorage.getItem(RECOMMENDATIONS_CACHE_KEY) ?? 'null')
+    const key = userScopedStorageKey(RECOMMENDATIONS_CACHE_KEY, userId)
+    if (!key) return null
+    const value: unknown = JSON.parse(window.sessionStorage.getItem(key) ?? 'null')
     return Array.isArray(value) ? value as GmailRecommendation[] : null
   } catch { return null }
 }
 
-function writeRecommendationCache(recommendations: GmailRecommendation[]) {
-  try { window.sessionStorage.setItem(RECOMMENDATIONS_CACHE_KEY, JSON.stringify(recommendations)) } catch { /* Storage is optional. */ }
+function writeRecommendationCache(recommendations: GmailRecommendation[], userId: string | null) {
+  const key = userScopedStorageKey(RECOMMENDATIONS_CACHE_KEY, userId)
+  if (!key) return
+  try { window.sessionStorage.setItem(key, JSON.stringify(recommendations)) } catch { /* Storage is optional. */ }
 }
