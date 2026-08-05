@@ -21,7 +21,7 @@ import { reconcileGoogleLoginIdentity } from './google-identity'
 describe('reconcileGoogleLoginIdentity', () => {
   beforeEach(() => {
     Object.values(mocks).forEach(mock => mock.mockReset())
-    mocks.userUpsert.mockResolvedValue({ id: 'target-user' })
+    mocks.userUpsert.mockResolvedValue({ id: 'target-user', email: 'member@example.com', name: 'Member', image: 'https://example.test/member.png' })
     mocks.accountFindFirst.mockResolvedValue(null)
     mocks.accountUpdateMany.mockResolvedValue({ count: 1 })
   })
@@ -38,8 +38,10 @@ describe('reconcileGoogleLoginIdentity', () => {
   })
 
   it('repairs a legacy Google identity that points to the demo user', async () => {
+    const user = { id: 'demo-user', email: 'demo@applymate.ai', name: 'Zhang Li', image: null as string | null }
+
     await expect(reconcileGoogleLoginIdentity({
-      user: { email: 'demo@applymate.ai' },
+      user,
       account: { provider: 'google', providerAccountId: 'google-subject' },
       profile: {
         email: 'Member@Example.com',
@@ -48,6 +50,13 @@ describe('reconcileGoogleLoginIdentity', () => {
         picture: 'https://example.test/member.png',
       },
     })).resolves.toBe(true)
+
+    expect(user).toMatchObject({
+      id: 'target-user',
+      email: 'member@example.com',
+      name: 'Member',
+      image: 'https://example.test/member.png',
+    })
 
     expect(mocks.userUpsert).toHaveBeenCalledWith({
       where: { email: 'member@example.com' },
