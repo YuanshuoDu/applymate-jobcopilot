@@ -1,6 +1,8 @@
 'use client'
 
 import { AdminDataTable, values } from './AdminDataTable'
+import { AdminAtsControls } from './AdminAtsControls'
+import { AdminBudgetControls } from './AdminBudgetControls'
 import Link from 'next/link'
 
 export function AdminUsersPage() {
@@ -10,11 +12,11 @@ export function AdminUsersPage() {
   ]} />
 }
 
-export function AdminAtsPage() {
-  return <AdminDataTable title="ATS sources" subtitle="Registry, discovery volume, and hard rate-limit metadata" endpoint="/api/admin/v1/ats" columns={[
+export function AdminAtsPage({ permissions }: { permissions: readonly string[] }) {
+  return <><AdminDataTable title="ATS sources" subtitle="Registry, discovery volume, and hard rate-limit metadata" endpoint="/api/admin/v1/ats" columns={[
     { label: 'Source', value: (row) => `${row.atsType} · ${row.name ?? row.slug}` }, { label: 'Jobs', value: values.text('jobCount') },
     { label: 'RPS ceiling', value: (row) => row.rateLimitRps ? `${row.rateLimitRps} rps` : 'Not registered' }, { label: 'Last seen', value: values.date('lastSeen') }, { label: 'Credential', value: (row) => row.credentialConfigured ? 'Configured' : 'Not reported' },
-  ]} />
+  ]} /><AdminAtsControls permissions={permissions} /></>
 }
 
 export function AdminApplicationsPage() {
@@ -24,11 +26,11 @@ export function AdminApplicationsPage() {
   ]} />
 }
 
-export function AdminAiPage() {
-  return <AdminDataTable title="AI operations" subtitle="Monthly budget accounting and remaining credits" endpoint="/api/admin/v1/ai/budgets" columns={[
+export function AdminAiPage({ permissions }: { permissions: readonly string[] }) {
+  return <><AdminDataTable title="AI operations" subtitle="Monthly budget accounting and remaining credits" endpoint="/api/admin/v1/ai/budgets" columns={[
     { label: 'User ID', value: values.text('userId') }, { label: 'Month', value: values.text('month') }, { label: 'Used', value: values.text('used') },
     { label: 'Limit', value: values.text('limit') }, { label: 'Remaining', value: values.text('remaining') }, { label: 'Updated', value: values.date('updatedAt') },
-  ]} />
+  ]} /><AdminBudgetControls canUpdate={permissions.includes('ai_budget.update')} /></>
 }
 
 export function AdminAuditPage() {
