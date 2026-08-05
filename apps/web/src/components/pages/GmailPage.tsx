@@ -10,6 +10,7 @@ import { GmailInboxSidebar } from '@/components/gmail/GmailInboxSidebar'
 import { GmailMessageReader } from '@/components/gmail/GmailMessageReader'
 import { countInboxEmails, filterInboxEmails, type GmailEmail, type GmailInboxFilter } from '@/components/gmail/inbox-model'
 import { useNav } from '@/lib/nav-context'
+import { userScopedStorageKey } from '@/lib/user-scoped-storage'
 
 interface GmailThreadsResponse {
   emails?: GmailEmail[]
@@ -23,10 +24,11 @@ type InboxConnectionState = GmailConnectionState | 'ready'
 /** The original Gmail inbox: filters, message list, and reading pane. */
 export function GmailPage() {
   const { data: session } = useSession()
+  const userId = session?.user?.id ?? null
   const { navigate } = useNav()
   const toast = useToast()
   const authTriggeredRef = useRef(false)
-  const cachedEmails = useRef(readInboxCache())
+  const cachedEmails = useRef(readInboxCache(userId))
   const [connection, setConnection] = useState<InboxConnectionState>(() => cachedEmails.current ? 'ready' : 'loading')
   const [emails, setEmails] = useState<GmailEmail[]>(() => cachedEmails.current ?? [])
   const [selected, setSelected] = useState<GmailEmail | null>(null)
@@ -47,7 +49,7 @@ export function GmailPage() {
         return
       }
       setEmails(body.emails ?? [])
-      writeInboxCache(body.emails ?? [])
+      writeInboxCache(body.emails ?? [], userId)
       setConnection('ready')
       if (silent) toast.success('Refreshed', `${body.emails?.length ?? 0} emails loaded`)
     } catch (error) {
@@ -56,7 +58,7 @@ export function GmailPage() {
     } finally {
       setRefreshing(false)
     }
-  }, [toast])
+  }, [toast, userId])
 
   useEffect(() => {
     const controller = new AbortController()
@@ -118,14 +120,18 @@ function removeGmailQueryParam(name: string) {
 
 const searchStyle = { width: 200, padding: '5px 10px', fontSize: 12, border: '0.5px solid var(--border)', borderRadius: 6, background: 'var(--bg)', color: 'var(--text)', outline: 'none' }
 
-function readInboxCache(): GmailEmail[] | null {
+function readInboxCache(userId: string | null): GmailEmail[] | null {
   if (typeof window === 'undefined') return null
   try {
-    const value: unknown = JSON.parse(window.sessionStorage.getItem(GMAIL_INBOX_CACHE_KEY) ?? 'null')
+    const key = userScopedStorageKey(GMAIL_INBOX_CACHE_KEY, userId)
+    if (!key) return null
+    const value: unknown = JSON.parse(window.sessionStorage.getItem(key) ?? 'null')
     return Array.isArray(value) ? value as GmailEmail[] : null
   } catch { return null }
 }
 
-function writeInboxCache(emails: GmailEmail[]) {
-  try { window.sessionStorage.setItem(GMAIL_INBOX_CACHE_KEY, JSON.stringify(emails)) } catch { /* Storage is optional. */ }
+function writeInboxCache(emails: GmailEmail[], userId: string | null) {
+  const key = userScopedStorageKey(GMAIL_INBOX_CACHE_KEY, userId)
+  if (!key) return
+  try { window.sessionStorage.setItem(key, JSON.stringify(emails)) } catch { /* Storage is optional. */ }
 }

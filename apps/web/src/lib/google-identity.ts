@@ -9,7 +9,12 @@ type GoogleProfile = {
 }
 
 type GoogleIdentityInput = {
-  user: { email?: string | null }
+  user: {
+    id?: string
+    email?: string | null
+    name?: string | null
+    image?: string | null
+  }
   account: { provider?: string; providerAccountId?: string }
   profile?: GoogleProfile | null
 }
@@ -50,6 +55,14 @@ export async function reconcileGoogleLoginIdentity(input: GoogleIdentityInput): 
   if (targetGoogleAccount && targetGoogleAccount.providerAccountId !== input.account.providerAccountId) {
     return false
   }
+
+  // Auth.js has already built its session user from the legacy account row by
+  // this point. Keep that object aligned with the verified Google user so the
+  // session created by the same callback cannot retain the demo identity.
+  input.user.id = target.id
+  input.user.email = target.email
+  input.user.name = target.name
+  input.user.image = target.image
 
   const repaired = await db.account.updateMany({
     where: {

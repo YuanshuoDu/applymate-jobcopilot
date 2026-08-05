@@ -74,7 +74,8 @@
         "*://*.irishjobs.ie/*",
         "http://localhost:3000/*",
         "http://localhost:5173/*",
-        "*://web-delta-ruddy-29.vercel.app/*"
+        "*://web-delta-ruddy-29.vercel.app/*",
+        "https://applymate.site/*"
       ],
       "js":       ["src/content/index.ts"],
       "css":      ["src/content/inject.css"],
