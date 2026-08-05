@@ -175,6 +175,7 @@ async function refreshAuthFromDashboard(
     try {
       const url = new URL(tab.url)
       return url.hostname === 'localhost' ||
+        url.hostname === 'applymate.site' ||
         url.hostname === 'web-delta-ruddy-29.vercel.app' ||
         url.hostname.endsWith('.applymate.ai')
     } catch {

@@ -49,6 +49,7 @@ const TOAST_ID    = 'applymate-toast'
 // repeated DOM scans and retry timers that provide no value there.
 const IS_DASHBOARD_PAGE =
   window.location.hostname === 'localhost' ||
+  window.location.hostname === 'applymate.site' ||
   window.location.hostname === 'web-delta-ruddy-29.vercel.app' ||
   window.location.hostname.endsWith('.applymate.ai')
 const IS_FORM_FILL_ONLY_PAGE =

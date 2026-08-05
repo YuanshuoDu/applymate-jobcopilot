@@ -1,7 +1,7 @@
 import type { ExtensionSettings, ScrapedJob } from './types'
 
 const DEFAULTS: ExtensionSettings = {
-  apiBaseUrl: 'https://web-delta-ruddy-29.vercel.app',
+  apiBaseUrl: 'https://applymate.site',
   apiToken:   '',
   userEmail:  '',
   userName:   '',

@@ -9,6 +9,7 @@ import { jwtVerify } from 'jose'
 import { db } from '@/lib/db'
 import { normalizeEmail } from '@/lib/auth-identifiers'
 import { reconcileGoogleLoginIdentity } from '@/lib/google-identity'
+import { canonicalAuthRedirect } from '@/lib/auth-url'
 
 const AUTH_SECRET = process.env.AUTH_SECRET ?? 'fallback-secret-change-this'
 const JWT_SECRET = new TextEncoder().encode(AUTH_SECRET)
@@ -137,6 +138,9 @@ export const { handlers, signIn, signOut, auth } = NextAuth({
         session.user.plan = (token.plan as 'free' | 'pro' | 'enterprise') ?? 'free'
       }
       return session
+    },
+    async redirect({ url, baseUrl }) {
+      return canonicalAuthRedirect(url, baseUrl, process.env.AUTH_CANONICAL_URL ?? 'https://applymate.site')
     },
   },
   pages: {
