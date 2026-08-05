@@ -482,11 +482,29 @@ model AiBudget {
   month     String                                // "2026-06"
   used      Int      @default(0)
   limit     Int      @default(30)
+  version   Int      @default(1)
   createdAt DateTime @default(now()) @map("created_at")
   updatedAt DateTime @updatedAt @map("updated_at")
+  adjustments AiBudgetAdjustment[]
 
   @@unique([userId, month])
   @@map("ai_budgets")
+}
+
+model AiBudgetAdjustment {
+  id             String   @id @default(cuid())
+  budgetId       String   @map("budget_id")
+  actorUserId    String   @map("actor_user_id")
+  kind           String
+  previousLimit  Int      @map("previous_limit")
+  nextLimit      Int      @map("next_limit")
+  reason         String
+  idempotencyKey String   @unique @map("idempotency_key")
+  createdAt      DateTime @default(now()) @map("created_at")
+  budget         AiBudget @relation(fields: [budgetId], references: [id], onDelete: Restrict)
+
+  @@index([budgetId, createdAt(sort: Desc)])
+  @@map("ai_budget_adjustments")
 }
 
 enum AdminMembershipStatus {
@@ -542,6 +560,14 @@ enum FeatureFlagStatus {
   pending_approval
   active
   retired
+}
+
+enum AtsSourceState {
+  enabled
+  degraded
+  pending_pause
+  paused
+  disabled
 }
 
 enum SupportCaseStatus {
@@ -669,6 +695,40 @@ model PlatformFeatureFlag {
   @@index([environment, status])
 }
 
+model AtsSourcePolicy {
+  id                      String         @id @default(cuid())
+  sourceKey               String         @unique @map("source_key")
+  state                   AtsSourceState @default(enabled)
+  enabled                 Boolean        @default(true)
+  rolloutPercent          Int            @default(100) @map("rollout_percent")
+  globalRpsLimit          Int            @map("global_rps_limit")
+  perTenantRpsLimit       Int            @map("per_tenant_rps_limit")
+  maxRetries              Int            @default(3) @map("max_retries")
+  backoffBaseMs           Int            @default(1000) @map("backoff_base_ms")
+  allowAutoApply          Boolean        @default(false) @map("allow_auto_apply")
+  version                 Int            @default(1)
+  lastChangedById         String         @map("last_changed_by_id")
+  lastAcknowledgedVersion Int?           @map("last_acknowledged_version")
+  pauseRequestedById      String?        @map("pause_requested_by_id")
+  pauseApprovedById       String?        @map("pause_approved_by_id")
+  updatedAt               DateTime       @updatedAt @map("updated_at")
+
+  @@index([state, updatedAt(sort: Desc)])
+  @@map("ats_source_policies")
+}
+
+model AdminIdempotencyKey {
+  id             String   @id @default(cuid())
+  actorUserId    String   @map("actor_user_id")
+  action         String
+  idempotencyKey String   @map("idempotency_key")
+  targetId       String?  @map("target_id")
+  createdAt      DateTime @default(now()) @map("created_at")
+
+  @@unique([actorUserId, action, idempotencyKey])
+  @@map("admin_idempotency_keys")
+}
+
 model SupportCase {
   id               String            @id @default(cuid())
   requesterUserId  String            @map("requester_user_id")
@@ -681,6 +741,7 @@ model SupportCase {
   firstRespondedAt DateTime?         @map("first_responded_at")
   resolvedAt       DateTime?         @map("resolved_at")
   safeContext      Json?             @map("safe_context")
+  version          Int               @default(1)
   createdAt        DateTime          @default(now())
   updatedAt        DateTime          @updatedAt
   requester        User              @relation("SupportRequester", fields: [requesterUserId], references: [id], onDelete: Cascade)

@@ -4,8 +4,9 @@ import { KeyRound, ShieldCheck } from 'lucide-react'
 import { useEffect, useState } from 'react'
 
 type Member = { id: string; status: string; mfaLevel: string; sessionVersion: number; grantedAt: string; user: { name: string | null; email: string }; role: { key: string; name: string } }
+const roles = ['support', 'operations', 'analyst', 'billing', 'security_admin', 'platform_admin', 'super_admin']
 
-export function AdminAccessPage({ canRevoke }: { canRevoke: boolean }) {
+export function AdminAccessPage({ canRevoke, canManage }: { canRevoke: boolean; canManage: boolean }) {
   const [items, setItems] = useState<Member[]>([])
   const [notice, setNotice] = useState('')
   async function load() {
@@ -21,5 +22,13 @@ export function AdminAccessPage({ canRevoke }: { canRevoke: boolean }) {
     if (!response.ok) setNotice(payload?.error ?? 'Unable to revoke sessions.')
     else { setNotice('Sessions revoked.'); await load() }
   }
-  return <div className="admin-page"><header className="admin-header"><div><h1>Access</h1><p>Internal members, roles and session controls</p></div><ShieldCheck size={22} aria-hidden="true" /></header><section className="admin-list-page">{notice && <div className="admin-alert">{notice}</div>}<div className="admin-table-wrap"><table className="admin-table"><thead><tr><th>Member</th><th>Role</th><th>Status</th><th>MFA</th><th>Sessions</th><th>Granted</th><th aria-label="Actions" /></tr></thead><tbody>{items.length === 0 ? <tr><td colSpan={7}>No internal members.</td></tr> : items.map((member) => <tr key={member.id}><td>{member.user.name ?? 'Unnamed'} · {member.user.email}</td><td>{member.role.name}</td><td>{member.status}</td><td>{member.mfaLevel}</td><td>v{member.sessionVersion}</td><td>{new Date(member.grantedAt).toLocaleString()}</td><td>{canRevoke && member.status === 'active' && <button className="admin-row-action" title="Revoke sessions" onClick={() => void revoke(member)}><KeyRound size={15} /></button>}</td></tr>)}</tbody></table></div></section></div>
+  async function update(member: Member, roleKey: string, status: string) {
+    const reason = window.prompt('Enter the access-change reason')
+    if (!reason) return
+    const response = await fetch(`/api/admin/v1/access/members/${member.id}`, { method: 'PATCH', headers: { 'Content-Type': 'application/json', 'Idempotency-Key': crypto.randomUUID() }, body: JSON.stringify({ roleKey, status, sessionVersion: member.sessionVersion, reason }) })
+    const payload = await response.json().catch(() => null) as { error?: string } | null
+    setNotice(response.ok ? 'Access updated and active sessions invalidated.' : payload?.error ?? 'Unable to update access.')
+    if (response.ok) await load()
+  }
+  return <div className="admin-page"><header className="admin-header"><div><h1>Access</h1><p>Internal members, roles and session controls</p></div><ShieldCheck size={22} aria-hidden="true" /></header><section className="admin-list-page">{notice && <div className="admin-alert">{notice}</div>}<div className="admin-table-wrap"><table className="admin-table"><thead><tr><th>Member</th><th>Role</th><th>Status</th><th>MFA</th><th>Sessions</th><th>Granted</th><th aria-label="Actions" /></tr></thead><tbody>{items.length === 0 ? <tr><td colSpan={7}>No internal members.</td></tr> : items.map((member) => <tr key={member.id}><td>{member.user.name ?? 'Unnamed'} · {member.user.email}</td><td>{canManage ? <select aria-label={`Role for ${member.user.email}`} value={member.role.key} onChange={(event) => void update(member, event.target.value, member.status)}>{roles.map((role) => <option key={role} value={role}>{role.replaceAll('_', ' ')}</option>)}</select> : member.role.name}</td><td>{canManage ? <select aria-label={`Status for ${member.user.email}`} value={member.status} onChange={(event) => void update(member, member.role.key, event.target.value)}><option value="active">active</option><option value="suspended">suspended</option><option value="revoked">revoked</option></select> : member.status}</td><td>{member.mfaLevel}</td><td>v{member.sessionVersion}</td><td>{new Date(member.grantedAt).toLocaleString()}</td><td>{canRevoke && member.status === 'active' && <button className="admin-row-action" title="Revoke sessions" onClick={() => void revoke(member)}><KeyRound size={15} /></button>}</td></tr>)}</tbody></table></div></section></div>
 }
