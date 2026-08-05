@@ -19,23 +19,23 @@ const C = {
 const FEATURES = [
   {
     icon: <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="12" r="3"/><path d="M12 1v4M12 19v4M4.22 4.22l2.83 2.83M16.95 16.95l2.83 2.83M1 12h4M19 12h4M4.22 19.78l2.83-2.83M16.95 7.05l2.83-2.83"/></svg>,
-    title: '智能职位匹配',
-    desc:  'AI 实时评估每个职位与你简历的匹配程度',
+    title: 'Smart Job Matching',
+    desc:  'AI evaluates how well each job matches your resume',
   },
   {
     icon: <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></svg>,
-    title: '简历自动定制',
-    desc:  '针对每个 JD 一键优化简历关键词与格式',
+    title: 'Resume Tailoring',
+    desc:  'Optimize resume keywords and formatting for every job description',
   },
   {
     icon: <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><rect x="2" y="7" width="20" height="14" rx="2"/><path d="M16 7V5a2 2 0 0 0-2-2h-4a2 2 0 0 0-2 2v2"/></svg>,
-    title: 'AI Agent 自动投递',
-    desc:  '设置规则后，Agent 24h 自动发现并申请职位',
+    title: 'AI Agent Auto-Apply',
+    desc:  'Set your rules and let the Agent discover and apply to jobs 24/7',
   },
   {
     icon: <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M4 4h16c1.1 0 2 .9 2 2v12c0 1.1-.9 2-2 2H4c-1.1 0-2-.9-2-2V6c0-1.1.9-2 2-2z"/><polyline points="22,6 12,13 2,6"/></svg>,
-    title: 'Gmail 一站跟踪',
-    desc:  '自动识别 HR 回复，汇总申请进度',
+    title: 'Gmail Tracking',
+    desc:  'Automatically identify recruiter replies and track your applications',
   },
 ]
 
@@ -64,7 +64,7 @@ function PasswordStrength({ password }: { password: string }) {
     /[0-9]/.test(password),
     /[^A-Za-z0-9]/.test(password),
   ].filter(Boolean).length
-  const labels = ['', '弱', '一般', '较强', '强']
+  const labels = ['', 'Weak', 'Fair', 'Good', 'Strong']
   const colors = ['', C.red, '#D97706', C.primary, C.green]
   return (
     <div style={{ marginTop: 6 }}>
@@ -100,11 +100,11 @@ export function RegisterPage() {
   const googleAvailable = Boolean(oauthProviders?.google)
 
   function validate(): string | null {
-    if (!name.trim())                  return '请填写姓名'
-    if (!email.trim())                 return '请填写邮箱'
-    if (!/\S+@\S+\.\S+/.test(email))  return '邮箱格式不正确'
-    if (password.length < 8)          return '密码至少 8 位'
-    if (password !== confirm)         return '两次密码输入不一致'
+    if (!name.trim())                  return 'Please enter your name'
+    if (!email.trim())                 return 'Please enter your email'
+    if (!/\S+@\S+\.\S+/.test(email))  return 'Please enter a valid email address'
+    if (password.length < 8)          return 'Password must be at least 8 characters'
+    if (password !== confirm)         return 'Passwords do not match'
     return null
   }
 
@@ -122,7 +122,7 @@ export function RegisterPage() {
       })
       const data = await res.json().catch(() => ({} as { error?: string }))
       if (!res.ok) {
-        setError(data.error ?? (res.status >= 500 ? '服务器配置错误，请检查数据库连接' : '注册失败'))
+        setError(data.error ?? (res.status >= 500 ? 'Server configuration error. Please check the database connection.' : 'Registration failed'))
         setLoading(null)
         return
       }
@@ -132,13 +132,13 @@ export function RegisterPage() {
       else { setStep('success'); setTimeout(() => { router.push('/'); router.refresh() }, 1800) }
     } catch {
       setLoading(null)
-      setError('网络错误，请重试')
+      setError('Network error. Please try again')
     }
   }
 
   async function handleGoogle() {
     if (!googleAvailable) {
-      setError('Google 登录尚未配置，请先使用邮箱注册或登录。')
+      setError('Google sign-in is not configured. Please use email registration or sign-in.')
       return
     }
     setLoading('google')
@@ -151,8 +151,8 @@ export function RegisterPage() {
       <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', minHeight: '100vh', background: 'linear-gradient(135deg, #EEF2FF 0%, #F5F3FF 35%, #EDE9FE 65%, #F0F9FF 100%)' }}>
         <div style={{ textAlign: 'center', padding: 32 }}>
           <div style={{ fontSize: 56, marginBottom: 16 }}>🎉</div>
-          <h2 style={{ fontSize: 22, fontWeight: 700, marginBottom: 8, color: C.text }}>账号创建成功！</h2>
-          <p style={{ fontSize: 13, color: C.muted }}>正在跳转到你的 Dashboard…</p>
+          <h2 style={{ fontSize: 22, fontWeight: 700, marginBottom: 8, color: C.text }}>Account created successfully!</h2>
+          <p style={{ fontSize: 13, color: C.muted }}>Redirecting to your Dashboard...</p>
           <div style={{ marginTop: 20, width: 28, height: 28, border: `3px solid rgba(79,70,229,0.20)`, borderTopColor: C.primary, borderRadius: '50%', animation: 'spin 0.7s linear infinite', margin: '20px auto 0' }} />
         </div>
       </div>
@@ -211,10 +211,10 @@ export function RegisterPage() {
         {/* Hero text */}
         <div style={{ marginBottom: 40 }}>
           <h1 style={{ fontSize: 28, fontWeight: 800, color: C.text, lineHeight: 1.25, marginBottom: 14, letterSpacing: '-0.02em' }}>
-            开始你的<br />AI 求职之旅
+            Start your<br />AI-powered job search
           </h1>
           <p style={{ fontSize: 13, color: C.muted, lineHeight: 1.75 }}>
-            免费注册，立即使用 ApplyMate AI——从发现职位到投递简历，全程 AI 驱动。
+            Create a free account and start using ApplyMate AI, from discovering jobs to submitting applications.
           </p>
         </div>
 
@@ -245,10 +245,10 @@ export function RegisterPage() {
           }}>
             <div style={{ fontSize: 24, lineHeight: 1, color: C.primary, opacity: 0.28, fontFamily: 'Georgia,serif', marginBottom: 4, userSelect: 'none' }}>&ldquo;</div>
             <p style={{ fontSize: 12, color: C.text, lineHeight: 1.80, margin: '0 0 12px' }}>
-              用 ApplyMate 两周内拿到了 Adyen、Booking.com 的面试，省了我大量整理简历的时间。
+              ApplyMate helped me land interviews at Adyen and Booking.com within two weeks, saving me hours of resume work.
             </p>
             <div style={{ fontSize: 11, color: C.muted }}>
-              — <span style={{ fontWeight: 600, color: C.text }}>Zhang Li</span>，Backend Engineer · Amsterdam
+              — <span style={{ fontWeight: 600, color: C.text }}>Zhang Li</span>, Backend Engineer · Amsterdam
             </div>
           </div>
         </div>
@@ -270,14 +270,14 @@ export function RegisterPage() {
         }}>
           {/* Header */}
           <div style={{ marginBottom: 28 }}>
-            <h2 style={{ fontSize: 22, fontWeight: 800, color: C.text, marginBottom: 6, letterSpacing: '-0.02em' }}>创建你的账号 👋</h2>
+            <h2 style={{ fontSize: 22, fontWeight: 800, color: C.text, marginBottom: 6, letterSpacing: '-0.02em' }}>Create your account 👋</h2>
             <p style={{ fontSize: 13, color: C.muted }}>
-              已有账号？{' '}
+              Already have an account?{' '}
               <Link href="/login" style={{
                 color: C.primary, textDecoration: 'none', fontWeight: 600,
                 background: 'linear-gradient(135deg, #4F46E5, #7C3AED)',
                 WebkitBackgroundClip: 'text', WebkitTextFillColor: 'transparent', backgroundClip: 'text',
-              }}>立即登录</Link>
+              }}>Sign in</Link>
             </p>
           </div>
 
@@ -314,14 +314,14 @@ export function RegisterPage() {
                   }}
                 >
                   {loading === 'google' ? <Spinner /> : <GoogleIcon />}
-                  {googleAvailable ? '使用 Google 登录' : 'Google 登录未配置'}
+                  {googleAvailable ? 'Sign up with Google' : 'Google sign-in is not configured'}
                 </button>
               </div>
 
               {/* Divider */}
               <div style={{ display: 'flex', alignItems: 'center', gap: 14, marginBottom: 22 }}>
                 <div style={{ flex: 1, height: 1, background: 'linear-gradient(90deg, transparent, rgba(79,70,229,0.20), transparent)' }} />
-                <span style={{ fontSize: 11, color: C.subtle, whiteSpace: 'nowrap' }}>或填写邮箱注册</span>
+                <span style={{ fontSize: 11, color: C.subtle, whiteSpace: 'nowrap' }}>or register with email</span>
                 <div style={{ flex: 1, height: 1, background: 'linear-gradient(90deg, transparent, rgba(79,70,229,0.20), transparent)' }} />
               </div>
             </>
@@ -335,9 +335,9 @@ export function RegisterPage() {
           <form onSubmit={handleRegister} style={{ display: 'flex', flexDirection: 'column', gap: 15 }}>
             {/* Name */}
             <div style={{ display: 'flex', flexDirection: 'column', gap: 7 }}>
-              <label style={{ fontSize: 12, fontWeight: 500, color: C.muted }}>姓名</label>
+              <label style={{ fontSize: 12, fontWeight: 500, color: C.muted }}>Name</label>
               <input
-                type="text" value={name} autoComplete="name" placeholder="张三"
+                type="text" value={name} autoComplete="name" placeholder="Alex Smith"
                 onFocus={() => setFocused('name')} onBlur={() => setFocused(null)}
                 onChange={e => setName(e.target.value)}
                 style={inputStyle('name')}
@@ -345,7 +345,7 @@ export function RegisterPage() {
             </div>
             {/* Email */}
             <div style={{ display: 'flex', flexDirection: 'column', gap: 7 }}>
-              <label style={{ fontSize: 12, fontWeight: 500, color: C.muted }}>邮箱</label>
+              <label style={{ fontSize: 12, fontWeight: 500, color: C.muted }}>Email</label>
               <input
                 type="email" value={email} autoComplete="email" placeholder="you@example.com"
                 onFocus={() => setFocused('email')} onBlur={() => setFocused(null)}
@@ -356,8 +356,8 @@ export function RegisterPage() {
             {/* Password */}
             <div style={{ display: 'flex', flexDirection: 'column', gap: 7 }}>
               <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-                <label style={{ fontSize: 12, fontWeight: 500, color: C.muted }}>密码</label>
-                <span style={{ fontSize: 11, color: C.subtle }}>至少 8 位</span>
+                <label style={{ fontSize: 12, fontWeight: 500, color: C.muted }}>Password</label>
+                <span style={{ fontSize: 11, color: C.subtle }}>At least 8 characters</span>
               </div>
               <input
                 type="password" value={password} autoComplete="new-password" placeholder="••••••••"
@@ -369,9 +369,9 @@ export function RegisterPage() {
             </div>
             {/* Confirm */}
             <div style={{ display: 'flex', flexDirection: 'column', gap: 7 }}>
-              <label style={{ fontSize: 12, fontWeight: 500, color: C.muted }}>确认密码</label>
+              <label style={{ fontSize: 12, fontWeight: 500, color: C.muted }}>Confirm password</label>
               <input
-                type="password" value={confirm} autoComplete="new-password" placeholder="再次输入密码"
+                type="password" value={confirm} autoComplete="new-password" placeholder="Enter your password again"
                 onFocus={() => setFocused('confirm')} onBlur={() => setFocused(null)}
                 onChange={e => setConfirm(e.target.value)}
                 style={inputStyle('confirm')}
@@ -380,10 +380,10 @@ export function RegisterPage() {
 
             {/* Terms */}
             <p style={{ fontSize: 11, color: C.muted, lineHeight: 1.6, margin: 0 }}>
-              注册即表示同意我们的{' '}
-              <a href="#" style={{ color: C.primary, textDecoration: 'none', fontWeight: 500 }}>服务条款</a>
-              {' '}和{' '}
-              <a href="#" style={{ color: C.primary, textDecoration: 'none', fontWeight: 500 }}>隐私政策</a>
+              By signing up, you agree to our{' '}
+              <a href="#" style={{ color: C.primary, textDecoration: 'none', fontWeight: 500 }}>Terms of Service</a>
+              {' '}and{' '}
+              <a href="#" style={{ color: C.primary, textDecoration: 'none', fontWeight: 500 }}>Privacy Policy</a>
             </p>
 
             {/* Submit */}
@@ -402,7 +402,7 @@ export function RegisterPage() {
               }}
             >
               {loading === 'register' && <Spinner />}
-              {loading === 'register' ? '注册中…' : '免费注册'}
+              {loading === 'register' ? 'Signing up...' : 'Create free account'}
             </button>
           </form>
         </div>

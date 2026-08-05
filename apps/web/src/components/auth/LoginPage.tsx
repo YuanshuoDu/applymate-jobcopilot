@@ -18,23 +18,23 @@ const C = {
 const FEATURES = [
   {
     icon: <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="12" r="3"/><path d="M12 1v4M12 19v4M4.22 4.22l2.83 2.83M16.95 16.95l2.83 2.83M1 12h4M19 12h4M4.22 19.78l2.83-2.83M16.95 7.05l2.83-2.83"/></svg>,
-    title: '智能职位匹配',
-    desc:  'AI 实时评估每个职位与你简历的匹配程度',
+    title: 'Smart Job Matching',
+    desc:  'AI evaluates how well each job matches your resume',
   },
   {
     icon: <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></svg>,
-    title: '简历自动定制',
-    desc:  '针对每个 JD 一键优化简历关键词与格式',
+    title: 'Resume Tailoring',
+    desc:  'Optimize resume keywords and formatting for every job description',
   },
   {
     icon: <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><rect x="2" y="7" width="20" height="14" rx="2"/><path d="M16 7V5a2 2 0 0 0-2-2h-4a2 2 0 0 0-2 2v2"/></svg>,
-    title: 'AI Agent 自动投递',
-    desc:  '设置规则后，Agent 24h 自动发现并申请职位',
+    title: 'AI Agent Auto-Apply',
+    desc:  'Set your rules and let the Agent discover and apply to jobs 24/7',
   },
   {
     icon: <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M4 4h16c1.1 0 2 .9 2 2v12c0 1.1-.9 2-2 2H4c-1.1 0-2-.9-2-2V6c0-1.1.9-2 2-2z"/><polyline points="22,6 12,13 2,6"/></svg>,
-    title: 'Gmail 一站跟踪',
-    desc:  '自动识别 HR 回复，汇总申请进度',
+    title: 'Gmail Tracking',
+    desc:  'Automatically identify recruiter replies and track your applications',
   },
 ]
 
@@ -100,13 +100,13 @@ function OAuthBtn({ icon, label, onClick, loading, dark }: {
 
 function mapOAuthError(err: string): string {
   const MAP: Record<string, string> = {
-    OAuthAccountNotLinked: '该邮箱已用其他方式注册，请使用原登录方式',
-    OAuthCallbackError:    'OAuth 登录失败，请重试',
-    AccessDenied:          '登录被拒绝',
-    Verification:          '验证链接已过期',
-    OAuthIdentityMismatch: 'Google 账号与原有登录记录不一致，请重新选择正确的账号或联系支持。',
+    OAuthAccountNotLinked: 'This email is already registered with another sign-in method. Please use the original method.',
+    OAuthCallbackError:    'Google sign-in failed. Please try again.',
+    AccessDenied:          'Sign-in was denied.',
+    Verification:          'This verification link has expired.',
+    OAuthIdentityMismatch: 'The Google account does not match the existing login record. Please choose the correct account or contact support.',
   }
-  return MAP[err] ?? `登录出错：${err}`
+  return MAP[err] ?? `Sign-in error: ${err}`
 }
 
 export function safeCallbackUrl(value: string | null): string {
@@ -141,13 +141,13 @@ export function LoginPage({ switchAccount = false }: { switchAccount?: boolean }
 
   async function handleCredentials(e: React.FormEvent) {
     e.preventDefault()
-    if (!email || !password) { setError('请填写邮箱和密码'); return }
+    if (!email || !password) { setError('Please enter your email and password.'); return }
     setError('')
     setLoading('credentials')
     if (switchAccount) await signOut({ redirect: false })
     const result = await signIn('credentials', { email, password, redirect: false })
     setLoading(null)
-    if (result?.error) { setError('邮箱或密码不正确') }
+    if (result?.error) { setError('Invalid email or password.') }
     else { router.push(callbackUrl); router.refresh() }
   }
 
@@ -158,7 +158,7 @@ export function LoginPage({ switchAccount = false }: { switchAccount?: boolean }
   }
 
   function handleUnavailableGoogle() {
-    setError('Google 登录尚未配置，请先使用邮箱登录。')
+    setError('Google sign-in is not configured. Please use email sign-in.')
   }
 
   return (
@@ -204,10 +204,10 @@ export function LoginPage({ switchAccount = false }: { switchAccount?: boolean }
         {/* Hero text */}
         <div style={{ marginBottom:40 }}>
           <h1 style={{ fontSize:28, fontWeight:800, color:C.text, lineHeight:1.25, marginBottom:14, letterSpacing:'-0.02em' }}>
-            让 AI 帮你<br />找到理想的工作
+            Let AI help you<br />find your next opportunity
           </h1>
           <p style={{ fontSize:13, color:C.muted, lineHeight:1.75 }}>
-            ApplyMate AI 自动化你的求职流程——从发现职位到投递简历，全程 AI 驱动。
+            ApplyMate AI automates your job search, from discovering jobs to submitting applications.
           </p>
         </div>
 
@@ -238,10 +238,10 @@ export function LoginPage({ switchAccount = false }: { switchAccount?: boolean }
           }}>
             <div style={{ fontSize:24, lineHeight:1, color:C.primary, opacity:0.28, fontFamily:'Georgia,serif', marginBottom:4, userSelect:'none' }}>&ldquo;</div>
             <p style={{ fontSize:12, color:C.text, lineHeight:1.80, margin:'0 0 12px' }}>
-              用 ApplyMate 两周内拿到了 Adyen、Booking.com 的面试，省了我大量整理简历的时间。
+              ApplyMate helped me land interviews at Adyen and Booking.com within two weeks, saving me hours of resume work.
             </p>
             <div style={{ fontSize:11, color:C.muted }}>
-              — <span style={{ fontWeight:600, color:C.text }}>Zhang Li</span>，Backend Engineer · Amsterdam
+              — <span style={{ fontWeight:600, color:C.text }}>Zhang Li</span>, Backend Engineer · Amsterdam
             </div>
           </div>
         </div>
@@ -263,14 +263,14 @@ export function LoginPage({ switchAccount = false }: { switchAccount?: boolean }
         }}>
           {/* Header */}
           <div style={{ marginBottom:28 }}>
-            <h2 style={{ fontSize:22, fontWeight:800, color:C.text, marginBottom:6, letterSpacing:'-0.02em' }}>欢迎回来 👋</h2>
+            <h2 style={{ fontSize:22, fontWeight:800, color:C.text, marginBottom:6, letterSpacing:'-0.02em' }}>Welcome back 👋</h2>
             <p style={{ fontSize:13, color:C.muted }}>
-              还没有账号？{' '}
+              Don&apos;t have an account?{' '}
               <Link href="/register" style={{
                 color:C.primary, textDecoration:'none', fontWeight:600,
                 background:'linear-gradient(135deg, #4F46E5, #7C3AED)',
                 WebkitBackgroundClip:'text', WebkitTextFillColor:'transparent', backgroundClip:'text',
-              }}>免费注册</Link>
+              }}>Create a free account</Link>
             </p>
           </div>
 
@@ -292,15 +292,15 @@ export function LoginPage({ switchAccount = false }: { switchAccount?: boolean }
               <div style={{ display:'flex', flexDirection:'column', gap:10, marginBottom:22 }}>
                 <OAuthBtn
                   icon={<GoogleIcon />}
-                  label={googleAvailable ? '使用 Google 登录' : 'Google 登录未配置'}
+                  label={googleAvailable ? 'Sign in with Google' : 'Google sign-in is not configured'}
                   onClick={() => googleAvailable ? handleOAuth('google') : handleUnavailableGoogle()}
                   loading={loading === 'google'}
                 />
-                {oauthProviders.github && <OAuthBtn icon={<GitHubIcon />} label="使用 GitHub 登录" onClick={() => handleOAuth('github')} loading={loading === 'github'} dark />}
+                {oauthProviders.github && <OAuthBtn icon={<GitHubIcon />} label="Sign in with GitHub" onClick={() => handleOAuth('github')} loading={loading === 'github'} dark />}
               </div>
               <div style={{ display:'flex', alignItems:'center', gap:14, marginBottom:22 }}>
                 <div style={{ flex:1, height:1, background:'linear-gradient(90deg, transparent, rgba(79,70,229,0.20), transparent)' }} />
-                <span style={{ fontSize:11, color:C.subtle, whiteSpace:'nowrap' }}>或使用邮箱登录</span>
+                <span style={{ fontSize:11, color:C.subtle, whiteSpace:'nowrap' }}>or continue with email</span>
                 <div style={{ flex:1, height:1, background:'linear-gradient(90deg, transparent, rgba(79,70,229,0.20), transparent)' }} />
               </div>
             </>
@@ -315,7 +315,7 @@ export function LoginPage({ switchAccount = false }: { switchAccount?: boolean }
           <form onSubmit={handleCredentials} style={{ display:'flex', flexDirection:'column', gap:15 }}>
             {/* Email */}
             <div style={{ display:'flex', flexDirection:'column', gap:7 }}>
-              <label style={{ fontSize:12, fontWeight:500, color:C.muted }}>邮箱</label>
+              <label style={{ fontSize:12, fontWeight:500, color:C.muted }}>Email</label>
               <input
                 type="email" value={email} autoComplete="email" placeholder="you@example.com"
                 onFocus={() => setFocused('email')} onBlur={() => setFocused(null)}
@@ -333,8 +333,8 @@ export function LoginPage({ switchAccount = false }: { switchAccount?: boolean }
             {/* Password */}
             <div style={{ display:'flex', flexDirection:'column', gap:7 }}>
               <div style={{ display:'flex', justifyContent:'space-between', alignItems:'center' }}>
-                <label style={{ fontSize:12, fontWeight:500, color:C.muted }}>密码</label>
-                <Link href="/forgot-password" style={{ fontSize:11, color:C.primary, textDecoration:'none', fontWeight:500 }}>忘记密码？</Link>
+                <label style={{ fontSize:12, fontWeight:500, color:C.muted }}>Password</label>
+                <Link href="/forgot-password" style={{ fontSize:11, color:C.primary, textDecoration:'none', fontWeight:500 }}>Forgot password?</Link>
               </div>
               <input
                 type="password" value={password} autoComplete="current-password" placeholder="••••••••"
@@ -366,22 +366,9 @@ export function LoginPage({ switchAccount = false }: { switchAccount?: boolean }
               }}
             >
               {loading === 'credentials' && <Spinner />}
-              {loading === 'credentials' ? '登录中…' : '登录'}
+              {loading === 'credentials' ? 'Signing in...' : 'Sign in'}
             </button>
           </form>
-
-          {/* Demo hint */}
-          <div style={{
-            marginTop: 20, padding: '10px 14px',
-            background: 'rgba(79,70,229,0.05)', borderRadius: 10,
-            border: '1px solid rgba(79,70,229,0.12)',
-          }}>
-            <div style={{ fontSize: 11, color: C.muted, lineHeight: 1.6 }}>
-              <span style={{ fontWeight: 600, color: C.primary }}>Demo：</span>
-              {' '}使用 <code style={{ background: 'rgba(79,70,229,0.08)', padding: '1px 5px', borderRadius: 4, fontFamily: 'monospace' }}>demo@applymate.ai</code>
-              {' '}+ 密码 <code style={{ background: 'rgba(79,70,229,0.08)', padding: '1px 5px', borderRadius: 4, fontFamily: 'monospace' }}>demo1234</code> 体验完整功能。
-            </div>
-          </div>
         </div>
       </div>
     </div>
