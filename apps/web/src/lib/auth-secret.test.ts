@@ -16,11 +16,22 @@ describe('auth secret configuration', () => {
     vi.stubEnv('NODE_ENV', 'production')
     vi.stubEnv('NEXT_PHASE', '')
     vi.stubEnv('AUTH_SECRET', '')
-    expect(getAuthSecret).toThrow('AUTH_SECRET must be configured')
+    vi.stubEnv('NEXTAUTH_SECRET', '')
+    expect(getAuthSecret).toThrow('AUTH_SECRET or NEXTAUTH_SECRET must be configured')
   })
+
+  it('supports the prior NEXTAUTH_SECRET deployment variable', () => {
+    vi.stubEnv('NODE_ENV', 'production')
+    vi.stubEnv('AUTH_SECRET', '')
+    vi.stubEnv('NEXTAUTH_SECRET', 'legacy-production-secret')
+
+    expect(getAuthSecret()).toBe('legacy-production-secret')
+  })
+
   it('uses the configured value in production', () => {
     vi.stubEnv('NODE_ENV', 'production')
     vi.stubEnv('AUTH_SECRET', 'production-secret')
+    vi.stubEnv('NEXTAUTH_SECRET', 'legacy-production-secret')
     expect(getAuthSecret()).toBe('production-secret')
   })
 })
