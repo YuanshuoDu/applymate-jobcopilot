@@ -8,11 +8,12 @@ describe('toAdminUserMetadata', () => {
       password: 'hash', refresh_token: 'secret-token', resumeContent: 'private resume', gmailBody: 'private email',
       _count: { jobs: 2, resumes: 1, notifications: 3 }, gmailSyncState: { lastSyncedAt: null, lastError: null },
     } as never)
-    expect(result).toEqual(expect.objectContaining({ email: 'ja***@example.com', location: 'B***', jobsCount: 2, resumeExists: true }))
+    expect(result).toEqual(expect.objectContaining({ name: 'J*** C***', email: 'ja***@example.com', location: 'B***', jobsCount: 2, resumeExists: true }))
     const serialized = JSON.stringify(result)
     expect(serialized).not.toContain('hash')
     expect(serialized).not.toContain('secret-token')
     expect(serialized).not.toContain('private resume')
     expect(serialized).not.toContain('private email')
+    expect(serialized).not.toContain('Jane Candidate')
   })
 })

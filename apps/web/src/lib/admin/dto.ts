@@ -20,10 +20,15 @@ function maskLocation(location: string | null) {
   return `${location.slice(0, 1)}***`
 }
 
+function maskName(name: string | null) {
+  if (!name) return null
+  return name.split(/\s+/).filter(Boolean).map((part) => `${part.slice(0, 1)}***`).join(' ')
+}
+
 export function toAdminUserMetadata(user: UserMetadataRecord) {
   return {
     id: user.id,
-    name: user.name,
+    name: maskName(user.name),
     email: maskEmail(user.email),
     plan: user.plan,
     location: maskLocation(user.location),

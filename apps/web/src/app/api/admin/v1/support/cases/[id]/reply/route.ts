@@ -23,7 +23,7 @@ export async function POST(request: NextRequest, context: { params: Promise<{ id
   await writeAdminAudit({ requestId: actor.requestId, actorUserId: actor.userId, actorRoleKey: actor.roleKey, action: 'support.reply_sent', targetType: 'support_case', targetId: id, tenantUserId: supportCase.requesterUserId, reason, outcome: 'success' })
   const created = await db.$transaction(async (tx) => {
     const staffReply = await tx.supportCaseMessage.create({ data: { caseId: id, authorType: 'staff_reply', authorUserId: actor.userId, idempotencyKey, body: message.body, redacted: message.redacted } })
-    await tx.supportCase.update({ where: { id }, data: { status: 'waiting_on_customer', assignedAdminId: actor.userId, firstRespondedAt: new Date() } })
+    await tx.supportCase.update({ where: { id }, data: { status: 'waiting_on_customer', assignedAdminId: actor.userId, firstRespondedAt: new Date(), version: { increment: 1 } } })
     await tx.notification.create({ data: { userId: supportCase.requesterUserId, type: 'contact_us_reply', title: 'New support reply', body: 'A support team member replied to your case.' } })
     return staffReply
   })

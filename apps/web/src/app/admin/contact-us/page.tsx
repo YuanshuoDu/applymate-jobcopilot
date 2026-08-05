@@ -5,5 +5,5 @@ import { isAdminResponse, requireAdmin } from '@/lib/admin/authorization'
 export default async function ContactUsAdminPage() {
   const actor = await requireAdmin('support_cases.read')
   if (isAdminResponse(actor)) redirect('/login?callbackUrl=/admin/contact-us')
-  return <ContactUsPage />
+  return <ContactUsPage actorId={actor.userId} permissions={actor.permissions} />
 }

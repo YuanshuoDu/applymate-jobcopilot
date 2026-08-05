@@ -16,7 +16,7 @@ export async function GET(request: NextRequest) {
     where: { ...statusFilter, ...scope },
     orderBy: [{ priority: 'desc' }, { slaDueAt: 'asc' }], take: 100,
     select: {
-      id: true, subject: true, category: true, status: true, priority: true, assignedAdminId: true, slaDueAt: true, createdAt: true, updatedAt: true, safeContext: true,
+      id: true, subject: true, category: true, status: true, priority: true, assignedAdminId: true, slaDueAt: true, version: true, createdAt: true, updatedAt: true, safeContext: true,
       requester: { select: adminUserMetadataSelect },
       messages: { select: { id: true, authorType: true, body: true, redacted: true, createdAt: true }, orderBy: { createdAt: 'asc' } },
     },
