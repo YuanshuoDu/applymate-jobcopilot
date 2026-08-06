@@ -1,7 +1,9 @@
 # ApplyMate AI
 
 > **AI-powered job application co-pilot for the European market.**  
-> Automate the tedious parts of job hunting — from smart job discovery to tailored CVs and cover letters — while keeping humans in control of every decision that matters.
+> Discover relevant roles, tailor CVs and cover letters, and complete supported ATS workflows while keeping humans in control of every decision that matters.
+
+Production: [applymate.site](https://applymate.site) · Preview: [preview.applymate.site](https://preview.applymate.site)
 
 [![Next.js](https://img.shields.io/badge/Next.js-15-black?logo=next.js)](https://nextjs.org)
 [![TypeScript](https://img.shields.io/badge/TypeScript-5-blue?logo=typescript)](https://www.typescriptlang.org)
@@ -12,14 +14,15 @@
 
 ## What is ApplyMate AI?
 
-ApplyMate AI is a **Chrome Extension + Web Dashboard** combo that acts as your personal job application assistant. It discovers relevant jobs, tailors your CV and cover letter for each role, and supports both reviewable form filling and autonomous ATS application workflows. Think of it as a shopping cart for job applications: browse JDs → one-click save → AI optimises → you review → apply.
+ApplyMate AI is a **Chrome Extension + Web Dashboard + Worker** platform that acts as your personal job application assistant. It discovers relevant jobs, tailors your CV and cover letter for each role, and supports both reviewable form filling and autonomous ATS application workflows. Think of it as a shopping cart for job applications: browse JDs → one-click save → AI optimises → you review → apply.
 
 Repository: [github.com/YuanshuoDu/applymate-jobcopilot](https://github.com/YuanshuoDu/applymate-jobcopilot)
 
 ### Key Principles
 - **User-controlled automation**: AI prepares applications and can automate supported ATS workflows; you choose what enters the application queue.
 - **Europe-first**: GDPR-compliant, deep ATS support (Workday EMEA, Personio, SmartRecruiters), multi-language cover letters (EN/DE/FR/NL/ES).
-- **Model-agnostic**: Switch between Claude, GPT-4o, or Ollama via the built-in ModelRouter without changing any code.
+- **Model-agnostic**: ModelRouter supports MiniMax, Anthropic, OpenAI, DeepSeek, Qwen, Z.ai, Kimi, and compatible custom endpoints.
+- **Privacy-first administration**: Internal roles are isolated from candidate content. Administrators, including `super_admin` and break-glass operators, cannot read API keys, password hashes, OAuth refresh tokens, full resumes, or email bodies.
 
 ---
 
@@ -37,7 +40,7 @@ Repository: [github.com/YuanshuoDu/applymate-jobcopilot](https://github.com/Yuan
 ### Resume & Cover Letter System
 - Upload and parse existing resumes (PDF/DOCX)
 - Multi-direction resume library (Base / Adapted / ⭐ Final badges)
-- AI tailoring with per-section model selection (Claude/GPT/Ollama)
+- AI tailoring with per-section model selection through ModelRouter
 - 3 cover letter PDF templates
 - One-click Bundle ZIP download (CV + CL per job)
 - Version history with restore
@@ -61,6 +64,13 @@ Repository: [github.com/YuanshuoDu/applymate-jobcopilot](https://github.com/Yuan
 - i18n support (EN baseline + extensible)
 - Real-time SSE event log from the Agent Pipeline
 
+### Secure Admin Console
+- Role- and permission-based access for support, operations, billing, security, platform, and super-admin teams
+- Masked user metadata, safe application diagnostics, ATS source health, queue controls, AI budgets, feature flags, and audit search
+- Contact us support workspace with assignments, SLA status, customer-visible replies, internal notes, and safe context only
+- Broadcast drafts, anonymous audience previews, approval separation, and idempotent delivery through the existing in-app `Notification` records
+- Append-only audit events, CSRF protection, idempotency keys, optimistic versioning, and signed Worker commands for every write
+
 ---
 
 ## Tech Stack
@@ -76,7 +86,7 @@ Repository: [github.com/YuanshuoDu/applymate-jobcopilot](https://github.com/Yuan
 | Database | PostgreSQL (Neon / Supabase) | 16.x |
 | Auth | NextAuth v5 | ^5.x |
 | AI SDK | Vercel AI SDK | ^4.0 |
-| AI Models | Claude (Anthropic), GPT-4o (OpenAI), Ollama | — |
+| AI Models | MiniMax, Anthropic, OpenAI, DeepSeek, Qwen, Z.ai, Kimi, custom OpenAI-compatible endpoints | ModelRouter |
 | Rich Text | Tiptap | ^2.10 |
 | PDF | @react-pdf/renderer | ^4.5 |
 | Object Storage | Cloudflare R2 | — |
@@ -90,7 +100,7 @@ Repository: [github.com/YuanshuoDu/applymate-jobcopilot](https://github.com/Yuan
 ## Project Structure
 
 ```
-jobcopilot/
+applymate-jobcopilot/
 ├── apps/
 │   ├── web/                  # Next.js Dashboard (port 3000)
 │   │   ├── app/              # App Router pages & API routes
@@ -103,12 +113,12 @@ jobcopilot/
 │   │   │   ├── ai/           # ModelRouter + prompt templates
 │   │   │   └── pdf/          # Resume & cover letter PDF generation
 │   │   └── prisma/           # Schema + migrations
-│   └── extension/            # Chrome Extension (Vite)
-│       ├── src/
-│       │   ├── content/      # Content scripts (job capture, form fill)
-│       │   ├── sidebar/      # React sidebar app
-│       │   └── background/   # Service worker (JWT bridge, message routing)
-│       └── vite.config.ts
+│   ├── extension/            # Chrome Extension (Vite)
+│   │   ├── src/
+│   │   │   ├── content/      # Content scripts (job capture, form fill)
+│   │   │   ├── sidebar/      # React sidebar app
+│   │   │   └── background/   # Service worker (JWT bridge, message routing)
+│   │   └── vite.config.ts
 │   └── worker/               # BullMQ worker + ATS auto-apply flows
 │       └── src/
 │           ├── flows/        # Workday, Greenhouse, Lever, SmartRecruiters, Personio
@@ -132,6 +142,8 @@ jobcopilot/
 - [Auto-Apply Runbook](docs/runbook.md) — production incident response for queues, workers, CAPTCHA, and rate limits.
 - [Scraping & Auto-Apply Design](docs/scraping-autoapply-design.md) — architecture and flow design notes.
 - [Scraping & Auto-Apply Developer Guide](docs/scraping-autoapply-dev-guide.md) — implementation guidance for worker and ATS flows.
+- [Admin Console RBAC Design](docs/admin-console-rbac-design.md) — permissions, data isolation, support, broadcasts, and operational controls.
+- [Admin Console Implementation Plan](docs/admin-console-implementation-plan.md) — delivered controls and deployment release gates.
 - [GitHub Collaboration](docs/github-collaboration.md) — issue, PR, review, and CI workflow.
 - [Docs Index](docs/README.md) — quick map of maintained documentation.
 
@@ -171,7 +183,7 @@ docker-compose up -d   # PostgreSQL on 5432, Redis on 6379
 ### 4. Run database migrations
 
 ```bash
-pnpm --filter web db:push   # prisma db push
+pnpm --filter @jobcopilot/web db:push   # prisma db push
 ```
 
 ### 5. Start the development server
@@ -182,7 +194,7 @@ pnpm dev   # Starts web (3000) + extension (HMR) in parallel via Turborepo
 
 ### 6. Load the extension
 
-1. Build the extension: `pnpm --filter extension build:dev`
+1. Build the extension: `pnpm --filter @jobcopilot/extension build`
 2. Open Chrome → `chrome://extensions` → Enable Developer mode
 3. Click "Load unpacked" → select `apps/extension/dist`
 
@@ -194,26 +206,32 @@ pnpm dev   # Starts web (3000) + extension (HMR) in parallel via Turborepo
 # Database
 DATABASE_URL=postgresql://user:password@localhost:5432/applymate
 
-# Auth
-NEXTAUTH_SECRET=your-secret-here
+# Auth (Auth.js / NextAuth v5)
+AUTH_SECRET=your-secret-here
 NEXTAUTH_URL=http://localhost:3000
-GOOGLE_CLIENT_ID=
-GOOGLE_CLIENT_SECRET=
-GITHUB_CLIENT_ID=
-GITHUB_CLIENT_SECRET=
+AUTH_GOOGLE_ID=
+AUTH_GOOGLE_SECRET=
+AUTH_GITHUB_ID=
+AUTH_GITHUB_SECRET=
 
 # AI Models
-ANTHROPIC_API_KEY=           # Claude (Scout / Analyst / Writer / Auditor)
-OPENAI_API_KEY=              # GPT-4o fallback
-OLLAMA_BASE_URL=             # http://localhost:11434 (optional local model)
+MINIMAX_API_KEY=             # Platform default model
+ANTHROPIC_API_KEY=
+OPENAI_API_KEY=
+DEEPSEEK_API_KEY=
+QWEN_API_KEY=
+ZHIPU_API_KEY=
+KIMI_API_KEY=
 
 # Job Search APIs
 ADZUNA_APP_ID=
 ADZUNA_APP_KEY=
 
-# Gmail (Auditor Agent)
-GMAIL_CLIENT_ID=
-GMAIL_CLIENT_SECRET=
+# Worker and queue control
+REDIS_URL=redis://localhost:6379
+AGENT_WORKER_SECRET=
+WORKER_CONTROL_URL=
+WORKER_CONTROL_SECRET=
 
 # Storage
 CLOUDFLARE_R2_ACCOUNT_ID=
@@ -224,26 +242,31 @@ CLOUDFLARE_R2_BUCKET=
 # Extension security
 EXTENSION_HMAC_SECRET=
 
-# Redis
-REDIS_URL=redis://localhost:6379
-
 # Monitoring (optional)
 NEXT_PUBLIC_SENTRY_DSN=
 NEXT_PUBLIC_POSTHOG_KEY=
 ```
 
+The complete, environment-specific list is maintained in [`apps/web/.env.example`](apps/web/.env.example). Never commit `.env.local` or provider credentials.
+
 ---
 
 ## Deployment
 
-The web dashboard is designed for deployment on **Vercel**. `applymate.dev` is retired and is not a current production endpoint.
+The web dashboard is deployed on **Vercel**. Production is [applymate.site](https://applymate.site); the branch-linked Preview environment is [preview.applymate.site](https://preview.applymate.site).
+
+- A push or merge to `master` creates a Production deployment.
+- The `sync-staging` GitHub Actions workflow mirrors `master` to `staging` after each production-branch push.
+- Vercel tracks `staging`, so `preview.applymate.site` automatically follows the newest Preview deployment without a manual alias command.
 
 ```bash
 pnpm build        # Build all apps
 pnpm typecheck    # Type-check all packages
 ```
 
-For the Chrome Extension, submit the output of `pnpm --filter extension build` to the Chrome Web Store.
+For the Chrome Extension, submit the output of `pnpm --filter @jobcopilot/extension build` to the Chrome Web Store.
+
+The Worker runs separately from the Vercel web deployment and owns BullMQ queues, ATS apply flows, and the signed internal admin control endpoint. Bull Board is not exposed by the production console.
 
 ---
 
@@ -259,6 +282,10 @@ pnpm build
 ```
 
 For worker or E2E-heavy changes, also run the targeted commands documented in the relevant PR or issue.
+
+## Security and privacy
+
+The admin console is a separate internal surface under `/admin` and `/api/admin/v1`. Authorization is enforced on the server with explicit permissions; `User.plan` is never an admin role. Admin DTOs use allow-listed metadata only, and audit snapshots exclude secrets and candidate content. Contact us staff may read only messages intentionally submitted to support, while platform broadcasts create standard in-app notifications that remain visible only to the addressed user.
 
 ---
 
