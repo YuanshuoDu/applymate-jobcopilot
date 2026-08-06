@@ -13,6 +13,7 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { SignJWT } from 'jose'
 import { safeAuth } from '@/lib/safe-auth'
+import { db } from '@/lib/db'
 
 const JWT_SECRET = new TextEncoder().encode(
   process.env.AUTH_SECRET ?? 'fallback-secret-change-this',
@@ -42,6 +43,12 @@ export async function GET(req: NextRequest) {
   const session = await safeAuth()
   if (!session?.user?.id) {
     return NextResponse.redirect(new URL('/login', req.url))
+  }
+
+  const user = await db.user.findUnique({ where: { id: session.user.id }, select: { accountStatus: true } })
+  if (!user) return NextResponse.redirect(new URL('/login', req.url))
+  if (user.accountStatus === 'suspended') {
+    return NextResponse.json({ error: 'Account suspended' }, { status: 403 })
   }
 
   const clientId = process.env.AUTH_GOOGLE_ID

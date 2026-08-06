@@ -27,6 +27,8 @@ export type Provider =
   | 'kimi'
   | 'custom'
 
+const KNOWN_PROVIDERS = new Set<Provider>(['anthropic', 'openai', 'deepseek', 'minimax', 'qwen', 'zhipu', 'kimi', 'custom'])
+
 export interface ModelOption {
   provider:    Provider
   model:       string
@@ -177,7 +179,7 @@ export function withMiniMaxThinking(config: AiConfig, thinking: MiniMaxThinkingM
 // ── Resolve effective config ──────────────────────────────────────────────────
 
 /** Merge user config with server env-var fallbacks */
-export function resolveConfig(userConfig?: AiConfig | null): AiConfig & { resolvedKey: string } {
+export function resolveConfig(userConfig?: AiConfig | null, options?: { preserveModel?: boolean }): AiConfig & { resolvedKey: string } {
   const input  = userConfig ?? DEFAULT_AI_CONFIG
   const exact  = MODEL_CATALOGUE.find(m => m.provider === input.provider && m.model === input.model)
   const option = exact
@@ -187,7 +189,7 @@ export function resolveConfig(userConfig?: AiConfig | null): AiConfig & { resolv
 
   // Saved settings can outlive a provider model. Do not send a retired model
   // identifier to the provider; retain custom model IDs because they are user-owned.
-  const cfg = !exact && input.provider !== 'custom'
+  const cfg = !exact && input.provider !== 'custom' && !options?.preserveModel
     ? { ...input, provider: option.provider, model: option.model }
     : input
 
@@ -586,7 +588,51 @@ export async function loadUserAiConfig(
 ): Promise<AiConfig & { resolvedKey: string }> {
   const user   = await db.user.findUnique({ where: { id: userId }, select: { preferences: true } })
   const prefs  = (user?.preferences ?? {}) as Record<string, unknown>
-  return resolveFeatureConfig(featureId, (prefs.aiSettings ?? null) as UserAiSettings | null)
+  const settings = (prefs.aiSettings ?? null) as UserAiSettings | null
+  const featureCfg = settings?.features?.[featureId]
+  if (featureCfg && typeof featureCfg === 'object') return resolveFeatureConfig(featureId, settings)
+
+  const platform = await loadPlatformFeatureConfig(featureId, settings)
+  if (!platform) return resolveFeatureConfig(featureId, settings)
+
+  const providerKey = settings?.keys?.[platform.provider]
+  return resolveConfig({ ...platform, apiKey: platform.apiKey ?? providerKey }, { preserveModel: true })
+}
+
+async function loadPlatformFeatureConfig(featureId: FeatureId, settings: UserAiSettings | null): Promise<AiConfig | null> {
+  try {
+    const route = await db.aiRouteConfig.findUnique({
+      where: { featureKey: featureId },
+      select: { defaultProvider: true, defaultModel: true, fallbackProvider: true, fallbackModel: true },
+    })
+    if (!route) return null
+
+    const candidates = [
+      { provider: route.defaultProvider, model: route.defaultModel },
+      ...(route.fallbackProvider && route.fallbackModel ? [{ provider: route.fallbackProvider, model: route.fallbackModel }] : []),
+    ]
+    const hasFallback = candidates.length > 1
+    for (const [index, candidate] of candidates.entries()) {
+      const provider = toKnownProvider(candidate.provider)
+      if (!provider) continue
+      const row = await db.aiProviderConfig.findUnique({
+        where: { key: candidate.provider },
+        select: { key: true, apiBase: true, secretRef: true, enabled: true, models: { where: { model: candidate.model, active: true }, select: { model: true } } },
+      })
+      if (!row?.enabled || row.models.length === 0) continue
+      const apiKey = row.secretRef ? process.env[row.secretRef] : undefined
+      const userKey = settings?.keys?.[provider]?.trim()
+      if (!apiKey && !userKey && !getServerKey(provider) && hasFallback && index === 0) continue
+      return { provider, model: candidate.model, apiBase: row.apiBase, apiKey: apiKey ?? userKey }
+    }
+  } catch {
+    // Keep older deployments and read-only test doubles on the built-in default.
+  }
+  return null
+}
+
+function toKnownProvider(value: string): Provider | null {
+  return KNOWN_PROVIDERS.has(value as Provider) ? value as Provider : null
 }
 
 export function resolveFeatureConfig(

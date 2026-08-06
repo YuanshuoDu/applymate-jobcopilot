@@ -2,6 +2,7 @@ import { db } from "@/lib/db";
 import { Prisma } from "@prisma/client";
 import { enqueueApplyTask } from "@/lib/apply-queue-client";
 import { assessApplicationPreflight, isSupportedAutomatedApplyUrl } from "@/lib/agent/application-preflight";
+import { isFeatureAllowed, resolveAiAccess } from "@/lib/entitlements";
 
 export class AutoApplyError extends Error {}
 
@@ -78,6 +79,10 @@ export async function queueAutonomousApplication(input: {
   /** Approved per-job authorization. Global settings can never replace this. */
   approvalId: string;
 }): Promise<{ taskId: string }> {
+  if (!(await isFeatureAllowed(input.userId, "auto_apply"))) throw new AutoApplyError("This feature is not included in your current plan.");
+  const aiAccess = await resolveAiAccess(input.userId);
+  if (aiAccess === "disabled") throw new AutoApplyError("This feature is not included in your current plan.");
+  if (aiAccess === "exhausted") throw new AutoApplyError("Monthly AI credits exhausted.");
   const applyUrl = validateAutoApplyUrl(input.applyUrl);
   await assertJobPreflight(input)
   const approval = await db.agentApproval.findFirst({

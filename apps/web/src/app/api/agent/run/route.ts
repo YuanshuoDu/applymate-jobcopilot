@@ -22,7 +22,7 @@ import { err, prepareAiRoute, sseResponse }          from '@/lib/api-helpers'
 import { runAgentPipeline }                          from '@/lib/agent/run-service'
 
 export async function GET(req: NextRequest) {
-  const prep = await prepareAiRoute(req, 'agent')
+  const prep = await prepareAiRoute(req, 'agent', 'job_discovery')
   if ('error' in prep) return prep.error
 
   // autonomous=true → never pause, make all decisions automatically

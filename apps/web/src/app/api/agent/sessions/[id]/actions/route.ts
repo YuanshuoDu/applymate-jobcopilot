@@ -4,6 +4,7 @@ import { err, isErrorResponse, ok, requireAuth } from "@/lib/api-helpers"
 import { nextRunAtFromCron } from "@/lib/agent/automation-schedule"
 import { updateAgentSession } from "@/lib/agent/session/repository"
 import { loadUserAiConfig } from "@/lib/model-router"
+import { isFeatureAllowed, resolveAiAccess } from "@/lib/entitlements"
 import { tailorResumeForAgent } from "@/lib/agent/resume-tailoring"
 import { queueApplicationFill, queueAutonomousApplication } from "@/lib/auto-apply"
 
@@ -206,6 +207,12 @@ export async function POST(req: NextRequest, ctx: RouteCtx) {
       select: { type: true, payload: true },
     })
     if (!approval) return err("Approval is no longer pending", 409)
+    if (action.decision === "approved" && approval.type === "tailor_resume") {
+      if (!(await isFeatureAllowed(auth.userId, "tailored_resume"))) return err("This feature is not included in your current plan", 403)
+      const aiAccess = await resolveAiAccess(auth.userId)
+      if (aiAccess === "disabled") return err("This feature is not included in your current plan", 403)
+      if (aiAccess === "exhausted") return err("Monthly AI credits exhausted", 429)
+    }
     const result = await db.agentApproval.updateMany({
       where: {
         id: action.approvalId,

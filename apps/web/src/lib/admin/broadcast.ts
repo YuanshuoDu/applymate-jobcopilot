@@ -2,6 +2,15 @@ import type { BroadcastAudienceType, BroadcastStatus, Plan } from '@prisma/clien
 
 export interface BroadcastAudience { audienceType: BroadcastAudienceType; audience: { plan?: Plan; location?: string; userIds?: string[] } }
 
+export function serializeBroadcast(value: { id: string; title: string; body: string; audienceType: unknown; audience: unknown; status: unknown; scheduledAt: Date | null; createdById: string; approvedById: string | null; publishedById: string | null; recipientCount: number; deliveredCount: number; failedCount: number; createdAt: Date; updatedAt: Date }) {
+  return { ...value, scheduledAt: value.scheduledAt?.toISOString() ?? null, createdAt: value.createdAt.toISOString(), updatedAt: value.updatedAt.toISOString() }
+}
+
+export function storedAudience(value: { audienceType: unknown; audience: unknown }): BroadcastAudience {
+  const raw = value.audience !== null && typeof value.audience === 'object' && !Array.isArray(value.audience) ? value.audience as Record<string, unknown> : {}
+  return validateBroadcastAudience({ audienceType: value.audienceType, ...raw })
+}
+
 export function sanitizeBroadcastText(value: unknown, maxLength = 2000): { text: string; redacted: boolean } {
   if (typeof value !== 'string') throw new Error('Broadcast text is required')
   const stripped = value.replace(/<[^>]*>/g, '').trim()

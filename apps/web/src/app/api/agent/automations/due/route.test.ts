@@ -86,7 +86,7 @@ describe("agent automation due scheduler API", () => {
       started: [{ automationId: "automation_1", sessionId: "session_1", taskId: "task_1" }],
     })
     expect(mocks.automationFindMany).toHaveBeenCalledWith({
-      where: { enabled: true, nextRunAt: { lte: expect.any(Date) } },
+      where: { enabled: true, nextRunAt: { lte: expect.any(Date) }, user: { accountStatus: "active" } },
       orderBy: { nextRunAt: "asc" },
       take: 20,
     })
@@ -112,6 +112,7 @@ describe("agent automation due scheduler API", () => {
         userId: "user_1",
         enabled: true,
         nextRunAt: { lte: expect.any(Date) },
+        user: { accountStatus: "active" },
       },
       data: { lastRunAt: expect.any(Date), nextRunAt: expect.any(Date) },
     })
@@ -177,5 +178,16 @@ describe("agent automation due scheduler API", () => {
     expect(mocks.automationUpdate).toHaveBeenCalledWith(expect.objectContaining({
       where: { id: "automation_1" }, data: { nextRunAt: expect.any(Date) },
     }))
+  })
+
+  it("does not create a session for an automation owned by a suspended user", async () => {
+    mocks.automationFindMany.mockResolvedValueOnce([])
+    const { POST } = await import("./route")
+
+    const res = await POST(postRequest() as never)
+
+    expect(res.status).toBe(200)
+    await expect(res.json()).resolves.toMatchObject({ started: [] })
+    expect(mocks.sessionCreate).not.toHaveBeenCalled()
   })
 })

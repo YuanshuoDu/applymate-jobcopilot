@@ -1,6 +1,6 @@
 import { db } from '@/lib/db'
 import { requireAdmin } from '@/lib/admin/authorization'
-import { storedAudience } from '../../route'
+import { storedAudience } from '@/lib/admin/broadcast'
 import { broadcastWhere } from '@/lib/admin/broadcast'
 import { adminError, adminJson, requestId } from '@/lib/admin/route-utils'
 

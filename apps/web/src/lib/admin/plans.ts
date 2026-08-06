@@ -50,6 +50,20 @@ export interface PlanCatalogDto {
   entitlements: Array<EntitlementValue & { id: string }>
 }
 
+export function buildPlanPatch(input: PlanMetadata & { active: boolean }): PlanMetadata & { active: boolean } {
+  return { ...validatePlanMetadata(input), active: input.active }
+}
+
+export function buildEntitlementPatch(items: unknown[]): EntitlementValue[] {
+  return items.map(item => validateEntitlement(item))
+}
+
+export const PLAN_SELECT = {
+  id: true, plan: true, name: true, description: true, monthlyPriceCents: true, yearlyPriceCents: true,
+  currency: true, active: true, version: true,
+  entitlements: { select: { id: true, featureKey: true, kind: true, enabled: true, limit: true, textValue: true }, orderBy: { featureKey: 'asc' as const } },
+} as const
+
 export function toPlanCatalogDto(input: unknown): PlanCatalogDto {
   const row = record(input)
   const plan = planKey(row.plan)

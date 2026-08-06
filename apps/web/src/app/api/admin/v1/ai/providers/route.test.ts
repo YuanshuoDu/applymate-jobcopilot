@@ -5,7 +5,7 @@ vi.mock('@/lib/db', () => ({ db: { aiProviderConfig: { findMany: mocks.findMany 
 vi.mock('@/lib/admin/authorization', () => ({ requireAdmin: mocks.requireAdmin }))
 
 describe('GET /api/admin/v1/ai/providers', () => {
-  beforeEach(() => { vi.resetModules(); mocks.findMany.mockReset(); mocks.requireAdmin.mockReset(); mocks.requireAdmin.mockResolvedValue({ userId: 'admin_1', roleKey: 'platform_admin' }) })
+  beforeEach(() => { vi.resetModules(); mocks.findMany.mockReset(); mocks.requireAdmin.mockReset(); mocks.requireAdmin.mockResolvedValue({ userId: 'admin_1', roleKey: 'platform_admin' }); vi.stubEnv('MINIMAX_API_KEY', 'runtime-secret') })
   it('returns provider metadata and never returns credential values', async () => {
     mocks.findMany.mockResolvedValue([{ id: 'provider_1', key: 'minimax', displayName: 'MiniMax', apiBase: 'https://api.minimax.io/v1', secretRef: 'MINIMAX_API_KEY', credentialConfigured: true, enabled: true, version: 1, models: [{ id: 'model_1', model: 'MiniMax-M3', label: 'MiniMax M3', tier: 'standard', priceIn: 0.6, priceOut: 2.4, contextK: 512, active: true }], apiKey: 'must-not-leak' }])
     const { GET } = await import('./route')

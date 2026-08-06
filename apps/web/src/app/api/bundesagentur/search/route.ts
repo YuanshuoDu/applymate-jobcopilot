@@ -39,7 +39,7 @@ function fmtLocation(loc: { ort?: string; region?: string } | undefined): string
 }
 
 export async function GET(req: NextRequest) {
-  const auth = await requireAuth(req)
+  const auth = await requireAuth(req, 'job_discovery')
   if (isErrorResponse(auth)) return auth
 
   const sp         = req.nextUrl.searchParams

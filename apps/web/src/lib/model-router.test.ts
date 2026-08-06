@@ -1,17 +1,62 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
-vi.mock('@/lib/db', () => ({ db: {} }))
+const dbMocks = vi.hoisted(() => ({
+  userFindUnique: vi.fn(),
+  routeFindUnique: vi.fn(),
+  providerFindUnique: vi.fn(),
+}))
+
+vi.mock('@/lib/db', () => ({
+  db: {
+    user: { findUnique: dbMocks.userFindUnique },
+    aiRouteConfig: { findUnique: dbMocks.routeFindUnique },
+    aiProviderConfig: { findUnique: dbMocks.providerFindUnique },
+  },
+}))
 
 import {
   APPLYMATE_BACKING,
   DEFAULT_AI_CONFIG,
   MODEL_CATALOGUE,
+  loadUserAiConfig,
   modelChat,
   resolveConfig,
 } from './model-router'
 
 describe('model catalogue and MiniMax compatibility', () => {
-  afterEach(() => vi.restoreAllMocks())
+  afterEach(() => {
+    vi.restoreAllMocks()
+    vi.unstubAllEnvs()
+  })
+
+  it('resolves a platform feature route from the active provider model', async () => {
+    dbMocks.userFindUnique.mockResolvedValue({ preferences: null })
+    dbMocks.routeFindUnique.mockResolvedValue({ defaultProvider: 'openai', defaultModel: 'gpt-platform', fallbackProvider: null, fallbackModel: null })
+    dbMocks.providerFindUnique.mockResolvedValue({ key: 'openai', apiBase: 'https://platform.example/v1', secretRef: null, enabled: true, models: [{ model: 'gpt-platform' }] })
+
+    await expect(loadUserAiConfig('user-1', 'jobScoring')).resolves.toMatchObject({ provider: 'openai', model: 'gpt-platform', apiBase: 'https://platform.example/v1' })
+  })
+
+  it('uses the configured fallback when the primary provider is disabled', async () => {
+    dbMocks.userFindUnique.mockResolvedValue({ preferences: null })
+    dbMocks.routeFindUnique.mockResolvedValue({ defaultProvider: 'openai', defaultModel: 'gpt-platform', fallbackProvider: 'deepseek', fallbackModel: 'deep-platform' })
+    dbMocks.providerFindUnique.mockImplementation(async ({ where }: { where: { key: string } }) => where.key === 'openai'
+      ? { key: 'openai', apiBase: 'https://platform.example/v1', secretRef: null, enabled: false, models: [{ model: 'gpt-platform' }] }
+      : { key: 'deepseek', apiBase: 'https://fallback.example/v1', secretRef: null, enabled: true, models: [{ model: 'deep-platform' }] })
+
+    await expect(loadUserAiConfig('user-1', 'jobScoring')).resolves.toMatchObject({ provider: 'deepseek', model: 'deep-platform', apiBase: 'https://fallback.example/v1' })
+  })
+
+  it('uses the configured fallback when the primary provider has no credential', async () => {
+    vi.stubEnv('DEEPSEEK_API_KEY', 'deepseek-platform-key')
+    dbMocks.userFindUnique.mockResolvedValue({ preferences: null })
+    dbMocks.routeFindUnique.mockResolvedValue({ defaultProvider: 'openai', defaultModel: 'gpt-platform', fallbackProvider: 'deepseek', fallbackModel: 'deep-platform' })
+    dbMocks.providerFindUnique.mockImplementation(async ({ where }: { where: { key: string } }) => where.key === 'openai'
+      ? { key: 'openai', apiBase: 'https://platform.example/v1', secretRef: 'OPENAI_API_KEY', enabled: true, models: [{ model: 'gpt-platform' }] }
+      : { key: 'deepseek', apiBase: 'https://fallback.example/v1', secretRef: 'DEEPSEEK_API_KEY', enabled: true, models: [{ model: 'deep-platform' }] })
+
+    await expect(loadUserAiConfig('user-1', 'jobScoring')).resolves.toMatchObject({ provider: 'deepseek', model: 'deep-platform', apiBase: 'https://fallback.example/v1', apiKey: 'deepseek-platform-key' })
+  })
 
   it('uses MiniMax M3 completion tokens and adaptive reasoning for the current default', async () => {
     const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response(JSON.stringify({
@@ -73,5 +118,9 @@ describe('model catalogue and MiniMax compatibility', () => {
     expect(resolveConfig({ provider: 'openai', model: 'gpt-4o', apiKey: 'test-key' })).toMatchObject({
       provider: 'openai', model: 'gpt-5.5', apiKey: 'test-key',
     })
+  })
+
+  it('preserves a platform model that is managed outside the curated catalogue', () => {
+    expect(resolveConfig({ provider: 'openai', model: 'gpt-platform', apiBase: 'https://platform.example/v1', apiKey: 'test-key' }, { preserveModel: true })).toMatchObject({ provider: 'openai', model: 'gpt-platform' })
   })
 })

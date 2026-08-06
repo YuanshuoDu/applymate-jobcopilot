@@ -2,7 +2,7 @@ import pg from "pg";
 
 // ── Types ──
 
-export type Provider = "minimax" | "openai" | "anthropic" | "deepseek" | "custom";
+export type Provider = "minimax" | "openai" | "anthropic" | "deepseek" | "qwen" | "zhipu" | "kimi" | "custom";
 
 export interface AiConfig {
   provider: Provider;
@@ -34,10 +34,13 @@ export const APPLYMATE_BACKING: AiConfig = {
 };
 
 const DEFAULT_API_BASES: Record<Provider, string> = {
-  minimax: "https://api.minimax.chat/v1",
+  minimax: "https://api.minimax.io/v1",
   openai: "https://api.openai.com/v1",
   anthropic: "https://api.anthropic.com",
   deepseek: "https://api.deepseek.com/v1",
+  qwen: "https://dashscope.aliyuncs.com/compatible-mode/v1",
+  zhipu: "https://api.z.ai/api/paas/v4",
+  kimi: "https://api.moonshot.ai/v1",
   custom: "",
 };
 
@@ -73,33 +76,73 @@ export async function loadWorkerAiConfig(userId: string): Promise<AiConfig> {
       | Record<string, unknown>
       | undefined;
 
-    if (!aiSettings) return { ...APPLYMATE_BACKING };
-
-    // Check per-feature override
-    const features = aiSettings.features as
+    // Check per-feature override first. A user-owned model remains higher
+    // priority than the platform route configured by administrators.
+    const features = aiSettings?.features as
       | Record<string, AiConfig | null>
       | undefined;
     const featureCfg = features?.["autoApply"];
+    const keys = aiSettings?.keys as Record<string, string> | undefined;
+    if (featureCfg && typeof featureCfg === "object") return withUserKey(featureCfg, keys);
 
-    // Build base config
-    const base = featureCfg ?? APPLYMATE_BACKING;
-
-    // Resolve API key: feature.apiKey → keys[provider] → server env
-    const keys = aiSettings.keys as Record<string, string> | undefined;
-    const apiKey =
-      base.apiKey?.trim() ||
-      keys?.[base.provider]?.trim() ||
-      undefined;
-
-    return {
-      provider: base.provider,
-      model: base.model,
-      apiKey,
-      apiBase: (base as AiConfig).apiBase,
-    };
+    const platform = await loadPlatformRoute(client, keys);
+    if (platform) return platform;
+    return withUserKey(APPLYMATE_BACKING, keys);
   } finally {
     client.release();
   }
+}
+
+function withUserKey(config: AiConfig, keys: Record<string, string> | undefined): AiConfig {
+  return {
+    ...config,
+    apiKey: config.apiKey?.trim() || keys?.[config.provider]?.trim() || undefined,
+  };
+}
+
+async function loadPlatformRoute(
+  client: { query: (text: string, values?: unknown[]) => Promise<{ rows: unknown[] }> },
+  keys: Record<string, string> | undefined,
+): Promise<AiConfig | null> {
+  try {
+    const routeResult = await client.query(
+      `SELECT "defaultProvider", "defaultModel", "fallbackProvider", "fallbackModel"
+       FROM "AiRouteConfig" WHERE "featureKey" = $1`,
+      ["autoApply"],
+    );
+    const route = routeResult.rows[0] as Record<string, unknown> | undefined;
+    if (!route) return null;
+
+    const candidates = [
+      { provider: route.defaultProvider, model: route.defaultModel },
+      { provider: route.fallbackProvider, model: route.fallbackModel },
+    ];
+    const hasFallback = typeof route.fallbackProvider === "string" && typeof route.fallbackModel === "string";
+    for (const [index, candidate] of candidates.entries()) {
+      if (typeof candidate.provider !== "string" || typeof candidate.model !== "string") continue;
+      const providerResult = await client.query(
+        `SELECT provider.key, provider."apiBase", provider."secretRef", provider.enabled, model.active
+         FROM "AiProviderConfig" AS provider
+         JOIN "AiModelConfig" AS model ON model."providerId" = provider.id
+         WHERE provider.key = $1 AND model.model = $2`,
+        [candidate.provider, candidate.model],
+      );
+      const row = providerResult.rows[0] as Record<string, unknown> | undefined;
+      if (!row || row.enabled !== true || row.active !== true) continue;
+      const provider = candidate.provider as Provider;
+      const apiKey = (typeof row.secretRef === "string" ? process.env[row.secretRef] : undefined)
+        || keys?.[provider]?.trim()
+        || getServerKey(provider);
+      // Prefer a configured fallback when the primary provider has no usable
+      // credential, while preserving a clear error for a single misconfigured route.
+      if (!apiKey && hasFallback && index === 0) continue;
+      return { provider, model: candidate.model, apiBase: String(row.apiBase ?? ""), apiKey };
+    }
+  } catch {
+    // The platform AI tables are additive; older worker deployments use the
+    // existing environment-backed configuration until migrations complete.
+  }
+  return null;
 }
 
 /** Close the shared pool (for tests/cleanup) */
@@ -252,6 +295,9 @@ function getServerKey(provider: Provider): string | undefined {
     openai: process.env.OPENAI_API_KEY,
     anthropic: process.env.ANTHROPIC_API_KEY,
     deepseek: process.env.DEEPSEEK_API_KEY,
+    qwen: process.env.QWEN_API_KEY,
+    zhipu: process.env.ZHIPU_API_KEY,
+    kimi: process.env.KIMI_API_KEY,
     custom: undefined,
   };
   return envMap[provider];

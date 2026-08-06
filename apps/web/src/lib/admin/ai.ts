@@ -27,6 +27,15 @@ export interface AiProviderDto {
 export interface AiProviderInput { key: string; displayName: string; apiBase: string; secretRef?: string; enabled?: boolean }
 export interface AiModelInput { model: string; label: string; description?: string; tier: string; priceIn: number; priceOut: number; contextK: number; active?: boolean }
 
+export const AI_PROVIDER_SELECT = { id: true, key: true, displayName: true, apiBase: true, secretRef: true, credentialConfigured: true, enabled: true, version: true, models: { orderBy: { model: 'asc' as const } } } as const
+export const MODEL_SELECT = { id: true, model: true, label: true, description: true, tier: true, priceIn: true, priceOut: true, contextK: true, active: true } as const
+
+export function runtimeCredentialConfigured(input: { secretRef?: unknown; credentialConfigured?: unknown }, env: Record<string, string | undefined> = process.env): boolean {
+  return typeof input.secretRef === 'string' && input.secretRef.length > 0
+    ? Boolean(env[input.secretRef])
+    : input.credentialConfigured === true
+}
+
 export function toAiProviderDto(input: unknown): AiProviderDto {
   const row = record(input)
   const models = Array.isArray(row.models) ? row.models.map(toAiModelDto) : []

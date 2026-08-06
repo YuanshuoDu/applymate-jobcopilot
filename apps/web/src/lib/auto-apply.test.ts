@@ -12,6 +12,8 @@ const mocks = vi.hoisted(() => ({
   jobFindFirst: vi.fn(),
   activityCreate: vi.fn(),
   enqueueApplyTask: vi.fn(),
+  isFeatureAllowed: vi.fn(),
+  resolveAiAccess: vi.fn(),
 }));
 
 vi.mock("@/lib/db", () => ({
@@ -28,6 +30,7 @@ vi.mock("@/lib/db", () => ({
 }));
 
 vi.mock("@/lib/apply-queue-client", () => ({ enqueueApplyTask: mocks.enqueueApplyTask }));
+vi.mock("@/lib/entitlements", () => ({ isFeatureAllowed: mocks.isFeatureAllowed, resolveAiAccess: mocks.resolveAiAccess }));
 
 describe("auto-apply authorization", () => {
   const input = {
@@ -60,6 +63,8 @@ describe("auto-apply authorization", () => {
     mocks.activityCreate.mockResolvedValue({});
     mocks.taskUpdate.mockResolvedValue({});
     mocks.taskEventCreate.mockResolvedValue({});
+    mocks.isFeatureAllowed.mockResolvedValue(true);
+    mocks.resolveAiAccess.mockResolvedValue('allowed');
   });
 
   it("queues only after matching explicit per-job authorization", async () => {
@@ -69,6 +74,22 @@ describe("auto-apply authorization", () => {
       applicationTaskId: "application_1", jobId: "job_1", userId: "user_1", applyUrl: input.applyUrl, operation: "submit",
     });
     expect(mocks.transaction).toHaveBeenCalled();
+  });
+
+  it("rejects autonomous submission when the current plan lacks auto-apply", async () => {
+    mocks.isFeatureAllowed.mockResolvedValueOnce(false);
+    const { queueAutonomousApplication } = await import("./auto-apply");
+
+    await expect(queueAutonomousApplication(input)).rejects.toThrow("not included in your current plan");
+    expect(mocks.approvalFindFirst).not.toHaveBeenCalled();
+  });
+
+  it("rejects autonomous submission when monthly AI credits are exhausted", async () => {
+    mocks.resolveAiAccess.mockResolvedValueOnce('exhausted');
+    const { queueAutonomousApplication } = await import("./auto-apply");
+
+    await expect(queueAutonomousApplication(input)).rejects.toThrow("Monthly AI credits exhausted");
+    expect(mocks.approvalFindFirst).not.toHaveBeenCalled();
   });
 
   it("queues a fill-only pass without changing the job into a submission", async () => {

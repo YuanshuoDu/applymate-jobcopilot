@@ -18,9 +18,15 @@ export async function GET() {
     return NextResponse.json({ error: 'Not authenticated' }, { status: 401 })
   }
 
-  const user = await db.user.findUnique({ where: { id: session.user.id } })
+  const user = await db.user.findUnique({
+    where: { id: session.user.id },
+    select: { id: true, email: true, name: true, plan: true, accountStatus: true },
+  })
   if (!user) {
     return NextResponse.json({ error: 'User not found' }, { status: 404 })
+  }
+  if (user.accountStatus === 'suspended') {
+    return NextResponse.json({ error: 'Account suspended' }, { status: 403 })
   }
 
   const token = await new SignJWT({

@@ -61,7 +61,7 @@ function fmtAiSalary(
 }
 
 export async function GET(req: NextRequest) {
-  const auth = await requireAuth(req)
+  const auth = await requireAuth(req, 'job_discovery')
   if (isErrorResponse(auth)) return auth
 
   const apiKey = process.env.RAPIDAPI_KEY

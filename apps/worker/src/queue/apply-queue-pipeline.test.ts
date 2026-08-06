@@ -26,6 +26,7 @@ const mocks = vi.hoisted(() => {
     shouldUsePattern: vi.fn().mockReturnValue(false),
     replayPattern: vi.fn(),
     claimApplicationTask: vi.fn().mockResolvedValue(true),
+    isUserActive: vi.fn().mockResolvedValue(true),
     completeFillForReview: vi.fn().mockResolvedValue(true),
     finishApplicationTask: vi.fn().mockResolvedValue(undefined),
     pauseForFormInput: vi.fn().mockResolvedValue(undefined),
@@ -86,6 +87,7 @@ vi.mock("../db/application-task-state.js", () => ({
   claimApplicationTask: mocks.claimApplicationTask,
   completeFillForReview: mocks.completeFillForReview,
   finishApplicationTask: mocks.finishApplicationTask,
+  isUserActive: mocks.isUserActive,
   pauseForFormInput: mocks.pauseForFormInput,
   needsUserTakeover: vi.fn(() => false),
 }));

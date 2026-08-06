@@ -1,7 +1,11 @@
 import { describe, expect, it } from 'vitest'
-import { validateEntitlement, validatePlanMetadata, validatePlanTransition, validateFeatureOverride, toPlanCatalogDto, type PlanKey } from './plans'
+import { PLAN_SELECT, buildPlanPatch, buildEntitlementPatch, validateEntitlement, validatePlanMetadata, validatePlanTransition, validateFeatureOverride, toPlanCatalogDto, type PlanKey } from './plans'
 
 describe('admin plan validation', () => {
+  it('keeps the plan selector outside route modules', () => {
+    expect(PLAN_SELECT).toMatchObject({ id: true, plan: true, entitlements: { select: { id: true } } })
+  })
+
   it('normalizes valid EUR pricing and rejects negative or fractional cents', () => {
     expect(validatePlanMetadata({ name: 'Pro', monthlyPriceCents: 1900, yearlyPriceCents: 19000, currency: 'eur' })).toMatchObject({ currency: 'EUR', monthlyPriceCents: 1900 })
     expect(() => validatePlanMetadata({ name: 'Pro', monthlyPriceCents: -1, yearlyPriceCents: 19000, currency: 'EUR' })).toThrow()
@@ -30,5 +34,13 @@ describe('admin plan validation', () => {
 
   it('builds a plan DTO from an explicit safe shape', () => {
     expect(toPlanCatalogDto({ id: 'plan_1', plan: 'pro', name: 'Pro', monthlyPriceCents: 1900, yearlyPriceCents: 19000, currency: 'EUR', active: true, version: 2, entitlements: [{ id: 'ent_1', featureKey: 'auto_apply', kind: 'boolean', enabled: true }] })).toMatchObject({ plan: 'pro', version: 2, entitlements: [{ featureKey: 'auto_apply' }] })
+  })
+
+  it('builds an active-state plan patch for activation controls', () => {
+    expect(buildPlanPatch({ name: 'Pro', description: 'Full access', monthlyPriceCents: 1900, yearlyPriceCents: 19000, currency: 'EUR', active: false })).toEqual({ name: 'Pro', description: 'Full access', monthlyPriceCents: 1900, yearlyPriceCents: 19000, currency: 'EUR', active: false })
+  })
+
+  it('keeps text entitlement values in the update payload', () => {
+    expect(buildEntitlementPatch([{ featureKey: 'support', kind: 'text', enabled: true, textValue: 'Priority support' }])).toEqual([{ featureKey: 'support', kind: 'text', enabled: true, textValue: 'Priority support' }])
   })
 })

@@ -3,9 +3,8 @@ import { requireAdmin } from '@/lib/admin/authorization'
 import { writeAdminAudit } from '@/lib/admin/audit'
 import { validateAdminWriteRequest } from '@/lib/admin/csrf'
 import { withAdminIdempotency } from '@/lib/admin/idempotency'
-import { planKey, toPlanCatalogDto, validatePlanMetadata } from '@/lib/admin/plans'
+import { PLAN_SELECT, planKey, toPlanCatalogDto, validatePlanMetadata } from '@/lib/admin/plans'
 import { adminError, adminJson, jsonBody, requestId, requiredIdempotencyKey, requiredReason } from '@/lib/admin/route-utils'
-import { PLAN_SELECT } from '../route'
 
 export async function PATCH(request: Request, context: { params: Promise<{ plan: string }> }) {
   const correlationId = requestId(request)

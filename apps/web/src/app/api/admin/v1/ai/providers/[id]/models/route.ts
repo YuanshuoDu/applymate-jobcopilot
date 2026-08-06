@@ -3,10 +3,8 @@ import { requireAdmin } from '@/lib/admin/authorization'
 import { writeAdminAudit } from '@/lib/admin/audit'
 import { validateAdminWriteRequest } from '@/lib/admin/csrf'
 import { withAdminIdempotency } from '@/lib/admin/idempotency'
-import { toAiModelDto, validateAiModel } from '@/lib/admin/ai'
+import { MODEL_SELECT, toAiModelDto, validateAiModel } from '@/lib/admin/ai'
 import { adminError, adminJson, jsonBody, requestId, requiredIdempotencyKey, requiredReason } from '@/lib/admin/route-utils'
-
-const MODEL_SELECT = { id: true, model: true, label: true, description: true, tier: true, priceIn: true, priceOut: true, contextK: true, active: true } as const
 
 export async function GET(request: Request, context: { params: Promise<{ id: string }> }) {
   const correlationId = requestId(request)
@@ -27,5 +25,3 @@ export async function POST(request: Request, context: { params: Promise<{ id: st
     return adminJson(response.body, response.status, correlationId)
   } catch (error) { return adminError(error, correlationId) }
 }
-
-export { MODEL_SELECT }

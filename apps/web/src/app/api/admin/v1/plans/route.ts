@@ -3,14 +3,8 @@ import { requireAdmin } from '@/lib/admin/authorization'
 import { writeAdminAudit } from '@/lib/admin/audit'
 import { validateAdminWriteRequest } from '@/lib/admin/csrf'
 import { withAdminIdempotency } from '@/lib/admin/idempotency'
-import { planKey, toPlanCatalogDto, validatePlanMetadata } from '@/lib/admin/plans'
+import { PLAN_SELECT, planKey, toPlanCatalogDto, validatePlanMetadata } from '@/lib/admin/plans'
 import { adminError, adminJson, jsonBody, requestId, requiredIdempotencyKey, requiredReason } from '@/lib/admin/route-utils'
-
-export const PLAN_SELECT = {
-  id: true, plan: true, name: true, description: true, monthlyPriceCents: true, yearlyPriceCents: true,
-  currency: true, active: true, version: true,
-  entitlements: { select: { id: true, featureKey: true, kind: true, enabled: true, limit: true, textValue: true }, orderBy: { featureKey: 'asc' as const } },
-} as const
 
 export async function GET(request: Request) {
   const correlationId = requestId(request)

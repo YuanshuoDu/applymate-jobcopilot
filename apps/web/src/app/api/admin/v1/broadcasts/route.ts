@@ -3,7 +3,7 @@ import { requireAdmin } from '@/lib/admin/authorization'
 import { writeAdminAudit } from '@/lib/admin/audit'
 import { validateAdminWriteRequest } from '@/lib/admin/csrf'
 import { withAdminIdempotency } from '@/lib/admin/idempotency'
-import { sanitizeBroadcastText, validateBroadcastAudience, broadcastWhere } from '@/lib/admin/broadcast'
+import { sanitizeBroadcastText, serializeBroadcast, storedAudience, validateBroadcastAudience, broadcastWhere } from '@/lib/admin/broadcast'
 import { adminError, adminJson, jsonBody, requestId, requiredIdempotencyKey, requiredReason } from '@/lib/admin/route-utils'
 import type { Prisma } from '@prisma/client'
 
@@ -27,9 +27,3 @@ export async function POST(request: Request) {
     }); return adminJson(response.body, response.status, correlationId)
   } catch (error) { return adminError(error, correlationId) }
 }
-
-export function serializeBroadcast(value: { id: string; title: string; body: string; audienceType: unknown; audience: unknown; status: unknown; scheduledAt: Date | null; createdById: string; approvedById: string | null; publishedById: string | null; recipientCount: number; deliveredCount: number; failedCount: number; createdAt: Date; updatedAt: Date }) { return { ...value, scheduledAt: value.scheduledAt?.toISOString() ?? null, createdAt: value.createdAt.toISOString(), updatedAt: value.updatedAt.toISOString() } }
-
-export function storedAudience(value: { audienceType: unknown; audience: unknown }) { const raw = value.audience !== null && typeof value.audience === 'object' && !Array.isArray(value.audience) ? value.audience as Record<string, unknown> : {}; return validateBroadcastAudience({ audienceType: value.audienceType, ...raw }) }
-
-export { BROADCAST_SELECT }

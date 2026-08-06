@@ -24,7 +24,7 @@ const BASE      = 'https://www.reed.co.uk/api/1.0/search'
 const PAGE_SIZE = 20
 
 export async function GET(req: NextRequest) {
-  const auth = await requireAuth(req)
+  const auth = await requireAuth(req, 'job_discovery')
   if (isErrorResponse(auth)) return auth
 
   const reedKey = process.env.REED_API_KEY

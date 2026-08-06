@@ -5,7 +5,7 @@ import { validateAdminWriteRequest } from '@/lib/admin/csrf'
 import { withAdminIdempotency } from '@/lib/admin/idempotency'
 import { toAiModelDto, validateAiModel } from '@/lib/admin/ai'
 import { adminError, adminJson, jsonBody, requestId, requiredIdempotencyKey, requiredReason } from '@/lib/admin/route-utils'
-import { MODEL_SELECT } from '../route'
+import { MODEL_SELECT } from '@/lib/admin/ai'
 
 export async function PATCH(request: Request, context: { params: Promise<{ id: string; modelId: string }> }) {
   const correlationId = requestId(request)

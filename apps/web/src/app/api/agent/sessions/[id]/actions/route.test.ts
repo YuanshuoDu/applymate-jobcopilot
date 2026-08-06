@@ -17,6 +17,8 @@ const mocks = vi.hoisted(() => ({
   tailorResumeForAgent: vi.fn(),
   loadUserAiConfig: vi.fn(),
   enqueueApplyTask: vi.fn(),
+  isFeatureAllowed: vi.fn(),
+  resolveAiAccess: vi.fn(),
 }))
 
 vi.mock("@/lib/api-helpers", () => ({
@@ -42,6 +44,7 @@ vi.mock("@/lib/db", () => ({
 }))
 
 vi.mock("@/lib/model-router", () => ({ loadUserAiConfig: mocks.loadUserAiConfig }))
+vi.mock("@/lib/entitlements", () => ({ isFeatureAllowed: mocks.isFeatureAllowed, resolveAiAccess: mocks.resolveAiAccess }))
 vi.mock("@/lib/agent/resume-tailoring", () => ({ tailorResumeForAgent: mocks.tailorResumeForAgent }))
 vi.mock("@/lib/apply-queue-client", () => ({ enqueueApplyTask: mocks.enqueueApplyTask }))
 
@@ -79,6 +82,10 @@ describe("agent session actions API", () => {
     mocks.loadUserAiConfig.mockResolvedValue({ provider: 'openai', model: 'test' })
     mocks.tailorResumeForAgent.mockResolvedValue({ id: 'resume_tailored', name: 'Tailored for N26', jobId: 'job_1', company: 'N26', role: 'Backend Engineer', reused: false })
     mocks.enqueueApplyTask.mockResolvedValue('apply_task_1')
+    mocks.isFeatureAllowed.mockReset()
+    mocks.resolveAiAccess.mockReset()
+    mocks.isFeatureAllowed.mockResolvedValue(true)
+    mocks.resolveAiAccess.mockResolvedValue('allowed')
     mocks.automationFindFirst.mockResolvedValue(null)
     mocks.transcriptCreate.mockResolvedValue({
       id: "event_1",
@@ -342,6 +349,44 @@ describe("agent session actions API", () => {
     expect(mocks.tailorResumeForAgent).toHaveBeenCalledWith(expect.objectContaining({ userId: 'user_1', resumeId: 'resume_1', jobId: 'job_1' }))
     expect(mocks.approvalCreate).toHaveBeenCalledWith({ data: expect.objectContaining({ type: 'confirm_tailored_resume', sessionId: 'session_1' }) })
     expect(mocks.sessionUpdate).toHaveBeenCalledWith({ where: { id: 'session_1' }, data: { status: 'waiting_for_user', completedAt: null } })
+  })
+
+  it('does not tailor a resume when AI credits are disabled', async () => {
+    mocks.resolveAiAccess.mockResolvedValueOnce('disabled')
+    mocks.tailorResumeForAgent.mockClear()
+    mocks.approvalFindFirst.mockResolvedValueOnce({ type: 'tailor_resume', payload: { resumeId: 'resume_1', jobId: 'job_1' } })
+    const { POST } = await import('./route')
+
+    const res = await POST(postRequest({ type: 'approval_response', approvalId: 'approval_writer', decision: 'approved' }) as never, ctx)
+
+    expect(res.status).toBe(403)
+    expect(mocks.tailorResumeForAgent).not.toHaveBeenCalled()
+  })
+
+  it('does not tailor a resume when the tailored-resume entitlement is disabled', async () => {
+    mocks.isFeatureAllowed.mockResolvedValueOnce(false)
+    mocks.tailorResumeForAgent.mockClear()
+    mocks.approvalFindFirst.mockResolvedValueOnce({ type: 'tailor_resume', payload: { resumeId: 'resume_1', jobId: 'job_1' } })
+    const { POST } = await import('./route')
+
+    const res = await POST(postRequest({ type: 'approval_response', approvalId: 'approval_writer', decision: 'approved' }) as never, ctx)
+
+    expect(res.status).toBe(403)
+    expect(mocks.resolveAiAccess).not.toHaveBeenCalled()
+    expect(mocks.tailorResumeForAgent).not.toHaveBeenCalled()
+  })
+
+  it('does not tailor a resume when monthly AI credits are exhausted', async () => {
+    mocks.isFeatureAllowed.mockResolvedValueOnce(true)
+    mocks.resolveAiAccess.mockResolvedValueOnce('exhausted')
+    mocks.tailorResumeForAgent.mockClear()
+    mocks.approvalFindFirst.mockResolvedValueOnce({ type: 'tailor_resume', payload: { resumeId: 'resume_1', jobId: 'job_1' } })
+    const { POST } = await import('./route')
+
+    const res = await POST(postRequest({ type: 'approval_response', approvalId: 'approval_writer', decision: 'approved' }) as never, ctx)
+
+    expect(res.status).toBe(429)
+    expect(mocks.tailorResumeForAgent).not.toHaveBeenCalled()
   })
 
   it('prepares the assisted application only after the Reviewer confirmation binds the final resume', async () => {
