@@ -416,7 +416,7 @@ export function AgentPlaygroundPage() {
   return (
     <div style={{ flex: 1, display: 'flex', flexDirection: 'column', overflow: 'hidden', background: 'var(--bg-tertiary)' }}>
       <style>{`
-        @media (max-width: 760px) {
+        @media (max-width: 900px) {
           .agent-workspace-layout {
             flex-direction: column !important;
             min-height: 0 !important;

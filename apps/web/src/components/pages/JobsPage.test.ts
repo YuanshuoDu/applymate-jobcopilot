@@ -1,6 +1,9 @@
 import { describe, expect, it } from 'vitest'
+import { readFileSync } from 'node:fs'
 import type { Job } from '@/lib/types'
 import { toMobileJobCard } from './JobsPage'
+
+const globalCss = readFileSync(new URL('../../app/globals.css', import.meta.url), 'utf8')
 
 describe('mobile job card projection', () => {
   it('keeps the fields needed to review a saved job', () => {
@@ -40,5 +43,10 @@ describe('mobile job card projection', () => {
       score: 86,
       date: '2026-08-01T10:00:00.000Z',
     })
+  })
+
+  it('uses the card list before the desktop table is clipped on narrow desktop widths', () => {
+    expect(globalCss).toMatch(/@media \(max-width: 1200px\)[\s\S]*\.jobs-desktop-list\s*\{\s*display:\s*none/)
+    expect(globalCss).toMatch(/@media \(max-width: 1200px\)[\s\S]*\.jobs-mobile-list\s*\{[\s\S]*display:\s*flex/)
   })
 })

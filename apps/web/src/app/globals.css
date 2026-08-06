@@ -326,12 +326,134 @@ body {
   }
 }
 
+@media (max-width: 900px) {
+  .settings-workspace {
+    flex-direction: column !important;
+    min-width: 0 !important;
+    overflow-y: auto !important;
+  }
+
+  .settings-sidebar {
+    width: 100% !important;
+    min-height: 0;
+    flex-direction: row !important;
+    gap: 4px !important;
+    overflow-x: auto !important;
+    overflow-y: hidden !important;
+    border-right: 0 !important;
+    border-bottom: 1px solid var(--border) !important;
+    padding: 8px !important;
+  }
+
+  .settings-sidebar > div:first-child { display: none; }
+
+  .settings-sidebar button {
+    width: auto !important;
+    flex: 0 0 auto;
+    min-height: 40px;
+    white-space: nowrap;
+  }
+
+  .settings-content {
+    overflow: visible !important;
+    min-width: 0 !important;
+    padding: 16px 16px calc(24px + var(--mobile-content-inset, 0px)) !important;
+  }
+
+  .settings-profile-grid {
+    grid-template-columns: minmax(0, 1fr) !important;
+  }
+
+  .settings-field-row {
+    align-items: flex-start !important;
+    flex-direction: column !important;
+    gap: 5px !important;
+  }
+
+  .settings-field-row > span,
+  .settings-field-control {
+    width: 100%;
+    min-width: 0 !important;
+  }
+
+  .settings-field-control input,
+  .settings-field-control select {
+    width: 100% !important;
+    max-width: none !important;
+    min-width: 0 !important;
+  }
+}
+
 .mobile-scroll-safe-area {
   padding-bottom: var(--mobile-content-inset, 0px);
 }
 
 .jobs-mobile-list {
   display: none;
+  min-width: 0;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.jobs-mobile-card {
+  display: flex;
+  min-width: 0;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 12px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--bg);
+}
+
+.jobs-mobile-card > input {
+  flex: 0 0 auto;
+  margin-top: 4px;
+}
+
+.jobs-mobile-card-main {
+  display: block;
+  min-width: 0;
+  flex: 1;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: var(--text);
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.jobs-mobile-card-heading,
+.jobs-mobile-card-meta {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 8px;
+}
+
+.jobs-mobile-card-heading { align-items: flex-start; }
+
+.jobs-mobile-card-copy {
+  display: flex;
+  min-width: 0;
+  flex: 1;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.jobs-mobile-card-copy strong,
+.jobs-mobile-card-copy span,
+.jobs-mobile-card-role { overflow-wrap: anywhere; }
+.jobs-mobile-card-copy strong { font-size: 12px; font-weight: 650; }
+.jobs-mobile-card-copy span,
+.jobs-mobile-card-meta span { color: var(--text-muted); font-size: 10px; }
+.jobs-mobile-card-role { margin: 10px 0 8px; font-size: 13px; font-weight: 650; line-height: 1.35; }
+.jobs-mobile-card-meta { justify-content: space-between; }
+
+@media (max-width: 1200px) {
+  .jobs-desktop-list { display: none; }
+  .jobs-mobile-list { display: flex; }
 }
 
 @media (max-width: 767px) {
@@ -381,93 +503,6 @@ body {
     flex: 1 1 100%;
   }
 
-  .jobs-desktop-list {
-    display: none;
-  }
-
-  .jobs-mobile-list {
-    display: flex;
-    min-width: 0;
-    flex-direction: column;
-    gap: 8px;
-  }
-
-  .jobs-mobile-card {
-    display: flex;
-    min-width: 0;
-    align-items: flex-start;
-    gap: 10px;
-    padding: 12px;
-    border: 1px solid var(--border);
-    border-radius: 10px;
-    background: var(--bg);
-  }
-
-  .jobs-mobile-card > input {
-    flex: 0 0 auto;
-    margin-top: 4px;
-  }
-
-  .jobs-mobile-card-main {
-    display: block;
-    min-width: 0;
-    flex: 1;
-    padding: 0;
-    border: 0;
-    background: transparent;
-    color: var(--text);
-    font: inherit;
-    text-align: left;
-    cursor: pointer;
-  }
-
-  .jobs-mobile-card-heading,
-  .jobs-mobile-card-meta {
-    display: flex;
-    min-width: 0;
-    align-items: center;
-    gap: 8px;
-  }
-
-  .jobs-mobile-card-heading {
-    align-items: flex-start;
-  }
-
-  .jobs-mobile-card-copy {
-    display: flex;
-    min-width: 0;
-    flex: 1;
-    flex-direction: column;
-    gap: 3px;
-  }
-
-  .jobs-mobile-card-copy strong,
-  .jobs-mobile-card-copy span,
-  .jobs-mobile-card-role {
-    overflow-wrap: anywhere;
-  }
-
-  .jobs-mobile-card-copy strong {
-    font-size: 12px;
-    font-weight: 650;
-  }
-
-  .jobs-mobile-card-copy span,
-  .jobs-mobile-card-meta span {
-    color: var(--text-muted);
-    font-size: 10px;
-  }
-
-  .jobs-mobile-card-role {
-    margin: 10px 0 8px;
-    font-size: 13px;
-    font-weight: 650;
-    line-height: 1.35;
-  }
-
-  .jobs-mobile-card-meta {
-    justify-content: space-between;
-  }
 }
 
 /* ─── Mobile Bottom Nav ──────────────────────────────────────────────── */
