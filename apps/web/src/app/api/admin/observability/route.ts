@@ -1,6 +1,7 @@
-import { NextRequest } from "next/server";
-import { ok } from "@/lib/api-helpers";
+import type { NextRequest } from "next/server";
 import { db } from "@/lib/db";
+import { requireAdmin } from "@/lib/admin/authorization";
+import { adminError, adminJson, requestId } from "@/lib/admin/route-utils";
 
 type OverallRow = {
   total: number | null;
@@ -21,6 +22,9 @@ type AtsRow = {
 };
 
 export async function GET(_req: NextRequest) {
+  const correlationId = requestId(_req);
+  try {
+  await requireAdmin('observability.read', _req);
   const overallRows = await db.$queryRaw`
     SELECT
       COUNT(*)::int AS total,
@@ -73,7 +77,7 @@ export async function GET(_req: NextRequest) {
   const llm = Number(row.llm ?? 0);
   const captchaErrors = Number(row.captchaErrors ?? 0);
 
-  return ok({
+  return adminJson({
     overall: {
       total,
       successRate: Number(row.successRate ?? 0),
@@ -96,5 +100,8 @@ export async function GET(_req: NextRequest) {
       count: Number(ats.count ?? 0),
       successRate: Number(ats.successRate ?? 0),
     })),
-  });
+  }, 200, correlationId);
+  } catch (error) {
+    return adminError(error, correlationId);
+  }
 }

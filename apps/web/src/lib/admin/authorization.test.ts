@@ -25,7 +25,7 @@ describe('requireAdmin', () => {
 
   it('rejects an unauthenticated request', async () => {
     mocks.safeAuth.mockResolvedValue(null)
-    await expect(requireAdmin('users.read')).rejects.toMatchObject<AdminAuthorizationError>({ status: 401, code: 'ADMIN_UNAUTHENTICATED' })
+    await expect(requireAdmin('users.read')).rejects.toMatchObject({ status: 401, code: 'ADMIN_UNAUTHENTICATED' } satisfies Partial<AdminAuthorizationError>)
   })
 
   it('rejects a user without an internal membership', async () => {

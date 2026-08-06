@@ -42,12 +42,13 @@ describe('admin DTO redaction', () => {
   })
 
   it('does not serialize unknown role fields', () => {
-    expect(toAdminRoleDto({ id: 'role_1', key: 'support', name: 'Support', permissions: ['users.read'], system: true, internalSecret: 'x' })).toEqual({
+    expect(toAdminRoleDto({ id: 'role_1', key: 'support', name: 'Support', permissions: ['users.read'], system: true, version: 4, internalSecret: 'x' })).toEqual({
       id: 'role_1',
       key: 'support',
       name: 'Support',
       permissions: ['users.read'],
       system: true,
+      version: 4,
     })
   })
 })

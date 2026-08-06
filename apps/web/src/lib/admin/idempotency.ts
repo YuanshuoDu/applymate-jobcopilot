@@ -26,7 +26,7 @@ export interface IdempotencyTransaction {
   adminIdempotencyKey: IdempotencyStore
 }
 
-interface TransactionDatabase<T extends IdempotencyTransaction> {
+interface TransactionDatabase<T> {
   $transaction<R>(callback: (transaction: T) => Promise<R>): Promise<R>
 }
 
@@ -51,14 +51,15 @@ export class AdminIdempotencyError extends Error {
   }
 }
 
-export async function withAdminIdempotency<T extends IdempotencyTransaction>(
+export async function withAdminIdempotency<T>(
   database: TransactionDatabase<T>,
   input: IdempotencyInput,
   operation: (transaction: T) => Promise<IdempotencyResponse>,
 ): Promise<IdempotencyResponse & { replayed: boolean }> {
   const requestHash = hashBody(input.body)
   return database.$transaction(async transaction => {
-    const existing = await transaction.adminIdempotencyKey.findUnique({
+    const idempotencyTransaction = transaction as unknown as IdempotencyTransaction
+    const existing = await idempotencyTransaction.adminIdempotencyKey.findUnique({
       where: { actorUserId_key: { actorUserId: input.actorUserId, key: input.key } },
     })
 
@@ -68,7 +69,7 @@ export async function withAdminIdempotency<T extends IdempotencyTransaction>(
     }
 
     const result = await operation(transaction)
-    await transaction.adminIdempotencyKey.create({
+    await idempotencyTransaction.adminIdempotencyKey.create({
       data: {
         actorUserId: input.actorUserId,
         key: input.key,

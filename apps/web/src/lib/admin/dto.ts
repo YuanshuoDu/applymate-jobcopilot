@@ -4,6 +4,7 @@ export interface AdminRoleDto {
   name: string
   permissions: string[]
   system: boolean
+  version: number
 }
 
 export interface AdminMemberDto {
@@ -52,6 +53,7 @@ export function toAdminRoleDto(input: unknown): AdminRoleDto {
     name: stringValue(row.name),
     permissions,
     system: row.system === true,
+    version: numberValue(row.version),
   }
 }
 
