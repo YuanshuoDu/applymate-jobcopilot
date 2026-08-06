@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { validateEntitlement, validatePlanMetadata, validatePlanTransition, validateFeatureOverride, type PlanKey } from './plans'
+import { validateEntitlement, validatePlanMetadata, validatePlanTransition, validateFeatureOverride, toPlanCatalogDto, type PlanKey } from './plans'
 
 describe('admin plan validation', () => {
   it('normalizes valid EUR pricing and rejects negative or fractional cents', () => {
@@ -26,5 +26,9 @@ describe('admin plan validation', () => {
     expect(() => validateFeatureOverride({ featureKey: 'unknown', enabled: true })).toThrow()
     expect(() => validateFeatureOverride({ featureKey: 'auto_apply', enabled: true, limit: -1 })).toThrow()
     expect(() => validateFeatureOverride({ featureKey: 'auto_apply', enabled: true, expiresAt: '2000-01-01T00:00:00.000Z' })).toThrow()
+  })
+
+  it('builds a plan DTO from an explicit safe shape', () => {
+    expect(toPlanCatalogDto({ id: 'plan_1', plan: 'pro', name: 'Pro', monthlyPriceCents: 1900, yearlyPriceCents: 19000, currency: 'EUR', active: true, version: 2, entitlements: [{ id: 'ent_1', featureKey: 'auto_apply', kind: 'boolean', enabled: true }] })).toMatchObject({ plan: 'pro', version: 2, entitlements: [{ featureKey: 'auto_apply' }] })
   })
 })

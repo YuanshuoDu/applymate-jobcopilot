@@ -37,6 +37,41 @@ export interface FeatureOverrideValue {
   expiresAt?: Date
 }
 
+export interface PlanCatalogDto {
+  id: string
+  plan: PlanKey
+  name: string
+  description?: string
+  monthlyPriceCents: number
+  yearlyPriceCents: number
+  currency: string
+  active: boolean
+  version: number
+  entitlements: Array<EntitlementValue & { id: string }>
+}
+
+export function toPlanCatalogDto(input: unknown): PlanCatalogDto {
+  const row = record(input)
+  const plan = planKey(row.plan)
+  const entitlements = Array.isArray(row.entitlements) ? row.entitlements.map(toEntitlementDto) : []
+  return {
+    id: stringValue(row.id), plan, name: stringValue(row.name), description: optionalText(row.description, 500),
+    monthlyPriceCents: integerValue(row.monthlyPriceCents), yearlyPriceCents: integerValue(row.yearlyPriceCents),
+    currency: stringValue(row.currency).toUpperCase(), active: row.active === true, version: integerValue(row.version), entitlements,
+  }
+}
+
+export function toEntitlementDto(input: unknown): EntitlementValue & { id: string } {
+  const row = record(input)
+  const value = validateEntitlement({ featureKey: row.featureKey, kind: row.kind, enabled: row.enabled, limit: row.limit, textValue: row.textValue })
+  return { id: stringValue(row.id), ...value }
+}
+
+export function toTransitionDto(input: unknown) {
+  const row = record(input)
+  return { id: stringValue(row.id), ...validatePlanTransition({ fromPlan: row.fromPlan, toPlan: row.toPlan, enabled: row.enabled, note: row.note }, new Set(PLAN_KEYS)), version: integerValue(row.version) }
+}
+
 export function validatePlanMetadata(input: unknown): PlanMetadata {
   const row = record(input)
   const name = requiredText(row.name, 'Plan name', 80)
@@ -127,3 +162,6 @@ function parseFutureDate(value: unknown, now: Date): Date {
 function record(value: unknown): Record<string, unknown> {
   return value !== null && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : {}
 }
+
+function stringValue(value: unknown): string { return typeof value === 'string' ? value : '' }
+function integerValue(value: unknown): number { return typeof value === 'number' && Number.isInteger(value) ? value : 0 }
