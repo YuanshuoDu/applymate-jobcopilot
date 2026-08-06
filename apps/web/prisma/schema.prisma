@@ -103,6 +103,7 @@ model User {
   gmailSyncState GmailSyncState?
   gmailMessages  GmailMessage[]
   gmailRecommendations GmailRecommendation[]
+  adminMembership AdminMembership? @relation("AdminUser")
 }
 
 enum Plan {
@@ -592,6 +593,109 @@ model GmailRecommendation {
   @@unique([userId, fingerprint])
   @@index([userId, status, createdAt(sort: Desc)])
   @@map("gmail_recommendations")
+}
+
+// ─────────────────────────────────────────────
+// Internal admin security and audit
+// ─────────────────────────────────────────────
+
+enum AdminMembershipStatus {
+  active
+  suspended
+  revoked
+}
+
+enum AdminMfaLevel {
+  none
+  totp
+  webauthn
+}
+
+enum AdminAuditOutcome {
+  success
+  denied
+  failed
+}
+
+enum AdminTargetType {
+  user
+  admin_member
+  admin_role
+  plan
+  plan_change
+  ai_provider
+  ai_model
+  ai_route
+  broadcast
+  support_case
+}
+
+model AdminRole {
+  id          String   @id @default(cuid())
+  key         String   @unique
+  name        String
+  description String?
+  permissions String[]
+  system      Boolean  @default(false)
+  version     Int      @default(1)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  memberships AdminMembership[]
+}
+
+model AdminMembership {
+  id             String                @id @default(cuid())
+  userId         String                @unique
+  roleId         String
+  status         AdminMembershipStatus @default(active)
+  mfaLevel       AdminMfaLevel         @default(none)
+  sessionVersion Int                   @default(1)
+  grantedById    String?
+  grantedAt      DateTime              @default(now())
+  revokedAt      DateTime?
+
+  user User      @relation("AdminUser", fields: [userId], references: [id], onDelete: Restrict)
+  role AdminRole @relation(fields: [roleId], references: [id], onDelete: Restrict)
+
+  @@index([status, roleId])
+}
+
+model AdminAuditLog {
+  id            String            @id @default(cuid())
+  requestId     String
+  actorUserId   String?
+  actorRoleKey  String?
+  action        String
+  targetType    AdminTargetType?
+  targetId      String?
+  tenantUserId  String?
+  reason        String?
+  outcome       AdminAuditOutcome
+  ipHash        String?
+  userAgentHash String?
+  before        Json?
+  after         Json?
+  errorCode     String?
+  createdAt     DateTime          @default(now())
+
+  @@index([actorUserId, createdAt(sort: Desc)])
+  @@index([tenantUserId, createdAt(sort: Desc)])
+  @@index([action, createdAt(sort: Desc)])
+}
+
+model AdminIdempotencyKey {
+  id             String   @id @default(cuid())
+  key            String
+  actorUserId    String
+  action         String
+  requestHash    String
+  responseStatus Int
+  responseBody   Json
+  createdAt      DateTime @default(now())
+
+  @@unique([actorUserId, key])
+  @@index([createdAt])
 }
 
 // ─────────────────────────────────────────────
