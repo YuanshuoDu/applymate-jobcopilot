@@ -129,6 +129,11 @@ export const { handlers, signIn, signOut, auth } = NextAuth({
         // Cache plan in token to avoid per-request DB queries
         const dbUser = await db.user.findUnique({ where: { id: user.id }, select: { plan: true } })
         if (dbUser) token.plan = dbUser.plan
+        const adminMembership = await db.adminMembership.findUnique({
+          where: { userId: user.id },
+          select: { sessionVersion: true },
+        })
+        if (adminMembership) token.adminSessionVersion = adminMembership.sessionVersion
       }
       return token
     },
@@ -136,6 +141,9 @@ export const { handlers, signIn, signOut, auth } = NextAuth({
       if (token?.id && session.user) {
         session.user.id   = token.id as string
         session.user.plan = (token.plan as 'free' | 'pro' | 'enterprise') ?? 'free'
+        if (typeof token.adminSessionVersion === 'number') {
+          session.user.adminSessionVersion = token.adminSessionVersion
+        }
       }
       return session
     },
