@@ -80,7 +80,7 @@ export function AgentComposer({
   const [advancedModelOpen, setAdvancedModelOpen] = React.useState(false)
 
   return (
-    <div style={{ borderTop: '0.5px solid var(--border)', padding: '10px 14px', background: 'var(--bg-secondary)', flexShrink: 0 }}>
+    <div className="agent-composer" style={{ borderTop: '0.5px solid var(--border)', padding: '10px 14px', background: 'var(--bg-secondary)', flexShrink: 0 }}>
       {waitingForAnswer && (
         <div style={{ marginBottom: 8, padding: '6px 10px', borderRadius: 7, background: 'rgba(245,158,11,0.08)', border: '1px solid rgba(245,158,11,0.25)', fontSize: 11, color: '#b45309' }}>
           ⏸ The Orchestrator is waiting for your answer above, or you can send a new instruction below.
@@ -175,7 +175,7 @@ export function AgentComposer({
               +
             </button>
             {addMenuOpen && (
-              <div style={{ position: 'absolute', bottom: 'calc(100% + 8px)', left: 0, width: 280, maxHeight: 'min(420px, 60vh)', overflowY: 'auto', border: '1px solid var(--border)', borderRadius: 10, background: 'var(--bg)', boxShadow: '0 16px 36px rgba(15,23,42,0.18)', padding: 7, zIndex: 100 }}>
+              <div className="agent-composer-add-menu" style={{ position: 'absolute', bottom: 'calc(100% + 8px)', left: 0, width: 280, maxHeight: 'min(420px, 60vh)', overflowY: 'auto', border: '1px solid var(--border)', borderRadius: 10, background: 'var(--bg)', boxShadow: '0 16px 36px rgba(15,23,42,0.18)', padding: 7, zIndex: 100 }}>
                 <ComposerMenuSection title="Jobs">
                   {composerJobs.length === 0 && <ComposerMenuEmpty>No saved jobs yet</ComposerMenuEmpty>}
                   {composerJobs.slice(0, 4).map(job => (
@@ -237,7 +237,7 @@ export function AgentComposer({
                 <span style={{ padding: '1px 5px', borderRadius: 999, background: 'var(--border)', color: 'var(--text-subtle)', fontSize: 9, fontWeight: 750 }}>Advanced</span>
               </button>
               {advancedModelOpen && (
-                <div role="dialog" aria-label="Advanced model selection" style={{ position: 'absolute', bottom: 'calc(100% + 8px)', left: 0, width: 276, padding: 12, border: '1px solid var(--border)', borderRadius: 10, background: 'var(--bg)', boxShadow: '0 16px 36px rgba(15,23,42,0.18)', zIndex: 100 }}>
+                <div className="agent-composer-model-dialog" role="dialog" aria-label="Advanced model selection" style={{ position: 'absolute', bottom: 'calc(100% + 8px)', left: 0, width: 276, padding: 12, border: '1px solid var(--border)', borderRadius: 10, background: 'var(--bg)', boxShadow: '0 16px 36px rgba(15,23,42,0.18)', zIndex: 100 }}>
                   <div style={{ display: 'flex', alignItems: 'center', gap: 7, fontSize: 12, fontWeight: 700, color: 'var(--text)' }}>
                     <LockKeyhole size={14} color="var(--text-muted)" aria-hidden="true" />
                     Advanced model settings

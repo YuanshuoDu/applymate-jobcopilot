@@ -419,8 +419,12 @@ export function AgentPlaygroundPage() {
         @media (max-width: 760px) {
           .agent-workspace-layout {
             flex-direction: column !important;
+            min-height: 0 !important;
             overflow-y: auto !important;
             overflow-x: hidden !important;
+            box-sizing: border-box;
+            padding-bottom: var(--mobile-content-inset);
+            overscroll-behavior-y: contain;
           }
 
           .agent-session-console {
@@ -435,6 +439,14 @@ export function AgentPlaygroundPage() {
             flex: 0 0 auto !important;
             min-height: 620px !important;
             width: 100% !important;
+            min-width: 0 !important;
+          }
+
+          .agent-composer,
+          .agent-composer-add-menu,
+          .agent-composer-model-dialog {
+            min-width: 0 !important;
+            max-width: calc(100vw - 32px) !important;
           }
 
           .agent-new-chat-starters {
