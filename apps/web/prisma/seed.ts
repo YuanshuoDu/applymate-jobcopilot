@@ -4,11 +4,15 @@
  */
 import { PrismaClient, JobStatus, JobWorkflowState, ActivityType, Plan, PlanEntitlementKind } from '@prisma/client'
 import bcrypt from 'bcryptjs'
+import { seedAiConfiguration } from './seed-ai'
 
 const db = new PrismaClient()
 
 async function main() {
   console.log('🌱 Seeding database...')
+
+  const aiSeed = await seedAiConfiguration(db as never)
+  console.log(`✓ AI catalogue: ${aiSeed.providerCount} providers, ${aiSeed.modelCount} models, ${aiSeed.routeCount} routes`)
 
   const planSeeds = [
     { plan: Plan.free, name: 'Free', description: 'A starter workspace for manual applications.', monthlyPriceCents: 0, yearlyPriceCents: 0, entitlements: [{ featureKey: 'ai_credits', kind: PlanEntitlementKind.limit, enabled: true, limit: 25 }, { featureKey: 'job_discovery', kind: PlanEntitlementKind.limit, enabled: true, limit: 20 }, { featureKey: 'auto_apply', kind: PlanEntitlementKind.boolean, enabled: false }, { featureKey: 'tailored_resume', kind: PlanEntitlementKind.boolean, enabled: true }, { featureKey: 'cover_letter', kind: PlanEntitlementKind.limit, enabled: true, limit: 5 }, { featureKey: 'gmail_tracking', kind: PlanEntitlementKind.boolean, enabled: false }, { featureKey: 'api_access', kind: PlanEntitlementKind.boolean, enabled: false }] },

@@ -110,6 +110,7 @@ model User {
   adminMembership AdminMembership? @relation("AdminUser")
   planChanges UserPlanChange[]
   featureOverrides UserFeatureOverride[]
+  supportCases SupportCase[] @relation("SupportRequester")
 }
 
 enum Plan {
@@ -502,11 +503,15 @@ model Notification {
   body      String?
   read      Boolean  @default(false)
   jobId     String?  @map("job_id")
+  broadcastId String? @map("broadcast_id")
   createdAt DateTime @default(now()) @map("created_at")
 
   user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+  broadcast AdminBroadcast? @relation(fields: [broadcastId], references: [id], onDelete: SetNull)
 
   @@index([userId, createdAt(sort: Desc)])
+  @@index([broadcastId])
+  @@unique([broadcastId, userId])
   @@map("notifications")
 }
 
@@ -689,6 +694,140 @@ model UserFeatureOverride {
   user User @relation(fields: [userId], references: [id], onDelete: Cascade)
 
   @@unique([userId, featureKey])
+}
+
+model AiProviderConfig {
+  id                   String          @id @default(cuid())
+  key                  String          @unique
+  displayName          String
+  apiBase              String
+  secretRef            String?
+  credentialConfigured Boolean         @default(false)
+  enabled              Boolean         @default(true)
+  version              Int             @default(1)
+  createdAt            DateTime        @default(now())
+  updatedAt            DateTime        @updatedAt
+  models               AiModelConfig[]
+}
+
+model AiModelConfig {
+  id          String           @id @default(cuid())
+  providerId  String
+  model       String
+  label       String
+  description String?
+  tier        String
+  priceIn     Float            @default(0)
+  priceOut    Float            @default(0)
+  contextK    Int              @default(128)
+  active      Boolean          @default(true)
+  provider    AiProviderConfig @relation(fields: [providerId], references: [id], onDelete: Cascade)
+  @@unique([providerId, model])
+}
+
+model AiRouteConfig {
+  id               String   @id @default(cuid())
+  featureKey       String   @unique
+  defaultProvider  String
+  defaultModel     String
+  fallbackProvider String?
+  fallbackModel    String?
+  version          Int      @default(1)
+  updatedById      String
+  updatedAt        DateTime @updatedAt
+}
+
+enum BroadcastStatus {
+  draft
+  pending_approval
+  scheduled
+  publishing
+  published
+  cancelled
+  failed
+}
+
+enum BroadcastAudienceType {
+  all_active_users
+  plan
+  location
+  explicit_user_ids
+}
+
+model AdminBroadcast {
+  id             String                 @id @default(cuid())
+  title          String
+  body           String                 @db.Text
+  audienceType   BroadcastAudienceType
+  audience       Json
+  status         BroadcastStatus        @default(draft)
+  scheduledAt    DateTime?
+  createdById    String
+  approvedById   String?
+  publishedById  String?
+  recipientCount Int                    @default(0)
+  deliveredCount Int                   @default(0)
+  failedCount    Int                   @default(0)
+  createdAt      DateTime               @default(now())
+  updatedAt      DateTime               @updatedAt
+  notifications  Notification[]
+  @@index([status, scheduledAt])
+}
+
+enum SupportCaseStatus {
+  open
+  in_progress
+  waiting_on_customer
+  resolved
+  closed
+}
+
+enum SupportCasePriority {
+  low
+  normal
+  high
+  urgent
+}
+
+enum SupportCaseMessageKind {
+  customer_reply
+  staff_reply
+  internal_note
+  system_event
+}
+
+model SupportCase {
+  id               String                  @id @default(cuid())
+  requesterUserId  String                 @map("requester_user_id")
+  subject          String
+  category         String
+  status           SupportCaseStatus       @default(open)
+  priority         SupportCasePriority     @default(normal)
+  assignedAdminId  String?                @map("assigned_admin_id")
+  slaDueAt         DateTime?              @map("sla_due_at")
+  firstRespondedAt DateTime?              @map("first_responded_at")
+  resolvedAt       DateTime?              @map("resolved_at")
+  safeContext      Json?                  @map("safe_context")
+  createdAt        DateTime               @default(now())
+  updatedAt        DateTime               @updatedAt
+  requester        User                   @relation("SupportRequester", fields: [requesterUserId], references: [id], onDelete: Cascade)
+  messages         SupportCaseMessage[]
+  @@index([status, priority, slaDueAt])
+  @@index([requesterUserId, updatedAt(sort: Desc)])
+  @@map("support_cases")
+}
+
+model SupportCaseMessage {
+  id            String                 @id @default(cuid())
+  caseId        String                 @map("case_id")
+  authorType    SupportCaseMessageKind @map("author_type")
+  authorUserId  String?                @map("author_user_id")
+  body          String                 @db.Text
+  redacted      Boolean                @default(false)
+  createdAt     DateTime               @default(now())
+  supportCase   SupportCase            @relation(fields: [caseId], references: [id], onDelete: Cascade)
+  @@index([caseId, createdAt])
+  @@map("support_case_messages")
 }
 
 // ─────────────────────────────────────────────
