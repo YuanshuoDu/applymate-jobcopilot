@@ -26,7 +26,7 @@ export async function requireAuth(
     try {
       const { payload } = await jwtVerify(token, JWT_SECRET)
       if (payload.sub) {
-        return { userId: payload.sub as string }
+        return resolveActiveUser(payload.sub as string)
       }
     } catch {
       // Token invalid — fall through to session check.
@@ -35,9 +35,16 @@ export async function requireAuth(
 
   // NextAuth session (web app)
   const session = await safeAuth()
-  if (session?.user?.id) return { userId: session.user.id }
+  if (session?.user?.id) return resolveActiveUser(session.user.id)
 
   return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
+}
+
+async function resolveActiveUser(userId: string): Promise<{ userId: string } | NextResponse> {
+  const user = await db.user.findUnique({ where: { id: userId }, select: { accountStatus: true } })
+  if (!user) return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
+  if (user.accountStatus === 'suspended') return NextResponse.json({ error: 'Account suspended' }, { status: 403 })
+  return { userId }
 }
 
 export function isErrorResponse(val: unknown): val is NextResponse {

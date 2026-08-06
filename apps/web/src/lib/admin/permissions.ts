@@ -56,6 +56,7 @@ const SUPPORT_PERMISSIONS: readonly Permission[] = [
 ]
 
 const BILLING_PERMISSIONS: readonly Permission[] = [
+  'admin_members.read',
   'users.read',
   'users.read_pii_masked',
   'billing.read',
@@ -128,7 +129,7 @@ export const ROLE_SEEDS = {
     name: 'Analyst',
     description: 'Read-only operational aggregates.',
     system: true,
-    permissions: ['users.read', 'jobs.read_metadata', 'applications.read', 'observability.read'] as const,
+    permissions: ['admin_members.read', 'users.read', 'jobs.read_metadata', 'applications.read', 'observability.read'] as const,
   },
   security_admin: {
     name: 'Security admin',

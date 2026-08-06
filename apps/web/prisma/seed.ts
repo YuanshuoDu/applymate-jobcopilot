@@ -2,13 +2,27 @@
  * Prisma seed script — ApplyMate AI
  * Run: pnpm prisma db seed
  */
-import { PrismaClient, JobStatus, JobWorkflowState, ActivityType } from '@prisma/client'
+import { PrismaClient, JobStatus, JobWorkflowState, ActivityType, Plan, PlanEntitlementKind } from '@prisma/client'
 import bcrypt from 'bcryptjs'
 
 const db = new PrismaClient()
 
 async function main() {
   console.log('🌱 Seeding database...')
+
+  const planSeeds = [
+    { plan: Plan.free, name: 'Free', description: 'A starter workspace for manual applications.', monthlyPriceCents: 0, yearlyPriceCents: 0, entitlements: [{ featureKey: 'ai_credits', kind: PlanEntitlementKind.limit, enabled: true, limit: 25 }, { featureKey: 'job_discovery', kind: PlanEntitlementKind.limit, enabled: true, limit: 20 }, { featureKey: 'auto_apply', kind: PlanEntitlementKind.boolean, enabled: false }, { featureKey: 'tailored_resume', kind: PlanEntitlementKind.boolean, enabled: true }, { featureKey: 'cover_letter', kind: PlanEntitlementKind.limit, enabled: true, limit: 5 }, { featureKey: 'gmail_tracking', kind: PlanEntitlementKind.boolean, enabled: false }, { featureKey: 'api_access', kind: PlanEntitlementKind.boolean, enabled: false }] },
+    { plan: Plan.pro, name: 'Pro', description: 'Full AI-assisted job search and applications.', monthlyPriceCents: 1900, yearlyPriceCents: 19000, entitlements: [{ featureKey: 'ai_credits', kind: PlanEntitlementKind.limit, enabled: true, limit: 1000 }, { featureKey: 'job_discovery', kind: PlanEntitlementKind.limit, enabled: true, limit: 1000 }, { featureKey: 'auto_apply', kind: PlanEntitlementKind.boolean, enabled: true }, { featureKey: 'tailored_resume', kind: PlanEntitlementKind.boolean, enabled: true }, { featureKey: 'cover_letter', kind: PlanEntitlementKind.limit, enabled: true, limit: 100 }, { featureKey: 'gmail_tracking', kind: PlanEntitlementKind.boolean, enabled: true }, { featureKey: 'api_access', kind: PlanEntitlementKind.boolean, enabled: false }] },
+    { plan: Plan.enterprise, name: 'Enterprise', description: 'High-volume controls for teams and managed accounts.', monthlyPriceCents: 4900, yearlyPriceCents: 49000, entitlements: [{ featureKey: 'ai_credits', kind: PlanEntitlementKind.limit, enabled: true, limit: 10000 }, { featureKey: 'job_discovery', kind: PlanEntitlementKind.limit, enabled: true, limit: 10000 }, { featureKey: 'auto_apply', kind: PlanEntitlementKind.boolean, enabled: true }, { featureKey: 'tailored_resume', kind: PlanEntitlementKind.boolean, enabled: true }, { featureKey: 'cover_letter', kind: PlanEntitlementKind.limit, enabled: true, limit: 1000 }, { featureKey: 'gmail_tracking', kind: PlanEntitlementKind.boolean, enabled: true }, { featureKey: 'api_access', kind: PlanEntitlementKind.boolean, enabled: true }] },
+  ] as const
+  const planRows = new Map<Plan, { id: string }>()
+  for (const seed of planSeeds) {
+    const row = await db.planCatalog.upsert({ where: { plan: seed.plan }, update: {}, create: { plan: seed.plan, name: seed.name, description: seed.description, monthlyPriceCents: seed.monthlyPriceCents, yearlyPriceCents: seed.yearlyPriceCents, currency: 'EUR', active: true }, select: { id: true } })
+    planRows.set(seed.plan, row)
+    for (const entitlement of seed.entitlements) await db.planEntitlement.upsert({ where: { planId_featureKey: { planId: row.id, featureKey: entitlement.featureKey } }, update: {}, create: { planId: row.id, ...entitlement } })
+  }
+  for (const fromPlan of Object.values(Plan)) for (const toPlan of Object.values(Plan)) if (fromPlan !== toPlan) await db.planTransition.upsert({ where: { fromPlan_toPlan: { fromPlan, toPlan } }, update: {}, create: { fromPlan, toPlan, enabled: true } })
+  console.log(`✓ Plan catalogue: ${planRows.size} plans`)
 
   // ── Demo user ─────────────────────────────────────────────
   const password = await bcrypt.hash('demo1234', 12)

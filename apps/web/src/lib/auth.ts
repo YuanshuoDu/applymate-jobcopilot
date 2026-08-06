@@ -32,7 +32,7 @@ providers.push(Credentials({
         const { payload } = await jwtVerify(credentials.token, JWT_SECRET)
         if (!payload.sub) return null
         const user = await db.user.findUnique({ where: { id: payload.sub as string } })
-        if (!user) return null
+        if (!user || user.accountStatus === 'suspended') return null
         return { id: user.id, email: user.email, name: user.name, image: user.image }
       } catch {
         return null
@@ -46,7 +46,7 @@ providers.push(Credentials({
     const user = await db.user.findUnique({
       where: { email },
     })
-    if (!user?.password) return null
+    if (!user?.password || user.accountStatus === 'suspended') return null
     const valid = await bcrypt.compare(credentials.password as string, user.password)
     if (!valid) return null
     return { id: user.id, email: user.email, name: user.name, image: user.image }
@@ -88,6 +88,10 @@ export const { handlers, signIn, signOut, auth } = NextAuth({
   session: { strategy: 'jwt' },
   callbacks: {
     async signIn({ user, account, profile }) {
+      if (user.id) {
+        const accountState = await db.user.findUnique({ where: { id: user.id }, select: { accountStatus: true } })
+        if (!accountState || accountState.accountStatus === 'suspended') return '/login?error=AccountSuspended'
+      }
       if (account?.provider === 'google') {
         const validIdentity = await reconcileGoogleLoginIdentity({ user, account, profile })
         if (!validIdentity) return '/login?error=OAuthIdentityMismatch'

@@ -2,6 +2,11 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const mocks = vi.hoisted(() => ({
   queryRaw: vi.fn(),
+  requireAdmin: vi.fn(),
+}));
+
+vi.mock("@/lib/admin/authorization", () => ({
+  requireAdmin: mocks.requireAdmin,
 }));
 
 vi.mock("@/lib/api-helpers", () => ({
@@ -20,6 +25,8 @@ describe("GET /api/admin/observability", () => {
   beforeEach(() => {
     vi.resetModules();
     mocks.queryRaw.mockReset();
+    mocks.requireAdmin.mockReset();
+    mocks.requireAdmin.mockResolvedValue({ userId: "admin_1", permissions: ["observability.read"] });
   });
 
   it("returns overall auto-apply health metrics and ATS breakdown", async () => {
