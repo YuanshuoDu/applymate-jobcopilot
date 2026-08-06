@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import { getSidebarNavItems } from '@/components/layout/Sidebar'
-import { getNotificationTargetPage } from '@/components/layout/AppShell'
+import { getMobileMoreItems, getMobileNavItems, getNotificationTargetPage } from '@/components/layout/AppShell'
 
 describe('app navigation', () => {
   it('does not expose apply history as a standalone sidebar destination', () => {
@@ -29,5 +29,14 @@ describe('app navigation', () => {
   it('routes Gmail recommendations to their review queue and application alerts to Gmail', () => {
     expect(getNotificationTargetPage('gmail_recommendations')).toBe('gmail-recommendations')
     expect(getNotificationTargetPage('gmail_application_update')).toBe('gmail')
+  })
+
+  it('keeps the approved mobile navigation order', () => {
+    expect(getMobileNavItems().map(item => item.id)).toEqual(['jobs', 'search', 'dashboard', 'agent', 'more'])
+    expect(getMobileNavItems()[2].label).toBe('Home')
+  })
+
+  it('puts Gmail and Settings in the mobile More menu', () => {
+    expect(getMobileMoreItems().map(item => item.id)).toEqual(['gmail', 'settings'])
   })
 })

@@ -50,19 +50,32 @@ interface NotificationItem {
   createdAt: string
 }
 
-const MOB_NAV: { id: Page; label: string }[] = [
-  { id: 'dashboard', label: 'Home'     },
-  { id: 'jobs',      label: 'Jobs'     },
-  { id: 'gmail',     label: 'Gmail'    },
-  { id: 'agent',     label: 'Agent'    },
-  { id: 'settings',  label: 'More'     },
-]
+type MobileNavItem = { id: Page | 'more'; label: string }
+type MobileMoreItem = { id: Extract<Page, 'gmail' | 'settings'>; label: string }
+
+export function getMobileNavItems(): MobileNavItem[] {
+  return [
+    { id: 'jobs',      label: 'Jobs'   },
+    { id: 'search',    label: 'Search' },
+    { id: 'dashboard', label: 'Home'   },
+    { id: 'agent',     label: 'Agent'  },
+    { id: 'more',      label: 'More'   },
+  ]
+}
+
+export function getMobileMoreItems(): MobileMoreItem[] {
+  return [
+    { id: 'gmail',    label: 'Gmail'    },
+    { id: 'settings', label: 'Settings' },
+  ]
+}
 
 const MOB_ICONS: Record<string, React.ReactNode> = {
   dashboard: <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></svg>,
   jobs:      <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><rect x="2" y="7" width="20" height="14" rx="2"/><path d="M16 7V5a2 2 0 0 0-2-2h-4a2 2 0 0 0-2 2v2"/></svg>,
   gmail:     <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M4 4h16c1.1 0 2 .9 2 2v12c0 1.1-.9 2-2 2H4c-1.1 0-2-.9-2-2V6c0-1.1.9-2 2-2z"/><polyline points="22,6 12,13 2,6"/></svg>,
   agent:     <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="12" r="3"/><path d="M12 1v4M12 19v4M4.22 4.22l2.83 2.83M16.95 16.95l2.83 2.83M1 12h4M19 12h4M4.22 19.78l2.83-2.83M16.95 7.05l2.83-2.83"/></svg>,
+  more:      <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><circle cx="5" cy="12" r="1"/><circle cx="12" cy="12" r="1"/><circle cx="19" cy="12" r="1"/></svg>,
   settings:  <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>,
 }
 
@@ -167,6 +180,7 @@ export function AppShell() {
   const [notifications, setNotifications] = useState<NotificationItem[]>([])
   const [unreadCount, setUnreadCount] = useState(0)
   const [sidebarPopover, setSidebarPopover] = useState<'account' | 'notifications' | null>(null)
+  const [mobileMoreOpen, setMobileMoreOpen] = useState(false)
 
   const prefetchPage = useCallback((nextPage: Page) => {
     // A speculative prefetch must never surface an unhandled rejection; the
@@ -177,6 +191,7 @@ export function AppShell() {
   const navigatePage = useCallback((nextPage: Page, mode: 'push' | 'replace' = 'push') => {
     prefetchPage(nextPage)
     setSidebarPopover(null)
+    setMobileMoreOpen(false)
     setPage(nextPage)
     writePageToUrl(nextPage, mode)
   }, [prefetchPage])
@@ -295,6 +310,29 @@ export function AppShell() {
     }
   }, [status])
 
+  useEffect(() => {
+    if (!mobileMoreOpen) return
+
+    function closeOnEscape(event: KeyboardEvent) {
+      if (event.key === 'Escape') setMobileMoreOpen(false)
+    }
+
+    function closeOnOutsidePointer(event: PointerEvent) {
+      const target = event.target
+      if (!(target instanceof Element)) return
+      if (!target.closest('[data-mobile-more-menu]') && !target.closest('[data-mobile-more-button]')) {
+        setMobileMoreOpen(false)
+      }
+    }
+
+    document.addEventListener('keydown', closeOnEscape)
+    document.addEventListener('pointerdown', closeOnOutsidePointer)
+    return () => {
+      document.removeEventListener('keydown', closeOnEscape)
+      document.removeEventListener('pointerdown', closeOnOutsidePointer)
+    }
+  }, [mobileMoreOpen])
+
   async function markNotificationRead(id?: string) {
     await fetch('/api/notifications/mark-read', {
       method: 'PATCH',
@@ -410,23 +448,47 @@ export function AppShell() {
               </div>
             </div>
 
+            {mobileMoreOpen && (
+              <div className="mobile-more-menu" data-mobile-more-menu role="menu" aria-label="More navigation">
+                {getMobileMoreItems().map(item => (
+                  <button key={item.id} role="menuitem" onClick={() => navigatePage(item.id)}>
+                    {item.label}
+                  </button>
+                ))}
+              </div>
+            )}
+
             {/* Mobile bottom bar */}
             <div id="mobile-bottom-bar">
-              {MOB_NAV.map(item => (
-                <button key={item.id}
-                  aria-label={item.label}
-                  onClick={() => navigatePage(item.id)}
-                  onPointerEnter={() => prefetchPage(item.id)}
-                  style={{
-                    display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 3,
-                    flex: 1, padding: '6px 0', border: 'none', background: 'transparent', cursor: 'pointer',
-                    color: (page === 'gmail-recommendations' ? 'gmail' : page) === item.id ? 'var(--primary)' : 'var(--text-muted)',
-                    fontSize: 10, fontFamily: 'inherit', position: 'relative',
-                  }}>
-                  <span aria-hidden="true" style={{ fontSize: 18 }}>{MOB_ICONS[item.id]}</span>
-                  <span>{item.label}</span>
-                </button>
-              ))}
+              {getMobileNavItems().map(item => {
+                const isMore = item.id === 'more'
+                const isActive = isMore
+                  ? mobileMoreOpen || page === 'gmail' || page === 'settings'
+                  : page === item.id
+                return (
+                  <button key={item.id}
+                    aria-label={item.label}
+                    aria-expanded={isMore ? mobileMoreOpen : undefined}
+                    aria-haspopup={isMore ? 'menu' : undefined}
+                    data-mobile-more-button={isMore ? '' : undefined}
+                    onClick={() => {
+                      if (item.id === 'more') setMobileMoreOpen(open => !open)
+                      else navigatePage(item.id)
+                    }}
+                    onPointerEnter={() => {
+                      if (item.id !== 'more') prefetchPage(item.id)
+                    }}
+                    style={{
+                      display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 3,
+                      flex: 1, padding: '6px 0', border: 'none', background: 'transparent', cursor: 'pointer',
+                      color: isActive ? 'var(--primary)' : 'var(--text-muted)',
+                      fontSize: 10, fontFamily: 'inherit', position: 'relative',
+                    }}>
+                    <span aria-hidden="true" style={{ fontSize: 18 }}>{MOB_ICONS[item.id]}</span>
+                    <span>{item.label}</span>
+                  </button>
+                )
+              })}
             </div>
           </>
         )}
