@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { maskEmail, maskName, toAdminMemberDto, toAdminRoleDto } from './dto'
+import { maskEmail, maskName, toAdminMemberDto, toAdminRoleDto, toAdminUserDto } from './dto'
 
 describe('admin DTO redaction', () => {
   it('masks controlled identity fields', () => {
@@ -50,5 +50,16 @@ describe('admin DTO redaction', () => {
       system: true,
       version: 4,
     })
+  })
+
+  it('masks user identity while keeping operational counts and omitting content', () => {
+    const result = toAdminUserDto({
+      id: 'user_1', email: 'ada.lovelace@example.com', name: 'Ada Lovelace', plan: 'pro', accountStatus: 'active',
+      createdAt: new Date('2026-08-01T00:00:00.000Z'), updatedAt: new Date('2026-08-02T00:00:00.000Z'), location: 'Berlin, Germany',
+      _count: { resumes: 2, jobs: 4, applicationTasks: 1 }, personaFields: { secret: 'x' }, password: 'hash',
+    })
+    expect(result).toMatchObject({ id: 'user_1', email: 'a***@example.com', name: 'A*** L***', plan: 'pro', accountStatus: 'active', counts: { resumes: 2, jobs: 4, applicationTasks: 1 } })
+    expect(JSON.stringify(result)).not.toContain('secret')
+    expect(JSON.stringify(result)).not.toContain('password')
   })
 })

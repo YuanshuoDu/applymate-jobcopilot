@@ -27,6 +27,19 @@ export interface AdminMemberDto {
   }
 }
 
+export interface AdminUserDto {
+  id: string
+  email: string
+  name: string
+  plan: string
+  accountStatus: string
+  region: string
+  createdAt: string
+  updatedAt: string
+  suspendedAt: string | null
+  counts: { resumes: number; jobs: number; applicationTasks: number }
+}
+
 export function maskEmail(value: string | null | undefined): string {
   const email = value?.trim() ?? ''
   const at = email.indexOf('@')
@@ -80,6 +93,27 @@ export function toAdminMemberDto(input: unknown): AdminMemberDto {
   }
 }
 
+export function toAdminUserDto(input: unknown): AdminUserDto {
+  const row = record(input)
+  const count = record(row._count)
+  return {
+    id: stringValue(row.id),
+    email: maskEmail(stringValue(row.email)),
+    name: maskName(stringValue(row.name)),
+    plan: stringValue(row.plan),
+    accountStatus: stringValue(row.accountStatus),
+    region: maskRegion(stringValue(row.location)),
+    createdAt: dateValue(row.createdAt),
+    updatedAt: dateValue(row.updatedAt),
+    suspendedAt: dateValue(row.suspendedAt) || null,
+    counts: {
+      resumes: numberValue(count.resumes),
+      jobs: numberValue(count.jobs),
+      applicationTasks: numberValue(count.applicationTasks),
+    },
+  }
+}
+
 function record(value: unknown): Record<string, unknown> {
   return value !== null && typeof value === 'object' ? value as Record<string, unknown> : {}
 }
@@ -95,4 +129,9 @@ function numberValue(value: unknown): number {
 function dateValue(value: unknown): string {
   if (value instanceof Date) return value.toISOString()
   return typeof value === 'string' ? value : ''
+}
+
+function maskRegion(value: string): string {
+  const parts = value.split(',').map(part => part.trim()).filter(Boolean)
+  return parts.length > 1 ? parts[parts.length - 1] : ''
 }
