@@ -244,9 +244,59 @@ body {
   margin: -2px -4px;
 }
 
-/* ─── Auth panel — hidden on mobile ─────────────────────────────────── */
-@media (max-width: 767px) {
+/* ─── Authentication layout ─────────────────────────────────────────── */
+.auth-layout {
+  min-height: 100svh !important;
+  overflow-x: hidden !important;
+  overflow-y: auto !important;
+}
+
+.auth-panel {
+  min-height: 100svh;
+}
+
+.auth-form-area,
+.auth-form-card {
+  min-width: 0;
+}
+
+@media (max-width: 900px) {
   .auth-panel { display: none !important; }
+
+  .auth-form-area {
+    width: 100%;
+    padding: 24px 16px !important;
+    align-items: flex-start !important;
+  }
+
+  .auth-form-card {
+    max-width: 460px !important;
+    margin: auto 0;
+    padding: 32px 24px !important;
+  }
+}
+
+@media (max-width: 420px) {
+  .auth-form-area { padding: 16px 12px !important; }
+  .auth-form-card {
+    border-radius: 16px !important;
+    padding: 28px 20px !important;
+  }
+}
+
+@media (min-width: 901px) and (max-height: 760px) {
+  .auth-panel {
+    max-height: 100svh;
+    overflow-y: auto !important;
+    padding: 28px 36px !important;
+  }
+
+  .auth-panel > a { margin-bottom: 28px !important; }
+  .auth-brand-hero { margin-bottom: 24px !important; }
+  .auth-features { gap: 14px !important; }
+  .auth-testimonial { padding-top: 18px !important; }
+  .auth-form-area { padding-block: 24px !important; }
+  .auth-form-card { padding-block: 28px !important; }
 }
 
 /* ─── Responsive — Mobile ────────────────────────────────────────────── */
