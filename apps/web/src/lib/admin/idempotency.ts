@@ -51,10 +51,10 @@ export class AdminIdempotencyError extends Error {
   }
 }
 
-export async function withAdminIdempotency(
-  database: TransactionDatabase<IdempotencyTransaction>,
+export async function withAdminIdempotency<T extends IdempotencyTransaction>(
+  database: TransactionDatabase<T>,
   input: IdempotencyInput,
-  operation: (transaction: IdempotencyTransaction) => Promise<IdempotencyResponse>,
+  operation: (transaction: T) => Promise<IdempotencyResponse>,
 ): Promise<IdempotencyResponse & { replayed: boolean }> {
   const requestHash = hashBody(input.body)
   return database.$transaction(async transaction => {
