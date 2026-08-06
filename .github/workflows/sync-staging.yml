@@ -1,0 +1,30 @@
+name: Sync staging branch
+
+on:
+  push:
+    branches: [master]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sync-staging
+  cancel-in-progress: false
+
+jobs:
+  mirror-master:
+    name: Mirror master to staging
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository history
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Update staging branch
+        run: |
+          git fetch origin master staging
+          # staging is a deployment mirror, not an independent development branch.
+          # Force-updating it prevents a deleted feature branch from leaving Preview stale.
+          git push origin refs/remotes/origin/master:refs/heads/staging --force

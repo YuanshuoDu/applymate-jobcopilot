@@ -9,10 +9,11 @@ import { jwtVerify } from 'jose'
 import { db } from '@/lib/db'
 import { normalizeEmail } from '@/lib/auth-identifiers'
 import { reconcileGoogleLoginIdentity } from '@/lib/google-identity'
+import { getAuthJwtSecret, getAuthSecret } from '@/lib/auth-secret'
 import { canonicalAuthRedirect } from '@/lib/auth-url'
 
-const AUTH_SECRET = process.env.AUTH_SECRET ?? 'fallback-secret-change-this'
-const JWT_SECRET = new TextEncoder().encode(AUTH_SECRET)
+const AUTH_SECRET = getAuthSecret()
+const JWT_SECRET = getAuthJwtSecret()
 
 // Build provider list dynamically — OAuth only enabled when keys are set
 const providers: Provider[] = []
@@ -126,9 +127,14 @@ export const { handlers, signIn, signOut, auth } = NextAuth({
     async jwt({ token, user }) {
       if (user) {
         token.id = user.id
-        // Cache plan in token to avoid per-request DB queries
-        const dbUser = await db.user.findUnique({ where: { id: user.id }, select: { plan: true } })
+        // Cache plan and internal session version at sign-in. Admin routes compare
+        // the latter to the live membership, invalidating stale role sessions.
+        const [dbUser, membership] = await Promise.all([
+          db.user.findUnique({ where: { id: user.id }, select: { plan: true } }),
+          db.adminMembership.findUnique({ where: { userId: user.id }, select: { sessionVersion: true } }),
+        ])
         if (dbUser) token.plan = dbUser.plan
+        token.adminSessionVersion = membership?.sessionVersion
       }
       return token
     },
@@ -136,6 +142,7 @@ export const { handlers, signIn, signOut, auth } = NextAuth({
       if (token?.id && session.user) {
         session.user.id   = token.id as string
         session.user.plan = (token.plan as 'free' | 'pro' | 'enterprise') ?? 'free'
+        session.user.adminSessionVersion = typeof token.adminSessionVersion === 'number' ? token.adminSessionVersion : undefined
       }
       return session
     },

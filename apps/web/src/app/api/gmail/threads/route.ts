@@ -23,7 +23,9 @@ export async function GET(req: NextRequest) {
   // 1. Check Google account exists
   const account = await findGmailConnection(auth.userId)
   if (!account) {
-    console.error('[gmail/threads] no Google account in DB → NO_GOOGLE_ACCOUNT')
+    // This is an expected onboarding state, not an application failure. Keep it
+    // out of Vercel's error aggregation so alerting reflects real Gmail faults.
+    console.info('[gmail/threads] no Google account in DB → NO_GOOGLE_ACCOUNT')
     return err('NO_GOOGLE_ACCOUNT', 403)
   }
   console.log('[gmail/threads] Google account exists in DB')
@@ -31,7 +33,7 @@ export async function GET(req: NextRequest) {
   // 2. Get fresh access token (auto-refreshes if needed)
   const accessToken = await getGoogleAccessToken(auth.userId)
   if (!accessToken) {
-    console.error('[gmail/threads] getGoogleAccessToken returned null → GMAIL_REAUTH (token expired/missing)')
+    console.warn('[gmail/threads] getGoogleAccessToken returned null → GMAIL_REAUTH (token expired/missing)')
     return err('GMAIL_REAUTH', 401)
   }
   console.log('[gmail/threads] got access token, length=', accessToken.length)

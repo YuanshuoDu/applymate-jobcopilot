@@ -7,10 +7,9 @@ import { NextResponse } from 'next/server'
 import { safeAuth } from '@/lib/safe-auth'
 import { SignJWT } from 'jose'
 import { db } from '@/lib/db'
+import { getAuthJwtSecret } from '@/lib/auth-secret'
 
-const JWT_SECRET = new TextEncoder().encode(
-  process.env.AUTH_SECRET ?? 'fallback-secret-change-this',
-)
+const JWT_SECRET = getAuthJwtSecret()
 
 export async function GET() {
   const session = await safeAuth()
