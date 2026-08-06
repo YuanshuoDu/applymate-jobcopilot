@@ -2,7 +2,7 @@ import React from 'react'
 
 export function TopBar({ title, titleAccessory, children }: { title: string; titleAccessory?: React.ReactNode; children?: React.ReactNode }) {
   return (
-    <div style={{
+    <div className="app-topbar" style={{
       minHeight: 62, flexShrink: 0,
       background: 'var(--glass-topbar)',
       backdropFilter: 'blur(20px) saturate(180%)',

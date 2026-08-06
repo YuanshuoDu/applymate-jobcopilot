@@ -300,6 +300,143 @@ body {
   padding-bottom: var(--mobile-content-inset, 0px);
 }
 
+.jobs-mobile-list {
+  display: none;
+}
+
+@media (max-width: 767px) {
+  .app-topbar {
+    padding: 10px 16px !important;
+    align-items: flex-start !important;
+  }
+
+  .app-topbar > div:last-child {
+    width: 100%;
+  }
+
+  .search-page {
+    min-width: 0;
+    padding-bottom: var(--mobile-content-inset);
+  }
+
+  .search-page-content {
+    min-width: 0;
+    padding: 12px 16px calc(24px + var(--mobile-content-inset)) !important;
+  }
+
+  .jobs-page {
+    min-width: 0;
+    padding-bottom: var(--mobile-content-inset);
+  }
+
+  .jobs-page-header {
+    padding: 12px 16px !important;
+  }
+
+  .jobs-page-content {
+    min-width: 0;
+    padding: 10px 16px calc(24px + var(--mobile-content-inset)) !important;
+  }
+
+  .jobs-page-toolbar {
+    padding: 10px !important;
+    gap: 8px !important;
+  }
+
+  .jobs-page-search {
+    width: 100% !important;
+    flex: 1 1 100%;
+  }
+
+  .jobs-desktop-list {
+    display: none;
+  }
+
+  .jobs-mobile-list {
+    display: flex;
+    min-width: 0;
+    flex-direction: column;
+    gap: 8px;
+  }
+
+  .jobs-mobile-card {
+    display: flex;
+    min-width: 0;
+    align-items: flex-start;
+    gap: 10px;
+    padding: 12px;
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    background: var(--bg);
+  }
+
+  .jobs-mobile-card > input {
+    flex: 0 0 auto;
+    margin-top: 4px;
+  }
+
+  .jobs-mobile-card-main {
+    display: block;
+    min-width: 0;
+    flex: 1;
+    padding: 0;
+    border: 0;
+    background: transparent;
+    color: var(--text);
+    font: inherit;
+    text-align: left;
+    cursor: pointer;
+  }
+
+  .jobs-mobile-card-heading,
+  .jobs-mobile-card-meta {
+    display: flex;
+    min-width: 0;
+    align-items: center;
+    gap: 8px;
+  }
+
+  .jobs-mobile-card-heading {
+    align-items: flex-start;
+  }
+
+  .jobs-mobile-card-copy {
+    display: flex;
+    min-width: 0;
+    flex: 1;
+    flex-direction: column;
+    gap: 3px;
+  }
+
+  .jobs-mobile-card-copy strong,
+  .jobs-mobile-card-copy span,
+  .jobs-mobile-card-role {
+    overflow-wrap: anywhere;
+  }
+
+  .jobs-mobile-card-copy strong {
+    font-size: 12px;
+    font-weight: 650;
+  }
+
+  .jobs-mobile-card-copy span,
+  .jobs-mobile-card-meta span {
+    color: var(--text-muted);
+    font-size: 10px;
+  }
+
+  .jobs-mobile-card-role {
+    margin: 10px 0 8px;
+    font-size: 13px;
+    font-weight: 650;
+    line-height: 1.35;
+  }
+
+  .jobs-mobile-card-meta {
+    justify-content: space-between;
+  }
+}
+
 /* ─── Mobile Bottom Nav ──────────────────────────────────────────────── */
 #mobile-bottom-bar {
   display: none;

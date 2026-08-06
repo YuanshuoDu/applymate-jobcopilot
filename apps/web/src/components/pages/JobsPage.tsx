@@ -68,6 +68,30 @@ function formatDuration(seconds: number) {
   return minutes ? `${minutes}m ${remainder}s` : `${remainder}s`
 }
 
+export interface MobileJobCardData {
+  id: string
+  company: string
+  logo: string | null
+  role: string
+  location: string | null
+  status: JobStatus
+  score: number | null
+  date: string
+}
+
+export function toMobileJobCard(job: Job): MobileJobCardData {
+  return {
+    id: job.id,
+    company: job.company,
+    logo: job.logo,
+    role: job.role,
+    location: job.location,
+    status: job.status,
+    score: job.score,
+    date: job.appliedAt ?? job.createdAt,
+  }
+}
+
 // ── ListView ──────────────────────────────────────────────────────────────────
 function ListView({ jobs, onRowClick, selectedIds, onToggle, onToggleAll }: {
   jobs: Job[]
@@ -170,6 +194,51 @@ function ListView({ jobs, onRowClick, selectedIds, onToggle, onToggleAll }: {
         </tbody>
       </table>
     </Card>
+  )
+}
+
+function MobileListView({ jobs, onRowClick, selectedIds, onToggle }: {
+  jobs: Job[]
+  onRowClick: (job: Job) => void
+  selectedIds: Set<string>
+  onToggle: (id: string) => void
+}) {
+  return (
+    <div className="jobs-mobile-list" aria-label="Mobile job list">
+      {jobs.map(job => {
+        const card = toMobileJobCard(job)
+        return (
+          <article key={card.id} className="jobs-mobile-card">
+            <input
+              type="checkbox"
+              aria-label={`Select ${card.role} at ${card.company}`}
+              checked={selectedIds.has(card.id)}
+              onChange={() => onToggle(card.id)}
+            />
+            <button
+              type="button"
+              className="jobs-mobile-card-main"
+              onClick={() => onRowClick(job)}
+              aria-label={`View ${card.role} at ${card.company}`}
+            >
+              <div className="jobs-mobile-card-heading">
+                <CompanyLogo logo={card.logo ?? card.company.slice(0, 2).toUpperCase()} size={28} />
+                <div className="jobs-mobile-card-copy">
+                  <strong>{card.company}</strong>
+                  <span>{card.location ?? 'Location not specified'}</span>
+                </div>
+                {card.score != null && <ScorePill score={card.score} />}
+              </div>
+              <div className="jobs-mobile-card-role">{card.role}</div>
+              <div className="jobs-mobile-card-meta">
+                <StatusBadge status={card.status} />
+                <span>{fmtDate(card.date)}</span>
+              </div>
+            </button>
+          </article>
+        )
+      })}
+    </div>
   )
 }
 
@@ -1460,8 +1529,8 @@ export function JobsPage() {
   }
 
   return (
-    <div style={{ flex: 1, overflowY: 'auto', background: 'var(--bg-tertiary)', display: 'flex', flexDirection: 'column' }}>
-      <header style={{ minHeight: 62, padding: '8px 30px', background: 'var(--bg-tertiary)' }}>
+    <div className="jobs-page" style={{ flex: 1, overflowY: 'auto', background: 'var(--bg-tertiary)', display: 'flex', flexDirection: 'column' }}>
+      <header className="jobs-page-header" style={{ minHeight: 62, padding: '8px 30px', background: 'var(--bg-tertiary)' }}>
         <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 24, flexWrap: 'wrap' }}>
           <div style={{ flex: '1 1 360px', display: 'flex', alignItems: 'center', gap: 10, minWidth: 0 }}>
             <h1 style={{ margin: 0, flexShrink: 0, fontSize: 22, fontWeight: 760, lineHeight: 1.1, letterSpacing: '-0.05em' }}>My Jobs</h1>
@@ -1489,9 +1558,9 @@ export function JobsPage() {
         </div>
       </header>
 
-      <div style={{ padding: '16px 30px 30px', flex: 1 }}>
-        <div style={{ padding: 14, marginBottom: 0, background: 'var(--bg)', border: '0.5px solid var(--border)', borderBottom: 'none', borderRadius: '12px 12px 0 0', display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' }}>
-          <div style={{ width: 420, maxWidth: '100%', display: 'flex', alignItems: 'center', gap: 8, padding: '0 12px', border: '0.5px solid var(--border)', borderRadius: 8, background: 'var(--bg)' }}>
+      <div className="jobs-page-content" style={{ padding: '16px 30px 30px', flex: 1 }}>
+        <div className="jobs-page-toolbar" style={{ padding: 14, marginBottom: 0, background: 'var(--bg)', border: '0.5px solid var(--border)', borderBottom: 'none', borderRadius: '12px 12px 0 0', display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' }}>
+          <div className="jobs-page-search" style={{ width: 420, maxWidth: '100%', display: 'flex', alignItems: 'center', gap: 8, padding: '0 12px', border: '0.5px solid var(--border)', borderRadius: 8, background: 'var(--bg)' }}>
             <Search size={17} color="var(--text-muted)" />
             <input value={search} onChange={e => doSearch(e.target.value)} placeholder="Search jobs…"
               style={{ width: '100%', padding: '10px 0', fontSize: 13, border: 'none', background: 'transparent', color: 'var(--text)', outline: 'none' }} />
@@ -1538,7 +1607,12 @@ export function JobsPage() {
         ) : (
           <>
             {view === 'list'
-              ? <ListView jobs={jobs} onRowClick={setSelectedJob} selectedIds={selectedIds} onToggle={toggleSelected} onToggleAll={toggleAllVisible} />
+              ? <>
+                <div className="jobs-desktop-list">
+                  <ListView jobs={jobs} onRowClick={setSelectedJob} selectedIds={selectedIds} onToggle={toggleSelected} onToggleAll={toggleAllVisible} />
+                </div>
+                <MobileListView jobs={jobs} onRowClick={setSelectedJob} selectedIds={selectedIds} onToggle={toggleSelected} />
+              </>
               : <KanbanView jobs={jobs} onStatusChange={handleStatusChange} onAddClick={col => { setPrefillStatus(col); setShowAdd(true) }} />}
 
             {/* ── Pagination bar ── */}
