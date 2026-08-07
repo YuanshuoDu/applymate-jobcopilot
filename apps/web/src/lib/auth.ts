@@ -10,6 +10,7 @@ import { db } from '@/lib/db'
 import { normalizeEmail } from '@/lib/auth-identifiers'
 import { reconcileGoogleLoginIdentity } from '@/lib/google-identity'
 import { canonicalAuthRedirect } from '@/lib/auth-url'
+import { shouldSuppressAuthSessionErrorLog } from '@/lib/safe-auth-errors'
 
 const AUTH_SECRET = process.env.AUTH_SECRET ?? 'fallback-secret-change-this'
 const JWT_SECRET = new TextEncoder().encode(AUTH_SECRET)
@@ -86,6 +87,12 @@ export const { handlers, signIn, signOut, auth } = NextAuth({
   secret: AUTH_SECRET,
   trustHost: true,
   session: { strategy: 'jwt' },
+  logger: {
+    error(error) {
+      if (shouldSuppressAuthSessionErrorLog(error, process.env.NODE_ENV)) return
+      console.error(error)
+    },
+  },
   callbacks: {
     async signIn({ user, account, profile }) {
       if (account?.provider === 'google') {
