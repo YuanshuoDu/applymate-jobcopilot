@@ -4,6 +4,7 @@
  */
 import { PrismaClient, JobStatus, JobWorkflowState, ActivityType } from '@prisma/client'
 import bcrypt from 'bcryptjs'
+import { DEFAULT_PLAN_CATALOGUE } from '../src/lib/plan-catalogue-shared'
 
 const db = new PrismaClient()
 
@@ -29,6 +30,29 @@ async function main() {
     },
   })
   console.log(`✓ User: ${user.email}`)
+
+  // ── Public plan catalogue ────────────────────────────────
+  for (const plan of DEFAULT_PLAN_CATALOGUE) {
+    await db.planCatalogue.upsert({
+      where: { plan: plan.key },
+      update: {},
+      create: {
+        plan: plan.key,
+        name: plan.name,
+        priceMinor: plan.priceMinor,
+        currency: plan.currency,
+        interval: plan.interval,
+        description: plan.description,
+        features: plan.features,
+        badge: plan.badge,
+        cta: plan.cta,
+        trialDays: plan.trialDays,
+        active: plan.active,
+        sortOrder: plan.sortOrder,
+      },
+    })
+  }
+  console.log(`✓ Plans: ${DEFAULT_PLAN_CATALOGUE.length}`)
 
   // ── Jobs ──────────────────────────────────────────────────
   const jobsData = [
