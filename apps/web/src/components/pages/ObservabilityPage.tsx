@@ -1,6 +1,7 @@
 'use client'
 
 import React from 'react'
+import Link from 'next/link'
 import { RefreshCw } from 'lucide-react'
 import { TopBar } from '@/components/layout/TopBar'
 import { Btn, Card } from '@/components/ui'
@@ -91,6 +92,7 @@ export function ObservabilityPage() {
   return (
     <div style={{ height: '100%', overflowY: 'auto', background: 'var(--bg)' }}>
       <TopBar title="Observability">
+        <Link href="/admin/plans" style={{ color: 'var(--text-muted)', fontSize: 12, textDecoration: 'none' }}>Manage plans</Link>
         <Btn small variant="ghost" onClick={refetch}>
           <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
             <RefreshCw size={13} aria-hidden="true" />

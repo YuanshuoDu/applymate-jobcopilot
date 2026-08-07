@@ -12,23 +12,9 @@ import {
   MODEL_CATALOGUE, PROVIDER_LABELS, APPLYMATE_BACKING, APPLYMATE_LABEL,
   type Provider, type AiConfig, type FeatureId, type UserAiSettings,
 } from '@/lib/model-router'
+import type { PublicPlan } from '@/lib/plan-catalogue-shared'
 
 // ── Static data ───────────────────────────────────────────────────────────────
-
-const PLANS = [
-  {
-    id: 'free', name: 'Free', price: '€0', period: 'forever',
-    features: ['5 applications/month', 'Basic CV tailoring', 'Job tracker (20 jobs)', 'Extension popup'],
-  },
-  {
-    id: 'pro', name: 'Pro', price: '€12', period: 'month',
-    features: ['Unlimited applications', 'AI CV tailoring per role', 'Unlimited tracker', 'Full sidebar', 'AI cover letters', 'Gmail integration', 'Priority support'],
-  },
-  {
-    id: 'team', name: 'Team', price: '€29', period: 'month',
-    features: ['Everything in Pro', '5 team seats', 'Shared job pool', 'Analytics dashboard', 'Custom AI model', 'Dedicated support'],
-  },
-]
 
 const CONNECTED_ACCOUNTS = [
   { id: 'gmail',    name: 'Gmail',    icon: '✉',  color: 'var(--c-danger)', connected: false, account: null as string | null, desc: 'AI email detection, auto-labeling & follow-up' },
@@ -109,6 +95,7 @@ export function SettingsPage() {
 
   // Load user profile
   const { data: user, loading: userLoading } = useApi<UserProfile>('/api/me')
+  const { data: billingData, loading: billingLoading, error: billingError } = useApi<{ plans: PublicPlan[] }>('/api/plans')
 
   // Profile form state (editable fields)
   const [name,     setName    ] = useState('')
@@ -186,7 +173,9 @@ export function SettingsPage() {
     { id: 'privacy',  label: t('settings.privacy')  },
   ]
 
-  const planLabel = user?.plan === 'pro' ? 'Pro' : user?.plan === 'enterprise' ? 'Team' : 'Free'
+  const planLabel = billingData?.plans.find(plan => plan.key === user?.plan)?.name
+    ?? (user?.plan === 'pro' ? 'Pro' : user?.plan === 'enterprise' ? 'Team' : 'Free')
+  const currentPlan = billingData?.plans.find(plan => plan.key === user?.plan)
 
   async function saveProfile() {
     setSaving(true)
@@ -515,7 +504,7 @@ export function SettingsPage() {
                   <div>
                     <div style={{ fontSize: 14, fontWeight: 500 }}>{planLabel} Plan</div>
                     <div style={{ fontSize: 11, color: 'var(--text-muted)', marginTop: 2 }}>
-                      {user?.plan === 'free' ? 'Free forever' : 'Renews monthly'}
+                      {currentPlan?.interval === 'forever' || user?.plan === 'free' ? 'Free forever' : `Renews ${currentPlan?.interval ?? 'monthly'}`}
                     </div>
                   </div>
                   <span style={{ marginLeft: 'auto', fontSize: 10, background: 'rgba(79,70,229,0.12)', color: 'var(--primary)', borderRadius: 999, padding: '3px 10px', fontWeight: 500 }}>Active</span>
@@ -523,18 +512,25 @@ export function SettingsPage() {
                 <Btn variant="ghost" onClick={() => toast.info('Opening billing portal')}>Manage billing →</Btn>
               </SettingsSection>
 
-              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(min(100%, 200px), 1fr))', gap: 12 }}>
-                {PLANS.map(plan => {
-                  const isCurrent = (user?.plan ?? 'free') === plan.id
+              {billingLoading && !billingData && (
+                <Card style={{ padding: 16, color: 'var(--text-muted)', fontSize: 12 }}>Loading plans…</Card>
+              )}
+              {billingError && !billingData && (
+                <Card style={{ padding: 16, color: 'var(--c-danger)', fontSize: 12 }}>{billingError}</Card>
+              )}
+              {billingData && (
+                <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(min(100%, 200px), 1fr))', gap: 12 }}>
+                {billingData.plans.map(plan => {
+                  const isCurrent = (user?.plan ?? 'free') === plan.key
                   return (
-                    <Card key={plan.id} style={{ padding: 16, border: isCurrent ? '1.5px solid var(--primary)' : '0.5px solid var(--border)', background: isCurrent ? 'rgba(79,70,229,0.03)' : 'var(--bg)' }}>
+                    <Card key={plan.key} style={{ padding: 16, border: isCurrent ? '1.5px solid var(--primary)' : '0.5px solid var(--border)', background: isCurrent ? 'rgba(79,70,229,0.03)' : 'var(--bg)' }}>
                       <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 12 }}>
                         <span style={{ fontSize: 13, fontWeight: 500 }}>{plan.name}</span>
                         {isCurrent && <span style={{ fontSize: 10, background: 'rgba(79,70,229,0.12)', color: 'var(--primary)', borderRadius: 999, padding: '2px 7px' }}>Current</span>}
                       </div>
                       <div style={{ marginBottom: 12 }}>
                         <span style={{ fontSize: 22, fontWeight: 500 }}>{plan.price}</span>
-                        <span style={{ fontSize: 11, color: 'var(--text-muted)' }}> / {plan.period}</span>
+                        <span style={{ fontSize: 11, color: 'var(--text-muted)' }}> / {plan.interval === 'forever' ? 'forever' : plan.interval}</span>
                       </div>
                       <div style={{ display: 'flex', flexDirection: 'column', gap: 5, marginBottom: 14 }}>
                         {plan.features.map(f => (
@@ -545,12 +541,13 @@ export function SettingsPage() {
                       </div>
                       <Btn variant={isCurrent ? 'ghost' : 'primary'} style={{ width: '100%', justifyContent: 'center' }}
                         onClick={() => isCurrent ? setShowCancelModal(true) : toast.success(`Upgraded to ${plan.name}`)}>
-                        {isCurrent ? 'Cancel plan' : plan.id === 'free' ? 'Downgrade' : 'Upgrade'}
+                        {isCurrent ? 'Cancel plan' : plan.key === 'free' ? 'Downgrade' : 'Upgrade'}
                       </Btn>
                     </Card>
                   )
                 })}
               </div>
+              )}
             </>
           )}
 
