@@ -155,7 +155,7 @@ export function LoginPage({ switchAccount = false }: { switchAccount?: boolean }
   return (
     <div style={{
       display: 'flex', minHeight: '100vh',
-      background: 'linear-gradient(135deg, #EEF2FF 0%, #F5F3FF 35%, #EDE9FE 65%, #F0F9FF 100%)',
+      backgroundImage: 'linear-gradient(135deg, #EEF2FF 0%, #F5F3FF 35%, #EDE9FE 65%, #F0F9FF 100%)',
       backgroundAttachment: 'fixed', position: 'relative', overflow: 'hidden',
     }}>
       {/* Decorative blobs */}
