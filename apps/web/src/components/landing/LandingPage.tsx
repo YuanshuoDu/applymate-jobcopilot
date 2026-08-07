@@ -2,9 +2,10 @@
 
 import React, { useState, useEffect, useRef, useCallback } from 'react'
 import Link from 'next/link'
+import { Menu, X } from 'lucide-react'
 import { useI18n } from '@/lib/i18n'
 import { DEFAULT_PLAN_CATALOGUE, toPublicPlan, type PublicPlan } from '@/lib/plan-catalogue-shared'
-import { FOOTER_COLUMNS, SOCIAL_LINKS } from './landing-links'
+import { FOOTER_COLUMNS, SOCIAL_LINKS, landingFeatureHref, landingPlanAction } from './landing-links'
 
 // ── Design tokens ─────────────────────────────────────────────────────────────
 const C = {
@@ -121,12 +122,12 @@ function Label({ children, color = C.primary, bg = 'rgba(99,102,241,0.12)', bd =
 
 // ── Data ──────────────────────────────────────────────────────────────────────
 const FEATURES = [
-  { icon: '🤖', title: 'AI Auto-Apply', desc: 'Scans 50,000+ European jobs daily, matches your profile, auto-fills forms and applies — up to 100 jobs per day.', gradient: 'linear-gradient(135deg,rgba(99,102,241,.15) 0%,rgba(139,92,246,.08) 100%)', border: 'rgba(99,102,241,.28)' },
-  { icon: '📄', title: 'Dynamic Resume Tailoring', desc: 'Automatically adjusts keywords and skill weights for each JD. 3× better ATS pass rate with live Tiptap editor preview.', gradient: 'linear-gradient(135deg,rgba(251,146,60,.12) 0%,rgba(245,101,101,.06) 100%)', border: 'rgba(251,146,60,.25)' },
-  { icon: '✉️', title: 'AI Cover Letter', desc: 'Generates a professional, personalised cover letter in 30 seconds — choose Professional, Enthusiastic or Concise tone.', gradient: 'linear-gradient(135deg,rgba(52,211,153,.12) 0%,rgba(16,185,129,.06) 100%)', border: 'rgba(52,211,153,.25)' },
-  { icon: '📬', title: 'Smart Gmail Inbox', desc: 'Auto-syncs recruitment emails, detects interview invitations and rejections, sends follow-up reminders.', gradient: 'linear-gradient(135deg,rgba(129,140,248,.12) 0%,rgba(99,102,241,.06) 100%)', border: 'rgba(129,140,248,.25)' },
-  { icon: '📊', title: 'Full Application Tracker', desc: 'Kanban board for every application — from Saved → Applied → Interview → Offer. Never miss a follow-up.', gradient: 'linear-gradient(135deg,rgba(251,191,36,.10) 0%,rgba(251,146,60,.06) 100%)', border: 'rgba(251,191,36,.22)' },
-  { icon: '🔌', title: 'Chrome Extension', desc: 'Browse LinkedIn / Indeed / Glassdoor and save jobs with one click. Sidebar shows your match score and auto-fills forms.', gradient: 'linear-gradient(135deg,rgba(192,132,252,.12) 0%,rgba(139,92,246,.06) 100%)', border: 'rgba(192,132,252,.25)' },
+  { icon: '🤖', title: 'AI Auto-Apply', page: 'agent' as const, desc: 'Scans 50,000+ European jobs daily, matches your profile, auto-fills forms and applies — up to 100 jobs per day.', gradient: 'linear-gradient(135deg,rgba(99,102,241,.15) 0%,rgba(139,92,246,.08) 100%)', border: 'rgba(99,102,241,.28)' },
+  { icon: '📄', title: 'Dynamic Resume Tailoring', page: 'resume' as const, desc: 'Automatically adjusts keywords and skill weights for each JD. 3× better ATS pass rate with live Tiptap editor preview.', gradient: 'linear-gradient(135deg,rgba(251,146,60,.12) 0%,rgba(245,101,101,.06) 100%)', border: 'rgba(251,146,60,.25)' },
+  { icon: '✉️', title: 'AI Cover Letter', page: 'resume' as const, desc: 'Generates a professional, personalised cover letter in 30 seconds — choose Professional, Enthusiastic or Concise tone.', gradient: 'linear-gradient(135deg,rgba(52,211,153,.12) 0%,rgba(16,185,129,.06) 100%)', border: 'rgba(52,211,153,.25)' },
+  { icon: '📬', title: 'Smart Gmail Inbox', page: 'gmail' as const, desc: 'Auto-syncs recruitment emails, detects interview invitations and rejections, sends follow-up reminders.', gradient: 'linear-gradient(135deg,rgba(129,140,248,.12) 0%,rgba(99,102,241,.06) 100%)', border: 'rgba(129,140,248,.25)' },
+  { icon: '📊', title: 'Full Application Tracker', page: 'jobs' as const, desc: 'Kanban board for every application — from Saved → Applied → Interview → Offer. Never miss a follow-up.', gradient: 'linear-gradient(135deg,rgba(251,191,36,.10) 0%,rgba(251,146,60,.06) 100%)', border: 'rgba(251,191,36,.22)' },
+  { icon: '🔌', title: 'Chrome Extension', externalHref: 'https://github.com/YuanshuoDu/applymate-jobcopilot/tree/main/apps/extension', desc: 'Browse LinkedIn / Indeed / Glassdoor and save jobs with one click. Sidebar shows your match score and auto-fills forms.', gradient: 'linear-gradient(135deg,rgba(192,132,252,.12) 0%,rgba(139,92,246,.06) 100%)', border: 'rgba(192,132,252,.25)' },
 ]
 
 const STEPS = [
@@ -146,7 +147,7 @@ const FAQS = [
   { q: 'How effective is AI auto-apply?', a: 'Users who use ApplyMate AI to tailor their resumes see an average 3× improvement in ATS pass rate and 2.4× more interview invitations. Results depend on your skill match and competition for the role.' },
   { q: 'Which job boards are supported?', a: 'We support LinkedIn, Indeed, Glassdoor, StepStone, XING, Arbeitsagentur, Adzuna, Reed, IrishJobs and more — 14 sources in total. We are continuously expanding the list.' },
   { q: 'Is my resume data safe?', a: 'Your data is stored on EU servers (Neon PostgreSQL, eu-west-2) and is fully GDPR-compliant. We never sell your resume data or use it to train AI models.' },
-  { q: 'Can I cancel any time?', a: 'Yes — cancel any time, no questions asked. You keep access until the end of your current billing period. No minimum contract, no cancellation fees.' },
+  { q: 'How do paid plan changes work?', a: 'Paid plan upgrades, trial requests and cancellations are handled by the ApplyMate team while self-serve checkout is being rolled out. Contact us and we will confirm the options and effective date.' },
   { q: 'How good is the AI-generated cover letter?', a: 'The AI generates personalised letters based on the specific JD and your actual experience — not generic templates. You can review and edit before sending. Supports Professional, Enthusiastic and Concise tone styles.' },
   { q: 'Does ApplyMate support non-English applications?', a: 'Yes. The platform supports English, German, French and more. The AI automatically selects the appropriate language based on the target company and job posting language.' },
 ]
@@ -174,17 +175,37 @@ function planPeriod(plan: PublicPlan): string {
 export function LandingPage({ plans = FALLBACK_PLANS }: { plans?: PublicPlan[] }) {
   const { t } = useI18n()
   const [scrolled, setScrolled]   = useState(false)
+  const [mobileMenuOpen, setMobileMenuOpen] = useState(false)
   const [openFaq, setOpenFaq]     = useState<number | null>(null)
   const [contactForm, setContactForm] = useState({ name: '', email: '', message: '' })
   const [contactSent, setContactSent] = useState(false)
   const [contactError, setContactError] = useState<string | null>(null)
   const [sending, setSending]     = useState(false)
   const { ref: statsRef, visible: statsVisible } = useReveal(0.3)
+  const proPlan = plans.find(plan => plan.key === 'pro')
+  const proTrialDays = proPlan?.trialDays ?? 0
+  const statsData = STATS_DATA.map(stat => stat.label === 'Pro free trial' ? { ...stat, value: proTrialDays } : stat)
 
   useEffect(() => {
     const fn = () => setScrolled(window.scrollY > 60)
     window.addEventListener('scroll', fn, { passive: true })
     return () => window.removeEventListener('scroll', fn)
+  }, [])
+
+  useEffect(() => {
+    if (!mobileMenuOpen) return
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') setMobileMenuOpen(false)
+    }
+    document.addEventListener('keydown', closeOnEscape)
+    return () => document.removeEventListener('keydown', closeOnEscape)
+  }, [mobileMenuOpen])
+
+  const closeMobileMenu = useCallback(() => setMobileMenuOpen(false), [])
+  const prepareContact = useCallback((message: string) => {
+    setContactSent(false)
+    setContactError(null)
+    setContactForm(current => ({ ...current, message }))
   }, [])
 
   const handleContact = useCallback(async (e: React.FormEvent) => {
@@ -260,6 +281,21 @@ export function LandingPage({ plans = FALLBACK_PLANS }: { plans?: PublicPlan[] }
           transition: transform 0.5s ease;
         }
         .btn-shine:hover::after { transform: translateX(100%); }
+        .landing-nav-links { display: flex; gap: 28px; font-size: 13px; align-items: center; }
+        .landing-nav-actions { display: flex; gap: 10px; align-items: center; }
+        .landing-menu-toggle { display: none; }
+        .landing-mobile-menu { display: none; }
+        @media (max-width: 780px) {
+          .landing-nav-links, .landing-nav-actions { display: none !important; }
+          .landing-menu-toggle { display: inline-flex !important; }
+          .landing-mobile-menu { display: flex; }
+          .landing-mobile-menu a { min-height: 42px; display: flex; align-items: center; }
+        }
+        @media (max-width: 560px) {
+          .landing-header { padding-left: 12px !important; padding-right: 12px !important; }
+          .landing-nav { padding-left: 14px !important; padding-right: 14px !important; }
+          .landing-contact-fields { grid-template-columns: 1fr !important; }
+        }
       `}</style>
 
       {/* ── Ambient lights (animated) ───────────────────────────────────── */}
@@ -270,7 +306,7 @@ export function LandingPage({ plans = FALLBACK_PLANS }: { plans?: PublicPlan[] }
       </div>
 
       {/* ── Navbar ──────────────────────────────────────────────────────── */}
-      <header style={{ position: 'fixed', top: 0, left: 0, right: 0, zIndex: 100, padding: '12px 24px', transition: 'all 0.3s' }}>
+      <header className="landing-header" style={{ position: 'fixed', top: 0, left: 0, right: 0, zIndex: 100, padding: '12px 24px', transition: 'all 0.3s' }}>
         <nav style={{
           maxWidth: 1140, margin: '0 auto',
           background: scrolled ? 'rgba(8,11,20,0.88)' : 'rgba(255,255,255,0.05)',
@@ -278,7 +314,7 @@ export function LandingPage({ plans = FALLBACK_PLANS }: { plans?: PublicPlan[] }
           WebkitBackdropFilter: 'blur(28px) saturate(200%)',
           border: `1px solid ${scrolled ? 'rgba(255,255,255,0.11)' : 'rgba(255,255,255,0.07)'}`,
           borderRadius: 16, padding: '10px 22px',
-          display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+          display: 'flex', alignItems: 'center', justifyContent: 'space-between', position: 'relative',
           boxShadow: scrolled ? '0 8px 40px rgba(0,0,0,0.45)' : 'none',
           transition: 'all 0.35s ease',
         }}>
@@ -292,9 +328,9 @@ export function LandingPage({ plans = FALLBACK_PLANS }: { plans?: PublicPlan[] }
           </div>
 
           {/* Links */}
-          <div style={{ display: 'flex', gap: 28, fontSize: 13, alignItems: 'center' }}>
+          <div className="landing-nav-links">
             {[['#features','Features'],['#how-it-works','How it Works'],['#pricing','Pricing'],['#faq','FAQ'],['#contact','Contact']].map(([href,label]) => (
-              <a key={href} href={href} style={{ color: C.textMuted, textDecoration: 'none', fontWeight: 500, transition: 'color 0.15s' }}
+              <a key={href} href={href} onClick={closeMobileMenu} style={{ color: C.textMuted, textDecoration: 'none', fontWeight: 500, transition: 'color 0.15s' }}
                 onMouseEnter={e => (e.currentTarget.style.color = '#fff')}
                 onMouseLeave={e => (e.currentTarget.style.color = C.textMuted)}
               >{label}</a>
@@ -302,7 +338,7 @@ export function LandingPage({ plans = FALLBACK_PLANS }: { plans?: PublicPlan[] }
           </div>
 
           {/* CTA */}
-          <div style={{ display: 'flex', gap: 10, alignItems: 'center' }}>
+          <div className="landing-nav-actions">
             <Link href="/login" style={{ fontSize: 12, fontWeight: 600, color: C.textMuted, textDecoration: 'none', padding: '6px 14px', border: '1px solid rgba(255,255,255,0.12)', borderRadius: 9, background: 'rgba(255,255,255,0.04)', transition: 'all 0.15s' }}
               onMouseEnter={e => { e.currentTarget.style.color='#fff'; e.currentTarget.style.borderColor='rgba(255,255,255,0.24)' }}
               onMouseLeave={e => { e.currentTarget.style.color=C.textMuted; e.currentTarget.style.borderColor='rgba(255,255,255,0.12)' }}
@@ -312,6 +348,32 @@ export function LandingPage({ plans = FALLBACK_PLANS }: { plans?: PublicPlan[] }
               onMouseLeave={e => { e.currentTarget.style.transform='none'; e.currentTarget.style.boxShadow='0 4px 16px rgba(79,70,229,0.50)' }}
             >Get started free →</Link>
           </div>
+
+          <button
+            type="button"
+            className="landing-menu-toggle"
+            aria-label={mobileMenuOpen ? 'Close navigation menu' : 'Open navigation menu'}
+            aria-expanded={mobileMenuOpen}
+            aria-controls="landing-mobile-menu"
+            onClick={() => setMobileMenuOpen(open => !open)}
+            style={{ width: 38, height: 38, alignItems: 'center', justifyContent: 'center', color: '#fff', background: 'rgba(255,255,255,0.07)', border: '1px solid rgba(255,255,255,0.14)', borderRadius: 10, cursor: 'pointer' }}
+          >
+            {mobileMenuOpen ? <X size={18} aria-hidden="true" /> : <Menu size={18} aria-hidden="true" />}
+          </button>
+
+          {mobileMenuOpen && (
+            <div id="landing-mobile-menu" className="landing-mobile-menu" style={{ position: 'absolute', top: 'calc(100% + 8px)', left: 0, right: 0, flexDirection: 'column', gap: 2, padding: 10, background: 'rgba(8,11,20,0.96)', backdropFilter: 'blur(24px)', border: '1px solid rgba(255,255,255,0.14)', borderRadius: 14, boxShadow: '0 18px 40px rgba(0,0,0,0.45)' }}>
+              {[
+                ['#features', 'Features'], ['#how-it-works', 'How it Works'], ['#pricing', 'Pricing'], ['#faq', 'FAQ'], ['#contact', 'Contact'],
+              ].map(([href, label]) => (
+                <a key={href} href={href} onClick={closeMobileMenu} style={{ color: C.textMuted, textDecoration: 'none', fontSize: 13, fontWeight: 600, padding: '0 12px' }}>{label}</a>
+              ))}
+              <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8, padding: '8px 0 0', borderTop: '1px solid rgba(255,255,255,0.08)', marginTop: 4 }}>
+                <Link href="/login" onClick={closeMobileMenu} style={{ color: C.textMuted, textDecoration: 'none', fontSize: 12, fontWeight: 600, padding: '10px 12px', textAlign: 'center', border: '1px solid rgba(255,255,255,0.12)', borderRadius: 9 }}>Sign in</Link>
+                <Link href="/register" onClick={closeMobileMenu} style={{ color: '#fff', textDecoration: 'none', fontSize: 12, fontWeight: 700, padding: '10px 12px', textAlign: 'center', background: 'linear-gradient(135deg, #4F46E5, #7C3AED)', borderRadius: 9 }}>Get started</Link>
+              </div>
+            </div>
+          )}
         </nav>
       </header>
 
@@ -360,7 +422,7 @@ export function LandingPage({ plans = FALLBACK_PLANS }: { plans?: PublicPlan[] }
 
         {/* Stats (animated counters) */}
         <div ref={statsRef} style={{ display: 'flex', gap: 10, flexWrap: 'wrap', justifyContent: 'center' }}>
-          {STATS_DATA.map((s, i) => (
+          {statsData.map((s, i) => (
             <StatCard key={s.label} {...s} active={statsVisible} delay={i * 180} />
           ))}
         </div>
@@ -389,11 +451,18 @@ export function LandingPage({ plans = FALLBACK_PLANS }: { plans?: PublicPlan[] }
         <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(min(100%, 330px), 1fr))', gap: 18 }}>
           {FEATURES.map((f, i) => (
             <Reveal key={f.title} delay={i * 80}>
-              <GlassCard gradient={f.gradient} border={f.border} style={{ padding: '30px 26px', height: '100%' }}>
-                <div style={{ fontSize: 34, marginBottom: 16 }}>{f.icon}</div>
-                <div style={{ fontSize: 16, fontWeight: 700, color: '#fff', marginBottom: 10 }}>{f.title}</div>
-                <div style={{ fontSize: 13, color: C.textMuted, lineHeight: 1.75 }}>{f.desc}</div>
-              </GlassCard>
+              <a
+                href={f.externalHref ?? landingFeatureHref(f.page)}
+                {...(f.externalHref ? { target: '_blank', rel: 'noreferrer' } : {})}
+                aria-label={`Open ${f.title}`}
+                style={{ display: 'block', height: '100%', textDecoration: 'none' }}
+              >
+                <GlassCard gradient={f.gradient} border={f.border} style={{ padding: '30px 26px', height: '100%' }}>
+                  <div style={{ fontSize: 34, marginBottom: 16 }}>{f.icon}</div>
+                  <div style={{ fontSize: 16, fontWeight: 700, color: '#fff', marginBottom: 10 }}>{f.title}</div>
+                  <div style={{ fontSize: 13, color: C.textMuted, lineHeight: 1.75 }}>{f.desc}</div>
+                </GlassCard>
+              </a>
             </Reveal>
           ))}
         </div>
@@ -475,6 +544,7 @@ export function LandingPage({ plans = FALLBACK_PLANS }: { plans?: PublicPlan[] }
           <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(min(100%, 300px), 1fr))', gap: 18 }}>
             {plans.map((plan, i) => {
               const isPro = plan.key === 'pro'
+              const action = landingPlanAction(plan.key)
               return (
                 <Reveal key={plan.key} delay={i * 100}>
                   <GlassCard
@@ -498,10 +568,10 @@ export function LandingPage({ plans = FALLBACK_PLANS }: { plans?: PublicPlan[] }
                         </div>
                       ))}
                     </div>
-                    <Link href={plan.key === 'enterprise' ? '#contact' : '/register'} className="btn-shine" style={{ display: 'block', textAlign: 'center', padding: '12px 20px', fontSize: 13, fontWeight: 700, borderRadius: 12, textDecoration: 'none', ...(isPro ? { background: 'linear-gradient(135deg, #4F46E5, #7C3AED)', color: '#fff', boxShadow: '0 4px 20px rgba(79,70,229,0.50)' } : { background: 'rgba(255,255,255,0.07)', border: '1px solid rgba(255,255,255,0.14)', color: 'rgba(255,255,255,0.82)' }), transition: 'all 0.18s' }}
+                    <Link href={action.href} onClick={() => action.message && prepareContact(action.message)} className="btn-shine" style={{ display: 'block', textAlign: 'center', padding: '12px 20px', fontSize: 13, fontWeight: 700, borderRadius: 12, textDecoration: 'none', ...(isPro ? { background: 'linear-gradient(135deg, #4F46E5, #7C3AED)', color: '#fff', boxShadow: '0 4px 20px rgba(79,70,229,0.50)' } : { background: 'rgba(255,255,255,0.07)', border: '1px solid rgba(255,255,255,0.14)', color: 'rgba(255,255,255,0.82)' }), transition: 'all 0.18s' }}
                       onMouseEnter={e => { e.currentTarget.style.transform = 'translateY(-1px)' }}
                       onMouseLeave={e => { e.currentTarget.style.transform = 'none' }}
-                    >{plan.cta}</Link>
+                  >{plan.cta}</Link>
                   </GlassCard>
                 </Reveal>
               )
@@ -557,10 +627,11 @@ export function LandingPage({ plans = FALLBACK_PLANS }: { plans?: PublicPlan[] }
                   <div style={{ fontSize: 48, marginBottom: 16 }}>✅</div>
                   <div style={{ fontSize: 18, fontWeight: 700, color: '#fff', marginBottom: 8 }}>Message sent!</div>
                   <div style={{ fontSize: 13, color: C.textMuted }}>We&apos;ll reply by email within 24 hours.</div>
+                  <button type="button" onClick={() => { setContactSent(false); setContactError(null) }} style={{ marginTop: 22, padding: '10px 16px', color: C.textMuted, background: 'rgba(255,255,255,0.07)', border: '1px solid rgba(255,255,255,0.14)', borderRadius: 10, cursor: 'pointer', fontSize: 12, fontWeight: 600 }}>Send another message</button>
                 </div>
               ) : (
                 <form onSubmit={handleContact} style={{ display: 'flex', flexDirection: 'column', gap: 18 }}>
-                  <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 14 }}>
+                  <div className="landing-contact-fields" style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 14 }}>
                     <InputField label="Name" value={contactForm.name} onChange={v => setContactForm(f => ({ ...f, name: v }))} placeholder="Your name" required />
                     <InputField label="Email" type="email" value={contactForm.email} onChange={v => setContactForm(f => ({ ...f, email: v }))} placeholder="your@email.com" required />
                   </div>
@@ -587,7 +658,8 @@ export function LandingPage({ plans = FALLBACK_PLANS }: { plans?: PublicPlan[] }
                 Your next offer<br /><span style={gradientText}>starts here</span>
               </div>
               <p style={{ fontSize: 14, color: C.textMuted, marginBottom: 36, lineHeight: 1.75 }}>
-                Join the job seekers who already landed their role with ApplyMate AI.<br />14 days free, cancel any time, no credit card required.
+                Join the job seekers who already landed their role with ApplyMate AI.<br />
+                {proTrialDays > 0 ? `${proTrialDays} days free on Pro, no credit card required.` : 'Start with the free plan and contact us when you are ready to upgrade.'}
               </p>
               <Link href="/register" className="btn-shine" style={{ display: 'inline-flex', alignItems: 'center', gap: 8, padding: '15px 40px', fontSize: 15, fontWeight: 700, background: 'linear-gradient(135deg, #4F46E5, #7C3AED)', color: '#fff', borderRadius: 14, textDecoration: 'none', boxShadow: '0 6px 30px rgba(79,70,229,0.58)', transition: 'all 0.22s' }}
                 onMouseEnter={e => { e.currentTarget.style.transform='translateY(-2px)'; e.currentTarget.style.boxShadow='0 10px 40px rgba(79,70,229,0.72)' }}
@@ -667,10 +739,10 @@ function FaqItem({ question, answer, open, onToggle }: { question: string; answe
   const [hov, setHov] = useState(false)
   return (
     <div
-      onClick={onToggle}
       onMouseEnter={() => setHov(true)}
       onMouseLeave={() => setHov(false)}
       style={{
+        width: '100%',
         background: open ? 'rgba(99,102,241,0.10)' : (hov ? 'rgba(255,255,255,0.07)' : 'rgba(255,255,255,0.04)'),
         backdropFilter: 'blur(16px)',
         border: `1px solid ${open ? 'rgba(99,102,241,0.35)' : (hov ? 'rgba(255,255,255,0.14)' : 'rgba(255,255,255,0.09)')}`,
@@ -678,12 +750,18 @@ function FaqItem({ question, answer, open, onToggle }: { question: string; answe
         cursor: 'pointer',
         transition: 'all 0.2s ease',
       }}>
-      <div style={{ padding: '18px 22px', display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 16 }}>
+      <button
+        type="button"
+        aria-expanded={open}
+        aria-controls={`faq-answer-${question.slice(0, 12).replace(/\W+/g, '-').toLowerCase()}`}
+        onClick={onToggle}
+        style={{ width: '100%', padding: '18px 22px', display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 16, textAlign: 'left', font: 'inherit', color: 'inherit', background: 'transparent', border: 'none', cursor: 'pointer' }}
+      >
         <span style={{ fontSize: 14, fontWeight: 600, color: open ? '#fff' : 'rgba(255,255,255,0.85)', flex: 1 }}>{question}</span>
         <span style={{ fontSize: 18, color: open ? '#818CF8' : C.textMuted, flexShrink: 0, transition: 'transform 0.25s', transform: open ? 'rotate(45deg)' : 'none' }}>+</span>
-      </div>
+      </button>
       <div style={{ maxHeight: open ? '200px' : '0', overflow: 'hidden', transition: 'max-height 0.35s ease' }}>
-        <div style={{ padding: '0 22px 20px', fontSize: 13, color: C.textMuted, lineHeight: 1.80 }}>{answer}</div>
+        <div id={`faq-answer-${question.slice(0, 12).replace(/\W+/g, '-').toLowerCase()}`} style={{ padding: '0 22px 20px', fontSize: 13, color: C.textMuted, lineHeight: 1.80 }}>{answer}</div>
       </div>
     </div>
   )

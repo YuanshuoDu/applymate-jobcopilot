@@ -4,6 +4,7 @@ import React, { useState, useEffect } from 'react'
 import { signIn, signOut, getProviders } from 'next-auth/react'
 import { useRouter, useSearchParams } from 'next/navigation'
 import Link from 'next/link'
+import { authLink, safeCallbackUrl } from '@/lib/auth-callback'
 
 // ── Design tokens ─────────────────────────────────────────────────────────────
 const C = {
@@ -109,17 +110,7 @@ function mapOAuthError(err: string): string {
   return MAP[err] ?? `Sign-in error: ${err}`
 }
 
-export function safeCallbackUrl(value: string | null): string {
-  if (!value || !value.startsWith('/')) return '/'
-  try {
-    const base = 'https://applymate.invalid'
-    const parsed = new URL(value, base)
-    if (parsed.origin !== base) return '/'
-    return `${parsed.pathname}${parsed.search}${parsed.hash}`
-  } catch {
-    return '/'
-  }
-}
+export { safeCallbackUrl } from '@/lib/auth-callback'
 
 export function LoginPage({ switchAccount = false }: { switchAccount?: boolean }) {
   const router       = useRouter()
@@ -266,7 +257,7 @@ export function LoginPage({ switchAccount = false }: { switchAccount?: boolean }
             <h2 style={{ fontSize:22, fontWeight:800, color:C.text, marginBottom:6, letterSpacing:'-0.02em' }}>Welcome back 👋</h2>
             <p style={{ fontSize:13, color:C.muted }}>
               Don&apos;t have an account?{' '}
-              <Link href="/register" style={{
+              <Link href={authLink('/register', callbackUrl)} style={{
                 color:C.primary, textDecoration:'none', fontWeight:600,
                 background:'linear-gradient(135deg, #4F46E5, #7C3AED)',
                 WebkitBackgroundClip:'text', WebkitTextFillColor:'transparent', backgroundClip:'text',

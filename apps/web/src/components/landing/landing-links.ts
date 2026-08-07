@@ -1,7 +1,23 @@
+import { authLink } from '@/lib/auth-callback'
+
 export type LandingLink = {
   label: string
   href: string
   external?: boolean
+}
+
+export type LandingFeaturePage = 'resume' | 'jobs' | 'gmail' | 'agent' | 'search'
+
+export function landingFeatureHref(page: LandingFeaturePage): string {
+  return authLink('/register', `/?page=${page}`)
+}
+
+export type LandingPlanAction = { href: '/register' | '#contact'; message?: string }
+
+export function landingPlanAction(key: string): LandingPlanAction {
+  if (key === 'pro') return { href: '#contact', message: 'I would like to start the Pro free trial.' }
+  if (key === 'enterprise') return { href: '#contact', message: 'I would like to discuss a Team plan for my organisation.' }
+  return { href: '/register' }
 }
 
 export const SOCIAL_LINKS: LandingLink[] = [

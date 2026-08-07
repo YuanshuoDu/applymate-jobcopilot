@@ -4,6 +4,7 @@ import React, { useEffect, useState } from 'react'
 import { getProviders, signIn } from 'next-auth/react'
 import { useRouter } from 'next/navigation'
 import Link from 'next/link'
+import { authLink, safeCallbackUrl } from '@/lib/auth-callback'
 
 // ── Design tokens (identical to LoginPage) ────────────────────────────────────
 const C = {
@@ -82,8 +83,9 @@ function PasswordStrength({ password }: { password: string }) {
   )
 }
 
-export function RegisterPage() {
+export function RegisterPage({ callbackUrl: rawCallbackUrl = '/' }: { callbackUrl?: string }) {
   const router = useRouter()
+  const callbackUrl = safeCallbackUrl(rawCallbackUrl)
   const [name,     setName]     = useState('')
   const [email,    setEmail]    = useState('')
   const [password, setPassword] = useState('')
@@ -128,8 +130,8 @@ export function RegisterPage() {
       }
       const login = await signIn('credentials', { email, password, redirect: false })
       setLoading(null)
-      if (login?.error) { router.push('/login') }
-      else { setStep('success'); setTimeout(() => { router.push('/'); router.refresh() }, 1800) }
+      if (login?.error) { router.push(authLink('/login', callbackUrl)) }
+      else { setStep('success'); setTimeout(() => { router.push(callbackUrl); router.refresh() }, 1800) }
     } catch {
       setLoading(null)
       setError('Network error. Please try again')
@@ -142,7 +144,7 @@ export function RegisterPage() {
       return
     }
     setLoading('google')
-    await signIn('google', { callbackUrl: '/' })
+    await signIn('google', { callbackUrl })
   }
 
   // ── Success screen ────────────────────────────────────────────────────────────
@@ -273,7 +275,7 @@ export function RegisterPage() {
             <h2 style={{ fontSize: 22, fontWeight: 800, color: C.text, marginBottom: 6, letterSpacing: '-0.02em' }}>Create your account 👋</h2>
             <p style={{ fontSize: 13, color: C.muted }}>
               Already have an account?{' '}
-              <Link href="/login" style={{
+              <Link href={authLink('/login', callbackUrl)} style={{
                 color: C.primary, textDecoration: 'none', fontWeight: 600,
                 background: 'linear-gradient(135deg, #4F46E5, #7C3AED)',
                 WebkitBackgroundClip: 'text', WebkitTextFillColor: 'transparent', backgroundClip: 'text',
@@ -381,9 +383,9 @@ export function RegisterPage() {
             {/* Terms */}
             <p style={{ fontSize: 11, color: C.muted, lineHeight: 1.6, margin: 0 }}>
               By signing up, you agree to our{' '}
-              <a href="#" style={{ color: C.primary, textDecoration: 'none', fontWeight: 500 }}>Terms of Service</a>
+              <a href="mailto:legal@applymate.ai?subject=Terms%20of%20service" style={{ color: C.primary, textDecoration: 'none', fontWeight: 500 }}>Terms of Service</a>
               {' '}and{' '}
-              <a href="#" style={{ color: C.primary, textDecoration: 'none', fontWeight: 500 }}>Privacy Policy</a>
+              <a href="mailto:legal@applymate.ai?subject=Privacy%20policy" style={{ color: C.primary, textDecoration: 'none', fontWeight: 500 }}>Privacy Policy</a>
             </p>
 
             {/* Submit */}
