@@ -3,8 +3,10 @@
  * PATCH /api/agent  — update agent config
  */
 import { NextRequest } from 'next/server'
+import type { Prisma } from '@prisma/client'
 import { db } from '@/lib/db'
 import { requireAuth, isErrorResponse, ok, err } from '@/lib/api-helpers'
+import { mergeUserPreferences, readNotificationPreferences } from '@/lib/settings-preferences'
 
 const DEFAULTS = {
   isRunning:         false,
@@ -90,9 +92,21 @@ export async function GET() {
   const auth = await requireAuth()
   if (isErrorResponse(auth)) return auth
 
-  const config = await db.agentConfig.findUnique({ where: { userId: auth.userId } })
+  const [config, user] = await Promise.all([
+    db.agentConfig.findUnique({ where: { userId: auth.userId } }),
+    db.user.findUnique({ where: { id: auth.userId }, select: { preferences: true } }),
+  ])
+  const notificationPreferences = readNotificationPreferences(user?.preferences)
 
-  return ok(config ?? DEFAULTS)
+  return ok({
+    ...(config ?? DEFAULTS),
+    // User.preferences is the canonical delivery setting. The AgentConfig
+    // fields remain in the response for older clients and exports.
+    notifyApply: notificationPreferences.apply,
+    notifyReject: notificationPreferences.reject,
+    weeklySummary: notificationPreferences.weekly,
+    followUpReminder: notificationPreferences.followUp,
+  })
 }
 
 export async function PATCH(req: NextRequest) {
@@ -108,6 +122,25 @@ export async function PATCH(req: NextRequest) {
     update: parsed.data,
     create: { userId: auth.userId, ...DEFAULTS, ...parsed.data },
   })
+
+  const notificationFields = ['notifyApply', 'notifyReject', 'weeklySummary', 'followUpReminder'] as const
+  if (notificationFields.some(field => field in parsed.data)) {
+    const current = await db.user.findUnique({ where: { id: auth.userId }, select: { preferences: true } })
+    if (!current) return err('User not found', 404)
+    const currentNotifications = readNotificationPreferences(current.preferences)
+    const preferences = mergeUserPreferences(current.preferences, {
+      notificationPreferences: {
+        apply: parsed.data.notifyApply ?? currentNotifications.apply,
+        reject: parsed.data.notifyReject ?? currentNotifications.reject,
+        weekly: parsed.data.weeklySummary ?? currentNotifications.weekly,
+        followUp: parsed.data.followUpReminder ?? currentNotifications.followUp,
+      },
+    })
+    await db.user.update({
+      where: { id: auth.userId },
+      data: { preferences: preferences as Prisma.InputJsonValue },
+    })
+  }
 
   return ok(config)
 }

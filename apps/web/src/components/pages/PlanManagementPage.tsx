@@ -1,6 +1,6 @@
 'use client'
 
-import { useEffect, useMemo, useState } from 'react'
+import React, { useEffect, useMemo, useState } from 'react'
 import Link from 'next/link'
 import { Save, ShieldAlert } from 'lucide-react'
 import { TopBar } from '@/components/layout/TopBar'
@@ -14,6 +14,11 @@ const INTERVALS: BillingInterval[] = ['forever', 'month', 'year']
 
 function updatePlan(plans: PlanCatalogueRecord[], key: PlanKey, patch: Partial<PlanCatalogueRecord>) {
   return plans.map(plan => plan.key === key ? { ...plan, ...patch } : plan)
+}
+
+function priceLabel(plan: PlanCatalogueRecord): string {
+  const period = plan.interval === 'forever' ? 'one-time' : `per ${plan.interval}`
+  return `Price (${plan.currency} ${period})`
 }
 
 export function PlanManagementPage() {
@@ -30,7 +35,11 @@ export function PlanManagementPage() {
     setSelectedKey(current => data.plans.some(plan => plan.key === current) ? current : data.plans[0]?.key ?? 'free')
   }, [data])
 
-  const selected = useMemo(() => plans.find(plan => plan.key === selectedKey) ?? null, [plans, selectedKey])
+  const availablePlans = useMemo(
+    () => plans.length ? plans : data?.plans ?? [],
+    [data?.plans, plans],
+  )
+  const selected = useMemo(() => availablePlans.find(plan => plan.key === selectedKey) ?? null, [availablePlans, selectedKey])
 
   function patchSelected(patch: Partial<PlanCatalogueRecord>) {
     setSaved(false)
@@ -68,11 +77,11 @@ export function PlanManagementPage() {
             {error ?? saveError}
           </Card>
         )}
-        {plans.length > 0 && selected && (
+        {availablePlans.length > 0 && selected && (
           <>
             <Card style={{ padding: 16 }}>
               <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
-                {plans.map(plan => (
+                {availablePlans.map(plan => (
                   <button key={plan.key} type="button" onClick={() => setSelectedKey(plan.key)} style={{ border: `1px solid ${plan.key === selectedKey ? 'var(--primary)' : 'var(--border)'}`, background: plan.key === selectedKey ? 'rgba(79,70,229,0.08)' : 'var(--bg)', color: 'var(--text)', borderRadius: 8, padding: '8px 12px', cursor: 'pointer', fontSize: 12 }}>
                     {plan.name}
                   </button>
@@ -83,8 +92,10 @@ export function PlanManagementPage() {
             <Card style={{ padding: 20 }}>
               <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(220px, 1fr))', gap: 14 }}>
                 <label style={{ fontSize: 12, color: 'var(--text-muted)' }}>Display name<input value={selected.name} onChange={event => patchSelected({ name: event.target.value })} style={inputStyle} /></label>
-                <label style={{ fontSize: 12, color: 'var(--text-muted)' }}>Price (EUR / month)<input type="number" min="0" step="0.01" value={selected.priceMinor / 100} onChange={event => patchSelected({ priceMinor: Math.max(0, Math.round(Number(event.target.value || 0) * 100)) })} style={inputStyle} /></label>
+                <label style={{ fontSize: 12, color: 'var(--text-muted)' }}>{priceLabel(selected)}<input type="number" min="0" step="0.01" value={selected.priceMinor / 100} onChange={event => patchSelected({ priceMinor: Math.max(0, Math.round(Number(event.target.value || 0) * 100)) })} style={inputStyle} /></label>
+                <label style={{ fontSize: 12, color: 'var(--text-muted)' }}>Currency<input value={selected.currency} maxLength={3} onChange={event => patchSelected({ currency: event.target.value.toUpperCase().replace(/[^A-Z]/g, '').slice(0, 3) })} style={inputStyle} /></label>
                 <label style={{ fontSize: 12, color: 'var(--text-muted)' }}>Billing interval<select value={selected.interval} onChange={event => patchSelected({ interval: event.target.value as BillingInterval })} style={inputStyle}>{INTERVALS.map(interval => <option key={interval} value={interval}>{interval}</option>)}</select></label>
+                <label style={{ fontSize: 12, color: 'var(--text-muted)' }}>Display order<input type="number" min="0" max="1000" step="1" value={selected.sortOrder} onChange={event => patchSelected({ sortOrder: Math.max(0, Math.min(1000, Math.trunc(Number(event.target.value || 0)))) })} style={inputStyle} /></label>
                 <label style={{ fontSize: 12, color: 'var(--text-muted)' }}>Trial days<input type="number" min="0" max="365" value={selected.trialDays} onChange={event => patchSelected({ trialDays: Math.max(0, Math.min(365, Number(event.target.value || 0))) })} style={inputStyle} /></label>
                 <label style={{ fontSize: 12, color: 'var(--text-muted)' }}>Badge<input value={selected.badge ?? ''} onChange={event => patchSelected({ badge: event.target.value || null })} style={inputStyle} /></label>
                 <label style={{ fontSize: 12, color: 'var(--text-muted)' }}>Call to action<input value={selected.cta} onChange={event => patchSelected({ cta: event.target.value })} style={inputStyle} /></label>

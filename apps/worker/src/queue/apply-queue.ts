@@ -23,6 +23,7 @@ import { runPersonioFlow } from '../flows/personio-flow.js'
 import { runSmartRecruitersFlow } from '../flows/smartrecruiters-flow.js'
 import { createNotification } from "../notifications/create-notification.js";
 import { notifyApplyResult } from "../notifications/notify-apply-result.js";
+import { purgeTemporaryGeneratedCoverLetters } from "../notifications/purge-cover-letters.js";
 import { shouldUsePattern } from "../patterns/confidence.js";
 import { replayPattern } from "../patterns/replay.js";
 import { unlinkSync } from "node:fs";
@@ -311,6 +312,13 @@ export const applyWorker = new Worker<ApplyTaskPayload>(
         const newJobStatus = isSubmitted ? 'applied' : 'saved';
         const newWorkflowState = isSubmitted ? 'submitted' : 'ready_to_apply';
 
+        if (isSubmitted) {
+          await purgeTemporaryGeneratedCoverLetters(userId, jobId).catch((error: Error) =>
+            console.warn('[apply-worker] Could not apply cover-letter retention policy:', error.message)
+          )
+        }
+        // Keep the durable job-state write last in this block. The retention
+        // cleanup is best-effort and must not obscure the submission outcome.
         await getPool().query(
           'UPDATE "Job" SET status = $1, "workflowState" = $2, "appliedAt" = CASE WHEN $1 = \'applied\' THEN NOW() ELSE "appliedAt" END, "updatedAt" = NOW() WHERE id = $3 AND "userId" = $4',
           [newJobStatus, newWorkflowState, jobId, userId]

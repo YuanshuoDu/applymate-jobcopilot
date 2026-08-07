@@ -1,6 +1,8 @@
 import { NextRequest } from "next/server";
-import { ok } from "@/lib/api-helpers";
+import { isErrorResponse, ok } from "@/lib/api-helpers";
+import { requireSettingsAdmin } from "@/lib/admin/settings-access";
 import { db } from "@/lib/db";
+import { PRIVACY_CAPABILITIES } from "@/lib/privacy-consent";
 
 type OverallRow = {
   total: number | null;
@@ -21,6 +23,9 @@ type AtsRow = {
 };
 
 export async function GET(_req: NextRequest) {
+  const actor = await requireSettingsAdmin(_req)
+  if (isErrorResponse(actor)) return actor
+
   const overallRows = await db.$queryRaw`
     SELECT
       COUNT(*)::int AS total,
@@ -40,7 +45,13 @@ export async function GET(_req: NextRequest) {
         )::float,
         0
       ) AS "last24hSuccessRate"
-    FROM apply_results
+    FROM apply_results ar
+    LEFT JOIN "User" u ON u.id = ar.user_id
+    WHERE CASE
+      WHEN u.preferences->'privacyPreferences'->>'shareUsageData' IN ('true', 'false')
+        THEN (u.preferences->'privacyPreferences'->>'shareUsageData')::boolean
+      ELSE true
+    END
   ` as OverallRow[];
 
   const byAtsRows = await db.$queryRaw`
@@ -51,7 +62,13 @@ export async function GET(_req: NextRequest) {
         ROUND(100.0 * COUNT(*) FILTER (WHERE status='submitted') / NULLIF(COUNT(*),0), 1)::float,
         0
       ) AS "successRate"
-    FROM apply_results
+    FROM apply_results ar
+    LEFT JOIN "User" u ON u.id = ar.user_id
+    WHERE CASE
+      WHEN u.preferences->'privacyPreferences'->>'shareUsageData' IN ('true', 'false')
+        THEN (u.preferences->'privacyPreferences'->>'shareUsageData')::boolean
+      ELSE true
+    END
     GROUP BY ats_type
     ORDER BY count DESC
   ` as AtsRow[];
@@ -73,7 +90,7 @@ export async function GET(_req: NextRequest) {
   const llm = Number(row.llm ?? 0);
   const captchaErrors = Number(row.captchaErrors ?? 0);
 
-  return ok({
+  const response = ok({
     overall: {
       total,
       successRate: Number(row.successRate ?? 0),
@@ -96,5 +113,9 @@ export async function GET(_req: NextRequest) {
       count: Number(ats.count ?? 0),
       successRate: Number(ats.successRate ?? 0),
     })),
+    privacy: PRIVACY_CAPABILITIES,
   });
+  response.headers.set("Cache-Control", "no-store");
+  response.headers.set("x-request-id", crypto.randomUUID());
+  return response;
 }

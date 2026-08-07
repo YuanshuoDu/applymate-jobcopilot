@@ -7,6 +7,7 @@
 import { NextRequest } from 'next/server'
 import { requireAuth, isErrorResponse, ok, err } from '@/lib/api-helpers'
 import { truncate } from '@/lib/utils'
+import { DISCOVERY_KEY_ERROR_MESSAGES, getDiscoveryApiKeys } from '@/lib/discovery-api-keys'
 
 const HOST      = 'linkedin-job-search-api.p.rapidapi.com'
 const PAGE_SIZE = 20
@@ -82,8 +83,8 @@ export async function GET(req: NextRequest) {
   const auth = await requireAuth(req)
   if (isErrorResponse(auth)) return auth
 
-  const apiKey = process.env.RAPIDAPI_KEY
-  if (!apiKey) return err('RapidAPI key not configured. Add RAPIDAPI_KEY to .env.local.', 501)
+  const { rapidapiKey: apiKey } = await getDiscoveryApiKeys(auth.userId)
+  if (!apiKey) return err(DISCOVERY_KEY_ERROR_MESSAGES.rapidapi, 501)
 
   const sp         = req.nextUrl.searchParams
   const q          = sp.get('q')?.trim()

@@ -268,8 +268,9 @@ body {
     width: 100% !important;
     min-height: 0;
     flex-direction: row !important;
+    flex-wrap: wrap !important;
     gap: 4px !important;
-    overflow-x: auto !important;
+    overflow-x: visible !important;
     overflow-y: hidden !important;
     border-right: 0 !important;
     border-bottom: 1px solid var(--border) !important;
@@ -282,6 +283,7 @@ body {
     width: auto !important;
     flex: 0 0 auto;
     white-space: nowrap;
+    min-height: 34px;
   }
 
   .settings-content {

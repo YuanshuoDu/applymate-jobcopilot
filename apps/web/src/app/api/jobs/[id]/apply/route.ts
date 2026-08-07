@@ -6,6 +6,7 @@
 import { NextRequest }                          from 'next/server'
 import { db }                                    from '@/lib/db'
 import { requireAuth, isErrorResponse, ok, err } from '@/lib/api-helpers'
+import { purgeTemporaryGeneratedCoverLetters } from '@/lib/cover-letter-retention'
 
 export async function POST(
   req: NextRequest,
@@ -32,6 +33,7 @@ export async function POST(
       color:  '#059669',
     },
   })
+  await purgeTemporaryGeneratedCoverLetters(auth.userId, id).catch(() => undefined)
 
   return ok({ applied: true })
 }

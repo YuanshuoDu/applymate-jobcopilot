@@ -3,9 +3,10 @@
 import React, { useState, useEffect, useRef } from 'react'
 import { TopBar }           from '@/components/layout/TopBar'
 import { Btn, Card, useToast } from '@/components/ui'
-import type { AgentConfig, Activity } from '@/lib/types'
+import type { AgentConfig, Activity, NotificationPreferences, UserProfile } from '@/lib/types'
 import { useApi, apiMutate, fmtRelative } from '@/lib/hooks'
-import { MODEL_CATALOGUE, PROVIDER_LABELS, type AiConfig } from '@/lib/model-router'
+import { APPLYMATE_BACKING, MODEL_CATALOGUE, PROVIDER_LABELS, type AiConfig, type UserAiSettings } from '@/lib/model-router'
+import { readNotificationPreferences } from '@/lib/settings-preferences'
 
 // ── Stage definitions ─────────────────────────────────────────────────────────
 
@@ -281,16 +282,16 @@ function RunPanel({ onClose }: { onClose: () => void }) {
 
 // ── Sub-components (pure UI) ──────────────────────────────────────────────────
 
-function Toggle({ value, onChange, label, sub }: { value: boolean; onChange: (v: boolean) => void; label: string; sub?: string }) {
+function Toggle({ value, onChange, label, sub, disabled = false }: { value: boolean; onChange: (v: boolean) => void; label: string; sub?: string; disabled?: boolean }) {
   return (
     <div style={{ display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between', gap: 12, padding: '10px 0', borderBottom: '0.5px solid var(--border)' }}>
       <div>
         <div style={{ fontSize: 12, color: 'var(--text)' }}>{label}</div>
         {sub && <div style={{ fontSize: 10, color: 'var(--text-muted)', marginTop: 2 }}>{sub}</div>}
       </div>
-      <div onClick={() => onChange(!value)} style={{ width: 32, height: 18, borderRadius: 9, background: value ? 'var(--primary)' : 'var(--border)', cursor: 'pointer', position: 'relative', transition: 'background 0.2s', flexShrink: 0 }}>
+      <button type="button" role="switch" aria-label={label} aria-checked={value} disabled={disabled} onClick={() => onChange(!value)} style={{ width: 32, height: 18, border: 0, padding: 0, borderRadius: 9, background: value ? 'var(--primary)' : 'var(--border)', cursor: disabled ? 'not-allowed' : 'pointer', position: 'relative', transition: 'background 0.2s', flexShrink: 0, opacity: disabled ? 0.55 : 1 }}>
         <div style={{ width: 14, height: 14, borderRadius: '50%', background: '#fff', position: 'absolute', top: 2, left: value ? 16 : 2, transition: 'left 0.2s' }} />
-      </div>
+      </button>
     </div>
   )
 }
@@ -414,13 +415,15 @@ const DEFAULT_CFG: UiCfg = {
   followUpDays: 7,
   targetRoles: [], targetLocations: [], excludeCompanies: [], priorityCompanies: [],
   salaryMin: 55000, salaryMax: 90000,
-  aiProvider: 'anthropic', aiModel: 'claude-sonnet-5', aiApiKey: '',
+  aiProvider: APPLYMATE_BACKING.provider, aiModel: APPLYMATE_BACKING.model, aiApiKey: '',
 }
 
 export function AgentPage() {
   const toast = useToast()
 
   const { data: agentData, loading: agentLoading } = useApi<AgentConfig>('/api/agent')
+  const { data: profileData } = useApi<UserProfile>('/api/me')
+  const { data: aiData } = useApi<UserAiSettings>('/api/me/ai-config')
   const { data: activityData } = useApi<Activity[]>('/api/activity?limit=20')
 
   const [running,      setRunning]      = useState(false)
@@ -440,12 +443,27 @@ export function AgentPage() {
       autoCoverLetter:   (agentData as any).autoCoverLetter  ?? false,
       coverTone:         (agentData as any).coverTone        ?? 'professional',
       useTailoredCV:     (agentData as any).useTailoredCV    ?? false,
+      salaryMin:         agentData.salaryMin                  ?? 55000,
+      salaryMax:         agentData.salaryMax                  ?? 90000,
       targetRoles:       agentData.targetRoles               ?? [],
       targetLocations:   agentData.targetLocations           ?? [],
       excludeCompanies:  agentData.excludeCompanies          ?? [],
       priorityCompanies: (agentData as any).priorityCompanies ?? [],
+      ...(aiData ? (() => {
+        const configured = aiData.features?.agent ?? APPLYMATE_BACKING
+        return { aiProvider: configured.provider, aiModel: configured.model }
+      })() : {}),
+      ...(profileData?.preferences ? (() => {
+        const preferences = readNotificationPreferences(profileData.preferences)
+        return {
+          notifyApply: preferences.apply,
+          notifyReject: preferences.reject,
+          weeklySummary: preferences.weekly,
+          followUpReminder: preferences.followUp,
+        }
+      })() : {}),
     }))
-  }, [agentData])
+  }, [agentData, profileData, aiData])
 
   function set<K extends keyof UiCfg>(k: K, v: UiCfg[K]) {
     setCfg(c => ({ ...c, [k]: v }))
@@ -468,7 +486,7 @@ export function AgentPage() {
     setSaving(true)
 
     // Save agent config
-    const { error } = await apiMutate('/api/agent', 'PATCH', {
+    const { error: agentError } = await apiMutate('/api/agent', 'PATCH', {
       isRunning:         running,
       dailyLimit:        cfg.maxPerDay,
       minMatchScore:     cfg.minScore,
@@ -481,20 +499,48 @@ export function AgentPage() {
       autoCoverLetter:   cfg.autoCoverLetter,
       coverTone:         cfg.coverTone,
       useTailoredCV:     cfg.useTailoredCV,
+      salaryMin:         cfg.salaryMin,
+      salaryMax:         cfg.salaryMax,
+      // Compatibility mirror for older workers. The shared User preference
+      // below remains the source of truth for notification delivery.
+      notifyApply:       cfg.notifyApply,
+      notifyReject:      cfg.notifyReject,
+      weeklySummary:     cfg.weeklySummary,
+      followUpReminder:  cfg.followUpReminder,
+      followUpDays:      cfg.followUpDays,
       model:             `${cfg.aiProvider}/${cfg.aiModel}`,
     })
 
+    let preferencesError: string | null = null
+    if (!agentError) {
+      const notificationPreferences: NotificationPreferences = {
+        apply: cfg.notifyApply,
+        reject: cfg.notifyReject,
+        interview: readNotificationPreferences(profileData?.preferences).interview,
+        offer: readNotificationPreferences(profileData?.preferences).offer,
+        weekly: cfg.weeklySummary,
+        followUp: cfg.followUpReminder,
+      }
+      const result = await apiMutate('/api/me', 'PATCH', { preferences: { notificationPreferences } })
+      preferencesError = result.error
+    }
+
     // Save AI config to user preferences
-    if (!error && cfg.aiProvider && cfg.aiModel) {
+    let aiError: string | null = null
+    if (!agentError && cfg.aiProvider && cfg.aiModel) {
       const aiConfig: Partial<AiConfig> = {
         provider: cfg.aiProvider as AiConfig['provider'],
         model:    cfg.aiModel,
+        ...(cfg.aiProvider === 'custom' && aiData?.features?.agent?.apiBase
+          ? { apiBase: aiData.features.agent.apiBase }
+          : {}),
         ...(cfg.aiApiKey.trim() ? { apiKey: cfg.aiApiKey.trim() } : {}),
       }
-      await apiMutate('/api/me/ai-config', 'POST', aiConfig)
+      aiError = (await apiMutate('/api/me/ai-config', 'POST', aiConfig)).error
     }
 
     setSaving(false)
+    const error = agentError ?? preferencesError ?? aiError
     if (error) toast.error('Error', error)
     else       toast.success('Settings saved', 'Agent will use updated configuration')
   }
@@ -596,14 +642,14 @@ export function AgentPage() {
                   <button onClick={() => set('maxPerDay', Math.min(50, cfg.maxPerDay + 1))} style={{ width: 24, height: 24, borderRadius: 4, border: '0.5px solid var(--border)', background: 'var(--bg-secondary)', cursor: 'pointer', fontSize: 14 }}>+</button>
                 </div>
               </div>
-              <Toggle label="Skip if already processed today" sub="Deduplication across all sources" value={true} onChange={() => {}} />
+              <Toggle label="Skip if already processed today" sub="Deduplication is enforced by the server for every source" value={true} onChange={() => undefined} disabled />
             </ConfigCard>
           </div>
 
           <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
             <ConfigCard title="Application Agent Settings">
               <Toggle label="Auto-prepare when match ≥ min score" sub="Searches, scores, and prepares materials in parallel; it never submits a job." value={cfg.autoApply} onChange={v => set('autoApply', v)} />
-              <Toggle label="Review and final authorization" sub="Always required before a browser task starts. CAPTCHA, login, and MFA require your takeover." value={true} onChange={() => {}} />
+              <Toggle label="Review and final authorization" sub="Always required before a browser task starts. CAPTCHA, login, and MFA require your takeover." value={true} onChange={() => undefined} disabled />
               <Toggle label="Auto-generate cover letter" sub="AI writes a tailored cover letter per job" value={cfg.autoCoverLetter} onChange={v => set('autoCoverLetter', v)} />
               {cfg.autoCoverLetter && (
                 <div style={{ padding: '10px 0', borderBottom: '0.5px solid var(--border)', display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>

@@ -16,6 +16,7 @@ import { requireAuth, isErrorResponse, ok, err } from '@/lib/api-helpers'
 import { db } from '@/lib/db'
 import { truncate } from '@/lib/utils'
 import { enrichJob } from '@/lib/agent/enrich'
+import { getDiscoveryApiKeys } from '@/lib/discovery-api-keys'
 
 type Params = { params: Promise<{ id: string }> }
 
@@ -51,10 +52,8 @@ export async function POST(_req: NextRequest, { params }: Params) {
   const job = await db.job.findUnique({ where: { id } })
   if (!job || job.userId !== auth.userId) return err('Not found', 404)
 
-  const rapidKey   = process.env.RAPIDAPI_KEY   ?? ''
+  const { rapidapiKey: rapidKey, adzunaAppId: adzunaId, adzunaAppKey: adzunaKey } = await getDiscoveryApiKeys(auth.userId)
   const mantisKey  = process.env.MANTIKS_API_KEY ?? ''
-  const adzunaId   = process.env.ADZUNA_APP_ID   ?? ''
-  const adzunaKey  = process.env.ADZUNA_APP_KEY  ?? ''
 
   const result: EnrichmentResult = { sources: [] }
 

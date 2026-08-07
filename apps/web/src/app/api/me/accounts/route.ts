@@ -12,15 +12,32 @@ export async function GET() {
 
   const accounts = await db.account.findMany({
     where: { userId: auth.userId },
-    select: { provider: true, providerAccountId: true },
+    select: { provider: true, providerAccountId: true, scope: true },
   })
 
-  const connected = accounts.map(a => ({
-    provider: a.provider,
-    account:  a.providerAccountId,
-  }))
+  const connected = new Map<string, { provider: string; account: string; disconnectable?: boolean; legacy?: boolean }>()
+  for (const account of accounts) {
+    if (account.provider === 'gmail') {
+      connected.set(`gmail:${account.providerAccountId}`, {
+        provider: 'gmail', account: account.providerAccountId,
+      })
+      continue
+    }
+    if (account.provider === 'google' && account.scope?.includes('gmail')) {
+      const key = `gmail:${account.providerAccountId}`
+      if (!connected.has(key)) {
+        connected.set(key, {
+          provider: 'gmail', account: account.providerAccountId, disconnectable: false, legacy: true,
+        })
+      }
+      continue
+    }
+    connected.set(`${account.provider}:${account.providerAccountId}`, {
+      provider: account.provider, account: account.providerAccountId,
+    })
+  }
 
-  return ok({ accounts: connected })
+  return ok({ accounts: [...connected.values()] })
 }
 
 export async function DELETE(req: NextRequest) {
@@ -29,13 +46,19 @@ export async function DELETE(req: NextRequest) {
 
   const { provider } = await req.json().catch(() => ({}))
   if (!provider) return err('provider is required', 400)
-  if (provider === 'google') {
-    return err('Google sign-in identity cannot be disconnected from Gmail settings', 400)
+  if (provider !== 'gmail' && provider !== 'github') {
+    return err('Unsupported account provider', 400)
   }
-
-  await db.account.deleteMany({
-    where: { userId: auth.userId, provider },
-  })
+  if (provider === 'gmail') {
+    await db.account.deleteMany({
+      where: {
+        userId: auth.userId,
+        provider: 'gmail',
+      },
+    })
+  } else {
+    await db.account.deleteMany({ where: { userId: auth.userId, provider } })
+  }
 
   return ok({ disconnected: provider })
 }

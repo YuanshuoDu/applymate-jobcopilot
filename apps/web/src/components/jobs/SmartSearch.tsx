@@ -570,7 +570,7 @@ export function SmartSearch({ onJobSaved }: { onJobSaved?: () => void }) {
                 <div style={{ marginTop: 8, padding: '10px 16px', background: 'rgba(234,179,8,0.08)', border: '1px solid rgba(234,179,8,0.25)', borderRadius: 8, maxWidth: 340, textAlign: 'left' }}>
                   <div style={{ fontSize: 11, fontWeight: 600, color: '#b45309', marginBottom: 4 }}>⚠ 搜索 API 未配置</div>
                   <div style={{ fontSize: 11, color: 'var(--text-muted)', lineHeight: 1.6 }}>
-                    LinkedIn、Indeed、JSearch 等付费源需要 <code style={{ fontSize: 10, background: 'rgba(0,0,0,0.07)', padding: '1px 4px', borderRadius: 3 }}>RAPIDAPI_KEY</code> 环境变量。
+                    LinkedIn、Indeed、JSearch 等付费源需要 RapidAPI Key；可在 Settings → Keys &amp; connections 中保存，未保存时使用平台配置或免费来源。
                     当前仅 Remotive 等免费源可用。
                   </div>
                 </div>

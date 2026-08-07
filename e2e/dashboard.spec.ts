@@ -13,12 +13,12 @@ test("login -> dashboard -> search jobs -> save one -> saved list", async ({ app
   await page.getByPlaceholder(/Search jobs/).fill("Backend Engineer Dublin");
   await page.getByRole("button", { name: /^Search$/ }).click();
 
-  await expect(page.getByText("Acme Systems")).toBeVisible();
+  await expect(page.getByText("Acme Systems", { exact: true }).first()).toBeVisible();
   await page.getByTitle("Save to tracker").click();
   await expect(page.getByText("✓").first()).toBeVisible();
 
-  await app.goTo(/Jobs|职位/);
+  await app.goTo(/^(My Jobs|我的职位)(?: \d+)?$/);
   await page.getByPlaceholder("Search jobs…").fill("Acme");
-  await expect(page.getByText("Acme Systems")).toBeVisible();
+  await expect(page.getByText("Acme Systems", { exact: true }).last()).toBeVisible();
   await expect(page.getByText("Backend Engineer")).toBeVisible();
 });

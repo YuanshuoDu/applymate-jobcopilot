@@ -191,19 +191,30 @@ export interface Resume extends ResumeListItem {
 
 // ── Agent Config ───────────────────────────────────────────────────────────────
 export interface AgentConfig {
-  id:               string
-  userId:           string
-  isRunning:        boolean
-  dailyLimit:       number
-  minMatchScore:    number
-  autoApply:        boolean
-  requireApproval:  boolean
-  targetLocations:  string[]
-  targetRoles:      string[]
-  excludeCompanies: string[]
-  model:            string
-  createdAt:        string
-  updatedAt:        string
+  id?:               string
+  userId?:           string
+  isRunning:         boolean
+  dailyLimit:        number
+  minMatchScore:     number
+  autoApply:         boolean
+  requireApproval:   boolean
+  targetLocations:   string[]
+  targetRoles:       string[]
+  excludeCompanies:  string[]
+  priorityCompanies?: string[]
+  autoCoverLetter?:  boolean
+  coverTone?:        string
+  useTailoredCV?:    boolean
+  salaryMin?:        number
+  salaryMax?:        number
+  notifyApply?:      boolean
+  notifyReject?:     boolean
+  weeklySummary?:    boolean
+  followUpReminder?: boolean
+  followUpDays?:     number
+  model:             string
+  createdAt?:        string
+  updatedAt?:        string
 }
 
 // ── Dashboard API response ─────────────────────────────────────────────────────
@@ -293,6 +304,25 @@ export interface UserPreferences {
   salaryExpectation: string
   workAuthorization: string
   openToRelocation:  boolean
+  notificationPreferences?: NotificationPreferences
+  privacyPreferences?: PrivacyPreferences
+  dataDeletionRequestedAt?: string
+  dataDeletionRequestStatus?: 'requested' | 'processing' | 'completed' | 'cancelled'
+}
+
+export interface NotificationPreferences {
+  apply:     boolean
+  reject:    boolean
+  interview: boolean
+  offer:     boolean
+  weekly:    boolean
+  followUp:  boolean
+}
+
+export interface PrivacyPreferences {
+  shareUsageData:    boolean
+  allowAiTraining:   boolean
+  storeCoverLetters: boolean
 }
 
 // ── Pagination wrapper ─────────────────────────────────────────────────────────

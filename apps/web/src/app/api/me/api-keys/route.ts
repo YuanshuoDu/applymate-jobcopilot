@@ -7,7 +7,7 @@
 import { NextRequest } from 'next/server'
 import { requireAuth, isErrorResponse, ok, err } from '@/lib/api-helpers'
 import { db } from '@/lib/db'
-import { getDiscoveryApiKeys } from '@/lib/discovery-api-keys'
+import { getDiscoveryApiKeyStatus, getDiscoveryApiKeys } from '@/lib/discovery-api-keys'
 
 type ApiKeyPatch = {
   adzunaAppId?: string | null
@@ -16,12 +16,16 @@ type ApiKeyPatch = {
 }
 
 type ApiKeyTestRequest = { action?: 'test'; provider?: 'adzuna' | 'rapidapi' }
+const MAX_KEY_LENGTH = 4096
 
-function normalize(value: unknown): string | null | undefined {
-  if (value === null) return null
-  if (typeof value !== 'string') return undefined
+function normalize(value: unknown): { value?: string | null; error?: string } {
+  if (value === undefined) return { value: undefined }
+  if (value === null) return { value: null }
+  if (typeof value !== 'string') return { error: 'API keys must be strings or null' }
   const trimmed = value.trim()
-  return trimmed ? trimmed : undefined
+  if (!trimmed) return { value: undefined }
+  if (trimmed.length > MAX_KEY_LENGTH) return { error: 'API keys are too long' }
+  return { value: trimmed }
 }
 
 async function save(req: NextRequest) {
@@ -35,23 +39,23 @@ async function save(req: NextRequest) {
   const adzunaAppId = normalize(body.adzunaAppId)
   const adzunaAppKey = normalize(body.adzunaAppKey)
   const rapidapiKey = normalize(body.rapidapiKey)
+  if (adzunaAppId.error || adzunaAppKey.error || rapidapiKey.error) {
+    return err(adzunaAppId.error ?? adzunaAppKey.error ?? rapidapiKey.error ?? 'Invalid API key')
+  }
 
-  if (adzunaAppId !== undefined) data.adzunaAppId = adzunaAppId
-  if (adzunaAppKey !== undefined) data.adzunaAppKey = adzunaAppKey
-  if (rapidapiKey !== undefined) data.rapidapiKey = rapidapiKey
+  if (adzunaAppId.value !== undefined) data.adzunaAppId = adzunaAppId.value
+  if (adzunaAppKey.value !== undefined) data.adzunaAppKey = adzunaAppKey.value
+  if (rapidapiKey.value !== undefined) data.rapidapiKey = rapidapiKey.value
 
   if (Object.keys(data).length === 0) return err('No API keys provided')
 
-  const saved = await db.userApiKeys.upsert({
+  await db.userApiKeys.upsert({
     where:  { userId: auth.userId },
     create: { userId: auth.userId, ...data },
     update: data,
   })
 
-  return ok({
-    hasAdzuna:   Boolean(saved.adzunaAppId && saved.adzunaAppKey),
-    hasRapidapi: Boolean(saved.rapidapiKey),
-  })
+  return ok(await getDiscoveryApiKeyStatus(auth.userId))
 }
 
 async function testConnection(req: NextRequest, body: ApiKeyTestRequest) {
@@ -63,13 +67,14 @@ async function testConnection(req: NextRequest, body: ApiKeyTestRequest) {
   if (body.provider === 'adzuna') {
     if (!keys.adzunaAppId || !keys.adzunaAppKey) return err('Save both Adzuna credentials before testing')
     const params = new URLSearchParams({ app_id: keys.adzunaAppId, app_key: keys.adzunaAppKey, results_per_page: '1', what: 'software engineer' })
-    const response = await fetch(`https://api.adzuna.com/v1/api/jobs/gb/search/1?${params}`, { cache: 'no-store' }).catch(() => null)
+    const response = await fetch(`https://api.adzuna.com/v1/api/jobs/gb/search/1?${params}`, { cache: 'no-store', signal: AbortSignal.timeout(10_000) }).catch(() => null)
     if (!response?.ok) return err(`Adzuna rejected the credentials (${response?.status ?? 'network error'})`)
   } else {
     if (!keys.rapidapiKey) return err('Save your RapidAPI key before testing')
     const response = await fetch('https://jsearch.p.rapidapi.com/search?query=software%20engineer&page=1&num_pages=1', {
       headers: { 'X-RapidAPI-Key': keys.rapidapiKey, 'X-RapidAPI-Host': 'jsearch.p.rapidapi.com' },
       cache: 'no-store',
+      signal: AbortSignal.timeout(10_000),
     }).catch(() => null)
     if (!response?.ok) return err(`RapidAPI rejected the credentials (${response?.status ?? 'network error'})`)
   }
@@ -81,15 +86,7 @@ export async function GET(req: NextRequest) {
   const auth = await requireAuth(req)
   if (isErrorResponse(auth)) return auth
 
-  const keys = await db.userApiKeys.findUnique({
-    where:  { userId: auth.userId },
-    select: { adzunaAppId: true, adzunaAppKey: true, rapidapiKey: true },
-  })
-
-  return ok({
-    hasAdzuna:   Boolean(keys?.adzunaAppId && keys?.adzunaAppKey),
-    hasRapidapi: Boolean(keys?.rapidapiKey),
-  })
+  return ok(await getDiscoveryApiKeyStatus(auth.userId))
 }
 
 export async function PUT(req: NextRequest) {

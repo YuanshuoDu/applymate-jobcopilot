@@ -8,6 +8,10 @@
     {
       "path": "/api/gmail/sync/daily",
       "schedule": "15 8 * * *"
+    },
+    {
+      "path": "/api/notifications/daily",
+      "schedule": "30 8 * * *"
     }
   ]
 }

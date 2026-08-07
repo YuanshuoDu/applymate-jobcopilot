@@ -6,7 +6,6 @@ import { useSession, signOut } from 'next-auth/react'
 import { useRouter } from 'next/navigation'
 import { Bell } from 'lucide-react'
 import { Sidebar } from './Sidebar'
-import { ToastProvider } from '@/components/ui'
 import type { Page } from '@/lib/types'
 import { NavContext } from '@/lib/nav-context'
 import { OnboardingFlow } from '@/components/onboarding/OnboardingFlow'
@@ -371,9 +370,7 @@ export function AppShell() {
           margin: -2px -4px;
         }
       `}</style>
-      <ToastProvider>
       <NavContext.Provider value={navContextValue}>
-        {/* Onboarding sits inside ToastProvider so useToast works */}
         {needsOnboarding ? (
           <OnboardingFlow onComplete={() => setNeedsOnboarding(false)} />
         ) : (
@@ -431,7 +428,6 @@ export function AppShell() {
           </>
         )}
       </NavContext.Provider>
-    </ToastProvider>
     </>
   )
 }

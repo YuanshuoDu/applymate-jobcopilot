@@ -1,10 +1,16 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const mocks = vi.hoisted(() => ({
+  admin: vi.fn(),
   queryRaw: vi.fn(),
 }));
 
+vi.mock("@/lib/admin/settings-access", () => ({
+  requireSettingsAdmin: mocks.admin,
+}));
+
 vi.mock("@/lib/api-helpers", () => ({
+  isErrorResponse: (value: unknown) => value instanceof Response,
   ok: (data: unknown, status = 200) => Response.json(data, { status }),
 }));
 
@@ -19,7 +25,9 @@ function request() {
 describe("GET /api/admin/observability", () => {
   beforeEach(() => {
     vi.resetModules();
+    mocks.admin.mockReset();
     mocks.queryRaw.mockReset();
+    mocks.admin.mockResolvedValue({ userId: "admin_1", email: "admin@example.com" });
   });
 
   it("returns overall auto-apply health metrics and ATS breakdown", async () => {
@@ -68,6 +76,11 @@ describe("GET /api/admin/observability", () => {
         { atsType: "greenhouse", count: 50, successRate: 80 },
         { atsType: "lever", count: 20, successRate: 65 },
       ],
+      privacy: {
+        usageAnalytics: true,
+        aiTraining: false,
+        coverLetterRetention: true,
+      },
     });
     expect(mocks.queryRaw).toHaveBeenCalledTimes(2);
   });
@@ -111,6 +124,11 @@ describe("GET /api/admin/observability", () => {
         },
       },
       byAts: [],
+      privacy: {
+        usageAnalytics: true,
+        aiTraining: false,
+        coverLetterRetention: true,
+      },
     });
   });
 });
