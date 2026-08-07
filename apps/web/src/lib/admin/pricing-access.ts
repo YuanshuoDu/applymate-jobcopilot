@@ -1,9 +1,12 @@
 import type { NextRequest } from 'next/server'
-import { requireSettingsAdmin, type SettingsAdminActor } from './settings-access'
+import { requireAdmin, type AdminActor } from './authorization'
 
-export type PricingAdminActor = SettingsAdminActor
+export type PricingAdminActor = AdminActor
 
-/** Backward-compatible name for the shared deny-by-default admin guard. */
-export function requirePricingAdmin(req?: NextRequest): Promise<PricingAdminActor | Response> {
-  return requireSettingsAdmin(req)
+export function requirePricingReadAdmin(req?: NextRequest) {
+  return requireAdmin('billing.read', req)
+}
+
+export function requirePricingWriteAdmin(req?: NextRequest) {
+  return requireAdmin('billing.update', req)
 }

@@ -40,4 +40,17 @@ describe('PlanManagementPage', () => {
     expect(html).toContain('Display order')
     expect(html).toContain('value="42"')
   })
+
+  it('hides observability navigation from administrators without that permission', () => {
+    mocks.useApi.mockReturnValue({
+      data: { plans: [] },
+      loading: false,
+      error: null,
+      refetch: vi.fn(),
+    })
+
+    const html = renderToStaticMarkup(React.createElement(PlanManagementPage, { canViewObservability: false }))
+
+    expect(html).not.toContain('href="/admin/observability"')
+  })
 })

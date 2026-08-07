@@ -2,7 +2,7 @@ import React from 'react'
 import { renderToStaticMarkup } from 'react-dom/server'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
-const mocks = vi.hoisted(() => ({ useApi: vi.fn() }))
+const mocks = vi.hoisted(() => ({ useApi: vi.fn(), links: [] as string[] }))
 
 vi.mock('@/lib/hooks', () => ({ useApi: mocks.useApi }))
 vi.mock('@/components/layout/TopBar', () => ({
@@ -12,7 +12,7 @@ vi.mock('@/components/ui', () => ({
   Btn: ({ children }: { children?: React.ReactNode }) => React.createElement('button', null, children),
   Card: ({ children }: { children?: React.ReactNode }) => React.createElement('section', null, children),
 }))
-vi.mock('next/link', () => ({ default: ({ href, children }: { href: string; children?: React.ReactNode }) => React.createElement('a', { href }, children) }))
+vi.mock('next/link', () => ({ default: ({ href, children }: { href: string; children?: React.ReactNode }) => { mocks.links.push(href); return React.createElement('a', { href }, children) } }))
 vi.mock('lucide-react', () => ({ ExternalLink: () => null, RefreshCw: () => null }))
 
 import { ObservabilityPage } from './ObservabilityPage'
@@ -20,6 +20,7 @@ import { ObservabilityPage } from './ObservabilityPage'
 describe('ObservabilityPage', () => {
   beforeEach(() => {
     mocks.useApi.mockReset()
+    mocks.links.length = 0
   })
 
   it('reports the MiniMax default separately from optional provider health', () => {
@@ -48,5 +49,6 @@ describe('ObservabilityPage', () => {
     expect(html).not.toContain('ApplyMate AI · MiniMax · ready')
     expect(html).toContain('Operational applies')
     expect(html).toContain('All users · operational count')
+    expect(mocks.links).toContain('/admin/users')
   })
 })

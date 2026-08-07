@@ -1,13 +1,14 @@
 import { NextRequest } from 'next/server'
 import { db } from '@/lib/db'
-import { isErrorResponse, ok } from '@/lib/api-helpers'
-import { requireSettingsAdmin } from '@/lib/admin/settings-access'
+import { ok } from '@/lib/api-helpers'
+import { writeAdminAudit } from '@/lib/admin/audit'
+import { isAdminResponse, requireAdmin } from '@/lib/admin/authorization'
 import { platformIntegrationStatus } from '@/lib/admin/integration-status'
 
-function adminOk<T>(data: T) {
+function adminOk<T>(data: T, requestId: string) {
   const response = ok(data)
   response.headers.set('Cache-Control', 'no-store')
-  response.headers.set('x-request-id', crypto.randomUUID())
+  response.headers.set('x-request-id', requestId)
   return response
 }
 
@@ -30,9 +31,9 @@ async function deletionRequestCounts(): Promise<{ requested: number; processing:
   }
 }
 
-export async function GET(_req: NextRequest) {
-  const actor = await requireSettingsAdmin(_req)
-  if (isErrorResponse(actor)) return actor
+export async function GET(req: NextRequest) {
+  const actor = await requireAdmin('observability.read', req)
+  if (isAdminResponse(actor)) return actor
 
   const [total, plans, applies, deletionRequests] = await Promise.all([
     db.user.count(),
@@ -46,11 +47,13 @@ export async function GET(_req: NextRequest) {
     if (row.plan in byPlan) byPlan[row.plan as keyof typeof byPlan] = Number(row._count._all)
   }
 
+  await writeAdminAudit({ requestId: actor.requestId, actorUserId: actor.userId, actorRoleKey: actor.roleKey, action: 'platform.viewed', outcome: 'success' })
+
   return adminOk({
     users: { total: Number(total), byPlan },
     applies: { total: Number(applies) },
     deletionRequests,
     integrations: platformIntegrationStatus(),
     generatedAt: new Date().toISOString(),
-  })
+  }, actor.requestId)
 }

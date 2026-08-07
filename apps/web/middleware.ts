@@ -2,13 +2,13 @@ import { NextResponse } from 'next/server'
 import type { NextRequest } from 'next/server'
 import { jwtVerify } from 'jose'
 import { auth } from '@/lib/auth'
+import { getAuthJwtSecret } from '@/lib/auth-secret'
+import { applyAdminSecurityHeaders } from '@/lib/admin/http-security'
 
 const API_PROTECTED = ['/api/jobs', '/api/dashboard', '/api/resume', '/api/activity', '/api/agent', '/api/me']
 const PUBLIC_ROUTES = ['/login', '/register', '/forgot-password', '/reset-password', '/api/auth']
 
-const JWT_SECRET = new TextEncoder().encode(
-  process.env.AUTH_SECRET ?? 'fallback-secret-change-this',
-)
+const JWT_SECRET = getAuthJwtSecret()
 
 export async function middleware(req: NextRequest) {
   const { pathname } = req.nextUrl
@@ -16,6 +16,12 @@ export async function middleware(req: NextRequest) {
   // ── Allow public routes through ────────────────────────────
   if (PUBLIC_ROUTES.some(p => pathname.startsWith(p))) {
     return NextResponse.next()
+  }
+
+  // Route handlers own admin authorization so callers receive API-appropriate
+  // 401/403 responses. The middleware supplies defense-in-depth headers only.
+  if (pathname.startsWith('/api/admin/v1')) {
+    return applyAdminSecurityHeaders(NextResponse.next())
   }
 
   // ── API routes: check Bearer token ─────────────────────────
@@ -51,7 +57,9 @@ export async function middleware(req: NextRequest) {
     return NextResponse.redirect(loginUrl)
   }
 
-  return NextResponse.next()
+  return pathname === '/admin' || pathname.startsWith('/admin/')
+    ? applyAdminSecurityHeaders(NextResponse.next())
+    : NextResponse.next()
 }
 
 export const config = {

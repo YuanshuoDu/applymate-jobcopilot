@@ -1,41 +1,21 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 
-const mocks = vi.hoisted(() => ({ requireAuth: vi.fn(), userFindUnique: vi.fn() }))
-vi.mock('@/lib/api-helpers', () => ({
-  requireAuth: mocks.requireAuth,
-  isErrorResponse: (value: unknown) => value instanceof Response,
-  err: (message: string, status = 400) => Response.json({ error: message }, { status }),
+vi.mock('./integration-status', () => ({
+  userIntegrationStatus: () => ({
+    accounts: { gmail: false, github: false },
+    ai: { providers: {}, featureOverrides: 0, customConfigured: false },
+    discovery: { hasAdzuna: false, hasRapidapi: false, adzunaSource: null, rapidapiSource: null },
+  }),
 }))
-vi.mock('@/lib/db', () => ({ db: { user: { findUnique: mocks.userFindUnique } } }))
 
 import {
+  adminSettingsAuditSnapshot,
   canTransitionDeletionRequest,
   parseAdminSettingsPatch,
-  requireSettingsAdmin,
   toAdminSettingsDto,
 } from './settings-access'
 
 describe('admin settings access', () => {
-  beforeEach(() => {
-    vi.resetModules()
-    mocks.requireAuth.mockReset()
-    mocks.userFindUnique.mockReset()
-    process.env.ADMIN_EMAILS = 'admin@example.com'
-    delete process.env.ADMIN_USER_IDS
-    mocks.requireAuth.mockResolvedValue({ userId: 'admin_1' })
-    mocks.userFindUnique.mockResolvedValue({ id: 'admin_1', email: 'ADMIN@example.com' })
-  })
-
-  it('requires an explicitly allow-listed administrator', async () => {
-    await expect(requireSettingsAdmin(new Request('http://localhost/admin') as never)).resolves.toEqual({
-      userId: 'admin_1',
-      email: 'ADMIN@example.com',
-    })
-
-    mocks.userFindUnique.mockResolvedValue({ id: 'admin_1', email: 'other@example.com' })
-    await expect(requireSettingsAdmin(new Request('http://localhost/admin') as never)).resolves.toBeInstanceOf(Response)
-  })
-
   it('returns only masked settings metadata and never serializes secret fields', () => {
     const dto = toAdminSettingsDto({
       id: 'user_1', email: 'candidate@example.com', name: 'Candidate Name', plan: 'pro',
@@ -106,5 +86,21 @@ describe('admin settings access', () => {
     expect(parseAdminSettingsPatch({ dataDeletionRequestStatus: 'purged' })).toMatchObject({ error: expect.any(String) })
     expect(parseAdminSettingsPatch({ jobPreferences: { targetLocations: 'Berlin' } })).toMatchObject({ error: expect.any(String) })
     expect(parseAdminSettingsPatch({ aiSettings: { keys: { openai: 'secret' } } })).toMatchObject({ error: expect.any(String) })
+  })
+
+  it('creates an audit snapshot containing only editable preference state', () => {
+    const snapshot = adminSettingsAuditSnapshot({
+      notificationPreferences: { apply: false },
+      privacyPreferences: { shareUsageData: false },
+      dataDeletionRequestStatus: 'processing',
+      aiSettings: { keys: { openai: 'secret' } },
+    })
+
+    expect(snapshot).toEqual({
+      notificationPreferences: { apply: false, reject: true, interview: true, offer: true, weekly: false, followUp: true },
+      privacyPreferences: { shareUsageData: false, allowAiTraining: false, storeCoverLetters: true },
+      dataDeletionRequestStatus: 'processing',
+    })
+    expect(JSON.stringify(snapshot)).not.toContain('secret')
   })
 })

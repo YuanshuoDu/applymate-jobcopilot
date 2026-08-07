@@ -5,10 +5,9 @@ import { checkRateLimit } from '@/lib/rate-limit'
 import { APPLYMATE_BACKING, resolveConfig, resolveFeatureConfig, type UserAiSettings, type FeatureId } from '@/lib/model-router'
 import { db } from '@/lib/db'
 import { safeAuth } from '@/lib/safe-auth'
+import { getAuthJwtSecret } from '@/lib/auth-secret'
 
-const JWT_SECRET = new TextEncoder().encode(
-  process.env.AUTH_SECRET ?? 'fallback-secret-change-this',
-)
+const JWT_SECRET = getAuthJwtSecret()
 
 /** Get authenticated userId — supports both NextAuth session and Extension Bearer token */
 export async function requireAuth(

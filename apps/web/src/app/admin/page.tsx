@@ -1,6 +1,9 @@
 import { redirect } from 'next/navigation'
+import { AdminOverview } from '@/components/admin/AdminOverview'
+import { isAdminResponse, requireAdmin } from '@/lib/admin/authorization'
 
-/** Stable admin entry point; the API guard on the destination remains authoritative. */
-export default function AdminHomeRoute() {
-  redirect('/admin/observability')
+export default async function AdminPage() {
+  const actor = await requireAdmin('observability.read')
+  if (isAdminResponse(actor)) redirect('/login?callbackUrl=/admin')
+  return <AdminOverview permissions={actor.permissions} />
 }

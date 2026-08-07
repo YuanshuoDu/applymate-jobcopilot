@@ -1,6 +1,3 @@
-import type { NextRequest } from 'next/server'
-import { db } from '@/lib/db'
-import { err, isErrorResponse, requireAuth } from '@/lib/api-helpers'
 import {
   DEFAULT_NOTIFICATION_PREFERENCES,
   DEFAULT_PRIVACY_PREFERENCES,
@@ -8,11 +5,8 @@ import {
   readPrivacyPreferences,
   type SettingsPreferences,
 } from '@/lib/settings-preferences'
-import type { NotificationPreferences, PrivacyPreferences } from '@/lib/types'
-import type { UserPreferences } from '@/lib/types'
+import type { NotificationPreferences, PrivacyPreferences, UserPreferences } from '@/lib/types'
 import { userIntegrationStatus } from './integration-status'
-
-export type SettingsAdminActor = { userId: string; email: string }
 
 type StoredUser = Record<string, unknown>
 
@@ -30,28 +24,6 @@ export type AdminSettingsPatch = {
   notificationPreferences?: Partial<NotificationPreferences>
   privacyPreferences?: Partial<PrivacyPreferences>
   dataDeletionRequestStatus?: DeletionRequestStatus
-}
-
-function listEnvValues(value: string | undefined): string[] {
-  return (value ?? '').split(',').map(item => item.trim().toLowerCase()).filter(Boolean)
-}
-
-/** Admin access is deny-by-default and intentionally independent of candidate plan. */
-export async function requireSettingsAdmin(req?: NextRequest): Promise<SettingsAdminActor | Response> {
-  const auth = await requireAuth(req)
-  if (isErrorResponse(auth)) return auth
-
-  const user = await db.user.findUnique({
-    where: { id: auth.userId },
-    select: { id: true, email: true },
-  })
-  if (!user) return err('Admin identity not found', 403)
-
-  const allowedIds = listEnvValues(process.env.ADMIN_USER_IDS)
-  const allowedEmails = listEnvValues(process.env.ADMIN_EMAILS)
-  const allowed = allowedIds.includes(user.id.toLowerCase()) || allowedEmails.includes(user.email.toLowerCase())
-  if (!allowed) return err('Admin access denied', 403)
-  return { userId: user.id, email: user.email }
 }
 
 function maskEmail(email: string): string {
@@ -214,4 +186,23 @@ export function readAdminSettings(preferences: unknown): SettingsPreferences {
     notificationPreferences: readNotificationPreferences(input),
     privacyPreferences: readPrivacyPreferences(input),
   }
+}
+
+/** Values retained in an append-only admin audit record. No PII or credentials. */
+export function adminSettingsAuditSnapshot(preferences: unknown) {
+  const safe = readAdminSettings(preferences)
+  const current = asRecord(preferences)
+  const snapshot: {
+    notificationPreferences: NotificationPreferences
+    privacyPreferences: PrivacyPreferences
+    dataDeletionRequestStatus?: DeletionRequestStatus
+  } = {
+    notificationPreferences: safe.notificationPreferences,
+    privacyPreferences: safe.privacyPreferences,
+  }
+  const status = current.dataDeletionRequestStatus
+  if (typeof status === 'string' && DELETION_STATUSES.has(status as DeletionRequestStatus)) {
+    snapshot.dataDeletionRequestStatus = status as DeletionRequestStatus
+  }
+  return snapshot
 }

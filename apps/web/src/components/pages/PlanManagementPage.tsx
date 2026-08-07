@@ -21,7 +21,7 @@ function priceLabel(plan: PlanCatalogueRecord): string {
   return `Price (${plan.currency} ${period})`
 }
 
-export function PlanManagementPage() {
+export function PlanManagementPage({ canUpdate = true, canViewObservability = true }: { canUpdate?: boolean; canViewObservability?: boolean }) {
   const { data, loading, error, refetch } = useApi<PlansResponse>('/api/admin/v1/plans')
   const [plans, setPlans] = useState<PlanCatalogueRecord[]>([])
   const [selectedKey, setSelectedKey] = useState<PlanKey>('free')
@@ -65,7 +65,7 @@ export function PlanManagementPage() {
   return (
     <div style={{ height: '100%', overflowY: 'auto', background: 'var(--bg)' }}>
       <TopBar title="Plan management">
-        <Link href="/admin/observability" style={{ color: 'var(--text-muted)', fontSize: 12, textDecoration: 'none' }}>Observability</Link>
+        {canViewObservability && <Link href="/admin/observability" style={{ color: 'var(--text-muted)', fontSize: 12, textDecoration: 'none' }}>Observability</Link>}
         <Btn small variant="ghost" onClick={refetch}>Refresh</Btn>
       </TopBar>
 
@@ -104,7 +104,8 @@ export function PlanManagementPage() {
               <label style={{ display: 'block', marginTop: 14, fontSize: 12, color: 'var(--text-muted)' }}>Features (one per line)<textarea value={selected.features.join('\n')} onChange={event => patchSelected({ features: event.target.value.split('\n').map(item => item.trim()).filter(Boolean) })} rows={7} style={{ ...inputStyle, resize: 'vertical' }} /></label>
               <label style={{ display: 'flex', alignItems: 'center', gap: 8, marginTop: 14, fontSize: 12, color: 'var(--text)' }}><input type="checkbox" checked={selected.active} onChange={event => patchSelected({ active: event.target.checked })} /> Publicly active</label>
               <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginTop: 18 }}>
-                <Btn variant="primary" onClick={save} disabled={saving}><Save size={14} aria-hidden="true" />{saving ? 'Saving…' : 'Save plan'}</Btn>
+                <Btn variant="primary" onClick={save} disabled={saving || !canUpdate}><Save size={14} aria-hidden="true" />{saving ? 'Saving…' : 'Save plan'}</Btn>
+                {!canUpdate && <span style={{ color: 'var(--text-muted)', fontSize: 12 }}>You can view plans but do not have permission to edit them.</span>}
                 {saved && <span style={{ color: 'var(--c-success)', fontSize: 12 }}>Saved</span>}
               </div>
             </Card>

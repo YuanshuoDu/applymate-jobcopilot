@@ -1,0 +1,6 @@
+# Local build and recovery artifacts must never be uploaded by the CLI.
+.next/
+apps/*/.next-recovery-*/
+node_modules/
+.pnpm-store/
+.turbo/

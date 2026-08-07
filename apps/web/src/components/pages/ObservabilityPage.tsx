@@ -95,7 +95,7 @@ function flowLabel(key: string) {
 }
 
 export function ObservabilityPage() {
-  const { data, loading, error, refetch } = useApi<ObservabilityData>('/api/admin/observability', { cache: false })
+  const { data, loading, error, refetch } = useApi<ObservabilityData>('/api/admin/v1/observability', { cache: false })
   const { data: platform, loading: platformLoading, error: platformError, refetch: refetchPlatform } = useApi<PlatformData>('/api/admin/v1/platform', { cache: false })
   const overall = data?.overall
   const flowEntries = overall
@@ -108,9 +108,9 @@ export function ObservabilityPage() {
     <div style={{ height: '100%', overflowY: 'auto', background: 'var(--bg)' }}>
       <TopBar title="Observability">
         <Link href="/admin/plans" style={{ color: 'var(--text-muted)', fontSize: 12, textDecoration: 'none' }}>Manage plans</Link>
-        <a href="/admin/users" style={{ display: 'inline-flex', alignItems: 'center', gap: 5, fontSize: 11, color: 'var(--text-muted)', textDecoration: 'none' }}>
+        <Link href="/admin/users" style={{ display: 'inline-flex', alignItems: 'center', gap: 5, fontSize: 11, color: 'var(--text-muted)', textDecoration: 'none' }}>
           User settings <ExternalLink size={12} aria-hidden="true" />
-        </a>
+        </Link>
         <Btn small variant="ghost" onClick={refetch}>
           <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
             <RefreshCw size={13} aria-hidden="true" />

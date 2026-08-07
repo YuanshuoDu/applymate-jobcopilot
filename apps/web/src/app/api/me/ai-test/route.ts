@@ -9,7 +9,7 @@
 import { NextRequest } from 'next/server'
 import { requireAuth, isErrorResponse } from '@/lib/api-helpers'
 import { db } from '@/lib/db'
-import { checkRateLimit } from '@/lib/rate-limit'
+import { checkDistributedRateLimit } from '@/lib/distributed-rate-limit'
 import {
   APPLYMATE_BACKING,
   MODEL_CATALOGUE,
@@ -158,8 +158,11 @@ export async function POST(req: NextRequest) {
   // A successful probe can use a platform-backed model. Keep this narrower
   // than normal AI work while preventing repeated Settings clicks from
   // becoming an unbounded billable endpoint.
-  const rateLimit = checkRateLimit(`ai-test:${auth.userId}`, 3, 60_000)
+  const rateLimit = await checkDistributedRateLimit(`ai-test:${auth.userId}`, 3, 60_000)
   if (!rateLimit.ok) {
+    if (rateLimit.unavailable) {
+      return responseError('AI testing is temporarily unavailable. Please try again shortly.', 503, 'rate_limit_unavailable')
+    }
     return responseError(`Rate limit exceeded — retry in ${rateLimit.retryAfter}s`, 429, 'rate_limited')
   }
 

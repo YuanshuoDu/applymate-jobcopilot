@@ -6,14 +6,14 @@ const mocks = vi.hoisted(() => ({
   modelChat: vi.fn(),
   resolveConfig: vi.fn(),
   resolveFeatureConfig: vi.fn(),
-  checkRateLimit: vi.fn(),
+  checkDistributedRateLimit: vi.fn(),
 }))
 
 vi.mock('@/lib/api-helpers', () => ({
   requireAuth: mocks.requireAuth,
   isErrorResponse: (value: unknown) => value instanceof Response,
 }))
-vi.mock('@/lib/rate-limit', () => ({ checkRateLimit: mocks.checkRateLimit }))
+vi.mock('@/lib/distributed-rate-limit', () => ({ checkDistributedRateLimit: mocks.checkDistributedRateLimit }))
 vi.mock('@/lib/db', () => ({ db: { user: { findUnique: mocks.findUnique } } }))
 vi.mock('@/lib/model-router', () => ({
   MODEL_CATALOGUE: [
@@ -40,7 +40,7 @@ describe('POST /api/me/ai-test', () => {
       provider: 'openai', model: 'gpt-5.5', apiBase: 'https://api.openai.com/v1', resolvedKey: 'saved-key',
     })
     mocks.modelChat.mockResolvedValue({ text: 'ok', provider: 'openai', model: 'gpt-5.5' })
-    mocks.checkRateLimit.mockReturnValue({ ok: true })
+    mocks.checkDistributedRateLimit.mockResolvedValue({ ok: true })
   })
 
   it('uses the saved feature-specific key when testing a feature', async () => {
@@ -78,7 +78,7 @@ describe('POST /api/me/ai-test', () => {
   })
 
   it('rate limits platform-backed probes before calling a provider', async () => {
-    mocks.checkRateLimit.mockReturnValue({ ok: false, retryAfter: 42 })
+    mocks.checkDistributedRateLimit.mockResolvedValue({ ok: false, retryAfter: 42 })
     mocks.resolveConfig.mockReturnValueOnce({
       provider: 'openai', model: 'gpt-5.5', apiBase: 'https://api.openai.com/v1', resolvedKey: 'platform-key',
     })
@@ -92,7 +92,22 @@ describe('POST /api/me/ai-test', () => {
 
     expect(response.status).toBe(429)
     await expect(response.json()).resolves.toMatchObject({ ok: false, code: 'rate_limited' })
-    expect(mocks.checkRateLimit).toHaveBeenCalledWith('ai-test:user_1', 3, 60_000)
+    expect(mocks.checkDistributedRateLimit).toHaveBeenCalledWith('ai-test:user_1', 3, 60_000)
+    expect(mocks.modelChat).not.toHaveBeenCalled()
+  })
+
+  it('fails closed when the shared rate limiter is unavailable', async () => {
+    mocks.checkDistributedRateLimit.mockResolvedValue({ ok: false, retryAfter: 60, unavailable: true })
+    const { POST } = await import('./route')
+
+    const response = await POST(new Request('http://localhost/api/me/ai-test', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ provider: 'openai', model: 'gpt-5.5', apiKey: 'secret' }),
+    }) as never)
+
+    expect(response.status).toBe(503)
+    await expect(response.json()).resolves.toMatchObject({ ok: false, code: 'rate_limit_unavailable' })
     expect(mocks.modelChat).not.toHaveBeenCalled()
   })
 

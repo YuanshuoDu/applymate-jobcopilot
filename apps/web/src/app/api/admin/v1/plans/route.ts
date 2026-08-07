@@ -1,7 +1,11 @@
 import type { NextRequest } from 'next/server'
 import { db } from '@/lib/db'
-import { err, isErrorResponse, ok } from '@/lib/api-helpers'
-import { requirePricingAdmin } from '@/lib/admin/pricing-access'
+import { err, ok } from '@/lib/api-helpers'
+import { writeAdminAudit } from '@/lib/admin/audit'
+import { isAdminResponse } from '@/lib/admin/authorization'
+import { validateAdminWrite } from '@/lib/admin/csrf'
+import { requirePricingReadAdmin, requirePricingWriteAdmin } from '@/lib/admin/pricing-access'
+import { runAdminMutation } from '@/lib/admin/write-transaction'
 import { getAdminPlans } from '@/lib/plan-catalogue'
 import { BILLING_INTERVALS, PLAN_KEYS, type BillingInterval, type PlanCatalogueRecord, type PlanKey } from '@/lib/plan-catalogue-shared'
 
@@ -79,16 +83,20 @@ function upsertData(plan: PlanCatalogueRecord) {
 }
 
 export async function GET(req: NextRequest) {
-  const actor = await requirePricingAdmin(req)
-  if (isErrorResponse(actor)) return actor
+  const actor = await requirePricingReadAdmin(req)
+  if (isAdminResponse(actor)) return actor
   const response = ok({ plans: await getAdminPlans() })
   response.headers.set('Cache-Control', 'no-store')
+  response.headers.set('x-request-id', actor.requestId)
+  await writeAdminAudit({ requestId: actor.requestId, actorUserId: actor.userId, actorRoleKey: actor.roleKey, action: 'plans.catalogue_viewed', outcome: 'success' })
   return response
 }
 
 export async function PATCH(req: NextRequest) {
-  const actor = await requirePricingAdmin(req)
-  if (isErrorResponse(actor)) return actor
+  const actor = await requirePricingWriteAdmin(req)
+  if (isAdminResponse(actor)) return actor
+  const writeError = validateAdminWrite(req)
+  if (writeError) return writeError
 
   const body = await req.json().catch(() => null)
   const input = asRecord(body)
@@ -109,13 +117,34 @@ export async function PATCH(req: NextRequest) {
   const free = nextPlans.find(plan => plan.key === 'free')
   if (!free?.active) return err('Free plan must remain active')
 
-  await db.$transaction(nextPlans.map(plan => db.planCatalogue.upsert({
-    where: { plan: plan.key },
-    update: upsertData(plan),
-    create: upsertData(plan),
-  })))
+  const mutation = await runAdminMutation({
+    actorUserId: actor.userId,
+    action: 'plans.catalogue_updated',
+    idempotencyKey: req.headers.get('idempotency-key') as string,
+    audit: {
+      requestId: actor.requestId,
+      actorRoleKey: actor.roleKey,
+      outcome: 'success',
+      before: current,
+      after: nextPlans,
+    },
+    mutate: (tx) => Promise.all(nextPlans.map(plan => tx.planCatalogue.upsert({
+      where: { plan: plan.key },
+      update: upsertData(plan),
+      create: upsertData(plan),
+    }))),
+  })
 
-  const response = ok({ plans: await getAdminPlans() })
+  if (mutation.duplicate) {
+    const response = ok({ duplicate: true })
+    response.headers.set('Cache-Control', 'no-store')
+    response.headers.set('x-request-id', actor.requestId)
+    return response
+  }
+
+  const plans = await getAdminPlans()
+  const response = ok({ plans })
   response.headers.set('Cache-Control', 'no-store')
+  response.headers.set('x-request-id', actor.requestId)
   return response
 }

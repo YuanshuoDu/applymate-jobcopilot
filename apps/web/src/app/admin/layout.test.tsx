@@ -1,32 +1,41 @@
 import React from 'react'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
-const mocks = vi.hoisted(() => ({ requireSettingsAdmin: vi.fn(), redirect: vi.fn() }))
+const mocks = vi.hoisted(() => ({ requireAdminMembership: vi.fn(), redirect: vi.fn() }))
 
-vi.mock('@/lib/admin/settings-access', () => ({ requireSettingsAdmin: mocks.requireSettingsAdmin }))
+vi.mock('@/lib/admin/authorization', () => ({
+  requireAdminMembership: mocks.requireAdminMembership,
+  isAdminResponse: (value: unknown) => value instanceof Response,
+}))
+vi.mock('@/components/admin/AdminShell', () => ({
+  AdminShell: ({ children }: { children: React.ReactNode }) => React.createElement('section', { 'data-admin-shell': true }, children),
+}))
 vi.mock('next/navigation', () => ({ redirect: mocks.redirect }))
 
 import AdminLayout from './layout'
 
 describe('AdminLayout', () => {
   beforeEach(() => {
-    mocks.requireSettingsAdmin.mockReset()
+    vi.stubGlobal('React', React)
+    mocks.requireAdminMembership.mockReset()
     mocks.redirect.mockReset()
   })
 
-  it('redirects a signed-in user who is not on the admin allowlist', async () => {
-    mocks.requireSettingsAdmin.mockResolvedValue(Response.json({ error: 'Admin access denied' }, { status: 403 }))
+  it('redirects callers without an active admin membership to login', async () => {
+    mocks.requireAdminMembership.mockResolvedValue(Response.json({ error: 'Forbidden' }, { status: 403 }))
 
     await AdminLayout({ children: React.createElement('main', null, 'Admin content') })
 
-    expect(mocks.redirect).toHaveBeenCalledWith('/')
+    expect(mocks.redirect).toHaveBeenCalledWith('/login?callbackUrl=/admin')
   })
 
-  it('renders the admin route content for an allow-listed administrator', async () => {
+  it('renders the RBAC shell for an active admin membership', async () => {
     const children = React.createElement('main', null, 'Admin content')
-    mocks.requireSettingsAdmin.mockResolvedValue({ userId: 'admin_1', email: 'admin@example.com' })
+    mocks.requireAdminMembership.mockResolvedValue({ userId: 'admin_1', roleKey: 'support', permissions: ['users.read'], requestId: 'request_1' })
 
-    expect(await AdminLayout({ children })).toBe(children)
+    const result = await AdminLayout({ children })
+
+    expect(result).toEqual(expect.objectContaining({ type: expect.anything() }))
     expect(mocks.redirect).not.toHaveBeenCalled()
   })
 })

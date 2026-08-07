@@ -1,10 +1,9 @@
-import { ErrorBoundary } from '@/components/ErrorBoundary'
-import { AdminUsersPage } from '@/components/pages/AdminUsersPage'
+import { redirect } from 'next/navigation'
+import { AdminUsersPage } from '@/components/admin/OperationsPages'
+import { isAdminResponse, requireAdmin } from '@/lib/admin/authorization'
 
-export default function AdminUsersRoute() {
-  return (
-    <ErrorBoundary>
-      <AdminUsersPage />
-    </ErrorBoundary>
-  )
+export default async function UsersAdminPage() {
+  const actor = await requireAdmin('users.read')
+  if (isAdminResponse(actor)) redirect('/login?callbackUrl=/admin/users')
+  return <AdminUsersPage />
 }

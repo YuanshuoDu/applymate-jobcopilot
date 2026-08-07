@@ -1,23 +1,26 @@
 import { describe, expect, it, vi } from 'vitest'
 
-const requireSettingsAdmin = vi.hoisted(() => vi.fn())
+const requireAdmin = vi.hoisted(() => vi.fn())
 
-vi.mock('./settings-access', () => ({ requireSettingsAdmin }))
-vi.mock('@/lib/api-helpers', () => ({
-  requireAuth: vi.fn(),
-  isErrorResponse: (value: unknown) => value instanceof Response,
-  err: vi.fn(),
-}))
-vi.mock('@/lib/db', () => ({ db: { user: { findUnique: vi.fn() } } }))
+vi.mock('./authorization', () => ({ requireAdmin }))
+vi.mock('./settings-access', () => ({ requireSettingsAdmin: vi.fn() }))
 
-import { requirePricingAdmin } from './pricing-access'
+import { requirePricingReadAdmin, requirePricingWriteAdmin } from './pricing-access'
 
 describe('pricing admin access', () => {
-  it('delegates authorization to the shared admin guard', async () => {
-    const actor = { userId: 'admin_1', email: 'admin@example.com' }
-    requireSettingsAdmin.mockResolvedValue(actor)
+  it('uses billing.read for catalogue reads', async () => {
+    const actor = { userId: 'admin_1', roleKey: 'billing', requestId: 'request_1' }
+    requireAdmin.mockResolvedValue(actor)
 
-    await expect(requirePricingAdmin(new Request('http://localhost/admin/plans') as never)).resolves.toBe(actor)
-    expect(requireSettingsAdmin).toHaveBeenCalledTimes(1)
+    await expect(requirePricingReadAdmin(new Request('http://localhost/admin/plans') as never)).resolves.toBe(actor)
+    expect(requireAdmin).toHaveBeenCalledWith('billing.read', expect.any(Request))
+  })
+
+  it('uses billing.update for catalogue writes', async () => {
+    const actor = { userId: 'admin_1', roleKey: 'billing', requestId: 'request_1' }
+    requireAdmin.mockResolvedValue(actor)
+
+    await expect(requirePricingWriteAdmin(new Request('http://localhost/admin/plans') as never)).resolves.toBe(actor)
+    expect(requireAdmin).toHaveBeenCalledWith('billing.update', expect.any(Request))
   })
 })
