@@ -18,6 +18,7 @@ import {
   sessionTokenUserId,
 } from '@/lib/auth-session-token'
 import { authVersionFromClaim } from '@/lib/auth-version'
+import { shouldSuppressAuthSessionErrorLog } from '@/lib/safe-auth-errors'
 
 assertNoAuthOriginOverride()
 const AUTH_SECRET = getAuthSecret()
@@ -71,6 +72,12 @@ export const { handlers, signIn, signOut, auth } = NextAuth({
   secret: AUTH_SECRET,
   trustHost: true,
   session: { strategy: 'jwt' },
+  logger: {
+    error(error) {
+      if (shouldSuppressAuthSessionErrorLog(error, process.env.NODE_ENV)) return
+      console.error(error)
+    },
+  },
   callbacks: {
     async signIn({ user, account, profile }) {
       if (account?.provider === 'google') {
