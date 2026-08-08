@@ -1,6 +1,7 @@
 'use client'
 
 import React, { useState, useEffect, useMemo, useRef } from 'react'
+import { useRouter } from 'next/navigation'
 import { TopBar } from '@/components/layout/TopBar'
 import { Btn, Card, useToast, useConfirm, UserAvatar } from '@/components/ui'
 import type { NotificationPreferences, PrivacyPreferences, UserProfile, UserPreferences } from '@/lib/types'
@@ -39,7 +40,7 @@ import {
 } from './settings-view-model'
 import { customConfigError, hasIncompleteCustomConfig } from './ai-settings-view-model'
 import type { PublicPlan } from '@/lib/plan-catalogue-shared'
-import { isPrivacyPreferenceAvailable } from '@/lib/privacy-consent'
+import { hasUsageAnalyticsConsentChanged, isPrivacyPreferenceAvailable } from '@/lib/privacy-consent'
 
 // ── Static data ───────────────────────────────────────────────────────────────
 
@@ -122,6 +123,7 @@ const THEME_OPTIONS: { mode: ThemeMode; icon: string }[] = [
 ]
 
 export function SettingsPage() {
+  const router = useRouter()
   const toast = useToast()
   const { lang, t, setLang } = useI18n()
   const { mode, setMode } = useTheme()
@@ -384,6 +386,8 @@ export function SettingsPage() {
     if (error) {
       setPrivacy(previous)
       toast.error('Privacy settings failed', error)
+    } else if (hasUsageAnalyticsConsentChanged(previous, next)) {
+      router.refresh()
     }
   }
 

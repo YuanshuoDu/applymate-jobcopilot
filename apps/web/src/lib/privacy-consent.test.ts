@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest'
 import {
   allowsAiTraining,
   allowsUsageAnalytics,
+  hasUsageAnalyticsConsentChanged,
   isPrivacyPreferenceAvailable,
   PRIVACY_CAPABILITIES,
   retainsGeneratedCoverLetters,
@@ -16,5 +17,16 @@ describe('privacy consent', () => {
     expect(isPrivacyPreferenceAvailable('allowAiTraining')).toBe(false)
     expect(isPrivacyPreferenceAvailable('shareUsageData')).toBe(true)
     expect(isPrivacyPreferenceAvailable('storeCoverLetters')).toBe(true)
+  })
+
+  it('identifies changes that require analytics to be remounted', () => {
+    expect(hasUsageAnalyticsConsentChanged(
+      { shareUsageData: true },
+      { shareUsageData: false },
+    )).toBe(true)
+    expect(hasUsageAnalyticsConsentChanged(
+      { shareUsageData: false },
+      { shareUsageData: false },
+    )).toBe(false)
   })
 })

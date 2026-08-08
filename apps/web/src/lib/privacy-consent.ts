@@ -20,6 +20,13 @@ export function allowsUsageAnalytics(preferences: unknown): boolean {
   return readPrivacyPreferences(preferences).shareUsageData
 }
 
+export function hasUsageAnalyticsConsentChanged(
+  previous: Pick<PrivacyPreferences, 'shareUsageData'>,
+  next: Pick<PrivacyPreferences, 'shareUsageData'>,
+): boolean {
+  return previous.shareUsageData !== next.shareUsageData
+}
+
 export function retainsGeneratedCoverLetters(preferences: unknown): boolean {
   return readPrivacyPreferences(preferences).storeCoverLetters
 }
