@@ -15,7 +15,7 @@ export function AdminUsersPage() {
 export function AdminAtsPage({ permissions }: { permissions: readonly string[] }) {
   return <><AdminDataTable title="ATS sources" subtitle="Registry, discovery volume, and hard rate-limit metadata" endpoint="/api/admin/v1/ats" columns={[
     { label: 'Source', value: (row) => `${row.atsType} · ${row.name ?? row.slug}` }, { label: 'Jobs', value: values.text('jobCount') },
-    { label: 'RPS ceiling', value: (row) => row.rateLimitRps ? `${row.rateLimitRps} rps` : 'Not registered' }, { label: 'Last seen', value: values.date('lastSeen') }, { label: 'Credential', value: (row) => row.credentialConfigured ? 'Configured' : 'Not reported' },
+    { label: 'RPS ceiling', value: (row) => row.rateLimitRps ? `${row.rateLimitRps} rps` : 'Not registered' }, { label: 'Last seen', value: values.date('lastSeen') }, { label: 'Credential', value: (row) => row.credentialRequirement === 'none' ? 'Not required' : row.credentialConfigured ? 'Configured' : 'Not reported' },
   ]} /><AdminAtsControls permissions={permissions} /></>
 }
 

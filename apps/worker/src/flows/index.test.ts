@@ -4,6 +4,7 @@ import { detectFlow } from "./index.js";
 describe("detectFlow", () => {
   it("detects greenhouse URLs", () => {
     expect(detectFlow("https://boards.greenhouse.io/booking/jobs/123")).toBe("greenhouse");
+    expect(detectFlow("https://booking.greenhouse.io/jobs/123")).toBe("greenhouse");
     expect(detectFlow("https://grnh.se/abc123")).toBe("greenhouse");
     expect(detectFlow("https://greenhouse.io/applications/789")).toBe("greenhouse");
   });
@@ -11,6 +12,7 @@ describe("detectFlow", () => {
   it("detects lever URLs", () => {
     expect(detectFlow("https://jobs.lever.co/spotify/abc")).toBe("lever");
     expect(detectFlow("https://jobs.eu.lever.co/klarna/xyz")).toBe("lever");
+    expect(detectFlow("https://app.lever.co/posting/spotify/abc")).toBe("lever");
   });
 
   it("detects workday URLs", () => {
@@ -20,6 +22,7 @@ describe("detectFlow", () => {
   it("detects smartrecruiters URLs", () => {
     expect(detectFlow("https://jobs.smartrecruiters.com/Visa/123-engineer")).toBe("smartrecruiters");
     expect(detectFlow("https://JOBS.SMARTRECRUITERS.COM/Bosch/456")).toBe("smartrecruiters");
+    expect(detectFlow("https://careers.smartrecruiters.com/Bosch/456")).toBe("smartrecruiters");
   });
 
   it("detects personio URLs", () => {

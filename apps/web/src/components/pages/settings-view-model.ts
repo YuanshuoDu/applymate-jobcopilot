@@ -41,6 +41,14 @@ export function discoveryKeyClearPatch(provider: 'adzuna' | 'rapidapi'): Record<
     : { rapidapiKey: null }
 }
 
+export type OAuthProviderAvailability = { gmail: boolean; github: boolean }
+
+export function isOAuthProviderAvailable(provider: string, availability: OAuthProviderAvailability): boolean {
+  return provider === 'gmail' || provider === 'github'
+    ? availability[provider]
+    : false
+}
+
 export type DiscoveryStatusView = {
   hasAdzuna?: boolean
   hasRapidapi?: boolean

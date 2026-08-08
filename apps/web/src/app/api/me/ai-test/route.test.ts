@@ -92,8 +92,28 @@ describe('POST /api/me/ai-test', () => {
 
     expect(response.status).toBe(429)
     await expect(response.json()).resolves.toMatchObject({ ok: false, code: 'rate_limited' })
-    expect(mocks.checkDistributedRateLimit).toHaveBeenCalledWith('ai-test:user_1', 3, 60_000)
+    expect(mocks.checkDistributedRateLimit).toHaveBeenCalledWith('ai-test:user_1:openai', 3, 60_000)
     expect(mocks.modelChat).not.toHaveBeenCalled()
+  })
+
+  it('keeps test limits separate for each configured provider', async () => {
+    const { POST } = await import('./route')
+
+    const openAiResponse = await POST(new Request('http://localhost/api/me/ai-test', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ provider: 'openai', model: 'gpt-5.5', apiKey: 'openai-secret' }),
+    }) as never)
+    const customResponse = await POST(new Request('http://localhost/api/me/ai-test', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ provider: 'custom', model: 'custom', apiBase: 'https://llm.example.test/v1', apiKey: 'custom-secret' }),
+    }) as never)
+
+    expect(openAiResponse.status).toBe(200)
+    expect(customResponse.status).toBe(200)
+    expect(mocks.checkDistributedRateLimit).toHaveBeenNthCalledWith(1, 'ai-test:user_1:openai', 3, 60_000)
+    expect(mocks.checkDistributedRateLimit).toHaveBeenNthCalledWith(2, 'ai-test:user_1:custom', 3, 60_000)
   })
 
   it('fails closed when the shared rate limiter is unavailable', async () => {

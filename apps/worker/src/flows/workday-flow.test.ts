@@ -16,8 +16,10 @@ function mockPage() {
       }),
       all: () => Promise.resolve([]),
     }),
-    waitForTimeout: vi.fn(),
-    waitForLoadState: vi.fn(),
+    waitForTimeout: vi.fn().mockResolvedValue(undefined),
+    waitForLoadState: vi.fn().mockResolvedValue(undefined),
+    fill: vi.fn(),
+    type: vi.fn(),
     setInputFiles: vi.fn(),
     keyboard: { type: vi.fn() },
   } as any;
@@ -43,9 +45,8 @@ describe("runWorkdayFlow", () => {
 
   it("step failure returns manual with step number", async () => {
     const page = mockPage();
-    // Make the first fill throw
-    const loc = page.locator();
-    loc.first().isVisible = vi.fn().mockRejectedValue(new Error("selector not found"));
+    // Make the first form interaction throw.
+    page.fill = vi.fn().mockRejectedValue(new Error("selector not found"));
 
     const task: ApplyTask = {
       jobId: "j1",
@@ -59,5 +60,18 @@ describe("runWorkdayFlow", () => {
     const result = await runWorkdayFlow(page, task);
     expect(result.status).toBe("manual");
     expect(result.error).toContain("Workday flow failed at step 1");
+  });
+
+  it("stops at review when submission authorization is revoked", async () => {
+    const page = mockPage();
+    const beforeSubmit = vi.fn().mockResolvedValue(false);
+    const result = await runWorkdayFlow(page, {
+      jobId: "j2", applyUrl: "https://sap.wd3.myworkdayjobs.com/SAP",
+      persona: { firstName: "Jean", lastName: "Dupont", email: "jean@test.com" },
+      jobTitle: "Engineer", jobCompany: "SAP", resumePath: "/resume.pdf", beforeSubmit,
+    });
+
+    expect(beforeSubmit).toHaveBeenCalledOnce();
+    expect(result).toMatchObject({ status: "manual", reviewReady: true });
   });
 });

@@ -2,8 +2,20 @@ import { db } from "@/lib/db";
 import { Prisma } from "@prisma/client";
 import { enqueueApplyTask } from "@/lib/apply-queue-client";
 import { assessApplicationPreflight, isSupportedAutomatedApplyUrl } from "@/lib/agent/application-preflight";
+import { isRuntimeFeatureEnabled } from '@/lib/runtime-feature-flags'
 
 export class AutoApplyError extends Error {}
+
+async function assertUnattendedApplyEnabled(userId: string): Promise<void> {
+  try {
+    if (!await isRuntimeFeatureEnabled('unattended_apply', userId)) {
+      throw new AutoApplyError('Unattended applications are temporarily unavailable.')
+    }
+  } catch (error) {
+    if (error instanceof AutoApplyError) throw error
+    throw new AutoApplyError('Unattended applications are temporarily unavailable.')
+  }
+}
 
 export function validateAutoApplyUrl(rawUrl: string | null | undefined): string {
   const url = rawUrl?.trim();
@@ -45,6 +57,7 @@ export async function queueApplicationFill(input: {
   applicationTaskId: string;
   resumeAfterUserInput?: boolean;
 }): Promise<{ taskId: string }> {
+  await assertUnattendedApplyEnabled(input.userId)
   const applyUrl = validateAutoApplyUrl(input.applyUrl);
   await assertJobPreflight(input)
   const claimed = await db.applicationTask.updateMany({
@@ -78,6 +91,7 @@ export async function queueAutonomousApplication(input: {
   /** Approved per-job authorization. Global settings can never replace this. */
   approvalId: string;
 }): Promise<{ taskId: string }> {
+  await assertUnattendedApplyEnabled(input.userId)
   const applyUrl = validateAutoApplyUrl(input.applyUrl);
   await assertJobPreflight(input)
   const approval = await db.agentApproval.findFirst({

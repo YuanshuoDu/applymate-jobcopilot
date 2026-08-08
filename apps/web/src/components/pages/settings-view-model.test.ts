@@ -6,6 +6,7 @@ import {
   discoveryKeyClearPatch,
   EXTENSION_SETUP_HREF,
   gmailOAuthStartHref,
+  isOAuthProviderAvailable,
   hasPendingSecretClear,
   matchesEmailConfirmation,
   parseSettingsTab,
@@ -99,5 +100,12 @@ describe('settings view model', () => {
     expect(gmailOAuthStartHref(true)).toBe(
       '/api/gmail/oauth/start?returnTo=%2F%3Fpage%3Dsettings%26tab%3Daccounts&transfer=1',
     )
+  })
+
+  it('keeps OAuth connect actions unavailable until the platform reports readiness', () => {
+    const providers = { gmail: false, github: true }
+    expect(isOAuthProviderAvailable('gmail', providers)).toBe(false)
+    expect(isOAuthProviderAvailable('github', providers)).toBe(true)
+    expect(isOAuthProviderAvailable('linkedin', providers)).toBe(false)
   })
 })

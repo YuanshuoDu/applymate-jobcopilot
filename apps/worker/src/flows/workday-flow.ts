@@ -1,7 +1,7 @@
 import type { Page } from "playwright-core";
 import type { ApplyTask } from "../harness/agent-harness.js";
 import type { HarnessResult } from "../harness/agent-harness.js";
-import { confirmedAnswerForLabel, humanType, isSensitiveQuestion, uploadResume, type FlowLogEntry } from "./helpers.js";
+import { confirmedAnswerForLabel, humanType, isSensitiveQuestion, isSubmissionAuthorized, uploadResume, type FlowLogEntry } from "./helpers.js";
 
 const SELECTORS = {
   // Step 1 — Personal info
@@ -60,6 +60,9 @@ export async function runWorkdayFlow(page: Page, task: ApplyTask): Promise<Harne
     for (const sel of SELECTORS.submitBtn) {
       const btn = page.locator(sel).first();
       if (await btn.isVisible().catch(() => false)) {
+        if (!await isSubmissionAuthorized(task)) {
+          return { status: "manual", turns: step, error: "Form filled and ready for user review.", durationMs: Date.now() - startedAt, log, reviewReady: true };
+        }
         await btn.click();
         await page.waitForLoadState("networkidle", { timeout: 20_000 }).catch(() => {});
         break;

@@ -2,7 +2,7 @@ import pg from "pg";
 
 // ── Types ──
 
-export type Provider = "minimax" | "openai" | "anthropic" | "deepseek" | "custom";
+export type Provider = "minimax" | "openai" | "anthropic" | "deepseek" | "qwen" | "zhipu" | "kimi" | "custom";
 
 export interface AiConfig {
   provider: Provider;
@@ -38,6 +38,9 @@ const DEFAULT_API_BASES: Record<Provider, string> = {
   openai: "https://api.openai.com/v1",
   anthropic: "https://api.anthropic.com",
   deepseek: "https://api.deepseek.com/v1",
+  qwen: "https://dashscope.aliyuncs.com/compatible-mode/v1",
+  zhipu: "https://api.z.ai/api/paas/v4",
+  kimi: "https://api.moonshot.ai/v1",
   custom: "",
 };
 
@@ -68,38 +71,29 @@ export async function loadWorkerAiConfig(userId: string): Promise<AiConfig> {
     );
     if (res.rows.length === 0) return { ...APPLYMATE_BACKING };
 
-    const prefs = res.rows[0].preferences ?? {};
-    const aiSettings = (prefs as Record<string, unknown>).aiSettings as
-      | Record<string, unknown>
-      | undefined;
-
-    if (!aiSettings) return { ...APPLYMATE_BACKING };
-
-    // Check per-feature override
-    const features = aiSettings.features as
-      | Record<string, AiConfig | null>
-      | undefined;
-    const featureCfg = features?.["autoApply"];
-
-    // Build base config
-    const base = featureCfg ?? APPLYMATE_BACKING;
-
-    // Resolve API key: feature.apiKey → keys[provider] → server env
-    const keys = aiSettings.keys as Record<string, string> | undefined;
-    const apiKey =
-      base.apiKey?.trim() ||
-      keys?.[base.provider]?.trim() ||
-      undefined;
-
-    return {
-      provider: base.provider,
-      model: base.model,
-      apiKey,
-      apiBase: (base as AiConfig).apiBase,
-    };
+    return resolveWorkerAiConfig(res.rows[0].preferences);
   } finally {
     client.release();
   }
+}
+
+/** Resolve persisted Preferences JSON without opening a database connection. */
+export function resolveWorkerAiConfig(preferences: unknown): AiConfig {
+  const root = asRecord(preferences);
+  const aiSettings = asRecord(root.aiSettings);
+  const features = asRecord(aiSettings.features);
+  const configured = asAiConfig(features.autoApply);
+  if (!configured) return { ...APPLYMATE_BACKING };
+
+  const keys = asRecord(aiSettings.keys);
+  const apiKey = stringValue(configured.apiKey) ?? stringValue(keys[configured.provider]);
+  return {
+    provider: configured.provider,
+    model: configured.model,
+    ...(apiKey ? { apiKey } : {}),
+    ...(configured.apiBase ? { apiBase: configured.apiBase } : {}),
+    ...(configured.thinking ? { thinking: configured.thinking } : {}),
+  };
 }
 
 /** Close the shared pool (for tests/cleanup) */
@@ -135,7 +129,7 @@ async function callOpenAICompat(
   messages: ChatMessage[],
   config: AiConfig
 ): Promise<ChatResult> {
-  const base = config.apiBase || DEFAULT_API_BASES[config.provider] || DEFAULT_API_BASES.minimax;
+  const base = config.apiBase || DEFAULT_API_BASES[config.provider];
   const key = config.apiKey || getServerKey(config.provider);
   if (!key) throw new Error(`No API key for provider "${config.provider}"`);
 
@@ -252,9 +246,49 @@ function getServerKey(provider: Provider): string | undefined {
     openai: process.env.OPENAI_API_KEY,
     anthropic: process.env.ANTHROPIC_API_KEY,
     deepseek: process.env.DEEPSEEK_API_KEY,
+    qwen: process.env.QWEN_API_KEY,
+    zhipu: process.env.ZHIPU_API_KEY,
+    kimi: process.env.KIMI_API_KEY,
     custom: undefined,
   };
   return envMap[provider];
+}
+
+function asRecord(value: unknown): Record<string, unknown> {
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : {};
+}
+
+function asAiConfig(value: unknown): AiConfig | null {
+  const raw = asRecord(value);
+  const provider = raw.provider;
+  const model = stringValue(raw.model);
+  if (!isProvider(provider) || !model) return null;
+  const apiBase = provider === "custom" ? stringValue(raw.apiBase) : undefined;
+  if (provider === "custom" && !apiBase) return null;
+  const thinking = raw.thinking === "adaptive" || raw.thinking === "disabled"
+    ? raw.thinking
+    : undefined;
+  return {
+    provider,
+    model,
+    ...(stringValue(raw.apiKey) ? { apiKey: stringValue(raw.apiKey) } : {}),
+    ...(apiBase ? { apiBase } : {}),
+    ...(thinking ? { thinking } : {}),
+  };
+}
+
+function isProvider(value: unknown): value is Provider {
+  return value === "minimax" || value === "openai" || value === "anthropic" ||
+    value === "deepseek" || value === "qwen" || value === "zhipu" ||
+    value === "kimi" || value === "custom";
+}
+
+function stringValue(value: unknown): string | undefined {
+  if (typeof value !== "string") return undefined;
+  const normalized = value.trim();
+  return normalized || undefined;
 }
 
 /** Convenience: call LLM and return only the text string */

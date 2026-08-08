@@ -353,7 +353,7 @@ function ModelSelector({ value, onChange }: {
   value: { provider: string; model: string }
   onChange: (v: { provider: string; model: string }) => void
 }) {
-  const byProvider = MODEL_CATALOGUE.reduce<Record<string, typeof MODEL_CATALOGUE>>((acc, m) => {
+  const byProvider = MODEL_CATALOGUE.filter(m => m.provider !== 'custom').reduce<Record<string, typeof MODEL_CATALOGUE>>((acc, m) => {
     if (!acc[m.provider]) acc[m.provider] = []
     acc[m.provider].push(m)
     return acc
@@ -368,6 +368,9 @@ function ModelSelector({ value, onChange }: {
       }}
       style={{ fontSize: 11, padding: '3px 6px', border: '0.5px solid var(--border)', borderRadius: 5, background: 'var(--bg)', color: 'var(--text)', outline: 'none' }}
     >
+      {value.provider === 'custom' && (
+        <option value={`${value.provider}::${value.model}`}>Custom (edit in Settings)</option>
+      )}
       {Object.entries(byProvider).map(([provider, models]) => (
         <optgroup key={provider} label={PROVIDER_LABELS[provider as keyof typeof PROVIDER_LABELS] ?? provider}>
           {models.map(m => (
@@ -450,7 +453,7 @@ export function AgentPage() {
       excludeCompanies:  agentData.excludeCompanies          ?? [],
       priorityCompanies: (agentData as any).priorityCompanies ?? [],
       ...(aiData ? (() => {
-        const configured = aiData.features?.agent ?? APPLYMATE_BACKING
+        const configured = aiData.features?.agent ?? aiData.features?.autoApply ?? APPLYMATE_BACKING
         return { aiProvider: configured.provider, aiModel: configured.model }
       })() : {}),
       ...(profileData?.preferences ? (() => {
@@ -531,8 +534,8 @@ export function AgentPage() {
       const aiConfig: Partial<AiConfig> = {
         provider: cfg.aiProvider as AiConfig['provider'],
         model:    cfg.aiModel,
-        ...(cfg.aiProvider === 'custom' && aiData?.features?.agent?.apiBase
-          ? { apiBase: aiData.features.agent.apiBase }
+        ...(cfg.aiProvider === 'custom' && (aiData?.features?.agent?.apiBase ?? aiData?.features?.autoApply?.apiBase)
+          ? { apiBase: aiData.features.agent?.apiBase ?? aiData.features.autoApply?.apiBase }
           : {}),
         ...(cfg.aiApiKey.trim() ? { apiKey: cfg.aiApiKey.trim() } : {}),
       }

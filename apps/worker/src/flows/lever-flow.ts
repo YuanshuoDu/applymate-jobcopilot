@@ -3,6 +3,7 @@ import type { ApplyTask, HarnessResult } from "../harness/agent-harness.js";
 import {
   clickSubmit,
   fillCustomQuestions,
+  isSubmissionAuthorized,
   humanType,
   tryFill,
   uploadResume,
@@ -63,8 +64,11 @@ export async function runLeverFlow(
   if (task.allowSubmit === false) {
     return { status: "manual", turns: 1, error: "Form filled and ready for user review.", durationMs: Date.now() - startedAt, log, reviewReady: true };
   }
-  const submitted = await clickSubmit(page, SELECTORS.submit);
-  if (!submitted) {
+  const submission = await clickSubmit(page, SELECTORS.submit, () => isSubmissionAuthorized(task));
+  if (submission === 'blocked') {
+    return { status: "manual", turns: 1, error: "Form filled and ready for user review.", durationMs: Date.now() - startedAt, log, reviewReady: true };
+  }
+  if (submission === 'missing') {
     return {
       status: "manual",
       turns: 1,

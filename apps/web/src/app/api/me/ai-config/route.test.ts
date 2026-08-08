@@ -111,6 +111,10 @@ describe('/api/me/ai-config', () => {
                 provider: 'custom', model: 'llama-3.3', apiKey: 'custom-secret',
                 apiBase: 'https://llm.example.test/v1', thinking: 'disabled',
               },
+              autoApply: {
+                provider: 'custom', model: 'llama-3.3', apiKey: 'custom-secret',
+                apiBase: 'https://llm.example.test/v1', thinking: 'disabled',
+              },
             }),
           }),
         }),

@@ -5,6 +5,7 @@ import {
 } from '@/lib/discovery-api-keys'
 import type { Provider, UserAiSettings } from '@/lib/model-router'
 import { PRIVACY_CAPABILITIES } from '@/lib/privacy-consent'
+import { getOAuthStateSecret } from '@/lib/oauth-state'
 
 const PROVIDERS: readonly Provider[] = ['anthropic', 'openai', 'deepseek', 'minimax', 'qwen', 'zhipu', 'kimi', 'custom']
 const PLATFORM_KEY_ENV: Partial<Record<Provider, string>> = {
@@ -89,6 +90,7 @@ export function userIntegrationStatus(input: {
 }
 
 export function platformIntegrationStatus(): PlatformIntegrationStatus {
+  const oauthStateReady = getOAuthStateSecret() !== null
   return {
     ai: { providers: platformProviderStatus() },
     discovery: {
@@ -96,8 +98,8 @@ export function platformIntegrationStatus(): PlatformIntegrationStatus {
       rapidapi: hasValue(process.env.RAPIDAPI_KEY),
     },
     oauth: {
-      google: hasValue(process.env.AUTH_GOOGLE_ID) && hasValue(process.env.AUTH_GOOGLE_SECRET),
-      github: hasValue(process.env.AUTH_GITHUB_ID) && hasValue(process.env.AUTH_GITHUB_SECRET),
+      google: oauthStateReady && hasValue(process.env.AUTH_GOOGLE_ID) && hasValue(process.env.AUTH_GOOGLE_SECRET),
+      github: oauthStateReady && hasValue(process.env.AUTH_GITHUB_ID) && hasValue(process.env.AUTH_GITHUB_SECRET),
     },
     messaging: { resend: hasValue(process.env.RESEND_API_KEY) },
     infrastructure: {

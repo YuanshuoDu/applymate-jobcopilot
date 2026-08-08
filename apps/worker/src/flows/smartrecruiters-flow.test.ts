@@ -95,6 +95,14 @@ describe("runSmartRecruitersFlow", () => {
     expect(result.status).toBe("manual");
     expect(result.error).toContain("Submit button not found");
   });
+
+  it("stops at review when submission authorization is revoked", async () => {
+    const beforeSubmit = vi.fn().mockResolvedValue(false);
+    const result = await runSmartRecruitersFlow(mockSmartRecruitersPage(), { ...baseTask(), beforeSubmit });
+
+    expect(beforeSubmit).toHaveBeenCalledOnce();
+    expect(result).toMatchObject({ status: "manual", reviewReady: true });
+  });
 });
 
 describe("detectFlow", () => {

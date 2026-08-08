@@ -1,4 +1,5 @@
 import type { Page } from "playwright-core";
+import type { ApplyTask } from "../harness/agent-harness.js";
 
 export type FlowLogEntry = { field?: string; selector?: string; action: string };
 
@@ -141,18 +142,33 @@ export async function fillCustomQuestions(
   }
 }
 
-export async function clickSubmit(page: Page, selectors: string[]): Promise<boolean> {
+export type SubmitAttempt = 'submitted' | 'missing' | 'blocked';
+
+export async function clickSubmit(
+  page: Page,
+  selectors: string[],
+  beforeSubmit?: () => Promise<boolean>,
+): Promise<SubmitAttempt> {
   for (const selector of selectors) {
     try {
       const button = page.locator(selector).first();
       if (!(await button.count())) continue;
       if (!(await button.isVisible().catch(() => false))) continue;
+      if (beforeSubmit && !await beforeSubmit()) return 'blocked';
       await button.click();
       await page.waitForLoadState("networkidle", { timeout: 20_000 }).catch(() => {});
-      return true;
+      return 'submitted';
     } catch {
       continue;
     }
   }
-  return false;
+  return 'missing';
+}
+
+export async function isSubmissionAuthorized(task: Pick<ApplyTask, 'beforeSubmit'>): Promise<boolean> {
+  try {
+    return task.beforeSubmit ? await task.beforeSubmit() : true;
+  } catch {
+    return false;
+  }
 }

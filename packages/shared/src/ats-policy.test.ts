@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { ATS_POLICIES, getHardRpsLimit, isAtsSourceKey } from "./ats-policy.js";
+import { ATS_POLICIES, getDefaultAtsPolicy, getHardRpsLimit, isAtsSourceKey } from "./ats-policy.js";
 
 describe("ATS hard policy", () => {
   it("defines the approved ATS hosts and hard RPS ceilings", () => {
@@ -20,5 +20,18 @@ describe("ATS hard policy", () => {
   it("returns null when a source has no hard RPS ceiling", () => {
     expect(getHardRpsLimit("workday")).toBe(1);
     expect(getHardRpsLimit("linkedin")).toBeNull();
+  });
+
+  it("shares the unconfigured Worker policy that the admin console displays", () => {
+    expect(getDefaultAtsPolicy("lever")).toEqual({
+      state: "enabled",
+      enabled: true,
+      rolloutPercent: 100,
+      globalRpsLimit: 4,
+      perTenantRpsLimit: 4,
+      maxRetries: 0,
+      backoffBaseMs: 1_000,
+      allowAutoApply: true,
+    });
   });
 });

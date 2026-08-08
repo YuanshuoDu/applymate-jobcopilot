@@ -69,6 +69,7 @@ describe('admin integration status', () => {
     process.env.AUTH_GOOGLE_SECRET = 'google-secret'
     process.env.AUTH_GITHUB_ID = 'github-client'
     process.env.AUTH_GITHUB_SECRET = 'github-secret'
+    process.env.AUTH_SECRET = 'state-secret'
     delete process.env.GOOGLE_CLIENT_ID
     delete process.env.GOOGLE_CLIENT_SECRET
     delete process.env.GITHUB_CLIENT_ID
@@ -77,5 +78,15 @@ describe('admin integration status', () => {
     const status = platformIntegrationStatus()
 
     expect(status.oauth).toEqual({ google: true, github: true })
+  })
+
+  it('does not advertise OAuth as ready without the state signing secret', () => {
+    process.env.AUTH_GOOGLE_ID = 'google-client'
+    process.env.AUTH_GOOGLE_SECRET = 'google-secret'
+    process.env.AUTH_GITHUB_ID = 'github-client'
+    process.env.AUTH_GITHUB_SECRET = 'github-secret'
+    delete process.env.AUTH_SECRET
+
+    expect(platformIntegrationStatus().oauth).toEqual({ google: false, github: false })
   })
 })

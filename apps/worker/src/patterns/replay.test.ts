@@ -112,4 +112,17 @@ describe("replayPattern", () => {
     expect(page.fill).toHaveBeenCalledWith("#name", "");
     expect(page.click).not.toHaveBeenCalled();
   });
+
+  it("does not replay a cached form into a submit after authorization is revoked", async () => {
+    const page = mockPage({ visibleSelectors: ["#name"], submitVisible: true });
+    const beforeSubmit = vi.fn().mockResolvedValue(false);
+
+    const result = await replayPattern(page, pattern({ "#name": "fullName" }), {
+      fullName: "Ada Lovelace",
+    }, beforeSubmit);
+
+    expect(beforeSubmit).toHaveBeenCalledOnce();
+    expect(page.click).not.toHaveBeenCalled();
+    expect(result).toMatchObject({ status: "manual", reviewReady: true });
+  });
 });

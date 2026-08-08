@@ -34,7 +34,7 @@ export async function PATCH(req: NextRequest, { params }: Params) {
   }
   const token = await getGoogleAccessToken(auth.userId).catch(() => null)
   if (!token || !recommendation.sourceMessage?.gmailMessageId) return err('Reconnect Gmail to retrieve the job details before saving', 401)
-  const details = await hydrateRecommendationDetails({ ...recommendation, gmailMessageId: recommendation.sourceMessage.gmailMessageId }, token)
+  const details = await hydrateRecommendationDetails({ ...recommendation, gmailMessageId: recommendation.sourceMessage.gmailMessageId }, token, auth.userId)
   if (!details.company || !details.role || !hasJobDescription(details.description)) {
     return err('We could not retrieve a complete job description from the source email. Open the source email and retry after the job details are available.', 422)
   }

@@ -19,6 +19,9 @@ const mocks = vi.hoisted(() => ({
   pauseForFormInput: vi.fn().mockResolvedValue(undefined),
   createNotification: vi.fn().mockResolvedValue(undefined),
   notifyApplyResult: vi.fn().mockResolvedValue(undefined),
+  runtimeFeatureEnabled: vi.fn().mockResolvedValue(true),
+  loadAtsPolicy: vi.fn(),
+  canUseAtsSource: vi.fn().mockReturnValue(true),
 }));
 
 vi.mock("bullmq", () => ({
@@ -79,6 +82,13 @@ vi.mock("../notifications/create-notification.js", () => ({
 }));
 vi.mock("../patterns/confidence.js", () => ({ shouldUsePattern: vi.fn(() => false) }));
 vi.mock("../patterns/replay.js", () => ({ replayPattern: vi.fn() }));
+vi.mock("../admin/runtime-feature-flags.js", () => ({
+  isWorkerFeatureEnabled: mocks.runtimeFeatureEnabled,
+}));
+vi.mock("../admin/ats-policy.js", () => ({
+  loadEffectiveAtsPolicy: mocks.loadAtsPolicy,
+  canUseAtsSource: mocks.canUseAtsSource,
+}));
 vi.mock("../db/application-task-state.js", () => ({
   claimApplicationTask: mocks.claimApplicationTask,
   completeFillForReview: mocks.completeFillForReview,
@@ -120,6 +130,9 @@ describe("apply-queue CAPTCHA handling", () => {
     mocks.detectCaptcha.mockResolvedValue(false);
     mocks.solveCaptcha.mockResolvedValue(false);
     mocks.detectFlow.mockReturnValue(null);
+    mocks.runtimeFeatureEnabled.mockResolvedValue(true);
+    mocks.loadAtsPolicy.mockResolvedValue({ configured: true, version: 1, allowAutoApply: true });
+    mocks.canUseAtsSource.mockReturnValue(true);
     mocks.runGreenhouseFlow.mockResolvedValue({ status: "submitted", durationMs: 1 });
     mocks.runSmartRecruitersFlow.mockResolvedValue({ status: "submitted", durationMs: 1 });
     await import("./apply-queue.js");

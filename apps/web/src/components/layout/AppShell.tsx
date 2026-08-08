@@ -10,6 +10,7 @@ import type { Page } from '@/lib/types'
 import { NavContext } from '@/lib/nav-context'
 import { OnboardingFlow } from '@/components/onboarding/OnboardingFlow'
 import { clearCachedApiResponses } from '@/lib/api-cache'
+import { pageFromSearch } from './page-routing'
 
 function PageLoading() {
   return <div style={{ flex: 1, display: 'grid', placeItems: 'center', color: 'var(--text-muted)', fontSize: 13 }}>Loading page…</div>
@@ -127,14 +128,7 @@ function NotificationPanel({ notifications, unreadCount, onMarkRead, onOpenNotif
 
 function getInitialPage(): Page {
   if (typeof window === 'undefined') return 'dashboard'
-  const params = new URLSearchParams(window.location.search)
-  const pageParam = params.get('page')
-  if (isPage(pageParam)) return pageParam
-  return 'dashboard'
-}
-
-function isPage(value: string | null): value is Page {
-  return Boolean(value && value in PAGES)
+  return pageFromSearch(window.location.search)
 }
 
 function writePageToUrl(nextPage: Page, mode: 'push' | 'replace' = 'push') {
@@ -190,12 +184,13 @@ export function AppShell() {
   }, [status])
 
   useEffect(() => {
-    writePageToUrl(initialPageRef.current, 'replace')
+    const locationPage = pageFromSearch(window.location.search)
+    initialPageRef.current = locationPage
+    setPage(locationPage)
+    writePageToUrl(locationPage, 'replace')
 
     function handlePopState() {
-      const params = new URLSearchParams(window.location.search)
-      const pageParam = params.get('page')
-      setPage(isPage(pageParam) ? pageParam : 'dashboard')
+      setPage(pageFromSearch(window.location.search))
     }
 
     window.addEventListener('popstate', handlePopState)

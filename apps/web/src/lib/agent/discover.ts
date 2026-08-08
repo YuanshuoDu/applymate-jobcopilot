@@ -14,6 +14,7 @@
  */
 import { truncate } from '@/lib/utils'
 import { getDiscoveryApiKeys } from '@/lib/discovery-api-keys'
+import { isRuntimeFeatureEnabled } from '@/lib/runtime-feature-flags'
 import { dedupJobs } from './dedup'
 import { resolveLocation } from './location-resolver'
 
@@ -332,6 +333,18 @@ async function fetchIrishJobsRss(q: string, location: string): Promise<Discovere
 
 export async function discoverJobs(params: DiscoverParams): Promise<DiscoveredJob[]> {
   const { userId, targetRoles, targetLocations, existingUrls, maxResults } = params
+
+  if (userId) {
+    try {
+      if (!await isRuntimeFeatureEnabled('worker_discovery', userId)) return []
+    } catch (error) {
+      console.warn('[discover] Platform discovery control unavailable', {
+        userId,
+        error: error instanceof Error ? error.message : String(error),
+      })
+      return []
+    }
+  }
 
   const keys = userId
     ? await getDiscoveryApiKeys(userId)

@@ -32,7 +32,9 @@ import {
   settingsTabHref,
   discoveryKeyStatusText,
   hasSavedDiscoveryKey,
+  isOAuthProviderAvailable,
   type DiscoveryStatusView,
+  type OAuthProviderAvailability,
   type SettingsTab,
 } from './settings-view-model'
 import { customConfigError, hasIncompleteCustomConfig } from './ai-settings-view-model'
@@ -42,10 +44,10 @@ import { isPrivacyPreferenceAvailable } from '@/lib/privacy-consent'
 // ── Static data ───────────────────────────────────────────────────────────────
 
 const CONNECTED_ACCOUNTS = [
-  { id: 'gmail',    name: 'Gmail',    icon: '✉',  color: 'var(--c-danger)', connected: false, available: true,  account: null as string | null, disconnectable: true, legacy: false, desc: 'AI email detection, auto-labeling & follow-up' },
+  { id: 'gmail',    name: 'Gmail',    icon: '✉',  color: 'var(--c-danger)', connected: false, available: false, account: null as string | null, disconnectable: true, legacy: false, desc: 'AI email detection, auto-labeling & follow-up' },
   { id: 'linkedin', name: 'LinkedIn', icon: 'in', color: 'var(--primary)', connected: false, available: false, account: null as string | null, disconnectable: true, legacy: false, desc: 'No LinkedIn OAuth connector is configured' },
   { id: 'indeed',   name: 'Indeed',   icon: 'I',  color: '#003A9B', connected: false, available: false, account: null as string | null, disconnectable: true, legacy: false, desc: 'Indeed search uses public sources, not account login' },
-  { id: 'github',   name: 'GitHub',   icon: '⌥',  color: '#24292f', connected: false, available: true,  account: null as string | null, disconnectable: true, legacy: false, desc: 'Pull CV data from repos'       },
+  { id: 'github',   name: 'GitHub',   icon: '⌥',  color: '#24292f', connected: false, available: false, account: null as string | null, disconnectable: true, legacy: false, desc: 'Pull CV data from repos'       },
 ]
 
 // ── UI helpers ────────────────────────────────────────────────────────────────
@@ -180,6 +182,7 @@ export function SettingsPage() {
   const [exporting, setExporting] = useState(false)
   const [showCancelModal,   setShowCancelModal]   = useState(false)
   const [connectedProviders, setConnectedProviders] = useState<{ provider: string; account: string; disconnectable?: boolean; legacy?: boolean }[]>([])
+  const [oauthProviders, setOauthProviders] = useState<OAuthProviderAvailability>({ gmail: false, github: false })
   const [gmailHealth, setGmailHealth] = useState<{ hasGmail: boolean; reason: string | null; scopes?: string; gmailError?: string }>({ hasGmail: true, reason: null })
   const [accountAction, setAccountAction] = useState<string | null>(null)
   const [accountsError, setAccountsError] = useState<string | null>(null)
@@ -226,11 +229,20 @@ export function SettingsPage() {
         if (!response.ok) throw new Error(data?.error ?? 'Could not verify Gmail access')
         return data
       }),
+      fetch('/api/me/integrations').then(async response => {
+        const data = await response.json().catch(() => null)
+        if (!response.ok) throw new Error(data?.error ?? 'Could not verify available integrations')
+        return data
+      }),
     ])
-      .then(([accountsData, gmailData]) => {
+      .then(([accountsData, gmailData, integrationsData]) => {
         if (cancelled) return
         setConnectedProviders(Array.isArray(accountsData?.accounts) ? accountsData.accounts : [])
         setGmailHealth({ hasGmail: Boolean(gmailData?.hasGmail), reason: gmailData?.reason ?? null, scopes: gmailData?.scopes, gmailError: gmailData?.gmailError })
+        setOauthProviders({
+          gmail: Boolean(integrationsData?.providers?.gmail),
+          github: Boolean(integrationsData?.providers?.github),
+        })
       })
       .catch(error => {
         if (!cancelled) setAccountsError(error instanceof Error ? error.message : 'Could not load connected accounts')
@@ -243,9 +255,15 @@ export function SettingsPage() {
   const accounts = useMemo(() => {
     return CONNECTED_ACCOUNTS.map(acc => {
       const conn = connectedProviders.find(c => c.provider === acc.id)
-      return conn ? { ...acc, connected: true, account: conn.account, disconnectable: conn.disconnectable !== false, legacy: conn.legacy } : acc
+      const available = isOAuthProviderAvailable(acc.id, oauthProviders)
+      const desc = !available && (acc.id === 'gmail' || acc.id === 'github')
+        ? `${acc.name} OAuth is not configured by the platform`
+        : acc.desc
+      return conn
+        ? { ...acc, available, desc, connected: true, account: conn.account, disconnectable: conn.disconnectable !== false, legacy: conn.legacy }
+        : { ...acc, available, desc }
     })
-  }, [connectedProviders])
+  }, [connectedProviders, oauthProviders])
 
   // Password change state
   const [passwordCur,  setPasswordCur]  = useState('')

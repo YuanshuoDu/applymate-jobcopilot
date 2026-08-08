@@ -207,6 +207,14 @@ export async function POST(req: NextRequest) {
     if ('error' in parsed) return err(parsed.error)
     mergedFeatures[feature] = parsed.config
   }
+  if (legacy) {
+    const agent = mergedFeatures.agent
+    mergedFeatures.autoApply = agent === null
+      ? null
+      : agent && typeof agent === 'object'
+        ? { ...(agent as AiConfig) }
+        : null
+  }
 
   const nextFeatures: UserAiSettings['features'] = {}
   for (const feature of FEATURES) {
@@ -215,7 +223,10 @@ export async function POST(req: NextRequest) {
     else if (value && typeof value === 'object') nextFeatures[feature] = value as AiConfig
   }
   const nextSettings: UserAiSettings = { keys: mergedKeys, features: nextFeatures }
-  for (const feature of Object.keys(incomingFeatures)) {
+  const updatedFeatures = legacy
+    ? [...Object.keys(incomingFeatures), 'autoApply']
+    : Object.keys(incomingFeatures)
+  for (const feature of updatedFeatures) {
     if (!isFeature(feature)) continue
     const selected = nextFeatures[feature]
     const effective = resolveFeatureConfig(feature, nextSettings)
