@@ -21,6 +21,8 @@ export interface AdminSettingsUser {
 export type AdminSettingsPatch = {
   notificationPreferences: NotificationPreferences
   privacyPreferences: PrivacyPreferences
+  reason: string
+  dataDeletionRequestStatus?: NonNullable<SettingsPreferences['dataDeletionRequestStatus']>
 }
 
 export type DeletionRequestAction = {
@@ -45,10 +47,19 @@ export function filterAdminUsers(users: AdminSettingsUser[], query: string): Adm
 export function buildAdminSettingsPatch(
   notificationPreferences: NotificationPreferences,
   privacyPreferences: PrivacyPreferences,
+  reason: string,
+  dataDeletionRequestStatus?: NonNullable<SettingsPreferences['dataDeletionRequestStatus']>,
 ): AdminSettingsPatch {
+  const auditReason = reason.trim()
+  if (auditReason.length < 10 || auditReason.length > 500) {
+    throw new Error('Enter a settings-change reason between 10 and 500 characters.')
+  }
+
   return {
     notificationPreferences: { ...notificationPreferences },
     privacyPreferences: { ...privacyPreferences },
+    reason: auditReason,
+    ...(dataDeletionRequestStatus ? { dataDeletionRequestStatus } : {}),
   }
 }
 

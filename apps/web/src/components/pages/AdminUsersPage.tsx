@@ -127,11 +127,20 @@ export function AdminUsersPage() {
 
   async function saveSettings() {
     if (!selectedUser) return
+    const reason = window.prompt('Enter the settings-change reason')
+    if (reason === null) return
+    let patch: ReturnType<typeof buildAdminSettingsPatch>
+    try {
+      patch = buildAdminSettingsPatch(notifications, privacy, reason)
+    } catch (error) {
+      toast.error('Could not save user settings', error instanceof Error ? error.message : 'A valid settings-change reason is required')
+      return
+    }
     setSaving(true)
     const { data: response, error: requestError } = await apiMutate<{ user: AdminSettingsUser }>(
       `/api/admin/v1/users/${encodeURIComponent(selectedUser.id)}/settings`,
       'PATCH',
-      buildAdminSettingsPatch(notifications, privacy),
+      patch,
     )
     setSaving(false)
     if (requestError) {
@@ -146,11 +155,20 @@ export function AdminUsersPage() {
 
   async function updateDeletionRequestStatus(status: DeletionRequestAction['status']) {
     if (!selectedUser) return
+    const reason = window.prompt('Enter the settings-change reason')
+    if (reason === null) return
+    let patch: ReturnType<typeof buildAdminSettingsPatch>
+    try {
+      patch = buildAdminSettingsPatch(notifications, privacy, reason, status)
+    } catch (error) {
+      toast.error('Could not update deletion request', error instanceof Error ? error.message : 'A valid settings-change reason is required')
+      return
+    }
     setSaving(true)
     const { data: response, error: requestError } = await apiMutate<{ user: AdminSettingsUser }>(
       `/api/admin/v1/users/${encodeURIComponent(selectedUser.id)}/settings`,
       'PATCH',
-      { dataDeletionRequestStatus: status },
+      patch,
     )
     setSaving(false)
     if (requestError) {

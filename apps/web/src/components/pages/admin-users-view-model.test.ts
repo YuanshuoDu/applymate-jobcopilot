@@ -40,11 +40,16 @@ describe('admin users view model', () => {
     expect(filterAdminUsers(users, '')).toEqual(users)
   })
 
-  it('builds a bounded settings patch from the two editable groups', () => {
-    const patch = buildAdminSettingsPatch(users[0].preferences.notificationPreferences, users[0].preferences.privacyPreferences)
+  it('builds a bounded and auditable settings patch from the two editable groups', () => {
+    const patch = buildAdminSettingsPatch(
+      users[0].preferences.notificationPreferences,
+      users[0].preferences.privacyPreferences,
+      'Correcting user notification preferences',
+    )
     expect(patch).toEqual({
       notificationPreferences: users[0].preferences.notificationPreferences,
       privacyPreferences: users[0].preferences.privacyPreferences,
+      reason: 'Correcting user notification preferences',
     })
     expect(JSON.stringify(patch)).not.toContain('targetRoles')
   })
@@ -54,17 +59,31 @@ describe('admin users view model', () => {
     expect(getDeletionRequestLabel(users[0])).toBe('No deletion request')
   })
 
-  it('does not include read-only operational fields in the settings patch', () => {
+  it('records deletion workflow changes with the required audit reason only', () => {
     const patch = buildAdminSettingsPatch(
       users[0].preferences.notificationPreferences,
       users[0].preferences.privacyPreferences,
+      'Recording GDPR deletion completion',
+      'completed',
     )
     expect(patch).toEqual({
       notificationPreferences: users[0].preferences.notificationPreferences,
       privacyPreferences: users[0].preferences.privacyPreferences,
+      reason: 'Recording GDPR deletion completion',
+      dataDeletionRequestStatus: 'completed',
     })
     expect(JSON.stringify(patch)).not.toContain('plan')
     expect(JSON.stringify(patch)).not.toContain('targetLocations')
+  })
+
+  it('rejects missing and too-short audit reasons before a request is sent', () => {
+    for (const reason of ['', 'too short']) {
+      expect(() => buildAdminSettingsPatch(
+        users[0].preferences.notificationPreferences,
+        users[0].preferences.privacyPreferences,
+        reason,
+      )).toThrow('between 10 and 500 characters')
+    }
   })
 
   it('offers only the allowed administrative actions for an active deletion request', () => {
