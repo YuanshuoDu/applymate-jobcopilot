@@ -38,6 +38,14 @@ describe('ObservabilityPage', () => {
             messaging: { resend: false },
             infrastructure: { database: true, redis: false },
           },
+          readiness: {
+            candidateSettings: {
+              migrations: { state: 'unavailable', missing: [] },
+              superAdminPermission: 'unavailable',
+              currentActorPermission: 'ready',
+            },
+            workerControl: { state: 'missing', urlConfigured: false, secretConfigured: false, redisConfigured: true },
+          },
         },
         loading: false,
         error: null,
@@ -49,6 +57,10 @@ describe('ObservabilityPage', () => {
     expect(html).not.toContain('ApplyMate AI · MiniMax · ready')
     expect(html).toContain('Operational applies')
     expect(html).toContain('All users · operational count')
+    expect(html).toContain('Deployment readiness')
+    expect(html).toContain('Settings migrations: Unavailable')
+    expect(html).toContain('Database readiness checks are unavailable.')
+    expect(html).toContain('Worker controls need: URL and shared secret')
     expect(mocks.links).toContain('/admin/users')
   })
 })

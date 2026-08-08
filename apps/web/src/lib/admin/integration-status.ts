@@ -33,7 +33,13 @@ export type PlatformIntegrationStatus = {
   discovery: { adzuna: boolean; rapidapi: boolean }
   oauth: { google: boolean; github: boolean }
   messaging: { resend: boolean }
-  infrastructure: { database: boolean; redis: boolean; workerControl: boolean }
+  infrastructure: {
+    database: boolean
+    redis: boolean
+    workerControl: boolean
+    workerControlUrl: boolean
+    workerControlSecret: boolean
+  }
   privacy: typeof PRIVACY_CAPABILITIES
 }
 
@@ -91,6 +97,8 @@ export function userIntegrationStatus(input: {
 
 export function platformIntegrationStatus(): PlatformIntegrationStatus {
   const oauthStateReady = getOAuthStateSecret() !== null
+  const workerControlUrl = hasValue(process.env.WORKER_CONTROL_URL)
+  const workerControlSecret = hasValue(process.env.WORKER_CONTROL_SECRET)
   return {
     ai: { providers: platformProviderStatus() },
     discovery: {
@@ -105,7 +113,9 @@ export function platformIntegrationStatus(): PlatformIntegrationStatus {
     infrastructure: {
       database: hasValue(process.env.DATABASE_URL),
       redis: hasValue(process.env.REDIS_URL),
-      workerControl: hasValue(process.env.WORKER_CONTROL_URL) && hasValue(process.env.WORKER_CONTROL_SECRET),
+      workerControl: workerControlUrl && workerControlSecret,
+      workerControlUrl,
+      workerControlSecret,
     },
     privacy: PRIVACY_CAPABILITIES,
   }

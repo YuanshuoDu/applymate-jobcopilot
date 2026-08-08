@@ -3,6 +3,7 @@ import { db } from '@/lib/db'
 import { ok } from '@/lib/api-helpers'
 import { writeAdminAudit } from '@/lib/admin/audit'
 import { isAdminResponse, requireAdmin } from '@/lib/admin/authorization'
+import { getDeploymentReadiness } from '@/lib/admin/deployment-readiness'
 import { platformIntegrationStatus } from '@/lib/admin/integration-status'
 
 function adminOk<T>(data: T, requestId: string) {
@@ -35,11 +36,13 @@ export async function GET(req: NextRequest) {
   const actor = await requireAdmin('observability.read', req)
   if (isAdminResponse(actor)) return actor
 
-  const [total, plans, applies, deletionRequests] = await Promise.all([
+  const integrations = platformIntegrationStatus()
+  const [total, plans, applies, deletionRequests, readiness] = await Promise.all([
     db.user.count(),
     db.user.groupBy({ by: ['plan'], _count: { _all: true } }),
     db.applyResult.count(),
     deletionRequestCounts(),
+    getDeploymentReadiness(actor, integrations),
   ])
 
   const byPlan = { free: 0, pro: 0, enterprise: 0 }
@@ -53,7 +56,8 @@ export async function GET(req: NextRequest) {
     users: { total: Number(total), byPlan },
     applies: { total: Number(applies) },
     deletionRequests,
-    integrations: platformIntegrationStatus(),
+    integrations,
+    readiness,
     generatedAt: new Date().toISOString(),
   }, actor.requestId)
 }

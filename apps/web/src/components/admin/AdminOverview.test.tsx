@@ -23,6 +23,14 @@ describe('AdminOverview', () => {
             messaging: { resend: true },
             infrastructure: { database: true, redis: false, workerControl: true },
           },
+          readiness: {
+            candidateSettings: {
+              migrations: { state: 'missing', missing: ['20260807110000_add_user_preferences_admin_permission'] },
+              superAdminPermission: 'missing',
+              currentActorPermission: 'missing',
+            },
+            workerControl: { state: 'missing', urlConfigured: false, secretConfigured: false, redisConfigured: false },
+          },
         },
         loading: false,
         error: null,
@@ -45,6 +53,10 @@ describe('AdminOverview', () => {
     expect(html).toContain('Platform integrations')
     expect(html).toContain('MiniMax')
     expect(html).toContain('Worker control')
+    expect(html).toContain('Deployment readiness')
+    expect(html).toContain('Settings migrations: Missing')
+    expect(html).toContain('Current admin: Missing')
+    expect(html).toContain('Worker controls need: URL and shared secret')
     expect(html).toContain('Ready')
     expect(html).toContain('Missing')
     expect(mocks.useApi).toHaveBeenCalledWith('/api/admin/v1/queues', { enabled: true })

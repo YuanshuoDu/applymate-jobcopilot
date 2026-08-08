@@ -8,6 +8,7 @@ const mocks = vi.hoisted(() => ({
   userGroupBy: vi.fn(),
   applyCount: vi.fn(),
   queryRaw: vi.fn(),
+  readiness: vi.fn(),
 }))
 
 vi.mock('@/lib/admin/authorization', () => ({ requireAdmin: mocks.requireAdmin, isAdminResponse: (value: unknown) => value instanceof Response }))
@@ -19,9 +20,10 @@ vi.mock('@/lib/admin/integration-status', () => ({
     discovery: { adzuna: false, rapidapi: true },
     oauth: { google: true, github: false },
     messaging: { resend: true },
-    infrastructure: { database: true, redis: false },
+    infrastructure: { database: true, redis: false, workerControl: false, workerControlUrl: false, workerControlSecret: false },
   }),
 }))
+vi.mock('@/lib/admin/deployment-readiness', () => ({ getDeploymentReadiness: mocks.readiness }))
 vi.mock('@/lib/db', () => ({ db: {
   user: { count: mocks.userCount, groupBy: mocks.userGroupBy },
   applyResult: { count: mocks.applyCount },
@@ -45,9 +47,17 @@ describe('GET /api/admin/v1/platform', () => {
     ])
     mocks.applyCount.mockResolvedValue(30)
     mocks.queryRaw.mockResolvedValue([{ status: 'requested', count: 1 }, { status: 'processing', count: 2 }])
+    mocks.readiness.mockResolvedValue({
+      candidateSettings: {
+        migrations: { state: 'missing', missing: ['20260807110000_add_user_preferences_admin_permission'] },
+        superAdminPermission: 'missing',
+        currentActorPermission: 'missing',
+      },
+      workerControl: { state: 'missing', urlConfigured: false, secretConfigured: false, redisConfigured: false },
+    })
   })
 
-  it('requires observability.read and returns operational counts with boolean integration health', async () => {
+  it('requires observability.read and returns operational counts with deployment readiness', async () => {
     const { GET } = await import('./route')
     const response = await GET(new Request('http://localhost/api/admin/v1/platform') as never)
 
@@ -58,7 +68,12 @@ describe('GET /api/admin/v1/platform', () => {
       applies: { total: 30 },
       deletionRequests: { requested: 1, processing: 2 },
       integrations: { discovery: { rapidapi: true } },
+      readiness: { candidateSettings: { superAdminPermission: 'missing' } },
     })
+    expect(mocks.readiness).toHaveBeenCalledWith(
+      expect.objectContaining({ userId: 'admin_1' }),
+      expect.objectContaining({ infrastructure: expect.objectContaining({ workerControl: false }) }),
+    )
     expect(response.headers.get('Cache-Control')).toBe('no-store')
     expect(mocks.audit).toHaveBeenCalledWith(expect.objectContaining({ action: 'platform.viewed' }))
   })
@@ -70,5 +85,6 @@ describe('GET /api/admin/v1/platform', () => {
 
     expect(response.status).toBe(403)
     expect(mocks.userCount).not.toHaveBeenCalled()
+    expect(mocks.readiness).not.toHaveBeenCalled()
   })
 })

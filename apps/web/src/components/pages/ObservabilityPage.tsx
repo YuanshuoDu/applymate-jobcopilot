@@ -3,9 +3,12 @@
 import React from 'react'
 import Link from 'next/link'
 import { ExternalLink, RefreshCw } from 'lucide-react'
+import { DeploymentReadinessPanel } from '@/components/admin/DeploymentReadinessPanel'
 import { TopBar } from '@/components/layout/TopBar'
 import { Btn, Card } from '@/components/ui'
+import type { DeploymentReadiness } from '@/lib/admin/deployment-readiness'
 import { useApi } from '@/lib/hooks'
+import type { PlatformIntegrationStatus } from '@/lib/admin/integration-status'
 
 interface ObservabilityData {
   overall: {
@@ -36,14 +39,8 @@ interface PlatformData {
   users: { total: number; byPlan: { free: number; pro: number; enterprise: number } }
   applies: { total: number }
   deletionRequests: { requested: number; processing: number }
-  integrations: {
-    ai: { providers: Record<string, boolean> }
-    discovery: { adzuna: boolean; rapidapi: boolean }
-    oauth: { google: boolean; github: boolean }
-    messaging: { resend: boolean }
-    infrastructure: { database: boolean; redis: boolean; workerControl: boolean }
-    privacy?: { usageAnalytics: boolean; aiTraining: boolean; coverLetterRetention: boolean }
-  }
+  integrations: PlatformIntegrationStatus
+  readiness?: DeploymentReadiness
 }
 
 const FLOW_COLORS: Record<string, string> = {
@@ -98,6 +95,7 @@ export function ObservabilityPage() {
   const { data, loading, error, refetch } = useApi<ObservabilityData>('/api/admin/v1/observability', { cache: false })
   const { data: platform, loading: platformLoading, error: platformError, refetch: refetchPlatform } = useApi<PlatformData>('/api/admin/v1/platform', { cache: false })
   const overall = data?.overall
+  const readiness = platform?.readiness
   const flowEntries = overall
     ? Object.entries(overall.byFlowUsed).map(([key, value]) => ({ key, value }))
     : []
@@ -166,6 +164,7 @@ export function ObservabilityPage() {
           <div style={{ marginTop: 9, fontSize: 10, color: 'var(--text-muted)' }}>Health is configuration presence only; raw keys, OAuth tokens, and user content are never returned.</div>
           {platform?.integrations.privacy && <div style={{ marginTop: 5, fontSize: 10, color: 'var(--text-muted)' }}>Privacy: usage analytics honor candidate consent · AI training pipeline is currently disabled.</div>}
         </Card>
+        <DeploymentReadinessPanel readiness={readiness} />
 
         <section style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(170px, 1fr))', gap: 12 }}>
           <StatCard label="Analytics applies" value={loading ? '…' : String(overall?.total ?? 0)} sub="Consented analytics · all time" />

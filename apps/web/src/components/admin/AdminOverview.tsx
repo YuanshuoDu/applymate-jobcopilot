@@ -1,12 +1,14 @@
 'use client'
 
 import { AlertTriangle, CalendarDays, ShieldCheck } from 'lucide-react'
+import { DeploymentReadinessPanel } from '@/components/admin/DeploymentReadinessPanel'
+import type { DeploymentReadiness } from '@/lib/admin/deployment-readiness'
 import { useApi } from '@/lib/hooks'
 import type { PlatformIntegrationStatus } from '@/lib/admin/integration-status'
 
 type Metrics = { overall: { total: number; successRate: number; avgDurationMs: number; captchaRate: number; last24h: { count: number; successRate: number } }; platform: { registeredUsers: number; registrationsLast7d: number; plans: Record<string, number>; sources: { employers: number; jobs: number }; overdueSupportCases: number } }
 type QueueData = { queues: { counts: Record<string, number> }[] }
-type PlatformData = { integrations: PlatformIntegrationStatus }
+type PlatformData = { integrations: PlatformIntegrationStatus; readiness?: DeploymentReadiness }
 type AdminOverviewProps = { permissions: readonly string[] }
 
 function Metric({ label, value, detail }: { label: string; value: string; detail: string }) {
@@ -21,6 +23,7 @@ export function AdminOverview({ permissions }: AdminOverviewProps) {
   const metrics = data?.overall
   const platform = data?.platform
   const integrations = platformSummary.data?.integrations
+  const readiness = platformSummary.data?.readiness
   const integrationChecks = integrations ? [
     ['MiniMax', integrations.ai.providers.minimax],
     ['Adzuna', integrations.discovery.adzuna],
@@ -51,6 +54,7 @@ export function AdminOverview({ permissions }: AdminOverviewProps) {
       </div>
       <section className="admin-status-panel"><ShieldCheck size={19} /><div><strong>Privacy controls active</strong><p>{planSummary}. Operational screens use allow-listed metadata only. Secrets, documents, and mailbox content are excluded.</p></div></section>
       <section className="admin-status-panel admin-integration-panel" aria-label="Platform integrations"><div><strong>Platform integrations</strong><p>{platformSummary.error ? 'Integration status unavailable.' : platformSummary.loading && !integrations ? 'Loading integration status...' : `${readyIntegrations}/${integrationChecks.length} ready`}</p>{integrationChecks.length > 0 && <div className="admin-integration-grid">{integrationChecks.map(([label, ready]) => <span key={label} className="admin-integration-chip" data-ready={ready}>{label}: {ready ? 'Ready' : 'Missing'}</span>)}</div>}</div></section>
+      <DeploymentReadinessPanel readiness={readiness} />
     </div>
   </div>
 }

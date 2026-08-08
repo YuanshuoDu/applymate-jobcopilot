@@ -42,6 +42,8 @@ describe('admin integration status', () => {
     expect(status.ai.providers.minimax).toBe(true)
     expect(status.infrastructure.database).toBe(true)
     expect(status.infrastructure.workerControl).toBe(true)
+    expect(status.infrastructure.workerControlUrl).toBe(true)
+    expect(status.infrastructure.workerControlSecret).toBe(true)
     expect(JSON.stringify(status)).not.toContain('password')
     expect(JSON.stringify(status)).not.toContain('worker-secret')
   })
