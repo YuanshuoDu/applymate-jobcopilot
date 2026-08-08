@@ -26,6 +26,11 @@ const settings = {
       notificationPreferences: { apply: true, reject: true, interview: true, offer: true, weekly: false, followUp: true },
       privacyPreferences: { shareUsageData: true, allowAiTraining: false, storeCoverLetters: true },
     },
+    integrations: {
+      accounts: { gmail: true, github: false },
+      ai: { providers: { minimax: { userConfigured: false, platformConfigured: true, effective: true } }, featureOverrides: 0, customConfigured: false },
+      discovery: { hasAdzuna: false, hasRapidapi: true, userHasAdzuna: false, userHasRapidapi: true, adzunaSource: 'none', rapidapiSource: 'user', needsAdzunaPair: false },
+    },
   },
 }
 
@@ -42,6 +47,9 @@ describe('AdminUserDetailPage', () => {
 
     expect(html).toContain('Candidate settings')
     expect(html).toContain('Notification preferences')
+    expect(html).toContain('Integration status')
+    expect(html).toContain('Gmail: Connected')
+    expect(html).toContain('RapidAPI: Ready')
     expect(html).toContain('Save settings')
     expect(html).not.toContain('apiKey')
   })

@@ -30,6 +30,7 @@ export function AdminOverview({ permissions }: AdminOverviewProps) {
     ['Resend', integrations.messaging.resend],
     ['Database', integrations.infrastructure.database],
     ['Redis', integrations.infrastructure.redis],
+    ['Worker control', integrations.infrastructure.workerControl],
   ] as const : []
   const readyIntegrations = integrationChecks.filter(([, ready]) => ready).length
   const queued = queueSummary.data?.queues.reduce((sum, queue) => sum + (queue.counts.waiting ?? 0) + (queue.counts.active ?? 0), 0) ?? 0

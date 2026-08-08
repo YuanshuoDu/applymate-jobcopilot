@@ -35,11 +35,15 @@ describe('admin integration status', () => {
   it('reports only boolean platform integration health', () => {
     process.env.MINIMAX_API_KEY = 'platform-secret'
     process.env.DATABASE_URL = 'postgres://user:password@example.test/db'
+    process.env.WORKER_CONTROL_URL = 'https://worker.internal'
+    process.env.WORKER_CONTROL_SECRET = 'worker-secret'
     const status = platformIntegrationStatus()
 
     expect(status.ai.providers.minimax).toBe(true)
     expect(status.infrastructure.database).toBe(true)
+    expect(status.infrastructure.workerControl).toBe(true)
     expect(JSON.stringify(status)).not.toContain('password')
+    expect(JSON.stringify(status)).not.toContain('worker-secret')
   })
 
   it('does not report a standard Google sign-in as a Gmail connection', () => {

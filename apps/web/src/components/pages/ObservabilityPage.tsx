@@ -41,7 +41,7 @@ interface PlatformData {
     discovery: { adzuna: boolean; rapidapi: boolean }
     oauth: { google: boolean; github: boolean }
     messaging: { resend: boolean }
-    infrastructure: { database: boolean; redis: boolean }
+    infrastructure: { database: boolean; redis: boolean; workerControl: boolean }
     privacy?: { usageAnalytics: boolean; aiTraining: boolean; coverLetterRetention: boolean }
   }
 }
@@ -156,6 +156,7 @@ export function ObservabilityPage() {
               ['Resend', platform?.integrations.messaging.resend ?? false],
               ['Database', platform?.integrations.infrastructure.database ?? false],
               ['Redis', platform?.integrations.infrastructure.redis ?? false],
+              ['Worker control', platform?.integrations.infrastructure.workerControl ?? false],
             ].map(([label, ready]) => (
               <span key={String(label)} style={{ fontSize: 10, padding: '4px 8px', borderRadius: 999, background: ready ? 'rgba(5,150,105,0.10)' : 'rgba(220,38,38,0.08)', color: ready ? 'var(--c-success)' : 'var(--c-danger)' }}>
                 {String(label)} · {ready ? 'ready' : 'not configured'}

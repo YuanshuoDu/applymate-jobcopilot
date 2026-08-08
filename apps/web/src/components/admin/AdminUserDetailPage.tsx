@@ -4,6 +4,7 @@ import React, { useState } from 'react'
 import Link from 'next/link'
 import { ArrowLeft, CalendarDays, Save } from 'lucide-react'
 import { apiMutate, useApi } from '@/lib/hooks'
+import type { UserIntegrationStatus } from '@/lib/admin/integration-status'
 
 type Detail = {
   user: {
@@ -33,7 +34,7 @@ type Preferences = {
   dataDeletionRequestStatus?: 'requested' | 'processing' | 'completed' | 'cancelled'
 }
 
-type SettingsResponse = { user: { preferences: Preferences } }
+type SettingsResponse = { user: { preferences: Preferences; integrations: UserIntegrationStatus } }
 
 const notificationLabels: Record<string, string> = {
   apply: 'Application updates', reject: 'Rejections', interview: 'Interview invitations', offer: 'Offer notifications', weekly: 'Weekly summary', followUp: 'Follow-up reminders',
@@ -47,6 +48,12 @@ function nextDeletionStatuses(status: Preferences['dataDeletionRequestStatus']) 
   if (status === 'requested') return ['processing', 'cancelled'] as const
   if (status === 'processing') return ['completed', 'cancelled'] as const
   return [] as const
+}
+
+function aiStatusLabel(status: UserIntegrationStatus['ai']['providers'][keyof UserIntegrationStatus['ai']['providers']]) {
+  if (status.userConfigured) return 'User key'
+  if (status.platformConfigured) return 'Platform fallback'
+  return 'Not configured'
 }
 
 function ToggleList({ labels, values, disabled, onChange }: {
@@ -64,6 +71,7 @@ function SettingsPanel({ userId, canUpdatePreferences }: { userId: string; canUp
   const [saving, setSaving] = useState(false)
   const [saveError, setSaveError] = useState<string | null>(null)
   const preferences = draft ?? data?.user.preferences
+  const integrations = data?.user.integrations
   const deletionStatuses = nextDeletionStatuses(preferences?.dataDeletionRequestStatus)
 
   function updateGroup(group: 'notificationPreferences' | 'privacyPreferences', key: string, value: boolean) {
@@ -99,6 +107,7 @@ function SettingsPanel({ userId, canUpdatePreferences }: { userId: string; canUp
     {!preferences && !loading ? <p className="admin-settings-empty">Settings are unavailable for this account.</p> : null}
     {preferences && <>
       <div className="admin-settings-readonly"><span>Target roles: {preferences.targetRoles || 'Not set'}</span><span>Locations: {preferences.targetLocations || 'Not set'}</span><span>Relocation: {preferences.openToRelocation ? 'Open' : 'Not open'}</span></div>
+      {integrations && <section className="admin-settings-integrations"><h3>Integration status</h3><div className="admin-settings-status-list"><span>Gmail: {integrations.accounts.gmail ? 'Connected' : 'Not connected'}</span><span>GitHub: {integrations.accounts.github ? 'Connected' : 'Not connected'}</span><span>Adzuna: {integrations.discovery.hasAdzuna ? 'Ready' : 'Not configured'}</span><span>RapidAPI: {integrations.discovery.hasRapidapi ? 'Ready' : 'Not configured'}</span>{Object.entries(integrations.ai.providers).map(([provider, status]) => <span key={provider}>{provider}: {aiStatusLabel(status)}</span>)}</div><p className="admin-settings-integration-note">Only readiness and source labels are shown. API keys, OAuth tokens, documents and mailbox content are excluded.</p></section>}
       <div className="admin-settings-grid">
         <section><h3>Notification preferences</h3><ToggleList labels={notificationLabels} values={preferences.notificationPreferences} disabled={!canUpdatePreferences || saving} onChange={(key, value) => updateGroup('notificationPreferences', key, value)} /></section>
         <section><h3>Privacy preferences</h3><ToggleList labels={privacyLabels} values={preferences.privacyPreferences} disabled={!canUpdatePreferences || saving} onChange={(key, value) => updateGroup('privacyPreferences', key, value)} /></section>

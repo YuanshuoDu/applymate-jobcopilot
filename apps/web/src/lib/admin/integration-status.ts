@@ -32,7 +32,7 @@ export type PlatformIntegrationStatus = {
   discovery: { adzuna: boolean; rapidapi: boolean }
   oauth: { google: boolean; github: boolean }
   messaging: { resend: boolean }
-  infrastructure: { database: boolean; redis: boolean }
+  infrastructure: { database: boolean; redis: boolean; workerControl: boolean }
   privacy: typeof PRIVACY_CAPABILITIES
 }
 
@@ -103,6 +103,7 @@ export function platformIntegrationStatus(): PlatformIntegrationStatus {
     infrastructure: {
       database: hasValue(process.env.DATABASE_URL),
       redis: hasValue(process.env.REDIS_URL),
+      workerControl: hasValue(process.env.WORKER_CONTROL_URL) && hasValue(process.env.WORKER_CONTROL_SECRET),
     },
     privacy: PRIVACY_CAPABILITIES,
   }

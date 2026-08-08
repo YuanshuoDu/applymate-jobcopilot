@@ -21,7 +21,7 @@ describe('AdminOverview', () => {
             discovery: { adzuna: true, rapidapi: false },
             oauth: { google: true, github: false },
             messaging: { resend: true },
-            infrastructure: { database: true, redis: false },
+            infrastructure: { database: true, redis: false, workerControl: true },
           },
         },
         loading: false,
@@ -44,6 +44,7 @@ describe('AdminOverview', () => {
 
     expect(html).toContain('Platform integrations')
     expect(html).toContain('MiniMax')
+    expect(html).toContain('Worker control')
     expect(html).toContain('Ready')
     expect(html).toContain('Missing')
     expect(mocks.useApi).toHaveBeenCalledWith('/api/admin/v1/queues', { enabled: true })
