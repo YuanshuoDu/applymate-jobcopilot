@@ -7,7 +7,7 @@
  * See: docs/scraping-autoapply-design.md §8 (Compliance)
  */
 
-import { ATS_POLICIES } from "../../../../../../packages/shared/src/ats-policy"
+import { ATS_POLICIES } from "@jobcopilot/shared"
 
 export interface RatePolicy {
   host: string        // e.g. "boards-api.greenhouse.io"

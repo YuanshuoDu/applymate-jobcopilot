@@ -1,5 +1,5 @@
 import { AtsSourceState } from '@prisma/client'
-import { getHardRpsLimit, isAtsSourceKey as isSharedAtsSourceKey } from '../../../../../packages/shared/src/ats-policy'
+import { getHardRpsLimit, isAtsSourceKey as isSharedAtsSourceKey } from '@jobcopilot/shared'
 
 export type AtsPolicyInput = {
   rolloutPercent: number
