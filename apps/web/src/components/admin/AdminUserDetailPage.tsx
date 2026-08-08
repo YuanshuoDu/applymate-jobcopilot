@@ -5,6 +5,8 @@ import Link from 'next/link'
 import { ArrowLeft, CalendarDays, Save } from 'lucide-react'
 import { apiMutate, useApi } from '@/lib/hooks'
 import type { UserIntegrationStatus } from '@/lib/admin/integration-status'
+import type { PrivacyPreferences } from '@/lib/types'
+import { editablePrivacyPreferences, isPrivacyPreferenceAvailable } from '@/lib/privacy-consent'
 
 type Detail = {
   user: {
@@ -30,7 +32,7 @@ type Preferences = {
   workAuthorization: string
   openToRelocation: boolean
   notificationPreferences: Record<string, boolean>
-  privacyPreferences: Record<string, boolean>
+  privacyPreferences: PrivacyPreferences
   dataDeletionRequestStatus?: 'requested' | 'processing' | 'completed' | 'cancelled'
 }
 
@@ -56,13 +58,17 @@ function aiStatusLabel(status: UserIntegrationStatus['ai']['providers'][keyof Us
   return 'Not configured'
 }
 
-function ToggleList({ labels, values, disabled, onChange }: {
+function ToggleList<T extends object>({ labels, values, disabled, onChange, isAvailable }: {
   labels: Record<string, string>
-  values: Record<string, boolean>
+  values: T
   disabled: boolean
   onChange: (key: string, value: boolean) => void
+  isAvailable?: (key: string) => boolean
 }) {
-  return <div className="admin-settings-list">{Object.entries(labels).map(([key, label]) => <label key={key} className="admin-settings-toggle"><span>{label}</span><input type="checkbox" checked={values[key] ?? false} disabled={disabled} onChange={(event) => onChange(key, event.target.checked)} /></label>)}</div>
+  return <div className="admin-settings-list">{Object.entries(labels).map(([key, label]) => {
+    const available = isAvailable?.(key) ?? true
+    return <label key={key} className="admin-settings-toggle"><span>{label}{available ? '' : ' (currently unavailable)'}</span><input type="checkbox" checked={Boolean(values[key as keyof T])} disabled={disabled || !available} onChange={(event) => onChange(key, event.target.checked)} /></label>
+  })}</div>
 }
 
 function SettingsPanel({ userId, canUpdatePreferences }: { userId: string; canUpdatePreferences: boolean }) {
@@ -88,7 +94,7 @@ function SettingsPanel({ userId, canUpdatePreferences }: { userId: string; canUp
     const original = data?.user.preferences
     const result = await apiMutate<SettingsResponse>(`/api/admin/v1/users/${userId}/settings`, 'PATCH', {
       notificationPreferences: preferences.notificationPreferences,
-      privacyPreferences: preferences.privacyPreferences,
+      privacyPreferences: editablePrivacyPreferences(preferences.privacyPreferences),
       reason,
       ...(preferences.dataDeletionRequestStatus && preferences.dataDeletionRequestStatus !== original?.dataDeletionRequestStatus ? { dataDeletionRequestStatus: preferences.dataDeletionRequestStatus } : {}),
     })
@@ -110,7 +116,7 @@ function SettingsPanel({ userId, canUpdatePreferences }: { userId: string; canUp
       {integrations && <section className="admin-settings-integrations"><h3>Integration status</h3><div className="admin-settings-status-list"><span>Gmail: {integrations.accounts.gmail ? 'Connected' : 'Not connected'}</span><span>GitHub: {integrations.accounts.github ? 'Connected' : 'Not connected'}</span><span>Adzuna: {integrations.discovery.hasAdzuna ? 'Ready' : 'Not configured'}</span><span>RapidAPI: {integrations.discovery.hasRapidapi ? 'Ready' : 'Not configured'}</span>{Object.entries(integrations.ai.providers).map(([provider, status]) => <span key={provider}>{provider}: {aiStatusLabel(status)}</span>)}</div><p className="admin-settings-integration-note">Only readiness and source labels are shown. API keys, OAuth tokens, documents and mailbox content are excluded.</p></section>}
       <div className="admin-settings-grid">
         <section><h3>Notification preferences</h3><ToggleList labels={notificationLabels} values={preferences.notificationPreferences} disabled={!canUpdatePreferences || saving} onChange={(key, value) => updateGroup('notificationPreferences', key, value)} /></section>
-        <section><h3>Privacy preferences</h3><ToggleList labels={privacyLabels} values={preferences.privacyPreferences} disabled={!canUpdatePreferences || saving} onChange={(key, value) => updateGroup('privacyPreferences', key, value)} /></section>
+        <section><h3>Privacy preferences</h3><ToggleList labels={privacyLabels} values={preferences.privacyPreferences} disabled={!canUpdatePreferences || saving} onChange={(key, value) => updateGroup('privacyPreferences', key, value)} isAvailable={(key) => isPrivacyPreferenceAvailable(key as 'shareUsageData' | 'allowAiTraining' | 'storeCoverLetters')} /></section>
       </div>
       {preferences.dataDeletionRequestStatus && <label className="admin-settings-deletion">Deletion request<select value={preferences.dataDeletionRequestStatus} disabled={!canUpdatePreferences || saving || deletionStatuses.length === 0} onChange={(event) => setDraft({ ...preferences, dataDeletionRequestStatus: event.target.value as Preferences['dataDeletionRequestStatus'] })}><option value={preferences.dataDeletionRequestStatus}>{preferences.dataDeletionRequestStatus}</option>{deletionStatuses.map(status => <option key={status} value={status}>{status}</option>)}</select></label>}
       {canUpdatePreferences ? <button type="button" className="admin-secondary" onClick={() => void save()} disabled={saving}><Save size={15} />{saving ? 'Saving...' : 'Save settings'}</button> : <p className="admin-settings-readonly-notice">You can view settings but do not have permission to edit them.</p>}

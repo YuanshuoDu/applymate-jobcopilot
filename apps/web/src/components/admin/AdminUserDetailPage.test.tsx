@@ -60,4 +60,11 @@ describe('AdminUserDetailPage', () => {
     expect(html).toContain('You can view settings but do not have permission to edit them.')
     expect(html).not.toContain('Save settings')
   })
+
+  it('keeps unavailable privacy capabilities read-only for administrators', () => {
+    const html = renderToStaticMarkup(React.createElement(AdminUserDetailPage, { userId: 'user_1', canUpdatePreferences: true }))
+
+    expect(html).toContain('Allow AI training (currently unavailable)')
+    expect(html).toMatch(/Allow AI training \(currently unavailable\)<\/span><input type="checkbox" disabled=""/)
+  })
 })

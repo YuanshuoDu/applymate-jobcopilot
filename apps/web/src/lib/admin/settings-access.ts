@@ -6,6 +6,7 @@ import {
   type SettingsPreferences,
 } from '@/lib/settings-preferences'
 import type { NotificationPreferences, PrivacyPreferences, UserPreferences } from '@/lib/types'
+import { isPrivacyPreferenceAvailable } from '@/lib/privacy-consent'
 import { userIntegrationStatus } from './integration-status'
 
 type StoredUser = Record<string, unknown>
@@ -159,6 +160,8 @@ export function parseAdminSettingsPatch(value: unknown): AdminSettingsPatch | { 
   if (body.privacyPreferences !== undefined) {
     const parsed = parseBooleanMap(body.privacyPreferences, PRIVACY_KEYS)
     if ('error' in parsed) return parsed
+    const unavailable = Object.keys(parsed).find(key => !isPrivacyPreferenceAvailable(key as keyof PrivacyPreferences))
+    if (unavailable) return { error: `${unavailable} is currently unavailable` }
     patch.privacyPreferences = parsed
   }
   if (body.dataDeletionRequestStatus !== undefined) {

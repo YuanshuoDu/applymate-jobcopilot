@@ -16,6 +16,14 @@ export function isPrivacyPreferenceAvailable(key: keyof PrivacyPreferences): boo
   return key !== 'allowAiTraining' || PRIVACY_CAPABILITIES.aiTraining
 }
 
+export function editablePrivacyPreferences(preferences: PrivacyPreferences): Partial<PrivacyPreferences> {
+  const editable: Partial<PrivacyPreferences> = {}
+  for (const key of Object.keys(preferences) as Array<keyof PrivacyPreferences>) {
+    if (isPrivacyPreferenceAvailable(key)) editable[key] = preferences[key]
+  }
+  return editable
+}
+
 export function allowsUsageAnalytics(preferences: unknown): boolean {
   return readPrivacyPreferences(preferences).shareUsageData
 }

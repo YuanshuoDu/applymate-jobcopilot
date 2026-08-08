@@ -14,6 +14,7 @@ import {
   parseAdminSettingsPatch,
   toAdminSettingsDto,
 } from './settings-access'
+import { mergeUserPreferences } from '@/lib/settings-preferences'
 
 describe('admin settings access', () => {
   it('returns only masked settings metadata and never serializes secret fields', () => {
@@ -56,6 +57,27 @@ describe('admin settings access', () => {
     })
     expect(parseAdminSettingsPatch({ aiSettings: { keys: { openai: 'secret' } } })).toMatchObject({ error: expect.any(String) })
     expect(parseAdminSettingsPatch({ privacyPreferences: { allowAiTraining: 'yes' } })).toMatchObject({ error: expect.any(String) })
+  })
+
+  it('rejects unavailable privacy controls while retaining editable privacy changes', () => {
+    expect(parseAdminSettingsPatch({ privacyPreferences: { allowAiTraining: true } })).toEqual({
+      error: 'allowAiTraining is currently unavailable',
+    })
+    expect(parseAdminSettingsPatch({ privacyPreferences: { shareUsageData: false, storeCoverLetters: false } })).toEqual({
+      privacyPreferences: { shareUsageData: false, storeCoverLetters: false },
+    })
+  })
+
+  it('preserves an unavailable stored value while applying editable privacy changes', () => {
+    const patch = parseAdminSettingsPatch({ privacyPreferences: { shareUsageData: false, storeCoverLetters: false } })
+    expect('error' in patch).toBe(false)
+    if ('error' in patch) return
+
+    expect(mergeUserPreferences({
+      privacyPreferences: { shareUsageData: true, allowAiTraining: true, storeCoverLetters: true },
+    }, patch)).toMatchObject({
+      privacyPreferences: { shareUsageData: false, allowAiTraining: true, storeCoverLetters: false },
+    })
   })
 
   it('serializes Prisma Date values in the admin account metadata', () => {

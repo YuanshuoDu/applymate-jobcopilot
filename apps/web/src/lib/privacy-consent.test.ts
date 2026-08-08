@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest'
 import {
   allowsAiTraining,
   allowsUsageAnalytics,
+  editablePrivacyPreferences,
   hasUsageAnalyticsConsentChanged,
   isPrivacyPreferenceAvailable,
   PRIVACY_CAPABILITIES,
@@ -28,5 +29,12 @@ describe('privacy consent', () => {
       { shareUsageData: false },
       { shareUsageData: false },
     )).toBe(false)
+  })
+
+  it('excludes unavailable privacy controls from an admin write payload', () => {
+    expect(editablePrivacyPreferences({ shareUsageData: false, allowAiTraining: true, storeCoverLetters: false })).toEqual({
+      shareUsageData: false,
+      storeCoverLetters: false,
+    })
   })
 })
