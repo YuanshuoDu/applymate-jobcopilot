@@ -1,14 +1,9 @@
 import { NextResponse } from 'next/server'
 import type { NextRequest } from 'next/server'
-import { jwtVerify } from 'jose'
 import { auth } from '@/lib/auth'
-import { getAuthJwtSecret } from '@/lib/auth-secret'
 import { applyAdminSecurityHeaders } from '@/lib/admin/http-security'
 
-const API_PROTECTED = ['/api/jobs', '/api/dashboard', '/api/resume', '/api/activity', '/api/agent', '/api/me']
 const PUBLIC_ROUTES = ['/login', '/register', '/forgot-password', '/reset-password', '/api/auth']
-
-const JWT_SECRET = getAuthJwtSecret()
 
 export async function middleware(req: NextRequest) {
   const { pathname } = req.nextUrl
@@ -24,23 +19,10 @@ export async function middleware(req: NextRequest) {
     return applyAdminSecurityHeaders(NextResponse.next())
   }
 
-  // ── API routes: check Bearer token ─────────────────────────
-  if (API_PROTECTED.some(p => pathname.startsWith(p))) {
-    const authHeader = req.headers.get('authorization')
-    if (authHeader?.startsWith('Bearer ')) {
-      const token = authHeader.slice(7)
-      try {
-        const { payload } = await jwtVerify(token, JWT_SECRET)
-        if (payload.sub) {
-          const headers = new Headers(req.headers)
-          headers.set('x-user-id', payload.sub as string)
-          return NextResponse.next({ request: { headers } })
-        }
-      } catch {
-        return NextResponse.json({ error: 'Invalid token' }, { status: 401 })
-      }
-    }
-    // Fall through — route handlers call auth() for session check
+  // API handlers own authentication (session, bearer token, admin permission,
+  // or internal secret) and must return API-shaped errors instead of a page
+  // redirect. Middleware only adds the admin response headers above.
+  if (pathname === '/api' || pathname.startsWith('/api/')) {
     return NextResponse.next()
   }
 
