@@ -12,6 +12,7 @@ const mocks = vi.hoisted(() => ({
   jobFindFirst: vi.fn(),
   activityCreate: vi.fn(),
   enqueueApplyTask: vi.fn(),
+  runtimeFeatureEnabled: vi.fn(),
 }));
 
 vi.mock("@/lib/db", () => ({
@@ -28,6 +29,7 @@ vi.mock("@/lib/db", () => ({
 }));
 
 vi.mock("@/lib/apply-queue-client", () => ({ enqueueApplyTask: mocks.enqueueApplyTask }));
+vi.mock("@/lib/runtime-feature-flags", () => ({ isRuntimeFeatureEnabled: mocks.runtimeFeatureEnabled }));
 
 describe("auto-apply authorization", () => {
   const input = {
@@ -57,6 +59,7 @@ describe("auto-apply authorization", () => {
       return Promise.all(callback);
     });
     mocks.enqueueApplyTask.mockResolvedValue("worker_1");
+    mocks.runtimeFeatureEnabled.mockResolvedValue(true);
     mocks.activityCreate.mockResolvedValue({});
     mocks.taskUpdate.mockResolvedValue({});
     mocks.taskEventCreate.mockResolvedValue({});
@@ -79,6 +82,18 @@ describe("auto-apply authorization", () => {
     })).resolves.toEqual({ taskId: "worker_1" });
     expect(mocks.enqueueApplyTask).toHaveBeenCalledWith(expect.objectContaining({ operation: "fill" }));
     expect(mocks.jobUpdateMany).not.toHaveBeenCalled();
+  });
+
+  it("does not queue unattended browser work when the platform control is disabled", async () => {
+    mocks.runtimeFeatureEnabled.mockResolvedValueOnce(false);
+    mocks.taskUpdate.mockResolvedValueOnce({ count: 1 });
+    const { queueApplicationFill } = await import("./auto-apply");
+
+    await expect(queueApplicationFill({
+      userId: "user_1", jobId: "job_1", applicationTaskId: "application_1", applyUrl: input.applyUrl,
+    })).rejects.toThrow("temporarily unavailable");
+
+    expect(mocks.enqueueApplyTask).not.toHaveBeenCalled();
   });
 
   it("rejects a global setting or unrelated approval as submission consent", async () => {

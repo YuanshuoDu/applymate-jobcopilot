@@ -115,4 +115,16 @@ describe("runLeverFlow", () => {
     expect(result.status).toBe("manual");
     expect(result.error).toContain("Submit button not found");
   });
+
+  it("stops at review when submission authorization is revoked", async () => {
+    const beforeSubmit = vi.fn().mockResolvedValue(false);
+    const result = await runLeverFlow(mockLeverPage(), {
+      jobId: "job-4", applyUrl: "https://jobs.lever.co/spotify/abc123/apply",
+      persona: { fullName: "Jean Dupont", email: "jean@example.com" },
+      jobTitle: "Engineer", jobCompany: "Spotify", resumePath: "/resume.pdf", beforeSubmit,
+    });
+
+    expect(beforeSubmit).toHaveBeenCalledOnce();
+    expect(result).toMatchObject({ status: "manual", reviewReady: true });
+  });
 });

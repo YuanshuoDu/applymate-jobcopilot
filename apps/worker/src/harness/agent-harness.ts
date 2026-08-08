@@ -41,6 +41,8 @@ export interface ApplyTask {
   coverLetterPath?: string;
   dryRun?: boolean;
   allowSubmit?: boolean;
+  /** Re-evaluates runtime controls before a submit or generic click can advance a form. */
+  beforeSubmit?: () => Promise<boolean>;
   /** Per-application values explicitly entered by the candidate after a pause. */
   confirmedAnswers?: Record<string, string>;
 }
@@ -131,6 +133,9 @@ export class AgentHarness {
           };
           this.turns.push(logEntry);
           this.logTurn(logEntry);
+          if (task.allowSubmit === false || !await submissionAuthorized(task)) {
+            return this.buildUncertainSubmissionResult(task.jobId, Date.now() - startedAt, fieldMappings);
+          }
           return this.buildResult("submitted", task.jobId, Date.now() - startedAt, undefined, fieldMappings);
         }
 
@@ -179,6 +184,9 @@ export class AgentHarness {
           if (task.allowSubmit === false) {
             return this.buildReviewResult(task.jobId, Date.now() - startedAt);
           }
+          if (!await submissionAuthorized(task)) {
+            return this.buildReviewResult(task.jobId, Date.now() - startedAt);
+          }
           return this.buildResult("submitted", task.jobId, Date.now() - startedAt, undefined, this.collectFieldMappings());
         }
 
@@ -193,8 +201,20 @@ export class AgentHarness {
         if (action.type === "manual") {
           return this.buildResult("manual", task.jobId, Date.now() - startedAt, action.reasoning);
         }
-        if (action.type === "submit" && task.allowSubmit === false) {
-          return this.buildReviewResult(task.jobId, Date.now() - startedAt);
+        if (action.type === "submit") {
+          if (task.allowSubmit === false || !await submissionAuthorized(task)) {
+            return this.buildReviewResult(task.jobId, Date.now() - startedAt);
+          }
+        }
+        if (action.type === "click" && action.selector) {
+          // A custom form control can submit through a JavaScript handler without
+          // exposing a native submit type. A live Worker authorization therefore
+          // gates every generic click; the DOM heuristic remains a fallback for
+          // callers that do not supply a live authorization callback.
+          const needsAuthorization = task.beforeSubmit ? true : await clickMaySubmit(page, action.selector);
+          if (needsAuthorization && (task.allowSubmit === false || !await submissionAuthorized(task))) {
+            return this.buildReviewResult(task.jobId, Date.now() - startedAt);
+          }
         }
 
         // ── Execute ──
@@ -306,6 +326,20 @@ export class AgentHarness {
     };
   }
 
+  private buildUncertainSubmissionResult(
+    jobId: string,
+    durationMs: number,
+    fieldMappings: Record<string, string>,
+  ): HarnessResult {
+    return this.buildResult(
+      "manual",
+      jobId,
+      durationMs,
+      "The application may have been submitted, but authorization was revoked and the result could not be confirmed.",
+      fieldMappings,
+    );
+  }
+
   private collectFieldMappings(): Record<string, string> {
     const fieldMappings: Record<string, string> = {};
     for (const turn of this.turns) {
@@ -319,6 +353,35 @@ export class AgentHarness {
 
   private logTurn(log: TurnLog): void {
     console.log(JSON.stringify(log));
+  }
+}
+
+async function submissionAuthorized(task: ApplyTask): Promise<boolean> {
+  try {
+    return task.beforeSubmit ? await task.beforeSubmit() : true;
+  } catch {
+    return false;
+  }
+}
+
+async function clickMaySubmit(page: Page, selector: string): Promise<boolean> {
+  try {
+    return await page.$eval(selector, (element) => {
+      const tag = element.tagName.toLowerCase();
+      const type = element.getAttribute("type")?.toLowerCase() ?? "";
+      if (tag === "button" && (type === "submit" || (!type && element.closest("form")))) return true;
+      if (tag === "input" && (type === "submit" || type === "image")) return true;
+      const label = [
+        element.textContent,
+        element.getAttribute("aria-label"),
+        element.getAttribute("title"),
+        element.getAttribute("value"),
+      ].filter(Boolean).join(" ");
+      return /\b(submit|apply|send|complete|finish|confirm)\b/i.test(label);
+    });
+  } catch {
+    // A selector that cannot be inspected is unsafe to execute after a revocation.
+    return true;
   }
 }
 

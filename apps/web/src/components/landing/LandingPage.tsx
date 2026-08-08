@@ -3,6 +3,8 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react'
 import Link from 'next/link'
 import { useI18n } from '@/lib/i18n'
+import { DEFAULT_PLAN_CATALOGUE, toPublicPlan, type PublicPlan } from '@/lib/plan-catalogue-shared'
+import { FOOTER_COLUMNS, SOCIAL_LINKS } from './landing-links'
 
 // ── Design tokens ─────────────────────────────────────────────────────────────
 const C = {
@@ -139,14 +141,8 @@ const TESTIMONIALS = [
   { name: 'Ahmed Hassan', role: 'Product Manager', city: 'London', avatar: 'AH', color: '#059669', text: 'Chrome extension made everything so smooth. Just browsing LinkedIn, click "Save", and the AI fills the application automatically. Absolutely game-changing.' },
 ]
 
-const PLANS = [
-  { name: 'Free', price: '€0', period: '/mo', desc: 'Get started for free', color: C.textMuted, features: ['10 AI applications/day', '1 resume', 'Basic job search', 'Application tracker', 'Gmail basic sync'], cta: 'Get started free', ctaStyle: 'ghost' as const },
-  { name: 'Pro', price: '€19', period: '/mo', desc: 'Best for serious job seekers', color: '#818CF8', badge: 'Most popular', features: ['100 AI applications/day', 'Unlimited resumes', 'AI Cover Letter', 'Priority job matching', 'Full Gmail integration', 'Chrome Extension'], cta: 'Start 14-day free trial', ctaStyle: 'primary' as const },
-  { name: 'Enterprise', price: '€49', period: '/mo', desc: 'For teams & recruiters', color: '#FB923C', features: ['Unlimited AI applications', 'Multi-account management', 'Custom Agent rules', 'Team dashboard', 'Priority support', 'API access'], cta: 'Contact sales', ctaStyle: 'ghost' as const },
-]
-
 const FAQS = [
-  { q: 'What are the limits on the Free plan?', a: 'Free gives you 10 AI applications per day, 1 resume, basic job search, and the Kanban tracker. Upgrade to Pro if you need more daily applications or AI Cover Letters.' },
+  { q: 'What are the limits on the Free plan?', a: 'The Free plan includes the features and limits shown on the pricing card above. Limits and included features are kept current by the ApplyMate team.' },
   { q: 'How effective is AI auto-apply?', a: 'Users who use ApplyMate AI to tailor their resumes see an average 3× improvement in ATS pass rate and 2.4× more interview invitations. Results depend on your skill match and competition for the role.' },
   { q: 'Which job boards are supported?', a: 'We support LinkedIn, Indeed, Glassdoor, StepStone, XING, Arbeitsagentur, Adzuna, Reed, IrishJobs and more — 14 sources in total. We are continuously expanding the list.' },
   { q: 'Is my resume data safe?', a: 'Your data is stored on EU servers (Neon PostgreSQL, eu-west-2) and is fully GDPR-compliant. We never sell your resume data or use it to train AI models.' },
@@ -165,12 +161,23 @@ const STATS_DATA = [
 const PLATFORMS = ['LinkedIn', 'Indeed', 'Glassdoor', 'StepStone', 'XING', 'Arbeitsagentur']
 
 // ── Main component ────────────────────────────────────────────────────────────
-export function LandingPage() {
+const FALLBACK_PLANS = DEFAULT_PLAN_CATALOGUE.filter(plan => plan.active).map(toPublicPlan)
+
+function planColor(key: PublicPlan['key']): string {
+  return key === 'pro' ? '#818CF8' : key === 'enterprise' ? '#FB923C' : C.textMuted
+}
+
+function planPeriod(plan: PublicPlan): string {
+  return plan.interval === 'forever' ? 'forever' : plan.interval === 'year' ? '/yr' : '/mo'
+}
+
+export function LandingPage({ plans = FALLBACK_PLANS }: { plans?: PublicPlan[] }) {
   const { t } = useI18n()
   const [scrolled, setScrolled]   = useState(false)
   const [openFaq, setOpenFaq]     = useState<number | null>(null)
   const [contactForm, setContactForm] = useState({ name: '', email: '', message: '' })
   const [contactSent, setContactSent] = useState(false)
+  const [contactError, setContactError] = useState<string | null>(null)
   const [sending, setSending]     = useState(false)
   const { ref: statsRef, visible: statsVisible } = useReveal(0.3)
 
@@ -182,11 +189,24 @@ export function LandingPage() {
 
   const handleContact = useCallback(async (e: React.FormEvent) => {
     e.preventDefault()
+    setContactError(null)
     setSending(true)
-    await new Promise(r => setTimeout(r, 1200))
-    setContactSent(true)
-    setSending(false)
-  }, [])
+    try {
+      const response = await fetch('/api/contact', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(contactForm),
+      })
+      const payload = await response.json().catch(() => ({})) as { error?: string }
+      if (!response.ok) throw new Error(payload.error ?? 'We could not send your message. Please try again.')
+      setContactSent(true)
+      setContactForm({ name: '', email: '', message: '' })
+    } catch (error) {
+      setContactError(error instanceof Error ? error.message : 'We could not send your message. Please try again.')
+    } finally {
+      setSending(false)
+    }
+  }, [contactForm])
 
   return (
     <div style={{ background: C.bg, minHeight: '100vh', color: C.text, fontFamily: "'Inter', system-ui, sans-serif", overflowX: 'hidden' }}>
@@ -448,15 +468,15 @@ export function LandingPage() {
               <h2 style={{ fontSize: 'clamp(28px, 4vw, 46px)', fontWeight: 800, letterSpacing: '-0.035em', marginBottom: 12 }}>
                 Simple, transparent<span style={gradientText}> pricing</span>
               </h2>
-              <p style={{ fontSize: 15, color: C.textMuted }}>All plans include a 14-day free trial. No credit card required.</p>
+              <p style={{ fontSize: 15, color: C.textMuted }}>Trial details are shown on each plan. No credit card required.</p>
             </div>
           </Reveal>
 
           <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(min(100%, 300px), 1fr))', gap: 18 }}>
-            {PLANS.map((plan, i) => {
-              const isPro = plan.name === 'Pro'
+            {plans.map((plan, i) => {
+              const isPro = plan.key === 'pro'
               return (
-                <Reveal key={plan.name} delay={i * 100}>
+                <Reveal key={plan.key} delay={i * 100}>
                   <GlassCard
                     gradient={isPro ? 'linear-gradient(145deg, rgba(99,102,241,0.18) 0%, rgba(139,92,246,0.12) 100%)' : C.glass}
                     border={isPro ? 'rgba(99,102,241,0.45)' : C.glassBd}
@@ -464,12 +484,13 @@ export function LandingPage() {
                   >
                     {isPro && <div style={{ position: 'absolute', top: -1, left: 0, right: 0, height: 2, background: 'linear-gradient(90deg, transparent, #6366F1, #7C3AED, transparent)', borderRadius: '20px 20px 0 0' }} />}
                     {plan.badge && <div style={{ display: 'inline-block', marginBottom: 14, fontSize: 10, fontWeight: 700, letterSpacing: '0.08em', background: 'linear-gradient(135deg, #4F46E5, #7C3AED)', color: '#fff', borderRadius: 999, padding: '3px 10px' }}>{plan.badge}</div>}
-                    <div style={{ fontSize: 13, fontWeight: 600, color: plan.color, marginBottom: 6 }}>{plan.name}</div>
+                    <div style={{ fontSize: 13, fontWeight: 600, color: planColor(plan.key), marginBottom: 6 }}>{plan.name}</div>
                     <div style={{ display: 'flex', alignItems: 'baseline', gap: 4, marginBottom: 6 }}>
                       <span style={{ fontSize: 40, fontWeight: 900, color: '#fff', letterSpacing: '-0.045em' }}>{plan.price}</span>
-                      <span style={{ fontSize: 13, color: C.textMuted }}>{plan.period}</span>
+                      <span style={{ fontSize: 13, color: C.textMuted }}>{planPeriod(plan)}</span>
                     </div>
-                    <div style={{ fontSize: 12, color: C.textMuted, marginBottom: 26 }}>{plan.desc}</div>
+                    <div style={{ fontSize: 12, color: C.textMuted, marginBottom: 10 }}>{plan.description}</div>
+                    {plan.trialDays > 0 && <div style={{ fontSize: 11, color: C.green, marginBottom: 18 }}>{plan.trialDays}-day free trial</div>}
                     <div style={{ flex: 1, marginBottom: 28 }}>
                       {plan.features.map(f => (
                         <div key={f} style={{ display: 'flex', alignItems: 'center', gap: 9, marginBottom: 11, fontSize: 13, color: 'rgba(255,255,255,0.82)' }}>
@@ -477,7 +498,7 @@ export function LandingPage() {
                         </div>
                       ))}
                     </div>
-                    <Link href="/register" className="btn-shine" style={{ display: 'block', textAlign: 'center', padding: '12px 20px', fontSize: 13, fontWeight: 700, borderRadius: 12, textDecoration: 'none', ...(plan.ctaStyle === 'primary' ? { background: 'linear-gradient(135deg, #4F46E5, #7C3AED)', color: '#fff', boxShadow: '0 4px 20px rgba(79,70,229,0.50)' } : { background: 'rgba(255,255,255,0.07)', border: '1px solid rgba(255,255,255,0.14)', color: 'rgba(255,255,255,0.82)' }), transition: 'all 0.18s' }}
+                    <Link href={plan.key === 'enterprise' ? '#contact' : '/register'} className="btn-shine" style={{ display: 'block', textAlign: 'center', padding: '12px 20px', fontSize: 13, fontWeight: 700, borderRadius: 12, textDecoration: 'none', ...(isPro ? { background: 'linear-gradient(135deg, #4F46E5, #7C3AED)', color: '#fff', boxShadow: '0 4px 20px rgba(79,70,229,0.50)' } : { background: 'rgba(255,255,255,0.07)', border: '1px solid rgba(255,255,255,0.14)', color: 'rgba(255,255,255,0.82)' }), transition: 'all 0.18s' }}
                       onMouseEnter={e => { e.currentTarget.style.transform = 'translateY(-1px)' }}
                       onMouseLeave={e => { e.currentTarget.style.transform = 'none' }}
                     >{plan.cta}</Link>
@@ -544,6 +565,7 @@ export function LandingPage() {
                     <InputField label="Email" type="email" value={contactForm.email} onChange={v => setContactForm(f => ({ ...f, email: v }))} placeholder="your@email.com" required />
                   </div>
                   <InputField label="Message" value={contactForm.message} onChange={v => setContactForm(f => ({ ...f, message: v }))} placeholder="Tell us about your question or request…" multiline required />
+                  {contactError && <div role="alert" style={{ color: '#FCA5A5', fontSize: 12, lineHeight: 1.5, padding: '10px 12px', borderRadius: 9, background: 'rgba(220,38,38,0.12)', border: '1px solid rgba(248,113,113,0.25)' }}>{contactError}</div>}
                   <button type="submit" disabled={sending} className="btn-shine" style={{ padding: '13px 0', fontSize: 14, fontWeight: 700, background: sending ? 'rgba(99,102,241,0.5)' : 'linear-gradient(135deg, #4F46E5, #7C3AED)', color: '#fff', border: 'none', borderRadius: 12, cursor: sending ? 'not-allowed' : 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 8, boxShadow: '0 4px 20px rgba(79,70,229,0.45)', transition: 'all 0.2s' }}>
                     {sending ? (
                       <><div style={{ width: 14, height: 14, borderRadius: '50%', border: '2px solid rgba(255,255,255,0.3)', borderTopColor: '#fff', animation: 'spin 0.7s linear infinite' }} />Sending…</>
@@ -586,29 +608,24 @@ export function LandingPage() {
             </div>
             <p style={{ fontSize: 12, color: C.textSubtle, lineHeight: 1.75 }}>AI-powered European job search automation. 50,000+ jobs/day.</p>
             <div style={{ display: 'flex', gap: 10, marginTop: 18 }}>
-              {['Twitter', 'LinkedIn', 'GitHub'].map(s => (
-                <a key={s} href="#" style={{ fontSize: 11, color: C.textSubtle, textDecoration: 'none', background: 'rgba(255,255,255,0.06)', border: '1px solid rgba(255,255,255,0.10)', borderRadius: 7, padding: '4px 9px', transition: 'all 0.15s' }}
+              {SOCIAL_LINKS.map(link => (
+                <a key={link.label} href={link.href} {...(link.external ? { target: '_blank', rel: 'noreferrer' } : {})} style={{ fontSize: 11, color: C.textSubtle, textDecoration: 'none', background: 'rgba(255,255,255,0.06)', border: '1px solid rgba(255,255,255,0.10)', borderRadius: 7, padding: '4px 9px', transition: 'all 0.15s' }}
                   onMouseEnter={e => { e.currentTarget.style.color='#fff'; e.currentTarget.style.borderColor='rgba(255,255,255,0.22)' }}
                   onMouseLeave={e => { e.currentTarget.style.color=C.textSubtle; e.currentTarget.style.borderColor='rgba(255,255,255,0.10)' }}
-                >{s}</a>
+                >{link.label}</a>
               ))}
             </div>
           </div>
 
-          {[
-            { title: 'Product',  links: ['Features', 'Pricing', 'Chrome Extension', 'Changelog', 'API'] },
-            { title: 'Company',  links: ['About', 'Blog', 'Careers', 'Press'] },
-            { title: 'Support',  links: ['Help centre', 'Contact', 'Status', 'Security'] },
-            { title: 'Legal',    links: ['Privacy policy', 'Terms of service', 'Cookie settings', 'GDPR'] },
-          ].map(col => (
+          {FOOTER_COLUMNS.map(col => (
             <div key={col.title}>
               <div style={{ fontSize: 11, fontWeight: 700, color: C.textSubtle, letterSpacing: '0.08em', textTransform: 'uppercase', marginBottom: 14 }}>{col.title}</div>
-              {col.links.map(l => (
-                <div key={l} style={{ marginBottom: 9 }}>
-                  <a href="#" style={{ fontSize: 13, color: C.textMuted, textDecoration: 'none', transition: 'color 0.15s' }}
+              {col.links.map(link => (
+                <div key={link.label} style={{ marginBottom: 9 }}>
+                  <a href={link.href} {...(link.external ? { target: '_blank', rel: 'noreferrer' } : {})} style={{ fontSize: 13, color: C.textMuted, textDecoration: 'none', transition: 'color 0.15s' }}
                     onMouseEnter={e => (e.currentTarget.style.color = '#fff')}
                     onMouseLeave={e => (e.currentTarget.style.color = C.textMuted)}
-                  >{l}</a>
+                  >{link.label}</a>
                 </div>
               ))}
             </div>

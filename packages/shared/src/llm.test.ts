@@ -5,6 +5,7 @@
  */
 import { afterEach, describe, it, expect, vi } from 'vitest'
 import { callLlm, loadWorkerAiConfig, callLlmText, closeSharedPool } from './index.js'
+import { resolveWorkerAiConfig } from './llm.js'
 
 describe('shared/llm exports — existence guards', () => {
   afterEach(() => vi.restoreAllMocks())
@@ -41,5 +42,27 @@ describe('shared/llm exports — existence guards', () => {
     })
     expect(JSON.parse(String(request.body))).not.toHaveProperty('max_tokens')
     expect(JSON.parse(String(request.body))).not.toHaveProperty('reasoning_split')
+  })
+
+  it.each([
+    ['qwen', 'qwen3.7-plus', 'https://dashscope.aliyuncs.com/compatible-mode/v1'],
+    ['zhipu', 'glm-5.1', 'https://api.z.ai/api/paas/v4'],
+    ['kimi', 'kimi-k2.5', 'https://api.moonshot.ai/v1'],
+  ])('keeps %s auto-apply settings on its own endpoint and key', async (provider, model, base) => {
+    const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response(JSON.stringify({
+      choices: [{ message: { content: 'ok' } }],
+    })))
+    const config = resolveWorkerAiConfig({
+      aiSettings: {
+        keys: { [provider]: `${provider}-key` },
+        features: { autoApply: { provider, model, thinking: 'disabled' } },
+      },
+    })
+
+    await callLlm([{ role: 'user', content: 'Ping' }], config)
+
+    expect(config).toMatchObject({ provider, model, thinking: 'disabled' })
+    expect(fetchMock.mock.calls[0][0]).toBe(`${base}/chat/completions`)
+    expect((fetchMock.mock.calls[0][1] as RequestInit).headers).toMatchObject({ Authorization: `Bearer ${provider}-key` })
   })
 })

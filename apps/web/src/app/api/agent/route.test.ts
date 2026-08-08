@@ -4,6 +4,8 @@ const mocks = vi.hoisted(() => ({
   requireAuth: vi.fn(),
   findUnique: vi.fn(),
   upsert: vi.fn(),
+  userFindUnique: vi.fn(),
+  userUpdate: vi.fn(),
 }))
 
 vi.mock('@/lib/api-helpers', () => ({
@@ -18,6 +20,10 @@ vi.mock('@/lib/db', () => ({
     agentConfig: {
       findUnique: mocks.findUnique,
       upsert: mocks.upsert,
+    },
+    user: {
+      findUnique: mocks.userFindUnique,
+      update: mocks.userUpdate,
     },
   },
 }))
@@ -35,6 +41,8 @@ describe('agent config API', () => {
     Object.values(mocks).forEach(mock => mock.mockReset())
     mocks.requireAuth.mockResolvedValue({ userId: 'user_1' })
     mocks.upsert.mockResolvedValue({ userId: 'user_1', minMatchScore: 85, autoApply: true })
+    mocks.userFindUnique.mockResolvedValue({ preferences: {} })
+    mocks.userUpdate.mockResolvedValue({})
   })
 
   it('updates only validated agent config fields', async () => {

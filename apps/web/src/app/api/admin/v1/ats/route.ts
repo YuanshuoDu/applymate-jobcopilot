@@ -17,6 +17,6 @@ export async function GET(request: NextRequest) {
     orderBy: { id: 'asc' }, cursor: cursor ? { id: cursor } : undefined, skip: cursor ? 1 : undefined, take: limit + 1,
   })
   await writeAdminAudit({ requestId: actor.requestId, actorUserId: actor.userId, actorRoleKey: actor.roleKey, action: 'ats.registry_viewed', outcome: 'success' })
-  const page = pageResult(rows.map((row) => ({ ...row, rateLimitRps: POLICIES[row.atsType]?.rps ?? null, credentialConfigured: false })), limit)
+  const page = pageResult(rows.map((row) => ({ ...row, rateLimitRps: POLICIES[row.atsType]?.rps ?? null, credentialRequirement: 'none' })), limit)
   return NextResponse.json(page, { headers: { 'Cache-Control': 'no-store', 'x-request-id': actor.requestId } })
 }

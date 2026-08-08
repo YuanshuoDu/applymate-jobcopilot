@@ -1,11 +1,13 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { isAdminResponse, requireAdmin } from '@/lib/admin/authorization'
 import { hardRpsLimit, isAtsSourceKey, parseAtsPolicy } from '@/lib/admin/ats-service'
+import { acknowledgeCommittedAtsPolicy } from '@/lib/admin/ats-policy-propagation'
 import { validateAdminWrite } from '@/lib/admin/csrf'
 import { sendWorkerCommand } from '@/lib/admin/worker-client'
 import { AdminMutationConflict, runAdminMutation } from '@/lib/admin/write-transaction'
+import { db } from '@/lib/db'
 
-type AtsPolicyResult = { version: number; propagation: string }
+type AtsPolicyResult = { version: number }
 
 export async function PATCH(request: NextRequest, context: { params: Promise<{ sourceKey: string }> }) {
   const actor = await requireAdmin('ats.update', request)
@@ -24,7 +26,7 @@ export async function PATCH(request: NextRequest, context: { params: Promise<{ s
       action: 'ats.policy_updated',
       idempotencyKey: key,
       targetId: sourceKey,
-      audit: (value) => ({ requestId: actor.requestId, actorRoleKey: actor.roleKey, targetType: 'ats_source', targetId: sourceKey, reason, after: { version: value.version, propagation: value.propagation }, outcome: 'success' }),
+      audit: (value) => ({ requestId: actor.requestId, actorRoleKey: actor.roleKey, targetType: 'ats_source', targetId: sourceKey, reason, after: { version: value.version, propagation: 'pending' }, outcome: 'success' }),
       mutate: async (tx) => {
         const existing = await tx.atsSourcePolicy.findUnique({ where: { sourceKey }, select: { version: true, state: true } })
         let nextVersion: number
@@ -38,17 +40,15 @@ export async function PATCH(request: NextRequest, context: { params: Promise<{ s
           if (!updated.count) throw new AdminMutationConflict('Policy changed or source is not editable')
           nextVersion = input.version + 1
         }
-        let propagation = 'pending'
-        try {
-          await sendWorkerCommand({ requestId: actor.requestId, actorId: actor.userId, action: 'apply_ats_policy', reason, params: { sourceKey, version: nextVersion } })
-          await tx.atsSourcePolicy.update({ where: { sourceKey }, data: { lastAcknowledgedVersion: nextVersion } })
-          propagation = 'acknowledged'
-        } catch { /* Policy remains safe and visibly pending until the worker reconnects. */ }
-        return { version: nextVersion, propagation }
+        return { version: nextVersion }
       },
     })
     if (result.duplicate) return NextResponse.json({ duplicate: true }, { headers: { 'Cache-Control': 'no-store' } })
-    return NextResponse.json({ sourceKey, ...result.value }, { headers: { 'Cache-Control': 'no-store', 'x-request-id': actor.requestId } })
+    const propagation = await acknowledgeCommittedAtsPolicy({ requestId: actor.requestId, actorId: actor.userId, sourceKey, version: result.value.version, reason }, {
+      send: sendWorkerCommand,
+      markAcknowledged: async (key, version) => (await db.atsSourcePolicy.updateMany({ where: { sourceKey: key, version }, data: { lastAcknowledgedVersion: version } })).count,
+    })
+    return NextResponse.json({ sourceKey, ...result.value, propagation }, { headers: { 'Cache-Control': 'no-store', 'x-request-id': actor.requestId } })
   } catch (error) {
     if (error instanceof AdminMutationConflict) return NextResponse.json({ error: error.message }, { status: 409 })
     throw error

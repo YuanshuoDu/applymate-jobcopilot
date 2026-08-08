@@ -16,9 +16,13 @@ import { jwtVerify } from 'jose'
 import { db } from '@/lib/db'
 import { GMAIL_ACCOUNT_PROVIDER } from '@/lib/gmail-helpers'
 import { canRecoverStaleGmailConnection } from '@/lib/gmail-connection-recovery'
-import { getAuthJwtSecret } from '@/lib/auth-secret'
-
-const JWT_SECRET = getAuthJwtSecret()
+import { configuredRedirectUri } from '@/lib/app-url'
+import { configuredAppOrigin } from '@/lib/app-url'
+import {
+  clearOAuthStateCookie,
+  getOAuthStateSecret,
+  hasMatchingOAuthStateCookie,
+} from '@/lib/oauth-state'
 
 function safeReturnTo(value: unknown): string | null {
   if (typeof value !== 'string' || !value.startsWith('/')) return null
@@ -40,9 +44,11 @@ export async function GET(req: NextRequest) {
   let returnTo = '/?page=gmail'
   let transferRequested = false
   const back = (msg: string) => {
-    const u = new URL(returnTo, req.url)
+    const u = new URL(returnTo, configuredAppOrigin(req.url))
     u.searchParams.set('gmailError', msg)
-    return NextResponse.redirect(u)
+    const response = NextResponse.redirect(u)
+    clearOAuthStateCookie(response, 'gmail')
+    return response
   }
 
   if (errParam) {
@@ -51,11 +57,19 @@ export async function GET(req: NextRequest) {
   }
   if (!code || !state) return back('missing_code_or_state')
 
-  // Verify state and extract userId
+  const stateSecret = getOAuthStateSecret()
+  if (!stateSecret) return back('oauth_not_configured')
+
+  // Verify the signed state and browser binding before using its user id.
   let userId: string
   try {
-    const { payload } = await jwtVerify(state, JWT_SECRET)
-    if (!payload.uid || typeof payload.uid !== 'string') return back('invalid_state')
+    const { payload } = await jwtVerify(state, stateSecret)
+    if (
+      !payload.uid
+      || typeof payload.uid !== 'string'
+      || typeof payload.nonce !== 'string'
+      || !hasMatchingOAuthStateCookie(req, 'gmail', payload.nonce)
+    ) return back('invalid_state')
     userId = payload.uid
     returnTo = safeReturnTo(payload.returnTo) ?? returnTo
     transferRequested = payload.transfer === true
@@ -65,7 +79,7 @@ export async function GET(req: NextRequest) {
   }
 
   // Exchange code for tokens
-  const redirectUri = new URL('/api/gmail/oauth/callback', req.url).toString()
+  const redirectUri = configuredRedirectUri(req.url, '/api/gmail/oauth/callback')
   const tokenRes = await fetch('https://oauth2.googleapis.com/token', {
     method:  'POST',
     headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
@@ -166,7 +180,9 @@ export async function GET(req: NextRequest) {
       : '[gmail/oauth/callback] linked Gmail integration to current user',
   )
 
-  const success = new URL(returnTo, req.url)
+  const success = new URL(returnTo, configuredAppOrigin(req.url))
   success.searchParams.set('gmailAuth', '1')
-  return NextResponse.redirect(success)
+  const response = NextResponse.redirect(success)
+  clearOAuthStateCookie(response, 'gmail')
+  return response
 }

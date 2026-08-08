@@ -1,7 +1,7 @@
 import type { Pool } from "pg";
 import type { FormReviewNeeds } from "../harness/form-review.js";
 
-type TerminalStatus = "submitted" | "failed" | "waiting_for_user";
+type TerminalStatus = "submitted" | "failed" | "waiting_for_user" | "waiting_for_authorization";
 
 /** Worker-side guard: a stale/revoked queue payload must never open a browser. */
 export async function claimApplicationTask(

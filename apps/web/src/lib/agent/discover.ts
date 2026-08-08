@@ -13,7 +13,8 @@
  *   3. Adzuna (EU) or JSearch (US/global) based on location
  */
 import { truncate } from '@/lib/utils'
-import { db } from '@/lib/db'
+import { getDiscoveryApiKeys } from '@/lib/discovery-api-keys'
+import { isRuntimeFeatureEnabled } from '@/lib/runtime-feature-flags'
 import { dedupJobs } from './dedup'
 import { resolveLocation } from './location-resolver'
 
@@ -333,14 +334,29 @@ async function fetchIrishJobsRss(q: string, location: string): Promise<Discovere
 export async function discoverJobs(params: DiscoverParams): Promise<DiscoveredJob[]> {
   const { userId, targetRoles, targetLocations, existingUrls, maxResults } = params
 
-  const userKeys = userId ? await db.userApiKeys.findUnique({
-    where:  { userId },
-    select: { rapidapiKey: true, adzunaAppId: true, adzunaAppKey: true },
-  }).catch(() => null) : null
+  if (userId) {
+    try {
+      if (!await isRuntimeFeatureEnabled('worker_discovery', userId)) return []
+    } catch (error) {
+      console.warn('[discover] Platform discovery control unavailable', {
+        userId,
+        error: error instanceof Error ? error.message : String(error),
+      })
+      return []
+    }
+  }
 
-  const apiKey    = userKeys?.rapidapiKey?.trim()  || process.env.RAPIDAPI_KEY   || ''
-  const adzunaId  = userKeys?.adzunaAppId?.trim()  || process.env.ADZUNA_APP_ID  || ''
-  const adzunaKey = userKeys?.adzunaAppKey?.trim() || process.env.ADZUNA_APP_KEY || ''
+  const keys = userId
+    ? await getDiscoveryApiKeys(userId)
+    : {
+        rapidapiKey: process.env.RAPIDAPI_KEY?.trim() ?? '',
+        adzunaAppId: process.env.ADZUNA_APP_ID?.trim() ?? '',
+        adzunaAppKey: process.env.ADZUNA_APP_KEY?.trim() ?? '',
+      }
+
+  const apiKey    = keys.rapidapiKey
+  const adzunaId  = keys.adzunaAppId
+  const adzunaKey = keys.adzunaAppKey
 
   const seen    = new Set(existingUrls)
   const results: DiscoveredJob[] = []

@@ -1,17 +1,20 @@
 import { NextRequest, NextResponse } from 'next/server'
+import { SupportCaseStatus } from '@prisma/client'
 import { isAdminResponse, requireAdmin } from '@/lib/admin/authorization'
 import { writeAdminAudit } from '@/lib/admin/audit'
 import { adminUserMetadataSelect, toAdminUserMetadata } from '@/lib/admin/dto'
+import { supportCaseScope } from '@/lib/admin/support-case'
 import { db } from '@/lib/db'
 
 export async function GET(request: NextRequest) {
   const actor = await requireAdmin('support_cases.read', request)
   if (isAdminResponse(actor)) return actor
   const status = request.nextUrl.searchParams.get('status')
-  const statusFilter = status ? { status: status as 'open' | 'in_progress' | 'waiting_on_customer' | 'resolved' | 'closed' } : {}
-  const scope = actor.roleKey === 'support'
-    ? { OR: [{ assignedAdminId: null }, { assignedAdminId: actor.userId }] }
-    : {}
+  if (status && !Object.values(SupportCaseStatus).includes(status as SupportCaseStatus)) {
+    return NextResponse.json({ error: 'Invalid support case status' }, { status: 400, headers: { 'Cache-Control': 'no-store' } })
+  }
+  const statusFilter = status ? { status: status as SupportCaseStatus } : {}
+  const scope = supportCaseScope(actor)
   const cases = await db.supportCase.findMany({
     where: { ...statusFilter, ...scope },
     orderBy: [{ priority: 'desc' }, { slaDueAt: 'asc' }], take: 100,

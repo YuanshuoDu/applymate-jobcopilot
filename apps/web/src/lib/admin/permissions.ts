@@ -1,5 +1,5 @@
 export const PERMISSIONS = [
-  'users.read', 'users.read_pii_masked', 'users.suspend', 'users.restore', 'users.export_anonymized',
+  'users.read', 'users.read_pii_masked', 'users.update_preferences', 'users.suspend', 'users.restore', 'users.export_anonymized',
   'billing.read', 'billing.update', 'billing.refund_mark',
   'jobs.read_metadata', 'jobs.read_content_masked', 'applications.read', 'applications.retry', 'applications.cancel', 'applications.manual_review',
   'ats.read', 'ats.update', 'ats.pause', 'ats.resume', 'ats.test', 'ats.registry.manage',

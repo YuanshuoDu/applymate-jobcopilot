@@ -15,4 +15,12 @@ describe('worker client', () => {
     expect(fetchMock.mock.calls[0]?.[0]).toBe('https://worker.internal/internal/admin/control')
     expect((fetchMock.mock.calls[0]?.[1] as RequestInit).headers).toHaveProperty('x-worker-control-signature')
   })
+  it('retains the version that an ATS policy command actually acknowledged', async () => {
+    process.env.WORKER_CONTROL_URL = 'https://worker.internal'
+    process.env.WORKER_CONTROL_SECRET = 'test-secret'
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response(JSON.stringify({ receipt: 'ok', acknowledgedVersion: 4 }), { status: 200 })))
+
+    await expect(sendWorkerCommand({ requestId: 'request', actorId: 'admin', action: 'apply_ats_policy', reason: 'Apply committed ATS policy version', params: { sourceKey: 'lever', version: 4 } }))
+      .resolves.toEqual({ receipt: 'ok', acknowledgedVersion: 4 })
+  })
 })

@@ -1,4 +1,6 @@
-import { describe, it, expect, vi, afterEach } from "vitest"
+import { beforeEach, describe, it, expect, vi, afterEach } from "vitest"
+
+const mocks = vi.hoisted(() => ({ getRuntimeAtsPolicy: vi.fn() }))
 
 // Mock the DB module so we don't need Prisma client at test time
 vi.mock("@/lib/db", () => ({
@@ -14,6 +16,8 @@ vi.mock("../pace/policies", () => ({
   acquire: vi.fn().mockResolvedValue(undefined),
 }))
 
+vi.mock("@/lib/runtime-ats-policy", () => ({ getRuntimeAtsPolicy: mocks.getRuntimeAtsPolicy }))
+
 import { fetchViaAtsApi } from "./t0-ats-fetch"
 import type { AtsMatch } from "./ats-url-detector"
 
@@ -28,6 +32,11 @@ function mockFetchOnce(body: unknown, status = 200) {
 
 afterEach(() => {
   vi.unstubAllGlobals()
+})
+
+beforeEach(() => {
+  mocks.getRuntimeAtsPolicy.mockReset()
+  mocks.getRuntimeAtsPolicy.mockResolvedValue({ allowed: true, rps: 5 })
 })
 
 describe("fetchViaAtsApi", () => {
@@ -84,5 +93,17 @@ describe("fetchViaAtsApi", () => {
     const result = await fetchViaAtsApi(match)
 
     expect(result).toBeNull()
+  })
+
+  it("does not call a paused ATS API from a web enrichment request", async () => {
+    mocks.getRuntimeAtsPolicy.mockResolvedValueOnce({ allowed: false, rps: 1 })
+    const fetchMock = vi.fn()
+    vi.stubGlobal("fetch", fetchMock)
+
+    const result = await fetchViaAtsApi({ ats: "greenhouse", slug: "acme", jobId: "123" }, { userId: "user-1" })
+
+    expect(result).toBeNull()
+    expect(mocks.getRuntimeAtsPolicy).toHaveBeenCalledWith("greenhouse", "user-1")
+    expect(fetchMock).not.toHaveBeenCalled()
   })
 })

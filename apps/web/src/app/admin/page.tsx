@@ -5,5 +5,5 @@ import { isAdminResponse, requireAdmin } from '@/lib/admin/authorization'
 export default async function AdminPage() {
   const actor = await requireAdmin('observability.read')
   if (isAdminResponse(actor)) redirect('/login?callbackUrl=/admin')
-  return <AdminOverview />
+  return <AdminOverview permissions={actor.permissions} />
 }

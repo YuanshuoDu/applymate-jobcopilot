@@ -97,13 +97,13 @@ export const MODEL_CATALOGUE: ModelOption[] = [
     provider: 'minimax', model: 'MiniMax-M3',
     label: 'MiniMax M3', description: '平台默认，当前文本旗舰',
     tier: 'standard', priceIn: 0.6, priceOut: 2.4, contextK: 512,
-    defaultBase: 'https://api.minimax.io/v1',
+    defaultBase: 'https://api.minimax.chat/v1',
   },
   {
     provider: 'minimax', model: 'MiniMax-M2.7-highspeed',
     label: 'MiniMax M2.7 Highspeed', description: '同等能力的低延迟版本',
     tier: 'fast', priceIn: 0.6, priceOut: 2.4, contextK: 200,
-    defaultBase: 'https://api.minimax.io/v1',
+    defaultBase: 'https://api.minimax.chat/v1',
   },
 
   // ── Qwen / 通义千问 ───────────────────────────────────────
@@ -196,7 +196,11 @@ export function resolveConfig(userConfig?: AiConfig | null): AiConfig & { resolv
     || getServerKey(cfg.provider)
     || ''
 
-  const resolvedBase = cfg.apiBase?.trim() || option?.defaultBase || ''
+  // Only custom providers own their endpoint. Internal providers must retain
+  // their curated base so a persisted override cannot receive a platform key.
+  const resolvedBase = cfg.provider === 'custom'
+    ? cfg.apiBase?.trim() || option?.defaultBase || ''
+    : option?.defaultBase || ''
 
   return { ...cfg, apiBase: resolvedBase, resolvedKey }
 }
@@ -210,7 +214,9 @@ function getServerKey(provider: Provider): string {
     case 'qwen':      return process.env.QWEN_API_KEY      ?? ''
     case 'zhipu':     return process.env.ZHIPU_API_KEY     ?? ''
     case 'kimi':      return process.env.KIMI_API_KEY      ?? ''
-    case 'custom':    return process.env.CUSTOM_API_KEY    ?? ''
+    // A custom endpoint is user-controlled, so it must never receive a
+    // server-level credential. Custom configs require a saved user key.
+    case 'custom':    return ''
     default:          return ''
   }
 }

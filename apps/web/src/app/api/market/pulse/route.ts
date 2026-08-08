@@ -17,6 +17,7 @@ import { NextRequest } from 'next/server'
 import { requireAuth, isErrorResponse, ok } from '@/lib/api-helpers'
 import { db } from '@/lib/db'
 import { truncate } from '@/lib/utils'
+import { getDiscoveryApiKeys } from '@/lib/discovery-api-keys'
 
 // In-memory cache per userId (market data changes slowly)
 const _pulseCache = new Map<string, { data: object; exp: number }>()
@@ -52,9 +53,7 @@ export async function GET(req: NextRequest) {
   const primaryRole     = roles[0]     ?? ''
   const primaryLocation = locations[0] ?? ''
 
-  const rapidKey   = process.env.RAPIDAPI_KEY   ?? ''
-  const adzunaId   = process.env.ADZUNA_APP_ID  ?? ''
-  const adzunaKey  = process.env.ADZUNA_APP_KEY ?? ''
+  const { rapidapiKey: rapidKey, adzunaAppId: adzunaId, adzunaAppKey: adzunaKey } = await getDiscoveryApiKeys(userId)
 
   // ── Parallel data collection ──────────────────────────────────────────────
   const [salaryData, jobsData] = await Promise.all([

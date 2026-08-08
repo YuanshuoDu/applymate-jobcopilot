@@ -2,11 +2,11 @@
  * GET /api/jsearch/search
  * Params: q, location, country (us/gb/de/...), page, employment_type, remote
  * Proxies JSearch v2 (RapidAPI) — aggregates Google for Jobs, Indeed, LinkedIn etc.
- * Requires RAPIDAPI_KEY in environment.
+ * Uses the candidate RapidAPI key first, then the platform key.
  */
 import { NextRequest } from 'next/server'
 import { requireAuth, isErrorResponse, ok, err } from '@/lib/api-helpers'
-import { getDiscoveryApiKeys } from '@/lib/discovery-api-keys'
+import { DISCOVERY_KEY_ERROR_MESSAGES, getDiscoveryApiKeys } from '@/lib/discovery-api-keys'
 import { truncate, fmtSalary } from '@/lib/utils'
 
 const HOST = 'jsearch.p.rapidapi.com'
@@ -16,7 +16,7 @@ export async function GET(req: NextRequest) {
   if (isErrorResponse(auth)) return auth
 
   const { rapidapiKey: apiKey } = await getDiscoveryApiKeys(auth.userId)
-  if (!apiKey) return err('RapidAPI is not configured. Add a key in Settings → Keys & connections.', 501)
+  if (!apiKey) return err(DISCOVERY_KEY_ERROR_MESSAGES.rapidapi, 501)
 
   const { searchParams } = req.nextUrl
   const q              = searchParams.get('q')?.trim()

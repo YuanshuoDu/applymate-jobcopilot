@@ -13,6 +13,7 @@
  */
 import { NextRequest } from 'next/server'
 import { requireAuth, isErrorResponse, ok, err } from '@/lib/api-helpers'
+import { DISCOVERY_KEY_ERROR_MESSAGES, getDiscoveryApiKeys } from '@/lib/discovery-api-keys'
 
 const HOST = 'jobs-api14.p.rapidapi.com'
 
@@ -27,8 +28,8 @@ export async function GET(req: NextRequest) {
   const auth = await requireAuth(req)
   if (isErrorResponse(auth)) return auth
 
-  const apiKey = process.env.RAPIDAPI_KEY
-  if (!apiKey) return err('RapidAPI key not configured.', 501)
+  const { rapidapiKey: apiKey } = await getDiscoveryApiKeys(auth.userId)
+  if (!apiKey) return err(DISCOVERY_KEY_ERROR_MESSAGES.rapidapi, 501)
 
   const { searchParams } = req.nextUrl
   const title   = searchParams.get('title')?.trim()

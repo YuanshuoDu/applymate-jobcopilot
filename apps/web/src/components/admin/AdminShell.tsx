@@ -2,13 +2,14 @@
 
 import Link from 'next/link'
 import { usePathname } from 'next/navigation'
-import { Activity, Bell, Bot, FileText, Flag, Home, Inbox, Radio, ServerCog, ShieldAlert, ShieldCheck, Users } from 'lucide-react'
+import { Activity, Bell, Bot, CreditCard, FileText, Flag, Home, Inbox, Radio, ServerCog, ShieldAlert, ShieldCheck, Users } from 'lucide-react'
 import type { ReactNode } from 'react'
 
 const navigation = [
   { href: '/admin', label: 'Overview', icon: Home, permission: 'observability.read' },
   { href: '/admin/contact-us', label: 'Contact us', icon: Inbox, permission: 'support_cases.read' },
   { href: '/admin/users', label: 'Users', icon: Users, permission: 'users.read' },
+  { href: '/admin/plans', label: 'Plans', icon: CreditCard, permission: 'billing.read' },
   { href: '/admin/ats', label: 'ATS sources', icon: Radio, permission: 'ats.read' },
   { href: '/admin/applications', label: 'Applications', icon: Activity, permission: 'applications.read' },
   { href: '/admin/queues', label: 'Queues', icon: ServerCog, permission: 'queues.read' },

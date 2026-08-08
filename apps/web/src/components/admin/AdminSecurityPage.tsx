@@ -1,7 +1,7 @@
 'use client'
 
 import { Check, ShieldAlert } from 'lucide-react'
-import { useEffect, useState } from 'react'
+import { useCallback, useEffect, useState } from 'react'
 
 type Grant = { id: string; requesterId: string; approverId: string | null; permission: string; expiresAt: string; createdAt: string }
 const permissions = ['queues.pause', 'ats.pause', 'ai_budget.reset', 'feature_flags.approve', 'broadcasts.publish']
@@ -11,14 +11,14 @@ export function AdminSecurityPage({ canApprove }: { canApprove: boolean }) {
   const [permission, setPermission] = useState(permissions[0])
   const [minutes, setMinutes] = useState(15)
   const [notice, setNotice] = useState('')
-  async function load() {
+  const load = useCallback(async () => {
     if (!canApprove) return
     const response = await fetch('/api/admin/v1/break-glass', { cache: 'no-store' })
     const payload = await response.json().catch(() => null) as { grants?: Grant[]; error?: string } | null
     setGrants(payload?.grants ?? [])
     if (!response.ok) setNotice(payload?.error ?? 'Unable to load temporary grants.')
-  }
-  useEffect(() => { void load() }, [])
+  }, [canApprove])
+  useEffect(() => { void load() }, [load])
   async function requestGrant(event: React.FormEvent) {
     event.preventDefault()
     const reason = window.prompt('Enter the incident reason for temporary access')

@@ -16,11 +16,13 @@ export async function PATCH(req: NextRequest) {
   if (!body) return err('Invalid JSON body')
 
   const { currentPassword, newPassword } = body as {
-    currentPassword: string
-    newPassword: string
+    currentPassword?: unknown
+    newPassword?: unknown
   }
 
-  if (!currentPassword || !newPassword) return err('currentPassword and newPassword are required')
+  if (typeof currentPassword !== 'string' || typeof newPassword !== 'string' || !currentPassword || !newPassword) {
+    return err('currentPassword and newPassword are required')
+  }
   if (newPassword.length < 8) return err('New password must be at least 8 characters')
 
   // Verify current password

@@ -12,7 +12,7 @@ describe('GET /api/admin/v1/ats', () => {
     mocks.findMany.mockResolvedValue([{ id: 1, atsType: 'lever', slug: 'spotify', name: 'Spotify', firstSeen: new Date(), lastSeen: new Date(), jobCount: 4 }])
     const { GET } = await import('./route')
     const response = await GET(new Request('http://localhost/api/admin/v1/ats') as never)
-    await expect(response.json()).resolves.toEqual(expect.objectContaining({ items: [expect.objectContaining({ rateLimitRps: 5, credentialConfigured: false })] }))
+    await expect(response.json()).resolves.toEqual(expect.objectContaining({ items: [expect.objectContaining({ rateLimitRps: 5, credentialRequirement: 'none' })] }))
     expect(mocks.requireAdmin).toHaveBeenCalledWith('ats.read', expect.any(Request))
   })
 })

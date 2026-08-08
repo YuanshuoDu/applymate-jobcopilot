@@ -113,6 +113,33 @@ enum Plan {
   enterprise
 }
 
+enum BillingInterval {
+  forever
+  month
+  year
+}
+
+model PlanCatalogue {
+  id          String          @id @default(cuid())
+  plan        Plan            @unique
+  name        String
+  priceMinor  Int             @default(0)
+  currency    String          @default("EUR")
+  interval    BillingInterval @default(month)
+  description String          @db.Text
+  features    Json
+  badge       String?
+  cta         String
+  trialDays   Int             @default(0)
+  active      Boolean         @default(true)
+  sortOrder   Int             @default(0)
+  createdAt   DateTime        @default(now())
+  updatedAt   DateTime        @updatedAt
+
+  @@index([active, sortOrder])
+  @@map("plan_catalogue")
+}
+
 model Job {
   id          String    @id @default(cuid())
   userId      String

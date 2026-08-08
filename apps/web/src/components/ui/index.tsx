@@ -229,6 +229,7 @@ export function Btn({
 
   return (
     <button
+      disabled={disabled}
       onClick={disabled ? undefined : onClick}
       onMouseEnter={() => setHovered(true)}
       onMouseLeave={() => setHovered(false)}

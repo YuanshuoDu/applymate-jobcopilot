@@ -3,9 +3,39 @@ import type { Request, Response } from 'express'
 import { agentRunQueue } from '../queue/agent-run-queue.js'
 import { applyQueue, connection } from '../queue/apply-queue.js'
 import { scoutQueue } from '../queue/scout-queue.js'
+import { getPool } from '../db/apply-results.js'
+import { isAtsSourceKey } from '@jobcopilot/shared'
+import { loadEffectiveAtsPolicy } from './ats-policy.js'
 import { verifyWorkerCommand } from './control-auth.js'
 
 const queues = { 'apply-tasks': applyQueue, 'scout-tasks': scoutQueue, 'agent-runs': agentRunQueue }
+
+class WorkerControlError extends Error {
+  constructor(message: string, readonly status: number) {
+    super(message)
+  }
+}
+
+export async function applyAtsPolicyCommand(
+  pool: ReturnType<typeof getPool>,
+  params: Record<string, string | number | boolean>,
+): Promise<{ acknowledgedVersion: number }> {
+  const sourceKey = typeof params.sourceKey === 'string' ? params.sourceKey : ''
+  const version = typeof params.version === 'number' ? params.version : -1
+  if (!isAtsSourceKey(sourceKey) || !Number.isInteger(version) || version < 1) {
+    throw new WorkerControlError('Invalid ATS policy command', 400)
+  }
+  let policy
+  try {
+    policy = await loadEffectiveAtsPolicy(pool, sourceKey)
+  } catch {
+    throw new WorkerControlError('ATS policy is unavailable', 503)
+  }
+  if (!policy.configured || policy.version !== version) {
+    throw new WorkerControlError('Requested ATS policy version is not committed', 409)
+  }
+  return { acknowledgedVersion: policy.version }
+}
 
 export function createWorkerControlHandler() {
   return async (request: Request, response: Response) => {
@@ -18,7 +48,14 @@ export function createWorkerControlHandler() {
     if (nonce !== 'OK') return response.status(409).json({ error: 'Replayed worker command' })
     try {
       if (command.action === 'queue_summary') return response.json({ receipt: randomUUID(), queues: await queueSummary() })
-      if (command.action === 'apply_ats_policy') return response.json({ receipt: randomUUID(), acknowledgedVersion: command.params.version })
+      if (command.action === 'apply_ats_policy') {
+        try {
+          return response.json({ receipt: randomUUID(), ...await applyAtsPolicyCommand(getPool(), command.params) })
+        } catch (error) {
+          if (error instanceof WorkerControlError) return response.status(error.status).json({ error: error.message })
+          throw error
+        }
+      }
       const queueName = typeof command.params.queue === 'string' ? command.params.queue : ''
       const queue = queues[queueName as keyof typeof queues]
       if (!queue) return response.status(400).json({ error: 'Unsupported queue' })

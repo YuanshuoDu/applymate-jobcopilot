@@ -1,0 +1,54 @@
+import { beforeEach, describe, expect, it, vi } from 'vitest'
+
+const mocks = vi.hoisted(() => ({
+  requireAuth: vi.fn(),
+  findMany: vi.fn(),
+  deleteMany: vi.fn(),
+}))
+
+vi.mock('@/lib/api-helpers', () => ({
+  requireAuth: mocks.requireAuth,
+  isErrorResponse: (value: unknown) => value instanceof Response,
+  ok: (data: unknown, status = 200) => Response.json(data, { status }),
+  err: (message: string, status = 400) => Response.json({ error: message }, { status }),
+}))
+vi.mock('@/lib/db', () => ({ db: { account: { findMany: mocks.findMany, deleteMany: mocks.deleteMany } } }))
+
+describe('/api/me/accounts', () => {
+  beforeEach(() => {
+    vi.resetModules()
+    Object.values(mocks).forEach(mock => mock.mockReset())
+    mocks.requireAuth.mockResolvedValue({ userId: 'user_1' })
+    mocks.findMany.mockResolvedValue([
+      { provider: 'google', providerAccountId: 'google-1', scope: 'openid https://www.googleapis.com/auth/gmail.readonly' },
+      { provider: 'github', providerAccountId: 'github-1', scope: 'read:user' },
+    ])
+  })
+
+  it('normalizes legacy Google Gmail rows so Settings shows the connection', async () => {
+    const { GET } = await import('./route')
+    const response = await GET()
+    await expect(response.json()).resolves.toEqual({ accounts: [
+      { provider: 'gmail', account: 'google-1', disconnectable: false, legacy: true },
+      { provider: 'github', account: 'github-1' },
+    ] })
+    expect(mocks.findMany).toHaveBeenCalledWith(expect.objectContaining({
+      select: { provider: true, providerAccountId: true, scope: true },
+    }))
+  })
+
+  it('disconnects Gmail integration rows without removing plain Google login identity', async () => {
+    const { DELETE } = await import('./route')
+    const response = await DELETE(new Request('http://localhost/api/me/accounts', {
+      method: 'DELETE',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ provider: 'gmail' }),
+    }) as never)
+
+    expect(response.status).toBe(200)
+    expect(mocks.deleteMany).toHaveBeenCalledWith({
+      where: { userId: 'user_1', provider: 'gmail' },
+    })
+    expect(JSON.stringify(mocks.deleteMany.mock.calls[0])).not.toContain('google')
+  })
+})

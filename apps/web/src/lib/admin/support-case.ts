@@ -1,7 +1,15 @@
-import type { SupportCasePriority, SupportCaseStatus } from '@prisma/client'
+import type { Prisma, SupportCasePriority, SupportCaseStatus } from '@prisma/client'
+import type { AdminActor } from './authorization'
 
 const statuses = ['open', 'in_progress', 'waiting_on_customer', 'resolved', 'closed'] as const
 const priorities = ['low', 'normal', 'high', 'urgent'] as const
+
+/** Support staff can work only their own queue or an unassigned case. */
+export function supportCaseScope(actor: Pick<AdminActor, 'roleKey' | 'userId'>): Prisma.SupportCaseWhereInput {
+  return actor.roleKey === 'support'
+    ? { OR: [{ assignedAdminId: null }, { assignedAdminId: actor.userId }] }
+    : {}
+}
 
 export function parseSupportCaseUpdate(value: unknown) {
   if (!value || typeof value !== 'object') return null

@@ -1,11 +1,11 @@
 /**
  * GET /api/adzuna/search
  * Query params: q, where, country (gb/ie/de/fr/nl/es/it/at/be/pl/us/ca/au), page, job_type
- * Proxies Adzuna job search API. Requires ADZUNA_APP_ID + ADZUNA_APP_KEY in environment.
+ * Proxies Adzuna job search API. Uses candidate credentials first, then the platform pair.
  */
 import { NextRequest } from 'next/server'
 import { requireAuth, isErrorResponse, ok, err } from '@/lib/api-helpers'
-import { getDiscoveryApiKeys } from '@/lib/discovery-api-keys'
+import { DISCOVERY_KEY_ERROR_MESSAGES, getDiscoveryApiKeys } from '@/lib/discovery-api-keys'
 import { truncate, fmtSalary as fmtSal } from '@/lib/utils'
 
 const ADZUNA_BASE = 'https://api.adzuna.com/v1/api/jobs'
@@ -22,7 +22,7 @@ export async function GET(req: NextRequest) {
 
   const { adzunaAppId: appId, adzunaAppKey: appKey } = await getDiscoveryApiKeys(auth.userId)
   if (!appId || !appKey) {
-    return err('Adzuna is not configured. Add credentials in Settings → Keys & connections.', 501)
+    return err(DISCOVERY_KEY_ERROR_MESSAGES.adzuna, 501)
   }
 
   const { searchParams } = req.nextUrl

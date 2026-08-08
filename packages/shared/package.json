@@ -13,6 +13,14 @@
     "./llm": {
       "types": "./dist/llm.d.ts",
       "default": "./dist/llm.js"
+    },
+    "./ats-url": {
+      "types": "./dist/ats-url.d.ts",
+      "default": "./dist/ats-url.js"
+    },
+    "./feature-flags": {
+      "types": "./dist/feature-flags.d.ts",
+      "default": "./dist/feature-flags.js"
     }
   },
   "dependencies": {

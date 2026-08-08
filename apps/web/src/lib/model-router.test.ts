@@ -30,6 +30,7 @@ describe('model catalogue and MiniMax compatibility', () => {
     })
     expect(JSON.parse(String(request.body))).not.toHaveProperty('max_tokens')
     expect(JSON.parse(String(request.body))).toMatchObject({ thinking: { type: 'adaptive' } })
+    expect(fetchMock.mock.calls[0][0]).toBe('https://api.minimax.chat/v1/chat/completions')
   })
 
   it('reports an empty final answer with the provider finish reason', async () => {
@@ -73,5 +74,26 @@ describe('model catalogue and MiniMax compatibility', () => {
     expect(resolveConfig({ provider: 'openai', model: 'gpt-4o', apiKey: 'test-key' })).toMatchObject({
       provider: 'openai', model: 'gpt-5.5', apiKey: 'test-key',
     })
+  })
+
+  it('uses the curated endpoint for an internal provider even when legacy settings contain an override', () => {
+    const minimaxBase = MODEL_CATALOGUE.find(option => option.provider === 'minimax' && option.model === 'MiniMax-M3')?.defaultBase
+
+    expect(resolveConfig({
+      provider: 'minimax',
+      model: 'MiniMax-M3',
+      apiKey: 'platform-key',
+      apiBase: 'https://attacker.example/v1',
+    })).toMatchObject({ apiBase: minimaxBase })
+  })
+
+  it('does not use a server API key for a user-controlled custom endpoint', () => {
+    process.env.CUSTOM_API_KEY = 'platform-custom-secret'
+
+    expect(resolveConfig({
+      provider: 'custom',
+      model: 'llama-3.3',
+      apiBase: 'https://llm.example.test/v1',
+    })).toMatchObject({ resolvedKey: '' })
   })
 })
