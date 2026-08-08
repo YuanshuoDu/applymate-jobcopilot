@@ -7,19 +7,15 @@
  * See: docs/scraping-autoapply-design.md §8 (Compliance)
  */
 
+import { ATS_POLICIES } from "../../../../../../packages/shared/src/ats-policy"
+
 export interface RatePolicy {
   host: string        // e.g. "boards-api.greenhouse.io"
   rps:  number        // requests per second ceiling
 }
 
 /** Per-ATS rate limits — hard ceiling regardless of user count. */
-export const POLICIES: Record<string, RatePolicy> = {
-  greenhouse:       { host: "boards-api.greenhouse.io", rps: 5 },
-  lever:            { host: "api.lever.co",             rps: 5 },
-  workday:          { host: "myworkdayjobs.com",         rps: 1 },
-  smartrecruiters:  { host: "api.smartrecruiters.com",  rps: 5 },
-    personio:        { host: "jobs.personio.com",       rps: 5 },
-}
+export const POLICIES: Record<string, RatePolicy> = ATS_POLICIES
 
 /**
  * Acquire a rate-limit slot before calling an ATS endpoint.

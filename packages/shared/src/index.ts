@@ -5,6 +5,12 @@
 // (Prisma dependency) — this shared package is the isolation layer.
 export type { AiConfig, ChatMessage, ChatResult, Provider } from "./llm.js";
 export { callLlm, callLlmText, loadWorkerAiConfig, closeSharedPool } from "./llm.js";
+export {
+  ATS_POLICIES,
+  getHardRpsLimit,
+  isAtsSourceKey,
+  type AtsSourceKey,
+} from "./ats-policy.js";
 
 /** Job payload pushed to the apply-tasks queue */
 export interface ApplyTaskPayload {

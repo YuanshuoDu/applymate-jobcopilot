@@ -1,7 +1,5 @@
 import { AtsSourceState } from '@prisma/client'
-import { POLICIES } from '@/lib/agent/pace/policies'
-
-const sourceKeys = Object.keys(POLICIES)
+import { getHardRpsLimit, isAtsSourceKey as isSharedAtsSourceKey } from '../../../../../packages/shared/src/ats-policy'
 
 export type AtsPolicyInput = {
   rolloutPercent: number
@@ -14,11 +12,11 @@ export type AtsPolicyInput = {
 }
 
 export function isAtsSourceKey(value: string) {
-  return sourceKeys.includes(value)
+  return isSharedAtsSourceKey(value)
 }
 
 export function hardRpsLimit(sourceKey: string) {
-  return POLICIES[sourceKey]?.rps ?? 0
+  return getHardRpsLimit(sourceKey) ?? 0
 }
 
 export function parseAtsPolicy(value: unknown): AtsPolicyInput | null {
