@@ -14,13 +14,13 @@ vi.mock('./ats-policy.js', () => ({ loadEffectiveAtsPolicy: mocks.loadPolicy }))
 import { applyAtsPolicyCommand, resolveWorkerAdminHost } from './control-plane.js'
 
 describe('worker admin host resolution', () => {
-  it('requires a control secret for a public production listener', () => {
-    expect(() => resolveWorkerAdminHost({ host: '0.0.0.0', environment: 'production', hasControlSecret: false }))
+  it('requires a control secret for a public listener when NODE_ENV is unset', () => {
+    expect(() => resolveWorkerAdminHost({ host: '0.0.0.0', hasControlSecret: false }))
       .toThrow('WORKER_CONTROL_SECRET is required')
   })
 
-  it('allows a public production listener with a control secret', () => {
-    expect(resolveWorkerAdminHost({ host: '0.0.0.0', environment: 'production', hasControlSecret: true }))
+  it('allows a public listener with a control secret', () => {
+    expect(resolveWorkerAdminHost({ host: '0.0.0.0', hasControlSecret: true }))
       .toBe('0.0.0.0')
   })
 

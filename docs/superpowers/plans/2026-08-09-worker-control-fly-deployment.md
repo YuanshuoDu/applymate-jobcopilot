@@ -4,7 +4,7 @@
 
 **Goal:** Make the existing HMAC-protected Web-to-Worker admin control plane reachable from Vercel through Fly while failing closed when a public Worker listener lacks its control secret.
 
-**Architecture:** The Web app continues to send signed commands to the Worker control endpoint. Fly exposes the Worker HTTP service on its proxy address, while the Worker validates that a production public listener has `WORKER_CONTROL_SECRET` before it starts. The deployment guides and environment templates describe the same base URL and shared secret contract.
+**Architecture:** The Web app continues to send signed commands to the Worker control endpoint. Fly exposes the Worker HTTP service on its proxy address, while the Worker validates that every public listener has `WORKER_CONTROL_SECRET` before it starts. The deployment guides and environment templates describe the same base URL and shared secret contract.
 
 **Tech Stack:** TypeScript, Express, Vitest, Fly.io, Vercel, Prisma, pnpm.
 
@@ -43,7 +43,7 @@ Expected: failure because `resolveWorkerAdminHost` is not exported.
 
 - [x] **Step 3: Implement the smallest host resolver**
 
-Add an exported resolver in `control-plane.ts` that defaults to `127.0.0.1`, accepts loopback/private listeners, and throws only when `NODE_ENV=production`, the requested host is `0.0.0.0` or `::`, and no control secret is configured. Replace the inline host check in `index.ts` with this resolver.
+Add an exported resolver in `control-plane.ts` that defaults to `127.0.0.1`, accepts loopback/private listeners, and throws whenever the requested host is `0.0.0.0` or `::` and no control secret is configured. Replace the inline host check in `index.ts` with this resolver.
 
 - [x] **Step 4: Run the focused Worker test to verify green**
 
