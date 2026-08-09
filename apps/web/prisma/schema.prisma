@@ -108,6 +108,9 @@ model User {
   gmailMessages  GmailMessage[]
   gmailRecommendations GmailRecommendation[]
   adminMembership AdminMembership? @relation("AdminUser")
+  adminWebAuthnCredentials AdminWebAuthnCredential[]
+  adminWebAuthnChallenges AdminWebAuthnChallenge[]
+  adminReauthGrants AdminReauthGrant[]
   supportCases SupportCase[] @relation("SupportRequester")
   planChanges UserPlanChange[]
   featureOverrides UserFeatureOverride[]
@@ -666,6 +669,11 @@ enum AdminMfaLevel {
   webauthn
 }
 
+enum AdminWebAuthnChallengePurpose {
+  registration
+  reauthentication
+}
+
 enum AdminAuditOutcome {
   success
   denied
@@ -783,6 +791,51 @@ model AdminMembership {
   user           User                  @relation("AdminUser", fields: [userId], references: [id], onDelete: Restrict)
   role           AdminRole             @relation(fields: [roleId], references: [id], onDelete: Restrict)
   @@index([status, roleId])
+}
+
+model AdminWebAuthnCredential {
+  id          String    @id @default(cuid())
+  userId      String    @map("user_id")
+  credentialId String   @unique @map("credential_id")
+  publicKey   Bytes     @map("public_key")
+  counter     Int       @default(0)
+  transports  String[]
+  deviceType  String?   @map("device_type")
+  backedUp    Boolean   @default(false)
+  deviceName  String?   @map("device_name")
+  createdAt   DateTime  @default(now()) @map("created_at")
+  lastUsedAt  DateTime? @map("last_used_at")
+  revokedAt   DateTime? @map("revoked_at")
+  user        User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, revokedAt])
+  @@map("admin_webauthn_credentials")
+}
+
+model AdminWebAuthnChallenge {
+  id         String                         @id @default(cuid())
+  userId     String                         @map("user_id")
+  purpose    AdminWebAuthnChallengePurpose
+  challenge  String                         @unique
+  expiresAt  DateTime                       @map("expires_at")
+  usedAt     DateTime?                      @map("used_at")
+  createdAt  DateTime                       @default(now()) @map("created_at")
+  user       User                           @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, purpose, expiresAt])
+  @@map("admin_webauthn_challenges")
+}
+
+model AdminReauthGrant {
+  id        String   @id @default(cuid())
+  userId    String   @map("user_id")
+  tokenHash String   @unique @map("token_hash")
+  expiresAt DateTime @map("expires_at")
+  createdAt DateTime @default(now()) @map("created_at")
+  user     User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, expiresAt])
+  @@map("admin_reauth_grants")
 }
 
 model AdminAuditLog {
