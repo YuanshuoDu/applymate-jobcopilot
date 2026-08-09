@@ -56,6 +56,20 @@ Set the following Worker secrets in Fly.io (or the chosen long-running host):
 | `CLOAK_MAX_WORKERS` | Start at `1` to respect ATS rate limits |
 | `CAPSOLVER_API_KEY` | Optional CAPTCHA solver |
 
+When the Vercel variables are marked hidden, `vercel env pull` cannot return
+their plaintext values. Run the checked-in synchronizer from the repository
+root before deploying the Worker; it refreshes the database/web origin values,
+preserves hidden values it cannot read, and never prints secret contents:
+
+```powershell
+pwsh -NoProfile -File scripts/sync-worker-production-runtime.ps1
+```
+
+The Worker requires a Redis endpoint with available request quota. If the
+provider returns `ERR max requests limit exceeded`, do not deploy repeatedly:
+provision or upgrade a Redis resource first, then set the same `REDIS_URL` in
+Vercel and Fly before restarting the Worker.
+
 The Worker invokes `/api/agent/automations/due`, `/api/notifications/broadcasts/due`,
 and `/api/admin/observability/alerts/evaluate` every five minutes by default.
 This avoids Vercel Hobby Cron's daily-only restriction while retaining a secured,
