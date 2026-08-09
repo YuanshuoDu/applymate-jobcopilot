@@ -30,7 +30,7 @@ Initialize roles once a staff user exists with `INITIAL_SUPER_ADMIN_EMAIL=<staff
 2. Provide a real WebAuthn enrollment and recent-reauthentication ceremony. The current model enforces stored MFA level for `super_admin`; it does not perform the ceremony.
 3. Roll out PostgreSQL RLS only with a candidate-service credential and transaction-scoped `SET LOCAL app.user_id`. Enable it after tenant-query inventory and cross-tenant SQL tests; enabling it against the current shared Prisma connection would break candidate traffic.
 4. Restrict the application database role to `INSERT`/`SELECT` on `AdminAuditLog`, add an isolated daily hash-chain checkpoint job, and verify audit-write failure alerts. The migration already blocks normal row updates/deletes and revokes public mutation privileges; role-specific grants still require deployment ownership.
-5. Configure `WORKER_CONTROL_URL`, `WORKER_CONTROL_SECRET`, and a loopback/private `WORKER_ADMIN_HOST`; validate the private network path in the target deployment.
+5. Configure `WORKER_CONTROL_URL` as the Worker base URL, plus the matching `WORKER_CONTROL_SECRET` in Web and Worker. For Fly, the checked-in configuration binds `WORKER_ADMIN_HOST=0.0.0.0` for the HTTPS proxy; the control route remains HMAC-signed, short-lived, replay-protected, and Bull Board stays disabled.
 6. Run the full Web and Worker suites, a migration smoke test against an ephemeral PostgreSQL instance, and the external access-control/security review before production rollout.
 
 Every admin write remains gated by permission, same-origin CSRF, an idempotency key, a 10-500 character reason, audit persistence before the side effect, and relevant approval separation.
