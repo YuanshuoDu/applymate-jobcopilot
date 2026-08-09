@@ -13,6 +13,7 @@ import {
 } from '@/lib/settings-preferences'
 import type { NotificationPreferences, PrivacyPreferences } from '@/lib/types'
 import { isPrivacyPreferenceAvailable } from '@/lib/privacy-consent'
+import { useAdminPrompt } from '@/components/admin/AdminPromptDialog'
 import {
   buildAdminSettingsPatch,
   getDeletionRequestActions,
@@ -87,6 +88,7 @@ function UserListItem({ user, selected, onSelect }: { user: AdminSettingsUser; s
 
 export function AdminUsersPage() {
   const toast = useToast()
+  const adminPrompt = useAdminPrompt()
   const [searchInput, setSearchInput] = useState('')
   const [query, setQuery] = useState('')
   const [page, setPage] = useState(1)
@@ -127,7 +129,13 @@ export function AdminUsersPage() {
 
   async function saveSettings() {
     if (!selectedUser) return
-    const reason = window.prompt('Enter the settings-change reason')
+    const reason = await adminPrompt.request({
+      title: 'Save user settings',
+      label: 'Reason for this settings change',
+      kind: 'reason',
+      description: 'This reason is stored in the administrator audit trail.',
+      submitLabel: 'Save settings',
+    })
     if (reason === null) return
     let patch: ReturnType<typeof buildAdminSettingsPatch>
     try {
@@ -155,7 +163,13 @@ export function AdminUsersPage() {
 
   async function updateDeletionRequestStatus(status: DeletionRequestAction['status']) {
     if (!selectedUser) return
-    const reason = window.prompt('Enter the settings-change reason')
+    const reason = await adminPrompt.request({
+      title: 'Update deletion request',
+      label: 'Reason for this workflow change',
+      kind: 'reason',
+      description: 'This reason is stored in the administrator audit trail.',
+      submitLabel: 'Update request',
+    })
     if (reason === null) return
     let patch: ReturnType<typeof buildAdminSettingsPatch>
     try {
@@ -343,6 +357,7 @@ export function AdminUsersPage() {
           )}
         </Card>
       </main>
+      {adminPrompt.dialog}
     </div>
   )
 }
