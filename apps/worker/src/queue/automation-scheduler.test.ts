@@ -29,6 +29,18 @@ describe("automation scheduler", () => {
     });
   });
 
+  it("uses a separate maintenance secret for broadcasts and alerts when configured", () => {
+    expect(automationSchedulerConfig({
+      AGENT_WEB_URL: "https://app.applymate.test",
+      AGENT_AUTOMATION_CRON_SECRET: "automation-secret",
+      WEB_MAINTENANCE_CRON_SECRET: "maintenance-secret",
+    }).tasks).toEqual([
+      { name: "automations", endpoint: "https://app.applymate.test/api/agent/automations/due", secret: "automation-secret" },
+      { name: "broadcasts", endpoint: "https://app.applymate.test/api/notifications/broadcasts/due", secret: "maintenance-secret" },
+      { name: "alerts", endpoint: "https://app.applymate.test/api/admin/observability/alerts/evaluate", secret: "maintenance-secret" },
+    ]);
+  });
+
   it("requires the production web origin and secret", () => {
     expect(() => automationSchedulerConfig({ AGENT_AUTOMATION_CRON_SECRET: "secret" }))
       .toThrow("AGENT_WEB_URL");
