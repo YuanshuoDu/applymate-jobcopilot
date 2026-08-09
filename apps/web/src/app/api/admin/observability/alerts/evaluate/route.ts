@@ -5,8 +5,9 @@ import { writeAdminAudit } from '@/lib/admin/audit'
 import { db } from '@/lib/db'
 
 function authorized(request: NextRequest) {
-  const secret = process.env.CRON_SECRET?.trim()
-  return Boolean(secret && request.headers.get('authorization') === `Bearer ${secret}`)
+  const authorization = request.headers.get('authorization')
+  const secrets = [process.env.WEB_MAINTENANCE_CRON_SECRET, process.env.CRON_SECRET, process.env.AGENT_AUTOMATION_CRON_SECRET].filter((value): value is string => Boolean(value?.trim()))
+  return secrets.some(secret => authorization === `Bearer ${secret}`)
 }
 
 function metricValue(metric: string, snapshot: Awaited<ReturnType<typeof getObservabilitySnapshot>>) {
@@ -23,7 +24,7 @@ function breached(value: number, operator: string, threshold: number) {
   return value <= threshold
 }
 
-export async function POST(request: NextRequest) {
+async function evaluate(request: NextRequest) {
   if (!authorized(request)) return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
   const rules = await db.adminAlertRule.findMany({ where: { enabled: true } })
   const snapshot = await getObservabilitySnapshot({ days: 1 })
@@ -42,4 +43,12 @@ export async function POST(request: NextRequest) {
   }
   await writeAdminAudit({ requestId: 'observability-alert-cron', action: 'observability.alerts_evaluated', outcome: 'success', after: { checked: rules.length, fired } }).catch(() => undefined)
   return NextResponse.json({ checked: rules.length, fired })
+}
+
+export async function GET(request: NextRequest) {
+  return evaluate(request)
+}
+
+export async function POST(request: NextRequest) {
+  return evaluate(request)
 }

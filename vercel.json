@@ -14,14 +14,6 @@
       "schedule": "30 8 * * *"
     },
     {
-      "path": "/api/notifications/broadcasts/due",
-      "schedule": "*/5 * * * *"
-    },
-    {
-      "path": "/api/admin/observability/alerts/evaluate",
-      "schedule": "*/5 * * * *"
-    },
-    {
       "path": "/api/admin/audit-checkpoint",
       "schedule": "0 2 * * *"
     }

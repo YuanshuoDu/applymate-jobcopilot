@@ -5,9 +5,14 @@ import { writeAdminAudit } from '@/lib/admin/audit'
 
 const BATCH_SIZE = 500
 
-export async function GET(request: NextRequest) {
-  const cronSecret = process.env.CRON_SECRET
-  if (!cronSecret || request.headers.get('authorization') !== `Bearer ${cronSecret}`) return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
+function authorized(request: NextRequest) {
+  const authorization = request.headers.get('authorization')
+  const secrets = [process.env.WEB_MAINTENANCE_CRON_SECRET, process.env.CRON_SECRET, process.env.AGENT_AUTOMATION_CRON_SECRET].filter((value): value is string => Boolean(value?.trim()))
+  return secrets.some(secret => authorization === `Bearer ${secret}`)
+}
+
+async function processDue(request: NextRequest) {
+  if (!authorized(request)) return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
   const due = await db.adminBroadcast.findMany({ where: { status: 'scheduled', scheduledAt: { lte: new Date() } }, take: 20, orderBy: { scheduledAt: 'asc' }, select: { id: true, title: true, body: true, audienceType: true, audience: true } })
   const processed: Array<{ id: string; status: string; deliveredCount?: number }> = []
   for (const item of due) {
@@ -37,4 +42,12 @@ export async function GET(request: NextRequest) {
   }
   await writeAdminAudit({ requestId: 'broadcast-cron', action: 'broadcasts.due_processed', targetType: 'broadcast', outcome: 'success', after: { count: processed.length } }).catch(() => undefined)
   return NextResponse.json({ processed })
+}
+
+export async function GET(request: NextRequest) {
+  return processDue(request)
+}
+
+export async function POST(request: NextRequest) {
+  return processDue(request)
 }

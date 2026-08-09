@@ -7,11 +7,11 @@ import {
 } from "./automation-scheduler.js";
 
 describe("automation scheduler", () => {
-  it("checks for due automations every 15 minutes by default", () => {
+  it("checks worker-maintained web tasks every five minutes by default", () => {
     expect(automationSchedulerConfig({
       AGENT_WEB_URL: "https://app.applymate.test",
       AGENT_AUTOMATION_CRON_SECRET: "scheduler-secret",
-    }).intervalMs).toBe(15 * 60_000);
+    }).intervalMs).toBe(5 * 60_000);
   });
 
   it("uses the worker web origin and dedicated scheduler secret", () => {
@@ -20,8 +20,11 @@ describe("automation scheduler", () => {
       AGENT_AUTOMATION_CRON_SECRET: "scheduler-secret",
       AGENT_SCHEDULER_INTERVAL_MS: "5000",
     })).toEqual({
-      endpoint: "https://app.applymate.test/api/agent/automations/due",
-      secret: "scheduler-secret",
+      tasks: [
+        { name: "automations", endpoint: "https://app.applymate.test/api/agent/automations/due", secret: "scheduler-secret" },
+        { name: "broadcasts", endpoint: "https://app.applymate.test/api/notifications/broadcasts/due", secret: "scheduler-secret" },
+        { name: "alerts", endpoint: "https://app.applymate.test/api/admin/observability/alerts/evaluate", secret: "scheduler-secret" },
+      ],
       intervalMs: 60_000,
     });
   });
@@ -36,8 +39,7 @@ describe("automation scheduler", () => {
   it("calls the protected due endpoint and records success", async () => {
     const request = vi.fn().mockResolvedValue(new Response(JSON.stringify({ started: [] })));
     const scheduler = createAutomationScheduler({
-      endpoint: "https://app.applymate.test/api/agent/automations/due",
-      secret: "scheduler-secret",
+      tasks: [{ name: "automations", endpoint: "https://app.applymate.test/api/agent/automations/due", secret: "scheduler-secret" }],
       intervalMs: 300_000,
       request,
     });
@@ -58,8 +60,7 @@ describe("automation scheduler", () => {
   it("keeps the worker alive and reports a failed scheduler request", async () => {
     const request = vi.fn().mockResolvedValue(new Response("Unavailable", { status: 503 }));
     const scheduler = createAutomationScheduler({
-      endpoint: "https://app.applymate.test/api/agent/automations/due",
-      secret: "scheduler-secret",
+      tasks: [{ name: "automations", endpoint: "https://app.applymate.test/api/agent/automations/due", secret: "scheduler-secret" }],
       intervalMs: 300_000,
       request,
     });

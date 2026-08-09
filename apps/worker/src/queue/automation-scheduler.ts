@@ -1,4 +1,4 @@
-const DEFAULT_INTERVAL_MS = 15 * 60_000;
+const DEFAULT_INTERVAL_MS = 5 * 60_000;
 const MINIMUM_INTERVAL_MS = 60_000;
 
 export interface AutomationSchedulerStatus {
@@ -27,8 +27,7 @@ export interface AutomationScheduler {
 }
 
 export interface AutomationSchedulerConfig {
-  endpoint: string;
-  secret: string;
+  tasks: ReadonlyArray<{ name: string; endpoint: string; secret: string }>;
   intervalMs: number;
   request?: typeof fetch;
 }
@@ -46,9 +45,13 @@ export function automationSchedulerConfig(
     ? Math.max(MINIMUM_INTERVAL_MS, configuredInterval)
     : DEFAULT_INTERVAL_MS;
 
+  const maintenanceSecret = env.WEB_MAINTENANCE_CRON_SECRET ?? env.CRON_SECRET ?? secret;
   return {
-    endpoint: `${webUrl}/api/agent/automations/due`,
-    secret,
+    tasks: [
+      { name: "automations", endpoint: `${webUrl}/api/agent/automations/due`, secret },
+      { name: "broadcasts", endpoint: `${webUrl}/api/notifications/broadcasts/due`, secret: maintenanceSecret },
+      { name: "alerts", endpoint: `${webUrl}/api/admin/observability/alerts/evaluate`, secret: maintenanceSecret },
+    ],
     intervalMs,
   };
 }
@@ -69,15 +72,19 @@ export function createAutomationScheduler(config: AutomationSchedulerConfig): Au
     state.lastAttemptAt = new Date().toISOString();
 
     try {
-      const response = await request(config.endpoint, {
-        method: "POST",
-        headers: { Authorization: `Bearer ${config.secret}` },
-        signal: AbortSignal.timeout(30_000),
-      });
-      if (!response.ok) {
-        const body = await response.text().catch(() => "");
-        throw new Error(`Due automation endpoint returned ${response.status}: ${body.slice(0, 300)}`);
+      const failures: string[] = [];
+      for (const task of config.tasks) {
+        const response = await request(task.endpoint, {
+          method: "POST",
+          headers: { Authorization: `Bearer ${task.secret}` },
+          signal: AbortSignal.timeout(30_000),
+        });
+        if (!response.ok) {
+          const body = await response.text().catch(() => "");
+          failures.push(`${task.name} returned ${response.status}: ${body.slice(0, 300)}`);
+        }
       }
+      if (failures.length) throw new Error(failures.join("; "));
 
       state.lastSuccessAt = new Date().toISOString();
       state.lastError = null;

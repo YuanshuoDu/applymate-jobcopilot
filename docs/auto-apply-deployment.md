@@ -35,6 +35,7 @@ Set the following Web environment variables in Vercel:
 | `REDIS_URL` | Same Redis instance used by the Worker |
 | `CRON_SECRET` | Vercel's daily Gmail-sync Cron authentication secret |
 | `AGENT_AUTOMATION_CRON_SECRET` | Shared secret for the Worker to invoke due automations |
+| `WEB_MAINTENANCE_CRON_SECRET` | Shared secret for the Worker to run scheduled broadcasts and observability alert evaluation |
 | `AGENT_WORKER_SECRET` | Shared secret used only by the Worker internal callback |
 | `WORKER_CONTROL_URL` | Worker base URL without `/internal/admin/control`; for Fly use `https://applymate-worker.fly.dev` |
 | `WORKER_CONTROL_SECRET` | HMAC secret that exactly matches the Worker secret for admin queue and ATS controls |
@@ -49,12 +50,14 @@ Set the following Worker secrets in Fly.io (or the chosen long-running host):
 | `AGENT_WEB_URL` | Public Web origin, for example `https://app.example.com` |
 | `AGENT_WORKER_SECRET` | Exact same value as the Web app |
 | `AGENT_AUTOMATION_CRON_SECRET` | Exact same value as the Web app |
+| `WEB_MAINTENANCE_CRON_SECRET` | Exact same value as the Web app; the Worker runs broadcast delivery and alert evaluation every five minutes |
 | `WORKER_CONTROL_SECRET` | Exact same HMAC value as the Web app; required for every non-loopback listener |
 | `AGENT_SCHEDULER_INTERVAL_MS` | Optional due-check interval; defaults to `300000` (five minutes) |
 | `CLOAK_MAX_WORKERS` | Start at `1` to respect ATS rate limits |
 | `CAPSOLVER_API_KEY` | Optional CAPTCHA solver |
 
-The Worker invokes `/api/agent/automations/due` every five minutes by default.
+The Worker invokes `/api/agent/automations/due`, `/api/notifications/broadcasts/due`,
+and `/api/admin/observability/alerts/evaluate` every five minutes by default.
 This avoids Vercel Hobby Cron's daily-only restriction while retaining a secured,
 private scheduler. Set `AGENT_SCHEDULER_ENABLED=0` only for a Worker instance that
 must not schedule automations.
