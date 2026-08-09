@@ -4,6 +4,7 @@ import { writeAdminAudit } from '@/lib/admin/audit'
 import { adminUserMetadataSelect, toAdminUserMetadata } from '@/lib/admin/dto'
 import { adminPageLimit, pageResult } from '@/lib/admin/pagination'
 import { db } from '@/lib/db'
+import { Plan, UserAccountStatus } from '@prisma/client'
 
 export async function GET(request: NextRequest) {
   const actor = await requireAdmin('users.read', request)
@@ -12,8 +13,12 @@ export async function GET(request: NextRequest) {
   const limit = adminPageLimit(params.get('limit'))
   const cursor = params.get('cursor')
   const search = params.get('q')?.trim().slice(0, 100)
+  const planValue = params.get('plan')
+  const plan = planValue === 'free' || planValue === 'pro' || planValue === 'enterprise' ? planValue as Plan : undefined
+  const statusValue = params.get('status')
+  const accountStatus = statusValue === 'active' || statusValue === 'suspended' ? statusValue as UserAccountStatus : undefined
   const rows = await db.user.findMany({
-    where: search ? { OR: [{ name: { contains: search, mode: 'insensitive' } }, { email: { contains: search, mode: 'insensitive' } }] } : undefined,
+    where: { ...(search ? { OR: [{ name: { contains: search, mode: 'insensitive' } }, { email: { contains: search, mode: 'insensitive' } }] } : {}), ...(plan ? { plan } : {}), ...(accountStatus ? { accountStatus } : {}) },
     select: adminUserMetadataSelect,
     orderBy: { id: 'asc' },
     cursor: cursor ? { id: cursor } : undefined,

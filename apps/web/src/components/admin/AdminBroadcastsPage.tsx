@@ -3,7 +3,7 @@
 import { BarChart3, Check, Megaphone, Send, X } from 'lucide-react'
 import { useEffect, useState } from 'react'
 
-type Broadcast = { id: string; title: string; body: string; audienceType: string; status: string; approvedById: string | null; recipientCount: number; deliveredCount: number; failedCount: number; createdAt: string }
+type Broadcast = { id: string; title: string; body: string; audienceType: string; status: string; approvedById: string | null; scheduledAt: string | null; recipientCount: number; deliveredCount: number; failedCount: number; createdAt: string }
 type AudienceType = 'all_active_users' | 'plan' | 'location'
 
 export function AdminBroadcastsPage({ permissions }: { permissions: readonly string[] }) {
@@ -50,10 +50,25 @@ export function AdminBroadcastsPage({ permissions }: { permissions: readonly str
   async function cancel(id: string) {
     if (await request(`/api/admin/v1/broadcasts/${id}/cancel`, { reason: 'Cancelling platform announcement draft' })) { setNotice('Broadcast cancelled.'); await load() }
   }
+  async function schedule(id: string) {
+    const value = window.prompt('Enter future schedule time in ISO format, e.g. 2026-08-10T09:00:00Z')
+    if (!value) return
+    if (await request(`/api/admin/v1/broadcasts/${id}/schedule`, { scheduledAt: value, reason: 'Scheduling approved platform announcement for controlled delivery' })) { setNotice('Broadcast scheduled.'); await load() }
+  }
+  async function retry(id: string) {
+    if (await request(`/api/admin/v1/broadcasts/${id}/retry`, { reason: 'Retrying failed platform announcement after delivery review' })) { setNotice('Broadcast returned to draft for review.'); await load() }
+  }
+  async function edit(id: string, current: Broadcast) {
+    const nextTitle = window.prompt('Edit broadcast title', current.title)
+    if (!nextTitle) return
+    const nextBody = window.prompt('Edit broadcast body', current.body)
+    if (!nextBody) return
+    if (await request(`/api/admin/v1/broadcasts/${id}`, { title: nextTitle, body: nextBody, reason: 'Editing platform announcement before approval' })) { setNotice('Broadcast updated.'); await load() }
+  }
 
   return <div className="admin-page"><header className="admin-header"><div><h1>Broadcasts</h1><p>In-app platform announcements</p></div><Megaphone size={22} aria-hidden="true" /></header>
     <section className="broadcast-layout"><form className="broadcast-compose" onSubmit={(event) => { event.preventDefault(); void createDraft() }}><h2>New draft</h2><label>Title<input value={title} onChange={(event) => setTitle(event.target.value)} maxLength={120} required /></label><label>Message<textarea value={body} onChange={(event) => setBody(event.target.value)} maxLength={2000} required /></label><div className="broadcast-audience"><label>Audience<select value={audienceType} onChange={(event) => setAudienceType(event.target.value as AudienceType)}><option value="all_active_users">All active users</option><option value="plan">Plan</option><option value="location">Location</option></select></label>{audienceType === 'plan' && <label>Plan<select value={audienceValue} onChange={(event) => setAudienceValue(event.target.value)}><option value="pro">Pro</option><option value="free">Free</option><option value="enterprise">Enterprise</option></select></label>}{audienceType === 'location' && <label>Location<input value={audienceValue} onChange={(event) => setAudienceValue(event.target.value)} maxLength={80} required /></label>}</div><button className="broadcast-primary" type="submit"><Send size={16} /> Create draft</button></form>
-      <section className="broadcast-list"><div className="broadcast-list-title"><h2>Announcements</h2>{notice && <span role="status">{notice}</span>}</div>{loading ? <p>Loading broadcasts...</p> : items.length === 0 ? <p>No broadcasts yet.</p> : items.map((item) => <article className="broadcast-row" key={item.id}><div><h3>{item.title}</h3><p>{item.body}</p><small>{item.audienceType.replaceAll('_', ' ')} · {item.approvedById ? 'Approved' : item.status} · {new Date(item.createdAt).toLocaleString()}</small></div><div className="broadcast-actions"><button title="Preview anonymous audience" onClick={() => void preview(item.id)} disabled={!can('broadcasts.preview')}><BarChart3 size={16} /></button>{!item.approvedById && item.status === 'draft' && <button title="Approve broadcast" onClick={() => void approve(item.id)} disabled={!can('broadcasts.approve')}><Check size={16} /></button>}{item.approvedById && item.status === 'draft' && <button title="Publish broadcast" onClick={() => void publish(item.id)} disabled={!can('broadcasts.publish')}><Send size={16} /></button>}{item.status === 'draft' && <button title="Cancel broadcast" onClick={() => void cancel(item.id)} disabled={!can('broadcasts.cancel')}><X size={16} /></button>}</div></article>)}</section>
+      <section className="broadcast-list"><div className="broadcast-list-title"><h2>Announcements</h2>{notice && <span role="status">{notice}</span>}</div>{loading ? <p>Loading broadcasts...</p> : items.length === 0 ? <p>No broadcasts yet.</p> : items.map((item) => <article className="broadcast-row" key={item.id}><div><h3>{item.title}</h3><p>{item.body}</p><small>{item.audienceType.replaceAll('_', ' ')} · {item.scheduledAt ? `scheduled ${new Date(item.scheduledAt).toLocaleString()}` : item.approvedById ? 'Approved' : item.status} · {new Date(item.createdAt).toLocaleString()}</small></div><div className="broadcast-actions"><button title="Preview anonymous audience" onClick={() => void preview(item.id)} disabled={!can('broadcasts.preview')}><BarChart3 size={16} /></button>{item.status === 'draft' && <button title="Edit draft" onClick={() => void edit(item.id, item)} disabled={!can('broadcasts.update')}>Edit</button>}{!item.approvedById && item.status === 'draft' && <button title="Approve broadcast" onClick={() => void approve(item.id)} disabled={!can('broadcasts.approve')}><Check size={16} /></button>}{item.approvedById && item.status === 'draft' && <><button title="Publish broadcast" onClick={() => void publish(item.id)} disabled={!can('broadcasts.publish')}><Send size={16} /></button><button title="Schedule broadcast" onClick={() => void schedule(item.id)} disabled={!can('broadcasts.schedule')}>Schedule</button></>}{item.status === 'failed' && <button title="Retry failed broadcast" onClick={() => void retry(item.id)} disabled={!can('broadcasts.publish')}>Retry</button>}{['draft', 'scheduled'].includes(item.status) && <button title="Cancel broadcast" onClick={() => void cancel(item.id)} disabled={!can('broadcasts.cancel')}><X size={16} /></button>}</div></article>)}</section>
     </section>
   </div>
 }

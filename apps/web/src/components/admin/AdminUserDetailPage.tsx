@@ -1,6 +1,6 @@
 'use client'
 
-import React, { useState } from 'react'
+import React, { useEffect, useState } from 'react'
 import Link from 'next/link'
 import { ArrowLeft, CalendarDays, Save } from 'lucide-react'
 import { apiMutate, useApi } from '@/lib/hooks'
@@ -13,6 +13,7 @@ type Detail = {
     name: string | null
     email: string
     plan: string
+    accountStatus: 'active' | 'suspended'
     location: string | null
     createdAt: string
     jobsCount: number
@@ -23,6 +24,53 @@ type Detail = {
     count: number
     recent: Array<{ id: number; status: string; mode: string; atsType: string | null; flowUsed: string | null; durationMs: number | null; createdAt: string }>
   }
+}
+
+type Override = { id: string; featureKey: string; enabled: boolean; limit: number | null; expiresAt: string | null; reason: string }
+type PlanChange = { id: string; fromPlan: string; toPlan: string; reason: string; actorUserId: string; createdAt: string }
+
+function AccountOperations({ userId, user, permissions }: { userId: string; user: Detail['user']; permissions: readonly string[] }) {
+  const [status, setStatus] = useState(user.accountStatus)
+  const [plan, setPlan] = useState(user.plan)
+  const [overrides, setOverrides] = useState<Override[]>([])
+  const [planHistory, setPlanHistory] = useState<PlanChange[]>([])
+  const [featureKey, setFeatureKey] = useState('auto_apply')
+  const [enabled, setEnabled] = useState(true)
+  const [limit, setLimit] = useState('')
+  const [expiresAt, setExpiresAt] = useState('')
+  const [notice, setNotice] = useState('')
+  const [busy, setBusy] = useState(false)
+
+  useEffect(() => { setStatus(user.accountStatus); setPlan(user.plan) }, [user.accountStatus, user.plan])
+  useEffect(() => {
+    if (!permissions.includes('users.feature_override')) return
+    void fetch(`/api/admin/v1/users/${userId}/feature-overrides`, { cache: 'no-store' }).then(response => response.json()).then(payload => setOverrides(payload.items ?? [])).catch(() => setNotice('Unable to load feature overrides.'))
+  }, [permissions, userId])
+  useEffect(() => {
+    if (!permissions.includes('billing.read')) return
+    void fetch(`/api/admin/v1/users/${userId}/plan`, { cache: 'no-store' }).then(response => response.json()).then(payload => setPlanHistory(payload.changes ?? [])).catch(() => setNotice('Unable to load plan history.'))
+  }, [permissions, userId, plan])
+
+  async function mutate(url: string, body: Record<string, unknown>, message: string) {
+    const reason = window.prompt('Enter the operational reason')?.trim()
+    if (!reason) return
+    setBusy(true)
+    const response = await fetch(url, { method: 'PATCH', headers: { 'Content-Type': 'application/json', 'Idempotency-Key': crypto.randomUUID() }, body: JSON.stringify({ ...body, reason }) })
+    const payload = await response.json().catch(() => null) as { error?: string; item?: Override } | null
+    setBusy(false)
+    if (!response.ok) { setNotice(payload?.error ?? 'Operation failed.'); return }
+    setNotice(message)
+    if (payload?.item) setOverrides(current => [...current.filter(item => item.featureKey !== payload.item!.featureKey), payload.item!])
+  }
+
+  const canSuspend = permissions.includes('users.suspend')
+  const canRestore = permissions.includes('users.restore')
+  const canPlan = permissions.includes('billing.update')
+  const canOverride = permissions.includes('users.feature_override')
+  return <section className="admin-detail-operations"><div className="admin-settings-heading"><div><h2>Account operations</h2><p>High-impact actions are audited and never expose candidate documents or credentials.</p></div><span role="status">{notice}</span></div><div className="admin-operation-grid">
+    <label>Account state<select value={status} disabled={busy || (status === 'active' ? !canSuspend : !canRestore)} onChange={event => { const next = event.target.value as 'active' | 'suspended'; setStatus(next); void mutate(`/api/admin/v1/users/${userId}/account-state`, { status: next }, next === 'suspended' ? 'Account suspended.' : 'Account restored.') }}><option value="active">Active</option><option value="suspended">Suspended</option></select></label>
+    <label>Commercial plan<select value={plan} disabled={busy || !canPlan} onChange={event => { const next = event.target.value; setPlan(next); void mutate(`/api/admin/v1/users/${userId}/plan`, { toPlan: next }, `Plan changed to ${next}.`) }}><option value="free">Free</option><option value="pro">Pro</option><option value="enterprise">Enterprise</option></select></label>
+  </div>{canOverride && <><h3>Feature overrides</h3><form className="admin-operation-form" onSubmit={event => { event.preventDefault(); void mutate(`/api/admin/v1/users/${userId}/feature-overrides`, { featureKey, enabled, limit: limit ? Number(limit) : null, expiresAt: expiresAt || null }, 'Feature override saved.') }}><input value={featureKey} onChange={event => setFeatureKey(event.target.value)} placeholder="Feature key" required /><label><input type="checkbox" checked={enabled} onChange={event => setEnabled(event.target.checked)} /> Enabled</label><input type="number" min="0" value={limit} onChange={event => setLimit(event.target.value)} placeholder="Limit" /><input type="datetime-local" value={expiresAt} onChange={event => setExpiresAt(event.target.value)} /><button className="admin-secondary" disabled={busy}>Save override</button></form><div className="admin-override-list">{overrides.length === 0 ? <span>No overrides.</span> : overrides.map(item => <span key={item.id}>{item.featureKey}: {item.enabled ? 'on' : 'off'}{item.limit === null ? '' : ` · ${item.limit}`}{item.expiresAt ? ` · expires ${new Date(item.expiresAt).toLocaleDateString()}` : ''}</span>)}</div></>}{permissions.includes('billing.read') && <section className="admin-detail-history"><h3>Plan change history</h3><div className="admin-table-wrap"><table className="admin-table"><thead><tr><th>From</th><th>To</th><th>Reason</th><th>Actor</th><th>Time</th></tr></thead><tbody>{planHistory.length === 0 ? <tr><td colSpan={5}>No plan changes.</td></tr> : planHistory.map(change => <tr key={change.id}><td>{change.fromPlan}</td><td>{change.toPlan}</td><td>{change.reason}</td><td>{change.actorUserId}</td><td>{new Date(change.createdAt).toLocaleString()}</td></tr>)}</tbody></table></div></section>}</section>
 }
 
 type Preferences = {
@@ -124,10 +172,10 @@ function SettingsPanel({ userId, canUpdatePreferences }: { userId: string; canUp
   </section>
 }
 
-export function AdminUserDetailPage({ userId, canUpdatePreferences }: { userId: string; canUpdatePreferences: boolean }) {
+export function AdminUserDetailPage({ userId, canUpdatePreferences, permissions = [] }: { userId: string; canUpdatePreferences: boolean; permissions?: readonly string[] }) {
   const { data, loading, error } = useApi<Detail>(`/api/admin/v1/users/${userId}`)
   const user = data?.user
   return <div className="admin-page"><header className="admin-header"><div><Link className="admin-back" href="/admin/users"><ArrowLeft size={16} /> Users</Link><h1>{loading ? 'Loading user...' : user?.name ?? 'User'}</h1><p>Masked account metadata and safe operational history</p></div><div className="admin-header-time"><CalendarDays size={18} /> Internal console</div></header>
-    {error ? <div className="admin-alert">{error}</div> : user && <section className="admin-detail"><div className="admin-detail-grid"><section><h2>Account</h2><dl><dt>Email</dt><dd>{user.email}</dd><dt>Plan</dt><dd>{user.plan}</dd><dt>Location</dt><dd>{user.location ?? 'Not provided'}</dd><dt>Joined</dt><dd>{new Date(user.createdAt).toLocaleString()}</dd></dl></section><section><h2>Safe status</h2><dl><dt>Jobs</dt><dd>{user.jobsCount}</dd><dt>Resume</dt><dd>{user.resumeExists ? 'On file' : 'Not uploaded'}</dd><dt>Gmail</dt><dd>{user.gmail.connected ? (user.gmail.hasError ? 'Needs attention' : 'Connected') : 'Not connected'}</dd><dt>Applications</dt><dd>{data.applications.count}</dd></dl></section></div><SettingsPanel userId={userId} canUpdatePreferences={canUpdatePreferences} /><section className="admin-detail-history"><h2>Recent application metadata</h2><div className="admin-table-wrap"><table className="admin-table"><thead><tr><th>Status</th><th>ATS</th><th>Flow</th><th>Mode</th><th>Created</th></tr></thead><tbody>{data.applications.recent.length === 0 ? <tr><td colSpan={5}>No application records.</td></tr> : data.applications.recent.map((item) => <tr key={item.id}><td>{item.status}</td><td>{item.atsType ?? 'unknown'}</td><td>{item.flowUsed ?? 'unknown'}</td><td>{item.mode}</td><td>{new Date(item.createdAt).toLocaleString()}</td></tr>)}</tbody></table></div></section></section>}
+    {error ? <div className="admin-alert">{error}</div> : user && <section className="admin-detail"><div className="admin-detail-grid"><section><h2>Account</h2><dl><dt>Email</dt><dd>{user.email}</dd><dt>Plan</dt><dd>{user.plan}</dd><dt>Account state</dt><dd>{user.accountStatus}</dd><dt>Location</dt><dd>{user.location ?? 'Not provided'}</dd><dt>Joined</dt><dd>{new Date(user.createdAt).toLocaleString()}</dd></dl></section><section><h2>Safe status</h2><dl><dt>Jobs</dt><dd>{user.jobsCount}</dd><dt>Resume</dt><dd>{user.resumeExists ? 'On file' : 'Not uploaded'}</dd><dt>Gmail</dt><dd>{user.gmail.connected ? (user.gmail.hasError ? 'Needs attention' : 'Connected') : 'Not connected'}</dd><dt>Applications</dt><dd>{data.applications.count}</dd></dl></section></div><AccountOperations userId={userId} user={user} permissions={permissions} /><SettingsPanel userId={userId} canUpdatePreferences={canUpdatePreferences} /><section className="admin-detail-history"><h2>Recent application metadata</h2><div className="admin-table-wrap"><table className="admin-table"><thead><tr><th>Status</th><th>ATS</th><th>Flow</th><th>Mode</th><th>Created</th></tr></thead><tbody>{data.applications.recent.length === 0 ? <tr><td colSpan={5}>No application records.</td></tr> : data.applications.recent.map((item) => <tr key={item.id}><td>{item.status}</td><td>{item.atsType ?? 'unknown'}</td><td>{item.flowUsed ?? 'unknown'}</td><td>{item.mode}</td><td>{new Date(item.createdAt).toLocaleString()}</td></tr>)}</tbody></table></div></section></section>}
   </div>
 }

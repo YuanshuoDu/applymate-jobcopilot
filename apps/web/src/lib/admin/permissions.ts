@@ -1,12 +1,12 @@
 export const PERMISSIONS = [
-  'users.read', 'users.read_pii_masked', 'users.update_preferences', 'users.suspend', 'users.restore', 'users.export_anonymized',
+  'users.read', 'users.read_pii_masked', 'users.update_preferences', 'users.suspend', 'users.restore', 'users.feature_override', 'users.export_anonymized',
   'billing.read', 'billing.update', 'billing.refund_mark',
   'jobs.read_metadata', 'jobs.read_content_masked', 'applications.read', 'applications.retry', 'applications.cancel', 'applications.manual_review',
   'ats.read', 'ats.update', 'ats.pause', 'ats.resume', 'ats.test', 'ats.registry.manage',
   'feature_flags.read', 'feature_flags.update', 'feature_flags.approve',
   'ai_budget.read', 'ai_budget.update', 'ai_budget.reset',
   'queues.read', 'queues.retry', 'queues.pause', 'queues.resume',
-  'broadcasts.create', 'broadcasts.update', 'broadcasts.preview', 'broadcasts.approve', 'broadcasts.publish', 'broadcasts.cancel',
+  'broadcasts.create', 'broadcasts.update', 'broadcasts.preview', 'broadcasts.approve', 'broadcasts.publish', 'broadcasts.schedule', 'broadcasts.cancel',
   'support_cases.read', 'support_cases.assign', 'support_cases.reply', 'support_cases.note', 'support_cases.resolve', 'support_cases.escalate', 'support_sla.manage', 'support_macros.manage',
   'admin_members.read', 'admin_members.manage', 'admin_roles.manage', 'sessions.revoke', 'audit.read', 'break_glass.request', 'break_glass.approve',
   'observability.read', 'incidents.manage',
@@ -21,7 +21,7 @@ const rolePermissions: Record<AdminRoleKey, readonly Permission[]> = {
   analyst: ['observability.read', 'ai_budget.read', 'users.export_anonymized'],
   billing: ['billing.read', 'billing.update', 'billing.refund_mark'],
   security_admin: ['admin_members.read', 'admin_members.manage', 'admin_roles.manage', 'sessions.revoke', 'audit.read', 'break_glass.request', 'break_glass.approve'],
-  platform_admin: ['ats.read', 'ats.update', 'ats.pause', 'ats.resume', 'ats.test', 'ats.registry.manage', 'feature_flags.read', 'feature_flags.update', 'feature_flags.approve', 'ai_budget.read', 'ai_budget.update', 'broadcasts.create', 'broadcasts.update', 'broadcasts.preview', 'broadcasts.approve', 'broadcasts.publish', 'broadcasts.cancel', 'queues.read', 'observability.read', 'incidents.manage'],
+  platform_admin: ['ats.read', 'ats.update', 'ats.pause', 'ats.resume', 'ats.test', 'ats.registry.manage', 'feature_flags.read', 'feature_flags.update', 'feature_flags.approve', 'ai_budget.read', 'ai_budget.update', 'users.feature_override', 'broadcasts.create', 'broadcasts.update', 'broadcasts.preview', 'broadcasts.approve', 'broadcasts.publish', 'broadcasts.schedule', 'broadcasts.cancel', 'queues.read', 'observability.read', 'incidents.manage'],
   super_admin: PERMISSIONS,
 }
 

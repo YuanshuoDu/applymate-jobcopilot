@@ -6,5 +6,5 @@ export default async function UserDetailAdminPage({ params }: { params: Promise<
   const actor = await requireAdmin('users.read')
   if (isAdminResponse(actor)) redirect('/login?callbackUrl=/admin/users')
   const { id } = await params
-  return <AdminUserDetailPage userId={id} canUpdatePreferences={actor.permissions.includes('users.update_preferences')} />
+  return <AdminUserDetailPage userId={id} permissions={actor.permissions} canUpdatePreferences={actor.permissions.includes('users.update_preferences')} />
 }

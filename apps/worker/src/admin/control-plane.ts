@@ -78,6 +78,18 @@ export function createWorkerControlHandler() {
       const { queues } = await loadWorkerQueueResources()
       const queue = queues[queueName as keyof typeof queues]
       if (!queue) return response.status(400).json({ error: 'Unsupported queue' })
+      if (command.action === 'failed_queue_jobs') {
+        const jobs = await queue.getJobs(['failed'], 0, 49, true)
+        return response.json({ receipt: randomUUID(), queue: queueName, jobs: jobs.map(job => ({ id: job.id, name: job.name, failedReason: job.failedReason, attemptsMade: job.attemptsMade, finishedOn: job.finishedOn })) })
+      }
+      if (command.action === 'retry_queue_job') {
+        const jobId = typeof command.params.jobId === 'string' ? command.params.jobId : ''
+        if (!jobId) return response.status(400).json({ error: 'Missing job id' })
+        const job = await queue.getJob(jobId)
+        if (!job) return response.status(404).json({ error: 'Job not found' })
+        await job.retry('failed')
+        return response.json({ receipt: randomUUID(), queue: queueName, jobId })
+      }
       if (command.action === 'pause_queue') await queue.pause()
       if (command.action === 'resume_queue') await queue.resume()
       return response.json({ receipt: randomUUID(), queue: queueName, action: command.action })

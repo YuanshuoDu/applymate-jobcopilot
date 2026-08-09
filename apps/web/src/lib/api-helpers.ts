@@ -6,6 +6,7 @@ import { APPLYMATE_BACKING, resolveConfig, resolveFeatureConfig, type UserAiSett
 import { db } from '@/lib/db'
 import { safeAuth } from '@/lib/safe-auth'
 import { getAuthJwtSecret } from '@/lib/auth-secret'
+import { resolvePlatformRoute } from '@/lib/admin/ai-config'
 
 const JWT_SECRET = getAuthJwtSecret()
 
@@ -25,7 +26,7 @@ export async function requireAuth(
     try {
       const { payload } = await jwtVerify(token, JWT_SECRET)
       if (payload.sub) {
-        return { userId: payload.sub as string }
+        return activeAccountOrDenied(payload.sub as string)
       }
     } catch {
       // Token invalid — fall through to session check.
@@ -34,9 +35,15 @@ export async function requireAuth(
 
   // NextAuth session (web app)
   const session = await safeAuth()
-  if (session?.user?.id) return { userId: session.user.id }
+  if (session?.user?.id) return activeAccountOrDenied(session.user.id)
 
   return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
+}
+
+async function activeAccountOrDenied(userId: string) {
+  const user = await db.user.findUnique({ where: { id: userId }, select: { accountStatus: true } })
+  if (user?.accountStatus === 'suspended') return NextResponse.json({ error: 'Account suspended' }, { status: 403 })
+  return { userId }
 }
 
 export function isErrorResponse(val: unknown): val is NextResponse {
@@ -66,7 +73,7 @@ export async function prepareAiRoute(req: NextRequest, featureId: FeatureId) {
   const configured = resolveFeatureConfig(featureId, (prefs.aiSettings ?? null) as UserAiSettings | null)
   // A stale feature override must not make the application flow unusable when
   // its provider has no key. Fall back to the platform MiniMax model.
-  const cfg = configured.resolvedKey ? configured : resolveConfig(APPLYMATE_BACKING)
+  const cfg = configured.resolvedKey ? configured : await resolvePlatformRoute(featureId)
 
   return { userId: auth.userId, cfg }
 }

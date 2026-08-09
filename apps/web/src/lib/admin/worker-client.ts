@@ -1,10 +1,12 @@
 import { createHmac, randomUUID } from 'node:crypto'
 
-export type WorkerControlAction = 'queue_summary' | 'pause_queue' | 'resume_queue' | 'apply_ats_policy'
+export type WorkerControlAction = 'queue_summary' | 'failed_queue_jobs' | 'retry_queue_job' | 'pause_queue' | 'resume_queue' | 'apply_ats_policy'
 export type WorkerCommand = Readonly<{ requestId: string; timestamp: number; nonce: string; actorId: string; action: WorkerControlAction; reason: string; params: Record<string, string | number | boolean> }>
 export type WorkerCommandResult = Readonly<{
   receipt?: string
   queues?: unknown
+  jobs?: unknown
+  jobId?: string
   queue?: string
   action?: WorkerControlAction
   acknowledgedVersion?: number

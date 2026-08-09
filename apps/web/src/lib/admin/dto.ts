@@ -3,6 +3,7 @@ type UserMetadataRecord = {
   name: string | null
   email: string
   plan: string
+  accountStatus?: string
   location: string | null
   createdAt: Date
   _count?: { jobs: number; resumes: number; notifications: number }
@@ -31,6 +32,7 @@ export function toAdminUserMetadata(user: UserMetadataRecord) {
     name: maskName(user.name),
     email: maskEmail(user.email),
     plan: user.plan,
+    accountStatus: user.accountStatus ?? 'active',
     location: maskLocation(user.location),
     createdAt: user.createdAt,
     jobsCount: user._count?.jobs ?? 0,
@@ -45,6 +47,7 @@ export const adminUserMetadataSelect = {
   name: true,
   email: true,
   plan: true,
+  accountStatus: true,
   location: true,
   createdAt: true,
   _count: { select: { jobs: true, resumes: true, notifications: true } },

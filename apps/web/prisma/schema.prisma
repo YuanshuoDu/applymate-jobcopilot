@@ -62,6 +62,10 @@ model User {
   image         String?
   password      String?   // hashed, for credential login
   plan          Plan      @default(free)
+  accountStatus UserAccountStatus @default(active)
+  suspendedAt   DateTime?
+  suspendedById String?
+  suspensionReason String?
   phone         String?
   location      String?
   linkedin      String?
@@ -105,12 +109,51 @@ model User {
   gmailRecommendations GmailRecommendation[]
   adminMembership AdminMembership? @relation("AdminUser")
   supportCases SupportCase[] @relation("SupportRequester")
+  planChanges UserPlanChange[]
+  featureOverrides UserFeatureOverride[]
 }
 
 enum Plan {
   free
   pro
   enterprise
+}
+
+enum UserAccountStatus {
+  active
+  suspended
+}
+
+model UserPlanChange {
+  id          String   @id @default(cuid())
+  userId      String
+  fromPlan    Plan
+  toPlan      Plan
+  reason      String
+  actorUserId String
+  createdAt   DateTime @default(now())
+  user        User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, createdAt(sort: Desc)])
+  @@map("user_plan_changes")
+}
+
+model UserFeatureOverride {
+  id          String   @id @default(cuid())
+  userId      String
+  featureKey  String
+  enabled     Boolean
+  limit       Int?
+  reason      String
+  actorUserId String
+  expiresAt   DateTime?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+  user        User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, featureKey])
+  @@index([userId, expiresAt])
+  @@map("user_feature_overrides")
 }
 
 enum BillingInterval {
@@ -563,6 +606,54 @@ model AiBudgetResetRequest {
   @@map("ai_budget_reset_requests")
 }
 
+model AiProviderConfig {
+  id                   String   @id @default(cuid())
+  key                  String   @unique
+  displayName          String
+  apiBase              String
+  secretRef            String?
+  credentialConfigured Boolean  @default(false)
+  enabled              Boolean  @default(true)
+  version              Int      @default(1)
+  createdAt            DateTime @default(now())
+  updatedAt            DateTime @updatedAt
+  models               AiModelConfig[]
+
+  @@map("ai_provider_configs")
+}
+
+model AiModelConfig {
+  id          String   @id @default(cuid())
+  providerId  String
+  model       String
+  label       String
+  description String?
+  tier        String
+  priceIn     Float    @default(0)
+  priceOut    Float    @default(0)
+  contextK    Int      @default(128)
+  active      Boolean  @default(true)
+  provider    AiProviderConfig @relation(fields: [providerId], references: [id], onDelete: Cascade)
+
+  @@unique([providerId, model])
+  @@index([providerId, active])
+  @@map("ai_model_configs")
+}
+
+model AiRouteConfig {
+  id               String   @id @default(cuid())
+  featureKey       String   @unique
+  defaultProvider  String
+  defaultModel     String
+  fallbackProvider String?
+  fallbackModel    String?
+  version          Int      @default(1)
+  updatedById      String
+  updatedAt        DateTime @updatedAt
+
+  @@map("ai_route_configs")
+}
+
 enum AdminMembershipStatus {
   active
   suspended
@@ -583,15 +674,34 @@ enum AdminAuditOutcome {
 
 enum AdminTargetType {
   user
+  plan
+  admin_role
   job
   application
   ats_source
   feature_flag
   ai_budget
+  ai_provider
+  ai_model
+  ai_route
   queue
   broadcast
   support_case
   admin_member
+  incident
+}
+
+enum AdminIncidentSeverity {
+  low
+  medium
+  high
+  critical
+}
+
+enum AdminIncidentStatus {
+  open
+  monitoring
+  resolved
 }
 
 enum BroadcastStatus {
@@ -695,6 +805,24 @@ model AdminAuditLog {
   @@index([actorUserId, createdAt(sort: Desc)])
   @@index([tenantUserId, createdAt(sort: Desc)])
   @@index([action, createdAt(sort: Desc)])
+}
+
+model AdminIncident {
+  id          String                @id @default(cuid())
+  title       String
+  summary     String                @db.Text
+  service     String
+  severity    AdminIncidentSeverity @default(medium)
+  status      AdminIncidentStatus   @default(open)
+  startedAt   DateTime              @default(now())
+  resolvedAt  DateTime?
+  createdById String
+  updatedById String
+  createdAt   DateTime              @default(now())
+  updatedAt   DateTime              @updatedAt
+
+  @@index([status, severity, startedAt(sort: Desc)])
+  @@map("admin_incidents")
 }
 
 model AdminBreakGlassGrant {

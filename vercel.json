@@ -12,6 +12,10 @@
     {
       "path": "/api/notifications/daily",
       "schedule": "30 8 * * *"
+    },
+    {
+      "path": "/api/notifications/broadcasts/due",
+      "schedule": "*/5 * * * *"
     }
   ]
 }
