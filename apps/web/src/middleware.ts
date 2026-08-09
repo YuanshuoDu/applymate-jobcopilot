@@ -1,6 +1,7 @@
 import { NextResponse } from 'next/server'
 import type { NextRequest } from 'next/server'
 import { applyAdminSecurityHeaders } from '@/lib/admin/http-security'
+import { adminOrigin, isAdminApiPath, isAdminHost, isAdminPath, isAuthPath, isLocalHost } from '@/lib/host-routing'
 
 const PUBLIC_ROUTES = ['/login', '/register', '/forgot-password', '/reset-password', '/api/auth']
 const SESSION_COOKIE_NAMES = [
@@ -17,6 +18,35 @@ function hasSessionCookie(req: NextRequest) {
 
 export async function middleware(req: NextRequest) {
   const { pathname } = req.nextUrl
+  const hostname = req.nextUrl.hostname
+  const onAdminHost = isAdminHost(hostname)
+
+  // The administrator hostname is intentionally a narrow surface: only the
+  // admin UI, Auth.js endpoints, and admin APIs are routable there.
+  if (onAdminHost) {
+    if (pathname === '/register') {
+      return NextResponse.redirect(new URL('/login?callbackUrl=%2Fadmin', req.url))
+    }
+
+    if ((pathname === '/api' || pathname.startsWith('/api/')) && !isAuthPath(pathname) && !isAdminApiPath(pathname)) {
+      return applyAdminSecurityHeaders(NextResponse.json({ error: 'Administrator host only' }, { status: 404 }))
+    }
+
+    if (!isAuthPath(pathname) && !isAdminPath(pathname) && !pathname.startsWith('/api/')) {
+      return NextResponse.redirect(new URL('/admin', req.url))
+    }
+  } else if (isAdminPath(pathname) && !isLocalHost(hostname)) {
+    // Keep the admin session and its logout callback on the administrator
+    // origin. Preview deployments are included so they cannot become a
+    // second, accidentally public admin surface.
+    const target = new URL(pathname, adminOrigin(req.url))
+    target.search = req.nextUrl.search
+    return NextResponse.redirect(target)
+  }
+
+  if (isAdminApiPath(pathname) && !onAdminHost && !isLocalHost(hostname)) {
+    return applyAdminSecurityHeaders(NextResponse.json({ error: 'Administrator API is only available on the administrator host' }, { status: 404 }))
+  }
 
   // ── Allow public routes through ────────────────────────────
   if (PUBLIC_ROUTES.some(p => pathname.startsWith(p))) {

@@ -55,4 +55,40 @@ describe('web middleware entrypoint', () => {
     expect(response.status).toBe(307)
     expect(response.headers.get('location')).toContain('/login?callbackUrl=%2Fdashboard')
   })
+
+  it('sends the administrator host root to the protected admin entrypoint', async () => {
+    const response = await middleware(new NextRequest('https://admin.applymate.site/'))
+
+    expect(response.status).toBe(307)
+    expect(response.headers.get('location')).toBe('https://admin.applymate.site/admin')
+  })
+
+  it('keeps ordinary pages off the administrator host', async () => {
+    const response = await middleware(new NextRequest('https://admin.applymate.site/jobs'))
+
+    expect(response.status).toBe(307)
+    expect(response.headers.get('location')).toBe('https://admin.applymate.site/admin')
+  })
+
+  it('moves admin pages from production and preview hosts to the administrator origin', async () => {
+    const response = await middleware(new NextRequest('https://applymate.site/admin/plans?tab=limits'))
+
+    expect(response.status).toBe(307)
+    expect(response.headers.get('location')).toBe('https://admin.applymate.site/admin/plans?tab=limits')
+  })
+
+  it('does not expose admin APIs on the ordinary production host', async () => {
+    const response = await middleware(new NextRequest('https://applymate.site/api/admin/v1/users'))
+
+    expect(response.status).toBe(404)
+    expect(response.headers.get('Cache-Control')).toBe('no-store, private')
+  })
+
+  it('keeps the administrator login public while restricting other APIs', async () => {
+    const login = await middleware(new NextRequest('https://admin.applymate.site/login?callbackUrl=%2Fadmin'))
+    const api = await middleware(new NextRequest('https://admin.applymate.site/api/jobs'))
+
+    expect(login.status).toBe(200)
+    expect(api.status).toBe(404)
+  })
 })

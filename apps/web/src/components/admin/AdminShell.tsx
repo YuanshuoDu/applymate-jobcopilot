@@ -2,7 +2,8 @@
 
 import Link from 'next/link'
 import { usePathname } from 'next/navigation'
-import { Activity, Bell, Bot, CreditCard, FileText, Flag, Home, Inbox, Radio, ServerCog, ShieldAlert, ShieldCheck, Users } from 'lucide-react'
+import { Activity, Bell, Bot, CreditCard, FileText, Flag, Home, Inbox, LogOut, Radio, ServerCog, ShieldAlert, ShieldCheck, Users } from 'lucide-react'
+import { signOut } from 'next-auth/react'
 import type { ReactNode } from 'react'
 
 const navigation = [
@@ -34,7 +35,7 @@ export function AdminShell({ children, permissions, roleKey }: { children: React
             return <Link key={item.href} href={item.href} data-active={active} className="admin-nav-link"><Icon size={18} aria-hidden="true" />{item.label}</Link>
           })}
         </nav>
-        <div className="admin-identity"><span className="admin-avatar">{roleKey.slice(0, 2).toUpperCase()}</span><div><strong>{roleKey.replaceAll('_', ' ')}</strong><small>Internal role</small></div></div>
+        <div className="admin-identity"><span className="admin-avatar">{roleKey.slice(0, 2).toUpperCase()}</span><div><strong>{roleKey.replaceAll('_', ' ')}</strong><small>Internal role</small></div><button type="button" className="admin-logout" onClick={() => signOut({ callbackUrl: '/login?callbackUrl=%2Fadmin' })} aria-label="Sign out"><LogOut size={15} aria-hidden="true" /></button></div>
       </aside>
       <main className="admin-main">{children}</main>
     </div>

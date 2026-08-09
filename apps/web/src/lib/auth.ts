@@ -147,7 +147,12 @@ export const { handlers, signIn, signOut, auth } = NextAuth({
       return session
     },
     async redirect({ url, baseUrl }) {
-      return canonicalAuthRedirect(url, baseUrl, process.env.AUTH_CANONICAL_URL ?? 'https://applymate.site')
+      return canonicalAuthRedirect(
+        url,
+        baseUrl,
+        process.env.AUTH_CANONICAL_URL ?? 'https://applymate.site',
+        process.env.VERCEL_ENV === 'preview',
+      )
     },
   },
   pages: {
