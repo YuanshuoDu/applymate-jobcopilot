@@ -11,7 +11,31 @@ vi.mock('../queue/scout-queue.js', () => ({ scoutQueue: { pause: vi.fn(), resume
 vi.mock('../queue/agent-run-queue.js', () => ({ agentRunQueue: { pause: vi.fn(), resume: vi.fn(), getJobCounts: vi.fn(), isPaused: vi.fn() } }))
 vi.mock('./ats-policy.js', () => ({ loadEffectiveAtsPolicy: mocks.loadPolicy }))
 
-import { applyAtsPolicyCommand } from './control-plane.js'
+import { applyAtsPolicyCommand, resolveWorkerAdminHost } from './control-plane.js'
+
+describe('worker admin host resolution', () => {
+  it('requires a control secret for a public production listener', () => {
+    expect(() => resolveWorkerAdminHost({ host: '0.0.0.0', environment: 'production', hasControlSecret: false }))
+      .toThrow('WORKER_CONTROL_SECRET is required')
+  })
+
+  it('allows a public production listener with a control secret', () => {
+    expect(resolveWorkerAdminHost({ host: '0.0.0.0', environment: 'production', hasControlSecret: true }))
+      .toBe('0.0.0.0')
+  })
+
+  it('defaults to a loopback host when none is configured', () => {
+    const configuredHost = process.env.WORKER_ADMIN_HOST
+    delete process.env.WORKER_ADMIN_HOST
+
+    try {
+      expect(resolveWorkerAdminHost()).toBe('127.0.0.1')
+    } finally {
+      if (configuredHost === undefined) delete process.env.WORKER_ADMIN_HOST
+      else process.env.WORKER_ADMIN_HOST = configuredHost
+    }
+  })
+})
 
 describe('ATS control-plane acknowledgement', () => {
   it('acknowledges only the version loaded from the committed policy row', async () => {

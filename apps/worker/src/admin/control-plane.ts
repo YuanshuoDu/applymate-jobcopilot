@@ -10,10 +10,28 @@ import { verifyWorkerCommand } from './control-auth.js'
 
 const queues = { 'apply-tasks': applyQueue, 'scout-tasks': scoutQueue, 'agent-runs': agentRunQueue }
 
+type WorkerAdminHostOptions = {
+  host?: string
+  environment?: string
+  hasControlSecret?: boolean
+}
+
 class WorkerControlError extends Error {
   constructor(message: string, readonly status: number) {
     super(message)
   }
+}
+
+export function resolveWorkerAdminHost(options: WorkerAdminHostOptions = {}): string {
+  const host = options.host ?? process.env.WORKER_ADMIN_HOST ?? '127.0.0.1'
+  const environment = options.environment ?? process.env.NODE_ENV
+  const hasControlSecret = options.hasControlSecret ?? Boolean(process.env.WORKER_CONTROL_SECRET)
+
+  if (environment === 'production' && (host === '0.0.0.0' || host === '::') && !hasControlSecret) {
+    throw new Error('WORKER_CONTROL_SECRET is required for a public worker control listener in production')
+  }
+
+  return host
 }
 
 export async function applyAtsPolicyCommand(

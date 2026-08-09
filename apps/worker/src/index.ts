@@ -8,7 +8,7 @@ import express from "express";
 import { createBullBoard } from "@bull-board/api";
 import { BullMQAdapter } from "@bull-board/api/bullMQAdapter";
 import { ExpressAdapter } from "@bull-board/express";
-import { createWorkerControlHandler } from "./admin/control-plane.js";
+import { createWorkerControlHandler, resolveWorkerAdminHost } from "./admin/control-plane.js";
 
 async function main() {
   console.log("[worker] Starting ApplyMate worker...");
@@ -73,10 +73,7 @@ async function main() {
   }
 
   const boardPort = Number(process.env.BULL_BOARD_PORT ?? "3001");
-  const adminHost = process.env.WORKER_ADMIN_HOST ?? "127.0.0.1";
-  if (process.env.NODE_ENV === "production" && ["0.0.0.0", "::"].includes(adminHost)) {
-    throw new Error("WORKER_ADMIN_HOST must be loopback or private in production");
-  }
+  const adminHost = resolveWorkerAdminHost();
   adminApp.listen(boardPort, adminHost, () =>
     console.log(`[worker-health] http://${adminHost}:${boardPort}/healthz`)
   );
