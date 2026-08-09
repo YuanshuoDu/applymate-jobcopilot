@@ -16,7 +16,7 @@ export async function getPlanCatalogue(includeInactive = false): Promise<PlanCat
     where: includeInactive ? undefined : { active: true },
     orderBy: [{ sortOrder: 'asc' }, { plan: 'asc' }],
   })
-  if (rows.length === 0) return DEFAULT_PLAN_CATALOGUE.map(plan => ({ ...plan, features: [...plan.features] }))
+  if (rows.length === 0) return DEFAULT_PLAN_CATALOGUE.map(plan => ({ ...plan, features: [...plan.features], entitlements: [...plan.entitlements] }))
   return ordered(rows.map(row => normalizePlanRow(row)))
 }
 

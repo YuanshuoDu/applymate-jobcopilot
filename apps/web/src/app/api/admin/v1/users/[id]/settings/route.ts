@@ -55,6 +55,8 @@ export async function PATCH(req: NextRequest, { params }: Params) {
   const body = await req.json().catch(() => null)
   const bodyRecord = body && typeof body === 'object' && !Array.isArray(body) ? body as Record<string, unknown> : null
   const reason = typeof bodyRecord?.reason === 'string' ? bodyRecord.reason.trim() : ''
+  const idempotencyKey = req.headers.get('idempotency-key')?.trim() ?? ''
+  if (!idempotencyKey) return adminJson({ error: 'Idempotency-Key is required' }, actor.requestId, 400)
   if (reason.length < 10 || reason.length > 500) return adminJson({ error: 'A settings-change reason is required' }, actor.requestId, 400)
   const settingsBody = bodyRecord
     ? Object.fromEntries(Object.entries(bodyRecord).filter(([key]) => key !== 'reason'))
@@ -91,11 +93,18 @@ export async function PATCH(req: NextRequest, { params }: Params) {
       before: adminSettingsAuditSnapshot(existing.preferences) as unknown as Prisma.InputJsonValue,
       after: adminSettingsAuditSnapshot(updated.preferences) as unknown as Prisma.InputJsonValue,
     }),
-    mutate: (tx) => tx.user.update({
-      where: { id },
-      data: { preferences },
-      select: USER_SELECT,
-    }),
+    mutate: async (tx) => {
+      if (patch.dataDeletionRequestStatus) {
+        const current = existing.preferences && typeof existing.preferences === 'object' && !Array.isArray(existing.preferences) ? existing.preferences as Record<string, unknown> : {}
+        const requestedAt = typeof current.dataDeletionRequestedAt === 'string' && !Number.isNaN(new Date(current.dataDeletionRequestedAt).getTime()) ? new Date(current.dataDeletionRequestedAt) : new Date()
+        await tx.adminDataDeletionRequest.upsert({
+          where: { userId: id },
+          create: { userId: id, status: patch.dataDeletionRequestStatus, reason, requestedAt, processedAt: ['completed', 'cancelled'].includes(patch.dataDeletionRequestStatus) ? new Date() : null, processedById: ['completed', 'cancelled'].includes(patch.dataDeletionRequestStatus) ? actor.userId : null, note: reason },
+          update: { status: patch.dataDeletionRequestStatus, reason, processedAt: ['completed', 'cancelled'].includes(patch.dataDeletionRequestStatus) ? new Date() : null, processedById: ['completed', 'cancelled'].includes(patch.dataDeletionRequestStatus) ? actor.userId : null, note: reason, version: { increment: 1 } },
+        })
+      }
+      return tx.user.update({ where: { id }, data: { preferences }, select: USER_SELECT })
+    },
   })
   if (result.duplicate) return adminJson({ duplicate: true }, actor.requestId)
 

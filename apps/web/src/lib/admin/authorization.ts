@@ -21,7 +21,9 @@ const highRiskPermissions = new Set([
   'ats.update', 'ats.pause', 'ats.resume', 'queues.pause', 'queues.resume', 'queues.retry',
   'broadcasts.create', 'broadcasts.publish', 'broadcasts.schedule', 'broadcasts.retry',
   'break_glass.request', 'break_glass.approve', 'support_cases.assign', 'support_cases.resolve',
-  'support_cases.reply', 'support_cases.note', 'incidents.manage',
+  'support_cases.reply', 'support_cases.note', 'support_cases.escalate', 'support_macros.manage',
+  'support_sla.manage', 'admin_access_reviews.manage', 'security.webauthn.manage', 'users.deletion.manage',
+  'observability.alerts.manage', 'incidents.manage',
 ])
 
 export async function requireAdminMembership(request?: Request): Promise<AdminActor | NextResponse> {

@@ -5,8 +5,10 @@ import { DeploymentReadinessPanel } from '@/components/admin/DeploymentReadiness
 import type { DeploymentReadiness } from '@/lib/admin/deployment-readiness'
 import { useApi } from '@/lib/hooks'
 import type { PlatformIntegrationStatus } from '@/lib/admin/integration-status'
+import { AdminAlertRulesPanel } from './AdminAlertRulesPanel'
 
-type Metrics = { overall: { total: number; successRate: number; avgDurationMs: number; captchaRate: number; last24h: { count: number; successRate: number } }; platform: { registeredUsers: number; registrationsLast7d: number; plans: Record<string, number>; sources: { employers: number; jobs: number }; overdueSupportCases: number } }
+type Metrics = { overall: { total: number; successRate: number; avgDurationMs: number; captchaRate: number; last24h: { count: number; successRate: number } }; trend: Array<{ day: string; count: number; successRate: number }>; platform: { registeredUsers: number; registrationsLast7d: number; plans: Record<string, number>; sources: { employers: number; jobs: number }; overdueSupportCases: number } }
+type AlertData = { events: Array<{ id: string; ruleKey: string; metric: string; value: number; threshold: number; severity: string; status: string; createdAt: string }> }
 type QueueData = { queues: { counts: Record<string, number> }[] }
 type PlatformData = { integrations: PlatformIntegrationStatus; readiness?: DeploymentReadiness }
 type AdminOverviewProps = { permissions: readonly string[] }
@@ -20,6 +22,7 @@ export function AdminOverview({ permissions }: AdminOverviewProps) {
   const canReadQueues = permissions.includes('queues.read')
   const queueSummary = useApi<QueueData>('/api/admin/v1/queues', { enabled: canReadQueues })
   const platformSummary = useApi<PlatformData>('/api/admin/v1/platform', { cache: false })
+  const alertSummary = useApi<AlertData>('/api/admin/v1/observability/alerts')
   const metrics = data?.overall
   const platform = data?.platform
   const integrations = platformSummary.data?.integrations
@@ -53,8 +56,10 @@ export function AdminOverview({ permissions }: AdminOverviewProps) {
         <Metric label="Overdue support" value={loading ? '...' : String(platform?.overdueSupportCases ?? 0)} detail="Cases beyond SLA" />
       </div>
       <section className="admin-status-panel"><ShieldCheck size={19} /><div><strong>Privacy controls active</strong><p>{planSummary}. Operational screens use allow-listed metadata only. Secrets, documents, and mailbox content are excluded.</p></div></section>
+      <section className="admin-status-panel"><div><strong>Operational trend · last 3 days</strong><div className="admin-trend-grid">{(data?.trend ?? []).slice(-3).map((point) => <div className="admin-trend-row" key={point.day}><span>{new Date(point.day).toLocaleDateString()}</span><div className="admin-trend-bar"><i style={{ width: `${Math.min(100, Math.max(0, point.successRate))}%` }} /></div><strong>{point.count} runs · {point.successRate}%</strong></div>)}</div><p>{(alertSummary.data?.events ?? []).filter(event => event.status === 'open').length} open alert events.</p></div></section>
       <section className="admin-status-panel admin-integration-panel" aria-label="Platform integrations"><div><strong>Platform integrations</strong><p>{platformSummary.error ? 'Integration status unavailable.' : platformSummary.loading && !integrations ? 'Loading integration status...' : `${readyIntegrations}/${integrationChecks.length} ready`}</p>{integrationChecks.length > 0 && <div className="admin-integration-grid">{integrationChecks.map(([label, ready]) => <span key={label} className="admin-integration-chip" data-ready={ready}>{label}: {ready ? 'Ready' : 'Missing'}</span>)}</div>}</div></section>
       <DeploymentReadinessPanel readiness={readiness} />
+      {(permissions.includes('observability.read')) && <AdminAlertRulesPanel canManage={permissions.includes('observability.alerts.manage')} />}
     </div>
   </div>
 }

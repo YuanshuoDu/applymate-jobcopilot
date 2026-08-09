@@ -47,5 +47,11 @@ export function createAdminAuditData(input: AuditInput): Prisma.AdminAuditLogCre
 }
 
 export async function writeAdminAudit(input: AuditInput) {
-  await db.adminAuditLog.create({ data: createAdminAuditData(input) })
+  try {
+    await db.adminAuditLog.create({ data: createAdminAuditData(input) })
+  } catch (error) {
+    await db.adminAlertEvent.create({ data: { ruleKey: 'audit.write_failure', metric: 'audit_write_failure', value: 1, threshold: 0, severity: 'critical' } }).catch(() => undefined)
+    console.error('ADMIN_AUDIT_WRITE_FAILED', { requestId: input.requestId, action: input.action, error })
+    throw error
+  }
 }

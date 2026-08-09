@@ -3,6 +3,7 @@
 import { startAuthentication, startRegistration } from '@simplewebauthn/browser'
 import { Check, KeyRound, ShieldAlert } from 'lucide-react'
 import { useCallback, useEffect, useState } from 'react'
+import { useAdminPrompt } from './AdminPromptDialog'
 
 type Grant = { id: string; requesterId: string; approverId: string | null; permission: string; expiresAt: string; createdAt: string }
 type SecurityAction = 'request' | 'approve' | null
@@ -23,6 +24,7 @@ export function AdminSecurityPage({ canApprove }: { canApprove: boolean }) {
   const [reason, setReason] = useState('')
   const [mfa, setMfa] = useState<WebAuthnStatus | null>(null)
   const [working, setWorking] = useState(false)
+  const { request, dialog } = useAdminPrompt()
 
   const load = useCallback(async () => {
     const [grantResponse, mfaResponse] = await Promise.all([
@@ -97,13 +99,24 @@ export function AdminSecurityPage({ canApprove }: { canApprove: boolean }) {
     }
   }
 
-  return <div className="admin-page">
+  async function revokeSecurityKey(credentialId: string) {
+    const confirmation = await request({ title: 'Revoke security key', label: 'Reason', kind: 'reason', description: 'The key will no longer be accepted for administrator authentication.', submitLabel: 'Revoke key' })
+    if (!confirmation) return
+    setWorking(true)
+    const response = await fetch('/api/admin/v1/security/webauthn', { method: 'POST', headers: requestHeaders(), body: JSON.stringify({ action: 'revoke', credentialId, reason: confirmation }) })
+    const payload = await response.json().catch(() => null) as { error?: string } | null
+    setNotice(response.ok ? 'Security key revoked.' : payload?.error ?? 'Unable to revoke security key.')
+    setWorking(false)
+    if (response.ok) await load()
+  }
+
+  return <><div className="admin-page">
     <header className="admin-header"><div><h1>Security controls</h1><p>Short-lived emergency access with independent approval</p></div><ShieldAlert size={22} aria-hidden="true" /></header>
     <section className="security-layout">
-      <section className="security-card"><div className="broadcast-list-title"><div><h2>WebAuthn protection</h2><p>{mfa?.credentials.length ? `${mfa.credentials.length} security key${mfa.credentials.length === 1 ? '' : 's'} registered` : 'No security key registered'}</p></div><KeyRound size={20} aria-hidden="true" /></div><div className="admin-inline-actions"><button className="broadcast-primary" type="button" disabled={working} onClick={() => void registerSecurityKey()}>{mfa?.credentials.length ? 'Register another key' : 'Register security key'}</button>{Boolean(mfa?.credentials.length) && <button className="admin-row-action" type="button" disabled={working} onClick={() => void reauthenticate()}>Reauthenticate</button>}</div><small>High-risk changes require a fresh WebAuthn check. Reauthentication lasts 15 minutes.</small></section>
+      <section className="security-card"><div className="broadcast-list-title"><div><h2>WebAuthn protection</h2><p>{mfa?.credentials.length ? `${mfa.credentials.length} security key${mfa.credentials.length === 1 ? '' : 's'} registered` : 'No security key registered'}</p></div><KeyRound size={20} aria-hidden="true" /></div><div className="admin-inline-actions"><button className="broadcast-primary" type="button" disabled={working} onClick={() => void registerSecurityKey()}>{mfa?.credentials.length ? 'Register another key' : 'Register security key'}</button>{Boolean(mfa?.credentials.length) && <button className="admin-row-action" type="button" disabled={working} onClick={() => void reauthenticate()}>Reauthenticate</button>}</div><div className="security-key-list">{mfa?.credentials.map((credential) => <article className="security-grant" key={credential.id}><div><strong>{credential.deviceName ?? 'Unnamed security key'}</strong><small>Added {new Date(credential.createdAt).toLocaleDateString()} · {credential.lastUsedAt ? `last used ${new Date(credential.lastUsedAt).toLocaleString()}` : 'not used yet'}</small></div><button className="admin-row-action" type="button" disabled={working} onClick={() => void revokeSecurityKey(credential.id)}>Revoke</button></article>)}</div><small>High-risk changes require a fresh WebAuthn check. Reauthentication lasts 15 minutes.</small></section>
       <form className="security-card" onSubmit={(event) => { event.preventDefault(); openReasonDialog('request') }}><h2>Request temporary access</h2><label>Permission<select value={permission} onChange={(event) => setPermission(event.target.value)}>{permissions.map((item) => <option value={item} key={item}>{item}</option>)}</select></label><label>Duration (minutes)<input type="number" min="5" max="60" value={minutes} onChange={(event) => setMinutes(Number(event.target.value))} /></label><button className="broadcast-primary" type="submit">Request approval</button></form>
       <section className="security-card"><div className="broadcast-list-title"><h2>Active requests</h2><span role="status">{notice}</span></div>{!canApprove ? <p>Approval permission is required to inspect requests.</p> : grants.length ? grants.map((grant) => <article className="security-grant" key={grant.id}><div><strong>{grant.permission}</strong><small>{grant.approverId ? 'Approved' : 'Pending approval'} · expires {new Date(grant.expiresAt).toLocaleString()}</small></div>{!grant.approverId && <button className="admin-row-action" title="Approve temporary access" type="button" onClick={() => openReasonDialog('approve', grant)}><Check size={15} /></button>}</article>) : <p>No active temporary-access requests.</p>}</section>
     </section>
     {securityAction && <div className="security-dialog-backdrop"><form className="security-card security-dialog" role="dialog" aria-modal="true" onSubmit={(event) => void submitReason(event)}><h2>{securityAction === 'approve' ? 'Approve temporary access' : 'Request temporary access'}</h2><p>Record a reason in the audit log before continuing.</p><label>Reason<textarea required minLength={10} maxLength={500} rows={4} value={reason} onChange={(event) => setReason(event.target.value)} autoFocus /></label><div className="admin-inline-actions"><button className="admin-row-action" type="button" onClick={() => setSecurityAction(null)}>Cancel</button><button className="broadcast-primary" type="submit" disabled={working || reason.trim().length < 10}>{working ? 'Saving…' : 'Continue'}</button></div></form></div>}
-  </div>
+  </div>{dialog}</>
 }

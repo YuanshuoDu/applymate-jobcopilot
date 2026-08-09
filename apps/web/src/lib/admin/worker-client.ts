@@ -11,6 +11,7 @@ export type WorkerCommandResult = Readonly<{
   action?: WorkerControlAction
   acknowledgedVersion?: number
   error?: string
+  worker?: { status: string; workerId: string; version: string; startedAt: string; uptimeSeconds: number; pid: number }
 }>
 
 function workerControlConfig() {

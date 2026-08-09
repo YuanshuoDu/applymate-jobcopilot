@@ -1,6 +1,6 @@
 import { Plan, UserAccountStatus } from '@prisma/client'
 
-export function reasonFrom(value: unknown, label: string): string | { error: string } {
+export function reasonFrom(value: unknown, label = 'Reason'): string | { error: string } {
   if (typeof value !== 'string') return { error: `${label} is required` }
   const reason = value.trim()
   return reason.length >= 10 && reason.length <= 500

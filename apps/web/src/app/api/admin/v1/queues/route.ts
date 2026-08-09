@@ -9,7 +9,7 @@ export async function GET(request: NextRequest) {
   try {
     const result = await sendWorkerCommand({ requestId: actor.requestId, actorId: actor.userId, action: 'queue_summary', reason: 'View queue health summary', params: {} })
     await writeAdminAudit({ requestId: actor.requestId, actorUserId: actor.userId, actorRoleKey: actor.roleKey, action: 'queues.summary_viewed', targetType: 'queue', outcome: 'success' })
-    return NextResponse.json({ queues: result.queues ?? [] }, { headers: { 'Cache-Control': 'no-store', 'x-request-id': actor.requestId } })
+    return NextResponse.json({ queues: result.queues ?? [], worker: result.worker ?? null }, { headers: { 'Cache-Control': 'no-store', 'x-request-id': actor.requestId } })
   } catch {
     return NextResponse.json({ error: 'Queue control plane unavailable' }, { status: 503, headers: { 'Cache-Control': 'no-store', 'x-request-id': actor.requestId } })
   }

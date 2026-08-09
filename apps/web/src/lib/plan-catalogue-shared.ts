@@ -12,6 +12,7 @@ export type PlanCatalogueRecord = {
   interval: BillingInterval
   description: string
   features: string[]
+  entitlements: string[]
   badge: string | null
   cta: string
   trialDays: number
@@ -33,6 +34,7 @@ export const DEFAULT_PLAN_CATALOGUE: readonly PlanCatalogueRecord[] = [
     interval: 'forever',
     description: 'Get started for free',
     features: ['5 applications/month', 'Basic CV tailoring', 'Job tracker (20 jobs)', 'Extension popup'],
+    entitlements: ['applications:5/month', 'cv:basic', 'tracker:20', 'extension:popup'],
     badge: null,
     cta: 'Get started free',
     trialDays: 0,
@@ -47,6 +49,7 @@ export const DEFAULT_PLAN_CATALOGUE: readonly PlanCatalogueRecord[] = [
     interval: 'month',
     description: 'Best for serious job seekers',
     features: ['Unlimited applications', 'AI CV tailoring per role', 'Unlimited tracker', 'Full sidebar', 'AI cover letters', 'Gmail integration', 'Priority support'],
+    entitlements: ['applications:unlimited', 'cv:tailoring', 'tracker:unlimited', 'extension:sidebar', 'cover_letters:ai', 'gmail:connected', 'support:priority'],
     badge: 'Most popular',
     cta: 'Start free trial',
     trialDays: 14,
@@ -61,6 +64,7 @@ export const DEFAULT_PLAN_CATALOGUE: readonly PlanCatalogueRecord[] = [
     interval: 'month',
     description: 'For teams and recruiters',
     features: ['Everything in Pro', '5 team seats', 'Shared job pool', 'Analytics dashboard', 'Custom AI model', 'Dedicated support'],
+    entitlements: ['plan:pro', 'seats:5', 'jobs:shared', 'analytics:dashboard', 'ai:custom_model', 'support:dedicated'],
     badge: null,
     cta: 'Contact sales',
     trialDays: 0,
@@ -102,12 +106,22 @@ function normalizedFeatures(value: unknown): string[] {
     .slice(0, 20)
 }
 
+function normalizedEntitlements(value: unknown): string[] {
+  if (!Array.isArray(value)) return []
+  return value
+    .filter((item): item is string => typeof item === 'string')
+    .map(item => item.trim().slice(0, 120))
+    .filter(Boolean)
+    .slice(0, 40)
+}
+
 export function normalizePlanRow(value: unknown): PlanCatalogueRecord {
   const input = asRecord(value)
   const key = planKey(input.plan ?? input.key)
   const fallback = DEFAULT_BY_KEY.get(key) ?? DEFAULT_BY_KEY.get('free')!
   const currency = boundedText(input.currency, fallback.currency, 3).toUpperCase()
   const features = normalizedFeatures(input.features)
+  const entitlements = normalizedEntitlements(input.entitlements)
 
   return {
     key,
@@ -117,6 +131,7 @@ export function normalizePlanRow(value: unknown): PlanCatalogueRecord {
     interval: billingInterval(input.interval),
     description: boundedText(input.description, fallback.description, 240),
     features: features.length ? features : [...fallback.features],
+    entitlements: entitlements.length ? entitlements : [...fallback.entitlements],
     badge: typeof input.badge === 'string' && input.badge.trim() ? input.badge.trim().slice(0, 60) : null,
     cta: boundedText(input.cta, fallback.cta, 80),
     trialDays: boundedInteger(input.trialDays, fallback.trialDays, 0, 365),
@@ -146,6 +161,7 @@ export function toPublicPlan(plan: PlanCatalogueRecord): PublicPlan {
     period: plan.interval,
     description: plan.description,
     features: [...plan.features],
+    entitlements: [...plan.entitlements],
     badge: plan.badge,
     cta: plan.cta,
     trialDays: plan.trialDays,

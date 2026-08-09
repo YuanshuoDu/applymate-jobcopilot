@@ -2,7 +2,7 @@
 
 import Link from 'next/link'
 import { usePathname } from 'next/navigation'
-import { Activity, Bell, Bot, CreditCard, FileText, Flag, Home, Inbox, LogOut, Radio, ServerCog, ShieldAlert, ShieldCheck, Siren, Users } from 'lucide-react'
+import { Activity, Bell, Bot, CreditCard, FileText, Flag, Home, Inbox, LogOut, Radio, ServerCog, ShieldAlert, ShieldCheck, Siren, Trash2, Users } from 'lucide-react'
 import { signOut } from 'next-auth/react'
 import type { ReactNode } from 'react'
 
@@ -10,6 +10,7 @@ const navigation = [
   { href: '/admin', label: 'Overview', icon: Home, permission: 'observability.read' },
   { href: '/admin/contact-us', label: 'Contact us', icon: Inbox, permission: 'support_cases.read' },
   { href: '/admin/users', label: 'Users', icon: Users, permission: 'users.read' },
+  { href: '/admin/users/deletions', label: 'Deletion queue', icon: Trash2, permission: 'users.deletion.manage' },
   { href: '/admin/plans', label: 'Plans', icon: CreditCard, permission: 'billing.read' },
   { href: '/admin/ats', label: 'ATS sources', icon: Radio, permission: 'ats.read' },
   { href: '/admin/applications', label: 'Applications', icon: Activity, permission: 'applications.read' },

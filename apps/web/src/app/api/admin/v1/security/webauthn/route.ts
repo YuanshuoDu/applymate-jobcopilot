@@ -3,11 +3,13 @@ import { AdminMfaLevel, AdminWebAuthnChallengePurpose } from '@prisma/client'
 import { NextResponse } from 'next/server'
 import { db } from '@/lib/db'
 import { isAdminResponse, requireAdminMembership } from '@/lib/admin/authorization'
+import { requireAdmin } from '@/lib/admin/authorization'
 import { requestIdFor, writeAdminAudit } from '@/lib/admin/audit'
 import { validateAdminWrite } from '@/lib/admin/csrf'
+import { runAdminMutation } from '@/lib/admin/write-transaction'
 import { credentialIdBytes, hashReauthToken, newChallenge, newReauthToken, setReauthCookie, webAuthnSettings, ADMIN_REAUTH_TTL_SECONDS, ADMIN_WEBAUTHN_CHALLENGE_TTL_MS, validTransports } from '@/lib/admin/webauthn'
 
-type Payload = { action?: string; challengeId?: string; response?: unknown; deviceName?: string }
+type Payload = { action?: string; challengeId?: string; response?: unknown; deviceName?: string; credentialId?: string; reason?: string }
 
 export async function GET(request: Request) {
   const actor = await requireAdminMembership(request)
@@ -28,11 +30,32 @@ export async function POST(request: Request) {
     if (body.action === 'register_verify') return await registrationVerify(actor.userId, actor.requestId, request, body)
     if (body.action === 'reauth_options') return await reauthenticationOptions(actor.userId, actor.requestId, request)
     if (body.action === 'reauth_verify') return await reauthenticationVerify(actor.userId, actor.requestId, request, body)
+    if (body.action === 'revoke') return await revokeCredential(request, body)
   } catch (error) {
     console.error('[admin-webauthn]', error)
     return NextResponse.json({ error: 'WebAuthn verification failed' }, { status: 400 })
   }
   return NextResponse.json({ error: 'Unsupported WebAuthn action' }, { status: 400 })
+}
+
+async function revokeCredential(request: Request, body: Payload) {
+  const actor = await requireAdmin('security.webauthn.manage', request)
+  if (isAdminResponse(actor)) return actor
+  const reason = typeof body.reason === 'string' ? body.reason.trim() : ''
+  const credentialId = typeof body.credentialId === 'string' ? body.credentialId.trim() : ''
+  const idempotencyKey = request.headers.get('idempotency-key')?.trim() ?? ''
+  if (!credentialId || !idempotencyKey || reason.length < 10 || reason.length > 500) return NextResponse.json({ error: 'credentialId, idempotency key and a 10-500 character reason are required' }, { status: 400 })
+  const credential = await db.adminWebAuthnCredential.findFirst({ where: { id: credentialId, userId: actor.userId, revokedAt: null }, select: { id: true } })
+  if (!credential) return NextResponse.json({ error: 'Security key not found' }, { status: 404 })
+  const membership = await db.adminMembership.findUnique({ where: { userId: actor.userId }, select: { role: { select: { key: true } } } })
+  if (membership?.role.key === 'super_admin') {
+    const count = await db.adminWebAuthnCredential.count({ where: { userId: actor.userId, revokedAt: null } })
+    if (count <= 1) return NextResponse.json({ error: 'Register another security key before revoking the last key' }, { status: 409 })
+  }
+  const result = await runAdminMutation({ actorUserId: actor.userId, action: 'admin.webauthn.revoked', idempotencyKey, targetId: credential.id, audit: { requestId: actor.requestId, actorRoleKey: actor.roleKey, targetType: 'admin_member', targetId: actor.userId, reason, outcome: 'success', after: { credentialId: credential.id, revoked: true } }, mutate: (tx) => tx.adminWebAuthnCredential.updateMany({ where: { id: credential.id, userId: actor.userId, revokedAt: null }, data: { revokedAt: new Date() } }) })
+  if (result.duplicate) return NextResponse.json({ duplicate: true }, { headers: { 'Cache-Control': 'no-store', 'x-request-id': actor.requestId } })
+  if (result.value.count !== 1) return NextResponse.json({ error: 'Security key was already revoked' }, { status: 409 })
+  return NextResponse.json({ revoked: true }, { headers: { 'Cache-Control': 'no-store', 'x-request-id': actor.requestId } })
 }
 
 async function registrationOptions(userId: string, requestId: string, request: Request) {

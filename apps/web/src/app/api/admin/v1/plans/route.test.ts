@@ -25,9 +25,9 @@ vi.mock('@/lib/api-helpers', () => ({
 }))
 
 const plans = [
-  { key: 'free', name: 'Free', priceMinor: 0, currency: 'EUR', interval: 'forever', description: 'Free', features: ['Tracker'], badge: null, cta: 'Start', trialDays: 0, active: true, sortOrder: 0 },
-  { key: 'pro', name: 'Pro', priceMinor: 1200, currency: 'EUR', interval: 'month', description: 'Pro', features: ['AI'], badge: 'Popular', cta: 'Upgrade', trialDays: 14, active: true, sortOrder: 1 },
-  { key: 'enterprise', name: 'Team', priceMinor: 2900, currency: 'EUR', interval: 'month', description: 'Team', features: ['Seats'], badge: null, cta: 'Contact', trialDays: 0, active: true, sortOrder: 2 },
+  { key: 'free', name: 'Free', priceMinor: 0, currency: 'EUR', interval: 'forever', description: 'Free', features: ['Tracker'], entitlements: ['tracker:20'], badge: null, cta: 'Start', trialDays: 0, active: true, sortOrder: 0 },
+  { key: 'pro', name: 'Pro', priceMinor: 1200, currency: 'EUR', interval: 'month', description: 'Pro', features: ['AI'], entitlements: ['ai:tailoring'], badge: 'Popular', cta: 'Upgrade', trialDays: 14, active: true, sortOrder: 1 },
+  { key: 'enterprise', name: 'Team', priceMinor: 2900, currency: 'EUR', interval: 'month', description: 'Team', features: ['Seats'], entitlements: ['seats:5'], badge: null, cta: 'Contact', trialDays: 0, active: true, sortOrder: 2 },
 ] as const
 
 function request(body?: unknown, idempotencyKey = 'plans-key-1') {

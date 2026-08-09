@@ -4,7 +4,7 @@ import { writeAdminAudit } from '@/lib/admin/audit'
 import { adminUserMetadataSelect, toAdminUserMetadata } from '@/lib/admin/dto'
 import { adminPageLimit, pageResult } from '@/lib/admin/pagination'
 import { db } from '@/lib/db'
-import { Plan, UserAccountStatus } from '@prisma/client'
+import { Plan, UserAccountStatus, type Prisma } from '@prisma/client'
 
 export async function GET(request: NextRequest) {
   const actor = await requireAdmin('users.read', request)
@@ -17,10 +17,13 @@ export async function GET(request: NextRequest) {
   const plan = planValue === 'free' || planValue === 'pro' || planValue === 'enterprise' ? planValue as Plan : undefined
   const statusValue = params.get('status')
   const accountStatus = statusValue === 'active' || statusValue === 'suspended' ? statusValue as UserAccountStatus : undefined
+  const sort = params.get('sort')
+  const direction = params.get('direction') === 'desc' ? 'desc' : 'asc'
+  const orderBy: Prisma.UserOrderByWithRelationInput = sort === 'createdAt' ? { createdAt: direction } : sort === 'name' ? { name: direction } : sort === 'plan' ? { plan: direction } : sort === 'accountStatus' ? { accountStatus: direction } : { id: 'asc' }
   const rows = await db.user.findMany({
     where: { ...(search ? { OR: [{ name: { contains: search, mode: 'insensitive' } }, { email: { contains: search, mode: 'insensitive' } }] } : {}), ...(plan ? { plan } : {}), ...(accountStatus ? { accountStatus } : {}) },
     select: adminUserMetadataSelect,
-    orderBy: { id: 'asc' },
+    orderBy,
     cursor: cursor ? { id: cursor } : undefined,
     skip: cursor ? 1 : undefined,
     take: limit + 1,

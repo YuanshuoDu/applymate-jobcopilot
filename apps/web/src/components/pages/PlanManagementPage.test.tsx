@@ -25,7 +25,7 @@ describe('PlanManagementPage', () => {
       data: {
         plans: [{
           key: 'free', name: 'Free', priceMinor: 0, currency: 'USD', interval: 'year', description: 'Free tier',
-          features: ['Tracker'], badge: null, cta: 'Start', trialDays: 0, active: true, sortOrder: 42,
+          features: ['Tracker'], entitlements: ['tracker:20'], badge: null, cta: 'Start', trialDays: 0, active: true, sortOrder: 42,
         }],
       },
       loading: false,

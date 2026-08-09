@@ -9,7 +9,7 @@ import { runAdminMutation } from '@/lib/admin/write-transaction'
 import { getAdminPlans } from '@/lib/plan-catalogue'
 import { BILLING_INTERVALS, PLAN_KEYS, type BillingInterval, type PlanCatalogueRecord, type PlanKey } from '@/lib/plan-catalogue-shared'
 
-const EDITABLE_FIELDS = new Set(['plan', 'key', 'name', 'priceMinor', 'currency', 'interval', 'description', 'features', 'badge', 'cta', 'trialDays', 'active', 'sortOrder'])
+const EDITABLE_FIELDS = new Set(['plan', 'key', 'name', 'priceMinor', 'currency', 'interval', 'description', 'features', 'entitlements', 'badge', 'cta', 'trialDays', 'active', 'sortOrder'])
 
 function asRecord(value: unknown): Record<string, unknown> {
   return value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : {}
@@ -44,6 +44,7 @@ function parsePlan(value: unknown): PlanCatalogueRecord | { error: string } {
   if (typeof input.currency !== 'string' || !/^[A-Z]{3}$/.test(input.currency)) return { error: 'currency must be an uppercase ISO 4217 code' }
   if (!validInterval(input.interval)) return { error: 'interval must be forever, month, or year' }
   if (!Array.isArray(input.features) || input.features.length > 20 || input.features.some(feature => typeof feature !== 'string' || !feature.trim() || feature.length > 160)) return { error: 'features must contain at most 20 non-empty strings of at most 160 characters' }
+  if (!Array.isArray(input.entitlements) || input.entitlements.length > 40 || input.entitlements.some(entitlement => typeof entitlement !== 'string' || !entitlement.trim() || entitlement.length > 120)) return { error: 'entitlements must contain at most 40 non-empty strings of at most 120 characters' }
   if (input.badge !== null && input.badge !== undefined && (typeof input.badge !== 'string' || input.badge.length > 60)) return { error: 'badge must be null or a string of at most 60 characters' }
   if (typeof input.trialDays !== 'number' || !Number.isInteger(input.trialDays) || input.trialDays < 0 || input.trialDays > 365) return { error: 'trialDays must be an integer between 0 and 365' }
   if (typeof input.active !== 'boolean') return { error: 'active must be boolean' }
@@ -57,6 +58,7 @@ function parsePlan(value: unknown): PlanCatalogueRecord | { error: string } {
     interval: input.interval,
     description,
     features: input.features.map(feature => feature.trim()),
+    entitlements: input.entitlements.map(entitlement => entitlement.trim()),
     badge: typeof input.badge === 'string' && input.badge.trim() ? input.badge.trim() : null,
     cta,
     trialDays: input.trialDays,
@@ -74,6 +76,7 @@ function upsertData(plan: PlanCatalogueRecord) {
     interval: plan.interval,
     description: plan.description,
     features: plan.features,
+    entitlements: plan.entitlements,
     badge: plan.badge,
     cta: plan.cta,
     trialDays: plan.trialDays,

@@ -44,6 +44,7 @@ async function main() {
         interval: plan.interval,
         description: plan.description,
         features: plan.features,
+        entitlements: plan.entitlements,
         badge: plan.badge,
         cta: plan.cta,
         trialDays: plan.trialDays,

@@ -7,6 +7,7 @@ import { apiMutate, useApi } from '@/lib/hooks'
 import type { UserIntegrationStatus } from '@/lib/admin/integration-status'
 import type { PrivacyPreferences } from '@/lib/types'
 import { editablePrivacyPreferences, isPrivacyPreferenceAvailable } from '@/lib/privacy-consent'
+import { useAdminPrompt } from './AdminPromptDialog'
 
 type Detail = {
   user: {
@@ -40,6 +41,7 @@ function AccountOperations({ userId, user, permissions }: { userId: string; user
   const [expiresAt, setExpiresAt] = useState('')
   const [notice, setNotice] = useState('')
   const [busy, setBusy] = useState(false)
+  const { request, dialog } = useAdminPrompt()
 
   useEffect(() => { setStatus(user.accountStatus); setPlan(user.plan) }, [user.accountStatus, user.plan])
   useEffect(() => {
@@ -52,7 +54,7 @@ function AccountOperations({ userId, user, permissions }: { userId: string; user
   }, [permissions, userId, plan])
 
   async function mutate(url: string, body: Record<string, unknown>, message: string) {
-    const reason = window.prompt('Enter the operational reason')?.trim()
+    const reason = await request({ title: 'Confirm account operation', label: 'Reason', kind: 'reason', description: 'This action is audited and requires an operational reason.', submitLabel: 'Continue' })
     if (!reason) return
     setBusy(true)
     const response = await fetch(url, { method: 'PATCH', headers: { 'Content-Type': 'application/json', 'Idempotency-Key': crypto.randomUUID() }, body: JSON.stringify({ ...body, reason }) })
@@ -67,10 +69,10 @@ function AccountOperations({ userId, user, permissions }: { userId: string; user
   const canRestore = permissions.includes('users.restore')
   const canPlan = permissions.includes('billing.update')
   const canOverride = permissions.includes('users.feature_override')
-  return <section className="admin-detail-operations"><div className="admin-settings-heading"><div><h2>Account operations</h2><p>High-impact actions are audited and never expose candidate documents or credentials.</p></div><span role="status">{notice}</span></div><div className="admin-operation-grid">
+  return <><section className="admin-detail-operations"><div className="admin-settings-heading"><div><h2>Account operations</h2><p>High-impact actions are audited and never expose candidate documents or credentials.</p></div><span role="status">{notice}</span></div><div className="admin-operation-grid">
     <label>Account state<select value={status} disabled={busy || (status === 'active' ? !canSuspend : !canRestore)} onChange={event => { const next = event.target.value as 'active' | 'suspended'; setStatus(next); void mutate(`/api/admin/v1/users/${userId}/account-state`, { status: next }, next === 'suspended' ? 'Account suspended.' : 'Account restored.') }}><option value="active">Active</option><option value="suspended">Suspended</option></select></label>
     <label>Commercial plan<select value={plan} disabled={busy || !canPlan} onChange={event => { const next = event.target.value; setPlan(next); void mutate(`/api/admin/v1/users/${userId}/plan`, { toPlan: next }, `Plan changed to ${next}.`) }}><option value="free">Free</option><option value="pro">Pro</option><option value="enterprise">Enterprise</option></select></label>
-  </div>{canOverride && <><h3>Feature overrides</h3><form className="admin-operation-form" onSubmit={event => { event.preventDefault(); void mutate(`/api/admin/v1/users/${userId}/feature-overrides`, { featureKey, enabled, limit: limit ? Number(limit) : null, expiresAt: expiresAt || null }, 'Feature override saved.') }}><input value={featureKey} onChange={event => setFeatureKey(event.target.value)} placeholder="Feature key" required /><label><input type="checkbox" checked={enabled} onChange={event => setEnabled(event.target.checked)} /> Enabled</label><input type="number" min="0" value={limit} onChange={event => setLimit(event.target.value)} placeholder="Limit" /><input type="datetime-local" value={expiresAt} onChange={event => setExpiresAt(event.target.value)} /><button className="admin-secondary" disabled={busy}>Save override</button></form><div className="admin-override-list">{overrides.length === 0 ? <span>No overrides.</span> : overrides.map(item => <span key={item.id}>{item.featureKey}: {item.enabled ? 'on' : 'off'}{item.limit === null ? '' : ` · ${item.limit}`}{item.expiresAt ? ` · expires ${new Date(item.expiresAt).toLocaleDateString()}` : ''}</span>)}</div></>}{permissions.includes('billing.read') && <section className="admin-detail-history"><h3>Plan change history</h3><div className="admin-table-wrap"><table className="admin-table"><thead><tr><th>From</th><th>To</th><th>Reason</th><th>Actor</th><th>Time</th></tr></thead><tbody>{planHistory.length === 0 ? <tr><td colSpan={5}>No plan changes.</td></tr> : planHistory.map(change => <tr key={change.id}><td>{change.fromPlan}</td><td>{change.toPlan}</td><td>{change.reason}</td><td>{change.actorUserId}</td><td>{new Date(change.createdAt).toLocaleString()}</td></tr>)}</tbody></table></div></section>}</section>
+  </div>{canOverride && <><h3>Feature overrides</h3><form className="admin-operation-form" onSubmit={event => { event.preventDefault(); void mutate(`/api/admin/v1/users/${userId}/feature-overrides`, { featureKey, enabled, limit: limit ? Number(limit) : null, expiresAt: expiresAt || null }, 'Feature override saved.') }}><input value={featureKey} onChange={event => setFeatureKey(event.target.value)} placeholder="Feature key" required /><label><input type="checkbox" checked={enabled} onChange={event => setEnabled(event.target.checked)} /> Enabled</label><input type="number" min="0" value={limit} onChange={event => setLimit(event.target.value)} placeholder="Limit" /><input type="datetime-local" value={expiresAt} onChange={event => setExpiresAt(event.target.value)} /><button className="admin-secondary" disabled={busy}>Save override</button></form><div className="admin-override-list">{overrides.length === 0 ? <span>No overrides.</span> : overrides.map(item => <span key={item.id}>{item.featureKey}: {item.enabled ? 'on' : 'off'}{item.limit === null ? '' : ` · ${item.limit}`}{item.expiresAt ? ` · expires ${new Date(item.expiresAt).toLocaleDateString()}` : ''}</span>)}</div></>}{permissions.includes('billing.read') && <section className="admin-detail-history"><h3>Plan change history</h3><div className="admin-table-wrap"><table className="admin-table"><thead><tr><th>From</th><th>To</th><th>Reason</th><th>Actor</th><th>Time</th></tr></thead><tbody>{planHistory.length === 0 ? <tr><td colSpan={5}>No plan changes.</td></tr> : planHistory.map(change => <tr key={change.id}><td>{change.fromPlan}</td><td>{change.toPlan}</td><td>{change.reason}</td><td>{change.actorUserId}</td><td>{new Date(change.createdAt).toLocaleString()}</td></tr>)}</tbody></table></div></section>}</section>{dialog}</>
 }
 
 type Preferences = {
@@ -124,6 +126,7 @@ function SettingsPanel({ userId, canUpdatePreferences }: { userId: string; canUp
   const [draft, setDraft] = useState<Preferences | null>(null)
   const [saving, setSaving] = useState(false)
   const [saveError, setSaveError] = useState<string | null>(null)
+  const { request, dialog } = useAdminPrompt()
   const preferences = draft ?? data?.user.preferences
   const integrations = data?.user.integrations
   const deletionStatuses = nextDeletionStatuses(preferences?.dataDeletionRequestStatus)
@@ -135,7 +138,7 @@ function SettingsPanel({ userId, canUpdatePreferences }: { userId: string; canUp
 
   async function save() {
     if (!preferences) return
-    const reason = window.prompt('Enter the settings-change reason')?.trim()
+    const reason = await request({ title: 'Save candidate settings', label: 'Reason', kind: 'reason', description: 'The change will be recorded in the admin audit log.', submitLabel: 'Save' })
     if (!reason) return
     setSaving(true)
     setSaveError(null)
@@ -155,7 +158,7 @@ function SettingsPanel({ userId, canUpdatePreferences }: { userId: string; canUp
     void refetch()
   }
 
-  return <section className="admin-detail-settings">
+  return <><section className="admin-detail-settings">
     <div className="admin-settings-heading"><div><h2>Candidate settings</h2><p>Notification, privacy and deletion-request settings only. Credentials and documents are excluded.</p></div>{loading && <span>Loading...</span>}</div>
     {error || saveError ? <div className="admin-alert">{error ?? saveError}</div> : null}
     {!preferences && !loading ? <p className="admin-settings-empty">Settings are unavailable for this account.</p> : null}
@@ -169,7 +172,7 @@ function SettingsPanel({ userId, canUpdatePreferences }: { userId: string; canUp
       {preferences.dataDeletionRequestStatus && <label className="admin-settings-deletion">Deletion request<select value={preferences.dataDeletionRequestStatus} disabled={!canUpdatePreferences || saving || deletionStatuses.length === 0} onChange={(event) => setDraft({ ...preferences, dataDeletionRequestStatus: event.target.value as Preferences['dataDeletionRequestStatus'] })}><option value={preferences.dataDeletionRequestStatus}>{preferences.dataDeletionRequestStatus}</option>{deletionStatuses.map(status => <option key={status} value={status}>{status}</option>)}</select></label>}
       {canUpdatePreferences ? <button type="button" className="admin-secondary" onClick={() => void save()} disabled={saving}><Save size={15} />{saving ? 'Saving...' : 'Save settings'}</button> : <p className="admin-settings-readonly-notice">You can view settings but do not have permission to edit them.</p>}
     </>}
-  </section>
+  </section>{dialog}</>
 }
 
 export function AdminUserDetailPage({ userId, canUpdatePreferences, permissions = [] }: { userId: string; canUpdatePreferences: boolean; permissions?: readonly string[] }) {

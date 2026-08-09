@@ -55,25 +55,25 @@ model VerificationToken {
 // ─────────────────────────────────────────────
 
 model User {
-  id            String    @id @default(cuid())
-  email         String    @unique
-  emailVerified DateTime?
-  name          String?
-  image         String?
-  password      String?   // hashed, for credential login
-  plan          Plan      @default(free)
-  accountStatus UserAccountStatus @default(active)
-  suspendedAt   DateTime?
-  suspendedById String?
+  id               String            @id @default(cuid())
+  email            String            @unique
+  emailVerified    DateTime?
+  name             String?
+  image            String?
+  password         String? // hashed, for credential login
+  plan             Plan              @default(free)
+  accountStatus    UserAccountStatus @default(active)
+  suspendedAt      DateTime?
+  suspendedById    String?
   suspensionReason String?
-  phone         String?
-  location      String?
-  linkedin      String?
-  github        String?
-  preferences   Json?     // { targetRoles, targetLocations, salaryExpectation, workAuthorization, openToRelocation, aiSettings }
-  personaFields Json?     // PersonaField[] �?learned answers from form fills
-  createdAt     DateTime  @default(now())
-  updatedAt     DateTime  @updatedAt
+  phone            String?
+  location         String?
+  linkedin         String?
+  github           String?
+  preferences      Json? // { targetRoles, targetLocations, salaryExpectation, workAuthorization, openToRelocation, aiSettings }
+  personaFields    Json? // PersonaField[] �?learned answers from form fills
+  createdAt        DateTime          @default(now())
+  updatedAt        DateTime          @updatedAt
 
   // M1 extensions
   onboardedAt        DateTime?
@@ -81,39 +81,43 @@ model User {
   defaultTemplateId  String?
   defaultAccentColor String?
   defaultFontFamily  String?
-  aiAutoPilot        String   @default("off")
+  aiAutoPilot        String    @default("off")
 
-  accounts       Account[]
-  sessions       Session[]
-  jobs           Job[]
-  resumes        Resume[]
-  activities     Activity[]
-  agentConfig        AgentConfig?
-  agentRoles         AgentRole[]
-  customAgentRoles   CustomAgentRole[]
-  agentRunQuestions  AgentRunQuestion[]
-  agentRuns          AgentRun[]
-  agentExecutions    AgentExecution[]
-  agentSessions      AgentSession[]
-  applicationTasks  ApplicationTask[]
-  agentAutomations   AgentAutomation[]
-  resumeVersions ResumeVersion[]
-  directions     Direction[]
-  coverLetters   CoverLetter[]
-  notifications  Notification[]
-  apiKeys        UserApiKeys?
-  personaFacts   PersonaFact[]
-  personaEvidenceChunks PersonaEvidenceChunk[]
-  gmailSyncState GmailSyncState?
-  gmailMessages  GmailMessage[]
-  gmailRecommendations GmailRecommendation[]
-  adminMembership AdminMembership? @relation("AdminUser")
-  adminWebAuthnCredentials AdminWebAuthnCredential[]
-  adminWebAuthnChallenges AdminWebAuthnChallenge[]
-  adminReauthGrants AdminReauthGrant[]
-  supportCases SupportCase[] @relation("SupportRequester")
-  planChanges UserPlanChange[]
-  featureOverrides UserFeatureOverride[]
+  accounts                  Account[]
+  sessions                  Session[]
+  jobs                      Job[]
+  resumes                   Resume[]
+  activities                Activity[]
+  agentConfig               AgentConfig?
+  agentRoles                AgentRole[]
+  customAgentRoles          CustomAgentRole[]
+  agentRunQuestions         AgentRunQuestion[]
+  agentRuns                 AgentRun[]
+  agentExecutions           AgentExecution[]
+  agentSessions             AgentSession[]
+  applicationTasks          ApplicationTask[]
+  agentAutomations          AgentAutomation[]
+  resumeVersions            ResumeVersion[]
+  directions                Direction[]
+  coverLetters              CoverLetter[]
+  notifications             Notification[]
+  apiKeys                   UserApiKeys?
+  personaFacts              PersonaFact[]
+  personaEvidenceChunks     PersonaEvidenceChunk[]
+  gmailSyncState            GmailSyncState?
+  gmailMessages             GmailMessage[]
+  gmailRecommendations      GmailRecommendation[]
+  adminMembership           AdminMembership?           @relation("AdminUser")
+  adminWebAuthnCredentials  AdminWebAuthnCredential[]
+  adminWebAuthnChallenges   AdminWebAuthnChallenge[]
+  adminReauthGrants         AdminReauthGrant[]
+  supportCases              SupportCase[]              @relation("SupportRequester")
+  planChanges               UserPlanChange[]
+  planSubscription          UserPlanSubscription?
+  featureOverrides          UserFeatureOverride[]
+  adminAccessReviewsGiven   AdminAccessReview[]        @relation("AccessReviewReviewer")
+  deletionRequest           AdminDataDeletionRequest?
+  deletionRequestsProcessed AdminDataDeletionRequest[] @relation("DeletionProcessor")
 }
 
 enum Plan {
@@ -141,8 +145,38 @@ model UserPlanChange {
   @@map("user_plan_changes")
 }
 
+enum PlanSubscriptionStatus {
+  trialing
+  active
+  past_due
+  cancelled
+  expired
+}
+
+model UserPlanSubscription {
+  id                      String                 @id @default(cuid())
+  userId                  String                 @unique @map("user_id")
+  plan                    Plan
+  status                  PlanSubscriptionStatus @default(active)
+  trialStartsAt           DateTime?              @map("trial_starts_at")
+  trialEndsAt             DateTime?              @map("trial_ends_at")
+  currentPeriodStart      DateTime?              @map("current_period_start")
+  currentPeriodEnd        DateTime?              @map("current_period_end")
+  cancelAtPeriodEnd       Boolean                @default(false) @map("cancel_at_period_end")
+  version                 Int                    @default(1)
+  providerCustomerRef     String?                @map("provider_customer_ref")
+  providerSubscriptionRef String?                @map("provider_subscription_ref")
+  updatedById             String?                @map("updated_by_id")
+  createdAt               DateTime               @default(now()) @map("created_at")
+  updatedAt               DateTime               @updatedAt @map("updated_at")
+  user                    User                   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([status, trialEndsAt])
+  @@map("user_plan_subscriptions")
+}
+
 model UserFeatureOverride {
-  id          String   @id @default(cuid())
+  id          String    @id @default(cuid())
   userId      String
   featureKey  String
   enabled     Boolean
@@ -150,9 +184,9 @@ model UserFeatureOverride {
   reason      String
   actorUserId String
   expiresAt   DateTime?
-  createdAt   DateTime @default(now())
-  updatedAt   DateTime @updatedAt
-  user        User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+  user        User      @relation(fields: [userId], references: [id], onDelete: Cascade)
 
   @@unique([userId, featureKey])
   @@index([userId, expiresAt])
@@ -166,62 +200,63 @@ enum BillingInterval {
 }
 
 model PlanCatalogue {
-  id          String          @id @default(cuid())
-  plan        Plan            @unique
-  name        String
-  priceMinor  Int             @default(0)
-  currency    String          @default("EUR")
-  interval    BillingInterval @default(month)
-  description String          @db.Text
-  features    Json
-  badge       String?
-  cta         String
-  trialDays   Int             @default(0)
-  active      Boolean         @default(true)
-  sortOrder   Int             @default(0)
-  createdAt   DateTime        @default(now())
-  updatedAt   DateTime        @updatedAt
+  id           String          @id @default(cuid())
+  plan         Plan            @unique
+  name         String
+  priceMinor   Int             @default(0)
+  currency     String          @default("EUR")
+  interval     BillingInterval @default(month)
+  description  String          @db.Text
+  features     Json
+  entitlements Json
+  badge        String?
+  cta          String
+  trialDays    Int             @default(0)
+  active       Boolean         @default(true)
+  sortOrder    Int             @default(0)
+  createdAt    DateTime        @default(now())
+  updatedAt    DateTime        @updatedAt
 
   @@index([active, sortOrder])
   @@map("plan_catalogue")
 }
 
 model Job {
-  id          String    @id @default(cuid())
-  userId      String
-  company     String
-  logo        String?   // 2-letter abbreviation or image URL
-  role        String
-  location    String?
-  status      JobStatus @default(saved)
-  score       Int?      // AI match score 0-100
-  url         String?   @db.Text
-  description String?   @db.Text
-  salary      String?
-  source      String?   // linkedin | indeed | manual | agent
-  notes        String?   @db.Text
-  coverLetter  String?   @db.Text  // saved by Writer agent (deprecated — use CoverLetter table)
-  analysisNote String?   @db.Text  // saved by Analyst agent (recommendation)
-  keywords     String?   @db.Text  // ATS keywords extracted from JD during scoring
-  appliedAt    DateTime?
-  followUpAt  DateTime?
+  id            String           @id @default(cuid())
+  userId        String
+  company       String
+  logo          String? // 2-letter abbreviation or image URL
+  role          String
+  location      String?
+  status        JobStatus        @default(saved)
+  score         Int? // AI match score 0-100
+  url           String?          @db.Text
+  description   String?          @db.Text
+  salary        String?
+  source        String? // linkedin | indeed | manual | agent
+  notes         String?          @db.Text
+  coverLetter   String?          @db.Text // saved by Writer agent (deprecated — use CoverLetter table)
+  analysisNote  String?          @db.Text // saved by Analyst agent (recommendation)
+  keywords      String?          @db.Text // ATS keywords extracted from JD during scoring
+  appliedAt     DateTime?
+  followUpAt    DateTime?
   workflowState JobWorkflowState @default(draft)
-  createdAt   DateTime  @default(now())
-  updatedAt   DateTime  @updatedAt
+  createdAt     DateTime         @default(now())
+  updatedAt     DateTime         @updatedAt
 
   // M1 extensions
   finalResumeId      String?
   finalCoverLetterId String?
 
-  user             User          @relation(fields: [userId], references: [id], onDelete: Cascade)
-  applyResults     ApplyResult[]
-  applicationTasks ApplicationTask[]
-  activities       Activity[]
-  finalResume      Resume?       @relation("JobFinalResume",   fields: [finalResumeId],      references: [id], onDelete: SetNull)
-  finalCoverLetter CoverLetter?  @relation("JobFinalCL",       fields: [finalCoverLetterId], references: [id], onDelete: SetNull)
-  adaptedResumes   Resume[]      @relation("JobAdaptedResumes")
-  coverLetters     CoverLetter[]
-  gmailMessages    GmailMessage[]
+  user                 User                  @relation(fields: [userId], references: [id], onDelete: Cascade)
+  applyResults         ApplyResult[]
+  applicationTasks     ApplicationTask[]
+  activities           Activity[]
+  finalResume          Resume?               @relation("JobFinalResume", fields: [finalResumeId], references: [id], onDelete: SetNull)
+  finalCoverLetter     CoverLetter?          @relation("JobFinalCL", fields: [finalCoverLetterId], references: [id], onDelete: SetNull)
+  adaptedResumes       Resume[]              @relation("JobAdaptedResumes")
+  coverLetters         CoverLetter[]
+  gmailMessages        GmailMessage[]
   savedRecommendations GmailRecommendation[] @relation("SavedGmailRecommendations")
 
   @@index([userId, status])
@@ -231,30 +266,30 @@ model Job {
 // Durable control-plane record for one candidate/job application.  Job keeps
 // the candidate-facing lifecycle; this model owns resumable agent execution.
 model ApplicationTask {
-  id              String   @id @default(cuid())
-  userId          String
-  jobId           String
-  sessionId       String?
-  status          String   @default("discovered")
-  checkpoint      String?
-  question        Json?
-  sensitiveFlags  Json?
+  id               String    @id @default(cuid())
+  userId           String
+  jobId            String
+  sessionId        String?
+  status           String    @default("discovered")
+  checkpoint       String?
+  question         Json?
+  sensitiveFlags   Json?
   // Answers the candidate explicitly supplied for this application only.
   // Never inferred from a model or promoted into the shared Persona automatically.
   confirmedAnswers Json?
-  resumeId        String?
-  coverLetterId   String?
-  workerTaskId    String?
-  error           String?  @db.Text
-  startedAt       DateTime?
-  completedAt     DateTime?
-  createdAt       DateTime @default(now())
-  updatedAt       DateTime @updatedAt
+  resumeId         String?
+  coverLetterId    String?
+  workerTaskId     String?
+  error            String?   @db.Text
+  startedAt        DateTime?
+  completedAt      DateTime?
+  createdAt        DateTime  @default(now())
+  updatedAt        DateTime  @updatedAt
 
-  user     User          @relation(fields: [userId], references: [id], onDelete: Cascade)
-  job      Job           @relation(fields: [jobId], references: [id], onDelete: Cascade)
-  session  AgentSession? @relation(fields: [sessionId], references: [id], onDelete: SetNull)
-  events   ApplicationTaskEvent[]
+  user    User                   @relation(fields: [userId], references: [id], onDelete: Cascade)
+  job     Job                    @relation(fields: [jobId], references: [id], onDelete: Cascade)
+  session AgentSession?          @relation(fields: [sessionId], references: [id], onDelete: SetNull)
+  events  ApplicationTaskEvent[]
 
   @@unique([userId, jobId])
   @@index([userId, status, updatedAt(sort: Desc)])
@@ -299,20 +334,20 @@ model Resume {
   id              String   @id @default(cuid())
   userId          String
   name            String
-  content         Json     // ResumeContent JSON (see types.ts)
+  content         Json // ResumeContent JSON (see types.ts)
   templateId      String?
-  templateOptions Json?    // TemplateOptions JSON { accentColor, fontFamily, density }
+  templateOptions Json? // TemplateOptions JSON { accentColor, fontFamily, density }
   isDefault       Boolean  @default(false)
   createdAt       DateTime @default(now())
   updatedAt       DateTime @updatedAt
 
   // M1 extensions
   directionId    String?
-  kind           String   @default("base")
+  kind           String  @default("base")
   parentResumeId String?
   targetJobId    String?
-  origin         String   @default("manual")
-  basicsDetached Boolean  @default(false)
+  origin         String  @default("manual")
+  basicsDetached Boolean @default(false)
 
   user         User            @relation(fields: [userId], references: [id], onDelete: Cascade)
   versions     ResumeVersion[]
@@ -332,8 +367,8 @@ model ResumeVersion {
   id        String   @id @default(cuid())
   resumeId  String
   userId    String
-  content   Json     // ResumeContent snapshot
-  name      String   // resume name at time of snapshot
+  content   Json // ResumeContent snapshot
+  name      String // resume name at time of snapshot
   createdAt DateTime @default(now())
 
   resume Resume @relation(fields: [resumeId], references: [id], onDelete: Cascade)
@@ -348,25 +383,25 @@ model ResumeVersion {
 // ─────────────────────────────────────────────
 
 model PersonaFact {
-  id              String   @id @default(cuid())
+  id              String    @id @default(cuid())
   userId          String
   key             String
   category        String
-  value           String   @db.Text
-  normalizedValue String   @map("normalized_value")
-  source          String   // manual | form_scan | resume | ai_derived
-  sourceRef       String?  @map("source_ref")
-  evidence        Json?    // { label, applicationUrl?, resumeId?, excerpt? }
-  confidence      Float    @default(1)
-  status          String   @default("confirmed") // pending | confirmed | superseded | rejected | revoked
-  allowedUses     String[] @default(["form_fill", "tailor", "cover_letter"])
+  value           String    @db.Text
+  normalizedValue String    @map("normalized_value")
+  source          String // manual | form_scan | resume | ai_derived
+  sourceRef       String?   @map("source_ref")
+  evidence        Json? // { label, applicationUrl?, resumeId?, excerpt? }
+  confidence      Float     @default(1)
+  status          String    @default("confirmed") // pending | confirmed | superseded | rejected | revoked
+  allowedUses     String[]  @default(["form_fill", "tailor", "cover_letter"])
   consentAt       DateTime? @map("consent_at")
   expiresAt       DateTime? @map("expires_at")
   revokedAt       DateTime? @map("revoked_at")
-  createdAt       DateTime @default(now()) @map("created_at")
-  updatedAt       DateTime @updatedAt @map("updated_at")
+  createdAt       DateTime  @default(now()) @map("created_at")
+  updatedAt       DateTime  @updatedAt @map("updated_at")
 
-  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+  user           User                   @relation(fields: [userId], references: [id], onDelete: Cascade)
   evidenceChunks PersonaEvidenceChunk[]
 
   @@unique([userId, key, normalizedValue])
@@ -376,21 +411,21 @@ model PersonaFact {
 }
 
 model PersonaEvidenceChunk {
-  id                String   @id @default(cuid())
-  userId            String
-  factId            String?  @map("fact_id")
-  sourceType        String   @map("source_type") // resume | persona_fact
-  sourceRef         String   @map("source_ref")
-  content           String   @db.Text
-  contentHash       String   @map("content_hash")
-  status            String   @default("confirmed")
-  allowedUses       String[] @default(["form_fill", "tailor", "cover_letter"])
-  embeddingModel    String?  @map("embedding_model")
-  embeddedAt        DateTime? @map("embedded_at")
-  createdAt         DateTime @default(now()) @map("created_at")
-  updatedAt         DateTime @updatedAt @map("updated_at")
+  id             String    @id @default(cuid())
+  userId         String
+  factId         String?   @map("fact_id")
+  sourceType     String    @map("source_type") // resume | persona_fact
+  sourceRef      String    @map("source_ref")
+  content        String    @db.Text
+  contentHash    String    @map("content_hash")
+  status         String    @default("confirmed")
+  allowedUses    String[]  @default(["form_fill", "tailor", "cover_letter"])
+  embeddingModel String?   @map("embedding_model")
+  embeddedAt     DateTime? @map("embedded_at")
+  createdAt      DateTime  @default(now()) @map("created_at")
+  updatedAt      DateTime  @updatedAt @map("updated_at")
 
-  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+  user User         @relation(fields: [userId], references: [id], onDelete: Cascade)
   fact PersonaFact? @relation(fields: [factId], references: [id], onDelete: Cascade)
 
   @@unique([userId, sourceRef, contentHash])
@@ -400,16 +435,16 @@ model PersonaEvidenceChunk {
 }
 
 model Activity {
-  id        String   @id @default(cuid())
+  id        String       @id @default(cuid())
   userId    String
   jobId     String?
   type      ActivityType
   text      String
   color     String?
-  createdAt DateTime @default(now())
+  createdAt DateTime     @default(now())
 
-  user User  @relation(fields: [userId], references: [id], onDelete: Cascade)
-  job  Job?  @relation(fields: [jobId], references: [id], onDelete: SetNull)
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+  job  Job? @relation(fields: [jobId], references: [id], onDelete: SetNull)
 
   @@index([userId, createdAt(sort: Desc)])
 }
@@ -490,9 +525,9 @@ model AgentRole {
   provider     String        @default("anthropic")
   model        String
   apiKey       String?
-  systemPrompt String?       @db.Text  // user-customizable instructions
+  systemPrompt String?       @db.Text // user-customizable instructions
   lastRunAt    DateTime?
-  lastResult   Json?         // { count, durationMs, summary }
+  lastResult   Json? // { count, durationMs, summary }
   totalRuns    Int           @default(0)
   createdAt    DateTime      @default(now())
   updatedAt    DateTime      @updatedAt
@@ -520,8 +555,8 @@ model ApplyResult {
   id         Int      @id @default(autoincrement())
   userId     String   @map("user_id")
   jobId      String   @map("job_id")
-  status     String                     // submitted | manual | failed | dry-run
-  mode       String                     // unattended | assisted
+  status     String // submitted | manual | failed | dry-run
+  mode       String // unattended | assisted
   atsType    String?  @map("ats_type")
   flowUsed   String?  @map("flow_used")
   error      String?
@@ -536,9 +571,9 @@ model ApplyResult {
 
 model FormPattern {
   id            String   @id @default(cuid())
-  atsHost       String   @map("ats_host")       // "jobs.lever.co"
-  urlPattern    String   @map("url_pattern")    // "spotify/" for matching
-  fieldMapping  Json     @map("field_mapping")  // {"input[name='first_name']": "firstName", ...}
+  atsHost       String   @map("ats_host") // "jobs.lever.co"
+  urlPattern    String   @map("url_pattern") // "spotify/" for matching
+  fieldMapping  Json     @map("field_mapping") // {"input[name='first_name']": "firstName", ...}
   successCount  Int      @default(1) @map("success_count")
   failureCount  Int      @default(0) @map("failure_count")
   lastSuccessAt DateTime @default(now()) @map("last_success_at")
@@ -550,15 +585,15 @@ model FormPattern {
 }
 
 model AiBudget {
-  id        String   @id @default(cuid())
-  userId    String   @map("user_id")
-  month     String                                // "2026-06"
-  used      Int      @default(0)
-  limit     Int      @default(30)
-  version   Int      @default(1)
-  createdAt DateTime @default(now()) @map("created_at")
-  updatedAt DateTime @updatedAt @map("updated_at")
-  adjustments AiBudgetAdjustment[]
+  id            String                 @id @default(cuid())
+  userId        String                 @map("user_id")
+  month         String // "2026-06"
+  used          Int                    @default(0)
+  limit         Int                    @default(30)
+  version       Int                    @default(1)
+  createdAt     DateTime               @default(now()) @map("created_at")
+  updatedAt     DateTime               @updatedAt @map("updated_at")
+  adjustments   AiBudgetAdjustment[]
   resetRequests AiBudgetResetRequest[]
 
   @@unique([userId, month])
@@ -591,51 +626,51 @@ enum AiBudgetResetStatus {
 }
 
 model AiBudgetResetRequest {
-  id                String              @id @default(cuid())
-  budgetId          String              @map("budget_id")
-  requesterId       String              @map("requester_id")
-  approverId        String?             @map("approver_id")
-  reason            String
-  status            AiBudgetResetStatus @default(pending)
-  budgetVersion     Int                 @map("budget_version")
-  createIdempotencyKey String           @unique @map("create_idempotency_key")
-  approveIdempotencyKey String?         @unique @map("approve_idempotency_key")
-  expiresAt         DateTime            @map("expires_at")
-  createdAt         DateTime            @default(now()) @map("created_at")
-  approvedAt        DateTime?           @map("approved_at")
-  budget            AiBudget            @relation(fields: [budgetId], references: [id], onDelete: Restrict)
+  id                    String              @id @default(cuid())
+  budgetId              String              @map("budget_id")
+  requesterId           String              @map("requester_id")
+  approverId            String?             @map("approver_id")
+  reason                String
+  status                AiBudgetResetStatus @default(pending)
+  budgetVersion         Int                 @map("budget_version")
+  createIdempotencyKey  String              @unique @map("create_idempotency_key")
+  approveIdempotencyKey String?             @unique @map("approve_idempotency_key")
+  expiresAt             DateTime            @map("expires_at")
+  createdAt             DateTime            @default(now()) @map("created_at")
+  approvedAt            DateTime?           @map("approved_at")
+  budget                AiBudget            @relation(fields: [budgetId], references: [id], onDelete: Restrict)
 
   @@index([status, expiresAt])
   @@map("ai_budget_reset_requests")
 }
 
 model AiProviderConfig {
-  id                   String   @id @default(cuid())
-  key                  String   @unique
+  id                   String          @id @default(cuid())
+  key                  String          @unique
   displayName          String
   apiBase              String
   secretRef            String?
-  credentialConfigured Boolean  @default(false)
-  enabled              Boolean  @default(true)
-  version              Int      @default(1)
-  createdAt            DateTime @default(now())
-  updatedAt            DateTime @updatedAt
+  credentialConfigured Boolean         @default(false)
+  enabled              Boolean         @default(true)
+  version              Int             @default(1)
+  createdAt            DateTime        @default(now())
+  updatedAt            DateTime        @updatedAt
   models               AiModelConfig[]
 
   @@map("ai_provider_configs")
 }
 
 model AiModelConfig {
-  id          String   @id @default(cuid())
+  id          String           @id @default(cuid())
   providerId  String
   model       String
   label       String
   description String?
   tier        String
-  priceIn     Float    @default(0)
-  priceOut    Float    @default(0)
-  contextK    Int      @default(128)
-  active      Boolean  @default(true)
+  priceIn     Float            @default(0)
+  priceOut    Float            @default(0)
+  contextK    Int              @default(128)
+  active      Boolean          @default(true)
   provider    AiProviderConfig @relation(fields: [providerId], references: [id], onDelete: Cascade)
 
   @@unique([providerId, model])
@@ -767,15 +802,33 @@ enum SupportCaseMessageKind {
 }
 
 model AdminRole {
-  id          String   @id @default(cuid())
-  key         String   @unique
+  id          String            @id @default(cuid())
+  key         String            @unique
   name        String
   description String?
   permissions String[]
-  system      Boolean  @default(true)
-  createdAt   DateTime @default(now())
-  updatedAt   DateTime @updatedAt
+  system      Boolean           @default(true)
+  createdAt   DateTime          @default(now())
+  updatedAt   DateTime          @updatedAt
   memberships AdminMembership[]
+  invitations AdminInvitation[]
+}
+
+model AdminInvitation {
+  id         String   @id @default(cuid())
+  email      String
+  roleId     String   @map("role_id")
+  tokenHash  String   @unique @map("token_hash")
+  status     String   @default("pending")
+  invitedById String  @map("invited_by_id")
+  expiresAt  DateTime @map("expires_at")
+  acceptedAt DateTime? @map("accepted_at")
+  createdAt  DateTime @default(now()) @map("created_at")
+  role       AdminRole @relation(fields: [roleId], references: [id], onDelete: Restrict)
+
+  @@index([email, status])
+  @@index([status, expiresAt])
+  @@map("admin_invitations")
 }
 
 model AdminMembership {
@@ -790,37 +843,58 @@ model AdminMembership {
   revokedAt      DateTime?
   user           User                  @relation("AdminUser", fields: [userId], references: [id], onDelete: Restrict)
   role           AdminRole             @relation(fields: [roleId], references: [id], onDelete: Restrict)
+  accessReviews  AdminAccessReview[]
+
   @@index([status, roleId])
 }
 
+model AdminAccessReview {
+  id           String          @id @default(cuid())
+  membershipId String          @map("membership_id")
+  reviewerId   String          @map("reviewer_id")
+  cycleKey     String          @map("cycle_key")
+  status       String          @default("pending")
+  dueAt        DateTime        @map("due_at")
+  reviewedAt   DateTime?       @map("reviewed_at")
+  notes        String?         @db.Text
+  createdAt    DateTime        @default(now()) @map("created_at")
+  updatedAt    DateTime        @updatedAt @map("updated_at")
+  membership   AdminMembership @relation(fields: [membershipId], references: [id], onDelete: Restrict)
+  reviewer     User            @relation("AccessReviewReviewer", fields: [reviewerId], references: [id], onDelete: Restrict)
+
+  @@unique([membershipId, cycleKey])
+  @@index([status, dueAt])
+  @@map("admin_access_reviews")
+}
+
 model AdminWebAuthnCredential {
-  id          String    @id @default(cuid())
-  userId      String    @map("user_id")
-  credentialId String   @unique @map("credential_id")
-  publicKey   Bytes     @map("public_key")
-  counter     Int       @default(0)
-  transports  String[]
-  deviceType  String?   @map("device_type")
-  backedUp    Boolean   @default(false)
-  deviceName  String?   @map("device_name")
-  createdAt   DateTime  @default(now()) @map("created_at")
-  lastUsedAt  DateTime? @map("last_used_at")
-  revokedAt   DateTime? @map("revoked_at")
-  user        User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  id           String    @id @default(cuid())
+  userId       String    @map("user_id")
+  credentialId String    @unique @map("credential_id")
+  publicKey    Bytes     @map("public_key")
+  counter      Int       @default(0)
+  transports   String[]
+  deviceType   String?   @map("device_type")
+  backedUp     Boolean   @default(false)
+  deviceName   String?   @map("device_name")
+  createdAt    DateTime  @default(now()) @map("created_at")
+  lastUsedAt   DateTime? @map("last_used_at")
+  revokedAt    DateTime? @map("revoked_at")
+  user         User      @relation(fields: [userId], references: [id], onDelete: Cascade)
 
   @@index([userId, revokedAt])
   @@map("admin_webauthn_credentials")
 }
 
 model AdminWebAuthnChallenge {
-  id         String                         @id @default(cuid())
-  userId     String                         @map("user_id")
-  purpose    AdminWebAuthnChallengePurpose
-  challenge  String                         @unique
-  expiresAt  DateTime                       @map("expires_at")
-  usedAt     DateTime?                      @map("used_at")
-  createdAt  DateTime                       @default(now()) @map("created_at")
-  user       User                           @relation(fields: [userId], references: [id], onDelete: Cascade)
+  id        String                        @id @default(cuid())
+  userId    String                        @map("user_id")
+  purpose   AdminWebAuthnChallengePurpose
+  challenge String                        @unique
+  expiresAt DateTime                      @map("expires_at")
+  usedAt    DateTime?                     @map("used_at")
+  createdAt DateTime                      @default(now()) @map("created_at")
+  user      User                          @relation(fields: [userId], references: [id], onDelete: Cascade)
 
   @@index([userId, purpose, expiresAt])
   @@map("admin_webauthn_challenges")
@@ -832,10 +906,28 @@ model AdminReauthGrant {
   tokenHash String   @unique @map("token_hash")
   expiresAt DateTime @map("expires_at")
   createdAt DateTime @default(now()) @map("created_at")
-  user     User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
 
   @@index([userId, expiresAt])
   @@map("admin_reauth_grants")
+}
+
+model AdminDataDeletionRequest {
+  id            String    @id @default(cuid())
+  userId        String    @unique @map("user_id")
+  status        String    @default("requested")
+  reason        String?
+  requestedAt   DateTime  @default(now()) @map("requested_at")
+  processedAt   DateTime? @map("processed_at")
+  processedById String?   @map("processed_by_id")
+  note          String?   @db.Text
+  version       Int       @default(1)
+  updatedAt     DateTime  @updatedAt @map("updated_at")
+  user          User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  processedBy   User?     @relation("DeletionProcessor", fields: [processedById], references: [id], onDelete: SetNull)
+
+  @@index([status, requestedAt(sort: Desc)])
+  @@map("admin_data_deletion_requests")
 }
 
 model AdminAuditLog {
@@ -854,10 +946,61 @@ model AdminAuditLog {
   before        Json?
   after         Json?
   errorCode     String?
+  previousHash  String?           @map("previous_hash")
+  recordHash    String?           @unique @map("record_hash")
   createdAt     DateTime          @default(now())
+
   @@index([actorUserId, createdAt(sort: Desc)])
   @@index([tenantUserId, createdAt(sort: Desc)])
   @@index([action, createdAt(sort: Desc)])
+}
+
+model AdminAuditCheckpoint {
+  id              String   @id @default(cuid())
+  checkpointDate  DateTime @unique @map("checkpoint_date")
+  firstRecordHash String?  @map("first_record_hash")
+  lastRecordHash  String?  @map("last_record_hash")
+  recordCount     Int      @map("record_count")
+  verified        Boolean  @default(false)
+  createdAt       DateTime @default(now()) @map("created_at")
+
+  @@map("admin_audit_checkpoints")
+}
+
+model AdminAlertRule {
+  id          String                @id @default(cuid())
+  key         String                @unique
+  name        String
+  metric      String
+  operator    String
+  threshold   Float
+  windowMin   Int                   @map("window_min")
+  severity    AdminIncidentSeverity @default(medium)
+  enabled     Boolean               @default(true)
+  lastFiredAt DateTime?             @map("last_fired_at")
+  createdById String                @map("created_by_id")
+  updatedById String                @map("updated_by_id")
+  createdAt   DateTime              @default(now()) @map("created_at")
+  updatedAt   DateTime              @updatedAt @map("updated_at")
+
+  @@index([enabled, metric])
+  @@map("admin_alert_rules")
+}
+
+model AdminAlertEvent {
+  id         String                @id @default(cuid())
+  ruleKey    String                @map("rule_key")
+  metric     String
+  value      Float
+  threshold  Float
+  severity   AdminIncidentSeverity
+  status     String                @default("open")
+  incidentId String?               @map("incident_id")
+  createdAt  DateTime              @default(now()) @map("created_at")
+  resolvedAt DateTime?             @map("resolved_at")
+
+  @@index([status, createdAt(sort: Desc)])
+  @@map("admin_alert_events")
 }
 
 model AdminIncident {
@@ -879,55 +1022,58 @@ model AdminIncident {
 }
 
 model AdminBreakGlassGrant {
-  id          String   @id @default(cuid())
+  id          String    @id @default(cuid())
   requesterId String
   approverId  String?
   permission  String
   reason      String
   expiresAt   DateTime
   revokedAt   DateTime?
-  createdAt   DateTime @default(now())
+  createdAt   DateTime  @default(now())
+
   @@index([requesterId, expiresAt])
 }
 
 model AdminBroadcast {
-  id             String                @id @default(cuid())
-  title          String
-  body           String                @db.Text
-  audienceType   BroadcastAudienceType
-  audience       Json
-  status         BroadcastStatus       @default(draft)
-  scheduledAt    DateTime?
-  createdById    String
-  approvedById   String?
-  publishedById  String?
-  createIdempotencyKey String?        @unique
-  publishIdempotencyKey String?       @unique
-  recipientCount Int                   @default(0)
-  deliveredCount Int                   @default(0)
-  failedCount    Int                   @default(0)
-  createdAt      DateTime              @default(now())
-  updatedAt      DateTime              @updatedAt
-  notifications  Notification[]
+  id                    String                @id @default(cuid())
+  title                 String
+  body                  String                @db.Text
+  audienceType          BroadcastAudienceType
+  audience              Json
+  status                BroadcastStatus       @default(draft)
+  scheduledAt           DateTime?
+  createdById           String
+  approvedById          String?
+  publishedById         String?
+  createIdempotencyKey  String?               @unique
+  publishIdempotencyKey String?               @unique
+  recipientCount        Int                   @default(0)
+  deliveredCount        Int                   @default(0)
+  failedCount           Int                   @default(0)
+  createdAt             DateTime              @default(now())
+  updatedAt             DateTime              @updatedAt
+  notifications         Notification[]
+
   @@index([status, scheduledAt])
 }
 
 model PlatformFeatureFlag {
-  id            String            @id @default(cuid())
-  key           String
-  environment   String
-  enabled       Boolean           @default(false)
-  rolloutPercent Int              @default(0)
-  targetPlans   Plan[]
-  targetUserIds String[]
-  status        FeatureFlagStatus @default(draft)
-  version       Int               @default(1)
-  createdById   String
-  approvedById  String?
-  updatedById   String
-  rollbackAt    DateTime?
-  createdAt     DateTime          @default(now())
-  updatedAt     DateTime          @updatedAt
+  id             String            @id @default(cuid())
+  key            String
+  environment    String
+  enabled        Boolean           @default(false)
+  rolloutPercent Int               @default(0)
+  targetPlans    Plan[]
+  targetUserIds  String[]
+  status         FeatureFlagStatus @default(draft)
+  version        Int               @default(1)
+  createdById    String
+  approvedById   String?
+  updatedById    String
+  rollbackAt     DateTime?
+  createdAt      DateTime          @default(now())
+  updatedAt      DateTime          @updatedAt
+
   @@unique([key, environment])
   @@index([environment, status])
 }
@@ -967,58 +1113,108 @@ model AdminIdempotencyKey {
 }
 
 model SupportCase {
-  id               String            @id @default(cuid())
-  requesterUserId  String            @map("requester_user_id")
+  id               String                  @id @default(cuid())
+  requesterUserId  String                  @map("requester_user_id")
   subject          String
   category         String
-  status           SupportCaseStatus @default(open)
-  priority         SupportCasePriority @default(normal)
-  assignedAdminId  String?           @map("assigned_admin_id")
-  slaDueAt         DateTime?         @map("sla_due_at")
-  firstRespondedAt DateTime?         @map("first_responded_at")
-  resolvedAt       DateTime?         @map("resolved_at")
-  safeContext      Json?             @map("safe_context")
-  version          Int               @default(1)
-  createdAt        DateTime          @default(now())
-  updatedAt        DateTime          @updatedAt
-  requester        User              @relation("SupportRequester", fields: [requesterUserId], references: [id], onDelete: Cascade)
+  status           SupportCaseStatus       @default(open)
+  priority         SupportCasePriority     @default(normal)
+  assignedAdminId  String?                 @map("assigned_admin_id")
+  slaDueAt         DateTime?               @map("sla_due_at")
+  firstRespondedAt DateTime?               @map("first_responded_at")
+  resolvedAt       DateTime?               @map("resolved_at")
+  safeContext      Json?                   @map("safe_context")
+  version          Int                     @default(1)
+  createdAt        DateTime                @default(now())
+  updatedAt        DateTime                @updatedAt
+  requester        User                    @relation("SupportRequester", fields: [requesterUserId], references: [id], onDelete: Cascade)
   messages         SupportCaseMessage[]
+  escalations      SupportCaseEscalation[]
+
   @@index([status, priority, slaDueAt])
   @@index([requesterUserId, updatedAt(sort: Desc)])
   @@map("support_cases")
 }
 
+model SupportCaseEscalation {
+  id          String      @id @default(cuid())
+  caseId      String      @map("case_id")
+  incidentId  String?     @map("incident_id")
+  service     String
+  reason      String
+  createdById String      @map("created_by_id")
+  createdAt   DateTime    @default(now()) @map("created_at")
+  supportCase SupportCase @relation(fields: [caseId], references: [id], onDelete: Cascade)
+
+  @@index([caseId, createdAt(sort: Desc)])
+  @@map("support_case_escalations")
+}
+
 model SupportCaseMessage {
-  id           String                 @id @default(cuid())
-  caseId       String                 @map("case_id")
-  authorType   SupportCaseMessageKind @map("author_type")
-  authorUserId String?                @map("author_user_id")
-  idempotencyKey String?              @unique @map("idempotency_key")
-  body         String                 @db.Text
-  redacted     Boolean                @default(false)
-  createdAt    DateTime               @default(now())
-  supportCase  SupportCase            @relation(fields: [caseId], references: [id], onDelete: Cascade)
+  id             String                 @id @default(cuid())
+  caseId         String                 @map("case_id")
+  authorType     SupportCaseMessageKind @map("author_type")
+  authorUserId   String?                @map("author_user_id")
+  idempotencyKey String?                @unique @map("idempotency_key")
+  body           String                 @db.Text
+  redacted       Boolean                @default(false)
+  createdAt      DateTime               @default(now())
+  supportCase    SupportCase            @relation(fields: [caseId], references: [id], onDelete: Cascade)
+
   @@index([caseId, createdAt])
   @@map("support_case_messages")
 }
 
-model Notification {
-  id        String   @id @default(cuid())
-  userId    String   @map("user_id")
-  type      String
-  title     String
-  body      String?
-  read      Boolean  @default(false)
-  jobId     String?  @map("job_id")
-  broadcastId String? @map("broadcast_id")
-  createdAt DateTime @default(now()) @map("created_at")
+model SupportSlaPolicy {
+  id                   String              @id @default(cuid())
+  category             String
+  priority             SupportCasePriority
+  firstResponseMinutes Int                 @map("first_response_minutes")
+  resolutionMinutes    Int                 @map("resolution_minutes")
+  warningMinutes       Int                 @map("warning_minutes")
+  version              Int                 @default(1)
+  active               Boolean             @default(true)
+  updatedById          String              @map("updated_by_id")
+  createdAt            DateTime            @default(now()) @map("created_at")
+  updatedAt            DateTime            @updatedAt @map("updated_at")
 
-  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+  @@unique([category, priority])
+  @@index([active, category])
+  @@map("support_sla_policies")
+}
+
+model SupportMacro {
+  id          String   @id @default(cuid())
+  name        String
+  category    String?
+  body        String   @db.Text
+  active      Boolean  @default(true)
+  createdById String   @map("created_by_id")
+  updatedById String   @map("updated_by_id")
+  createdAt   DateTime @default(now()) @map("created_at")
+  updatedAt   DateTime @updatedAt @map("updated_at")
+
+  @@index([active, category])
+  @@map("support_macros")
+}
+
+model Notification {
+  id          String   @id @default(cuid())
+  userId      String   @map("user_id")
+  type        String
+  title       String
+  body        String?
+  read        Boolean  @default(false)
+  jobId       String?  @map("job_id")
+  broadcastId String?  @map("broadcast_id")
+  createdAt   DateTime @default(now()) @map("created_at")
+
+  user      User            @relation(fields: [userId], references: [id], onDelete: Cascade)
   broadcast AdminBroadcast? @relation(fields: [broadcastId], references: [id], onDelete: SetNull)
 
+  @@unique([broadcastId, userId])
   @@index([userId, createdAt(sort: Desc)])
   @@index([broadcastId])
-  @@unique([broadcastId, userId])
   @@map("notifications")
 }
 
@@ -1027,12 +1223,12 @@ model Notification {
 // ─────────────────────────────────────────────────────────────────────────────
 
 model GmailSyncState {
-  id           String   @id @default(cuid())
-  userId       String   @unique @map("user_id")
+  id           String    @id @default(cuid())
+  userId       String    @unique @map("user_id")
   lastSyncedAt DateTime? @map("last_synced_at")
-  lastError    String?  @db.Text @map("last_error")
-  createdAt    DateTime @default(now()) @map("created_at")
-  updatedAt    DateTime @updatedAt @map("updated_at")
+  lastError    String?   @map("last_error") @db.Text
+  createdAt    DateTime  @default(now()) @map("created_at")
+  updatedAt    DateTime  @updatedAt @map("updated_at")
 
   user User @relation(fields: [userId], references: [id], onDelete: Cascade)
 
@@ -1118,16 +1314,16 @@ model GmailRecommendation {
 // ─────────────────────────────────────────────
 
 model AgentRunQuestion {
-  id          String    @id @default(cuid())
-  userId      String
-  runId       String
-  stage       String
-  question    String    @db.Text
-  options     Json
-  answer      String?
-  autonomous  Boolean   @default(false)
-  createdAt   DateTime  @default(now())
-  answeredAt  DateTime?
+  id         String    @id @default(cuid())
+  userId     String
+  runId      String
+  stage      String
+  question   String    @db.Text
+  options    Json
+  answer     String?
+  autonomous Boolean   @default(false)
+  createdAt  DateTime  @default(now())
+  answeredAt DateTime?
 
   user User @relation(fields: [userId], references: [id], onDelete: Cascade)
 
@@ -1157,20 +1353,20 @@ model AgentRun {
 // historical summary), this row owns cancellation, retries and the exact
 // stage snapshot required to resume after a worker or web-process restart.
 model AgentExecution {
-  id             String   @id @default(cuid())
-  userId         String
-  sessionId      String   @unique
-  status         String   @default("queued") // queued | running | waiting_for_user | paused | completed | failed | cancelled
-  checkpoint     String   @default("scout")
-  state          Json?
-  error          String?  @db.Text
-  workerTaskId   String?
-  attemptCount   Int      @default(0)
-  startedAt      DateTime?
-  completedAt    DateTime?
-  cancelledAt    DateTime?
-  createdAt      DateTime @default(now())
-  updatedAt      DateTime @updatedAt
+  id           String    @id @default(cuid())
+  userId       String
+  sessionId    String    @unique
+  status       String    @default("queued") // queued | running | waiting_for_user | paused | completed | failed | cancelled
+  checkpoint   String    @default("scout")
+  state        Json?
+  error        String?   @db.Text
+  workerTaskId String?
+  attemptCount Int       @default(0)
+  startedAt    DateTime?
+  completedAt  DateTime?
+  cancelledAt  DateTime?
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @updatedAt
 
   user    User         @relation(fields: [userId], references: [id], onDelete: Cascade)
   session AgentSession @relation(fields: [sessionId], references: [id], onDelete: Cascade)
@@ -1193,12 +1389,12 @@ model AgentSession {
   createdAt     DateTime  @default(now())
   updatedAt     DateTime  @updatedAt
 
-  user       User                   @relation(fields: [userId], references: [id], onDelete: Cascade)
-  tasks      SubAgentTask[]
-  transcript AgentTranscriptEvent[]
-  approvals  AgentApproval[]
+  user             User                   @relation(fields: [userId], references: [id], onDelete: Cascade)
+  tasks            SubAgentTask[]
+  transcript       AgentTranscriptEvent[]
+  approvals        AgentApproval[]
   applicationTasks ApplicationTask[]
-  execution AgentExecution?
+  execution        AgentExecution?
 
   @@index([userId, createdAt(sort: Desc)])
   @@index([userId, status])
@@ -1357,10 +1553,10 @@ model CoverLetter {
   createdAt       DateTime @default(now())
   updatedAt       DateTime @updatedAt
 
-  user   User    @relation(fields: [userId], references: [id], onDelete: Cascade)
-  job    Job     @relation(fields: [jobId], references: [id], onDelete: Cascade)
-  resume Resume? @relation(fields: [resumeId], references: [id], onDelete: SetNull)
-  finalForJobs Job[] @relation("JobFinalCL")
+  user         User    @relation(fields: [userId], references: [id], onDelete: Cascade)
+  job          Job     @relation(fields: [jobId], references: [id], onDelete: Cascade)
+  resume       Resume? @relation(fields: [resumeId], references: [id], onDelete: SetNull)
+  finalForJobs Job[]   @relation("JobFinalCL")
 
   @@index([userId, jobId])
   @@index([jobId, isFinal])
