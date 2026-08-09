@@ -17,7 +17,7 @@
 - Modify: `apps/worker/src/admin/control-plane.ts`
 - Modify: `apps/worker/src/index.ts`
 
-- [ ] **Step 1: Write the failing configuration tests**
+- [x] **Step 1: Write the failing configuration tests**
 
 Add tests for the desired boundary behavior:
 
@@ -35,17 +35,17 @@ it('allows the Fly listener when the HMAC control secret is configured', () => {
 })
 ```
 
-- [ ] **Step 2: Run the focused test to verify the red state**
+- [x] **Step 2: Run the focused test to verify the red state**
 
 Run: `pnpm --filter @jobcopilot/worker test -- src/admin/control-plane.test.ts`
 
 Expected: failure because `resolveWorkerAdminHost` is not exported.
 
-- [ ] **Step 3: Implement the smallest host resolver**
+- [x] **Step 3: Implement the smallest host resolver**
 
 Add an exported resolver in `control-plane.ts` that defaults to `127.0.0.1`, accepts loopback/private listeners, and throws only when `NODE_ENV=production`, the requested host is `0.0.0.0` or `::`, and no control secret is configured. Replace the inline host check in `index.ts` with this resolver.
 
-- [ ] **Step 4: Run the focused Worker test to verify green**
+- [x] **Step 4: Run the focused Worker test to verify green**
 
 Run: `pnpm --filter @jobcopilot/worker test -- src/admin/control-plane.test.ts`
 
@@ -60,19 +60,19 @@ Expected: all control-plane tests pass.
 - Modify: `docs/auto-apply-deployment.md`
 - Modify: `docs/admin-console-implementation-plan.md`
 
-- [ ] **Step 1: Declare Fly's proxy listener**
+- [x] **Step 1: Declare Fly's proxy listener**
 
 Add `WORKER_ADMIN_HOST = "0.0.0.0"` to `apps/worker/fly.toml` so Fly's `http_service` can reach port 3001. The process still refuses to start in production until its HMAC control secret exists.
 
-- [ ] **Step 2: Document the matching control-plane contract**
+- [x] **Step 2: Document the matching control-plane contract**
 
 Update both environment templates to describe `WORKER_CONTROL_URL` as the Worker base URL without `/internal/admin/control`, and require `WORKER_CONTROL_SECRET` to match between Vercel and Fly. State that the Fly public route is HMAC protected and Bull Board remains disabled.
 
-- [ ] **Step 3: Make the production guide executable**
+- [x] **Step 3: Make the production guide executable**
 
 Update `docs/auto-apply-deployment.md` to include the two Web control variables, the Worker control secret, the Fly `secrets set` argument, current migrations, and a post-deploy administrator queue-control smoke check. Update `docs/admin-console-implementation-plan.md` to remove its incompatible private-network instruction and link it to the same HMAC-protected Fly contract. Keep secrets represented only by placeholders.
 
-- [ ] **Step 4: Review the rendered diff**
+- [x] **Step 4: Review the rendered diff**
 
 Run: `git diff --check`
 
@@ -85,7 +85,7 @@ Expected: no whitespace errors or leaked secret values.
 - Verify: `apps/web/src/lib/admin/worker-client.test.ts`
 - Verify: `docs/auto-apply-deployment.md`
 
-- [ ] **Step 1: Run focused control-plane tests**
+- [x] **Step 1: Run focused control-plane tests**
 
 Run:
 
@@ -96,7 +96,7 @@ pnpm --filter @jobcopilot/web test -- src/lib/admin/worker-client.test.ts
 
 Expected: all selected tests pass.
 
-- [ ] **Step 2: Run type checks and serial full test suites**
+- [x] **Step 2: Run type checks and serial full test suites**
 
 Run:
 
@@ -112,7 +112,7 @@ pnpm --filter @jobcopilot/shared test
 
 Expected: all commands pass. The Web suite is serial because the local Windows runner can otherwise starve its five-second per-test budget during full parallel collection.
 
-- [ ] **Step 3: Build deployable artifacts**
+- [x] **Step 3: Build deployable artifacts**
 
 Run:
 
