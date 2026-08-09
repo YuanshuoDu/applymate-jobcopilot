@@ -7,6 +7,7 @@ import { NextRequest } from 'next/server'
 import { db } from '@/lib/db'
 import { prepareAiRoute, isErrorResponse, ok, err } from '@/lib/api-helpers'
 import { modelChat, stripFences, withMiniMaxThinking, type AiConfig } from '@/lib/model-router'
+import { roleAiConfig } from '@/lib/agent/role-config'
 import type { ApplicationAuditFinding, ResumeContent } from '@/lib/types'
 
 type Params = { params: Promise<{ id: string }> }
@@ -57,11 +58,11 @@ export async function POST(req: NextRequest, { params }: Params) {
   // Load Writer Agent role config for consistency with pipeline
   const writerRole = await db.agentRole.findFirst({
     where:  { userId: prep.userId, role: 'writer' },
-    select: { provider: true, model: true, apiKey: true, systemPrompt: true },
+    select: { enabled: true, provider: true, model: true, apiKey: true, systemPrompt: true },
   }).catch(() => null)
-  const selectedCfg: AiConfig = writerRole
-    ? { provider: writerRole.provider as AiConfig['provider'], model: writerRole.model, apiKey: writerRole.apiKey ?? undefined }
-    : prep.cfg
+  const selectedCfg = roleAiConfig('writer', writerRole
+    ? { ...writerRole, apiKey: writerRole.apiKey ?? undefined }
+    : undefined, prep.cfg)
   const cfg = withMiniMaxThinking(selectedCfg, 'disabled')
   const writerSystemPrompt = writerRole?.systemPrompt
     ?? 'You are a professional cover letter writer. Output ONLY the cover letter text. Start directly with the greeting.'

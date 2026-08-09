@@ -59,6 +59,32 @@ describe('cover letter generation after an audit failure', () => {
     expect(mocks.modelChat.mock.calls[0][1]).toMatchObject({ model: 'MiniMax-M3', thinking: 'disabled' })
   })
 
+  it('keeps the feature-level model when the Writer role is the keyless platform default', async () => {
+    const settingsCfg = { provider: 'openai', model: 'gpt-4o', apiKey: 'user-openai-key' }
+    mocks.prepareAiRoute.mockResolvedValue({ userId: 'user_1', cfg: settingsCfg })
+    mocks.agentRoleFindFirst.mockResolvedValue({
+      enabled: true,
+      provider: 'minimax',
+      model: 'MiniMax-M3',
+      apiKey: null,
+      systemPrompt: 'Custom writer prompt',
+    })
+
+    const { POST } = await import('./route')
+    const response = await POST(new NextRequest('http://localhost/api/jobs/job_1/cover-letters/generate', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ resumeId: 'resume_1', preferProvidedResume: true }),
+    }) as never, { params: Promise.resolve({ id: 'job_1' }) })
+
+    if (!response) throw new Error('Expected a response')
+    expect(response.status).toBe(201)
+    expect(mocks.modelChat).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining(settingsCfg),
+      4096,
+    )
+  })
+
   it('repairs an existing cover letter in place and preserves its supported wording', async () => {
     mocks.coverLetterFindFirst.mockResolvedValue({ id: 'letter_1', content: 'Dear Hiring Manager,\n\nI improved delivery by 50%.\n\nSincerely,\nAda' })
     mocks.coverLetterUpdate.mockResolvedValue({ id: 'letter_1', resumeId: 'resume_1', content: 'Dear Hiring Manager,\n\nI improved delivery.\n\nSincerely,\nAda' })

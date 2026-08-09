@@ -7,6 +7,20 @@ vi.mock('./audit', () => ({ requestIdFor: () => 'request-1', writeAdminAudit: mo
 
 describe('requireAdmin', () => {
   beforeEach(() => { vi.resetModules(); mocks.safeAuth.mockReset(); mocks.findUnique.mockReset(); mocks.findGrant.mockReset(); mocks.audit.mockReset() })
+  it('rejects an invalid cross-origin write before authentication or auditing', async () => {
+    const { requireAdmin } = await import('./authorization')
+
+    const result = await requireAdmin('queues.pause', new Request('http://localhost/api/admin/v1/queues/apply-tasks/pause', {
+      method: 'POST',
+      headers: { Origin: 'https://untrusted.example', Host: 'localhost', 'Idempotency-Key': 'cross-origin-1' },
+    }))
+
+    expect(result).toBeInstanceOf(Response)
+    expect((result as Response).status).toBe(403)
+    expect(mocks.safeAuth).not.toHaveBeenCalled()
+    expect(mocks.audit).not.toHaveBeenCalled()
+  })
+
   it('denies an old admin session after the membership session version changes', async () => {
     mocks.safeAuth.mockResolvedValue({ user: { id: 'admin-1', plan: 'pro', adminSessionVersion: 1 } })
     mocks.findUnique.mockResolvedValue({ status: 'active', mfaLevel: 'totp', sessionVersion: 2, role: { key: 'operations', permissions: ['observability.read'] } })

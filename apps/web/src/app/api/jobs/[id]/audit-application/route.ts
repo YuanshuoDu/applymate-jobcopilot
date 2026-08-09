@@ -8,7 +8,8 @@
 import { NextRequest } from 'next/server'
 import { db } from '@/lib/db'
 import { prepareAiRoute, requireAuth, isErrorResponse, ok, err } from '@/lib/api-helpers'
-import { modelChat, parseAiJson, resolveConfig, withMiniMaxThinking, type AiConfig } from '@/lib/model-router'
+import { modelChat, parseAiJson, withMiniMaxThinking, type AiConfig } from '@/lib/model-router'
+import { roleAiConfig } from '@/lib/agent/role-config'
 import { buildPersona } from '@/lib/persona'
 import type { ApplicationAudit, ApplicationAuditFinding, ResumeContent } from '@/lib/types'
 
@@ -201,14 +202,11 @@ export async function POST(req: NextRequest, { params }: Params) {
   }
 
   const auditorRole = await db.agentRole.findFirst({
-    where: { userId: prep.userId, role: 'auditor' }, select: { provider: true, model: true, apiKey: true, systemPrompt: true },
+    where: { userId: prep.userId, role: 'auditor' }, select: { enabled: true, provider: true, model: true, apiKey: true, systemPrompt: true },
   }).catch(() => null)
-  const configuredAuditor: AiConfig | null = auditorRole
-    ? { provider: auditorRole.provider as AiConfig['provider'], model: auditorRole.model, apiKey: auditorRole.apiKey ?? undefined }
-    : null
-  const cfg: AiConfig = configuredAuditor && resolveConfig(configuredAuditor).resolvedKey
-    ? configuredAuditor
-    : prep.cfg
+  const cfg = roleAiConfig('auditor', auditorRole
+    ? { ...auditorRole, apiKey: auditorRole.apiKey ?? undefined }
+    : undefined, prep.cfg)
   const rolePrompt = auditorRole?.systemPrompt ?? 'You are an independent application auditor. Be conservative and evidence-based.'
 
   const prompt = `${rolePrompt}

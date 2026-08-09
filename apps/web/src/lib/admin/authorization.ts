@@ -3,6 +3,7 @@ import { AdminMfaLevel, AdminMembershipStatus } from '@prisma/client'
 import { safeAuth } from '@/lib/safe-auth'
 import { db } from '@/lib/db'
 import { requestIdFor, writeAdminAudit } from './audit'
+import { validateAdminWrite } from './csrf'
 import type { Permission } from './permissions'
 
 export type AdminActor = Readonly<{
@@ -29,6 +30,10 @@ export async function requireAdminMembership(request?: Request): Promise<AdminAc
 }
 
 export async function requireAdmin(permission: Permission, request?: Request): Promise<AdminActor | NextResponse> {
+  if (request && ['POST', 'PUT', 'PATCH', 'DELETE'].includes(request.method)) {
+    const writeError = validateAdminWrite(request)
+    if (writeError) return writeError
+  }
   const requestId = requestIdFor(request)
   const session = await safeAuth()
   const userId = session?.user?.id
