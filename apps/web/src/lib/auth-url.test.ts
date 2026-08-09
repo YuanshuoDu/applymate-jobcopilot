@@ -20,4 +20,10 @@ describe('canonicalAuthRedirect', () => {
     expect(canonicalAuthRedirect('https://attacker.example/steal', 'https://web-preview.vercel.app', undefined, true))
       .toBe('https://web-preview.vercel.app/steal')
   })
+
+  it('falls back to the canonical origin when a hidden or malformed deployment URL leaks into the callback', () => {
+    expect(canonicalAuthRedirect('/admin', 'https://[SENSITIVE]')).toBe('https://applymate.site/admin')
+    expect(canonicalAuthRedirect('/admin', 'https://preview.vercel.app', 'https://[SENSITIVE]'))
+      .toBe('https://applymate.site/admin')
+  })
 })

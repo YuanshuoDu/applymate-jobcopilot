@@ -1,13 +1,22 @@
 const PRODUCTION_HOST = 'applymate.site'
+const DEFAULT_CANONICAL_URL = `https://${PRODUCTION_HOST}`
+
+function safeUrl(value: string | undefined, fallback: string): URL {
+  try {
+    return new URL(value ?? fallback)
+  } catch {
+    return new URL(fallback)
+  }
+}
 
 export function canonicalAuthRedirect(
   url: string,
   baseUrl: string,
-  canonicalUrl = 'https://' + PRODUCTION_HOST,
+  canonicalUrl = DEFAULT_CANONICAL_URL,
   preservePreview = false,
 ): string {
-  const target = new URL(url, baseUrl)
-  const base = new URL(baseUrl)
+  const base = safeUrl(baseUrl, DEFAULT_CANONICAL_URL)
+  const target = new URL(url, base)
   const isPreviewHost = base.hostname.endsWith('.vercel.app') || target.hostname.endsWith('.vercel.app')
   if (!isPreviewHost) return target.toString()
   if (preservePreview) {
@@ -16,6 +25,6 @@ export function canonicalAuthRedirect(
       : new URL(target.pathname + target.search + target.hash, base).toString()
   }
 
-  const canonical = new URL(canonicalUrl)
+  const canonical = safeUrl(canonicalUrl, DEFAULT_CANONICAL_URL)
   return new URL(target.pathname + target.search + target.hash, canonical).toString()
 }
