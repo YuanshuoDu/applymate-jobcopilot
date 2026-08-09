@@ -11,3 +11,14 @@ Required rollout checks:
 - a cross-tenant query returns zero rows;
 - the candidate role cannot disable RLS or read another tenant's rows;
 - the migration is applied in a maintenance window and followed by the web/worker smoke suite.
+
+Run the reversible cross-tenant smoke test with a direct database credential before
+enabling the policies:
+
+```powershell
+pnpm --filter @jobcopilot/web exec tsx scripts/verify-rls.ts
+```
+
+The verifier creates a temporary `NOBYPASSRLS` role, runs the policy inside a
+rolled-back transaction, checks two tenant contexts and the empty-context case,
+then drops the temporary role.
