@@ -1,3 +1,4 @@
+import { Prisma } from '@prisma/client'
 import { db } from '@/lib/db'
 
 type OverallRow = {
@@ -13,10 +14,14 @@ type OverallRow = {
 }
 
 type AtsRow = { atsType: string | null; count: number; successRate: number | null }
+type TrendRow = { day: Date; count: number; successRate: number | null }
 
-export async function getObservabilitySnapshot() {
+export async function getObservabilitySnapshot(options: { days?: number; atsType?: string } = {}) {
+  const days = options.days && options.days >= 1 && options.days <= 3_650 ? Math.trunc(options.days) : 3_650
+  const since = new Date(Date.now() - days * 24 * 60 * 60_000)
   const weekAgo = new Date(Date.now() - 7 * 24 * 60 * 60_000)
-  const [overallRows, byAtsRows, registeredUsers, registrationsLast7d, usersByPlan, sources, overdueCases] = await Promise.all([
+  const atsFilter = options.atsType ? Prisma.sql`AND ats_type = ${options.atsType}` : Prisma.empty
+  const [overallRows, byAtsRows, trendRows, registeredUsers, registrationsLast7d, usersByPlan, sources, overdueCases] = await Promise.all([
     db.$queryRaw`
     SELECT COUNT(*)::int AS total,
       COALESCE(ROUND(100.0 * COUNT(*) FILTER (WHERE status = 'submitted') / NULLIF(COUNT(*), 0), 1)::float, 0) AS "successRate",
@@ -27,13 +32,19 @@ export async function getObservabilitySnapshot() {
       COUNT(*) FILTER (WHERE error ILIKE '%captcha%')::int AS "captchaErrors",
       COUNT(*) FILTER (WHERE created_at > NOW() - INTERVAL '24 hours')::int AS "last24h",
       COALESCE(ROUND(100.0 * COUNT(*) FILTER (WHERE status = 'submitted' AND created_at > NOW() - INTERVAL '24 hours') / NULLIF(COUNT(*) FILTER (WHERE created_at > NOW() - INTERVAL '24 hours'), 0), 1)::float, 0) AS "last24hSuccessRate"
-    FROM apply_results
+    FROM apply_results WHERE created_at >= ${since} ${atsFilter}
   ` as Promise<OverallRow[]>,
     db.$queryRaw`
     SELECT COALESCE(ats_type, 'unknown') AS "atsType", COUNT(*)::int AS count,
       COALESCE(ROUND(100.0 * COUNT(*) FILTER (WHERE status = 'submitted') / NULLIF(COUNT(*), 0), 1)::float, 0) AS "successRate"
-    FROM apply_results GROUP BY ats_type ORDER BY count DESC
+    FROM apply_results WHERE created_at >= ${since} ${atsFilter} GROUP BY ats_type ORDER BY count DESC
   ` as Promise<AtsRow[]>,
+    db.$queryRaw`
+    SELECT DATE_TRUNC('day', created_at) AS day, COUNT(*)::int AS count,
+      COALESCE(ROUND(100.0 * COUNT(*) FILTER (WHERE status = 'submitted') / NULLIF(COUNT(*), 0), 1)::float, 0) AS "successRate"
+    FROM apply_results WHERE created_at >= ${since} ${atsFilter}
+    GROUP BY DATE_TRUNC('day', created_at) ORDER BY day ASC
+  ` as Promise<TrendRow[]>,
     db.user.count(),
     db.user.count({ where: { createdAt: { gte: weekAgo } } }),
     db.user.groupBy({ by: ['plan'], _count: { id: true } }),
@@ -57,6 +68,7 @@ export async function getObservabilitySnapshot() {
       last24h: { count: Number(row?.last24h ?? 0), successRate: Number(row?.last24hSuccessRate ?? 0) },
     },
     byAts: byAtsRows.map((ats) => ({ atsType: ats.atsType ?? 'unknown', count: Number(ats.count ?? 0), successRate: Number(ats.successRate ?? 0) })),
+    trend: trendRows.map((trend) => ({ day: trend.day, count: Number(trend.count ?? 0), successRate: Number(trend.successRate ?? 0) })),
     platform: {
       registeredUsers,
       registrationsLast7d,

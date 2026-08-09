@@ -1,6 +1,6 @@
 'use client'
 
-import React from 'react'
+import React, { useState } from 'react'
 import Link from 'next/link'
 import { ExternalLink, RefreshCw } from 'lucide-react'
 import { DeploymentReadinessPanel } from '@/components/admin/DeploymentReadinessPanel'
@@ -33,6 +33,7 @@ interface ObservabilityData {
     count: number
     successRate: number
   }>
+  trend: Array<{ day: string; count: number; successRate: number }>
 }
 
 interface PlatformData {
@@ -92,7 +93,10 @@ function flowLabel(key: string) {
 }
 
 export function ObservabilityPage() {
-  const { data, loading, error, refetch } = useApi<ObservabilityData>('/api/admin/v1/observability', { cache: false })
+  const [days, setDays] = useState('30')
+  const [atsType, setAtsType] = useState('')
+  const observabilityUrl = `/api/admin/v1/observability?days=${days}${atsType ? `&atsType=${encodeURIComponent(atsType)}` : ''}`
+  const { data, loading, error, refetch } = useApi<ObservabilityData>(observabilityUrl, { cache: false })
   const { data: platform, loading: platformLoading, error: platformError, refetch: refetchPlatform } = useApi<PlatformData>('/api/admin/v1/platform', { cache: false })
   const overall = data?.overall
   const readiness = platform?.readiness
@@ -105,6 +109,8 @@ export function ObservabilityPage() {
   return (
     <div style={{ height: '100%', overflowY: 'auto', background: 'var(--bg)' }}>
       <TopBar title="Observability">
+        <label style={{ display: 'inline-flex', alignItems: 'center', gap: 5, fontSize: 11, color: 'var(--text-muted)' }}>Range<select value={days} onChange={event => setDays(event.target.value)}><option value="7">7d</option><option value="30">30d</option><option value="90">90d</option><option value="365">1y</option></select></label>
+        <label style={{ display: 'inline-flex', alignItems: 'center', gap: 5, fontSize: 11, color: 'var(--text-muted)' }}>ATS<select value={atsType} onChange={event => setAtsType(event.target.value)}><option value="">All</option>{(data?.byAts ?? []).map(ats => <option key={ats.atsType} value={ats.atsType}>{ats.atsType}</option>)}</select></label>
         <Link href="/admin/plans" style={{ color: 'var(--text-muted)', fontSize: 12, textDecoration: 'none' }}>Manage plans</Link>
         <Link href="/admin/users" style={{ display: 'inline-flex', alignItems: 'center', gap: 5, fontSize: 11, color: 'var(--text-muted)', textDecoration: 'none' }}>
           User settings <ExternalLink size={12} aria-hidden="true" />
@@ -134,6 +140,7 @@ export function ObservabilityPage() {
           <StatCard label="Deletion queue" value={platformLoading ? '…' : String((platform?.deletionRequests.requested ?? 0) + (platform?.deletionRequests.processing ?? 0))} sub={platform ? `${platform.deletionRequests.processing} processing` : undefined} />
           <StatCard label="Operational applies" value={platformLoading ? '…' : String(platform?.applies.total ?? 0)} sub="All users · operational count" />
         </section>
+        <Card style={{ padding: 16 }}><h2 style={{ margin: '0 0 14px', fontSize: 14 }}>Trend</h2>{(data?.trend?.length ?? 0) === 0 ? <div style={{ fontSize: 12, color: 'var(--text-muted)' }}>No trend data for this range.</div> : <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(70px, 1fr))', gap: 8, alignItems: 'end', minHeight: 130 }}>{data!.trend.map(point => <div key={point.day} title={`${point.count} applies · ${point.successRate}% success`} style={{ display: 'grid', gap: 5, justifyItems: 'center', fontSize: 10, color: 'var(--text-muted)' }}><div style={{ width: '100%', minHeight: 4, height: `${Math.max(point.count / Math.max(...data!.trend.map(item => item.count), 1) * 90, point.count ? 4 : 0)}px`, background: 'var(--primary)', borderRadius: 4 }} /><span>{new Date(point.day).toLocaleDateString(undefined, { month: 'short', day: 'numeric' })}</span></div>)}</div>}</Card>
 
         <Card style={{ padding: 16 }}>
           <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 10, marginBottom: 12 }}>
