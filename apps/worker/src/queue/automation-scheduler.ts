@@ -9,6 +9,17 @@ export interface AutomationSchedulerStatus {
   lastError: string | null;
 }
 
+export type PublicAutomationSchedulerStatus = Omit<AutomationSchedulerStatus, "lastError"> & {
+  healthy: boolean;
+};
+
+export function publicAutomationSchedulerStatus(
+  status: AutomationSchedulerStatus,
+): PublicAutomationSchedulerStatus {
+  const { lastError, ...safeStatus } = status;
+  return { ...safeStatus, healthy: lastError === null };
+}
+
 export interface AutomationScheduler {
   run(): Promise<void>;
   close(): void;

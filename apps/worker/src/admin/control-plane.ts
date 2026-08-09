@@ -1,14 +1,11 @@
 import { randomUUID } from 'node:crypto'
 import type { Request, Response } from 'express'
-import { agentRunQueue } from '../queue/agent-run-queue.js'
-import { applyQueue, connection } from '../queue/apply-queue.js'
-import { scoutQueue } from '../queue/scout-queue.js'
 import { getPool } from '../db/apply-results.js'
 import { isAtsSourceKey } from '@jobcopilot/shared'
 import { loadEffectiveAtsPolicy } from './ats-policy.js'
 import { verifyWorkerCommand } from './control-auth.js'
 
-const queues = { 'apply-tasks': applyQueue, 'scout-tasks': scoutQueue, 'agent-runs': agentRunQueue }
+const loopbackAdminHosts = new Set(['127.0.0.1', '::1', 'localhost'])
 
 type WorkerAdminHostOptions = {
   host?: string
@@ -22,11 +19,15 @@ class WorkerControlError extends Error {
 }
 
 export function resolveWorkerAdminHost(options: WorkerAdminHostOptions = {}): string {
-  const host = options.host ?? process.env.WORKER_ADMIN_HOST ?? '127.0.0.1'
-  const hasControlSecret = options.hasControlSecret ?? Boolean(process.env.WORKER_CONTROL_SECRET)
+  const configuredHost = options.host ?? process.env.WORKER_ADMIN_HOST
+  const host = configuredHost === undefined ? '127.0.0.1' : configuredHost.trim()
+  const hasControlSecret = options.hasControlSecret ?? Boolean(process.env.WORKER_CONTROL_SECRET?.trim())
 
-  if ((host === '0.0.0.0' || host === '::') && !hasControlSecret) {
-    throw new Error('WORKER_CONTROL_SECRET is required for a public worker control listener')
+  if (!host) {
+    throw new Error('WORKER_ADMIN_HOST must not be empty')
+  }
+  if (!loopbackAdminHosts.has(host.toLowerCase()) && !hasControlSecret) {
+    throw new Error('WORKER_CONTROL_SECRET is required for a non-loopback worker control listener')
   }
 
   return host
@@ -60,6 +61,7 @@ export function createWorkerControlHandler() {
     if (!secret) return response.status(401).json({ error: 'Unauthorized worker command' })
     const command = verifyWorkerCommand(rawBody, request.header('x-worker-control-signature'), secret)
     if (!command) return response.status(401).json({ error: 'Unauthorized or stale worker command' })
+    const { connection } = await loadWorkerQueueResources()
     const nonce = await connection.set(`admin-control:${command.nonce}`, '1', 'PX', 300_000, 'NX')
     if (nonce !== 'OK') return response.status(409).json({ error: 'Replayed worker command' })
     try {
@@ -73,6 +75,7 @@ export function createWorkerControlHandler() {
         }
       }
       const queueName = typeof command.params.queue === 'string' ? command.params.queue : ''
+      const { queues } = await loadWorkerQueueResources()
       const queue = queues[queueName as keyof typeof queues]
       if (!queue) return response.status(400).json({ error: 'Unsupported queue' })
       if (command.action === 'pause_queue') await queue.pause()
@@ -86,5 +89,23 @@ export function createWorkerControlHandler() {
 }
 
 async function queueSummary() {
+  const { queues } = await loadWorkerQueueResources()
   return Promise.all(Object.entries(queues).map(async ([name, queue]) => ({ name, counts: await queue.getJobCounts('active', 'completed', 'delayed', 'failed', 'paused', 'prioritized', 'waiting'), paused: await queue.isPaused() })))
+}
+
+async function loadWorkerQueueResources() {
+  const [agentRunQueueModule, applyQueueModule, scoutQueueModule] = await Promise.all([
+    import('../queue/agent-run-queue.js'),
+    import('../queue/apply-queue.js'),
+    import('../queue/scout-queue.js'),
+  ])
+
+  return {
+    connection: applyQueueModule.connection,
+    queues: {
+      'apply-tasks': applyQueueModule.applyQueue,
+      'scout-tasks': scoutQueueModule.scoutQueue,
+      'agent-runs': agentRunQueueModule.agentRunQueue,
+    },
+  }
 }

@@ -4,7 +4,7 @@
 
 **Goal:** Make the existing HMAC-protected Web-to-Worker admin control plane reachable from Vercel through Fly while failing closed when a public Worker listener lacks its control secret.
 
-**Architecture:** The Web app continues to send signed commands to the Worker control endpoint. Fly exposes the Worker HTTP service on its proxy address, while the Worker validates that every public listener has `WORKER_CONTROL_SECRET` before it starts. The deployment guides and environment templates describe the same base URL and shared secret contract.
+**Architecture:** The Web app continues to send signed commands to the Worker control endpoint. Fly exposes the Worker HTTP service on its proxy address, while the Worker validates that every non-loopback listener has `WORKER_CONTROL_SECRET` before it starts. The deployment guides and environment templates describe the same base URL and shared secret contract.
 
 **Tech Stack:** TypeScript, Express, Vitest, Fly.io, Vercel, Prisma, pnpm.
 
@@ -24,13 +24,13 @@ Add tests for the desired boundary behavior:
 ```ts
 import { resolveWorkerAdminHost } from './control-plane.js'
 
-it('rejects a production public listener without a control secret', () => {
-  expect(() => resolveWorkerAdminHost({ host: '0.0.0.0', environment: 'production', hasControlSecret: false }))
+it('rejects a non-loopback listener without a control secret', () => {
+  expect(() => resolveWorkerAdminHost({ host: '0.0.0.0', hasControlSecret: false }))
     .toThrow('WORKER_CONTROL_SECRET is required')
 })
 
 it('allows the Fly listener when the HMAC control secret is configured', () => {
-  expect(resolveWorkerAdminHost({ host: '0.0.0.0', environment: 'production', hasControlSecret: true }))
+  expect(resolveWorkerAdminHost({ host: '0.0.0.0', hasControlSecret: true }))
     .toBe('0.0.0.0')
 })
 ```
@@ -43,7 +43,7 @@ Expected: failure because `resolveWorkerAdminHost` is not exported.
 
 - [x] **Step 3: Implement the smallest host resolver**
 
-Add an exported resolver in `control-plane.ts` that defaults to `127.0.0.1`, accepts loopback/private listeners, and throws whenever the requested host is `0.0.0.0` or `::` and no control secret is configured. Replace the inline host check in `index.ts` with this resolver.
+Add an exported resolver in `control-plane.ts` that defaults to `127.0.0.1`, permits explicit loopback listeners without a secret, and throws whenever a non-loopback host has no control secret. Replace the inline host check in `index.ts` with this resolver before any queue modules load.
 
 - [x] **Step 4: Run the focused Worker test to verify green**
 
@@ -62,7 +62,7 @@ Expected: all control-plane tests pass.
 
 - [x] **Step 1: Declare Fly's proxy listener**
 
-Add `WORKER_ADMIN_HOST = "0.0.0.0"` to `apps/worker/fly.toml` so Fly's `http_service` can reach port 3001. The process still refuses to start in production until its HMAC control secret exists.
+Add `WORKER_ADMIN_HOST = "0.0.0.0"` to `apps/worker/fly.toml` so Fly's `http_service` can reach port 3001. The process still refuses to start until its HMAC control secret exists.
 
 - [x] **Step 2: Document the matching control-plane contract**
 

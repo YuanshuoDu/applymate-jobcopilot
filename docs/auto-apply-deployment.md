@@ -49,7 +49,7 @@ Set the following Worker secrets in Fly.io (or the chosen long-running host):
 | `AGENT_WEB_URL` | Public Web origin, for example `https://app.example.com` |
 | `AGENT_WORKER_SECRET` | Exact same value as the Web app |
 | `AGENT_AUTOMATION_CRON_SECRET` | Exact same value as the Web app |
-| `WORKER_CONTROL_SECRET` | Exact same HMAC value as the Web app; required for every public listener |
+| `WORKER_CONTROL_SECRET` | Exact same HMAC value as the Web app; required for every non-loopback listener |
 | `AGENT_SCHEDULER_INTERVAL_MS` | Optional due-check interval; defaults to `300000` (five minutes) |
 | `CLOAK_MAX_WORKERS` | Start at `1` to respect ATS rate limits |
 | `CAPSOLVER_API_KEY` | Optional CAPTCHA solver |

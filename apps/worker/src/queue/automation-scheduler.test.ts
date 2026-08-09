@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 import {
   automationSchedulerConfig,
   createAutomationScheduler,
+  publicAutomationSchedulerStatus,
   startAutomationScheduler,
 } from "./automation-scheduler.js";
 
@@ -72,5 +73,21 @@ describe("automation scheduler", () => {
   it("can be explicitly disabled for local worker usage", () => {
     const scheduler = startAutomationScheduler({ AGENT_SCHEDULER_ENABLED: "0" });
     expect(scheduler.status().enabled).toBe(false);
+  });
+
+  it("does not expose upstream error text through public health status", () => {
+    expect(publicAutomationSchedulerStatus({
+      enabled: true,
+      running: false,
+      lastAttemptAt: "2026-08-09T00:00:00.000Z",
+      lastSuccessAt: null,
+      lastError: "Due automation endpoint returned 503: internal diagnostic",
+    })).toEqual({
+      enabled: true,
+      running: false,
+      lastAttemptAt: "2026-08-09T00:00:00.000Z",
+      lastSuccessAt: null,
+      healthy: false,
+    });
   });
 });

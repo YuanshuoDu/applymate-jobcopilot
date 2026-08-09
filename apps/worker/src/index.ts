@@ -1,9 +1,3 @@
-import { ensureApplyResultsTable, closePool } from "./db/apply-results.js";
-import { applyWorker, applyQueue, connection } from "./queue/apply-queue.js";
-import { scoutWorker, scoutQueue, SCOUT_QUEUE_NAME } from "./queue/scout-queue.js";
-import { agentRunQueue, AGENT_RUN_QUEUE_NAME, closeAgentRunResources } from "./queue/agent-run-queue.js";
-import { startAutomationScheduler } from "./queue/automation-scheduler.js";
-import { closeAllSlots } from "./cloak/pool.js";
 import express from "express";
 import { createBullBoard } from "@bull-board/api";
 import { BullMQAdapter } from "@bull-board/api/bullMQAdapter";
@@ -11,6 +5,29 @@ import { ExpressAdapter } from "@bull-board/express";
 import { createWorkerControlHandler, resolveWorkerAdminHost } from "./admin/control-plane.js";
 
 async function main() {
+  const adminHost = resolveWorkerAdminHost();
+  const [
+    applyResultsModule,
+    applyQueueModule,
+    scoutQueueModule,
+    agentRunQueueModule,
+    automationSchedulerModule,
+    cloakPoolModule,
+  ] = await Promise.all([
+    import("./db/apply-results.js"),
+    import("./queue/apply-queue.js"),
+    import("./queue/scout-queue.js"),
+    import("./queue/agent-run-queue.js"),
+    import("./queue/automation-scheduler.js"),
+    import("./cloak/pool.js"),
+  ]);
+  const { ensureApplyResultsTable, closePool } = applyResultsModule;
+  const { applyWorker, applyQueue, connection } = applyQueueModule;
+  const { scoutWorker, scoutQueue, SCOUT_QUEUE_NAME } = scoutQueueModule;
+  const { agentRunQueue, AGENT_RUN_QUEUE_NAME, closeAgentRunResources } = agentRunQueueModule;
+  const { publicAutomationSchedulerStatus, startAutomationScheduler } = automationSchedulerModule;
+  const { closeAllSlots } = cloakPoolModule;
+
   console.log("[worker] Starting ApplyMate worker...");
   console.log(`[worker] CLOAK_MAX_WORKERS=${process.env.CLOAK_MAX_WORKERS ?? "1"}`);
   console.log(`[worker] DATABASE_URL=${process.env.DATABASE_URL ? "set" : "not set"}`);
@@ -43,7 +60,7 @@ async function main() {
   const adminApp = express();
   adminApp.get("/healthz", (_req, res) => res.status(200).json({
     status: "ok",
-    automationScheduler: automationScheduler.status(),
+    automationScheduler: publicAutomationSchedulerStatus(automationScheduler.status()),
   }));
   adminApp.post("/internal/admin/control", express.text({ type: "application/json", limit: "16kb" }), createWorkerControlHandler());
 
@@ -73,7 +90,6 @@ async function main() {
   }
 
   const boardPort = Number(process.env.BULL_BOARD_PORT ?? "3001");
-  const adminHost = resolveWorkerAdminHost();
   adminApp.listen(boardPort, adminHost, () =>
     console.log(`[worker-health] http://${adminHost}:${boardPort}/healthz`)
   );
