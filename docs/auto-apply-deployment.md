@@ -106,6 +106,7 @@ appends `/internal/admin/control` itself.
 7. Only then enable `autoApply=true` and `requireApproval=false` for a test job
    whose ATS application may safely be submitted.
 
-If a task remains queued, inspect `agent-runs` and `apply-tasks` in the private
-Bull Board. If a submission is not confirmed, the Worker returns the job to
-`ready_to_apply`; it does not mark it applied speculatively.
+If a task remains queued, inspect `agent-runs` and `apply-tasks` through the
+admin queue view and corroborate the result in Fly logs. Keep Bull Board
+disabled in production. If a submission is not confirmed, the Worker returns
+the job to `ready_to_apply`; it does not mark it applied speculatively.
