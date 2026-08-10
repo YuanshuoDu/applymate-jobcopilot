@@ -43,6 +43,8 @@ export function createAdminAuditData(input: AuditInput): Prisma.AdminAuditLogCre
     after: input.after,
     ipHash: hash(input.ip),
     userAgentHash: hash(input.userAgent),
+    // The append-only database trigger replaces this placeholder with the chained hash.
+    recordHash: '',
   }
 }
 

@@ -947,7 +947,7 @@ model AdminAuditLog {
   after         Json?
   errorCode     String?
   previousHash  String?           @map("previous_hash")
-  recordHash    String?           @unique @map("record_hash")
+  recordHash    String            @unique @map("record_hash")
   createdAt     DateTime          @default(now())
 
   @@index([actorUserId, createdAt(sort: Desc)])

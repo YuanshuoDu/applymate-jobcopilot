@@ -19,4 +19,15 @@ describe('Prisma migration dependencies', () => {
     expect(createIndex).toBeGreaterThanOrEqual(0)
     expect(dependentIndex).toBeGreaterThan(createIndex)
   })
+
+  it('backfills the audit hash chain before enforcing record hashes', () => {
+    const migrationPath = join(migrationsRoot, '20260810013000_backfill_admin_audit_hash_chain', 'migration.sql')
+    const migration = readFileSync(migrationPath, 'utf8')
+
+    expect(migration).toContain('DISABLE TRIGGER "admin_audit_log_append_only"')
+    expect(migration).toContain('ORDER BY "createdAt" ASC, "id" ASC')
+    expect(migration).toContain('SET "previous_hash" = previous, "record_hash" = current_hash')
+    expect(migration).toContain('ENABLE TRIGGER "admin_audit_log_append_only"')
+    expect(migration).toContain('ALTER COLUMN "record_hash" SET NOT NULL')
+  })
 })
