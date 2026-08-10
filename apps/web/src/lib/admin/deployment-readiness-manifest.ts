@@ -42,7 +42,6 @@ export const EXPECTED_MIGRATIONS = [
   '20260810054000_add_scheduled_plan_changes',
   '20260810055000_add_broadcast_delivery_templates',
   '20260810100000_scope_form_patterns_to_user',
-  '20260810120000_add_credential_encryption_columns',
 ] as const
 
 export const RLS_TABLES = [
