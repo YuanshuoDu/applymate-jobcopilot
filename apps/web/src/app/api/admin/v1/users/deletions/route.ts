@@ -21,5 +21,5 @@ export async function GET(request: NextRequest) {
   })
   const result = pageResult(requests, limit)
   await writeAdminAudit({ requestId: actor.requestId, actorUserId: actor.userId, actorRoleKey: actor.roleKey, action: 'users.deletion_queue_viewed', outcome: 'success' })
-  return NextResponse.json({ items: result.items.map((item) => ({ id: item.id, status: item.status, reason: item.reason, requestedAt: item.requestedAt, processedAt: item.processedAt, version: item.version, user: toAdminUserMetadata(item.user) })), nextCursor: result.nextCursor }, { headers: { 'Cache-Control': 'no-store', 'x-request-id': actor.requestId } })
+  return NextResponse.json({ items: result.items.map((item) => ({ id: item.id, status: item.status, reason: item.reason, requestedAt: item.requestedAt, processedAt: item.processedAt, version: item.version, user: item.user ? toAdminUserMetadata(item.user) : null })), nextCursor: result.nextCursor }, { headers: { 'Cache-Control': 'no-store', 'x-request-id': actor.requestId } })
 }

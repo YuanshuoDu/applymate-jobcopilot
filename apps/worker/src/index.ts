@@ -14,6 +14,7 @@ async function main() {
     agentRunQueueModule,
     automationSchedulerModule,
     cloakPoolModule,
+    deadLetterModule,
   ] = await Promise.all([
     import("./db/apply-results.js"),
     import("./queue/apply-queue.js"),
@@ -21,6 +22,7 @@ async function main() {
     import("./queue/agent-run-queue.js"),
     import("./queue/automation-scheduler.js"),
     import("./cloak/pool.js"),
+    import("./queue/dead-letter.js"),
   ]);
   const { ensureApplyResultsTable, closePool } = applyResultsModule;
   const { applyWorker, applyQueue, connection } = applyQueueModule;
@@ -28,6 +30,12 @@ async function main() {
   const { agentRunQueue, AGENT_RUN_QUEUE_NAME, closeAgentRunResources } = agentRunQueueModule;
   const { publicAutomationSchedulerStatus, startAutomationScheduler } = automationSchedulerModule;
   const { closeAllSlots } = cloakPoolModule;
+  const { deadLetterQueue, registerDeadLetterListeners, closeDeadLetterResources } = deadLetterModule;
+  registerDeadLetterListeners([
+    { name: applyQueueModule.QUEUE_NAME, worker: applyWorker },
+    { name: SCOUT_QUEUE_NAME, worker: scoutWorker },
+    { name: AGENT_RUN_QUEUE_NAME, worker: agentRunQueueModule.agentRunWorker },
+  ]);
 
   console.log("[worker] Starting ApplyMate worker...");
   console.log(`[worker] CLOAK_MAX_WORKERS=${process.env.CLOAK_MAX_WORKERS ?? "1"}`);
@@ -82,7 +90,7 @@ async function main() {
     const serverAdapter = new ExpressAdapter();
     serverAdapter.setBasePath("/admin/queues");
     createBullBoard({
-      queues: [new BullMQAdapter(applyQueue), new BullMQAdapter(scoutQueue), new BullMQAdapter(agentRunQueue)],
+      queues: [new BullMQAdapter(applyQueue), new BullMQAdapter(scoutQueue), new BullMQAdapter(agentRunQueue), new BullMQAdapter(deadLetterQueue)],
       serverAdapter,
     });
 
@@ -109,6 +117,7 @@ async function main() {
     await scoutWorker.close();
     await applyWorker.close();
     await closeAgentRunResources();
+    await closeDeadLetterResources();
     automationScheduler.close();
     await closeAllSlots();
     await closePool();

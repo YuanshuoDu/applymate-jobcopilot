@@ -22,7 +22,7 @@ const highRiskPermissions = new Set([
   'broadcasts.create', 'broadcasts.publish', 'broadcasts.schedule', 'broadcasts.retry',
   'break_glass.request', 'break_glass.approve', 'support_cases.assign', 'support_cases.resolve',
   'support_cases.reply', 'support_cases.note', 'support_cases.escalate', 'support_macros.manage',
-  'support_sla.manage', 'admin_access_reviews.manage', 'security.webauthn.manage', 'users.deletion.manage',
+  'support_sla.manage', 'admin_access_reviews.manage', 'security.webauthn.manage', 'users.deletion.manage', 'users.api_keys.revoke',
   'observability.alerts.manage', 'incidents.manage',
 ])
 
@@ -43,6 +43,11 @@ export async function requireAdminMembership(request?: Request): Promise<AdminAc
 }
 
 export async function requireAdmin(permission: Permission, request?: Request): Promise<AdminActor | NextResponse> {
+  return requireAdminAny([permission], request)
+}
+
+export async function requireAdminAny(permissions: readonly Permission[], request?: Request): Promise<AdminActor | NextResponse> {
+  const permission = permissions[0] ?? 'observability.read'
   if (request && ['POST', 'PUT', 'PATCH', 'DELETE'].includes(request.method)) {
     const writeError = validateAdminWrite(request)
     if (writeError) return writeError
@@ -63,19 +68,20 @@ export async function requireAdmin(permission: Permission, request?: Request): P
     },
   })
   const activeAccount = membership?.user.accountStatus === 'active'
-  const grant = activeAccount && membership?.status === AdminMembershipStatus.active && !membership.role.permissions.includes(permission)
-    ? await db.adminBreakGlassGrant.findFirst({ where: { requesterId: userId, permission, approverId: { not: null }, revokedAt: null, expiresAt: { gt: new Date() } }, select: { id: true } })
+  const rolePermission = permissions.find(value => membership?.role.permissions.includes(value))
+  const grant = activeAccount && membership?.status === AdminMembershipStatus.active && !rolePermission
+    ? await db.adminBreakGlassGrant.findFirst({ where: { requesterId: userId, permission: { in: [...permissions] }, approverId: { not: null }, revokedAt: null, expiresAt: { gt: new Date() } }, select: { id: true, permission: true } })
     : null
-  const allowed = activeAccount && membership?.status === AdminMembershipStatus.active && (membership.role.permissions.includes(permission) || Boolean(grant))
+  const allowed = activeAccount && membership?.status === AdminMembershipStatus.active && (Boolean(rolePermission) || Boolean(grant))
   const needsWebauthn = membership?.role.key === 'super_admin'
   const sessionValid = session?.user?.adminSessionVersion === membership?.sessionVersion
-  const reauthValid = !highRiskPermissions.has(permission) || await hasFreshAdminReauth(request, userId)
+  const reauthValid = !permissions.some(value => highRiskPermissions.has(value)) || await hasFreshAdminReauth(request, userId)
   if (!allowed || !sessionValid || (needsWebauthn && membership?.mfaLevel !== AdminMfaLevel.webauthn) || !reauthValid) {
     return denied(requestId, permission, reauthValid ? 'permission_denied' : 'reauth_required', request, userId)
   }
 
   if (grant) await writeAdminAudit({ requestId, actorUserId: userId, actorRoleKey: membership.role.key, action: 'break_glass.used', targetId: grant.id, outcome: 'success' })
-  return Object.freeze({ userId, roleKey: membership.role.key, permissions: Object.freeze([...membership.role.permissions, ...(grant ? [permission] : [])]), requestId })
+  return Object.freeze({ userId, roleKey: membership.role.key, permissions: Object.freeze([...membership.role.permissions, ...(grant ? [grant.permission ?? permission] : [])]), requestId })
 }
 
 async function denied(requestId: string, permission: Permission, errorCode: string, request?: Request, userId?: string) {

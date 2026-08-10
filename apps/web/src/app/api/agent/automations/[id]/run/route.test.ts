@@ -10,10 +10,12 @@ const mocks = vi.hoisted(() => ({
   executionUpdate: vi.fn(),
   ensureExecution: vi.fn(),
   enqueueAgentRun: vi.fn(),
+  hasEffectiveEntitlement: vi.fn(),
 }))
 
 vi.mock("@/lib/agent/execution-control", () => ({ ensureAgentExecution: mocks.ensureExecution }))
 vi.mock("@/lib/agent-run-queue-client", () => ({ enqueueAgentRun: mocks.enqueueAgentRun }))
+vi.mock("@/lib/entitlements", () => ({ hasEffectiveEntitlement: mocks.hasEffectiveEntitlement }))
 
 vi.mock("@/lib/api-helpers", () => ({
   requireAuth: mocks.requireAuth,
@@ -49,6 +51,7 @@ describe("agent automation run API", () => {
     vi.resetModules()
     Object.values(mocks).forEach(mock => mock.mockReset())
     mocks.requireAuth.mockResolvedValue({ userId: "user_1" })
+    mocks.hasEffectiveEntitlement.mockResolvedValue(true)
     mocks.automationFindFirst.mockResolvedValue({
       id: "automation_1",
       name: "Weekday Berlin SWE Scout",

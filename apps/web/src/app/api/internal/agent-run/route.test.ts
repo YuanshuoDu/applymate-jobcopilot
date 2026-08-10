@@ -5,6 +5,7 @@ const mocks = vi.hoisted(() => ({
   executionFindFirst: vi.fn(),
   loadUserAiConfig: vi.fn(),
   runAgentPipeline: vi.fn(),
+  hasEffectiveEntitlement: vi.fn(),
 }));
 
 vi.mock("@/lib/db", () => ({ db: { agentSession: { findFirst: mocks.findFirst }, agentExecution: { findFirst: mocks.executionFindFirst } } }));
@@ -18,6 +19,7 @@ vi.mock("@/lib/model-router", () => ({
   resolveConfig: vi.fn(value => ({ ...value, resolvedKey: "platform-key" })),
 }));
 vi.mock("@/lib/agent/run-service", () => ({ runAgentPipeline: mocks.runAgentPipeline }));
+vi.mock("@/lib/entitlements", () => ({ hasEffectiveEntitlement: mocks.hasEffectiveEntitlement }));
 
 function request(headers?: HeadersInit, body: unknown = { userId: "user_1", sessionId: "session_1" }) {
   return new Request("http://localhost/api/internal/agent-run", {
@@ -34,6 +36,7 @@ describe("POST /api/internal/agent-run", () => {
     mocks.executionFindFirst.mockResolvedValue({ state: { autonomous: true } });
     mocks.loadUserAiConfig.mockResolvedValue({ provider: "minimax", model: "MiniMax-M3", resolvedKey: "platform-key" });
     mocks.runAgentPipeline.mockResolvedValue({ processed: 1, queued: 1, applied: 0, pending: 0, skipped: 0, failed: 0, durationMs: 10 });
+    mocks.hasEffectiveEntitlement.mockResolvedValue(true);
   });
 
   it("rejects an unauthenticated worker request", async () => {

@@ -110,6 +110,8 @@ model User {
   gmailRecommendations      GmailRecommendation[]
   adminMembership           AdminMembership?           @relation("AdminUser")
   adminNotifications        AdminNotification[]        @relation("AdminNotificationRecipient")
+  broadcastDeliveries       AdminBroadcastDelivery[]
+  aiUsageEvents             AiUsageEvent[]             @relation("AiUsageUser")
   adminWebAuthnCredentials  AdminWebAuthnCredential[]
   adminWebAuthnChallenges   AdminWebAuthnChallenge[]
   adminReauthGrants         AdminReauthGrant[]
@@ -165,6 +167,8 @@ model UserPlanSubscription {
   currentPeriodStart      DateTime?              @map("current_period_start")
   currentPeriodEnd        DateTime?              @map("current_period_end")
   cancelAtPeriodEnd       Boolean                @default(false) @map("cancel_at_period_end")
+  scheduledPlan           Plan?                  @map("scheduled_plan")
+  scheduledAt             DateTime?              @map("scheduled_at")
   version                 Int                    @default(1)
   providerCustomerRef     String?                @map("provider_customer_ref")
   providerSubscriptionRef String?                @map("provider_subscription_ref")
@@ -174,6 +178,7 @@ model UserPlanSubscription {
   user                    User                   @relation(fields: [userId], references: [id], onDelete: Cascade)
 
   @@index([status, trialEndsAt])
+  @@index([scheduledAt])
   @@map("user_plan_subscriptions")
 }
 
@@ -1073,8 +1078,42 @@ model AdminBroadcast {
   createdAt             DateTime              @default(now())
   updatedAt             DateTime              @updatedAt
   notifications         Notification[]
+  deliveries            AdminBroadcastDelivery[]
 
   @@index([status, scheduledAt])
+}
+
+model AdminBroadcastDelivery {
+  id           String    @id @default(cuid())
+  broadcastId  String    @map("broadcast_id")
+  userId       String    @map("user_id")
+  status       String    @default("pending")
+  attempts     Int       @default(0)
+  error        String?
+  deliveredAt  DateTime? @map("delivered_at")
+  createdAt    DateTime  @default(now()) @map("created_at")
+  updatedAt    DateTime  @updatedAt @map("updated_at")
+  broadcast    AdminBroadcast @relation(fields: [broadcastId], references: [id], onDelete: Cascade)
+  user         User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([broadcastId, userId])
+  @@index([broadcastId, status, updatedAt])
+  @@map("admin_broadcast_deliveries")
+}
+
+model AdminBroadcastTemplate {
+  id          String   @id @default(cuid())
+  name        String
+  title       String
+  body        String   @db.Text
+  active      Boolean  @default(true)
+  createdById String   @map("created_by_id")
+  updatedById String   @map("updated_by_id")
+  createdAt   DateTime @default(now()) @map("created_at")
+  updatedAt   DateTime @updatedAt @map("updated_at")
+
+  @@index([active, updatedAt(sort: Desc)])
+  @@map("admin_broadcast_templates")
 }
 
 model PlatformFeatureFlag {
@@ -1254,6 +1293,27 @@ model AdminNotification {
 
   @@index([adminUserId, readAt, createdAt(sort: Desc)])
   @@map("admin_notifications")
+}
+
+model AiUsageEvent {
+  id              String    @id @default(cuid())
+  userId          String?   @map("user_id")
+  featureKey      String    @map("feature_key")
+  provider        String
+  model           String
+  inputTokens     Int       @default(0) @map("input_tokens")
+  outputTokens    Int       @default(0) @map("output_tokens")
+  estimatedCostUsd Float    @default(0) @map("estimated_cost_usd")
+  latencyMs       Int       @map("latency_ms")
+  status          String
+  errorCode       String?   @map("error_code")
+  createdAt       DateTime  @default(now()) @map("created_at")
+  user            User?     @relation("AiUsageUser", fields: [userId], references: [id], onDelete: SetNull)
+
+  @@index([createdAt, status])
+  @@index([featureKey, createdAt])
+  @@index([provider, model, createdAt])
+  @@map("ai_usage_events")
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

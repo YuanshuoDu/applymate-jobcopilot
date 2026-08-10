@@ -4,6 +4,7 @@ import { err, ok } from "@/lib/api-helpers"
 import { nextRunAfterCurrent } from "@/lib/agent/automation-schedule"
 import { enqueueAgentRun } from "@/lib/agent-run-queue-client"
 import { ensureAgentExecution } from "@/lib/agent/execution-control"
+import { hasEffectiveEntitlement } from '@/lib/entitlements'
 
 type AutomationForRun = {
   id: string
@@ -121,6 +122,7 @@ async function runDueAutomations(req: NextRequest) {
 
   const started = []
   for (const automation of automations) {
+    if (!await hasEffectiveEntitlement(automation.userId, 'auto_apply')) continue
     const result = await startAutomation(automation, now)
     if (result) started.push(result)
   }

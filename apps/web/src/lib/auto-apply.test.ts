@@ -14,6 +14,7 @@ const mocks = vi.hoisted(() => ({
   activityCreate: vi.fn(),
   enqueueApplyTask: vi.fn(),
   runtimeFeatureEnabled: vi.fn(),
+  hasEffectiveEntitlement: vi.fn(),
 }));
 
 vi.mock("@/lib/db", () => ({
@@ -32,6 +33,7 @@ vi.mock("@/lib/db", () => ({
 
 vi.mock("@/lib/apply-queue-client", () => ({ enqueueApplyTask: mocks.enqueueApplyTask }));
 vi.mock("@/lib/runtime-feature-flags", () => ({ isRuntimeFeatureEnabled: mocks.runtimeFeatureEnabled }));
+vi.mock("@/lib/entitlements", () => ({ hasEffectiveEntitlement: mocks.hasEffectiveEntitlement }));
 
 describe("auto-apply authorization", () => {
   const input = {
@@ -63,6 +65,7 @@ describe("auto-apply authorization", () => {
     });
     mocks.enqueueApplyTask.mockResolvedValue("worker_1");
     mocks.runtimeFeatureEnabled.mockResolvedValue(true);
+    mocks.hasEffectiveEntitlement.mockResolvedValue(true);
     mocks.activityCreate.mockResolvedValue({});
     mocks.taskUpdate.mockResolvedValue({});
     mocks.taskEventCreate.mockResolvedValue({});

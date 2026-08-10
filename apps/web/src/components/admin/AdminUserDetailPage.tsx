@@ -8,6 +8,7 @@ import type { UserIntegrationStatus } from '@/lib/admin/integration-status'
 import type { PrivacyPreferences } from '@/lib/types'
 import { editablePrivacyPreferences, isPrivacyPreferenceAvailable } from '@/lib/privacy-consent'
 import { useAdminPrompt } from './AdminPromptDialog'
+import { AdminUserApiKeysPanel } from './AdminUserApiKeysPanel'
 
 type Detail = {
   user: {
@@ -29,7 +30,7 @@ type Detail = {
 
 type Override = { id: string; featureKey: string; enabled: boolean; limit: number | null; expiresAt: string | null; reason: string }
 type PlanChange = { id: string; fromPlan: string; toPlan: string; reason: string; actorUserId: string; createdAt: string }
-type Subscription = { id: string; plan: string; status: 'trialing' | 'active' | 'past_due' | 'cancelled' | 'expired'; trialStartsAt: string | null; trialEndsAt: string | null; currentPeriodStart: string | null; currentPeriodEnd: string | null; cancelAtPeriodEnd: boolean; version: number; updatedAt: string }
+type Subscription = { id: string; plan: string; status: 'trialing' | 'active' | 'past_due' | 'cancelled' | 'expired'; trialStartsAt: string | null; trialEndsAt: string | null; currentPeriodStart: string | null; currentPeriodEnd: string | null; cancelAtPeriodEnd: boolean; scheduledPlan: string | null; scheduledAt: string | null; version: number; updatedAt: string }
 
 function dateTimeLocal(value: string | null | undefined) {
   if (!value) return ''
@@ -120,6 +121,7 @@ function AccountOperations({ userId, user, permissions }: { userId: string; user
     setOverrides(current => current.filter(currentItem => currentItem.featureKey !== item.featureKey))
     setNotice('User permission override removed.')
   }
+
 
   const canSuspend = permissions.includes('users.suspend')
   const canRestore = permissions.includes('users.restore')
@@ -238,6 +240,6 @@ export function AdminUserDetailPage({ userId, canUpdatePreferences, permissions 
   const { data, loading, error } = useApi<Detail>(`/api/admin/v1/users/${userId}`)
   const user = data?.user
   return <div className="admin-page"><header className="admin-header"><div><Link className="admin-back" href="/admin/users"><ArrowLeft size={16} /> Users</Link><h1>{loading ? 'Loading user...' : user?.name ?? 'User'}</h1><p>Masked account metadata and safe operational history</p></div><div className="admin-header-time"><CalendarDays size={18} /> Internal console</div></header>
-    {error ? <div className="admin-alert">{error}</div> : user && <section className="admin-detail"><div className="admin-detail-grid"><section><h2>Account</h2><dl><dt>Email</dt><dd>{user.email}</dd><dt>Plan</dt><dd>{user.plan}</dd><dt>Account state</dt><dd>{user.accountStatus}</dd><dt>Location</dt><dd>{user.location ?? 'Not provided'}</dd><dt>Joined</dt><dd>{new Date(user.createdAt).toLocaleString()}</dd></dl></section><section><h2>Safe status</h2><dl><dt>Jobs</dt><dd>{user.jobsCount}</dd><dt>Resume</dt><dd>{user.resumeExists ? 'On file' : 'Not uploaded'}</dd><dt>Gmail</dt><dd>{user.gmail.connected ? (user.gmail.hasError ? 'Needs attention' : 'Connected') : 'Not connected'}</dd><dt>Applications</dt><dd>{data.applications.count}</dd></dl></section></div><AccountOperations userId={userId} user={user} permissions={permissions} /><SettingsPanel userId={userId} canUpdatePreferences={canUpdatePreferences} /><section className="admin-detail-history"><h2>Recent application metadata</h2><div className="admin-table-wrap"><table className="admin-table"><thead><tr><th>Status</th><th>ATS</th><th>Flow</th><th>Mode</th><th>Created</th></tr></thead><tbody>{data.applications.recent.length === 0 ? <tr><td colSpan={5}>No application records.</td></tr> : data.applications.recent.map((item) => <tr key={item.id}><td>{item.status}</td><td>{item.atsType ?? 'unknown'}</td><td>{item.flowUsed ?? 'unknown'}</td><td>{item.mode}</td><td>{new Date(item.createdAt).toLocaleString()}</td></tr>)}</tbody></table></div></section></section>}
+    {error ? <div className="admin-alert">{error}</div> : user && <section className="admin-detail"><div className="admin-detail-grid"><section><h2>Account</h2><dl><dt>Email</dt><dd>{user.email}</dd><dt>Plan</dt><dd>{user.plan}</dd><dt>Account state</dt><dd>{user.accountStatus}</dd><dt>Location</dt><dd>{user.location ?? 'Not provided'}</dd><dt>Joined</dt><dd>{new Date(user.createdAt).toLocaleString()}</dd></dl></section><section><h2>Safe status</h2><dl><dt>Jobs</dt><dd>{user.jobsCount}</dd><dt>Resume</dt><dd>{user.resumeExists ? 'On file' : 'Not uploaded'}</dd><dt>Gmail</dt><dd>{user.gmail.connected ? (user.gmail.hasError ? 'Needs attention' : 'Connected') : 'Not connected'}</dd><dt>Applications</dt><dd>{data.applications.count}</dd></dl></section></div><AccountOperations userId={userId} user={user} permissions={permissions} /><AdminUserApiKeysPanel userId={userId} canRevoke={permissions.includes('users.api_keys.revoke')} /><SettingsPanel userId={userId} canUpdatePreferences={canUpdatePreferences} /><section className="admin-detail-history"><h2>Recent application metadata</h2><div className="admin-table-wrap"><table className="admin-table"><thead><tr><th>Status</th><th>ATS</th><th>Flow</th><th>Mode</th><th>Created</th></tr></thead><tbody>{data.applications.recent.length === 0 ? <tr><td colSpan={5}>No application records.</td></tr> : data.applications.recent.map((item) => <tr key={item.id}><td>{item.status}</td><td>{item.atsType ?? 'unknown'}</td><td>{item.flowUsed ?? 'unknown'}</td><td>{item.mode}</td><td>{new Date(item.createdAt).toLocaleString()}</td></tr>)}</tbody></table></div></section></section>}
   </div>
 }

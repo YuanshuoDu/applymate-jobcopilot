@@ -15,6 +15,7 @@ vi.mock('@/lib/api-helpers', () => ({
 vi.mock('@/lib/db', () => ({
   db: { agentSession: { findFirst: mocks.findFirst } },
 }))
+vi.mock('@/lib/entitlements', () => ({ hasEffectiveEntitlement: vi.fn().mockResolvedValue(true) }))
 
 // This test exits before the SSE callback runs. Mock its heavy dependencies so
 // the session-ownership assertion stays isolated when the full suite is busy.

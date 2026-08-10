@@ -19,7 +19,7 @@ const tenantModels = new Set([
   'AiBudget', 'Notification', 'GmailSyncState', 'GmailMessage', 'GmailRecommendation',
   'AgentRunQuestion', 'AgentRun', 'AgentExecution', 'AgentSession', 'SubAgentTask',
   'AgentTranscriptEvent', 'AgentApproval', 'AgentAutomation', 'CustomAgentRole', 'Direction',
-  'CoverLetter', 'SupportCase', 'SupportCaseMessage', 'AdminDataDeletionRequest',
+  'CoverLetter', 'SupportCase', 'SupportCaseMessage', 'AdminDataDeletionRequest', 'AiUsageEvent',
 ])
 
 function modelDelegate(tx: unknown, model: string, operation: string) {

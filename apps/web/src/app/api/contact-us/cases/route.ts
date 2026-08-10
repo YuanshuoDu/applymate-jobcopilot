@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from 'next/server'
 import { isErrorResponse, requireAuth } from '@/lib/api-helpers'
 import { getSlaDueAt, parseNewCase } from '@/lib/contact-us'
 import { db } from '@/lib/db'
+import { notifySupportAdmins } from '@/lib/admin/admin-notifications'
 
 export async function GET(request: NextRequest) {
   const auth = await requireAuth(request)
@@ -25,7 +26,9 @@ export async function POST(request: NextRequest) {
       slaDueAt: getSlaDueAt(input.category, 'normal'),
       messages: { create: { authorType: 'customer_reply', authorUserId: auth.userId, body: input.message.body, redacted: input.message.redacted } },
     },
-    select: { id: true, subject: true, status: true, createdAt: true },
+    select: { id: true, subject: true, status: true, createdAt: true, messages: { select: { id: true }, orderBy: { createdAt: 'asc' }, take: 1 } },
   })
+  const firstMessage = supportCase.messages[0]
+  if (firstMessage) await notifySupportAdmins({ caseId: supportCase.id, messageId: firstMessage.id, subject: supportCase.subject, event: 'new_case' })
   return NextResponse.json({ case: supportCase }, { status: 201, headers: { 'Cache-Control': 'no-store' } })
 }

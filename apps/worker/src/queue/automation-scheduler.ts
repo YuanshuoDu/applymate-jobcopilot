@@ -2,6 +2,7 @@ const DEFAULT_INTERVAL_MS = 5 * 60_000;
 const MINIMUM_INTERVAL_MS = 60_000;
 const AUDIT_CHECKPOINT_INTERVAL_MS = 24 * 60 * 60_000;
 const RETENTION_CLEANUP_INTERVAL_MS = 24 * 60 * 60_000;
+const SUBSCRIPTION_LIFECYCLE_INTERVAL_MS = 15 * 60_000;
 
 export interface AutomationSchedulerStatus {
   enabled: boolean;
@@ -56,6 +57,7 @@ export function automationSchedulerConfig(
       { name: "alerts", endpoint: `${webUrl}/api/admin/observability/alerts/evaluate`, secret: maintenanceSecret },
       { name: "audit-checkpoint", endpoint: `${webUrl}/api/admin/audit-checkpoint`, secret: auditCheckpointSecret, intervalMs: AUDIT_CHECKPOINT_INTERVAL_MS },
       { name: "retention-cleanup", endpoint: `${webUrl}/api/internal/maintenance/retention`, secret: maintenanceSecret, intervalMs: RETENTION_CLEANUP_INTERVAL_MS },
+      { name: "subscription-lifecycle", endpoint: `${webUrl}/api/internal/maintenance/subscriptions`, secret: maintenanceSecret, intervalMs: SUBSCRIPTION_LIFECYCLE_INTERVAL_MS },
     ],
     intervalMs,
   };

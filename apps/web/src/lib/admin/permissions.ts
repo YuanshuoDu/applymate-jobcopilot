@@ -1,6 +1,6 @@
 export const PERMISSIONS = [
   'users.read', 'users.read_pii_masked', 'users.update_preferences', 'users.suspend', 'users.restore', 'users.feature_override', 'users.export_anonymized',
-  'users.deletion.manage',
+  'users.deletion.manage', 'users.api_keys.revoke',
   'billing.read', 'billing.update', 'billing.refund_mark',
   'jobs.read_metadata', 'jobs.read_content_masked', 'applications.read', 'applications.retry', 'applications.cancel', 'applications.manual_review',
   'ats.read', 'ats.update', 'ats.pause', 'ats.resume', 'ats.test', 'ats.registry.manage',
@@ -22,7 +22,7 @@ const rolePermissions: Record<AdminRoleKey, readonly Permission[]> = {
   operations: ['ats.read', 'ats.update', 'ats.pause', 'ats.resume', 'ats.test', 'applications.read', 'applications.retry', 'applications.cancel', 'applications.manual_review', 'queues.read', 'queues.retry', 'queues.pause', 'queues.resume', 'observability.read', 'broadcasts.create', 'broadcasts.update', 'broadcasts.preview', 'support_cases.escalate'],
   analyst: ['observability.read', 'ai_budget.read', 'users.export_anonymized'],
   billing: ['billing.read', 'billing.update', 'billing.refund_mark'],
-  security_admin: ['admin_members.read', 'admin_members.manage', 'admin_roles.manage', 'admin_access_reviews.read', 'admin_access_reviews.manage', 'security.webauthn.manage', 'users.deletion.manage', 'sessions.revoke', 'audit.read', 'break_glass.request', 'break_glass.approve'],
+  security_admin: ['admin_members.read', 'admin_members.manage', 'admin_roles.manage', 'admin_access_reviews.read', 'admin_access_reviews.manage', 'security.webauthn.manage', 'users.deletion.manage', 'users.api_keys.revoke', 'sessions.revoke', 'audit.read', 'break_glass.request', 'break_glass.approve'],
   platform_admin: ['ats.read', 'ats.update', 'ats.pause', 'ats.resume', 'ats.test', 'ats.registry.manage', 'feature_flags.read', 'feature_flags.update', 'feature_flags.approve', 'ai_budget.read', 'ai_budget.update', 'users.feature_override', 'users.deletion.manage', 'broadcasts.create', 'broadcasts.update', 'broadcasts.preview', 'broadcasts.approve', 'broadcasts.publish', 'broadcasts.schedule', 'broadcasts.cancel', 'queues.read', 'observability.read', 'observability.alerts.manage', 'incidents.manage', 'support_sla.manage'],
   super_admin: PERMISSIONS,
 }

@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { isErrorResponse, requireAuth } from '@/lib/api-helpers'
 import { parseReply } from '@/lib/contact-us'
+import { notifySupportAdmins } from '@/lib/admin/admin-notifications'
 import { db } from '@/lib/db'
 
 export async function GET(request: NextRequest, context: { params: Promise<{ id: string }> }) {
@@ -23,6 +24,7 @@ export async function POST(request: NextRequest, context: { params: Promise<{ id
   if (!message) return NextResponse.json({ error: 'Invalid message' }, { status: 400 })
   const result = await db.supportCase.updateMany({ where: { id, requesterUserId: auth.userId, status: { not: 'closed' } }, data: { status: 'in_progress' } })
   if (!result.count) return NextResponse.json({ error: 'Not found' }, { status: 404 })
-  const created = await db.supportCaseMessage.create({ data: { caseId: id, authorType: 'customer_reply', authorUserId: auth.userId, body: message.body, redacted: message.redacted }, select: { id: true, authorType: true, body: true, redacted: true, createdAt: true } })
+  const created = await db.supportCaseMessage.create({ data: { caseId: id, authorType: 'customer_reply', authorUserId: auth.userId, body: message.body, redacted: message.redacted }, select: { id: true, authorType: true, body: true, redacted: true, createdAt: true, supportCase: { select: { subject: true } } } })
+  await notifySupportAdmins({ caseId: id, messageId: created.id, subject: created.supportCase.subject, event: 'customer_reply' })
   return NextResponse.json({ message: created }, { status: 201 })
 }

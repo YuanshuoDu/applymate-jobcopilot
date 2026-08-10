@@ -70,6 +70,22 @@ provider returns `ERR max requests limit exceeded`, do not deploy repeatedly:
 provision or upgrade a Redis resource first, then set the same `REDIS_URL` in
 Vercel and Fly before restarting the Worker.
 
+### Upstash Redis
+
+Upstash is compatible with this deployment when its TLS Redis protocol endpoint
+is used as `REDIS_URL` in both Vercel and Fly:
+
+```text
+REDIS_URL=rediss://default:<password>@<endpoint>:6379
+```
+
+Use the connection string shown by the Upstash console and URL-encode special
+characters in the password. Do not put `UPSTASH_REDIS_REST_URL` or
+`UPSTASH_REDIS_REST_TOKEN` into `REDIS_URL`: those credentials are for the
+HTTP REST SDK, while BullMQ and ioredis require the Redis protocol endpoint.
+The Web and Worker must point to the same Upstash database so queue state,
+rate limits, pause state, and dead-letter records remain shared.
+
 The Worker invokes `/api/agent/automations/due`, `/api/notifications/broadcasts/due`,
 and `/api/admin/observability/alerts/evaluate` every five minutes by default.
 This avoids Vercel Hobby Cron's daily-only restriction while retaining a secured,

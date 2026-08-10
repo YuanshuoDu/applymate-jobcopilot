@@ -28,15 +28,18 @@ async function processDue(request: NextRequest) {
       while (true) {
         const recipients = await db.user.findMany({ where, select: { id: true }, orderBy: { id: 'asc' }, cursor: cursor ? { id: cursor } : undefined, skip: cursor ? 1 : undefined, take: BATCH_SIZE })
         if (!recipients.length) break
-        const created = await db.notification.createMany({ data: recipients.map(recipient => ({ userId: recipient.id, broadcastId: item.id, type: 'platform_broadcast', title: item.title, body: item.body })), skipDuplicates: true })
-        deliveredCount += created.count
+        await db.adminBroadcastDelivery.createMany({ data: recipients.map(recipient => ({ broadcastId: item.id, userId: recipient.id, status: 'pending' })), skipDuplicates: true })
+        await db.notification.createMany({ data: recipients.map(recipient => ({ userId: recipient.id, broadcastId: item.id, type: 'platform_broadcast', title: item.title, body: item.body })), skipDuplicates: true })
+        const delivered = await db.adminBroadcastDelivery.updateMany({ where: { broadcastId: item.id, userId: { in: recipients.map(recipient => recipient.id) } }, data: { status: 'delivered', deliveredAt: new Date(), attempts: { increment: 1 }, error: null } })
+        deliveredCount += delivered.count
         cursor = recipients[recipients.length - 1]?.id
         if (recipients.length < BATCH_SIZE) break
       }
       await db.adminBroadcast.update({ where: { id: item.id }, data: { status: 'published', recipientCount, deliveredCount: { increment: deliveredCount } } })
       processed.push({ id: item.id, status: 'published', deliveredCount })
     } catch {
-      await db.adminBroadcast.update({ where: { id: item.id }, data: { status: 'failed' } })
+      const failed = await db.adminBroadcastDelivery.updateMany({ where: { broadcastId: item.id, status: 'pending' }, data: { status: 'failed', attempts: { increment: 1 }, error: 'Broadcast delivery failed' } }).catch(() => ({ count: 0 }))
+      await db.adminBroadcast.update({ where: { id: item.id }, data: { status: 'failed', failedCount: { increment: failed.count } } })
       processed.push({ id: item.id, status: 'failed' })
     }
   }

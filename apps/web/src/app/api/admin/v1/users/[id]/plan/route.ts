@@ -6,6 +6,7 @@ import { validateAdminWrite } from '@/lib/admin/csrf'
 import { AdminMutationConflict, runAdminMutation } from '@/lib/admin/write-transaction'
 import { parsePlan, reasonFrom } from '@/lib/admin/user-lifecycle'
 import { db } from '@/lib/db'
+import { shouldScheduleDowngrade } from '@/lib/plan-change-policy'
 
 type Params = { params: Promise<{ id: string }> }
 type ParsedDateInput = Date | null | undefined | { error: string }
@@ -19,6 +20,8 @@ const subscriptionSelect = {
   currentPeriodStart: true,
   currentPeriodEnd: true,
   cancelAtPeriodEnd: true,
+  scheduledPlan: true,
+  scheduledAt: true,
   version: true,
   updatedAt: true,
 } as const
@@ -74,8 +77,9 @@ export async function PATCH(request: NextRequest, { params }: Params) {
   const cancelAtPeriodEnd = typeof body?.cancelAtPeriodEnd === 'boolean' ? body.cancelAtPeriodEnd : existingSubscription?.cancelAtPeriodEnd ?? false
   if (status === PlanSubscriptionStatus.trialing && (!trialEndsAt || trialEndsAt <= new Date())) return NextResponse.json({ error: 'A future trial end is required' }, { status: 400 })
   if (status !== PlanSubscriptionStatus.trialing && parsedTrialEndsAt instanceof Date) return NextResponse.json({ error: 'trialEndsAt is only valid for a trialing subscription' }, { status: 400 })
-  if (existing.plan === toPlan && existingSubscription && status === existingSubscription.status && trialEndsAt?.getTime() === existingSubscription.trialEndsAt?.getTime() && currentPeriodEnd?.getTime() === existingSubscription.currentPeriodEnd?.getTime() && cancelAtPeriodEnd === existingSubscription.cancelAtPeriodEnd) return NextResponse.json({ error: 'Subscription is unchanged' }, { status: 409 })
   const now = new Date()
+  const scheduledDowngrade = existingSubscription ? shouldScheduleDowngrade({ from: existing.plan, to: toPlan, currentPeriodEnd, now, applyImmediately: body?.applyImmediately === true }) : false
+  if (existing.plan === toPlan && existingSubscription && status === existingSubscription.status && trialEndsAt?.getTime() === existingSubscription.trialEndsAt?.getTime() && currentPeriodEnd?.getTime() === existingSubscription.currentPeriodEnd?.getTime() && cancelAtPeriodEnd === existingSubscription.cancelAtPeriodEnd && !existingSubscription.scheduledPlan) return NextResponse.json({ error: 'Subscription is unchanged' }, { status: 409 })
   let result
   try {
     result = await runAdminMutation({
@@ -83,11 +87,11 @@ export async function PATCH(request: NextRequest, { params }: Params) {
       action: existing.plan === toPlan ? 'users.subscription_updated' : 'users.plan_updated',
       idempotencyKey,
       targetId: id,
-      audit: { requestId: actor.requestId, actorRoleKey: actor.roleKey, targetType: 'user', targetId: id, tenantUserId: id, reason, outcome: 'success', before: { plan: existing.plan, subscription: existingSubscription }, after: { plan: toPlan, status, trialEndsAt, currentPeriodEnd, cancelAtPeriodEnd } },
+      audit: { requestId: actor.requestId, actorRoleKey: actor.roleKey, targetType: 'user', targetId: id, tenantUserId: id, reason, outcome: 'success', before: { plan: existing.plan, subscription: existingSubscription }, after: { plan: scheduledDowngrade ? existing.plan : toPlan, scheduledPlan: scheduledDowngrade ? toPlan : null, status, trialEndsAt, currentPeriodEnd, cancelAtPeriodEnd: scheduledDowngrade || cancelAtPeriodEnd } },
       mutate: async (tx) => {
-        if (existing.plan !== toPlan) await tx.userPlanChange.create({ data: { userId: id, fromPlan: existing.plan, toPlan, reason, actorUserId: actor.userId } })
-        const user = await tx.user.update({ where: { id }, data: { plan: toPlan }, select: adminUserMetadataSelect })
-        const subscriptionData = { plan: toPlan, status, trialEndsAt, currentPeriodEnd, cancelAtPeriodEnd, updatedById: actor.userId }
+        if (existing.plan !== toPlan && !scheduledDowngrade) await tx.userPlanChange.create({ data: { userId: id, fromPlan: existing.plan, toPlan, reason, actorUserId: actor.userId } })
+        const user = await tx.user.update({ where: { id }, data: { plan: scheduledDowngrade ? existing.plan : toPlan }, select: adminUserMetadataSelect })
+        const subscriptionData = { plan: scheduledDowngrade ? existing.plan : toPlan, status, trialEndsAt, currentPeriodEnd, cancelAtPeriodEnd: scheduledDowngrade || cancelAtPeriodEnd, scheduledPlan: scheduledDowngrade ? toPlan : null, scheduledAt: scheduledDowngrade ? currentPeriodEnd : null, updatedById: actor.userId }
         if (existingSubscription) {
           const updated = await tx.userPlanSubscription.updateMany({
             where: { userId: id, version: existingSubscription.version },
@@ -106,7 +110,7 @@ export async function PATCH(request: NextRequest, { params }: Params) {
     throw error
   }
   if (result.duplicate) return NextResponse.json({ duplicate: true }, { headers: { 'Cache-Control': 'no-store' } })
-  return NextResponse.json({ user: toAdminUserMetadata(result.value.user), subscription: result.value.subscription }, { headers: { 'Cache-Control': 'no-store', 'x-request-id': actor.requestId } })
+  return NextResponse.json({ user: toAdminUserMetadata(result.value.user), subscription: result.value.subscription, scheduled: scheduledDowngrade }, { headers: { 'Cache-Control': 'no-store', 'x-request-id': actor.requestId } })
 }
 
 export async function GET(request: NextRequest, { params }: Params) {

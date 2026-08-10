@@ -10,10 +10,12 @@ const mocks = vi.hoisted(() => ({
   enqueueAgentRun: vi.fn(),
   executionUpdate: vi.fn(),
   ensureExecution: vi.fn(),
+  hasEffectiveEntitlement: vi.fn(),
 }))
 
 vi.mock("@/lib/agent-run-queue-client", () => ({ enqueueAgentRun: mocks.enqueueAgentRun }))
 vi.mock("@/lib/agent/execution-control", () => ({ ensureAgentExecution: mocks.ensureExecution }))
+vi.mock("@/lib/entitlements", () => ({ hasEffectiveEntitlement: mocks.hasEffectiveEntitlement }))
 
 vi.mock("@/lib/api-helpers", () => ({
   ok: (data: unknown, status = 200) => Response.json(data, { status }),
@@ -70,6 +72,7 @@ describe("agent automation due scheduler API", () => {
     mocks.sessionUpdate.mockResolvedValue({})
     mocks.ensureExecution.mockResolvedValue({ id: "execution_1" })
     mocks.executionUpdate.mockResolvedValue({})
+    mocks.hasEffectiveEntitlement.mockResolvedValue(true)
   })
 
   afterEach(() => {

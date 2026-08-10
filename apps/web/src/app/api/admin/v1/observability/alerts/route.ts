@@ -5,7 +5,7 @@ import { validateAdminWrite } from '@/lib/admin/csrf'
 import { db } from '@/lib/db'
 import { runAdminMutation } from '@/lib/admin/write-transaction'
 
-const metrics = ['success_rate', 'captcha_rate', 'avg_duration_ms'] as const
+const metrics = ['success_rate', 'captcha_rate', 'avg_duration_ms', 'ai_error_rate', 'ai_cost_usd', 'queue_stuck_jobs', 'queue_failed_jobs', 'queue_dead_letter_jobs'] as const
 const operators = ['gt', 'gte', 'lt', 'lte'] as const
 
 export async function GET(request: NextRequest) {

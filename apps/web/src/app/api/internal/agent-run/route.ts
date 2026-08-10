@@ -3,6 +3,7 @@ import { db } from "@/lib/db";
 import { err, ok } from "@/lib/api-helpers";
 import { APPLYMATE_BACKING, loadUserAiConfig, resolveConfig } from "@/lib/model-router";
 import { runAgentPipeline } from "@/lib/agent/run-service";
+import { hasEffectiveEntitlement } from '@/lib/entitlements'
 
 export const maxDuration = 300;
 
@@ -42,6 +43,7 @@ export async function POST(req: NextRequest) {
   });
   const state = execution?.state
   const autonomous = Boolean(state && typeof state === "object" && !Array.isArray(state) && (state as { autonomous?: unknown }).autonomous === true)
+  if (autonomous && !await hasEffectiveEntitlement(input.userId, 'auto_apply')) return err("Your current plan does not include autonomous applications.", 403)
 
   const configured = await loadUserAiConfig(input.userId, "autoApply");
   const aiConfig = configured.resolvedKey ? configured : resolveConfig(APPLYMATE_BACKING);
