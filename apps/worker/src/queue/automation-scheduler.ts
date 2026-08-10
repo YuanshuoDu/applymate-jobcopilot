@@ -1,5 +1,6 @@
 const DEFAULT_INTERVAL_MS = 5 * 60_000;
 const MINIMUM_INTERVAL_MS = 60_000;
+const AUDIT_CHECKPOINT_INTERVAL_MS = 24 * 60 * 60_000;
 
 export interface AutomationSchedulerStatus {
   enabled: boolean;
@@ -27,7 +28,7 @@ export interface AutomationScheduler {
 }
 
 export interface AutomationSchedulerConfig {
-  tasks: ReadonlyArray<{ name: string; endpoint: string; secret: string }>;
+  tasks: ReadonlyArray<{ name: string; endpoint: string; secret: string; intervalMs?: number }>;
   intervalMs: number;
   request?: typeof fetch;
 }
@@ -46,11 +47,13 @@ export function automationSchedulerConfig(
     : DEFAULT_INTERVAL_MS;
 
   const maintenanceSecret = env.WEB_MAINTENANCE_CRON_SECRET ?? env.CRON_SECRET ?? secret;
+  const auditCheckpointSecret = env.AUDIT_CHECKPOINT_CRON_SECRET ?? maintenanceSecret;
   return {
     tasks: [
       { name: "automations", endpoint: `${webUrl}/api/agent/automations/due`, secret },
       { name: "broadcasts", endpoint: `${webUrl}/api/notifications/broadcasts/due`, secret: maintenanceSecret },
       { name: "alerts", endpoint: `${webUrl}/api/admin/observability/alerts/evaluate`, secret: maintenanceSecret },
+      { name: "audit-checkpoint", endpoint: `${webUrl}/api/admin/audit-checkpoint`, secret: auditCheckpointSecret, intervalMs: AUDIT_CHECKPOINT_INTERVAL_MS },
     ],
     intervalMs,
   };
@@ -65,6 +68,7 @@ export function createAutomationScheduler(config: AutomationSchedulerConfig): Au
     lastSuccessAt: null,
     lastError: null,
   };
+  const lastSuccessfulTaskAt = new Map<string, number>();
 
   async function run() {
     if (state.running) return;
@@ -74,6 +78,9 @@ export function createAutomationScheduler(config: AutomationSchedulerConfig): Au
     try {
       const failures: string[] = [];
       for (const task of config.tasks) {
+        const taskInterval = task.intervalMs ?? config.intervalMs;
+        const lastSuccessfulAt = lastSuccessfulTaskAt.get(task.name);
+        if (lastSuccessfulAt !== undefined && Date.now() - lastSuccessfulAt < taskInterval) continue;
         const response = await request(task.endpoint, {
           method: "POST",
           headers: { Authorization: `Bearer ${task.secret}` },
@@ -82,7 +89,9 @@ export function createAutomationScheduler(config: AutomationSchedulerConfig): Au
         if (!response.ok) {
           const body = await response.text().catch(() => "");
           failures.push(`${task.name} returned ${response.status}: ${body.slice(0, 300)}`);
+          continue;
         }
+        lastSuccessfulTaskAt.set(task.name, Date.now());
       }
       if (failures.length) throw new Error(failures.join("; "));
 

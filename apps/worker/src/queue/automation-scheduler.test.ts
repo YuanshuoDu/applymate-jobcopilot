@@ -24,6 +24,7 @@ describe("automation scheduler", () => {
         { name: "automations", endpoint: "https://app.applymate.test/api/agent/automations/due", secret: "scheduler-secret" },
         { name: "broadcasts", endpoint: "https://app.applymate.test/api/notifications/broadcasts/due", secret: "scheduler-secret" },
         { name: "alerts", endpoint: "https://app.applymate.test/api/admin/observability/alerts/evaluate", secret: "scheduler-secret" },
+        { name: "audit-checkpoint", endpoint: "https://app.applymate.test/api/admin/audit-checkpoint", secret: "scheduler-secret", intervalMs: 24 * 60 * 60_000 },
       ],
       intervalMs: 60_000,
     });
@@ -38,7 +39,23 @@ describe("automation scheduler", () => {
       { name: "automations", endpoint: "https://app.applymate.test/api/agent/automations/due", secret: "automation-secret" },
       { name: "broadcasts", endpoint: "https://app.applymate.test/api/notifications/broadcasts/due", secret: "maintenance-secret" },
       { name: "alerts", endpoint: "https://app.applymate.test/api/admin/observability/alerts/evaluate", secret: "maintenance-secret" },
+      { name: "audit-checkpoint", endpoint: "https://app.applymate.test/api/admin/audit-checkpoint", secret: "maintenance-secret", intervalMs: 24 * 60 * 60_000 },
     ]);
+  });
+
+  it("does not run the daily audit checkpoint more than once per day", async () => {
+    const request = vi.fn().mockResolvedValue(new Response(JSON.stringify({ verified: true })));
+    const scheduler = createAutomationScheduler({
+      tasks: [{ name: "audit-checkpoint", endpoint: "https://app.applymate.test/api/admin/audit-checkpoint", secret: "maintenance-secret", intervalMs: 24 * 60 * 60_000 }],
+      intervalMs: 300_000,
+      request,
+    });
+
+    await scheduler.run();
+    await scheduler.run();
+
+    expect(request).toHaveBeenCalledTimes(1);
+    expect(scheduler.status().lastError).toBeNull();
   });
 
   it("requires the production web origin and secret", () => {

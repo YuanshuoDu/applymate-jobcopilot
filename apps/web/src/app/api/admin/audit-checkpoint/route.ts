@@ -3,8 +3,13 @@ import { verifyAdminAuditChain } from '@/lib/admin/audit-integrity'
 import { db } from '@/lib/db'
 
 function authorized(request: NextRequest) {
-  const secret = process.env.CRON_SECRET?.trim()
-  return Boolean(secret && request.headers.get('authorization') === `Bearer ${secret}`)
+  const secrets = [
+    process.env.AUDIT_CHECKPOINT_CRON_SECRET,
+    process.env.WEB_MAINTENANCE_CRON_SECRET,
+    process.env.CRON_SECRET,
+  ].filter((value): value is string => Boolean(value?.trim()))
+  const authorization = request.headers.get('authorization')
+  return secrets.some((secret) => authorization === `Bearer ${secret}`)
 }
 
 export async function POST(request: NextRequest) {
