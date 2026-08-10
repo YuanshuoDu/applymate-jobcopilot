@@ -34,7 +34,11 @@ export async function pinnedFetch(rawUrl: string | URL, init: PinnedFetchOptions
 
   return new Promise<Response>((resolve, reject) => {
     const isHttps = url.protocol === 'https:'
-    const lookup: PinnedLookup = (_hostname, _options, callback) => {
+    const lookup: PinnedLookup = (_hostname, options, callback) => {
+      if (options.all) {
+        callback(null, [{ address: resolved.address, family: resolved.family }])
+        return
+      }
       callback(null, resolved.address, resolved.family)
     }
     const requestOptions = {

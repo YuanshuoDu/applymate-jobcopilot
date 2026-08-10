@@ -84,7 +84,7 @@ describe('pinned outbound client', () => {
     expect(response.status).toBe(200)
     const options = requestMock.mock.calls[0]?.[0] as {
       hostname: string
-      lookup: (hostname: string, options: object, callback: (error: Error | null, address: string, family: number) => void) => void
+      lookup: (hostname: string, options: { all?: boolean }, callback: (error: Error | null, address: string | Array<{ address: string; family: number }>, family?: number) => void) => void
     }
     expect(options.hostname).toBe('jobs.example.test')
     await new Promise<void>((resolve, reject) => {
@@ -93,6 +93,17 @@ describe('pinned outbound client', () => {
           expect(error).toBeNull()
           expect(address).toBe('93.184.216.34')
           expect(family).toBe(4)
+          resolve()
+        } catch (assertionError) {
+          reject(assertionError)
+        }
+      })
+    })
+    await new Promise<void>((resolve, reject) => {
+      options.lookup('ignored.example.test', { all: true }, (error, address) => {
+        try {
+          expect(error).toBeNull()
+          expect(address).toEqual([{ address: '93.184.216.34', family: 4 }])
           resolve()
         } catch (assertionError) {
           reject(assertionError)
