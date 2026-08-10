@@ -72,13 +72,68 @@ export async function loadWorkerAiConfig(userId: string): Promise<AiConfig> {
       `SELECT preferences FROM "User" WHERE id = $1`,
       [userId]
     );
-    if (res.rows.length === 0) return { ...APPLYMATE_BACKING };
+    const preferences = await decryptWorkerAiSettings(res.rows[0]?.preferences, userId)
+    const root = asRecord(preferences)
+    const aiSettings = asRecord(root.aiSettings)
+    const features = asRecord(aiSettings.features)
+    const configured = asAiConfig(features.autoApply)
+    if (configured) return resolveWorkerAiConfig(preferences)
 
-    const preferences = await decryptWorkerAiSettings(res.rows[0].preferences, userId)
-    return resolveWorkerAiConfig(preferences);
+    const keys = stringRecord(aiSettings.keys)
+    const platform = await loadPlatformRoute(client, keys)
+    return platform ?? withUserKey(APPLYMATE_BACKING, keys)
   } finally {
     client.release();
   }
+}
+
+function withUserKey(config: AiConfig, keys: Record<string, string> | undefined): AiConfig {
+  return {
+    ...config,
+    apiKey: config.apiKey?.trim() || keys?.[config.provider]?.trim() || undefined,
+  };
+}
+
+async function loadPlatformRoute(
+  client: { query: (text: string, values?: unknown[]) => Promise<{ rows: unknown[] }> },
+  keys: Record<string, string> | undefined,
+): Promise<AiConfig | null> {
+  try {
+    const routeResult = await client.query(
+      `SELECT "defaultProvider", "defaultModel", "fallbackProvider", "fallbackModel"
+       FROM "ai_route_configs" WHERE "featureKey" = $1`,
+      ["autoApply"],
+    );
+    const route = routeResult.rows[0] as Record<string, unknown> | undefined;
+    if (!route) return null;
+
+    const candidates = [
+      { provider: route.defaultProvider, model: route.defaultModel },
+      { provider: route.fallbackProvider, model: route.fallbackModel },
+    ];
+    const hasFallback = typeof route.fallbackProvider === "string" && typeof route.fallbackModel === "string";
+    for (const [index, candidate] of candidates.entries()) {
+      if (!isProvider(candidate.provider) || typeof candidate.model !== "string" || !candidate.model.trim()) continue;
+      const providerResult = await client.query(
+        `SELECT provider.key, provider."apiBase", provider."secretRef", provider.enabled, model.active
+         FROM "ai_provider_configs" AS provider
+         JOIN "ai_model_configs" AS model ON model."providerId" = provider.id
+         WHERE provider.key = $1 AND model.model = $2`,
+        [candidate.provider, candidate.model],
+      );
+      const row = providerResult.rows[0] as Record<string, unknown> | undefined;
+      if (!row || row.enabled !== true || row.active !== true) continue;
+      const apiKey = (typeof row.secretRef === "string" ? process.env[row.secretRef] : undefined)
+        || keys?.[candidate.provider]?.trim()
+        || getServerKey(candidate.provider);
+      if (!apiKey && hasFallback && index === 0) continue;
+      return { provider: candidate.provider, model: candidate.model, apiBase: String(row.apiBase ?? ""), apiKey };
+    }
+  } catch {
+    // AI configuration tables are additive; older worker deployments fall back
+    // to the environment-backed configuration until migrations complete.
+  }
+  return null;
 }
 
 /** Resolve persisted Preferences JSON without opening a database connection. */
@@ -301,6 +356,16 @@ function stringValue(value: unknown): string | undefined {
   if (typeof value !== "string") return undefined;
   const normalized = value.trim();
   return normalized || undefined;
+}
+
+function stringRecord(value: unknown): Record<string, string> | undefined {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+  const record: Record<string, string> = {};
+  for (const [key, item] of Object.entries(value)) {
+    const normalized = stringValue(item);
+    if (normalized) record[key] = normalized;
+  }
+  return record;
 }
 
 async function decryptWorkerAiSettings(preferences: unknown, userId: string): Promise<unknown> {
