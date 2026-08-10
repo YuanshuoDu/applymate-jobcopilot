@@ -9,7 +9,7 @@ import { isAdminHost } from '@/lib/host-routing'
 export default async function Page({
   searchParams,
 }: {
-  searchParams: Promise<{ switchAccount?: string }>
+  searchParams: Promise<{ switchAccount?: string; error?: string }>
 }) {
   const { switchAccount } = await searchParams
   const session = await safeAuth()
@@ -19,7 +19,10 @@ export default async function Page({
   if (session?.user && !allowAccountSwitch && !adminHost) redirect('/')
   return (
     <Suspense fallback={<LoadingShell text="Loading login…" />}>
-      <LoginPage switchAccount={allowAccountSwitch || (adminHost && Boolean(session?.user))} />
+      <LoginPage
+        switchAccount={allowAccountSwitch || (adminHost && Boolean(session?.user))}
+        adminLogin={adminHost}
+      />
     </Suspense>
   )
 }

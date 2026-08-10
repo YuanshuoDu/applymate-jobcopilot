@@ -26,7 +26,7 @@ describe('AdminLayout', () => {
 
     await AdminLayout({ children: React.createElement('main', null, 'Admin content') })
 
-    expect(mocks.redirect).toHaveBeenCalledWith('/login?callbackUrl=/admin')
+    expect(mocks.redirect).toHaveBeenCalledWith('/login?callbackUrl=%2Fadmin&error=not_admin')
   })
 
   it('renders the RBAC shell for an active admin membership', async () => {

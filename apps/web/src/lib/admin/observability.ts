@@ -15,13 +15,42 @@ type OverallRow = {
 
 type AtsRow = { atsType: string | null; count: number; successRate: number | null }
 type TrendRow = { day: Date; count: number; successRate: number | null; captchaRate: number | null }
+type AiUsageSnapshot = {
+  available: boolean
+  calls: number
+  errors: number
+  estimatedCostUsd: number
+  avgLatencyMs: number
+}
+
+async function readAiUsage(since: Date): Promise<AiUsageSnapshot> {
+  try {
+    const [usage, errors] = await Promise.all([
+      db.aiUsageEvent.aggregate({ where: { createdAt: { gte: since } }, _count: { id: true }, _sum: { estimatedCostUsd: true }, _avg: { latencyMs: true } }),
+      db.aiUsageEvent.count({ where: { createdAt: { gte: since }, status: 'error' } }),
+    ])
+    const calls = usage._count.id
+    return {
+      available: true,
+      calls,
+      errors,
+      estimatedCostUsd: Number((usage._sum.estimatedCostUsd ?? 0).toFixed(6)),
+      avgLatencyMs: Math.round(usage._avg.latencyMs ?? 0),
+    }
+  } catch {
+    // Keep the rest of the operational overview usable while a production
+    // deployment is catching up with the AI usage migration. Readiness still
+    // exposes the missing migration so this is not presented as real zeroes.
+    return { available: false, calls: 0, errors: 0, estimatedCostUsd: 0, avgLatencyMs: 0 }
+  }
+}
 
 export async function getObservabilitySnapshot(options: { days?: number; atsType?: string } = {}) {
   const days = options.days && options.days >= 1 && options.days <= 3_650 ? Math.trunc(options.days) : 3_650
   const since = new Date(Date.now() - days * 24 * 60 * 60_000)
   const weekAgo = new Date(Date.now() - 7 * 24 * 60 * 60_000)
   const atsFilter = options.atsType ? Prisma.sql`AND ats_type = ${options.atsType}` : Prisma.empty
-  const [overallRows, byAtsRows, trendRows, registeredUsers, registrationsLast7d, usersByPlan, sources, overdueCases, aiUsage, aiErrorCount] = await Promise.all([
+  const [overallRows, byAtsRows, trendRows, registeredUsers, registrationsLast7d, usersByPlan, sources, overdueCases, aiUsage] = await Promise.all([
     db.$queryRaw`
     SELECT COUNT(*)::int AS total,
       COALESCE(ROUND(100.0 * COUNT(*) FILTER (WHERE status = 'submitted') / NULLIF(COUNT(*), 0), 1)::float, 0) AS "successRate",
@@ -51,8 +80,7 @@ export async function getObservabilitySnapshot(options: { days?: number; atsType
     db.user.groupBy({ by: ['plan'], _count: { id: true } }),
     db.atsEmployer.aggregate({ _count: { id: true }, _sum: { jobCount: true } }),
     db.supportCase.count({ where: { slaDueAt: { lt: new Date() }, status: { notIn: ['resolved', 'closed'] } } }),
-    db.aiUsageEvent.aggregate({ where: { createdAt: { gte: since } }, _count: { id: true }, _sum: { estimatedCostUsd: true }, _avg: { latencyMs: true }, }),
-    db.aiUsageEvent.count({ where: { createdAt: { gte: since }, status: 'error' } }),
+    readAiUsage(since),
   ])
   const row = overallRows[0]
   const total = Number(row?.total ?? 0)
@@ -72,7 +100,7 @@ export async function getObservabilitySnapshot(options: { days?: number; atsType
     },
     byAts: byAtsRows.map((ats) => ({ atsType: ats.atsType ?? 'unknown', count: Number(ats.count ?? 0), successRate: Number(ats.successRate ?? 0) })),
     trend: trendRows.map((trend) => ({ day: trend.day, count: Number(trend.count ?? 0), successRate: Number(trend.successRate ?? 0), captchaRate: Number(trend.captchaRate ?? 0) })),
-    ai: { calls: aiUsage._count.id, errors: aiErrorCount, errorRate: aiUsage._count.id ? Number((aiErrorCount / aiUsage._count.id * 100).toFixed(1)) : 0, estimatedCostUsd: Number((aiUsage._sum.estimatedCostUsd ?? 0).toFixed(6)), avgLatencyMs: Math.round(aiUsage._avg.latencyMs ?? 0) },
+    ai: { available: aiUsage.available, calls: aiUsage.calls, errors: aiUsage.errors, errorRate: aiUsage.calls ? Number((aiUsage.errors / aiUsage.calls * 100).toFixed(1)) : 0, estimatedCostUsd: aiUsage.estimatedCostUsd, avgLatencyMs: aiUsage.avgLatencyMs },
     platform: {
       registeredUsers,
       registrationsLast7d,

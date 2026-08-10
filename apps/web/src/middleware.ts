@@ -25,7 +25,11 @@ export async function middleware(req: NextRequest) {
   // admin UI, Auth.js endpoints, and admin APIs are routable there.
   if (onAdminHost) {
     if (pathname === '/register') {
-      return NextResponse.redirect(new URL('/login?callbackUrl=%2Fadmin', req.url))
+      return NextResponse.redirect(new URL('/login?callbackUrl=%2Fadmin&error=admin_registration_disabled', req.url))
+    }
+
+    if (pathname === '/api/auth/register') {
+      return applyAdminSecurityHeaders(NextResponse.json({ error: 'Administrator registration is disabled' }, { status: 404 }))
     }
 
     if ((pathname === '/api' || pathname.startsWith('/api/')) && !isAuthPath(pathname) && !isAdminApiPath(pathname)) {
