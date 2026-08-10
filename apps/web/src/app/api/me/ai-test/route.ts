@@ -9,12 +9,12 @@
 import { NextRequest } from 'next/server'
 import { requireAuth, isErrorResponse } from '@/lib/api-helpers'
 import { isSafeAiEndpoint } from '@jobcopilot/shared/safe-ai-endpoint'
-import { db } from '@/lib/db'
 import { checkDistributedRateLimit } from '@/lib/distributed-rate-limit'
 import {
   APPLYMATE_BACKING,
   MODEL_CATALOGUE,
   modelChat,
+  loadUserAiSettings,
   resolveConfig,
   resolveFeatureConfig,
   type AiConfig,
@@ -84,8 +84,7 @@ function responseError(error: string, status: number, code: string) {
 }
 
 async function loadSettings(userId: string): Promise<UserAiSettings> {
-  const user = await db.user.findUnique({ where: { id: userId }, select: { preferences: true } })
-  return (asRecord(asRecord(user?.preferences).aiSettings) as UserAiSettings)
+  return loadUserAiSettings(userId)
 }
 
 function explicitConfig(body: RecordValue, settings: UserAiSettings): AiConfig | { error: string } {

@@ -12,9 +12,11 @@
  * explicitly move it by starting OAuth with transfer=1 and authorizing Google.
  */
 import { NextRequest, NextResponse } from 'next/server'
+import { pinnedFetch } from '@jobcopilot/shared'
 import { jwtVerify } from 'jose'
 import { db } from '@/lib/db'
 import { GMAIL_ACCOUNT_PROVIDER } from '@/lib/gmail-helpers'
+import { encryptAccountTokenFields } from '@/lib/credential-secrets'
 import { canRecoverStaleGmailConnection } from '@/lib/gmail-connection-recovery'
 import { configuredRedirectUri } from '@/lib/app-url'
 import { configuredAppOrigin } from '@/lib/app-url'
@@ -80,7 +82,7 @@ export async function GET(req: NextRequest) {
 
   // Exchange code for tokens
   const redirectUri = configuredRedirectUri(req.url, '/api/gmail/oauth/callback')
-  const tokenRes = await fetch('https://oauth2.googleapis.com/token', {
+  const tokenRes = await pinnedFetch('https://oauth2.googleapis.com/token', {
     method:  'POST',
     headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
     body:    new URLSearchParams({
@@ -98,7 +100,7 @@ export async function GET(req: NextRequest) {
   }
 
   // Fetch Google user id (sub) — needed for providerAccountId uniqueness
-  const profileRes = await fetch('https://www.googleapis.com/oauth2/v3/userinfo', {
+  const profileRes = await pinnedFetch('https://www.googleapis.com/oauth2/v3/userinfo', {
     headers: { Authorization: `Bearer ${tokens.access_token}` },
   })
   const profile = await profileRes.json()
@@ -147,6 +149,14 @@ export async function GET(req: NextRequest) {
     where: { userId, provider: GMAIL_ACCOUNT_PROVIDER, NOT: { providerAccountId } },
   })
 
+  const encryptedTokens = await encryptAccountTokenFields({
+    provider: GMAIL_ACCOUNT_PROVIDER,
+    providerAccountId,
+    accessToken: tokens.access_token,
+    refreshToken: tokens.refresh_token ?? null,
+    idToken: tokens.id_token ?? null,
+  })
+
   // Upsert the current user's isolated Gmail connection.
   await db.account.upsert({
     where: { provider_providerAccountId: { provider: GMAIL_ACCOUNT_PROVIDER, providerAccountId } },
@@ -155,20 +165,19 @@ export async function GET(req: NextRequest) {
       type:              'oauth',
       provider:          GMAIL_ACCOUNT_PROVIDER,
       providerAccountId,
-      access_token:      tokens.access_token,
-      refresh_token:     tokens.refresh_token ?? null,
+      ...encryptedTokens,
       expires_at,
       token_type:        tokens.token_type ?? null,
       scope:             tokens.scope ?? null,
-      id_token:          tokens.id_token ?? null,
     },
     update: {
       ...(recoveredLegacyConnection || transferredConnection ? { userId } : {}),
-      access_token:  tokens.access_token,
-      ...(tokens.refresh_token ? { refresh_token: tokens.refresh_token } : {}),
+      access_token:  null,
+      accessTokenEnc: encryptedTokens.accessTokenEnc,
+      ...(tokens.refresh_token ? { refresh_token: null, refreshTokenEnc: encryptedTokens.refreshTokenEnc } : {}),
       ...(expires_at != null   ? { expires_at }                          : {}),
       ...(tokens.scope         ? { scope:        tokens.scope }          : {}),
-      ...(tokens.id_token      ? { id_token:     tokens.id_token }       : {}),
+      ...(tokens.id_token      ? { id_token: null, idTokenEnc: encryptedTokens.idTokenEnc } : {}),
     },
   })
 

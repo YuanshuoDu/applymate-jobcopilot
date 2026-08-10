@@ -1,4 +1,5 @@
 import { db } from '@/lib/db'
+import { decryptSecret, discoveryCredentialContext, encryptSecret } from '@/lib/credential-secrets'
 
 export type DiscoveryApiKeys = {
   adzunaAppId: string
@@ -28,10 +29,17 @@ export type DiscoverySavedKeys = {
   adzunaAppId?: string | null
   adzunaAppKey?: string | null
   rapidapiKey?: string | null
+  adzunaAppIdEnc?: string | null
+  adzunaAppKeyEnc?: string | null
+  rapidapiKeyEnc?: string | null
 } | null
 
 function clean(value?: string | null): string {
   return value?.trim() ?? ''
+}
+
+function storedValue(plain?: string | null, encrypted?: string | null): string {
+  return clean(plain) || clean(encrypted)
 }
 
 function hasPair(first: string, second: string): boolean {
@@ -56,19 +64,44 @@ function resolveKeys(saved: DiscoverySavedKeys): DiscoveryApiKeys {
 export async function getDiscoveryApiKeys(userId: string): Promise<DiscoveryApiKeys> {
   const saved = await db.userApiKeys.findUnique({
     where: { userId },
-    select: { adzunaAppId: true, adzunaAppKey: true, rapidapiKey: true },
+    select: {
+      adzunaAppId: true, adzunaAppKey: true, rapidapiKey: true,
+      adzunaAppIdEnc: true, adzunaAppKeyEnc: true, rapidapiKeyEnc: true,
+    },
   }).catch(() => null)
 
-  return resolveKeys(saved)
+  const decrypted = saved ? {
+    adzunaAppId: await decryptSecret(saved.adzunaAppIdEnc ?? saved.adzunaAppId, discoveryCredentialContext('adzunaAppId')),
+    adzunaAppKey: await decryptSecret(saved.adzunaAppKeyEnc ?? saved.adzunaAppKey, discoveryCredentialContext('adzunaAppKey')),
+    rapidapiKey: await decryptSecret(saved.rapidapiKeyEnc ?? saved.rapidapiKey, discoveryCredentialContext('rapidapiKey')),
+  } : null
+  return resolveKeys(decrypted)
+}
+
+/** Return safe readiness/source metadata for the candidate/admin UI. */
+export async function getDiscoveryApiKeyStatus(userId: string): Promise<DiscoveryApiKeyStatus> {
+  const saved = await db.userApiKeys.findUnique({
+    where: { userId },
+    select: {
+      adzunaAppId: true, adzunaAppKey: true, rapidapiKey: true,
+      adzunaAppIdEnc: true, adzunaAppKeyEnc: true, rapidapiKeyEnc: true,
+    },
+  }).catch(() => null)
+
+  return discoveryApiKeyStatusFromSaved(saved)
+}
+
+export async function encryptDiscoveryApiKey(field: 'adzunaAppId' | 'adzunaAppKey' | 'rapidapiKey', value: string): Promise<string> {
+  return encryptSecret(value, discoveryCredentialContext(field))
 }
 
 export function discoveryApiKeyStatusFromSaved(saved: DiscoverySavedKeys): DiscoveryApiKeyStatus {
-  const userIdValue = clean(saved?.adzunaAppId)
-  const userKeyValue = clean(saved?.adzunaAppKey)
-  const userRapidValue = clean(saved?.rapidapiKey)
+  const userIdValue = storedValue(saved?.adzunaAppId, saved?.adzunaAppIdEnc)
+  const userKeyValue = storedValue(saved?.adzunaAppKey, saved?.adzunaAppKeyEnc)
+  const userRapidValue = storedValue(saved?.rapidapiKey, saved?.rapidapiKeyEnc)
   const userHasAdzuna = Boolean(userIdValue || userKeyValue)
   const userHasRapidapi = Boolean(userRapidValue)
-  const effective = resolveKeys(saved)
+  const effective = resolveKeys({ adzunaAppId: userIdValue, adzunaAppKey: userKeyValue, rapidapiKey: userRapidValue })
   const platformAdzuna = hasPair(clean(process.env.ADZUNA_APP_ID), clean(process.env.ADZUNA_APP_KEY))
   const adzunaReady = hasPair(effective.adzunaAppId, effective.adzunaAppKey)
   const rapidReady = Boolean(effective.rapidapiKey)
@@ -84,14 +117,4 @@ export function discoveryApiKeyStatusFromSaved(saved: DiscoverySavedKeys): Disco
     rapidapiSource: rapidReady ? userHasRapidapi ? 'user' : 'platform' : 'none',
     needsAdzunaPair: userHasAdzuna && !hasPair(userIdValue, userKeyValue),
   }
-}
-
-/** Return safe readiness/source metadata for the candidate/admin UI. */
-export async function getDiscoveryApiKeyStatus(userId: string): Promise<DiscoveryApiKeyStatus> {
-  const saved = await db.userApiKeys.findUnique({
-    where: { userId },
-    select: { adzunaAppId: true, adzunaAppKey: true, rapidapiKey: true },
-  }).catch(() => null)
-
-  return discoveryApiKeyStatusFromSaved(saved)
 }

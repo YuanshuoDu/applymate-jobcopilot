@@ -5,6 +5,7 @@
  * Uses the candidate RapidAPI key first, then the platform key.
  */
 import { NextRequest } from 'next/server'
+import { pinnedFetch } from '@jobcopilot/shared'
 import { requireAuth, isErrorResponse, ok, err } from '@/lib/api-helpers'
 import { DISCOVERY_KEY_ERROR_MESSAGES, getDiscoveryApiKeys } from '@/lib/discovery-api-keys'
 import { truncate, fmtSalary } from '@/lib/utils'
@@ -35,7 +36,7 @@ export async function GET(req: NextRequest) {
 
   let raw: Response
   try {
-    raw = await fetch(`https://${HOST}/search-v2?${params}`, {
+    raw = await pinnedFetch(`https://${HOST}/search-v2?${params}`, {
       headers: { 'X-RapidAPI-Key': apiKey, 'X-RapidAPI-Host': HOST },
       cache: 'no-store',
     })

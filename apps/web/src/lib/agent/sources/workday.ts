@@ -15,6 +15,7 @@
  *      Issue #30 (Phase 2.1+2.2)
  */
 
+import { pinnedFetch } from '@jobcopilot/shared'
 import type { DiscoveredJob } from "../discover"
 import { acquire } from "../pace/policies"
 import { stripHtml } from "../strip-html"
@@ -56,7 +57,7 @@ async function fetchSearch(
 ): Promise<CxsSearchResult | null> {
   const url = `${employer.baseUrl}/wday/cxs/${employer.tenant}/${employer.siteId}/jobs`
   try {
-    const r = await fetch(url, {
+    const r = await pinnedFetch(url, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
@@ -86,7 +87,7 @@ async function fetchDetail(
 ): Promise<CxsDetail | null> {
   const url = `${employer.baseUrl}/wday/cxs/${employer.tenant}/${employer.siteId}${externalPath}`
   try {
-    const r = await fetch(url, {
+    const r = await pinnedFetch(url, {
       headers: {
         "Accept": "application/json",
         "User-Agent": USER_AGENT,

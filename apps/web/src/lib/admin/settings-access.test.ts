@@ -46,6 +46,8 @@ describe('admin settings access', () => {
     expect(JSON.stringify(dto)).not.toContain('password')
     expect(JSON.stringify(dto)).not.toContain('private')
     expect(dto.email).not.toBe('candidate@example.com')
+    expect(dto.profile.location).toBe('D***')
+    expect(JSON.stringify(dto)).not.toContain('"location":"Dublin"')
   })
 
   it('accepts only bounded notification, privacy, and deletion-status patch fields', () => {

@@ -15,6 +15,8 @@ export {
 } from "./ats-policy.js";
 export { detectAtsSource } from "./ats-url.js";
 export { isSafeAiEndpoint } from "./safe-ai-endpoint.js";
+export { credentialContext, decryptSecret, encryptSecret, isEncryptedSecret, maskStoredSecret } from "./secret-crypto.js";
+export { pinnedFetch, validatePinnedUrl, type PinnedFetchOptions } from "./pinned-outbound.js";
 export {
   evaluateManagedFeature,
   isManagedFeatureKey,

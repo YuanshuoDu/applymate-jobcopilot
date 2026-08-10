@@ -10,6 +10,7 @@ const mocks = vi.hoisted(() => ({
   accountUpsert: vi.fn(),
   userFindUnique: vi.fn(),
 }))
+const pinnedFetch = vi.hoisted(() => vi.fn((input: string | URL, init?: unknown) => globalThis.fetch(String(input), init as RequestInit)))
 
 vi.mock('@/lib/db', () => ({ db: {
   account: {
@@ -19,6 +20,10 @@ vi.mock('@/lib/db', () => ({ db: {
   },
   user: { findUnique: mocks.userFindUnique },
 } }))
+vi.mock('@jobcopilot/shared', async () => {
+  const actual = await vi.importActual<typeof import('@jobcopilot/shared')>('@jobcopilot/shared')
+  return { ...actual, pinnedFetch }
+})
 
 describe('GET /api/github/oauth/callback', () => {
   beforeEach(() => {

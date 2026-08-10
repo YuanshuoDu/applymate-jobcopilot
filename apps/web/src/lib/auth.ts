@@ -11,6 +11,7 @@ import { normalizeEmail } from '@/lib/auth-identifiers'
 import { reconcileGoogleLoginIdentity } from '@/lib/google-identity'
 import { EXTENSION_TOKEN_AUDIENCE, EXTENSION_TOKEN_ISSUER, getAuthJwtSecret, getAuthSecret } from '@/lib/auth-secret'
 import { canonicalAuthRedirect } from '@/lib/auth-url'
+import { encryptAccountTokenFields } from '@/lib/credential-secrets'
 
 const AUTH_SECRET = getAuthSecret()
 const JWT_SECRET = getAuthJwtSecret()
@@ -111,18 +112,32 @@ export const { handlers, signIn, signOut, auth } = NextAuth({
         })
         if (account.access_token) {
           try {
+            const encryptedTokens = await encryptAccountTokenFields({
+              provider: 'google',
+              providerAccountId: account.providerAccountId,
+              accessToken: account.access_token,
+              refreshToken: account.refresh_token ?? null,
+              idToken: account.id_token ?? null,
+            })
             const updated = await db.account.updateMany({
               where: { provider: 'google', providerAccountId: account.providerAccountId },
               data: {
-                access_token:  account.access_token,
-                ...(account.refresh_token ? { refresh_token: account.refresh_token } : {}),
+                access_token: null,
+                accessTokenEnc: encryptedTokens.accessTokenEnc,
+                ...(account.refresh_token ? { refresh_token: null, refreshTokenEnc: encryptedTokens.refreshTokenEnc } : {}),
+                ...(account.id_token ? { id_token: null, idTokenEnc: encryptedTokens.idTokenEnc } : {}),
                 ...(account.expires_at    ? { expires_at:    Number(account.expires_at) } : {}),
                 ...(account.scope         ? { scope:         account.scope } : {}),
               },
             })
             console.log('[auth] Google tokens patched, rows updated=', updated.count)
           } catch (e) {
-            console.error('[auth] Failed to update Google account tokens:', e)
+            await db.account.updateMany({
+              where: { provider: 'google', providerAccountId: account.providerAccountId },
+              data: { access_token: null, refresh_token: null, id_token: null },
+            }).catch(() => undefined)
+            console.error('[auth] Failed to protect Google account tokens:', e)
+            return '/login?error=CredentialProtectionUnavailable'
           }
         }
       }
@@ -170,6 +185,33 @@ export const { handlers, signIn, signOut, auth } = NextAuth({
         process.env.AUTH_CANONICAL_URL ?? 'https://applymate.site',
         process.env.VERCEL_ENV === 'preview',
       )
+    },
+  },
+  events: {
+    // PrismaAdapter creates first-time OAuth accounts after signIn. Encrypt
+    // the adapter-created token row as a final write boundary as well.
+    async linkAccount({ account }) {
+      if (!account.providerAccountId || !account.access_token) return
+      if (account.provider !== 'google' && account.provider !== 'github') return
+      try {
+        const encryptedTokens = await encryptAccountTokenFields({
+          provider: account.provider,
+          providerAccountId: account.providerAccountId,
+          accessToken: account.access_token,
+          refreshToken: account.refresh_token ?? null,
+          idToken: account.id_token ?? null,
+        })
+        await db.account.updateMany({
+          where: { provider: account.provider, providerAccountId: account.providerAccountId },
+          data: encryptedTokens,
+        })
+      } catch (error) {
+        await db.account.updateMany({
+          where: { provider: account.provider, providerAccountId: account.providerAccountId },
+          data: { access_token: null, refresh_token: null, id_token: null },
+        }).catch(() => undefined)
+        throw error
+      }
     },
   },
   pages: {

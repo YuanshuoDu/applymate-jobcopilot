@@ -1,8 +1,10 @@
 /**
  * Shared Gmail helpers — token refresh and email body extraction.
  */
+import { pinnedFetch } from '@jobcopilot/shared'
 import { db } from '@/lib/db'
 import { classifyGmailMessage, type GmailMessageKind } from '@/lib/gmail-tracking'
+import { decryptAccountTokens, encryptAccountTokenFields } from '@/lib/credential-secrets'
 
 // ── Token management ─────────────────────────────────────────────────────────
 
@@ -12,13 +14,17 @@ export const GMAIL_ACCOUNT_PROVIDER = 'gmail'
 export async function findGmailConnection(userId: string) {
   const select = {
     id: true,
+    provider: true,
     providerAccountId: true,
     access_token: true,
+    accessTokenEnc: true,
     refresh_token: true,
+    refreshTokenEnc: true,
     expires_at: true,
     scope: true,
     token_type: true,
     id_token: true,
+    idTokenEnc: true,
     session_state: true,
   } as const
 
@@ -26,7 +32,7 @@ export async function findGmailConnection(userId: string) {
     where: { userId, provider: GMAIL_ACCOUNT_PROVIDER },
     select,
   })
-  if (connection) return connection
+  if (connection) return decryptAccountTokens(connection)
 
   // One-time compatibility path for credentials created before Gmail was split
   // from the Auth.js `google` identity provider. Copying preserves login
@@ -36,6 +42,7 @@ export async function findGmailConnection(userId: string) {
     select,
   })
   if (!legacy) return null
+  const legacyTokens = await decryptAccountTokens(legacy)
 
   const existingForGoogleAccount = await db.account.findUnique({
     where: {
@@ -48,7 +55,7 @@ export async function findGmailConnection(userId: string) {
   })
   if (existingForGoogleAccount && existingForGoogleAccount.userId !== userId) return null
 
-  return db.account.upsert({
+  const migrated = await db.account.upsert({
     where: {
       provider_providerAccountId: {
         provider: GMAIL_ACCOUNT_PROVIDER,
@@ -60,16 +67,21 @@ export async function findGmailConnection(userId: string) {
       type: 'oauth',
       provider: GMAIL_ACCOUNT_PROVIDER,
       providerAccountId: legacy.providerAccountId,
-      access_token: legacy.access_token,
-      refresh_token: legacy.refresh_token,
+      ...(await encryptAccountTokenFields({
+        provider: GMAIL_ACCOUNT_PROVIDER,
+        providerAccountId: legacy.providerAccountId,
+        accessToken: legacyTokens.access_token,
+        refreshToken: legacyTokens.refresh_token,
+        idToken: legacyTokens.id_token,
+      })),
       expires_at: legacy.expires_at,
       token_type: legacy.token_type,
       scope: legacy.scope,
-      id_token: legacy.id_token,
       session_state: legacy.session_state,
     },
     update: {},
   })
+  return decryptAccountTokens(migrated)
 }
 
 export async function getGoogleAccessToken(userId: string): Promise<string | null> {
@@ -88,7 +100,7 @@ export async function getGoogleAccessToken(userId: string): Promise<string | nul
       return null
     }
     try {
-      const res = await fetch('https://oauth2.googleapis.com/token', {
+      const res = await pinnedFetch('https://oauth2.googleapis.com/token', {
         method:  'POST',
         headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
         body:    new URLSearchParams({
@@ -104,7 +116,12 @@ export async function getGoogleAccessToken(userId: string): Promise<string | nul
         await db.account.update({
           where: { id: account.id },
           data:  {
-            access_token: data.access_token,
+            access_token: null,
+            accessTokenEnc: await encryptAccountTokenFields({
+              provider: GMAIL_ACCOUNT_PROVIDER,
+              providerAccountId: account.providerAccountId,
+              accessToken: data.access_token,
+            }).then(tokens => tokens.accessTokenEnc),
             expires_at:   Math.floor(Date.now() / 1000) + (data.expires_in ?? 3600),
           },
         })

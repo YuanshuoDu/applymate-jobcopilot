@@ -8,8 +8,19 @@ export async function GET(request: NextRequest, context: { params: Promise<{ id:
   const actor = await requireAdmin('users.read', request)
   if (isAdminResponse(actor)) return actor
   const { id } = await context.params
-  const keys = await db.userApiKeys.findUnique({ where: { userId: id }, select: { id: true, adzunaAppId: true, adzunaAppKey: true, rapidapiKey: true, createdAt: true, updatedAt: true } })
-  return NextResponse.json({ keys: keys ? { id: keys.id, providers: { adzuna: Boolean(keys.adzunaAppId && keys.adzunaAppKey), rapidapi: Boolean(keys.rapidapiKey) }, createdAt: keys.createdAt, updatedAt: keys.updatedAt } : null }, { headers: { 'Cache-Control': 'no-store', 'x-request-id': actor.requestId } })
+  const keys = await db.userApiKeys.findUnique({ where: { userId: id }, select: {
+    id: true, adzunaAppId: true, adzunaAppIdEnc: true, adzunaAppKey: true, adzunaAppKeyEnc: true,
+    rapidapiKey: true, rapidapiKeyEnc: true, createdAt: true, updatedAt: true,
+  } })
+  return NextResponse.json({ keys: keys ? {
+    id: keys.id,
+    providers: {
+      adzuna: Boolean((keys.adzunaAppId || keys.adzunaAppIdEnc) && (keys.adzunaAppKey || keys.adzunaAppKeyEnc)),
+      rapidapi: Boolean(keys.rapidapiKey || keys.rapidapiKeyEnc),
+    },
+    createdAt: keys.createdAt,
+    updatedAt: keys.updatedAt,
+  } : null }, { headers: { 'Cache-Control': 'no-store', 'x-request-id': actor.requestId } })
 }
 
 export async function DELETE(request: NextRequest, context: { params: Promise<{ id: string }> }) {

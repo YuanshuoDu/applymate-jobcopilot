@@ -8,6 +8,7 @@
  * See: docs/scraping-autoapply-design.md §5 (Enrichment Cascade)
  */
 
+import { pinnedFetch } from '@jobcopilot/shared'
 import type { EnrichedJob } from "../types"
 import type { AtsMatch } from "./ats-url-detector"
 import { acquire } from "../pace/policies"
@@ -75,7 +76,7 @@ async function fetchGreenhouseJob(
   await acquire({ ats: "greenhouse", rps })
 
   const url = `https://boards-api.greenhouse.io/v1/boards/${match.slug}/jobs/${match.jobId}?content=true`
-  const r = await fetch(url, {
+  const r = await pinnedFetch(url, {
     headers: { Accept: "application/json" },
     signal: AbortSignal.timeout(8_000),
   })
@@ -114,7 +115,7 @@ async function fetchLeverJob(
   await acquire({ ats: "lever", rps })
 
   const url = `https://api.lever.co/v0/postings/${match.slug}?mode=json`
-  const r = await fetch(url, {
+  const r = await pinnedFetch(url, {
     headers: { Accept: "application/json" },
     signal: AbortSignal.timeout(8_000),
   })

@@ -2,7 +2,7 @@ import { NextRequest, NextResponse } from 'next/server'
 import { headers } from 'next/headers'
 import { jwtVerify } from 'jose'
 import { checkRateLimit } from '@/lib/rate-limit'
-import { APPLYMATE_BACKING, resolveConfig, resolveFeatureConfig, type UserAiSettings, type FeatureId } from '@/lib/model-router'
+import { loadUserAiConfig, type FeatureId } from '@/lib/model-router'
 import { db } from '@/lib/db'
 import { safeAuth } from '@/lib/safe-auth'
 import { EXTENSION_TOKEN_AUDIENCE, EXTENSION_TOKEN_ISSUER, getAuthJwtSecret } from '@/lib/auth-secret'
@@ -85,9 +85,7 @@ export async function prepareAiRoute(req: NextRequest, featureId: FeatureId) {
   const rl = checkRateLimit(`ai:${auth.userId}`)
   if (!rl.ok) return { error: err(`Rate limit exceeded — retry in ${rl.retryAfter}s`, 429) }
 
-  const user  = await db.user.findUnique({ where: { id: auth.userId }, select: { preferences: true } })
-  const prefs = (user?.preferences ?? {}) as Record<string, unknown>
-  const configured = resolveFeatureConfig(featureId, (prefs.aiSettings ?? null) as UserAiSettings | null)
+  const configured = await loadUserAiConfig(auth.userId, featureId)
   // A stale feature override must not make the application flow unusable when
   // its provider has no key. Fall back to the platform MiniMax model.
   const cfg = configured.resolvedKey ? configured : await resolvePlatformRoute(featureId)

@@ -12,6 +12,7 @@
 
 import React from 'react'
 import type { ResumeContent, TemplateOptions } from '@/lib/types'
+import { safeAccentColor } from '@/lib/template-options'
 
 // ── Palette ───────────────────────────────────────────────────────────────────
 
@@ -47,7 +48,7 @@ export const TEMPLATE_DEFS = [
 // ── Resolved options ──────────────────────────────────────────────────────────
 
 function resolveOpts(opts?: TemplateOptions | null) {
-  const accent = opts?.accentColor ?? ACCENT_COLORS[0].hex
+  const accent = safeAccentColor(opts?.accentColor, ACCENT_COLORS[0].hex)
   const font   = FONT_FAMILIES.find(f => f.id === opts?.fontFamily) ?? FONT_FAMILIES[0]
   const den    = DENSITY_SCALE[opts?.density ?? 'comfortable']
   return { accent, font: font.css, den }

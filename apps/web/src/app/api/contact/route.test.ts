@@ -1,8 +1,13 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 const mocks = vi.hoisted(() => ({ fetch: vi.fn() }))
+const pinnedFetch = vi.hoisted(() => vi.fn((input: string | URL, init?: unknown) => globalThis.fetch(String(input), init as RequestInit)))
 
 vi.stubGlobal('fetch', mocks.fetch)
+vi.mock('@jobcopilot/shared', async () => {
+  const actual = await vi.importActual<typeof import('@jobcopilot/shared')>('@jobcopilot/shared')
+  return { ...actual, pinnedFetch }
+})
 vi.mock('@/lib/api-helpers', () => ({
   ok: (data: unknown, status = 200) => Response.json(data, { status }),
   err: (message: string, status = 400) => Response.json({ error: message }, { status }),

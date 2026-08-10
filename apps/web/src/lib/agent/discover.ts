@@ -12,6 +12,7 @@
  *   2. LinkedIn 24h (freshest postings)
  *   3. Adzuna (EU) or JSearch (US/global) based on location
  */
+import { pinnedFetch } from '@jobcopilot/shared'
 import { truncate } from '@/lib/utils'
 import { getDiscoveryApiKeys } from '@/lib/discovery-api-keys'
 import { isRuntimeFeatureEnabled } from '@/lib/runtime-feature-flags'
@@ -111,7 +112,7 @@ async function fetchAts(q: string, location: string, key: string): Promise<Disco
   })
   if (location) p.set('location_filter', location)
   try {
-    const r = await fetch(`https://active-jobs-db.p.rapidapi.com/active-ats-7d?${p}`, {
+    const r = await pinnedFetch(`https://active-jobs-db.p.rapidapi.com/active-ats-7d?${p}`, {
       headers: { 'x-rapidapi-key': key, 'x-rapidapi-host': 'active-jobs-db.p.rapidapi.com' },
       signal: AbortSignal.timeout(5_000),
       cache: 'no-store',
@@ -149,7 +150,7 @@ async function fetchLinkedIn(q: string, location: string, key: string): Promise<
   })
   if (location) p.set('location_filter', location)
   try {
-    const r = await fetch(`https://linkedin-job-search-api.p.rapidapi.com/active-jb-24h?${p}`, {
+    const r = await pinnedFetch(`https://linkedin-job-search-api.p.rapidapi.com/active-jb-24h?${p}`, {
       headers: { 'x-rapidapi-key': key, 'x-rapidapi-host': 'linkedin-job-search-api.p.rapidapi.com' },
       signal: AbortSignal.timeout(5_000),
       cache: 'no-store',
@@ -186,7 +187,7 @@ async function fetchAdzuna(
   })
   if (location) p.set('where', location)
   try {
-    const r = await fetch(`https://api.adzuna.com/v1/api/jobs/${country}/search/1?${p}`, {
+    const r = await pinnedFetch(`https://api.adzuna.com/v1/api/jobs/${country}/search/1?${p}`, {
       signal: AbortSignal.timeout(5_000), cache: 'no-store',
     })
     if (!r.ok) return []
@@ -215,7 +216,7 @@ async function fetchJSearch(q: string, location: string, key: string): Promise<D
     date_posted: 'week',
   })
   try {
-    const r = await fetch(`https://jsearch.p.rapidapi.com/search-v2?${p}`, {
+    const r = await pinnedFetch(`https://jsearch.p.rapidapi.com/search-v2?${p}`, {
       headers: { 'X-RapidAPI-Key': key, 'X-RapidAPI-Host': 'jsearch.p.rapidapi.com' },
       signal: AbortSignal.timeout(5_000), cache: 'no-store',
     })
@@ -250,7 +251,7 @@ async function fetchIndeedIE(q: string, location: string, key: string): Promise<
   })
   if (location) p.set('location', location || 'Ireland')
   try {
-    const r = await fetch(`https://jobs-api14.p.rapidapi.com/v2/indeed/search?${p}`, {
+    const r = await pinnedFetch(`https://jobs-api14.p.rapidapi.com/v2/indeed/search?${p}`, {
       headers: { 'x-rapidapi-key': key, 'x-rapidapi-host': 'jobs-api14.p.rapidapi.com' },
       signal: AbortSignal.timeout(5_000), cache: 'no-store',
     })
@@ -300,7 +301,7 @@ async function fetchIrishJobsRss(q: string, location: string): Promise<Discovere
   ]
   for (const url of urls) {
     try {
-      const r = await fetch(url, {
+      const r = await pinnedFetch(url, {
         headers: { 'User-Agent': 'ApplyMate/1.0', 'Accept': 'application/rss+xml, text/xml' },
         signal: AbortSignal.timeout(7_000), cache: 'no-store',
       })

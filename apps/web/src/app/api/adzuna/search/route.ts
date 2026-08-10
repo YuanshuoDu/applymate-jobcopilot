@@ -4,6 +4,7 @@
  * Proxies Adzuna job search API. Uses candidate credentials first, then the platform pair.
  */
 import { NextRequest } from 'next/server'
+import { pinnedFetch } from '@jobcopilot/shared'
 import { requireAuth, isErrorResponse, ok, err } from '@/lib/api-helpers'
 import { DISCOVERY_KEY_ERROR_MESSAGES, getDiscoveryApiKeys } from '@/lib/discovery-api-keys'
 import { truncate, fmtSalary as fmtSal } from '@/lib/utils'
@@ -51,7 +52,7 @@ export async function GET(req: NextRequest) {
 
   let raw: Response
   try {
-    raw = await fetch(url, { cache: 'no-store' })
+    raw = await pinnedFetch(url, { cache: 'no-store', redirect: 'error' })
   } catch {
     return err('Failed to reach Adzuna API', 502)
   }

@@ -1,4 +1,5 @@
 import type { NotificationPreferences, PrivacyPreferences, UserPreferences } from './types'
+import { isEncryptedSecret } from '@jobcopilot/shared'
 
 export const DEFAULT_NOTIFICATION_PREFERENCES: NotificationPreferences = {
   apply: true,
@@ -124,6 +125,7 @@ export function hasActiveDeletionRequest(value: unknown): boolean {
 
 function maskSecret(value: unknown): string | null {
   if (typeof value !== 'string' || !value) return null
+  if (isEncryptedSecret(value)) return '••••'
   return value.length <= 8 ? '••••' : `••••${value.slice(-4)}`
 }
 

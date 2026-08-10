@@ -7,6 +7,7 @@ const mocks = vi.hoisted(() => ({
   tokenCreate: vi.fn(),
   fetch: vi.fn(),
 }))
+const pinnedFetch = vi.hoisted(() => vi.fn((input: string | URL, init?: unknown) => globalThis.fetch(String(input), init as RequestInit)))
 
 vi.mock('@/lib/db', () => ({
   db: {
@@ -22,6 +23,10 @@ vi.mock('@/lib/api-helpers', () => ({
   ok: (data: unknown, status = 200) => Response.json(data, { status }),
   err: (message: string, status = 400) => Response.json({ error: message }, { status }),
 }))
+vi.mock('@jobcopilot/shared', async () => {
+  const actual = await vi.importActual<typeof import('@jobcopilot/shared')>('@jobcopilot/shared')
+  return { ...actual, pinnedFetch }
+})
 
 function request(body: unknown) {
   return new Request('http://localhost:3000/api/auth/forgot-password', {

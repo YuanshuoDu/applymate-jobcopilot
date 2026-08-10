@@ -11,6 +11,7 @@
  *   limit    number  — max results (default 20, max 100)
  */
 import { NextRequest } from 'next/server'
+import { pinnedFetch } from '@jobcopilot/shared'
 import { requireAuth, isErrorResponse, ok, err } from '@/lib/api-helpers'
 import { truncate } from '@/lib/utils'
 
@@ -59,7 +60,7 @@ export async function GET(req: NextRequest) {
 
   let raw: Response
   try {
-    raw = await fetch(`https://remotive.com/api/remote-jobs?${params}`, {
+    raw = await pinnedFetch(`https://remotive.com/api/remote-jobs?${params}`, {
       headers: { 'User-Agent': 'ApplyMate/1.0' },
       next: { revalidate: 900 },  // cache 15 min to respect rate limits
     })

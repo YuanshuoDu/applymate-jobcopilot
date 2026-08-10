@@ -1,6 +1,12 @@
 import { beforeEach, describe, it, expect, vi, afterEach } from "vitest"
 
 const mocks = vi.hoisted(() => ({ getRuntimeAtsPolicy: vi.fn() }))
+const pinnedFetch = vi.hoisted(() => vi.fn((input: string | URL, init?: unknown) => globalThis.fetch(String(input), init as RequestInit)))
+
+vi.mock('@jobcopilot/shared', async () => {
+  const actual = await vi.importActual<typeof import('@jobcopilot/shared')>('@jobcopilot/shared')
+  return { ...actual, pinnedFetch }
+})
 
 // Mock the DB module so we don't need Prisma client at test time
 vi.mock("@/lib/db", () => ({

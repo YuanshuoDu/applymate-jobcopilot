@@ -10,6 +10,7 @@
  * See: docs/scraping-autoapply-design.md §4 (ATS Coverage Matrix)
  */
 
+import { pinnedFetch } from '@jobcopilot/shared'
 import type { DiscoveredJob } from "../discover"
 import { acquire } from "../pace/policies"
 import { stripHtml } from "../strip-html"
@@ -47,7 +48,7 @@ export async function fetchGreenhouse(
 
     try {
       const url = `${BASE}/${slug}/jobs?content=true`
-      const r = await fetch(url, {
+      const r = await pinnedFetch(url, {
         headers: { "Accept": "application/json" },
         signal: AbortSignal.timeout(8_000),
       })

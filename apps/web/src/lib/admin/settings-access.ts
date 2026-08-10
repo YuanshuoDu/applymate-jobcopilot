@@ -45,6 +45,11 @@ function maskPhone(phone: unknown): string | null {
   return digits.length >= 2 ? `***${digits.slice(-2)}` : '***'
 }
 
+function maskLocation(location: unknown): string | null {
+  if (typeof location !== 'string' || !location.trim()) return null
+  return `${location.trim().slice(0, 1)}***`
+}
+
 function boundedString(value: unknown, max = 240): string {
   return typeof value === 'string' ? value.trim().slice(0, max) : ''
 }
@@ -107,7 +112,7 @@ export function toAdminSettingsDto(input: StoredUser) {
     plan: boundedString(input.plan, 24),
     profile: {
       phone: maskPhone(input.phone),
-      location: boundedString(input.location, 120) || null,
+      location: maskLocation(input.location),
       hasLinkedin: Boolean(boundedString(input.linkedin)),
       hasGithub: Boolean(boundedString(input.github)),
     },
@@ -120,8 +125,11 @@ export function toAdminSettingsDto(input: StoredUser) {
       preferences,
       apiKeys: {
         adzunaAppId: typeof apiKeys.adzunaAppId === 'string' ? apiKeys.adzunaAppId : null,
+        adzunaAppIdEnc: typeof apiKeys.adzunaAppIdEnc === 'string' ? apiKeys.adzunaAppIdEnc : null,
         adzunaAppKey: typeof apiKeys.adzunaAppKey === 'string' ? apiKeys.adzunaAppKey : null,
+        adzunaAppKeyEnc: typeof apiKeys.adzunaAppKeyEnc === 'string' ? apiKeys.adzunaAppKeyEnc : null,
         rapidapiKey: typeof apiKeys.rapidapiKey === 'string' ? apiKeys.rapidapiKey : null,
+        rapidapiKeyEnc: typeof apiKeys.rapidapiKeyEnc === 'string' ? apiKeys.rapidapiKeyEnc : null,
       },
       accounts,
     }),

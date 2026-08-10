@@ -27,7 +27,7 @@ export async function GET() {
       const key = `gmail:${account.providerAccountId}`
       if (!connected.has(key)) {
         connected.set(key, {
-          provider: 'gmail', account: account.providerAccountId, disconnectable: false, legacy: true,
+          provider: 'gmail', account: account.providerAccountId, legacy: true,
         })
       }
       continue
@@ -50,11 +50,31 @@ export async function DELETE(req: NextRequest) {
     return err('Unsupported account provider', 400)
   }
   if (provider === 'gmail') {
-    await db.account.deleteMany({
-      where: {
-        userId: auth.userId,
-        provider: 'gmail',
-      },
+    await db.$transaction(async (tx) => {
+      await tx.account.deleteMany({
+        where: {
+          userId: auth.userId,
+          provider: 'gmail',
+        },
+      })
+      // Older Gmail connections shared an Auth.js Google identity row. Keep
+      // that identity so Google sign-in still works, but remove its Gmail
+      // credentials and scope so the compatibility path cannot reconnect it.
+      await tx.account.updateMany({
+        where: { userId: auth.userId, provider: 'google', scope: { contains: 'gmail' } },
+        data: {
+          access_token: null,
+          accessTokenEnc: null,
+          refresh_token: null,
+          refreshTokenEnc: null,
+          expires_at: null,
+          token_type: null,
+          scope: null,
+          id_token: null,
+          idTokenEnc: null,
+          session_state: null,
+        },
+      })
     })
   } else {
     await db.account.deleteMany({ where: { userId: auth.userId, provider } })

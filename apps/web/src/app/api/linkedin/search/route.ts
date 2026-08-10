@@ -5,6 +5,7 @@
  * Requires RAPIDAPI_KEY in environment.
  */
 import { NextRequest } from 'next/server'
+import { pinnedFetch } from '@jobcopilot/shared'
 import { requireAuth, isErrorResponse, ok, err } from '@/lib/api-helpers'
 import { truncate } from '@/lib/utils'
 import { DISCOVERY_KEY_ERROR_MESSAGES, getDiscoveryApiKeys } from '@/lib/discovery-api-keys'
@@ -113,7 +114,7 @@ export async function GET(req: NextRequest) {
 
   let raw: Response
   try {
-    raw = await fetch(`https://${HOST}/active-jb-1h?${params}`, {
+    raw = await pinnedFetch(`https://${HOST}/active-jb-1h?${params}`, {
       headers: { 'x-rapidapi-key': apiKey, 'x-rapidapi-host': HOST },
       cache: 'no-store',
     })

@@ -1,3 +1,4 @@
+import { pinnedFetch } from '@jobcopilot/shared'
 import { extractHtml, extractPlainText } from '@/lib/gmail-helpers'
 
 const MAX_MESSAGE_FETCH_CONCURRENCY = 8
@@ -30,7 +31,7 @@ export async function fetchRecentGmailMessages(
   listUrl.searchParams.set('maxResults', '100')
   listUrl.searchParams.set('q', query)
 
-  const listResponse = await fetch(listUrl, {
+  const listResponse = await pinnedFetch(listUrl, {
     headers: { Authorization: `Bearer ${accessToken}` },
     signal: AbortSignal.timeout(12_000),
   })
@@ -82,7 +83,7 @@ function messageIds(payload: unknown): string[] {
 }
 
 export async function fetchGmailMessage(accessToken: string, id: string): Promise<GmailRemoteMessage | null> {
-  const response = await fetch(
+  const response = await pinnedFetch(
     `https://gmail.googleapis.com/gmail/v1/users/me/messages/${encodeURIComponent(id)}?format=full`,
     { headers: { Authorization: `Bearer ${accessToken}` }, signal: AbortSignal.timeout(8_000) },
   )

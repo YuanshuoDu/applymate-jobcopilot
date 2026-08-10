@@ -23,6 +23,7 @@
  *   withContact 0|1     — include hiring manager contacts (default 0, costs extra credits)
  */
 import { NextRequest } from 'next/server'
+import { pinnedFetch } from '@jobcopilot/shared'
 import { requireAuth, isErrorResponse, ok, err } from '@/lib/api-helpers'
 import { truncate } from '@/lib/utils'
 
@@ -144,7 +145,7 @@ export async function GET(req: NextRequest) {
 
   let raw: Response
   try {
-    raw = await fetch(`${BASE}/company/search?${params}`, {
+    raw = await pinnedFetch(`${BASE}/company/search?${params}`, {
       headers: {
         'X-API-KEY': apiKey,
         'Content-Type': 'application/json',

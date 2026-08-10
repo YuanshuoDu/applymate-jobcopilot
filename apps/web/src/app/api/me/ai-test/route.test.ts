@@ -3,6 +3,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest'
 const mocks = vi.hoisted(() => ({
   requireAuth: vi.fn(),
   findUnique: vi.fn(),
+  loadUserAiSettings: vi.fn(),
   modelChat: vi.fn(),
   resolveConfig: vi.fn(),
   resolveFeatureConfig: vi.fn(),
@@ -23,6 +24,7 @@ vi.mock('@/lib/model-router', () => ({
   modelChat: mocks.modelChat,
   resolveConfig: mocks.resolveConfig,
   resolveFeatureConfig: mocks.resolveFeatureConfig,
+  loadUserAiSettings: mocks.loadUserAiSettings,
 }))
 
 describe('POST /api/me/ai-test', () => {
@@ -31,6 +33,10 @@ describe('POST /api/me/ai-test', () => {
     Object.values(mocks).forEach(mock => mock.mockReset())
     mocks.requireAuth.mockResolvedValue({ userId: 'user_1' })
     mocks.findUnique.mockResolvedValue({ preferences: { aiSettings: { keys: {}, features: {} } } })
+    mocks.loadUserAiSettings.mockImplementation(async () => {
+      const user = await mocks.findUnique()
+      return (user?.preferences?.aiSettings ?? {}) as Record<string, unknown>
+    })
     mocks.resolveConfig.mockImplementation((config: Record<string, unknown>) => ({
       ...config,
       apiBase: config.apiBase ?? 'https://api.openai.com/v1',

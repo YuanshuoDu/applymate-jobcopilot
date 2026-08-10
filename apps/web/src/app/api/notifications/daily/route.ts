@@ -1,4 +1,5 @@
 import { NextRequest } from 'next/server'
+import { pinnedFetch } from '@jobcopilot/shared'
 import { db } from '@/lib/db'
 import { err, ok } from '@/lib/api-helpers'
 import { readNotificationPreferences } from '@/lib/settings-preferences'
@@ -56,7 +57,7 @@ async function sendEmail(user: UserRow, subject: string, lines: string[]): Promi
   if (!apiKey || !user.email) return false
   const baseUrl = (process.env.APP_URL ?? process.env.NEXTAUTH_URL ?? 'https://applymate.dev').replace(/\/$/, '')
   const htmlLines = lines.map(line => `<li>${escapeHtml(line)}</li>`).join('')
-  const response = await fetch('https://api.resend.com/emails', {
+  const response = await pinnedFetch('https://api.resend.com/emails', {
     method: 'POST',
     headers: { Authorization: `Bearer ${apiKey}`, 'Content-Type': 'application/json' },
     body: JSON.stringify({

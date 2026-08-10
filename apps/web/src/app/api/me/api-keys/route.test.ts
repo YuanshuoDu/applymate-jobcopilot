@@ -6,6 +6,7 @@ const mocks = vi.hoisted(() => ({
   upsert: vi.fn(),
   getDiscoveryApiKeys: vi.fn(),
   getDiscoveryApiKeyStatus: vi.fn(),
+  encryptDiscoveryApiKey: vi.fn(async (_field: unknown, value: string) => `enc:${value}`),
 }))
 
 vi.mock('@/lib/api-helpers', () => ({
@@ -50,7 +51,9 @@ describe('/api/me/api-keys', () => {
     const { POST } = await import('./route')
     const response = await POST(request({ rapidapiKey: null }) as never)
     expect(response.status).toBe(200)
-    expect(mocks.upsert).toHaveBeenCalledWith(expect.objectContaining({ update: { rapidapiKey: null } }))
+    expect(mocks.upsert).toHaveBeenCalledWith(expect.objectContaining({
+      update: { rapidapiKey: null, rapidapiKeyEnc: null },
+    }))
   })
 
   it('returns presence-only status from GET', async () => {

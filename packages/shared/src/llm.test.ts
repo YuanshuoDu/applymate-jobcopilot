@@ -4,6 +4,8 @@
  * If they fail, check packages/shared/src/index.ts — the re-exports may have been dropped.
  */
 import { afterEach, describe, it, expect, vi } from 'vitest'
+const pinnedFetch = vi.hoisted(() => vi.fn((input: string | URL, init?: unknown) => globalThis.fetch(String(input), init as RequestInit)))
+vi.mock('./pinned-outbound.js', () => ({ pinnedFetch }))
 import { callLlm, loadWorkerAiConfig, callLlmText, closeSharedPool } from './index.js'
 import { resolveWorkerAiConfig } from './llm.js'
 

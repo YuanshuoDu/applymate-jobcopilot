@@ -12,6 +12,7 @@
  *   }
  */
 import { NextRequest } from 'next/server'
+import { pinnedFetch } from '@jobcopilot/shared'
 import { requireAuth, isErrorResponse, ok, err } from '@/lib/api-helpers'
 import { DISCOVERY_KEY_ERROR_MESSAGES, getDiscoveryApiKeys } from '@/lib/discovery-api-keys'
 
@@ -40,7 +41,7 @@ export async function GET(req: NextRequest) {
 
   let raw: Response
   try {
-    raw = await fetch(`https://${HOST}/v2/salary/range?${params}`, {
+    raw = await pinnedFetch(`https://${HOST}/v2/salary/range?${params}`, {
       headers: { 'x-rapidapi-key': apiKey, 'x-rapidapi-host': HOST },
       cache: 'no-store',
     })

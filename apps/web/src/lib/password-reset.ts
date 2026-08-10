@@ -1,3 +1,4 @@
+import { pinnedFetch } from '@jobcopilot/shared'
 import { createHash, randomBytes } from 'node:crypto'
 import { normalizeEmail as normalizeAuthEmail } from '@/lib/auth-identifiers'
 import { configuredAppOrigin } from '@/lib/app-url'
@@ -61,7 +62,7 @@ export async function sendPasswordResetEmail(email: string, resetUrl: string): P
   if (!apiKey || !from) return false
 
   try {
-    const response = await fetch('https://api.resend.com/emails', {
+  const response = await pinnedFetch('https://api.resend.com/emails', {
       method: 'POST',
       headers: {
         Authorization: `Bearer ${apiKey}`,

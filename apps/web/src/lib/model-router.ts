@@ -13,9 +13,11 @@
  */
 
 import Anthropic from '@anthropic-ai/sdk'
+import { pinnedFetch } from '@jobcopilot/shared'
 import { db }    from '@/lib/db'
 import { isSafeAiEndpoint } from '@jobcopilot/shared/safe-ai-endpoint'
 import { recordAiUsage } from '@/lib/ai-usage'
+import { decryptAiSettings } from '@/lib/ai-credential-settings'
 
 // ── Provider & model catalogue ────────────────────────────────────────────────
 
@@ -381,13 +383,18 @@ function oaiFetch(c: OaiRequestConfig): Promise<Response> {
         ...(c.model === 'MiniMax-M3' ? { thinking: { type: c.thinking ?? 'adaptive' } } : {}),
       }
     : { max_tokens: c.maxTokens }
-  return fetch(`${c.base}/chat/completions`, {
+  const request = {
     method:  'POST',
     headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${c.key}` },
     body:    JSON.stringify({ model: c.model, ...providerOptions, messages: c.messages, stream: c.stream }),
-    redirect: 'error',
+    redirect: 'error' as const,
     signal:  controller.signal,
-  }).finally(() => clearTimeout(timer))
+  }
+  const response = pinnedFetch(`${c.base}/chat/completions`, {
+    ...request,
+    allowLocalDevelopment: c.provider === 'custom' && process.env.NODE_ENV !== 'production',
+  })
+  return response.finally(() => clearTimeout(timer))
 }
 
 async function oaiCheck(resp: Response, provider: Provider): Promise<void> {
@@ -607,9 +614,15 @@ export async function loadUserAiConfig(
   userId:    string,
   featureId: FeatureId,
 ): Promise<AiConfig & { resolvedKey: string }> {
-  const user   = await db.user.findUnique({ where: { id: userId }, select: { preferences: true } })
-  const prefs  = (user?.preferences ?? {}) as Record<string, unknown>
-  return resolveFeatureConfig(featureId, (prefs.aiSettings ?? null) as UserAiSettings | null)
+  const settings = await loadUserAiSettings(userId)
+  return resolveFeatureConfig(featureId, settings)
+}
+
+export async function loadUserAiSettings(userId: string): Promise<UserAiSettings> {
+  const user = await db.user.findUnique({ where: { id: userId }, select: { preferences: true } })
+  const prefs = (user?.preferences ?? {}) as Record<string, unknown>
+  const aiSettings = await decryptAiSettings(prefs.aiSettings ?? null, userId)
+  return aiSettings as UserAiSettings
 }
 
 export function resolveFeatureConfig(

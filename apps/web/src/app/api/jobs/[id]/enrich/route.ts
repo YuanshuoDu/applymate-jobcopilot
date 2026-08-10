@@ -12,6 +12,7 @@
  * Safe to call multiple times — always overwrites with fresher data.
  */
 import { NextRequest } from 'next/server'
+import { pinnedFetch } from '@jobcopilot/shared'
 import { requireAuth, isErrorResponse, ok, err } from '@/lib/api-helpers'
 import { db } from '@/lib/db'
 import { truncate } from '@/lib/utils'
@@ -92,7 +93,7 @@ export async function POST(_req: NextRequest, { params }: Params) {
       })
       if (job.company) p.set('organization_description_filter', job.company)
 
-      const atsRes = await fetch(`https://active-jobs-db.p.rapidapi.com/active-ats-7d?${p}`, {
+      const atsRes = await pinnedFetch(`https://active-jobs-db.p.rapidapi.com/active-ats-7d?${p}`, {
         headers: { 'x-rapidapi-key': rapidKey, 'x-rapidapi-host': 'active-jobs-db.p.rapidapi.com' },
         signal: AbortSignal.timeout(5_000), cache: 'no-store',
       })
@@ -140,7 +141,7 @@ export async function POST(_req: NextRequest, { params }: Params) {
         age_in_days: '30',
         keyword:     job.role,
       })
-      const mantRes = await fetch(`https://api.mantiks.io/company/jobs?${p}`, {
+      const mantRes = await pinnedFetch(`https://api.mantiks.io/company/jobs?${p}`, {
         headers: { 'X-API-KEY': mantisKey },
         signal: AbortSignal.timeout(6_000), cache: 'no-store',
       })
@@ -186,7 +187,7 @@ export async function POST(_req: NextRequest, { params }: Params) {
 
       const cleanRole = job.role.replace(/\b(senior|sr|junior|jr|lead|staff|principal)\b/gi, '').trim()
       const p = new URLSearchParams({ query: cleanRole, countryCode: cc })
-      const salRes = await fetch(`https://jobs-api14.p.rapidapi.com/v2/salary/range?${p}`, {
+      const salRes = await pinnedFetch(`https://jobs-api14.p.rapidapi.com/v2/salary/range?${p}`, {
         headers: { 'x-rapidapi-key': rapidKey, 'x-rapidapi-host': 'jobs-api14.p.rapidapi.com' },
         next: { revalidate: 3600 },
       })

@@ -7,6 +7,7 @@ import type { Prisma } from '@prisma/client'
 import { requireAuth, isErrorResponse, ok, err } from '@/lib/api-helpers'
 import { db } from '@/lib/db'
 import { isSafeAiEndpoint } from '@jobcopilot/shared/safe-ai-endpoint'
+import { decryptAiSettings, encryptAiSettings } from '@/lib/ai-credential-settings'
 import {
   MODEL_CATALOGUE,
   resolveFeatureConfig,
@@ -161,7 +162,8 @@ export async function GET() {
 
   const user = await db.user.findUnique({ where: { id: auth.userId }, select: { preferences: true } })
   const prefs = asRecord(user?.preferences)
-  return ok({ ...maskedSettings(prefs.aiSettings), platform: platformStatus() })
+  const settings = await decryptAiSettings(prefs.aiSettings, auth.userId)
+  return ok({ ...maskedSettings(settings), platform: platformStatus() })
 }
 
 export async function POST(req: NextRequest) {
@@ -175,7 +177,7 @@ export async function POST(req: NextRequest) {
   if (!user) return err('User not found', 404)
 
   const prefs = asRecord(user.preferences)
-  const existing = asRecord(prefs.aiSettings)
+  const existing = await decryptAiSettings(prefs.aiSettings, auth.userId)
   const mergedKeys: Partial<Record<Provider, string>> = {}
   for (const [provider, key] of Object.entries(asRecord(existing.keys))) {
     if (isProvider(provider) && typeof key === 'string' && key) mergedKeys[provider] = key
@@ -237,10 +239,10 @@ export async function POST(req: NextRequest) {
     }
   }
 
-  const updated = await db.user.update({
+  const encryptedSettings = await encryptAiSettings({ keys: mergedKeys, features: mergedFeatures }, auth.userId)
+  await db.user.update({
     where: { id: auth.userId },
-    data: { preferences: { ...prefs, aiSettings: { keys: mergedKeys, features: mergedFeatures } } as Prisma.InputJsonValue },
-    select: { preferences: true },
+    data: { preferences: { ...prefs, aiSettings: encryptedSettings } as Prisma.InputJsonValue },
   })
-  return ok({ saved: true, settings: { ...maskedSettings(asRecord(updated.preferences).aiSettings), platform: platformStatus() } })
+  return ok({ saved: true, settings: { ...maskedSettings({ keys: mergedKeys, features: mergedFeatures }), platform: platformStatus() } })
 }

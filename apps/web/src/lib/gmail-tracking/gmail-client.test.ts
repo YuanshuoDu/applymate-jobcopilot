@@ -1,4 +1,9 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
+const pinnedFetch = vi.hoisted(() => vi.fn((input: string | URL, init?: unknown) => globalThis.fetch(String(input), init as RequestInit)))
+vi.mock('@jobcopilot/shared', async () => {
+  const actual = await vi.importActual<typeof import('@jobcopilot/shared')>('@jobcopilot/shared')
+  return { ...actual, pinnedFetch }
+})
 import { fetchRecentGmailMessages, GmailApiError } from './gmail-client'
 
 afterEach(() => {

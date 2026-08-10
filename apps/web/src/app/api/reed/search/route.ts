@@ -17,6 +17,7 @@
  *   postedByDirect 0|1     — 1 = direct employers only
  */
 import { NextRequest } from 'next/server'
+import { pinnedFetch } from '@jobcopilot/shared'
 import { requireAuth, isErrorResponse, ok, err } from '@/lib/api-helpers'
 import { truncate } from '@/lib/utils'
 
@@ -64,7 +65,7 @@ export async function GET(req: NextRequest) {
 
   let raw: Response
   try {
-    raw = await fetch(`${BASE}?${params}`, {
+    raw = await pinnedFetch(`${BASE}?${params}`, {
       headers: { Authorization: `Basic ${credentials}` },
       cache: 'no-store',
     })

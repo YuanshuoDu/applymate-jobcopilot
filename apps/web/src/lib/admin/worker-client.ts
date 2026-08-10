@@ -1,3 +1,4 @@
+import { pinnedFetch } from '@jobcopilot/shared'
 import { createHmac, randomUUID } from 'node:crypto'
 
 export type WorkerControlAction = 'queue_summary' | 'failed_queue_jobs' | 'retry_queue_job' | 'dead_letter_jobs' | 'retry_dead_letter_job' | 'pause_queue' | 'resume_queue' | 'pause_worker' | 'resume_worker' | 'apply_ats_policy'
@@ -30,7 +31,7 @@ export async function sendWorkerCommand(
   const payload: WorkerCommand = { ...command, timestamp: Date.now(), nonce: randomUUID() }
   const body = JSON.stringify(payload)
   const signature = createHmac('sha256', config.secret).update(body).digest('hex')
-  const response = await fetch(config.url, { method: 'POST', headers: { 'Content-Type': 'application/json', 'x-worker-control-signature': signature }, body, cache: 'no-store', signal: AbortSignal.timeout(options.timeoutMs ?? 8_000) })
+  const response = await pinnedFetch(config.url, { method: 'POST', headers: { 'Content-Type': 'application/json', 'x-worker-control-signature': signature }, body, cache: 'no-store', signal: AbortSignal.timeout(options.timeoutMs ?? 8_000), redirect: 'error' })
   const result = await response.json().catch(() => null) as WorkerCommandResult | null
   if (!response.ok || !result) throw new Error(result?.error || `Worker command failed (${response.status})`)
   return result

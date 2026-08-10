@@ -3,6 +3,7 @@
  * Sends via Resend API. No-op if RESEND_API_KEY is not set.
  * Non-throwing — email failure never blocks apply result.
  */
+import { pinnedFetch } from '@jobcopilot/shared'
 import { getPool } from '../db/apply-results.js'
 
 export interface NotifyApplyResultParams {
@@ -73,7 +74,7 @@ export async function notifyApplyResult(p: NotifyApplyResultParams): Promise<voi
     `<p><a href="https://applymate.dev/apply-history" style="color:#185FA5">View full apply history →</a></p>`,
   ].join('\n')
 
-  const response = await fetch('https://api.resend.com/emails', {
+  const response = await pinnedFetch('https://api.resend.com/emails', {
     method: 'POST',
     headers: {
       Authorization: `Bearer ${apiKey}`,

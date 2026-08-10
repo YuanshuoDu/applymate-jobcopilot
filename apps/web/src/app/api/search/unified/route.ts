@@ -16,6 +16,7 @@
  *     durationMs, routing, salaryContext, topSkills, cached, withHiringManager } }
  */
 import { NextRequest } from 'next/server'
+import { pinnedFetch } from '@jobcopilot/shared'
 import { requireAuth, isErrorResponse, ok, err } from '@/lib/api-helpers'
 import { truncate, fmtSalary } from '@/lib/utils'
 import { getDiscoveryApiKeys } from '@/lib/discovery-api-keys'
@@ -429,7 +430,7 @@ async function fetchAdzuna(p: Record<string, string>, filters: SearchFilters): P
   if (filters.datePosted === 'week')   params.set('max_days_old', '7')
   if (filters.datePosted === 'month')  params.set('max_days_old', '30')
 
-  const res = await fetch(`https://api.adzuna.com/v1/api/jobs/${country}/search/1?${params}`, { cache: 'no-store' })
+  const res = await pinnedFetch(`https://api.adzuna.com/v1/api/jobs/${country}/search/1?${params}`, { cache: 'no-store', redirect: 'error' })
   if (!res.ok) return []
   const json = await res.json() as { results: Array<{ id: string; title: string; company: { display_name: string }; location: { display_name: string }; salary_min?: number; salary_max?: number; redirect_url: string; description: string; created: string; contract_time?: string }> }
   return (json.results ?? []).map(r => ({
@@ -460,7 +461,7 @@ async function fetchJSearch(p: Record<string, string>, filters: SearchFilters): 
   if (filters.datePosted === 'today') params.set('date_posted', 'today')
   if (filters.datePosted === 'week')  params.set('date_posted', '3days')
 
-  const res = await fetch(`https://jsearch.p.rapidapi.com/search-v2?${params}`, {
+  const res = await pinnedFetch(`https://jsearch.p.rapidapi.com/search-v2?${params}`, {
     headers: { 'X-RapidAPI-Key': apiKey, 'X-RapidAPI-Host': 'jsearch.p.rapidapi.com' },
     cache: 'no-store',
   })
@@ -571,7 +572,7 @@ async function fetchLinkedIn(p: Record<string, string>, filters: SearchFilters):
   if (threshold) params.set('date_filter', threshold)
 
   // Use 24h endpoint for broader coverage in unified search
-  const res = await fetch(`https://${LI_HOST}/active-jb-24h?${params}`, {
+  const res = await pinnedFetch(`https://${LI_HOST}/active-jb-24h?${params}`, {
     headers: { 'x-rapidapi-key': apiKey, 'x-rapidapi-host': LI_HOST },
     cache: 'no-store',
   })
@@ -622,7 +623,7 @@ async function fetchJobicy(p: Record<string, string>, _filters: SearchFilters): 
   if (p.tag) params.set('tag', p.tag)
   if (p.geo) params.set('geo', p.geo)
 
-  const res = await fetch(`https://jobicy.com/api/v2/remote-jobs?${params}`, {
+  const res = await pinnedFetch(`https://jobicy.com/api/v2/remote-jobs?${params}`, {
     headers: { 'User-Agent': 'ApplyMate/1.0' },
     cache: 'no-store',
   })
@@ -683,7 +684,7 @@ async function fetchAts(p: Record<string, string>, filters: SearchFilters): Prom
     if (d) params.set('date_filter', new Date(Date.now() - d * 86_400_000).toISOString().slice(0, 10))
   }
 
-  const res = await fetch(`https://${ATS_HOST}/active-ats-7d?${params}`, {
+  const res = await pinnedFetch(`https://${ATS_HOST}/active-ats-7d?${params}`, {
     headers: { 'x-rapidapi-key': apiKey, 'x-rapidapi-host': ATS_HOST },
     cache: 'no-store',
   })
@@ -765,7 +766,7 @@ async function fetchXing(p: Record<string, string>, filters: SearchFilters): Pro
   if (isRm)              params.set('remoteOptions', 'remote;hybrid')
   if (salaryMin && salaryMin > 0) params.set('minimumSalary', String(salaryMin))
 
-  const res = await fetch(`https://${JOBS_API_HOST}/v2/xing/search?${params}`, {
+  const res = await pinnedFetch(`https://${JOBS_API_HOST}/v2/xing/search?${params}`, {
     headers: { 'x-rapidapi-key': apiKey, 'x-rapidapi-host': JOBS_API_HOST },
     cache: 'no-store',
   })
@@ -818,7 +819,7 @@ async function fetchIndeed(p: Record<string, string>, filters: SearchFilters): P
   const params = new URLSearchParams({ query: q, countryCode, sortType: 'date' })
   if (loc) params.set('location', loc)
 
-  const res = await fetch(`https://${JOBS_API_HOST}/v2/indeed/search?${params}`, {
+  const res = await pinnedFetch(`https://${JOBS_API_HOST}/v2/indeed/search?${params}`, {
     headers: { 'x-rapidapi-key': apiKey, 'x-rapidapi-host': JOBS_API_HOST },
     cache: 'no-store',
   })
@@ -855,7 +856,7 @@ async function fetchRemotive(p: Record<string, string>, _filters: SearchFilters)
   const params = new URLSearchParams({ limit: '20' })
   if (q) params.set('search', q)
 
-  const res = await fetch(`https://remotive.com/api/remote-jobs?${params}`, {
+  const res = await pinnedFetch(`https://remotive.com/api/remote-jobs?${params}`, {
     headers: { 'User-Agent': 'ApplyMate/1.0' },
     next: { revalidate: 900 },
   })
@@ -899,7 +900,7 @@ async function fetchBundesagentur(p: Record<string, string>, filters: SearchFilt
   const dt = DT_MAP[p.datePosted || filters.datePosted || '']
   if (dt) params.set('veroeffentlichtseit', dt)
 
-  const res = await fetch(`https://rest.arbeitsagentur.de/jobboerse/jobsuche-service/pc/v4/jobs?${params}`, {
+  const res = await pinnedFetch(`https://rest.arbeitsagentur.de/jobboerse/jobsuche-service/pc/v4/jobs?${params}`, {
     headers: { 'X-API-Key': 'jobboerse-jobsuche' },
     cache: 'no-store',
   })
@@ -948,7 +949,7 @@ async function fetchCareerjet(p: Record<string, string>, _filters: SearchFilters
   if (q)   params.set('keywords', q)
   if (loc) params.set('location', loc)
 
-  const res = await fetch(`https://search.api.careerjet.net/v4/query?${params}`, { cache: 'no-store' })
+  const res = await pinnedFetch(`https://search.api.careerjet.net/v4/query?${params}`, { cache: 'no-store', redirect: 'error' })
   if (!res.ok) return []
   const json = await res.json() as {
     type?: string; jobs?: Array<{
@@ -987,7 +988,7 @@ async function fetchReed(p: Record<string, string>, filters: SearchFilters): Pro
   else if (filters.jobType === 'parttime')  params.set('partTime', 'true')
   else if (filters.jobType === 'contract')  params.set('contract', 'true')
 
-  const res = await fetch(`https://www.reed.co.uk/api/1.0/search?${params}`, {
+  const res = await pinnedFetch(`https://www.reed.co.uk/api/1.0/search?${params}`, {
     headers: { Authorization: `Basic ${credentials}` },
     cache: 'no-store',
   })
@@ -1049,7 +1050,7 @@ async function fetchIrishjobs(p: Record<string, string>, _f: SearchFilters): Pro
   let xml = ''
   for (const url of urls) {
     try {
-      const r = await fetch(url, {
+      const r = await pinnedFetch(url, {
         headers: { 'User-Agent': 'ApplyMate/1.0', 'Accept': 'application/rss+xml, text/xml' },
         signal:  AbortSignal.timeout(7_000),
         cache:   'no-store',
@@ -1101,7 +1102,7 @@ async function fetchMantiks(p: Record<string, string>, filters: SearchFilters): 
   const params = new URLSearchParams({ job_age_in_days: String(age) })
   params.append('job_title', q)
 
-  const res = await fetch(`https://api.mantiks.io/company/search?${params}`, {
+  const res = await pinnedFetch(`https://api.mantiks.io/company/search?${params}`, {
     headers: { 'X-API-KEY': apiKey },
     cache: 'no-store',
   })
@@ -1172,7 +1173,7 @@ async function fetchInternships(p: Record<string, string>, filters: SearchFilter
     if (d) params.set('date_filter', new Date(Date.now() - d * 86_400_000).toISOString().slice(0, 10))
   }
 
-  const res = await fetch(`https://${INTERNSHIPS_HOST}/active-jb-7d?${params}`, {
+  const res = await pinnedFetch(`https://${INTERNSHIPS_HOST}/active-jb-7d?${params}`, {
     headers: { 'x-rapidapi-key': apiKey, 'x-rapidapi-host': INTERNSHIPS_HOST },
     cache: 'no-store',
   })
@@ -1338,7 +1339,7 @@ async function fetchSalaryCtx(
   try {
     const clean  = jobTitle.replace(/\b(senior|sr|junior|jr|lead|staff|principal)\b/gi, '').trim()
     const params = new URLSearchParams({ query: clean, countryCode: countryCode || 'us' })
-    const res = await fetch(`https://jobs-api14.p.rapidapi.com/v2/salary/range?${params}`, {
+    const res = await pinnedFetch(`https://jobs-api14.p.rapidapi.com/v2/salary/range?${params}`, {
       headers: { 'x-rapidapi-key': apiKey, 'x-rapidapi-host': 'jobs-api14.p.rapidapi.com' },
       next: { revalidate: 3600 },  // cache salary data 1 hr
     })

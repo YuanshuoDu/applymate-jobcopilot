@@ -5,9 +5,10 @@
  * Stores user-provided discovery API keys. GET never returns secret values.
  */
 import { NextRequest } from 'next/server'
+import { pinnedFetch } from '@jobcopilot/shared'
 import { requireAuth, isErrorResponse, ok, err } from '@/lib/api-helpers'
 import { db } from '@/lib/db'
-import { getDiscoveryApiKeyStatus, getDiscoveryApiKeys } from '@/lib/discovery-api-keys'
+import { encryptDiscoveryApiKey, getDiscoveryApiKeyStatus, getDiscoveryApiKeys } from '@/lib/discovery-api-keys'
 
 type ApiKeyPatch = {
   adzunaAppId?: string | null
@@ -49,10 +50,19 @@ async function save(req: NextRequest) {
 
   if (Object.keys(data).length === 0) return err('No API keys provided')
 
+  const encryptedData: Record<string, string | null> = {}
+  for (const [field, value] of Object.entries(data) as Array<[keyof ApiKeyPatch, string | null | undefined]>) {
+    if (value === null) {
+      encryptedData[`${field}Enc`] = null
+      continue
+    }
+    if (typeof value === 'string') encryptedData[`${field}Enc`] = await encryptDiscoveryApiKey(field, value)
+  }
+
   await db.userApiKeys.upsert({
     where:  { userId: auth.userId },
-    create: { userId: auth.userId, ...data },
-    update: data,
+    create: { userId: auth.userId, ...encryptedData },
+    update: { ...encryptedData, ...Object.fromEntries(Object.keys(data).map(field => [field, null])) },
   })
 
   return ok(await getDiscoveryApiKeyStatus(auth.userId))
@@ -67,14 +77,15 @@ async function testConnection(req: NextRequest, body: ApiKeyTestRequest) {
   if (body.provider === 'adzuna') {
     if (!keys.adzunaAppId || !keys.adzunaAppKey) return err('Save both Adzuna credentials before testing')
     const params = new URLSearchParams({ app_id: keys.adzunaAppId, app_key: keys.adzunaAppKey, results_per_page: '1', what: 'software engineer' })
-    const response = await fetch(`https://api.adzuna.com/v1/api/jobs/gb/search/1?${params}`, { cache: 'no-store', signal: AbortSignal.timeout(10_000) }).catch(() => null)
+    const response = await pinnedFetch(`https://api.adzuna.com/v1/api/jobs/gb/search/1?${params}`, { cache: 'no-store', signal: AbortSignal.timeout(10_000), redirect: 'error' }).catch(() => null)
     if (!response?.ok) return err(`Adzuna rejected the credentials (${response?.status ?? 'network error'})`)
   } else {
     if (!keys.rapidapiKey) return err('Save your RapidAPI key before testing')
-    const response = await fetch('https://jsearch.p.rapidapi.com/search?query=software%20engineer&page=1&num_pages=1', {
+    const response = await pinnedFetch('https://jsearch.p.rapidapi.com/search?query=software%20engineer&page=1&num_pages=1', {
       headers: { 'X-RapidAPI-Key': keys.rapidapiKey, 'X-RapidAPI-Host': 'jsearch.p.rapidapi.com' },
       cache: 'no-store',
       signal: AbortSignal.timeout(10_000),
+      redirect: 'error',
     }).catch(() => null)
     if (!response?.ok) return err(`RapidAPI rejected the credentials (${response?.status ?? 'network error'})`)
   }

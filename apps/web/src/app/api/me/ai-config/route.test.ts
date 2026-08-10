@@ -1,4 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { decryptAiSettings } from '@/lib/ai-credential-settings'
 
 const mocks = vi.hoisted(() => ({
   requireAuth: vi.fn(),
@@ -15,6 +16,11 @@ vi.mock('@/lib/api-helpers', () => ({
 vi.mock('@/lib/db', () => ({ db: { user: { findUnique: mocks.findUnique, update: mocks.update } } }))
 
 describe('/api/me/ai-config', () => {
+  async function savedSettings() {
+    const call = mocks.update.mock.calls[0]?.[0] as { data?: { preferences?: { aiSettings?: unknown } } } | undefined
+    return decryptAiSettings(call?.data?.preferences?.aiSettings, 'user_1')
+  }
+
   beforeEach(() => {
     vi.resetModules()
     Object.values(mocks).forEach(mock => mock.mockReset())
@@ -44,19 +50,11 @@ describe('/api/me/ai-config', () => {
     }) as never)
 
     expect(response.status).toBe(200)
-    expect(mocks.update).toHaveBeenCalledWith(expect.objectContaining({
-      data: expect.objectContaining({
-        preferences: expect.objectContaining({
-          futureFlag: { enabled: true },
-          aiSettings: expect.objectContaining({
-            keys: { openai: 'provider-secret' },
-            features: expect.objectContaining({
-              scoring: { provider: 'openai', model: 'gpt-5.5', apiKey: 'feature-secret' },
-            }),
-          }),
-        }),
-      }),
-    }))
+    expect(mocks.update).toHaveBeenCalled()
+    await expect(savedSettings()).resolves.toMatchObject({
+      keys: { openai: 'provider-secret' },
+      features: { scoring: { provider: 'openai', model: 'gpt-5.5', apiKey: 'feature-secret' } },
+    })
   })
 
   it('masks feature keys in GET responses', async () => {
@@ -102,24 +100,12 @@ describe('/api/me/ai-config', () => {
     }) as never)
 
     expect(response.status).toBe(200)
-    expect(mocks.update).toHaveBeenCalledWith(expect.objectContaining({
-      data: expect.objectContaining({
-        preferences: expect.objectContaining({
-          aiSettings: expect.objectContaining({
-            features: expect.objectContaining({
-              agent: {
-                provider: 'custom', model: 'llama-3.3', apiKey: 'custom-secret',
-                apiBase: 'https://llm.example.test/v1', thinking: 'disabled',
-              },
-              autoApply: {
-                provider: 'custom', model: 'llama-3.3', apiKey: 'custom-secret',
-                apiBase: 'https://llm.example.test/v1', thinking: 'disabled',
-              },
-            }),
-          }),
-        }),
-      }),
-    }))
+    await expect(savedSettings()).resolves.toMatchObject({
+      features: {
+        agent: { provider: 'custom', model: 'llama-3.3', apiKey: 'custom-secret', apiBase: 'https://llm.example.test/v1', thinking: 'disabled' },
+        autoApply: { provider: 'custom', model: 'llama-3.3', apiKey: 'custom-secret', apiBase: 'https://llm.example.test/v1', thinking: 'disabled' },
+      },
+    })
   })
 
   it('rejects custom models without an HTTPS endpoint', async () => {
@@ -218,13 +204,7 @@ describe('/api/me/ai-config', () => {
     }) as never)
 
     expect(response.status).toBe(200)
-    expect(mocks.update).toHaveBeenCalledWith(expect.objectContaining({
-      data: expect.objectContaining({
-        preferences: expect.objectContaining({
-          aiSettings: expect.objectContaining({ keys: {} }),
-        }),
-      }),
-    }))
+    await expect(savedSettings()).resolves.not.toHaveProperty('keys')
   })
 
   it('trims provider keys and allows an explicit feature-key clear', async () => {
@@ -239,15 +219,9 @@ describe('/api/me/ai-config', () => {
     }) as never)
 
     expect(response.status).toBe(200)
-    expect(mocks.update).toHaveBeenCalledWith(expect.objectContaining({
-      data: expect.objectContaining({
-        preferences: expect.objectContaining({
-          aiSettings: expect.objectContaining({
-            keys: { openai: 'new-secret' },
-            features: expect.objectContaining({ scoring: { provider: 'openai', model: 'gpt-5.5' } }),
-          }),
-        }),
-      }),
-    }))
+    await expect(savedSettings()).resolves.toMatchObject({
+      keys: { openai: 'new-secret' },
+      features: { scoring: { provider: 'openai', model: 'gpt-5.5' } },
+    })
   })
 })

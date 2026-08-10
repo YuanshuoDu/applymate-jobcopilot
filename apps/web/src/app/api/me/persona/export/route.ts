@@ -13,7 +13,12 @@ const USER_EXPORT_SELECT = {
   onboardingGoals: true, onboardedAt: true, defaultTemplateId: true, defaultAccentColor: true,
   defaultFontFamily: true, aiAutoPilot: true,
   accounts: { select: { provider: true, providerAccountId: true, type: true, scope: true } },
-  apiKeys: { select: { adzunaAppId: true, adzunaAppKey: true, rapidapiKey: true, createdAt: true, updatedAt: true } },
+  apiKeys: { select: {
+    adzunaAppId: true, adzunaAppIdEnc: true,
+    adzunaAppKey: true, adzunaAppKeyEnc: true,
+    rapidapiKey: true, rapidapiKeyEnc: true,
+    createdAt: true, updatedAt: true,
+  } },
   resumes: { select: { id: true, name: true, content: true, templateId: true, templateOptions: true, isDefault: true, kind: true, targetJobId: true, origin: true, createdAt: true, updatedAt: true } },
   resumeVersions: { select: { id: true, resumeId: true, content: true, name: true, createdAt: true } },
   jobs: { select: { id: true, company: true, logo: true, role: true, location: true, status: true, score: true, url: true, description: true, salary: true, source: true, notes: true, coverLetter: true, analysisNote: true, keywords: true, appliedAt: true, followUpAt: true, workflowState: true, createdAt: true, updatedAt: true, finalResumeId: true, finalCoverLetterId: true } },
@@ -54,7 +59,10 @@ export async function GET(req: NextRequest) {
     exportedAt: new Date().toISOString(),
     profile: safeProfile,
     accounts: safeAccounts,
-    apiKeys: { hasAdzuna: Boolean(apiKeys?.adzunaAppId && apiKeys?.adzunaAppKey), hasRapidapi: Boolean(apiKeys?.rapidapiKey) },
+    apiKeys: {
+      hasAdzuna: Boolean((apiKeys?.adzunaAppId || apiKeys?.adzunaAppIdEnc) && (apiKeys?.adzunaAppKey || apiKeys?.adzunaAppKeyEnc)),
+      hasRapidapi: Boolean(apiKeys?.rapidapiKey || apiKeys?.rapidapiKeyEnc),
+    },
   })
   response.headers.set('Cache-Control', 'private, no-store')
   response.headers.set('Content-Disposition', 'attachment; filename="applymate-data.json"')

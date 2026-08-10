@@ -20,6 +20,7 @@
  *   jobType    string  — fulltime | parttime | contract
  */
 import { NextRequest } from 'next/server'
+import { pinnedFetch } from '@jobcopilot/shared'
 import { requireAuth, isErrorResponse, ok, err } from '@/lib/api-helpers'
 import { truncate } from '@/lib/utils'
 
@@ -76,7 +77,7 @@ export async function GET(req: NextRequest) {
 
   let raw: Response
   try {
-    raw = await fetch(`${BASE}?${params}`, { cache: 'no-store' })
+    raw = await pinnedFetch(`${BASE}?${params}`, { cache: 'no-store', redirect: 'error' })
   } catch { return err('Failed to reach CareerJet API', 502) }
 
   if (!raw.ok) {

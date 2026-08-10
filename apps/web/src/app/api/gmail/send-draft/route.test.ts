@@ -8,6 +8,7 @@ const mocks = vi.hoisted(() => ({
   activityCreate: vi.fn(),
   transaction: vi.fn(),
 }))
+const pinnedFetch = vi.hoisted(() => vi.fn((input: string | URL, init?: unknown) => globalThis.fetch(String(input), init as RequestInit)))
 
 vi.mock('@/lib/api-helpers', () => ({
   requireAuth: mocks.requireAuth,
@@ -15,6 +16,10 @@ vi.mock('@/lib/api-helpers', () => ({
   ok: (data: unknown, status = 200) => Response.json(data, { status }),
   err: (error: string, status = 400) => Response.json({ error }, { status }),
 }))
+vi.mock('@jobcopilot/shared', async () => {
+  const actual = await vi.importActual<typeof import('@jobcopilot/shared')>('@jobcopilot/shared')
+  return { ...actual, pinnedFetch }
+})
 vi.mock('@/lib/gmail-helpers', () => ({ getGoogleAccessToken: mocks.getGoogleAccessToken }))
 vi.mock('@/lib/db', () => ({
   db: {

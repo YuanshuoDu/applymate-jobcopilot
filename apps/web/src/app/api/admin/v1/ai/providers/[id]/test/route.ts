@@ -4,6 +4,7 @@ import { writeAdminAudit } from '@/lib/admin/audit'
 import { db } from '@/lib/db'
 import { fixedSecretRef } from '@/lib/admin/ai-config'
 import { isSafeAiEndpoint } from '@jobcopilot/shared/safe-ai-endpoint'
+import { pinnedFetch } from '@jobcopilot/shared'
 
 type Params = { params: Promise<{ id: string }> }
 
@@ -23,7 +24,7 @@ export async function POST(request: NextRequest, { params }: Params) {
   const started = Date.now()
   let status = 'ok'; let httpStatus: number | null = null
   try {
-    const response = await fetch(`${provider.apiBase.replace(/\/$/, '')}/models`, { headers: { Authorization: `Bearer ${secret}` }, cache: 'no-store', signal: AbortSignal.timeout(5_000) })
+    const response = await pinnedFetch(`${provider.apiBase.replace(/\/$/, '')}/models`, { headers: { Authorization: `Bearer ${secret}` }, cache: 'no-store', signal: AbortSignal.timeout(5_000) })
     httpStatus = response.status
     status = response.ok ? 'ok' : response.status === 401 || response.status === 403 ? 'invalid_credential' : 'provider_error'
   } catch { status = 'timeout_or_unreachable' }

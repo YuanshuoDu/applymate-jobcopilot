@@ -20,7 +20,11 @@ const USER_SELECT = {
   phone: true, location: true, linkedin: true, github: true,
   createdAt: true, onboardedAt: true,
   preferences: true,
-  apiKeys: { select: { adzunaAppId: true, adzunaAppKey: true, rapidapiKey: true } },
+  apiKeys: { select: {
+    adzunaAppId: true, adzunaAppIdEnc: true,
+    adzunaAppKey: true, adzunaAppKeyEnc: true,
+    rapidapiKey: true, rapidapiKeyEnc: true,
+  } },
   accounts: { select: { provider: true, scope: true } },
 } as const
 

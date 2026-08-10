@@ -1,5 +1,7 @@
 import pg from "pg";
 import { isSafeAiEndpoint } from "./safe-ai-endpoint.js";
+import { credentialContext, decryptSecret } from "./secret-crypto.js";
+import { pinnedFetch } from "./pinned-outbound.js";
 
 // ── Types ──
 
@@ -72,7 +74,8 @@ export async function loadWorkerAiConfig(userId: string): Promise<AiConfig> {
     );
     if (res.rows.length === 0) return { ...APPLYMATE_BACKING };
 
-    return resolveWorkerAiConfig(res.rows[0].preferences);
+    const preferences = await decryptWorkerAiSettings(res.rows[0].preferences, userId)
+    return resolveWorkerAiConfig(preferences);
   } finally {
     client.release();
   }
@@ -149,19 +152,23 @@ async function callOpenAICompat(
       }
     : { max_tokens: 4096 };
 
-  const res = await fetch(`${base}/chat/completions`, {
+  const request = {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
       Authorization: `Bearer ${key}`,
     },
-    redirect: "error",
     body: JSON.stringify({
       model: config.model,
       messages,
       ...providerOptions,
       temperature: 0.3,
     }),
+  };
+  const res = await pinnedFetch(`${base}/chat/completions`, {
+    ...request,
+    allowLocalDevelopment: config.provider === "custom" && process.env.NODE_ENV !== "production",
+    redirect: "error",
   });
 
   if (!res.ok) {
@@ -211,7 +218,7 @@ async function callAnthropic(
   };
   if (systemContent) body.system = systemContent;
 
-  const res = await fetch("https://api.anthropic.com/v1/messages", {
+  const res = await pinnedFetch("https://api.anthropic.com/v1/messages", {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
@@ -294,6 +301,37 @@ function stringValue(value: unknown): string | undefined {
   if (typeof value !== "string") return undefined;
   const normalized = value.trim();
   return normalized || undefined;
+}
+
+async function decryptWorkerAiSettings(preferences: unknown, userId: string): Promise<unknown> {
+  const root = asRecord(preferences);
+  const aiSettings = asRecord(root.aiSettings);
+  const keys = asRecord(aiSettings.keys);
+  const features = asRecord(aiSettings.features);
+  const decryptedKeys: Record<string, unknown> = { ...keys };
+  for (const [provider, value] of Object.entries(keys)) {
+    if (typeof value === "string") {
+      decryptedKeys[provider] = await decryptSecret(value, credentialContext(`ai:${userId}:provider:${provider}`));
+    }
+  }
+  const decryptedFeatures: Record<string, unknown> = { ...features };
+  for (const [feature, value] of Object.entries(features)) {
+    if (!value || typeof value !== "object" || Array.isArray(value)) continue;
+    const config = value as Record<string, unknown>;
+    if (typeof config.apiKey !== "string") continue;
+    decryptedFeatures[feature] = {
+      ...config,
+      apiKey: await decryptSecret(config.apiKey, credentialContext(`ai:${userId}:feature:${feature}`)),
+    };
+  }
+  return {
+    ...root,
+    aiSettings: {
+      ...aiSettings,
+      keys: decryptedKeys,
+      features: decryptedFeatures,
+    },
+  };
 }
 
 /** Convenience: call LLM and return only the text string */

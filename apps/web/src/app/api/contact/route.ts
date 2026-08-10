@@ -1,3 +1,4 @@
+import { pinnedFetch } from '@jobcopilot/shared'
 import { err, ok } from '@/lib/api-helpers'
 import { contactEmailConfig, contactEmailPayload, parseContactMessage } from '@/lib/contact-message'
 
@@ -10,7 +11,7 @@ export async function POST(req: Request) {
   if ('error' in config) return err(config.error, 503)
 
   try {
-    const response = await fetch('https://api.resend.com/emails', {
+  const response = await pinnedFetch('https://api.resend.com/emails', {
       method: 'POST',
       headers: {
         Authorization: `Bearer ${config.apiKey}`,

@@ -1,3 +1,4 @@
+import { pinnedFetch } from "@jobcopilot/shared";
 import { Queue, Worker } from "bullmq";
 import { Redis } from "ioredis";
 import { workerPollingOptions } from "./worker-polling-options.js";
@@ -28,7 +29,7 @@ export const agentRunWorker = new Worker<AgentRunTaskPayload>(
     if (!url) throw new Error("AGENT_WEB_URL is required for scheduled agent runs");
     if (!secret) throw new Error("AGENT_WORKER_SECRET is required for scheduled agent runs");
 
-    const response = await fetch(url, {
+    const response = await pinnedFetch(url, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",

@@ -1,12 +1,18 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 const lookup = vi.hoisted(() => vi.fn())
+const pinnedFetch = vi.hoisted(() => vi.fn())
 
 vi.mock('node:dns/promises', () => ({ default: { lookup } }))
+vi.mock('@jobcopilot/shared', async () => {
+  const actual = await vi.importActual<typeof import('@jobcopilot/shared')>('@jobcopilot/shared')
+  return { ...actual, pinnedFetch }
+})
 
 describe('safe outbound URL fetches', () => {
   beforeEach(() => {
     lookup.mockReset()
+    pinnedFetch.mockReset()
   })
 
   afterEach(() => {
@@ -33,12 +39,10 @@ describe('safe outbound URL fetches', () => {
   })
 
   it('caps response size and disables redirects', async () => {
-    lookup.mockResolvedValue([{ address: '93.184.216.34', family: 4 }])
-    const fetchMock = vi.fn().mockResolvedValue(new Response('0123456789'))
-    vi.stubGlobal('fetch', fetchMock)
+    pinnedFetch.mockResolvedValue(new Response('0123456789'))
     const { fetchExternalText } = await import('./safe-outbound-url')
 
     await expect(fetchExternalText('https://jobs.example.test/posting', {}, 5)).resolves.toBeNull()
-    expect(fetchMock).toHaveBeenCalledWith(expect.any(URL), expect.objectContaining({ redirect: 'error' }))
+    expect(pinnedFetch).toHaveBeenCalledWith('https://jobs.example.test/posting', expect.objectContaining({ redirect: 'error' }))
   })
 })
