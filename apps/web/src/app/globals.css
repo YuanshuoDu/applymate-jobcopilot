@@ -244,9 +244,59 @@ body {
   margin: -2px -4px;
 }
 
-/* ─── Auth panel — hidden on mobile ─────────────────────────────────── */
-@media (max-width: 767px) {
+/* ─── Authentication layout ─────────────────────────────────────────── */
+.auth-layout {
+  min-height: 100svh !important;
+  overflow-x: hidden !important;
+  overflow-y: auto !important;
+}
+
+.auth-panel {
+  min-height: 100svh;
+}
+
+.auth-form-area,
+.auth-form-card {
+  min-width: 0;
+}
+
+@media (max-width: 900px) {
   .auth-panel { display: none !important; }
+
+  .auth-form-area {
+    width: 100%;
+    padding: 24px 16px !important;
+    align-items: flex-start !important;
+  }
+
+  .auth-form-card {
+    max-width: 460px !important;
+    margin: auto 0;
+    padding: 32px 24px !important;
+  }
+}
+
+@media (max-width: 420px) {
+  .auth-form-area { padding: 16px 12px !important; }
+  .auth-form-card {
+    border-radius: 16px !important;
+    padding: 28px 20px !important;
+  }
+}
+
+@media (min-width: 901px) and (max-height: 760px) {
+  .auth-panel {
+    max-height: 100svh;
+    overflow-y: auto !important;
+    padding: 28px 36px !important;
+  }
+
+  .auth-panel > a { margin-bottom: 28px !important; }
+  .auth-brand-hero { margin-bottom: 24px !important; }
+  .auth-features { gap: 14px !important; }
+  .auth-testimonial { padding-top: 18px !important; }
+  .auth-form-area { padding-block: 24px !important; }
+  .auth-form-card { padding-block: 28px !important; }
 }
 
 /* ─── Responsive — Mobile ────────────────────────────────────────────── */
@@ -254,13 +304,20 @@ body {
   :root {
     --sidebar-w: 0px;
     --bottom-bar: 60px;
+    --mobile-nav-h: 60px;
+    --mobile-content-inset: calc(var(--mobile-nav-h) + env(safe-area-inset-bottom));
   }
   #desktop-sidebar  { display: none !important; }
   #mobile-bottom-bar { display: flex !important; }
-  #main-content { padding-bottom: var(--bottom-bar); }
+  #main-content {
+    padding-bottom: var(--mobile-content-inset);
+    min-width: 0;
+    min-height: 0;
+  }
 
   .settings-workspace {
     flex-direction: column !important;
+    min-width: 0 !important;
     overflow-y: auto !important;
   }
 
@@ -282,25 +339,268 @@ body {
   .settings-sidebar button {
     width: auto !important;
     flex: 0 0 auto;
+    min-height: 40px;
     white-space: nowrap;
     min-height: 34px;
   }
 
   .settings-content {
     overflow: visible !important;
-    padding: 16px !important;
+    min-width: 0 !important;
+    padding: 16px 16px calc(24px + var(--mobile-content-inset)) !important;
   }
+
+  .settings-profile-grid {
+    grid-template-columns: minmax(0, 1fr) !important;
+  }
+
+  .settings-field-row {
+    align-items: flex-start !important;
+    flex-direction: column !important;
+    gap: 5px !important;
+  }
+
+  .settings-field-row > span {
+    width: 100%;
+    min-width: 0 !important;
+  }
+
+  .settings-field-control {
+    width: 100%;
+    min-width: 0 !important;
+  }
+
+  .settings-field-control input,
+  .settings-field-control select {
+    width: 100% !important;
+    max-width: none !important;
+    min-width: 0 !important;
+  }
+}
+
+@media (max-width: 900px) {
+  .settings-workspace {
+    flex-direction: column !important;
+    min-width: 0 !important;
+    overflow-y: auto !important;
+  }
+
+  .settings-sidebar {
+    width: 100% !important;
+    min-height: 0;
+    flex-direction: row !important;
+    gap: 4px !important;
+    overflow-x: auto !important;
+    overflow-y: hidden !important;
+    border-right: 0 !important;
+    border-bottom: 1px solid var(--border) !important;
+    padding: 8px !important;
+  }
+
+  .settings-sidebar > div:first-child { display: none; }
+
+  .settings-sidebar button {
+    width: auto !important;
+    flex: 0 0 auto;
+    min-height: 40px;
+    white-space: nowrap;
+  }
+
+  .settings-content {
+    overflow: visible !important;
+    min-width: 0 !important;
+    padding: 16px 16px calc(24px + var(--mobile-content-inset, 0px)) !important;
+  }
+
+  .settings-profile-grid {
+    grid-template-columns: minmax(0, 1fr) !important;
+  }
+
+  .settings-field-row {
+    align-items: flex-start !important;
+    flex-direction: column !important;
+    gap: 5px !important;
+  }
+
+  .settings-field-row > span,
+  .settings-field-control {
+    width: 100%;
+    min-width: 0 !important;
+  }
+
+  .settings-field-control input,
+  .settings-field-control select {
+    width: 100% !important;
+    max-width: none !important;
+    min-width: 0 !important;
+  }
+}
+
+.mobile-scroll-safe-area {
+  padding-bottom: var(--mobile-content-inset, 0px);
+}
+
+.jobs-mobile-list {
+  display: none;
+  min-width: 0;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.jobs-mobile-card {
+  display: flex;
+  min-width: 0;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 12px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--bg);
+}
+
+.jobs-mobile-card > input {
+  flex: 0 0 auto;
+  margin-top: 4px;
+}
+
+.jobs-mobile-card-main {
+  display: block;
+  min-width: 0;
+  flex: 1;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: var(--text);
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.jobs-mobile-card-heading,
+.jobs-mobile-card-meta {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 8px;
+}
+
+.jobs-mobile-card-heading { align-items: flex-start; }
+
+.jobs-mobile-card-copy {
+  display: flex;
+  min-width: 0;
+  flex: 1;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.jobs-mobile-card-copy strong,
+.jobs-mobile-card-copy span,
+.jobs-mobile-card-role { overflow-wrap: anywhere; }
+.jobs-mobile-card-copy strong { font-size: 12px; font-weight: 650; }
+.jobs-mobile-card-copy span,
+.jobs-mobile-card-meta span { color: var(--text-muted); font-size: 10px; }
+.jobs-mobile-card-role { margin: 10px 0 8px; font-size: 13px; font-weight: 650; line-height: 1.35; }
+.jobs-mobile-card-meta { justify-content: space-between; }
+
+@media (max-width: 1200px) {
+  .jobs-desktop-list { display: none; }
+  .jobs-mobile-list { display: flex; }
+}
+
+@media (max-width: 767px) {
+  .app-topbar {
+    padding: 10px 16px !important;
+    align-items: flex-start !important;
+  }
+
+  .app-topbar > div:last-child {
+    width: 100%;
+  }
+
+  .search-page {
+    min-width: 0;
+    padding-bottom: var(--mobile-content-inset);
+  }
+
+  .search-page-content {
+    min-width: 0;
+    padding: 12px 16px calc(24px + var(--mobile-content-inset)) !important;
+  }
+
+  .jobs-page {
+    min-width: 0;
+    padding-bottom: var(--mobile-content-inset);
+  }
+
+  .jobs-page-header {
+    height: auto !important;
+    min-height: 0 !important;
+    flex-shrink: 0 !important;
+    padding: 12px 16px !important;
+  }
+
+  .jobs-page-content {
+    min-width: 0;
+    padding: 10px 16px calc(24px + var(--mobile-content-inset)) !important;
+  }
+
+  .jobs-page-toolbar {
+    padding: 10px !important;
+    gap: 8px !important;
+  }
+
+  .jobs-page-search {
+    width: 100% !important;
+    flex: 1 1 100%;
+  }
+
 }
 
 /* ─── Mobile Bottom Nav ──────────────────────────────────────────────── */
 #mobile-bottom-bar {
   display: none;
-  position: fixed; bottom: 0; left: 0; right: 0; height: 60px; z-index: 50;
+  position: fixed; bottom: 0; left: 0; right: 0; height: var(--mobile-nav-h, 60px); z-index: 50;
   background: var(--glass-topbar);
   backdrop-filter: var(--glass-blur);
   -webkit-backdrop-filter: var(--glass-blur);
   border-top: 1px solid var(--border-glass);
   align-items: center; justify-content: space-around;
+  padding-bottom: env(safe-area-inset-bottom);
+}
+
+.mobile-more-menu {
+  position: fixed;
+  right: 12px;
+  bottom: calc(var(--mobile-content-inset, 60px) + 8px);
+  z-index: 60;
+  display: grid;
+  min-width: 156px;
+  gap: 4px;
+  padding: 6px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--bg);
+  box-shadow: 0 16px 36px rgba(15,23,42,0.16);
+}
+
+.mobile-more-menu button {
+  min-height: 40px;
+  padding: 0 12px;
+  border: 0;
+  border-radius: 7px;
+  background: transparent;
+  color: var(--text);
+  font: inherit;
+  font-size: 12px;
+  text-align: left;
+  cursor: pointer;
+}
+
+.mobile-more-menu button:hover,
+.mobile-more-menu button:focus-visible {
+  background: var(--nav-active);
+  color: var(--primary);
 }
 
 /* ─── Selection ──────────────────────────────────────────────────────── */

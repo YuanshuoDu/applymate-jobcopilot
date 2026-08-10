@@ -153,15 +153,15 @@ export function LoginPage({ switchAccount = false }: { switchAccount?: boolean }
   }
 
   return (
-    <div style={{
+    <div className="auth-layout" style={{
       display: 'flex', minHeight: '100vh',
       backgroundImage: 'linear-gradient(135deg, #EEF2FF 0%, #F5F3FF 35%, #EDE9FE 65%, #F0F9FF 100%)',
-      backgroundAttachment: 'fixed', position: 'relative', overflow: 'hidden',
+      backgroundAttachment: 'fixed', position: 'relative', overflowX: 'hidden',
     }}>
       {/* Decorative blobs */}
-      <div style={{ position:'absolute', top:'-15%', left:'-10%', width:600, height:600, borderRadius:'50%', background:'radial-gradient(circle, rgba(79,70,229,0.18) 0%, transparent 70%)', pointerEvents:'none', filter:'blur(40px)' }} />
-      <div style={{ position:'absolute', bottom:'-20%', right:'-5%', width:700, height:700, borderRadius:'50%', background:'radial-gradient(circle, rgba(124,58,237,0.14) 0%, transparent 70%)', pointerEvents:'none', filter:'blur(50px)' }} />
-      <div style={{ position:'absolute', top:'40%', left:'35%', width:400, height:400, borderRadius:'50%', background:'radial-gradient(circle, rgba(2,132,199,0.08) 0%, transparent 70%)', pointerEvents:'none', filter:'blur(30px)' }} />
+      <div style={{ position:'absolute', top:'-15%', left:'-10%', width:600, height:600, borderRadius:'50%', background:'radial-gradient(circle, rgba(79,70,229,0.10) 0%, transparent 70%)', pointerEvents:'none', filter:'blur(40px)' }} />
+      <div style={{ position:'absolute', bottom:'-20%', right:'-5%', width:700, height:700, borderRadius:'50%', background:'radial-gradient(circle, rgba(124,58,237,0.08) 0%, transparent 70%)', pointerEvents:'none', filter:'blur(50px)' }} />
+      <div style={{ position:'absolute', top:'40%', left:'35%', width:400, height:400, borderRadius:'50%', background:'radial-gradient(circle, rgba(2,132,199,0.04) 0%, transparent 70%)', pointerEvents:'none', filter:'blur(30px)' }} />
 
       {/* ── Left brand panel ────────────────────────────────── */}
       <div className="auth-panel" style={{
@@ -193,7 +193,7 @@ export function LoginPage({ switchAccount = false }: { switchAccount?: boolean }
         </Link>
 
         {/* Hero text */}
-        <div style={{ marginBottom:40 }}>
+        <div className="auth-brand-hero" style={{ marginBottom:40 }}>
           <h1 style={{ fontSize:28, fontWeight:800, color:C.text, lineHeight:1.25, marginBottom:14, letterSpacing:'-0.02em' }}>
             Let AI help you<br />find your next opportunity
           </h1>
@@ -203,7 +203,7 @@ export function LoginPage({ switchAccount = false }: { switchAccount?: boolean }
         </div>
 
         {/* Features */}
-        <div style={{ display:'flex', flexDirection:'column', gap:22 }}>
+        <div className="auth-features" style={{ display:'flex', flexDirection:'column', gap:22 }}>
           {FEATURES.map(f => (
             <div key={f.title} style={{ display:'flex', gap:14, alignItems:'flex-start' }}>
               <div style={{
@@ -222,7 +222,7 @@ export function LoginPage({ switchAccount = false }: { switchAccount?: boolean }
         </div>
 
         {/* Testimonial */}
-        <div style={{ marginTop:'auto', paddingTop:28, borderTop:`1px solid ${C.border}` }}>
+        <div className="auth-testimonial" style={{ marginTop:'auto', paddingTop:28, borderTop:`1px solid ${C.border}` }}>
           <div style={{
             background:'linear-gradient(135deg, rgba(79,70,229,0.06) 0%, rgba(124,58,237,0.04) 100%)',
             border:'1px solid rgba(79,70,229,0.12)', borderRadius:12, padding:'16px 18px',
@@ -239,11 +239,11 @@ export function LoginPage({ switchAccount = false }: { switchAccount?: boolean }
       </div>
 
       {/* ── Right form panel ────────────────────────────────── */}
-      <div style={{
+      <div className="auth-form-area" style={{
         flex:1, display:'flex', alignItems:'center', justifyContent:'center',
         padding:'32px 24px', position:'relative', zIndex:1,
       }}>
-        <div style={{
+        <div className="auth-form-card" style={{
           width:'100%', maxWidth:420,
           background:'rgba(255,255,255,0.80)',
           backdropFilter:'blur(24px) saturate(200%)',
@@ -306,9 +306,9 @@ export function LoginPage({ switchAccount = false }: { switchAccount?: boolean }
           <form onSubmit={handleCredentials} style={{ display:'flex', flexDirection:'column', gap:15 }}>
             {/* Email */}
             <div style={{ display:'flex', flexDirection:'column', gap:7 }}>
-              <label style={{ fontSize:12, fontWeight:500, color:C.muted }}>Email</label>
+              <label htmlFor="login-email" style={{ fontSize:12, fontWeight:500, color:C.muted }}>Email</label>
               <input
-                type="email" value={email} autoComplete="email" placeholder="you@example.com"
+                id="login-email" name="email" type="email" value={email} autoComplete="email" placeholder="you@example.com"
                 onFocus={() => setFocused('email')} onBlur={() => setFocused(null)}
                 onChange={e => setEmail(e.target.value)}
                 style={{
@@ -324,11 +324,11 @@ export function LoginPage({ switchAccount = false }: { switchAccount?: boolean }
             {/* Password */}
             <div style={{ display:'flex', flexDirection:'column', gap:7 }}>
               <div style={{ display:'flex', justifyContent:'space-between', alignItems:'center' }}>
-                <label style={{ fontSize:12, fontWeight:500, color:C.muted }}>Password</label>
+                <label htmlFor="login-password" style={{ fontSize:12, fontWeight:500, color:C.muted }}>Password</label>
                 <Link href="/forgot-password" style={{ fontSize:11, color:C.primary, textDecoration:'none', fontWeight:500 }}>Forgot password?</Link>
               </div>
               <input
-                type="password" value={password} autoComplete="current-password" placeholder="••••••••"
+                id="login-password" name="password" type="password" value={password} autoComplete="current-password" placeholder="••••••••"
                 onFocus={() => setFocused('password')} onBlur={() => setFocused(null)}
                 onChange={e => setPassword(e.target.value)}
                 style={{

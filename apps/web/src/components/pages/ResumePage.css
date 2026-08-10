@@ -169,7 +169,10 @@
 @media (max-width: 680px) {
   .resume-library-heading { grid-template-columns: minmax(0, 1fr); min-height: 54px; gap: 8px; padding: 8px 14px; }
   .resume-library-heading h1 { font-size: 19px; }
-  .resume-library-toolbar { width: 100%; gap: 7px; overflow-x: auto; padding-bottom: 2px; }
+  .resume-library-toolbar { width: 100%; flex-wrap: wrap; align-content: center; gap: 7px; overflow-x: visible; padding-bottom: 2px; }
+  .resume-toolbar-divider { display: none; }
+  .resume-final-confirm-trigger,
+  .resume-top-save { margin-left: 0; }
   .resume-library-layout { display: flex !important; flex-direction: column; }
   .resume-library-layout.is-library-collapsed { min-width: 0; }
   .resume-library-sidebar { width: auto; flex-basis: auto; border-right: 0; border-bottom: 1px solid #ebeaf6; }
