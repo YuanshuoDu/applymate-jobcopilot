@@ -1,7 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
 const mocks = vi.hoisted(() => ({ requireAdmin: vi.fn(), findUnique: vi.fn(), idempotency: vi.fn(), audit: vi.fn() }))
-vi.mock('@/lib/admin/authorization', () => ({ requireAdmin: mocks.requireAdmin }))
+vi.mock('@/lib/admin/authorization', () => ({ requireAdmin: mocks.requireAdmin, isAdminResponse: (value: unknown) => value instanceof Response }))
 vi.mock('@/lib/db', () => ({ db: { adminBroadcast: { findUnique: mocks.findUnique } } }))
 vi.mock('@/lib/admin/idempotency', () => ({ withAdminIdempotency: mocks.idempotency }))
 vi.mock('@/lib/admin/audit', () => ({ writeAdminAudit: mocks.audit }))

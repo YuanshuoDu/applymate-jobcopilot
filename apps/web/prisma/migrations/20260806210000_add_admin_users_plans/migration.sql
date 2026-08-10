@@ -1,6 +1,15 @@
 CREATE TYPE "UserAccountStatus" AS ENUM ('active', 'suspended');
 CREATE TYPE "PlanEntitlementKind" AS ENUM ('boolean', 'limit', 'text');
 
+ALTER TYPE "AdminTargetType" ADD VALUE IF NOT EXISTS 'plan';
+ALTER TYPE "AdminTargetType" ADD VALUE IF NOT EXISTS 'plan_change';
+ALTER TYPE "AdminTargetType" ADD VALUE IF NOT EXISTS 'ai_provider';
+ALTER TYPE "AdminTargetType" ADD VALUE IF NOT EXISTS 'ai_model';
+ALTER TYPE "AdminTargetType" ADD VALUE IF NOT EXISTS 'ai_route';
+ALTER TYPE "AdminTargetType" ADD VALUE IF NOT EXISTS 'admin_role';
+
+ALTER TABLE "AdminRole" ADD COLUMN IF NOT EXISTS "version" INTEGER NOT NULL DEFAULT 1;
+
 ALTER TABLE "User"
   ADD COLUMN "accountStatus" "UserAccountStatus" NOT NULL DEFAULT 'active',
   ADD COLUMN "suspendedAt" TIMESTAMP(3),

@@ -1,25 +1,22 @@
+import { NextRequest, NextResponse } from 'next/server'
+import { isAdminResponse, requireAdmin } from '@/lib/admin/authorization'
+import { writeAdminAudit } from '@/lib/admin/audit'
+import { adminUserMetadataSelect, toAdminUserMetadata } from '@/lib/admin/dto'
 import { db } from '@/lib/db'
-import { requireAdmin } from '@/lib/admin/authorization'
-import { toAdminUserDto } from '@/lib/admin/dto'
-import { adminError, adminJson, requestId } from '@/lib/admin/route-utils'
 
-const USER_DETAIL_SELECT = {
-  id: true, email: true, name: true, plan: true, accountStatus: true, location: true,
-  createdAt: true, updatedAt: true, suspendedAt: true,
-  _count: { select: { resumes: true, jobs: true, applicationTasks: true } },
-  planChanges: { orderBy: { createdAt: 'desc' as const }, take: 20, select: { id: true, fromPlan: true, toPlan: true, createdAt: true } },
-} as const
-
-export async function GET(request: Request, context: { params: Promise<{ id: string }> }) {
-  const correlationId = requestId(request)
-  try {
-    await requireAdmin('users.read', request)
-    const { id } = await context.params
-    const user = await db.user.findUnique({ where: { id }, select: USER_DETAIL_SELECT })
-    if (!user) return adminJson({ error: 'ADMIN_USER_NOT_FOUND' }, 404, correlationId)
-    const { planChanges, ...metadata } = user
-    return adminJson({ user: toAdminUserDto(metadata), planChanges: planChanges.map(change => ({ id: change.id, fromPlan: change.fromPlan, toPlan: change.toPlan, createdAt: change.createdAt.toISOString() })) }, 200, correlationId)
-  } catch (error) {
-    return adminError(error, correlationId)
-  }
+export async function GET(request: NextRequest, context: { params: Promise<{ id: string }> }) {
+  const actor = await requireAdmin('users.read', request)
+  if (isAdminResponse(actor)) return actor
+  const { id } = await context.params
+  const user = await db.user.findUnique({ where: { id }, select: adminUserMetadataSelect })
+  if (!user) return NextResponse.json({ error: 'Not found' }, { status: 404, headers: { 'Cache-Control': 'no-store' } })
+  const [applicationCount, recentApplications] = await Promise.all([
+    db.applyResult.count({ where: { userId: id } }),
+    db.applyResult.findMany({
+      where: { userId: id }, take: 5, orderBy: { createdAt: 'desc' },
+      select: { id: true, status: true, mode: true, atsType: true, flowUsed: true, durationMs: true, createdAt: true },
+    }),
+  ])
+  await writeAdminAudit({ requestId: actor.requestId, actorUserId: actor.userId, actorRoleKey: actor.roleKey, action: 'users.detail_viewed', targetType: 'user', targetId: id, tenantUserId: id, outcome: 'success' })
+  return NextResponse.json({ user: toAdminUserMetadata(user), applications: { count: applicationCount, recent: recentApplications } }, { headers: { 'Cache-Control': 'no-store', 'x-request-id': actor.requestId } })
 }

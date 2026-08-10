@@ -2,7 +2,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest'
 
 const mocks = vi.hoisted(() => ({ findMany: vi.fn(), requireAdmin: vi.fn(), audit: vi.fn() }))
 vi.mock('@/lib/db', () => ({ db: { aiProviderConfig: { findMany: mocks.findMany } } }))
-vi.mock('@/lib/admin/authorization', () => ({ requireAdmin: mocks.requireAdmin }))
+vi.mock('@/lib/admin/authorization', () => ({ requireAdmin: mocks.requireAdmin, isAdminResponse: (value: unknown) => value instanceof Response }))
 
 describe('GET /api/admin/v1/ai/providers', () => {
   beforeEach(() => { vi.resetModules(); mocks.findMany.mockReset(); mocks.requireAdmin.mockReset(); mocks.requireAdmin.mockResolvedValue({ userId: 'admin_1', roleKey: 'platform_admin' }); vi.stubEnv('MINIMAX_API_KEY', 'runtime-secret') })

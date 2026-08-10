@@ -488,11 +488,323 @@ model AiBudget {
   month     String                                // "2026-06"
   used      Int      @default(0)
   limit     Int      @default(30)
+  version   Int      @default(1)
   createdAt DateTime @default(now()) @map("created_at")
   updatedAt DateTime @updatedAt @map("updated_at")
+  adjustments AiBudgetAdjustment[]
+  resetRequests AiBudgetResetRequest[]
 
   @@unique([userId, month])
   @@map("ai_budgets")
+}
+
+model AiBudgetAdjustment {
+  id             String   @id @default(cuid())
+  budgetId       String   @map("budget_id")
+  actorUserId    String   @map("actor_user_id")
+  kind           String
+  previousLimit  Int      @map("previous_limit")
+  nextLimit      Int      @map("next_limit")
+  previousUsed   Int?     @map("previous_used")
+  nextUsed       Int?     @map("next_used")
+  reason         String
+  idempotencyKey String   @unique @map("idempotency_key")
+  createdAt      DateTime @default(now()) @map("created_at")
+  budget         AiBudget @relation(fields: [budgetId], references: [id], onDelete: Restrict)
+
+  @@index([budgetId, createdAt(sort: Desc)])
+  @@map("ai_budget_adjustments")
+}
+
+enum AiBudgetResetStatus {
+  pending
+  approved
+  expired
+  cancelled
+}
+
+model AiBudgetResetRequest {
+  id                String              @id @default(cuid())
+  budgetId          String              @map("budget_id")
+  requesterId       String              @map("requester_id")
+  approverId        String?             @map("approver_id")
+  reason            String
+  status            AiBudgetResetStatus @default(pending)
+  budgetVersion     Int                 @map("budget_version")
+  createIdempotencyKey String           @unique @map("create_idempotency_key")
+  approveIdempotencyKey String?         @unique @map("approve_idempotency_key")
+  expiresAt         DateTime            @map("expires_at")
+  createdAt         DateTime            @default(now()) @map("created_at")
+  approvedAt        DateTime?           @map("approved_at")
+  budget            AiBudget            @relation(fields: [budgetId], references: [id], onDelete: Restrict)
+
+  @@index([status, expiresAt])
+  @@map("ai_budget_reset_requests")
+}
+
+enum AdminMembershipStatus {
+  active
+  suspended
+  revoked
+}
+
+enum AdminMfaLevel {
+  none
+  totp
+  webauthn
+}
+
+enum AdminAuditOutcome {
+  success
+  denied
+  failed
+}
+
+enum AdminTargetType {
+  user
+  job
+  application
+  ats_source
+  feature_flag
+  ai_budget
+  queue
+  plan
+  plan_change
+  ai_provider
+  ai_model
+  ai_route
+  admin_role
+  broadcast
+  support_case
+  admin_member
+}
+
+enum BroadcastStatus {
+  draft
+  pending_approval
+  scheduled
+  publishing
+  published
+  cancelled
+  failed
+}
+
+enum BroadcastAudienceType {
+  all_active_users
+  plan
+  location
+  explicit_user_ids
+}
+
+enum FeatureFlagStatus {
+  draft
+  pending_approval
+  active
+  retired
+}
+
+enum AtsSourceState {
+  enabled
+  degraded
+  pending_pause
+  paused
+  disabled
+}
+
+enum SupportCaseStatus {
+  open
+  in_progress
+  waiting_on_customer
+  resolved
+  closed
+}
+
+enum SupportCasePriority {
+  low
+  normal
+  high
+  urgent
+}
+
+enum SupportCaseMessageKind {
+  customer_reply
+  staff_reply
+  internal_note
+  system_event
+}
+
+model AdminRole {
+  id          String   @id @default(cuid())
+  key         String   @unique
+  name        String
+  description String?
+  permissions String[]
+  system      Boolean  @default(true)
+  version     Int      @default(1)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+  memberships AdminMembership[]
+}
+
+model AdminMembership {
+  id             String                @id @default(cuid())
+  userId         String                @unique
+  roleId         String
+  status         AdminMembershipStatus @default(active)
+  mfaLevel       AdminMfaLevel         @default(none)
+  sessionVersion Int                   @default(1)
+  grantedById    String?
+  grantedAt      DateTime              @default(now())
+  revokedAt      DateTime?
+  user           User                  @relation("AdminUser", fields: [userId], references: [id], onDelete: Restrict)
+  role           AdminRole             @relation(fields: [roleId], references: [id], onDelete: Restrict)
+  @@index([status, roleId])
+}
+
+model AdminAuditLog {
+  id            String            @id @default(cuid())
+  requestId     String
+  actorUserId   String?
+  actorRoleKey  String?
+  action        String
+  targetType    AdminTargetType?
+  targetId      String?
+  tenantUserId  String?
+  reason        String?
+  outcome       AdminAuditOutcome
+  ipHash        String?
+  userAgentHash String?
+  before        Json?
+  after         Json?
+  errorCode     String?
+  createdAt     DateTime          @default(now())
+  @@index([actorUserId, createdAt(sort: Desc)])
+  @@index([tenantUserId, createdAt(sort: Desc)])
+  @@index([action, createdAt(sort: Desc)])
+}
+
+model AdminBreakGlassGrant {
+  id          String   @id @default(cuid())
+  requesterId String
+  approverId  String?
+  permission  String
+  reason      String
+  expiresAt   DateTime
+  revokedAt   DateTime?
+  createdAt   DateTime @default(now())
+  @@index([requesterId, expiresAt])
+}
+
+model AdminBroadcast {
+  id             String                @id @default(cuid())
+  title          String
+  body           String                @db.Text
+  audienceType   BroadcastAudienceType
+  audience       Json
+  status         BroadcastStatus       @default(draft)
+  scheduledAt    DateTime?
+  createdById    String
+  approvedById   String?
+  publishedById  String?
+  createIdempotencyKey String?        @unique
+  publishIdempotencyKey String?       @unique
+  recipientCount Int                   @default(0)
+  deliveredCount Int                   @default(0)
+  failedCount    Int                   @default(0)
+  createdAt      DateTime              @default(now())
+  updatedAt      DateTime              @updatedAt
+  notifications  Notification[]
+  @@index([status, scheduledAt])
+}
+
+model PlatformFeatureFlag {
+  id            String            @id @default(cuid())
+  key           String
+  environment   String
+  enabled       Boolean           @default(false)
+  rolloutPercent Int              @default(0)
+  targetPlans   Plan[]
+  targetUserIds String[]
+  status        FeatureFlagStatus @default(draft)
+  version       Int               @default(1)
+  createdById   String
+  approvedById  String?
+  updatedById   String
+  rollbackAt    DateTime?
+  createdAt     DateTime          @default(now())
+  updatedAt     DateTime          @updatedAt
+  @@unique([key, environment])
+  @@index([environment, status])
+}
+
+model AtsSourcePolicy {
+  id                      String         @id @default(cuid())
+  sourceKey               String         @unique @map("source_key")
+  state                   AtsSourceState @default(enabled)
+  enabled                 Boolean        @default(true)
+  rolloutPercent          Int            @default(100) @map("rollout_percent")
+  globalRpsLimit          Int            @map("global_rps_limit")
+  perTenantRpsLimit       Int            @map("per_tenant_rps_limit")
+  maxRetries              Int            @default(3) @map("max_retries")
+  backoffBaseMs           Int            @default(1000) @map("backoff_base_ms")
+  allowAutoApply          Boolean        @default(false) @map("allow_auto_apply")
+  version                 Int            @default(1)
+  lastChangedById         String         @map("last_changed_by_id")
+  lastAcknowledgedVersion Int?           @map("last_acknowledged_version")
+  pauseRequestedById      String?        @map("pause_requested_by_id")
+  pauseApprovedById       String?        @map("pause_approved_by_id")
+  updatedAt               DateTime       @updatedAt @map("updated_at")
+
+  @@index([state, updatedAt(sort: Desc)])
+  @@map("ats_source_policies")
+}
+
+model AdminIdempotencyKey {
+  id             String   @id @default(cuid())
+  actorUserId    String   @map("actor_user_id")
+  action         String
+  idempotencyKey String   @map("idempotency_key")
+  targetId       String?  @map("target_id")
+  createdAt      DateTime @default(now()) @map("created_at")
+
+  @@unique([actorUserId, action, idempotencyKey])
+  @@map("admin_idempotency_keys")
+}
+
+model SupportCase {
+  id               String            @id @default(cuid())
+  requesterUserId  String            @map("requester_user_id")
+  subject          String
+  category         String
+  status           SupportCaseStatus @default(open)
+  priority         SupportCasePriority @default(normal)
+  assignedAdminId  String?           @map("assigned_admin_id")
+  slaDueAt         DateTime?         @map("sla_due_at")
+  firstRespondedAt DateTime?         @map("first_responded_at")
+  resolvedAt       DateTime?         @map("resolved_at")
+  safeContext      Json?             @map("safe_context")
+  version          Int               @default(1)
+  createdAt        DateTime          @default(now())
+  updatedAt        DateTime          @updatedAt
+  requester        User              @relation("SupportRequester", fields: [requesterUserId], references: [id], onDelete: Cascade)
+  messages         SupportCaseMessage[]
+  @@index([status, priority, slaDueAt])
+  @@index([requesterUserId, updatedAt(sort: Desc)])
+  @@map("support_cases")
+}
+
+model SupportCaseMessage {
+  id           String                 @id @default(cuid())
+  caseId       String                 @map("case_id")
+  authorType   SupportCaseMessageKind @map("author_type")
+  authorUserId String?                @map("author_user_id")
+  idempotencyKey String?              @unique @map("idempotency_key")
+  body         String                 @db.Text
+  redacted     Boolean                @default(false)
+  createdAt    DateTime               @default(now())
+  supportCase  SupportCase            @relation(fields: [caseId], references: [id], onDelete: Cascade)
+  @@index([caseId, createdAt])
+  @@map("support_case_messages")
 }
 
 model Notification {
@@ -630,9 +942,9 @@ model PlanCatalog {
   createdAt         DateTime @default(now())
   updatedAt         DateTime @updatedAt
 
-  entitlements     PlanEntitlement[]
-  fromTransitions  PlanTransition[] @relation("FromPlan")
-  toTransitions    PlanTransition[] @relation("ToPlan")
+  entitlements    PlanEntitlement[]
+  fromTransitions PlanTransition[] @relation("FromPlan")
+  toTransitions   PlanTransition[] @relation("ToPlan")
 }
 
 model PlanEntitlement {
@@ -697,16 +1009,16 @@ model UserFeatureOverride {
 }
 
 model AiProviderConfig {
-  id                   String          @id @default(cuid())
-  key                  String          @unique
+  id                   String   @id @default(cuid())
+  key                  String   @unique
   displayName          String
   apiBase              String
   secretRef            String?
-  credentialConfigured Boolean         @default(false)
-  enabled              Boolean         @default(true)
-  version              Int             @default(1)
-  createdAt            DateTime        @default(now())
-  updatedAt            DateTime        @updatedAt
+  credentialConfigured Boolean  @default(false)
+  enabled              Boolean  @default(true)
+  version              Int      @default(1)
+  createdAt            DateTime @default(now())
+  updatedAt            DateTime @updatedAt
   models               AiModelConfig[]
 }
 
@@ -722,6 +1034,7 @@ model AiModelConfig {
   contextK    Int              @default(128)
   active      Boolean          @default(true)
   provider    AiProviderConfig @relation(fields: [providerId], references: [id], onDelete: Cascade)
+
   @@unique([providerId, model])
 }
 
@@ -735,202 +1048,6 @@ model AiRouteConfig {
   version          Int      @default(1)
   updatedById      String
   updatedAt        DateTime @updatedAt
-}
-
-enum BroadcastStatus {
-  draft
-  pending_approval
-  scheduled
-  publishing
-  published
-  cancelled
-  failed
-}
-
-enum BroadcastAudienceType {
-  all_active_users
-  plan
-  location
-  explicit_user_ids
-}
-
-model AdminBroadcast {
-  id             String                 @id @default(cuid())
-  title          String
-  body           String                 @db.Text
-  audienceType   BroadcastAudienceType
-  audience       Json
-  status         BroadcastStatus        @default(draft)
-  scheduledAt    DateTime?
-  createdById    String
-  approvedById   String?
-  publishedById  String?
-  recipientCount Int                    @default(0)
-  deliveredCount Int                   @default(0)
-  failedCount    Int                   @default(0)
-  createdAt      DateTime               @default(now())
-  updatedAt      DateTime               @updatedAt
-  notifications  Notification[]
-  @@index([status, scheduledAt])
-}
-
-enum SupportCaseStatus {
-  open
-  in_progress
-  waiting_on_customer
-  resolved
-  closed
-}
-
-enum SupportCasePriority {
-  low
-  normal
-  high
-  urgent
-}
-
-enum SupportCaseMessageKind {
-  customer_reply
-  staff_reply
-  internal_note
-  system_event
-}
-
-model SupportCase {
-  id               String                  @id @default(cuid())
-  requesterUserId  String                 @map("requester_user_id")
-  subject          String
-  category         String
-  status           SupportCaseStatus       @default(open)
-  priority         SupportCasePriority     @default(normal)
-  assignedAdminId  String?                @map("assigned_admin_id")
-  slaDueAt         DateTime?              @map("sla_due_at")
-  firstRespondedAt DateTime?              @map("first_responded_at")
-  resolvedAt       DateTime?              @map("resolved_at")
-  safeContext      Json?                  @map("safe_context")
-  createdAt        DateTime               @default(now())
-  updatedAt        DateTime               @updatedAt
-  requester        User                   @relation("SupportRequester", fields: [requesterUserId], references: [id], onDelete: Cascade)
-  messages         SupportCaseMessage[]
-  @@index([status, priority, slaDueAt])
-  @@index([requesterUserId, updatedAt(sort: Desc)])
-  @@map("support_cases")
-}
-
-model SupportCaseMessage {
-  id            String                 @id @default(cuid())
-  caseId        String                 @map("case_id")
-  authorType    SupportCaseMessageKind @map("author_type")
-  authorUserId  String?                @map("author_user_id")
-  body          String                 @db.Text
-  redacted      Boolean                @default(false)
-  createdAt     DateTime               @default(now())
-  supportCase   SupportCase            @relation(fields: [caseId], references: [id], onDelete: Cascade)
-  @@index([caseId, createdAt])
-  @@map("support_case_messages")
-}
-
-// ─────────────────────────────────────────────
-// Internal admin security and audit
-// ─────────────────────────────────────────────
-
-enum AdminMembershipStatus {
-  active
-  suspended
-  revoked
-}
-
-enum AdminMfaLevel {
-  none
-  totp
-  webauthn
-}
-
-enum AdminAuditOutcome {
-  success
-  denied
-  failed
-}
-
-enum AdminTargetType {
-  user
-  admin_member
-  admin_role
-  plan
-  plan_change
-  ai_provider
-  ai_model
-  ai_route
-  broadcast
-  support_case
-}
-
-model AdminRole {
-  id          String   @id @default(cuid())
-  key         String   @unique
-  name        String
-  description String?
-  permissions String[]
-  system      Boolean  @default(false)
-  version     Int      @default(1)
-  createdAt   DateTime @default(now())
-  updatedAt   DateTime @updatedAt
-
-  memberships AdminMembership[]
-}
-
-model AdminMembership {
-  id             String                @id @default(cuid())
-  userId         String                @unique
-  roleId         String
-  status         AdminMembershipStatus @default(active)
-  mfaLevel       AdminMfaLevel         @default(none)
-  sessionVersion Int                   @default(1)
-  grantedById    String?
-  grantedAt      DateTime              @default(now())
-  revokedAt      DateTime?
-
-  user User      @relation("AdminUser", fields: [userId], references: [id], onDelete: Restrict)
-  role AdminRole @relation(fields: [roleId], references: [id], onDelete: Restrict)
-
-  @@index([status, roleId])
-}
-
-model AdminAuditLog {
-  id            String            @id @default(cuid())
-  requestId     String
-  actorUserId   String?
-  actorRoleKey  String?
-  action        String
-  targetType    AdminTargetType?
-  targetId      String?
-  tenantUserId  String?
-  reason        String?
-  outcome       AdminAuditOutcome
-  ipHash        String?
-  userAgentHash String?
-  before        Json?
-  after         Json?
-  errorCode     String?
-  createdAt     DateTime          @default(now())
-
-  @@index([actorUserId, createdAt(sort: Desc)])
-  @@index([tenantUserId, createdAt(sort: Desc)])
-  @@index([action, createdAt(sort: Desc)])
-}
-
-model AdminIdempotencyKey {
-  id             String   @id @default(cuid())
-  key            String
-  actorUserId    String
-  action         String
-  requestHash    String
-  responseStatus Int
-  responseBody   Json
-  createdAt      DateTime @default(now())
-
-  @@unique([actorUserId, key])
-  @@index([createdAt])
 }
 
 // ─────────────────────────────────────────────

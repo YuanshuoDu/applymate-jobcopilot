@@ -1,5 +1,9 @@
+import { redirect } from 'next/navigation'
 import { ContactUsPage } from '@/components/admin/ContactUsPage'
+import { isAdminResponse, requireAdmin } from '@/lib/admin/authorization'
 
-export default function AdminContactUsRoute() {
-  return <ContactUsPage />
+export default async function ContactUsAdminPage() {
+  const actor = await requireAdmin('support_cases.read')
+  if (isAdminResponse(actor)) redirect('/login?callbackUrl=/admin/contact-us')
+  return <ContactUsPage actorId={actor.userId} permissions={actor.permissions} />
 }

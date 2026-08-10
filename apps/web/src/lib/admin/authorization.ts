@@ -1,96 +1,80 @@
-import { randomUUID } from 'node:crypto'
-import { db } from '@/lib/db'
+import { NextResponse } from 'next/server'
+import { AdminMfaLevel, AdminMembershipStatus } from '@prisma/client'
 import { safeAuth } from '@/lib/safe-auth'
-import { writeAdminAudit } from './audit'
-import { ADMIN_PERMISSION_KEYS, type Permission } from './permissions'
+import { db } from '@/lib/db'
+import { requestIdFor, writeAdminAudit } from './audit'
+import type { Permission } from './permissions'
 
-export interface AdminActor {
+export type AdminActor = Readonly<{
   userId: string
-  email?: string
-  membershipId: string
   roleKey: string
-  permissions: Permission[]
-  mfaLevel: string
-  sessionVersion: number
-}
+  permissions: readonly string[]
+  requestId: string
+}>
 
-export class AdminAuthorizationError extends Error {
-  constructor(readonly status: 401 | 403, readonly code: string) {
-    super(code)
-  }
-}
-
-export async function requireAdmin(permission: Permission, request?: Request): Promise<AdminActor> {
-  const requestId = request?.headers.get('x-request-id') || randomUUID()
+export async function requireAdminMembership(request?: Request): Promise<AdminActor | NextResponse> {
+  const requestId = requestIdFor(request)
   const session = await safeAuth()
   const userId = session?.user?.id
-  if (!userId) throw new AdminAuthorizationError(401, 'ADMIN_UNAUTHENTICATED')
+  if (!userId) return denied(requestId, 'observability.read', 'unauthenticated', request)
+  const membership = await db.adminMembership.findUnique({
+    where: { userId },
+    select: { status: true, mfaLevel: true, sessionVersion: true, role: { select: { key: true, permissions: true } } },
+  })
+  const sessionValid = session?.user?.adminSessionVersion === membership?.sessionVersion
+  if (membership?.status !== AdminMembershipStatus.active || !sessionValid || (membership.role.key === 'super_admin' && membership.mfaLevel !== AdminMfaLevel.webauthn)) {
+    return denied(requestId, 'observability.read', 'membership_inactive', request, userId)
+  }
+  return Object.freeze({ userId, roleKey: membership.role.key, permissions: Object.freeze([...membership.role.permissions]), requestId })
+}
+
+export function requireAdmin(permission: Permission, request?: Request): Promise<AdminActor | NextResponse>
+export async function requireAdmin(permission: Permission, request?: Request): Promise<AdminActor | NextResponse> {
+  const requestId = requestIdFor(request)
+  const session = await safeAuth()
+  const userId = session?.user?.id
+  if (!userId) return denied(requestId, permission, 'unauthenticated', request)
 
   const membership = await db.adminMembership.findUnique({
     where: { userId },
     select: {
-      id: true,
       status: true,
       mfaLevel: true,
       sessionVersion: true,
       role: { select: { key: true, permissions: true } },
     },
   })
-
-  if (!membership) {
-    await auditDenied(requestId, userId, 'ADMIN_MEMBERSHIP_REQUIRED')
-    throw new AdminAuthorizationError(403, 'ADMIN_MEMBERSHIP_REQUIRED')
-  }
-  if (membership.status !== 'active') {
-    await auditDenied(requestId, userId, 'ADMIN_MEMBERSHIP_INACTIVE')
-    throw new AdminAuthorizationError(403, 'ADMIN_MEMBERSHIP_INACTIVE')
-  }
-
-  const sessionVersion = session.user.adminSessionVersion
-  if (typeof sessionVersion !== 'number') {
-    await auditDenied(requestId, userId, 'ADMIN_SESSION_VERSION_MISSING')
-    throw new AdminAuthorizationError(403, 'ADMIN_SESSION_VERSION_MISSING')
-  }
-  if (sessionVersion !== membership.sessionVersion) {
-    await auditDenied(requestId, userId, 'ADMIN_SESSION_REVOKED')
-    throw new AdminAuthorizationError(403, 'ADMIN_SESSION_REVOKED')
+  const grant = membership?.status === AdminMembershipStatus.active && !membership.role.permissions.includes(permission)
+    ? await db.adminBreakGlassGrant.findFirst({ where: { requesterId: userId, permission, approverId: { not: null }, revokedAt: null, expiresAt: { gt: new Date() } }, select: { id: true } })
+    : null
+  const allowed = membership?.status === AdminMembershipStatus.active && (membership.role.permissions.includes(permission) || Boolean(grant))
+  const needsWebauthn = membership?.role.key === 'super_admin'
+  const sessionValid = session?.user?.adminSessionVersion === membership?.sessionVersion
+  if (!allowed || !sessionValid || (needsWebauthn && membership?.mfaLevel !== AdminMfaLevel.webauthn)) {
+    return denied(requestId, permission, 'permission_denied', request, userId)
   }
 
-  if (!(ADMIN_PERMISSION_KEYS as readonly string[]).includes(permission)) {
-    await auditDenied(requestId, userId, 'ADMIN_PERMISSION_UNKNOWN')
-    throw new AdminAuthorizationError(403, 'ADMIN_PERMISSION_UNKNOWN')
-  }
-
-  const permissions = membership.role.permissions.filter(
-    (value): value is Permission => (ADMIN_PERMISSION_KEYS as readonly string[]).includes(value),
-  )
-  if (!permissions.includes(permission)) {
-    await auditDenied(requestId, userId, 'ADMIN_PERMISSION_DENIED', membership.role.key)
-    throw new AdminAuthorizationError(403, 'ADMIN_PERMISSION_DENIED')
-  }
-
-  return Object.freeze({
-    userId,
-    email: session.user.email ?? undefined,
-    membershipId: membership.id,
-    roleKey: membership.role.key,
-    permissions,
-    mfaLevel: membership.mfaLevel,
-    sessionVersion,
-  })
+  if (grant) await writeAdminAudit({ requestId, actorUserId: userId, actorRoleKey: membership.role.key, action: 'break_glass.used', targetId: grant.id, outcome: 'success' })
+  return Object.freeze({ userId, roleKey: membership.role.key, permissions: Object.freeze([...membership.role.permissions, ...(grant ? [permission] : [])]), requestId })
 }
 
-async function auditDenied(requestId: string, userId: string, code: string, roleKey?: string): Promise<void> {
+async function denied(requestId: string, permission: Permission, errorCode: string, request?: Request, userId?: string) {
   try {
-    await writeAdminAudit(db, {
+    await writeAdminAudit({
       requestId,
       actorUserId: userId,
-      actorRoleKey: roleKey,
-      action: 'admin.authorization.denied',
+      action: `admin.authorize.${permission}`,
       outcome: 'denied',
-      errorCode: code,
+      errorCode,
+      ip: request?.headers.get('x-forwarded-for'),
+      userAgent: request?.headers.get('user-agent'),
     })
   } catch {
-    // Access denial remains fail-closed even if the audit store is unavailable.
+    // A denial must never become an authorization grant when auditing is unavailable.
   }
+  return NextResponse.json({ error: 'Forbidden', requestId }, { status: userId ? 403 : 401, headers: { 'Cache-Control': 'no-store' } })
+}
+
+export function isAdminResponse(value: AdminActor | NextResponse): value is NextResponse {
+  return value instanceof NextResponse
 }

@@ -1,77 +1,43 @@
 'use client'
 
-import React, { type ReactNode } from 'react'
 import Link from 'next/link'
 import { usePathname } from 'next/navigation'
-import { signOut } from 'next-auth/react'
-import { Activity, BadgeDollarSign, Bot, ClipboardList, KeyRound, LayoutDashboard, LogOut, ShieldCheck, Users } from 'lucide-react'
-import type { Permission } from '@/lib/admin/permissions'
+import { Activity, Bell, Bot, FileText, Flag, Home, Inbox, Radio, ServerCog, ShieldAlert, ShieldCheck, Users } from 'lucide-react'
+import type { ReactNode } from 'react'
 
-export interface AdminShellActor {
-  userId: string
-  email?: string
-  roleKey: string
-  permissions: Permission[]
-}
-
-interface AdminNavItem {
-  href: string
-  label: string
-  permission: Permission
-  icon: ReactNode
-}
-
-const ADMIN_NAV: AdminNavItem[] = [
-  { href: '/admin', label: 'Overview', permission: 'admin_members.read', icon: <LayoutDashboard size={16} aria-hidden="true" /> },
-  { href: '/admin/access', label: 'Access', permission: 'admin_members.read', icon: <KeyRound size={16} aria-hidden="true" /> },
-  { href: '/admin/users', label: 'Users', permission: 'users.read', icon: <Users size={16} aria-hidden="true" /> },
-  { href: '/admin/plans', label: 'Plans', permission: 'billing.read', icon: <BadgeDollarSign size={16} aria-hidden="true" /> },
-  { href: '/admin/ai', label: 'Platform AI', permission: 'ai_budget.read', icon: <Bot size={16} aria-hidden="true" /> },
-  { href: '/admin/broadcasts', label: 'Broadcasts', permission: 'broadcasts.create', icon: <ClipboardList size={16} aria-hidden="true" /> },
-  { href: '/admin/contact-us', label: 'Contact us', permission: 'support_cases.read', icon: <ShieldCheck size={16} aria-hidden="true" /> },
-  { href: '/admin/observability', label: 'Observability', permission: 'observability.read', icon: <Activity size={16} aria-hidden="true" /> },
+const navigation = [
+  { href: '/admin', label: 'Overview', icon: Home, permission: 'observability.read' },
+  { href: '/admin/contact-us', label: 'Contact us', icon: Inbox, permission: 'support_cases.read' },
+  { href: '/admin/users', label: 'Users', icon: Users, permission: 'users.read' },
+  { href: '/admin/ats', label: 'ATS sources', icon: Radio, permission: 'ats.read' },
+  { href: '/admin/applications', label: 'Applications', icon: Activity, permission: 'applications.read' },
+  { href: '/admin/queues', label: 'Queues', icon: ServerCog, permission: 'queues.read' },
+  { href: '/admin/ai', label: 'AI operations', icon: Bot, permission: 'ai_budget.read' },
+  { href: '/admin/platform', label: 'Feature flags', icon: Flag, permission: 'feature_flags.read' },
+  { href: '/admin/broadcasts', label: 'Broadcasts', icon: Bell, permission: 'broadcasts.create' },
+  { href: '/admin/audit', label: 'Audit', icon: FileText, permission: 'audit.read' },
+  { href: '/admin/access', label: 'Access', icon: ShieldCheck, permission: 'admin_members.read' },
+  { href: '/admin/security', label: 'Security', icon: ShieldAlert, permission: 'break_glass.request' },
 ]
 
-export function filterAdminNav(permissions: readonly string[]): AdminNavItem[] {
-  const granted = new Set(permissions)
-  return ADMIN_NAV.filter(item => granted.has(item.permission))
+export function filterAdminNav(permissions: readonly string[]) {
+  return navigation.filter(item => permissions.includes(item.permission))
 }
 
-export function AdminShell({ actor, children }: { actor: AdminShellActor; children: ReactNode }) {
+export function AdminShell({ children, permissions, roleKey }: { children: ReactNode; permissions: readonly string[]; roleKey: string }) {
   const pathname = usePathname()
-  const items = filterAdminNav(actor.permissions)
   return (
     <div className="admin-shell">
-      <style>{`
-        .admin-shell { min-height: 100vh; display: flex; background: #f4f7fb; color: #172033; }
-        .admin-shell aside { width: 236px; flex: 0 0 236px; background: #10253f; color: #d9e6f5; padding: 20px 14px; display: flex; flex-direction: column; gap: 20px; }
-        .admin-brand { color: #fff; font-weight: 750; letter-spacing: .01em; font-size: 16px; padding: 0 10px; }
-        .admin-nav { display: grid; gap: 4px; }
-        .admin-nav a { display: flex; align-items: center; gap: 10px; min-height: 38px; padding: 0 10px; color: #b7c9dc; text-decoration: none; border-radius: 6px; font-size: 13px; }
-        .admin-nav a:hover, .admin-nav a[data-active="true"] { color: #fff; background: #1e3b5c; }
-        .admin-identity { margin-top: auto; border-top: 1px solid rgba(255,255,255,.14); padding: 14px 10px 0; font-size: 11px; color: #9fb4ca; overflow: hidden; }
-        .admin-identity strong { display: block; color: #fff; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; margin-bottom: 4px; }
-        .admin-signout { width: 100%; display: flex; align-items: center; gap: 8px; margin-top: 12px; padding: 8px 0; border: 0; color: #c2d0de; background: transparent; cursor: pointer; font: inherit; font-size: 12px; }
-        .admin-signout:hover { color: #fff; }
-        .admin-main { min-width: 0; flex: 1; padding: 28px; }
-        @media (max-width: 720px) { .admin-shell { display: block; } .admin-shell aside { width: 100%; padding: 14px 12px; gap: 12px; } .admin-nav { display: flex; overflow-x: auto; padding-bottom: 2px; } .admin-nav a { flex: 0 0 auto; } .admin-identity { display: none; } .admin-main { padding: 16px; } }
-      `}</style>
-      <aside aria-label="Admin navigation">
-        <div className="admin-brand">ApplyMate Admin</div>
-        <nav className="admin-nav">
-          {items.map(item => (
-            <Link key={item.href} href={item.href} data-active={pathname === item.href || (item.href !== '/admin' && pathname.startsWith(`${item.href}/`))}>
-              {item.icon}<span>{item.label}</span>
-            </Link>
-          ))}
+      <aside className="admin-sidebar">
+        <Link href="/admin" className="admin-brand"><span>ApplyMate</span><small>Internal Admin</small></Link>
+        <nav aria-label="Admin navigation" className="admin-nav">
+          {filterAdminNav(permissions).map((item) => {
+            const active = item.href === '/admin' ? pathname === '/admin' : pathname.startsWith(item.href)
+            const Icon = item.icon
+            return <Link key={item.href} href={item.href} data-active={active} className="admin-nav-link"><Icon size={18} aria-hidden="true" />{item.label}</Link>
+          })}
         </nav>
-        <div className="admin-identity">
-          <strong>{actor.email || 'Administrator'}</strong>
-          <span>{actor.roleKey}</span>
-          <button type="button" className="admin-signout" onClick={() => void signOut({ callbackUrl: '/login' })}>
-            <LogOut size={14} aria-hidden="true" /> Sign out
-          </button>
-        </div>
+        <div className="admin-identity"><span className="admin-avatar">{roleKey.slice(0, 2).toUpperCase()}</span><div><strong>{roleKey.replaceAll('_', ' ')}</strong><small>Internal role</small></div></div>
       </aside>
       <main className="admin-main">{children}</main>
     </div>

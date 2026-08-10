@@ -1,11 +1,22 @@
+import { NextRequest, NextResponse } from 'next/server'
+import { isAdminResponse, requireAdmin } from '@/lib/admin/authorization'
+import { runAdminMutation } from '@/lib/admin/write-transaction'
+import { validateAdminWrite } from '@/lib/admin/csrf'
 import { db } from '@/lib/db'
-import { requireAdmin } from '@/lib/admin/authorization'
-import { writeAdminAudit } from '@/lib/admin/audit'
-import { validateAdminWriteRequest } from '@/lib/admin/csrf'
-import { withAdminIdempotency } from '@/lib/admin/idempotency'
-import { adminError, adminJson, jsonBody, requestId, requiredIdempotencyKey, requiredReason } from '@/lib/admin/route-utils'
 
-export async function POST(request: Request, context: { params: Promise<{ id: string }> }) {
-  const correlationId = requestId(request)
-  try { const actor = await requireAdmin('broadcasts.cancel', request); const csrf = validateAdminWriteRequest(request); if (!csrf.ok) return adminJson({ error: csrf.code }, csrf.status, correlationId); const { id } = await context.params; const body = await jsonBody(request); const reason = requiredReason(body); const current = await db.adminBroadcast.findUnique({ where: { id }, select: { id: true, status: true } }); if (!current) return adminJson({ error: 'BROADCAST_NOT_FOUND' }, 404, correlationId); if (!['draft', 'pending_approval', 'scheduled', 'publishing'].includes(current.status)) return adminJson({ error: 'BROADCAST_STATUS_INVALID' }, 409, correlationId); const idempotencyKey = requiredIdempotencyKey(request); const response = await withAdminIdempotency(db, { actorUserId: actor.userId, key: idempotencyKey, action: 'admin.broadcast.cancel', body: { id, reason } }, async transaction => { const broadcast = await transaction.adminBroadcast.update({ where: { id }, data: { status: 'cancelled' }, select: { id: true, status: true } }); await writeAdminAudit(transaction, { requestId: correlationId, actorUserId: actor.userId, actorRoleKey: actor.roleKey, action: 'admin.broadcast.cancel', targetType: 'broadcast', targetId: id, reason, outcome: 'success', after: { status: broadcast.status } }); return { status: 200, body: { broadcast } } }); return adminJson(response.body, response.status, correlationId) } catch (error) { return adminError(error, correlationId) }
+export async function POST(request: NextRequest, context: { params: Promise<{ id: string }> }) {
+  const actor = await requireAdmin('broadcasts.cancel', request)
+  if (isAdminResponse(actor)) return actor
+  const writeError = validateAdminWrite(request)
+  if (writeError) return writeError
+  const { id } = await context.params
+  const payload = await request.json().catch(() => null) as { reason?: unknown } | null
+  const reason = typeof payload?.reason === 'string' ? payload.reason.trim() : ''
+  if (reason.length < 10 || reason.length > 500 || !request.headers.get('idempotency-key')) return NextResponse.json({ error: 'Invalid cancellation request' }, { status: 400 })
+  const key = request.headers.get('idempotency-key') as string
+  const result = await runAdminMutation({ actorUserId: actor.userId, action: 'broadcast.cancelled', idempotencyKey: key, targetId: id, audit: { requestId: actor.requestId, actorRoleKey: actor.roleKey, targetType: 'broadcast', targetId: id, reason, outcome: 'success' }, mutate: (tx) => tx.adminBroadcast.updateMany({ where: { id, status: { in: ['draft', 'pending_approval', 'scheduled'] } }, data: { status: 'cancelled' } }) })
+  if (result.duplicate) return NextResponse.json({ duplicate: true }, { headers: { 'Cache-Control': 'no-store' } })
+  const updated = result.value
+  if (!updated.count) return NextResponse.json({ error: 'Broadcast cannot be cancelled' }, { status: 409 })
+  return NextResponse.json({ broadcast: { id, status: 'cancelled' } }, { headers: { 'Cache-Control': 'no-store', 'x-request-id': actor.requestId } })
 }

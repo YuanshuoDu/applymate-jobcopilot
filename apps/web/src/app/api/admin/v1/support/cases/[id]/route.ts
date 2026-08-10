@@ -1,26 +1,33 @@
+import { NextRequest, NextResponse } from 'next/server'
+import { AdminMembershipStatus } from '@prisma/client'
+import { isAdminResponse, requireAdmin } from '@/lib/admin/authorization'
+import { runAdminMutation } from '@/lib/admin/write-transaction'
+import { validateAdminWrite } from '@/lib/admin/csrf'
+import { parseSupportCaseUpdate } from '@/lib/admin/support-case'
 import { db } from '@/lib/db'
-import { requireAdmin } from '@/lib/admin/authorization'
-import { writeAdminAudit } from '@/lib/admin/audit'
-import { validateAdminWriteRequest } from '@/lib/admin/csrf'
-import { withAdminIdempotency } from '@/lib/admin/idempotency'
-import { parseSupportCasePriority, parseSupportCaseStatus, supportStatusTransition } from '@/lib/admin/support'
-import { adminError, adminJson, jsonBody, requestId, requiredIdempotencyKey, requiredReason } from '@/lib/admin/route-utils'
 
-export async function PATCH(request: Request, context: { params: Promise<{ id: string }> }) {
-  const correlationId = requestId(request)
-  try {
-    const actor = await requireAdmin('support_cases.assign', request); const csrf = validateAdminWriteRequest(request); if (!csrf.ok) return adminJson({ error: csrf.code }, csrf.status, correlationId)
-    const { id } = await context.params; const body = await jsonBody(request); const reason = requiredReason(body); const current = await db.supportCase.findUnique({ where: { id }, select: { id: true, status: true, priority: true, assignedAdminId: true, firstRespondedAt: true, updatedAt: true } }); if (!current) return adminJson({ error: 'SUPPORT_CASE_NOT_FOUND' }, 404, correlationId)
-    if (typeof body.updatedAt !== 'string' || Number.isNaN(new Date(body.updatedAt).getTime())) throw new Error('updatedAt is required')
-    const nextStatus = body.status === undefined ? current.status : parseSupportCaseStatus(body.status); const nextPriority = body.priority === undefined ? current.priority : parseSupportCasePriority(body.priority); const assignedAdminId = body.assignedAdminId === null || typeof body.assignedAdminId === 'string' ? body.assignedAdminId : current.assignedAdminId
-    if (!nextStatus || !supportStatusTransition(current.status, nextStatus) && nextStatus !== current.status) return adminJson({ error: 'SUPPORT_STATUS_TRANSITION_INVALID' }, 409, correlationId)
-    if (!nextPriority) return adminJson({ error: 'SUPPORT_PRIORITY_INVALID' }, 400, correlationId)
-    if (assignedAdminId) { const member = await db.adminMembership.findFirst({ where: { userId: assignedAdminId, status: 'active' }, select: { userId: true } }); if (!member) return adminJson({ error: 'SUPPORT_ASSIGNEE_INVALID' }, 400, correlationId) }
-    const idempotencyKey = requiredIdempotencyKey(request); const updatedAt = new Date(body.updatedAt)
-    const response = await withAdminIdempotency(db, { actorUserId: actor.userId, key: idempotencyKey, action: 'admin.support.case.update', body: { id, nextStatus, nextPriority, assignedAdminId, updatedAt: updatedAt.toISOString(), reason } }, async transaction => {
-      const updated = await transaction.supportCase.updateMany({ where: { id, updatedAt }, data: { status: nextStatus, priority: nextPriority, assignedAdminId, ...(nextStatus === 'resolved' ? { resolvedAt: new Date() } : {}), ...(current.firstRespondedAt === null && nextStatus === 'in_progress' ? { firstRespondedAt: new Date() } : {}) } }); if (updated.count !== 1) throw new Error('VERSION_CONFLICT')
-      await writeAdminAudit(transaction, { requestId: correlationId, actorUserId: actor.userId, actorRoleKey: actor.roleKey, action: assignedAdminId !== current.assignedAdminId ? 'support.case.assigned' : nextStatus === 'resolved' ? 'support.case.resolved' : 'support.case.updated', targetType: 'support_case', targetId: id, reason, outcome: 'success', after: { status: nextStatus, priority: nextPriority, assignedAdminId } })
-      return { status: 200, body: { updated: true } }
-    }); return adminJson(response.body, response.status, correlationId)
-  } catch (error) { if (error instanceof Error && error.message === 'VERSION_CONFLICT') return adminJson({ error: 'VERSION_CONFLICT' }, 409, correlationId); return adminError(error, correlationId) }
+export async function PATCH(request: NextRequest, context: { params: Promise<{ id: string }> }) {
+  const actor = await requireAdmin('support_cases.assign', request)
+  if (isAdminResponse(actor)) return actor
+  const writeError = validateAdminWrite(request)
+  if (writeError) return writeError
+  const { id } = await context.params
+  const payload = await request.json().catch(() => null) as { reason?: unknown } | null
+  const input = parseSupportCaseUpdate(payload)
+  const reason = typeof payload?.reason === 'string' ? payload.reason.trim() : ''
+  const key = request.headers.get('idempotency-key')
+  if (!input || reason.length < 10 || reason.length > 500 || !key) return NextResponse.json({ error: 'Invalid support case update' }, { status: 400 })
+  if (input.status === 'resolved' && !actor.permissions.includes('support_cases.resolve')) return NextResponse.json({ error: 'Resolution permission required' }, { status: 403 })
+  const supportCase = await db.supportCase.findUnique({ where: { id }, select: { requesterUserId: true } })
+  if (!supportCase) return NextResponse.json({ error: 'Not found' }, { status: 404 })
+  if (input.assignedAdminId) {
+    const assignee = await db.adminMembership.findUnique({ where: { userId: input.assignedAdminId }, select: { status: true, role: { select: { key: true } } } })
+    if (assignee?.status !== AdminMembershipStatus.active || assignee.role.key !== 'support') return NextResponse.json({ error: 'Assignee must be an active support member' }, { status: 400 })
+  }
+  const action = input.status === 'resolved' ? 'support.case_resolved' : input.assignedAdminId !== undefined ? 'support.case_assigned' : 'support.case_updated'
+  const result = await runAdminMutation({ actorUserId: actor.userId, action, idempotencyKey: key, targetId: id, audit: { requestId: actor.requestId, actorRoleKey: actor.roleKey, targetType: 'support_case', targetId: id, tenantUserId: supportCase.requesterUserId, reason, after: { version: input.version + 1 }, outcome: 'success' }, mutate: (tx) => tx.supportCase.updateMany({ where: { id, version: input.version }, data: { ...(input.status ? { status: input.status } : {}), ...(input.priority ? { priority: input.priority } : {}), ...(input.assignedAdminId !== undefined ? { assignedAdminId: input.assignedAdminId } : {}), ...(input.status === 'resolved' ? { resolvedAt: new Date() } : {}), version: { increment: 1 } } }) })
+  if (result.duplicate) return NextResponse.json({ duplicate: true }, { headers: { 'Cache-Control': 'no-store' } })
+  const update = result.value
+  if (!update.count) return NextResponse.json({ error: 'Case changed' }, { status: 409 })
+  return NextResponse.json({ id, version: input.version + 1 }, { headers: { 'Cache-Control': 'no-store', 'x-request-id': actor.requestId } })
 }

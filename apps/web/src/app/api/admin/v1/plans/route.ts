@@ -1,15 +1,14 @@
 import { db } from '@/lib/db'
-import { requireAdmin } from '@/lib/admin/authorization'
 import { writeAdminAudit } from '@/lib/admin/audit'
 import { validateAdminWriteRequest } from '@/lib/admin/csrf'
 import { withAdminIdempotency } from '@/lib/admin/idempotency'
 import { PLAN_SELECT, planKey, toPlanCatalogDto, validatePlanMetadata } from '@/lib/admin/plans'
-import { adminError, adminJson, jsonBody, requestId, requiredIdempotencyKey, requiredReason } from '@/lib/admin/route-utils'
+import { adminError, adminJson, jsonBody, requestId, requiredIdempotencyKey, requiredReason, requireAdminActor } from '@/lib/admin/route-utils'
 
 export async function GET(request: Request) {
   const correlationId = requestId(request)
   try {
-    await requireAdmin('billing.read', request)
+    await requireAdminActor('billing.read', request)
     const plans = await db.planCatalog.findMany({ orderBy: { plan: 'asc' }, select: PLAN_SELECT })
     return adminJson({ items: plans.map(toPlanCatalogDto) }, 200, correlationId)
   } catch (error) { return adminError(error, correlationId) }
@@ -18,7 +17,7 @@ export async function GET(request: Request) {
 export async function POST(request: Request) {
   const correlationId = requestId(request)
   try {
-    const actor = await requireAdmin('billing.update', request)
+    const actor = await requireAdminActor('billing.update', request)
     const csrf = validateAdminWriteRequest(request)
     if (!csrf.ok) return adminJson({ error: csrf.code }, csrf.status, correlationId)
     const body = await jsonBody(request)

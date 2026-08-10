@@ -1,9 +1,8 @@
 import { db } from '@/lib/db'
-import { requireAdmin } from '@/lib/admin/authorization'
 import { toAdminUserDto } from '@/lib/admin/dto'
 import { validateAdminWriteRequest } from '@/lib/admin/csrf'
 import { withAdminIdempotency } from '@/lib/admin/idempotency'
-import { adminError, adminJson, jsonBody, requestId, requiredIdempotencyKey, requiredReason } from '@/lib/admin/route-utils'
+import { adminError, adminJson, jsonBody, requestId, requiredIdempotencyKey, requiredReason, requireAdminActor } from '@/lib/admin/route-utils'
 
 const USER_SELECT = {
   id: true, email: true, name: true, plan: true, accountStatus: true, location: true,
@@ -14,7 +13,7 @@ const USER_SELECT = {
 export async function PATCH(request: Request, context: { params: Promise<{ id: string }> }) {
   const correlationId = requestId(request)
   try {
-    const actor = await requireAdmin('users.suspend', request)
+    const actor = await requireAdminActor('users.suspend', request)
     const csrf = validateAdminWriteRequest(request)
     if (!csrf.ok) return adminJson({ error: csrf.code }, csrf.status, correlationId)
     const body = await jsonBody(request)

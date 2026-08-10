@@ -1,5 +1,18 @@
 import { randomUUID } from 'node:crypto'
 import { NextResponse } from 'next/server'
+import type { AdminActor } from '@/lib/admin/authorization'
+import type { Permission } from '@/lib/admin/permissions'
+
+class AdminResponseError extends Error {
+  constructor(readonly response: NextResponse) { super('Admin authorization failed') }
+}
+
+export async function requireAdminActor(permission: Permission, request: Request): Promise<AdminActor> {
+  const { isAdminResponse, requireAdmin } = await import('@/lib/admin/authorization')
+  const actor = await requireAdmin(permission, request)
+  if ((typeof isAdminResponse === 'function' && isAdminResponse(actor)) || actor instanceof Response) throw new AdminResponseError(actor as NextResponse)
+  return actor
+}
 
 export function requestId(request: Request): string {
   return request.headers.get('x-request-id')?.trim() || randomUUID()
@@ -13,6 +26,7 @@ export function adminJson(body: unknown, status: number, correlationId: string):
 }
 
 export function adminError(error: unknown, correlationId: string): NextResponse {
+  if (error instanceof AdminResponseError) return error.response
   if (isAdminAuthorizationError(error)) {
     return adminJson({ error: error.code }, error.status, correlationId)
   }

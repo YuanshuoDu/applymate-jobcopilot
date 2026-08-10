@@ -1,17 +1,16 @@
 import { db } from '@/lib/db'
-import { requireAdmin } from '@/lib/admin/authorization'
 import { writeAdminAudit } from '@/lib/admin/audit'
 import { validateAdminWriteRequest } from '@/lib/admin/csrf'
 import { withAdminIdempotency } from '@/lib/admin/idempotency'
 import { planKey, toTransitionDto, validatePlanTransition, type PlanKey } from '@/lib/admin/plans'
-import { adminError, adminJson, jsonBody, requestId, requiredIdempotencyKey, requiredReason } from '@/lib/admin/route-utils'
+import { adminError, adminJson, jsonBody, requestId, requiredIdempotencyKey, requiredReason, requireAdminActor } from '@/lib/admin/route-utils'
 
 const TRANSITION_SELECT = { id: true, fromPlan: true, toPlan: true, enabled: true, note: true, version: true } as const
 
 export async function GET(request: Request) {
   const correlationId = requestId(request)
   try {
-    await requireAdmin('billing.read', request)
+    await requireAdminActor('billing.read', request)
     const transitions = await db.planTransition.findMany({ orderBy: [{ fromPlan: 'asc' }, { toPlan: 'asc' }], select: TRANSITION_SELECT })
     return adminJson({ items: transitions.map(toTransitionDto) }, 200, correlationId)
   } catch (error) { return adminError(error, correlationId) }
@@ -20,7 +19,7 @@ export async function GET(request: Request) {
 export async function PATCH(request: Request) {
   const correlationId = requestId(request)
   try {
-    const actor = await requireAdmin('billing.update', request)
+    const actor = await requireAdminActor('billing.update', request)
     const csrf = validateAdminWriteRequest(request)
     if (!csrf.ok) return adminJson({ error: csrf.code }, csrf.status, correlationId)
     const body = await jsonBody(request)

@@ -1,14 +1,13 @@
 import { db } from '@/lib/db'
-import { requireAdmin } from '@/lib/admin/authorization'
 import { writeAdminAudit } from '@/lib/admin/audit'
 import { validateAdminWriteRequest } from '@/lib/admin/csrf'
 import { withAdminIdempotency } from '@/lib/admin/idempotency'
-import { adminError, adminJson, jsonBody, requestId, requiredIdempotencyKey, requiredReason } from '@/lib/admin/route-utils'
+import { adminError, adminJson, jsonBody, requestId, requiredIdempotencyKey, requiredReason, requireAdminActor } from '@/lib/admin/route-utils'
 
 export async function POST(request: Request, context: { params: Promise<{ id: string }> }) {
   const correlationId = requestId(request)
   try {
-    const actor = await requireAdmin('broadcasts.update', request)
+    const actor = await requireAdminActor('broadcasts.update', request)
     const csrf = validateAdminWriteRequest(request); if (!csrf.ok) return adminJson({ error: csrf.code }, csrf.status, correlationId)
     const { id } = await context.params; const body = await jsonBody(request); const reason = requiredReason(body)
     const current = await db.adminBroadcast.findUnique({ where: { id }, select: { id: true, status: true, createdById: true } })

@@ -1,20 +1,19 @@
 import { db } from '@/lib/db'
-import { requireAdmin } from '@/lib/admin/authorization'
 import { writeAdminAudit } from '@/lib/admin/audit'
 import { validateAdminWriteRequest } from '@/lib/admin/csrf'
 import { withAdminIdempotency } from '@/lib/admin/idempotency'
 import { AI_PROVIDER_SELECT, runtimeCredentialConfigured, toAiProviderDto, validateAiProvider } from '@/lib/admin/ai'
-import { adminError, adminJson, jsonBody, requestId, requiredIdempotencyKey, requiredReason } from '@/lib/admin/route-utils'
+import { adminError, adminJson, jsonBody, requestId, requiredIdempotencyKey, requiredReason, requireAdminActor } from '@/lib/admin/route-utils'
 
 export async function GET(request: Request) {
   const correlationId = requestId(request)
-  try { await requireAdmin('ai_budget.read', request); const providers = await db.aiProviderConfig.findMany({ orderBy: { key: 'asc' }, select: AI_PROVIDER_SELECT }); return adminJson({ items: providers.map(provider => toAiProviderDto({ ...provider, credentialConfigured: runtimeCredentialConfigured(provider) })) }, 200, correlationId) } catch (error) { return adminError(error, correlationId) }
+  try { await requireAdminActor('ai_budget.read', request); const providers = await db.aiProviderConfig.findMany({ orderBy: { key: 'asc' }, select: AI_PROVIDER_SELECT }); return adminJson({ items: providers.map(provider => toAiProviderDto({ ...provider, credentialConfigured: runtimeCredentialConfigured(provider) })) }, 200, correlationId) } catch (error) { return adminError(error, correlationId) }
 }
 
 export async function POST(request: Request) {
   const correlationId = requestId(request)
   try {
-    const actor = await requireAdmin('ai_budget.update', request)
+    const actor = await requireAdminActor('ai_budget.update', request)
     const csrf = validateAdminWriteRequest(request); if (!csrf.ok) return adminJson({ error: csrf.code }, csrf.status, correlationId)
     const body = await jsonBody(request); const reason = requiredReason(body); const value = validateAiProvider(body); const idempotencyKey = requiredIdempotencyKey(request)
     const response = await withAdminIdempotency(db, { actorUserId: actor.userId, key: idempotencyKey, action: 'admin.ai.provider.create', body: { ...value, reason } }, async transaction => {

@@ -1,10 +1,9 @@
 import { db } from '@/lib/db'
-import { requireAdmin } from '@/lib/admin/authorization'
 import { writeAdminAudit } from '@/lib/admin/audit'
 import { validateAdminWriteRequest } from '@/lib/admin/csrf'
 import { withAdminIdempotency } from '@/lib/admin/idempotency'
 import { canEditRole, validatePermissionList } from '@/lib/admin/permissions'
-import { adminError, adminJson, jsonBody, requestId, requiredIdempotencyKey, requiredReason } from '@/lib/admin/route-utils'
+import { adminError, adminJson, jsonBody, requestId, requiredIdempotencyKey, requiredReason, requireAdminActor } from '@/lib/admin/route-utils'
 import { toAdminRoleDto } from '@/lib/admin/dto'
 
 const ROLE_SELECT = { id: true, key: true, name: true, permissions: true, system: true, version: true } as const
@@ -13,7 +12,7 @@ export async function PATCH(request: Request, context: { params: Promise<{ id: s
   const correlationId = requestId(request)
   try {
     const { id } = await context.params
-    const actor = await requireAdmin('admin_roles.manage', request)
+    const actor = await requireAdminActor('admin_roles.manage', request)
     const csrf = validateAdminWriteRequest(request)
     if (!csrf.ok) return adminJson({ error: csrf.code }, csrf.status, correlationId)
     const body = await jsonBody(request)

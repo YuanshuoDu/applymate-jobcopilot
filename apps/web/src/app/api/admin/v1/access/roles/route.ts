@@ -1,10 +1,9 @@
 import { db } from '@/lib/db'
-import { requireAdmin } from '@/lib/admin/authorization'
 import { writeAdminAudit } from '@/lib/admin/audit'
 import { validateAdminWriteRequest } from '@/lib/admin/csrf'
 import { withAdminIdempotency } from '@/lib/admin/idempotency'
 import { validatePermissionList } from '@/lib/admin/permissions'
-import { adminError, adminJson, jsonBody, requestId, requiredIdempotencyKey, requiredReason } from '@/lib/admin/route-utils'
+import { adminError, adminJson, jsonBody, requestId, requiredIdempotencyKey, requiredReason, requireAdminActor } from '@/lib/admin/route-utils'
 import { toAdminRoleDto } from '@/lib/admin/dto'
 
 const ROLE_SELECT = { id: true, key: true, name: true, permissions: true, system: true, version: true } as const
@@ -12,7 +11,7 @@ const ROLE_SELECT = { id: true, key: true, name: true, permissions: true, system
 export async function GET(request: Request) {
   const correlationId = requestId(request)
   try {
-    await requireAdmin('admin_members.read', request)
+    await requireAdminActor('admin_members.read', request)
     const roles = await db.adminRole.findMany({ orderBy: { name: 'asc' }, select: ROLE_SELECT })
     return adminJson({ items: roles.map(toAdminRoleDto) }, 200, correlationId)
   } catch (error) {
@@ -23,7 +22,7 @@ export async function GET(request: Request) {
 export async function POST(request: Request) {
   const correlationId = requestId(request)
   try {
-    const actor = await requireAdmin('admin_roles.manage', request)
+    const actor = await requireAdminActor('admin_roles.manage', request)
     const csrf = validateAdminWriteRequest(request)
     if (!csrf.ok) return adminJson({ error: csrf.code }, csrf.status, correlationId)
     const body = await jsonBody(request)

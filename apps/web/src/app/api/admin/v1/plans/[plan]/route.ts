@@ -1,15 +1,14 @@
 import { db } from '@/lib/db'
-import { requireAdmin } from '@/lib/admin/authorization'
 import { writeAdminAudit } from '@/lib/admin/audit'
 import { validateAdminWriteRequest } from '@/lib/admin/csrf'
 import { withAdminIdempotency } from '@/lib/admin/idempotency'
 import { PLAN_SELECT, planKey, toPlanCatalogDto, validatePlanMetadata } from '@/lib/admin/plans'
-import { adminError, adminJson, jsonBody, requestId, requiredIdempotencyKey, requiredReason } from '@/lib/admin/route-utils'
+import { adminError, adminJson, jsonBody, requestId, requiredIdempotencyKey, requiredReason, requireAdminActor } from '@/lib/admin/route-utils'
 
 export async function PATCH(request: Request, context: { params: Promise<{ plan: string }> }) {
   const correlationId = requestId(request)
   try {
-    const actor = await requireAdmin('billing.update', request)
+    const actor = await requireAdminActor('billing.update', request)
     const csrf = validateAdminWriteRequest(request)
     if (!csrf.ok) return adminJson({ error: csrf.code }, csrf.status, correlationId)
     const { plan: rawPlan } = await context.params

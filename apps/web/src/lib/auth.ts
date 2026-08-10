@@ -9,10 +9,11 @@ import { jwtVerify } from 'jose'
 import { db } from '@/lib/db'
 import { normalizeEmail } from '@/lib/auth-identifiers'
 import { reconcileGoogleLoginIdentity } from '@/lib/google-identity'
+import { getAuthJwtSecret, getAuthSecret } from '@/lib/auth-secret'
 import { canonicalAuthRedirect } from '@/lib/auth-url'
 
-const AUTH_SECRET = process.env.AUTH_SECRET ?? 'fallback-secret-change-this'
-const JWT_SECRET = new TextEncoder().encode(AUTH_SECRET)
+const AUTH_SECRET = getAuthSecret()
+const JWT_SECRET = getAuthJwtSecret()
 
 // Build provider list dynamically — OAuth only enabled when keys are set
 const providers: Provider[] = []
@@ -32,7 +33,7 @@ providers.push(Credentials({
         const { payload } = await jwtVerify(credentials.token, JWT_SECRET)
         if (!payload.sub) return null
         const user = await db.user.findUnique({ where: { id: payload.sub as string } })
-        if (!user || user.accountStatus === 'suspended') return null
+        if (!user) return null
         return { id: user.id, email: user.email, name: user.name, image: user.image }
       } catch {
         return null
@@ -46,7 +47,7 @@ providers.push(Credentials({
     const user = await db.user.findUnique({
       where: { email },
     })
-    if (!user?.password || user.accountStatus === 'suspended') return null
+    if (!user?.password) return null
     const valid = await bcrypt.compare(credentials.password as string, user.password)
     if (!valid) return null
     return { id: user.id, email: user.email, name: user.name, image: user.image }
@@ -88,10 +89,6 @@ export const { handlers, signIn, signOut, auth } = NextAuth({
   session: { strategy: 'jwt' },
   callbacks: {
     async signIn({ user, account, profile }) {
-      if (user.id) {
-        const accountState = await db.user.findUnique({ where: { id: user.id }, select: { accountStatus: true } })
-        if (!accountState || accountState.accountStatus === 'suspended') return '/login?error=AccountSuspended'
-      }
       if (account?.provider === 'google') {
         const validIdentity = await reconcileGoogleLoginIdentity({ user, account, profile })
         if (!validIdentity) return '/login?error=OAuthIdentityMismatch'
@@ -130,14 +127,14 @@ export const { handlers, signIn, signOut, auth } = NextAuth({
     async jwt({ token, user }) {
       if (user) {
         token.id = user.id
-        // Cache plan in token to avoid per-request DB queries
-        const dbUser = await db.user.findUnique({ where: { id: user.id }, select: { plan: true } })
+        // Cache plan and internal session version at sign-in. Admin routes compare
+        // the latter to the live membership, invalidating stale role sessions.
+        const [dbUser, membership] = await Promise.all([
+          db.user.findUnique({ where: { id: user.id }, select: { plan: true } }),
+          db.adminMembership.findUnique({ where: { userId: user.id }, select: { sessionVersion: true } }),
+        ])
         if (dbUser) token.plan = dbUser.plan
-        const adminMembership = await db.adminMembership.findUnique({
-          where: { userId: user.id },
-          select: { sessionVersion: true },
-        })
-        if (adminMembership) token.adminSessionVersion = adminMembership.sessionVersion
+        token.adminSessionVersion = membership?.sessionVersion
       }
       return token
     },
@@ -145,9 +142,7 @@ export const { handlers, signIn, signOut, auth } = NextAuth({
       if (token?.id && session.user) {
         session.user.id   = token.id as string
         session.user.plan = (token.plan as 'free' | 'pro' | 'enterprise') ?? 'free'
-        if (typeof token.adminSessionVersion === 'number') {
-          session.user.adminSessionVersion = token.adminSessionVersion
-        }
+        session.user.adminSessionVersion = typeof token.adminSessionVersion === 'number' ? token.adminSessionVersion : undefined
       }
       return session
     },

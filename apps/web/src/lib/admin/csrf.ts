@@ -1,30 +1,30 @@
-export type AdminWriteValidation =
-  | { ok: true }
-  | { ok: false; status: 403; code: 'CSRF_ORIGIN_MISMATCH' }
+import { NextResponse } from 'next/server'
 
-const SAFE_METHODS = new Set(['GET', 'HEAD', 'OPTIONS'])
+export type AdminWriteValidation = { ok: true } | { ok: false; status: 403 | 400; code: 'CSRF_ORIGIN_MISMATCH' | 'IDEMPOTENCY_KEY_REQUIRED' }
 
-export function validateAdminWriteRequest(request: Request): AdminWriteValidation {
-  if (SAFE_METHODS.has(request.method.toUpperCase())) return { ok: true }
-
-  const configuredOrigin = originFrom(process.env.AUTH_CANONICAL_URL)
-    ?? originFrom(process.env.NEXTAUTH_URL)
-    ?? originFrom(request.url)
-  const requestOrigin = request.headers.get('origin')
-    ?? originFrom(request.headers.get('referer') ?? undefined)
-
-  if (!configuredOrigin || requestOrigin !== configuredOrigin) {
-    return { ok: false, status: 403, code: 'CSRF_ORIGIN_MISMATCH' }
+export function validateAdminWrite(request: Request) {
+  const origin = request.headers.get('origin')
+  const host = request.headers.get('host')
+  const idempotencyKey = request.headers.get('idempotency-key')
+  if (!origin || !host || new URL(origin).host !== host) {
+    return NextResponse.json({ error: 'Invalid request origin' }, { status: 403 })
   }
-
-  return { ok: true }
+  if (!idempotencyKey || idempotencyKey.length > 128) {
+    return NextResponse.json({ error: 'Idempotency-Key is required' }, { status: 400 })
+  }
+  return null
 }
 
-function originFrom(value: string | undefined): string | null {
+export function validateAdminWriteRequest(request: Request): AdminWriteValidation {
+  if (['GET', 'HEAD', 'OPTIONS'].includes(request.method.toUpperCase())) return { ok: true }
+  const configuredOrigin = originFrom(process.env.AUTH_CANONICAL_URL) ?? originFrom(process.env.NEXTAUTH_URL) ?? originFrom(request.url)
+  const requestOrigin = originFrom(request.headers.get('origin') ?? request.headers.get('referer') ?? undefined)
+  return configuredOrigin && requestOrigin === configuredOrigin
+    ? { ok: true }
+    : { ok: false, status: 403, code: 'CSRF_ORIGIN_MISMATCH' }
+}
+
+function originFrom(value: string | null | undefined): string | null {
   if (!value) return null
-  try {
-    return new URL(value).origin
-  } catch {
-    return null
-  }
+  try { return new URL(value).origin } catch { return null }
 }

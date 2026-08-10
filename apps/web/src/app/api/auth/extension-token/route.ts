@@ -8,10 +8,9 @@ import bcrypt from 'bcryptjs'
 import { SignJWT } from 'jose'
 import { db } from '@/lib/db'
 import { normalizeEmail } from '@/lib/auth-identifiers'
+import { getAuthJwtSecret } from '@/lib/auth-secret'
 
-const JWT_SECRET = new TextEncoder().encode(
-  process.env.AUTH_SECRET ?? 'fallback-secret-change-this',
-)
+const JWT_SECRET = getAuthJwtSecret()
 
 export async function POST(req: NextRequest) {
   const body = await req.json().catch(() => null)

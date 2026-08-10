@@ -1,12 +1,48 @@
+import { NextRequest, NextResponse } from 'next/server'
+import { isAdminResponse, requireAdmin } from '@/lib/admin/authorization'
+import { runAdminMutation } from '@/lib/admin/write-transaction'
+import { audienceWhere, storedAudience } from '@/lib/admin/broadcast-service'
+import { validateAdminWrite } from '@/lib/admin/csrf'
 import { db } from '@/lib/db'
-import { requireAdmin } from '@/lib/admin/authorization'
-import { writeAdminAudit } from '@/lib/admin/audit'
-import { validateAdminWriteRequest } from '@/lib/admin/csrf'
-import { withAdminIdempotency } from '@/lib/admin/idempotency'
-import { broadcastWhere, storedAudience } from '@/lib/admin/broadcast'
-import { adminError, adminJson, jsonBody, requestId, requiredIdempotencyKey, requiredReason } from '@/lib/admin/route-utils'
 
-export async function POST(request: Request, context: { params: Promise<{ id: string }> }) {
-  const correlationId = requestId(request)
-  try { const actor = await requireAdmin('broadcasts.publish', request); const csrf = validateAdminWriteRequest(request); if (!csrf.ok) return adminJson({ error: csrf.code }, csrf.status, correlationId); const { id } = await context.params; const body = await jsonBody(request); const reason = requiredReason(body); if (body.confirm !== true) return adminJson({ error: 'BROADCAST_CONFIRMATION_REQUIRED' }, 400, correlationId); const current = await db.adminBroadcast.findUnique({ where: { id }, select: { id: true, status: true, createdById: true, audienceType: true, audience: true, title: true, body: true } }); if (!current) return adminJson({ error: 'BROADCAST_NOT_FOUND' }, 404, correlationId); if (current.createdById === actor.userId) return adminJson({ error: 'BROADCAST_CREATOR_CANNOT_PUBLISH' }, 403, correlationId); if (current.status !== 'scheduled') return adminJson({ error: 'BROADCAST_STATUS_INVALID' }, 409, correlationId); const idempotencyKey = requiredIdempotencyKey(request); const response = await withAdminIdempotency(db, { actorUserId: actor.userId, key: idempotencyKey, action: 'admin.broadcast.publish', body: { id, reason } }, async transaction => { const users = await transaction.user.findMany({ where: broadcastWhere(storedAudience(current)), select: { id: true } }); const result = await transaction.notification.createMany({ data: users.map(user => ({ userId: user.id, broadcastId: id, type: 'platform_broadcast', title: current.title, body: current.body })), skipDuplicates: true }); const broadcast = await transaction.adminBroadcast.update({ where: { id, status: 'scheduled' }, data: { status: 'published', publishedById: actor.userId, recipientCount: users.length, deliveredCount: result.count, failedCount: 0 }, select: { id: true, status: true, recipientCount: true, deliveredCount: true } }); await writeAdminAudit(transaction, { requestId: correlationId, actorUserId: actor.userId, actorRoleKey: actor.roleKey, action: 'admin.broadcast.publish', targetType: 'broadcast', targetId: id, reason, outcome: 'success', after: { status: broadcast.status, recipientCount: broadcast.recipientCount, deliveredCount: broadcast.deliveredCount } }); return { status: 200, body: { broadcast } } }); return adminJson(response.body, response.status, correlationId) } catch (error) { return adminError(error, correlationId) }
+const RECIPIENT_BATCH_SIZE = 500
+
+export async function POST(request: NextRequest, context: { params: Promise<{ id: string }> }) {
+  const actor = await requireAdmin('broadcasts.publish', request)
+  if (isAdminResponse(actor)) return actor
+  const writeError = validateAdminWrite(request)
+  if (writeError) return writeError
+  const { id } = await context.params
+  const payload = await request.json().catch(() => null) as { reason?: unknown; confirmation?: unknown } | null
+  const reason = typeof payload?.reason === 'string' ? payload.reason.trim() : ''
+  const idempotencyKey = request.headers.get('idempotency-key')
+  if (payload?.confirmation !== 'publish' || reason.length < 10 || reason.length > 500 || !idempotencyKey) return NextResponse.json({ error: 'A confirmed publish request is required' }, { status: 400 })
+  const broadcast = await db.adminBroadcast.findUnique({ where: { id }, select: { title: true, body: true, audienceType: true, audience: true, status: true, approvedById: true, publishIdempotencyKey: true } })
+  if (!broadcast) return NextResponse.json({ error: 'Not found' }, { status: 404 })
+  if (broadcast.status === 'published' && broadcast.publishIdempotencyKey === idempotencyKey) return NextResponse.json({ broadcast: { id, status: 'published' }, duplicate: true })
+  const audience = storedAudience(broadcast.audience, broadcast.audienceType)
+  if (!audience || !broadcast.approvedById || broadcast.status !== 'draft') return NextResponse.json({ error: 'Broadcast must be approved before publishing' }, { status: 409 })
+  const where = audienceWhere(audience)
+  const recipientCount = await db.user.count({ where })
+  const claimResult = await runAdminMutation({ actorUserId: actor.userId, action: 'broadcast.publish_started', idempotencyKey, targetId: id, audit: { requestId: actor.requestId, actorRoleKey: actor.roleKey, targetType: 'broadcast', targetId: id, reason, outcome: 'success' }, mutate: (tx) => tx.adminBroadcast.updateMany({ where: { id, status: 'draft', approvedById: { not: null } }, data: { status: 'publishing', publishIdempotencyKey: idempotencyKey, publishedById: actor.userId, recipientCount } }) })
+  if (claimResult.duplicate) return NextResponse.json({ duplicate: true }, { headers: { 'Cache-Control': 'no-store' } })
+  const claimed = claimResult.value
+  if (!claimed.count) return NextResponse.json({ error: 'Broadcast is already being processed' }, { status: 409 })
+  let cursor: string | undefined
+  let deliveredCount = 0
+  try {
+    while (true) {
+      const recipients = await db.user.findMany({ where, select: { id: true }, orderBy: { id: 'asc' }, cursor: cursor ? { id: cursor } : undefined, skip: cursor ? 1 : undefined, take: RECIPIENT_BATCH_SIZE })
+      if (!recipients.length) break
+      const created = await db.notification.createMany({ data: recipients.map((recipient) => ({ userId: recipient.id, broadcastId: id, type: 'platform_broadcast', title: broadcast.title, body: broadcast.body })), skipDuplicates: true })
+      deliveredCount += created.count
+      cursor = recipients[recipients.length - 1]?.id
+      if (recipients.length < RECIPIENT_BATCH_SIZE) break
+    }
+    const published = await db.adminBroadcast.update({ where: { id }, data: { status: 'published', deliveredCount: { increment: deliveredCount } }, select: { id: true, status: true, recipientCount: true, deliveredCount: true } })
+    return NextResponse.json({ broadcast: published }, { headers: { 'Cache-Control': 'no-store', 'x-request-id': actor.requestId } })
+  } catch {
+    await db.adminBroadcast.update({ where: { id }, data: { status: 'failed' } })
+    return NextResponse.json({ error: 'Broadcast delivery failed' }, { status: 500 })
+  }
 }

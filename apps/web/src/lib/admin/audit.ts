@@ -1,84 +1,64 @@
 import { createHash } from 'node:crypto'
+import type { AdminAuditOutcome, AdminTargetType, Prisma } from '@prisma/client'
+import { db } from '@/lib/db'
 
-const SAFE_SNAPSHOT_KEYS = new Set([
-  'status',
-  'version',
-  'roleKey',
-  'roleName',
-  'permissionCount',
-  'sessionVersion',
-  'outcome',
-  'reasonCode',
-])
-
-export type AuditOutcome = 'success' | 'denied' | 'failed'
-
-export interface AdminAuditEvent {
+export type AuditInput = {
   requestId: string
-  actorUserId?: string
-  actorRoleKey?: string
+  actorUserId?: string | null
+  actorRoleKey?: string | null
   action: string
-  targetType?: string
+  outcome: AdminAuditOutcome
+  targetType?: AdminTargetType
   targetId?: string
   tenantUserId?: string
   reason?: string
-  outcome: AuditOutcome
-  ip?: string
-  userAgent?: string
-  before?: unknown
-  after?: unknown
   errorCode?: string
+  before?: Prisma.InputJsonValue
+  after?: Prisma.InputJsonValue
+  ip?: string | null
+  userAgent?: string | null
 }
 
-interface AuditStore {
-  adminAuditLog: {
-    create(args: { data: Record<string, unknown> }): Promise<unknown>
-  }
-}
+type AuditStore = { adminAuditLog: { create(args: { data: Prisma.AdminAuditLogCreateInput }): Promise<unknown> } }
 
-export function safeAuditSnapshot(input: unknown): Record<string, unknown> {
+const SAFE_SNAPSHOT_KEYS = new Set(['status', 'version', 'roleKey', 'roleName', 'permissionCount', 'sessionVersion', 'outcome', 'reasonCode'])
+
+export function safeAuditSnapshot(input: unknown): Record<string, string | number | boolean> {
   if (input === null || typeof input !== 'object' || Array.isArray(input)) return {}
-  const source = input as Record<string, unknown>
-  return Object.fromEntries(
-    Object.entries(source).filter(([key, value]) => SAFE_SNAPSHOT_KEYS.has(key) && isSafeValue(value)),
-  )
+  return Object.fromEntries(Object.entries(input as Record<string, unknown>).filter(([key, value]) => SAFE_SNAPSHOT_KEYS.has(key) && ['string', 'number', 'boolean'].includes(typeof value))) as Record<string, string | number | boolean>
 }
 
-export async function writeAdminAudit(store: AuditStore, event: AdminAuditEvent): Promise<unknown> {
-  return store.adminAuditLog.create({
-    data: {
-      requestId: event.requestId,
-      actorUserId: event.actorUserId,
-      actorRoleKey: event.actorRoleKey,
-      action: event.action,
-      targetType: event.targetType,
-      targetId: event.targetId,
-      tenantUserId: event.tenantUserId,
-      reason: sanitizeReason(event.reason),
-      outcome: event.outcome,
-      ipHash: hashMetadata(event.ip),
-      userAgentHash: hashMetadata(event.userAgent),
-      before: safeAuditSnapshot(event.before),
-      after: safeAuditSnapshot(event.after),
-      errorCode: event.errorCode,
-    },
-  })
-}
-
-function isSafeValue(value: unknown): boolean {
-  return typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean'
-}
-
-function hashMetadata(value: string | undefined): string | undefined {
+function hash(value: string | null | undefined) {
   return value ? createHash('sha256').update(value).digest('hex') : undefined
 }
 
-function sanitizeReason(value: string | undefined): string | undefined {
-  if (!value) return undefined
-  return value
-    .trim()
-    .slice(0, 500)
-    .replace(/(?:sk-|Bearer\s+|AKIA)[A-Za-z0-9_./+=-]+/gi, '[REDACTED]')
-    .replace(/\b\d{13,19}\b/g, '[REDACTED]')
-    .replace(/-----BEGIN [^-]+-----[\s\S]*?-----END [^-]+-----/gi, '[REDACTED]')
+export function requestIdFor(request?: Request) {
+  return request?.headers.get('x-request-id')?.slice(0, 128) || crypto.randomUUID()
+}
+
+export function createAdminAuditData(input: AuditInput): Prisma.AdminAuditLogCreateInput {
+  return {
+    requestId: input.requestId,
+    actorUserId: input.actorUserId,
+    actorRoleKey: input.actorRoleKey,
+    action: input.action,
+    outcome: input.outcome,
+    targetType: input.targetType,
+    targetId: input.targetId,
+    tenantUserId: input.tenantUserId,
+    reason: input.reason,
+    errorCode: input.errorCode,
+    before: input.before,
+    after: input.after,
+    ipHash: hash(input.ip),
+    userAgentHash: hash(input.userAgent),
+  }
+}
+
+export async function writeAdminAudit(input: AuditInput): Promise<void>
+export async function writeAdminAudit(store: AuditStore, input: AuditInput): Promise<void>
+export async function writeAdminAudit(first: AuditInput | AuditStore, second?: AuditInput): Promise<void> {
+  const store = second ? first as AuditStore : db
+  const input = second ?? first as AuditInput
+  await store.adminAuditLog.create({ data: createAdminAuditData({ ...input, before: input.before === undefined ? undefined : safeAuditSnapshot(input.before), after: input.after === undefined ? undefined : safeAuditSnapshot(input.after) }) })
 }

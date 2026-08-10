@@ -1,16 +1,15 @@
 import { db } from '@/lib/db'
-import { requireAdmin } from '@/lib/admin/authorization'
 import { validateAdminWriteRequest } from '@/lib/admin/csrf'
 import { withAdminIdempotency } from '@/lib/admin/idempotency'
 import { validateFeatureOverride } from '@/lib/admin/plans'
-import { adminError, adminJson, jsonBody, requestId, requiredIdempotencyKey, requiredReason } from '@/lib/admin/route-utils'
+import { adminError, adminJson, jsonBody, requestId, requiredIdempotencyKey, requiredReason, requireAdminActor } from '@/lib/admin/route-utils'
 
 const OVERRIDE_SELECT = { id: true, featureKey: true, enabled: true, limit: true, expiresAt: true, reason: true, updatedAt: true } as const
 
 export async function GET(request: Request, context: { params: Promise<{ id: string }> }) {
   const correlationId = requestId(request)
   try {
-    await requireAdmin('users.read', request)
+    await requireAdminActor('users.read', request)
     const { id } = await context.params
     const user = await db.user.findUnique({ where: { id }, select: { id: true } })
     if (!user) return adminJson({ error: 'ADMIN_USER_NOT_FOUND' }, 404, correlationId)
@@ -22,7 +21,7 @@ export async function GET(request: Request, context: { params: Promise<{ id: str
 export async function PATCH(request: Request, context: { params: Promise<{ id: string }> }) {
   const correlationId = requestId(request)
   try {
-    const actor = await requireAdmin('billing.update', request)
+    const actor = await requireAdminActor('billing.update', request)
     const csrf = validateAdminWriteRequest(request)
     if (!csrf.ok) return adminJson({ error: csrf.code }, csrf.status, correlationId)
     const { id } = await context.params

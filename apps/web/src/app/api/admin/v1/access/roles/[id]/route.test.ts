@@ -3,7 +3,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest'
 const mocks = vi.hoisted(() => ({
   requireAdmin: vi.fn(), findUnique: vi.fn(), update: vi.fn(), count: vi.fn(), audit: vi.fn(), idempotency: vi.fn(), csrf: vi.fn(),
 }))
-vi.mock('@/lib/admin/authorization', () => ({ requireAdmin: mocks.requireAdmin }))
+vi.mock('@/lib/admin/authorization', () => ({ requireAdmin: mocks.requireAdmin, isAdminResponse: (value: unknown) => value instanceof Response }))
 vi.mock('@/lib/db', () => ({ db: { adminRole: { findUnique: mocks.findUnique, update: mocks.update }, adminMembership: { count: mocks.count } } }))
 vi.mock('@/lib/admin/audit', () => ({ writeAdminAudit: mocks.audit }))
 vi.mock('@/lib/admin/csrf', () => ({ validateAdminWriteRequest: mocks.csrf }))

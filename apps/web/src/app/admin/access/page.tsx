@@ -1,5 +1,9 @@
-import { AccessPage } from '@/components/admin/AccessPage'
+import { redirect } from 'next/navigation'
+import { AdminAccessPage } from '@/components/admin/AdminAccessPage'
+import { isAdminResponse, requireAdmin } from '@/lib/admin/authorization'
 
-export default function AdminAccessRoute() {
-  return <AccessPage />
+export default async function AccessAdminPage() {
+  const actor = await requireAdmin('admin_members.read')
+  if (isAdminResponse(actor)) redirect('/login?callbackUrl=/admin/access')
+  return <AdminAccessPage canRevoke={actor.permissions.includes('sessions.revoke')} canManage={actor.permissions.includes('admin_members.manage')} />
 }

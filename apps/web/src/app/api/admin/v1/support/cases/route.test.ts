@@ -1,7 +1,8 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { NextRequest } from 'next/server'
 
 const mocks = vi.hoisted(() => ({ requireAdmin: vi.fn(), findMany: vi.fn(), members: vi.fn() }))
-vi.mock('@/lib/admin/authorization', () => ({ requireAdmin: mocks.requireAdmin }))
+vi.mock('@/lib/admin/authorization', () => ({ requireAdmin: mocks.requireAdmin, isAdminResponse: (value: unknown) => value instanceof Response }))
 vi.mock('@/lib/db', () => ({ db: { supportCase: { findMany: mocks.findMany }, adminMembership: { findMany: mocks.members } } }))
 
 describe('GET /api/admin/v1/support/cases', () => {
@@ -11,7 +12,7 @@ describe('GET /api/admin/v1/support/cases', () => {
 
   it('returns masked support context and assignment metadata only', async () => {
     const { GET } = await import('./route')
-    const response = await GET(new Request('http://localhost/api/admin/v1/support/cases'))
+    const response = await GET(new NextRequest('http://localhost/api/admin/v1/support/cases'))
     const body = await response.json()
     expect(response.status).toBe(200)
     expect(body.actorUserId).toBe('admin-a')

@@ -1,44 +1,20 @@
+import { NextRequest, NextResponse } from 'next/server'
+import { isAdminResponse, requireAdmin } from '@/lib/admin/authorization'
+import { writeAdminAudit } from '@/lib/admin/audit'
+import { adminUserMetadataSelect, toAdminUserMetadata } from '@/lib/admin/dto'
+import { adminPageLimit, pageResult } from '@/lib/admin/pagination'
 import { db } from '@/lib/db'
-import { requireAdmin } from '@/lib/admin/authorization'
-import { toAdminMemberDto } from '@/lib/admin/dto'
-import { adminError, adminJson, requestId } from '@/lib/admin/route-utils'
 
-const MEMBER_SELECT = {
-  id: true, userId: true, status: true, mfaLevel: true, sessionVersion: true, grantedAt: true,
-  role: { select: { key: true, name: true, permissions: true } },
-  user: { select: { id: true, email: true, name: true, plan: true } },
-} as const
-
-export async function GET(request: Request) {
-  const correlationId = requestId(request)
-  try {
-    await requireAdmin('admin_members.read', request)
-    const url = new URL(request.url)
-    const limit = boundedLimit(url.searchParams.get('limit'))
-    const cursor = url.searchParams.get('cursor')?.trim() || undefined
-    const status = parseStatus(url.searchParams.get('status'))
-    const search = url.searchParams.get('q')?.trim()
-    const items = await db.adminMembership.findMany({
-      where: {
-        ...(status ? { status } : {}),
-        ...(search ? { user: { OR: [{ email: { contains: search, mode: 'insensitive' } }, { name: { contains: search, mode: 'insensitive' } }] } } : {}),
-      },
-      orderBy: { grantedAt: 'desc' },
-      ...(cursor ? { cursor: { id: cursor }, skip: 1 } : {}),
-      take: limit,
-      select: MEMBER_SELECT,
-    })
-    return adminJson({ items: items.map(toAdminMemberDto), nextCursor: items.length === limit ? items[items.length - 1]?.id ?? null : null }, 200, correlationId)
-  } catch (error) {
-    return adminError(error, correlationId)
-  }
-}
-
-function boundedLimit(value: string | null): number {
-  const parsed = Number(value ?? 50)
-  return Number.isInteger(parsed) && parsed > 0 ? Math.min(parsed, 100) : 50
-}
-
-function parseStatus(value: string | null): 'active' | 'suspended' | 'revoked' | undefined {
-  return value === 'active' || value === 'suspended' || value === 'revoked' ? value : undefined
+export async function GET(request: NextRequest) {
+  const actor = await requireAdmin('admin_members.read', request)
+  if (isAdminResponse(actor)) return actor
+  const params = new URL(request.url).searchParams
+  const limit = adminPageLimit(params.get('limit'))
+  const cursor = params.get('cursor')
+  const rows = await db.adminMembership.findMany({
+    select: { id: true, status: true, mfaLevel: true, sessionVersion: true, grantedAt: true, revokedAt: true, user: { select: adminUserMetadataSelect }, role: { select: { key: true, name: true } } },
+    orderBy: { id: 'asc' }, cursor: cursor ? { id: cursor } : undefined, skip: cursor ? 1 : undefined, take: limit + 1,
+  })
+  await writeAdminAudit({ requestId: actor.requestId, actorUserId: actor.userId, actorRoleKey: actor.roleKey, action: 'admin_members.list_viewed', outcome: 'success' })
+  return NextResponse.json(pageResult(rows.map((row) => ({ ...row, user: toAdminUserMetadata(row.user) })), limit), { headers: { 'Cache-Control': 'no-store', 'x-request-id': actor.requestId } })
 }

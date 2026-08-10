@@ -1,16 +1,15 @@
 import { db } from '@/lib/db'
-import { requireAdmin } from '@/lib/admin/authorization'
 import { writeAdminAudit } from '@/lib/admin/audit'
 import { validateAdminWriteRequest } from '@/lib/admin/csrf'
 import { withAdminIdempotency } from '@/lib/admin/idempotency'
 import { runtimeCredentialConfigured, toAiProviderDto, validateAiProvider } from '@/lib/admin/ai'
-import { adminError, adminJson, jsonBody, requestId, requiredIdempotencyKey, requiredReason } from '@/lib/admin/route-utils'
+import { adminError, adminJson, jsonBody, requestId, requiredIdempotencyKey, requiredReason, requireAdminActor } from '@/lib/admin/route-utils'
 import { AI_PROVIDER_SELECT } from '@/lib/admin/ai'
 
 export async function PATCH(request: Request, context: { params: Promise<{ id: string }> }) {
   const correlationId = requestId(request)
   try {
-    const actor = await requireAdmin('ai_budget.update', request)
+    const actor = await requireAdminActor('ai_budget.update', request)
     const csrf = validateAdminWriteRequest(request); if (!csrf.ok) return adminJson({ error: csrf.code }, csrf.status, correlationId)
     const { id } = await context.params; const body = await jsonBody(request); const reason = requiredReason(body); const value = validateAiProvider(body); const version = body.version
     if (typeof version !== 'number' || !Number.isInteger(version) || version < 1) throw new Error('Provider version is required')

@@ -6,10 +6,9 @@ import { APPLYMATE_BACKING, loadUserAiConfig, resolveConfig, type FeatureId } fr
 import { db } from '@/lib/db'
 import { safeAuth } from '@/lib/safe-auth'
 import { isFeatureAllowed, resolveAiAccess } from '@/lib/entitlements'
+import { getAuthJwtSecret } from '@/lib/auth-secret'
 
-const JWT_SECRET = new TextEncoder().encode(
-  process.env.AUTH_SECRET ?? 'fallback-secret-change-this',
-)
+const JWT_SECRET = getAuthJwtSecret()
 
 /** Get authenticated userId — supports both NextAuth session and Extension Bearer token */
 export async function requireAuth(

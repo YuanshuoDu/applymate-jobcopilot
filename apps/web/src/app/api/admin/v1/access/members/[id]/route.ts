@@ -1,77 +1,32 @@
+import { NextRequest, NextResponse } from 'next/server'
+import { AdminMembershipStatus } from '@prisma/client'
+import { isAdminResponse, requireAdmin } from '@/lib/admin/authorization'
+import { runAdminMutation } from '@/lib/admin/write-transaction'
+import { validateAdminWrite } from '@/lib/admin/csrf'
 import { db } from '@/lib/db'
-import { requireAdmin } from '@/lib/admin/authorization'
-import { writeAdminAudit } from '@/lib/admin/audit'
-import { validateAdminWriteRequest } from '@/lib/admin/csrf'
-import { withAdminIdempotency } from '@/lib/admin/idempotency'
-import { toAdminMemberDto } from '@/lib/admin/dto'
-import { adminError, adminJson, jsonBody, requestId, requiredIdempotencyKey, requiredReason } from '@/lib/admin/route-utils'
 
-const MEMBER_SELECT = {
-  id: true, userId: true, status: true, mfaLevel: true, sessionVersion: true, grantedAt: true,
-  role: { select: { key: true, name: true, permissions: true } },
-  user: { select: { id: true, email: true, name: true, plan: true } },
-} as const
+const statuses = Object.values(AdminMembershipStatus)
 
-export async function PATCH(request: Request, context: { params: Promise<{ id: string }> }) {
-  const correlationId = requestId(request)
-  try {
-    const { id } = await context.params
-    const actor = await requireAdmin('admin_members.manage', request)
-    const csrf = validateAdminWriteRequest(request)
-    if (!csrf.ok) return adminJson({ error: csrf.code }, csrf.status, correlationId)
-    const body = await jsonBody(request)
-    const reason = requiredReason(body)
-    const version = body.version
-    if (typeof version !== 'number' || !Number.isInteger(version) || version < 1) throw new Error('Membership version is required')
-    const current = await db.adminMembership.findUnique({ where: { id }, select: { ...MEMBER_SELECT, roleId: true } })
-    if (!current) return adminJson({ error: 'ADMIN_MEMBER_NOT_FOUND' }, 404, correlationId)
-    const nextStatus = body.status === undefined ? current.status : parseStatus(body.status)
-    const nextRoleId = body.roleId === undefined ? current.roleId : requiredString(body.roleId, 'roleId')
-    if (current.userId === actor.userId && (nextStatus !== 'active' || nextRoleId !== current.roleId)) {
-      return adminJson({ error: 'SELF_ADMIN_CHANGE_FORBIDDEN' }, 403, correlationId)
-    }
-    const targetRole = nextRoleId === current.roleId
-      ? { id: current.roleId, key: current.role.key }
-      : await db.adminRole.findUnique({ where: { id: nextRoleId }, select: { id: true, key: true } })
-    if (!targetRole) return adminJson({ error: 'ADMIN_ROLE_NOT_FOUND' }, 404, correlationId)
-    if (current.role.key === 'super_admin' && current.status === 'active' && (targetRole.key !== 'super_admin' || nextStatus !== 'active')) {
-      const standing = await db.adminMembership.count({ where: { roleId: current.roleId, status: 'active' } })
-      if (standing <= 1) return adminJson({ error: 'LAST_SUPER_ADMIN_PROTECTED' }, 409, correlationId)
-    }
-    const idempotencyKey = requiredIdempotencyKey(request)
-    const response = await withAdminIdempotency(db, {
-      actorUserId: actor.userId, key: idempotencyKey, action: 'admin.member.update', body: { id: current.id, roleId: nextRoleId, status: nextStatus, version, reason },
-    }, async transaction => {
-      const member = await transaction.adminMembership.update({
-        where: { id: current.id, sessionVersion: version },
-        data: { roleId: nextRoleId, status: nextStatus, revokedAt: nextStatus === 'revoked' ? new Date() : null },
-        select: MEMBER_SELECT,
-      })
-      await writeAdminAudit(transaction, {
-        requestId: correlationId, actorUserId: actor.userId, actorRoleKey: actor.roleKey,
-        action: 'admin.member.update', targetType: 'admin_member', targetId: member.id, reason, outcome: 'success',
-        before: { status: current.status, roleKey: current.role.key, sessionVersion: current.sessionVersion },
-        after: { status: member.status, roleKey: member.role.key, sessionVersion: member.sessionVersion },
-      })
-      return { status: 200, body: { member: toAdminMemberDto(member) } }
-    })
-    return adminJson(response.body, response.status, correlationId)
-  } catch (error) {
-    if (isPrismaConflict(error)) return adminJson({ error: 'VERSION_CONFLICT' }, 409, correlationId)
-    return adminError(error, correlationId)
-  }
-}
-
-function requiredString(value: unknown, field: string): string {
-  if (typeof value !== 'string' || !value.trim()) throw new Error(`${field} is required`)
-  return value.trim()
-}
-
-function parseStatus(value: unknown): 'active' | 'suspended' | 'revoked' {
-  if (value === 'active' || value === 'suspended' || value === 'revoked') return value
-  throw new Error('Invalid membership status')
-}
-
-function isPrismaConflict(value: unknown): boolean {
-  return Boolean(value && typeof value === 'object' && (value as { code?: unknown }).code === 'P2025')
+export async function PATCH(request: NextRequest, context: { params: Promise<{ id: string }> }) {
+  const actor = await requireAdmin('admin_members.manage', request)
+  if (isAdminResponse(actor)) return actor
+  const writeError = validateAdminWrite(request)
+  if (writeError) return writeError
+  const { id } = await context.params
+  const payload = await request.json().catch(() => null) as { roleKey?: unknown; status?: unknown; sessionVersion?: unknown; reason?: unknown } | null
+  const roleKey = typeof payload?.roleKey === 'string' ? payload.roleKey : ''
+  const status = typeof payload?.status === 'string' && statuses.includes(payload.status as AdminMembershipStatus) ? payload.status as AdminMembershipStatus : null
+  const sessionVersion = typeof payload?.sessionVersion === 'number' && Number.isInteger(payload.sessionVersion) ? payload.sessionVersion : -1
+  const reason = typeof payload?.reason === 'string' ? payload.reason.trim() : ''
+  const key = request.headers.get('idempotency-key')
+  if (!roleKey || !status || sessionVersion < 1 || reason.length < 10 || reason.length > 500 || !key) return NextResponse.json({ error: 'Invalid access update' }, { status: 400 })
+  const membership = await db.adminMembership.findUnique({ where: { id }, select: { userId: true } })
+  const role = await db.adminRole.findUnique({ where: { key: roleKey }, select: { id: true } })
+  if (!membership || !role) return NextResponse.json({ error: 'Not found' }, { status: 404 })
+  if (membership.userId === actor.userId) return NextResponse.json({ error: 'Administrators cannot change their own access' }, { status: 403 })
+  const result = await runAdminMutation({ actorUserId: actor.userId, action: 'admin_members.updated', idempotencyKey: key, targetId: id, audit: { requestId: actor.requestId, actorRoleKey: actor.roleKey, targetType: 'admin_member', targetId: id, tenantUserId: membership.userId, reason, outcome: 'success', after: { roleKey, status, sessionVersion: sessionVersion + 1 } }, mutate: (tx) => tx.adminMembership.updateMany({ where: { id, sessionVersion }, data: { roleId: role.id, status, sessionVersion: { increment: 1 }, revokedAt: status === 'active' ? null : new Date() } }) })
+  if (result.duplicate) return NextResponse.json({ duplicate: true }, { headers: { 'Cache-Control': 'no-store' } })
+  const updated = result.value
+  if (!updated.count) return NextResponse.json({ error: 'Access changed' }, { status: 409 })
+  return NextResponse.json({ id, sessionVersion: sessionVersion + 1 }, { headers: { 'Cache-Control': 'no-store', 'x-request-id': actor.requestId } })
 }

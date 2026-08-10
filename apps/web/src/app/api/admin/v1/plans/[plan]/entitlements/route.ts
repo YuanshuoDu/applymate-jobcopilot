@@ -1,17 +1,16 @@
 import { db } from '@/lib/db'
-import { requireAdmin } from '@/lib/admin/authorization'
 import { writeAdminAudit } from '@/lib/admin/audit'
 import { validateAdminWriteRequest } from '@/lib/admin/csrf'
 import { withAdminIdempotency } from '@/lib/admin/idempotency'
 import { planKey, toEntitlementDto, validateEntitlement } from '@/lib/admin/plans'
-import { adminError, adminJson, jsonBody, requestId, requiredIdempotencyKey, requiredReason } from '@/lib/admin/route-utils'
+import { adminError, adminJson, jsonBody, requestId, requiredIdempotencyKey, requiredReason, requireAdminActor } from '@/lib/admin/route-utils'
 
 const ENTITLEMENT_SELECT = { id: true, featureKey: true, kind: true, enabled: true, limit: true, textValue: true } as const
 
 export async function GET(request: Request, context: { params: Promise<{ plan: string }> }) {
   const correlationId = requestId(request)
   try {
-    await requireAdmin('billing.read', request)
+    await requireAdminActor('billing.read', request)
     const { plan: rawPlan } = await context.params
     const plan = planKey(rawPlan)
     const catalogue = await db.planCatalog.findUnique({ where: { plan }, select: { id: true } })
@@ -24,7 +23,7 @@ export async function GET(request: Request, context: { params: Promise<{ plan: s
 export async function PATCH(request: Request, context: { params: Promise<{ plan: string }> }) {
   const correlationId = requestId(request)
   try {
-    const actor = await requireAdmin('billing.update', request)
+    const actor = await requireAdminActor('billing.update', request)
     const csrf = validateAdminWriteRequest(request)
     if (!csrf.ok) return adminJson({ error: csrf.code }, csrf.status, correlationId)
     const { plan: rawPlan } = await context.params

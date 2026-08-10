@@ -1,15 +1,14 @@
 import { describe, expect, it, vi } from 'vitest'
 
-const requireAdmin = vi.hoisted(() => vi.fn())
-vi.mock('@/lib/admin/authorization', () => ({ requireAdmin }))
+const requireAdminMembership = vi.hoisted(() => vi.fn())
+vi.mock('@/lib/admin/authorization', () => ({ requireAdminMembership, isAdminResponse: (value: unknown) => value instanceof Response }))
+vi.mock('next/navigation', () => ({ redirect: (url: string) => { throw new Error(`redirect:${url}`) } }))
 vi.mock('@/components/admin/AdminShell', () => ({ AdminShell: ({ children }: { children: unknown }) => children }))
 
 describe('admin layout', () => {
-  it('renders an access-denied state when the admin session is not authorized', async () => {
-    requireAdmin.mockRejectedValueOnce(new Error('denied'))
+  it('redirects an unauthorized administrator to login', async () => {
+    requireAdminMembership.mockResolvedValueOnce(new Response(null, { status: 401 }))
     const { default: AdminLayout } = await import('./layout')
-    const result = await AdminLayout({ children: 'content' })
-    expect(result).toBeTruthy()
-    expect(JSON.stringify(result)).toContain('Access denied')
+    await expect(AdminLayout({ children: 'content' })).rejects.toThrow('redirect:/login?callbackUrl=/admin')
   })
 })
