@@ -9,6 +9,8 @@ export function safeTemplateOptions(value: unknown): { accentColor: string; font
   const input = value as Record<string, unknown>
   const fontFamily = input.fontFamily === 'serif' || input.fontFamily === 'mono' ? input.fontFamily : 'sans'
   const density = input.density === 'compact' || input.density === 'spacious' ? input.density : 'comfortable'
-  if (input.accentColor !== undefined && safeAccentColor(input.accentColor, '') === '') return null
+  // Old resumes may contain a free-form color from before validation existed.
+  // Normalize it to the product token so editing and saving those resumes does
+  // not turn a security migration into a user-visible save failure.
   return { accentColor: safeAccentColor(input.accentColor, 'var(--primary)'), fontFamily, density }
 }

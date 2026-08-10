@@ -48,6 +48,25 @@ describe('requireAuth', () => {
     await expect(requireAuth()).resolves.toEqual({ userId: 'extension-user' })
   })
 
+  it('keeps normal web sessions working without an extension-token revision claim', async () => {
+    mocks.headers.mockResolvedValue(new Headers())
+    mocks.safeAuth.mockResolvedValue({ user: { id: 'web-user' } })
+    mocks.userFindUnique.mockResolvedValue({ accountStatus: 'active', updatedAt })
+    const { requireAuth } = await import('./api-helpers')
+
+    await expect(requireAuth()).resolves.toEqual({ userId: 'web-user' })
+  })
+
+  it('accepts a legacy bearer token when its issued-at predates no account update', async () => {
+    mocks.jwtVerify.mockResolvedValue({ payload: { sub: 'extension-user', iat: Math.floor(updatedAt.getTime() / 1000) } })
+    const { requireAuth } = await import('./api-helpers')
+    const result = await requireAuth(new Request('http://localhost/api/jobs', {
+      headers: { Authorization: 'Bearer legacy-extension-token' },
+    }) as never)
+
+    expect(result).toEqual({ userId: 'extension-user' })
+  })
+
   it('does not trust a client-provided x-user-id header', async () => {
     mocks.headers.mockResolvedValue(new Headers({ 'x-user-id': 'forged-user' }))
     const { requireAuth } = await import('./api-helpers')

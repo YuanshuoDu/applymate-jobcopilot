@@ -141,10 +141,17 @@ export const { handlers, signIn, signOut, auth } = NextAuth({
         if (dbUser) token.userUpdatedAt = dbUser.updatedAt.toISOString()
         token.adminSessionVersion = membership?.sessionVersion
       }
-      if (!user && typeof token.id === 'string' && typeof token.userUpdatedAt !== 'string') return {}
-      if (!user && typeof token.id === 'string' && typeof token.userUpdatedAt === 'string') {
+      if (!user && typeof token.id === 'string') {
         const current = await db.user.findUnique({ where: { id: token.id }, select: { updatedAt: true, accountStatus: true } })
-        if (!current || current.accountStatus === 'suspended' || current.updatedAt.toISOString() !== token.userUpdatedAt) return {}
+        if (!current || current.accountStatus === 'suspended') return {}
+        if (typeof token.userUpdatedAt === 'string') {
+          if (current.updatedAt.toISOString() !== token.userUpdatedAt) return {}
+        } else if (typeof token.iat === 'number' && current.updatedAt.getTime() > token.iat * 1000) {
+          return {}
+        }
+        // Seamlessly upgrade a session minted before the revocation claim was
+        // introduced while retaining the account-update invalidation check.
+        token.userUpdatedAt = current.updatedAt.toISOString()
       }
       return token
     },

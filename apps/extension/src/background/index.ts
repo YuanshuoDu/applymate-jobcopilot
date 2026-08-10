@@ -32,7 +32,10 @@ function isAllowedJobPageUrl(rawUrl: string | undefined): boolean {
   try {
     const url = new URL(rawUrl)
     if (url.protocol !== 'http:' && url.protocol !== 'https:') return false
-    return /(?:linkedin\.com\/jobs|indeed\.[^/]+|glassdoor\.com|stepstone\.|xing\.com\/jobs|wellfound\.com|greenhouse\.io|lever\.co|myworkdayjobs\.com|smartrecruiters\.com|ashbyhq\.com|bamboohr\.com\/jobs|jobvite\.com\/jobs|icims\.com|monster\.|arbeitsagentur\.de|jobs\.de|irishjobs\.ie|localhost)/i.test(url.href)
+    // Content scripts support employer career pages beyond the curated source
+    // list. The extension boundary already verifies the sender; here only
+    // reject browser-internal pages and credential-bearing URLs.
+    return !url.username && !url.password
   } catch { return false }
 }
 

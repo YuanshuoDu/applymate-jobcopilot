@@ -15,6 +15,7 @@
 import Anthropic from '@anthropic-ai/sdk'
 import { db }    from '@/lib/db'
 import { isSafeAiEndpoint } from '@jobcopilot/shared/safe-ai-endpoint'
+import { recordAiUsage } from '@/lib/ai-usage'
 
 // ── Provider & model catalogue ────────────────────────────────────────────────
 
@@ -252,15 +253,26 @@ export async function modelChat(
   messages:  ChatMessage[],
   config:    AiConfig,
   maxTokens: number = 1024,
+  usageContext?: { userId?: string; featureKey?: string },
 ): Promise<ChatResult> {
   const resolved = resolveConfig(config)
-  assertKey(resolved)
-
-  if (resolved.provider === 'anthropic') {
-    return callAnthropic(messages, resolved, maxTokens)
-  } else {
-    return callOpenAICompat(messages, resolved, maxTokens)
+  const startedAt = Date.now()
+  try {
+    assertKey(resolved)
+    const result = resolved.provider === 'anthropic'
+      ? await callAnthropic(messages, resolved, maxTokens)
+      : await callOpenAICompat(messages, resolved, maxTokens)
+    void recordAiUsage({ ...usageContext, provider: result.provider, model: result.model, inputTokens: result.inputTokens, outputTokens: result.outputTokens, estimatedCostUsd: aiCost(result.provider, result.model, result.inputTokens ?? 0, result.outputTokens ?? 0), latencyMs: Date.now() - startedAt, status: 'success' })
+    return result
+  } catch (error) {
+    void recordAiUsage({ ...usageContext, provider: resolved.provider, model: resolved.model, estimatedCostUsd: 0, latencyMs: Date.now() - startedAt, status: 'error', errorCode: error instanceof Error ? error.message.slice(0, 120) : 'unknown_error' })
+    throw error
   }
+}
+
+function aiCost(provider: Provider, model: string, inputTokens: number, outputTokens: number): number {
+  const option = MODEL_CATALOGUE.find(item => item.provider === provider && item.model === model)
+  return option ? Number(((inputTokens / 1_000_000) * option.priceIn + (outputTokens / 1_000_000) * option.priceOut).toFixed(8)) : 0
 }
 
 /**
@@ -352,7 +364,7 @@ interface OaiRequestConfig {
 }
 
 function oaiFetch(c: OaiRequestConfig): Promise<Response> {
-  if (c.provider === 'custom' && !isSafeAiEndpoint(c.base)) {
+  if (c.provider === 'custom' && !isSafeAiEndpoint(c.base, { allowLocalDevelopment: process.env.NODE_ENV !== 'production' })) {
     return Promise.reject(new Error('Custom AI endpoint is not an allowed public HTTPS destination'))
   }
   const controller = new AbortController()

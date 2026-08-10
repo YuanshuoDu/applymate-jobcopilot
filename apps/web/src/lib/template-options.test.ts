@@ -7,7 +7,7 @@ describe('template option sanitization', () => {
     expect(safeAccentColor('#2e6b4f')).toBe('#2e6b4f')
   })
 
-  it('rejects CSS functions in persisted options', () => {
-    expect(safeTemplateOptions({ accentColor: 'url(https://attacker.example/x)' })).toBeNull()
+  it('normalizes unsafe legacy colors without blocking resume saves', () => {
+    expect(safeTemplateOptions({ accentColor: 'url(https://attacker.example/x)' })).toMatchObject({ accentColor: 'var(--primary)' })
   })
 })

@@ -54,7 +54,7 @@ function validBase(value: unknown, required: boolean): string | null | undefined
   if (typeof value !== 'string' || value.length > MAX_BASE_LENGTH) return null
   try {
     const url = new URL(value)
-    if (!isSafeAiEndpoint(value)) return null
+    if (!isSafeAiEndpoint(value, { allowLocalDevelopment: process.env.NODE_ENV !== 'production' })) return null
     return value.replace(/\/$/, '')
   } catch {
     return null

@@ -1,10 +1,17 @@
+export type SafeAiEndpointOptions = {
+  /** Allow loopback HTTP(S) endpoints for a local development server only. */
+  allowLocalDevelopment?: boolean
+}
+
 /** Reject endpoint forms that can target local, metadata, or private services. */
-export function isSafeAiEndpoint(raw: string): boolean {
+export function isSafeAiEndpoint(raw: string, options: SafeAiEndpointOptions = {}): boolean {
   try {
     const url = new URL(raw)
-    if (url.protocol !== 'https:' || url.username || url.password || url.hash) return false
-    if (url.port && url.port !== '443') return false
     const host = url.hostname.toLowerCase().replace(/^\[|\]$/g, '')
+    if (options.allowLocalDevelopment && isLocalDevelopmentHost(host) &&
+      (url.protocol === 'http:' || url.protocol === 'https:') &&
+      !url.username && !url.password && !url.hash) return true
+    if (url.protocol !== 'https:' || url.username || url.password || url.hash) return false
     if (!host || host === 'localhost' || host.endsWith('.localhost') || host.endsWith('.local') || host.endsWith('.internal')) return false
     if (host === 'metadata.google.internal' || host === 'metadata.google' || host === '169.254.169.254') return false
     if (isPrivateIpv4(host) || host === '::1' || host.startsWith('fe80:') || host.startsWith('fc') || host.startsWith('fd')) return false
@@ -12,6 +19,10 @@ export function isSafeAiEndpoint(raw: string): boolean {
   } catch {
     return false
   }
+}
+
+function isLocalDevelopmentHost(host: string): boolean {
+  return host === 'localhost' || host === '127.0.0.1' || host === '::1'
 }
 
 function isPrivateIpv4(host: string): boolean {

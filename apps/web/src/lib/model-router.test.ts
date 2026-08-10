@@ -96,4 +96,15 @@ describe('model catalogue and MiniMax compatibility', () => {
       apiBase: 'https://llm.example.test/v1',
     })).toMatchObject({ resolvedKey: '' })
   })
+
+  it('keeps local custom endpoints usable in development', async () => {
+    const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response(JSON.stringify({
+      choices: [{ message: { content: 'ok' } }],
+    })))
+
+    await expect(modelChat([{ role: 'user', content: 'Ping' }], {
+      provider: 'custom', model: 'llama-3.3', apiBase: 'http://localhost:1234/v1', apiKey: 'test-key',
+    })).resolves.toMatchObject({ provider: 'custom', model: 'llama-3.3', text: 'ok' })
+    expect(fetchMock.mock.calls[0][0]).toBe('http://localhost:1234/v1/chat/completions')
+  })
 })

@@ -207,19 +207,20 @@ export class AgentHarness {
           }
         }
         if (action.type === "click" && action.selector) {
-          // Fill-only passes have no submission authorization callback. A
-          // model-controlled click can still navigate or trigger a custom
-          // JavaScript submit, so stop for review instead of guessing.
+          // Fill-only passes may still need safe clicks for custom controls
+          // such as comboboxes. Keep the submit heuristic as the boundary so
+          // those controls remain usable without enabling form submission.
           if (task.allowSubmit === false) {
-            return this.buildReviewResult(task.jobId, Date.now() - startedAt);
-          }
-          // A custom form control can submit through a JavaScript handler without
-          // exposing a native submit type. A live Worker authorization therefore
-          // gates every generic click; the DOM heuristic remains a fallback for
-          // callers that do not supply a live authorization callback.
-          const needsAuthorization = task.beforeSubmit ? true : await clickMaySubmit(page, action.selector);
-          if (needsAuthorization && !await submissionAuthorized(task)) {
-            return this.buildReviewResult(task.jobId, Date.now() - startedAt);
+            if (await clickMaySubmit(page, action.selector)) {
+              return this.buildReviewResult(task.jobId, Date.now() - startedAt);
+            }
+          } else {
+            // A live Worker authorization gates every generic click because a
+            // custom form control can submit through a JavaScript handler.
+            const needsAuthorization = task.beforeSubmit ? true : await clickMaySubmit(page, action.selector);
+            if (needsAuthorization && !await submissionAuthorized(task)) {
+              return this.buildReviewResult(task.jobId, Date.now() - startedAt);
+            }
           }
         }
 

@@ -157,7 +157,19 @@ describe('POST /api/me/ai-test', () => {
     expect(mocks.modelChat).not.toHaveBeenCalled()
   })
 
-  it('rejects custom endpoints that are not HTTPS', async () => {
+  it('rejects custom endpoints that are not HTTPS public endpoints', async () => {
+    const { POST } = await import('./route')
+    const response = await POST(new Request('http://localhost/api/me/ai-test', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ provider: 'custom', model: 'llama', apiBase: 'http://provider.example/v1', apiKey: 'secret' }),
+    }) as never)
+
+    expect(response.status).toBe(400)
+    expect(mocks.modelChat).not.toHaveBeenCalled()
+  })
+
+  it('keeps local custom model testing available during development', async () => {
     const { POST } = await import('./route')
     const response = await POST(new Request('http://localhost/api/me/ai-test', {
       method: 'POST',
@@ -165,7 +177,7 @@ describe('POST /api/me/ai-test', () => {
       body: JSON.stringify({ provider: 'custom', model: 'llama', apiBase: 'http://localhost:1234/v1', apiKey: 'secret' }),
     }) as never)
 
-    expect(response.status).toBe(400)
-    expect(mocks.modelChat).not.toHaveBeenCalled()
+    expect(response.status).toBe(200)
+    expect(mocks.modelChat).toHaveBeenCalled()
   })
 })

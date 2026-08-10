@@ -282,12 +282,12 @@ describe("AgentHarness", () => {
     expect(result.error).toContain("could not be confirmed");
   });
 
-  it("does not execute model-controlled clicks during a fill-only pass", async () => {
+  it("does not execute submit-like clicks during a fill-only pass", async () => {
     const { callLlmText } = await import("@jobcopilot/shared/llm");
     vi.mocked(callLlmText).mockResolvedValueOnce(
       '{"type":"click","selector":"#continue","reasoning":"Advance the form"}',
     );
-    const page = mockPage(undefined, false);
+    const page = mockPage(undefined, true);
 
     const result = await new AgentHarness({ userId: "user-1", maxTurns: 2, dryRun: false, mode: "dom" }).run(page, {
       jobId: "job-8a", applyUrl: "https://jobs.example.com/apply", persona: {},
@@ -295,6 +295,22 @@ describe("AgentHarness", () => {
     });
 
     expect(page.click).not.toHaveBeenCalled();
+    expect(result).toMatchObject({ status: "manual", reviewReady: true });
+  });
+
+  it("keeps non-submit custom controls usable during a fill-only pass", async () => {
+    const { callLlmText } = await import("@jobcopilot/shared/llm");
+    vi.mocked(callLlmText)
+      .mockResolvedValueOnce('{"type":"click","selector":"#country-combobox","reasoning":"Open the country picker"}')
+      .mockResolvedValueOnce('{"type":"done","reasoning":"Ready for review"}');
+    const page = mockPage(undefined, false);
+
+    const result = await new AgentHarness({ userId: "user-1", maxTurns: 2, dryRun: false, mode: "dom" }).run(page, {
+      jobId: "job-8b", applyUrl: "https://jobs.example.com/apply", persona: {},
+      jobTitle: "Dev", jobCompany: "Inc", resumePath: "/r.pdf", allowSubmit: false,
+    });
+
+    expect(page.click).toHaveBeenCalledWith("#country-combobox");
     expect(result).toMatchObject({ status: "manual", reviewReady: true });
   });
 });

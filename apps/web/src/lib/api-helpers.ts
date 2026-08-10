@@ -30,7 +30,11 @@ export async function requireAuth(
         audience: EXTENSION_TOKEN_AUDIENCE,
       })
       if (typeof payload.sub === 'string' && payload.sub.length > 0) {
-        return activeAccountOrDenied(payload.sub, typeof payload.updatedAt === 'string' ? payload.updatedAt : null)
+        return activeAccountOrDenied(
+          payload.sub,
+          typeof payload.updatedAt === 'string' ? payload.updatedAt : null,
+          typeof payload.iat === 'number' ? payload.iat : null,
+        )
       }
     } catch {
       // Token invalid — fall through to session check.
@@ -44,11 +48,17 @@ export async function requireAuth(
   return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
 }
 
-async function activeAccountOrDenied(userId: string, issuedAt?: string | null) {
+async function activeAccountOrDenied(userId: string, issuedAt?: string | null, issuedUnix?: number | null) {
   const user = await db.user.findUnique({ where: { id: userId }, select: { accountStatus: true, updatedAt: true } })
   if (!user) return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
   if (user?.accountStatus === 'suspended') return NextResponse.json({ error: 'Account suspended' }, { status: 403 })
-  if (!issuedAt || user.updatedAt.toISOString() !== issuedAt) return NextResponse.json({ error: 'Session expired' }, { status: 401 })
+  const isBearerToken = issuedAt !== undefined || issuedUnix !== undefined
+  if (isBearerToken) {
+    if (issuedAt && user.updatedAt.toISOString() !== issuedAt) return NextResponse.json({ error: 'Session expired' }, { status: 401 })
+    if (!issuedAt && (!issuedUnix || user.updatedAt.getTime() > issuedUnix * 1000)) {
+      return NextResponse.json({ error: 'Session expired' }, { status: 401 })
+    }
+  }
   activateTenantContext(userId)
   return { userId }
 }
