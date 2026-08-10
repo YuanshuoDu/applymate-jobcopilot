@@ -21,6 +21,10 @@
     "./feature-flags": {
       "types": "./dist/feature-flags.d.ts",
       "default": "./dist/feature-flags.js"
+    },
+    "./safe-ai-endpoint": {
+      "types": "./dist/safe-ai-endpoint.d.ts",
+      "default": "./dist/safe-ai-endpoint.js"
     }
   },
   "dependencies": {

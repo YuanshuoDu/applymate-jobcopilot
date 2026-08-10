@@ -2,6 +2,8 @@ import { NextRequest, NextResponse } from 'next/server'
 import { isAdminResponse, requireAdmin } from '@/lib/admin/authorization'
 import { writeAdminAudit } from '@/lib/admin/audit'
 import { db } from '@/lib/db'
+import { fixedSecretRef } from '@/lib/admin/ai-config'
+import { isSafeAiEndpoint } from '@jobcopilot/shared/safe-ai-endpoint'
 
 type Params = { params: Promise<{ id: string }> }
 
@@ -11,7 +13,10 @@ export async function POST(request: NextRequest, { params }: Params) {
   const { id } = await params
   const provider = await db.aiProviderConfig.findUnique({ where: { id }, select: { key: true, apiBase: true, secretRef: true, enabled: true } })
   if (!provider) return NextResponse.json({ error: 'Provider not found' }, { status: 404 })
-  const secretRef = provider.secretRef ?? `${provider.key.toUpperCase()}_API_KEY`
+  const secretRef = fixedSecretRef(provider.key)
+  if (!secretRef || !isSafeAiEndpoint(provider.apiBase)) {
+    return NextResponse.json({ error: 'Provider endpoint or credential mapping is not approved' }, { status: 409 })
+  }
   const secret = process.env[secretRef]
   if (!provider.enabled) return NextResponse.json({ error: 'Provider is disabled' }, { status: 409 })
   if (!secret) return NextResponse.json({ status: 'missing_credential', credentialConfigured: false, secretRef }, { headers: { 'Cache-Control': 'no-store' } })

@@ -6,6 +6,7 @@ import { replayPattern } from "./replay.js";
 function pattern(fieldMapping: Record<string, string>): FormPatternRow {
   return {
     id: "pattern-1",
+    userId: "user-1",
     atsHost: "jobs.example.com",
     urlPattern: "/apply",
     fieldMapping,

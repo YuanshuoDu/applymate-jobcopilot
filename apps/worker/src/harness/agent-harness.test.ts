@@ -21,10 +21,14 @@ function mockFields() {
 }
 
 /** Create a mock Page */
-function mockPage(url: string = "https://jobs.example.com/apply", clickMaySubmit = false): Page {
+function mockPage(
+  url: string = "https://jobs.example.com/apply",
+  clickMaySubmit = false,
+  fields = mockFields(),
+): Page {
   return {
     url: () => url,
-    evaluate: vi.fn().mockResolvedValue(mockFields()),
+    evaluate: vi.fn().mockResolvedValue(fields),
     $eval: vi.fn().mockResolvedValue(clickMaySubmit),
     focus: vi.fn().mockResolvedValue(undefined),
     fill: vi.fn().mockResolvedValue(undefined),
@@ -158,6 +162,42 @@ describe("AgentHarness", () => {
     expect(page.fill).not.toHaveBeenCalled();
   });
 
+  it("uses the perceived field label when guarding sensitive answers", async () => {
+    const { callLlmText } = await import("@jobcopilot/shared/llm");
+    vi.mocked(callLlmText).mockResolvedValueOnce(
+      '{"type":"fill","selector":"#salary","value":"100000","field":"role","reasoning":"answer"}',
+    );
+    const page = mockPage("https://jobs.example.com/apply", false, [
+      { selector: "#salary", type: "text", label: "Salary expectation", required: true, currentValue: "" },
+    ]);
+
+    const result = await new AgentHarness({ userId: "user-1", maxTurns: 2, dryRun: false, mode: "dom" }).run(page, {
+      jobId: "job-5a", applyUrl: "https://jobs.example.com/apply", persona: {},
+      jobTitle: "Dev", jobCompany: "Inc", resumePath: "/r.pdf",
+    });
+
+    expect(result.status).toBe("manual");
+    expect(page.fill).not.toHaveBeenCalled();
+  });
+
+  it("never lets the model choose an arbitrary upload path", async () => {
+    const { callLlmText } = await import("@jobcopilot/shared/llm");
+    vi.mocked(callLlmText)
+      .mockResolvedValueOnce(
+        '{"type":"upload","selector":"#resume","filePath":"/var/run/secrets/app.env","field":"resume","reasoning":"upload"}',
+      )
+      .mockResolvedValueOnce('{"type":"done","reasoning":"complete"}');
+    const page = mockPage();
+
+    await new AgentHarness({ userId: "user-1", maxTurns: 2, dryRun: false, mode: "dom" }).run(page, {
+      jobId: "job-9", applyUrl: "https://jobs.example.com/apply", persona: {},
+      jobTitle: "Dev", jobCompany: "Inc", resumePath: "/safe/resume.pdf",
+    });
+
+    expect(page.setInputFiles).toHaveBeenCalledWith("#resume", "/safe/resume.pdf");
+    expect(page.setInputFiles).not.toHaveBeenCalledWith("#resume", "/var/run/secrets/app.env");
+  });
+
   it("does not accept a final agent completion after submission authorization is revoked", async () => {
     const { callLlmText } = await import("@jobcopilot/shared/llm");
     vi.mocked(callLlmText).mockResolvedValueOnce('{"type":"done","reasoning":"Form submitted"}');
@@ -240,5 +280,21 @@ describe("AgentHarness", () => {
     expect(beforeSubmit).toHaveBeenCalledOnce();
     expect(result).toMatchObject({ status: "manual" });
     expect(result.error).toContain("could not be confirmed");
+  });
+
+  it("does not execute model-controlled clicks during a fill-only pass", async () => {
+    const { callLlmText } = await import("@jobcopilot/shared/llm");
+    vi.mocked(callLlmText).mockResolvedValueOnce(
+      '{"type":"click","selector":"#continue","reasoning":"Advance the form"}',
+    );
+    const page = mockPage(undefined, false);
+
+    const result = await new AgentHarness({ userId: "user-1", maxTurns: 2, dryRun: false, mode: "dom" }).run(page, {
+      jobId: "job-8a", applyUrl: "https://jobs.example.com/apply", persona: {},
+      jobTitle: "Dev", jobCompany: "Inc", resumePath: "/r.pdf", allowSubmit: false,
+    });
+
+    expect(page.click).not.toHaveBeenCalled();
+    expect(result).toMatchObject({ status: "manual", reviewReady: true });
   });
 });

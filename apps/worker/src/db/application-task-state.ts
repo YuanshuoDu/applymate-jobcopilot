@@ -12,8 +12,9 @@ export async function claimApplicationTask(
 ): Promise<boolean> {
   const result = await pool.query(
     `UPDATE application_tasks
-       SET status = 'filling', "checkpoint" = 'browser_active', "updatedAt" = NOW()
+     SET status = 'filling', "checkpoint" = 'browser_active', "updatedAt" = NOW()
      WHERE id = $1 AND "userId" = $2 AND "jobId" = $3 AND status = 'filling'
+       AND EXISTS (SELECT 1 FROM "User" u WHERE u.id = application_tasks."userId" AND u."accountStatus" = 'active')
      RETURNING id`,
     [taskId, userId, jobId],
   );
@@ -34,7 +35,7 @@ export async function finishApplicationTask(
        SET status = $2, "checkpoint" = $3, error = $4,
            "completedAt" = CASE WHEN $2 IN ('submitted', 'failed') THEN NOW() ELSE NULL END,
            "updatedAt" = NOW()
-     WHERE id = $1`,
+     WHERE id = $1 AND status NOT IN ('cancelled', 'submitted')`,
     [taskId, status, checkpoint, error],
   );
   await pool.query(
@@ -43,6 +44,19 @@ export async function finishApplicationTask(
     [taskId, status, error ?? checkpoint],
   );
   if (sessionId) await refreshSessionStatus(pool, sessionId);
+}
+
+export async function applicationTaskStillActive(pool: Pool, taskId: string, userId: string, jobId: string): Promise<boolean> {
+  const result = await pool.query(
+    `SELECT 1 FROM application_tasks t
+       JOIN "User" u ON u.id = t."userId"
+      WHERE t.id = $1 AND t."userId" = $2 AND t."jobId" = $3
+        AND t.status = 'filling' AND t."checkpoint" = 'browser_active'
+        AND u."accountStatus" = 'active'
+      LIMIT 1`,
+    [taskId, userId, jobId],
+  )
+  return result.rowCount === 1
 }
 
 async function refreshSessionStatus(pool: Pool, sessionId: string): Promise<void> {

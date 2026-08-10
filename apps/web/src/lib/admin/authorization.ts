@@ -33,10 +33,10 @@ export async function requireAdminMembership(request?: Request): Promise<AdminAc
   if (!userId) return denied(requestId, 'observability.read', 'unauthenticated', request)
   const membership = await db.adminMembership.findUnique({
     where: { userId },
-    select: { status: true, mfaLevel: true, sessionVersion: true, role: { select: { key: true, permissions: true } } },
+    select: { status: true, mfaLevel: true, sessionVersion: true, user: { select: { accountStatus: true } }, role: { select: { key: true, permissions: true } } },
   })
   const sessionValid = session?.user?.adminSessionVersion === membership?.sessionVersion
-  if (membership?.status !== AdminMembershipStatus.active || !sessionValid || (membership.role.key === 'super_admin' && membership.mfaLevel !== AdminMfaLevel.webauthn)) {
+  if (membership?.user.accountStatus !== 'active' || membership?.status !== AdminMembershipStatus.active || !sessionValid || (membership.role.key === 'super_admin' && membership.mfaLevel !== AdminMfaLevel.webauthn)) {
     return denied(requestId, 'observability.read', 'membership_inactive', request, userId)
   }
   return Object.freeze({ userId, roleKey: membership.role.key, permissions: Object.freeze([...membership.role.permissions]), requestId })
@@ -58,13 +58,15 @@ export async function requireAdmin(permission: Permission, request?: Request): P
       status: true,
       mfaLevel: true,
       sessionVersion: true,
+      user: { select: { accountStatus: true } },
       role: { select: { key: true, permissions: true } },
     },
   })
-  const grant = membership?.status === AdminMembershipStatus.active && !membership.role.permissions.includes(permission)
+  const activeAccount = membership?.user.accountStatus === 'active'
+  const grant = activeAccount && membership?.status === AdminMembershipStatus.active && !membership.role.permissions.includes(permission)
     ? await db.adminBreakGlassGrant.findFirst({ where: { requesterId: userId, permission, approverId: { not: null }, revokedAt: null, expiresAt: { gt: new Date() } }, select: { id: true } })
     : null
-  const allowed = membership?.status === AdminMembershipStatus.active && (membership.role.permissions.includes(permission) || Boolean(grant))
+  const allowed = activeAccount && membership?.status === AdminMembershipStatus.active && (membership.role.permissions.includes(permission) || Boolean(grant))
   const needsWebauthn = membership?.role.key === 'super_admin'
   const sessionValid = session?.user?.adminSessionVersion === membership?.sessionVersion
   const reauthValid = !highRiskPermissions.has(permission) || await hasFreshAdminReauth(request, userId)

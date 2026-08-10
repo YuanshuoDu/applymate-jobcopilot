@@ -42,7 +42,7 @@ function automationPayload(automation: AutomationForRun) {
 
 async function startAutomation(automation: AutomationForRun, now: Date) {
   const claimed = await db.agentAutomation.updateMany({
-    where: { id: automation.id, userId: automation.userId, enabled: true, nextRunAt: { lte: now } },
+    where: { id: automation.id, userId: automation.userId, enabled: true, nextRunAt: { lte: now }, user: { accountStatus: 'active' } },
     data: {
       lastRunAt: now,
       nextRunAt: nextRunAfterCurrent(automation.cron, now, automation.timezone),
@@ -114,7 +114,7 @@ async function runDueAutomations(req: NextRequest) {
 
   const now = new Date()
   const automations = await db.agentAutomation.findMany({
-    where: { enabled: true, nextRunAt: { lte: now } },
+    where: { enabled: true, nextRunAt: { lte: now }, user: { accountStatus: 'active' } },
     orderBy: { nextRunAt: "asc" },
     take: 20,
   }) as AutomationForRun[]

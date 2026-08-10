@@ -13,7 +13,7 @@ export function detectAtsSource(rawUrl: string): AtsSourceKey | null {
   } catch {
     return null
   }
-  if (url.protocol !== 'https:' && url.protocol !== 'http:') return null
+  if (url.protocol !== 'https:') return null
 
   const host = url.hostname.toLowerCase()
   const segments = url.pathname.split('/').filter(Boolean)
@@ -29,7 +29,6 @@ export function detectAtsSource(rawUrl: string): AtsSourceKey | null {
     (host === 'boards.greenhouse.io' && segments.length >= 3 && segments[1] === 'jobs') ||
     (host.endsWith('.greenhouse.io') && host !== 'boards.greenhouse.io' && segments.length >= 2 && segments[0] === 'jobs') ||
     isGreenhouseEmbeddedApplication ||
-    (host === 'grnh.se' && segments.length >= 1) ||
     (host === 'greenhouse.io' && segments.length >= 2 && segments[0] === 'applications')
   ) return 'greenhouse'
 

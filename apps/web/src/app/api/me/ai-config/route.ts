@@ -6,6 +6,7 @@ import { NextRequest } from 'next/server'
 import type { Prisma } from '@prisma/client'
 import { requireAuth, isErrorResponse, ok, err } from '@/lib/api-helpers'
 import { db } from '@/lib/db'
+import { isSafeAiEndpoint } from '@jobcopilot/shared/safe-ai-endpoint'
 import {
   MODEL_CATALOGUE,
   resolveFeatureConfig,
@@ -52,8 +53,8 @@ function validateBase(value: unknown, required: boolean): string | null | undefi
     const url = new URL(value)
     const localDev = process.env.NODE_ENV !== 'production' && url.protocol === 'http:'
       && (url.hostname === 'localhost' || url.hostname === '127.0.0.1')
-    if (url.protocol !== 'https:' && !localDev) return null
-    if (url.username || url.password || url.hash) return null
+    if (!localDev && !isSafeAiEndpoint(value)) return null
+    if (localDev && (url.username || url.password || url.hash)) return null
     return value.replace(/\/$/, '')
   } catch {
     return null

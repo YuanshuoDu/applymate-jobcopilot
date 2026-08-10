@@ -23,6 +23,19 @@ function checkRateLimit(key: string): boolean {
   return true
 }
 
+function isTrustedExtensionSender(sender: chrome.runtime.MessageSender): boolean {
+  return sender.id === chrome.runtime.id
+}
+
+function isAllowedJobPageUrl(rawUrl: string | undefined): boolean {
+  if (!rawUrl) return false
+  try {
+    const url = new URL(rawUrl)
+    if (url.protocol !== 'http:' && url.protocol !== 'https:') return false
+    return /(?:linkedin\.com\/jobs|indeed\.[^/]+|glassdoor\.com|stepstone\.|xing\.com\/jobs|wellfound\.com|greenhouse\.io|lever\.co|myworkdayjobs\.com|smartrecruiters\.com|ashbyhq\.com|bamboohr\.com\/jobs|jobvite\.com\/jobs|icims\.com|monster\.|arbeitsagentur\.de|jobs\.de|irishjobs\.ie|localhost)/i.test(url.href)
+  } catch { return false }
+}
+
 // Clean up rate limit map periodically to prevent memory leaks
 setInterval(() => {
   const now = Date.now()
@@ -179,6 +192,10 @@ async function handleMessage(
   msg: ExtMessage,
   sender: chrome.runtime.MessageSender,
 ): Promise<unknown> {
+  if (!isTrustedExtensionSender(sender)) return { error: 'Unauthorized sender' }
+  if (msg.type === 'SAVE_JOB' && sender.tab && !isAllowedJobPageUrl(sender.tab.url)) {
+    return { type: 'SAVE_JOB_RESULT', success: false, error: 'Saving is only available on supported job pages.' }
+  }
   let settings = await getSettings()
 
   // The Dashboard owns the API endpoint and token. A job-site message (for

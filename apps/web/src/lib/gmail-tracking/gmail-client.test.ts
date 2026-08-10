@@ -62,4 +62,24 @@ describe('fetchRecentGmailMessages', () => {
       }),
     )
   })
+
+  it('bounds concurrent message fetches during a large sync', async () => {
+    let callCount = 0
+    let active = 0
+    let maxActive = 0
+    const fetchMock = vi.fn().mockImplementation(async () => {
+      callCount += 1
+      if (callCount === 1) return Response.json({ messages: Array.from({ length: 100 }, (_, index) => ({ id: `message-${index}` })) })
+      active += 1
+      maxActive = Math.max(maxActive, active)
+      await new Promise(resolve => setTimeout(resolve, 0))
+      active -= 1
+      return Response.json({ id: `message-${callCount}`, payload: { headers: [], parts: [] } })
+    })
+    vi.stubGlobal('fetch', fetchMock)
+
+    await fetchRecentGmailMessages('access-token', null)
+
+    expect(maxActive).toBeLessThanOrEqual(8)
+  })
 })

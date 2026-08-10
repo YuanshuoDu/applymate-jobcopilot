@@ -8,6 +8,7 @@
  */
 import { NextRequest } from 'next/server'
 import { requireAuth, isErrorResponse } from '@/lib/api-helpers'
+import { isSafeAiEndpoint } from '@jobcopilot/shared/safe-ai-endpoint'
 import { db } from '@/lib/db'
 import { checkDistributedRateLimit } from '@/lib/distributed-rate-limit'
 import {
@@ -53,8 +54,7 @@ function validBase(value: unknown, required: boolean): string | null | undefined
   if (typeof value !== 'string' || value.length > MAX_BASE_LENGTH) return null
   try {
     const url = new URL(value)
-    if (url.protocol !== 'https:') return null
-    if (url.username || url.password || url.hash) return null
+    if (!isSafeAiEndpoint(value)) return null
     return value.replace(/\/$/, '')
   } catch {
     return null

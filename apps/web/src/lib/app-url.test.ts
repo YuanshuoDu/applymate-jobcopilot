@@ -23,4 +23,13 @@ describe('configured app URLs', () => {
     vi.stubEnv('AUTH_URL', 'not a URL')
     expect(configuredAppOrigin('http://localhost:3000/api/callback')).toBe('http://localhost:3000')
   })
+
+  it('uses the canonical production origin when deployment URL configuration is missing', () => {
+    vi.stubEnv('NODE_ENV', 'production')
+    vi.stubEnv('AUTH_URL', 'not a URL')
+    vi.stubEnv('NEXTAUTH_URL', '')
+    vi.stubEnv('APP_URL', '')
+    vi.stubEnv('AUTH_CANONICAL_URL', '')
+    expect(configuredAppOrigin('https://attacker.example/api/callback')).toBe('https://applymate.site')
+  })
 })

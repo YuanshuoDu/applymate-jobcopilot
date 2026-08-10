@@ -86,7 +86,7 @@ describe("agent automation due scheduler API", () => {
       started: [{ automationId: "automation_1", sessionId: "session_1", taskId: "task_1" }],
     })
     expect(mocks.automationFindMany).toHaveBeenCalledWith({
-      where: { enabled: true, nextRunAt: { lte: expect.any(Date) } },
+      where: { enabled: true, nextRunAt: { lte: expect.any(Date) }, user: { accountStatus: "active" } },
       orderBy: { nextRunAt: "asc" },
       take: 20,
     })
@@ -112,6 +112,7 @@ describe("agent automation due scheduler API", () => {
         userId: "user_1",
         enabled: true,
         nextRunAt: { lte: expect.any(Date) },
+        user: { accountStatus: "active" },
       },
       data: { lastRunAt: expect.any(Date), nextRunAt: expect.any(Date) },
     })

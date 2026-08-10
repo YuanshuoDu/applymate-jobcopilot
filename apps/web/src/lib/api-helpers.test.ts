@@ -15,15 +15,17 @@ vi.mock('@/lib/model-router', () => ({ resolveFeatureConfig: vi.fn() }))
 vi.mock('@/lib/db', () => ({ db: { user: { findUnique: mocks.userFindUnique } } }))
 
 describe('requireAuth', () => {
+  const updatedAt = new Date('2026-08-10T09:00:00.000Z')
+
   beforeEach(() => {
     vi.resetModules()
     mocks.headers.mockReset()
     mocks.jwtVerify.mockReset()
     mocks.safeAuth.mockReset()
     mocks.userFindUnique.mockReset()
-    mocks.jwtVerify.mockResolvedValue({ payload: { sub: 'extension-user' } })
+    mocks.jwtVerify.mockResolvedValue({ payload: { sub: 'extension-user', updatedAt: updatedAt.toISOString() } })
     mocks.safeAuth.mockResolvedValue(null)
-    mocks.userFindUnique.mockResolvedValue({ accountStatus: 'active' })
+    mocks.userFindUnique.mockResolvedValue({ accountStatus: 'active', updatedAt })
   })
 
   it('accepts a verified Bearer token passed explicitly by a route', async () => {

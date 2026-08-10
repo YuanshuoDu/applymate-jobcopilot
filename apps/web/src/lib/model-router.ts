@@ -14,6 +14,7 @@
 
 import Anthropic from '@anthropic-ai/sdk'
 import { db }    from '@/lib/db'
+import { isSafeAiEndpoint } from '@jobcopilot/shared/safe-ai-endpoint'
 
 // ── Provider & model catalogue ────────────────────────────────────────────────
 
@@ -351,6 +352,9 @@ interface OaiRequestConfig {
 }
 
 function oaiFetch(c: OaiRequestConfig): Promise<Response> {
+  if (c.provider === 'custom' && !isSafeAiEndpoint(c.base)) {
+    return Promise.reject(new Error('Custom AI endpoint is not an allowed public HTTPS destination'))
+  }
   const controller = new AbortController()
   // Audits compare two full documents and can legitimately take longer than a
   // short suggestion request. Keep a bounded timeout, but avoid aborting a
@@ -369,6 +373,7 @@ function oaiFetch(c: OaiRequestConfig): Promise<Response> {
     method:  'POST',
     headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${c.key}` },
     body:    JSON.stringify({ model: c.model, ...providerOptions, messages: c.messages, stream: c.stream }),
+    redirect: 'error',
     signal:  controller.signal,
   }).finally(() => clearTimeout(timer))
 }

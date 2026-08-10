@@ -127,7 +127,6 @@ export function parseAction(raw: string): AgentAction | null {
       selector: parsed.selector,
       value: parsed.value,
       field: parsed.field,
-      filePath: parsed.filePath,
       reasoning: parsed.reasoning ?? "",
     };
   } catch {
@@ -141,7 +140,6 @@ export interface AgentAction {
   selector?: string;
   value?: string;
   field?: string;
-  filePath?: string;
   reasoning: string;
 }
 

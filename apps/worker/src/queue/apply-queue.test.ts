@@ -57,6 +57,7 @@ vi.mock("../cloak/captcha.js", () => ({
 
 vi.mock("../db/application-task-state.js", () => ({
   claimApplicationTask: vi.fn().mockResolvedValue(true),
+  applicationTaskStillActive: vi.fn().mockResolvedValue(true),
   completeFillForReview: mockCompleteFillForReview,
   finishApplicationTask: vi.fn().mockResolvedValue(undefined),
   needsUserTakeover: vi.fn().mockReturnValue(false),
@@ -151,6 +152,7 @@ describe("apply-queue (unit — mocked)", () => {
 
     expect(mockIncrementBudget).toHaveBeenCalledWith("user-1");
     expect(mockUpsertFormPattern).toHaveBeenCalledWith({
+      userId: "user-1",
       atsHost: "example.com",
       urlPattern: "jobs/123/",
       fieldMapping: { "#name": "fullName" },

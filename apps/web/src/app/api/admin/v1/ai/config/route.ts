@@ -4,6 +4,8 @@ import { getAiAdminConfig } from '@/lib/admin/ai-config'
 import { validateAdminWrite } from '@/lib/admin/csrf'
 import { runAdminMutation } from '@/lib/admin/write-transaction'
 import { db } from '@/lib/db'
+import { fixedSecretRef } from '@/lib/admin/ai-config'
+import { isSafeAiEndpoint } from '@jobcopilot/shared/safe-ai-endpoint'
 
 function text(value: unknown, max: number) { return typeof value === 'string' && value.trim() && value.length <= max ? value.trim() : null }
 function numberValue(value: unknown, min: number, max: number) { return typeof value === 'number' && Number.isFinite(value) && value >= min && value <= max ? value : null }
@@ -31,9 +33,9 @@ export async function PATCH(request: NextRequest) {
   let mutate: Parameters<typeof runAdminMutation>[0]['mutate']
   if (type === 'provider') {
     const key = text(body?.key, 60); const displayName = text(body?.displayName, 80); const apiBase = text(body?.apiBase, 240)
-    const secretRef = body?.secretRef === null || body?.secretRef === undefined ? null : text(body.secretRef, 120)
+    const secretRef = key ? fixedSecretRef(key) : null
     const enabled = typeof body?.enabled === 'boolean' ? body.enabled : null
-    if (!key || !displayName || !apiBase || enabled === null) return NextResponse.json({ error: 'Invalid provider config' }, { status: 400 })
+    if (!key || !displayName || !apiBase || enabled === null || !isSafeAiEndpoint(apiBase)) return NextResponse.json({ error: 'Invalid provider config' }, { status: 400 })
     action = 'ai_provider.updated'; targetType = 'ai_provider'; targetId = typeof body.id === 'string' ? body.id : key
     mutate = tx => body.id
       ? tx.aiProviderConfig.update({ where: { id: body.id as string }, data: { displayName, apiBase, secretRef, enabled, version: { increment: 1 } } })

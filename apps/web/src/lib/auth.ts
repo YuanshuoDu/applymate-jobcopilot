@@ -37,6 +37,7 @@ providers.push(Credentials({
         if (typeof payload.sub !== 'string' || !payload.sub) return null
         const user = await db.user.findUnique({ where: { id: payload.sub as string } })
         if (!user || user.accountStatus === 'suspended') return null
+        if (typeof payload.updatedAt !== 'string' || user.updatedAt.toISOString() !== payload.updatedAt) return null
         return { id: user.id, email: user.email, name: user.name, image: user.image }
       } catch {
         return null
@@ -133,11 +134,17 @@ export const { handlers, signIn, signOut, auth } = NextAuth({
         // Cache plan and internal session version at sign-in. Admin routes compare
         // the latter to the live membership, invalidating stale role sessions.
         const [dbUser, membership] = await Promise.all([
-          db.user.findUnique({ where: { id: user.id }, select: { plan: true } }),
+          db.user.findUnique({ where: { id: user.id }, select: { plan: true, updatedAt: true } }),
           db.adminMembership.findUnique({ where: { userId: user.id }, select: { sessionVersion: true } }),
         ])
         if (dbUser) token.plan = dbUser.plan
+        if (dbUser) token.userUpdatedAt = dbUser.updatedAt.toISOString()
         token.adminSessionVersion = membership?.sessionVersion
+      }
+      if (!user && typeof token.id === 'string' && typeof token.userUpdatedAt !== 'string') return {}
+      if (!user && typeof token.id === 'string' && typeof token.userUpdatedAt === 'string') {
+        const current = await db.user.findUnique({ where: { id: token.id }, select: { updatedAt: true, accountStatus: true } })
+        if (!current || current.accountStatus === 'suspended' || current.updatedAt.toISOString() !== token.userUpdatedAt) return {}
       }
       return token
     },

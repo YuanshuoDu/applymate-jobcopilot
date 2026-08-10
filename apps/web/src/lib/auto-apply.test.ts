@@ -10,6 +10,7 @@ const mocks = vi.hoisted(() => ({
   coverLetterFindFirst: vi.fn(),
   jobUpdateMany: vi.fn(),
   jobFindFirst: vi.fn(),
+  userFindUnique: vi.fn(),
   activityCreate: vi.fn(),
   enqueueApplyTask: vi.fn(),
   runtimeFeatureEnabled: vi.fn(),
@@ -24,6 +25,7 @@ vi.mock("@/lib/db", () => ({
     coverLetter: { findFirst: mocks.coverLetterFindFirst },
     applicationTaskEvent: { create: mocks.taskEventCreate },
     job: { findFirst: mocks.jobFindFirst, updateMany: mocks.jobUpdateMany },
+    user: { findUnique: mocks.userFindUnique },
     activity: { create: mocks.activityCreate },
   },
 }));
@@ -47,6 +49,7 @@ describe("auto-apply authorization", () => {
     mocks.jobFindFirst.mockResolvedValue({
       company: "Acme", description: "Join the platform team with Acme. Build products.", source: "lever", url: input.applyUrl,
     });
+    mocks.userFindUnique.mockResolvedValue({ accountStatus: "active" });
     mocks.transaction.mockImplementation(async (callback: (tx: unknown) => unknown) => {
       if (typeof callback === "function") {
         return callback({

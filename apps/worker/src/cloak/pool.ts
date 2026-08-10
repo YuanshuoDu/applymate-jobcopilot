@@ -33,7 +33,9 @@ async function launchContext(
     headless,
     humanize: true,
     userDataDir: profileDir,
-    args: ["--no-sandbox", "--disable-setuid-sandbox"],
+    // Keep Chromium's sandbox enabled. Deployments that cannot provide a
+    // sandbox must isolate the worker at the container/VM boundary rather
+    // than weakening the browser process here.
     ...(proxy ? { proxy: { server: proxy } } : {}),
   });
 

@@ -1,5 +1,7 @@
 import { extractHtml, extractPlainText } from '@/lib/gmail-helpers'
 
+const MAX_MESSAGE_FETCH_CONCURRENCY = 8
+
 export interface GmailRemoteMessage {
   id: string
   threadId: string | null
@@ -36,8 +38,25 @@ export async function fetchRecentGmailMessages(
 
   const listPayload = await listResponse.json() as unknown
   const ids = messageIds(listPayload)
-  const settled = await Promise.allSettled(ids.map((id) => fetchGmailMessage(accessToken, id)))
-  return settled.flatMap((result) => result.status === 'fulfilled' && result.value ? [result.value] : [])
+  const messages = await mapWithConcurrency(
+    ids,
+    MAX_MESSAGE_FETCH_CONCURRENCY,
+    (id) => fetchGmailMessage(accessToken, id).catch(() => null),
+  )
+  return messages.flatMap((message) => message ? [message] : [])
+}
+
+async function mapWithConcurrency<T, R>(items: T[], limit: number, mapper: (item: T) => Promise<R>): Promise<R[]> {
+  const results: R[] = []
+  let nextIndex = 0
+  async function worker(): Promise<void> {
+    while (nextIndex < items.length) {
+      const index = nextIndex++
+      results[index] = await mapper(items[index])
+    }
+  }
+  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, () => worker()))
+  return results
 }
 
 function buildSearchQuery(since: Date | null): string {

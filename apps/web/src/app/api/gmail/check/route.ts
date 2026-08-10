@@ -15,15 +15,9 @@ export async function GET() {
   const token = await getGoogleAccessToken(auth.userId)
   if (!token) return ok({ connected: true, hasGmail: false, reason: 'token_expired' })
 
-  // 1. Check scopes via tokeninfo (diagnostic)
-  let scopes = ''
-  try {
-    const tiRes = await fetch(`https://www.googleapis.com/oauth2/v3/tokeninfo?access_token=${token}`)
-    if (tiRes.ok) {
-      const ti = await tiRes.json()
-      scopes = ti.scope ?? ''
-    }
-  } catch { /* non-critical */ }
+  // Keep the diagnostic scope from the stored OAuth metadata. Access tokens
+  // must never be placed in a URL query string where proxies can log them.
+  const scopes = account.scope ?? ''
 
   // 2. Actually try a Gmail API call — the authoritative check
   try {

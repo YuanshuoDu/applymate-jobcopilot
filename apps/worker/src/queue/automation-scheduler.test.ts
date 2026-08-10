@@ -25,6 +25,7 @@ describe("automation scheduler", () => {
         { name: "broadcasts", endpoint: "https://app.applymate.test/api/notifications/broadcasts/due", secret: "scheduler-secret" },
         { name: "alerts", endpoint: "https://app.applymate.test/api/admin/observability/alerts/evaluate", secret: "scheduler-secret" },
         { name: "audit-checkpoint", endpoint: "https://app.applymate.test/api/admin/audit-checkpoint", secret: "scheduler-secret", intervalMs: 24 * 60 * 60_000 },
+        { name: "retention-cleanup", endpoint: "https://app.applymate.test/api/internal/maintenance/retention", secret: "scheduler-secret", intervalMs: 24 * 60 * 60_000 },
       ],
       intervalMs: 60_000,
     });
@@ -40,6 +41,7 @@ describe("automation scheduler", () => {
       { name: "broadcasts", endpoint: "https://app.applymate.test/api/notifications/broadcasts/due", secret: "maintenance-secret" },
       { name: "alerts", endpoint: "https://app.applymate.test/api/admin/observability/alerts/evaluate", secret: "maintenance-secret" },
       { name: "audit-checkpoint", endpoint: "https://app.applymate.test/api/admin/audit-checkpoint", secret: "maintenance-secret", intervalMs: 24 * 60 * 60_000 },
+      { name: "retention-cleanup", endpoint: "https://app.applymate.test/api/internal/maintenance/retention", secret: "maintenance-secret", intervalMs: 24 * 60 * 60_000 },
     ]);
   });
 

@@ -14,6 +14,7 @@ export {
   type AtsSourceKey,
 } from "./ats-policy.js";
 export { detectAtsSource } from "./ats-url.js";
+export { isSafeAiEndpoint } from "./safe-ai-endpoint.js";
 export {
   evaluateManagedFeature,
   isManagedFeatureKey,

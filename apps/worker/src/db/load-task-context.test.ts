@@ -21,6 +21,7 @@ describe("loadTaskContext", () => {
   it("happy path: returns correct persona (base + learned merged)", async () => {
     const pool = mockPool(
       {
+        accountStatus: "active",
         name: "Jean Dupont",
         email: "jean@example.com",
         phone: "+33 6 12 34 56 78",
@@ -54,7 +55,7 @@ describe("loadTaskContext", () => {
   });
 
   it("missing job: throws with job ID in message", async () => {
-    const pool = mockPool({ name: "Jean" }, null);
+    const pool = mockPool({ accountStatus: "active", name: "Jean" }, null);
     await expect(
       loadTaskContext(pool, "user-1", "job-missing", "https://fallback.com")
     ).rejects.toThrow(/job-missing/);
@@ -62,7 +63,7 @@ describe("loadTaskContext", () => {
 
   it("empty personaFields (null): base fields still present", async () => {
     const pool = mockPool(
-      { name: "Jean", email: "jean@test.com", phone: null, location: null, linkedin: null, personaFields: null },
+      { accountStatus: "active", name: "Jean", email: "jean@test.com", phone: null, location: null, linkedin: null, personaFields: null },
       { role: "Engineer", company: "Corp", keywords: null, url: null, coverLetter: null }
     );
 
@@ -81,6 +82,7 @@ describe("loadTaskContext", () => {
   it("personaFields with entries: learned fields merged on top of base", async () => {
     const pool = mockPool(
       {
+        accountStatus: "active",
         name: "Jane",
         email: "jane@test.com",
         personaFields: [

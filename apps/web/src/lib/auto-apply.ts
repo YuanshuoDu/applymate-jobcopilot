@@ -6,6 +6,11 @@ import { isRuntimeFeatureEnabled } from '@/lib/runtime-feature-flags'
 
 export class AutoApplyError extends Error {}
 
+async function assertActiveAccount(userId: string): Promise<void> {
+  const user = await db.user.findUnique({ where: { id: userId }, select: { accountStatus: true } })
+  if (user?.accountStatus !== 'active') throw new AutoApplyError('Account is not active.')
+}
+
 async function assertUnattendedApplyEnabled(userId: string): Promise<void> {
   try {
     if (!await isRuntimeFeatureEnabled('unattended_apply', userId)) {
@@ -28,8 +33,8 @@ export function validateAutoApplyUrl(rawUrl: string | null | undefined): string 
     throw new AutoApplyError("The application URL is invalid.");
   }
 
-  if (parsed.protocol !== "https:" && parsed.protocol !== "http:") {
-    throw new AutoApplyError("The application URL must use HTTP or HTTPS.");
+  if (parsed.protocol !== "https:") {
+    throw new AutoApplyError("Automatic applications require an HTTPS destination.");
   }
 
   if (!isSupportedAutomatedApplyUrl(parsed.toString())) {
@@ -57,6 +62,7 @@ export async function queueApplicationFill(input: {
   applicationTaskId: string;
   resumeAfterUserInput?: boolean;
 }): Promise<{ taskId: string }> {
+  await assertActiveAccount(input.userId)
   await assertUnattendedApplyEnabled(input.userId)
   const applyUrl = validateAutoApplyUrl(input.applyUrl);
   await assertJobPreflight(input)
@@ -91,6 +97,7 @@ export async function queueAutonomousApplication(input: {
   /** Approved per-job authorization. Global settings can never replace this. */
   approvalId: string;
 }): Promise<{ taskId: string }> {
+  await assertActiveAccount(input.userId)
   await assertUnattendedApplyEnabled(input.userId)
   const applyUrl = validateAutoApplyUrl(input.applyUrl);
   await assertJobPreflight(input)

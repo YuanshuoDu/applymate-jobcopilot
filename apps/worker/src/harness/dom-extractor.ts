@@ -71,6 +71,11 @@ export async function perceiveFields(page: Page): Promise<PerceivedField[]> {
         continue;
       }
 
+      const sensitive = /password|passcode|one[-\s]?time|otp|token|secret|security[\s_-]?code|verification[\s_-]?code|cvv|cvc|card[\s_-]?number|social[\s_-]?security|\bssn\b|\bpin\b/i.test(
+        [type, htmlEl.getAttribute("name"), htmlEl.id, htmlEl.getAttribute("autocomplete"), htmlEl.getAttribute("placeholder"), label].filter(Boolean).join(" "),
+      );
+      if (sensitive) continue;
+
       // Deduplicate
       const dedupeKey = `${selector}:${label}`;
       if (seen.has(dedupeKey)) continue;

@@ -57,7 +57,7 @@ async function main() {
     templateId: payload.resume.templateId ?? payload.coverLetter.templateId ?? 'clean',
     templateOptions: payload.resume.templateOptions ?? payload.coverLetter.templateOptions ?? {},
   })), 'Cover letter')
-  const browser = await puppeteer.launch({ headless: true, executablePath: chrome, args: ['--no-sandbox', '--disable-gpu'] })
+  const browser = await puppeteer.launch({ headless: true, executablePath: chrome, args: ['--disable-gpu'] })
   try {
     const [resumePdf, coverLetterPdf] = await Promise.all([renderPage(browser, resumeMarkup), renderPage(browser, coverMarkup)])
     process.stdout.write(JSON.stringify({ resumePdf: resumePdf.toString('base64'), coverLetterPdf: coverLetterPdf.toString('base64') }))

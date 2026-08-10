@@ -37,13 +37,29 @@ export async function PATCH(request: NextRequest, { params }: Params) {
       before: { accountStatus: existing.accountStatus, suspendedAt: existing.suspendedAt, suspensionReason: existing.suspensionReason },
       after: { accountStatus: status, suspendedAt: status === 'suspended' ? 'now' : null, suspensionReason: status === 'suspended' ? reason : null },
     },
-    mutate: (tx) => tx.user.update({
-      where: { id },
-      data: status === UserAccountStatus.suspended
-        ? { accountStatus: status, suspendedAt: new Date(), suspendedById: actor.userId, suspensionReason: reason }
-        : { accountStatus: status, suspendedAt: null, suspendedById: null, suspensionReason: null },
-      select: adminUserMetadataSelect,
-    }),
+    mutate: async (tx) => {
+      const user = await tx.user.update({
+        where: { id },
+        data: status === UserAccountStatus.suspended
+          ? { accountStatus: status, suspendedAt: new Date(), suspendedById: actor.userId, suspensionReason: reason }
+          : { accountStatus: status, suspendedAt: null, suspendedById: null, suspensionReason: null },
+        select: adminUserMetadataSelect,
+      })
+      // Invalidate privileged sessions immediately. Background workers also
+      // re-check accountStatus before opening a browser/submitting.
+      await tx.adminMembership.updateMany({
+        where: { userId: id },
+        data: { sessionVersion: { increment: 1 }, ...(status === UserAccountStatus.suspended ? { status: 'suspended', revokedAt: new Date() } : {}) },
+      })
+      if (status === UserAccountStatus.suspended) {
+        await tx.agentAutomation.updateMany({ where: { userId: id }, data: { enabled: false } })
+        await tx.applicationTask.updateMany({
+          where: { userId: id, status: { in: ['filling', 'waiting_for_authorization'] } },
+          data: { status: 'waiting_for_user', checkpoint: 'account_suspended', error: 'Account suspended; external processing was stopped.' },
+        })
+      }
+      return user
+    },
   })
   if (result.duplicate) return NextResponse.json({ duplicate: true }, { headers: { 'Cache-Control': 'no-store' } })
   return NextResponse.json({ user: toAdminUserMetadata(result.value) }, { headers: { 'Cache-Control': 'no-store', 'x-request-id': actor.requestId } })

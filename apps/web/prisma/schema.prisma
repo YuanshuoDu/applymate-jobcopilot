@@ -96,6 +96,7 @@ model User {
   agentExecutions           AgentExecution[]
   agentSessions             AgentSession[]
   applicationTasks          ApplicationTask[]
+  formPatterns             FormPattern[]
   agentAutomations          AgentAutomation[]
   resumeVersions            ResumeVersion[]
   directions                Direction[]
@@ -108,6 +109,7 @@ model User {
   gmailMessages             GmailMessage[]
   gmailRecommendations      GmailRecommendation[]
   adminMembership           AdminMembership?           @relation("AdminUser")
+  adminNotifications        AdminNotification[]        @relation("AdminNotificationRecipient")
   adminWebAuthnCredentials  AdminWebAuthnCredential[]
   adminWebAuthnChallenges   AdminWebAuthnChallenge[]
   adminReauthGrants         AdminReauthGrant[]
@@ -571,6 +573,7 @@ model ApplyResult {
 
 model FormPattern {
   id            String   @id @default(cuid())
+  userId        String   @map("user_id")
   atsHost       String   @map("ats_host") // "jobs.lever.co"
   urlPattern    String   @map("url_pattern") // "spotify/" for matching
   fieldMapping  Json     @map("field_mapping") // {"input[name='first_name']": "firstName", ...}
@@ -580,7 +583,9 @@ model FormPattern {
   createdAt     DateTime @default(now()) @map("created_at")
   updatedAt     DateTime @updatedAt @map("updated_at")
 
-  @@unique([atsHost, urlPattern])
+  user         User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, atsHost, urlPattern])
   @@map("form_patterns")
 }
 
@@ -914,7 +919,7 @@ model AdminReauthGrant {
 
 model AdminDataDeletionRequest {
   id            String    @id @default(cuid())
-  userId        String    @unique @map("user_id")
+  userId        String?   @unique @map("user_id")
   status        String    @default("requested")
   reason        String?
   requestedAt   DateTime  @default(now()) @map("requested_at")
@@ -923,11 +928,26 @@ model AdminDataDeletionRequest {
   note          String?   @db.Text
   version       Int       @default(1)
   updatedAt     DateTime  @updatedAt @map("updated_at")
-  user          User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  user          User?     @relation(fields: [userId], references: [id], onDelete: SetNull)
   processedBy   User?     @relation("DeletionProcessor", fields: [processedById], references: [id], onDelete: SetNull)
 
   @@index([status, requestedAt(sort: Desc)])
   @@map("admin_data_deletion_requests")
+}
+
+model DataRetentionPolicy {
+  id            String   @id @default(cuid())
+  key           String   @unique
+  name          String
+  retentionDays Int      @map("retention_days")
+  enabled       Boolean  @default(true)
+  version       Int      @default(1)
+  updatedById   String?  @map("updated_by_id")
+  createdAt     DateTime @default(now()) @map("created_at")
+  updatedAt     DateTime @updatedAt @map("updated_at")
+
+  @@index([enabled, key])
+  @@map("data_retention_policies")
 }
 
 model AdminAuditLog {
@@ -1216,6 +1236,24 @@ model Notification {
   @@index([userId, createdAt(sort: Desc)])
   @@index([broadcastId])
   @@map("notifications")
+}
+
+model AdminNotification {
+  id          String    @id @default(cuid())
+  adminUserId String    @map("admin_user_id")
+  type        String
+  title       String
+  body        String?
+  entityType  String?   @map("entity_type")
+  entityId    String?   @map("entity_id")
+  dedupeKey   String    @unique @map("dedupe_key")
+  readAt      DateTime? @map("read_at")
+  createdAt   DateTime  @default(now()) @map("created_at")
+
+  adminUser User @relation("AdminNotificationRecipient", fields: [adminUserId], references: [id], onDelete: Cascade)
+
+  @@index([adminUserId, readAt, createdAt(sort: Desc)])
+  @@map("admin_notifications")
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

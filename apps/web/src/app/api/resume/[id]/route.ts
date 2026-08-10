@@ -6,6 +6,7 @@
 import { NextRequest } from 'next/server'
 import { db } from '@/lib/db'
 import { requireAuth, isErrorResponse, ok, err } from '@/lib/api-helpers'
+import { safeTemplateOptions } from '@/lib/template-options'
 
 type Params = { params: Promise<{ id: string }> }
 
@@ -32,6 +33,10 @@ export async function PATCH(req: NextRequest, { params }: Params) {
   if (!body) return err('Invalid JSON body')
 
   const { name, content, templateId, templateOptions, isDefault, targetJobId, unlinkJob } = body
+  const sanitizedTemplateOptions = templateOptions === undefined || templateOptions === null
+    ? templateOptions
+    : safeTemplateOptions(templateOptions)
+  if (templateOptions !== undefined && templateOptions !== null && !sanitizedTemplateOptions) return err('Invalid template options')
 
   if (targetJobId !== undefined && targetJobId !== null) {
     const job = await db.job.findFirst({ where: { id: targetJobId, userId: auth.userId } })
@@ -83,7 +88,7 @@ export async function PATCH(req: NextRequest, { params }: Params) {
       ...(name            !== undefined ? { name }            : {}),
       ...(content         !== undefined ? { content }         : {}),
       ...(templateId      !== undefined ? { templateId }      : {}),
-      ...(templateOptions !== undefined ? { templateOptions } : {}),
+      ...(templateOptions !== undefined ? { templateOptions: sanitizedTemplateOptions } : {}),
       ...(isDefault       !== undefined ? { isDefault }       : {}),
       ...(unlinkJob || targetJobId !== undefined ? { targetJobId: unlinkJob ? null : targetJobId } : {}),
     },

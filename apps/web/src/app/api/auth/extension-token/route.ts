@@ -48,6 +48,7 @@ export async function POST(req: NextRequest) {
     email: user.email,
     name:  user.name ?? '',
     plan:  user.plan,
+    updatedAt: user.updatedAt.toISOString(),
   })
     .setProtectedHeader({ alg: 'HS256' })
     .setIssuer(EXTENSION_TOKEN_ISSUER)

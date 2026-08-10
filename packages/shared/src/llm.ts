@@ -1,4 +1,5 @@
 import pg from "pg";
+import { isSafeAiEndpoint } from "./safe-ai-endpoint.js";
 
 // ── Types ──
 
@@ -130,6 +131,9 @@ async function callOpenAICompat(
   config: AiConfig
 ): Promise<ChatResult> {
   const base = config.apiBase || DEFAULT_API_BASES[config.provider];
+  if (config.provider === "custom" && !isSafeAiEndpoint(base)) {
+    throw new Error("Custom AI endpoint is not an allowed public HTTPS destination");
+  }
   const key = config.apiKey || getServerKey(config.provider);
   if (!key) throw new Error(`No API key for provider "${config.provider}"`);
 
@@ -151,6 +155,7 @@ async function callOpenAICompat(
       "Content-Type": "application/json",
       Authorization: `Bearer ${key}`,
     },
+    redirect: "error",
     body: JSON.stringify({
       model: config.model,
       messages,

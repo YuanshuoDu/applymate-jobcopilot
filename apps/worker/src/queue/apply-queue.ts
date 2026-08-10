@@ -27,7 +27,7 @@ import { purgeTemporaryGeneratedCoverLetters } from "../notifications/purge-cove
 import { shouldUsePattern } from "../patterns/confidence.js";
 import { replayPattern } from "../patterns/replay.js";
 import { unlinkSync } from "node:fs";
-import { claimApplicationTask, completeFillForReview, finishApplicationTask, needsUserTakeover, pauseForFormInput } from "../db/application-task-state.js";
+import { applicationTaskStillActive, claimApplicationTask, completeFillForReview, finishApplicationTask, needsUserTakeover, pauseForFormInput } from "../db/application-task-state.js";
 import { formNeedsMessage, inspectFormReviewNeeds } from "../harness/form-review.js";
 import { workerPollingOptions } from "./worker-polling-options.js";
 import {
@@ -121,6 +121,7 @@ export const applyWorker = new Worker<ApplyTaskPayload>(
 
       await Promise.race([
         withCloakContext(userId, async (page) => {
+        if (!await applicationTaskStillActive(getPool(), applicationTaskId, userId, jobId)) return;
         if (operation === "submit") {
           const submissionClaim = await claimUnattendedSubmission(getPool(), userId, jobId);
           if (submissionClaim === "unavailable") {
@@ -150,6 +151,9 @@ export const applyWorker = new Worker<ApplyTaskPayload>(
           waitUntil: "domcontentloaded",
           timeout: 30_000,
         });
+        if (!isAllowedAtsDestination(page.url(), flow, taskCtx.applyUrl)) {
+          throw new Error("Application page redirected outside the approved ATS origin.");
+        }
 
         const applyTask: ApplyTask = {
           jobId,
@@ -169,6 +173,8 @@ export const applyWorker = new Worker<ApplyTaskPayload>(
           ...(operation === "submit" ? {
             beforeSubmit: async () => {
               if (await applyQueue.isPaused()) return false;
+              if (!await applicationTaskStillActive(getPool(), applicationTaskId, userId, jobId)) return false;
+              if (!isAllowedAtsDestination(page.url(), flow, taskCtx.applyUrl)) return false;
               return (await evaluateUnattendedApplyControl(getPool(), taskCtx.applyUrl, userId)).allowed;
             },
           } : {}),
@@ -228,7 +234,7 @@ export const applyWorker = new Worker<ApplyTaskPayload>(
             const pathParts = taskCtx.applyUrl.replace(/^https?:\/\/[^/]+\//, "").split("/");
             const urlPattern = pathParts.slice(0, 2).join("/") + "/";
 
-            const pattern = await findFormPattern(host, urlPattern).catch((e: Error) => {
+            const pattern = await findFormPattern(userId, host, urlPattern).catch((e: Error) => {
               console.warn("[apply-worker] Pattern lookup failed:", e.message);
               return null;
             });
@@ -257,7 +263,7 @@ export const applyWorker = new Worker<ApplyTaskPayload>(
                   await incrementBudget(userId).catch((e: Error) =>
                     console.warn("[apply-worker] Budget increment failed:", e.message)
                   );
-                  writeFormPattern(taskCtx.applyUrl, harnessResult);
+                  writeFormPattern(userId, taskCtx.applyUrl, harnessResult);
                 }
               } else {
                 usedFlow = "pattern-cache";
@@ -276,7 +282,7 @@ export const applyWorker = new Worker<ApplyTaskPayload>(
                 await incrementBudget(userId).catch((e: Error) =>
                   console.warn("[apply-worker] Budget increment failed:", e.message)
                 );
-                writeFormPattern(taskCtx.applyUrl, harnessResult);
+                writeFormPattern(userId, taskCtx.applyUrl, harnessResult);
               }
             }
           }
@@ -499,7 +505,7 @@ async function handOffUnavailableUnattendedTask(params: {
   }).catch((error: Error) => console.warn("[notify] in-app notification failed:", error.message));
 }
 
-function writeFormPattern(applyUrl: string, harnessResult: HarnessResult): void {
+function writeFormPattern(userId: string, applyUrl: string, harnessResult: HarnessResult): void {
   if (!harnessResult.fieldMappings || Object.keys(harnessResult.fieldMappings).length === 0) {
     return;
   }
@@ -510,10 +516,28 @@ function writeFormPattern(applyUrl: string, harnessResult: HarnessResult): void 
   const urlPattern = pathParts.slice(0, 2).join("/") + "/";
 
   upsertFormPattern({
+    userId,
     atsHost: host,
     urlPattern,
     fieldMapping: harnessResult.fieldMappings,
   }).catch((e: Error) => console.warn("[apply-worker] Pattern write failed:", e.message));
+}
+
+function isAllowedAtsDestination(rawUrl: string, flow: FlowType | null, approvedUrl: string): boolean {
+  try {
+    const url = new URL(rawUrl);
+    if (url.protocol !== "https:") return false;
+    const host = url.hostname.toLowerCase();
+    if (flow === "greenhouse") return host === "boards.greenhouse.io" || host.endsWith(".greenhouse.io");
+    if (flow === "lever") return host === "jobs.lever.co" || host === "jobs.eu.lever.co" || host === "app.lever.co";
+    if (flow === "workday") return host.endsWith(".myworkdayjobs.com");
+    if (flow === "smartrecruiters") return host === "jobs.smartrecruiters.com" || host === "careers.smartrecruiters.com";
+    if (flow === "personio") return host.endsWith(".jobs.personio.com");
+    if (flow !== null) return false;
+    return url.origin === new URL(approvedUrl).origin;
+  } catch {
+    return false;
+  }
 }
 
 function notificationTypeForStatus(

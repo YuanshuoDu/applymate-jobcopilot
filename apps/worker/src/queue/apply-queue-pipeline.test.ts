@@ -5,7 +5,7 @@ const mocks = vi.hoisted(() => {
 
   return {
     workerHandler: undefined as undefined | ((job: { data: Record<string, unknown> }) => Promise<void>),
-    fakePage: { goto: vi.fn().mockResolvedValue(undefined) },
+    fakePage: { goto: vi.fn().mockResolvedValue(undefined), url: vi.fn().mockReturnValue("https://jobs.example/apply/start/123") },
     checkRateLimit: vi.fn().mockResolvedValue({ allowed: true }),
     withCloakContext: vi.fn(),
     insertApplyResult: vi.fn().mockResolvedValue(1),
@@ -26,6 +26,7 @@ const mocks = vi.hoisted(() => {
     shouldUsePattern: vi.fn().mockReturnValue(false),
     replayPattern: vi.fn(),
     claimApplicationTask: vi.fn().mockResolvedValue(true),
+    applicationTaskStillActive: vi.fn().mockResolvedValue(true),
     completeFillForReview: vi.fn().mockResolvedValue(true),
     finishApplicationTask: vi.fn().mockResolvedValue(undefined),
     pauseForFormInput: vi.fn().mockResolvedValue(undefined),
@@ -92,6 +93,7 @@ vi.mock("../admin/ats-policy.js", () => ({
 }));
 vi.mock("../db/application-task-state.js", () => ({
   claimApplicationTask: mocks.claimApplicationTask,
+  applicationTaskStillActive: mocks.applicationTaskStillActive,
   completeFillForReview: mocks.completeFillForReview,
   finishApplicationTask: mocks.finishApplicationTask,
   pauseForFormInput: mocks.pauseForFormInput,
@@ -165,7 +167,7 @@ describe("apply-queue Phase 5 pipeline", () => {
     await expect(runApplyJob()).resolves.toBeUndefined();
 
     expect(mocks.checkBudget).toHaveBeenCalledWith("user-1");
-    expect(mocks.findFormPattern).toHaveBeenCalledWith("jobs.example", "apply/start/");
+    expect(mocks.findFormPattern).toHaveBeenCalledWith("user-1", "jobs.example", "apply/start/");
     expect(mocks.shouldUsePattern).toHaveBeenCalledWith(formPattern);
     expect(mocks.replayPattern).toHaveBeenCalledWith(
       mocks.fakePage,
@@ -193,7 +195,7 @@ describe("apply-queue Phase 5 pipeline", () => {
 
     await expect(runApplyJob()).resolves.toBeUndefined();
 
-    expect(mocks.findFormPattern).toHaveBeenCalledWith("jobs.example", "apply/start/");
+    expect(mocks.findFormPattern).toHaveBeenCalledWith("user-1", "jobs.example", "apply/start/");
     expect(mocks.shouldUsePattern).not.toHaveBeenCalled();
     expect(mocks.replayPattern).not.toHaveBeenCalled();
     expect(mocks.AgentHarness).toHaveBeenCalledWith({
@@ -364,6 +366,7 @@ describe("apply-queue Phase 5 pipeline", () => {
 
   it("gives every active ATS flow a fresh submission authorization callback", async () => {
     mocks.detectFlow.mockReturnValueOnce("greenhouse");
+    mocks.fakePage.url.mockReturnValueOnce("https://jobs.greenhouse.io/apply/start/123");
     mocks.runtimeFeatureEnabled.mockResolvedValueOnce(true).mockResolvedValueOnce(false);
     const capturedTask: { current: { beforeSubmit?: () => Promise<boolean> } | null } = { current: null };
     mocks.runGreenhouseFlow.mockImplementationOnce(async (_page: unknown, input: { beforeSubmit?: () => Promise<boolean> }) => {

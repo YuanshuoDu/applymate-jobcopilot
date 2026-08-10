@@ -2,9 +2,13 @@ import type { Prisma } from '@prisma/client'
 import { db } from '@/lib/db'
 import { APPLYMATE_BACKING, FEATURE_LABELS, MODEL_CATALOGUE, resolveConfig, type Provider } from '@/lib/model-router'
 
-const SECRET_REFS: Partial<Record<Provider, string>> = {
+export const SECRET_REFS: Partial<Record<Provider, string>> = {
   anthropic: 'ANTHROPIC_API_KEY', openai: 'OPENAI_API_KEY', deepseek: 'DEEPSEEK_API_KEY', minimax: 'MINIMAX_API_KEY',
   qwen: 'QWEN_API_KEY', zhipu: 'ZHIPU_API_KEY', kimi: 'KIMI_API_KEY',
+}
+
+export function fixedSecretRef(provider: string): string | null {
+  return SECRET_REFS[provider as Provider] ?? null
 }
 
 function configured(secretRef: string | null, provider: string) {

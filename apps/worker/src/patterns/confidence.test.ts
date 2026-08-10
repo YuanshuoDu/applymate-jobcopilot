@@ -5,6 +5,7 @@ import { shouldUsePattern } from "./confidence.js";
 function pattern(counts: Pick<FormPatternRow, "successCount" | "failureCount">): FormPatternRow {
   return {
     id: "pattern-1",
+    userId: "user-1",
     atsHost: "jobs.example.com",
     urlPattern: "company/",
     fieldMapping: {},
