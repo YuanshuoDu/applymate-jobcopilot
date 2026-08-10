@@ -61,4 +61,14 @@ describe('requireAdmin', () => {
     expect((result as Response).status).toBe(403)
     expect(await (result as Response).json()).toEqual(expect.objectContaining({ code: 'reauth_required' }))
   })
+
+  it('requires fresh WebAuthn before changing a user feature permission', async () => {
+    mocks.safeAuth.mockResolvedValue({ user: { id: 'admin-1', plan: 'pro', adminSessionVersion: 2 } })
+    mocks.findUnique.mockResolvedValue({ status: 'active', mfaLevel: 'webauthn', sessionVersion: 2, role: { key: 'platform_admin', permissions: ['users.feature_override'] } })
+    mocks.findReauth.mockResolvedValue(null)
+    const { requireAdmin } = await import('./authorization')
+    const result = await requireAdmin('users.feature_override', new Request('http://localhost/api/admin/v1/users/u1/feature-overrides', { method: 'PATCH', headers: { Origin: 'http://localhost', Host: 'localhost', 'Idempotency-Key': 'override-reauth-1' } }))
+    expect(result).toBeInstanceOf(Response)
+    expect(await (result as Response).json()).toEqual(expect.objectContaining({ code: 'reauth_required' }))
+  })
 })

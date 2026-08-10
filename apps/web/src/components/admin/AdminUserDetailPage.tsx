@@ -29,10 +29,24 @@ type Detail = {
 
 type Override = { id: string; featureKey: string; enabled: boolean; limit: number | null; expiresAt: string | null; reason: string }
 type PlanChange = { id: string; fromPlan: string; toPlan: string; reason: string; actorUserId: string; createdAt: string }
+type Subscription = { id: string; plan: string; status: 'trialing' | 'active' | 'past_due' | 'cancelled' | 'expired'; trialStartsAt: string | null; trialEndsAt: string | null; currentPeriodStart: string | null; currentPeriodEnd: string | null; cancelAtPeriodEnd: boolean; version: number; updatedAt: string }
+
+function dateTimeLocal(value: string | null | undefined) {
+  if (!value) return ''
+  const date = new Date(value)
+  if (Number.isNaN(date.getTime())) return ''
+  const offset = date.getTimezoneOffset()
+  return new Date(date.getTime() - offset * 60_000).toISOString().slice(0, 16)
+}
 
 function AccountOperations({ userId, user, permissions }: { userId: string; user: Detail['user']; permissions: readonly string[] }) {
   const [status, setStatus] = useState(user.accountStatus)
   const [plan, setPlan] = useState(user.plan)
+  const [subscription, setSubscription] = useState<Subscription | null>(null)
+  const [subscriptionStatus, setSubscriptionStatus] = useState<Subscription['status']>('active')
+  const [trialEndsAt, setTrialEndsAt] = useState('')
+  const [currentPeriodEnd, setCurrentPeriodEnd] = useState('')
+  const [cancelAtPeriodEnd, setCancelAtPeriodEnd] = useState(false)
   const [overrides, setOverrides] = useState<Override[]>([])
   const [planHistory, setPlanHistory] = useState<PlanChange[]>([])
   const [featureKey, setFeatureKey] = useState('auto_apply')
@@ -50,8 +64,19 @@ function AccountOperations({ userId, user, permissions }: { userId: string; user
   }, [permissions, userId])
   useEffect(() => {
     if (!permissions.includes('billing.read')) return
-    void fetch(`/api/admin/v1/users/${userId}/plan`, { cache: 'no-store' }).then(response => response.json()).then(payload => setPlanHistory(payload.changes ?? [])).catch(() => setNotice('Unable to load plan history.'))
-  }, [permissions, userId, plan])
+    void fetch(`/api/admin/v1/users/${userId}/plan`, { cache: 'no-store' }).then(response => response.json()).then(payload => {
+      setPlanHistory(payload.changes ?? [])
+      const next = payload.subscription as Subscription | null | undefined
+      setSubscription(next ?? null)
+      if (next) {
+        setPlan(next.plan)
+        setSubscriptionStatus(next.status)
+        setTrialEndsAt(dateTimeLocal(next.trialEndsAt))
+        setCurrentPeriodEnd(dateTimeLocal(next.currentPeriodEnd))
+        setCancelAtPeriodEnd(next.cancelAtPeriodEnd)
+      }
+    }).catch(() => setNotice('Unable to load plan history.'))
+  }, [permissions, userId])
 
   async function mutate(url: string, body: Record<string, unknown>, message: string) {
     const reason = await request({ title: 'Confirm account operation', label: 'Reason', kind: 'reason', description: 'This action is audited and requires an operational reason.', submitLabel: 'Continue' })
@@ -65,14 +90,48 @@ function AccountOperations({ userId, user, permissions }: { userId: string; user
     if (payload?.item) setOverrides(current => [...current.filter(item => item.featureKey !== payload.item!.featureKey), payload.item!])
   }
 
+  async function saveSubscription(event: React.FormEvent) {
+    event.preventDefault()
+    const reason = await request({ title: 'Save package settings', label: 'Reason', kind: 'reason', description: 'Plan, trial and subscription changes are audited and version checked.', submitLabel: 'Save package settings' })
+    if (!reason) return
+    setBusy(true)
+    const response = await fetch(`/api/admin/v1/users/${userId}/plan`, { method: 'PATCH', headers: { 'Content-Type': 'application/json', 'Idempotency-Key': crypto.randomUUID() }, body: JSON.stringify({ toPlan: plan, status: subscriptionStatus, trialEndsAt: subscriptionStatus === 'trialing' && trialEndsAt ? new Date(trialEndsAt).toISOString() : null, currentPeriodEnd: currentPeriodEnd ? new Date(currentPeriodEnd).toISOString() : null, cancelAtPeriodEnd, version: subscription?.version, reason }) })
+    const payload = await response.json().catch(() => null) as { error?: string; subscription?: Subscription } | null
+    setBusy(false)
+    if (!response.ok) { setNotice(payload?.error ?? 'Package settings could not be saved.'); return }
+    if (payload?.subscription) {
+      setSubscription(payload.subscription)
+      setSubscriptionStatus(payload.subscription.status)
+      setTrialEndsAt(dateTimeLocal(payload.subscription.trialEndsAt))
+      setCurrentPeriodEnd(dateTimeLocal(payload.subscription.currentPeriodEnd))
+      setCancelAtPeriodEnd(payload.subscription.cancelAtPeriodEnd)
+    }
+    setNotice('Package settings saved.')
+  }
+
+  async function removeOverride(item: Override) {
+    const reason = await request({ title: 'Remove user permission override', label: 'Reason', kind: 'reason', description: `The user will inherit the ${item.featureKey} permission from their package again.`, submitLabel: 'Remove override' })
+    if (!reason) return
+    setBusy(true)
+    const response = await fetch(`/api/admin/v1/users/${userId}/feature-overrides?featureKey=${encodeURIComponent(item.featureKey)}&reason=${encodeURIComponent(reason)}`, { method: 'DELETE', headers: { 'Idempotency-Key': crypto.randomUUID() } })
+    const payload = await response.json().catch(() => null) as { error?: string } | null
+    setBusy(false)
+    if (!response.ok) { setNotice(payload?.error ?? 'Permission override could not be removed.'); return }
+    setOverrides(current => current.filter(currentItem => currentItem.featureKey !== item.featureKey))
+    setNotice('User permission override removed.')
+  }
+
   const canSuspend = permissions.includes('users.suspend')
   const canRestore = permissions.includes('users.restore')
-  const canPlan = permissions.includes('billing.update')
+  const canPlan = permissions.includes('billing.update') && permissions.includes('billing.read')
   const canOverride = permissions.includes('users.feature_override')
-  return <><section className="admin-detail-operations"><div className="admin-settings-heading"><div><h2>Account operations</h2><p>High-impact actions are audited and never expose candidate documents or credentials.</p></div><span role="status">{notice}</span></div><div className="admin-operation-grid">
+  return <><section className="admin-detail-operations"><div className="admin-settings-heading"><div><h2>Account operations</h2><p>Core administrators can manage access, package settings and lifecycle state. Every write is audited.</p></div><span role="status">{notice}</span></div><div className="admin-operation-grid">
     <label>Account state<select value={status} disabled={busy || (status === 'active' ? !canSuspend : !canRestore)} onChange={event => { const next = event.target.value as 'active' | 'suspended'; setStatus(next); void mutate(`/api/admin/v1/users/${userId}/account-state`, { status: next }, next === 'suspended' ? 'Account suspended.' : 'Account restored.') }}><option value="active">Active</option><option value="suspended">Suspended</option></select></label>
-    <label>Commercial plan<select value={plan} disabled={busy || !canPlan} onChange={event => { const next = event.target.value; setPlan(next); void mutate(`/api/admin/v1/users/${userId}/plan`, { toPlan: next }, `Plan changed to ${next}.`) }}><option value="free">Free</option><option value="pro">Pro</option><option value="enterprise">Enterprise</option></select></label>
-  </div>{canOverride && <><h3>Feature overrides</h3><form className="admin-operation-form" onSubmit={event => { event.preventDefault(); void mutate(`/api/admin/v1/users/${userId}/feature-overrides`, { featureKey, enabled, limit: limit ? Number(limit) : null, expiresAt: expiresAt || null }, 'Feature override saved.') }}><input value={featureKey} onChange={event => setFeatureKey(event.target.value)} placeholder="Feature key" required /><label><input type="checkbox" checked={enabled} onChange={event => setEnabled(event.target.checked)} /> Enabled</label><input type="number" min="0" value={limit} onChange={event => setLimit(event.target.value)} placeholder="Limit" /><input type="datetime-local" value={expiresAt} onChange={event => setExpiresAt(event.target.value)} /><button className="admin-secondary" disabled={busy}>Save override</button></form><div className="admin-override-list">{overrides.length === 0 ? <span>No overrides.</span> : overrides.map(item => <span key={item.id}>{item.featureKey}: {item.enabled ? 'on' : 'off'}{item.limit === null ? '' : ` · ${item.limit}`}{item.expiresAt ? ` · expires ${new Date(item.expiresAt).toLocaleDateString()}` : ''}</span>)}</div></>}{permissions.includes('billing.read') && <section className="admin-detail-history"><h3>Plan change history</h3><div className="admin-table-wrap"><table className="admin-table"><thead><tr><th>From</th><th>To</th><th>Reason</th><th>Actor</th><th>Time</th></tr></thead><tbody>{planHistory.length === 0 ? <tr><td colSpan={5}>No plan changes.</td></tr> : planHistory.map(change => <tr key={change.id}><td>{change.fromPlan}</td><td>{change.toPlan}</td><td>{change.reason}</td><td>{change.actorUserId}</td><td>{new Date(change.createdAt).toLocaleString()}</td></tr>)}</tbody></table></div></section>}</section>{dialog}</>
+    <label>Commercial plan<select value={plan} disabled={busy || !canPlan} onChange={event => setPlan(event.target.value)}><option value="free">Free</option><option value="pro">Pro</option><option value="enterprise">Enterprise</option></select></label>
+    {canPlan && <label>Subscription state<select value={subscriptionStatus} disabled={busy} onChange={event => setSubscriptionStatus(event.target.value as Subscription['status'])}><option value="trialing">Trialing</option><option value="active">Active</option><option value="past_due">Past due</option><option value="cancelled">Cancelled</option><option value="expired">Expired</option></select></label>}
+    {canPlan && <label>Trial ends<input type="datetime-local" value={trialEndsAt} disabled={busy || subscriptionStatus !== 'trialing'} onChange={event => setTrialEndsAt(event.target.value)} /></label>}
+    {canPlan && <label>Current period ends<input type="datetime-local" value={currentPeriodEnd} disabled={busy} onChange={event => setCurrentPeriodEnd(event.target.value)} /></label>}
+  </div>{canPlan && <div className="admin-inline-actions"><label className="admin-operation-checkbox"><input type="checkbox" checked={cancelAtPeriodEnd} disabled={busy} onChange={event => setCancelAtPeriodEnd(event.target.checked)} /> Cancel at period end</label><button className="admin-secondary" disabled={busy} onClick={event => void saveSubscription(event)}>Save package settings</button></div>}{canOverride && <><h3>User permissions</h3><p className="admin-operation-help">Grant, deny or temporarily limit a user feature independently from the commercial package. Removing an override returns to package permissions.</p><form className="admin-operation-form" onSubmit={event => { event.preventDefault(); void mutate(`/api/admin/v1/users/${userId}/feature-overrides`, { featureKey, enabled, limit: limit ? Number(limit) : null, expiresAt: expiresAt || null }, 'User permission saved.') }}><input value={featureKey} onChange={event => setFeatureKey(event.target.value)} placeholder="Permission key, e.g. auto_apply" required /><label><input type="checkbox" checked={enabled} onChange={event => setEnabled(event.target.checked)} /> Granted</label><input type="number" min="0" value={limit} onChange={event => setLimit(event.target.value)} placeholder="Limit" /><input type="datetime-local" value={expiresAt} onChange={event => setExpiresAt(event.target.value)} /><button className="admin-secondary" disabled={busy}>Save permission</button></form><div className="admin-override-list">{overrides.length === 0 ? <span>No user permission overrides.</span> : overrides.map(item => <span key={item.id}>{item.featureKey}: {item.enabled ? 'granted' : 'denied'}{item.limit === null ? '' : ` · limit ${item.limit}`}{item.expiresAt ? ` · expires ${new Date(item.expiresAt).toLocaleDateString()}` : ''}<button type="button" className="admin-chip-remove" disabled={busy} onClick={() => void removeOverride(item)}>Remove</button></span>)}</div></>}{permissions.includes('billing.read') && <section className="admin-detail-history"><h3>Plan change history</h3><div className="admin-table-wrap"><table className="admin-table"><thead><tr><th>From</th><th>To</th><th>Reason</th><th>Actor</th><th>Time</th></tr></thead><tbody>{planHistory.length === 0 ? <tr><td colSpan={5}>No plan changes.</td></tr> : planHistory.map(change => <tr key={change.id}><td>{change.fromPlan}</td><td>{change.toPlan}</td><td>{change.reason}</td><td>{change.actorUserId}</td><td>{new Date(change.createdAt).toLocaleString()}</td></tr>)}</tbody></table></div></section>}</section>{dialog}</>
 }
 
 type Preferences = {

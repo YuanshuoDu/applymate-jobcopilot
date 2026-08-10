@@ -16,7 +16,7 @@ export type AdminActor = Readonly<{
 
 const highRiskPermissions = new Set([
   'admin_members.manage', 'admin_roles.manage', 'sessions.revoke',
-  'users.suspend', 'users.activate', 'users.export_anonymized', 'billing.update',
+  'users.suspend', 'users.restore', 'users.activate', 'users.export_anonymized', 'users.feature_override', 'billing.update',
   'ai_budget.update', 'ai_budget.reset', 'feature_flags.update', 'feature_flags.approve',
   'ats.update', 'ats.pause', 'ats.resume', 'queues.pause', 'queues.resume', 'queues.retry',
   'broadcasts.create', 'broadcasts.publish', 'broadcasts.schedule', 'broadcasts.retry',

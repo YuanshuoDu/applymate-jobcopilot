@@ -54,6 +54,18 @@ describe('AdminUserDetailPage', () => {
     expect(html).not.toContain('apiKey')
   })
 
+  it('shows package and user permission controls to an authorized core administrator', () => {
+    const html = renderToStaticMarkup(React.createElement(AdminUserDetailPage, {
+      userId: 'user_1',
+      canUpdatePreferences: true,
+      permissions: ['users.suspend', 'users.restore', 'billing.read', 'billing.update', 'users.feature_override'],
+    }))
+
+    expect(html).toContain('Save package settings')
+    expect(html).toContain('User permissions')
+    expect(html).toContain('Grant, deny or temporarily limit')
+  })
+
   it('keeps the settings view read-only without the update permission', () => {
     const html = renderToStaticMarkup(React.createElement(AdminUserDetailPage, { userId: 'user_1', canUpdatePreferences: false }))
 
