@@ -1,16 +1,42 @@
-import { ensureApplyResultsTable, closePool } from "./db/apply-results.js";
-import { applyWorker, applyQueue, connection } from "./queue/apply-queue.js";
-import { scoutWorker, scoutQueue, SCOUT_QUEUE_NAME } from "./queue/scout-queue.js";
-import { agentRunQueue, AGENT_RUN_QUEUE_NAME, closeAgentRunResources } from "./queue/agent-run-queue.js";
-import { startAutomationScheduler } from "./queue/automation-scheduler.js";
-import { closeAllSlots } from "./cloak/pool.js";
 import express from "express";
 import { createBullBoard } from "@bull-board/api";
 import { BullMQAdapter } from "@bull-board/api/bullMQAdapter";
 import { ExpressAdapter } from "@bull-board/express";
-import { createWorkerControlHandler } from "./admin/control-plane.js";
+import { createWorkerControlHandler, resolveWorkerAdminHost } from "./admin/control-plane.js";
+import { getWorkerRuntimeState, restoreWorkerRuntimeState } from "./admin/worker-state.js";
 
 async function main() {
+  const adminHost = resolveWorkerAdminHost();
+  const [
+    applyResultsModule,
+    applyQueueModule,
+    scoutQueueModule,
+    agentRunQueueModule,
+    automationSchedulerModule,
+    cloakPoolModule,
+    deadLetterModule,
+  ] = await Promise.all([
+    import("./db/apply-results.js"),
+    import("./queue/apply-queue.js"),
+    import("./queue/scout-queue.js"),
+    import("./queue/agent-run-queue.js"),
+    import("./queue/automation-scheduler.js"),
+    import("./cloak/pool.js"),
+    import("./queue/dead-letter.js"),
+  ]);
+  const { ensureApplyResultsTable, closePool } = applyResultsModule;
+  const { applyWorker, applyQueue, connection } = applyQueueModule;
+  const { scoutWorker, scoutQueue, SCOUT_QUEUE_NAME } = scoutQueueModule;
+  const { agentRunQueue, AGENT_RUN_QUEUE_NAME, closeAgentRunResources } = agentRunQueueModule;
+  const { publicAutomationSchedulerStatus, startAutomationScheduler } = automationSchedulerModule;
+  const { closeAllSlots } = cloakPoolModule;
+  const { deadLetterQueue, registerDeadLetterListeners, closeDeadLetterResources } = deadLetterModule;
+  registerDeadLetterListeners([
+    { name: applyQueueModule.QUEUE_NAME, worker: applyWorker },
+    { name: SCOUT_QUEUE_NAME, worker: scoutWorker },
+    { name: AGENT_RUN_QUEUE_NAME, worker: agentRunQueueModule.agentRunWorker },
+  ]);
+
   console.log("[worker] Starting ApplyMate worker...");
   console.log(`[worker] CLOAK_MAX_WORKERS=${process.env.CLOAK_MAX_WORKERS ?? "1"}`);
   console.log(`[worker] DATABASE_URL=${process.env.DATABASE_URL ? "set" : "not set"}`);
@@ -34,6 +60,13 @@ async function main() {
     process.exit(1);
   }
 
+  const workerRuntimeState = await restoreWorkerRuntimeState(connection, {
+    "apply-tasks": applyQueue,
+    "scout-tasks": scoutQueue,
+    "agent-runs": agentRunQueue,
+  });
+  console.log(`[worker] Runtime control state: ${workerRuntimeState.status}`);
+
   console.log(`[worker] Listening on queue 'apply-tasks' (concurrency: ${process.env.CLOAK_MAX_WORKERS ?? "1"})`);
   console.log(`[worker] Listening on queue '${SCOUT_QUEUE_NAME}' (concurrency: 1)`);
   console.log(`[worker] Listening on queue '${AGENT_RUN_QUEUE_NAME}' (concurrency: 1)`);
@@ -42,8 +75,9 @@ async function main() {
 
   const adminApp = express();
   adminApp.get("/healthz", (_req, res) => res.status(200).json({
-    status: "ok",
-    automationScheduler: automationScheduler.status(),
+    status: getWorkerRuntimeState().status === "paused" ? "paused" : "ok",
+    workerState: getWorkerRuntimeState().status,
+    automationScheduler: publicAutomationSchedulerStatus(automationScheduler.status()),
   }));
   adminApp.post("/internal/admin/control", express.text({ type: "application/json", limit: "16kb" }), createWorkerControlHandler());
 
@@ -56,7 +90,7 @@ async function main() {
     const serverAdapter = new ExpressAdapter();
     serverAdapter.setBasePath("/admin/queues");
     createBullBoard({
-      queues: [new BullMQAdapter(applyQueue), new BullMQAdapter(scoutQueue), new BullMQAdapter(agentRunQueue)],
+      queues: [new BullMQAdapter(applyQueue), new BullMQAdapter(scoutQueue), new BullMQAdapter(agentRunQueue), new BullMQAdapter(deadLetterQueue)],
       serverAdapter,
     });
 
@@ -73,10 +107,6 @@ async function main() {
   }
 
   const boardPort = Number(process.env.BULL_BOARD_PORT ?? "3001");
-  const adminHost = process.env.WORKER_ADMIN_HOST ?? "127.0.0.1";
-  if (process.env.NODE_ENV === "production" && ["0.0.0.0", "::"].includes(adminHost)) {
-    throw new Error("WORKER_ADMIN_HOST must be loopback or private in production");
-  }
   adminApp.listen(boardPort, adminHost, () =>
     console.log(`[worker-health] http://${adminHost}:${boardPort}/healthz`)
   );
@@ -87,6 +117,7 @@ async function main() {
     await scoutWorker.close();
     await applyWorker.close();
     await closeAgentRunResources();
+    await closeDeadLetterResources();
     automationScheduler.close();
     await closeAllSlots();
     await closePool();

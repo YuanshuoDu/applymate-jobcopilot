@@ -34,15 +34,18 @@ export async function POST(request: NextRequest, context: { params: Promise<{ id
     while (true) {
       const recipients = await db.user.findMany({ where, select: { id: true }, orderBy: { id: 'asc' }, cursor: cursor ? { id: cursor } : undefined, skip: cursor ? 1 : undefined, take: RECIPIENT_BATCH_SIZE })
       if (!recipients.length) break
-      const created = await db.notification.createMany({ data: recipients.map((recipient) => ({ userId: recipient.id, broadcastId: id, type: 'platform_broadcast', title: broadcast.title, body: broadcast.body })), skipDuplicates: true })
-      deliveredCount += created.count
+      await db.adminBroadcastDelivery.createMany({ data: recipients.map((recipient) => ({ broadcastId: id, userId: recipient.id, status: 'pending' })), skipDuplicates: true })
+      await db.notification.createMany({ data: recipients.map((recipient) => ({ userId: recipient.id, broadcastId: id, type: 'platform_broadcast', title: broadcast.title, body: broadcast.body })), skipDuplicates: true })
+      const delivered = await db.adminBroadcastDelivery.updateMany({ where: { broadcastId: id, userId: { in: recipients.map(recipient => recipient.id) } }, data: { status: 'delivered', deliveredAt: new Date(), attempts: { increment: 1 }, error: null } })
+      deliveredCount += delivered.count
       cursor = recipients[recipients.length - 1]?.id
       if (recipients.length < RECIPIENT_BATCH_SIZE) break
     }
     const published = await db.adminBroadcast.update({ where: { id }, data: { status: 'published', deliveredCount: { increment: deliveredCount } }, select: { id: true, status: true, recipientCount: true, deliveredCount: true } })
     return NextResponse.json({ broadcast: published }, { headers: { 'Cache-Control': 'no-store', 'x-request-id': actor.requestId } })
   } catch {
-    await db.adminBroadcast.update({ where: { id }, data: { status: 'failed' } })
+    const failed = await db.adminBroadcastDelivery.updateMany({ where: { broadcastId: id, status: 'pending' }, data: { status: 'failed', attempts: { increment: 1 }, error: 'Broadcast delivery failed' } }).catch(() => ({ count: 0 }))
+    await db.adminBroadcast.update({ where: { id }, data: { status: 'failed', failedCount: { increment: failed.count } } }).catch(() => undefined)
     return NextResponse.json({ error: 'Broadcast delivery failed' }, { status: 500 })
   }
 }

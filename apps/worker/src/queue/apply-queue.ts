@@ -15,7 +15,7 @@ import { findFormPattern, recordPatternFailure, upsertFormPattern } from "../db/
 import { loadTaskContext } from "../db/load-task-context.js";
 import { AgentHarness } from "../harness/agent-harness.js";
 import type { ApplyTask, HarnessResult } from "../harness/agent-harness.js";
-import { detectFlow } from "../flows/index.js";
+import type { FlowType } from "../flows/index.js";
 import { runGreenhouseFlow } from "../flows/greenhouse-flow.js";
 import { runWorkdayFlow } from '../flows/workday-flow.js'
 import { runLeverFlow } from '../flows/lever-flow.js'
@@ -23,12 +23,17 @@ import { runPersonioFlow } from '../flows/personio-flow.js'
 import { runSmartRecruitersFlow } from '../flows/smartrecruiters-flow.js'
 import { createNotification } from "../notifications/create-notification.js";
 import { notifyApplyResult } from "../notifications/notify-apply-result.js";
+import { purgeTemporaryGeneratedCoverLetters } from "../notifications/purge-cover-letters.js";
 import { shouldUsePattern } from "../patterns/confidence.js";
 import { replayPattern } from "../patterns/replay.js";
 import { unlinkSync } from "node:fs";
-import { claimApplicationTask, completeFillForReview, finishApplicationTask, needsUserTakeover, pauseForFormInput } from "../db/application-task-state.js";
+import { applicationTaskStillActive, claimApplicationTask, completeFillForReview, finishApplicationTask, isUserActive, needsUserTakeover, pauseForFormInput } from "../db/application-task-state.js";
 import { formNeedsMessage, inspectFormReviewNeeds } from "../harness/form-review.js";
 import { workerPollingOptions } from "./worker-polling-options.js";
+import {
+  evaluateUnattendedApplyControl,
+  UNATTENDED_APPLY_UNAVAILABLE_MESSAGE,
+} from "./unattended-apply-control.js";
 
 const redisUrl = process.env.REDIS_URL ?? "redis://localhost:6379";
 export const connection = new Redis(redisUrl, { maxRetriesPerRequest: null });
@@ -57,32 +62,71 @@ export const applyWorker = new Worker<ApplyTaskPayload>(
       // Invalid URL — skip domain check
     }
 
-    // Rate limit check
-    const limit = await checkRateLimit(userId, domain);
-    if (!limit.allowed) {
-      const retryMs = limit.retryAfterMs ?? 60_000;
-      console.warn(
-        `[apply-worker] Rate-limited: user=${userId} domain=${domain}, retry in ${retryMs}ms`
-      );
-      throw new Error(`RATE_LIMITED:${retryMs}`);
-    }
-
     const startedAt = Date.now();
     let resultWritten = false;
     let browserAttemptStarted = false;
     let ctx: Awaited<ReturnType<typeof loadTaskContext>> | null = null;
 
     try {
+      if (!(await isUserActive(getPool(), userId))) {
+        await finishApplicationTask(getPool(), applicationTaskId, "failed", "account_suspended", "Account suspended by an administrator.");
+        console.warn(`[apply-worker] Skipping suspended account for job=${jobId}`);
+        return;
+      }
       if (!applicationTaskId || !operation || !await claimApplicationTask(getPool(), applicationTaskId, userId, jobId)) {
         console.warn(`[apply-worker] Skipping stale or revoked application task for job=${jobId}`);
         return;
       }
+      const initialControl = await evaluateUnattendedApplyControl(getPool(), applyUrl, userId);
+      if (!initialControl.allowed) {
+        await handOffUnavailableUnattendedTask({
+          applicationTaskId,
+          operation,
+          userId,
+          jobId,
+          flow: initialControl.flow,
+          startedAt,
+          jobTitle: null,
+          jobCompany: "Application",
+        });
+        resultWritten = true;
+        return;
+      }
+
+      const limit = await checkRateLimit(userId, domain);
+      if (!limit.allowed) {
+        const retryMs = limit.retryAfterMs ?? 60_000;
+        console.warn(
+          `[apply-worker] Rate-limited: user=${userId} domain=${domain}, retry in ${retryMs}ms`
+        );
+        throw new Error(`RATE_LIMITED:${retryMs}`);
+      }
+
       // Load real persona + job data from DB
       ctx = await loadTaskContext(getPool(), userId, jobId, applyUrl, applicationTaskId);
       const taskCtx = ctx; // non-null const for use inside async callbacks
+      const control = taskCtx.applyUrl === applyUrl
+        ? initialControl
+        : await evaluateUnattendedApplyControl(getPool(), taskCtx.applyUrl, userId);
+      if (!control.allowed) {
+        await handOffUnavailableUnattendedTask({
+          applicationTaskId,
+          operation,
+          userId,
+          jobId,
+          flow: control.flow,
+          startedAt,
+          jobTitle: taskCtx.jobTitle,
+          jobCompany: taskCtx.jobCompany,
+        });
+        resultWritten = true;
+        return;
+      }
+      const flow = control.flow;
 
       await Promise.race([
         withCloakContext(userId, async (page) => {
+        if (!await applicationTaskStillActive(getPool(), applicationTaskId, userId, jobId)) return;
         if (operation === "submit") {
           const submissionClaim = await claimUnattendedSubmission(getPool(), userId, jobId);
           if (submissionClaim === "unavailable") {
@@ -112,6 +156,9 @@ export const applyWorker = new Worker<ApplyTaskPayload>(
           waitUntil: "domcontentloaded",
           timeout: 30_000,
         });
+        if (!isAllowedAtsDestination(page.url(), flow, taskCtx.applyUrl)) {
+          throw new Error("Application page redirected outside the approved ATS origin.");
+        }
 
         const applyTask: ApplyTask = {
           jobId,
@@ -128,10 +175,17 @@ export const applyWorker = new Worker<ApplyTaskPayload>(
           dryRun: dryRun ?? false,
           allowSubmit: operation === "submit",
           confirmedAnswers: taskCtx.confirmedAnswers,
+          ...(operation === "submit" ? {
+            beforeSubmit: async () => {
+              if (await applyQueue.isPaused()) return false;
+              if (!await applicationTaskStillActive(getPool(), applicationTaskId, userId, jobId)) return false;
+              if (!isAllowedAtsDestination(page.url(), flow, taskCtx.applyUrl)) return false;
+              return (await evaluateUnattendedApplyControl(getPool(), taskCtx.applyUrl, userId)).allowed;
+            },
+          } : {}),
         };
 
-        // Detect ATS → use pre-programmed flow if available, else AI fallback
-        const flow = detectFlow(taskCtx.applyUrl);
+        // Use the preflighted ATS flow when available, else AI fallback.
         let harnessResult: HarnessResult | null = null;
         let usedFlow: string | null = flow ? "programmatic" : null;
 
@@ -185,7 +239,7 @@ export const applyWorker = new Worker<ApplyTaskPayload>(
             const pathParts = taskCtx.applyUrl.replace(/^https?:\/\/[^/]+\//, "").split("/");
             const urlPattern = pathParts.slice(0, 2).join("/") + "/";
 
-            const pattern = await findFormPattern(host, urlPattern).catch((e: Error) => {
+            const pattern = await findFormPattern(userId, host, urlPattern).catch((e: Error) => {
               console.warn("[apply-worker] Pattern lookup failed:", e.message);
               return null;
             });
@@ -195,7 +249,7 @@ export const applyWorker = new Worker<ApplyTaskPayload>(
               console.log(
                 `[apply-worker] Pattern cache hit: ${host}/${urlPattern} (confidence=${pattern.successCount}/${attempts})`
               );
-              harnessResult = await replayPattern(page, pattern, applyTask.persona);
+              harnessResult = await replayPattern(page, pattern, applyTask.persona, applyTask.beforeSubmit);
 
               if (harnessResult.status !== "submitted") {
                 await recordPatternFailure(pattern.id).catch((e: Error) =>
@@ -214,7 +268,7 @@ export const applyWorker = new Worker<ApplyTaskPayload>(
                   await incrementBudget(userId).catch((e: Error) =>
                     console.warn("[apply-worker] Budget increment failed:", e.message)
                   );
-                  writeFormPattern(taskCtx.applyUrl, harnessResult);
+                  writeFormPattern(userId, taskCtx.applyUrl, harnessResult);
                 }
               } else {
                 usedFlow = "pattern-cache";
@@ -233,7 +287,7 @@ export const applyWorker = new Worker<ApplyTaskPayload>(
                 await incrementBudget(userId).catch((e: Error) =>
                   console.warn("[apply-worker] Budget increment failed:", e.message)
                 );
-                writeFormPattern(taskCtx.applyUrl, harnessResult);
+                writeFormPattern(userId, taskCtx.applyUrl, harnessResult);
               }
             }
           }
@@ -311,6 +365,13 @@ export const applyWorker = new Worker<ApplyTaskPayload>(
         const newJobStatus = isSubmitted ? 'applied' : 'saved';
         const newWorkflowState = isSubmitted ? 'submitted' : 'ready_to_apply';
 
+        if (isSubmitted) {
+          await purgeTemporaryGeneratedCoverLetters(userId, jobId).catch((error: Error) =>
+            console.warn('[apply-worker] Could not apply cover-letter retention policy:', error.message)
+          )
+        }
+        // Keep the durable job-state write last in this block. The retention
+        // cleanup is best-effort and must not obscure the submission outcome.
         await getPool().query(
           'UPDATE "Job" SET status = $1, "workflowState" = $2, "appliedAt" = CASE WHEN $1 = \'applied\' THEN NOW() ELSE "appliedAt" END, "updatedAt" = NOW() WHERE id = $3 AND "userId" = $4',
           [newJobStatus, newWorkflowState, jobId, userId]
@@ -409,7 +470,47 @@ async function createApplyResultNotification(params: {
   });
 }
 
-function writeFormPattern(applyUrl: string, harnessResult: HarnessResult): void {
+async function handOffUnavailableUnattendedTask(params: {
+  applicationTaskId: string;
+  operation: ApplyTaskPayload["operation"];
+  userId: string;
+  jobId: string;
+  flow: FlowType;
+  startedAt: number;
+  jobTitle: string | null;
+  jobCompany: string;
+}): Promise<void> {
+  await insertApplyResult({
+    userId: params.userId,
+    jobId: params.jobId,
+    status: "manual",
+    mode: "unattended",
+    atsType: params.flow,
+    flowUsed: null,
+    error: UNATTENDED_APPLY_UNAVAILABLE_MESSAGE,
+    durationMs: Date.now() - params.startedAt,
+  });
+  await getPool().query(
+    'UPDATE "Job" SET status = $1, "workflowState" = $2, "updatedAt" = NOW() WHERE id = $3 AND "userId" = $4',
+    ["saved", "ready_to_apply", params.jobId, params.userId],
+  );
+  await finishApplicationTask(
+    getPool(),
+    params.applicationTaskId,
+    params.operation === "submit" ? "waiting_for_authorization" : "waiting_for_user",
+    params.operation === "submit" ? "form_filled" : "materials_ready",
+    UNATTENDED_APPLY_UNAVAILABLE_MESSAGE,
+  );
+  createApplyResultNotification({
+    userId: params.userId,
+    jobId: params.jobId,
+    jobTitle: params.jobTitle,
+    jobCompany: params.jobCompany,
+    status: "manual",
+  }).catch((error: Error) => console.warn("[notify] in-app notification failed:", error.message));
+}
+
+function writeFormPattern(userId: string, applyUrl: string, harnessResult: HarnessResult): void {
   if (!harnessResult.fieldMappings || Object.keys(harnessResult.fieldMappings).length === 0) {
     return;
   }
@@ -420,10 +521,28 @@ function writeFormPattern(applyUrl: string, harnessResult: HarnessResult): void 
   const urlPattern = pathParts.slice(0, 2).join("/") + "/";
 
   upsertFormPattern({
+    userId,
     atsHost: host,
     urlPattern,
     fieldMapping: harnessResult.fieldMappings,
   }).catch((e: Error) => console.warn("[apply-worker] Pattern write failed:", e.message));
+}
+
+function isAllowedAtsDestination(rawUrl: string, flow: FlowType | null, approvedUrl: string): boolean {
+  try {
+    const url = new URL(rawUrl);
+    if (url.protocol !== "https:") return false;
+    const host = url.hostname.toLowerCase();
+    if (flow === "greenhouse") return host === "boards.greenhouse.io" || host.endsWith(".greenhouse.io");
+    if (flow === "lever") return host === "jobs.lever.co" || host === "jobs.eu.lever.co" || host === "app.lever.co";
+    if (flow === "workday") return host.endsWith(".myworkdayjobs.com");
+    if (flow === "smartrecruiters") return host === "jobs.smartrecruiters.com" || host === "careers.smartrecruiters.com";
+    if (flow === "personio") return host.endsWith(".jobs.personio.com");
+    if (flow !== null) return false;
+    return url.origin === new URL(approvedUrl).origin;
+  } catch {
+    return false;
+  }
 }
 
 function notificationTypeForStatus(

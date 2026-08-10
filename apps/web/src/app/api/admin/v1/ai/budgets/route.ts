@@ -3,6 +3,7 @@ import { isAdminResponse, requireAdmin } from '@/lib/admin/authorization'
 import { writeAdminAudit } from '@/lib/admin/audit'
 import { adminPageLimit, pageResult } from '@/lib/admin/pagination'
 import { db } from '@/lib/db'
+import type { Prisma } from '@prisma/client'
 
 export async function GET(request: NextRequest) {
   const actor = await requireAdmin('ai_budget.read', request)
@@ -10,9 +11,12 @@ export async function GET(request: NextRequest) {
   const params = new URL(request.url).searchParams
   const limit = adminPageLimit(params.get('limit'))
   const cursor = params.get('cursor')
+  const sort = params.get('sort')
+  const direction = params.get('direction') === 'desc' ? 'desc' : 'asc'
+  const orderBy: Prisma.AiBudgetOrderByWithRelationInput = sort === 'updatedAt' ? { updatedAt: direction } : sort === 'used' ? { used: direction } : sort === 'limit' ? { limit: direction } : { id: 'asc' }
   const rows = await db.aiBudget.findMany({
     select: { id: true, userId: true, month: true, used: true, limit: true, updatedAt: true },
-    orderBy: { id: 'asc' }, cursor: cursor ? { id: cursor } : undefined, skip: cursor ? 1 : undefined, take: limit + 1,
+    orderBy, cursor: cursor ? { id: cursor } : undefined, skip: cursor ? 1 : undefined, take: limit + 1,
   })
   await writeAdminAudit({ requestId: actor.requestId, actorUserId: actor.userId, actorRoleKey: actor.roleKey, action: 'ai_budget.list_viewed', outcome: 'success' })
   return NextResponse.json(pageResult(rows.map((row) => ({ ...row, remaining: Math.max(row.limit - row.used, 0) })), limit), { headers: { 'Cache-Control': 'no-store', 'x-request-id': actor.requestId } })

@@ -17,6 +17,7 @@ describe("createNotification", () => {
   it("inserts an apply result notification row", async () => {
     const { createNotification } = await import("./create-notification.js");
 
+    mocks.query.mockResolvedValueOnce({ rows: [{ preferences: {} }] });
     await createNotification("user-1", {
       type: "apply_submitted",
       title: "Example submitted",
@@ -24,9 +25,35 @@ describe("createNotification", () => {
       jobId: "job-1",
     });
 
-    expect(mocks.query).toHaveBeenCalledWith(
+    expect(mocks.query).toHaveBeenLastCalledWith(
       expect.stringContaining("INSERT INTO notifications"),
       ["user-1", "apply_submitted", "Example submitted", "Software Engineer", "job-1"]
     );
+  });
+
+  it("does not insert an apply notification when the user disabled it", async () => {
+    const { createNotification } = await import("./create-notification.js");
+    mocks.query.mockResolvedValueOnce({ rows: [{ preferences: { notificationPreferences: { apply: false } } }] });
+
+    await createNotification("user-1", {
+      type: "apply_submitted",
+      title: "Example submitted",
+    });
+
+    expect(mocks.query).toHaveBeenCalledTimes(1);
+    expect(mocks.query.mock.calls[0][0]).not.toContain("INSERT INTO notifications");
+  });
+
+  it("uses the apply preference for failed application attempts", async () => {
+    const { createNotification } = await import("./create-notification.js");
+    mocks.query.mockResolvedValueOnce({ rows: [{ preferences: { notificationPreferences: { apply: false, reject: true } } }] });
+
+    await createNotification("user-1", {
+      type: "apply_failed",
+      title: "Example failed",
+    });
+
+    expect(mocks.query).toHaveBeenCalledTimes(1);
+    expect(mocks.query.mock.calls[0][0]).not.toContain("INSERT INTO notifications");
   });
 });

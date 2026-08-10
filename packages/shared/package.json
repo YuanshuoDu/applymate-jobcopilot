@@ -13,9 +13,34 @@
     "./llm": {
       "types": "./dist/llm.d.ts",
       "default": "./dist/llm.js"
+    },
+    "./ats-url": {
+      "types": "./dist/ats-url.d.ts",
+      "default": "./dist/ats-url.js"
+    },
+    "./feature-flags": {
+      "types": "./dist/feature-flags.d.ts",
+      "default": "./dist/feature-flags.js"
+    },
+    "./safe-ai-endpoint": {
+      "types": "./dist/safe-ai-endpoint.d.ts",
+      "default": "./dist/safe-ai-endpoint.js"
+    },
+    "./pinned-outbound": {
+      "types": "./dist/pinned-outbound.d.ts",
+      "default": "./dist/pinned-outbound.js"
+    },
+    "./secret-crypto": {
+      "types": "./dist/secret-crypto.d.ts",
+      "default": "./dist/secret-crypto.js"
+    },
+    "./secret-crypto-client": {
+      "types": "./dist/secret-crypto-client.d.ts",
+      "default": "./dist/secret-crypto-client.js"
     }
   },
   "dependencies": {
+    "@aws-sdk/client-kms": "^3.879.0",
     "pg": "^8.16.3"
   },
   "scripts": {

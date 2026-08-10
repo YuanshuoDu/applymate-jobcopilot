@@ -23,6 +23,22 @@ function checkRateLimit(key: string): boolean {
   return true
 }
 
+function isTrustedExtensionSender(sender: chrome.runtime.MessageSender): boolean {
+  return sender.id === chrome.runtime.id
+}
+
+function isAllowedJobPageUrl(rawUrl: string | undefined): boolean {
+  if (!rawUrl) return false
+  try {
+    const url = new URL(rawUrl)
+    if (url.protocol !== 'http:' && url.protocol !== 'https:') return false
+    // Content scripts support employer career pages beyond the curated source
+    // list. The extension boundary already verifies the sender; here only
+    // reject browser-internal pages and credential-bearing URLs.
+    return !url.username && !url.password
+  } catch { return false }
+}
+
 // Clean up rate limit map periodically to prevent memory leaks
 setInterval(() => {
   const now = Date.now()
@@ -179,6 +195,10 @@ async function handleMessage(
   msg: ExtMessage,
   sender: chrome.runtime.MessageSender,
 ): Promise<unknown> {
+  if (!isTrustedExtensionSender(sender)) return { error: 'Unauthorized sender' }
+  if (msg.type === 'SAVE_JOB' && sender.tab && !isAllowedJobPageUrl(sender.tab.url)) {
+    return { type: 'SAVE_JOB_RESULT', success: false, error: 'Saving is only available on supported job pages.' }
+  }
   let settings = await getSettings()
 
   // The Dashboard owns the API endpoint and token. A job-site message (for

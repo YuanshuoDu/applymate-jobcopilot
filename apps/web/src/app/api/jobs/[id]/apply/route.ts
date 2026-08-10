@@ -6,6 +6,8 @@
 import { NextRequest }                          from 'next/server'
 import { db }                                    from '@/lib/db'
 import { requireAuth, isErrorResponse, ok, err } from '@/lib/api-helpers'
+import { purgeTemporaryGeneratedCoverLetters } from '@/lib/cover-letter-retention'
+import { checkEntitlementLimit } from '@/lib/entitlements'
 
 export async function POST(
   req: NextRequest,
@@ -17,6 +19,13 @@ export async function POST(
   const { id } = await params
   const job = await db.job.findFirst({ where: { id, userId: auth.userId } })
   if (!job) return err('Job not found', 404)
+
+  const monthStart = new Date()
+  monthStart.setUTCDate(1)
+  monthStart.setUTCHours(0, 0, 0, 0)
+  const usage = await db.job.count({ where: { userId: auth.userId, status: 'applied', appliedAt: { gte: monthStart } } })
+  const quota = await checkEntitlementLimit(auth.userId, 'applications', usage)
+  if (!quota.allowed) return err(quota.reason === 'limit_reached' ? 'Your monthly application limit has been reached.' : 'Your current plan does not include manual applications.', 403)
 
   await db.job.update({
     where: { id },
@@ -32,6 +41,7 @@ export async function POST(
       color:  '#059669',
     },
   })
+  await purgeTemporaryGeneratedCoverLetters(auth.userId, id).catch(() => undefined)
 
   return ok({ applied: true })
 }

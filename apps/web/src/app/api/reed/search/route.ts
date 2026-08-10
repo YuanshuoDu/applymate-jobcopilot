@@ -17,6 +17,7 @@
  *   postedByDirect 0|1     — 1 = direct employers only
  */
 import { NextRequest } from 'next/server'
+import { pinnedFetch } from '@jobcopilot/shared'
 import { requireAuth, isErrorResponse, ok, err } from '@/lib/api-helpers'
 import { truncate } from '@/lib/utils'
 
@@ -24,7 +25,7 @@ const BASE      = 'https://www.reed.co.uk/api/1.0/search'
 const PAGE_SIZE = 20
 
 export async function GET(req: NextRequest) {
-  const auth = await requireAuth(req)
+  const auth = await requireAuth(req, 'job_discovery')
   if (isErrorResponse(auth)) return auth
 
   const reedKey = process.env.REED_API_KEY
@@ -64,7 +65,7 @@ export async function GET(req: NextRequest) {
 
   let raw: Response
   try {
-    raw = await fetch(`${BASE}?${params}`, {
+    raw = await pinnedFetch(`${BASE}?${params}`, {
       headers: { Authorization: `Basic ${credentials}` },
       cache: 'no-store',
     })

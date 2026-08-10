@@ -10,6 +10,7 @@ const mocks = vi.hoisted(() => ({
   coverLetterCreate: vi.fn(),
   coverLetterUpdate: vi.fn(),
   modelChat: vi.fn(),
+  hasEffectiveEntitlement: vi.fn(),
 }))
 
 vi.mock('@/lib/api-helpers', () => ({
@@ -29,11 +30,13 @@ vi.mock('@/lib/model-router', () => ({
   withMiniMaxThinking: (config: { provider: string; model: string }, thinking: 'adaptive' | 'disabled') =>
     config.provider === 'minimax' && config.model === 'MiniMax-M3' ? { ...config, thinking } : config,
 }))
+vi.mock('@/lib/entitlements', () => ({ hasEffectiveEntitlement: mocks.hasEffectiveEntitlement }))
 
 describe('cover letter generation after an audit failure', () => {
   beforeEach(() => {
     vi.clearAllMocks()
     mocks.prepareAiRoute.mockResolvedValue({ userId: 'user_1', cfg: { provider: 'minimax', model: 'MiniMax-M3', thinking: 'adaptive' } })
+    mocks.hasEffectiveEntitlement.mockResolvedValue(true)
     mocks.jobFindFirst.mockResolvedValue({ id: 'job_1', role: 'Engineer', company: 'Acme', description: 'Build resilient systems.', finalResumeId: null })
     mocks.resumeFindFirst.mockResolvedValue({ id: 'resume_1', content: { contact: { name: 'Ada' }, summary: 'Engineer', experience: [], skills: ['TypeScript'] }, templateId: 'clean', templateOptions: null })
     mocks.agentRoleFindFirst.mockResolvedValue(null)
@@ -57,6 +60,32 @@ describe('cover letter generation after an audit failure', () => {
     expect(mocks.modelChat.mock.calls[0][0][1].content).toContain('AUDIT REPAIR NOTES')
     expect(mocks.modelChat.mock.calls[0][0][1].content).toContain('Remove the metric or cite supported evidence.')
     expect(mocks.modelChat.mock.calls[0][1]).toMatchObject({ model: 'MiniMax-M3', thinking: 'disabled' })
+  })
+
+  it('keeps the feature-level model when the Writer role is the keyless platform default', async () => {
+    const settingsCfg = { provider: 'openai', model: 'gpt-4o', apiKey: 'user-openai-key' }
+    mocks.prepareAiRoute.mockResolvedValue({ userId: 'user_1', cfg: settingsCfg })
+    mocks.agentRoleFindFirst.mockResolvedValue({
+      enabled: true,
+      provider: 'minimax',
+      model: 'MiniMax-M3',
+      apiKey: null,
+      systemPrompt: 'Custom writer prompt',
+    })
+
+    const { POST } = await import('./route')
+    const response = await POST(new NextRequest('http://localhost/api/jobs/job_1/cover-letters/generate', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ resumeId: 'resume_1', preferProvidedResume: true }),
+    }) as never, { params: Promise.resolve({ id: 'job_1' }) })
+
+    if (!response) throw new Error('Expected a response')
+    expect(response.status).toBe(201)
+    expect(mocks.modelChat).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining(settingsCfg),
+      4096,
+    )
   })
 
   it('repairs an existing cover letter in place and preserves its supported wording', async () => {

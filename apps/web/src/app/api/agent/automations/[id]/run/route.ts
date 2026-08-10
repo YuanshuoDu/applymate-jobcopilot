@@ -4,6 +4,7 @@ import { err, isErrorResponse, ok, requireAuth } from "@/lib/api-helpers"
 import { nextRunAfterCurrent } from "@/lib/agent/automation-schedule"
 import { enqueueAgentRun } from "@/lib/agent-run-queue-client"
 import { ensureAgentExecution } from "@/lib/agent/execution-control"
+import { hasEffectiveEntitlement } from '@/lib/entitlements'
 
 type RouteCtx = { params: Promise<{ id: string }> }
 
@@ -75,6 +76,7 @@ function automationPayload(automation: AutomationForRun) {
 export async function POST(req: NextRequest, ctx: RouteCtx) {
   const auth = await requireAuth(req)
   if (isErrorResponse(auth)) return auth
+  if (!await hasEffectiveEntitlement(auth.userId, 'auto_apply')) return err('Your current plan does not include autonomous applications.', 403)
 
   const { id } = await ctx.params
   const automation = await db.agentAutomation.findFirst({

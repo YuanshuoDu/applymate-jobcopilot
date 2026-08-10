@@ -43,7 +43,9 @@ COPY --from=builder /app/packages/shared/dist packages/shared/dist/
 ENV CLOAK_MAX_WORKERS=1
 ENV CLOAK_PROFILES_DIR=/data/cloak-profiles
 
-RUN mkdir -p /data/cloak-profiles
+RUN mkdir -p /data/cloak-profiles && chown -R node:node /app /data
 VOLUME ["/data"]
+
+USER node
 
 CMD ["node", "apps/worker/dist/index.js"]

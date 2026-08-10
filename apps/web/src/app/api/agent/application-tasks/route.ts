@@ -32,23 +32,22 @@ export async function DELETE(req: NextRequest) {
   })
   if (!task) return err("Application task not found", 404)
   if (["submitted", "skipped", "cancelled"].includes(task.status)) return err("This application task cannot be cancelled", 409)
-  const cancellation: Array<Prisma.PrismaPromise<unknown>> = [
-    db.applicationTask.update({ where: { id }, data: { status: "cancelled", checkpoint: "cancelled_by_user", completedAt: new Date() } }),
-    db.applicationTaskEvent.create({ data: { taskId: id, type: "cancelled", actor: "user", body: "User cancelled the application task." } }),
-  ]
-  if (task.sessionId) {
-    cancellation.push(db.agentApproval.updateMany({
-      where: {
-        sessionId: task.sessionId,
-        userId: auth.userId,
-        type: "submit_application",
-        status: "pending",
-        payload: { path: ["applicationTaskId"], equals: id },
-      },
-      data: { status: "cancelled", decidedAt: new Date() },
-    }))
-  }
-  await db.$transaction(cancellation)
+  await db.$transaction(async tx => {
+    await tx.applicationTask.update({ where: { id }, data: { status: "cancelled", checkpoint: "cancelled_by_user", completedAt: new Date() } })
+    await tx.applicationTaskEvent.create({ data: { taskId: id, type: "cancelled", actor: "user", body: "User cancelled the application task." } })
+    if (task.sessionId) {
+      await tx.agentApproval.updateMany({
+        where: {
+          sessionId: task.sessionId,
+          userId: auth.userId,
+          type: "submit_application",
+          status: "pending",
+          payload: { path: ["applicationTaskId"], equals: id },
+        },
+        data: { status: "cancelled", decidedAt: new Date() },
+      })
+    }
+  })
   return ok({ cancelled: true })
 }
 
@@ -71,10 +70,10 @@ export async function PATCH(req: NextRequest) {
     const existing = task.confirmedAnswers && typeof task.confirmedAnswers === "object" && !Array.isArray(task.confirmedAnswers)
       ? task.confirmedAnswers as Record<string, string>
       : {}
-    await db.$transaction([
-      db.applicationTask.update({ where: { id: task.id }, data: { confirmedAnswers: { ...existing, ...answers } as Prisma.InputJsonValue } }),
-      db.applicationTaskEvent.create({ data: { taskId: task.id, type: "user_answers_confirmed", actor: "user", body: "Candidate explicitly confirmed application-specific form answers.", data: answers as Prisma.InputJsonValue } }),
-    ])
+    await db.$transaction(async tx => {
+      await tx.applicationTask.update({ where: { id: task.id }, data: { confirmedAnswers: { ...existing, ...answers } as Prisma.InputJsonValue } })
+      await tx.applicationTaskEvent.create({ data: { taskId: task.id, type: "user_answers_confirmed", actor: "user", body: "Candidate explicitly confirmed application-specific form answers.", data: answers as Prisma.InputJsonValue } })
+    })
   }
   try {
     const queued = await queueApplicationFill({ userId: auth.userId, jobId: task.job.id, applyUrl: task.job.url, applicationTaskId: task.id, resumeAfterUserInput: true })

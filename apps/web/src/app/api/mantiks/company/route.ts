@@ -13,6 +13,7 @@
  *   datePosted string   — today | week | month (default: month)
  */
 import { NextRequest } from 'next/server'
+import { pinnedFetch } from '@jobcopilot/shared'
 import { requireAuth, isErrorResponse, ok, err } from '@/lib/api-helpers'
 import { truncate } from '@/lib/utils'
 
@@ -47,7 +48,7 @@ export async function GET(req: NextRequest) {
 
   let raw: Response
   try {
-    raw = await fetch(`${BASE}/company/jobs?${params}`, {
+    raw = await pinnedFetch(`${BASE}/company/jobs?${params}`, {
       headers: { 'X-API-KEY': apiKey },
       cache: 'no-store',
     })

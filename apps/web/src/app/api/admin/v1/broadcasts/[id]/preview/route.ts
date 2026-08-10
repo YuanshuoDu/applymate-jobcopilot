@@ -1,11 +1,14 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { isAdminResponse, requireAdmin } from '@/lib/admin/authorization'
 import { writeAdminAudit } from '@/lib/admin/audit'
+import { validateAdminWrite } from '@/lib/admin/csrf'
 import { runAdminMutation } from '@/lib/admin/write-transaction'
 import { audienceWhere, storedAudience } from '@/lib/admin/broadcast-service'
 import { db } from '@/lib/db'
 
 export async function POST(request: NextRequest, context: { params: Promise<{ id: string }> }) {
+  const writeError = validateAdminWrite(request)
+  if (writeError) return writeError
   const actor = await requireAdmin('broadcasts.preview', request)
   if (isAdminResponse(actor)) return actor
   const { id } = await context.params

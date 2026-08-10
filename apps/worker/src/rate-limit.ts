@@ -8,15 +8,21 @@ const MAX_PER_DOMAIN_4H = 5;
 const HOUR_SECONDS = 60 * 60;
 const FOUR_HOURS_SECONDS = 4 * HOUR_SECONDS;
 
+const incrementWithExpiry = `
+local count = redis.call('INCR', KEYS[1])
+if count == 1 then
+  redis.call('EXPIRE', KEYS[1], ARGV[1])
+end
+return count
+`;
+
 async function checkRedisLimit(
   key: string,
   max: number,
   windowSeconds: number
 ): Promise<RateLimitResult> {
-  const count = await redis.incr(key);
-  if (count === 1) {
-    await redis.expire(key, windowSeconds);
-  }
+  const count = await redis.eval(incrementWithExpiry, 1, key, windowSeconds);
+  if (typeof count !== "number") throw new Error("Unexpected Redis counter response");
 
   if (count > max) {
     const ttl = await redis.ttl(key);

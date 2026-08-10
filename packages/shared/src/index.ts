@@ -4,7 +4,28 @@
 // from this package. Worker cannot import apps/web/src/lib/model-router.ts
 // (Prisma dependency) — this shared package is the isolation layer.
 export type { AiConfig, ChatMessage, ChatResult, Provider } from "./llm.js";
-export { callLlm, callLlmText, loadWorkerAiConfig, closeSharedPool } from "./llm.js";
+export { callLlm, callLlmText, loadWorkerAiConfig, resolveWorkerAiConfig, closeSharedPool } from "./llm.js";
+export {
+  ATS_POLICIES,
+  getDefaultAtsPolicy,
+  getHardRpsLimit,
+  isAtsSourceKey,
+  type DefaultAtsPolicy,
+  type AtsSourceKey,
+} from "./ats-policy.js";
+export { detectAtsSource } from "./ats-url.js";
+export { isSafeAiEndpoint } from "./safe-ai-endpoint.js";
+export { credentialContext, decryptSecret, encryptSecret, isEncryptedSecret, maskStoredSecret } from "./secret-crypto.js";
+export { pinnedFetch, validatePinnedUrl, type PinnedFetchOptions } from "./pinned-outbound.js";
+export {
+  evaluateManagedFeature,
+  isManagedFeatureKey,
+  MANAGED_FEATURES,
+  platformEnvironment,
+  type ManagedFeatureKey,
+  type ManagedFeatureOverride,
+  type PlatformEnvironment,
+} from "./feature-flags.js";
 
 /** Job payload pushed to the apply-tasks queue */
 export interface ApplyTaskPayload {

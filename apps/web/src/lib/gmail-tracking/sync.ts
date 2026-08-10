@@ -6,6 +6,9 @@ import { fetchRecentGmailMessages, type GmailRemoteMessage } from './gmail-clien
 import { activityTypeForGmailMessage, canApplyGmailStatus, gmailEventLabel, statusForGmailMessage } from './lifecycle'
 import { findConfidentGmailJobMatch, type GmailMatchableJob } from './matching'
 import { extractInterviewSchedule } from './interview-schedule'
+import { readNotificationPreferences } from '@/lib/settings-preferences'
+import type { NotificationPreferences } from '@/lib/types'
+import { purgeTemporaryGeneratedCoverLetters } from '@/lib/cover-letter-retention'
 
 export interface GmailSyncResult {
   connected: boolean
@@ -29,6 +32,9 @@ export async function syncGmailForUser(userId: string, now = new Date()): Promis
   const accessToken = await getGoogleAccessToken(userId).catch(() => null)
   if (!accessToken) return EMPTY_RESULT
 
+  const user = await db.user.findUnique({ where: { id: userId }, select: { preferences: true } }).catch(() => null)
+  const notificationPreferences = readNotificationPreferences(user?.preferences)
+
   const syncState = await db.gmailSyncState.upsert({
     where: { userId },
     create: { userId },
@@ -51,7 +57,7 @@ export async function syncGmailForUser(userId: string, now = new Date()): Promis
     const result: GmailSyncResult = { ...EMPTY_RESULT, connected: true }
 
     for (const message of orderedMessages) {
-      const processed = await processMessage(userId, message, jobs, now)
+      const processed = await processMessage(userId, message, jobs, now, notificationPreferences)
       result.importedMessages += processed.imported ? 1 : 0
       result.matchedMessages += processed.matched ? 1 : 0
       result.statusUpdates += processed.statusUpdated ? 1 : 0
@@ -76,6 +82,7 @@ async function processMessage(
   message: GmailRemoteMessage,
   jobs: Array<GmailMatchableJob & { appliedAt: Date | null }>,
   now: Date,
+  notificationPreferences: NotificationPreferences,
 ) {
   const existing = await db.gmailMessage.findUnique({
     where: { userId_gmailMessageId: { userId, gmailMessageId: message.id } },
@@ -109,7 +116,7 @@ async function processMessage(
     : 0
   if (!match) return { imported: true, matched: false, statusUpdated: false, recommendations }
 
-  const statusUpdated = await projectLinkedMessage(userId, match.job, message, kind)
+  const statusUpdated = await projectLinkedMessage(userId, match.job, message, kind, notificationPreferences)
   return { imported: true, matched: true, statusUpdated, recommendations }
 }
 
@@ -187,6 +194,7 @@ async function projectLinkedMessage(
   job: GmailMatchableJob & { appliedAt: Date | null },
   message: GmailRemoteMessage,
   kind: GmailMessageKind,
+  notificationPreferences: NotificationPreferences,
 ): Promise<boolean> {
   const nextStatus = statusForGmailMessage(kind)
   const statusUpdated = Boolean(nextStatus && canApplyGmailStatus(job.status, nextStatus))
@@ -201,6 +209,7 @@ async function projectLinkedMessage(
     })
     job.status = nextStatus
     if (nextStatus === 'applied' && !job.appliedAt) job.appliedAt = message.receivedAt
+    if (nextStatus === 'applied') await purgeTemporaryGeneratedCoverLetters(userId, job.id).catch(() => undefined)
   }
 
   await db.activity.create({
@@ -212,11 +221,26 @@ async function projectLinkedMessage(
       color: colorForGmailKind(kind),
     },
   })
-  if (statusUpdated) await createStatusNotification(userId, job.id, job.company, job.role, kind)
+  if (statusUpdated) await createStatusNotification(userId, job.id, job.company, job.role, kind, notificationPreferences)
   return statusUpdated
 }
 
-async function createStatusNotification(userId: string, jobId: string, company: string, role: string, kind: GmailMessageKind) {
+function gmailPreferenceKey(kind: GmailMessageKind): keyof NotificationPreferences {
+  if (kind === 'rejection') return 'reject'
+  if (kind === 'interview_invitation') return 'interview'
+  if (kind === 'offer') return 'offer'
+  return 'apply'
+}
+
+async function createStatusNotification(
+  userId: string,
+  jobId: string,
+  company: string,
+  role: string,
+  kind: GmailMessageKind,
+  notificationPreferences: NotificationPreferences,
+) {
+  if (!notificationPreferences[gmailPreferenceKey(kind)]) return
   await db.notification.create({
     data: {
       userId,

@@ -4,6 +4,7 @@ import { err, ok } from "@/lib/api-helpers"
 import { nextRunAfterCurrent } from "@/lib/agent/automation-schedule"
 import { enqueueAgentRun } from "@/lib/agent-run-queue-client"
 import { ensureAgentExecution } from "@/lib/agent/execution-control"
+import { hasEffectiveEntitlement } from '@/lib/entitlements'
 
 type AutomationForRun = {
   id: string
@@ -42,7 +43,7 @@ function automationPayload(automation: AutomationForRun) {
 
 async function startAutomation(automation: AutomationForRun, now: Date) {
   const claimed = await db.agentAutomation.updateMany({
-    where: { id: automation.id, userId: automation.userId, enabled: true, nextRunAt: { lte: now } },
+    where: { id: automation.id, userId: automation.userId, enabled: true, nextRunAt: { lte: now }, user: { accountStatus: 'active' } },
     data: {
       lastRunAt: now,
       nextRunAt: nextRunAfterCurrent(automation.cron, now, automation.timezone),
@@ -114,13 +115,14 @@ async function runDueAutomations(req: NextRequest) {
 
   const now = new Date()
   const automations = await db.agentAutomation.findMany({
-    where: { enabled: true, nextRunAt: { lte: now } },
+    where: { enabled: true, nextRunAt: { lte: now }, user: { accountStatus: 'active' } },
     orderBy: { nextRunAt: "asc" },
     take: 20,
   }) as AutomationForRun[]
 
   const started = []
   for (const automation of automations) {
+    if (!await hasEffectiveEntitlement(automation.userId, 'auto_apply')) continue
     const result = await startAutomation(automation, now)
     if (result) started.push(result)
   }

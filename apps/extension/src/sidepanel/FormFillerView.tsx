@@ -429,7 +429,7 @@ export function FormFillerView({ settings, pendingFields, onFieldsConsumed, scan
       const empty = formFields.filter(f => !f.currentValue?.trim())
       console.log('[FormFiller] Pre-fill split:', prefilled.length, 'prefilled,', empty.length, 'empty → match/ai')
       if (prefilled.length > 0) {
-        console.log('[FormFiller] Pre-filled fields:', prefilled.map(f => f.label + '=' + f.currentValue?.slice(0, 30)).join(', '))
+        console.log('[FormFiller] Pre-filled fields:', prefilled.map(f => f.label).join(', '))
       }
       const prefilledFields: FilledField[] = prefilled.map(f => ({
         fieldId: f.id,

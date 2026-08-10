@@ -11,6 +11,7 @@
  *   GMAIL_ERROR         — other Gmail API error
  */
 import { NextRequest } from 'next/server'
+import { pinnedFetch } from '@jobcopilot/shared'
 import { requireAuth, isErrorResponse, ok, err } from '@/lib/api-helpers'
 import { findGmailConnection, getGoogleAccessToken, classifyEmail } from '@/lib/gmail-helpers'
 
@@ -43,7 +44,7 @@ export async function GET(req: NextRequest) {
     const q = encodeURIComponent(
       'subject:(application OR interview OR offer OR "thank you for applying" OR "your application" OR "position" OR "candidacy" OR "hiring" OR "opportunity") -from:me'
     )
-    const listRes = await fetch(
+    const listRes = await pinnedFetch(
       `https://gmail.googleapis.com/gmail/v1/users/me/messages?maxResults=25&q=${q}`,
       { headers: { Authorization: `Bearer ${accessToken}` } }
     )
@@ -74,7 +75,7 @@ export async function GET(req: NextRequest) {
     // 4. Fetch metadata for each message (parallel)
     const details = await Promise.allSettled(
       messages.slice(0, 20).map(msg =>
-        fetch(
+        pinnedFetch(
           `https://gmail.googleapis.com/gmail/v1/users/me/messages/${msg.id}?format=metadata` +
           `&metadataHeaders=From&metadataHeaders=Subject&metadataHeaders=Date`,
           { headers: { Authorization: `Bearer ${accessToken}` } }

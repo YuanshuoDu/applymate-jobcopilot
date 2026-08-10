@@ -2,7 +2,10 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const mocks = vi.hoisted(() => ({
   workerHandler: undefined as undefined | ((job: { data: Record<string, unknown> }) => Promise<void>),
-  fakePage: { goto: vi.fn().mockResolvedValue(undefined) },
+  fakePage: {
+    goto: vi.fn().mockResolvedValue(undefined),
+    url: vi.fn().mockReturnValue("https://jobs.example/apply"),
+  },
   checkRateLimit: vi.fn().mockResolvedValue({ allowed: true }),
   withCloakContext: vi.fn(),
   insertApplyResult: vi.fn().mockResolvedValue(1),
@@ -14,11 +17,16 @@ const mocks = vi.hoisted(() => ({
   runGreenhouseFlow: vi.fn(),
   runSmartRecruitersFlow: vi.fn(),
   claimApplicationTask: vi.fn().mockResolvedValue(true),
+  isUserActive: vi.fn().mockResolvedValue(true),
   completeFillForReview: vi.fn().mockResolvedValue(true),
   finishApplicationTask: vi.fn().mockResolvedValue(undefined),
   pauseForFormInput: vi.fn().mockResolvedValue(undefined),
+  applicationTaskStillActive: vi.fn().mockResolvedValue(true),
   createNotification: vi.fn().mockResolvedValue(undefined),
   notifyApplyResult: vi.fn().mockResolvedValue(undefined),
+  runtimeFeatureEnabled: vi.fn().mockResolvedValue(true),
+  loadAtsPolicy: vi.fn(),
+  canUseAtsSource: vi.fn().mockReturnValue(true),
 }));
 
 vi.mock("bullmq", () => ({
@@ -79,11 +87,20 @@ vi.mock("../notifications/create-notification.js", () => ({
 }));
 vi.mock("../patterns/confidence.js", () => ({ shouldUsePattern: vi.fn(() => false) }));
 vi.mock("../patterns/replay.js", () => ({ replayPattern: vi.fn() }));
+vi.mock("../admin/runtime-feature-flags.js", () => ({
+  isWorkerFeatureEnabled: mocks.runtimeFeatureEnabled,
+}));
+vi.mock("../admin/ats-policy.js", () => ({
+  loadEffectiveAtsPolicy: mocks.loadAtsPolicy,
+  canUseAtsSource: mocks.canUseAtsSource,
+}));
 vi.mock("../db/application-task-state.js", () => ({
   claimApplicationTask: mocks.claimApplicationTask,
   completeFillForReview: mocks.completeFillForReview,
   finishApplicationTask: mocks.finishApplicationTask,
+  isUserActive: mocks.isUserActive,
   pauseForFormInput: mocks.pauseForFormInput,
+  applicationTaskStillActive: mocks.applicationTaskStillActive,
   needsUserTakeover: vi.fn(() => false),
 }));
 vi.mock("node:fs", () => ({ unlinkSync: vi.fn() }));
@@ -105,6 +122,7 @@ describe("apply-queue CAPTCHA handling", () => {
     vi.clearAllMocks();
     mocks.workerHandler = undefined;
     mocks.fakePage.goto.mockResolvedValue(undefined);
+    mocks.fakePage.url.mockReturnValue(payload.applyUrl);
     mocks.withCloakContext.mockImplementation(async (_userId: string, fn: (page: typeof mocks.fakePage) => Promise<void>) => {
       await fn(mocks.fakePage);
     });
@@ -120,6 +138,9 @@ describe("apply-queue CAPTCHA handling", () => {
     mocks.detectCaptcha.mockResolvedValue(false);
     mocks.solveCaptcha.mockResolvedValue(false);
     mocks.detectFlow.mockReturnValue(null);
+    mocks.runtimeFeatureEnabled.mockResolvedValue(true);
+    mocks.loadAtsPolicy.mockResolvedValue({ configured: true, version: 1, allowAutoApply: true });
+    mocks.canUseAtsSource.mockReturnValue(true);
     mocks.runGreenhouseFlow.mockResolvedValue({ status: "submitted", durationMs: 1 });
     mocks.runSmartRecruitersFlow.mockResolvedValue({ status: "submitted", durationMs: 1 });
     await import("./apply-queue.js");
@@ -154,6 +175,7 @@ describe("apply-queue CAPTCHA handling", () => {
 
   it("uses the Greenhouse flow when no human-handoff condition is found", async () => {
     mocks.detectFlow.mockReturnValueOnce("greenhouse");
+    mocks.fakePage.url.mockReturnValue("https://boards.greenhouse.io/example/jobs/123/apply");
 
     await expect(mocks.workerHandler?.({ data: payload })).resolves.toBeUndefined();
 
@@ -176,6 +198,7 @@ describe("apply-queue CAPTCHA handling", () => {
 
   it("uses the SmartRecruiters flow instead of the generic fallback", async () => {
     mocks.detectFlow.mockReturnValueOnce("smartrecruiters");
+    mocks.fakePage.url.mockReturnValue("https://jobs.smartrecruiters.com/Example/123");
 
     await expect(mocks.workerHandler?.({ data: payload })).resolves.toBeUndefined();
 

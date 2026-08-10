@@ -829,6 +829,7 @@ function injectLazySaveButton() {
   })
 
   btn.addEventListener('click', async (e) => {
+    if (!e.isTrusted) return
     e.preventDefault(); e.stopPropagation()
     if (btn.dataset.applymateBusy === 'true') return
     btn.dataset.applymateBusy = 'true'
@@ -927,6 +928,7 @@ function injectDetailButtons() {
     saveBtn.style.setProperty('padding-right', mode === 'inline' ? '16px' : '14px', 'important')
   })
   saveBtn.addEventListener('click', (e) => {
+    if (!e.isTrusted) return
     e.preventDefault(); e.stopPropagation()
     if (saveBtn.dataset.applymateBusy === 'true') return
     log('Detail Save button clicked')

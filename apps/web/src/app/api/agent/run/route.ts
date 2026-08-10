@@ -20,10 +20,12 @@ import { NextRequest }                              from 'next/server'
 import { db }                                       from '@/lib/db'
 import { err, prepareAiRoute, sseResponse }          from '@/lib/api-helpers'
 import { runAgentPipeline }                          from '@/lib/agent/run-service'
+import { hasEffectiveEntitlement }                   from '@/lib/entitlements'
 
 export async function GET(req: NextRequest) {
-  const prep = await prepareAiRoute(req, 'agent')
+  const prep = await prepareAiRoute(req, 'agent', 'job_discovery')
   if ('error' in prep) return prep.error
+  if (!(await hasEffectiveEntitlement(prep.userId, 'auto_apply'))) return err('Your current plan does not include autonomous applications.', 403)
 
   // autonomous=true → never pause, make all decisions automatically
   const autonomous = req.nextUrl.searchParams.get('autonomous') === 'true'

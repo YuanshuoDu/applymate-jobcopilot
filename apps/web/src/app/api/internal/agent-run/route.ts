@@ -3,6 +3,7 @@ import { db } from "@/lib/db";
 import { err, ok } from "@/lib/api-helpers";
 import { APPLYMATE_BACKING, loadUserAiConfig, resolveConfig } from "@/lib/model-router";
 import { runAgentPipeline } from "@/lib/agent/run-service";
+import { hasEffectiveEntitlement, isFeatureAllowed, resolveAiAccess } from '@/lib/entitlements'
 
 export const maxDuration = 300;
 
@@ -35,6 +36,10 @@ export async function POST(req: NextRequest) {
     select: { id: true },
   });
   if (!session) return err("Agent session not found", 404);
+  if (!(await isFeatureAllowed(input.userId, "auto_apply"))) return err("This feature is not included in your current plan", 403);
+  const aiAccess = await resolveAiAccess(input.userId);
+  if (aiAccess === "disabled") return err("This feature is not included in your current plan", 403);
+  if (aiAccess === "exhausted") return err("Monthly AI credits exhausted", 429);
 
   const execution = await db.agentExecution.findFirst({
     where: { userId: input.userId, sessionId: session.id },
@@ -42,6 +47,7 @@ export async function POST(req: NextRequest) {
   });
   const state = execution?.state
   const autonomous = Boolean(state && typeof state === "object" && !Array.isArray(state) && (state as { autonomous?: unknown }).autonomous === true)
+  if (autonomous && !await hasEffectiveEntitlement(input.userId, 'auto_apply')) return err("Your current plan does not include autonomous applications.", 403)
 
   const configured = await loadUserAiConfig(input.userId, "autoApply");
   const aiConfig = configured.resolvedKey ? configured : resolveConfig(APPLYMATE_BACKING);

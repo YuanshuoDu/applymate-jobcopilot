@@ -43,7 +43,7 @@ RULES:
 1. Fill every required field visible on the current page.
 2. For file upload fields: use the exact file path provided (resumePath, coverLetterPath).
 3. NEVER guess or fabricate values not in the candidate data. Leave unknown fields empty.
-4. When all visible fields on the current page are filled, click Next/Submit to advance.
+4. When all visible fields on the current page are filled, click only Next or Continue to advance. Use type: 'submit' only for the final application control; never use type: 'click' on a final Submit, Apply, Send, Complete, Finish, or Confirm button.
 5. If you see a CAPTCHA, login-wall, or error message you cannot resolve, return type: 'manual'.
 6. Work ONE page at a time. Each turn you see only the current page's fields.
 7. Return ONLY valid JSON matching the exact AgentAction schema below.
@@ -103,7 +103,7 @@ export function buildUserMessage(
   }
 
   msg += `\nINSTRUCTIONS: Analyze the fields above and return ONE AgentAction JSON object. `;
-  msg += `If all fields on this page are filled and you see a submit/next button, click it. `;
+  msg += `If all fields on this page are filled and you see a Next or Continue button, click it. If you see the final application control, return type: 'submit' with that control's selector. `;
   msg += `If the application appears complete, return {"type": "done"}.`;
 
   return msg;
@@ -127,7 +127,6 @@ export function parseAction(raw: string): AgentAction | null {
       selector: parsed.selector,
       value: parsed.value,
       field: parsed.field,
-      filePath: parsed.filePath,
       reasoning: parsed.reasoning ?? "",
     };
   } catch {
@@ -141,7 +140,6 @@ export interface AgentAction {
   selector?: string;
   value?: string;
   field?: string;
-  filePath?: string;
   reasoning: string;
 }
 

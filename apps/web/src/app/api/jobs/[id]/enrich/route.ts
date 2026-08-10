@@ -12,10 +12,15 @@
  * Safe to call multiple times — always overwrites with fresher data.
  */
 import { NextRequest } from 'next/server'
+import { pinnedFetch } from '@jobcopilot/shared'
 import { requireAuth, isErrorResponse, ok, err } from '@/lib/api-helpers'
 import { db } from '@/lib/db'
 import { truncate } from '@/lib/utils'
 import { enrichJob } from '@/lib/agent/enrich'
+import { getDiscoveryApiKeys } from '@/lib/discovery-api-keys'
+import { getRuntimeAtsPolicy } from '@/lib/runtime-ats-policy'
+import { detectAtsSource } from '@jobcopilot/shared/ats-url'
+import { fetchExternalText } from '@/lib/safe-outbound-url'
 
 type Params = { params: Promise<{ id: string }> }
 
@@ -51,24 +56,24 @@ export async function POST(_req: NextRequest, { params }: Params) {
   const job = await db.job.findUnique({ where: { id } })
   if (!job || job.userId !== auth.userId) return err('Not found', 404)
 
-  const rapidKey   = process.env.RAPIDAPI_KEY   ?? ''
+  const { rapidapiKey: rapidKey, adzunaAppId: adzunaId, adzunaAppKey: adzunaKey } = await getDiscoveryApiKeys(auth.userId)
   const mantisKey  = process.env.MANTIKS_API_KEY ?? ''
-  const adzunaId   = process.env.ADZUNA_APP_ID   ?? ''
-  const adzunaKey  = process.env.ADZUNA_APP_KEY  ?? ''
 
   const result: EnrichmentResult = { sources: [] }
 
   // ── 0. Enrichment cascade (T0→T1→T2) — free description extraction ───
-  if (job.url && !job.description) {
+  const atsSource = job.url ? detectAtsSource(job.url) : null
+  const pageFetchAllowed = !atsSource || (await getRuntimeAtsPolicy(atsSource, auth.userId)).allowed
+  if (job.url && !job.description && pageFetchAllowed) {
     try {
-      const html = await fetch(job.url, {
+      const html = await fetchExternalText(job.url, {
         signal: AbortSignal.timeout(8_000),
         headers: { 'User-Agent': 'ApplyMate/1.0' },
         cache: 'no-store',
-      }).then(r => r.ok ? r.text() : null)
+      })
 
       if (html) {
-        const enriched = await enrichJob({ html, url: job.url })
+        const enriched = await enrichJob({ html, url: job.url, userId: auth.userId })
         if (enriched?.description) {
           result.description = truncate(enriched.description, 2000)
           result.sources.push(`enrich-${enriched.method}`)
@@ -88,7 +93,7 @@ export async function POST(_req: NextRequest, { params }: Params) {
       })
       if (job.company) p.set('organization_description_filter', job.company)
 
-      const atsRes = await fetch(`https://active-jobs-db.p.rapidapi.com/active-ats-7d?${p}`, {
+      const atsRes = await pinnedFetch(`https://active-jobs-db.p.rapidapi.com/active-ats-7d?${p}`, {
         headers: { 'x-rapidapi-key': rapidKey, 'x-rapidapi-host': 'active-jobs-db.p.rapidapi.com' },
         signal: AbortSignal.timeout(5_000), cache: 'no-store',
       })
@@ -136,7 +141,7 @@ export async function POST(_req: NextRequest, { params }: Params) {
         age_in_days: '30',
         keyword:     job.role,
       })
-      const mantRes = await fetch(`https://api.mantiks.io/company/jobs?${p}`, {
+      const mantRes = await pinnedFetch(`https://api.mantiks.io/company/jobs?${p}`, {
         headers: { 'X-API-KEY': mantisKey },
         signal: AbortSignal.timeout(6_000), cache: 'no-store',
       })
@@ -182,7 +187,7 @@ export async function POST(_req: NextRequest, { params }: Params) {
 
       const cleanRole = job.role.replace(/\b(senior|sr|junior|jr|lead|staff|principal)\b/gi, '').trim()
       const p = new URLSearchParams({ query: cleanRole, countryCode: cc })
-      const salRes = await fetch(`https://jobs-api14.p.rapidapi.com/v2/salary/range?${p}`, {
+      const salRes = await pinnedFetch(`https://jobs-api14.p.rapidapi.com/v2/salary/range?${p}`, {
         headers: { 'x-rapidapi-key': rapidKey, 'x-rapidapi-host': 'jobs-api14.p.rapidapi.com' },
         next: { revalidate: 3600 },
       })

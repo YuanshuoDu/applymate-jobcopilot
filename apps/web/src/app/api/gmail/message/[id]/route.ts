@@ -3,6 +3,7 @@
  * Returns the plain-text body of a single Gmail message.
  */
 import { NextRequest } from 'next/server'
+import { pinnedFetch } from '@jobcopilot/shared'
 import { requireAuth, isErrorResponse, ok, err } from '@/lib/api-helpers'
 import { getGoogleAccessToken, extractPlainText } from '@/lib/gmail-helpers'
 
@@ -17,7 +18,7 @@ export async function GET(req: NextRequest, { params }: Params) {
   if (!token) return err('No Google account connected', 403)
 
   try {
-    const res = await fetch(
+    const res = await pinnedFetch(
       `https://gmail.googleapis.com/gmail/v1/users/me/messages/${id}?format=full`,
       { headers: { Authorization: `Bearer ${token}` } }
     )

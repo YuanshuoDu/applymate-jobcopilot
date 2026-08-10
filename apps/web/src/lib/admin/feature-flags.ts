@@ -1,10 +1,11 @@
 import type { Plan } from '@prisma/client'
+import { isManagedFeatureKey, type ManagedFeatureKey } from '@jobcopilot/shared'
 
 const environments = ['development', 'staging', 'production'] as const
 const plans = ['free', 'pro', 'enterprise'] as const
 
 export type FeatureFlagInput = {
-  key: string
+  key: ManagedFeatureKey
   environment: (typeof environments)[number]
   enabled: boolean
   rolloutPercent: number
@@ -14,7 +15,7 @@ export type FeatureFlagInput = {
 }
 
 function isHighRiskKey(key: string) {
-  return /auto[_-]?apply|captcha|payment|auth(?:entication)?|source[_-]?compliance/i.test(key)
+  return /(?:auto|unattended)[_-]?apply|captcha|payment|auth(?:entication)?|source[_-]?compliance/i.test(key)
 }
 
 export function parseFeatureFlag(value: unknown): FeatureFlagInput | null {
@@ -26,7 +27,7 @@ export function parseFeatureFlag(value: unknown): FeatureFlagInput | null {
   const targetPlans = Array.isArray(record.targetPlans) ? [...new Set(record.targetPlans.filter((plan): plan is Plan => typeof plan === 'string' && plans.includes(plan as Plan)))] : []
   const targetUserIds = Array.isArray(record.targetUserIds) ? [...new Set(record.targetUserIds.filter((id): id is string => typeof id === 'string' && id.length > 0 && id.length <= 64))] : []
   const rollbackAt = typeof record.rollbackAt === 'string' && !Number.isNaN(Date.parse(record.rollbackAt)) ? new Date(record.rollbackAt) : null
-  if (!/^[a-z][a-z0-9_.-]{2,79}$/.test(key) || !environment || typeof record.enabled !== 'boolean' || rolloutPercent < 0 || rolloutPercent > 100 || targetUserIds.length > 1_000) return null
+  if (!isManagedFeatureKey(key) || !environment || typeof record.enabled !== 'boolean' || rolloutPercent < 0 || rolloutPercent > 100 || targetUserIds.length > 1_000) return null
   if (environment === 'production' && isHighRiskKey(key) && (!rollbackAt || rollbackAt <= new Date())) return null
   return { key, environment, enabled: record.enabled, rolloutPercent, targetPlans, targetUserIds, rollbackAt }
 }

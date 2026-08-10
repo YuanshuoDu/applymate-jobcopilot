@@ -1,40 +1,54 @@
 'use client'
 
-import React, { useState, useEffect, useMemo } from 'react'
-import { signIn } from 'next-auth/react'
+import React, { useState, useEffect, useMemo, useRef } from 'react'
+import { useRouter } from 'next/navigation'
 import { TopBar } from '@/components/layout/TopBar'
 import { Btn, Card, useToast, useConfirm, UserAvatar } from '@/components/ui'
-import type { UserProfile, UserPreferences } from '@/lib/types'
+import type { NotificationPreferences, PrivacyPreferences, UserProfile, UserPreferences } from '@/lib/types'
 import { useApi, apiMutate } from '@/lib/hooks'
 import { useI18n, LANGUAGES, type Lang } from '@/lib/i18n'
 import { useTheme, type ThemeMode } from '@/components/ThemeProvider'
 import {
   MODEL_CATALOGUE, PROVIDER_LABELS, APPLYMATE_BACKING, APPLYMATE_LABEL,
   type Provider, type AiConfig, type FeatureId, type UserAiSettings,
-} from '@/lib/model-router'
+} from '@/lib/model-router-client'
+import {
+  DEFAULT_NOTIFICATION_PREFERENCES,
+  DEFAULT_PRIVACY_PREFERENCES,
+  hasActiveDeletionRequest,
+  readNotificationPreferences,
+  readPrivacyPreferences,
+} from '@/lib/settings-preferences'
+import {
+  discoveryKeyClearPatch,
+  EXTENSION_SETUP_HREF,
+  billingSupportHref,
+  billingStatusText,
+  gmailOAuthStartHref,
+  hasPendingSecretClear,
+  matchesEmailConfirmation,
+  settingsExportFilename,
+  secretInputValue,
+  settingsTabFromHref,
+  settingsTabHref,
+  discoveryKeyStatusText,
+  hasSavedDiscoveryKey,
+  isOAuthProviderAvailable,
+  type DiscoveryStatusView,
+  type OAuthProviderAvailability,
+  type SettingsTab,
+} from './settings-view-model'
+import { customConfigError, hasIncompleteCustomConfig } from './ai-settings-view-model'
+import type { PublicPlan } from '@/lib/plan-catalogue-shared'
+import { hasUsageAnalyticsConsentChanged, isPrivacyPreferenceAvailable } from '@/lib/privacy-consent'
 
 // ── Static data ───────────────────────────────────────────────────────────────
 
-const PLANS = [
-  {
-    id: 'free', name: 'Free', price: '€0', period: 'forever',
-    features: ['5 applications/month', 'Basic CV tailoring', 'Job tracker (20 jobs)', 'Extension popup'],
-  },
-  {
-    id: 'pro', name: 'Pro', price: '€12', period: 'month',
-    features: ['Unlimited applications', 'AI CV tailoring per role', 'Unlimited tracker', 'Full sidebar', 'AI cover letters', 'Gmail integration', 'Priority support'],
-  },
-  {
-    id: 'team', name: 'Team', price: '€29', period: 'month',
-    features: ['Everything in Pro', '5 team seats', 'Shared job pool', 'Analytics dashboard', 'Custom AI model', 'Dedicated support'],
-  },
-]
-
 const CONNECTED_ACCOUNTS = [
-  { id: 'gmail',    name: 'Gmail',    icon: '✉',  color: 'var(--c-danger)', connected: false, account: null as string | null, desc: 'AI email detection, auto-labeling & follow-up' },
-  { id: 'linkedin', name: 'LinkedIn', icon: 'in', color: 'var(--primary)', connected: false, account: null as string | null, desc: 'Job search + auto-apply'      },
-  { id: 'indeed',   name: 'Indeed',   icon: 'I',  color: '#003A9B', connected: false, account: null as string | null, desc: 'Job aggregation'               },
-  { id: 'github',   name: 'GitHub',   icon: '⌥',  color: '#24292f', connected: false, account: null as string | null, desc: 'Pull CV data from repos'       },
+  { id: 'gmail',    name: 'Gmail',    icon: '✉',  color: 'var(--c-danger)', connected: false, available: false, account: null as string | null, disconnectable: true, legacy: false, desc: 'AI email detection, auto-labeling & follow-up' },
+  { id: 'linkedin', name: 'LinkedIn', icon: 'in', color: 'var(--primary)', connected: false, available: false, account: null as string | null, disconnectable: true, legacy: false, desc: 'No LinkedIn OAuth connector is configured' },
+  { id: 'indeed',   name: 'Indeed',   icon: 'I',  color: '#003A9B', connected: false, available: false, account: null as string | null, disconnectable: true, legacy: false, desc: 'Indeed search uses public sources, not account login' },
+  { id: 'github',   name: 'GitHub',   icon: '⌥',  color: '#24292f', connected: false, available: false, account: null as string | null, disconnectable: true, legacy: false, desc: 'Pull CV data from repos'       },
 ]
 
 // ── UI helpers ────────────────────────────────────────────────────────────────
@@ -77,22 +91,29 @@ function Input({ value, onChange, type = 'text', placeholder, readOnly, style = 
   )
 }
 
-function Toggle({ value, onChange }: { value: boolean; onChange: (v: boolean) => void }) {
+function Toggle({ label, value, onChange, disabled = false }: { label?: string; value: boolean; onChange: (v: boolean) => void; disabled?: boolean }) {
   return (
-    <div onClick={() => onChange(!value)} style={{ width: 32, height: 18, borderRadius: 9, background: value ? 'var(--primary)' : 'var(--border)', cursor: 'pointer', position: 'relative', transition: 'background 0.2s', flexShrink: 0 }}>
+    <button
+      type="button"
+      role="switch"
+      aria-checked={value}
+      aria-label={label ?? (value ? 'Enabled' : 'Disabled')}
+      disabled={disabled}
+      onClick={() => onChange(!value)}
+      style={{ width: 32, height: 18, border: 0, padding: 0, borderRadius: 9, background: value ? 'var(--primary)' : 'var(--border)', cursor: disabled ? 'not-allowed' : 'pointer', position: 'relative', transition: 'background 0.2s', flexShrink: 0, opacity: disabled ? 0.55 : 1 }}
+    >
       <div style={{ width: 14, height: 14, borderRadius: '50%', background: '#fff', position: 'absolute', top: 2, left: value ? 16 : 2, transition: 'left 0.2s' }} />
-    </div>
+    </button>
   )
 }
 
 // ── SettingsPage ──────────────────────────────────────────────────────────────
 
-type Tab = 'profile' | 'appearance' | 'accounts' | 'apiKeys' | 'billing' | 'notifs' | 'privacy'
+type Tab = SettingsTab
 
 function initialSettingsTab(): Tab {
   if (typeof window === 'undefined') return 'profile'
-  const value = new URLSearchParams(window.location.search).get('tab')
-  return value === 'apiKeys' ? 'apiKeys' : 'profile'
+  return settingsTabFromHref(window.location.href)
 }
 
 const THEME_OPTIONS: { mode: ThemeMode; icon: string }[] = [
@@ -102,13 +123,15 @@ const THEME_OPTIONS: { mode: ThemeMode; icon: string }[] = [
 ]
 
 export function SettingsPage() {
+  const router = useRouter()
   const toast = useToast()
   const { lang, t, setLang } = useI18n()
   const { mode, setMode } = useTheme()
   const [confirm, ConfirmDialog] = useConfirm()
 
   // Load user profile
-  const { data: user, loading: userLoading } = useApi<UserProfile>('/api/me')
+  const { data: user, loading: userLoading, error: userError, refetch: refetchUser } = useApi<UserProfile>('/api/me')
+  const { data: billingData, loading: billingLoading, error: billingError } = useApi<{ plans: PublicPlan[] }>('/api/plans')
 
   // Profile form state (editable fields)
   const [name,     setName    ] = useState('')
@@ -117,6 +140,9 @@ export function SettingsPage() {
   const [linkedin, setLinkedin] = useState('')
   const [github,   setGithub  ] = useState('')
   const [saving,   setSaving  ] = useState(false)
+  const [avatar,   setAvatar  ] = useState<string | null>(null)
+  const [avatarSaving, setAvatarSaving] = useState(false)
+  const avatarInputRef = useRef<HTMLInputElement>(null)
 
   // Job preferences state
   const [prefRoles,       setPrefRoles]       = useState('')
@@ -133,42 +159,113 @@ export function SettingsPage() {
     setLocation(user.location ?? '')
     setLinkedin(user.linkedin ?? '')
     setGithub(user.github ?? '')
+    setAvatar(user.image ?? null)
     if (user.preferences) {
       setPrefRoles(user.preferences.targetRoles ?? '')
       setPrefLocations(user.preferences.targetLocations ?? '')
       setPrefSalary(user.preferences.salaryExpectation ?? '')
       setPrefVisa(user.preferences.workAuthorization ?? 'EU citizen / no visa required')
       setPrefRelocate(user.preferences.openToRelocation ?? true)
+      setNotifs(readNotificationPreferences(user.preferences))
+      setPrivacy(readPrivacyPreferences(user.preferences))
+      setDeletionRequested(hasActiveDeletionRequest(user.preferences))
+    } else {
+      setNotifs(DEFAULT_NOTIFICATION_PREFERENCES)
+      setPrivacy(DEFAULT_PRIVACY_PREFERENCES)
+      setDeletionRequested(false)
     }
   }, [user])
 
   const [activeTab,      setActiveTab     ] = useState<Tab>(initialSettingsTab)
-  const [notifs,         setNotifs        ] = useState({ apply: true, reject: true, interview: true, offer: true, weekly: false, followUp: true })
+  const [notifs,         setNotifs        ] = useState<NotificationPreferences>(DEFAULT_NOTIFICATION_PREFERENCES)
+  const [privacy,        setPrivacy       ] = useState<PrivacyPreferences>(DEFAULT_PRIVACY_PREFERENCES)
+  const [preferenceSaving, setPreferenceSaving] = useState<'notifications' | 'privacy' | null>(null)
+  const [deletionRequested, setDeletionRequested] = useState(false)
+  const [exporting, setExporting] = useState(false)
   const [showCancelModal,   setShowCancelModal]   = useState(false)
-  const [connectedProviders, setConnectedProviders] = useState<{ provider: string; account: string }[]>([])
+  const [connectedProviders, setConnectedProviders] = useState<{ provider: string; account: string; disconnectable?: boolean; legacy?: boolean }[]>([])
+  const [oauthProviders, setOauthProviders] = useState<OAuthProviderAvailability>({ gmail: false, github: false })
   const [gmailHealth, setGmailHealth] = useState<{ hasGmail: boolean; reason: string | null; scopes?: string; gmailError?: string }>({ hasGmail: true, reason: null })
+  const [accountAction, setAccountAction] = useState<string | null>(null)
+  const [accountsError, setAccountsError] = useState<string | null>(null)
+  const [accountsLoading, setAccountsLoading] = useState(false)
+
+  useEffect(() => {
+    const handlePopState = () => setActiveTab(settingsTabFromHref(window.location.href))
+    window.addEventListener('popstate', handlePopState)
+    return () => window.removeEventListener('popstate', handlePopState)
+  }, [])
+
+  useEffect(() => {
+    if (activeTab !== 'accounts' || typeof window === 'undefined') return
+    const url = new URL(window.location.href)
+    const githubError = url.searchParams.get('githubError')
+    const githubAuth = url.searchParams.get('githubAuth')
+    const gmailError = url.searchParams.get('gmailError')
+    if (githubError) toast.error('GitHub connection failed', githubError.replaceAll('_', ' '))
+    else if (githubAuth === '1') toast.success('GitHub connected')
+    if (gmailError) toast.error('Gmail connection failed', gmailError.replaceAll('_', ' '))
+    if (githubError || githubAuth || gmailError) {
+      url.searchParams.delete('githubError')
+      url.searchParams.delete('githubAuth')
+      url.searchParams.delete('gmailError')
+      window.history.replaceState({}, '', url.toString())
+    }
+  }, [activeTab, toast])
 
   // OAuth state is only shown on the Accounts tab. Deferring these requests
   // keeps the common Profile/Appearance visits responsive.
   useEffect(() => {
     if (activeTab !== 'accounts') return
-    fetch('/api/me/accounts')
-      .then(r => r.json())
-      .then(d => setConnectedProviders(d.accounts ?? []))
-      .catch(() => {})
-    fetch('/api/gmail/check')
-      .then(r => r.json())
-      .then(d => setGmailHealth({ hasGmail: d.hasGmail, reason: d.reason, scopes: d.scopes, gmailError: d.gmailError }))
-      .catch(() => {})
+    let cancelled = false
+    setAccountsLoading(true)
+    setAccountsError(null)
+    Promise.all([
+      fetch('/api/me/accounts').then(async response => {
+        const data = await response.json().catch(() => null)
+        if (!response.ok) throw new Error(data?.error ?? 'Could not load connected accounts')
+        return data
+      }),
+      fetch('/api/gmail/check').then(async response => {
+        const data = await response.json().catch(() => null)
+        if (!response.ok) throw new Error(data?.error ?? 'Could not verify Gmail access')
+        return data
+      }),
+      fetch('/api/me/integrations').then(async response => {
+        const data = await response.json().catch(() => null)
+        if (!response.ok) throw new Error(data?.error ?? 'Could not verify available integrations')
+        return data
+      }),
+    ])
+      .then(([accountsData, gmailData, integrationsData]) => {
+        if (cancelled) return
+        setConnectedProviders(Array.isArray(accountsData?.accounts) ? accountsData.accounts : [])
+        setGmailHealth({ hasGmail: Boolean(gmailData?.hasGmail), reason: gmailData?.reason ?? null, scopes: gmailData?.scopes, gmailError: gmailData?.gmailError })
+        setOauthProviders({
+          gmail: Boolean(integrationsData?.providers?.gmail),
+          github: Boolean(integrationsData?.providers?.github),
+        })
+      })
+      .catch(error => {
+        if (!cancelled) setAccountsError(error instanceof Error ? error.message : 'Could not load connected accounts')
+      })
+      .finally(() => { if (!cancelled) setAccountsLoading(false) })
+    return () => { cancelled = true }
   }, [activeTab])
 
   // Merge real connections with static config
   const accounts = useMemo(() => {
     return CONNECTED_ACCOUNTS.map(acc => {
       const conn = connectedProviders.find(c => c.provider === acc.id)
-      return conn ? { ...acc, connected: true, account: conn.account } : acc
+      const available = isOAuthProviderAvailable(acc.id, oauthProviders)
+      const desc = !available && (acc.id === 'gmail' || acc.id === 'github')
+        ? `${acc.name} OAuth is not configured by the platform`
+        : acc.desc
+      return conn
+        ? { ...acc, available, desc, connected: true, account: conn.account, disconnectable: conn.disconnectable !== false, legacy: conn.legacy }
+        : { ...acc, available, desc }
     })
-  }, [connectedProviders])
+  }, [connectedProviders, oauthProviders])
 
   // Password change state
   const [passwordCur,  setPasswordCur]  = useState('')
@@ -186,7 +283,63 @@ export function SettingsPage() {
     { id: 'privacy',  label: t('settings.privacy')  },
   ]
 
-  const planLabel = user?.plan === 'pro' ? 'Pro' : user?.plan === 'enterprise' ? 'Team' : 'Free'
+  const planLabel = billingData?.plans.find(plan => plan.key === user?.plan)?.name
+    ?? (user?.plan === 'pro' ? 'Pro' : user?.plan === 'enterprise' ? 'Team' : 'Free')
+  const currentPlan = billingData?.plans.find(plan => plan.key === user?.plan)
+  const currentPlanId = user?.plan ?? 'free'
+  const billingStatus = billingStatusText(currentPlan?.interval, user?.plan)
+
+  async function refreshConnectedAccounts() {
+    const response = await fetch('/api/me/accounts')
+    const data = await response.json().catch(() => null)
+    if (!response.ok) throw new Error(data?.error ?? 'Could not load connected accounts')
+    setConnectedProviders(Array.isArray(data?.accounts) ? data.accounts : [])
+  }
+
+  async function disconnectAccount(provider: string, name: string) {
+    setAccountAction(`disconnect:${provider}`)
+    const { error } = await apiMutate('/api/me/accounts', 'DELETE', { provider })
+    if (error) {
+      toast.error(`${name} disconnect failed`, error)
+    } else {
+      try {
+        await refreshConnectedAccounts()
+      } catch (refreshError) {
+        setAccountsError(refreshError instanceof Error ? refreshError.message : 'Could not refresh connected accounts')
+      }
+      if (provider === 'gmail') {
+        setGmailHealth({ hasGmail: false, reason: 'disconnected' })
+        window.open('https://myaccount.google.com/permissions', '_blank', 'noopener,noreferrer')
+        toast.info('Gmail disconnected', 'Visit Google permissions to fully revoke access')
+      } else {
+        toast.success(`${name} disconnected`)
+      }
+    }
+    setAccountAction(null)
+  }
+
+  async function repairGmailAccess() {
+    setAccountAction('repair:gmail')
+    const { error } = await apiMutate('/api/me/accounts', 'DELETE', { provider: 'gmail' })
+    if (error) {
+      toast.error('Could not reset Gmail access', error)
+      setAccountAction(null)
+      return
+    }
+    window.location.assign(gmailOAuthStartHref(true))
+  }
+
+  async function connectGithub() {
+    setAccountAction('connect:github')
+    try {
+      const returnTo = encodeURIComponent('/?page=settings&tab=accounts')
+      window.location.assign(`/api/github/oauth/start?returnTo=${returnTo}`)
+    } catch (error) {
+      toast.error('GitHub connection failed', error instanceof Error ? error.message : 'Could not start GitHub OAuth')
+    } finally {
+      setAccountAction(null)
+    }
+  }
 
   async function saveProfile() {
     setSaving(true)
@@ -205,6 +358,119 @@ export function SettingsPage() {
     else       toast.success('Profile saved')
   }
 
+  function selectTab(tab: Tab) {
+    setActiveTab(tab)
+    if (typeof window !== 'undefined') {
+      window.history.replaceState({}, '', settingsTabHref(tab, window.location.href))
+    }
+  }
+
+  async function persistNotifications(next: NotificationPreferences) {
+    const previous = notifs
+    setNotifs(next)
+    setPreferenceSaving('notifications')
+    const { error } = await apiMutate('/api/me', 'PATCH', { preferences: { notificationPreferences: next } })
+    setPreferenceSaving(null)
+    if (error) {
+      setNotifs(previous)
+      toast.error('Notification settings failed', error)
+    }
+  }
+
+  async function persistPrivacy(next: PrivacyPreferences) {
+    const previous = privacy
+    setPrivacy(next)
+    setPreferenceSaving('privacy')
+    const { error } = await apiMutate('/api/me', 'PATCH', { preferences: { privacyPreferences: next } })
+    setPreferenceSaving(null)
+    if (error) {
+      setPrivacy(previous)
+      toast.error('Privacy settings failed', error)
+    } else if (hasUsageAnalyticsConsentChanged(previous, next)) {
+      router.refresh()
+    }
+  }
+
+  async function handleAvatarChange(event: React.ChangeEvent<HTMLInputElement>) {
+    const file = event.target.files?.[0]
+    event.target.value = ''
+    if (!file) return
+    if (!file.type.startsWith('image/')) {
+      toast.error('Invalid image', 'Choose a PNG, JPEG, WebP, or GIF file')
+      return
+    }
+    if (file.size > 2 * 1024 * 1024) {
+      toast.error('Image too large', 'Avatar images must be 2 MiB or smaller')
+      return
+    }
+
+    const reader = new FileReader()
+    reader.onerror = () => toast.error('Upload failed', 'The image could not be read')
+    reader.onload = async () => {
+      if (typeof reader.result !== 'string') {
+        toast.error('Upload failed', 'The image could not be read')
+        return
+      }
+      const previous = avatar
+      setAvatar(reader.result)
+      setAvatarSaving(true)
+      const { error } = await apiMutate('/api/me', 'PATCH', { image: reader.result })
+      setAvatarSaving(false)
+      if (error) {
+        setAvatar(previous)
+        toast.error('Upload failed', error)
+      } else {
+        toast.success('Profile photo updated')
+        void refetchUser()
+      }
+    }
+    reader.readAsDataURL(file)
+  }
+
+  async function downloadUserData() {
+    setExporting(true)
+    try {
+      const response = await fetch('/api/me/persona/export', { cache: 'no-store' })
+      const data = await response.json().catch(() => null)
+      if (!response.ok) throw new Error(data?.error ?? 'Could not export your data')
+      const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' })
+      const url = URL.createObjectURL(blob)
+      const link = document.createElement('a')
+      link.href = url
+      link.download = settingsExportFilename(new Date())
+      document.body.appendChild(link)
+      link.click()
+      link.remove()
+      URL.revokeObjectURL(url)
+      toast.success('Data export ready')
+    } catch (error) {
+      toast.error('Export failed', error instanceof Error ? error.message : 'Could not export your data')
+    } finally {
+      setExporting(false)
+    }
+  }
+
+  async function requestDataDeletion() {
+    const approved = await confirm({
+      title: 'Request data deletion?',
+      message: 'We will record your GDPR deletion request and contact you about the retention timeline.',
+      danger: true,
+      confirmLabel: 'Submit request',
+    })
+    if (!approved) return
+    const { error } = await apiMutate('/api/me/deletion-request', 'POST')
+    if (error) toast.error('Request failed', error)
+    else {
+      setDeletionRequested(true)
+      toast.success('Deletion request submitted', 'Support will follow up with the retention timeline')
+    }
+  }
+
+  function openBillingSupport(action: string) {
+    const address = process.env.NEXT_PUBLIC_SUPPORT_EMAIL ?? 'support@applymate.site'
+    window.location.assign(billingSupportHref(address, action))
+  }
+
   const TAB_ICONS: Record<Tab, string> = {
     profile:  '👤',
     appearance: '🎨',
@@ -220,7 +486,7 @@ export function SettingsPage() {
       <ConfirmDialog />
       <TopBar title={t('settings.title')}>
         {activeTab === 'profile' && (
-          <Btn variant="primary" onClick={saveProfile} disabled={saving}>
+          <Btn variant="primary" onClick={saveProfile} disabled={saving || userLoading || Boolean(userError) || !user}>
             {saving ? t('settings.saving') : t('settings.save')}
           </Btn>
         )}
@@ -242,7 +508,7 @@ export function SettingsPage() {
           {TABS.map(tab => {
             const active = activeTab === tab.id
             return (
-              <button key={tab.id} onClick={() => setActiveTab(tab.id)} style={{
+              <button key={tab.id} type="button" onClick={() => selectTab(tab.id)} style={{
                 display: 'flex', alignItems: 'center', gap: 9,
                 width: '100%', padding: '8px 10px', borderRadius: 8,
                 border: 'none', cursor: 'pointer', textAlign: 'left',
@@ -273,16 +539,23 @@ export function SettingsPage() {
           {/* ── Profile ── */}
           {activeTab === 'profile' && (
             <>
-              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(420px, 1fr))', gap: 16, alignItems: 'start' }}>
+              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(min(100%, 420px), 1fr))', gap: 16, alignItems: 'start' }}>
                 <SettingsSection title={t('settings.personalInfo')}>
                   {userLoading ? (
                     <div style={{ fontSize: 12, color: 'var(--text-muted)', padding: '12px 0' }}>Loading...</div>
+                  ) : userError ? (
+                    <div style={{ padding: '12px 0', fontSize: 12, color: 'var(--c-danger)' }}>
+                      Could not load your profile: {userError}
+                    </div>
                   ) : (
                     <>
                       <div style={{ display: 'flex', alignItems: 'center', gap: 16, marginBottom: 12, paddingBottom: 12, borderBottom: '0.5px solid var(--border)' }}>
-                        <UserAvatar src={user?.image} name={user?.name} email={user?.email} size={56} />
+                        <UserAvatar src={avatar ?? user?.image} name={user?.name} email={user?.email} size={56} />
                         <div>
-                          <Btn small variant="ghost" onClick={() => toast.info('Upload photo')}>Upload photo</Btn>
+                          <input ref={avatarInputRef} type="file" accept="image/png,image/jpeg,image/webp,image/gif" onChange={handleAvatarChange} style={{ display: 'none' }} />
+                          <Btn small variant="ghost" disabled={avatarSaving} onClick={() => avatarInputRef.current?.click()}>
+                            {avatarSaving ? 'Uploading...' : 'Upload photo'}
+                          </Btn>
                           <div style={{ fontSize: 10, color: 'var(--text-muted)', marginTop: 4 }}>JPG, PNG up to 2MB</div>
                         </div>
                       </div>
@@ -308,7 +581,7 @@ export function SettingsPage() {
                       <option>Open work permit</option>
                     </select>
                   </FieldRow>
-                  <FieldRow label="Open to relocation"><Toggle value={prefRelocate} onChange={setPrefRelocate} /></FieldRow>
+                  <FieldRow label="Open to relocation"><Toggle label="Open to relocation" value={prefRelocate} onChange={setPrefRelocate} /></FieldRow>
                 </SettingsSection>
 
                 <SettingsSection title={t('settings.password')}>
@@ -387,12 +660,20 @@ export function SettingsPage() {
           {activeTab === 'accounts' && (
             <>
             <SettingsSection title={t('settings.connAccounts')}>
+              {accountsError && (
+                <div style={{ margin: '8px 0 12px', padding: '9px 10px', borderRadius: 7, background: 'rgba(220,38,38,0.08)', color: 'var(--c-danger)', fontSize: 11 }}>
+                  {accountsError}
+                </div>
+              )}
+              {accountsLoading && (
+                <div style={{ margin: '8px 0 12px', fontSize: 11, color: 'var(--text-muted)' }}>Checking connected accounts…</div>
+              )}
               <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
                 {accounts.map(acc => {
                   const isGmail = acc.id === 'gmail'
                   const gmailNeedsFix = isGmail && acc.connected && !gmailHealth.hasGmail
                   return (
-                    <div key={acc.id} style={{ display: 'flex', alignItems: 'center', gap: 14, padding: 14, background: 'var(--bg-secondary)', borderRadius: 10, border: gmailNeedsFix ? '1px solid rgba(163,45,45,0.25)' : '0.5px solid var(--border)' }}>
+                    <div key={acc.id} style={{ display: 'flex', alignItems: 'center', gap: 14, flexWrap: 'wrap', padding: 14, background: 'var(--bg-secondary)', borderRadius: 10, border: gmailNeedsFix ? '1px solid rgba(163,45,45,0.25)' : '0.5px solid var(--border)' }}>
                       <div style={{ width: 36, height: 36, borderRadius: 8, background: `${acc.color}18`, color: acc.color, display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 14, fontWeight: 700, flexShrink: 0 }}>
                         {acc.icon}
                       </div>
@@ -419,43 +700,30 @@ export function SettingsPage() {
                       {acc.connected ? (
                         <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
                           {gmailNeedsFix ? (
-                            <Btn small variant="primary" onClick={() => {
-                              fetch('/api/me/accounts', {
-                                method: 'DELETE',
-                                headers: { 'Content-Type': 'application/json' },
-                                body: JSON.stringify({ provider: 'gmail' }),
-                              }).then(() => { window.location.assign('/api/gmail/oauth/start?returnTo=/?page=settings&transfer=1') })
-                            }}>Fix Gmail Access</Btn>
-                          ) : (
-                            <span style={{ fontSize: 10, color: 'var(--c-success)', background: 'rgba(5,150,105,0.12)', borderRadius: 999, padding: '2px 8px' }}>● Connected</span>
-                          )}
-                          <Btn small variant="danger" onClick={async () => {
-                            if (isGmail) {
-                              await fetch('/api/me/accounts', {
-                                method: 'DELETE',
-                                headers: { 'Content-Type': 'application/json' },
-                                body: JSON.stringify({ provider: 'gmail' }),
-                              })
-                              fetch('/api/me/accounts')
-                                .then(r => r.json())
-                                .then(d => setConnectedProviders(d.accounts ?? []))
-                                .catch(() => {})
-                              setGmailHealth({ hasGmail: true, reason: null })
-                              window.open('https://myaccount.google.com/permissions', '_blank')
-                              toast.info('Gmail disconnected', 'Visit Google permissions to fully revoke access')
-                            } else {
-                              toast.warning(`${acc.name} disconnected`)
-                            }
-                          }}>Disconnect</Btn>
+                               <Btn small variant="primary" disabled={accountsLoading || accountAction !== null} onClick={() => void repairGmailAccess()}>
+                               {accountAction === 'repair:gmail' ? 'Resetting...' : 'Fix Gmail Access'}
+                             </Btn>
+                           ) : acc.disconnectable === false ? (
+                             <Btn small variant="primary" disabled={accountsLoading || accountAction !== null} onClick={() => window.location.assign(gmailOAuthStartHref(true))}>
+                               Re-link Gmail
+                             </Btn>
+                           ) : (
+                             <span style={{ fontSize: 10, color: 'var(--c-success)', background: 'rgba(5,150,105,0.12)', borderRadius: 999, padding: '2px 8px' }}>● Connected</span>
+                           )}
+                            {acc.disconnectable !== false && (
+                              <Btn small variant="danger" disabled={accountsLoading || accountAction !== null} onClick={() => void disconnectAccount(acc.id, acc.name)}>
+                                {accountAction === `disconnect:${acc.id}` ? 'Disconnecting...' : 'Disconnect'}
+                              </Btn>
+                            )}
                         </div>
+                      ) : !acc.available ? (
+                         <span title={acc.desc}><Btn small variant="ghost" disabled>Unavailable</Btn></span>
                       ) : (
-                        <Btn small variant="primary" onClick={() => {
-                          if (isGmail) {
-                            window.location.assign('/api/gmail/oauth/start?returnTo=/?page=settings&transfer=1')
+                         <Btn small variant="primary" disabled={accountsLoading || accountAction !== null} onClick={() => {
+                           if (isGmail) {
+                             window.location.assign(gmailOAuthStartHref())
                           } else if (acc.id === 'github') {
-                            signIn('github', { callbackUrl: window.location.origin + '/?page=settings' })
-                          } else {
-                            toast.info(`${acc.name} integration`, 'Coming soon')
+                            void connectGithub()
                           }
                         }}>Connect</Btn>
                       )}
@@ -480,7 +748,7 @@ export function SettingsPage() {
                 </div>
                 <div style={{ display: 'flex', flexDirection: 'column', gap: 6, alignItems: 'flex-end', flexShrink: 0 }}>
                   <a
-                    href="https://chrome.google.com/webstore"
+                    href={EXTENSION_SETUP_HREF}
                     target="_blank"
                     rel="noreferrer"
                     style={{
@@ -515,26 +783,29 @@ export function SettingsPage() {
                   <div>
                     <div style={{ fontSize: 14, fontWeight: 500 }}>{planLabel} Plan</div>
                     <div style={{ fontSize: 11, color: 'var(--text-muted)', marginTop: 2 }}>
-                      {user?.plan === 'free' ? 'Free forever' : 'Renews monthly'}
+                      {billingStatus.detail}
                     </div>
                   </div>
-                  <span style={{ marginLeft: 'auto', fontSize: 10, background: 'rgba(79,70,229,0.12)', color: 'var(--primary)', borderRadius: 999, padding: '3px 10px', fontWeight: 500 }}>Active</span>
+                  <span style={{ marginLeft: 'auto', fontSize: 10, background: 'rgba(79,70,229,0.12)', color: 'var(--primary)', borderRadius: 999, padding: '3px 10px', fontWeight: 500 }}>{billingStatus.label}</span>
                 </div>
-                <Btn variant="ghost" onClick={() => toast.info('Opening billing portal')}>Manage billing →</Btn>
+                <Btn variant="ghost" onClick={() => openBillingSupport('manage billing')}>Contact billing support</Btn>
               </SettingsSection>
 
-              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(min(100%, 200px), 1fr))', gap: 12 }}>
-                {PLANS.map(plan => {
-                  const isCurrent = (user?.plan ?? 'free') === plan.id
+              {billingLoading && !billingData && <Card style={{ padding: 16, color: 'var(--text-muted)', fontSize: 12 }}>Loading plans…</Card>}
+              {billingError && !billingData && <Card style={{ padding: 16, color: 'var(--c-danger)', fontSize: 12 }}>{billingError}</Card>}
+              {billingData && <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(min(100%, 200px), 1fr))', gap: 12 }}>
+                {billingData.plans.map(plan => {
+                  const isCurrent = currentPlanId === plan.key
+                  const canCancel = isCurrent && user?.plan !== 'free'
                   return (
-                    <Card key={plan.id} style={{ padding: 16, border: isCurrent ? '1.5px solid var(--primary)' : '0.5px solid var(--border)', background: isCurrent ? 'rgba(79,70,229,0.03)' : 'var(--bg)' }}>
+                    <Card key={plan.key} style={{ padding: 16, border: isCurrent ? '1.5px solid var(--primary)' : '0.5px solid var(--border)', background: isCurrent ? 'rgba(79,70,229,0.03)' : 'var(--bg)' }}>
                       <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 12 }}>
                         <span style={{ fontSize: 13, fontWeight: 500 }}>{plan.name}</span>
                         {isCurrent && <span style={{ fontSize: 10, background: 'rgba(79,70,229,0.12)', color: 'var(--primary)', borderRadius: 999, padding: '2px 7px' }}>Current</span>}
                       </div>
                       <div style={{ marginBottom: 12 }}>
                         <span style={{ fontSize: 22, fontWeight: 500 }}>{plan.price}</span>
-                        <span style={{ fontSize: 11, color: 'var(--text-muted)' }}> / {plan.period}</span>
+                        <span style={{ fontSize: 11, color: 'var(--text-muted)' }}> / {plan.interval === 'forever' ? 'forever' : plan.interval}</span>
                       </div>
                       <div style={{ display: 'flex', flexDirection: 'column', gap: 5, marginBottom: 14 }}>
                         {plan.features.map(f => (
@@ -543,14 +814,14 @@ export function SettingsPage() {
                           </div>
                         ))}
                       </div>
-                      <Btn variant={isCurrent ? 'ghost' : 'primary'} style={{ width: '100%', justifyContent: 'center' }}
-                        onClick={() => isCurrent ? setShowCancelModal(true) : toast.success(`Upgraded to ${plan.name}`)}>
-                        {isCurrent ? 'Cancel plan' : plan.id === 'free' ? 'Downgrade' : 'Upgrade'}
+                      <Btn variant={isCurrent ? 'ghost' : 'primary'} disabled={isCurrent && !canCancel} style={{ width: '100%', justifyContent: 'center' }}
+                        onClick={() => canCancel ? setShowCancelModal(true) : openBillingSupport(plan.key === 'free' ? 'downgrade to Free' : `upgrade to ${plan.name}`)}>
+                        {isCurrent ? canCancel ? 'Cancel plan' : 'Current plan' : plan.key === 'free' ? 'Downgrade' : 'Upgrade'}
                       </Btn>
                     </Card>
                   )
                 })}
-              </div>
+              </div>}
             </>
           )}
 
@@ -570,7 +841,7 @@ export function SettingsPage() {
                     <div style={{ fontSize: 12 }}>{n.label}</div>
                     <div style={{ fontSize: 10, color: 'var(--text-muted)', marginTop: 2 }}>{n.sub}</div>
                   </div>
-                  <Toggle value={notifs[n.key]} onChange={v => setNotifs(s => ({ ...s, [n.key]: v }))} />
+                  <Toggle label={n.label} value={notifs[n.key]} disabled={preferenceSaving === 'notifications'} onChange={v => void persistNotifications({ ...notifs, [n.key]: v })} />
                 </div>
               ))}
             </SettingsSection>
@@ -580,23 +851,29 @@ export function SettingsPage() {
           {activeTab === 'privacy' && (
             <>
               <SettingsSection title={t('settings.dataPrivacy')}>
-                {[
-                  { label: 'Share anonymous usage data',          sub: 'Helps us improve ApplyMate',         value: true  },
-                  { label: 'Allow AI training on your CVs',       sub: 'Your data is always anonymised',     value: false },
-                  { label: 'Store cover letters for improvement', sub: 'Used to improve generation quality', value: true  },
-                ].map((item, i) => (
-                  <div key={i} style={{ display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between', padding: '12px 0', borderBottom: '0.5px solid var(--border)' }}>
+                {([
+                  { key: 'shareUsageData', label: 'Share anonymous usage data',          sub: 'Helps us improve ApplyMate'         },
+                  { key: 'allowAiTraining', label: 'Allow AI training on your CVs',       sub: 'Currently unavailable until a training pipeline is approved' },
+                  { key: 'storeCoverLetters', label: 'Retain generated cover letters', sub: 'Temporary material is removed after submission when disabled' },
+                ] as Array<{ key: keyof PrivacyPreferences; label: string; sub: string }>).map(item => (
+                  <div key={item.key} style={{ display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between', padding: '12px 0', borderBottom: '0.5px solid var(--border)' }}>
                     <div>
                       <div style={{ fontSize: 12 }}>{item.label}</div>
                       <div style={{ fontSize: 10, color: 'var(--text-muted)', marginTop: 2 }}>{item.sub}</div>
                     </div>
-                    <Toggle value={item.value} onChange={() => {}} />
+                    <Toggle
+                      label={item.label}
+                      value={privacy[item.key]}
+                      disabled={preferenceSaving === 'privacy' || !isPrivacyPreferenceAvailable(item.key)}
+                      onChange={value => void persistPrivacy({ ...privacy, [item.key]: value })}
+                    />
                   </div>
                 ))}
                 <div style={{ marginTop: 12, display: 'flex', gap: 8 }}>
-                  <Btn variant="ghost" onClick={() => toast.info('Downloading data…')}>Download my data</Btn>
-                  <Btn variant="ghost" onClick={() => toast.info('Request sent', 'We will delete your data within 30 days')}>Request data deletion</Btn>
+                  <Btn variant="ghost" disabled={exporting} onClick={() => void downloadUserData()}>{exporting ? 'Preparing export...' : 'Download my data'}</Btn>
+                  <Btn variant="ghost" disabled={deletionRequested} onClick={() => void requestDataDeletion()}>{deletionRequested ? 'Deletion requested' : 'Request data deletion'}</Btn>
                 </div>
+                {deletionRequested && <div style={{ marginTop: 8, fontSize: 10, color: 'var(--text-muted)' }}>Your request is recorded. Support will follow up with the retention timeline.</div>}
               </SettingsSection>
 
               <Card style={{ padding: 16, border: '0.5px solid rgba(163,45,45,0.3)', background: 'rgba(163,45,45,0.03)' }}>
@@ -615,16 +892,16 @@ export function SettingsPage() {
                   if (!ok) return
                   // Second confirmation: user must type their email
                   const typed = prompt(`Type your email to confirm deletion: ${user?.email ?? ''}`)
-                  if (typed !== user?.email) {
+                  if (!typed || !user?.email || !matchesEmailConfirmation(typed, user.email)) {
                     toast.warning('Cancelled', 'Email did not match — account preserved')
                     return
                   }
-                  const { error } = await apiMutate('/api/me', 'DELETE', { confirmation: user?.email })
+                  const { error } = await apiMutate('/api/me/delete', 'DELETE', { confirmation: typed })
                   if (error) {
                     toast.error('Deletion failed', error)
                   } else {
                     toast.success('Account deleted', 'Redirecting…')
-                    setTimeout(() => window.location.href = '/login', 1500)
+                    setTimeout(() => window.location.replace('/login'), 1500)
                   }
                 }}>Delete my account</Btn>
               </Card>
@@ -645,7 +922,7 @@ export function SettingsPage() {
             </div>
             <div style={{ display: 'flex', gap: 8 }}>
               <Btn variant="ghost"  style={{ flex: 1, justifyContent: 'center' }} onClick={() => setShowCancelModal(false)}>Keep plan</Btn>
-              <Btn variant="danger" style={{ flex: 1, justifyContent: 'center' }} onClick={() => { setShowCancelModal(false); toast.warning('Plan cancelled', 'Access continues until period end') }}>Cancel plan</Btn>
+              <Btn variant="danger" style={{ flex: 1, justifyContent: 'center' }} onClick={() => { setShowCancelModal(false); openBillingSupport(`cancel ${planLabel} plan`) }}>Contact support</Btn>
             </div>
           </Card>
         </div>
@@ -656,10 +933,7 @@ export function SettingsPage() {
 
 // ── API Keys Settings ─────────────────────────────────────────────────────────
 
-type ApiKeyStatus = {
-  hasAdzuna: boolean
-  hasRapidapi: boolean
-}
+type ApiKeyStatus = DiscoveryStatusView & { hasAdzuna: boolean; hasRapidapi: boolean }
 
 type DiscoveryTestStatus = 'idle' | 'testing' | 'ok' | { error: string }
 
@@ -685,14 +959,27 @@ function ApiKeysSettings() {
   const [rapidapiKey, setRapidapiKey] = useState('')
   const [visible, setVisible] = useState<Record<string, boolean>>({})
   const [loading, setLoading] = useState(true)
+  const [loadError, setLoadError] = useState<string | null>(null)
   const [saving, setSaving] = useState(false)
+  const [keyClearing, setKeyClearing] = useState<'adzuna' | 'rapidapi' | null>(null)
   const [tests, setTests] = useState<Record<'adzuna' | 'rapidapi', DiscoveryTestStatus>>({ adzuna: 'idle', rapidapi: 'idle' })
 
   useEffect(() => {
     fetch('/api/me/api-keys')
-      .then(r => r.json())
-      .then((data: ApiKeyStatus) => setStatus({ hasAdzuna: Boolean(data.hasAdzuna), hasRapidapi: Boolean(data.hasRapidapi) }))
-      .catch(() => setStatus({ hasAdzuna: false, hasRapidapi: false }))
+      .then(async response => {
+        const data = await response.json().catch(() => null) as (ApiKeyStatus & { error?: string }) | null
+        if (!response.ok) throw new Error(data?.error ?? 'Could not load discovery key status')
+        setStatus({
+          hasAdzuna: Boolean(data?.hasAdzuna),
+          hasRapidapi: Boolean(data?.hasRapidapi),
+          userHasAdzuna: Boolean(data?.userHasAdzuna),
+          userHasRapidapi: Boolean(data?.userHasRapidapi),
+          adzunaSource: data?.adzunaSource,
+          rapidapiSource: data?.rapidapiSource,
+          needsAdzunaPair: Boolean(data?.needsAdzunaPair),
+        })
+      })
+      .catch(error => setLoadError(error instanceof Error ? error.message : 'Could not load discovery key status'))
       .finally(() => setLoading(false))
   }, [])
 
@@ -722,7 +1009,27 @@ function ApiKeysSettings() {
     setAdzunaAppId('')
     setAdzunaAppKey('')
     setRapidapiKey('')
-    toast.success('Job discovery keys saved', 'Adzuna and JSearch will use your credentials before the platform fallback')
+    setTests({ adzuna: 'idle', rapidapi: 'idle' })
+    toast.success('Job discovery keys saved', 'The next search will use complete user credentials before any platform fallback')
+  }
+
+  async function clearKey(provider: 'adzuna' | 'rapidapi') {
+    setKeyClearing(provider)
+    const { data, error } = await apiMutate<ApiKeyStatus>('/api/me/api-keys', 'POST', discoveryKeyClearPatch(provider))
+    setKeyClearing(null)
+    if (error) {
+      toast.error('Could not clear discovery key', error)
+      return
+    }
+    if (data) setStatus(data)
+    setTests(prev => ({ ...prev, [provider]: 'idle' }))
+    if (provider === 'adzuna') {
+      setAdzunaAppId('')
+      setAdzunaAppKey('')
+    } else {
+      setRapidapiKey('')
+    }
+    toast.success(`${provider === 'adzuna' ? 'Adzuna' : 'RapidAPI'} key cleared`)
   }
 
   async function testConnection(provider: 'adzuna' | 'rapidapi') {
@@ -770,6 +1077,7 @@ function ApiKeysSettings() {
   }
 
   if (loading) return <div style={{ padding: 24, color: 'var(--text-muted)', fontSize: 13 }}>Loading API key status...</div>
+  if (loadError) return <div style={{ padding: 14, color: 'var(--c-danger)', fontSize: 12, background: 'rgba(220,38,38,0.08)', borderRadius: 8 }}>{loadError}</div>
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
@@ -778,30 +1086,38 @@ function ApiKeysSettings() {
           These keys only search job boards. They do not run AI features or parse your resume. Save first, then test the provider; saved values stay masked.
         </div>
         <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', padding: '8px 0 4px' }}>
-          <span style={{ fontSize: 10, borderRadius: 999, padding: '2px 8px', color: status.hasAdzuna ? 'var(--c-success)' : 'var(--text-muted)', background: status.hasAdzuna ? 'rgba(5,150,105,0.10)' : 'var(--bg-secondary)' }}>
-            Adzuna {status.hasAdzuna ? 'saved · ready to test' : 'not configured'}
+          <span style={{ fontSize: 10, borderRadius: 999, padding: '2px 8px', color: status.hasAdzuna ? 'var(--c-success)' : status.needsAdzunaPair ? 'var(--c-danger)' : 'var(--text-muted)', background: status.hasAdzuna ? 'rgba(5,150,105,0.10)' : status.needsAdzunaPair ? 'rgba(220,38,38,0.10)' : 'var(--bg-secondary)' }}>
+            Adzuna {discoveryKeyStatusText(status, 'adzuna')}
           </span>
           <span style={{ fontSize: 10, borderRadius: 999, padding: '2px 8px', color: status.hasRapidapi ? 'var(--c-success)' : 'var(--text-muted)', background: status.hasRapidapi ? 'rgba(5,150,105,0.10)' : 'var(--bg-secondary)' }}>
-            RapidAPI {status.hasRapidapi ? 'saved · ready to test' : 'not configured'}
+            RapidAPI {discoveryKeyStatusText(status, 'rapidapi')}
           </span>
         </div>
         <div style={{ display: 'grid', gap: 10, padding: '8px 0 4px', fontSize: 11, color: 'var(--text-muted)', lineHeight: 1.55 }}>
           <div><strong style={{ color: 'var(--text)' }}>Adzuna</strong> — direct European job listings. Requires an App ID and App Key.</div>
           <div><strong style={{ color: 'var(--text)' }}>RapidAPI</strong> — provider marketplace used for JSearch and other job sources. Requires one API Key.</div>
         </div>
-        <SecretField id="adzunaAppId" label="Adzuna App ID" value={adzunaAppId} onChange={setAdzunaAppId} saved={status.hasAdzuna} />
-        <SecretField id="adzunaAppKey" label="Adzuna App Key" value={adzunaAppKey} onChange={setAdzunaAppKey} saved={status.hasAdzuna} />
-        <SecretField id="rapidapiKey" label="RapidAPI Key" value={rapidapiKey} onChange={setRapidapiKey} saved={status.hasRapidapi} />
+        <SecretField id="adzunaAppId" label="Adzuna App ID" value={adzunaAppId} onChange={setAdzunaAppId} saved={hasSavedDiscoveryKey(status, 'adzuna')} />
+        <SecretField id="adzunaAppKey" label="Adzuna App Key" value={adzunaAppKey} onChange={setAdzunaAppKey} saved={hasSavedDiscoveryKey(status, 'adzuna')} />
+        <SecretField id="rapidapiKey" label="RapidAPI Key" value={rapidapiKey} onChange={setRapidapiKey} saved={hasSavedDiscoveryKey(status, 'rapidapi')} />
         <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8, flexWrap: 'wrap', paddingTop: 12 }}>
           <div style={{ display: 'flex', gap: 8 }}>
             {(['adzuna', 'rapidapi'] as const).map(provider => {
               const configured = provider === 'adzuna' ? status.hasAdzuna : status.hasRapidapi
+              const userConfigured = hasSavedDiscoveryKey(status, provider)
               const test = tests[provider]
               const label = provider === 'adzuna' ? 'Test Adzuna' : 'Test RapidAPI'
               return (
-                <button key={provider} type="button" onClick={() => testConnection(provider)} disabled={!configured || test === 'testing'} style={{ padding: '7px 10px', fontSize: 11, borderRadius: 7, border: '0.5px solid var(--border)', background: 'var(--bg-secondary)', color: test === 'ok' ? 'var(--c-success)' : 'var(--text)', cursor: configured && test !== 'testing' ? 'pointer' : 'default', opacity: configured ? 1 : 0.5 }} title={typeof test === 'object' ? test.error : undefined}>
-                  {test === 'testing' ? 'Testing…' : test === 'ok' ? 'Connected ✓' : label}
-                </button>
+                <div key={provider} style={{ display: 'flex', gap: 6 }}>
+                  <button type="button" onClick={() => testConnection(provider)} disabled={!configured || test === 'testing' || keyClearing !== null} style={{ padding: '7px 10px', fontSize: 11, borderRadius: 7, border: '0.5px solid var(--border)', background: 'var(--bg-secondary)', color: test === 'ok' ? 'var(--c-success)' : 'var(--text)', cursor: configured && test !== 'testing' && keyClearing === null ? 'pointer' : 'default', opacity: configured ? 1 : 0.5 }} title={typeof test === 'object' ? test.error : undefined}>
+                    {test === 'testing' ? 'Testing…' : test === 'ok' ? 'Connected ✓' : label}
+                  </button>
+                  {userConfigured && (
+                    <button type="button" onClick={() => void clearKey(provider)} disabled={keyClearing !== null || saving} style={{ padding: '7px 8px', fontSize: 11, borderRadius: 7, border: '0.5px solid var(--border)', background: 'transparent', color: 'var(--c-danger)', cursor: keyClearing === null && !saving ? 'pointer' : 'default', opacity: keyClearing === provider ? 0.6 : 1 }}>
+                      {keyClearing === provider ? 'Clearing…' : 'Clear'}
+                    </button>
+                  )}
+                </div>
               )
             })}
           </div>
@@ -859,7 +1175,7 @@ const FEATURE_GROUPS: Array<{ label: string; description: string; features: Feat
 
 function groupConfig(settings: UserAiSettings, group: (typeof FEATURE_GROUPS)[number]): AiConfig | null | undefined {
   const configs = group.features.map(id => settings.features?.[id] ?? null)
-  const signature = (cfg: AiConfig | null) => cfg ? `${cfg.provider}/${cfg.model}` : 'default'
+  const signature = (cfg: AiConfig | null) => cfg ? `${cfg.provider}/${cfg.model}/${cfg.apiBase ?? ''}/${cfg.thinking ?? ''}` : 'default'
   return configs.every(cfg => signature(cfg) === signature(configs[0])) ? configs[0] : undefined
 }
 
@@ -872,14 +1188,20 @@ function AiModelSettings() {
   const [draftKeys, setDraftKeys] = useState<Partial<Record<Provider, string>>>({})
   const [saving,    setSaving   ] = useState(false)
   const [loaded,    setLoaded   ] = useState(false)
+  const [loadError, setLoadError] = useState<string | null>(null)
   const [keyTests,  setKeyTests ] = useState<Partial<Record<Provider, TestStatus>>>({})
   const [allTesting, setAllTesting] = useState(false)
+  const [platformMinimaxReady, setPlatformMinimaxReady] = useState<boolean | null>(null)
 
   useEffect(() => {
-    fetch('/api/me/ai-config').then(r => r.json()).then((data: UserAiSettings) => {
-      setSettings(data)
-      setLoaded(true)
-    }).catch(() => setLoaded(true))
+    fetch('/api/me/ai-config').then(async response => {
+      const data = await response.json().catch(() => null) as (UserAiSettings & { error?: string; platform?: { minimax?: boolean } }) | null
+      if (!response.ok) throw new Error(data?.error ?? 'Could not load AI settings')
+      setSettings({ keys: data?.keys ?? {}, features: data?.features ?? {} })
+      setPlatformMinimaxReady(typeof data?.platform?.minimax === 'boolean' ? data.platform.minimax : null)
+    }).catch(error => {
+      setLoadError(error instanceof Error ? error.message : 'Could not load AI settings')
+    }).finally(() => setLoaded(true))
   }, [])
 
   function setFeatureGroupCfg(group: (typeof FEATURE_GROUPS)[number], cfg: AiConfig | null) {
@@ -893,22 +1215,40 @@ function AiModelSettings() {
   }
 
   async function testKey(p: Provider) {
-    const key = draftKeys[p] || settings.keys?.[p] || ''
+    const key = draftKeys[p] !== undefined ? draftKeys[p] : settings.keys?.[p] || ''
 
     setKeyTests(prev => ({ ...prev, [p]: 'testing' }))
-    const model = MODEL_CATALOGUE.find(m => m.provider === p)
+    const selectedFeatureEntry = Object.entries(settings.features ?? {}).find(([, config]) => config?.provider === p) ?? null
+    const selectedFeature = selectedFeatureEntry?.[1] ?? null
+    const catalogueOption = p === 'custom' ? null : MODEL_CATALOGUE.find(m => m.provider === p)
+    const model: AiConfig | null = selectedFeature ?? (catalogueOption ? {
+      provider: catalogueOption.provider,
+      model: catalogueOption.model,
+      ...(catalogueOption.defaultBase ? { apiBase: catalogueOption.defaultBase } : {}),
+    } : null)
+    if (!model) {
+      setKeyTests(prev => ({ ...prev, [p]: { error: 'No model is configured for this provider' } }))
+      return
+    }
+    const customError = p === 'custom' ? customConfigError(model) : null
+    if (customError) {
+      setKeyTests(prev => ({ ...prev, [p]: { error: customError } }))
+      return
+    }
     try {
       const res = await fetch('/api/me/ai-test', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           provider: p,
-          model: model?.model,
+          model: model.model,
+          ...(selectedFeatureEntry ? { feature: selectedFeatureEntry[0] } : {}),
+          ...(p === 'custom' && model.apiBase ? { apiBase: model.apiBase } : {}),
           apiKey: key && !key.startsWith('••••') ? key : undefined,
         }),
       })
-      const data = await res.json()
-      setKeyTests(prev => ({ ...prev, [p]: data.ok ? 'ok' : { error: data.error ?? t('settings.ai.connFail') } }))
+      const data = await res.json().catch(() => null) as { ok?: boolean; error?: string } | null
+      setKeyTests(prev => ({ ...prev, [p]: res.ok && data?.ok ? 'ok' : { error: data?.error ?? t('settings.ai.connFail') } }))
     } catch {
       setKeyTests(prev => ({ ...prev, [p]: { error: t('settings.ai.netErr') } }))
     }
@@ -916,25 +1256,42 @@ function AiModelSettings() {
 
   async function testAllProviders() {
     setAllTesting(true)
-    for (const p of PROVIDERS_WITH_MODELS.filter(p => p !== 'custom')) {
+    const hasCustom = Object.values(settings.features ?? {}).some(config => config?.provider === 'custom')
+    for (const p of PROVIDERS_WITH_MODELS.filter(p => p !== 'custom' || hasCustom)) {
       await testKey(p)
     }
     setAllTesting(false)
   }
 
+  const customConfigInvalid = hasIncompleteCustomConfig(settings.features)
+
   async function save() {
     setSaving(true)
+    const nextKeys: Partial<Record<Provider, string | null>> = { ...settings.keys }
+    for (const provider of PROVIDERS_WITH_MODELS) {
+      if (draftKeys[provider] === '') nextKeys[provider] = null
+      else if (draftKeys[provider] !== undefined) nextKeys[provider] = draftKeys[provider]
+    }
     const body: UserAiSettings = {
-      keys:     { ...settings.keys, ...draftKeys },
+      keys:     nextKeys as Partial<Record<Provider, string>>,
       features: settings.features,
     }
-    const { error } = await apiMutate('/api/me/ai-config', 'POST', body)
+    const { data, error } = await apiMutate<{ saved: boolean; settings?: UserAiSettings }>('/api/me/ai-config', 'POST', body)
     setSaving(false)
     if (error) toast.error(t('settings.ai.saveFail'), error)
-    else { toast.success(t('settings.ai.saveOk')); setDraftKeys({}); setKeyTests({}) }
+    else {
+      toast.success(t('settings.ai.saveOk'))
+      const returnedKeys = data?.settings?.keys ?? Object.fromEntries(
+        Object.entries(nextKeys).filter(([, key]) => typeof key === 'string')
+      ) as Partial<Record<Provider, string>>
+      setSettings(prev => ({ ...prev, ...(data?.settings ?? {}), keys: returnedKeys }))
+      setDraftKeys({})
+      setKeyTests({})
+    }
   }
 
   if (!loaded) return <div style={{ padding: 24, color: 'var(--text-muted)', fontSize: 13 }}>{t('settings.ai.loading')}</div>
+  if (loadError) return <div style={{ padding: 14, color: 'var(--c-danger)', fontSize: 12, background: 'rgba(220,38,38,0.08)', borderRadius: 8 }}>{loadError}</div>
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 20 }}>
@@ -952,6 +1309,11 @@ function AiModelSettings() {
         <div style={{ marginTop: 8, fontSize: 11, color: 'var(--text-muted)' }}>
           {t('settings.ai.underlying')}{APPLYMATE_BACKING.provider} / {APPLYMATE_BACKING.model}
         </div>
+        {platformMinimaxReady === false && (
+          <div style={{ marginTop: 10, padding: '8px 10px', borderRadius: 7, background: 'rgba(220,38,38,0.08)', color: 'var(--c-danger)', fontSize: 11, lineHeight: 1.5 }}>
+            {t('settings.ai.platformUnavailable')}
+          </div>
+        )}
       </div>
 
       {/* ── 分功能模型控制 ── */}
@@ -965,7 +1327,7 @@ function AiModelSettings() {
             const mixed = current === undefined
             const isDefault = current === null
             return (
-              <div key={group.label} style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '10px 12px', background: 'var(--bg-secondary)', borderRadius: 8, border: '0.5px solid var(--border)' }}>
+              <div key={group.label} style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap', padding: '10px 12px', background: 'var(--bg-secondary)', borderRadius: 8, border: '0.5px solid var(--border)' }}>
                 <div style={{ flex: 1, minWidth: 0 }}>
                   <div style={{ fontSize: 12, fontWeight: 500, color: 'var(--text)' }}>{group.label}</div>
                   <div style={{ fontSize: 10, color: 'var(--text-muted)', marginTop: 2 }}>
@@ -979,6 +1341,34 @@ function AiModelSettings() {
                   <div style={{ fontSize: 10, color: 'var(--text-muted)', marginTop: 3 }}>{group.description}</div>
                 </div>
                 <FeatureModelPicker value={current ?? null} mixed={mixed} onChange={cfg => setFeatureGroupCfg(group, cfg)} />
+                {current?.provider === 'custom' && (
+                  <div style={{ flexBasis: '100%', display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(min(100%, 220px), 1fr))', gap: 8, paddingTop: 4 }}>
+                    <label style={{ display: 'grid', gap: 4, fontSize: 10, color: 'var(--text-muted)' }}>
+                      Custom model ID
+                      <input
+                        aria-label={`${group.label} custom model ID`}
+                        value={current.model}
+                        onChange={event => setFeatureGroupCfg(group, { ...current, model: event.target.value })}
+                        placeholder="e.g. llama-3.3-70b"
+                        style={{ width: '100%', boxSizing: 'border-box', padding: '7px 9px', border: '1px solid var(--border)', borderRadius: 7, background: 'var(--bg)', color: 'var(--text)', fontSize: 11 }}
+                      />
+                    </label>
+                    <label style={{ display: 'grid', gap: 4, fontSize: 10, color: 'var(--text-muted)' }}>
+                      HTTPS endpoint
+                      <input
+                        aria-label={`${group.label} custom HTTPS endpoint`}
+                        value={current.apiBase ?? ''}
+                        onChange={event => setFeatureGroupCfg(group, { ...current, apiBase: event.target.value })}
+                        placeholder="https://your-endpoint.example/v1"
+                        inputMode="url"
+                        style={{ width: '100%', boxSizing: 'border-box', padding: '7px 9px', border: '1px solid var(--border)', borderRadius: 7, background: 'var(--bg)', color: 'var(--text)', fontSize: 11 }}
+                      />
+                    </label>
+                    {customConfigError(current) && (
+                      <div style={{ gridColumn: '1 / -1', fontSize: 10, color: 'var(--c-danger)' }}>{customConfigError(current)}</div>
+                    )}
+                  </div>
+                )}
               </div>
             )
           })}
@@ -1000,10 +1390,11 @@ function AiModelSettings() {
           </button>
         </div>
         <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
-          {PROVIDERS_WITH_MODELS.filter(p => p !== 'custom').map(p => {
+          {PROVIDERS_WITH_MODELS.map(p => {
             const existing = settings.keys?.[p] ?? ''
-            const draft    = draftKeys[p] ?? ''
-            const display  = draft || existing
+            const draft    = draftKeys[p]
+            const display  = secretInputValue(existing, draft)
+            const pendingClear = hasPendingSecretClear(existing, draft)
             const hint     = KEY_HINTS[p]
             const status   = keyTests[p] ?? 'idle'
             return (
@@ -1038,11 +1429,23 @@ function AiModelSettings() {
                     style={{ flex: 1, padding: '8px 10px', border: '1px solid var(--border)', borderRadius: 7, fontSize: 12, color: 'var(--text)', background: 'var(--bg)', outline: 'none' }}
                   />
                   <button
+                    type="button"
                     onClick={() => testKey(p)}
                     disabled={status === 'testing'}
                     style={{ padding: '0 14px', fontSize: 11, borderRadius: 7, border: '0.5px solid var(--border)', background: 'var(--bg-secondary)', color: 'var(--text)', cursor: status === 'testing' ? 'default' : 'pointer', whiteSpace: 'nowrap', opacity: status === 'testing' ? 0.65 : 1 }}>
                     {t('settings.ai.testBtn')}
                   </button>
+                  {existing && (
+                    <button
+                      type="button"
+                      onClick={() => setDraftKeys(prev => pendingClear
+                        ? Object.fromEntries(Object.entries(prev).filter(([provider]) => provider !== p))
+                        : { ...prev, [p]: '' })}
+                      style={{ padding: '0 10px', fontSize: 11, borderRadius: 7, border: '0.5px solid var(--border)', background: 'transparent', color: 'var(--c-danger)', cursor: 'pointer', whiteSpace: 'nowrap' }}
+                    >
+                      {pendingClear ? 'Undo' : 'Clear'}
+                    </button>
+                  )}
                 </div>
               </div>
             )
@@ -1050,9 +1453,12 @@ function AiModelSettings() {
         </div>
       </SettingsSection>
 
-      <Btn variant="primary" onClick={save} disabled={saving}>
+      <Btn variant="primary" onClick={save} disabled={saving || customConfigInvalid}>
         {saving ? t('settings.ai.saving') : t('settings.ai.saveBtn')}
       </Btn>
+      {customConfigInvalid && (
+        <div style={{ fontSize: 11, color: 'var(--c-danger)' }}>Complete each custom model ID and HTTPS endpoint before saving.</div>
+      )}
     </div>
   )
 }
@@ -1065,13 +1471,15 @@ function FeatureModelPicker({ value, mixed, onChange }: {
   const { t } = useI18n()
   const [open, setOpen] = useState(false)
   const isDefault = value === null && !mixed
+  const isCustom = !isDefault && !mixed && value?.provider === 'custom'
 
   return (
     <div style={{ position: 'relative' }}>
       <button
+        type="button"
         onClick={() => setOpen(v => !v)}
         style={{ fontSize: 11, padding: '4px 10px', borderRadius: 6, border: '0.5px solid var(--border)', background: isDefault ? 'rgba(79,70,229,0.06)' : 'var(--bg)', color: isDefault ? 'var(--primary)' : 'var(--text)', cursor: 'pointer', whiteSpace: 'nowrap' }}>
-        {mixed ? 'Mixed ▾' : isDefault ? `✦ ${APPLYMATE_LABEL} ▾` : `${value!.model.split('-').slice(-1)[0]} ▾`}
+         {mixed ? 'Mixed ▾' : isDefault ? `✦ ${APPLYMATE_LABEL} ▾` : isCustom ? 'Custom ▾' : `${value!.model.split('-').slice(-1)[0]} ▾`}
       </button>
 
       {open && (
@@ -1081,7 +1489,7 @@ function FeatureModelPicker({ value, mixed, onChange }: {
             <div style={{ padding: '6px 10px', fontSize: 9, fontWeight: 700, color: 'var(--text-muted)', borderBottom: '0.5px solid var(--border)', letterSpacing: 1 }}>{t('settings.ai.pickModel').toUpperCase()}</div>
 
             {/* ── ApplyMate default ── */}
-            <button onClick={() => { onChange(null); setOpen(false) }} style={{
+            <button type="button" onClick={() => { onChange(null); setOpen(false) }} style={{
               display: 'flex', alignItems: 'center', gap: 8, width: '100%', padding: '10px 12px',
               background: isDefault ? 'rgba(79,70,229,0.06)' : 'none', border: 'none', cursor: 'pointer', textAlign: 'left',
             }}>
@@ -1104,6 +1512,19 @@ function FeatureModelPicker({ value, mixed, onChange }: {
                 })}
               </div>
             ))}
+
+            <div style={{ height: 1, background: 'var(--border)', margin: '2px 0' }} />
+            <button type="button" onClick={() => { onChange({ provider: 'custom', model: '', apiBase: '' }); setOpen(false) }} style={{
+              display: 'flex', alignItems: 'center', gap: 8, width: '100%', padding: '10px 12px',
+              background: isCustom ? 'rgba(79,70,229,0.06)' : 'none', border: 'none', cursor: 'pointer', textAlign: 'left',
+            }}>
+              <span style={{ fontSize: 14 }}>⚙</span>
+              <div style={{ flex: 1 }}>
+                <div style={{ fontSize: 12, fontWeight: 600, color: 'var(--text)' }}>Custom provider</div>
+                <div style={{ fontSize: 10, color: 'var(--text-muted)' }}>Any OpenAI-compatible HTTPS endpoint</div>
+              </div>
+              {isCustom && <span style={{ fontSize: 10, color: 'var(--primary)' }}>✓</span>}
+            </button>
           </div>
         </>
       )}
@@ -1117,7 +1538,7 @@ function ModelOption({ m, active, onSelect }: {
   onSelect: () => void
 }) {
   return (
-    <button onClick={onSelect} style={{
+    <button type="button" onClick={onSelect} style={{
       display: 'flex', alignItems: 'center', gap: 8, width: '100%', padding: '8px 12px',
       background: active ? 'rgba(79,70,229,0.06)' : 'none', border: 'none', cursor: 'pointer', textAlign: 'left',
     }}>

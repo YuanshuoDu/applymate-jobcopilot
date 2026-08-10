@@ -9,6 +9,9 @@ type ApplyResultRecord = {
   error: string | null
   durationMs: number | null
   createdAt: Date
+  taskId?: string | null
+  taskStatus?: string | null
+  checkpoint?: string | null
 }
 
 function errorClass(error: string | null) {
@@ -33,5 +36,8 @@ export function toAdminApplicationMetadata(result: ApplyResultRecord) {
     errorClass: errorClass(result.error),
     durationMs: result.durationMs,
     createdAt: result.createdAt,
+    taskId: result.taskId ?? null,
+    taskStatus: result.taskStatus ?? null,
+    checkpoint: result.checkpoint ?? null,
   }
 }

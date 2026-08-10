@@ -1,7 +1,8 @@
 import { NextRequest, NextResponse } from 'next/server'
+import { getDefaultAtsPolicy } from '@jobcopilot/shared'
 import { isAdminResponse, requireAdmin } from '@/lib/admin/authorization'
 import { writeAdminAudit } from '@/lib/admin/audit'
-import { hardRpsLimit, isAtsSourceKey } from '@/lib/admin/ats-service'
+import { isAtsSourceKey } from '@/lib/admin/ats-service'
 import { db } from '@/lib/db'
 
 export async function GET(request: NextRequest, context: { params: Promise<{ sourceKey: string }> }) {
@@ -14,5 +15,11 @@ export async function GET(request: NextRequest, context: { params: Promise<{ sou
     db.atsEmployer.aggregate({ where: { atsType: sourceKey }, _count: { id: true }, _max: { lastSeen: true } }),
   ])
   await writeAdminAudit({ requestId: actor.requestId, actorUserId: actor.userId, actorRoleKey: actor.roleKey, action: 'ats.health_viewed', targetType: 'ats_source', targetId: sourceKey, outcome: 'success' })
-  return NextResponse.json({ sourceKey, credentialConfigured: false, registryCount: registry._count.id, lastSeenAt: registry._max.lastSeen, policy: policy ?? { state: 'enabled', enabled: true, rolloutPercent: 100, globalRpsLimit: hardRpsLimit(sourceKey), perTenantRpsLimit: 1, maxRetries: 3, backoffBaseMs: 1000, allowAutoApply: false, version: 1, lastAcknowledgedVersion: null, updatedAt: null }, propagation: policy?.lastAcknowledgedVersion === policy?.version ? 'acknowledged' : 'pending' }, { headers: { 'Cache-Control': 'no-store', 'x-request-id': actor.requestId } })
+  const effectivePolicy = policy
+    ? { ...policy, configured: true }
+    : { ...getDefaultAtsPolicy(sourceKey), configured: false, version: 1, lastAcknowledgedVersion: null, updatedAt: null }
+  const propagation = policy
+    ? policy.lastAcknowledgedVersion === policy.version ? 'acknowledged' : 'pending'
+    : 'not-configured'
+  return NextResponse.json({ sourceKey, credentialRequirement: 'none', registryCount: registry._count.id, lastSeenAt: registry._max.lastSeen, policy: effectivePolicy, propagation }, { headers: { 'Cache-Control': 'no-store', 'x-request-id': actor.requestId } })
 }

@@ -2,8 +2,30 @@ import { db } from "@/lib/db";
 import { Prisma } from "@prisma/client";
 import { enqueueApplyTask } from "@/lib/apply-queue-client";
 import { assessApplicationPreflight, isSupportedAutomatedApplyUrl } from "@/lib/agent/application-preflight";
+import { isRuntimeFeatureEnabled } from '@/lib/runtime-feature-flags'
+import { isFeatureAllowed, resolveAiAccess } from '@/lib/entitlements'
 
 export class AutoApplyError extends Error {}
+
+async function assertActiveAccount(userId: string): Promise<void> {
+  const user = await db.user.findUnique({ where: { id: userId }, select: { accountStatus: true } })
+  if (user?.accountStatus !== 'active') throw new AutoApplyError('Account is not active.')
+}
+
+async function assertUnattendedApplyEnabled(userId: string): Promise<void> {
+  try {
+    if (!await isFeatureAllowed(userId, 'auto_apply')) throw new AutoApplyError('This feature is not included in your current plan.')
+    const aiAccess = await resolveAiAccess(userId)
+    if (aiAccess === 'disabled') throw new AutoApplyError('This feature is not included in your current plan.')
+    if (aiAccess === 'exhausted') throw new AutoApplyError('Monthly AI credits exhausted.')
+    if (!await isRuntimeFeatureEnabled('unattended_apply', userId)) {
+      throw new AutoApplyError('Unattended applications are temporarily unavailable.')
+    }
+  } catch (error) {
+    if (error instanceof AutoApplyError) throw error
+    throw new AutoApplyError('Unattended applications are temporarily unavailable.')
+  }
+}
 
 export function validateAutoApplyUrl(rawUrl: string | null | undefined): string {
   const url = rawUrl?.trim();
@@ -16,8 +38,8 @@ export function validateAutoApplyUrl(rawUrl: string | null | undefined): string 
     throw new AutoApplyError("The application URL is invalid.");
   }
 
-  if (parsed.protocol !== "https:" && parsed.protocol !== "http:") {
-    throw new AutoApplyError("The application URL must use HTTP or HTTPS.");
+  if (parsed.protocol !== "https:") {
+    throw new AutoApplyError("Automatic applications require an HTTPS destination.");
   }
 
   if (!isSupportedAutomatedApplyUrl(parsed.toString())) {
@@ -45,6 +67,8 @@ export async function queueApplicationFill(input: {
   applicationTaskId: string;
   resumeAfterUserInput?: boolean;
 }): Promise<{ taskId: string }> {
+  await assertActiveAccount(input.userId)
+  await assertUnattendedApplyEnabled(input.userId)
   const applyUrl = validateAutoApplyUrl(input.applyUrl);
   await assertJobPreflight(input)
   const claimed = await db.applicationTask.updateMany({
@@ -78,6 +102,8 @@ export async function queueAutonomousApplication(input: {
   /** Approved per-job authorization. Global settings can never replace this. */
   approvalId: string;
 }): Promise<{ taskId: string }> {
+  await assertActiveAccount(input.userId)
+  await assertUnattendedApplyEnabled(input.userId)
   const applyUrl = validateAutoApplyUrl(input.applyUrl);
   await assertJobPreflight(input)
   const approval = await db.agentApproval.findFirst({
@@ -183,10 +209,10 @@ export async function queueAutonomousApplication(input: {
     });
     return { taskId };
   } catch (error) {
-    await db.$transaction([
-      db.job.updateMany({ where: { id: input.jobId, userId: input.userId, workflowState: "queued" }, data: { workflowState: "ready_to_apply" } }),
-      db.applicationTask.updateMany({ where: { id: input.applicationTaskId, status: "filling" }, data: { status: "waiting_for_authorization", checkpoint: "queue_retry" } }),
-    ]).catch(() => undefined);
+    await db.$transaction(async tx => {
+      await tx.job.updateMany({ where: { id: input.jobId, userId: input.userId, workflowState: "queued" }, data: { workflowState: "ready_to_apply" } })
+      await tx.applicationTask.updateMany({ where: { id: input.applicationTaskId, status: "filling" }, data: { status: "waiting_for_authorization", checkpoint: "queue_retry" } })
+    }).catch(() => undefined);
     throw error;
   }
 }

@@ -1,7 +1,10 @@
 import { enrichJob } from '@/lib/agent/enrich'
+import { getRuntimeAtsPolicy } from '@/lib/runtime-ats-policy'
+import { detectAtsSource } from '@jobcopilot/shared/ats-url'
 import { fetchGmailMessage } from './gmail-client'
 import { extractRecommendationCards, type GmailRecommendationCard } from './recommendations'
 import { isLikelyJobDetailUrl, recommendationIdentityKey, simplifyRecommendationLocation } from './recommendation-utils'
+import { fetchExternalText } from '@/lib/safe-outbound-url'
 
 export interface RecommendationDetails {
   platform: string | null
@@ -18,20 +21,22 @@ export interface SourceRecommendation extends RecommendationDetails {
 }
 
 /** Reload the source email before saving so My Jobs receives real job details. */
-export async function hydrateRecommendationDetails(input: SourceRecommendation, accessToken: string): Promise<RecommendationDetails> {
+export async function hydrateRecommendationDetails(input: SourceRecommendation, accessToken: string, userId?: string): Promise<RecommendationDetails> {
   const source = await fetchGmailMessage(accessToken, input.gmailMessageId).catch(() => null)
   const card = source ? matchingCard(input, extractRecommendationCards({ html: source.html, text: source.text, platform: input.platform })) : null
   const fromEmail = mergeDetails(input, card)
   if (!isLikelyJobDetailUrl(fromEmail.url)) return fromEmail
 
   try {
-    const response = await fetch(fromEmail.url!, {
+    const atsSource = detectAtsSource(fromEmail.url!)
+    if (atsSource && !(await getRuntimeAtsPolicy(atsSource, userId)).allowed) return fromEmail
+    const html = await fetchExternalText(fromEmail.url!, {
       cache: 'no-store',
       headers: { 'User-Agent': 'ApplyMate/1.0' },
       signal: AbortSignal.timeout(8_000),
     })
-    if (!response.ok) return fromEmail
-    const enriched = await enrichJob({ html: await response.text(), url: fromEmail.url! })
+    if (!html) return fromEmail
+    const enriched = await enrichJob({ html, url: fromEmail.url!, userId })
     return enriched?.description
       ? { ...fromEmail, description: truncate(enriched.description, 2_000), salary: fromEmail.salary ?? enriched.salary ?? null }
       : fromEmail

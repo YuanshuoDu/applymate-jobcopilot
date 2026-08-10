@@ -12,6 +12,7 @@ const mocks = vi.hoisted(() => ({
   resumeUpdate: vi.fn(),
   resumeVersionCreate: vi.fn(),
   activityCreate: vi.fn(),
+  hasEffectiveEntitlement: vi.fn(),
 }))
 
 vi.mock('@/lib/api-helpers', () => ({
@@ -34,6 +35,7 @@ vi.mock('@/lib/model-router', () => ({
   parseAiJson: mocks.parseAiJson,
 }))
 vi.mock('@/lib/persona', () => ({ buildPersona: mocks.buildPersona }))
+vi.mock('@/lib/entitlements', () => ({ hasEffectiveEntitlement: mocks.hasEffectiveEntitlement }))
 
 describe('tailor resume API', () => {
   beforeEach(() => {
@@ -48,7 +50,9 @@ describe('tailor resume API', () => {
     mocks.resumeUpdate.mockReset()
     mocks.resumeVersionCreate.mockReset()
     mocks.activityCreate.mockReset()
+    mocks.hasEffectiveEntitlement.mockReset()
     mocks.prepareAiRoute.mockResolvedValue({ userId: 'user_1', cfg: { provider: 'test', model: 'm1' } })
+    mocks.hasEffectiveEntitlement.mockResolvedValue(true)
     mocks.buildPersona.mockResolvedValue('EXPERIENCE:\n- Backend engineer')
   })
 

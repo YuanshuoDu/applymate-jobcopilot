@@ -11,38 +11,52 @@ import { getCachedApiResponse, setCachedApiResponse } from './api-cache'
  * while a fresh request runs in the background; explicit refetches still show
  * the existing loading state.
  */
-export function useApi<T>(url: string) {
+export function useApi<T>(url: string, options: { cache?: boolean; enabled?: boolean } = {}) {
   const { data: session, status } = useSession()
   const userId = status === 'authenticated' ? session.user?.id ?? null : null
-  const [data,    setData   ] = useState<T | null>(() => getCachedApiResponse<T>(url, userId))
-  const [loading, setLoading] = useState(() => getCachedApiResponse<T>(url, userId) === null)
+  const cacheEnabled = options.cache !== false
+  const enabled = options.enabled !== false
+  const initial = enabled && cacheEnabled ? getCachedApiResponse<T>(url, userId) : null
+  const [data,    setData   ] = useState<T | null>(() => initial)
+  const [loading, setLoading] = useState(() => initial === null)
   const [error,   setError  ] = useState<string | null>(null)
 
   const load = useCallback(async (showLoading: boolean, signal?: AbortSignal) => {
+    if (!enabled) {
+      setLoading(false)
+      setError(null)
+      return
+    }
     if (showLoading) setLoading(true)
     setError(null)
     try {
-      const res  = await fetch(url, { signal })
+      const res  = await fetch(url, { signal, cache: cacheEnabled ? 'default' : 'no-store' })
       const json = await res.json().catch(() => ({}))
       if (!res.ok) throw new Error((json as { error?: string }).error ?? 'Request failed')
       const nextData = json as T
-      setCachedApiResponse(url, nextData, userId)
+      if (cacheEnabled) setCachedApiResponse(url, nextData, userId)
       setData(nextData)
     } catch (e) {
       if (e instanceof DOMException && e.name === 'AbortError') return
       // Preserve usable cached data if a background refresh temporarily fails.
-      if (getCachedApiResponse<T>(url, userId) === null) {
+      if (!cacheEnabled || getCachedApiResponse<T>(url, userId) === null) {
         setError(e instanceof Error ? e.message : 'Unknown error')
       }
     } finally {
       if (!signal?.aborted) setLoading(false)
     }
-  }, [url, userId])
+  }, [url, userId, cacheEnabled, enabled])
 
   const refetch = useCallback(() => load(true), [load])
 
   useEffect(() => {
-    const cached = getCachedApiResponse<T>(url, userId)
+    if (!enabled) {
+      setData(null)
+      setLoading(false)
+      setError(null)
+      return
+    }
+    const cached = cacheEnabled ? getCachedApiResponse<T>(url, userId) : null
     const controller = new AbortController()
     // URLs can change while a page remains mounted (for example the Dashboard
     // week picker). Reset to that URL's cached response rather than retaining
@@ -51,7 +65,7 @@ export function useApi<T>(url: string) {
     setLoading(cached === null)
     void load(cached === null, controller.signal)
     return () => controller.abort()
-  }, [load, url, userId])
+  }, [load, url, userId, cacheEnabled, enabled])
 
   return { data, loading, error, refetch }
 }
@@ -65,9 +79,11 @@ export async function apiMutate<T = unknown>(
   body?: unknown,
 ): Promise<{ data: T | null; error: string | null }> {
   try {
+    const headers: Record<string, string> = body !== undefined ? { 'Content-Type': 'application/json' } : {}
+    headers['Idempotency-Key'] = crypto.randomUUID()
     const res  = await fetch(url, {
       method,
-      headers: body !== undefined ? { 'Content-Type': 'application/json' } : {},
+      headers,
       body:    body !== undefined ? JSON.stringify(body) : undefined,
     })
     const json = await res.json().catch(() => ({}))

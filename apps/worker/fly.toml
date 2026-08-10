@@ -12,6 +12,7 @@ kill_timeout = 30
   CLOAK_MAX_WORKERS = "1"
   CLOAK_PROFILES_DIR = "/data/cloak-profiles"
   ENABLE_BULL_BOARD = "0"
+  WORKER_ADMIN_HOST = "0.0.0.0"
 
 [http_service]
   internal_port = 3001

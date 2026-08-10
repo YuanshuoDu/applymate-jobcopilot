@@ -21,7 +21,7 @@ interface ScoutTaskPayload {
 }
 
 export async function POST(req: NextRequest) {
-  const auth = await requireAuth(req)
+  const auth = await requireAuth(req, 'job_discovery')
   if (isErrorResponse(auth)) return auth
 
   const connection = new Redis(redisUrl, { maxRetriesPerRequest: null })

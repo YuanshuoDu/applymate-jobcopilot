@@ -3,6 +3,7 @@ import { getPool } from "./apply-results.js";
 
 export interface FormPatternRow {
   id: string;
+  userId: string;
   atsHost: string;
   urlPattern: string;
   fieldMapping: Record<string, string>;
@@ -27,6 +28,7 @@ function normalizeFieldMapping(value: unknown): Record<string, string> {
  * increments successCount, resets failureCount, and updates mapping.
  */
 export async function upsertFormPattern(params: {
+  userId: string;
   atsHost: string;
   urlPattern: string;
   fieldMapping: Record<string, string>;
@@ -34,17 +36,17 @@ export async function upsertFormPattern(params: {
   const id = randomUUID();
   await getPool().query(
     `INSERT INTO form_patterns (
-       id, ats_host, url_pattern, field_mapping, success_count, failure_count,
+       id, user_id, ats_host, url_pattern, field_mapping, success_count, failure_count,
        last_success_at, created_at, updated_at
      )
-     VALUES ($1, $2, $3, $4, 1, 0, NOW(), NOW(), NOW())
-     ON CONFLICT (ats_host, url_pattern) DO UPDATE
+     VALUES ($1, $2, $3, $4, $5, 1, 0, NOW(), NOW(), NOW())
+     ON CONFLICT (user_id, ats_host, url_pattern) DO UPDATE
      SET field_mapping   = EXCLUDED.field_mapping,
          success_count   = form_patterns.success_count + 1,
          failure_count   = 0,
          last_success_at = NOW(),
          updated_at      = NOW()`,
-    [id, params.atsHost, params.urlPattern, JSON.stringify(params.fieldMapping)]
+    [id, params.userId, params.atsHost, params.urlPattern, JSON.stringify(params.fieldMapping)]
   );
 }
 
@@ -53,21 +55,23 @@ export async function upsertFormPattern(params: {
  * Returns null if no match is found.
  */
 export async function findFormPattern(
+  userId: string,
   atsHost: string,
   urlPattern: string
 ): Promise<FormPatternRow | null> {
   const result = await getPool().query(
-    `SELECT id, ats_host, url_pattern, field_mapping, success_count, failure_count, last_success_at
+    `SELECT id, user_id, ats_host, url_pattern, field_mapping, success_count, failure_count, last_success_at
      FROM form_patterns
-     WHERE ats_host = $1 AND url_pattern = $2
+     WHERE user_id = $1 AND ats_host = $2 AND url_pattern = $3
      LIMIT 1`,
-    [atsHost, urlPattern]
+    [userId, atsHost, urlPattern]
   );
   if (result.rows.length === 0) return null;
 
   const row = result.rows[0];
   return {
     id: row.id,
+    userId: row.user_id,
     atsHost: row.ats_host,
     urlPattern: row.url_pattern,
     fieldMapping: normalizeFieldMapping(row.field_mapping),

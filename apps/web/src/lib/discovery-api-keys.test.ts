@@ -4,7 +4,11 @@ const { findUnique } = vi.hoisted(() => ({ findUnique: vi.fn() }))
 
 vi.mock('@/lib/db', () => ({ db: { userApiKeys: { findUnique } } }))
 
-import { getDiscoveryApiKeys } from './discovery-api-keys'
+import {
+  DISCOVERY_KEY_ERROR_MESSAGES,
+  getDiscoveryApiKeyStatus,
+  getDiscoveryApiKeys,
+} from './discovery-api-keys'
 
 describe('getDiscoveryApiKeys', () => {
   beforeEach(() => {
@@ -28,5 +32,33 @@ describe('getDiscoveryApiKeys', () => {
     await expect(getDiscoveryApiKeys('user_1')).resolves.toEqual({
       adzunaAppId: 'platform-id', adzunaAppKey: 'platform-key', rapidapiKey: 'platform-rapid',
     })
+  })
+
+  it('does not mix a partial user Adzuna pair with platform credentials', async () => {
+    findUnique.mockResolvedValue({ adzunaAppId: 'user-id', adzunaAppKey: null, rapidapiKey: null })
+
+    await expect(getDiscoveryApiKeys('user_1')).resolves.toEqual({
+      adzunaAppId: 'user-id', adzunaAppKey: '', rapidapiKey: 'platform-rapid',
+    })
+  })
+
+  it('reports effective source and incomplete pair state without exposing values', async () => {
+    findUnique.mockResolvedValue({ adzunaAppId: 'user-id', adzunaAppKey: null, rapidapiKey: 'user-rapid' })
+
+    await expect(getDiscoveryApiKeyStatus('user_1')).resolves.toEqual({
+      hasAdzuna: false,
+      hasRapidapi: true,
+      userHasAdzuna: true,
+      userHasRapidapi: true,
+      adzunaSource: 'incomplete',
+      rapidapiSource: 'user',
+      needsAdzunaPair: true,
+    })
+  })
+
+  it('keeps missing-credential guidance in one Settings-focused contract', () => {
+    expect(DISCOVERY_KEY_ERROR_MESSAGES.rapidapi).toContain('Settings')
+    expect(DISCOVERY_KEY_ERROR_MESSAGES.rapidapi).not.toContain('RAPIDAPI_KEY')
+    expect(DISCOVERY_KEY_ERROR_MESSAGES.adzuna).toContain('Settings')
   })
 })

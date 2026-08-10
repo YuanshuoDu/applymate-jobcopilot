@@ -15,6 +15,7 @@ vi.mock('@/lib/api-helpers', () => ({
 vi.mock('@/lib/db', () => ({
   db: { agentSession: { findFirst: mocks.findFirst } },
 }))
+vi.mock('@/lib/entitlements', () => ({ hasEffectiveEntitlement: vi.fn().mockResolvedValue(true) }))
 
 // This test exits before the SSE callback runs. Mock its heavy dependencies so
 // the session-ownership assertion stays isolated when the full suite is busy.
@@ -41,6 +42,7 @@ describe('agent run API session binding', () => {
 
     expect(response.status).toBe(404)
     await expect(response.json()).resolves.toEqual({ error: 'Session not found' })
+    expect(mocks.prepareAiRoute).toHaveBeenCalledWith(expect.any(NextRequest), 'agent', 'job_discovery')
     expect(mocks.findFirst).toHaveBeenCalledWith({
       where: { id: 'deleted_session', userId: 'user_1' },
       select: { id: true },

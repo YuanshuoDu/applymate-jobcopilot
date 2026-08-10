@@ -179,6 +179,7 @@ export function classifyElement(el: HTMLElement): FormFieldSchema | null {
 
   // Always try to extract a label — use name humanization as last resort
   const label = extractLabel(el)
+  if (isSensitiveField(el, label)) return null
 
   const placeholder = el.getAttribute('placeholder') ?? undefined
   const isRequired = el.getAttribute('required') !== null ||
@@ -415,6 +416,7 @@ function extractSurroundingText(el: HTMLElement): string {
 
 /** Read the current user-filled value from a form element */
 function readCurrentValue(el: HTMLElement): string | undefined {
+  if (isSensitiveField(el, extractLabel(el))) return undefined
   const tag = el.tagName.toLowerCase()
   const type = (el as HTMLInputElement).type ?? ''
 
@@ -443,6 +445,18 @@ function readCurrentValue(el: HTMLElement): string | undefined {
   }
   const val = (el as HTMLInputElement).value?.trim()
   return val || undefined
+}
+
+const SENSITIVE_FIELD = /password|passcode|one[-\s]?time|otp|token|secret|security[\s_-]?code|verification[\s_-]?code|cvv|cvc|card[\s_-]?number|social[\s_-]?security|\bssn\b|\bpin\b/i
+
+function isSensitiveField(el: HTMLElement, label: string): boolean {
+  const type = (el.getAttribute('type') ?? '').toLowerCase()
+  if (type === 'password') return true
+  const metadata = [
+    el.getAttribute('name'), el.getAttribute('id'), el.getAttribute('autocomplete'),
+    el.getAttribute('placeholder'), el.getAttribute('aria-label'), label,
+  ].filter(Boolean).join(' ')
+  return SENSITIVE_FIELD.test(metadata)
 }
 
 // ── Shadow DOM ────────────────────────────────────────────────
@@ -560,6 +574,7 @@ function classifyElementInDoc(el: HTMLElement, doc: Document): FormFieldSchema |
   }
 
   const label = extractLabelInDoc(el, doc)
+  if (isSensitiveField(el, label)) return null
   const placeholder = el.getAttribute('placeholder') ?? undefined
   const isRequired = el.getAttribute('required') !== null ||
     el.getAttribute('aria-required') === 'true'

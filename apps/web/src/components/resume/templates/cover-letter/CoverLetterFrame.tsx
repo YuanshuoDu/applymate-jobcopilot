@@ -1,6 +1,7 @@
 // apps/web/src/components/resume/templates/cover-letter/CoverLetterFrame.tsx
 import React from 'react'
 import { Document, Page, Text, View, StyleSheet } from '@react-pdf/renderer'
+import { safeAccentColor } from '@/lib/template-options'
 
 export interface CoverLetterDocProps {
   content:      string          // the letter body text
@@ -40,7 +41,7 @@ export function CoverLetterDoc({
   templateVariant,
 }: CoverLetterDocProps) {
   const d       = getDensityScale(density)
-  const color   = accentColor
+  const color   = safeAccentColor(accentColor)
   const dateStr = date
     ? date.toLocaleDateString('en-GB', { day: 'numeric', month: 'long', year: 'numeric' })
     : new Date().toLocaleDateString('en-GB', { day: 'numeric', month: 'long', year: 'numeric' })

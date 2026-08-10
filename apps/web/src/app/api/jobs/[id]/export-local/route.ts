@@ -109,7 +109,7 @@ export async function POST(req: NextRequest, { params }: Params) {
     return err('The final documents must pass a factual audit before export.', 409)
   }
   const root = process.env.APPLYMATE_LOCAL_EXPORT_ROOT || 'D:\\My Jobs resume'
-  const folderPath = join(root, safeName(`${job.company} - ${job.role}`))
+  const folderPath = join(root, safeName(`${auth.userId} - ${job.company} - ${job.role}`))
   if (body.openOnly) {
     try { await access(folderPath) } catch { return err('The exported job folder no longer exists. Save the PDFs again first.', 404) }
     if (process.platform === 'win32') await openFile('explorer.exe', [folderPath])

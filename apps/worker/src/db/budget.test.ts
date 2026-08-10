@@ -17,25 +17,50 @@ describe("budget", () => {
 
   it("allows AI usage when used is below the monthly limit", async () => {
     mocks.query
+      .mockResolvedValueOnce({ rows: [{ enabled: true, configured: true, configured_limit: 100 }] })
       .mockResolvedValueOnce({ rows: [] })
-      .mockResolvedValueOnce({ rows: [{ used: 3, limit: 30 }] });
+      .mockResolvedValueOnce({ rows: [] })
+      .mockResolvedValueOnce({ rows: [{ used: 3, limit: 100 }] });
 
     const result = await checkBudget("user-1");
 
-    expect(result).toEqual({ allowed: true, used: 3, limit: 30 });
-    expect(mocks.query).toHaveBeenCalledTimes(2);
-    expect(String(mocks.query.mock.calls[0][0])).toContain("INSERT INTO ai_budgets");
-    expect(String(mocks.query.mock.calls[1][0])).toContain("SELECT used");
+    expect(result).toEqual({ allowed: true, used: 3, limit: 100 });
+    expect(mocks.query).toHaveBeenCalledTimes(4);
+    expect(String(mocks.query.mock.calls[0][0])).toContain('plan_catalogue');
+    expect(String(mocks.query.mock.calls[0][0])).toContain('jsonb_array_elements_text');
+    expect(String(mocks.query.mock.calls[1][0])).toContain("INSERT INTO ai_budgets");
+    expect(String(mocks.query.mock.calls[3][0])).toContain("SELECT used");
   });
 
   it("blocks AI usage when used has reached the monthly limit", async () => {
     mocks.query
+      .mockResolvedValueOnce({ rows: [{ enabled: true, configured: true, configured_limit: 25 }] })
       .mockResolvedValueOnce({ rows: [] })
-      .mockResolvedValueOnce({ rows: [{ used: 30, limit: 30 }] });
+      .mockResolvedValueOnce({ rows: [] })
+      .mockResolvedValueOnce({ rows: [{ used: 25, limit: 25 }] });
 
     const result = await checkBudget("user-1");
 
-    expect(result).toEqual({ allowed: false, used: 30, limit: 30 });
+    expect(result).toEqual({ allowed: false, used: 25, limit: 25 });
+  });
+
+  it("fails open to the row limit while the plan catalogue is unavailable", async () => {
+    mocks.query
+      .mockRejectedValueOnce(new Error('relation "plan_catalogue" does not exist'))
+      .mockResolvedValueOnce({ rows: [] })
+      .mockResolvedValueOnce({ rows: [{ used: 3, limit: 30 }] });
+
+    await expect(checkBudget("user-1")).resolves.toEqual({ allowed: true, used: 3, limit: 30 });
+  });
+
+  it("blocks a disabled AI entitlement before invoking the model", async () => {
+    mocks.query
+      .mockResolvedValueOnce({ rows: [{ enabled: false, configured: true, configured_limit: 100 }] })
+      .mockResolvedValueOnce({ rows: [] })
+      .mockResolvedValueOnce({ rows: [] })
+      .mockResolvedValueOnce({ rows: [{ used: 0, limit: 100 }] });
+
+    await expect(checkBudget("user-1")).resolves.toEqual({ allowed: false, used: 0, limit: 100 });
   });
 
   it("increments the monthly budget usage for the current user", async () => {

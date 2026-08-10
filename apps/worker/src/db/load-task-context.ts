@@ -23,7 +23,7 @@ export async function loadTaskContext(
 ): Promise<TaskContext> {
   const [userRes, jobRes, resumeRes] = await Promise.all([
     pool.query(
-      'SELECT name, email, phone, location, linkedin, "personaFields" FROM "User" WHERE id = $1',
+      'SELECT name, email, phone, location, linkedin, "personaFields", "accountStatus" FROM "User" WHERE id = $1',
       [userId]
     ),
     pool.query(
@@ -41,6 +41,7 @@ export async function loadTaskContext(
   }
 
   const user = userRes.rows[0] ?? {};
+  if (user.accountStatus !== "active") throw new Error("Account is not active");
   const job = jobRes.rows[0];
 
   // Build flat persona map from base fields

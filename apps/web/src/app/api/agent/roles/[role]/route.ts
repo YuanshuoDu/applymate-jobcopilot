@@ -7,6 +7,14 @@ import { requireAuth, isErrorResponse, ok, err } from '@/lib/api-helpers'
 import { upsertRoleConfig, loadRoleConfigs, AGENT_ROLES } from '@/lib/agent/role-config'
 import type { AgentRoleType }              from '@/lib/agent/role-config'
 
+function publicRoleConfig(role: Awaited<ReturnType<typeof loadRoleConfigs>>[number] | null) {
+  if (!role) return null
+  const apiKey = typeof role.apiKey === 'string' && role.apiKey
+    ? (role.apiKey.length <= 8 ? '••••' : `••••${role.apiKey.slice(-4)}`)
+    : ''
+  return { ...role, apiKey, apiKeyConfigured: Boolean(role.apiKey) }
+}
+
 export async function GET(
   req: NextRequest,
   { params }: { params: Promise<{ role: string }> },
@@ -19,7 +27,7 @@ export async function GET(
 
   const roles = await loadRoleConfigs(auth.userId)
   const found = roles.find(r => r.role === role)
-  return ok(found ?? null)
+  return ok(publicRoleConfig(found ?? null))
 }
 
 export async function PATCH(
@@ -39,13 +47,15 @@ export async function PATCH(
     provider?: string; model?: string; apiKey?: string | null; enabled?: boolean; systemPrompt?: string | null
   }
 
+  const preservedMaskedKey = typeof apiKey === 'string' && apiKey.startsWith('••••')
+
   const updated = await upsertRoleConfig(auth.userId, role as AgentRoleType, {
     ...(provider     !== undefined ? { provider }                           : {}),
     ...(model        !== undefined ? { model }                              : {}),
-    ...(apiKey       !== undefined ? { apiKey: apiKey ?? undefined }        : {}),
+    ...(apiKey !== undefined && !preservedMaskedKey ? { apiKey: apiKey ?? undefined } : {}),
     ...(enabled      !== undefined ? { enabled }                            : {}),
     ...(systemPrompt !== undefined ? { systemPrompt: systemPrompt ?? null } : {}),
   })
 
-  return ok(updated)
+  return ok(publicRoleConfig(updated))
 }

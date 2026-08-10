@@ -33,7 +33,11 @@ describe("DELETE /api/agent/application-tasks", () => {
     mocks.update.mockResolvedValue({ id: "task_1" })
     mocks.approvalUpdateMany.mockResolvedValue({ count: 1 })
     mocks.eventCreate.mockResolvedValue({ id: "event_1" })
-    mocks.transaction.mockImplementation((operations: Array<Promise<unknown>>) => Promise.all(operations))
+    mocks.transaction.mockImplementation(async (callback: (tx: unknown) => Promise<unknown>) => callback({
+      applicationTask: { update: mocks.update },
+      applicationTaskEvent: { create: mocks.eventCreate },
+      agentApproval: { updateMany: mocks.approvalUpdateMany },
+    }))
   })
 
   it("revokes a pending final-submission authorization with the cancelled task", async () => {

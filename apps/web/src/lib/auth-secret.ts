@@ -1,6 +1,9 @@
 const DEVELOPMENT_FALLBACK = 'development-only-auth-secret'
 const BUILD_FALLBACK = 'build-time-auth-secret-not-for-runtime'
 
+export const EXTENSION_TOKEN_ISSUER = 'applymate-extension'
+export const EXTENSION_TOKEN_AUDIENCE = 'applymate-extension'
+
 function isProductionBuild() {
   return process.env.NEXT_PHASE === 'phase-production-build'
 }

@@ -21,7 +21,8 @@ type ReplayLogEntry = { field?: string; selector: string; action: string };
 export async function replayPattern(
   page: Page,
   pattern: FormPatternRow,
-  persona: Record<string, string>
+  persona: Record<string, string>,
+  beforeSubmit?: () => Promise<boolean>,
 ): Promise<HarnessResult> {
   const startedAt = Date.now();
   const log: ReplayLogEntry[] = [];
@@ -60,8 +61,18 @@ export async function replayPattern(
     };
   }
 
-  const submitted = await clickSubmit(page, SUBMIT_SELECTORS);
-  if (!submitted) {
+  const submission = await clickSubmit(page, SUBMIT_SELECTORS, beforeSubmit);
+  if (submission === 'blocked') {
+    return {
+      status: "manual",
+      turns: 1,
+      error: "Form filled and ready for user review.",
+      durationMs: Date.now() - startedAt,
+      log,
+      reviewReady: true,
+    };
+  }
+  if (submission === 'missing') {
     return {
       status: "manual",
       turns: 1,

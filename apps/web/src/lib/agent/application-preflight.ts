@@ -1,3 +1,5 @@
+import { detectAtsSource } from '@jobcopilot/shared/ats-url'
+
 /**
  * Deterministic checks that run before an Agent spends credits on an
  * application or permits a browser worker to touch an external form.
@@ -23,14 +25,6 @@ export type ApplicationPreflight = {
   issues: ApplicationPreflightIssue[]
 }
 
-const SUPPORTED_ATS = [
-  /(?:^|\.)myworkdayjobs\.com$/i,
-  /(?:^|\.)greenhouse\.io$/i,
-  /(?:^|\.)lever\.co$/i,
-  /(?:^|\.)smartrecruiters\.com$/i,
-  /(?:^|\.)jobs\.personio\.com$/i,
-]
-
 const GENERIC_COMPANY_CLAIMS = new Set(["our", "the", "us", "team", "future", "company"])
 
 function normalizeCompany(value: string) {
@@ -40,14 +34,7 @@ function normalizeCompany(value: string) {
 }
 
 function directAtsUrl(rawUrl: string | null | undefined): boolean {
-  if (!rawUrl) return false
-  try {
-    const url = new URL(rawUrl)
-    return (url.protocol === "https:" || url.protocol === "http:")
-      && SUPPORTED_ATS.some(pattern => pattern.test(url.hostname))
-  } catch {
-    return false
-  }
+  return Boolean(rawUrl && detectAtsSource(rawUrl))
 }
 
 /** Extract only explicit company claims from the opening of a job description. */

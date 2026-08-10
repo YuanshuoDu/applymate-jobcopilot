@@ -36,6 +36,7 @@
  * See: docs/scraping-autoapply-design.md §4 (ATS Coverage Matrix)
  */
 
+import { pinnedFetch } from '@jobcopilot/shared'
 import type { DiscoveredJob } from "../discover"
 import { acquire } from "../pace/policies"
 
@@ -91,7 +92,7 @@ export async function fetchPersonio(slug: string): Promise<DiscoveredJob[]> {
 
   try {
     await acquire({ ats: "personio" })
-    const r = await fetch(url, {
+  const r = await pinnedFetch(url, {
       headers: {
         "User-Agent": "ApplyMate/1.0",
         "Accept": "application/xml, text/xml, */*",
