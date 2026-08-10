@@ -8,7 +8,7 @@ import { useApi } from '@/lib/hooks'
 type TableItem = { id: string | number; [key: string]: unknown }
 type Column = { label: string; value: (item: TableItem) => ReactNode; sortKey?: string }
 type Filter = { label: string; param: string; options: Array<{ label: string; value: string }> }
-type BulkAction = { label: string; onRun: (ids: string[]) => void | Promise<void> }
+export type BulkAction = { label: string; onRun: (ids: string[]) => void | Promise<void> }
 
 function dateValue(value: unknown) {
   return value ? new Date(String(value)).toLocaleString() : '-'
@@ -39,6 +39,7 @@ export function AdminDataTable({ title, subtitle, endpoint, columns, searchable 
     setSort(url.searchParams.get('sort') ?? '')
     setDirection(url.searchParams.get('direction') === 'desc' ? 'desc' : 'asc')
     setCursor(url.searchParams.get('cursor'))
+    setCursorStack((url.searchParams.get('cursorStack') ?? '').split('|').filter(Boolean))
     setMounted(true)
   }, [filters])
   const params = new URLSearchParams()
@@ -51,7 +52,10 @@ export function AdminDataTable({ title, subtitle, endpoint, columns, searchable 
   const url = `${endpoint}?${params.toString()}`
   const { data, loading, error } = useApi<{ items: TableItem[]; nextCursor: string | null }>(url)
   const rows = data?.items ?? []
-  function resetPage() { setCursor(null); setCursorStack([]) }
+  function resetPage() {
+    setCursor(null)
+    setCursorStack([])
+  }
   function replaceUrl(nextQuery: string, nextFilters: Record<string, string>, nextSort: string, nextDirection: 'asc' | 'desc') {
     const nextUrl = new URL(window.location.href)
     if (nextQuery.trim()) nextUrl.searchParams.set('q', nextQuery.trim()); else nextUrl.searchParams.delete('q')
@@ -59,19 +63,38 @@ export function AdminDataTable({ title, subtitle, endpoint, columns, searchable 
     if (nextSort) nextUrl.searchParams.set('sort', nextSort); else nextUrl.searchParams.delete('sort')
     if (nextSort || nextDirection !== 'asc') nextUrl.searchParams.set('direction', nextDirection); else nextUrl.searchParams.delete('direction')
     nextUrl.searchParams.delete('cursor')
+    nextUrl.searchParams.delete('cursorStack')
     window.history.replaceState(null, '', `${nextUrl.pathname}${nextUrl.search}`)
   }
   function setFilter(param: string, value: string) { const nextFilters = { ...filterValues, [param]: value }; setFilterValues(nextFilters); replaceUrl(query, nextFilters, sort, direction); resetPage() }
-  function setCursorInUrl(value: string | null) { const nextUrl = new URL(window.location.href); if (value) nextUrl.searchParams.set('cursor', value); else nextUrl.searchParams.delete('cursor'); window.history.replaceState(null, '', `${nextUrl.pathname}${nextUrl.search}`) }
-  function nextPage() { if (data?.nextCursor) { setCursorStack(current => [...current, cursor ?? '']); setCursor(data.nextCursor); setCursorInUrl(data.nextCursor) } }
-  function previousPage() { const previous = cursorStack[cursorStack.length - 1]; setCursorStack(current => current.slice(0, -1)); setCursor(previous || null); setCursorInUrl(previous || null) }
+  function setCursorInUrl(value: string | null, stack: string[]) {
+    const nextUrl = new URL(window.location.href)
+    if (value) nextUrl.searchParams.set('cursor', value); else nextUrl.searchParams.delete('cursor')
+    if (stack.length) nextUrl.searchParams.set('cursorStack', stack.join('|')); else nextUrl.searchParams.delete('cursorStack')
+    window.history.replaceState(null, '', `${nextUrl.pathname}${nextUrl.search}`)
+  }
+  function nextPage() {
+    if (!data?.nextCursor) return
+    const nextStack = [...cursorStack, cursor ?? '']
+    setCursorStack(nextStack)
+    setCursor(data.nextCursor)
+    setCursorInUrl(data.nextCursor, nextStack)
+  }
+  function previousPage() {
+    const previous = cursorStack[cursorStack.length - 1]
+    const nextStack = cursorStack.slice(0, -1)
+    setCursorStack(nextStack)
+    setCursor(previous || null)
+    setCursorInUrl(previous || null, nextStack)
+  }
   function setSortValue(value: string) { setSort(value); replaceUrl(query, filterValues, value, direction); resetPage() }
   function toggleDirection() { const next = direction === 'asc' ? 'desc' : 'asc'; setDirection(next); replaceUrl(query, filterValues, sort, next); resetPage() }
   useEffect(() => { if (!mounted || refreshMs <= 0) return; const timer = window.setInterval(() => setRefreshKey(current => current + 1), refreshMs); return () => window.clearInterval(timer) }, [mounted, refreshMs])
   const exportParams = new URLSearchParams(params)
   exportParams.delete('limit'); exportParams.delete('cursor'); exportParams.delete('_refresh')
   const exportHref = exportEndpoint ? `${exportEndpoint}${exportEndpoint.includes('?') ? '&' : '?'}${exportParams.toString()}` : ''
-  const effectiveBulkActions: BulkAction[] = bulkActions.length > 0 ? bulkActions : exportEndpoint ? [{ label: 'Export selected', onRun: async (ids) => { const target = new URL(exportEndpoint, window.location.origin); target.searchParams.set('ids', ids.join(',')); window.location.assign(target.toString()) } }] : []
+  const exportSelectedAction: BulkAction[] = exportEndpoint ? [{ label: 'Export selected', onRun: async (ids) => { const target = new URL(exportEndpoint, window.location.origin); target.searchParams.set('ids', ids.join(',')); window.location.assign(target.toString()) } }] : []
+  const effectiveBulkActions: BulkAction[] = [...bulkActions, ...exportSelectedAction]
   const allSelected = rows.length > 0 && rows.every(row => selectedIds.has(String(row.id)))
   async function runBulk(action: BulkAction) { await action.onRun([...selectedIds]); setSelectedIds(new Set()); }
   return <div className="admin-page">

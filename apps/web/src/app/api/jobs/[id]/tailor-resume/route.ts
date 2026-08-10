@@ -10,6 +10,7 @@ import { prepareAiRoute, ok, err } from '@/lib/api-helpers'
 import { modelChat, parseAiJson } from '@/lib/model-router'
 import { buildPersona } from '@/lib/persona'
 import { personaEvidenceContext } from '@/lib/persona-evidence'
+import { hasEffectiveEntitlement } from '@/lib/entitlements'
 import type { ApplicationAuditFinding } from '@/lib/types'
 
 type Params = { params: Promise<{ id: string }> }
@@ -70,6 +71,7 @@ function sectionsForAuditRepair(findings: ApplicationAuditFinding[]) {
 export async function POST(req: NextRequest, { params }: Params) {
   const prep = await prepareAiRoute(req, 'suggest')
   if ('error' in prep) return prep.error
+  if (!await hasEffectiveEntitlement(prep.userId, 'cv:tailoring')) return err('Your current plan does not include AI CV tailoring.', 403)
 
   const { id: jobId } = await params
   const body = await req.json().catch(() => null)

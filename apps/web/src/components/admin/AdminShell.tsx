@@ -5,29 +5,47 @@ import { usePathname } from 'next/navigation'
 import { Activity, Bell, Bot, CreditCard, FileText, Flag, Home, Inbox, LogOut, Radio, ServerCog, ShieldAlert, ShieldCheck, Siren, Trash2, Users } from 'lucide-react'
 import { signOut } from 'next-auth/react'
 import { useEffect, useState, type ReactNode } from 'react'
+import { AdminExportLink } from './AdminExportLink'
+import { useI18n, type Lang } from '@/lib/i18n'
 
 const navigation = [
-  { href: '/admin', label: 'Overview', icon: Home, permission: 'observability.read' },
-  { href: '/admin/contact-us', label: 'Contact us', icon: Inbox, permission: 'support_cases.read' },
-  { href: '/admin/users', label: 'Users', icon: Users, permission: 'users.read' },
-  { href: '/admin/users/deletions', label: 'Deletion queue', icon: Trash2, permission: 'users.deletion.manage' },
-  { href: '/admin/plans', label: 'Plans', icon: CreditCard, permission: 'billing.read' },
-  { href: '/admin/ats', label: 'ATS sources', icon: Radio, permission: 'ats.read' },
-  { href: '/admin/applications', label: 'Applications', icon: Activity, permission: 'applications.read' },
-  { href: '/admin/queues', label: 'Queues', icon: ServerCog, permission: 'queues.read' },
-  { href: '/admin/ai', label: 'AI operations', icon: Bot, permission: 'ai_budget.read' },
-  { href: '/admin/incidents', label: 'Incidents', icon: Siren, permission: 'observability.read' },
-  { href: '/admin/platform', label: 'Feature flags', icon: Flag, permission: 'feature_flags.read' },
-  { href: '/admin/broadcasts', label: 'Broadcasts', icon: Bell, permission: 'broadcasts.create' },
-  { href: '/admin/audit', label: 'Audit', icon: FileText, permission: 'audit.read' },
-  { href: '/admin/access', label: 'Access', icon: ShieldCheck, permission: 'admin_members.read' },
-  { href: '/admin/security', label: 'Security', icon: ShieldAlert, permission: 'break_glass.request' },
+  { href: '/admin', labelKey: 'admin.nav.overview', icon: Home, permission: 'observability.read' },
+  { href: '/admin/contact-us', labelKey: 'admin.nav.support', icon: Inbox, permission: 'support_cases.read' },
+  { href: '/admin/users', labelKey: 'admin.nav.users', icon: Users, permission: 'users.read' },
+  { href: '/admin/users/deletions', labelKey: 'admin.nav.deletions', icon: Trash2, permission: 'users.deletion.manage' },
+  { href: '/admin/plans', labelKey: 'admin.nav.plans', icon: CreditCard, permission: 'billing.read' },
+  { href: '/admin/ats', labelKey: 'admin.nav.ats', icon: Radio, permission: 'ats.read' },
+  { href: '/admin/applications', labelKey: 'admin.nav.applications', icon: Activity, permission: 'applications.read' },
+  { href: '/admin/queues', labelKey: 'admin.nav.queues', icon: ServerCog, permission: 'queues.read' },
+  { href: '/admin/ai', labelKey: 'admin.nav.ai', icon: Bot, permission: 'ai_budget.read' },
+  { href: '/admin/incidents', labelKey: 'admin.nav.incidents', icon: Siren, permission: 'observability.read' },
+  { href: '/admin/platform', labelKey: 'admin.nav.flags', icon: Flag, permission: 'feature_flags.read' },
+  { href: '/admin/broadcasts', labelKey: 'admin.nav.broadcasts', icon: Bell, permission: 'broadcasts.create' },
+  { href: '/admin/audit', labelKey: 'admin.nav.audit', icon: FileText, permission: 'audit.read' },
+  { href: '/admin/access', labelKey: 'admin.nav.access', icon: ShieldCheck, permission: 'admin_members.read' },
+  { href: '/admin/security', labelKey: 'admin.nav.security', icon: ShieldAlert, permission: 'break_glass.request' },
 ]
 
 const notificationPermissions = ['support_cases.read', 'audit.read', 'observability.read']
 
+function exportConfigForPath(pathname: string) {
+  if (pathname.startsWith('/admin/users/deletions')) return { resource: 'deletions', permission: 'users.deletion.manage' }
+  if (pathname.startsWith('/admin/contact-us')) return { resource: 'support-cases', permission: 'support_cases.read' }
+  if (pathname.startsWith('/admin/users')) return { resource: 'users', permission: 'users.export_anonymized' }
+  if (pathname.startsWith('/admin/plans')) return { resource: 'subscriptions', permission: 'billing.read' }
+  if (pathname.startsWith('/admin/ats')) return { resource: 'ats', permission: 'ats.read' }
+  if (pathname.startsWith('/admin/applications')) return { resource: 'applications', permission: 'applications.read' }
+  if (pathname.startsWith('/admin/ai')) return { resource: 'ai-usage', permission: 'ai_budget.read' }
+  if (pathname.startsWith('/admin/incidents')) return { resource: 'incidents', permission: 'observability.read' }
+  if (pathname.startsWith('/admin/access')) return { resource: 'access-members', permission: 'admin_members.read' }
+  if (pathname.startsWith('/admin/broadcasts')) return { resource: 'broadcasts', permission: 'broadcasts.preview' }
+  return null
+}
+
 export function AdminShell({ children, permissions, roleKey }: { children: ReactNode; permissions: readonly string[]; roleKey: string }) {
   const pathname = usePathname()
+  const exportConfig = exportConfigForPath(pathname)
+  const { lang, setLang, t } = useI18n()
   const canReadNotifications = permissions.some(permission => notificationPermissions.includes(permission))
   const [notifications, setNotifications] = useState<Array<{ id: string; title: string; body: string | null; entityId: string | null; createdAt: string; readAt: string | null }>>([])
   const [unreadCount, setUnreadCount] = useState(0)
@@ -62,13 +80,14 @@ export function AdminShell({ children, permissions, roleKey }: { children: React
         {navigation.filter(item => permissions.includes(item.permission)).map(item => {
           const active = item.href === '/admin' ? pathname === '/admin' : pathname.startsWith(item.href)
           const Icon = item.icon
-          return <Link key={item.href} href={item.href} title={item.label} aria-label={item.label} data-active={active} className="admin-nav-link"><Icon size={18} aria-hidden="true" />{item.label}</Link>
+          const label = t(item.labelKey)
+          return <Link key={item.href} href={item.href} title={label} aria-label={label} data-active={active} className="admin-nav-link"><Icon size={18} aria-hidden="true" />{label}</Link>
         })}
       </nav>
       <div className="admin-identity"><span className="admin-avatar">{roleKey.slice(0, 2).toUpperCase()}</span><div><strong>{roleKey.replaceAll('_', ' ')}</strong><small>Internal role</small></div><button type="button" className="admin-logout" onClick={() => signOut({ callbackUrl: '/login?callbackUrl=%2Fadmin' })} aria-label="Sign out"><LogOut size={15} aria-hidden="true" /></button></div>
     </aside>
     <main className="admin-main">
-      <div className="admin-topbar">{canReadNotifications && <div className="admin-notification-center"><button type="button" className="admin-notification-button" aria-label={`Notifications${unreadCount ? `, ${unreadCount} unread` : ''}`} aria-expanded={notificationsOpen} onClick={() => setNotificationsOpen(current => !current)}><Bell size={17} aria-hidden="true" />{unreadCount > 0 && <span className="admin-notification-badge" aria-live="polite">{unreadCount > 99 ? '99+' : unreadCount}</span>}</button>{notificationsOpen && <div className="admin-notification-panel" role="dialog" aria-label="Admin notifications"><div className="admin-notification-panel-title"><strong>Notifications</strong><button type="button" onClick={() => void markNotification()}>Mark all read</button></div>{notifications.length === 0 ? <p>No notifications.</p> : notifications.map(item => <Link key={item.id} href={item.entityId ? `/admin/contact-us?case=${encodeURIComponent(item.entityId)}` : '/admin'} className="admin-notification-item" data-unread={!item.readAt} onClick={() => { if (!item.readAt) void markNotification(item.id); setNotificationsOpen(false) }}><strong>{item.title}</strong><span>{item.body ?? ''}</span><time>{new Date(item.createdAt).toLocaleString()}</time></Link>)}</div>}</div>}</div>
+      <div className="admin-topbar">{exportConfig && permissions.includes(exportConfig.permission) && <AdminExportLink resource={exportConfig.resource} label={t('admin.exportCsv')} />}<label className="admin-language-picker"><span className="sr-only">{t('admin.language')}</span><select aria-label={t('admin.language')} value={lang} onChange={event => setLang(event.target.value as Lang)}><option value="en">EN</option><option value="zh">中文</option></select></label>{canReadNotifications && <div className="admin-notification-center"><button type="button" className="admin-notification-button" aria-label={`${t('admin.notifications')}${unreadCount ? `, ${unreadCount} unread` : ''}`} aria-expanded={notificationsOpen} onClick={() => setNotificationsOpen(current => !current)}><Bell size={17} aria-hidden="true" />{unreadCount > 0 && <span className="admin-notification-badge" aria-live="polite">{unreadCount > 99 ? '99+' : unreadCount}</span>}</button>{notificationsOpen && <div className="admin-notification-panel" role="dialog" aria-label={t('admin.notifications')}><div className="admin-notification-panel-title"><strong>{t('admin.notifications')}</strong><button type="button" onClick={() => void markNotification()}>{t('admin.markAllRead')}</button></div>{notifications.length === 0 ? <p>{t('admin.noNotifications')}</p> : notifications.map(item => <Link key={item.id} href={item.entityId ? `/admin/contact-us?case=${encodeURIComponent(item.entityId)}` : '/admin'} className="admin-notification-item" data-unread={!item.readAt} onClick={() => { if (!item.readAt) void markNotification(item.id); setNotificationsOpen(false) }}><strong>{item.title}</strong><span>{item.body ?? ''}</span><time>{new Date(item.createdAt).toLocaleString()}</time></Link>)}</div>}</div>}</div>
       {children}
     </main>
   </div>

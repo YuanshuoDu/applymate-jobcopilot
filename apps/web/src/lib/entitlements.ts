@@ -12,6 +12,14 @@ export type EffectiveEntitlements = {
   overrides: readonly string[]
 }
 
+export type EntitlementDecision = {
+  allowed: boolean
+  key: string
+  limit: number | null
+  usage: number
+  reason: 'available' | 'missing' | 'expired' | 'limit_reached'
+}
+
 function entitlementKey(value: string) {
   return value.split(':', 1)[0]?.trim() ?? value
 }
@@ -53,5 +61,21 @@ export async function hasEffectiveEntitlement(userId: string, key: string) {
   const subscriptionExpired = snapshot.subscriptionStatus === 'expired'
     || (snapshot.subscriptionStatus === 'trialing' && Boolean(snapshot.trialEndsAt && snapshot.trialEndsAt <= new Date()))
     || (snapshot.subscriptionStatus === 'cancelled' && (!snapshot.subscriptionPeriodEnd || snapshot.subscriptionPeriodEnd <= new Date()))
-  return !subscriptionExpired && snapshot.entitlements.some(value => entitlementKey(value) === requested)
+  const value = snapshot.entitlements.find(item => entitlementKey(item) === requested)
+  const limit = value ? entitlementLimit(value) : null
+  return !subscriptionExpired && Boolean(value) && (limit === null || limit > 0)
+}
+
+export async function checkEntitlementLimit(userId: string, key: string, usage: number): Promise<EntitlementDecision> {
+  const snapshot = await getEffectiveEntitlements(userId)
+  const requested = entitlementKey(key)
+  const value = snapshot.entitlements.find(item => entitlementKey(item) === requested)
+  const limit = value ? entitlementLimit(value) : null
+  const expired = snapshot.subscriptionStatus === 'expired'
+    || (snapshot.subscriptionStatus === 'trialing' && Boolean(snapshot.trialEndsAt && snapshot.trialEndsAt <= new Date()))
+    || (snapshot.subscriptionStatus === 'cancelled' && (!snapshot.subscriptionPeriodEnd || snapshot.subscriptionPeriodEnd <= new Date()))
+  if (!value) return { allowed: false, key: requested, limit: null, usage, reason: 'missing' }
+  if (expired) return { allowed: false, key: requested, limit, usage, reason: 'expired' }
+  if (limit !== null && usage >= limit) return { allowed: false, key: requested, limit, usage, reason: 'limit_reached' }
+  return { allowed: true, key: requested, limit, usage, reason: 'available' }
 }

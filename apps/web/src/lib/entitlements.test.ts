@@ -28,4 +28,14 @@ describe('effective entitlements', () => {
     mocks.overrideFindMany.mockResolvedValueOnce([{ featureKey: 'team_seats', enabled: true, limit: 3, expiresAt: null }])
     await expect(getEffectiveEntitlements('user_1')).resolves.toEqual(expect.objectContaining({ limits: { applications: null, auto_apply: null, team_seats: 3 } }))
   })
+
+  it('enforces a finite entitlement limit while allowing unlimited plans', async () => {
+    mocks.getPlanCatalogue.mockResolvedValueOnce([{ key: 'free', entitlements: ['applications:5/month'] }])
+    mocks.userFindUnique.mockResolvedValueOnce({ plan: 'free', planSubscription: { status: 'active', currentPeriodEnd: null } })
+    const { checkEntitlementLimit } = await import('./entitlements')
+    await expect(checkEntitlementLimit('user_1', 'applications', 4)).resolves.toMatchObject({ allowed: true, limit: 5 })
+    mocks.getPlanCatalogue.mockResolvedValueOnce([{ key: 'free', entitlements: ['applications:5/month'] }])
+    mocks.userFindUnique.mockResolvedValueOnce({ plan: 'free', planSubscription: { status: 'active', currentPeriodEnd: null } })
+    await expect(checkEntitlementLimit('user_1', 'applications', 5)).resolves.toMatchObject({ allowed: false, reason: 'limit_reached' })
+  })
 })

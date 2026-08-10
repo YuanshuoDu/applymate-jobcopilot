@@ -8,6 +8,7 @@ import { db } from '@/lib/db'
 import { prepareAiRoute, isErrorResponse, ok, err } from '@/lib/api-helpers'
 import { modelChat, stripFences, withMiniMaxThinking, type AiConfig } from '@/lib/model-router'
 import { roleAiConfig } from '@/lib/agent/role-config'
+import { hasEffectiveEntitlement } from '@/lib/entitlements'
 import type { ApplicationAuditFinding, ResumeContent } from '@/lib/types'
 
 type Params = { params: Promise<{ id: string }> }
@@ -20,6 +21,7 @@ const COVER_FALLBACKS: AiConfig[] = [
 export async function POST(req: NextRequest, { params }: Params) {
   const prep = await prepareAiRoute(req, 'coverLetter')
   if ('error' in prep) return prep.error
+  if (!await hasEffectiveEntitlement(prep.userId, 'cover_letters:ai')) return err('Your current plan does not include AI cover letters.', 403)
 
   const { id: jobId } = await params
 

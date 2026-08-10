@@ -1,6 +1,6 @@
 'use client'
 
-import { AdminDataTable, values } from './AdminDataTable'
+import { AdminDataTable, values, type BulkAction } from './AdminDataTable'
 import { AdminAtsControls } from './AdminAtsControls'
 import { AdminAtsQualityTrends } from './AdminAtsQualityTrends'
 import { AdminBudgetControls } from './AdminBudgetControls'
@@ -23,11 +23,22 @@ function ApplicationActions({ row, permissions }: { row: Record<string, unknown>
   return <><span className="admin-action-group">{permissions.includes('applications.retry') && ['failed', 'cancelled'].includes(status) && <button className="admin-row-action" title="Retry application" onClick={() => void act('retry')}>Retry</button>}{permissions.includes('applications.manual_review') && !['submitted', 'cancelled'].includes(status) && <button className="admin-row-action" title="Move to manual review" onClick={() => void act('manual_review')}>Review</button>}{permissions.includes('applications.cancel') && !['submitted', 'skipped', 'cancelled'].includes(status) && <button className="admin-row-action" title="Cancel application" onClick={() => void act('cancel')}>Cancel</button>}</span>{dialog}</>
 }
 
-export function AdminUsersPage({ canExport = false }: { canExport?: boolean }) {
+export function AdminUsersPage({ canExport = false, permissions = [] }: { canExport?: boolean; permissions?: readonly string[] }) {
+  const { request, dialog } = useAdminPrompt()
+  async function runBulk(action: 'suspend' | 'restore', ids: string[]) {
+    const reason = await request({ title: `${action === 'suspend' ? 'Suspend' : 'Restore'} selected accounts`, label: 'Operational reason', kind: 'reason', submitLabel: 'Continue' })
+    if (!reason) return
+    const response = await fetch('/api/admin/v1/bulk', { method: 'POST', headers: { 'Content-Type': 'application/json', 'Idempotency-Key': crypto.randomUUID() }, body: JSON.stringify({ resource: 'users', action, ids, reason }) })
+    if (response.ok) window.location.reload()
+  }
+  const bulkActions: BulkAction[] = [
+    ...(permissions.includes('users.suspend') ? [{ label: 'Suspend selected', onRun: (ids: string[]) => runBulk('suspend', ids) }] : []),
+    ...(permissions.includes('users.restore') ? [{ label: 'Restore selected', onRun: (ids: string[]) => runBulk('restore', ids) }] : []),
+  ]
   return <><div className="admin-list-toolbar"><span>Exports contain deterministic hashes only; no email, resume, or document content.</span>{canExport && <Link className="admin-secondary" href="/api/admin/v1/export?resource=users">Download anonymized CSV</Link>}</div><AdminDataTable title="Users" subtitle="Masked account metadata and operational status" endpoint="/api/admin/v1/users" searchable columns={[
     { label: 'User', value: (row) => <Link className="admin-table-link" href={`/admin/users/${row.id}`}>{String(row.name ?? 'Unnamed')} · {String(row.email ?? '')}</Link> }, { label: 'Plan', value: values.text('plan') },
     { label: 'Status', sortKey: 'accountStatus', value: values.text('accountStatus') }, { label: 'Location', value: values.text('location') }, { label: 'Jobs', sortKey: 'jobsCount', value: values.text('jobsCount') }, { label: 'Resume', value: (row) => row.resumeExists ? 'On file' : 'Not uploaded' }, { label: 'Joined', sortKey: 'createdAt', value: values.date('createdAt') },
-  ]} filters={[{ label: 'Plan', param: 'plan', options: [{ label: 'Free', value: 'free' }, { label: 'Pro', value: 'pro' }, { label: 'Enterprise', value: 'enterprise' }] }, { label: 'Status', param: 'status', options: [{ label: 'Active', value: 'active' }, { label: 'Suspended', value: 'suspended' }] }]} exportEndpoint={canExport ? '/api/admin/v1/export?resource=users' : undefined} /></>
+  ]} filters={[{ label: 'Plan', param: 'plan', options: [{ label: 'Free', value: 'free' }, { label: 'Pro', value: 'pro' }, { label: 'Enterprise', value: 'enterprise' }] }, { label: 'Status', param: 'status', options: [{ label: 'Active', value: 'active' }, { label: 'Suspended', value: 'suspended' }] }]} exportEndpoint={canExport ? '/api/admin/v1/export?resource=users' : undefined} bulkActions={bulkActions} />{dialog}</>
 }
 
 export function AdminAtsPage({ permissions }: { permissions: readonly string[] }) {
@@ -38,10 +49,21 @@ export function AdminAtsPage({ permissions }: { permissions: readonly string[] }
 }
 
 export function AdminApplicationsPage({ permissions = [] }: { permissions?: readonly string[] }) {
-  return <AdminDataTable title="Applications" subtitle="Safe outcome metadata without job content or candidate documents" endpoint="/api/admin/v1/applications" columns={[
+  const { request, dialog } = useAdminPrompt()
+  async function runBulk(action: 'cancel' | 'manual_review', ids: string[]) {
+    const reason = await request({ title: `${action === 'cancel' ? 'Cancel' : 'Move'} selected applications`, label: 'Operational reason', kind: 'reason', submitLabel: 'Continue' })
+    if (!reason) return
+    const response = await fetch('/api/admin/v1/bulk', { method: 'POST', headers: { 'Content-Type': 'application/json', 'Idempotency-Key': crypto.randomUUID() }, body: JSON.stringify({ resource: 'applications', action, ids, reason }) })
+    if (response.ok) window.location.reload()
+  }
+  const bulkActions: BulkAction[] = [
+    ...(permissions.includes('applications.cancel') ? [{ label: 'Cancel selected', onRun: (ids: string[]) => runBulk('cancel', ids) }] : []),
+    ...(permissions.includes('applications.manual_review') ? [{ label: 'Review selected', onRun: (ids: string[]) => runBulk('manual_review', ids) }] : []),
+  ]
+  return <><AdminDataTable title="Applications" subtitle="Safe outcome metadata without job content or candidate documents" endpoint="/api/admin/v1/applications" columns={[
     { label: 'ID', sortKey: 'createdAt', value: row => <Link className="admin-table-link" href={`/admin/applications/${row.id}`}>{String(row.id)}</Link> }, { label: 'Status', sortKey: 'status', value: values.text('status') }, { label: 'ATS', value: values.text('atsType') }, { label: 'Flow', value: values.text('flowUsed') },
     { label: 'Mode', value: values.text('mode') }, { label: 'Error class', value: values.text('errorClass') }, { label: 'Duration', sortKey: 'durationMs', value: values.duration('durationMs') }, { label: 'Created', sortKey: 'createdAt', value: values.date('createdAt') }, { label: 'Task', value: values.text('taskStatus') }, { label: 'Actions', value: row => <ApplicationActions row={row} permissions={permissions} /> },
-  ]} filters={[{ label: 'Status', param: 'status', options: [{ label: 'Submitted', value: 'submitted' }, { label: 'Failed', value: 'failed' }, { label: 'Manual', value: 'manual' }] }, { label: 'Mode', param: 'mode', options: [{ label: 'Unattended', value: 'unattended' }, { label: 'Assisted', value: 'assisted' }] }]} exportEndpoint="/api/admin/v1/export?resource=applications" />
+  ]} filters={[{ label: 'Status', param: 'status', options: [{ label: 'Submitted', value: 'submitted' }, { label: 'Failed', value: 'failed' }, { label: 'Manual', value: 'manual' }] }, { label: 'Mode', param: 'mode', options: [{ label: 'Unattended', value: 'unattended' }, { label: 'Assisted', value: 'assisted' }] }]} exportEndpoint="/api/admin/v1/export?resource=applications" bulkActions={bulkActions} />{dialog}</>
 }
 
 export function AdminAiPage({ permissions }: { permissions: readonly string[] }) {

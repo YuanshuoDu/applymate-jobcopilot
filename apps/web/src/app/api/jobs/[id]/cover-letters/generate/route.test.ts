@@ -10,6 +10,7 @@ const mocks = vi.hoisted(() => ({
   coverLetterCreate: vi.fn(),
   coverLetterUpdate: vi.fn(),
   modelChat: vi.fn(),
+  hasEffectiveEntitlement: vi.fn(),
 }))
 
 vi.mock('@/lib/api-helpers', () => ({
@@ -29,11 +30,13 @@ vi.mock('@/lib/model-router', () => ({
   withMiniMaxThinking: (config: { provider: string; model: string }, thinking: 'adaptive' | 'disabled') =>
     config.provider === 'minimax' && config.model === 'MiniMax-M3' ? { ...config, thinking } : config,
 }))
+vi.mock('@/lib/entitlements', () => ({ hasEffectiveEntitlement: mocks.hasEffectiveEntitlement }))
 
 describe('cover letter generation after an audit failure', () => {
   beforeEach(() => {
     vi.clearAllMocks()
     mocks.prepareAiRoute.mockResolvedValue({ userId: 'user_1', cfg: { provider: 'minimax', model: 'MiniMax-M3', thinking: 'adaptive' } })
+    mocks.hasEffectiveEntitlement.mockResolvedValue(true)
     mocks.jobFindFirst.mockResolvedValue({ id: 'job_1', role: 'Engineer', company: 'Acme', description: 'Build resilient systems.', finalResumeId: null })
     mocks.resumeFindFirst.mockResolvedValue({ id: 'resume_1', content: { contact: { name: 'Ada' }, summary: 'Engineer', experience: [], skills: ['TypeScript'] }, templateId: 'clean', templateOptions: null })
     mocks.agentRoleFindFirst.mockResolvedValue(null)
