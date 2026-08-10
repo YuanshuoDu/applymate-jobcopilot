@@ -1,5 +1,5 @@
 import React from 'react'
-import type { DeploymentReadiness } from '@/lib/admin/deployment-readiness'
+import type { DeploymentReadiness, ReadinessState } from '@/lib/admin/deployment-readiness'
 
 function statusLabel(status: 'ready' | 'missing' | 'unavailable') {
   return status.charAt(0).toUpperCase() + status.slice(1)
@@ -14,12 +14,22 @@ export function DeploymentReadinessPanel({ readiness }: { readiness?: Deployment
   if (!readiness) return null
 
   const migrationState = readiness.candidateSettings.migrations.state
-  const checks = [
+  const checks: Array<readonly [string, ReadinessState]> = [
     ['Settings migrations', migrationState],
     ['Super admin', readiness.candidateSettings.superAdminPermission],
     ['Current admin', readiness.candidateSettings.currentActorPermission],
     ['Worker control', readiness.workerControl.state],
-  ] as const
+  ]
+  if (readiness.infrastructure) {
+    checks.push(['Database connection', readiness.infrastructure.database], ['Redis connection', readiness.infrastructure.redis])
+  }
+  if (readiness.security) {
+    checks.push(
+      ['RLS candidate isolation', readiness.security.rls.state],
+      ['WebAuthn production config', readiness.security.webauthn.state],
+      ['Audit chain', readiness.security.audit.state],
+    )
+  }
   const workerNeeds = [
     !readiness.workerControl.urlConfigured ? 'URL' : null,
     !readiness.workerControl.secretConfigured ? 'shared secret' : null,
@@ -35,6 +45,11 @@ export function DeploymentReadinessPanel({ readiness }: { readiness?: Deployment
       {migrationState === 'missing' && <p>Pending migrations: {readiness.candidateSettings.migrations.missing.join(', ')}</p>}
       {migrationState === 'unavailable' && <p>Database readiness checks are unavailable.</p>}
       {workerNeeds.length > 0 && <p>Worker controls need: {joinNeeds(workerNeeds)}</p>}
+      {readiness.workerControl.state === 'unavailable' && <p>Worker control endpoint did not respond to the signed readiness probe.</p>}
+      {readiness.infrastructure?.database === 'unavailable' && <p>Database connection probe failed.</p>}
+      {readiness.infrastructure?.redis === 'unavailable' && <p>Redis connection probe failed.</p>}
+      {readiness.security?.rls.state === 'missing' && <p>RLS is not fully active for the candidate role or required tables.</p>}
+      {readiness.security?.audit.state === 'missing' && <p>Audit hash-chain, checkpoint table, or checkpoint secret is not ready.</p>}
     </div>
   </section>
 }

@@ -1,61 +1,59 @@
-import { db } from '@/lib/db'
+import { db } from '../db'
 import type { PlatformIntegrationStatus } from './integration-status'
+import {
+  auditProbe,
+  databaseProbe,
+  hasValue,
+  migrationReadiness,
+  redisProbe,
+  rlsProbe,
+  workerProbe,
+  type AuditProbe,
+  type ReadinessState,
+  type RlsProbe,
+  type WorkerProbe,
+} from './deployment-readiness-probes'
+import { EXPECTED_MIGRATIONS } from './deployment-readiness-manifest'
 
-const REQUIRED_MIGRATIONS = [
-  '20260603170000_add_ai_budget',
-  '20260807110000_add_user_preferences_admin_permission',
-] as const
-
-type ReadinessState = 'ready' | 'missing' | 'unavailable'
-
-type MigrationRow = {
-  migration_name: string
-  finished_at: Date | null
-  rolled_back_at: Date | null
-}
+export { EXPECTED_MIGRATIONS }
+export type { ReadinessState }
 
 export type DeploymentReadiness = {
   candidateSettings: {
-    migrations: { state: ReadinessState; missing: string[] }
+    migrations: { state: ReadinessState; missing: string[]; pending?: string[]; rolledBack?: string[] }
     superAdminPermission: ReadinessState
     currentActorPermission: 'ready' | 'missing'
   }
+  infrastructure?: { database: ReadinessState; redis: ReadinessState }
   workerControl: {
-    state: 'ready' | 'missing'
+    state: ReadinessState
+    reachability?: ReadinessState
     urlConfigured: boolean
     secretConfigured: boolean
     redisConfigured: boolean
+    workerState?: 'running' | 'paused' | null
+  }
+  security?: {
+    webauthn: { state: ReadinessState; originConfigured: boolean; rpIdConfigured: boolean; adminAppUrlConfigured: boolean }
+    rls: RlsProbe
+    audit: AuditProbe
   }
 }
 
 type ReadinessActor = { permissions: readonly string[] }
 
-async function migrationReadiness(): Promise<DeploymentReadiness['candidateSettings']['migrations']> {
-  try {
-    const rows = await db.$queryRaw<MigrationRow[]>`
-      SELECT migration_name, finished_at, rolled_back_at
-      FROM "_prisma_migrations"
-      WHERE migration_name IN (
-        '20260603170000_add_ai_budget',
-        '20260807110000_add_user_preferences_admin_permission'
-      )
-    `
-    const applied = new Set(rows
-      .filter(row => row.finished_at !== null && row.rolled_back_at === null)
-      .map(row => row.migration_name))
-    const missing = REQUIRED_MIGRATIONS.filter(migration => !applied.has(migration))
-    return { state: missing.length === 0 ? 'ready' : 'missing', missing: [...missing] }
-  } catch {
-    return { state: 'unavailable', missing: [] }
-  }
+export type DeploymentReadinessProbes = {
+  database?: () => Promise<ReadinessState>
+  redis?: () => Promise<ReadinessState>
+  worker?: () => Promise<WorkerProbe>
+  rls?: () => Promise<RlsProbe>
+  audit?: () => Promise<AuditProbe>
 }
 
 async function superAdminPermissionReadiness(): Promise<ReadinessState> {
+  if (!hasValue(process.env.DATABASE_URL)) return 'missing'
   try {
-    const role = await db.adminRole.findUnique({
-      where: { key: 'super_admin' },
-      select: { permissions: true },
-    })
+    const role = await db.adminRole.findUnique({ where: { key: 'super_admin' }, select: { permissions: true } })
     return role?.permissions.includes('users.update_preferences') ? 'ready' : 'missing'
   } catch {
     return 'unavailable'
@@ -65,13 +63,25 @@ async function superAdminPermissionReadiness(): Promise<ReadinessState> {
 export async function getDeploymentReadiness(
   actor: ReadinessActor,
   integrations: PlatformIntegrationStatus,
+  overrides: DeploymentReadinessProbes = {},
 ): Promise<DeploymentReadiness> {
-  const [migrations, superAdminPermission] = await Promise.all([
+  const { infrastructure } = integrations
+  const [migrations, superAdminPermission, database, redis, worker, rls, audit] = await Promise.all([
     migrationReadiness(),
     superAdminPermissionReadiness(),
+    overrides.database?.() ?? databaseProbe(),
+    overrides.redis?.() ?? redisProbe(),
+    infrastructure.workerControlUrl && infrastructure.workerControlSecret
+      ? (overrides.worker?.() ?? workerProbe())
+      : Promise.resolve<WorkerProbe>({ state: 'missing', workerState: null }),
+    overrides.rls?.() ?? rlsProbe(),
+    overrides.audit?.() ?? auditProbe(),
   ])
-  const { infrastructure } = integrations
-  const workerReady = infrastructure.workerControlUrl && infrastructure.workerControlSecret
+  const webauthn = {
+    originConfigured: hasValue(process.env.WEBAUTHN_ORIGIN),
+    rpIdConfigured: hasValue(process.env.WEBAUTHN_RP_ID),
+    adminAppUrlConfigured: hasValue(process.env.ADMIN_APP_URL),
+  }
 
   return {
     candidateSettings: {
@@ -79,11 +89,19 @@ export async function getDeploymentReadiness(
       superAdminPermission,
       currentActorPermission: actor.permissions.includes('users.update_preferences') ? 'ready' : 'missing',
     },
+    infrastructure: { database, redis },
     workerControl: {
-      state: workerReady ? 'ready' : 'missing',
+      state: worker.state,
+      reachability: worker.state,
       urlConfigured: infrastructure.workerControlUrl,
       secretConfigured: infrastructure.workerControlSecret,
       redisConfigured: infrastructure.redis,
+      workerState: worker.workerState,
+    },
+    security: {
+      webauthn: { state: Object.values(webauthn).every(Boolean) ? 'ready' : 'missing', ...webauthn },
+      rls,
+      audit,
     },
   }
 }

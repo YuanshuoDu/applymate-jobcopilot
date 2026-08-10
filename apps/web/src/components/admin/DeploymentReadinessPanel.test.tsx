@@ -62,6 +62,24 @@ describe('DeploymentReadinessPanel', () => {
     expect(html).not.toContain('Worker controls need: Redis')
   })
 
+  it('renders live dependency and security probes when available', () => {
+    const html = renderToStaticMarkup(React.createElement(DeploymentReadinessPanel, {
+      readiness: readiness({
+        infrastructure: { database: 'ready', redis: 'ready' },
+        security: {
+          webauthn: { state: 'ready', originConfigured: true, rpIdConfigured: true, adminAppUrlConfigured: true },
+          rls: { state: 'ready', runtimeConfigured: true, candidateRole: 'applymate_candidate', missingTables: [] },
+          audit: { state: 'ready', hashTrigger: true, checkpointTable: true, secretConfigured: true },
+        },
+      }),
+    }))
+
+    expect(html).toContain('Database connection: Ready')
+    expect(html).toContain('Redis connection: Ready')
+    expect(html).toContain('RLS candidate isolation: Ready')
+    expect(html).toContain('Audit chain: Ready')
+  })
+
   it('reports checks that cannot be read as unavailable', () => {
     const html = renderToStaticMarkup(React.createElement(DeploymentReadinessPanel, {
       readiness: readiness({

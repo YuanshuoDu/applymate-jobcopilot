@@ -21,13 +21,16 @@ function workerControlConfig() {
   return url && secret ? { url: `${url.replace(/\/$/, '')}/internal/admin/control`, secret } : null
 }
 
-export async function sendWorkerCommand(command: Omit<WorkerCommand, 'timestamp' | 'nonce'>): Promise<WorkerCommandResult> {
+export async function sendWorkerCommand(
+  command: Omit<WorkerCommand, 'timestamp' | 'nonce'>,
+  options: { timeoutMs?: number } = {},
+): Promise<WorkerCommandResult> {
   const config = workerControlConfig()
   if (!config) throw new Error('Worker control plane is not configured')
   const payload: WorkerCommand = { ...command, timestamp: Date.now(), nonce: randomUUID() }
   const body = JSON.stringify(payload)
   const signature = createHmac('sha256', config.secret).update(body).digest('hex')
-  const response = await fetch(config.url, { method: 'POST', headers: { 'Content-Type': 'application/json', 'x-worker-control-signature': signature }, body, cache: 'no-store', signal: AbortSignal.timeout(8_000) })
+  const response = await fetch(config.url, { method: 'POST', headers: { 'Content-Type': 'application/json', 'x-worker-control-signature': signature }, body, cache: 'no-store', signal: AbortSignal.timeout(options.timeoutMs ?? 8_000) })
   const result = await response.json().catch(() => null) as WorkerCommandResult | null
   if (!response.ok || !result) throw new Error(result?.error || `Worker command failed (${response.status})`)
   return result
