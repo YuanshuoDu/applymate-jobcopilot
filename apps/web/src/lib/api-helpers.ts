@@ -2,17 +2,20 @@ import { NextRequest, NextResponse } from 'next/server'
 import { headers } from 'next/headers'
 import { jwtVerify } from 'jose'
 import { checkRateLimit } from '@/lib/rate-limit'
-import { APPLYMATE_BACKING, resolveConfig, resolveFeatureConfig, type UserAiSettings, type FeatureId } from '@/lib/model-router'
+import { loadUserAiConfig, type FeatureId } from '@/lib/model-router'
 import { db } from '@/lib/db'
 import { safeAuth } from '@/lib/safe-auth'
+import { EXTENSION_TOKEN_AUDIENCE, EXTENSION_TOKEN_ISSUER, getAuthJwtSecret } from '@/lib/auth-secret'
+import { resolvePlatformRoute } from '@/lib/admin/ai-config'
+import { activateTenantContext } from '@/lib/db/tenant-store'
+import { isFeatureAllowed, resolveAiAccess } from '@/lib/entitlements'
 
-const JWT_SECRET = new TextEncoder().encode(
-  process.env.AUTH_SECRET ?? 'fallback-secret-change-this',
-)
+const JWT_SECRET = getAuthJwtSecret()
 
 /** Get authenticated userId — supports both NextAuth session and Extension Bearer token */
 export async function requireAuth(
   req?: NextRequest,
+  requiredFeature?: string,
 ): Promise<{ userId: string } | NextResponse> {
   // Extension Bearer token. Do not trust x-user-id: it is a client-settable
   // header unless every proxy strips it before the request reaches this route.
@@ -24,9 +27,16 @@ export async function requireAuth(
   if (authHeader?.startsWith('Bearer ')) {
     const token = authHeader.slice(7)
     try {
-      const { payload } = await jwtVerify(token, JWT_SECRET)
-      if (payload.sub) {
-        return { userId: payload.sub as string }
+      const { payload } = await jwtVerify(token, JWT_SECRET, {
+        issuer: EXTENSION_TOKEN_ISSUER,
+        audience: EXTENSION_TOKEN_AUDIENCE,
+      })
+      if (typeof payload.sub === 'string' && payload.sub.length > 0) {
+        return activeAccountOrDenied(
+          payload.sub,
+          typeof payload.updatedAt === 'string' ? payload.updatedAt : null,
+          typeof payload.iat === 'number' ? payload.iat : null,
+        )
       }
     } catch {
       // Token invalid — fall through to session check.
@@ -35,9 +45,24 @@ export async function requireAuth(
 
   // NextAuth session (web app)
   const session = await safeAuth()
-  if (session?.user?.id) return { userId: session.user.id }
+  if (session?.user?.id) return activeAccountOrDenied(session.user.id)
 
   return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
+}
+
+async function activeAccountOrDenied(userId: string, issuedAt?: string | null, issuedUnix?: number | null) {
+  const user = await db.user.findUnique({ where: { id: userId }, select: { accountStatus: true, updatedAt: true } })
+  if (!user) return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
+  if (user?.accountStatus === 'suspended') return NextResponse.json({ error: 'Account suspended' }, { status: 403 })
+  const isBearerToken = issuedAt !== undefined || issuedUnix !== undefined
+  if (isBearerToken) {
+    if (issuedAt && user.updatedAt.toISOString() !== issuedAt) return NextResponse.json({ error: 'Session expired' }, { status: 401 })
+    if (!issuedAt && (!issuedUnix || user.updatedAt.getTime() > issuedUnix * 1000)) {
+      return NextResponse.json({ error: 'Session expired' }, { status: 401 })
+    }
+  }
+  activateTenantContext(userId)
+  return { userId }
 }
 
 export function isErrorResponse(val: unknown): val is NextResponse {
@@ -55,19 +80,26 @@ export function err(message: string, status = 400) {
 // ── AI Route helpers ──────────────────────────────────────────────────────────
 
 /** Auth + rate limit + load user AI config. Returns the config or an error response. */
-export async function prepareAiRoute(req: NextRequest, featureId: FeatureId) {
+export async function prepareAiRoute(req: NextRequest, featureId: FeatureId, requiredEntitlement?: string | string[]) {
   const auth = await requireAuth(req)
   if (isErrorResponse(auth)) return { error: auth }
+
+  const defaultEntitlement = featureId === 'autoApply' ? 'auto_apply' : featureId === 'coverLetter' ? 'cover_letter' : null
+  const entitlementKeys = requiredEntitlement ? (Array.isArray(requiredEntitlement) ? requiredEntitlement : [requiredEntitlement]) : defaultEntitlement ? [defaultEntitlement] : []
+  for (const entitlementKey of entitlementKeys) {
+    if (!(await isFeatureAllowed(auth.userId, entitlementKey))) return { error: err('This feature is not included in your current plan', 403) }
+  }
+  const aiAccess = await resolveAiAccess(auth.userId)
+  if (aiAccess === 'disabled') return { error: err('This feature is not included in your current plan', 403) }
+  if (aiAccess === 'exhausted') return { error: err('Monthly AI credits exhausted', 429) }
 
   const rl = checkRateLimit(`ai:${auth.userId}`)
   if (!rl.ok) return { error: err(`Rate limit exceeded — retry in ${rl.retryAfter}s`, 429) }
 
-  const user  = await db.user.findUnique({ where: { id: auth.userId }, select: { preferences: true } })
-  const prefs = (user?.preferences ?? {}) as Record<string, unknown>
-  const configured = resolveFeatureConfig(featureId, (prefs.aiSettings ?? null) as UserAiSettings | null)
+  const configured = await loadUserAiConfig(auth.userId, featureId)
   // A stale feature override must not make the application flow unusable when
   // its provider has no key. Fall back to the platform MiniMax model.
-  const cfg = configured.resolvedKey ? configured : resolveConfig(APPLYMATE_BACKING)
+  const cfg = configured.resolvedKey ? configured : await resolvePlatformRoute(featureId)
 
   return { userId: auth.userId, cfg }
 }

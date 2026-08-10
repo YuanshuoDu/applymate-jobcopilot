@@ -1,0 +1,52 @@
+'use client'
+
+import { Check, Flag, RotateCcw, Send } from 'lucide-react'
+import { useEffect, useState } from 'react'
+import { MANAGED_FEATURES, type ManagedFeatureKey } from '@jobcopilot/shared/feature-flags'
+
+type FlagRow = { id: string; key: string; environment: string; enabled: boolean; rolloutPercent: number; targetPlans: string[]; targetUserIds: string[]; status: string; version: number; approvedById: string | null; rollbackAt: string | null; updatedAt: string }
+const featureKeys = Object.keys(MANAGED_FEATURES) as ManagedFeatureKey[]
+
+export function AdminPlatformPage({ permissions }: { permissions: readonly string[] }) {
+  const [items, setItems] = useState<FlagRow[]>([])
+  const [key, setKey] = useState<ManagedFeatureKey>('worker_discovery')
+  const [environment, setEnvironment] = useState('development')
+  const [enabled, setEnabled] = useState(false)
+  const [rolloutPercent, setRolloutPercent] = useState(0)
+  const [plan, setPlan] = useState('')
+  const [userIds, setUserIds] = useState('')
+  const [rollbackAt, setRollbackAt] = useState('')
+  const [notice, setNotice] = useState('')
+
+  const can = (permission: string) => permissions.includes(permission)
+  async function load() {
+    const response = await fetch('/api/admin/v1/platform/flags', { cache: 'no-store' })
+    const payload = await response.json().catch(() => null) as { items?: FlagRow[]; error?: string } | null
+    setItems(payload?.items ?? [])
+    if (!response.ok) setNotice(payload?.error ?? 'Unable to load flags.')
+  }
+  useEffect(() => { void load() }, [])
+  async function request(url: string, payload: Record<string, unknown>) {
+    const response = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json', 'Idempotency-Key': crypto.randomUUID() }, body: JSON.stringify(payload) })
+    const result = await response.json().catch(() => null) as { error?: string } | null
+    if (!response.ok) { setNotice(result?.error ?? 'Action failed.'); return false }
+    return true
+  }
+  async function create(event: React.FormEvent) {
+    event.preventDefault()
+    const targetUserIds = userIds.split(',').map((id) => id.trim()).filter(Boolean)
+    const created = await request('/api/admin/v1/platform/flags', { key, environment, enabled, rolloutPercent, targetPlans: plan ? [plan] : [], targetUserIds, rollbackAt: rollbackAt || null, reason: 'Creating reviewed platform feature flag draft' })
+    if (created) { setKey('worker_discovery'); setPlan(''); setUserIds(''); setRollbackAt(''); setNotice('Flag draft created.'); await load() }
+  }
+  async function submit(flag: FlagRow) {
+    if (await request(`/api/admin/v1/platform/flags/${flag.id}/submit`, { version: flag.version, reason: 'Submitting reviewed feature flag for approval' })) { setNotice('Flag submitted for approval.'); await load() }
+  }
+  async function approve(flag: FlagRow) {
+    if (await request(`/api/admin/v1/platform/flags/${flag.id}/approve`, { version: flag.version, reason: 'Approving reviewed feature flag activation' })) { setNotice(`${flag.key} is active.`); await load() }
+  }
+  async function rollback(flag: FlagRow) {
+    if (await request(`/api/admin/v1/platform/flags/${flag.id}/rollback`, { version: flag.version, reason: 'Rolling back active platform control after operational review' })) { setNotice('Feature flag rolled back.'); await load() }
+  }
+
+  return <div className="admin-page"><header className="admin-header"><div><h1>Feature flags</h1><p>Versioned platform controls</p></div><Flag size={22} aria-hidden="true" /></header><section className="flag-layout"><form className="flag-form" onSubmit={(event) => void create(event)}><h2>New flag</h2><label>Control<select value={key} onChange={(event) => setKey(event.target.value as ManagedFeatureKey)}>{featureKeys.map((featureKey) => <option key={featureKey} value={featureKey}>{featureKey}</option>)}</select></label><div className="flag-grid"><label>Environment<select value={environment} onChange={(event) => setEnvironment(event.target.value)}><option value="development">Development</option><option value="staging">Staging</option><option value="production">Production</option></select></label><label>Rollout<input type="number" min="0" max="100" value={rolloutPercent} onChange={(event) => setRolloutPercent(Number(event.target.value))} /></label></div><label className="flag-check"><input type="checkbox" checked={enabled} onChange={(event) => setEnabled(event.target.checked)} /> Enabled</label><div className="flag-grid"><label>Plan target<select value={plan} onChange={(event) => setPlan(event.target.value)}><option value="">All plans</option><option value="free">Free</option><option value="pro">Pro</option><option value="enterprise">Enterprise</option></select></label><label>Rollback at<input type="datetime-local" value={rollbackAt} onChange={(event) => setRollbackAt(event.target.value)} /></label></div><label>User ID targets<input value={userIds} onChange={(event) => setUserIds(event.target.value)} placeholder="Optional, comma separated" /></label><button className="broadcast-primary" type="submit"><Flag size={16} /> Create draft</button></form><section className="flag-list"><div className="broadcast-list-title"><h2>Platform controls</h2>{notice && <span role="status">{notice}</span>}</div>{items.length === 0 ? <p>No feature flags yet.</p> : items.map((flag) => <article className="flag-row" key={flag.id}><div><h3>{flag.key}</h3><p>{flag.environment} · {flag.enabled ? 'Enabled' : 'Disabled'} · {flag.rolloutPercent}% rollout · v{flag.version}</p><small>{flag.targetPlans.length ? flag.targetPlans.join(', ') : 'All plans'}{flag.targetUserIds.length ? ` · ${flag.targetUserIds.length} explicit users` : ''}{flag.rollbackAt ? ` · rollback ${new Date(flag.rollbackAt).toLocaleString()}` : ''}</small></div><div className="broadcast-actions">{flag.status === 'draft' && <button title="Submit for approval" onClick={() => void submit(flag)} disabled={!can('feature_flags.update')}><Send size={16} /></button>}{flag.status === 'pending_approval' && <button title="Approve flag" onClick={() => void approve(flag)} disabled={!can('feature_flags.approve')}><Check size={16} /></button>}{flag.status === 'active' && <button title="Roll back flag" onClick={() => void rollback(flag)} disabled={!can('feature_flags.approve')}><RotateCcw size={16} /></button>}<span className={`flag-status ${flag.status}`}>{flag.status.replaceAll('_', ' ')}</span></div></article>)}</section></section></div>
+}

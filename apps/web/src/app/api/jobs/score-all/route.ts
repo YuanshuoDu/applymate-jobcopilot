@@ -1,4 +1,5 @@
 import { NextRequest } from 'next/server'
+import { pinnedFetch } from '@jobcopilot/shared'
 import { db } from '@/lib/db'
 import { requireAuth, isErrorResponse, ok, err } from '@/lib/api-helpers'
 import type { ResumeContent } from '@/lib/types'
@@ -28,9 +29,10 @@ export async function POST(req: NextRequest) {
   const cookie = req.headers.get('cookie') ?? ''
   const scoreUrl = new URL('/api/ai/score', req.url)
   const results = await runWithConcurrency(jobs, SCORE_CONCURRENCY, async job => {
-    const scoreResponse = await fetch(scoreUrl, {
+    const scoreResponse = await pinnedFetch(scoreUrl, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', cookie },
+      allowLocalDevelopment: process.env.NODE_ENV !== 'production',
       body: JSON.stringify({
         resumeContent: resume.content as unknown as ResumeContent,
         jobTitle: job.role,

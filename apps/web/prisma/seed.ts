@@ -2,13 +2,18 @@
  * Prisma seed script — ApplyMate AI
  * Run: pnpm prisma db seed
  */
-import { PrismaClient, JobStatus, JobWorkflowState, ActivityType } from '@prisma/client'
+import { PrismaClient, JobStatus, JobWorkflowState, ActivityType, Plan } from '@prisma/client'
 import bcrypt from 'bcryptjs'
+import { DEFAULT_PLAN_CATALOGUE } from '../src/lib/plan-catalogue-shared'
+import { seedAiConfiguration } from './seed-ai'
 
 const db = new PrismaClient()
 
 async function main() {
   console.log('🌱 Seeding database...')
+
+  const aiSeed = await seedAiConfiguration(db as never)
+  console.log(`✓ AI catalogue: ${aiSeed.providerCount} providers, ${aiSeed.modelCount} models, ${aiSeed.routeCount} routes`)
 
   // ── Demo user ─────────────────────────────────────────────
   const password = await bcrypt.hash('demo1234', 12)
@@ -29,6 +34,35 @@ async function main() {
     },
   })
   console.log(`✓ User: ${user.email}`)
+
+  // ── Public plan catalogue ────────────────────────────────
+  for (const plan of DEFAULT_PLAN_CATALOGUE) {
+    await db.planCatalogue.upsert({
+      where: { plan: plan.key },
+      update: {},
+      create: {
+        plan: plan.key,
+        name: plan.name,
+        priceMinor: plan.priceMinor,
+        currency: plan.currency,
+        interval: plan.interval,
+        description: plan.description,
+        features: plan.features,
+        entitlements: plan.entitlements,
+        badge: plan.badge,
+        cta: plan.cta,
+        trialDays: plan.trialDays,
+        active: plan.active,
+        sortOrder: plan.sortOrder,
+      },
+    })
+  }
+  console.log(`✓ Plans: ${DEFAULT_PLAN_CATALOGUE.length}`)
+  for (const fromPlan of Object.values(Plan)) {
+    for (const toPlan of Object.values(Plan)) {
+      if (fromPlan !== toPlan) await db.planTransition.upsert({ where: { fromPlan_toPlan: { fromPlan, toPlan } }, update: {}, create: { fromPlan, toPlan, enabled: true } })
+    }
+  }
 
   // ── Jobs ──────────────────────────────────────────────────
   const jobsData = [

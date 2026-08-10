@@ -2,6 +2,7 @@
 // M9: Full implementation — generates a React PDF document from resume data
 
 import type { Resume, ResumeContent, TemplateOptions } from '@/lib/types'
+import { safeAccentColor } from '@/lib/template-options'
 
 function getDensity(density?: string) {
   if (density === 'compact')  return { body: 9,  h3: 10.5, margin: 24, gap: 3 }
@@ -17,7 +18,7 @@ export async function renderResumeDoc(resume: Resume): Promise<React.ReactElemen
   const opts    = (resume.templateOptions ?? {}) as TemplateOptions
   // CSS variables are valid in the browser preview but invalid in a PDF.
   // Convert the default preview token to the equivalent exported blue.
-  const accent  = opts.accentColor?.startsWith('var(') ? '#185FA5' : (opts.accentColor ?? '#185FA5')
+  const accent  = safeAccentColor(opts.accentColor, '#185FA5').startsWith('var(') ? '#185FA5' : safeAccentColor(opts.accentColor, '#185FA5')
   const font    = opts.fontFamily === 'serif' ? 'Times-Roman' : 'Helvetica'
   const bold    = opts.fontFamily === 'serif' ? 'Times-Bold'  : 'Helvetica-Bold'
   const d       = getDensity(opts.density)

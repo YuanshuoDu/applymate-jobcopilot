@@ -1,6 +1,12 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const mocks = vi.hoisted(() => ({ handler: undefined as undefined | ((job: { data: unknown }) => Promise<unknown>) }));
+const pinnedFetch = vi.hoisted(() => vi.fn((input: string | URL, init?: unknown) => globalThis.fetch(String(input), init as RequestInit)));
+
+vi.mock("@jobcopilot/shared", async () => {
+  const actual = await vi.importActual<typeof import("@jobcopilot/shared")>("@jobcopilot/shared");
+  return { ...actual, pinnedFetch };
+});
 
 vi.mock("bullmq", () => ({
   Queue: vi.fn(),

@@ -24,6 +24,12 @@ interface FilledField {
   skip: boolean
 }
 
+const SENSITIVE_FIELD = /password|passcode|one[-\s]?time|otp|token|secret|security[\s_-]?code|verification[\s_-]?code|cvv|cvc|card[\s_-]?number|social[\s_-]?security|\bssn\b|\bpin\b/i
+
+function isSensitiveField(field: Pick<FormFieldSchema, 'type' | 'label' | 'placeholder'>): boolean {
+  return field.type === 'password' || SENSITIVE_FIELD.test([field.label, field.placeholder].filter(Boolean).join(' '))
+}
+
 export async function POST(req: NextRequest) {
   const prep = await prepareAiRoute(req, 'formRevise')
   if ('error' in prep) return prep.error
@@ -40,10 +46,13 @@ export async function POST(req: NextRequest) {
   if (!persona) return err('persona is required')
   if (!instruction) return err('instruction is required')
 
-  const fieldsJson = JSON.stringify(fields.map(f => ({
+  const safeFields = fields.filter(field => !isSensitiveField(field))
+  const safeFieldIds = new Set(safeFields.map(field => field.id))
+  const safePreviousFill = previousFill.filter(fill => safeFieldIds.has(fill.fieldId))
+  const fieldsJson = JSON.stringify(safeFields.map(f => ({
     id: f.id, type: f.type, label: f.label, options: f.options, required: f.required,
   })))
-  const previousJson = JSON.stringify(previousFill.map(f => ({
+  const previousJson = JSON.stringify(safePreviousFill.map(f => ({
     fieldId: f.fieldId, value: f.value, confidence: f.confidence, reasoning: f.reasoning, skip: f.skip,
   })))
 

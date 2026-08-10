@@ -11,6 +11,7 @@
  *   GMAIL_ERROR         — other Gmail API error
  */
 import { NextRequest } from 'next/server'
+import { pinnedFetch } from '@jobcopilot/shared'
 import { requireAuth, isErrorResponse, ok, err } from '@/lib/api-helpers'
 import { findGmailConnection, getGoogleAccessToken, classifyEmail } from '@/lib/gmail-helpers'
 
@@ -23,7 +24,9 @@ export async function GET(req: NextRequest) {
   // 1. Check Google account exists
   const account = await findGmailConnection(auth.userId)
   if (!account) {
-    console.error('[gmail/threads] no Google account in DB → NO_GOOGLE_ACCOUNT')
+    // This is an expected onboarding state, not an application failure. Keep it
+    // out of Vercel's error aggregation so alerting reflects real Gmail faults.
+    console.info('[gmail/threads] no Google account in DB → NO_GOOGLE_ACCOUNT')
     return err('NO_GOOGLE_ACCOUNT', 403)
   }
   console.log('[gmail/threads] Google account exists in DB')
@@ -31,7 +34,7 @@ export async function GET(req: NextRequest) {
   // 2. Get fresh access token (auto-refreshes if needed)
   const accessToken = await getGoogleAccessToken(auth.userId)
   if (!accessToken) {
-    console.error('[gmail/threads] getGoogleAccessToken returned null → GMAIL_REAUTH (token expired/missing)')
+    console.warn('[gmail/threads] getGoogleAccessToken returned null → GMAIL_REAUTH (token expired/missing)')
     return err('GMAIL_REAUTH', 401)
   }
   console.log('[gmail/threads] got access token, length=', accessToken.length)
@@ -41,7 +44,7 @@ export async function GET(req: NextRequest) {
     const q = encodeURIComponent(
       'subject:(application OR interview OR offer OR "thank you for applying" OR "your application" OR "position" OR "candidacy" OR "hiring" OR "opportunity") -from:me'
     )
-    const listRes = await fetch(
+    const listRes = await pinnedFetch(
       `https://gmail.googleapis.com/gmail/v1/users/me/messages?maxResults=25&q=${q}`,
       { headers: { Authorization: `Bearer ${accessToken}` } }
     )
@@ -72,7 +75,7 @@ export async function GET(req: NextRequest) {
     // 4. Fetch metadata for each message (parallel)
     const details = await Promise.allSettled(
       messages.slice(0, 20).map(msg =>
-        fetch(
+        pinnedFetch(
           `https://gmail.googleapis.com/gmail/v1/users/me/messages/${msg.id}?format=metadata` +
           `&metadataHeaders=From&metadataHeaders=Subject&metadataHeaders=Date`,
           { headers: { Authorization: `Bearer ${accessToken}` } }

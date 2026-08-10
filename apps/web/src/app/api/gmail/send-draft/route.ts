@@ -4,6 +4,7 @@
  * Body: { to, subject, draft, gmailMessageId?, threadId?, jobId? }
  */
 import { NextRequest }                          from 'next/server'
+import { pinnedFetch }                           from '@jobcopilot/shared'
 import { requireAuth, isErrorResponse, ok, err } from '@/lib/api-helpers'
 import { getGoogleAccessToken }                  from '@/lib/gmail-helpers'
 import { db }                                    from '@/lib/db'
@@ -23,7 +24,7 @@ export async function POST(req: NextRequest) {
   if (!token) return err('Gmail not connected. Please connect Google account in Settings.')
 
   // Build RFC 2822 message
-  const fromRes = await fetch('https://gmail.googleapis.com/gmail/v1/users/me/profile', {
+  const fromRes = await pinnedFetch('https://gmail.googleapis.com/gmail/v1/users/me/profile', {
     headers: { Authorization: `Bearer ${token}` },
   })
   const profile = fromRes.ok ? await fromRes.json() as { emailAddress?: string } : {}
@@ -40,7 +41,7 @@ export async function POST(req: NextRequest) {
   ]
   const raw = Buffer.from(messageParts.join('\r\n')).toString('base64url')
 
-  const sendRes = await fetch('https://gmail.googleapis.com/gmail/v1/users/me/messages/send', {
+  const sendRes = await pinnedFetch('https://gmail.googleapis.com/gmail/v1/users/me/messages/send', {
     method:  'POST',
     headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
     body:    JSON.stringify({ raw, ...(typeof threadId === 'string' && threadId ? { threadId } : {}) }),
@@ -52,9 +53,9 @@ export async function POST(req: NextRequest) {
   }
 
   const matchedJob = await findFollowUpJob(auth.userId, jobId, gmailMessageId)
-  if (matchedJob) await db.$transaction([
-    db.job.update({ where: { id: matchedJob.id }, data: { followUpAt: null } }),
-    db.activity.create({
+  if (matchedJob) await db.$transaction(async tx => {
+    await tx.job.update({ where: { id: matchedJob.id }, data: { followUpAt: null } })
+    await tx.activity.create({
       data: {
         userId: auth.userId,
         jobId: matchedJob.id,
@@ -62,8 +63,8 @@ export async function POST(req: NextRequest) {
         text: `Follow-up email sent to ${to}${messageKind ? ` · ${messageKind.replace(/_/g, ' ')}` : ''}`,
         color: '#7C3AED',
       },
-    }),
-  ])
+    })
+  })
 
   return ok({ sent: true, to, tracked: Boolean(matchedJob), jobId: matchedJob?.id ?? null })
 }

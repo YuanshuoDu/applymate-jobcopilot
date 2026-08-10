@@ -23,6 +23,7 @@ import { extractByCssSelectors } from "./css"
 export interface EnrichInput {
   html: string
   url: string
+  userId?: string
 }
 
 /**
@@ -36,14 +37,14 @@ export interface EnrichInput {
 export async function enrichJob(
   input: EnrichInput,
 ): Promise<EnrichedJob | null> {
-  const { html, url } = input
+  const { html, url, userId } = input
 
   // ── T0: ATS API ──────────────────────────────────────────────────────
   const t0Start = performance.now()
   const atsMatch = detectAtsUrl(url)
   if (atsMatch) {
     console.log("[enrich]", `t0-detected ats=${atsMatch.ats} slug=${atsMatch.slug}`)
-    const t0Result = await fetchViaAtsApi(atsMatch)
+    const t0Result = await fetchViaAtsApi(atsMatch, { userId })
     if (t0Result) {
       const ms = Math.round(performance.now() - t0Start)
       console.log("[enrich]", `t0-hit method=${t0Result.method} descLen=${t0Result.description.length} duration=${ms}ms`)

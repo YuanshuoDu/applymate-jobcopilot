@@ -1,5 +1,7 @@
+import { pinnedFetch } from '@jobcopilot/shared'
 import { createHash, randomBytes } from 'node:crypto'
 import { normalizeEmail as normalizeAuthEmail } from '@/lib/auth-identifiers'
+import { configuredAppOrigin } from '@/lib/app-url'
 
 const PASSWORD_RESET_TOKEN_TTL_MS = 60 * 60 * 1000
 const PASSWORD_RESET_IDENTIFIER_PREFIX = 'password-reset:'
@@ -40,9 +42,7 @@ export function isValidPasswordResetToken(token: unknown): token is string {
 }
 
 export function configuredAppUrl(requestUrl: string): string {
-  const configured = process.env.AUTH_URL ?? process.env.NEXTAUTH_URL
-  const baseUrl = configured?.trim() || new URL(requestUrl).origin
-  return new URL(baseUrl).origin
+  return configuredAppOrigin(requestUrl)
 }
 
 export function passwordResetUrl(requestUrl: string, token: string): string {
@@ -62,7 +62,7 @@ export async function sendPasswordResetEmail(email: string, resetUrl: string): P
   if (!apiKey || !from) return false
 
   try {
-    const response = await fetch('https://api.resend.com/emails', {
+  const response = await pinnedFetch('https://api.resend.com/emails', {
       method: 'POST',
       headers: {
         Authorization: `Bearer ${apiKey}`,

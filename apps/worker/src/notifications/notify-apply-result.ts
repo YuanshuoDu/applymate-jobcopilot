@@ -3,6 +3,7 @@
  * Sends via Resend API. No-op if RESEND_API_KEY is not set.
  * Non-throwing — email failure never blocks apply result.
  */
+import { pinnedFetch } from '@jobcopilot/shared'
 import { getPool } from '../db/apply-results.js'
 
 export interface NotifyApplyResultParams {
@@ -15,17 +16,35 @@ export interface NotifyApplyResultParams {
   jobUrl?: string | null
 }
 
+type PreferenceKey = 'apply' | 'reject'
+
+function preferenceKey(status: NotifyApplyResultParams['status']): PreferenceKey {
+  // A failed automated attempt is operational feedback, not an employer
+  // rejection. Keep it under the auto-apply result preference.
+  void status
+  return 'apply'
+}
+
+function preferenceEnabled(value: unknown, key: PreferenceKey): boolean {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return true
+  const prefs = (value as Record<string, unknown>).notificationPreferences
+  if (!prefs || typeof prefs !== 'object' || Array.isArray(prefs)) return true
+  const configured = (prefs as Record<string, unknown>)[key]
+  return typeof configured === 'boolean' ? configured : true
+}
+
 export async function notifyApplyResult(p: NotifyApplyResultParams): Promise<void> {
   const apiKey = process.env.RESEND_API_KEY
   if (!apiKey) return  // not configured — silently skip
 
   // Load user email from DB
   const res = await getPool().query(
-    'SELECT email, name FROM "User" WHERE id = $1 LIMIT 1',
+    'SELECT email, name, preferences FROM "User" WHERE id = $1 LIMIT 1',
     [p.userId]
   )
-  const user = res.rows[0] as { email: string; name: string | null } | undefined
+  const user = res.rows[0] as { email: string; name: string | null; preferences?: unknown } | undefined
   if (!user?.email) return
+  if (!preferenceEnabled(user.preferences, preferenceKey(p.status))) return
 
   const subject =
     p.status === 'submitted' ? `✅ Applied to ${p.jobCompany} — ${p.jobTitle}` :
@@ -55,7 +74,7 @@ export async function notifyApplyResult(p: NotifyApplyResultParams): Promise<voi
     `<p><a href="https://applymate.dev/apply-history" style="color:#185FA5">View full apply history →</a></p>`,
   ].join('\n')
 
-  const response = await fetch('https://api.resend.com/emails', {
+  const response = await pinnedFetch('https://api.resend.com/emails', {
     method: 'POST',
     headers: {
       Authorization: `Bearer ${apiKey}`,

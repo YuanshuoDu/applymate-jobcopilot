@@ -7,6 +7,7 @@ import { NextRequest } from 'next/server'
 import { prepareAiRoute, ok, err } from '@/lib/api-helpers'
 import { modelChat, stripFences, withMiniMaxThinking, type AiConfig } from '@/lib/model-router'
 import { db } from '@/lib/db'
+import { roleAiConfig } from '@/lib/agent/role-config'
 
 const COVER_FALLBACKS: AiConfig[] = [
   { provider: 'deepseek', model: 'deepseek-v4-pro' },
@@ -56,12 +57,12 @@ export async function POST(req: NextRequest) {
   // Load Writer Agent role config (model + system prompt) for consistency with pipeline
   const writerRole = await db.agentRole.findFirst({
     where:  { userId: prep.userId, role: 'writer' },
-    select: { provider: true, model: true, apiKey: true, systemPrompt: true },
+    select: { enabled: true, provider: true, model: true, apiKey: true, systemPrompt: true },
   }).catch(() => null)
 
-  const selectedCfg: import('@/lib/model-router').AiConfig = writerRole
-    ? { provider: writerRole.provider as any, model: writerRole.model, apiKey: writerRole.apiKey ?? undefined }
-    : prep.cfg
+  const selectedCfg = roleAiConfig('writer', writerRole
+    ? { ...writerRole, apiKey: writerRole.apiKey ?? undefined }
+    : undefined, prep.cfg)
   // A cover letter is a bounded rewrite; M3's direct mode is faster and keeps
   // the answer focused without exposing or spending on private reasoning.
   const cfg = withMiniMaxThinking(selectedCfg, 'disabled')

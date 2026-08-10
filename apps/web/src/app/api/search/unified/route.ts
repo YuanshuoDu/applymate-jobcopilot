@@ -16,8 +16,10 @@
  *     durationMs, routing, salaryContext, topSkills, cached, withHiringManager } }
  */
 import { NextRequest } from 'next/server'
+import { pinnedFetch } from '@jobcopilot/shared'
 import { requireAuth, isErrorResponse, ok, err } from '@/lib/api-helpers'
 import { truncate, fmtSalary } from '@/lib/utils'
+import { getDiscoveryApiKeys } from '@/lib/discovery-api-keys'
 import { cleanSearchTitle, postFilter, queryKeywords, scoreSearchJobs, smartDedup, type SearchFilters, type SearchJob } from './search-quality'
 
 // ── Infrastructure ────────────────────────────────────────────────────────────
@@ -33,8 +35,11 @@ const MIN_RESULTS_FOR_FALLBACK = 5                // expand sources when < 5 res
 const _cache = new Map<string, { data: object; exp: number }>()
 
 function buildCacheKey(q: string, f: SearchFilters): string {
+  const discoveryReady = f.discovery
+    ? `${Boolean(f.discovery.adzunaAppId && f.discovery.adzunaAppKey)}:${Boolean(f.discovery.rapidapiKey)}`
+    : 'unknown'
   return [q, f.location, f.remote, f.jobType, f.datePosted,
-          f.experience, f.salaryMin ?? '', f.salaryMax ?? ''].join('|')
+          f.experience, f.salaryMin ?? '', f.salaryMax ?? '', discoveryReady].join('|')
 }
 function cacheGet(key: string): object | null {
   const e = _cache.get(key)
@@ -407,9 +412,12 @@ function smartRouter(q: string, f: SearchFilters, qa?: QueryAnalysis): RouterDec
 async function fetchAdzuna(p: Record<string, string>, filters: SearchFilters): Promise<JobResult[]> {
   const country = p.country || 'gb'
   const sym = { gb: '£', us: '$', ca: 'C$', au: 'A$' }[country] ?? '€'
+  const appId = filters.discovery?.adzunaAppId ?? ''
+  const appKey = filters.discovery?.adzunaAppKey ?? ''
+  if (!appId || !appKey) return []
   const params = new URLSearchParams({
-    app_id:           process.env.ADZUNA_APP_ID ?? '',
-    app_key:          process.env.ADZUNA_APP_KEY ?? '',
+    app_id:           appId,
+    app_key:          appKey,
     results_per_page: '15',
     sort_by:          'date',
     what:             p.q ?? p.query ?? '',
@@ -422,7 +430,7 @@ async function fetchAdzuna(p: Record<string, string>, filters: SearchFilters): P
   if (filters.datePosted === 'week')   params.set('max_days_old', '7')
   if (filters.datePosted === 'month')  params.set('max_days_old', '30')
 
-  const res = await fetch(`https://api.adzuna.com/v1/api/jobs/${country}/search/1?${params}`, { cache: 'no-store' })
+  const res = await pinnedFetch(`https://api.adzuna.com/v1/api/jobs/${country}/search/1?${params}`, { cache: 'no-store', redirect: 'error' })
   if (!res.ok) return []
   const json = await res.json() as { results: Array<{ id: string; title: string; company: { display_name: string }; location: { display_name: string }; salary_min?: number; salary_max?: number; redirect_url: string; description: string; created: string; contract_time?: string }> }
   return (json.results ?? []).map(r => ({
@@ -441,6 +449,8 @@ async function fetchAdzuna(p: Record<string, string>, filters: SearchFilters): P
 }
 
 async function fetchJSearch(p: Record<string, string>, filters: SearchFilters): Promise<JobResult[]> {
+  const apiKey = filters.discovery?.rapidapiKey ?? ''
+  if (!apiKey) return []
   const params = new URLSearchParams({ query: p.query ?? '', num_pages: '1', country: p.country || 'us', date_posted: 'all' })
   if (p.employmentType || filters.jobType) {
     const map: Record<string, string> = { fulltime: 'FULLTIME', parttime: 'PARTTIME', contract: 'CONTRACTOR', internship: 'INTERN' }
@@ -451,8 +461,8 @@ async function fetchJSearch(p: Record<string, string>, filters: SearchFilters): 
   if (filters.datePosted === 'today') params.set('date_posted', 'today')
   if (filters.datePosted === 'week')  params.set('date_posted', '3days')
 
-  const res = await fetch(`https://jsearch.p.rapidapi.com/search-v2?${params}`, {
-    headers: { 'X-RapidAPI-Key': process.env.RAPIDAPI_KEY ?? '', 'X-RapidAPI-Host': 'jsearch.p.rapidapi.com' },
+  const res = await pinnedFetch(`https://jsearch.p.rapidapi.com/search-v2?${params}`, {
+    headers: { 'X-RapidAPI-Key': apiKey, 'X-RapidAPI-Host': 'jsearch.p.rapidapi.com' },
     cache: 'no-store',
   })
   if (!res.ok) return []
@@ -537,6 +547,8 @@ function safeSalary(raw: unknown): string | undefined {
 }
 
 async function fetchLinkedIn(p: Record<string, string>, filters: SearchFilters): Promise<JobResult[]> {
+  const apiKey = filters.discovery?.rapidapiKey ?? ''
+  if (!apiKey) return []
   const params = new URLSearchParams({
     offset:                '0',
     description_type:      'text',
@@ -560,8 +572,8 @@ async function fetchLinkedIn(p: Record<string, string>, filters: SearchFilters):
   if (threshold) params.set('date_filter', threshold)
 
   // Use 24h endpoint for broader coverage in unified search
-  const res = await fetch(`https://${LI_HOST}/active-jb-24h?${params}`, {
-    headers: { 'x-rapidapi-key': process.env.RAPIDAPI_KEY ?? '', 'x-rapidapi-host': LI_HOST },
+  const res = await pinnedFetch(`https://${LI_HOST}/active-jb-24h?${params}`, {
+    headers: { 'x-rapidapi-key': apiKey, 'x-rapidapi-host': LI_HOST },
     cache: 'no-store',
   })
   if (!res.ok) return []
@@ -611,7 +623,7 @@ async function fetchJobicy(p: Record<string, string>, _filters: SearchFilters): 
   if (p.tag) params.set('tag', p.tag)
   if (p.geo) params.set('geo', p.geo)
 
-  const res = await fetch(`https://jobicy.com/api/v2/remote-jobs?${params}`, {
+  const res = await pinnedFetch(`https://jobicy.com/api/v2/remote-jobs?${params}`, {
     headers: { 'User-Agent': 'ApplyMate/1.0' },
     cache: 'no-store',
   })
@@ -646,6 +658,8 @@ const ATS_TYPE: Record<string, string> = {
 }
 
 async function fetchAts(p: Record<string, string>, filters: SearchFilters): Promise<JobResult[]> {
+  const apiKey = filters.discovery?.rapidapiKey ?? ''
+  if (!apiKey) return []
   const params = new URLSearchParams({
     offset:           '0',
     description_type: 'text',
@@ -670,8 +684,8 @@ async function fetchAts(p: Record<string, string>, filters: SearchFilters): Prom
     if (d) params.set('date_filter', new Date(Date.now() - d * 86_400_000).toISOString().slice(0, 10))
   }
 
-  const res = await fetch(`https://${ATS_HOST}/active-ats-7d?${params}`, {
-    headers: { 'x-rapidapi-key': process.env.RAPIDAPI_KEY ?? '', 'x-rapidapi-host': ATS_HOST },
+  const res = await pinnedFetch(`https://${ATS_HOST}/active-ats-7d?${params}`, {
+    headers: { 'x-rapidapi-key': apiKey, 'x-rapidapi-host': ATS_HOST },
     cache: 'no-store',
   })
   if (!res.ok) return []
@@ -731,6 +745,8 @@ const XING_TYPE: Record<string, string> = {
 const XING_DATE: Record<string, string> = { today: 'day', week: 'week', month: 'month' }
 
 async function fetchXing(p: Record<string, string>, filters: SearchFilters): Promise<JobResult[]> {
+  const apiKey = filters.discovery?.rapidapiKey ?? ''
+  if (!apiKey) return []
   const params = new URLSearchParams()
   const q   = p.q || p.titleFilter || ''
   const loc = p.location || p.locationFilter || filters.location || ''
@@ -750,8 +766,8 @@ async function fetchXing(p: Record<string, string>, filters: SearchFilters): Pro
   if (isRm)              params.set('remoteOptions', 'remote;hybrid')
   if (salaryMin && salaryMin > 0) params.set('minimumSalary', String(salaryMin))
 
-  const res = await fetch(`https://${JOBS_API_HOST}/v2/xing/search?${params}`, {
-    headers: { 'x-rapidapi-key': process.env.RAPIDAPI_KEY ?? '', 'x-rapidapi-host': JOBS_API_HOST },
+  const res = await pinnedFetch(`https://${JOBS_API_HOST}/v2/xing/search?${params}`, {
+    headers: { 'x-rapidapi-key': apiKey, 'x-rapidapi-host': JOBS_API_HOST },
     cache: 'no-store',
   })
   if (!res.ok) return []
@@ -792,7 +808,9 @@ async function fetchXing(p: Record<string, string>, filters: SearchFilters): Pro
   })
 }
 
-async function fetchIndeed(p: Record<string, string>, _filters: SearchFilters): Promise<JobResult[]> {
+async function fetchIndeed(p: Record<string, string>, filters: SearchFilters): Promise<JobResult[]> {
+  const apiKey = filters.discovery?.rapidapiKey ?? ''
+  if (!apiKey) return []
   const q           = p.q || p.titleFilter || ''
   const loc         = p.location || p.locationFilter || ''
   const countryCode = p.countryCode || 'us'
@@ -801,8 +819,8 @@ async function fetchIndeed(p: Record<string, string>, _filters: SearchFilters): 
   const params = new URLSearchParams({ query: q, countryCode, sortType: 'date' })
   if (loc) params.set('location', loc)
 
-  const res = await fetch(`https://${JOBS_API_HOST}/v2/indeed/search?${params}`, {
-    headers: { 'x-rapidapi-key': process.env.RAPIDAPI_KEY ?? '', 'x-rapidapi-host': JOBS_API_HOST },
+  const res = await pinnedFetch(`https://${JOBS_API_HOST}/v2/indeed/search?${params}`, {
+    headers: { 'x-rapidapi-key': apiKey, 'x-rapidapi-host': JOBS_API_HOST },
     cache: 'no-store',
   })
   if (!res.ok) return []
@@ -838,7 +856,7 @@ async function fetchRemotive(p: Record<string, string>, _filters: SearchFilters)
   const params = new URLSearchParams({ limit: '20' })
   if (q) params.set('search', q)
 
-  const res = await fetch(`https://remotive.com/api/remote-jobs?${params}`, {
+  const res = await pinnedFetch(`https://remotive.com/api/remote-jobs?${params}`, {
     headers: { 'User-Agent': 'ApplyMate/1.0' },
     next: { revalidate: 900 },
   })
@@ -882,7 +900,7 @@ async function fetchBundesagentur(p: Record<string, string>, filters: SearchFilt
   const dt = DT_MAP[p.datePosted || filters.datePosted || '']
   if (dt) params.set('veroeffentlichtseit', dt)
 
-  const res = await fetch(`https://rest.arbeitsagentur.de/jobboerse/jobsuche-service/pc/v4/jobs?${params}`, {
+  const res = await pinnedFetch(`https://rest.arbeitsagentur.de/jobboerse/jobsuche-service/pc/v4/jobs?${params}`, {
     headers: { 'X-API-Key': 'jobboerse-jobsuche' },
     cache: 'no-store',
   })
@@ -931,7 +949,7 @@ async function fetchCareerjet(p: Record<string, string>, _filters: SearchFilters
   if (q)   params.set('keywords', q)
   if (loc) params.set('location', loc)
 
-  const res = await fetch(`https://search.api.careerjet.net/v4/query?${params}`, { cache: 'no-store' })
+  const res = await pinnedFetch(`https://search.api.careerjet.net/v4/query?${params}`, { cache: 'no-store', redirect: 'error' })
   if (!res.ok) return []
   const json = await res.json() as {
     type?: string; jobs?: Array<{
@@ -970,7 +988,7 @@ async function fetchReed(p: Record<string, string>, filters: SearchFilters): Pro
   else if (filters.jobType === 'parttime')  params.set('partTime', 'true')
   else if (filters.jobType === 'contract')  params.set('contract', 'true')
 
-  const res = await fetch(`https://www.reed.co.uk/api/1.0/search?${params}`, {
+  const res = await pinnedFetch(`https://www.reed.co.uk/api/1.0/search?${params}`, {
     headers: { Authorization: `Basic ${credentials}` },
     cache: 'no-store',
   })
@@ -1032,7 +1050,7 @@ async function fetchIrishjobs(p: Record<string, string>, _f: SearchFilters): Pro
   let xml = ''
   for (const url of urls) {
     try {
-      const r = await fetch(url, {
+      const r = await pinnedFetch(url, {
         headers: { 'User-Agent': 'ApplyMate/1.0', 'Accept': 'application/rss+xml, text/xml' },
         signal:  AbortSignal.timeout(7_000),
         cache:   'no-store',
@@ -1084,7 +1102,7 @@ async function fetchMantiks(p: Record<string, string>, filters: SearchFilters): 
   const params = new URLSearchParams({ job_age_in_days: String(age) })
   params.append('job_title', q)
 
-  const res = await fetch(`https://api.mantiks.io/company/search?${params}`, {
+  const res = await pinnedFetch(`https://api.mantiks.io/company/search?${params}`, {
     headers: { 'X-API-KEY': apiKey },
     cache: 'no-store',
   })
@@ -1134,6 +1152,8 @@ async function fetchMantiks(p: Record<string, string>, filters: SearchFilters): 
 const INTERNSHIPS_HOST = 'internships-api.p.rapidapi.com'
 
 async function fetchInternships(p: Record<string, string>, filters: SearchFilters): Promise<JobResult[]> {
+  const apiKey = filters.discovery?.rapidapiKey ?? ''
+  if (!apiKey) return []
   const params = new URLSearchParams({
     offset:           '0',
     description_type: 'text',
@@ -1153,8 +1173,8 @@ async function fetchInternships(p: Record<string, string>, filters: SearchFilter
     if (d) params.set('date_filter', new Date(Date.now() - d * 86_400_000).toISOString().slice(0, 10))
   }
 
-  const res = await fetch(`https://${INTERNSHIPS_HOST}/active-jb-7d?${params}`, {
-    headers: { 'x-rapidapi-key': process.env.RAPIDAPI_KEY ?? '', 'x-rapidapi-host': INTERNSHIPS_HOST },
+  const res = await pinnedFetch(`https://${INTERNSHIPS_HOST}/active-jb-7d?${params}`, {
+    headers: { 'x-rapidapi-key': apiKey, 'x-rapidapi-host': INTERNSHIPS_HOST },
     cache: 'no-store',
   })
   if (!res.ok) return []
@@ -1313,13 +1333,13 @@ function aggregateTopSkills(jobs: JobResult[], n = 10): string[] {
 async function fetchSalaryCtx(
   jobTitle: string,
   countryCode: string,
+  apiKey: string,
 ): Promise<{ currency: string; median: number; min: number; max: number } | null> {
-  const apiKey = process.env.RAPIDAPI_KEY
   if (!apiKey || !jobTitle) return null
   try {
     const clean  = jobTitle.replace(/\b(senior|sr|junior|jr|lead|staff|principal)\b/gi, '').trim()
     const params = new URLSearchParams({ query: clean, countryCode: countryCode || 'us' })
-    const res = await fetch(`https://jobs-api14.p.rapidapi.com/v2/salary/range?${params}`, {
+    const res = await pinnedFetch(`https://jobs-api14.p.rapidapi.com/v2/salary/range?${params}`, {
       headers: { 'x-rapidapi-key': apiKey, 'x-rapidapi-host': 'jobs-api14.p.rapidapi.com' },
       next: { revalidate: 3600 },  // cache salary data 1 hr
     })
@@ -1369,8 +1389,10 @@ const FETCHERS: Record<string, (p: Record<string, string>, f: SearchFilters) => 
 }
 
 export async function GET(req: NextRequest) {
-  const auth = await requireAuth(req)
+  const auth = await requireAuth(req, 'job_discovery')
   if (isErrorResponse(auth)) return auth
+
+  const discovery = await getDiscoveryApiKeys(auth.userId)
 
   const sp      = req.nextUrl.searchParams
   const q       = sp.get('q')?.trim() ?? ''
@@ -1385,10 +1407,11 @@ export async function GET(req: NextRequest) {
     experience: sp.get('experience') ?? '',
     salaryMin:  sp.get('salaryMin') ? Number(sp.get('salaryMin')) * 1000 : undefined,
     salaryMax:  sp.get('salaryMax') ? Number(sp.get('salaryMax')) * 1000 : undefined,
+    discovery,
   }
 
   // ① Cache check — identical queries return cached results
-  const cKey = buildCacheKey(q, filters)
+  const cKey = `${auth.userId}:${buildCacheKey(q, filters)}`
   if (!noCache) {
     const hit = cacheGet(cKey)
     if (hit) return ok({ ...(hit as object), meta: { ...(hit as { meta: object }).meta, cached: true } })
@@ -1418,7 +1441,7 @@ export async function GET(req: NextRequest) {
           : Promise.resolve([] as JobResult[])
       })
     ),
-    fetchSalaryCtx(q, ccForSalary),   // fires in parallel, best-effort
+    fetchSalaryCtx(q, ccForSalary, discovery.rapidapiKey),   // fires in parallel, best-effort
   ])
 
   let raw: JobResult[] = jobResults.flatMap(r => r.status === 'fulfilled' ? r.value : [])
@@ -1431,10 +1454,11 @@ export async function GET(req: NextRequest) {
   }
 
   // ⑥b Zero-result guarantee: if STILL 0 results, try free-tier sources that need no API key.
-  // This ensures search always returns something even when RAPIDAPI_KEY is missing/expired.
+  // This ensures search still returns something when neither user nor platform
+  // RapidAPI credentials are available (or when the provider rejects them).
   // Free sources: Remotive (remote jobs), Jobicy (remote jobs), IrishJobs (Ireland RSS).
   if (raw.length === 0 && (!filters.location || filters.remote)) {
-    const hasRapidKey = !!(process.env.RAPIDAPI_KEY)
+    const hasRapidKey = !!discovery.rapidapiKey
     const freeFallbacks: Array<Promise<JobResult[]>> = [
       withTimeout(fetchRemotive({ q }, filters), SOURCE_TIMEOUT_MS, []),
       withTimeout(fetchJobicy({ q, geo: 'worldwide' }, filters), SOURCE_TIMEOUT_MS, []),
@@ -1448,7 +1472,7 @@ export async function GET(req: NextRequest) {
 
     // Log diagnostic if paid APIs were supposed to be used
     if (!hasRapidKey) {
-      console.warn('[search/unified] RAPIDAPI_KEY not configured — paid sources skipped, using free sources only')
+      console.warn('[search/unified] RapidAPI not configured — paid sources skipped, using free sources only')
     }
   }
 
@@ -1460,8 +1484,8 @@ export async function GET(req: NextRequest) {
 
   // ⑧ Build enriched meta
   const withHM = sorted.filter(j => j.hiringManager).length
-  const hasRapidKey  = !!(process.env.RAPIDAPI_KEY)
-  const hasAdzunaKey = !!(process.env.ADZUNA_APP_ID && process.env.ADZUNA_APP_KEY)
+  const hasRapidKey  = !!discovery.rapidapiKey
+  const hasAdzunaKey = !!(discovery.adzunaAppId && discovery.adzunaAppKey)
 
   const meta = {
     sourcesUsed:       decision.sources.map(s => s.id),

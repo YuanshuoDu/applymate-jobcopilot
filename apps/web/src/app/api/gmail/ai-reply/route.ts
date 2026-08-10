@@ -11,7 +11,7 @@ import { modelChat } from '@/lib/model-router'
 import { db } from '@/lib/db'
 
 export async function POST(req: NextRequest) {
-  const prep = await prepareAiRoute(req, 'coverLetter')
+  const prep = await prepareAiRoute(req, 'coverLetter', ['cover_letter', 'gmail_tracking'])
   if ('error' in prep) return prep.error
 
   const body = await req.json().catch(() => null)

@@ -95,12 +95,31 @@ describe("runGreenhouseFlow", () => {
     expect(result.status).toBe("manual");
     expect(result.error).toContain("No submit button");
   });
+
+  it("rechecks submission authorization immediately before clicking submit", async () => {
+    const page = mockPage();
+    const beforeSubmit = vi.fn().mockResolvedValue(false);
+
+    const result = await runGreenhouseFlow(page, {
+      jobId: "job-4",
+      applyUrl: "https://boards.greenhouse.io/booking/jobs/789",
+      persona: { firstName: "Jane", email: "jane@test.com" },
+      jobTitle: "Dev",
+      jobCompany: "Inc",
+      resumePath: "/r.pdf",
+      beforeSubmit,
+    });
+
+    expect(beforeSubmit).toHaveBeenCalledOnce();
+    expect(result.status).toBe("manual");
+    expect(result.reviewReady).toBe(true);
+  });
 });
 
 describe("detectFlow", () => {
   it("greenhouse URL detected", () => {
     expect(detectFlow("https://boards.greenhouse.io/booking/jobs/123")).toBe("greenhouse");
-    expect(detectFlow("https://job.boards.greenhouse.io/n26/jobs/456")).toBe("greenhouse");
+    expect(detectFlow("https://job-boards.greenhouse.io/embed/job_app?for=n26")).toBe("greenhouse");
     expect(detectFlow("https://grnh.se/abc123")).toBe("greenhouse");
   });
 
@@ -108,9 +127,8 @@ describe("detectFlow", () => {
     expect(detectFlow("https://sap.wd3.myworkdayjobs.com/SAP")).toBe("workday");
   });
 
-  it("unknown URL returns null", () => {
-    // Lever URLs are now handled — returns 'lever', not null
-    expect(detectFlow("https://jobs.lever.co/spotify")).toBe("lever");
+  it("direct Lever job URLs are detected while unknown URLs return null", () => {
+    expect(detectFlow("https://jobs.lever.co/spotify/abc123")).toBe("lever");
     expect(detectFlow("https://example.com")).toBe(null);
   });
 

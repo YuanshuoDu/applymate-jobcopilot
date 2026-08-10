@@ -29,6 +29,12 @@ export interface SearchFilters {
   experience: string
   salaryMin?: number
   salaryMax?: number
+  /** Request-scoped credentials resolved by /lib/discovery-api-keys. */
+  discovery?: {
+    adzunaAppId: string
+    adzunaAppKey: string
+    rapidapiKey: string
+  }
 }
 
 const REMOTE_VERIFIED_SOURCES = new Set<string>(['jobicy', 'remotive', 'ats', 'internships'])

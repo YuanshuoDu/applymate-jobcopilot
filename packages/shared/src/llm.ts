@@ -1,8 +1,11 @@
 import pg from "pg";
+import { isSafeAiEndpoint } from "./safe-ai-endpoint.js";
+import { credentialContext, decryptSecret } from "./secret-crypto.js";
+import { pinnedFetch } from "./pinned-outbound.js";
 
 // ── Types ──
 
-export type Provider = "minimax" | "openai" | "anthropic" | "deepseek" | "custom";
+export type Provider = "minimax" | "openai" | "anthropic" | "deepseek" | "qwen" | "zhipu" | "kimi" | "custom";
 
 export interface AiConfig {
   provider: Provider;
@@ -34,10 +37,13 @@ export const APPLYMATE_BACKING: AiConfig = {
 };
 
 const DEFAULT_API_BASES: Record<Provider, string> = {
-  minimax: "https://api.minimax.chat/v1",
+  minimax: "https://api.minimax.io/v1",
   openai: "https://api.openai.com/v1",
   anthropic: "https://api.anthropic.com",
   deepseek: "https://api.deepseek.com/v1",
+  qwen: "https://dashscope.aliyuncs.com/compatible-mode/v1",
+  zhipu: "https://api.z.ai/api/paas/v4",
+  kimi: "https://api.moonshot.ai/v1",
   custom: "",
 };
 
@@ -66,40 +72,87 @@ export async function loadWorkerAiConfig(userId: string): Promise<AiConfig> {
       `SELECT preferences FROM "User" WHERE id = $1`,
       [userId]
     );
-    if (res.rows.length === 0) return { ...APPLYMATE_BACKING };
+    const preferences = await decryptWorkerAiSettings(res.rows[0]?.preferences, userId)
+    const root = asRecord(preferences)
+    const aiSettings = asRecord(root.aiSettings)
+    const features = asRecord(aiSettings.features)
+    const configured = asAiConfig(features.autoApply)
+    if (configured) return resolveWorkerAiConfig(preferences)
 
-    const prefs = res.rows[0].preferences ?? {};
-    const aiSettings = (prefs as Record<string, unknown>).aiSettings as
-      | Record<string, unknown>
-      | undefined;
-
-    if (!aiSettings) return { ...APPLYMATE_BACKING };
-
-    // Check per-feature override
-    const features = aiSettings.features as
-      | Record<string, AiConfig | null>
-      | undefined;
-    const featureCfg = features?.["autoApply"];
-
-    // Build base config
-    const base = featureCfg ?? APPLYMATE_BACKING;
-
-    // Resolve API key: feature.apiKey → keys[provider] → server env
-    const keys = aiSettings.keys as Record<string, string> | undefined;
-    const apiKey =
-      base.apiKey?.trim() ||
-      keys?.[base.provider]?.trim() ||
-      undefined;
-
-    return {
-      provider: base.provider,
-      model: base.model,
-      apiKey,
-      apiBase: (base as AiConfig).apiBase,
-    };
+    const keys = stringRecord(aiSettings.keys)
+    const platform = await loadPlatformRoute(client, keys)
+    return platform ?? withUserKey(APPLYMATE_BACKING, keys)
   } finally {
     client.release();
   }
+}
+
+function withUserKey(config: AiConfig, keys: Record<string, string> | undefined): AiConfig {
+  return {
+    ...config,
+    apiKey: config.apiKey?.trim() || keys?.[config.provider]?.trim() || undefined,
+  };
+}
+
+async function loadPlatformRoute(
+  client: { query: (text: string, values?: unknown[]) => Promise<{ rows: unknown[] }> },
+  keys: Record<string, string> | undefined,
+): Promise<AiConfig | null> {
+  try {
+    const routeResult = await client.query(
+      `SELECT "defaultProvider", "defaultModel", "fallbackProvider", "fallbackModel"
+       FROM "ai_route_configs" WHERE "featureKey" = $1`,
+      ["autoApply"],
+    );
+    const route = routeResult.rows[0] as Record<string, unknown> | undefined;
+    if (!route) return null;
+
+    const candidates = [
+      { provider: route.defaultProvider, model: route.defaultModel },
+      { provider: route.fallbackProvider, model: route.fallbackModel },
+    ];
+    const hasFallback = typeof route.fallbackProvider === "string" && typeof route.fallbackModel === "string";
+    for (const [index, candidate] of candidates.entries()) {
+      if (!isProvider(candidate.provider) || typeof candidate.model !== "string" || !candidate.model.trim()) continue;
+      const providerResult = await client.query(
+        `SELECT provider.key, provider."apiBase", provider."secretRef", provider.enabled, model.active
+         FROM "ai_provider_configs" AS provider
+         JOIN "ai_model_configs" AS model ON model."providerId" = provider.id
+         WHERE provider.key = $1 AND model.model = $2`,
+        [candidate.provider, candidate.model],
+      );
+      const row = providerResult.rows[0] as Record<string, unknown> | undefined;
+      if (!row || row.enabled !== true || row.active !== true) continue;
+      const apiKey = (typeof row.secretRef === "string" ? process.env[row.secretRef] : undefined)
+        || keys?.[candidate.provider]?.trim()
+        || getServerKey(candidate.provider);
+      if (!apiKey && hasFallback && index === 0) continue;
+      return { provider: candidate.provider, model: candidate.model, apiBase: String(row.apiBase ?? ""), apiKey };
+    }
+  } catch {
+    // AI configuration tables are additive; older worker deployments fall back
+    // to the environment-backed configuration until migrations complete.
+  }
+  return null;
+}
+
+/** Resolve persisted Preferences JSON without opening a database connection. */
+export function resolveWorkerAiConfig(preferences: unknown): AiConfig {
+  const root = asRecord(preferences);
+  const aiSettings = asRecord(root.aiSettings);
+  const features = asRecord(aiSettings.features);
+  const configured = asAiConfig(features.autoApply);
+  if (!configured) return { ...APPLYMATE_BACKING };
+
+  const keys = asRecord(aiSettings.keys);
+  const apiKey = stringValue(configured.apiKey) ?? stringValue(keys[configured.provider]);
+  return {
+    provider: configured.provider,
+    model: configured.model,
+    ...(apiKey ? { apiKey } : {}),
+    ...(configured.apiBase ? { apiBase: configured.apiBase } : {}),
+    ...(configured.thinking ? { thinking: configured.thinking } : {}),
+  };
 }
 
 /** Close the shared pool (for tests/cleanup) */
@@ -135,7 +188,10 @@ async function callOpenAICompat(
   messages: ChatMessage[],
   config: AiConfig
 ): Promise<ChatResult> {
-  const base = config.apiBase || DEFAULT_API_BASES[config.provider] || DEFAULT_API_BASES.minimax;
+  const base = config.apiBase || DEFAULT_API_BASES[config.provider];
+  if (config.provider === "custom" && !isSafeAiEndpoint(base)) {
+    throw new Error("Custom AI endpoint is not an allowed public HTTPS destination");
+  }
   const key = config.apiKey || getServerKey(config.provider);
   if (!key) throw new Error(`No API key for provider "${config.provider}"`);
 
@@ -151,7 +207,7 @@ async function callOpenAICompat(
       }
     : { max_tokens: 4096 };
 
-  const res = await fetch(`${base}/chat/completions`, {
+  const request = {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
@@ -163,6 +219,11 @@ async function callOpenAICompat(
       ...providerOptions,
       temperature: 0.3,
     }),
+  };
+  const res = await pinnedFetch(`${base}/chat/completions`, {
+    ...request,
+    allowLocalDevelopment: config.provider === "custom" && process.env.NODE_ENV !== "production",
+    redirect: "error",
   });
 
   if (!res.ok) {
@@ -212,7 +273,7 @@ async function callAnthropic(
   };
   if (systemContent) body.system = systemContent;
 
-  const res = await fetch("https://api.anthropic.com/v1/messages", {
+  const res = await pinnedFetch("https://api.anthropic.com/v1/messages", {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
@@ -252,9 +313,90 @@ function getServerKey(provider: Provider): string | undefined {
     openai: process.env.OPENAI_API_KEY,
     anthropic: process.env.ANTHROPIC_API_KEY,
     deepseek: process.env.DEEPSEEK_API_KEY,
+    qwen: process.env.QWEN_API_KEY,
+    zhipu: process.env.ZHIPU_API_KEY,
+    kimi: process.env.KIMI_API_KEY,
     custom: undefined,
   };
   return envMap[provider];
+}
+
+function asRecord(value: unknown): Record<string, unknown> {
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : {};
+}
+
+function asAiConfig(value: unknown): AiConfig | null {
+  const raw = asRecord(value);
+  const provider = raw.provider;
+  const model = stringValue(raw.model);
+  if (!isProvider(provider) || !model) return null;
+  const apiBase = provider === "custom" ? stringValue(raw.apiBase) : undefined;
+  if (provider === "custom" && !apiBase) return null;
+  const thinking = raw.thinking === "adaptive" || raw.thinking === "disabled"
+    ? raw.thinking
+    : undefined;
+  return {
+    provider,
+    model,
+    ...(stringValue(raw.apiKey) ? { apiKey: stringValue(raw.apiKey) } : {}),
+    ...(apiBase ? { apiBase } : {}),
+    ...(thinking ? { thinking } : {}),
+  };
+}
+
+function isProvider(value: unknown): value is Provider {
+  return value === "minimax" || value === "openai" || value === "anthropic" ||
+    value === "deepseek" || value === "qwen" || value === "zhipu" ||
+    value === "kimi" || value === "custom";
+}
+
+function stringValue(value: unknown): string | undefined {
+  if (typeof value !== "string") return undefined;
+  const normalized = value.trim();
+  return normalized || undefined;
+}
+
+function stringRecord(value: unknown): Record<string, string> | undefined {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+  const record: Record<string, string> = {};
+  for (const [key, item] of Object.entries(value)) {
+    const normalized = stringValue(item);
+    if (normalized) record[key] = normalized;
+  }
+  return record;
+}
+
+async function decryptWorkerAiSettings(preferences: unknown, userId: string): Promise<unknown> {
+  const root = asRecord(preferences);
+  const aiSettings = asRecord(root.aiSettings);
+  const keys = asRecord(aiSettings.keys);
+  const features = asRecord(aiSettings.features);
+  const decryptedKeys: Record<string, unknown> = { ...keys };
+  for (const [provider, value] of Object.entries(keys)) {
+    if (typeof value === "string") {
+      decryptedKeys[provider] = await decryptSecret(value, credentialContext(`ai:${userId}:provider:${provider}`));
+    }
+  }
+  const decryptedFeatures: Record<string, unknown> = { ...features };
+  for (const [feature, value] of Object.entries(features)) {
+    if (!value || typeof value !== "object" || Array.isArray(value)) continue;
+    const config = value as Record<string, unknown>;
+    if (typeof config.apiKey !== "string") continue;
+    decryptedFeatures[feature] = {
+      ...config,
+      apiKey: await decryptSecret(config.apiKey, credentialContext(`ai:${userId}:feature:${feature}`)),
+    };
+  }
+  return {
+    ...root,
+    aiSettings: {
+      ...aiSettings,
+      keys: decryptedKeys,
+      features: decryptedFeatures,
+    },
+  };
 }
 
 /** Convenience: call LLM and return only the text string */

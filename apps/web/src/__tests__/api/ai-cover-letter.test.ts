@@ -3,9 +3,14 @@
  */
 import { describe, it, expect, vi, beforeEach } from 'vitest'
 
-const mockModelChat = vi.fn()
+const mocks = vi.hoisted(() => ({
+  modelChat: vi.fn(),
+  agentRoleFindFirst: vi.fn(),
+  prepareAiRoute: vi.fn(),
+}))
+
 vi.mock('@/lib/model-router', () => ({
-  modelChat: mockModelChat,
+  modelChat: mocks.modelChat,
   stripFences: (raw: string) => raw.replace(/^```(?:json)?\n?/, '').replace(/\n?```$/, ''),
   withMiniMaxThinking: (config: { provider: string; model: string }, thinking: 'adaptive' | 'disabled') =>
     config.provider === 'minimax' && config.model === 'MiniMax-M3' ? { ...config, thinking } : config,
@@ -13,7 +18,7 @@ vi.mock('@/lib/model-router', () => ({
 
 vi.mock('@/lib/db', () => ({
   db: {
-    agentRole: { findFirst: vi.fn().mockResolvedValue(null) },
+    agentRole: { findFirst: mocks.agentRoleFindFirst },
     coverLetter: { create: vi.fn() },
   },
 }))
@@ -22,7 +27,7 @@ vi.mock('@/lib/api-helpers', () => ({
   isErrorResponse: (val: unknown) => val instanceof Response && (val as Response).status === 401,
   ok: (data: unknown, status = 200) => Response.json(data, { status }),
   err: (message: string, status = 400) => Response.json({ error: message }, { status }),
-  prepareAiRoute: vi.fn().mockResolvedValue({ auth: { userId: 'test-user' }, cfg: { provider: 'anthropic', model: 'claude-sonnet-4-6' } }),
+  prepareAiRoute: mocks.prepareAiRoute,
 }))
 vi.mock('@/lib/rate-limit', () => ({
   checkRateLimit: vi.fn().mockReturnValue({ ok: true }),
@@ -39,6 +44,11 @@ function fakeNextRequest(body: unknown): Request {
 describe('POST /api/ai/cover-letter', () => {
   beforeEach(() => {
     vi.clearAllMocks()
+    mocks.prepareAiRoute.mockResolvedValue({
+      userId: 'test-user',
+      cfg: { provider: 'anthropic', model: 'claude-sonnet-4-6' },
+    })
+    mocks.agentRoleFindFirst.mockResolvedValue(null)
   })
 
   it('returns 400 when resumeContent is missing', async () => {
@@ -65,7 +75,7 @@ I am excited to apply for the Software Engineer role at Acme Corp.
 Sincerely,
 John Doe`
 
-    mockModelChat.mockResolvedValueOnce({ text: mockLetter })
+    mocks.modelChat.mockResolvedValueOnce({ text: mockLetter })
 
     const req = fakeNextRequest({
       resumeContent: {
@@ -87,7 +97,7 @@ John Doe`
   it('includes recipientName in the prompt when provided', async () => {
     const { POST } = await import('@/app/api/ai/cover-letter/route')
 
-    mockModelChat.mockResolvedValueOnce({ text: 'Dear Ms. Smith,\n\n...' })
+    mocks.modelChat.mockResolvedValueOnce({ text: 'Dear Ms. Smith,\n\n...' })
 
     const req = fakeNextRequest({
       resumeContent: { contact: { name: 'Jane', email: 'jane@test.com', location: 'SF' }, summary: '', skills: [], experience: [] },
@@ -103,7 +113,7 @@ John Doe`
   it('supports different tones', async () => {
     const { POST } = await import('@/app/api/ai/cover-letter/route')
 
-    mockModelChat.mockResolvedValueOnce({ text: 'Short and punchy letter.' })
+    mocks.modelChat.mockResolvedValueOnce({ text: 'Short and punchy letter.' })
 
     const req = fakeNextRequest({
       resumeContent: { contact: { name: 'A', email: 'a@b.com', location: 'X' }, summary: '', skills: [], experience: [] },
@@ -113,5 +123,32 @@ John Doe`
     })
     const res = await POST(req as never)
     expect(res!.status).toBe(200)
+  })
+
+  it('keeps the feature-level model when the Writer role is the keyless platform default', async () => {
+    const settingsCfg = { provider: 'openai', model: 'gpt-4o', apiKey: 'user-openai-key' }
+    mocks.prepareAiRoute.mockResolvedValue({ userId: 'test-user', cfg: settingsCfg })
+    mocks.agentRoleFindFirst.mockResolvedValue({
+      enabled: true,
+      provider: 'minimax',
+      model: 'MiniMax-M3',
+      apiKey: null,
+      systemPrompt: 'Custom writer prompt',
+    })
+    mocks.modelChat.mockResolvedValueOnce({ text: 'Dear Hiring Manager,\n\nA tailored letter.\n\nSincerely,\nJohn Doe' })
+
+    const { POST } = await import('@/app/api/ai/cover-letter/route')
+    const res = await POST(fakeNextRequest({
+      resumeContent: { contact: { name: 'John Doe' }, summary: 'Engineer', skills: [], experience: [] },
+      jobTitle: 'Engineer',
+      jobCompany: 'Acme',
+    }) as never)
+
+    expect(res!.status).toBe(200)
+    expect(mocks.modelChat).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining(settingsCfg),
+      4096,
+    )
   })
 })

@@ -13,6 +13,7 @@
  *   page      number  — 1-based page
  */
 import { NextRequest } from 'next/server'
+import { pinnedFetch } from '@jobcopilot/shared'
 import { requireAuth, isErrorResponse, ok, err } from '@/lib/api-helpers'
 
 const BASE = 'https://www.irishjobs.ie'
@@ -72,7 +73,7 @@ function parseRss(xml: string): Array<{
 }
 
 export async function GET(req: NextRequest) {
-  const auth = await requireAuth(req)
+  const auth = await requireAuth(req, 'job_discovery')
   if (isErrorResponse(auth)) return auth
 
   const sp       = req.nextUrl.searchParams
@@ -102,7 +103,7 @@ export async function GET(req: NextRequest) {
 
   for (const url of urlCandidates) {
     try {
-      const res = await fetch(url, {
+      const res = await pinnedFetch(url, {
         headers: {
           'User-Agent':      'Mozilla/5.0 (compatible; ApplyMate/1.0; +https://applymate.ai/bot)',
           'Accept':          'application/rss+xml, application/xml, text/xml, */*',

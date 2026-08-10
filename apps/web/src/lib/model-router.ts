@@ -13,7 +13,11 @@
  */
 
 import Anthropic from '@anthropic-ai/sdk'
+import { pinnedFetch } from '@jobcopilot/shared/pinned-outbound'
 import { db }    from '@/lib/db'
+import { isSafeAiEndpoint } from '@jobcopilot/shared/safe-ai-endpoint'
+import { recordAiUsage } from '@/lib/ai-usage'
+import { decryptAiSettings } from '@/lib/ai-credential-settings'
 
 // ── Provider & model catalogue ────────────────────────────────────────────────
 
@@ -26,6 +30,8 @@ export type Provider =
   | 'zhipu'
   | 'kimi'
   | 'custom'
+
+const KNOWN_PROVIDERS = new Set<Provider>(['anthropic', 'openai', 'deepseek', 'minimax', 'qwen', 'zhipu', 'kimi', 'custom'])
 
 export interface ModelOption {
   provider:    Provider
@@ -97,13 +103,13 @@ export const MODEL_CATALOGUE: ModelOption[] = [
     provider: 'minimax', model: 'MiniMax-M3',
     label: 'MiniMax M3', description: '平台默认，当前文本旗舰',
     tier: 'standard', priceIn: 0.6, priceOut: 2.4, contextK: 512,
-    defaultBase: 'https://api.minimax.io/v1',
+    defaultBase: 'https://api.minimax.chat/v1',
   },
   {
     provider: 'minimax', model: 'MiniMax-M2.7-highspeed',
     label: 'MiniMax M2.7 Highspeed', description: '同等能力的低延迟版本',
     tier: 'fast', priceIn: 0.6, priceOut: 2.4, contextK: 200,
-    defaultBase: 'https://api.minimax.io/v1',
+    defaultBase: 'https://api.minimax.chat/v1',
   },
 
   // ── Qwen / 通义千问 ───────────────────────────────────────
@@ -177,7 +183,7 @@ export function withMiniMaxThinking(config: AiConfig, thinking: MiniMaxThinkingM
 // ── Resolve effective config ──────────────────────────────────────────────────
 
 /** Merge user config with server env-var fallbacks */
-export function resolveConfig(userConfig?: AiConfig | null): AiConfig & { resolvedKey: string } {
+export function resolveConfig(userConfig?: AiConfig | null, options?: { preserveModel?: boolean }): AiConfig & { resolvedKey: string } {
   const input  = userConfig ?? DEFAULT_AI_CONFIG
   const exact  = MODEL_CATALOGUE.find(m => m.provider === input.provider && m.model === input.model)
   const option = exact
@@ -187,7 +193,7 @@ export function resolveConfig(userConfig?: AiConfig | null): AiConfig & { resolv
 
   // Saved settings can outlive a provider model. Do not send a retired model
   // identifier to the provider; retain custom model IDs because they are user-owned.
-  const cfg = !exact && input.provider !== 'custom'
+  const cfg = !exact && input.provider !== 'custom' && !options?.preserveModel
     ? { ...input, provider: option.provider, model: option.model }
     : input
 
@@ -196,7 +202,11 @@ export function resolveConfig(userConfig?: AiConfig | null): AiConfig & { resolv
     || getServerKey(cfg.provider)
     || ''
 
-  const resolvedBase = cfg.apiBase?.trim() || option?.defaultBase || ''
+  // Only custom providers own their endpoint. Internal providers must retain
+  // their curated base so a persisted override cannot receive a platform key.
+  const resolvedBase = cfg.provider === 'custom'
+    ? cfg.apiBase?.trim() || option?.defaultBase || ''
+    : option?.defaultBase || ''
 
   return { ...cfg, apiBase: resolvedBase, resolvedKey }
 }
@@ -210,7 +220,9 @@ function getServerKey(provider: Provider): string {
     case 'qwen':      return process.env.QWEN_API_KEY      ?? ''
     case 'zhipu':     return process.env.ZHIPU_API_KEY     ?? ''
     case 'kimi':      return process.env.KIMI_API_KEY      ?? ''
-    case 'custom':    return process.env.CUSTOM_API_KEY    ?? ''
+    // A custom endpoint is user-controlled, so it must never receive a
+    // server-level credential. Custom configs require a saved user key.
+    case 'custom':    return ''
     default:          return ''
   }
 }
@@ -245,15 +257,26 @@ export async function modelChat(
   messages:  ChatMessage[],
   config:    AiConfig,
   maxTokens: number = 1024,
+  usageContext?: { userId?: string; featureKey?: string },
 ): Promise<ChatResult> {
   const resolved = resolveConfig(config)
-  assertKey(resolved)
-
-  if (resolved.provider === 'anthropic') {
-    return callAnthropic(messages, resolved, maxTokens)
-  } else {
-    return callOpenAICompat(messages, resolved, maxTokens)
+  const startedAt = Date.now()
+  try {
+    assertKey(resolved)
+    const result = resolved.provider === 'anthropic'
+      ? await callAnthropic(messages, resolved, maxTokens)
+      : await callOpenAICompat(messages, resolved, maxTokens)
+    void recordAiUsage({ ...usageContext, provider: result.provider, model: result.model, inputTokens: result.inputTokens, outputTokens: result.outputTokens, estimatedCostUsd: aiCost(result.provider, result.model, result.inputTokens ?? 0, result.outputTokens ?? 0), latencyMs: Date.now() - startedAt, status: 'success' })
+    return result
+  } catch (error) {
+    void recordAiUsage({ ...usageContext, provider: resolved.provider, model: resolved.model, estimatedCostUsd: 0, latencyMs: Date.now() - startedAt, status: 'error', errorCode: error instanceof Error ? error.message.slice(0, 120) : 'unknown_error' })
+    throw error
   }
+}
+
+function aiCost(provider: Provider, model: string, inputTokens: number, outputTokens: number): number {
+  const option = MODEL_CATALOGUE.find(item => item.provider === provider && item.model === model)
+  return option ? Number(((inputTokens / 1_000_000) * option.priceIn + (outputTokens / 1_000_000) * option.priceOut).toFixed(8)) : 0
 }
 
 /**
@@ -345,6 +368,9 @@ interface OaiRequestConfig {
 }
 
 function oaiFetch(c: OaiRequestConfig): Promise<Response> {
+  if (c.provider === 'custom' && !isSafeAiEndpoint(c.base, { allowLocalDevelopment: process.env.NODE_ENV !== 'production' })) {
+    return Promise.reject(new Error('Custom AI endpoint is not an allowed public HTTPS destination'))
+  }
   const controller = new AbortController()
   // Audits compare two full documents and can legitimately take longer than a
   // short suggestion request. Keep a bounded timeout, but avoid aborting a
@@ -359,12 +385,18 @@ function oaiFetch(c: OaiRequestConfig): Promise<Response> {
         ...(c.model === 'MiniMax-M3' ? { thinking: { type: c.thinking ?? 'adaptive' } } : {}),
       }
     : { max_tokens: c.maxTokens }
-  return fetch(`${c.base}/chat/completions`, {
+  const request = {
     method:  'POST',
     headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${c.key}` },
     body:    JSON.stringify({ model: c.model, ...providerOptions, messages: c.messages, stream: c.stream }),
+    redirect: 'error' as const,
     signal:  controller.signal,
-  }).finally(() => clearTimeout(timer))
+  }
+  const response = pinnedFetch(`${c.base}/chat/completions`, {
+    ...request,
+    allowLocalDevelopment: c.provider === 'custom' && process.env.NODE_ENV !== 'production',
+  })
+  return response.finally(() => clearTimeout(timer))
 }
 
 async function oaiCheck(resp: Response, provider: Provider): Promise<void> {
@@ -584,9 +616,15 @@ export async function loadUserAiConfig(
   userId:    string,
   featureId: FeatureId,
 ): Promise<AiConfig & { resolvedKey: string }> {
-  const user   = await db.user.findUnique({ where: { id: userId }, select: { preferences: true } })
-  const prefs  = (user?.preferences ?? {}) as Record<string, unknown>
-  return resolveFeatureConfig(featureId, (prefs.aiSettings ?? null) as UserAiSettings | null)
+  const settings = await loadUserAiSettings(userId)
+  return resolveFeatureConfig(featureId, settings)
+}
+
+export async function loadUserAiSettings(userId: string): Promise<UserAiSettings> {
+  const user = await db.user.findUnique({ where: { id: userId }, select: { preferences: true } })
+  const prefs = (user?.preferences ?? {}) as Record<string, unknown>
+  const aiSettings = await decryptAiSettings(prefs.aiSettings ?? null, userId)
+  return aiSettings as UserAiSettings
 }
 
 export function resolveFeatureConfig(

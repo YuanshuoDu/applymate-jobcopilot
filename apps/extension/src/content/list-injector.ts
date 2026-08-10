@@ -768,6 +768,7 @@ function injectCardButton(card: Element, job: CardJob, jobKey = job.url): HTMLBu
   btn.dataset.applymateSaveKey = getJobIdentity(job)
 
   btn.addEventListener('click', async (e) => {
+    if (!e.isTrusted) return
     e.stopPropagation()
     e.stopImmediatePropagation()
     e.preventDefault()
@@ -933,7 +934,7 @@ function showPopup(card: Element, job: CardJob) {
       </div>
       ${job.salary ? `<div class="am-pop-salary"><span class="am-pop-salary-icon">💰</span> ${escHtml(job.salary)}</div>` : ''}
       <div class="am-pop-footer">
-        <a class="am-pop-link" href="${escHtml(job.url)}" target="_blank" rel="noreferrer">View on ${escHtml(typeof srcLabel === 'string' ? srcLabel : 'site')} ↗</a>
+        <a class="am-pop-link" href="${escHtml(safePopupUrl(job.url))}" target="_blank" rel="noreferrer">View on ${escHtml(typeof srcLabel === 'string' ? srcLabel : 'site')} ↗</a>
       </div>
     </div>
   `
@@ -983,6 +984,14 @@ function showInlineError(card: HTMLElement, message: string) {
 
 function escHtml(s: string): string {
   return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;')
+}
+
+function safePopupUrl(raw: string): string {
+  try {
+    const url = new URL(raw)
+    if ((url.protocol === 'http:' || url.protocol === 'https:') && !url.username && !url.password) return url.href
+  } catch { /* malformed scraped URL */ }
+  return '#'
 }
 
 async function fetchIndeedDetails(job: CardJob): Promise<ScrapedJob | null> {

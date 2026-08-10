@@ -1,5 +1,5 @@
 /**
- * DELETE /api/me — permanently delete the current user's account and all data
+ * DELETE /api/me/delete — permanently delete the current user's account and all data
  *
  * Body (optional): { confirmation: string } — must be the user's email to confirm
  */
@@ -8,11 +8,11 @@ import { db } from '@/lib/db'
 import { requireAuth, isErrorResponse, ok, err } from '@/lib/api-helpers'
 
 export async function DELETE(req: NextRequest) {
-  const auth = await requireAuth()
+  const auth = await requireAuth(req)
   if (isErrorResponse(auth)) return auth
 
   const body = await req.json().catch(() => null)
-  const confirmation = (body?.confirmation ?? '') as string
+  const confirmation = typeof body?.confirmation === 'string' ? body.confirmation : ''
 
   // Fetch user to verify
   const user = await db.user.findUnique({
@@ -23,7 +23,7 @@ export async function DELETE(req: NextRequest) {
   if (!user) return err('User not found', 404)
 
   // Require email confirmation
-  if (!confirmation || confirmation.toLowerCase() !== user.email.toLowerCase()) {
+  if (!confirmation.trim() || confirmation.trim().toLowerCase() !== user.email.trim().toLowerCase()) {
     return err('Must provide your email as confirmation', 400)
   }
 

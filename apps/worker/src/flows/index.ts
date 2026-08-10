@@ -1,11 +1,21 @@
-export type FlowType = "greenhouse" | "workday" | "lever" | "smartrecruiters" | "personio" | null;
+import { detectAtsSource, type AtsSourceKey } from '@jobcopilot/shared/ats-url'
+
+export type FlowType = AtsSourceKey | null;
 
 export function detectFlow(url: string): FlowType {
-  // Order matters: keep specific ATS hostnames before broader jobs.* patterns.
-  if (/jobs\.smartrecruiters\.com/i.test(url)) return "smartrecruiters";
-  if (/\.jobs\.personio\.com/i.test(url)) return "personio";
-  if (/boards\.greenhouse\.io|grnh\.se|greenhouse\.io\/applications/i.test(url)) return "greenhouse";
-  if (/\.myworkdayjobs\.com/i.test(url)) return "workday";
-  if (/jobs\.lever\.co|jobs\.eu\.lever\.co/i.test(url)) return "lever";
-  return null;
+  const source = detectAtsSource(url)
+  if (source) return source
+
+  // Greenhouse short links are only a routing hint. apply-queue validates the
+  // post-redirect page origin before selecting or running a flow.
+  try {
+    const parsed = new URL(url)
+    const segments = parsed.pathname.split('/').filter(Boolean)
+    if (parsed.protocol === 'https:' && parsed.hostname.toLowerCase() === 'grnh.se' && segments.length === 1) {
+      return 'greenhouse'
+    }
+  } catch {
+    // Unknown/invalid URLs remain unsupported.
+  }
+  return null
 }

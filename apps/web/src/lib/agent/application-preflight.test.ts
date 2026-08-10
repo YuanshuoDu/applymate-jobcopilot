@@ -37,4 +37,10 @@ describe("application preflight", () => {
     ]) expect(isSupportedAutomatedApplyUrl(url)).toBe(true)
     expect(isSupportedAutomatedApplyUrl("https://www.linkedin.com/jobs/view/1")).toBe(false)
   })
+
+  it("does not treat a vendor marketing page as an automated application", () => {
+    expect(isSupportedAutomatedApplyUrl("https://greenhouse.io/products")).toBe(false)
+    expect(isSupportedAutomatedApplyUrl("https://lever.co/blog")).toBe(false)
+    expect(isSupportedAutomatedApplyUrl("https://smartrecruiters.com/resources")).toBe(false)
+  })
 })

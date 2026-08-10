@@ -14,9 +14,11 @@
  * Falls back gracefully if API keys are not configured.
  */
 import { NextRequest } from 'next/server'
+import { pinnedFetch } from '@jobcopilot/shared'
 import { requireAuth, isErrorResponse, ok } from '@/lib/api-helpers'
 import { db } from '@/lib/db'
 import { truncate } from '@/lib/utils'
+import { getDiscoveryApiKeys } from '@/lib/discovery-api-keys'
 
 // In-memory cache per userId (market data changes slowly)
 const _pulseCache = new Map<string, { data: object; exp: number }>()
@@ -52,9 +54,7 @@ export async function GET(req: NextRequest) {
   const primaryRole     = roles[0]     ?? ''
   const primaryLocation = locations[0] ?? ''
 
-  const rapidKey   = process.env.RAPIDAPI_KEY   ?? ''
-  const adzunaId   = process.env.ADZUNA_APP_ID  ?? ''
-  const adzunaKey  = process.env.ADZUNA_APP_KEY ?? ''
+  const { rapidapiKey: rapidKey, adzunaAppId: adzunaId, adzunaAppKey: adzunaKey } = await getDiscoveryApiKeys(userId)
 
   // ── Parallel data collection ──────────────────────────────────────────────
   const [salaryData, jobsData] = await Promise.all([
@@ -110,7 +110,7 @@ async function fetchSalary(
   const cleanRole = role.replace(/\b(senior|sr|junior|jr|lead|staff|principal)\b/gi, '').trim()
   try {
     const p = new URLSearchParams({ query: cleanRole, countryCode: cc })
-    const res = await fetch(`https://jobs-api14.p.rapidapi.com/v2/salary/range?${p}`, {
+    const res = await pinnedFetch(`https://jobs-api14.p.rapidapi.com/v2/salary/range?${p}`, {
       headers: { 'x-rapidapi-key': rapidKey, 'x-rapidapi-host': 'jobs-api14.p.rapidapi.com' },
       next: { revalidate: 3600 },
     })
@@ -153,7 +153,7 @@ async function fetchRecentJobs(
       include_ai:       'true',
     })
     if (location) p.set('location_filter', location)
-    const res = await fetch(`https://active-jobs-db.p.rapidapi.com/active-ats-7d?${p}`, {
+    const res = await pinnedFetch(`https://active-jobs-db.p.rapidapi.com/active-ats-7d?${p}`, {
       headers: { 'x-rapidapi-key': rapidKey, 'x-rapidapi-host': 'active-jobs-db.p.rapidapi.com' },
       signal: AbortSignal.timeout(6_000), cache: 'no-store',
     })
@@ -181,7 +181,7 @@ async function fetchRecentJobs(
       exclude_ats_duplicate: 'true',
     })
     if (location) p.set('location_filter', location)
-    const res = await fetch(`https://linkedin-job-search-api.p.rapidapi.com/active-jb-24h?${p}`, {
+    const res = await pinnedFetch(`https://linkedin-job-search-api.p.rapidapi.com/active-jb-24h?${p}`, {
       headers: { 'x-rapidapi-key': rapidKey, 'x-rapidapi-host': 'linkedin-job-search-api.p.rapidapi.com' },
       signal: AbortSignal.timeout(5_000), cache: 'no-store',
     })

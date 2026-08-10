@@ -23,6 +23,7 @@
  *   withContact 0|1     — include hiring manager contacts (default 0, costs extra credits)
  */
 import { NextRequest } from 'next/server'
+import { pinnedFetch } from '@jobcopilot/shared'
 import { requireAuth, isErrorResponse, ok, err } from '@/lib/api-helpers'
 import { truncate } from '@/lib/utils'
 
@@ -112,7 +113,7 @@ function flattenJobs(companies: MantiksCompany[]): MantiksJobResult[] {
 }
 
 export async function GET(req: NextRequest) {
-  const auth = await requireAuth(req)
+  const auth = await requireAuth(req, 'job_discovery')
   if (isErrorResponse(auth)) return auth
 
   const apiKey = process.env.MANTIKS_API_KEY
@@ -144,7 +145,7 @@ export async function GET(req: NextRequest) {
 
   let raw: Response
   try {
-    raw = await fetch(`${BASE}/company/search?${params}`, {
+    raw = await pinnedFetch(`${BASE}/company/search?${params}`, {
       headers: {
         'X-API-KEY': apiKey,
         'Content-Type': 'application/json',

@@ -10,8 +10,13 @@ const mocks = vi.hoisted(() => ({
   coverLetterFindFirst: vi.fn(),
   jobUpdateMany: vi.fn(),
   jobFindFirst: vi.fn(),
+  userFindUnique: vi.fn(),
   activityCreate: vi.fn(),
   enqueueApplyTask: vi.fn(),
+  runtimeFeatureEnabled: vi.fn(),
+  hasEffectiveEntitlement: vi.fn(),
+  isFeatureAllowed: vi.fn(),
+  resolveAiAccess: vi.fn(),
 }));
 
 vi.mock("@/lib/db", () => ({
@@ -23,11 +28,14 @@ vi.mock("@/lib/db", () => ({
     coverLetter: { findFirst: mocks.coverLetterFindFirst },
     applicationTaskEvent: { create: mocks.taskEventCreate },
     job: { findFirst: mocks.jobFindFirst, updateMany: mocks.jobUpdateMany },
+    user: { findUnique: mocks.userFindUnique },
     activity: { create: mocks.activityCreate },
   },
 }));
 
 vi.mock("@/lib/apply-queue-client", () => ({ enqueueApplyTask: mocks.enqueueApplyTask }));
+vi.mock("@/lib/runtime-feature-flags", () => ({ isRuntimeFeatureEnabled: mocks.runtimeFeatureEnabled }));
+vi.mock("@/lib/entitlements", () => ({ hasEffectiveEntitlement: mocks.hasEffectiveEntitlement, isFeatureAllowed: mocks.isFeatureAllowed, resolveAiAccess: mocks.resolveAiAccess }));
 
 describe("auto-apply authorization", () => {
   const input = {
@@ -45,6 +53,7 @@ describe("auto-apply authorization", () => {
     mocks.jobFindFirst.mockResolvedValue({
       company: "Acme", description: "Join the platform team with Acme. Build products.", source: "lever", url: input.applyUrl,
     });
+    mocks.userFindUnique.mockResolvedValue({ accountStatus: "active" });
     mocks.transaction.mockImplementation(async (callback: (tx: unknown) => unknown) => {
       if (typeof callback === "function") {
         return callback({
@@ -57,9 +66,13 @@ describe("auto-apply authorization", () => {
       return Promise.all(callback);
     });
     mocks.enqueueApplyTask.mockResolvedValue("worker_1");
+    mocks.runtimeFeatureEnabled.mockResolvedValue(true);
+    mocks.hasEffectiveEntitlement.mockResolvedValue(true);
     mocks.activityCreate.mockResolvedValue({});
     mocks.taskUpdate.mockResolvedValue({});
     mocks.taskEventCreate.mockResolvedValue({});
+    mocks.isFeatureAllowed.mockResolvedValue(true);
+    mocks.resolveAiAccess.mockResolvedValue('allowed');
   });
 
   it("queues only after matching explicit per-job authorization", async () => {
@@ -71,6 +84,22 @@ describe("auto-apply authorization", () => {
     expect(mocks.transaction).toHaveBeenCalled();
   });
 
+  it("rejects autonomous submission when the current plan lacks auto-apply", async () => {
+    mocks.isFeatureAllowed.mockResolvedValueOnce(false);
+    const { queueAutonomousApplication } = await import("./auto-apply");
+
+    await expect(queueAutonomousApplication(input)).rejects.toThrow("not included in your current plan");
+    expect(mocks.approvalFindFirst).not.toHaveBeenCalled();
+  });
+
+  it("rejects autonomous submission when monthly AI credits are exhausted", async () => {
+    mocks.resolveAiAccess.mockResolvedValueOnce('exhausted');
+    const { queueAutonomousApplication } = await import("./auto-apply");
+
+    await expect(queueAutonomousApplication(input)).rejects.toThrow("Monthly AI credits exhausted");
+    expect(mocks.approvalFindFirst).not.toHaveBeenCalled();
+  });
+
   it("queues a fill-only pass without changing the job into a submission", async () => {
     mocks.taskUpdate.mockResolvedValueOnce({ count: 1 }).mockResolvedValue({});
     const { queueApplicationFill } = await import("./auto-apply");
@@ -79,6 +108,18 @@ describe("auto-apply authorization", () => {
     })).resolves.toEqual({ taskId: "worker_1" });
     expect(mocks.enqueueApplyTask).toHaveBeenCalledWith(expect.objectContaining({ operation: "fill" }));
     expect(mocks.jobUpdateMany).not.toHaveBeenCalled();
+  });
+
+  it("does not queue unattended browser work when the platform control is disabled", async () => {
+    mocks.runtimeFeatureEnabled.mockResolvedValueOnce(false);
+    mocks.taskUpdate.mockResolvedValueOnce({ count: 1 });
+    const { queueApplicationFill } = await import("./auto-apply");
+
+    await expect(queueApplicationFill({
+      userId: "user_1", jobId: "job_1", applicationTaskId: "application_1", applyUrl: input.applyUrl,
+    })).rejects.toThrow("temporarily unavailable");
+
+    expect(mocks.enqueueApplyTask).not.toHaveBeenCalled();
   });
 
   it("rejects a global setting or unrelated approval as submission consent", async () => {

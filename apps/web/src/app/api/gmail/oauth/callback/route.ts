@@ -12,14 +12,19 @@
  * explicitly move it by starting OAuth with transfer=1 and authorizing Google.
  */
 import { NextRequest, NextResponse } from 'next/server'
+import { pinnedFetch } from '@jobcopilot/shared'
 import { jwtVerify } from 'jose'
 import { db } from '@/lib/db'
 import { GMAIL_ACCOUNT_PROVIDER } from '@/lib/gmail-helpers'
+import { encryptAccountTokenFields } from '@/lib/credential-secrets'
 import { canRecoverStaleGmailConnection } from '@/lib/gmail-connection-recovery'
-
-const JWT_SECRET = new TextEncoder().encode(
-  process.env.AUTH_SECRET ?? 'fallback-secret-change-this',
-)
+import { configuredRedirectUri } from '@/lib/app-url'
+import { configuredAppOrigin } from '@/lib/app-url'
+import {
+  clearOAuthStateCookie,
+  getOAuthStateSecret,
+  hasMatchingOAuthStateCookie,
+} from '@/lib/oauth-state'
 
 function safeReturnTo(value: unknown): string | null {
   if (typeof value !== 'string' || !value.startsWith('/')) return null
@@ -41,9 +46,11 @@ export async function GET(req: NextRequest) {
   let returnTo = '/?page=gmail'
   let transferRequested = false
   const back = (msg: string) => {
-    const u = new URL(returnTo, req.url)
+    const u = new URL(returnTo, configuredAppOrigin(req.url))
     u.searchParams.set('gmailError', msg)
-    return NextResponse.redirect(u)
+    const response = NextResponse.redirect(u)
+    clearOAuthStateCookie(response, 'gmail')
+    return response
   }
 
   if (errParam) {
@@ -52,11 +59,19 @@ export async function GET(req: NextRequest) {
   }
   if (!code || !state) return back('missing_code_or_state')
 
-  // Verify state and extract userId
+  const stateSecret = getOAuthStateSecret()
+  if (!stateSecret) return back('oauth_not_configured')
+
+  // Verify the signed state and browser binding before using its user id.
   let userId: string
   try {
-    const { payload } = await jwtVerify(state, JWT_SECRET)
-    if (!payload.uid || typeof payload.uid !== 'string') return back('invalid_state')
+    const { payload } = await jwtVerify(state, stateSecret)
+    if (
+      !payload.uid
+      || typeof payload.uid !== 'string'
+      || typeof payload.nonce !== 'string'
+      || !hasMatchingOAuthStateCookie(req, 'gmail', payload.nonce)
+    ) return back('invalid_state')
     userId = payload.uid
     returnTo = safeReturnTo(payload.returnTo) ?? returnTo
     transferRequested = payload.transfer === true
@@ -65,9 +80,13 @@ export async function GET(req: NextRequest) {
     return back('invalid_state')
   }
 
+  const user = await db.user.findUnique({ where: { id: userId }, select: { accountStatus: true } })
+  if (!user) return back('user_not_found')
+  if (user.accountStatus === 'suspended') return back('account_suspended')
+
   // Exchange code for tokens
-  const redirectUri = new URL('/api/gmail/oauth/callback', req.url).toString()
-  const tokenRes = await fetch('https://oauth2.googleapis.com/token', {
+  const redirectUri = configuredRedirectUri(req.url, '/api/gmail/oauth/callback')
+  const tokenRes = await pinnedFetch('https://oauth2.googleapis.com/token', {
     method:  'POST',
     headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
     body:    new URLSearchParams({
@@ -85,7 +104,7 @@ export async function GET(req: NextRequest) {
   }
 
   // Fetch Google user id (sub) — needed for providerAccountId uniqueness
-  const profileRes = await fetch('https://www.googleapis.com/oauth2/v3/userinfo', {
+  const profileRes = await pinnedFetch('https://www.googleapis.com/oauth2/v3/userinfo', {
     headers: { Authorization: `Bearer ${tokens.access_token}` },
   })
   const profile = await profileRes.json()
@@ -134,6 +153,14 @@ export async function GET(req: NextRequest) {
     where: { userId, provider: GMAIL_ACCOUNT_PROVIDER, NOT: { providerAccountId } },
   })
 
+  const encryptedTokens = await encryptAccountTokenFields({
+    provider: GMAIL_ACCOUNT_PROVIDER,
+    providerAccountId,
+    accessToken: tokens.access_token,
+    refreshToken: tokens.refresh_token ?? null,
+    idToken: tokens.id_token ?? null,
+  })
+
   // Upsert the current user's isolated Gmail connection.
   await db.account.upsert({
     where: { provider_providerAccountId: { provider: GMAIL_ACCOUNT_PROVIDER, providerAccountId } },
@@ -142,20 +169,19 @@ export async function GET(req: NextRequest) {
       type:              'oauth',
       provider:          GMAIL_ACCOUNT_PROVIDER,
       providerAccountId,
-      access_token:      tokens.access_token,
-      refresh_token:     tokens.refresh_token ?? null,
+      ...encryptedTokens,
       expires_at,
       token_type:        tokens.token_type ?? null,
       scope:             tokens.scope ?? null,
-      id_token:          tokens.id_token ?? null,
     },
     update: {
       ...(recoveredLegacyConnection || transferredConnection ? { userId } : {}),
-      access_token:  tokens.access_token,
-      ...(tokens.refresh_token ? { refresh_token: tokens.refresh_token } : {}),
+      access_token:  null,
+      accessTokenEnc: encryptedTokens.accessTokenEnc,
+      ...(tokens.refresh_token ? { refresh_token: null, refreshTokenEnc: encryptedTokens.refreshTokenEnc } : {}),
       ...(expires_at != null   ? { expires_at }                          : {}),
       ...(tokens.scope         ? { scope:        tokens.scope }          : {}),
-      ...(tokens.id_token      ? { id_token:     tokens.id_token }       : {}),
+      ...(tokens.id_token      ? { id_token: null, idTokenEnc: encryptedTokens.idTokenEnc } : {}),
     },
   })
 
@@ -167,7 +193,9 @@ export async function GET(req: NextRequest) {
       : '[gmail/oauth/callback] linked Gmail integration to current user',
   )
 
-  const success = new URL(returnTo, req.url)
+  const success = new URL(returnTo, configuredAppOrigin(req.url))
   success.searchParams.set('gmailAuth', '1')
-  return NextResponse.redirect(success)
+  const response = NextResponse.redirect(success)
+  clearOAuthStateCookie(response, 'gmail')
+  return response
 }

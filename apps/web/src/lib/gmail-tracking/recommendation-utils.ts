@@ -38,9 +38,13 @@ export function isLikelyJobDetailUrl(value?: string | null): boolean {
   try {
     const url = new URL(value)
     const host = url.hostname.toLowerCase()
-    if (host.includes('indeed.')) return Boolean(url.searchParams.get('jk') || url.searchParams.get('vjk'))
-    if (host.includes('linkedin.')) return /\/jobs\/view\//i.test(url.pathname)
-    return /(greenhouse\.io|lever\.co|myworkdayjobs\.com|smartrecruiters\.com|personio\.de)/i.test(host)
+    if (host === 'indeed.com' || host.endsWith('.indeed.com')) return Boolean(url.searchParams.get('jk') || url.searchParams.get('vjk'))
+    if (host === 'linkedin.com' || host.endsWith('.linkedin.com')) return /\/jobs\/view\//i.test(url.pathname)
+    return (host === 'greenhouse.io' || host.endsWith('.greenhouse.io')
+      || host === 'lever.co' || host.endsWith('.lever.co')
+      || host.endsWith('.myworkdayjobs.com')
+      || host === 'smartrecruiters.com' || host.endsWith('.smartrecruiters.com')
+      || host === 'personio.de' || host.endsWith('.personio.de'))
   } catch {
     return false
   }

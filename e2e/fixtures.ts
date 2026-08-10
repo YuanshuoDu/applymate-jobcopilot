@@ -52,7 +52,7 @@ function makeSeedJobs(): Job[] {
       status: "saved",
       workflowState: "draft",
       score: null,
-      url: "https://example.com/cloudflare-systems",
+      url: "https://boards.greenhouse.io/cloudflare/jobs/123456",
       description: "Build distributed systems with TypeScript, Go, PostgreSQL, and observability.",
       salary: "EUR 80k-100k",
       source: "agent",
@@ -130,6 +130,7 @@ function agentConfig() {
 }
 
 async function installAppMocks(page: Page, jobs: Job[]) {
+  let generatedCoverLetter: Job["coverLetter"] = null;
   await page.route("**/api/me", route =>
     json(route, {
       id: "e2e-user",
@@ -212,19 +213,9 @@ async function installAppMocks(page: Page, jobs: Job[]) {
     return json(route, job, 201);
   });
 
-  await page.route("**/api/jobs/*", async route => {
-    if (route.request().method() !== "PATCH") return route.fallback();
-    const id = new URL(route.request().url()).pathname.split("/").at(-1);
-    const body = await route.request().postDataJSON();
-    const index = jobs.findIndex(job => job.id === id);
-    if (index === -1) return json(route, { error: "Not found" }, 404);
-    jobs[index] = { ...jobs[index], ...body, updatedAt: now };
-    return json(route, jobs[index]);
-  });
-
   await page.route("**/api/activity**", route => json(route, []));
   await page.route("**/api/resume", route =>
-    json(route, [{ id: "resume-1", name: "Main Resume", isDefault: true, createdAt: now, updatedAt: now }]),
+    json(route, [{ id: "resume-1", name: "Main Resume", kind: "base", isDefault: true, createdAt: now, updatedAt: now }]),
   );
   await page.route("**/api/resume/default", route =>
     json(route, {
@@ -243,6 +234,22 @@ async function installAppMocks(page: Page, jobs: Job[]) {
     json(route, {
       id: "resume-1",
       name: "Main Resume",
+      content: {
+        contact: { name: "E2E Demo", email: demoUser.email },
+        summary: "Backend engineer focused on distributed systems.",
+        skills: ["TypeScript", "Go", "PostgreSQL", "Playwright"],
+        experience: [],
+        education: [],
+      },
+    }),
+  );
+  await page.route("**/api/resume/resume-tailored-1", route =>
+    json(route, {
+      id: "resume-tailored-1",
+      name: "Systems Engineer · Cloudflare",
+      kind: "adapted",
+      targetJobId: "e2e-job-1",
+      isDefault: false,
       content: {
         contact: { name: "E2E Demo", email: demoUser.email },
         summary: "Backend engineer focused on distributed systems.",
@@ -305,6 +312,95 @@ async function installAppMocks(page: Page, jobs: Job[]) {
     json(route, { coverLetter: generatedCoverLetter }),
   );
 
+  await page.route("**/api/jobs/**", async route => {
+    const request = route.request();
+    const url = new URL(request.url());
+    const pathname = url.pathname;
+    const method = request.method();
+
+    if (pathname.endsWith("/cover-letters") && method === "GET") {
+      return json(route, generatedCoverLetter ? [{
+        id: "e2e-cover-letter-1",
+        userId: "e2e-user",
+        jobId: "e2e-job-1",
+        resumeId: "resume-tailored-1",
+        content: generatedCoverLetter,
+        tone: "professional",
+        templateId: "clean",
+        templateOptions: {},
+        origin: "ai",
+        isFinal: true,
+        createdAt: now,
+        updatedAt: now,
+      }] : []);
+    }
+
+    if (method === "POST" && pathname.endsWith("/tailor-resume")) {
+      return json(route, { adaptedResumeId: "resume-tailored-1" });
+    }
+
+    if (method === "POST" && pathname.endsWith("/cover-letters/generate")) {
+      generatedCoverLetter = generatedCoverLetter ?? generatedCoverLetterText;
+      jobs[0].coverLetter = generatedCoverLetter;
+      return json(route, {
+        id: "e2e-cover-letter-1",
+        userId: "e2e-user",
+        jobId: "e2e-job-1",
+        resumeId: "resume-tailored-1",
+        content: generatedCoverLetter,
+        tone: "professional",
+        templateId: "clean",
+        templateOptions: {},
+        origin: "ai",
+        isFinal: true,
+        createdAt: now,
+        updatedAt: now,
+      });
+    }
+
+    if (method === "POST" && pathname.endsWith("/audit-application")) {
+      return json(route, {
+        verdict: "pass",
+        summary: "All application claims are supported.",
+        matchScore: 91,
+        findings: [],
+        source: "current_resume",
+        auditedAt: now,
+      });
+    }
+
+    if (method === "GET" && pathname.endsWith("/audit-application")) {
+      return json(route, null);
+    }
+
+    if (method === "PATCH" && pathname.endsWith("/assign")) {
+      const body = await request.postDataJSON();
+      const job = jobs.find(item => item.id === pathname.split("/").at(-2));
+      if (!job) return json(route, { error: "Not found" }, 404);
+      Object.assign(job, body, { updatedAt: now });
+      return json(route, job);
+    }
+
+    if (method === "POST" && pathname.endsWith("/score-all")) {
+      for (const job of jobs) {
+        job.score = 91;
+        job.keywords = "TypeScript, PostgreSQL, distributed systems";
+      }
+      return json(route, { scored: jobs.length, failed: 0, remaining: 0 });
+    }
+
+    if (method === "PATCH") {
+      const id = pathname.split("/").at(-1);
+      const body = await request.postDataJSON();
+      const index = jobs.findIndex(job => job.id === id);
+      if (index === -1) return json(route, { error: "Not found" }, 404);
+      jobs[index] = { ...jobs[index], ...body, updatedAt: now };
+      return json(route, jobs[index]);
+    }
+
+    return route.fallback();
+  });
+
   await page.route("**/api/agent", async route => {
     if (route.request().method() === "PATCH") return json(route, agentConfig());
     return json(route, agentConfig());
@@ -331,7 +427,23 @@ async function installAppMocks(page: Page, jobs: Job[]) {
       ].join("\n"),
     }),
   );
+  await page.route("**/api/agent/chat", route =>
+    route.fulfill({
+      status: 200,
+      contentType: "text/event-stream",
+      body: [
+        'event: session\ndata: {"sessionId":"e2e-session-1"}\n',
+        'event: text\ndata: {"delta":"Starting the matching job run."}\n',
+        'event: action\ndata: {"type":"start_run"}\n',
+        "",
+      ].join("\n"),
+    }),
+  );
+  await page.route("**/api/agent/sessions/*/events", route => json(route, { events: [] }));
 }
+
+const generatedCoverLetterText =
+  "Dear Hiring Team, I am excited to apply my backend systems experience to this role and help your team ship reliable job-search products.";
 
 export const test = base.extend<E2eFixtures>({
   app: async ({ page }, use) => {
@@ -341,9 +453,10 @@ export const test = base.extend<E2eFixtures>({
       await page.goto("/login");
       await page.getByPlaceholder("you@example.com").fill(demoUser.email);
       await page.locator('input[type="password"]').fill(demoUser.password);
-      await page.getByRole("button", { name: /^登录$/ }).click();
+      await page.getByRole("button", { name: /^(Sign in|登录)$/ }).click();
+      await page.waitForURL(url => url.pathname === "/", { timeout: 15_000 });
       await expect(page.getByText("ApplyMate AI").first()).toBeVisible();
-      await expect(page.getByRole("button", { name: /Dashboard|仪表盘/ })).toBeVisible();
+      await expect(page.getByRole("button", { name: /Dashboard|仪表盘/ })).toBeVisible({ timeout: 15_000 });
     };
     const goTo = async (label: string | RegExp) => {
       await page.getByRole("button", { name: label }).click();

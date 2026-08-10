@@ -10,6 +10,7 @@
  * See: docs/scraping-autoapply-design.md §4 (ATS Coverage Matrix)
  */
 
+import { pinnedFetch } from '@jobcopilot/shared'
 import type { DiscoveredJob } from "../discover"
 import { acquire } from "../pace/policies"
 import { stripHtml } from "../strip-html"
@@ -100,7 +101,7 @@ async function fetchDetail(slug: string, posting: SmartRecruitersPosting): Promi
 
   try {
     await acquire({ ats: "smartrecruiters" })
-    const r = await fetch(url, {
+    const r = await pinnedFetch(url, {
       headers: {
         "Accept": "application/json",
         "User-Agent": "ApplyMate/1.0",
@@ -131,7 +132,7 @@ export async function fetchSmartRecruiters(slug: string): Promise<DiscoveredJob[
     while (offset < totalReported && offset < MAX_JOBS_PER_COMPANY) {
       await acquire({ ats: "smartrecruiters" })
       const url = `${BASE}/${slug}/postings?offset=${offset}&limit=${PAGE_SIZE}`
-      const r = await fetch(url, {
+      const r = await pinnedFetch(url, {
         headers: {
           "Accept": "application/json",
           "User-Agent": "ApplyMate/1.0",

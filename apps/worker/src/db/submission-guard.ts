@@ -20,6 +20,7 @@ export async function claimUnattendedSubmission(
        SET "workflowState" = 'submitting', "updatedAt" = NOW()
      WHERE id = $1
        AND "userId" = $2
+       AND EXISTS (SELECT 1 FROM "User" u WHERE u.id = "Job"."userId" AND u."accountStatus" = 'active')
        AND status = 'saved'
        AND "workflowState" = 'queued'
      RETURNING id`,

@@ -9,6 +9,7 @@ import { NextRequest } from 'next/server'
 import { requireAuth, isErrorResponse, ok, err } from '@/lib/api-helpers'
 import { checkRateLimit } from '@/lib/rate-limit'
 import { modelChat, parseAiJson, loadUserAiConfig, withMiniMaxThinking, type AiConfig } from '@/lib/model-router'
+import { resolveAiAccess } from '@/lib/entitlements'
 
 const PARSE_FALLBACKS: AiConfig[] = [
   { provider: 'deepseek', model: 'deepseek-v4-pro' },
@@ -21,6 +22,9 @@ const MAX_BYTES = 5 * 1024 * 1024 // 5 MB
 export async function POST(req: NextRequest) {
   const auth = await requireAuth(req)
   if (isErrorResponse(auth)) return auth
+  const aiAccess = await resolveAiAccess(auth.userId)
+  if (aiAccess === 'disabled') return err('This feature is not included in your current plan', 403)
+  if (aiAccess === 'exhausted') return err('Monthly AI credits exhausted', 429)
 
   const rl = checkRateLimit(`resume-parse:${auth.userId}`, 10, 60_000)
   if (!rl.ok) return err(`Rate limit exceeded — retry in ${rl.retryAfter}s`, 429)

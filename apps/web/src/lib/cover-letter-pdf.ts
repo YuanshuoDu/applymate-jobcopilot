@@ -1,6 +1,7 @@
 // apps/web/src/lib/cover-letter-pdf.ts
 import type { CoverLetterDocProps } from '@/components/resume/templates/cover-letter/CoverLetterFrame'
 import type { TemplateOptions } from '@/lib/types'
+import { safeAccentColor } from '@/lib/template-options'
 
 /**
  * Select the right CL template based on resume templateId
@@ -22,9 +23,8 @@ export async function renderCoverLetterDoc(
 
   // CSS variables work in the HTML preview but are not valid color values for
   // @react-pdf/renderer. Fall back to the product's exported blue instead.
-  const accentColor = resumeOptions?.accentColor?.startsWith('var(')
-    ? '#185FA5'
-    : resumeOptions?.accentColor ?? '#185FA5'
+  const accentColor = safeAccentColor(resumeOptions?.accentColor, '#185FA5')
+    .startsWith('var(') ? '#185FA5' : safeAccentColor(resumeOptions?.accentColor, '#185FA5')
 
   const props: CoverLetterDocProps = {
     content:         clContent,

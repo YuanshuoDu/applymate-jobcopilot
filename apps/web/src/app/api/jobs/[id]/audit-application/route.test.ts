@@ -4,7 +4,7 @@ const mocks = {
   jobFindFirst: vi.fn(), resumeFindFirst: vi.fn(), coverLetterFindFirst: vi.fn(),
   resumeVersionFindFirst: vi.fn(), agentRoleFindFirst: vi.fn(), modelChat: vi.fn(),
   activityCreate: vi.fn(), activityFindFirst: vi.fn(),
-  buildPersona: vi.fn(),
+  buildPersona: vi.fn(), prepareAiRoute: vi.fn(),
 }
 
 vi.mock('@/lib/db', () => ({ db: {
@@ -16,7 +16,7 @@ vi.mock('@/lib/db', () => ({ db: {
   activity: { create: mocks.activityCreate, findFirst: mocks.activityFindFirst },
 } }))
 vi.mock('@/lib/api-helpers', () => ({
-  prepareAiRoute: vi.fn().mockResolvedValue({ userId: 'user_1', cfg: { provider: 'minimax', model: 'MiniMax-M3', thinking: 'adaptive' } }),
+  prepareAiRoute: mocks.prepareAiRoute,
   requireAuth: vi.fn().mockResolvedValue({ userId: 'user_1' }),
   isErrorResponse: () => false,
   ok: (data: unknown, status = 200) => Response.json(data, { status }),
@@ -41,6 +41,7 @@ function request(body: unknown) {
 describe('POST /api/jobs/[id]/audit-application', () => {
   beforeEach(() => {
     vi.clearAllMocks()
+    mocks.prepareAiRoute.mockResolvedValue({ userId: 'user_1', cfg: { provider: 'minimax', model: 'MiniMax-M3', thinking: 'adaptive' } })
     mocks.jobFindFirst.mockResolvedValue({ id: 'job_1', company: 'Acme', role: 'Engineer', description: 'Build TypeScript systems.' })
     mocks.resumeFindFirst.mockResolvedValue({ id: 'resume_final', parentResumeId: 'resume_base', content: { contact: { name: 'Ada', email: 'ada@example.com', location: 'Dublin' }, summary: 'Engineer', experience: [], education: [], skills: ['TypeScript'] } })
     mocks.coverLetterFindFirst.mockResolvedValue({ content: 'Dear Acme, I built TypeScript systems.' })
@@ -80,10 +81,18 @@ describe('POST /api/jobs/[id]/audit-application', () => {
     expect(body.verdict).toBe('blocked')
   })
 
-  it('falls back to the platform MiniMax model when the auditor role has no key', async () => {
+  it('keeps the feature-level model when the Auditor role is the keyless platform default', async () => {
     mocks.resumeFindFirst.mockResolvedValueOnce({ id: 'resume_final', parentResumeId: 'resume_base', content: { contact: {}, summary: 'Final', experience: [], education: [], skills: [] } })
       .mockResolvedValueOnce({ content: { contact: {}, summary: 'Original', experience: [], education: [], skills: [] } })
-    mocks.agentRoleFindFirst.mockResolvedValue({ provider: 'anthropic', model: 'claude-sonnet-4-6', apiKey: null, systemPrompt: 'Auditor' })
+    const settingsCfg = { provider: 'openai', model: 'gpt-4o', apiKey: 'user-openai-key' }
+    mocks.prepareAiRoute.mockResolvedValue({ userId: 'user_1', cfg: settingsCfg })
+    mocks.agentRoleFindFirst.mockResolvedValue({
+      enabled: true,
+      provider: 'minimax',
+      model: 'MiniMax-M3',
+      apiKey: null,
+      systemPrompt: 'Auditor',
+    })
     mocks.modelChat.mockResolvedValue({ provider: 'minimax', model: 'MiniMax-M3', text: JSON.stringify({ verdict: 'pass', findings: [
       { area: 'resume', severity: 'pass', title: 'Supported', evidence: 'Matches.', action: 'None.' },
       { area: 'cover_letter', severity: 'pass', title: 'Supported', evidence: 'Matches.', action: 'None.' },
@@ -92,7 +101,7 @@ describe('POST /api/jobs/[id]/audit-application', () => {
     const { POST } = await import('./route')
     const response = (await POST(request({ resumeId: 'resume_final', coverLetterId: 'cover_1' }) as never, { params: Promise.resolve({ id: 'job_1' }) }))!
     expect(response.status).toBe(200)
-    expect(mocks.modelChat).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({ provider: 'minimax', model: 'MiniMax-M3', thinking: 'adaptive' }), 2048)
+    expect(mocks.modelChat).toHaveBeenCalledWith(expect.anything(), expect.objectContaining(settingsCfg), 2048)
   })
 
   it('retries one aborted model call before failing the audit', async () => {

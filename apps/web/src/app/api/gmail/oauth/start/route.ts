@@ -13,10 +13,9 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { SignJWT } from 'jose'
 import { safeAuth } from '@/lib/safe-auth'
-
-const JWT_SECRET = new TextEncoder().encode(
-  process.env.AUTH_SECRET ?? 'fallback-secret-change-this',
-)
+import { db } from '@/lib/db'
+import { configuredRedirectUri } from '@/lib/app-url'
+import { getOAuthStateSecret, setOAuthStateCookie } from '@/lib/oauth-state'
 
 const SCOPES = [
   'openid',
@@ -44,21 +43,29 @@ export async function GET(req: NextRequest) {
     return NextResponse.redirect(new URL('/login', req.url))
   }
 
+  const user = await db.user.findUnique({ where: { id: session.user.id }, select: { accountStatus: true } })
+  if (!user) return NextResponse.redirect(new URL('/login', req.url))
+  if (user.accountStatus === 'suspended') return NextResponse.json({ error: 'Account suspended' }, { status: 403 })
+
   const clientId = process.env.AUTH_GOOGLE_ID
-  if (!clientId) {
+  if (!clientId || !process.env.AUTH_GOOGLE_SECRET) {
     return NextResponse.json({ error: 'Google OAuth not configured' }, { status: 500 })
   }
+  const stateSecret = getOAuthStateSecret()
+  if (!stateSecret) {
+    return NextResponse.json({ error: 'OAuth state signing is not configured' }, { status: 503 })
+  }
 
-  // Sign both user and a same-origin return location into state. The callback
-  // can then attach Gmail without changing the active application identity.
+  // Bind the signed callback state to the browser that initiated this flow.
   const returnTo = safeReturnTo(req.nextUrl.searchParams.get('returnTo'))
   const transfer = req.nextUrl.searchParams.get('transfer') === '1'
-  const state = await new SignJWT({ uid: session.user.id, nonce: crypto.randomUUID(), returnTo, transfer })
+  const nonce = crypto.randomUUID()
+  const state = await new SignJWT({ uid: session.user.id, nonce, returnTo, transfer })
     .setProtectedHeader({ alg: 'HS256' })
     .setExpirationTime('10m')
-    .sign(JWT_SECRET)
+    .sign(stateSecret)
 
-  const redirectUri = new URL('/api/gmail/oauth/callback', req.url).toString()
+  const redirectUri = configuredRedirectUri(req.url, '/api/gmail/oauth/callback')
 
   const url = new URL('https://accounts.google.com/o/oauth2/v2/auth')
   url.searchParams.set('client_id',     clientId)
@@ -70,5 +77,7 @@ export async function GET(req: NextRequest) {
   url.searchParams.set('state',         state)
   url.searchParams.set('include_granted_scopes', 'true')
 
-  return NextResponse.redirect(url.toString())
+  const response = NextResponse.redirect(url.toString())
+  setOAuthStateCookie(response, 'gmail', nonce)
+  return response
 }

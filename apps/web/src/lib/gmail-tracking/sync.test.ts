@@ -16,6 +16,7 @@ const mocks = vi.hoisted(() => ({
   activitiesCreate: vi.fn(),
   notificationsFindFirst: vi.fn(),
   notificationsCreate: vi.fn(),
+  userFindUnique: vi.fn(),
 }))
 
 vi.mock('@/lib/gmail-helpers', () => ({ getGoogleAccessToken: mocks.getGoogleAccessToken }))
@@ -28,6 +29,7 @@ vi.mock('@/lib/db', () => ({
     gmailRecommendation: { create: mocks.recommendationsCreate },
     activity: { create: mocks.activitiesCreate },
     notification: { findFirst: mocks.notificationsFindFirst, create: mocks.notificationsCreate },
+    user: { findUnique: mocks.userFindUnique },
   },
 }))
 
@@ -66,6 +68,7 @@ beforeEach(() => {
   mocks.activitiesCreate.mockResolvedValue({})
   mocks.notificationsFindFirst.mockResolvedValue(null)
   mocks.notificationsCreate.mockResolvedValue({})
+  mocks.userFindUnique.mockResolvedValue({ preferences: {} })
 })
 
 describe('syncGmailForUser', () => {
@@ -108,6 +111,18 @@ describe('syncGmailForUser', () => {
     expect(result).toEqual({ connected: true, importedMessages: 0, matchedMessages: 0, statusUpdates: 0, newRecommendations: 0, error: null })
     expect(mocks.messagesCreate).not.toHaveBeenCalled()
     expect(mocks.jobsUpdate).not.toHaveBeenCalled()
+  })
+
+  it('honours the apply notification preference for Gmail application updates', async () => {
+    mocks.userFindUnique.mockResolvedValue({ preferences: { notificationPreferences: { apply: false } } })
+    mocks.fetchRecentGmailMessages.mockResolvedValue([remoteMessage()])
+    mocks.jobsFindMany.mockResolvedValue([
+      { id: 'job-1', company: 'Acme Labs', role: 'Senior Data Engineer', status: 'saved', appliedAt: null },
+    ])
+
+    await syncGmailForUser('user-1', receivedAt)
+
+    expect(mocks.notificationsCreate).not.toHaveBeenCalled()
   })
 
   it('backfills a concrete interview schedule from an already tracked email', async () => {

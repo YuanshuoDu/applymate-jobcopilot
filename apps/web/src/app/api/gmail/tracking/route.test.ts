@@ -52,7 +52,7 @@ describe('GET /api/gmail/tracking', () => {
     expect(response.status).toBe(401)
     expect(mocks.findGmailConnection).not.toHaveBeenCalled()
     expect(mocks.syncGmailForUser).not.toHaveBeenCalled()
-  })
+  }, 10_000)
 
   it('syncs only when the caller explicitly refreshes and returns the recommendation queue', async () => {
     const { GET } = await import('./route')

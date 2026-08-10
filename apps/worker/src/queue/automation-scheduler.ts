@@ -1,5 +1,8 @@
-const DEFAULT_INTERVAL_MS = 15 * 60_000;
+const DEFAULT_INTERVAL_MS = 5 * 60_000;
 const MINIMUM_INTERVAL_MS = 60_000;
+const AUDIT_CHECKPOINT_INTERVAL_MS = 24 * 60 * 60_000;
+const RETENTION_CLEANUP_INTERVAL_MS = 24 * 60 * 60_000;
+const SUBSCRIPTION_LIFECYCLE_INTERVAL_MS = 15 * 60_000;
 
 export interface AutomationSchedulerStatus {
   enabled: boolean;
@@ -9,6 +12,17 @@ export interface AutomationSchedulerStatus {
   lastError: string | null;
 }
 
+export type PublicAutomationSchedulerStatus = Omit<AutomationSchedulerStatus, "lastError"> & {
+  healthy: boolean;
+};
+
+export function publicAutomationSchedulerStatus(
+  status: AutomationSchedulerStatus,
+): PublicAutomationSchedulerStatus {
+  const { lastError, ...safeStatus } = status;
+  return { ...safeStatus, healthy: lastError === null };
+}
+
 export interface AutomationScheduler {
   run(): Promise<void>;
   close(): void;
@@ -16,8 +30,7 @@ export interface AutomationScheduler {
 }
 
 export interface AutomationSchedulerConfig {
-  endpoint: string;
-  secret: string;
+  tasks: ReadonlyArray<{ name: string; endpoint: string; secret: string; intervalMs?: number }>;
   intervalMs: number;
   request?: typeof fetch;
 }
@@ -35,9 +48,17 @@ export function automationSchedulerConfig(
     ? Math.max(MINIMUM_INTERVAL_MS, configuredInterval)
     : DEFAULT_INTERVAL_MS;
 
+  const maintenanceSecret = env.WEB_MAINTENANCE_CRON_SECRET ?? env.CRON_SECRET ?? secret;
+  const auditCheckpointSecret = env.AUDIT_CHECKPOINT_CRON_SECRET ?? maintenanceSecret;
   return {
-    endpoint: `${webUrl}/api/agent/automations/due`,
-    secret,
+    tasks: [
+      { name: "automations", endpoint: `${webUrl}/api/agent/automations/due`, secret },
+      { name: "broadcasts", endpoint: `${webUrl}/api/notifications/broadcasts/due`, secret: maintenanceSecret },
+      { name: "alerts", endpoint: `${webUrl}/api/admin/observability/alerts/evaluate`, secret: maintenanceSecret },
+      { name: "audit-checkpoint", endpoint: `${webUrl}/api/admin/audit-checkpoint`, secret: auditCheckpointSecret, intervalMs: AUDIT_CHECKPOINT_INTERVAL_MS },
+      { name: "retention-cleanup", endpoint: `${webUrl}/api/internal/maintenance/retention`, secret: maintenanceSecret, intervalMs: RETENTION_CLEANUP_INTERVAL_MS },
+      { name: "subscription-lifecycle", endpoint: `${webUrl}/api/internal/maintenance/subscriptions`, secret: maintenanceSecret, intervalMs: SUBSCRIPTION_LIFECYCLE_INTERVAL_MS },
+    ],
     intervalMs,
   };
 }
@@ -51,6 +72,7 @@ export function createAutomationScheduler(config: AutomationSchedulerConfig): Au
     lastSuccessAt: null,
     lastError: null,
   };
+  const lastSuccessfulTaskAt = new Map<string, number>();
 
   async function run() {
     if (state.running) return;
@@ -58,15 +80,24 @@ export function createAutomationScheduler(config: AutomationSchedulerConfig): Au
     state.lastAttemptAt = new Date().toISOString();
 
     try {
-      const response = await request(config.endpoint, {
-        method: "POST",
-        headers: { Authorization: `Bearer ${config.secret}` },
-        signal: AbortSignal.timeout(30_000),
-      });
-      if (!response.ok) {
-        const body = await response.text().catch(() => "");
-        throw new Error(`Due automation endpoint returned ${response.status}: ${body.slice(0, 300)}`);
+      const failures: string[] = [];
+      for (const task of config.tasks) {
+        const taskInterval = task.intervalMs ?? config.intervalMs;
+        const lastSuccessfulAt = lastSuccessfulTaskAt.get(task.name);
+        if (lastSuccessfulAt !== undefined && Date.now() - lastSuccessfulAt < taskInterval) continue;
+        const response = await request(task.endpoint, {
+          method: "POST",
+          headers: { Authorization: `Bearer ${task.secret}` },
+          signal: AbortSignal.timeout(30_000),
+        });
+        if (!response.ok) {
+          const body = await response.text().catch(() => "");
+          failures.push(`${task.name} returned ${response.status}: ${body.slice(0, 300)}`);
+          continue;
+        }
+        lastSuccessfulTaskAt.set(task.name, Date.now());
       }
+      if (failures.length) throw new Error(failures.join("; "));
 
       state.lastSuccessAt = new Date().toISOString();
       state.lastError = null;

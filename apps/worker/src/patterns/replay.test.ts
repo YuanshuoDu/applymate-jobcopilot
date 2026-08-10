@@ -6,6 +6,7 @@ import { replayPattern } from "./replay.js";
 function pattern(fieldMapping: Record<string, string>): FormPatternRow {
   return {
     id: "pattern-1",
+    userId: "user-1",
     atsHost: "jobs.example.com",
     urlPattern: "/apply",
     fieldMapping,
@@ -111,5 +112,18 @@ describe("replayPattern", () => {
     expect(result.error).toBe("Submit button not found");
     expect(page.fill).toHaveBeenCalledWith("#name", "");
     expect(page.click).not.toHaveBeenCalled();
+  });
+
+  it("does not replay a cached form into a submit after authorization is revoked", async () => {
+    const page = mockPage({ visibleSelectors: ["#name"], submitVisible: true });
+    const beforeSubmit = vi.fn().mockResolvedValue(false);
+
+    const result = await replayPattern(page, pattern({ "#name": "fullName" }), {
+      fullName: "Ada Lovelace",
+    }, beforeSubmit);
+
+    expect(beforeSubmit).toHaveBeenCalledOnce();
+    expect(page.click).not.toHaveBeenCalled();
+    expect(result).toMatchObject({ status: "manual", reviewReady: true });
   });
 });

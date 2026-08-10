@@ -12,15 +12,32 @@ export async function GET() {
 
   const accounts = await db.account.findMany({
     where: { userId: auth.userId },
-    select: { provider: true, providerAccountId: true },
+    select: { provider: true, providerAccountId: true, scope: true },
   })
 
-  const connected = accounts.map(a => ({
-    provider: a.provider,
-    account:  a.providerAccountId,
-  }))
+  const connected = new Map<string, { provider: string; account: string; disconnectable?: boolean; legacy?: boolean }>()
+  for (const account of accounts) {
+    if (account.provider === 'gmail') {
+      connected.set(`gmail:${account.providerAccountId}`, {
+        provider: 'gmail', account: account.providerAccountId,
+      })
+      continue
+    }
+    if (account.provider === 'google' && account.scope?.includes('gmail')) {
+      const key = `gmail:${account.providerAccountId}`
+      if (!connected.has(key)) {
+        connected.set(key, {
+          provider: 'gmail', account: account.providerAccountId, legacy: true,
+        })
+      }
+      continue
+    }
+    connected.set(`${account.provider}:${account.providerAccountId}`, {
+      provider: account.provider, account: account.providerAccountId,
+    })
+  }
 
-  return ok({ accounts: connected })
+  return ok({ accounts: [...connected.values()] })
 }
 
 export async function DELETE(req: NextRequest) {
@@ -29,13 +46,39 @@ export async function DELETE(req: NextRequest) {
 
   const { provider } = await req.json().catch(() => ({}))
   if (!provider) return err('provider is required', 400)
-  if (provider === 'google') {
-    return err('Google sign-in identity cannot be disconnected from Gmail settings', 400)
+  if (provider !== 'gmail' && provider !== 'github') {
+    return err('Unsupported account provider', 400)
   }
-
-  await db.account.deleteMany({
-    where: { userId: auth.userId, provider },
-  })
+  if (provider === 'gmail') {
+    await db.$transaction(async (tx) => {
+      await tx.account.deleteMany({
+        where: {
+          userId: auth.userId,
+          provider: 'gmail',
+        },
+      })
+      // Older Gmail connections shared an Auth.js Google identity row. Keep
+      // that identity so Google sign-in still works, but remove its Gmail
+      // credentials and scope so the compatibility path cannot reconnect it.
+      await tx.account.updateMany({
+        where: { userId: auth.userId, provider: 'google', scope: { contains: 'gmail' } },
+        data: {
+          access_token: null,
+          accessTokenEnc: null,
+          refresh_token: null,
+          refreshTokenEnc: null,
+          expires_at: null,
+          token_type: null,
+          scope: null,
+          id_token: null,
+          idTokenEnc: null,
+          session_state: null,
+        },
+      })
+    })
+  } else {
+    await db.account.deleteMany({ where: { userId: auth.userId, provider } })
+  }
 
   return ok({ disconnected: provider })
 }

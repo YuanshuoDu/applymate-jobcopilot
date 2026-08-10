@@ -24,6 +24,14 @@ export async function PATCH(req: NextRequest, { params }: { params: Promise<{ id
     finalCoverLetterId?: string | null
   }
 
+  if (finalResumeId) {
+    const resume = await db.resume.findFirst({
+      where: { id: finalResumeId, userId: auth.userId, OR: [{ isDefault: true }, { targetJobId: id }] },
+      select: { id: true },
+    })
+    if (!resume) return err('Resume not found', 400)
+  }
+
   const updated = await db.$transaction(async (tx) => {
     // Handle CoverLetter isFinal side-effects
     if ('finalCoverLetterId' in body) {

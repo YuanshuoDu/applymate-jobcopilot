@@ -9,16 +9,12 @@ test("login -> saved job -> score -> generate cover letter", async ({ app, page 
   await app.installMocks();
   await app.login();
 
-  await app.goTo(/Jobs|职位/);
+  await app.goTo(/^(My Jobs|我的职位)(?: \d+)?$/);
+  await page.getByRole("button", { name: /^Score$/ }).click();
+  await expect(page.getByText("91%", { exact: true })).toBeVisible();
   await page.getByText("Cloudflare").first().click();
-  await page.getByRole("button", { name: /Score|Re-score/ }).click();
-  await expect(page.getByText("91/100")).toBeVisible();
+  await page.getByRole("button", { name: /Prepare full application pack automatically/ }).click();
 
-  await page.getByRole("button", { name: "✕" }).first().click();
-  await page.getByRole("button", { name: /\+ Basket/ }).click();
-  await page.getByRole("button", { name: /Basket 1/ }).click();
-  await page.getByRole("button", { name: /Tailor CVs/ }).click();
-
-  await expect(page.getByText(/Cover letters ready/)).toBeVisible();
+  await expect(page.getByText("Generated for this job")).toBeVisible();
   expect(app.jobs[0].coverLetter).toContain("Dear Hiring Team");
 });

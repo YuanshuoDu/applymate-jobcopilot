@@ -19,6 +19,7 @@ describe("form-patterns", () => {
     mocks.query.mockResolvedValueOnce({ rows: [] });
 
     await upsertFormPattern({
+      userId: "user-1",
       atsHost: "jobs.example.com",
       urlPattern: "/apply",
       fieldMapping: { "#name": "fullName", "#email": "email" },
@@ -28,6 +29,7 @@ describe("form-patterns", () => {
     expect(String(mocks.query.mock.calls[0][0])).toContain("INSERT INTO form_patterns");
     expect(mocks.query.mock.calls[0][1]).toEqual([
       expect.any(String),
+      "user-1",
       "jobs.example.com",
       "/apply",
       JSON.stringify({ "#name": "fullName", "#email": "email" }),
@@ -39,6 +41,7 @@ describe("form-patterns", () => {
       rows: [
         {
           id: "pattern-1",
+          user_id: "user-1",
           ats_host: "jobs.example.com",
           url_pattern: "/apply",
           field_mapping: '{"#name":"fullName"}',
@@ -49,10 +52,11 @@ describe("form-patterns", () => {
       ],
     });
 
-    const result = await findFormPattern("jobs.example.com", "/apply");
+    const result = await findFormPattern("user-1", "jobs.example.com", "/apply");
 
     expect(result).toEqual({
       id: "pattern-1",
+      userId: "user-1",
       atsHost: "jobs.example.com",
       urlPattern: "/apply",
       fieldMapping: { "#name": "fullName" },
@@ -65,6 +69,6 @@ describe("form-patterns", () => {
   it("returns null when no form pattern exists", async () => {
     mocks.query.mockResolvedValueOnce({ rows: [] });
 
-    await expect(findFormPattern("jobs.example.com", "/missing")).resolves.toBeNull();
+    await expect(findFormPattern("user-1", "jobs.example.com", "/missing")).resolves.toBeNull();
   });
 });

@@ -1,0 +1,22 @@
+'use client'
+
+import { AlertTriangle, CheckCircle2, Siren } from 'lucide-react'
+import { useEffect, useState } from 'react'
+import { useAdminPrompt } from './AdminPromptDialog'
+
+type Incident = { id: string; title: string; summary: string; service: string; severity: string; status: string; startedAt: string; resolvedAt: string | null }
+
+export function AdminIncidentsPage({ canManage }: { canManage: boolean }) {
+  const [items, setItems] = useState<Incident[]>([])
+  const [title, setTitle] = useState('')
+  const [summary, setSummary] = useState('')
+  const [service, setService] = useState('web')
+  const [severity, setSeverity] = useState('medium')
+  const [notice, setNotice] = useState('')
+  const { request, dialog } = useAdminPrompt()
+  async function load() { const response = await fetch('/api/admin/v1/incidents', { cache: 'no-store' }); const payload = await response.json().catch(() => null) as { incidents?: Incident[]; error?: string } | null; setItems(payload?.incidents ?? []); if (!response.ok) setNotice(payload?.error ?? 'Unable to load incidents.') }
+  useEffect(() => { void load() }, [])
+  async function create(event: React.FormEvent<HTMLFormElement>) { event.preventDefault(); const reason = await request({ title: 'Create incident', label: 'Incident reason', kind: 'reason' }); if (!reason) return; const response = await fetch('/api/admin/v1/incidents', { method: 'POST', headers: { 'Content-Type': 'application/json', 'Idempotency-Key': crypto.randomUUID() }, body: JSON.stringify({ title, summary, service, severity, reason }) }); const payload = await response.json().catch(() => null) as { error?: string } | null; setNotice(response.ok ? 'Incident created.' : payload?.error ?? 'Unable to create incident.'); if (response.ok) { setTitle(''); setSummary(''); await load() } }
+  async function update(id: string, status: string) { const reason = await request({ title: `Set incident to ${status}`, label: 'Change reason', kind: 'reason' }); if (!reason) return; const response = await fetch(`/api/admin/v1/incidents/${id}`, { method: 'PATCH', headers: { 'Content-Type': 'application/json', 'Idempotency-Key': crypto.randomUUID() }, body: JSON.stringify({ status, reason }) }); const payload = await response.json().catch(() => null) as { error?: string } | null; setNotice(response.ok ? 'Incident updated.' : payload?.error ?? 'Unable to update incident.'); if (response.ok) await load() }
+  return <><div className="admin-page"><header className="admin-header"><div><h1>Incidents</h1><p>Track service impact, ownership and recovery state</p></div><Siren size={22} aria-hidden="true" /></header><section className="admin-list-page">{notice && <div className="admin-alert">{notice}</div>}{canManage && <form className="admin-filter-panel" onSubmit={(event) => void create(event)}><label>Title<input value={title} onChange={(event) => setTitle(event.target.value)} maxLength={120} required /></label><label>Service<input value={service} onChange={(event) => setService(event.target.value)} maxLength={80} required /></label><label>Severity<select value={severity} onChange={(event) => setSeverity(event.target.value)}><option value="low">Low</option><option value="medium">Medium</option><option value="high">High</option><option value="critical">Critical</option></select></label><label>Summary<textarea value={summary} onChange={(event) => setSummary(event.target.value)} maxLength={2000} required /></label><button className="admin-primary-button" type="submit"><AlertTriangle size={15} /> Create incident</button></form>}<div className="admin-table-wrap"><table className="admin-table"><thead><tr><th>Incident</th><th>Service</th><th>Severity</th><th>Status</th><th>Started</th><th aria-label="Actions" /></tr></thead><tbody>{items.length === 0 ? <tr><td colSpan={6}>No incidents.</td></tr> : items.map(item => <tr key={item.id}><td><strong>{item.title}</strong><small>{item.summary}</small></td><td>{item.service}</td><td>{item.severity}</td><td>{item.status}</td><td>{new Date(item.startedAt).toLocaleString()}</td><td>{canManage && item.status !== 'resolved' ? <span className="admin-action-group"><button className="admin-row-action" onClick={() => void update(item.id, 'monitoring')}>Monitor</button><button className="admin-row-action" onClick={() => void update(item.id, 'resolved')}><CheckCircle2 size={14} /> Resolve</button></span> : null}</td></tr>)}</tbody></table></div></section></div>{dialog}</>
+}

@@ -1,3 +1,5 @@
+import { pinnedFetch } from '@jobcopilot/shared'
+
 const MODEL = 'text-embedding-3-small'
 const DIMENSIONS = 1536
 
@@ -5,7 +7,7 @@ export async function embedPersonaText(text: string): Promise<number[] | null> {
   const key = process.env.OPENAI_API_KEY?.trim()
   if (!key || !text.trim()) return null
 
-  const response = await fetch('https://api.openai.com/v1/embeddings', {
+const response = await pinnedFetch('https://api.openai.com/v1/embeddings', {
     method: 'POST',
     headers: { Authorization: `Bearer ${key}`, 'Content-Type': 'application/json' },
     body: JSON.stringify({ model: MODEL, input: text.slice(0, 8_000) }),

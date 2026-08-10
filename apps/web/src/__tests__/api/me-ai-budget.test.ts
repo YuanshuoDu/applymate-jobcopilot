@@ -3,6 +3,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest'
 const mocks = vi.hoisted(() => ({
   requireAuth: vi.fn(),
   queryRaw: vi.fn(),
+  resolveEntitlement: vi.fn(),
 }))
 
 vi.mock('@/lib/api-helpers', () => ({
@@ -15,6 +16,8 @@ vi.mock('@/lib/db', () => ({
   db: { $queryRaw: mocks.queryRaw },
 }))
 
+vi.mock('@/lib/entitlements', () => ({ resolveEntitlement: mocks.resolveEntitlement }))
+
 function request() {
   return new Request('http://localhost/api/me/ai-budget')
 }
@@ -24,7 +27,9 @@ describe('GET /api/me/ai-budget', () => {
     vi.resetModules()
     mocks.requireAuth.mockReset()
     mocks.queryRaw.mockReset()
+    mocks.resolveEntitlement.mockReset()
     mocks.requireAuth.mockResolvedValue({ userId: 'user-1' })
+    mocks.resolveEntitlement.mockResolvedValue({ kind: 'limit', enabled: true, limit: 30 })
   })
 
   it('returns used, limit, remaining, and hasBudget when a budget row exists', async () => {
@@ -55,6 +60,27 @@ describe('GET /api/me/ai-budget', () => {
       remaining: 30,
       hasBudget: false,
     })
+  })
+
+  it('uses the current plan entitlement as the limit for an existing budget row', async () => {
+    mocks.resolveEntitlement.mockResolvedValueOnce({ kind: 'limit', enabled: true, limit: 100 })
+    mocks.queryRaw.mockResolvedValueOnce([{ used: 18, limit: 30 }])
+    const { GET } = await import('@/app/api/me/ai-budget/route')
+
+    const res = await GET(request() as never)
+
+    await expect(res.json()).resolves.toMatchObject({ used: 18, limit: 100, remaining: 82, hasBudget: true })
+  })
+
+  it('fails open when the budget table is not available yet', async () => {
+    mocks.resolveEntitlement.mockResolvedValueOnce({ kind: 'limit', enabled: true, limit: 25 })
+    mocks.queryRaw.mockRejectedValueOnce(new Error('relation "ai_budgets" does not exist'))
+    const { GET } = await import('@/app/api/me/ai-budget/route')
+
+    const res = await GET(request() as never)
+
+    expect(res.status).toBe(200)
+    await expect(res.json()).resolves.toEqual({ used: 0, limit: 25, remaining: 25, hasBudget: false })
   })
 
   it('returns auth errors without querying the budget table', async () => {
