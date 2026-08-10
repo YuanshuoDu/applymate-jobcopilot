@@ -28,6 +28,7 @@
     }
   },
   "dependencies": {
+    "@aws-sdk/client-kms": "^3.879.0",
     "pg": "^8.16.3"
   },
   "scripts": {
