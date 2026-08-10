@@ -14,6 +14,13 @@ describe('worker control command verification', () => {
       expect(verifyWorkerCommand(nextBody, nextSignature, secret, 1_001)).toMatchObject({ action })
     }
   })
+  it('accepts global worker pause and resume commands', () => {
+    for (const action of ['pause_worker', 'resume_worker']) {
+      const nextBody = JSON.stringify({ requestId: 'request', timestamp: 1_000, nonce: action, actorId: 'admin', action, reason: 'Operational maintenance requires a worker state change', params: {} })
+      const nextSignature = createHmac('sha256', secret).update(nextBody).digest('hex')
+      expect(verifyWorkerCommand(nextBody, nextSignature, secret, 1_001)).toMatchObject({ action })
+    }
+  })
   it('rejects tampering and stale commands before queue access', () => {
     expect(verifyWorkerCommand(body, 'invalid', secret, 1_001)).toBeNull()
     expect(verifyWorkerCommand(body, signature, secret, 400_001)).toBeNull()

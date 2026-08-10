@@ -3,6 +3,7 @@ import { createBullBoard } from "@bull-board/api";
 import { BullMQAdapter } from "@bull-board/api/bullMQAdapter";
 import { ExpressAdapter } from "@bull-board/express";
 import { createWorkerControlHandler, resolveWorkerAdminHost } from "./admin/control-plane.js";
+import { getWorkerRuntimeState, restoreWorkerRuntimeState } from "./admin/worker-state.js";
 
 async function main() {
   const adminHost = resolveWorkerAdminHost();
@@ -51,6 +52,13 @@ async function main() {
     process.exit(1);
   }
 
+  const workerRuntimeState = await restoreWorkerRuntimeState(connection, {
+    "apply-tasks": applyQueue,
+    "scout-tasks": scoutQueue,
+    "agent-runs": agentRunQueue,
+  });
+  console.log(`[worker] Runtime control state: ${workerRuntimeState.status}`);
+
   console.log(`[worker] Listening on queue 'apply-tasks' (concurrency: ${process.env.CLOAK_MAX_WORKERS ?? "1"})`);
   console.log(`[worker] Listening on queue '${SCOUT_QUEUE_NAME}' (concurrency: 1)`);
   console.log(`[worker] Listening on queue '${AGENT_RUN_QUEUE_NAME}' (concurrency: 1)`);
@@ -59,7 +67,8 @@ async function main() {
 
   const adminApp = express();
   adminApp.get("/healthz", (_req, res) => res.status(200).json({
-    status: "ok",
+    status: getWorkerRuntimeState().status === "paused" ? "paused" : "ok",
+    workerState: getWorkerRuntimeState().status,
     automationScheduler: publicAutomationSchedulerStatus(automationScheduler.status()),
   }));
   adminApp.post("/internal/admin/control", express.text({ type: "application/json", limit: "16kb" }), createWorkerControlHandler());

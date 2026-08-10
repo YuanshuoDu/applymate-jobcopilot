@@ -1,6 +1,6 @@
 import { createHmac, randomUUID } from 'node:crypto'
 
-export type WorkerControlAction = 'queue_summary' | 'failed_queue_jobs' | 'retry_queue_job' | 'pause_queue' | 'resume_queue' | 'apply_ats_policy'
+export type WorkerControlAction = 'queue_summary' | 'failed_queue_jobs' | 'retry_queue_job' | 'pause_queue' | 'resume_queue' | 'pause_worker' | 'resume_worker' | 'apply_ats_policy'
 export type WorkerCommand = Readonly<{ requestId: string; timestamp: number; nonce: string; actorId: string; action: WorkerControlAction; reason: string; params: Record<string, string | number | boolean> }>
 export type WorkerCommandResult = Readonly<{
   receipt?: string
@@ -11,7 +11,7 @@ export type WorkerCommandResult = Readonly<{
   action?: WorkerControlAction
   acknowledgedVersion?: number
   error?: string
-  worker?: { status: string; workerId: string; version: string; startedAt: string; uptimeSeconds: number; pid: number }
+  worker?: { status: string; state: 'running' | 'paused'; workerId: string; version: string; startedAt: string; uptimeSeconds: number; pid: number }
 }>
 
 function workerControlConfig() {

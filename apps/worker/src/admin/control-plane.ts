@@ -4,6 +4,7 @@ import { getPool } from '../db/apply-results.js'
 import { isAtsSourceKey } from '@jobcopilot/shared'
 import { loadEffectiveAtsPolicy } from './ats-policy.js'
 import { verifyWorkerCommand } from './control-auth.js'
+import { getWorkerRuntimeState, pauseWorkerRuntime, readWorkerRuntimeState, resumeWorkerRuntime, WORKER_RUNTIME_STATE_KEY } from './worker-state.js'
 
 const loopbackAdminHosts = new Set(['127.0.0.1', '::1', 'localhost'])
 const workerStartedAt = new Date().toISOString()
@@ -66,7 +67,10 @@ export function createWorkerControlHandler() {
     const nonce = await connection.set(`admin-control:${command.nonce}`, '1', 'PX', 300_000, 'NX')
     if (nonce !== 'OK') return response.status(409).json({ error: 'Replayed worker command' })
     try {
-      if (command.action === 'queue_summary') return response.json({ receipt: randomUUID(), worker: workerHealth(), queues: await queueSummary() })
+      if (command.action === 'queue_summary') {
+        const state = await readWorkerRuntimeState(connection)
+        return response.json({ receipt: randomUUID(), worker: workerHealth(state), queues: await queueSummary() })
+      }
       if (command.action === 'apply_ats_policy') {
         try {
           return response.json({ receipt: randomUUID(), ...await applyAtsPolicyCommand(getPool(), command.params) })
@@ -77,6 +81,12 @@ export function createWorkerControlHandler() {
       }
       const queueName = typeof command.params.queue === 'string' ? command.params.queue : ''
       const { queues } = await loadWorkerQueueResources()
+      if (command.action === 'pause_worker' || command.action === 'resume_worker') {
+        const state = command.action === 'pause_worker'
+          ? await pauseWorkerRuntime(connection, queues, command.actorId, command.reason)
+          : await resumeWorkerRuntime(connection, queues, command.actorId, command.reason)
+        return response.json({ receipt: randomUUID(), action: command.action, worker: workerHealth(state) })
+      }
       const queue = queues[queueName as keyof typeof queues]
       if (!queue) return response.status(400).json({ error: 'Unsupported queue' })
       if (command.action === 'failed_queue_jobs') {
@@ -91,7 +101,14 @@ export function createWorkerControlHandler() {
         await job.retry('failed')
         return response.json({ receipt: randomUUID(), queue: queueName, jobId })
       }
-      if (command.action === 'pause_queue') await queue.pause()
+      const state = await readWorkerRuntimeState(connection)
+      if (command.action === 'resume_queue' && state.status === 'paused') return response.status(409).json({ error: 'Worker is globally paused' })
+      if (command.action === 'pause_queue') {
+        await queue.pause()
+        if (state.status === 'paused' && !state.pausedQueues.includes(queueName)) {
+          await connection.set(WORKER_RUNTIME_STATE_KEY, JSON.stringify({ ...state, pausedQueues: [...state.pausedQueues, queueName] }))
+        }
+      }
       if (command.action === 'resume_queue') await queue.resume()
       return response.json({ receipt: randomUUID(), queue: queueName, action: command.action })
     } catch (error) {
@@ -111,8 +128,8 @@ async function queueSummary() {
   }))
 }
 
-function workerHealth() {
-  return { status: 'ok', workerId: process.env.WORKER_ID ?? `worker-${process.pid}`, version: process.env.RELEASE_SHA ?? 'unknown', startedAt: workerStartedAt, uptimeSeconds: Math.floor(process.uptime()), pid: process.pid }
+function workerHealth(state = getWorkerRuntimeState()) {
+  return { status: state.status === 'paused' ? 'paused' : 'ok', state: state.status, workerId: process.env.WORKER_ID ?? `worker-${process.pid}`, version: process.env.RELEASE_SHA ?? 'unknown', startedAt: workerStartedAt, uptimeSeconds: Math.floor(process.uptime()), pid: process.pid }
 }
 
 async function loadWorkerQueueResources() {
