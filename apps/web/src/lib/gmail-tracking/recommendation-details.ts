@@ -4,6 +4,7 @@ import { detectAtsSource } from '@jobcopilot/shared/ats-url'
 import { fetchGmailMessage } from './gmail-client'
 import { extractRecommendationCards, type GmailRecommendationCard } from './recommendations'
 import { isLikelyJobDetailUrl, recommendationIdentityKey, simplifyRecommendationLocation } from './recommendation-utils'
+import { fetchExternalText } from '@/lib/safe-outbound-url'
 
 export interface RecommendationDetails {
   platform: string | null
@@ -29,13 +30,13 @@ export async function hydrateRecommendationDetails(input: SourceRecommendation, 
   try {
     const atsSource = detectAtsSource(fromEmail.url!)
     if (atsSource && !(await getRuntimeAtsPolicy(atsSource, userId)).allowed) return fromEmail
-    const response = await fetch(fromEmail.url!, {
+    const html = await fetchExternalText(fromEmail.url!, {
       cache: 'no-store',
       headers: { 'User-Agent': 'ApplyMate/1.0' },
       signal: AbortSignal.timeout(8_000),
     })
-    if (!response.ok) return fromEmail
-    const enriched = await enrichJob({ html: await response.text(), url: fromEmail.url!, userId })
+    if (!html) return fromEmail
+    const enriched = await enrichJob({ html, url: fromEmail.url!, userId })
     return enriched?.description
       ? { ...fromEmail, description: truncate(enriched.description, 2_000), salary: fromEmail.salary ?? enriched.salary ?? null }
       : fromEmail

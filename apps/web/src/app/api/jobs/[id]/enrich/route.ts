@@ -19,6 +19,7 @@ import { enrichJob } from '@/lib/agent/enrich'
 import { getDiscoveryApiKeys } from '@/lib/discovery-api-keys'
 import { getRuntimeAtsPolicy } from '@/lib/runtime-ats-policy'
 import { detectAtsSource } from '@jobcopilot/shared/ats-url'
+import { fetchExternalText } from '@/lib/safe-outbound-url'
 
 type Params = { params: Promise<{ id: string }> }
 
@@ -64,11 +65,11 @@ export async function POST(_req: NextRequest, { params }: Params) {
   const pageFetchAllowed = !atsSource || (await getRuntimeAtsPolicy(atsSource, auth.userId)).allowed
   if (job.url && !job.description && pageFetchAllowed) {
     try {
-      const html = await fetch(job.url, {
+      const html = await fetchExternalText(job.url, {
         signal: AbortSignal.timeout(8_000),
         headers: { 'User-Agent': 'ApplyMate/1.0' },
         cache: 'no-store',
-      }).then(r => r.ok ? r.text() : null)
+      })
 
       if (html) {
         const enriched = await enrichJob({ html, url: job.url, userId: auth.userId })

@@ -9,7 +9,7 @@ import { jwtVerify } from 'jose'
 import { db } from '@/lib/db'
 import { normalizeEmail } from '@/lib/auth-identifiers'
 import { reconcileGoogleLoginIdentity } from '@/lib/google-identity'
-import { getAuthJwtSecret, getAuthSecret } from '@/lib/auth-secret'
+import { EXTENSION_TOKEN_AUDIENCE, EXTENSION_TOKEN_ISSUER, getAuthJwtSecret, getAuthSecret } from '@/lib/auth-secret'
 import { canonicalAuthRedirect } from '@/lib/auth-url'
 
 const AUTH_SECRET = getAuthSecret()
@@ -30,10 +30,13 @@ providers.push(Credentials({
     // ── Extension JWT auth (token sync) ──
     if (credentials?.token && typeof credentials.token === 'string') {
       try {
-        const { payload } = await jwtVerify(credentials.token, JWT_SECRET)
-        if (!payload.sub) return null
+        const { payload } = await jwtVerify(credentials.token, JWT_SECRET, {
+          issuer: EXTENSION_TOKEN_ISSUER,
+          audience: EXTENSION_TOKEN_AUDIENCE,
+        })
+        if (typeof payload.sub !== 'string' || !payload.sub) return null
         const user = await db.user.findUnique({ where: { id: payload.sub as string } })
-        if (!user) return null
+        if (!user || user.accountStatus === 'suspended') return null
         return { id: user.id, email: user.email, name: user.name, image: user.image }
       } catch {
         return null
@@ -47,7 +50,7 @@ providers.push(Credentials({
     const user = await db.user.findUnique({
       where: { email },
     })
-    if (!user?.password) return null
+    if (!user?.password || user.accountStatus === 'suspended') return null
     const valid = await bcrypt.compare(credentials.password as string, user.password)
     if (!valid) return null
     return { id: user.id, email: user.email, name: user.name, image: user.image }

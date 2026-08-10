@@ -19,4 +19,9 @@ describe('recommendation utils', () => {
     const second = recommendationSemanticKey({ platform: 'Indeed', role: 'Intern - AI & ML', company: 'Ascentic', location: null, url: 'https://ie.indeed.com/viewjob?jk=second' })
     expect(first).toBe(second)
   })
+
+  it('rejects lookalike domains that only contain an ATS name', () => {
+    expect(isLikelyJobDetailUrl('https://evilgreenhouse.io/acme/jobs/123')).toBe(false)
+    expect(isLikelyJobDetailUrl('https://evilindeed.com/viewjob?jk=123')).toBe(false)
+  })
 })

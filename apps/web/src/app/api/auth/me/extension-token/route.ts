@@ -7,7 +7,7 @@ import { NextResponse } from 'next/server'
 import { safeAuth } from '@/lib/safe-auth'
 import { SignJWT } from 'jose'
 import { db } from '@/lib/db'
-import { getAuthJwtSecret } from '@/lib/auth-secret'
+import { EXTENSION_TOKEN_AUDIENCE, EXTENSION_TOKEN_ISSUER, getAuthJwtSecret } from '@/lib/auth-secret'
 
 const JWT_SECRET = getAuthJwtSecret()
 
@@ -18,7 +18,7 @@ export async function GET() {
   }
 
   const user = await db.user.findUnique({ where: { id: session.user.id } })
-  if (!user) {
+  if (!user || user.accountStatus === 'suspended') {
     return NextResponse.json({ error: 'User not found' }, { status: 404 })
   }
 
@@ -29,6 +29,8 @@ export async function GET() {
     plan:  user.plan,
   })
     .setProtectedHeader({ alg: 'HS256' })
+    .setIssuer(EXTENSION_TOKEN_ISSUER)
+    .setAudience(EXTENSION_TOKEN_AUDIENCE)
     .setIssuedAt()
     .setExpirationTime('30d')
     .sign(JWT_SECRET)

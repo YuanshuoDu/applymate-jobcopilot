@@ -5,7 +5,7 @@ import { checkRateLimit } from '@/lib/rate-limit'
 import { APPLYMATE_BACKING, resolveConfig, resolveFeatureConfig, type UserAiSettings, type FeatureId } from '@/lib/model-router'
 import { db } from '@/lib/db'
 import { safeAuth } from '@/lib/safe-auth'
-import { getAuthJwtSecret } from '@/lib/auth-secret'
+import { EXTENSION_TOKEN_AUDIENCE, EXTENSION_TOKEN_ISSUER, getAuthJwtSecret } from '@/lib/auth-secret'
 import { resolvePlatformRoute } from '@/lib/admin/ai-config'
 
 const JWT_SECRET = getAuthJwtSecret()
@@ -24,9 +24,12 @@ export async function requireAuth(
   if (authHeader?.startsWith('Bearer ')) {
     const token = authHeader.slice(7)
     try {
-      const { payload } = await jwtVerify(token, JWT_SECRET)
-      if (payload.sub) {
-        return activeAccountOrDenied(payload.sub as string)
+      const { payload } = await jwtVerify(token, JWT_SECRET, {
+        issuer: EXTENSION_TOKEN_ISSUER,
+        audience: EXTENSION_TOKEN_AUDIENCE,
+      })
+      if (typeof payload.sub === 'string' && payload.sub.length > 0) {
+        return activeAccountOrDenied(payload.sub)
       }
     } catch {
       // Token invalid — fall through to session check.
@@ -42,6 +45,7 @@ export async function requireAuth(
 
 async function activeAccountOrDenied(userId: string) {
   const user = await db.user.findUnique({ where: { id: userId }, select: { accountStatus: true } })
+  if (!user) return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
   if (user?.accountStatus === 'suspended') return NextResponse.json({ error: 'Account suspended' }, { status: 403 })
   return { userId }
 }
