@@ -34,7 +34,10 @@ describe('POST /api/gmail/send-draft', () => {
     mocks.gmailMessageFindFirst.mockResolvedValue({ job: { id: 'job-1' } })
     mocks.jobUpdate.mockResolvedValue({})
     mocks.activityCreate.mockResolvedValue({})
-    mocks.transaction.mockResolvedValue([])
+    mocks.transaction.mockImplementation(async (callback: (tx: unknown) => Promise<unknown>) => callback({
+      job: { update: mocks.jobUpdate },
+      activity: { create: mocks.activityCreate },
+    }))
     vi.stubGlobal('fetch', vi.fn()
       .mockResolvedValueOnce(Response.json({ emailAddress: 'me@example.com' }))
       .mockResolvedValueOnce(Response.json({ id: 'sent-1' })))

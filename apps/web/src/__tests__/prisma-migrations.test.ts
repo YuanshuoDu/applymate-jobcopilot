@@ -30,4 +30,13 @@ describe('Prisma migration dependencies', () => {
     expect(migration).toContain('ENABLE TRIGGER "admin_audit_log_append_only"')
     expect(migration).toContain('ALTER COLUMN "record_hash" SET NOT NULL')
   })
+
+  it('creates the agent run history table required by the Prisma schema', () => {
+    const migrationPath = join(migrationsRoot, '20260810030000_add_agent_run_history', 'migration.sql')
+    const migration = readFileSync(migrationPath, 'utf8')
+
+    expect(migration).toContain('CREATE TABLE "agent_runs"')
+    expect(migration).toContain('agent_runs_userId_createdAt_idx')
+    expect(migration).toContain('agent_runs_userId_fkey')
+  })
 })

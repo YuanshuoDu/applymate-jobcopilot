@@ -52,9 +52,9 @@ export async function POST(req: NextRequest) {
   }
 
   const matchedJob = await findFollowUpJob(auth.userId, jobId, gmailMessageId)
-  if (matchedJob) await db.$transaction([
-    db.job.update({ where: { id: matchedJob.id }, data: { followUpAt: null } }),
-    db.activity.create({
+  if (matchedJob) await db.$transaction(async tx => {
+    await tx.job.update({ where: { id: matchedJob.id }, data: { followUpAt: null } })
+    await tx.activity.create({
       data: {
         userId: auth.userId,
         jobId: matchedJob.id,
@@ -62,8 +62,8 @@ export async function POST(req: NextRequest) {
         text: `Follow-up email sent to ${to}${messageKind ? ` · ${messageKind.replace(/_/g, ' ')}` : ''}`,
         color: '#7C3AED',
       },
-    }),
-  ])
+    })
+  })
 
   return ok({ sent: true, to, tracked: Boolean(matchedJob), jobId: matchedJob?.id ?? null })
 }

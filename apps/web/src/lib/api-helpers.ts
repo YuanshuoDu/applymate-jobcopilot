@@ -7,6 +7,7 @@ import { db } from '@/lib/db'
 import { safeAuth } from '@/lib/safe-auth'
 import { EXTENSION_TOKEN_AUDIENCE, EXTENSION_TOKEN_ISSUER, getAuthJwtSecret } from '@/lib/auth-secret'
 import { resolvePlatformRoute } from '@/lib/admin/ai-config'
+import { activateTenantContext } from '@/lib/db/tenant-store'
 
 const JWT_SECRET = getAuthJwtSecret()
 
@@ -47,6 +48,7 @@ async function activeAccountOrDenied(userId: string) {
   const user = await db.user.findUnique({ where: { id: userId }, select: { accountStatus: true } })
   if (!user) return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
   if (user?.accountStatus === 'suspended') return NextResponse.json({ error: 'Account suspended' }, { status: 403 })
+  activateTenantContext(userId)
   return { userId }
 }
 

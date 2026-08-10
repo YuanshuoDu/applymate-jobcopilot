@@ -197,10 +197,10 @@ export async function queueAutonomousApplication(input: {
     });
     return { taskId };
   } catch (error) {
-    await db.$transaction([
-      db.job.updateMany({ where: { id: input.jobId, userId: input.userId, workflowState: "queued" }, data: { workflowState: "ready_to_apply" } }),
-      db.applicationTask.updateMany({ where: { id: input.applicationTaskId, status: "filling" }, data: { status: "waiting_for_authorization", checkpoint: "queue_retry" } }),
-    ]).catch(() => undefined);
+    await db.$transaction(async tx => {
+      await tx.job.updateMany({ where: { id: input.jobId, userId: input.userId, workflowState: "queued" }, data: { workflowState: "ready_to_apply" } })
+      await tx.applicationTask.updateMany({ where: { id: input.applicationTaskId, status: "filling" }, data: { status: "waiting_for_authorization", checkpoint: "queue_retry" } })
+    }).catch(() => undefined);
     throw error;
   }
 }

@@ -4,9 +4,16 @@ The application uses Prisma connection pooling, so `app.user_id` must be set wit
 
 `enable.sql` is intentionally deployment-gated. Run it only with a candidate-service database role after the tenant-query inventory and cross-tenant SQL tests pass. Running it against the current shared Prisma connection before that migration will deny existing candidate traffic because those requests do not yet carry a tenant transaction context.
 
+Candidate requests activate their tenant context in `requireAuth`, and the
+Prisma runtime wrapper starts an interactive transaction, sets `app.user_id`,
+and switches to `applymate_candidate` for every tenant model query. Explicit
+multi-operation candidate work must use an interactive callback transaction;
+array transactions fail closed while RLS is enabled.
+
 Required rollout checks:
 
-- candidate queries use `withTenantContext(userId, callback)`;
+- candidate request auth activates a tenant context before tenant queries;
+- candidate multi-operation paths use `db.$transaction(async tx => ...)`;
 - admin reporting uses safe allow-listed queries and does not rely on an RLS bypass;
 - a cross-tenant query returns zero rows;
 - the candidate role cannot disable RLS or read another tenant's rows;

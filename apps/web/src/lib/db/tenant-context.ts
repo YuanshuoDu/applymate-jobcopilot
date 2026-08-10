@@ -1,12 +1,11 @@
 import type { Prisma } from '@prisma/client'
 import { db } from '@/lib/db'
-
-const USER_ID_PATTERN = /^[A-Za-z0-9_-]{1,128}$/
+import { configureTenantTransaction, validateTenantUserId } from './tenant-store'
 
 export function withTenantContext<T>(userId: string, callback: (tx: Prisma.TransactionClient) => Promise<T>) {
-  if (!USER_ID_PATTERN.test(userId)) throw new Error('Invalid tenant user id')
+  validateTenantUserId(userId)
   return db.$transaction(async (tx) => {
-    await tx.$executeRaw`SELECT set_config('app.user_id', ${userId}, true)`
+    await configureTenantTransaction(tx, userId)
     return callback(tx)
   })
 }
