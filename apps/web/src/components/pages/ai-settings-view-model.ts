@@ -1,4 +1,4 @@
-import type { AiConfig, UserAiSettings } from '@/lib/model-router'
+import type { AiConfig, UserAiSettings } from '@/lib/model-router-client'
 
 /** Return a user-facing validation message for a custom OpenAI-compatible config. */
 export function customConfigError(config: AiConfig | null | undefined): string | null {

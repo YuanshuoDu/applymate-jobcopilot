@@ -13,7 +13,7 @@
  */
 
 import Anthropic from '@anthropic-ai/sdk'
-import { pinnedFetch } from '@jobcopilot/shared'
+import { pinnedFetch } from '@jobcopilot/shared/pinned-outbound'
 import { db }    from '@/lib/db'
 import { isSafeAiEndpoint } from '@jobcopilot/shared/safe-ai-endpoint'
 import { recordAiUsage } from '@/lib/ai-usage'

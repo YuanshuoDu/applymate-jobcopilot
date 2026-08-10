@@ -2,7 +2,7 @@
 
 import React, { useState } from 'react'
 import { Btn, useToast } from '@/components/ui'
-import { MODEL_CATALOGUE, PROVIDER_LABELS } from '@/lib/model-router'
+import { MODEL_CATALOGUE, PROVIDER_LABELS } from '@/lib/model-router-client'
 
 export interface CustomAgentRow {
   id: string

@@ -5,7 +5,7 @@ import { TopBar }           from '@/components/layout/TopBar'
 import { Btn, Card, useToast } from '@/components/ui'
 import type { AgentConfig, Activity, NotificationPreferences, UserProfile } from '@/lib/types'
 import { useApi, apiMutate, fmtRelative } from '@/lib/hooks'
-import { APPLYMATE_BACKING, MODEL_CATALOGUE, PROVIDER_LABELS, type AiConfig, type UserAiSettings } from '@/lib/model-router'
+import { APPLYMATE_BACKING, MODEL_CATALOGUE, PROVIDER_LABELS, type AiConfig, type UserAiSettings } from '@/lib/model-router-client'
 import { readNotificationPreferences } from '@/lib/settings-preferences'
 
 // ── Stage definitions ─────────────────────────────────────────────────────────

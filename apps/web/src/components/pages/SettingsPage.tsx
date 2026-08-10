@@ -11,7 +11,7 @@ import { useTheme, type ThemeMode } from '@/components/ThemeProvider'
 import {
   MODEL_CATALOGUE, PROVIDER_LABELS, APPLYMATE_BACKING, APPLYMATE_LABEL,
   type Provider, type AiConfig, type FeatureId, type UserAiSettings,
-} from '@/lib/model-router'
+} from '@/lib/model-router-client'
 import {
   DEFAULT_NOTIFICATION_PREFERENCES,
   DEFAULT_PRIVACY_PREFERENCES,

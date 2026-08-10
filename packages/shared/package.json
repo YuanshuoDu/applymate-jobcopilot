@@ -25,6 +25,18 @@
     "./safe-ai-endpoint": {
       "types": "./dist/safe-ai-endpoint.d.ts",
       "default": "./dist/safe-ai-endpoint.js"
+    },
+    "./pinned-outbound": {
+      "types": "./dist/pinned-outbound.d.ts",
+      "default": "./dist/pinned-outbound.js"
+    },
+    "./secret-crypto": {
+      "types": "./dist/secret-crypto.d.ts",
+      "default": "./dist/secret-crypto.js"
+    },
+    "./secret-crypto-client": {
+      "types": "./dist/secret-crypto-client.d.ts",
+      "default": "./dist/secret-crypto-client.js"
     }
   },
   "dependencies": {

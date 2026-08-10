@@ -1,5 +1,5 @@
 import type { NotificationPreferences, PrivacyPreferences, UserPreferences } from './types'
-import { isEncryptedSecret } from '@jobcopilot/shared'
+import { isEncryptedSecret } from '@jobcopilot/shared/secret-crypto-client'
 
 export const DEFAULT_NOTIFICATION_PREFERENCES: NotificationPreferences = {
   apply: true,
