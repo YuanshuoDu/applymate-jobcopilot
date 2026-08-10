@@ -4,6 +4,7 @@ import React, { useEffect, useState } from 'react'
 import { getProviders, signIn } from 'next-auth/react'
 import { useRouter } from 'next/navigation'
 import Link from 'next/link'
+import { authLink, safeCallbackUrl } from '@/lib/auth-callback'
 
 // ── Design tokens (identical to LoginPage) ────────────────────────────────────
 const C = {
@@ -82,8 +83,9 @@ function PasswordStrength({ password }: { password: string }) {
   )
 }
 
-export function RegisterPage() {
+export function RegisterPage({ callbackUrl: rawCallbackUrl = '/' }: { callbackUrl?: string }) {
   const router = useRouter()
+  const callbackUrl = safeCallbackUrl(rawCallbackUrl)
   const [name,     setName]     = useState('')
   const [email,    setEmail]    = useState('')
   const [password, setPassword] = useState('')
@@ -128,8 +130,8 @@ export function RegisterPage() {
       }
       const login = await signIn('credentials', { email, password, redirect: false })
       setLoading(null)
-      if (login?.error) { router.push('/login') }
-      else { setStep('success'); setTimeout(() => { router.push('/'); router.refresh() }, 1800) }
+      if (login?.error) { router.push(authLink('/login', callbackUrl)) }
+      else { setStep('success'); setTimeout(() => { router.push(callbackUrl); router.refresh() }, 1800) }
     } catch {
       setLoading(null)
       setError('Network error. Please try again')
@@ -142,7 +144,7 @@ export function RegisterPage() {
       return
     }
     setLoading('google')
-    await signIn('google', { callbackUrl: '/' })
+    await signIn('google', { callbackUrl })
   }
 
   // ── Success screen ────────────────────────────────────────────────────────────
@@ -172,7 +174,7 @@ export function RegisterPage() {
   return (
     <div className="auth-layout" style={{
       display: 'flex', minHeight: '100vh',
-      background: 'linear-gradient(135deg, #EEF2FF 0%, #F5F3FF 35%, #EDE9FE 65%, #F0F9FF 100%)',
+      backgroundImage: 'linear-gradient(135deg, #EEF2FF 0%, #F5F3FF 35%, #EDE9FE 65%, #F0F9FF 100%)',
       backgroundAttachment: 'fixed', position: 'relative', overflowX: 'hidden',
     }}>
       {/* Decorative blobs */}
@@ -273,7 +275,7 @@ export function RegisterPage() {
             <h2 style={{ fontSize: 22, fontWeight: 800, color: C.text, marginBottom: 6, letterSpacing: '-0.02em' }}>Create your account 👋</h2>
             <p style={{ fontSize: 13, color: C.muted }}>
               Already have an account?{' '}
-              <Link href="/login" style={{
+              <Link href={authLink('/login', callbackUrl)} style={{
                 color: C.primary, textDecoration: 'none', fontWeight: 600,
                 background: 'linear-gradient(135deg, #4F46E5, #7C3AED)',
                 WebkitBackgroundClip: 'text', WebkitTextFillColor: 'transparent', backgroundClip: 'text',
