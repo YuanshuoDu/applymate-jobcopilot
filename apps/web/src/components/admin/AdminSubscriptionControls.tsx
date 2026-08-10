@@ -17,7 +17,7 @@ export function AdminSubscriptionControls({ canUpdate }: { canUpdate: boolean })
     const response = await fetch('/api/admin/v1/plans/subscriptions?limit=50', { cache: 'no-store' })
     const payload = await response.json().catch(() => null) as { items?: Subscription[]; error?: string } | null
     setItems(payload?.items ?? [])
-    if (!response.ok) setNotice(payload?.error ?? 'Unable to load subscriptions.')
+    if (!response.ok) setNotice(response.status >= 500 ? 'Subscription operations are unavailable until the production billing migrations are applied.' : payload?.error ?? 'Unable to load subscriptions.')
   }
   useEffect(() => { void load() }, [])
   async function save(event: React.FormEvent) {

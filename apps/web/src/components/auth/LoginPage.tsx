@@ -105,6 +105,8 @@ function mapOAuthError(err: string): string {
     AccessDenied:          'Sign-in was denied.',
     Verification:          'This verification link has expired.',
     OAuthIdentityMismatch: 'The Google account does not match the existing login record. Please choose the correct account or contact support.',
+    not_admin:              'This account is not an administrator. Administrator access is invitation-only.',
+    admin_registration_disabled: 'Administrator accounts are created by invitation only.',
   }
   return MAP[err] ?? `Sign-in error: ${err}`
 }
@@ -121,7 +123,7 @@ export function safeCallbackUrl(value: string | null): string {
   }
 }
 
-export function LoginPage({ switchAccount = false }: { switchAccount?: boolean }) {
+export function LoginPage({ switchAccount = false, adminLogin = false }: { switchAccount?: boolean; adminLogin?: boolean }) {
   const router       = useRouter()
   const searchParams = useSearchParams()
   const callbackUrl  = safeCallbackUrl(searchParams.get('callbackUrl'))
@@ -264,14 +266,20 @@ export function LoginPage({ switchAccount = false }: { switchAccount?: boolean }
           {/* Header */}
           <div style={{ marginBottom:28 }}>
             <h2 style={{ fontSize:22, fontWeight:800, color:C.text, marginBottom:6, letterSpacing:'-0.02em' }}>Welcome back 👋</h2>
-            <p style={{ fontSize:13, color:C.muted }}>
-              Don&apos;t have an account?{' '}
-              <Link href="/register" style={{
-                color:C.primary, textDecoration:'none', fontWeight:600,
-                background:'linear-gradient(135deg, #4F46E5, #7C3AED)',
-                WebkitBackgroundClip:'text', WebkitTextFillColor:'transparent', backgroundClip:'text',
-              }}>Create a free account</Link>
-            </p>
+            {adminLogin ? (
+              <p style={{ fontSize:13, color:C.muted }}>
+                Administrator access is invitation-only. Sign in with an approved admin account.
+              </p>
+            ) : (
+              <p style={{ fontSize:13, color:C.muted }}>
+                Don&apos;t have an account?{' '}
+                <Link href="/register" style={{
+                  color:C.primary, textDecoration:'none', fontWeight:600,
+                  background:'linear-gradient(135deg, #4F46E5, #7C3AED)',
+                  WebkitBackgroundClip:'text', WebkitTextFillColor:'transparent', backgroundClip:'text',
+                }}>Create a free account</Link>
+              </p>
+            )}
           </div>
 
           {/* Error */}

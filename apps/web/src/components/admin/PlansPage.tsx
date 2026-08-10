@@ -22,16 +22,22 @@ export function PlansPage() {
   const [transitions, setTransitions] = useState<Transition[]>([])
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
+  const [transitionError, setTransitionError] = useState('')
 
   async function load() {
-    setLoading(true); setError('')
+    setLoading(true); setError(''); setTransitionError('')
     try {
       const [plansResponse, transitionsResponse] = await Promise.all([fetch('/api/admin/v1/plans', { cache: 'no-store' }), fetch('/api/admin/v1/plans/transitions', { cache: 'no-store' })])
       const planBody = await plansResponse.json() as { plans?: unknown[]; error?: string }
       const transitionBody = await transitionsResponse.json() as { items?: Transition[]; error?: string }
       if (!plansResponse.ok) throw new Error(planBody.error ?? 'Unable to load plans')
-      if (!transitionsResponse.ok) throw new Error(transitionBody.error ?? 'Unable to load transitions')
-      setPlans((planBody.plans ?? []).map(toPlanCatalogDto)); setTransitions(transitionBody.items ?? [])
+      setPlans((planBody.plans ?? []).map(toPlanCatalogDto))
+      if (!transitionsResponse.ok) {
+        setTransitions([])
+        setTransitionError('Transition controls are unavailable until the production plan-transition migration is applied.')
+      } else {
+        setTransitions(transitionBody.items ?? [])
+      }
     } catch (loadError) { setError(loadError instanceof Error ? loadError.message : 'Unable to load plans') }
     finally { setLoading(false) }
   }
@@ -45,7 +51,7 @@ export function PlansPage() {
     {error && <ErrorBox text={error} />}
     {loading ? <p style={muted}>Loading plans…</p> : <>
       <section style={section}><div style={sectionHeader}><h2 style={heading}>Plan catalogue</h2></div>{plans.length > 0 && <div style={planGrid}>{plans.map(plan => <PlanCard key={plan.id} plan={plan} onSaved={load} />)}</div>}{plans.length === 0 && <p style={muted}>No plans have been seeded yet.</p>}</section>
-      <section style={section}><h2 style={heading}>Manual transitions</h2><p style={muted}>Only enabled transitions can be used when changing a user plan.</p><div style={{ overflowX: 'auto' }}><table style={table}><thead><tr><th>From</th><th>To</th><th>Status</th><th>Note</th><th /></tr></thead><tbody>{transitionRows.map(item => <TransitionRow key={item.id} transition={item} onSaved={load} />)}</tbody></table></div></section>
+      <section style={section}><h2 style={heading}>Manual transitions</h2><p style={muted}>Only enabled transitions can be used when changing a user plan.</p>{transitionError ? <ErrorBox text={transitionError} /> : <div style={{ overflowX: 'auto' }}><table style={table}><thead><tr><th>From</th><th>To</th><th>Status</th><th>Note</th><th /></tr></thead><tbody>{transitionRows.map(item => <TransitionRow key={item.id} transition={item} onSaved={load} />)}</tbody></table></div>}</section>
     </>}
   </div>
 }
