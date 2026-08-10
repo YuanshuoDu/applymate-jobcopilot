@@ -15,6 +15,14 @@ function relativeSla(value: string | null) {
   return hours < 0 ? `${Math.abs(hours)}h overdue` : `${hours}h left`
 }
 
+export function slaLabel(value: Date, now = new Date()): string {
+  return value.getTime() < now.getTime() ? 'Overdue' : 'Within SLA'
+}
+
+export function supportMessageLabel(kind: Message['authorType']): string {
+  return kind === 'internal_note' ? 'Internal note' : kind === 'staff_reply' ? 'Reply to customer' : 'Customer message'
+}
+
 export function ContactUsPage({ actorId, permissions }: { actorId: string; permissions: readonly string[] }) {
   const [cases, setCases] = useState<Case[]>([])
   const [selectedId, setSelectedId] = useState<string | null>(null)

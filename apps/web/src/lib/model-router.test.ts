@@ -14,7 +14,10 @@ import {
 } from './model-router'
 
 describe('model catalogue and MiniMax compatibility', () => {
-  afterEach(() => vi.restoreAllMocks())
+  afterEach(() => {
+    vi.restoreAllMocks()
+    vi.unstubAllEnvs()
+  })
 
   it('uses MiniMax M3 completion tokens and adaptive reasoning for the current default', async () => {
     const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response(JSON.stringify({

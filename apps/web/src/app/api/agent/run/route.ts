@@ -23,7 +23,7 @@ import { runAgentPipeline }                          from '@/lib/agent/run-servi
 import { hasEffectiveEntitlement }                   from '@/lib/entitlements'
 
 export async function GET(req: NextRequest) {
-  const prep = await prepareAiRoute(req, 'agent')
+  const prep = await prepareAiRoute(req, 'agent', 'job_discovery')
   if ('error' in prep) return prep.error
   if (!(await hasEffectiveEntitlement(prep.userId, 'auto_apply'))) return err('Your current plan does not include autonomous applications.', 403)
 

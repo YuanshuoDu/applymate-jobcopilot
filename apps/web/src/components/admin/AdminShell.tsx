@@ -26,6 +26,10 @@ const navigation = [
   { href: '/admin/security', labelKey: 'admin.nav.security', icon: ShieldAlert, permission: 'break_glass.request' },
 ]
 
+export function filterAdminNav(permissions: readonly string[]) {
+  return navigation.filter(item => permissions.includes(item.permission))
+}
+
 const notificationPermissions = ['support_cases.read', 'audit.read', 'observability.read']
 
 function exportConfigForPath(pathname: string) {
@@ -77,7 +81,7 @@ export function AdminShell({ children, permissions, roleKey }: { children: React
     <aside className="admin-sidebar">
       <Link href="/admin" className="admin-brand"><span>ApplyMate</span><small>Internal Admin</small></Link>
       <nav aria-label="Admin navigation" className="admin-nav">
-        {navigation.filter(item => permissions.includes(item.permission)).map(item => {
+        {filterAdminNav(permissions).map(item => {
           const active = item.href === '/admin' ? pathname === '/admin' : pathname.startsWith(item.href)
           const Icon = item.icon
           const label = t(item.labelKey)

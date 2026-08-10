@@ -53,3 +53,66 @@ export const adminUserMetadataSelect = {
   _count: { select: { jobs: true, resumes: true, notifications: true } },
   gmailSyncState: { select: { lastSyncedAt: true, lastError: true } },
 } as const
+
+export interface AdminRoleDto {
+  id: string
+  key: string
+  name: string
+  permissions: string[]
+  system: boolean
+  version: number
+}
+
+export interface AdminUserDto {
+  id: string
+  email: string
+  name: string
+  plan: string
+  accountStatus: string
+  region: string
+  createdAt: string
+  updatedAt: string
+  suspendedAt: string | null
+  counts: { resumes: number; jobs: number; applicationTasks: number }
+}
+
+export function toAdminRoleDto(input: unknown): AdminRoleDto {
+  const row = record(input)
+  return {
+    id: stringValue(row.id),
+    key: stringValue(row.key),
+    name: stringValue(row.name),
+    permissions: Array.isArray(row.permissions) ? row.permissions.filter((value): value is string => typeof value === 'string') : [],
+    system: row.system === true,
+    version: numberValue(row.version, 1),
+  }
+}
+
+export function toAdminUserDto(input: unknown): AdminUserDto {
+  const row = record(input)
+  const count = record(row._count)
+  return {
+    id: stringValue(row.id),
+    email: maskEmail(stringValue(row.email)),
+    name: maskName(stringValue(row.name)) ?? '',
+    plan: stringValue(row.plan),
+    accountStatus: stringValue(row.accountStatus),
+    region: maskRegion(stringValue(row.location)),
+    createdAt: dateValue(row.createdAt),
+    updatedAt: dateValue(row.updatedAt),
+    suspendedAt: dateValue(row.suspendedAt) || null,
+    counts: { resumes: numberValue(count.resumes, 0), jobs: numberValue(count.jobs, 0), applicationTasks: numberValue(count.applicationTasks, 0) },
+  }
+}
+
+function record(value: unknown): Record<string, unknown> {
+  return value !== null && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : {}
+}
+
+function stringValue(value: unknown): string { return typeof value === 'string' ? value : '' }
+function numberValue(value: unknown, fallback: number): number { return typeof value === 'number' && Number.isFinite(value) ? value : fallback }
+function dateValue(value: unknown): string { return value instanceof Date ? value.toISOString() : typeof value === 'string' ? value : '' }
+function maskRegion(value: string): string {
+  const parts = value.split(',').map(part => part.trim()).filter(Boolean)
+  return parts.length > 1 ? parts[parts.length - 1] : ''
+}

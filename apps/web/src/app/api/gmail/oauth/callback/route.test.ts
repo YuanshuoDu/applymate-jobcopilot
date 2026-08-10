@@ -6,12 +6,13 @@ const GMAIL_STATE_COOKIE = 'applymate-gmail-oauth-state'
 
 const mocks = vi.hoisted(() => ({
   findUnique: vi.fn(),
+  userFindUnique: vi.fn(),
   deleteMany: vi.fn(),
   upsert: vi.fn(),
 }))
 const pinnedFetch = vi.hoisted(() => vi.fn((input: string | URL, init?: unknown) => globalThis.fetch(String(input), init as RequestInit)))
 
-vi.mock('@/lib/db', () => ({ db: { account: mocks } }))
+vi.mock('@/lib/db', () => ({ db: { account: mocks, user: { findUnique: mocks.userFindUnique } } }))
 vi.mock('@jobcopilot/shared', async () => {
   const actual = await vi.importActual<typeof import('@jobcopilot/shared')>('@jobcopilot/shared')
   return { ...actual, pinnedFetch }
@@ -32,6 +33,7 @@ describe('GET /api/gmail/oauth/callback', () => {
     vi.stubEnv('AUTH_GOOGLE_SECRET', 'google-secret')
     vi.stubEnv('AUTH_URL', 'https://applymate.site')
     mocks.findUnique.mockReset()
+    mocks.userFindUnique.mockReset().mockResolvedValue({ accountStatus: 'active' })
     mocks.deleteMany.mockReset()
     mocks.upsert.mockReset()
     mocks.findUnique.mockResolvedValue(null)

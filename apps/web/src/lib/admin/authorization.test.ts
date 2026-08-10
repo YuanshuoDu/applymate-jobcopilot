@@ -27,7 +27,7 @@ describe('requireAdmin', () => {
     const { requireAdmin } = await import('./authorization')
     const result = await requireAdmin('observability.read', new Request('http://localhost/api/admin/v1/observability'))
     expect(result).toBeInstanceOf(Response)
-    expect((result as Response).status).toBe(403)
+    expect((result as unknown as Response).status).toBe(403)
     expect(mocks.audit).toHaveBeenCalledWith(expect.objectContaining({ errorCode: 'permission_denied', outcome: 'denied' }))
   })
 

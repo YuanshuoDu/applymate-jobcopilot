@@ -69,7 +69,7 @@ function sectionsForAuditRepair(findings: ApplicationAuditFinding[]) {
 }
 
 export async function POST(req: NextRequest, { params }: Params) {
-  const prep = await prepareAiRoute(req, 'suggest')
+  const prep = await prepareAiRoute(req, 'suggest', 'tailored_resume')
   if ('error' in prep) return prep.error
   if (!await hasEffectiveEntitlement(prep.userId, 'cv:tailoring')) return err('Your current plan does not include AI CV tailoring.', 403)
 

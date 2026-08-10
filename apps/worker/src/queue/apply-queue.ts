@@ -27,7 +27,7 @@ import { purgeTemporaryGeneratedCoverLetters } from "../notifications/purge-cove
 import { shouldUsePattern } from "../patterns/confidence.js";
 import { replayPattern } from "../patterns/replay.js";
 import { unlinkSync } from "node:fs";
-import { applicationTaskStillActive, claimApplicationTask, completeFillForReview, finishApplicationTask, needsUserTakeover, pauseForFormInput } from "../db/application-task-state.js";
+import { applicationTaskStillActive, claimApplicationTask, completeFillForReview, finishApplicationTask, isUserActive, needsUserTakeover, pauseForFormInput } from "../db/application-task-state.js";
 import { formNeedsMessage, inspectFormReviewNeeds } from "../harness/form-review.js";
 import { workerPollingOptions } from "./worker-polling-options.js";
 import {
@@ -68,6 +68,11 @@ export const applyWorker = new Worker<ApplyTaskPayload>(
     let ctx: Awaited<ReturnType<typeof loadTaskContext>> | null = null;
 
     try {
+      if (!(await isUserActive(getPool(), userId))) {
+        await finishApplicationTask(getPool(), applicationTaskId, "failed", "account_suspended", "Account suspended by an administrator.");
+        console.warn(`[apply-worker] Skipping suspended account for job=${jobId}`);
+        return;
+      }
       if (!applicationTaskId || !operation || !await claimApplicationTask(getPool(), applicationTaskId, userId, jobId)) {
         console.warn(`[apply-worker] Skipping stale or revoked application task for job=${jobId}`);
         return;

@@ -1389,7 +1389,7 @@ const FETCHERS: Record<string, (p: Record<string, string>, f: SearchFilters) => 
 }
 
 export async function GET(req: NextRequest) {
-  const auth = await requireAuth(req)
+  const auth = await requireAuth(req, 'job_discovery')
   if (isErrorResponse(auth)) return auth
 
   const discovery = await getDiscoveryApiKeys(auth.userId)

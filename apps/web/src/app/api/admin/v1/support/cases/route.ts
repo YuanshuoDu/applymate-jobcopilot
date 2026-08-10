@@ -5,6 +5,8 @@ import { writeAdminAudit } from '@/lib/admin/audit'
 import { adminUserMetadataSelect, toAdminUserMetadata } from '@/lib/admin/dto'
 import { supportCaseScope } from '@/lib/admin/support-case'
 import { db } from '@/lib/db'
+import { parseSupportCasePriority, parseSupportCaseStatus } from '@/lib/admin/support'
+import { adminError, adminJson, requestId, requireAdminActor } from '@/lib/admin/route-utils'
 
 export async function GET(request: NextRequest) {
   const actor = await requireAdmin('support_cases.read', request)
@@ -39,3 +41,13 @@ export async function GET(request: NextRequest) {
   await writeAdminAudit({ requestId: actor.requestId, actorUserId: actor.userId, actorRoleKey: actor.roleKey, action: 'support.case_list_viewed', outcome: 'success' })
   return NextResponse.json({ cases: cases.map((supportCase) => ({ ...supportCase, requester: toAdminUserMetadata(supportCase.requester) })) }, { headers: { 'Cache-Control': 'no-store' } })
 }
+
+type AdminCaseRow = { id: string; subject: string; category: string; status: string; priority: string; assignedAdminId: string | null; slaDueAt: Date | null; firstRespondedAt: Date | null; resolvedAt: Date | null; safeContext: unknown; createdAt: Date; updatedAt: Date; requester: { id: string; email: string; name: string | null; plan: string; accountStatus: string; location: string | null; _count: { jobs: number; applicationTasks: number; resumes: number } }; messages: Array<{ id: string; authorType: string; authorUserId: string | null; body: string; redacted: boolean; createdAt: Date }> }
+
+function toAdminCaseDto(value: AdminCaseRow) {
+  const requester = value.requester
+  return { id: value.id, subject: value.subject, category: value.category, status: value.status, priority: value.priority, assignedAdminId: value.assignedAdminId, slaDueAt: value.slaDueAt?.toISOString() ?? null, firstRespondedAt: value.firstRespondedAt?.toISOString() ?? null, resolvedAt: value.resolvedAt?.toISOString() ?? null, createdAt: value.createdAt.toISOString(), updatedAt: value.updatedAt.toISOString(), safeContext: value.safeContext, requester: { id: requester.id, email: maskEmail(requester.email), name: maskName(requester.name), plan: requester.plan, accountStatus: requester.accountStatus, region: requester.location ? requester.location.split(',').at(-1)?.trim() ?? '' : '', counts: requester._count }, messages: value.messages.map(message => ({ ...message, createdAt: message.createdAt.toISOString() })) }
+}
+
+function maskEmail(value: string): string { const [local, domain] = value.split('@'); return `${local?.slice(0, 1) ?? '*'}***@${domain ?? 'redacted'}` }
+function maskName(value: string | null): string { if (!value) return ''; return value.split(/\s+/).map(part => part ? `${part[0]}***` : '').join(' ') }

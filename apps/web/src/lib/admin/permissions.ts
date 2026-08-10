@@ -36,3 +36,66 @@ export const SYSTEM_ROLES = (Object.keys(rolePermissions) as AdminRoleKey[]).map
 export function isPermission(value: string): value is Permission {
   return (PERMISSIONS as readonly string[]).includes(value)
 }
+
+// Compatibility exports used by the access-management slice. The operational
+// permission catalogue above remains the single source of truth.
+export const ADMIN_PERMISSION_KEYS = PERMISSIONS
+
+export interface RoleSeed {
+  name: string
+  description: string
+  system: boolean
+  permissions: readonly Permission[]
+}
+
+export const ROLE_SEEDS = Object.fromEntries(
+  SYSTEM_ROLES.map(role => [role.key, {
+    name: role.name,
+    description: `${role.name} administrative role`,
+    system: true,
+    permissions: role.permissions,
+  }]),
+) as Record<AdminRoleKey, RoleSeed>
+
+export function validatePermissionList(values: unknown): Permission[] {
+  if (!Array.isArray(values)) throw new Error('Permissions must be an array')
+  const result: Permission[] = []
+  for (const value of values) {
+    if (typeof value !== 'string') throw new Error('Permission keys must be strings')
+    const key = value.trim()
+    if (!key) continue
+    if (!isPermission(key)) throw new Error(`Unknown admin permission: ${key}`)
+    if (!result.includes(key)) result.push(key)
+  }
+  return result
+}
+
+export interface AdminRoleActor {
+  roleKey: string
+  permissions: readonly string[]
+}
+
+export interface RoleEditTarget {
+  key: string
+  isLastSuperAdmin: boolean
+}
+
+export function canEditRole(
+  actor: AdminRoleActor,
+  target: RoleEditTarget,
+  nextPermissions: unknown,
+): { ok: true; permissions: Permission[] } | { ok: false; error: string } {
+  if (!actor.permissions.includes('admin_roles.manage')) return { ok: false, error: 'Missing admin_roles.manage permission' }
+  let permissions: Permission[]
+  try {
+    permissions = validatePermissionList(nextPermissions)
+  } catch (error) {
+    return { ok: false, error: error instanceof Error ? error.message : 'Invalid permissions' }
+  }
+  const actorPermissions = new Set(actor.permissions)
+  if (permissions.some(permission => !actorPermissions.has(permission))) return { ok: false, error: 'Cannot grant a permission you do not hold' }
+  if (target.key === 'super_admin' && target.isLastSuperAdmin && !permissions.includes('admin_roles.manage')) {
+    return { ok: false, error: 'The last super admin must retain admin management permissions' }
+  }
+  return { ok: true, permissions }
+}

@@ -6,5 +6,5 @@
     "outDir": ".seed-dist",
     "noEmit": false
   },
-  "include": ["seed.ts"]
+  "include": ["seed.ts", "seed-admin.ts", "../src/lib/admin/permissions.ts"]
 }

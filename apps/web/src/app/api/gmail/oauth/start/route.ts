@@ -13,6 +13,7 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { SignJWT } from 'jose'
 import { safeAuth } from '@/lib/safe-auth'
+import { db } from '@/lib/db'
 import { configuredRedirectUri } from '@/lib/app-url'
 import { getOAuthStateSecret, setOAuthStateCookie } from '@/lib/oauth-state'
 
@@ -41,6 +42,10 @@ export async function GET(req: NextRequest) {
   if (!session?.user?.id) {
     return NextResponse.redirect(new URL('/login', req.url))
   }
+
+  const user = await db.user.findUnique({ where: { id: session.user.id }, select: { accountStatus: true } })
+  if (!user) return NextResponse.redirect(new URL('/login', req.url))
+  if (user.accountStatus === 'suspended') return NextResponse.json({ error: 'Account suspended' }, { status: 403 })
 
   const clientId = process.env.AUTH_GOOGLE_ID
   if (!clientId || !process.env.AUTH_GOOGLE_SECRET) {

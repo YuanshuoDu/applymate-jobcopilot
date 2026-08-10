@@ -2,14 +2,16 @@ import { beforeEach, afterEach, describe, expect, it, vi } from 'vitest'
 import { jwtVerify } from 'jose'
 import { NextRequest } from 'next/server'
 
-const mocks = vi.hoisted(() => ({ safeAuth: vi.fn() }))
+const mocks = vi.hoisted(() => ({ safeAuth: vi.fn(), userFindUnique: vi.fn() }))
 vi.mock('@/lib/safe-auth', () => ({ safeAuth: mocks.safeAuth }))
+vi.mock('@/lib/db', () => ({ db: { user: { findUnique: mocks.userFindUnique } } }))
 
 describe('GET /api/gmail/oauth/start', () => {
   beforeEach(() => {
     vi.resetModules()
     mocks.safeAuth.mockReset()
     mocks.safeAuth.mockResolvedValue({ user: { id: 'user_1' } })
+    mocks.userFindUnique.mockReset().mockResolvedValue({ accountStatus: 'active' })
     vi.stubEnv('AUTH_SECRET', 'test-secret-which-is-long-enough')
     vi.stubEnv('AUTH_GOOGLE_ID', 'google-client')
     vi.stubEnv('AUTH_GOOGLE_SECRET', 'google-secret')

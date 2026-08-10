@@ -46,7 +46,7 @@ function inferCategory(q: string): string {
 }
 
 export async function GET(req: NextRequest) {
-  const auth = await requireAuth(req)
+  const auth = await requireAuth(req, 'job_discovery')
   if (isErrorResponse(auth)) return auth
 
   const sp       = req.nextUrl.searchParams

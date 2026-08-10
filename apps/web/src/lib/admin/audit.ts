@@ -19,6 +19,15 @@ export type AuditInput = {
   userAgent?: string | null
 }
 
+type AuditStore = { adminAuditLog: { create(args: { data: Prisma.AdminAuditLogCreateInput }): Promise<unknown> } }
+
+const SAFE_SNAPSHOT_KEYS = new Set(['status', 'version', 'roleKey', 'roleName', 'permissionCount', 'sessionVersion', 'outcome', 'reasonCode'])
+
+export function safeAuditSnapshot(input: unknown): Record<string, string | number | boolean> {
+  if (input === null || typeof input !== 'object' || Array.isArray(input)) return {}
+  return Object.fromEntries(Object.entries(input as Record<string, unknown>).filter(([key, value]) => SAFE_SNAPSHOT_KEYS.has(key) && ['string', 'number', 'boolean'].includes(typeof value))) as Record<string, string | number | boolean>
+}
+
 function hash(value: string | null | undefined) {
   return value ? createHash('sha256').update(value).digest('hex') : undefined
 }
@@ -48,9 +57,13 @@ export function createAdminAuditData(input: AuditInput): Prisma.AdminAuditLogCre
   }
 }
 
-export async function writeAdminAudit(input: AuditInput) {
+export function writeAdminAudit(input: AuditInput): Promise<void>
+export function writeAdminAudit(store: AuditStore, input: AuditInput): Promise<void>
+export async function writeAdminAudit(first: AuditInput | AuditStore, second?: AuditInput) {
+  const store = second ? first as AuditStore : db
+  const input = second ?? first as AuditInput
   try {
-    await db.adminAuditLog.create({ data: createAdminAuditData(input) })
+    await store.adminAuditLog.create({ data: createAdminAuditData(input) })
   } catch (error) {
     await db.adminAlertEvent.create({ data: { ruleKey: 'audit.write_failure', metric: 'audit_write_failure', value: 1, threshold: 0, severity: 'critical' } }).catch(() => undefined)
     console.error('ADMIN_AUDIT_WRITE_FAILED', { requestId: input.requestId, action: input.action, error })

@@ -79,3 +79,61 @@ export async function checkEntitlementLimit(userId: string, key: string, usage: 
   if (limit !== null && usage >= limit) return { allowed: false, key: requested, limit, usage, reason: 'limit_reached' }
   return { allowed: true, key: requested, limit, usage, reason: 'available' }
 }
+
+export type RuntimeEntitlementKind = 'boolean' | 'limit' | 'text'
+export type RuntimeEntitlement = {
+  featureKey: string
+  kind: RuntimeEntitlementKind
+  enabled: boolean
+  limit: number | null
+  textValue: string | null
+  source: 'plan' | 'override'
+  expiresAt: Date | null
+}
+
+/** Compatibility API for older user-facing AI routes while the catalogue uses JSON entitlements. */
+export async function resolveEntitlement(userId: string, featureKey: string): Promise<RuntimeEntitlement | null> {
+  const snapshot = await getEffectiveEntitlements(userId)
+  const requested = entitlementKey(featureKey)
+  const value = snapshot.entitlements.find(item => entitlementKey(item) === requested)
+  if (!value && !snapshot.overrides.includes(requested)) return { featureKey: requested, kind: 'boolean', enabled: false, limit: null, textValue: null, source: 'plan', expiresAt: null }
+  const limit = value ? entitlementLimit(value) : snapshot.limits[requested] ?? null
+  return {
+    featureKey: requested,
+    kind: limit !== null ? 'limit' : 'boolean',
+    enabled: Boolean(value) && (limit === null || limit > 0),
+    limit,
+    textValue: null,
+    source: snapshot.overrides.includes(requested) ? 'override' : 'plan',
+    expiresAt: null,
+  }
+}
+
+export async function isFeatureAllowed(userId: string, featureKey: string) {
+  return hasEffectiveEntitlement(userId, featureKey)
+}
+
+export type AiAccessDecision = 'allowed' | 'disabled' | 'exhausted'
+
+export async function resolveAiAccess(userId: string, now = new Date()): Promise<AiAccessDecision> {
+  const snapshot = await getEffectiveEntitlements(userId)
+  const limit = snapshot.limits.ai_credits
+  if (!hasEntitlement(snapshot, 'ai_credits')) return 'disabled'
+  if (limit === null) return 'allowed'
+  const month = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}`
+  try {
+    const rows = await db.$queryRaw<Array<{ used: number }>>`
+      SELECT used FROM ai_budgets WHERE user_id = ${userId} AND month = ${month} LIMIT 1
+    `
+    return Number(rows[0]?.used ?? 0) < limit ? 'allowed' : 'exhausted'
+  } catch {
+    return 'allowed'
+  }
+}
+
+function hasEntitlement(snapshot: EffectiveEntitlements, key: string) {
+  const requested = entitlementKey(key)
+  const value = snapshot.entitlements.find(item => entitlementKey(item) === requested)
+  const limit = value ? entitlementLimit(value) : null
+  return Boolean(value) && (limit === null || limit > 0)
+}

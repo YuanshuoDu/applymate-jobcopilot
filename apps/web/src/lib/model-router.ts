@@ -31,6 +31,8 @@ export type Provider =
   | 'kimi'
   | 'custom'
 
+const KNOWN_PROVIDERS = new Set<Provider>(['anthropic', 'openai', 'deepseek', 'minimax', 'qwen', 'zhipu', 'kimi', 'custom'])
+
 export interface ModelOption {
   provider:    Provider
   model:       string
@@ -181,7 +183,7 @@ export function withMiniMaxThinking(config: AiConfig, thinking: MiniMaxThinkingM
 // ── Resolve effective config ──────────────────────────────────────────────────
 
 /** Merge user config with server env-var fallbacks */
-export function resolveConfig(userConfig?: AiConfig | null): AiConfig & { resolvedKey: string } {
+export function resolveConfig(userConfig?: AiConfig | null, options?: { preserveModel?: boolean }): AiConfig & { resolvedKey: string } {
   const input  = userConfig ?? DEFAULT_AI_CONFIG
   const exact  = MODEL_CATALOGUE.find(m => m.provider === input.provider && m.model === input.model)
   const option = exact
@@ -191,7 +193,7 @@ export function resolveConfig(userConfig?: AiConfig | null): AiConfig & { resolv
 
   // Saved settings can outlive a provider model. Do not send a retired model
   // identifier to the provider; retain custom model IDs because they are user-owned.
-  const cfg = !exact && input.provider !== 'custom'
+  const cfg = !exact && input.provider !== 'custom' && !options?.preserveModel
     ? { ...input, provider: option.provider, model: option.model }
     : input
 

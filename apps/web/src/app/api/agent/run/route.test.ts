@@ -42,6 +42,7 @@ describe('agent run API session binding', () => {
 
     expect(response.status).toBe(404)
     await expect(response.json()).resolves.toEqual({ error: 'Session not found' })
+    expect(mocks.prepareAiRoute).toHaveBeenCalledWith(expect.any(NextRequest), 'agent', 'job_discovery')
     expect(mocks.findFirst).toHaveBeenCalledWith({
       where: { id: 'deleted_session', userId: 'user_1' },
       select: { id: true },

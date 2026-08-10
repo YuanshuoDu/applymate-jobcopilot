@@ -182,4 +182,15 @@ describe("agent automation due scheduler API", () => {
       where: { id: "automation_1" }, data: { nextRunAt: expect.any(Date) },
     }))
   })
+
+  it("does not create a session for an automation owned by a suspended user", async () => {
+    mocks.automationFindMany.mockResolvedValueOnce([])
+    const { POST } = await import("./route")
+
+    const res = await POST(postRequest() as never)
+
+    expect(res.status).toBe(200)
+    await expect(res.json()).resolves.toMatchObject({ started: [] })
+    expect(mocks.sessionCreate).not.toHaveBeenCalled()
+  })
 })

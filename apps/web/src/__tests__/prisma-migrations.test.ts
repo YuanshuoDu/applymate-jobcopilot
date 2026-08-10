@@ -1,4 +1,4 @@
-import { readdirSync, readFileSync } from 'node:fs'
+import { existsSync, readdirSync, readFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { describe, expect, it } from 'vitest'
@@ -8,7 +8,7 @@ const migrationsRoot = fileURLToPath(new URL('../../prisma/migrations/', import.
 describe('Prisma migration dependencies', () => {
   it('creates ai_budgets before a later migration alters or references it', () => {
     const migrations = readdirSync(migrationsRoot, { withFileTypes: true })
-      .filter((entry) => entry.isDirectory())
+      .filter((entry) => entry.isDirectory() && existsSync(join(migrationsRoot, entry.name, 'migration.sql')))
       .map((entry) => entry.name)
       .sort()
       .map((name) => ({ name, sql: readFileSync(join(migrationsRoot, name, 'migration.sql'), 'utf8') }))

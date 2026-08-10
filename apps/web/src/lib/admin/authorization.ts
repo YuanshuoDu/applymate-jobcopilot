@@ -42,6 +42,7 @@ export async function requireAdminMembership(request?: Request): Promise<AdminAc
   return Object.freeze({ userId, roleKey: membership.role.key, permissions: Object.freeze([...membership.role.permissions]), requestId })
 }
 
+export function requireAdmin(permission: Permission, request?: Request): Promise<AdminActor | NextResponse>
 export async function requireAdmin(permission: Permission, request?: Request): Promise<AdminActor | NextResponse> {
   return requireAdminAny([permission], request)
 }

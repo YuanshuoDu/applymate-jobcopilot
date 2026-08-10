@@ -5,6 +5,8 @@ export const BILLING_INTERVALS = ['forever', 'month', 'year'] as const
 export type BillingInterval = typeof BILLING_INTERVALS[number]
 
 export type PlanCatalogueRecord = {
+  id?: string
+  version?: number
   key: PlanKey
   name: string
   priceMinor: number
@@ -34,7 +36,7 @@ export const DEFAULT_PLAN_CATALOGUE: readonly PlanCatalogueRecord[] = [
     interval: 'forever',
     description: 'Get started for free',
     features: ['5 applications/month', 'Basic CV tailoring', 'Job tracker (20 jobs)', 'Extension popup'],
-    entitlements: ['applications:5/month', 'cv:basic', 'tracker:20', 'extension:popup'],
+    entitlements: ['applications:5/month', 'cv:basic', 'tracker:20', 'extension:popup', 'ai_credits:25', 'job_discovery:20', 'tailored_resume', 'cover_letter:5'],
     badge: null,
     cta: 'Get started free',
     trialDays: 0,
@@ -49,7 +51,7 @@ export const DEFAULT_PLAN_CATALOGUE: readonly PlanCatalogueRecord[] = [
     interval: 'month',
     description: 'Best for serious job seekers',
     features: ['Unlimited applications', 'AI CV tailoring per role', 'Unlimited tracker', 'Full sidebar', 'AI cover letters', 'Gmail integration', 'Priority support'],
-    entitlements: ['applications:unlimited', 'cv:tailoring', 'tracker:unlimited', 'extension:sidebar', 'cover_letters:ai', 'auto_apply', 'gmail:connected', 'support:priority'],
+    entitlements: ['applications:unlimited', 'cv:tailoring', 'tracker:unlimited', 'extension:sidebar', 'cover_letters:ai', 'auto_apply', 'gmail:connected', 'support:priority', 'ai_credits:1000', 'job_discovery:1000', 'tailored_resume', 'cover_letter:100', 'gmail_tracking'],
     badge: 'Most popular',
     cta: 'Start free trial',
     trialDays: 14,
@@ -64,7 +66,7 @@ export const DEFAULT_PLAN_CATALOGUE: readonly PlanCatalogueRecord[] = [
     interval: 'month',
     description: 'For teams and recruiters',
     features: ['Everything in Pro', '5 team seats', 'Shared job pool', 'Analytics dashboard', 'Custom AI model', 'Dedicated support'],
-    entitlements: ['plan:pro', 'seats:5', 'jobs:shared', 'analytics:dashboard', 'ai:custom_model', 'auto_apply', 'support:dedicated'],
+    entitlements: ['plan:pro', 'seats:5', 'jobs:shared', 'analytics:dashboard', 'ai:custom_model', 'auto_apply', 'support:dedicated', 'ai_credits:10000', 'job_discovery:10000', 'tailored_resume', 'cover_letter:1000', 'gmail_tracking', 'api_access'],
     badge: null,
     cta: 'Contact sales',
     trialDays: 0,
@@ -124,6 +126,8 @@ export function normalizePlanRow(value: unknown): PlanCatalogueRecord {
   const entitlements = normalizedEntitlements(input.entitlements)
 
   return {
+    id: typeof input.id === 'string' ? input.id : undefined,
+    version: boundedInteger(input.version, 1, 1, 1_000_000),
     key,
     name: boundedText(input.name, fallback.name, 80),
     priceMinor: boundedInteger(input.priceMinor, fallback.priceMinor, 0, 10_000_000),

@@ -3,7 +3,7 @@ import { Prisma } from "@prisma/client";
 import { enqueueApplyTask } from "@/lib/apply-queue-client";
 import { assessApplicationPreflight, isSupportedAutomatedApplyUrl } from "@/lib/agent/application-preflight";
 import { isRuntimeFeatureEnabled } from '@/lib/runtime-feature-flags'
-import { hasEffectiveEntitlement } from '@/lib/entitlements'
+import { isFeatureAllowed, resolveAiAccess } from '@/lib/entitlements'
 
 export class AutoApplyError extends Error {}
 
@@ -14,7 +14,10 @@ async function assertActiveAccount(userId: string): Promise<void> {
 
 async function assertUnattendedApplyEnabled(userId: string): Promise<void> {
   try {
-    if (!await hasEffectiveEntitlement(userId, 'auto_apply')) throw new AutoApplyError('Your current plan does not include autonomous applications.')
+    if (!await isFeatureAllowed(userId, 'auto_apply')) throw new AutoApplyError('This feature is not included in your current plan.')
+    const aiAccess = await resolveAiAccess(userId)
+    if (aiAccess === 'disabled') throw new AutoApplyError('This feature is not included in your current plan.')
+    if (aiAccess === 'exhausted') throw new AutoApplyError('Monthly AI credits exhausted.')
     if (!await isRuntimeFeatureEnabled('unattended_apply', userId)) {
       throw new AutoApplyError('Unattended applications are temporarily unavailable.')
     }

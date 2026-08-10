@@ -8,12 +8,14 @@ import { safeAuth } from '@/lib/safe-auth'
 import { EXTENSION_TOKEN_AUDIENCE, EXTENSION_TOKEN_ISSUER, getAuthJwtSecret } from '@/lib/auth-secret'
 import { resolvePlatformRoute } from '@/lib/admin/ai-config'
 import { activateTenantContext } from '@/lib/db/tenant-store'
+import { isFeatureAllowed, resolveAiAccess } from '@/lib/entitlements'
 
 const JWT_SECRET = getAuthJwtSecret()
 
 /** Get authenticated userId — supports both NextAuth session and Extension Bearer token */
 export async function requireAuth(
   req?: NextRequest,
+  requiredFeature?: string,
 ): Promise<{ userId: string } | NextResponse> {
   // Extension Bearer token. Do not trust x-user-id: it is a client-settable
   // header unless every proxy strips it before the request reaches this route.
@@ -78,9 +80,18 @@ export function err(message: string, status = 400) {
 // ── AI Route helpers ──────────────────────────────────────────────────────────
 
 /** Auth + rate limit + load user AI config. Returns the config or an error response. */
-export async function prepareAiRoute(req: NextRequest, featureId: FeatureId) {
+export async function prepareAiRoute(req: NextRequest, featureId: FeatureId, requiredEntitlement?: string | string[]) {
   const auth = await requireAuth(req)
   if (isErrorResponse(auth)) return { error: auth }
+
+  const defaultEntitlement = featureId === 'autoApply' ? 'auto_apply' : featureId === 'coverLetter' ? 'cover_letter' : null
+  const entitlementKeys = requiredEntitlement ? (Array.isArray(requiredEntitlement) ? requiredEntitlement : [requiredEntitlement]) : defaultEntitlement ? [defaultEntitlement] : []
+  for (const entitlementKey of entitlementKeys) {
+    if (!(await isFeatureAllowed(auth.userId, entitlementKey))) return { error: err('This feature is not included in your current plan', 403) }
+  }
+  const aiAccess = await resolveAiAccess(auth.userId)
+  if (aiAccess === 'disabled') return { error: err('This feature is not included in your current plan', 403) }
+  if (aiAccess === 'exhausted') return { error: err('Monthly AI credits exhausted', 429) }
 
   const rl = checkRateLimit(`ai:${auth.userId}`)
   if (!rl.ok) return { error: err(`Rate limit exceeded — retry in ${rl.retryAfter}s`, 429) }

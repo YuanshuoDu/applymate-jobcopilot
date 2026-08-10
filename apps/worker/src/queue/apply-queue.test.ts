@@ -6,6 +6,8 @@ const mockIncrementBudget = vi.fn().mockResolvedValue(undefined);
 const mockInsertApplyResult = vi.fn().mockResolvedValue(1);
 const mockCompleteFillForReview = vi.fn().mockResolvedValue(undefined);
 const mockHarnessRun = vi.fn();
+const mockWithCloakContext = vi.fn();
+const mockIsUserActive = vi.fn().mockResolvedValue(true);
 
 vi.mock("ioredis", () => ({
   Redis: vi.fn().mockImplementation(() => ({
@@ -34,7 +36,7 @@ vi.mock("bullmq", () => {
 });
 
 vi.mock("../cloak/pool.js", () => ({
-  withCloakContext: vi.fn().mockImplementation(
+  withCloakContext: mockWithCloakContext.mockImplementation(
     async (_userId: string, fn: (page: unknown) => Promise<void>) => {
       await fn({ goto: vi.fn().mockResolvedValue(undefined), url: vi.fn().mockReturnValue("https://example.com/apply") });
     }
@@ -60,6 +62,7 @@ vi.mock("../db/application-task-state.js", () => ({
   applicationTaskStillActive: vi.fn().mockResolvedValue(true),
   completeFillForReview: mockCompleteFillForReview,
   finishApplicationTask: vi.fn().mockResolvedValue(undefined),
+  isUserActive: mockIsUserActive,
   needsUserTakeover: vi.fn().mockReturnValue(false),
 }));
 
@@ -108,6 +111,7 @@ vi.mock("../harness/agent-harness.js", () => ({
 describe("apply-queue (unit — mocked)", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    mockIsUserActive.mockResolvedValue(true);
     mockHarnessRun.mockImplementation(async (_page: unknown, task: { allowSubmit?: boolean }) => task.allowSubmit === false
       ? { status: "manual", error: "Form filled and ready for user review.", durationMs: 123, reviewReady: true }
       : { status: "submitted", error: null, durationMs: 123, fieldMappings: { "#name": "fullName" } });
@@ -173,5 +177,19 @@ describe("apply-queue (unit — mocked)", () => {
     });
     expect(mockCompleteFillForReview).toHaveBeenCalledWith(expect.anything(), "application-task-1", "user-1", "job-1");
     expect(mockInsertApplyResult).toHaveBeenCalledWith(expect.objectContaining({ status: "manual", error: expect.stringContaining("ready for user review") }));
+  });
+
+  it("marks suspended queued tasks failed without opening a browser", async () => {
+    mockIsUserActive.mockResolvedValue(false);
+    await import("./apply-queue.js");
+
+    await mockProcessor({
+      data: {
+        applicationTaskId: "application-task-1", operation: "submit", jobId: "job-1", userId: "user-1",
+        applyUrl: "https://example.com/jobs/123/apply", personaId: "persona-1", resumePath: "/resume.pdf", dryRun: false,
+      },
+    });
+
+    expect(mockWithCloakContext).not.toHaveBeenCalled();
   });
 });

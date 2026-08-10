@@ -3,6 +3,7 @@ export type SupportCategory = (typeof SUPPORT_CATEGORIES)[number]
 
 const SECRET_PATTERNS = [
   /(?:sk|pk)_[A-Za-z0-9_-]{16,}/g,
+  /\bBearer\s+[A-Za-z0-9._-]{12,}\b/gi,
   /(?:api[_ -]?key|access[_ -]?token|refresh[_ -]?token)\s*[:=]\s*[^\s]{8,}/gi,
   /-----BEGIN [A-Z ]+PRIVATE KEY-----[\s\S]*?-----END [A-Z ]+PRIVATE KEY-----/g,
   /\b(?:\d[ -]*?){13,19}\b/g,

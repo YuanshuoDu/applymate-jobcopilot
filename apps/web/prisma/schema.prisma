@@ -224,8 +224,11 @@ model PlanCatalogue {
   trialDays    Int             @default(0)
   active       Boolean         @default(true)
   sortOrder    Int             @default(0)
+  version      Int             @default(1)
   createdAt    DateTime        @default(now())
   updatedAt    DateTime        @updatedAt
+  fromTransitions PlanTransition[] @relation("FromPlan")
+  toTransitions   PlanTransition[] @relation("ToPlan")
 
   @@index([active, sortOrder])
   @@map("plan_catalogue")
@@ -744,6 +747,7 @@ enum AdminTargetType {
   ai_model
   ai_route
   queue
+  plan_change
   broadcast
   support_case
   admin_member
@@ -1411,6 +1415,23 @@ model GmailRecommendation {
   @@unique([userId, fingerprint])
   @@index([userId, status, createdAt(sort: Desc)])
   @@map("gmail_recommendations")
+}
+
+model PlanTransition {
+  id        String   @id @default(cuid())
+  fromPlan  Plan
+  toPlan    Plan
+  enabled   Boolean  @default(true)
+  note      String?
+  version   Int      @default(1)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  from PlanCatalogue @relation("FromPlan", fields: [fromPlan], references: [plan], onDelete: Restrict)
+  to   PlanCatalogue @relation("ToPlan", fields: [toPlan], references: [plan], onDelete: Restrict)
+
+  @@unique([fromPlan, toPlan])
+  @@map("plan_transitions")
 }
 
 // ─────────────────────────────────────────────
