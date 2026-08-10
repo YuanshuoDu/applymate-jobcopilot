@@ -10,4 +10,10 @@ describe('admin shell account controls', () => {
     expect(source).toContain("signOut({ callbackUrl: '/login?callbackUrl=%2Fadmin' })")
     expect(source).toContain('aria-label="Sign out"')
   })
+
+  it('does not prefetch admin routes from the persistent shell', () => {
+    expect(source).toContain('<Link prefetch={false} href="/admin"')
+    expect(source).toContain('<Link prefetch={false} key={item.href}')
+    expect(source).toContain('<Link prefetch={false} key={item.id}')
+  })
 })
