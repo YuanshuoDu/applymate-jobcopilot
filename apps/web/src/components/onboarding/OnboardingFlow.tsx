@@ -85,7 +85,7 @@ function StepLayout({ step, title, desc, children, onBack, onContinue, onSkip, c
         <div className="onboarding-content">{children}</div>
         <footer className="onboarding-footer">
           {onBack ? <Btn variant="ghost" onClick={onBack}>Back</Btn> : <span />}
-          <div>{onSkip && <button className="onboarding-skip" onClick={onSkip}>Skip for now</button>}<Btn variant="primary" onClick={onContinue} disabled={disableContinue}>{continueLabel ?? 'Continue'}</Btn></div>
+          <div className="onboarding-footer-actions">{onSkip && <button className="onboarding-skip" onClick={onSkip}>Skip for now</button>}<Btn variant="primary" onClick={onContinue} disabled={disableContinue}>{continueLabel ?? 'Continue'}</Btn></div>
         </footer>
       </section>
 

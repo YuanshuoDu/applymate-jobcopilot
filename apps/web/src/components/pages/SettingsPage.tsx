@@ -66,9 +66,9 @@ function SettingsSection({ title, children }: { title: string; children: React.R
 
 function FieldRow({ label, children }: { label: string; children: React.ReactNode }) {
   return (
-    <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'flex-start', gap: 12, padding: '8px 0', borderBottom: '1px solid var(--border)', flexWrap: 'wrap' }}>
+    <div className="settings-field-row" style={{ display: 'flex', alignItems: 'center', justifyContent: 'flex-start', gap: 12, padding: '8px 0', borderBottom: '1px solid var(--border)', flexWrap: 'wrap' }}>
       <span style={{ fontSize: 12, color: 'var(--text-muted)', flexShrink: 0, minWidth: 130 }}>{label}</span>
-      <div style={{ display: 'flex', justifyContent: 'flex-start', flex: 1, minWidth: 0 }}>{children}</div>
+      <div className="settings-field-control" style={{ display: 'flex', justifyContent: 'flex-start', flex: 1, minWidth: 0 }}>{children}</div>
     </div>
   )
 }
@@ -539,7 +539,7 @@ export function SettingsPage() {
           {/* ── Profile ── */}
           {activeTab === 'profile' && (
             <>
-              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(min(100%, 420px), 1fr))', gap: 16, alignItems: 'start' }}>
+              <div className="settings-profile-grid" style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(min(100%, 420px), 1fr))', gap: 16, alignItems: 'start' }}>
                 <SettingsSection title={t('settings.personalInfo')}>
                   {userLoading ? (
                     <div style={{ fontSize: 12, color: 'var(--text-muted)', padding: '12px 0' }}>Loading...</div>
