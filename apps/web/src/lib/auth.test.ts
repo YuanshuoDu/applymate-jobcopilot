@@ -37,11 +37,21 @@ vi.mock('@/lib/credential-authorizer', () => ({ authorizeCredentials: vi.fn() })
 import './auth'
 
 type JwtCallback = (input: { token: Record<string, unknown>; user?: undefined }) => Promise<Record<string, unknown>>
+type SessionCallback = (input: {
+  session: { user?: Record<string, unknown> }
+  token: Record<string, unknown>
+}) => Promise<{ user?: Record<string, unknown> }>
 
 function jwtCallback(): JwtCallback {
   const config = mocks.nextAuth.mock.calls[0]?.[0] as { callbacks: { jwt: JwtCallback } } | undefined
   if (!config) throw new Error('Expected NextAuth configuration')
   return config.callbacks.jwt
+}
+
+function sessionCallback(): SessionCallback {
+  const config = mocks.nextAuth.mock.calls[0]?.[0] as { callbacks: { session: SessionCallback } } | undefined
+  if (!config) throw new Error('Expected NextAuth configuration')
+  return config.callbacks.session
 }
 
 describe('Auth.js JWT callback', () => {
@@ -60,5 +70,16 @@ describe('Auth.js JWT callback', () => {
     mocks.findUnique.mockResolvedValue({ accountStatus: 'suspended', authVersion: 1, plan: 'pro' })
 
     await expect(jwtCallback()({ token: { sub: 'legacy_user' } })).resolves.toEqual({})
+  })
+
+  it('exposes a legacy Auth.js subject and revision in the web session', async () => {
+    const session = { user: { email: 'candidate@example.com' } }
+
+    await expect(sessionCallback()({
+      session,
+      token: { sub: 'legacy_user', authVersion: 1, plan: 'pro' },
+    })).resolves.toMatchObject({
+      user: { id: 'legacy_user', authVersion: 1, plan: 'pro' },
+    })
   })
 })

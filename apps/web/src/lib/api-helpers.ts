@@ -45,7 +45,12 @@ export async function requireAuth(
 
   // NextAuth session (web app)
   const session = await safeAuth()
-  if (session?.user?.id) return activeAccountOrDenied(session.user.id)
+  if (session?.user?.id) {
+    return activeAccountOrDenied(
+      session.user.id,
+      authVersionFromClaim(session.user.authVersion),
+    )
+  }
 
   return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
 }
