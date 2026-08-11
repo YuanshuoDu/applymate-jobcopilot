@@ -1,5 +1,22 @@
+const TEMPORARY_SIGN_IN_MESSAGE = 'Sign-in is temporarily unavailable. Please try again.'
+
+const URL_SIGN_IN_ERROR_MESSAGES: Record<string, string> = {
+  CredentialsSignin: 'Invalid email or password.',
+  OAuthAccountNotLinked: 'This email is already registered with another sign-in method. Please use the original method.',
+  OAuthCallbackError: 'Google sign-in failed. Please try again.',
+  AccessDenied: 'Sign-in was denied.',
+  Verification: 'This verification link has expired.',
+  OAuthIdentityMismatch: 'The Google account does not match the existing login record. Please choose the correct account or contact support.',
+  not_admin: 'This account is not an administrator. Administrator access is invitation-only.',
+  admin_registration_disabled: 'Administrator accounts are created by invitation only.',
+}
+
 export function credentialsSignInMessage(error: string | undefined): string {
   return error === 'CredentialsSignin'
     ? 'Invalid email or password.'
-    : 'Sign-in is temporarily unavailable. Please try again.'
+    : TEMPORARY_SIGN_IN_MESSAGE
+}
+
+export function signInUrlErrorMessage(error: string): string {
+  return URL_SIGN_IN_ERROR_MESSAGES[error] ?? TEMPORARY_SIGN_IN_MESSAGE
 }

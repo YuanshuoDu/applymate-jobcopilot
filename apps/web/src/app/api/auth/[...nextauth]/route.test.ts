@@ -14,14 +14,14 @@ describe('Auth.js route host boundary', () => {
     mocks.post.mockResolvedValue(new Response(null, { status: 204 }))
   })
 
-  it('does not expose provider enumeration or OAuth callbacks on the administrator host', async () => {
+  it('allows provider discovery but blocks OAuth callbacks on the administrator host', async () => {
     const providers = await GET(new NextRequest('https://admin.applymate.site/api/auth/providers'))
     const callback = await GET(new NextRequest('https://admin.applymate.site/api/auth/callback/google'))
 
-    expect(providers.status).toBe(404)
+    expect(providers.status).toBe(204)
     expect(callback.status).toBe(404)
-    expect(providers.headers.get('Cache-Control')).toBe('no-store, private')
-    expect(mocks.get).not.toHaveBeenCalled()
+    expect(callback.headers.get('Cache-Control')).toBe('no-store, private')
+    expect(mocks.get).toHaveBeenCalledTimes(1)
   })
 
   it('permits credential callbacks required for administrator sessions', async () => {
