@@ -72,7 +72,7 @@ describe('reset password API', () => {
     })
     expect(mocks.userUpdate).toHaveBeenCalledWith({
       where: { id: 'user_1' },
-      data: { password: 'new-password-hash' },
+      data: { password: 'new-password-hash', authVersion: { increment: 1 } },
     })
   })
 

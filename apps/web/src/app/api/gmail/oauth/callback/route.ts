@@ -82,7 +82,7 @@ export async function GET(req: NextRequest) {
 
   const user = await db.user.findUnique({ where: { id: userId }, select: { accountStatus: true } })
   if (!user) return back('user_not_found')
-  if (user.accountStatus === 'suspended') return back('account_suspended')
+  if (user.accountStatus !== 'active') return back('account_suspended')
 
   // Exchange code for tokens
   const redirectUri = configuredRedirectUri(req.url, '/api/gmail/oauth/callback')

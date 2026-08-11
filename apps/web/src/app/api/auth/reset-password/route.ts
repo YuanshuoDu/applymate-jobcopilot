@@ -56,7 +56,7 @@ export async function POST(req: NextRequest) {
 
       await tx.user.update({
         where: { id: userId },
-        data: { password },
+        data: { password, authVersion: { increment: 1 } },
       })
       return 'updated'
     })

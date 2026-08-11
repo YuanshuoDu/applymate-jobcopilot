@@ -41,8 +41,8 @@ export async function PATCH(request: NextRequest, { params }: Params) {
       const user = await tx.user.update({
         where: { id },
         data: status === UserAccountStatus.suspended
-          ? { accountStatus: status, suspendedAt: new Date(), suspendedById: actor.userId, suspensionReason: reason }
-          : { accountStatus: status, suspendedAt: null, suspendedById: null, suspensionReason: null },
+          ? { accountStatus: status, suspendedAt: new Date(), suspendedById: actor.userId, suspensionReason: reason, authVersion: { increment: 1 } }
+          : { accountStatus: status, suspendedAt: null, suspendedById: null, suspensionReason: null, authVersion: { increment: 1 } },
         select: adminUserMetadataSelect,
       })
       // Invalidate privileged sessions immediately. Background workers also

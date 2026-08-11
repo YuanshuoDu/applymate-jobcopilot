@@ -31,7 +31,7 @@ export async function POST(req: NextRequest) {
   }
 
   const user = await db.user.findUnique({ where: { email } })
-  if (!user?.password || user.accountStatus === 'suspended') {
+  if (!user?.password || user.accountStatus !== 'active') {
     return NextResponse.json({ error: 'Invalid credentials' }, { status: 401 })
   }
 
@@ -48,7 +48,7 @@ export async function POST(req: NextRequest) {
     email: user.email,
     name:  user.name ?? '',
     plan:  user.plan,
-    updatedAt: user.updatedAt.toISOString(),
+    authVersion: user.authVersion,
   })
     .setProtectedHeader({ alg: 'HS256' })
     .setIssuer(EXTENSION_TOKEN_ISSUER)

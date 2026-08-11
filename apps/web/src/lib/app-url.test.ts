@@ -5,8 +5,9 @@ describe('configured app URLs', () => {
   afterEach(() => vi.unstubAllEnvs())
 
   it('uses the configured public origin instead of a proxy or preview request host', () => {
-    vi.stubEnv('AUTH_URL', 'https://applymate.site/some-path')
+    vi.stubEnv('AUTH_URL', 'https://legacy.example')
     vi.stubEnv('NEXTAUTH_URL', 'https://old.example')
+    vi.stubEnv('AUTH_CANONICAL_URL', 'https://applymate.site/some-path')
     expect(configuredAppOrigin('https://preview.vercel.app/api/callback')).toBe('https://applymate.site')
     expect(configuredRedirectUri('https://preview.vercel.app/api/callback', '/api/gmail/oauth/callback')).toBe(
       'https://applymate.site/api/gmail/oauth/callback',
@@ -20,14 +21,12 @@ describe('configured app URLs', () => {
   })
 
   it('ignores malformed configured URLs rather than throwing from an OAuth route', () => {
-    vi.stubEnv('AUTH_URL', 'not a URL')
+    vi.stubEnv('APP_URL', 'not a URL')
     expect(configuredAppOrigin('http://localhost:3000/api/callback')).toBe('http://localhost:3000')
   })
 
   it('uses the canonical production origin when deployment URL configuration is missing', () => {
     vi.stubEnv('NODE_ENV', 'production')
-    vi.stubEnv('AUTH_URL', 'not a URL')
-    vi.stubEnv('NEXTAUTH_URL', '')
     vi.stubEnv('APP_URL', '')
     vi.stubEnv('AUTH_CANONICAL_URL', '')
     expect(configuredAppOrigin('https://attacker.example/api/callback')).toBe('https://applymate.site')

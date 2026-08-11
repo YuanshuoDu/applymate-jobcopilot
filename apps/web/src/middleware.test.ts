@@ -77,6 +77,15 @@ describe('web middleware entrypoint', () => {
     expect(response.headers.get('location')).toBe('https://admin.applymate.site/admin/plans?tab=limits')
   })
 
+  it('keeps administrator invitations on the administrator origin', async () => {
+    const page = await middleware(new NextRequest('https://applymate.site/invite/admin?token=invite-token'))
+    const api = await middleware(new NextRequest('https://applymate.site/api/admin/invitations/accept'))
+
+    expect(page.status).toBe(307)
+    expect(page.headers.get('location')).toBe('https://admin.applymate.site/invite/admin?token=invite-token')
+    expect(api.status).toBe(404)
+  })
+
   it('does not expose admin APIs on the ordinary production host', async () => {
     const response = await middleware(new NextRequest('https://applymate.site/api/admin/v1/users'))
 

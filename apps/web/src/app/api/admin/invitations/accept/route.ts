@@ -3,8 +3,12 @@ import { NextRequest, NextResponse } from 'next/server'
 import { safeAuth } from '@/lib/safe-auth'
 import { writeAdminAudit } from '@/lib/admin/audit'
 import { db } from '@/lib/db'
+import { isAdminHost, isLocalHost } from '@/lib/host-routing'
 
 export async function POST(request: NextRequest) {
+  if (!isAdminHost(request.nextUrl.hostname) && !isLocalHost(request.nextUrl.hostname)) {
+    return NextResponse.json({ error: 'Administrator API is only available on the administrator host' }, { status: 404, headers: { 'Cache-Control': 'no-store' } })
+  }
   const session = await safeAuth()
   const userId = session?.user?.id
   const email = session?.user?.email?.trim().toLowerCase()

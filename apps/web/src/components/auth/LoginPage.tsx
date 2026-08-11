@@ -15,6 +15,7 @@ const C = {
   subtle:     '#94A3B8',
   border:     'rgba(79,70,229,0.12)',
   red:        '#DC2626',
+  success:    '#15803D',
 }
 
 const FEATURES = [
@@ -128,6 +129,7 @@ export function LoginPage({ switchAccount = false, adminLogin = false }: { switc
   const searchParams = useSearchParams()
   const callbackUrl  = safeCallbackUrl(searchParams.get('callbackUrl'))
   const urlError     = searchParams.get('error')
+  const passwordChanged = searchParams.get('passwordChanged') === '1'
 
   const [email,    setEmail]    = useState('')
   const [password, setPassword] = useState('')
@@ -138,7 +140,10 @@ export function LoginPage({ switchAccount = false, adminLogin = false }: { switc
 
   type Providers = Awaited<ReturnType<typeof getProviders>>
   const [oauthProviders, setOauthProviders] = useState<Providers>(null)
-  useEffect(() => { getProviders().then(setOauthProviders) }, [])
+  useEffect(() => {
+    if (adminLogin) return
+    getProviders().then(setOauthProviders)
+  }, [adminLogin])
   const providersLoaded = oauthProviders !== null
   const googleAvailable = Boolean(oauthProviders?.google)
 
@@ -299,6 +304,16 @@ export function LoginPage({ switchAccount = false, adminLogin = false }: { switc
             )}
           </div>
 
+          {passwordChanged && (
+            <div style={{
+              padding: '10px 14px', background: 'rgba(21,128,61,0.08)',
+              border: '1px solid rgba(21,128,61,0.22)', borderRadius: 10, marginBottom: 20,
+              fontSize: 12, color: C.success,
+            }}>
+              Your password was updated. Please sign in again.
+            </div>
+          )}
+
           {/* Error */}
           {error && (
             <div style={{
@@ -312,7 +327,7 @@ export function LoginPage({ switchAccount = false, adminLogin = false }: { switc
           )}
 
           {/* OAuth */}
-          {providersLoaded ? (
+          {!adminLogin && (providersLoaded ? (
             <>
               <div style={{ display:'flex', flexDirection:'column', gap:10, marginBottom:22 }}>
                 <OAuthBtn
@@ -334,7 +349,7 @@ export function LoginPage({ switchAccount = false, adminLogin = false }: { switc
               <div style={{ height:46, borderRadius:10, marginBottom:10, background:'rgba(79,70,229,0.06)' }} />
               <div style={{ height:46, borderRadius:10, background:'rgba(79,70,229,0.04)' }} />
             </div>
-          )}
+          ))}
 
           {/* Credentials form */}
           <form onSubmit={handleCredentials} style={{ display:'flex', flexDirection:'column', gap:15 }}>

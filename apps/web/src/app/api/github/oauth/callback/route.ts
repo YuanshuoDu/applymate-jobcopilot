@@ -67,8 +67,9 @@ export async function GET(req: NextRequest) {
   if (!profileResponse?.ok || (typeof profile?.id !== 'number' && typeof profile?.id !== 'string')) return back('profile_fetch_failed')
   const providerAccountId = String(profile.id)
 
-  const owner = await db.user.findUnique({ where: { id: userId }, select: { id: true } })
+  const owner = await db.user.findUnique({ where: { id: userId }, select: { id: true, accountStatus: true } })
   if (!owner) return back('user_not_found')
+  if (owner.accountStatus !== 'active') return back('account_suspended')
   const existing = await db.account.findUnique({
     where: { provider_providerAccountId: { provider: 'github', providerAccountId } },
     select: { userId: true },

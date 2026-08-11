@@ -27,6 +27,12 @@ export async function POST(req: NextRequest) {
   }
 
   if (!subject && !emailBody) return err('subject or emailBody is required')
+  const requestedJobId = typeof jobId === 'string' && jobId.trim() ? jobId : null
+  if (jobId !== undefined && !requestedJobId) return err('jobId must be a non-empty string')
+  if (requestedJobId) {
+    const job = await db.job.findFirst({ where: { id: requestedJobId, userId: prep.userId }, select: { id: true } })
+    if (!job) return err('Job not found', 404)
+  }
 
   const contextHints: Record<string, string> = {
     interview_invitation: 'The sender has invited me to an interview or wants to schedule a call. I want to confirm availability and express enthusiasm.',
@@ -62,11 +68,11 @@ Write the reply now:`
     const reply  = result.text.trim()
 
     // Log this reply action so Auditor won't draft a duplicate follow-up
-    if (jobId) {
+    if (requestedJobId) {
       await db.activity.create({
         data: {
           userId: prep.userId,
-          jobId,
+          jobId: requestedJobId,
           type:   'agent_action',
           text:   `[Gmail] 已为 ${tag} 邮件起草回复（发送至 ${senderEmail}）`,
           color:  '#7C3AED',

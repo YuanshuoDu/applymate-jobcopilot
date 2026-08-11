@@ -13,5 +13,8 @@ export default function AdminInvitationPage() {
     if (status !== 'authenticated') { setMessage('Sign in with the invited email to accept this invitation.'); return }
     void fetch('/api/admin/invitations/accept', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ token }) }).then(async response => { const payload = await response.json().catch(() => null) as { error?: string } | null; setMessage(response.ok ? 'Invitation accepted. You can now open the administrator console.' : payload?.error ?? 'Invitation could not be accepted.') }).catch(() => setMessage('Invitation could not be accepted.'))
   }, [status])
-  return <main style={{ maxWidth: 520, margin: '15vh auto', padding: 24, fontFamily: 'system-ui' }}><h1>ApplyMate administrator invitation</h1><p>{message}</p>{status !== 'authenticated' && <Link href={`/login?callbackUrl=${encodeURIComponent(typeof window === 'undefined' ? '/invite/admin' : window.location.href)}`}>Sign in</Link>}{status === 'authenticated' && <Link href="/admin">Open admin console</Link>}</main>
+  const callbackUrl = typeof window === 'undefined'
+    ? '/invite/admin'
+    : `${window.location.pathname}${window.location.search}`
+  return <main style={{ maxWidth: 520, margin: '15vh auto', padding: 24, fontFamily: 'system-ui' }}><h1>ApplyMate administrator invitation</h1><p>{message}</p>{status !== 'authenticated' && <Link href={`/login?callbackUrl=${encodeURIComponent(callbackUrl)}`}>Sign in</Link>}{status === 'authenticated' && <Link href="/admin">Open admin console</Link>}</main>
 }
