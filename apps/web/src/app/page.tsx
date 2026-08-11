@@ -9,7 +9,9 @@ export const dynamic = 'force-dynamic'
 export default async function Home() {
   const session = await safeAuth()
 
-  if (!session?.user) {
+  // Auth.js's server helper may represent a rejected legacy JWT as an empty
+  // user object. Only an issued application user id is an authenticated shell.
+  if (!session?.user?.id?.trim()) {
     return <LandingPage plans={await getPublicPlans()} />
   }
 

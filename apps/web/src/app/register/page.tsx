@@ -10,6 +10,6 @@ export default async function Page({
 }) {
   const { callbackUrl } = await searchParams
   const session = await safeAuth()
-  if (session?.user) redirect('/')
+  if (session?.user?.id?.trim()) redirect('/')
   return <RegisterPage callbackUrl={safeCallbackUrl(callbackUrl)} />
 }

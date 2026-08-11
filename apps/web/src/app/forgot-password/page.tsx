@@ -4,6 +4,6 @@ import { ForgotPasswordPage } from '@/components/auth/ForgotPasswordPage'
 
 export default async function Page() {
   const session = await safeAuth()
-  if (session?.user) redirect('/')
+  if (session?.user?.id?.trim()) redirect('/')
   return <ForgotPasswordPage />
 }
