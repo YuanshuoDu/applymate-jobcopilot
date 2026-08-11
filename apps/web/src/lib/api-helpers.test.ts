@@ -58,6 +58,46 @@ describe('requireAuth', () => {
     await expect(requireAuth()).resolves.toEqual({ userId: 'web-user' })
   })
 
+  it('recovers an initial-version legacy web session from its signed email', async () => {
+    mocks.headers.mockResolvedValue(new Headers())
+    mocks.safeAuth.mockResolvedValue({ user: { email: 'candidate@example.com' } })
+    mocks.userFindUnique.mockResolvedValue({ id: 'legacy-user', accountStatus: 'active', authVersion: 1, updatedAt })
+    const { requireAuth } = await import('./api-helpers')
+
+    await expect(requireAuth()).resolves.toEqual({ userId: 'legacy-user' })
+    expect(mocks.userFindUnique).toHaveBeenCalledWith({
+      where: { email: 'candidate@example.com' },
+      select: { id: true, accountStatus: true, authVersion: true },
+    })
+  })
+
+  it('does not recover an email-only session after its auth version changes', async () => {
+    mocks.headers.mockResolvedValue(new Headers())
+    mocks.safeAuth.mockResolvedValue({ user: { email: 'candidate@example.com' } })
+    mocks.userFindUnique.mockResolvedValue({ id: 'legacy-user', accountStatus: 'active', authVersion: 2, updatedAt })
+    const { requireAuth } = await import('./api-helpers')
+
+    const result = await requireAuth()
+
+    expect(result).toBeInstanceOf(Response)
+    expect((result as Response).status).toBe(401)
+  })
+
+  it.each([
+    [null, 401],
+    [{ id: 'legacy-user', accountStatus: 'suspended', authVersion: 1, updatedAt }, 403],
+  ])('fails closed for an email-only session when the account is unsafe: %o', async (user, status) => {
+    mocks.headers.mockResolvedValue(new Headers())
+    mocks.safeAuth.mockResolvedValue({ user: { email: 'candidate@example.com' } })
+    mocks.userFindUnique.mockResolvedValue(user)
+    const { requireAuth } = await import('./api-helpers')
+
+    const result = await requireAuth()
+
+    expect(result).toBeInstanceOf(Response)
+    expect((result as Response).status).toBe(status)
+  })
+
   it('rejects a web session after a security-sensitive auth version change', async () => {
     mocks.headers.mockResolvedValue(new Headers())
     mocks.safeAuth.mockResolvedValue({ user: { id: 'web-user', authVersion: 1 } })

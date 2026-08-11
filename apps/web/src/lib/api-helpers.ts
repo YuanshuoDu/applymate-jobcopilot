@@ -10,6 +10,7 @@ import { resolvePlatformRoute } from '@/lib/admin/ai-config'
 import { activateTenantContext } from '@/lib/db/tenant-store'
 import { isFeatureAllowed, resolveAiAccess } from '@/lib/entitlements'
 import { authVersionFromClaim, isCurrentAuthVersion } from '@/lib/auth-version'
+import { normalizeEmail } from '@/lib/auth-identifiers'
 
 const JWT_SECRET = getAuthJwtSecret()
 
@@ -45,10 +46,24 @@ export async function requireAuth(
 
   // NextAuth session (web app)
   const session = await safeAuth()
-  if (session?.user?.id) {
+  const sessionUser = session?.user
+  if (sessionUser?.id) {
     return activeAccountOrDenied(
-      session.user.id,
-      authVersionFromClaim(session.user.authVersion),
+      sessionUser.id,
+      authVersionFromClaim(sessionUser.authVersion),
+    )
+  }
+  // A small number of pre-Auth.js-v5 browser sessions retain signed profile
+  // attributes but neither an application `id` nor a standard `sub` claim.
+  // Recover only through the unique normalized account email, then apply the
+  // same status and revision check used by all other session identities.
+  const sessionEmail = typeof sessionUser?.email === 'string'
+    ? normalizeEmail(sessionUser.email)
+    : ''
+  if (sessionEmail) {
+    return activeAccountEmailOrDenied(
+      sessionEmail,
+      authVersionFromClaim(sessionUser?.authVersion),
     )
   }
 
@@ -57,6 +72,23 @@ export async function requireAuth(
 
 async function activeAccountOrDenied(userId: string, expectedAuthVersion?: number) {
   const user = await db.user.findUnique({ where: { id: userId }, select: { accountStatus: true, authVersion: true } })
+  return activeAccountResult(userId, user, expectedAuthVersion)
+}
+
+async function activeAccountEmailOrDenied(email: string, expectedAuthVersion: number) {
+  const user = await db.user.findUnique({
+    where: { email },
+    select: { id: true, accountStatus: true, authVersion: true },
+  })
+  if (!user) return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
+  return activeAccountResult(user.id, user, expectedAuthVersion)
+}
+
+function activeAccountResult(
+  userId: string,
+  user: { accountStatus: string; authVersion: number } | null,
+  expectedAuthVersion?: number,
+) {
   if (!user) return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
   if (user.accountStatus !== 'active') return NextResponse.json({ error: 'Account suspended' }, { status: 403 })
   if (expectedAuthVersion !== undefined && !isCurrentAuthVersion(expectedAuthVersion, user.authVersion)) return NextResponse.json({ error: 'Session expired' }, { status: 401 })
