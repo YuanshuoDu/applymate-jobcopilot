@@ -6,6 +6,7 @@ export const ADMIN_HOST = configuredAdminHost || DEFAULT_ADMIN_HOST
 const LOCAL_HOSTS = new Set(['localhost', '127.0.0.1', '[::1]'])
 const ADMIN_AUTH_API_PATHS = new Set([
   '/api/auth/csrf',
+  '/api/auth/providers',
   '/api/auth/session',
   '/api/auth/signin/credentials',
   '/api/auth/callback/credentials',

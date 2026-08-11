@@ -16,7 +16,7 @@ describe('host routing', () => {
     expect(isAuthPath('/login')).toBe(true)
     expect(isAuthPath('/api/auth/session')).toBe(true)
     expect(isAdminAuthApiPath('/api/auth/callback/credentials')).toBe(true)
-    expect(isAdminAuthApiPath('/api/auth/providers')).toBe(false)
+    expect(isAdminAuthApiPath('/api/auth/providers')).toBe(true)
     expect(isAdminAuthApiPath('/api/auth/callback/google')).toBe(false)
     expect(isAuthPath('/register')).toBe(false)
     expect(isAdminApiPath('/api/admin/v1/users')).toBe(true)

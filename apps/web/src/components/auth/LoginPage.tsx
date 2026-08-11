@@ -5,7 +5,7 @@ import { signIn, signOut, getProviders } from 'next-auth/react'
 import { useRouter, useSearchParams } from 'next/navigation'
 import Link from 'next/link'
 import { authLink, safeCallbackUrl } from '@/lib/auth-callback'
-import { credentialsSignInMessage } from '@/lib/auth-errors'
+import { credentialsSignInMessage, signInUrlErrorMessage } from '@/lib/auth-errors'
 
 // ── Design tokens ─────────────────────────────────────────────────────────────
 const C = {
@@ -109,19 +109,6 @@ function OAuthBtn({ icon, label, onClick, loading, dark }: {
   )
 }
 
-function mapOAuthError(err: string): string {
-  const MAP: Record<string, string> = {
-    OAuthAccountNotLinked: 'This email is already registered with another sign-in method. Please use the original method.',
-    OAuthCallbackError:    'Google sign-in failed. Please try again.',
-    AccessDenied:          'Sign-in was denied.',
-    Verification:          'This verification link has expired.',
-    OAuthIdentityMismatch: 'The Google account does not match the existing login record. Please choose the correct account or contact support.',
-    not_admin:              'This account is not an administrator. Administrator access is invitation-only.',
-    admin_registration_disabled: 'Administrator accounts are created by invitation only.',
-  }
-  return MAP[err] ?? `Sign-in error: ${err}`
-}
-
 export { safeCallbackUrl } from '@/lib/auth-callback'
 
 export function LoginPage({ switchAccount = false, adminLogin = false }: { switchAccount?: boolean; adminLogin?: boolean }) {
@@ -134,7 +121,7 @@ export function LoginPage({ switchAccount = false, adminLogin = false }: { switc
   const [email,    setEmail]    = useState('')
   const [password, setPassword] = useState('')
   const [passwordVisible, setPasswordVisible] = useState(false)
-  const [error,    setError]    = useState(urlError ? mapOAuthError(urlError) : '')
+  const [error,    setError]    = useState(urlError ? signInUrlErrorMessage(urlError) : '')
   const [loading,  setLoading]  = useState<string | null>(null)
   const [focused,  setFocused]  = useState<string | null>(null)
 
