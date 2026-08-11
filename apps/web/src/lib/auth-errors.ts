@@ -12,7 +12,10 @@ const URL_SIGN_IN_ERROR_MESSAGES: Record<string, string> = {
 }
 
 export function credentialsSignInMessage(error: string | undefined): string {
-  return error === 'CredentialsSignin'
+  // Auth.js beta can omit `error` from a failed credentials result even though
+  // the callback correctly records CredentialsSignin. Treat that missing value
+  // as the same generic credential denial instead of a service outage.
+  return error === undefined || error === 'CredentialsSignin'
     ? 'Invalid email or password.'
     : TEMPORARY_SIGN_IN_MESSAGE
 }
