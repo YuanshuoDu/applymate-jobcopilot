@@ -49,8 +49,8 @@ providers.push(Credentials({
     if (!credentials?.email || !credentials?.password) return null
     const email = normalizeEmail(credentials.email as string)
     if (!email) return null
-    const user = await db.user.findUnique({
-      where: { email },
+    const user = await db.user.findFirst({
+      where: { email: { equals: email, mode: 'insensitive' } },
     })
     if (!user?.password || user.accountStatus === 'suspended') return null
     const valid = await bcrypt.compare(credentials.password as string, user.password)

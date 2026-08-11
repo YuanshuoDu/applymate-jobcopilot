@@ -5,6 +5,7 @@ import { signIn, signOut, getProviders } from 'next-auth/react'
 import { useRouter, useSearchParams } from 'next/navigation'
 import Link from 'next/link'
 import { authLink, safeCallbackUrl } from '@/lib/auth-callback'
+import { credentialsSignInMessage } from '@/lib/auth-errors'
 
 // ── Design tokens ─────────────────────────────────────────────────────────────
 const C = {
@@ -140,7 +141,7 @@ export function LoginPage({ switchAccount = false, adminLogin = false }: { switc
     if (switchAccount) await signOut({ redirect: false })
     const result = await signIn('credentials', { email, password, redirect: false })
     setLoading(null)
-    if (result?.error) { setError('Invalid email or password.') }
+    if (!result?.ok || result.error) { setError(credentialsSignInMessage(result?.error)) }
     else { router.push(callbackUrl); router.refresh() }
   }
 
