@@ -47,6 +47,14 @@ function Spinner() {
   )
 }
 
+function EyeIcon({ visible }: { visible: boolean }) {
+  return (
+    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+      {visible ? <><path d="M2.5 12s3.5-6 9.5-6 9.5 6 9.5 6-3.5 6-9.5 6-9.5-6-9.5-6Z" /><circle cx="12" cy="12" r="2.5" /></> : <><path d="m3 3 18 18" /><path d="M10.6 6.2A10.7 10.7 0 0 1 12 6c6 0 9.5 6 9.5 6a17.4 17.4 0 0 1-3 3.7M6.2 6.3C3.8 8 2.5 12 2.5 12a17.4 17.4 0 0 0 3.7 4.2A10.7 10.7 0 0 0 12 18c.8 0 1.6-.1 2.3-.3" /></>}
+    </svg>
+  )
+}
+
 function GoogleIcon() {
   return (
     <svg width="17" height="17" viewBox="0 0 24 24">
@@ -123,6 +131,7 @@ export function LoginPage({ switchAccount = false, adminLogin = false }: { switc
 
   const [email,    setEmail]    = useState('')
   const [password, setPassword] = useState('')
+  const [passwordVisible, setPasswordVisible] = useState(false)
   const [error,    setError]    = useState(urlError ? mapOAuthError(urlError) : '')
   const [loading,  setLoading]  = useState<string | null>(null)
   const [focused,  setFocused]  = useState<string | null>(null)
@@ -132,6 +141,22 @@ export function LoginPage({ switchAccount = false, adminLogin = false }: { switc
   useEffect(() => { getProviders().then(setOauthProviders) }, [])
   const providersLoaded = oauthProviders !== null
   const googleAvailable = Boolean(oauthProviders?.google)
+
+  function releasePasswordVisibility() {
+    setPasswordVisible(false)
+  }
+
+  function handlePasswordPointerDown(event: React.PointerEvent<HTMLButtonElement>) {
+    event.preventDefault()
+    setPasswordVisible(true)
+  }
+
+  function handlePasswordKeyDown(event: React.KeyboardEvent<HTMLButtonElement>) {
+    if (event.key === ' ' || event.key === 'Enter') {
+      event.preventDefault()
+      setPasswordVisible(true)
+    }
+  }
 
   async function handleCredentials(e: React.FormEvent) {
     e.preventDefault()
@@ -336,19 +361,42 @@ export function LoginPage({ switchAccount = false, adminLogin = false }: { switc
                 <label htmlFor="login-password" style={{ fontSize:12, fontWeight:500, color:C.muted }}>Password</label>
                 <Link href="/forgot-password" style={{ fontSize:11, color:C.primary, textDecoration:'none', fontWeight:500 }}>Forgot password?</Link>
               </div>
-              <input
-                id="login-password" name="password" type="password" value={password} autoComplete="current-password" placeholder="••••••••"
-                onFocus={() => setFocused('password')} onBlur={() => setFocused(null)}
-                onChange={e => setPassword(e.target.value)}
-                style={{
-                  width:'100%', padding:'10px 13px',
-                  background: focused === 'password' ? 'rgba(255,255,255,0.95)' : 'rgba(255,255,255,0.65)',
-                  border: focused === 'password' ? '1.5px solid rgba(79,70,229,0.55)' : '1px solid rgba(79,70,229,0.18)',
-                  borderRadius:9, fontSize:13, color:C.text, outline:'none',
-                  boxShadow: focused === 'password' ? '0 0 0 3px rgba(79,70,229,0.12)' : '0 1px 2px rgba(0,0,0,0.04)',
-                  transition:'all 0.18s', backdropFilter:'blur(8px)',
-                }}
-              />
+              <div style={{ position: 'relative' }}>
+                <input
+                  id="login-password" name="password" type={passwordVisible ? 'text' : 'password'} value={password} autoComplete="current-password" placeholder="••••••••"
+                  onFocus={() => setFocused('password')} onBlur={() => setFocused(null)}
+                  onChange={e => setPassword(e.target.value)}
+                  style={{
+                    width:'100%', padding:'10px 40px 10px 13px', boxSizing:'border-box',
+                    background: focused === 'password' ? 'rgba(255,255,255,0.95)' : 'rgba(255,255,255,0.65)',
+                    border: focused === 'password' ? '1.5px solid rgba(79,70,229,0.55)' : '1px solid rgba(79,70,229,0.18)',
+                    borderRadius:9, fontSize:13, color:C.text, outline:'none',
+                    boxShadow: focused === 'password' ? '0 0 0 3px rgba(79,70,229,0.12)' : '0 1px 2px rgba(0,0,0,0.04)',
+                    transition:'all 0.18s', backdropFilter:'blur(8px)',
+                  }}
+                />
+                <button
+                  type="button"
+                  aria-label={passwordVisible ? 'Release to hide password' : 'Hold to show password'}
+                  title="Hold to show password"
+                  aria-pressed={passwordVisible}
+                  onPointerDown={handlePasswordPointerDown}
+                  onPointerUp={releasePasswordVisibility}
+                  onPointerCancel={releasePasswordVisibility}
+                  onPointerLeave={releasePasswordVisibility}
+                  onKeyDown={handlePasswordKeyDown}
+                  onKeyUp={releasePasswordVisibility}
+                  onBlur={releasePasswordVisibility}
+                  style={{
+                    position:'absolute', top:'50%', right:6, transform:'translateY(-50%)',
+                    width:30, height:30, padding:0, border:0, borderRadius:7,
+                    background:'transparent', color:C.muted, cursor:'pointer',
+                    display:'flex', alignItems:'center', justifyContent:'center',
+                  }}
+                >
+                  <EyeIcon visible={passwordVisible} />
+                </button>
+              </div>
             </div>
             {/* Submit */}
             <button

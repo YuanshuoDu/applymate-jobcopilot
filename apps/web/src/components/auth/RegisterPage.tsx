@@ -47,6 +47,14 @@ function Spinner() {
   )
 }
 
+function EyeIcon({ visible }: { visible: boolean }) {
+  return (
+    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+      {visible ? <><path d="M2.5 12s3.5-6 9.5-6 9.5 6 9.5 6-3.5 6-9.5 6-9.5-6-9.5-6Z" /><circle cx="12" cy="12" r="2.5" /></> : <><path d="m3 3 18 18" /><path d="M10.6 6.2A10.7 10.7 0 0 1 12 6c6 0 9.5 6 9.5 6a17.4 17.4 0 0 1-3 3.7M6.2 6.3C3.8 8 2.5 12 2.5 12a17.4 17.4 0 0 0 3.7 4.2A10.7 10.7 0 0 0 12 18c.8 0 1.6-.1 2.3-.3" /></>}
+    </svg>
+  )
+}
+
 function GoogleIcon() {
   return (
     <svg width="17" height="17" viewBox="0 0 24 24">
@@ -89,7 +97,9 @@ export function RegisterPage({ callbackUrl: rawCallbackUrl = '/' }: { callbackUr
   const [name,     setName]     = useState('')
   const [email,    setEmail]    = useState('')
   const [password, setPassword] = useState('')
+  const [passwordVisible, setPasswordVisible] = useState(false)
   const [confirm,  setConfirm]  = useState('')
+  const [confirmVisible, setConfirmVisible] = useState(false)
   const [error,    setError]    = useState('')
   const [loading,  setLoading]  = useState<string | null>(null)
   const [focused,  setFocused]  = useState<string | null>(null)
@@ -361,23 +371,55 @@ export function RegisterPage({ callbackUrl: rawCallbackUrl = '/' }: { callbackUr
                 <label htmlFor="register-password" style={{ fontSize: 12, fontWeight: 500, color: C.muted }}>Password</label>
                 <span style={{ fontSize: 11, color: C.subtle }}>At least 8 characters</span>
               </div>
-              <input
-                id="register-password" name="password" type="password" value={password} autoComplete="new-password" placeholder="••••••••"
-                onFocus={() => setFocused('password')} onBlur={() => setFocused(null)}
-                onChange={e => setPassword(e.target.value)}
-                style={inputStyle('password')}
-              />
+              <div style={{ position: 'relative' }}>
+                <input
+                  id="register-password" name="password" type={passwordVisible ? 'text' : 'password'} value={password} autoComplete="new-password" placeholder="••••••••"
+                  onFocus={() => setFocused('password')} onBlur={() => setFocused(null)}
+                  onChange={e => setPassword(e.target.value)}
+                  style={{ ...inputStyle('password'), paddingRight: 40 }}
+                />
+                <button
+                  type="button"
+                  aria-label={passwordVisible ? 'Hide password' : 'Show password'}
+                  aria-pressed={passwordVisible}
+                  onClick={() => setPasswordVisible(value => !value)}
+                  style={{
+                    position:'absolute', top:'50%', right:6, transform:'translateY(-50%)',
+                    width:30, height:30, padding:0, border:0, borderRadius:7,
+                    background:'transparent', color:C.muted, cursor:'pointer',
+                    display:'flex', alignItems:'center', justifyContent:'center',
+                  }}
+                >
+                  <EyeIcon visible={passwordVisible} />
+                </button>
+              </div>
               {password && <PasswordStrength password={password} />}
             </div>
             {/* Confirm */}
             <div style={{ display: 'flex', flexDirection: 'column', gap: 7 }}>
               <label htmlFor="register-confirm" style={{ fontSize: 12, fontWeight: 500, color: C.muted }}>Confirm password</label>
-              <input
-                id="register-confirm" name="confirm" type="password" value={confirm} autoComplete="new-password" placeholder="Enter your password again"
-                onFocus={() => setFocused('confirm')} onBlur={() => setFocused(null)}
-                onChange={e => setConfirm(e.target.value)}
-                style={inputStyle('confirm')}
-              />
+              <div style={{ position: 'relative' }}>
+                <input
+                  id="register-confirm" name="confirm" type={confirmVisible ? 'text' : 'password'} value={confirm} autoComplete="new-password" placeholder="Enter your password again"
+                  onFocus={() => setFocused('confirm')} onBlur={() => setFocused(null)}
+                  onChange={e => setConfirm(e.target.value)}
+                  style={{ ...inputStyle('confirm'), paddingRight: 40 }}
+                />
+                <button
+                  type="button"
+                  aria-label={confirmVisible ? 'Hide confirmation password' : 'Show confirmation password'}
+                  aria-pressed={confirmVisible}
+                  onClick={() => setConfirmVisible(value => !value)}
+                  style={{
+                    position:'absolute', top:'50%', right:6, transform:'translateY(-50%)',
+                    width:30, height:30, padding:0, border:0, borderRadius:7,
+                    background:'transparent', color:C.muted, cursor:'pointer',
+                    display:'flex', alignItems:'center', justifyContent:'center',
+                  }}
+                >
+                  <EyeIcon visible={confirmVisible} />
+                </button>
+              </div>
             </div>
 
             {/* Terms */}
