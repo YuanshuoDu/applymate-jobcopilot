@@ -4,20 +4,17 @@ import { PrismaAdapter } from '@auth/prisma-adapter'
 import Google from 'next-auth/providers/google'
 import GitHub from 'next-auth/providers/github'
 import Credentials from 'next-auth/providers/credentials'
-import bcrypt from 'bcryptjs'
-import { jwtVerify } from 'jose'
 import { db } from '@/lib/db'
-import { normalizeEmail } from '@/lib/auth-identifiers'
 import { reconcileGoogleLoginIdentity } from '@/lib/google-identity'
-import { EXTENSION_TOKEN_AUDIENCE, EXTENSION_TOKEN_ISSUER, getAuthJwtSecret, getAuthSecret } from '@/lib/auth-secret'
+import { getAuthSecret } from '@/lib/auth-secret'
 import { canonicalAuthRedirect } from '@/lib/auth-url'
 import { encryptAccountTokenFields } from '@/lib/credential-secrets'
 import { isCurrentAuthVersion } from '@/lib/auth-version'
 import { assertNoAuthOriginOverride } from '@/lib/auth-runtime-config'
+import { authorizeCredentials } from '@/lib/credential-authorizer'
 
 assertNoAuthOriginOverride()
 const AUTH_SECRET = getAuthSecret()
-const JWT_SECRET = getAuthJwtSecret()
 
 // Build provider list dynamically — OAuth only enabled when keys are set
 const providers: Provider[] = []
@@ -30,37 +27,8 @@ providers.push(Credentials({
     password: { label: 'Password', type: 'password' },
     token:    { label: 'Token',    type: 'text' },     // Extension JWT sync
   },
-  async authorize(credentials) {
-    // ── Extension JWT auth (token sync) ──
-    if (credentials?.token && typeof credentials.token === 'string') {
-      try {
-        const { payload } = await jwtVerify(credentials.token, JWT_SECRET, {
-          issuer: EXTENSION_TOKEN_ISSUER,
-          audience: EXTENSION_TOKEN_AUDIENCE,
-        })
-        if (typeof payload.sub !== 'string' || !payload.sub) return null
-        const user = await db.user.findUnique({
-          where: { id: payload.sub as string },
-          select: { id: true, email: true, name: true, image: true, accountStatus: true, authVersion: true },
-        })
-        if (!user || user.accountStatus !== 'active' || !isCurrentAuthVersion(payload.authVersion, user.authVersion)) return null
-        return { id: user.id, email: user.email, name: user.name, image: user.image }
-      } catch {
-        return null
-      }
-    }
-
-    // ── Email+password auth ──
-    if (!credentials?.email || !credentials?.password) return null
-    const email = normalizeEmail(credentials.email as string)
-    if (!email) return null
-    const user = await db.user.findFirst({
-      where: { email: { equals: email, mode: 'insensitive' } },
-    })
-    if (!user?.password || user.accountStatus !== 'active') return null
-    const valid = await bcrypt.compare(credentials.password as string, user.password)
-    if (!valid) return null
-    return { id: user.id, email: user.email, name: user.name, image: user.image }
+  async authorize(credentials, request) {
+    return authorizeCredentials(credentials, request)
   },
 }))
 

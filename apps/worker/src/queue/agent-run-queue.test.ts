@@ -42,4 +42,13 @@ describe("agent-run queue", () => {
     await import("./agent-run-queue.js");
     await expect(mocks.handler?.({ data: { userId: "user_1", sessionId: "session_1" } })).rejects.toThrow("AGENT_WEB_URL");
   });
+
+  it("does not retry a run rejected after account suspension or entitlement revocation", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response(JSON.stringify({ error: "Account unavailable" }), { status: 403 })));
+    await import("./agent-run-queue.js");
+
+    await expect(mocks.handler?.({ data: { userId: "user_1", sessionId: "session_1" } })).resolves.toEqual({
+      status: "skipped", reason: "authorization-revoked",
+    });
+  });
 });

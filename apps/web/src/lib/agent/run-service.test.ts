@@ -2,6 +2,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const mocks = vi.hoisted(() => ({
   createHistory: vi.fn(),
+  findUser: vi.fn(),
   executionFindFirst: vi.fn(),
   executionUpdateMany: vi.fn(),
   executionUpsert: vi.fn(),
@@ -22,6 +23,7 @@ vi.mock("@/lib/db", () => ({
     agentExecution: { findFirst: mocks.executionFindFirst, updateMany: mocks.executionUpdateMany, upsert: mocks.executionUpsert },
     agentTranscriptEvent: { findFirst: mocks.findTranscript },
     resume: { findFirst: mocks.findResume },
+    user: { findUnique: mocks.findUser },
   },
 }));
 vi.mock("@/lib/agent/pipeline", () => ({ runPipeline: mocks.runPipeline }));
@@ -52,6 +54,7 @@ describe("runAgentPipeline", () => {
     mocks.finalize.mockResolvedValue({});
     mocks.pause.mockResolvedValue({});
     mocks.findConfig.mockResolvedValue(config);
+    mocks.findUser.mockResolvedValue({ accountStatus: "active" });
     mocks.findTranscript.mockResolvedValue({ data: {
       automation: { targetRoles: ["Backend Engineer"], targetLocations: ["Berlin"], minScore: 85,
         dailyCap: 4, requireApproval: false, autoApply: true },
@@ -94,6 +97,35 @@ describe("runAgentPipeline", () => {
     expect(mocks.record).toHaveBeenCalledWith("error", expect.objectContaining({ message: expect.stringContaining("not configured") }));
     expect(mocks.finalize).toHaveBeenCalledWith({ status: "failed", report: null });
   });
+
+  it("stops a queued run when the account is no longer active", async () => {
+    mocks.findUser.mockResolvedValue({ accountStatus: "suspended" })
+    const { runAgentPipeline } = await import("./run-service")
+
+    await expect(runAgentPipeline({
+      userId: "user_1", autonomous: true,
+      aiConfig: { provider: "minimax", model: "MiniMax-M3", apiKey: "key" },
+    })).resolves.toBeNull()
+
+    expect(mocks.runPipeline).not.toHaveBeenCalled()
+    expect(mocks.executionUpdateMany).toHaveBeenCalledWith(expect.objectContaining({
+      data: expect.objectContaining({ status: "failed", error: "Account is not active" }),
+    }))
+    expect(mocks.finalize).toHaveBeenCalledWith({ status: "failed", report: null })
+  })
+
+  it("fails closed when the current account state cannot be read", async () => {
+    mocks.findUser.mockRejectedValue(new Error("database unavailable"))
+    const { runAgentPipeline } = await import("./run-service")
+
+    await expect(runAgentPipeline({
+      userId: "user_1", autonomous: true,
+      aiConfig: { provider: "minimax", model: "MiniMax-M3", apiKey: "key" },
+    })).resolves.toBeNull()
+
+    expect(mocks.runPipeline).not.toHaveBeenCalled()
+    expect(mocks.finalize).toHaveBeenCalledWith({ status: "failed", report: null })
+  })
 
   it("keeps a user-cancelled execution cancelled when the pipeline returns late", async () => {
     mocks.executionUpdateMany

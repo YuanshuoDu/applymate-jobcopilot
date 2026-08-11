@@ -3,6 +3,7 @@ import { Queue, Worker } from 'bullmq'
 import { Redis } from 'ioredis'
 import { randomUUID } from 'node:crypto'
 import { getPool } from '../db/apply-results.js'
+import { isUserActive } from '../db/application-task-state.js'
 import { isWorkerFeatureEnabled } from '../admin/runtime-feature-flags.js'
 import { workerPollingOptions } from './worker-polling-options.js'
 import { discoverGreenhouseJobs, discoverLeverJobs, type DiscoveredJob } from './scout-discovery.js'
@@ -33,6 +34,9 @@ export const scoutWorker = new Worker<ScoutTaskPayload>(
     const { userId } = job.data
     const pool = getPool()
     const startedAt = Date.now()
+    if (!await isUserActive(pool, userId)) {
+      return { skipped: true, reason: 'account-inactive' }
+    }
     try {
       if (!await isWorkerFeatureEnabled(pool, 'worker_discovery', userId)) {
         return { skipped: true, reason: 'feature-disabled' }

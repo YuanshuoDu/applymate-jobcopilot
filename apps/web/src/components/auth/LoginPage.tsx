@@ -374,7 +374,7 @@ export function LoginPage({ switchAccount = false, adminLogin = false }: { switc
             <div style={{ display:'flex', flexDirection:'column', gap:7 }}>
               <div style={{ display:'flex', justifyContent:'space-between', alignItems:'center' }}>
                 <label htmlFor="login-password" style={{ fontSize:12, fontWeight:500, color:C.muted }}>Password</label>
-                <Link href="/forgot-password" style={{ fontSize:11, color:C.primary, textDecoration:'none', fontWeight:500 }}>Forgot password?</Link>
+                {!adminLogin && <Link href="/forgot-password" style={{ fontSize:11, color:C.primary, textDecoration:'none', fontWeight:500 }}>Forgot password?</Link>}
               </div>
               <div style={{ position: 'relative' }}>
                 <input

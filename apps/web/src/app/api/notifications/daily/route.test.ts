@@ -54,5 +54,8 @@ describe('POST /api/notifications/daily', () => {
     expect(mocks.notificationCreate).toHaveBeenCalledWith(expect.objectContaining({
       data: expect.objectContaining({ id: expect.stringContaining('daily:follow-up:user_1:job_1') }),
     }))
+    expect(mocks.userFindMany).toHaveBeenCalledWith(expect.objectContaining({
+      where: { accountStatus: 'active' },
+    }))
   })
 })

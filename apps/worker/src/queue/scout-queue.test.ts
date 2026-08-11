@@ -4,6 +4,7 @@ const mocks = vi.hoisted(() => ({
   handler: undefined as undefined | ((job: { data: { userId: string } }) => Promise<unknown>),
   query: vi.fn(),
   featureEnabled: vi.fn(),
+  isUserActive: vi.fn(),
   discoverGreenhouse: vi.fn(),
   discoverLever: vi.fn(),
 }))
@@ -23,6 +24,7 @@ vi.mock('./scout-discovery.js', () => ({
   discoverLeverJobs: mocks.discoverLever,
 }))
 vi.mock('../admin/runtime-feature-flags.js', () => ({ isWorkerFeatureEnabled: mocks.featureEnabled }))
+vi.mock('../db/application-task-state.js', () => ({ isUserActive: mocks.isUserActive }))
 
 async function runScout() {
   await import('./scout-queue.js')
@@ -34,6 +36,7 @@ describe('Scout queue platform controls', () => {
     vi.resetModules()
     vi.clearAllMocks()
     mocks.handler = undefined
+    mocks.isUserActive.mockResolvedValue(true)
     mocks.featureEnabled.mockResolvedValue(false)
     mocks.query.mockRejectedValue(new Error('target config must not be read'))
   })
@@ -41,6 +44,17 @@ describe('Scout queue platform controls', () => {
   it('stops before source work when Worker discovery is disabled', async () => {
     await expect(runScout()).resolves.toEqual({ skipped: true, reason: 'feature-disabled' })
 
+    expect(mocks.query).not.toHaveBeenCalled()
+    expect(mocks.discoverGreenhouse).not.toHaveBeenCalled()
+    expect(mocks.discoverLever).not.toHaveBeenCalled()
+  })
+
+  it('stops before feature and source work when the account is suspended', async () => {
+    mocks.isUserActive.mockResolvedValue(false)
+
+    await expect(runScout()).resolves.toEqual({ skipped: true, reason: 'account-inactive' })
+
+    expect(mocks.featureEnabled).not.toHaveBeenCalled()
     expect(mocks.query).not.toHaveBeenCalled()
     expect(mocks.discoverGreenhouse).not.toHaveBeenCalled()
     expect(mocks.discoverLever).not.toHaveBeenCalled()

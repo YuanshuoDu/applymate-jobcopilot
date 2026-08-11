@@ -47,6 +47,20 @@ function checkpointState(value: unknown): PipelineCheckpointState | undefined {
     : undefined
 }
 
+async function isActiveAccount(userId: string): Promise<boolean> {
+  try {
+    const user = await db.user.findUnique({
+      where: { id: userId },
+      select: { accountStatus: true },
+    })
+    return user?.accountStatus === "active"
+  } catch {
+    // A background action must never proceed if the current account state is
+    // unavailable. The execution is recorded as failed by the caller.
+    return false
+  }
+}
+
 async function saveHistory(
   userId: string,
   events: HistoryEvent[],
@@ -109,6 +123,18 @@ export async function runAgentPipeline(input: AgentPipelineRunInput): Promise<Ru
     await recorder.finalize({ status, report });
   };
 
+  // Web requests check this in requireAuth, but scheduled worker runs carry a
+  // durable user ID instead of a browser session. Re-check it after claiming
+  // the execution so suspension takes effect before any agent work starts.
+  if (!await isActiveAccount(input.userId)) {
+    emit("error", { message: "Account is not active." });
+    const failed = await finishAgentExecution({ id: execution.id, userId: input.userId, status: "failed", error: "Account is not active" })
+    if (!failed) return null
+    await finalize("failed", null)
+    await saveHistory(input.userId, events, startedAt, null, true)
+    return null
+  }
+
   const agentConfig = await db.agentConfig.findUnique({ where: { userId: input.userId } });
   if (!agentConfig) {
     emit("error", { message: "Agent not configured. Save settings first." });
@@ -162,6 +188,7 @@ export async function runAgentPipeline(input: AgentPipelineRunInput): Promise<Ru
       emit,
       resumeState: checkpointState(execution.state),
       checkpoint: async state => {
+        if (!await isActiveAccount(input.userId)) throw new Error("Account is not active")
         const saved = await saveExecutionCheckpoint({ id: execution.id, userId: input.userId, state })
         if (!saved) throw new AgentExecutionCancelledError()
       },

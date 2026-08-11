@@ -1,7 +1,7 @@
 import { NextResponse } from 'next/server'
 import type { NextRequest } from 'next/server'
 import { applyAdminSecurityHeaders } from '@/lib/admin/http-security'
-import { adminOrigin, isAdminApiPath, isAdminHost, isAdminPath, isAuthPath, isLocalHost } from '@/lib/host-routing'
+import { adminOrigin, isAdminApiPath, isAdminAuthApiPath, isAdminHost, isAdminPath, isAuthPath, isLocalHost } from '@/lib/host-routing'
 
 const PUBLIC_ROUTES = ['/login', '/register', '/forgot-password', '/reset-password', '/api/auth']
 const SESSION_COOKIE_NAMES = [
@@ -24,12 +24,14 @@ export async function middleware(req: NextRequest) {
   // The administrator hostname is intentionally a narrow surface: only the
   // admin UI, Auth.js endpoints, and admin APIs are routable there.
   if (onAdminHost) {
-    if (pathname === '/register') {
+    if (pathname === '/register' || pathname === '/forgot-password' || pathname === '/reset-password') {
       return NextResponse.redirect(new URL('/login?callbackUrl=%2Fadmin&error=admin_registration_disabled', req.url))
     }
 
-    if (pathname === '/api/auth/register') {
-      return applyAdminSecurityHeaders(NextResponse.json({ error: 'Administrator registration is disabled' }, { status: 404 }))
+    if (pathname === '/api/auth' || pathname.startsWith('/api/auth/')) {
+      if (!isAdminAuthApiPath(pathname)) {
+        return applyAdminSecurityHeaders(NextResponse.json({ error: 'Administrator authentication endpoint is unavailable' }, { status: 404 }))
+      }
     }
 
     if ((pathname === '/api' || pathname.startsWith('/api/')) && !isAuthPath(pathname) && !isAdminApiPath(pathname)) {

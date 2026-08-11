@@ -19,6 +19,7 @@ describe('LoginPage', () => {
     expect(html).not.toContain('Sign in with Google')
     expect(html).not.toContain('Sign in with GitHub')
     expect(html).not.toContain('Create a free account')
+    expect(html).not.toContain('Forgot password?')
     expect(html).toContain('Administrator access is invitation-only.')
   })
 })

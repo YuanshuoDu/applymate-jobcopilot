@@ -51,6 +51,7 @@ describe('daily Gmail sync API', () => {
     await expect(response.json()).resolves.toEqual({ checked: 2, synced: 2, recommendations: 3 })
     expect(mocks.accountsFindMany).toHaveBeenCalledWith({
       where: {
+        user: { accountStatus: 'active' },
         OR: [
           { provider: 'gmail' },
           { provider: 'google', scope: { contains: 'gmail' } },

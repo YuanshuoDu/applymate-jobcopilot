@@ -82,6 +82,7 @@ export async function POST(req: NextRequest) {
   const now = new Date()
   const start = weekStartUtc(now)
   const users = await db.user.findMany({
+    where: { accountStatus: 'active' },
     select: { id: true, email: true, name: true, preferences: true },
     take: 10_000,
   }) as UserRow[]
