@@ -31,7 +31,7 @@ describe('GET /api/github/oauth/callback', () => {
     vi.stubEnv('AUTH_SECRET', 'test-secret-which-is-long-enough')
     vi.stubEnv('AUTH_GITHUB_ID', 'github-client')
     vi.stubEnv('AUTH_GITHUB_SECRET', 'github-secret')
-    vi.stubEnv('AUTH_URL', 'https://applymate.site')
+    vi.stubEnv('AUTH_CANONICAL_URL', 'https://applymate.site')
     mocks.accountFindUnique.mockReset().mockResolvedValue(null)
     mocks.accountDeleteMany.mockReset().mockResolvedValue({ count: 0 })
     mocks.accountUpsert.mockReset().mockResolvedValue({})

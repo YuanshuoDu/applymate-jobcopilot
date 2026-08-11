@@ -4,7 +4,7 @@
  * preview host that is not registered with an OAuth provider.
  */
 export function configuredAppOrigin(requestUrl: string): string {
-  const configured = [process.env.AUTH_URL, process.env.NEXTAUTH_URL, process.env.APP_URL, process.env.AUTH_CANONICAL_URL]
+  const configured = [process.env.APP_URL, process.env.AUTH_CANONICAL_URL]
     .map(value => value?.trim())
     .find(Boolean)
 

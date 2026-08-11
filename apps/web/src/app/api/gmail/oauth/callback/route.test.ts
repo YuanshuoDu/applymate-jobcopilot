@@ -31,7 +31,7 @@ describe('GET /api/gmail/oauth/callback', () => {
     vi.stubEnv('AUTH_SECRET', 'test-secret-which-is-long-enough')
     vi.stubEnv('AUTH_GOOGLE_ID', 'google-client')
     vi.stubEnv('AUTH_GOOGLE_SECRET', 'google-secret')
-    vi.stubEnv('AUTH_URL', 'https://applymate.site')
+    vi.stubEnv('AUTH_CANONICAL_URL', 'https://applymate.site')
     mocks.findUnique.mockReset()
     mocks.userFindUnique.mockReset().mockResolvedValue({ accountStatus: 'active' })
     mocks.deleteMany.mockReset()

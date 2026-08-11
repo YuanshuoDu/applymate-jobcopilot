@@ -13,7 +13,9 @@ import { EXTENSION_TOKEN_AUDIENCE, EXTENSION_TOKEN_ISSUER, getAuthJwtSecret, get
 import { canonicalAuthRedirect } from '@/lib/auth-url'
 import { encryptAccountTokenFields } from '@/lib/credential-secrets'
 import { isCurrentAuthVersion } from '@/lib/auth-version'
+import { assertNoAuthOriginOverride } from '@/lib/auth-runtime-config'
 
+assertNoAuthOriginOverride()
 const AUTH_SECRET = getAuthSecret()
 const JWT_SECRET = getAuthJwtSecret()
 

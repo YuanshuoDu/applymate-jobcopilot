@@ -2,6 +2,7 @@ import { NextRequest } from 'next/server'
 import { pinnedFetch } from '@jobcopilot/shared'
 import { db } from '@/lib/db'
 import { err, ok } from '@/lib/api-helpers'
+import { configuredAppOrigin } from '@/lib/app-url'
 import { readNotificationPreferences } from '@/lib/settings-preferences'
 import {
   dailyNotificationId,
@@ -55,7 +56,7 @@ async function createOnce(data: { id: string; userId: string; type: string; titl
 async function sendEmail(user: UserRow, subject: string, lines: string[]): Promise<boolean> {
   const apiKey = process.env.RESEND_API_KEY
   if (!apiKey || !user.email) return false
-  const baseUrl = (process.env.APP_URL ?? process.env.NEXTAUTH_URL ?? 'https://applymate.dev').replace(/\/$/, '')
+  const baseUrl = configuredAppOrigin('https://applymate.site')
   const htmlLines = lines.map(line => `<li>${escapeHtml(line)}</li>`).join('')
   const response = await pinnedFetch('https://api.resend.com/emails', {
     method: 'POST',
