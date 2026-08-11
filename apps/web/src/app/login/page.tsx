@@ -16,11 +16,12 @@ export default async function Page({
   const requestHost = (await headers()).get('host') ?? ''
   const adminHost = isAdminHost(requestHost)
   const allowAccountSwitch = switchAccount === '1'
-  if (session?.user && !allowAccountSwitch && !adminHost) redirect('/')
+  const hasAuthenticatedUser = Boolean(session?.user?.id?.trim())
+  if (hasAuthenticatedUser && !allowAccountSwitch && !adminHost) redirect('/')
   return (
     <Suspense fallback={<LoadingShell text="Loading login…" />}>
       <LoginPage
-        switchAccount={allowAccountSwitch || (adminHost && Boolean(session?.user))}
+        switchAccount={allowAccountSwitch || (adminHost && hasAuthenticatedUser)}
         adminLogin={adminHost}
       />
     </Suspense>
