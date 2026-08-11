@@ -4,7 +4,7 @@ const mocks = vi.hoisted(() => ({
   compare: vi.fn(),
   jwtVerify: vi.fn(),
   membershipFindUnique: vi.fn(),
-  userFindFirst: vi.fn(),
+  userFindMany: vi.fn(),
   userFindUnique: vi.fn(),
 }))
 
@@ -12,7 +12,7 @@ vi.mock('bcryptjs', () => ({ default: { compare: mocks.compare } }))
 vi.mock('jose', () => ({ jwtVerify: mocks.jwtVerify }))
 vi.mock('@/lib/db', () => ({
   db: {
-    user: { findFirst: mocks.userFindFirst, findUnique: mocks.userFindUnique },
+    user: { findMany: mocks.userFindMany, findUnique: mocks.userFindUnique },
     adminMembership: { findUnique: mocks.membershipFindUnique },
   },
 }))
@@ -33,7 +33,7 @@ describe('credential authorization by host', () => {
   beforeEach(() => {
     vi.resetAllMocks()
     mocks.compare.mockResolvedValue(true)
-    mocks.userFindFirst.mockResolvedValue(activeUser)
+    mocks.userFindMany.mockResolvedValue([activeUser])
     mocks.membershipFindUnique.mockResolvedValue({ status: 'active' })
   })
 
@@ -67,6 +67,19 @@ describe('credential authorization by host', () => {
 
     expect(user).toMatchObject({ id: 'user_1' })
     expect(mocks.membershipFindUnique).not.toHaveBeenCalled()
+  })
+
+  it('rejects ambiguous case-insensitive email matches before password verification', async () => {
+    mocks.userFindMany.mockResolvedValue([activeUser, { ...activeUser, id: 'user_2' }])
+
+    const user = await authorizeCredentials(
+      { email: 'user@example.com', password: 'password' },
+      new Request('https://applymate.site/api/auth/callback/credentials'),
+    )
+
+    expect(user).toBeNull()
+    expect(mocks.compare).not.toHaveBeenCalled()
+    expect(mocks.userFindMany).toHaveBeenCalledWith(expect.objectContaining({ take: 2 }))
   })
 
   it('rejects extension tokens on the administrator host before token verification', async () => {

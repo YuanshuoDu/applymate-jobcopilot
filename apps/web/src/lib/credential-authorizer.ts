@@ -44,10 +44,14 @@ export async function authorizeCredentials(credentials: Credentials, request: Re
   if (!credentials.email || !credentials.password) return null
   const email = normalizeEmail(credentials.email as string)
   if (!email) return null
-  const user = await db.user.findFirst({
+  const candidates = await db.user.findMany({
     where: { email: { equals: email, mode: 'insensitive' } },
     select: { id: true, email: true, name: true, image: true, password: true, accountStatus: true },
+    take: 2,
   })
+  // Historic rows can differ only in email casing because PostgreSQL's unique
+  // index is case-sensitive. Refuse to select an arbitrary account.
+  const user = candidates.length === 1 ? candidates[0] : null
   if (!user?.password || user.accountStatus !== 'active') return null
   const valid = await bcrypt.compare(credentials.password as string, user.password)
   if (!valid) return null
