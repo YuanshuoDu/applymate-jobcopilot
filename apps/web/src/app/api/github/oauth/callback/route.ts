@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from 'next/server'
 import { pinnedFetch } from '@jobcopilot/shared'
 import { jwtVerify } from 'jose'
 import { db } from '@/lib/db'
+import { safeAuth } from '@/lib/safe-auth'
 import { encryptAccountTokenFields } from '@/lib/credential-secrets'
 import { githubCallbackRedirect, safeGithubReturnTo } from '@/lib/github-oauth'
 import { configuredAppOrigin, configuredRedirectUri } from '@/lib/app-url'
@@ -47,6 +48,12 @@ export async function GET(req: NextRequest) {
   } catch {
     return back('invalid_state')
   }
+
+  // Bind completion to the account that started the flow as well as the
+  // browser nonce. Otherwise a user switch during GitHub authorization could
+  // attach external credentials to the stale account in the signed state.
+  const session = await safeAuth()
+  if (session?.user?.id !== userId) return back('session_mismatch')
 
   const clientId = process.env.AUTH_GITHUB_ID
   const clientSecret = process.env.AUTH_GITHUB_SECRET

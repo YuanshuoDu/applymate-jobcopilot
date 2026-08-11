@@ -15,6 +15,7 @@ import { NextRequest, NextResponse } from 'next/server'
 import { pinnedFetch } from '@jobcopilot/shared'
 import { jwtVerify } from 'jose'
 import { db } from '@/lib/db'
+import { safeAuth } from '@/lib/safe-auth'
 import { GMAIL_ACCOUNT_PROVIDER } from '@/lib/gmail-helpers'
 import { encryptAccountTokenFields } from '@/lib/credential-secrets'
 import { canRecoverStaleGmailConnection } from '@/lib/gmail-connection-recovery'
@@ -79,6 +80,12 @@ export async function GET(req: NextRequest) {
     console.error('[gmail/oauth/callback] state verify failed:', e)
     return back('invalid_state')
   }
+
+  // The signed state belongs to the browser, not indefinitely to whichever
+  // account first created it. A user can sign out or switch accounts while
+  // Google is open; never attach that Google connection to the stale user.
+  const session = await safeAuth()
+  if (session?.user?.id !== userId) return back('session_mismatch')
 
   const user = await db.user.findUnique({ where: { id: userId }, select: { accountStatus: true } })
   if (!user) return back('user_not_found')

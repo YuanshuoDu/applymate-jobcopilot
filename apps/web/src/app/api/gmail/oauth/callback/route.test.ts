@@ -9,10 +9,12 @@ const mocks = vi.hoisted(() => ({
   userFindUnique: vi.fn(),
   deleteMany: vi.fn(),
   upsert: vi.fn(),
+  safeAuth: vi.fn(),
 }))
 const pinnedFetch = vi.hoisted(() => vi.fn((input: string | URL, init?: unknown) => globalThis.fetch(String(input), init as RequestInit)))
 
 vi.mock('@/lib/db', () => ({ db: { account: mocks, user: { findUnique: mocks.userFindUnique } } }))
+vi.mock('@/lib/safe-auth', () => ({ safeAuth: mocks.safeAuth }))
 vi.mock('@jobcopilot/shared', async () => {
   const actual = await vi.importActual<typeof import('@jobcopilot/shared')>('@jobcopilot/shared')
   return { ...actual, pinnedFetch }
@@ -36,6 +38,7 @@ describe('GET /api/gmail/oauth/callback', () => {
     mocks.userFindUnique.mockReset().mockResolvedValue({ accountStatus: 'active' })
     mocks.deleteMany.mockReset()
     mocks.upsert.mockReset()
+    mocks.safeAuth.mockReset().mockResolvedValue({ user: { id: 'user_1' } })
     mocks.findUnique.mockResolvedValue(null)
     mocks.deleteMany.mockResolvedValue({ count: 0 })
     mocks.upsert.mockResolvedValue({ id: 'account_1' })
@@ -78,6 +81,20 @@ describe('GET /api/gmail/oauth/callback', () => {
     expect(response.status).toBe(307)
     expect(location.searchParams.get('gmailError')).toBe('invalid_state')
     expect(fetch).not.toHaveBeenCalled()
+    expect(mocks.upsert).not.toHaveBeenCalled()
+  })
+
+  it('does not attach Gmail credentials after the initiating session is replaced', async () => {
+    mocks.safeAuth.mockResolvedValue({ user: { id: 'user_2' } })
+    const { GET } = await import('./route')
+    const response = await GET(new NextRequest(
+      `https://applymate.site/api/gmail/oauth/callback?code=c1&state=${encodeURIComponent(await state())}`,
+      { headers: { cookie: `${GMAIL_STATE_COOKIE}=n1` } },
+    ))
+
+    expect(new URL(response.headers.get('location') ?? '').searchParams.get('gmailError')).toBe('session_mismatch')
+    expect(fetch).not.toHaveBeenCalled()
+    expect(mocks.userFindUnique).not.toHaveBeenCalled()
     expect(mocks.upsert).not.toHaveBeenCalled()
   })
 })
