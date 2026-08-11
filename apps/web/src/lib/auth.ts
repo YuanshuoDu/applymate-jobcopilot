@@ -9,9 +9,9 @@ import { reconcileGoogleLoginIdentity } from '@/lib/google-identity'
 import { getAuthSecret } from '@/lib/auth-secret'
 import { canonicalAuthRedirect } from '@/lib/auth-url'
 import { encryptAccountTokenFields } from '@/lib/credential-secrets'
-import { isCurrentAuthVersion } from '@/lib/auth-version'
 import { assertNoAuthOriginOverride } from '@/lib/auth-runtime-config'
 import { authorizeCredentials } from '@/lib/credential-authorizer'
+import { refreshExistingSessionToken } from '@/lib/auth-session-token'
 
 assertNoAuthOriginOverride()
 const AUTH_SECRET = getAuthSecret()
@@ -141,10 +141,16 @@ export const { handlers, signIn, signOut, auth } = NextAuth({
         if (dbUser) token.authVersion = dbUser.authVersion
         token.adminSessionVersion = membership?.sessionVersion
       }
-      if (!user && typeof token.id === 'string') {
-        const current = await db.user.findUnique({ where: { id: token.id }, select: { authVersion: true, accountStatus: true } })
-        if (!current || current.accountStatus !== 'active' || !isCurrentAuthVersion(token.authVersion, current.authVersion)) return {}
-        token.authVersion = current.authVersion
+      if (!user) {
+        const userId = typeof token.id === 'string' && token.id
+          ? token.id
+          : typeof token.sub === 'string' && token.sub
+            ? token.sub
+            : null
+        const current = userId
+          ? await db.user.findUnique({ where: { id: userId }, select: { plan: true, authVersion: true, accountStatus: true } })
+          : null
+        return refreshExistingSessionToken(token, current)
       }
       return token
     },
