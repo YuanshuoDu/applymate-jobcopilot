@@ -11,11 +11,12 @@ import { getCachedApiResponse, setCachedApiResponse } from './api-cache'
  * while a fresh request runs in the background; explicit refetches still show
  * the existing loading state.
  */
-export function useApi<T>(url: string, options: { cache?: boolean; enabled?: boolean } = {}) {
+export function useApi<T>(url: string, options: { cache?: boolean; enabled?: boolean; timeoutMs?: number } = {}) {
   const { data: session, status } = useSession()
   const userId = status === 'authenticated' ? session.user?.id ?? null : null
   const cacheEnabled = options.cache !== false
   const enabled = options.enabled !== false
+  const timeoutMs = options.timeoutMs ?? 30_000
   const initial = enabled && cacheEnabled ? getCachedApiResponse<T>(url, userId) : null
   const [data,    setData   ] = useState<T | null>(() => initial)
   const [loading, setLoading] = useState(() => initial === null)
@@ -29,23 +30,45 @@ export function useApi<T>(url: string, options: { cache?: boolean; enabled?: boo
     }
     if (showLoading) setLoading(true)
     setError(null)
+    let timedOut = false
+    let timeoutId: ReturnType<typeof setTimeout> | undefined
+    let requestController: AbortController | undefined
+    let abortRequest: (() => void) | undefined
+    let requestSignal = signal
+    if (timeoutMs > 0) {
+      requestController = new AbortController()
+      abortRequest = () => requestController?.abort()
+      if (signal?.aborted) requestController.abort()
+      else signal?.addEventListener('abort', abortRequest, { once: true })
+      timeoutId = setTimeout(() => {
+        timedOut = true
+        requestController?.abort()
+      }, timeoutMs)
+      requestSignal = requestController.signal
+    }
     try {
-      const res  = await fetch(url, { signal, cache: cacheEnabled ? 'default' : 'no-store' })
+      const res  = await fetch(url, { signal: requestSignal, cache: cacheEnabled ? 'default' : 'no-store' })
       const json = await res.json().catch(() => ({}))
       if (!res.ok) throw new Error((json as { error?: string }).error ?? 'Request failed')
       const nextData = json as T
       if (cacheEnabled) setCachedApiResponse(url, nextData, userId)
       setData(nextData)
     } catch (e) {
+      if (timedOut) {
+        setError(`Request timed out after ${Math.ceil(timeoutMs / 1000)} seconds. Try refreshing.`)
+        return
+      }
       if (e instanceof DOMException && e.name === 'AbortError') return
       // Preserve usable cached data if a background refresh temporarily fails.
       if (!cacheEnabled || getCachedApiResponse<T>(url, userId) === null) {
         setError(e instanceof Error ? e.message : 'Unknown error')
       }
     } finally {
+      if (timeoutId) clearTimeout(timeoutId)
+      if (signal && abortRequest) signal.removeEventListener('abort', abortRequest)
       if (!signal?.aborted) setLoading(false)
     }
-  }, [url, userId, cacheEnabled, enabled])
+  }, [url, userId, cacheEnabled, enabled, timeoutMs])
 
   const refetch = useCallback(() => load(true), [load])
 
@@ -68,6 +91,19 @@ export function useApi<T>(url: string, options: { cache?: boolean; enabled?: boo
   }, [load, url, userId, cacheEnabled, enabled])
 
   return { data, loading, error, refetch }
+}
+
+export async function fetchWithTimeout(input: RequestInfo | URL, init: RequestInit = {}, timeoutMs = 10_000): Promise<Response> {
+  const controller = new AbortController()
+  const timer = setTimeout(() => controller.abort(), timeoutMs)
+  try {
+    return await fetch(input, { ...init, signal: controller.signal })
+  } catch (error) {
+    if (controller.signal.aborted) throw new Error(`Request timed out after ${Math.ceil(timeoutMs / 1000)} seconds. Try refreshing.`)
+    throw error
+  } finally {
+    clearTimeout(timer)
+  }
 }
 
 // ── One-off mutation ──────────────────────────────────────────────────────────

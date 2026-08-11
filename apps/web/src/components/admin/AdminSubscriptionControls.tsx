@@ -2,6 +2,7 @@
 
 import React, { useEffect, useState } from 'react'
 import { Card, Btn } from '@/components/ui'
+import { fetchWithTimeout } from '@/lib/hooks'
 
 type Subscription = { id: string; userId: string; plan: string; status: string; trialEndsAt: string | null; currentPeriodEnd: string | null; cancelAtPeriodEnd: boolean; version: number; user: { name: string | null; email: string; plan: string } }
 
@@ -14,10 +15,15 @@ export function AdminSubscriptionControls({ canUpdate }: { canUpdate: boolean })
   const [notice, setNotice] = useState('')
 
   async function load() {
-    const response = await fetch('/api/admin/v1/plans/subscriptions?limit=50', { cache: 'no-store' })
-    const payload = await response.json().catch(() => null) as { items?: Subscription[]; error?: string } | null
-    setItems(payload?.items ?? [])
-    if (!response.ok) setNotice(response.status >= 500 ? 'Subscription operations are unavailable until the production billing migrations are applied.' : payload?.error ?? 'Unable to load subscriptions.')
+    try {
+      const response = await fetchWithTimeout('/api/admin/v1/plans/subscriptions?limit=50', { cache: 'no-store' })
+      const payload = await response.json().catch(() => null) as { items?: Subscription[]; error?: string } | null
+      setItems(payload?.items ?? [])
+      if (!response.ok) setNotice(response.status >= 500 ? 'Subscription operations are unavailable until the production billing migrations are applied.' : payload?.error ?? 'Unable to load subscriptions.')
+    } catch (loadError) {
+      setItems([])
+      setNotice(loadError instanceof Error ? loadError.message : 'Unable to load subscriptions.')
+    }
   }
   useEffect(() => { void load() }, [])
   async function save(event: React.FormEvent) {

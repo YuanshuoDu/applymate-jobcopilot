@@ -13,7 +13,8 @@ describe('admin shell account controls', () => {
 
   it('does not prefetch admin routes from the persistent shell', () => {
     expect(source).toContain('<Link prefetch={false} href="/admin"')
-    expect(source).toContain('<Link prefetch={false} key={item.href}')
+    expect(source).toContain('<a key={item.href} href={item.href}')
+    expect(source).toContain("aria-current={active ? 'page' : undefined}")
     expect(source).toContain('<Link prefetch={false} key={item.id}')
   })
 })

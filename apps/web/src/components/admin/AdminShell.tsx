@@ -85,7 +85,7 @@ export function AdminShell({ children, permissions, roleKey }: { children: React
           const active = item.href === '/admin' ? pathname === '/admin' : pathname.startsWith(item.href)
           const Icon = item.icon
           const label = t(item.labelKey)
-          return <Link prefetch={false} key={item.href} href={item.href} title={label} aria-label={label} data-active={active} className="admin-nav-link"><Icon size={18} aria-hidden="true" />{label}</Link>
+          return <a key={item.href} href={item.href} title={label} aria-label={label} aria-current={active ? 'page' : undefined} data-active={active} className="admin-nav-link"><Icon size={18} aria-hidden="true" />{label}</a>
         })}
       </nav>
       <div className="admin-identity"><span className="admin-avatar">{roleKey.slice(0, 2).toUpperCase()}</span><div><strong>{roleKey.replaceAll('_', ' ')}</strong><small>Internal role</small></div><button type="button" className="admin-logout" onClick={() => signOut({ callbackUrl: '/login?callbackUrl=%2Fadmin' })} aria-label="Sign out"><LogOut size={15} aria-hidden="true" /></button></div>
