@@ -6,10 +6,13 @@ describe('credentials sign-in errors', () => {
     expect(credentialsSignInMessage('CredentialsSignin')).toBe('Invalid email or password.')
   })
 
-  it('does not mislabel service failures as bad credentials', () => {
+  it('treats an omitted Auth.js credentials error as a generic credential denial', () => {
+    expect(credentialsSignInMessage(undefined)).toBe('Invalid email or password.')
+  })
+
+  it('does not mislabel explicit service failures as bad credentials', () => {
     expect(credentialsSignInMessage('CallbackRouteError')).toBe('Sign-in is temporarily unavailable. Please try again.')
     expect(credentialsSignInMessage('Configuration')).toBe('Sign-in is temporarily unavailable. Please try again.')
-    expect(credentialsSignInMessage(undefined)).toBe('Sign-in is temporarily unavailable. Please try again.')
   })
 })
 
