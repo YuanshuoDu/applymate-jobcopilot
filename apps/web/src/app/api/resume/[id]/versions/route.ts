@@ -38,8 +38,11 @@ export async function POST(req: NextRequest, { params }: Params) {
   const versionId: string | undefined = body?.versionId
   if (!versionId) return err('versionId is required')
 
-  const version = await db.resumeVersion.findUnique({ where: { id: versionId } })
-  if (!version || version.resumeId !== id) return err('Version not found', 404)
+  const version = await db.resumeVersion.findUnique({
+    where: { id: versionId },
+    select: { id: true, resumeId: true, userId: true, content: true, name: true },
+  })
+  if (!version || version.resumeId !== id || version.userId !== auth.userId) return err('Version not found', 404)
 
   // Snapshot current state before restoring (allows undo)
   await db.resumeVersion.create({

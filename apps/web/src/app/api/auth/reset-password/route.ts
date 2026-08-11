@@ -7,8 +7,10 @@ import {
   isValidPasswordResetToken,
   userIdFromPasswordResetIdentifier,
 } from '@/lib/password-reset'
+import { checkAuthRateLimit } from '@/lib/auth-rate-limit'
 
 const MIN_PASSWORD_LENGTH = 8
+const MAX_PASSWORD_LENGTH = 256
 
 function parseBody(body: unknown): { token: string; password: string } | null {
   if (!body || typeof body !== 'object') return null
@@ -24,6 +26,14 @@ export async function POST(req: NextRequest) {
   if (body.password.length < MIN_PASSWORD_LENGTH) {
     return err(`Password must be at least ${MIN_PASSWORD_LENGTH} characters`)
   }
+  if (body.password.length > MAX_PASSWORD_LENGTH) {
+    return err(`Password must be at most ${MAX_PASSWORD_LENGTH} characters`)
+  }
+
+  // bcrypt is intentionally expensive. Rate-limit before hashing so random
+  // token probes cannot turn this unauthenticated endpoint into a CPU sink.
+  const rate = await checkAuthRateLimit(req, 'reset-password', undefined, { ipLimit: 20, windowMs: 15 * 60_000 })
+  if (!rate.ok) return err(rate.unavailable ? 'Authentication service temporarily unavailable' : 'Too many requests — retry later', rate.unavailable ? 503 : 429)
 
   const tokenHash = hashPasswordResetToken(body.token)
 

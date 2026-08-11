@@ -7,6 +7,7 @@ const mocks = vi.hoisted(() => ({
   tokenDeleteMany: vi.fn(),
   userUpdate: vi.fn(),
   hash: vi.fn(),
+  rateLimit: vi.fn(),
 }))
 
 vi.mock('@/lib/db', () => ({
@@ -22,6 +23,10 @@ vi.mock('@/lib/api-helpers', () => ({
   err: (message: string, status = 400) => Response.json({ error: message }, { status }),
 }))
 
+vi.mock('@/lib/auth-rate-limit', () => ({
+  checkAuthRateLimit: mocks.rateLimit,
+}))
+
 function request(body: unknown) {
   return new Request('http://localhost:3000/api/auth/reset-password', {
     method: 'POST',
@@ -35,6 +40,7 @@ describe('reset password API', () => {
     vi.resetModules()
     Object.values(mocks).forEach(mock => mock.mockReset())
     mocks.hash.mockResolvedValue('new-password-hash')
+    mocks.rateLimit.mockResolvedValue({ ok: true })
     mocks.tokenDeleteMany.mockResolvedValue({ count: 1 })
     mocks.userUpdate.mockResolvedValue({ id: 'user_1' })
     mocks.transaction.mockImplementation(async (callback: (tx: unknown) => Promise<unknown>) => callback({
@@ -100,5 +106,24 @@ describe('reset password API', () => {
 
     expect(response.status).toBe(400)
     expect(mocks.userUpdate).not.toHaveBeenCalled()
+  })
+
+  it('does not hash when the reset rate limit is exceeded', async () => {
+    mocks.rateLimit.mockResolvedValue({ ok: false, retryAfter: 60 })
+    const { POST } = await import('./route')
+    const response = await POST(request({ token: 'd'.repeat(43), password: 'new-password' }) as never)
+
+    expect(response.status).toBe(429)
+    expect(mocks.hash).not.toHaveBeenCalled()
+    expect(mocks.transaction).not.toHaveBeenCalled()
+  })
+
+  it('rejects excessively long passwords before hashing', async () => {
+    const { POST } = await import('./route')
+    const response = await POST(request({ token: 'e'.repeat(43), password: 'p'.repeat(257) }) as never)
+
+    expect(response.status).toBe(400)
+    expect(mocks.hash).not.toHaveBeenCalled()
+    expect(mocks.rateLimit).not.toHaveBeenCalled()
   })
 })
