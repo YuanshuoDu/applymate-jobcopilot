@@ -4,6 +4,14 @@ const configuredAdminHost = process.env.ADMIN_HOST?.trim().toLowerCase()
 export const ADMIN_HOST = configuredAdminHost || DEFAULT_ADMIN_HOST
 
 const LOCAL_HOSTS = new Set(['localhost', '127.0.0.1', '[::1]'])
+const ADMIN_AUTH_API_PATHS = new Set([
+  '/api/auth/csrf',
+  '/api/auth/session',
+  '/api/auth/signin/credentials',
+  '/api/auth/callback/credentials',
+  '/api/auth/signout',
+  '/api/auth/error',
+])
 
 export function normalizeHostname(hostname: string): string {
   return hostname.trim().toLowerCase().replace(/:\d+$/, '')
@@ -29,6 +37,10 @@ export function isAuthPath(pathname: string): boolean {
     || pathname.startsWith('/reset-password/')
     || pathname === '/api/auth'
     || pathname.startsWith('/api/auth/')
+}
+
+export function isAdminAuthApiPath(pathname: string): boolean {
+  return ADMIN_AUTH_API_PATHS.has(pathname)
 }
 
 export function isAdminApiPath(pathname: string): boolean {

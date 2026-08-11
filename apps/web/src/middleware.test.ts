@@ -110,4 +110,19 @@ describe('web middleware entrypoint', () => {
     expect(api.status).toBe(404)
     expect(api.headers.get('X-Frame-Options')).toBe('DENY')
   })
+
+  it('limits administrator-host Auth.js endpoints to credential session operations', async () => {
+    const csrf = await middleware(new NextRequest('https://admin.applymate.site/api/auth/csrf'))
+    const credentials = await middleware(new NextRequest('https://admin.applymate.site/api/auth/callback/credentials', { method: 'POST' }))
+    const providers = await middleware(new NextRequest('https://admin.applymate.site/api/auth/providers'))
+    const oauth = await middleware(new NextRequest('https://admin.applymate.site/api/auth/signin/google'))
+    const extension = await middleware(new NextRequest('https://admin.applymate.site/api/auth/extension-token', { method: 'POST' }))
+
+    expect(csrf.status).toBe(200)
+    expect(credentials.status).toBe(200)
+    for (const response of [providers, oauth, extension]) {
+      expect(response.status).toBe(404)
+      expect(response.headers.get('Cache-Control')).toBe('no-store, private')
+    }
+  })
 })
