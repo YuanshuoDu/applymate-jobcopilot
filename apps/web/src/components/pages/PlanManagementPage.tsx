@@ -23,7 +23,7 @@ function priceLabel(plan: PlanCatalogueRecord): string {
 }
 
 export function PlanManagementPage({ canUpdate = true, canViewObservability = true }: { canUpdate?: boolean; canViewObservability?: boolean }) {
-  const { data, loading, error, refetch } = useApi<PlansResponse>('/api/admin/v1/plans')
+  const { data, loading, error, refetch } = useApi<PlansResponse>('/api/admin/v1/plans', { timeoutMs: 10_000 })
   const [plans, setPlans] = useState<PlanCatalogueRecord[]>([])
   const [selectedKey, setSelectedKey] = useState<PlanKey>('free')
   const [saving, setSaving] = useState(false)
@@ -70,7 +70,7 @@ export function PlanManagementPage({ canUpdate = true, canViewObservability = tr
         <Btn small variant="ghost" onClick={refetch}>Refresh</Btn>
       </TopBar>
 
-      <main style={{ maxWidth: 960, padding: 20, display: 'flex', flexDirection: 'column', gap: 16 }}>
+      <div style={{ maxWidth: 960, padding: 20, display: 'flex', flexDirection: 'column', gap: 16 }}>
         {loading && !data && <Card style={{ padding: 16, color: 'var(--text-muted)', fontSize: 12 }}>Loading plan catalogue…</Card>}
         {(error || saveError) && (
           <Card style={{ padding: 14, borderColor: 'rgba(220,38,38,0.25)', color: 'var(--c-danger)', display: 'flex', gap: 8, alignItems: 'center' }}>
@@ -114,7 +114,7 @@ export function PlanManagementPage({ canUpdate = true, canViewObservability = tr
           </>
         )}
         <AdminSubscriptionControls canUpdate={canUpdate} />
-      </main>
+      </div>
     </div>
   )
 }

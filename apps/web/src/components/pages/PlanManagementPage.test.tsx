@@ -39,6 +39,7 @@ describe('PlanManagementPage', () => {
     expect(html).toContain('Currency')
     expect(html).toContain('Display order')
     expect(html).toContain('value="42"')
+    expect(html).not.toContain('<main')
   })
 
   it('hides observability navigation from administrators without that permission', () => {
