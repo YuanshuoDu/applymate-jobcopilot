@@ -11,7 +11,12 @@ import { canonicalAuthRedirect } from '@/lib/auth-url'
 import { encryptAccountTokenFields } from '@/lib/credential-secrets'
 import { assertNoAuthOriginOverride } from '@/lib/auth-runtime-config'
 import { authorizeCredentials } from '@/lib/credential-authorizer'
-import { refreshExistingSessionToken, sessionTokenUserId } from '@/lib/auth-session-token'
+import {
+  refreshEmailOnlySessionToken,
+  refreshExistingSessionToken,
+  sessionTokenEmail,
+  sessionTokenUserId,
+} from '@/lib/auth-session-token'
 import { authVersionFromClaim } from '@/lib/auth-version'
 
 assertNoAuthOriginOverride()
@@ -143,26 +148,39 @@ export const { handlers, signIn, signOut, auth } = NextAuth({
         token.adminSessionVersion = membership?.sessionVersion
       }
       if (!user) {
-        const userId = typeof token.id === 'string' && token.id
-          ? token.id
-          : typeof token.sub === 'string' && token.sub
-            ? token.sub
-            : null
-        const current = userId
-          ? await db.user.findUnique({ where: { id: userId }, select: { plan: true, authVersion: true, accountStatus: true } })
-          : null
-        return refreshExistingSessionToken(token, current)
+        const userId = sessionTokenUserId(token)
+        if (userId) {
+          const current = await db.user.findUnique({
+            where: { id: userId },
+            select: { plan: true, authVersion: true, accountStatus: true },
+          })
+          return refreshExistingSessionToken(token, current)
+        }
+
+        const email = sessionTokenEmail(token)
+        const candidates = email
+          ? await db.user.findMany({
+            where: { email: { equals: email, mode: 'insensitive' } },
+            select: { id: true, plan: true, authVersion: true, accountStatus: true },
+            take: 2,
+          })
+          : []
+        return refreshEmailOnlySessionToken(token, candidates.length === 1 ? candidates[0] : null)
       }
       return token
     },
     async session({ session, token }) {
       const userId = sessionTokenUserId(token)
-      if (userId && session.user) {
-        session.user.id   = userId
-        session.user.plan = (token.plan as 'free' | 'pro' | 'enterprise') ?? 'free'
-        session.user.authVersion = authVersionFromClaim(token.authVersion)
-        session.user.adminSessionVersion = typeof token.adminSessionVersion === 'number' ? token.adminSessionVersion : undefined
+      if (!userId || !session.user) {
+        // Return the public DefaultSession shape so a malformed or revoked JWT
+        // cannot keep the client in an authenticated-looking application shell.
+        return { expires: session.expires }
       }
+
+      session.user.id   = userId
+      session.user.plan = (token.plan as 'free' | 'pro' | 'enterprise') ?? 'free'
+      session.user.authVersion = authVersionFromClaim(token.authVersion)
+      session.user.adminSessionVersion = typeof token.adminSessionVersion === 'number' ? token.adminSessionVersion : undefined
       return session
     },
     async redirect({ url, baseUrl }) {

@@ -1,8 +1,10 @@
 import { isCurrentAuthVersion } from './auth-version'
+import { normalizeEmail } from './auth-identifiers'
 
 type SessionToken = {
   id?: unknown
   sub?: unknown
+  email?: unknown
   plan?: unknown
   authVersion?: unknown
   [key: string]: unknown
@@ -12,6 +14,10 @@ type CurrentUser = {
   accountStatus: string
   authVersion: number
   plan: string
+}
+
+type CurrentEmailUser = CurrentUser & {
+  id: string
 }
 
 /**
@@ -25,6 +31,21 @@ export function sessionTokenUserId(token: SessionToken): string | null {
 
   if ((tokenId && subject && tokenId !== subject) || (!tokenId && !subject)) return null
   return tokenId ?? subject
+}
+
+/**
+ * A narrow legacy migration path for signed Auth.js tokens which pre-date the
+ * `sub` / application `id` claims. Do not return an email when a token has
+ * any identity claim (including conflicting claims); those states must not be
+ * converted into another account identity.
+ */
+export function sessionTokenEmail(token: SessionToken): string | null {
+  const tokenId = typeof token.id === 'string' && token.id ? token.id : null
+  const subject = typeof token.sub === 'string' && token.sub ? token.sub : null
+  if (tokenId || subject || typeof token.email !== 'string') return null
+
+  const email = normalizeEmail(token.email)
+  return email || null
 }
 
 /**
@@ -45,6 +66,27 @@ export function refreshExistingSessionToken<T extends SessionToken>(
   ) return {}
 
   token.id = userId
+  token.authVersion = currentUser.authVersion
+  token.plan = currentUser.plan
+  return token
+}
+
+/**
+ * Upgrade a signed, email-only legacy token after the database establishes a
+ * unique active account at the token's current authentication revision.
+ */
+export function refreshEmailOnlySessionToken<T extends SessionToken>(
+  token: T,
+  currentUser: CurrentEmailUser | null,
+): T | Record<string, never> {
+  if (
+    !sessionTokenEmail(token)
+    || !currentUser
+    || currentUser.accountStatus !== 'active'
+    || !isCurrentAuthVersion(token.authVersion, currentUser.authVersion)
+  ) return {}
+
+  token.id = currentUser.id
   token.authVersion = currentUser.authVersion
   token.plan = currentUser.plan
   return token
