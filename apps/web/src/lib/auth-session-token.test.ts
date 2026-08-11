@@ -1,0 +1,38 @@
+import { describe, expect, it } from 'vitest'
+import { refreshExistingSessionToken } from './auth-session-token'
+
+const activeUser = { accountStatus: 'active', authVersion: 1, plan: 'pro' }
+
+describe('refreshExistingSessionToken', () => {
+  it('normalizes an active legacy Auth.js subject into the application id claim', () => {
+    const token = { sub: 'user_legacy', email: 'candidate@example.com' }
+
+    expect(refreshExistingSessionToken(token, activeUser)).toEqual({
+      sub: 'user_legacy',
+      id: 'user_legacy',
+      email: 'candidate@example.com',
+      authVersion: 1,
+      plan: 'pro',
+    })
+  })
+
+  it('preserves a current session identity and refreshes current account claims', () => {
+    const token = { id: 'user_current', sub: 'user_current', authVersion: 1, plan: 'free' }
+
+    expect(refreshExistingSessionToken(token, activeUser)).toEqual({
+      id: 'user_current',
+      sub: 'user_current',
+      authVersion: 1,
+      plan: 'pro',
+    })
+  })
+
+  it.each([
+    [{ sub: 'user_1', authVersion: 1 }, { accountStatus: 'suspended', authVersion: 1, plan: 'pro' }],
+    [{ sub: 'user_1', authVersion: 1 }, { accountStatus: 'active', authVersion: 2, plan: 'pro' }],
+    [{ id: 'user_1', sub: 'user_2', authVersion: 1 }, activeUser],
+    [{ email: 'candidate@example.com' }, activeUser],
+  ])('invalidates unsafe or revoked token state: %o', (token, user) => {
+    expect(refreshExistingSessionToken(token, user)).toEqual({})
+  })
+})
