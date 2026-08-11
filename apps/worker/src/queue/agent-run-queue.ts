@@ -38,6 +38,12 @@ export const agentRunWorker = new Worker<AgentRunTaskPayload>(
       body: JSON.stringify(task.data),
       signal: AbortSignal.timeout(Number(process.env.AGENT_RUN_TIMEOUT_MS ?? "300000")),
     });
+    // Suspension and entitlement changes are terminal for this queued run.
+    // Returning a skipped result prevents BullMQ from repeatedly retrying an
+    // action that the current account state no longer permits.
+    if (response.status === 403) {
+      return { status: "skipped", reason: "authorization-revoked" };
+    }
     if (!response.ok) {
       const body = await response.text().catch(() => "");
       throw new Error(`Agent run endpoint returned ${response.status}: ${body.slice(0, 300)}`);

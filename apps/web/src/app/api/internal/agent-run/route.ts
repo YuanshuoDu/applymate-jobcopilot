@@ -27,6 +27,12 @@ export async function POST(req: NextRequest) {
   const input = taskInput(await req.json().catch(() => null));
   if (!input) return err("Invalid agent run task", 400);
 
+  const account = await db.user.findUnique({
+    where: { id: input.userId },
+    select: { accountStatus: true },
+  });
+  if (account?.accountStatus !== "active") return err("Account unavailable", 403);
+
   const session = await db.agentSession.findFirst({
     // A user can begin in the interactive Agent UI and later answer a durable
     // question after the original SSE request has ended. The worker is already

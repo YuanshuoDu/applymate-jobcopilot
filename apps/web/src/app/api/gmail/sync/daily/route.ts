@@ -15,6 +15,7 @@ async function runDailySync(req: NextRequest) {
 
   const accounts = await db.account.findMany({
     where: {
+      user: { accountStatus: 'active' },
       OR: [
         { provider: 'gmail' },
         { provider: 'google', scope: { contains: 'gmail' } },

@@ -2,6 +2,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const mocks = vi.hoisted(() => ({
   findFirst: vi.fn(),
+  findUser: vi.fn(),
   executionFindFirst: vi.fn(),
   loadUserAiConfig: vi.fn(),
   runAgentPipeline: vi.fn(),
@@ -10,7 +11,7 @@ const mocks = vi.hoisted(() => ({
   resolveAiAccess: vi.fn(),
 }));
 
-vi.mock("@/lib/db", () => ({ db: { agentSession: { findFirst: mocks.findFirst }, agentExecution: { findFirst: mocks.executionFindFirst } } }));
+vi.mock("@/lib/db", () => ({ db: { user: { findUnique: mocks.findUser }, agentSession: { findFirst: mocks.findFirst }, agentExecution: { findFirst: mocks.executionFindFirst } } }));
 vi.mock("@/lib/api-helpers", () => ({
   err: (message: string, status = 400) => Response.json({ error: message }, { status }),
   ok: (data: unknown, status = 200) => Response.json(data, { status }),
@@ -35,6 +36,7 @@ describe("POST /api/internal/agent-run", () => {
     Object.values(mocks).forEach(mock => mock.mockReset());
     vi.stubEnv("AGENT_WORKER_SECRET", "worker-secret");
     mocks.findFirst.mockResolvedValue({ id: "session_1" });
+    mocks.findUser.mockResolvedValue({ accountStatus: "active" });
     mocks.executionFindFirst.mockResolvedValue({ state: { autonomous: true } });
     mocks.loadUserAiConfig.mockResolvedValue({ provider: "minimax", model: "MiniMax-M3", resolvedKey: "platform-key" });
     mocks.runAgentPipeline.mockResolvedValue({ processed: 1, queued: 1, applied: 0, pending: 0, skipped: 0, failed: 0, durationMs: 10 });
@@ -74,6 +76,18 @@ describe("POST /api/internal/agent-run", () => {
     expect(response.status).toBe(403);
     expect(mocks.runAgentPipeline).not.toHaveBeenCalled();
   });
+
+  it("blocks a worker task for a suspended account before reading its session", async () => {
+    mocks.findUser.mockResolvedValue({ accountStatus: "suspended" })
+    const { POST } = await import("./route")
+
+    const response = await POST(request({ "x-agent-worker-secret": "worker-secret" }) as never)
+
+    expect(response.status).toBe(403)
+    await expect(response.json()).resolves.toEqual({ error: "Account unavailable" })
+    expect(mocks.findFirst).not.toHaveBeenCalled()
+    expect(mocks.runAgentPipeline).not.toHaveBeenCalled()
+  })
 
   it("blocks the worker when the monthly AI credits are exhausted", async () => {
     mocks.resolveAiAccess.mockResolvedValueOnce('exhausted');
