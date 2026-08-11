@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { isAdminResponse, requireAdmin } from '@/lib/admin/authorization'
 import { writeAdminAudit } from '@/lib/admin/audit'
-import { toAdminApplicationMetadata } from '@/lib/admin/application-dto'
+import { toAdminApplicationMetadata, toAdminApplicationTaskMetadata } from '@/lib/admin/application-dto'
 import { db } from '@/lib/db'
 
 type Params = { params: Promise<{ id: string }> }
@@ -15,5 +15,5 @@ export async function GET(request: NextRequest, { params }: Params) {
   if (!result) return NextResponse.json({ error: 'Application result not found' }, { status: 404 })
   const task = await db.applicationTask.findUnique({ where: { userId_jobId: { userId: result.userId, jobId: result.jobId } }, select: { id: true, status: true, checkpoint: true, error: true, startedAt: true, completedAt: true, createdAt: true, updatedAt: true, events: { orderBy: { createdAt: 'desc' }, take: 50, select: { id: true, type: true, actor: true, body: true, createdAt: true } } } })
   await writeAdminAudit({ requestId: actor.requestId, actorUserId: actor.userId, actorRoleKey: actor.roleKey, action: 'application.detail_viewed', targetType: 'application', targetId: String(id), tenantUserId: result.userId, outcome: 'success' })
-  return NextResponse.json({ application: toAdminApplicationMetadata({ ...result, taskId: task?.id ?? null, taskStatus: task?.status ?? null, checkpoint: task?.checkpoint ?? null }), task: task ? { ...task, events: task.events.map(event => ({ ...event, body: event.body.slice(0, 500) })) } : null }, { headers: { 'Cache-Control': 'no-store', 'x-request-id': actor.requestId } })
+  return NextResponse.json({ application: toAdminApplicationMetadata({ ...result, taskId: task?.id ?? null, taskStatus: task?.status ?? null, checkpoint: task?.checkpoint ?? null }), task: task ? toAdminApplicationTaskMetadata(task) : null }, { headers: { 'Cache-Control': 'no-store', 'x-request-id': actor.requestId } })
 }
