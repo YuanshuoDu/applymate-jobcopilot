@@ -21,8 +21,8 @@ export async function GET() {
   if (!user) {
     return NextResponse.json({ error: 'User not found' }, { status: 404 })
   }
-  if (user.accountStatus === 'suspended') {
-    return NextResponse.json({ error: 'Account suspended' }, { status: 403 })
+  if (user.accountStatus !== 'active') {
+    return NextResponse.json({ error: 'Account unavailable' }, { status: 403 })
   }
 
   const token = await new SignJWT({
@@ -30,6 +30,7 @@ export async function GET() {
     email: user.email,
     name:  user.name ?? '',
     plan:  user.plan,
+    authVersion: user.authVersion,
   })
     .setProtectedHeader({ alg: 'HS256' })
     .setIssuer(EXTENSION_TOKEN_ISSUER)

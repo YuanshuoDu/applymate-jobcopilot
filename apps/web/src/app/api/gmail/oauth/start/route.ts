@@ -45,7 +45,7 @@ export async function GET(req: NextRequest) {
 
   const user = await db.user.findUnique({ where: { id: session.user.id }, select: { accountStatus: true } })
   if (!user) return NextResponse.redirect(new URL('/login', req.url))
-  if (user.accountStatus === 'suspended') return NextResponse.json({ error: 'Account suspended' }, { status: 403 })
+  if (user.accountStatus !== 'active') return NextResponse.json({ error: 'Account unavailable' }, { status: 403 })
 
   const clientId = process.env.AUTH_GOOGLE_ID
   if (!clientId || !process.env.AUTH_GOOGLE_SECRET) {

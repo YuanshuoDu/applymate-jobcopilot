@@ -6,6 +6,7 @@ import { requestIdFor, writeAdminAudit } from './audit'
 import { validateAdminWrite } from './csrf'
 import { hasFreshAdminReauth } from './webauthn'
 import type { Permission } from './permissions'
+import { isAdminHost, isLocalHost } from '@/lib/host-routing'
 
 export type AdminActor = Readonly<{
   userId: string
@@ -28,6 +29,7 @@ const highRiskPermissions = new Set([
 
 export async function requireAdminMembership(request?: Request): Promise<AdminActor | NextResponse> {
   const requestId = requestIdFor(request)
+  if (request && !isAdminRequest(request)) return administratorHostOnly()
   const session = await safeAuth()
   const userId = session?.user?.id
   if (!userId) return denied(requestId, 'observability.read', 'unauthenticated', request)
@@ -49,6 +51,7 @@ export async function requireAdmin(permission: Permission, request?: Request): P
 
 export async function requireAdminAny(permissions: readonly Permission[], request?: Request): Promise<AdminActor | NextResponse> {
   const permission = permissions[0] ?? 'observability.read'
+  if (request && !isAdminRequest(request)) return administratorHostOnly()
   if (request && ['POST', 'PUT', 'PATCH', 'DELETE'].includes(request.method)) {
     const writeError = validateAdminWrite(request)
     if (writeError) return writeError
@@ -83,6 +86,22 @@ export async function requireAdminAny(permissions: readonly Permission[], reques
 
   if (grant) await writeAdminAudit({ requestId, actorUserId: userId, actorRoleKey: membership.role.key, action: 'break_glass.used', targetId: grant.id, outcome: 'success' })
   return Object.freeze({ userId, roleKey: membership.role.key, permissions: Object.freeze([...membership.role.permissions, ...(grant ? [grant.permission ?? permission] : [])]), requestId })
+}
+
+function isAdminRequest(request: Request): boolean {
+  try {
+    const hostname = new URL(request.url).hostname
+    return isAdminHost(hostname) || isLocalHost(hostname)
+  } catch {
+    return false
+  }
+}
+
+function administratorHostOnly(): NextResponse {
+  return NextResponse.json(
+    { error: 'Administrator API is only available on the administrator host' },
+    { status: 404, headers: { 'Cache-Control': 'no-store' } },
+  )
 }
 
 async function denied(requestId: string, permission: Permission, errorCode: string, request?: Request, userId?: string) {

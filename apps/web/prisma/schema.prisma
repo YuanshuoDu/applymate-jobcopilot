@@ -66,6 +66,7 @@ model User {
   password         String? // hashed, for credential login
   plan             Plan              @default(free)
   accountStatus    UserAccountStatus @default(active)
+  authVersion      Int               @default(1)
   suspendedAt      DateTime?
   suspendedById    String?
   suspensionReason String?

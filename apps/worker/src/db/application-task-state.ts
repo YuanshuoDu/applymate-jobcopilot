@@ -3,13 +3,13 @@ import type { FormReviewNeeds } from "../harness/form-review.js";
 
 type TerminalStatus = "submitted" | "failed" | "waiting_for_user" | "waiting_for_authorization";
 
-/** Worker-side account guard; old deployments without the additive column stay usable. */
+/** Worker-side account guard.  A state lookup failure must not open a browser. */
 export async function isUserActive(pool: Pool, userId: string): Promise<boolean> {
   try {
     const result = await pool.query(`SELECT "accountStatus" FROM "User" WHERE id = $1`, [userId]);
-    return result.rows[0]?.accountStatus !== "suspended";
+    return result.rows[0]?.accountStatus === "active";
   } catch {
-    return true;
+    return false;
   }
 }
 

@@ -36,7 +36,7 @@ export async function PATCH(req: NextRequest) {
   const hashed = await bcrypt.hash(newPassword, 12)
   await db.user.update({
     where: { id: auth.userId },
-    data: { password: hashed },
+    data: { password: hashed, authVersion: { increment: 1 } },
   })
 
   return ok({ message: 'Password updated' })

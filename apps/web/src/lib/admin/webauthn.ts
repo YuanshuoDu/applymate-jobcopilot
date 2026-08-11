@@ -1,6 +1,7 @@
 import { createHash, randomBytes } from 'node:crypto'
 import type { NextResponse } from 'next/server'
 import { db } from '@/lib/db'
+import { adminOrigin } from '@/lib/host-routing'
 
 export const ADMIN_REAUTH_COOKIE = 'applymate-admin-reauth'
 export const ADMIN_REAUTH_TTL_SECONDS = 15 * 60
@@ -10,7 +11,7 @@ const supportedTransports = ['ble', 'cable', 'hybrid', 'internal', 'nfc', 'smart
 export type StoredAuthenticatorTransport = (typeof supportedTransports)[number]
 
 export function webAuthnSettings(request: Request) {
-  const origin = process.env.WEBAUTHN_ORIGIN ?? process.env.AUTH_CANONICAL_URL ?? new URL(request.url).origin
+  const origin = process.env.WEBAUTHN_ORIGIN ?? adminOrigin(request.url)
   return {
     origin,
     rpID: process.env.WEBAUTHN_RP_ID ?? new URL(origin).hostname,

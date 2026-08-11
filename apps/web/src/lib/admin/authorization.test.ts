@@ -21,6 +21,19 @@ describe('requireAdmin', () => {
     expect(mocks.audit).not.toHaveBeenCalled()
   })
 
+  it('rejects an admin API request sent to the public application host', async () => {
+    const { requireAdmin } = await import('./authorization')
+    const result = await requireAdmin('queues.pause', new Request('https://applymate.site/api/admin/v1/queues/apply-tasks/pause', {
+      method: 'POST',
+      headers: { Origin: 'https://applymate.site', Host: 'applymate.site', 'Idempotency-Key': 'public-host-1' },
+    }))
+
+    expect(result).toBeInstanceOf(Response)
+    expect((result as Response).status).toBe(404)
+    expect(mocks.safeAuth).not.toHaveBeenCalled()
+    expect(mocks.audit).not.toHaveBeenCalled()
+  })
+
   it('denies an old admin session after the membership session version changes', async () => {
     mocks.safeAuth.mockResolvedValue({ user: { id: 'admin-1', plan: 'pro', adminSessionVersion: 1 } })
     mocks.findUnique.mockResolvedValue({ status: 'active', mfaLevel: 'totp', sessionVersion: 2, user: { accountStatus: 'active' }, role: { key: 'operations', permissions: ['observability.read'] } })

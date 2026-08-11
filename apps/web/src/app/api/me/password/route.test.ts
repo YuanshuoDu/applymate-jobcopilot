@@ -36,4 +36,18 @@ describe('PATCH /api/me/password', () => {
     expect(response.status).toBe(400)
     expect(mocks.compare).not.toHaveBeenCalled()
   })
+
+  it('increments the auth version when a password changes', async () => {
+    const { PATCH } = await import('./route')
+    const response = await PATCH(new Request('http://localhost/api/me/password', {
+      method: 'PATCH', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ currentPassword: 'old-password', newPassword: 'new-password' }),
+    }) as never)
+
+    expect(response.status).toBe(200)
+    expect(mocks.update).toHaveBeenCalledWith({
+      where: { id: 'user_1' },
+      data: { password: 'hashed-new', authVersion: { increment: 1 } },
+    })
+  })
 })

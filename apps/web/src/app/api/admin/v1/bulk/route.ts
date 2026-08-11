@@ -48,7 +48,7 @@ export async function POST(request: NextRequest) {
       audit: { requestId: actor.requestId, actorRoleKey: actor.roleKey, targetType: 'user', reason: body.reason, outcome: 'success', before: { ids: users.map(user => user.id), statuses: users.map(user => user.accountStatus) }, after: { status: targetStatus, affected: eligible.length } },
       mutate: async tx => {
         if (eligible.length === 0) return { affected: 0 }
-        const updated = await tx.user.updateMany({ where: { id: { in: eligible.map(user => user.id) } }, data: body.action === 'suspend' ? { accountStatus: 'suspended', suspendedAt: new Date(), suspendedById: actor.userId, suspensionReason: body.reason } : { accountStatus: 'active', suspendedAt: null, suspendedById: null, suspensionReason: null } })
+        const updated = await tx.user.updateMany({ where: { id: { in: eligible.map(user => user.id) } }, data: body.action === 'suspend' ? { accountStatus: 'suspended', suspendedAt: new Date(), suspendedById: actor.userId, suspensionReason: body.reason, authVersion: { increment: 1 } } : { accountStatus: 'active', suspendedAt: null, suspendedById: null, suspensionReason: null, authVersion: { increment: 1 } } })
         return { affected: updated.count }
       },
     })

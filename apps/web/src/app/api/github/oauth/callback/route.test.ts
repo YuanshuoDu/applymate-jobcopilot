@@ -35,7 +35,7 @@ describe('GET /api/github/oauth/callback', () => {
     mocks.accountFindUnique.mockReset().mockResolvedValue(null)
     mocks.accountDeleteMany.mockReset().mockResolvedValue({ count: 0 })
     mocks.accountUpsert.mockReset().mockResolvedValue({})
-    mocks.userFindUnique.mockReset().mockResolvedValue({ id: 'user_1' })
+    mocks.userFindUnique.mockReset().mockResolvedValue({ id: 'user_1', accountStatus: 'active' })
   })
 
   afterEach(() => {
@@ -80,6 +80,26 @@ describe('GET /api/github/oauth/callback', () => {
     expect(response.status).toBe(307)
     expect(location.searchParams.get('githubError')).toBe('invalid_state')
     expect(fetchMock).not.toHaveBeenCalled()
+    expect(mocks.accountUpsert).not.toHaveBeenCalled()
+  })
+
+  it('does not link a GitHub account after the owner is suspended', async () => {
+    mocks.userFindUnique.mockResolvedValue({ id: 'user_1', accountStatus: 'suspended' })
+    const state = await new SignJWT({ uid: 'user_1', returnTo: '/?page=settings&tab=accounts', nonce: 'nonce-1' })
+      .setProtectedHeader({ alg: 'HS256' })
+      .setExpirationTime('10m')
+      .sign(new TextEncoder().encode('test-secret-which-is-long-enough'))
+    vi.spyOn(globalThis, 'fetch')
+      .mockResolvedValueOnce(new Response(JSON.stringify({ access_token: 'token-1' }), { status: 200 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ id: 42 }), { status: 200 }))
+
+    const { GET } = await import('./route')
+    const response = await GET(new NextRequest(
+      `https://applymate.site/api/github/oauth/callback?code=code-1&state=${encodeURIComponent(state)}`,
+      { headers: { cookie: `${GITHUB_STATE_COOKIE}=nonce-1` } },
+    ))
+
+    expect(new URL(response.headers.get('location') ?? '').searchParams.get('githubError')).toBe('account_suspended')
     expect(mocks.accountUpsert).not.toHaveBeenCalled()
   })
 })

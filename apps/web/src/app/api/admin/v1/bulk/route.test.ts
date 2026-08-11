@@ -49,7 +49,7 @@ describe('POST /api/admin/v1/bulk', () => {
     expect(response.status).toBe(200)
     await expect(response.json()).resolves.toMatchObject({ resource: 'users', action: 'suspend', affected: 1 })
     expect(mocks.requireAdmin).toHaveBeenCalledWith('users.suspend', expect.any(NextRequest))
-    expect(mocks.userUpdateMany).toHaveBeenCalledWith(expect.objectContaining({ where: { id: { in: ['user_1'] } }, data: expect.objectContaining({ accountStatus: 'suspended', suspendedById: 'admin_1' }) }))
+    expect(mocks.userUpdateMany).toHaveBeenCalledWith(expect.objectContaining({ where: { id: { in: ['user_1'] } }, data: expect.objectContaining({ accountStatus: 'suspended', suspendedById: 'admin_1', authVersion: { increment: 1 } }) }))
   })
 
   it('rejects a failed CSRF/origin check before authentication', async () => {

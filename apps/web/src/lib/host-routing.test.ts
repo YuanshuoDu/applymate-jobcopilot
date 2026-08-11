@@ -11,16 +11,22 @@ describe('host routing', () => {
   it('classifies admin, auth, and admin API paths', () => {
     expect(isAdminPath('/admin')).toBe(true)
     expect(isAdminPath('/admin/users')).toBe(true)
+    expect(isAdminPath('/invite/admin')).toBe(true)
     expect(isAdminPath('/dashboard')).toBe(false)
     expect(isAuthPath('/login')).toBe(true)
     expect(isAuthPath('/api/auth/session')).toBe(true)
     expect(isAuthPath('/register')).toBe(false)
     expect(isAdminApiPath('/api/admin/v1/users')).toBe(true)
+    expect(isAdminApiPath('/api/admin/invitations/accept')).toBe(true)
     expect(isAdminApiPath('/api/users')).toBe(false)
   })
 
   it('builds the administrator origin without preserving a preview host', () => {
     expect(adminOrigin('https://web-preview.vercel.app/admin')).toBe('https://admin.applymate.site')
+  })
+
+  it('keeps the local administrator origin on the local development host', () => {
+    expect(adminOrigin('http://localhost:3000/admin')).toBe('http://localhost:3000')
   })
 
   it('recognizes local development hosts', () => {

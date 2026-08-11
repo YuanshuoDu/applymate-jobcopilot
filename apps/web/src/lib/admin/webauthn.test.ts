@@ -18,6 +18,19 @@ describe('admin WebAuthn helpers', () => {
     else process.env.WEBAUTHN_RP_ID = oldRpId
   })
 
+  it('defaults WebAuthn to the administrator origin, never the public app origin', async () => {
+    const oldOrigin = process.env.WEBAUTHN_ORIGIN
+    const oldAdminUrl = process.env.ADMIN_APP_URL
+    delete process.env.WEBAUTHN_ORIGIN
+    process.env.ADMIN_APP_URL = 'https://admin.applymate.site'
+    const { webAuthnSettings } = await import('./webauthn')
+    expect(webAuthnSettings(new Request('https://applymate.site/api/admin/v1/security/webauthn'))).toMatchObject({ origin: 'https://admin.applymate.site', rpID: 'admin.applymate.site' })
+    if (oldOrigin === undefined) delete process.env.WEBAUTHN_ORIGIN
+    else process.env.WEBAUTHN_ORIGIN = oldOrigin
+    if (oldAdminUrl === undefined) delete process.env.ADMIN_APP_URL
+    else process.env.ADMIN_APP_URL = oldAdminUrl
+  })
+
   it('accepts only a non-expired hashed reauth cookie', async () => {
     const { ADMIN_REAUTH_COOKIE, hashReauthToken, hasFreshAdminReauth } = await import('./webauthn')
     findReauth.mockResolvedValue({ id: 'grant-1' })

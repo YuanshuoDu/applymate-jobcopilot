@@ -1,4 +1,5 @@
 import { NextResponse } from 'next/server'
+import { adminOrigin } from '@/lib/host-routing'
 
 export type AdminWriteValidation = { ok: true } | { ok: false; status: 403 | 400; code: 'CSRF_ORIGIN_MISMATCH' | 'IDEMPOTENCY_KEY_REQUIRED' }
 
@@ -23,7 +24,7 @@ export function validateAdminWrite(request: Request) {
 
 export function validateAdminWriteRequest(request: Request): AdminWriteValidation {
   if (['GET', 'HEAD', 'OPTIONS'].includes(request.method.toUpperCase())) return { ok: true }
-  const configuredOrigin = originFrom(process.env.AUTH_CANONICAL_URL) ?? originFrom(process.env.NEXTAUTH_URL) ?? originFrom(request.url)
+  const configuredOrigin = originFrom(adminOrigin(request.url))
   const requestOrigin = originFrom(request.headers.get('origin') ?? request.headers.get('referer') ?? undefined)
   return configuredOrigin && requestOrigin === configuredOrigin
     ? { ok: true }

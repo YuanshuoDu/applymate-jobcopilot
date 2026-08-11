@@ -9,6 +9,7 @@ import { EXTENSION_TOKEN_AUDIENCE, EXTENSION_TOKEN_ISSUER, getAuthJwtSecret } fr
 import { resolvePlatformRoute } from '@/lib/admin/ai-config'
 import { activateTenantContext } from '@/lib/db/tenant-store'
 import { isFeatureAllowed, resolveAiAccess } from '@/lib/entitlements'
+import { authVersionFromClaim, isCurrentAuthVersion } from '@/lib/auth-version'
 
 const JWT_SECRET = getAuthJwtSecret()
 
@@ -34,8 +35,7 @@ export async function requireAuth(
       if (typeof payload.sub === 'string' && payload.sub.length > 0) {
         return activeAccountOrDenied(
           payload.sub,
-          typeof payload.updatedAt === 'string' ? payload.updatedAt : null,
-          typeof payload.iat === 'number' ? payload.iat : null,
+          authVersionFromClaim(payload.authVersion),
         )
       }
     } catch {
@@ -50,17 +50,11 @@ export async function requireAuth(
   return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
 }
 
-async function activeAccountOrDenied(userId: string, issuedAt?: string | null, issuedUnix?: number | null) {
-  const user = await db.user.findUnique({ where: { id: userId }, select: { accountStatus: true, updatedAt: true } })
+async function activeAccountOrDenied(userId: string, expectedAuthVersion?: number) {
+  const user = await db.user.findUnique({ where: { id: userId }, select: { accountStatus: true, authVersion: true } })
   if (!user) return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
-  if (user?.accountStatus === 'suspended') return NextResponse.json({ error: 'Account suspended' }, { status: 403 })
-  const isBearerToken = issuedAt !== undefined || issuedUnix !== undefined
-  if (isBearerToken) {
-    if (issuedAt && user.updatedAt.toISOString() !== issuedAt) return NextResponse.json({ error: 'Session expired' }, { status: 401 })
-    if (!issuedAt && (!issuedUnix || user.updatedAt.getTime() > issuedUnix * 1000)) {
-      return NextResponse.json({ error: 'Session expired' }, { status: 401 })
-    }
-  }
+  if (user.accountStatus !== 'active') return NextResponse.json({ error: 'Account suspended' }, { status: 403 })
+  if (expectedAuthVersion !== undefined && !isCurrentAuthVersion(expectedAuthVersion, user.authVersion)) return NextResponse.json({ error: 'Session expired' }, { status: 401 })
   activateTenantContext(userId)
   return { userId }
 }

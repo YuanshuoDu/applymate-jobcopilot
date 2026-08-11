@@ -29,7 +29,7 @@ describe('PATCH /api/admin/v1/users/:id/account-state', () => {
       body: JSON.stringify({ status: 'suspended', reason: 'Policy review requires a pause' }),
     }) as never, { params: Promise.resolve({ id: 'user_1' }) })
     expect(response.status).toBe(200)
-    expect(mocks.update).toHaveBeenCalledWith(expect.objectContaining({ where: { id: 'user_1' }, data: expect.objectContaining({ accountStatus: 'suspended' }) }))
+    expect(mocks.update).toHaveBeenCalledWith(expect.objectContaining({ where: { id: 'user_1' }, data: expect.objectContaining({ accountStatus: 'suspended', authVersion: { increment: 1 } }) }))
     expect(mocks.audit).toHaveBeenCalled()
   })
 })

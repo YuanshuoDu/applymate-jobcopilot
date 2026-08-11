@@ -2,6 +2,7 @@
 
 import React, { useState, useEffect, useMemo, useRef } from 'react'
 import { useRouter } from 'next/navigation'
+import { signOut } from 'next-auth/react'
 import { TopBar } from '@/components/layout/TopBar'
 import { Btn, Card, useToast, useConfirm, UserAvatar } from '@/components/ui'
 import type { NotificationPreferences, PrivacyPreferences, UserProfile, UserPreferences } from '@/lib/types'
@@ -604,8 +605,8 @@ export function SettingsPage() {
                       setPwSaving(false)
                       if (error) { toast.error('Password change failed', error) }
                       else {
-                        toast.success('Password updated')
-                        setPasswordCur(''); setPasswordNew(''); setPasswordConf('')
+                        toast.success('Password updated', 'Sign in again to continue')
+                        await signOut({ callbackUrl: '/login?passwordChanged=1' })
                       }
                     }}>{pwSaving ? 'Updating...' : 'Update password'}</Btn>
                   </div>

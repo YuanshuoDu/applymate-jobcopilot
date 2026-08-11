@@ -16,6 +16,7 @@ vi.mock('@/lib/db', () => ({ db: { user: { findUnique: mocks.userFindUnique } } 
 
 describe('requireAuth', () => {
   const updatedAt = new Date('2026-08-10T09:00:00.000Z')
+  const authVersion = 1
 
   beforeEach(() => {
     vi.resetModules()
@@ -23,9 +24,9 @@ describe('requireAuth', () => {
     mocks.jwtVerify.mockReset()
     mocks.safeAuth.mockReset()
     mocks.userFindUnique.mockReset()
-    mocks.jwtVerify.mockResolvedValue({ payload: { sub: 'extension-user', updatedAt: updatedAt.toISOString() } })
+    mocks.jwtVerify.mockResolvedValue({ payload: { sub: 'extension-user', authVersion } })
     mocks.safeAuth.mockResolvedValue(null)
-    mocks.userFindUnique.mockResolvedValue({ accountStatus: 'active', updatedAt })
+    mocks.userFindUnique.mockResolvedValue({ accountStatus: 'active', authVersion, updatedAt })
   })
 
   it('accepts a verified Bearer token passed explicitly by a route', async () => {
@@ -51,13 +52,13 @@ describe('requireAuth', () => {
   it('keeps normal web sessions working without an extension-token revision claim', async () => {
     mocks.headers.mockResolvedValue(new Headers())
     mocks.safeAuth.mockResolvedValue({ user: { id: 'web-user' } })
-    mocks.userFindUnique.mockResolvedValue({ accountStatus: 'active', updatedAt })
+    mocks.userFindUnique.mockResolvedValue({ accountStatus: 'active', authVersion, updatedAt })
     const { requireAuth } = await import('./api-helpers')
 
     await expect(requireAuth()).resolves.toEqual({ userId: 'web-user' })
   })
 
-  it('accepts a legacy bearer token when its issued-at predates no account update', async () => {
+  it('accepts a legacy bearer token after an unrelated profile update', async () => {
     mocks.jwtVerify.mockResolvedValue({ payload: { sub: 'extension-user', iat: Math.floor(updatedAt.getTime() / 1000) } })
     const { requireAuth } = await import('./api-helpers')
     const result = await requireAuth(new Request('http://localhost/api/jobs', {
@@ -65,6 +66,17 @@ describe('requireAuth', () => {
     }) as never)
 
     expect(result).toEqual({ userId: 'extension-user' })
+  })
+
+  it('rejects a bearer token after a security-sensitive auth version change', async () => {
+    mocks.userFindUnique.mockResolvedValue({ accountStatus: 'active', authVersion: 2 })
+    const { requireAuth } = await import('./api-helpers')
+    const result = await requireAuth(new Request('http://localhost/api/jobs', {
+      headers: { Authorization: 'Bearer extension-token' },
+    }) as never)
+
+    expect(result).toBeInstanceOf(Response)
+    expect((result as Response).status).toBe(401)
   })
 
   it('does not trust a client-provided x-user-id header', async () => {

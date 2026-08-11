@@ -41,10 +41,10 @@ describe("isUserActive", () => {
     expect(String(query.mock.calls[0]?.[0])).toContain('"accountStatus"');
   });
 
-  it("fails open when an older database has no account status column", async () => {
+  it("fails closed when account status cannot be checked", async () => {
     const { pool, query } = testPool();
     query.mockRejectedValueOnce(new Error('column "accountStatus" does not exist'));
 
-    await expect(isUserActive(pool, "user_1")).resolves.toBe(true);
+    await expect(isUserActive(pool, "user_1")).resolves.toBe(false);
   });
 });

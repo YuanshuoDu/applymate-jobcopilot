@@ -12,6 +12,7 @@ import { reconcileGoogleLoginIdentity } from '@/lib/google-identity'
 import { EXTENSION_TOKEN_AUDIENCE, EXTENSION_TOKEN_ISSUER, getAuthJwtSecret, getAuthSecret } from '@/lib/auth-secret'
 import { canonicalAuthRedirect } from '@/lib/auth-url'
 import { encryptAccountTokenFields } from '@/lib/credential-secrets'
+import { isCurrentAuthVersion } from '@/lib/auth-version'
 
 const AUTH_SECRET = getAuthSecret()
 const JWT_SECRET = getAuthJwtSecret()
@@ -36,9 +37,11 @@ providers.push(Credentials({
           audience: EXTENSION_TOKEN_AUDIENCE,
         })
         if (typeof payload.sub !== 'string' || !payload.sub) return null
-        const user = await db.user.findUnique({ where: { id: payload.sub as string } })
-        if (!user || user.accountStatus === 'suspended') return null
-        if (typeof payload.updatedAt !== 'string' || user.updatedAt.toISOString() !== payload.updatedAt) return null
+        const user = await db.user.findUnique({
+          where: { id: payload.sub as string },
+          select: { id: true, email: true, name: true, image: true, accountStatus: true, authVersion: true },
+        })
+        if (!user || user.accountStatus !== 'active' || !isCurrentAuthVersion(payload.authVersion, user.authVersion)) return null
         return { id: user.id, email: user.email, name: user.name, image: user.image }
       } catch {
         return null
@@ -52,7 +55,7 @@ providers.push(Credentials({
     const user = await db.user.findFirst({
       where: { email: { equals: email, mode: 'insensitive' } },
     })
-    if (!user?.password || user.accountStatus === 'suspended') return null
+    if (!user?.password || user.accountStatus !== 'active') return null
     const valid = await bcrypt.compare(credentials.password as string, user.password)
     if (!valid) return null
     return { id: user.id, email: user.email, name: user.name, image: user.image }
@@ -97,6 +100,17 @@ export const { handlers, signIn, signOut, auth } = NextAuth({
       if (account?.provider === 'google') {
         const validIdentity = await reconcileGoogleLoginIdentity({ user, account, profile })
         if (!validIdentity) return '/login?error=OAuthIdentityMismatch'
+      }
+
+      // OAuth providers can resolve a previously linked account without using
+      // Credentials.authorize. Enforce the same lifecycle rule before a JWT is
+      // minted, including after Google identity reconciliation changes user.id.
+      if (user.id) {
+        const currentUser = await db.user.findUnique({
+          where: { id: user.id },
+          select: { accountStatus: true },
+        })
+        if (currentUser && currentUser.accountStatus !== 'active') return '/login?error=AccountUnavailable'
       }
 
       // PrismaAdapter only INSERTS account rows via linkAccount on first OAuth;
@@ -146,27 +160,21 @@ export const { handlers, signIn, signOut, auth } = NextAuth({
     async jwt({ token, user }) {
       if (user) {
         token.id = user.id
-        // Cache plan and internal session version at sign-in. Admin routes compare
-        // the latter to the live membership, invalidating stale role sessions.
+        // Cache plan and revocation versions at sign-in. The general version
+        // invalidates every session after password/account-state changes without
+        // logging users out after ordinary profile or preference updates.
         const [dbUser, membership] = await Promise.all([
-          db.user.findUnique({ where: { id: user.id }, select: { plan: true, updatedAt: true } }),
+          db.user.findUnique({ where: { id: user.id }, select: { plan: true, authVersion: true } }),
           db.adminMembership.findUnique({ where: { userId: user.id }, select: { sessionVersion: true } }),
         ])
         if (dbUser) token.plan = dbUser.plan
-        if (dbUser) token.userUpdatedAt = dbUser.updatedAt.toISOString()
+        if (dbUser) token.authVersion = dbUser.authVersion
         token.adminSessionVersion = membership?.sessionVersion
       }
       if (!user && typeof token.id === 'string') {
-        const current = await db.user.findUnique({ where: { id: token.id }, select: { updatedAt: true, accountStatus: true } })
-        if (!current || current.accountStatus === 'suspended') return {}
-        if (typeof token.userUpdatedAt === 'string') {
-          if (current.updatedAt.toISOString() !== token.userUpdatedAt) return {}
-        } else if (typeof token.iat === 'number' && current.updatedAt.getTime() > token.iat * 1000) {
-          return {}
-        }
-        // Seamlessly upgrade a session minted before the revocation claim was
-        // introduced while retaining the account-update invalidation check.
-        token.userUpdatedAt = current.updatedAt.toISOString()
+        const current = await db.user.findUnique({ where: { id: token.id }, select: { authVersion: true, accountStatus: true } })
+        if (!current || current.accountStatus !== 'active' || !isCurrentAuthVersion(token.authVersion, current.authVersion)) return {}
+        token.authVersion = current.authVersion
       }
       return token
     },

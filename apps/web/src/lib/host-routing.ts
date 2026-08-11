@@ -14,7 +14,10 @@ export function isAdminHost(hostname: string): boolean {
 }
 
 export function isAdminPath(pathname: string): boolean {
-  return pathname === '/admin' || pathname.startsWith('/admin/')
+  return pathname === '/admin'
+    || pathname.startsWith('/admin/')
+    || pathname === '/invite/admin'
+    || pathname.startsWith('/invite/admin/')
 }
 
 export function isAuthPath(pathname: string): boolean {
@@ -29,7 +32,9 @@ export function isAuthPath(pathname: string): boolean {
 }
 
 export function isAdminApiPath(pathname: string): boolean {
-  return pathname === '/api/admin/v1' || pathname.startsWith('/api/admin/v1/')
+  return pathname === '/api/admin/v1'
+    || pathname.startsWith('/api/admin/v1/')
+    || pathname === '/api/admin/invitations/accept'
 }
 
 export function isLocalHost(hostname: string): boolean {
@@ -37,16 +42,18 @@ export function isLocalHost(hostname: string): boolean {
 }
 
 export function adminOrigin(requestUrl: string): string {
+  const request = new URL(requestUrl)
+  if (isLocalHost(request.hostname)) return request.origin
+
   const configured = process.env.ADMIN_APP_URL?.trim()
   if (configured) {
     try {
       const url = new URL(configured)
-      if (url.protocol === 'http:' || url.protocol === 'https:') return url.origin
+      if ((url.protocol === 'http:' || url.protocol === 'https:') && isAdminHost(url.hostname)) return url.origin
     } catch {
       // Fall through to the configured host and request protocol.
     }
   }
 
-  const request = new URL(requestUrl)
   return `${request.protocol}//${ADMIN_HOST}`
 }
