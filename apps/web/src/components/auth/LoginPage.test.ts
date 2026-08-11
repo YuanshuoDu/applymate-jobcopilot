@@ -13,11 +13,25 @@ describe('authentication layout safeguards', () => {
     expect(loginSource).toMatch(/id="login-password" name="password"/)
   })
 
+  it('uses hold-to-reveal for the login password field', () => {
+    expect(loginSource).toMatch(/type=\{passwordVisible \? 'text' : 'password'\}/)
+    expect(loginSource).toMatch(/onPointerDown=\{handlePasswordPointerDown\}/)
+    expect(loginSource).toMatch(/onPointerUp=\{releasePasswordVisibility\}/)
+    expect(loginSource).toMatch(/onPointerCancel=\{releasePasswordVisibility\}/)
+  })
+
   it('associates registration labels with stable, named form controls', () => {
     for (const field of ['name', 'email', 'password', 'confirm']) {
       expect(registerSource).toMatch(new RegExp(`<label htmlFor="register-${field}"`))
       expect(registerSource).toMatch(new RegExp(`id="register-${field}" name="${field}"`))
     }
+  })
+
+  it('provides click-to-toggle visibility for both registration password fields', () => {
+    expect(registerSource).toMatch(/type=\{passwordVisible \? 'text' : 'password'\}/)
+    expect(registerSource).toMatch(/type=\{confirmVisible \? 'text' : 'password'\}/)
+    expect(registerSource).toMatch(/onClick=\{\(\) => setPasswordVisible\(value => !value\)\}/)
+    expect(registerSource).toMatch(/onClick=\{\(\) => setConfirmVisible\(value => !value\)\}/)
   })
 
   it('uses a tablet breakpoint so the brand panel cannot squeeze the form', () => {
