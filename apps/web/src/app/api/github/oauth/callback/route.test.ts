@@ -9,6 +9,7 @@ const mocks = vi.hoisted(() => ({
   accountDeleteMany: vi.fn(),
   accountUpsert: vi.fn(),
   userFindUnique: vi.fn(),
+  safeAuth: vi.fn(),
 }))
 const pinnedFetch = vi.hoisted(() => vi.fn((input: string | URL, init?: unknown) => globalThis.fetch(String(input), init as RequestInit)))
 
@@ -20,6 +21,7 @@ vi.mock('@/lib/db', () => ({ db: {
   },
   user: { findUnique: mocks.userFindUnique },
 } }))
+vi.mock('@/lib/safe-auth', () => ({ safeAuth: mocks.safeAuth }))
 vi.mock('@jobcopilot/shared', async () => {
   const actual = await vi.importActual<typeof import('@jobcopilot/shared')>('@jobcopilot/shared')
   return { ...actual, pinnedFetch }
@@ -36,6 +38,7 @@ describe('GET /api/github/oauth/callback', () => {
     mocks.accountDeleteMany.mockReset().mockResolvedValue({ count: 0 })
     mocks.accountUpsert.mockReset().mockResolvedValue({})
     mocks.userFindUnique.mockReset().mockResolvedValue({ id: 'user_1', accountStatus: 'active' })
+    mocks.safeAuth.mockReset().mockResolvedValue({ user: { id: 'user_1' } })
   })
 
   afterEach(() => {
@@ -100,6 +103,26 @@ describe('GET /api/github/oauth/callback', () => {
     ))
 
     expect(new URL(response.headers.get('location') ?? '').searchParams.get('githubError')).toBe('account_suspended')
+    expect(mocks.accountUpsert).not.toHaveBeenCalled()
+  })
+
+  it('does not attach GitHub credentials after the initiating session is replaced', async () => {
+    mocks.safeAuth.mockResolvedValue({ user: { id: 'user_2' } })
+    const state = await new SignJWT({ uid: 'user_1', returnTo: '/?page=settings&tab=accounts', nonce: 'nonce-1' })
+      .setProtectedHeader({ alg: 'HS256' })
+      .setExpirationTime('10m')
+      .sign(new TextEncoder().encode('test-secret-which-is-long-enough'))
+    const fetchMock = vi.spyOn(globalThis, 'fetch')
+
+    const { GET } = await import('./route')
+    const response = await GET(new NextRequest(
+      `https://applymate.site/api/github/oauth/callback?code=code-1&state=${encodeURIComponent(state)}`,
+      { headers: { cookie: `${GITHUB_STATE_COOKIE}=nonce-1` } },
+    ))
+
+    expect(new URL(response.headers.get('location') ?? '').searchParams.get('githubError')).toBe('session_mismatch')
+    expect(fetchMock).not.toHaveBeenCalled()
+    expect(mocks.userFindUnique).not.toHaveBeenCalled()
     expect(mocks.accountUpsert).not.toHaveBeenCalled()
   })
 })
