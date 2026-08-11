@@ -603,6 +603,16 @@ body {
   color: var(--primary);
 }
 
+.mobile-more-menu button[data-danger="true"] {
+  color: #B4233B;
+}
+
+.mobile-more-menu button[data-danger="true"]:hover,
+.mobile-more-menu button[data-danger="true"]:focus-visible {
+  background: #FFF5F5;
+  color: #A32D2D;
+}
+
 /* ─── Selection ──────────────────────────────────────────────────────── */
 ::selection {
   background: rgba(var(--primary-rgb, 79,70,229), 0.20);

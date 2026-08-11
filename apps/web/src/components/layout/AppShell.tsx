@@ -8,6 +8,7 @@ import { Bell } from 'lucide-react'
 import { Sidebar } from './Sidebar'
 import type { Page } from '@/lib/types'
 import { NavContext } from '@/lib/nav-context'
+import { useI18n } from '@/lib/i18n'
 import { OnboardingFlow } from '@/components/onboarding/OnboardingFlow'
 import { clearCachedApiResponses } from '@/lib/api-cache'
 import { pageFromSearch } from './page-routing'
@@ -51,7 +52,7 @@ interface NotificationItem {
 }
 
 type MobileNavItem = { id: Page | 'more'; label: string }
-type MobileMoreItem = { id: Extract<Page, 'gmail' | 'settings'>; label: string }
+type MobileMoreItem = { id: Extract<Page, 'gmail' | 'settings'> | 'signout'; label: string }
 
 export function getMobileNavItems(): MobileNavItem[] {
   return [
@@ -63,10 +64,11 @@ export function getMobileNavItems(): MobileNavItem[] {
   ]
 }
 
-export function getMobileMoreItems(): MobileMoreItem[] {
+export function getMobileMoreItems(signOutLabel = 'Sign out'): MobileMoreItem[] {
   return [
     { id: 'gmail',    label: 'Gmail'    },
     { id: 'settings', label: 'Settings' },
+    { id: 'signout',  label: signOutLabel },
   ]
 }
 
@@ -163,6 +165,7 @@ export function AppShell() {
   const [timedOut, setTimedOut] = useState(false)
   const [jobCount, setJobCount] = useState(0)
   const { data: session, status } = useSession()
+  const { t } = useI18n()
   const router = useRouter()
   const initialPageRef = useRef(page)
   const previousUserIdRef = useRef<string | null>(null)
@@ -443,8 +446,11 @@ export function AppShell() {
 
             {mobileMoreOpen && (
               <div className="mobile-more-menu" data-mobile-more-menu role="menu" aria-label="More navigation">
-                {getMobileMoreItems().map(item => (
-                  <button key={item.id} role="menuitem" onClick={() => navigatePage(item.id)}>
+                {getMobileMoreItems(t('nav.signout')).map(item => (
+                  <button key={item.id} role="menuitem" data-danger={item.id === 'signout'} onClick={() => {
+                    if (item.id === 'signout') void signOut({ callbackUrl: '/login' })
+                    else navigatePage(item.id)
+                  }}>
                     {item.label}
                   </button>
                 ))}
