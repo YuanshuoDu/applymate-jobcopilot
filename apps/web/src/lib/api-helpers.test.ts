@@ -58,6 +58,18 @@ describe('requireAuth', () => {
     await expect(requireAuth()).resolves.toEqual({ userId: 'web-user' })
   })
 
+  it('rejects a web session after a security-sensitive auth version change', async () => {
+    mocks.headers.mockResolvedValue(new Headers())
+    mocks.safeAuth.mockResolvedValue({ user: { id: 'web-user', authVersion: 1 } })
+    mocks.userFindUnique.mockResolvedValue({ accountStatus: 'active', authVersion: 2, updatedAt })
+    const { requireAuth } = await import('./api-helpers')
+
+    const result = await requireAuth()
+
+    expect(result).toBeInstanceOf(Response)
+    expect((result as Response).status).toBe(401)
+  })
+
   it('accepts a legacy bearer token after an unrelated profile update', async () => {
     mocks.jwtVerify.mockResolvedValue({ payload: { sub: 'extension-user', iat: Math.floor(updatedAt.getTime() / 1000) } })
     const { requireAuth } = await import('./api-helpers')

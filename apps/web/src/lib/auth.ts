@@ -11,7 +11,8 @@ import { canonicalAuthRedirect } from '@/lib/auth-url'
 import { encryptAccountTokenFields } from '@/lib/credential-secrets'
 import { assertNoAuthOriginOverride } from '@/lib/auth-runtime-config'
 import { authorizeCredentials } from '@/lib/credential-authorizer'
-import { refreshExistingSessionToken } from '@/lib/auth-session-token'
+import { refreshExistingSessionToken, sessionTokenUserId } from '@/lib/auth-session-token'
+import { authVersionFromClaim } from '@/lib/auth-version'
 
 assertNoAuthOriginOverride()
 const AUTH_SECRET = getAuthSecret()
@@ -155,9 +156,11 @@ export const { handlers, signIn, signOut, auth } = NextAuth({
       return token
     },
     async session({ session, token }) {
-      if (token?.id && session.user) {
-        session.user.id   = token.id as string
+      const userId = sessionTokenUserId(token)
+      if (userId && session.user) {
+        session.user.id   = userId
         session.user.plan = (token.plan as 'free' | 'pro' | 'enterprise') ?? 'free'
+        session.user.authVersion = authVersionFromClaim(token.authVersion)
         session.user.adminSessionVersion = typeof token.adminSessionVersion === 'number' ? token.adminSessionVersion : undefined
       }
       return session

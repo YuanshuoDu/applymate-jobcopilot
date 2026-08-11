@@ -1,9 +1,19 @@
 import { describe, expect, it } from 'vitest'
-import { refreshExistingSessionToken } from './auth-session-token'
+import { refreshExistingSessionToken, sessionTokenUserId } from './auth-session-token'
 
 const activeUser = { accountStatus: 'active', authVersion: 1, plan: 'pro' }
 
 describe('refreshExistingSessionToken', () => {
+  it('reads one verified identity from either current or legacy claims', () => {
+    expect(sessionTokenUserId({ id: 'user_current', sub: 'user_current' })).toBe('user_current')
+    expect(sessionTokenUserId({ sub: 'user_legacy' })).toBe('user_legacy')
+  })
+
+  it('rejects conflicting or missing session identities', () => {
+    expect(sessionTokenUserId({ id: 'user_1', sub: 'user_2' })).toBeNull()
+    expect(sessionTokenUserId({ email: 'candidate@example.com' })).toBeNull()
+  })
+
   it('normalizes an active legacy Auth.js subject into the application id claim', () => {
     const token = { sub: 'user_legacy', email: 'candidate@example.com' }
 
