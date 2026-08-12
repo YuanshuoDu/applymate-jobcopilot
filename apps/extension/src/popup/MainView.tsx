@@ -7,7 +7,7 @@ import { C } from './popup-constants'
 import { ActionRow, countPill, Divider, EmptyJob, footerLink, InlineMessage, primaryAction } from './PopupActions'
 import { PopupHeader } from './PopupHeader'
 import { DetectionRow, JobSummary } from './PopupJobCard'
-import { getLabels, isCurrentJobResponse, isSavedJob, isSavedJobsResponse, isSaveResponse, isScrapedJob, isStatsResponse, openSidePanel, sameJob, type PopupStats } from './popup-utils'
+import { getLabels, isCurrentJobResponse, isSavedJob, isSavedJobsResponse, isSaveResponse, isScrapedJob, isStatsResponse, openCurrentSidePanel, sameJob, type PopupStats } from './popup-utils'
 
 export function PopupMainView({ settings, onSettings, onLogout }: {
   settings: ExtensionSettings
@@ -16,7 +16,6 @@ export function PopupMainView({ settings, onSettings, onLogout }: {
 }) {
   const labels = getLabels()
   const [currentJob, setCurrentJob] = useState<ScrapedJob | null>(null)
-  const [activeWindowId, setActiveWindowId] = useState<number | null>(null)
   const [savedJobs, setSavedJobs] = useState<SavedJob[]>([])
   const [stats, setStats] = useState<PopupStats | null>(null)
   const [score, setScore] = useState<ScoreResult | null>(null)
@@ -38,7 +37,6 @@ export function PopupMainView({ settings, onSettings, onLogout }: {
     }
     const load = async () => {
       const [activeTab] = await chrome.tabs.query({ active: true, currentWindow: true })
-      if (typeof activeTab?.windowId === 'number') setActiveWindowId(activeTab.windowId)
       const currentResponse = activeTab?.id
         ? await chrome.tabs.sendMessage(activeTab.id, { type: 'GET_CURRENT_JOB' }).catch(() => null)
         : null
@@ -118,14 +116,15 @@ export function PopupMainView({ settings, onSettings, onLogout }: {
   async function handleOpenSidePanel(target: 'jobs' | 'resume' = 'jobs') {
     setMessage('')
     try {
-      if (activeWindowId === null) throw new Error('No active browser window')
-      await openSidePanel(activeWindowId, target)
+      await openCurrentSidePanel(target)
     } catch {
       setMessage(labels.sidePanelError)
     }
   }
 
-  const openDashboard = () => chrome.tabs.create({ url: `${settings.apiBaseUrl}/?page=jobs` })
+  const openDashboard = () => {
+    void chrome.tabs.create({ url: `${settings.apiBaseUrl}/?page=jobs`, active: true })
+  }
   if (loading) return <PopupLoading />
 
   return (

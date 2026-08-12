@@ -17,12 +17,16 @@ export function UserSettingsView({ settings, onBack, onLogout }: {
   async function toggleAutoSave() {
     const next = !autoSave
     setAutoSave(next)
-    await saveSettings({ autoSave: next })
-    setSaved(true)
-    window.setTimeout(() => setSaved(false), 1600)
+    try {
+      await saveSettings({ autoSave: next })
+      setSaved(true)
+      window.setTimeout(() => setSaved(false), 1600)
+    } catch {
+      setAutoSave(!next)
+    }
   }
 
-  const openAccount = () => chrome.tabs.create({ url: `${settings.apiBaseUrl}/?page=settings` })
+  const openAccount = () => { void chrome.tabs.create({ url: `${settings.apiBaseUrl}/?page=settings`, active: true }) }
 
   return <div style={{ minHeight: 360, background: C.bg, color: C.navy, fontFamily: 'Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif' }}>
     <header style={{ display: 'flex', alignItems: 'center', gap: 9, padding: '13px 14px 11px', borderBottom: `1px solid ${C.border}` }}>

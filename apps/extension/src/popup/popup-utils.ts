@@ -72,6 +72,12 @@ export function companyInitials(company: string): string {
 
 export type SidePanelTarget = 'jobs' | 'resume'
 
+export async function openCurrentSidePanel(target: SidePanelTarget = 'jobs'): Promise<void> {
+  // Keep the native API call in the click chain. Querying the active tab first
+  // would consume Chrome's user-gesture grant and make open() fail.
+  await openSidePanel(chrome.windows.WINDOW_ID_CURRENT, target)
+}
+
 export async function openSidePanel(windowId: number, target: SidePanelTarget = 'jobs'): Promise<void> {
   // Keep this API call in the Popup click handler. Chrome requires the live
   // user gesture and rejects a later Service Worker call as a new action.
