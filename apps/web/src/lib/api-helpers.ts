@@ -40,8 +40,11 @@ export async function requireAuth(
         )
       }
     } catch {
-      // Token invalid — fall through to session check.
+      // A caller that explicitly supplied Bearer credentials must never fall
+      // through to a browser cookie. Otherwise a stale extension token for
+      // account A could silently execute as the cookie account B.
     }
+    return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
   }
 
   // NextAuth session (web app)
@@ -76,10 +79,12 @@ async function activeAccountOrDenied(userId: string, expectedAuthVersion?: numbe
 }
 
 async function activeAccountEmailOrDenied(email: string, expectedAuthVersion: number) {
-  const user = await db.user.findUnique({
-    where: { email },
+  const candidates = await db.user.findMany({
+    where: { email: { equals: email, mode: 'insensitive' } },
     select: { id: true, accountStatus: true, authVersion: true },
+    take: 2,
   })
+  const user = candidates.length === 1 ? candidates[0] : null
   if (!user) return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
   return activeAccountResult(user.id, user, expectedAuthVersion)
 }

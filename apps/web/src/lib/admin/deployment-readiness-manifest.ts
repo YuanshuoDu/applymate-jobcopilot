@@ -45,6 +45,8 @@ export const EXPECTED_MIGRATIONS = [
   '20260810110000_add_plan_transition_controls',
   '20260810120000_add_canonical_plan_entitlements',
   '20260810120000_add_credential_encryption_columns',
+  '20260811090000_add_user_auth_version',
+  '20260812100000_enforce_normalized_user_email',
 ] as const
 
 export const RLS_TABLES = [

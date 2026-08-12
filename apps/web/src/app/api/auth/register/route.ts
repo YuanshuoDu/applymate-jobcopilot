@@ -21,14 +21,26 @@ export async function POST(req: NextRequest) {
   if (password.length < 8)  return err('Password must be at least 8 characters')
   if (password.length > 256 || email.length > 320 || (name && name.length > 120)) return err('Registration details are too long')
 
-  const existing = await db.user.findUnique({ where: { email } })
-  if (existing) return err('Email already registered', 409)
+  const candidates = await db.user.findMany({
+    where: { email: { equals: email, mode: 'insensitive' } },
+    select: { id: true },
+    take: 2,
+  })
+  if (candidates.length > 0) return err('Email already registered', 409)
 
   const hashed = await bcrypt.hash(password, 12)
-  const user = await db.user.create({
-    data: { email, name, password: hashed },
-    select: { id: true, email: true, name: true, plan: true, createdAt: true },
-  })
-
-  return ok(user, 201)
+  try {
+    const user = await db.user.create({
+      data: { email, name, password: hashed },
+      select: { id: true, email: true, name: true, plan: true, createdAt: true },
+    })
+    return ok(user, 201)
+  } catch (error) {
+    // The normalized unique index is the final race-condition guard when two
+    // registrations pass the preflight lookup at the same time.
+    if (typeof error === 'object' && error !== null && 'code' in error && error.code === 'P2002') {
+      return err('Email already registered', 409)
+    }
+    throw error
+  }
 }

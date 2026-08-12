@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { hashPasswordResetToken } from '@/lib/password-reset'
 
 const mocks = vi.hoisted(() => ({
-  userFindFirst: vi.fn(),
+  userFindMany: vi.fn(),
   tokenDeleteMany: vi.fn(),
   tokenCreate: vi.fn(),
   fetch: vi.fn(),
@@ -11,7 +11,7 @@ const pinnedFetch = vi.hoisted(() => vi.fn((input: string | URL, init?: unknown)
 
 vi.mock('@/lib/db', () => ({
   db: {
-    user: { findFirst: mocks.userFindFirst },
+    user: { findMany: mocks.userFindMany },
     verificationToken: {
       deleteMany: mocks.tokenDeleteMany,
       create: mocks.tokenCreate,
@@ -44,7 +44,7 @@ describe('forgot password API', () => {
     vi.stubEnv('EMAIL_FROM', 'ApplyMate <no-reply@example.test>')
     vi.stubEnv('NEXTAUTH_URL', 'https://applymate.example')
     vi.stubGlobal('fetch', mocks.fetch)
-    mocks.userFindFirst.mockResolvedValue({ id: 'user_1' })
+    mocks.userFindMany.mockResolvedValue([{ id: 'user_1' }])
     mocks.tokenDeleteMany.mockResolvedValue({ count: 1 })
     mocks.tokenCreate.mockResolvedValue({ token: 'stored' })
     mocks.fetch.mockResolvedValue(new Response(JSON.stringify({ id: 'email_1' }), { status: 200 }))
@@ -61,9 +61,10 @@ describe('forgot password API', () => {
 
     expect(response.status).toBe(200)
     await expect(response.json()).resolves.toEqual({ ok: true })
-    expect(mocks.userFindFirst).toHaveBeenCalledWith({
+    expect(mocks.userFindMany).toHaveBeenCalledWith({
       where: { email: { equals: 'member@example.com', mode: 'insensitive' } },
       select: { id: true },
+      take: 2,
     })
 
     const tokenData = mocks.tokenCreate.mock.calls[0][0].data as {
@@ -85,7 +86,7 @@ describe('forgot password API', () => {
   })
 
   it('does not reveal whether an address belongs to an account', async () => {
-    mocks.userFindFirst.mockResolvedValue(null)
+    mocks.userFindMany.mockResolvedValue([])
     const { POST } = await import('./route')
     const response = await POST(request({ email: 'missing@example.com' }) as never)
 
@@ -104,7 +105,7 @@ describe('forgot password API', () => {
     await expect(response.json()).resolves.toEqual({
       error: 'Password reset email is not configured. Set RESEND_API_KEY and EMAIL_FROM.',
     })
-    expect(mocks.userFindFirst).not.toHaveBeenCalled()
+    expect(mocks.userFindMany).not.toHaveBeenCalled()
     expect(mocks.tokenCreate).not.toHaveBeenCalled()
   })
 

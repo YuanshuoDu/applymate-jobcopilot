@@ -16,7 +16,7 @@ export async function GET(_req: NextRequest, { params }: Params) {
     SELECT id, status, mode, ats_type as "atsType", flow_used as "flowUsed",
            error, duration_ms as "durationMs", created_at as "createdAt"
     FROM apply_results
-    WHERE job_id = ${jobId}
+    WHERE user_id = ${auth.userId} AND job_id = ${jobId}
     ORDER BY created_at DESC
     LIMIT 10
   `;

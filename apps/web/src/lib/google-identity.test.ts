@@ -1,14 +1,15 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
 const mocks = vi.hoisted(() => ({
-  userUpsert: vi.fn(),
+  userFindMany: vi.fn(),
+  userCreate: vi.fn(),
   accountFindFirst: vi.fn(),
   accountUpdateMany: vi.fn(),
 }))
 
 vi.mock('@/lib/db', () => ({
   db: {
-    user: { upsert: mocks.userUpsert },
+    user: { findMany: mocks.userFindMany, create: mocks.userCreate },
     account: {
       findFirst: mocks.accountFindFirst,
       updateMany: mocks.accountUpdateMany,
@@ -21,7 +22,8 @@ import { reconcileGoogleLoginIdentity } from './google-identity'
 describe('reconcileGoogleLoginIdentity', () => {
   beforeEach(() => {
     Object.values(mocks).forEach(mock => mock.mockReset())
-    mocks.userUpsert.mockResolvedValue({ id: 'target-user', email: 'member@example.com', name: 'Member', image: 'https://example.test/member.png' })
+    mocks.userFindMany.mockResolvedValue([])
+    mocks.userCreate.mockResolvedValue({ id: 'target-user', email: 'member@example.com', name: 'Member', image: 'https://example.test/member.png' })
     mocks.accountFindFirst.mockResolvedValue(null)
     mocks.accountUpdateMany.mockResolvedValue({ count: 1 })
   })
@@ -33,7 +35,7 @@ describe('reconcileGoogleLoginIdentity', () => {
       profile: { email: 'Member@Example.com', email_verified: true },
     })).resolves.toBe(true)
 
-    expect(mocks.userUpsert).not.toHaveBeenCalled()
+    expect(mocks.userFindMany).not.toHaveBeenCalled()
     expect(mocks.accountUpdateMany).not.toHaveBeenCalled()
   })
 
@@ -58,15 +60,19 @@ describe('reconcileGoogleLoginIdentity', () => {
       image: 'https://example.test/member.png',
     })
 
-    expect(mocks.userUpsert).toHaveBeenCalledWith({
-      where: { email: 'member@example.com' },
-      update: {},
-      create: {
+    expect(mocks.userFindMany).toHaveBeenCalledWith({
+      where: { email: { equals: 'member@example.com', mode: 'insensitive' } },
+      select: { id: true, email: true, name: true, image: true },
+      take: 2,
+    })
+    expect(mocks.userCreate).toHaveBeenCalledWith({
+      data: {
         email: 'member@example.com',
         name: 'Member',
         image: 'https://example.test/member.png',
         emailVerified: expect.any(Date),
       },
+      select: { id: true, email: true, name: true, image: true },
     })
     expect(mocks.accountUpdateMany).toHaveBeenCalledWith({
       where: { provider: 'google', providerAccountId: 'google-subject' },
@@ -81,7 +87,7 @@ describe('reconcileGoogleLoginIdentity', () => {
       profile: { email: 'member@example.com', email_verified: false },
     })).resolves.toBe(false)
 
-    expect(mocks.userUpsert).not.toHaveBeenCalled()
+    expect(mocks.userCreate).not.toHaveBeenCalled()
     expect(mocks.accountUpdateMany).not.toHaveBeenCalled()
   })
 
@@ -95,5 +101,23 @@ describe('reconcileGoogleLoginIdentity', () => {
     })).resolves.toBe(false)
 
     expect(mocks.accountUpdateMany).not.toHaveBeenCalled()
+  })
+
+  it('reuses the identity created by a concurrent normalized-email insert', async () => {
+    mocks.userFindMany
+      .mockResolvedValueOnce([])
+      .mockResolvedValueOnce([{ id: 'member-1', email: 'member@example.com', name: 'Member', image: null }])
+    mocks.userCreate.mockRejectedValue({ code: 'P2002' })
+    mocks.accountFindFirst.mockResolvedValue(null)
+    mocks.accountUpdateMany.mockResolvedValue({ count: 1 })
+
+    const user = { id: 'legacy-user', email: 'legacy@example.com', name: 'Legacy', image: null as string | null }
+    await expect(reconcileGoogleLoginIdentity({
+      user,
+      account: { provider: 'google', providerAccountId: 'google-subject' },
+      profile: { email: 'member@example.com', email_verified: true },
+    })).resolves.toBe(true)
+
+    expect(user.id).toBe('member-1')
   })
 })

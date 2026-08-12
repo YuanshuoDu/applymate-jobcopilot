@@ -31,10 +31,12 @@ export async function POST(req: NextRequest) {
   if (configurationError) return err(configurationError, 503)
 
   try {
-    const user = await db.user.findFirst({
+    const candidates = await db.user.findMany({
       where: { email: { equals: email, mode: 'insensitive' } },
       select: { id: true },
+      take: 2,
     })
+    const user = candidates.length === 1 ? candidates[0] : null
 
     // Keep the response identical for known and unknown accounts.
     if (!user) return ok({ ok: true })

@@ -1,7 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
 const mocks = vi.hoisted(() => ({
-  userFindUnique: vi.fn(),
+  userFindMany: vi.fn(),
   userCreate: vi.fn(),
   hash: vi.fn(),
 }))
@@ -9,7 +9,7 @@ const mocks = vi.hoisted(() => ({
 vi.mock('@/lib/db', () => ({
   db: {
     user: {
-      findUnique: mocks.userFindUnique,
+      findMany: mocks.userFindMany,
       create: mocks.userCreate,
     },
   },
@@ -36,7 +36,7 @@ describe('register API', () => {
   beforeEach(() => {
     vi.resetModules()
     Object.values(mocks).forEach(mock => mock.mockReset())
-    mocks.userFindUnique.mockResolvedValue(null)
+    mocks.userFindMany.mockResolvedValue([])
     mocks.hash.mockResolvedValue('password-hash')
     mocks.userCreate.mockResolvedValue({
       id: 'user_1',
@@ -56,7 +56,11 @@ describe('register API', () => {
     }) as never)
 
     expect(response.status).toBe(201)
-    expect(mocks.userFindUnique).toHaveBeenCalledWith({ where: { email: 'member@example.com' } })
+    expect(mocks.userFindMany).toHaveBeenCalledWith({
+      where: { email: { equals: 'member@example.com', mode: 'insensitive' } },
+      select: { id: true },
+      take: 2,
+    })
     expect(mocks.userCreate).toHaveBeenCalledWith({
       data: { email: 'member@example.com', name: 'Member', password: 'password-hash' },
       select: { id: true, email: true, name: true, plan: true, createdAt: true },
@@ -64,7 +68,7 @@ describe('register API', () => {
   })
 
   it('prevents a case-variant from creating a second account', async () => {
-    mocks.userFindUnique.mockResolvedValue({ id: 'existing-user' })
+    mocks.userFindMany.mockResolvedValue([{ id: 'existing-user' }])
     const { POST } = await import('./route')
     const response = await POST(request({
       name: 'Member',
@@ -75,5 +79,18 @@ describe('register API', () => {
     expect(response.status).toBe(409)
     await expect(response.json()).resolves.toEqual({ error: 'Email already registered' })
     expect(mocks.userCreate).not.toHaveBeenCalled()
+  })
+
+  it('converts a database uniqueness race into the same safe conflict', async () => {
+    mocks.userCreate.mockRejectedValue({ code: 'P2002' })
+    const { POST } = await import('./route')
+    const response = await POST(request({
+      name: 'Member',
+      email: 'member@example.com',
+      password: 'password-123',
+    }) as never)
+
+    expect(response.status).toBe(409)
+    await expect(response.json()).resolves.toEqual({ error: 'Email already registered' })
   })
 })

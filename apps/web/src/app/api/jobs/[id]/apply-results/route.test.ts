@@ -49,6 +49,11 @@ describe("GET /api/jobs/[id]/apply-results", () => {
     expect(body.results).toBeDefined();
     expect(body.results).toHaveLength(1);
     expect(body.results[0].status).toBe("submitted");
+    expect(vi.mocked(db.$queryRaw)).toHaveBeenCalledWith(
+      expect.anything(),
+      "user-1",
+      "job-1",
+    );
   });
 
   it("returns empty results array when no results exist", async () => {

@@ -30,7 +30,13 @@ export async function POST(req: NextRequest) {
     )
   }
 
-  const user = await db.user.findUnique({ where: { email } })
+  const candidates = await db.user.findMany({
+    where: { email: { equals: email, mode: 'insensitive' } },
+    take: 2,
+  })
+  // Refuse to select an arbitrary account if historic case-sensitive rows
+  // contain duplicate normalized email addresses.
+  const user = candidates.length === 1 ? candidates[0] : null
   if (!user?.password || user.accountStatus !== 'active') {
     return NextResponse.json({ error: 'Invalid credentials' }, { status: 401 })
   }
