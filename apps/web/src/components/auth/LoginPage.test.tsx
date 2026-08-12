@@ -34,7 +34,7 @@ describe('LoginPage', () => {
 
     const html = renderToStaticMarkup(<LoginPage />)
 
-    expect(html).toContain('Sign-in is temporarily unavailable. Please try again.')
+    expect(html).toContain('Invalid email or password.')
     expect(html).not.toContain('Sign-in error: undefined')
   })
 })
