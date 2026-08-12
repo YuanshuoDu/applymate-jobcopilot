@@ -21,7 +21,7 @@ vi.mock('@jobcopilot/shared', async () => {
 })
 
 async function state() {
-  return new SignJWT({ uid: 'user_1', returnTo: '/?page=settings&tab=accounts', nonce: 'n1' })
+  return new SignJWT({ uid: 'user_1', authVersion: 1, returnTo: '/?page=settings&tab=accounts', nonce: 'n1' })
     .setProtectedHeader({ alg: 'HS256' })
     .setExpirationTime('10m')
     .sign(new TextEncoder().encode('test-secret-which-is-long-enough'))
@@ -35,10 +35,10 @@ describe('GET /api/gmail/oauth/callback', () => {
     vi.stubEnv('AUTH_GOOGLE_SECRET', 'google-secret')
     vi.stubEnv('AUTH_CANONICAL_URL', 'https://applymate.site')
     mocks.findUnique.mockReset()
-    mocks.userFindUnique.mockReset().mockResolvedValue({ accountStatus: 'active' })
+    mocks.userFindUnique.mockReset().mockResolvedValue({ accountStatus: 'active', authVersion: 1 })
     mocks.deleteMany.mockReset()
     mocks.upsert.mockReset()
-    mocks.safeAuth.mockReset().mockResolvedValue({ user: { id: 'user_1' } })
+    mocks.safeAuth.mockReset().mockResolvedValue({ user: { id: 'user_1', authVersion: 1 } })
     mocks.findUnique.mockResolvedValue(null)
     mocks.deleteMany.mockResolvedValue({ count: 0 })
     mocks.upsert.mockResolvedValue({ id: 'account_1' })
@@ -85,7 +85,7 @@ describe('GET /api/gmail/oauth/callback', () => {
   })
 
   it('does not attach Gmail credentials after the initiating session is replaced', async () => {
-    mocks.safeAuth.mockResolvedValue({ user: { id: 'user_2' } })
+    mocks.safeAuth.mockResolvedValue({ user: { id: 'user_2', authVersion: 1 } })
     const { GET } = await import('./route')
     const response = await GET(new NextRequest(
       `https://applymate.site/api/gmail/oauth/callback?code=c1&state=${encodeURIComponent(await state())}`,
@@ -95,6 +95,19 @@ describe('GET /api/gmail/oauth/callback', () => {
     expect(new URL(response.headers.get('location') ?? '').searchParams.get('gmailError')).toBe('session_mismatch')
     expect(fetch).not.toHaveBeenCalled()
     expect(mocks.userFindUnique).not.toHaveBeenCalled()
+    expect(mocks.upsert).not.toHaveBeenCalled()
+  })
+
+  it('does not attach Gmail credentials after the auth version changes', async () => {
+    mocks.userFindUnique.mockResolvedValue({ accountStatus: 'active', authVersion: 2 })
+    const { GET } = await import('./route')
+    const response = await GET(new NextRequest(
+      `https://applymate.site/api/gmail/oauth/callback?code=c1&state=${encodeURIComponent(await state())}`,
+      { headers: { cookie: `${GMAIL_STATE_COOKIE}=n1` } },
+    ))
+
+    expect(new URL(response.headers.get('location') ?? '').searchParams.get('gmailError')).toBe('session_expired')
+    expect(fetch).not.toHaveBeenCalled()
     expect(mocks.upsert).not.toHaveBeenCalled()
   })
 })
