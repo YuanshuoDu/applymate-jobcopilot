@@ -148,6 +148,7 @@ fs.writeFileSync(path.join(DIST, 'sidepanel.html'), `<!DOCTYPE html>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>ApplyMate AI</title>
+  <link rel="stylesheet" href="./assets/sidepanel.css" />
   <style>
     * { box-sizing: border-box; margin: 0; padding: 0; }
     body { width: 100%; min-height: 100vh; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #f8f9fb; color: #1a1a2e; font-size: 13px; }
