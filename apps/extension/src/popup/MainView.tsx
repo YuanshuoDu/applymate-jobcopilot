@@ -26,6 +26,9 @@ export function PopupMainView({ settings, onSettings, onLogout }: {
 
   useEffect(() => {
     let cancelled = false
+    setSavedJobs([])
+    setStats(null)
+    setScore(null)
     const refreshSavedData = async () => {
       const [recentResponse, statsResponse] = await Promise.all([
         chrome.runtime.sendMessage({ type: 'GET_RECENT_JOBS' }).catch(() => null),
@@ -63,7 +66,7 @@ export function PopupMainView({ settings, onSettings, onLogout }: {
     // authoritative API state as well as with Side Panel saves.
     const syncTimer = window.setInterval(() => { void refreshSavedData() }, 10000)
     return () => { cancelled = true; window.clearInterval(syncTimer); chrome.runtime.onMessage.removeListener(onJobDetected) }
-  }, [])
+  }, [settings.apiBaseUrl, settings.apiToken, settings.userEmail])
 
   const savedJob = useMemo(() => currentJob ? savedJobs.find(job => sameJob(currentJob, job)) ?? null : null, [currentJob, savedJobs])
   const matchScore = savedJob?.score ?? score?.score ?? null

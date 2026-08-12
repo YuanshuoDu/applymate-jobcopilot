@@ -52,9 +52,9 @@ setInterval(() => {
 // the authenticated user, so never let it leak into the next account.
 chrome.storage.onChanged.addListener((changes, area) => {
   if (area !== 'sync' || !changes.settings) return
-  const before = changes.settings.oldValue as { apiToken?: unknown } | undefined
-  const after = changes.settings.newValue as { apiToken?: unknown } | undefined
-  if (before?.apiToken === after?.apiToken) return
+  const before = changes.settings.oldValue as { apiToken?: unknown; userEmail?: unknown; apiBaseUrl?: unknown } | undefined
+  const after = changes.settings.newValue as { apiToken?: unknown; userEmail?: unknown; apiBaseUrl?: unknown } | undefined
+  if (before?.apiToken === after?.apiToken && before?.userEmail === after?.userEmail && before?.apiBaseUrl === after?.apiBaseUrl) return
   savedJobsByKey.clear()
   pendingSavesByKey.clear()
 })

@@ -272,7 +272,7 @@ export function SidePanel() {
   )
 }
 
-function CurrentPageBanner({ onSaved }: { onSaved: () => void }) {
+function CurrentPageBanner({ accountKey, onSaved }: { accountKey: string; onSaved: () => void }) {
   const [currentJob, setCurrentJob] = useState<ScrapedJob | null>(null)
   const [saving, setSaving] = useState(false)
   const [saved, setSaved] = useState(false)
@@ -281,6 +281,10 @@ function CurrentPageBanner({ onSaved }: { onSaved: () => void }) {
   const currentJobRef = useRef<ScrapedJob | null>(null)
 
   useEffect(() => {
+    // A shared storage account switch must not retain the previous account's
+    // saved-state marker for the same job on the current page.
+    setSaved(false)
+    setSaveError('')
     const syncSavedState = (job: ScrapedJob | null) => {
       if (!job) {
         setSaved(false)
@@ -294,6 +298,7 @@ function CurrentPageBanner({ onSaved }: { onSaved: () => void }) {
         }
       }).catch(() => {})
     }
+    if (currentJobRef.current) syncSavedState(currentJobRef.current)
     const acceptJob = (job?: ScrapedJob | null) => {
       const detectedAt = job?.detectedAt ?? 0
       if (detectedAt < latestDetectedAt.current) return
@@ -311,7 +316,7 @@ function CurrentPageBanner({ onSaved }: { onSaved: () => void }) {
     }
     chrome.runtime.onMessage.addListener(handler)
     return () => chrome.runtime.onMessage.removeListener(handler)
-  }, [])
+  }, [accountKey])
 
   if (!currentJob) return null
 
@@ -416,6 +421,13 @@ function TrackerPanel({ settings, L, onOpenResume }: { settings: ExtensionSettin
   }
 
   useEffect(() => {
+    setJobs([])
+    setDashboard(null)
+    setExpandedId(null)
+    setJobsSyncError('')
+    setDashboardSyncError('')
+    setLastJobsSyncedAt(null)
+    setLastDashboardSyncedAt(null)
     refreshAll(true)
     const handler = (message: { type?: string }) => {
       if (message.type === 'JOB_SCRAPED' || message.type === 'JOB_SAVED') {
@@ -435,9 +447,10 @@ function TrackerPanel({ settings, L, onOpenResume }: { settings: ExtensionSettin
       chrome.runtime.onMessage.removeListener(handler)
       document.removeEventListener('visibilitychange', onVisibilityChange)
     }
-    // settings is stable for the lifetime of the authenticated side panel.
+    // Reload both the list and dashboard snapshot whenever the shared account
+    // token changes so an account switch cannot retain the previous user's data.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [])
+  }, [settings.apiBaseUrl, settings.apiToken, settings.userEmail])
 
   const availableSources = useMemo(() => Array.from(new Set(jobs.map(job => job.source).filter((source): source is string => Boolean(source && source !== 'unknown')))).sort(), [jobs])
   const counts = useMemo(() => {
@@ -532,7 +545,7 @@ function TrackerPanel({ settings, L, onOpenResume }: { settings: ExtensionSettin
       </div>
 
       {(jobsSyncError || dashboardSyncError) && <div className="am-sync-banner" role="alert"><div><strong>Sync needs attention</strong><span>{jobsSyncError || dashboardSyncError}</span>{(jobsSyncError ? lastJobsSyncedAt : lastDashboardSyncedAt) && <small>Last synced {formatSyncAge((jobsSyncError ? lastJobsSyncedAt : lastDashboardSyncedAt)!)}</small>}</div><button type="button" onClick={() => refreshAll(true)}>Retry</button></div>}
-      <CurrentPageBanner onSaved={() => refreshAll()} />
+      <CurrentPageBanner accountKey={`${settings.apiBaseUrl}|${settings.apiToken}|${settings.userEmail}`} onSaved={() => refreshAll()} />
       <div className="am-list">
         {loading ? <div className="am-spinner"><LoaderCircle className="am-spin" size={20} aria-label="Loading jobs" /></div> : filtered.length === 0 ? <EmptyState hasSearch={Boolean(search.trim())} filter={filterStatus} connectionError={Boolean(jobsSyncError)} onRetry={() => refreshAll(true)} onClearSearch={() => setSearch('')} onOpenDashboard={() => chrome.tabs.create({ url: `${settings.apiBaseUrl}/jobs` })} L={L} /> : <div className="am-list-inner">{filtered.map(job => <JobCard key={job.id} job={job} expanded={expandedId === job.id} onToggle={() => setExpandedId(current => current === job.id ? null : job.id)} settings={settings} L={L} scoring={scoringId === job.id} onScore={() => void scoreJob(job)} onStatusChange={async (id, status) => { try { const updated = await updateJobStatus(settings, id, status); setJobs(previous => previous.map(item => item.id === id ? { ...item, ...updated } : item)); await loadDashboard(); showToast(`Status updated · ${statusLabel(status, L)}`) } catch (error) { showToast(error instanceof Error ? error.message : 'Could not update status') } }} />)}</div>}
       </div>

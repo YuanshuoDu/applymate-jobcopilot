@@ -693,7 +693,10 @@ async function syncFromDashboard(force = false): Promise<boolean> {
 // work on every DOM change.
 if (IS_DASHBOARD_PAGE) {
   new MutationObserver(() => { void syncFromDashboard() }).observe(document.head, {
-    childList: true, subtree: true,
+    childList: true,
+    subtree: true,
+    attributes: true,
+    attributeFilter: ['content'],
   })
 }
 

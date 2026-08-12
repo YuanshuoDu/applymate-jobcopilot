@@ -24,10 +24,21 @@ export function App() {
   }, [])
 
   useEffect(() => {
-    getSettings().then(next => {
+    let active = true
+    const applySettings = (next: ExtensionSettings) => {
+      if (!active) return
       setSettings(next)
-      if (!isLoggedIn(next)) setView('login')
-    })
+      setView(current => !isLoggedIn(next) ? 'login' : current === 'login' ? 'main' : current)
+    }
+    void getSettings().then(applySettings)
+    const onStorageChange = (changes: { settings?: chrome.storage.StorageChange }, area: string) => {
+      if (area === 'sync' && changes.settings) void getSettings().then(applySettings)
+    }
+    chrome.storage.onChanged.addListener(onStorageChange)
+    return () => {
+      active = false
+      chrome.storage.onChanged.removeListener(onStorageChange)
+    }
   }, [])
 
   const labels = getLoginLabels(lang)
