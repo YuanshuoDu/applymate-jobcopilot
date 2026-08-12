@@ -22,7 +22,8 @@ describe('URL sign-in errors', () => {
   })
 
   it('does not echo malformed or internal Auth.js error values', () => {
-    expect(signInUrlErrorMessage('undefined')).toBe('Sign-in is temporarily unavailable. Please try again.')
+    expect(signInUrlErrorMessage('undefined')).toBe('Invalid email or password.')
+    expect(signInUrlErrorMessage('CredentialsSignin')).toBe('Invalid email or password.')
     expect(signInUrlErrorMessage('Configuration')).toBe('Sign-in is temporarily unavailable. Please try again.')
   })
 })

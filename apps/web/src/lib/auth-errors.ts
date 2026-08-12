@@ -2,6 +2,10 @@ const TEMPORARY_SIGN_IN_MESSAGE = 'Sign-in is temporarily unavailable. Please tr
 
 const URL_SIGN_IN_ERROR_MESSAGES: Record<string, string> = {
   CredentialsSignin: 'Invalid email or password.',
+  // Some Auth.js versions redirect with a literal `undefined` when the
+  // credentials callback omits an error code. Keep that failure on the same
+  // generic credential path instead of presenting it as an outage.
+  undefined: 'Invalid email or password.',
   OAuthAccountNotLinked: 'This email is already registered with another sign-in method. Please use the original method.',
   OAuthCallbackError: 'Google sign-in failed. Please try again.',
   AccessDenied: 'Sign-in was denied.',
