@@ -6,6 +6,7 @@ import { adminPageLimit, pageResult } from '@/lib/admin/pagination'
 import { db } from '@/lib/db'
 import { validateAdminWrite } from '@/lib/admin/csrf'
 import { runAdminMutation } from '@/lib/admin/write-transaction'
+import { normalizeEmail } from '@/lib/auth-identifiers'
 
 export async function POST(request: NextRequest) {
   const actor = await requireAdmin('admin_members.manage', request)
@@ -13,15 +14,16 @@ export async function POST(request: NextRequest) {
   const writeError = validateAdminWrite(request)
   if (writeError) return writeError
   const body = await request.json().catch(() => null) as { email?: unknown; roleKey?: unknown; reason?: unknown } | null
-  const email = typeof body?.email === 'string' ? body.email.trim().toLowerCase() : ''
+  const email = typeof body?.email === 'string' ? normalizeEmail(body.email) : ''
   const roleKey = typeof body?.roleKey === 'string' ? body.roleKey.trim() : ''
   const reason = typeof body?.reason === 'string' ? body.reason.trim() : ''
   const key = request.headers.get('idempotency-key')
   if (!email.includes('@') || email.length > 320 || !roleKey || reason.length < 10 || reason.length > 500 || !key) return NextResponse.json({ error: 'Invalid admin member grant' }, { status: 400 })
-  const [user, role] = await Promise.all([
-    db.user.findUnique({ where: { email }, select: { id: true, email: true, name: true } }),
+  const [users, role] = await Promise.all([
+    db.user.findMany({ where: { email: { equals: email, mode: 'insensitive' } }, take: 2, select: { id: true, email: true, name: true } }),
     db.adminRole.findUnique({ where: { key: roleKey }, select: { id: true, key: true, name: true } }),
   ])
+  const user = users.length === 1 ? users[0] : null
   if (!user || !role) return NextResponse.json({ error: 'User or role not found' }, { status: 404 })
   const existing = await db.adminMembership.findUnique({ where: { userId: user.id }, select: { id: true } })
   if (existing) return NextResponse.json({ error: 'User already has an admin membership' }, { status: 409 })

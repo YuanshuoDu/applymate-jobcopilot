@@ -19,6 +19,13 @@ type GoogleIdentityInput = {
   profile?: GoogleProfile | null
 }
 
+type GoogleTargetUser = {
+  id: string
+  email: string
+  name: string | null
+  image: string | null
+}
+
 function verifiedEmail(profile?: GoogleProfile | null): string | null {
   if (typeof profile?.email !== 'string' || profile.email_verified !== true) return null
   const email = normalizeEmail(profile.email)
@@ -42,11 +49,38 @@ export async function reconcileGoogleLoginIdentity(input: GoogleIdentityInput): 
 
   const name = typeof input.profile?.name === 'string' ? input.profile.name : null
   const image = typeof input.profile?.picture === 'string' ? input.profile.picture : null
-  const target = await db.user.upsert({
-    where: { email },
-    update: {},
-    create: { email, name, image, emailVerified: new Date() },
+  const candidates = await db.user.findMany({
+    where: { email: { equals: email, mode: 'insensitive' } },
+    select: { id: true, email: true, name: true, image: true },
+    take: 2,
   })
+  // Historic PostgreSQL rows may differ only by case. Never let OAuth choose
+  // one of multiple normalized identities, and never create a second account
+  // beside an existing case-variant account.
+  if (candidates.length > 1) return false
+  let target: GoogleTargetUser
+  if (candidates[0]) {
+    target = candidates[0]
+  } else {
+    try {
+      target = await db.user.create({
+        data: { email, name, image, emailVerified: new Date() },
+        select: { id: true, email: true, name: true, image: true },
+      })
+    } catch (error) {
+      // A concurrent OAuth callback may win the normalized-email insert. Read
+      // the single resulting identity instead of creating or selecting a
+      // second account.
+      if (!(typeof error === 'object' && error !== null && 'code' in error && error.code === 'P2002')) throw error
+      const raced = await db.user.findMany({
+        where: { email: { equals: email, mode: 'insensitive' } },
+        select: { id: true, email: true, name: true, image: true },
+        take: 2,
+      })
+      if (raced.length !== 1) return false
+      target = raced[0]
+    }
+  }
 
   const targetGoogleAccount = await db.account.findFirst({
     where: { userId: target.id, provider: 'google' },

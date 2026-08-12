@@ -37,17 +37,27 @@ export async function POST(req: NextRequest, { params }: Params) {
   if (!job) return err('Not found', 404)
 
   const body = await req.json().catch(() => ({}))
-  const { resumeId, tone = 'professional', content = '' } = body as {
-    resumeId?: string
-    tone?: string
-    content?: string
+  if (!body || typeof body !== 'object' || Array.isArray(body)) return err('Invalid JSON body')
+  const input = body as Record<string, unknown>
+  const rawResumeId = input.resumeId
+  const resumeId = typeof rawResumeId === 'string' ? rawResumeId.trim() : null
+  const tone = typeof input.tone === 'string' && input.tone.trim() ? input.tone.trim() : 'professional'
+  const content = typeof input.content === 'string' ? input.content : ''
+  if (rawResumeId !== undefined && (!resumeId || typeof rawResumeId !== 'string')) return err('resumeId must be a non-empty string')
+
+  if (resumeId) {
+    const resume = await db.resume.findFirst({
+      where: { id: resumeId, userId: auth.userId },
+      select: { id: true },
+    })
+    if (!resume) return err('Resume not found', 404)
   }
 
   const coverLetter = await db.coverLetter.create({
     data: {
       userId:   auth.userId,
       jobId,
-      resumeId: resumeId ?? null,
+      resumeId,
       content,
       tone,
       origin:   'manual',

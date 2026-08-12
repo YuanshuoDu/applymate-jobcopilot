@@ -54,6 +54,24 @@ export async function POST(req: NextRequest) {
   if (!jobTitle)      return err('jobTitle is required')
   if (!jobCompany)    return err('jobCompany is required')
 
+  const { jobId, resumeId } = body as { jobId?: unknown; resumeId?: unknown } & typeof body
+  const requestedJobId = typeof jobId === 'string' && jobId.trim() ? jobId.trim() : null
+  const requestedResumeId = typeof resumeId === 'string' && resumeId.trim() ? resumeId.trim() : null
+  if (jobId !== undefined && !requestedJobId) return err('jobId must be a non-empty string', 400)
+  if (resumeId !== undefined && !requestedResumeId) return err('resumeId must be a non-empty string', 400)
+
+  // These IDs are optional for legacy callers that only want generated text,
+  // but any ID used for persistence must belong to the authenticated tenant.
+  // Validate before spending model credits or creating any side effect.
+  if (requestedJobId) {
+    const job = await db.job.findFirst({ where: { id: requestedJobId, userId: prep.userId }, select: { id: true } })
+    if (!job) return err('Job not found', 404)
+  }
+  if (requestedResumeId) {
+    const resume = await db.resume.findFirst({ where: { id: requestedResumeId, userId: prep.userId }, select: { id: true } })
+    if (!resume) return err('Resume not found', 404)
+  }
+
   // Load Writer Agent role config (model + system prompt) for consistency with pipeline
   const writerRole = await db.agentRole.findFirst({
     where:  { userId: prep.userId, role: 'writer' },
@@ -129,15 +147,14 @@ Return ONLY the cover letter text.`
     const greetingIdx = letter.search(/Dear\s/i)
     if (greetingIdx > 20) letter = letter.slice(greetingIdx)
     // Optionally persist to CoverLetter table
-    const { jobId, resumeId } = body as { jobId?: string; resumeId?: string } & typeof body
     let coverLetterId: string | undefined
-    if (jobId) {
+    if (requestedJobId) {
       try {
         const cl = await db.coverLetter.create({
           data: {
             userId:   prep.userId,
-            jobId,
-            resumeId: resumeId ?? null,
+            jobId:    requestedJobId,
+            resumeId: requestedResumeId,
             content:  letter.trim(),
             tone:     tone ?? 'professional',
             origin:   'ai-generated',

@@ -3,14 +3,14 @@ import { NextRequest } from 'next/server'
 
 const mocks = vi.hoisted(() => ({
   compare: vi.fn(),
-  findUnique: vi.fn(),
+  findMany: vi.fn(),
   rateLimit: vi.fn(),
   sign: vi.fn(),
   payloads: [] as unknown[],
 }))
 
 vi.mock('bcryptjs', () => ({ default: { compare: mocks.compare } }))
-vi.mock('@/lib/db', () => ({ db: { user: { findUnique: mocks.findUnique } } }))
+vi.mock('@/lib/db', () => ({ db: { user: { findMany: mocks.findMany } } }))
 vi.mock('@/lib/auth-rate-limit', () => ({ checkAuthRateLimit: mocks.rateLimit }))
 vi.mock('@/lib/auth-secret', () => ({
   EXTENSION_TOKEN_AUDIENCE: 'applymate-extension',
@@ -33,14 +33,14 @@ describe('POST /api/auth/extension-token', () => {
   beforeEach(() => {
     vi.resetModules()
     mocks.compare.mockReset()
-    mocks.findUnique.mockReset()
+    mocks.findMany.mockReset()
     mocks.rateLimit.mockReset().mockResolvedValue({ ok: true })
     mocks.sign.mockReset().mockResolvedValue('extension-token')
     mocks.payloads.length = 0
   })
 
   it('does not issue a token to a non-active account', async () => {
-    mocks.findUnique.mockResolvedValue({ id: 'user_1', password: 'hashed', accountStatus: 'suspended' })
+    mocks.findMany.mockResolvedValue([{ id: 'user_1', password: 'hashed', accountStatus: 'suspended' }])
     const { POST } = await import('./route')
 
     const response = await POST(new NextRequest('http://localhost/api/auth/extension-token', {
@@ -55,7 +55,7 @@ describe('POST /api/auth/extension-token', () => {
   })
 
   it('binds an active extension token to the user auth version', async () => {
-    mocks.findUnique.mockResolvedValue({ id: 'user_1', email: 'user@example.com', name: 'User', password: 'hashed', plan: 'pro', accountStatus: 'active', authVersion: 3 })
+    mocks.findMany.mockResolvedValue([{ id: 'user_1', email: 'user@example.com', name: 'User', password: 'hashed', plan: 'pro', accountStatus: 'active', authVersion: 3 }])
     mocks.compare.mockResolvedValue(true)
     const { POST } = await import('./route')
 
@@ -67,5 +67,27 @@ describe('POST /api/auth/extension-token', () => {
 
     expect(response.status).toBe(200)
     expect(mocks.payloads).toContainEqual(expect.objectContaining({ sub: 'user_1', authVersion: 3 }))
+    expect(mocks.findMany).toHaveBeenCalledWith(expect.objectContaining({
+      where: { email: { equals: 'user@example.com', mode: 'insensitive' } },
+      take: 2,
+    }))
+  })
+
+  it('does not select an arbitrary account when normalized emails are duplicated', async () => {
+    mocks.findMany.mockResolvedValue([
+      { id: 'user_1', password: 'hashed', accountStatus: 'active' },
+      { id: 'user_2', password: 'hashed', accountStatus: 'active' },
+    ])
+    const { POST } = await import('./route')
+
+    const response = await POST(new NextRequest('http://localhost/api/auth/extension-token', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ email: 'user@example.com', password: 'password' }),
+    }))
+
+    expect(response.status).toBe(401)
+    expect(mocks.compare).not.toHaveBeenCalled()
+    expect(mocks.sign).not.toHaveBeenCalled()
   })
 })
