@@ -142,7 +142,8 @@
     "*://*.irishjobs.ie/*",
     "http://localhost:3000/*",
     "https://*.vercel.app/*",
-    "https://*.applymate.ai/*"
+    "https://*.applymate.ai/*",
+    "https://applymate.site/*"
   ],
   "optional_host_permissions": [
     "<all_urls>"

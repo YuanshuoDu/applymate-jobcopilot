@@ -168,6 +168,7 @@ export type ExtMessage =
   | { type: 'JOB_SCRAPED'; job: ScrapedJob }   // content → background when job detected
   | { type: 'ENRICH_JOB'; job: ScrapedJob }    // content → background: auto-patch saved job with description
   | { type: 'FETCH_DASHBOARD_TOKEN' }
+  | { type: 'REFRESH_DASHBOARD_TOKEN' }
   | { type: 'PING' }
   | { type: 'PONG' }
   // ── Form Filler ──

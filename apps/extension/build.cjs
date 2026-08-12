@@ -35,7 +35,7 @@ let bgJs = fs.readFileSync(path.join(DIST, 'background.js'), 'utf-8')
 bgJs = bgJs.replace(/^import [^\n]+ from "\.\/chunks\/[^"]+\.js";\n/gm, '')
 
 // Collect and inline all chunks referenced by background (storage, api, etc.)
-const chunksToInline = ['storage', 'api', 'job-identity']
+const chunksToInline = ['storage', 'api', 'job-identity', 'auth-recovery']
 let inlinedChunks = ''
 for (const name of chunksToInline) {
   const chunkPath = path.join(chunkDir, `${name}.js`)
