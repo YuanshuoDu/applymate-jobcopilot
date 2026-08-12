@@ -6,10 +6,10 @@ import { companyDomain, companyInitials, sourceLabel } from './popup-utils'
 
 export function DetectionRow({ job, labels }: { job: ScrapedJob | null; labels: PopupLabels }) {
   const isLinkedIn = job?.source === 'linkedin'
-  return <div style={{ display: 'flex', alignItems: 'center', gap: 9, minHeight: 48, padding: '7px 10px', border: `1px solid ${C.border}`, borderRadius: 12, background: C.panel, boxShadow: C.shadow }}>
-    <div style={{ width: 30, height: 30, display: 'grid', placeItems: 'center', borderRadius: 9, background: isLinkedIn ? '#0A76B8' : C.lavender, color: isLinkedIn ? '#fff' : C.primary }}>{isLinkedIn ? <Linkedin size={17} strokeWidth={2.2} /> : <Search size={16} strokeWidth={1.8} />}</div>
-    <span style={{ flex: 1, minWidth: 0, fontSize: 12.5, fontWeight: 620, color: C.navy, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{job ? (isLinkedIn ? labels.detected : `${sourceLabel(job.source)} job page detected`) : labels.notDetected}</span>
-    <span aria-label={job ? 'Detected' : 'Not detected'} style={{ width: 22, height: 22, display: 'grid', placeItems: 'center', borderRadius: '50%', background: job ? C.greenBg : '#F3F4F8', color: job ? C.green : C.subtle }}>{job ? <Check size={14} strokeWidth={2.8} /> : <Search size={13} strokeWidth={1.8} />}</span>
+  return <div style={{ display: 'flex', alignItems: 'center', gap: 8, minHeight: 42, padding: '5px 9px', border: `1px solid ${C.border}`, borderRadius: 11, background: C.panel, boxShadow: C.shadow }}>
+    <div style={{ width: 28, height: 28, display: 'grid', placeItems: 'center', borderRadius: 8, background: isLinkedIn ? '#0A76B8' : C.lavender, color: isLinkedIn ? '#fff' : C.primary }}>{isLinkedIn ? <Linkedin size={16} strokeWidth={2.2} /> : <Search size={15} strokeWidth={1.8} />}</div>
+    <span style={{ flex: 1, minWidth: 0, fontSize: 11.5, fontWeight: 620, color: C.navy, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{job ? (isLinkedIn ? labels.detected : `${sourceLabel(job.source)} job page detected`) : labels.notDetected}</span>
+    <span aria-label={job ? 'Detected' : 'Not detected'} style={{ width: 21, height: 21, display: 'grid', placeItems: 'center', borderRadius: '50%', background: job ? C.greenBg : '#F3F4F8', color: job ? C.green : C.subtle }}>{job ? <Check size={13} strokeWidth={2.8} /> : <Search size={12} strokeWidth={1.8} />}</span>
   </div>
 }
 
