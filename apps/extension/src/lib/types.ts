@@ -29,6 +29,8 @@ export interface SavedJob {
   status:    JobStatus
   score:     number | null
   salary:    string | null
+  description?: string | null
+  keywords?: string | null
   notes:     string | null
   source:    string | null
   createdAt: string
@@ -135,6 +137,7 @@ export interface MissingItem {
 
 export interface ScoreResult {
   score:            number
+  keywords?:        string
   matchedKeywords:  string[]
   sectionMatches:   SectionMatch[]
   missingItems:     MissingItem[]

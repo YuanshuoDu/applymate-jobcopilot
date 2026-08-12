@@ -139,6 +139,18 @@ export async function updateJobNotes(
   })
 }
 
+export async function updateJobScore(
+  settings: ExtensionSettings,
+  jobId: string,
+  score: number,
+  keywords: string,
+): Promise<SavedJob> {
+  return request<SavedJob>(settings, `/api/jobs/${jobId}`, {
+    method: 'PATCH',
+    body: JSON.stringify({ score, keywords }),
+  })
+}
+
 export async function updateJob(
   settings: ExtensionSettings,
   jobId: string,
@@ -155,6 +167,21 @@ export async function updateJob(
 export async function getStats(settings: ExtensionSettings): Promise<DashboardStats> {
   const data = await request<{ stats: DashboardStats }>(settings, '/api/dashboard')
   return data.stats
+}
+
+export interface DashboardSnapshot {
+  stats: DashboardStats & {
+    saved?: number
+    rejected?: number
+    thisWeek?: number
+  }
+  minMatchScore: number
+  hasResume: boolean
+  followUpsDue: Array<{ id: string; company: string; role: string; status: string; followUpAt: string | null }>
+}
+
+export async function getDashboard(settings: ExtensionSettings): Promise<DashboardSnapshot> {
+  return request<DashboardSnapshot>(settings, '/api/dashboard')
 }
 
 // ── Persona ─────────────────────────────────────────────────────

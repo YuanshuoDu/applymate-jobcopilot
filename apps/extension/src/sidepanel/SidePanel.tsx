@@ -1,53 +1,77 @@
 /**
  * ApplyMate AI — Side Panel
  *
- * Design philosophy:
- *  • Sidebar = job TRACKER (list of saved jobs, status management)
- *  • Deliberately different from the hover popup (which is a lightweight preview)
- *  • Think: a mini Kanban / CRM panel anchored to the side of the browser
+ * Jobs is intentionally a compact companion to the web Dashboard + My Jobs:
+ * a small momentum overview sits above the searchable application tracker.
+ * The other tabs stay mounted after their first visit so their existing state
+ * and form-filling flow are preserved.
  */
-import { useState, useEffect, useRef, useMemo } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
+import {
+  ArrowRight,
+  Ban,
+  BarChart3,
+  Bookmark,
+  ChevronDown,
+  ExternalLink,
+  LoaderCircle,
+  RefreshCw,
+  Search,
+  Send,
+  MessageSquare,
+  Sparkles,
+  Target,
+  X,
+} from 'lucide-react'
+import { getCurrentResumeId } from '@/lib/storage'
+import {
+  getDashboard,
+  getResume,
+  listResumes,
+  scoreResume,
+  updateJobNotes,
+  updateJobScore,
+  updateJobStatus,
+} from '@/lib/api'
 import { getSettings, isLoggedIn } from '@/lib/storage'
-import { updateJobStatus, updateJobNotes } from '@/lib/api'
 import { FormFillerView } from './FormFillerView'
 import { PersonaView } from './PersonaView'
 import { ResumeView } from './ResumeView'
-import type { SavedJob, ExtensionSettings, ScrapedJob } from '@/lib/types'
+import type { DashboardSnapshot } from '@/lib/api'
+import type { ExtensionSettings, SavedJob, ScrapedJob } from '@/lib/types'
 import type { FormFieldSchema } from '@/lib/form-filler/types'
+import './sidepanel.css'
 
-// ── Design tokens (aligned with web app brand) ────────────────────────────────
-const C = {
-  primary:     '#4F46E5',
-  accent:      '#7C3AED',
-  green:       '#059669',
-  red:         '#DC2626',
-  amber:       '#D97706',
-  teal:        '#0891B2',
-  bg:          '#F8F9FF',
-  bgSecondary: '#F1F3FF',
-  card:        '#FFFFFF',
-  border:      'rgba(99,102,241,0.15)',
-  text:        '#0F172A',
-  muted:       '#64748B',
-  subtle:      '#94A3B8',
-  gradient:    'linear-gradient(135deg, #4F46E5 0%, #7C3AED 100%)',
+type ExtLang = 'en' | 'de' | 'fr' | 'es' | 'nl' | 'zh'
+type TabId = 'jobs' | 'form' | 'resume' | 'persona'
+type FilterStatus = 'all' | 'saved' | 'applied' | 'interview' | 'rejected'
+type SortBy = 'date' | 'company' | 'score'
+
+type Labels = {
+  saved: string
+  applied: string
+  interview: string
+  rejected: string
+  today: string
+  yesterday: string
+  daysAgo: (n: number) => string
+  jobs: string
+  form: string
+  persona: string
+  resume: string
+  noJobs: string
+  openDashboard: string
+  notLoggedIn: string
+  loginPrompt: string
 }
 
-// ── i18n — reads same key as web app from localStorage ───────────────────────
-type ExtLang = 'en' | 'de' | 'fr' | 'es' | 'nl' | 'zh'
-
-const EXT_LABELS: Record<ExtLang, {
-  saved: string; applied: string; review: string; interview: string; offer: string; rejected: string
-  today: string; yesterday: string; daysAgo: (n: number) => string
-  jobs: string; form: string; persona: string; resume: string
-  noJobs: string; openDashboard: string; notLoggedIn: string; loginPrompt: string
-}> = {
-  en: { saved: 'Saved', applied: 'Applied', review: 'In Review', interview: 'Interview', offer: 'Offer', rejected: 'Rejected', today: 'Today', yesterday: 'Yesterday', daysAgo: n => `${n}d ago`, jobs: 'Jobs', form: 'Form Fill', persona: 'Profile', resume: 'Resume', noJobs: 'No saved jobs yet.', openDashboard: 'Open Dashboard', notLoggedIn: 'Not logged in', loginPrompt: 'Sign in to ApplyMate to use the extension.' },
-  de: { saved: 'Gespeichert', applied: 'Beworben', review: 'In Prüfung', interview: 'Gespräch', offer: 'Angebot', rejected: 'Abgelehnt', today: 'Heute', yesterday: 'Gestern', daysAgo: n => `vor ${n} Tagen`, jobs: 'Jobs', form: 'Formular', persona: 'Profil', resume: 'Lebenslauf', noJobs: 'Noch keine gespeicherten Jobs.', openDashboard: 'Dashboard öffnen', notLoggedIn: 'Nicht eingeloggt', loginPrompt: 'Melde dich bei ApplyMate an.' },
-  fr: { saved: 'Sauvegardé', applied: 'Postulé', review: 'En cours', interview: 'Entretien', offer: 'Offre', rejected: 'Refusé', today: "Aujourd'hui", yesterday: 'Hier', daysAgo: n => `il y a ${n}j`, jobs: 'Offres', form: 'Formulaire', persona: 'Profil', resume: 'CV', noJobs: "Aucune offre sauvegardée.", openDashboard: 'Ouvrir le tableau de bord', notLoggedIn: 'Non connecté', loginPrompt: 'Connectez-vous à ApplyMate.' },
-  es: { saved: 'Guardado', applied: 'Aplicado', review: 'En revisión', interview: 'Entrevista', offer: 'Oferta', rejected: 'Rechazado', today: 'Hoy', yesterday: 'Ayer', daysAgo: n => `hace ${n}d`, jobs: 'Empleos', form: 'Formulario', persona: 'Perfil', resume: 'CV', noJobs: 'No hay empleos guardados.', openDashboard: 'Abrir panel', notLoggedIn: 'No conectado', loginPrompt: 'Inicia sesión en ApplyMate.' },
-  nl: { saved: 'Opgeslagen', applied: 'Gesolliciteerd', review: 'In behandeling', interview: 'Gesprek', offer: 'Aanbod', rejected: 'Afgewezen', today: 'Vandaag', yesterday: 'Gisteren', daysAgo: n => `${n}d geleden`, jobs: 'Vacatures', form: 'Formulier', persona: 'Profiel', resume: 'CV', noJobs: 'Geen opgeslagen vacatures.', openDashboard: 'Dashboard openen', notLoggedIn: 'Niet ingelogd', loginPrompt: 'Meld je aan bij ApplyMate.' },
-  zh: { saved: '已保存', applied: '已申请', review: '审核中', interview: '面试', offer: 'Offer', rejected: '已拒绝', today: '今天', yesterday: '昨天', daysAgo: n => `${n}天前`, jobs: '职位', form: '自动填表', persona: '画像', resume: '简历', noJobs: '暂无保存的职位。', openDashboard: '打开控制台', notLoggedIn: '未登录', loginPrompt: '请登录 ApplyMate 以使用扩展。' },
+const EXT_LABELS: Record<ExtLang, Labels> = {
+  en: { saved: 'Saved', applied: 'Applied', interview: 'Interview', rejected: 'Rejected', today: 'Today', yesterday: 'Yesterday', daysAgo: n => `${n}d ago`, jobs: 'Jobs', form: 'Form Fill', persona: 'Profile', resume: 'Resume', noJobs: 'No saved jobs yet.', openDashboard: 'Open Dashboard', notLoggedIn: 'Not logged in', loginPrompt: 'Sign in to ApplyMate to use the extension.' },
+  de: { saved: 'Gespeichert', applied: 'Beworben', interview: 'Gespräch', rejected: 'Abgelehnt', today: 'Heute', yesterday: 'Gestern', daysAgo: n => `vor ${n} Tagen`, jobs: 'Jobs', form: 'Formular', persona: 'Profil', resume: 'Lebenslauf', noJobs: 'Noch keine gespeicherten Jobs.', openDashboard: 'Dashboard öffnen', notLoggedIn: 'Nicht eingeloggt', loginPrompt: 'Melde dich bei ApplyMate an.' },
+  fr: { saved: 'Sauvegardé', applied: 'Postulé', interview: 'Entretien', rejected: 'Refusé', today: "Aujourd'hui", yesterday: 'Hier', daysAgo: n => `il y a ${n}j`, jobs: 'Offres', form: 'Formulaire', persona: 'Profil', resume: 'CV', noJobs: "Aucune offre sauvegardée.", openDashboard: 'Ouvrir le tableau de bord', notLoggedIn: 'Non connecté', loginPrompt: 'Connectez-vous à ApplyMate.' },
+  es: { saved: 'Guardado', applied: 'Aplicado', interview: 'Entrevista', rejected: 'Rechazado', today: 'Hoy', yesterday: 'Ayer', daysAgo: n => `hace ${n}d`, jobs: 'Empleos', form: 'Formulario', persona: 'Perfil', resume: 'CV', noJobs: 'No hay empleos guardados.', openDashboard: 'Abrir panel', notLoggedIn: 'No conectado', loginPrompt: 'Inicia sesión en ApplyMate.' },
+  nl: { saved: 'Opgeslagen', applied: 'Gesolliciteerd', interview: 'Gesprek', rejected: 'Afgewezen', today: 'Vandaag', yesterday: 'Gisteren', daysAgo: n => `${n}d geleden`, jobs: 'Vacatures', form: 'Formulier', persona: 'Profiel', resume: 'CV', noJobs: 'Geen opgeslagen vacatures.', openDashboard: 'Dashboard openen', notLoggedIn: 'Niet ingelogd', loginPrompt: 'Meld je aan bij ApplyMate.' },
+  zh: { saved: '已保存', applied: '已申请', interview: '面试', rejected: '已拒绝', today: '今天', yesterday: '昨天', daysAgo: n => `${n}天前`, jobs: '职位', form: '自动填表', persona: '画像', resume: '简历', noJobs: '暂无保存的职位。', openDashboard: '打开控制台', notLoggedIn: '未登录', loginPrompt: '请登录 ApplyMate 以使用扩展。' },
 }
 
 function getLang(): ExtLang {
@@ -56,39 +80,49 @@ function getLang(): ExtLang {
     if (stored && stored in EXT_LABELS) return stored
     const browser = navigator.language?.slice(0, 2).toLowerCase()
     if (browser in EXT_LABELS) return browser as ExtLang
-  } catch {}
+  } catch { /* extension storage may be unavailable during first paint */ }
   return 'en'
 }
 
-function useExtLang() {
+function useExtLang(): Labels {
   const [lang, setLang] = useState<ExtLang>(getLang)
   useEffect(() => {
-    // Re-check every 2s in case user changes lang in web app
-    const id = setInterval(() => { const l = getLang(); setLang(l) }, 2000)
-    return () => clearInterval(id)
+    const id = window.setInterval(() => {
+      const next = getLang()
+      setLang(current => current === next ? current : next)
+    }, 2000)
+    return () => window.clearInterval(id)
   }, [])
   return EXT_LABELS[lang]
 }
 
-function statusColor(s: string): string {
-  return { saved: C.subtle, applied: C.primary, review: C.amber, interview: C.teal, offer: C.green, rejected: C.red }[s] ?? C.subtle
-}
-
-function formatDate(iso: string, L: typeof EXT_LABELS['en']): string {
-  const d    = new Date(iso)
-  const now  = new Date()
-  const diff = Math.floor((now.getTime() - d.getTime()) / 86400000)
+function formatDate(iso: string, L: Labels): string {
+  const date = new Date(iso)
+  const diff = Math.floor((Date.now() - date.getTime()) / 86400000)
   if (diff === 0) return L.today
   if (diff === 1) return L.yesterday
-  if (diff < 7)  return L.daysAgo(diff)
-  return d.toLocaleDateString(undefined, { month: 'numeric', day: 'numeric' })
+  if (diff > 1 && diff < 7) return L.daysAgo(diff)
+  return date.toLocaleDateString(undefined, { month: 'short', day: 'numeric' })
 }
 
-// ── Root ──────────────────────────────────────────────────────────────────────
+function companyInitials(company: string): string {
+  const words = company.trim().split(/\s+/).filter(Boolean)
+  if (words.length > 1) return `${words[0][0]}${words[1][0]}`.toUpperCase()
+  return company.slice(0, 2).toUpperCase() || 'A'
+}
+
+function statusColor(status: string): string {
+  return { saved: '#8995B2', applied: '#5146E5', interview: '#0E9FBD', rejected: '#CF3151', offer: '#28A66F' }[status] ?? '#8995B2'
+}
+
+function visibleStatus(status: string): FilterStatus {
+  // The web workspace no longer exposes the legacy Offer bucket. Existing
+  // records still remain in the API and are shown in the applied workflow.
+  return status === 'offer' ? 'applied' : (status as FilterStatus)
+}
 
 export function SidePanel() {
   const L = useExtLang()
-  type TabId = 'jobs' | 'form' | 'persona' | 'resume'
   const [settings, setSettings] = useState<ExtensionSettings | null>(null)
   const [activeTab, setActiveTab] = useState<TabId>('jobs')
   const [mountedTabs, setMountedTabs] = useState<Set<TabId>>(() => new Set(['jobs']))
@@ -96,10 +130,9 @@ export function SidePanel() {
   const [pendingFormFields, setPendingFormFields] = useState<FormFieldSchema[] | null>(null)
   const [lastTabUrl, setLastTabUrl] = useState('')
   const [scanTrigger, setScanTrigger] = useState(0)
+
   useEffect(() => {
     getSettings().then(setSettings)
-    // Re-read only when the settings record changes. Local job writes must not
-    // trigger a redundant sync-storage read and full side-panel re-render.
     const onChange = (changes: { settings?: chrome.storage.StorageChange }, area: string) => {
       if (area === 'sync' && changes.settings) getSettings().then(setSettings)
     }
@@ -107,19 +140,18 @@ export function SidePanel() {
     return () => chrome.storage.onChanged.removeListener(onChange)
   }, [])
 
-  // Detect tab switches — reset form filler to offer re-scan on new page
   useEffect(() => {
     async function checkCurrentTab() {
       const tabs = await chrome.tabs.query({ active: true, currentWindow: true })
       if (tabs[0]?.url && tabs[0].url !== lastTabUrl) {
         setLastTabUrl(tabs[0].url)
-        setPendingFormFields(null)  // Clear stale fields from previous page
-        setScanTrigger(s => s + 1)  // Signal FormFillerView to reset
+        setPendingFormFields(null)
+        setScanTrigger(current => current + 1)
       }
     }
-    const onActivated = () => checkCurrentTab()
+    const onActivated = () => void checkCurrentTab()
     const onUpdated = (_tabId: number, changeInfo: chrome.tabs.TabChangeInfo) => {
-      if (changeInfo.url || changeInfo.status === 'complete') checkCurrentTab()
+      if (changeInfo.url || changeInfo.status === 'complete') void checkCurrentTab()
     }
     chrome.tabs.onActivated.addListener(onActivated)
     chrome.tabs.onUpdated.addListener(onUpdated)
@@ -129,20 +161,13 @@ export function SidePanel() {
     }
   }, [lastTabUrl])
 
-  // Auto-switch to form filler when FORM_DETECTED message arrives
-  // Store fields in state so FormFillerView can receive them after mount
   useEffect(() => {
-    const handler = (msg: any) => {
-      if (msg.type === 'FORM_DETECTED' && msg.fields) {
-        setPendingFormFields(msg.fields)
-        setMountedTabs(previous => {
-          if (previous.has('form')) return previous
-          const next = new Set(previous)
-          next.add('form')
-          return next
-        })
-        setActiveTab('form')
-      }
+    type FormMessage = { type?: string; fields?: FormFieldSchema[] }
+    const handler = (message: FormMessage) => {
+      if (message.type !== 'FORM_DETECTED' || !message.fields) return
+      setPendingFormFields(message.fields)
+      setMountedTabs(previous => new Set(previous).add('form'))
+      setActiveTab('form')
     }
     chrome.runtime.onMessage.addListener(handler)
     return () => chrome.runtime.onMessage.removeListener(handler)
@@ -151,96 +176,50 @@ export function SidePanel() {
   if (!settings) return <Spinner />
   if (!isLoggedIn(settings)) return <NotLoggedIn apiBase={settings.apiBaseUrl} />
 
-  const TABS: { id: TabId; label: string }[] = [
-    { id: 'jobs',    label: L.jobs    },
-    { id: 'form',    label: L.form    },
-    { id: 'resume',  label: L.resume  },
+  const tabs: Array<{ id: TabId; label: string }> = [
+    { id: 'jobs', label: L.jobs },
+    { id: 'form', label: L.form },
+    { id: 'resume', label: L.resume },
     { id: 'persona', label: L.persona },
   ]
+  const selectTab = (tab: TabId) => {
+    setMountedTabs(previous => new Set(previous).add(tab))
+    setActiveTab(tab)
+  }
 
   return (
-    <div style={{ display: 'flex', flexDirection: 'column', height: '100vh', background: C.bg, fontFamily: '-apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif' }}>
-      {/* Header */}
-      <div style={{ padding: '10px 14px', borderBottom: `1px solid ${C.border}`, background: 'linear-gradient(135deg, rgba(79,70,229,0.04) 0%, rgba(124,58,237,0.03) 100%)', display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexShrink: 0 }}>
-        <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-          <div style={{ width: 26, height: 26, borderRadius: 8, background: C.gradient, display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 11, fontWeight: 800, color: '#fff', boxShadow: '0 2px 8px rgba(79,70,229,0.35)', flexShrink: 0 }}>A</div>
-          <div style={{ fontSize: 12, fontWeight: 700, background: C.gradient, WebkitBackgroundClip: 'text', WebkitTextFillColor: 'transparent' }}>ApplyMate AI</div>
+    <div className="am-sidepanel">
+      <header className="am-topbar">
+        <div className="am-brand">
+          <span className="am-brand-mark" aria-hidden="true">A</span>
+          <span className="am-brand-name">ApplyMate AI</span>
         </div>
-        <button onClick={() => chrome.tabs.create({ url: settings.apiBaseUrl })} style={{ fontSize: 11, color: C.primary, background: 'rgba(79,70,229,0.08)', border: `1px solid rgba(79,70,229,0.20)`, borderRadius: 7, padding: '4px 10px', cursor: 'pointer', fontWeight: 600, fontFamily: 'inherit' }}>
-          {L.openDashboard} ↗
+        <button className="am-dashboard-link" type="button" onClick={() => chrome.tabs.create({ url: settings.apiBaseUrl })}>
+          {L.openDashboard} <ArrowRight size={12} aria-hidden="true" />
         </button>
-      </div>
-
-      {/* Tab Bar */}
-      <div style={{ display: 'flex', borderBottom: `1px solid ${C.border}`, background: C.bg, flexShrink: 0 }}>
-        {TABS.map(tab => (
-          <button
-            key={tab.id}
-            onClick={() => {
-              setMountedTabs(previous => {
-                if (previous.has(tab.id)) return previous
-                const next = new Set(previous)
-                next.add(tab.id)
-                return next
-              })
-              setActiveTab(tab.id)
-            }}
-            style={{
-              flex: 1, padding: '9px 4px', border: 'none', background: 'none',
-              fontSize: 11, fontWeight: activeTab === tab.id ? 700 : 500,
-              color: activeTab === tab.id ? C.primary : C.muted,
-              cursor: 'pointer',
-              borderBottom: activeTab === tab.id ? `2px solid ${C.primary}` : '2px solid transparent',
-              transition: 'all 0.15s', fontFamily: 'inherit',
-            }}
-          >
+      </header>
+      <nav className="am-tabs" aria-label="ApplyMate navigation">
+        {tabs.map(tab => (
+          <button key={tab.id} className="am-tab" type="button" role="tab" aria-selected={activeTab === tab.id} onClick={() => selectTab(tab.id)}>
             {tab.label}
           </button>
         ))}
-      </div>
-
-      {/* Mount tabs on first visit, then keep them mounted to preserve state. */}
-      <div style={{ flex: 1, overflow: 'auto' }}>
-        {mountedTabs.has('jobs') && (
-          <div style={{ display: activeTab === 'jobs' ? 'block' : 'none' }}>
-            <TrackerPanel settings={settings} L={L} />
-          </div>
-        )}
-        {mountedTabs.has('form') && (
-          <div style={{ display: activeTab === 'form' ? 'block' : 'none' }}>
-            <FormFillerView
-              settings={settings}
-              pendingFields={pendingFormFields}
-              onFieldsConsumed={() => setPendingFormFields(null)}
-              scanTrigger={scanTrigger}
-              personaUpdateTrigger={personaUpdateTrigger}
-              onPersonaUpdated={() => setPersonaUpdateTrigger(t => t + 1)}
-            />
-          </div>
-        )}
-        {mountedTabs.has('resume') && (
-          <div style={{ display: activeTab === 'resume' ? 'block' : 'none' }}>
-            <ResumeView settings={settings} />
-          </div>
-        )}
-        {mountedTabs.has('persona') && (
-          <div style={{ display: activeTab === 'persona' ? 'block' : 'none' }}>
-            <PersonaView settings={settings} personaUpdateTrigger={personaUpdateTrigger} />
-          </div>
-        )}
+      </nav>
+      <div className="am-panel-body">
+        {mountedTabs.has('jobs') && <div hidden={activeTab !== 'jobs'}><TrackerPanel settings={settings} L={L} onOpenResume={() => selectTab('resume')} /></div>}
+        {mountedTabs.has('form') && <div hidden={activeTab !== 'form'}><FormFillerView settings={settings} pendingFields={pendingFormFields} onFieldsConsumed={() => setPendingFormFields(null)} scanTrigger={scanTrigger} personaUpdateTrigger={personaUpdateTrigger} onPersonaUpdated={() => setPersonaUpdateTrigger(current => current + 1)} /></div>}
+        {mountedTabs.has('resume') && <div hidden={activeTab !== 'resume'}><ResumeView settings={settings} /></div>}
+        {mountedTabs.has('persona') && <div hidden={activeTab !== 'persona'}><PersonaView settings={settings} personaUpdateTrigger={personaUpdateTrigger} /></div>}
       </div>
     </div>
   )
 }
 
-// ── Current page banner ───────────────────────────────────────────────────────
-
-function CurrentPageBanner({ settings, onSaved }: { settings: ExtensionSettings; onSaved: () => void }) {
+function CurrentPageBanner({ onSaved }: { onSaved: () => void }) {
   const [currentJob, setCurrentJob] = useState<ScrapedJob | null>(null)
-  const [saving,     setSaving]     = useState(false)
-  const [savedOk,    setSavedOk]    = useState(false)
+  const [saving, setSaving] = useState(false)
+  const [saved, setSaved] = useState(false)
   const latestDetectedAt = useRef(0)
-  const activeJobKeyRef = useRef('')
 
   useEffect(() => {
     const acceptJob = (job?: ScrapedJob | null) => {
@@ -248,688 +227,256 @@ function CurrentPageBanner({ settings, onSaved }: { settings: ExtensionSettings;
       if (detectedAt < latestDetectedAt.current) return
       latestDetectedAt.current = detectedAt
       setCurrentJob(job ?? null)
+      setSaved(false)
     }
-
-    chrome.storage.local.get('currentJob', r => acceptJob(r.currentJob ?? null))
-
-    const handler = (msg: { type: string; job?: ScrapedJob }) => {
-      if (msg.type === 'JOB_SCRAPED') acceptJob(msg.job ?? null)
+    chrome.storage.local.get('currentJob', result => acceptJob(result.currentJob ?? null))
+    const handler = (message: { type?: string; job?: ScrapedJob }) => {
+      if (message.type === 'JOB_SCRAPED') acceptJob(message.job)
     }
     chrome.runtime.onMessage.addListener(handler)
     return () => chrome.runtime.onMessage.removeListener(handler)
   }, [])
 
-  const currentJobKey = currentJob
-    ? `${currentJob.source}|${currentJob.url}|${currentJob.title}|${currentJob.company}`
-    : ''
-  useEffect(() => {
-    activeJobKeyRef.current = currentJobKey
-    setSavedOk(false)
-    setSaving(false)
-  }, [currentJobKey])
-
   if (!currentJob) return null
 
-  const sourceColors: Record<string, string> = {
-    linkedin: '#0077B5', indeed: '#003A9B', glassdoor: '#0CAA41',
-    stepstone: '#E8001E', xing: '#026466', wellfound: '#333',
-    greenhouse: '#3BB273', lever: '#005AFF', workday: '#F5821F',
-    unknown: C.primary,
-  }
-  const srcColor = sourceColors[currentJob.source] ?? C.primary
-
-  async function handleSave() {
-    const requestJobKey = currentJobKey
+  async function saveCurrentJob() {
     setSaving(true)
     try {
-      const res = await chrome.runtime.sendMessage({ type: 'SAVE_JOB', job: currentJob })
-        .catch(() => null) // suppress port-closed error
-      if (res?.success) {
-        if (activeJobKeyRef.current === requestJobKey) setSavedOk(true)
+      const response = await chrome.runtime.sendMessage({ type: 'SAVE_JOB', job: currentJob }).catch(() => null)
+      if (response?.success) {
+        setSaved(true)
         onSaved()
       }
     } finally {
-      if (activeJobKeyRef.current === requestJobKey) setSaving(false)
+      setSaving(false)
     }
   }
 
   return (
-    <div style={{
-      margin: '10px 10px 0', borderRadius: 10,
-      border: `1.5px solid ${srcColor}30`,
-      background: `${srcColor}06`,
-      overflow: 'hidden',
-    }}>
-      <div style={{
-        padding: '6px 10px', display: 'flex', alignItems: 'center', gap: 6,
-        background: `${srcColor}10`, borderBottom: `1px solid ${srcColor}20`,
-      }}>
-        <span style={{ width: 6, height: 6, borderRadius: '50%', background: srcColor, display: 'inline-block', flexShrink: 0 }} />
-        <span style={{ fontSize: 10, fontWeight: 600, color: srcColor }}>Current Page</span>
-        <span style={{ fontSize: 10, color: C.muted, marginLeft: 'auto', textTransform: 'capitalize' }}>
-          {currentJob.source !== 'unknown' ? currentJob.source : ''}
-        </span>
+    <section className="am-current-page" aria-label="Current page job">
+      <div className="am-current-page-head"><Sparkles size={11} aria-hidden="true" /><span>Current job detected</span><span>{currentJob.source !== 'unknown' ? currentJob.source : ''}</span></div>
+      <div className="am-current-page-body">
+        <span className="am-company-mark" aria-hidden="true">{companyInitials(currentJob.company)}</span>
+        <div className="am-current-copy"><div className="am-current-title">{currentJob.title}</div><div className="am-current-company">{currentJob.company}{currentJob.location && currentJob.location !== 'Unknown' ? ` · ${currentJob.location}` : ''}</div></div>
+        <button className="am-save-button" type="button" disabled={saving || saved} onClick={() => void saveCurrentJob()}>{saved ? 'Saved' : saving ? 'Saving…' : 'Save job'}</button>
       </div>
-      <div style={{ padding: '9px 10px', display: 'flex', gap: 8, alignItems: 'center' }}>
-        <div style={{
-          width: 32, height: 32, borderRadius: 8, flexShrink: 0,
-          background: `${srcColor}15`, color: srcColor,
-          display: 'flex', alignItems: 'center', justifyContent: 'center',
-          fontSize: 10, fontWeight: 700,
-        }}>
-          {currentJob.company.slice(0, 2).toUpperCase()}
-        </div>
-        <div style={{ flex: 1, minWidth: 0 }}>
-          <div style={{ fontSize: 12, fontWeight: 600, color: C.text, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-            {currentJob.title}
-          </div>
-          <div style={{ fontSize: 10, color: C.muted, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-            {currentJob.company}{currentJob.location && currentJob.location !== 'Unknown' ? ` · ${currentJob.location}` : ''}
-          </div>
-        </div>
-        <button
-          onClick={handleSave}
-          disabled={saving || savedOk}
-          style={{
-            flexShrink: 0, padding: '5px 10px',
-            background: savedOk ? '#3B6D11' : srcColor,
-            color: '#fff', border: 'none', borderRadius: 7,
-            fontSize: 10.5, fontWeight: 600, cursor: saving || savedOk ? 'default' : 'pointer',
-            opacity: saving ? 0.7 : 1, transition: 'all 0.15s',
-            fontFamily: 'inherit',
-          }}
-        >
-          {savedOk ? '✓ Saved' : saving ? '…' : '⊕ Save'}
-        </button>
-      </div>
-    </div>
+    </section>
   )
 }
 
-// ── Main tracker panel ────────────────────────────────────────────────────────
+type LType = Labels
 
-type LType = ReturnType<typeof useExtLang>
+function TrackerPanel({ settings, L, onOpenResume }: { settings: ExtensionSettings; L: LType; onOpenResume: () => void }) {
+  const [jobs, setJobs] = useState<SavedJob[]>([])
+  const [dashboard, setDashboard] = useState<DashboardSnapshot | null>(null)
+  const [loading, setLoading] = useState(false)
+  const [expandedId, setExpandedId] = useState<string | null>(null)
+  const [filterStatus, setFilterStatus] = useState<FilterStatus>('all')
+  const [filterSource, setFilterSource] = useState('all')
+  const [search, setSearch] = useState('')
+  const [sortBy, setSortBy] = useState<SortBy>('date')
+  const [scoringId, setScoringId] = useState<string | null>(null)
+  const [toast, setToast] = useState('')
 
-function TrackerPanel({ settings, L }: { settings: ExtensionSettings; L: LType }) {
-  const [jobs,         setJobs]     = useState<SavedJob[]>([])
-  const [loading,      setLoading]  = useState(false)
-  const [expandedId,   setExpanded]  = useState<string | null>(null)
-  const [filterStatus, setFilter]   = useState<string>('all')
-  const [filterSource, setSource]   = useState<string>('all')
-  const [search,       setSearch]   = useState('')
-  const [sortBy,       setSortBy]   = useState<'date' | 'company' | 'score'>('date')
-  const [toast,        setToast]    = useState('')
+  function showToast(message: string) {
+    setToast(message)
+    window.setTimeout(() => setToast(current => current === message ? '' : current), 2600)
+  }
 
-  function showToast(msg: string) { setToast(msg); setTimeout(() => setToast(''), 2500) }
-
-  const loadJobs = (showSpinner = false) => {
+  function loadJobs(showSpinner = false) {
     if (showSpinner) setLoading(true)
-    const timeout = setTimeout(() => {
-      setLoading(false)
-    }, 5000)
-    chrome.runtime.sendMessage({ type: 'GET_RECENT_JOBS' }, r => {
-      clearTimeout(timeout)
-      void chrome.runtime.lastError // suppress port-closed warning
-      setJobs(r?.jobs ?? [])
+    const timeout = window.setTimeout(() => setLoading(false), 5000)
+    chrome.runtime.sendMessage({ type: 'GET_RECENT_JOBS' }, response => {
+      window.clearTimeout(timeout)
+      void chrome.runtime.lastError
+      setJobs(response?.jobs ?? [])
       setLoading(false)
     })
   }
 
   useEffect(() => {
-    // Do not block the side panel's first paint on the API. The list fills in
-    // when the background response arrives, while Scan and the other tabs are
-    // immediately usable even if the API is slow or temporarily unavailable.
-    loadJobs(false)
-    const handler = (msg: { type: string }) => {
-          if (msg.type === 'JOB_SCRAPED' || msg.type === 'JOB_SAVED') loadJobs(false)
+    loadJobs()
+    getDashboard(settings).then(setDashboard).catch(() => setDashboard(null))
+    const handler = (message: { type?: string }) => {
+      if (message.type === 'JOB_SCRAPED' || message.type === 'JOB_SAVED') loadJobs()
     }
     chrome.runtime.onMessage.addListener(handler)
     return () => chrome.runtime.onMessage.removeListener(handler)
+    // settings is stable for the lifetime of the authenticated side panel.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
-  // Unique sources for filter
-  const availableSources = useMemo(() => {
-    const sources = new Set<string>()
-    for (const j of jobs) { if (j.source && j.source !== 'unknown') sources.add(j.source) }
-    return Array.from(sources).sort()
+  const availableSources = useMemo(() => Array.from(new Set(jobs.map(job => job.source).filter((source): source is string => Boolean(source && source !== 'unknown')))).sort(), [jobs])
+  const counts = useMemo(() => {
+    const result: Record<FilterStatus, number> = { all: jobs.length, saved: 0, applied: 0, interview: 0, rejected: 0 }
+    for (const job of jobs) {
+      const status = visibleStatus(job.status)
+      if (status in result && status !== 'all') result[status] += 1
+    }
+    return result
   }, [jobs])
-
-  // Status counts for filter badges
-  const statusCounts = useMemo(() => {
-    const counts: Record<string, number> = { all: jobs.length }
-    for (const j of jobs) { counts[j.status] = (counts[j.status] ?? 0) + 1 }
-    return counts
-  }, [jobs])
-
-  // Filtered + searched + sorted list
   const filtered = useMemo(() => {
-    let list = filterStatus === 'all' ? [...jobs] : jobs.filter(j => j.status === filterStatus)
-    if (filterSource !== 'all') {
-      list = list.filter(j => j.source === filterSource)
-    }
-    if (search.trim()) {
-      const q = search.trim().toLowerCase()
-      list = list.filter(j =>
-        j.role.toLowerCase().includes(q) || j.company.toLowerCase().includes(q)
-      )
-    }
-    // Sort
-    if (sortBy === 'company') {
-      list.sort((a, b) => a.company.localeCompare(b.company))
-    } else if (sortBy === 'score') {
-      list.sort((a, b) => (b.score ?? 0) - (a.score ?? 0))
-    } else {
-      list.sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime())
-    }
+    let list = filterStatus === 'all' ? [...jobs] : jobs.filter(job => visibleStatus(job.status) === filterStatus)
+    if (filterSource !== 'all') list = list.filter(job => job.source === filterSource)
+    const query = search.trim().toLowerCase()
+    if (query) list = list.filter(job => job.role.toLowerCase().includes(query) || job.company.toLowerCase().includes(query))
+    if (sortBy === 'company') list.sort((a, b) => a.company.localeCompare(b.company))
+    else if (sortBy === 'score') list.sort((a, b) => (b.score ?? -1) - (a.score ?? -1))
+    else list.sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime())
     return list
   }, [jobs, filterStatus, filterSource, search, sortBy])
 
-  // Header summary stats
-  const appliedCount   = jobs.filter(j => j.status === 'applied').length
-  const interviewCount = jobs.filter(j => j.status === 'interview').length
-  const offerCount     = jobs.filter(j => j.status === 'offer').length
+  const savedCount = dashboard?.stats.saved ?? counts.saved
+  const appliedCount = dashboard?.stats.applied ?? counts.applied
+  const interviewCount = dashboard?.stats.interviews ?? counts.interview
+  const rejectedCount = dashboard?.stats.rejected ?? counts.rejected
+  const weeklyApplications = dashboard?.stats.thisWeek ?? 0
+  const weeklyTarget = 30
+  const highMatchThreshold = dashboard?.minMatchScore ?? 75
+  const highMatch = jobs.filter(job => visibleStatus(job.status) === 'saved' && job.score != null && job.score >= highMatchThreshold).sort((a, b) => (b.score ?? 0) - (a.score ?? 0))[0] ?? null
+  const unscoredCount = jobs.filter(job => job.score == null).length
+
+  async function scoreJob(job: SavedJob) {
+    if (scoringId) return
+    setScoringId(job.id)
+    try {
+      const resumes = await listResumes(settings)
+      const currentId = await getCurrentResumeId()
+      const resumeId = currentId && resumes.some(resume => resume.id === currentId) ? currentId : resumes[0]?.id
+      if (!resumeId) {
+        showToast('Add a resume before scoring a job')
+        onOpenResume()
+        return
+      }
+      const resume = await getResume(settings, resumeId)
+      const result = await scoreResume(settings, { resumeContent: resume.content, jobTitle: job.role, jobCompany: job.company, jobDescription: job.description ?? '' })
+      const updated = await updateJobScore(settings, job.id, result.score, result.keywords ?? '')
+      setJobs(previous => previous.map(item => item.id === job.id ? { ...item, ...updated, score: result.score } : item))
+      showToast(`${job.score == null ? 'Match score ready' : 'Match score updated'} · ${result.score}%`)
+    } catch (error) {
+      showToast(error instanceof Error ? error.message : 'Scoring failed')
+    } finally {
+      setScoringId(null)
+    }
+  }
 
   return (
-    <div style={{
-      display: 'flex', flexDirection: 'column', height: '100vh',
-      background: C.bg,
-      fontFamily: '-apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif',
-    }}>
-
-      {/* ── Header ── */}
-      <div style={{
-        background: `linear-gradient(135deg, ${C.primary} 0%, #7C3AED 100%)`,
-        padding: '12px 14px',
-        boxShadow: '0 2px 10px rgba(79,70,229,0.25)',
-      }}>
-        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 10 }}>
-          <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
-            <div style={{
-              width: 30, height: 30, borderRadius: 9, flexShrink: 0,
-              background: 'rgba(255,255,255,0.2)',
-              display: 'flex', alignItems: 'center', justifyContent: 'center',
-              fontSize: 14, fontWeight: 700, color: '#fff',
-            }}>
-              A
-            </div>
-            <div>
-              <div style={{ fontSize: 13, fontWeight: 700, color: '#fff', lineHeight: 1.2 }}>ApplyMate</div>
-              <div style={{ fontSize: 10, color: 'rgba(255,255,255,0.65)', lineHeight: 1.2 }}>
-                {jobs.length} 个职位已跟踪
-              </div>
-            </div>
+    <div className="am-tracker">
+      <section className="am-overview" aria-label="Application overview">
+        <div className="am-overview-grid">
+          <div className="am-overview-cell">
+            <div className="am-overview-label"><Target size={12} aria-hidden="true" />Application momentum</div>
+            <div className="am-momentum-summary"><div className="am-momentum-ring" style={{ '--am-progress-angle': `${Math.min(weeklyApplications / weeklyTarget * 100, 100) * 3.6}deg` } as React.CSSProperties} aria-label={`${Math.min(weeklyApplications / weeklyTarget * 100, 100)}% of weekly target`}><strong>{Math.min(weeklyApplications, weeklyTarget)}</strong><span>/ {weeklyTarget}</span><small>weekly target</small></div><div className="am-momentum-copy"><strong>Keep it up!</strong><span>{Math.max(1, 7 - new Date().getDay())} days left</span></div></div>
           </div>
-          <a href={settings.apiBaseUrl} target="_blank" rel="noreferrer" style={{
-            fontSize: 10, color: 'rgba(255,255,255,0.9)', textDecoration: 'none',
-            background: 'rgba(255,255,255,0.15)', padding: '4px 10px',
-            borderRadius: 20, fontWeight: 600,
-          }}>
-            Dashboard ↗
-          </a>
-        </div>
-
-        {/* Mini stats row */}
-        <div style={{ display: 'flex', gap: 8 }}>
-          {[
-            { label: '申请', count: appliedCount,   bright: false },
-            { label: '面试', count: interviewCount,  bright: false },
-            { label: 'Offer', count: offerCount,      bright: true  },
-          ].map(s => (
-            <div key={s.label} style={{
-              background: 'rgba(255,255,255,0.12)', borderRadius: 8,
-              padding: '6px 0', flex: 1, textAlign: 'center',
-            }}>
-              <div style={{
-                fontSize: 17, fontWeight: 700, lineHeight: 1,
-                color: s.bright ? 'rgba(186,255,161,0.95)' : 'rgba(255,255,255,0.95)',
-              }}>
-                {s.count}
-              </div>
-              <div style={{ fontSize: 9, color: 'rgba(255,255,255,0.65)', marginTop: 2 }}>{s.label}</div>
-            </div>
-          ))}
-        </div>
-      </div>
-
-      {/* ── Search bar ── */}
-      <div style={{ background: C.card, padding: '8px 12px', borderBottom: `1px solid ${C.border}` }}>
-        <div style={{
-          display: 'flex', alignItems: 'center', gap: 6,
-          background: C.bg, border: `1px solid ${C.border}`, borderRadius: 8, padding: '6px 10px',
-        }}>
-          <span style={{ fontSize: 12, color: C.subtle, flexShrink: 0 }}>🔍</span>
-          <input
-            value={search}
-            onChange={e => setSearch(e.target.value)}
-            placeholder="搜索职位或公司…"
-            style={{
-              flex: 1, border: 'none', background: 'transparent',
-              outline: 'none', fontSize: 12, color: C.text, fontFamily: 'inherit',
-            }}
-          />
-          {search && (
-            <button onClick={() => setSearch('')} style={{
-              border: 'none', background: 'none', cursor: 'pointer',
-              color: C.subtle, fontSize: 13, padding: '0 2px', lineHeight: 1,
-            }}>
-              ✕
-            </button>
-          )}
-        </div>
-      </div>
-
-      {/* ── Status filter strip ── */}
-      <div style={{
-        background: C.card, borderBottom: `1px solid ${C.border}`,
-        padding: '0 10px', display: 'flex', gap: 1, overflowX: 'auto',
-      }}>
-        {([
-          { value: 'all', label: 'All', color: '' },
-          { value: 'saved',     label: L.saved,     color: C.subtle  },
-          { value: 'applied',   label: L.applied,   color: C.primary },
-          { value: 'review',    label: L.review,    color: C.amber   },
-          { value: 'interview', label: L.interview, color: C.teal    },
-          { value: 'offer',     label: L.offer,     color: C.green   },
-          { value: 'rejected',  label: L.rejected,  color: C.red     },
-        ]).map(opt => {
-          const active = filterStatus === opt.value
-          const count  = statusCounts[opt.value] ?? 0
-          return (
-            <button key={opt.value} onClick={() => setFilter(opt.value)} style={{
-              padding: '7px 8px', border: 'none', background: 'transparent', cursor: 'pointer',
-              fontSize: 10.5, fontWeight: active ? 600 : 400, whiteSpace: 'nowrap',
-              color: active ? C.primary : C.muted,
-              borderBottom: active ? `2px solid ${C.primary}` : '2px solid transparent',
-              transition: 'all 0.1s', display: 'flex', alignItems: 'center', gap: 4,
-            }}>
-              {opt.color && (
-                <span style={{ width: 5, height: 5, borderRadius: '50%', background: opt.color, display: 'inline-block', flexShrink: 0 }} />
-              )}
-              {opt.label}
-              {count > 0 && (
-                <span style={{
-                  fontSize: 9, fontWeight: 600, lineHeight: '14px', padding: '0 4px',
-                  background: active ? `rgba(79,70,229,0.12)` : C.bg,
-                  color: active ? C.primary : C.subtle,
-                  borderRadius: 999,
-                }}>
-                  {count}
-                </span>
-              )}
-            </button>
-          )
-        })}
-      </div>
-
-      {/* ── Source filter + Sort controls ── */}
-      <div style={{
-        background: C.card, borderBottom: `1px solid ${C.border}`,
-        padding: '5px 10px', display: 'flex', gap: 6, alignItems: 'center',
-      }}>
-        {/* Source filter */}
-        <select value={filterSource} onChange={e => setSource(e.target.value)} style={{
-          flex: 1, padding: '4px 6px', fontSize: 10.5,
-          border: `1px solid ${C.border}`, borderRadius: 6,
-          background: C.bg, color: C.text, fontFamily: 'inherit', outline: 'none',
-          cursor: 'pointer',
-        }}>
-          <option value="all">所有来源</option>
-          {availableSources.map(s => (
-            <option key={s} value={s}>{s}</option>
-          ))}
-        </select>
-        {/* Sort */}
-        <select value={sortBy} onChange={e => setSortBy(e.target.value as typeof sortBy)} style={{
-          padding: '4px 6px', fontSize: 10.5,
-          border: `1px solid ${C.border}`, borderRadius: 6,
-          background: C.bg, color: C.text, fontFamily: 'inherit', outline: 'none',
-          cursor: 'pointer',
-        }}>
-          <option value="date">最新</option>
-          <option value="company">公司</option>
-          <option value="score">匹配</option>
-        </select>
-      </div>
-
-      {/* ── Current page job banner ── */}
-          <CurrentPageBanner settings={settings} onSaved={() => loadJobs(false)} />
-
-      {/* ── Job list ── */}
-      <div style={{ flex: 1, overflowY: 'auto', padding: '10px' }}>
-        {loading ? (
-          <Spinner />
-        ) : filtered.length === 0 ? (
-          <EmptyState filter={filterStatus} hasSearch={!!search.trim()} onClearSearch={() => setSearch('')} L={L} />
-        ) : (
-          <div style={{ display: 'flex', flexDirection: 'column', gap: 7 }}>
-            {filtered.map(job => (
-              <JobCard
-                key={job.id}
-                job={job}
-                expanded={expandedId === job.id}
-                onToggle={() => setExpanded(prev => prev === job.id ? null : job.id)}
-                settings={settings}
-                L={L}
-                onStatusChange={async (id, status) => {
-                  await updateJobStatus(settings, id, status)
-                  setJobs(prev => prev.map(j => j.id === id ? { ...j, status: status as SavedJob['status'] } : j))
-                  showToast(`→ ${({ saved: L.saved, applied: L.applied, review: L.review, interview: L.interview, offer: L.offer, rejected: L.rejected })[status] ?? status}`)
-                }}
-                showToast={showToast}
-              />
-            ))}
+          <div className="am-overview-cell">
+            <div className="am-overview-label"><BarChart3 size={12} aria-hidden="true" />Next step</div>
+            <div className="am-overview-copy">{!dashboard?.hasResume ? 'Add your resume to unlock match scoring.' : unscoredCount > 0 ? `${unscoredCount} saved role${unscoredCount === 1 ? '' : 's'} ready to score.` : `${Math.max(0, weeklyTarget - weeklyApplications)} applications this week to stay on track.`}</div>
+            <div className="am-progress-bar" aria-hidden="true"><span style={{ width: `${Math.min(weeklyApplications / weeklyTarget * 100, 100)}%` }} /></div>
+            <button className="am-overview-action" type="button" onClick={() => dashboard?.hasResume ? (unscoredCount ? void scoreJob(jobs.find(job => job.score == null)!) : chrome.tabs.create({ url: `${settings.apiBaseUrl}/jobs` })) : onOpenResume()}>{!dashboard?.hasResume ? 'Add resume' : unscoredCount ? 'Score a role' : 'View plan'}</button>
           </div>
-        )}
-      </div>
-
-      {/* ── Footer ── */}
-      <div style={{
-        background: C.card, borderTop: `1px solid ${C.border}`,
-        padding: '8px 12px', display: 'flex', gap: 8,
-      }}>
-        <button onClick={() => loadJobs(true)} style={{
-          flex: 1, padding: '7px', background: C.bg,
-          border: `1px solid ${C.border}`, borderRadius: 7,
-          fontSize: 11, cursor: 'pointer', color: C.muted, fontFamily: 'inherit',
-        }}>
-          ↺ Refresh
-        </button>
-        <button onClick={() => chrome.tabs.create({ url: settings.apiBaseUrl })} style={{
-          flex: 2, padding: '7px', background: C.primary, border: 'none',
-          borderRadius: 7, fontSize: 11, fontWeight: 600, cursor: 'pointer',
-          color: '#fff', fontFamily: 'inherit',
-        }}>
-          {L.openDashboard} →
-        </button>
-      </div>
-
-      {/* ── Toast ── */}
-      {toast && (
-        <div style={{
-          position: 'fixed', bottom: 60, left: '50%', transform: 'translateX(-50%)',
-          background: '#0f172a', color: '#fff', padding: '8px 18px',
-          borderRadius: 20, fontSize: 11, zIndex: 9999, whiteSpace: 'nowrap',
-          boxShadow: '0 4px 16px rgba(0,0,0,0.2)', fontWeight: 600,
-        }}>
-          {toast}
+          <div className="am-overview-cell">
+            <div className="am-overview-label"><Sparkles size={12} aria-hidden="true" />High match opportunity</div>
+            {highMatch ? <div className="am-highlight"><span className="am-highlight-mark">{companyInitials(highMatch.company)}</span><div className="am-highlight-copy"><div className="am-highlight-role">{highMatch.role}</div><div className="am-highlight-company">{highMatch.company}</div></div><span className="am-highlight-score">{highMatch.score}%</span></div> : <div className="am-overview-copy">Score a saved role to see your strongest match here.</div>}
+            {highMatch && <button className="am-action-link" type="button" onClick={() => setExpandedId(highMatch.id)}>View job <ArrowRight size={10} aria-hidden="true" /></button>}
+          </div>
         </div>
-      )}
+      </section>
+
+      <div className="am-stat-grid" aria-label="Application counts">
+        <StatCard className="saved" label="Saved" value={savedCount} icon={<Bookmark size={13} />} />
+        <StatCard className="applied" label="Applied" value={appliedCount} icon={<Send size={13} />} />
+        <StatCard className="interview" label="Interviews" value={interviewCount} icon={<MessageSquare size={13} />} />
+        <StatCard className="rejected" label="Rejected" value={rejectedCount} icon={<Ban size={13} />} />
+      </div>
+
+      <div className="am-job-tools">
+        <div className="am-search-wrap"><label className="am-search"><Search size={15} aria-hidden="true" /><input value={search} onChange={event => setSearch(event.target.value)} placeholder="Search by role or company…" aria-label="Search jobs" />{search && <button className="am-search-clear" type="button" onClick={() => setSearch('')} aria-label="Clear search"><X size={13} /></button>}</label></div>
+        <div className="am-filter-strip" role="tablist" aria-label="Job status filters">
+          {([['all', 'All'], ['saved', L.saved], ['applied', L.applied], ['interview', 'Interviews'], ['rejected', L.rejected]] as const).map(([value, label]) => <button key={value} className={`am-filter${filterStatus === value ? ' active' : ''}`} type="button" role="tab" aria-selected={filterStatus === value} onClick={() => setFilterStatus(value)}>{label}<span className="am-filter-count">{counts[value]}</span></button>)}
+        </div>
+        <div className="am-select-row"><select className="am-select" value={filterSource} onChange={event => setFilterSource(event.target.value)} aria-label="Filter by source"><option value="all">All sources</option>{availableSources.map(source => <option key={source} value={source}>{source}</option>)}</select><select className="am-select" value={sortBy} onChange={event => setSortBy(event.target.value as SortBy)} aria-label="Sort jobs"><option value="date">Newest first</option><option value="company">Company</option><option value="score">Match score</option></select></div>
+      </div>
+
+      <CurrentPageBanner onSaved={() => loadJobs()} />
+      <div className="am-list">
+        {loading ? <div className="am-spinner"><LoaderCircle className="am-spin" size={20} aria-label="Loading jobs" /></div> : filtered.length === 0 ? <EmptyState hasSearch={Boolean(search.trim())} filter={filterStatus} onClearSearch={() => setSearch('')} onOpenDashboard={() => chrome.tabs.create({ url: `${settings.apiBaseUrl}/jobs` })} L={L} /> : <div className="am-list-inner">{filtered.map(job => <JobCard key={job.id} job={job} expanded={expandedId === job.id} onToggle={() => setExpandedId(current => current === job.id ? null : job.id)} settings={settings} L={L} scoring={scoringId === job.id} onScore={() => void scoreJob(job)} onStatusChange={async (id, status) => { try { const updated = await updateJobStatus(settings, id, status); setJobs(previous => previous.map(item => item.id === id ? { ...item, ...updated } : item)); showToast(`Status updated · ${statusLabel(status, L)}`) } catch (error) { showToast(error instanceof Error ? error.message : 'Could not update status') } }} />)}</div>}
+      </div>
+      <footer className="am-footer"><button className="am-footer-button" type="button" onClick={() => { loadJobs(true); getDashboard(settings).then(setDashboard).catch(() => {}) }}><RefreshCw size={12} aria-hidden="true" /> Refresh</button><button className="am-footer-button primary" type="button" onClick={() => chrome.tabs.create({ url: `${settings.apiBaseUrl}/jobs` })}>View all jobs <ArrowRight size={12} aria-hidden="true" /></button></footer>
+      {toast && <div className="am-toast" role="status">{toast}</div>}
     </div>
   )
 }
 
-// ── Job card (expandable) ─────────────────────────────────────────────────────
+function StatCard({ className, label, value, icon }: { className: string; label: string; value: number; icon: React.ReactNode }) {
+  return <div className={`am-stat ${className}`}><div className="am-stat-head">{icon}<span>{label}</span></div><div className="am-stat-value">{value}</div></div>
+}
 
-function JobCard({ job, expanded, onToggle, settings, onStatusChange, showToast, L }: {
+function statusLabel(status: string, L: Labels): string {
+  return ({ saved: L.saved, applied: L.applied, interview: 'Interview', rejected: L.rejected, offer: L.applied } as Record<string, string>)[status] ?? status
+}
+
+function JobCard({ job, expanded, onToggle, settings, onStatusChange, onScore, scoring, L }: {
   job: SavedJob
   expanded: boolean
   onToggle: () => void
   settings: ExtensionSettings
-  onStatusChange: (id: string, status: string) => void
-  showToast: (msg: string) => void
-  L: LType
+  onStatusChange: (id: string, status: string) => Promise<void>
+  onScore: () => void
+  scoring: boolean
+  L: Labels
 }) {
-  const sColor = statusColor(job.status)
-  const sLabel = ({ saved: L.saved, applied: L.applied, review: L.review, interview: L.interview, offer: L.offer, rejected: L.rejected })[job.status] ?? job.status
-  const [notes,      setNotes]   = useState(job.notes ?? '')
-  const [notesSaving, setNSaving] = useState(false)
+  const [notes, setNotes] = useState(job.notes ?? '')
+  const [notesSaving, setNotesSaving] = useState(false)
   const notesTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const displayStatus = visibleStatus(job.status)
+  const scoreTone = job.score != null && job.score >= 80 ? 'strong' : job.score != null && job.score < 60 ? 'weak' : 'normal'
 
-  // Auto-save notes with debounce
+  useEffect(() => setNotes(job.notes ?? ''), [job.id, job.notes])
   useEffect(() => {
     if (!expanded) return
     if (notesTimer.current) clearTimeout(notesTimer.current)
     notesTimer.current = setTimeout(async () => {
-      setNSaving(true)
-      try { await updateJobNotes(settings, job.id, notes) }
-      finally { setNSaving(false) }
-    }, 1200)
+      setNotesSaving(true)
+      try { await updateJobNotes(settings, job.id, notes) } finally { setNotesSaving(false) }
+    }, 1000)
     return () => { if (notesTimer.current) clearTimeout(notesTimer.current) }
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [notes])
+    // Debounced persistence intentionally follows the local notes field.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [notes, expanded])
 
   return (
-    <div style={{
-      background: C.card, borderRadius: 10, border: `1px solid ${C.border}`,
-      overflow: 'hidden',
-      boxShadow: expanded ? '0 4px 14px rgba(0,0,0,0.08)' : '0 1px 3px rgba(0,0,0,0.04)',
-      transition: 'box-shadow 0.2s',
-    }}>
-
-      {/* ── Card header (always visible) ── */}
-      <div
-        onClick={onToggle}
-        style={{ padding: '10px 12px', cursor: 'pointer', display: 'flex', gap: 10, alignItems: 'center' }}
-      >
-        {/* Avatar */}
-        <div style={{
-          width: 36, height: 36, borderRadius: 9, flexShrink: 0,
-          background: `${sColor}18`, color: sColor,
-          display: 'flex', alignItems: 'center', justifyContent: 'center',
-          fontSize: 11, fontWeight: 700,
-        }}>
-          {job.company.slice(0, 2).toUpperCase()}
-        </div>
-
-        {/* Text */}
-        <div style={{ flex: 1, minWidth: 0 }}>
-          <div style={{
-            fontSize: 12.5, fontWeight: 600, color: C.text,
-            overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', lineHeight: 1.3,
-          }}>
-            {job.role}
-          </div>
-          <div style={{ fontSize: 11, color: C.muted, display: 'flex', alignItems: 'center', gap: 4, marginTop: 2 }}>
-            <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', maxWidth: 120 }}>
-              {job.company}
-            </span>
-            <span style={{ color: C.subtle, flexShrink: 0 }}>·</span>
-            <span style={{ color: C.subtle, flexShrink: 0, fontSize: 10 }}>
-              {formatDate(job.createdAt, L)}
-            </span>
-          </div>
-        </div>
-
-        {/* Right */}
-        <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-end', gap: 4, flexShrink: 0 }}>
-          <span style={{
-            fontSize: 10, fontWeight: 600, padding: '2px 8px',
-            color: sColor, background: `${sColor}14`, borderRadius: 999,
-          }}>
-            {sLabel}
-          </span>
-          {/* Quick action: mark as applied when job is saved */}
-          {job.status === 'saved' && (
-            <button onClick={e => { e.stopPropagation(); onStatusChange(job.id, 'applied') }} style={{
-              fontSize: 9, fontWeight: 600, padding: '1px 7px',
-              background: 'rgba(79,70,229,0.1)', color: C.primary,
-              border: `1px solid rgba(79,70,229,0.2)`, borderRadius: 999,
-              cursor: 'pointer', fontFamily: 'inherit', lineHeight: '18px',
-            }}>
-              {L.applied} →
-            </button>
-          )}
-          <span style={{ fontSize: 9, color: C.subtle }}>{expanded ? '▲' : '▼'}</span>
-        </div>
-      </div>
-
-      {/* ── Expanded detail ── */}
-      {expanded && (
-        <div style={{
-          borderTop: `1px solid ${C.border}`, padding: '12px',
-          display: 'flex', flexDirection: 'column', gap: 12,
-        }}>
-
-          {/* Status selector */}
-          <div>
-            <div style={{
-              fontSize: 10, fontWeight: 600, color: C.subtle,
-              textTransform: 'uppercase', letterSpacing: '0.06em', marginBottom: 7,
-            }}>
-              申请状态
-            </div>
-            <div style={{ display: 'flex', flexWrap: 'wrap', gap: 5 }}>
-              {([
-                { value: 'saved',     label: L.saved,     color: C.subtle  },
-                { value: 'applied',   label: L.applied,   color: C.primary },
-                { value: 'review',    label: L.review,    color: C.amber   },
-                { value: 'interview', label: L.interview, color: C.teal    },
-                { value: 'offer',     label: L.offer,     color: C.green   },
-                { value: 'rejected',  label: L.rejected,  color: C.red     },
-              ]).map(opt => (
-                <button key={opt.value} onClick={() => onStatusChange(job.id, opt.value)} style={{
-                  padding: '4px 10px', borderRadius: 999,
-                  border: `1.5px solid ${job.status === opt.value ? opt.color : C.border}`,
-                  background: job.status === opt.value ? `${opt.color}14` : 'transparent',
-                  color: job.status === opt.value ? opt.color : C.muted,
-                  fontSize: 10.5, fontWeight: job.status === opt.value ? 600 : 400,
-                  cursor: 'pointer', transition: 'all 0.1s', fontFamily: 'inherit',
-                }}>
-                  {opt.label}
-                </button>
-              ))}
-            </div>
-          </div>
-
-          {/* Notes */}
-          <div>
-            <div style={{
-              fontSize: 10, fontWeight: 600, color: C.subtle,
-              textTransform: 'uppercase', letterSpacing: '0.06em', marginBottom: 6,
-              display: 'flex', justifyContent: 'space-between', alignItems: 'center',
-            }}>
-              <span>Notes</span>
-              {notesSaving ? (
-                <span style={{ textTransform: 'none', fontWeight: 400, color: C.subtle, fontSize: 10 }}>Saving…</span>
-              ) : notes ? (
-                <span style={{ textTransform: 'none', fontWeight: 400, color: C.green, fontSize: 10 }}>✓ Saved</span>
-              ) : null}
-            </div>
-            <textarea
-              value={notes}
-              onChange={e => setNotes(e.target.value)}
-              placeholder="Notes: interview questions, salary, contact…"
-              style={{
-                width: '100%', height: 70, padding: '7px 9px', resize: 'vertical',
-                border: `1px solid ${C.border}`, borderRadius: 7, fontSize: 11,
-                fontFamily: 'inherit', color: C.text, outline: 'none',
-                background: C.bg, boxSizing: 'border-box',
-              }}
-            />
-          </div>
-
-          {/* Salary (if available) */}
-          {job.salary && (
-            <div style={{
-              fontSize: 11, color: C.green, fontWeight: 500,
-              background: 'rgba(59,109,17,0.07)', padding: '5px 10px',
-              borderRadius: 6, border: '1px solid rgba(59,109,17,0.15)',
-            }}>
-              💰 {job.salary}
-            </div>
-          )}
-
-          {/* Actions */}
-          <div style={{ display: 'flex', gap: 8 }}>
-            {job.url && (
-              <a href={job.url} target="_blank" rel="noreferrer" style={{
-                flex: 1, padding: '7px 0', textAlign: 'center',
-                background: C.bg, border: `1px solid ${C.border}`, borderRadius: 7,
-                fontSize: 11, color: C.primary, textDecoration: 'none', fontWeight: 500,
-              }}>
-                Original ↗
-              </a>
-            )}
-            <a href={`${settings.apiBaseUrl}/jobs?highlight=${job.id}`} target="_blank" rel="noreferrer" style={{
-              flex: 2, padding: '7px 0', textAlign: 'center',
-              background: C.primary, borderRadius: 7,
-              fontSize: 11, fontWeight: 600, color: '#fff', textDecoration: 'none',
-            }}>
-              {L.openDashboard} →
-            </a>
-          </div>
-        </div>
-      )}
-    </div>
-  )
-}
-
-// ── Empty state ───────────────────────────────────────────────────────────────
-
-function EmptyState({ filter, hasSearch, onClearSearch, L }: {
-  filter: string; hasSearch: boolean; onClearSearch: () => void; L: LType
-}) {
-  if (hasSearch) {
-    return (
-      <div style={{ textAlign: 'center', padding: '44px 16px', color: C.muted }}>
-        <div style={{ fontSize: 30, marginBottom: 10 }}>🔍</div>
-        <div style={{ fontSize: 13, fontWeight: 600, color: C.text, marginBottom: 8 }}>No results</div>
-        <button onClick={onClearSearch} style={{
-          fontSize: 11, color: C.primary, background: 'rgba(79,70,229,0.08)',
-          border: `1px solid rgba(79,70,229,0.2)`, borderRadius: 6,
-          cursor: 'pointer', padding: '5px 14px', fontFamily: 'inherit', fontWeight: 500,
-        }}>
-          Clear search
+    <article className={`am-job-card${expanded ? ' expanded' : ''}`}>
+      <div className="am-job-row">
+        <span className="am-company-mark" aria-hidden="true">{companyInitials(job.company)}</span>
+        <button className="am-job-main" type="button" onClick={onToggle} aria-expanded={expanded}>
+          <div className="am-job-role">{job.role}</div>
+          <div className="am-job-company">{job.company}{job.location ? ` · ${job.location}` : ''}</div>
+          <div className="am-job-meta"><span className="am-status-pill" style={{ color: statusColor(displayStatus), background: `${statusColor(displayStatus)}14` }}><span className="am-status-dot" style={{ background: statusColor(displayStatus) }} />{statusLabel(displayStatus, L)}</span><span>·</span><span>{formatDate(job.createdAt, L)}</span></div>
         </button>
+        <div className={`am-score-box ${scoreTone}`}>
+          {job.score != null ? <><div className="am-score"><div className="am-score-ring" style={{ '--am-score-angle': `${Math.max(0, Math.min(job.score, 100)) * 3.6}deg` } as React.CSSProperties} aria-label={`${job.score}% match`}><span>{job.score}</span></div><span className="am-score-label">Match</span></div><button className="am-score-action" type="button" disabled={scoring} onClick={event => { event.stopPropagation(); onScore() }}>{scoring ? '…' : 'Re-score'}</button></> : <><button className="am-score-action" type="button" disabled={scoring} onClick={event => { event.stopPropagation(); onScore() }}>{scoring ? 'Scoring…' : 'Score'}</button><span className="am-score-help">Resume + profile</span></>}
+        </div>
+        <button className="am-chevron" type="button" onClick={onToggle} aria-label={expanded ? `Collapse ${job.role}` : `Expand ${job.role}`}><ChevronDown size={16} className={expanded ? 'am-chevron-open' : ''} /></button>
       </div>
-    )
-  }
-  return (
-    <div style={{ textAlign: 'center', padding: '48px 16px', color: C.muted }}>
-      <div style={{ fontSize: 32, marginBottom: 12 }}>📋</div>
-      <div style={{ fontSize: 13, fontWeight: 600, marginBottom: 6, color: C.text }}>
-        {L.noJobs}
-      </div>
-    </div>
+      {expanded && <div className="am-detail">
+        <div className="am-detail-grid"><div className="am-detail-box"><div className="am-detail-label">Notes</div><div className="am-notes-meta"><span>{notesSaving ? <span className="am-saving">Saving…</span> : notes ? <span className="am-saved">Saved</span> : 'Add context for later'}</span></div><textarea className="am-notes" value={notes} onChange={event => setNotes(event.target.value)} placeholder="Interview questions, salary, contact…" /></div><div className="am-detail-box"><div className="am-detail-label">Original job link</div>{job.url ? <a className="am-detail-link" href={job.url} target="_blank" rel="noreferrer">Open original <ExternalLink size={11} /></a> : <div className="am-detail-text">No original link saved.</div>}<div className="am-detail-label" style={{ marginTop: 12 }}>Match score</div><div className="am-detail-text">{job.score == null ? 'Not scored yet.' : `Scored at ${job.score}% against your resume.`}</div></div></div>
+        <div><div className="am-detail-label" style={{ marginBottom: 5 }}>Update status</div><div className="am-status-actions">{([['saved', L.saved], ['applied', L.applied], ['interview', 'Interviews'], ['rejected', L.rejected]] as const).map(([value, label]) => <button key={value} className={`am-status-button${displayStatus === value ? ' active' : ''}`} type="button" onClick={() => void onStatusChange(job.id, value)}>{label}</button>)}</div></div>
+        <div className="am-detail-actions">{job.url && <a className="am-detail-action" href={job.url} target="_blank" rel="noreferrer">Original <ExternalLink size={11} /></a>}<a className="am-detail-action primary" href={`${settings.apiBaseUrl}/jobs?highlight=${job.id}`} target="_blank" rel="noreferrer">Open in My Jobs <ArrowRight size={11} /></a></div>
+      </div>}
+    </article>
   )
 }
 
-// ── Not logged in ─────────────────────────────────────────────────────────────
+function EmptyState({ hasSearch, filter, onClearSearch, onOpenDashboard, L }: { hasSearch: boolean; filter: FilterStatus; onClearSearch: () => void; onOpenDashboard: () => void; L: Labels }) {
+  if (hasSearch) return <div className="am-empty"><div className="am-empty-icon"><Search size={17} /></div><div className="am-empty-title">No matching jobs</div><div className="am-empty-copy">Try another role or company name.</div><button className="am-empty-action" type="button" onClick={onClearSearch}>Clear search</button></div>
+  return <div className="am-empty"><div className="am-empty-icon"><Bookmark size={17} /></div><div className="am-empty-title">{filter === 'all' ? L.noJobs : `No ${filter === 'interview' ? 'interview' : filter} jobs yet`}</div><div className="am-empty-copy">Save a promising role from any supported job site and it will appear here.</div><button className="am-empty-action" type="button" onClick={onOpenDashboard}>Open My Jobs</button></div>
+}
 
 function NotLoggedIn({ apiBase }: { apiBase: string }) {
   const L = useExtLang()
-  return (
-    <div style={{
-      display: 'flex', flexDirection: 'column', alignItems: 'center',
-      justifyContent: 'center', height: '100vh', gap: 18,
-      padding: 28, textAlign: 'center',
-      background: 'linear-gradient(160deg, #F8F9FF 0%, #EEF0FF 100%)',
-      fontFamily: '-apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif',
-    }}>
-      <div style={{
-        width: 60, height: 60, borderRadius: 18,
-        background: C.gradient,
-        display: 'flex', alignItems: 'center', justifyContent: 'center',
-        fontSize: 26, fontWeight: 800, color: '#fff',
-        boxShadow: '0 8px 24px rgba(79,70,229,0.40)',
-      }}>A</div>
-      <div>
-        <div style={{ fontSize: 16, fontWeight: 700, marginBottom: 6, color: C.text }}>{L.notLoggedIn}</div>
-        <div style={{ fontSize: 12, color: C.muted, lineHeight: 1.75, maxWidth: 220 }}>{L.loginPrompt}</div>
-      </div>
-      <a href={apiBase} target="_blank" rel="noreferrer" style={{
-        padding: '10px 28px', background: C.gradient, color: '#fff',
-        borderRadius: 11, textDecoration: 'none', fontSize: 13,
-        fontWeight: 700, boxShadow: '0 4px 16px rgba(79,70,229,0.40)',
-        letterSpacing: '0.01em',
-      }}>
-        {L.openDashboard} →
-      </a>
-    </div>
-  )
+  return <div className="am-sidepanel" style={{ alignItems: 'center', justifyContent: 'center', gap: 14, padding: 24, textAlign: 'center' }}><span className="am-brand-mark" style={{ width: 48, height: 48, fontSize: 22 }} aria-hidden="true">A</span><div><div style={{ fontSize: 15, fontWeight: 750 }}>{L.notLoggedIn}</div><div style={{ marginTop: 5, color: 'var(--am-muted)', fontSize: 11, lineHeight: 1.6 }}>{L.loginPrompt}</div></div><a className="am-footer-button primary" style={{ flex: 'none', padding: '8px 14px', textDecoration: 'none' }} href={apiBase} target="_blank" rel="noreferrer">{L.openDashboard} <ArrowRight size={12} /></a></div>
 }
 
-// ── Spinner ───────────────────────────────────────────────────────────────────
-
 function Spinner() {
-  return (
-    <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', height: 200, flexDirection: 'column', gap: 12 }}>
-      <div style={{
-        width: 28, height: 28,
-        border: `3px solid rgba(79,70,229,0.12)`, borderTopColor: C.primary,
-        borderRadius: '50%', animation: 'sp-spin 0.7s linear infinite',
-      }} />
-      <style>{`@keyframes sp-spin { to { transform: rotate(360deg) } }`}</style>
-    </div>
-  )
+  return <div className="am-sidepanel"><div className="am-spinner"><LoaderCircle className="am-spin" size={20} /></div></div>
 }
