@@ -5,7 +5,7 @@
 import { getSettings, setCurrentJob, setBadge, clearBadge } from '@/lib/storage'
 import { login, saveJob, getRecentJobs, getStats, updateJob } from '@/lib/api'
 import { getJobIdentity } from '@/lib/job-identity'
-import type { ExtMessage, ExtensionSettings, SavedJob, ScrapedJob } from '@/lib/types'
+import type { DashboardStats, ExtMessage, ExtensionSettings, SavedJob, ScrapedJob } from '@/lib/types'
 import { isApplyMateDashboardUrl, isAuthFailure } from '@/lib/auth-recovery'
 
 // ── Simple rate limiter (prevent excessive API calls) ──────────────
@@ -52,9 +52,9 @@ setInterval(() => {
 // the authenticated user, so never let it leak into the next account.
 chrome.storage.onChanged.addListener((changes, area) => {
   if (area !== 'sync' || !changes.settings) return
-  const before = changes.settings.oldValue as { apiToken?: unknown } | undefined
-  const after = changes.settings.newValue as { apiToken?: unknown } | undefined
-  if (before?.apiToken === after?.apiToken) return
+  const before = changes.settings.oldValue as { apiToken?: unknown; userEmail?: unknown; apiBaseUrl?: unknown } | undefined
+  const after = changes.settings.newValue as { apiToken?: unknown; userEmail?: unknown; apiBaseUrl?: unknown } | undefined
+  if (before?.apiToken === after?.apiToken && before?.userEmail === after?.userEmail && before?.apiBaseUrl === after?.apiBaseUrl) return
   savedJobsByKey.clear()
   pendingSavesByKey.clear()
 })
@@ -150,6 +150,36 @@ async function saveJobWithAuthRecovery(settings: ExtensionSettings, job: Scraped
     const refreshed = await refreshSettingsFromDashboard()
     if (!refreshed?.apiToken) throw error
     return saveJob(refreshed, job)
+  }
+}
+
+async function getRecentJobsWithAuthRecovery(settings: ExtensionSettings): Promise<SavedJob[]> {
+  let activeSettings = settings
+  if (!activeSettings.apiToken) activeSettings = await refreshSettingsFromDashboard() ?? activeSettings
+  if (!activeSettings.apiToken) throw new Error('Not logged in — open the ApplyMate dashboard or extension popup to reconnect')
+
+  try {
+    return await getRecentJobs(activeSettings)
+  } catch (error) {
+    if (!isAuthFailure(error)) throw error
+    const refreshed = await refreshSettingsFromDashboard()
+    if (!refreshed?.apiToken) throw error
+    return getRecentJobs(refreshed)
+  }
+}
+
+async function getStatsWithAuthRecovery(settings: ExtensionSettings): Promise<DashboardStats> {
+  let activeSettings = settings
+  if (!activeSettings.apiToken) activeSettings = await refreshSettingsFromDashboard() ?? activeSettings
+  if (!activeSettings.apiToken) throw new Error('Not logged in — open the ApplyMate dashboard or extension popup to reconnect')
+
+  try {
+    return await getStats(activeSettings)
+  } catch (error) {
+    if (!isAuthFailure(error)) throw error
+    const refreshed = await refreshSettingsFromDashboard()
+    if (!refreshed?.apiToken) throw error
+    return getStats(refreshed)
   }
 }
 
@@ -253,9 +283,13 @@ async function handleMessage(
       return { type: 'PONG', settings: { hasToken: !!settings.apiToken, email: settings.userEmail, apiBaseUrl: settings.apiBaseUrl } }
 
     case 'GET_STATS': {
-      if (!settings.apiToken) return { type: 'STATS_RESULT', stats: null }
-      const stats = await getStats(settings)
+      const stats = await getStatsWithAuthRecovery(settings)
       return { type: 'STATS_RESULT', stats }
+    }
+
+    case 'REFRESH_DASHBOARD_TOKEN': {
+      const refreshed = await refreshSettingsFromDashboard()
+      return { ok: Boolean(refreshed?.apiToken) }
     }
 
     case 'JOB_SCRAPED': {
@@ -264,6 +298,8 @@ async function handleMessage(
       latestJobDetectedAt = detectedAt
       await setCurrentJob(msg.job)
       setBadge('1', '#4F46E5')
+      // Keep an already-open Popup/Side Panel in sync with the active page.
+      chrome.runtime.sendMessage({ type: 'JOB_SCRAPED', job: msg.job }).catch(() => {})
 
       // Auto-enrich: if we previously saved this job from a list page (no description),
       // patch it now that the user has visited the detail page.
@@ -286,6 +322,7 @@ async function handleMessage(
         const key = getJobIdentity(msg.job)
         const cached = savedJobsByKey.get(key)
         if (cached) {
+          chrome.runtime.sendMessage({ type: 'JOB_SAVED', savedJob: cached }).catch(() => {})
           return { type: 'SAVE_JOB_RESULT', success: true, alreadySaved: true, savedJob: cached }
         }
 
@@ -303,6 +340,7 @@ async function handleMessage(
         }
         setBadge('✓', '#3B6D11')
         setTimeout(clearBadge, 3000)
+        chrome.runtime.sendMessage({ type: 'JOB_SAVED', savedJob }).catch(() => {})
         return { type: 'SAVE_JOB_RESULT', success: true, savedJob }
       } catch (err) {
         pendingSavesByKey.delete(getJobIdentity(msg.job))
@@ -312,13 +350,21 @@ async function handleMessage(
     }
 
     case 'GET_RECENT_JOBS': {
-      if (!settings.apiToken) return { type: 'RECENT_JOBS_RESULT', jobs: [] }
-      const jobs = await getRecentJobs(settings)
+      const jobs = await getRecentJobsWithAuthRecovery(settings)
       return { type: 'RECENT_JOBS_RESULT', jobs }
     }
 
     case 'OPEN_SIDE_PANEL': {
       return openTrackerWindow()
+    }
+
+    case 'OPEN_SIDE_PANEL_TAB': {
+      // Opening the native panel and selecting its destination are two separate
+      // operations. Persist the target so a freshly-created side panel cannot
+      // lose the user's intent while its React page is still mounting.
+      await chrome.storage.local.set({ pendingSidePanelTab: { tab: msg.tab, createdAt: Date.now() } })
+      chrome.runtime.sendMessage(msg).catch(() => {})
+      return { ok: true }
     }
 
     // ── Form Filler ──
@@ -359,9 +405,6 @@ async function handleMessage(
 // ── Shared: open tracker side panel ──────────────────────
 
 async function openTrackerWindow(): Promise<{ ok: boolean; error?: string }> {
-  const url = chrome.runtime.getURL('sidepanel.html')
-
-  // Method 1: Chrome native sidePanel (best UX, slides out from right)
   try {
     const win = await chrome.windows.getLastFocused()
     if (win.id) {
@@ -369,31 +412,12 @@ async function openTrackerWindow(): Promise<{ ok: boolean; error?: string }> {
       console.log('[ApplyMate] Side panel opened natively')
       return { ok: true }
     }
-  } catch { /* fall through */ }
-
-  // Method 2: Open in a new tab (always works, most reliable)
-  try {
-    await chrome.tabs.create({ url, active: true })
-    console.log('[ApplyMate] Tracker opened in new tab')
-    return { ok: true }
-  } catch { /* fall through */ }
-
-  // Method 3: Popup window fallback (last resort)
-  try {
-    const win = await chrome.windows.getLastFocused()
-    const left = win.left != null && win.width != null ? win.left + win.width - 430 : 1000
-    await chrome.windows.create({
-      url, type: 'popup', width: 430,
-      height: win.height ?? 900, left, top: win.top ?? 0,
-      focused: true,
-    })
-    console.log('[ApplyMate] Tracker opened as popup')
-    return { ok: true }
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err)
-    console.error('[ApplyMate] All open methods failed:', message)
+    console.error('[ApplyMate] Native side panel could not be opened:', message)
     return { ok: false, error: message }
   }
+  return { ok: false, error: 'No focused browser window' }
 }
 
 // ── Tab navigation ────────────────────────────────────────────

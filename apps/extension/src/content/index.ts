@@ -547,6 +547,16 @@ if (SHOULD_BOOTSTRAP_JOB_UI) {
 
 // ── Form Filler: Listen for scan & fill commands ──────────────────
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+  if (msg.type === 'GET_CURRENT_JOB') {
+    sendResponse({ type: 'CURRENT_JOB_RESULT', job: currentJob })
+    return true
+  }
+
+  if (msg.type === 'PING') {
+    sendResponse({ type: 'PONG', hasJob: currentJob !== null })
+    return true
+  }
+
   if (msg.type === 'REFRESH_DASHBOARD_TOKEN') {
     if (!IS_DASHBOARD_PAGE) {
       sendResponse({ ok: false, error: 'Not an ApplyMate dashboard page' })
@@ -683,7 +693,10 @@ async function syncFromDashboard(force = false): Promise<boolean> {
 // work on every DOM change.
 if (IS_DASHBOARD_PAGE) {
   new MutationObserver(() => { void syncFromDashboard() }).observe(document.head, {
-    childList: true, subtree: true,
+    childList: true,
+    subtree: true,
+    attributes: true,
+    attributeFilter: ['content'],
   })
 }
 
