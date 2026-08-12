@@ -22,15 +22,7 @@ export function isSavedJobsResponse(value: unknown): value is { jobs: SavedJob[]
   return Array.isArray(response.jobs)
 }
 
-export type PopupStats = DashboardStats & { saved?: number }
-
-export function isSavedJob(value: unknown): value is SavedJob {
-  if (!value || typeof value !== 'object') return false
-  const job = value as Partial<SavedJob>
-  return typeof job.id === 'string' && typeof job.company === 'string' && typeof job.role === 'string'
-}
-
-export function isStatsResponse(value: unknown): value is { stats: PopupStats } {
+export function isStatsResponse(value: unknown): value is { stats: DashboardStats } {
   if (!value || typeof value !== 'object') return false
   const response = value as { stats?: unknown }
   return !!response.stats && typeof response.stats === 'object'
@@ -38,12 +30,6 @@ export function isStatsResponse(value: unknown): value is { stats: PopupStats } 
 
 export function isSaveResponse(value: unknown): value is { success?: boolean; savedJob?: SavedJob; error?: string } {
   return !!value && typeof value === 'object'
-}
-
-export function isCurrentJobResponse(value: unknown): value is { type: 'CURRENT_JOB_RESULT'; job: ScrapedJob | null } {
-  if (!value || typeof value !== 'object') return false
-  const response = value as { type?: unknown; job?: unknown }
-  return response.type === 'CURRENT_JOB_RESULT' && (response.job === null || isScrapedJob(response.job))
 }
 
 export function sourceLabel(source: string): string {
@@ -70,19 +56,7 @@ export function companyInitials(company: string): string {
   return company.trim().split(/\s+/).slice(0, 2).map(word => word[0]).join('').toUpperCase() || 'A'
 }
 
-export type SidePanelTarget = 'jobs' | 'resume'
-
-export async function openCurrentSidePanel(target: SidePanelTarget = 'jobs'): Promise<void> {
-  // Keep the native API call in the click chain. Querying the active tab first
-  // would consume Chrome's user-gesture grant and make open() fail.
-  await openSidePanel(chrome.windows.WINDOW_ID_CURRENT, target)
-}
-
-export async function openSidePanel(windowId: number, target: SidePanelTarget = 'jobs'): Promise<void> {
-  // Keep this API call in the Popup click handler. Chrome requires the live
-  // user gesture and rejects a later Service Worker call as a new action.
-  const pending = { tab: target, createdAt: Date.now() }
-  void chrome.storage.local.set({ pendingSidePanelTab: pending }).catch(() => {})
-  void chrome.runtime.sendMessage({ type: 'OPEN_SIDE_PANEL_TAB', tab: target }).catch(() => {})
-  await chrome.sidePanel.open({ windowId })
+export function openSidePanel(): void {
+  // Reuse the background fallback chain: native side panel → tab → popup window.
+  void chrome.runtime.sendMessage({ type: 'OPEN_SIDE_PANEL' })
 }
