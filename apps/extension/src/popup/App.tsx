@@ -2,6 +2,7 @@ import { useState, useEffect, useCallback } from 'react'
 import { getSettings, saveSettings, isLoggedIn, clearAuth } from '@/lib/storage'
 import { login as apiLogin } from '@/lib/api'
 import type { ExtensionSettings, ScrapedJob, SavedJob, DashboardStats } from '@/lib/types'
+import { PopupMainView } from './MainView'
 
 // ── Design tokens (aligned with web app brand) ────────────────
 const C = {
@@ -87,8 +88,9 @@ function formatDate(iso: string, L: typeof POPUP_LABELS['en']): string {
 // ── Global styles injected once ───────────────────────────────
 const GLOBAL_CSS = `
   @keyframes am-spin { to { transform: rotate(360deg) } }
+  .am-spin { animation: am-spin 0.8s linear infinite; }
   * { box-sizing: border-box; }
-  body { margin: 0; width: 360px; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+  body { margin: 0; width: 360px; min-width: 360px; background: #F8F8FF; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
 `
 
 // ── Main App ──────────────────────────────────────────────── v2
@@ -127,9 +129,8 @@ export function App() {
       ) : view === 'settings' ? (
         <SettingsView settings={settings} L={L} refresh={refresh} onBack={() => setView('main')} />
       ) : (
-        <MainView
+        <PopupMainView
           settings={settings}
-          L={L}
           onSettings={() => setView('settings')}
           onLogout={() => { clearAuth(); setView('login') }}
         />

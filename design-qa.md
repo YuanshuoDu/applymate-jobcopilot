@@ -38,3 +38,40 @@ The reference shows the composer’s model-selector position. The required varia
 ## Final result
 
 passed
+
+## Popup redesign QA
+
+### Result
+
+**Blocked for rendered browser QA** — the implementation passed static checks and production build, but the connected browser refused to open the `chrome-extension://` Popup URL under its security policy. No rendered screenshot is claimed.
+
+### Design source
+
+- Selected direction: third generated ApplyMate Popup concept
+- Source: `C:\Users\Steven.du\.codex\generated_images\019ff63a-e22d-7512-b80c-f9526f5e6522\exec-41fd7237-ba9b-40f7-a24a-8ecb6f0dfd7d.png`
+- Intended viewport: 360px-wide Chrome Popup, authenticated state with a detected job
+
+### Implemented visual state
+
+- ApplyMate AI header with branded icon, product subtitle, settings action, and account menu
+- Detected job-page status card with source icon and success state
+- Current job card with company mark, role, company, location, match ring, and fit status
+- Stacked Save job, Analyze match, and gradient Prepare application actions
+- Saved jobs count and Open sidebar footer shortcuts
+- Empty state retained for pages without a detected job
+- Indigo/lavender/white palette, restrained borders, rounded cards, and Lucide line icons
+
+### Interaction wiring
+
+- Popup refreshes the active tab with `PING`, reads the current scraped job, and listens for `JOB_SCRAPED`
+- Save job uses the existing background `SAVE_JOB` flow, including identity deduplication and auth recovery
+- Analyze match uses the active resume and existing `/api/ai/score` client
+- Prepare application and Open sidebar reuse background `OPEN_SIDE_PANEL` fallback behavior
+- Dashboard, settings, sign-out, and empty-state job-board links remain connected
+
+### Verification
+
+- `pnpm --filter @jobcopilot/extension typecheck` — passed
+- `pnpm --filter @jobcopilot/extension build` — passed
+- `pnpm --filter @jobcopilot/extension test` — 3 files / 8 tests passed
+- Rendered Popup screenshot — blocked by browser security policy; requires manual Chrome extension reload and click-through QA
