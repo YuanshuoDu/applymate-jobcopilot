@@ -7,6 +7,7 @@ import { validateAdminWrite } from './csrf'
 import { hasFreshAdminReauth } from './webauthn'
 import type { Permission } from './permissions'
 import { isAdminHost, isLocalHost } from '@/lib/host-routing'
+import { isCurrentAuthVersion } from '@/lib/auth-version'
 
 export type AdminActor = Readonly<{
   userId: string
@@ -35,10 +36,11 @@ export async function requireAdminMembership(request?: Request): Promise<AdminAc
   if (!userId) return denied(requestId, 'observability.read', 'unauthenticated', request)
   const membership = await db.adminMembership.findUnique({
     where: { userId },
-    select: { status: true, mfaLevel: true, sessionVersion: true, user: { select: { accountStatus: true } }, role: { select: { key: true, permissions: true } } },
+    select: { status: true, mfaLevel: true, sessionVersion: true, user: { select: { accountStatus: true, authVersion: true } }, role: { select: { key: true, permissions: true } } },
   })
   const sessionValid = session?.user?.adminSessionVersion === membership?.sessionVersion
-  if (membership?.user.accountStatus !== 'active' || membership?.status !== AdminMembershipStatus.active || !sessionValid || (membership.role.key === 'super_admin' && membership.mfaLevel !== AdminMfaLevel.webauthn)) {
+  const authVersionValid = isCurrentAuthVersion(session?.user?.authVersion, membership?.user.authVersion ?? -1)
+  if (membership?.user.accountStatus !== 'active' || membership?.status !== AdminMembershipStatus.active || !sessionValid || !authVersionValid || (membership.role.key === 'super_admin' && membership.mfaLevel !== AdminMfaLevel.webauthn)) {
     return denied(requestId, 'observability.read', 'membership_inactive', request, userId)
   }
   return Object.freeze({ userId, roleKey: membership.role.key, permissions: Object.freeze([...membership.role.permissions]), requestId })
@@ -67,7 +69,7 @@ export async function requireAdminAny(permissions: readonly Permission[], reques
       status: true,
       mfaLevel: true,
       sessionVersion: true,
-      user: { select: { accountStatus: true } },
+      user: { select: { accountStatus: true, authVersion: true } },
       role: { select: { key: true, permissions: true } },
     },
   })
@@ -79,8 +81,9 @@ export async function requireAdminAny(permissions: readonly Permission[], reques
   const allowed = activeAccount && membership?.status === AdminMembershipStatus.active && (Boolean(rolePermission) || Boolean(grant))
   const needsWebauthn = membership?.role.key === 'super_admin'
   const sessionValid = session?.user?.adminSessionVersion === membership?.sessionVersion
+  const authVersionValid = isCurrentAuthVersion(session?.user?.authVersion, membership?.user.authVersion ?? -1)
   const reauthValid = !permissions.some(value => highRiskPermissions.has(value)) || await hasFreshAdminReauth(request, userId)
-  if (!allowed || !sessionValid || (needsWebauthn && membership?.mfaLevel !== AdminMfaLevel.webauthn) || !reauthValid) {
+  if (!allowed || !sessionValid || !authVersionValid || (needsWebauthn && membership?.mfaLevel !== AdminMfaLevel.webauthn) || !reauthValid) {
     return denied(requestId, permission, reauthValid ? 'permission_denied' : 'reauth_required', request, userId)
   }
 
