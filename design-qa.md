@@ -75,3 +75,46 @@ passed
 - `pnpm --filter @jobcopilot/extension build` — passed
 - `pnpm --filter @jobcopilot/extension test` — 3 files / 8 tests passed
 - Rendered Popup screenshot — blocked by browser security policy; requires manual Chrome extension reload and click-through QA
+
+## Side panel design QA — selected second design
+
+- Source visual truth: `C:/Users/Steven.du/.codex/attachments/fb5c31e8-b288-4c68-92a4-41beda5ab422/image-1.png`
+- Implementation source: `apps/extension/src/sidepanel/SidePanel.tsx`, `apps/extension/src/sidepanel/sidepanel.css`
+- Implementation screenshot: in-app Browser capture of `http://127.0.0.1:4174/audit-artifacts/sidebar-runtime-preview.html` (runtime preview with read-only mock API data)
+- Reference pixels: 720 x 1366; normalized CSS viewport: 360 x 683; reference density: 2x.
+- Implementation pixels: 360 x 683 at 1x; comparison uses the normalized reference viewport.
+- State: authenticated Jobs tab, populated tracker, one saved high-match role highlighted, one role expanded for details.
+
+### Full-view comparison
+
+The normalized implementation preserves the selected second design's main composition: compact ApplyMate header, four-tab navigation, three-part momentum overview, four application metrics, search/filter/sort controls, scoreable job cards, expandable details, and a persistent footer action. The old `In Review` and `Offer` filter buckets are absent. The actual current-page detection card remains conditional, so it does not add visual noise when no job page is detected.
+
+### Focused-region comparison
+
+The overview and job-card score regions were compared separately because the ring progress and ring match score are too small to judge reliably from the full-height reference alone. The final capture shows the overview rings, high-match opportunity, and per-job score/re-score affordance at the normalized viewport. The expanded state was exercised on `Account Executive`; the score action was exercised on an unscored `Data Analyst` row and produced the in-panel scoring state/toast.
+
+### Findings
+
+- Fonts and typography: passed. The extension uses the existing system UI stack with restrained weights and compact hierarchy; no new font dependency was introduced.
+- Spacing and layout rhythm: passed after one P2 iteration. The initial compact breakpoint overflowed the third overview column at 360px; the final breakpoint keeps the reference's three-column overview, four-column metrics, and two-column detail cards while shrinking their internal spacing. Final layout has no horizontal overflow.
+- Colors and visual tokens: passed. Light indigo page surface, white cards, indigo active states, green match scores, teal interview state, and red rejected state track the reference.
+- Image quality and asset fidelity: passed. The source contains no photographic or illustrative assets that need recreation; UI icons use the existing Lucide library rather than emoji or custom SVG drawings.
+- Copy and content: passed. Jobs combines Dashboard momentum and My Jobs tracking, exposes Saved/Applied/Interviews/Rejected filters, and provides Score/Re-score plus Notes, Original link, and status actions.
+
+### Comparison history
+
+1. Initial implementation: passed build but had a responsive P2 issue at 360px; the overview's third column was clipped and stats did not reflow.
+2. Fix: added the 420px compact breakpoint and re-captured at 360 x 683; the final layout retains 100.9/100.9/116.1px overview columns and 82px x 4 metric cards without horizontal overflow.
+3. Visual fidelity pass: changed momentum to a ring target indicator, match scores to ring score indicators, and metric icons to the reference's bookmark/send/message/blocked language. Re-captured the final normalized state, including the two-column expanded detail state.
+
+### Verification
+
+- `pnpm --filter @jobcopilot/extension test` — 3 files, 8 tests passed.
+- `pnpm --filter @jobcopilot/extension typecheck` — passed.
+- `pnpm --filter @jobcopilot/extension build` — passed.
+- Primary interactions: status filter tabs, source/sort selects, expand/collapse, Score on an unscored job, and Re-score affordance were inspected in the runtime preview.
+- Browser console: final runtime preview capture had no errors. The earlier plain extension bundle preview emitted the expected missing `chrome.storage.onChanged` error because it was outside the extension runtime; it was not used as final evidence.
+
+### Final result
+
+passed

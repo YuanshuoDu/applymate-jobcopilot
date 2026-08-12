@@ -18,14 +18,12 @@ import {
   RefreshCw,
   Search,
   Send,
-  Tags,
   MessageSquare,
   Sparkles,
   Target,
   X,
 } from 'lucide-react'
 import { getCurrentResumeId } from '@/lib/storage'
-import { getJobIdentity } from '@/lib/job-identity'
 import {
   getDashboard,
   getResume,
@@ -33,6 +31,7 @@ import {
   scoreResume,
   updateJobNotes,
   updateJobScore,
+  updateJobStatus,
 } from '@/lib/api'
 import { getSettings, isLoggedIn } from '@/lib/storage'
 import { FormFillerView } from './FormFillerView'
@@ -41,7 +40,6 @@ import { ResumeView } from './ResumeView'
 import type { DashboardSnapshot } from '@/lib/api'
 import type { ExtensionSettings, SavedJob, ScrapedJob } from '@/lib/types'
 import type { FormFieldSchema } from '@/lib/form-filler/types'
-import { scoreToneFor } from '@/lib/score-colors'
 import './sidepanel.css'
 
 type ExtLang = 'en' | 'de' | 'fr' | 'es' | 'nl' | 'zh'
@@ -107,25 +105,6 @@ function formatDate(iso: string, L: Labels): string {
   return date.toLocaleDateString(undefined, { month: 'short', day: 'numeric' })
 }
 
-function formatSyncAge(timestamp: number): string {
-  const seconds = Math.max(0, Math.floor((Date.now() - timestamp) / 1000))
-  if (seconds < 5) return 'just now'
-  if (seconds < 60) return `${seconds}s ago`
-  const minutes = Math.floor(seconds / 60)
-  return `${minutes}m ago`
-}
-
-function errorMessage(error: unknown, fallback: string): string {
-  return error instanceof Error && error.message ? error.message : fallback
-}
-
-function syncErrorMessage(error: unknown, fallback: string): string {
-  const message = errorMessage(error, fallback)
-  if (/401|unauthorized|not logged in|session expired|reconnect/i.test(message)) return 'Session expired — open Dashboard to reconnect.'
-  if (/timeout|timed out|network|fetch/i.test(message)) return 'Connection interrupted — your last synced data is still shown.'
-  return message
-}
-
 function companyInitials(company: string): string {
   const words = company.trim().split(/\s+/).filter(Boolean)
   if (words.length > 1) return `${words[0][0]}${words[1][0]}`.toUpperCase()
@@ -137,10 +116,9 @@ function statusColor(status: string): string {
 }
 
 function visibleStatus(status: string): FilterStatus {
-  // The web workspace no longer exposes legacy Offer or In Review buckets.
-  // Normalize old records into the current five-state workflow without adding
-  // either legacy state back to the UI or API mutation contract.
-  return status === 'offer' || status === 'review' ? 'applied' : (status as FilterStatus)
+  // The web workspace no longer exposes the legacy Offer bucket. Existing
+  // records still remain in the API and are shown in the applied workflow.
+  return status === 'offer' ? 'applied' : (status as FilterStatus)
 }
 
 export function SidePanel() {
@@ -195,42 +173,6 @@ export function SidePanel() {
     return () => chrome.runtime.onMessage.removeListener(handler)
   }, [])
 
-  useEffect(() => {
-    type PanelNavigationMessage = { type?: string; tab?: TabId }
-    let hasAppliedPendingTab = false
-    const selectRequestedTab = (message: PanelNavigationMessage) => {
-      if (message.type !== 'OPEN_SIDE_PANEL_TAB' || (message.tab !== 'jobs' && message.tab !== 'resume')) return
-      hasAppliedPendingTab = true
-      setMountedTabs(previous => new Set(previous).add(message.tab!))
-      setActiveTab(message.tab)
-    }
-    chrome.runtime.onMessage.addListener(selectRequestedTab)
-    const onPendingTabChange = (changes: { pendingSidePanelTab?: chrome.storage.StorageChange }, area: string) => {
-      if (area !== 'local' || !changes.pendingSidePanelTab) return
-      const pending = changes.pendingSidePanelTab.newValue as { tab?: unknown; createdAt?: unknown } | string | undefined
-      const tab = typeof pending === 'string' ? pending : pending?.tab
-      const createdAt = typeof pending === 'object' ? pending.createdAt : undefined
-      if (typeof createdAt === 'number' && Date.now() - createdAt >= 30_000) return
-      if (tab === 'jobs' || tab === 'resume') {
-        selectRequestedTab({ type: 'OPEN_SIDE_PANEL_TAB', tab })
-        void chrome.storage.local.remove('pendingSidePanelTab')
-      }
-    }
-    chrome.storage.onChanged.addListener(onPendingTabChange)
-    chrome.storage.local.get('pendingSidePanelTab').then(result => {
-      const pending = result.pendingSidePanelTab as { tab?: unknown; createdAt?: unknown } | string | undefined
-      const tab = typeof pending === 'string' ? pending : pending?.tab
-      const createdAt = typeof pending === 'object' ? pending.createdAt : undefined
-      const fresh = typeof createdAt !== 'number' || Date.now() - createdAt < 30_000
-      if (!hasAppliedPendingTab && fresh && (tab === 'jobs' || tab === 'resume')) selectRequestedTab({ type: 'OPEN_SIDE_PANEL_TAB', tab })
-      void chrome.storage.local.remove('pendingSidePanelTab')
-    }).catch(() => {})
-    return () => {
-      chrome.runtime.onMessage.removeListener(selectRequestedTab)
-      chrome.storage.onChanged.removeListener(onPendingTabChange)
-    }
-  }, [])
-
   if (!settings) return <Spinner />
   if (!isLoggedIn(settings)) return <NotLoggedIn apiBase={settings.apiBaseUrl} />
 
@@ -273,67 +215,38 @@ export function SidePanel() {
   )
 }
 
-function CurrentPageBanner({ accountKey, onSaved }: { accountKey: string; onSaved: () => void }) {
+function CurrentPageBanner({ onSaved }: { onSaved: () => void }) {
   const [currentJob, setCurrentJob] = useState<ScrapedJob | null>(null)
   const [saving, setSaving] = useState(false)
   const [saved, setSaved] = useState(false)
-  const [saveError, setSaveError] = useState('')
   const latestDetectedAt = useRef(0)
-  const currentJobRef = useRef<ScrapedJob | null>(null)
 
   useEffect(() => {
-    // A shared storage account switch must not retain the previous account's
-    // saved-state marker for the same job on the current page.
-    setSaved(false)
-    setSaveError('')
-    const syncSavedState = (job: ScrapedJob | null) => {
-      if (!job) {
-        setSaved(false)
-        return
-      }
-      chrome.runtime.sendMessage({ type: 'GET_RECENT_JOBS' }).then(response => {
-        if (Array.isArray(response?.jobs)) {
-          const jobs = response.jobs as SavedJob[]
-          if (currentJobRef.current !== job) return
-          setSaved(jobs.some(savedJob => getJobIdentity(job) === getJobIdentity({ source: savedJob.source ?? undefined, url: savedJob.url ?? undefined, role: savedJob.role, company: savedJob.company, location: savedJob.location ?? undefined })))
-        }
-      }).catch(() => {})
-    }
-    if (currentJobRef.current) syncSavedState(currentJobRef.current)
     const acceptJob = (job?: ScrapedJob | null) => {
       const detectedAt = job?.detectedAt ?? 0
       if (detectedAt < latestDetectedAt.current) return
       latestDetectedAt.current = detectedAt
-      currentJobRef.current = job ?? null
       setCurrentJob(job ?? null)
       setSaved(false)
-      setSaveError('')
-      syncSavedState(job ?? null)
     }
     chrome.storage.local.get('currentJob', result => acceptJob(result.currentJob ?? null))
-    const handler = (message: { type?: string; job?: ScrapedJob; savedJob?: SavedJob }) => {
+    const handler = (message: { type?: string; job?: ScrapedJob }) => {
       if (message.type === 'JOB_SCRAPED') acceptJob(message.job)
-      if (message.type === 'JOB_SAVED' && message.savedJob && currentJobRef.current && getJobIdentity(currentJobRef.current) === getJobIdentity({ source: message.savedJob.source ?? undefined, url: message.savedJob.url ?? undefined, role: message.savedJob.role, company: message.savedJob.company, location: message.savedJob.location ?? undefined })) setSaved(true)
     }
     chrome.runtime.onMessage.addListener(handler)
     return () => chrome.runtime.onMessage.removeListener(handler)
-  }, [accountKey])
+  }, [])
 
   if (!currentJob) return null
 
   async function saveCurrentJob() {
     setSaving(true)
-    setSaveError('')
     try {
-      const response = await chrome.runtime.sendMessage({ type: 'SAVE_JOB', job: currentJob }) as { success?: boolean; error?: string } | undefined
+      const response = await chrome.runtime.sendMessage({ type: 'SAVE_JOB', job: currentJob }).catch(() => null)
       if (response?.success) {
         setSaved(true)
         onSaved()
-      } else {
-        setSaveError(response?.error ?? 'Could not save this job. Try again.')
       }
-    } catch (error) {
-      setSaveError(errorMessage(error, 'Could not save this job. Try again.'))
     } finally {
       setSaving(false)
     }
@@ -347,7 +260,6 @@ function CurrentPageBanner({ accountKey, onSaved }: { accountKey: string; onSave
         <div className="am-current-copy"><div className="am-current-title">{currentJob.title}</div><div className="am-current-company">{currentJob.company}{currentJob.location && currentJob.location !== 'Unknown' ? ` · ${currentJob.location}` : ''}</div></div>
         <button className="am-save-button" type="button" disabled={saving || saved} onClick={() => void saveCurrentJob()}>{saved ? 'Saved' : saving ? 'Saving…' : 'Save job'}</button>
       </div>
-      {saveError && <div className="am-current-error" role="alert">{saveError}</div>}
     </section>
   )
 }
@@ -365,13 +277,6 @@ function TrackerPanel({ settings, L, onOpenResume }: { settings: ExtensionSettin
   const [sortBy, setSortBy] = useState<SortBy>('date')
   const [scoringId, setScoringId] = useState<string | null>(null)
   const [toast, setToast] = useState('')
-  const [jobsSyncError, setJobsSyncError] = useState('')
-  const [dashboardSyncError, setDashboardSyncError] = useState('')
-  const [lastJobsSyncedAt, setLastJobsSyncedAt] = useState<number | null>(null)
-  const [lastDashboardSyncedAt, setLastDashboardSyncedAt] = useState<number | null>(null)
-  const jobsRequestId = useRef(0)
-  const dashboardRequestId = useRef(0)
-  const listRef = useRef<HTMLDivElement | null>(null)
 
   function showToast(message: string) {
     setToast(message)
@@ -379,94 +284,27 @@ function TrackerPanel({ settings, L, onOpenResume }: { settings: ExtensionSettin
   }
 
   function loadJobs(showSpinner = false) {
-    const requestId = ++jobsRequestId.current
     if (showSpinner) setLoading(true)
-    const timeout = window.setTimeout(() => {
-      if (requestId !== jobsRequestId.current) return
-      setLoading(false)
-      setJobsSyncError('Connection timed out — your last synced data is still shown.')
-    }, 20000)
-    chrome.runtime.sendMessage({ type: 'GET_RECENT_JOBS' }, (response: { jobs?: SavedJob[]; error?: string } | undefined) => {
+    const timeout = window.setTimeout(() => setLoading(false), 5000)
+    chrome.runtime.sendMessage({ type: 'GET_RECENT_JOBS' }, response => {
       window.clearTimeout(timeout)
-      if (requestId !== jobsRequestId.current) return
-      const runtimeError = chrome.runtime.lastError?.message
-      const responseError = response?.error
-      if (runtimeError || responseError || !Array.isArray(response?.jobs)) {
-        setJobsSyncError(syncErrorMessage(runtimeError ?? responseError, 'Could not sync jobs — your last synced data is still shown.'))
-        setLoading(false)
-        return
-      }
-      setJobs(response.jobs)
-      setJobsSyncError('')
-      setLastJobsSyncedAt(Date.now())
+      void chrome.runtime.lastError
+      setJobs(response?.jobs ?? [])
       setLoading(false)
     })
   }
 
-  async function loadDashboard() {
-    const requestId = ++dashboardRequestId.current
-    try {
-      const next = await getDashboard(settings)
-      if (requestId !== dashboardRequestId.current) return
-      setDashboard(next)
-      setDashboardSyncError('')
-      setLastDashboardSyncedAt(Date.now())
-    } catch (error) {
-      if (requestId !== dashboardRequestId.current) return
-      setDashboardSyncError(syncErrorMessage(error, 'Could not sync Dashboard stats — your last synced data is still shown.'))
-    }
-  }
-
-  function refreshAll(showSpinner = false) {
-    loadJobs(showSpinner)
-    void loadDashboard()
-  }
-
-  function focusJob(jobId: string) {
-    if (!filtered.some(job => job.id === jobId)) {
-      setFilterStatus('all')
-      setFilterSource('all')
-      setSearch('')
-    }
-    setExpandedId(jobId)
-    window.setTimeout(() => {
-      const target = Array.from(listRef.current?.querySelectorAll<HTMLElement>('[data-job-id]') ?? [])
-        .find(node => node.dataset.jobId === jobId)
-      target?.scrollIntoView({ behavior: 'smooth', block: 'center' })
-    }, 0)
-  }
-
   useEffect(() => {
-    setJobs([])
-    setDashboard(null)
-    setExpandedId(null)
-    setJobsSyncError('')
-    setDashboardSyncError('')
-    setLastJobsSyncedAt(null)
-    setLastDashboardSyncedAt(null)
-    refreshAll(true)
+    loadJobs()
+    getDashboard(settings).then(setDashboard).catch(() => setDashboard(null))
     const handler = (message: { type?: string }) => {
-      if (message.type === 'JOB_SCRAPED' || message.type === 'JOB_SAVED') {
-        refreshAll()
-      }
+      if (message.type === 'JOB_SCRAPED' || message.type === 'JOB_SAVED') loadJobs()
     }
     chrome.runtime.onMessage.addListener(handler)
-    const syncTimer = window.setInterval(() => {
-      refreshAll()
-    }, 30000)
-    const onVisibilityChange = () => {
-      if (document.visibilityState === 'visible') refreshAll()
-    }
-    document.addEventListener('visibilitychange', onVisibilityChange)
-    return () => {
-      window.clearInterval(syncTimer)
-      chrome.runtime.onMessage.removeListener(handler)
-      document.removeEventListener('visibilitychange', onVisibilityChange)
-    }
-    // Reload both the list and dashboard snapshot whenever the shared account
-    // token changes so an account switch cannot retain the previous user's data.
+    return () => chrome.runtime.onMessage.removeListener(handler)
+    // settings is stable for the lifetime of the authenticated side panel.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [settings.apiBaseUrl, settings.apiToken, settings.userEmail])
+  }, [])
 
   const availableSources = useMemo(() => Array.from(new Set(jobs.map(job => job.source).filter((source): source is string => Boolean(source && source !== 'unknown')))).sort(), [jobs])
   const counts = useMemo(() => {
@@ -494,10 +332,8 @@ function TrackerPanel({ settings, L, onOpenResume }: { settings: ExtensionSettin
   const rejectedCount = dashboard?.stats.rejected ?? counts.rejected
   const weeklyApplications = dashboard?.stats.thisWeek ?? 0
   const weeklyTarget = 30
-  const weeklyProgress = Math.min(weeklyApplications / weeklyTarget * 100, 100)
   const highMatchThreshold = dashboard?.minMatchScore ?? 75
-  const highMatch = jobs.filter(job => job.score != null && job.score >= highMatchThreshold).sort((a, b) => (b.score ?? 0) - (a.score ?? 0))[0] ?? null
-  const highMatchTone = highMatch ? scoreToneFor(highMatch.score ?? 0) : null
+  const highMatch = jobs.filter(job => visibleStatus(job.status) === 'saved' && job.score != null && job.score >= highMatchThreshold).sort((a, b) => (b.score ?? 0) - (a.score ?? 0))[0] ?? null
   const unscoredCount = jobs.filter(job => job.score == null).length
 
   async function scoreJob(job: SavedJob) {
@@ -526,48 +362,46 @@ function TrackerPanel({ settings, L, onOpenResume }: { settings: ExtensionSettin
 
   return (
     <div className="am-tracker">
-      <div className="am-tracker-scroll">
-        <section className="am-overview" aria-label="Application overview">
-          <div className="am-overview-grid">
-            <div className="am-overview-cell">
-              <div className="am-overview-label"><Target size={12} aria-hidden="true" />Application momentum</div>
-              <div className="am-momentum-summary"><div className="am-momentum-ring" style={{ '--am-progress-angle': `${weeklyProgress * 3.6}deg` } as React.CSSProperties} aria-label={`${Math.round(weeklyProgress)}% of weekly target`}><strong>{Math.round(weeklyProgress)}%</strong><small>{Math.min(weeklyApplications, weeklyTarget)} / {weeklyTarget}</small></div><div className="am-momentum-copy"><strong>{weeklyApplications >= weeklyTarget ? 'Goal reached!' : 'Keep it up!'}</strong><span>{Math.max(1, 7 - new Date().getDay())} days left</span></div></div>
-            </div>
-            <div className="am-overview-cell">
-              <div className="am-overview-label"><BarChart3 size={12} aria-hidden="true" />Next step</div>
-              <div className="am-overview-copy">{!dashboard?.hasResume ? 'Add your resume to unlock match scoring.' : unscoredCount > 0 ? `${unscoredCount} saved role${unscoredCount === 1 ? '' : 's'} ready to score.` : `${Math.max(0, weeklyTarget - weeklyApplications)} applications this week to stay on track.`}</div>
-              <div className="am-progress-bar" aria-hidden="true"><span style={{ width: `${weeklyProgress}%` }} /></div>
-              <button className="am-overview-action" type="button" onClick={() => dashboard?.hasResume ? (unscoredCount ? void scoreJob(jobs.find(job => job.score == null)!) : chrome.tabs.create({ url: `${settings.apiBaseUrl}/jobs` })) : onOpenResume()}>{!dashboard?.hasResume ? 'Add resume' : unscoredCount ? 'Score a role' : 'View plan'}</button>
-            </div>
-            <div className="am-overview-cell">
-              <div className="am-overview-label"><Sparkles size={12} aria-hidden="true" />High match opportunity</div>
-              {highMatch ? <div className="am-highlight"><div className="am-highlight-main"><span className="am-highlight-mark">{companyInitials(highMatch.company)}</span><div className="am-highlight-copy"><div className="am-highlight-role" title={highMatch.role}>{highMatch.role}</div><div className="am-highlight-company" title={highMatch.company}>{highMatch.company}</div></div></div><div className="am-highlight-actions"><span className={`am-highlight-score ${highMatchTone}`}>{highMatch.score}% match</span><button className="am-action-link" type="button" onClick={() => focusJob(highMatch.id)}>View job <ArrowRight size={10} aria-hidden="true" /></button></div></div> : <div className="am-overview-copy">Score a saved role to see your strongest match here.</div>}
-            </div>
+      <section className="am-overview" aria-label="Application overview">
+        <div className="am-overview-grid">
+          <div className="am-overview-cell">
+            <div className="am-overview-label"><Target size={12} aria-hidden="true" />Application momentum</div>
+            <div className="am-momentum-summary"><div className="am-momentum-ring" style={{ '--am-progress-angle': `${Math.min(weeklyApplications / weeklyTarget * 100, 100) * 3.6}deg` } as React.CSSProperties} aria-label={`${Math.min(weeklyApplications / weeklyTarget * 100, 100)}% of weekly target`}><strong>{Math.min(weeklyApplications, weeklyTarget)}</strong><span>/ {weeklyTarget}</span><small>weekly target</small></div><div className="am-momentum-copy"><strong>Keep it up!</strong><span>{Math.max(1, 7 - new Date().getDay())} days left</span></div></div>
           </div>
-        </section>
-
-        <div className="am-stat-grid" aria-label="Application counts">
-          <StatCard className="saved" label="Saved" value={savedCount} icon={<Bookmark size={13} />} />
-          <StatCard className="applied" label="Applied" value={appliedCount} icon={<Send size={13} />} />
-          <StatCard className="interview" label="Interviews" value={interviewCount} icon={<MessageSquare size={13} />} />
-          <StatCard className="rejected" label="Rejected" value={rejectedCount} icon={<Ban size={13} />} />
-        </div>
-
-        <div className="am-job-tools">
-          <div className="am-search-wrap"><label className="am-search"><Search size={15} aria-hidden="true" /><input value={search} onChange={event => setSearch(event.target.value)} placeholder="Search by role or company…" aria-label="Search jobs" />{search && <button className="am-search-clear" type="button" onClick={() => setSearch('')} aria-label="Clear search"><X size={13} /></button>}</label></div>
-          <div className="am-filter-strip" role="tablist" aria-label="Job status filters">
-            {([['all', 'All'], ['saved', L.saved], ['applied', L.applied], ['interview', 'Interviews'], ['rejected', L.rejected]] as const).map(([value, label]) => <button key={value} className={`am-filter${filterStatus === value ? ' active' : ''}`} type="button" role="tab" aria-selected={filterStatus === value} onClick={() => setFilterStatus(value)}>{label}</button>)}
+          <div className="am-overview-cell">
+            <div className="am-overview-label"><BarChart3 size={12} aria-hidden="true" />Next step</div>
+            <div className="am-overview-copy">{!dashboard?.hasResume ? 'Add your resume to unlock match scoring.' : unscoredCount > 0 ? `${unscoredCount} saved role${unscoredCount === 1 ? '' : 's'} ready to score.` : `${Math.max(0, weeklyTarget - weeklyApplications)} applications this week to stay on track.`}</div>
+            <div className="am-progress-bar" aria-hidden="true"><span style={{ width: `${Math.min(weeklyApplications / weeklyTarget * 100, 100)}%` }} /></div>
+            <button className="am-overview-action" type="button" onClick={() => dashboard?.hasResume ? (unscoredCount ? void scoreJob(jobs.find(job => job.score == null)!) : chrome.tabs.create({ url: `${settings.apiBaseUrl}/jobs` })) : onOpenResume()}>{!dashboard?.hasResume ? 'Add resume' : unscoredCount ? 'Score a role' : 'View plan'}</button>
           </div>
-          <div className="am-select-row"><select className="am-select" value={filterSource} onChange={event => setFilterSource(event.target.value)} aria-label="Filter by source"><option value="all">All sources</option>{availableSources.map(source => <option key={source} value={source}>{source}</option>)}</select><select className="am-select" value={sortBy} onChange={event => setSortBy(event.target.value as SortBy)} aria-label="Sort jobs"><option value="date">Newest first</option><option value="company">Company</option><option value="score">Match score</option></select></div>
+          <div className="am-overview-cell">
+            <div className="am-overview-label"><Sparkles size={12} aria-hidden="true" />High match opportunity</div>
+            {highMatch ? <div className="am-highlight"><span className="am-highlight-mark">{companyInitials(highMatch.company)}</span><div className="am-highlight-copy"><div className="am-highlight-role">{highMatch.role}</div><div className="am-highlight-company">{highMatch.company}</div></div><span className="am-highlight-score">{highMatch.score}%</span></div> : <div className="am-overview-copy">Score a saved role to see your strongest match here.</div>}
+            {highMatch && <button className="am-action-link" type="button" onClick={() => setExpandedId(highMatch.id)}>View job <ArrowRight size={10} aria-hidden="true" /></button>}
+          </div>
         </div>
+      </section>
 
-        {(jobsSyncError || dashboardSyncError) && <div className="am-sync-banner" role="alert"><div><strong>Sync needs attention</strong><span>{jobsSyncError || dashboardSyncError}</span>{(jobsSyncError ? lastJobsSyncedAt : lastDashboardSyncedAt) && <small>Last synced {formatSyncAge((jobsSyncError ? lastJobsSyncedAt : lastDashboardSyncedAt)!)}</small>}</div><button type="button" onClick={() => refreshAll(true)}>Retry</button></div>}
-        <CurrentPageBanner accountKey={`${settings.apiBaseUrl}|${settings.apiToken}|${settings.userEmail}`} onSaved={() => refreshAll()} />
-        <div className="am-list" ref={listRef}>
-          {loading ? <div className="am-spinner"><LoaderCircle className="am-spin" size={20} aria-label="Loading jobs" /></div> : filtered.length === 0 ? <EmptyState hasSearch={Boolean(search.trim())} filter={filterStatus} connectionError={Boolean(jobsSyncError)} onRetry={() => refreshAll(true)} onClearSearch={() => setSearch('')} onOpenDashboard={() => chrome.tabs.create({ url: `${settings.apiBaseUrl}/jobs` })} L={L} /> : <div className="am-list-inner">{filtered.map(job => <JobCard key={job.id} job={job} expanded={expandedId === job.id} onToggle={() => setExpandedId(current => current === job.id ? null : job.id)} settings={settings} L={L} scoring={scoringId === job.id} onScore={() => void scoreJob(job)} />)}</div>}
-        </div>
+      <div className="am-stat-grid" aria-label="Application counts">
+        <StatCard className="saved" label="Saved" value={savedCount} icon={<Bookmark size={13} />} />
+        <StatCard className="applied" label="Applied" value={appliedCount} icon={<Send size={13} />} />
+        <StatCard className="interview" label="Interviews" value={interviewCount} icon={<MessageSquare size={13} />} />
+        <StatCard className="rejected" label="Rejected" value={rejectedCount} icon={<Ban size={13} />} />
       </div>
-      <footer className="am-footer"><button className="am-footer-button" type="button" onClick={() => refreshAll(true)}><RefreshCw size={12} aria-hidden="true" /> Refresh</button><button className="am-footer-button primary" type="button" onClick={() => chrome.tabs.create({ url: `${settings.apiBaseUrl}/jobs` })}>View all jobs <ArrowRight size={12} aria-hidden="true" /></button></footer>
+
+      <div className="am-job-tools">
+        <div className="am-search-wrap"><label className="am-search"><Search size={15} aria-hidden="true" /><input value={search} onChange={event => setSearch(event.target.value)} placeholder="Search by role or company…" aria-label="Search jobs" />{search && <button className="am-search-clear" type="button" onClick={() => setSearch('')} aria-label="Clear search"><X size={13} /></button>}</label></div>
+        <div className="am-filter-strip" role="tablist" aria-label="Job status filters">
+          {([['all', 'All'], ['saved', L.saved], ['applied', L.applied], ['interview', 'Interviews'], ['rejected', L.rejected]] as const).map(([value, label]) => <button key={value} className={`am-filter${filterStatus === value ? ' active' : ''}`} type="button" role="tab" aria-selected={filterStatus === value} onClick={() => setFilterStatus(value)}>{label}<span className="am-filter-count">{counts[value]}</span></button>)}
+        </div>
+        <div className="am-select-row"><select className="am-select" value={filterSource} onChange={event => setFilterSource(event.target.value)} aria-label="Filter by source"><option value="all">All sources</option>{availableSources.map(source => <option key={source} value={source}>{source}</option>)}</select><select className="am-select" value={sortBy} onChange={event => setSortBy(event.target.value as SortBy)} aria-label="Sort jobs"><option value="date">Newest first</option><option value="company">Company</option><option value="score">Match score</option></select></div>
+      </div>
+
+      <CurrentPageBanner onSaved={() => loadJobs()} />
+      <div className="am-list">
+        {loading ? <div className="am-spinner"><LoaderCircle className="am-spin" size={20} aria-label="Loading jobs" /></div> : filtered.length === 0 ? <EmptyState hasSearch={Boolean(search.trim())} filter={filterStatus} onClearSearch={() => setSearch('')} onOpenDashboard={() => chrome.tabs.create({ url: `${settings.apiBaseUrl}/jobs` })} L={L} /> : <div className="am-list-inner">{filtered.map(job => <JobCard key={job.id} job={job} expanded={expandedId === job.id} onToggle={() => setExpandedId(current => current === job.id ? null : job.id)} settings={settings} L={L} scoring={scoringId === job.id} onScore={() => void scoreJob(job)} onStatusChange={async (id, status) => { try { const updated = await updateJobStatus(settings, id, status); setJobs(previous => previous.map(item => item.id === id ? { ...item, ...updated } : item)); showToast(`Status updated · ${statusLabel(status, L)}`) } catch (error) { showToast(error instanceof Error ? error.message : 'Could not update status') } }} />)}</div>}
+      </div>
+      <footer className="am-footer"><button className="am-footer-button" type="button" onClick={() => { loadJobs(true); getDashboard(settings).then(setDashboard).catch(() => {}) }}><RefreshCw size={12} aria-hidden="true" /> Refresh</button><button className="am-footer-button primary" type="button" onClick={() => chrome.tabs.create({ url: `${settings.apiBaseUrl}/jobs` })}>View all jobs <ArrowRight size={12} aria-hidden="true" /></button></footer>
       {toast && <div className="am-toast" role="status">{toast}</div>}
     </div>
   )
@@ -577,62 +411,33 @@ function StatCard({ className, label, value, icon }: { className: string; label:
   return <div className={`am-stat ${className}`}><div className="am-stat-head">{icon}<span>{label}</span></div><div className="am-stat-value">{value}</div></div>
 }
 
-function keyTagsForJob(job: SavedJob): string[] {
-  const seen = new Set<string>()
-  return (job.keywords ?? '')
-    .split(/[\n,;|]+/)
-    .map(value => value.trim())
-    .filter(value => {
-      const normalized = value.toLocaleLowerCase()
-      if (!value || seen.has(normalized)) return false
-      seen.add(normalized)
-      return true
-    })
-    .slice(0, 8)
-}
-
 function statusLabel(status: string, L: Labels): string {
   return ({ saved: L.saved, applied: L.applied, interview: 'Interview', rejected: L.rejected, offer: L.applied } as Record<string, string>)[status] ?? status
 }
 
-function JobCard({ job, expanded, onToggle, settings, onScore, scoring, L }: {
+function JobCard({ job, expanded, onToggle, settings, onStatusChange, onScore, scoring, L }: {
   job: SavedJob
   expanded: boolean
   onToggle: () => void
   settings: ExtensionSettings
+  onStatusChange: (id: string, status: string) => Promise<void>
   onScore: () => void
   scoring: boolean
   L: Labels
 }) {
   const [notes, setNotes] = useState(job.notes ?? '')
   const [notesSaving, setNotesSaving] = useState(false)
-  const [notesError, setNotesError] = useState('')
-  const initialNotes = useRef(job.notes ?? '')
   const notesTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
   const displayStatus = visibleStatus(job.status)
-  const keyTags = keyTagsForJob(job)
-  const scoreTone = job.score == null ? 'normal' : scoreToneFor(job.score)
+  const scoreTone = job.score != null && job.score >= 80 ? 'strong' : job.score != null && job.score < 60 ? 'weak' : 'normal'
 
+  useEffect(() => setNotes(job.notes ?? ''), [job.id, job.notes])
   useEffect(() => {
-    const nextNotes = job.notes ?? ''
-    setNotes(nextNotes)
-    initialNotes.current = nextNotes
-    setNotesError('')
-  }, [job.id, job.notes])
-  useEffect(() => {
-    if (!expanded || notes === initialNotes.current) return
+    if (!expanded) return
     if (notesTimer.current) clearTimeout(notesTimer.current)
     notesTimer.current = setTimeout(async () => {
       setNotesSaving(true)
-      try {
-        await updateJobNotes(settings, job.id, notes)
-        initialNotes.current = notes
-        setNotesError('')
-      } catch {
-        setNotesError('Could not save note')
-      } finally {
-        setNotesSaving(false)
-      }
+      try { await updateJobNotes(settings, job.id, notes) } finally { setNotesSaving(false) }
     }, 1000)
     return () => { if (notesTimer.current) clearTimeout(notesTimer.current) }
     // Debounced persistence intentionally follows the local notes field.
@@ -640,30 +445,29 @@ function JobCard({ job, expanded, onToggle, settings, onScore, scoring, L }: {
   }, [notes, expanded])
 
   return (
-    <article className={`am-job-card${expanded ? ' expanded' : ''}`} data-job-id={job.id}>
+    <article className={`am-job-card${expanded ? ' expanded' : ''}`}>
       <div className="am-job-row">
         <span className="am-company-mark" aria-hidden="true">{companyInitials(job.company)}</span>
         <button className="am-job-main" type="button" onClick={onToggle} aria-expanded={expanded}>
           <div className="am-job-role">{job.role}</div>
           <div className="am-job-company">{job.company}{job.location ? ` · ${job.location}` : ''}</div>
           <div className="am-job-meta"><span className="am-status-pill" style={{ color: statusColor(displayStatus), background: `${statusColor(displayStatus)}14` }}><span className="am-status-dot" style={{ background: statusColor(displayStatus) }} />{statusLabel(displayStatus, L)}</span><span>·</span><span>{formatDate(job.createdAt, L)}</span></div>
-          {keyTags.length > 0 && <div className="am-job-tags-preview" aria-label="Key job tags">{keyTags.slice(0, 2).map(tag => <span key={tag} className="am-job-tag-preview" title={tag}>{tag}</span>)}{keyTags.length > 2 && <span className="am-job-tag-more">+{keyTags.length - 2}</span>}</div>}
         </button>
         <div className={`am-score-box ${scoreTone}`}>
           {job.score != null ? <><div className="am-score"><div className="am-score-ring" style={{ '--am-score-angle': `${Math.max(0, Math.min(job.score, 100)) * 3.6}deg` } as React.CSSProperties} aria-label={`${job.score}% match`}><span>{job.score}</span></div><span className="am-score-label">Match</span></div><button className="am-score-action" type="button" disabled={scoring} onClick={event => { event.stopPropagation(); onScore() }}>{scoring ? '…' : 'Re-score'}</button></> : <><button className="am-score-action" type="button" disabled={scoring} onClick={event => { event.stopPropagation(); onScore() }}>{scoring ? 'Scoring…' : 'Score'}</button><span className="am-score-help">Resume + profile</span></>}
         </div>
-        <button className="am-chevron" type="button" onMouseDown={event => { event.preventDefault(); event.currentTarget.blur() }} onClick={onToggle} aria-label={expanded ? `Collapse ${job.role}` : `Expand ${job.role}`}><ChevronDown size={16} className={expanded ? 'am-chevron-open' : ''} /></button>
+        <button className="am-chevron" type="button" onClick={onToggle} aria-label={expanded ? `Collapse ${job.role}` : `Expand ${job.role}`}><ChevronDown size={16} className={expanded ? 'am-chevron-open' : ''} /></button>
       </div>
       {expanded && <div className="am-detail">
-        <div className="am-detail-grid"><div className="am-detail-box"><div className="am-detail-label">Notes</div><div className="am-notes-meta"><span>{notesSaving ? <span className="am-saving">Saving…</span> : notesError ? <span className="am-note-error">{notesError}</span> : notes ? <span className="am-saved">Saved</span> : 'Add context for later'}</span></div><textarea className="am-notes" value={notes} onChange={event => { setNotes(event.target.value); setNotesError('') }} placeholder="Interview questions, salary, contact…" /></div><div className="am-detail-box am-detail-insights"><div className="am-detail-label am-detail-label-icon"><Tags size={11} aria-hidden="true" /> Key job tags</div>{keyTags.length > 0 ? <div className="am-key-tags">{keyTags.map(tag => <span key={tag} className="am-key-tag">{tag}</span>)}</div> : <div className="am-detail-text">Score this role to extract its main skills and requirements.</div>}<div className="am-detail-label am-detail-score-label">Match score</div><div className="am-detail-text">{job.score == null ? 'Not scored yet.' : `Scored at ${job.score}% against your resume.`}</div>{!job.url && <div className="am-detail-text">No original link saved.</div>}</div></div>
-        <div className="am-detail-actions">{job.url && <a className="am-detail-action" href={job.url} target="_blank" rel="noreferrer">Open original <ExternalLink size={11} /></a>}<a className="am-detail-action primary" href={`${settings.apiBaseUrl}/jobs?highlight=${job.id}`} target="_blank" rel="noreferrer">Open in My Jobs <ArrowRight size={11} /></a></div>
+        <div className="am-detail-grid"><div className="am-detail-box"><div className="am-detail-label">Notes</div><div className="am-notes-meta"><span>{notesSaving ? <span className="am-saving">Saving…</span> : notes ? <span className="am-saved">Saved</span> : 'Add context for later'}</span></div><textarea className="am-notes" value={notes} onChange={event => setNotes(event.target.value)} placeholder="Interview questions, salary, contact…" /></div><div className="am-detail-box"><div className="am-detail-label">Original job link</div>{job.url ? <a className="am-detail-link" href={job.url} target="_blank" rel="noreferrer">Open original <ExternalLink size={11} /></a> : <div className="am-detail-text">No original link saved.</div>}<div className="am-detail-label" style={{ marginTop: 12 }}>Match score</div><div className="am-detail-text">{job.score == null ? 'Not scored yet.' : `Scored at ${job.score}% against your resume.`}</div></div></div>
+        <div><div className="am-detail-label" style={{ marginBottom: 5 }}>Update status</div><div className="am-status-actions">{([['saved', L.saved], ['applied', L.applied], ['interview', 'Interviews'], ['rejected', L.rejected]] as const).map(([value, label]) => <button key={value} className={`am-status-button${displayStatus === value ? ' active' : ''}`} type="button" onClick={() => void onStatusChange(job.id, value)}>{label}</button>)}</div></div>
+        <div className="am-detail-actions">{job.url && <a className="am-detail-action" href={job.url} target="_blank" rel="noreferrer">Original <ExternalLink size={11} /></a>}<a className="am-detail-action primary" href={`${settings.apiBaseUrl}/jobs?highlight=${job.id}`} target="_blank" rel="noreferrer">Open in My Jobs <ArrowRight size={11} /></a></div>
       </div>}
     </article>
   )
 }
 
-function EmptyState({ hasSearch, filter, connectionError, onRetry, onClearSearch, onOpenDashboard, L }: { hasSearch: boolean; filter: FilterStatus; connectionError: boolean; onRetry: () => void; onClearSearch: () => void; onOpenDashboard: () => void; L: Labels }) {
-  if (connectionError) return <div className="am-empty"><div className="am-empty-icon"><RefreshCw size={17} /></div><div className="am-empty-title">Could not sync jobs</div><div className="am-empty-copy">Your account connection needs attention. Retry or open My Jobs to continue.</div><button className="am-empty-action" type="button" onClick={onRetry}>Retry sync</button></div>
+function EmptyState({ hasSearch, filter, onClearSearch, onOpenDashboard, L }: { hasSearch: boolean; filter: FilterStatus; onClearSearch: () => void; onOpenDashboard: () => void; L: Labels }) {
   if (hasSearch) return <div className="am-empty"><div className="am-empty-icon"><Search size={17} /></div><div className="am-empty-title">No matching jobs</div><div className="am-empty-copy">Try another role or company name.</div><button className="am-empty-action" type="button" onClick={onClearSearch}>Clear search</button></div>
   return <div className="am-empty"><div className="am-empty-icon"><Bookmark size={17} /></div><div className="am-empty-title">{filter === 'all' ? L.noJobs : `No ${filter === 'interview' ? 'interview' : filter} jobs yet`}</div><div className="am-empty-copy">Save a promising role from any supported job site and it will appear here.</div><button className="am-empty-action" type="button" onClick={onOpenDashboard}>Open My Jobs</button></div>
 }
