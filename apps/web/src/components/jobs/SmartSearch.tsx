@@ -175,7 +175,7 @@ const glassInput: React.CSSProperties = {
 
 // ── Main component ────────────────────────────────────────────────────────────
 
-export function SmartSearch({ onJobSaved }: { onJobSaved?: () => void }) {
+export function SmartSearch({ onJobSaved, onOpenSettings }: { onJobSaved?: () => void; onOpenSettings?: () => void }) {
   const toast = useToast()
   const inputRef = useRef<HTMLInputElement>(null)
   const lastSearch = useRef(loadLast())
@@ -337,6 +337,7 @@ export function SmartSearch({ onJobSaved }: { onJobSaved?: () => void }) {
             onKeyDown={e => e.key === 'Enter' && doSearch()}
             onFocus={() => setSearchFocus(true)}
             onBlur={() => setSearchFocus(false)}
+            aria-label="Search jobs"
             placeholder='Search jobs — e.g. "React Developer Amsterdam" or "Data Engineer Berlin"'
             style={{
               ...glassInput,
@@ -347,13 +348,15 @@ export function SmartSearch({ onJobSaved }: { onJobSaved?: () => void }) {
             }}
           />
           {q && (
-            <button onClick={() => setQ('')} style={{ position: 'absolute', right: 10, top: '50%', transform: 'translateY(-50%)', background: 'none', border: 'none', cursor: 'pointer', color: 'var(--text-muted)', display: 'flex', padding: 2 }}>
+            <button type="button" aria-label="Clear search" title="Clear search" onClick={() => setQ('')} style={{ position: 'absolute', right: 10, top: '50%', transform: 'translateY(-50%)', background: 'none', border: 'none', cursor: 'pointer', color: 'var(--text-muted)', display: 'flex', padding: 2 }}>
               <Icon.X />
             </button>
           )}
         </div>
 
         <button
+          type="button"
+          aria-label={searching ? 'Searching jobs' : isStale ? 'Apply job search filters' : 'Search jobs'}
           onClick={doSearch}
           disabled={searching || !q.trim()}
           style={{
@@ -381,6 +384,10 @@ export function SmartSearch({ onJobSaved }: { onJobSaved?: () => void }) {
         </button>
 
         <button
+          type="button"
+          aria-label={showFilters ? 'Hide search filters' : 'Show search filters'}
+          aria-expanded={showFilters}
+          aria-controls="search-filters"
           onClick={toggleFilters}
           style={{
             padding: '0 16px', height: 44, borderRadius: 12, cursor: 'pointer',
@@ -405,7 +412,7 @@ export function SmartSearch({ onJobSaved }: { onJobSaved?: () => void }) {
           border: '1px solid var(--border-glass)', borderRadius: 14, padding: '18px 20px', marginBottom: 12,
           display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(160px, 1fr))', gap: 14,
           boxShadow: 'var(--shadow-md)',
-        }}>
+        }} id="search-filters">
           {[
             { key: 'location', label: 'Location', icon: <Icon.MapPin />, type: 'text', placeholder: 'Amsterdam, Berlin…' },
           ].map(f => (
@@ -565,19 +572,14 @@ export function SmartSearch({ onJobSaved }: { onJobSaved?: () => void }) {
               <div style={{ fontSize: 13, color: 'var(--text-muted)', lineHeight: 1.65 }}>
                 Try broader keywords, a different location, or remove some filters.
               </div>
-              {/* API key diagnostic — shown when keys are missing */}
+              {/* Keep provider configuration helpful without exposing routing internals. */}
               {meta?.apiKeys && !meta.apiKeys.rapidapi && (
-                <div style={{ marginTop: 8, padding: '10px 16px', background: 'rgba(234,179,8,0.08)', border: '1px solid rgba(234,179,8,0.25)', borderRadius: 8, maxWidth: 340, textAlign: 'left' }}>
-                  <div style={{ fontSize: 11, fontWeight: 600, color: '#b45309', marginBottom: 4 }}>⚠ 搜索 API 未配置</div>
+                <div style={{ marginTop: 8, padding: '12px 14px', background: 'rgba(234,179,8,0.08)', border: '1px solid rgba(234,179,8,0.25)', borderRadius: 10, maxWidth: 360, textAlign: 'left' }}>
+                  <div style={{ fontSize: 11, fontWeight: 700, color: '#b45309', marginBottom: 4 }}>Some sources need a connection</div>
                   <div style={{ fontSize: 11, color: 'var(--text-muted)', lineHeight: 1.6 }}>
-                    LinkedIn、Indeed、JSearch 等付费源需要 RapidAPI Key；可在 Settings → Keys &amp; connections 中保存，未保存时使用平台配置或免费来源。
-                    当前仅 Remotive 等免费源可用。
+                    Add your job-search API keys in Settings, or try broader keywords and a different location. Free sources remain available without a key.
                   </div>
-                </div>
-              )}
-              {meta?.routing && (
-                <div style={{ fontSize: 10, color: 'var(--text-muted)', opacity: 0.6 }}>
-                  路由：{meta.routing} · {meta.durationMs}ms
+                  {onOpenSettings && <button type="button" onClick={onOpenSettings} style={{ marginTop: 10, padding: '7px 11px', border: '1px solid rgba(180,83,9,0.35)', borderRadius: 8, background: 'rgba(255,255,255,0.62)', color: '#92400e', fontSize: 11, fontWeight: 700, cursor: 'pointer' }}>Open API key settings</button>}
                 </div>
               )}
             </div>
@@ -616,7 +618,6 @@ export function SmartSearch({ onJobSaved }: { onJobSaved?: () => void }) {
                       {meta.salaryContext.currency === 'EUR' ? '€' : meta.salaryContext.currency === 'GBP' ? '£' : '$'}{Math.round(meta.salaryContext.median / 1000)}k median
                     </span>
                   )}
-                  <span style={{ fontSize: 10, color: 'var(--text-subtle)', marginLeft: meta.salaryContext ? 0 : 'auto' }}>{meta.durationMs}ms{meta.cached ? ' · cached' : ''}</span>
                   <div style={{ display: 'flex', alignItems: 'center', gap: 5 }}>
                     <span style={{ fontSize: 10, color: 'var(--text-muted)' }}>Score:</span>
                     <button onClick={() => setSortDir(d => d === 'desc' ? 'asc' : 'desc')} style={{ fontSize: 10, padding: '3px 9px', border: '1px solid var(--border)', borderRadius: 6, background: 'var(--glass-bg)', color: 'var(--text-muted)', cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 3 }}>
