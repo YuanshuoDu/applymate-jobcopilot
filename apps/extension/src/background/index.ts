@@ -112,7 +112,7 @@ function shouldRestoreSaveUi(url?: string): boolean {
   }
 }
 
-async function refreshSettingsFromDashboard(): Promise<ExtensionSettings | null> {
+async function refreshBackgroundSettingsFromDashboard(): Promise<ExtensionSettings | null> {
   const tabs = await chrome.tabs.query({})
   const dashboardTabs = tabs.filter(tab => isApplyMateDashboardUrl(tab.url))
   for (const tab of dashboardTabs) {
@@ -139,7 +139,7 @@ async function refreshSettingsFromDashboard(): Promise<ExtensionSettings | null>
 async function saveJobWithAuthRecovery(settings: ExtensionSettings, job: ScrapedJob): Promise<SavedJob> {
   let activeSettings = settings
   if (!activeSettings.apiToken) {
-    activeSettings = await refreshSettingsFromDashboard() ?? activeSettings
+    activeSettings = await refreshBackgroundSettingsFromDashboard() ?? activeSettings
   }
   if (!activeSettings.apiToken) throw new Error('Not logged in — open the ApplyMate dashboard or extension popup to log in first')
 
@@ -147,7 +147,7 @@ async function saveJobWithAuthRecovery(settings: ExtensionSettings, job: Scraped
     return await saveJob(activeSettings, job)
   } catch (error) {
     if (!isAuthFailure(error)) throw error
-    const refreshed = await refreshSettingsFromDashboard()
+    const refreshed = await refreshBackgroundSettingsFromDashboard()
     if (!refreshed?.apiToken) throw error
     return saveJob(refreshed, job)
   }
@@ -155,14 +155,14 @@ async function saveJobWithAuthRecovery(settings: ExtensionSettings, job: Scraped
 
 async function getRecentJobsWithAuthRecovery(settings: ExtensionSettings): Promise<SavedJob[]> {
   let activeSettings = settings
-  if (!activeSettings.apiToken) activeSettings = await refreshSettingsFromDashboard() ?? activeSettings
+  if (!activeSettings.apiToken) activeSettings = await refreshBackgroundSettingsFromDashboard() ?? activeSettings
   if (!activeSettings.apiToken) throw new Error('Not logged in — open the ApplyMate dashboard or extension popup to reconnect')
 
   try {
     return await getRecentJobs(activeSettings)
   } catch (error) {
     if (!isAuthFailure(error)) throw error
-    const refreshed = await refreshSettingsFromDashboard()
+    const refreshed = await refreshBackgroundSettingsFromDashboard()
     if (!refreshed?.apiToken) throw error
     return getRecentJobs(refreshed)
   }
@@ -170,14 +170,14 @@ async function getRecentJobsWithAuthRecovery(settings: ExtensionSettings): Promi
 
 async function getStatsWithAuthRecovery(settings: ExtensionSettings): Promise<DashboardStats> {
   let activeSettings = settings
-  if (!activeSettings.apiToken) activeSettings = await refreshSettingsFromDashboard() ?? activeSettings
+  if (!activeSettings.apiToken) activeSettings = await refreshBackgroundSettingsFromDashboard() ?? activeSettings
   if (!activeSettings.apiToken) throw new Error('Not logged in — open the ApplyMate dashboard or extension popup to reconnect')
 
   try {
     return await getStats(activeSettings)
   } catch (error) {
     if (!isAuthFailure(error)) throw error
-    const refreshed = await refreshSettingsFromDashboard()
+    const refreshed = await refreshBackgroundSettingsFromDashboard()
     if (!refreshed?.apiToken) throw error
     return getStats(refreshed)
   }
@@ -288,7 +288,7 @@ async function handleMessage(
     }
 
     case 'REFRESH_DASHBOARD_TOKEN': {
-      const refreshed = await refreshSettingsFromDashboard()
+      const refreshed = await refreshBackgroundSettingsFromDashboard()
       return { ok: Boolean(refreshed?.apiToken) }
     }
 
