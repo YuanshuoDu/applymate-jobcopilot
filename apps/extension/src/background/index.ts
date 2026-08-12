@@ -5,7 +5,7 @@
 import { getSettings, setCurrentJob, setBadge, clearBadge } from '@/lib/storage'
 import { login, saveJob, getRecentJobs, getStats, updateJob } from '@/lib/api'
 import { getJobIdentity } from '@/lib/job-identity'
-import type { ExtMessage, ExtensionSettings, SavedJob, ScrapedJob } from '@/lib/types'
+import type { DashboardStats, ExtMessage, ExtensionSettings, SavedJob, ScrapedJob } from '@/lib/types'
 import { isApplyMateDashboardUrl, isAuthFailure } from '@/lib/auth-recovery'
 
 // ── Simple rate limiter (prevent excessive API calls) ──────────────
@@ -153,6 +153,36 @@ async function saveJobWithAuthRecovery(settings: ExtensionSettings, job: Scraped
   }
 }
 
+async function getRecentJobsWithAuthRecovery(settings: ExtensionSettings): Promise<SavedJob[]> {
+  let activeSettings = settings
+  if (!activeSettings.apiToken) activeSettings = await refreshSettingsFromDashboard() ?? activeSettings
+  if (!activeSettings.apiToken) throw new Error('Not logged in — open the ApplyMate dashboard or extension popup to reconnect')
+
+  try {
+    return await getRecentJobs(activeSettings)
+  } catch (error) {
+    if (!isAuthFailure(error)) throw error
+    const refreshed = await refreshSettingsFromDashboard()
+    if (!refreshed?.apiToken) throw error
+    return getRecentJobs(refreshed)
+  }
+}
+
+async function getStatsWithAuthRecovery(settings: ExtensionSettings): Promise<DashboardStats> {
+  let activeSettings = settings
+  if (!activeSettings.apiToken) activeSettings = await refreshSettingsFromDashboard() ?? activeSettings
+  if (!activeSettings.apiToken) throw new Error('Not logged in — open the ApplyMate dashboard or extension popup to reconnect')
+
+  try {
+    return await getStats(activeSettings)
+  } catch (error) {
+    if (!isAuthFailure(error)) throw error
+    const refreshed = await refreshSettingsFromDashboard()
+    if (!refreshed?.apiToken) throw error
+    return getStats(refreshed)
+  }
+}
+
 async function restoreSaveUi(tabId: number, url?: string): Promise<void> {
   if (!shouldRestoreSaveUi(url)) return
   try {
@@ -253,9 +283,13 @@ async function handleMessage(
       return { type: 'PONG', settings: { hasToken: !!settings.apiToken, email: settings.userEmail, apiBaseUrl: settings.apiBaseUrl } }
 
     case 'GET_STATS': {
-      if (!settings.apiToken) return { type: 'STATS_RESULT', stats: null }
-      const stats = await getStats(settings)
+      const stats = await getStatsWithAuthRecovery(settings)
       return { type: 'STATS_RESULT', stats }
+    }
+
+    case 'REFRESH_DASHBOARD_TOKEN': {
+      const refreshed = await refreshSettingsFromDashboard()
+      return { ok: Boolean(refreshed?.apiToken) }
     }
 
     case 'JOB_SCRAPED': {
@@ -316,13 +350,21 @@ async function handleMessage(
     }
 
     case 'GET_RECENT_JOBS': {
-      if (!settings.apiToken) return { type: 'RECENT_JOBS_RESULT', jobs: [] }
-      const jobs = await getRecentJobs(settings)
+      const jobs = await getRecentJobsWithAuthRecovery(settings)
       return { type: 'RECENT_JOBS_RESULT', jobs }
     }
 
     case 'OPEN_SIDE_PANEL': {
       return openTrackerWindow()
+    }
+
+    case 'OPEN_SIDE_PANEL_TAB': {
+      // Opening the native panel and selecting its destination are two separate
+      // operations. Persist the target so a freshly-created side panel cannot
+      // lose the user's intent while its React page is still mounting.
+      await chrome.storage.local.set({ pendingSidePanelTab: { tab: msg.tab, createdAt: Date.now() } })
+      chrome.runtime.sendMessage(msg).catch(() => {})
+      return { ok: true }
     }
 
     // ── Form Filler ──

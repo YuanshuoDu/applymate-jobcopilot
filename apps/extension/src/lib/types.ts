@@ -168,6 +168,8 @@ export type ExtMessage =
   | { type: 'GET_RECENT_JOBS' }
   | { type: 'RECENT_JOBS_RESULT'; jobs: SavedJob[] }
   | { type: 'OPEN_SIDE_PANEL' }
+  | { type: 'OPEN_SIDE_PANEL_TAB'; tab: 'jobs' | 'resume' }
+  | { type: 'JOB_SAVED'; savedJob: SavedJob }
   | { type: 'JOB_SCRAPED'; job: ScrapedJob }   // content → background when job detected
   | { type: 'ENRICH_JOB'; job: ScrapedJob }    // content → background: auto-patch saved job with description
   | { type: 'FETCH_DASHBOARD_TOKEN' }

@@ -4,6 +4,7 @@
  */
 import type { ScrapedJob, SavedJob, DashboardStats, ExtensionSettings, ResumeListItem, Resume, ScoreResult, Suggestion } from './types'
 import type { FormFillRequest, FormFillResponse, FormReviseRequest } from './form-filler/types'
+import { getSettings } from './storage'
 
 export class ApiError extends Error {
   constructor(public status: number, message: string) {
@@ -16,6 +17,22 @@ interface RequestExtras {
   _timeoutMs?: number
   /** Whether to retry on timeout/network error. Default true for non-AI calls. */
   _retry?: boolean
+  /** Whether a 401 may refresh the extension token through an open Dashboard tab. */
+  _authRecovery?: boolean
+}
+
+async function refreshSettingsFromDashboard(): Promise<ExtensionSettings | null> {
+  // The background worker owns the tab/session bridge. UI surfaces can ask it
+  // to refresh the token, then read the shared settings written by the bridge.
+  if (typeof window === 'undefined' || typeof chrome === 'undefined' || !chrome.runtime?.sendMessage) return null
+  try {
+    const response = await chrome.runtime.sendMessage({ type: 'REFRESH_DASHBOARD_TOKEN' }) as { ok?: boolean } | undefined
+    if (!response?.ok) return null
+    const refreshed = await getSettings()
+    return refreshed.apiToken ? refreshed : null
+  } catch {
+    return null
+  }
 }
 
 async function request<T>(
@@ -23,8 +40,8 @@ async function request<T>(
   path: string,
   options: RequestInit & RequestExtras = {},
 ): Promise<T> {
-  const { _timeoutMs = 15_000, _retry = true, ...fetchOpts } = options
-  const url = `${settings.apiBaseUrl}${path}`
+  const { _timeoutMs = 15_000, _retry = true, _authRecovery = true, ...fetchOpts } = options
+  const url = `${settings.apiBaseUrl.replace(/\/+$/, '')}${path}`
   const headers: Record<string, string> = {
     'Content-Type': 'application/json',
     ...(fetchOpts.headers as Record<string, string> ?? {}),
@@ -45,14 +62,27 @@ async function request<T>(
       })
       if (!res.ok) {
         const body = await res.json().catch(() => ({ error: res.statusText }))
+        if (res.status === 401 && _authRecovery && settings.apiToken) {
+          const refreshed = await refreshSettingsFromDashboard()
+          if (refreshed?.apiToken && refreshed.apiToken !== settings.apiToken) {
+            return request<T>(refreshed, path, {
+              ...fetchOpts,
+              _timeoutMs,
+              _retry: false,
+              _authRecovery: false,
+            })
+          }
+        }
         throw new ApiError(res.status, body.error ?? 'Request failed')
       }
       return res.json()
     } catch (err) {
       lastError = err instanceof Error ? err : new Error(String(err))
       if (err instanceof ApiError) throw err // Don't retry API errors
-      // Don't retry timeouts — the server is likely still processing
-      if (err instanceof DOMException && err.name === 'AbortError' && lastError.message.includes('timed out')) break
+      // Don't retry timeouts — the server is likely still processing. Chrome
+      // reports AbortSignal.timeout() as either AbortError or TimeoutError.
+      const isTimeout = err instanceof DOMException && (err.name === 'AbortError' || err.name === 'TimeoutError')
+      if (isTimeout || /timed out|timeout/i.test(lastError.message)) break
       if (attempt < maxAttempts - 1) await new Promise(r => setTimeout(r, 800))
     }
   }
