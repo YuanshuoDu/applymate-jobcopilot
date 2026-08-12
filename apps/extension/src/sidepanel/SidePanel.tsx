@@ -173,6 +173,24 @@ export function SidePanel() {
     return () => chrome.runtime.onMessage.removeListener(handler)
   }, [])
 
+  useEffect(() => {
+    type PanelNavigationMessage = { type?: string; tab?: TabId }
+    const selectRequestedTab = (message: PanelNavigationMessage) => {
+      if (message.type !== 'OPEN_SIDE_PANEL_TAB' || (message.tab !== 'jobs' && message.tab !== 'resume')) return
+      setMountedTabs(previous => new Set(previous).add(message.tab!))
+      setActiveTab(message.tab)
+    }
+    chrome.runtime.onMessage.addListener(selectRequestedTab)
+    chrome.storage.local.get('pendingSidePanelTab').then(result => {
+      const tab = result.pendingSidePanelTab as unknown
+      if (tab === 'jobs' || tab === 'resume') {
+        selectRequestedTab({ type: 'OPEN_SIDE_PANEL_TAB', tab })
+        void chrome.storage.local.remove('pendingSidePanelTab')
+      }
+    }).catch(() => {})
+    return () => chrome.runtime.onMessage.removeListener(selectRequestedTab)
+  }, [])
+
   if (!settings) return <Spinner />
   if (!isLoggedIn(settings)) return <NotLoggedIn apiBase={settings.apiBaseUrl} />
 
@@ -298,7 +316,10 @@ function TrackerPanel({ settings, L, onOpenResume }: { settings: ExtensionSettin
     loadJobs()
     getDashboard(settings).then(setDashboard).catch(() => setDashboard(null))
     const handler = (message: { type?: string }) => {
-      if (message.type === 'JOB_SCRAPED' || message.type === 'JOB_SAVED') loadJobs()
+      if (message.type === 'JOB_SCRAPED' || message.type === 'JOB_SAVED') {
+        loadJobs()
+        getDashboard(settings).then(setDashboard).catch(() => setDashboard(null))
+      }
     }
     chrome.runtime.onMessage.addListener(handler)
     return () => chrome.runtime.onMessage.removeListener(handler)
@@ -332,8 +353,9 @@ function TrackerPanel({ settings, L, onOpenResume }: { settings: ExtensionSettin
   const rejectedCount = dashboard?.stats.rejected ?? counts.rejected
   const weeklyApplications = dashboard?.stats.thisWeek ?? 0
   const weeklyTarget = 30
+  const weeklyProgress = Math.min(weeklyApplications / weeklyTarget * 100, 100)
   const highMatchThreshold = dashboard?.minMatchScore ?? 75
-  const highMatch = jobs.filter(job => visibleStatus(job.status) === 'saved' && job.score != null && job.score >= highMatchThreshold).sort((a, b) => (b.score ?? 0) - (a.score ?? 0))[0] ?? null
+  const highMatch = jobs.filter(job => job.score != null && job.score >= highMatchThreshold).sort((a, b) => (b.score ?? 0) - (a.score ?? 0))[0] ?? null
   const unscoredCount = jobs.filter(job => job.score == null).length
 
   async function scoreJob(job: SavedJob) {
@@ -366,12 +388,12 @@ function TrackerPanel({ settings, L, onOpenResume }: { settings: ExtensionSettin
         <div className="am-overview-grid">
           <div className="am-overview-cell">
             <div className="am-overview-label"><Target size={12} aria-hidden="true" />Application momentum</div>
-            <div className="am-momentum-summary"><div className="am-momentum-ring" style={{ '--am-progress-angle': `${Math.min(weeklyApplications / weeklyTarget * 100, 100) * 3.6}deg` } as React.CSSProperties} aria-label={`${Math.min(weeklyApplications / weeklyTarget * 100, 100)}% of weekly target`}><strong>{Math.min(weeklyApplications, weeklyTarget)}</strong><span>/ {weeklyTarget}</span><small>weekly target</small></div><div className="am-momentum-copy"><strong>Keep it up!</strong><span>{Math.max(1, 7 - new Date().getDay())} days left</span></div></div>
+            <div className="am-momentum-summary"><div className="am-momentum-ring" style={{ '--am-progress-angle': `${weeklyProgress * 3.6}deg` } as React.CSSProperties} aria-label={`${Math.round(weeklyProgress)}% of weekly target`}><strong>{Math.round(weeklyProgress)}%</strong><small>{Math.min(weeklyApplications, weeklyTarget)} / {weeklyTarget}</small></div><div className="am-momentum-copy"><strong>{weeklyApplications >= weeklyTarget ? 'Goal reached!' : 'Keep it up!'}</strong><span>{Math.max(1, 7 - new Date().getDay())} days left</span></div></div>
           </div>
           <div className="am-overview-cell">
             <div className="am-overview-label"><BarChart3 size={12} aria-hidden="true" />Next step</div>
             <div className="am-overview-copy">{!dashboard?.hasResume ? 'Add your resume to unlock match scoring.' : unscoredCount > 0 ? `${unscoredCount} saved role${unscoredCount === 1 ? '' : 's'} ready to score.` : `${Math.max(0, weeklyTarget - weeklyApplications)} applications this week to stay on track.`}</div>
-            <div className="am-progress-bar" aria-hidden="true"><span style={{ width: `${Math.min(weeklyApplications / weeklyTarget * 100, 100)}%` }} /></div>
+            <div className="am-progress-bar" aria-hidden="true"><span style={{ width: `${weeklyProgress}%` }} /></div>
             <button className="am-overview-action" type="button" onClick={() => dashboard?.hasResume ? (unscoredCount ? void scoreJob(jobs.find(job => job.score == null)!) : chrome.tabs.create({ url: `${settings.apiBaseUrl}/jobs` })) : onOpenResume()}>{!dashboard?.hasResume ? 'Add resume' : unscoredCount ? 'Score a role' : 'View plan'}</button>
           </div>
           <div className="am-overview-cell">
@@ -392,7 +414,7 @@ function TrackerPanel({ settings, L, onOpenResume }: { settings: ExtensionSettin
       <div className="am-job-tools">
         <div className="am-search-wrap"><label className="am-search"><Search size={15} aria-hidden="true" /><input value={search} onChange={event => setSearch(event.target.value)} placeholder="Search by role or company…" aria-label="Search jobs" />{search && <button className="am-search-clear" type="button" onClick={() => setSearch('')} aria-label="Clear search"><X size={13} /></button>}</label></div>
         <div className="am-filter-strip" role="tablist" aria-label="Job status filters">
-          {([['all', 'All'], ['saved', L.saved], ['applied', L.applied], ['interview', 'Interviews'], ['rejected', L.rejected]] as const).map(([value, label]) => <button key={value} className={`am-filter${filterStatus === value ? ' active' : ''}`} type="button" role="tab" aria-selected={filterStatus === value} onClick={() => setFilterStatus(value)}>{label}<span className="am-filter-count">{counts[value]}</span></button>)}
+          {([['all', 'All'], ['saved', L.saved], ['applied', L.applied], ['interview', 'Interviews'], ['rejected', L.rejected]] as const).map(([value, label]) => <button key={value} className={`am-filter${filterStatus === value ? ' active' : ''}`} type="button" role="tab" aria-selected={filterStatus === value} onClick={() => setFilterStatus(value)}>{label}</button>)}
         </div>
         <div className="am-select-row"><select className="am-select" value={filterSource} onChange={event => setFilterSource(event.target.value)} aria-label="Filter by source"><option value="all">All sources</option>{availableSources.map(source => <option key={source} value={source}>{source}</option>)}</select><select className="am-select" value={sortBy} onChange={event => setSortBy(event.target.value as SortBy)} aria-label="Sort jobs"><option value="date">Newest first</option><option value="company">Company</option><option value="score">Match score</option></select></div>
       </div>
