@@ -29,7 +29,7 @@ vi.mock('jose', () => ({
 describe('GET /api/auth/me/extension-token', () => {
   beforeEach(() => {
     vi.resetModules()
-    mocks.safeAuth.mockReset().mockResolvedValue({ user: { id: 'user_1' } })
+    mocks.safeAuth.mockReset().mockResolvedValue({ user: { id: 'user_1', authVersion: 1 } })
     mocks.userFindUnique.mockReset().mockResolvedValue({ id: 'user_1', email: 'user@example.com', name: 'User', plan: 'pro', accountStatus: 'active', authVersion: 1 })
     mocks.sign.mockReset().mockResolvedValue('extension-token')
     mocks.payloads.length = 0
@@ -51,5 +51,17 @@ describe('GET /api/auth/me/extension-token', () => {
 
     expect(response.status).toBe(200)
     expect(mocks.payloads).toContainEqual(expect.objectContaining({ sub: 'user_1', authVersion: 1 }))
+  })
+
+  it('does not mint a token from a stale dashboard session', async () => {
+    mocks.safeAuth.mockResolvedValue({ user: { id: 'user_1', authVersion: 1 } })
+    mocks.userFindUnique.mockResolvedValue({ id: 'user_1', email: 'user@example.com', accountStatus: 'active', authVersion: 2 })
+    const { GET } = await import('./route')
+
+    const response = await GET()
+
+    expect(response.status).toBe(401)
+    await expect(response.json()).resolves.toEqual({ error: 'Session expired' })
+    expect(mocks.sign).not.toHaveBeenCalled()
   })
 })

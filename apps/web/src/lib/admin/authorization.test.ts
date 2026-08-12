@@ -35,8 +35,8 @@ describe('requireAdmin', () => {
   })
 
   it('denies an old admin session after the membership session version changes', async () => {
-    mocks.safeAuth.mockResolvedValue({ user: { id: 'admin-1', plan: 'pro', adminSessionVersion: 1 } })
-    mocks.findUnique.mockResolvedValue({ status: 'active', mfaLevel: 'totp', sessionVersion: 2, user: { accountStatus: 'active' }, role: { key: 'operations', permissions: ['observability.read'] } })
+    mocks.safeAuth.mockResolvedValue({ user: { id: 'admin-1', plan: 'pro', adminSessionVersion: 1, authVersion: 1 } })
+    mocks.findUnique.mockResolvedValue({ status: 'active', mfaLevel: 'totp', sessionVersion: 2, user: { accountStatus: 'active', authVersion: 1 }, role: { key: 'operations', permissions: ['observability.read'] } })
     const { requireAdmin } = await import('./authorization')
     const result = await requireAdmin('observability.read', new Request('http://localhost/api/admin/v1/observability'))
     expect(result).toBeInstanceOf(Response)
@@ -45,8 +45,8 @@ describe('requireAdmin', () => {
   })
 
   it('allows a permission only when the active membership and session version match', async () => {
-    mocks.safeAuth.mockResolvedValue({ user: { id: 'admin-1', plan: 'pro', adminSessionVersion: 2 } })
-    mocks.findUnique.mockResolvedValue({ status: 'active', mfaLevel: 'totp', sessionVersion: 2, user: { accountStatus: 'active' }, role: { key: 'operations', permissions: ['observability.read'] } })
+    mocks.safeAuth.mockResolvedValue({ user: { id: 'admin-1', plan: 'pro', adminSessionVersion: 2, authVersion: 1 } })
+    mocks.findUnique.mockResolvedValue({ status: 'active', mfaLevel: 'totp', sessionVersion: 2, user: { accountStatus: 'active', authVersion: 1 }, role: { key: 'operations', permissions: ['observability.read'] } })
     const { requireAdmin, isAdminResponse } = await import('./authorization')
     const result = await requireAdmin('observability.read')
     expect(isAdminResponse(result)).toBe(false)
@@ -54,8 +54,8 @@ describe('requireAdmin', () => {
   })
 
   it('permits an approved unexpired break-glass grant without changing the membership role', async () => {
-    mocks.safeAuth.mockResolvedValue({ user: { id: 'admin-1', plan: 'pro', adminSessionVersion: 2 } })
-    mocks.findUnique.mockResolvedValue({ status: 'active', mfaLevel: 'totp', sessionVersion: 2, user: { accountStatus: 'active' }, role: { key: 'operations', permissions: [] } })
+    mocks.safeAuth.mockResolvedValue({ user: { id: 'admin-1', plan: 'pro', adminSessionVersion: 2, authVersion: 1 } })
+    mocks.findUnique.mockResolvedValue({ status: 'active', mfaLevel: 'totp', sessionVersion: 2, user: { accountStatus: 'active', authVersion: 1 }, role: { key: 'operations', permissions: [] } })
     mocks.findGrant.mockResolvedValue({ id: 'grant-1' })
     const { requireAdmin, isAdminResponse } = await import('./authorization')
     const result = await requireAdmin('queues.pause')
@@ -65,8 +65,8 @@ describe('requireAdmin', () => {
   })
 
   it('requires fresh WebAuthn for a high-risk request', async () => {
-    mocks.safeAuth.mockResolvedValue({ user: { id: 'admin-1', plan: 'pro', adminSessionVersion: 2 } })
-    mocks.findUnique.mockResolvedValue({ status: 'active', mfaLevel: 'webauthn', sessionVersion: 2, user: { accountStatus: 'active' }, role: { key: 'operations', permissions: ['queues.pause'] } })
+    mocks.safeAuth.mockResolvedValue({ user: { id: 'admin-1', plan: 'pro', adminSessionVersion: 2, authVersion: 1 } })
+    mocks.findUnique.mockResolvedValue({ status: 'active', mfaLevel: 'webauthn', sessionVersion: 2, user: { accountStatus: 'active', authVersion: 1 }, role: { key: 'operations', permissions: ['queues.pause'] } })
     mocks.findReauth.mockResolvedValue(null)
     const { requireAdmin } = await import('./authorization')
     const result = await requireAdmin('queues.pause', new Request('http://localhost/api/admin/v1/queues/apply-tasks/pause', { headers: { Cookie: 'applymate-admin-reauth=expired' } }))
@@ -76,12 +76,24 @@ describe('requireAdmin', () => {
   })
 
   it('requires fresh WebAuthn before changing a user feature permission', async () => {
-    mocks.safeAuth.mockResolvedValue({ user: { id: 'admin-1', plan: 'pro', adminSessionVersion: 2 } })
-    mocks.findUnique.mockResolvedValue({ status: 'active', mfaLevel: 'webauthn', sessionVersion: 2, user: { accountStatus: 'active' }, role: { key: 'platform_admin', permissions: ['users.feature_override'] } })
+    mocks.safeAuth.mockResolvedValue({ user: { id: 'admin-1', plan: 'pro', adminSessionVersion: 2, authVersion: 1 } })
+    mocks.findUnique.mockResolvedValue({ status: 'active', mfaLevel: 'webauthn', sessionVersion: 2, user: { accountStatus: 'active', authVersion: 1 }, role: { key: 'platform_admin', permissions: ['users.feature_override'] } })
     mocks.findReauth.mockResolvedValue(null)
     const { requireAdmin } = await import('./authorization')
     const result = await requireAdmin('users.feature_override', new Request('http://localhost/api/admin/v1/users/u1/feature-overrides', { method: 'PATCH', headers: { Origin: 'http://localhost', Host: 'localhost', 'Idempotency-Key': 'override-reauth-1' } }))
     expect(result).toBeInstanceOf(Response)
     expect(await (result as Response).json()).toEqual(expect.objectContaining({ code: 'reauth_required' }))
+  })
+
+  it('denies an admin session after the user auth version changes', async () => {
+    mocks.safeAuth.mockResolvedValue({ user: { id: 'admin-1', plan: 'pro', adminSessionVersion: 2, authVersion: 1 } })
+    mocks.findUnique.mockResolvedValue({ status: 'active', mfaLevel: 'totp', sessionVersion: 2, user: { accountStatus: 'active', authVersion: 2 }, role: { key: 'operations', permissions: ['observability.read'] } })
+    const { requireAdmin } = await import('./authorization')
+
+    const result = await requireAdmin('observability.read')
+
+    expect(result).toBeInstanceOf(Response)
+    expect((result as Response).status).toBe(403)
+    expect(mocks.audit).toHaveBeenCalledWith(expect.objectContaining({ errorCode: 'permission_denied', outcome: 'denied' }))
   })
 })

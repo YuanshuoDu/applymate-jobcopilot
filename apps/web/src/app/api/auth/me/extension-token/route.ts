@@ -8,6 +8,7 @@ import { safeAuth } from '@/lib/safe-auth'
 import { SignJWT } from 'jose'
 import { db } from '@/lib/db'
 import { EXTENSION_TOKEN_AUDIENCE, EXTENSION_TOKEN_ISSUER, getAuthJwtSecret } from '@/lib/auth-secret'
+import { isCurrentAuthVersion } from '@/lib/auth-version'
 
 const JWT_SECRET = getAuthJwtSecret()
 
@@ -23,6 +24,9 @@ export async function GET() {
   }
   if (user.accountStatus !== 'active') {
     return NextResponse.json({ error: 'Account unavailable' }, { status: 403 })
+  }
+  if (!isCurrentAuthVersion(session.user.authVersion, user.authVersion)) {
+    return NextResponse.json({ error: 'Session expired' }, { status: 401 })
   }
 
   const token = await new SignJWT({

@@ -5,6 +5,7 @@ import { writeAdminAudit } from '@/lib/admin/audit'
 import { db } from '@/lib/db'
 import { isAdminHost, isLocalHost } from '@/lib/host-routing'
 import { normalizeEmail } from '@/lib/auth-identifiers'
+import { isCurrentAuthVersion } from '@/lib/auth-version'
 
 export async function POST(request: NextRequest) {
   if (!isAdminHost(request.nextUrl.hostname) && !isLocalHost(request.nextUrl.hostname)) {
@@ -12,10 +13,14 @@ export async function POST(request: NextRequest) {
   }
   const session = await safeAuth()
   const userId = session?.user?.id
-  const email = session?.user?.email ? normalizeEmail(session.user.email) : ''
   const body = await request.json().catch(() => null) as { token?: string } | null
   const token = typeof body?.token === 'string' ? body.token.trim() : ''
-  if (!userId || !email || token.length < 20) return NextResponse.json({ error: 'Sign in with the invited email before accepting this invitation' }, { status: 401 })
+  if (!userId || token.length < 20) return NextResponse.json({ error: 'Sign in with the invited email before accepting this invitation' }, { status: 401 })
+  const user = await db.user.findUnique({ where: { id: userId }, select: { email: true, accountStatus: true, authVersion: true } })
+  if (!user) return NextResponse.json({ error: 'Not authenticated' }, { status: 401 })
+  if (user.accountStatus !== 'active') return NextResponse.json({ error: 'Account unavailable' }, { status: 403 })
+  if (!isCurrentAuthVersion(session?.user?.authVersion, user.authVersion)) return NextResponse.json({ error: 'Session expired' }, { status: 401 })
+  const email = normalizeEmail(user.email)
   const tokenHash = createHash('sha256').update(token).digest('hex')
   const invitation = await db.adminInvitation.findUnique({ where: { tokenHash }, select: { id: true, email: true, roleId: true, expiresAt: true, status: true } })
   if (!invitation || normalizeEmail(invitation.email) !== email || invitation.status !== 'pending' || invitation.expiresAt <= new Date()) return NextResponse.json({ error: 'Invitation is invalid or expired' }, { status: 400 })
