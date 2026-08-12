@@ -80,14 +80,14 @@ passed
 
 - Source visual truth: `C:/Users/Steven.du/.codex/attachments/fb5c31e8-b288-4c68-92a4-41beda5ab422/image-1.png`
 - Implementation source: `apps/extension/src/sidepanel/SidePanel.tsx`, `apps/extension/src/sidepanel/sidepanel.css`
-- Implementation screenshot: in-app Browser capture of `http://127.0.0.1:4174/audit-artifacts/sidebar-runtime-preview.html` (runtime preview with read-only mock API data)
-- Reference pixels: 720 x 1366; normalized CSS viewport: 360 x 683; reference density: 2x.
-- Implementation pixels: 360 x 683 at 1x; comparison uses the normalized reference viewport.
-- State: authenticated Jobs tab, populated tracker, one saved high-match role highlighted, one role expanded for details.
+- Implementation screenshot: in-app Browser capture of `http://127.0.0.1:4174/audit-artifacts/sidebar-runtime-preview.html?v=final2` (runtime preview with read-only mock API data)
+- Reference pixels: 911 x 1727; normalized CSS viewport: 455 x 864; reference density: approximately 2x.
+- Implementation pixels: 455 x 864 at 1x; comparison uses the normalized reference viewport.
+- State: authenticated Jobs tab, populated tracker, one high-match role highlighted, and the `Account Executive` row expanded for details.
 
 ### Full-view comparison
 
-The normalized implementation preserves the selected second design's main composition: compact ApplyMate header, four-tab navigation, three-part momentum overview, four application metrics, search/filter/sort controls, scoreable job cards, expandable details, and a persistent footer action. The old `In Review` and `Offer` filter buckets are absent. The actual current-page detection card remains conditional, so it does not add visual noise when no job page is detected.
+The normalized implementation preserves the selected second design's main composition: compact ApplyMate header, four-tab navigation, three-part momentum overview, four application metrics, search/filter/sort controls, scoreable job cards, expandable details, and a persistent footer action. The old `In Review` and `Offer` filter buckets are absent. The actual current-page detection card remains conditional, so it does not add visual noise when no job page is detected. The final capture uses a true percentage momentum ring and segmented match rings with a pale unfilled track.
 
 ### Focused-region comparison
 
@@ -103,9 +103,9 @@ The overview and job-card score regions were compared separately because the rin
 
 ### Comparison history
 
-1. Initial implementation: passed build but had a responsive P2 issue at 360px; the overview's third column was clipped and stats did not reflow.
-2. Fix: added the 420px compact breakpoint and re-captured at 360 x 683; the final layout retains 100.9/100.9/116.1px overview columns and 82px x 4 metric cards without horizontal overflow.
-3. Visual fidelity pass: changed momentum to a ring target indicator, match scores to ring score indicators, and metric icons to the reference's bookmark/send/message/blocked language. Re-captured the final normalized state, including the two-column expanded detail state.
+1. Initial implementation: passed build but had a responsive P2 issue at narrow widths; the overview's third column was clipped and stats did not reflow.
+2. Fix: added the compact breakpoint and re-captured at 455 x 864; the final layout retains three overview columns and four metric cards without horizontal overflow.
+3. Visual fidelity pass: changed momentum to a percentage ring with a segmented track, match scores to segmented rings, removed filter-count badges to match the reference, and aligned the high-match opportunity with scored roles. Re-captured the final normalized state and expanded detail state.
 
 ### Verification
 
@@ -113,6 +113,7 @@ The overview and job-card score regions were compared separately because the rin
 - `pnpm --filter @jobcopilot/extension typecheck` — passed.
 - `pnpm --filter @jobcopilot/extension build` — passed.
 - Primary interactions: status filter tabs, source/sort selects, expand/collapse, Score on an unscored job, and Re-score affordance were inspected in the runtime preview.
+- Interaction evidence: search narrowed the list to Stripe, Greenhouse source filtering narrowed the list to two roles, score sorting reordered by match score, expansion rendered two detail panels, and exact `Score` produced one success toast without console errors.
 - Browser console: final runtime preview capture had no errors. The earlier plain extension bundle preview emitted the expected missing `chrome.storage.onChanged` error because it was outside the extension runtime; it was not used as final evidence.
 
 ### Final result
