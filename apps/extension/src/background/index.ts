@@ -288,6 +288,7 @@ async function handleMessage(
         const key = getJobIdentity(msg.job)
         const cached = savedJobsByKey.get(key)
         if (cached) {
+          chrome.runtime.sendMessage({ type: 'JOB_SAVED', savedJob: cached }).catch(() => {})
           return { type: 'SAVE_JOB_RESULT', success: true, alreadySaved: true, savedJob: cached }
         }
 
@@ -305,6 +306,7 @@ async function handleMessage(
         }
         setBadge('✓', '#3B6D11')
         setTimeout(clearBadge, 3000)
+        chrome.runtime.sendMessage({ type: 'JOB_SAVED', savedJob }).catch(() => {})
         return { type: 'SAVE_JOB_RESULT', success: true, savedJob }
       } catch (err) {
         pendingSavesByKey.delete(getJobIdentity(msg.job))

@@ -1,8 +1,9 @@
-import { useState, useEffect, useCallback } from 'react'
+import { useState, useEffect } from 'react'
 import { getSettings, saveSettings, isLoggedIn, clearAuth } from '@/lib/storage'
 import { login as apiLogin } from '@/lib/api'
 import type { ExtensionSettings, ScrapedJob, SavedJob, DashboardStats } from '@/lib/types'
 import { PopupMainView } from './MainView'
+import { UserSettingsView } from './UserSettingsView'
 
 // ── Design tokens (aligned with web app brand) ────────────────
 const C = {
@@ -90,7 +91,8 @@ const GLOBAL_CSS = `
   @keyframes am-spin { to { transform: rotate(360deg) } }
   .am-spin { animation: am-spin 0.8s linear infinite; }
   * { box-sizing: border-box; }
-  body { margin: 0; width: 360px; min-width: 360px; background: #F8F8FF; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+  body { margin: 0; width: 360px; min-width: 360px; overflow: hidden; background: #F8F8FF; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+  body::-webkit-scrollbar { width: 0; height: 0; }
 `
 
 // ── Main App ──────────────────────────────────────────────── v2
@@ -117,8 +119,6 @@ export function App() {
     })
   }, [])
 
-  const refresh = useCallback(() => { getSettings().then(setSettings) }, [])
-
   return (
     <>
       <style>{GLOBAL_CSS}</style>
@@ -127,7 +127,7 @@ export function App() {
       ) : view === 'login' ? (
         <LoginView settings={settings} L={L} onLogin={s => { setSettings(s); setView('main') }} />
       ) : view === 'settings' ? (
-        <SettingsView settings={settings} L={L} refresh={refresh} onBack={() => setView('main')} />
+        <UserSettingsView settings={settings} onBack={() => setView('main')} onLogout={() => { clearAuth(); setView('login') }} />
       ) : (
         <PopupMainView
           settings={settings}
@@ -667,51 +667,6 @@ function RecentJobsList({ jobs, settings, L }: { jobs: SavedJob[]; settings: Ext
           </a>
         )
       })}
-    </div>
-  )
-}
-
-// ── Settings View ─────────────────────────────────────────────
-
-function SettingsView({ settings, L, refresh, onBack }: {
-  settings: ExtensionSettings; L: LType; refresh: () => void; onBack: () => void
-}) {
-  const [apiUrl, setApiUrl] = useState(settings.apiBaseUrl)
-  const [saved,  setSaved]  = useState(false)
-
-  async function handleSave() {
-    await saveSettings({ apiBaseUrl: apiUrl })
-    refresh()
-    setSaved(true)
-    setTimeout(() => setSaved(false), 2000)
-  }
-
-  return (
-    <div style={{ padding: 16, display: 'flex', flexDirection: 'column', gap: 14, background: C.bg }}>
-      <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-        <button onClick={onBack} style={{ background: C.bgCard, border: `1px solid ${C.border}`, cursor: 'pointer', color: C.muted, fontSize: 16, padding: '3px 8px', borderRadius: 7, lineHeight: 1.4 }}>
-          ←
-        </button>
-        <span style={{ fontSize: 14, fontWeight: 700, color: C.text }}>{L.settingsTitle}</span>
-      </div>
-
-      <Input label={L.apiUrl} type="url" value={apiUrl} onChange={setApiUrl} placeholder="http://localhost:3000" />
-
-      <div style={{ fontSize: 11, color: C.muted, background: 'rgba(79,70,229,0.05)', padding: '9px 11px', borderRadius: 7, lineHeight: 1.8, border: `1px solid rgba(79,70,229,0.12)` }}>
-        <span style={{ color: C.text, fontWeight: 600 }}>Dev:</span>{' '}
-        <code style={{ fontFamily: 'monospace', background: 'rgba(0,0,0,0.04)', padding: '0 4px', borderRadius: 3 }}>http://localhost:3000</code><br />
-        <span style={{ color: C.text, fontWeight: 600 }}>Prod:</span>{' '}
-        <code style={{ fontFamily: 'monospace', background: 'rgba(0,0,0,0.04)', padding: '0 4px', borderRadius: 3 }}>https://your-domain.com</code>
-      </div>
-
-      <Btn onClick={handleSave} primary>{saved ? L.savedConfirm : L.saveSettings}</Btn>
-
-      <div style={{ borderTop: `1px solid ${C.border}`, paddingTop: 14, display: 'flex', flexDirection: 'column', gap: 10 }}>
-        <div style={{ fontSize: 11, color: C.muted, padding: '7px 10px', background: C.bgCard, borderRadius: 7, border: `1px solid ${C.border}` }}>
-          {L.currentAccount} {settings.userEmail || L.notLoggedIn}
-        </div>
-        <Btn onClick={() => clearAuth().then(onBack)}>{L.signOut}</Btn>
-      </div>
     </div>
   )
 }
