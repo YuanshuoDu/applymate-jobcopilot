@@ -37,4 +37,21 @@ describe('Auth.js route host boundary', () => {
     expect(response.status).toBe(204)
     expect(mocks.get).toHaveBeenCalledTimes(1)
   })
+
+  it('strips OAuth providers from administrator provider discovery', async () => {
+    mocks.get.mockResolvedValueOnce(new Response(JSON.stringify({
+      credentials: { id: 'credentials', type: 'credentials' },
+      google: { id: 'google', type: 'oidc' },
+      github: { id: 'github', type: 'oauth' },
+    }), {
+      status: 200,
+      headers: { 'content-type': 'application/json', 'cache-control': 'public, max-age=0' },
+    }))
+
+    const response = await GET(new NextRequest('https://admin.applymate.site/api/auth/providers'))
+
+    expect(response.status).toBe(200)
+    await expect(response.json()).resolves.toEqual({ credentials: { id: 'credentials', type: 'credentials' } })
+    expect(mocks.get).toHaveBeenCalledTimes(1)
+  })
 })
