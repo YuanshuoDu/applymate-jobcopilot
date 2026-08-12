@@ -11,6 +11,13 @@ export function SearchPage() {
   const { navigate } = useNav()
   const { t } = useI18n()
 
+  function openApiKeySettings() {
+    const url = new URL(window.location.href)
+    url.searchParams.set('tab', 'apiKeys')
+    window.history.replaceState({}, '', `${url.pathname}${url.search}${url.hash}`)
+    navigate('settings')
+  }
+
   return (
     <div className="search-page" style={{ flex: 1, overflowY: 'auto', background: 'var(--bg-tertiary)', display: 'flex', flexDirection: 'column' }}>
       <TopBar title={t('search.pageTitle')}>
@@ -23,7 +30,7 @@ export function SearchPage() {
       </TopBar>
 
       <div className="search-page-content" style={{ padding: 20, flex: 1, display: 'flex', flexDirection: 'column' }}>
-        <SmartSearch onJobSaved={() => {
+        <SmartSearch onOpenSettings={openApiKeySettings} onJobSaved={() => {
           // Notify JobsPage to refresh when user navigates back
           window.postMessage({ type: 'job-saved' }, window.location.origin)
         }} />
