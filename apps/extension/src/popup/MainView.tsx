@@ -2,12 +2,12 @@ import { useEffect, useMemo, useState } from 'react'
 import { BarChart3, Bookmark, ChevronRight, ExternalLink, Folder, LoaderCircle, Sparkles } from 'lucide-react'
 import { getResume, listResumes, scoreResume } from '@/lib/api'
 import { getCurrentResumeId } from '@/lib/storage'
-import type { DashboardStats, ExtensionSettings, SavedJob, ScoreResult, ScrapedJob } from '@/lib/types'
+import type { ExtensionSettings, SavedJob, ScoreResult, ScrapedJob } from '@/lib/types'
 import { C } from './popup-constants'
 import { ActionRow, countPill, Divider, EmptyJob, footerLink, InlineMessage, primaryAction } from './PopupActions'
 import { PopupHeader } from './PopupHeader'
 import { DetectionRow, JobSummary } from './PopupJobCard'
-import { getLabels, isCurrentJobResponse, isSavedJobsResponse, isSaveResponse, isScrapedJob, isStatsResponse, openSidePanel, sameJob } from './popup-utils'
+import { getLabels, isCurrentJobResponse, isSavedJob, isSavedJobsResponse, isSaveResponse, isScrapedJob, isStatsResponse, openSidePanel, sameJob, type PopupStats } from './popup-utils'
 
 export function PopupMainView({ settings, onSettings, onLogout }: {
   settings: ExtensionSettings
@@ -18,7 +18,7 @@ export function PopupMainView({ settings, onSettings, onLogout }: {
   const [currentJob, setCurrentJob] = useState<ScrapedJob | null>(null)
   const [activeWindowId, setActiveWindowId] = useState<number | null>(null)
   const [savedJobs, setSavedJobs] = useState<SavedJob[]>([])
-  const [stats, setStats] = useState<DashboardStats | null>(null)
+  const [stats, setStats] = useState<PopupStats | null>(null)
   const [score, setScore] = useState<ScoreResult | null>(null)
   const [loading, setLoading] = useState(true)
   const [saving, setSaving] = useState(false)
@@ -46,8 +46,14 @@ export function PopupMainView({ settings, onSettings, onLogout }: {
     }
     void load()
 
-    const onJobDetected = (messageEvent: { type: string; job?: ScrapedJob }) => {
+    const onJobDetected = (messageEvent: { type: string; job?: ScrapedJob; savedJob?: SavedJob }) => {
       if (messageEvent.type === 'JOB_SCRAPED' && isScrapedJob(messageEvent.job)) setCurrentJob(messageEvent.job)
+      if (messageEvent.type === 'JOB_SAVED' && isSavedJob(messageEvent.savedJob)) {
+        setSavedJobs(previous => [messageEvent.savedJob!, ...previous.filter(job => job.id !== messageEvent.savedJob!.id)])
+        void chrome.runtime.sendMessage({ type: 'GET_STATS' }).then(response => {
+          if (isStatsResponse(response)) setStats(response.stats)
+        }).catch(() => {})
+      }
     }
     chrome.runtime.onMessage.addListener(onJobDetected)
     return () => { cancelled = true; chrome.runtime.onMessage.removeListener(onJobDetected) }
@@ -55,7 +61,7 @@ export function PopupMainView({ settings, onSettings, onLogout }: {
 
   const savedJob = useMemo(() => currentJob ? savedJobs.find(job => sameJob(currentJob, job)) ?? null : null, [currentJob, savedJobs])
   const matchScore = savedJob?.score ?? score?.score ?? null
-  const count = stats?.total ?? savedJobs.length
+  const count = stats?.saved ?? savedJobs.length
 
   async function handleSave() {
     if (!currentJob || savedJob || saving) return
@@ -64,7 +70,10 @@ export function PopupMainView({ settings, onSettings, onLogout }: {
     try {
       const response = await chrome.runtime.sendMessage({ type: 'SAVE_JOB', job: currentJob }).catch(() => null)
       if (!isSaveResponse(response) || !response.success) throw new Error(response?.error ?? 'Save failed')
-      if (response.savedJob) setSavedJobs(previous => [response.savedJob!, ...previous])
+      if (response.savedJob) setSavedJobs(previous => [response.savedJob!, ...previous.filter(job => job.id !== response.savedJob!.id)])
+      void chrome.runtime.sendMessage({ type: 'GET_STATS' }).then(statsResponse => {
+        if (isStatsResponse(statsResponse)) setStats(statsResponse.stats)
+      }).catch(() => {})
       setMessage('saved')
     } catch (error) {
       setMessage(error instanceof Error ? error.message : 'Save failed')
@@ -109,7 +118,7 @@ export function PopupMainView({ settings, onSettings, onLogout }: {
   return (
     <div style={{ background: C.bg, color: C.navy, fontFamily: 'Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif' }}>
       <PopupHeader user={settings.userName || settings.userEmail} onSettings={onSettings} onLogout={onLogout} onDashboard={openDashboard} labels={labels} />
-      <main style={{ padding: '18px 12px 0' }}>
+      <main style={{ padding: '12px 10px 0', overflow: 'hidden' }}>
         <DetectionRow job={currentJob} labels={labels} />
         {currentJob ? <>
           <JobSummary job={currentJob} score={matchScore} labels={labels} />
@@ -122,7 +131,7 @@ export function PopupMainView({ settings, onSettings, onLogout }: {
           {message && message !== 'saved' && message !== 'analyzed' && <InlineMessage text={message} />}
         </> : <EmptyJob labels={labels} />}
       </main>
-      <footer style={{ marginTop: 12, padding: '14px 16px 16px', borderTop: `1px solid ${C.border}`, background: C.panel, display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 10 }}>
+      <footer style={{ marginTop: 10, padding: '10px 12px 12px', borderTop: `1px solid ${C.border}`, background: C.panel, display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 10 }}>
         <button type="button" onClick={openDashboard} style={footerLink}><Folder size={20} strokeWidth={1.8} /><span>{labels.savedJobs}</span><span style={countPill}>{count}</span></button>
         <button type="button" onClick={() => void handleOpenSidePanel()} style={{ ...footerLink, color: C.primary, fontWeight: 650 }}><span>{labels.openSidebar}</span><ExternalLink size={17} strokeWidth={1.8} /></button>
       </footer>

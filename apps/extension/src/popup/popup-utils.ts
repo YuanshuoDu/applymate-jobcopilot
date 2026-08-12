@@ -22,7 +22,15 @@ export function isSavedJobsResponse(value: unknown): value is { jobs: SavedJob[]
   return Array.isArray(response.jobs)
 }
 
-export function isStatsResponse(value: unknown): value is { stats: DashboardStats } {
+export type PopupStats = DashboardStats & { saved?: number }
+
+export function isSavedJob(value: unknown): value is SavedJob {
+  if (!value || typeof value !== 'object') return false
+  const job = value as Partial<SavedJob>
+  return typeof job.id === 'string' && typeof job.company === 'string' && typeof job.role === 'string'
+}
+
+export function isStatsResponse(value: unknown): value is { stats: PopupStats } {
   if (!value || typeof value !== 'object') return false
   const response = value as { stats?: unknown }
   return !!response.stats && typeof response.stats === 'object'
