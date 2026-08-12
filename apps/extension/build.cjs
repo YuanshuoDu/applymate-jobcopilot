@@ -130,7 +130,7 @@ fs.writeFileSync(path.join(DIST, 'popup.html'), `<!DOCTYPE html>
   <title>ApplyMate AI</title>
   <style>
     * { box-sizing: border-box; margin: 0; padding: 0; }
-    body { width: 320px; min-height: 420px; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #f8f9fb; color: #1a1a2e; font-size: 13px; }
+  body { width: 360px; min-width: 360px; min-height: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #f8f8ff; color: #101a3a; font-size: 13px; }
   </style>
 </head>
 <body>

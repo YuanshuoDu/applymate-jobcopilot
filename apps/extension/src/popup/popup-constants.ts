@@ -36,6 +36,7 @@ export type PopupLabels = {
   menuSettings: string
   menuDashboard: string
   menuSignOut: string
+  sidePanelError: string
 }
 
 export const LABELS: Record<string, PopupLabels> = {
@@ -48,7 +49,7 @@ export const LABELS: Record<string, PopupLabels> = {
     readyToAnalyze: 'Ready to analyze this role.', noJobTitle: 'Open a job page to get started',
     noJobSub: 'ApplyMate will identify the role and make the next step clear.',
     browseLinkedIn: 'Browse LinkedIn jobs', browseIndeed: 'Browse Indeed jobs', analyzeError: 'Match analysis failed.',
-    noResume: 'Add a resume in the Sidebar before analyzing.', menuSettings: 'Settings', menuDashboard: 'Open dashboard', menuSignOut: 'Sign out',
+    noResume: 'Add a resume in the Sidebar before analyzing.', menuSettings: 'Settings', menuDashboard: 'Open dashboard', menuSignOut: 'Sign out', sidePanelError: 'Chrome could not open the side panel. Use the Side panel button in the toolbar.',
   },
   zh: {
     detected: '已识别 LinkedIn 职位页面', notDetected: '此页面未识别到职位',
@@ -59,6 +60,6 @@ export const LABELS: Record<string, PopupLabels> = {
     readyToAnalyze: '可以开始分析这个职位。', noJobTitle: '打开职位页面开始使用',
     noJobSub: 'ApplyMate 会识别职位，并告诉你下一步该做什么。',
     browseLinkedIn: '浏览 LinkedIn 职位', browseIndeed: '浏览 Indeed 职位', analyzeError: '匹配分析失败。',
-    noResume: '请先在侧边栏添加简历，再进行分析。', menuSettings: '设置', menuDashboard: '打开控制台', menuSignOut: '退出登录',
+    noResume: '请先在侧边栏添加简历，再进行分析。', menuSettings: '设置', menuDashboard: '打开控制台', menuSignOut: '退出登录', sidePanelError: 'Chrome 无法打开侧边栏，请使用浏览器工具栏中的侧边栏按钮。',
   },
 }

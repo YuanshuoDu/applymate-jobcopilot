@@ -264,6 +264,8 @@ async function handleMessage(
       latestJobDetectedAt = detectedAt
       await setCurrentJob(msg.job)
       setBadge('1', '#4F46E5')
+      // Keep an already-open Popup/Side Panel in sync with the active page.
+      chrome.runtime.sendMessage({ type: 'JOB_SCRAPED', job: msg.job }).catch(() => {})
 
       // Auto-enrich: if we previously saved this job from a list page (no description),
       // patch it now that the user has visited the detail page.
@@ -359,9 +361,6 @@ async function handleMessage(
 // ── Shared: open tracker side panel ──────────────────────
 
 async function openTrackerWindow(): Promise<{ ok: boolean; error?: string }> {
-  const url = chrome.runtime.getURL('sidepanel.html')
-
-  // Method 1: Chrome native sidePanel (best UX, slides out from right)
   try {
     const win = await chrome.windows.getLastFocused()
     if (win.id) {
@@ -369,31 +368,12 @@ async function openTrackerWindow(): Promise<{ ok: boolean; error?: string }> {
       console.log('[ApplyMate] Side panel opened natively')
       return { ok: true }
     }
-  } catch { /* fall through */ }
-
-  // Method 2: Open in a new tab (always works, most reliable)
-  try {
-    await chrome.tabs.create({ url, active: true })
-    console.log('[ApplyMate] Tracker opened in new tab')
-    return { ok: true }
-  } catch { /* fall through */ }
-
-  // Method 3: Popup window fallback (last resort)
-  try {
-    const win = await chrome.windows.getLastFocused()
-    const left = win.left != null && win.width != null ? win.left + win.width - 430 : 1000
-    await chrome.windows.create({
-      url, type: 'popup', width: 430,
-      height: win.height ?? 900, left, top: win.top ?? 0,
-      focused: true,
-    })
-    console.log('[ApplyMate] Tracker opened as popup')
-    return { ok: true }
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err)
-    console.error('[ApplyMate] All open methods failed:', message)
+    console.error('[ApplyMate] Native side panel could not be opened:', message)
     return { ok: false, error: message }
   }
+  return { ok: false, error: 'No focused browser window' }
 }
 
 // ── Tab navigation ────────────────────────────────────────────

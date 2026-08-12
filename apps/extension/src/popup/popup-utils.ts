@@ -32,6 +32,12 @@ export function isSaveResponse(value: unknown): value is { success?: boolean; sa
   return !!value && typeof value === 'object'
 }
 
+export function isCurrentJobResponse(value: unknown): value is { type: 'CURRENT_JOB_RESULT'; job: ScrapedJob | null } {
+  if (!value || typeof value !== 'object') return false
+  const response = value as { type?: unknown; job?: unknown }
+  return response.type === 'CURRENT_JOB_RESULT' && (response.job === null || isScrapedJob(response.job))
+}
+
 export function sourceLabel(source: string): string {
   return source === 'linkedin' ? 'LinkedIn' : source === 'indeed' ? 'Indeed' : source === 'unknown' ? 'Job page' : source[0].toUpperCase() + source.slice(1)
 }
@@ -56,7 +62,8 @@ export function companyInitials(company: string): string {
   return company.trim().split(/\s+/).slice(0, 2).map(word => word[0]).join('').toUpperCase() || 'A'
 }
 
-export function openSidePanel(): void {
-  // Reuse the background fallback chain: native side panel → tab → popup window.
-  void chrome.runtime.sendMessage({ type: 'OPEN_SIDE_PANEL' })
+export function openSidePanel(windowId: number): Promise<void> {
+  // Keep this API call in the Popup click handler. Chrome requires the live
+  // user gesture and rejects a later Service Worker call as a new action.
+  return chrome.sidePanel.open({ windowId })
 }

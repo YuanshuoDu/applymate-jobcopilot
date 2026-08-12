@@ -367,13 +367,7 @@ function LoginView({ settings, L, onLogin }: { settings: ExtensionSettings; L: L
         <div style={{ textAlign: 'center', marginTop: 16, borderTop: `1px solid ${C.border}`, paddingTop: 12 }}>
           <button
             onClick={() => {
-              chrome.windows.getLastFocused().then(win => {
-                if (win?.id) {
-                  chrome.sidePanel.open({ windowId: win.id }).catch(() => {
-                    chrome.tabs.create({ url: chrome.runtime.getURL('sidepanel.html'), active: true })
-                  })
-                }
-              })
+              chrome.sidePanel.open({ windowId: chrome.windows.WINDOW_ID_CURRENT }).catch(() => {})
             }}
             style={{ background: 'transparent', border: 'none', cursor: 'pointer', color: C.subtle, fontSize: 10, padding: '4px 8px', fontFamily: 'inherit' }}
           >
@@ -484,13 +478,7 @@ function MainView({ settings, L, onSettings, onLogout }: {
       {/* Footer */}
       <div style={{ padding: '10px 12px', borderTop: `1px solid ${C.border}`, background: C.bgSecondary, display: 'flex', flexDirection: 'column', gap: 6 }}>
         <Btn onClick={() => {
-          chrome.windows.getLastFocused().then(win => {
-            if (win?.id) {
-              chrome.sidePanel.open({ windowId: win.id }).catch(() => {
-                chrome.tabs.create({ url: chrome.runtime.getURL('sidepanel.html'), active: true })
-              })
-            }
-          })
+          chrome.sidePanel.open({ windowId: chrome.windows.WINDOW_ID_CURRENT }).catch(() => {})
         }}>
           {L.openSidebar}
         </Btn>

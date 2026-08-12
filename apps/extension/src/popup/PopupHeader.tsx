@@ -8,7 +8,7 @@ export function PopupHeader({ user, onSettings, onLogout, onDashboard, labels }:
   return (
     <header style={{ position: 'relative', padding: '16px 16px 14px', display: 'flex', alignItems: 'center', justifyContent: 'space-between', background: C.bg, borderBottom: `1px solid ${C.border}` }}>
       <div style={{ display: 'flex', alignItems: 'center', gap: 11, minWidth: 0 }}>
-        <img src={chrome.runtime.getURL('icons/icon128.png')} alt="ApplyMate AI" style={{ width: 48, height: 48, borderRadius: 14, boxShadow: '0 6px 14px rgba(81,70,229,0.20)' }} />
+        <div role="img" aria-label="ApplyMate AI" style={{ width: 48, height: 48, display: 'grid', placeItems: 'center', borderRadius: 14, background: 'linear-gradient(135deg, #5146E5 0%, #7038D8 100%)', color: '#fff', fontSize: 22, fontWeight: 800, boxShadow: '0 6px 14px rgba(81,70,229,0.20)' }}>A</div>
         <div style={{ minWidth: 0 }}>
           <div style={{ fontSize: 19, lineHeight: 1.1, fontWeight: 750, color: C.navy, letterSpacing: '-0.03em' }}>ApplyMate AI</div>
           <div style={{ marginTop: 5, fontSize: 12, color: C.muted, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis', maxWidth: 155 }}>Your AI job copilot</div>
