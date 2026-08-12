@@ -119,3 +119,42 @@ The overview and job-card score regions were compared separately because the rin
 ### Final result
 
 passed
+
+## Side panel visual refinement QA — Jobs + Form Fill
+
+### Evidence
+
+- Reference 1: `C:\Users\Steven.du\.codex\attachments\110345ab-0931-45b9-a27a-19a546634351\image-1.png`
+- Reference 2: `C:\Users\Steven.du\.codex\attachments\110345ab-0931-45b9-a27a-19a546634351\image-2.png`
+- Implementation source: `apps/extension/src/sidepanel/FormFillerView.tsx`, `apps/extension/src/sidepanel/sidepanel.css`
+- Browser captures: local side-panel runtime preview at 320 × 568 and 390 × 844 CSS pixels
+
+### Findings
+
+- No actionable P0/P1/P2 findings remain for the refined surfaces.
+- Form Fill now shares the Jobs design tokens: pale lavender page surface, white bordered cards, indigo primary actions, green success states, amber manual-review states, and restrained muted copy.
+- The old Form Fill inline palette, emoji status icons, and oversized empty-state rhythm were removed in favor of Lucide icons, compact context headers, explicit status badges, and consistent action hierarchy.
+- The panel body keeps each mounted tab isolated, while Form Fill owns its own vertical scroll so review, upload, Persona-save, and next-step content remain reachable on narrow side panels.
+- At 320px width, the refined Form Fill state has no horizontal overflow and its action/context cards stay within the viewport.
+
+### Required fidelity surfaces
+
+| Surface | Result | Evidence |
+| --- | --- | --- |
+| Fonts and typography | Pass | Form Fill headings, eyebrow labels, field copy, badges, and buttons inherit the same compact system stack as Jobs. |
+| Spacing and layout rhythm | Pass | Idle, error, analysis, review, applying, and done states use shared card/action rhythm; narrow viewport check passed. |
+| Colors and visual tokens | Pass | `--am-primary`, `--am-page`, `--am-panel`, `--am-line`, `--am-green`, `--am-amber`, and `--am-red` are shared across the side panel. |
+| Image and asset fidelity | Pass | UI icons use the existing `lucide-react` library; no emoji or custom-drawn replacement assets remain in Form Fill states. |
+| Copy and content | Pass | Existing scan, retry, AI revise, apply-all, upload, Persona-save, and next-step actions remain wired; only presentation copy was tightened. |
+
+### Verification
+
+- `pnpm --filter @jobcopilot/extension typecheck` — passed.
+- `pnpm --filter @jobcopilot/extension test` — 4 files, 10 tests passed.
+- `pnpm --filter @jobcopilot/extension build` — passed; side-panel CSS is emitted and linked by the extension build.
+- Browser: populated Jobs state, Form Fill idle state, Form Fill scan-error state, tab switching, and 320px horizontal-overflow check were inspected.
+- Limitation: live content-script scanning, AI analysis, and page injection still require a real Chrome extension tab; the local preview intentionally exercises the visual states and the unavailable-page error path without sending user data.
+
+### Final result
+
+passed with runtime-extension verification noted above

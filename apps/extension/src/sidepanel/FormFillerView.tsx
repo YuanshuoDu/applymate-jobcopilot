@@ -2,25 +2,27 @@
  * FormFillerView — Sidepanel tab for reviewing & applying AI-generated form answers.
  */
 import { useState, useEffect, useCallback, useRef } from 'react'
+import type { LucideIcon } from 'lucide-react'
+import {
+  AlertTriangle,
+  ArrowRight,
+  CheckCircle2,
+  FilePenLine,
+  FileText,
+  LockKeyhole,
+  RefreshCw,
+  ScanSearch,
+  ShieldCheck,
+  Sparkles,
+  Upload,
+  UserRound,
+  WandSparkles,
+} from 'lucide-react'
 import { getSettings, saveSettings } from '@/lib/storage'
 import { getPersona, analyzeForm, reviseFormFields, getPersonaFields, savePersonaFields } from '@/lib/api'
 import type { ExtensionSettings } from '@/lib/types'
 import type { FormFieldSchema, FilledField, FormFillResponse } from '@/lib/form-filler/types'
 import type { PersonaField } from '@/lib/api'
-
-const C = {
-  primary:  '#4F46E5',
-  green:    '#3B6D11',
-  red:      '#A32D2D',
-  amber:    '#854F0B',
-  teal:     '#0E7490',
-  bg:       '#f0f4f8',
-  card:     '#ffffff',
-  border:   '#e2e8f0',
-  text:     '#0f172a',
-  muted:    '#64748b',
-  subtle:   '#94a3b8',
-}
 
 type ViewState = 'idle' | 'scanning' | 'aiThinking' | 'review' | 'applying' | 'done' | 'error'
 type AnalysisPhase = 'fetchingPersona' | 'preparingPrompt' | 'waitingForAI' | 'processingResult'
@@ -780,8 +782,8 @@ export function FormFillerView({ settings, pendingFields, onFieldsConsumed, scan
 
   const confidenceBadge = (conf: number) => {
     const pct = Math.round(conf * 100)
-    const color = pct >= 80 ? C.green : pct >= 50 ? C.amber : C.red
-    return { pct, color }
+    const tone = pct >= 80 ? 'high' : pct >= 50 ? 'medium' : 'low'
+    return { pct, tone }
   }
 
   // ── Render States ──────────────────────────────────────────
@@ -789,31 +791,35 @@ export function FormFillerView({ settings, pendingFields, onFieldsConsumed, scan
   if (viewState === 'idle' || viewState === 'scanning') {
     const scanning = viewState === 'scanning'
     return (
-      <div style={{ padding: 16 }}>
-        <div style={{ textAlign: 'center', padding: '40px 20px' }}>
-          <div style={{ fontSize: 40, marginBottom: 12 }}>&#128269;</div>
-          <div style={{ fontSize: 14, fontWeight: 600, color: C.text, marginBottom: 4 }}>
-            {scanning ? 'Scanning Page...' : 'Form Auto-Fill'}
+      <div className="am-form-view am-form-idle">
+        <div className="am-form-context">
+          <div className="am-form-context-icon"><FileText size={16} strokeWidth={2.2} /></div>
+          <div className="am-form-context-copy">
+            <span className="am-form-eyebrow">APPLICATION FORM</span>
+            <strong>Form auto-fill</strong>
           </div>
-          <div style={{ fontSize: 12, color: C.muted, marginBottom: 20 }}>
+          <span className="am-form-context-status">Ready</span>
+        </div>
+
+        <div className="am-form-hero">
+          <div className="am-form-hero-icon"><ScanSearch size={23} strokeWidth={1.8} /></div>
+          <h2>{scanning ? 'Scanning this page' : 'Ready to scan this page'}</h2>
+          <p>
             {scanning
-              ? 'Scanning the current page for form fields...'
-              : 'Navigate to any job application page, then click below to scan for form fields.'}
-          </div>
-          <button
-            onClick={handleScanPage}
-            disabled={scanning}
-            style={{
-              ...btnStyle(C.primary),
-              fontSize: 13, padding: '10px 24px',
-              opacity: scanning ? 0.6 : 1,
-            }}
-          >
-            {scanning ? 'Scanning...' : 'Scan Current Page for Form'}
+              ? 'Looking for fields on the current application page.'
+              : 'Find application fields and prepare answers from your ApplyMate profile.'}
+          </p>
+          <button className="am-form-button primary" onClick={handleScanPage} disabled={scanning}>
+            <ScanSearch size={15} />
+            {scanning ? 'Scanning page' : 'Scan current page'}
+            {!scanning && <ArrowRight size={14} />}
           </button>
-          <div style={{ fontSize: 10, color: C.subtle, marginTop: 12 }}>
-            Works on any company career site, Greenhouse, Lever, Workday, and more.
-          </div>
+          <span className="am-form-helper">Works with company career sites, Greenhouse, Lever, Workday, and more.</span>
+        </div>
+
+        <div className="am-form-info-strip">
+          <ShieldCheck size={15} />
+          <span>Your profile stays private and is only used to fill this application.</span>
         </div>
       </div>
     )
@@ -826,31 +832,28 @@ export function FormFillerView({ settings, pendingFields, onFieldsConsumed, scan
 
   if (viewState === 'error') {
     const isPermission = !!injectPermissionHost
+    const StateIcon = isPermission ? LockKeyhole : AlertTriangle
     return (
-      <div style={{ padding: 16 }}>
-        <div style={{ textAlign: 'center', padding: 40 }}>
-          <div style={{ fontSize: 40, marginBottom: 12 }}>{isPermission ? '🔒' : '❌'}</div>
-          <div style={{ fontSize: 14, fontWeight: 600, color: isPermission ? C.amber : C.red }}>
-            {isPermission ? 'Permission Required' : 'Error'}
-          </div>
-          <div style={{ fontSize: 12, color: C.muted, marginTop: 4, lineHeight: 1.6, whiteSpace: 'pre-wrap' }}>
-            {errorMsg}
-          </div>
-          <div style={{ display: 'flex', gap: 8, justifyContent: 'center', marginTop: 16 }}>
+      <div className="am-form-view">
+        <div className={`am-form-state ${isPermission ? 'warning' : 'error'}`}>
+          <div className="am-form-state-icon"><StateIcon size={22} /></div>
+          <span className="am-form-eyebrow">FORM AUTO-FILL</span>
+          <h2>{isPermission ? 'Permission required' : 'We could not scan this page'}</h2>
+          <p>{errorMsg}</p>
+          <div className="am-form-actions">
             {isPermission ? (
               <>
-                <button onClick={handleRequestPermission} style={btnStyle(C.green)}>
+                <button className="am-form-button primary" onClick={handleRequestPermission}>
+                  <LockKeyhole size={14} />
                   Grant Permission
                 </button>
-                <button onClick={() => { setInjectPermissionHost(null); setViewState('idle') }} style={{
-                  background: 'transparent', color: C.muted, border: `1px solid ${C.border}`,
-                  borderRadius: 6, padding: '8px 14px', fontSize: 12, fontWeight: 600, cursor: 'pointer',
-                }}>
+                <button className="am-form-button ghost" onClick={() => { setInjectPermissionHost(null); setViewState('idle') }}>
                   Cancel
                 </button>
               </>
             ) : (
-              <button onClick={() => fields.length > 0 ? analyzeFields(fields) : handleScanPage()} style={btnStyle(C.primary)}>
+              <button className="am-form-button primary" onClick={() => fields.length > 0 ? analyzeFields(fields) : handleScanPage()}>
+                <RefreshCw size={14} />
                 Retry
               </button>
             )}
@@ -861,25 +864,20 @@ export function FormFillerView({ settings, pendingFields, onFieldsConsumed, scan
   }
 
   if (viewState === 'applying') {
+    const fillableCount = filledFields.filter(f => !f.skip).length
+    const progress = fillableCount > 0 ? (appliedCount / fillableCount) * 100 : 0
     return (
-      <div style={{ padding: 16 }}>
-        <div style={{ textAlign: 'center', padding: 40, color: C.muted }}>
-          <div style={{ fontSize: 32, marginBottom: 12 }}>&#128221;</div>
-          <div style={{ fontSize: 14, fontWeight: 600 }}>Filling Form...</div>
-          <div style={{ fontSize: 12, marginTop: 4, color: C.primary }}>
-            {appliedCount} / {filledFields.filter(f => !f.skip).length} fields
-          </div>
-          <div style={{
-            width: '100%', height: 4, background: C.border, borderRadius: 2,
-            marginTop: 12, overflow: 'hidden',
-          }}>
-            <div style={{
-              height: '100%', background: C.green, borderRadius: 2,
-              width: `${filledFields.filter(f => !f.skip).length > 0
-                ? (appliedCount / filledFields.filter(f => !f.skip).length) * 100 : 0}%`,
-              transition: 'width 0.3s ease',
-            }} />
-          </div>
+      <div className="am-form-view am-form-centered">
+        <div className="am-form-state-icon primary"><FilePenLine size={22} className="am-form-icon-pulse" /></div>
+        <span className="am-form-eyebrow">APPLYMATE IS WORKING</span>
+        <h2>Filling your form</h2>
+        <p className="am-form-state-copy">Applying reviewed answers to the current page.</p>
+        <div className="am-form-progress" aria-label={`Filled ${appliedCount} of ${fillableCount} fields`}>
+          <span style={{ width: `${progress}%` }} />
+        </div>
+        <div className="am-form-progress-meta">
+          <strong>{appliedCount} / {fillableCount} fields</strong>
+          <span>{Math.round(progress)}%</span>
         </div>
       </div>
     )
@@ -889,26 +887,27 @@ export function FormFillerView({ settings, pendingFields, onFieldsConsumed, scan
     const uploadFields = fields.filter(field => field.type === 'file')
     const failedFields = fields.filter(field => failedFieldIds.includes(field.id))
     return (
-      <div style={{ padding: 16 }}>
-        <div style={{ textAlign: 'center', padding: '24px 0' }}>
-          <div style={{ fontSize: 40, marginBottom: 8 }}>&#9989;</div>
-          <div style={{ fontSize: 14, fontWeight: 600, color: C.green }}>Form Filled!</div>
-          <div style={{ fontSize: 12, color: C.muted, marginTop: 4 }}>
+      <div className="am-form-view am-form-done">
+        <div className="am-form-success">
+          <div className="am-form-success-icon"><CheckCircle2 size={25} /></div>
+          <span className="am-form-eyebrow">FORM AUTO-FILL</span>
+          <h2>Form filled</h2>
+          <p>
             {failedFields.length
               ? `${appliedCount} fields filled — ${failedFields.length} still need your review.`
               : `${appliedCount} fields filled — review and submit manually.`}
-          </div>
+          </p>
         </div>
 
         {failedFields.length > 0 && (
-          <div style={{ background: '#FFF8E8', border: `1px solid ${C.amber}45`, borderRadius: 10, padding: 12, marginBottom: 12 }}>
-            <div style={{ fontSize: 12, fontWeight: 700, color: C.amber, marginBottom: 4 }}>Review these fields manually</div>
-            <div style={{ fontSize: 10, color: C.muted, lineHeight: 1.5 }}>
+          <div className="am-form-callout warning">
+            <div className="am-form-callout-title"><AlertTriangle size={14} /> Review these fields manually</div>
+            <p>
               Workday custom dropdowns can require a manual selection. Your other answers have already been filled and remain on the form.
-            </div>
-            <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, marginTop: 9 }}>
+            </p>
+            <div className="am-form-chip-list">
               {failedFields.map(field => (
-                <span key={field.id} style={{ fontSize: 10, color: C.text, background: C.card, border: `1px solid ${C.border}`, borderRadius: 999, padding: '4px 7px' }}>
+                <span key={field.id} className="am-form-chip">
                   {field.label || 'Unmatched field'}
                 </span>
               ))}
@@ -917,18 +916,18 @@ export function FormFillerView({ settings, pendingFields, onFieldsConsumed, scan
         )}
 
         {uploadFields.length > 0 && (
-          <div style={{ background: C.card, border: `1px solid ${C.primary}35`, borderRadius: 10, padding: 12, marginBottom: 12 }}>
-            <div style={{ fontSize: 12, fontWeight: 700, color: C.text, marginBottom: 4 }}>Attach reviewed documents</div>
-            <div style={{ fontSize: 10, color: C.muted, lineHeight: 1.5, marginBottom: 10 }}>
+          <div className="am-form-card am-form-upload">
+            <div className="am-form-card-title"><Upload size={14} /> Attach reviewed documents</div>
+            <p>
               Choose your audited resume or cover-letter PDF in Chrome&apos;s file picker. ApplyMate cannot select local files for you.
-            </div>
+            </p>
             {uploadFields.map(field => (
-              <div key={field.id} style={{ display: 'flex', alignItems: 'center', gap: 8, marginTop: 8 }}>
-                <span style={{ flex: 1, fontSize: 11, color: C.text }}>{field.label || 'Document upload'}{field.required ? ' *' : ''}</span>
+              <div key={field.id} className="am-form-upload-row">
+                <span>{field.label || 'Document upload'}{field.required ? ' *' : ''}</span>
                 {uploadedFiles[field.id] ? (
-                  <span style={{ fontSize: 10, color: C.green, maxWidth: 120, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>✓ {uploadedFiles[field.id]}</span>
+                  <span className="am-form-uploaded"><CheckCircle2 size={12} /> {uploadedFiles[field.id]}</span>
                 ) : (
-                  <button onClick={() => handleUpload(field.id)} style={{ ...btnStyle(C.primary), fontSize: 10, padding: '6px 9px' }}>Choose file</button>
+                  <button className="am-form-button small primary" onClick={() => handleUpload(field.id)}><Upload size={12} /> Choose file</button>
                 )}
               </div>
             ))}
@@ -937,58 +936,50 @@ export function FormFillerView({ settings, pendingFields, onFieldsConsumed, scan
 
         {/* Persona Save Prompt */}
         {personaMatches.length > 0 && (
-          <div style={{
-            background: C.card, border: `1px solid ${C.green}40`, borderRadius: 10,
-            padding: 12, marginBottom: 12,
-          }}>
-            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 2 }}>
-              <span style={{ fontSize: 12, fontWeight: 600, color: C.text }}>Save to Persona?</span>
+          <div className="am-form-card am-form-persona">
+            <div className="am-form-card-head">
+              <div className="am-form-card-title"><UserRound size={14} /> Save updates to your profile?</div>
               <button
                 onClick={handleRefreshPersona}
                 disabled={savingPersona}
                 title="Re-read form values from the page and compare with saved persona"
-                style={{
-                  ...btnStyleGhost(), fontSize: 10, padding: '3px 8px',
-                  opacity: savingPersona ? 0.5 : 1,
-                }}
+                className="am-form-icon-button"
               >
-                🔄 Refresh
+                <RefreshCw size={12} className={savingPersona ? 'am-form-icon-pulse' : undefined} />
+                Refresh
               </button>
             </div>
-            <div style={{ fontSize: 10, color: C.muted, marginBottom: 10 }}>
+            <p>
               {personaMatches.filter(m => !m.existingValue).length} new, {personaMatches.filter(m => m.existingValue).length} updated — edit on page, then refresh
-            </div>
-            <div style={{ maxHeight: 160, overflowY: 'auto', marginBottom: 10 }}>
+            </p>
+            <div className="am-form-persona-list">
               {personaMatches.map(m => (
-                <div key={m.personaKey} style={{
-                  display: 'flex', alignItems: 'center', gap: 8,
-                  padding: '5px 0', borderBottom: `1px solid ${C.border}`,
-                  fontSize: 10,
-                }}>
-                  <div style={{ flex: 1, minWidth: 0 }}>
-                    <div style={{ fontWeight: 600, color: C.text, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                <div key={m.personaKey} className="am-form-persona-row">
+                  <div>
+                    <strong>
                       {m.label}
-                    </div>
-                    <div style={{ color: C.green, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                    </strong>
+                    <span className="am-form-persona-value">
                       {m.value}
-                    </div>
+                    </span>
                     {m.existingValue && (
-                      <div style={{ color: C.subtle, textDecoration: 'line-through', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                      <small>
                         was: {m.existingValue}
-                      </div>
+                      </small>
                     )}
                   </div>
-                  <span style={{ fontSize: 9, color: m.existingValue ? C.amber : C.green, fontWeight: 600, flexShrink: 0 }}>
+                  <span className={`am-form-badge ${m.existingValue ? 'warning' : 'success'}`}>
                     {m.existingValue ? 'UPDATE' : 'NEW'}
                   </span>
                 </div>
               ))}
             </div>
-            <div style={{ display: 'flex', gap: 8 }}>
-              <button onClick={handleSavePersonaMatches} disabled={savingPersona} style={{ ...btnStyle(C.green), flex: 1 }}>
+            <div className="am-form-actions stretch">
+              <button className="am-form-button primary" onClick={handleSavePersonaMatches} disabled={savingPersona}>
+                <CheckCircle2 size={14} />
                 {savingPersona ? 'Saving...' : 'Save to Persona'}
               </button>
-              <button onClick={() => setPersonaMatches([])} style={btnStyleGhost()}>
+              <button className="am-form-button ghost" onClick={() => setPersonaMatches([])}>
                 Dismiss
               </button>
             </div>
@@ -996,12 +987,13 @@ export function FormFillerView({ settings, pendingFields, onFieldsConsumed, scan
         )}
 
         {/* Next Step */}
-        <div style={{ textAlign: 'center', borderTop: `1px solid ${C.border}`, paddingTop: 14 }}>
-          <div style={{ fontSize: 12, color: C.muted, marginBottom: 10 }}>
-            Multi-step application? Go to the next page and scan again.
+        <div className="am-form-next">
+          <div>
+            <strong>Continue to the next step?</strong>
+            <span>Open the next page and scan again.</span>
           </div>
-          <button onClick={handleScanPage} style={btnStyle(C.primary)}>
-            Scan Next Step
+          <button className="am-form-button ghost" onClick={handleScanPage}>
+            Scan next step <ArrowRight size={13} />
           </button>
         </div>
       </div>
@@ -1011,74 +1003,53 @@ export function FormFillerView({ settings, pendingFields, onFieldsConsumed, scan
   // ── Main Review View ───────────────────────────────────────
 
   return (
-    <div style={{ padding: '16px', paddingBottom: 16 }}>
-      {/* Header */}
-      <div style={{ marginBottom: 12 }}>
-        <div style={{ fontSize: 14, fontWeight: 700, color: C.text, marginBottom: 2 }}>
-          Form Fields ({fields.length})
+    <div className="am-form-view am-form-review">
+      <div className="am-form-review-head">
+        <div>
+          <span className="am-form-eyebrow">REVIEW ANSWERS</span>
+          <h2>Form fields <span>({fields.length})</span></h2>
+          <p className="am-form-review-meta">
+            {filledFields.filter(f => f.confidence === 1.0 && f.reasoning?.includes('already filled')).length} pre-filled ·{' '}
+            {filledFields.filter(f => f.reasoning?.includes('Matched from persona')).length} profile matched ·{' '}
+            {filledFields.filter(f => !(f.confidence === 1.0 && f.reasoning?.includes('already filled')) && !f.reasoning?.includes('Matched from persona') && !f.skip).length} AI suggested
+          </p>
         </div>
-        <div style={{ fontSize: 11, color: C.muted }}>
-          {filledFields.filter(f => f.confidence === 1.0 && f.reasoning?.includes('already filled')).length} pre-filled,{' '}
-          {filledFields.filter(f => f.reasoning?.includes('Matched from persona')).length} persona-matched,{' '}
-          {filledFields.filter(f => !(f.confidence === 1.0 && f.reasoning?.includes('already filled')) && !f.reasoning?.includes('Matched from persona') && !f.skip).length} AI-suggested
-        </div>
+        <div className="am-form-review-icon"><FileText size={18} /></div>
       </div>
 
-      {/* Apply All Button */}
-      <button
-        onClick={handleApplyAll}
-        style={{
-          ...btnStyle(C.green), width: '100%', marginBottom: 12,
-          fontSize: 14, fontWeight: 700, padding: '10px 16px',
-        }}
-      >
-        Apply All to Form
+      <div className="am-form-summary">
+        <span><strong>{filledFields.filter(f => f.confidence === 1.0 && f.reasoning?.includes('already filled')).length}</strong> Pre-filled</span>
+        <span><strong>{filledFields.filter(f => f.reasoning?.includes('Matched from persona')).length}</strong> Profile matched</span>
+        <span><strong>{filledFields.filter(f => !(f.confidence === 1.0 && f.reasoning?.includes('already filled')) && !f.reasoning?.includes('Matched from persona') && !f.skip).length}</strong> AI suggested</span>
+      </div>
+
+      <button className="am-form-button primary am-form-apply-all" onClick={handleApplyAll}>
+        <WandSparkles size={16} />
+        Apply all to form
+        <ArrowRight size={14} />
       </button>
 
-      {/* Field List */}
-      <div style={{ maxHeight: '50vh', overflowY: 'auto', marginBottom: 12 }}>
+      <div className="am-form-field-list">
         {filledFields.map(f => {
           const fieldSchema = fields.find(s => s.id === f.fieldId)
           if (f.skip) return null
 
-          const { pct, color } = confidenceBadge(f.confidence)
-
+          const { pct, tone } = confidenceBadge(f.confidence)
           return (
-            <div
-              key={f.fieldId}
-              style={{
-                background: C.card, border: `1px solid ${C.border}`,
-                borderRadius: 8, padding: 10, marginBottom: 8,
-              }}
-            >
-              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 4 }}>
-                <span style={{ fontSize: 12, fontWeight: 600, color: C.text }}>
+            <div key={f.fieldId} className={`am-form-field-card ${tone}`}>
+              <div className="am-form-field-head">
+                <span className="am-form-field-label">
                   {fieldSchema?.label ?? f.fieldId}
-                  {fieldSchema?.required && <span style={{ color: C.red, marginLeft: 2 }}>*</span>}
+                  {fieldSchema?.required && <em>*</em>}
                 </span>
-                <div style={{ display: 'flex', gap: 4, alignItems: 'center' }}>
+                <div className="am-form-field-badges">
                   {f.confidence === 1.0 && f.reasoning?.includes('already filled') && f.value?.trim() && (
-                    <span style={{
-                      fontSize: 9, fontWeight: 600, color: C.primary,
-                      background: `${C.primary}12`, padding: '2px 6px', borderRadius: 10,
-                    }}>
-                      PRE-FILLED
-                    </span>
+                    <span className="am-form-badge primary">PRE-FILLED</span>
                   )}
                   {f.reasoning?.includes('Matched from persona') && (
-                    <span style={{
-                      fontSize: 9, fontWeight: 600, color: C.teal,
-                      background: `${C.teal}12`, padding: '2px 6px', borderRadius: 10,
-                    }}>
-                      PERSONA
-                    </span>
+                    <span className="am-form-badge teal">PROFILE</span>
                   )}
-                  <span style={{
-                    fontSize: 10, fontWeight: 600, color,
-                    background: `${color}15`, padding: '2px 6px', borderRadius: 10,
-                  }}>
-                    {pct}%
-                  </span>
+                  <span className={`am-form-badge ${tone}`}>{pct}%</span>
                 </div>
               </div>
 
@@ -1086,29 +1057,22 @@ export function FormFillerView({ settings, pendingFields, onFieldsConsumed, scan
                 value={f.value}
                 onChange={e => handleFieldEdit(f.fieldId, e.target.value)}
                 rows={2}
-                style={{
-                  width: '100%', border: `1px solid ${C.border}`, borderRadius: 4,
-                  padding: 6, fontSize: 12, fontFamily: 'inherit',
-                  resize: 'vertical', color: C.text,
-                  boxSizing: 'border-box',
-                }}
+                className="am-form-input am-form-textarea"
               />
 
               {f.reasoning && (
-                <div style={{ fontSize: 10, color: C.muted, marginTop: 2, fontStyle: 'italic' }}>
+                <div className="am-form-reasoning">
+                  <Sparkles size={11} />
                   {f.reasoning}
                 </div>
               )}
 
               {fieldSchema?.type === 'select' && fieldSchema?.options && (
-                <div style={{ marginTop: 4 }}>
+                <div className="am-form-select-wrap">
                   <select
                     value={f.value}
                     onChange={e => handleFieldEdit(f.fieldId, e.target.value)}
-                    style={{
-                      width: '100%', border: `1px solid ${C.border}`,
-                      borderRadius: 4, padding: 4, fontSize: 11, color: C.text,
-                    }}
+                    className="am-form-input am-form-select"
                   >
                     <option value="">-- Select --</option>
                     {fieldSchema.options.map(o => (
@@ -1122,53 +1086,34 @@ export function FormFillerView({ settings, pendingFields, onFieldsConsumed, scan
         })}
       </div>
 
-      {/* Revise Panel */}
-      <div style={{
-        border: `1px solid ${C.border}`, borderRadius: 8, padding: 10,
-        background: C.bg, marginBottom: 10,
-      }}>
-        <div style={{ fontSize: 11, fontWeight: 600, color: C.text, marginBottom: 6 }}>
-          AI Revise with Natural Language
-        </div>
-        <div style={{ display: 'flex', gap: 6 }}>
+      <div className="am-form-revise">
+        <div className="am-form-card-title"><Sparkles size={14} /> Revise with natural language</div>
+        <div className="am-form-revise-row">
           <input
             type="text"
             value={reviseInstruction}
             onChange={e => setReviseInstruction(e.target.value)}
-            placeholder="e.g., make answers more concise, emphasize leadership..."
-            style={{
-              flex: 1, border: `1px solid ${C.border}`, borderRadius: 4,
-              padding: '6px 8px', fontSize: 11, color: C.text,
-            }}
+            placeholder="e.g. make answers more concise..."
+            className="am-form-input"
             onKeyDown={e => e.key === 'Enter' && handleRevise()}
           />
           <button
             onClick={handleRevise}
             disabled={revising || !reviseInstruction.trim()}
-            style={{
-              ...btnStyle(C.primary), fontSize: 11, padding: '6px 12px',
-              opacity: revising ? 0.6 : 1,
-            }}
+            className="am-form-button primary small"
           >
-            {revising ? '...' : 'Revise'}
+            {revising ? 'Working...' : 'Revise'}
           </button>
         </div>
       </div>
 
-      {/* Re-scan for multi-step forms */}
-      <div style={{
-        border: `1px dashed ${C.border}`, borderRadius: 8, padding: 10,
-        background: 'transparent', textAlign: 'center',
-      }}>
-        <div style={{ fontSize: 10, color: C.subtle, marginBottom: 6 }}>
-          Multi-step form? Go to next page →
+      <div className="am-form-next">
+        <div>
+          <strong>Multi-step form?</strong>
+          <span>Go to the next page and scan again.</span>
         </div>
-        <button onClick={handleScanPage} style={{
-          background: 'transparent', color: C.primary, border: `1px solid ${C.primary}30`,
-          borderRadius: 6, padding: '6px 14px', fontSize: 11,
-          fontWeight: 600, cursor: 'pointer',
-        }}>
-          &#128269; Scan New Step
+        <button className="am-form-button ghost" onClick={handleScanPage}>
+          <ScanSearch size={13} /> Scan new step
         </button>
       </div>
     </div>
@@ -1177,11 +1122,11 @@ export function FormFillerView({ settings, pendingFields, onFieldsConsumed, scan
 
 // ── AI Analysis Progress View ─────────────────────────────────
 
-const PHASE_INFO: Record<AnalysisPhase, { icon: string; label: string; subLabel: (n: number) => string; pct: number }> = {
-  fetchingPersona:  { icon: '👤', label: 'Fetching your profile...',      subLabel: () => 'Loading resume, preferences & contact info', pct: 15 },
-  preparingPrompt:  { icon: '📝', label: 'Preparing AI prompt...',        subLabel: (n) => `Formatting ${n} fields for AI analysis`,    pct: 30 },
-  waitingForAI:     { icon: '⚡', label: 'AI is analyzing your form...',  subLabel: (n) => `Generating answers for ${n} fields`,         pct: 70 },
-  processingResult: { icon: '🔍', label: 'Processing results...',          subLabel: () => 'Parsing and validating AI responses',        pct: 95 },
+const PHASE_INFO: Record<AnalysisPhase, { icon: LucideIcon; label: string; subLabel: (n: number) => string; pct: number }> = {
+  fetchingPersona:  { icon: UserRound, label: 'Fetching your profile...',      subLabel: () => 'Loading resume, preferences and contact info', pct: 15 },
+  preparingPrompt:  { icon: FileText, label: 'Preparing AI prompt...',          subLabel: n => `Formatting ${n} fields for analysis`,          pct: 30 },
+  waitingForAI:     { icon: Sparkles, label: 'AI is analyzing your form...',     subLabel: n => `Generating answers for ${n} fields`,         pct: 70 },
+  processingResult: { icon: ShieldCheck, label: 'Processing results...',         subLabel: () => 'Parsing and validating AI responses',          pct: 95 },
 }
 
 function AnalysisProgressView({ phase, totalFields, aiFieldCount, elapsed }: { phase: AnalysisPhase; totalFields: number; aiFieldCount: number; elapsed: number }) {
@@ -1190,164 +1135,74 @@ function AnalysisProgressView({ phase, totalFields, aiFieldCount, elapsed }: { p
   // Rough estimate: ~3s per AI field (MiniMax M3 average)
   const estSeconds = Math.max(10, Math.min(180, aiFieldCount * 3))
   const estStr = estSeconds < 60 ? `~${estSeconds}s` : `~${Math.round(estSeconds / 60)}min`
+  const phases = ['fetchingPersona', 'preparingPrompt', 'waitingForAI', 'processingResult'] as AnalysisPhase[]
+  const phaseIndex = phases.indexOf(phase)
 
   return (
-    <div style={{ padding: '16px', display: 'flex', flexDirection: 'column', height: '100%' }}>
-      {/* Header */}
-      <div style={{ textAlign: 'center', marginBottom: 0, flex: '0 0 auto' }}>
-        <div style={{ fontSize: 42, marginBottom: 12, display: 'flex', justifyContent: 'center', gap: 12 }}>
-          {(['fetchingPersona', 'preparingPrompt', 'waitingForAI', 'processingResult'] as AnalysisPhase[]).map((p, i) => {
-            const isDone = (['fetchingPersona', 'preparingPrompt', 'waitingForAI', 'processingResult'].indexOf(phase)) >= i
-            const isCurrent = phase === p
+    <div className="am-form-view am-form-analysis">
+      <div className="am-form-context">
+        <div className="am-form-context-icon"><Sparkles size={16} strokeWidth={2.2} /></div>
+        <div className="am-form-context-copy">
+          <span className="am-form-eyebrow">APPLICATION FORM</span>
+          <strong>Preparing your answers</strong>
+        </div>
+        <span className="am-form-context-status active">In progress</span>
+      </div>
+
+      <div className="am-form-analysis-head">
+        <div className="am-form-analysis-icon"><Sparkles size={22} className="am-form-icon-pulse" /></div>
+        <span className="am-form-eyebrow">AI ANALYSIS</span>
+        <h2>{info.label}</h2>
+        <p>{info.subLabel(aiFieldCount)}</p>
+      </div>
+
+      <div className="am-form-progress-wrap">
+        <div className="am-form-progress"><span style={{ width: `${info.pct}%` }} /></div>
+        <div className="am-form-progress-meta">
+          <span>Phase {phaseIndex + 1} of {phases.length}</span>
+          <strong>{info.pct}%</strong>
+          <span>Elapsed {elapsedStr}</span>
+        </div>
+      </div>
+
+      <div className="am-form-analysis-card">
+        <div className="am-form-card-head">
+          <div className="am-form-card-title"><FileText size={14} /> Field summary</div>
+          <span className="am-form-estimate">Estimated {estStr}</span>
+        </div>
+        <div className="am-form-analysis-stats">
+          <span><strong>{totalFields}</strong> fields total</span>
+          {totalFields - aiFieldCount > 0 && (
+            <span className="am-form-badge primary">{totalFields - aiFieldCount} pre-filled</span>
+          )}
+          <span className="am-form-badge neutral">{aiFieldCount} need AI</span>
+        </div>
+        <div className="am-form-phase-list">
+          {phases.map((p, index) => {
+            const PhaseIcon = PHASE_INFO[p].icon
+            const state = index < phaseIndex ? 'done' : index === phaseIndex ? 'current' : ''
             return (
-              <span key={p} style={{
-                opacity: isDone ? 1 : 0.25,
-                fontSize: isCurrent ? 36 : 28,
-                transition: 'all 0.4s ease',
-                transform: isCurrent ? 'scale(1.15)' : 'scale(1)',
-              }}>
-                {PHASE_INFO[p].icon}
-              </span>
+              <div key={p} className={`am-form-phase ${state}`}>
+                <span className="am-form-phase-icon">
+                  {index < phaseIndex ? <CheckCircle2 size={13} /> : <PhaseIcon size={13} />}
+                </span>
+                <span>{PHASE_INFO[p].label.replace('...', '')}</span>
+                {index === phaseIndex && <span className="am-form-phase-dot" />}
+              </div>
             )
           })}
         </div>
-        <div style={{ fontSize: 15, fontWeight: 700, color: C.text, marginBottom: 4 }}>
-          {info.label}
-        </div>
-        <div style={{ fontSize: 11, color: C.muted, marginBottom: 12 }}>
-          {info.subLabel(aiFieldCount)}
-        </div>
       </div>
 
-      {/* Progress Bar */}
-      <div style={{ flex: '0 0 auto', padding: '0 8px', marginBottom: 16 }}>
-        <div style={{
-          width: '100%', height: 8, background: C.border, borderRadius: 4, overflow: 'hidden',
-          position: 'relative',
-        }}>
-          {/* Determinate fill based on phase */}
-          <div style={{
-            height: '100%',
-            background: `linear-gradient(90deg, ${C.primary}, ${C.green})`,
-            borderRadius: 4,
-            width: `${info.pct}%`,
-            transition: 'width 0.6s ease',
-            position: 'absolute', top: 0, left: 0,
-          }} />
-          {/* Animated shimmer on the progress bar */}
-          <div style={{
-            position: 'absolute', top: 0, left: 0, height: '100%', width: '100%',
-            background: 'linear-gradient(90deg, transparent 0%, rgba(255,255,255,0.25) 50%, transparent 100%)',
-            animation: 'shimmer 1.6s ease-in-out infinite',
-          }} />
-        </div>
-        <div style={{ display: 'flex', justifyContent: 'space-between', marginTop: 6 }}>
-          <div>
-            <span style={{ fontSize: 10, color: C.muted }}>Phase: </span>
-            <span style={{ fontSize: 10, fontWeight: 600, color: C.primary }}>
-              {['fetchingPersona', 'preparingPrompt', 'waitingForAI', 'processingResult'].indexOf(phase) + 1}/4
-            </span>
-          </div>
-          <div>
-            <span style={{ fontSize: 10, fontWeight: 600, color: C.subtle }}>{info.pct}%</span>
-          </div>
-          <div>
-            <span style={{ fontSize: 10, color: C.muted }}>Elapsed: </span>
-            <span style={{ fontSize: 10, fontWeight: 600, color: C.subtle }}>{elapsedStr}</span>
-          </div>
-        </div>
-      </div>
-
-      {/* Field Summary */}
-      <div style={{
-        flex: '0 0 auto',
-        background: C.card, border: `1px solid ${C.border}`, borderRadius: 10,
-        padding: '12px 14px',
-      }}>
-        <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 10 }}>
-          <span style={{ fontSize: 11, fontWeight: 600, color: C.text }}>
-            {totalFields} fields total
-          </span>
-          <span style={{ fontSize: 10, color: C.subtle }}>
-            Est: {estStr}
-          </span>
-        </div>
-        <div style={{ display: 'flex', gap: 8, marginBottom: 10 }}>
-          {totalFields - aiFieldCount > 0 && (
-            <span style={{ fontSize: 10, color: C.primary, background: `${C.primary}12`, padding: '2px 8px', borderRadius: 10 }}>
-              {totalFields - aiFieldCount} pre-filled ✓
-            </span>
-          )}
-          <span style={{ fontSize: 10, color: C.muted, background: C.bg, padding: '2px 8px', borderRadius: 10 }}>
-            {aiFieldCount} need AI
-          </span>
-        </div>
-        <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
-          {/* Animated dots showing activity */}
-          <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-            {Array.from({ length: 4 }).map((_, i) => (
-              <div
-                key={i}
-                style={{
-                  width: 8, height: 8, borderRadius: '50%',
-                  background: C.primary,
-                  opacity: 1,
-                  animation: `dotPulse 1.4s ${i * 0.2}s ease-in-out infinite`,
-                }}
-              />
-            ))}
-            <span style={{ fontSize: 10, color: C.muted, marginLeft: 4 }}>
-              {phase === 'fetchingPersona' && 'Loading your data...'}
-              {phase === 'preparingPrompt' && 'Building prompt context...'}
-              {phase === 'waitingForAI' && `Generating answers (this may take 30-90s)...`}
-              {phase === 'processingResult' && 'Parsing AI response...'}
-            </span>
-          </div>
-        </div>
-      </div>
-
-      {/* Tip */}
-      <div style={{
-        flex: '0 0 auto', marginTop: 12,
-        fontSize: 10, color: C.subtle, textAlign: 'center', lineHeight: 1.6,
-      }}>
+      <div className="am-form-analysis-tip">
+        <ShieldCheck size={13} />
         {phase === 'waitingForAI'
-          ? 'AI is carefully considering each field based on your profile.\nResponses with higher confidence will show in green.'
+          ? 'AI is considering each field based on your profile. Higher-confidence answers will be marked clearly.'
           : 'Your profile data stays private — it\'s only used for this form fill.'
         }
       </div>
-
-      <style>{`
-        @keyframes shimmer {
-          from { transform: translateX(-100%); }
-          to   { transform: translateX(100%); }
-        }
-        @keyframes dotPulse {
-          0%, 80%, 100% { transform: scale(0.6); opacity: 0.4; }
-          40%           { transform: scale(1);   opacity: 1; }
-        }
-      `}</style>
     </div>
   )
-}
-
-function btnStyle(bg: string): React.CSSProperties {
-  return {
-    background: bg, color: '#fff', border: 'none',
-    borderRadius: 6, padding: '8px 14px', fontSize: 12,
-    fontWeight: 600, cursor: 'pointer',
-    display: 'inline-flex', alignItems: 'center', justifyContent: 'center',
-    gap: 6,
-  }
-}
-
-function btnStyleGhost(): React.CSSProperties {
-  return {
-    background: 'transparent', color: '#64748b',
-    border: '1px solid #e2e8f0', borderRadius: 6,
-    padding: '6px 12px', fontSize: 11,
-    fontWeight: 600, cursor: 'pointer',
-  }
 }
 
 // ── Persona Matching Engine ──────────────────────────────────────────────────────
