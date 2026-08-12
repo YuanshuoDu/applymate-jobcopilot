@@ -46,6 +46,11 @@ type SessionCallback = (input: {
   session: { user?: Record<string, unknown>; expires?: string }
   token: Record<string, unknown>
 }) => Promise<{ user?: Record<string, unknown>; expires?: string }>
+type SignInCallback = (input: {
+  user: { id?: string }
+  account?: { provider?: string; providerAccountId?: string }
+  profile?: unknown
+}) => Promise<boolean | string>
 
 function jwtCallback(): JwtCallback {
   const config = mocks.nextAuth.mock.calls[0]?.[0] as { callbacks: { jwt: JwtCallback } } | undefined
@@ -57,6 +62,12 @@ function sessionCallback(): SessionCallback {
   const config = mocks.nextAuth.mock.calls[0]?.[0] as { callbacks: { session: SessionCallback } } | undefined
   if (!config) throw new Error('Expected NextAuth configuration')
   return config.callbacks.session
+}
+
+function signInCallback(): SignInCallback {
+  const config = mocks.nextAuth.mock.calls[0]?.[0] as { callbacks: { signIn: SignInCallback } } | undefined
+  if (!config) throw new Error('Expected NextAuth configuration')
+  return config.callbacks.signIn
 }
 
 describe('Auth.js JWT callback', () => {
@@ -126,5 +137,34 @@ describe('Auth.js JWT callback', () => {
       session,
       token: { email: 'candidate@example.com' },
     })).resolves.toEqual({ expires: '2026-08-11T17:00:00.000Z' })
+  })
+})
+
+describe('Auth.js OAuth lifecycle callback', () => {
+  it('refuses to mint a session when the OAuth user row disappeared', async () => {
+    mocks.findUnique.mockResolvedValue(null)
+
+    await expect(signInCallback()({
+      user: { id: 'missing-user' },
+      account: { provider: 'github' },
+    })).resolves.toBe('/login?error=AccountUnavailable')
+  })
+
+  it('refuses OAuth sign-in for a suspended account', async () => {
+    mocks.findUnique.mockResolvedValue({ accountStatus: 'suspended' })
+
+    await expect(signInCallback()({
+      user: { id: 'suspended-user' },
+      account: { provider: 'github' },
+    })).resolves.toBe('/login?error=AccountUnavailable')
+  })
+
+  it('preserves OAuth sign-in for an active account', async () => {
+    mocks.findUnique.mockResolvedValue({ accountStatus: 'active' })
+
+    await expect(signInCallback()({
+      user: { id: 'active-user' },
+      account: { provider: 'github' },
+    })).resolves.toBe(true)
   })
 })

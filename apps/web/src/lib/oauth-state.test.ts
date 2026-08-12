@@ -49,4 +49,17 @@ describe('OAuth state browser binding', () => {
 
     expect(getOAuthStateSecret()).toBeNull()
   })
+
+  it('uses the Auth.js secret alias when AUTH_SECRET is absent', () => {
+    vi.stubEnv('AUTH_SECRET', '')
+    vi.stubEnv('NEXTAUTH_SECRET', 'next-auth-secret')
+
+    expect(getOAuthStateSecret()).toEqual(new TextEncoder().encode('next-auth-secret'))
+  })
+
+  it('does not create OAuth state from the development-only secret', () => {
+    vi.stubEnv('AUTH_SECRET', 'development-only-auth-secret')
+
+    expect(getOAuthStateSecret()).toBeNull()
+  })
 })

@@ -10,8 +10,8 @@ describe('GET /api/gmail/oauth/start', () => {
   beforeEach(() => {
     vi.resetModules()
     mocks.safeAuth.mockReset()
-    mocks.safeAuth.mockResolvedValue({ user: { id: 'user_1' } })
-    mocks.userFindUnique.mockReset().mockResolvedValue({ accountStatus: 'active' })
+    mocks.safeAuth.mockResolvedValue({ user: { id: 'user_1', authVersion: 1 } })
+    mocks.userFindUnique.mockReset().mockResolvedValue({ accountStatus: 'active', authVersion: 1 })
     vi.stubEnv('AUTH_SECRET', 'test-secret-which-is-long-enough')
     vi.stubEnv('AUTH_GOOGLE_ID', 'google-client')
     vi.stubEnv('AUTH_GOOGLE_SECRET', 'google-secret')
@@ -33,6 +33,7 @@ describe('GET /api/gmail/oauth/start', () => {
     expect(cookie).toEqual(expect.objectContaining({ httpOnly: true, sameSite: 'lax', maxAge: 600 }))
     const { payload } = await jwtVerify(state!, new TextEncoder().encode('test-secret-which-is-long-enough'))
     expect(payload.nonce).toBe(cookie?.value)
+    expect(payload.authVersion).toBe(1)
   })
 
   it('redirects unauthenticated users to login', async () => {

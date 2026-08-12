@@ -81,13 +81,12 @@ export const { handlers, signIn, signOut, auth } = NextAuth({
       // OAuth providers can resolve a previously linked account without using
       // Credentials.authorize. Enforce the same lifecycle rule before a JWT is
       // minted, including after Google identity reconciliation changes user.id.
-      if (user.id) {
-        const currentUser = await db.user.findUnique({
-          where: { id: user.id },
-          select: { accountStatus: true },
-        })
-        if (currentUser && currentUser.accountStatus !== 'active') return '/login?error=AccountUnavailable'
-      }
+      if (!user.id) return '/login?error=AccountUnavailable'
+      const currentUser = await db.user.findUnique({
+        where: { id: user.id },
+        select: { accountStatus: true },
+      })
+      if (!currentUser || currentUser.accountStatus !== 'active') return '/login?error=AccountUnavailable'
 
       // PrismaAdapter only INSERTS account rows via linkAccount on first OAuth;
       // it never updates them on subsequent sign-ins. Patch the existing row here so

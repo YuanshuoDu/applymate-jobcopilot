@@ -16,6 +16,7 @@ import { safeAuth } from '@/lib/safe-auth'
 import { db } from '@/lib/db'
 import { configuredRedirectUri } from '@/lib/app-url'
 import { getOAuthStateSecret, setOAuthStateCookie } from '@/lib/oauth-state'
+import { isCurrentAuthVersion } from '@/lib/auth-version'
 
 const SCOPES = [
   'openid',
@@ -43,9 +44,10 @@ export async function GET(req: NextRequest) {
     return NextResponse.redirect(new URL('/login', req.url))
   }
 
-  const user = await db.user.findUnique({ where: { id: session.user.id }, select: { accountStatus: true } })
+  const user = await db.user.findUnique({ where: { id: session.user.id }, select: { accountStatus: true, authVersion: true } })
   if (!user) return NextResponse.redirect(new URL('/login', req.url))
   if (user.accountStatus !== 'active') return NextResponse.json({ error: 'Account unavailable' }, { status: 403 })
+  if (!isCurrentAuthVersion(session.user.authVersion, user.authVersion)) return NextResponse.json({ error: 'Session expired' }, { status: 401 })
 
   const clientId = process.env.AUTH_GOOGLE_ID
   if (!clientId || !process.env.AUTH_GOOGLE_SECRET) {
@@ -60,7 +62,7 @@ export async function GET(req: NextRequest) {
   const returnTo = safeReturnTo(req.nextUrl.searchParams.get('returnTo'))
   const transfer = req.nextUrl.searchParams.get('transfer') === '1'
   const nonce = crypto.randomUUID()
-  const state = await new SignJWT({ uid: session.user.id, nonce, returnTo, transfer })
+  const state = await new SignJWT({ uid: session.user.id, authVersion: user.authVersion, nonce, returnTo, transfer })
     .setProtectedHeader({ alg: 'HS256' })
     .setExpirationTime('10m')
     .sign(stateSecret)

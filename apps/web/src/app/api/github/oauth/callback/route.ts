@@ -11,6 +11,7 @@ import {
   getOAuthStateSecret,
   hasMatchingOAuthStateCookie,
 } from '@/lib/oauth-state'
+import { isCurrentAuthVersion } from '@/lib/auth-version'
 
 type GithubToken = { access_token?: unknown; token_type?: unknown; scope?: unknown }
 type GithubProfile = { id?: unknown; login?: unknown }
@@ -35,15 +36,20 @@ export async function GET(req: NextRequest) {
   if (!stateSecret) return back('oauth_not_configured')
 
   let userId: string
+  let stateAuthVersion: number
   try {
     const verified = await jwtVerify(state, stateSecret)
     if (
       typeof verified.payload.uid !== 'string'
       || !verified.payload.uid
+      || typeof verified.payload.authVersion !== 'number'
+      || !Number.isSafeInteger(verified.payload.authVersion)
+      || verified.payload.authVersion < 1
       || typeof verified.payload.nonce !== 'string'
       || !hasMatchingOAuthStateCookie(req, 'github', verified.payload.nonce)
     ) return back('invalid_state')
     userId = verified.payload.uid
+    stateAuthVersion = verified.payload.authVersion
     returnTo = safeGithubReturnTo(verified.payload.returnTo)
   } catch {
     return back('invalid_state')
@@ -54,6 +60,11 @@ export async function GET(req: NextRequest) {
   // attach external credentials to the stale account in the signed state.
   const session = await safeAuth()
   if (session?.user?.id !== userId) return back('session_mismatch')
+
+  const owner = await db.user.findUnique({ where: { id: userId }, select: { id: true, accountStatus: true, authVersion: true } })
+  if (!owner) return back('user_not_found')
+  if (owner.accountStatus !== 'active') return back('account_suspended')
+  if (!isCurrentAuthVersion(stateAuthVersion, owner.authVersion) || !isCurrentAuthVersion(session.user.authVersion, owner.authVersion)) return back('session_expired')
 
   const clientId = process.env.AUTH_GITHUB_ID
   const clientSecret = process.env.AUTH_GITHUB_SECRET
@@ -74,9 +85,6 @@ export async function GET(req: NextRequest) {
   if (!profileResponse?.ok || (typeof profile?.id !== 'number' && typeof profile?.id !== 'string')) return back('profile_fetch_failed')
   const providerAccountId = String(profile.id)
 
-  const owner = await db.user.findUnique({ where: { id: userId }, select: { id: true, accountStatus: true } })
-  if (!owner) return back('user_not_found')
-  if (owner.accountStatus !== 'active') return back('account_suspended')
   const existing = await db.account.findUnique({
     where: { provider_providerAccountId: { provider: 'github', providerAccountId } },
     select: { userId: true },

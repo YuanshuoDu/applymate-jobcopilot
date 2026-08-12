@@ -26,6 +26,7 @@ import {
   getOAuthStateSecret,
   hasMatchingOAuthStateCookie,
 } from '@/lib/oauth-state'
+import { isCurrentAuthVersion } from '@/lib/auth-version'
 
 function safeReturnTo(value: unknown): string | null {
   if (typeof value !== 'string' || !value.startsWith('/')) return null
@@ -65,15 +66,20 @@ export async function GET(req: NextRequest) {
 
   // Verify the signed state and browser binding before using its user id.
   let userId: string
+  let stateAuthVersion: number
   try {
     const { payload } = await jwtVerify(state, stateSecret)
     if (
       !payload.uid
       || typeof payload.uid !== 'string'
+      || typeof payload.authVersion !== 'number'
+      || !Number.isSafeInteger(payload.authVersion)
+      || payload.authVersion < 1
       || typeof payload.nonce !== 'string'
       || !hasMatchingOAuthStateCookie(req, 'gmail', payload.nonce)
     ) return back('invalid_state')
     userId = payload.uid
+    stateAuthVersion = payload.authVersion
     returnTo = safeReturnTo(payload.returnTo) ?? returnTo
     transferRequested = payload.transfer === true
   } catch (e) {
@@ -87,9 +93,10 @@ export async function GET(req: NextRequest) {
   const session = await safeAuth()
   if (session?.user?.id !== userId) return back('session_mismatch')
 
-  const user = await db.user.findUnique({ where: { id: userId }, select: { accountStatus: true } })
+  const user = await db.user.findUnique({ where: { id: userId }, select: { accountStatus: true, authVersion: true } })
   if (!user) return back('user_not_found')
   if (user.accountStatus !== 'active') return back('account_suspended')
+  if (!isCurrentAuthVersion(stateAuthVersion, user.authVersion) || !isCurrentAuthVersion(session.user.authVersion, user.authVersion)) return back('session_expired')
 
   // Exchange code for tokens
   const redirectUri = configuredRedirectUri(req.url, '/api/gmail/oauth/callback')

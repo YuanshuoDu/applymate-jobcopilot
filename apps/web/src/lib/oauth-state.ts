@@ -5,8 +5,14 @@ export type OAuthStateProvider = 'github' | 'gmail'
 const STATE_COOKIE_MAX_AGE = 10 * 60
 
 export function getOAuthStateSecret(): Uint8Array | null {
-  const secret = process.env.AUTH_SECRET?.trim()
-  if (!secret || secret === 'fallback-secret-change-this') return null
+  const secret = process.env.AUTH_SECRET?.trim() || process.env.NEXTAUTH_SECRET?.trim()
+  if (
+    !secret ||
+    secret === 'fallback-secret-change-this' ||
+    secret === 'development-only-auth-secret'
+  ) {
+    return null
+  }
   return new TextEncoder().encode(secret)
 }
 
