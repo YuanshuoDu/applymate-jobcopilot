@@ -70,8 +70,13 @@ export function companyInitials(company: string): string {
   return company.trim().split(/\s+/).slice(0, 2).map(word => word[0]).join('').toUpperCase() || 'A'
 }
 
-export function openSidePanel(windowId: number): Promise<void> {
+export type SidePanelTarget = 'jobs' | 'resume'
+
+export async function openSidePanel(windowId: number, target: SidePanelTarget = 'jobs'): Promise<void> {
   // Keep this API call in the Popup click handler. Chrome requires the live
   // user gesture and rejects a later Service Worker call as a new action.
-  return chrome.sidePanel.open({ windowId })
+  const pending = { tab: target, createdAt: Date.now() }
+  void chrome.storage.local.set({ pendingSidePanelTab: pending }).catch(() => {})
+  void chrome.runtime.sendMessage({ type: 'OPEN_SIDE_PANEL_TAB', tab: target }).catch(() => {})
+  await chrome.sidePanel.open({ windowId })
 }

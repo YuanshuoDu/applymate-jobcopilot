@@ -4,12 +4,14 @@ import { C, type PopupLabels } from './popup-constants'
 
 export function PopupHeader({ user, onSettings, onLogout, onDashboard, labels }: { user: string; onSettings: () => void; onLogout: () => void; onDashboard: () => void; labels: PopupLabels }) {
   const [menuOpen, setMenuOpen] = useState(false)
-  const headerRef = useRef<HTMLElement>(null)
+  const menuRef = useRef<HTMLDivElement>(null)
+  const triggerRef = useRef<HTMLButtonElement>(null)
   const initial = user.trim().slice(0, 1).toUpperCase() || 'A'
   useEffect(() => {
     if (!menuOpen) return
     const closeOnOutsidePointer = (event: PointerEvent) => {
-      if (!headerRef.current?.contains(event.target as Node)) setMenuOpen(false)
+      const target = event.target as Node
+      if (!menuRef.current?.contains(target) && !triggerRef.current?.contains(target)) setMenuOpen(false)
     }
     const closeOnEscape = (event: KeyboardEvent) => { if (event.key === 'Escape') setMenuOpen(false) }
     document.addEventListener('pointerdown', closeOnOutsidePointer)
@@ -26,19 +28,19 @@ export function PopupHeader({ user, onSettings, onLogout, onDashboard, labels }:
   }
 
   return (
-    <header ref={headerRef} style={{ position: 'relative', padding: '13px 14px 11px', display: 'flex', alignItems: 'center', justifyContent: 'space-between', background: C.bg, borderBottom: `1px solid ${C.border}` }}>
+    <header style={{ position: 'relative', padding: '10px 12px 9px', display: 'flex', alignItems: 'center', justifyContent: 'space-between', background: C.bg, borderBottom: `1px solid ${C.border}` }}>
       <div style={{ display: 'flex', alignItems: 'center', gap: 11, minWidth: 0 }}>
-        <img src={chrome.runtime.getURL('icons/icon48.png')} alt="ApplyMate AI" width={42} height={42} style={{ display: 'block', borderRadius: 13, boxShadow: '0 5px 12px rgba(81,70,229,0.18)' }} />
+        <img src={chrome.runtime.getURL('icons/icon48.png')} alt="ApplyMate AI" width={38} height={38} style={{ display: 'block', borderRadius: 12, boxShadow: '0 5px 12px rgba(81,70,229,0.18)' }} />
         <div style={{ minWidth: 0 }}>
-          <div style={{ fontSize: 18, lineHeight: 1.1, fontWeight: 750, color: C.navy, letterSpacing: '-0.03em' }}>ApplyMate AI</div>
+          <div style={{ fontSize: 17, lineHeight: 1.1, fontWeight: 750, color: C.navy, letterSpacing: '-0.03em' }}>ApplyMate AI</div>
           <div style={{ marginTop: 3, fontSize: 11, color: C.muted, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis', maxWidth: 155 }}>Your AI job copilot</div>
         </div>
       </div>
       <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexShrink: 0 }}>
-        <IconButton label={labels.menuSettings} onClick={onSettings}><Settings size={20} strokeWidth={1.8} /></IconButton>
-        <button type="button" aria-label="Account menu" aria-expanded={menuOpen} onClick={() => setMenuOpen(open => !open)} style={{ width: 36, height: 36, borderRadius: '50%', border: 'none', background: '#EAEAFF', color: C.primary, fontWeight: 700, fontSize: 13, cursor: 'pointer' }}>{initial}</button>
+        <IconButton label={labels.menuSettings} onClick={onSettings}><Settings size={19} strokeWidth={1.8} /></IconButton>
+        <button ref={triggerRef} type="button" aria-label="Account menu" aria-haspopup="menu" aria-expanded={menuOpen} onClick={() => setMenuOpen(open => !open)} style={{ width: 34, height: 34, borderRadius: '50%', border: 'none', background: '#EAEAFF', color: C.primary, fontWeight: 700, fontSize: 12, cursor: 'pointer' }}>{initial}</button>
       </div>
-      {menuOpen && <div role="menu" style={{ position: 'absolute', right: 14, top: 61, zIndex: 3, width: 172, padding: 6, background: C.panel, border: `1px solid ${C.border}`, borderRadius: 12, boxShadow: '0 12px 30px rgba(31,38,94,0.16)' }}>
+      {menuOpen && <div ref={menuRef} role="menu" style={{ position: 'absolute', right: 14, top: 61, zIndex: 3, width: 172, padding: 6, background: C.panel, border: `1px solid ${C.border}`, borderRadius: 12, boxShadow: '0 12px 30px rgba(31,38,94,0.16)' }}>
         <MenuButton label={labels.menuDashboard} onClick={() => runMenuAction(onDashboard)} />
         <MenuButton label={labels.menuSettings} onClick={() => runMenuAction(onSettings)} />
         <MenuButton label={labels.menuSignOut} onClick={() => runMenuAction(onLogout)} danger />
@@ -48,7 +50,7 @@ export function PopupHeader({ user, onSettings, onLogout, onDashboard, labels }:
 }
 
 function IconButton({ label, onClick, children }: { label: string; onClick: () => void; children: ReactNode }) {
-  return <button type="button" aria-label={label} title={label} onClick={onClick} style={{ width: 38, height: 38, display: 'grid', placeItems: 'center', border: 'none', borderRadius: '50%', background: 'transparent', color: C.muted, cursor: 'pointer' }}>{children}</button>
+  return <button type="button" aria-label={label} title={label} onClick={onClick} style={{ width: 40, height: 40, display: 'grid', placeItems: 'center', border: `1px solid ${C.border}`, borderRadius: '50%', background: '#FCFCFF', color: C.muted, cursor: 'pointer' }}>{children}</button>
 }
 
 function MenuButton({ label, onClick, danger = false }: { label: string; onClick: () => void; danger?: boolean }) {
