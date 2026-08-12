@@ -55,6 +55,9 @@ importers:
       vite:
         specifier: ^6.3.5
         version: 6.4.3(@types/node@26.2.0)(jiti@2.7.0)(lightningcss@1.32.0)(tsx@4.23.11)
+      vitest:
+        specifier: ^3.2.7
+        version: 3.2.7(@types/node@26.2.0)(jiti@2.7.0)(lightningcss@1.32.0)(tsx@4.23.11)
 
   apps/web:
     dependencies:

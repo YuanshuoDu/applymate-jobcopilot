@@ -547,6 +547,17 @@ if (SHOULD_BOOTSTRAP_JOB_UI) {
 
 // ── Form Filler: Listen for scan & fill commands ──────────────────
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+  if (msg.type === 'REFRESH_DASHBOARD_TOKEN') {
+    if (!IS_DASHBOARD_PAGE) {
+      sendResponse({ ok: false, error: 'Not an ApplyMate dashboard page' })
+      return true
+    }
+    void syncFromDashboard(true)
+      .then(ok => sendResponse({ ok }))
+      .catch(() => sendResponse({ ok: false, error: 'Dashboard session refresh failed' }))
+    return true
+  }
+
   if (msg.type === 'APPLY_FIELD_VALUES') {
     log('APPLY_FIELD_VALUES received —', msg.fields?.length, 'fields to fill')
     try {
@@ -623,26 +634,26 @@ function getSyncStorage(): chrome.storage.StorageArea | null {
   }
 }
 
-async function syncFromDashboard() {
+async function syncFromDashboard(force = false): Promise<boolean> {
   const meta = document.querySelector('meta[name="applymate:user"]') as HTMLMetaElement | null
-  if (!meta?.content) return
+  if (!meta?.content) return false
 
   const currentOrigin = window.location.origin // e.g. http://localhost:3000
   const syncStorage = getSyncStorage()
-  if (!syncStorage) return
+  if (!syncStorage) return false
 
   let result: { settings?: Partial<ExtensionSettings> }
   try {
     result = await syncStorage.get('settings') as typeof result
   } catch {
-    return
+    return false
   }
   const s = result.settings ?? {}
 
   // Only skip if token exists AND email matches AND stored apiBaseUrl matches current origin
   // If apiBaseUrl changed (env switch), always re-fetch
   const alreadySynced = s.apiToken && s.userEmail === meta.content && s.apiBaseUrl === currentOrigin
-  if (alreadySynced) return
+  if (alreadySynced && !force) return true
 
   log('Dashboard user detected:', meta.content, '— fetching extension token for', currentOrigin)
   try {
@@ -660,8 +671,10 @@ async function syncFromDashboard() {
     })
     log('Extension auto-logged in via dashboard:', data.user?.email, '@', currentOrigin)
     window.dispatchEvent(new CustomEvent('applymate:login'))
+    return true
   } catch (err) {
     log('Failed to fetch extension token:', err)
+    return false
   }
 }
 
@@ -697,7 +710,7 @@ window.addEventListener('message', (e) => {
 // Run dashboard sync only on the dashboard; job pages never expose its user
 // meta tag and do not need an additional storage read/fetch during startup.
 if (IS_DASHBOARD_PAGE) {
-  void syncFromDashboard()
+  void syncFromDashboard(true)
   setTimeout(() => { void syncFromDashboard() }, 3000)
 }
 

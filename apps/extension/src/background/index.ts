@@ -5,7 +5,8 @@
 import { getSettings, setCurrentJob, setBadge, clearBadge } from '@/lib/storage'
 import { login, saveJob, getRecentJobs, getStats, updateJob } from '@/lib/api'
 import { getJobIdentity } from '@/lib/job-identity'
-import type { ExtMessage, SavedJob, ScrapedJob } from '@/lib/types'
+import type { ExtMessage, ExtensionSettings, SavedJob, ScrapedJob } from '@/lib/types'
+import { isApplyMateDashboardUrl, isAuthFailure } from '@/lib/auth-recovery'
 
 // ── Simple rate limiter (prevent excessive API calls) ──────────────
 const RATE_LIMIT_WINDOW = 2000 // 2 seconds between same-type operations
@@ -108,6 +109,47 @@ function shouldRestoreSaveUi(url?: string): boolean {
       host.includes('irishjobs.ie')
   } catch {
     return false
+  }
+}
+
+async function refreshSettingsFromDashboard(): Promise<ExtensionSettings | null> {
+  const tabs = await chrome.tabs.query({})
+  const dashboardTabs = tabs.filter(tab => isApplyMateDashboardUrl(tab.url))
+  for (const tab of dashboardTabs) {
+    if (!tab.id) continue
+    try {
+      let response: { ok?: boolean } | undefined
+      try {
+        response = await chrome.tabs.sendMessage(tab.id, { type: 'REFRESH_DASHBOARD_TOKEN' }) as typeof response
+      } catch {
+        // Extension updates remove content scripts from already-open tabs.
+        // Rehydrate the dashboard bridge before retrying the refresh request.
+        await chrome.scripting.executeScript({ target: { tabId: tab.id }, files: ['content.js'], world: 'ISOLATED' })
+        response = await chrome.tabs.sendMessage(tab.id, { type: 'REFRESH_DASHBOARD_TOKEN' }) as typeof response
+      }
+      if (response?.ok) return getSettings()
+    } catch {
+      // The dashboard may be an older content-script instance. Try another
+      // open dashboard tab before asking the user to sign in again.
+    }
+  }
+  return null
+}
+
+async function saveJobWithAuthRecovery(settings: ExtensionSettings, job: ScrapedJob): Promise<SavedJob> {
+  let activeSettings = settings
+  if (!activeSettings.apiToken) {
+    activeSettings = await refreshSettingsFromDashboard() ?? activeSettings
+  }
+  if (!activeSettings.apiToken) throw new Error('Not logged in — open the ApplyMate dashboard or extension popup to log in first')
+
+  try {
+    return await saveJob(activeSettings, job)
+  } catch (error) {
+    if (!isAuthFailure(error)) throw error
+    const refreshed = await refreshSettingsFromDashboard()
+    if (!refreshed?.apiToken) throw error
+    return saveJob(refreshed, job)
   }
 }
 
@@ -240,9 +282,6 @@ async function handleMessage(
     }
 
     case 'SAVE_JOB': {
-      if (!settings.apiToken) {
-        return { type: 'SAVE_JOB_RESULT', success: false, error: 'Not logged in — open the extension popup to log in first' }
-      }
       try {
         const key = getJobIdentity(msg.job)
         const cached = savedJobsByKey.get(key)
@@ -252,7 +291,7 @@ async function handleMessage(
 
         let pending = pendingSavesByKey.get(key)
         if (!pending) {
-          pending = saveJob(settings, msg.job)
+          pending = saveJobWithAuthRecovery(settings, msg.job)
           pendingSavesByKey.set(key, pending)
         }
         const savedJob = await pending
