@@ -530,17 +530,17 @@ function TrackerPanel({ settings, L, onOpenResume }: { settings: ExtensionSettin
         <section className="am-overview" aria-label="Application overview">
           <div className="am-overview-grid">
             <div className="am-overview-cell">
-              <div className="am-overview-label"><Target size={12} aria-hidden="true" />Application momentum</div>
+              <div className="am-overview-label"><Target size={12} aria-hidden="true" /><span>Application momentum</span></div>
               <div className="am-momentum-summary"><div className="am-momentum-ring" style={{ '--am-progress-angle': `${weeklyProgress * 3.6}deg` } as React.CSSProperties} aria-label={`${Math.round(weeklyProgress)}% of weekly target`}><strong>{Math.round(weeklyProgress)}%</strong><small>{Math.min(weeklyApplications, weeklyTarget)} / {weeklyTarget}</small></div><div className="am-momentum-copy"><strong>{weeklyApplications >= weeklyTarget ? 'Goal reached!' : 'Keep it up!'}</strong><span>{Math.max(1, 7 - new Date().getDay())} days left</span></div></div>
             </div>
             <div className="am-overview-cell">
-              <div className="am-overview-label"><BarChart3 size={12} aria-hidden="true" />Next step</div>
+              <div className="am-overview-label"><BarChart3 size={12} aria-hidden="true" /><span>Next step</span></div>
               <div className="am-overview-copy">{!dashboard?.hasResume ? 'Add your resume to unlock match scoring.' : unscoredCount > 0 ? `${unscoredCount} saved role${unscoredCount === 1 ? '' : 's'} ready to score.` : `${Math.max(0, weeklyTarget - weeklyApplications)} applications this week to stay on track.`}</div>
               <div className="am-progress-bar" aria-hidden="true"><span style={{ width: `${weeklyProgress}%` }} /></div>
               <button className="am-overview-action" type="button" onClick={() => dashboard?.hasResume ? (unscoredCount ? void scoreJob(jobs.find(job => job.score == null)!) : chrome.tabs.create({ url: `${settings.apiBaseUrl}/jobs` })) : onOpenResume()}>{!dashboard?.hasResume ? 'Add resume' : unscoredCount ? 'Score a role' : 'View plan'}</button>
             </div>
             <div className="am-overview-cell">
-              <div className="am-overview-label"><Sparkles size={12} aria-hidden="true" />High match opportunity</div>
+              <div className="am-overview-label"><Sparkles size={12} aria-hidden="true" /><span>High match opportunity</span></div>
               {highMatch ? <div className="am-highlight"><div className="am-highlight-main"><span className="am-highlight-mark">{companyInitials(highMatch.company)}</span><div className="am-highlight-copy"><div className="am-highlight-role" title={highMatch.role}>{highMatch.role}</div><div className="am-highlight-company" title={highMatch.company}>{highMatch.company}</div></div></div><div className="am-highlight-actions"><span className={`am-highlight-score ${highMatchTone}`}>{highMatch.score}% match</span><button className="am-action-link" type="button" onClick={() => focusJob(highMatch.id)}>View job <ArrowRight size={10} aria-hidden="true" /></button></div></div> : <div className="am-overview-copy">Score a saved role to see your strongest match here.</div>}
             </div>
           </div>

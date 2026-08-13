@@ -8,7 +8,7 @@ import { LoginView, getLoginLabels, getPopupLang, type PopupLang } from './Login
 const GLOBAL_CSS = `
   @keyframes am-spin { to { transform: rotate(360deg) } }
   .am-spin { animation: am-spin 0.8s linear infinite; }
-  html, body, #root { margin: 0; padding: 0; width: 360px; min-width: 360px; overflow: hidden; }
+  html, body, #root { margin: 0; padding: 0; width: 100%; max-width: 360px; min-width: 0; overflow: hidden; }
   body { background: #F8F8FF; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
 `
 
