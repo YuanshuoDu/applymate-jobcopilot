@@ -120,6 +120,34 @@ The overview and job-card score regions were compared separately because the rin
 
 passed
 
+## Side panel Jobs footer layout QA
+
+### Evidence
+
+- User reference: `C:\Users\Steven.du\AppData\Local\Temp\codex-clipboard-5666a211-7e56-44ad-a653-a2ac0f7a9494.png`
+- Implementation source: `apps/extension/src/sidepanel/sidepanel.css`
+- Current implementation screenshots: `audit-artifacts/jobs-footer-fixed.png`, `audit-artifacts/jobs-footer-fixed-mobile.png`
+- Preview URL: `http://localhost:4175/audit-artifacts/sidebar-runtime-preview.html`
+
+### Finding and fix
+
+- The footer was participating in the tracker’s page scroll, which allowed `Refresh` and `View all jobs` to sit over the job list in the captured state.
+- The tracker now owns the fixed-height shell, the job list is the only independently scrollable region, and the footer remains a non-scrolling bottom action bar.
+- Expanded job details still scroll with the list and remain clear of the footer.
+
+### Verification
+
+- Desktop preview at 1166 × 844: footer is aligned to the bottom edge and no longer covers a job card.
+- Narrow preview at 390 × 844: footer stays visible at the bottom, the list scrolls above it, and the expanded detail card remains readable.
+- `Refresh` and `View all jobs` controls are each present exactly once in the runtime DOM.
+- `pnpm --filter @jobcopilot/extension typecheck` — passed.
+- `pnpm --filter @jobcopilot/extension test` — 4 files, 10 tests passed.
+- `pnpm --filter @jobcopilot/extension build` — passed.
+
+### Final result
+
+passed
+
 ## Side panel visual refinement QA — Jobs + Form Fill
 
 ### Evidence
