@@ -334,7 +334,7 @@ export function AgentUnifiedStream({
   ]
 
   return (
-    <div className="agent-live-stream" style={{ flex: 1, display: 'flex', flexDirection: 'column', overflow: 'hidden', background: 'var(--bg)' }}>
+    <div className="agent-live-stream" style={{ flex: 1, minWidth: 0, minHeight: 0, display: 'flex', flexDirection: 'column', overflow: 'hidden', background: 'var(--bg)' }}>
       <AgentUnifiedStreamHeader
         hideForNewChat={isNewChatDraft}
         running={running}

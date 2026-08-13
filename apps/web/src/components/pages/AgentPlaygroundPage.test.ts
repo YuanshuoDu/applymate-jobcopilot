@@ -2,6 +2,8 @@ import { readFileSync } from 'node:fs'
 import { describe, expect, it } from 'vitest'
 
 const source = readFileSync(new URL('./AgentPlaygroundPage.tsx', import.meta.url), 'utf8')
+const streamSource = readFileSync(new URL('../agent-workspace/AgentUnifiedStream.tsx', import.meta.url), 'utf8')
+const appShellSource = readFileSync(new URL('../layout/AppShell.tsx', import.meta.url), 'utf8')
 
 describe('Agent workspace responsive layout', () => {
   it('stacks the workspace before the tablet split pane can overflow', () => {
@@ -12,6 +14,13 @@ describe('Agent workspace responsive layout', () => {
     expect(source).toMatch(/\.agent-workspace-layout[\s\S]*overflow: hidden !important/)
     expect(source).toMatch(/\.agent-live-stream[\s\S]*height: 100% !important[\s\S]*overflow: hidden !important/)
     expect(source).toMatch(/\.agent-live-stream-body[\s\S]*overflow-y: auto !important/)
+  })
+
+  it('keeps every desktop split-pane flex boundary shrinkable from first paint', () => {
+    expect(appShellSource).toMatch(/id="main-content" style=\{\{ flex: 1, minWidth: 0, minHeight: 0/)
+    expect(source).toMatch(/minWidth: 0, minHeight: 0, display: 'flex'[\s\S]*agent-workspace-layout/)
+    expect(source).toMatch(/agent-workspace-layout" style=\{\{ flex: 1, minWidth: 0, minHeight: 0/)
+    expect(streamSource).toMatch(/agent-live-stream" style=\{\{ flex: 1, minWidth: 0, minHeight: 0/)
   })
 
   it('hides sessions in a dismissible mobile drawer so chat stays primary', () => {
