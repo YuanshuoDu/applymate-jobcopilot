@@ -1,6 +1,8 @@
 'use client'
 
+import { ArrowUp, ChevronDown, Home, Paperclip, PanelLeftClose, PanelLeftOpen, Sparkles } from 'lucide-react'
 import { useState, type CSSProperties } from 'react'
+import styles from './AgentPreviewClient.module.css'
 import { Sidebar } from '@/components/layout/Sidebar'
 import type { Page } from '@/lib/types'
 
@@ -18,79 +20,89 @@ const rows = [
 
 export function AgentPreviewClient() {
   const [thinkingExpanded, setThinkingExpanded] = useState(false)
+  const [drawerOpen, setDrawerOpen] = useState(false)
+  const [newChat, setNewChat] = useState(false)
+
+  function startNewChat() {
+    setNewChat(true)
+    setDrawerOpen(false)
+  }
+
+  function resumeLastChat() {
+    setNewChat(false)
+    setDrawerOpen(false)
+  }
 
   return (
-    <div className="agent-preview-shell" style={{ display: 'flex', height: '100vh', overflow: 'hidden', background: 'var(--bg-tertiary)' }}>
-      <style>{`
-        @media (max-width: 767px) {
-          .agent-preview-shell {
-            height: auto !important;
-            min-height: 100vh !important;
-            flex-direction: column !important;
-            overflow-y: auto !important;
-          }
-          .agent-preview-desktop-sidebar {
-            display: none !important;
-          }
-          .agent-preview-console {
-            width: 100% !important;
-            height: min(42vh, 340px) !important;
-            border-right: none !important;
-            border-bottom: 1px solid var(--border) !important;
-          }
-          .agent-preview-main {
-            min-height: 620px !important;
-            width: 100% !important;
-          }
-        }
-      `}</style>
+    <div className={`${styles.root} agent-preview-shell`} style={{ display: 'flex', height: '100vh', overflow: 'hidden', background: 'var(--bg-tertiary)' }}>
       <div className="agent-preview-desktop-sidebar">
         <Sidebar active={'agent' as Page} onNav={() => undefined} session={previewSession} jobCount={12} />
       </div>
-      <aside className="agent-preview-console" style={agentSidebar}>
-        <div style={{ padding: 14, borderBottom: '1px solid var(--border)' }}>
-          <button style={primaryButton}>+ New chat</button>
-        </div>
-        <MetricGrid />
-        <Section title="Recent Sessions">
-          <SessionRow active title="Berlin SWE Auto-Apply" meta="Running · quality 87% · 09:14" />
-          <SessionRow title="Munich Data Engineer Search" meta="Done · quality 91% · Yesterday" />
-          <SessionRow title="Gmail Follow-up Batch" meta="Approval · quality pending · May 22" />
-        </Section>
-        <Section title="Queued Tasks">
-          <TaskRow role="Scout" status="LivenessGate" value="94%" />
-          <TaskRow role="Analyst" status="JobDecision" value="89%" />
-          <TaskRow role="Executor" status="Approval" value="waiting" warn />
-        </Section>
-        <Section title="Agent Team">
-          {['Orchestrator', 'Scout', 'Analyst', 'Writer', 'Reviewer', 'Executor', 'Auditor'].map((name, index) => (
-            <TaskRow key={name} role={name} status={index < 3 ? 'active' : 'idle'} value={index < 3 ? 'MiniMax' : 'Claude'} />
-          ))}
-        </Section>
-        <Section title="Automations">
-          <TaskRow role="Weekday 09:00 EU scout" status="enabled" value="run" />
-          <TaskRow role="Auto-apply 85+" status="approval required" value="on" />
-        </Section>
-        <Section title="Session Quality">
-          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10 }}>
-            <Quality label="Quality" value="87%" />
-            <Quality label="Gate pass" value="92%" />
-            <Quality label="Retry" value="8%" />
-            <Quality label="Approvals" value="2" warn />
+      <button className={`agent-preview-drawer-scrim${drawerOpen ? ' is-open' : ''}`} type="button" aria-label="Close conversations" tabIndex={drawerOpen ? 0 : -1} onClick={() => setDrawerOpen(false)} />
+      <div id="agent-preview-drawer" className={`agent-preview-drawer${drawerOpen ? ' is-open' : ''}`}>
+        <div className="agent-preview-drawer-header">
+          <span>Conversations</span>
+          <div className="agent-preview-drawer-actions">
+            <button className="agent-preview-drawer-home" type="button" aria-label="Back to Home" onClick={() => { window.location.assign('/?page=dashboard') }}>
+              <Home size={15} aria-hidden="true" />
+              Back to Home
+            </button>
+            <button className="agent-preview-drawer-collapse" type="button" aria-label="Collapse conversations" onClick={() => setDrawerOpen(false)}>
+              <PanelLeftClose size={17} aria-hidden="true" />
+            </button>
           </div>
-        </Section>
-      </aside>
+        </div>
+        <aside className="agent-preview-console" style={agentSidebar}>
+          <div style={{ padding: 14, borderBottom: '1px solid var(--border)' }}>
+            <button type="button" style={primaryButton} onClick={startNewChat}>+ New chat</button>
+          </div>
+          <MetricGrid />
+          <Section title="Recent Sessions">
+            <SessionRow active={!newChat} title="Berlin SWE Auto-Apply" meta="Last opened · Running · quality 87% · 09:14" onClick={resumeLastChat} />
+            <SessionRow title="Munich Data Engineer Search" meta="Done · quality 91% · Yesterday" />
+            <SessionRow title="Gmail Follow-up Batch" meta="Approval · quality pending · May 22" />
+          </Section>
+          <Section title="Queued Tasks">
+            <TaskRow role="Scout" status="LivenessGate" value="94%" />
+            <TaskRow role="Analyst" status="JobDecision" value="89%" />
+            <TaskRow role="Executor" status="Approval" value="waiting" warn />
+          </Section>
+          <Section title="Agent Team">
+            {['Orchestrator', 'Scout', 'Analyst', 'Writer', 'Reviewer', 'Executor', 'Auditor'].map((name, index) => (
+              <TaskRow key={name} role={name} status={index < 3 ? 'active' : 'idle'} value={index < 3 ? 'MiniMax' : 'Claude'} />
+            ))}
+          </Section>
+          <Section title="Automations">
+            <TaskRow role="Weekday 09:00 EU scout" status="enabled" value="run" />
+            <TaskRow role="Auto-apply 85+" status="approval required" value="on" />
+          </Section>
+          <Section title="Session Quality">
+            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10 }}>
+              <Quality label="Quality" value="87%" />
+              <Quality label="Gate pass" value="92%" />
+              <Quality label="Retry" value="8%" />
+              <Quality label="Approvals" value="2" warn />
+            </div>
+          </Section>
+        </aside>
+      </div>
       <main className="agent-preview-main" style={{ flex: 1, minWidth: 0, display: 'flex', flexDirection: 'column', background: 'var(--bg)' }}>
         <header style={headerStyle}>
-          <div>
-            <h1 style={{ margin: 0, fontSize: 17 }}>Berlin SWE Auto-Apply</h1>
-            <div style={{ marginTop: 4, fontSize: 12, color: 'var(--text-muted)' }}>
-              Memory: Berlin SWE · min score 85 · approval required · no LinkedIn
-            </div>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 10, minWidth: 0 }}>
+            <button className="agent-preview-drawer-trigger" type="button" aria-label="Open conversations" aria-expanded={drawerOpen} aria-controls="agent-preview-drawer" onClick={() => setDrawerOpen(true)}>
+              <PanelLeftOpen size={17} aria-hidden="true" />
+            </button>
+            {!newChat && <div>
+              <h1 style={{ margin: 0, fontSize: 17 }}>Berlin SWE Auto-Apply</h1>
+              <div style={{ marginTop: 4, fontSize: 12, color: 'var(--text-muted)' }}>
+                Memory: Berlin SWE · min score 85 · approval required · no LinkedIn
+              </div>
+            </div>}
           </div>
           <div style={{ display: 'flex', gap: 14, color: 'var(--text-muted)' }}>◴ ⌕ ⋮</div>
         </header>
-        <section style={transcriptStyle}>
+        <section className="agent-preview-transcript" style={transcriptStyle}>
+          {newChat ? <NewChatEmptyState /> : <>
           <Message speaker="You" body="每天早上 9 点自动找 Berlin 软件工程岗位，85 分以上自动投，但需要我确认。" time="09:11" />
           <Message speaker="Orchestrator · Automation draft" body="我可以创建一个工作日 09:00 自动化：在 Berlin 搜索软件工程岗位，85 分以上进入投递队列，提交前请求你确认。" time="09:12">
             <Grid rows={[['Trigger', 'Weekdays 09:00'], ['Target', 'Berlin · SWE'], ['Score', '85+'], ['Approval', 'Required'], ['Daily cap', '8 applications']]} />
@@ -118,19 +130,21 @@ export function AgentPreviewClient() {
               <tbody>{rows.map(row => <tr key={row[0]}>{row.map(cell => <td key={cell} style={tdStyle}>{cell}</td>)}</tr>)}</tbody>
             </table>
           </Message>
+          </>}
         </section>
         <footer style={composerWrap}>
-          <div style={{ display: 'flex', gap: 8, marginBottom: 8 }}>
-            {['Create automation', 'Review pending', 'Explain score'].map(label => <button key={label} style={chipStyle}>{label}</button>)}
-            <button style={chipStyle} onClick={() => setThinkingExpanded(value => !value)}>
-              {thinkingExpanded ? 'Hide thinking' : 'Show thinking'}
+          <div style={chipRowStyle}>
+            {['Automate', 'Review', 'Explain score'].map(label => <button key={label} style={composerChipStyle}><Sparkles size={13} color="var(--primary)" aria-hidden="true" />{label}</button>)}
+            <button style={composerChipStyle} onClick={() => setThinkingExpanded(value => !value)}>
+              <Sparkles size={13} color="var(--primary)" aria-hidden="true" />
+              {thinkingExpanded ? 'Hide thinking' : 'Thinking'}
             </button>
           </div>
           <div style={composerBox}>
             <textarea placeholder="Ask ApplyMate to search, score, apply, or create an automation..." style={textareaStyle} />
             <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
-              <div style={{ display: 'flex', gap: 8 }}><button style={iconButton}>+</button><button style={selectButton}>MiniMax M3 ▾</button></div>
-              <button style={sendButton}>↑</button>
+              <div style={{ display: 'flex', gap: 8 }}><button aria-label="Add context" style={iconButton}><Paperclip size={17} aria-hidden="true" /></button><button style={selectButton}>Model <ChevronDown size={13} aria-hidden="true" /></button></div>
+              <button aria-label="Send message" style={sendButton}><ArrowUp size={19} strokeWidth={2.7} aria-hidden="true" /></button>
             </div>
           </div>
         </footer>
@@ -147,8 +161,18 @@ function Section({ title, children }: { title: string; children: React.ReactNode
   return <div style={{ padding: '0 10px 12px' }}><div style={sectionTitle}>{title}</div><div style={panelStyle}>{children}</div></div>
 }
 
-function SessionRow({ title, meta, active = false }: { title: string; meta: string; active?: boolean }) {
-  return <div style={{ padding: 10, borderBottom: '1px solid var(--border)', background: active ? 'var(--bg)' : 'transparent' }}><div style={{ fontSize: 12, fontWeight: 700 }}>{title}</div><div style={metaText}>{meta}</div></div>
+function SessionRow({ title, meta, active = false, onClick }: { title: string; meta: string; active?: boolean; onClick?: () => void }) {
+  return <button type="button" onClick={onClick} style={{ width: '100%', padding: 10, border: 0, borderBottom: '1px solid var(--border)', background: active ? 'var(--bg)' : 'transparent', color: 'var(--text)', cursor: 'pointer', fontFamily: 'inherit', textAlign: 'left' }}><div style={{ fontSize: 12, fontWeight: 700 }}>{title}</div><div style={metaText}>{meta}</div></button>
+}
+
+function NewChatEmptyState() {
+  return <div aria-label="New chat welcome" style={{ flex: 1, display: 'grid', placeItems: 'center', textAlign: 'center' }}>
+    <div style={{ display: 'grid', justifyItems: 'center', gap: 14 }}>
+      <span aria-label="ApplyMate AI" style={{ width: 58, height: 58, display: 'grid', placeItems: 'center', borderRadius: 18, background: 'var(--brand-gradient)', color: '#fff', fontSize: 25, fontWeight: 800, boxShadow: '0 12px 28px rgba(79,70,229,0.24)' }}>A</span>
+      <div style={{ fontSize: 22, fontWeight: 760, letterSpacing: '-0.03em' }}>What can I help you with?</div>
+      <div style={{ fontSize: 13, color: 'var(--text-muted)' }}>Start a new ApplyMate conversation below.</div>
+    </div>
+  </div>
 }
 
 function TaskRow({ role, status, value, warn = false }: { role: string; status: string; value: string; warn?: boolean }) {
@@ -184,11 +208,13 @@ const taskRow: CSSProperties = { display: 'flex', alignItems: 'center', gap: 8, 
 const metaText: CSSProperties = { fontSize: 10, color: 'var(--text-muted)', marginTop: 3 }
 const headerStyle: CSSProperties = { height: 64, borderBottom: '1px solid var(--border)', padding: '12px 18px', display: 'flex', alignItems: 'center', justifyContent: 'space-between' }
 const transcriptStyle: CSSProperties = { flex: 1, overflowY: 'auto', padding: '16px 18px', display: 'flex', flexDirection: 'column', gap: 12 }
-const composerWrap: CSSProperties = { borderTop: '1px solid var(--border)', padding: '10px 16px 14px', background: 'var(--bg-secondary)' }
-const composerBox: CSSProperties = { border: '1px solid rgba(79,70,229,.35)', borderRadius: 10, background: 'var(--bg)', padding: 9 }
-const textareaStyle: CSSProperties = { width: '100%', minHeight: 54, border: 0, outline: 0, resize: 'none', fontFamily: 'inherit', background: 'transparent', color: 'var(--text)' }
-const iconButton: CSSProperties = { width: 30, height: 30, borderRadius: 7, border: '1px solid var(--border)', background: 'var(--bg)', color: 'var(--primary)' }
-const selectButton: CSSProperties = { height: 30, borderRadius: 7, border: '1px solid var(--border)', background: 'var(--bg)', color: 'var(--text)', padding: '0 12px' }
-const sendButton: CSSProperties = { width: 34, height: 30, borderRadius: 7, border: 0, background: 'var(--primary)', color: '#fff', fontWeight: 900 }
+const composerWrap: CSSProperties = { borderTop: '1px solid rgba(79,70,229,.08)', padding: '12px 16px 14px', background: 'linear-gradient(180deg,rgba(248,250,252,.72),var(--bg-secondary))' }
+const chipRowStyle: CSSProperties = { display: 'flex', gap: 7, overflowX: 'auto', marginBottom: 10, padding: '1px 1px 3px' }
+const composerBox: CSSProperties = { border: '1px solid rgba(99,102,241,.22)', borderRadius: 18, background: 'rgba(255,255,255,.96)', padding: '5px 7px 7px 8px', boxShadow: '0 12px 28px rgba(49,46,129,.10),0 2px 7px rgba(15,23,42,.04)' }
+const textareaStyle: CSSProperties = { width: '100%', boxSizing: 'border-box', minHeight: 66, padding: '8px 6px 7px', border: 0, outline: 0, resize: 'none', fontFamily: 'inherit', fontSize: 14, lineHeight: 1.5, background: 'transparent', color: 'var(--text)' }
+const iconButton: CSSProperties = { width: 34, height: 34, display: 'grid', placeItems: 'center', borderRadius: 12, border: 0, background: 'rgba(79,70,229,.08)', color: 'var(--primary)' }
+const selectButton: CSSProperties = { height: 34, display: 'inline-flex', alignItems: 'center', gap: 6, borderRadius: 12, border: 0, background: 'rgba(15,23,42,.045)', color: 'var(--text-muted)', padding: '0 10px', fontSize: 11, fontWeight: 700 }
+const sendButton: CSSProperties = { width: 38, height: 38, display: 'grid', placeItems: 'center', borderRadius: 14, border: 0, background: 'var(--brand-gradient)', color: '#fff', boxShadow: '0 8px 16px rgba(79,70,229,.28)' }
+const composerChipStyle: CSSProperties = { minHeight: 34, flexShrink: 0, display: 'inline-flex', alignItems: 'center', gap: 7, padding: '0 12px', border: '1px solid rgba(79,70,229,.14)', borderRadius: 999, background: 'rgba(255,255,255,.82)', boxShadow: '0 2px 7px rgba(15,23,42,.035)', color: 'var(--text)', fontSize: 11.5, fontWeight: 650, fontFamily: 'inherit' }
 const chipStyle: CSSProperties = { border: '1px solid var(--border)', borderRadius: 7, background: 'var(--bg)', color: 'var(--text)', padding: '6px 10px', fontSize: 11 }
 const tdStyle: CSSProperties = { borderTop: '1px solid var(--border)', padding: '7px 8px' }

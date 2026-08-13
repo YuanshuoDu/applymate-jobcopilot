@@ -11,6 +11,11 @@ export interface AgentSessionSummary {
   completedAt: string | null
 }
 
+export interface AgentSessionsResponse {
+  sessions: AgentSessionSummary[]
+  lastOpenedSessionId: string | null
+}
+
 export interface AgentTranscriptEvent {
   id: string
   taskId: string | null

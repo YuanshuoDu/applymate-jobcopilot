@@ -14,10 +14,10 @@ interface AgentLiveStreamBodyProps {
   liveBlocks: AgentTranscriptEvent[]
   applyQueue: ApplyReadyJob[]
   isEmpty: boolean
+  isRestoringSession: boolean
   revealThinkingVersion: number
   streamScrollRef: React.RefObject<HTMLDivElement | null>
   streamEndRef: React.RefObject<HTMLDivElement | null>
-  onSelectPrompt: (prompt: string) => void
   onAnswerQuestion: (entry: LogEntry, opt: QuestionOption) => Promise<void> | void
   onAnswerOrchestrator: (questionId: string, answer: string, options?: QuestionOption[]) => Promise<void> | void
   onApplied: (jobId: string, job: ApplyReadyJob) => void
@@ -30,10 +30,10 @@ export function AgentLiveStreamBody({
   liveBlocks,
   applyQueue,
   isEmpty,
+  isRestoringSession,
   revealThinkingVersion,
   streamScrollRef,
   streamEndRef,
-  onSelectPrompt,
   onAnswerQuestion,
   onAnswerOrchestrator,
   onApplied,
@@ -57,8 +57,10 @@ export function AgentLiveStreamBody({
       onScroll={event => onFollowStateChange(shouldStickToBottom(event.currentTarget))}
       style={{ flex: 1, minHeight: 0, overflowY: 'auto', overscrollBehavior: 'contain', padding: '18px 20px', display: 'flex', flexDirection: 'column', gap: 12 }}
     >
-      {isEmpty ? (
-        <AgentNewChatWelcome onSelectPrompt={onSelectPrompt} />
+      {isRestoringSession ? (
+        <p style={{ margin: 'auto', color: 'var(--text-muted)', fontSize: 14 }}>Loading conversation…</p>
+      ) : isEmpty ? (
+        <AgentNewChatWelcome />
       ) : (
         <>
           {log.map((entry, i) => {

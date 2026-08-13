@@ -7,6 +7,7 @@ const mocks = vi.hoisted(() => ({
   applicationTaskFindMany: vi.fn(),
   executionFindFirst: vi.fn(),
   deleteMany: vi.fn(),
+  updateMany: vi.fn(),
 }))
 
 vi.mock("@/lib/api-helpers", () => ({
@@ -21,6 +22,7 @@ vi.mock("@/lib/db", () => ({
     agentSession: {
       findFirst: mocks.findFirst,
       deleteMany: mocks.deleteMany,
+      updateMany: mocks.updateMany,
     },
     agentRunQuestion: { findMany: mocks.questionFindMany },
     applicationTask: { findMany: mocks.applicationTaskFindMany },
@@ -43,8 +45,10 @@ describe("agent session detail API", () => {
     mocks.applicationTaskFindMany.mockReset()
     mocks.executionFindFirst.mockReset()
     mocks.deleteMany.mockReset()
+    mocks.updateMany.mockReset()
     mocks.requireAuth.mockResolvedValue({ userId: "user_1" })
     mocks.deleteMany.mockResolvedValue({ count: 1 })
+    mocks.updateMany.mockResolvedValue({ count: 1 })
     mocks.questionFindMany.mockResolvedValue([])
     mocks.applicationTaskFindMany.mockResolvedValue([])
     mocks.executionFindFirst.mockResolvedValue(null)
@@ -204,6 +208,29 @@ describe("agent session detail API", () => {
     expect(mocks.deleteMany).toHaveBeenCalledWith({
       where: { id: "session_1", userId: "user_1" },
     })
+  })
+
+  it("records the last opened session only when it belongs to the user", async () => {
+    const { PATCH } = await import("./route")
+
+    const res = await PATCH(getRequest() as never, params)
+
+    expect(res.status).toBe(200)
+    await expect(res.json()).resolves.toEqual({ id: "session_1" })
+    expect(mocks.updateMany).toHaveBeenCalledWith({
+      where: { id: "session_1", userId: "user_1" },
+      data: { lastViewedAt: expect.any(Date) },
+    })
+  })
+
+  it("does not record a session outside the current user", async () => {
+    mocks.updateMany.mockResolvedValueOnce({ count: 0 })
+    const { PATCH } = await import("./route")
+
+    const res = await PATCH(getRequest() as never, params)
+
+    expect(res.status).toBe(404)
+    await expect(res.json()).resolves.toEqual({ error: "Session not found" })
   })
 
   it("does not delete a session outside the current user", async () => {

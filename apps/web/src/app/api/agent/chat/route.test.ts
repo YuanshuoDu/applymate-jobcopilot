@@ -206,6 +206,10 @@ describe("agent chat API session recording", () => {
       userId: 'user_1',
       message: 'Continue',
       model: { provider: 'test', model: 'm1' },
+      conversationHistory: [
+        { role: 'user', content: 'Previous question' },
+        { role: 'assistant', content: 'Previous answer' },
+      ],
     }))
     expect(mocks.runChatWorker).toHaveBeenCalledTimes(1)
   })

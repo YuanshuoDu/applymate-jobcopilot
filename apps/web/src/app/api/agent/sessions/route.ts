@@ -48,25 +48,37 @@ export async function GET(req: NextRequest) {
     data: { status: "completed", completedAt },
   })
 
-  const sessions = await db.agentSession.findMany({
-    where: { userId: auth.userId },
-    orderBy: { createdAt: "desc" },
-    take: 50,
-    select: {
-      id: true,
-      goal: true,
-      status: true,
-      source: true,
-      memorySummary: true,
-      qualityScore: true,
-      currentTaskId: true,
-      createdAt: true,
-      updatedAt: true,
-      completedAt: true,
-    },
-  })
+  const [sessions, lastOpenedSession] = await Promise.all([
+    db.agentSession.findMany({
+      where: { userId: auth.userId },
+      orderBy: { updatedAt: "desc" },
+      take: 50,
+      select: {
+        id: true,
+        goal: true,
+        status: true,
+        source: true,
+        memorySummary: true,
+        qualityScore: true,
+        currentTaskId: true,
+        createdAt: true,
+        updatedAt: true,
+        completedAt: true,
+      },
+    }),
+    db.agentSession.findFirst({
+      where: { userId: auth.userId, lastViewedAt: { not: null } },
+      orderBy: { lastViewedAt: "desc" },
+      select: { id: true },
+    }),
+  ])
 
-  return ok({ sessions: sessions.map(serializeSession) })
+  return ok({
+    sessions: sessions.map(serializeSession),
+    // Existing accounts created before this column was introduced should still
+    // resume the most recent conversation instead of opening a blank page.
+    lastOpenedSessionId: lastOpenedSession?.id ?? sessions[0]?.id ?? null,
+  })
 }
 
 export async function POST(req: NextRequest) {

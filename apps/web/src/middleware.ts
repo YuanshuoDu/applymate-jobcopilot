@@ -54,6 +54,12 @@ export async function middleware(req: NextRequest) {
     return applyAdminSecurityHeaders(NextResponse.json({ error: 'Administrator API is only available on the administrator host' }, { status: 404 }))
   }
 
+  // The visual Agent workspace preview is intentionally available only to a
+  // local non-production developer session. It does not expose account data.
+  if (pathname === '/agent-preview' && isLocalHost(hostname) && process.env.NODE_ENV !== 'production') {
+    return NextResponse.next()
+  }
+
   // ── Allow public routes through ────────────────────────────
   if (PUBLIC_ROUTES.some(p => pathname.startsWith(p))) {
     return NextResponse.next()

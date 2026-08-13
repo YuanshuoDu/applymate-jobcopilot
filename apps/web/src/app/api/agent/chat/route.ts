@@ -18,6 +18,7 @@ import { appendTranscriptEvent, createAgentSession, updateAgentSession } from '@
 import { runSubAgentTask } from '@/lib/agent/session/subagent-task-runner'
 import { approvalRequestFrom, automationDraftFrom, resumeTailoringApprovalFrom } from './blocks'
 import { correctedScoutPlan, createChatPlan, requestedMinMatchScore, requestsFullWorkflow, runChatWorker, scoutResultMatchesRequest, synthesizeChatResult, type ChatPlan, type ChatWorkerResult } from './chat-orchestrator'
+import { readSessionConversationHistory } from './session-history'
 import {
   latestUserMessage,
   readChatMessages,
@@ -65,12 +66,13 @@ export async function POST(req: NextRequest) {
   const session = await resolveChatSession(prep.userId, body, userMessage)
   if (session instanceof Response) return session
 
-  const [agentCfg, jobs, resume, lastActivity] = await Promise.all([
+  const [agentCfg, jobs, resume, lastActivity, conversationHistory] = await Promise.all([
     db.agentConfig.findUnique({ where: { userId: prep.userId } }),
     db.job.findMany({ where: { userId: prep.userId }, orderBy: { updatedAt: 'desc' }, take: 15, select: { id: true, company: true, role: true, score: true, status: true, workflowState: true, url: true } }),
     db.resume.findFirst({ where: { userId: prep.userId, isDefault: true }, select: { id: true, name: true } })
       ?? db.resume.findFirst({ where: { userId: prep.userId }, orderBy: { createdAt: 'desc' }, select: { id: true, name: true } }),
     db.activity.findFirst({ where: { userId: prep.userId, type: 'agent_action' }, orderBy: { createdAt: 'desc' }, select: { createdAt: true } }),
+    readSessionConversationHistory(db, session.id),
   ])
 
   const ctxData = {
@@ -129,6 +131,7 @@ export async function POST(req: NextRequest) {
       let plan = await createChatPlan({
         userId: prep.userId,
         message: userMessage,
+        conversationHistory,
         config: agentCfg,
         jobs,
         model,
@@ -149,9 +152,9 @@ export async function POST(req: NextRequest) {
         constraints: ['Work only on the assigned specialty.', 'Use only the supplied user context and connected sources.'],
         successCriteria: ['Return a concise, structured result for the orchestrator.'],
         allowedActions: assignedPlan.role === 'scout' ? ['live_job_search', 'read_context'] : ['read_context', 'generate_result'],
-        context: { userMessage, jobs: ctxData.recentJobs }, expectedOutputSchema: { type: 'object', required: ['summary', 'result'] },
+        context: { userMessage, conversationHistory, jobs: ctxData.recentJobs }, expectedOutputSchema: { type: 'object', required: ['summary', 'result'] },
       }, async () => {
-        const worker = await runChatWorker({ userId: prep.userId, message: userMessage, config: agentCfg, jobs, model }, assignedPlan)
+        const worker = await runChatWorker({ userId: prep.userId, message: userMessage, conversationHistory, config: agentCfg, jobs, model }, assignedPlan)
         return {
           result: worker,
           confidence: worker.confidence,
@@ -188,7 +191,7 @@ export async function POST(req: NextRequest) {
           data: { jobs: jobRows },
         })
       }
-      fullText = await synthesizeChatResult({ userId: prep.userId, message: userMessage, config: agentCfg, jobs, model }, plan, worker)
+      fullText = await synthesizeChatResult({ userId: prep.userId, message: userMessage, conversationHistory, config: agentCfg, jobs, model }, plan, worker)
       send('text', { delta: fullText })
     } catch (error) {
       const message = error instanceof Error ? error.message : 'Agent chat failed.'
