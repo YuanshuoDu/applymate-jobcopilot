@@ -17,5 +17,6 @@ describe('DashboardPage mobile layout', () => {
     expect(css).toMatch(/\.momentum-goal-legend \{ flex-wrap: wrap/)
     expect(css).toMatch(/@container \(max-width: 680px\)/)
     expect(css).toMatch(/@container \(max-width: 510px\)/)
+    expect(css).toMatch(/\.momentum-goal-legend \{ flex-wrap: wrap; justify-content: flex-start; gap: 8px 12px/)
   })
 })
