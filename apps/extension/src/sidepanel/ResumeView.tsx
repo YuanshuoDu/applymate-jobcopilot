@@ -31,6 +31,7 @@ import {
   scoreResume, suggestResume, getRecentJobs, exportApplicationPackLocally,
 } from '@/lib/api'
 import type { ExtensionSettings, ScrapedJob, ResumeListItem, Resume, ResumeContent, TemplateOptions, ScoreResult, Suggestion } from '@/lib/types'
+import { scoreColorsFor } from '@/lib/score-colors'
 
 // ── Design tokens ────────────────────────────────────────────────────────────────
 const C = {
@@ -136,6 +137,7 @@ export function ResumeView({ settings }: Props) {
   const saveTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
   const fileInputRef = useRef<HTMLInputElement>(null)
   const apiBase = settings.apiBaseUrl
+  const scoreColors = scoreResult ? scoreColorsFor(scoreResult.score) : null
 
   function showToast(msg: string) { setToast(msg); setTimeout(() => setToast(''), 2500) }
 
@@ -446,14 +448,14 @@ export function ResumeView({ settings }: Props) {
               <Sparkles size={13} aria-hidden="true" /> {analyzing ? 'Analyzing…' : scoreResult ? 'Re-analyze match' : 'Analyze match'}
             </button>
 
-            {scoreResult && (
+            {scoreResult && scoreColors && (
               <div style={{ marginTop: 10 }}>
                 <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-                  <div style={{ width: 48, height: 48, borderRadius: '50%', background: `conic-gradient(${scoreResult.score >= 80 ? C.green : scoreResult.score >= 50 ? C.primary : C.amber} ${scoreResult.score}%, ${C.border} ${scoreResult.score}%)`, display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0 }}>
-                    <div style={{ width: 36, height: 36, borderRadius: '50%', background: C.card, display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 14, fontWeight: 700, color: scoreResult.score >= 80 ? C.green : scoreResult.score >= 50 ? C.primary : C.amber }}>{scoreResult.score}</div>
+                  <div style={{ width: 48, height: 48, borderRadius: '50%', background: `conic-gradient(${scoreColors.color} ${scoreResult.score}%, rgba(0,0,0,.07) ${scoreResult.score}%)`, display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0 }}>
+                    <div style={{ width: 36, height: 36, borderRadius: '50%', background: C.card, display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 14, fontWeight: 700, color: scoreColors.color }}>{scoreResult.score}</div>
                   </div>
                   <div>
-                    <div style={{ fontSize: 11, fontWeight: 600, color: C.text }}>{scoreResult.score >= 80 ? 'Strong Match' : scoreResult.score >= 50 ? 'Good Match' : 'Needs Work'}</div>
+                    <div style={{ fontSize: 11, fontWeight: 600, color: C.text }}>{scoreColors.tone === 'strong' ? 'Strong Match' : scoreColors.tone === 'normal' ? 'Good Match' : 'Needs Work'}</div>
                     {scoreResult.strengthSummary && <div style={{ fontSize: 9, color: C.muted, marginTop: 2 }}>{scoreResult.strengthSummary}</div>}
                   </div>
                 </div>

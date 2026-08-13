@@ -41,6 +41,7 @@ import { ResumeView } from './ResumeView'
 import type { DashboardSnapshot } from '@/lib/api'
 import type { ExtensionSettings, SavedJob, ScrapedJob } from '@/lib/types'
 import type { FormFieldSchema } from '@/lib/form-filler/types'
+import { scoreToneFor } from '@/lib/score-colors'
 import './sidepanel.css'
 
 type ExtLang = 'en' | 'de' | 'fr' | 'es' | 'nl' | 'zh'
@@ -496,6 +497,7 @@ function TrackerPanel({ settings, L, onOpenResume }: { settings: ExtensionSettin
   const weeklyProgress = Math.min(weeklyApplications / weeklyTarget * 100, 100)
   const highMatchThreshold = dashboard?.minMatchScore ?? 75
   const highMatch = jobs.filter(job => job.score != null && job.score >= highMatchThreshold).sort((a, b) => (b.score ?? 0) - (a.score ?? 0))[0] ?? null
+  const highMatchTone = highMatch ? scoreToneFor(highMatch.score ?? 0) : null
   const unscoredCount = jobs.filter(job => job.score == null).length
 
   async function scoreJob(job: SavedJob) {
@@ -539,7 +541,7 @@ function TrackerPanel({ settings, L, onOpenResume }: { settings: ExtensionSettin
             </div>
             <div className="am-overview-cell">
               <div className="am-overview-label"><Sparkles size={12} aria-hidden="true" />High match opportunity</div>
-              {highMatch ? <div className="am-highlight"><div className="am-highlight-main"><span className="am-highlight-mark">{companyInitials(highMatch.company)}</span><div className="am-highlight-copy"><div className="am-highlight-role" title={highMatch.role}>{highMatch.role}</div><div className="am-highlight-company" title={highMatch.company}>{highMatch.company}</div></div></div><div className="am-highlight-actions"><span className="am-highlight-score">{highMatch.score}% match</span><button className="am-action-link" type="button" onClick={() => focusJob(highMatch.id)}>View job <ArrowRight size={10} aria-hidden="true" /></button></div></div> : <div className="am-overview-copy">Score a saved role to see your strongest match here.</div>}
+              {highMatch ? <div className="am-highlight"><div className="am-highlight-main"><span className="am-highlight-mark">{companyInitials(highMatch.company)}</span><div className="am-highlight-copy"><div className="am-highlight-role" title={highMatch.role}>{highMatch.role}</div><div className="am-highlight-company" title={highMatch.company}>{highMatch.company}</div></div></div><div className="am-highlight-actions"><span className={`am-highlight-score ${highMatchTone}`}>{highMatch.score}% match</span><button className="am-action-link" type="button" onClick={() => focusJob(highMatch.id)}>View job <ArrowRight size={10} aria-hidden="true" /></button></div></div> : <div className="am-overview-copy">Score a saved role to see your strongest match here.</div>}
             </div>
           </div>
         </section>
@@ -609,7 +611,7 @@ function JobCard({ job, expanded, onToggle, settings, onScore, scoring, L }: {
   const notesTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
   const displayStatus = visibleStatus(job.status)
   const keyTags = keyTagsForJob(job)
-  const scoreTone = job.score != null && job.score >= 70 ? 'strong' : job.score != null && job.score < 60 ? 'weak' : 'normal'
+  const scoreTone = job.score == null ? 'normal' : scoreToneFor(job.score)
 
   useEffect(() => {
     const nextNotes = job.notes ?? ''

@@ -1,6 +1,7 @@
 import { useState } from 'react'
 import { Check, Linkedin, MapPin, Search, Sparkles } from 'lucide-react'
 import type { ScoreResult, ScrapedJob } from '@/lib/types'
+import { scoreColorsFor } from '@/lib/score-colors'
 import { C, type PopupLabels } from './popup-constants'
 import { companyDomain, companyInitials, sourceLabel } from './popup-utils'
 
@@ -15,7 +16,8 @@ export function DetectionRow({ job, labels }: { job: ScrapedJob | null; labels: 
 
 export function JobSummary({ job, score, labels }: { job: ScrapedJob; score: number | null; labels: PopupLabels }) {
   const [logoFailed, setLogoFailed] = useState(false)
-  const summary = score == null ? labels.readyToAnalyze : score >= 80 ? labels.strongFit : score >= 60 ? 'Good fit — review the role details.' : 'Review this role carefully before applying.'
+  const scoreColors = score == null ? null : scoreColorsFor(score)
+  const summary = score == null ? labels.readyToAnalyze : scoreColors?.tone === 'strong' ? labels.strongFit : scoreColors?.tone === 'normal' ? 'Good fit — review the role details.' : 'Review this role carefully before applying.'
   return <section style={{ marginTop: 10, padding: '14px 12px 12px', border: `1px solid ${C.border}`, borderRadius: 14, background: C.panel, boxShadow: C.shadow }}>
     <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
       <div style={{ width: 56, height: 56, display: 'grid', placeItems: 'center', overflow: 'hidden', flexShrink: 0, borderRadius: 13, background: '#131313', color: '#fff', fontWeight: 650, fontSize: job.company.length > 4 ? 11 : 16 }}>
@@ -29,8 +31,8 @@ export function JobSummary({ job, score, labels }: { job: ScrapedJob; score: num
       </div>
       <ScoreRing score={score} labels={labels} />
     </div>
-    <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginTop: 11, padding: '8px 10px', borderRadius: 10, background: score == null ? C.lavender : C.greenBg, color: score == null ? C.primary : C.green }}>
-      <span style={{ width: 20, height: 20, display: 'grid', placeItems: 'center', flexShrink: 0, borderRadius: '50%', background: score == null ? 'rgba(81,70,229,0.12)' : '#43B985' }}>{score == null ? <Sparkles size={12} strokeWidth={2} /> : <Check size={13} strokeWidth={2.8} color="#fff" />}</span>
+    <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginTop: 11, padding: '8px 10px', borderRadius: 10, background: scoreColors?.background ?? C.lavender, color: scoreColors?.color ?? C.primary }}>
+      <span style={{ width: 20, height: 20, display: 'grid', placeItems: 'center', flexShrink: 0, borderRadius: '50%', background: scoreColors?.color ?? 'rgba(81,70,229,0.12)' }}>{score == null ? <Sparkles size={12} strokeWidth={2} /> : <Check size={13} strokeWidth={2.8} color="#fff" />}</span>
       <span style={{ fontSize: 11.5, fontWeight: 640, lineHeight: 1.3 }}>{summary}</span>
     </div>
   </section>
@@ -38,14 +40,15 @@ export function JobSummary({ job, score, labels }: { job: ScrapedJob; score: num
 
 function ScoreRing({ score, labels }: { score: number | null; labels: PopupLabels }) {
   const value = score == null ? 0 : Math.max(0, Math.min(100, score))
+  const scoreColors = score == null ? null : scoreColorsFor(score)
   const radius = 22
   const circumference = 2 * Math.PI * radius
   const offset = circumference - (value / 100) * circumference
   return <div role="img" aria-label={score == null ? labels.readyToAnalyze : `${score}% ${labels.match.toLowerCase()}`} style={{ position: 'relative', width: 62, height: 62, flexShrink: 0 }}>
     <svg width="62" height="62" viewBox="0 0 62 62" style={{ transform: 'rotate(-90deg)' }} aria-hidden="true">
-      <circle cx="31" cy="31" r={radius} fill="none" stroke="#E6E8F5" strokeWidth="5" />
-      {score != null && <circle cx="31" cy="31" r={radius} fill="none" stroke={C.green} strokeWidth="5" strokeLinecap="round" strokeDasharray={circumference} strokeDashoffset={offset} />}
+      <circle cx="31" cy="31" r={radius} fill="none" stroke="rgba(0,0,0,0.07)" strokeWidth="5" />
+      {score != null && <circle cx="31" cy="31" r={radius} fill="none" stroke={scoreColors?.color} strokeWidth="5" strokeLinecap="round" strokeDasharray={circumference} strokeDashoffset={offset} />}
     </svg>
-    <div style={{ position: 'absolute', inset: 0, display: 'grid', placeItems: 'center', textAlign: 'center' }}><strong style={{ fontSize: score == null ? 14 : 15, color: score == null ? C.subtle : C.navy, lineHeight: 1 }}>{score == null ? '—' : `${score}%`}</strong><span style={{ position: 'absolute', top: 38, fontSize: 8, color: C.muted }}>{labels.match}</span></div>
+    <div style={{ position: 'absolute', inset: 0, display: 'grid', placeItems: 'center', textAlign: 'center' }}><strong style={{ fontSize: score == null ? 14 : 15, color: scoreColors?.color ?? C.subtle, lineHeight: 1 }}>{score == null ? '—' : `${score}%`}</strong><span style={{ position: 'absolute', top: 38, fontSize: 8, color: C.muted }}>{labels.match}</span></div>
   </div>
 }
