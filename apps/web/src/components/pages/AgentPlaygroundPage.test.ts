@@ -22,6 +22,8 @@ describe('Agent workspace responsive layout', () => {
     expect(source).toContain('Back to Home')
     expect(source).toContain('agent-session-drawer-home')
     expect(source).toContain("navigate('dashboard')")
+    expect(source).toContain('Collapse conversations')
+    expect(source).toContain('agent-session-drawer-collapse')
   })
 
   it('restores the last opened session and records future session views server-side', () => {

@@ -1,7 +1,7 @@
 'use client'
 
 import React, { useState, useEffect, useRef, useCallback } from 'react'
-import { Home, PanelLeftOpen } from 'lucide-react'
+import { Home, PanelLeftClose, PanelLeftOpen } from 'lucide-react'
 import { TopBar }              from '@/components/layout/TopBar'
 import { useToast } from '@/components/ui'
 import { useApi, apiMutate }   from '@/lib/hooks'
@@ -519,6 +519,24 @@ export function AgentPlaygroundPage() {
             font-weight: 750;
           }
 
+          .agent-session-drawer-actions {
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+          }
+
+          .agent-session-drawer-collapse {
+            display: inline-grid;
+            width: 34px;
+            height: 34px;
+            place-items: center;
+            border: 1px solid var(--border);
+            border-radius: 10px;
+            color: var(--text-muted);
+            background: var(--bg);
+            cursor: pointer;
+          }
+
           .agent-session-drawer-home {
             display: inline-flex;
             align-items: center;
@@ -565,6 +583,7 @@ export function AgentPlaygroundPage() {
           .agent-session-drawer-scrim,
           .agent-session-drawer-header,
           .agent-session-drawer-home,
+          .agent-session-drawer-collapse,
           .agent-session-drawer-trigger {
             display: none;
           }
@@ -610,13 +629,18 @@ export function AgentPlaygroundPage() {
         <div id="agent-session-drawer" className={`agent-session-drawer${mobileSessionDrawerOpen ? ' is-open' : ''}`}>
           <div className="agent-session-drawer-header">
             <span>Conversations</span>
-            <button className="agent-session-drawer-home" type="button" aria-label="Back to Home" onClick={() => {
-              setMobileSessionDrawerOpen(false)
-              navigate('dashboard')
-            }}>
-              <Home size={15} aria-hidden="true" />
-              Back to Home
-            </button>
+            <div className="agent-session-drawer-actions">
+              <button className="agent-session-drawer-home" type="button" aria-label="Back to Home" onClick={() => {
+                setMobileSessionDrawerOpen(false)
+                navigate('dashboard')
+              }}>
+                <Home size={15} aria-hidden="true" />
+                Back to Home
+              </button>
+              <button className="agent-session-drawer-collapse" type="button" aria-label="Collapse conversations" onClick={() => setMobileSessionDrawerOpen(false)}>
+                <PanelLeftClose size={17} aria-hidden="true" />
+              </button>
+            </div>
           </div>
           <AgentSessionConsole
             selectedSessionId={selectedSessionId}

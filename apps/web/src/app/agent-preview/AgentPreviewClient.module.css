@@ -67,6 +67,24 @@
     font-weight: 750;
   }
 
+  .root :global(.agent-preview-drawer-actions) {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+  }
+
+  .root :global(.agent-preview-drawer-collapse) {
+    display: inline-grid;
+    width: 34px;
+    height: 34px;
+    place-items: center;
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    color: var(--text-muted);
+    background: var(--bg);
+    cursor: pointer;
+  }
+
   .root :global(.agent-preview-drawer-home) {
     display: inline-flex;
     align-items: center;
@@ -111,7 +129,8 @@
   .root :global(.agent-preview-drawer-trigger),
   .root :global(.agent-preview-drawer-scrim),
   .root :global(.agent-preview-drawer-header),
-  .root :global(.agent-preview-drawer-home) {
+  .root :global(.agent-preview-drawer-home),
+  .root :global(.agent-preview-drawer-collapse) {
     display: none;
   }
 

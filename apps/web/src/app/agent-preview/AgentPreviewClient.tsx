@@ -1,6 +1,6 @@
 'use client'
 
-import { ArrowUp, ChevronDown, Home, Paperclip, PanelLeftOpen, Sparkles } from 'lucide-react'
+import { ArrowUp, ChevronDown, Home, Paperclip, PanelLeftClose, PanelLeftOpen, Sparkles } from 'lucide-react'
 import { useState, type CSSProperties } from 'react'
 import styles from './AgentPreviewClient.module.css'
 import { Sidebar } from '@/components/layout/Sidebar'
@@ -42,10 +42,15 @@ export function AgentPreviewClient() {
       <div id="agent-preview-drawer" className={`agent-preview-drawer${drawerOpen ? ' is-open' : ''}`}>
         <div className="agent-preview-drawer-header">
           <span>Conversations</span>
-          <button className="agent-preview-drawer-home" type="button" aria-label="Back to Home" onClick={() => { window.location.assign('/?page=dashboard') }}>
-            <Home size={15} aria-hidden="true" />
-            Back to Home
-          </button>
+          <div className="agent-preview-drawer-actions">
+            <button className="agent-preview-drawer-home" type="button" aria-label="Back to Home" onClick={() => { window.location.assign('/?page=dashboard') }}>
+              <Home size={15} aria-hidden="true" />
+              Back to Home
+            </button>
+            <button className="agent-preview-drawer-collapse" type="button" aria-label="Collapse conversations" onClick={() => setDrawerOpen(false)}>
+              <PanelLeftClose size={17} aria-hidden="true" />
+            </button>
+          </div>
         </div>
         <aside className="agent-preview-console" style={agentSidebar}>
           <div style={{ padding: 14, borderBottom: '1px solid var(--border)' }}>
