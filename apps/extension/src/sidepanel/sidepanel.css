@@ -33,6 +33,11 @@
 .am-panel-body { flex: 1; min-height: 0; overflow: hidden; }
 .am-panel-body > div:not([hidden]) { height: 100%; min-height: 0; overflow: hidden; }
 .am-tracker { height: 100%; min-height: 0; display: flex; flex-direction: column; overflow: hidden; background: var(--am-page); }
+.am-tracker-scroll { min-height: 0; flex: 1 1 auto; overflow-y: auto; overscroll-behavior: contain; scrollbar-color: #9aa1b8 transparent; scrollbar-width: auto; }
+.am-tracker-scroll::-webkit-scrollbar { width: 10px; }
+.am-tracker-scroll::-webkit-scrollbar-track { background: transparent; }
+.am-tracker-scroll::-webkit-scrollbar-thumb { border: 2px solid transparent; border-radius: 999px; background: #9aa1b8; background-clip: padding-box; }
+.am-tracker-scroll::-webkit-scrollbar-thumb:hover { background: #7e879f; background-clip: padding-box; }
 .am-overview { margin: 8px 12px 0; padding: 8px 10px 7px; border: 1px solid var(--am-line); border-radius: 10px; background: var(--am-panel); }
 .am-overview-grid { display: grid; grid-template-columns: 1fr 1fr 1.15fr; }
 .am-overview-cell { min-width: 0; padding: 0 10px; border-right: 1px solid var(--am-line); }
@@ -95,7 +100,7 @@
 .am-company-mark { width: 29px; height: 29px; display: grid; place-items: center; flex: 0 0 auto; border-radius: 7px; color: #fff; background: #263c76; font-size: 9px; font-weight: 800; }
 .am-current-copy { min-width: 0; flex: 1; }.am-current-title, .am-current-company { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }.am-current-title { color: var(--am-ink); font-size: 10px; font-weight: 700; }.am-current-company { margin-top: 2px; color: var(--am-muted); font-size: 9px; }
 .am-save-button { padding: 5px 8px; border: 0; border-radius: 6px; color: #fff; background: var(--am-primary); cursor: pointer; font-size: 9px; font-weight: 700; }.am-save-button:disabled { cursor: default; opacity: .65; }
-.am-list { min-height: 0; flex: 1 1 auto; overflow-y: auto; padding: 8px 12px 12px; overscroll-behavior: contain; }.am-list-inner { display: flex; flex-direction: column; gap: 5px; }
+.am-list { min-height: 0; padding: 8px 12px 12px; }.am-list-inner { display: flex; flex-direction: column; gap: 5px; }
 .am-job-card { overflow: hidden; border: 1px solid var(--am-line); border-radius: 9px; background: var(--am-panel); scroll-margin-block: 12px; }.am-job-card.expanded { border-color: #cfcff4; }
 .am-job-row { display: flex; align-items: center; gap: 8px; min-height: 54px; padding: 8px 9px; }.am-job-main { min-width: 0; flex: 1; padding: 0; border: 0; color: inherit; background: transparent; cursor: pointer; text-align: left; }.am-job-role, .am-job-company, .am-job-meta { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }.am-job-role { color: var(--am-ink); font-size: 11px; font-weight: 720; }.am-job-company { margin-top: 2px; color: var(--am-muted); font-size: 10px; }.am-job-meta { display: flex; align-items: center; gap: 4px; margin-top: 3px; color: var(--am-subtle); font-size: 9px; }.am-status-dot { width: 5px; height: 5px; flex: 0 0 auto; border-radius: 50%; }.am-status-pill { display: inline-flex; align-items: center; gap: 4px; margin-top: 4px; padding: 2px 5px; border-radius: 4px; font-size: 9px; font-weight: 650; }.am-job-tags-preview { display: flex; align-items: center; gap: 4px; min-width: 0; margin-top: 4px; overflow: hidden; }.am-job-tag-preview, .am-job-tag-more { overflow: hidden; max-width: 46%; padding: 2px 5px; border: 1px solid #dedef8; border-radius: 999px; color: var(--am-primary); background: var(--am-primary-soft); font-size: 8px; line-height: 1.15; text-overflow: ellipsis; white-space: nowrap; }.am-job-tag-more { max-width: none; border-color: transparent; background: transparent; font-weight: 700; }
 .am-job-card.expanded .am-job-tags-preview { display: none; }

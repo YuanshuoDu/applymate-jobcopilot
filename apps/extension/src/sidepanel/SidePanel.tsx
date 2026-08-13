@@ -524,45 +524,47 @@ function TrackerPanel({ settings, L, onOpenResume }: { settings: ExtensionSettin
 
   return (
     <div className="am-tracker">
-      <section className="am-overview" aria-label="Application overview">
-        <div className="am-overview-grid">
-          <div className="am-overview-cell">
-            <div className="am-overview-label"><Target size={12} aria-hidden="true" />Application momentum</div>
-            <div className="am-momentum-summary"><div className="am-momentum-ring" style={{ '--am-progress-angle': `${weeklyProgress * 3.6}deg` } as React.CSSProperties} aria-label={`${Math.round(weeklyProgress)}% of weekly target`}><strong>{Math.round(weeklyProgress)}%</strong><small>{Math.min(weeklyApplications, weeklyTarget)} / {weeklyTarget}</small></div><div className="am-momentum-copy"><strong>{weeklyApplications >= weeklyTarget ? 'Goal reached!' : 'Keep it up!'}</strong><span>{Math.max(1, 7 - new Date().getDay())} days left</span></div></div>
+      <div className="am-tracker-scroll">
+        <section className="am-overview" aria-label="Application overview">
+          <div className="am-overview-grid">
+            <div className="am-overview-cell">
+              <div className="am-overview-label"><Target size={12} aria-hidden="true" />Application momentum</div>
+              <div className="am-momentum-summary"><div className="am-momentum-ring" style={{ '--am-progress-angle': `${weeklyProgress * 3.6}deg` } as React.CSSProperties} aria-label={`${Math.round(weeklyProgress)}% of weekly target`}><strong>{Math.round(weeklyProgress)}%</strong><small>{Math.min(weeklyApplications, weeklyTarget)} / {weeklyTarget}</small></div><div className="am-momentum-copy"><strong>{weeklyApplications >= weeklyTarget ? 'Goal reached!' : 'Keep it up!'}</strong><span>{Math.max(1, 7 - new Date().getDay())} days left</span></div></div>
+            </div>
+            <div className="am-overview-cell">
+              <div className="am-overview-label"><BarChart3 size={12} aria-hidden="true" />Next step</div>
+              <div className="am-overview-copy">{!dashboard?.hasResume ? 'Add your resume to unlock match scoring.' : unscoredCount > 0 ? `${unscoredCount} saved role${unscoredCount === 1 ? '' : 's'} ready to score.` : `${Math.max(0, weeklyTarget - weeklyApplications)} applications this week to stay on track.`}</div>
+              <div className="am-progress-bar" aria-hidden="true"><span style={{ width: `${weeklyProgress}%` }} /></div>
+              <button className="am-overview-action" type="button" onClick={() => dashboard?.hasResume ? (unscoredCount ? void scoreJob(jobs.find(job => job.score == null)!) : chrome.tabs.create({ url: `${settings.apiBaseUrl}/jobs` })) : onOpenResume()}>{!dashboard?.hasResume ? 'Add resume' : unscoredCount ? 'Score a role' : 'View plan'}</button>
+            </div>
+            <div className="am-overview-cell">
+              <div className="am-overview-label"><Sparkles size={12} aria-hidden="true" />High match opportunity</div>
+              {highMatch ? <div className="am-highlight"><span className="am-highlight-mark">{companyInitials(highMatch.company)}</span><div className="am-highlight-copy"><div className="am-highlight-role" title={highMatch.role}>{highMatch.role}</div><div className="am-highlight-company" title={highMatch.company}>{highMatch.company}</div></div><span className="am-highlight-score">{highMatch.score}%</span></div> : <div className="am-overview-copy">Score a saved role to see your strongest match here.</div>}
+              {highMatch && <button className="am-action-link" type="button" onClick={() => focusJob(highMatch.id)}>View job <ArrowRight size={10} aria-hidden="true" /></button>}
+            </div>
           </div>
-          <div className="am-overview-cell">
-            <div className="am-overview-label"><BarChart3 size={12} aria-hidden="true" />Next step</div>
-            <div className="am-overview-copy">{!dashboard?.hasResume ? 'Add your resume to unlock match scoring.' : unscoredCount > 0 ? `${unscoredCount} saved role${unscoredCount === 1 ? '' : 's'} ready to score.` : `${Math.max(0, weeklyTarget - weeklyApplications)} applications this week to stay on track.`}</div>
-            <div className="am-progress-bar" aria-hidden="true"><span style={{ width: `${weeklyProgress}%` }} /></div>
-            <button className="am-overview-action" type="button" onClick={() => dashboard?.hasResume ? (unscoredCount ? void scoreJob(jobs.find(job => job.score == null)!) : chrome.tabs.create({ url: `${settings.apiBaseUrl}/jobs` })) : onOpenResume()}>{!dashboard?.hasResume ? 'Add resume' : unscoredCount ? 'Score a role' : 'View plan'}</button>
-          </div>
-          <div className="am-overview-cell">
-            <div className="am-overview-label"><Sparkles size={12} aria-hidden="true" />High match opportunity</div>
-            {highMatch ? <div className="am-highlight"><span className="am-highlight-mark">{companyInitials(highMatch.company)}</span><div className="am-highlight-copy"><div className="am-highlight-role" title={highMatch.role}>{highMatch.role}</div><div className="am-highlight-company" title={highMatch.company}>{highMatch.company}</div></div><span className="am-highlight-score">{highMatch.score}%</span></div> : <div className="am-overview-copy">Score a saved role to see your strongest match here.</div>}
-            {highMatch && <button className="am-action-link" type="button" onClick={() => focusJob(highMatch.id)}>View job <ArrowRight size={10} aria-hidden="true" /></button>}
-          </div>
+        </section>
+
+        <div className="am-stat-grid" aria-label="Application counts">
+          <StatCard className="saved" label="Saved" value={savedCount} icon={<Bookmark size={13} />} />
+          <StatCard className="applied" label="Applied" value={appliedCount} icon={<Send size={13} />} />
+          <StatCard className="interview" label="Interviews" value={interviewCount} icon={<MessageSquare size={13} />} />
+          <StatCard className="rejected" label="Rejected" value={rejectedCount} icon={<Ban size={13} />} />
         </div>
-      </section>
 
-      <div className="am-stat-grid" aria-label="Application counts">
-        <StatCard className="saved" label="Saved" value={savedCount} icon={<Bookmark size={13} />} />
-        <StatCard className="applied" label="Applied" value={appliedCount} icon={<Send size={13} />} />
-        <StatCard className="interview" label="Interviews" value={interviewCount} icon={<MessageSquare size={13} />} />
-        <StatCard className="rejected" label="Rejected" value={rejectedCount} icon={<Ban size={13} />} />
-      </div>
-
-      <div className="am-job-tools">
-        <div className="am-search-wrap"><label className="am-search"><Search size={15} aria-hidden="true" /><input value={search} onChange={event => setSearch(event.target.value)} placeholder="Search by role or company…" aria-label="Search jobs" />{search && <button className="am-search-clear" type="button" onClick={() => setSearch('')} aria-label="Clear search"><X size={13} /></button>}</label></div>
-        <div className="am-filter-strip" role="tablist" aria-label="Job status filters">
-          {([['all', 'All'], ['saved', L.saved], ['applied', L.applied], ['interview', 'Interviews'], ['rejected', L.rejected]] as const).map(([value, label]) => <button key={value} className={`am-filter${filterStatus === value ? ' active' : ''}`} type="button" role="tab" aria-selected={filterStatus === value} onClick={() => setFilterStatus(value)}>{label}</button>)}
+        <div className="am-job-tools">
+          <div className="am-search-wrap"><label className="am-search"><Search size={15} aria-hidden="true" /><input value={search} onChange={event => setSearch(event.target.value)} placeholder="Search by role or company…" aria-label="Search jobs" />{search && <button className="am-search-clear" type="button" onClick={() => setSearch('')} aria-label="Clear search"><X size={13} /></button>}</label></div>
+          <div className="am-filter-strip" role="tablist" aria-label="Job status filters">
+            {([['all', 'All'], ['saved', L.saved], ['applied', L.applied], ['interview', 'Interviews'], ['rejected', L.rejected]] as const).map(([value, label]) => <button key={value} className={`am-filter${filterStatus === value ? ' active' : ''}`} type="button" role="tab" aria-selected={filterStatus === value} onClick={() => setFilterStatus(value)}>{label}</button>)}
+          </div>
+          <div className="am-select-row"><select className="am-select" value={filterSource} onChange={event => setFilterSource(event.target.value)} aria-label="Filter by source"><option value="all">All sources</option>{availableSources.map(source => <option key={source} value={source}>{source}</option>)}</select><select className="am-select" value={sortBy} onChange={event => setSortBy(event.target.value as SortBy)} aria-label="Sort jobs"><option value="date">Newest first</option><option value="company">Company</option><option value="score">Match score</option></select></div>
         </div>
-        <div className="am-select-row"><select className="am-select" value={filterSource} onChange={event => setFilterSource(event.target.value)} aria-label="Filter by source"><option value="all">All sources</option>{availableSources.map(source => <option key={source} value={source}>{source}</option>)}</select><select className="am-select" value={sortBy} onChange={event => setSortBy(event.target.value as SortBy)} aria-label="Sort jobs"><option value="date">Newest first</option><option value="company">Company</option><option value="score">Match score</option></select></div>
-      </div>
 
-      {(jobsSyncError || dashboardSyncError) && <div className="am-sync-banner" role="alert"><div><strong>Sync needs attention</strong><span>{jobsSyncError || dashboardSyncError}</span>{(jobsSyncError ? lastJobsSyncedAt : lastDashboardSyncedAt) && <small>Last synced {formatSyncAge((jobsSyncError ? lastJobsSyncedAt : lastDashboardSyncedAt)!)}</small>}</div><button type="button" onClick={() => refreshAll(true)}>Retry</button></div>}
-      <CurrentPageBanner accountKey={`${settings.apiBaseUrl}|${settings.apiToken}|${settings.userEmail}`} onSaved={() => refreshAll()} />
-      <div className="am-list" ref={listRef}>
-        {loading ? <div className="am-spinner"><LoaderCircle className="am-spin" size={20} aria-label="Loading jobs" /></div> : filtered.length === 0 ? <EmptyState hasSearch={Boolean(search.trim())} filter={filterStatus} connectionError={Boolean(jobsSyncError)} onRetry={() => refreshAll(true)} onClearSearch={() => setSearch('')} onOpenDashboard={() => chrome.tabs.create({ url: `${settings.apiBaseUrl}/jobs` })} L={L} /> : <div className="am-list-inner">{filtered.map(job => <JobCard key={job.id} job={job} expanded={expandedId === job.id} onToggle={() => setExpandedId(current => current === job.id ? null : job.id)} settings={settings} L={L} scoring={scoringId === job.id} onScore={() => void scoreJob(job)} />)}</div>}
+        {(jobsSyncError || dashboardSyncError) && <div className="am-sync-banner" role="alert"><div><strong>Sync needs attention</strong><span>{jobsSyncError || dashboardSyncError}</span>{(jobsSyncError ? lastJobsSyncedAt : lastDashboardSyncedAt) && <small>Last synced {formatSyncAge((jobsSyncError ? lastJobsSyncedAt : lastDashboardSyncedAt)!)}</small>}</div><button type="button" onClick={() => refreshAll(true)}>Retry</button></div>}
+        <CurrentPageBanner accountKey={`${settings.apiBaseUrl}|${settings.apiToken}|${settings.userEmail}`} onSaved={() => refreshAll()} />
+        <div className="am-list" ref={listRef}>
+          {loading ? <div className="am-spinner"><LoaderCircle className="am-spin" size={20} aria-label="Loading jobs" /></div> : filtered.length === 0 ? <EmptyState hasSearch={Boolean(search.trim())} filter={filterStatus} connectionError={Boolean(jobsSyncError)} onRetry={() => refreshAll(true)} onClearSearch={() => setSearch('')} onOpenDashboard={() => chrome.tabs.create({ url: `${settings.apiBaseUrl}/jobs` })} L={L} /> : <div className="am-list-inner">{filtered.map(job => <JobCard key={job.id} job={job} expanded={expandedId === job.id} onToggle={() => setExpandedId(current => current === job.id ? null : job.id)} settings={settings} L={L} scoring={scoringId === job.id} onScore={() => void scoreJob(job)} />)}</div>}
+        </div>
       </div>
       <footer className="am-footer"><button className="am-footer-button" type="button" onClick={() => refreshAll(true)}><RefreshCw size={12} aria-hidden="true" /> Refresh</button><button className="am-footer-button primary" type="button" onClick={() => chrome.tabs.create({ url: `${settings.apiBaseUrl}/jobs` })}>View all jobs <ArrowRight size={12} aria-hidden="true" /></button></footer>
       {toast && <div className="am-toast" role="status">{toast}</div>}
