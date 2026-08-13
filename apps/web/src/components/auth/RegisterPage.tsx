@@ -425,9 +425,9 @@ export function RegisterPage({ callbackUrl: rawCallbackUrl = '/' }: { callbackUr
             {/* Terms */}
             <p style={{ fontSize: 11, color: C.muted, lineHeight: 1.6, margin: 0 }}>
               By signing up, you agree to our{' '}
-              <a href="#" style={{ color: C.primary, textDecoration: 'none', fontWeight: 500 }}>Terms of Service</a>
+              <a href="mailto:legal@applymate.ai?subject=Terms%20of%20service" style={{ color: C.primary, textDecoration: 'none', fontWeight: 500 }}>Terms of Service</a>
               {' '}and{' '}
-              <a href="#" style={{ color: C.primary, textDecoration: 'none', fontWeight: 500 }}>Privacy Policy</a>
+              <a href="mailto:legal@applymate.ai?subject=Privacy%20policy" style={{ color: C.primary, textDecoration: 'none', fontWeight: 500 }}>Privacy Policy</a>
             </p>
 
             {/* Submit */}

@@ -24,7 +24,11 @@ The landing form calls this endpoint and has four observable states: idle, submi
 
 Remove placeholder `href="#"` values from the landing page. Keep existing `/register` and `/login` routes for all signup and sign-in CTAs. Keep product section links as page anchors. Use the verified repository URL for GitHub. Use `mailto:` links with useful subjects for support, privacy, legal, company, press, and integration requests where the repository has no dedicated public route. These links must be represented by a small local configuration so they are easy to audit and cannot silently become dead anchors.
 
-The pricing cards continue to link to registration; checkout and billing are explicitly out of scope because no public billing endpoint exists.
+The Free pricing card links to registration. Pro trial and Team sales actions link to the contact section and prefill an explicit request because checkout and billing are explicitly out of scope while no public billing endpoint exists.
+
+### Product intent and responsive interactions
+
+Feature cards are actionable entry points rather than static claims. Resume, jobs, Gmail and agent cards use `/register?callbackUrl=...` links that return a newly authenticated user to the selected product page; the extension card uses the verified repository URL. Callback values accept only same-origin relative paths and are shared by login and registration, including OAuth. The mobile navigation exposes the same section links and auth actions, has an accessible menu button, and closes on Escape. FAQ rows use keyboard-operable disclosure buttons. A successful contact submission offers a reset action for another message, while a failed submission keeps the entered values.
 
 ## Data flow
 
@@ -50,7 +54,7 @@ The browser never receives provider credentials or raw provider error messages.
 - Public catalogue route tests cover active-only filtering and the safe public response shape.
 - Admin catalogue route tests cover access denial, valid updates, invalid prices/features, and the invariant that Free cannot be disabled.
 - Route tests mock `fetch` and cover invalid JSON, invalid fields, missing configuration, successful delivery, and provider failure.
-- Landing component tests verify the plans endpoint is called, pricing data is rendered, contact submission feedback is shown, errors preserve the form, and no `href="#"` remains in the rendered footer links.
+- Landing action tests verify safe feature callback links, paid-plan contact intent, pricing data rendering, contact submission feedback, errors preserving the form, keyboard-operable disclosure/menu controls, and no `href="#"` remains in the rendered footer links.
 - Settings and admin plan screens test that they render the same plan keys and update after a successful save.
 - Run the focused Vitest files, the web TypeScript check, and a local browser smoke test for the public page.
 
