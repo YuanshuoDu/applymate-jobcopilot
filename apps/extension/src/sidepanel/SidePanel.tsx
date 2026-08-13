@@ -609,7 +609,7 @@ function JobCard({ job, expanded, onToggle, settings, onScore, scoring, L }: {
   const notesTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
   const displayStatus = visibleStatus(job.status)
   const keyTags = keyTagsForJob(job)
-  const scoreTone = job.score != null && job.score >= 70 ? 'strong' : job.score != null && job.score < 65 ? 'weak' : 'normal'
+  const scoreTone = job.score != null && job.score >= 70 ? 'strong' : job.score != null && job.score < 60 ? 'weak' : 'normal'
 
   useEffect(() => {
     const nextNotes = job.notes ?? ''
