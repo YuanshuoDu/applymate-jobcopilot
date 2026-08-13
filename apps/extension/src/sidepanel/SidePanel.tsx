@@ -539,8 +539,7 @@ function TrackerPanel({ settings, L, onOpenResume }: { settings: ExtensionSettin
             </div>
             <div className="am-overview-cell">
               <div className="am-overview-label"><Sparkles size={12} aria-hidden="true" />High match opportunity</div>
-              {highMatch ? <div className="am-highlight"><span className="am-highlight-mark">{companyInitials(highMatch.company)}</span><div className="am-highlight-copy"><div className="am-highlight-role" title={highMatch.role}>{highMatch.role}</div><div className="am-highlight-company" title={highMatch.company}>{highMatch.company}</div></div><span className="am-highlight-score">{highMatch.score}%</span></div> : <div className="am-overview-copy">Score a saved role to see your strongest match here.</div>}
-              {highMatch && <button className="am-action-link" type="button" onClick={() => focusJob(highMatch.id)}>View job <ArrowRight size={10} aria-hidden="true" /></button>}
+              {highMatch ? <div className="am-highlight"><div className="am-highlight-main"><span className="am-highlight-mark">{companyInitials(highMatch.company)}</span><div className="am-highlight-copy"><div className="am-highlight-role" title={highMatch.role}>{highMatch.role}</div><div className="am-highlight-company" title={highMatch.company}>{highMatch.company}</div></div></div><div className="am-highlight-actions"><span className="am-highlight-score">{highMatch.score}% match</span><button className="am-action-link" type="button" onClick={() => focusJob(highMatch.id)}>View job <ArrowRight size={10} aria-hidden="true" /></button></div></div> : <div className="am-overview-copy">Score a saved role to see your strongest match here.</div>}
             </div>
           </div>
         </section>
@@ -573,7 +572,7 @@ function TrackerPanel({ settings, L, onOpenResume }: { settings: ExtensionSettin
 }
 
 function StatCard({ className, label, value, icon }: { className: string; label: string; value: number; icon: React.ReactNode }) {
-  return <div className={`am-stat ${className}`}><div className="am-stat-head">{icon}<span>{label}</span></div><div className="am-stat-value">{value}</div></div>
+  return <div className={`am-stat ${className}`}><div className="am-stat-icon" aria-hidden="true">{icon}</div><div className="am-stat-content"><div className="am-stat-head"><span>{label}</span></div><div className="am-stat-value">{value}</div></div></div>
 }
 
 function keyTagsForJob(job: SavedJob): string[] {

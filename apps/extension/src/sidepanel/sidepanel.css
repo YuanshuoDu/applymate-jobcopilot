@@ -63,18 +63,23 @@
 .am-progress-bar span { display: block; height: 100%; border-radius: inherit; background: var(--am-primary); }
 .am-overview-action { width: 100%; margin-top: 6px; padding: 5px 6px; border: 1px solid #c9c9f7; border-radius: 6px; color: var(--am-primary); background: transparent; cursor: pointer; font-size: 9px; font-weight: 700; }
 .am-overview-action:focus-visible, .am-score-action:focus-visible, .am-filter:focus-visible, .am-tab:focus-visible, .am-footer-button:focus-visible { outline: 2px solid var(--am-primary); outline-offset: 2px; }
-.am-highlight { display: flex; align-items: center; gap: 7px; min-width: 0; margin-top: 7px; }
+.am-highlight { display: flex; flex-direction: column; gap: 6px; min-width: 0; margin-top: 7px; }
+.am-highlight-main { display: flex; align-items: flex-start; gap: 7px; min-width: 0; }
 .am-highlight-mark { width: 24px; height: 24px; display: grid; place-items: center; flex: 0 0 auto; border: 1px solid #dfe0ed; border-radius: 6px; color: var(--am-primary); background: var(--am-primary-soft); font-size: 9px; font-weight: 750; }
 .am-highlight-copy { min-width: 0; flex: 1; }
-.am-highlight-role, .am-highlight-company { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.am-highlight-role { color: var(--am-ink); font-size: 10px; font-weight: 700; }
-.am-highlight-company { margin-top: 2px; color: var(--am-muted); font-size: 9px; }
-.am-highlight-score { flex: 0 0 auto; color: var(--am-green); font-size: 11px; font-weight: 800; }
-.am-action-link { display: inline-flex; align-items: center; gap: 3px; margin-top: 5px; padding: 0; border: 0; color: var(--am-primary); background: transparent; cursor: pointer; font-size: 9px; font-weight: 700; white-space: nowrap; }
+.am-highlight-role { overflow-wrap: anywhere; color: var(--am-ink); font-size: 10px; font-weight: 700; line-height: 1.2; }
+.am-highlight-company { overflow: hidden; margin-top: 2px; color: var(--am-muted); font-size: 9px; text-overflow: ellipsis; white-space: nowrap; }
+.am-highlight-actions { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding-left: 31px; }
+.am-highlight-score { display: inline-flex; align-items: center; flex: 0 0 auto; padding: 4px 7px; border: 1px solid #d8f0e3; border-radius: 5px; color: var(--am-green); background: var(--am-green-soft); font-size: 9px; font-weight: 800; line-height: 1; white-space: nowrap; }
+.am-action-link { display: inline-flex; align-items: center; gap: 3px; margin: 0; padding: 2px 0; border: 0; color: var(--am-primary); background: transparent; cursor: pointer; font-size: 9px; font-weight: 700; white-space: nowrap; }
 .am-stat-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 6px; margin: 7px 12px 0; }
-.am-stat { min-width: 0; padding: 7px 7px; border: 1px solid var(--am-line); border-radius: 8px; background: var(--am-panel); }
-.am-stat-head { display: flex; align-items: center; gap: 5px; color: var(--am-muted); font-size: 9px; white-space: nowrap; }
-.am-stat-value { margin-top: 5px; color: var(--am-ink); font-size: 15px; font-weight: 780; }
+.am-stat { display: flex; align-items: center; gap: 7px; min-width: 0; min-height: 52px; padding: 7px; border: 1px solid var(--am-line); border-radius: 8px; background: var(--am-panel); }
+.am-stat-icon { display: grid; place-items: center; flex: 0 0 auto; }
+.am-stat-content { min-width: 0; }
+.am-stat-head { overflow: hidden; color: var(--am-muted); font-size: 9px; line-height: 1.15; white-space: nowrap; }
+.am-stat-head span { overflow: hidden; text-overflow: ellipsis; }
+.am-stat-value { margin-top: 5px; color: var(--am-ink); font-size: 15px; font-weight: 780; line-height: 1; }
+.am-stat.applied .am-stat-value { color: var(--am-primary); }.am-stat.interview .am-stat-value { color: var(--am-teal); }.am-stat.rejected .am-stat-value { color: var(--am-red); }
 .am-stat.saved svg { color: var(--am-primary); }.am-stat.applied svg { color: #2977d8; }.am-stat.interview svg { color: var(--am-teal); }.am-stat.rejected svg { color: var(--am-red); }
 .am-job-tools { margin-top: 7px; border-top: 1px solid var(--am-line); border-bottom: 1px solid var(--am-line); background: var(--am-panel); }
 .am-search-wrap { padding: 8px 12px 6px; }
