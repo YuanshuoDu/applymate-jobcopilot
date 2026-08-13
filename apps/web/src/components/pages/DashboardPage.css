@@ -34,7 +34,7 @@
 .momentum-mini-calendar-days button:disabled { cursor: default; opacity: .55; }
 .momentum-date-current-week { width: 100%; margin-top: 9px; padding-top: 8px; border: 0; border-top: 1px solid #efeff7; color: #4a33f3; background: transparent; font: inherit; font-size: 10px; font-weight: 700; cursor: pointer; }
 .momentum-layout { align-items: flex-start; gap: 28px; }
-.momentum-primary-column { display: flex; flex: 1; min-width: 0; flex-direction: column; gap: 20px; }
+.momentum-primary-column { display: flex; flex: 1; min-width: 0; flex-direction: column; gap: 20px; container-type: inline-size; }
 .momentum-secondary-column { display: flex; width: 304px; flex: 0 0 304px; flex-direction: column; gap: 20px; }
 
 .momentum-week-goal, .momentum-coach-card, .momentum-side-card { border: 1px solid #e5e4fa; border-radius: 14px; background: #fff; }
@@ -49,16 +49,16 @@
 .momentum-section-kicker { display: flex; align-items: center; gap: 6px; color: #4a33f3; font-size: 13px; font-weight: 700; }
 .momentum-week-copy h2 { margin: 9px 0 8px; color: #161b36; font-size: 16px; letter-spacing: -.025em; }
 .momentum-week-copy p { max-width: 365px; color: #68708f; font-size: 12px; line-height: 1.55; }
-.momentum-days { justify-content: space-between; gap: 9px; margin-top: 27px; }
-.momentum-days div { display: grid; gap: 9px; justify-items: center; flex: 1; color: #646b8b; }
-.momentum-days small { font-size: 9px; }
+.momentum-days { display: grid; grid-template-columns: repeat(7, minmax(0, 1fr)); gap: 4px; margin-top: 27px; }
+.momentum-days div { display: grid; min-width: 0; gap: 9px; justify-items: center; color: #646b8b; }
+.momentum-days small { min-width: 0; font-size: 9px; white-space: nowrap; }
 .momentum-days span { display: grid; place-items: center; width: 18px; height: 18px; border: 1px solid #ddddf5; border-radius: 50%; color: #fff; background: #f5f5fc; }
 .momentum-days span.is-done { border-color: #5136f4; background: #5136f4; }
 .momentum-days span.is-today { border-color: #9a8cff; background: #fff; }
 .momentum-days span.is-missed { color: #aa5c6a; border-color: #edcdd3; background: #fff6f7; }
 .momentum-days span.is-interview { color: #fff; border-color: #0b8f70; background: #0b8f70; }
-.momentum-goal-legend { gap: 18px; margin-top: 18px; color: #737b98; font-size: 10px; }
-.momentum-goal-legend span { display: inline-flex; align-items: center; gap: 6px; }
+.momentum-goal-legend { flex-wrap: wrap; gap: 8px 18px; margin-top: 18px; color: #737b98; font-size: 10px; }
+.momentum-goal-legend span { display: inline-flex; flex: 0 0 auto; align-items: center; gap: 6px; white-space: nowrap; }
 .momentum-goal-legend i { display: grid; place-items: center; width: 13px; height: 13px; border: 1px solid #d9d8ef; border-radius: 50%; font-style: normal; }
 .momentum-goal-legend i.is-done { color: #fff; border-color: #5136f4; background: #5136f4; }
 .momentum-goal-legend i.is-missed { color: #aa5c6a; border-color: #edcdd3; background: #fff6f7; }
@@ -148,6 +148,9 @@
 .momentum-profile-prompt { align-items: center; gap: 10px; margin: 0 0 18px; padding: 10px 12px; color: #4a33f3; background: #f6f5ff; border: 1px solid #dfddff; border-radius: 10px; font-size: 12px; }
 .momentum-profile-prompt span { flex: 1; }
 .momentum-profile-prompt button { border: 0; color: #4a33f3; background: transparent; font: inherit; font-weight: 700; cursor: pointer; }
+
+@container (max-width: 680px) { .momentum-week-goal { gap: 24px; padding: 24px; } .momentum-ring { width: 156px; height: 156px; flex-basis: 156px; } .momentum-ring::after { width: 121px; height: 121px; } .momentum-ring strong { font-size: 34px; } }
+@container (max-width: 510px) { .momentum-week-goal { align-items: center; flex-direction: column; } .momentum-week-copy { width: 100%; } }
 
 @media (max-width: 900px) { .momentum-layout { flex-direction: column; width: 100%; min-width: 0; } .momentum-primary-column { width: 100%; min-width: 0; } .momentum-secondary-column { display: grid; width: 100%; flex-basis: auto; grid-template-columns: 1fr 1fr; } }
 @media (max-width: 650px) { .momentum-content { padding: 24px 16px 40px; } .momentum-header { align-items: flex-start; } .momentum-header h1 { font-size: 24px; } .momentum-date-picker { padding: 9px; font-size: 0; } .momentum-date-picker svg:last-child { margin-left: 0; } .momentum-date-menu { right: 0; } .momentum-week-goal { align-items: center; flex-direction: column; padding: 25px 20px; } .momentum-week-copy { width: 100%; } .momentum-secondary-column { display: flex; } .momentum-coach-document { display: none; } .momentum-row time, .momentum-row-more { display: none; } }
