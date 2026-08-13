@@ -439,7 +439,7 @@ export function AppShell() {
                   ) : null}
                 />
               </div>
-              <div id="main-content" style={{ flex: 1, display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
+              <div id="main-content" style={{ flex: 1, minWidth: 0, minHeight: 0, display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
                 <PageComp key={activeUserId ?? 'anonymous'} />
               </div>
             </div>

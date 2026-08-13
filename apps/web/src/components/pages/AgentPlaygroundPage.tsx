@@ -439,7 +439,7 @@ export function AgentPlaygroundPage() {
   const pendingCount = (jobsData?.jobs ?? []).filter(j => j.workflowState === 'ready_to_apply').length
 
   return (
-    <div style={{ flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column', overflow: 'hidden', background: 'var(--bg-tertiary)' }}>
+    <div style={{ flex: 1, minWidth: 0, minHeight: 0, display: 'flex', flexDirection: 'column', overflow: 'hidden', background: 'var(--bg-tertiary)' }}>
       <style>{`
         @media (max-width: 900px) {
           .agent-workspace-layout {
@@ -618,7 +618,7 @@ export function AgentPlaygroundPage() {
       )}
 
       {/* Unified Stream — Chat + Execution in one panel (like Claude) */}
-      <div className="agent-workspace-layout" style={{ flex: 1, minHeight: 0, display: 'flex', overflow: 'hidden' }}>
+      <div className="agent-workspace-layout" style={{ flex: 1, minWidth: 0, minHeight: 0, display: 'flex', overflow: 'hidden' }}>
         <button
           className={`agent-session-drawer-scrim${mobileSessionDrawerOpen ? ' is-open' : ''}`}
           type="button"
