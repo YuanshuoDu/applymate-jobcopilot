@@ -1,6 +1,8 @@
 'use client'
 
+import { PanelLeftOpen, X } from 'lucide-react'
 import { useState, type CSSProperties } from 'react'
+import styles from './AgentPreviewClient.module.css'
 import { Sidebar } from '@/components/layout/Sidebar'
 import type { Page } from '@/lib/types'
 
@@ -18,79 +20,71 @@ const rows = [
 
 export function AgentPreviewClient() {
   const [thinkingExpanded, setThinkingExpanded] = useState(false)
+  const [drawerOpen, setDrawerOpen] = useState(false)
 
   return (
-    <div className="agent-preview-shell" style={{ display: 'flex', height: '100vh', overflow: 'hidden', background: 'var(--bg-tertiary)' }}>
-      <style>{`
-        @media (max-width: 767px) {
-          .agent-preview-shell {
-            height: auto !important;
-            min-height: 100vh !important;
-            flex-direction: column !important;
-            overflow-y: auto !important;
-          }
-          .agent-preview-desktop-sidebar {
-            display: none !important;
-          }
-          .agent-preview-console {
-            width: 100% !important;
-            height: min(42vh, 340px) !important;
-            border-right: none !important;
-            border-bottom: 1px solid var(--border) !important;
-          }
-          .agent-preview-main {
-            min-height: 620px !important;
-            width: 100% !important;
-          }
-        }
-      `}</style>
+    <div className={`${styles.root} agent-preview-shell`} style={{ display: 'flex', height: '100vh', overflow: 'hidden', background: 'var(--bg-tertiary)' }}>
       <div className="agent-preview-desktop-sidebar">
         <Sidebar active={'agent' as Page} onNav={() => undefined} session={previewSession} jobCount={12} />
       </div>
-      <aside className="agent-preview-console" style={agentSidebar}>
-        <div style={{ padding: 14, borderBottom: '1px solid var(--border)' }}>
-          <button style={primaryButton}>+ New chat</button>
+      <button className={`agent-preview-drawer-scrim${drawerOpen ? ' is-open' : ''}`} type="button" aria-label="Close conversations" tabIndex={drawerOpen ? 0 : -1} onClick={() => setDrawerOpen(false)} />
+      <div id="agent-preview-drawer" className={`agent-preview-drawer${drawerOpen ? ' is-open' : ''}`}>
+        <div className="agent-preview-drawer-header">
+          <span>Conversations</span>
+          <button className="agent-preview-drawer-close" type="button" aria-label="Close conversations" onClick={() => setDrawerOpen(false)}>
+            <X size={16} aria-hidden="true" />
+          </button>
         </div>
-        <MetricGrid />
-        <Section title="Recent Sessions">
-          <SessionRow active title="Berlin SWE Auto-Apply" meta="Running · quality 87% · 09:14" />
-          <SessionRow title="Munich Data Engineer Search" meta="Done · quality 91% · Yesterday" />
-          <SessionRow title="Gmail Follow-up Batch" meta="Approval · quality pending · May 22" />
-        </Section>
-        <Section title="Queued Tasks">
-          <TaskRow role="Scout" status="LivenessGate" value="94%" />
-          <TaskRow role="Analyst" status="JobDecision" value="89%" />
-          <TaskRow role="Executor" status="Approval" value="waiting" warn />
-        </Section>
-        <Section title="Agent Team">
-          {['Orchestrator', 'Scout', 'Analyst', 'Writer', 'Reviewer', 'Executor', 'Auditor'].map((name, index) => (
-            <TaskRow key={name} role={name} status={index < 3 ? 'active' : 'idle'} value={index < 3 ? 'MiniMax' : 'Claude'} />
-          ))}
-        </Section>
-        <Section title="Automations">
-          <TaskRow role="Weekday 09:00 EU scout" status="enabled" value="run" />
-          <TaskRow role="Auto-apply 85+" status="approval required" value="on" />
-        </Section>
-        <Section title="Session Quality">
-          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10 }}>
-            <Quality label="Quality" value="87%" />
-            <Quality label="Gate pass" value="92%" />
-            <Quality label="Retry" value="8%" />
-            <Quality label="Approvals" value="2" warn />
+        <aside className="agent-preview-console" style={agentSidebar}>
+          <div style={{ padding: 14, borderBottom: '1px solid var(--border)' }}>
+            <button style={primaryButton}>+ New chat</button>
           </div>
-        </Section>
-      </aside>
+          <MetricGrid />
+          <Section title="Recent Sessions">
+            <SessionRow active title="Berlin SWE Auto-Apply" meta="Running · quality 87% · 09:14" />
+            <SessionRow title="Munich Data Engineer Search" meta="Done · quality 91% · Yesterday" />
+            <SessionRow title="Gmail Follow-up Batch" meta="Approval · quality pending · May 22" />
+          </Section>
+          <Section title="Queued Tasks">
+            <TaskRow role="Scout" status="LivenessGate" value="94%" />
+            <TaskRow role="Analyst" status="JobDecision" value="89%" />
+            <TaskRow role="Executor" status="Approval" value="waiting" warn />
+          </Section>
+          <Section title="Agent Team">
+            {['Orchestrator', 'Scout', 'Analyst', 'Writer', 'Reviewer', 'Executor', 'Auditor'].map((name, index) => (
+              <TaskRow key={name} role={name} status={index < 3 ? 'active' : 'idle'} value={index < 3 ? 'MiniMax' : 'Claude'} />
+            ))}
+          </Section>
+          <Section title="Automations">
+            <TaskRow role="Weekday 09:00 EU scout" status="enabled" value="run" />
+            <TaskRow role="Auto-apply 85+" status="approval required" value="on" />
+          </Section>
+          <Section title="Session Quality">
+            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10 }}>
+              <Quality label="Quality" value="87%" />
+              <Quality label="Gate pass" value="92%" />
+              <Quality label="Retry" value="8%" />
+              <Quality label="Approvals" value="2" warn />
+            </div>
+          </Section>
+        </aside>
+      </div>
       <main className="agent-preview-main" style={{ flex: 1, minWidth: 0, display: 'flex', flexDirection: 'column', background: 'var(--bg)' }}>
         <header style={headerStyle}>
-          <div>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 10, minWidth: 0 }}>
+            <button className="agent-preview-drawer-trigger" type="button" aria-label="Open conversations" aria-expanded={drawerOpen} aria-controls="agent-preview-drawer" onClick={() => setDrawerOpen(true)}>
+              <PanelLeftOpen size={17} aria-hidden="true" />
+            </button>
+            <div>
             <h1 style={{ margin: 0, fontSize: 17 }}>Berlin SWE Auto-Apply</h1>
             <div style={{ marginTop: 4, fontSize: 12, color: 'var(--text-muted)' }}>
               Memory: Berlin SWE · min score 85 · approval required · no LinkedIn
             </div>
+            </div>
           </div>
           <div style={{ display: 'flex', gap: 14, color: 'var(--text-muted)' }}>◴ ⌕ ⋮</div>
         </header>
-        <section style={transcriptStyle}>
+        <section className="agent-preview-transcript" style={transcriptStyle}>
           <Message speaker="You" body="每天早上 9 点自动找 Berlin 软件工程岗位，85 分以上自动投，但需要我确认。" time="09:11" />
           <Message speaker="Orchestrator · Automation draft" body="我可以创建一个工作日 09:00 自动化：在 Berlin 搜索软件工程岗位，85 分以上进入投递队列，提交前请求你确认。" time="09:12">
             <Grid rows={[['Trigger', 'Weekdays 09:00'], ['Target', 'Berlin · SWE'], ['Score', '85+'], ['Approval', 'Required'], ['Daily cap', '8 applications']]} />

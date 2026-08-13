@@ -56,6 +56,19 @@ describe('web middleware entrypoint', () => {
     expect(response.headers.get('location')).toContain('/login?callbackUrl=%2Fdashboard')
   })
 
+  it('keeps the local Agent preview accessible without a session', async () => {
+    const response = await middleware(new NextRequest('http://localhost/agent-preview'))
+
+    expect(response.status).toBe(200)
+  })
+
+  it('does not expose the local Agent preview on a public hostname', async () => {
+    const response = await middleware(new NextRequest('https://applymate.site/agent-preview'))
+
+    expect(response.status).toBe(307)
+    expect(response.headers.get('location')).toContain('/login?callbackUrl=%2Fagent-preview')
+  })
+
   it('sends the administrator host root to the protected admin entrypoint', async () => {
     const response = await middleware(new NextRequest('https://admin.applymate.site/'))
 

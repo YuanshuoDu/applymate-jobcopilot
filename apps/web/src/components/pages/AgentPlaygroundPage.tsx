@@ -1,6 +1,7 @@
 'use client'
 
 import React, { useState, useEffect, useRef, useCallback } from 'react'
+import { PanelLeftOpen, X } from 'lucide-react'
 import { TopBar }              from '@/components/layout/TopBar'
 import { useToast } from '@/components/ui'
 import { useApi, apiMutate }   from '@/lib/hooks'
@@ -35,6 +36,7 @@ export function AgentPlaygroundPage() {
   const [conversationSubtitle, setConversationSubtitle] = useState<string | null>(null)
   const [sessionsRefreshVersion, setSessionsRefreshVersion] = useState(0)
   const [chatResetVersion, setChatResetVersion] = useState(0)
+  const [mobileSessionDrawerOpen, setMobileSessionDrawerOpen] = useState(false)
   const [waitingQuestion, setWaitingQuestion] = useState<{ id: string; question: string; options: QuestionOption[] } | null>(null)
   const [activeRunPolicy, setActiveRunPolicy] = useState<SubmissionPolicySettings | null>(null)
 
@@ -50,6 +52,16 @@ export function AgentPlaygroundPage() {
   )
 
   const addLog = useCallback((entry: LogEntry) => { setRunLog(prev => [...prev, entry]) }, [])
+
+  useEffect(() => {
+    if (!mobileSessionDrawerOpen) return
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') setMobileSessionDrawerOpen(false)
+    }
+    window.addEventListener('keydown', closeOnEscape)
+    return () => window.removeEventListener('keydown', closeOnEscape)
+  }, [mobileSessionDrawerOpen])
+
   useEffect(() => {
     return () => {
       runIdRef.current += 1
@@ -414,49 +426,110 @@ export function AgentPlaygroundPage() {
   const pendingCount = (jobsData?.jobs ?? []).filter(j => j.workflowState === 'ready_to_apply').length
 
   return (
-    <div style={{ flex: 1, display: 'flex', flexDirection: 'column', overflow: 'hidden', background: 'var(--bg-tertiary)' }}>
+    <div style={{ flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column', overflow: 'hidden', background: 'var(--bg-tertiary)' }}>
       <style>{`
         @media (max-width: 900px) {
           .agent-workspace-layout {
-            flex-direction: column !important;
+            position: relative;
+            min-height: 0 !important;
+            overflow: hidden !important;
+          }
+
+          .agent-session-drawer-trigger {
+            display: inline-flex !important;
+            align-items: center;
+            gap: 6px;
+            min-height: 34px;
+            padding: 0 10px;
+            border: 1px solid var(--border);
+            border-radius: 9px;
+            color: var(--text);
+            background: var(--bg);
+            font: inherit;
+            font-size: 11px;
+            font-weight: 650;
+            cursor: pointer;
+          }
+
+          .agent-session-drawer-scrim {
+            position: absolute;
+            inset: 0;
+            z-index: 29;
+            border: 0;
+            background: rgba(15, 23, 42, 0.34);
+            opacity: 0;
+            pointer-events: none;
+            transition: opacity 180ms ease;
+          }
+
+          .agent-session-drawer-scrim.is-open {
+            opacity: 1;
+            pointer-events: auto;
+          }
+
+          .agent-session-drawer {
+            position: absolute;
+            inset: 0 auto 0 0;
+            z-index: 30;
+            width: min(calc(100vw - 44px), 360px);
+            display: flex;
+            flex-direction: column;
+            transform: translateX(-104%);
+            pointer-events: none;
+            transition: transform 180ms ease;
+          }
+
+          .agent-session-drawer.is-open {
+            transform: translateX(0);
+            pointer-events: auto;
+          }
+
+          .agent-session-drawer > .agent-session-console {
+            flex: 1;
+            min-height: 0;
+            width: 100% !important;
+            height: auto !important;
+            border-right: 1px solid var(--border) !important;
+            box-shadow: 14px 0 32px rgba(15, 23, 42, 0.18);
+          }
+
+          .agent-session-drawer-header {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            min-height: 48px;
+            padding: 8px 10px 8px 14px;
+            border-bottom: 1px solid var(--border);
+            color: var(--text);
+            background: var(--bg);
+            font-size: 13px;
+            font-weight: 750;
+          }
+
+          .agent-session-drawer-close {
+            display: inline-grid;
+            width: 28px;
+            height: 28px;
+            place-items: center;
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            color: var(--text-muted);
+            background: var(--bg);
+            cursor: pointer;
+          }
+
+          .agent-live-stream {
+            height: 100% !important;
+            min-width: 0 !important;
+            min-height: 0 !important;
+            overflow: hidden !important;
+          }
+
+          .agent-live-stream-body {
             min-height: 0 !important;
             overflow-y: auto !important;
-            overflow-x: hidden !important;
-            box-sizing: border-box;
-            padding-bottom: var(--mobile-content-inset);
-            overscroll-behavior-y: auto;
+            overscroll-behavior-y: contain !important;
             -webkit-overflow-scrolling: touch;
-          }
-
-          .agent-session-console {
-            width: 100% !important;
-            height: min(42vh, 360px) !important;
-            border-right: none !important;
-            border-bottom: 1px solid var(--border) !important;
-          }
-
-          .agent-live-stream,
-          .agent-transcript-pane {
-            flex: 0 0 auto !important;
-            min-height: 620px !important;
-            width: 100% !important;
-            min-width: 0 !important;
-          }
-
-          /* Keep one scroll owner on phones. The empty welcome state can be
-             taller than the viewport, so an inner, non-overflowing pane must
-             not consume the gesture before the workspace can scroll. */
-          .agent-live-stream {
-            height: auto !important;
-            overflow: visible !important;
-          }
-
-          .agent-live-stream-body[data-empty='true'] {
-            flex: 0 0 auto !important;
-            min-height: 0 !important;
-            overflow: visible !important;
-            overscroll-behavior: auto !important;
-            padding-bottom: 24px !important;
           }
 
           .agent-composer,
@@ -470,9 +543,33 @@ export function AgentPlaygroundPage() {
             grid-template-columns: repeat(2, minmax(0, 1fr)) !important;
           }
         }
+
+        @media (min-width: 901px) {
+          .agent-session-drawer-scrim,
+          .agent-session-drawer-header,
+          .agent-session-drawer-close,
+          .agent-session-drawer-trigger {
+            display: none;
+          }
+
+          .agent-session-drawer {
+            display: contents;
+          }
+        }
       `}</style>
       {/* TopBar */}
-      <TopBar title="AI Agent" />
+      <TopBar title="AI Agent">
+        <button
+          className="agent-session-drawer-trigger"
+          type="button"
+          aria-expanded={mobileSessionDrawerOpen}
+          aria-controls="agent-session-drawer"
+          onClick={() => setMobileSessionDrawerOpen(true)}
+        >
+          <PanelLeftOpen size={15} aria-hidden="true" />
+          Conversations
+        </button>
+      </TopBar>
 
       {/* Add Agent Modal */}
       {showAddModal && (
@@ -485,19 +582,41 @@ export function AgentPlaygroundPage() {
       )}
 
       {/* Unified Stream — Chat + Execution in one panel (like Claude) */}
-      <div className="agent-workspace-layout" style={{ flex: 1, display: 'flex', overflow: 'hidden' }}>
-        <AgentSessionConsole
-          selectedSessionId={selectedSessionId}
-          onSelectSession={selectSession}
-          onRunSession={(sessionId, policy) => {
-            selectSession(sessionId)
-            startRun(undefined, sessionId, policy)
-          }}
-          onAddAgent={() => setShowAddModal(true)}
-          onNewChat={resetLiveWorkspace}
-          onDeletedSession={handleDeletedSession}
-          refreshVersion={sessionsRefreshVersion}
+      <div className="agent-workspace-layout" style={{ flex: 1, minHeight: 0, display: 'flex', overflow: 'hidden' }}>
+        <button
+          className={`agent-session-drawer-scrim${mobileSessionDrawerOpen ? ' is-open' : ''}`}
+          type="button"
+          aria-label="Close conversations"
+          tabIndex={mobileSessionDrawerOpen ? 0 : -1}
+          onClick={() => setMobileSessionDrawerOpen(false)}
         />
+        <div id="agent-session-drawer" className={`agent-session-drawer${mobileSessionDrawerOpen ? ' is-open' : ''}`}>
+          <div className="agent-session-drawer-header">
+            <span>Conversations</span>
+            <button className="agent-session-drawer-close" type="button" aria-label="Close conversations" onClick={() => setMobileSessionDrawerOpen(false)}>
+              <X size={16} aria-hidden="true" />
+            </button>
+          </div>
+          <AgentSessionConsole
+            selectedSessionId={selectedSessionId}
+            onSelectSession={(sessionId, goal, subtitle) => {
+              selectSession(sessionId, goal, subtitle)
+              setMobileSessionDrawerOpen(false)
+            }}
+            onRunSession={(sessionId, policy) => {
+              selectSession(sessionId)
+              setMobileSessionDrawerOpen(false)
+              startRun(undefined, sessionId, policy)
+            }}
+            onAddAgent={() => setShowAddModal(true)}
+            onNewChat={() => {
+              resetLiveWorkspace()
+              setMobileSessionDrawerOpen(false)
+            }}
+            onDeletedSession={handleDeletedSession}
+            refreshVersion={sessionsRefreshVersion}
+          />
+        </div>
         <AgentUnifiedStream
             log={runLog}
             running={isRunning}

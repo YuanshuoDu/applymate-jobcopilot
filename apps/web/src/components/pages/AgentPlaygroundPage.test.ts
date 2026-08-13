@@ -9,8 +9,15 @@ describe('Agent workspace responsive layout', () => {
   })
 
   it('keeps mobile Agent content on one scroll chain above the fixed navigation', () => {
-    expect(source).toMatch(/\.agent-workspace-layout[\s\S]*overscroll-behavior-y: auto/)
-    expect(source).toMatch(/\.agent-live-stream[\s\S]*overflow: visible !important/)
-    expect(source).toMatch(/\.agent-live-stream-body\[data-empty='true'\][\s\S]*overflow: visible !important[\s\S]*padding-bottom: 24px !important/)
+    expect(source).toMatch(/\.agent-workspace-layout[\s\S]*overflow: hidden !important/)
+    expect(source).toMatch(/\.agent-live-stream[\s\S]*height: 100% !important[\s\S]*overflow: hidden !important/)
+    expect(source).toMatch(/\.agent-live-stream-body[\s\S]*overflow-y: auto !important/)
+  })
+
+  it('hides sessions in a dismissible mobile drawer so chat stays primary', () => {
+    expect(source).toContain('agent-session-drawer')
+    expect(source).toMatch(/\.agent-session-drawer[\s\S]*transform: translateX\(-104%\)/)
+    expect(source).toContain('aria-controls="agent-session-drawer"')
+    expect(source).toContain('Close conversations')
   })
 })

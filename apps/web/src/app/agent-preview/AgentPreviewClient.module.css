@@ -1,0 +1,117 @@
+@media (max-width: 767px) {
+  .root {
+    position: relative;
+    min-height: 0 !important;
+    overflow: hidden !important;
+  }
+
+  .root :global(.agent-preview-desktop-sidebar) {
+    display: none !important;
+  }
+
+  .root :global(.agent-preview-drawer-trigger) {
+    display: inline-grid !important;
+    width: 34px;
+    height: 34px;
+    place-items: center;
+    border: 1px solid var(--border);
+    border-radius: 9px;
+    color: var(--text);
+    background: var(--bg);
+    cursor: pointer;
+  }
+
+  .root :global(.agent-preview-drawer-scrim) {
+    position: absolute;
+    inset: 0;
+    z-index: 29;
+    border: 0;
+    background: rgba(15, 23, 42, 0.34);
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity 180ms ease;
+  }
+
+  .root :global(.agent-preview-drawer-scrim.is-open) {
+    opacity: 1;
+    pointer-events: auto;
+  }
+
+  .root :global(.agent-preview-drawer) {
+    position: absolute;
+    inset: 0 auto 0 0;
+    z-index: 30;
+    display: flex;
+    flex-direction: column;
+    width: min(calc(100vw - 44px), 360px);
+    transform: translateX(-104%);
+    pointer-events: none;
+    transition: transform 180ms ease;
+  }
+
+  .root :global(.agent-preview-drawer.is-open) {
+    transform: translateX(0);
+    pointer-events: auto;
+  }
+
+  .root :global(.agent-preview-drawer-header) {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    min-height: 48px;
+    padding: 8px 10px 8px 14px;
+    border-bottom: 1px solid var(--border);
+    background: var(--bg);
+    color: var(--text);
+    font-size: 13px;
+    font-weight: 750;
+  }
+
+  .root :global(.agent-preview-drawer-close) {
+    display: inline-grid;
+    width: 28px;
+    height: 28px;
+    place-items: center;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    color: var(--text-muted);
+    background: var(--bg);
+    cursor: pointer;
+  }
+
+  .root :global(.agent-preview-console) {
+    width: 100% !important;
+    height: auto !important;
+    min-height: 0;
+    flex: 1;
+    border-right: 1px solid var(--border) !important;
+    box-shadow: 14px 0 32px rgba(15, 23, 42, 0.18);
+  }
+
+  .root :global(.agent-preview-main) {
+    min-height: 0 !important;
+    width: 100% !important;
+    height: 100% !important;
+    overflow: hidden;
+  }
+
+  .root :global(.agent-preview-transcript) {
+    min-height: 0 !important;
+    overflow-y: auto !important;
+    overscroll-behavior-y: contain;
+    -webkit-overflow-scrolling: touch;
+  }
+}
+
+@media (min-width: 768px) {
+  .root :global(.agent-preview-drawer-trigger),
+  .root :global(.agent-preview-drawer-scrim),
+  .root :global(.agent-preview-drawer-header),
+  .root :global(.agent-preview-drawer-close) {
+    display: none;
+  }
+
+  .root :global(.agent-preview-drawer) {
+    display: contents;
+  }
+}
