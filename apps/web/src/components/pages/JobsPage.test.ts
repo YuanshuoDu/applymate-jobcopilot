@@ -49,4 +49,9 @@ describe('mobile job card projection', () => {
     expect(globalCss).toMatch(/@media \(max-width: 1200px\)[\s\S]*\.jobs-desktop-list\s*\{\s*display:\s*none/)
     expect(globalCss).toMatch(/@media \(max-width: 1200px\)[\s\S]*\.jobs-mobile-list\s*\{[\s\S]*display:\s*flex/)
   })
+
+  it('lets the wrapped header grow instead of overlapping the jobs toolbar', () => {
+    const source = readFileSync(new URL('./JobsPage.tsx', import.meta.url), 'utf8')
+    expect(source).toMatch(/className="jobs-page-header" style=\{\{[^}]*flexShrink: 0/)
+  })
 })

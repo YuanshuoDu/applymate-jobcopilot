@@ -12,12 +12,26 @@
  * Syncs bidirectionally with the web app via the REST API.
  */
 import { useState, useEffect, useRef, useCallback } from 'react'
+import {
+  AlertTriangle,
+  Check,
+  Download,
+  FileText,
+  LoaderCircle,
+  Palette,
+  Pencil,
+  Plus,
+  RefreshCw,
+  Sparkles,
+  Upload,
+} from 'lucide-react'
 import { getCurrentResumeId, setCurrentResumeId, setResumeDraft, clearResumeDraft } from '@/lib/storage'
 import {
   listResumes, getResume, updateResume, createResume,
   scoreResume, suggestResume, getRecentJobs, exportApplicationPackLocally,
 } from '@/lib/api'
 import type { ExtensionSettings, ScrapedJob, ResumeListItem, Resume, ResumeContent, TemplateOptions, ScoreResult, Suggestion } from '@/lib/types'
+import { scoreColorsFor } from '@/lib/score-colors'
 
 // ── Design tokens ────────────────────────────────────────────────────────────────
 const C = {
@@ -40,6 +54,21 @@ const EMPTY_CONTENT: ResumeContent = {
   experience: [],
   education: [],
   skills: [],
+}
+
+function normalizeResumeContent(value: Partial<ResumeContent> | null | undefined): ResumeContent {
+  return {
+    ...EMPTY_CONTENT,
+    ...value,
+    contact: { ...EMPTY_CONTENT.contact, ...(value?.contact ?? {}) },
+    experience: Array.isArray(value?.experience) ? value.experience.map(exp => ({ ...exp, bullets: Array.isArray(exp.bullets) ? exp.bullets : [] })) : [],
+    education: Array.isArray(value?.education) ? value.education : [],
+    skills: Array.isArray(value?.skills) ? value.skills : [],
+    languages: Array.isArray(value?.languages) ? value.languages : [],
+    projects: Array.isArray(value?.projects) ? value.projects.map(project => ({ ...project, bullets: Array.isArray(project.bullets) ? project.bullets : [] })) : [],
+    certifications: Array.isArray(value?.certifications) ? value.certifications : [],
+    custom: Array.isArray(value?.custom) ? value.custom.map(section => ({ ...section, items: Array.isArray(section.items) ? section.items.map(item => ({ ...item, bullets: Array.isArray(item.bullets) ? item.bullets : [] })) : [] })) : [],
+  }
 }
 
 const TEMPLATE_NAMES: Record<string, string> = {
@@ -108,6 +137,7 @@ export function ResumeView({ settings }: Props) {
   const saveTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
   const fileInputRef = useRef<HTMLInputElement>(null)
   const apiBase = settings.apiBaseUrl
+  const scoreColors = scoreResult ? scoreColorsFor(scoreResult.score) : null
 
   function showToast(msg: string) { setToast(msg); setTimeout(() => setToast(''), 2500) }
 
@@ -169,7 +199,7 @@ export function ResumeView({ settings }: Props) {
     try {
       const r = await getResume(settings, id)
       setResume(r)
-      setContent(r.content ?? EMPTY_CONTENT)
+      setContent(normalizeResumeContent(r.content))
       setTemplateId(r.templateId ?? 'clean')
       setTemplateOpts(r.templateOptions ?? {})
       setDirty(false)
@@ -215,7 +245,7 @@ export function ResumeView({ settings }: Props) {
         templateId: 'clean',
       })
       setResumes(prev => [r, ...prev]); setActiveId(r.id); setResume(r)
-      setContent(r.content); setTemplateId('clean'); setTemplateOpts({}); setDirty(false)
+      setContent(normalizeResumeContent(r.content)); setTemplateId('clean'); setTemplateOpts({}); setDirty(false)
       await setCurrentResumeId(r.id); showToast('Resume uploaded & parsed!')
     } catch { showToast('Upload failed') }
     finally { setUploading(false) }
@@ -333,20 +363,18 @@ export function ResumeView({ settings }: Props) {
 
   // ── Loading ────────────────────────────────────────────────────────────────────
   if (loading && !resume) {
-    return <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', height: '60vh' }}><Spinner /></div>
+    return <div className="am-resume-state am-resume-loading"><LoaderCircle size={20} className="am-spin" aria-label="Loading resumes" /></div>
   }
 
   // ── Load error ─────────────────────────────────────────────────────────────────
   if (!loading && loadError) {
     return (
-      <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', height: '60vh', gap: 14, padding: 28, textAlign: 'center', background: C.bg, fontFamily: '-apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif' }}>
-        <div style={{ fontSize: 32 }}>⚠️</div>
-        <div style={{ fontSize: 13, fontWeight: 600, color: C.text }}>Failed to load resumes</div>
-        <div style={{ fontSize: 11, color: C.muted, lineHeight: 1.6, maxWidth: 240, wordBreak: 'break-word' }}>{loadError}</div>
-        <div style={{ fontSize: 10, color: C.subtle, background: `${C.border}`, padding: '6px 12px', borderRadius: 6 }}>
-          API: {settings.apiBaseUrl}
-        </div>
-        <button onClick={loadResumeList} style={btnPrimary(C)}>Retry</button>
+      <div className="am-resume-view am-resume-state am-resume-error">
+        <div className="am-resume-state-icon danger"><AlertTriangle size={19} aria-hidden="true" /></div>
+        <div className="am-resume-state-title">Failed to load resumes</div>
+        <div className="am-resume-state-copy">{loadError}</div>
+        <div className="am-resume-api">API: {settings.apiBaseUrl}</div>
+        <button className="am-resume-primary-button" type="button" onClick={loadResumeList}><RefreshCw size={13} aria-hidden="true" /> Retry</button>
       </div>
     )
   }
@@ -354,14 +382,14 @@ export function ResumeView({ settings }: Props) {
   // ── Empty state ────────────────────────────────────────────────────────────────
   if (!loading && resumes.length === 0) {
     return (
-      <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', height: '100vh', gap: 16, padding: 28, textAlign: 'center', background: C.bg, fontFamily: '-apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif' }}>
-        <div style={{ fontSize: 40 }}>📄</div>
-        <div style={{ fontSize: 14, fontWeight: 600, color: C.text }}>No resumes yet</div>
-        <div style={{ fontSize: 11, color: C.muted, lineHeight: 1.6 }}>Create one or upload a PDF/DOCX</div>
-        <div style={{ display: 'flex', gap: 8 }}>
-          <button onClick={handleCreate} style={btnPrimary(C)}>+ Create Resume</button>
-          <button onClick={() => fileInputRef.current?.click()} style={btnGhost(C)} disabled={uploading}>
-            {uploading ? 'Uploading...' : 'Upload PDF/DOCX'}
+      <div className="am-resume-view am-resume-state am-resume-empty">
+        <div className="am-resume-state-icon"><FileText size={20} aria-hidden="true" /></div>
+        <div className="am-resume-state-title">No resumes yet</div>
+        <div className="am-resume-state-copy">Create one or upload a PDF/DOCX to get started.</div>
+        <div className="am-resume-state-actions">
+          <button className="am-resume-primary-button" type="button" onClick={handleCreate}><Plus size={13} aria-hidden="true" /> Create resume</button>
+          <button className="am-resume-secondary-button" type="button" onClick={() => fileInputRef.current?.click()} disabled={uploading}>
+            <Upload size={13} aria-hidden="true" /> {uploading ? 'Uploading…' : 'Upload PDF/DOCX'}
           </button>
           <input ref={fileInputRef} type="file" accept=".pdf,.docx,.doc" style={{ display: 'none' }}
             onChange={e => { const f = e.target.files?.[0]; if (f) handleUpload(f) }} />
@@ -383,49 +411,51 @@ export function ResumeView({ settings }: Props) {
 
   // ── Render ─────────────────────────────────────────────────────────────────────
   return (
-    <div style={{ display: 'flex', flexDirection: 'column', height: '100vh', background: C.bg, fontFamily: '-apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif' }}>
+    <div className="am-resume-view">
       {/* ════ Top Bar: Selector + New + Upload ════ */}
-      <div style={{ background: C.card, borderBottom: `1px solid ${C.border}`, padding: '10px 12px', display: 'flex', gap: 8, alignItems: 'center', flexShrink: 0 }}>
-        <select value={activeId ?? ''} onChange={e => handleSelect(e.target.value)} style={selectStyle(C)}>
+      <div className="am-resume-toolbar">
+        <div className="am-resume-toolbar-title"><span className="am-resume-toolbar-icon"><FileText size={14} aria-hidden="true" /></span><span><small>Workspace</small><strong>Resume</strong></span></div>
+        <select className="am-resume-select" value={activeId ?? ''} onChange={e => handleSelect(e.target.value)} style={selectStyle(C)} aria-label="Select resume">
           {resumes.map(r => (<option key={r.id} value={r.id}>{r.name}{r.isDefault ? ' ★' : ''}</option>))}
         </select>
-        <button onClick={handleCreate} title="New resume" style={{ ...iconBtn(C), background: C.primary, color: '#fff' }}>+</button>
-        <button onClick={() => fileInputRef.current?.click()} title="Upload PDF/DOCX" style={{ ...iconBtn(C), background: C.bg, border: `1px solid ${C.border}`, color: C.muted, fontSize: 10, fontWeight: 500, width: 'auto', padding: '0 8px', whiteSpace: 'nowrap' }}>
-          {uploading ? '...' : 'Upload'}
+        <button className="am-resume-icon-action" type="button" onClick={handleCreate} title="New resume" aria-label="New resume"><Plus size={15} aria-hidden="true" /></button>
+        <button className="am-resume-upload-action" type="button" onClick={() => fileInputRef.current?.click()} title="Upload PDF/DOCX">
+          <Upload size={12} aria-hidden="true" /> {uploading ? '…' : 'Upload'}
         </button>
         <input ref={fileInputRef} type="file" accept=".pdf,.docx,.doc" style={{ display: 'none' }}
           onChange={e => { const f = e.target.files?.[0]; if (f) handleUpload(f); e.target.value = '' }} />
       </div>
 
-      <div style={{ flex: 1, overflow: 'auto', padding: '10px' }}>
+      <div className="am-resume-content">
         {/* ══════════════════════════════════════════════════════════════════════════
             1️⃣  JOB MATCH
            ═══════════════════════════════════════════════════════════════════════ */}
         {currentJob && (
-          <div style={{ background: C.card, borderRadius: 10, border: `1px solid ${C.border}`, padding: '12px', marginBottom: 10 }}>
-            <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 10 }}>
-              <div style={{ width: 28, height: 28, borderRadius: 7, flexShrink: 0, background: `${C.primary}12`, color: C.primary, display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 10, fontWeight: 700 }}>
+          <div className="am-resume-card am-resume-job-card">
+            <div className="am-resume-job-heading">
+              <div className="am-resume-job-avatar">
                 {currentJob.company.slice(0, 2).toUpperCase()}
               </div>
-              <div style={{ flex: 1, minWidth: 0 }}>
+              <div className="am-resume-job-copy">
+                <span className="am-resume-eyebrow">Current job</span>
                 <div style={{ fontSize: 11, fontWeight: 600, color: C.text, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{currentJob.title}</div>
                 <div style={{ fontSize: 10, color: C.muted }}>{currentJob.company}{currentJob.location ? ` · ${currentJob.location}` : ''}</div>
               </div>
             </div>
             {auditedResumeId === activeId && <div style={{ margin: '0 0 9px', fontSize: 10, fontWeight: 600, color: C.green }}>✓ Using the audited resume selected in My Jobs</div>}
             {packageStatus === 'missing' && <div style={{ margin: '0 0 9px', fontSize: 10, fontWeight: 600, color: C.amber }}>No audited package for this job yet — the displayed resume is not ready to submit.</div>}
-            <button onClick={handleAnalyze} disabled={analyzing} style={{ width: '100%', padding: '8px', borderRadius: 7, border: 'none', background: analyzing ? `${C.primary}80` : C.primary, color: '#fff', fontSize: 11, fontWeight: 600, cursor: analyzing ? 'default' : 'pointer', fontFamily: 'inherit' }}>
-              {analyzing ? 'Analyzing...' : scoreResult ? 'Re-analyze Match' : 'Analyze Match'}
+            <button className="am-resume-match-button" type="button" onClick={handleAnalyze} disabled={analyzing}>
+              <Sparkles size={13} aria-hidden="true" /> {analyzing ? 'Analyzing…' : scoreResult ? 'Re-analyze match' : 'Analyze match'}
             </button>
 
-            {scoreResult && (
+            {scoreResult && scoreColors && (
               <div style={{ marginTop: 10 }}>
                 <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-                  <div style={{ width: 48, height: 48, borderRadius: '50%', background: `conic-gradient(${scoreResult.score >= 80 ? C.green : scoreResult.score >= 50 ? C.primary : C.amber} ${scoreResult.score}%, ${C.border} ${scoreResult.score}%)`, display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0 }}>
-                    <div style={{ width: 36, height: 36, borderRadius: '50%', background: C.card, display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 14, fontWeight: 700, color: scoreResult.score >= 80 ? C.green : scoreResult.score >= 50 ? C.primary : C.amber }}>{scoreResult.score}</div>
+                  <div style={{ width: 48, height: 48, borderRadius: '50%', background: `conic-gradient(${scoreColors.color} ${scoreResult.score}%, rgba(0,0,0,.07) ${scoreResult.score}%)`, display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0 }}>
+                    <div style={{ width: 36, height: 36, borderRadius: '50%', background: C.card, display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 14, fontWeight: 700, color: scoreColors.color }}>{scoreResult.score}</div>
                   </div>
                   <div>
-                    <div style={{ fontSize: 11, fontWeight: 600, color: C.text }}>{scoreResult.score >= 80 ? 'Strong Match' : scoreResult.score >= 50 ? 'Good Match' : 'Needs Work'}</div>
+                    <div style={{ fontSize: 11, fontWeight: 600, color: C.text }}>{scoreColors.tone === 'strong' ? 'Strong Match' : scoreColors.tone === 'normal' ? 'Good Match' : 'Needs Work'}</div>
                     {scoreResult.strengthSummary && <div style={{ fontSize: 9, color: C.muted, marginTop: 2 }}>{scoreResult.strengthSummary}</div>}
                   </div>
                 </div>
@@ -474,11 +504,11 @@ export function ResumeView({ settings }: Props) {
         {/* ══════════════════════════════════════════════════════════════════════════
             2️⃣  RESUME PREVIEW — template applied, ready-to-go look
            ═══════════════════════════════════════════════════════════════════════ */}
-        <div style={{ background: C.card, borderRadius: 10, border: `1px solid ${C.border}`, marginBottom: 10, overflow: 'hidden' }}>
-          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '10px 12px', borderBottom: `1px solid ${C.border}` }}>
-            <span style={{ fontSize: 11, fontWeight: 600, color: C.text }}>📋 Preview</span>
-            <button onClick={() => setEditMode(v => !v)} style={{ fontSize: 9, fontWeight: 600, padding: '3px 10px', borderRadius: 999, background: editMode ? C.primary : C.bg, color: editMode ? '#fff' : C.muted, border: `0.5px solid ${editMode ? C.primary : C.border}`, cursor: 'pointer', fontFamily: 'inherit' }}>
-              {editMode ? 'Done' : '✎ Quick Edit'}
+        <div className="am-resume-card am-resume-preview-card">
+          <div className="am-resume-card-head">
+            <span className="am-resume-card-title"><FileText size={13} aria-hidden="true" /> Resume preview</span>
+            <button className={`am-resume-pill-action${editMode ? ' active' : ''}`} type="button" onClick={() => setEditMode(v => !v)}>
+              {editMode ? <><Check size={11} aria-hidden="true" /> Done</> : <><Pencil size={11} aria-hidden="true" /> Quick edit</>}
             </button>
           </div>
 
@@ -492,8 +522,8 @@ export function ResumeView({ settings }: Props) {
         {/* ══════════════════════════════════════════════════════════════════════════
             3️⃣  TEMPLATE PICKER — with thumbnails
            ═══════════════════════════════════════════════════════════════════════ */}
-        <div style={{ background: C.card, borderRadius: 10, border: `1px solid ${C.border}`, padding: '12px', marginBottom: 10 }}>
-          <div style={{ fontSize: 11, fontWeight: 600, color: C.text, marginBottom: 8 }}>🎨 Template</div>
+        <div className="am-resume-card am-resume-template-card">
+          <div className="am-resume-card-title"><Palette size={13} aria-hidden="true" /> Template</div>
 
           {/* Thumbnail grid */}
           <div style={{ display: 'grid', gridTemplateColumns: 'repeat(5, 1fr)', gap: 6, marginBottom: 10 }}>
@@ -541,25 +571,26 @@ export function ResumeView({ settings }: Props) {
         {/* ══════════════════════════════════════════════════════════════════════════
             4️⃣  DOWNLOAD PDF (the only download entry)
            ═══════════════════════════════════════════════════════════════════════ */}
-        <div style={{ background: `linear-gradient(135deg, ${C.green}06, ${C.green}02)`, borderRadius: 10, border: `1.5px solid ${C.green}20`, padding: '14px', marginBottom: 10 }}>
-          <div style={{ fontSize: 11, fontWeight: 600, color: C.text, marginBottom: 2 }}>Download PDF</div>
-          <div style={{ fontSize: 9, color: C.muted, marginBottom: 10 }}>{packageStatus === 'audited' ? 'Saves the audited resume and cover letter into this job’s D: folder' : 'Opens print view → save as PDF → drag to upload portal'}</div>
-          <button onClick={handleExportApplicationPack} disabled={!activeId || exportingPack} style={{ width: '100%', padding: '10px', borderRadius: 8, background: activeId ? C.green : `${C.green}60`, color: '#fff', border: 'none', fontSize: 12, fontWeight: 600, cursor: activeId ? 'pointer' : 'default', fontFamily: 'inherit' }}>
+        <div className="am-resume-card am-resume-download-card">
+          <div className="am-resume-card-title"><Download size={13} aria-hidden="true" /> Download PDF</div>
+          <div className="am-resume-download-copy">{packageStatus === 'audited' ? 'Saves the audited resume and cover letter into this job’s D: folder' : 'Opens print view → save as PDF → drag to upload portal'}</div>
+          <button className="am-resume-download-button" type="button" onClick={handleExportApplicationPack} disabled={!activeId || exportingPack}>
+            <Download size={14} aria-hidden="true" />
             {exportingPack ? 'Saving audited PDFs…' : exportedPackFolder ? 'Open job folder →' : packageStatus === 'audited' ? 'Save audited application PDFs →' : 'Print & Download PDF →'}
           </button>
         </div>
 
         {/* ── Sync status ── */}
-        <div style={{ padding: '6px 0', display: 'flex', alignItems: 'center', gap: 8, fontSize: 9, color: C.subtle }}>
+        <div className="am-resume-sync">
           <span style={{ width: 5, height: 5, borderRadius: '50%', background: dirty ? C.amber : saving ? C.subtle : C.green, display: 'inline-block' }} />
           {saving ? 'Saving...' : dirty ? 'Unsaved' : 'Synced'}
-          <button onClick={() => activeId && loadResume(activeId)} style={{ background: 'none', border: `0.5px solid ${C.border}`, borderRadius: 4, padding: '1px 6px', fontSize: 8, cursor: 'pointer', color: C.muted, fontFamily: 'inherit', marginLeft: 'auto' }}>↺ Refresh</button>
+          <button type="button" onClick={() => activeId && loadResume(activeId)}><RefreshCw size={10} aria-hidden="true" /> Refresh</button>
         </div>
       </div>
 
       {/* ── Toast ── */}
       {toast && (
-        <div style={{ position: 'fixed', bottom: 60, left: '50%', transform: 'translateX(-50%)', background: '#0f172a', color: '#fff', padding: '8px 18px', borderRadius: 20, fontSize: 11, zIndex: 9999, whiteSpace: 'nowrap', boxShadow: '0 4px 16px rgba(0,0,0,0.2)', fontWeight: 600 }}>{toast}</div>
+        <div className="am-toast">{toast}</div>
       )}
     </div>
   )
@@ -618,7 +649,7 @@ function PreviewSection({ sectionId, content, accent }: { sectionId: string; con
       return <div>{title('Summary')}<div style={{ fontSize: 10, color: '#555', lineHeight: 1.55 }}>{sec.summary}</div></div>
 
     case 'experience':
-      if (sec.experience.length === 0) return null
+      if (!Array.isArray(sec.experience) || sec.experience.length === 0) return null
       return (
         <div>
           {title('Experience')}
@@ -629,9 +660,9 @@ function PreviewSection({ sectionId, content, accent }: { sectionId: string; con
                 <span style={{ fontSize: 9, color: '#888', flexShrink: 0, marginLeft: 8 }}>{exp.period}</span>
               </div>
               {exp.company && <div style={{ fontSize: 10, color: '#666', marginTop: 1 }}>{exp.company}</div>}
-              {exp.bullets.filter(Boolean).length > 0 && (
+              {(exp.bullets ?? []).filter(Boolean).length > 0 && (
                 <ul style={{ margin: '3px 0 0 12px', padding: 0 }}>
-                  {exp.bullets.filter(Boolean).map((b, j) => (
+                  {(exp.bullets ?? []).filter(Boolean).map((b, j) => (
                     <li key={j} style={{ fontSize: 10, color: '#555', lineHeight: 1.45, marginBottom: 1 }}>{b}</li>
                   ))}
                 </ul>
@@ -642,7 +673,7 @@ function PreviewSection({ sectionId, content, accent }: { sectionId: string; con
       )
 
     case 'skills':
-      if (sec.skills.length === 0) return null
+      if (!Array.isArray(sec.skills) || sec.skills.length === 0) return null
       return (
         <div>
           {title('Skills')}
@@ -655,7 +686,7 @@ function PreviewSection({ sectionId, content, accent }: { sectionId: string; con
       )
 
     case 'education':
-      if (sec.education.length === 0) return null
+      if (!Array.isArray(sec.education) || sec.education.length === 0) return null
       return (
         <div>
           {title('Education')}
@@ -693,9 +724,9 @@ function PreviewSection({ sectionId, content, accent }: { sectionId: string; con
                 {p.period && <span style={{ fontSize: 9, color: '#888' }}>{p.period}</span>}
               </div>
               {p.url && <div style={{ fontSize: 9, color: accent }}>{p.url}</div>}
-              {p.bullets.filter(Boolean).length > 0 && (
+              {(p.bullets ?? []).filter(Boolean).length > 0 && (
                 <ul style={{ margin: '2px 0 0 12px', padding: 0 }}>
-                  {p.bullets.filter(Boolean).map((b, j) => (
+                  {(p.bullets ?? []).filter(Boolean).map((b, j) => (
                     <li key={j} style={{ fontSize: 9, color: '#555', lineHeight: 1.45 }}>{b}</li>
                   ))}
                 </ul>
@@ -733,9 +764,9 @@ function PreviewSection({ sectionId, content, accent }: { sectionId: string; con
                 {item.period && <span style={{ fontSize: 9, color: '#888' }}>{item.period}</span>}
               </div>
               {item.subtitle && <div style={{ fontSize: 9, color: '#666' }}>{item.subtitle}</div>}
-              {item.bullets.filter(Boolean).length > 0 && (
+              {(item.bullets ?? []).filter(Boolean).length > 0 && (
                 <ul style={{ margin: '2px 0 0 12px', padding: 0 }}>
-                  {item.bullets.filter(Boolean).map((b, k) => (
+                  {(item.bullets ?? []).filter(Boolean).map((b, k) => (
                     <li key={k} style={{ fontSize: 9, color: '#555', lineHeight: 1.45 }}>{b}</li>
                   ))}
                 </ul>

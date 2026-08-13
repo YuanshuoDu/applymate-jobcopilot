@@ -119,3 +119,181 @@ The overview and job-card score regions were compared separately because the rin
 ### Final result
 
 passed
+
+## Side panel Jobs professional UX/UI refinement
+
+### Audit scope
+
+- User goal: scan a saved role quickly, understand match quality and key requirements, then open the job or continue in My Jobs without losing context.
+- Evidence: user-provided screenshot plus current-run previews at 488 × 730 and 390 × 844 CSS pixels.
+- Current implementation screenshots: `audit-artifacts/jobs-ux-polished-collapsed.png`, `audit-artifacts/jobs-ux-polished-expanded.png`
+
+### Strengths retained
+
+- Jobs combines dashboard momentum and My Jobs tracking in one surface.
+- Search, status/source filters, sort, one-click Score/Re-score, notes, original link, and My Jobs navigation remain available.
+- Status is displayed as passive synced information; no manual sidebar status editor is exposed.
+
+### UX/UI findings and adjustments
+
+- The original screen was visually complete but top-heavy: overview, metrics, filters, cards, and footer competed for the same narrow viewport. Reduced repeated vertical padding while preserving touch targets and section boundaries.
+- Users needed to open every card to discover the role’s important skills. Added a two-tag collapsed preview with a `+N` remainder; expanded cards hide the preview so tags are not duplicated.
+- Expanded details previously read as a notes form first and a decision surface second. Kept Notes available, but aligned the right panel around `Key job tags` and `Match score`, with clear paired actions below.
+- The high-match opportunity could truncate to an ambiguous label at narrow widths. It now allows a two-line role title, and `View job` expands and scrolls the target card into the list center.
+- Original job link is now presented once in the action row; the detail panel no longer repeats the same link.
+- Footer remains a fixed bottom action bar while the list scrolls independently; expanded cards do not overlap it.
+
+### Verification
+
+- `pnpm --filter @jobcopilot/extension typecheck` — passed.
+- `pnpm --filter @jobcopilot/extension test` — 4 files, 10 tests passed.
+- `pnpm --filter @jobcopilot/extension build` — passed.
+- `node --check apps/extension/dist/background.js` — passed.
+- `node --check apps/extension/dist/sidepanel.js` — passed.
+- Runtime: search and Saved filter work; Refresh and View all jobs each render once; status editor absent.
+- Runtime: top `View job` focused the Account Executive card, expanded it, and kept it visible above the footer.
+- Runtime: expanded card contains one `Open original`, visible key tags, no horizontal overflow, and no captured console errors.
+
+### Evidence limits
+
+- This is a visual/runtime preview with mocked API responses. Live extension content-script scanning, authenticated production data, and real browser-tab navigation still need separate Chrome extension verification.
+
+### Final result
+
+passed
+
+## Side panel Jobs footer layout QA
+
+### Evidence
+
+- User reference: `C:\Users\Steven.du\AppData\Local\Temp\codex-clipboard-5666a211-7e56-44ad-a653-a2ac0f7a9494.png`
+- Implementation source: `apps/extension/src/sidepanel/sidepanel.css`
+- Current implementation screenshots: `audit-artifacts/jobs-footer-fixed.png`, `audit-artifacts/jobs-footer-fixed-mobile.png`
+- Preview URL: `http://localhost:4175/audit-artifacts/sidebar-runtime-preview.html`
+
+### Finding and fix
+
+- The footer was participating in the tracker’s page scroll, which allowed `Refresh` and `View all jobs` to sit over the job list in the captured state.
+- The tracker now owns the fixed-height shell, the job list is the only independently scrollable region, and the footer remains a non-scrolling bottom action bar.
+- Expanded job details still scroll with the list and remain clear of the footer.
+
+### Verification
+
+- Desktop preview at 1166 × 844: footer is aligned to the bottom edge and no longer covers a job card.
+- Narrow preview at 390 × 844: footer stays visible at the bottom, the list scrolls above it, and the expanded detail card remains readable.
+- `Refresh` and `View all jobs` controls are each present exactly once in the runtime DOM.
+- `pnpm --filter @jobcopilot/extension typecheck` — passed.
+- `pnpm --filter @jobcopilot/extension test` — 4 files, 10 tests passed.
+- `pnpm --filter @jobcopilot/extension build` — passed.
+
+### Final result
+
+passed
+
+## Side panel visual refinement QA — Jobs + Form Fill
+
+### Evidence
+
+- Reference 1: `C:\Users\Steven.du\.codex\attachments\110345ab-0931-45b9-a27a-19a546634351\image-1.png`
+- Reference 2: `C:\Users\Steven.du\.codex\attachments\110345ab-0931-45b9-a27a-19a546634351\image-2.png`
+- Implementation source: `apps/extension/src/sidepanel/FormFillerView.tsx`, `apps/extension/src/sidepanel/sidepanel.css`
+- Browser captures: local side-panel runtime preview at 320 × 568 and 390 × 844 CSS pixels
+
+### Findings
+
+- No actionable P0/P1/P2 findings remain for the refined surfaces.
+- Form Fill now shares the Jobs design tokens: pale lavender page surface, white bordered cards, indigo primary actions, green success states, amber manual-review states, and restrained muted copy.
+- The old Form Fill inline palette, emoji status icons, and oversized empty-state rhythm were removed in favor of Lucide icons, compact context headers, explicit status badges, and consistent action hierarchy.
+- The panel body keeps each mounted tab isolated, while Form Fill owns its own vertical scroll so review, upload, Persona-save, and next-step content remain reachable on narrow side panels.
+- At 320px width, the refined Form Fill state has no horizontal overflow and its action/context cards stay within the viewport.
+
+### Required fidelity surfaces
+
+| Surface | Result | Evidence |
+| --- | --- | --- |
+| Fonts and typography | Pass | Form Fill headings, eyebrow labels, field copy, badges, and buttons inherit the same compact system stack as Jobs. |
+| Spacing and layout rhythm | Pass | Idle, error, analysis, review, applying, and done states use shared card/action rhythm; narrow viewport check passed. |
+| Colors and visual tokens | Pass | `--am-primary`, `--am-page`, `--am-panel`, `--am-line`, `--am-green`, `--am-amber`, and `--am-red` are shared across the side panel. |
+| Image and asset fidelity | Pass | UI icons use the existing `lucide-react` library; no emoji or custom-drawn replacement assets remain in Form Fill states. |
+| Copy and content | Pass | Existing scan, retry, AI revise, apply-all, upload, Persona-save, and next-step actions remain wired; only presentation copy was tightened. |
+
+### Verification
+
+- `pnpm --filter @jobcopilot/extension typecheck` — passed.
+- `pnpm --filter @jobcopilot/extension test` — 4 files, 10 tests passed.
+- `pnpm --filter @jobcopilot/extension build` — passed; side-panel CSS is emitted and linked by the extension build.
+- Browser: populated Jobs state, Form Fill idle state, Form Fill scan-error state, tab switching, and 320px horizontal-overflow check were inspected.
+- Limitation: live content-script scanning, AI analysis, and page injection still require a real Chrome extension tab; the local preview intentionally exercises the visual states and the unavailable-page error path without sending user data.
+
+### Final result
+
+passed with runtime-extension verification noted above
+
+## Side panel visual refinement QA — Resume + Profile
+
+### Evidence
+
+- Implementation source: `apps/extension/src/sidepanel/ResumeView.tsx`, `apps/extension/src/sidepanel/PersonaView.tsx`, `apps/extension/src/sidepanel/sidepanel.css`
+- Browser captures: local runtime preview at `http://localhost:4175/audit-artifacts/sidebar-runtime-preview.html?flaky=1`, rendered at the connected browser viewport (`1280 × 720` CSS pixels in this browser session)
+- Preview data: read-only mock responses matching the real `/api/resume`, `/api/resume/:id`, `/api/me/persona`, and `/api/me/persona/fields` response shapes
+
+### Findings
+
+- No actionable P0/P1/P2 findings remain for the updated surfaces.
+- Resume now uses the same page surface, card border, compact typography, indigo action hierarchy, green completion state, and Lucide icon language as Jobs/Form Fill.
+- Profile now presents a compact intro/status card, unified profile knowledge base, saved-answer groups, and a consistent add/edit state without changing the existing save/delete API calls.
+- Resume content is normalized before rendering so incomplete but valid API payloads do not blank the panel when optional arrays or contact fields are absent.
+
+### Required fidelity surfaces
+
+| Surface | Result | Evidence |
+| --- | --- | --- |
+| Fonts and typography | Pass | Resume/Profile use the side panel's system stack and compact heading, eyebrow, body, badge, and control hierarchy. |
+| Spacing and layout rhythm | Pass | Toolbar, cards, summary groups, editors, and sync actions follow the existing Jobs/Form Fill rhythm; no horizontal overflow in the rendered preview. |
+| Colors and visual tokens | Pass | Shared `--am-primary`, `--am-page`, `--am-panel`, `--am-line`, `--am-green`, `--am-red`, and `--am-shadow` tokens are used across both tabs. |
+| Image and asset fidelity | Pass | Standard UI controls use the existing `lucide-react` icon set; old emoji status/action glyphs were removed from the updated states. |
+| Copy and content | Pass | Existing Resume preview, template, quick edit, upload, export, refresh, Profile add, edit, delete, and sync actions remain present. |
+
+### Functional checks
+
+- Resume `Quick edit` toggles to `Done` and back without changing the editing model.
+- Profile `Add new field` opens the editor and `Cancel adding field` closes it.
+- Profile field `Edit` opens the inline editor; existing save/delete handlers remain wired.
+- Resume and Profile loaded without browser console errors in the final preview.
+- `pnpm --filter @jobcopilot/extension typecheck` — passed.
+- `pnpm --filter @jobcopilot/extension test` — 4 files, 10 tests passed.
+- `pnpm --filter @jobcopilot/extension build` — passed; side-panel CSS emitted and linked by the extension build.
+
+### Final result
+
+passed
+
+## Side panel Jobs detail QA — key job tags
+
+### Evidence
+
+- User references: three attached Jobs screenshots showing the expanded job detail state.
+- Implementation source: `apps/extension/src/sidepanel/SidePanel.tsx`, `apps/extension/src/sidepanel/sidepanel.css`
+- Current implementation screenshot: `audit-artifacts/jobs-key-tags-expanded.png`
+- Preview URL: `http://localhost:4175/audit-artifacts/sidebar-runtime-preview.html`
+- Screenshot viewport: 390 × 844 CSS pixels
+
+### Findings
+
+- The expanded card now shows deduplicated key job tags from `SavedJob.keywords`, with a compact pill treatment that follows the existing indigo token system.
+- The original job URL is rendered once as `Open original`; the duplicate bottom `Original` action was removed.
+- Manual `Update status` controls were removed from the sidebar. Stored status remains a read-only row pill and the existing list filters continue to work.
+- `Open in My Jobs`, Notes, Score, and Re-score remain available in the existing card flow.
+
+### Verification
+
+- `pnpm --filter @jobcopilot/extension typecheck` — passed.
+- `pnpm --filter @jobcopilot/extension test` — 4 files, 10 tests passed.
+- `pnpm --filter @jobcopilot/extension build` — passed; updated side-panel CSS and bundle emitted.
+- Runtime preview: `Open original` count = 1; `Update status` absent; SQL, product analytics, experimentation, and dashboards rendered as tags.
+- Runtime interactions: Search, Saved filter, Score, Notes autosave, and expanded-card rendering passed.
+- Responsive screenshot inspection: 390 × 844 layout has no horizontal overflow; detail columns remain readable and the primary My Jobs action spans the card.
+
+### Final result
+
+passed

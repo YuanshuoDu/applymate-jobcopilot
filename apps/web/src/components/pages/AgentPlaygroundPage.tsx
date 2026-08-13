@@ -424,7 +424,8 @@ export function AgentPlaygroundPage() {
             overflow-x: hidden !important;
             box-sizing: border-box;
             padding-bottom: var(--mobile-content-inset);
-            overscroll-behavior-y: contain;
+            overscroll-behavior-y: auto;
+            -webkit-overflow-scrolling: touch;
           }
 
           .agent-session-console {
@@ -440,6 +441,22 @@ export function AgentPlaygroundPage() {
             min-height: 620px !important;
             width: 100% !important;
             min-width: 0 !important;
+          }
+
+          /* Keep one scroll owner on phones. The empty welcome state can be
+             taller than the viewport, so an inner, non-overflowing pane must
+             not consume the gesture before the workspace can scroll. */
+          .agent-live-stream {
+            height: auto !important;
+            overflow: visible !important;
+          }
+
+          .agent-live-stream-body[data-empty='true'] {
+            flex: 0 0 auto !important;
+            min-height: 0 !important;
+            overflow: visible !important;
+            overscroll-behavior: auto !important;
+            padding-bottom: 24px !important;
           }
 
           .agent-composer,

@@ -1530,7 +1530,7 @@ export function JobsPage() {
 
   return (
     <div className="jobs-page" style={{ flex: 1, overflowY: 'auto', background: 'var(--bg-tertiary)', display: 'flex', flexDirection: 'column' }}>
-      <header className="jobs-page-header" style={{ minHeight: 62, padding: '8px 30px', background: 'var(--bg-tertiary)' }}>
+      <header className="jobs-page-header" style={{ minHeight: 62, flexShrink: 0, padding: '8px 30px', background: 'var(--bg-tertiary)' }}>
         <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 24, flexWrap: 'wrap' }}>
           <div style={{ flex: '1 1 360px', display: 'flex', alignItems: 'center', gap: 10, minWidth: 0 }}>
             <h1 style={{ margin: 0, flexShrink: 0, fontSize: 22, fontWeight: 760, lineHeight: 1.1, letterSpacing: '-0.05em' }}>My Jobs</h1>
