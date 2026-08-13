@@ -1,7 +1,7 @@
 'use client'
 
 import React from 'react'
-import { LockKeyhole } from 'lucide-react'
+import { ArrowUp, ChevronDown, LockKeyhole, Paperclip, Sparkles } from 'lucide-react'
 import { ComposerMenuButton, ComposerMenuEmpty, ComposerMenuSection, formatBytes } from '@/components/agent-workspace/ComposerParts'
 
 export interface ComposerJob {
@@ -80,36 +80,41 @@ export function AgentComposer({
   const [advancedModelOpen, setAdvancedModelOpen] = React.useState(false)
 
   return (
-    <div className="agent-composer" style={{ borderTop: '0.5px solid var(--border)', padding: '10px 14px', background: 'var(--bg-secondary)', flexShrink: 0 }}>
+    <div className="agent-composer" style={{ borderTop: '1px solid rgba(79,70,229,0.08)', padding: '12px 14px max(14px, env(safe-area-inset-bottom))', background: 'linear-gradient(180deg, rgba(248,250,252,0.72), var(--bg-secondary))', flexShrink: 0 }}>
       {waitingForAnswer && (
         <div style={{ marginBottom: 8, padding: '6px 10px', borderRadius: 7, background: 'rgba(245,158,11,0.08)', border: '1px solid rgba(245,158,11,0.25)', fontSize: 11, color: '#b45309' }}>
           ⏸ The Orchestrator is waiting for your answer above, or you can send a new instruction below.
         </div>
       )}
-      <div style={{ display: 'flex', flexWrap: 'wrap', gap: 7, marginBottom: 8 }}>
+      <div style={{ display: 'flex', gap: 7, marginBottom: 10, overflowX: 'auto', scrollbarWidth: 'none', padding: '1px 1px 3px' }}>
         {chips.map(chip => (
-          <button key={chip.label} onClick={() => chip.onClick ? chip.onClick() : onSendChat(chip.prompt)} style={{
-            padding: '6px 10px',
-            fontSize: 11,
-            borderRadius: 8,
-            border: '1px solid var(--border)',
-            background: 'var(--bg)',
+          <button className="agent-composer-chip" key={chip.label} onClick={() => chip.onClick ? chip.onClick() : onSendChat(chip.prompt)} style={{
+            minHeight: 34,
+            flexShrink: 0,
+            padding: '0 12px',
+            fontSize: 11.5,
+            fontWeight: 650,
+            borderRadius: 999,
+            border: '1px solid rgba(79,70,229,0.14)',
+            background: 'rgba(255,255,255,0.82)',
             cursor: 'pointer',
             color: 'var(--text)',
             fontFamily: 'inherit',
             display: 'inline-flex',
             alignItems: 'center',
-            gap: 6,
+            gap: 7,
+            boxShadow: '0 2px 7px rgba(15,23,42,0.035)',
           }}>
+            <Sparkles size={13} color="var(--primary)" strokeWidth={2.1} aria-hidden="true" />
             {chip.label}
           </button>
         ))}
       </div>
       <div style={{
-        border: '1px solid var(--border)',
-        borderRadius: 12,
-        background: 'var(--bg)',
-        boxShadow: '0 2px 10px rgba(15,23,42,0.04)',
+        border: '1px solid rgba(99,102,241,0.22)',
+        borderRadius: 18,
+        background: 'rgba(255,255,255,0.96)',
+        boxShadow: '0 12px 28px rgba(49,46,129,0.10), 0 2px 7px rgba(15,23,42,0.04)',
         overflow: 'visible',
       }}>
         {attachedFiles.length > 0 && (
@@ -150,9 +155,9 @@ export function AgentComposer({
             ? 'Answer the question or message the Orchestrator… (Enter to send)'
             : 'Message the Orchestrator… (Enter to send)'}
           rows={2}
-          style={{ width: '100%', boxSizing: 'border-box', padding: '10px 12px 6px', fontSize: 12, border: 'none', background: 'transparent', color: 'var(--text)', outline: 'none', resize: 'none', fontFamily: 'inherit', lineHeight: 1.55 }}
+          style={{ width: '100%', boxSizing: 'border-box', minHeight: 66, padding: '13px 14px 7px', fontSize: 14, border: 'none', background: 'transparent', color: 'var(--text)', outline: 'none', resize: 'none', fontFamily: 'inherit', lineHeight: 1.5 }}
         />
-        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8, padding: '7px 8px 8px', borderTop: '1px solid var(--border)' }}>
+        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8, padding: '5px 7px 7px 8px' }}>
           <div style={{ display: 'flex', alignItems: 'center', gap: 7, position: 'relative' }}>
             <input
               ref={fileInputRef}
@@ -170,12 +175,13 @@ export function AgentComposer({
                 onAddMenuOpenChange(open => !open)
               }}
               title="Add context"
-              style={{ width: 28, height: 28, borderRadius: 7, border: '1px solid var(--border)', background: 'var(--bg-secondary)', color: 'var(--text)', cursor: 'pointer', fontSize: 16, lineHeight: 1 }}
+              aria-label="Add context"
+              style={{ width: 34, height: 34, display: 'grid', placeItems: 'center', borderRadius: 12, border: 'none', background: 'rgba(79,70,229,0.08)', color: 'var(--primary)', cursor: 'pointer' }}
             >
-              +
+              <Paperclip size={17} strokeWidth={2.15} aria-hidden="true" />
             </button>
             {addMenuOpen && (
-              <div className="agent-composer-add-menu" style={{ position: 'absolute', bottom: 'calc(100% + 8px)', left: 0, width: 280, maxHeight: 'min(420px, 60vh)', overflowY: 'auto', border: '1px solid var(--border)', borderRadius: 10, background: 'var(--bg)', boxShadow: '0 16px 36px rgba(15,23,42,0.18)', padding: 7, zIndex: 100 }}>
+                <div className="agent-composer-add-menu" style={{ position: 'absolute', bottom: 'calc(100% + 10px)', left: 0, width: 280, maxHeight: 'min(420px, 60vh)', overflowY: 'auto', border: '1px solid rgba(79,70,229,0.14)', borderRadius: 14, background: 'var(--bg)', boxShadow: '0 18px 42px rgba(15,23,42,0.18)', padding: 8, zIndex: 100 }}>
                 <ComposerMenuSection title="Jobs">
                   {composerJobs.length === 0 && <ComposerMenuEmpty>No saved jobs yet</ComposerMenuEmpty>}
                   {composerJobs.slice(0, 4).map(job => (
@@ -230,14 +236,14 @@ export function AgentComposer({
                 aria-expanded={advancedModelOpen}
                 aria-haspopup="dialog"
                 title="Model selection is an advanced feature"
-                style={{ height: 28, display: 'inline-flex', alignItems: 'center', gap: 6, padding: '0 9px', borderRadius: 7, border: '1px solid var(--border)', background: 'var(--bg-secondary)', color: 'var(--text-muted)', cursor: 'pointer', fontFamily: 'inherit', fontSize: 11, fontWeight: 650 }}
+                style={{ height: 34, display: 'inline-flex', alignItems: 'center', gap: 6, padding: '0 10px', borderRadius: 12, border: 'none', background: 'rgba(15,23,42,0.045)', color: 'var(--text-muted)', cursor: 'pointer', fontFamily: 'inherit', fontSize: 11, fontWeight: 700 }}
               >
                 <LockKeyhole size={13} aria-hidden="true" />
-                <span>Model selection</span>
-                <span style={{ padding: '1px 5px', borderRadius: 999, background: 'var(--border)', color: 'var(--text-subtle)', fontSize: 9, fontWeight: 750 }}>Advanced</span>
+                <span>Model</span>
+                <ChevronDown size={13} aria-hidden="true" />
               </button>
               {advancedModelOpen && (
-                <div className="agent-composer-model-dialog" role="dialog" aria-label="Advanced model selection" style={{ position: 'absolute', bottom: 'calc(100% + 8px)', left: 0, width: 276, padding: 12, border: '1px solid var(--border)', borderRadius: 10, background: 'var(--bg)', boxShadow: '0 16px 36px rgba(15,23,42,0.18)', zIndex: 100 }}>
+                <div className="agent-composer-model-dialog" role="dialog" aria-label="Advanced model selection" style={{ position: 'absolute', bottom: 'calc(100% + 10px)', left: 0, width: 276, padding: 12, border: '1px solid rgba(79,70,229,0.14)', borderRadius: 14, background: 'var(--bg)', boxShadow: '0 18px 42px rgba(15,23,42,0.18)', zIndex: 100 }}>
                   <div style={{ display: 'flex', alignItems: 'center', gap: 7, fontSize: 12, fontWeight: 700, color: 'var(--text)' }}>
                     <LockKeyhole size={14} color="var(--text-muted)" aria-hidden="true" />
                     Advanced model settings
@@ -258,8 +264,9 @@ export function AgentComposer({
           </div>
           <button onClick={() => onSendChat(chatInput)} disabled={!canSend}
             title="Send message"
-            style={{ width: 30, height: 30, borderRadius: 8, border: 'none', background: !canSend ? 'var(--border)' : 'var(--primary)', color: '#fff', fontSize: 15, cursor: !canSend ? 'not-allowed' : 'pointer' }}>
-            {chatLoading ? '…' : '↑'}
+            aria-label="Send message"
+            style={{ width: 38, height: 38, display: 'grid', placeItems: 'center', borderRadius: 14, border: 'none', background: !canSend ? 'rgba(148,163,184,0.35)' : 'var(--brand-gradient)', color: '#fff', cursor: !canSend ? 'not-allowed' : 'pointer', boxShadow: canSend ? '0 8px 16px rgba(79,70,229,0.28)' : 'none', transition: 'transform 160ms ease, box-shadow 160ms ease' }}>
+            {chatLoading ? '…' : <ArrowUp size={19} strokeWidth={2.7} aria-hidden="true" />}
           </button>
         </div>
       </div>

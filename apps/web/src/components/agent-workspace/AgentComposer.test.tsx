@@ -29,7 +29,7 @@ describe('AgentComposer', () => {
     expect(html).toContain('class="agent-composer"')
   })
 
-  it('shows a locked advanced model entry without exposing an active model choice', () => {
+  it('keeps advanced model settings behind a compact model control', () => {
     const html = renderToString(<AgentComposer
       waitingForAnswer={false}
       chips={[]}
@@ -51,8 +51,8 @@ describe('AgentComposer', () => {
       onAppendComposerContext={vi.fn()}
     />)
 
-    expect(html).toContain('Model selection')
-    expect(html).toContain('Advanced')
+    expect(html).toContain('Model')
+    expect(html).toContain('Model selection is an advanced feature')
     expect(html).not.toContain('Claude Sonnet')
   })
 })

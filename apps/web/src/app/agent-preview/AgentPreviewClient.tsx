@@ -1,6 +1,6 @@
 'use client'
 
-import { PanelLeftOpen, X } from 'lucide-react'
+import { ArrowUp, ChevronDown, Paperclip, PanelLeftOpen, Sparkles, X } from 'lucide-react'
 import { useState, type CSSProperties } from 'react'
 import styles from './AgentPreviewClient.module.css'
 import { Sidebar } from '@/components/layout/Sidebar'
@@ -127,17 +127,18 @@ export function AgentPreviewClient() {
           </>}
         </section>
         <footer style={composerWrap}>
-          <div style={{ display: 'flex', gap: 8, marginBottom: 8 }}>
-            {['Create automation', 'Review pending', 'Explain score'].map(label => <button key={label} style={chipStyle}>{label}</button>)}
-            <button style={chipStyle} onClick={() => setThinkingExpanded(value => !value)}>
-              {thinkingExpanded ? 'Hide thinking' : 'Show thinking'}
+          <div style={chipRowStyle}>
+            {['Automate', 'Review', 'Explain score'].map(label => <button key={label} style={composerChipStyle}><Sparkles size={13} color="var(--primary)" aria-hidden="true" />{label}</button>)}
+            <button style={composerChipStyle} onClick={() => setThinkingExpanded(value => !value)}>
+              <Sparkles size={13} color="var(--primary)" aria-hidden="true" />
+              {thinkingExpanded ? 'Hide thinking' : 'Thinking'}
             </button>
           </div>
           <div style={composerBox}>
             <textarea placeholder="Ask ApplyMate to search, score, apply, or create an automation..." style={textareaStyle} />
             <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
-              <div style={{ display: 'flex', gap: 8 }}><button style={iconButton}>+</button><button style={selectButton}>MiniMax M3 ▾</button></div>
-              <button style={sendButton}>↑</button>
+              <div style={{ display: 'flex', gap: 8 }}><button aria-label="Add context" style={iconButton}><Paperclip size={17} aria-hidden="true" /></button><button style={selectButton}>Model <ChevronDown size={13} aria-hidden="true" /></button></div>
+              <button aria-label="Send message" style={sendButton}><ArrowUp size={19} strokeWidth={2.7} aria-hidden="true" /></button>
             </div>
           </div>
         </footer>
@@ -201,11 +202,13 @@ const taskRow: CSSProperties = { display: 'flex', alignItems: 'center', gap: 8, 
 const metaText: CSSProperties = { fontSize: 10, color: 'var(--text-muted)', marginTop: 3 }
 const headerStyle: CSSProperties = { height: 64, borderBottom: '1px solid var(--border)', padding: '12px 18px', display: 'flex', alignItems: 'center', justifyContent: 'space-between' }
 const transcriptStyle: CSSProperties = { flex: 1, overflowY: 'auto', padding: '16px 18px', display: 'flex', flexDirection: 'column', gap: 12 }
-const composerWrap: CSSProperties = { borderTop: '1px solid var(--border)', padding: '10px 16px 14px', background: 'var(--bg-secondary)' }
-const composerBox: CSSProperties = { border: '1px solid rgba(79,70,229,.35)', borderRadius: 10, background: 'var(--bg)', padding: 9 }
-const textareaStyle: CSSProperties = { width: '100%', minHeight: 54, border: 0, outline: 0, resize: 'none', fontFamily: 'inherit', background: 'transparent', color: 'var(--text)' }
-const iconButton: CSSProperties = { width: 30, height: 30, borderRadius: 7, border: '1px solid var(--border)', background: 'var(--bg)', color: 'var(--primary)' }
-const selectButton: CSSProperties = { height: 30, borderRadius: 7, border: '1px solid var(--border)', background: 'var(--bg)', color: 'var(--text)', padding: '0 12px' }
-const sendButton: CSSProperties = { width: 34, height: 30, borderRadius: 7, border: 0, background: 'var(--primary)', color: '#fff', fontWeight: 900 }
+const composerWrap: CSSProperties = { borderTop: '1px solid rgba(79,70,229,.08)', padding: '12px 16px 14px', background: 'linear-gradient(180deg,rgba(248,250,252,.72),var(--bg-secondary))' }
+const chipRowStyle: CSSProperties = { display: 'flex', gap: 7, overflowX: 'auto', marginBottom: 10, padding: '1px 1px 3px' }
+const composerBox: CSSProperties = { border: '1px solid rgba(99,102,241,.22)', borderRadius: 18, background: 'rgba(255,255,255,.96)', padding: '5px 7px 7px 8px', boxShadow: '0 12px 28px rgba(49,46,129,.10),0 2px 7px rgba(15,23,42,.04)' }
+const textareaStyle: CSSProperties = { width: '100%', boxSizing: 'border-box', minHeight: 66, padding: '8px 6px 7px', border: 0, outline: 0, resize: 'none', fontFamily: 'inherit', fontSize: 14, lineHeight: 1.5, background: 'transparent', color: 'var(--text)' }
+const iconButton: CSSProperties = { width: 34, height: 34, display: 'grid', placeItems: 'center', borderRadius: 12, border: 0, background: 'rgba(79,70,229,.08)', color: 'var(--primary)' }
+const selectButton: CSSProperties = { height: 34, display: 'inline-flex', alignItems: 'center', gap: 6, borderRadius: 12, border: 0, background: 'rgba(15,23,42,.045)', color: 'var(--text-muted)', padding: '0 10px', fontSize: 11, fontWeight: 700 }
+const sendButton: CSSProperties = { width: 38, height: 38, display: 'grid', placeItems: 'center', borderRadius: 14, border: 0, background: 'var(--brand-gradient)', color: '#fff', boxShadow: '0 8px 16px rgba(79,70,229,.28)' }
+const composerChipStyle: CSSProperties = { minHeight: 34, flexShrink: 0, display: 'inline-flex', alignItems: 'center', gap: 7, padding: '0 12px', border: '1px solid rgba(79,70,229,.14)', borderRadius: 999, background: 'rgba(255,255,255,.82)', boxShadow: '0 2px 7px rgba(15,23,42,.035)', color: 'var(--text)', fontSize: 11.5, fontWeight: 650, fontFamily: 'inherit' }
 const chipStyle: CSSProperties = { border: '1px solid var(--border)', borderRadius: 7, background: 'var(--bg)', color: 'var(--text)', padding: '6px 10px', fontSize: 11 }
 const tdStyle: CSSProperties = { borderTop: '1px solid var(--border)', padding: '7px 8px' }
