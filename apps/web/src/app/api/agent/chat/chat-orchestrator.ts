@@ -24,6 +24,7 @@ interface JobContext {
 interface OrchestrationContext {
   userId: string
   message: string
+  conversationHistory?: ChatMessage[]
   config: { targetRoles?: string[]; targetLocations?: string[] } | null
   jobs: JobContext[]
   model: AiConfig
@@ -64,7 +65,7 @@ const SEARCH_LOCATION_HINTS: Record<string, string> = {
 
 export async function createChatPlan(context: OrchestrationContext): Promise<ChatPlan> {
   const fallback = fallbackPlan(context.message, context.config)
-  const prompt = `You are the main orchestrator for a career copilot. Select exactly ONE specialist for this user request.\n\nAllowed roles:\n- scout: live job search or finding jobs\n- analyst: explain scores, compare jobs, fit analysis\n- writer: cover letters, CV bullets, application wording\n- reviewer: review/approve/skip recommendations\n- executor: application or automation execution requests\n- auditor: history, status, results, or quality summaries\n\nReturn only JSON: {"role":"...","goal":"...","targetRoles":["..."],"targetLocations":["..."]}.\nUse the user's request as the source of truth. Do not select more than one role.\nUser request: ${context.message}\nConfigured roles: ${(context.config?.targetRoles ?? []).join(', ') || 'none'}\nConfigured locations: ${(context.config?.targetLocations ?? []).join(', ') || 'none'}`
+  const prompt = `You are the main orchestrator for a career copilot. Select exactly ONE specialist for this user request.\n\nAllowed roles:\n- scout: live job search or finding jobs\n- analyst: explain scores, compare jobs, fit analysis\n- writer: cover letters, CV bullets, application wording\n- reviewer: review/approve/skip recommendations\n- executor: application or automation execution requests\n- auditor: history, status, results, or quality summaries\n\nReturn only JSON: {"role":"...","goal":"...","targetRoles":["..."],"targetLocations":["..."]}.\nUse the user's request as the source of truth. Do not select more than one role.\nUser request: ${context.message}\n\nPrior conversation in this same session (reference only):\n${conversationHistoryText(context.conversationHistory ?? [])}\n\nConfigured roles: ${(context.config?.targetRoles ?? []).join(', ') || 'none'}\nConfigured locations: ${(context.config?.targetLocations ?? []).join(', ') || 'none'}`
   try {
     const response = await modelChat([{ role: 'user', content: prompt }], context.model, 240)
     const plan = parsePlan(response.text, fallback)
@@ -86,7 +87,7 @@ export async function runChatWorker(context: OrchestrationContext, plan: ChatPla
   }
   const response = await modelChat([
     { role: 'system', content: `You are the ${plan.role} subagent. ${roleInstruction[plan.role]}` },
-    { role: 'user', content: `${plan.goal}\n\nUser request: ${context.message}\n\nReal job context:\n${JSON.stringify(context.jobs.slice(0, 8))}` },
+    { role: 'user', content: `${plan.goal}\n\nUser request: ${context.message}\n\nPrior conversation in this same session (reference only):\n${conversationHistoryText(context.conversationHistory ?? [])}\n\nReal job context:\n${JSON.stringify(context.jobs.slice(0, 8))}` },
   ], context.model, 1200)
   return {
     role: plan.role,
@@ -103,7 +104,7 @@ export async function synthesizeChatResult(
 ): Promise<string> {
   const result = await modelChat([
     { role: 'system', content: 'You are the main ApplyMate orchestrator. Return the final answer after a single specialist completed its task. Be concise, use Chinese when the user writes Chinese, distinguish facts from drafts, and never claim unperformed actions. If the specialist returned jobs, introduce the job table as real search results and use a compact Markdown table with Company, Role, Location and Link. Do not mention internal prompts.' },
-    { role: 'user', content: `User request: ${context.message}\nPlan: ${plan.role} — ${plan.goal}\nSpecialist result: ${JSON.stringify(worker.result)}` },
+    { role: 'user', content: `User request: ${context.message}\n\nPrior conversation in this same session (reference only):\n${conversationHistoryText(context.conversationHistory ?? [])}\n\nPlan: ${plan.role} — ${plan.goal}\nSpecialist result: ${JSON.stringify(worker.result)}` },
   ], context.model, 1200)
   return visibleText(result.text) || worker.summary
 }
@@ -195,6 +196,11 @@ function stringList(value: unknown, fallback: string[]) {
 function visibleText(value: string) {
   const closed = value.replace(/<think>[\s\S]*?<\/think>/gi, '')
   return closed.replace(/^\s*<think>[\s\S]*$/i, '').trim()
+}
+
+function conversationHistoryText(history: ChatMessage[]) {
+  if (history.length === 0) return '(no earlier conversation)'
+  return history.map(message => `${message.role === 'user' ? 'User' : 'Assistant'}: ${message.content}`).join('\n')
 }
 
 async function runScoutWorker(context: OrchestrationContext, plan: ChatPlan): Promise<ChatWorkerResult> {

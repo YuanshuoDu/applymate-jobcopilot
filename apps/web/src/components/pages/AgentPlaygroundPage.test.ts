@@ -20,4 +20,11 @@ describe('Agent workspace responsive layout', () => {
     expect(source).toContain('aria-controls="agent-session-drawer"')
     expect(source).toContain('Close conversations')
   })
+
+  it('restores the last opened session and records future session views server-side', () => {
+    expect(source).toContain('initialSessionRestoredRef')
+    expect(source).toContain('lastOpenedSessionId')
+    expect(source).toContain("method: 'PATCH'")
+    expect(source).toContain('onSessionsLoaded={restoreLastSession}')
+  })
 })

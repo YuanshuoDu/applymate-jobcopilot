@@ -160,6 +160,21 @@ export async function GET(req: NextRequest, ctx: RouteCtx) {
   return ok({ session: serializeSession({ ...session, questions, applicationTasks, execution }) })
 }
 
+/** Records the user's own most recently opened conversation. */
+export async function PATCH(req: NextRequest, ctx: RouteCtx) {
+  const auth = await requireAuth(req)
+  if (isErrorResponse(auth)) return auth
+
+  const { id } = await ctx.params
+  const result = await db.agentSession.updateMany({
+    where: { id, userId: auth.userId },
+    data: { lastViewedAt: new Date() },
+  })
+  if (result.count === 0) return err("Session not found", 404)
+
+  return ok({ id })
+}
+
 export async function DELETE(req: NextRequest, ctx: RouteCtx) {
   const auth = await requireAuth(req)
   if (isErrorResponse(auth)) return auth

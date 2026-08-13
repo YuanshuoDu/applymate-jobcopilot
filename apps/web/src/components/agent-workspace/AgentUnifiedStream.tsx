@@ -75,6 +75,7 @@ export function AgentUnifiedStream({
   const [chatInput, setChatInput] = useState('')
   const [chatLoading, setChatLoading] = useState(false)
   const [chatSessionId, setChatSessionId] = useState<string | null>(null)
+  const [isRestoringSession, setIsRestoringSession] = useState(false)
   const [addMenuOpen, setAddMenuOpen] = useState(false)
   const [liveBlocks, setLiveBlocks] = useState<AgentTranscriptEvent[]>([])
   const [revealThinkingVersion, setRevealThinkingVersion] = useState(0)
@@ -110,6 +111,7 @@ export function AgentUnifiedStream({
     cancelChatRequest()
     activeSessionRef.current = null
     setChatSessionId(null)
+    setIsRestoringSession(false)
     setChatInput('')
     setLiveBlocks([])
     setRevealThinkingVersion(0)
@@ -125,8 +127,12 @@ export function AgentUnifiedStream({
     shouldFollowScrollRef.current = true
     activeSessionRef.current = resumeSessionId
     setChatSessionId(resumeSessionId)
+    setIsRestoringSession(true)
     setChatInput('')
     setAttachedFiles([])
+    // Do not leave the prior conversation visible while the next session's
+    // authorized transcript is loading.
+    setLiveBlocks([])
 
     void fetch(`/api/agent/sessions/${resumeSessionId}/events`, { signal: controller.signal })
       .then(async response => {
@@ -136,10 +142,12 @@ export function AgentUnifiedStream({
       .then(data => {
         if (controller.signal.aborted) return
         setLiveBlocks(data.events ?? [])
+        setIsRestoringSession(false)
         requestAnimationFrame(scrollToBottom)
       })
       .catch(error => {
         if (controller.signal.aborted) return
+        setIsRestoringSession(false)
         toast.error('Session restore failed', error instanceof Error ? error.message : 'Could not restore this session.')
       })
 
@@ -177,7 +185,7 @@ export function AgentUnifiedStream({
     return () => window.removeEventListener('applymate:composer-prefill', prefillComposer)
   }, [])
 
-  const isEmpty = log.length === 0 && applyQueue.length === 0 && liveBlocks.length === 0
+  const isEmpty = !isRestoringSession && log.length === 0 && applyQueue.length === 0 && liveBlocks.length === 0
   const isNewChatDraft = isEmpty
   const restoredPolicy = sessionSubmissionPolicy(liveBlocks)
   const effectiveAutonomousMode = restoredPolicy
@@ -342,10 +350,10 @@ export function AgentUnifiedStream({
         liveBlocks={liveBlocks}
         applyQueue={applyQueue}
         isEmpty={isEmpty}
+        isRestoringSession={isRestoringSession}
         revealThinkingVersion={revealThinkingVersion}
         streamScrollRef={streamScrollRef}
         streamEndRef={streamEndRef}
-        onSelectPrompt={prefillPrompt}
         onAnswerQuestion={onAnswerQuestion}
         onAnswerOrchestrator={onAnswerOrchestrator}
         onApplied={onApplied}

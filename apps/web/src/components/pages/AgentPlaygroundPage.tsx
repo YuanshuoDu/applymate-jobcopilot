@@ -10,6 +10,7 @@ import { AddAgentModal } from '@/components/agent-workspace/AddAgentModal'
 import { AgentUnifiedStream } from '@/components/agent-workspace/AgentUnifiedStream'
 import type { ApplyReadyJob } from '@/components/agent-workspace/ApplyJobCard'
 import { AgentSessionConsole } from '@/components/agent-workspace/AgentSessionConsole'
+import { sessionHeaderSubtitle, type AgentSessionsResponse } from '@/components/agent-workspace/session-view-model'
 import type { AgentChatAction } from '@/components/agent-workspace/agent-chat-stream'
 import type { LogEntry, QuestionOption, RunSummary } from '@/components/agent-workspace/live-run-types'
 import type { SubmissionPolicySettings } from '@/components/agent-workspace/automation-policy'
@@ -47,6 +48,7 @@ export function AgentPlaygroundPage() {
   const esRef = useRef<EventSource | null>(null)
   const currentRoleRef = useRef<string | null>(null)
   const runIdRef = useRef(0)
+  const initialSessionRestoredRef = useRef(false)
   const autonomousMode = Boolean(
     (activeRunPolicy ?? agentConfig)?.autoApply && !(activeRunPolicy ?? agentConfig)?.requireApproval,
   )
@@ -105,7 +107,16 @@ export function AgentPlaygroundPage() {
     setSelectedSessionId(sessionId)
     setConversationTitle(goal)
     setConversationSubtitle(subtitle)
+    // The server owns this preference and scopes it to the authenticated user.
+    void fetch(`/api/agent/sessions/${encodeURIComponent(sessionId)}`, { method: 'PATCH' }).catch(() => undefined)
   }, [])
+
+  const restoreLastSession = useCallback((data: AgentSessionsResponse) => {
+    if (initialSessionRestoredRef.current) return
+    initialSessionRestoredRef.current = true
+    const session = data.sessions.find(item => item.id === data.lastOpenedSessionId)
+    if (session) selectSession(session.id, session.goal, sessionHeaderSubtitle(session))
+  }, [selectSession])
 
   const handleDeletedSession = useCallback((sessionId: string) => {
     // A chat session is writable through liveSessionId even when it was never
@@ -615,6 +626,7 @@ export function AgentPlaygroundPage() {
             }}
             onDeletedSession={handleDeletedSession}
             refreshVersion={sessionsRefreshVersion}
+            onSessionsLoaded={restoreLastSession}
           />
         </div>
         <AgentUnifiedStream
@@ -666,6 +678,7 @@ export function AgentPlaygroundPage() {
               setSelectedSessionId(sessionId)
               if (goal) setConversationTitle(goal)
               if (subtitle) setConversationSubtitle(subtitle)
+              void fetch(`/api/agent/sessions/${encodeURIComponent(sessionId)}`, { method: 'PATCH' }).catch(() => undefined)
               setSessionsRefreshVersion(v => v + 1)
             }}
         />

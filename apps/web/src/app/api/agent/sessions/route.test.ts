@@ -3,6 +3,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest"
 const mocks = vi.hoisted(() => ({
   requireAuth: vi.fn(),
   findMany: vi.fn(),
+  findFirst: vi.fn(),
   updateMany: vi.fn(),
   create: vi.fn(),
 }))
@@ -18,6 +19,7 @@ vi.mock("@/lib/db", () => ({
   db: {
     agentSession: {
       findMany: mocks.findMany,
+      findFirst: mocks.findFirst,
       updateMany: mocks.updateMany,
       create: mocks.create,
     },
@@ -40,10 +42,12 @@ describe("agent sessions API", () => {
     vi.resetModules()
     mocks.requireAuth.mockReset()
     mocks.findMany.mockReset()
+    mocks.findFirst.mockReset()
     mocks.updateMany.mockReset()
     mocks.create.mockReset()
     mocks.requireAuth.mockResolvedValue({ userId: "user_1" })
     mocks.updateMany.mockResolvedValue({ count: 0 })
+    mocks.findFirst.mockResolvedValue(null)
   })
 
   it("lists recent sessions for the authenticated user", async () => {
@@ -76,10 +80,11 @@ describe("agent sessions API", () => {
           completedAt: null,
         },
       ],
+      lastOpenedSessionId: "session_1",
     })
     expect(mocks.findMany).toHaveBeenCalledWith({
       where: { userId: "user_1" },
-      orderBy: { createdAt: "desc" },
+      orderBy: { updatedAt: "desc" },
       take: 50,
       select: {
         id: true,
@@ -94,6 +99,11 @@ describe("agent sessions API", () => {
         completedAt: true,
       },
     })
+    expect(mocks.findFirst).toHaveBeenCalledWith({
+      where: { userId: "user_1", lastViewedAt: { not: null } },
+      orderBy: { lastViewedAt: "desc" },
+      select: { id: true },
+    })
     expect(mocks.updateMany).toHaveBeenCalledWith(expect.objectContaining({
       where: expect.objectContaining({
         userId: "user_1",
@@ -103,6 +113,26 @@ describe("agent sessions API", () => {
       }),
       data: expect.objectContaining({ status: "completed", completedAt: expect.any(Date) }),
     }))
+  })
+
+  it("returns the last viewed owned session even when a different conversation updated more recently", async () => {
+    mocks.findMany.mockResolvedValueOnce([
+      {
+        id: "session_recent", goal: "Recently updated", status: "completed", source: "chat", memorySummary: "",
+        qualityScore: null, currentTaskId: null, createdAt: new Date("2026-06-18T08:00:00Z"), updatedAt: new Date("2026-06-18T09:00:00Z"), completedAt: new Date("2026-06-18T09:00:00Z"),
+      },
+      {
+        id: "session_last_opened", goal: "Resume this conversation", status: "completed", source: "chat", memorySummary: "",
+        qualityScore: null, currentTaskId: null, createdAt: new Date("2026-06-18T07:00:00Z"), updatedAt: new Date("2026-06-18T08:00:00Z"), completedAt: new Date("2026-06-18T08:00:00Z"),
+      },
+    ])
+    mocks.findFirst.mockResolvedValueOnce({ id: "session_last_opened" })
+    const { GET } = await import("./route")
+
+    const res = await GET(getRequest() as never)
+
+    expect(res.status).toBe(200)
+    await expect(res.json()).resolves.toMatchObject({ lastOpenedSessionId: "session_last_opened" })
   })
 
   it("creates a chat session with trimmed goal text", async () => {

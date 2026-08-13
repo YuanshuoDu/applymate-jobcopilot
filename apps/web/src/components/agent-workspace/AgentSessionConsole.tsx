@@ -2,16 +2,12 @@
 
 import React from 'react'
 import { useApi } from '@/lib/hooks'
-import type { AgentSessionSummary } from './session-view-model'
+import type { AgentSessionSummary, AgentSessionsResponse } from './session-view-model'
 import { sessionHeaderSubtitle, sessionStatusLabel, sessionSubtitle } from './session-view-model'
 import { AgentTeamList } from './AgentTeamList'
 import { HealthStrip } from './HealthStrip'
 import { AutomationList } from './AutomationList'
 import { SessionFocusPanel } from './SessionFocusPanel'
-
-interface SessionsResponse {
-  sessions: AgentSessionSummary[]
-}
 
 function statusColor(status: string): string {
   if (status === 'running') return 'var(--primary)'
@@ -29,6 +25,7 @@ export function AgentSessionConsole({
   onDeletedSession,
   onAddAgent,
   refreshVersion = 0,
+  onSessionsLoaded,
 }: {
   selectedSessionId: string | null
   onSelectSession: (id: string, goal?: string, subtitle?: string) => void
@@ -37,8 +34,9 @@ export function AgentSessionConsole({
   onDeletedSession: (id: string) => void
   onAddAgent?: () => void
   refreshVersion?: number
+  onSessionsLoaded?: (data: AgentSessionsResponse) => void
 }) {
-  const { data, loading, error, refetch } = useApi<SessionsResponse>('/api/agent/sessions')
+  const { data, loading, error, refetch } = useApi<AgentSessionsResponse>('/api/agent/sessions')
   const [statusFilter, setStatusFilter] = React.useState('all')
   const [confirmingDeleteId, setConfirmingDeleteId] = React.useState<string | null>(null)
   const [deletingSessionId, setDeletingSessionId] = React.useState<string | null>(null)
@@ -49,6 +47,10 @@ export function AgentSessionConsole({
   React.useEffect(() => {
     if (refreshVersion > 0) void refetch()
   }, [refreshVersion, refetch])
+
+  React.useEffect(() => {
+    if (data) onSessionsLoaded?.(data)
+  }, [data, onSessionsLoaded])
 
   React.useEffect(() => {
     const refresh = () => { void refetch() }

@@ -1511,6 +1511,7 @@ model AgentSession {
   memorySummary String    @default("") @db.Text
   qualityScore  Float?
   currentTaskId String?
+  lastViewedAt  DateTime?
   completedAt   DateTime?
   createdAt     DateTime  @default(now())
   updatedAt     DateTime  @updatedAt
@@ -1523,6 +1524,7 @@ model AgentSession {
   execution        AgentExecution?
 
   @@index([userId, createdAt(sort: Desc)])
+  @@index([userId, lastViewedAt(sort: Desc)])
   @@index([userId, status])
   @@map("agent_sessions")
 }

@@ -21,6 +21,17 @@ const rows = [
 export function AgentPreviewClient() {
   const [thinkingExpanded, setThinkingExpanded] = useState(false)
   const [drawerOpen, setDrawerOpen] = useState(false)
+  const [newChat, setNewChat] = useState(false)
+
+  function startNewChat() {
+    setNewChat(true)
+    setDrawerOpen(false)
+  }
+
+  function resumeLastChat() {
+    setNewChat(false)
+    setDrawerOpen(false)
+  }
 
   return (
     <div className={`${styles.root} agent-preview-shell`} style={{ display: 'flex', height: '100vh', overflow: 'hidden', background: 'var(--bg-tertiary)' }}>
@@ -37,11 +48,11 @@ export function AgentPreviewClient() {
         </div>
         <aside className="agent-preview-console" style={agentSidebar}>
           <div style={{ padding: 14, borderBottom: '1px solid var(--border)' }}>
-            <button style={primaryButton}>+ New chat</button>
+            <button type="button" style={primaryButton} onClick={startNewChat}>+ New chat</button>
           </div>
           <MetricGrid />
           <Section title="Recent Sessions">
-            <SessionRow active title="Berlin SWE Auto-Apply" meta="Running · quality 87% · 09:14" />
+            <SessionRow active={!newChat} title="Berlin SWE Auto-Apply" meta="Last opened · Running · quality 87% · 09:14" onClick={resumeLastChat} />
             <SessionRow title="Munich Data Engineer Search" meta="Done · quality 91% · Yesterday" />
             <SessionRow title="Gmail Follow-up Batch" meta="Approval · quality pending · May 22" />
           </Section>
@@ -75,16 +86,17 @@ export function AgentPreviewClient() {
             <button className="agent-preview-drawer-trigger" type="button" aria-label="Open conversations" aria-expanded={drawerOpen} aria-controls="agent-preview-drawer" onClick={() => setDrawerOpen(true)}>
               <PanelLeftOpen size={17} aria-hidden="true" />
             </button>
-            <div>
-            <h1 style={{ margin: 0, fontSize: 17 }}>Berlin SWE Auto-Apply</h1>
-            <div style={{ marginTop: 4, fontSize: 12, color: 'var(--text-muted)' }}>
-              Memory: Berlin SWE · min score 85 · approval required · no LinkedIn
-            </div>
-            </div>
+            {!newChat && <div>
+              <h1 style={{ margin: 0, fontSize: 17 }}>Berlin SWE Auto-Apply</h1>
+              <div style={{ marginTop: 4, fontSize: 12, color: 'var(--text-muted)' }}>
+                Memory: Berlin SWE · min score 85 · approval required · no LinkedIn
+              </div>
+            </div>}
           </div>
           <div style={{ display: 'flex', gap: 14, color: 'var(--text-muted)' }}>◴ ⌕ ⋮</div>
         </header>
         <section className="agent-preview-transcript" style={transcriptStyle}>
+          {newChat ? <NewChatEmptyState /> : <>
           <Message speaker="You" body="每天早上 9 点自动找 Berlin 软件工程岗位，85 分以上自动投，但需要我确认。" time="09:11" />
           <Message speaker="Orchestrator · Automation draft" body="我可以创建一个工作日 09:00 自动化：在 Berlin 搜索软件工程岗位，85 分以上进入投递队列，提交前请求你确认。" time="09:12">
             <Grid rows={[['Trigger', 'Weekdays 09:00'], ['Target', 'Berlin · SWE'], ['Score', '85+'], ['Approval', 'Required'], ['Daily cap', '8 applications']]} />
@@ -112,6 +124,7 @@ export function AgentPreviewClient() {
               <tbody>{rows.map(row => <tr key={row[0]}>{row.map(cell => <td key={cell} style={tdStyle}>{cell}</td>)}</tr>)}</tbody>
             </table>
           </Message>
+          </>}
         </section>
         <footer style={composerWrap}>
           <div style={{ display: 'flex', gap: 8, marginBottom: 8 }}>
@@ -141,8 +154,18 @@ function Section({ title, children }: { title: string; children: React.ReactNode
   return <div style={{ padding: '0 10px 12px' }}><div style={sectionTitle}>{title}</div><div style={panelStyle}>{children}</div></div>
 }
 
-function SessionRow({ title, meta, active = false }: { title: string; meta: string; active?: boolean }) {
-  return <div style={{ padding: 10, borderBottom: '1px solid var(--border)', background: active ? 'var(--bg)' : 'transparent' }}><div style={{ fontSize: 12, fontWeight: 700 }}>{title}</div><div style={metaText}>{meta}</div></div>
+function SessionRow({ title, meta, active = false, onClick }: { title: string; meta: string; active?: boolean; onClick?: () => void }) {
+  return <button type="button" onClick={onClick} style={{ width: '100%', padding: 10, border: 0, borderBottom: '1px solid var(--border)', background: active ? 'var(--bg)' : 'transparent', color: 'var(--text)', cursor: 'pointer', fontFamily: 'inherit', textAlign: 'left' }}><div style={{ fontSize: 12, fontWeight: 700 }}>{title}</div><div style={metaText}>{meta}</div></button>
+}
+
+function NewChatEmptyState() {
+  return <div aria-label="New chat welcome" style={{ flex: 1, display: 'grid', placeItems: 'center', textAlign: 'center' }}>
+    <div style={{ display: 'grid', justifyItems: 'center', gap: 14 }}>
+      <span aria-label="ApplyMate AI" style={{ width: 58, height: 58, display: 'grid', placeItems: 'center', borderRadius: 18, background: 'var(--brand-gradient)', color: '#fff', fontSize: 25, fontWeight: 800, boxShadow: '0 12px 28px rgba(79,70,229,0.24)' }}>A</span>
+      <div style={{ fontSize: 22, fontWeight: 760, letterSpacing: '-0.03em' }}>What can I help you with?</div>
+      <div style={{ fontSize: 13, color: 'var(--text-muted)' }}>Start a new ApplyMate conversation below.</div>
+    </div>
+  </div>
 }
 
 function TaskRow({ role, status, value, warn = false }: { role: string; status: string; value: string; warn?: boolean }) {
