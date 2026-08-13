@@ -1,7 +1,7 @@
 'use client'
 
 import React, { useState, useEffect, useRef, useCallback } from 'react'
-import { PanelLeftOpen, X } from 'lucide-react'
+import { Home, PanelLeftOpen } from 'lucide-react'
 import { TopBar }              from '@/components/layout/TopBar'
 import { useToast } from '@/components/ui'
 import { useApi, apiMutate }   from '@/lib/hooks'
@@ -14,6 +14,7 @@ import { sessionHeaderSubtitle, type AgentSessionsResponse } from '@/components/
 import type { AgentChatAction } from '@/components/agent-workspace/agent-chat-stream'
 import type { LogEntry, QuestionOption, RunSummary } from '@/components/agent-workspace/live-run-types'
 import type { SubmissionPolicySettings } from '@/components/agent-workspace/automation-policy'
+import { useNav } from '@/lib/nav-context'
 
 // ── Role metadata ─────────────────────────────────────────────────────────────
 
@@ -25,6 +26,7 @@ import type { SubmissionPolicySettings } from '@/components/agent-workspace/auto
 
 export function AgentPlaygroundPage() {
   const toast = useToast()
+  const { navigate } = useNav()
 
   const { data: jobsData }                               = useApi<{ jobs: Array<{ status: string; workflowState: string }> }>('/api/jobs?pageSize=100')
   const { data: agentConfig, refetch: refetchAgentConfig } = useApi<AgentConfig>('/api/agent')
@@ -517,16 +519,20 @@ export function AgentPlaygroundPage() {
             font-weight: 750;
           }
 
-          .agent-session-drawer-close {
-            display: inline-grid;
-            width: 28px;
-            height: 28px;
-            place-items: center;
-            border: 1px solid var(--border);
-            border-radius: 8px;
-            color: var(--text-muted);
-            background: var(--bg);
+          .agent-session-drawer-home {
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            min-height: 34px;
+            padding: 0 10px;
+            border: 0;
+            border-radius: 10px;
+            color: var(--primary);
+            background: rgba(79, 70, 229, 0.08);
             cursor: pointer;
+            font: inherit;
+            font-size: 11px;
+            font-weight: 750;
           }
 
           .agent-live-stream {
@@ -558,7 +564,7 @@ export function AgentPlaygroundPage() {
         @media (min-width: 901px) {
           .agent-session-drawer-scrim,
           .agent-session-drawer-header,
-          .agent-session-drawer-close,
+          .agent-session-drawer-home,
           .agent-session-drawer-trigger {
             display: none;
           }
@@ -604,8 +610,12 @@ export function AgentPlaygroundPage() {
         <div id="agent-session-drawer" className={`agent-session-drawer${mobileSessionDrawerOpen ? ' is-open' : ''}`}>
           <div className="agent-session-drawer-header">
             <span>Conversations</span>
-            <button className="agent-session-drawer-close" type="button" aria-label="Close conversations" onClick={() => setMobileSessionDrawerOpen(false)}>
-              <X size={16} aria-hidden="true" />
+            <button className="agent-session-drawer-home" type="button" aria-label="Back to Home" onClick={() => {
+              setMobileSessionDrawerOpen(false)
+              navigate('dashboard')
+            }}>
+              <Home size={15} aria-hidden="true" />
+              Back to Home
             </button>
           </div>
           <AgentSessionConsole
