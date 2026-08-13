@@ -197,3 +197,33 @@ passed with runtime-extension verification noted above
 ### Final result
 
 passed
+
+## Side panel Jobs detail QA — key job tags
+
+### Evidence
+
+- User references: three attached Jobs screenshots showing the expanded job detail state.
+- Implementation source: `apps/extension/src/sidepanel/SidePanel.tsx`, `apps/extension/src/sidepanel/sidepanel.css`
+- Current implementation screenshot: `audit-artifacts/jobs-key-tags-expanded.png`
+- Preview URL: `http://localhost:4175/audit-artifacts/sidebar-runtime-preview.html`
+- Screenshot viewport: 390 × 844 CSS pixels
+
+### Findings
+
+- The expanded card now shows deduplicated key job tags from `SavedJob.keywords`, with a compact pill treatment that follows the existing indigo token system.
+- The original job URL is rendered once as `Open original`; the duplicate bottom `Original` action was removed.
+- Manual `Update status` controls were removed from the sidebar. Stored status remains a read-only row pill and the existing list filters continue to work.
+- `Open in My Jobs`, Notes, Score, and Re-score remain available in the existing card flow.
+
+### Verification
+
+- `pnpm --filter @jobcopilot/extension typecheck` — passed.
+- `pnpm --filter @jobcopilot/extension test` — 4 files, 10 tests passed.
+- `pnpm --filter @jobcopilot/extension build` — passed; updated side-panel CSS and bundle emitted.
+- Runtime preview: `Open original` count = 1; `Update status` absent; SQL, product analytics, experimentation, and dashboards rendered as tags.
+- Runtime interactions: Search, Saved filter, Score, Notes autosave, and expanded-card rendering passed.
+- Responsive screenshot inspection: 390 × 844 layout has no horizontal overflow; detail columns remain readable and the primary My Jobs action spans the card.
+
+### Final result
+
+passed

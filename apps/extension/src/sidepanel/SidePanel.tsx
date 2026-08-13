@@ -18,6 +18,7 @@ import {
   RefreshCw,
   Search,
   Send,
+  Tags,
   MessageSquare,
   Sparkles,
   Target,
@@ -32,7 +33,6 @@ import {
   scoreResume,
   updateJobNotes,
   updateJobScore,
-  updateJobStatus,
 } from '@/lib/api'
 import { getSettings, isLoggedIn } from '@/lib/storage'
 import { FormFillerView } from './FormFillerView'
@@ -547,7 +547,7 @@ function TrackerPanel({ settings, L, onOpenResume }: { settings: ExtensionSettin
       {(jobsSyncError || dashboardSyncError) && <div className="am-sync-banner" role="alert"><div><strong>Sync needs attention</strong><span>{jobsSyncError || dashboardSyncError}</span>{(jobsSyncError ? lastJobsSyncedAt : lastDashboardSyncedAt) && <small>Last synced {formatSyncAge((jobsSyncError ? lastJobsSyncedAt : lastDashboardSyncedAt)!)}</small>}</div><button type="button" onClick={() => refreshAll(true)}>Retry</button></div>}
       <CurrentPageBanner accountKey={`${settings.apiBaseUrl}|${settings.apiToken}|${settings.userEmail}`} onSaved={() => refreshAll()} />
       <div className="am-list">
-        {loading ? <div className="am-spinner"><LoaderCircle className="am-spin" size={20} aria-label="Loading jobs" /></div> : filtered.length === 0 ? <EmptyState hasSearch={Boolean(search.trim())} filter={filterStatus} connectionError={Boolean(jobsSyncError)} onRetry={() => refreshAll(true)} onClearSearch={() => setSearch('')} onOpenDashboard={() => chrome.tabs.create({ url: `${settings.apiBaseUrl}/jobs` })} L={L} /> : <div className="am-list-inner">{filtered.map(job => <JobCard key={job.id} job={job} expanded={expandedId === job.id} onToggle={() => setExpandedId(current => current === job.id ? null : job.id)} settings={settings} L={L} scoring={scoringId === job.id} onScore={() => void scoreJob(job)} onStatusChange={async (id, status) => { try { const updated = await updateJobStatus(settings, id, status); setJobs(previous => previous.map(item => item.id === id ? { ...item, ...updated } : item)); await loadDashboard(); showToast(`Status updated · ${statusLabel(status, L)}`) } catch (error) { showToast(error instanceof Error ? error.message : 'Could not update status') } }} />)}</div>}
+        {loading ? <div className="am-spinner"><LoaderCircle className="am-spin" size={20} aria-label="Loading jobs" /></div> : filtered.length === 0 ? <EmptyState hasSearch={Boolean(search.trim())} filter={filterStatus} connectionError={Boolean(jobsSyncError)} onRetry={() => refreshAll(true)} onClearSearch={() => setSearch('')} onOpenDashboard={() => chrome.tabs.create({ url: `${settings.apiBaseUrl}/jobs` })} L={L} /> : <div className="am-list-inner">{filtered.map(job => <JobCard key={job.id} job={job} expanded={expandedId === job.id} onToggle={() => setExpandedId(current => current === job.id ? null : job.id)} settings={settings} L={L} scoring={scoringId === job.id} onScore={() => void scoreJob(job)} />)}</div>}
       </div>
       <footer className="am-footer"><button className="am-footer-button" type="button" onClick={() => refreshAll(true)}><RefreshCw size={12} aria-hidden="true" /> Refresh</button><button className="am-footer-button primary" type="button" onClick={() => chrome.tabs.create({ url: `${settings.apiBaseUrl}/jobs` })}>View all jobs <ArrowRight size={12} aria-hidden="true" /></button></footer>
       {toast && <div className="am-toast" role="status">{toast}</div>}
@@ -559,16 +559,29 @@ function StatCard({ className, label, value, icon }: { className: string; label:
   return <div className={`am-stat ${className}`}><div className="am-stat-head">{icon}<span>{label}</span></div><div className="am-stat-value">{value}</div></div>
 }
 
+function keyTagsForJob(job: SavedJob): string[] {
+  const seen = new Set<string>()
+  return (job.keywords ?? '')
+    .split(/[\n,;|]+/)
+    .map(value => value.trim())
+    .filter(value => {
+      const normalized = value.toLocaleLowerCase()
+      if (!value || seen.has(normalized)) return false
+      seen.add(normalized)
+      return true
+    })
+    .slice(0, 8)
+}
+
 function statusLabel(status: string, L: Labels): string {
   return ({ saved: L.saved, applied: L.applied, interview: 'Interview', rejected: L.rejected, offer: L.applied } as Record<string, string>)[status] ?? status
 }
 
-function JobCard({ job, expanded, onToggle, settings, onStatusChange, onScore, scoring, L }: {
+function JobCard({ job, expanded, onToggle, settings, onScore, scoring, L }: {
   job: SavedJob
   expanded: boolean
   onToggle: () => void
   settings: ExtensionSettings
-  onStatusChange: (id: string, status: string) => Promise<void>
   onScore: () => void
   scoring: boolean
   L: Labels
@@ -579,6 +592,7 @@ function JobCard({ job, expanded, onToggle, settings, onStatusChange, onScore, s
   const initialNotes = useRef(job.notes ?? '')
   const notesTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
   const displayStatus = visibleStatus(job.status)
+  const keyTags = keyTagsForJob(job)
   const scoreTone = job.score != null && job.score >= 80 ? 'strong' : job.score != null && job.score < 60 ? 'weak' : 'normal'
 
   useEffect(() => {
@@ -622,9 +636,8 @@ function JobCard({ job, expanded, onToggle, settings, onStatusChange, onScore, s
         <button className="am-chevron" type="button" onClick={onToggle} aria-label={expanded ? `Collapse ${job.role}` : `Expand ${job.role}`}><ChevronDown size={16} className={expanded ? 'am-chevron-open' : ''} /></button>
       </div>
       {expanded && <div className="am-detail">
-        <div className="am-detail-grid"><div className="am-detail-box"><div className="am-detail-label">Notes</div><div className="am-notes-meta"><span>{notesSaving ? <span className="am-saving">Saving…</span> : notesError ? <span className="am-note-error">{notesError}</span> : notes ? <span className="am-saved">Saved</span> : 'Add context for later'}</span></div><textarea className="am-notes" value={notes} onChange={event => { setNotes(event.target.value); setNotesError('') }} placeholder="Interview questions, salary, contact…" /></div><div className="am-detail-box"><div className="am-detail-label">Original job link</div>{job.url ? <a className="am-detail-link" href={job.url} target="_blank" rel="noreferrer">Open original <ExternalLink size={11} /></a> : <div className="am-detail-text">No original link saved.</div>}<div className="am-detail-label" style={{ marginTop: 12 }}>Match score</div><div className="am-detail-text">{job.score == null ? 'Not scored yet.' : `Scored at ${job.score}% against your resume.`}</div></div></div>
-        <div><div className="am-detail-label" style={{ marginBottom: 5 }}>Update status</div><div className="am-status-actions">{([['saved', L.saved], ['applied', L.applied], ['interview', 'Interviews'], ['rejected', L.rejected]] as const).map(([value, label]) => <button key={value} className={`am-status-button${displayStatus === value ? ' active' : ''}`} type="button" onClick={() => void onStatusChange(job.id, value)}>{label}</button>)}</div></div>
-        <div className="am-detail-actions">{job.url && <a className="am-detail-action" href={job.url} target="_blank" rel="noreferrer">Original <ExternalLink size={11} /></a>}<a className="am-detail-action primary" href={`${settings.apiBaseUrl}/jobs?highlight=${job.id}`} target="_blank" rel="noreferrer">Open in My Jobs <ArrowRight size={11} /></a></div>
+        <div className="am-detail-grid"><div className="am-detail-box"><div className="am-detail-label">Notes</div><div className="am-notes-meta"><span>{notesSaving ? <span className="am-saving">Saving…</span> : notesError ? <span className="am-note-error">{notesError}</span> : notes ? <span className="am-saved">Saved</span> : 'Add context for later'}</span></div><textarea className="am-notes" value={notes} onChange={event => { setNotes(event.target.value); setNotesError('') }} placeholder="Interview questions, salary, contact…" /></div><div className="am-detail-box am-detail-insights"><div className="am-detail-label am-detail-label-icon"><Tags size={11} aria-hidden="true" /> Key job tags</div>{keyTags.length > 0 ? <div className="am-key-tags">{keyTags.map(tag => <span key={tag} className="am-key-tag">{tag}</span>)}</div> : <div className="am-detail-text">Score this role to extract its main skills and requirements.</div>}<div className="am-detail-label am-detail-score-label">Match score</div><div className="am-detail-text">{job.score == null ? 'Not scored yet.' : `Scored at ${job.score}% against your resume.`}</div>{job.url ? <a className="am-detail-link" href={job.url} target="_blank" rel="noreferrer">Open original <ExternalLink size={11} /></a> : <div className="am-detail-text">No original link saved.</div>}</div></div>
+        <div className="am-detail-actions"><a className="am-detail-action primary" href={`${settings.apiBaseUrl}/jobs?highlight=${job.id}`} target="_blank" rel="noreferrer">Open in My Jobs <ArrowRight size={11} /></a></div>
       </div>}
     </article>
   )
