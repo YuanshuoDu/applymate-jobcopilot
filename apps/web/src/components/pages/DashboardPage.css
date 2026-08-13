@@ -49,7 +49,7 @@
 .momentum-section-kicker { display: flex; align-items: center; gap: 6px; color: #4a33f3; font-size: 13px; font-weight: 700; }
 .momentum-week-copy h2 { margin: 9px 0 8px; color: #161b36; font-size: 16px; letter-spacing: -.025em; }
 .momentum-week-copy p { max-width: 365px; color: #68708f; font-size: 12px; line-height: 1.55; }
-.momentum-days { display: grid; grid-template-columns: repeat(7, minmax(24px, 32px)); justify-content: start; gap: 8px; margin-top: 27px; }
+.momentum-days { display: grid; grid-template-columns: repeat(7, minmax(0, 1fr)); gap: 4px; margin-top: 27px; }
 .momentum-days div { display: grid; min-width: 0; gap: 9px; justify-items: center; color: #646b8b; }
 .momentum-days small { min-width: 0; font-size: 9px; white-space: nowrap; }
 .momentum-days span { display: grid; place-items: center; width: 18px; height: 18px; border: 1px solid #ddddf5; border-radius: 50%; color: #fff; background: #f5f5fc; }

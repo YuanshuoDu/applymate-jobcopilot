@@ -9,7 +9,7 @@ describe('DashboardPage mobile layout', () => {
   })
 
   it('keeps the seven-day progress row inside a narrow dashboard column', () => {
-    expect(css).toMatch(/\.momentum-days \{ display: grid; grid-template-columns: repeat\(7, minmax\(24px, 32px\)\); justify-content: start/)
+    expect(css).toMatch(/\.momentum-days \{ display: grid; grid-template-columns: repeat\(7, minmax\(0, 1fr\)\)/)
     expect(css).toMatch(/\.momentum-days small \{ min-width: 0;[\s\S]*white-space: nowrap/)
   })
 
