@@ -572,7 +572,7 @@ function TrackerPanel({ settings, L, onOpenResume }: { settings: ExtensionSettin
 }
 
 function StatCard({ className, label, value, icon }: { className: string; label: string; value: number; icon: React.ReactNode }) {
-  return <div className={`am-stat ${className}`}><div className="am-stat-icon" aria-hidden="true">{icon}</div><div className="am-stat-content"><div className="am-stat-head"><span>{label}</span></div><div className="am-stat-value">{value}</div></div></div>
+  return <div className={`am-stat ${className}`}><div className="am-stat-head">{icon}<span>{label}</span></div><div className="am-stat-value">{value}</div></div>
 }
 
 function keyTagsForJob(job: SavedJob): string[] {
@@ -609,7 +609,7 @@ function JobCard({ job, expanded, onToggle, settings, onScore, scoring, L }: {
   const notesTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
   const displayStatus = visibleStatus(job.status)
   const keyTags = keyTagsForJob(job)
-  const scoreTone = job.score != null && job.score >= 80 ? 'strong' : job.score != null && job.score < 60 ? 'weak' : 'normal'
+  const scoreTone = job.score != null && job.score >= 70 ? 'strong' : job.score != null && job.score < 65 ? 'weak' : 'normal'
 
   useEffect(() => {
     const nextNotes = job.notes ?? ''
