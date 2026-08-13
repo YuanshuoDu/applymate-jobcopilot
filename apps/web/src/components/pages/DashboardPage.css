@@ -49,7 +49,7 @@
 .momentum-section-kicker { display: flex; align-items: center; gap: 6px; color: #4a33f3; font-size: 13px; font-weight: 700; }
 .momentum-week-copy h2 { margin: 9px 0 8px; color: #161b36; font-size: 16px; letter-spacing: -.025em; }
 .momentum-week-copy p { max-width: 365px; color: #68708f; font-size: 12px; line-height: 1.55; }
-.momentum-days { display: grid; grid-template-columns: repeat(7, minmax(0, 1fr)); gap: 4px; margin-top: 27px; }
+.momentum-days { display: grid; grid-template-columns: repeat(7, minmax(24px, 32px)); justify-content: start; gap: 8px; margin-top: 27px; }
 .momentum-days div { display: grid; min-width: 0; gap: 9px; justify-items: center; color: #646b8b; }
 .momentum-days small { min-width: 0; font-size: 9px; white-space: nowrap; }
 .momentum-days span { display: grid; place-items: center; width: 18px; height: 18px; border: 1px solid #ddddf5; border-radius: 50%; color: #fff; background: #f5f5fc; }
@@ -57,7 +57,7 @@
 .momentum-days span.is-today { border-color: #9a8cff; background: #fff; }
 .momentum-days span.is-missed { color: #aa5c6a; border-color: #edcdd3; background: #fff6f7; }
 .momentum-days span.is-interview { color: #fff; border-color: #0b8f70; background: #0b8f70; }
-.momentum-goal-legend { flex-wrap: wrap; gap: 8px 18px; margin-top: 18px; color: #737b98; font-size: 10px; }
+.momentum-goal-legend { flex-wrap: wrap; justify-content: flex-start; gap: 8px 12px; margin-top: 18px; color: #737b98; font-size: 10px; }
 .momentum-goal-legend span { display: inline-flex; flex: 0 0 auto; align-items: center; gap: 6px; white-space: nowrap; }
 .momentum-goal-legend i { display: grid; place-items: center; width: 13px; height: 13px; border: 1px solid #d9d8ef; border-radius: 50%; font-style: normal; }
 .momentum-goal-legend i.is-done { color: #fff; border-color: #5136f4; background: #5136f4; }
