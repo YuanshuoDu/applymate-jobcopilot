@@ -51,6 +51,8 @@ export function AgentLiveStreamBody({
 
   return (
     <div
+      className="agent-live-stream-body"
+      data-empty={isEmpty ? 'true' : 'false'}
       ref={streamScrollRef}
       onScroll={event => onFollowStateChange(shouldStickToBottom(event.currentTarget))}
       style={{ flex: 1, minHeight: 0, overflowY: 'auto', overscrollBehavior: 'contain', padding: '18px 20px', display: 'flex', flexDirection: 'column', gap: 12 }}
