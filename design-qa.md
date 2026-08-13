@@ -120,6 +120,48 @@ The overview and job-card score regions were compared separately because the rin
 
 passed
 
+## Side panel Jobs professional UX/UI refinement
+
+### Audit scope
+
+- User goal: scan a saved role quickly, understand match quality and key requirements, then open the job or continue in My Jobs without losing context.
+- Evidence: user-provided screenshot plus current-run previews at 488 × 730 and 390 × 844 CSS pixels.
+- Current implementation screenshots: `audit-artifacts/jobs-ux-polished-collapsed.png`, `audit-artifacts/jobs-ux-polished-expanded.png`
+
+### Strengths retained
+
+- Jobs combines dashboard momentum and My Jobs tracking in one surface.
+- Search, status/source filters, sort, one-click Score/Re-score, notes, original link, and My Jobs navigation remain available.
+- Status is displayed as passive synced information; no manual sidebar status editor is exposed.
+
+### UX/UI findings and adjustments
+
+- The original screen was visually complete but top-heavy: overview, metrics, filters, cards, and footer competed for the same narrow viewport. Reduced repeated vertical padding while preserving touch targets and section boundaries.
+- Users needed to open every card to discover the role’s important skills. Added a two-tag collapsed preview with a `+N` remainder; expanded cards hide the preview so tags are not duplicated.
+- Expanded details previously read as a notes form first and a decision surface second. Kept Notes available, but aligned the right panel around `Key job tags` and `Match score`, with clear paired actions below.
+- The high-match opportunity could truncate to an ambiguous label at narrow widths. It now allows a two-line role title, and `View job` expands and scrolls the target card into the list center.
+- Original job link is now presented once in the action row; the detail panel no longer repeats the same link.
+- Footer remains a fixed bottom action bar while the list scrolls independently; expanded cards do not overlap it.
+
+### Verification
+
+- `pnpm --filter @jobcopilot/extension typecheck` — passed.
+- `pnpm --filter @jobcopilot/extension test` — 4 files, 10 tests passed.
+- `pnpm --filter @jobcopilot/extension build` — passed.
+- `node --check apps/extension/dist/background.js` — passed.
+- `node --check apps/extension/dist/sidepanel.js` — passed.
+- Runtime: search and Saved filter work; Refresh and View all jobs each render once; status editor absent.
+- Runtime: top `View job` focused the Account Executive card, expanded it, and kept it visible above the footer.
+- Runtime: expanded card contains one `Open original`, visible key tags, no horizontal overflow, and no captured console errors.
+
+### Evidence limits
+
+- This is a visual/runtime preview with mocked API responses. Live extension content-script scanning, authenticated production data, and real browser-tab navigation still need separate Chrome extension verification.
+
+### Final result
+
+passed
+
 ## Side panel Jobs footer layout QA
 
 ### Evidence

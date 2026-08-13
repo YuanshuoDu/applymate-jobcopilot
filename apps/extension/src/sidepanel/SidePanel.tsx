@@ -370,6 +370,7 @@ function TrackerPanel({ settings, L, onOpenResume }: { settings: ExtensionSettin
   const [lastDashboardSyncedAt, setLastDashboardSyncedAt] = useState<number | null>(null)
   const jobsRequestId = useRef(0)
   const dashboardRequestId = useRef(0)
+  const listRef = useRef<HTMLDivElement | null>(null)
 
   function showToast(message: string) {
     setToast(message)
@@ -418,6 +419,20 @@ function TrackerPanel({ settings, L, onOpenResume }: { settings: ExtensionSettin
   function refreshAll(showSpinner = false) {
     loadJobs(showSpinner)
     void loadDashboard()
+  }
+
+  function focusJob(jobId: string) {
+    if (!filtered.some(job => job.id === jobId)) {
+      setFilterStatus('all')
+      setFilterSource('all')
+      setSearch('')
+    }
+    setExpandedId(jobId)
+    window.setTimeout(() => {
+      const target = Array.from(listRef.current?.querySelectorAll<HTMLElement>('[data-job-id]') ?? [])
+        .find(node => node.dataset.jobId === jobId)
+      target?.scrollIntoView({ behavior: 'smooth', block: 'center' })
+    }, 0)
   }
 
   useEffect(() => {
@@ -523,8 +538,8 @@ function TrackerPanel({ settings, L, onOpenResume }: { settings: ExtensionSettin
           </div>
           <div className="am-overview-cell">
             <div className="am-overview-label"><Sparkles size={12} aria-hidden="true" />High match opportunity</div>
-            {highMatch ? <div className="am-highlight"><span className="am-highlight-mark">{companyInitials(highMatch.company)}</span><div className="am-highlight-copy"><div className="am-highlight-role">{highMatch.role}</div><div className="am-highlight-company">{highMatch.company}</div></div><span className="am-highlight-score">{highMatch.score}%</span></div> : <div className="am-overview-copy">Score a saved role to see your strongest match here.</div>}
-            {highMatch && <button className="am-action-link" type="button" onClick={() => setExpandedId(highMatch.id)}>View job <ArrowRight size={10} aria-hidden="true" /></button>}
+            {highMatch ? <div className="am-highlight"><span className="am-highlight-mark">{companyInitials(highMatch.company)}</span><div className="am-highlight-copy"><div className="am-highlight-role" title={highMatch.role}>{highMatch.role}</div><div className="am-highlight-company" title={highMatch.company}>{highMatch.company}</div></div><span className="am-highlight-score">{highMatch.score}%</span></div> : <div className="am-overview-copy">Score a saved role to see your strongest match here.</div>}
+            {highMatch && <button className="am-action-link" type="button" onClick={() => focusJob(highMatch.id)}>View job <ArrowRight size={10} aria-hidden="true" /></button>}
           </div>
         </div>
       </section>
@@ -546,7 +561,7 @@ function TrackerPanel({ settings, L, onOpenResume }: { settings: ExtensionSettin
 
       {(jobsSyncError || dashboardSyncError) && <div className="am-sync-banner" role="alert"><div><strong>Sync needs attention</strong><span>{jobsSyncError || dashboardSyncError}</span>{(jobsSyncError ? lastJobsSyncedAt : lastDashboardSyncedAt) && <small>Last synced {formatSyncAge((jobsSyncError ? lastJobsSyncedAt : lastDashboardSyncedAt)!)}</small>}</div><button type="button" onClick={() => refreshAll(true)}>Retry</button></div>}
       <CurrentPageBanner accountKey={`${settings.apiBaseUrl}|${settings.apiToken}|${settings.userEmail}`} onSaved={() => refreshAll()} />
-      <div className="am-list">
+      <div className="am-list" ref={listRef}>
         {loading ? <div className="am-spinner"><LoaderCircle className="am-spin" size={20} aria-label="Loading jobs" /></div> : filtered.length === 0 ? <EmptyState hasSearch={Boolean(search.trim())} filter={filterStatus} connectionError={Boolean(jobsSyncError)} onRetry={() => refreshAll(true)} onClearSearch={() => setSearch('')} onOpenDashboard={() => chrome.tabs.create({ url: `${settings.apiBaseUrl}/jobs` })} L={L} /> : <div className="am-list-inner">{filtered.map(job => <JobCard key={job.id} job={job} expanded={expandedId === job.id} onToggle={() => setExpandedId(current => current === job.id ? null : job.id)} settings={settings} L={L} scoring={scoringId === job.id} onScore={() => void scoreJob(job)} />)}</div>}
       </div>
       <footer className="am-footer"><button className="am-footer-button" type="button" onClick={() => refreshAll(true)}><RefreshCw size={12} aria-hidden="true" /> Refresh</button><button className="am-footer-button primary" type="button" onClick={() => chrome.tabs.create({ url: `${settings.apiBaseUrl}/jobs` })}>View all jobs <ArrowRight size={12} aria-hidden="true" /></button></footer>
@@ -622,13 +637,14 @@ function JobCard({ job, expanded, onToggle, settings, onScore, scoring, L }: {
   }, [notes, expanded])
 
   return (
-    <article className={`am-job-card${expanded ? ' expanded' : ''}`}>
+    <article className={`am-job-card${expanded ? ' expanded' : ''}`} data-job-id={job.id}>
       <div className="am-job-row">
         <span className="am-company-mark" aria-hidden="true">{companyInitials(job.company)}</span>
         <button className="am-job-main" type="button" onClick={onToggle} aria-expanded={expanded}>
           <div className="am-job-role">{job.role}</div>
           <div className="am-job-company">{job.company}{job.location ? ` · ${job.location}` : ''}</div>
           <div className="am-job-meta"><span className="am-status-pill" style={{ color: statusColor(displayStatus), background: `${statusColor(displayStatus)}14` }}><span className="am-status-dot" style={{ background: statusColor(displayStatus) }} />{statusLabel(displayStatus, L)}</span><span>·</span><span>{formatDate(job.createdAt, L)}</span></div>
+          {keyTags.length > 0 && <div className="am-job-tags-preview" aria-label="Key job tags">{keyTags.slice(0, 2).map(tag => <span key={tag} className="am-job-tag-preview" title={tag}>{tag}</span>)}{keyTags.length > 2 && <span className="am-job-tag-more">+{keyTags.length - 2}</span>}</div>}
         </button>
         <div className={`am-score-box ${scoreTone}`}>
           {job.score != null ? <><div className="am-score"><div className="am-score-ring" style={{ '--am-score-angle': `${Math.max(0, Math.min(job.score, 100)) * 3.6}deg` } as React.CSSProperties} aria-label={`${job.score}% match`}><span>{job.score}</span></div><span className="am-score-label">Match</span></div><button className="am-score-action" type="button" disabled={scoring} onClick={event => { event.stopPropagation(); onScore() }}>{scoring ? '…' : 'Re-score'}</button></> : <><button className="am-score-action" type="button" disabled={scoring} onClick={event => { event.stopPropagation(); onScore() }}>{scoring ? 'Scoring…' : 'Score'}</button><span className="am-score-help">Resume + profile</span></>}
@@ -636,8 +652,8 @@ function JobCard({ job, expanded, onToggle, settings, onScore, scoring, L }: {
         <button className="am-chevron" type="button" onClick={onToggle} aria-label={expanded ? `Collapse ${job.role}` : `Expand ${job.role}`}><ChevronDown size={16} className={expanded ? 'am-chevron-open' : ''} /></button>
       </div>
       {expanded && <div className="am-detail">
-        <div className="am-detail-grid"><div className="am-detail-box"><div className="am-detail-label">Notes</div><div className="am-notes-meta"><span>{notesSaving ? <span className="am-saving">Saving…</span> : notesError ? <span className="am-note-error">{notesError}</span> : notes ? <span className="am-saved">Saved</span> : 'Add context for later'}</span></div><textarea className="am-notes" value={notes} onChange={event => { setNotes(event.target.value); setNotesError('') }} placeholder="Interview questions, salary, contact…" /></div><div className="am-detail-box am-detail-insights"><div className="am-detail-label am-detail-label-icon"><Tags size={11} aria-hidden="true" /> Key job tags</div>{keyTags.length > 0 ? <div className="am-key-tags">{keyTags.map(tag => <span key={tag} className="am-key-tag">{tag}</span>)}</div> : <div className="am-detail-text">Score this role to extract its main skills and requirements.</div>}<div className="am-detail-label am-detail-score-label">Match score</div><div className="am-detail-text">{job.score == null ? 'Not scored yet.' : `Scored at ${job.score}% against your resume.`}</div>{job.url ? <a className="am-detail-link" href={job.url} target="_blank" rel="noreferrer">Open original <ExternalLink size={11} /></a> : <div className="am-detail-text">No original link saved.</div>}</div></div>
-        <div className="am-detail-actions"><a className="am-detail-action primary" href={`${settings.apiBaseUrl}/jobs?highlight=${job.id}`} target="_blank" rel="noreferrer">Open in My Jobs <ArrowRight size={11} /></a></div>
+        <div className="am-detail-grid"><div className="am-detail-box"><div className="am-detail-label">Notes</div><div className="am-notes-meta"><span>{notesSaving ? <span className="am-saving">Saving…</span> : notesError ? <span className="am-note-error">{notesError}</span> : notes ? <span className="am-saved">Saved</span> : 'Add context for later'}</span></div><textarea className="am-notes" value={notes} onChange={event => { setNotes(event.target.value); setNotesError('') }} placeholder="Interview questions, salary, contact…" /></div><div className="am-detail-box am-detail-insights"><div className="am-detail-label am-detail-label-icon"><Tags size={11} aria-hidden="true" /> Key job tags</div>{keyTags.length > 0 ? <div className="am-key-tags">{keyTags.map(tag => <span key={tag} className="am-key-tag">{tag}</span>)}</div> : <div className="am-detail-text">Score this role to extract its main skills and requirements.</div>}<div className="am-detail-label am-detail-score-label">Match score</div><div className="am-detail-text">{job.score == null ? 'Not scored yet.' : `Scored at ${job.score}% against your resume.`}</div>{!job.url && <div className="am-detail-text">No original link saved.</div>}</div></div>
+        <div className="am-detail-actions">{job.url && <a className="am-detail-action" href={job.url} target="_blank" rel="noreferrer">Open original <ExternalLink size={11} /></a>}<a className="am-detail-action primary" href={`${settings.apiBaseUrl}/jobs?highlight=${job.id}`} target="_blank" rel="noreferrer">Open in My Jobs <ArrowRight size={11} /></a></div>
       </div>}
     </article>
   )
