@@ -158,3 +158,42 @@ passed
 ### Final result
 
 passed with runtime-extension verification noted above
+
+## Side panel visual refinement QA — Resume + Profile
+
+### Evidence
+
+- Implementation source: `apps/extension/src/sidepanel/ResumeView.tsx`, `apps/extension/src/sidepanel/PersonaView.tsx`, `apps/extension/src/sidepanel/sidepanel.css`
+- Browser captures: local runtime preview at `http://localhost:4175/audit-artifacts/sidebar-runtime-preview.html?flaky=1`, rendered at the connected browser viewport (`1280 × 720` CSS pixels in this browser session)
+- Preview data: read-only mock responses matching the real `/api/resume`, `/api/resume/:id`, `/api/me/persona`, and `/api/me/persona/fields` response shapes
+
+### Findings
+
+- No actionable P0/P1/P2 findings remain for the updated surfaces.
+- Resume now uses the same page surface, card border, compact typography, indigo action hierarchy, green completion state, and Lucide icon language as Jobs/Form Fill.
+- Profile now presents a compact intro/status card, unified profile knowledge base, saved-answer groups, and a consistent add/edit state without changing the existing save/delete API calls.
+- Resume content is normalized before rendering so incomplete but valid API payloads do not blank the panel when optional arrays or contact fields are absent.
+
+### Required fidelity surfaces
+
+| Surface | Result | Evidence |
+| --- | --- | --- |
+| Fonts and typography | Pass | Resume/Profile use the side panel's system stack and compact heading, eyebrow, body, badge, and control hierarchy. |
+| Spacing and layout rhythm | Pass | Toolbar, cards, summary groups, editors, and sync actions follow the existing Jobs/Form Fill rhythm; no horizontal overflow in the rendered preview. |
+| Colors and visual tokens | Pass | Shared `--am-primary`, `--am-page`, `--am-panel`, `--am-line`, `--am-green`, `--am-red`, and `--am-shadow` tokens are used across both tabs. |
+| Image and asset fidelity | Pass | Standard UI controls use the existing `lucide-react` icon set; old emoji status/action glyphs were removed from the updated states. |
+| Copy and content | Pass | Existing Resume preview, template, quick edit, upload, export, refresh, Profile add, edit, delete, and sync actions remain present. |
+
+### Functional checks
+
+- Resume `Quick edit` toggles to `Done` and back without changing the editing model.
+- Profile `Add new field` opens the editor and `Cancel adding field` closes it.
+- Profile field `Edit` opens the inline editor; existing save/delete handlers remain wired.
+- Resume and Profile loaded without browser console errors in the final preview.
+- `pnpm --filter @jobcopilot/extension typecheck` — passed.
+- `pnpm --filter @jobcopilot/extension test` — 4 files, 10 tests passed.
+- `pnpm --filter @jobcopilot/extension build` — passed; side-panel CSS emitted and linked by the extension build.
+
+### Final result
+
+passed
