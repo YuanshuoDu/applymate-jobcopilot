@@ -25,6 +25,7 @@ import type { PersonaField } from '@/lib/api'
 
 type ViewState = 'idle' | 'scanning' | 'aiThinking' | 'review' | 'applying' | 'done' | 'error'
 type AnalysisPhase = 'fetchingPersona' | 'preparingPrompt' | 'waitingForAI' | 'processingResult'
+const ALL_SITE_ORIGINS = ['https://*/*', 'http://*/*'] as const
 
 const contentScriptLoads = new Map<number, Promise<void>>()
 
@@ -230,6 +231,8 @@ export function FormFillerView({ settings, pendingFields, onFieldsConsumed, scan
   const [fields, setFields] = useState<FormFieldSchema[]>([])
   const [filledFields, setFilledFields] = useState<FilledField[]>([])
   const [errorMsg, setErrorMsg] = useState('')
+  const [allSitesAccess, setAllSitesAccess] = useState(false)
+  const [requestingAccess, setRequestingAccess] = useState(false)
   const [appliedCount, setAppliedCount] = useState(0)
   const [reviseInstruction, setReviseInstruction] = useState('')
   const [revising, setRevising] = useState(false)
@@ -246,6 +249,28 @@ export function FormFillerView({ settings, pendingFields, onFieldsConsumed, scan
     fieldId: string; label: string; value: string; existingValue?: string; personaKey: string
   }>>([])
   const [savingPersona, setSavingPersona] = useState(false)
+
+  useEffect(() => {
+    void chrome.permissions.contains({ origins: [...ALL_SITE_ORIGINS] })
+      .then(setAllSitesAccess)
+      .catch(() => setAllSitesAccess(false))
+  }, [])
+
+  const handleRequestAllSitesAccess = useCallback(async () => {
+    setRequestingAccess(true)
+    try {
+      const granted = await chrome.permissions.request({ origins: [...ALL_SITE_ORIGINS] })
+      setAllSitesAccess(granted)
+      if (granted) {
+        setErrorMsg('')
+        setViewState('idle')
+      }
+    } catch (error) {
+      console.warn('[FormFiller] all-site permission request failed:', error)
+    } finally {
+      setRequestingAccess(false)
+    }
+  }, [])
 
   /** Build a persona key from a field label (for dedup across sites) */
   function fieldToPersonaKey(label: string): string {
@@ -674,6 +699,13 @@ export function FormFillerView({ settings, pendingFields, onFieldsConsumed, scan
         console.warn('[FormFiller] content script ensure failed:', msg)
         return { ok: false, injectError: msg }
       }
+      if (allSitesAccess) {
+        try {
+          await chrome.tabs.sendMessage(tab.id!, { type: 'ENABLE_JOB_SCRAPING' })
+        } catch {
+          // The scan can still proceed if the page's script was just starting.
+        }
+      }
       try {
         const response = await chrome.tabs.sendMessage(tab.id!, { type: 'SCAN_FORM' })
         if (response?.type === 'FORM_DETECTED' && response.fields?.length > 0) {
@@ -709,7 +741,7 @@ export function FormFillerView({ settings, pendingFields, onFieldsConsumed, scan
       r2.injectError?.includes('not allowed')
 
     if (isPermissionError) {
-      setErrorMsg(`ApplyMate can only scan forms on its supported job and ATS sites. This page (${host}) is not enabled.`)
+      setErrorMsg(`Chrome has not granted access to ${host}. Allow access to all websites once, then scan any company form without activating the extension for every new site.`)
       setViewState('error')
     } else if (r2.injectError) {
       setErrorMsg(`Injection failed on ${host}: ${r2.injectError}`)
@@ -718,7 +750,7 @@ export function FormFillerView({ settings, pendingFields, onFieldsConsumed, scan
       setErrorMsg(`No form fields detected on ${host}. Make sure you are on a page with an application form.`)
       setViewState('error')
     }
-  }, [settings])
+  }, [allSitesAccess, settings])
 
   const confidenceBadge = (conf: number) => {
     const pct = Math.round(conf * 100)
@@ -755,6 +787,17 @@ export function FormFillerView({ settings, pendingFields, onFieldsConsumed, scan
             {!scanning && <ArrowRight size={14} />}
           </button>
           <span className="am-form-helper">Works with company career sites, Greenhouse, Lever, Workday, and more.</span>
+          <div className="am-form-access-card">
+            <div>
+              <strong>{allSitesAccess ? 'All websites access enabled' : 'Use on any company career site'}</strong>
+              <span>{allSitesAccess ? 'You can scan custom forms without activating the extension on each new domain.' : 'Grant once to scan custom forms, Workday, and other ATS pages.'}</span>
+            </div>
+            {!allSitesAccess && (
+              <button className="am-form-button ghost small" onClick={handleRequestAllSitesAccess} disabled={requestingAccess}>
+                {requestingAccess ? 'Waiting...' : 'Allow access'}
+              </button>
+            )}
+          </div>
         </div>
 
         <div className="am-form-info-strip">
@@ -783,6 +826,12 @@ export function FormFillerView({ settings, pendingFields, onFieldsConsumed, scan
               <RefreshCw size={14} />
               Retry
             </button>
+            {!allSitesAccess && (
+              <button className="am-form-button ghost" onClick={handleRequestAllSitesAccess} disabled={requestingAccess}>
+                <ShieldCheck size={14} />
+                {requestingAccess ? 'Waiting for permission' : 'Allow all websites'}
+              </button>
+            )}
           </div>
         </div>
       </div>

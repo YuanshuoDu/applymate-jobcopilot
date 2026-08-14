@@ -52,7 +52,36 @@ const IS_DASHBOARD_PAGE =
 const IS_FORM_FILL_ONLY_PAGE =
   window.location.hostname.includes('workday.com') ||
   window.location.hostname.includes('myworkdayjobs.com')
-const SHOULD_BOOTSTRAP_JOB_UI = !IS_DASHBOARD_PAGE && !IS_FORM_FILL_ONLY_PAGE
+const IS_KNOWN_JOB_PAGE = [
+  /(^|\.)linkedin\.com$/i,
+  /(^|\.)indeed\.[a-z.]+$/i,
+  /(^|\.)glassdoor\.com$/i,
+  /(^|\.)stepstone\.[a-z.]+$/i,
+  /(^|\.)xing\.com$/i,
+  /(^|\.)wellfound\.com$/i,
+  /(^|\.)greenhouse\.io$/i,
+  /(^|\.)lever\.co$/i,
+  /(^|\.)workday\.com$/i,
+  /(^|\.)myworkdayjobs\.com$/i,
+  /(^|\.)smartrecruiters\.com$/i,
+  /(^|\.)ashbyhq\.com$/i,
+  /(^|\.)bamboohr\.com$/i,
+  /(^|\.)jobvite\.com$/i,
+  /(^|\.)icims\.com$/i,
+  /(^|\.)monster\.[a-z.]+$/i,
+  /(^|\.)arbeitsagentur\.de$/i,
+  /(^|\.)jobs\.de$/i,
+  /(^|\.)irishjobs\.ie$/i,
+].some(pattern => pattern.test(window.location.hostname)) ||
+  window.location.hostname === 'localhost' ||
+  window.location.hostname === '127.0.0.1' ||
+  window.location.hostname === 'web-delta-ruddy-29.vercel.app'
+
+// Generic company pages are injected on demand for form fill only. Keep the
+// job-board bootstrap limited to known sources so optional all-site access
+// never causes job scraping UI to appear on unrelated websites.
+let SHOULD_BOOTSTRAP_JOB_UI =
+  IS_KNOWN_JOB_PAGE && !IS_DASHBOARD_PAGE && !IS_FORM_FILL_ONLY_PAGE
 
 const DEBUG = true
 function log(...args: unknown[]) { if (DEBUG) console.log('[ApplyMate]', ...args) }
@@ -544,6 +573,19 @@ if (SHOULD_BOOTSTRAP_JOB_UI) {
 
 // ── Form Filler: Listen for scan & fill commands ──────────────────
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+  if (msg.type === 'ENABLE_JOB_SCRAPING') {
+    // Optional all-site access is granted by the Side Panel before this
+    // command is sent. Unknown company pages start with form-fill only and
+    // are promoted to the full job scraper only after that explicit grant.
+    if (!SHOULD_BOOTSTRAP_JOB_UI) {
+      SHOULD_BOOTSTRAP_JOB_UI = true
+      void init()
+      setTimeout(scheduleRetry, 1500)
+    }
+    sendResponse({ ok: true })
+    return true
+  }
+
   if (msg.type === 'GET_CURRENT_JOB') {
     sendResponse({ type: 'CURRENT_JOB_RESULT', job: currentJob })
     return true

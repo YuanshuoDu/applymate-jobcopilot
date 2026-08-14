@@ -141,5 +141,9 @@
     "*://*.jobs.de/*",
     "*://*.irishjobs.ie/*",
     "https://applymate.site/*"
+  ],
+  "optional_host_permissions": [
+    "https://*/*",
+    "http://*/*"
   ]
 }
