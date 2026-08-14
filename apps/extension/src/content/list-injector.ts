@@ -6,6 +6,7 @@ import { detectAndScrape } from '@/lib/scrapers/detect'
 import { scrapeIndeedFromDocument } from '@/lib/scrapers/indeed'
 import { hasUsableDescription, isJobReadyForTailoring, mergeJobDetails } from '@/lib/job-quality'
 import { getJobIdentity, isSameJob, isWeakJobIdentity } from '@/lib/job-identity'
+import { sendRuntimeMessage } from '@/lib/runtime-messaging'
 import type { SavedJob, ScrapedJob } from '@/lib/types'
 
 const ATTR        = 'data-applymate'
@@ -796,7 +797,7 @@ async function hydrateSavedJobs() {
   const generation = savedJobsHydrationGeneration
   savedJobsHydrationPromise = (async () => {
     try {
-      const response = await chrome.runtime.sendMessage({ type: 'GET_RECENT_JOBS' }) as { jobs?: unknown } | undefined
+      const response = await sendRuntimeMessage<{ jobs?: unknown }>({ type: 'GET_RECENT_JOBS' })
       if (!Array.isArray(response?.jobs)) return
       if (generation !== savedJobsHydrationGeneration) return
       savedRemoteJobs = response.jobs.filter((job): job is SavedJob => Boolean(
@@ -936,8 +937,8 @@ async function saveCardJob(card: Element, job: CardJob, button: HTMLButtonElemen
     }
     const fullJob = await resolveJobForSave(card, job)
     if (!fullJob) throw new Error('Open the job details first so ApplyMate can read the full description.')
-    await chrome.runtime.sendMessage({ type: 'JOB_SCRAPED', job: fullJob })
-    const response = await chrome.runtime.sendMessage({ type: 'SAVE_JOB', job: fullJob })
+    await sendRuntimeMessage({ type: 'JOB_SCRAPED', job: fullJob })
+    const response = await sendRuntimeMessage<{ success?: boolean; error?: string; savedJob?: SavedJob }>({ type: 'SAVE_JOB', job: fullJob })
     if (!response?.success) throw new Error(response?.error ?? 'Could not save this job.')
     markJobSaved(fullJob, button, cardKey)
   } catch (error) {
@@ -1026,15 +1027,15 @@ async function runActionCardAction(action: string, card: Element, job: CardJob, 
   const originalButtonContent = button.innerHTML
   try {
     if (action === 'sidebar') {
-      await chrome.runtime.sendMessage({ type: 'OPEN_SIDE_PANEL' })
+      await sendRuntimeMessage({ type: 'OPEN_SIDE_PANEL' })
       closeActionCard(popup)
       return
     }
 
     const fullJob = await resolveJobForSave(card, job)
     if (!fullJob) throw new Error('Open the job details first so ApplyMate can read the full description.')
-    await chrome.runtime.sendMessage({ type: 'JOB_SCRAPED', job: fullJob })
-    const response = await chrome.runtime.sendMessage({ type: 'SAVE_JOB', job: fullJob })
+    await sendRuntimeMessage({ type: 'JOB_SCRAPED', job: fullJob })
+    const response = await sendRuntimeMessage<{ success?: boolean; error?: string; savedJob?: SavedJob }>({ type: 'SAVE_JOB', job: fullJob })
     if (!response?.success) throw new Error(response?.error ?? 'Could not save this job.')
     const cardButton = card.querySelector<HTMLButtonElement>(`.${BTN_CLASS}`)
     markJobSaved(fullJob, cardButton ?? undefined, cardButton?.dataset.applymateCardKey)
@@ -1043,7 +1044,7 @@ async function runActionCardAction(action: string, card: Element, job: CardJob, 
       const savedJob = response.savedJob as SavedJob | undefined
       if (!savedJob?.id) throw new Error('The job was saved, but its record could not be loaded for matching.')
       button.innerHTML = '<span>◎</span><strong>Matching…</strong>'
-      const matchResponse = await chrome.runtime.sendMessage({ type: 'MATCH_JOB', job: savedJob }) as { success?: boolean; job?: SavedJob; error?: string } | undefined
+      const matchResponse = await sendRuntimeMessage<{ success?: boolean; job?: SavedJob; error?: string }>({ type: 'MATCH_JOB', job: savedJob })
       if (!matchResponse?.success || !matchResponse.job) throw new Error(matchResponse?.error ?? 'Matching failed.')
       const updatedJob = matchResponse.job
       button.innerHTML = `<span>✓</span><strong>Matched ${updatedJob.score ?? 0}%</strong>`
@@ -1052,7 +1053,7 @@ async function runActionCardAction(action: string, card: Element, job: CardJob, 
     }
 
     if (action === 'tailor') {
-      await chrome.runtime.sendMessage({ type: 'OPEN_SIDE_PANEL_TAB', tab: 'resume' })
+      await sendRuntimeMessage({ type: 'OPEN_SIDE_PANEL_TAB', tab: 'resume' })
       closeActionCard(popup)
     }
   } catch (error) {

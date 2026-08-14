@@ -14,6 +14,7 @@ import { openUploadPicker } from '../lib/form-filler/auto-fill'
 import type { ExtensionSettings, SavedJob, ScrapedJob } from '@/lib/types'
 import { isJobReadyForTailoring, mergeJobDetails } from '@/lib/job-quality'
 import { getJobIdentity, isSameJob } from '@/lib/job-identity'
+import { sendRuntimeMessage } from '@/lib/runtime-messaging'
 
 type ContentRuntime = {
   marker?: string
@@ -99,7 +100,7 @@ let savedDetailHydrationGeneration = 0
 function publishJob(job: ScrapedJob) {
   const stamped = { ...job, detectedAt: Date.now() }
   currentJob = stamped
-  chrome.runtime.sendMessage({ type: 'JOB_SCRAPED', job: stamped }).catch(() => {})
+  void sendRuntimeMessage({ type: 'JOB_SCRAPED', job: stamped }).catch(() => {})
 }
 
 function renderVisibleDetailSaved() {
@@ -286,7 +287,7 @@ function updateDiagnosticBadge() {
 async function checkBackground(): Promise<boolean> {
   for (let i = 0; i < 5; i++) {
     try {
-      const res = await chrome.runtime.sendMessage({ type: 'PING' })
+      const res = await sendRuntimeMessage<{ settings?: { hasToken?: boolean; email?: string } }>({ type: 'PING' })
       log('Background OK — hasToken:', (res as any)?.settings?.hasToken, 'email:', (res as any)?.settings?.email)
       return true
     } catch {
@@ -653,7 +654,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 
   if (msg.type === 'OPEN_UPLOAD_PICKER') {
     const result = openUploadPicker(msg.fieldId, (fileName) => {
-      chrome.runtime.sendMessage({ type: 'FILE_UPLOAD_CHANGED', fieldId: msg.fieldId, fileName }).catch(() => {})
+      void sendRuntimeMessage({ type: 'FILE_UPLOAD_CHANGED', fieldId: msg.fieldId, fileName }).catch(() => {})
     })
     sendResponse({ type: 'UPLOAD_PICKER_OPENED', success: result.success, error: result.error })
     return true
@@ -962,7 +963,7 @@ function injectLazySaveButton() {
     // Now save
     btn.innerHTML = '<span>Saving…</span>'
     try {
-      const response = await chrome.runtime.sendMessage({ type: 'SAVE_JOB', job: currentJob })
+      const response = await sendRuntimeMessage<{ success?: boolean; error?: string }>({ type: 'SAVE_JOB', job: currentJob })
       if (response?.success) {
         markJobSaved(currentJob)
         btn.innerHTML = '✓ Saved!'
@@ -1075,7 +1076,7 @@ async function hydrateSavedDetailJobs(): Promise<void> {
   const generation = savedDetailHydrationGeneration
   savedDetailHydrationPromise = (async () => {
     try {
-      const response = await chrome.runtime.sendMessage({ type: 'GET_RECENT_JOBS' }) as { jobs?: unknown } | undefined
+      const response = await sendRuntimeMessage<{ jobs?: unknown }>({ type: 'GET_RECENT_JOBS' })
       if (!Array.isArray(response?.jobs) || generation !== savedDetailHydrationGeneration) return
       savedDetailJobs = response.jobs.filter((job): job is SavedJob => Boolean(
         job && typeof job === 'object' &&
@@ -1121,7 +1122,7 @@ async function saveDetailJob(btn: HTMLButtonElement, mode: 'inline' | 'floating'
     publishJob(currentJob)
     log('Saving fresh detail job:', currentJob.title)
     btn.innerHTML = '<span>Saving…</span>'
-    const response = await chrome.runtime.sendMessage({ type: 'SAVE_JOB', job: currentJob })
+    const response = await sendRuntimeMessage<{ success?: boolean; error?: string }>({ type: 'SAVE_JOB', job: currentJob })
     log('SAVE_JOB response:', response)
 
     if (response?.success) {
