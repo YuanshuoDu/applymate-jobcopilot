@@ -215,7 +215,7 @@ async function restoreActiveSaveUi(): Promise<void> {
 
 chrome.runtime.onInstalled.addListener(async ({ reason }) => {
   if (reason === 'install') {
-    chrome.tabs.create({ url: 'http://localhost:3000' })
+    chrome.tabs.create({ url: 'https://applymate.site' })
   }
 
   // Let Chrome show the side panel button in the toolbar

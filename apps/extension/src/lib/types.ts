@@ -1,7 +1,7 @@
 // ── Shared types across popup / sidepanel / background / content ──
 
 export interface ExtensionSettings {
-  apiBaseUrl: string    // e.g. http://localhost:3000
+  apiBaseUrl: string    // canonical https://applymate.site (localhost is dev-only)
   apiToken:   string    // long-lived JWT from /api/auth/extension-token
   userEmail:  string
   userName:   string

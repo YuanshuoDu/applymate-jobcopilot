@@ -28,7 +28,7 @@ pnpm build        # 一次性构建
 
 1. 确保 Next.js 开发服务器正在运行（`pnpm dev`，默认 http://localhost:3000）
 2. 点击 Chrome 工具栏上的 ApplyMate 图标
-3. 输入你的账号（演示账号：`demo@applymate.ai` / `demo1234`）
+3. 使用你自己的 ApplyMate 账号登录
 4. 登录成功后即可在 LinkedIn/Indeed/Glassdoor 使用
 
 ---
@@ -64,5 +64,5 @@ Popup 内点击 **"打开侧边栏查看详情"** → 侧边栏展开，显示�
 
 ```bash
 pnpm build
-node scripts/zip.mjs    # 生成可上传到 Chrome Web Store 的 zip
+pnpm zip                # 生成 release/ApplyMate-AI-<version>.zip
 ```

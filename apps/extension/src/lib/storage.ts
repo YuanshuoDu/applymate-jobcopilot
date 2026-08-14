@@ -9,6 +9,20 @@ const DEFAULTS: ExtensionSettings = {
 }
 
 const STORAGE_TIMEOUT_MS = 2000
+const CANONICAL_API_ORIGIN = 'https://applymate.site'
+const DEV_API_ORIGINS = new Set(['http://localhost:3000', 'http://localhost:5173'])
+
+/** Keep bearer tokens on the canonical HTTPS service; localhost is dev-only. */
+export function normalizeApiBaseUrl(raw: string): string | null {
+  try {
+    const url = new URL(raw.trim())
+    if (url.username || url.password || url.search || url.hash || url.pathname !== '/') return null
+    if (url.origin === CANONICAL_API_ORIGIN || DEV_API_ORIGINS.has(url.origin)) return url.origin
+    return null
+  } catch {
+    return null
+  }
+}
 
 function getSyncStorage(): chrome.storage.StorageArea | null {
   try {
@@ -40,7 +54,13 @@ export async function getSettings(): Promise<ExtensionSettings> {
     const syncStorage = getSyncStorage()
     if (!syncStorage) return { ...DEFAULTS }
     const result = await within(syncStorage.get('settings'), STORAGE_TIMEOUT_MS)
-    return { ...DEFAULTS, ...(result.settings ?? {}) }
+    const stored = (result.settings ?? {}) as Partial<ExtensionSettings>
+    const apiBaseUrl = normalizeApiBaseUrl(stored.apiBaseUrl ?? DEFAULTS.apiBaseUrl)
+    if (!apiBaseUrl) {
+      // Never reuse a token that was configured for an untrusted origin.
+      return { ...DEFAULTS }
+    }
+    return { ...DEFAULTS, ...stored, apiBaseUrl }
   } catch (error) {
     console.warn('[ApplyMate] Settings load failed; using defaults:', error)
     return { ...DEFAULTS }
@@ -51,6 +71,13 @@ export async function saveSettings(partial: Partial<ExtensionSettings>): Promise
   const current = await getSettings()
   const syncStorage = getSyncStorage()
   if (!syncStorage) return
+  if (partial.apiBaseUrl !== undefined) {
+    const apiBaseUrl = normalizeApiBaseUrl(partial.apiBaseUrl)
+    if (!apiBaseUrl) {
+      throw new Error('API URL must be https://applymate.site or a documented localhost development server.')
+    }
+    partial = { ...partial, apiBaseUrl }
+  }
   try {
     await syncStorage.set({ settings: { ...current, ...partial } })
   } catch (error) {

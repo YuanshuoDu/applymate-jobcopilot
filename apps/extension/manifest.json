@@ -140,18 +140,6 @@
     "*://*.arbeitsagentur.de/*",
     "*://*.jobs.de/*",
     "*://*.irishjobs.ie/*",
-    "http://localhost:3000/*",
-    "https://*.vercel.app/*",
-    "https://*.applymate.ai/*",
     "https://applymate.site/*"
-  ],
-  "optional_host_permissions": [
-    "<all_urls>"
-  ],
-  "web_accessible_resources": [
-    {
-      "resources": ["icons/*", "chunks/*.js"],
-      "matches":   ["<all_urls>"]
-    }
   ]
 }

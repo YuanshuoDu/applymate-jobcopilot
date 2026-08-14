@@ -9,7 +9,6 @@ import {
   CheckCircle2,
   FilePenLine,
   FileText,
-  LockKeyhole,
   RefreshCw,
   ScanSearch,
   ShieldCheck,
@@ -234,7 +233,6 @@ export function FormFillerView({ settings, pendingFields, onFieldsConsumed, scan
   const [appliedCount, setAppliedCount] = useState(0)
   const [reviseInstruction, setReviseInstruction] = useState('')
   const [revising, setRevising] = useState(false)
-  const [injectPermissionHost, setInjectPermissionHost] = useState<string | null>(null)
   const [uploadedFiles, setUploadedFiles] = useState<Record<string, string>>({})
   const [failedFieldIds, setFailedFieldIds] = useState<string[]>([])
   const analyzeFieldsRef = useRef<(
@@ -384,7 +382,6 @@ export function FormFillerView({ settings, pendingFields, onFieldsConsumed, scan
     setFields([])
     setFilledFields([])
     setErrorMsg('')
-    setInjectPermissionHost(null)
   }, [scanTrigger])
 
   useEffect(() => {
@@ -629,44 +626,6 @@ export function FormFillerView({ settings, pendingFields, onFieldsConsumed, scan
     if (!response?.success) setErrorMsg(response?.error ?? 'Could not open the file picker.')
   }, [])
 
-  const handleRequestPermission = useCallback(async () => {
-    try {
-      const granted = await chrome.permissions.request({ origins: ['<all_urls>'] })
-      if (granted) {
-        setInjectPermissionHost(null)
-        setViewState('idle')
-        // Re-scan after a short delay (permission just granted)
-        setTimeout(() => {
-          // Ensure the content script exists once, then send SCAN_FORM.
-          ;(async () => {
-            const tabs = await chrome.tabs.query({ active: true, currentWindow: true })
-            const tabId = tabs[0]?.id
-            if (!tabId) return
-            try {
-              setViewState('scanning')
-              await ensureContentScript(tabId)
-              const response = await chrome.tabs.sendMessage(tabId, { type: 'SCAN_FORM' })
-              if (response?.type === 'FORM_DETECTED' && response.fields?.length > 0) {
-                setFields(response.fields)
-                analyzeFields(response.fields)
-              } else {
-                setErrorMsg('No form fields detected on this page.')
-                setViewState('error')
-              }
-            } catch (error) {
-              setErrorMsg(`Could not connect to this page: ${(error as Error).message}`)
-              setViewState('error')
-            }
-          })()
-        }, 500)
-      } else {
-        setErrorMsg('Permission denied. You can grant it later in chrome://extensions → ApplyMate AI → Details.')
-      }
-    } catch (e) {
-      setErrorMsg(`Permission request failed: ${(e as Error).message}`)
-    }
-  }, []) // handleRequestPermission
-
   const handleFieldEdit = useCallback((fieldId: string, value: string) => {
     setFilledFields(prev => prev.map(f =>
       f.fieldId === fieldId
@@ -700,23 +659,6 @@ export function FormFillerView({ settings, pendingFields, onFieldsConsumed, scan
       setErrorMsg('Cannot scan Chrome system pages. Please navigate to a job application website first.')
       setViewState('error')
       return
-    }
-
-    // Proactively ensure <all_urls> permission (one-time grant)
-    const hasAllUrls = await chrome.permissions.contains({ origins: ['<all_urls>'] })
-    if (!hasAllUrls) {
-      try {
-        const granted = await chrome.permissions.request({ origins: ['<all_urls>'] })
-        if (!granted) {
-          setErrorMsg('Permission required to scan form fields on this page. Grant "Read and change all your data on all websites" to proceed.')
-          setViewState('error')
-          return
-        }
-        // Short delay after permission grant for Chrome to register it
-        await new Promise(r => setTimeout(r, 300))
-      } catch {
-        // Fall through — try anyway (may work via activeTab)
-      }
     }
 
     /**
@@ -767,10 +709,8 @@ export function FormFillerView({ settings, pendingFields, onFieldsConsumed, scan
       r2.injectError?.includes('not allowed')
 
     if (isPermissionError) {
-      // Offer to request <all_urls> optional permission
-      setErrorMsg(`ApplyMate needs permission to access ${host}. Click below to grant it (one-time).`)
+      setErrorMsg(`ApplyMate can only scan forms on its supported job and ATS sites. This page (${host}) is not enabled.`)
       setViewState('error')
-      setInjectPermissionHost(host)
     } else if (r2.injectError) {
       setErrorMsg(`Injection failed on ${host}: ${r2.injectError}`)
       setViewState('error')
@@ -831,32 +771,18 @@ export function FormFillerView({ settings, pendingFields, onFieldsConsumed, scan
   }
 
   if (viewState === 'error') {
-    const isPermission = !!injectPermissionHost
-    const StateIcon = isPermission ? LockKeyhole : AlertTriangle
     return (
       <div className="am-form-view">
-        <div className={`am-form-state ${isPermission ? 'warning' : 'error'}`}>
-          <div className="am-form-state-icon"><StateIcon size={22} /></div>
+        <div className="am-form-state error">
+          <div className="am-form-state-icon"><AlertTriangle size={22} /></div>
           <span className="am-form-eyebrow">FORM AUTO-FILL</span>
-          <h2>{isPermission ? 'Permission required' : 'We could not scan this page'}</h2>
+          <h2>We could not scan this page</h2>
           <p>{errorMsg}</p>
           <div className="am-form-actions">
-            {isPermission ? (
-              <>
-                <button className="am-form-button primary" onClick={handleRequestPermission}>
-                  <LockKeyhole size={14} />
-                  Grant Permission
-                </button>
-                <button className="am-form-button ghost" onClick={() => { setInjectPermissionHost(null); setViewState('idle') }}>
-                  Cancel
-                </button>
-              </>
-            ) : (
-              <button className="am-form-button primary" onClick={() => fields.length > 0 ? analyzeFields(fields) : handleScanPage()}>
-                <RefreshCw size={14} />
-                Retry
-              </button>
-            )}
+            <button className="am-form-button primary" onClick={() => fields.length > 0 ? analyzeFields(fields) : handleScanPage()}>
+              <RefreshCw size={14} />
+              Retry
+            </button>
           </div>
         </div>
       </div>

@@ -48,10 +48,7 @@ const TOAST_ID    = 'applymate-toast'
 // demand for form fill. Running the job-board bootstrap on either page starts
 // repeated DOM scans and retry timers that provide no value there.
 const IS_DASHBOARD_PAGE =
-  window.location.hostname === 'localhost' ||
-  window.location.hostname === 'applymate.site' ||
-  window.location.hostname === 'web-delta-ruddy-29.vercel.app' ||
-  window.location.hostname.endsWith('.applymate.ai')
+  window.location.hostname === 'applymate.site'
 const IS_FORM_FILL_ONLY_PAGE =
   window.location.hostname.includes('workday.com') ||
   window.location.hostname.includes('myworkdayjobs.com')
