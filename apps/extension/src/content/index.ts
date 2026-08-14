@@ -1,7 +1,7 @@
 /**
  * ApplyMate AI — Content Script
  * Two modes:
- *  • List page  → per-card ⊕ button + hover popup
+ *  • List page  → per-card ⊕ button + click-to-open action card
  *  • Detail page → inline Save to ApplyMate near the job action buttons
  */
 import { detectAndScrape } from '@/lib/scrapers/detect'

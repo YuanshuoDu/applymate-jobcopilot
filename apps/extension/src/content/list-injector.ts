@@ -1,5 +1,5 @@
 /**
- * List-page injector: injects per-card ⊕ button and hover popup
+ * List-page injector: injects per-card ⊕ button and click-to-open action card
  * on LinkedIn, Indeed, Glassdoor, Stepstone, Xing, Wellfound, Monster, Arbeitsagentur search-result pages.
  */
 import { detectAndScrape } from '@/lib/scrapers/detect'
@@ -9,9 +9,8 @@ import { getJobIdentity } from '@/lib/job-identity'
 import type { ScrapedJob } from '@/lib/types'
 
 const ATTR        = 'data-applymate'
-const POPUP_ID    = 'applymate-popup'
-const BTN_CLASS   = 'applymate-card-btn'
-const HOVER_DELAY = 500   // ms before popup appears (reduced for snappier preview)
+const POPUP_ID  = 'applymate-popup'
+const BTN_CLASS = 'applymate-card-btn'
 
 // Logged-in LinkedIn has begun rolling out result cards that are plain
 // `div[role="button"]` controls. They contain neither a job URL nor any of the
@@ -446,11 +445,11 @@ function scrapeCard(card: Element, cfg: SiteConfig): CardJob | null {
   return { title, company, location: location || 'Unknown', salary, url, source }
 }
 
-// ── Saved-jobs cache (shared between card ⊕ and popup Save button) ──────────
+// ── Saved-jobs cache (shared between card button and action card) ───────────
 
 const savedJobKeys = new Set<string>()
 
-type CardButtonState = 'idle' | 'loading' | 'saved' | 'error'
+type CardButtonState = 'idle' | 'saved'
 
 function setImportantStyle(el: HTMLElement, property: string, value: string) {
   el.style.setProperty(property, value, 'important')
@@ -708,10 +707,8 @@ function styleCardButton(btn: HTMLButtonElement) {
 
 function renderCardButtonState(btn: HTMLButtonElement, state: CardButtonState) {
   const visuals: Record<CardButtonState, { icon: string; background: string; opacity: string; title: string }> = {
-    idle: { icon: '＋', background: '#4F46E5', opacity: '1', title: 'Save to ApplyMate' },
-    loading: { icon: '…', background: '#4F46E5', opacity: '0.68', title: 'Saving to ApplyMate' },
-    saved: { icon: '✓', background: '#3B6D11', opacity: '1', title: 'Saved to ApplyMate' },
-    error: { icon: '!', background: '#A32D2D', opacity: '1', title: 'Save failed — click to retry' },
+    idle: { icon: '＋', background: '#4F46E5', opacity: '1', title: 'Open ApplyMate actions' },
+    saved: { icon: '✓', background: '#3B6D11', opacity: '1', title: 'Open ApplyMate actions — saved' },
   }
   const visual = visuals[state]
   btn.innerHTML = `<span aria-hidden="true">${visual.icon}</span>`
@@ -722,19 +719,11 @@ function renderCardButtonState(btn: HTMLButtonElement, state: CardButtonState) {
   setImportantStyle(btn, 'opacity', visual.opacity)
 }
 
-function restoreCardButton(btn: HTMLButtonElement) {
-  btn.disabled = false
-  delete btn.dataset.applymateBusy
-  renderCardButtonState(btn, 'idle')
-}
-
 function markSavedByKey(key: string) {
   if (!key) return
   savedJobKeys.add(key)
   document.querySelectorAll<HTMLButtonElement>(`.${BTN_CLASS}`).forEach(btn => {
     if (btn.dataset.applymateSaveKey === key) {
-      btn.disabled = true
-      delete btn.dataset.applymateBusy
       renderCardButtonState(btn, 'saved')
     }
   })
@@ -760,59 +749,19 @@ function injectCardButton(card: Element, job: CardJob, jobKey = job.url): HTMLBu
   if (isIndeedHost()) btn.dataset.applymateSite = 'indeed'
   styleCardButton(btn)
   renderCardButtonState(btn, isAlreadySaved(job) ? 'saved' : 'idle')
-  btn.disabled = isAlreadySaved(job)
+  btn.disabled = false
   btn.setAttribute('data-applymate-job', JSON.stringify(job))
   // Store URL for element-recycling detection in processCards()
   btn.setAttribute('data-applymate-job-url', job.url)
   btn.setAttribute('data-applymate-job-key', jobKey)
   btn.dataset.applymateSaveKey = getJobIdentity(job)
 
-  btn.addEventListener('click', async (e) => {
+  btn.addEventListener('click', (e) => {
     if (!e.isTrusted) return
     e.stopPropagation()
     e.stopImmediatePropagation()
     e.preventDefault()
-    if (btn.dataset.applymateBusy === 'true' || isAlreadySaved(job)) return
-    log('Card button clicked:', job.title)
-
-    btn.dataset.applymateBusy = 'true'
-    btn.disabled = true
-    renderCardButtonState(btn, 'loading')
-
-    try {
-      const fullJob = await resolveJobForSave(card, job)
-      if (!fullJob) {
-        renderCardButtonState(btn, 'error')
-        showInlineError(
-          card as HTMLElement,
-          'Could not read the full job description. This job was not saved — open its details and retry.',
-        )
-        setTimeout(() => restoreCardButton(btn), 3_500)
-        return
-      }
-      const res = await chrome.runtime.sendMessage({ type: 'SAVE_JOB', job: fullJob })
-      log('SAVE_JOB response:', res)
-
-      if (res?.success) {
-        markJobSaved(fullJob)
-      } else {
-        const msg = res?.error ?? 'Save failed'
-        log('Save failed:', msg)
-        if (msg.includes('Not logged in') || msg.includes('login') || msg.includes('logged') || msg.includes('Unauthorized')) {
-          showInlineError(card as HTMLElement, 'Not logged in — click the ApplyMate icon in the toolbar to log in.')
-        } else {
-          showInlineError(card as HTMLElement, msg)
-        }
-        renderCardButtonState(btn, 'error')
-        setTimeout(() => restoreCardButton(btn), 2000)
-      }
-    } catch (err: unknown) {
-      log('SAVE_JOB threw:', err)
-      const message = err instanceof Error ? err.message : String(err)
-      renderCardButtonState(btn, 'error')
-      showInlineError(card as HTMLElement, 'Extension error: ' + message + '. Try reloading the extension.')
-      setTimeout(() => restoreCardButton(btn), 3000)
-    }
+    openActionCard(card, job)
   })
 
   const el = card as HTMLElement
@@ -825,9 +774,7 @@ function injectCardButton(card: Element, job: CardJob, jobKey = job.url): HTMLBu
   el.appendChild(btn)
 
   function showBtn() { setImportantStyle(btn, 'opacity', '1') }
-  function hideBtn() {
-    setImportantStyle(btn, 'opacity', btn.dataset.applymateState === 'loading' ? '0.68' : '1')
-  }
+  function hideBtn() { setImportantStyle(btn, 'opacity', '1') }
 
   el.addEventListener('mouseenter', showBtn)
   el.addEventListener('mouseleave', hideBtn)
@@ -843,65 +790,14 @@ function injectCardButton(card: Element, job: CardJob, jobKey = job.url): HTMLBu
   return btn
 }
 
-// ── Hover popup (lightweight info preview — NO save, NO score) ──────────────
+// ── Click-to-open action card ────────────────────────────────────────────────
 
-let hoverTimer: ReturnType<typeof setTimeout> | null = null
-let currentPopupJob: CardJob | null = null
-
-function attachHoverPopup(card: Element, job: CardJob) {
-  const el = card as HTMLElement
-
-  el.addEventListener('mouseenter', () => {
-    hoverTimer = setTimeout(() => showPopup(card, job), HOVER_DELAY)
-  })
-  el.addEventListener('mouseleave', () => {
-    if (hoverTimer) { clearTimeout(hoverTimer); hoverTimer = null }
-    setTimeout(maybeHidePopup, 200)
-  })
-}
-
-const SOURCE_CLASS: Record<string, string> = {
-  linkedin:        'am-src-linkedin',
-  indeed:          'am-src-indeed',
-  glassdoor:       'am-src-glassdoor',
-  stepstone:       'am-src-stepstone',
-  xing:            'am-src-xing',
-  wellfound:       'am-src-wellfound',
-  greenhouse:      'am-src-greenhouse',
-  lever:           'am-src-lever',
-  workday:         'am-src-workday',
-  smartrecruiters: 'am-src-smartrecruiters',
-  ashby:           'am-src-ashby',
-  bamboohr:        'am-src-bamboohr',
-  jobvite:         'am-src-jobvite',
-  icims:           'am-src-icims',
-}
-
-const SOURCE_LABEL: Record<string, string> = {
-  linkedin:        'LinkedIn',
-  indeed:          'Indeed',
-  glassdoor:       'Glassdoor',
-  stepstone:       'Stepstone',
-  xing:            'Xing',
-  wellfound:       'Wellfound',
-  greenhouse:      'Greenhouse',
-  lever:           'Lever',
-  workday:         'Workday',
-  smartrecruiters: 'SmartRecruiters',
-  ashby:           'Ashby',
-  bamboohr:        'BambooHR',
-  jobvite:         'Jobvite',
-  icims:           'iCIMS',
-}
-
-function showPopup(card: Element, job: CardJob) {
+function openActionCard(card: Element, job: CardJob) {
   getPopup()?.remove()
-  currentPopupJob = job
 
   const rect    = (card as HTMLElement).getBoundingClientRect()
-  // Smaller popup: only info, no score, no save button
-  const POPUP_H = 130
-  const POPUP_W = 260
+  const POPUP_H = 188
+  const POPUP_W = 292
 
   const spaceBelow = window.innerHeight - rect.bottom
   const placeAbove = spaceBelow < POPUP_H + 12 && rect.top > POPUP_H + 12
@@ -911,47 +807,84 @@ function showPopup(card: Element, job: CardJob) {
 
   const leftAbs = Math.max(8, Math.min(rect.left + window.scrollX, window.innerWidth - POPUP_W - 8))
 
-  const srcClass = SOURCE_CLASS[job.source] ?? 'am-src-unknown'
-  const srcLabel = SOURCE_LABEL[job.source] ?? (() => {
-    const h = window.location.hostname
-    if (h.includes('monster'))        return 'Monster'
-    if (h.includes('arbeitsagentur')) return 'Arbeitsagentur'
-    if (h.includes('jobs.de'))        return 'Jobs.de'
-    return 'Job Board'
-  })()
-
   const popup  = document.createElement('div')
   popup.id     = POPUP_ID
   popup.innerHTML = `
-    <div class="am-pop-inner">
-      <div class="am-pop-header">
-        <div class="am-pop-logo">${escHtml(job.company.slice(0, 2).toUpperCase())}</div>
-        <div class="am-pop-info">
-          <div class="am-pop-title">${escHtml(job.title)}</div>
-          <div class="am-pop-company">${escHtml(job.company)}${job.location && job.location !== 'Unknown' ? ` · ${escHtml(job.location)}` : ''}</div>
+    <div class="am-action-inner">
+      <div class="am-action-head">
+        <div>
+          <strong>ApplyMate actions</strong>
+          <span>${escHtml(job.title)} · ${escHtml(job.company)}</span>
         </div>
-        <span class="am-pop-source ${escHtml(srcClass)}">${escHtml(typeof srcLabel === 'string' ? srcLabel : 'Job')}</span>
+        <button type="button" data-am-action="close" aria-label="Close">×</button>
       </div>
-      ${job.salary ? `<div class="am-pop-salary"><span class="am-pop-salary-icon">💰</span> ${escHtml(job.salary)}</div>` : ''}
-      <div class="am-pop-footer">
-        <a class="am-pop-link" href="${escHtml(safePopupUrl(job.url))}" target="_blank" rel="noreferrer">View on ${escHtml(typeof srcLabel === 'string' ? srcLabel : 'site')} ↗</a>
+      <div class="am-action-grid">
+        <button type="button" data-am-action="save"><span>＋</span><strong>${isAlreadySaved(job) ? 'Saved' : 'Save job'}</strong></button>
+        <button type="button" data-am-action="match"><span>◎</span><strong>Match</strong></button>
+        <button type="button" data-am-action="tailor"><span>✦</span><strong>Tailor resume</strong></button>
+        <button type="button" data-am-action="sidebar"><span>☰</span><strong>Open Side Panel</strong></button>
+        <button type="button" data-am-action="open"><span>↗</span><strong>Open job</strong></button>
       </div>
+      <span class="am-action-hint">Review the job before any application is submitted.</span>
     </div>
   `
 
   Object.assign(popup.style, { top: `${topAbs}px`, left: `${leftAbs}px` })
   document.body.appendChild(popup)
 
-  popup.addEventListener('mouseenter', () => { if (hoverTimer) { clearTimeout(hoverTimer); hoverTimer = null } })
-  popup.addEventListener('mouseleave', () => setTimeout(maybeHidePopup, 100))
+  popup.addEventListener('click', event => {
+    const target = event.target instanceof Element
+      ? event.target.closest<HTMLButtonElement>('[data-am-action]')
+      : null
+    if (!target) return
+    event.preventDefault()
+    event.stopPropagation()
+    const action = target.dataset.amAction
+    if (action === 'close') {
+      popup.remove()
+      return
+    }
+    if (action) void runActionCardAction(action, card, job, popup, target)
+  })
 }
 
-function maybeHidePopup() {
-  const popup = getPopup()
-  if (!popup) return
-  if (popup.matches(':hover')) return
-  popup.remove()
-  currentPopupJob = null
+async function runActionCardAction(action: string, card: Element, job: CardJob, popup: HTMLElement, button: HTMLButtonElement) {
+  if (action === 'open') {
+    const url = safeExternalUrl(job.url)
+    if (url) window.open(url, '_blank', 'noopener,noreferrer')
+    popup.remove()
+    return
+  }
+
+  button.disabled = true
+  try {
+    if (action === 'sidebar') {
+      await chrome.runtime.sendMessage({ type: 'OPEN_SIDE_PANEL' })
+      popup.remove()
+      return
+    }
+
+    const fullJob = await resolveJobForSave(card, job)
+    if (!fullJob) throw new Error('Open the job details first so ApplyMate can read the full description.')
+    await chrome.runtime.sendMessage({ type: 'JOB_SCRAPED', job: fullJob })
+    const response = await chrome.runtime.sendMessage({ type: 'SAVE_JOB', job: fullJob })
+    if (!response?.success) throw new Error(response?.error ?? 'Could not save this job.')
+    markJobSaved(fullJob)
+
+    if (action === 'match' || action === 'tailor') {
+      const tab = action === 'match' ? 'jobs' : 'resume'
+      await chrome.runtime.sendMessage({ type: 'OPEN_SIDE_PANEL_TAB', tab })
+      await chrome.runtime.sendMessage({ type: 'OPEN_SIDE_PANEL' })
+      popup.remove()
+    } else {
+      button.innerHTML = '<span>✓</span><strong>Saved</strong>'
+      button.disabled = true
+    }
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error)
+    showInlineError(card as HTMLElement, message)
+    button.disabled = false
+  }
 }
 
 function getPopup(): HTMLElement | null {
@@ -986,12 +919,12 @@ function escHtml(s: string): string {
   return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;')
 }
 
-function safePopupUrl(raw: string): string {
+function safeExternalUrl(raw: string): string | null {
   try {
     const url = new URL(raw)
     if ((url.protocol === 'http:' || url.protocol === 'https:') && !url.username && !url.password) return url.href
   } catch { /* malformed scraped URL */ }
-  return '#'
+  return null
 }
 
 async function fetchIndeedDetails(job: CardJob): Promise<ScrapedJob | null> {
@@ -1170,7 +1103,6 @@ function processCards(cfg: SiteConfig) {
         ? getIndeedJobKey(card, job.url)
         : job.url
     injectCardButton(card, job, jobKey)
-    attachHoverPopup(card, job)
     processed++
   })
   if (processed > 0) log(`✅ Injected ${processed} card buttons`)
@@ -1193,7 +1125,6 @@ function processCardsViaJobLinks() {
     const job = scrapeLinkedInCard(card)
     if (!job) return
     injectCardButton(card, job, key)
-    attachHoverPopup(card, job)
     processed++
   })
 
@@ -1250,7 +1181,6 @@ window.addEventListener('applymate:logout', () => {
     btn.style.background = ''
   })
   getPopup()?.remove()
-  currentPopupJob = null
 })
 
 window.addEventListener('applymate:job-saved', (event) => {
