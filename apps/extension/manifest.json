@@ -61,6 +61,8 @@
         "*://*.wellfound.com/*",
         "*://*.greenhouse.io/*",
         "*://*.lever.co/*",
+        "*://*.myworkdayjobs.com/*",
+        "*://*.workday.com/*",
         "*://*.smartrecruiters.com/*",
         "*://jobs.ashbyhq.com/*",
         "*://*.bamboohr.com/jobs/*",
