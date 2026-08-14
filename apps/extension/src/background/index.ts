@@ -273,6 +273,35 @@ chrome.commands.onCommand.addListener((command) => {
 
 chrome.runtime.onMessage.addListener(
   (msg: ExtMessage, sender, sendResponse) => {
+    // Chrome only accepts sidePanel.open() while the original user gesture
+    // is still alive. A content-script click reaches this listener with that
+    // gesture, but awaiting getSettings() first (the normal message path)
+    // consumes it. Handle content-script panel requests synchronously and
+    // open the tab-specific panel before any other async work.
+    if ((msg.type === 'OPEN_SIDE_PANEL' || msg.type === 'OPEN_SIDE_PANEL_TAB') && sender.tab?.id !== undefined) {
+      if (!isTrustedExtensionSender(sender)) {
+        try { sendResponse({ error: 'Unauthorized sender' }) } catch { /* port already closed */ }
+        return false
+      }
+
+      if (msg.type === 'OPEN_SIDE_PANEL_TAB') {
+        void chrome.storage.local.set({ pendingSidePanelTab: { tab: msg.tab, createdAt: Date.now() } }).catch(() => {})
+        chrome.runtime.sendMessage(msg).catch(() => {})
+      }
+
+      chrome.sidePanel.open({ tabId: sender.tab.id })
+        .then(() => {
+          console.log('[ApplyMate] Side panel opened from content-script gesture')
+          try { sendResponse({ ok: true }) } catch { /* port already closed */ }
+        })
+        .catch(error => {
+          const message = error instanceof Error ? error.message : String(error)
+          console.error('[ApplyMate] Native side panel could not be opened:', message)
+          try { sendResponse({ ok: false, error: message }) } catch { /* port already closed */ }
+        })
+      return true
+    }
+
     // Keep service worker alive during async handling (MV3 requirement)
     // Wrap in try-catch so a closed port doesn't throw
     handleMessage(msg, sender)
@@ -447,12 +476,12 @@ async function handleMessage(
 
 async function openTrackerWindow(): Promise<{ ok: boolean; error?: string }> {
   try {
-    const win = await chrome.windows.getLastFocused()
-    if (win.id) {
-      await chrome.sidePanel.open({ windowId: win.id })
-      console.log('[ApplyMate] Side panel opened natively')
-      return { ok: true }
-    }
+    // Do not await getLastFocused() here. The function is also used by the
+    // keyboard shortcut path, where sidePanel.open() must remain in the same
+    // user-gesture turn. WINDOW_ID_CURRENT is valid for the current window.
+    await chrome.sidePanel.open({ windowId: chrome.windows.WINDOW_ID_CURRENT })
+    console.log('[ApplyMate] Side panel opened natively')
+    return { ok: true }
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err)
     console.error('[ApplyMate] Native side panel could not be opened:', message)

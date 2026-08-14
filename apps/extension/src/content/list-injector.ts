@@ -1053,7 +1053,6 @@ async function runActionCardAction(action: string, card: Element, job: CardJob, 
 
     if (action === 'tailor') {
       await chrome.runtime.sendMessage({ type: 'OPEN_SIDE_PANEL_TAB', tab: 'resume' })
-      await chrome.runtime.sendMessage({ type: 'OPEN_SIDE_PANEL' })
       closeActionCard(popup)
     }
   } catch (error) {
