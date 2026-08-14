@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "ApplyMate AI",
-  "version": "0.1.15",
-  "version_name": "0.1.15-popup-sidepanel-fix",
+  "version": "0.1.16",
+  "version_name": "0.1.16-workday-iframe-account-isolation",
   "description": "AI-powered job application copilot — save jobs, match resumes, track progress",
   "icons": {
     "16":  "icons/icon16.png",
