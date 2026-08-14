@@ -1,4 +1,4 @@
-import { getJobIdentity } from '@/lib/job-identity'
+import { isSameJob } from '@/lib/job-identity'
 import type { DashboardStats, SavedJob, ScrapedJob } from '@/lib/types'
 import { LABELS, type PopupLabels } from './popup-constants'
 
@@ -56,8 +56,7 @@ export function companyDomain(company: string): string {
 }
 
 export function sameJob(job: ScrapedJob, saved: SavedJob): boolean {
-  if (job.url && saved.url && job.url === saved.url) return true
-  return getJobIdentity(job) === getJobIdentity({
+  return isSameJob(job, {
     source: saved.source ?? undefined,
     url: saved.url ?? undefined,
     role: saved.role,

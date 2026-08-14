@@ -11,9 +11,9 @@ import { findDetailActionHost, mountDetailButtonContainer } from './detail-butto
 import { detectAndScanForms } from '../lib/form-filler/detectors/detect'
 import { generateId } from '../lib/form-filler/form-scanner'
 import { openUploadPicker } from '../lib/form-filler/auto-fill'
-import type { ExtensionSettings, ScrapedJob } from '@/lib/types'
+import type { ExtensionSettings, SavedJob, ScrapedJob } from '@/lib/types'
 import { isJobReadyForTailoring, mergeJobDetails } from '@/lib/job-quality'
-import { getJobIdentity } from '@/lib/job-identity'
+import { getJobIdentity, isSameJob } from '@/lib/job-identity'
 
 type ContentRuntime = {
   marker?: string
@@ -91,6 +91,10 @@ let lastPanelSignature = ''
 let lastSavedPanelSignature = ''
 let panelRefreshTimer: ReturnType<typeof setTimeout> | null = null
 const savedDetailJobKeys = new Set<string>()
+let savedDetailJobs: SavedJob[] = []
+let savedDetailJobsHydrated = false
+let savedDetailHydrationPromise: Promise<void> | null = null
+let savedDetailHydrationGeneration = 0
 
 function publishJob(job: ScrapedJob) {
   const stamped = { ...job, detectedAt: Date.now() }
@@ -592,6 +596,14 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     return true
   }
 
+  if (msg.type === 'JOB_SAVED' && msg.savedJob) {
+    savedDetailJobs = [msg.savedJob, ...savedDetailJobs.filter(job => job.id !== msg.savedJob?.id)]
+    savedDetailJobKeys.add(getJobIdentity(savedJobInput(msg.savedJob)))
+    if (currentJob && isSameJob(currentJob, savedJobInput(msg.savedJob))) renderVisibleDetailSaved()
+    sendResponse({ ok: true })
+    return true
+  }
+
   if (msg.type === 'PING') {
     sendResponse({ type: 'PONG', hasJob: currentJob !== null })
     return true
@@ -777,6 +789,18 @@ const syncStorageEvents = (() => {
   }
 })()
 
+function resetDetailSavedState() {
+  savedDetailJobKeys.clear()
+  savedDetailJobs = []
+  savedDetailJobsHydrated = false
+  savedDetailHydrationPromise = null
+  savedDetailHydrationGeneration += 1
+  const saveBtn = document.getElementById(BUTTON_ID)?.querySelector<HTMLButtonElement>('button')
+  if (saveBtn) setSaveButtonIdle(saveBtn, 'inline')
+  const lazySaveBtn = document.getElementById('am-lazy-btn') as HTMLButtonElement | null
+  if (lazySaveBtn) setSaveButtonIdle(lazySaveBtn, 'floating')
+}
+
 syncStorageEvents?.addListener((changes, area) => {
   if (area !== 'sync') return
   const settingsChange = changes.settings
@@ -784,25 +808,29 @@ syncStorageEvents?.addListener((changes, area) => {
 
   const oldToken = settingsChange.oldValue?.apiToken
   const newToken = settingsChange.newValue?.apiToken
+  const oldEmail = String(settingsChange.oldValue?.userEmail ?? '').trim().toLowerCase()
+  const newEmail = String(settingsChange.newValue?.userEmail ?? '').trim().toLowerCase()
 
   // User logged out
   if (oldToken && !newToken) {
     log('User logged out — resetting save buttons')
-    savedDetailJobKeys.clear()
-    const saveBtn = document.getElementById(BUTTON_ID)
-    if (saveBtn) {
-      const button = saveBtn.querySelector<HTMLButtonElement>('button')
-      if (button) setSaveButtonIdle(button, 'inline')
-    }
-    const lazySaveBtn = document.getElementById('am-lazy-btn') as HTMLButtonElement | null
-    if (lazySaveBtn) setSaveButtonIdle(lazySaveBtn, 'floating')
+    resetDetailSavedState()
     window.dispatchEvent(new CustomEvent('applymate:logout'))
+  }
+
+  // A non-empty token changing to another account must clear the old
+  // account's in-memory detail state just like logout/login does.
+  if (oldEmail && newEmail && oldEmail !== newEmail) {
+    log('Account changed — resetting saved buttons')
+    resetDetailSavedState()
+    window.dispatchEvent(new CustomEvent('applymate:account-change'))
   }
 
   // The popup can change extension credentials, but the dashboard keeps its
   // own explicit session so a stale token cannot silently switch users.
   if (!oldToken && newToken) {
     log('Extension logged in as:', settingsChange.newValue?.userEmail)
+    resetDetailSavedState()
     window.dispatchEvent(new CustomEvent('applymate:login'))
   }
 })
@@ -876,6 +904,7 @@ function injectLazySaveButton() {
   }
 
   log('🔵 Creating button element...')
+  void hydrateSavedDetailJobs()
   const btn = document.createElement('button')
   btn.id = 'am-lazy-btn'
   btn.type = 'button'
@@ -897,7 +926,7 @@ function injectLazySaveButton() {
     btn.style.setProperty('background', '#4F46E5', 'important')
     btn.style.setProperty('padding-right', mode === 'inline' ? '16px' : '14px', 'important')
   })
-  if (currentJob && savedDetailJobKeys.has(getJobIdentity(currentJob))) {
+  if (currentJob && isCurrentDetailSaved(currentJob)) {
     renderVisibleDetailSaved()
   }
 
@@ -978,6 +1007,7 @@ function injectLazySaveButton() {
 function injectDetailButtons() {
   if (document.getElementById(BUTTON_ID)) return
   if (!currentJob) return
+  void hydrateSavedDetailJobs()
 
   const wrap = document.createElement('div')
   wrap.id = BUTTON_ID // use same ID so duplicate-guard works
@@ -991,7 +1021,7 @@ function injectDetailButtons() {
   const mode = mountDetailButtonContainer(wrap)
   styleDetailContainer(wrap, mode)
   applySaveButtonStyle(saveBtn, mode)
-  if (savedDetailJobKeys.has(getJobIdentity(currentJob))) {
+  if (isCurrentDetailSaved(currentJob)) {
     renderDetailButtonSaved(saveBtn)
   }
   saveBtn.addEventListener('mouseenter', () => {
@@ -1023,6 +1053,48 @@ function renderDetailButtonSaved(btn: HTMLButtonElement) {
   btn.title = 'Saved to ApplyMate'
   btn.style.setProperty('background', '#3B6D11', 'important')
   btn.style.setProperty('opacity', '1', 'important')
+}
+
+function savedJobInput(saved: SavedJob) {
+  return {
+    source: saved.source ?? undefined,
+    url: saved.url ?? undefined,
+    role: saved.role,
+    company: saved.company,
+    location: saved.location ?? undefined,
+  }
+}
+
+function isCurrentDetailSaved(job: ScrapedJob): boolean {
+  return savedDetailJobKeys.has(getJobIdentity(job)) || savedDetailJobs.some(saved => isSameJob(job, savedJobInput(saved)))
+}
+
+async function hydrateSavedDetailJobs(): Promise<void> {
+  if (savedDetailJobsHydrated) return
+  if (savedDetailHydrationPromise) return savedDetailHydrationPromise
+  const generation = savedDetailHydrationGeneration
+  savedDetailHydrationPromise = (async () => {
+    try {
+      const response = await chrome.runtime.sendMessage({ type: 'GET_RECENT_JOBS' }) as { jobs?: unknown } | undefined
+      if (!Array.isArray(response?.jobs) || generation !== savedDetailHydrationGeneration) return
+      savedDetailJobs = response.jobs.filter((job): job is SavedJob => Boolean(
+        job && typeof job === 'object' &&
+        typeof (job as { id?: unknown }).id === 'string' &&
+        typeof (job as { role?: unknown }).role === 'string' &&
+        typeof (job as { company?: unknown }).company === 'string',
+      ))
+      savedDetailJobs.forEach(saved => savedDetailJobKeys.add(getJobIdentity(savedJobInput(saved))))
+      savedDetailJobsHydrated = true
+      if (currentJob && isCurrentDetailSaved(currentJob)) renderVisibleDetailSaved()
+    } catch {
+      // Authentication recovery and a later page event can retry hydration.
+    }
+  })()
+  try {
+    await savedDetailHydrationPromise
+  } finally {
+    savedDetailHydrationPromise = null
+  }
 }
 
 async function saveDetailJob(btn: HTMLButtonElement, mode: 'inline' | 'floating') {

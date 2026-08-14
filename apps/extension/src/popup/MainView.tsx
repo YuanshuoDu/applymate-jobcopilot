@@ -25,6 +25,7 @@ export function PopupMainView({ settings, onSettings, onLogout }: {
 
   useEffect(() => {
     let cancelled = false
+    setCurrentJob(null)
     setSavedJobs([])
     setStats(null)
     setScore(null)

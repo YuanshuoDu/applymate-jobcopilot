@@ -135,10 +135,19 @@ export async function saveJob(
 }
 
 export async function getRecentJobs(settings: ExtensionSettings): Promise<SavedJob[]> {
-  const data = await request<{ jobs: SavedJob[]; total: number }>(
-    settings, '/api/jobs?pageSize=100',
-  )
-  return data.jobs
+  const pageSize = 100
+  const jobs: SavedJob[] = []
+  let page = 1
+  let total = 0
+  do {
+    const data = await request<{ jobs: SavedJob[]; total: number }>(
+      settings, `/api/jobs?page=${page}&pageSize=${pageSize}`,
+    )
+    jobs.push(...data.jobs)
+    total = data.total
+    page += 1
+  } while (jobs.length < total && page <= 100)
+  return jobs
 }
 
 export async function exportApplicationPackLocally(settings: ExtensionSettings, jobId: string, openFolder = false): Promise<{ folderPath: string; opened: boolean }> {

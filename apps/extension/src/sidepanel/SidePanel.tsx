@@ -25,7 +25,7 @@ import {
   X,
 } from 'lucide-react'
 import { getCurrentJob } from '@/lib/storage'
-import { getJobIdentity } from '@/lib/job-identity'
+import { isSameJob } from '@/lib/job-identity'
 import {
   getDashboard,
   scoreSavedJob,
@@ -261,7 +261,7 @@ export function SidePanel() {
         ))}
       </nav>
       <div className="am-panel-body">
-        {mountedTabs.has('jobs') && <div hidden={activeTab !== 'jobs'}><TrackerPanel settings={settings} L={L} onOpenResume={() => selectTab('resume')} /></div>}
+        {mountedTabs.has('jobs') && <div hidden={activeTab !== 'jobs'}><TrackerPanel settings={settings} tabKey={lastTabUrl} L={L} onOpenResume={() => selectTab('resume')} /></div>}
         {mountedTabs.has('form') && <div hidden={activeTab !== 'form'}><FormFillerView settings={settings} pendingFields={pendingFormFields} onFieldsConsumed={() => setPendingFormFields(null)} scanTrigger={scanTrigger} personaUpdateTrigger={personaUpdateTrigger} onPersonaUpdated={() => setPersonaUpdateTrigger(current => current + 1)} /></div>}
         {mountedTabs.has('resume') && <div hidden={activeTab !== 'resume'}><ResumeView settings={settings} /></div>}
         {mountedTabs.has('persona') && <div hidden={activeTab !== 'persona'}><PersonaView settings={settings} personaUpdateTrigger={personaUpdateTrigger} /></div>}
@@ -270,7 +270,7 @@ export function SidePanel() {
   )
 }
 
-function CurrentPageBanner({ accountKey, userEmail, onSaved }: { accountKey: string; userEmail: string; onSaved: () => void }) {
+function CurrentPageBanner({ accountKey, tabKey, userEmail, onSaved }: { accountKey: string; tabKey: string; userEmail: string; onSaved: () => void }) {
   const [currentJob, setCurrentJob] = useState<ScrapedJob | null>(null)
   const [saving, setSaving] = useState(false)
   const [saved, setSaved] = useState(false)
@@ -283,6 +283,17 @@ function CurrentPageBanner({ accountKey, userEmail, onSaved }: { accountKey: str
     // saved-state marker for the same job on the current page.
     setSaved(false)
     setSaveError('')
+    setCurrentJob(null)
+    currentJobRef.current = null
+    latestDetectedAt.current = 0
+    const readActiveTabJob = async (): Promise<ScrapedJob | null> => {
+      const tabs = await chrome.tabs.query({ active: true, currentWindow: true })
+      const tabId = tabs[0]?.id
+      if (tabId == null) return getCurrentJob(userEmail)
+      const response = await chrome.tabs.sendMessage(tabId, { type: 'GET_CURRENT_JOB' }).catch(() => null) as { type?: string; job?: ScrapedJob | null } | null
+      if (response?.type === 'CURRENT_JOB_RESULT') return response.job ?? null
+      return getCurrentJob(userEmail)
+    }
     const syncSavedState = (job: ScrapedJob | null) => {
       if (!job) {
         setSaved(false)
@@ -292,7 +303,7 @@ function CurrentPageBanner({ accountKey, userEmail, onSaved }: { accountKey: str
         if (Array.isArray(response?.jobs)) {
           const jobs = response.jobs as SavedJob[]
           if (currentJobRef.current !== job) return
-          setSaved(jobs.some(savedJob => getJobIdentity(job) === getJobIdentity({ source: savedJob.source ?? undefined, url: savedJob.url ?? undefined, role: savedJob.role, company: savedJob.company, location: savedJob.location ?? undefined })))
+          setSaved(jobs.some(savedJob => isSameJob(job, { source: savedJob.source ?? undefined, url: savedJob.url ?? undefined, role: savedJob.role, company: savedJob.company, location: savedJob.location ?? undefined })))
         }
       }).catch(() => {})
     }
@@ -307,14 +318,14 @@ function CurrentPageBanner({ accountKey, userEmail, onSaved }: { accountKey: str
       setSaveError('')
       syncSavedState(job ?? null)
     }
-    void getCurrentJob(userEmail).then(acceptJob)
+    void readActiveTabJob().then(acceptJob)
     const handler = (message: { type?: string; job?: ScrapedJob; savedJob?: SavedJob }) => {
-      if (message.type === 'JOB_SCRAPED') acceptJob(message.job)
-      if (message.type === 'JOB_SAVED' && message.savedJob && currentJobRef.current && getJobIdentity(currentJobRef.current) === getJobIdentity({ source: message.savedJob.source ?? undefined, url: message.savedJob.url ?? undefined, role: message.savedJob.role, company: message.savedJob.company, location: message.savedJob.location ?? undefined })) setSaved(true)
+      if (message.type === 'JOB_SCRAPED') void readActiveTabJob().then(acceptJob)
+      if (message.type === 'JOB_SAVED' && message.savedJob && currentJobRef.current && isSameJob(currentJobRef.current, { source: message.savedJob.source ?? undefined, url: message.savedJob.url ?? undefined, role: message.savedJob.role, company: message.savedJob.company, location: message.savedJob.location ?? undefined })) setSaved(true)
     }
     chrome.runtime.onMessage.addListener(handler)
     return () => chrome.runtime.onMessage.removeListener(handler)
-  }, [accountKey])
+  }, [accountKey, tabKey, userEmail])
 
   if (!currentJob) return null
 
@@ -351,7 +362,7 @@ function CurrentPageBanner({ accountKey, userEmail, onSaved }: { accountKey: str
 
 type LType = Labels
 
-function TrackerPanel({ settings, L, onOpenResume }: { settings: ExtensionSettings; L: LType; onOpenResume: () => void }) {
+function TrackerPanel({ settings, tabKey, L, onOpenResume }: { settings: ExtensionSettings; tabKey: string; L: LType; onOpenResume: () => void }) {
   const [jobs, setJobs] = useState<SavedJob[]>([])
   const [dashboard, setDashboard] = useState<DashboardSnapshot | null>(null)
   const [loading, setLoading] = useState(false)
@@ -551,7 +562,7 @@ function TrackerPanel({ settings, L, onOpenResume }: { settings: ExtensionSettin
         </div>
 
         {(jobsSyncError || dashboardSyncError) && <div className="am-sync-banner" role="alert"><div><strong>Sync needs attention</strong><span>{jobsSyncError || dashboardSyncError}</span>{(jobsSyncError ? lastJobsSyncedAt : lastDashboardSyncedAt) && <small>Last synced {formatSyncAge((jobsSyncError ? lastJobsSyncedAt : lastDashboardSyncedAt)!)}</small>}</div><button type="button" onClick={() => refreshAll(true)}>Retry</button></div>}
-        <CurrentPageBanner accountKey={`${settings.apiBaseUrl}|${settings.apiToken}|${settings.userEmail}`} userEmail={settings.userEmail} onSaved={() => refreshAll()} />
+        <CurrentPageBanner accountKey={`${settings.apiBaseUrl}|${settings.apiToken}|${settings.userEmail}`} tabKey={tabKey} userEmail={settings.userEmail} onSaved={() => refreshAll()} />
         <div className="am-list" ref={listRef}>
           {loading ? <div className="am-spinner"><LoaderCircle className="am-spin" size={20} aria-label="Loading jobs" /></div> : filtered.length === 0 ? <EmptyState hasSearch={Boolean(search.trim())} filter={filterStatus} connectionError={Boolean(jobsSyncError)} onRetry={() => refreshAll(true)} onClearSearch={() => setSearch('')} onOpenDashboard={() => chrome.tabs.create({ url: `${settings.apiBaseUrl}/jobs` })} L={L} /> : <div className="am-list-inner">{filtered.map(job => <JobCard key={job.id} job={job} expanded={expandedId === job.id} onToggle={() => setExpandedId(current => current === job.id ? null : job.id)} settings={settings} L={L} scoring={scoringId === job.id} onScore={() => void scoreJob(job)} />)}</div>}
         </div>

@@ -5,7 +5,7 @@
 import { detectAndScrape } from '@/lib/scrapers/detect'
 import { scrapeIndeedFromDocument } from '@/lib/scrapers/indeed'
 import { hasUsableDescription, isJobReadyForTailoring, mergeJobDetails } from '@/lib/job-quality'
-import { getJobIdentity } from '@/lib/job-identity'
+import { getJobIdentity, isSameJob, isWeakJobIdentity } from '@/lib/job-identity'
 import type { SavedJob, ScrapedJob } from '@/lib/types'
 
 const ATTR        = 'data-applymate'
@@ -740,31 +740,18 @@ function markSavedByCardKey(cardKey: string) {
   })
 }
 
-function normalizedJobText(value: string | null | undefined): string {
-  return (value ?? '').replace(/\s+/g, ' ').trim().toLowerCase()
-}
-
 function isWeakListIdentity(job: CardJob): boolean {
-  if (job.source === 'linkedin') {
-    return !/currentJobId=|\/jobs\/view\/(?:[^/?#]*-)?\d{5,}/i.test(job.url)
-  }
-  if (job.source === 'indeed') return !/[?&](?:jk|vjk)=/i.test(job.url)
-  return false
-}
-
-function locationsOverlap(left: string, right: string): boolean {
-  if (!left || !right || left === 'unknown' || right === 'unknown') return true
-  return left.includes(right) || right.includes(left) || left.split(/[(),·|/]+/).some(part =>
-    part.trim().length >= 3 && right.includes(part.trim()),
-  )
+  return isWeakJobIdentity(job)
 }
 
 function matchesSavedRemoteJob(job: CardJob, saved: SavedJob): boolean {
-  const source = normalizedJobText(saved.source)
-  if (source && source !== 'unknown' && source !== normalizedJobText(job.source)) return false
-  if (normalizedJobText(job.title) !== normalizedJobText(saved.role)) return false
-  if (normalizedJobText(job.company) !== normalizedJobText(saved.company)) return false
-  return locationsOverlap(normalizedJobText(job.location), normalizedJobText(saved.location))
+  return isSameJob(job, {
+    source: saved.source ?? undefined,
+    url: saved.url ?? undefined,
+    role: saved.role,
+    company: saved.company,
+    location: saved.location ?? undefined,
+  })
 }
 
 function readCardJob(button: HTMLButtonElement): CardJob | null {
@@ -1365,8 +1352,8 @@ export function startListModeInjector() {
 
 // ── Listen for login/logout from popup ──────────────────────────────────────
 
-window.addEventListener('applymate:logout', () => {
-  log('Logout event — clearing saved state')
+function resetSavedState(reason: string) {
+  log(`${reason} — clearing saved state`)
   savedJobKeys.clear()
   savedCardKeys.clear()
   savedRemoteJobs = []
@@ -1378,6 +1365,12 @@ window.addEventListener('applymate:logout', () => {
     btn.disabled = false
   })
   closeActionCard(getPopup())
+}
+
+window.addEventListener('applymate:logout', () => resetSavedState('Logout event'))
+window.addEventListener('applymate:account-change', () => {
+  resetSavedState('Account change event')
+  void hydrateSavedJobs()
 })
 
 window.addEventListener('applymate:job-saved', (event) => {
@@ -1390,23 +1383,7 @@ window.addEventListener('applymate:job-saved', (event) => {
 })
 
 window.addEventListener('applymate:login', () => {
-  log('Login event — ready to save')
-  savedJobKeys.clear()
-  savedCardKeys.clear()
-  savedRemoteJobs = []
-  savedJobsHydratedForAccount = false
-  savedJobsHydrationPromise = null
-  savedJobsHydrationGeneration += 1
-  document.querySelectorAll<HTMLButtonElement>(`.${BTN_CLASS}`).forEach(btn => {
-    renderCardButtonState(btn, 'idle')
-    btn.disabled = false
-  })
-  document.querySelectorAll<HTMLButtonElement>(`.${BTN_CLASS}`).forEach(btn => {
-    if (btn.style.background === 'rgb(163, 45, 45)') {
-      btn.innerHTML = `<span>⊕</span>`
-      btn.style.background = ''
-    }
-  })
+  resetSavedState('Login event')
   void hydrateSavedJobs()
 })
 
