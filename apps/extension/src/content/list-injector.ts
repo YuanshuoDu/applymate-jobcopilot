@@ -448,8 +448,12 @@ function scrapeCard(card: Element, cfg: SiteConfig): CardJob | null {
 // ── Saved-jobs cache (shared between card button and action card) ───────────
 
 const savedJobKeys = new Set<string>()
+// A DOM card key is deliberately kept separate from the canonical job key.
+// Some LinkedIn virtualized cards temporarily share a URL/provider id while
+// their own fingerprint remains distinct.
+const savedCardKeys = new Set<string>()
 
-type CardButtonState = 'idle' | 'saved'
+type CardButtonState = 'idle' | 'saving' | 'saved' | 'error'
 
 function setImportantStyle(el: HTMLElement, property: string, value: string) {
   el.style.setProperty(property, value, 'important')
@@ -708,7 +712,9 @@ function styleCardButton(btn: HTMLButtonElement) {
 function renderCardButtonState(btn: HTMLButtonElement, state: CardButtonState) {
   const visuals: Record<CardButtonState, { icon: string; background: string; opacity: string; title: string }> = {
     idle: { icon: '＋', background: '#4F46E5', opacity: '1', title: 'Open ApplyMate actions' },
+    saving: { icon: '…', background: '#4F46E5', opacity: '0.72', title: 'Saving to ApplyMate' },
     saved: { icon: '✓', background: '#3B6D11', opacity: '1', title: 'Open ApplyMate actions — saved' },
+    error: { icon: '!', background: '#A32D2D', opacity: '1', title: 'Save failed — click to retry' },
   }
   const visual = visuals[state]
   btn.innerHTML = `<span aria-hidden="true">${visual.icon}</span>`
@@ -719,24 +725,52 @@ function renderCardButtonState(btn: HTMLButtonElement, state: CardButtonState) {
   setImportantStyle(btn, 'opacity', visual.opacity)
 }
 
-function markSavedByKey(key: string) {
-  if (!key) return
-  savedJobKeys.add(key)
+function markSavedByCardKey(cardKey: string) {
+  if (!cardKey) return
+  savedCardKeys.add(cardKey)
   document.querySelectorAll<HTMLButtonElement>(`.${BTN_CLASS}`).forEach(btn => {
-    if (btn.dataset.applymateSaveKey === key) {
+    if (btn.dataset.applymateCardKey === cardKey) {
       renderCardButtonState(btn, 'saved')
+      btn.disabled = false
     }
   })
 }
 
-export function markJobSaved(job: Pick<ScrapedJob, 'source' | 'url' | 'title' | 'company' | 'location'>) {
-  const key = getJobIdentity(job)
-  markSavedByKey(key)
-  window.dispatchEvent(new CustomEvent('applymate:job-saved', { detail: { key } }))
+function markSavedByKey(key: string, targetButton?: HTMLButtonElement, cardKey?: string) {
+  if (!key) return
+  savedJobKeys.add(key)
+  if (cardKey) savedCardKeys.add(cardKey)
+  if (targetButton) {
+    renderCardButtonState(targetButton, 'saved')
+    targetButton.disabled = false
+    return
+  }
+  if (cardKey) {
+    markSavedByCardKey(cardKey)
+    return
+  }
+  document.querySelectorAll<HTMLButtonElement>(`.${BTN_CLASS}`).forEach(btn => {
+    if (btn.dataset.applymateSaveKey === key) {
+      renderCardButtonState(btn, 'saved')
+      btn.disabled = false
+    }
+  })
 }
 
-function isAlreadySaved(job: CardJob): boolean {
-  return savedJobKeys.has(getJobIdentity(job))
+export function markJobSaved(
+  job: Pick<ScrapedJob, 'source' | 'url' | 'title' | 'company' | 'location'>,
+  targetButton?: HTMLButtonElement,
+  cardKey?: string,
+) {
+  const key = getJobIdentity(job)
+  markSavedByKey(key, targetButton, cardKey)
+  window.dispatchEvent(new CustomEvent('applymate:job-saved', { detail: { key, cardKey } }))
+}
+
+function isAlreadySaved(job: CardJob, cardKey?: string): boolean {
+  return cardKey
+    ? savedCardKeys.has(cardKey)
+    : savedJobKeys.has(getJobIdentity(job))
 }
 
 // ── Per-card button ───────────────────────────────────────────────────────────
@@ -748,12 +782,13 @@ function injectCardButton(card: Element, job: CardJob, jobKey = job.url): HTMLBu
   btn.dataset.applymateRole = 'list-save'
   if (isIndeedHost()) btn.dataset.applymateSite = 'indeed'
   styleCardButton(btn)
-  renderCardButtonState(btn, isAlreadySaved(job) ? 'saved' : 'idle')
+  renderCardButtonState(btn, isAlreadySaved(job, jobKey) ? 'saved' : 'idle')
   btn.disabled = false
   btn.setAttribute('data-applymate-job', JSON.stringify(job))
   // Store URL for element-recycling detection in processCards()
   btn.setAttribute('data-applymate-job-url', job.url)
   btn.setAttribute('data-applymate-job-key', jobKey)
+  btn.dataset.applymateCardKey = jobKey
   btn.dataset.applymateSaveKey = getJobIdentity(job)
 
   btn.addEventListener('click', (e) => {
@@ -761,7 +796,11 @@ function injectCardButton(card: Element, job: CardJob, jobKey = job.url): HTMLBu
     e.stopPropagation()
     e.stopImmediatePropagation()
     e.preventDefault()
-    openActionCard(card, job)
+    if (btn.dataset.applymateState === 'saved') {
+      openActionCard(card, job)
+      return
+    }
+    void saveCardJob(card, job, btn, jobKey)
   })
 
   const el = card as HTMLElement
@@ -790,10 +829,39 @@ function injectCardButton(card: Element, job: CardJob, jobKey = job.url): HTMLBu
   return btn
 }
 
+async function saveCardJob(card: Element, job: CardJob, button: HTMLButtonElement, cardKey: string) {
+  if (button.dataset.applymateBusy === 'true') return
+  button.dataset.applymateBusy = 'true'
+  button.disabled = true
+  renderCardButtonState(button, 'saving')
+
+  try {
+    const fullJob = await resolveJobForSave(card, job)
+    if (!fullJob) throw new Error('Open the job details first so ApplyMate can read the full description.')
+    await chrome.runtime.sendMessage({ type: 'JOB_SCRAPED', job: fullJob })
+    const response = await chrome.runtime.sendMessage({ type: 'SAVE_JOB', job: fullJob })
+    if (!response?.success) throw new Error(response?.error ?? 'Could not save this job.')
+    markJobSaved(fullJob, button, cardKey)
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error)
+    renderCardButtonState(button, 'error')
+    button.disabled = false
+    showInlineError(card as HTMLElement, message)
+    window.setTimeout(() => {
+      if (button.isConnected && button.dataset.applymateState === 'error') {
+        renderCardButtonState(button, 'idle')
+      }
+    }, 3000)
+  } finally {
+    delete button.dataset.applymateBusy
+    if (button.dataset.applymateState === 'saved') button.disabled = false
+  }
+}
+
 // ── Click-to-open action card ────────────────────────────────────────────────
 
 function openActionCard(card: Element, job: CardJob) {
-  getPopup()?.remove()
+  closeActionCard(getPopup())
 
   const rect    = (card as HTMLElement).getBoundingClientRect()
   const POPUP_H = 188
@@ -819,11 +887,9 @@ function openActionCard(card: Element, job: CardJob) {
         <button type="button" data-am-action="close" aria-label="Close">×</button>
       </div>
       <div class="am-action-grid">
-        <button type="button" data-am-action="save"><span>＋</span><strong>${isAlreadySaved(job) ? 'Saved' : 'Save job'}</strong></button>
         <button type="button" data-am-action="match"><span>◎</span><strong>Match</strong></button>
         <button type="button" data-am-action="tailor"><span>✦</span><strong>Tailor resume</strong></button>
         <button type="button" data-am-action="sidebar"><span>☰</span><strong>Open Side Panel</strong></button>
-        <button type="button" data-am-action="open"><span>↗</span><strong>Open job</strong></button>
       </div>
       <span class="am-action-hint">Review the job before any application is submitted.</span>
     </div>
@@ -831,6 +897,15 @@ function openActionCard(card: Element, job: CardJob) {
 
   Object.assign(popup.style, { top: `${topAbs}px`, left: `${leftAbs}px` })
   document.body.appendChild(popup)
+
+  const closeOnOutsidePointer = (event: PointerEvent) => {
+    const target = event.target
+    if (target instanceof Node && !popup.contains(target) && !card.contains(target)) {
+      closeActionCard(popup)
+    }
+  }
+  document.addEventListener('pointerdown', closeOnOutsidePointer, true)
+  popupCleanup.set(popup, () => document.removeEventListener('pointerdown', closeOnOutsidePointer, true))
 
   popup.addEventListener('click', event => {
     const target = event.target instanceof Element
@@ -841,7 +916,7 @@ function openActionCard(card: Element, job: CardJob) {
     event.stopPropagation()
     const action = target.dataset.amAction
     if (action === 'close') {
-      popup.remove()
+      closeActionCard(popup)
       return
     }
     if (action) void runActionCardAction(action, card, job, popup, target)
@@ -849,18 +924,11 @@ function openActionCard(card: Element, job: CardJob) {
 }
 
 async function runActionCardAction(action: string, card: Element, job: CardJob, popup: HTMLElement, button: HTMLButtonElement) {
-  if (action === 'open') {
-    const url = safeExternalUrl(job.url)
-    if (url) window.open(url, '_blank', 'noopener,noreferrer')
-    popup.remove()
-    return
-  }
-
   button.disabled = true
   try {
     if (action === 'sidebar') {
       await chrome.runtime.sendMessage({ type: 'OPEN_SIDE_PANEL' })
-      popup.remove()
+      closeActionCard(popup)
       return
     }
 
@@ -869,16 +937,14 @@ async function runActionCardAction(action: string, card: Element, job: CardJob, 
     await chrome.runtime.sendMessage({ type: 'JOB_SCRAPED', job: fullJob })
     const response = await chrome.runtime.sendMessage({ type: 'SAVE_JOB', job: fullJob })
     if (!response?.success) throw new Error(response?.error ?? 'Could not save this job.')
-    markJobSaved(fullJob)
+    const cardButton = card.querySelector<HTMLButtonElement>(`.${BTN_CLASS}`)
+    markJobSaved(fullJob, cardButton ?? undefined, cardButton?.dataset.applymateCardKey)
 
     if (action === 'match' || action === 'tailor') {
       const tab = action === 'match' ? 'jobs' : 'resume'
       await chrome.runtime.sendMessage({ type: 'OPEN_SIDE_PANEL_TAB', tab })
       await chrome.runtime.sendMessage({ type: 'OPEN_SIDE_PANEL' })
-      popup.remove()
-    } else {
-      button.innerHTML = '<span>✓</span><strong>Saved</strong>'
-      button.disabled = true
+      closeActionCard(popup)
     }
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error)
@@ -889,6 +955,15 @@ async function runActionCardAction(action: string, card: Element, job: CardJob, 
 
 function getPopup(): HTMLElement | null {
   return document.getElementById(POPUP_ID)
+}
+
+const popupCleanup = new WeakMap<HTMLElement, () => void>()
+
+function closeActionCard(popup: HTMLElement | null) {
+  if (!popup) return
+  popupCleanup.get(popup)?.()
+  popupCleanup.delete(popup)
+  popup.remove()
 }
 
 // ── Inline error toast ────────────────────────────────────────────────────────
@@ -917,14 +992,6 @@ function showInlineError(card: HTMLElement, message: string) {
 
 function escHtml(s: string): string {
   return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;')
-}
-
-function safeExternalUrl(raw: string): string | null {
-  try {
-    const url = new URL(raw)
-    if ((url.protocol === 'http:' || url.protocol === 'https:') && !url.username && !url.password) return url.href
-  } catch { /* malformed scraped URL */ }
-  return null
 }
 
 async function fetchIndeedDetails(job: CardJob): Promise<ScrapedJob | null> {
@@ -1176,16 +1243,21 @@ export function startListModeInjector() {
 window.addEventListener('applymate:logout', () => {
   log('Logout event — clearing saved state')
   savedJobKeys.clear()
+  savedCardKeys.clear()
   document.querySelectorAll<HTMLButtonElement>(`.${BTN_CLASS}`).forEach(btn => {
-    btn.innerHTML = `<span>⊕</span>`
-    btn.style.background = ''
+    renderCardButtonState(btn, 'idle')
+    btn.disabled = false
   })
-  getPopup()?.remove()
+  closeActionCard(getPopup())
 })
 
 window.addEventListener('applymate:job-saved', (event) => {
-  const key = (event as CustomEvent<{ key?: unknown }>).detail?.key
-  if (typeof key === 'string') markSavedByKey(key)
+  const detail = (event as CustomEvent<{ key?: unknown; cardKey?: unknown }>).detail
+  if (typeof detail?.cardKey === 'string') {
+    markSavedByCardKey(detail.cardKey)
+  } else if (typeof detail?.key === 'string') {
+    markSavedByKey(detail.key)
+  }
 })
 
 window.addEventListener('applymate:login', () => {

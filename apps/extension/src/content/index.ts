@@ -90,6 +90,7 @@ let backgroundReady = false
 let lastPanelSignature = ''
 let lastSavedPanelSignature = ''
 let panelRefreshTimer: ReturnType<typeof setTimeout> | null = null
+const savedDetailJobKeys = new Set<string>()
 
 function publishJob(job: ScrapedJob) {
   const stamped = { ...job, detectedAt: Date.now() }
@@ -102,6 +103,7 @@ function renderVisibleDetailSaved() {
     `#${BUTTON_ID} button, #am-lazy-btn`,
   )
   if (!btn) return
+  btn.dataset.applymateSaved = 'true'
   btn.disabled = true
   delete btn.dataset.applymateBusy
   btn.innerHTML = '<span>✓ Saved to ApplyMate</span>'
@@ -113,6 +115,7 @@ function renderVisibleDetailSaved() {
 window.addEventListener('applymate:job-saved', (event) => {
   const key = (event as CustomEvent<{ key?: unknown }>).detail?.key
   if (!currentJob || typeof key !== 'string' || key !== getJobIdentity(currentJob)) return
+  savedDetailJobKeys.add(key)
   lastSavedPanelSignature = getPanelSignature()
   renderVisibleDetailSaved()
 })
@@ -785,12 +788,14 @@ syncStorageEvents?.addListener((changes, area) => {
   // User logged out
   if (oldToken && !newToken) {
     log('User logged out — resetting save buttons')
+    savedDetailJobKeys.clear()
     const saveBtn = document.getElementById(BUTTON_ID)
     if (saveBtn) {
-      saveBtn.innerHTML = `<span style="font-size:13px">⊕</span><span>Save to ApplyMate</span>`
-      ;(saveBtn as HTMLButtonElement).style.background = '#4F46E5'
-      ;(saveBtn as HTMLButtonElement).style.opacity = '1'
+      const button = saveBtn.querySelector<HTMLButtonElement>('button')
+      if (button) setSaveButtonIdle(button, 'inline')
     }
+    const lazySaveBtn = document.getElementById('am-lazy-btn') as HTMLButtonElement | null
+    if (lazySaveBtn) setSaveButtonIdle(lazySaveBtn, 'floating')
     window.dispatchEvent(new CustomEvent('applymate:logout'))
   }
 
@@ -852,6 +857,7 @@ function styleDetailContainer(el: HTMLElement, mode: 'inline' | 'floating') {
 }
 
 function setSaveButtonIdle(btn: HTMLButtonElement, mode: 'inline' | 'floating') {
+  delete btn.dataset.applymateSaved
   btn.innerHTML = `<span style="font-size:14px;line-height:1">⊕</span><span>Save to ApplyMate</span>`
   btn.style.setProperty('background', '#4F46E5', 'important')
   btn.style.setProperty('opacity', '1', 'important')
@@ -882,14 +888,18 @@ function injectLazySaveButton() {
   applySaveButtonStyle(btn, mode)
   log('🔵 Button styled, width:', btn.offsetWidth, 'height:', btn.offsetHeight, 'rect:', JSON.stringify(btn.getBoundingClientRect()))
   btn.addEventListener('mouseenter', () => {
+    if (btn.dataset.applymateSaved === 'true') return
     btn.style.setProperty('background', '#4338CA', 'important')
     btn.style.setProperty('padding-right', '18px', 'important')
   })
   btn.addEventListener('mouseleave', () => {
-    if (btn.dataset.applymateBusy === 'true') return
+    if (btn.dataset.applymateBusy === 'true' || btn.dataset.applymateSaved === 'true') return
     btn.style.setProperty('background', '#4F46E5', 'important')
     btn.style.setProperty('padding-right', mode === 'inline' ? '16px' : '14px', 'important')
   })
+  if (currentJob && savedDetailJobKeys.has(getJobIdentity(currentJob))) {
+    renderVisibleDetailSaved()
+  }
 
   btn.addEventListener('click', async (e) => {
     if (!e.isTrusted) return
@@ -981,12 +991,16 @@ function injectDetailButtons() {
   const mode = mountDetailButtonContainer(wrap)
   styleDetailContainer(wrap, mode)
   applySaveButtonStyle(saveBtn, mode)
+  if (savedDetailJobKeys.has(getJobIdentity(currentJob))) {
+    renderDetailButtonSaved(saveBtn)
+  }
   saveBtn.addEventListener('mouseenter', () => {
+    if (saveBtn.dataset.applymateSaved === 'true') return
     saveBtn.style.setProperty('background', '#4338CA', 'important')
     saveBtn.style.setProperty('padding-right', '18px', 'important')
   })
   saveBtn.addEventListener('mouseleave', () => {
-    if (saveBtn.dataset.applymateBusy === 'true') return
+    if (saveBtn.dataset.applymateBusy === 'true' || saveBtn.dataset.applymateSaved === 'true') return
     saveBtn.style.setProperty('background', '#4F46E5', 'important')
     saveBtn.style.setProperty('padding-right', mode === 'inline' ? '16px' : '14px', 'important')
   })
@@ -995,13 +1009,23 @@ function injectDetailButtons() {
     e.preventDefault(); e.stopPropagation()
     if (saveBtn.dataset.applymateBusy === 'true') return
     log('Detail Save button clicked')
-    saveDetailJob(saveBtn, wrap, mode)
+    saveDetailJob(saveBtn, mode)
   })
 
   log('Detail save button injected', mode)
 }
 
-async function saveDetailJob(btn: HTMLButtonElement, wrap: HTMLElement, mode: 'inline' | 'floating') {
+function renderDetailButtonSaved(btn: HTMLButtonElement) {
+  btn.dataset.applymateSaved = 'true'
+  btn.disabled = true
+  delete btn.dataset.applymateBusy
+  btn.innerHTML = '<span>✓ Saved to ApplyMate</span>'
+  btn.title = 'Saved to ApplyMate'
+  btn.style.setProperty('background', '#3B6D11', 'important')
+  btn.style.setProperty('opacity', '1', 'important')
+}
+
+async function saveDetailJob(btn: HTMLButtonElement, mode: 'inline' | 'floating') {
   const original = btn.innerHTML
   btn.dataset.applymateBusy = 'true'
   btn.disabled = true
@@ -1030,12 +1054,9 @@ async function saveDetailJob(btn: HTMLButtonElement, wrap: HTMLElement, mode: 'i
 
     if (response?.success) {
       markJobSaved(currentJob)
-      btn.innerHTML = '✓ Saved!'
-      btn.style.setProperty('background', '#3B6D11', 'important')
-      btn.style.setProperty('opacity', '1', 'important')
+      renderDetailButtonSaved(btn)
       showToast(`Saved: ${currentJob.title} @ ${currentJob.company}`)
       lastSavedPanelSignature = getPanelSignature()
-      setTimeout(() => wrap.remove(), 2500)
     } else {
       const msg = response?.error ?? 'Save failed'
       log('Save failed:', msg)
@@ -1068,7 +1089,7 @@ async function saveDetailJob(btn: HTMLButtonElement, wrap: HTMLElement, mode: 'i
   setTimeout(() => {
     // A successful save keeps the busy marker until the wrapper is removed.
     // Failed saves clear it above and become reusable after this short status.
-    if (!btn.isConnected || btn.dataset.applymateBusy === 'true') return
+    if (!btn.isConnected || btn.dataset.applymateBusy === 'true' || btn.dataset.applymateSaved === 'true') return
     btn.innerHTML = original
     btn.style.setProperty('background', '#4F46E5', 'important')
   }, 4000)
