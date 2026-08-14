@@ -3,6 +3,7 @@
 import { BarChart3, Check, Megaphone, Send, X } from 'lucide-react'
 import { useEffect, useState } from 'react'
 import { useAdminPrompt } from './AdminPromptDialog'
+import { adminMutationHeaders } from '@/lib/admin/client'
 
 type Broadcast = { id: string; title: string; body: string; audienceType: string; status: string; approvedById: string | null; scheduledAt: string | null; recipientCount: number; deliveredCount: number; failedCount: number; createdAt: string }
 type Template = { id: string; name: string; title: string; body: string }
@@ -35,7 +36,7 @@ export function AdminBroadcastsPage({ permissions }: { permissions: readonly str
   useEffect(() => { if (permissions.includes('broadcasts.create')) void fetch('/api/admin/v1/broadcasts/templates', { cache: 'no-store' }).then(response => response.json()).then(payload => setTemplates(payload.templates ?? [])).catch(() => undefined) }, [permissions])
 
   async function request(url: string, payload: Record<string, unknown>) {
-    const response = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json', 'Idempotency-Key': crypto.randomUUID() }, body: JSON.stringify(payload) })
+    const response = await fetch(url, { method: 'POST', headers: adminMutationHeaders(), body: JSON.stringify(payload) })
     const result = await response.json().catch(() => null) as { error?: string; recipientCount?: number } | null
     if (!response.ok) { setNotice(result?.error ?? 'Action failed.'); return null }
     return result

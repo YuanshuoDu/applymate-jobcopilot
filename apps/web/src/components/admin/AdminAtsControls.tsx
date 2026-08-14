@@ -4,6 +4,7 @@ import { Pause, Play, Save } from 'lucide-react'
 import { useEffect, useState } from 'react'
 import { toAtsPolicyPayload } from './admin-ats-policy-form'
 import { useAdminPrompt } from './AdminPromptDialog'
+import { adminMutationHeaders } from '@/lib/admin/client'
 
 type Policy = { configured: boolean; state: string; enabled: boolean; rolloutPercent: number; globalRpsLimit: number; perTenantRpsLimit: number; maxRetries: number; backoffBaseMs: number; allowAutoApply: boolean; version: number; lastAcknowledgedVersion: number | null }
 type Source = { sourceKey: string; policy: Policy; propagation: string; registryCount: number; lastSeenAt: string | null }
@@ -28,7 +29,7 @@ export function AdminAtsControls({ permissions }: { permissions: readonly string
   async function request(url: string, body: Record<string, unknown>) {
     const reason = await askReason({ title: 'Change ATS source state', label: 'Operational reason', kind: 'reason' })
     if (!reason) return false
-    const response = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json', 'Idempotency-Key': crypto.randomUUID() }, body: JSON.stringify({ ...body, reason }) })
+    const response = await fetch(url, { method: 'POST', headers: adminMutationHeaders(), body: JSON.stringify({ ...body, reason }) })
     const payload = await response.json().catch(() => null) as { error?: string; state?: string } | null
     setNotice(response.ok ? `Source state: ${payload?.state ?? 'updated'}.` : payload?.error ?? 'Source operation failed.')
     return response.ok
@@ -37,7 +38,7 @@ export function AdminAtsControls({ permissions }: { permissions: readonly string
     const reason = await askReason({ title: 'Save ATS source policy', label: 'Policy change reason', kind: 'reason' })
     if (!reason) return
     const policy = source.policy
-    const response = await fetch(`/api/admin/v1/ats/${source.sourceKey}/policy`, { method: 'PATCH', headers: { 'Content-Type': 'application/json', 'Idempotency-Key': crypto.randomUUID() }, body: JSON.stringify({ ...toAtsPolicyPayload(policy), reason }) })
+    const response = await fetch(`/api/admin/v1/ats/${source.sourceKey}/policy`, { method: 'PATCH', headers: adminMutationHeaders(), body: JSON.stringify({ ...toAtsPolicyPayload(policy), reason }) })
     const payload = await response.json().catch(() => null) as { error?: string; propagation?: string } | null
     setNotice(response.ok ? `Policy saved; Worker propagation ${payload?.propagation ?? 'pending'}.` : payload?.error ?? 'Policy save failed.')
     if (response.ok) await load()
@@ -53,7 +54,7 @@ export function AdminAtsControls({ permissions }: { permissions: readonly string
     if (!reason) return
     const url = registryId ? `/api/admin/v1/ats/registry/${registryId}` : '/api/admin/v1/ats/registry'
     const body = registryId ? { name: registry.name, reason } : { ...registry, reason }
-    const response = await fetch(url, { method: registryId ? 'PATCH' : 'POST', headers: { 'Content-Type': 'application/json', 'Idempotency-Key': crypto.randomUUID() }, body: JSON.stringify(body) })
+    const response = await fetch(url, { method: registryId ? 'PATCH' : 'POST', headers: adminMutationHeaders(), body: JSON.stringify(body) })
     const payload = await response.json().catch(() => null) as { error?: string } | null
     setNotice(response.ok ? 'ATS employer registry saved.' : payload?.error ?? 'Unable to save ATS employer registry entry.')
     if (response.ok) { setRegistryId(''); setRegistry({ atsType: 'greenhouse', slug: '', name: '' }) }

@@ -3,6 +3,7 @@
 import { Pause, Play, RefreshCw, ServerCog } from 'lucide-react'
 import { useEffect, useState } from 'react'
 import { useAdminPrompt } from './AdminPromptDialog'
+import { adminMutationHeaders } from '@/lib/admin/client'
 
 type Queue = { name: string; counts: Record<string, number>; paused: boolean; stuckActiveCount?: number }
 type FailedJob = { id?: string; name?: string; sourceQueue?: string; sourceJobId?: string; failedReason?: string; attemptsMade?: number; failedAt?: number; finishedOn?: number }
@@ -37,7 +38,7 @@ export function AdminQueuesPage({ permissions }: { permissions: readonly string[
     if (!job.id) return
     const reason = await request({ title: `Retry ${job.id}`, label: 'Operational reason', kind: 'reason' })
     if (!reason) return
-    const response = await fetch(`/api/admin/v1/queues/${queue}/retry`, { method: 'POST', headers: { 'Content-Type': 'application/json', 'Idempotency-Key': crypto.randomUUID() }, body: JSON.stringify({ jobId: job.id, reason }) })
+    const response = await fetch(`/api/admin/v1/queues/${queue}/retry`, { method: 'POST', headers: adminMutationHeaders(), body: JSON.stringify({ jobId: job.id, reason }) })
     const result = await response.json().catch(() => null) as { error?: string } | null
     setNotice(response.ok ? `${job.id} retry request accepted.` : result?.error ?? 'Retry failed.')
     if (response.ok) await loadFailed(queue)
@@ -45,7 +46,7 @@ export function AdminQueuesPage({ permissions }: { permissions: readonly string[
   async function change(queue: Queue, action: 'pause' | 'resume') {
     const reason = await request({ title: `${action === 'pause' ? 'Pause' : 'Resume'} ${queue.name}`, label: 'Operational reason', kind: 'reason' })
     if (!reason) return
-    const response = await fetch(`/api/admin/v1/queues/${queue.name}/${action}`, { method: 'POST', headers: { 'Content-Type': 'application/json', 'Idempotency-Key': crypto.randomUUID() }, body: JSON.stringify({ reason }) })
+    const response = await fetch(`/api/admin/v1/queues/${queue.name}/${action}`, { method: 'POST', headers: adminMutationHeaders(), body: JSON.stringify({ reason }) })
     const result = await response.json().catch(() => null) as { error?: string } | null
     setNotice(response.ok ? `${queue.name} ${action} request accepted.` : result?.error ?? 'Queue action failed.')
     if (response.ok) await load()
@@ -54,7 +55,7 @@ export function AdminQueuesPage({ permissions }: { permissions: readonly string[
     const reason = await request({ title: `${action === 'pause' ? 'Pause' : 'Resume'} Worker`, label: 'Operational reason', kind: 'reason', description: 'This changes processing for all Worker queues. Active tasks may finish; new tasks wait until resumed.' })
     if (!reason) return
     setWorkerBusy(true)
-    const response = await fetch('/api/admin/v1/queues', { method: 'POST', headers: { 'Content-Type': 'application/json', 'Idempotency-Key': crypto.randomUUID() }, body: JSON.stringify({ action, reason }) })
+    const response = await fetch('/api/admin/v1/queues', { method: 'POST', headers: adminMutationHeaders(), body: JSON.stringify({ action, reason }) })
     const result = await response.json().catch(() => null) as { error?: string } | null
     setNotice(response.ok ? `Worker ${action} request accepted.` : result?.error ?? 'Worker action failed.')
     setWorkerBusy(false)

@@ -3,6 +3,7 @@
 import { Check, Flag, RotateCcw, Send } from 'lucide-react'
 import { useEffect, useState } from 'react'
 import { MANAGED_FEATURES, type ManagedFeatureKey } from '@jobcopilot/shared/feature-flags'
+import { adminMutationHeaders } from '@/lib/admin/client'
 
 type FlagRow = { id: string; key: string; environment: string; enabled: boolean; rolloutPercent: number; targetPlans: string[]; targetUserIds: string[]; status: string; version: number; approvedById: string | null; rollbackAt: string | null; updatedAt: string }
 const featureKeys = Object.keys(MANAGED_FEATURES) as ManagedFeatureKey[]
@@ -27,7 +28,7 @@ export function AdminPlatformPage({ permissions }: { permissions: readonly strin
   }
   useEffect(() => { void load() }, [])
   async function request(url: string, payload: Record<string, unknown>) {
-    const response = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json', 'Idempotency-Key': crypto.randomUUID() }, body: JSON.stringify(payload) })
+    const response = await fetch(url, { method: 'POST', headers: adminMutationHeaders(), body: JSON.stringify(payload) })
     const result = await response.json().catch(() => null) as { error?: string } | null
     if (!response.ok) { setNotice(result?.error ?? 'Action failed.'); return false }
     return true

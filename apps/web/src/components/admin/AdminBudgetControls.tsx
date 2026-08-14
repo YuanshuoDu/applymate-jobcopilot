@@ -3,6 +3,7 @@
 import { Save } from 'lucide-react'
 import { useState } from 'react'
 import { useAdminPrompt } from './AdminPromptDialog'
+import { adminMutationHeaders } from '@/lib/admin/client'
 
 export function AdminBudgetControls({ canUpdate }: { canUpdate: boolean }) {
   const [userId, setUserId] = useState('')
@@ -15,7 +16,7 @@ export function AdminBudgetControls({ canUpdate }: { canUpdate: boolean }) {
     event.preventDefault()
     const reason = await request({ title: 'Override AI budget', label: 'Budget override reason', kind: 'reason' })
     if (!reason) return
-    const response = await fetch(`/api/admin/v1/ai/budgets/${encodeURIComponent(userId)}/${month}`, { method: 'PATCH', headers: { 'Content-Type': 'application/json', 'Idempotency-Key': crypto.randomUUID() }, body: JSON.stringify({ limit, version, reason, confirmBelowUsed: true }) })
+    const response = await fetch(`/api/admin/v1/ai/budgets/${encodeURIComponent(userId)}/${month}`, { method: 'PATCH', headers: adminMutationHeaders(), body: JSON.stringify({ limit, version, reason, confirmBelowUsed: true }) })
     const payload = await response.json().catch(() => null) as { error?: string; version?: number } | null
     if (!response.ok) { setNotice(payload?.error ?? 'Budget override failed.'); return }
     setVersion(payload?.version ?? version + 1)
