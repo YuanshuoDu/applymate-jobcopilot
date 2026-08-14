@@ -3,7 +3,7 @@
  * Handles: message routing, API calls, badge updates, side panel
  */
 import { clearAccountLocalState, getAccountStorageKey, getSettings, setCurrentJob, setBadge, clearBadge } from '@/lib/storage'
-import { login, saveJob, getRecentJobs, getStats, updateJob } from '@/lib/api'
+import { login, saveJob, getRecentJobs, getStats, updateJob, scoreSavedJob } from '@/lib/api'
 import { getJobIdentity } from '@/lib/job-identity'
 import type { DashboardStats, ExtMessage, ExtensionSettings, SavedJob, ScrapedJob } from '@/lib/types'
 import { isApplyMateDashboardUrl, isAuthFailure } from '@/lib/auth-recovery'
@@ -156,6 +156,23 @@ async function saveJobWithAuthRecovery(settings: ExtensionSettings, job: Scraped
     const refreshed = await refreshBackgroundSettingsFromDashboard()
     if (!refreshed?.apiToken) throw error
     return saveJob(refreshed, job)
+  }
+}
+
+async function scoreSavedJobWithAuthRecovery(settings: ExtensionSettings, job: SavedJob): Promise<SavedJob> {
+  let activeSettings = settings
+  if (!activeSettings.apiToken) {
+    activeSettings = await refreshBackgroundSettingsFromDashboard() ?? activeSettings
+  }
+  if (!activeSettings.apiToken) throw new Error('Not logged in — open the ApplyMate dashboard or extension popup to log in first')
+
+  try {
+    return await scoreSavedJob(activeSettings, job)
+  } catch (error) {
+    if (!isAuthFailure(error)) throw error
+    const refreshed = await refreshBackgroundSettingsFromDashboard()
+    if (!refreshed?.apiToken) throw error
+    return scoreSavedJob(refreshed, job)
   }
 }
 
@@ -321,6 +338,24 @@ async function handleMessage(
         }
       }
       return { ok: true }
+    }
+
+    case 'JOB_MATCHED': {
+      // Match scores are already persisted by the caller through the shared
+      // API client. Broadcast the canonical record so Popup and Side Panel
+      // refresh their views without maintaining separate match caches.
+      chrome.runtime.sendMessage({ type: 'JOB_MATCHED', job: msg.job }).catch(() => {})
+      return { ok: true }
+    }
+
+    case 'MATCH_JOB': {
+      try {
+        const updatedJob = await scoreSavedJobWithAuthRecovery(settings, msg.job)
+        chrome.runtime.sendMessage({ type: 'JOB_MATCHED', job: updatedJob }).catch(() => {})
+        return { type: 'MATCH_JOB_RESULT', success: true, job: updatedJob }
+      } catch (error) {
+        return { type: 'MATCH_JOB_RESULT', success: false, error: error instanceof Error ? error.message : String(error) }
+      }
     }
 
     case 'SAVE_JOB': {

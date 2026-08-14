@@ -24,15 +24,12 @@ import {
   Target,
   X,
 } from 'lucide-react'
-import { getCurrentJob, getCurrentResumeId } from '@/lib/storage'
+import { getCurrentJob } from '@/lib/storage'
 import { getJobIdentity } from '@/lib/job-identity'
 import {
   getDashboard,
-  getResume,
-  listResumes,
-  scoreResume,
+  scoreSavedJob,
   updateJobNotes,
-  updateJobScore,
 } from '@/lib/api'
 import { getSettings, isLoggedIn } from '@/lib/storage'
 import { FormFillerView } from './FormFillerView'
@@ -446,7 +443,7 @@ function TrackerPanel({ settings, L, onOpenResume }: { settings: ExtensionSettin
     setLastDashboardSyncedAt(null)
     refreshAll(true)
     const handler = (message: { type?: string }) => {
-      if (message.type === 'JOB_SCRAPED' || message.type === 'JOB_SAVED') {
+      if (message.type === 'JOB_SCRAPED' || message.type === 'JOB_SAVED' || message.type === 'JOB_MATCHED') {
         refreshAll()
       }
     }
@@ -504,20 +501,12 @@ function TrackerPanel({ settings, L, onOpenResume }: { settings: ExtensionSettin
     if (scoringId) return
     setScoringId(job.id)
     try {
-      const resumes = await listResumes(settings)
-      const currentId = await getCurrentResumeId(settings.userEmail)
-      const resumeId = currentId && resumes.some(resume => resume.id === currentId) ? currentId : resumes[0]?.id
-      if (!resumeId) {
-        showToast('Add a resume before scoring a job')
-        onOpenResume()
-        return
-      }
-      const resume = await getResume(settings, resumeId)
-      const result = await scoreResume(settings, { resumeContent: resume.content, jobTitle: job.role, jobCompany: job.company, jobDescription: job.description ?? '' })
-      const updated = await updateJobScore(settings, job.id, result.score, result.keywords ?? '')
-      setJobs(previous => previous.map(item => item.id === job.id ? { ...item, ...updated, score: result.score } : item))
-      showToast(`${job.score == null ? 'Match score ready' : 'Match score updated'} · ${result.score}%`)
+      const updated = await scoreSavedJob(settings, job)
+      setJobs(previous => previous.map(item => item.id === job.id ? { ...item, ...updated, score: updated.score } : item))
+      void chrome.runtime.sendMessage({ type: 'JOB_MATCHED', job: updated })
+      showToast(`${job.score == null ? 'Match score ready' : 'Match score updated'} · ${updated.score}%`)
     } catch (error) {
+      if (/add a resume/i.test(error instanceof Error ? error.message : String(error))) onOpenResume()
       showToast(error instanceof Error ? error.message : 'Scoring failed')
     } finally {
       setScoringId(null)

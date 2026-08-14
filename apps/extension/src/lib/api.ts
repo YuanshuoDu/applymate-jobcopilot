@@ -4,7 +4,7 @@
  */
 import type { ScrapedJob, SavedJob, DashboardStats, ExtensionSettings, ResumeListItem, Resume, ScoreResult, Suggestion } from './types'
 import type { FormFillRequest, FormFillResponse, FormReviseRequest } from './form-filler/types'
-import { getSettings } from './storage'
+import { getCurrentResumeId, getSettings } from './storage'
 
 export class ApiError extends Error {
   constructor(public status: number, message: string) {
@@ -349,6 +349,25 @@ export async function scoreResume(settings: ExtensionSettings, body: {
     _timeoutMs: AI_TIMEOUT,
     _retry: false,
   })
+}
+
+/** Score one persisted job against the user's selected resume and persist the result. */
+export async function scoreSavedJob(settings: ExtensionSettings, job: SavedJob): Promise<SavedJob> {
+  const resumes = await listResumes(settings)
+  const currentResumeId = await getCurrentResumeId(settings.userEmail)
+  const resumeId = currentResumeId && resumes.some(resume => resume.id === currentResumeId)
+    ? currentResumeId
+    : resumes[0]?.id
+  if (!resumeId) throw new Error('Add a resume before matching this job')
+
+  const resume = await getResume(settings, resumeId)
+  const result = await scoreResume(settings, {
+    resumeContent: resume.content,
+    jobTitle: job.role,
+    jobCompany: job.company,
+    jobDescription: job.description ?? '',
+  })
+  return updateJobScore(settings, job.id, result.score, result.keywords ?? result.matchedKeywords.join(', '))
 }
 
 export async function suggestResume(settings: ExtensionSettings, body: {

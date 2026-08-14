@@ -163,6 +163,7 @@ export type ExtMessage =
   | { type: 'CURRENT_JOB_RESULT'; job: ScrapedJob | null }
   | { type: 'SAVE_JOB'; job: ScrapedJob }
   | { type: 'SAVE_JOB_RESULT'; success: boolean; savedJob?: SavedJob; error?: string }
+  | { type: 'MATCH_JOB'; job: SavedJob }
   | { type: 'GET_STATS' }
   | { type: 'STATS_RESULT'; stats: DashboardStats }
   | { type: 'GET_RECENT_JOBS' }
@@ -170,6 +171,7 @@ export type ExtMessage =
   | { type: 'OPEN_SIDE_PANEL' }
   | { type: 'OPEN_SIDE_PANEL_TAB'; tab: 'jobs' | 'resume' }
   | { type: 'JOB_SAVED'; savedJob: SavedJob }
+  | { type: 'JOB_MATCHED'; job: SavedJob }
   | { type: 'JOB_SCRAPED'; job: ScrapedJob }   // content → background when job detected
   | { type: 'ENRICH_JOB'; job: ScrapedJob }    // content → background: auto-patch saved job with description
   | { type: 'FETCH_DASHBOARD_TOKEN' }

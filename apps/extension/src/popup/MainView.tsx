@@ -1,7 +1,6 @@
 import { useEffect, useMemo, useState } from 'react'
 import { BarChart3, Bookmark, ChevronRight, ExternalLink, Folder, LoaderCircle, Sparkles } from 'lucide-react'
-import { getResume, listResumes, scoreResume, updateJobScore } from '@/lib/api'
-import { getCurrentResumeId } from '@/lib/storage'
+import { scoreSavedJob } from '@/lib/api'
 import type { ExtensionSettings, SavedJob, ScoreResult, ScrapedJob } from '@/lib/types'
 import { C } from './popup-constants'
 import { ActionRow, countPill, Divider, EmptyJob, footerLink, InlineMessage, primaryAction } from './PopupActions'
@@ -58,7 +57,7 @@ export function PopupMainView({ settings, onSettings, onLogout }: {
 
     const onJobDetected = (messageEvent: { type: string; job?: ScrapedJob; savedJob?: SavedJob }) => {
       if (messageEvent.type === 'JOB_SCRAPED' && isScrapedJob(messageEvent.job)) setCurrentJob(messageEvent.job)
-      if (messageEvent.type === 'JOB_SAVED' && isSavedJob(messageEvent.savedJob)) void refreshSavedData()
+      if ((messageEvent.type === 'JOB_SAVED' && isSavedJob(messageEvent.savedJob)) || messageEvent.type === 'JOB_MATCHED') void refreshSavedData()
     }
     chrome.runtime.onMessage.addListener(onJobDetected)
     // A web Dashboard save happens in another tab and cannot emit an extension
@@ -96,18 +95,19 @@ export function PopupMainView({ settings, onSettings, onLogout }: {
     setAnalyzing(true)
     setMessage('')
     try {
-      const resumeList = await listResumes(settings)
-      const currentResumeId = await getCurrentResumeId(settings.userEmail)
-      const resumeId = currentResumeId && resumeList.some(resume => resume.id === currentResumeId) ? currentResumeId : resumeList[0]?.id
-      if (!resumeId) throw new Error(labels.noResume)
-      const resume = await getResume(settings, resumeId)
-      const result = await scoreResume(settings, { resumeContent: resume.content, jobTitle: currentJob.title, jobCompany: currentJob.company, jobDescription: currentJob.description })
-      setScore(result)
-      const matchingSavedJob = savedJobs.find(job => sameJob(currentJob, job))
-      if (matchingSavedJob) {
-        const updatedJob = await updateJobScore(settings, matchingSavedJob.id, result.score, result.keywords ?? result.matchedKeywords.join(', '))
-        setSavedJobs(previous => previous.map(job => job.id === matchingSavedJob.id ? { ...job, ...updatedJob, score: result.score } : job))
+      let matchingSavedJob = savedJobs.find(job => sameJob(currentJob, job))
+      if (!matchingSavedJob) {
+        const saveResponse = await chrome.runtime.sendMessage({ type: 'SAVE_JOB', job: currentJob }).catch(() => null)
+        if (!isSaveResponse(saveResponse) || !saveResponse.success || !saveResponse.savedJob) {
+          throw new Error(saveResponse?.error ?? 'Save this job before matching it')
+        }
+        matchingSavedJob = saveResponse.savedJob
+        setSavedJobs(previous => [matchingSavedJob!, ...previous.filter(job => job.id !== matchingSavedJob!.id)])
       }
+      const updatedJob = await scoreSavedJob(settings, matchingSavedJob)
+      setScore(null)
+      setSavedJobs(previous => previous.map(job => job.id === matchingSavedJob.id ? { ...job, ...updatedJob, score: updatedJob.score } : job))
+      void chrome.runtime.sendMessage({ type: 'JOB_MATCHED', job: updatedJob })
       setMessage('analyzed')
     } catch (error) {
       setMessage(error instanceof Error ? error.message : labels.analyzeError)

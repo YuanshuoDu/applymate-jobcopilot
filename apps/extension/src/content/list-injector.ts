@@ -1036,6 +1036,7 @@ function openActionCard(card: Element, job: CardJob) {
 
 async function runActionCardAction(action: string, card: Element, job: CardJob, popup: HTMLElement, button: HTMLButtonElement) {
   button.disabled = true
+  const originalButtonContent = button.innerHTML
   try {
     if (action === 'sidebar') {
       await chrome.runtime.sendMessage({ type: 'OPEN_SIDE_PANEL' })
@@ -1051,15 +1052,27 @@ async function runActionCardAction(action: string, card: Element, job: CardJob, 
     const cardButton = card.querySelector<HTMLButtonElement>(`.${BTN_CLASS}`)
     markJobSaved(fullJob, cardButton ?? undefined, cardButton?.dataset.applymateCardKey)
 
-    if (action === 'match' || action === 'tailor') {
-      const tab = action === 'match' ? 'jobs' : 'resume'
-      await chrome.runtime.sendMessage({ type: 'OPEN_SIDE_PANEL_TAB', tab })
+    if (action === 'match') {
+      const savedJob = response.savedJob as SavedJob | undefined
+      if (!savedJob?.id) throw new Error('The job was saved, but its record could not be loaded for matching.')
+      button.innerHTML = '<span>◎</span><strong>Matching…</strong>'
+      const matchResponse = await chrome.runtime.sendMessage({ type: 'MATCH_JOB', job: savedJob }) as { success?: boolean; job?: SavedJob; error?: string } | undefined
+      if (!matchResponse?.success || !matchResponse.job) throw new Error(matchResponse?.error ?? 'Matching failed.')
+      const updatedJob = matchResponse.job
+      button.innerHTML = `<span>✓</span><strong>Matched ${updatedJob.score ?? 0}%</strong>`
+      button.disabled = false
+      return
+    }
+
+    if (action === 'tailor') {
+      await chrome.runtime.sendMessage({ type: 'OPEN_SIDE_PANEL_TAB', tab: 'resume' })
       await chrome.runtime.sendMessage({ type: 'OPEN_SIDE_PANEL' })
       closeActionCard(popup)
     }
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error)
     showInlineError(card as HTMLElement, message)
+    button.innerHTML = originalButtonContent
     button.disabled = false
   }
 }
