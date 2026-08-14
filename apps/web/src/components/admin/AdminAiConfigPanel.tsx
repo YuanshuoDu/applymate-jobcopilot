@@ -2,6 +2,7 @@
 
 import { useEffect, useMemo, useState } from 'react'
 import { fetchWithTimeout } from '@/lib/hooks'
+import { adminMutationHeaders } from '@/lib/admin/client'
 
 type Model = { id: string; model: string; label: string; tier: string; priceIn: number; priceOut: number; active: boolean }
 type Provider = { id: string; key: string; displayName: string; apiBase: string; enabled: boolean; credentialConfigured: boolean; models: Model[] }
@@ -33,13 +34,13 @@ export function AdminAiConfigPanel({ canUpdate }: { canUpdate: boolean }) {
   const providerMap = useMemo(() => new Map((config?.providers ?? []).map(provider => [provider.key, provider])), [config?.providers])
   function updateRoute(featureKey: string, patch: Partial<Route>) { setConfig(current => current ? { ...current, routes: current.routes.map(route => route.featureKey === featureKey ? { ...route, ...patch } : route) } : current) }
   async function saveRoute(route: Route) {
-    const response = await fetch('/api/admin/v1/ai/config', { method: 'PATCH', headers: { 'Content-Type': 'application/json', 'Idempotency-Key': crypto.randomUUID() }, body: JSON.stringify({ type: 'route', ...route, reason: 'Updating reviewed platform AI routing policy' }) })
+    const response = await fetch('/api/admin/v1/ai/config', { method: 'PATCH', headers: adminMutationHeaders(), body: JSON.stringify({ type: 'route', ...route, reason: 'Updating reviewed platform AI routing policy' }) })
     const payload = await response.json().catch(() => null) as { config?: Config; error?: string } | null
     if (!response.ok) setNotice(payload?.error ?? 'Unable to save AI route.'); else { setConfig(payload?.config ?? null); setNotice(`${route.featureKey} route saved.`) }
   }
   async function testProvider(provider: Provider) {
     setTesting(provider.id)
-    const response = await fetch(`/api/admin/v1/ai/providers/${provider.id}/test`, { method: 'POST', headers: { 'Idempotency-Key': crypto.randomUUID() } })
+    const response = await fetch(`/api/admin/v1/ai/providers/${provider.id}/test`, { method: 'POST', headers: adminMutationHeaders({ json: false }) })
     const payload = await response.json().catch(() => null) as { status?: string; latencyMs?: number; error?: string } | null
     setTesting(null)
     setNotice(response.ok ? `${provider.displayName}: ${payload?.status ?? 'unknown'}${payload?.latencyMs ? ` · ${payload.latencyMs}ms` : ''}` : payload?.error ?? 'Provider test failed.')

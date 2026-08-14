@@ -4,6 +4,7 @@ import { startAuthentication, startRegistration } from '@simplewebauthn/browser'
 import { Check, KeyRound, ShieldAlert } from 'lucide-react'
 import { useCallback, useEffect, useState } from 'react'
 import { useAdminPrompt } from './AdminPromptDialog'
+import { adminMutationHeaders } from '@/lib/admin/client'
 
 type Grant = { id: string; requesterId: string; approverId: string | null; permission: string; expiresAt: string; createdAt: string }
 type SecurityAction = 'request' | 'approve' | null
@@ -11,7 +12,7 @@ type WebAuthnStatus = { mfaLevel: 'none' | 'webauthn'; credentials: Array<{ id: 
 const permissions = ['queues.pause', 'ats.pause', 'ai_budget.reset', 'feature_flags.approve', 'broadcasts.publish']
 
 function requestHeaders() {
-  return { 'Content-Type': 'application/json', 'Idempotency-Key': crypto.randomUUID() }
+  return adminMutationHeaders()
 }
 
 export function AdminSecurityPage({ canApprove }: { canApprove: boolean }) {

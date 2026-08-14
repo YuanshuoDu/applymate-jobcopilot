@@ -2,6 +2,7 @@
 
 import { AlertTriangle, CalendarDays, Filter, LockKeyhole, MoreVertical, Send, ShieldCheck } from 'lucide-react'
 import { useEffect, useMemo, useState } from 'react'
+import { adminMutationHeaders } from '@/lib/admin/client'
 
 type Message = { id: string; authorType: 'customer_reply' | 'staff_reply' | 'internal_note' | 'system_event'; body: string; redacted: boolean; createdAt: string }
 type Case = { id: string; subject: string; category: string; status: string; priority: string; assignedAdminId: string | null; slaDueAt: string | null; version: number; createdAt: string; requester: { id: string; name: string | null; email: string; plan: string; location: string | null; jobsCount: number; resumeExists: boolean; gmail: { connected: boolean; lastSyncedAt: string | null; hasError: boolean } }; messages: Message[] }
@@ -78,7 +79,7 @@ export function ContactUsPage({ actorId, permissions }: { actorId: string; permi
     if (!selected || !body.trim()) return
     setSending(true)
     const endpoint = `/api/admin/v1/support/cases/${selected.id}/${mode === 'reply' ? 'reply' : 'notes'}`
-    const response = await fetch(endpoint, { method: 'POST', headers: { 'Content-Type': 'application/json', 'Idempotency-Key': crypto.randomUUID() }, body: JSON.stringify({ body, reason: mode === 'reply' ? 'Responding to customer support case' : 'Recording support case investigation note' }) })
+    const response = await fetch(endpoint, { method: 'POST', headers: adminMutationHeaders(), body: JSON.stringify({ body, reason: mode === 'reply' ? 'Responding to customer support case' : 'Recording support case investigation note' }) })
     if (!response.ok) setError('Unable to save this message.')
     else { setBody(''); await loadCases() }
     setSending(false)
@@ -89,7 +90,7 @@ export function ContactUsPage({ actorId, permissions }: { actorId: string; permi
     setSending(true)
     const response = await fetch(`/api/admin/v1/support/cases/${selected.id}`, {
       method: 'PATCH',
-      headers: { 'Content-Type': 'application/json', 'Idempotency-Key': crypto.randomUUID() },
+      headers: adminMutationHeaders(),
       body: JSON.stringify({ ...changes, version: selected.version, reason }),
     })
     const payload = await response.json().catch(() => null) as { error?: string } | null
@@ -101,7 +102,7 @@ export function ContactUsPage({ actorId, permissions }: { actorId: string; permi
   async function escalate() {
     if (!selected || escalationReason.trim().length < 10) return
     setSending(true)
-    const response = await fetch(`/api/admin/v1/support/cases/${selected.id}/escalate`, { method: 'POST', headers: { 'Content-Type': 'application/json', 'Idempotency-Key': crypto.randomUUID() }, body: JSON.stringify({ service: escalationService, reason: escalationReason.trim() }) })
+    const response = await fetch(`/api/admin/v1/support/cases/${selected.id}/escalate`, { method: 'POST', headers: adminMutationHeaders(), body: JSON.stringify({ service: escalationService, reason: escalationReason.trim() }) })
     const payload = await response.json().catch(() => null) as { error?: string } | null
     if (!response.ok) setError(payload?.error ?? 'Unable to escalate this case.')
     else { setError('Case escalated to an incident.'); setEscalationOpen(false); setEscalationReason(''); await loadCases() }

@@ -2,6 +2,7 @@
 
 import React, { useEffect, useState } from 'react'
 import { useAdminPrompt } from './AdminPromptDialog'
+import { adminMutationHeaders } from '@/lib/admin/client'
 
 type ApiKeyStatus = {
   id: string
@@ -32,7 +33,7 @@ export function AdminUserApiKeysPanel({ userId, canRevoke }: { userId: string; c
     const reason = await request({ title: 'Revoke user API keys', label: 'Audit reason', kind: 'reason', description: 'This permanently removes the user-managed provider credentials from ApplyMate.' })
     if (!reason) return
     setBusy(true)
-    const response = await fetch(`/api/admin/v1/users/${userId}/api-keys`, { method: 'DELETE', headers: { 'x-admin-reason': reason, 'Idempotency-Key': crypto.randomUUID() } })
+    const response = await fetch(`/api/admin/v1/users/${userId}/api-keys`, { method: 'DELETE', headers: { ...adminMutationHeaders({ json: false }), 'x-admin-reason': reason } })
     const payload = await response.json().catch(() => null) as { error?: string; revoked?: boolean } | null
     setNotice(response.ok ? (payload?.revoked ? 'User API keys revoked.' : 'No user API keys were present.') : payload?.error ?? 'Unable to revoke user API keys.')
     if (response.ok) await load()

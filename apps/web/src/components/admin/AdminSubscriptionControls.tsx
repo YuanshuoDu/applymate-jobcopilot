@@ -3,6 +3,7 @@
 import React, { useEffect, useState } from 'react'
 import { Card, Btn } from '@/components/ui'
 import { fetchWithTimeout } from '@/lib/hooks'
+import { adminMutationHeaders } from '@/lib/admin/client'
 
 type Subscription = { id: string; userId: string; plan: string; status: string; trialEndsAt: string | null; currentPeriodEnd: string | null; cancelAtPeriodEnd: boolean; version: number; user: { name: string | null; email: string; plan: string } }
 
@@ -29,7 +30,7 @@ export function AdminSubscriptionControls({ canUpdate }: { canUpdate: boolean })
   async function save(event: React.FormEvent) {
     event.preventDefault()
     if (!userId.trim()) return
-    const response = await fetch('/api/admin/v1/plans/subscriptions', { method: 'PATCH', headers: { 'Content-Type': 'application/json', 'Idempotency-Key': crypto.randomUUID() }, body: JSON.stringify({ userId: userId.trim(), plan, status, trialEndsAt: status === 'trialing' ? new Date(trialEndsAt).toISOString() : null, reason: 'Updating a customer subscription after a reviewed billing decision' }) })
+    const response = await fetch('/api/admin/v1/plans/subscriptions', { method: 'PATCH', headers: adminMutationHeaders(), body: JSON.stringify({ userId: userId.trim(), plan, status, trialEndsAt: status === 'trialing' ? new Date(trialEndsAt).toISOString() : null, reason: 'Updating a customer subscription after a reviewed billing decision' }) })
     const payload = await response.json().catch(() => null) as { error?: string } | null
     setNotice(response.ok ? 'Subscription updated.' : payload?.error ?? 'Unable to update subscription.')
     if (response.ok) { setUserId(''); setTrialEndsAt(''); await load() }

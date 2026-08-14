@@ -7,6 +7,7 @@ import { AdminBudgetControls } from './AdminBudgetControls'
 import { AdminAiConfigPanel } from './AdminAiConfigPanel'
 import { AdminAiUsageTrends } from './AdminAiUsageTrends'
 import { useAdminPrompt } from './AdminPromptDialog'
+import { adminMutationHeaders } from '@/lib/admin/client'
 import Link from 'next/link'
 
 function ApplicationActions({ row, permissions }: { row: Record<string, unknown>; permissions: readonly string[] }) {
@@ -16,7 +17,7 @@ function ApplicationActions({ row, permissions }: { row: Record<string, unknown>
   async function act(action: 'retry' | 'cancel' | 'manual_review') {
     const reason = await request({ title: 'Confirm application action', label: 'Operational reason', kind: 'reason', description: 'This reason will be written to the administrator audit log.', submitLabel: 'Continue' })
     if (!reason) return
-    const response = await fetch(`/api/admin/v1/applications/${taskId}/action`, { method: 'POST', headers: { 'Content-Type': 'application/json', 'Idempotency-Key': crypto.randomUUID() }, body: JSON.stringify({ action, reason }) })
+    const response = await fetch(`/api/admin/v1/applications/${taskId}/action`, { method: 'POST', headers: adminMutationHeaders(), body: JSON.stringify({ action, reason }) })
     if (response.ok) window.location.reload()
   }
   const status = String(row.taskStatus ?? '')
@@ -28,7 +29,7 @@ export function AdminUsersPage({ canExport = false, permissions = [] }: { canExp
   async function runBulk(action: 'suspend' | 'restore', ids: string[]) {
     const reason = await request({ title: `${action === 'suspend' ? 'Suspend' : 'Restore'} selected accounts`, label: 'Operational reason', kind: 'reason', submitLabel: 'Continue' })
     if (!reason) return
-    const response = await fetch('/api/admin/v1/bulk', { method: 'POST', headers: { 'Content-Type': 'application/json', 'Idempotency-Key': crypto.randomUUID() }, body: JSON.stringify({ resource: 'users', action, ids, reason }) })
+    const response = await fetch('/api/admin/v1/bulk', { method: 'POST', headers: adminMutationHeaders(), body: JSON.stringify({ resource: 'users', action, ids, reason }) })
     if (response.ok) window.location.reload()
   }
   const bulkActions: BulkAction[] = [
@@ -53,7 +54,7 @@ export function AdminApplicationsPage({ permissions = [] }: { permissions?: read
   async function runBulk(action: 'cancel' | 'manual_review', ids: string[]) {
     const reason = await request({ title: `${action === 'cancel' ? 'Cancel' : 'Move'} selected applications`, label: 'Operational reason', kind: 'reason', submitLabel: 'Continue' })
     if (!reason) return
-    const response = await fetch('/api/admin/v1/bulk', { method: 'POST', headers: { 'Content-Type': 'application/json', 'Idempotency-Key': crypto.randomUUID() }, body: JSON.stringify({ resource: 'applications', action, ids, reason }) })
+    const response = await fetch('/api/admin/v1/bulk', { method: 'POST', headers: adminMutationHeaders(), body: JSON.stringify({ resource: 'applications', action, ids, reason }) })
     if (response.ok) window.location.reload()
   }
   const bulkActions: BulkAction[] = [

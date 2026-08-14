@@ -7,6 +7,7 @@ import { signOut } from 'next-auth/react'
 import { useEffect, useState, type ReactNode } from 'react'
 import { AdminExportLink } from './AdminExportLink'
 import { useI18n, type Lang } from '@/lib/i18n'
+import { adminMutationHeaders } from '@/lib/admin/client'
 
 const navigation = [
   { href: '/admin', labelKey: 'admin.nav.overview', icon: Home, permission: 'observability.read' },
@@ -70,7 +71,7 @@ export function AdminShell({ children, permissions, roleKey }: { children: React
   }, [canReadNotifications])
 
   async function markNotification(id?: string) {
-    const response = await fetch('/api/admin/v1/notifications', { method: 'PATCH', headers: { 'Content-Type': 'application/json', 'Idempotency-Key': crypto.randomUUID() }, body: JSON.stringify(id ? { id } : { all: true }) })
+    const response = await fetch('/api/admin/v1/notifications', { method: 'PATCH', headers: adminMutationHeaders(), body: JSON.stringify(id ? { id } : { all: true }) })
     if (!response.ok) return
     const payload = await response.json().catch(() => null) as { unreadCount?: number } | null
     setUnreadCount(payload?.unreadCount ?? 0)

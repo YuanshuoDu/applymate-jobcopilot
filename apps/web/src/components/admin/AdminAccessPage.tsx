@@ -3,6 +3,7 @@
 import { KeyRound, ShieldCheck } from 'lucide-react'
 import { useEffect, useState, type FormEvent } from 'react'
 import { useAdminPrompt } from './AdminPromptDialog'
+import { adminMutationHeaders } from '@/lib/admin/client'
 
 type Member = { id: string; status: string; mfaLevel: string; sessionVersion: number; grantedAt: string; user: { name: string | null; email: string }; role: { key: string; name: string } }
 type Role = { id: string; key: string; name: string; permissions: string[]; system: boolean }
@@ -44,7 +45,7 @@ export function AdminAccessPage({ canRevoke, canManage, canManageRoles = false, 
   }
   useEffect(() => { void load() }, [])
   async function revoke(member: Member) {
-    const response = await fetch(`/api/admin/v1/access/members/${member.id}/revoke-sessions`, { method: 'POST', headers: { 'Content-Type': 'application/json', 'Idempotency-Key': crypto.randomUUID() }, body: JSON.stringify({ sessionVersion: member.sessionVersion, reason: 'Revoking active internal sessions for security review' }) })
+    const response = await fetch(`/api/admin/v1/access/members/${member.id}/revoke-sessions`, { method: 'POST', headers: adminMutationHeaders(), body: JSON.stringify({ sessionVersion: member.sessionVersion, reason: 'Revoking active internal sessions for security review' }) })
     const payload = await response.json().catch(() => null) as { error?: string } | null
     if (!response.ok) setNotice(payload?.error ?? 'Unable to revoke sessions.')
     else { setNotice('Sessions revoked.'); await load() }
@@ -52,7 +53,7 @@ export function AdminAccessPage({ canRevoke, canManage, canManageRoles = false, 
   async function update(member: Member, roleKey: string, status: string) {
     const reason = await request({ title: 'Update administrator access', label: 'Audit reason', kind: 'reason' })
     if (!reason) return
-    const response = await fetch(`/api/admin/v1/access/members/${member.id}`, { method: 'PATCH', headers: { 'Content-Type': 'application/json', 'Idempotency-Key': crypto.randomUUID() }, body: JSON.stringify({ roleKey, status, sessionVersion: member.sessionVersion, reason }) })
+    const response = await fetch(`/api/admin/v1/access/members/${member.id}`, { method: 'PATCH', headers: adminMutationHeaders(), body: JSON.stringify({ roleKey, status, sessionVersion: member.sessionVersion, reason }) })
     const payload = await response.json().catch(() => null) as { error?: string } | null
     setNotice(response.ok ? 'Access updated and active sessions invalidated.' : payload?.error ?? 'Unable to update access.')
     if (response.ok) await load()
@@ -67,7 +68,7 @@ export function AdminAccessPage({ canRevoke, canManage, canManageRoles = false, 
   async function revokeCredential(member: Member, credential: Credential) {
     const reason = await request({ title: 'Revoke administrator WebAuthn key', label: 'Audit reason', kind: 'reason' })
     if (!reason) return
-    const response = await fetch(`/api/admin/v1/access/members/${member.id}/webauthn?credentialId=${encodeURIComponent(credential.id)}`, { method: 'DELETE', headers: { 'x-admin-reason': reason, 'Idempotency-Key': crypto.randomUUID() } })
+    const response = await fetch(`/api/admin/v1/access/members/${member.id}/webauthn?credentialId=${encodeURIComponent(credential.id)}`, { method: 'DELETE', headers: { ...adminMutationHeaders({ json: false }), 'x-admin-reason': reason } })
     const payload = await response.json().catch(() => null) as { error?: string } | null
     setNotice(response.ok ? 'Administrator WebAuthn key revoked.' : payload?.error ?? 'Unable to revoke security key.')
     if (response.ok) await loadCredentials(member)
@@ -76,10 +77,10 @@ export function AdminAccessPage({ canRevoke, canManage, canManageRoles = false, 
     event.preventDefault()
     const reason = await request({ title: 'Grant administrator access', label: 'Audit reason', kind: 'reason' })
     if (!reason || !newEmail || !newRole) return
-    const response = await fetch('/api/admin/v1/access/members', { method: 'POST', headers: { 'Content-Type': 'application/json', 'Idempotency-Key': crypto.randomUUID() }, body: JSON.stringify({ email: newEmail, roleKey: newRole, reason }) })
+    const response = await fetch('/api/admin/v1/access/members', { method: 'POST', headers: adminMutationHeaders(), body: JSON.stringify({ email: newEmail, roleKey: newRole, reason }) })
     const payload = await response.json().catch(() => null) as { error?: string } | null
     if (!response.ok && response.status === 404) {
-      const invitationResponse = await fetch('/api/admin/v1/access/invitations', { method: 'POST', headers: { 'Content-Type': 'application/json', 'Idempotency-Key': crypto.randomUUID() }, body: JSON.stringify({ email: newEmail, roleKey: newRole, reason }) })
+      const invitationResponse = await fetch('/api/admin/v1/access/invitations', { method: 'POST', headers: adminMutationHeaders(), body: JSON.stringify({ email: newEmail, roleKey: newRole, reason }) })
       const invitationPayload = await invitationResponse.json().catch(() => null) as { error?: string; inviteUrl?: string } | null
       setNotice(invitationResponse.ok ? `Account not found; invitation created: ${invitationPayload?.inviteUrl ?? ''}` : invitationPayload?.error ?? 'Unable to grant or invite admin access.')
       if (invitationResponse.ok) setInviteUrl(invitationPayload?.inviteUrl ?? '')
@@ -92,7 +93,7 @@ export function AdminAccessPage({ canRevoke, canManage, canManageRoles = false, 
   async function inviteMember() {
     const reason = await request({ title: 'Invite administrator', label: 'Audit reason', kind: 'reason', description: 'The invitation is one-time and expires after seven days.' })
     if (!reason || !newEmail || !newRole) return
-    const response = await fetch('/api/admin/v1/access/invitations', { method: 'POST', headers: { 'Content-Type': 'application/json', 'Idempotency-Key': crypto.randomUUID() }, body: JSON.stringify({ email: newEmail, roleKey: newRole, reason }) })
+    const response = await fetch('/api/admin/v1/access/invitations', { method: 'POST', headers: adminMutationHeaders(), body: JSON.stringify({ email: newEmail, roleKey: newRole, reason }) })
     const payload = await response.json().catch(() => null) as { error?: string; inviteUrl?: string } | null
     setNotice(response.ok ? 'Invitation created. Copy the one-time link before closing this screen.' : payload?.error ?? 'Unable to create invitation.')
     if (response.ok) { setInviteUrl(payload?.inviteUrl ?? ''); setNewEmail(''); setNewRole(''); await load() }
@@ -101,7 +102,7 @@ export function AdminAccessPage({ canRevoke, canManage, canManageRoles = false, 
     event.preventDefault()
     const reason = await request({ title: 'Create custom role', label: 'Audit reason', kind: 'reason' })
     if (!reason) return
-    const response = await fetch('/api/admin/v1/access/roles', { method: 'POST', headers: { 'Content-Type': 'application/json', 'Idempotency-Key': crypto.randomUUID() }, body: JSON.stringify({ key: roleKey, name: roleName, permissions: rolePermissions.split(',').map(item => item.trim()).filter(Boolean), reason }) })
+    const response = await fetch('/api/admin/v1/access/roles', { method: 'POST', headers: adminMutationHeaders(), body: JSON.stringify({ key: roleKey, name: roleName, permissions: rolePermissions.split(',').map(item => item.trim()).filter(Boolean), reason }) })
     const payload = await response.json().catch(() => null) as { error?: string } | null
     setNotice(response.ok ? 'Custom role created.' : payload?.error ?? 'Unable to create role.')
     if (response.ok) { setRoleKey(''); setRoleName(''); setRolePermissions(''); await load() }
@@ -110,7 +111,7 @@ export function AdminAccessPage({ canRevoke, canManage, canManageRoles = false, 
     event.preventDefault()
     const review = reviews.find((item) => item.id === reviewId)
     if (!review || reviewReason.trim().length < 10) return
-    const response = await fetch('/api/admin/v1/access/reviews', { method: 'POST', headers: { 'Content-Type': 'application/json', 'Idempotency-Key': crypto.randomUUID() }, body: JSON.stringify({ membershipId: review.id, status: reviewStatus, notes: reviewNotes, reason: reviewReason.trim() }) })
+    const response = await fetch('/api/admin/v1/access/reviews', { method: 'POST', headers: adminMutationHeaders(), body: JSON.stringify({ membershipId: review.id, status: reviewStatus, notes: reviewNotes, reason: reviewReason.trim() }) })
     const payload = await response.json().catch(() => null) as { error?: string } | null
     setNotice(response.ok ? 'Access review recorded.' : payload?.error ?? 'Unable to record access review.')
     if (response.ok) { setReviewReason(''); setReviewNotes(''); await load() }

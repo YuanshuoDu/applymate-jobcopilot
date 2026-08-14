@@ -3,6 +3,7 @@
 import { RefreshCw, Trash2 } from 'lucide-react'
 import { useEffect, useState } from 'react'
 import { useAdminPrompt } from './AdminPromptDialog'
+import { adminMutationHeaders } from '@/lib/admin/client'
 
 type DeletionRequest = { id: string; status: string; reason: string | null; requestedAt: string; processedAt: string | null; version: number; user: { name: string | null; email: string; plan: string; accountStatus: string } | null }
 type RetentionPolicy = { key: string; name: string; retentionDays: number; enabled: boolean; version: number }
@@ -37,7 +38,7 @@ export function AdminDeletionQueuePage() {
   async function saveRetention() {
     const confirmation = await request({ title: 'Save data retention policy', label: 'Reason', kind: 'reason', description: 'This controls how long completed deletion queue tombstones remain available for audit operations.', submitLabel: 'Save policy' })
     if (!confirmation || !retention) return
-    const response = await fetch('/api/admin/v1/users/deletions/retention', { method: 'PATCH', headers: { 'Content-Type': 'application/json', 'Idempotency-Key': crypto.randomUUID() }, body: JSON.stringify({ key: retention.key, retentionDays: Number(retentionDays), enabled: retentionEnabled, version: retention.version, reason: confirmation }) })
+      const response = await fetch('/api/admin/v1/users/deletions/retention', { method: 'PATCH', headers: adminMutationHeaders(), body: JSON.stringify({ key: retention.key, retentionDays: Number(retentionDays), enabled: retentionEnabled, version: retention.version, reason: confirmation }) })
     const payload = await response.json().catch(() => null) as { policy?: RetentionPolicy; error?: string } | null
     if (response.ok && payload?.policy) { setRetention(payload.policy); setRetentionDays(String(payload.policy.retentionDays)); setRetentionEnabled(payload.policy.enabled); setNotice('Retention policy saved.') }
     else setNotice(payload?.error ?? 'Unable to save retention policy.')
@@ -46,7 +47,7 @@ export function AdminDeletionQueuePage() {
   async function update(event: React.FormEvent) {
     event.preventDefault()
     if (!selected || reason.trim().length < 10) return
-    const response = await fetch(`/api/admin/v1/users/deletions/${selected.id}`, { method: 'PATCH', headers: { 'Content-Type': 'application/json', 'Idempotency-Key': crypto.randomUUID() }, body: JSON.stringify({ status: nextStatus, version: selected.version, reason: reason.trim(), note: note.trim() }) })
+      const response = await fetch(`/api/admin/v1/users/deletions/${selected.id}`, { method: 'PATCH', headers: adminMutationHeaders(), body: JSON.stringify({ status: nextStatus, version: selected.version, reason: reason.trim(), note: note.trim() }) })
     const payload = await response.json().catch(() => null) as { error?: string } | null
     setNotice(response.ok ? 'Deletion request updated.' : payload?.error ?? 'Unable to update deletion request.')
     if (response.ok) { setSelected(null); setReason(''); setNote(''); await load() }
@@ -60,7 +61,7 @@ export function AdminDeletionQueuePage() {
     let completed = 0
     for (const item of targets) {
       const next = item.status === 'requested' ? 'processing' : 'completed'
-      const response = await fetch(`/api/admin/v1/users/deletions/${item.id}`, { method: 'PATCH', headers: { 'Content-Type': 'application/json', 'Idempotency-Key': crypto.randomUUID() }, body: JSON.stringify({ status: next, version: item.version, reason: confirmation, note: 'Bulk queue operation' }) })
+      const response = await fetch(`/api/admin/v1/users/deletions/${item.id}`, { method: 'PATCH', headers: adminMutationHeaders(), body: JSON.stringify({ status: next, version: item.version, reason: confirmation, note: 'Bulk queue operation' }) })
       if (response.ok) completed += 1
     }
     setNotice(`${completed}/${targets.length} deletion requests advanced.`)
