@@ -807,7 +807,12 @@ export function FormFillerView({ settings, pendingFields, onFieldsConsumed, scan
             {scanning ? 'Scanning page' : 'Scan current page'}
             {!scanning && <ArrowRight size={14} />}
           </button>
-          <span className="am-form-helper">Works with company career sites, Greenhouse, Lever, Workday, and more.</span>
+          <span className="am-form-helper">
+            Works with company career sites, Greenhouse, Lever, Workday, and more.
+            When you scan, ApplyMate reads field labels and any existing values on this page to prepare suggestions.
+            Review everything before filling; it never submits the application.
+            <a href="https://applymate.site/privacy" target="_blank" rel="noreferrer">Privacy &amp; data use</a>
+          </span>
           <div className="am-form-access-card">
             <div>
               <strong>{allSitesAccess ? 'All websites access enabled' : 'Use on any company career site'}</strong>
@@ -823,7 +828,7 @@ export function FormFillerView({ settings, pendingFields, onFieldsConsumed, scan
 
         <div className="am-form-info-strip">
           <ShieldCheck size={15} />
-          <span>Your profile stays private and is only used to fill this application.</span>
+          <span>Your profile and scanned form data are used only for the ApplyMate feature you start.</span>
         </div>
       </div>
     )

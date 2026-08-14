@@ -22,7 +22,7 @@ export default function PrivacyPage() {
       </ul>
 
       <h2>How we use data</h2>
-      <p>We use this data only to provide the user-facing ApplyMate features you request: saving and tracking jobs, generating or revising application materials, matching your profile to a job, and filling application forms for your review. The extension reads supported job pages only to provide those features.</p>
+      <p>We use this data only to provide the user-facing ApplyMate features you request: saving and tracking jobs, generating or revising application materials, matching your profile to a job, and filling application forms for your review. The extension reads supported job pages and, when you grant optional site access and start a form scan, the specific company or ATS page you selected.</p>
 
       <h2>Sharing and limited use</h2>
       <p>Data is sent to ApplyMate services over HTTPS. When you request an AI feature, the relevant job, resume, Persona, or form information may be processed by the configured AI provider to return that feature’s result. We do not sell personal data, use it for personalised advertising, or use it for advertising attribution.</p>
