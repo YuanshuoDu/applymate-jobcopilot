@@ -11,11 +11,13 @@ describe('apiMutate', () => {
   it('adds a unique idempotency key to admin mutation requests', async () => {
     const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify({ ok: true }), { status: 200 }))
     vi.stubGlobal('fetch', fetchMock)
+    vi.stubGlobal('window', { location: { origin: 'https://admin.applymate.site' } })
 
     await apiMutate('/api/admin/v1/plans', 'PATCH', { plans: [] })
 
     const [, init] = fetchMock.mock.calls[0] as [string, RequestInit]
     const headers = init.headers as Record<string, string>
+    expect(headers.Origin).toBe('https://admin.applymate.site')
     expect(headers['Idempotency-Key']).toMatch(/^[0-9a-f-]{36}$/)
   })
 

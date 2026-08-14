@@ -10,6 +10,14 @@ import { editablePrivacyPreferences, isPrivacyPreferenceAvailable } from '@/lib/
 import { useAdminPrompt } from './AdminPromptDialog'
 import { AdminUserApiKeysPanel } from './AdminUserApiKeysPanel'
 
+function adminWriteHeaders(): HeadersInit {
+  return {
+    'Content-Type': 'application/json',
+    Origin: window.location.origin,
+    'Idempotency-Key': crypto.randomUUID(),
+  }
+}
+
 type Detail = {
   user: {
     name: string | null
@@ -83,7 +91,7 @@ function AccountOperations({ userId, user, permissions }: { userId: string; user
     const reason = await request({ title: 'Confirm account operation', label: 'Reason', kind: 'reason', description: 'This action is audited and requires an operational reason.', submitLabel: 'Continue' })
     if (!reason) return
     setBusy(true)
-    const response = await fetch(url, { method: 'PATCH', headers: { 'Content-Type': 'application/json', 'Idempotency-Key': crypto.randomUUID() }, body: JSON.stringify({ ...body, reason }) })
+    const response = await fetch(url, { method: 'PATCH', headers: adminWriteHeaders(), body: JSON.stringify({ ...body, reason }) })
     const payload = await response.json().catch(() => null) as { error?: string; item?: Override } | null
     setBusy(false)
     if (!response.ok) { setNotice(payload?.error ?? 'Operation failed.'); return }
@@ -96,7 +104,7 @@ function AccountOperations({ userId, user, permissions }: { userId: string; user
     const reason = await request({ title: 'Save package settings', label: 'Reason', kind: 'reason', description: 'Plan, trial and subscription changes are audited and version checked.', submitLabel: 'Save package settings' })
     if (!reason) return
     setBusy(true)
-    const response = await fetch(`/api/admin/v1/users/${userId}/plan`, { method: 'PATCH', headers: { 'Content-Type': 'application/json', 'Idempotency-Key': crypto.randomUUID() }, body: JSON.stringify({ toPlan: plan, status: subscriptionStatus, trialEndsAt: subscriptionStatus === 'trialing' && trialEndsAt ? new Date(trialEndsAt).toISOString() : null, currentPeriodEnd: currentPeriodEnd ? new Date(currentPeriodEnd).toISOString() : null, cancelAtPeriodEnd, version: subscription?.version, reason }) })
+    const response = await fetch(`/api/admin/v1/users/${userId}/plan`, { method: 'PATCH', headers: adminWriteHeaders(), body: JSON.stringify({ toPlan: plan, status: subscriptionStatus, trialEndsAt: subscriptionStatus === 'trialing' && trialEndsAt ? new Date(trialEndsAt).toISOString() : null, currentPeriodEnd: currentPeriodEnd ? new Date(currentPeriodEnd).toISOString() : null, cancelAtPeriodEnd, version: subscription?.version, reason }) })
     const payload = await response.json().catch(() => null) as { error?: string; subscription?: Subscription } | null
     setBusy(false)
     if (!response.ok) { setNotice(payload?.error ?? 'Package settings could not be saved.'); return }

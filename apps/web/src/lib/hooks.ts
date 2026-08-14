@@ -116,6 +116,9 @@ export async function apiMutate<T = unknown>(
 ): Promise<{ data: T | null; error: string | null }> {
   try {
     const headers: Record<string, string> = body !== undefined ? { 'Content-Type': 'application/json' } : {}
+    // Admin write routes validate same-origin requests. Keep this in the
+    // shared browser mutation helper so admin panels cannot silently omit it.
+    if (typeof window !== 'undefined') headers.Origin = window.location.origin
     headers['Idempotency-Key'] = crypto.randomUUID()
     const res  = await fetch(url, {
       method,
