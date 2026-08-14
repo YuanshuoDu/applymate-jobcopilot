@@ -34,6 +34,7 @@ import { isSameJob } from '@/lib/job-identity'
 import {
   exportApplicationPackLocally,
   getDashboard,
+  prepareApplicationPack,
   scoreSavedJob,
   updateJobNotes,
 } from '@/lib/api'
@@ -543,7 +544,7 @@ function TrackerPanel({ settings, tabKey, L, onOpenResume }: { settings: Extensi
               <div className="am-overview-label"><BarChart3 size={12} aria-hidden="true" /><span>Next step</span></div>
               <div className="am-overview-copy">{!dashboard?.hasResume ? 'Add your resume to unlock match scoring.' : unscoredCount > 0 ? `${unscoredCount} saved role${unscoredCount === 1 ? '' : 's'} ready to score.` : `${Math.max(0, weeklyTarget - weeklyApplications)} applications this week to stay on track.`}</div>
               <div className="am-progress-bar" aria-hidden="true"><span style={{ width: `${weeklyProgress}%` }} /></div>
-              <button className="am-overview-action" type="button" onClick={() => dashboard?.hasResume ? (unscoredCount ? void scoreJob(jobs.find(job => job.score == null)!) : chrome.tabs.create({ url: `${settings.apiBaseUrl}/jobs` })) : onOpenResume()}>{!dashboard?.hasResume ? 'Add resume' : unscoredCount ? 'Score a role' : 'View plan'}</button>
+              <button className="am-overview-action" type="button" onClick={() => dashboard?.hasResume ? (unscoredCount ? void scoreJob(jobs.find(job => job.score == null)!) : chrome.tabs.create({ url: `${settings.apiBaseUrl}/?page=jobs` })) : onOpenResume()}>{!dashboard?.hasResume ? 'Add resume' : unscoredCount ? 'Score a role' : 'View plan'}</button>
             </div>
             <div className="am-overview-cell">
               <div className="am-overview-label"><Sparkles size={12} aria-hidden="true" /><span>High match opportunity</span></div>
@@ -570,10 +571,10 @@ function TrackerPanel({ settings, tabKey, L, onOpenResume }: { settings: Extensi
         {(jobsSyncError || dashboardSyncError) && <div className="am-sync-banner" role="alert"><div><strong>Sync needs attention</strong><span>{jobsSyncError || dashboardSyncError}</span>{(jobsSyncError ? lastJobsSyncedAt : lastDashboardSyncedAt) && <small>Last synced {formatSyncAge((jobsSyncError ? lastJobsSyncedAt : lastDashboardSyncedAt)!)}</small>}</div><button type="button" onClick={() => refreshAll(true)}>Retry</button></div>}
         <CurrentPageBanner accountKey={`${settings.apiBaseUrl}|${settings.apiToken}|${settings.userEmail}`} tabKey={tabKey} userEmail={settings.userEmail} onSaved={() => refreshAll()} />
         <div className="am-list" ref={listRef}>
-          {loading ? <div className="am-spinner"><LoaderCircle className="am-spin" size={20} aria-label="Loading jobs" /></div> : filtered.length === 0 ? <EmptyState hasSearch={Boolean(search.trim())} filter={filterStatus} connectionError={Boolean(jobsSyncError)} onRetry={() => refreshAll(true)} onClearSearch={() => setSearch('')} onOpenDashboard={() => chrome.tabs.create({ url: `${settings.apiBaseUrl}/jobs` })} L={L} /> : <div className="am-list-inner">{filtered.map(job => <JobCard key={job.id} job={job} expanded={expandedId === job.id} onToggle={() => setExpandedId(current => current === job.id ? null : job.id)} settings={settings} L={L} scoring={scoringId === job.id} onScore={() => void scoreJob(job)} />)}</div>}
+          {loading ? <div className="am-spinner"><LoaderCircle className="am-spin" size={20} aria-label="Loading jobs" /></div> : filtered.length === 0 ? <EmptyState hasSearch={Boolean(search.trim())} filter={filterStatus} connectionError={Boolean(jobsSyncError)} onRetry={() => refreshAll(true)} onClearSearch={() => setSearch('')} onOpenDashboard={() => chrome.tabs.create({ url: `${settings.apiBaseUrl}/?page=jobs` })} L={L} /> : <div className="am-list-inner">{filtered.map(job => <JobCard key={job.id} job={job} expanded={expandedId === job.id} onToggle={() => setExpandedId(current => current === job.id ? null : job.id)} settings={settings} L={L} scoring={scoringId === job.id} onScore={() => void scoreJob(job)} onPrepared={() => void refreshAll(true)} />)}</div>}
         </div>
       </div>
-      <footer className="am-footer"><button className="am-footer-button" type="button" onClick={() => refreshAll(true)}><RefreshCw size={12} aria-hidden="true" /> Refresh</button><button className="am-footer-button primary" type="button" onClick={() => chrome.tabs.create({ url: `${settings.apiBaseUrl}/jobs` })}>View all jobs <ArrowRight size={12} aria-hidden="true" /></button></footer>
+      <footer className="am-footer"><button className="am-footer-button" type="button" onClick={() => refreshAll(true)}><RefreshCw size={12} aria-hidden="true" /> Refresh</button><button className="am-footer-button primary" type="button" onClick={() => chrome.tabs.create({ url: `${settings.apiBaseUrl}/?page=jobs` })}>View all jobs <ArrowRight size={12} aria-hidden="true" /></button></footer>
       {toast && <div className="am-toast" role="status">{toast}</div>}
     </div>
   )
@@ -601,13 +602,14 @@ function statusLabel(status: string, L: Labels): string {
   return ({ saved: L.saved, applied: L.applied, interview: 'Interview', rejected: L.rejected, offer: L.applied } as Record<string, string>)[status] ?? status
 }
 
-function JobCard({ job, expanded, onToggle, settings, onScore, scoring, L }: {
+function JobCard({ job, expanded, onToggle, settings, onScore, scoring, onPrepared, L }: {
   job: SavedJob
   expanded: boolean
   onToggle: () => void
   settings: ExtensionSettings
   onScore: () => void
   scoring: boolean
+  onPrepared: () => void
   L: Labels
 }) {
   const [notes, setNotes] = useState(job.notes ?? '')
@@ -615,6 +617,8 @@ function JobCard({ job, expanded, onToggle, settings, onScore, scoring, L }: {
   const [notesError, setNotesError] = useState('')
   const [packExporting, setPackExporting] = useState(false)
   const [packError, setPackError] = useState('')
+  const [packPreparing, setPackPreparing] = useState(false)
+  const [packStage, setPackStage] = useState<'resume' | 'coverLetter' | 'audit' | null>(null)
   const initialNotes = useRef(job.notes ?? '')
   const notesTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
   const displayStatus = visibleStatus(job.status)
@@ -665,6 +669,21 @@ function JobCard({ job, expanded, onToggle, settings, onScore, scoring, L }: {
     }
   }
 
+  async function handlePackPrepare() {
+    if (packReady || packPreparing) return
+    setPackPreparing(true)
+    setPackError('')
+    try {
+      await prepareApplicationPack(settings, job, setPackStage)
+      onPrepared()
+    } catch (error) {
+      setPackError(error instanceof Error ? error.message : 'Could not prepare application pack')
+    } finally {
+      setPackPreparing(false)
+      setPackStage(null)
+    }
+  }
+
   return (
     <article className={`am-job-card${expanded ? ' expanded' : ''}`} data-job-id={job.id}>
       <div className="am-job-row">
@@ -681,17 +700,19 @@ function JobCard({ job, expanded, onToggle, settings, onScore, scoring, L }: {
         <button className="am-chevron" type="button" onMouseDown={event => { event.preventDefault(); event.currentTarget.blur() }} onClick={onToggle} aria-label={expanded ? `Collapse ${job.role}` : `Expand ${job.role}`}><ChevronDown size={16} className={expanded ? 'am-chevron-open' : ''} /></button>
       </div>
       {expanded && <div className="am-detail">
-        <div className="am-detail-grid"><div className="am-detail-box"><div className="am-detail-label">Notes</div><div className="am-notes-meta"><span>{notesSaving ? <span className="am-saving">Saving…</span> : notesError ? <span className="am-note-error">{notesError}</span> : notes ? <span className="am-saved">Saved</span> : 'Add context for later'}</span></div><textarea className="am-notes" value={notes} onChange={event => { setNotes(event.target.value); setNotesError('') }} placeholder="Interview questions, salary, contact…" /><ApplicationPackSummary hasResume={hasResume} hasCoverLetter={hasCoverLetter} ready={packReady} exporting={packExporting} error={packError} onPrepare={() => window.open(`${settings.apiBaseUrl}/jobs?highlight=${job.id}`, '_blank', 'noopener,noreferrer')} onDownload={() => void handlePackDownload()} /></div><div className="am-detail-box am-detail-insights"><div className="am-detail-label am-detail-label-icon"><Tags size={11} aria-hidden="true" /> Key job tags</div>{keyTags.length > 0 ? <div className="am-key-tags">{keyTags.map(tag => <span key={tag} className="am-key-tag">{tag}</span>)}</div> : <div className="am-detail-text">Score this role to extract its main skills and requirements.</div>}<div className="am-detail-label am-detail-score-label">Match score</div><div className="am-detail-text">{job.score == null ? 'Not scored yet.' : `Scored at ${job.score}% against your resume.`}</div>{!job.url && <div className="am-detail-text">No original link saved.</div>}</div></div>
-        <div className="am-detail-actions">{job.url && <a className="am-detail-action" href={job.url} target="_blank" rel="noreferrer">Open original <ExternalLink size={11} /></a>}<a className="am-detail-action primary" href={`${settings.apiBaseUrl}/jobs?highlight=${job.id}`} target="_blank" rel="noreferrer">Open in My Jobs <ArrowRight size={11} /></a></div>
+        <div className="am-detail-grid"><div className="am-detail-box"><div className="am-detail-label">Notes</div><div className="am-notes-meta"><span>{notesSaving ? <span className="am-saving">Saving…</span> : notesError ? <span className="am-note-error">{notesError}</span> : notes ? <span className="am-saved">Saved</span> : 'Add context for later'}</span></div><textarea className="am-notes" value={notes} onChange={event => { setNotes(event.target.value); setNotesError('') }} placeholder="Interview questions, salary, contact…" /><ApplicationPackSummary hasResume={hasResume} hasCoverLetter={hasCoverLetter} ready={packReady} preparing={packPreparing} stage={packStage} exporting={packExporting} error={packError} onPrepare={() => void handlePackPrepare()} onDownload={() => void handlePackDownload()} /></div><div className="am-detail-box am-detail-insights"><div className="am-detail-label am-detail-label-icon"><Tags size={11} aria-hidden="true" /> Key job tags</div>{keyTags.length > 0 ? <div className="am-key-tags">{keyTags.map(tag => <span key={tag} className="am-key-tag">{tag}</span>)}</div> : <div className="am-detail-text">Score this role to extract its main skills and requirements.</div>}<div className="am-detail-label am-detail-score-label">Match score</div><div className="am-detail-text">{job.score == null ? 'Not scored yet.' : `Scored at ${job.score}% against your resume.`}</div>{!job.url && <div className="am-detail-text">No original link saved.</div>}</div></div>
+        <div className="am-detail-actions">{job.url && <a className="am-detail-action" href={job.url} target="_blank" rel="noreferrer">Open original <ExternalLink size={11} /></a>}<a className="am-detail-action primary" href={`${settings.apiBaseUrl}/?page=jobs&highlight=${job.id}`} target="_blank" rel="noreferrer">Open in My Jobs <ArrowRight size={11} /></a></div>
       </div>}
     </article>
   )
 }
 
-function ApplicationPackSummary({ hasResume, hasCoverLetter, ready, exporting, error, onPrepare, onDownload }: {
+function ApplicationPackSummary({ hasResume, hasCoverLetter, ready, preparing, stage, exporting, error, onPrepare, onDownload }: {
   hasResume: boolean
   hasCoverLetter: boolean
   ready: boolean
+  preparing: boolean
+  stage: 'resume' | 'coverLetter' | 'audit' | null
   exporting: boolean
   error: string
   onPrepare: () => void
@@ -703,10 +724,12 @@ function ApplicationPackSummary({ hasResume, hasCoverLetter, ready, exporting, e
     { label: 'Independent audit', icon: ShieldCheck, done: ready },
   ]
 
+  const stageLabel = stage === 'resume' ? 'Preparing resume…' : stage === 'coverLetter' ? 'Writing cover letter…' : stage === 'audit' ? 'Running independent audit…' : 'Preparing…'
   return <div className="am-pack-summary">
     <div className="am-pack-heading"><span><Sparkles size={11} aria-hidden="true" /> Application pack</span><span className={ready ? 'am-pack-ready' : 'am-pack-pending'}>{ready ? 'Ready' : 'Pending'}</span></div>
-    <div className="am-pack-rows">{rows.map(({ label, icon: Icon, done }) => <div className="am-pack-row" key={label}><span className={`am-pack-icon${done ? ' done' : ''}`}><Icon size={10} aria-hidden="true" /></span><span className="am-pack-row-label">{label}</span><span className={`am-pack-status${done ? ' done' : ''}`}>{done ? <><Check size={9} /> Ready</> : 'Pending'}</span></div>)}</div>
-    <div className="am-pack-actions"><button className="am-pack-prepare" type="button" onClick={onPrepare}>{ready ? 'Review in My Jobs' : 'Prepare full pack'} <ArrowRight size={10} /></button><button className="am-pack-download" type="button" disabled={!ready || exporting} onClick={onDownload} aria-label="Download application pack" title={ready ? 'Download application pack' : 'Complete the pack in My Jobs first'}><Download size={11} />{exporting ? '…' : 'Download'}</button></div>
+    <div className="am-pack-rows">{rows.map(({ label, icon: Icon, done }, index) => { const active = preparing && ((stage === 'resume' && index === 0) || (stage === 'coverLetter' && index === 1) || (stage === 'audit' && index === 2)); return <div className="am-pack-row" key={label}><span className={`am-pack-icon${done ? ' done' : active ? ' active' : ''}`}><Icon size={10} aria-hidden="true" /></span><span className="am-pack-row-label">{label}</span><span className={`am-pack-status${done ? ' done' : active ? ' active' : ''}`}>{done ? <><Check size={9} /> Ready</> : active ? 'Working…' : 'Pending'}</span></div> })}</div>
+    {preparing && <div className="am-pack-progress">{stageLabel}</div>}
+    <div className="am-pack-actions"><button className="am-pack-prepare" type="button" disabled={ready || preparing} onClick={onPrepare}>{preparing ? stageLabel : ready ? 'Pack ready' : 'Prepare full pack'} {!ready && !preparing && <ArrowRight size={10} />}</button><button className="am-pack-download" type="button" disabled={!ready || exporting} onClick={onDownload} aria-label="Download application pack" title={ready ? 'Download application pack' : 'Complete the pack first'}><Download size={11} />{exporting ? '…' : 'Download'}</button></div>
     {error && <div className="am-pack-error" role="status">{error}</div>}
   </div>
 }

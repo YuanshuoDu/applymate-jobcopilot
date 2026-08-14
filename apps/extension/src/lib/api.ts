@@ -351,6 +351,57 @@ export async function tailorResume(settings: ExtensionSettings, jobId: string, r
   })
 }
 
+export type ApplicationPackStage = 'resume' | 'coverLetter' | 'audit'
+
+interface CoverLetterArtifact { id: string; resumeId: string; content: string }
+interface ApplicationAuditResult { verdict: 'pass' | 'needs_review' | 'blocked'; summary: string; matchScore?: number }
+
+export async function prepareApplicationPack(
+  settings: ExtensionSettings,
+  job: SavedJob,
+  onStage?: (stage: ApplicationPackStage) => void,
+): Promise<{ job: SavedJob; audit: ApplicationAuditResult }> {
+  if (job.finalResumeId && job.finalCoverLetterId) {
+    return { job, audit: { verdict: 'pass', summary: 'Application pack already confirmed.' } }
+  }
+
+  const resumes = await listResumes(settings)
+  const baseResume = resumes.find(resume => resume.isDefault) ?? resumes[0]
+  if (!baseResume) throw new Error('Add a resume before preparing the application pack.')
+
+  onStage?.('resume')
+  const tailored = await tailorResume(settings, job.id, baseResume.id)
+  onStage?.('coverLetter')
+  const coverLetter = await request<CoverLetterArtifact>(settings, `/api/jobs/${job.id}/cover-letters/generate`, {
+    method: 'POST',
+    body: JSON.stringify({ resumeId: tailored.adaptedResumeId, preferProvidedResume: true }),
+    _timeoutMs: 120_000,
+    _retry: false,
+  })
+  await assignApplicationPack(settings, job.id, { finalCoverLetterId: coverLetter.id })
+
+  onStage?.('audit')
+  const audit = await request<ApplicationAuditResult>(settings, `/api/jobs/${job.id}/audit-application`, {
+    method: 'POST',
+    body: JSON.stringify({ resumeId: tailored.adaptedResumeId, coverLetterId: coverLetter.id }),
+    _timeoutMs: 120_000,
+    _retry: false,
+  })
+  if (audit.verdict !== 'pass') throw new Error(audit.summary || 'Independent audit needs review before the pack can be confirmed.')
+
+  const updatedJob = await assignApplicationPack(settings, job.id, {
+    finalResumeId: tailored.adaptedResumeId,
+    finalCoverLetterId: coverLetter.id,
+  })
+  return { job: updatedJob, audit }
+}
+
+async function assignApplicationPack(settings: ExtensionSettings, jobId: string, body: { finalResumeId?: string; finalCoverLetterId?: string }): Promise<SavedJob> {
+  return request<SavedJob>(settings, `/api/jobs/${jobId}/assign`, {
+    method: 'PATCH', body: JSON.stringify(body), _retry: false,
+  })
+}
+
 export async function deleteResume(settings: ExtensionSettings, id: string): Promise<void> {
   await request(settings, `/api/resume/${id}`, { method: 'DELETE' })
 }
