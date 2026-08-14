@@ -3,7 +3,7 @@
  *
  * Layout (top to bottom):
  *   1. Top bar: resume selector + new + upload
- *   2. Job Match: AI scoring + suggestions with one-click apply (if job detected)
+ *   2. Tailor: open the shared My Jobs application-pack workflow (if job detected)
  *   3. Preview: rendered with template styling — the final look
  *   4. Template picker: style / accent color / density
  *   5. Quick Edit: collapsed by default, can add/remove sections
@@ -22,16 +22,14 @@ import {
   Pencil,
   Plus,
   RefreshCw,
-  Sparkles,
   Upload,
 } from 'lucide-react'
 import { getCurrentJob, getCurrentResumeId, setCurrentResumeId, setResumeDraft, clearResumeDraft } from '@/lib/storage'
 import {
   listResumes, getResume, updateResume, createResume,
-  scoreResume, suggestResume, getRecentJobs, exportApplicationPackLocally,
+  getRecentJobs, exportApplicationPackLocally,
 } from '@/lib/api'
-import type { ExtensionSettings, ScrapedJob, ResumeListItem, Resume, ResumeContent, TemplateOptions, ScoreResult, Suggestion } from '@/lib/types'
-import { scoreColorsFor } from '@/lib/score-colors'
+import type { ExtensionSettings, ScrapedJob, ResumeListItem, Resume, ResumeContent, TemplateOptions } from '@/lib/types'
 
 // ── Design tokens ────────────────────────────────────────────────────────────────
 const C = {
@@ -128,17 +126,12 @@ export function ResumeView({ settings }: Props) {
   const [savedJobId, setSavedJobId] = useState<string | null>(null)
   const [exportedPackFolder, setExportedPackFolder] = useState<string | null>(null)
   const [exportingPack, setExportingPack] = useState(false)
-  const [scoreResult, setScoreResult] = useState<ScoreResult | null>(null)
-  const [suggestions, setSuggestions] = useState<Suggestion[]>([])
-  const [analyzing, setAnalyzing] = useState(false)
   const [uploading, setUploading] = useState(false)
   const [loadError, setLoadError] = useState('')
 
   const saveTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
   const fileInputRef = useRef<HTMLInputElement>(null)
   const apiBase = settings.apiBaseUrl
-  const scoreColors = scoreResult ? scoreColorsFor(scoreResult.score) : null
-
   function showToast(msg: string) { setToast(msg); setTimeout(() => setToast(''), 2500) }
 
   // ── Init ───────────────────────────────────────────────────────────────────────
@@ -203,8 +196,6 @@ export function ResumeView({ settings }: Props) {
       setTemplateId(r.templateId ?? 'clean')
       setTemplateOpts(r.templateOptions ?? {})
       setDirty(false)
-      setScoreResult(null)
-      setSuggestions([])
       await setCurrentResumeId(id, settings.userEmail)
     } catch (err) {
       const msg = err instanceof Error ? err.message : 'Failed to load'
@@ -271,46 +262,6 @@ export function ResumeView({ settings }: Props) {
     saveTimer.current = setTimeout(() => doSave(newContent, newTid ?? templateId, newTpts ?? templateOpts), 1200)
   }
 
-  // ── AI Analysis ────────────────────────────────────────────────────────────────
-  async function handleAnalyze() {
-    if (!currentJob) return
-    setAnalyzing(true); setScoreResult(null); setSuggestions([])
-    try {
-      const [score, suggs] = await Promise.all([
-        scoreResume(settings, { resumeContent: content, jobTitle: currentJob.title, jobCompany: currentJob.company, jobDescription: currentJob.description }),
-        suggestResume(settings, { resumeContent: content, jobTitle: currentJob.title, jobCompany: currentJob.company, jobDescription: currentJob.description }),
-      ])
-      setScoreResult(score); setSuggestions(suggs.suggestions ?? [])
-    } catch { showToast('Analysis failed') }
-    finally { setAnalyzing(false) }
-  }
-
-  function applySuggestion(s: Suggestion) {
-    if (!s.proposed) return
-    const updated = { ...content }
-    switch (s.target) {
-      case 'summary': updated.summary = s.proposed; break
-      case 'skills': updated.skills = s.proposed.split(',').map(x => x.trim()).filter(Boolean); break
-      case 'experience':
-        if (updated.experience.length > 0) {
-          updated.experience = updated.experience.map((exp, i) => i === 0 ? { ...exp, bullets: [...exp.bullets, s.proposed!] } : exp)
-        } else { updated.experience = [{ company: '', role: '', period: '', bullets: [s.proposed!] }] }
-        break
-      case 'education':
-        updated.education = [...(updated.education ?? []), { institution: s.proposed, degree: '', year: '' }]; break
-    }
-    markDirty(updated)
-    setSuggestions(prev => prev.map(sg => sg === s ? { ...sg, applied: true } : sg))
-    showToast('Applied!')
-  }
-
-  function addMissingKeyword(item: { keyword: string; target: string }) {
-    const updated = { ...content }
-    if (item.target === 'skills' && !updated.skills.includes(item.keyword)) updated.skills = [...updated.skills, item.keyword]
-    else if (item.target === 'summary') updated.summary = updated.summary ? `${updated.summary} ${item.keyword}` : item.keyword
-    markDirty(updated); showToast(`Added: ${item.keyword}`)
-  }
-
   // ── Template ───────────────────────────────────────────────────────────────────
   function changeTemplate(tid: string | null) { markDirty(content, tid, templateOpts) }
   function changeAccent(color: string) { markDirty(content, templateId, { ...templateOpts, accentColor: color }) }
@@ -354,6 +305,11 @@ export function ResumeView({ settings }: Props) {
     } finally {
       setExportingPack(false)
     }
+  }
+
+  function handleOpenTailor() {
+    const url = savedJobId ? `${apiBase}/jobs?highlight=${savedJobId}` : `${apiBase}/jobs`
+    chrome.tabs.create({ url })
   }
 
   // ── Resolved template options ──────────────────────────────────────────────────
@@ -443,61 +399,10 @@ export function ResumeView({ settings }: Props) {
               </div>
             </div>
             {auditedResumeId === activeId && <div style={{ margin: '0 0 9px', fontSize: 10, fontWeight: 600, color: C.green }}>✓ Using the audited resume selected in My Jobs</div>}
-            {packageStatus === 'missing' && <div style={{ margin: '0 0 9px', fontSize: 10, fontWeight: 600, color: C.amber }}>No audited package for this job yet — the displayed resume is not ready to submit.</div>}
-            <button className="am-resume-match-button" type="button" onClick={handleAnalyze} disabled={analyzing}>
-              <Sparkles size={13} aria-hidden="true" /> {analyzing ? 'Analyzing…' : scoreResult ? 'Re-analyze match' : 'Analyze match'}
+            {packageStatus === 'missing' && <div style={{ margin: '0 0 9px', fontSize: 10, lineHeight: 1.4, fontWeight: 600, color: C.amber }}>No tailored application pack for this job yet. Prepare it in My Jobs before submitting.</div>}
+            <button className="am-resume-match-button" type="button" onClick={handleOpenTailor}>
+              <FileText size={13} aria-hidden="true" /> {packageStatus === 'audited' ? 'Review application pack' : 'Tailor resume'}
             </button>
-
-            {scoreResult && scoreColors && (
-              <div style={{ marginTop: 10 }}>
-                <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-                  <div style={{ width: 48, height: 48, borderRadius: '50%', background: `conic-gradient(${scoreColors.color} ${scoreResult.score}%, rgba(0,0,0,.07) ${scoreResult.score}%)`, display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0 }}>
-                    <div style={{ width: 36, height: 36, borderRadius: '50%', background: C.card, display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 14, fontWeight: 700, color: scoreColors.color }}>{scoreResult.score}</div>
-                  </div>
-                  <div>
-                    <div style={{ fontSize: 11, fontWeight: 600, color: C.text }}>{scoreColors.tone === 'strong' ? 'Strong Match' : scoreColors.tone === 'normal' ? 'Good Match' : 'Needs Work'}</div>
-                    {scoreResult.strengthSummary && <div style={{ fontSize: 9, color: C.muted, marginTop: 2 }}>{scoreResult.strengthSummary}</div>}
-                  </div>
-                </div>
-                {scoreResult.matchedKeywords.length > 0 && (
-                  <div style={{ marginTop: 8 }}>
-                    <div style={{ fontSize: 9, fontWeight: 600, color: C.subtle, marginBottom: 4, textTransform: 'uppercase' }}>Matched</div>
-                    <div style={{ display: 'flex', flexWrap: 'wrap', gap: 3 }}>
-                      {scoreResult.matchedKeywords.slice(0, 12).map(kw => (
-                        <span key={kw} style={{ fontSize: 9, padding: '2px 6px', borderRadius: 999, background: 'rgba(59,109,17,0.1)', color: C.green, border: '0.5px solid rgba(59,109,17,0.2)' }}>{kw}</span>
-                      ))}
-                    </div>
-                  </div>
-                )}
-                {scoreResult.missingItems.length > 0 && (
-                  <div style={{ marginTop: 8 }}>
-                    <div style={{ fontSize: 9, fontWeight: 600, color: C.subtle, marginBottom: 4, textTransform: 'uppercase' }}>Missing</div>
-                    {scoreResult.missingItems.slice(0, 6).map(item => (
-                      <div key={item.keyword} style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '3px 0', borderBottom: `0.5px solid ${C.border}20` }}>
-                        <div><span style={{ fontSize: 10, color: C.red }}>{item.keyword}</span><span style={{ fontSize: 8, color: C.subtle, marginLeft: 6 }}>{item.target}</span></div>
-                        <button onClick={() => addMissingKeyword(item)} style={{ fontSize: 9, padding: '2px 8px', borderRadius: 999, background: C.primary, color: '#fff', border: 'none', cursor: 'pointer', fontFamily: 'inherit', fontWeight: 600 }}>+ Add</button>
-                      </div>
-                    ))}
-                  </div>
-                )}
-              </div>
-            )}
-
-            {suggestions.filter(s => !s.applied).length > 0 && (
-              <div style={{ marginTop: 10 }}>
-                <div style={{ fontSize: 9, fontWeight: 600, color: C.subtle, marginBottom: 6, textTransform: 'uppercase' }}>AI Suggestions · One-Click Apply</div>
-                {suggestions.filter(s => !s.applied).map((s, i) => (
-                  <div key={i} style={{ padding: '8px 10px', borderRadius: 8, marginBottom: 6, background: C.bg, border: `0.5px solid ${C.border}` }}>
-                    <div style={{ fontSize: 10, color: C.text, marginBottom: 4, lineHeight: 1.4 }}>{s.text}</div>
-                    <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
-                      <span style={{ fontSize: 9, padding: '1px 6px', borderRadius: 999, background: 'rgba(79,70,229,0.08)', color: C.primary }}>{s.target}</span>
-                      <span style={{ fontSize: 9, color: C.subtle }}>{s.action}</span>
-                      <button onClick={() => applySuggestion(s)} style={{ fontSize: 9, padding: '3px 12px', borderRadius: 999, background: C.green, color: '#fff', border: 'none', cursor: 'pointer', fontFamily: 'inherit', fontWeight: 600, marginLeft: 'auto' }}>Apply</button>
-                    </div>
-                  </div>
-                ))}
-              </div>
-            )}
           </div>
         )}
 
