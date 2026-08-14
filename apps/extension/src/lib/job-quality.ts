@@ -52,9 +52,14 @@ export function mergeJobDetails<T extends JobLike>(primary: T, fallback: Partial
   const useFallbackDescription = fallbackDescription.trim().length > primaryDescription.trim().length
   const useFallbackLocation = !hasKnownLocation(primary.location) && hasKnownLocation(fallback.location)
   const useFallbackSalary = !primary.salary && Boolean(fallback.salary)
+  const fallbackCanonical = fallback.url
+    ? canonicalJobKey({ source: fallback.source ?? primary.source, url: fallback.url })
+    : null
+  const useFallbackUrl = Boolean(fallback.url && fallbackCanonical && !canonicalJobKey(primary))
 
   return {
     ...primary,
+    url: useFallbackUrl ? fallback.url! : primary.url,
     description: useFallbackDescription ? fallbackDescription : primary.description,
     location: useFallbackLocation ? fallback.location! : primary.location,
     salary: useFallbackSalary ? fallback.salary! : primary.salary,

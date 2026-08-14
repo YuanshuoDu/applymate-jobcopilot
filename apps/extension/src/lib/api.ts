@@ -136,7 +136,7 @@ export async function saveJob(
 
 export async function getRecentJobs(settings: ExtensionSettings): Promise<SavedJob[]> {
   const data = await request<{ jobs: SavedJob[]; total: number }>(
-    settings, '/api/jobs?pageSize=20',
+    settings, '/api/jobs?pageSize=100',
   )
   return data.jobs
 }

@@ -6,7 +6,7 @@ import { detectAndScrape } from '@/lib/scrapers/detect'
 import { scrapeIndeedFromDocument } from '@/lib/scrapers/indeed'
 import { hasUsableDescription, isJobReadyForTailoring, mergeJobDetails } from '@/lib/job-quality'
 import { getJobIdentity } from '@/lib/job-identity'
-import type { ScrapedJob } from '@/lib/types'
+import type { SavedJob, ScrapedJob } from '@/lib/types'
 
 const ATTR        = 'data-applymate'
 const POPUP_ID  = 'applymate-popup'
@@ -452,6 +452,10 @@ const savedJobKeys = new Set<string>()
 // Some LinkedIn virtualized cards temporarily share a URL/provider id while
 // their own fingerprint remains distinct.
 const savedCardKeys = new Set<string>()
+let savedRemoteJobs: SavedJob[] = []
+let savedJobsHydratedForAccount = false
+let savedJobsHydrationPromise: Promise<void> | null = null
+let savedJobsHydrationGeneration = 0
 
 type CardButtonState = 'idle' | 'saving' | 'saved' | 'error'
 
@@ -736,6 +740,107 @@ function markSavedByCardKey(cardKey: string) {
   })
 }
 
+function normalizedJobText(value: string | null | undefined): string {
+  return (value ?? '').replace(/\s+/g, ' ').trim().toLowerCase()
+}
+
+function isWeakListIdentity(job: CardJob): boolean {
+  if (job.source === 'linkedin') {
+    return !/currentJobId=|\/jobs\/view\/(?:[^/?#]*-)?\d{5,}/i.test(job.url)
+  }
+  if (job.source === 'indeed') return !/[?&](?:jk|vjk)=/i.test(job.url)
+  return false
+}
+
+function locationsOverlap(left: string, right: string): boolean {
+  if (!left || !right || left === 'unknown' || right === 'unknown') return true
+  return left.includes(right) || right.includes(left) || left.split(/[(),·|/]+/).some(part =>
+    part.trim().length >= 3 && right.includes(part.trim()),
+  )
+}
+
+function matchesSavedRemoteJob(job: CardJob, saved: SavedJob): boolean {
+  const source = normalizedJobText(saved.source)
+  if (source && source !== 'unknown' && source !== normalizedJobText(job.source)) return false
+  if (normalizedJobText(job.title) !== normalizedJobText(saved.role)) return false
+  if (normalizedJobText(job.company) !== normalizedJobText(saved.company)) return false
+  return locationsOverlap(normalizedJobText(job.location), normalizedJobText(saved.location))
+}
+
+function readCardJob(button: HTMLButtonElement): CardJob | null {
+  try {
+    const value: unknown = JSON.parse(button.getAttribute('data-applymate-job') ?? 'null')
+    if (!value || typeof value !== 'object') return null
+    const job = value as Partial<CardJob>
+    if (typeof job.title !== 'string' || typeof job.company !== 'string' || typeof job.url !== 'string') return null
+    return {
+      title: job.title,
+      company: job.company,
+      location: typeof job.location === 'string' ? job.location : '',
+      salary: typeof job.salary === 'string' ? job.salary : '',
+      url: job.url,
+      source: typeof job.source === 'string' ? job.source : 'unknown',
+    }
+  } catch {
+    return null
+  }
+}
+
+function isRemoteSaved(job: CardJob): boolean {
+  if (savedRemoteJobs.some(saved => matchesSavedRemoteJob(job, saved))) return true
+  return !isWeakListIdentity(job) && savedJobKeys.has(getJobIdentity(job))
+}
+
+function refreshSavedCardButtons() {
+  document.querySelectorAll<HTMLButtonElement>(`.${BTN_CLASS}`).forEach(button => {
+    const job = readCardJob(button)
+    const cardKey = button.dataset.applymateCardKey
+    if (!job || !cardKey || !isRemoteSaved(job)) return
+    savedCardKeys.add(cardKey)
+    renderCardButtonState(button, 'saved')
+    button.disabled = false
+  })
+}
+
+async function hydrateSavedJobs() {
+  if (savedJobsHydratedForAccount) return
+  if (savedJobsHydrationPromise) return savedJobsHydrationPromise
+
+  const generation = savedJobsHydrationGeneration
+  savedJobsHydrationPromise = (async () => {
+    try {
+      const response = await chrome.runtime.sendMessage({ type: 'GET_RECENT_JOBS' }) as { jobs?: unknown } | undefined
+      if (!Array.isArray(response?.jobs)) return
+      if (generation !== savedJobsHydrationGeneration) return
+      savedRemoteJobs = response.jobs.filter((job): job is SavedJob => Boolean(
+        job && typeof job === 'object' &&
+        typeof (job as { id?: unknown }).id === 'string' &&
+        typeof (job as { role?: unknown }).role === 'string' &&
+        typeof (job as { company?: unknown }).company === 'string',
+      ))
+      savedRemoteJobs.forEach(saved => {
+        savedJobKeys.add(getJobIdentity({
+          source: saved.source ?? undefined,
+          url: saved.url ?? undefined,
+          role: saved.role,
+          company: saved.company,
+          location: saved.location ?? undefined,
+        }))
+      })
+      refreshSavedCardButtons()
+      savedJobsHydratedForAccount = true
+    } catch (error) {
+      log('Saved-job hydration skipped:', error)
+    }
+  })()
+
+  try {
+    await savedJobsHydrationPromise
+  } finally {
+    savedJobsHydrationPromise = null
+  }
+}
+
 function markSavedByKey(key: string, targetButton?: HTMLButtonElement, cardKey?: string) {
   if (!key) return
   savedJobKeys.add(key)
@@ -768,9 +873,7 @@ export function markJobSaved(
 }
 
 function isAlreadySaved(job: CardJob, cardKey?: string): boolean {
-  return cardKey
-    ? savedCardKeys.has(cardKey)
-    : savedJobKeys.has(getJobIdentity(job))
+  return (cardKey ? savedCardKeys.has(cardKey) : false) || isRemoteSaved(job)
 }
 
 // ── Per-card button ───────────────────────────────────────────────────────────
@@ -836,6 +939,14 @@ async function saveCardJob(card: Element, job: CardJob, button: HTMLButtonElemen
   renderCardButtonState(button, 'saving')
 
   try {
+    // Prevent a just-refreshed page from saving a job again while the
+    // account's authoritative saved-job list is still loading.
+    await hydrateSavedJobs()
+    if (isAlreadySaved(job, cardKey)) {
+      renderCardButtonState(button, 'saved')
+      button.disabled = false
+      return
+    }
     const fullJob = await resolveJobForSave(card, job)
     if (!fullJob) throw new Error('Open the job details first so ApplyMate can read the full description.')
     await chrome.runtime.sendMessage({ type: 'JOB_SCRAPED', job: fullJob })
@@ -1208,6 +1319,7 @@ export function startListModeInjector() {
   log('Starting list injector for:', window.location.hostname, 'card selector:', cfg.card)
 
   processCards(cfg)
+  void hydrateSavedJobs()
 
   // RAF debounce: LinkedIn and Indeed trigger dozens of DOM mutations per second
   // (virtual scrolling, ad injection, lazy-loaded images). Without debounce,
@@ -1244,6 +1356,10 @@ window.addEventListener('applymate:logout', () => {
   log('Logout event — clearing saved state')
   savedJobKeys.clear()
   savedCardKeys.clear()
+  savedRemoteJobs = []
+  savedJobsHydratedForAccount = false
+  savedJobsHydrationPromise = null
+  savedJobsHydrationGeneration += 1
   document.querySelectorAll<HTMLButtonElement>(`.${BTN_CLASS}`).forEach(btn => {
     renderCardButtonState(btn, 'idle')
     btn.disabled = false
@@ -1262,12 +1378,23 @@ window.addEventListener('applymate:job-saved', (event) => {
 
 window.addEventListener('applymate:login', () => {
   log('Login event — ready to save')
+  savedJobKeys.clear()
+  savedCardKeys.clear()
+  savedRemoteJobs = []
+  savedJobsHydratedForAccount = false
+  savedJobsHydrationPromise = null
+  savedJobsHydrationGeneration += 1
+  document.querySelectorAll<HTMLButtonElement>(`.${BTN_CLASS}`).forEach(btn => {
+    renderCardButtonState(btn, 'idle')
+    btn.disabled = false
+  })
   document.querySelectorAll<HTMLButtonElement>(`.${BTN_CLASS}`).forEach(btn => {
     if (btn.style.background === 'rgb(163, 45, 45)') {
       btn.innerHTML = `<span>⊕</span>`
       btn.style.background = ''
     }
   })
+  void hydrateSavedJobs()
 })
 
 export function isJobListPage(): boolean {
