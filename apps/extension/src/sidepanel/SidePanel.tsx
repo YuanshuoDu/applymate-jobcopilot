@@ -13,11 +13,16 @@ import {
   BarChart3,
   Bookmark,
   ChevronDown,
+  Check,
+  Download,
   ExternalLink,
+  FileText,
   LoaderCircle,
+  Mail,
   RefreshCw,
   Search,
   Send,
+  ShieldCheck,
   Tags,
   MessageSquare,
   Sparkles,
@@ -27,6 +32,7 @@ import {
 import { getCurrentJob } from '@/lib/storage'
 import { isSameJob } from '@/lib/job-identity'
 import {
+  exportApplicationPackLocally,
   getDashboard,
   scoreSavedJob,
   updateJobNotes,
@@ -607,6 +613,8 @@ function JobCard({ job, expanded, onToggle, settings, onScore, scoring, L }: {
   const [notes, setNotes] = useState(job.notes ?? '')
   const [notesSaving, setNotesSaving] = useState(false)
   const [notesError, setNotesError] = useState('')
+  const [packExporting, setPackExporting] = useState(false)
+  const [packError, setPackError] = useState('')
   const initialNotes = useRef(job.notes ?? '')
   const notesTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
   const displayStatus = visibleStatus(job.status)
@@ -639,6 +647,24 @@ function JobCard({ job, expanded, onToggle, settings, onScore, scoring, L }: {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [notes, expanded])
 
+  const hasResume = Boolean(job.finalResumeId)
+  const hasCoverLetter = Boolean(job.finalCoverLetterId)
+  const packReady = hasResume && hasCoverLetter
+
+  async function handlePackDownload() {
+    if (!packReady || packExporting) return
+    setPackExporting(true)
+    setPackError('')
+    try {
+      const result = await exportApplicationPackLocally(settings, job.id, true)
+      if (!result.opened) setPackError('Could not open the job folder')
+    } catch (error) {
+      setPackError(error instanceof Error ? error.message : 'Download failed')
+    } finally {
+      setPackExporting(false)
+    }
+  }
+
   return (
     <article className={`am-job-card${expanded ? ' expanded' : ''}`} data-job-id={job.id}>
       <div className="am-job-row">
@@ -655,11 +681,34 @@ function JobCard({ job, expanded, onToggle, settings, onScore, scoring, L }: {
         <button className="am-chevron" type="button" onMouseDown={event => { event.preventDefault(); event.currentTarget.blur() }} onClick={onToggle} aria-label={expanded ? `Collapse ${job.role}` : `Expand ${job.role}`}><ChevronDown size={16} className={expanded ? 'am-chevron-open' : ''} /></button>
       </div>
       {expanded && <div className="am-detail">
-        <div className="am-detail-grid"><div className="am-detail-box"><div className="am-detail-label">Notes</div><div className="am-notes-meta"><span>{notesSaving ? <span className="am-saving">Saving…</span> : notesError ? <span className="am-note-error">{notesError}</span> : notes ? <span className="am-saved">Saved</span> : 'Add context for later'}</span></div><textarea className="am-notes" value={notes} onChange={event => { setNotes(event.target.value); setNotesError('') }} placeholder="Interview questions, salary, contact…" /></div><div className="am-detail-box am-detail-insights"><div className="am-detail-label am-detail-label-icon"><Tags size={11} aria-hidden="true" /> Key job tags</div>{keyTags.length > 0 ? <div className="am-key-tags">{keyTags.map(tag => <span key={tag} className="am-key-tag">{tag}</span>)}</div> : <div className="am-detail-text">Score this role to extract its main skills and requirements.</div>}<div className="am-detail-label am-detail-score-label">Match score</div><div className="am-detail-text">{job.score == null ? 'Not scored yet.' : `Scored at ${job.score}% against your resume.`}</div>{!job.url && <div className="am-detail-text">No original link saved.</div>}</div></div>
+        <div className="am-detail-grid"><div className="am-detail-box"><div className="am-detail-label">Notes</div><div className="am-notes-meta"><span>{notesSaving ? <span className="am-saving">Saving…</span> : notesError ? <span className="am-note-error">{notesError}</span> : notes ? <span className="am-saved">Saved</span> : 'Add context for later'}</span></div><textarea className="am-notes" value={notes} onChange={event => { setNotes(event.target.value); setNotesError('') }} placeholder="Interview questions, salary, contact…" /><ApplicationPackSummary hasResume={hasResume} hasCoverLetter={hasCoverLetter} ready={packReady} exporting={packExporting} error={packError} onPrepare={() => window.open(`${settings.apiBaseUrl}/jobs?highlight=${job.id}`, '_blank', 'noopener,noreferrer')} onDownload={() => void handlePackDownload()} /></div><div className="am-detail-box am-detail-insights"><div className="am-detail-label am-detail-label-icon"><Tags size={11} aria-hidden="true" /> Key job tags</div>{keyTags.length > 0 ? <div className="am-key-tags">{keyTags.map(tag => <span key={tag} className="am-key-tag">{tag}</span>)}</div> : <div className="am-detail-text">Score this role to extract its main skills and requirements.</div>}<div className="am-detail-label am-detail-score-label">Match score</div><div className="am-detail-text">{job.score == null ? 'Not scored yet.' : `Scored at ${job.score}% against your resume.`}</div>{!job.url && <div className="am-detail-text">No original link saved.</div>}</div></div>
         <div className="am-detail-actions">{job.url && <a className="am-detail-action" href={job.url} target="_blank" rel="noreferrer">Open original <ExternalLink size={11} /></a>}<a className="am-detail-action primary" href={`${settings.apiBaseUrl}/jobs?highlight=${job.id}`} target="_blank" rel="noreferrer">Open in My Jobs <ArrowRight size={11} /></a></div>
       </div>}
     </article>
   )
+}
+
+function ApplicationPackSummary({ hasResume, hasCoverLetter, ready, exporting, error, onPrepare, onDownload }: {
+  hasResume: boolean
+  hasCoverLetter: boolean
+  ready: boolean
+  exporting: boolean
+  error: string
+  onPrepare: () => void
+  onDownload: () => void
+}) {
+  const rows = [
+    { label: 'Resume', icon: FileText, done: hasResume },
+    { label: 'Cover letter', icon: Mail, done: hasCoverLetter },
+    { label: 'Independent audit', icon: ShieldCheck, done: ready },
+  ]
+
+  return <div className="am-pack-summary">
+    <div className="am-pack-heading"><span><Sparkles size={11} aria-hidden="true" /> Application pack</span><span className={ready ? 'am-pack-ready' : 'am-pack-pending'}>{ready ? 'Ready' : 'Pending'}</span></div>
+    <div className="am-pack-rows">{rows.map(({ label, icon: Icon, done }) => <div className="am-pack-row" key={label}><span className={`am-pack-icon${done ? ' done' : ''}`}><Icon size={10} aria-hidden="true" /></span><span className="am-pack-row-label">{label}</span><span className={`am-pack-status${done ? ' done' : ''}`}>{done ? <><Check size={9} /> Ready</> : 'Pending'}</span></div>)}</div>
+    <div className="am-pack-actions"><button className="am-pack-prepare" type="button" onClick={onPrepare}>{ready ? 'Review in My Jobs' : 'Prepare full pack'} <ArrowRight size={10} /></button><button className="am-pack-download" type="button" disabled={!ready || exporting} onClick={onDownload} aria-label="Download application pack" title={ready ? 'Download application pack' : 'Complete the pack in My Jobs first'}><Download size={11} />{exporting ? '…' : 'Download'}</button></div>
+    {error && <div className="am-pack-error" role="status">{error}</div>}
+  </div>
 }
 
 function EmptyState({ hasSearch, filter, connectionError, onRetry, onClearSearch, onOpenDashboard, L }: { hasSearch: boolean; filter: FilterStatus; connectionError: boolean; onRetry: () => void; onClearSearch: () => void; onOpenDashboard: () => void; L: Labels }) {
