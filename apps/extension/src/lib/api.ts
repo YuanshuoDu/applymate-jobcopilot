@@ -342,6 +342,15 @@ export async function updateResume(settings: ExtensionSettings, id: string, body
   })
 }
 
+export async function tailorResume(settings: ExtensionSettings, jobId: string, resumeId: string): Promise<{ adaptedResumeId: string; changes?: unknown[]; reused?: boolean }> {
+  return request(settings, `/api/jobs/${jobId}/tailor-resume`, {
+    method: 'POST',
+    body: JSON.stringify({ resumeId }),
+    _timeoutMs: 120_000,
+    _retry: false,
+  })
+}
+
 export async function deleteResume(settings: ExtensionSettings, id: string): Promise<void> {
   await request(settings, `/api/resume/${id}`, { method: 'DELETE' })
 }

@@ -27,9 +27,9 @@ import {
 import { getCurrentJob, getCurrentResumeId, setCurrentResumeId, setResumeDraft, clearResumeDraft } from '@/lib/storage'
 import {
   listResumes, getResume, updateResume, createResume,
-  getRecentJobs, exportApplicationPackLocally,
+  getRecentJobs, saveJob, tailorResume, scoreResume, exportApplicationPackLocally,
 } from '@/lib/api'
-import type { ExtensionSettings, ScrapedJob, ResumeListItem, Resume, ResumeContent, TemplateOptions } from '@/lib/types'
+import type { ExtensionSettings, ScrapedJob, ResumeListItem, Resume, ResumeContent, TemplateOptions, ScoreResult } from '@/lib/types'
 
 // ── Design tokens ────────────────────────────────────────────────────────────────
 const C = {
@@ -126,6 +126,9 @@ export function ResumeView({ settings }: Props) {
   const [savedJobId, setSavedJobId] = useState<string | null>(null)
   const [exportedPackFolder, setExportedPackFolder] = useState<string | null>(null)
   const [exportingPack, setExportingPack] = useState(false)
+  const [tailoring, setTailoring] = useState(false)
+  const [tailorResult, setTailorResult] = useState<ScoreResult | null>(null)
+  const [tailorError, setTailorError] = useState('')
   const [uploading, setUploading] = useState(false)
   const [loadError, setLoadError] = useState('')
 
@@ -143,7 +146,7 @@ export function ResumeView({ settings }: Props) {
     return () => chrome.runtime.onMessage.removeListener(handler)
   }, [settings.apiBaseUrl, settings.apiToken, settings.userEmail])
 
-  useEffect(() => { setAuditedResumeId(null); setPackageStatus(null); setSavedJobId(null); setExportedPackFolder(null) }, [currentJob?.url])
+  useEffect(() => { setAuditedResumeId(null); setPackageStatus(null); setSavedJobId(null); setExportedPackFolder(null); setTailorResult(null); setTailorError('') }, [currentJob?.url])
 
   // A job opened in Chrome may have a different reviewed application package
   // from the last resume viewed in the extension. Prefer the final, audited
@@ -308,8 +311,41 @@ export function ResumeView({ settings }: Props) {
   }
 
   function handleOpenTailor() {
-    const url = savedJobId ? `${apiBase}/jobs?highlight=${savedJobId}` : `${apiBase}/jobs`
-    chrome.tabs.create({ url })
+    void handleTailor()
+  }
+
+  async function handleTailor() {
+    if (!currentJob || !activeId || tailoring) return
+    setTailoring(true)
+    setTailorResult(null)
+    setTailorError('')
+    try {
+      let jobId = savedJobId
+      if (!jobId) {
+        const saved = await saveJob(settings, currentJob)
+        jobId = saved.id
+        setSavedJobId(jobId)
+      }
+      const result = await tailorResume(settings, jobId, activeId)
+      const tailored = await getResume(settings, result.adaptedResumeId)
+      await loadResume(result.adaptedResumeId)
+      setAuditedResumeId(null)
+      setPackageStatus('missing')
+      const analysis = await scoreResume(settings, {
+        resumeContent: tailored.content,
+        jobTitle: currentJob.title,
+        jobCompany: currentJob.company,
+        jobDescription: currentJob.description,
+      })
+      setTailorResult(analysis)
+      showToast('Resume tailored for this job')
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Tailoring failed'
+      setTailorError(message)
+      showToast(message)
+    } finally {
+      setTailoring(false)
+    }
   }
 
   // ── Resolved template options ──────────────────────────────────────────────────
@@ -400,9 +436,11 @@ export function ResumeView({ settings }: Props) {
             </div>
             {auditedResumeId === activeId && <div style={{ margin: '0 0 9px', fontSize: 10, fontWeight: 600, color: C.green }}>✓ Using the audited resume selected in My Jobs</div>}
             {packageStatus === 'missing' && <div style={{ margin: '0 0 9px', fontSize: 10, lineHeight: 1.4, fontWeight: 600, color: C.amber }}>No tailored application pack for this job yet. Prepare it in My Jobs before submitting.</div>}
-            <button className="am-resume-match-button" type="button" onClick={handleOpenTailor}>
-              <FileText size={13} aria-hidden="true" /> {packageStatus === 'audited' ? 'Review application pack' : 'Tailor resume'}
+            <button className="am-resume-match-button" type="button" onClick={handleOpenTailor} disabled={tailoring}>
+              {tailoring ? <LoaderCircle size={13} className="am-spin" aria-hidden="true" /> : <FileText size={13} aria-hidden="true" />} {tailoring ? 'Tailoring resume…' : packageStatus === 'audited' ? 'Review application pack' : 'Tailor resume'}
             </button>
+            {tailorError && <div className="am-resume-tailor-error" role="alert">{tailorError}</div>}
+            {tailorResult && <TailorAnalysis result={tailorResult} />}
           </div>
         )}
 
@@ -499,6 +537,21 @@ export function ResumeView({ settings }: Props) {
       )}
     </div>
   )
+}
+
+function TailorAnalysis({ result }: { result: ScoreResult }) {
+  const sections = ['Summary', 'Skills', 'Experience', 'Education', 'Projects']
+  return <div className="am-resume-tailor-analysis">
+    <div className="am-resume-tailor-score"><div className="am-resume-tailor-score-ring" style={{ '--am-tailor-score': `${result.score}%` } as React.CSSProperties}><strong>{result.score}%</strong></div><div><strong>Match score</strong><span>{result.strengthSummary || 'Tailored to this role'}</span></div></div>
+    <div className="am-resume-section-heading">SECTION ANALYSIS</div>
+    <div className="am-resume-section-list">{sections.map(section => {
+      const score = result.sectionScores?.[section]
+      const match = result.sectionMatches?.find(item => item.section === section)
+      const tip = result.sectionTips?.[section]
+      if (score === undefined && !match) return null
+      return <div className="am-resume-section-row" key={section}><div className="am-resume-section-row-head"><span>{section}</span><strong>{score ?? match?.score ?? 0}%</strong></div><div className="am-resume-section-bar"><span style={{ width: `${Math.max(0, Math.min(score ?? match?.score ?? 0, 100))}%` }} /></div>{tip && <small>{tip}</small>}</div>
+    })}</div>
+  </div>
 }
 
 // ── Template Preview — renders resume with template styling ──────────────────────
