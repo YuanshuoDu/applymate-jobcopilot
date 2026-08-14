@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { normalizeApiBaseUrl } from '../src/lib/storage'
+import { getAccountStorageKey, getAccountStorageNamespace, normalizeApiBaseUrl } from '../src/lib/storage'
 
 describe('normalizeApiBaseUrl', () => {
   it('accepts the canonical HTTPS service', () => {
@@ -17,5 +17,17 @@ describe('normalizeApiBaseUrl', () => {
     expect(normalizeApiBaseUrl('https://applymate.site/api')).toBeNull()
     expect(normalizeApiBaseUrl('https://user:pass@applymate.site')).toBeNull()
     expect(normalizeApiBaseUrl('https://example.com')).toBeNull()
+  })
+})
+
+describe('account-scoped local keys', () => {
+  it('normalizes account identity and never uses a shared key', () => {
+    expect(getAccountStorageNamespace(' User@Example.com ')).toBe('user%40example.com')
+    expect(getAccountStorageKey('currentJob', 'User@Example.com')).toBe('applymate:currentJob:user%40example.com')
+    expect(getAccountStorageKey('currentJob', 'other@example.com')).not.toBe(getAccountStorageKey('currentJob', 'User@Example.com'))
+  })
+
+  it('uses an anonymous namespace when no account is authenticated', () => {
+    expect(getAccountStorageKey('urlCache')).toBe('applymate:urlCache:anonymous')
   })
 })

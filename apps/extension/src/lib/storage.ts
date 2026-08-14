@@ -11,6 +11,21 @@ const DEFAULTS: ExtensionSettings = {
 const STORAGE_TIMEOUT_MS = 2000
 const CANONICAL_API_ORIGIN = 'https://applymate.site'
 const DEV_API_ORIGINS = new Set(['http://localhost:3000', 'http://localhost:5173'])
+const LEGACY_LOCAL_KEYS = ['currentJob', 'currentResumeId', 'urlCache']
+
+/**
+ * Local extension state must never be shared between authenticated accounts.
+ * Email is the only stable identity currently returned to the extension, so
+ * use a URL-safe, case-normalized namespace until the API exposes a user id.
+ */
+export function getAccountStorageNamespace(userEmail?: string): string {
+  const normalized = userEmail?.trim().toLowerCase()
+  return normalized ? encodeURIComponent(normalized) : 'anonymous'
+}
+
+export function getAccountStorageKey(name: string, userEmail?: string): string {
+  return `applymate:${name}:${getAccountStorageNamespace(userEmail)}`
+}
 
 /** Keep bearer tokens on the canonical HTTPS service; localhost is dev-only. */
 export function normalizeApiBaseUrl(raw: string): string | null {
@@ -86,6 +101,8 @@ export async function saveSettings(partial: Partial<ExtensionSettings>): Promise
 }
 
 export async function clearAuth(): Promise<void> {
+  const current = await getSettings()
+  await clearAccountLocalState(current.userEmail)
   await saveSettings({ apiToken: '', userEmail: '', userName: '' })
 }
 
@@ -95,13 +112,14 @@ export function isLoggedIn(settings: ExtensionSettings): boolean {
 
 // ── Current page job (local — tab-specific) ───────────────────
 
-export async function setCurrentJob(job: ScrapedJob | null): Promise<void> {
-  await chrome.storage.local.set({ currentJob: job })
+export async function setCurrentJob(job: ScrapedJob | null, userEmail?: string): Promise<void> {
+  await chrome.storage.local.set({ [getAccountStorageKey('currentJob', userEmail)]: job })
 }
 
-export async function getCurrentJob(): Promise<ScrapedJob | null> {
-  const result = await chrome.storage.local.get('currentJob')
-  return result.currentJob ?? null
+export async function getCurrentJob(userEmail?: string): Promise<ScrapedJob | null> {
+  const key = getAccountStorageKey('currentJob', userEmail)
+  const result = await chrome.storage.local.get(key)
+  return result[key] ?? null
 }
 
 // ── Badge helpers ─────────────────────────────────────────────
@@ -117,31 +135,46 @@ export function clearBadge() {
 
 // ── Resume helpers ────────────────────────────────────────────────
 
-export async function setCurrentResumeId(id: string): Promise<void> {
-  await chrome.storage.local.set({ currentResumeId: id })
+export async function setCurrentResumeId(id: string, userEmail?: string): Promise<void> {
+  await chrome.storage.local.set({ [getAccountStorageKey('currentResumeId', userEmail)]: id })
 }
 
-export async function getCurrentResumeId(): Promise<string | null> {
-  const result = await chrome.storage.local.get('currentResumeId')
-  return result.currentResumeId ?? null
+export async function getCurrentResumeId(userEmail?: string): Promise<string | null> {
+  const key = getAccountStorageKey('currentResumeId', userEmail)
+  const result = await chrome.storage.local.get(key)
+  return result[key] ?? null
 }
 
-export async function setResumeDraft(resumeId: string, content: object): Promise<void> {
-  await chrome.storage.local.set({ [`resumeDraft:${resumeId}`]: { content, ts: Date.now() } })
+export async function setResumeDraft(resumeId: string, content: object, userEmail?: string): Promise<void> {
+  await chrome.storage.local.set({ [getAccountStorageKey(`resumeDraft:${resumeId}`, userEmail)]: { content, ts: Date.now() } })
 }
 
-export async function getResumeDraft(resumeId: string): Promise<{ content: object; ts: number } | null> {
-  const result = await chrome.storage.local.get(`resumeDraft:${resumeId}`)
-  const draft = result[`resumeDraft:${resumeId}`]
+export async function getResumeDraft(resumeId: string, userEmail?: string): Promise<{ content: object; ts: number } | null> {
+  const key = getAccountStorageKey(`resumeDraft:${resumeId}`, userEmail)
+  const result = await chrome.storage.local.get(key)
+  const draft = result[key]
   if (!draft) return null
   // Discard drafts older than 24h
   if (Date.now() - draft.ts > 86400000) {
-    await chrome.storage.local.remove(`resumeDraft:${resumeId}`)
+    await chrome.storage.local.remove(key)
     return null
   }
   return draft
 }
 
-export async function clearResumeDraft(resumeId: string): Promise<void> {
-  await chrome.storage.local.remove(`resumeDraft:${resumeId}`)
+export async function clearResumeDraft(resumeId: string, userEmail?: string): Promise<void> {
+  await chrome.storage.local.remove(getAccountStorageKey(`resumeDraft:${resumeId}`, userEmail))
+}
+
+/** Clear all local state owned by one account, including pre-fix legacy keys. */
+export async function clearAccountLocalState(userEmail?: string): Promise<void> {
+  const namespace = getAccountStorageNamespace(userEmail)
+  const all = await chrome.storage.local.get(null)
+  const ownedKeys = Object.keys(all).filter(key =>
+    key.startsWith(`applymate:`) && key.endsWith(`:${namespace}`),
+  )
+  // Remove the pre-account-scoping keys during any logout/switch so an older
+  // extension version cannot leave resumable state behind for the next user.
+  const keys = [...new Set([...ownedKeys, ...LEGACY_LOCAL_KEYS])]
+  if (keys.length > 0) await chrome.storage.local.remove(keys)
 }

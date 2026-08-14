@@ -97,7 +97,7 @@ export function PopupMainView({ settings, onSettings, onLogout }: {
     setMessage('')
     try {
       const resumeList = await listResumes(settings)
-      const currentResumeId = await getCurrentResumeId()
+      const currentResumeId = await getCurrentResumeId(settings.userEmail)
       const resumeId = currentResumeId && resumeList.some(resume => resume.id === currentResumeId) ? currentResumeId : resumeList[0]?.id
       if (!resumeId) throw new Error(labels.noResume)
       const resume = await getResume(settings, resumeId)

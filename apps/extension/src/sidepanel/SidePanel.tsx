@@ -24,7 +24,7 @@ import {
   Target,
   X,
 } from 'lucide-react'
-import { getCurrentResumeId } from '@/lib/storage'
+import { getCurrentJob, getCurrentResumeId } from '@/lib/storage'
 import { getJobIdentity } from '@/lib/job-identity'
 import {
   getDashboard,
@@ -273,7 +273,7 @@ export function SidePanel() {
   )
 }
 
-function CurrentPageBanner({ accountKey, onSaved }: { accountKey: string; onSaved: () => void }) {
+function CurrentPageBanner({ accountKey, userEmail, onSaved }: { accountKey: string; userEmail: string; onSaved: () => void }) {
   const [currentJob, setCurrentJob] = useState<ScrapedJob | null>(null)
   const [saving, setSaving] = useState(false)
   const [saved, setSaved] = useState(false)
@@ -310,7 +310,7 @@ function CurrentPageBanner({ accountKey, onSaved }: { accountKey: string; onSave
       setSaveError('')
       syncSavedState(job ?? null)
     }
-    chrome.storage.local.get('currentJob', result => acceptJob(result.currentJob ?? null))
+    void getCurrentJob(userEmail).then(acceptJob)
     const handler = (message: { type?: string; job?: ScrapedJob; savedJob?: SavedJob }) => {
       if (message.type === 'JOB_SCRAPED') acceptJob(message.job)
       if (message.type === 'JOB_SAVED' && message.savedJob && currentJobRef.current && getJobIdentity(currentJobRef.current) === getJobIdentity({ source: message.savedJob.source ?? undefined, url: message.savedJob.url ?? undefined, role: message.savedJob.role, company: message.savedJob.company, location: message.savedJob.location ?? undefined })) setSaved(true)
@@ -505,7 +505,7 @@ function TrackerPanel({ settings, L, onOpenResume }: { settings: ExtensionSettin
     setScoringId(job.id)
     try {
       const resumes = await listResumes(settings)
-      const currentId = await getCurrentResumeId()
+      const currentId = await getCurrentResumeId(settings.userEmail)
       const resumeId = currentId && resumes.some(resume => resume.id === currentId) ? currentId : resumes[0]?.id
       if (!resumeId) {
         showToast('Add a resume before scoring a job')
@@ -562,7 +562,7 @@ function TrackerPanel({ settings, L, onOpenResume }: { settings: ExtensionSettin
         </div>
 
         {(jobsSyncError || dashboardSyncError) && <div className="am-sync-banner" role="alert"><div><strong>Sync needs attention</strong><span>{jobsSyncError || dashboardSyncError}</span>{(jobsSyncError ? lastJobsSyncedAt : lastDashboardSyncedAt) && <small>Last synced {formatSyncAge((jobsSyncError ? lastJobsSyncedAt : lastDashboardSyncedAt)!)}</small>}</div><button type="button" onClick={() => refreshAll(true)}>Retry</button></div>}
-        <CurrentPageBanner accountKey={`${settings.apiBaseUrl}|${settings.apiToken}|${settings.userEmail}`} onSaved={() => refreshAll()} />
+        <CurrentPageBanner accountKey={`${settings.apiBaseUrl}|${settings.apiToken}|${settings.userEmail}`} userEmail={settings.userEmail} onSaved={() => refreshAll()} />
         <div className="am-list" ref={listRef}>
           {loading ? <div className="am-spinner"><LoaderCircle className="am-spin" size={20} aria-label="Loading jobs" /></div> : filtered.length === 0 ? <EmptyState hasSearch={Boolean(search.trim())} filter={filterStatus} connectionError={Boolean(jobsSyncError)} onRetry={() => refreshAll(true)} onClearSearch={() => setSearch('')} onOpenDashboard={() => chrome.tabs.create({ url: `${settings.apiBaseUrl}/jobs` })} L={L} /> : <div className="am-list-inner">{filtered.map(job => <JobCard key={job.id} job={job} expanded={expandedId === job.id} onToggle={() => setExpandedId(current => current === job.id ? null : job.id)} settings={settings} L={L} scoring={scoringId === job.id} onScore={() => void scoreJob(job)} />)}</div>}
         </div>

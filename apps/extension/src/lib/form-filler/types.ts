@@ -2,6 +2,8 @@
 
 export interface FormFieldSchema {
   id: string
+  /** Chrome frame that owns the field; omitted for legacy/main-frame scans. */
+  frameId?: number
   type: 'text' | 'textarea' | 'select' | 'radio' | 'checkbox' | 'date' | 'email' | 'tel' | 'url' | 'number' | 'file'
   label: string
   placeholder?: string

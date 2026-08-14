@@ -23,12 +23,14 @@ type ContentRuntime = {
 
 type ContentRuntimeGlobal = typeof globalThis & {
   __applyMateContentBuild?: string
+  __applyMateContentScriptState?: 'loading' | 'ready'
   __applyMateContentRuntime?: ContentRuntime
   __applyMateListInjectorCleanup?: () => void
   __applyMateJobUiCleanup?: () => void
 }
 
 const contentRuntimeGlobal = globalThis as ContentRuntimeGlobal
+contentRuntimeGlobal.__applyMateContentScriptState = 'loading'
 const contentRuntime: ContentRuntime = {
   marker: contentRuntimeGlobal.__applyMateContentBuild,
   isAlive: () => {
@@ -44,14 +46,10 @@ contentRuntimeGlobal.__applyMateContentRuntime = contentRuntime
 const BUTTON_ID   = 'applymate-save-btn'
 const TOAST_ID    = 'applymate-toast'
 
-// The dashboard only needs auth synchronisation, and Workday is injected on
-// demand for form fill. Running the job-board bootstrap on either page starts
-// repeated DOM scans and retry timers that provide no value there.
+// The dashboard only needs auth synchronisation. Workday supports both job
+// discovery and form fill, so it must use the normal job-page bootstrap.
 const IS_DASHBOARD_PAGE =
   window.location.hostname === 'applymate.site'
-const IS_FORM_FILL_ONLY_PAGE =
-  window.location.hostname.includes('workday.com') ||
-  window.location.hostname.includes('myworkdayjobs.com')
 const IS_KNOWN_JOB_PAGE = [
   /(^|\.)linkedin\.com$/i,
   /(^|\.)indeed\.[a-z.]+$/i,
@@ -81,7 +79,7 @@ const IS_KNOWN_JOB_PAGE = [
 // job-board bootstrap limited to known sources so optional all-site access
 // never causes job scraping UI to appear on unrelated websites.
 let SHOULD_BOOTSTRAP_JOB_UI =
-  IS_KNOWN_JOB_PAGE && !IS_DASHBOARD_PAGE && !IS_FORM_FILL_ONLY_PAGE
+  IS_KNOWN_JOB_PAGE && !IS_DASHBOARD_PAGE
 
 const DEBUG = true
 function log(...args: unknown[]) { if (DEBUG) console.log('[ApplyMate]', ...args) }
@@ -1101,7 +1099,7 @@ const FIELD_S = 'input:not([type="hidden"]):not([type="submit"]):not([type="butt
 
 function readCurrentFieldValues(fieldIds: string[]): Array<{ fieldId: string; value: string }> {
   const results: Array<{ fieldId: string; value: string }> = []
-  const targets = new Set(fieldIds)
+  const targetIds = new Map(fieldIds.map(fieldId => [fieldId.replace(/^frame\|\d+\|/, '').replace(/^iframe\|[^|]+\|/, ''), fieldId]))
   const docs: Document[] = [document]
   for (const iframe of Array.from(document.querySelectorAll('iframe'))) {
     try { const d = iframe.contentDocument; if (d) docs.push(d) } catch { /* x-origin */ }
@@ -1110,7 +1108,8 @@ function readCurrentFieldValues(fieldIds: string[]): Array<{ fieldId: string; va
     for (const el of Array.from(doc.querySelectorAll(FIELD_S))) {
       const ht = el as HTMLElement
       const gid = generateId(ht)
-      if (targets.has(gid)) {
+      const originalId = targetIds.get(gid)
+      if (originalId) {
         const tag = ht.tagName.toLowerCase()
         const type = (ht as HTMLInputElement).type ?? ''
         let val = ''
@@ -1119,7 +1118,7 @@ function readCurrentFieldValues(fieldIds: string[]): Array<{ fieldId: string; va
         else if (type === 'radio') { val = (ht as HTMLInputElement).checked ? ((ht as HTMLInputElement).value || 'true') : '' }
         else if (ht.getAttribute('contenteditable') === 'true') { val = ht.textContent ?? '' }
         else { val = (ht as HTMLInputElement).value ?? '' }
-        results.push({ fieldId: gid, value: val })
+        results.push({ fieldId: originalId, value: val })
       }
     }
   }
@@ -1195,3 +1194,5 @@ function installDebugTool() {
   document.documentElement.appendChild(script)
   log('Debug tool installed: run __amDebug() in console')
 }
+
+contentRuntimeGlobal.__applyMateContentScriptState = 'ready'

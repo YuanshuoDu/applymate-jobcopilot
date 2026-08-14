@@ -2,7 +2,7 @@
  * ApplyMate AI — Background Service Worker
  * Handles: message routing, API calls, badge updates, side panel
  */
-import { getSettings, setCurrentJob, setBadge, clearBadge } from '@/lib/storage'
+import { clearAccountLocalState, getAccountStorageKey, getSettings, setCurrentJob, setBadge, clearBadge } from '@/lib/storage'
 import { login, saveJob, getRecentJobs, getStats, updateJob } from '@/lib/api'
 import { getJobIdentity } from '@/lib/job-identity'
 import type { DashboardStats, ExtMessage, ExtensionSettings, SavedJob, ScrapedJob } from '@/lib/types'
@@ -57,27 +57,32 @@ chrome.storage.onChanged.addListener((changes, area) => {
   if (before?.apiToken === after?.apiToken && before?.userEmail === after?.userEmail && before?.apiBaseUrl === after?.apiBaseUrl) return
   savedJobsByKey.clear()
   pendingSavesByKey.clear()
+  if (before?.userEmail && before.userEmail !== after?.userEmail) {
+    void clearAccountLocalState(String(before.userEmail))
+  }
 })
 
 // ── URL → saved job ID cache (for auto-enrichment) ────────────────
-async function cacheJobUrl(url: string, jobId: string) {
-  const r = await chrome.storage.local.get('urlCache')
-  const cache = (r.urlCache ?? {}) as Record<string, string>
+async function cacheJobUrl(url: string, jobId: string, userEmail?: string) {
+  const key = getAccountStorageKey('urlCache', userEmail)
+  const r = await chrome.storage.local.get(key)
+  const cache = (r[key] ?? {}) as Record<string, string>
   cache[url] = jobId
   // Keep only 200 most recent (simple FIFO via Object.keys order)
   const keys = Object.keys(cache)
   if (keys.length > 200) {
     const trimmed: Record<string, string> = {}
     keys.slice(-200).forEach(k => { trimmed[k] = cache[k] })
-    await chrome.storage.local.set({ urlCache: trimmed })
+    await chrome.storage.local.set({ [key]: trimmed })
   } else {
-    await chrome.storage.local.set({ urlCache: cache })
+    await chrome.storage.local.set({ [key]: cache })
   }
 }
 
-async function lookupCachedJobId(url: string): Promise<string | null> {
-  const r = await chrome.storage.local.get('urlCache')
-  const cache = (r.urlCache ?? {}) as Record<string, string>
+async function lookupCachedJobId(url: string, userEmail?: string): Promise<string | null> {
+  const key = getAccountStorageKey('urlCache', userEmail)
+  const r = await chrome.storage.local.get(key)
+  const cache = (r[key] ?? {}) as Record<string, string>
   return cache[url] ?? null
 }
 
@@ -89,7 +94,6 @@ function shouldRestoreSaveUi(url?: string): boolean {
   if (!url) return false
   try {
     const host = new URL(url).hostname
-    if (host.includes('workday.com') || host.includes('myworkdayjobs.com')) return false
     return host.includes('linkedin.com') ||
       host.includes('indeed.') ||
       host.includes('glassdoor.com') ||
@@ -98,6 +102,8 @@ function shouldRestoreSaveUi(url?: string): boolean {
       host.includes('wellfound.com') ||
       host.includes('greenhouse.io') ||
       host.includes('lever.co') ||
+      host.includes('workday.com') ||
+      host.includes('myworkdayjobs.com') ||
       host.includes('smartrecruiters.com') ||
       host.includes('ashbyhq.com') ||
       host.includes('bamboohr.com') ||
@@ -296,7 +302,7 @@ async function handleMessage(
       const detectedAt = msg.job.detectedAt ?? Date.now()
       if (detectedAt < latestJobDetectedAt) return { ok: true, stale: true }
       latestJobDetectedAt = detectedAt
-      await setCurrentJob(msg.job)
+      await setCurrentJob(msg.job, settings.userEmail)
       setBadge('1', '#4F46E5')
       // Keep an already-open Popup/Side Panel in sync with the active page.
       chrome.runtime.sendMessage({ type: 'JOB_SCRAPED', job: msg.job }).catch(() => {})
@@ -305,7 +311,7 @@ async function handleMessage(
       // patch it now that the user has visited the detail page.
       // Rate limited: max once per URL per 30s window.
       if (settings.apiToken && msg.job.description) {
-        const jobId = await lookupCachedJobId(msg.job.url)
+        const jobId = await lookupCachedJobId(msg.job.url, settings.userEmail)
         if (jobId && checkRateLimit(`enrich:${msg.job.url}`)) {
           updateJob(settings, jobId, {
             description: msg.job.description,
@@ -336,7 +342,7 @@ async function handleMessage(
         pendingSavesByKey.delete(key)
         // Cache URL→jobId for later auto-enrichment when user visits the detail page
         if (savedJob?.id && msg.job.url) {
-          await cacheJobUrl(msg.job.url, savedJob.id)
+          await cacheJobUrl(msg.job.url, savedJob.id, settings.userEmail)
         }
         setBadge('✓', '#3B6D11')
         setTimeout(clearBadge, 3000)
@@ -455,6 +461,7 @@ chrome.tabs.onUpdated.addListener(async (tabId, info, tab) => {
 
   if (!isJobPage) {
     clearBadge()
-    await setCurrentJob(null)
+    const settings = await getSettings()
+    await setCurrentJob(null, settings.userEmail)
   }
 })

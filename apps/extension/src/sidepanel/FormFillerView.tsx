@@ -19,9 +19,11 @@ import {
 } from 'lucide-react'
 import { getSettings, saveSettings } from '@/lib/storage'
 import { getPersona, analyzeForm, reviseFormFields, getPersonaFields, savePersonaFields } from '@/lib/api'
+import { getCurrentJob } from '@/lib/storage'
 import type { ExtensionSettings } from '@/lib/types'
 import type { FormFieldSchema, FilledField, FormFillResponse } from '@/lib/form-filler/types'
 import type { PersonaField } from '@/lib/api'
+import { groupFieldIdsByFrame, groupFilledFieldsByFrame } from '@/lib/form-filler/frame-routing'
 
 type ViewState = 'idle' | 'scanning' | 'aiThinking' | 'review' | 'applying' | 'done' | 'error'
 type AnalysisPhase = 'fetchingPersona' | 'preparingPrompt' | 'waitingForAI' | 'processingResult'
@@ -35,7 +37,7 @@ async function ensureContentScript(tabId: number): Promise<void> {
 
   const load = (async () => {
     const probe = await chrome.scripting.executeScript({
-      target: { tabId },
+      target: { tabId, allFrames: true },
       world: 'ISOLATED',
       func: () => {
         const state = (globalThis as typeof globalThis & {
@@ -45,10 +47,13 @@ async function ensureContentScript(tabId: number): Promise<void> {
       },
     })
 
-    if (probe.some(result => result.result === true)) return
+    const missingFrameIds = probe
+      .filter(result => result.result !== true)
+      .map(result => result.frameId)
+    if (missingFrameIds.length === 0 && probe.length > 0) return
 
     await chrome.scripting.executeScript({
-      target: { tabId },
+      target: missingFrameIds.length > 0 ? { tabId, frameIds: missingFrameIds } : { tabId, allFrames: true },
       files: ['content.js'],
       world: 'ISOLATED',
     })
@@ -64,7 +69,7 @@ async function ensureContentScript(tabId: number): Promise<void> {
 
 async function scanFormDirectly(tabId: number): Promise<FormFieldSchema[]> {
   const results = await chrome.scripting.executeScript({
-    target: { tabId },
+    target: { tabId, allFrames: true },
     world: 'ISOLATED',
     func: () => {
       const hash = (value: string) => {
@@ -164,8 +169,15 @@ async function scanFormDirectly(tabId: number): Promise<FormFieldSchema[]> {
     },
   })
 
-  const fields = results[0]?.result
-  return Array.isArray(fields) ? fields as FormFieldSchema[] : []
+  const fields: FormFieldSchema[] = []
+  for (const result of results) {
+    if (!Array.isArray(result.result)) continue
+    const frameId = result.frameId ?? 0
+    for (const field of result.result as FormFieldSchema[]) {
+      fields.push({ ...field, id: `frame|${frameId}|${field.id}`, frameId })
+    }
+  }
+  return fields
 }
 
 async function refreshAuthFromDashboard(
@@ -340,14 +352,17 @@ export function FormFillerView({ settings, pendingFields, onFieldsConsumed, scan
       const tabId = tabs[0]?.id
       if (!tabId) return
 
-      const resp = await chrome.tabs.sendMessage(tabId, {
-        type: 'READ_FIELD_VALUES',
-        fieldIds: filledFields.filter(f => !f.skip).map(f => f.fieldId),
-      }) as { type?: string; values?: Array<{ fieldId: string; value: string }> } | undefined
+      const fieldIds = filledFields.filter(f => !f.skip).map(f => f.fieldId)
+      const grouped = groupFieldIdsByFrame(fieldIds, fields)
+      const responses = await Promise.all([...grouped.entries()].map(async ([frameId, ids]) => {
+        try {
+          return await chrome.tabs.sendMessage(tabId, { type: 'READ_FIELD_VALUES', fieldIds: ids }, { frameId }) as { type?: string; values?: Array<{ fieldId: string; value: string }> } | undefined
+        } catch { return undefined }
+      }))
+      const values = responses.flatMap(response => response?.type === 'FIELD_VALUES_RESULT' ? response.values ?? [] : [])
+      if (values.length === 0) return
 
-      if (resp?.type !== 'FIELD_VALUES_RESULT' || !resp.values) return
-
-      const matches = await computePersonaMatches(resp.values)
+      const matches = await computePersonaMatches(values)
       setPersonaMatches(matches)
     } catch { /* ignore */ }
     finally { setSavingPersona(false) }
@@ -493,8 +508,7 @@ export function FormFillerView({ settings, pendingFields, onFieldsConsumed, scan
       // Get current job for context
       let jobContext: string | undefined
       try {
-        const stored = await chrome.storage.local.get('currentJob')
-        const job = stored.currentJob
+        const job = await getCurrentJob(activeSettings.userEmail)
         if (job?.title && job?.company) {
           jobContext = `Job: ${job.title} at ${job.company}`
           if (job.location && job.location !== 'Unknown') jobContext += ` — ${job.location}`
@@ -617,14 +631,20 @@ export function FormFillerView({ settings, pendingFields, onFieldsConsumed, scan
         return
       }
       await ensureContentScript(tab.id)
-      const response = await chrome.tabs.sendMessage(tab.id, {
-        type: 'APPLY_FIELD_VALUES',
-        fields: filledFields,
-        schemas: fields,
-      })
-      if (response?.type === 'APPLY_RESULT') {
+      const groups = groupFilledFieldsByFrame(filledFields, fields)
+      const responses = await Promise.all(groups.map(async group => {
+        const response = await chrome.tabs.sendMessage(tab.id!, {
+          type: 'APPLY_FIELD_VALUES',
+          fields: group.fields,
+          schemas: group.schemas,
+        }, { frameId: group.frameId }) as { type?: string; failed?: string[] } | undefined
+        return response?.type === 'APPLY_RESULT'
+          ? response
+          : { failed: group.fields.filter(field => !field.skip).map(field => field.fieldId) }
+      }))
+      if (responses.length > 0) {
         const skipped = filledFields.filter(f => f.skip).length
-        const failed = response.failed ?? []
+        const failed = responses.flatMap(response => response.failed ?? [])
         const applied = filledFields.length - skipped - failed.length
         setAppliedCount(applied)
         setFailedFieldIds(failed)
@@ -641,15 +661,16 @@ export function FormFillerView({ settings, pendingFields, onFieldsConsumed, scan
       setErrorMsg(`Could not reach page: ${message}. Try scanning again.`)
       setViewState('error')
     }
-  }, [filledFields])
+  }, [filledFields, fields, analyzePersonaMatches])
 
   const handleUpload = useCallback(async (fieldId: string) => {
     const [tab] = await chrome.tabs.query({ active: true, currentWindow: true })
     if (!tab?.id) return
     await ensureContentScript(tab.id)
-    const response = await chrome.tabs.sendMessage(tab.id, { type: 'OPEN_UPLOAD_PICKER', fieldId }) as { success?: boolean; error?: string } | undefined
+    const frameId = fields.find(field => field.id === fieldId)?.frameId ?? 0
+    const response = await chrome.tabs.sendMessage(tab.id, { type: 'OPEN_UPLOAD_PICKER', fieldId }, { frameId }) as { success?: boolean; error?: string } | undefined
     if (!response?.success) setErrorMsg(response?.error ?? 'Could not open the file picker.')
-  }, [])
+  }, [fields])
 
   const handleFieldEdit = useCallback((fieldId: string, value: string) => {
     setFilledFields(prev => prev.map(f =>
@@ -687,9 +708,9 @@ export function FormFillerView({ settings, pendingFields, onFieldsConsumed, scan
     }
 
     /**
-     * Use the content scanner first so the scan IDs and the subsequent fill
-     * IDs come from the same implementation. The direct scanner remains an
-     * escape hatch for pages that reject content-script messaging.
+     * The direct scanner runs in every accessible frame and supplies stable
+     * frame-qualified IDs. The content scanner remains a fallback for custom
+     * widgets that are not represented by the direct DOM selector.
      */
     async function tryScan(): Promise<{ ok: boolean; injectError?: string }> {
       try {
@@ -707,15 +728,6 @@ export function FormFillerView({ settings, pendingFields, onFieldsConsumed, scan
         }
       }
       try {
-        const response = await chrome.tabs.sendMessage(tab.id!, { type: 'SCAN_FORM' })
-        if (response?.type === 'FORM_DETECTED' && response.fields?.length > 0) {
-          setFields(response.fields)
-          analyzeFields(response.fields)
-          return { ok: true }
-        }
-      } catch { /* content script not available yet */ }
-
-      try {
         const directFields = await scanFormDirectly(tab.id!)
         if (directFields.length > 0) {
           console.log('[FormFiller] Direct scan found', directFields.length, 'fields')
@@ -728,6 +740,15 @@ export function FormFillerView({ settings, pendingFields, onFieldsConsumed, scan
         console.warn('[FormFiller] Direct scan failed:', message)
         return { ok: false, injectError: message }
       }
+
+      try {
+        const response = await chrome.tabs.sendMessage(tab.id!, { type: 'SCAN_FORM' })
+        if (response?.type === 'FORM_DETECTED' && response.fields?.length > 0) {
+          setFields(response.fields)
+          analyzeFields(response.fields)
+          return { ok: true }
+        }
+      } catch { /* content script not available yet */ }
       return { ok: false }
     }
 

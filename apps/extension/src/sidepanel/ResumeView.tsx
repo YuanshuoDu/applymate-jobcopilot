@@ -25,7 +25,7 @@ import {
   Sparkles,
   Upload,
 } from 'lucide-react'
-import { getCurrentResumeId, setCurrentResumeId, setResumeDraft, clearResumeDraft } from '@/lib/storage'
+import { getCurrentJob, getCurrentResumeId, setCurrentResumeId, setResumeDraft, clearResumeDraft } from '@/lib/storage'
 import {
   listResumes, getResume, updateResume, createResume,
   scoreResume, suggestResume, getRecentJobs, exportApplicationPackLocally,
@@ -144,11 +144,11 @@ export function ResumeView({ settings }: Props) {
   // ── Init ───────────────────────────────────────────────────────────────────────
   useEffect(() => {
     loadResumeList()
-    chrome.storage.local.get('currentJob', r => { if (r.currentJob) setCurrentJob(r.currentJob) })
+    void getCurrentJob(settings.userEmail).then(job => setCurrentJob(job))
     const handler = (msg: any) => { if (msg.type === 'JOB_SCRAPED' && msg.job) setCurrentJob(msg.job) }
     chrome.runtime.onMessage.addListener(handler)
     return () => chrome.runtime.onMessage.removeListener(handler)
-  }, [])
+  }, [settings.apiBaseUrl, settings.apiToken, settings.userEmail])
 
   useEffect(() => { setAuditedResumeId(null); setPackageStatus(null); setSavedJobId(null); setExportedPackFolder(null) }, [currentJob?.url])
 
@@ -182,7 +182,7 @@ export function ResumeView({ settings }: Props) {
       const list = await listResumes(settings)
       setResumes(list)
       if (list.length > 0) {
-        const savedId = await getCurrentResumeId()
+        const savedId = await getCurrentResumeId(settings.userEmail)
         const targetId = savedId && list.find(r => r.id === savedId) ? savedId : list[0].id
         setActiveId(targetId)
         await loadResume(targetId)
@@ -205,7 +205,7 @@ export function ResumeView({ settings }: Props) {
       setDirty(false)
       setScoreResult(null)
       setSuggestions([])
-      await setCurrentResumeId(id)
+      await setCurrentResumeId(id, settings.userEmail)
     } catch (err) {
       const msg = err instanceof Error ? err.message : 'Failed to load'
       showToast(msg)
@@ -220,7 +220,7 @@ export function ResumeView({ settings }: Props) {
       const r = await createResume(settings, { name: `Resume ${resumes.length + 1}`, content: EMPTY_CONTENT, templateId: 'clean' })
       setResumes(prev => [r, ...prev]); setActiveId(r.id); setResume(r)
       setContent(EMPTY_CONTENT); setTemplateId('clean'); setTemplateOpts({}); setDirty(false)
-      await setCurrentResumeId(r.id); showToast('Created')
+      await setCurrentResumeId(r.id, settings.userEmail); showToast('Created')
     } catch { showToast('Failed') }
   }
 
@@ -246,7 +246,7 @@ export function ResumeView({ settings }: Props) {
       })
       setResumes(prev => [r, ...prev]); setActiveId(r.id); setResume(r)
       setContent(normalizeResumeContent(r.content)); setTemplateId('clean'); setTemplateOpts({}); setDirty(false)
-      await setCurrentResumeId(r.id); showToast('Resume uploaded & parsed!')
+      await setCurrentResumeId(r.id, settings.userEmail); showToast('Resume uploaded & parsed!')
     } catch { showToast('Upload failed') }
     finally { setUploading(false) }
   }
@@ -257,8 +257,8 @@ export function ResumeView({ settings }: Props) {
     setSaving(true)
     try {
       await updateResume(settings, activeId, { content: c, templateId: tid, templateOptions: topts })
-      setDirty(false); clearResumeDraft(activeId)
-    } catch { showToast('Save failed'); setResumeDraft(activeId, c) }
+      setDirty(false); clearResumeDraft(activeId, settings.userEmail)
+    } catch { showToast('Save failed'); setResumeDraft(activeId, c, settings.userEmail) }
     finally { setSaving(false) }
   }, [settings, activeId])
 

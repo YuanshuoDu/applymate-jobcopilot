@@ -5,6 +5,10 @@
 import type { FormFieldSchema, FilledField } from './types'
 import { generateId, extractLabel } from './form-scanner'
 
+function stripFramePrefix(fieldId: string): string {
+  return fieldId.replace(/^frame\|\d+\|/, '').replace(/^iframe\|[^|]+\|/, '')
+}
+
 export interface FillResult {
   fieldId: string
   success: boolean
@@ -67,7 +71,7 @@ export function fillFields(
  * the candidate chooses the reviewed PDF in this picker.
  */
 export function openUploadPicker(fieldId: string, onSelected: (fileName: string) => void): FillResult {
-  const cleanId = fieldId.replace(/^iframe\|[^|]+\|/, '')
+  const cleanId = stripFramePrefix(fieldId)
   for (const doc of getAllDocs()) {
     for (const candidate of Array.from(doc.querySelectorAll('input[type="file"]'))) {
       const input = candidate as HTMLInputElement
@@ -104,7 +108,7 @@ const INPUT_SELECTOR = 'input:not([type="hidden"]):not([type="submit"]):not([typ
 
 function resolveElement(field: FormFieldSchema): HTMLElement | null {
   // Strip iframe prefix from ID if present (fields scanned in iframes)
-  const cleanId = field.id.replace(/^iframe\|[^|]+\|/, '')
+  const cleanId = stripFramePrefix(field.id)
 
   for (const doc of getAllDocs()) {
     const candidates = doc.querySelectorAll(INPUT_SELECTOR)
@@ -131,7 +135,7 @@ function resolveElement(field: FormFieldSchema): HTMLElement | null {
 }
 
 function fillFieldById(fieldId: string, value: string): FillResult {
-  const cleanId = fieldId.replace(/^iframe\|[^|]+\|/, '')
+  const cleanId = stripFramePrefix(fieldId)
 
   for (const doc of getAllDocs()) {
     const candidates = doc.querySelectorAll(INPUT_SELECTOR)
