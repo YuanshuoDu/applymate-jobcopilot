@@ -1,6 +1,6 @@
 {
   "framework": "nextjs",
-  "buildCommand": "pnpm --filter @jobcopilot/shared build && pnpm --filter @jobcopilot/web exec prisma generate && pnpm --filter @jobcopilot/web build",
+  "buildCommand": "pnpm --filter @jobcopilot/shared build && if [ \"$VERCEL_ENV\" = \"production\" ]; then pnpm --filter @jobcopilot/web exec prisma migrate deploy; fi && pnpm --filter @jobcopilot/web exec prisma generate && pnpm --filter @jobcopilot/web build",
   "outputDirectory": "apps/web/.next",
   "installCommand": "pnpm install --ignore-scripts",
   "devCommand": "pnpm --filter @jobcopilot/web dev",
