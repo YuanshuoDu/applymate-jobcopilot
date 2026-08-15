@@ -40,7 +40,8 @@ export async function requireAdminMembership(request?: Request): Promise<AdminAc
   })
   const sessionValid = session?.user?.adminSessionVersion === membership?.sessionVersion
   const authVersionValid = isCurrentAuthVersion(session?.user?.authVersion, membership?.user.authVersion ?? -1)
-  if (membership?.user.accountStatus !== 'active' || membership?.status !== AdminMembershipStatus.active || !sessionValid || !authVersionValid || (membership.role.key === 'super_admin' && membership.mfaLevel !== AdminMfaLevel.webauthn)) {
+  const canBootstrapWebAuthn = isWebAuthnBootstrapRequest(request)
+  if (membership?.user.accountStatus !== 'active' || membership?.status !== AdminMembershipStatus.active || !sessionValid || !authVersionValid || (membership.role.key === 'super_admin' && membership.mfaLevel !== AdminMfaLevel.webauthn && !canBootstrapWebAuthn)) {
     return denied(requestId, 'observability.read', 'membership_inactive', request, userId)
   }
   return Object.freeze({ userId, roleKey: membership.role.key, permissions: Object.freeze([...membership.role.permissions]), requestId })
@@ -95,6 +96,15 @@ function isAdminRequest(request: Request): boolean {
   try {
     const hostname = new URL(request.url).hostname
     return isAdminHost(hostname) || isLocalHost(hostname)
+  } catch {
+    return false
+  }
+}
+
+function isWebAuthnBootstrapRequest(request?: Request): boolean {
+  if (!request || !['GET', 'POST'].includes(request.method)) return false
+  try {
+    return new URL(request.url).pathname === '/api/admin/v1/security/webauthn'
   } catch {
     return false
   }

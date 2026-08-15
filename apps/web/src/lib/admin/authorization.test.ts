@@ -53,6 +53,23 @@ describe('requireAdmin', () => {
     if (!isAdminResponse(result)) expect(result.roleKey).toBe('operations')
   })
 
+  it('allows a super admin without MFA to bootstrap the first WebAuthn key', async () => {
+    mocks.safeAuth.mockResolvedValue({ user: { id: 'admin-1', adminSessionVersion: 2, authVersion: 1 } })
+    mocks.findUnique.mockResolvedValue({ status: 'active', mfaLevel: 'none', sessionVersion: 2, user: { accountStatus: 'active', authVersion: 1 }, role: { key: 'super_admin', permissions: ['security.webauthn.manage'] } })
+    const { requireAdminMembership, isAdminResponse } = await import('./authorization')
+    const result = await requireAdminMembership(new Request('https://admin.applymate.site/api/admin/v1/security/webauthn', { method: 'POST' }))
+    expect(isAdminResponse(result)).toBe(false)
+  })
+
+  it('does not treat the WebAuthn bootstrap exception as fresh reauthentication', async () => {
+    mocks.safeAuth.mockResolvedValue({ user: { id: 'admin-1', adminSessionVersion: 2, authVersion: 1 } })
+    mocks.findUnique.mockResolvedValue({ status: 'active', mfaLevel: 'none', sessionVersion: 2, user: { accountStatus: 'active', authVersion: 1 }, role: { key: 'super_admin', permissions: ['billing.update'] } })
+    const { requireAdmin } = await import('./authorization')
+    const result = await requireAdmin('billing.update', new Request('https://admin.applymate.site/api/admin/v1/users/u1/subscription', { method: 'POST', headers: { Origin: 'https://admin.applymate.site', Host: 'admin.applymate.site', 'Idempotency-Key': 'bootstrap-security-check' } }))
+    expect(result).toBeInstanceOf(Response)
+    expect(await (result as Response).json()).toEqual(expect.objectContaining({ code: 'reauth_required' }))
+  })
+
   it('permits an approved unexpired break-glass grant without changing the membership role', async () => {
     mocks.safeAuth.mockResolvedValue({ user: { id: 'admin-1', plan: 'pro', adminSessionVersion: 2, authVersion: 1 } })
     mocks.findUnique.mockResolvedValue({ status: 'active', mfaLevel: 'totp', sessionVersion: 2, user: { accountStatus: 'active', authVersion: 1 }, role: { key: 'operations', permissions: [] } })
