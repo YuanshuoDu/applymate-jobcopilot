@@ -33,7 +33,7 @@ export async function POST(request: Request) {
     if (body.action === 'revoke') return await revokeCredential(request, body)
   } catch (error) {
     console.error('[admin-webauthn]', error)
-    return NextResponse.json({ error: 'WebAuthn verification failed' }, { status: 400 })
+    return NextResponse.json({ error: 'WebAuthn verification failed', requestId: actor.requestId }, { status: 400, headers: { 'Cache-Control': 'no-store', 'x-request-id': actor.requestId } })
   }
   return NextResponse.json({ error: 'Unsupported WebAuthn action' }, { status: 400 })
 }
