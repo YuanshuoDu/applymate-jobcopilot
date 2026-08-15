@@ -13,7 +13,12 @@ vi.mock('@/components/ui', () => ({
   Card: ({ children }: { children?: React.ReactNode }) => React.createElement('section', null, children),
 }))
 vi.mock('next/link', () => ({ default: ({ href, children }: { href: string; children?: React.ReactNode }) => React.createElement('a', { href }, children) }))
-vi.mock('lucide-react', () => ({ Save: () => null, ShieldAlert: () => null }))
+vi.mock('lucide-react', () => ({
+  Plus: () => null,
+  Save: () => null,
+  ShieldAlert: () => null,
+  Trash2: () => null,
+}))
 
 import { PlanManagementPage } from './PlanManagementPage'
 
@@ -39,6 +44,8 @@ describe('PlanManagementPage', () => {
     expect(html).toContain('Currency')
     expect(html).toContain('Display order')
     expect(html).toContain('value="42"')
+    expect(html).toContain('What users can actually use')
+    expect(html).not.toContain('Entitlements (one per line)')
     expect(html).not.toContain('<main')
   })
 
