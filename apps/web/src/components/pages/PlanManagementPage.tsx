@@ -2,16 +2,19 @@
 
 import React, { useEffect, useMemo, useState } from 'react'
 import Link from 'next/link'
+import { startAuthentication } from '@simplewebauthn/browser'
 import { Save, ShieldAlert } from 'lucide-react'
 import { TopBar } from '@/components/layout/TopBar'
 import { Btn, Card } from '@/components/ui'
-import { apiMutate, useApi } from '@/lib/hooks'
+import { useApi } from '@/lib/hooks'
+import { adminMutationHeaders } from '@/lib/admin/client'
 import type { BillingInterval, PlanCatalogueRecord, PlanKey } from '@/lib/plan-catalogue-shared'
 import { AdminSubscriptionControls } from '@/components/admin/AdminSubscriptionControls'
 import { PlanEntitlementEditor } from '@/components/admin/PlanEntitlementEditor'
 import { PlanFeatureListEditor } from '@/components/admin/PlanFeatureListEditor'
 
 type PlansResponse = { plans: PlanCatalogueRecord[] }
+type PlanMutationResponse = PlansResponse & { error?: string; code?: string }
 
 const INTERVALS: BillingInterval[] = ['forever', 'month', 'year']
 
@@ -24,6 +27,13 @@ function priceLabel(plan: PlanCatalogueRecord): string {
   return `Price (${plan.currency} ${period})`
 }
 
+function webAuthnErrorMessage(error: unknown) {
+  const message = error instanceof Error ? error.message : ''
+  return /notallowederror|does not have focus|not allowed at this time/i.test(message)
+    ? 'Click this administrator page to give it focus, then try WebAuthn again.'
+    : message || 'WebAuthn reauthentication failed.'
+}
+
 export function PlanManagementPage({ canUpdate = true, canViewObservability = true }: { canUpdate?: boolean; canViewObservability?: boolean }) {
   const { data, loading, error, refetch } = useApi<PlansResponse>('/api/admin/v1/plans', { timeoutMs: 10_000 })
   const [plans, setPlans] = useState<PlanCatalogueRecord[]>([])
@@ -31,6 +41,7 @@ export function PlanManagementPage({ canUpdate = true, canViewObservability = tr
   const [saving, setSaving] = useState(false)
   const [saveError, setSaveError] = useState<string | null>(null)
   const [saved, setSaved] = useState(false)
+  const [reauthRequired, setReauthRequired] = useState(false)
 
   useEffect(() => {
     if (!data?.plans) return
@@ -50,22 +61,65 @@ export function PlanManagementPage({ canUpdate = true, canViewObservability = tr
     setPlans(current => updatePlan(current, selectedKey, patch))
   }
 
+  async function persist(nextPlans: PlanCatalogueRecord[]) {
+    // The catalogue API accepts editable plan fields only. `id` and `version`
+    // are response metadata and must not be sent back as part of the patch.
+    const editablePlans = nextPlans.map(({ id: _id, version: _version, ...plan }) => plan)
+    const response = await fetch('/api/admin/v1/plans', { method: 'PATCH', headers: adminMutationHeaders(), body: JSON.stringify({ plans: editablePlans }) })
+    const payload = await response.json().catch(() => ({})) as PlanMutationResponse
+    return { response, payload }
+  }
+
   async function save() {
     if (!plans.length) return
     setSaving(true)
     setSaveError(null)
     setSaved(false)
-    // The catalogue API accepts editable plan fields only. `id` and `version`
-    // are response metadata and must not be sent back as part of the patch.
-    const editablePlans = plans.map(({ id: _id, version: _version, ...plan }) => plan)
-    const result = await apiMutate<PlansResponse>('/api/admin/v1/plans', 'PATCH', { plans: editablePlans })
-    setSaving(false)
-    if (result.error) {
-      setSaveError(result.error)
-      return
+    try {
+      const result = await persist(plans)
+      if (!result.response.ok) {
+        setReauthRequired(result.payload.code === 'reauth_required')
+        setSaveError(result.payload.error ?? 'Plan catalogue could not be saved.')
+        return
+      }
+      setReauthRequired(false)
+      if (result.payload.plans) setPlans(result.payload.plans)
+      setSaved(true)
+    } catch (error) {
+      setSaveError(error instanceof Error ? error.message : 'Plan catalogue could not be saved.')
+    } finally {
+      setSaving(false)
     }
-    if (result.data?.plans) setPlans(result.data.plans)
-    setSaved(true)
+  }
+
+  async function reauthenticateAndRetry() {
+    if (!plans.length) return
+    setSaving(true)
+    setSaveError(null)
+    try {
+      const optionsResponse = await fetch('/api/admin/v1/security/webauthn', { method: 'POST', headers: adminMutationHeaders(), body: JSON.stringify({ action: 'reauth_options' }) })
+      const optionsPayload = await optionsResponse.json() as { options?: Parameters<typeof startAuthentication>[0]; challengeId?: string; error?: string }
+      if (!optionsResponse.ok || !optionsPayload.options || !optionsPayload.challengeId) throw new Error(optionsPayload.error ?? 'Unable to start WebAuthn reauthentication.')
+      const response = await startAuthentication(optionsPayload.options)
+      const verifyResponse = await fetch('/api/admin/v1/security/webauthn', { method: 'POST', headers: adminMutationHeaders(), body: JSON.stringify({ action: 'reauth_verify', challengeId: optionsPayload.challengeId, response }) })
+      const verifyPayload = await verifyResponse.json() as { error?: string }
+      if (!verifyResponse.ok) throw new Error(verifyPayload.error ?? 'Unable to verify WebAuthn reauthentication.')
+
+      const result = await persist(plans)
+      if (!result.response.ok) {
+        setReauthRequired(result.payload.code === 'reauth_required')
+        setSaveError(result.payload.error ?? 'Plan catalogue could not be saved.')
+        return
+      }
+      setReauthRequired(false)
+      if (result.payload.plans) setPlans(result.payload.plans)
+      setSaved(true)
+    } catch (error) {
+      setReauthRequired(true)
+      setSaveError(webAuthnErrorMessage(error))
+    } finally {
+      setSaving(false)
+    }
   }
 
   return (
@@ -80,7 +134,8 @@ export function PlanManagementPage({ canUpdate = true, canViewObservability = tr
         {(error || saveError) && (
           <Card style={{ padding: 14, borderColor: 'rgba(220,38,38,0.25)', color: 'var(--c-danger)', display: 'flex', gap: 8, alignItems: 'center' }}>
             <ShieldAlert size={15} aria-hidden="true" />
-            {error ?? saveError}
+            <span style={{ flex: 1 }}>{error ?? saveError}</span>
+            {reauthRequired && <button type="button" disabled={saving} onClick={() => void reauthenticateAndRetry()} style={retryButton}>{saving ? 'Authenticating…' : 'Reauthenticate and retry'}</button>}
           </Card>
         )}
         {availablePlans.length > 0 && selected && (
@@ -126,4 +181,8 @@ export function PlanManagementPage({ canUpdate = true, canViewObservability = tr
 
 const inputStyle: React.CSSProperties = {
   display: 'block', width: '100%', marginTop: 6, boxSizing: 'border-box', padding: '8px 10px', border: '1px solid var(--border)', borderRadius: 7, background: 'var(--bg)', color: 'var(--text)', font: 'inherit', fontSize: 12,
+}
+
+const retryButton: React.CSSProperties = {
+  border: '1px solid var(--primary)', borderRadius: 7, padding: '7px 10px', background: 'var(--primary)', color: '#fff', font: 'inherit', fontSize: 11, cursor: 'pointer', whiteSpace: 'nowrap',
 }
