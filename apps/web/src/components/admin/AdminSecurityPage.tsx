@@ -15,6 +15,13 @@ function requestHeaders() {
   return adminMutationHeaders()
 }
 
+function webAuthnErrorMessage(error: unknown, fallback: string) {
+  const message = error instanceof Error ? error.message : ''
+  return /notallowederror|does not have focus|not allowed at this time/i.test(message)
+    ? 'Click this administrator page to give it focus, then try WebAuthn again.'
+    : message || fallback
+}
+
 export function AdminSecurityPage({ canApprove }: { canApprove: boolean }) {
   const [grants, setGrants] = useState<Grant[]>([])
   const [permission, setPermission] = useState(permissions[0])
@@ -76,7 +83,7 @@ export function AdminSecurityPage({ canApprove }: { canApprove: boolean }) {
       setNotice('Security key registered. High-risk actions now require WebAuthn reauthentication.')
       await load()
     } catch (error) {
-      setNotice(error instanceof Error ? error.message : 'Security-key registration was cancelled.')
+      setNotice(webAuthnErrorMessage(error, 'Security-key registration was cancelled.'))
     } finally {
       setWorking(false)
     }
@@ -94,7 +101,7 @@ export function AdminSecurityPage({ canApprove }: { canApprove: boolean }) {
       if (!verifyResponse.ok) throw new Error(verifyPayload.error ?? 'Unable to reauthenticate.')
       setNotice('WebAuthn reauthentication complete. High-risk actions are unlocked for 15 minutes.')
     } catch (error) {
-      setNotice(error instanceof Error ? error.message : 'WebAuthn reauthentication was cancelled.')
+      setNotice(webAuthnErrorMessage(error, 'WebAuthn reauthentication was cancelled.'))
     } finally {
       setWorking(false)
     }
