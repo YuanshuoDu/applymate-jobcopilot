@@ -13,6 +13,7 @@ vi.mock('@/components/ui', () => ({
   Card: ({ children }: { children?: React.ReactNode }) => React.createElement('section', null, children),
 }))
 vi.mock('next/link', () => ({ default: ({ href, children }: { href: string; children?: React.ReactNode }) => React.createElement('a', { href }, children) }))
+vi.mock('@simplewebauthn/browser', () => ({ startAuthentication: vi.fn() }))
 vi.mock('lucide-react', () => ({
   Plus: () => null,
   Save: () => null,
