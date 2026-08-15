@@ -896,7 +896,7 @@ model AdminWebAuthnCredential {
   counter      Int       @default(0)
   transports   String[]
   deviceType   String?   @map("device_type")
-  backedUp     Boolean   @default(false)
+  backedUp     Boolean   @default(false) @map("backed_up")
   deviceName   String?   @map("device_name")
   createdAt    DateTime  @default(now()) @map("created_at")
   lastUsedAt   DateTime? @map("last_used_at")
