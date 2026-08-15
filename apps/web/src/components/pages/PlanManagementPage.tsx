@@ -53,7 +53,10 @@ export function PlanManagementPage({ canUpdate = true, canViewObservability = tr
     setSaving(true)
     setSaveError(null)
     setSaved(false)
-    const result = await apiMutate<PlansResponse>('/api/admin/v1/plans', 'PATCH', { plans })
+    // The catalogue API accepts editable plan fields only. `id` and `version`
+    // are response metadata and must not be sent back as part of the patch.
+    const editablePlans = plans.map(({ id: _id, version: _version, ...plan }) => plan)
+    const result = await apiMutate<PlansResponse>('/api/admin/v1/plans', 'PATCH', { plans: editablePlans })
     setSaving(false)
     if (result.error) {
       setSaveError(result.error)
