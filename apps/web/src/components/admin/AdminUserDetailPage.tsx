@@ -56,6 +56,7 @@ function AccountOperations({ userId, user, permissions }: { userId: string; user
   const [limit, setLimit] = useState('')
   const [expiresAt, setExpiresAt] = useState('')
   const [notice, setNotice] = useState('')
+  const [reauthRequired, setReauthRequired] = useState(false)
   const [busy, setBusy] = useState(false)
   const { request, dialog } = useAdminPrompt()
 
@@ -98,8 +99,14 @@ function AccountOperations({ userId, user, permissions }: { userId: string; user
     setBusy(true)
     try {
       const response = await fetch(`/api/admin/v1/users/${userId}/plan`, { method: 'PATCH', headers: adminMutationHeaders(), body: JSON.stringify({ toPlan: plan, status: subscriptionStatus, trialEndsAt: subscriptionStatus === 'trialing' && trialEndsAt ? new Date(trialEndsAt).toISOString() : null, currentPeriodEnd: currentPeriodEnd ? new Date(currentPeriodEnd).toISOString() : null, cancelAtPeriodEnd, version: subscription?.version, reason }) })
-      const payload = await response.json().catch(() => null) as { error?: string; subscription?: Subscription } | null
-      if (!response.ok) { setNotice(payload?.error ?? 'Package settings could not be saved.'); return }
+      const payload = await response.json().catch(() => null) as { error?: string; code?: string; subscription?: Subscription } | null
+      if (!response.ok) {
+        const needsReauth = payload?.code === 'reauth_required'
+        setReauthRequired(needsReauth)
+        setNotice(needsReauth ? 'Fresh WebAuthn authentication is required before saving package settings.' : payload?.error ?? 'Package settings could not be saved.')
+        return
+      }
+      setReauthRequired(false)
       if (payload?.subscription) {
         setSubscription(payload.subscription)
         setSubscriptionStatus(payload.subscription.status)
@@ -132,7 +139,7 @@ function AccountOperations({ userId, user, permissions }: { userId: string; user
   const canRestore = permissions.includes('users.restore')
   const canPlan = permissions.includes('billing.update') && permissions.includes('billing.read')
   const canOverride = permissions.includes('users.feature_override')
-  return <><section className="admin-detail-operations"><div className="admin-settings-heading"><div><h2>Account operations</h2><p>Core administrators can manage access, package settings and lifecycle state. Every write is audited.</p></div><span role="status">{notice}</span></div><div className="admin-operation-grid">
+  return <><section className="admin-detail-operations"><div className="admin-settings-heading"><div><h2>Account operations</h2><p>Core administrators can manage access, package settings and lifecycle state. Every write is audited.</p></div><span role="status">{notice}{reauthRequired && <> <Link href="/admin/security">Open Security controls to reauthenticate</Link>, then retry.</>}</span></div><div className="admin-operation-grid">
     <label>Account state<select value={status} disabled={busy || (status === 'active' ? !canSuspend : !canRestore)} onChange={event => { const next = event.target.value as 'active' | 'suspended'; setStatus(next); void mutate(`/api/admin/v1/users/${userId}/account-state`, { status: next }, next === 'suspended' ? 'Account suspended.' : 'Account restored.') }}><option value="active">Active</option><option value="suspended">Suspended</option></select></label>
     <label>Commercial plan<select value={plan} disabled={busy || !canPlan} onChange={event => setPlan(event.target.value)}><option value="free">Free</option><option value="pro">Pro</option><option value="enterprise">Enterprise</option></select></label>
     {canPlan && <label>Subscription state<select value={subscriptionStatus} disabled={busy} onChange={event => setSubscriptionStatus(event.target.value as Subscription['status'])}><option value="trialing">Trialing</option><option value="active">Active</option><option value="past_due">Past due</option><option value="cancelled">Cancelled</option><option value="expired">Expired</option></select></label>}
