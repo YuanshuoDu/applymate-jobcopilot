@@ -134,6 +134,11 @@ const zh: Record<string, string> = {
   'APPLICATION FORM': '申请表单',
   'Form auto-fill': '表单自动填写',
   Ready: '就绪',
+  Applied: '已申请',
+  Rejected: '已拒绝',
+  Collapse: '收起',
+  Expand: '展开',
+  fields: '个字段',
   'Scanning this page': '正在扫描此页面',
   'Ready to scan this page': '准备扫描此页面',
   'Looking for fields on the current application page.': '正在查找当前申请页面中的字段。',
@@ -375,6 +380,8 @@ export function translateExtension(lang: ExtensionLang, english: string): string
   if (formatting) return `正在整理 ${formatting[1]} 个字段进行分析`
   const generating = english.match(/^Generating answers for (\d+) fields$/)
   if (generating) return `正在为 ${generating[1]} 个字段生成答案`
+  const filled = english.match(/^Filled (\d+) of (\d+) fields$/)
+  if (filled) return `已填写 ${filled[1]} / ${filled[2]} 个字段`
   if (/^(ApplyMate(?: AI)?|LinkedIn|Indeed|Workday|Greenhouse|Lever|SmartRecruiters|Personio|Gmail|Chrome|PDF|DOCX|ATS|AI|URL|API|Persona)$/i.test(english.trim())) return english
   return zh['Something went wrong']
 }

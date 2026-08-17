@@ -16,8 +16,8 @@ export default function AdminInvitationPage() {
     if (status === 'loading') return
     const token = new URLSearchParams(window.location.search).get('token') ?? ''
     if (status !== 'authenticated') { setMessage(copy.signIn); return }
-    void fetch('/api/admin/invitations/accept', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ token }) }).then(async response => { const payload = await response.json().catch(() => null) as { error?: string } | null; setMessage(response.ok ? copy.accepted : payload?.error ?? copy.failed) }).catch(() => setMessage(copy.failed))
-  }, [status, copy.accepted, copy.failed, copy.signIn])
+    void fetch('/api/admin/invitations/accept', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ token }) }).then(async response => { const payload = await response.json().catch(() => null) as { error?: string } | null; setMessage(response.ok ? copy.accepted : lang === 'zh' ? copy.failed : payload?.error ?? copy.failed) }).catch(() => setMessage(copy.failed))
+  }, [status, copy.accepted, copy.failed, copy.signIn, lang])
   const callbackUrl = typeof window === 'undefined'
     ? '/invite/admin'
     : `${window.location.pathname}${window.location.search}`

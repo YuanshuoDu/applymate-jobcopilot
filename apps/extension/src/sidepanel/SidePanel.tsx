@@ -72,7 +72,7 @@ type Labels = {
   loginPrompt: string
 }
 
-const EXT_LABELS: Record<ExtLang, Labels> = {
+const EXT_LABELS: Record<string, Labels> = {
   en: { saved: 'Saved', applied: 'Applied', interview: 'Interview', rejected: 'Rejected', today: 'Today', yesterday: 'Yesterday', daysAgo: n => `${n}d ago`, jobs: 'Jobs', form: 'Form Fill', persona: 'Profile', resume: 'Resume', noJobs: 'No saved jobs yet.', openDashboard: 'Open Dashboard', notLoggedIn: 'Not logged in', loginPrompt: 'Sign in to ApplyMate to use the extension.' },
   de: { saved: 'Gespeichert', applied: 'Beworben', interview: 'Gespräch', rejected: 'Abgelehnt', today: 'Heute', yesterday: 'Gestern', daysAgo: n => `vor ${n} Tagen`, jobs: 'Jobs', form: 'Formular', persona: 'Profil', resume: 'Lebenslauf', noJobs: 'Noch keine gespeicherten Jobs.', openDashboard: 'Dashboard öffnen', notLoggedIn: 'Nicht eingeloggt', loginPrompt: 'Melde dich bei ApplyMate an.' },
   fr: { saved: 'Sauvegardé', applied: 'Postulé', interview: 'Entretien', rejected: 'Refusé', today: "Aujourd'hui", yesterday: 'Hier', daysAgo: n => `il y a ${n}j`, jobs: 'Offres', form: 'Formulaire', persona: 'Profil', resume: 'CV', noJobs: "Aucune offre sauvegardée.", openDashboard: 'Ouvrir le tableau de bord', notLoggedIn: 'Non connecté', loginPrompt: 'Connectez-vous à ApplyMate.' },
@@ -83,8 +83,7 @@ const EXT_LABELS: Record<ExtLang, Labels> = {
 
 function getLang(): ExtLang {
   try {
-    const stored = localStorage.getItem('applymate_lang') as ExtLang | null
-    if (stored && stored in EXT_LABELS) return stored
+    if (localStorage.getItem('applymate_lang') === 'zh') return 'zh'
   } catch { /* extension storage may be unavailable during first paint */ }
   return 'en'
 }
@@ -110,8 +109,13 @@ function formatDate(iso: string, L: Labels): string {
   return date.toLocaleDateString(undefined, { month: 'short', day: 'numeric' })
 }
 
-function formatSyncAge(timestamp: number): string {
+function formatSyncAge(timestamp: number, lang: ExtLang): string {
   const seconds = Math.max(0, Math.floor((Date.now() - timestamp) / 1000))
+  if (lang === 'zh') {
+    if (seconds < 5) return '刚刚'
+    if (seconds < 60) return `${seconds}秒前`
+    return `${Math.floor(seconds / 60)}分钟前`
+  }
   if (seconds < 5) return 'just now'
   if (seconds < 60) return `${seconds}s ago`
   const minutes = Math.floor(seconds / 60)
@@ -556,10 +560,10 @@ function TrackerPanel({ settings, tabKey, L, onOpenResume }: { settings: Extensi
         </section>
 
         <div className="am-stat-grid" aria-label={t('Application counts')}>
-          <StatCard className="saved" label="Saved" value={savedCount} icon={<Bookmark size={13} />} />
-          <StatCard className="applied" label="Applied" value={appliedCount} icon={<Send size={13} />} />
-          <StatCard className="interview" label="Interviews" value={interviewCount} icon={<MessageSquare size={13} />} />
-          <StatCard className="rejected" label="Rejected" value={rejectedCount} icon={<Ban size={13} />} />
+          <StatCard className="saved" label={t('Saved')} value={savedCount} icon={<Bookmark size={13} />} />
+          <StatCard className="applied" label={t('Applied')} value={appliedCount} icon={<Send size={13} />} />
+          <StatCard className="interview" label={t('Interviews')} value={interviewCount} icon={<MessageSquare size={13} />} />
+          <StatCard className="rejected" label={t('Rejected')} value={rejectedCount} icon={<Ban size={13} />} />
         </div>
 
         <div className="am-job-tools">
@@ -570,7 +574,7 @@ function TrackerPanel({ settings, tabKey, L, onOpenResume }: { settings: Extensi
           <div className="am-select-row"><select className="am-select" value={filterSource} onChange={event => setFilterSource(event.target.value)} aria-label={t('Filter by source')}><option value="all">{t('All sources')}</option>{availableSources.map(source => <option key={source} value={source}>{source}</option>)}</select><select className="am-select" value={sortBy} onChange={event => setSortBy(event.target.value as SortBy)} aria-label={t('Sort jobs')}><option value="date">{t('Newest first')}</option><option value="company">{t('Company')}</option><option value="score">{t('Match score')}</option></select></div>
         </div>
 
-        {(jobsSyncError || dashboardSyncError) && <div className="am-sync-banner" role="alert"><div><strong>{t('Sync needs attention')}</strong><span>{lang === 'zh' ? t('Something went wrong') : jobsSyncError || dashboardSyncError}</span>{(jobsSyncError ? lastJobsSyncedAt : lastDashboardSyncedAt) && <small>{t('Last synced')} {formatSyncAge((jobsSyncError ? lastJobsSyncedAt : lastDashboardSyncedAt)!)}</small>}</div><button type="button" onClick={() => refreshAll(true)}>{t('Retry')}</button></div>}
+        {(jobsSyncError || dashboardSyncError) && <div className="am-sync-banner" role="alert"><div><strong>{t('Sync needs attention')}</strong><span>{lang === 'zh' ? t('Something went wrong') : jobsSyncError || dashboardSyncError}</span>{(jobsSyncError ? lastJobsSyncedAt : lastDashboardSyncedAt) && <small>{t('Last synced')} {formatSyncAge((jobsSyncError ? lastJobsSyncedAt : lastDashboardSyncedAt)!, lang)}</small>}</div><button type="button" onClick={() => refreshAll(true)}>{t('Retry')}</button></div>}
         <CurrentPageBanner accountKey={`${settings.apiBaseUrl}|${settings.apiToken}|${settings.userEmail}`} tabKey={tabKey} userEmail={settings.userEmail} onSaved={() => refreshAll()} />
         <div className="am-list" ref={listRef}>
           {loading ? <div className="am-spinner"><LoaderCircle className="am-spin" size={20} aria-label={t('Loading jobs')} /></div> : filtered.length === 0 ? <EmptyState hasSearch={Boolean(search.trim())} filter={filterStatus} connectionError={Boolean(jobsSyncError)} onRetry={() => refreshAll(true)} onClearSearch={() => setSearch('')} onOpenDashboard={() => chrome.tabs.create({ url: `${settings.apiBaseUrl}/?page=jobs` })} L={L} /> : <div className="am-list-inner">{filtered.map(job => <JobCard key={job.id} job={job} expanded={expandedId === job.id} onToggle={() => setExpandedId(current => current === job.id ? null : job.id)} settings={settings} L={L} scoring={scoringId === job.id} onScore={() => void scoreJob(job)} onPrepared={() => void refreshAll(true)} />)}</div>}
@@ -601,7 +605,7 @@ function keyTagsForJob(job: SavedJob): string[] {
 }
 
 function statusLabel(status: string, L: Labels): string {
-  return ({ saved: L.saved, applied: L.applied, interview: 'Interview', rejected: L.rejected, offer: L.applied } as Record<string, string>)[status] ?? status
+  return ({ saved: L.saved, applied: L.applied, interview: L.interview, rejected: L.rejected, offer: L.applied } as Record<string, string>)[status] ?? status
 }
 
 function JobCard({ job, expanded, onToggle, settings, onScore, scoring, onPrepared, L }: {
@@ -700,7 +704,7 @@ function JobCard({ job, expanded, onToggle, settings, onScore, scoring, onPrepar
         <div className={`am-score-box ${scoreTone}`}>
           {job.score != null ? <><div className="am-score"><div className="am-score-ring" style={{ '--am-score-angle': `${Math.max(0, Math.min(job.score, 100)) * 3.6}deg` } as React.CSSProperties} aria-label={`${job.score}% ${t('match')}`}><span>{job.score}</span></div><span className="am-score-label">{t('Match')}</span></div><button className="am-score-action" type="button" disabled={scoring} onClick={event => { event.stopPropagation(); onScore() }}>{scoring ? '…' : t('Re-score')}</button></> : <><button className="am-score-action" type="button" disabled={scoring} onClick={event => { event.stopPropagation(); onScore() }}>{scoring ? t('Scoring…') : t('Score')}</button><span className="am-score-help">{t('Resume + profile')}</span></>}
         </div>
-        <button className="am-chevron" type="button" onMouseDown={event => { event.preventDefault(); event.currentTarget.blur() }} onClick={onToggle} aria-label={expanded ? `Collapse ${job.role}` : `Expand ${job.role}`}><ChevronDown size={16} className={expanded ? 'am-chevron-open' : ''} /></button>
+        <button className="am-chevron" type="button" onMouseDown={event => { event.preventDefault(); event.currentTarget.blur() }} onClick={onToggle} aria-label={`${expanded ? t('Collapse') : t('Expand')} ${job.role}`}><ChevronDown size={16} className={expanded ? 'am-chevron-open' : ''} /></button>
       </div>
       {expanded && <div className="am-detail">
         <div className="am-detail-grid"><div className="am-detail-box"><div className="am-detail-label">{t('Notes')}</div><div className="am-notes-meta"><span>{notesSaving ? <span className="am-saving">{t('Saving…')}</span> : notesError ? <span className="am-note-error">{lang === 'zh' ? t('Something went wrong') : notesError}</span> : notes ? <span className="am-saved">{t('Saved')}</span> : t('Add context for later')}</span></div><textarea className="am-notes" value={notes} onChange={event => { setNotes(event.target.value); setNotesError('') }} placeholder={t('Interview questions, salary, contact…')} /><ApplicationPackSummary hasResume={hasResume} hasCoverLetter={hasCoverLetter} ready={packReady} preparing={packPreparing} stage={packStage} exporting={packExporting} error={packError} onPrepare={() => void handlePackPrepare()} onDownload={() => void handlePackDownload()} /></div><div className="am-detail-box am-detail-insights"><div className="am-detail-label am-detail-label-icon"><Tags size={11} aria-hidden="true" /> {t('Key job tags')}</div>{keyTags.length > 0 ? <div className="am-key-tags">{keyTags.map(tag => <span key={tag} className="am-key-tag">{tag}</span>)}</div> : <div className="am-detail-text">{t('Score this role to extract its main skills and requirements.')}</div>}<div className="am-detail-label am-detail-score-label">{t('Match score')}</div><div className="am-detail-text">{job.score == null ? t('Not scored yet.') : `${t('Scored at')} ${job.score}% ${t('against your resume.')}`}</div>{!job.url && <div className="am-detail-text">{t('No original link saved.')}</div>}</div></div>

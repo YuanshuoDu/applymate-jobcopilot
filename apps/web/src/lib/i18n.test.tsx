@@ -58,4 +58,8 @@ describe('AI settings translations', () => {
     }
   })
 
+  it('does not leak an English fallback into the Chinese UI', () => {
+    expect(translate('zh', 'missing.ui.key')).toBe('出现了问题')
+  })
+
 })

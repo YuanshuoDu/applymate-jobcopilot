@@ -7,6 +7,10 @@ describe('extension language switching', () => {
     expect(translateExtension('zh', 'Loading resumes')).toBe('正在加载简历')
   })
 
+  it('translates dynamic progress copy in Chinese mode', () => {
+    expect(translateExtension('zh', 'Filled 2 of 3 fields')).toBe('已填写 2 / 3 个字段')
+  })
+
   it('keeps brand names but does not leak unknown UI copy in Chinese mode', () => {
     expect(translateExtension('zh', 'ApplyMate')).toBe('ApplyMate')
     expect(translateExtension('zh', 'Unexpected English UI copy')).toBe('出了点问题，请重试')

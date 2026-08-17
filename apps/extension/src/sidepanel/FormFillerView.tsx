@@ -875,11 +875,11 @@ export function FormFillerView({ settings, pendingFields, onFieldsConsumed, scan
         <span className="am-form-eyebrow">{t('APPLYMATE IS WORKING')}</span>
         <h2>{t('Filling your form')}</h2>
         <p className="am-form-state-copy">{t('Applying reviewed answers to the current page.')}</p>
-        <div className="am-form-progress" aria-label={`Filled ${appliedCount} of ${fillableCount} fields`}>
+        <div className="am-form-progress" aria-label={t(`Filled ${appliedCount} of ${fillableCount} fields`)}>
           <span style={{ width: `${progress}%` }} />
         </div>
         <div className="am-form-progress-meta">
-          <strong>{appliedCount} / {fillableCount} fields</strong>
+          <strong>{appliedCount} / {fillableCount} {t('fields')}</strong>
           <span>{Math.round(progress)}%</span>
         </div>
       </div>

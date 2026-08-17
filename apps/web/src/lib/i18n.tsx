@@ -4734,7 +4734,9 @@ export const SEARCH_TARGET_LANGS: { value: string; label: string }[] = [
 ]
 
 export function translate(lang: Lang, key: string): string {
-  return dict[lang]?.[key] ?? dict.en?.[key] ?? key
+  if (dict[lang]?.[key]) return dict[lang][key]
+  if (lang === 'zh') return dict.zh['common.somethingWentWrong'] ?? '出现了问题'
+  return dict.en?.[key] ?? key
 }
 
 export const TRANSLATION_KEYS = Object.keys(dict.en)

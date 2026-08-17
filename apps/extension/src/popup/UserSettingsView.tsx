@@ -2,15 +2,16 @@ import { useState } from 'react'
 import { ArrowLeft, ExternalLink, LogOut, SlidersHorizontal, UserRound } from 'lucide-react'
 import { saveSettings } from '@/lib/storage'
 import type { ExtensionSettings } from '@/lib/types'
-import { C } from './popup-constants'
-import { getLabels } from './popup-utils'
+import { C, LABELS } from './popup-constants'
+import { getPopupLang } from './popup-utils'
 
 export function UserSettingsView({ settings, onBack, onLogout }: {
   settings: ExtensionSettings
   onBack: () => void
   onLogout: () => void
 }) {
-  const labels = getLabels()
+  const [lang, setLang] = useState(getPopupLang)
+  const labels = LABELS[lang]
   const [autoSave, setAutoSave] = useState(settings.autoSave)
   const [saved, setSaved] = useState(false)
 
@@ -24,6 +25,12 @@ export function UserSettingsView({ settings, onBack, onLogout }: {
     } catch {
       setAutoSave(!next)
     }
+  }
+
+  function changeLanguage(next: string) {
+    const value = next === 'zh' ? 'zh' : 'en'
+    localStorage.setItem('applymate_lang', value)
+    setLang(value)
   }
 
   const openAccount = () => { void chrome.tabs.create({ url: `${settings.apiBaseUrl}/?page=settings`, active: true }) }
@@ -50,6 +57,13 @@ export function UserSettingsView({ settings, onBack, onLogout }: {
           <span style={{ width: 36, height: 21, padding: 2, borderRadius: 999, background: autoSave ? C.primary : '#D8DCEB', transition: 'background .16s' }}><span style={{ display: 'block', width: 17, height: 17, borderRadius: '50%', background: '#fff', transform: autoSave ? 'translateX(15px)' : 'translateX(0)', transition: 'transform .16s', boxShadow: '0 1px 3px rgba(16,26,58,.18)' }} /></span>
         </button>
         {saved && <div role="status" style={{ marginTop: 8, color: C.green, fontSize: 10.5 }}>{labels.savedConfirm}</div>}
+        <label style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12, marginTop: 14, paddingTop: 12, borderTop: `1px solid ${C.border}`, fontSize: 12, fontWeight: 650 }}>
+          <span>{labels.language}</span>
+          <select value={lang} onChange={event => changeLanguage(event.target.value)} aria-label={labels.language} style={{ minWidth: 108, padding: '6px 8px', border: `1px solid ${C.border}`, borderRadius: 8, background: C.panel, color: C.navy, fontSize: 11 }}>
+            <option value="en">{labels.english}</option>
+            <option value="zh">{labels.chinese}</option>
+          </select>
+        </label>
       </section>
 
       <button type="button" onClick={openAccount} style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 7, padding: '10px 12px', border: `1px solid ${C.border}`, borderRadius: 11, background: C.panel, color: C.primary, fontSize: 12, fontWeight: 680, cursor: 'pointer' }}>{labels.manageAccount}<ExternalLink size={14} /></button>

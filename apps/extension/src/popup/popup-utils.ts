@@ -3,11 +3,15 @@ import type { DashboardStats, SavedJob, ScrapedJob } from '@/lib/types'
 import { LABELS, type PopupLabels } from './popup-constants'
 
 export function getLabels(): PopupLabels {
+  return LABELS[getPopupLang()]
+}
+
+export function getPopupLang(): 'en' | 'zh' {
   try {
     const lang = localStorage.getItem('applymate_lang') ?? ''
-    if (LABELS[lang]) return LABELS[lang]
+    if (lang === 'zh') return 'zh'
   } catch { /* extension storage may be unavailable in a preview */ }
-  return LABELS.en
+  return 'en'
 }
 
 export function isScrapedJob(value: unknown): value is ScrapedJob {

@@ -56,6 +56,9 @@ export type PopupLabels = {
   detectedLabel: string
   notDetectedLabel: string
   emailPlaceholder: string
+  language: string
+  english: string
+  chinese: string
 }
 
 export const LABELS: Record<string, PopupLabels> = {
@@ -69,7 +72,7 @@ export const LABELS: Record<string, PopupLabels> = {
     noJobSub: 'ApplyMate will identify the role and make the next step clear.',
     browseLinkedIn: 'Browse LinkedIn jobs', browseIndeed: 'Browse Indeed jobs', analyzeError: 'Match analysis failed.',
     noResume: 'Add a resume in the Sidebar before analyzing.', menuSettings: 'Settings', menuDashboard: 'Open dashboard', menuSignOut: 'Sign out', sidePanelError: 'Chrome could not open the side panel. Use the Side panel button in the toolbar.',
-    settingsBack: 'Back', account: 'Account', accountMenu: 'Account menu', signedIn: 'Signed in', preferences: 'Preferences', autoSave: 'Automatically save jobs', autoSaveSub: 'Save detected jobs while you browse', manageAccount: 'Manage account', savedConfirm: 'Saved', syncedWorkspace: 'Synced to your ApplyMate workspace', aiReviewing: 'AI is reviewing your profile…', yourAiJobCopilot: 'Your AI job copilot', waitingBrowserLogin: 'Waiting for login in browser tab…', cancel: 'Cancel', goodFit: 'Good fit — review the role details.', reviewCarefully: 'Review this role carefully before applying.', detectedLabel: 'Detected', notDetectedLabel: 'Not detected', emailPlaceholder: 'you@example.com',
+    settingsBack: 'Back', account: 'Account', accountMenu: 'Account menu', signedIn: 'Signed in', preferences: 'Preferences', autoSave: 'Automatically save jobs', autoSaveSub: 'Save detected jobs while you browse', manageAccount: 'Manage account', savedConfirm: 'Saved', syncedWorkspace: 'Synced to your ApplyMate workspace', aiReviewing: 'AI is reviewing your profile…', yourAiJobCopilot: 'Your AI job copilot', waitingBrowserLogin: 'Waiting for login in browser tab…', cancel: 'Cancel', goodFit: 'Good fit — review the role details.', reviewCarefully: 'Review this role carefully before applying.', detectedLabel: 'Detected', notDetectedLabel: 'Not detected', emailPlaceholder: 'you@example.com', language: 'Language', english: 'English', chinese: '中文',
   },
   zh: {
     detected: '已识别 LinkedIn 职位页面', notDetected: '此页面未识别到职位',
@@ -81,6 +84,6 @@ export const LABELS: Record<string, PopupLabels> = {
     noJobSub: 'ApplyMate 会识别职位，并告诉你下一步该做什么。',
     browseLinkedIn: '浏览 LinkedIn 职位', browseIndeed: '浏览 Indeed 职位', analyzeError: '匹配分析失败。',
     noResume: '请先在侧边栏添加简历，再进行分析。', menuSettings: '设置', menuDashboard: '打开控制台', menuSignOut: '退出登录', sidePanelError: 'Chrome 无法打开侧边栏，请使用浏览器工具栏中的侧边栏按钮。',
-    settingsBack: '返回', account: '账户', accountMenu: '账户菜单', signedIn: '已登录', preferences: '偏好设置', autoSave: '自动保存职位', autoSaveSub: '浏览职位页面时自动保存识别结果', manageAccount: '管理账户', savedConfirm: '已保存', syncedWorkspace: '已同步到你的 ApplyMate 工作区', aiReviewing: 'AI 正在分析你的画像……', yourAiJobCopilot: '你的 AI 求职助手', waitingBrowserLogin: '等待浏览器标签页登录……', cancel: '取消', goodFit: '匹配度不错，请查看职位详情。', reviewCarefully: '申请前请仔细审核该职位。', detectedLabel: '已识别', notDetectedLabel: '未识别', emailPlaceholder: '你的邮箱@example.com',
+    settingsBack: '返回', account: '账户', accountMenu: '账户菜单', signedIn: '已登录', preferences: '偏好设置', autoSave: '自动保存职位', autoSaveSub: '浏览职位页面时自动保存识别结果', manageAccount: '管理账户', savedConfirm: '已保存', syncedWorkspace: '已同步到你的 ApplyMate 工作区', aiReviewing: 'AI 正在分析你的画像……', yourAiJobCopilot: '你的 AI 求职助手', waitingBrowserLogin: '等待浏览器标签页登录……', cancel: '取消', goodFit: '匹配度不错，请查看职位详情。', reviewCarefully: '申请前请仔细审核该职位。', detectedLabel: '已识别', notDetectedLabel: '未识别', emailPlaceholder: '你的邮箱@example.com', language: '语言', english: 'English', chinese: '中文',
   },
 }
