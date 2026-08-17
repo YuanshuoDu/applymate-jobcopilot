@@ -1456,7 +1456,7 @@ export function ResumePage() {
       <ConfirmDialog />
       <header className="resume-library-heading">
         <div>
-          <h1>Resume library</h1>
+          <h1>{t('resume.library')}</h1>
           {returnToJobs && <button onClick={() => navigate('jobs')} style={{ marginTop: 4, padding: 0, border: 'none', background: 'none', color: 'var(--primary)', cursor: 'pointer', fontSize: 12 }}>← Back to My Jobs</button>}
         </div>
       <div className="resume-library-toolbar">
@@ -1660,7 +1660,7 @@ export function ResumePage() {
 
           <aside className="resume-ai-column">
           <div className="resume-ai-title" style={{ display: 'flex', gap: 6 }}>
-            <button onClick={() => setRightPanel('insights')} style={{ border: 0, background: 'transparent', color: rightPanel === 'insights' ? 'var(--text)' : 'var(--text-muted)', font: 'inherit', fontWeight: 700, cursor: 'pointer', padding: 0 }}>AI insights</button>
+            <button onClick={() => setRightPanel('insights')} style={{ border: 0, background: 'transparent', color: rightPanel === 'insights' ? 'var(--text)' : 'var(--text-muted)', font: 'inherit', fontWeight: 700, cursor: 'pointer', padding: 0 }}>{t('resume.aiInsights')}</button>
             <button onClick={() => setRightPanel('persona')} style={{ border: 0, background: 'transparent', color: rightPanel === 'persona' ? 'var(--primary)' : 'var(--text-muted)', font: 'inherit', fontWeight: 700, cursor: 'pointer', padding: 0 }}>Persona</button>
           </div>
           {rightPanel === 'persona' ? <PersonaPanel isDefault={selectedResume?.isDefault ?? false} onEditResume={setEditSection} onUseAsProfile={() => { if (selectedResume) void handleSetDefaultResume(selectedResume) }} /> : <>
