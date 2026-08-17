@@ -1347,22 +1347,22 @@ function AiModelSettings() {
                 {current?.provider === 'custom' && (
                   <div style={{ flexBasis: '100%', display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(min(100%, 220px), 1fr))', gap: 8, paddingTop: 4 }}>
                     <label style={{ display: 'grid', gap: 4, fontSize: 10, color: 'var(--text-muted)' }}>
-                      Custom model ID
+                      {t('settings.customModelId')}
                       <input
                         aria-label={`${group.label} custom model ID`}
                         value={current.model}
                         onChange={event => setFeatureGroupCfg(group, { ...current, model: event.target.value })}
-                        placeholder="e.g. llama-3.3-70b"
+                        placeholder={t('settings.customModelPlaceholder')}
                         style={{ width: '100%', boxSizing: 'border-box', padding: '7px 9px', border: '1px solid var(--border)', borderRadius: 7, background: 'var(--bg)', color: 'var(--text)', fontSize: 11 }}
                       />
                     </label>
                     <label style={{ display: 'grid', gap: 4, fontSize: 10, color: 'var(--text-muted)' }}>
-                      HTTPS endpoint
+                      {t('settings.httpsEndpoint')}
                       <input
                         aria-label={`${group.label} custom HTTPS endpoint`}
                         value={current.apiBase ?? ''}
                         onChange={event => setFeatureGroupCfg(group, { ...current, apiBase: event.target.value })}
-                        placeholder="https://your-endpoint.example/v1"
+                        placeholder={t('settings.httpsEndpointPlaceholder')}
                         inputMode="url"
                         style={{ width: '100%', boxSizing: 'border-box', padding: '7px 9px', border: '1px solid var(--border)', borderRadius: 7, background: 'var(--bg)', color: 'var(--text)', fontSize: 11 }}
                       />
@@ -1523,8 +1523,8 @@ function FeatureModelPicker({ value, mixed, onChange }: {
             }}>
               <span style={{ fontSize: 14 }}>⚙</span>
               <div style={{ flex: 1 }}>
-                <div style={{ fontSize: 12, fontWeight: 600, color: 'var(--text)' }}>Custom provider</div>
-                <div style={{ fontSize: 10, color: 'var(--text-muted)' }}>Any OpenAI-compatible HTTPS endpoint</div>
+                <div style={{ fontSize: 12, fontWeight: 600, color: 'var(--text)' }}>{t('settings.customProvider')}</div>
+                <div style={{ fontSize: 10, color: 'var(--text-muted)' }}>{t('settings.customProviderDescription')}</div>
               </div>
               {isCustom && <span style={{ fontSize: 10, color: 'var(--primary)' }}>✓</span>}
             </button>

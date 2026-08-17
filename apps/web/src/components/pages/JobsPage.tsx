@@ -986,7 +986,7 @@ function JobDetailDrawer({ job, onClose, onStatusChange, onUpdate, onDelete, onO
           {/* Interview Prep */}
           {job.status === 'interview' && (
             <div>
-              <div style={{ fontSize: 10, color: '#3B6D11', fontWeight: 500, marginBottom: 8 }}>INTERVIEW PREP</div>
+              <div style={{ fontSize: 10, color: '#3B6D11', fontWeight: 500, marginBottom: 8 }}>{t('jobs.interviewPrep')}</div>
               {!interviewPrep ? (
                 <button
                   onClick={generateInterviewPrep}
@@ -1019,13 +1019,13 @@ function JobDetailDrawer({ job, onClose, onStatusChange, onUpdate, onDelete, onO
                     </div>
                   </div>
                   <div>
-                    <div style={{ fontSize: 10, color: 'var(--text-muted)', fontWeight: 500, marginBottom: 4 }}>Company Research</div>
+                    <div style={{ fontSize: 10, color: 'var(--text-muted)', fontWeight: 500, marginBottom: 4 }}>{t('jobs.companyResearch')}</div>
                     <div style={{ fontSize: 11, color: 'var(--text)', lineHeight: 1.7, background: 'var(--bg-secondary)', borderRadius: 6, padding: '8px 10px', whiteSpace: 'pre-wrap' }}>
                       {interviewPrep.companyResearch}
                     </div>
                   </div>
                   <div>
-                    <div style={{ fontSize: 10, color: 'var(--text-muted)', fontWeight: 500, marginBottom: 4 }}>Follow-up Email Template</div>
+                    <div style={{ fontSize: 10, color: 'var(--text-muted)', fontWeight: 500, marginBottom: 4 }}>{t('jobs.followUp')}</div>
                     <div style={{ fontSize: 11, color: 'var(--text)', lineHeight: 1.7, background: 'var(--bg-secondary)', borderRadius: 6, padding: '8px 10px', whiteSpace: 'pre-wrap', position: 'relative' }}>
                       {interviewPrep.followUpEmail}
                       <button
@@ -1139,13 +1139,13 @@ function ResumePackPreview({ resume, onReview }: { resume: Resume | null; onRevi
   if (!resume) return <div style={{ fontSize: 13, color: 'var(--text-muted)' }}>{t('jobs.preview.resumeMissing')}</div>
   const templateLabel = resume.templateId ? `${resume.templateId[0].toUpperCase()}${resume.templateId.slice(1)} template` : 'Clean template'
   return <div>
-    <button onClick={onReview} aria-label="Open the full tailored resume preview" style={{ display: 'block', position: 'relative', width: '100%', height: 420, padding: 0, overflow: 'hidden', contain: 'layout paint', border: '1px solid #dbe1ea', borderRadius: 8, background: '#e9eef5', cursor: 'zoom-in', textAlign: 'left' }}>
+    <button onClick={onReview} aria-label={t('jobs.fullResumePreview')} style={{ display: 'block', position: 'relative', width: '100%', height: 420, padding: 0, overflow: 'hidden', contain: 'layout paint', border: '1px solid #dbe1ea', borderRadius: 8, background: '#e9eef5', cursor: 'zoom-in', textAlign: 'left' }}>
       <div style={{ position: 'absolute', inset: 0, width: '222.23%', transform: 'scale(.45)', transformOrigin: 'top left', pointerEvents: 'none', background: '#fff' }}>
         <ResumeRenderer content={resume.content} templateId={resume.templateId} templateOptions={resume.templateOptions} />
       </div>
       <span style={{ position: 'absolute', right: 12, bottom: 12, display: 'inline-flex', alignItems: 'center', gap: 5, padding: '8px 10px', borderRadius: 7, background: 'rgba(15,23,42,.86)', color: '#fff', fontSize: 12, fontWeight: 700 }}>{t('jobs.preview.viewResume')} <ChevronRight size={15} /></span>
     </button>
-    <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12, marginTop: 10, fontSize: 12, color: '#64748b' }}><span>AI tailored for this job</span><span>{templateLabel}</span></div>
+    <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12, marginTop: 10, fontSize: 12, color: '#64748b' }}><span>{t('jobs.aiTailored')}</span><span>{templateLabel}</span></div>
   </div>
 }
 

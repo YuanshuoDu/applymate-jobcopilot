@@ -122,41 +122,41 @@ function Label({ children, color = C.primary, bg = 'rgba(99,102,241,0.12)', bd =
 
 // ── Data ──────────────────────────────────────────────────────────────────────
 const FEATURES = [
-  { icon: '🤖', title: 'AI Auto-Apply', page: 'agent' as const, desc: 'Scans 50,000+ European jobs daily, matches your profile, auto-fills forms and applies — up to 100 jobs per day.', gradient: 'linear-gradient(135deg,rgba(99,102,241,.15) 0%,rgba(139,92,246,.08) 100%)', border: 'rgba(99,102,241,.28)' },
-  { icon: '📄', title: 'Dynamic Resume Tailoring', page: 'resume' as const, desc: 'Automatically adjusts keywords and skill weights for each JD. 3× better ATS pass rate with live Tiptap editor preview.', gradient: 'linear-gradient(135deg,rgba(251,146,60,.12) 0%,rgba(245,101,101,.06) 100%)', border: 'rgba(251,146,60,.25)' },
-  { icon: '✉️', title: 'AI Cover Letter', page: 'resume' as const, desc: 'Generates a professional, personalised cover letter in 30 seconds — choose Professional, Enthusiastic or Concise tone.', gradient: 'linear-gradient(135deg,rgba(52,211,153,.12) 0%,rgba(16,185,129,.06) 100%)', border: 'rgba(52,211,153,.25)' },
-  { icon: '📬', title: 'Smart Gmail Inbox', page: 'gmail' as const, desc: 'Auto-syncs recruitment emails, detects interview invitations and rejections, sends follow-up reminders.', gradient: 'linear-gradient(135deg,rgba(129,140,248,.12) 0%,rgba(99,102,241,.06) 100%)', border: 'rgba(129,140,248,.25)' },
-  { icon: '📊', title: 'Full Application Tracker', page: 'jobs' as const, desc: 'Kanban board for every application — from Saved → Applied → Interview → Offer. Never miss a follow-up.', gradient: 'linear-gradient(135deg,rgba(251,191,36,.10) 0%,rgba(251,146,60,.06) 100%)', border: 'rgba(251,191,36,.22)' },
-  { icon: '🔌', title: 'Chrome Extension', externalHref: 'https://github.com/YuanshuoDu/applymate-jobcopilot/tree/main/apps/extension', desc: 'Browse LinkedIn / Indeed / Glassdoor and save jobs with one click. Sidebar shows your match score and auto-fills forms.', gradient: 'linear-gradient(135deg,rgba(192,132,252,.12) 0%,rgba(139,92,246,.06) 100%)', border: 'rgba(192,132,252,.25)' },
+  { icon: '🤖', titleKey: 'landing.feature.autoApply', page: 'agent' as const, descKey: 'landing.feature.autoApplyDesc', gradient: 'linear-gradient(135deg,rgba(99,102,241,.15) 0%,rgba(139,92,246,.08) 100%)', border: 'rgba(99,102,241,.28)' },
+  { icon: '📄', titleKey: 'landing.feature.resume', page: 'resume' as const, descKey: 'landing.feature.resumeDesc', gradient: 'linear-gradient(135deg,rgba(251,146,60,.12) 0%,rgba(245,101,101,.06) 100%)', border: 'rgba(251,146,60,.25)' },
+  { icon: '✉️', titleKey: 'landing.feature.coverLetter', page: 'resume' as const, descKey: 'landing.feature.coverLetterDesc', gradient: 'linear-gradient(135deg,rgba(52,211,153,.12) 0%,rgba(16,185,129,.06) 100%)', border: 'rgba(52,211,153,.25)' },
+  { icon: '📬', titleKey: 'landing.feature.gmail', page: 'gmail' as const, descKey: 'landing.feature.gmailDesc', gradient: 'linear-gradient(135deg,rgba(129,140,248,.12) 0%,rgba(99,102,241,.06) 100%)', border: 'rgba(129,140,248,.25)' },
+  { icon: '📊', titleKey: 'landing.feature.tracker', page: 'jobs' as const, descKey: 'landing.feature.trackerDesc', gradient: 'linear-gradient(135deg,rgba(251,191,36,.10) 0%,rgba(251,146,60,.06) 100%)', border: 'rgba(251,191,36,.22)' },
+  { icon: '🔌', titleKey: 'landing.feature.extension', externalHref: 'https://github.com/YuanshuoDu/applymate-jobcopilot/tree/main/apps/extension', descKey: 'landing.feature.extensionDesc', gradient: 'linear-gradient(135deg,rgba(192,132,252,.12) 0%,rgba(139,92,246,.06) 100%)', border: 'rgba(192,132,252,.25)' },
 ]
 
 const STEPS = [
-  { num: '01', title: 'Upload Resume · Set Preferences', desc: 'Upload your existing resume or generate one with AI. Set target roles, locations and salary range — Persona extracts your full profile automatically.', icon: '📋' },
-  { num: '02', title: 'AI Agent Searches Automatically', desc: 'The Agent scans every major European job board daily, filters by your match-score threshold, and applies or sends you candidates for review.', icon: '🤖' },
-  { num: '03', title: 'Track Progress · Prepare for Interviews', desc: 'All application statuses sync in real time. Gmail auto-categorises recruiter emails and AI generates interview prep notes per role.', icon: '🎯' },
+  { num: '01', titleKey: 'landing.step.upload', descKey: 'landing.step.uploadDesc', icon: '📋' },
+  { num: '02', titleKey: 'landing.step.search', descKey: 'landing.step.searchDesc', icon: '🤖' },
+  { num: '03', titleKey: 'landing.step.track', descKey: 'landing.step.trackDesc', icon: '🎯' },
 ]
 
 const TESTIMONIALS = [
-  { name: 'Zhang Li', role: 'Backend Engineer', city: 'Amsterdam', avatar: 'ZL', color: '#4F46E5', text: 'Got interviews at Adyen and Booking.com within two weeks using ApplyMate. It used to take me a whole week to send 10 applications manually — now I auto-apply to 50+ a day.' },
-  { name: 'Maria García', role: 'Data Scientist', city: 'Berlin', avatar: 'MG', color: '#7C3AED', text: 'The AI cover letter generator is incredible. Each letter feels personalized, and my response rate went from 5% to 23%. Got my dream job at Zalando in 6 weeks.' },
-  { name: 'Ahmed Hassan', role: 'Product Manager', city: 'London', avatar: 'AH', color: '#059669', text: 'Chrome extension made everything so smooth. Just browsing LinkedIn, click "Save", and the AI fills the application automatically. Absolutely game-changing.' },
+  { name: 'Zhang Li', role: 'Backend Engineer', city: 'Amsterdam', avatar: 'ZL', color: '#4F46E5', textKey: 'landing.testimonial.zhang' },
+  { name: 'Maria García', role: 'Data Scientist', city: 'Berlin', avatar: 'MG', color: '#7C3AED', textKey: 'landing.testimonial.maria' },
+  { name: 'Ahmed Hassan', role: 'Product Manager', city: 'London', avatar: 'AH', color: '#059669', textKey: 'landing.testimonial.ahmed' },
 ]
 
 const FAQS = [
-  { q: 'What are the limits on the Free plan?', a: 'The Free plan includes the features and limits shown on the pricing card above. Limits and included features are kept current by the ApplyMate team.' },
-  { q: 'How effective is AI auto-apply?', a: 'Users who use ApplyMate AI to tailor their resumes see an average 3× improvement in ATS pass rate and 2.4× more interview invitations. Results depend on your skill match and competition for the role.' },
-  { q: 'Which job boards are supported?', a: 'We support LinkedIn, Indeed, Glassdoor, StepStone, XING, Arbeitsagentur, Adzuna, Reed, IrishJobs and more — 14 sources in total. We are continuously expanding the list.' },
-  { q: 'Is my resume data safe?', a: 'Your data is stored on EU servers (Neon PostgreSQL, eu-west-2) and is fully GDPR-compliant. We never sell your resume data or use it to train AI models.' },
-  { q: 'How do paid plan changes work?', a: 'Paid plan upgrades, trial requests and cancellations are handled by the ApplyMate team while self-serve checkout is being rolled out. Contact us and we will confirm the options and effective date.' },
-  { q: 'How good is the AI-generated cover letter?', a: 'The AI generates personalised letters based on the specific JD and your actual experience — not generic templates. You can review and edit before sending. Supports Professional, Enthusiastic and Concise tone styles.' },
-  { q: 'Does ApplyMate support non-English applications?', a: 'Yes. The platform supports English, German, French and more. The AI automatically selects the appropriate language based on the target company and job posting language.' },
+  { qKey: 'landing.faq.freePlan', aKey: 'landing.faq.freePlanAnswer' },
+  { qKey: 'landing.faq.autoApply', aKey: 'landing.faq.autoApplyAnswer' },
+  { qKey: 'landing.faq.boards', aKey: 'landing.faq.boardsAnswer' },
+  { qKey: 'landing.faq.safety', aKey: 'landing.faq.safetyAnswer' },
+  { qKey: 'landing.faq.paidPlans', aKey: 'landing.faq.paidPlansAnswer' },
+  { qKey: 'landing.faq.coverLetter', aKey: 'landing.faq.coverLetterAnswer' },
+  { qKey: 'landing.faq.languages', aKey: 'landing.faq.languagesAnswer' },
 ]
 
 const STATS_DATA = [
-  { value: 50, suffix: 'K+', label: 'European jobs/day' },
-  { value: 3,  suffix: '×',  label: 'ATS pass rate boost' },
-  { value: 14, suffix: 'd',  label: 'Pro free trial' },
-  { value: 92, suffix: '%',  label: 'User satisfaction' },
+  { value: 50, suffix: 'K+', labelKey: 'landing.stat.jobs' },
+  { value: 3,  suffix: '×',  labelKey: 'landing.stat.ats' },
+  { value: 14, suffix: 'd',  labelKey: 'landing.stat.trial' },
+  { value: 92, suffix: '%',  labelKey: 'landing.stat.satisfaction' },
 ]
 
 const PLATFORMS = ['LinkedIn', 'Indeed', 'Glassdoor', 'StepStone', 'XING', 'Arbeitsagentur']
@@ -184,7 +184,7 @@ export function LandingPage({ plans = FALLBACK_PLANS }: { plans?: PublicPlan[] }
   const { ref: statsRef, visible: statsVisible } = useReveal(0.3)
   const proPlan = plans.find(plan => plan.key === 'pro')
   const proTrialDays = proPlan?.trialDays ?? 0
-  const statsData = STATS_DATA.map(stat => stat.label === 'Pro free trial' ? { ...stat, value: proTrialDays } : stat)
+  const statsData = STATS_DATA.map(stat => stat.labelKey === 'landing.stat.trial' ? { ...stat, value: proTrialDays } : stat)
 
   useEffect(() => {
     const fn = () => setScrolled(window.scrollY > 60)
@@ -423,7 +423,7 @@ export function LandingPage({ plans = FALLBACK_PLANS }: { plans?: PublicPlan[] }
         {/* Stats (animated counters) */}
         <div ref={statsRef} style={{ display: 'flex', gap: 10, flexWrap: 'wrap', justifyContent: 'center' }}>
           {statsData.map((s, i) => (
-            <StatCard key={s.label} {...s} active={statsVisible} delay={i * 180} />
+            <StatCard key={s.labelKey} {...s} active={statsVisible} delay={i * 180} />
           ))}
         </div>
 
@@ -450,17 +450,17 @@ export function LandingPage({ plans = FALLBACK_PLANS }: { plans?: PublicPlan[] }
 
         <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(min(100%, 330px), 1fr))', gap: 18 }}>
           {FEATURES.map((f, i) => (
-            <Reveal key={f.title} delay={i * 80}>
+            <Reveal key={f.titleKey} delay={i * 80}>
               <a
                 href={f.externalHref ?? landingFeatureHref(f.page)}
                 {...(f.externalHref ? { target: '_blank', rel: 'noreferrer' } : {})}
-                aria-label={`Open ${f.title}`}
+                aria-label={t(f.titleKey)}
                 style={{ display: 'block', height: '100%', textDecoration: 'none' }}
               >
                 <GlassCard gradient={f.gradient} border={f.border} style={{ padding: '30px 26px', height: '100%' }}>
                   <div style={{ fontSize: 34, marginBottom: 16 }}>{f.icon}</div>
-                  <div style={{ fontSize: 16, fontWeight: 700, color: '#fff', marginBottom: 10 }}>{f.title}</div>
-                  <div style={{ fontSize: 13, color: C.textMuted, lineHeight: 1.75 }}>{f.desc}</div>
+                  <div style={{ fontSize: 16, fontWeight: 700, color: '#fff', marginBottom: 10 }}>{t(f.titleKey)}</div>
+                  <div style={{ fontSize: 13, color: C.textMuted, lineHeight: 1.75 }}>{t(f.descKey)}</div>
                 </GlassCard>
               </a>
             </Reveal>
@@ -486,9 +486,9 @@ export function LandingPage({ plans = FALLBACK_PLANS }: { plans?: PublicPlan[] }
                 <GlassCard style={{ padding: '34px 28px', position: 'relative', overflow: 'hidden', height: '100%' }}>
                   <div style={{ position: 'absolute', top: -12, right: -6, fontSize: 96, fontWeight: 900, color: 'rgba(255,255,255,0.04)', lineHeight: 1, userSelect: 'none', pointerEvents: 'none' }}>{s.num}</div>
                   <div style={{ fontSize: 34, marginBottom: 18 }}>{s.icon}</div>
-                  <div style={{ fontSize: 10, fontWeight: 700, color: C.textSubtle, letterSpacing: '0.12em', marginBottom: 8 }}>STEP {s.num}</div>
-                  <div style={{ fontSize: 17, fontWeight: 700, color: '#fff', marginBottom: 12 }}>{s.title}</div>
-                  <div style={{ fontSize: 13, color: C.textMuted, lineHeight: 1.75 }}>{s.desc}</div>
+                  <div style={{ fontSize: 10, fontWeight: 700, color: C.textSubtle, letterSpacing: '0.12em', marginBottom: 8 }}>{t('landing.stepLabel')} {s.num}</div>
+                  <div style={{ fontSize: 17, fontWeight: 700, color: '#fff', marginBottom: 12 }}>{t(s.titleKey)}</div>
+                  <div style={{ fontSize: 13, color: C.textMuted, lineHeight: 1.75 }}>{t(s.descKey)}</div>
                 </GlassCard>
               </Reveal>
             ))}
@@ -509,16 +509,16 @@ export function LandingPage({ plans = FALLBACK_PLANS }: { plans?: PublicPlan[] }
           </Reveal>
 
           <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(min(100%, 320px), 1fr))', gap: 18 }}>
-            {TESTIMONIALS.map((t, i) => (
-              <Reveal key={t.name} delay={i * 100}>
+            {TESTIMONIALS.map((testimonial, i) => (
+              <Reveal key={testimonial.name} delay={i * 100}>
                 <GlassCard style={{ padding: '28px 26px', height: '100%' }}>
                   <div style={{ fontSize: 28, color: 'rgba(255,255,255,0.12)', fontFamily: 'Georgia,serif', marginBottom: 10, lineHeight: 1 }}>&ldquo;</div>
-                  <p style={{ fontSize: 13, color: 'rgba(255,255,255,0.80)', lineHeight: 1.80, marginBottom: 20 }}>{t.text}</p>
+                  <p style={{ fontSize: 13, color: 'rgba(255,255,255,0.80)', lineHeight: 1.80, marginBottom: 20 }}>{t(testimonial.textKey)}</p>
                   <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
-                    <div style={{ width: 36, height: 36, borderRadius: '50%', background: `linear-gradient(135deg, ${t.color}, ${t.color}88)`, display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 12, fontWeight: 700, color: '#fff', flexShrink: 0 }}>{t.avatar}</div>
+                    <div style={{ width: 36, height: 36, borderRadius: '50%', background: `linear-gradient(135deg, ${testimonial.color}, ${testimonial.color}88)`, display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 12, fontWeight: 700, color: '#fff', flexShrink: 0 }}>{testimonial.avatar}</div>
                     <div>
-                      <div style={{ fontSize: 13, fontWeight: 600, color: '#fff' }}>{t.name}</div>
-                      <div style={{ fontSize: 11, color: C.textMuted }}>{t.role} · {t.city}</div>
+                      <div style={{ fontSize: 13, fontWeight: 600, color: '#fff' }}>{testimonial.name}</div>
+                      <div style={{ fontSize: 11, color: C.textMuted }}>{testimonial.role} · {testimonial.city}</div>
                     </div>
                   </div>
                 </GlassCard>
@@ -596,8 +596,8 @@ export function LandingPage({ plans = FALLBACK_PLANS }: { plans?: PublicPlan[] }
             {FAQS.map((faq, i) => (
               <Reveal key={i} delay={i * 50}>
                 <FaqItem
-                  question={faq.q}
-                  answer={faq.a}
+                  question={t(faq.qKey)}
+                  answer={t(faq.aKey)}
                   open={openFaq === i}
                   onToggle={() => setOpenFaq(openFaq === i ? null : i)}
                 />
@@ -714,7 +714,8 @@ export function LandingPage({ plans = FALLBACK_PLANS }: { plans?: PublicPlan[] }
 }
 
 // ── StatCard (animated counter) ───────────────────────────────────────────────
-function StatCard({ value, suffix, label, active, delay }: { value: number; suffix: string; label: string; active: boolean; delay: number }) {
+function StatCard({ value, suffix, labelKey, active, delay }: { value: number; suffix: string; labelKey: string; active: boolean; delay: number }) {
+  const { t } = useI18n()
   const [started, setStarted] = useState(false)
   useEffect(() => {
     if (active && !started) {
@@ -729,7 +730,7 @@ function StatCard({ value, suffix, label, active, delay }: { value: number; suff
       <div style={{ fontSize: 24, fontWeight: 800, marginBottom: 3, ...gradientText }}>
         {count}{suffix}
       </div>
-      <div style={{ fontSize: 11, color: C.textMuted }}>{label}</div>
+      <div style={{ fontSize: 11, color: C.textMuted }}>{t(labelKey)}</div>
     </div>
   )
 }
