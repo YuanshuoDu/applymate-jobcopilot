@@ -6,6 +6,7 @@ import type { ResumeContent } from '@/lib/types'
 import { InlineInput } from './InlineInput'
 import { SectionHeader, type DragHandleProps } from './SectionHeader'
 import { AiFieldSuggestion, type AiFieldContext } from './AiFieldSuggestion'
+import { useI18n } from '@/lib/i18n'
 
 type Project = NonNullable<ResumeContent['projects']>[number]
 
@@ -17,6 +18,7 @@ export function ProjectsSection({ projects, jobContext, onChange, dragHandleProp
   dragHandleProps?: DragHandleProps
   onRemove?:        () => void
 }) {
+  const { t } = useI18n()
   const [editIdx,   setEditIdx]   = useState<number | null>(null)
   const [collapsed, setCollapsed] = useState(false)
   const [dragOver,  setDragOver]  = useState<number | null>(null)
@@ -37,7 +39,7 @@ export function ProjectsSection({ projects, jobContext, onChange, dragHandleProp
   return (
     <div style={{ marginBottom: 20 }}>
       <SectionHeader
-        title="PROJECTS"
+        title={t('resume.section.projects')}
         count={projects.length}
         collapsed={collapsed}
         onToggle={() => setCollapsed(v => !v)}
@@ -49,19 +51,19 @@ export function ProjectsSection({ projects, jobContext, onChange, dragHandleProp
       {!collapsed && (
         <>
           {projects.length === 0 && (
-            <div style={{ fontSize: 12, color: 'var(--text-muted)', padding: '8px 4px' }}>No projects added yet.</div>
+            <div style={{ fontSize: 12, color: 'var(--text-muted)', padding: '8px 4px' }}>{t('resume.noProjects')}</div>
           )}
 
           {projects.map((p, i) => (
             editIdx === i ? (
               <div key={i} style={{ border: '0.5px solid var(--primary)', borderRadius: 6, padding: 10, marginBottom: 10 }}>
                 <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 6, marginBottom: 6 }}>
-                  <InlineInput value={p.name}    onChange={v => { const n=[...projects]; n[i]={...n[i],name:v};    onChange(n) }} placeholder="Project Name" />
-                  <InlineInput value={p.role??''} onChange={v => { const n=[...projects]; n[i]={...n[i],role:v||undefined}; onChange(n) }} placeholder="Your Role (optional)" />
+                  <InlineInput value={p.name}    onChange={v => { const n=[...projects]; n[i]={...n[i],name:v};    onChange(n) }} placeholder={t('resume.projectName')} />
+                  <InlineInput value={p.role??''} onChange={v => { const n=[...projects]; n[i]={...n[i],role:v||undefined}; onChange(n) }} placeholder={t('resume.yourRoleOptional')} />
                 </div>
                 <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 6, marginBottom: 8 }}>
-                  <InlineInput value={p.period??''} onChange={v => { const n=[...projects]; n[i]={...n[i],period:v||undefined}; onChange(n) }} placeholder="Period (optional)" />
-                  <InlineInput value={p.url??''}    onChange={v => { const n=[...projects]; n[i]={...n[i],url:v||undefined};   onChange(n) }} placeholder="URL (optional)" />
+                  <InlineInput value={p.period??''} onChange={v => { const n=[...projects]; n[i]={...n[i],period:v||undefined}; onChange(n) }} placeholder={t('resume.periodOptional')} />
+                  <InlineInput value={p.url??''}    onChange={v => { const n=[...projects]; n[i]={...n[i],url:v||undefined};   onChange(n) }} placeholder={t('resume.urlOptional')} />
                 </div>
                 <div>
                   {p.bullets.map((b, bi) => (
@@ -69,7 +71,7 @@ export function ProjectsSection({ projects, jobContext, onChange, dragHandleProp
                       <span style={{ fontSize: 12, color: 'var(--text-muted)', marginTop: 7, flexShrink: 0 }}>•</span>
                       <InlineInput value={b} onChange={v => {
                         const n=[...projects]; n[i]={...n[i],bullets:n[i].bullets.map((x,xi)=>xi===bi?v:x)}; onChange(n)
-                      }} multiline placeholder="Describe what you built…" style={{ minHeight: 36 }} />
+                      }} multiline placeholder={t('resume.builtPlaceholder')} style={{ minHeight: 36 }} />
                       <button onClick={() => { const n=[...projects]; n[i]={...n[i],bullets:n[i].bullets.filter((_,xi)=>xi!==bi)}; onChange(n) }}
                         style={{ fontSize: 11, color: 'var(--c-danger)', background: 'none', border: 'none', cursor: 'pointer', marginTop: 7, flexShrink: 0 }}>✕</button>
                     </div>
@@ -84,13 +86,13 @@ export function ProjectsSection({ projects, jobContext, onChange, dragHandleProp
                   ))}
                   <button onClick={() => { const n=[...projects]; n[i]={...n[i],bullets:[...n[i].bullets,'']}; onChange(n) }}
                     style={{ fontSize: 10, color: 'var(--primary)', background: 'none', border: 'none', cursor: 'pointer', marginTop: 4 }}>
-                    + Add bullet
+                    + {t('resume.addBullet')}
                   </button>
                 </div>
                 <div style={{ display: 'flex', justifyContent: 'space-between', marginTop: 8 }}>
                   <button onClick={() => { onChange(projects.filter((_,xi)=>xi!==i)); setEditIdx(null) }}
-                    style={{ fontSize: 10, color: 'var(--c-danger)', background: 'none', border: 'none', cursor: 'pointer' }}>Delete</button>
-                  <Btn small variant="primary" onClick={() => setEditIdx(null)}>Done</Btn>
+                    style={{ fontSize: 10, color: 'var(--c-danger)', background: 'none', border: 'none', cursor: 'pointer' }}>{t('common.delete')}</button>
+                  <Btn small variant="primary" onClick={() => setEditIdx(null)}>{t('common.done')}</Btn>
                 </div>
               </div>
             ) : (
@@ -108,9 +110,9 @@ export function ProjectsSection({ projects, jobContext, onChange, dragHandleProp
                 <div style={{ flex: 1 }} onClick={() => setEditIdx(i)}>
                   <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 2 }}>
                     <div>
-                      <span style={{ fontSize: 12, fontWeight: 500 }}>{p.name || <em style={{ color: 'var(--text-muted)' }}>Untitled</em>}</span>
+                      <span style={{ fontSize: 12, fontWeight: 500 }}>{p.name || <em style={{ color: 'var(--text-muted)' }}>{t('resume.untitled')}</em>}</span>
                       {p.role && <span style={{ fontSize: 12, color: 'var(--text-muted)' }}> · {p.role}</span>}
-                      {p.url && <a href={p.url} target="_blank" rel="noreferrer" onClick={e => e.stopPropagation()} style={{ fontSize: 10, color: 'var(--primary)', marginLeft: 8 }}>↗ link</a>}
+                      {p.url && <a href={p.url} target="_blank" rel="noreferrer" onClick={e => e.stopPropagation()} style={{ fontSize: 10, color: 'var(--primary)', marginLeft: 8 }}>↗ {t('resume.link')}</a>}
                     </div>
                     <span style={{ fontSize: 11, color: 'var(--text-muted)' }}>{p.period}</span>
                   </div>

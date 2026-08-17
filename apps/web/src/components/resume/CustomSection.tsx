@@ -6,6 +6,7 @@ import type { ResumeContent } from '@/lib/types'
 import { InlineInput } from './InlineInput'
 import { SectionHeader, type DragHandleProps } from './SectionHeader'
 import { AiFieldSuggestion, type AiFieldContext } from './AiFieldSuggestion'
+import { useI18n } from '@/lib/i18n'
 
 type CustomEntry = NonNullable<ResumeContent['custom']>[number]
 type CustomItem  = CustomEntry['items'][number]
@@ -17,6 +18,7 @@ export function CustomSection({ entry, jobContext, onChange, onRemove, dragHandl
   onRemove?:        () => void
   dragHandleProps?: DragHandleProps
 }) {
+  const { t } = useI18n()
   // A newly-created custom section opens directly in title-edit mode so it
   // never looks like the default name is fixed.
   const [editTitle, setEditTitle] = useState(() => !entry.title || entry.title === 'CUSTOM SECTION')
@@ -44,7 +46,7 @@ export function CustomSection({ entry, jobContext, onChange, onRemove, dragHandl
   return (
     <div style={{ marginBottom: 20 }}>
       <SectionHeader
-        title={entry.title || 'CUSTOM SECTION'}
+        title={entry.title || t('resume.section.custom')}
         count={entry.items.length}
         collapsed={collapsed}
         onToggle={() => setCollapsed(v => !v)}
@@ -62,35 +64,35 @@ export function CustomSection({ entry, jobContext, onChange, onRemove, dragHandl
               onChange={e => onChange({ ...entry, title: e.target.value.toUpperCase() })}
               onBlur={() => setEditTitle(false)}
               onKeyDown={e => { if (e.key === 'Enter' || e.key === 'Escape') setEditTitle(false) }}
-              placeholder="SECTION TITLE"
+              placeholder={t('resume.sectionTitle')}
               style={{ fontSize: 11, fontWeight: 500, width: '100%', border: '0.5px solid var(--primary)', borderRadius: 4, padding: '3px 6px', outline: 'none', marginBottom: 8, color: 'var(--text)', background: 'var(--bg)', boxSizing: 'border-box' }}
             />
           ) : (
             <button onClick={() => setEditTitle(true)}
               style={{ fontSize: 9, color: 'var(--primary)', background: 'none', border: 'none', cursor: 'pointer', marginBottom: 6, padding: 0 }}>
-              Edit title
+              {t('resume.editTitle')}
             </button>
           )}
 
           {entry.items.length === 0 && (
-            <div style={{ fontSize: 12, color: 'var(--text-muted)', padding: '8px 4px' }}>No items added yet.</div>
+            <div style={{ fontSize: 12, color: 'var(--text-muted)', padding: '8px 4px' }}>{t('resume.noItems')}</div>
           )}
 
           {entry.items.map((item, i) => (
             editIdx === i ? (
               <div key={i} style={{ border: '0.5px solid var(--primary)', borderRadius: 6, padding: 10, marginBottom: 8 }}>
                 <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 6, marginBottom: 6 }}>
-                  <InlineInput value={item.title??''}    onChange={v => updateItem(i, { title: v||undefined })}    placeholder="Title (optional)" />
-                  <InlineInput value={item.subtitle??''} onChange={v => updateItem(i, { subtitle: v||undefined })} placeholder="Subtitle (optional)" />
+                  <InlineInput value={item.title??''}    onChange={v => updateItem(i, { title: v||undefined })}    placeholder={t('resume.titleOptional')} />
+                  <InlineInput value={item.subtitle??''} onChange={v => updateItem(i, { subtitle: v||undefined })} placeholder={t('resume.subtitleOptional')} />
                 </div>
-                <InlineInput value={item.period??''} onChange={v => updateItem(i, { period: v||undefined })} placeholder="Period (optional)" style={{ marginBottom: 8 }} />
+                <InlineInput value={item.period??''} onChange={v => updateItem(i, { period: v||undefined })} placeholder={t('resume.periodOptional')} style={{ marginBottom: 8 }} />
                 <div>
                   {item.bullets.map((b, bi) => (
                     <div key={bi} style={{ display: 'flex', gap: 4, marginBottom: 4, alignItems: 'flex-start' }}>
                       <span style={{ fontSize: 12, color: 'var(--text-muted)', marginTop: 7, flexShrink: 0 }}>•</span>
                       <InlineInput value={b} onChange={v => {
                         updateItem(i, { bullets: item.bullets.map((x, xi) => xi === bi ? v : x) })
-                      }} multiline placeholder="Detail…" style={{ minHeight: 36 }} />
+                      }} multiline placeholder={t('resume.detailPlaceholder')} style={{ minHeight: 36 }} />
                       <button onClick={() => updateItem(i, { bullets: item.bullets.filter((_, xi) => xi !== bi) })}
                         style={{ fontSize: 11, color: 'var(--c-danger)', background: 'none', border: 'none', cursor: 'pointer', marginTop: 7, flexShrink: 0 }}>✕</button>
                     </div>
@@ -105,13 +107,13 @@ export function CustomSection({ entry, jobContext, onChange, onRemove, dragHandl
                   ))}
                   <button onClick={() => updateItem(i, { bullets: [...item.bullets, ''] })}
                     style={{ fontSize: 10, color: 'var(--primary)', background: 'none', border: 'none', cursor: 'pointer', marginTop: 4 }}>
-                    + Add bullet
+                    + {t('resume.addBullet')}
                   </button>
                 </div>
                 <div style={{ display: 'flex', justifyContent: 'space-between', marginTop: 8 }}>
                   <button onClick={() => { onChange({ ...entry, items: entry.items.filter((_, xi) => xi !== i) }); setEditIdx(null) }}
-                    style={{ fontSize: 10, color: 'var(--c-danger)', background: 'none', border: 'none', cursor: 'pointer' }}>Delete</button>
-                  <Btn small variant="primary" onClick={() => setEditIdx(null)}>Done</Btn>
+                    style={{ fontSize: 10, color: 'var(--c-danger)', background: 'none', border: 'none', cursor: 'pointer' }}>{t('common.delete')}</button>
+                  <Btn small variant="primary" onClick={() => setEditIdx(null)}>{t('common.done')}</Btn>
                 </div>
               </div>
             ) : (
