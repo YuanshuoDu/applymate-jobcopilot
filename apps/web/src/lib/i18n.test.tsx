@@ -51,4 +51,10 @@ describe('AI settings translations', () => {
       expect(translate('zh', key), key).not.toBe(key)
     }
   })
+
+  it('keeps registered English translations free of Chinese characters', () => {
+    for (const key of TRANSLATION_KEYS) {
+      expect(translate('en', key), key).not.toMatch(/[\u3400-\u9fff]/)
+    }
+  })
 })

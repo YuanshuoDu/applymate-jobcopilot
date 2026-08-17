@@ -16,4 +16,10 @@ describe('extension language switching', () => {
       expect(translateExtension('zh', key), key).not.toBe(key)
     }
   })
+
+  it('keeps registered English strings free of Chinese characters', () => {
+    for (const key of EXTENSION_TRANSLATION_KEYS) {
+      expect(translateExtension('en', key), key).not.toMatch(/[\u3400-\u9fff]/)
+    }
+  })
 })
