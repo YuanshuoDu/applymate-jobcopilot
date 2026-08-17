@@ -1134,14 +1134,15 @@ function PreparationProgress({ stage, elapsed }: { stage: 'idle' | 'resume' | 'c
 }
 
 function ResumePackPreview({ resume, onReview }: { resume: Resume | null; onReview: () => void }) {
-  if (!resume) return <div style={{ fontSize: 13, color: 'var(--text-muted)' }}>The tailored resume will appear here once AI tailoring finishes.</div>
+  const { t } = useI18n()
+  if (!resume) return <div style={{ fontSize: 13, color: 'var(--text-muted)' }}>{t('jobs.preview.resumeMissing')}</div>
   const templateLabel = resume.templateId ? `${resume.templateId[0].toUpperCase()}${resume.templateId.slice(1)} template` : 'Clean template'
   return <div>
     <button onClick={onReview} aria-label="Open the full tailored resume preview" style={{ display: 'block', position: 'relative', width: '100%', height: 420, padding: 0, overflow: 'hidden', contain: 'layout paint', border: '1px solid #dbe1ea', borderRadius: 8, background: '#e9eef5', cursor: 'zoom-in', textAlign: 'left' }}>
       <div style={{ position: 'absolute', inset: 0, width: '222.23%', transform: 'scale(.45)', transformOrigin: 'top left', pointerEvents: 'none', background: '#fff' }}>
         <ResumeRenderer content={resume.content} templateId={resume.templateId} templateOptions={resume.templateOptions} />
       </div>
-      <span style={{ position: 'absolute', right: 12, bottom: 12, display: 'inline-flex', alignItems: 'center', gap: 5, padding: '8px 10px', borderRadius: 7, background: 'rgba(15,23,42,.86)', color: '#fff', fontSize: 12, fontWeight: 700 }}>View full resume <ChevronRight size={15} /></span>
+      <span style={{ position: 'absolute', right: 12, bottom: 12, display: 'inline-flex', alignItems: 'center', gap: 5, padding: '8px 10px', borderRadius: 7, background: 'rgba(15,23,42,.86)', color: '#fff', fontSize: 12, fontWeight: 700 }}>{t('jobs.preview.viewResume')} <ChevronRight size={15} /></span>
     </button>
     <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12, marginTop: 10, fontSize: 12, color: '#64748b' }}><span>AI tailored for this job</span><span>{templateLabel}</span></div>
   </div>
@@ -1151,9 +1152,10 @@ function CoverLetterPackPreview({ coverLetter, applicant, fallbackName, company,
   coverLetter: CoverLetter | null; applicant?: Resume['content']['contact']; fallbackName: string; company: string; role: string
   templateId?: string | null; templateOptions?: Resume['templateOptions']; onReview: () => void
 }) {
+  const { t } = useI18n()
   return coverLetter
-    ? <button onClick={onReview} aria-label="Open the full generated cover letter" style={{ display: 'block', position: 'relative', width: '100%', height: 260, padding: 0, overflow: 'hidden', contain: 'layout paint', border: '1px solid #dbe1ea', borderRadius: 8, background: '#e9eef5', cursor: 'zoom-in', textAlign: 'left' }}><div style={{ position: 'absolute', inset: 0, width: '200%', transform: 'scale(.5)', transformOrigin: 'top left', pointerEvents: 'none' }}><CoverLetterPreview content={coverLetter.content} applicant={applicant} fallbackName={fallbackName} company={company} role={role} templateId={templateId ?? coverLetter.templateId ?? 'clean'} templateOptions={templateOptions ?? coverLetter.templateOptions ?? {}} /></div><span style={{ position: 'absolute', right: 12, bottom: 12, display: 'inline-flex', alignItems: 'center', gap: 4, padding: '7px 9px', borderRadius: 6, background: 'rgba(15,23,42,.86)', color: '#fff', fontSize: 11, fontWeight: 700 }}>View full letter <ChevronRight size={14} /></span></button>
-    : <div style={{ fontSize: 13, color: 'var(--text-muted)' }}>The generated cover letter will appear here after automatic preparation.</div>
+    ? <button onClick={onReview} aria-label={t('jobs.fullCoverLetter')} style={{ display: 'block', position: 'relative', width: '100%', height: 260, padding: 0, overflow: 'hidden', contain: 'layout paint', border: '1px solid #dbe1ea', borderRadius: 8, background: '#e9eef5', cursor: 'zoom-in', textAlign: 'left' }}><div style={{ position: 'absolute', inset: 0, width: '200%', transform: 'scale(.5)', transformOrigin: 'top left', pointerEvents: 'none' }}><CoverLetterPreview content={coverLetter.content} applicant={applicant} fallbackName={fallbackName} company={company} role={role} templateId={templateId ?? coverLetter.templateId ?? 'clean'} templateOptions={templateOptions ?? coverLetter.templateOptions ?? {}} /></div><span style={{ position: 'absolute', right: 12, bottom: 12, display: 'inline-flex', alignItems: 'center', gap: 4, padding: '7px 9px', borderRadius: 6, background: 'rgba(15,23,42,.86)', color: '#fff', fontSize: 11, fontWeight: 700 }}>{t('jobs.viewFullLetter')} <ChevronRight size={14} /></span></button>
+    : <div style={{ fontSize: 13, color: 'var(--text-muted)' }}>{t('jobs.preview.coverLetterMissing')}</div>
 }
 
 function DocumentPreviewModal({ title, onClose, children }: { title: string; onClose: () => void; children: React.ReactNode }) {
