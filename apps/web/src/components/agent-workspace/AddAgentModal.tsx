@@ -3,6 +3,7 @@
 import React, { useState } from 'react'
 import { Btn, useToast } from '@/components/ui'
 import { MODEL_CATALOGUE, PROVIDER_LABELS } from '@/lib/model-router-client'
+import { useI18n } from '@/lib/i18n'
 
 export interface CustomAgentRow {
   id: string
@@ -68,6 +69,7 @@ export function AddAgentModal({ onClose, onCreated }: {
   onCreated: (agent: CustomAgentRow) => void
 }) {
   const toast = useToast()
+  const { t } = useI18n()
   const [name, setName] = useState('')
   const [icon, setIcon] = useState('🧩')
   const [description, setDescription] = useState('')
@@ -79,7 +81,7 @@ export function AddAgentModal({ onClose, onCreated }: {
 
   async function handleCreate() {
     if (!name.trim()) {
-      toast.error('Name required', 'Give this Agent a clear name before creating it.')
+      toast.error(t('agent.nameRequiredToast'), t('agent.nameRequiredDetail'))
       return
     }
 
@@ -92,16 +94,16 @@ export function AddAgentModal({ onClose, onCreated }: {
       })
 
       if (!res.ok) {
-        toast.error('Could not create Agent', await res.text())
+        toast.error(t('agent.createFailed'), await res.text())
         return
       }
 
       const data = await res.json()
       onCreated(data.data ?? data)
-      toast.success('Custom Agent created', `${name} will run after the ${insertAfter} stage.`)
+      toast.success(t('agent.created'), `${name} ${t('agent.createdDetail')}`)
       onClose()
     } catch (error) {
-      toast.error('Could not create Agent', (error as Error).message || 'Network request failed.')
+      toast.error(t('agent.createFailed'), (error as Error).message || 'Network request failed.')
     } finally {
       setSaving(false)
     }
@@ -140,14 +142,14 @@ export function AddAgentModal({ onClose, onCreated }: {
         overflow: 'hidden',
       }} onClick={event => event.stopPropagation()}>
         <div style={{ padding: '14px 18px', background: 'var(--bg-secondary)', borderBottom: '0.5px solid var(--border)', display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
-          <div style={{ fontSize: 13, fontWeight: 600 }}>＋ Add custom Agent</div>
+          <div style={{ fontSize: 13, fontWeight: 600 }}>＋ {t('agent.addCustom')}</div>
           <button onClick={onClose} style={{ background: 'none', border: 'none', cursor: 'pointer', fontSize: 16, color: 'var(--text-muted)' }}>✕</button>
         </div>
 
         <div style={{ padding: '16px 18px', display: 'flex', flexDirection: 'column', gap: 12 }}>
           <div style={{ display: 'flex', gap: 10, alignItems: 'flex-start' }}>
             <div>
-              <div style={{ fontSize: 10, color: 'var(--text-muted)', marginBottom: 5 }}>Icon</div>
+              <div style={{ fontSize: 10, color: 'var(--text-muted)', marginBottom: 5 }}>{t('agent.icon')}</div>
               <div style={{ display: 'flex', flexWrap: 'wrap', gap: 4, width: 110 }}>
                 {EMOJI_OPTIONS.map(option => (
                   <button key={option} onClick={() => setIcon(option)} style={{
@@ -168,15 +170,15 @@ export function AddAgentModal({ onClose, onCreated }: {
               </div>
             </div>
             <div style={{ flex: 1 }}>
-              <div style={{ fontSize: 10, color: 'var(--text-muted)', marginBottom: 5 }}>Name *</div>
+              <div style={{ fontSize: 10, color: 'var(--text-muted)', marginBottom: 5 }}>{t('agent.nameRequired')}</div>
               <input value={name} onChange={event => setName(event.target.value)} placeholder="e.g. Remote Filter" style={inputStyle} autoFocus />
-              <div style={{ fontSize: 10, color: 'var(--text-muted)', marginTop: 8, marginBottom: 5 }}>Description (optional)</div>
+              <div style={{ fontSize: 10, color: 'var(--text-muted)', marginTop: 8, marginBottom: 5 }}>{t('agent.descriptionOptional')}</div>
               <input value={description} onChange={event => setDescription(event.target.value)} placeholder="A short description of this Agent's responsibility" style={inputStyle} />
             </div>
           </div>
 
           <div>
-            <div style={{ fontSize: 10, color: 'var(--text-muted)', marginBottom: 5 }}>System prompt (how the Agent should reason)</div>
+            <div style={{ fontSize: 10, color: 'var(--text-muted)', marginBottom: 5 }}>{t('agent.systemPrompt')}</div>
             <textarea
               value={systemPrompt}
               onChange={event => setSystemPrompt(event.target.value)}
@@ -188,11 +190,11 @@ export function AddAgentModal({ onClose, onCreated }: {
 
           <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10 }}>
             <div>
-              <div style={{ fontSize: 10, color: 'var(--text-muted)', marginBottom: 5 }}>AI model</div>
+              <div style={{ fontSize: 10, color: 'var(--text-muted)', marginBottom: 5 }}>{t('agent.aiModelLabel')}</div>
               <ModelSelect provider={provider} model={model} onChange={(nextProvider, nextModel) => { setProvider(nextProvider); setModel(nextModel) }} />
             </div>
             <div>
-              <div style={{ fontSize: 10, color: 'var(--text-muted)', marginBottom: 5 }}>Run after stage</div>
+              <div style={{ fontSize: 10, color: 'var(--text-muted)', marginBottom: 5 }}>{t('agent.runAfter')}</div>
               <select value={insertAfter} onChange={event => setInsertAfter(event.target.value)} style={{ ...inputStyle, cursor: 'pointer' }}>
                 {BUILTIN_STAGE_KEYS.map(key => (
                   <option key={key} value={key}>{key}</option>
@@ -203,9 +205,9 @@ export function AddAgentModal({ onClose, onCreated }: {
         </div>
 
         <div style={{ padding: '12px 18px', borderTop: '0.5px solid var(--border)', display: 'flex', gap: 8, justifyContent: 'flex-end' }}>
-          <Btn variant="ghost" onClick={onClose}>Cancel</Btn>
+          <Btn variant="ghost" onClick={onClose}>{t('agent.cancel')}</Btn>
           <Btn variant="primary" onClick={handleCreate} disabled={saving || !name.trim()}>
-            {saving ? 'Creating…' : '✓ Create Agent'}
+            {saving ? t('agent.creating') : `✓ ${t('agent.create')}`}
           </Btn>
         </div>
       </div>
