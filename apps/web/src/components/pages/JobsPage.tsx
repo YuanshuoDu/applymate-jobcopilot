@@ -953,7 +953,7 @@ function JobDetailDrawer({ job, onClose, onStatusChange, onUpdate, onDelete, onO
               onChange={e => setNotes(e.target.value)}
               onBlur={saveNotes}
               onKeyDown={e => { if ((e.metaKey || e.ctrlKey) && e.key === 's') { e.preventDefault(); saveNotes() } }}
-              placeholder="Add notes, contacts, salary details…"
+              placeholder={t('jobs.notesPlaceholder')}
               style={{ ...drawerInputSt, minHeight: 90, resize: 'vertical', lineHeight: 1.6, padding: '7px 9px' }}
             />
           </div>
@@ -1124,12 +1124,13 @@ function PackRow({ number, title, detail, done, failed = false, active = false, 
 }
 
 function PreparationProgress({ stage, elapsed }: { stage: 'idle' | 'resume' | 'coverLetter' | 'audit' | 'review'; elapsed: number }) {
+  const { t } = useI18n()
   const current = stage === 'audit' ? 3 : stage === 'coverLetter' ? 2 : 1
-  const labels = ['Preparing resume', 'Preparing cover letter', 'Running independent audit']
+  const labels = [t('jobs.progress.resume'), t('jobs.progress.coverLetter'), t('jobs.progress.audit')]
   return <div role="status" style={{ marginTop: 12, padding: '12px 14px', border: '1px solid #bfdbfe', borderRadius: 9, background: '#f8fbff' }}>
     <div style={{ display: 'flex', justifyContent: 'space-between', gap: 12, fontSize: 12, fontWeight: 700, color: '#1d4ed8' }}><span>{labels[current - 1]}…</span><span style={{ fontVariantNumeric: 'tabular-nums' }}>{formatDuration(elapsed)}</span></div>
     <div style={{ height: 6, overflow: 'hidden', marginTop: 9, borderRadius: 999, background: '#dbeafe' }}><div style={{ width: `${Math.max(12, current * 30)}%`, height: '100%', borderRadius: 999, background: '#2563eb', transition: 'width .35s ease' }} /></div>
-    <div style={{ marginTop: 8, fontSize: 11, color: '#64748b' }}>Usually 1–3 minutes. You can keep this panel open while we work.</div>
+    <div style={{ marginTop: 8, fontSize: 11, color: '#64748b' }}>{t('jobs.progress.hint')}</div>
   </div>
 }
 
