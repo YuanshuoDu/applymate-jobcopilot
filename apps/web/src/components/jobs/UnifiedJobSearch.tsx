@@ -4,6 +4,7 @@ import React, { useState, useCallback, useMemo } from 'react'
 import { Btn, CompanyLogo, INPUT_STYLE, ScorePill, useToast } from '@/components/ui'
 import { apiMutate } from '@/lib/hooks'
 import type { Job } from '@/lib/types'
+import { useI18n } from '@/lib/i18n'
 
 // ── Shared types ──────────────────────────────────────────────────────────────
 
@@ -70,14 +71,14 @@ async function saveAndScore(
 
 // ── Shared job card ───────────────────────────────────────────────────────────
 
-function fmtPosted(iso?: string | null): string {
+function fmtPosted(iso: string | null | undefined, t: (key: string) => string): string {
   if (!iso) return ''
   const days = Math.floor((Date.now() - new Date(iso).getTime()) / 86_400_000)
-  if (days === 0) return 'Today'
-  if (days === 1) return 'Yesterday'
-  if (days < 7)  return `${days}d ago`
-  if (days < 30) return `${Math.floor(days / 7)}w ago`
-  return `${Math.floor(days / 30)}mo ago`
+  if (days === 0) return t('jobSearch.today')
+  if (days === 1) return t('jobSearch.yesterday')
+  if (days < 7)  return `${days}${t('jobSearch.daysAgo')}`
+  if (days < 30) return `${Math.floor(days / 7)}${t('jobSearch.weeksAgo')}`
+  return `${Math.floor(days / 30)}${t('jobSearch.monthsAgo')}`
 }
 
 const SOURCE_BADGE: Record<JobSource, { label: string; color: string }> = {
@@ -98,6 +99,7 @@ function JobCard({
   showSource: boolean
   onSave:     () => void
 }) {
+  const { t } = useI18n()
   const badge = SOURCE_BADGE[r.source]
   return (
     <div style={{ padding: '12px 16px', display: 'flex', alignItems: 'flex-start', gap: 10, borderBottom: '0.5px solid var(--border)', background: 'var(--bg)' }}>
@@ -118,7 +120,7 @@ function JobCard({
         </div>
         <div style={{ fontSize: 11, color: 'var(--text-muted)' }}>
           {r.company}{r.location ? ` · ${r.location}` : ''}
-          {r.postedAt && <span style={{ marginLeft: 8, fontSize: 10, opacity: 0.65 }}>{fmtPosted(r.postedAt)}</span>}
+            {r.postedAt && <span style={{ marginLeft: 8, fontSize: 10, opacity: 0.65 }}>{fmtPosted(r.postedAt, t)}</span>}
         </div>
         {r.salary && <div style={{ fontSize: 11, color: 'var(--c-success)', marginTop: 2 }}>{r.salary}</div>}
         {r.description && <div style={{ fontSize: 10, color: 'var(--text-muted)', marginTop: 4, lineHeight: 1.5 }}>{r.description}</div>}
@@ -128,20 +130,20 @@ function JobCard({
           scoring ? (
             <span style={{ fontSize: 10, color: 'var(--text-muted)', display: 'flex', alignItems: 'center', gap: 4 }}>
               <span style={{ width: 10, height: 10, border: '1.5px solid rgba(79,70,229,0.30)', borderTopColor: 'var(--primary)', borderRadius: '50%', animation: 'spin 0.7s linear infinite', display: 'inline-block' }} />
-              Scoring…
+              {t('jobSearch.scoring')}…
             </span>
           ) : score !== undefined ? (
             <ScorePill score={score} />
           ) : (
-            <span style={{ fontSize: 10, color: 'var(--c-success)', fontWeight: 500 }}>✓ Saved</span>
+            <span style={{ fontSize: 10, color: 'var(--c-success)', fontWeight: 500 }}>✓ {t('common.saved')}</span>
           )
         ) : (
           <Btn small variant="primary" disabled={saving} onClick={onSave}>
-            {saving ? 'Saving…' : '+ Save'}
+            {saving ? `${t('jobSearch.saving')}…` : `+ ${t('common.save')}`}
           </Btn>
         )}
         <a href={r.url} target="_blank" rel="noopener noreferrer" style={{ fontSize: 10, color: 'var(--primary)', textDecoration: 'none' }}>
-          View ↗
+          {t('jobSearch.view')} ↗
         </a>
       </div>
     </div>
@@ -160,6 +162,7 @@ interface SourcePanelProps {
 }
 
 function SourcePanel({ fetchJobs, formFields, placeholder, q: qProp, onJobSaved, showSource = false }: SourcePanelProps) {
+  const { t } = useI18n()
   const toast = useToast()
   const [searching,   setSearching  ] = useState(false)
   const [loadingMore, setLoadingMore ] = useState(false)
@@ -189,14 +192,14 @@ function SourcePanel({ fetchJobs, formFields, placeholder, q: qProp, onJobSaved,
     if (!qProp.trim()) return
     setSearching(true); setSearched(true); setPage(1); setSavedIds(new Set()); setScores({})
     try { await doSearch(1, false) }
-    catch (ex) { toast.error('Search failed', (ex as Error).message); setResults([]) }
+    catch (ex) { toast.error(t('jobSearch.searchFailed'), (ex as Error).message); setResults([]) }
     finally    { setSearching(false) }
   }
 
   async function handleLoadMore() {
     const next = page + 1; setPage(next); setLoadingMore(true)
     try { await doSearch(next, true) }
-    catch { toast.error('Load more failed', '') }
+    catch { toast.error(t('jobSearch.loadMoreFailed'), '') }
     finally { setLoadingMore(false) }
   }
 
@@ -208,17 +211,17 @@ function SourcePanel({ fetchJobs, formFields, placeholder, q: qProp, onJobSaved,
         setSavingIds(prev => { const n = new Set(prev); n.delete(rid); return n })
         setSavedIds(prev => new Set(prev).add(rid))
         setScoringIds(prev => new Set(prev).add(rid))
-        toast.success('Job saved', `${r.title} at ${r.company} — scoring…`)
+        toast.success(t('jobSearch.jobSaved'), `${r.title} at ${r.company} — ${t('jobSearch.scoring')}…`)
         onJobSaved?.()
       },
       (rid, score) => {
         setScoringIds(prev => { const n = new Set(prev); n.delete(rid); return n })
         setScores(prev => ({ ...prev, [rid]: score }))
-        toast.success('Match scored', `${r.company}: ${score}% match`)
+        toast.success(t('jobSearch.matchScored'), `${r.company}: ${score}% ${t('common.match')}`)
       },
       (msg) => {
         setSavingIds(prev => { const n = new Set(prev); n.delete(r.id); return n })
-        toast.error('Save failed', msg)
+        toast.error(t('jobSearch.saveFailed'), msg)
       },
     )
   }
@@ -237,11 +240,11 @@ function SourcePanel({ fetchJobs, formFields, placeholder, q: qProp, onJobSaved,
           padding: '8px 18px', background: 'var(--primary)', color: '#fff', border: 'none', borderRadius: 6,
           fontSize: 12, fontWeight: 500, cursor: searching ? 'not-allowed' : 'pointer', opacity: searching ? 0.7 : 1, whiteSpace: 'nowrap',
         }}>
-          {searching ? 'Searching…' : 'Search'}
+          {searching ? `${t('common.searching')}…` : t('common.search')}
         </button>
         {searched && !searching && (
           <span style={{ fontSize: 11, color: 'var(--text-muted)', alignSelf: 'center' }}>
-            {total.toLocaleString()} results
+            {total.toLocaleString()} {t('jobSearch.results')}
           </span>
         )}
       </form>
@@ -251,11 +254,11 @@ function SourcePanel({ fetchJobs, formFields, placeholder, q: qProp, onJobSaved,
           {searching ? (
             <div style={{ padding: 40, textAlign: 'center' }}>
               <div style={{ width: 22, height: 22, border: '2px solid rgba(79,70,229,0.20)', borderTopColor: 'var(--primary)', borderRadius: '50%', animation: 'spin 0.7s linear infinite', margin: '0 auto 10px' }} />
-              <div style={{ fontSize: 12, color: 'var(--text-muted)' }}>Searching {placeholder}…</div>
+              <div style={{ fontSize: 12, color: 'var(--text-muted)' }}>{t('jobSearch.searchingSource')} {placeholder}…</div>
             </div>
           ) : results.length === 0 ? (
             <div style={{ padding: 40, textAlign: 'center', fontSize: 12, color: 'var(--text-muted)' }}>
-              No jobs found. Try different keywords or a broader location.
+              {t('jobSearch.noJobs')}
             </div>
           ) : (
             <>
@@ -272,9 +275,9 @@ function SourcePanel({ fetchJobs, formFields, placeholder, q: qProp, onJobSaved,
               </div>
               {results.length < total && (
                 <div style={{ padding: '12px 16px', borderTop: '0.5px solid var(--border)', display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 10 }}>
-                  <span style={{ fontSize: 11, color: 'var(--text-muted)' }}>Showing {results.length} of {total.toLocaleString()}</span>
+                  <span style={{ fontSize: 11, color: 'var(--text-muted)' }}>{t('jobSearch.showing')} {results.length} {t('jobSearch.of')} {total.toLocaleString()}</span>
                   <Btn small variant="ghost" disabled={loadingMore} onClick={handleLoadMore}>
-                    {loadingMore ? 'Loading…' : 'Load more'}
+                    {loadingMore ? `${t('common.loading')}…` : t('jobSearch.loadMore')}
                   </Btn>
                 </div>
               )}
