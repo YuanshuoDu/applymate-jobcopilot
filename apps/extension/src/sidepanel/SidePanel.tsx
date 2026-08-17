@@ -564,7 +564,7 @@ function TrackerPanel({ settings, tabKey, L, onOpenResume }: { settings: Extensi
 
         <div className="am-job-tools">
           <div className="am-search-wrap"><label className="am-search"><Search size={15} aria-hidden="true" /><input value={search} onChange={event => setSearch(event.target.value)} placeholder={t('Search by role or company…')} aria-label={t('Search jobs')} />{search && <button className="am-search-clear" type="button" onClick={() => setSearch('')} aria-label={t('Clear search')}><X size={13} /></button>}</label></div>
-          <div className="am-filter-strip" role="tablist" aria-label="Job status filters">
+          <div className="am-filter-strip" role="tablist" aria-label={t('Job status filters')}>
             {([['all', t('All')], ['saved', L.saved], ['applied', L.applied], ['interview', t('Interviews')], ['rejected', L.rejected]] as const).map(([value, label]) => <button key={value} className={`am-filter${filterStatus === value ? ' active' : ''}`} type="button" role="tab" aria-selected={filterStatus === value} onClick={() => setFilterStatus(value)}>{label}</button>)}
           </div>
           <div className="am-select-row"><select className="am-select" value={filterSource} onChange={event => setFilterSource(event.target.value)} aria-label={t('Filter by source')}><option value="all">{t('All sources')}</option>{availableSources.map(source => <option key={source} value={source}>{source}</option>)}</select><select className="am-select" value={sortBy} onChange={event => setSortBy(event.target.value as SortBy)} aria-label={t('Sort jobs')}><option value="date">{t('Newest first')}</option><option value="company">{t('Company')}</option><option value="score">{t('Match score')}</option></select></div>

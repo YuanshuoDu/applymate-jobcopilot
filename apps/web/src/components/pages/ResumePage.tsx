@@ -128,22 +128,23 @@ function calcCompleteness(c: ResumeContent): { score: number; tips: string[] } {
 }
 
 function CompletenessBar({ content }: { content: ResumeContent }) {
+  const { t } = useI18n()
   const { score, tips } = calcCompleteness(content)
   const color = score >= 80 ? 'var(--c-success)' : score >= 50 ? 'var(--primary)' : 'var(--c-warning)'
   const [showTips, setShowTips] = useState(false)
   return (
     <div style={{ marginBottom: 12, padding: '8px 12px', background: 'var(--bg)', border: '0.5px solid var(--border)', borderRadius: 8 }}>
       <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 5 }}>
-        <span style={{ fontSize: 10, fontWeight: 500, color: 'var(--text-muted)' }}>RESUME COMPLETENESS</span>
+        <span style={{ fontSize: 10, fontWeight: 500, color: 'var(--text-muted)' }}>{t('resume.completeness')}</span>
         <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
           <span style={{ fontSize: 11, fontWeight: 600, color }}>{score}%</span>
           {tips.length > 0 && (
             <button onClick={() => setShowTips(v => !v)}
               style={{ fontSize: 9, color: 'var(--primary)', background: 'rgba(79,70,229,0.08)', border: '0.5px solid rgba(79,70,229,0.20)', borderRadius: 10, padding: '1px 7px', cursor: 'pointer' }}>
-              {showTips ? 'Hide tips' : `${tips.length} tip${tips.length > 1 ? 's' : ''}`}
+              {showTips ? t('resume.hideTips') : `${tips.length} ${t('resume.tips')}`}
             </button>
           )}
-          {score === 100 && <span style={{ fontSize: 10, color: 'var(--c-success)' }}>✓ Complete</span>}
+          {score === 100 && <span style={{ fontSize: 10, color: 'var(--c-success)' }}>{t('resume.complete')}</span>}
         </div>
       </div>
       <div style={{ height: 5, background: 'var(--border)', borderRadius: 3, overflow: 'hidden' }}>
@@ -163,20 +164,21 @@ function CompletenessBar({ content }: { content: ResumeContent }) {
 // ── NewResumeModal ────────────────────────────────────────────────────────────
 
 function NewResumeModal({ onClose, onCreate }: { onClose: () => void; onCreate: (name: string) => void }) {
+  const { t } = useI18n()
   const [name, setName] = useState('New Resume')
   return (
     <div style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.3)', zIndex: 100, display: 'flex', alignItems: 'center', justifyContent: 'center' }}
       onClick={e => { if (e.target === e.currentTarget) onClose() }}>
       <div style={{ background: 'var(--bg)', border: '0.5px solid var(--border)', borderRadius: 10, padding: 20, width: 340, boxShadow: '0 8px 32px rgba(0,0,0,0.15)' }}>
-        <div style={{ fontSize: 14, fontWeight: 500, marginBottom: 12 }}>New Resume</div>
+        <div style={{ fontSize: 14, fontWeight: 500, marginBottom: 12 }}>{t('resume.newTitle')}</div>
         <input autoFocus value={name} onChange={e => setName(e.target.value)}
           onKeyDown={e => { if (e.key === 'Enter' && name.trim()) onCreate(name.trim()); if (e.key === 'Escape') onClose() }}
-          placeholder="Resume name…"
+          placeholder={t('resume.namePlaceholder')}
           style={{ width: '100%', fontSize: 13, padding: '8px 10px', border: '0.5px solid var(--primary)', borderRadius: 6, outline: 'none', boxSizing: 'border-box', color: 'var(--text)', background: 'var(--bg)' }}
         />
         <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 8, marginTop: 14 }}>
-          <Btn small variant="ghost" onClick={onClose}>Cancel</Btn>
-          <Btn small variant="primary" onClick={() => { if (name.trim()) onCreate(name.trim()) }} disabled={!name.trim()}>Create</Btn>
+          <Btn small variant="ghost" onClick={onClose}>{t('resume.cancel')}</Btn>
+          <Btn small variant="primary" onClick={() => { if (name.trim()) onCreate(name.trim()) }} disabled={!name.trim()}>{t('resume.create')}</Btn>
         </div>
       </div>
     </div>
@@ -184,13 +186,14 @@ function NewResumeModal({ onClose, onCreate }: { onClose: () => void; onCreate: 
 }
 
 function RenameResumeModal({ resume, onClose, onRename }: { resume: ResumeListItem; onClose: () => void; onRename: (name: string) => void }) {
+  const { t } = useI18n()
   const [name, setName] = useState(resume.name)
   return <div style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.3)', zIndex: 200, display: 'flex', alignItems: 'center', justifyContent: 'center' }} onClick={e => { if (e.target === e.currentTarget) onClose() }}>
     <div style={{ background: 'var(--bg)', border: '0.5px solid var(--border)', borderRadius: 10, padding: 20, width: 340, boxShadow: '0 8px 32px rgba(0,0,0,0.15)' }}>
-      <div style={{ fontSize: 14, fontWeight: 600, marginBottom: 6 }}>Rename resume</div>
-      <div style={{ color: 'var(--text-muted)', fontSize: 11, marginBottom: 12 }}>Choose a clear name for this version.</div>
+      <div style={{ fontSize: 14, fontWeight: 600, marginBottom: 6 }}>{t('resume.renameTitle')}</div>
+      <div style={{ color: 'var(--text-muted)', fontSize: 11, marginBottom: 12 }}>{t('resume.renameHint')}</div>
       <input autoFocus value={name} onChange={e => setName(e.target.value)} onKeyDown={e => { if (e.key === 'Enter' && name.trim()) onRename(name.trim()); if (e.key === 'Escape') onClose() }} style={{ width: '100%', fontSize: 13, padding: '8px 10px', border: '0.5px solid var(--primary)', borderRadius: 6, outline: 'none', boxSizing: 'border-box', color: 'var(--text)', background: 'var(--bg)' }} />
-      <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 8, marginTop: 14 }}><Btn small variant="ghost" onClick={onClose}>Cancel</Btn><Btn small variant="primary" onClick={() => name.trim() && onRename(name.trim())} disabled={!name.trim()}>Save name</Btn></div>
+      <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 8, marginTop: 14 }}><Btn small variant="ghost" onClick={onClose}>{t('resume.cancel')}</Btn><Btn small variant="primary" onClick={() => name.trim() && onRename(name.trim())} disabled={!name.trim()}>{t('resume.saveName')}</Btn></div>
     </div>
   </div>
 }
