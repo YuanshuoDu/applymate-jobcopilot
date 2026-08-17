@@ -163,41 +163,49 @@ export async function GET(req: NextRequest) {
     transferredConnection = transferRequested
   }
 
-  await db.account.deleteMany({
-    where: { userId, provider: GMAIL_ACCOUNT_PROVIDER, NOT: { providerAccountId } },
-  })
+  try {
+    await db.account.deleteMany({
+      where: { userId, provider: GMAIL_ACCOUNT_PROVIDER, NOT: { providerAccountId } },
+    })
 
-  const encryptedTokens = await encryptAccountTokenFields({
-    provider: GMAIL_ACCOUNT_PROVIDER,
-    providerAccountId,
-    accessToken: tokens.access_token,
-    refreshToken: tokens.refresh_token ?? null,
-    idToken: tokens.id_token ?? null,
-  })
-
-  // Upsert the current user's isolated Gmail connection.
-  await db.account.upsert({
-    where: { provider_providerAccountId: { provider: GMAIL_ACCOUNT_PROVIDER, providerAccountId } },
-    create: {
-      userId,
-      type:              'oauth',
-      provider:          GMAIL_ACCOUNT_PROVIDER,
+    const encryptedTokens = await encryptAccountTokenFields({
+      provider: GMAIL_ACCOUNT_PROVIDER,
       providerAccountId,
-      ...encryptedTokens,
-      expires_at,
-      token_type:        tokens.token_type ?? null,
-      scope:             tokens.scope ?? null,
-    },
-    update: {
-      ...(recoveredLegacyConnection || transferredConnection ? { userId } : {}),
-      access_token:  null,
-      accessTokenEnc: encryptedTokens.accessTokenEnc,
-      ...(tokens.refresh_token ? { refresh_token: null, refreshTokenEnc: encryptedTokens.refreshTokenEnc } : {}),
-      ...(expires_at != null   ? { expires_at }                          : {}),
-      ...(tokens.scope         ? { scope:        tokens.scope }          : {}),
-      ...(tokens.id_token      ? { id_token: null, idTokenEnc: encryptedTokens.idTokenEnc } : {}),
-    },
-  })
+      accessToken: tokens.access_token,
+      refreshToken: tokens.refresh_token ?? null,
+      idToken: tokens.id_token ?? null,
+    })
+
+    // Upsert the current user's isolated Gmail connection.
+    await db.account.upsert({
+      where: { provider_providerAccountId: { provider: GMAIL_ACCOUNT_PROVIDER, providerAccountId } },
+      create: {
+        userId,
+        type:              'oauth',
+        provider:          GMAIL_ACCOUNT_PROVIDER,
+        providerAccountId,
+        ...encryptedTokens,
+        expires_at,
+        token_type:        tokens.token_type ?? null,
+        scope:             tokens.scope ?? null,
+      },
+      update: {
+        ...(recoveredLegacyConnection || transferredConnection ? { userId } : {}),
+        access_token:  null,
+        accessTokenEnc: encryptedTokens.accessTokenEnc,
+        ...(tokens.refresh_token ? { refresh_token: null, refreshTokenEnc: encryptedTokens.refreshTokenEnc } : {}),
+        ...(expires_at != null   ? { expires_at }                          : {}),
+        ...(tokens.scope         ? { scope:        tokens.scope }          : {}),
+        ...(tokens.id_token      ? { id_token: null, idTokenEnc: encryptedTokens.idTokenEnc } : {}),
+      },
+    })
+  } catch (error) {
+    console.error('[gmail/oauth/callback] credential persistence failed', {
+      name: error instanceof Error ? error.name : 'UnknownError',
+      message: error instanceof Error ? error.message : String(error).slice(0, 200),
+    })
+    return back('credential_storage_unavailable')
+  }
 
   console.log(
     transferredConnection
