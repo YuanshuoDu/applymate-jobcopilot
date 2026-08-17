@@ -1,6 +1,7 @@
 "use client";
 
 import { useState, useEffect, useRef } from "react";
+import { useI18n } from '@/lib/i18n'
 
 interface ApplyResult {
   id: number;
@@ -21,6 +22,7 @@ const STATUS_CONFIG: Record<string, { icon: string; label: string; color: string
 };
 
 export default function ApplyStatusCard({ jobId, jobUrl, jobStatus }: { jobId: string; jobUrl?: string; jobStatus?: string }) {
+  const { t } = useI18n()
   const [result, setResult] = useState<ApplyResult | null>(null);
   const [loading, setLoading] = useState(true);
   const [applying, setApplying] = useState(false);
@@ -76,7 +78,7 @@ export default function ApplyStatusCard({ jobId, jobUrl, jobStatus }: { jobId: s
       return (
         <div style={{ marginTop: 8, padding: '8px 12px', borderRadius: 6, background: 'var(--bg-secondary)', border: '1px solid var(--border)', display: 'flex', alignItems: 'center', gap: 8 }}>
           <div style={{ width: 10, height: 10, borderRadius: '50%', border: '2px solid #185FA5', borderTopColor: 'transparent', animation: 'spin 0.8s linear infinite', flexShrink: 0 }} />
-          <span style={{ fontSize: 13, color: 'var(--text-secondary)' }}>Applying in background…</span>
+          <span style={{ fontSize: 13, color: 'var(--text-secondary)' }}>{t('jobs.applyingBackground')}</span>
         </div>
       )
     }

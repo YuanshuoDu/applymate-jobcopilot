@@ -4,6 +4,7 @@ import React, { useState } from 'react'
 import { Btn, Card, CompanyLogo, INPUT_STYLE, ScorePill, useToast } from '@/components/ui'
 import { apiMutate } from '@/lib/hooks'
 import type { Job } from '@/lib/types'
+import { useI18n } from '@/lib/i18n'
 
 interface SearchResult {
   id: string
@@ -20,6 +21,7 @@ interface Props {
 }
 
 export function IndeedSearchPanel({ onJobSaved, onClose }: Props) {
+  const { t } = useI18n()
   const toast = useToast()
   const [search, setSearch]   = useState('')
   const [location, setLocation] = useState('')
@@ -97,15 +99,15 @@ export function IndeedSearchPanel({ onJobSaved, onClose }: Props) {
       {/* Search form */}
       <form onSubmit={handleSearch} style={{ padding: 16, display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'flex-end' }}>
         <div style={{ flex: '1 1 180px' }}>
-          <label style={labelSt}>Job Title / Keywords *</label>
-          <input style={INPUT_STYLE} value={search} onChange={e => setSearch(e.target.value)} placeholder="e.g. Software Engineer" />
+          <label style={labelSt}>{t('jobs.jobTitleKeywords')} *</label>
+          <input style={INPUT_STYLE} value={search} onChange={e => setSearch(e.target.value)} placeholder={t('jobs.softwareEngineerExample')} />
         </div>
         <div style={{ flex: '1 1 140px' }}>
-          <label style={labelSt}>Location</label>
-          <input style={INPUT_STYLE} value={location} onChange={e => setLocation(e.target.value)} placeholder="e.g. New York, NY" />
+          <label style={labelSt}>{t('jobs.location')}</label>
+          <input style={INPUT_STYLE} value={location} onChange={e => setLocation(e.target.value)} placeholder={t('jobs.newYorkExample')} />
         </div>
         <div style={{ width: 90 }}>
-          <label style={labelSt}>Country</label>
+          <label style={labelSt}>{t('jobs.country')}</label>
           <select style={INPUT_STYLE} value={country} onChange={e => setCountry(e.target.value)}>
             <option value="US">US</option>
             <option value="GB">UK</option>
@@ -117,13 +119,13 @@ export function IndeedSearchPanel({ onJobSaved, onClose }: Props) {
           </select>
         </div>
         <div style={{ width: 110 }}>
-          <label style={labelSt}>Type</label>
+          <label style={labelSt}>{t('jobs.type')}</label>
           <select style={INPUT_STYLE} value={jobType} onChange={e => setJobType(e.target.value)}>
-            <option value="">Any</option>
-            <option value="fulltime">Full-time</option>
-            <option value="parttime">Part-time</option>
-            <option value="contract">Contract</option>
-            <option value="internship">Internship</option>
+            <option value="">{t('jobs.any')}</option>
+            <option value="fulltime">{t('jobs.fullTime')}</option>
+            <option value="parttime">{t('jobs.partTime')}</option>
+            <option value="contract">{t('jobs.contract')}</option>
+            <option value="internship">{t('jobs.internship')}</option>
           </select>
         </div>
         <button type="submit" disabled={searching || !search.trim()} style={{
@@ -141,7 +143,7 @@ export function IndeedSearchPanel({ onJobSaved, onClose }: Props) {
           {searching ? (
             <div style={{ padding: 32, textAlign: 'center' }}>
               <div style={{ width: 22, height: 22, border: '2px solid rgba(79,70,229,0.20)', borderTopColor: 'var(--primary)', borderRadius: '50%', animation: 'spin 0.7s linear infinite', margin: '0 auto 10px' }} />
-              <div style={{ fontSize: 12, color: 'var(--text-muted)' }}>Searching Indeed…</div>
+              <div style={{ fontSize: 12, color: 'var(--text-muted)' }}>{t('jobs.searchingIndeed')}</div>
             </div>
           ) : results.length > 0 ? (
             <div style={{ maxHeight: 400, overflowY: 'auto' }}>
