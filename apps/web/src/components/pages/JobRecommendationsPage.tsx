@@ -132,9 +132,15 @@ export function JobRecommendationsPage() {
 }
 
 function FilterSelect({ value, label, options, onChange }: { value: string; label: string; options: string[]; onChange: (value: string) => void }) {
+  const { t } = useI18n()
+  const optionLabels: Record<string, string> = {
+    pending: t('recommendations.new'),
+    saved: t('recommendations.saved'),
+    dismissed: t('recommendations.dismissed'),
+  }
   return <select aria-label={label} value={value} onChange={event => onChange(event.target.value)}>
     <option value="all">{label}</option>
-    {options.filter(option => option !== 'all').map(option => <option key={option} value={option}>{option === 'pending' ? 'New' : option[0].toUpperCase() + option.slice(1)}</option>)}
+    {options.filter(option => option !== 'all').map(option => <option key={option} value={option}>{optionLabels[option] ?? option}</option>)}
   </select>
 }
 

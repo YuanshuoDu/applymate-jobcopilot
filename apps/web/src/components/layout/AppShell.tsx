@@ -112,7 +112,7 @@ function NotificationControl({ unreadCount, onToggle, t }: {
     display: 'inline-flex', alignItems: 'center', justifyContent: 'center', cursor: 'pointer', position: 'relative', flexShrink: 0,
   }}>
     <Bell size={16} aria-hidden="true" />
-    {unreadCount > 0 && <span aria-label={`${unreadCount} unread notifications`} style={{
+    {unreadCount > 0 && <span aria-label={`${unreadCount} ${t('notifications.unread')}`} style={{
       position: 'absolute', top: -3, right: -3, minWidth: 13, height: 13, padding: '0 3px', borderRadius: 999,
       background: 'var(--c-danger)', color: '#fff', fontSize: 8, fontWeight: 700, display: 'flex', alignItems: 'center', justifyContent: 'center', border: '1.5px solid var(--bg)', lineHeight: 1,
     }}>{unreadCount > 9 ? '9+' : unreadCount}</span>}
