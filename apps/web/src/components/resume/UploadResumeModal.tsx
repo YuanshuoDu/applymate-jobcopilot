@@ -3,17 +3,9 @@
 import React, { useCallback, useRef, useState } from 'react'
 import { Btn, useToast } from '@/components/ui'
 import type { ResumeContent } from '@/lib/types'
+import { useI18n } from '@/lib/i18n'
 
 type Stage = 'idle' | 'uploading' | 'extracting' | 'parsing' | 'preview' | 'error'
-
-const STAGE_LABELS: Record<Stage, string> = {
-  idle:       '',
-  uploading:  'Uploading file…',
-  extracting: 'Extracting text…',
-  parsing:    'AI parsing resume…',
-  preview:    '',
-  error:      '',
-}
 
 interface Props {
   onClose:  () => void
@@ -21,6 +13,7 @@ interface Props {
 }
 
 export function UploadResumeModal({ onClose, onImport }: Props) {
+  const { t } = useI18n()
   const toast = useToast()
   const inputRef = useRef<HTMLInputElement>(null)
   const [stage,   setStage]   = useState<Stage>('idle')
@@ -36,10 +29,10 @@ export function UploadResumeModal({ onClose, onImport }: Props) {
     const isDocx = file.type === 'application/vnd.openxmlformats-officedocument.wordprocessingml.document' || name.endsWith('.docx')
 
     if (!isPdf && !isDocx) {
-      setErrMsg('Only PDF and DOCX files are supported'); setStage('error'); return
+      setErrMsg(t('resume.onlyPdfDocx')); setStage('error'); return
     }
     if (file.size > 5 * 1024 * 1024) {
-      setErrMsg('File is too large — maximum 5 MB'); setStage('error'); return
+      setErrMsg(t('resume.fileTooLarge')); setStage('error'); return
     }
 
     setStage('uploading')
@@ -60,7 +53,7 @@ export function UploadResumeModal({ onClose, onImport }: Props) {
 
       const body = await res.json()
       if (!res.ok) {
-        setErrMsg(body?.error ?? 'Parsing failed')
+        setErrMsg(body?.error ?? t('resume.parsingFailed'))
         setStage('error')
         return
       }
@@ -69,7 +62,7 @@ export function UploadResumeModal({ onClose, onImport }: Props) {
     } catch {
       clearTimeout(extractTimer)
       clearTimeout(parseTimer)
-      setErrMsg('Network error — please check your connection')
+      setErrMsg(t('resume.networkError'))
       setStage('error')
     }
   }
@@ -99,8 +92,8 @@ export function UploadResumeModal({ onClose, onImport }: Props) {
         {/* Header */}
         <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 18 }}>
           <div>
-            <div style={{ fontSize: 14, fontWeight: 600, color: 'var(--text)' }}>Import Resume</div>
-            <div style={{ fontSize: 11, color: 'var(--text-muted)', marginTop: 2 }}>AI will extract and fill your resume automatically</div>
+            <div style={{ fontSize: 14, fontWeight: 600, color: 'var(--text)' }}>{t('resume.importResume')}</div>
+            <div style={{ fontSize: 11, color: 'var(--text-muted)', marginTop: 2 }}>{t('resume.aiExtractFill')}</div>
           </div>
           {!isLoading && (
             <button onClick={onClose} style={{ background: 'none', border: 'none', cursor: 'pointer', color: 'var(--text-muted)', fontSize: 16, padding: 4, lineHeight: 1 }}>✕</button>
@@ -127,9 +120,9 @@ export function UploadResumeModal({ onClose, onImport }: Props) {
             >
               <div style={{ fontSize: 28, marginBottom: 10 }}>📄</div>
               <div style={{ fontSize: 13, fontWeight: 500, color: 'var(--text)', marginBottom: 4 }}>
-                Drop your resume here, or click to browse
+                {t('resume.dropOrBrowse')}
               </div>
-              <div style={{ fontSize: 11, color: 'var(--text-muted)' }}>PDF or DOCX — up to 5 MB</div>
+              <div style={{ fontSize: 11, color: 'var(--text-muted)' }}>{t('resume.pdfDocxLimit')}</div>
               <input
                 ref={inputRef}
                 type="file"
@@ -139,7 +132,7 @@ export function UploadResumeModal({ onClose, onImport }: Props) {
               />
             </div>
             <div style={{ marginTop: 10, fontSize: 10, color: 'var(--text-muted)', textAlign: 'center' }}>
-              Supports text-based PDFs and DOCX. Scanned/image PDFs are not supported.
+              {t('resume.textPdfOnly')}
             </div>
           </>
         )}
@@ -147,7 +140,7 @@ export function UploadResumeModal({ onClose, onImport }: Props) {
         {/* Loading stages */}
         {isLoading && (
           <div style={{ padding: '24px 0', textAlign: 'center' }}>
-            <div style={{ fontSize: 11, color: 'var(--text-muted)', marginBottom: 16 }}>{STAGE_LABELS[stage]}</div>
+            <div style={{ fontSize: 11, color: 'var(--text-muted)', marginBottom: 16 }}>{stage === 'uploading' ? t('resume.uploading') : stage === 'extracting' ? t('resume.extracting') : t('resume.aiParsing')}</div>
             {/* Progress bar */}
             <div style={{ height: 4, background: 'var(--border)', borderRadius: 2, overflow: 'hidden', margin: '0 auto', maxWidth: 320 }}>
               <div style={{
@@ -173,7 +166,7 @@ export function UploadResumeModal({ onClose, onImport }: Props) {
                       {done ? '✓' : i + 1}
                     </div>
                     <span style={{ fontSize: 10, color: current ? 'var(--primary)' : done ? 'var(--text)' : 'var(--text-muted)' }}>
-                      {s === 'uploading' ? 'Upload' : s === 'extracting' ? 'Extract' : 'AI Parse'}
+                      {s === 'uploading' ? t('resume.upload') : s === 'extracting' ? t('resume.extract') : t('resume.aiParse')}
                     </span>
                   </div>
                 )
@@ -189,8 +182,8 @@ export function UploadResumeModal({ onClose, onImport }: Props) {
               {errMsg}
             </div>
             <div style={{ display: 'flex', gap: 8, justifyContent: 'flex-end' }}>
-              <Btn small variant="ghost" onClick={onClose}>Cancel</Btn>
-              <Btn small variant="primary" onClick={retry}>Try Again</Btn>
+              <Btn small variant="ghost" onClick={onClose}>{t('common.cancel')}</Btn>
+              <Btn small variant="primary" onClick={retry}>{t('resume.tryAgain')}</Btn>
             </div>
           </div>
         )}
@@ -199,31 +192,31 @@ export function UploadResumeModal({ onClose, onImport }: Props) {
         {stage === 'preview' && parsed && (
           <div style={{ marginTop: 0 }}>
             <div style={{ padding: '10px 12px', background: 'rgba(24,95,165,0.05)', border: '0.5px solid rgba(79,70,229,0.20)', borderRadius: 8, marginBottom: 14 }}>
-              <div style={{ fontSize: 11, fontWeight: 600, color: 'var(--primary)', marginBottom: 8 }}>Parsed successfully</div>
+              <div style={{ fontSize: 11, fontWeight: 600, color: 'var(--primary)', marginBottom: 8 }}>{t('resume.parsedSuccessfully')}</div>
               <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '4px 16px' }}>
-                <PreviewRow label="Name"       value={parsed.contact.name} />
-                <PreviewRow label="Email"      value={parsed.contact.email} />
-                <PreviewRow label="Location"   value={parsed.contact.location} />
-                <PreviewRow label="Phone"      value={parsed.contact.phone} />
-                <PreviewRow label="Experience" value={`${parsed.experience.length} item${parsed.experience.length !== 1 ? 's' : ''}`} />
-                <PreviewRow label="Education"  value={`${parsed.education.length} item${parsed.education.length !== 1 ? 's' : ''}`} />
-                <PreviewRow label="Skills"     value={`${parsed.skills.length} skills`} />
-                {parsed.languages?.length ? <PreviewRow label="Languages" value={`${parsed.languages.length}`} /> : null}
-                {parsed.projects?.length   ? <PreviewRow label="Projects"  value={`${parsed.projects.length}`} /> : null}
+                <PreviewRow label={t('resume.name')}       value={parsed.contact.name} />
+                <PreviewRow label={t('resume.email')}      value={parsed.contact.email} />
+                <PreviewRow label={t('resume.location')}   value={parsed.contact.location} />
+                <PreviewRow label={t('resume.phone')}      value={parsed.contact.phone} />
+                <PreviewRow label={t('resume.section.experience')} value={`${parsed.experience.length} ${t('resume.items')}`} />
+                <PreviewRow label={t('resume.section.education')}  value={`${parsed.education.length} ${t('resume.items')}`} />
+                <PreviewRow label={t('resume.section.skills')}     value={`${parsed.skills.length} ${t('resume.skillsLower')}`} />
+                {parsed.languages?.length ? <PreviewRow label={t('resume.section.languages')} value={`${parsed.languages.length}`} /> : null}
+                {parsed.projects?.length   ? <PreviewRow label={t('resume.section.projects')}  value={`${parsed.projects.length}`} /> : null}
               </div>
             </div>
 
             <div style={{ fontSize: 11, color: 'var(--text-muted)', marginBottom: 12 }}>
-              Choose how to import:
+              {t('resume.chooseImportMode')}
             </div>
             <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
-              <Btn small variant="ghost" onClick={onClose}>Cancel</Btn>
+              <Btn small variant="ghost" onClick={onClose}>{t('common.cancel')}</Btn>
               <div style={{ flex: 1 }} />
               <Btn small variant="ghost" onClick={() => { onImport(parsed!, 'new'); onClose() }}>
-                Import as New Resume
+                {t('resume.importNew')}
               </Btn>
               <Btn small variant="primary" onClick={() => { onImport(parsed!, 'replace'); onClose() }}>
-                Replace Current
+                {t('resume.replaceCurrent')}
               </Btn>
             </div>
           </div>
