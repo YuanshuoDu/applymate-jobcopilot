@@ -358,10 +358,10 @@ const GEO_JOBICY = [
 // ── Main unified component ────────────────────────────────────────────────────
 
 const SOURCES: { id: JobSource; label: string; desc: string; color: string }[] = [
-  { id: 'adzuna',   label: '🌍 Adzuna',   desc: 'Europe 12 local jobs（default）',   color: 'var(--c-warning)' },
+  { id: 'adzuna',   label: '🌍 Adzuna',   desc: 'Europe 12 local jobs(default)',   color: 'var(--c-warning)' },
   { id: 'jsearch',  label: '🔍 JSearch',  desc: 'polymerization LinkedIn · Indeed · wait',  color: 'var(--primary)' },
   { id: 'linkedin', label: '💼 LinkedIn', desc: 'recent 1 Hourly real-time new jobs',        color: '#0077B5' },
-  { id: 'jobicy',   label: '🌐 Jobicy',   desc: 'remote positions，completely free',           color: 'var(--c-success)' },
+  { id: 'jobicy',   label: '🌐 Jobicy',   desc: 'remote positions, completely free',           color: 'var(--c-success)' },
 ]
 
 interface Props {

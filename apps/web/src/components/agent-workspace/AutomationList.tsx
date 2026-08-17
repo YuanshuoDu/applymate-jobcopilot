@@ -94,7 +94,7 @@ export function AutomationList({ onCreate, onSessionStarted }: {
         onAskAgent={() => {
           closeModal()
           window.dispatchEvent(new CustomEvent('applymate:composer-prefill', {
-            detail: 'Help me create a new automation task：weekday morning 9 Click to search for the target position，85 Enter the application queue with scores or above，Require my approval before submitting。',
+            detail: 'Help me create a new automation task: weekday morning 9 Click to search for the target position, 85 Enter the application queue with scores or above, Require my approval before submitting.',
           }))
           onCreate()
         }}

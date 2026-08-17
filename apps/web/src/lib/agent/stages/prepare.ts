@@ -121,9 +121,9 @@ export async function runPrepare(
         } })
         tailoredResumeId = saved.id
         tailoredResumeName = saved.name
-        emit('agent_observation', { role: 'writer', observation: `✓ Already generated based on default resume ${sj.job.company} Custom Resume，Preserve job links and templates；wait Reviewer Review and your final confirmation。` })
+        emit('agent_observation', { role: 'writer', observation: `✓ Already generated based on default resume ${sj.job.company} Custom Resume, Preserve job links and templates; wait Reviewer Review and your final confirmation.` })
       } catch (err) {
-        emit('agent_observation', { role: 'writer', observation: `✗ ${sj.job.company} Resume optimization failed：${err instanceof Error ? err.message : 'Unknown error'}` })
+        emit('agent_observation', { role: 'writer', observation: `✗ ${sj.job.company} Resume optimization failed: ${err instanceof Error ? err.message : 'Unknown error'}` })
       }
     }
 

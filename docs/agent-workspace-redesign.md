@@ -143,14 +143,14 @@ Example:
 
 ```text
 You
-every morning 9 Click to find automatically Berlin software engineering positions，85 Automatically vote for points or more，But I need to confirm。
+every morning 9 Click to find automatically Berlin software engineering positions, 85 Automatically vote for points or more, But I need to confirm.
 
 10:41
 ```
 
 ```text
 Orchestrator
-Can。I will create a working day 09:00 Automation rules for，The goal is Berlin software engineering positions，Match points 85+，Please confirm before delivery。
+Can.I will create a working day 09:00 Automation rules for, The goal is Berlin software engineering positions, Match points 85+, Please confirm before delivery.
 
 10:42 · 1.1s
 ```
@@ -588,7 +588,7 @@ Upgrade `/api/agent/chat` to emit structured blocks.
 
 ```text
 event: text
-data: {"delta":"I can help you create this automation。"}
+data: {"delta":"I can help you create this automation."}
 
 event: block
 data: {

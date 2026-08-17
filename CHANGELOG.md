@@ -7,30 +7,30 @@ All notable changes to ApplyMate AI. Dates in YYYY-MM-DD format.
 ## 2026-05-07 — Adzuna Job Search API Access
 
 ### Added
-- **`GET /api/adzuna/search`**: new API routing，acting Adzuna official REST API，Normalized response format
-  - parameter：`q`（keywords）、`where`（City）、`country`（gb/de/fr/nl/es/it/at/be/pl/us/ca/au）、`page`、`job_type`
-  - Salary formatting：`£68k – £137k`；Forecast salary plus `~` Prefix distinguishes real data
-  - description truncation：Server end 180 Character
-  - `cache: 'no-store'`，Live data for every search
+- **`GET /api/adzuna/search`**: new API routing, acting Adzuna official REST API, Normalized response format
+  - parameter: `q`(keywords), `where`(City), `country`(gb/de/fr/nl/es/it/at/be/pl/us/ca/au), `page`, `job_type`
+  - Salary formatting: `£68k – £137k`; Forecast salary plus `~` Prefix distinguishes real data
+  - description truncation: Server end 180 Character
+  - `cache: 'no-store'`, Live data for every search
 - **`AdzunaSearchPanel` components** (`src/components/jobs/AdzunaSearchPanel.tsx`):
-  - 12 country selector（Europe first：🇬🇧🇩🇪🇫🇷🇳🇱🇪🇸🇮🇹🇦🇹🇧🇪🇵🇱 + US/CA/AU）
-  - Job Result Card：salary（green）、Release time（Today/3d ago）、contract_time + contract_type pair badge
-  - Load more Pagination，Automatically remove duplicates when appending（Defend Adzuna Overlapping page boundaries）
-  - One click "+ Save" save to My Jobs（`source: 'adzuna'`），Show after saving "✓ Saved"，external link "View ↗"
+  - 12 country selector(Europe first: 🇬🇧🇩🇪🇫🇷🇳🇱🇪🇸🇮🇹🇦🇹🇧🇪🇵🇱 + US/CA/AU)
+  - Job Result Card: salary(green), Release time(Today/3d ago), contract_time + contract_type pair badge
+  - Load more Pagination, Automatically remove duplicates when appending(Defend Adzuna Overlapping page boundaries)
+  - One click "+ Save" save to My Jobs(`source: 'adzuna'`), Show after saving "✓ Saved", external link "View ↗"
 
 ### Changed
-- **`JobsPage`**: replace `IndeedSearchPanel` → `AdzunaSearchPanel`，button text "Search Indeed" → "🌍 Search Jobs"
+- **`JobsPage`**: replace `IndeedSearchPanel` → `AdzunaSearchPanel`, button text "Search Indeed" → "🌍 Search Jobs"
 - **`.env` / `.env.example`**: New `ADZUNA_APP_ID` / `ADZUNA_APP_KEY` environment variables
 
 ### Removed
-- **`POST /api/indeed/search`**: The route remains but is no longer used UI call（Indeed Publisher API Already at 2025 Abandoned）
+- **`POST /api/indeed/search`**: The route remains but is no longer used UI call(Indeed Publisher API Already at 2025 Abandoned)
 
-### Fixed（This optimization）
+### Fixed(This optimization)
 - `AdzunaSearchPanel`: Remove unused `Card` import
-- API routing：`next: { revalidate: 60 }` → `cache: 'no-store'`（user query different，Caching is pointless）
-- Increase `salary_is_predicted` Field support，Forecasting salary `~` Prefix distinction
-- Increase `contract_type`（permanent/contract）Field，Before completion, only `contract_time` of badge Missing
-- Load more Add deduplication logic，prevent Adzuna Overlapping pagination results in duplicate entries
+- API routing: `next: { revalidate: 60 }` → `cache: 'no-store'`(user query different, Caching is pointless)
+- Increase `salary_is_predicted` Field support, Forecasting salary `~` Prefix distinction
+- Increase `contract_type`(permanent/contract)Field, Before completion, only `contract_time` of badge Missing
+- Load more Add deduplication logic, prevent Adzuna Overlapping pagination results in duplicate entries
 
 ---
 

@@ -62,7 +62,7 @@ describe('SmartSearch', () => {
     expect(html).toContain('Some sources need a connection')
     expect(html).toContain('Open API key settings')
     expect(html).not.toContain('search API Not configured')
-    expect(html).not.toContain('routing：')
+    expect(html).not.toContain('routing: ')
     expect(html).not.toContain('NL → adzuna + ats + linkedin')
   })
 })

@@ -169,8 +169,8 @@ export function Sidebar({ active, onNav, onNavIntent, session, jobCount: jobCoun
               <div style={{ fontSize: 11, fontWeight: 700, color: 'var(--text)' }}>{user?.name ?? user?.email?.split('@')[0] ?? 'User'}</div>
               <div style={{ fontSize: 10, color: 'var(--text-muted)', marginTop: 2, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{user?.email ?? ''}</div>
             </div>
-            <AccountMenuItem icon={<UserRound size={14} />} label="Profile & preferences" onClick={() => { onNav('settings'); onDismissSidebarPopovers() }} />
-            <AccountMenuItem icon={<CreditCard size={14} />} label="Plan & billing" badge={planLabel} onClick={() => { onNav('settings'); onDismissSidebarPopovers() }} />
+            <AccountMenuItem icon={<UserRound size={14} />} label={t('account.profile')} onClick={() => { onNav('settings'); onDismissSidebarPopovers() }} />
+            <AccountMenuItem icon={<CreditCard size={14} />} label={t('account.plan')} badge={planLabel} onClick={() => { onNav('settings'); onDismissSidebarPopovers() }} />
             <AccountMenuItem icon={<Settings size={14} />} label={t('nav.settings')} onClick={() => { onNav('settings'); onDismissSidebarPopovers() }} />
             <div style={{ height: 1, background: 'var(--border)', margin: '5px 3px' }} />
             <AccountMenuItem icon={<LogOut size={14} />} label={t('nav.signout')} danger onClick={() => signOut({ callbackUrl: '/login' })} />
@@ -178,7 +178,7 @@ export function Sidebar({ active, onNav, onNavIntent, session, jobCount: jobCoun
 
           {/* User row */}
           <div style={{ display: 'flex', alignItems: 'center', gap: 4, marginBottom: 6 }}>
-            <button type="button" onClick={onAccountMenuToggle} aria-expanded={accountMenuOpen} aria-haspopup="menu" title="Open account menu" style={{ display: 'flex', flex: 1, minWidth: 0, alignItems: 'center', gap: 8, padding: '5px 6px', border: '1px solid transparent', borderRadius: 8, background: accountMenuOpen ? 'var(--nav-active)' : 'transparent', cursor: 'pointer', textAlign: 'left', fontFamily: 'inherit' }}>
+            <button type="button" onClick={onAccountMenuToggle} aria-expanded={accountMenuOpen} aria-haspopup="menu" title={t('account.menu')} style={{ display: 'flex', flex: 1, minWidth: 0, alignItems: 'center', gap: 8, padding: '5px 6px', border: '1px solid transparent', borderRadius: 8, background: accountMenuOpen ? 'var(--nav-active)' : 'transparent', cursor: 'pointer', textAlign: 'left', fontFamily: 'inherit' }}>
               <UserAvatar src={user?.image} name={user?.name} email={user?.email} size={26} />
               <span style={{ flex: 1, minWidth: 0 }}>
                 <span style={{ display: 'block', fontSize: 12, fontWeight: 500, color: 'var(--text)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{user?.name ?? user?.email?.split('@')[0] ?? 'User'}</span>

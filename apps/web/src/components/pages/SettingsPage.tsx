@@ -745,7 +745,7 @@ export function SettingsPage() {
                 </div>
                 <div style={{ flex: 1 }}>
                   <div style={{ fontSize: 12, fontWeight: 500, color: 'var(--text)', marginBottom: 2 }}>ApplyMate AI for Chrome</div>
-                  <div style={{ fontSize: 10, color: 'var(--text-muted)', lineHeight: 1.5 }}>exist LinkedIn、Indeed Save jobs on job search websites with one click、Automatic form filling、View resume match score</div>
+                   <div style={{ fontSize: 10, color: 'var(--text-muted)', lineHeight: 1.5 }}>Save jobs with one click on LinkedIn, Indeed, and other job sites, fill forms automatically, and view resume match scores.</div>
                 </div>
                 <div style={{ display: 'flex', flexDirection: 'column', gap: 6, alignItems: 'flex-end', flexShrink: 0 }}>
                   <a
@@ -1159,17 +1159,17 @@ const PROVIDERS_WITH_MODELS = Array.from(new Set(MODEL_CATALOGUE.map(m => m.prov
 const FEATURE_GROUPS: Array<{ label: string; description: string; features: FeatureId[] }> = [
   {
     label: 'Resume and job analysis',
-    description: 'Resume scoring、Resume analysis、Improvement suggestions、Interview preparation、Job rating and keyword extraction',
+    description: 'Resume scoring, resume parsing, improvement suggestions, interview preparation, job scoring, and keyword extraction',
     features: ['scoring', 'parsing', 'suggest', 'interviewPrep', 'jobScoring'],
   },
   {
     label: 'Application material generation',
-    description: 'cover letter、Field suggestions and form answer modifications',
+    description: 'Cover letters, field suggestions, and form answer revisions',
     features: ['coverLetter', 'fieldSuggest', 'formRevise'],
   },
   {
     label: 'Agent automation',
-    description: 'AI Agent、Automatic form filling and unattended automatic application',
+    description: 'AI Agent, automatic form filling, and unattended applications',
     features: ['agent', 'formFill', 'autoApply'],
   },
 ]
@@ -1320,7 +1320,7 @@ function AiModelSettings() {
       {/* ── Functional model control ── */}
       <SettingsSection title={t('settings.ai.featuresTitle')}>
         <div style={{ fontSize: 11, color: 'var(--text-muted)', marginBottom: 14, lineHeight: 1.6 }}>
-          {t('settings.ai.featuresDesc').replace('ApplyMate AI', APPLYMATE_LABEL)} Has been summarized into three types of workflows；Selecting a model will be applied to all functions of that class simultaneously.。
+          {t('settings.ai.featuresDesc').replace('ApplyMate AI', APPLYMATE_LABEL)} These settings are grouped into three workflows. Selecting a model applies it to every feature in that workflow.
         </div>
         <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
           {FEATURE_GROUPS.map(group => {
@@ -1333,7 +1333,7 @@ function AiModelSettings() {
                   <div style={{ fontSize: 12, fontWeight: 500, color: 'var(--text)' }}>{group.label}</div>
                   <div style={{ fontSize: 10, color: 'var(--text-muted)', marginTop: 2 }}>
                     {mixed
-                      ? 'There are currently different settings；Reselecting will cover this group uniformly。'
+                      ? 'This workflow currently has different settings; selecting a model will apply it uniformly.'
                       : isDefault
                       ? `✦ ${APPLYMATE_LABEL} ${t('settings.ai.defaultLabel')}`
                       : `${PROVIDER_LABELS[current.provider]} · ${current.model}`

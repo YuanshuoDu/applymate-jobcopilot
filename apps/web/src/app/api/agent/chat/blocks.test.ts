@@ -3,7 +3,7 @@ import { approvalRequestFrom, automationDraftFrom, resumeTailoringApprovalFrom }
 
 describe('agent chat structured blocks', () => {
   it('extracts automation draft details from a natural-language request', () => {
-    expect(automationDraftFrom('every day 9 Click to help me find it Berlin SWE，85 Create automation')).toMatchObject({
+    expect(automationDraftFrom('every day 9 Click to help me find it Berlin SWE, 85 Create automation')).toMatchObject({
       name: 'Berlin SWE automation',
       triggerType: 'daily',
       cron: '0 9 * * *',

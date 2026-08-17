@@ -122,7 +122,7 @@ async function scoreWithFallback(prompt: string, primary: AiConfig): Promise<{ r
     }
   }
 
-  throw new Error(`current AI Configuration not available，Alternate models are also not available。${errors.join(' | ')}`)
+  throw new Error(`current AI Configuration not available, Alternate models are also not available.${errors.join(' | ')}`)
 }
 
 function dedupeConfigs(configs: AiConfig[]): AiConfig[] {

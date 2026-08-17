@@ -41,9 +41,9 @@ export async function runAnalyze(
   const noDescCount = jobs.filter(j => !j.description && !!j.role).length
   let skipNoDescription = false
   if (noDescCount > 0) {
-    const question = `Discover ${noDescCount} positions have no job description。I would try to rate based on job title and company，But the accuracy may be low。suggestion：exist Jobs The page manually adds descriptions for these positions before running。Do you want to continue?？`
+    const question = `Discover ${noDescCount} positions have no job description.I would try to rate based on job title and company, But the accuracy may be low.suggestion: exist Jobs The page manually adds descriptions for these positions before running.Do you want to continue??`
     const options = [
-      { label: '✓ continue（Rate by job title）', value: 'continue' },
+      { label: '✓ continue(Rate by job title)', value: 'continue' },
       { label: '↩ Skip jobs without description', value: 'skip_no_desc' },
     ]
     if (ctx.askUser) {
@@ -79,7 +79,7 @@ export async function runAnalyze(
       emit('job_skip', { jobId: job.id, company: job.company, role: job.role, reason })
       emit('agent_observation', {
         role: 'analyst',
-        observation: `⚠ jump over ${job.company} · ${job.role}：The pre-application verification failed。${reason}`,
+        observation: `⚠ jump over ${job.company} · ${job.role}: The pre-application verification failed.${reason}`,
       })
       return
     }
@@ -92,7 +92,7 @@ export async function runAnalyze(
       emit('job_skip', { jobId: job.id, company: job.company, role: job.role, reason: 'No job description available' })
       emit('agent_observation', {
         role:        'analyst',
-        observation: `⚠ jump over ${job.company} · ${job.role}：No job description，Unable to rate`,
+        observation: `⚠ jump over ${job.company} · ${job.role}: No job description, Unable to rate`,
       })
       return
     }
@@ -124,8 +124,8 @@ export async function runAnalyze(
       scoredJobs.push({ job, ...parsed })
 
       // Emit per-job observation with AI reasoning
-      const matchStr  = parsed.matchedKeywords.length  ? `match：${parsed.matchedKeywords.slice(0, 4).join(', ')}` : ''
-      const missStr   = parsed.missingKeywords.length   ? `Missing：${parsed.missingKeywords.slice(0, 3).join(', ')}` : ''
+      const matchStr  = parsed.matchedKeywords.length  ? `match: ${parsed.matchedKeywords.slice(0, 4).join(', ')}` : ''
+      const missStr   = parsed.missingKeywords.length   ? `Missing: ${parsed.missingKeywords.slice(0, 3).join(', ')}` : ''
       const scoreTag  = parsed.score >= 80 ? '✦ High match' : parsed.score >= 60 ? '◆ medium' : '◇ On the low side'
       emit('agent_observation', {
         role:        'analyst',
@@ -150,7 +150,7 @@ export async function runAnalyze(
       })
       emit('agent_observation', {
         role:        'analyst',
-        observation: `✗ ${job.company} · ${job.role} Rating failed：${message}`,
+        observation: `✗ ${job.company} · ${job.role} Rating failed: ${message}`,
       })
       emit('job_error', { jobId: job.id, company: job.company, role: job.role, error: message })
     }

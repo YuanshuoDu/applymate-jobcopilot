@@ -5,7 +5,7 @@ import type { ExtensionSettings } from '@/lib/types'
 import { openCurrentSidePanel } from './popup-utils'
 import { C } from './popup-constants'
 
-export type PopupLang = 'en' | 'de' | 'fr' | 'es' | 'nl'
+export type PopupLang = 'en' | 'de' | 'fr' | 'es' | 'nl' | 'zh'
 
 type LoginLabels = {
   connectTitle: string; connectSub: string; emailLabel: string; pwLabel: string
@@ -20,6 +20,7 @@ const LABELS: Record<PopupLang, LoginLabels> = {
   fr: { connectTitle: 'Connecter à ApplyMate AI', connectSub: 'Connectez-vous pour synchroniser vos offres', emailLabel: 'E-mail', pwLabel: 'Mot de passe', loginBtn: 'Se connecter', loggingIn: 'Connexion…', noAccount: 'Pas de compte?', signupLink: 'Inscription gratuite →', googleLogin: 'Se connecter avec Google', githubLogin: 'Se connecter avec GitHub', orEmail: 'ou se connecter par e-mail', openSidebar: 'Ouvrir le panneau', loginError: 'Connexion échouée', sidePanelError: 'Le panneau latéral n’a pas pu être ouvert.' },
   es: { connectTitle: 'Conectar a ApplyMate AI', connectSub: 'Inicia sesión para sincronizar tus empleos', emailLabel: 'Correo', pwLabel: 'Contraseña', loginBtn: 'Iniciar sesión', loggingIn: 'Iniciando sesión…', noAccount: '¿Sin cuenta?', signupLink: 'Registrarse gratis →', googleLogin: 'Iniciar sesión con Google', githubLogin: 'Iniciar sesión con GitHub', orEmail: 'o iniciar sesión con correo', openSidebar: 'Abrir panel', loginError: 'Error de inicio', sidePanelError: 'No se pudo abrir el panel lateral.' },
   nl: { connectTitle: 'Verbinden met ApplyMate AI', connectSub: 'Log in om vacatures automatisch te synchroniseren', emailLabel: 'E-mail', pwLabel: 'Wachtwoord', loginBtn: 'Inloggen', loggingIn: 'Inloggen…', noAccount: 'Geen account?', signupLink: 'Gratis registreren →', googleLogin: 'Inloggen met Google', githubLogin: 'Inloggen met GitHub', orEmail: 'of inloggen met e-mail', openSidebar: 'Zijpaneel openen', loginError: 'Inloggen mislukt', sidePanelError: 'Het zijpaneel kon niet worden geopend.' },
+  zh: { connectTitle: '连接 ApplyMate AI', connectSub: '登录后自动同步所有职位', emailLabel: '邮箱', pwLabel: '密码', loginBtn: '登录', loggingIn: '登录中…', noAccount: '还没有账号？', signupLink: '免费注册 →', googleLogin: '使用 Google 登录', githubLogin: '使用 GitHub 登录', orEmail: '或使用邮箱登录', openSidebar: '打开侧边栏', loginError: '登录失败', sidePanelError: 'Chrome 无法打开侧边栏，请使用浏览器工具栏中的侧边栏按钮。' },
 }
 
 export function getPopupLang(): PopupLang {

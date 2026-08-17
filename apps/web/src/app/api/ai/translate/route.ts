@@ -3,14 +3,14 @@
  * Body: { text, targetLang (default: "en"), sourceLang? (default: auto-detect) }
  * Returns: { translated, sourceLang }
  *
- * Supported targetLang: en, de, fr, es, ja, ko, pt, ar, ru, pl, nl, it
+ * Supported targetLang: zh, en, de, fr, es, ja, ko, pt, ar, ru, pl, nl, it
  */
 import { NextRequest } from 'next/server'
 import { prepareAiRoute, ok, err } from '@/lib/api-helpers'
 import { modelChat, stripFences } from '@/lib/model-router'
 
 const LANG_NAMES: Record<string, string> = {
-  en: 'English', de: 'German', fr: 'French',
+  zh: 'Chinese', en: 'English', de: 'German', fr: 'French',
   es: 'Spanish', ja: 'Japanese', ko: 'Korean', pt: 'Portuguese',
   ar: 'Arabic', ru: 'Russian', pl: 'Polish', nl: 'Dutch', it: 'Italian',
 }

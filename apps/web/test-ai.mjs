@@ -84,7 +84,7 @@ const TESTS = [
     fn: async () => {
       const raw = await chat('https://api.minimax.chat/v1', MINIMAX_KEY, 'MiniMax-M3', 'Reply with only: "MiniMax OK"')
       const stripped = raw.replace(/<think>[\s\S]*?<\/think>/gi, '').trim()
-      if (!stripped) throw new Error(`Empty reply（original ${raw.length} character，Contains think=${raw.includes('<think>')}）`)
+      if (!stripped) throw new Error(`Empty reply(original ${raw.length} character, Contains think=${raw.includes('<think>')})`)
       return stripped.slice(0, 60)
     },
   },
@@ -95,7 +95,7 @@ const TESTS = [
       const { raw, stripped } = await chatStream('https://api.minimax.chat/v1', MINIMAX_KEY, 'MiniMax-M3',
         'Reply with only the text: "Stream OK"')
       if (stripped.includes('<think>')) throw new Error(`think block unfiltered: ${stripped.slice(0, 80)}`)
-      if (!stripped) throw new Error(`Empty after filtering（original containing think=${raw.includes('<think>')}）`)
+      if (!stripped) throw new Error(`Empty after filtering(original containing think=${raw.includes('<think>')})`)
       return `think filter=${raw.includes('<think>')} → "${stripped.slice(0, 50)}"`
     },
   },
@@ -179,7 +179,7 @@ Flag every unsupported or contradicted claim.`, 1200, 'adaptive')
         JSON.stringify([{ role: 'system', content: 'You are a job search assistant.' },
                         { role: 'user',   content: 'How many jobs in my pipeline? Just say: "Pipeline test OK"' }]),
         300)
-      // actual agent Bundle system+messages pass in；Here we only test whether the flow pattern is normal
+      // actual agent Bundle system+messages pass in; Here we only test whether the flow pattern is normal
       const { stripped: s2 } = await chatStream('https://api.minimax.chat/v1', MINIMAX_KEY, 'MiniMax-M3',
         'You are a job assistant. Say: "Agent OK"', 200)
       if (!s2) throw new Error('Agent Streaming reply is empty')
@@ -197,7 +197,7 @@ console.log(`  DeepSeek key: ${DEEPSEEK_KEY ? G+'configured'+X : R+'Not configur
 let passed = 0, failed = 0, skipped = 0
 for (const t of TESTS) {
   process.stdout.write(`${Y}${t.name}${X}\n`)
-  if (t.skip) { console.log(`${Y}  ⚠ jump over（Key Not configured）${X}\n`); skipped++; continue }
+  if (t.skip) { console.log(`${Y}  ⚠ jump over(Key Not configured)${X}\n`); skipped++; continue }
   const start = Date.now()
   try {
     const result = await t.fn()
@@ -211,4 +211,4 @@ for (const t of TESTS) {
 
 console.log(`${C}══════════════════════════════════════════════════${X}`)
 console.log(`pass ${G}${passed}${X}  fail ${failed > 0 ? R : X}${failed}${X}  jump over ${Y}${skipped}${X}\n`)
-if (failed === 0 && skipped === 0) console.log(`${G}✓ All passed，all AI Functions available${X}\n`)
+if (failed === 0 && skipped === 0) console.log(`${G}✓ All passed, all AI Functions available${X}\n`)

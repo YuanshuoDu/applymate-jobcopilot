@@ -201,7 +201,7 @@ The existing Settings page already has `AiModelSettings` component with `Feature
 
 | FeatureId | Label | Default Model |
 |---|---|---|
-| `autoApply` | Automatic application Agent（unattended） | MiniMax M2.7 |
+| `autoApply` | Automatic application Agent(unattended) | MiniMax M2.7 |
 | `jobScoring` | job rating + Keyword extraction | MiniMax M2.7 |
 
 Settings UI:

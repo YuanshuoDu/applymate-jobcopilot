@@ -88,10 +88,10 @@ export async function runGate(
   let includeBorderline = false
   const borderline = packages.filter(p => p.score >= minMatchScore - 5 && p.score < minMatchScore)
   if (borderline.length > 0) {
-    const question = `${borderline.length} job ratings are just below the threshold ${minMatchScore}%（gap 1-5 point）：${borderline.slice(0, 3).map(p => `${p.job.company}(${p.score}%)`).join('、')}${borderline.length > 3 ? '…' : ''}。whether to include them for review？`
+    const question = `${borderline.length} job ratings are just below the threshold ${minMatchScore}%(gap 1-5 point): ${borderline.slice(0, 3).map(p => `${p.job.company}(${p.score}%)`).join(', ')}${borderline.length > 3 ? '…' : ''}.whether to include them for review?`
     const options = [
-      { label: '⏳ Included for review（recommend）', value: 'add_to_pending' },
-      { label: '✕ jump over（Keep existing thresholds）', value: 'skip' },
+      { label: '⏳ Included for review(recommend)', value: 'add_to_pending' },
+      { label: '✕ jump over(Keep existing thresholds)', value: 'skip' },
       { label: '⬇ lower threshold 5%', value: 'lower_threshold', action: { field: 'minMatchScore', value: Math.max(40, minMatchScore - 5) } },
     ]
     if (ctx.askUser) {
@@ -115,15 +115,15 @@ export async function runGate(
       const readyTag = quality.readyToApply ? '' : ' ⚠ Suggest improvements before submitting'
       emit('agent_observation', {
         role:        'reviewer',
-        observation: `Cover letter quality ${clTag}（${quality.clScore}/10）${readyTag}${quality.fitGap ? ` · gap：${quality.fitGap}` : ''} → ${quality.recommendation}`,
+        observation: `Cover letter quality ${clTag}(${quality.clScore}/10)${readyTag}${quality.fitGap ? ` · gap: ${quality.fitGap}` : ''} → ${quality.recommendation}`,
       })
 
       // Weak materials are not silently allowed through a queued review. Ask
       // the candidate to decide whether this job remains eligible for review.
       if (quality.clScore < 6 && pkg.coverLetter) {
-        const question = `${pkg.job.company} · ${pkg.job.role} cover letter quality is low（${quality.clScore}/10）：${quality.recommendation}。Whether to continue delivery or skip？`
+        const question = `${pkg.job.company} · ${pkg.job.role} cover letter quality is low(${quality.clScore}/10): ${quality.recommendation}.Whether to continue delivery or skip?`
         const options = [
-          { label: '📤 Continue delivery（Existing materials）', value: 'continue' },
+          { label: '📤 Continue delivery(Existing materials)', value: 'continue' },
           { label: '⏳ Place for review', value: 'review' },
           { label: '✕ Skip this post', value: 'skip' },
         ]
@@ -149,7 +149,7 @@ export async function runGate(
       })
       emit('agent_observation', {
         role:        'reviewer',
-        observation: `✕ jump over：${pkg.score}% < threshold ${minMatchScore}%`,
+        observation: `✕ jump over: ${pkg.score}% < threshold ${minMatchScore}%`,
       })
       continue
     }
@@ -178,11 +178,11 @@ export async function runGate(
       : null
     emit('agent_observation', {
       role:        'reviewer',
-      observation: `⏳ Enter to be reviewed：Material saved，They must be reviewed individually by you and explicitly authorized before submission.。`,
+      observation: `⏳ Enter to be reviewed: Material saved, They must be reviewed individually by you and explicitly authorized before submission..`,
     })
     emit('agent_question', {
       role: 'reviewer', questionId: `application_review_${pkg.job.id}`,
-      question: `${pkg.job.company} · ${pkg.job.role} The application materials are ready。Please check whether the materials correspond to the position、Are all answers true?；Submit can only be authorized after confirmation.。`,
+      question: `${pkg.job.company} · ${pkg.job.role} The application materials are ready.Please check whether the materials correspond to the position, Are all answers true?; Submit can only be authorized after confirmation..`,
       options: [
         { label: 'Reserved for review', value: 'review' },
       ],

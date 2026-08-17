@@ -74,7 +74,7 @@ Write the reply now:`
           userId: prep.userId,
           jobId: requestedJobId,
           type:   'agent_action',
-          text:   `[Gmail] has been ${tag} Drafting a reply to an email（Send to ${senderEmail}）`,
+          text:   `[Gmail] has been ${tag} Drafting a reply to an email(Send to ${senderEmail})`,
           color:  '#7C3AED',
         },
       }).catch(() => {})

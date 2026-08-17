@@ -223,7 +223,7 @@ export function locationSummary(inputs: string[]): string {
     if (r.isRemote) return '🌐 remote'
     if (r.isCountry) {
       const cities = COUNTRY_CITIES[r.countryCode ?? ''] ?? []
-      return `🇺🇳 ${r.canonical}（${cities.slice(0, 3).join('、')}wait）`
+      return `🇺🇳 ${r.canonical}(${cities.slice(0, 3).join(', ')}wait)`
     }
     return `📍 ${r.canonical}`
   }).join(' + ')

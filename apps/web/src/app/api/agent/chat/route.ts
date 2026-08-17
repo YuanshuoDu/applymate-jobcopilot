@@ -106,14 +106,14 @@ export async function POST(req: NextRequest) {
       if (workflowRequested) {
         const requestedScore = requestedMinMatchScore(userMessage)
         const thresholdText = requestedScore === null ? 'Currently configured threshold' : `≥${requestedScore}%`
-        const workflowBody = `Started complete Harness Workflow：Scout → Analyst → Writer → Reviewer → Executor → Auditor。will filter for matches ${thresholdText} position；Any external deliveries will still go through the confirmation gate。`
+        const workflowBody = `Started complete Harness Workflow: Scout → Analyst → Writer → Reviewer → Executor → Auditor.will filter for matches ${thresholdText} position; Any external deliveries will still go through the confirmation gate.`
         send('action', { type: 'start_run', ...(requestedScore === null ? {} : { minMatchScore: requestedScore }) })
         send('block', { type: 'orchestrator_plan', speaker: 'Orchestrator', title: 'Full workflow', body: workflowBody, data: { workflow: true, minMatchScore: requestedScore } })
         await appendTranscriptEvent(db, {
           sessionId: session.id, type: 'orchestrator_plan', speaker: 'Orchestrator',
           title: 'Full workflow', body: workflowBody, data: { workflow: true, minMatchScore: requestedScore },
         })
-        fullText = 'Workflow has started。Scout Will search or read the position first，Analyst Keep only matches that meet threshold，Writer Generate materials，Reviewer Submitted after review Executor；We will confirm with you before actual submission。'
+        fullText = 'Workflow has started.Scout Will search or read the position first, Analyst Keep only matches that meet threshold, Writer Generate materials, Reviewer Submitted after review Executor; We will confirm with you before actual submission.'
         send('text', { delta: fullText })
         await appendTranscriptEvent(db, {
           sessionId: session.id, type: 'orchestrator_plan', speaker: 'Orchestrator', title: 'Response', body: fullText,
@@ -136,7 +136,7 @@ export async function POST(req: NextRequest) {
         jobs,
         model,
       })
-      const planBody = `host Agent plan：Just call ${plan.role} son Agent。Target：${plan.goal}`
+      const planBody = `host Agent plan: Just call ${plan.role} son Agent.Target: ${plan.goal}`
       send('block', { type: 'orchestrator_plan', speaker: 'Orchestrator', title: 'Plan', body: planBody, data: { plan } })
       await appendTranscriptEvent(db, {
         sessionId: session.id,

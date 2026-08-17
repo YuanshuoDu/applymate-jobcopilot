@@ -93,6 +93,6 @@ body:
       label: Codex Handoff
       description: Paste the final debugging instruction for Codex.
       value: |
-        @codex Please click above first repro Recurrence，Relocate the root cause and make minimal repairs。Disable skipping tests、Weaken assertions or bypass CI Come“repair”question。Open after completion PR，And give a root cause analysis first in the comments。
+        @codex Please click above first repro Recurrence, Relocate the root cause and make minimal repairs.Disable skipping tests, Weaken assertions or bypass CI Come“repair”question.Open after completion PR, And give a root cause analysis first in the comments.
     validations:
       required: true

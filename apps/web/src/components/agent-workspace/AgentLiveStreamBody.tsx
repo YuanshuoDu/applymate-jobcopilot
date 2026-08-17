@@ -128,7 +128,7 @@ export function AgentLiveStreamBody({
                 <span style={{ fontSize: 12, fontWeight: 600 }}>Application queue</span>
                 <span style={{ fontSize: 10, padding: '1px 7px', borderRadius: 999, background: 'var(--primary)', color: '#fff', fontWeight: 600 }}>{applyPending.length}</span>
                 <span style={{ fontSize: 10, color: 'var(--text-muted)', marginLeft: 'auto' }}>
-                  {applyQueue.some(job => job.mode === 'queued') ? 'The background submission results will be updated automatically' : 'Click「Apply now」Confirm delivery'}
+                  {applyQueue.some(job => job.mode === 'queued') ? 'The background submission results will be updated automatically' : 'Click"Apply now"Confirm delivery'}
                 </span>
               </div>
               {applyQueue.map(job => (

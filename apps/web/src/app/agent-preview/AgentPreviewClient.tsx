@@ -103,8 +103,8 @@ export function AgentPreviewClient() {
         </header>
         <section className="agent-preview-transcript" style={transcriptStyle}>
           {newChat ? <NewChatEmptyState /> : <>
-          <Message speaker="You" body="every morning 9 Click to find automatically Berlin software engineering positions，85 Automatically vote for points or more，But I need to confirm。" time="09:11" />
-          <Message speaker="Orchestrator · Automation draft" body="I can create a working day 09:00 automation：exist Berlin Search software engineering jobs，85 Enter the delivery queue after 1 minute or more，Request your confirmation before submitting。" time="09:12">
+          <Message speaker="You" body="every morning 9 Click to find automatically Berlin software engineering positions, 85 Automatically vote for points or more, But I need to confirm." time="09:11" />
+          <Message speaker="Orchestrator · Automation draft" body="I can create a working day 09:00 automation: exist Berlin Search software engineering jobs, 85 Enter the delivery queue after 1 minute or more, Request your confirmation before submitting." time="09:12">
             <Grid rows={[['Trigger', 'Weekdays 09:00'], ['Target', 'Berlin · SWE'], ['Score', '85+'], ['Approval', 'Required'], ['Daily cap', '8 applications']]} />
             <ButtonRow labels={['Create automation', 'Edit', 'Cancel']} />
           </Message>
@@ -116,12 +116,12 @@ export function AgentPreviewClient() {
             time={thinkingExpanded ? '09:12 · expanded' : '09:12 · collapsed'}
             muted={!thinkingExpanded}
           />
-          <Message speaker="Orchestrator · Options" body="Choose a delivery strategy to optimize match quality and efficiency。" time="09:13">
-            <Option name="Conservative" desc="Higher match threshold，Fewer deliveries but higher quality。" />
-            <Option name="Balanced" desc="Balance matching quality and quantity，Recommended for daily use。" selected />
-            <Option name="Aggressive" desc="looser threshold，Get more opportunities。" />
+          <Message speaker="Orchestrator · Options" body="Choose a delivery strategy to optimize match quality and efficiency." time="09:13">
+            <Option name="Conservative" desc="Higher match threshold, Fewer deliveries but higher quality." />
+            <Option name="Balanced" desc="Balance matching quality and quantity, Recommended for daily use." selected />
+            <Option name="Aggressive" desc="looser threshold, Get more opportunities." />
           </Message>
-          <Message speaker="Executor · Approval Required" body="Prepare to submit the following 4 applications，Please confirm whether to continue。" time="09:14" warn>
+          <Message speaker="Executor · Approval Required" body="Prepare to submit the following 4 applications, Please confirm whether to continue." time="09:14" warn>
             <Grid rows={[['Impact', '4 applications · 4 cover letters'], ['LinkedIn', 'No LinkedIn actions'], ['Sensitive fields', 'Ask user if missing']]} />
             <ButtonRow labels={['Approve', 'Review jobs', 'Cancel']} />
           </Message>

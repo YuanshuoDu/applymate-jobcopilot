@@ -48,7 +48,7 @@ import type { FormFieldSchema } from '@/lib/form-filler/types'
 import { scoreToneFor } from '@/lib/score-colors'
 import './sidepanel.css'
 
-type ExtLang = 'en' | 'de' | 'fr' | 'es' | 'nl'
+type ExtLang = 'en' | 'de' | 'fr' | 'es' | 'nl' | 'zh'
 type TabId = 'jobs' | 'form' | 'resume' | 'persona'
 type FilterStatus = 'all' | 'saved' | 'applied' | 'interview' | 'rejected'
 type SortBy = 'date' | 'company' | 'score'
@@ -77,14 +77,13 @@ const EXT_LABELS: Record<ExtLang, Labels> = {
   fr: { saved: 'Sauvegardé', applied: 'Postulé', interview: 'Entretien', rejected: 'Refusé', today: "Aujourd'hui", yesterday: 'Hier', daysAgo: n => `il y a ${n}j`, jobs: 'Offres', form: 'Formulaire', persona: 'Profil', resume: 'CV', noJobs: "Aucune offre sauvegardée.", openDashboard: 'Ouvrir le tableau de bord', notLoggedIn: 'Non connecté', loginPrompt: 'Connectez-vous à ApplyMate.' },
   es: { saved: 'Guardado', applied: 'Aplicado', interview: 'Entrevista', rejected: 'Rechazado', today: 'Hoy', yesterday: 'Ayer', daysAgo: n => `hace ${n}d`, jobs: 'Empleos', form: 'Formulario', persona: 'Perfil', resume: 'CV', noJobs: 'No hay empleos guardados.', openDashboard: 'Abrir panel', notLoggedIn: 'No conectado', loginPrompt: 'Inicia sesión en ApplyMate.' },
   nl: { saved: 'Opgeslagen', applied: 'Gesolliciteerd', interview: 'Gesprek', rejected: 'Afgewezen', today: 'Vandaag', yesterday: 'Gisteren', daysAgo: n => `${n}d geleden`, jobs: 'Vacatures', form: 'Formulier', persona: 'Profiel', resume: 'CV', noJobs: 'Geen opgeslagen vacatures.', openDashboard: 'Dashboard openen', notLoggedIn: 'Niet ingelogd', loginPrompt: 'Meld je aan bij ApplyMate.' },
+  zh: { saved: '已保存', applied: '已申请', interview: '面试', rejected: '已拒绝', today: '今天', yesterday: '昨天', daysAgo: n => `${n}天前`, jobs: '职位', form: '自动填表', persona: '画像', resume: '简历', noJobs: '暂无保存的职位。', openDashboard: '打开控制台', notLoggedIn: '未登录', loginPrompt: '请登录 ApplyMate 以使用扩展。' },
 }
 
 function getLang(): ExtLang {
   try {
     const stored = localStorage.getItem('applymate_lang') as ExtLang | null
     if (stored && stored in EXT_LABELS) return stored
-    const browser = navigator.language?.slice(0, 2).toLowerCase()
-    if (browser in EXT_LABELS) return browser as ExtLang
   } catch { /* extension storage may be unavailable during first paint */ }
   return 'en'
 }

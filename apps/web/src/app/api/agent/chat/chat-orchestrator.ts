@@ -153,7 +153,7 @@ function applyExplicitSearchTarget(message: string, plan: ChatPlan): ChatPlan {
 function explicitSearchTarget(message: string): string | null {
   const match = message.match(/(?:search(?: one time)?|looking for|try to find|search|find)\s*(?:for\s+)?(.+?)(?:post|position|jobs?|roles?)(?:\s|$)/i)
   if (!match?.[1]) return null
-  const candidate = match[1].trim().replace(/^.*(?:of|in\s+)/i, '').replace(/^(?:dublin|london|berlin|amsterdam|paris|munich)/i, '').replace(/[，,。.]+$/g, '').trim()
+  const candidate = match[1].trim().replace(/^.*(?:of|in\s+)/i, '').replace(/^(?:dublin|london|berlin|amsterdam|paris|munich)/i, '').replace(/[, ,..]+$/g, '').trim()
   if (!candidate || candidate.length > 60) return null
   return candidate
 }

@@ -44,7 +44,7 @@ export async function runScout(ctx: PipelineCtx): Promise<StageResult<ScoutOutpu
       emit('agent_action', {
         role:   'scout',
         action: hasLocations
-          ? `search [${agentCfg.targetRoles.slice(0, 3).join(', ')}]，Place：${locSummary}`
+          ? `search [${agentCfg.targetRoles.slice(0, 3).join(', ')}], Place: ${locSummary}`
           : `Global search [${agentCfg.targetRoles.slice(0, 3).join(', ')}]`,
       })
 
@@ -71,7 +71,7 @@ export async function runScout(ctx: PipelineCtx): Promise<StageResult<ScoutOutpu
       if (candidates.length === 0 && hasLocations) {
         emit('agent_observation', {
           role:        'scout',
-          observation: `⚠ No jobs found in the specified location，Try broadening your search（Any location）…`,
+          observation: `⚠ No jobs found in the specified location, Try broadening your search(Any location)…`,
         })
         candidates = await discoverJobs({
           userId,
@@ -122,7 +122,7 @@ export async function runScout(ctx: PipelineCtx): Promise<StageResult<ScoutOutpu
 
         emit('agent_observation', {
           role:        'scout',
-          observation: `✓ Found and saved ${discovered} new positions${failedWrites > 0 ? `（${failedWrites} Invalid records have been skipped）` : ''}：\n${listText}`,
+          observation: `✓ Found and saved ${discovered} new positions${failedWrites > 0 ? `(${failedWrites} Invalid records have been skipped)` : ''}: \n${listText}`,
         })
 
         await db.activity.create({
@@ -193,7 +193,7 @@ export async function runScout(ctx: PipelineCtx): Promise<StageResult<ScoutOutpu
       const expandedCities = locResolved.allDbTerms.slice(0, 8)
       emit('agent_observation', {
         role:        'scout',
-        observation: `📍 location analysis：[${agentCfg.targetLocations.join(', ')}] → Expand to ${expandedCities.length} matching words（${expandedCities.slice(0, 5).join('、')}${expandedCities.length > 5 ? '…' : ''}）`,
+        observation: `📍 location analysis: [${agentCfg.targetLocations.join(', ')}] → Expand to ${expandedCities.length} matching words(${expandedCities.slice(0, 5).join(', ')}${expandedCities.length > 5 ? '…' : ''})`,
       })
     }
 
@@ -205,7 +205,7 @@ export async function runScout(ctx: PipelineCtx): Promise<StageResult<ScoutOutpu
 
       emit('agent_observation', {
         role:        'scout',
-        observation: `📋 Enter analysis queue（common ${jobs.length} indivual）：\n${jobList}`,
+        observation: `📋 Enter analysis queue(common ${jobs.length} indivual): \n${jobList}`,
       })
     } else if (hasLocations) {
       // Zero results — emit a question via orchestrator
@@ -214,9 +214,9 @@ export async function runScout(ctx: PipelineCtx): Promise<StageResult<ScoutOutpu
         emit('agent_question', {
           role:       'scout',
           questionId: 'no_local_jobs',
-          question:   `saved ${savedTotal} None of the positions match [${agentCfg.targetLocations.join(', ')}] position，and API No new positions were found in the search。\n\nsuggestion：`,
+          question:   `saved ${savedTotal} None of the positions match [${agentCfg.targetLocations.join(', ')}] position, and API No new positions were found in the search.\n\nsuggestion: `,
           options: [
-            { label: `🌍 Remove location restrictions，Analyze all ${savedTotal} positions`, value: 'remove_location', action: { field: 'targetLocations', value: [] } },
+            { label: `🌍 Remove location restrictions, Analyze all ${savedTotal} positions`, value: 'remove_location', action: { field: 'targetLocations', value: [] } },
             { label: '✏ go Search Jobs Page manual search',                   value: 'goto_search',   action: { field: '_navigate', value: 'search' } },
             { label: '✕ Abort this run',                                   value: 'abort' },
           ],

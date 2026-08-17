@@ -279,7 +279,7 @@ describe("agent chat API session recording", () => {
     const { POST } = await import("./route")
 
     const res = expectResponse(await POST(postRequest({
-      messages: [{ role: "user", content: "every day 9 Click to help me find it Berlin SWE，85 Create automation" }],
+      messages: [{ role: "user", content: "every day 9 Click to help me find it Berlin SWE, 85 Create automation" }],
     }) as never))
     const text = await readSse(res)
 

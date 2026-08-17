@@ -134,7 +134,7 @@ export class OrchestratorAgent {
   emitRetry(stage: string, attempt: number, maxRetries: number, reason: string) {
     this.emit('orchestrator_retry', {
       stage, attempt, maxRetries, reason,
-      message: `🔄 Orchestrator Try again ${stage}（${attempt}/${maxRetries}）：${reason}`,
+      message: `🔄 Orchestrator Try again ${stage}(${attempt}/${maxRetries}): ${reason}`,
     })
     this.history.push(`[Retry/${stage}] attempt ${attempt}: ${reason}`)
   }
@@ -147,7 +147,7 @@ export class OrchestratorAgent {
     }
     this.emit('orchestrator_decision', {
       stage, decision: 'skip',
-      reason: `${stage} Exhausted retries，Skip to continue（Processed ${context.jobsProcessed} positions）`,
+      reason: `${stage} Exhausted retries, Skip to continue(Processed ${context.jobsProcessed} positions)`,
     })
     return 'skip'
   }
@@ -183,7 +183,7 @@ Write the strategy sentence now:`
       })
       return plan
     } catch {
-      const fallback = `deal with ${agentCfg.targetRoles.length > 0 ? agentCfg.targetRoles.slice(0,2).join('/') : 'saved'} Position，threshold ${agentCfg.minMatchScore}%`
+      const fallback = `deal with ${agentCfg.targetRoles.length > 0 ? agentCfg.targetRoles.slice(0,2).join('/') : 'saved'} Position, threshold ${agentCfg.minMatchScore}%`
       this.emit('orchestrator_thinking', { thinking: fallback, autonomous: this.autonomous })
       return fallback
     }
@@ -302,7 +302,7 @@ Respond ONLY in valid JSON (no markdown):
       const resolved = named[fix]
       if (resolved) { this.applyFix(resolved, stage) }
       else {
-        this.emit('orchestrator_fix', { stage, fix, message: `🔧 Orchestrator Problem detected [${stage}]：${fix}，Try again…` })
+        this.emit('orchestrator_fix', { stage, fix, message: `🔧 Orchestrator Problem detected [${stage}]: ${fix}, Try again…` })
         this.history.push(`[Fix/${stage}] ${fix}`)
       }
       return
@@ -311,7 +311,7 @@ Respond ONLY in valid JSON (no markdown):
     if (changes.length > 0) {
       this.emit('orchestrator_fix', {
         stage, fix: changes.join(', '),
-        message: `🔧 Orchestrator repair [${stage}]：${changes.join('，')}`,
+        message: `🔧 Orchestrator repair [${stage}]: ${changes.join(', ')}`,
       })
       this.history.push(`[Fix/${stage}] ${changes.join(', ')}`)
     }
@@ -341,7 +341,7 @@ Respond ONLY in valid JSON (no markdown):
   abort(stage: string, reason: string): void {
     this.emit('orchestrator_decision', {
       stage, decision: 'abort',
-      reason: `🛑 Orchestrator abort [${stage}]：${reason}`,
+      reason: `🛑 Orchestrator abort [${stage}]: ${reason}`,
     })
     this.history.push(`[ABORT/${stage}] ${reason}`)
   }
@@ -356,8 +356,8 @@ Respond ONLY in valid JSON (no markdown):
       autonomous:   this.autonomous,
       report,
       message: retries > 0
-        ? `✅ Orchestrator Finish（Total repairs ${retries} Second-rate）`
-        : `✅ Orchestrator Finish，Passed all stages successfully`,
+        ? `✅ Orchestrator Finish(Total repairs ${retries} Second-rate)`
+        : `✅ Orchestrator Finish, Passed all stages successfully`,
     })
   }
 

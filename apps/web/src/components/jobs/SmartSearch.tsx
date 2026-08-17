@@ -748,7 +748,7 @@ export function SmartSearch({ onJobSaved, onOpenSettings }: { onJobSaved?: () =>
                                     <select
                                       value={tgtLang} onChange={e => setTgtLang(e.target.value)} onClick={e => e.stopPropagation()}
                                       style={{ fontSize: 10, padding: '3px 6px', border: '1px solid var(--border)', borderRadius: 6, background: 'var(--glass-bg)', color: 'var(--text-muted)' }}>
-                                      {['de','en','fr','es','nl','ja'].map(l => <option key={l} value={l}>{l.toUpperCase()}</option>)}
+                                      {['de','en','fr','es','nl','zh','ja'].map(l => <option key={l} value={l}>{l.toUpperCase()}</option>)}
                                     </select>
                                     <button
                                       onClick={e => { e.stopPropagation(); handleTranslate(r) }}

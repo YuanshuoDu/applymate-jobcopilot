@@ -35,7 +35,7 @@ try {
     $nodeVer = node --version 2>&1
     Write-OK "Node.js $nodeVer"
 } catch {
-    Write-Fail "not found Node.js，Please install first https://nodejs.org (LTS version)"
+    Write-Fail "not found Node.js, Please install first https://nodejs.org (LTS version)"
 }
 
 # ── 2. examine / Install pnpm ───────────────────────────────────────
@@ -43,7 +43,7 @@ Write-Step "examine pnpm..."
 $hasPnpm = $null
 try { $hasPnpm = pnpm --version 2>&1 } catch {}
 if (-not $hasPnpm) {
-    Write-Warn "pnpm Not installed，Currently using npm Install..."
+    Write-Warn "pnpm Not installed, Currently using npm Install..."
     npm install -g pnpm | Out-Null
     $hasPnpm = pnpm --version 2>&1
 }
@@ -60,17 +60,17 @@ Write-Step "Configure environment variables..."
 $envFile = Join-Path $WEB ".env.local"
 
 if (Test-Path $envFile) {
-    Write-OK ".env.local Already exists，jump over"
+    Write-OK ".env.local Already exists, jump over"
 } else {
     Write-Host ""
-    Write-Host "  need one PostgreSQL Database connection。" -ForegroundColor White
-    Write-Host "  Detected that this machine is installed PostgreSQL（pgAdmin 4）。" -ForegroundColor White
+    Write-Host "  need one PostgreSQL Database connection." -ForegroundColor White
+    Write-Host "  Detected that this machine is installed PostgreSQL(pgAdmin 4)." -ForegroundColor White
     Write-Host ""
-    Write-Host "  Please enter PostgreSQL password（By default, leave it blank and enter directly to try. 'postgres'）：" -ForegroundColor Yellow
+    Write-Host "  Please enter PostgreSQL password(By default, leave it blank and enter directly to try. 'postgres'): " -ForegroundColor Yellow
     $pgPass = Read-Host "  password"
     if ([string]::IsNullOrWhiteSpace($pgPass)) { $pgPass = "postgres" }
 
-    Write-Host "  Database name（default applymate，Just press Enter）：" -ForegroundColor Yellow
+    Write-Host "  Database name(default applymate, Just press Enter): " -ForegroundColor Yellow
     $pgDb = Read-Host "  Database name"
     if ([string]::IsNullOrWhiteSpace($pgDb)) { $pgDb = "applymate" }
 
@@ -92,7 +92,7 @@ OPENAI_API_KEY=""
 ANTHROPIC_API_KEY=""
 "@
     Set-Content -Path $envFile -Value $envContent -Encoding UTF8
-    Write-OK ".env.local Generated（DATABASE_URL=$dbUrl）"
+    Write-OK ".env.local Generated(DATABASE_URL=$dbUrl)"
 }
 
 # ── 5. create PostgreSQL database ─────────────────────────────────
@@ -121,7 +121,7 @@ if ($psqlPaths) {
     & $psqlPaths -U postgres -c "CREATE DATABASE $pgDb2;" 2>&1 | Out-Null
     Write-OK "database '$pgDb2' Ready"
 } else {
-    Write-Warn "not found psql，Skip automatic database creation。If the database does not exist, please manually pgAdmin create '$pgDb2'"
+    Write-Warn "not found psql, Skip automatic database creation.If the database does not exist, please manually pgAdmin create '$pgDb2'"
 }
 
 # ── 6. Prisma Generate client ──────────────────────────────────────
@@ -134,14 +134,14 @@ Write-OK "Prisma Client generation completed"
 Write-Step "Perform database migration (prisma migrate dev)..."
 $env:DATABASE_URL = ($envContent | Select-String 'DATABASE_URL="([^"]+)"').Matches[0].Groups[1].Value
 pnpm prisma migrate dev --name init
-if ($LASTEXITCODE -ne 0) { Write-Fail "migrate fail，Check, please DATABASE_URL and PostgreSQL Whether to run" }
+if ($LASTEXITCODE -ne 0) { Write-Fail "migrate fail, Check, please DATABASE_URL and PostgreSQL Whether to run" }
 Write-OK "Data table creation completed"
 
 # ── 8. Populate demo data ────────────────────────────────────────────
 Write-Step "Populate demo data (prisma db seed)..."
 pnpm prisma db seed
 if ($LASTEXITCODE -ne 0) {
-    Write-Warn "seed fail，Maybe the data already exists，continue..."
+    Write-Warn "seed fail, Maybe the data already exists, continue..."
 } else {
     Write-OK "Demo data filling completed"
     Write-Host "    account: demo@applymate.ai  password: demo1234" -ForegroundColor Magenta
@@ -150,14 +150,14 @@ if ($LASTEXITCODE -ne 0) {
 # ── Finish ──────────────────────────────────────────────────────
 Write-Host ""
 Write-Host "╔══════════════════════════════════════════╗" -ForegroundColor Green
-Write-Host "║         ✅ All installation and configuration completed！             ║" -ForegroundColor Green
+Write-Host "║         ✅ All installation and configuration completed!             ║" -ForegroundColor Green
 Write-Host "╚══════════════════════════════════════════╝" -ForegroundColor Green
 Write-Host ""
 Write-Host "  Demo account: demo@applymate.ai" -ForegroundColor White
 Write-Host "  demo password: demo1234" -ForegroundColor White
 Write-Host ""
 
-$launch = Read-Host "  Now start the development server？(y/n)"
+$launch = Read-Host "  Now start the development server?(y/n)"
 if ($launch -eq 'y' -or $launch -eq 'Y' -or $launch -eq '') {
     Write-Host "`n  Starting... Browser opens http://localhost:3000" -ForegroundColor Cyan
     Start-Process "http://localhost:3000"

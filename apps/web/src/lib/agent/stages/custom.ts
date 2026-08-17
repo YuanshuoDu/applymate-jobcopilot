@@ -59,7 +59,7 @@ export async function runCustomAgents(
 
     emit('agent_plan', {
       role: roleKey,
-      plan: `plan：right ${jobs.length} Run custom analysis for jobs「${agent.name}」${agent.description ? `（${agent.description}）` : ''}`,
+      plan: `plan: right ${jobs.length} Run custom analysis for jobs"${agent.name}"${agent.description ? `(${agent.description})` : ''}`,
     })
 
     const observations: CustomAgentObservation[] = []
@@ -90,7 +90,7 @@ export async function runCustomAgents(
 
         emit('agent_observation', {
           role:        roleKey,
-          observation: observation.summary || '（No output）',
+          observation: observation.summary || '(No output)',
         })
 
         // Write to activity log
@@ -107,7 +107,7 @@ export async function runCustomAgents(
       } catch (err) {
         emit('agent_observation', {
           role:        roleKey,
-          observation: `✗ Analysis failed：AI Call exception`,
+          observation: `✗ Analysis failed: AI Call exception`,
         })
       }
     }
@@ -117,7 +117,7 @@ export async function runCustomAgents(
 
     emit('agent_reflect', {
       role:    roleKey,
-      reflect: `「${agent.name}」Finish：analyzed ${processed} positions（time consuming ${(durationMs / 1000).toFixed(1)}s）`,
+      reflect: `"${agent.name}"Finish: analyzed ${processed} positions(time consuming ${(durationMs / 1000).toFixed(1)}s)`,
     })
 
     emit('role_done', {

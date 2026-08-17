@@ -216,12 +216,12 @@ export function AgentPlaygroundPage() {
       const d = JSON.parse(e.data)
       setWaitingQuestion(null)
       setRunLog(prev => prev.map(l => l.questionId === d.id ? { ...l, answered: true } : l))
-      addLog({ type: 'orchestrator_answer', message: `✓ Answered：${d.label}`, time: new Date() })
+      addLog({ type: 'orchestrator_answer', message: `✓ Answered: ${d.label}`, time: new Date() })
     })
 
     listen('orchestrator_plan', e => {
       const d = JSON.parse(e.data)
-      addLog({ type: 'orchestrator_plan', message: `🧠 Orchestrator Strategy：${d.plan}`, time: new Date() })
+      addLog({ type: 'orchestrator_plan', message: `🧠 Orchestrator Strategy: ${d.plan}`, time: new Date() })
     })
     listen('orchestrator_fix', e => {
       const d = JSON.parse(e.data)
@@ -233,7 +233,7 @@ export function AgentPlaygroundPage() {
     })
     listen('orchestrator_decision', e => {
       const d = JSON.parse(e.data)
-      addLog({ type: 'orchestrator_decision', message: `⚖ Orchestrator decision making [${d.stage}]：${d.reason}`, time: new Date() })
+      addLog({ type: 'orchestrator_decision', message: `⚖ Orchestrator decision making [${d.stage}]: ${d.reason}`, time: new Date() })
     })
     listen('orchestrator_complete', e => {
       const d = JSON.parse(e.data)
@@ -293,7 +293,7 @@ export function AgentPlaygroundPage() {
       setRunDone(true)
       currentRoleRef.current = null
       setCurrentRole(null)
-      addLog({ type: 'done', message: `✅ Pipeline completed — ${d.processed} ratings，${d.queued ?? 0} Distributed，${d.applied} Confirmed delivery，${d.pending} pending review，${d.skipped} skipped`, time: new Date() })
+      addLog({ type: 'done', message: `✅ Pipeline completed — ${d.processed} ratings, ${d.queued ?? 0} Distributed, ${d.applied} Confirmed delivery, ${d.pending} pending review, ${d.skipped} skipped`, time: new Date() })
       es.close(); esRef.current = null
       setSessionsRefreshVersion(v => v + 1)
       toast.success(
@@ -320,7 +320,7 @@ export function AgentPlaygroundPage() {
     setCurrentRole(null); setRunDone(true)
     const sessionId = liveSessionId ?? selectedSessionId
     if (!sessionId) {
-      addLog({ type: 'info', message: '— Frontend flow stopped；No cancelable sessions have been created for this run。', time: new Date() })
+      addLog({ type: 'info', message: '— Frontend flow stopped; No cancelable sessions have been created for this run.', time: new Date() })
       return
     }
 
@@ -329,7 +329,7 @@ export function AgentPlaygroundPage() {
       const body = await response.json().catch(() => ({})) as { error?: string }
       throw new Error(body.error ?? 'Could not cancel the Agent execution.')
     }
-    addLog({ type: 'info', message: '— Canceled Agent run；The background will not continue to process or submit new applications.。', time: new Date() })
+    addLog({ type: 'info', message: '— Canceled Agent run; The background will not continue to process or submit new applications..', time: new Date() })
     window.dispatchEvent(new Event('applymate:sessions-changed'))
   }, [addLog, liveSessionId, selectedSessionId])
 
@@ -358,13 +358,13 @@ export function AgentPlaygroundPage() {
           typeof action.sessionId === 'string' ? action.sessionId : undefined,
         )
         toast.info('Pipeline started', typeof action.minMatchScore === 'number'
-          ? `match threshold：≥${action.minMatchScore}%`
+          ? `match threshold: ≥${action.minMatchScore}%`
           : 'Orchestrator trigger run')
         break
       case 'stop_run':
         try {
           await stopRun()
-          toast.info('Pipeline canceled', 'Background execution has stopped，New applications will not be processed further。')
+          toast.info('Pipeline canceled', 'Background execution has stopped, New applications will not be processed further.')
         } catch (error) {
           toast.error('Cancel run failed', error instanceof Error ? error.message : 'Could not cancel the Agent execution.')
         }
@@ -429,10 +429,10 @@ export function AgentPlaygroundPage() {
     ))
     addLog({
       type: 'question_answered',
-      message: `✓ you chose「${opt.label}」${opt.action ? '，Preference saved' : ''}`,
+      message: `✓ you chose"${opt.label}"${opt.action ? ', Preference saved' : ''}`,
       time: new Date(),
     })
-    toast.success('Preference recorded', opt.action ? 'Settings updated，It will take effect next time it is run' : 'Already aware，continue running')
+    toast.success('Preference recorded', opt.action ? 'Settings updated, It will take effect next time it is run' : 'Already aware, continue running')
   }, [addLog, toast])
 
   const savedCount   = (jobsData?.jobs ?? []).filter(j => j.status === 'saved').length

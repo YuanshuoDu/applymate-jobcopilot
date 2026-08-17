@@ -402,7 +402,7 @@ When implementing any feature, ask yourself:
 - **#189** — Vercel build fix ✅ done
 
 **Phase 5.7 known Gap:**
-- AgentHarness Write after success FormPattern（wait AgentHarness exposed field→selector mapping）
+- AgentHarness Write after success FormPattern(wait AgentHarness exposed field→selector mapping)
 
 **Phase 6 — direct HTML crawl:**
 - Compliance review completed: StepStone ⚠️ (robots.txt blocks search), Xing 🔴 (blocked), WTTJ 🔴 (ToS prohibits scraping)
@@ -417,14 +417,14 @@ When implementing any feature, ask yourself:
 
 **Phase 6 — jump over:** StepStone ⚠️, Xing 🔴, WTTJ 🔴 (Compliance review failed)
 
-**all Phase Finish。Queue cleared，Warehouse is clean。**
+**all Phase Finish.Queue cleared, Warehouse is clean.**
 
 **ending Issue 🔄:**
 - **#202** — AgentHarness field mappings → upsertFormPattern closed loop ✅ done (PR #205)
 - **#203** — lever-flow Switch to share helpers ✅ done (PR #206)
 - **#204** — Phase 5 assembly line e2e Integration testing ✅ done (PR #207)
 
-**🎉 All done。Queue cleared，Warehouse is clean。Web 26/26 green， Worker 23/23 green。**
+**🎉 All done.Queue cleared, Warehouse is clean.Web 26/26 green,  Worker 23/23 green.**
 
 **Phase 5 moat (To be created):**
 - Form-pattern cache, Pattern replay, Confidence decay, Budget cap

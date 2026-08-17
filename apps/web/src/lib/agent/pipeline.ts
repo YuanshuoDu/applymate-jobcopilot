@@ -77,8 +77,8 @@ export async function runPipeline(ctx: PipelineCtx): Promise<RunReport> {
   emit('agent_plan', {
     role: 'scout',
     plan: hasTargets
-      ? `plan：Match found [${ctx.agentCfg.targetRoles.slice(0, 3).join(', ')}] new positions，Then load the saved job，Apply filters（exclude ${ctx.agentCfg.excludeCompanies.length} companies，daily cap ${ctx.agentCfg.dailyLimit} strip）`
-      : `plan：Load all saved jobs，Apply exclusions/Remove duplicates/Daily cap filter`,
+      ? `plan: Match found [${ctx.agentCfg.targetRoles.slice(0, 3).join(', ')}] new positions, Then load the saved job, Apply filters(exclude ${ctx.agentCfg.excludeCompanies.length} companies, daily cap ${ctx.agentCfg.dailyLimit} strip)`
+      : `plan: Load all saved jobs, Apply exclusions/Remove duplicates/Daily cap filter`,
   })
   await persist('scout')
 
@@ -130,7 +130,7 @@ export async function runPipeline(ctx: PipelineCtx): Promise<RunReport> {
 
     emit('agent_reflect', {
       role: 'scout',
-      reflect: `Reconnaissance completed：${scoutDiscovered > 0 ? `Discover ${scoutDiscovered} new positions，` : ''}common ${scoutedJobs.length} positions enter the analysis queue（time consuming ${(s1.metrics.durationMs / 1000).toFixed(1)}s）`,
+      reflect: `Reconnaissance completed: ${scoutDiscovered > 0 ? `Discover ${scoutDiscovered} new positions, ` : ''}common ${scoutedJobs.length} positions enter the analysis queue(time consuming ${(s1.metrics.durationMs / 1000).toFixed(1)}s)`,
     })
     emitRole(ctx, 'scout', 'done', { count: scoutedJobs.length, discovered: scoutDiscovered, durationMs: s1.metrics.durationMs, summary: scoutSummary })
     emit('stage_done', { stage: 'scout', count: scoutedJobs.length, durationMs: s1.metrics.durationMs })
@@ -162,7 +162,7 @@ export async function runPipeline(ctx: PipelineCtx): Promise<RunReport> {
   emitRole(ctx, 'analyst', 'start')
   emit('agent_plan', {
     role: 'analyst',
-    plan: `plan：right ${scoutedJobs.length} positions one by one AI match score，Extract matches/Missing keywords（minimum score threshold：${ctx.agentCfg.minMatchScore}%）`,
+    plan: `plan: right ${scoutedJobs.length} positions one by one AI match score, Extract matches/Missing keywords(minimum score threshold: ${ctx.agentCfg.minMatchScore}%)`,
   })
   await persist('analyze', { scoutedJobs })
 
@@ -219,7 +219,7 @@ export async function runPipeline(ctx: PipelineCtx): Promise<RunReport> {
 
     emit('agent_reflect', {
       role: 'analyst',
-      reflect: `Analysis completed：${scoredJobs.length} rated，average score ${avgScore}%，${aboveThreshold} reaches the threshold（≥${ctx.agentCfg.minMatchScore}%），${analysisFailed} a failure（time consuming ${(s2.metrics.durationMs / 1000).toFixed(1)}s）`,
+      reflect: `Analysis completed: ${scoredJobs.length} rated, average score ${avgScore}%, ${aboveThreshold} reaches the threshold(≥${ctx.agentCfg.minMatchScore}%), ${analysisFailed} a failure(time consuming ${(s2.metrics.durationMs / 1000).toFixed(1)}s)`,
     })
     emitRole(ctx, 'analyst', 'done', { count: scoredJobs.length, durationMs: s2.metrics.durationMs, summary: analystSummary, avgScore })
     emit('stage_done', { stage: 'analyze', count: scoredJobs.length, durationMs: s2.metrics.durationMs })
@@ -249,8 +249,8 @@ export async function runPipeline(ctx: PipelineCtx): Promise<RunReport> {
   emit('agent_plan', {
     role: 'writer',
     plan: ctx.agentCfg.autoCoverLetter
-      ? `plan：for ${qualifiedCount} Generate a customized cover letter for every qualified position（intonation：${ctx.agentCfg.coverTone || 'professional'}）`
-      : `plan：for ${qualifiedCount} Prepare application materials for qualified positions`,
+      ? `plan: for ${qualifiedCount} Generate a customized cover letter for every qualified position(intonation: ${ctx.agentCfg.coverTone || 'professional'})`
+      : `plan: for ${qualifiedCount} Prepare application materials for qualified positions`,
   })
   await persist('prepare', { scoutedJobs, scoredJobs, analysisFailed })
 
@@ -260,17 +260,17 @@ export async function runPipeline(ctx: PipelineCtx): Promise<RunReport> {
   // an explicit user gate; the Reviewer remains a separate final approval gate.
   if (ctx.agentCfg.requireApproval) {
     const decision = await orch.ask('writer',
-      `Writer Prepare for ${qualifiedCount} Applications for qualified positions AI Revise，Generate custom resumes and keep job connections with templates。Do you want to continue?？`,
+      `Writer Prepare for ${qualifiedCount} Applications for qualified positions AI Revise, Generate custom resumes and keep job connections with templates.Do you want to continue??`,
       [
         { label: 'application AI Modify and generate customized resumes', value: 'apply_ai_changes' },
-        { label: 'Generate cover letter only，Resume remains the same', value: 'keep_resume' },
+        { label: 'Generate cover letter only, Resume remains the same', value: 'keep_resume' },
       ],
     )
     allowResumeTailoring = decision === 'apply_ai_changes'
     if (!allowResumeTailoring) {
       emit('agent_observation', {
         role: 'writer',
-        observation: 'Original resume has been retained；Writer We will only prepare application materials without modifying your resume。',
+        observation: 'Original resume has been retained; Writer We will only prepare application materials without modifying your resume.',
       })
     }
   }
@@ -290,7 +290,7 @@ export async function runPipeline(ctx: PipelineCtx): Promise<RunReport> {
       orch.applyFix('writer', 'cover_letter_generation_failed')
       emit('orchestrator_fix', {
         stage: 'writer', fix: 'retry_cover_letters',
-        message: 'All cover letter generation failed，Retrying（may be API temporary exception）…',
+        message: 'All cover letter generation failed, Retrying(may be API temporary exception)…',
       })
       continue
     }
@@ -299,8 +299,8 @@ export async function runPipeline(ctx: PipelineCtx): Promise<RunReport> {
     emit('agent_reflect', {
       role: 'writer',
       reflect: ctx.agentCfg.autoCoverLetter
-        ? `Completed：generate ${lettersCount} cover letter，${preparedPackages.length - lettersCount} no need to generate（time consuming ${(s3.metrics.durationMs / 1000).toFixed(1)}s）`
-        : `Material preparation completed：${preparedPackages.length} Application packages are ready（time consuming ${(s3.metrics.durationMs / 1000).toFixed(1)}s）`,
+        ? `Completed: generate ${lettersCount} cover letter, ${preparedPackages.length - lettersCount} no need to generate(time consuming ${(s3.metrics.durationMs / 1000).toFixed(1)}s)`
+        : `Material preparation completed: ${preparedPackages.length} Application packages are ready(time consuming ${(s3.metrics.durationMs / 1000).toFixed(1)}s)`,
     })
     emitRole(ctx, 'writer', 'done', { count: preparedPackages.length, durationMs: s3.metrics.durationMs, summary: writerSummary, letters: lettersCount })
     emit('stage_done', { stage: 'prepare', count: preparedPackages.length, durationMs: s3.metrics.durationMs })
@@ -319,11 +319,11 @@ export async function runPipeline(ctx: PipelineCtx): Promise<RunReport> {
   orch.beginStage('reviewer', 1)
   emitRole(ctx, 'reviewer', 'start')
   const gateRule = ctx.agentCfg.autoApply && !ctx.agentCfg.requireApproval
-    ? `automatic preparation mode：point ≥ ${ctx.agentCfg.minMatchScore}% → Automatically complete material and form preparation；Each application must still be reviewed by the user and submitted with separate authorization`
-    : 'Audit mode：All positions are queued for review；Position-by-position authorization is required before submission'
+    ? `automatic preparation mode: point ≥ ${ctx.agentCfg.minMatchScore}% → Automatically complete material and form preparation; Each application must still be reviewed by the user and submitted with separate authorization`
+    : 'Audit mode: All positions are queued for review; Position-by-position authorization is required before submission'
   emit('agent_plan', {
     role: 'reviewer',
-    plan: `plan：right ${preparedPackages.length} Application package execution AI quality review + Diversion decision。rule：${gateRule}`,
+    plan: `plan: right ${preparedPackages.length} Application package execution AI quality review + Diversion decision.rule: ${gateRule}`,
   })
   await persist('gate', { scoutedJobs, scoredJobs, analysisFailed, preparedPackages })
 
@@ -333,7 +333,7 @@ export async function runPipeline(ctx: PipelineCtx): Promise<RunReport> {
   const reviewerSummary = `${gateOutput.approved.length} approved, ${gateOutput.pending.length} pending, ${gateOutput.skipped.length} skipped`
   emit('agent_reflect', {
     role: 'reviewer',
-    reflect: `Review completed：${gateOutput.approved.length} Approved to enter the application queue，${gateOutput.pending.length} pending review，${gateOutput.skipped.length} below the threshold to skip（time consuming ${(s4.metrics.durationMs / 1000).toFixed(1)}s）`,
+    reflect: `Review completed: ${gateOutput.approved.length} Approved to enter the application queue, ${gateOutput.pending.length} pending review, ${gateOutput.skipped.length} below the threshold to skip(time consuming ${(s4.metrics.durationMs / 1000).toFixed(1)}s)`,
   })
   emitRole(ctx, 'reviewer', 'done', { count: gateOutput.approved.length + gateOutput.pending.length, durationMs: s4.metrics.durationMs, summary: reviewerSummary, approved: gateOutput.approved.length, pending: gateOutput.pending.length })
   emit('stage_done', { stage: 'gate', approved: gateOutput.approved.length, pending: gateOutput.pending.length, skipped: gateOutput.skipped.length, durationMs: s4.metrics.durationMs })
@@ -354,7 +354,7 @@ export async function runPipeline(ctx: PipelineCtx): Promise<RunReport> {
   if (gateOutput.approved.length === 0 && gateOutput.pending.length === 0) {
     emit('orchestrator_decision', {
       stage: 'reviewer', decision: 'all_skipped',
-      reason: `all ${gateOutput.skipped.length} positions are below the threshold ${ctx.agentCfg.minMatchScore}%。It is recommended to lower the threshold or improve the resume。`,
+      reason: `all ${gateOutput.skipped.length} positions are below the threshold ${ctx.agentCfg.minMatchScore}%.It is recommended to lower the threshold or improve the resume.`,
     })
   }
   await persist('execute', { scoutedJobs, scoredJobs, analysisFailed, preparedPackages, gateOutput })
@@ -372,8 +372,8 @@ export async function runPipeline(ctx: PipelineCtx): Promise<RunReport> {
   emit('agent_plan', {
     role: 'executor',
     plan: gateOutput.approved.length > 0
-      ? `plan：for ${gateOutput.approved.length} Prepare for an approved position「Apply now」queue，Waiting for you to manually confirm delivery`
-      : `plan：No approved position，${gateOutput.pending.length} are in the review queue waiting for manual operation`,
+      ? `plan: for ${gateOutput.approved.length} Prepare for an approved position"Apply now"queue, Waiting for you to manually confirm delivery`
+      : `plan: No approved position, ${gateOutput.pending.length} are in the review queue waiting for manual operation`,
   })
   await persist('execute', { scoutedJobs, scoredJobs, analysisFailed, preparedPackages, gateOutput })
 
@@ -382,7 +382,7 @@ export async function runPipeline(ctx: PipelineCtx): Promise<RunReport> {
     if (attempt > 1) {
       const backoffMs = attempt * 1000
       await new Promise(r => setTimeout(r, backoffMs))
-      orch.emitRetry('executor', attempt, 3, `DB write retry（wait ${backoffMs}ms）…`)
+      orch.emitRetry('executor', attempt, 3, `DB write retry(wait ${backoffMs}ms)…`)
     }
 
     const s5 = await runExecute(gateOutput.approved, ctx)
@@ -395,7 +395,7 @@ export async function runPipeline(ctx: PipelineCtx): Promise<RunReport> {
       if (failedPkgs.length > 0) {
         emit('orchestrator_fix', {
           stage: 'executor', fix: 'retry_failed_db_writes',
-          message: `${s5.data!.failed.length} Delivery tasks failed to join the queue，Retrying…`,
+          message: `${s5.data!.failed.length} Delivery tasks failed to join the queue, Retrying…`,
         })
         // Merge results
         executorQueued = [...executorQueued, ...s5.data!.queued]
@@ -411,8 +411,8 @@ export async function runPipeline(ctx: PipelineCtx): Promise<RunReport> {
     emit('agent_reflect', {
       role: 'executor',
       reflect: executorQueued.length > 0
-        ? `Distributed：${executorQueued.length} Applications that have received final authorization on a position-by-position basis are executed in the background.。Submission confirmation will be provided by Worker write back${executorFailed.length > 0 ? `（${executorFailed.length} Failed to join the team）` : ''}（time consuming ${(s5.metrics.durationMs / 1000).toFixed(1)}s）`
-        : `Ready to complete：No applications have been distributed in this round；All qualified positions are still pending review，Awaiting your explicit authorization`,
+        ? `Distributed: ${executorQueued.length} Applications that have received final authorization on a position-by-position basis are executed in the background..Submission confirmation will be provided by Worker write back${executorFailed.length > 0 ? `(${executorFailed.length} Failed to join the team)` : ''}(time consuming ${(s5.metrics.durationMs / 1000).toFixed(1)}s)`
+        : `Ready to complete: No applications have been distributed in this round; All qualified positions are still pending review, Awaiting your explicit authorization`,
     })
     const executorSummary = `${executorQueued.length} explicitly authorized application(s) queued, ${executorFailed.length} failed`
     emitRole(ctx, 'executor', 'done', { count: executorQueued.length, durationMs: s5.metrics.durationMs, summary: executorSummary, queued: executorQueued.length, failed: executorFailed.length })
@@ -437,7 +437,7 @@ export async function runPipeline(ctx: PipelineCtx): Promise<RunReport> {
   emitRole(ctx, 'auditor', 'start')
   emit('agent_plan', {
     role: 'auditor',
-    plan: `plan：Verify DB state，Statistical results（${executorQueued.length} Dispatched to unattended Worker / ${gateOutput.pending.length} Pending review / ${gateOutput.skipped.length} jump over），scanning Gmail mail`,
+    plan: `plan: Verify DB state, Statistical results(${executorQueued.length} Dispatched to unattended Worker / ${gateOutput.pending.length} Pending review / ${gateOutput.skipped.length} jump over), scanning Gmail mail`,
   })
   await persist('audit', { scoutedJobs, scoredJobs, analysisFailed, preparedPackages, gateOutput, executeOutput })
 
@@ -446,7 +446,7 @@ export async function runPipeline(ctx: PipelineCtx): Promise<RunReport> {
   auditLoop: while (true) {
     const attempt = orch.nextAttempt('auditor')
     if (attempt > 1) {
-      orch.emitRetry('auditor', attempt, 2, 'jump over Gmail scanning，only do DB Verify…')
+      orch.emitRetry('auditor', attempt, 2, 'jump over Gmail scanning, only do DB Verify…')
     }
 
     const fakeExecuteOutput = { queued: executorQueued, failed: executorFailed }
@@ -470,7 +470,7 @@ export async function runPipeline(ctx: PipelineCtx): Promise<RunReport> {
     const auditorSummary = `${report.queued} dispatched, ${report.pending} pending, ${auditWarnings.length} warnings`
     emit('agent_reflect', {
       role: 'auditor',
-      reflect: `✅ This operation report：deal with ${report.processed} positions · 🚀 Distributed ${report.queued} indivual · ✅ Submission confirmed ${report.applied} indivual · ⏳ Pending review ${report.pending} indivual · ⏭ jump over ${report.skipped} indivual · ❌ fail ${report.failed} indivual${auditWarnings.length > 0 ? ` · ⚠ ${auditWarnings.length} warning` : ''} · Total time spent ${((Date.now() - t0) / 1000).toFixed(1)}s`,
+      reflect: `✅ This operation report: deal with ${report.processed} positions · 🚀 Distributed ${report.queued} indivual · ✅ Submission confirmed ${report.applied} indivual · ⏳ Pending review ${report.pending} indivual · ⏭ jump over ${report.skipped} indivual · ❌ fail ${report.failed} indivual${auditWarnings.length > 0 ? ` · ⚠ ${auditWarnings.length} warning` : ''} · Total time spent ${((Date.now() - t0) / 1000).toFixed(1)}s`,
     })
     emitRole(ctx, 'auditor', 'done', { count: report.processed, durationMs: s6.metrics.durationMs, summary: auditorSummary, warnings: auditWarnings.length })
     emit('stage_done', { stage: 'audit', durationMs: s6.metrics.durationMs })

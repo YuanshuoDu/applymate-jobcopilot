@@ -83,7 +83,7 @@ export function ApplyJobCard({ job, onApplied }: ApplyJobCardProps) {
           </div>
           {job.matchedKeywords.length > 0 && (
             <div style={{ fontSize: 9, color: 'var(--text-muted)', marginTop: 3 }}>
-              match：{job.matchedKeywords.slice(0, 5).join(' · ')}
+              match: {job.matchedKeywords.slice(0, 5).join(' · ')}
             </div>
           )}
           {job.coverLetter && (
