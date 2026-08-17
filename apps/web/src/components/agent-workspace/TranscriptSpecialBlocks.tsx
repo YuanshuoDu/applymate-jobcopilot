@@ -4,6 +4,7 @@ import React from 'react'
 import type { AgentTranscriptEvent } from './session-view-model'
 import { TranscriptActionButtons } from './TranscriptActionButtons'
 import { ApprovalBlock } from './ApprovalBlock'
+import { useI18n } from '@/lib/i18n'
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return !!value && typeof value === 'object' && !Array.isArray(value)
@@ -45,15 +46,16 @@ export function TranscriptSpecialContent({ event, border, actedApprovalIds, onAc
 }
 
 function ResumeArtifactBlock({ event, border }: { event: AgentTranscriptEvent; border: string }) {
+  const { t } = useI18n()
   const artifact = nestedRecord(event, 'resume')
   const job = nestedRecord(event, 'job')
   return (
     <div>
       <BodyText>{event.body}</BodyText>
       <KeyValueGrid border={border} rows={[
-        ['Resume', text(artifact.name) ?? 'Tailored resume'],
-        ['Job', [text(job.company) ?? text(artifact.company), text(job.role) ?? text(artifact.role)].filter(Boolean).join(' · ') || 'Linked job'],
-        ['Status', event.type === 'resume_finalized' ? 'Confirmed for Executor' : 'Waiting for Reviewer'],
+        [t('agent.resumeArtifact'), text(artifact.name) ?? t('agent.tailoredResume')],
+        [t('agent.job'), [text(job.company) ?? text(artifact.company), text(job.role) ?? text(artifact.role)].filter(Boolean).join(' · ') || t('agent.linkedJob')],
+        [t('common.status'), event.type === 'resume_finalized' ? t('agent.confirmedForExecutor') : t('agent.waitingForReviewer')],
       ]} />
     </div>
   )
@@ -74,14 +76,15 @@ function AutomationDraftBlock({ event, border, onAction }: {
   border: string
   onAction?: (action: TranscriptAction) => Promise<void> | void
 }) {
+  const { t } = useI18n()
   const draft = nestedRecord(event, 'draft')
   const actionDraft = toAutomationDraftAction(draft)
   const rows: Array<[string, string]> = [
-    ['Name', text(draft.name) ?? 'New automation'],
-    ['Trigger', text(draft.trigger) ?? text(draft.triggerType) ?? text(draft.cron) ?? 'Manual'],
-    ['Target', listValue(draft.targetRoles, draft.targetLocations)],
-    ['Score', text(draft.minScore) ? `${text(draft.minScore)}+` : '85+'],
-    ['Approval', draft.requireApproval === false ? 'Not required' : 'Required'],
+    [t('agent.name'), text(draft.name) ?? t('agent.newAutomation')],
+    [t('agent.trigger'), text(draft.trigger) ?? text(draft.triggerType) ?? text(draft.cron) ?? t('agent.manual')],
+    [t('agent.target'), listValue(draft.targetRoles, draft.targetLocations)],
+    [t('agent.score'), text(draft.minScore) ? `${text(draft.minScore)}+` : '85+'],
+    [t('agent.approval'), draft.requireApproval === false ? t('agent.notRequired') : t('agent.required')],
   ]
 
   return (
@@ -89,9 +92,9 @@ function AutomationDraftBlock({ event, border, onAction }: {
       <BodyText>{event.body}</BodyText>
       <KeyValueGrid border={border} rows={rows} />
       <TranscriptActionButtons actions={[
-        { label: 'Create automation', onClick: () => onAction?.({ type: 'create_automation', draft: actionDraft }) },
-        { label: 'Edit', onClick: () => onAction?.({ type: 'edit_automation_draft', draft: actionDraft, prompt: draftPrompt(actionDraft) }) },
-        { label: 'Cancel', onClick: () => onAction?.({ type: 'cancel_automation_draft', body: `Cancelled automation draft: ${actionDraft.name}` }) },
+        { label: t('agent.createAutomation'), onClick: () => onAction?.({ type: 'create_automation', draft: actionDraft }) },
+        { label: t('agent.edit'), onClick: () => onAction?.({ type: 'edit_automation_draft', draft: actionDraft, prompt: draftPrompt(actionDraft) }) },
+        { label: t('agent.cancel'), onClick: () => onAction?.({ type: 'cancel_automation_draft', body: `${t('agent.cancelledAutomationDraft')}: ${actionDraft.name}` }) },
       ]} />
     </div>
   )
@@ -140,16 +143,17 @@ function triggerTypeFromLabel(value: string | null) {
 }
 
 function QualityGateBlock({ event, border }: { event: AgentTranscriptEvent; border: string }) {
+  const { t } = useI18n()
   const gate = nestedRecord(event, 'qualityGate')
   const evidence = Array.isArray(gate.evidence) ? gate.evidence.map(text).filter((v): v is string => !!v).slice(0, 4) : []
 
   return (
     <div>
       <KeyValueGrid border={border} rows={[
-        ['Gate', text(gate.gate) ?? text(event.title) ?? 'Quality gate'],
-        ['Status', text(gate.status) ?? 'recorded'],
-        ['Score', text(gate.score) ?? 'n/a'],
-        ['Retry', gate.retryRecommended === true ? 'recommended' : 'not needed'],
+        [t('agent.gate'), text(gate.gate) ?? text(event.title) ?? t('agent.qualityGate')],
+        [t('common.status'), text(gate.status) ?? t('agent.recorded')],
+        [t('agent.score'), text(gate.score) ?? t('agent.notAvailable')],
+        [t('agent.retry'), gate.retryRecommended === true ? t('agent.recommended') : t('agent.notNeeded')],
       ]} />
       {evidence.length > 0 && <EvidenceList items={evidence} />}
       <BodyText>{event.body}</BodyText>
@@ -158,6 +162,7 @@ function QualityGateBlock({ event, border }: { event: AgentTranscriptEvent; bord
 }
 
 function JobResultsBlock({ event, border }: { event: AgentTranscriptEvent; border: string }) {
+  const { t } = useI18n()
   const data = isRecord(event.data) ? event.data : {}
   const jobs = Array.isArray(data.jobs) ? data.jobs.filter(isRecord).slice(0, 6) : []
 
@@ -167,7 +172,7 @@ function JobResultsBlock({ event, border }: { event: AgentTranscriptEvent; borde
 
   return (
     <div>
-      <BodyText>{event.body || 'Top matches'}</BodyText>
+      <BodyText>{event.body || t('agent.topMatches')}</BodyText>
       <div style={{ border: `1px solid ${border}`, borderRadius: 7, overflow: 'hidden', marginTop: 8 }}>
         {jobs.map((job, index) => (
           <div key={index} style={{
@@ -179,8 +184,8 @@ function JobResultsBlock({ event, border }: { event: AgentTranscriptEvent; borde
             fontSize: 10,
             alignItems: 'center',
           }}>
-            <span style={{ fontWeight: 650, color: 'var(--text)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{text(job.company) ?? 'Company'}</span>
-            <span style={{ color: 'var(--text-muted)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{text(job.role) ?? text(job.title) ?? 'Role'}</span>
+            <span style={{ fontWeight: 650, color: 'var(--text)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{text(job.company) ?? t('agent.company')}</span>
+            <span style={{ color: 'var(--text-muted)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{text(job.role) ?? text(job.title) ?? t('agent.role')}</span>
             <span style={{ color: 'var(--c-success)', fontWeight: 750, textAlign: 'right' }}>{text(job.score) ?? '-'}</span>
           </div>
         ))}

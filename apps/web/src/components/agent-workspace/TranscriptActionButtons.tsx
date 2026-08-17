@@ -1,6 +1,7 @@
 'use client'
 
 import React from 'react'
+import { useI18n } from '@/lib/i18n'
 
 export interface TranscriptButtonAction {
   label: string
@@ -13,6 +14,7 @@ export function transcriptActionErrorText(label: string, error: unknown): string
 }
 
 export function TranscriptActionButtons({ actions }: { actions: TranscriptButtonAction[] }) {
+  const { t } = useI18n()
   const [pendingLabel, setPendingLabel] = React.useState<string | null>(null)
   const [errorText, setErrorText] = React.useState<string | null>(null)
 
@@ -46,7 +48,7 @@ export function TranscriptActionButtons({ actions }: { actions: TranscriptButton
               opacity: disabled ? 0.72 : 1,
               fontFamily: 'inherit',
             }}>
-              {pendingLabel === action.label ? 'Working...' : action.label}
+              {pendingLabel === action.label ? t('agent.working') : action.label}
             </button>
           )
         })}
