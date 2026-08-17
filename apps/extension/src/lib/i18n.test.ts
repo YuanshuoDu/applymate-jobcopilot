@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import { EXTENSION_TRANSLATION_KEYS, translateExtension } from './i18n'
+import { LABELS } from '../popup/popup-constants'
 
 describe('extension language switching', () => {
   it('uses English by default and Chinese when selected', () => {
@@ -25,6 +26,12 @@ describe('extension language switching', () => {
   it('keeps registered English strings free of Chinese characters', () => {
     for (const key of EXTENSION_TRANSLATION_KEYS) {
       expect(translateExtension('en', key), key).not.toMatch(/[\u3400-\u9fff]/)
+    }
+  })
+
+  it('keeps English popup labels free of Chinese characters', () => {
+    for (const [key, value] of Object.entries(LABELS.en)) {
+      expect(value, key).not.toMatch(/[\u3400-\u9fff]/)
     }
   })
 })

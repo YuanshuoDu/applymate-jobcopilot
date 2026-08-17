@@ -360,7 +360,7 @@ export function LandingPage({ plans = FALLBACK_PLANS }: { plans?: PublicPlan[] }
             <label style={{ display: 'flex', alignItems: 'center', gap: 6, color: C.textMuted, fontSize: 12 }}>
               <span className="sr-only">{t('lang.label')}</span>
               <select aria-label={t('lang.label')} value={lang} onChange={event => setLang(event.target.value as Lang)} style={{ color: C.textMuted, background: 'rgba(255,255,255,0.04)', border: '1px solid rgba(255,255,255,0.12)', borderRadius: 8, padding: '6px 8px', fontSize: 12 }}>
-                {LANGUAGES.map(language => <option key={language.value} value={language.value}>{language.flag} {language.native}</option>)}
+                {LANGUAGES.map(language => <option key={language.value} value={language.value}>{language.flag} {t(`lang.${language.value}`)}</option>)}
               </select>
             </label>
             <Link href="/login" style={{ fontSize: 12, fontWeight: 600, color: C.textMuted, textDecoration: 'none', padding: '6px 14px', border: '1px solid rgba(255,255,255,0.12)', borderRadius: 9, background: 'rgba(255,255,255,0.04)', transition: 'all 0.15s' }}
@@ -396,7 +396,7 @@ export function LandingPage({ plans = FALLBACK_PLANS }: { plans?: PublicPlan[] }
                 <label style={{ gridColumn: '1 / -1', display: 'flex', alignItems: 'center', justifyContent: 'center', color: C.textMuted, fontSize: 12 }}>
                   <span className="sr-only">{t('lang.label')}</span>
                   <select aria-label={t('lang.label')} value={lang} onChange={event => setLang(event.target.value as Lang)} style={{ color: C.textMuted, background: 'rgba(255,255,255,0.04)', border: '1px solid rgba(255,255,255,0.12)', borderRadius: 8, padding: '8px 10px', fontSize: 12 }}>
-                    {LANGUAGES.map(language => <option key={language.value} value={language.value}>{language.flag} {language.native}</option>)}
+                    {LANGUAGES.map(language => <option key={language.value} value={language.value}>{language.flag} {t(`lang.${language.value}`)}</option>)}
                   </select>
                 </label>
                 <Link href="/login" onClick={closeMobileMenu} style={{ color: C.textMuted, textDecoration: 'none', fontSize: 12, fontWeight: 600, padding: '10px 12px', textAlign: 'center', border: '1px solid rgba(255,255,255,0.12)', borderRadius: 9 }}>{t('landing.signIn')}</Link>

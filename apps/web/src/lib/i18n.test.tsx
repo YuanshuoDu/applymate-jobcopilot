@@ -1,7 +1,7 @@
 import React from 'react'
 import { renderToStaticMarkup } from 'react-dom/server'
 import { describe, expect, it } from 'vitest'
-import { I18nProvider, TRANSLATION_KEYS, hasTranslation, translate, useI18n } from './i18n'
+import { I18nProvider, LANGUAGES, TRANSLATION_KEYS, hasTranslation, translate, useI18n } from './i18n'
 
 function TranslationProbe() {
   const { t } = useI18n()
@@ -60,6 +60,15 @@ describe('AI settings translations', () => {
 
   it('does not leak an English fallback into the Chinese UI', () => {
     expect(translate('zh', 'missing.ui.key')).toBe('出现了问题')
+  })
+
+  it('keeps language-picker names in the active UI language', () => {
+    for (const language of LANGUAGES) {
+      const key = `lang.${language.value}`
+      expect(translate('en', key), key).not.toMatch(/[\u3400-\u9fff]/)
+      expect(translate('zh', key), key).not.toBe(key)
+      expect(translate('zh', key), key).toMatch(/[\u3400-\u9fff]/)
+    }
   })
 
 })

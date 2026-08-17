@@ -648,7 +648,7 @@ export function SettingsPage() {
               </FieldRow>
               <FieldRow label={t('lang.label')}>
                 <select value={lang} onChange={event => setLang(event.target.value as Lang)} style={{ minWidth: 210, padding: '7px 10px', border: '1px solid var(--border)', borderRadius: 8, background: 'var(--bg)', color: 'var(--text)', fontFamily: 'inherit', fontSize: 12 }}>
-                  {LANGUAGES.map(language => <option key={language.value} value={language.value}>{language.flag} {language.native}</option>)}
+                  {LANGUAGES.map(language => <option key={language.value} value={language.value}>{language.flag} {t(`lang.${language.value}`)}</option>)}
                 </select>
               </FieldRow>
             </SettingsSection>

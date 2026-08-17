@@ -6,7 +6,7 @@ import { C } from './popup-constants'
 import { ActionRow, countPill, Divider, EmptyJob, footerLink, InlineMessage, primaryAction } from './PopupActions'
 import { PopupHeader } from './PopupHeader'
 import { DetectionRow, JobSummary } from './PopupJobCard'
-import { getLabels, isCurrentJobResponse, isSavedJob, isSavedJobsResponse, isSaveResponse, isScrapedJob, isStatsResponse, openCurrentSidePanel, sameJob, type PopupStats } from './popup-utils'
+import { getLabels, getPopupLang, isCurrentJobResponse, isSavedJob, isSavedJobsResponse, isSaveResponse, isScrapedJob, isStatsResponse, openCurrentSidePanel, sameJob, type PopupStats } from './popup-utils'
 
 export function PopupMainView({ settings, onSettings, onLogout }: {
   settings: ExtensionSettings
@@ -85,7 +85,7 @@ export function PopupMainView({ settings, onSettings, onLogout }: {
       }).catch(() => {})
       setMessage('saved')
     } catch (error) {
-      setMessage(error instanceof Error ? error.message : 'Save failed')
+      setMessage(getPopupLang() === 'zh' ? labels.genericError : error instanceof Error ? error.message : labels.genericError)
     } finally {
       setSaving(false)
     }
@@ -111,7 +111,7 @@ export function PopupMainView({ settings, onSettings, onLogout }: {
       void chrome.runtime.sendMessage({ type: 'JOB_MATCHED', job: updatedJob })
       setMessage('analyzed')
     } catch (error) {
-      setMessage(error instanceof Error ? error.message : labels.analyzeError)
+      setMessage(getPopupLang() === 'zh' ? labels.genericError : error instanceof Error ? error.message : labels.genericError)
     } finally {
       setAnalyzing(false)
     }
