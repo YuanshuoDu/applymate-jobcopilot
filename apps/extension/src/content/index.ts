@@ -116,8 +116,8 @@ function renderVisibleDetailSaved() {
   btn.dataset.applymateSaved = 'true'
   btn.disabled = true
   delete btn.dataset.applymateBusy
-  btn.innerHTML = '<span>✓ Saved to ApplyMate</span>'
-  btn.title = 'Saved to ApplyMate'
+  btn.innerHTML = `<span>✓ ${uiText('Saved to ApplyMate')}</span>`
+  btn.title = uiText('Saved to ApplyMate')
   btn.style.setProperty('background', '#3B6D11', 'important')
   btn.style.setProperty('opacity', '1', 'important')
 }
@@ -160,12 +160,12 @@ async function readReadyDetailJob(): Promise<DetailReadResult> {
 }
 
 function setIncompleteJobSaveState(btn: HTMLButtonElement, mode: 'inline' | 'floating') {
-  btn.innerHTML = '<span>⚠ Details still loading</span>'
+  btn.innerHTML = `<span>⚠ ${uiText('Details still loading')}</span>`
   btn.style.setProperty('background', '#854F0B', 'important')
   btn.style.setProperty('opacity', '1', 'important')
   btn.disabled = false
   delete btn.dataset.applymateBusy
-  showToast('The job description is not ready yet. Wait for the detail panel to finish loading, then try Save again.')
+  showToast(uiText('The job description is not ready yet. Wait for the detail panel to finish loading, then try Save again.'))
   setTimeout(() => {
     if (btn.isConnected && btn.dataset.applymateBusy !== 'true') setSaveButtonIdle(btn, mode)
   }, 4_000)
@@ -327,7 +327,7 @@ async function init() {
     backgroundReady = await checkBackground()
     log('🚀 checkBackground result:', backgroundReady)
     if (!backgroundReady) {
-      showToast('⚠ Extension background not ready. Try reloading the extension at chrome://extensions.')
+      showToast(`⚠ ${uiText('Extension background not ready. Try reloading the extension at chrome://extensions.')}`)
     }
 
     const isList = isJobListPage()
@@ -974,7 +974,7 @@ function injectLazySaveButton() {
         btn.innerHTML = `✓ ${uiText('Saved!')}`
         btn.style.setProperty('background', '#3B6D11', 'important')
         btn.style.setProperty('opacity', '1', 'important')
-        showToast(`Saved: ${currentJob.title} @ ${currentJob.company}`)
+        showToast(`${uiText('Saved')}: ${currentJob.title} @ ${currentJob.company}`)
         lastSavedPanelSignature = getPanelSignature()
         setTimeout(() => btn.remove(), 2500)
       } else {
@@ -1133,7 +1133,7 @@ async function saveDetailJob(btn: HTMLButtonElement, mode: 'inline' | 'floating'
     if (response?.success) {
       markJobSaved(currentJob)
       renderDetailButtonSaved(btn)
-      showToast(`Saved: ${currentJob.title} @ ${currentJob.company}`)
+      showToast(`${uiText('Saved')}: ${currentJob.title} @ ${currentJob.company}`)
       lastSavedPanelSignature = getPanelSignature()
     } else {
       const msg = response?.error ?? uiText('Save failed')
@@ -1141,15 +1141,15 @@ async function saveDetailJob(btn: HTMLButtonElement, mode: 'inline' | 'floating'
       if (msg.includes('Not logged in') || msg.includes('login') || msg.includes('logged') || msg.includes('Unauthorized')) {
         btn.innerHTML = `⚡ ${uiText('Log in first')}`
         btn.style.setProperty('background', '#854F0B', 'important')
-        showToast('Not logged in — click the ApplyMate icon in the toolbar to log in.')
+        showToast(uiText('Not logged in — click the ApplyMate icon in the toolbar to log in.'))
       } else if (msg.includes('fetch') || msg.includes('network') || msg.includes('Failed to fetch')) {
-        btn.innerHTML = '🔌 API offline'
+        btn.innerHTML = `🔌 ${uiText('API offline')}`
         btn.style.setProperty('background', '#A32D2D', 'important')
-        showToast('Cannot reach ApplyMate server. Is the backend running?')
+        showToast(uiText('Cannot reach ApplyMate server. Is the backend running?'))
       } else {
-        btn.innerHTML = '✗ Error'
+        btn.innerHTML = `✗ ${uiText('Error')}`
         btn.style.setProperty('background', '#A32D2D', 'important')
-        showToast('Error: ' + msg)
+        showToast(getExtensionLanguage() === 'zh' ? uiText('Could not save this job.') : `${uiText('Error')}: ${msg}`)
       }
       btn.disabled = false
       delete btn.dataset.applymateBusy
@@ -1161,7 +1161,7 @@ async function saveDetailJob(btn: HTMLButtonElement, mode: 'inline' | 'floating'
     btn.style.setProperty('background', '#A32D2D', 'important')
     btn.disabled = false
     delete btn.dataset.applymateBusy
-    showToast('Cannot reach extension. Try reloading at chrome://extensions/ (error: ' + message + ')')
+    showToast(getExtensionLanguage() === 'zh' ? uiText('Cannot reach extension. Try reloading at chrome://extensions/') : `${uiText('Cannot reach extension. Try reloading at chrome://extensions/')} (${uiText('Error')}: ${message})`)
   }
   btn.style.setProperty('opacity', '1', 'important')
   setTimeout(() => {

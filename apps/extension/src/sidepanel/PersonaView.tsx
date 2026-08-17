@@ -49,7 +49,7 @@ interface Props {
 type ViewMode = 'view' | 'editing' | 'adding'
 
 export function PersonaView({ settings, personaUpdateTrigger }: Props) {
-  const { t } = useExtensionI18n()
+  const { lang, t } = useExtensionI18n()
   const [fields, setFields] = useState<PersonaField[]>([])
   const [profile, setProfile] = useState<PersonaProfile | null>(null)
   const [loading, setLoading] = useState(true)
@@ -65,9 +65,9 @@ export function PersonaView({ settings, personaUpdateTrigger }: Props) {
       setProfile(personaResult.profile)
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err)
-      showToast(`${t('Load failed')}: ${msg}`)
+      showToast(lang === 'zh' ? t('Load failed') : `${t('Load failed')}: ${msg}`)
     } finally { setLoading(false) }
-  }, [settings])
+  }, [lang, settings, t])
 
   useEffect(() => { loadFields() }, [loadFields, personaUpdateTrigger])
 
@@ -110,8 +110,8 @@ export function PersonaView({ settings, personaUpdateTrigger }: Props) {
       await loadFields()
       setMode('view')
       setNewField({})
-      showToast('Added!')
-    } catch { showToast('Add failed') }
+      showToast(t('Added!'))
+    } catch { showToast(t('Add failed')) }
     finally { setSaving(false) }
   }
 

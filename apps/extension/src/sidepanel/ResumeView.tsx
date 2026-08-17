@@ -110,7 +110,7 @@ function sameJobUrl(left: string, right: string): boolean {
 
 // ── Root ─────────────────────────────────────────────────────────────────────────
 export function ResumeView({ settings }: Props) {
-  const { t } = useExtensionI18n()
+  const { lang, t } = useExtensionI18n()
   const [resumes, setResumes] = useState<ResumeListItem[]>([])
   const [activeId, setActiveId] = useState<string | null>(null)
   const [resume, setResume] = useState<Resume | null>(null)
@@ -168,7 +168,7 @@ export function ResumeView({ settings }: Props) {
       if (auditedResumeId === activeId) return
       setActiveId(auditedResumeId)
       void loadResume(auditedResumeId)
-      showToast('Using this job’s audited resume')
+      showToast(t('Using this job’s audited resume'))
     }).catch(() => {
       // The extension remains usable offline or before a job has been saved.
     })
@@ -204,7 +204,7 @@ export function ResumeView({ settings }: Props) {
       await setCurrentResumeId(id, settings.userEmail)
     } catch (err) {
       const msg = err instanceof Error ? err.message : 'Failed to load'
-      showToast(msg)
+      showToast(lang === 'zh' ? t('Load failed') : msg)
       setLoadError(msg)
     }
     finally { setLoading(false) }
@@ -216,8 +216,8 @@ export function ResumeView({ settings }: Props) {
       const r = await createResume(settings, { name: `Resume ${resumes.length + 1}`, content: EMPTY_CONTENT, templateId: 'clean' })
       setResumes(prev => [r, ...prev]); setActiveId(r.id); setResume(r)
       setContent(EMPTY_CONTENT); setTemplateId('clean'); setTemplateOpts({}); setDirty(false)
-      await setCurrentResumeId(r.id, settings.userEmail); showToast('Created')
-    } catch { showToast('Failed') }
+      await setCurrentResumeId(r.id, settings.userEmail); showToast(t('Created'))
+    } catch { showToast(t('Failed')) }
   }
 
   // ── Upload resume (parse) ──────────────────────────────────────────────────────
@@ -242,8 +242,8 @@ export function ResumeView({ settings }: Props) {
       })
       setResumes(prev => [r, ...prev]); setActiveId(r.id); setResume(r)
       setContent(normalizeResumeContent(r.content)); setTemplateId('clean'); setTemplateOpts({}); setDirty(false)
-      await setCurrentResumeId(r.id, settings.userEmail); showToast('Resume uploaded & parsed!')
-    } catch { showToast('Upload failed') }
+      await setCurrentResumeId(r.id, settings.userEmail); showToast(t('Resume uploaded & parsed!'))
+    } catch { showToast(t('Upload failed')) }
     finally { setUploading(false) }
   }
 
@@ -254,7 +254,7 @@ export function ResumeView({ settings }: Props) {
     try {
       await updateResume(settings, activeId, { content: c, templateId: tid, templateOptions: topts })
       setDirty(false); clearResumeDraft(activeId, settings.userEmail)
-    } catch { showToast('Save failed'); setResumeDraft(activeId, c, settings.userEmail) }
+    } catch { showToast(t('Save failed')); setResumeDraft(activeId, c, settings.userEmail) }
     finally { setSaving(false) }
   }, [settings, activeId])
 
@@ -289,7 +289,8 @@ export function ResumeView({ settings }: Props) {
       }
     }
     markDirty(updated)
-    showToast(`Added ${sectionId} section`)
+    const sectionLabel = sectionId.charAt(0).toUpperCase() + sectionId.slice(1)
+    showToast(`${t('Section added')}: ${t(sectionLabel)}`)
   }
 
   // ── PDF ────────────────────────────────────────────────────────────────────────
@@ -304,9 +305,9 @@ export function ResumeView({ settings }: Props) {
     try {
       const result = await exportApplicationPackLocally(settings, savedJobId, Boolean(exportedPackFolder))
       setExportedPackFolder(result.folderPath)
-      showToast(exportedPackFolder ? 'Opened job folder' : 'Audited PDFs saved to D:')
+      showToast(exportedPackFolder ? t('Opened job folder') : t('Audited PDFs saved to D:'))
     } catch (error) {
-      showToast(error instanceof Error ? error.message : 'Could not save application PDFs')
+      showToast(lang === 'zh' ? t('Could not save application PDFs') : error instanceof Error ? error.message : t('Could not save application PDFs'))
     } finally {
       setExportingPack(false)
     }
@@ -340,11 +341,11 @@ export function ResumeView({ settings }: Props) {
         jobDescription: currentJob.description,
       })
       setTailorResult(analysis)
-      showToast('Resume tailored for this job')
+      showToast(t('Resume tailored for this job'))
     } catch (error) {
       const message = error instanceof Error ? error.message : 'Tailoring failed'
       setTailorError(message)
-      showToast(message)
+      showToast(lang === 'zh' ? t('Tailoring failed') : message)
     } finally {
       setTailoring(false)
     }
@@ -366,7 +367,7 @@ export function ResumeView({ settings }: Props) {
       <div className="am-resume-view am-resume-state am-resume-error">
         <div className="am-resume-state-icon danger"><AlertTriangle size={19} aria-hidden="true" /></div>
         <div className="am-resume-state-title">{t('Failed to load resumes')}</div>
-        <div className="am-resume-state-copy">{loadError}</div>
+        <div className="am-resume-state-copy">{lang === 'zh' ? t('Something went wrong') : loadError}</div>
         <div className="am-resume-api">API: {settings.apiBaseUrl}</div>
         <button className="am-resume-primary-button" type="button" onClick={loadResumeList}><RefreshCw size={13} aria-hidden="true" /> {t('Retry')}</button>
       </div>
@@ -441,7 +442,7 @@ export function ResumeView({ settings }: Props) {
             <button className="am-resume-match-button" type="button" onClick={handleOpenTailor} disabled={tailoring}>
               {tailoring ? <LoaderCircle size={13} className="am-spin" aria-hidden="true" /> : <FileText size={13} aria-hidden="true" />} {tailoring ? t('Tailoring resume…') : packageStatus === 'audited' ? t('Review application pack') : t('Tailor resume')}
             </button>
-            {tailorError && <div className="am-resume-tailor-error" role="alert">{tailorError}</div>}
+            {tailorError && <div className="am-resume-tailor-error" role="alert">{lang === 'zh' ? t('Something went wrong') : tailorError}</div>}
             {tailorResult && <TailorAnalysis result={tailorResult} />}
           </div>
         )}

@@ -148,7 +148,7 @@ function visibleStatus(status: string): FilterStatus {
 
 export function SidePanel() {
   const L = useExtLang()
-  const { t } = useExtensionI18n()
+  const { lang, t } = useExtensionI18n()
   const [settings, setSettings] = useState<ExtensionSettings | null>(null)
   const [activeTab, setActiveTab] = useState<TabId>('jobs')
   const [mountedTabs, setMountedTabs] = useState<Set<TabId>>(() => new Set(['jobs']))
@@ -278,7 +278,7 @@ export function SidePanel() {
 }
 
 function CurrentPageBanner({ accountKey, tabKey, userEmail, onSaved }: { accountKey: string; tabKey: string; userEmail: string; onSaved: () => void }) {
-  const { t } = useExtensionI18n()
+  const { lang, t } = useExtensionI18n()
   const [currentJob, setCurrentJob] = useState<ScrapedJob | null>(null)
   const [saving, setSaving] = useState(false)
   const [saved, setSaved] = useState(false)
@@ -363,7 +363,7 @@ function CurrentPageBanner({ accountKey, tabKey, userEmail, onSaved }: { account
         <div className="am-current-copy"><div className="am-current-title">{currentJob.title}</div><div className="am-current-company">{currentJob.company}{currentJob.location && currentJob.location !== 'Unknown' ? ` · ${currentJob.location}` : ''}</div></div>
         <button className="am-save-button" type="button" disabled={saving || saved} onClick={() => void saveCurrentJob()}>{saved ? t('Saved') : saving ? t('Saving…') : t('Save job')}</button>
       </div>
-      {saveError && <div className="am-current-error" role="alert">{saveError}</div>}
+      {saveError && <div className="am-current-error" role="alert">{lang === 'zh' ? t('Something went wrong') : saveError}</div>}
     </section>
   )
 }
@@ -371,7 +371,7 @@ function CurrentPageBanner({ accountKey, tabKey, userEmail, onSaved }: { account
 type LType = Labels
 
 function TrackerPanel({ settings, tabKey, L, onOpenResume }: { settings: ExtensionSettings; tabKey: string; L: LType; onOpenResume: () => void }) {
-  const { t } = useExtensionI18n()
+  const { lang, t } = useExtensionI18n()
   const [jobs, setJobs] = useState<SavedJob[]>([])
   const [dashboard, setDashboard] = useState<DashboardSnapshot | null>(null)
   const [loading, setLoading] = useState(false)
@@ -527,7 +527,7 @@ function TrackerPanel({ settings, tabKey, L, onOpenResume }: { settings: Extensi
       showToast(`${job.score == null ? t('Match score ready') : t('Match score updated')} · ${updated.score}%`)
     } catch (error) {
       if (/add a resume/i.test(error instanceof Error ? error.message : String(error))) onOpenResume()
-      showToast(error instanceof Error ? error.message : t('Scoring failed'))
+      showToast(lang === 'zh' ? t('Scoring failed') : error instanceof Error ? error.message : t('Scoring failed'))
     } finally {
       setScoringId(null)
     }
@@ -570,7 +570,7 @@ function TrackerPanel({ settings, tabKey, L, onOpenResume }: { settings: Extensi
           <div className="am-select-row"><select className="am-select" value={filterSource} onChange={event => setFilterSource(event.target.value)} aria-label={t('Filter by source')}><option value="all">{t('All sources')}</option>{availableSources.map(source => <option key={source} value={source}>{source}</option>)}</select><select className="am-select" value={sortBy} onChange={event => setSortBy(event.target.value as SortBy)} aria-label={t('Sort jobs')}><option value="date">{t('Newest first')}</option><option value="company">{t('Company')}</option><option value="score">{t('Match score')}</option></select></div>
         </div>
 
-        {(jobsSyncError || dashboardSyncError) && <div className="am-sync-banner" role="alert"><div><strong>{t('Sync needs attention')}</strong><span>{jobsSyncError || dashboardSyncError}</span>{(jobsSyncError ? lastJobsSyncedAt : lastDashboardSyncedAt) && <small>{t('Last synced')} {formatSyncAge((jobsSyncError ? lastJobsSyncedAt : lastDashboardSyncedAt)!)}</small>}</div><button type="button" onClick={() => refreshAll(true)}>{t('Retry')}</button></div>}
+        {(jobsSyncError || dashboardSyncError) && <div className="am-sync-banner" role="alert"><div><strong>{t('Sync needs attention')}</strong><span>{lang === 'zh' ? t('Something went wrong') : jobsSyncError || dashboardSyncError}</span>{(jobsSyncError ? lastJobsSyncedAt : lastDashboardSyncedAt) && <small>{t('Last synced')} {formatSyncAge((jobsSyncError ? lastJobsSyncedAt : lastDashboardSyncedAt)!)}</small>}</div><button type="button" onClick={() => refreshAll(true)}>{t('Retry')}</button></div>}
         <CurrentPageBanner accountKey={`${settings.apiBaseUrl}|${settings.apiToken}|${settings.userEmail}`} tabKey={tabKey} userEmail={settings.userEmail} onSaved={() => refreshAll()} />
         <div className="am-list" ref={listRef}>
           {loading ? <div className="am-spinner"><LoaderCircle className="am-spin" size={20} aria-label={t('Loading jobs')} /></div> : filtered.length === 0 ? <EmptyState hasSearch={Boolean(search.trim())} filter={filterStatus} connectionError={Boolean(jobsSyncError)} onRetry={() => refreshAll(true)} onClearSearch={() => setSearch('')} onOpenDashboard={() => chrome.tabs.create({ url: `${settings.apiBaseUrl}/?page=jobs` })} L={L} /> : <div className="am-list-inner">{filtered.map(job => <JobCard key={job.id} job={job} expanded={expandedId === job.id} onToggle={() => setExpandedId(current => current === job.id ? null : job.id)} settings={settings} L={L} scoring={scoringId === job.id} onScore={() => void scoreJob(job)} onPrepared={() => void refreshAll(true)} />)}</div>}
@@ -614,7 +614,7 @@ function JobCard({ job, expanded, onToggle, settings, onScore, scoring, onPrepar
   onPrepared: () => void
   L: Labels
 }) {
-  const { t } = useExtensionI18n()
+  const { lang, t } = useExtensionI18n()
   const [notes, setNotes] = useState(job.notes ?? '')
   const [notesSaving, setNotesSaving] = useState(false)
   const [notesError, setNotesError] = useState('')
@@ -703,7 +703,7 @@ function JobCard({ job, expanded, onToggle, settings, onScore, scoring, onPrepar
         <button className="am-chevron" type="button" onMouseDown={event => { event.preventDefault(); event.currentTarget.blur() }} onClick={onToggle} aria-label={expanded ? `Collapse ${job.role}` : `Expand ${job.role}`}><ChevronDown size={16} className={expanded ? 'am-chevron-open' : ''} /></button>
       </div>
       {expanded && <div className="am-detail">
-        <div className="am-detail-grid"><div className="am-detail-box"><div className="am-detail-label">{t('Notes')}</div><div className="am-notes-meta"><span>{notesSaving ? <span className="am-saving">{t('Saving…')}</span> : notesError ? <span className="am-note-error">{notesError}</span> : notes ? <span className="am-saved">{t('Saved')}</span> : t('Add context for later')}</span></div><textarea className="am-notes" value={notes} onChange={event => { setNotes(event.target.value); setNotesError('') }} placeholder={t('Interview questions, salary, contact…')} /><ApplicationPackSummary hasResume={hasResume} hasCoverLetter={hasCoverLetter} ready={packReady} preparing={packPreparing} stage={packStage} exporting={packExporting} error={packError} onPrepare={() => void handlePackPrepare()} onDownload={() => void handlePackDownload()} /></div><div className="am-detail-box am-detail-insights"><div className="am-detail-label am-detail-label-icon"><Tags size={11} aria-hidden="true" /> {t('Key job tags')}</div>{keyTags.length > 0 ? <div className="am-key-tags">{keyTags.map(tag => <span key={tag} className="am-key-tag">{tag}</span>)}</div> : <div className="am-detail-text">{t('Score this role to extract its main skills and requirements.')}</div>}<div className="am-detail-label am-detail-score-label">{t('Match score')}</div><div className="am-detail-text">{job.score == null ? t('Not scored yet.') : `${t('Scored at')} ${job.score}% ${t('against your resume.')}`}</div>{!job.url && <div className="am-detail-text">{t('No original link saved.')}</div>}</div></div>
+        <div className="am-detail-grid"><div className="am-detail-box"><div className="am-detail-label">{t('Notes')}</div><div className="am-notes-meta"><span>{notesSaving ? <span className="am-saving">{t('Saving…')}</span> : notesError ? <span className="am-note-error">{lang === 'zh' ? t('Something went wrong') : notesError}</span> : notes ? <span className="am-saved">{t('Saved')}</span> : t('Add context for later')}</span></div><textarea className="am-notes" value={notes} onChange={event => { setNotes(event.target.value); setNotesError('') }} placeholder={t('Interview questions, salary, contact…')} /><ApplicationPackSummary hasResume={hasResume} hasCoverLetter={hasCoverLetter} ready={packReady} preparing={packPreparing} stage={packStage} exporting={packExporting} error={packError} onPrepare={() => void handlePackPrepare()} onDownload={() => void handlePackDownload()} /></div><div className="am-detail-box am-detail-insights"><div className="am-detail-label am-detail-label-icon"><Tags size={11} aria-hidden="true" /> {t('Key job tags')}</div>{keyTags.length > 0 ? <div className="am-key-tags">{keyTags.map(tag => <span key={tag} className="am-key-tag">{tag}</span>)}</div> : <div className="am-detail-text">{t('Score this role to extract its main skills and requirements.')}</div>}<div className="am-detail-label am-detail-score-label">{t('Match score')}</div><div className="am-detail-text">{job.score == null ? t('Not scored yet.') : `${t('Scored at')} ${job.score}% ${t('against your resume.')}`}</div>{!job.url && <div className="am-detail-text">{t('No original link saved.')}</div>}</div></div>
         <div className="am-detail-actions">{job.url && <a className="am-detail-action" href={job.url} target="_blank" rel="noreferrer">{t('Open original')} <ExternalLink size={11} /></a>}<a className="am-detail-action primary" href={`${settings.apiBaseUrl}/?page=jobs&highlight=${job.id}`} target="_blank" rel="noreferrer">{t('Open in My Jobs')} <ArrowRight size={11} /></a></div>
       </div>}
     </article>
@@ -721,7 +721,7 @@ function ApplicationPackSummary({ hasResume, hasCoverLetter, ready, preparing, s
   onPrepare: () => void
   onDownload: () => void
 }) {
-  const { t } = useExtensionI18n()
+  const { lang, t } = useExtensionI18n()
   const rows = [
     { label: t('Resume'), icon: FileText, done: hasResume },
     { label: t('Cover letter'), icon: Mail, done: hasCoverLetter },
@@ -734,7 +734,7 @@ function ApplicationPackSummary({ hasResume, hasCoverLetter, ready, preparing, s
     <div className="am-pack-rows">{rows.map(({ label, icon: Icon, done }, index) => { const active = preparing && ((stage === 'resume' && index === 0) || (stage === 'coverLetter' && index === 1) || (stage === 'audit' && index === 2)); return <div className="am-pack-row" key={label}><span className={`am-pack-icon${done ? ' done' : active ? ' active' : ''}`}><Icon size={10} aria-hidden="true" /></span><span className="am-pack-row-label">{label}</span><span className={`am-pack-status${done ? ' done' : active ? ' active' : ''}`}>{done ? <><Check size={9} /> {t('Ready')}</> : active ? t('Working…') : t('Pending')}</span></div> })}</div>
     {preparing && <div className="am-pack-progress">{stageLabel}</div>}
     <div className="am-pack-actions"><button className="am-pack-prepare" type="button" disabled={ready || preparing} onClick={onPrepare}>{preparing ? stageLabel : ready ? t('Pack ready') : t('Prepare full pack')} {!ready && !preparing && <ArrowRight size={10} />}</button><button className="am-pack-download" type="button" disabled={!ready || exporting} onClick={onDownload} aria-label={t('Download application pack')} title={ready ? t('Download application pack') : t('Complete the pack first')}><Download size={11} />{exporting ? '…' : t('Download')}</button></div>
-    {error && <div className="am-pack-error" role="status">{error}</div>}
+    {error && <div className="am-pack-error" role="status">{lang === 'zh' ? t('Something went wrong') : error}</div>}
   </div>
 }
 

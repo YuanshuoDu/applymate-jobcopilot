@@ -112,7 +112,7 @@ export function ToastProvider({ children }: { children: React.ReactNode }) {
   const localize = useCallback((text?: string) => {
     if (!text || lang === 'en') return text
     const key = TOAST_TRANSLATION_KEYS[text]
-    return key ? t(key) : text
+    return key ? t(key) : t(text === 'Error' ? 'toast.error' : 'toast.genericDetail')
   }, [lang, t])
   const add = useCallback((variant: ToastItem['variant'], title: string, description?: string) => {
     const id = Date.now()

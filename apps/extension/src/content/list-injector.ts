@@ -1052,7 +1052,7 @@ async function runActionCardAction(action: string, card: Element, job: CardJob, 
       const matchResponse = await sendRuntimeMessage<{ success?: boolean; job?: SavedJob; error?: string }>({ type: 'MATCH_JOB', job: savedJob })
       if (!matchResponse?.success || !matchResponse.job) throw new Error(matchResponse?.error ?? uiText('Matching failed.'))
       const updatedJob = matchResponse.job
-      button.innerHTML = `<span>✓</span><strong>Matched ${updatedJob.score ?? 0}%</strong>`
+      button.innerHTML = `<span>✓</span><strong>${uiText('Matched')} ${updatedJob.score ?? 0}%</strong>`
       button.disabled = false
       return
     }

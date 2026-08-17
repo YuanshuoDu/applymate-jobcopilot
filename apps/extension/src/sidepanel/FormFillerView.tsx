@@ -240,7 +240,7 @@ export function FormFillerView({ settings, pendingFields, onFieldsConsumed, scan
   personaUpdateTrigger?: number
   onPersonaUpdated?: () => void
 }) {
-  const { t } = useExtensionI18n()
+  const { lang, t } = useExtensionI18n()
   const [viewState, setViewState] = useState<ViewState>('idle')
   const [fields, setFields] = useState<FormFieldSchema[]>([])
   const [filledFields, setFilledFields] = useState<FilledField[]>([])
@@ -848,7 +848,7 @@ export function FormFillerView({ settings, pendingFields, onFieldsConsumed, scan
           <div className="am-form-state-icon"><AlertTriangle size={22} /></div>
           <span className="am-form-eyebrow">{t('FORM AUTO-FILL')}</span>
           <h2>{t('We could not scan this page')}</h2>
-          <p>{errorMsg}</p>
+          <p>{lang === 'zh' ? t('Something went wrong') : errorMsg}</p>
           <div className="am-form-actions">
             <button className="am-form-button primary" onClick={() => fields.length > 0 ? analyzeFields(fields) : handleScanPage()}>
               <RefreshCw size={14} />
