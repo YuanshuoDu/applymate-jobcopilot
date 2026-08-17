@@ -4,6 +4,7 @@ import React from 'react'
 import { apiMutate } from '@/lib/hooks'
 import type { AgentAutomation } from './AutomationRow'
 import { submissionPolicy, submissionPolicyValues, type SubmissionPolicy } from './automation-policy'
+import { useI18n } from '@/lib/i18n'
 
 interface FormState {
   name: string
@@ -78,6 +79,7 @@ export function AutomationCreateModal({
   onAskAgent: () => void
   automation?: AgentAutomation | null
 }) {
+  const { t } = useI18n()
   const editing = Boolean(automation)
   const [form, setForm] = React.useState<FormState>(() => automation ? formFromAutomation(automation) : DEFAULT_FORM)
   const [saving, setSaving] = React.useState(false)
@@ -106,7 +108,7 @@ export function AutomationCreateModal({
     event.preventDefault()
     const name = form.name.trim()
     if (!name) {
-      setError('Automation name is required.')
+      setError(t('agent.automationNameRequired'))
       return
     }
 
@@ -139,44 +141,44 @@ export function AutomationCreateModal({
       onSaved()
       onClose()
     } catch (error) {
-      setError((error as Error).message || 'Automation save failed.')
+      setError((error as Error).message || t('agent.saveFailed'))
     } finally {
       setSaving(false)
     }
   }
 
   return (
-    <div style={backdropStyle} role="dialog" aria-modal="true" aria-label={editing ? 'Edit automation' : 'Create automation'}>
+    <div style={backdropStyle} role="dialog" aria-modal="true" aria-label={editing ? t('agent.editAutomation') : t('agent.createAutomation')}>
       <form onSubmit={submit} style={modalStyle}>
         <div style={{ display: 'flex', justifyContent: 'space-between', gap: 12, marginBottom: 12 }}>
           <div>
-            <div style={{ fontSize: 14, fontWeight: 750, color: 'var(--text)' }}>{editing ? 'Edit automation' : 'Create automation'}</div>
-            <div style={{ fontSize: 10, color: 'var(--text-muted)', marginTop: 3 }}>{editing ? 'Update this agent routine.' : 'Manual setup for agent routines.'}</div>
+            <div style={{ fontSize: 14, fontWeight: 750, color: 'var(--text)' }}>{editing ? t('agent.editAutomation') : t('agent.createAutomation')}</div>
+            <div style={{ fontSize: 10, color: 'var(--text-muted)', marginTop: 3 }}>{editing ? t('agent.updateRoutine') : t('agent.manualSetup')}</div>
           </div>
-          <button type="button" onClick={onClose} style={iconButtonStyle} aria-label="Close">x</button>
+          <button type="button" onClick={onClose} style={iconButtonStyle} aria-label={t('agent.close')}>x</button>
         </div>
 
-        <Field label="Name">
+        <Field label={t('auth.register.name')}>
           <input value={form.name} onChange={e => update('name', e.target.value)} style={inputStyle} autoFocus />
         </Field>
 
         <div style={{ display: 'grid', gridTemplateColumns: '1fr 92px', gap: 9 }}>
-          <Field label="Trigger">
+          <Field label={t('agent.trigger')}>
             <select value={form.triggerType} onChange={e => update('triggerType', e.target.value)} style={inputStyle}>
-              <option value="weekdays">Weekdays</option>
-              <option value="daily">Daily</option>
-              <option value="manual">Manual only</option>
+              <option value="weekdays">{t('agent.weekdays')}</option>
+              <option value="daily">{t('agent.daily')}</option>
+              <option value="manual">{t('agent.manualOnly')}</option>
             </select>
           </Field>
-          <Field label="Time">
+          <Field label={t('agent.time')}>
             <input type="time" value={form.time} onChange={e => update('time', e.target.value)} disabled={form.triggerType === 'manual'} style={inputStyle} />
           </Field>
         </div>
 
-        <Field label="Roles">
+        <Field label={t('agent.roles')}>
           <input value={form.targetRoles} onChange={e => update('targetRoles', e.target.value)} placeholder="Software Engineer, Backend Engineer" style={inputStyle} />
         </Field>
-        <Field label="Locations">
+        <Field label={t('agent.locations')}>
           <input value={form.targetLocations} onChange={e => update('targetLocations', e.target.value)} placeholder="Berlin, Amsterdam" style={inputStyle} />
         </Field>
 
@@ -184,37 +186,37 @@ export function AutomationCreateModal({
           <Field label={`Score ${form.minScore}+`}>
             <input type="range" min={0} max={100} value={form.minScore} onChange={e => update('minScore', Number(e.target.value))} style={{ width: '100%' }} />
           </Field>
-          <Field label="Daily cap">
+          <Field label={t('agent.dailyCap')}>
             <input type="number" min={1} max={50} value={form.dailyCap} onChange={e => update('dailyCap', Number(e.target.value))} style={inputStyle} />
           </Field>
         </div>
 
         <fieldset style={policyFieldsetStyle}>
-          <legend style={policyLegendStyle}>Submission policy</legend>
+          <legend style={policyLegendStyle}>{t('agent.submissionPolicy')}</legend>
           <label style={checkStyle}>
             <input type="radio" name="submission-policy" checked={policy === 'review'} onChange={() => choosePolicy('review')} />
-            Review every application before submission
+            {t('agent.reviewEvery')}
           </label>
           <label style={checkStyle}>
             <input type="radio" name="submission-policy" checked={policy === 'autopilot'} onChange={() => choosePolicy('autopilot')} />
-            Unattended auto-apply for eligible roles
+            {t('agent.unattendedApply')}
           </label>
           <div role="status" aria-live="polite" style={policyNoteStyle}>
             {policy === 'autopilot'
-              ? `Eligible jobs are submitted without another review, up to ${form.dailyCap} per day. If a started attempt cannot be confirmed, it is held for review and never retried automatically. LinkedIn and Indeed stay excluded.`
-              : 'Jobs are prepared and held for your review; nothing is submitted automatically.'}
+              ? `${t('agent.autopilotNote')} (${form.dailyCap}/day)`
+              : t('agent.reviewNote')}
           </div>
         </fieldset>
 
         {error && <div style={errorStyle}>{error}</div>}
 
         <div style={{ display: 'flex', justifyContent: 'space-between', gap: 8, marginTop: 14 }}>
-          {!editing && <button type="button" onClick={onAskAgent} style={secondaryButtonStyle}>Ask agent instead</button>}
+          {!editing && <button type="button" onClick={onAskAgent} style={secondaryButtonStyle}>{t('agent.askInstead')}</button>}
           {editing && <span />}
           <div style={{ display: 'flex', gap: 8 }}>
-            <button type="button" onClick={onClose} style={secondaryButtonStyle}>Cancel</button>
+            <button type="button" onClick={onClose} style={secondaryButtonStyle}>{t('agent.cancel')}</button>
             <button type="submit" disabled={saving} style={{ ...primaryButtonStyle, opacity: saving ? 0.7 : 1 }}>
-              {saving ? (editing ? 'Saving...' : 'Creating...') : (editing ? 'Save' : 'Create')}
+              {saving ? (editing ? t('agent.saving') : t('agent.creatingAutomation')) : (editing ? t('agent.save') : t('agent.createButton'))}
             </button>
           </div>
         </div>

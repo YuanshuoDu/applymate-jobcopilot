@@ -3,6 +3,7 @@
 import React from 'react'
 import { useApi } from '@/lib/hooks'
 import type { AgentRole } from '@/lib/types'
+import { useI18n } from '@/lib/i18n'
 
 interface CustomAgentRow {
   id: string
@@ -23,6 +24,7 @@ const ROLE_LABEL: Record<string, string> = {
 }
 
 export function AgentTeamList({ onAddAgent }: { onAddAgent?: () => void }) {
+  const { t } = useI18n()
   const { data: roles, loading, error: rolesError, refetch: refetchRoles } = useApi<AgentRole[]>('/api/agent/roles')
   const { data: customAgents, error: customError, refetch: refetchCustomAgents } = useApi<CustomAgentRow[]>('/api/agent/roles/custom')
   const builtin = (roles ?? []).slice(0, 6)
@@ -39,17 +41,17 @@ export function AgentTeamList({ onAddAgent }: { onAddAgent?: () => void }) {
   }, [refetchCustomAgents, refetchRoles])
 
   return (
-    <Section title="Agent Team" action={onAddAgent ? { label: '+ Add', onClick: onAddAgent } : undefined}>
-      {loading && <Muted>Loading team...</Muted>}
-      {!loading && error && <Muted tone="error" title={error}>Agent team unavailable.</Muted>}
-      {!loading && !error && builtin.length === 0 && custom.length === 0 && <Muted>No agents configured.</Muted>}
+    <Section title={t('agent.team')} action={onAddAgent ? { label: `+ ${t('agent.add')}`, onClick: onAddAgent } : undefined}>
+      {loading && <Muted>{t('agent.loadingTeam')}</Muted>}
+      {!loading && error && <Muted tone="error" title={error}>{t('agent.teamUnavailable')}</Muted>}
+      {!loading && !error && builtin.length === 0 && custom.length === 0 && <Muted>{t('agent.noAgents')}</Muted>}
       {!error && builtin.map(role => (
         <TeamRow
           key={role.role}
           name={ROLE_LABEL[role.role] ?? role.role}
           model={role.model}
           enabled={role.enabled}
-          detail={role.lastResult?.summary ?? (role.lastRunAt ? 'recent activity' : 'idle')}
+          detail={role.lastResult?.summary ?? (role.lastRunAt ? t('agent.recentActivity') : t('agent.idle'))}
         />
       ))}
       {!error && custom.map(agent => (
@@ -58,7 +60,7 @@ export function AgentTeamList({ onAddAgent }: { onAddAgent?: () => void }) {
           name={`${agent.icon} ${agent.name}`}
           model={agent.model}
           enabled={agent.enabled}
-          detail="custom"
+          detail={t('agent.custom')}
         />
       ))}
     </Section>
