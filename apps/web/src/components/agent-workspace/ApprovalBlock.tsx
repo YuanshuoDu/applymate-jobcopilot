@@ -4,6 +4,7 @@ import React from 'react'
 import type { AgentTranscriptEvent } from './session-view-model'
 import { TranscriptActionButtons } from './TranscriptActionButtons'
 import type { TranscriptAction } from './TranscriptSpecialBlocks'
+import { useI18n } from '@/lib/i18n'
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return !!value && typeof value === 'object' && !Array.isArray(value)
@@ -27,6 +28,7 @@ export function ApprovalBlock({ event, border, acted, onAction }: {
   acted?: boolean
   onAction?: (action: TranscriptAction) => Promise<void> | void
 }) {
+  const { t } = useI18n()
   const payload = nestedRecord(event, 'approval')
   const impact = isRecord(payload.impact) ? payload.impact : {}
   const approvalId = text(payload.id) ?? text(payload.approvalId)
@@ -36,19 +38,19 @@ export function ApprovalBlock({ event, border, acted, onAction }: {
     <div>
       <BodyText>{event.body}</BodyText>
       <KeyValueGrid border={border} rows={[
-        ['Type', text(payload.type) ?? text(event.title) ?? 'approval'],
-        ['Status', status],
-        ['Impact', Object.entries(impact).map(([k, v]) => `${k}: ${text(v) ?? 'set'}`).join(' · ') || 'requires user decision'],
+        [t('agent.type'), text(payload.type) ?? text(event.title) ?? 'approval'],
+        [t('agent.status'), status],
+        [t('agent.impact'), Object.entries(impact).map(([k, v]) => `${k}: ${text(v) ?? 'set'}`).join(' · ') || t('agent.requiresDecision')],
       ]} />
       {acted ? (
         <div style={{ marginTop: 8, fontSize: 10, color: 'var(--c-success)', fontWeight: 650 }}>
-          Decision recorded in this session.
+          {t('agent.decisionRecorded')}
         </div>
       ) : (
         <TranscriptActionButtons actions={[
-          { label: 'Approve', onClick: () => onAction?.({ type: 'approval_response', approvalId, decision: 'approved', body: 'Approved the requested action.' }) },
-          { label: 'Review', onClick: () => onAction?.({ type: 'approval_response', approvalId, decision: 'review', body: 'Asked to review the requested action.' }) },
-          { label: 'Cancel', onClick: () => onAction?.({ type: 'approval_response', approvalId, decision: 'cancelled', body: 'Cancelled the requested action.' }) },
+          { label: t('agent.approve'), onClick: () => onAction?.({ type: 'approval_response', approvalId, decision: 'approved', body: 'Approved the requested action.' }) },
+          { label: t('agent.reviewAction'), onClick: () => onAction?.({ type: 'approval_response', approvalId, decision: 'review', body: 'Asked to review the requested action.' }) },
+          { label: t('agent.cancelAction'), onClick: () => onAction?.({ type: 'approval_response', approvalId, decision: 'cancelled', body: 'Cancelled the requested action.' }) },
         ]} />
       )}
     </div>
