@@ -1436,6 +1436,8 @@ const dict: Record<Lang, Record<string, string>> = {
     'jobSearch.industryExample': 'e.g. Software, Design',
     'jobSearch.locationOr': 'Location (OR syntax)',
     'jobSearch.locationOrExample': 'e.g. Germany OR Netherlands OR United Kingdom',
+    'adminPrompt.reasonTooShort': 'Reason must be at least 10 characters.',
+    'adminPrompt.continue': 'Continue',
 
     'lang.switch':       'Language',
   },
@@ -2875,6 +2877,8 @@ const dict: Record<Lang, Record<string, string>> = {
     'jobSearch.industryExample': '例如软件、设计',
     'jobSearch.locationOr': '地点（OR 语法）',
     'jobSearch.locationOrExample': '例如德国 OR 荷兰 OR 英国',
+    'adminPrompt.reasonTooShort': '原因至少需要 10 个字符。',
+    'adminPrompt.continue': '继续',
 
     'lang.switch':       'English',
   },
