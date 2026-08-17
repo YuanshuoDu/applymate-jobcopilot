@@ -9,6 +9,7 @@ import { Btn, Card } from '@/components/ui'
 import type { DeploymentReadiness } from '@/lib/admin/deployment-readiness'
 import { useApi } from '@/lib/hooks'
 import type { PlatformIntegrationStatus } from '@/lib/admin/integration-status'
+import { useI18n } from '@/lib/i18n'
 
 interface ObservabilityData {
   overall: {
@@ -76,23 +77,39 @@ function Bar({ label, value, max, color, sub }: { label: string; value: number; 
   )
 }
 
-function formatDuration(ms: number) {
-  if (!ms) return '0s'
+function formatDuration(ms: number, t: (key: string) => string) {
+  if (!ms) return `0${t('observability.seconds')}`
   const seconds = Math.round(ms / 1000)
-  if (seconds < 60) return `${seconds}s`
+  if (seconds < 60) return `${seconds}${t('observability.seconds')}`
   const minutes = Math.floor(seconds / 60)
   const rest = seconds % 60
-  return rest ? `${minutes}m ${rest}s` : `${minutes}m`
+  return rest ? `${minutes}${t('observability.minutes')} ${rest}${t('observability.seconds')}` : `${minutes}${t('observability.minutes')}`
 }
 
-function flowLabel(key: string) {
-  return key === 'patternCache' ? 'Pattern cache'
-    : key === 'llm' ? 'AI fallback'
-    : key === 'programmatic' ? 'Programmatic'
-    : 'Unknown'
+function flowLabel(key: string, t: (key: string) => string) {
+  return key === 'patternCache' ? t('observability.patternCache')
+    : key === 'llm' ? t('observability.aiFallback')
+    : key === 'programmatic' ? t('observability.programmatic')
+    : t('observability.unknown')
+}
+
+function platformLabel(label: string, t: (key: string) => string) {
+  const labels: Record<string, string> = {
+    'ApplyMate AI · MiniMax': 'observability.minimax',
+    Adzuna: 'observability.adzuna',
+    RapidAPI: 'observability.rapidapi',
+    'Google OAuth': 'observability.googleOAuth',
+    'GitHub OAuth': 'observability.githubOAuth',
+    Resend: 'observability.resend',
+    Database: 'observability.database',
+    Redis: 'observability.redis',
+    'Worker control': 'observability.workerControl',
+  }
+  return labels[label] ? t(labels[label]) : label
 }
 
 export function ObservabilityPage() {
+  const { t } = useI18n()
   const [days, setDays] = useState('30')
   const [atsType, setAtsType] = useState('')
   const observabilityUrl = `/api/admin/v1/observability?days=${days}${atsType ? `&atsType=${encodeURIComponent(atsType)}` : ''}`
@@ -108,17 +125,17 @@ export function ObservabilityPage() {
 
   return (
     <div style={{ height: '100%', overflowY: 'auto', background: 'var(--bg)' }}>
-      <TopBar title="Observability">
-        <label style={{ display: 'inline-flex', alignItems: 'center', gap: 5, fontSize: 11, color: 'var(--text-muted)' }}>Range<select value={days} onChange={event => setDays(event.target.value)}><option value="7">7d</option><option value="30">30d</option><option value="90">90d</option><option value="365">1y</option></select></label>
-        <label style={{ display: 'inline-flex', alignItems: 'center', gap: 5, fontSize: 11, color: 'var(--text-muted)' }}>ATS<select value={atsType} onChange={event => setAtsType(event.target.value)}><option value="">All</option>{(data?.byAts ?? []).map(ats => <option key={ats.atsType} value={ats.atsType}>{ats.atsType}</option>)}</select></label>
-        <Link href="/admin/plans" style={{ color: 'var(--text-muted)', fontSize: 12, textDecoration: 'none' }}>Manage plans</Link>
+      <TopBar title={t('observability.title')}>
+        <label style={{ display: 'inline-flex', alignItems: 'center', gap: 5, fontSize: 11, color: 'var(--text-muted)' }}>{t('observability.range')}<select value={days} onChange={event => setDays(event.target.value)}><option value="7">7d</option><option value="30">30d</option><option value="90">90d</option><option value="365">1y</option></select></label>
+        <label style={{ display: 'inline-flex', alignItems: 'center', gap: 5, fontSize: 11, color: 'var(--text-muted)' }}>ATS<select value={atsType} onChange={event => setAtsType(event.target.value)}><option value="">{t('admin.all')}</option>{(data?.byAts ?? []).map(ats => <option key={ats.atsType} value={ats.atsType}>{ats.atsType}</option>)}</select></label>
+        <Link href="/admin/plans" style={{ color: 'var(--text-muted)', fontSize: 12, textDecoration: 'none' }}>{t('observability.managePlans')}</Link>
         <Link href="/admin/users" style={{ display: 'inline-flex', alignItems: 'center', gap: 5, fontSize: 11, color: 'var(--text-muted)', textDecoration: 'none' }}>
-          User settings <ExternalLink size={12} aria-hidden="true" />
+          {t('observability.userSettings')} <ExternalLink size={12} aria-hidden="true" />
         </Link>
         <Btn small variant="ghost" onClick={refetch}>
           <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
             <RefreshCw size={13} aria-hidden="true" />
-            Refresh
+            {t('common.refresh')}
           </span>
         </Btn>
       </TopBar>
@@ -136,17 +153,17 @@ export function ObservabilityPage() {
         )}
 
         <section style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(170px, 1fr))', gap: 12 }}>
-          <StatCard label="Registered users" value={platformLoading ? '…' : String(platform?.users.total ?? 0)} sub={platform ? `${platform.users.byPlan.pro} Pro · ${platform.users.byPlan.enterprise} Team` : undefined} />
-          <StatCard label="Deletion queue" value={platformLoading ? '…' : String((platform?.deletionRequests.requested ?? 0) + (platform?.deletionRequests.processing ?? 0))} sub={platform ? `${platform.deletionRequests.processing} processing` : undefined} />
-          <StatCard label="Operational applies" value={platformLoading ? '…' : String(platform?.applies.total ?? 0)} sub="All users · operational count" />
+          <StatCard label={t('observability.registeredUsers')} value={platformLoading ? '…' : String(platform?.users.total ?? 0)} sub={platform ? `${platform.users.byPlan.pro} Pro · ${platform.users.byPlan.enterprise} Team` : undefined} />
+          <StatCard label={t('observability.deletionQueue')} value={platformLoading ? '…' : String((platform?.deletionRequests.requested ?? 0) + (platform?.deletionRequests.processing ?? 0))} sub={platform ? `${platform.deletionRequests.processing} ${t('observability.processing')}` : undefined} />
+          <StatCard label={t('observability.operationalApplies')} value={platformLoading ? '…' : String(platform?.applies.total ?? 0)} sub={t('observability.allUsersOperational')} />
         </section>
-        <Card style={{ padding: 16 }}><h2 style={{ margin: '0 0 14px', fontSize: 14 }}>Trend</h2>{(data?.trend?.length ?? 0) === 0 ? <div style={{ fontSize: 12, color: 'var(--text-muted)' }}>No trend data for this range.</div> : <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(70px, 1fr))', gap: 8, alignItems: 'end', minHeight: 130 }}>{data!.trend.map(point => <div key={point.day} title={`${point.count} applies · ${point.successRate}% success`} style={{ display: 'grid', gap: 5, justifyItems: 'center', fontSize: 10, color: 'var(--text-muted)' }}><div style={{ width: '100%', minHeight: 4, height: `${Math.max(point.count / Math.max(...data!.trend.map(item => item.count), 1) * 90, point.count ? 4 : 0)}px`, background: 'var(--primary)', borderRadius: 4 }} /><span>{new Date(point.day).toLocaleDateString(undefined, { month: 'short', day: 'numeric' })}</span></div>)}</div>}</Card>
+        <Card style={{ padding: 16 }}><h2 style={{ margin: '0 0 14px', fontSize: 14 }}>{t('observability.trend')}</h2>{(data?.trend?.length ?? 0) === 0 ? <div style={{ fontSize: 12, color: 'var(--text-muted)' }}>{t('observability.noTrend')}</div> : <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(70px, 1fr))', gap: 8, alignItems: 'end', minHeight: 130 }}>{data!.trend.map(point => <div key={point.day} title={`${point.count} ${t('observability.applies')} · ${point.successRate}% ${t('observability.success')}`} style={{ display: 'grid', gap: 5, justifyItems: 'center', fontSize: 10, color: 'var(--text-muted)' }}><div style={{ width: '100%', minHeight: 4, height: `${Math.max(point.count / Math.max(...data!.trend.map(item => item.count), 1) * 90, point.count ? 4 : 0)}px`, background: 'var(--primary)', borderRadius: 4 }} /><span>{new Date(point.day).toLocaleDateString(undefined, { month: 'short', day: 'numeric' })}</span></div>)}</div>}</Card>
 
         <Card style={{ padding: 16 }}>
           <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 10, marginBottom: 12 }}>
-            <h2 style={{ margin: 0, fontSize: 14 }}>Platform integrations</h2>
+            <h2 style={{ margin: 0, fontSize: 14 }}>{t('observability.integrations')}</h2>
             <Btn small variant="ghost" onClick={() => { refetch(); refetchPlatform() }} disabled={loading || platformLoading}>
-              <RefreshCw size={12} aria-hidden="true" /> Refresh all
+              <RefreshCw size={12} aria-hidden="true" /> {t('observability.refreshAll')}
             </Btn>
           </div>
           <div style={{ display: 'flex', flexWrap: 'wrap', gap: 7 }}>
@@ -164,36 +181,36 @@ export function ObservabilityPage() {
               ['Worker control', platform?.integrations.infrastructure.workerControl ?? false],
             ].map(([label, ready]) => (
               <span key={String(label)} style={{ fontSize: 10, padding: '4px 8px', borderRadius: 999, background: ready ? 'rgba(5,150,105,0.10)' : 'rgba(220,38,38,0.08)', color: ready ? 'var(--c-success)' : 'var(--c-danger)' }}>
-                {String(label)} · {ready ? 'ready' : 'not configured'}
+                {platformLabel(String(label), t)} · {ready ? t('observability.ready') : t('observability.notConfigured')}
               </span>
             ))}
           </div>
-          <div style={{ marginTop: 9, fontSize: 10, color: 'var(--text-muted)' }}>Health is configuration presence only; raw keys, OAuth tokens, and user content are never returned.</div>
-          {platform?.integrations.privacy && <div style={{ marginTop: 5, fontSize: 10, color: 'var(--text-muted)' }}>Privacy: usage analytics honor candidate consent · AI training pipeline is currently disabled.</div>}
+          <div style={{ marginTop: 9, fontSize: 10, color: 'var(--text-muted)' }}>{t('observability.healthDescription')}</div>
+          {platform?.integrations.privacy && <div style={{ marginTop: 5, fontSize: 10, color: 'var(--text-muted)' }}>{t('observability.privacyDescription')}</div>}
         </Card>
         <DeploymentReadinessPanel readiness={readiness} />
 
         <section style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(170px, 1fr))', gap: 12 }}>
-          <StatCard label="Analytics applies" value={loading ? '…' : String(overall?.total ?? 0)} sub="Consented analytics · all time" />
-          <StatCard label="Success rate" value={loading ? '…' : `${overall?.successRate ?? 0}%`} sub="Consented submitted / total" />
-          <StatCard label="Avg duration" value={loading ? '…' : formatDuration(overall?.avgDurationMs ?? 0)} sub="Consented analytics · all flows" />
+          <StatCard label={t('observability.analyticsApplies')} value={loading ? '…' : String(overall?.total ?? 0)} sub={t('observability.consentedAllTime')} />
+          <StatCard label={t('observability.successRate')} value={loading ? '…' : `${overall?.successRate ?? 0}%`} sub={t('observability.consentedSubmitted')} />
+          <StatCard label={t('observability.avgDuration')} value={loading ? '…' : formatDuration(overall?.avgDurationMs ?? 0, t)} sub={t('observability.consentedAllFlows')} />
           <StatCard
-            label="Last 24h"
+            label={t('observability.last24h')}
             value={loading ? '…' : String(overall?.last24h.count ?? 0)}
-            sub={`${overall?.last24h.successRate ?? 0}% success · consented analytics`}
+            sub={`${overall?.last24h.successRate ?? 0}% ${t('observability.success')} · ${t('observability.consentedAnalytics')}`}
           />
         </section>
 
         <section style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(300px, 1fr))', gap: 16 }}>
           <Card style={{ padding: 16 }}>
             <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline', marginBottom: 14 }}>
-              <h2 style={{ margin: 0, fontSize: 14 }}>By Flow Type</h2>
+              <h2 style={{ margin: 0, fontSize: 14 }}>{t('observability.byFlow')}</h2>
               <span style={{ fontSize: 11, color: 'var(--text-muted)' }}>{overall?.captchaErrors ?? 0} CAPTCHA · {overall?.captchaRate ?? 0}%</span>
             </div>
             {flowEntries.map(({ key, value }) => (
               <Bar
                 key={key}
-                label={flowLabel(key)}
+                label={flowLabel(key, t)}
                 value={value}
                 max={maxFlow}
                 color={FLOW_COLORS[key] ?? 'var(--primary)'}
@@ -202,9 +219,9 @@ export function ObservabilityPage() {
           </Card>
 
           <Card style={{ padding: 16 }}>
-            <h2 style={{ margin: '0 0 14px', fontSize: 14 }}>By ATS Type</h2>
+            <h2 style={{ margin: '0 0 14px', fontSize: 14 }}>{t('observability.byAts')}</h2>
             {(data?.byAts.length ?? 0) === 0 ? (
-              <div style={{ fontSize: 12, color: 'var(--text-muted)' }}>No apply results yet.</div>
+              <div style={{ fontSize: 12, color: 'var(--text-muted)' }}>{t('observability.noApplyResults')}</div>
             ) : data!.byAts.map((ats, idx) => (
               <Bar
                 key={ats.atsType}
@@ -212,7 +229,7 @@ export function ObservabilityPage() {
                 value={ats.count}
                 max={maxAts}
                 color={idx % 2 === 0 ? 'var(--primary)' : 'var(--accent)'}
-                sub={`${ats.successRate}% success`}
+                sub={`${ats.successRate}% ${t('observability.success')}`}
               />
             ))}
           </Card>
