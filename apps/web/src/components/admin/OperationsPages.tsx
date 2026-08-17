@@ -9,19 +9,21 @@ import { AdminAiUsageTrends } from './AdminAiUsageTrends'
 import { useAdminPrompt } from './AdminPromptDialog'
 import { adminMutationHeaders } from '@/lib/admin/client'
 import Link from 'next/link'
+import { useI18n } from '@/lib/i18n'
 
 function ApplicationActions({ row, permissions }: { row: Record<string, unknown>; permissions: readonly string[] }) {
+  const { t } = useI18n()
   const { request, dialog } = useAdminPrompt()
   const taskId = typeof row.taskId === 'string' ? row.taskId : null
   if (!taskId) return <span>-</span>
   async function act(action: 'retry' | 'cancel' | 'manual_review') {
-    const reason = await request({ title: 'Confirm application action', label: 'Operational reason', kind: 'reason', description: 'This reason will be written to the administrator audit log.', submitLabel: 'Continue' })
+    const reason = await request({ title: t('ops.confirmApplicationAction'), label: t('ops.operationalReason'), kind: 'reason', description: t('ops.auditReasonDescription'), submitLabel: t('ops.continue') })
     if (!reason) return
     const response = await fetch(`/api/admin/v1/applications/${taskId}/action`, { method: 'POST', headers: adminMutationHeaders(), body: JSON.stringify({ action, reason }) })
     if (response.ok) window.location.reload()
   }
   const status = String(row.taskStatus ?? '')
-  return <><span className="admin-action-group">{permissions.includes('applications.retry') && ['failed', 'cancelled'].includes(status) && <button className="admin-row-action" title="Retry application" onClick={() => void act('retry')}>Retry</button>}{permissions.includes('applications.manual_review') && !['submitted', 'cancelled'].includes(status) && <button className="admin-row-action" title="Move to manual review" onClick={() => void act('manual_review')}>Review</button>}{permissions.includes('applications.cancel') && !['submitted', 'skipped', 'cancelled'].includes(status) && <button className="admin-row-action" title="Cancel application" onClick={() => void act('cancel')}>Cancel</button>}</span>{dialog}</>
+  return <><span className="admin-action-group">{permissions.includes('applications.retry') && ['failed', 'cancelled'].includes(status) && <button className="admin-row-action" title={t('ops.retryApplication')} onClick={() => void act('retry')}>{t('ops.retry')}</button>}{permissions.includes('applications.manual_review') && !['submitted', 'cancelled'].includes(status) && <button className="admin-row-action" title={t('ops.manualReview')} onClick={() => void act('manual_review')}>{t('ops.review')}</button>}{permissions.includes('applications.cancel') && !['submitted', 'skipped', 'cancelled'].includes(status) && <button className="admin-row-action" title={t('ops.cancelApplication')} onClick={() => void act('cancel')}>{t('ops.cancel')}</button>}</span>{dialog}</>
 }
 
 export function AdminUsersPage({ canExport = false, permissions = [] }: { canExport?: boolean; permissions?: readonly string[] }) {
