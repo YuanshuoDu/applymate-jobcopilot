@@ -25,14 +25,14 @@ export function AdminUserApiKeysPanel({ userId, canRevoke }: { userId: string; c
     const response = await fetch(`/api/admin/v1/users/${userId}/api-keys`, { cache: 'no-store' })
     const payload = await response.json().catch(() => null) as { keys?: ApiKeyStatus | null; error?: string } | null
     setKeys(payload?.keys ?? null)
-    if (!response.ok) setNotice(payload?.error ?? 'Unable to load user API key status.')
+    if (!response.ok) setNotice(payload?.error ?? t('adminKeys.loadFailed'))
     setLoading(false)
   }
 
   useEffect(() => { void load() }, [userId])
 
   async function revoke() {
-    const reason = await request({ title: 'Revoke user API keys', label: 'Audit reason', kind: 'reason', description: 'This permanently removes the user-managed provider credentials from ApplyMate.' })
+    const reason = await request({ title: t('adminKeys.revokeTitle'), label: t('admin.reason'), kind: 'reason', description: t('adminKeys.revokeDescription') })
     if (!reason) return
     setBusy(true)
     const response = await fetch(`/api/admin/v1/users/${userId}/api-keys`, { method: 'DELETE', headers: { ...adminMutationHeaders({ json: false }), 'x-admin-reason': reason } })

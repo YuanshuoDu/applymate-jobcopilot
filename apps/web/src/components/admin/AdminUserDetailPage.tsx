@@ -84,7 +84,7 @@ function AccountOperations({ userId, user, permissions }: { userId: string; user
   }, [permissions, userId])
 
   async function mutate(url: string, body: Record<string, unknown>, message: string) {
-    const reason = await request({ title: 'Confirm account operation', label: 'Reason', kind: 'reason', description: 'This action is audited and requires an operational reason.', submitLabel: 'Continue' })
+    const reason = await request({ title: t('adminDetail.confirmOperation'), label: t('admin.reason'), kind: 'reason', description: t('adminDetail.operationReason'), submitLabel: t('common.continue') })
     if (!reason) return
     setBusy(true)
     const response = await fetch(url, { method: 'PATCH', headers: adminMutationHeaders(), body: JSON.stringify({ ...body, reason }) })
@@ -96,7 +96,7 @@ function AccountOperations({ userId, user, permissions }: { userId: string; user
   }
 
   async function saveSubscription() {
-    const reason = await request({ title: 'Save package settings', label: 'Reason', kind: 'reason', description: 'Plan, trial and subscription changes are audited and version checked.', submitLabel: 'Save package settings' })
+    const reason = await request({ title: t('adminDetail.savePackageTitle'), label: t('admin.reason'), kind: 'reason', description: t('adminDetail.packageReason'), submitLabel: t('adminDetail.savePackage') })
     if (!reason) return
     setBusy(true)
     try {
@@ -125,7 +125,7 @@ function AccountOperations({ userId, user, permissions }: { userId: string; user
   }
 
   async function removeOverride(item: Override) {
-    const reason = await request({ title: 'Remove user permission override', label: 'Reason', kind: 'reason', description: `The user will inherit the ${item.featureKey} permission from their package again.`, submitLabel: 'Remove override' })
+    const reason = await request({ title: t('adminDetail.removeOverrideTitle'), label: t('admin.reason'), kind: 'reason', description: t('adminDetail.removeOverrideDescription'), submitLabel: t('adminDetail.removeOverride') })
     if (!reason) return
     setBusy(true)
     const response = await fetch(`/api/admin/v1/users/${userId}/feature-overrides?featureKey=${encodeURIComponent(item.featureKey)}&reason=${encodeURIComponent(reason)}`, { method: 'DELETE', headers: adminMutationHeaders({ json: false }) })
