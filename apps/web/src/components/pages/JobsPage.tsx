@@ -936,7 +936,7 @@ function JobDetailDrawer({ job, onClose, onStatusChange, onUpdate, onDelete, onO
                 <button
                   onClick={() => { setFollowUpAt(''); saveFollowUpAt('') }}
                   style={{ marginTop: 4, fontSize: 10, color: 'var(--text-muted)', background: 'none', border: 'none', cursor: 'pointer', padding: 0 }}>
-                  ✕ Clear date
+                  ✕ {t('jobs.clearDate')}
                 </button>
               )}
             </div>
@@ -946,7 +946,7 @@ function JobDetailDrawer({ job, onClose, onStatusChange, onUpdate, onDelete, onO
           <div>
             <div style={{ fontSize: 10, color: 'var(--text-muted)', fontWeight: 500, marginBottom: 6, display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
               <span>{t('jobs.drawer.notes')}</span>
-              {savingNotes && <span style={{ fontSize: 9, color: 'var(--text-muted)' }}>Saving…</span>}
+              {savingNotes && <span style={{ fontSize: 9, color: 'var(--text-muted)' }}>{t('jobs.saving')}</span>}
             </div>
             <textarea
               value={notes}

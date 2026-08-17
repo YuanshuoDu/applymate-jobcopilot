@@ -1113,7 +1113,7 @@ function ApiKeysSettings() {
               return (
                 <div key={provider} style={{ display: 'flex', gap: 6 }}>
                   <button type="button" onClick={() => testConnection(provider)} disabled={!configured || test === 'testing' || keyClearing !== null} style={{ padding: '7px 10px', fontSize: 11, borderRadius: 7, border: '0.5px solid var(--border)', background: 'var(--bg-secondary)', color: test === 'ok' ? 'var(--c-success)' : 'var(--text)', cursor: configured && test !== 'testing' && keyClearing === null ? 'pointer' : 'default', opacity: configured ? 1 : 0.5 }} title={typeof test === 'object' ? test.error : undefined}>
-                    {test === 'testing' ? 'Testing…' : test === 'ok' ? 'Connected ✓' : label}
+                    {test === 'testing' ? t('settings.testing') : test === 'ok' ? t('settings.connectedCheck') : label}
                   </button>
                   {userConfigured && (
                     <button type="button" onClick={() => void clearKey(provider)} disabled={keyClearing !== null || saving} style={{ padding: '7px 8px', fontSize: 11, borderRadius: 7, border: '0.5px solid var(--border)', background: 'transparent', color: 'var(--c-danger)', cursor: keyClearing === null && !saving ? 'pointer' : 'default', opacity: keyClearing === provider ? 0.6 : 1 }}>
