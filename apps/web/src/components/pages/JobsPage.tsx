@@ -436,6 +436,7 @@ function JobDetailDrawer({ job, onClose, onStatusChange, onUpdate, onDelete, onO
   onDelete:       (id: string) => void
   onOpenTailoredResume: (resumeId: string) => void
 }) {
+  const { t } = useI18n()
   const toast = useToast()
   const [confirm, ConfirmDialog] = useConfirm()
   const [notes,        setNotes]        = useState(job.notes ?? '')
@@ -809,20 +810,20 @@ function JobDetailDrawer({ job, onClose, onStatusChange, onUpdate, onDelete, onO
         <ReferenceProgress ready={currentPackAudited} />
 
         {applicationPreflight.issues.length > 0 && <div style={{ margin: '18px 28px 0', padding: '12px 14px', borderRadius: 9, border: '1px solid #fbbf24', background: '#fffbeb', color: '#78350f', fontSize: 12, lineHeight: 1.5 }}>
-          <strong>{applicationPreflight.canPrepare ? 'Manual-only listing' : 'Application data needs correction'}</strong>
+          <strong>{applicationPreflight.canPrepare ? t('jobs.drawer.manualOnly') : t('jobs.drawer.dataNeedsCorrection')}</strong>
           <div style={{ marginTop: 4 }}>{applicationPreflight.issues.map(issue => issue.message).join(' ')}</div>
-          <div style={{ marginTop: 5, color: '#92400e' }}>{applicationPreflight.canPrepare ? 'You may prepare materials, but the Agent will not fill or submit this destination.' : 'Materials and form filling are paused until the company and job description are corrected.'}</div>
+          <div style={{ marginTop: 5, color: '#92400e' }}>{applicationPreflight.canPrepare ? t('jobs.drawer.manualOnlyHint') : t('jobs.drawer.correctionHint')}</div>
         </div>}
 
         {/* Body */}
         <div style={{ flex: 1, padding: '26px 28px', display: 'flex', flexDirection: 'column', gap: 24 }}>
 
           <section style={{ borderBottom: '1px solid var(--border)', padding: '18px 0 22px' }}>
-            <div style={{ display: 'flex', alignItems: 'center', gap: 9, fontSize: 11, fontWeight: 700, letterSpacing: '0.03em', color: '#64748b', marginBottom: 18 }}><Sparkles size={16} strokeWidth={2.4} style={{ color: '#2563eb', flexShrink: 0 }} />NEXT BEST ACTION</div>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 9, fontSize: 11, fontWeight: 700, letterSpacing: '0.03em', color: '#64748b', marginBottom: 18 }}><Sparkles size={16} strokeWidth={2.4} style={{ color: '#2563eb', flexShrink: 0 }} />{t('jobs.drawer.nextAction')}</div>
             <div style={{ fontSize: 20, lineHeight: 1.25, fontWeight: 700, letterSpacing: '-0.025em' }}>{currentPackAudited ? 'Application pack is ready' : auditRetryOnly ? 'Retry the independent audit' : auditNeedsEvidence ? 'Confirm the missing evidence' : auditNeedsRepair ? 'Correct factual issues before applying' : existingTailoredResume ? 'Resume is tailored for this job' : 'Tailor your resume for this job'}</div>
             <div style={{ fontSize: 14, lineHeight: 1.5, color: 'var(--text-muted)', margin: '7px 0 16px' }}>{currentPackAudited ? 'The same audited resume and cover letter selected in the extension are ready to review and download.' : auditRetryOnly ? 'Your resume and cover letter are unchanged. The auditor needs to return a structured result before you can continue.' : auditNeedsEvidence ? 'The auditor could not verify a claim from the current Persona. Add the accurate fact below; this is not a finding of fabrication.' : auditNeedsRepair ? 'The Auditor found unsupported claims. AI will rewrite only the affected document sections, then run the audit again.' : existingTailoredResume ? 'Review the AI-tailored version before preparing the application pack.' : 'Create a role-specific version, review it in Resume, then return here.'}</div>
 
-            {auditNeedsRepair && <div style={{ marginBottom: 16, padding: '12px 14px', border: '1px solid #fecaca', background: '#fff7f7', borderRadius: 9 }}><div style={{ fontSize: 12, fontWeight: 800, color: '#b42318', marginBottom: 7 }}>FACTUAL ISSUES TO FIX</div>{factualAuditFindings.slice(0, 2).map((finding, index) => <div key={`${finding.title}-${index}`} style={{ color: '#7f1d1d', fontSize: 12, lineHeight: 1.45, marginTop: index ? 6 : 0 }}><strong>{finding.title}</strong><br />{finding.action}</div>)}</div>}
+            {auditNeedsRepair && <div style={{ marginBottom: 16, padding: '12px 14px', border: '1px solid #fecaca', background: '#fff7f7', borderRadius: 9 }}><div style={{ fontSize: 12, fontWeight: 800, color: '#b42318', marginBottom: 7 }}>{t('jobs.drawer.factualIssues')}</div>{factualAuditFindings.slice(0, 2).map((finding, index) => <div key={`${finding.title}-${index}`} style={{ color: '#7f1d1d', fontSize: 12, lineHeight: 1.45, marginTop: index ? 6 : 0 }}><strong>{finding.title}</strong><br />{finding.action}</div>)}</div>}
 
             {existingTailoredResume ? (
               <button onClick={() => onOpenTailoredResume(existingTailoredResume.id)} style={workflowDocumentButton}>
@@ -839,7 +840,7 @@ function JobDetailDrawer({ job, onClose, onStatusChange, onUpdate, onDelete, onO
             <button onClick={() => auditNeedsEvidence ? setOpenPackItem('audit') : void autoTailorAndAudit()} disabled={packActionDisabled || currentPackAudited} style={{ width: '100%', minHeight: 56, padding: '14px', border: `2px solid ${packActionDisabled || currentPackAudited ? '#e2e8f0' : auditNeedsRepair ? '#dc2626' : '#2563eb'}`, borderRadius: 9, background: packActionDisabled || currentPackAudited ? '#f8fafc' : auditNeedsRepair ? '#fff7f7' : '#fff', color: packActionDisabled || currentPackAudited ? '#94a3b8' : auditNeedsRepair ? '#b42318' : '#2563eb', fontSize: 15, fontWeight: 700, cursor: packActionDisabled || currentPackAudited ? 'not-allowed' : 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 10, textAlign: 'center' }}><Sparkles size={19} style={{ flexShrink: 0 }} />{currentPackAudited ? 'Application pack ready' : autoPreparing ? 'Preparing application pack…' : auditNeedsEvidence ? 'Review evidence needed' : auditRetryOnly ? 'Retry independent audit' : auditNeedsRepair ? 'Fix with AI and re-audit' : 'Prepare full application pack automatically'}</button>
             {autoPreparing && <PreparationProgress stage={packStage} elapsed={preparationElapsed} />}
             <div style={{ textAlign: 'center', fontSize: 13, lineHeight: 1.55, color: 'var(--text-muted)', margin: '12px 28px 28px' }}>{auditRetryOnly ? 'Retrying the audit reuses your current resume and cover letter; it does not create new documents.' : auditNeedsEvidence ? 'Adding a confirmed fact saves it to Persona, then rewrites only the affected content.' : auditNeedsRepair ? 'This replaces unsupported claims; it does not invent experience, dates, or metrics.' : 'We’ll tailor your resume (if needed), generate a cover letter, and run an independent audit.'}</div>
-            <div style={{ borderTop: '1px solid var(--border)', paddingTop: 22, fontSize: 12, fontWeight: 700, letterSpacing: '0.03em', color: '#64748b' }}>APPLICATION PACK</div>
+            <div style={{ borderTop: '1px solid var(--border)', paddingTop: 22, fontSize: 12, fontWeight: 700, letterSpacing: '0.03em', color: '#64748b' }}>{t('jobs.drawer.applicationPack')}</div>
             <style>{`@keyframes pack-line-grow { from { transform: scaleY(0) } to { transform: scaleY(1) } } @keyframes pack-pulse { 0%,100% { box-shadow: 0 0 0 0 rgba(37,99,235,.35) } 50% { box-shadow: 0 0 0 7px rgba(37,99,235,0) } }`}</style>
             <PackRow number="1" title="Resume" detail={packStage === 'resume' ? 'AI tailoring this resume…' : 'Tailored for this role'} done={Boolean(previewResumeId)} active={packStage === 'resume'} open={openPackItem === 'resume'} onToggle={() => setOpenPackItem(current => current === 'resume' ? null : 'resume')}>
               <ResumePackPreview resume={resumePreview} onReview={() => setDocumentPreview('resume')} />
