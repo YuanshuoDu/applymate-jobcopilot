@@ -127,17 +127,17 @@ function RunPanel({ onClose, t }: { onClose: () => void; t: (key: string) => str
 
     es.addEventListener('start', e => {
       const d = JSON.parse(e.data)
-      addLog({ type: 'start', message: `🚀 Starting pipeline — ${d.total} saved job${d.total !== 1 ? 's' : ''} queued`, time: new Date() })
+      addLog({ type: 'start', message: `🚀 ${t('agent.log.starting')} — ${d.total} ${t('agent.log.savedJobsQueued')}`, time: new Date() })
     })
 
     es.addEventListener('job_start', e => {
       const d = JSON.parse(e.data)
-      addLog({ type: 'info', message: `  ⟳ Scoring ${d.company} · ${d.role}…`, time: new Date() })
+      addLog({ type: 'info', message: `  ⟳ ${t('agent.log.scoring')} ${d.company} · ${d.role}…`, time: new Date() })
     })
 
     es.addEventListener('job_done', e => {
       const d = JSON.parse(e.data)
-      const applied = d.autoApplied ? ' · ✓ Applied' : ''
+      const applied = d.autoApplied ? ` · ✓ ${t('agent.log.applied')}` : ''
       const kws = d.matchedKeywords?.length ? ` [${d.matchedKeywords.slice(0, 3).join(', ')}]` : ''
       addLog({
         type:    d.score >= 70 ? 'job_done' : 'job_skip',
@@ -168,7 +168,7 @@ function RunPanel({ onClose, t }: { onClose: () => void; t: (key: string) => str
       setCurrentStage(null)
       addLog({
         type: 'done',
-        message: `✓ Pipeline complete — ${d.processed} scored, ${d.queued ?? 0} dispatched, ${d.applied} confirmed, ${d.pending} pending review, ${d.skipped} skipped`,
+        message: `✓ ${t('agent.log.pipelineComplete')} — ${d.processed} ${t('agent.summaryScored').toLowerCase()}, ${d.queued ?? 0} ${t('agent.log.dispatched')}, ${d.applied} ${t('agent.log.confirmed')}, ${d.pending} ${t('agent.log.pendingReview')}, ${d.skipped} ${t('agent.log.skipped')}`,
         time: new Date(),
       })
       setRunning(false)
@@ -185,9 +185,9 @@ function RunPanel({ onClose, t }: { onClose: () => void; t: (key: string) => str
     es.addEventListener('error', e => {
       try {
         const d = JSON.parse((e as MessageEvent).data ?? '{}')
-        addLog({ type: 'error', message: `✗ ${d.message ?? 'Agent run failed'}`, time: new Date() })
+        addLog({ type: 'error', message: `✗ ${d.message ?? t('agent.log.runFailed')}`, time: new Date() })
       } catch {
-        addLog({ type: 'error', message: '✗ Connection lost', time: new Date() })
+        addLog({ type: 'error', message: `✗ ${t('agent.log.connectionLost')}`, time: new Date() })
       }
       setCurrentStage(null)
       setRunning(false)
@@ -202,7 +202,7 @@ function RunPanel({ onClose, t }: { onClose: () => void; t: (key: string) => str
     setRunning(false)
     setDone(true)
     setCurrentStage(null)
-    addLog({ type: 'info', message: '— Run stopped by user', time: new Date() })
+    addLog({ type: 'info', message: `— ${t('agent.log.runStopped')}`, time: new Date() })
   }
 
   function logColor(entry: LogEntry): string {
@@ -249,11 +249,11 @@ function RunPanel({ onClose, t }: { onClose: () => void; t: (key: string) => str
       {summary && (
         <div style={{ display: 'flex', gap: 0, borderBottom: '0.5px solid var(--border)' }}>
           {[
-            { label: 'Scored',   value: summary.processed, color: 'var(--primary)'   },
-            { label: 'Dispatched', value: summary.queued, color: 'var(--primary)' },
-            { label: 'Confirmed', value: summary.applied, color: 'var(--c-success)' },
-            { label: 'Review',   value: summary.pending,   color: 'var(--c-warning)' },
-            { label: 'Skipped',  value: summary.skipped,   color: 'var(--text-muted)' },
+            { label: t('agent.summaryScored'),   value: summary.processed, color: 'var(--primary)'   },
+            { label: t('agent.summaryDispatched'), value: summary.queued, color: 'var(--primary)' },
+            { label: t('agent.summaryConfirmed'), value: summary.applied, color: 'var(--c-success)' },
+            { label: t('agent.summaryReview'),   value: summary.pending,   color: 'var(--c-warning)' },
+            { label: t('agent.summarySkipped'),  value: summary.skipped,   color: 'var(--text-muted)' },
           ].map((s, i) => (
             <div key={s.label} style={{ flex: 1, textAlign: 'center', padding: '8px 0', borderRight: i < 3 ? '0.5px solid var(--border)' : 'none' }}>
               <div style={{ fontSize: 18, fontWeight: 600, color: s.color }}>{s.value}</div>
@@ -267,7 +267,7 @@ function RunPanel({ onClose, t }: { onClose: () => void; t: (key: string) => str
       <div style={{ maxHeight: 220, overflowY: 'auto', padding: '8px 14px', background: 'var(--bg)', fontFamily: 'monospace' }}>
         {log.length === 0 ? (
           <div style={{ fontSize: 11, color: 'var(--text-muted)', padding: '12px 0', textAlign: 'center' }}>
-            Click ▶ Start Run to launch the 6-stage pipeline.
+            {t('agent.startRunHint')}
           </div>
         ) : log.map((entry, i) => (
           <div key={i} style={{ display: 'flex', gap: 10, marginBottom: 3, alignItems: 'flex-start' }}>
