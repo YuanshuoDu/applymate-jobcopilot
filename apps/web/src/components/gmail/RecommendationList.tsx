@@ -111,7 +111,8 @@ function platformSource(platform: string | null) {
 }
 
 function MatchValue({ value }: { value: number | null }) {
-  if (value === null) return <span className="recommendation-no-match">Not scored</span>
+  const { t } = useI18n()
+  if (value === null) return <span className="recommendation-no-match">{t('jobs.notScored')}</span>
   const score = Math.round(value <= 1 ? value * 100 : value)
   return <span className="recommendation-match"><strong>{score}%</strong><i style={{ width: `${Math.max(0, Math.min(score, 100))}%` }} /></span>
 }

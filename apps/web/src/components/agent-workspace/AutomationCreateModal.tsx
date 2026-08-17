@@ -176,10 +176,10 @@ export function AutomationCreateModal({
         </div>
 
         <Field label={t('agent.roles')}>
-          <input value={form.targetRoles} onChange={e => update('targetRoles', e.target.value)} placeholder="Software Engineer, Backend Engineer" style={inputStyle} />
+          <input value={form.targetRoles} onChange={e => update('targetRoles', e.target.value)} placeholder={t('agent.rolesPlaceholder')} style={inputStyle} />
         </Field>
         <Field label={t('agent.locations')}>
-          <input value={form.targetLocations} onChange={e => update('targetLocations', e.target.value)} placeholder="Berlin, Amsterdam" style={inputStyle} />
+          <input value={form.targetLocations} onChange={e => update('targetLocations', e.target.value)} placeholder={t('agent.locationsPlaceholder')} style={inputStyle} />
         </Field>
 
         <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 9 }}>
