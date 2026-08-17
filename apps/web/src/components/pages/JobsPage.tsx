@@ -1047,15 +1047,15 @@ function JobDetailDrawer({ job, onClose, onStatusChange, onUpdate, onDelete, onO
         </div>
 
         {documentPreview === 'resume' && resumePreview && <DocumentPreviewModal title={resumePreview.name} onClose={() => setDocumentPreview(null)}><ResumeRenderer content={resumePreview.content} templateId={resumePreview.templateId} templateOptions={resumePreview.templateOptions} /></DocumentPreviewModal>}
-        {documentPreview === 'coverLetter' && selectedCoverLetter && <DocumentPreviewModal title="AI-generated cover letter" onClose={() => setDocumentPreview(null)}><CoverLetterPreview content={selectedCoverLetter.content} applicant={resumePreview?.content.contact} fallbackName={resumePreview?.name ?? 'Applicant'} company={job.company} role={job.role} templateId={resumePreview?.templateId ?? selectedCoverLetter.templateId ?? 'clean'} templateOptions={resumePreview?.templateOptions ?? selectedCoverLetter.templateOptions ?? {}} /></DocumentPreviewModal>}
+        {documentPreview === 'coverLetter' && selectedCoverLetter && <DocumentPreviewModal title={t('jobs.coverLetterPreview')} onClose={() => setDocumentPreview(null)}><CoverLetterPreview content={selectedCoverLetter.content} applicant={resumePreview?.content.contact} fallbackName={resumePreview?.name ?? 'Applicant'} company={job.company} role={job.role} templateId={resumePreview?.templateId ?? selectedCoverLetter.templateId ?? 'clean'} templateOptions={resumePreview?.templateOptions ?? selectedCoverLetter.templateOptions ?? {}} /></DocumentPreviewModal>}
         {evidenceFinding && <EvidenceCaptureModal finding={evidenceFinding} value={evidenceText} saving={savingEvidence} onChange={setEvidenceText} onClose={() => !savingEvidence && setEvidenceFinding(null)} onSave={() => void saveEvidenceAndRewrite()} />}
 
         {/* Footer */}
         <div style={{ padding: '12px 18px', borderTop: '0.5px solid var(--border)', display: 'flex', gap: 8 }}>
           <Btn variant="danger" small disabled={deleting} onClick={handleDelete} style={{ flex: 1 }}>
-            {deleting ? 'Deleting…' : 'Delete Job'}
+            {deleting ? t('jobs.deleting') : `${t('jobs.delete')} job`}
           </Btn>
-          <Btn variant="primary" small onClick={onClose} style={{ flex: 1 }}>Close</Btn>
+          <Btn variant="primary" small onClick={onClose} style={{ flex: 1 }}>{t('jobs.close')}</Btn>
         </div>
       </div>
     </>
@@ -1159,9 +1159,10 @@ function CoverLetterPackPreview({ coverLetter, applicant, fallbackName, company,
 }
 
 function DocumentPreviewModal({ title, onClose, children }: { title: string; onClose: () => void; children: React.ReactNode }) {
+  const { t } = useI18n()
   return <div role="dialog" aria-modal="true" aria-label={title} style={{ position: 'fixed', inset: 0, zIndex: 130, display: 'grid', placeItems: 'center', padding: 24, background: 'rgba(15,23,42,.62)' }} onMouseDown={onClose}>
     <div style={{ width: 'min(920px, calc(100vw - 48px))', maxHeight: 'calc(100vh - 48px)', display: 'flex', flexDirection: 'column', overflow: 'hidden', background: '#f1f5f9', borderRadius: 14, boxShadow: '0 24px 80px rgba(15,23,42,.42)' }} onMouseDown={event => event.stopPropagation()}>
-      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 16, padding: '15px 20px', background: '#fff', borderBottom: '1px solid #dbe1ea' }}><div><div style={{ fontSize: 15, fontWeight: 700, color: '#0f172a' }}>{title}</div><div style={{ marginTop: 2, fontSize: 12, color: '#64748b' }}>Full application document preview</div></div><button onClick={onClose} aria-label="Close preview" style={{ display: 'grid', placeItems: 'center', width: 32, height: 32, border: 'none', borderRadius: 8, color: '#475569', background: '#f1f5f9', cursor: 'pointer' }}><X size={18} /></button></div>
+      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 16, padding: '15px 20px', background: '#fff', borderBottom: '1px solid #dbe1ea' }}><div><div style={{ fontSize: 15, fontWeight: 700, color: '#0f172a' }}>{title}</div><div style={{ marginTop: 2, fontSize: 12, color: '#64748b' }}>{t('jobs.documentPreview')}</div></div><button onClick={onClose} aria-label={t('jobs.closePreview')} style={{ display: 'grid', placeItems: 'center', width: 32, height: 32, border: 'none', borderRadius: 8, color: '#475569', background: '#f1f5f9', cursor: 'pointer' }}><X size={18} /></button></div>
       <div style={{ flex: 1, overflow: 'auto', padding: 24 }}>{children}</div>
     </div>
   </div>
