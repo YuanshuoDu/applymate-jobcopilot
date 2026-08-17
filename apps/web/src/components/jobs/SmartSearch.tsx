@@ -381,7 +381,7 @@ export function SmartSearch({ onJobSaved, onOpenSettings }: { onJobSaved?: () =>
             ? <><span style={{ width: 14, height: 14, border: '2px solid rgba(255,255,255,0.3)', borderTopColor: '#fff', borderRadius: '50%', animation: 'spin 0.7s linear infinite', display: 'inline-block' }} /> {t('jobs.searching')}</>
             : isStale
               ? <><Icon.Search /> {t('jobs.applyFilters')}</>
-              : <><Icon.Search /> {t('jobs.search')}</>
+              : <><Icon.Search /> {t('jobs.searchButton')}</>
           }
         </button>
 
