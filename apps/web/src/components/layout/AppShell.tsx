@@ -14,7 +14,8 @@ import { clearCachedApiResponses } from '@/lib/api-cache'
 import { pageFromSearch } from './page-routing'
 
 function PageLoading() {
-  return <div style={{ flex: 1, display: 'grid', placeItems: 'center', color: 'var(--text-muted)', fontSize: 13 }}>Loading…</div>
+  const { t } = useI18n()
+  return <div style={{ flex: 1, display: 'grid', placeItems: 'center', color: 'var(--text-muted)', fontSize: 13 }}>{t('common.loading')}</div>
 }
 
 const DashboardPage = dynamic(() => import('@/components/pages/DashboardPage').then(module => module.DashboardPage), { loading: PageLoading })
@@ -388,7 +389,7 @@ export function AppShell() {
             borderTopColor: '#4F46E5',
             animation: 'spin 0.7s linear infinite',
           }} />
-          <div style={{ fontSize: 12, color: 'var(--text-muted)', letterSpacing: '0.02em' }}>Loading…</div>
+          <div style={{ fontSize: 12, color: 'var(--text-muted)', letterSpacing: '0.02em' }}>{t('common.loading')}</div>
         </div>
       </div>
     )
@@ -449,7 +450,7 @@ export function AppShell() {
             </div>
 
             {mobileMoreOpen && (
-              <div className="mobile-more-menu" data-mobile-more-menu role="menu" aria-label="More navigation">
+              <div className="mobile-more-menu" data-mobile-more-menu role="menu" aria-label={t('nav.moreNavigation')}>
                 {getMobileMoreItems(t('nav.signout'), t).map(item => (
                   <button key={item.id} role="menuitem" data-danger={item.id === 'signout'} onClick={() => {
                     if (item.id === 'signout') void signOut({ callbackUrl: '/login' })

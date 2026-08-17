@@ -19,6 +19,7 @@ const COL_LABELS: Record<JobStatus, string> = {
   saved: 'Saved', applied: 'Applied',
   interview: 'Interview', offer: 'Offer', rejected: 'Rejected',
 }
+function colLabel(t: (key: string) => string, status: JobStatus) { return t(`jobs.status.${status}`) }
 const COL_COLORS: Record<JobStatus, string> = {
   saved: '#6B7280', applied: '#185FA5',
   interview: '#3B6D11', offer: '#0E7490', rejected: '#A32D2D',
@@ -101,6 +102,7 @@ function ListView({ jobs, onRowClick, selectedIds, onToggle, onToggleAll }: {
   onToggle: (id: string) => void
   onToggleAll: (ids: string[]) => void
 }) {
+  const { t } = useI18n()
   const [sort, setSort] = useState<{ col: string; dir: 'asc' | 'desc' }>({ col: 'date', dir: 'desc' })
 
   const sorted = useMemo(() => [...jobs].sort((a, b) => {
@@ -136,14 +138,14 @@ function ListView({ jobs, onRowClick, selectedIds, onToggle, onToggleAll }: {
         <thead>
           <tr style={{ background: 'var(--bg-secondary)' }}>
             <th style={{ width: 42, padding: '8px 12px', borderBottom: '0.5px solid var(--border)' }}>
-              <input type="checkbox" aria-label="Select all visible jobs" checked={allVisibleSelected} onChange={() => onToggleAll(visibleIds)} />
+              <input type="checkbox" aria-label={t('jobs.selectAll')} checked={allVisibleSelected} onChange={() => onToggleAll(visibleIds)} />
             </th>
-            <SortTh col="company" label="Company" />
-            <th style={{ padding: '8px 16px', textAlign: 'left', fontSize: 10, color: 'var(--text-muted)', fontWeight: 500, borderBottom: '0.5px solid var(--border)' }}>Role</th>
-            <th style={{ padding: '8px 16px', textAlign: 'left', fontSize: 10, color: 'var(--text-muted)', fontWeight: 500, borderBottom: '0.5px solid var(--border)' }}>Status</th>
+            <SortTh col="company" label={t('jobs.companyLabel')} />
+            <th style={{ padding: '8px 16px', textAlign: 'left', fontSize: 10, color: 'var(--text-muted)', fontWeight: 500, borderBottom: '0.5px solid var(--border)' }}>{t('jobs.roleLabel')}</th>
+            <th style={{ padding: '8px 16px', textAlign: 'left', fontSize: 10, color: 'var(--text-muted)', fontWeight: 500, borderBottom: '0.5px solid var(--border)' }}>{t('jobs.statusLabel')}</th>
             <SortTh col="score" label="Match" />
-            <SortTh col="date"  label="Added" />
-            <th style={{ padding: '8px 16px', textAlign: 'left', fontSize: 10, color: 'var(--text-muted)', fontWeight: 500, borderBottom: '0.5px solid var(--border)' }}>Follow-up</th>
+            <SortTh col="date"  label={t('jobs.added')} />
+            <th style={{ padding: '8px 16px', textAlign: 'left', fontSize: 10, color: 'var(--text-muted)', fontWeight: 500, borderBottom: '0.5px solid var(--border)' }}>{t('jobs.followUp')}</th>
             <th style={{ padding: '8px 16px', borderBottom: '0.5px solid var(--border)' }} />
           </tr>
         </thead>
@@ -204,8 +206,9 @@ function MobileListView({ jobs, onRowClick, selectedIds, onToggle }: {
   selectedIds: Set<string>
   onToggle: (id: string) => void
 }) {
+  const { t } = useI18n()
   return (
-    <div className="jobs-mobile-list" aria-label="Mobile job list">
+    <div className="jobs-mobile-list" aria-label={t('jobs.mobileList')}>
       {jobs.map(job => {
         const card = toMobileJobCard(job)
         return (
@@ -226,7 +229,7 @@ function MobileListView({ jobs, onRowClick, selectedIds, onToggle }: {
                 <CompanyLogo logo={card.logo ?? card.company.slice(0, 2).toUpperCase()} size={28} />
                 <div className="jobs-mobile-card-copy">
                   <strong>{card.company}</strong>
-                  <span>{card.location ?? 'Location not specified'}</span>
+              <span>{card.location ?? t('jobs.locationUnspecified')}</span>
                 </div>
                 {card.score != null && <ScorePill score={card.score} />}
               </div>
@@ -249,6 +252,7 @@ function KanbanView({ jobs, onStatusChange, onAddClick }: {
   onStatusChange: (id: string, status: JobStatus) => void
   onAddClick: (status: JobStatus) => void
 }) {
+  const { t } = useI18n()
   const toast  = useToast()
   const dragId = useRef<string | null>(null)
   const [dragOver, setDragOver] = useState<JobStatus | null>(null)
@@ -294,7 +298,7 @@ function KanbanView({ jobs, onStatusChange, onAddClick }: {
           }}>
           <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 10 }}>
             <span style={{ width: 7, height: 7, borderRadius: '50%', background: COL_COLORS[col] }} />
-            <span style={{ fontSize: 11, fontWeight: 500, color: 'var(--text)' }}>{COL_LABELS[col]}</span>
+            <span style={{ fontSize: 11, fontWeight: 500, color: 'var(--text)' }}>{colLabel(t, col)}</span>
             <span style={{ marginLeft: 'auto', fontSize: 10, color: 'var(--text-muted)', background: 'var(--bg)', border: '0.5px solid var(--border)', borderRadius: 999, padding: '1px 6px' }}>
               {cols[col].length}
             </span>
@@ -331,7 +335,7 @@ function KanbanView({ jobs, onStatusChange, onAddClick }: {
           <button
             onClick={() => onAddClick(col)}
             style={{ width: '100%', padding: '6px 0', border: '0.5px dashed var(--border)', borderRadius: 6, background: 'transparent', color: 'var(--text-muted)', fontSize: 11, cursor: 'pointer' }}>
-            + Add {COL_LABELS[col]}
+            + {t('jobs.addStatus').replace('{status}', colLabel(t, col))}
           </button>
         </div>
       ))}
@@ -345,6 +349,7 @@ function AddJobModal({ onClose, onAdded, prefillStatus }: {
   onAdded: (job: Job) => void
   prefillStatus?: JobStatus | null
 }) {
+  const { t } = useI18n()
   const toast  = useToast()
   const [form, setForm] = useState({ company: '', role: '', location: '', url: '', salary: '', status: (prefillStatus ?? 'saved') as JobStatus })
   const [saving, setSaving] = useState(false)
@@ -354,14 +359,14 @@ function AddJobModal({ onClose, onAdded, prefillStatus }: {
   async function handleSubmit(e: React.FormEvent) {
     e.preventDefault()
     if (!form.company.trim() || !form.role.trim()) {
-      toast.error('Required', 'Company and role are required')
+      toast.error(t('jobs.required'), t('jobs.companyRoleRequired'))
       return
     }
     setSaving(true)
     const { data, error } = await apiMutate<Job>('/api/jobs', 'POST', form)
     setSaving(false)
-    if (error || !data) { toast.error('Error', error ?? 'Failed to add job'); return }
-    toast.success('Job added', `${form.role} at ${form.company}`)
+    if (error || !data) { toast.error(t('common.error'), error ?? t('jobs.addFailed')); return }
+    toast.success(t('jobs.jobAdded'), `${form.role} at ${form.company}`)
     onAdded(data)
     onClose()
   }
@@ -372,47 +377,47 @@ function AddJobModal({ onClose, onAdded, prefillStatus }: {
       <div role="dialog" aria-modal="true" aria-labelledby="add-job-title">
       <Card style={{ width: 'min(460px, calc(100vw - 32px))', maxHeight: 'calc(100dvh - 32px)', overflowY: 'auto', padding: 24 }}>
         <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 20 }}>
-          <h2 id="add-job-title" style={{ margin: 0, fontSize: 16, fontWeight: 600 }}>Add job</h2>
+          <h2 id="add-job-title" style={{ margin: 0, fontSize: 16, fontWeight: 600 }}>{t('jobs.addJobTitle')}</h2>
           <Btn small variant="ghost" onClick={onClose}>✕</Btn>
         </div>
         <form onSubmit={handleSubmit} style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
           <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(180px, 1fr))', gap: 12 }}>
             <div>
-              <label htmlFor="add-job-company" style={labelSt}>Company *</label>
+              <label htmlFor="add-job-company" style={labelSt}>{t('jobs.companyRequired')}</label>
               <input id="add-job-company" style={INPUT_STYLE} value={form.company} onChange={e => setForm(f => ({ ...f, company: e.target.value }))} placeholder="e.g. Stripe" />
             </div>
             <div>
-              <label htmlFor="add-job-role" style={labelSt}>Role *</label>
+              <label htmlFor="add-job-role" style={labelSt}>{t('jobs.roleRequired')}</label>
               <input id="add-job-role" style={INPUT_STYLE} value={form.role} onChange={e => setForm(f => ({ ...f, role: e.target.value }))} placeholder="e.g. Backend Engineer" />
             </div>
           </div>
           <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(180px, 1fr))', gap: 12 }}>
             <div>
-              <label htmlFor="add-job-location" style={labelSt}>Location</label>
+              <label htmlFor="add-job-location" style={labelSt}>{t('jobs.location')}</label>
               <input id="add-job-location" style={INPUT_STYLE} value={form.location} onChange={e => setForm(f => ({ ...f, location: e.target.value }))} placeholder="e.g. Amsterdam, NL" />
             </div>
             <div>
-              <label htmlFor="add-job-salary" style={labelSt}>Salary</label>
+              <label htmlFor="add-job-salary" style={labelSt}>{t('jobs.salaryLabel')}</label>
               <input id="add-job-salary" style={INPUT_STYLE} value={form.salary} onChange={e => setForm(f => ({ ...f, salary: e.target.value }))} placeholder="e.g. €70k–90k" />
             </div>
           </div>
           <div>
-            <label htmlFor="add-job-url" style={labelSt}>Job URL</label>
+            <label htmlFor="add-job-url" style={labelSt}>{t('jobs.jobUrl')}</label>
             <input id="add-job-url" style={INPUT_STYLE} value={form.url} onChange={e => setForm(f => ({ ...f, url: e.target.value }))} placeholder="https://…" />
           </div>
           <div>
-            <label htmlFor="add-job-status" style={labelSt}>Initial status</label>
+            <label htmlFor="add-job-status" style={labelSt}>{t('jobs.initialStatus')}</label>
             <select id="add-job-status" style={INPUT_STYLE} value={form.status} onChange={e => setForm(f => ({ ...f, status: e.target.value as JobStatus }))}>
-              {KANBAN_COLS.map(c => <option key={c} value={c}>{COL_LABELS[c]}</option>)}
+              {KANBAN_COLS.map(c => <option key={c} value={c}>{colLabel(t, c)}</option>)}
             </select>
           </div>
           <div style={{ display: 'flex', gap: 8, justifyContent: 'flex-end', marginTop: 4 }}>
-            <Btn variant="ghost" onClick={onClose}>Cancel</Btn>
+            <Btn variant="ghost" onClick={onClose}>{t('common.cancel')}</Btn>
             <button type="submit" disabled={saving} style={{
               padding: '7px 16px', background: 'var(--primary)', color: '#fff', border: 'none', borderRadius: 6,
               fontSize: 12, fontWeight: 500, cursor: saving ? 'not-allowed' : 'pointer', opacity: saving ? 0.7 : 1,
             }}>
-              {saving ? 'Adding…' : 'Add Job'}
+              {saving ? t('jobs.adding') : t('jobs.addButton')}
             </button>
           </div>
         </form>
@@ -1469,7 +1474,7 @@ export function JobsPage() {
       })
     } else {
       defaultJobsCache = null
-      toast.success('Moved', `Job moved to ${COL_LABELS[newStatus]}`)
+      toast.success(t('jobs.moved'), `${t('jobs.movedTo')} ${colLabel(t, newStatus)}`)
     }
   }
 
@@ -1579,7 +1584,7 @@ export function JobsPage() {
           </button>
           <select value={filterStatus} onChange={e => doFilter(e.target.value)} style={{ marginLeft: 'auto', padding: '10px 12px', fontSize: 12, border: '0.5px solid var(--border)', borderRadius: 8, background: 'var(--bg)', color: 'var(--text)', outline: 'none' }}>
             <option value="all">{t('jobs.allStatuses')}</option>
-            {KANBAN_COLS.map(c => <option key={c} value={c}>{COL_LABELS[c]}</option>)}
+            {KANBAN_COLS.map(c => <option key={c} value={c}>{colLabel(t, c)}</option>)}
           </select>
           <div style={{ display: 'flex', border: '0.5px solid var(--border)', borderRadius: 8, overflow: 'hidden' }}>
             {([['list', List, 'jobs.listView'], ['kanban', LayoutGrid, 'jobs.kanbanView']] as const).map(([v, Icon, labelKey]) => <button key={v} onClick={() => setView(v)} aria-label={t(labelKey)} style={{ padding: '8px 12px', background: view === v ? 'var(--primary)' : 'var(--bg)', color: view === v ? '#fff' : 'var(--text-muted)', border: 'none', cursor: 'pointer', display: 'inline-flex' }}><Icon size={17} /></button>)}

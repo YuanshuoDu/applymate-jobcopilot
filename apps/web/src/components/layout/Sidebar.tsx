@@ -164,7 +164,7 @@ export function Sidebar({ active, onNav, onNavIntent, session, jobCount: jobCoun
         {/* ── User info + sign out ── */}
         <div ref={accountAreaRef} style={{ borderTop: '1px solid var(--border)', paddingTop: 8, position: 'relative' }}>
           {notificationPanel}
-          {accountMenuOpen && <div role="menu" aria-label="Account menu" style={{ position: 'absolute', left: 0, right: 0, bottom: 'calc(100% + 8px)', padding: 6, border: '1px solid var(--border)', borderRadius: 12, background: 'var(--bg)', boxShadow: '0 16px 36px rgba(15,23,42,0.16)', zIndex: 110 }}>
+          {accountMenuOpen && <div role="menu" aria-label={t('nav.accountMenu')} style={{ position: 'absolute', left: 0, right: 0, bottom: 'calc(100% + 8px)', padding: 6, border: '1px solid var(--border)', borderRadius: 12, background: 'var(--bg)', boxShadow: '0 16px 36px rgba(15,23,42,0.16)', zIndex: 110 }}>
             <div style={{ padding: '7px 8px 8px', marginBottom: 3, borderBottom: '1px solid var(--border)' }}>
               <div style={{ fontSize: 11, fontWeight: 700, color: 'var(--text)' }}>{user?.name ?? user?.email?.split('@')[0] ?? 'User'}</div>
               <div style={{ fontSize: 10, color: 'var(--text-muted)', marginTop: 2, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{user?.email ?? ''}</div>

@@ -612,11 +612,11 @@ export function LandingPage({ plans = FALLBACK_PLANS }: { plans?: PublicPlan[] }
         <div style={{ maxWidth: 700, margin: '0 auto' }}>
           <Reveal>
             <div style={{ textAlign: 'center', marginBottom: 50 }}>
-              <Label color="#FB923C" bg="rgba(251,146,60,0.10)" bd="rgba(251,146,60,0.22)">Contact</Label>
+              <Label color="#FB923C" bg="rgba(251,146,60,0.10)" bd="rgba(251,146,60,0.22)">{t('landing.contactLabel')}</Label>
               <h2 style={{ fontSize: 'clamp(28px, 4vw, 46px)', fontWeight: 800, letterSpacing: '-0.035em', marginBottom: 12 }}>
-                Got a question?<span style={{ color: '#FB923C' }}> Reach out</span>
+                {t('landing.question')}<span style={{ color: '#FB923C' }}> {t('landing.reachOut')}</span>
               </h2>
-              <p style={{ fontSize: 15, color: C.textMuted, lineHeight: 1.7 }}>We usually respond within 24 hours. For enterprise or custom integrations email <span style={{ color: '#818CF8' }}>hello@applymate.ai</span></p>
+              <p style={{ fontSize: 15, color: C.textMuted, lineHeight: 1.7 }}>{t('landing.responseTime')} <span style={{ color: '#818CF8' }}>hello@applymate.ai</span></p>
             </div>
           </Reveal>
 
@@ -625,22 +625,22 @@ export function LandingPage({ plans = FALLBACK_PLANS }: { plans?: PublicPlan[] }
               {contactSent ? (
                 <div style={{ textAlign: 'center', padding: '20px 0' }}>
                   <div style={{ fontSize: 48, marginBottom: 16 }}>✅</div>
-                  <div style={{ fontSize: 18, fontWeight: 700, color: '#fff', marginBottom: 8 }}>Message sent!</div>
-                  <div style={{ fontSize: 13, color: C.textMuted }}>We&apos;ll reply by email within 24 hours.</div>
-                  <button type="button" onClick={() => { setContactSent(false); setContactError(null) }} style={{ marginTop: 22, padding: '10px 16px', color: C.textMuted, background: 'rgba(255,255,255,0.07)', border: '1px solid rgba(255,255,255,0.14)', borderRadius: 10, cursor: 'pointer', fontSize: 12, fontWeight: 600 }}>Send another message</button>
+                  <div style={{ fontSize: 18, fontWeight: 700, color: '#fff', marginBottom: 8 }}>{t('landing.messageSent')}</div>
+                  <div style={{ fontSize: 13, color: C.textMuted }}>{t('landing.replyTime')}</div>
+                  <button type="button" onClick={() => { setContactSent(false); setContactError(null) }} style={{ marginTop: 22, padding: '10px 16px', color: C.textMuted, background: 'rgba(255,255,255,0.07)', border: '1px solid rgba(255,255,255,0.14)', borderRadius: 10, cursor: 'pointer', fontSize: 12, fontWeight: 600 }}>{t('landing.sendAnother')}</button>
                 </div>
               ) : (
                 <form onSubmit={handleContact} style={{ display: 'flex', flexDirection: 'column', gap: 18 }}>
                   <div className="landing-contact-fields" style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 14 }}>
-                    <InputField label="Name" value={contactForm.name} onChange={v => setContactForm(f => ({ ...f, name: v }))} placeholder="Your name" required />
+                    <InputField label={t('landing.name')} value={contactForm.name} onChange={v => setContactForm(f => ({ ...f, name: v }))} placeholder={t('landing.yourName')} required />
                     <InputField label="Email" type="email" value={contactForm.email} onChange={v => setContactForm(f => ({ ...f, email: v }))} placeholder="your@email.com" required />
                   </div>
-                  <InputField label="Message" value={contactForm.message} onChange={v => setContactForm(f => ({ ...f, message: v }))} placeholder="Tell us about your question or request…" multiline required />
+                  <InputField label={t('landing.message')} value={contactForm.message} onChange={v => setContactForm(f => ({ ...f, message: v }))} placeholder={t('landing.messagePlaceholder')} multiline required />
                   {contactError && <div role="alert" style={{ color: '#FCA5A5', fontSize: 12, lineHeight: 1.5, padding: '10px 12px', borderRadius: 9, background: 'rgba(220,38,38,0.12)', border: '1px solid rgba(248,113,113,0.25)' }}>{contactError}</div>}
                   <button type="submit" disabled={sending} className="btn-shine" style={{ padding: '13px 0', fontSize: 14, fontWeight: 700, background: sending ? 'rgba(99,102,241,0.5)' : 'linear-gradient(135deg, #4F46E5, #7C3AED)', color: '#fff', border: 'none', borderRadius: 12, cursor: sending ? 'not-allowed' : 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 8, boxShadow: '0 4px 20px rgba(79,70,229,0.45)', transition: 'all 0.2s' }}>
                     {sending ? (
-                      <><div style={{ width: 14, height: 14, borderRadius: '50%', border: '2px solid rgba(255,255,255,0.3)', borderTopColor: '#fff', animation: 'spin 0.7s linear infinite' }} />Sending…</>
-                    ) : '✉️ Send message'}
+                      <><div style={{ width: 14, height: 14, borderRadius: '50%', border: '2px solid rgba(255,255,255,0.3)', borderTopColor: '#fff', animation: 'spin 0.7s linear infinite' }} />{t('landing.sending')}</>
+                    ) : `✉️ ${t('landing.sendMessage')}`}
                   </button>
                 </form>
               )}

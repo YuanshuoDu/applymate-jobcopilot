@@ -468,14 +468,14 @@ export function SmartSearch({ onJobSaved, onOpenSettings }: { onJobSaved?: () =>
             <label style={{ fontSize: 11, fontWeight: 600, color: 'var(--text-muted)', marginBottom: 5, display: 'flex', alignItems: 'center', gap: 5 }}>
               <Icon.Dollar /> {t('jobs.minSalary')}
             </label>
-            <input style={glassInput} type="number" min={0} max={500} value={filters.salaryMin} onChange={e => setFilter('salaryMin', e.target.value)} placeholder="e.g. 50" />
+            <input style={glassInput} type="number" min={0} max={500} value={filters.salaryMin} onChange={e => setFilter('salaryMin', e.target.value)} placeholder="50" />
           </div>
 
           <div>
             <label style={{ fontSize: 11, fontWeight: 600, color: 'var(--text-muted)', marginBottom: 5, display: 'flex', alignItems: 'center', gap: 5 }}>
               <Icon.Dollar /> {t('jobs.maxSalary')}
             </label>
-            <input style={glassInput} type="number" min={0} max={500} value={filters.salaryMax} onChange={e => setFilter('salaryMax', e.target.value)} placeholder="e.g. 120" />
+            <input style={glassInput} type="number" min={0} max={500} value={filters.salaryMax} onChange={e => setFilter('salaryMax', e.target.value)} placeholder="120" />
           </div>
 
           <div>
@@ -532,7 +532,7 @@ export function SmartSearch({ onJobSaved, onOpenSettings }: { onJobSaved?: () =>
       {!searched && recent.length > 0 && (
         <div style={{ display: 'flex', alignItems: 'center', gap: 7, flexWrap: 'wrap', marginBottom: 12 }}>
           <span style={{ fontSize: 11, color: 'var(--text-muted)', display: 'flex', alignItems: 'center', gap: 4, flexShrink: 0 }}>
-            <Icon.Clock /> Recent:
+            <Icon.Clock /> {t('jobs.recent')}:
           </span>
           {recent.slice(0, 6).map(s => (
             <button key={s} onClick={() => { setQ(s); setFilters(DEFAULT_FILTERS); runSearch(s, DEFAULT_FILTERS) }}
@@ -816,7 +816,7 @@ export function SmartSearch({ onJobSaved, onOpenSettings }: { onJobSaved?: () =>
                               {savedIds.has(r.id) ? (
                                 scores[r.id] !== undefined
                                   ? <ScorePill score={scores[r.id]} />
-                                  : <Badge color="#059669" bg="rgba(5,150,105,0.12)">✓ Saved</Badge>
+                                  : <Badge color="#059669" bg="rgba(5,150,105,0.12)">✓ {t('jobs.savedBadge')}</Badge>
                               ) : (
                                 <button
                                   onClick={e => { e.stopPropagation(); handleSave(r) }}
@@ -849,13 +849,13 @@ export function SmartSearch({ onJobSaved, onOpenSettings }: { onJobSaved?: () =>
                           {scoringIds.has(r.id) && <span style={{ width: 10, height: 10, border: '1.5px solid rgba(79,70,229,0.18)', borderTopColor: 'var(--primary)', borderRadius: '50%', animation: 'spin 0.7s linear infinite', display: 'inline-block' }} />}
 
                           {/* View button */}
-                          <a href={r.url} target="_blank" rel="noopener noreferrer" onClick={e => e.stopPropagation()} title="View job posting" style={{ width: 34, height: 34, display: 'flex', alignItems: 'center', justifyContent: 'center', borderRadius: 9, background: 'linear-gradient(135deg, #4F46E5, #7C3AED)', color: '#fff', textDecoration: 'none', boxShadow: '0 3px 10px rgba(79,70,229,0.35)', transition: 'all 0.15s' }}>
+                          <a href={r.url} target="_blank" rel="noopener noreferrer" onClick={e => e.stopPropagation()} title={t('jobs.viewPosting')} style={{ width: 34, height: 34, display: 'flex', alignItems: 'center', justifyContent: 'center', borderRadius: 9, background: 'linear-gradient(135deg, #4F46E5, #7C3AED)', color: '#fff', textDecoration: 'none', boxShadow: '0 3px 10px rgba(79,70,229,0.35)', transition: 'all 0.15s' }}>
                             <Icon.ExternalLink />
                           </a>
 
                           {/* Save button */}
                           {!savedIds.has(r.id) && (
-                            <button onClick={e => { e.stopPropagation(); handleSave(r) }} disabled={savingIds.has(r.id)} title="Save to tracker" style={{ width: 34, height: 34, display: 'flex', alignItems: 'center', justifyContent: 'center', borderRadius: 9, border: '1px solid var(--border)', background: 'var(--glass-bg)', color: 'var(--text-muted)', cursor: 'pointer', transition: 'all 0.15s' }}
+                            <button onClick={e => { e.stopPropagation(); handleSave(r) }} disabled={savingIds.has(r.id)} title={t('jobs.saveTracker')} style={{ width: 34, height: 34, display: 'flex', alignItems: 'center', justifyContent: 'center', borderRadius: 9, border: '1px solid var(--border)', background: 'var(--glass-bg)', color: 'var(--text-muted)', cursor: 'pointer', transition: 'all 0.15s' }}
                               onMouseEnter={e => { e.currentTarget.style.borderColor = 'rgba(79,70,229,0.35)'; e.currentTarget.style.color = 'var(--primary)' }}
                               onMouseLeave={e => { e.currentTarget.style.borderColor = 'var(--border)'; e.currentTarget.style.color = 'var(--text-muted)' }}>
                               {savingIds.has(r.id)
@@ -864,7 +864,7 @@ export function SmartSearch({ onJobSaved, onOpenSettings }: { onJobSaved?: () =>
                             </button>
                           )}
                           {savedIds.has(r.id) && scores[r.id] === undefined && !scoringIds.has(r.id) && (
-                            <span title="Saved" style={{ color: '#059669', display: 'flex' }}>✓</span>
+                            <span title={t('jobs.savedBadge')} style={{ color: '#059669', display: 'flex' }}>✓</span>
                           )}
                         </div>
                       )}
@@ -886,8 +886,8 @@ export function SmartSearch({ onJobSaved, onOpenSettings }: { onJobSaved?: () =>
                       </span>
                       <select value={pageSize} onChange={e => { setPageSize(Number(e.target.value)); setPage(1) }}
                         style={{ padding: '4px 8px', fontSize: 11, border: '1px solid var(--border)', borderRadius: 7, background: 'var(--glass-bg)', color: 'var(--text)', cursor: 'pointer' }}>
-                        <option value={20}>20 / page</option>
-                        <option value={50}>50 / page</option>
+                        <option value={20}>{t('jobs.perPage20')}</option>
+                        <option value={50}>{t('jobs.perPage50')}</option>
                       </select>
                     </div>
 

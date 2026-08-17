@@ -14,18 +14,18 @@ import './OnboardingFlow.css'
 // ── Constants ──────────────────────────────────────────────────────────────────
 
 const GOAL_CHIPS = [
-  { id: 'abroad', label: 'International job search', description: 'Find work in a new country.', icon: Globe2 },
-  { id: 'grad',   label: 'New graduate', description: 'Start your first role with confidence.', icon: GraduationCap },
-  { id: 'switch', label: 'Career change', description: 'Move into a new field or industry.', icon: WandSparkles },
-  { id: 'intern', label: 'Internship', description: 'Discover hands-on early-career roles.', icon: BriefcaseBusiness },
+  { id: 'abroad', labelKey: 'onboarding.goal.abroad', descriptionKey: 'onboarding.goal.abroadDesc', icon: Globe2 },
+  { id: 'grad', labelKey: 'onboarding.goal.grad', descriptionKey: 'onboarding.goal.gradDesc', icon: GraduationCap },
+  { id: 'switch', labelKey: 'onboarding.goal.switch', descriptionKey: 'onboarding.goal.switchDesc', icon: WandSparkles },
+  { id: 'intern', labelKey: 'onboarding.goal.intern', descriptionKey: 'onboarding.goal.internDesc', icon: BriefcaseBusiness },
 ]
 
 const STEPS = [
-  { label: 'Your goal', detail: 'Why you’re here', icon: Target },
-  { label: 'About you', detail: 'Your background', icon: UserRound },
-  { label: 'Preferences', detail: 'Roles and locations', icon: Sparkles },
-  { label: 'Your resume', detail: 'Ready to tailor', icon: FileText },
-  { label: 'Launch', detail: 'Review and start', icon: Rocket },
+  { labelKey: 'onboarding.step.goal', detailKey: 'onboarding.step.goalDetail', icon: Target },
+  { labelKey: 'onboarding.step.about', detailKey: 'onboarding.step.aboutDetail', icon: UserRound },
+  { labelKey: 'onboarding.step.preferences', detailKey: 'onboarding.step.preferencesDetail', icon: Sparkles },
+  { labelKey: 'onboarding.step.resume', detailKey: 'onboarding.step.resumeDetail', icon: FileText },
+  { labelKey: 'onboarding.step.launch', detailKey: 'onboarding.step.launchDetail', icon: Rocket },
 ]
 
 const STARTER_GROUPS = [
@@ -62,46 +62,46 @@ function StepLayout({ step, title, desc, children, onBack, onContinue, onSkip, c
 }) {
   return (
     <div className="onboarding-layout">
-      <aside className="onboarding-rail" aria-label="Onboarding progress">
+      <aside className="onboarding-rail" aria-label={t('onboarding.progress')}>
         <div className="onboarding-wordmark"><Sparkles size={21} /> ApplyMate <b>AI</b></div>
         <div className="onboarding-steps">
           {STEPS.map((item, index) => {
             const Icon = item.icon
             const active = index + 1 === step
             const complete = index + 1 < step
-            return <div className={`onboarding-rail-step ${active ? 'is-active' : ''} ${complete ? 'is-complete' : ''}`} key={item.label}>
+            return <div className={`onboarding-rail-step ${active ? 'is-active' : ''} ${complete ? 'is-complete' : ''}`} key={item.labelKey}>
               <div className="onboarding-step-dot">{complete ? <Check size={14} /> : index + 1}</div>
-              <div><strong>{item.label}</strong><span>{item.detail}</span></div>
+              <div><strong>{t(item.labelKey)}</strong><span>{t(item.detailKey)}</span></div>
               {active && <Icon size={16} />}
             </div>
           })}
         </div>
-        <div className="onboarding-rail-note"><Sparkles size={18} /><p>We’ll personalise your search, save time, and improve each match.</p></div>
+        <div className="onboarding-rail-note"><Sparkles size={18} /><p>{t('onboarding.launchNote')}</p></div>
       </aside>
 
       <section className="onboarding-main">
-        <div className="onboarding-progress"><div className="onboarding-progress-dots">{Array.from({ length: TOTAL_STEPS }, (_, i) => <i className={i < step ? 'done' : ''} key={i} />)}</div><span>Step {step} of {TOTAL_STEPS}</span></div>
+        <div className="onboarding-progress"><div className="onboarding-progress-dots">{Array.from({ length: TOTAL_STEPS }, (_, i) => <i className={i < step ? 'done' : ''} key={i} />)}</div><span>{t('onboarding.stepOf').replace('{step}', String(step)).replace('{total}', String(TOTAL_STEPS))}</span></div>
         <header className="onboarding-heading"><h2>{title}</h2><p>{desc}</p></header>
         <div className="onboarding-content">{children}</div>
         <footer className="onboarding-footer">
-          {onBack ? <Btn variant="ghost" onClick={onBack}>Back</Btn> : <span />}
-          <div className="onboarding-footer-actions">{onSkip && <button className="onboarding-skip" onClick={onSkip}>Skip for now</button>}<Btn variant="primary" onClick={onContinue} disabled={disableContinue}>{continueLabel ?? 'Continue'}</Btn></div>
+          {onBack ? <Btn variant="ghost" onClick={onBack}>{t('onboarding.back')}</Btn> : <span />}
+          <div className="onboarding-footer-actions">{onSkip && <button className="onboarding-skip" onClick={onSkip}>{t('onboarding.skip')}</button>}<Btn variant="primary" onClick={onContinue} disabled={disableContinue}>{continueLabel ?? t('onboarding.continue')}</Btn></div>
         </footer>
       </section>
 
       <aside className="onboarding-plan">
-        <div className="onboarding-plan-label">YOUR LAUNCH PLAN <span>Preview</span></div>
+        <div className="onboarding-plan-label">{t('onboarding.launchPlan')} <span>{t('onboarding.preview')}</span></div>
         {STEPS.slice(0, 4).map((item, index) => {
           const Icon = item.icon
           const complete = index + 1 < step
           const active = index + 1 === step
-          return <div className={`onboarding-plan-item ${active ? 'is-active' : ''}`} key={item.label}>
+          return <div className={`onboarding-plan-item ${active ? 'is-active' : ''}`} key={item.labelKey}>
             <div className="onboarding-plan-icon"><Icon size={22} /></div>
-            <div><strong>{item.label}</strong><p>{complete ? 'Ready to power better matches.' : active ? 'We’re setting this up now.' : 'Unlock this in the next step.'}</p></div>
+            <div><strong>{t(item.labelKey)}</strong><p>{complete ? t('onboarding.readyPower') : active ? t('onboarding.settingUp') : t('onboarding.unlockNext')}</p></div>
             {complete && <Check size={18} className="onboarding-check" />}
           </div>
         })}
-        <div className="onboarding-dashboard-preview"><span>WHAT YOU’LL UNLOCK</span><strong>Personalised job matches</strong><p>AI will identify the best roles and prepare your applications.</p><div><i /><i /><i /><i /></div></div>
+        <div className="onboarding-dashboard-preview"><span>{t('onboarding.unlockTitle')}</span><strong>{t('onboarding.personalisedMatches')}</strong><p>{t('onboarding.identifyRoles')}</p><div><i /><i /><i /><i /></div></div>
       </aside>
     </div>
   )
@@ -119,8 +119,8 @@ function Step1({ goals, onToggle, onContinue, onSkipAll, t }: {
   return (
     <StepLayout
       step={1}
-      title="What brings you here?"
-      desc="We’ll build a job-search launch plan around your goals. You can change this any time."
+      title={t('onboarding.goalTitle')}
+      desc={t('onboarding.goalDesc')}
       onContinue={onContinue}
       onSkip={onSkipAll}
       t={t}
@@ -135,12 +135,12 @@ function Step1({ goals, onToggle, onContinue, onSkipAll, t }: {
               onClick={() => onToggle(chip.id)}
               className={`onboarding-goal-card ${selected ? 'is-selected' : ''}`}
             >
-              <Icon size={26} strokeWidth={1.7} /><strong>{chip.label}</strong><span>{chip.description}</span>{selected && <Check size={17} className="onboarding-goal-check" />}
+              <Icon size={26} strokeWidth={1.7} /><strong>{t(chip.labelKey)}</strong><span>{t(chip.descriptionKey)}</span>{selected && <Check size={17} className="onboarding-goal-check" />}
             </button>
           )
         })}
       </div>
-      <button className="onboarding-skip-all" onClick={onSkipAll}>I’ll set this up later</button>
+      <button className="onboarding-skip-all" onClick={onSkipAll}>{t('onboarding.later')}</button>
     </StepLayout>
   )
 }
@@ -167,28 +167,28 @@ function Step2({ persona, onChange, onBack, onContinue, onSkip, t }: {
   t: (k: string) => string
 }) {
   const fields: { key: keyof PersonaForm; label: string; placeholder: string; required?: boolean; type?: string }[] = [
-    { key: 'name',        label: 'Full Name',        placeholder: 'Jane Smith',                  required: true },
-    { key: 'email',       label: 'Email',             placeholder: 'jane@example.com',            required: true, type: 'email' },
-    { key: 'phone',       label: 'Phone',             placeholder: '+1 555 000 0000' },
-    { key: 'location',    label: 'City / Country',    placeholder: 'Berlin, Germany' },
-    { key: 'nationality', label: 'Nationality',       placeholder: 'German' },
-    { key: 'visaStatus',  label: 'Visa / Work Status',placeholder: 'EU Citizen / Work Permit' },
-    { key: 'linkedin',    label: 'LinkedIn URL',      placeholder: 'linkedin.com/in/janesmith' },
-    { key: 'website',     label: 'Personal Site',     placeholder: 'https://janesmith.com' },
+    { key: 'name',        label: t('onboarding.fullName'),        placeholder: 'Jane Smith',                  required: true },
+    { key: 'email',       label: t('onboarding.email'),             placeholder: 'jane@example.com',            required: true, type: 'email' },
+    { key: 'phone',       label: t('onboarding.phone'),             placeholder: '+1 555 000 0000' },
+    { key: 'location',    label: t('onboarding.cityCountry'),    placeholder: 'Berlin, Germany' },
+    { key: 'nationality', label: t('onboarding.nationality'),       placeholder: 'German' },
+    { key: 'visaStatus',  label: t('onboarding.visaStatus'),placeholder: 'EU Citizen / Work Permit' },
+    { key: 'linkedin',    label: t('onboarding.linkedinUrl'),      placeholder: 'linkedin.com/in/janesmith' },
+    { key: 'website',     label: t('onboarding.personalSite'),     placeholder: 'https://janesmith.com' },
   ]
 
   return (
     <StepLayout
       step={2}
-      title="Let’s get the basics right"
-      desc="This information lets ApplyMate tailor your materials and spot the right opportunities."
+      title={t('onboarding.aboutTitle')}
+      desc={t('onboarding.aboutDesc')}
       onBack={onBack}
       onContinue={onContinue}
       onSkip={onSkip}
       disableContinue={!persona.name || !persona.email}
       t={t}
     >
-      <div className="onboarding-profile-note"><UserRound size={18} />The basics help us tailor every job, resume, and application. You can refine these later.</div>
+      <div className="onboarding-profile-note"><UserRound size={18} />{t('onboarding.basicsNote')}</div>
       <div className="onboarding-profile-grid">
         {fields.map(f => (
           <div key={f.key} className="onboarding-field">
@@ -232,8 +232,8 @@ function Step3({ directions, onAdd, onRemove, onBack, onContinue, onSkip, t }: {
   return (
     <StepLayout
       step={3}
-      title="Choose your target directions"
-      desc="Add the roles or career paths you want ApplyMate to prioritise."
+      title={t('onboarding.directionsTitle')}
+      desc={t('onboarding.directionsDesc')}
       onBack={onBack}
       onContinue={onContinue}
       onSkip={onSkip}
@@ -246,14 +246,14 @@ function Step3({ directions, onAdd, onRemove, onBack, onContinue, onSkip, t }: {
           value={input}
           onChange={e => setInput(e.target.value)}
           onKeyDown={e => { if (e.key === 'Enter') { addDirection(input); setInput('') } }}
-          placeholder="e.g. Software Engineering"
+          placeholder={t('onboarding.directionExample')}
           style={{
             flex: 1, padding: '8px 12px', borderRadius: 7,
             border: '0.5px solid var(--border)', background: 'var(--bg)',
             color: 'var(--text)', fontSize: 13, fontFamily: 'inherit', outline: 'none',
           }}
         />
-        <Btn variant="primary" small onClick={() => { addDirection(input); setInput('') }}>+ Add</Btn>
+        <Btn variant="primary" small onClick={() => { addDirection(input); setInput('') }}>{t('onboarding.add')}</Btn>
       </div>
 
       {/* Added directions */}
@@ -286,7 +286,7 @@ function Step3({ directions, onAdd, onRemove, onBack, onContinue, onSkip, t }: {
           <div style={{ marginTop: 12, display: 'flex', flexDirection: 'column', gap: 12 }}>
             {STARTER_GROUPS.map(grp => (
               <div key={grp.group}>
-                <div style={{ fontSize: 10, fontWeight: 600, color: 'var(--text-muted)', marginBottom: 6, textTransform: 'uppercase', letterSpacing: '0.05em' }}>{grp.group}</div>
+                <div style={{ fontSize: 10, fontWeight: 600, color: 'var(--text-muted)', marginBottom: 6, textTransform: 'uppercase', letterSpacing: '0.05em' }}>{t(`onboarding.group.${grp.group}`)}</div>
                 <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}>
                   {grp.items.map(item => {
                     const added = directions.includes(item)
@@ -302,7 +302,7 @@ function Step3({ directions, onAdd, onRemove, onBack, onContinue, onSkip, t }: {
                           cursor: 'pointer', fontFamily: 'inherit',
                         }}
                       >
-                        {added ? '✓ ' : ''}{item}
+                        {added ? '✓ ' : ''}{t(`onboarding.item.${item}`)}
                       </button>
                     )
                   })}
@@ -332,8 +332,8 @@ function Step4({ directions, doneSet, onOpen, onBack, onContinue, onSkip, t }: {
   return (
     <StepLayout
       step={4}
-      title="Add a resume to tailor"
-      desc="We’ll extract your strongest experience and adapt it to every high-match role."
+      title={t('onboarding.resumeTitle')}
+      desc={t('onboarding.resumeDesc')}
       onBack={onBack}
       onContinue={onContinue}
       onSkip={onSkip}
@@ -342,7 +342,7 @@ function Step4({ directions, doneSet, onOpen, onBack, onContinue, onSkip, t }: {
     >
       {doneSet.size === 0 && (
         <div style={{ fontSize: 10, color: 'var(--c-warning)', marginTop: 4, marginBottom: 4 }}>
-          Upload at least one resume to continue, or click &quot;Skip&quot; to do this later.
+          {t('onboarding.uploadContinue')}
         </div>
       )}
       <div style={{ display: 'flex', flexDirection: 'column', gap: 10, paddingTop: 8 }}>
@@ -358,10 +358,10 @@ function Step4({ directions, doneSet, onOpen, onBack, onContinue, onSkip, t }: {
               <span style={{ fontSize: 13, fontWeight: 500 }}>{dir}</span>
             </div>
             {doneSet.has(dir) ? (
-              <span style={{ fontSize: 11, color: 'var(--c-success)' }}>Resume added</span>
+              <span style={{ fontSize: 11, color: 'var(--c-success)' }}>{t('onboarding.resumeAdded')}</span>
             ) : (
               <div style={{ display: 'flex', gap: 8 }}>
-                <Btn small variant="primary" onClick={() => onOpen(dir)}>Upload / Paste</Btn>
+                <Btn small variant="primary" onClick={() => onOpen(dir)}>{t('onboarding.uploadPaste')}</Btn>
               </div>
             )}
           </div>
@@ -389,17 +389,17 @@ function Step5({ templateId, accentColor, fontFamily, onTemplate, onColor, onFon
   return (
     <StepLayout
       step={5}
-      title="You’re ready to launch"
-      desc="Choose a default presentation style, connect your tools, and start your job search."
+      title={t('onboarding.launchTitle')}
+      desc={t('onboarding.launchDesc')}
       onBack={onBack}
       onContinue={onFinish}
-      continueLabel="Start exploring jobs"
+      continueLabel={t('onboarding.startExploring')}
       t={t}
     >
       <div style={{ display: 'flex', flexDirection: 'column', gap: 20, paddingTop: 8 }}>
         {/* Template picker */}
         <div>
-          <div style={{ fontSize: 11, fontWeight: 600, color: 'var(--text-muted)', marginBottom: 10, textTransform: 'uppercase', letterSpacing: '0.05em' }}>Default Template</div>
+          <div style={{ fontSize: 11, fontWeight: 600, color: 'var(--text-muted)', marginBottom: 10, textTransform: 'uppercase', letterSpacing: '0.05em' }}>{t('onboarding.defaultTemplate')}</div>
           <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: 12 }}>
             {TEMPLATE_OPTIONS.map(tpl => (
               <button
@@ -422,7 +422,7 @@ function Step5({ templateId, accentColor, fontFamily, onTemplate, onColor, onFon
 
         {/* Accent color */}
         <div>
-          <div style={{ fontSize: 11, fontWeight: 600, color: 'var(--text-muted)', marginBottom: 10, textTransform: 'uppercase', letterSpacing: '0.05em' }}>Accent Color</div>
+          <div style={{ fontSize: 11, fontWeight: 600, color: 'var(--text-muted)', marginBottom: 10, textTransform: 'uppercase', letterSpacing: '0.05em' }}>{t('onboarding.accentColor')}</div>
           <div style={{ display: 'flex', gap: 10 }}>
             {ACCENT_COLORS.map(c => (
               <button
@@ -441,7 +441,7 @@ function Step5({ templateId, accentColor, fontFamily, onTemplate, onColor, onFon
 
         {/* Font */}
         <div>
-          <div style={{ fontSize: 11, fontWeight: 600, color: 'var(--text-muted)', marginBottom: 10, textTransform: 'uppercase', letterSpacing: '0.05em' }}>Font Family</div>
+          <div style={{ fontSize: 11, fontWeight: 600, color: 'var(--text-muted)', marginBottom: 10, textTransform: 'uppercase', letterSpacing: '0.05em' }}>{t('onboarding.fontFamily')}</div>
           <select
             value={fontFamily}
             onChange={e => onFont(e.target.value)}
@@ -458,21 +458,21 @@ function Step5({ templateId, accentColor, fontFamily, onTemplate, onColor, onFon
         <div className="onboarding-connect-grid">
           <div style={{ padding: 16, borderRadius: 10, border: '0.5px solid var(--border)', background: 'var(--bg-secondary)', display: 'flex', flexDirection: 'column', gap: 8 }}>
             <span style={{ fontSize: 18 }}>🧩</span>
-            <div style={{ fontSize: 12, fontWeight: 600 }}>Chrome Extension</div>
-            <div style={{ fontSize: 11, color: 'var(--text-muted)' }}>Auto-fill job apps as you browse</div>
-            <a href="https://chrome.google.com/webstore" target="_blank" rel="noopener noreferrer" style={{ fontSize: 11, color: 'var(--primary)', textDecoration: 'none' }}>Install →</a>
+            <div style={{ fontSize: 12, fontWeight: 600 }}>{t('onboarding.chromeExtension')}</div>
+            <div style={{ fontSize: 11, color: 'var(--text-muted)' }}>{t('onboarding.autoFill')}</div>
+            <a href="https://chrome.google.com/webstore" target="_blank" rel="noopener noreferrer" style={{ fontSize: 11, color: 'var(--primary)', textDecoration: 'none' }}>{t('onboarding.install')}</a>
           </div>
           <div style={{ padding: 16, borderRadius: 10, border: '0.5px solid var(--border)', background: 'var(--bg-secondary)', display: 'flex', flexDirection: 'column', gap: 8 }}>
             <span style={{ fontSize: 18 }}>✉️</span>
-            <div style={{ fontSize: 12, fontWeight: 600 }}>Connect Gmail</div>
-            <div style={{ fontSize: 11, color: 'var(--text-muted)' }}>Track replies and follow-ups</div>
-            <span style={{ fontSize: 11, color: 'var(--text-muted)' }}>Available in Settings</span>
+            <div style={{ fontSize: 12, fontWeight: 600 }}>{t('onboarding.connectGmail')}</div>
+            <div style={{ fontSize: 11, color: 'var(--text-muted)' }}>{t('onboarding.trackReplies')}</div>
+            <span style={{ fontSize: 11, color: 'var(--text-muted)' }}>{t('onboarding.availableSettings')}</span>
           </div>
           <div style={{ padding: 16, borderRadius: 10, border: '0.5px solid var(--border)', background: 'var(--bg-secondary)', display: 'flex', flexDirection: 'column', gap: 8 }}>
             <span style={{ fontSize: 18 }}>🤖</span>
-            <div style={{ fontSize: 12, fontWeight: 600 }}>AI Auto-Pilot</div>
-            <div style={{ fontSize: 11, color: 'var(--text-muted)' }}>Let AI suggest and apply automatically</div>
-            <span style={{ fontSize: 11, color: 'var(--text-muted)' }}>Configure in Agent settings</span>
+            <div style={{ fontSize: 12, fontWeight: 600 }}>{t('onboarding.aiAutopilot')}</div>
+            <div style={{ fontSize: 11, color: 'var(--text-muted)' }}>{t('onboarding.aiSuggestApply')}</div>
+            <span style={{ fontSize: 11, color: 'var(--text-muted)' }}>{t('onboarding.configureAgent')}</span>
           </div>
         </div>
       </div>

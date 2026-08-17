@@ -91,7 +91,7 @@ export function IndeedSearchPanel({ onJobSaved, onClose }: Props) {
         background: 'var(--bg-secondary)',
       }}>
         <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-          <span style={{ fontSize: 13, fontWeight: 600 }}>🔍 Search Indeed</span>
+          <span style={{ fontSize: 13, fontWeight: 600 }}>🔍 {t('jobs.indeedTitle')}</span>
         </div>
         <button onClick={onClose} style={{ background: 'none', border: 'none', cursor: 'pointer', color: 'var(--text-muted)', fontSize: 14, padding: 0, lineHeight: 1 }}>✕</button>
       </div>
@@ -133,7 +133,7 @@ export function IndeedSearchPanel({ onJobSaved, onClose }: Props) {
           fontSize: 12, fontWeight: 500, cursor: searching ? 'not-allowed' : 'pointer',
           opacity: searching ? 0.7 : 1, whiteSpace: 'nowrap',
         }}>
-          {searching ? 'Searching…' : 'Search'}
+          {searching ? t('jobs.searchingShort') : t('jobs.searchShort')}
         </button>
       </form>
 
@@ -165,14 +165,14 @@ export function IndeedSearchPanel({ onJobSaved, onClose }: Props) {
                     variant="primary"
                     disabled={savingIds.has(r.id)}
                     onClick={() => saveJob(r)}>
-                    {savingIds.has(r.id) ? 'Saving…' : '+ Save'}
+                    {savingIds.has(r.id) ? t('jobs.saving') : t('jobs.saveShort')}
                   </Btn>
                 </div>
               ))}
             </div>
           ) : (
             <div style={{ padding: 32, textAlign: 'center', fontSize: 12, color: 'var(--text-muted)' }}>
-              No jobs found. Try different keywords or a broader location.
+              {t('jobs.noIndeedResults')}
             </div>
           )}
         </div>
