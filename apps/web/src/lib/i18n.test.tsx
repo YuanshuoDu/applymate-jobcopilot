@@ -1,7 +1,7 @@
 import React from 'react'
 import { renderToStaticMarkup } from 'react-dom/server'
 import { describe, expect, it } from 'vitest'
-import { I18nProvider, translate, useI18n } from './i18n'
+import { I18nProvider, TRANSLATION_KEYS, hasTranslation, translate, useI18n } from './i18n'
 
 function TranslationProbe() {
   const { t } = useI18n()
@@ -40,6 +40,15 @@ describe('AI settings translations', () => {
       expect(translate('en', key), key).not.toBe(key)
       expect(translate('zh', key), key).not.toBe(key)
       expect(translate('en', key), key).not.toBe(translate('zh', key))
+    }
+  })
+
+  it('keeps every English UI key translated in Chinese', () => {
+    for (const key of TRANSLATION_KEYS) {
+      expect(hasTranslation('en', key), key).toBe(true)
+      expect(hasTranslation('zh', key), key).toBe(true)
+      expect(translate('en', key), key).not.toBe(key)
+      expect(translate('zh', key), key).not.toBe(key)
     }
   })
 })
