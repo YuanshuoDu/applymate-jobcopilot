@@ -744,8 +744,8 @@ export function SettingsPage() {
                   </svg>
                 </div>
                 <div style={{ flex: 1 }}>
-                  <div style={{ fontSize: 12, fontWeight: 500, color: 'var(--text)', marginBottom: 2 }}>ApplyMate AI for Chrome</div>
-                   <div style={{ fontSize: 10, color: 'var(--text-muted)', lineHeight: 1.5 }}>Save jobs with one click on LinkedIn, Indeed, and other job sites, fill forms automatically, and view resume match scores.</div>
+                  <div style={{ fontSize: 12, fontWeight: 500, color: 'var(--text)', marginBottom: 2 }}>{t('settings.chromeTitle')}</div>
+                   <div style={{ fontSize: 10, color: 'var(--text-muted)', lineHeight: 1.5 }}>{t('settings.chromeDescription')}</div>
                 </div>
                 <div style={{ display: 'flex', flexDirection: 'column', gap: 6, alignItems: 'flex-end', flexShrink: 0 }}>
                   <a
@@ -760,7 +760,7 @@ export function SettingsPage() {
                     }}
                   >
                     <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
-                    Install extension
+                    {t('settings.installExtension')}
                   </a>
                   <a
                     href="https://github.com/YuanshuoDu/applymate-jobcopilot"
@@ -768,7 +768,7 @@ export function SettingsPage() {
                     rel="noreferrer"
                     style={{ fontSize: 10, color: 'var(--text-muted)', textDecoration: 'none' }}
                   >
-                    View instructions for use →
+                    {t('settings.instructions')}
                   </a>
                 </div>
               </div>
@@ -789,7 +789,7 @@ export function SettingsPage() {
                   </div>
                   <span style={{ marginLeft: 'auto', fontSize: 10, background: 'rgba(79,70,229,0.12)', color: 'var(--primary)', borderRadius: 999, padding: '3px 10px', fontWeight: 500 }}>{billingStatus.label}</span>
                 </div>
-                <Btn variant="ghost" onClick={() => openBillingSupport('manage billing')}>Contact billing support</Btn>
+                <Btn variant="ghost" onClick={() => openBillingSupport('manage billing')}>{t('settings.contactBilling')}</Btn>
               </SettingsSection>
 
               {billingLoading && !billingData && <Card style={{ padding: 16, color: 'var(--text-muted)', fontSize: 12 }}>Loading plans…</Card>}
@@ -904,7 +904,7 @@ export function SettingsPage() {
                     toast.success('Account deleted', 'Redirecting…')
                     setTimeout(() => window.location.replace('/login'), 1500)
                   }
-                }}>Delete my account</Btn>
+                }}>{t('settings.deleteAccount')}</Btn>
               </Card>
             </>
           )}
@@ -917,12 +917,12 @@ export function SettingsPage() {
         <div style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.3)', zIndex: 200, display: 'flex', alignItems: 'center', justifyContent: 'center' }}
           onClick={e => { if (e.target === e.currentTarget) setShowCancelModal(false) }}>
           <Card style={{ width: 380, padding: 24 }}>
-            <div style={{ fontSize: 14, fontWeight: 500, marginBottom: 8 }}>Cancel {planLabel} plan?</div>
+            <div style={{ fontSize: 14, fontWeight: 500, marginBottom: 8 }}>{t('settings.cancelPlanTitle')} {planLabel}</div>
             <div style={{ fontSize: 12, color: 'var(--text-muted)', marginBottom: 20, lineHeight: 1.7 }}>
-              You&apos;ll lose access to all paid features at the end of your current billing period.
+              {t('settings.cancelPlanDescription')}
             </div>
             <div style={{ display: 'flex', gap: 8 }}>
-              <Btn variant="ghost"  style={{ flex: 1, justifyContent: 'center' }} onClick={() => setShowCancelModal(false)}>Keep plan</Btn>
+              <Btn variant="ghost"  style={{ flex: 1, justifyContent: 'center' }} onClick={() => setShowCancelModal(false)}>{t('settings.keepPlan')}</Btn>
               <Btn variant="danger" style={{ flex: 1, justifyContent: 'center' }} onClick={() => { setShowCancelModal(false); openBillingSupport(`cancel ${planLabel} plan`) }}>{t('settings.contactSupport')}</Btn>
             </div>
           </Card>
@@ -944,7 +944,7 @@ function KeyManagementSettings() {
     <div style={{ display: 'flex', flexDirection: 'column', gap: 20 }}>
       <SettingsSection title={t('settings.keysConnections')}>
         <div style={{ padding: '10px 0 2px', fontSize: 12, color: 'var(--text-muted)', lineHeight: 1.65 }}>
-          Keep every credential in one place. <strong style={{ color: 'var(--text)' }}>AI model keys</strong> power resume parsing, tailoring, and writing. <strong style={{ color: 'var(--text)' }}>Job discovery keys</strong> only fetch job listings and use your own provider quota.
+          {t('settings.keepCredentials')} <strong style={{ color: 'var(--text)' }}>{t('settings.aiModelKeys')}</strong> {t('settings.aiModelKeysDescription')} <strong style={{ color: 'var(--text)' }}>{t('settings.discoveryKeys')}</strong> {t('settings.discoveryKeysDescription')}
         </div>
       </SettingsSection>
       <AiModelSettings />
