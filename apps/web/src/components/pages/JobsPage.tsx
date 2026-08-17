@@ -384,26 +384,26 @@ function AddJobModal({ onClose, onAdded, prefillStatus }: {
           <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(180px, 1fr))', gap: 12 }}>
             <div>
               <label htmlFor="add-job-company" style={labelSt}>{t('jobs.companyRequired')}</label>
-              <input id="add-job-company" style={INPUT_STYLE} value={form.company} onChange={e => setForm(f => ({ ...f, company: e.target.value }))} placeholder="e.g. Stripe" />
+              <input id="add-job-company" style={INPUT_STYLE} value={form.company} onChange={e => setForm(f => ({ ...f, company: e.target.value }))} placeholder={t('jobs.companyPlaceholder')} />
             </div>
             <div>
               <label htmlFor="add-job-role" style={labelSt}>{t('jobs.roleRequired')}</label>
-              <input id="add-job-role" style={INPUT_STYLE} value={form.role} onChange={e => setForm(f => ({ ...f, role: e.target.value }))} placeholder="e.g. Backend Engineer" />
+              <input id="add-job-role" style={INPUT_STYLE} value={form.role} onChange={e => setForm(f => ({ ...f, role: e.target.value }))} placeholder={t('jobs.rolePlaceholder')} />
             </div>
           </div>
           <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(180px, 1fr))', gap: 12 }}>
             <div>
               <label htmlFor="add-job-location" style={labelSt}>{t('jobs.location')}</label>
-              <input id="add-job-location" style={INPUT_STYLE} value={form.location} onChange={e => setForm(f => ({ ...f, location: e.target.value }))} placeholder="e.g. Amsterdam, NL" />
+              <input id="add-job-location" style={INPUT_STYLE} value={form.location} onChange={e => setForm(f => ({ ...f, location: e.target.value }))} placeholder={t('jobs.locationPlaceholder')} />
             </div>
             <div>
               <label htmlFor="add-job-salary" style={labelSt}>{t('jobs.salaryLabel')}</label>
-              <input id="add-job-salary" style={INPUT_STYLE} value={form.salary} onChange={e => setForm(f => ({ ...f, salary: e.target.value }))} placeholder="e.g. €70k–90k" />
+              <input id="add-job-salary" style={INPUT_STYLE} value={form.salary} onChange={e => setForm(f => ({ ...f, salary: e.target.value }))} placeholder={t('jobs.salaryPlaceholder')} />
             </div>
           </div>
           <div>
             <label htmlFor="add-job-url" style={labelSt}>{t('jobs.jobUrl')}</label>
-            <input id="add-job-url" style={INPUT_STYLE} value={form.url} onChange={e => setForm(f => ({ ...f, url: e.target.value }))} placeholder="https://…" />
+            <input id="add-job-url" style={INPUT_STYLE} value={form.url} onChange={e => setForm(f => ({ ...f, url: e.target.value }))} placeholder={t('jobs.urlPlaceholder')} />
           </div>
           <div>
             <label htmlFor="add-job-status" style={labelSt}>{t('jobs.initialStatus')}</label>
@@ -836,7 +836,7 @@ function JobDetailDrawer({ job, onClose, onStatusChange, onUpdate, onDelete, onO
               {baseResumes.length > 1 && <select value={selectedResumeId} onChange={e => setSelectedResumeId(e.target.value)} style={{ ...drawerInputSt, width: '100%', marginBottom: 12 }}>{baseResumes.map(r => <option key={r.id} value={r.id}>{r.isDefault ? 'Default — ' : ''}{r.name}</option>)}</select>}
               <Btn variant="primary" onClick={handleTailorResume} disabled={tailoringLoading}>{tailoringLoading ? 'Creating tailored resume…' : 'Tailor in Resume'}</Btn>
             </div>}
-            <div style={{ display: 'flex', alignItems: 'center', gap: 12, color: 'var(--text-muted)', margin: '4px 0 20px' }}><span style={{ height: 1, background: 'var(--border)', flex: 1 }} /><span>OR</span><span style={{ height: 1, background: 'var(--border)', flex: 1 }} /></div>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 12, color: 'var(--text-muted)', margin: '4px 0 20px' }}><span style={{ height: 1, background: 'var(--border)', flex: 1 }} /><span>{t('jobs.or')}</span><span style={{ height: 1, background: 'var(--border)', flex: 1 }} /></div>
             <button onClick={() => auditNeedsEvidence ? setOpenPackItem('audit') : void autoTailorAndAudit()} disabled={packActionDisabled || currentPackAudited} style={{ width: '100%', minHeight: 56, padding: '14px', border: `2px solid ${packActionDisabled || currentPackAudited ? '#e2e8f0' : auditNeedsRepair ? '#dc2626' : '#2563eb'}`, borderRadius: 9, background: packActionDisabled || currentPackAudited ? '#f8fafc' : auditNeedsRepair ? '#fff7f7' : '#fff', color: packActionDisabled || currentPackAudited ? '#94a3b8' : auditNeedsRepair ? '#b42318' : '#2563eb', fontSize: 15, fontWeight: 700, cursor: packActionDisabled || currentPackAudited ? 'not-allowed' : 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 10, textAlign: 'center' }}><Sparkles size={19} style={{ flexShrink: 0 }} />{currentPackAudited ? 'Application pack ready' : autoPreparing ? 'Preparing application pack…' : auditNeedsEvidence ? 'Review evidence needed' : auditRetryOnly ? 'Retry independent audit' : auditNeedsRepair ? 'Fix with AI and re-audit' : 'Prepare full application pack automatically'}</button>
             {autoPreparing && <PreparationProgress stage={packStage} elapsed={preparationElapsed} />}
             <div style={{ textAlign: 'center', fontSize: 13, lineHeight: 1.55, color: 'var(--text-muted)', margin: '12px 28px 28px' }}>{auditRetryOnly ? 'Retrying the audit reuses your current resume and cover letter; it does not create new documents.' : auditNeedsEvidence ? 'Adding a confirmed fact saves it to Persona, then rewrites only the affected content.' : auditNeedsRepair ? 'This replaces unsupported claims; it does not invent experience, dates, or metrics.' : 'We’ll tailor your resume (if needed), generate a cover letter, and run an independent audit.'}</div>
@@ -853,9 +853,9 @@ function JobDetailDrawer({ job, onClose, onStatusChange, onUpdate, onDelete, onO
             </PackRow>
             {currentPackAudited && <button onClick={() => void downloadFinalPack()} disabled={downloadingPack} style={{ width: '100%', minHeight: 46, border: 0, borderRadius: 9, background: '#2563eb', color: '#fff', fontWeight: 700, cursor: 'pointer' }}>{downloadingPack ? (exportedPackFolder ? 'Opening job folder…' : 'Saving PDFs…') : exportedPackFolder ? 'Open job folder' : 'Save audited PDFs to D:\\My Jobs resume'}</button>}
             <PackRow number="4" title="Open & fill application" detail={applicationPreflight.canAutomate ? 'Available after all items are complete' : 'Requires a verified direct ATS application link'} done={false} locked={!currentPackAudited || !applicationPreflight.canAutomate} last onClick={currentPackAudited && applicationPreflight.canAutomate && job.url ? () => window.open(job.url!, '_blank', 'noopener,noreferrer') : undefined} />
-            <div style={{ borderTop: '1px solid var(--border)', marginTop: 8, paddingTop: 22 }}><div style={{ fontSize: 12, fontWeight: 700, color: '#64748b', marginBottom: 12 }}>REVIEW &amp; SUBMIT</div><div style={{ border: '1px solid #bfdbfe', background: '#f8fbff', borderRadius: 9, padding: '14px 16px', display: 'flex', gap: 12, fontSize: 13, lineHeight: 1.55 }}><Info size={22} color="#2563eb" style={{ flexShrink: 0, marginTop: 1 }} /><span><strong>You’ll review and submit on the employer site</strong><br /><span style={{ color: 'var(--text-muted)' }}>We’ll open the job in a new tab when your application pack is ready.</span></span></div></div>
+            <div style={{ borderTop: '1px solid var(--border)', marginTop: 8, paddingTop: 22 }}><div style={{ fontSize: 12, fontWeight: 700, color: '#64748b', marginBottom: 12 }}>{t('jobs.drawer.reviewSubmit')}</div><div style={{ border: '1px solid #bfdbfe', background: '#f8fbff', borderRadius: 9, padding: '14px 16px', display: 'flex', gap: 12, fontSize: 13, lineHeight: 1.55 }}><Info size={22} color="#2563eb" style={{ flexShrink: 0, marginTop: 1 }} /><span><strong>You’ll review and submit on the employer site</strong><br /><span style={{ color: 'var(--text-muted)' }}>We’ll open the job in a new tab when your application pack is ready.</span></span></div></div>
             <div style={{ borderTop: '1px solid var(--border)', marginTop: 28, paddingTop: 22 }}>
-              <div style={{ fontSize: 12, fontWeight: 700, color: '#64748b', marginBottom: 16 }}>JOB DETAILS</div>
+              <div style={{ fontSize: 12, fontWeight: 700, color: '#64748b', marginBottom: 16 }}>{t('jobs.drawer.jobDetails')}</div>
               <JobDetail label="Company" value={job.company} />
               {job.location && <JobDetail label="Location" value={job.location} />}
               {job.url && <JobDetail label="Job posting" value="View original posting" href={job.url} />}
@@ -865,7 +865,7 @@ function JobDetailDrawer({ job, onClose, onStatusChange, onUpdate, onDelete, onO
           {/* Description */}
           {job.description && (
             <div>
-              <div style={{ fontSize: 10, color: 'var(--text-muted)', fontWeight: 500, marginBottom: 6 }}>DESCRIPTION</div>
+              <div style={{ fontSize: 10, color: 'var(--text-muted)', fontWeight: 500, marginBottom: 6 }}>{t('jobs.drawer.description')}</div>
               <div style={{
                 fontSize: 12, color: 'var(--text)', lineHeight: 1.75, whiteSpace: 'pre-wrap',
                 background: 'var(--bg-secondary)', borderRadius: 6, padding: '10px 12px',
@@ -897,7 +897,7 @@ function JobDetailDrawer({ job, onClose, onStatusChange, onUpdate, onDelete, onO
           {/* Agent Analysis */}
           {job.analysisNote && (
             <div>
-              <div style={{ fontSize: 10, color: '#185FA5', fontWeight: 500, marginBottom: 6 }}>AI ANALYSIS</div>
+              <div style={{ fontSize: 10, color: '#185FA5', fontWeight: 500, marginBottom: 6 }}>{t('jobs.drawer.analysis')}</div>
               <div style={{ fontSize: 11, color: 'var(--text)', lineHeight: 1.7, whiteSpace: 'pre-wrap', background: 'rgba(24,95,165,0.06)', border: '0.5px solid rgba(24,95,165,0.15)', borderRadius: 6, padding: '8px 10px', maxHeight: 200, overflowY: 'auto' }}>
                 {job.analysisNote}
               </div>
@@ -907,12 +907,12 @@ function JobDetailDrawer({ job, onClose, onStatusChange, onUpdate, onDelete, onO
           {/* Dates */}
           <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10 }}>
             <div>
-              <div style={{ fontSize: 10, color: 'var(--text-muted)', fontWeight: 500, marginBottom: 2 }}>ADDED</div>
+              <div style={{ fontSize: 10, color: 'var(--text-muted)', fontWeight: 500, marginBottom: 2 }}>{t('jobs.drawer.added')}</div>
               <div style={{ fontSize: 11 }}>{fmtDate(job.createdAt)}</div>
             </div>
             {job.appliedAt && (
               <div>
-                <div style={{ fontSize: 10, color: 'var(--text-muted)', fontWeight: 500, marginBottom: 2 }}>APPLIED</div>
+                <div style={{ fontSize: 10, color: 'var(--text-muted)', fontWeight: 500, marginBottom: 2 }}>{t('jobs.drawer.applied')}</div>
                 <div style={{ fontSize: 11 }}>{fmtDate(job.appliedAt)}</div>
               </div>
             )}
@@ -945,7 +945,7 @@ function JobDetailDrawer({ job, onClose, onStatusChange, onUpdate, onDelete, onO
           {/* Notes */}
           <div>
             <div style={{ fontSize: 10, color: 'var(--text-muted)', fontWeight: 500, marginBottom: 6, display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-              <span>NOTES</span>
+              <span>{t('jobs.drawer.notes')}</span>
               {savingNotes && <span style={{ fontSize: 9, color: 'var(--text-muted)' }}>Saving…</span>}
             </div>
             <textarea
@@ -960,11 +960,11 @@ function JobDetailDrawer({ job, onClose, onStatusChange, onUpdate, onDelete, onO
 
           {/* Activity log */}
           <div>
-            <div style={{ fontSize: 10, color: 'var(--text-muted)', fontWeight: 500, marginBottom: 8 }}>ACTIVITY</div>
+            <div style={{ fontSize: 10, color: 'var(--text-muted)', fontWeight: 500, marginBottom: 8 }}>{t('jobs.drawer.activity')}</div>
             {loadingAct ? (
               <div style={{ fontSize: 11, color: 'var(--text-muted)' }}>Loading…</div>
             ) : activity.length === 0 ? (
-              <div style={{ fontSize: 11, color: 'var(--text-muted)' }}>No activity yet</div>
+              <div style={{ fontSize: 11, color: 'var(--text-muted)' }}>{t('jobs.drawer.noActivity')}</div>
             ) : (
               <div style={{ display: 'flex', flexDirection: 'column', gap: 0 }}>
                 {activity.map((a, i) => (
