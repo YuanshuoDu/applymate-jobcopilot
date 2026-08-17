@@ -5,6 +5,7 @@ import { CompanyLogo, ScorePill, useToast } from '@/components/ui'
 import { apiMutate } from '@/lib/hooks'
 import type { Job } from '@/lib/types'
 import { extractSearchQuery } from './search-query'
+import { useI18n } from '@/lib/i18n'
 
 // ── Types ────────────────────────────────────────────────────────────────────
 
@@ -176,6 +177,7 @@ const glassInput: React.CSSProperties = {
 // ── Main component ────────────────────────────────────────────────────────────
 
 export function SmartSearch({ onJobSaved, onOpenSettings }: { onJobSaved?: () => void; onOpenSettings?: () => void }) {
+  const { t } = useI18n()
   const toast = useToast()
   const inputRef = useRef<HTMLInputElement>(null)
   const lastSearch = useRef(loadLast())
@@ -337,8 +339,8 @@ export function SmartSearch({ onJobSaved, onOpenSettings }: { onJobSaved?: () =>
             onKeyDown={e => e.key === 'Enter' && doSearch()}
             onFocus={() => setSearchFocus(true)}
             onBlur={() => setSearchFocus(false)}
-            aria-label="Search jobs"
-            placeholder='Search jobs — e.g. "React Developer Amsterdam" or "Data Engineer Berlin"'
+            aria-label={t('jobs.searchJobs')}
+            placeholder={t('jobs.searchPlaceholder')}
             style={{
               ...glassInput,
               paddingLeft: 38, paddingRight: 12, height: 44, fontSize: 13,
@@ -348,7 +350,7 @@ export function SmartSearch({ onJobSaved, onOpenSettings }: { onJobSaved?: () =>
             }}
           />
           {q && (
-            <button type="button" aria-label="Clear search" title="Clear search" onClick={() => setQ('')} style={{ position: 'absolute', right: 10, top: '50%', transform: 'translateY(-50%)', background: 'none', border: 'none', cursor: 'pointer', color: 'var(--text-muted)', display: 'flex', padding: 2 }}>
+            <button type="button" aria-label={t('jobs.clearSearch')} title={t('jobs.clearSearch')} onClick={() => setQ('')} style={{ position: 'absolute', right: 10, top: '50%', transform: 'translateY(-50%)', background: 'none', border: 'none', cursor: 'pointer', color: 'var(--text-muted)', display: 'flex', padding: 2 }}>
               <Icon.X />
             </button>
           )}
@@ -356,7 +358,7 @@ export function SmartSearch({ onJobSaved, onOpenSettings }: { onJobSaved?: () =>
 
         <button
           type="button"
-          aria-label={searching ? 'Searching jobs' : isStale ? 'Apply job search filters' : 'Search jobs'}
+          aria-label={searching ? t('jobs.searchingJobs') : isStale ? t('jobs.applyFilters') : t('jobs.searchJobs')}
           onClick={doSearch}
           disabled={searching || !q.trim()}
           style={{
@@ -376,16 +378,16 @@ export function SmartSearch({ onJobSaved, onOpenSettings }: { onJobSaved?: () =>
           onMouseLeave={e => { e.currentTarget.style.boxShadow = isStale ? '0 4px 14px rgba(5,150,105,0.45)' : '0 4px 14px rgba(79,70,229,0.40)' }}
         >
           {searching
-            ? <><span style={{ width: 14, height: 14, border: '2px solid rgba(255,255,255,0.3)', borderTopColor: '#fff', borderRadius: '50%', animation: 'spin 0.7s linear infinite', display: 'inline-block' }} /> Searching…</>
+            ? <><span style={{ width: 14, height: 14, border: '2px solid rgba(255,255,255,0.3)', borderTopColor: '#fff', borderRadius: '50%', animation: 'spin 0.7s linear infinite', display: 'inline-block' }} /> {t('jobs.searching')}</>
             : isStale
-              ? <><Icon.Search /> Apply Filters</>
-              : <><Icon.Search /> Search</>
+              ? <><Icon.Search /> {t('jobs.applyFilters')}</>
+              : <><Icon.Search /> {t('jobs.search')}</>
           }
         </button>
 
         <button
           type="button"
-          aria-label={showFilters ? 'Hide search filters' : 'Show search filters'}
+          aria-label={showFilters ? t('jobs.hideFilters') : t('jobs.showFilters')}
           aria-expanded={showFilters}
           aria-controls="search-filters"
           onClick={toggleFilters}
