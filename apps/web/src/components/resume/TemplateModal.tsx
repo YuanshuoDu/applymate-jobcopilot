@@ -4,6 +4,7 @@ import { useState } from 'react'
 import { Btn } from '@/components/ui'
 import { ResumeRenderer, TEMPLATE_DEFS, ACCENT_COLORS, FONT_FAMILIES, DENSITY_SCALE } from './ResumeRenderer'
 import type { ResumeContent, TemplateOptions } from '@/lib/types'
+import { useI18n } from '@/lib/i18n'
 
 export const TEMPLATES = TEMPLATE_DEFS
 
@@ -25,6 +26,7 @@ export function TemplateModal({ current, currentOptions, onSelect, onClose }: {
   onSelect:        (id: string, opts: TemplateOptions) => void
   onClose:         () => void
 }) {
+  const { t } = useI18n()
   const [activeId,   setActiveId]   = useState(current)
   const [accentHex,  setAccentHex]  = useState(currentOptions?.accentColor ?? ACCENT_COLORS[0].hex)
   const [fontId,     setFontId]     = useState<'serif' | 'sans' | 'mono'>(currentOptions?.fontFamily ?? 'sans')
@@ -42,7 +44,7 @@ export function TemplateModal({ current, currentOptions, onSelect, onClose }: {
 
         {/* Header */}
         <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '16px 20px', borderBottom: '0.5px solid var(--border)', flexShrink: 0 }}>
-          <span style={{ fontSize: 15, fontWeight: 600 }}>Choose Template</span>
+          <span style={{ fontSize: 15, fontWeight: 600 }}>{t('resume.chooseTemplate')}</span>
           <Btn small variant="ghost" onClick={onClose}>✕</Btn>
         </div>
 
@@ -50,27 +52,27 @@ export function TemplateModal({ current, currentOptions, onSelect, onClose }: {
           {/* Template grid */}
           <div style={{ flex: 1, overflowY: 'auto', padding: 20 }}>
             <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: 14 }}>
-              {TEMPLATE_DEFS.map(t => (
-                <div key={t.id} onClick={() => setActiveId(t.id)}
-                  style={{ cursor: 'pointer', borderRadius: 8, overflow: 'hidden', border: activeId === t.id ? `2px solid ${accentHex}` : '1.5px solid var(--border)', transition: 'border-color 0.15s', background: 'var(--bg-secondary)' }}>
+              {TEMPLATE_DEFS.map(template => (
+                <div key={template.id} onClick={() => setActiveId(template.id)}
+                  style={{ cursor: 'pointer', borderRadius: 8, overflow: 'hidden', border: activeId === template.id ? `2px solid ${accentHex}` : '1.5px solid var(--border)', transition: 'border-color 0.15s', background: 'var(--bg-secondary)' }}>
                   {/* Thumbnail */}
                   <div style={{ height: 160, overflow: 'hidden', position: 'relative', background: '#f8f8f8' }}>
                     <div style={{ position: 'absolute', inset: 0, overflow: 'hidden' }}>
                       <ResumeRenderer
                         content={SAMPLE}
-                        templateId={t.id}
+                        templateId={template.id}
                         templateOptions={{ accentColor: accentHex, fontFamily: fontId as TemplateOptions['fontFamily'], density }}
                         scale={0.28}
                       />
                     </div>
-                    {activeId === t.id && (
+                    {activeId === template.id && (
                       <div style={{ position: 'absolute', top: 6, right: 6, background: accentHex, color: '#fff', borderRadius: '50%', width: 20, height: 20, display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 10, fontWeight: 700 }}>✓</div>
                     )}
                   </div>
                   {/* Label */}
                   <div style={{ padding: '8px 10px' }}>
-                    <div style={{ fontSize: 12, fontWeight: 500 }}>{t.name}</div>
-                    <div style={{ fontSize: 10, color: 'var(--text-muted)' }}>{t.desc}</div>
+                    <div style={{ fontSize: 12, fontWeight: 500 }}>{t(`resume.template.${template.id}.name`)}</div>
+                    <div style={{ fontSize: 10, color: 'var(--text-muted)' }}>{t(`resume.template.${template.id}.description`)}</div>
                   </div>
                 </div>
               ))}
@@ -82,7 +84,7 @@ export function TemplateModal({ current, currentOptions, onSelect, onClose }: {
 
             {/* Accent color */}
             <div>
-              <div style={{ fontSize: 10, fontWeight: 600, color: 'var(--text-muted)', marginBottom: 10 }}>ACCENT COLOR</div>
+              <div style={{ fontSize: 10, fontWeight: 600, color: 'var(--text-muted)', marginBottom: 10 }}>{t('resume.accentColor')}</div>
               <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8 }}>
                 {ACCENT_COLORS.map(ac => (
                   <button key={ac.id} onClick={() => setAccentHex(ac.hex)} title={ac.label}
@@ -93,7 +95,7 @@ export function TemplateModal({ current, currentOptions, onSelect, onClose }: {
 
             {/* Font */}
             <div>
-              <div style={{ fontSize: 10, fontWeight: 600, color: 'var(--text-muted)', marginBottom: 10 }}>FONT STYLE</div>
+              <div style={{ fontSize: 10, fontWeight: 600, color: 'var(--text-muted)', marginBottom: 10 }}>{t('resume.fontStyle')}</div>
               <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
                 {FONT_FAMILIES.map(f => (
                   <button key={f.id} onClick={() => setFontId(f.id as 'serif' | 'sans' | 'mono')}
@@ -107,7 +109,7 @@ export function TemplateModal({ current, currentOptions, onSelect, onClose }: {
 
             {/* Density */}
             <div>
-              <div style={{ fontSize: 10, fontWeight: 600, color: 'var(--text-muted)', marginBottom: 10 }}>SPACING</div>
+              <div style={{ fontSize: 10, fontWeight: 600, color: 'var(--text-muted)', marginBottom: 10 }}>{t('resume.spacing')}</div>
               <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
                 {(Object.keys(DENSITY_SCALE) as Array<keyof typeof DENSITY_SCALE>).map(d => (
                   <button key={d} onClick={() => setDensity(d)}
@@ -122,8 +124,8 @@ export function TemplateModal({ current, currentOptions, onSelect, onClose }: {
 
         {/* Footer */}
         <div style={{ padding: '12px 20px', borderTop: '0.5px solid var(--border)', display: 'flex', justifyContent: 'flex-end', gap: 10, flexShrink: 0 }}>
-          <Btn small variant="ghost" onClick={onClose}>Cancel</Btn>
-          <Btn small variant="primary" onClick={handleApply}>Apply Template</Btn>
+          <Btn small variant="ghost" onClick={onClose}>{t('common.cancel')}</Btn>
+          <Btn small variant="primary" onClick={handleApply}>{t('resume.applyTemplate')}</Btn>
         </div>
       </div>
     </div>
