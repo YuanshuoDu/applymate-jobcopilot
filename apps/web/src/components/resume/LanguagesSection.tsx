@@ -67,7 +67,7 @@ export function LanguagesSection({ languages, onChange, dragHandleProps, onRemov
                   </select>
                   <button onClick={() => setEditIdx(null)} style={{ fontSize: 10, color: 'var(--primary)', background: 'none', border: 'none', cursor: 'pointer', fontWeight: 500 }}>{t('common.done')}</button>
                   <button onClick={() => { onChange(languages.filter((_,xi)=>xi!==i)); setEditIdx(null) }}
-                    style={{ fontSize: 10, color: 'var(--c-danger)', background: 'none', border: 'none', cursor: 'pointer' }}>Del</button>
+                    style={{ fontSize: 10, color: 'var(--c-danger)', background: 'none', border: 'none', cursor: 'pointer' }}>{t('common.delete')}</button>
                 </div>
               ) : (
                 <div key={i} onClick={() => setEditIdx(i)} title={t('resume.clickToEdit')}

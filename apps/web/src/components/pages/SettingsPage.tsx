@@ -562,19 +562,19 @@ export function SettingsPage() {
                       </div>
 
                       <FieldRow label={t('settings.fullName')}><Input value={name} onChange={e => setName(e.target.value)} placeholder={t('settings.yourName')} /></FieldRow>
-                      <FieldRow label={t('settings.email')}><Input value={user?.email ?? ''} readOnly placeholder="email@example.com" /></FieldRow>
+                      <FieldRow label={t('settings.email')}><Input value={user?.email ?? ''} readOnly placeholder={t('settings.emailPlaceholder')} /></FieldRow>
                       <FieldRow label={t('settings.phone')}><Input type="tel" value={phone} onChange={e => setPhone(e.target.value)} placeholder="+1 555 000 0000" /></FieldRow>
-                      <FieldRow label={t('settings.location')}><Input value={location} onChange={e => setLocation(e.target.value)} placeholder="City, Country" /></FieldRow>
-                      <FieldRow label="LinkedIn"><Input value={linkedin} onChange={e => setLinkedin(e.target.value)} placeholder="linkedin.com/in/you" /></FieldRow>
-                      <FieldRow label="GitHub"><Input value={github} onChange={e => setGithub(e.target.value)} placeholder="github.com/you" /></FieldRow>
+                      <FieldRow label={t('settings.location')}><Input value={location} onChange={e => setLocation(e.target.value)} placeholder={t('settings.cityCountry')} /></FieldRow>
+                      <FieldRow label={t('settings.linkedin')}><Input value={linkedin} onChange={e => setLinkedin(e.target.value)} placeholder={t('settings.linkedinPlaceholder')} /></FieldRow>
+                      <FieldRow label={t('settings.github')}><Input value={github} onChange={e => setGithub(e.target.value)} placeholder={t('settings.githubPlaceholder')} /></FieldRow>
                     </>
                   )}
                 </SettingsSection>
 
                 <SettingsSection title={t('settings.jobPrefs')}>
-                  <FieldRow label={t('settings.targetRoles')}>    <Input value={prefRoles}     onChange={e => setPrefRoles(e.target.value)}     placeholder="Backend Engineer, SWE" /></FieldRow>
-                  <FieldRow label={t('settings.targetLocations')}><Input value={prefLocations} onChange={e => setPrefLocations(e.target.value)} placeholder="Amsterdam, Berlin, Remote" /></FieldRow>
-                  <FieldRow label={t('settings.salary')}><Input value={prefSalary}   onChange={e => setPrefSalary(e.target.value)}    placeholder="EUR65,000 - EUR90,000" /></FieldRow>
+                  <FieldRow label={t('settings.targetRoles')}>    <Input value={prefRoles}     onChange={e => setPrefRoles(e.target.value)}     placeholder={t('settings.rolesPlaceholder')} /></FieldRow>
+                  <FieldRow label={t('settings.targetLocations')}><Input value={prefLocations} onChange={e => setPrefLocations(e.target.value)} placeholder={t('settings.locationsPlaceholder')} /></FieldRow>
+                  <FieldRow label={t('settings.salary')}><Input value={prefSalary}   onChange={e => setPrefSalary(e.target.value)}    placeholder={t('settings.salaryPlaceholder')} /></FieldRow>
                   <FieldRow label={t('settings.workAuth')}>
                     <select value={prefVisa} onChange={e => setPrefVisa(e.target.value)} style={{ padding: '6px 10px', fontSize: 12, border: '0.5px solid var(--border)', borderRadius: 6, background: 'var(--bg)', color: 'var(--text)', outline: 'none', maxWidth: 260, width: '100%' }}>
                       <option value="EU citizen / no visa required">{t('settings.euCitizen')}</option>
@@ -682,7 +682,7 @@ export function SettingsPage() {
                         <div style={{ fontSize: 12, fontWeight: 500, display: 'flex', alignItems: 'center', gap: 6 }}>
                           {acc.name}
                           {gmailNeedsFix && (
-                            <span style={{ fontSize: 9, background: 'rgba(220,38,38,0.12)', color: 'var(--c-danger)', borderRadius: 999, padding: '1px 6px' }}>Needs fix</span>
+                            <span style={{ fontSize: 9, background: 'rgba(220,38,38,0.12)', color: 'var(--c-danger)', borderRadius: 999, padding: '1px 6px' }}>{t('settings.needsFix')}</span>
                           )}
                         </div>
                         <div style={{ fontSize: 10, color: 'var(--text-muted)' }}>
@@ -718,7 +718,7 @@ export function SettingsPage() {
                             )}
                         </div>
                       ) : !acc.available ? (
-                         <span title={acc.desc}><Btn small variant="ghost" disabled>Unavailable</Btn></span>
+                         <span title={acc.desc}><Btn small variant="ghost" disabled>{t('settings.unavailable')}</Btn></span>
                       ) : (
                          <Btn small variant="primary" disabled={accountsLoading || accountAction !== null} onClick={() => {
                            if (isGmail) {
@@ -726,7 +726,7 @@ export function SettingsPage() {
                           } else if (acc.id === 'github') {
                             void connectGithub()
                           }
-                        }}>Connect</Btn>
+                        }}>{t('settings.connect')}</Btn>
                       )}
                     </div>
                   )
@@ -735,7 +735,7 @@ export function SettingsPage() {
             </SettingsSection>
 
             {/* ── Chrome Extension ── */}
-            <SettingsSection title="Chrome Expand">
+            <SettingsSection title={t('settings.chromeExpand')}>
               <div style={{ display: 'flex', alignItems: 'center', gap: 14, padding: 14, background: 'var(--bg-secondary)', borderRadius: 10, border: '0.5px solid var(--border)', marginTop: 4 }}>
                 {/* Chrome puzzle icon */}
                 <div style={{ width: 36, height: 36, borderRadius: 8, background: 'rgba(79,70,229,0.12)', color: 'var(--primary)', display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0 }}>
@@ -802,7 +802,7 @@ export function SettingsPage() {
                     <Card key={plan.key} style={{ padding: 16, border: isCurrent ? '1.5px solid var(--primary)' : '0.5px solid var(--border)', background: isCurrent ? 'rgba(79,70,229,0.03)' : 'var(--bg)' }}>
                       <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 12 }}>
                         <span style={{ fontSize: 13, fontWeight: 500 }}>{plan.name}</span>
-                        {isCurrent && <span style={{ fontSize: 10, background: 'rgba(79,70,229,0.12)', color: 'var(--primary)', borderRadius: 999, padding: '2px 7px' }}>Current</span>}
+                        {isCurrent && <span style={{ fontSize: 10, background: 'rgba(79,70,229,0.12)', color: 'var(--primary)', borderRadius: 999, padding: '2px 7px' }}>{t('settings.current')}</span>}
                       </div>
                       <div style={{ marginBottom: 12 }}>
                         <span style={{ fontSize: 22, fontWeight: 500 }}>{plan.price}</span>
@@ -878,7 +878,7 @@ export function SettingsPage() {
               </SettingsSection>
 
               <Card style={{ padding: 16, border: '0.5px solid rgba(163,45,45,0.3)', background: 'rgba(163,45,45,0.03)' }}>
-                <div style={{ fontSize: 12, fontWeight: 500, color: 'var(--c-danger)', marginBottom: 8 }}>Danger Zone</div>
+                <div style={{ fontSize: 12, fontWeight: 500, color: 'var(--c-danger)', marginBottom: 8 }}>{t('settings.dangerZone')}</div>
                 <div style={{ fontSize: 11, color: 'var(--text-muted)', marginBottom: 12 }}>
                   Once you delete your account, there is no going back. All your data — jobs, resumes, cover letters, settings — will be permanently removed.
                 </div>
@@ -923,7 +923,7 @@ export function SettingsPage() {
             </div>
             <div style={{ display: 'flex', gap: 8 }}>
               <Btn variant="ghost"  style={{ flex: 1, justifyContent: 'center' }} onClick={() => setShowCancelModal(false)}>Keep plan</Btn>
-              <Btn variant="danger" style={{ flex: 1, justifyContent: 'center' }} onClick={() => { setShowCancelModal(false); openBillingSupport(`cancel ${planLabel} plan`) }}>Contact support</Btn>
+              <Btn variant="danger" style={{ flex: 1, justifyContent: 'center' }} onClick={() => { setShowCancelModal(false); openBillingSupport(`cancel ${planLabel} plan`) }}>{t('settings.contactSupport')}</Btn>
             </div>
           </Card>
         </div>
@@ -939,9 +939,10 @@ type ApiKeyStatus = DiscoveryStatusView & { hasAdzuna: boolean; hasRapidapi: boo
 type DiscoveryTestStatus = 'idle' | 'testing' | 'ok' | { error: string }
 
 function KeyManagementSettings() {
+  const { t } = useI18n()
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 20 }}>
-      <SettingsSection title="Keys & connections">
+      <SettingsSection title={t('settings.keysConnections')}>
         <div style={{ padding: '10px 0 2px', fontSize: 12, color: 'var(--text-muted)', lineHeight: 1.65 }}>
           Keep every credential in one place. <strong style={{ color: 'var(--text)' }}>AI model keys</strong> power resume parsing, tailoring, and writing. <strong style={{ color: 'var(--text)' }}>Job discovery keys</strong> only fetch job listings and use your own provider quota.
         </div>
@@ -953,6 +954,7 @@ function KeyManagementSettings() {
 }
 
 function ApiKeysSettings() {
+  const { t } = useI18n()
   const toast = useToast()
   const [status, setStatus] = useState<ApiKeyStatus>({ hasAdzuna: false, hasRapidapi: false })
   const [adzunaAppId, setAdzunaAppId] = useState('')
@@ -1082,7 +1084,7 @@ function ApiKeysSettings() {
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
-      <SettingsSection title="Job discovery APIs">
+      <SettingsSection title={t('settings.discoveryApis')}>
         <div style={{ fontSize: 11, color: 'var(--text-muted)', lineHeight: 1.6, padding: '10px 0 4px' }}>
           These keys only search job boards. They do not run AI features or parse your resume. Save first, then test the provider; saved values stay masked.
         </div>

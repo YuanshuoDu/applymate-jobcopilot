@@ -3,6 +3,7 @@
 import React, { useEffect, useState } from 'react'
 import { useAdminPrompt } from './AdminPromptDialog'
 import { adminMutationHeaders } from '@/lib/admin/client'
+import { useI18n } from '@/lib/i18n'
 
 type ApiKeyStatus = {
   id: string
@@ -12,6 +13,7 @@ type ApiKeyStatus = {
 }
 
 export function AdminUserApiKeysPanel({ userId, canRevoke }: { userId: string; canRevoke: boolean }) {
+  const { t } = useI18n()
   const [keys, setKeys] = useState<ApiKeyStatus | null>(null)
   const [notice, setNotice] = useState('')
   const [loading, setLoading] = useState(true)
@@ -35,7 +37,7 @@ export function AdminUserApiKeysPanel({ userId, canRevoke }: { userId: string; c
     setBusy(true)
     const response = await fetch(`/api/admin/v1/users/${userId}/api-keys`, { method: 'DELETE', headers: { ...adminMutationHeaders({ json: false }), 'x-admin-reason': reason } })
     const payload = await response.json().catch(() => null) as { error?: string; revoked?: boolean } | null
-    setNotice(response.ok ? (payload?.revoked ? 'User API keys revoked.' : 'No user API keys were present.') : payload?.error ?? 'Unable to revoke user API keys.')
+    setNotice(response.ok ? (payload?.revoked ? t('adminKeys.revoked') : t('adminKeys.none')) : payload?.error ?? t('adminKeys.empty'))
     if (response.ok) await load()
     setBusy(false)
   }
@@ -44,13 +46,13 @@ export function AdminUserApiKeysPanel({ userId, canRevoke }: { userId: string; c
     <>
       <section className="admin-detail-settings">
         <div className="admin-settings-heading">
-          <div><h2>User API keys</h2><p>Only provider presence is shown; secret values are never returned.</p></div>
+          <div><h2>{t('adminKeys.title')}</h2><p>{t('adminKeys.description')}</p></div>
           <span role="status">{notice}</span>
         </div>
-        {loading ? <p className="admin-settings-empty">Loading key status...</p> : !keys ? <p className="admin-settings-empty">No user-managed provider keys are configured.</p> : (
+        {loading ? <p className="admin-settings-empty">{t('adminKeys.loading')}</p> : !keys ? <p className="admin-settings-empty">{t('adminKeys.empty')}</p> : (
           <>
-            <div className="admin-settings-status-list"><span>Adzuna: {keys.providers.adzuna ? 'configured' : 'not configured'}</span><span>RapidAPI: {keys.providers.rapidapi ? 'configured' : 'not configured'}</span><span>Updated: {new Date(keys.updatedAt).toLocaleString()}</span></div>
-            {canRevoke && <div className="admin-inline-actions"><button className="admin-row-action" type="button" disabled={busy} onClick={() => void revoke()}>Revoke all keys</button></div>}
+            <div className="admin-settings-status-list"><span>Adzuna: {keys.providers.adzuna ? t('adminKeys.configured') : t('adminKeys.notConfigured')}</span><span>RapidAPI: {keys.providers.rapidapi ? t('adminKeys.configured') : t('adminKeys.notConfigured')}</span><span>{t('adminKeys.updated')}: {new Date(keys.updatedAt).toLocaleString()}</span></div>
+            {canRevoke && <div className="admin-inline-actions"><button className="admin-row-action" type="button" disabled={busy} onClick={() => void revoke()}>{t('adminKeys.revokeAll')}</button></div>}
           </>
         )}
       </section>
