@@ -1,6 +1,7 @@
 'use client'
 
 import { useState } from 'react'
+import { useI18n } from '@/lib/i18n'
 
 export type AiFieldContext = {
   sectionTitle?:   string
@@ -15,6 +16,7 @@ export function AiFieldSuggestion({ fieldType, currentValue, context, onApply }:
   context?:     AiFieldContext
   onApply:      (value: string) => void
 }) {
+  const { t } = useI18n()
   const [open,         setOpen]         = useState(false)
   const [loading,      setLoading]      = useState(false)
   const [suggestions,  setSuggestions]  = useState<string[]>([])
@@ -46,7 +48,7 @@ export function AiFieldSuggestion({ fieldType, currentValue, context, onApply }:
         }),
       })
       const data = await res.json()
-      if (!res.ok) throw new Error(data.error ?? 'API error')
+      if (!res.ok) throw new Error(data.error ?? t('resume.apiError'))
       const list: string[] = data.suggestions ?? []
 
       if (fb !== undefined) {
@@ -80,14 +82,14 @@ export function AiFieldSuggestion({ fieldType, currentValue, context, onApply }:
 
   if (!open) {
     return (
-      <button onClick={handleOpen} title="Get AI suggestions"
+      <button onClick={handleOpen} title={t('resume.getAiSuggestions')}
         style={{
           display: 'inline-flex', alignItems: 'center', gap: 3,
           fontSize: 10, color: 'var(--primary)',
           background: 'rgba(24,95,165,0.07)', border: '0.5px solid rgba(79,70,229,0.20)',
           borderRadius: 10, padding: '2px 8px', cursor: 'pointer', marginTop: 4,
         }}>
-        ✦ AI suggest
+        ✦ {t('resume.aiSuggest')}
       </button>
     )
   }
@@ -104,12 +106,12 @@ export function AiFieldSuggestion({ fieldType, currentValue, context, onApply }:
         padding: '7px 10px', background: 'rgba(79,70,229,0.06)',
         borderBottom: '0.5px solid rgba(79,70,229,0.15)',
       }}>
-        <span style={{ fontSize: 11, fontWeight: 500, color: 'var(--primary)' }}>✦ AI Suggestions</span>
+        <span style={{ fontSize: 11, fontWeight: 500, color: 'var(--primary)' }}>✦ {t('resume.aiSuggestions')}</span>
         <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
           <button onClick={() => fetchSuggestions()} disabled={loading}
-            title="Refresh all suggestions"
+            title={t('resume.refreshSuggestions')}
             style={{ fontSize: 10, color: 'var(--primary)', background: 'none', border: 'none', cursor: 'pointer', padding: 0 }}>
-            {loading ? '…' : '↻ Refresh'}
+            {loading ? '…' : `↻ ${t('common.refresh')}`}
           </button>
           <button onClick={() => setOpen(false)}
             style={{ fontSize: 12, color: 'var(--text-muted)', background: 'none', border: 'none', cursor: 'pointer', padding: 0, lineHeight: 1 }}>
@@ -123,10 +125,10 @@ export function AiFieldSuggestion({ fieldType, currentValue, context, onApply }:
         {loading ? (
           <div style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '12px 4px', color: 'var(--text-muted)', fontSize: 11 }}>
             <div style={{ width: 14, height: 14, border: '2px solid rgba(79,70,229,0.30)', borderTopColor: 'var(--primary)', borderRadius: '50%', animation: 'spin 0.7s linear infinite', flexShrink: 0 }} />
-            Generating 3 suggestions…
+            {t('resume.generatingSuggestions')}
           </div>
         ) : suggestions.length === 0 ? (
-          <div style={{ fontSize: 11, color: 'var(--text-muted)', padding: '8px 4px' }}>No suggestions yet.</div>
+          <div style={{ fontSize: 11, color: 'var(--text-muted)', padding: '8px 4px' }}>{t('resume.noSuggestions')}</div>
         ) : suggestions.map((s, i) => (
           <div key={i} style={{
             border: '0.5px solid var(--border)', borderRadius: 6,
@@ -134,15 +136,15 @@ export function AiFieldSuggestion({ fieldType, currentValue, context, onApply }:
           }}>
             {/* Option number bar */}
             <div style={{ padding: '4px 8px', background: 'var(--bg)', borderBottom: '0.5px solid var(--border)', display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
-              <span style={{ fontSize: 9, fontWeight: 600, color: 'var(--text-muted)' }}>OPTION {i + 1}</span>
+              <span style={{ fontSize: 9, fontWeight: 600, color: 'var(--text-muted)' }}>{t('resume.option')} {i + 1}</span>
               <div style={{ display: 'flex', gap: 8 }}>
                 <button onClick={() => handleApply(i)}
                   style={{ fontSize: 10, color: 'var(--c-success)', fontWeight: 600, background: 'rgba(59,109,17,0.08)', border: '0.5px solid rgba(5,150,105,0.20)', borderRadius: 4, padding: '1px 8px', cursor: 'pointer' }}>
-                  Apply
+                  {t('common.apply')}
                 </button>
                 <button onClick={() => setShowFeedback(prev => { const n = [...prev]; n[i] = !n[i]; return n })}
                   style={{ fontSize: 10, color: 'var(--text-muted)', background: 'none', border: 'none', cursor: 'pointer', padding: 0 }}>
-                  {showFeedback[i] ? 'Cancel' : 'Revise'}
+                  {showFeedback[i] ? t('common.cancel') : t('resume.revise')}
                 </button>
               </div>
             </div>
@@ -168,7 +170,7 @@ export function AiFieldSuggestion({ fieldType, currentValue, context, onApply }:
                   value={feedbacks[i]}
                   onChange={e => setFeedbacks(prev => { const n = [...prev]; n[i] = e.target.value; return n })}
                   onKeyDown={e => { if (e.key === 'Enter' && feedbacks[i].trim()) fetchSuggestions({ index: i, text: feedbacks[i] }) }}
-                  placeholder="e.g. make it more quantifiable, add leadership…"
+                  placeholder={t('resume.feedbackPlaceholder')}
                   style={{
                     flex: 1, fontSize: 11, padding: '4px 8px',
                     border: '0.5px solid var(--border)', borderRadius: 5,
@@ -183,7 +185,7 @@ export function AiFieldSuggestion({ fieldType, currentValue, context, onApply }:
                     background: 'rgba(79,70,229,0.08)', border: '0.5px solid rgba(79,70,229,0.20)',
                     borderRadius: 4, padding: '3px 10px', cursor: 'pointer', whiteSpace: 'nowrap',
                   }}>
-                  {regen[i] ? '…' : '↻ Regen'}
+                  {regen[i] ? '…' : `↻ ${t('resume.regenerate')}`}
                 </button>
               </div>
             )}
