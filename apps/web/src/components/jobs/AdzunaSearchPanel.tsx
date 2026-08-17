@@ -208,10 +208,10 @@ export function AdzunaSearchPanel({ variant = 'panel', onJobSaved, onClose }: Pr
       {!isPage && (
         <div style={{ padding: '12px 16px', borderBottom: '0.5px solid var(--border)', display: 'flex', alignItems: 'center', justifyContent: 'space-between', background: 'var(--bg-secondary)' }}>
           <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-            <span style={{ fontSize: 13, fontWeight: 600 }}>🌍 Search Jobs via Adzuna</span>
+            <span style={{ fontSize: 13, fontWeight: 600 }}>🌍 {t('jobs.adzunaTitle')}</span>
             {searched && !searching && (
               <span style={{ fontSize: 10, color: 'var(--text-muted)', background: 'var(--bg)', border: '0.5px solid var(--border)', borderRadius: 999, padding: '1px 8px' }}>
-                {total.toLocaleString()} results
+                {t('jobs.resultsCount').replace('{count}', total.toLocaleString())}
               </span>
             )}
           </div>
