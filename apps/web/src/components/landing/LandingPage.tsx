@@ -329,7 +329,7 @@ export function LandingPage({ plans = FALLBACK_PLANS }: { plans?: PublicPlan[] }
 
           {/* Links */}
           <div className="landing-nav-links">
-            {[['#features','Features'],['#how-it-works','How it Works'],['#pricing','Pricing'],['#faq','FAQ'],['#contact','Contact']].map(([href,label]) => (
+            {[[ '#features', t('landing.features') ], [ '#how-it-works', t('landing.howItWorks') ], [ '#pricing', t('landing.pricing') ], [ '#faq', t('landing.faq') ], [ '#contact', t('landing.contact') ]].map(([href,label]) => (
               <a key={href} href={href} onClick={closeMobileMenu} style={{ color: C.textMuted, textDecoration: 'none', fontWeight: 500, transition: 'color 0.15s' }}
                 onMouseEnter={e => (e.currentTarget.style.color = '#fff')}
                 onMouseLeave={e => (e.currentTarget.style.color = C.textMuted)}
@@ -342,17 +342,17 @@ export function LandingPage({ plans = FALLBACK_PLANS }: { plans?: PublicPlan[] }
             <Link href="/login" style={{ fontSize: 12, fontWeight: 600, color: C.textMuted, textDecoration: 'none', padding: '6px 14px', border: '1px solid rgba(255,255,255,0.12)', borderRadius: 9, background: 'rgba(255,255,255,0.04)', transition: 'all 0.15s' }}
               onMouseEnter={e => { e.currentTarget.style.color='#fff'; e.currentTarget.style.borderColor='rgba(255,255,255,0.24)' }}
               onMouseLeave={e => { e.currentTarget.style.color=C.textMuted; e.currentTarget.style.borderColor='rgba(255,255,255,0.12)' }}
-            >Sign in</Link>
+            >{t('landing.signIn')}</Link>
             <Link href="/register" className="btn-shine" style={{ fontSize: 12, fontWeight: 700, color: '#fff', textDecoration: 'none', padding: '7px 18px', background: 'linear-gradient(135deg, #4F46E5, #7C3AED)', borderRadius: 9, boxShadow: '0 4px 16px rgba(79,70,229,0.50)', transition: 'all 0.2s', letterSpacing: '0.01em' }}
               onMouseEnter={e => { e.currentTarget.style.transform='translateY(-1px)'; e.currentTarget.style.boxShadow='0 6px 22px rgba(79,70,229,0.65)' }}
               onMouseLeave={e => { e.currentTarget.style.transform='none'; e.currentTarget.style.boxShadow='0 4px 16px rgba(79,70,229,0.50)' }}
-            >Get started free →</Link>
+            >{t('landing.getStarted')}</Link>
           </div>
 
           <button
             type="button"
             className="landing-menu-toggle"
-            aria-label={mobileMenuOpen ? 'Close navigation menu' : 'Open navigation menu'}
+            aria-label={mobileMenuOpen ? t('landing.closeMenu') : t('landing.openMenu')}
             aria-expanded={mobileMenuOpen}
             aria-controls="landing-mobile-menu"
             onClick={() => setMobileMenuOpen(open => !open)}
@@ -364,13 +364,13 @@ export function LandingPage({ plans = FALLBACK_PLANS }: { plans?: PublicPlan[] }
           {mobileMenuOpen && (
             <div id="landing-mobile-menu" className="landing-mobile-menu" style={{ position: 'absolute', top: 'calc(100% + 8px)', left: 0, right: 0, flexDirection: 'column', gap: 2, padding: 10, background: 'rgba(8,11,20,0.96)', backdropFilter: 'blur(24px)', border: '1px solid rgba(255,255,255,0.14)', borderRadius: 14, boxShadow: '0 18px 40px rgba(0,0,0,0.45)' }}>
               {[
-                ['#features', 'Features'], ['#how-it-works', 'How it Works'], ['#pricing', 'Pricing'], ['#faq', 'FAQ'], ['#contact', 'Contact'],
+                ['#features', t('landing.features')], ['#how-it-works', t('landing.howItWorks')], ['#pricing', t('landing.pricing')], ['#faq', t('landing.faq')], ['#contact', t('landing.contact')],
               ].map(([href, label]) => (
                 <a key={href} href={href} onClick={closeMobileMenu} style={{ color: C.textMuted, textDecoration: 'none', fontSize: 13, fontWeight: 600, padding: '0 12px' }}>{label}</a>
               ))}
               <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8, padding: '8px 0 0', borderTop: '1px solid rgba(255,255,255,0.08)', marginTop: 4 }}>
-                <Link href="/login" onClick={closeMobileMenu} style={{ color: C.textMuted, textDecoration: 'none', fontSize: 12, fontWeight: 600, padding: '10px 12px', textAlign: 'center', border: '1px solid rgba(255,255,255,0.12)', borderRadius: 9 }}>Sign in</Link>
-                <Link href="/register" onClick={closeMobileMenu} style={{ color: '#fff', textDecoration: 'none', fontSize: 12, fontWeight: 700, padding: '10px 12px', textAlign: 'center', background: 'linear-gradient(135deg, #4F46E5, #7C3AED)', borderRadius: 9 }}>Get started</Link>
+                <Link href="/login" onClick={closeMobileMenu} style={{ color: C.textMuted, textDecoration: 'none', fontSize: 12, fontWeight: 600, padding: '10px 12px', textAlign: 'center', border: '1px solid rgba(255,255,255,0.12)', borderRadius: 9 }}>{t('landing.signIn')}</Link>
+                <Link href="/register" onClick={closeMobileMenu} style={{ color: '#fff', textDecoration: 'none', fontSize: 12, fontWeight: 700, padding: '10px 12px', textAlign: 'center', background: 'linear-gradient(135deg, #4F46E5, #7C3AED)', borderRadius: 9 }}>{t('landing.getStartedShort')}</Link>
               </div>
             </div>
           )}
@@ -429,7 +429,7 @@ export function LandingPage({ plans = FALLBACK_PLANS }: { plans?: PublicPlan[] }
 
         {/* Scroll cue */}
         <div style={{ position: 'absolute', bottom: 28, left: '50%', display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 6, animation: 'floatDown 2.4s ease-in-out infinite' }}>
-          <div style={{ fontSize: 10, color: C.textSubtle, letterSpacing: '0.06em', textTransform: 'uppercase' }}>Scroll</div>
+          <div style={{ fontSize: 10, color: C.textSubtle, letterSpacing: '0.06em', textTransform: 'uppercase' }}>{t('landing.scroll')}</div>
           <div style={{ width: 1, height: 36, background: 'linear-gradient(180deg, rgba(255,255,255,0.35), transparent)' }} />
         </div>
       </section>
@@ -438,7 +438,7 @@ export function LandingPage({ plans = FALLBACK_PLANS }: { plans?: PublicPlan[] }
       <section id="features" style={{ position: 'relative', zIndex: 1, padding: '90px 24px', maxWidth: 1140, margin: '0 auto' }}>
         <Reveal>
           <div style={{ textAlign: 'center', marginBottom: 60 }}>
-            <Label>Features</Label>
+            <Label>{t('landing.features')}</Label>
             <h2 style={{ fontSize: 'clamp(28px, 4vw, 46px)', fontWeight: 800, letterSpacing: '-0.035em', marginBottom: 14 }}>
               Every step of your job search,<br /><span style={gradientText}>handled by AI</span>
             </h2>
@@ -473,7 +473,7 @@ export function LandingPage({ plans = FALLBACK_PLANS }: { plans?: PublicPlan[] }
         <div style={{ maxWidth: 960, margin: '0 auto' }}>
           <Reveal>
             <div style={{ textAlign: 'center', marginBottom: 60 }}>
-              <Label color="#FB923C" bg="rgba(251,146,60,0.12)" bd="rgba(251,146,60,0.22)">How it Works</Label>
+              <Label color="#FB923C" bg="rgba(251,146,60,0.12)" bd="rgba(251,146,60,0.22)">{t('landing.howItWorks')}</Label>
               <h2 style={{ fontSize: 'clamp(28px, 4vw, 46px)', fontWeight: 800, letterSpacing: '-0.035em', marginBottom: 14 }}>
                 Three steps to<span style={{ color: '#FB923C' }}> automated job hunting</span>
               </h2>
@@ -533,7 +533,7 @@ export function LandingPage({ plans = FALLBACK_PLANS }: { plans?: PublicPlan[] }
         <div style={{ maxWidth: 1020, margin: '0 auto' }}>
           <Reveal>
             <div style={{ textAlign: 'center', marginBottom: 60 }}>
-              <Label color={C.green} bg="rgba(52,211,153,0.10)" bd="rgba(52,211,153,0.20)">Pricing</Label>
+              <Label color={C.green} bg="rgba(52,211,153,0.10)" bd="rgba(52,211,153,0.20)">{t('landing.pricing')}</Label>
               <h2 style={{ fontSize: 'clamp(28px, 4vw, 46px)', fontWeight: 800, letterSpacing: '-0.035em', marginBottom: 12 }}>
                 Simple, transparent<span style={gradientText}> pricing</span>
               </h2>
@@ -585,7 +585,7 @@ export function LandingPage({ plans = FALLBACK_PLANS }: { plans?: PublicPlan[] }
         <div style={{ maxWidth: 760, margin: '0 auto' }}>
           <Reveal>
             <div style={{ textAlign: 'center', marginBottom: 60 }}>
-              <Label color="#C084FC" bg="rgba(192,132,252,0.10)" bd="rgba(192,132,252,0.22)">FAQ</Label>
+              <Label color="#C084FC" bg="rgba(192,132,252,0.10)" bd="rgba(192,132,252,0.22)">{t('landing.faq')}</Label>
               <h2 style={{ fontSize: 'clamp(28px, 4vw, 46px)', fontWeight: 800, letterSpacing: '-0.035em' }}>
                 Frequently asked <span style={gradientText}>questions</span>
               </h2>
