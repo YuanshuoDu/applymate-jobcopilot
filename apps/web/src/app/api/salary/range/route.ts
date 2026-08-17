@@ -70,7 +70,7 @@ export async function GET(req: NextRequest) {
     // No data for this title — try to suggest related titles via /v2/salary/titles
     return ok({
       hasData: false,
-      message: '该岗位+国家组合暂无薪资数据，可尝试更通用的岗位名（如 "software engineer"）',
+      message: 'This position+There is no salary data for the country combination.，You can try a more general job title（like "software engineer"）',
       country,
     })
   }

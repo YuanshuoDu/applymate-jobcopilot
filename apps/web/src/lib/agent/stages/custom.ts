@@ -59,7 +59,7 @@ export async function runCustomAgents(
 
     emit('agent_plan', {
       role: roleKey,
-      plan: `计划：对 ${jobs.length} 个职位运行自定义分析「${agent.name}」${agent.description ? `（${agent.description}）` : ''}`,
+      plan: `plan：right ${jobs.length} Run custom analysis for jobs「${agent.name}」${agent.description ? `（${agent.description}）` : ''}`,
     })
 
     const observations: CustomAgentObservation[] = []
@@ -68,7 +68,7 @@ export async function runCustomAgents(
     for (const job of jobs) {
       emit('agent_action', {
         role:   roleKey,
-        action: `分析 ${job.company} · ${job.role}`,
+        action: `analyze ${job.company} · ${job.role}`,
       })
 
       try {
@@ -90,7 +90,7 @@ export async function runCustomAgents(
 
         emit('agent_observation', {
           role:        roleKey,
-          observation: observation.summary || '（无输出）',
+          observation: observation.summary || '（No output）',
         })
 
         // Write to activity log
@@ -107,7 +107,7 @@ export async function runCustomAgents(
       } catch (err) {
         emit('agent_observation', {
           role:        roleKey,
-          observation: `✗ 分析失败：AI 调用异常`,
+          observation: `✗ Analysis failed：AI Call exception`,
         })
       }
     }
@@ -117,7 +117,7 @@ export async function runCustomAgents(
 
     emit('agent_reflect', {
       role:    roleKey,
-      reflect: `「${agent.name}」完成：分析了 ${processed} 个职位（耗时 ${(durationMs / 1000).toFixed(1)}s）`,
+      reflect: `「${agent.name}」Finish：analyzed ${processed} positions（time consuming ${(durationMs / 1000).toFixed(1)}s）`,
     })
 
     emit('role_done', {

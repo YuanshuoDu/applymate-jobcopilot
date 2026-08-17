@@ -217,13 +217,13 @@ export function buildLocationWhere(inputs: string[]) {
  * For logging: show what location was resolved to.
  */
 export function locationSummary(inputs: string[]): string {
-  if (inputs.length === 0) return '不限地点'
+  if (inputs.length === 0) return 'Any location'
   const { resolved } = resolveLocations(inputs)
   return resolved.map(r => {
-    if (r.isRemote) return '🌐 远程'
+    if (r.isRemote) return '🌐 remote'
     if (r.isCountry) {
       const cities = COUNTRY_CITIES[r.countryCode ?? ''] ?? []
-      return `🇺🇳 ${r.canonical}（${cities.slice(0, 3).join('、')}等）`
+      return `🇺🇳 ${r.canonical}（${cities.slice(0, 3).join('、')}wait）`
     }
     return `📍 ${r.canonical}`
   }).join(' + ')

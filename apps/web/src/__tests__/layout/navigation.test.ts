@@ -38,6 +38,6 @@ describe('app navigation', () => {
 
   it('puts Gmail, Settings, and Sign out in the mobile More menu', () => {
     expect(getMobileMoreItems().map(item => item.id)).toEqual(['gmail', 'settings', 'signout'])
-    expect(getMobileMoreItems('退出登录').find(item => item.id === 'signout')?.label).toBe('退出登录')
+    expect(getMobileMoreItems('Log out').find(item => item.id === 'signout')?.label).toBe('Log out')
   })
 })

@@ -93,6 +93,6 @@ body:
       label: Codex Handoff
       description: Paste the final debugging instruction for Codex.
       value: |
-        @codex 请先按上述 repro 复现，再定位根因并做最小修复。禁止通过跳过测试、弱化断言或绕过 CI 来“修复”问题。完成后开 PR，并在评论中先给出根因分析。
+        @codex Please click above first repro Recurrence，Relocate the root cause and make minimal repairs。Disable skipping tests、Weaken assertions or bypass CI Come“repair”question。Open after completion PR，And give a root cause analysis first in the comments。
     validations:
       required: true

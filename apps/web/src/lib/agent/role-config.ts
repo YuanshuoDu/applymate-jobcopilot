@@ -72,13 +72,13 @@ After verifying all operations completed correctly, generate actionable insights
 Be specific and data-driven in your recommendations.`,
 }
 
-export const ROLE_META: Record<AgentRoleType, { icon: string; label: string; zh: string; description: string }> = {
-  scout:    { icon: '🔍', label: 'Scout',    zh: '侦察员', description: '过滤候选职位：排除、去重、优先公司、每日上限' },
-  analyst:  { icon: '🤖', label: 'Analyst',  zh: '分析员', description: 'AI 评分 resume↔JD，提取匹配/缺失关键词' },
-  writer:   { icon: '✍️', label: 'Writer',   zh: '撰写员', description: '生成求职信，定制简历关键词' },
-  reviewer: { icon: '🔎', label: 'Reviewer', zh: '审核员', description: '按规则分流：auto-apply / pending-review / skip' },
-  executor: { icon: '🚀', label: 'Executor', zh: '执行员', description: '更新 DB job.status=applied，写 Activity 日志' },
-  auditor:  { icon: '✅', label: 'Auditor',  zh: '验收员', description: '验证 DB 状态，生成最终运行报告' },
+export const ROLE_META: Record<AgentRoleType, { icon: string; label: string; description: string }> = {
+  scout:    { icon: '🔍', label: 'Scout', description: 'Filter job candidates: exclude, deduplicate, prioritize companies, and enforce the daily cap' },
+  analyst:  { icon: '🤖', label: 'Analyst', description: 'Score resume-to-job fit with AI and extract matched and missing keywords' },
+  writer:   { icon: '✍️', label: 'Writer', description: 'Generate cover letters and tailor resume keywords' },
+  reviewer: { icon: '🔎', label: 'Reviewer', description: 'Route applications according to the auto-apply, pending-review, and skip rules' },
+  executor: { icon: '🚀', label: 'Executor', description: 'Update the database application status and write activity logs' },
+  auditor:  { icon: '✅', label: 'Auditor', description: 'Verify database state and generate the final run report' },
 }
 
 export interface AgentRoleConfig {

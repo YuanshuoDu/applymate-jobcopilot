@@ -659,7 +659,7 @@ Example transcript flow:
 
 ```text
 You
-每天早上 9 点自动找 Berlin 软件工程岗位，85 分以上自动投，但需要我确认。
+every morning 9 Click to find automatically Berlin software engineering positions，85 Automatically vote for points or more，But I need to confirm。
 
 09:01
 ```

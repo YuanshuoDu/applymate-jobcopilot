@@ -37,7 +37,7 @@ export async function POST(
       userId: auth.userId,
       jobId:  id,
       type:   'applied',
-      text:   `你手动申请了 ${job.company} · ${job.role}`,
+      text:   `You applied manually ${job.company} · ${job.role}`,
       color:  '#059669',
     },
   })

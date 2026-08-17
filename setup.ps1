@@ -1,6 +1,6 @@
 # ============================================================
-# ApplyMate AI — 一键安装配置脚本
-# 右键此文件 → "用 PowerShell 运行"
+# ApplyMate AI — One-click installation configuration script
+# Right click on this file → "use PowerShell run"
 # ============================================================
 $ErrorActionPreference = "Stop"
 $Host.UI.RawUI.WindowTitle = "ApplyMate AI Setup"
@@ -15,72 +15,72 @@ function Write-Warn($msg) {
     Write-Host "  ⚠ $msg" -ForegroundColor Yellow
 }
 function Write-Fail($msg) {
-    Write-Host "`n✗ 错误: $msg" -ForegroundColor Red
-    Read-Host "`n按 Enter 退出"
+    Write-Host "`n✗ mistake: $msg" -ForegroundColor Red
+    Read-Host "`naccording to Enter quit"
     exit 1
 }
 
 Clear-Host
 Write-Host "╔══════════════════════════════════════════╗" -ForegroundColor Blue
-Write-Host "║     ApplyMate AI — 自动安装配置          ║" -ForegroundColor Blue
+Write-Host "║     ApplyMate AI — Automatic installation configuration          ║" -ForegroundColor Blue
 Write-Host "╚══════════════════════════════════════════╝" -ForegroundColor Blue
 
 $ROOT = Split-Path -Parent $MyInvocation.MyCommand.Path
 $WEB  = Join-Path $ROOT "apps\web"
 Set-Location $WEB
 
-# ── 1. 检查 Node.js ──────────────────────────────────────────
-Write-Step "检查 Node.js..."
+# ── 1. examine Node.js ──────────────────────────────────────────
+Write-Step "examine Node.js..."
 try {
     $nodeVer = node --version 2>&1
     Write-OK "Node.js $nodeVer"
 } catch {
-    Write-Fail "未找到 Node.js，请先安装 https://nodejs.org (LTS 版)"
+    Write-Fail "not found Node.js，Please install first https://nodejs.org (LTS version)"
 }
 
-# ── 2. 检查 / 安装 pnpm ───────────────────────────────────────
-Write-Step "检查 pnpm..."
+# ── 2. examine / Install pnpm ───────────────────────────────────────
+Write-Step "examine pnpm..."
 $hasPnpm = $null
 try { $hasPnpm = pnpm --version 2>&1 } catch {}
 if (-not $hasPnpm) {
-    Write-Warn "pnpm 未安装，正在用 npm 安装..."
+    Write-Warn "pnpm Not installed，Currently using npm Install..."
     npm install -g pnpm | Out-Null
     $hasPnpm = pnpm --version 2>&1
 }
 Write-OK "pnpm $hasPnpm"
 
-# ── 3. 安装依赖包 ─────────────────────────────────────────────
-Write-Step "安装依赖包 (pnpm install)..."
+# ── 3. Install dependency packages ─────────────────────────────────────────────
+Write-Step "Install dependency packages (pnpm install)..."
 pnpm install
-if ($LASTEXITCODE -ne 0) { Write-Fail "pnpm install 失败" }
-Write-OK "依赖安装完成"
+if ($LASTEXITCODE -ne 0) { Write-Fail "pnpm install fail" }
+Write-OK "Dependency installation completed"
 
-# ── 4. 配置 .env.local ────────────────────────────────────────
-Write-Step "配置环境变量..."
+# ── 4. Configuration .env.local ────────────────────────────────────────
+Write-Step "Configure environment variables..."
 $envFile = Join-Path $WEB ".env.local"
 
 if (Test-Path $envFile) {
-    Write-OK ".env.local 已存在，跳过"
+    Write-OK ".env.local Already exists，jump over"
 } else {
     Write-Host ""
-    Write-Host "  需要一个 PostgreSQL 数据库连接。" -ForegroundColor White
-    Write-Host "  检测到本机已安装 PostgreSQL（pgAdmin 4）。" -ForegroundColor White
+    Write-Host "  need one PostgreSQL Database connection。" -ForegroundColor White
+    Write-Host "  Detected that this machine is installed PostgreSQL（pgAdmin 4）。" -ForegroundColor White
     Write-Host ""
-    Write-Host "  请输入 PostgreSQL 密码（默认留空直接回车试 'postgres'）：" -ForegroundColor Yellow
-    $pgPass = Read-Host "  密码"
+    Write-Host "  Please enter PostgreSQL password（By default, leave it blank and enter directly to try. 'postgres'）：" -ForegroundColor Yellow
+    $pgPass = Read-Host "  password"
     if ([string]::IsNullOrWhiteSpace($pgPass)) { $pgPass = "postgres" }
 
-    Write-Host "  数据库名称（默认 applymate，直接回车）：" -ForegroundColor Yellow
-    $pgDb = Read-Host "  数据库名"
+    Write-Host "  Database name（default applymate，Just press Enter）：" -ForegroundColor Yellow
+    $pgDb = Read-Host "  Database name"
     if ([string]::IsNullOrWhiteSpace($pgDb)) { $pgDb = "applymate" }
 
     $dbUrl = "postgresql://postgres:${pgPass}@localhost:5432/${pgDb}"
 
-    # 生成 AUTH_SECRET
+    # generate AUTH_SECRET
     $authSecret = [Convert]::ToBase64String((1..32 | ForEach-Object { Get-Random -Maximum 256 }))
 
     $envContent = @"
-# ApplyMate AI — 本地开发环境变量
+# ApplyMate AI — Local development environment variables
 DATABASE_URL="$dbUrl"
 AUTH_SECRET="$authSecret"
 NEXTAUTH_URL="http://localhost:3000"
@@ -92,12 +92,12 @@ OPENAI_API_KEY=""
 ANTHROPIC_API_KEY=""
 "@
     Set-Content -Path $envFile -Value $envContent -Encoding UTF8
-    Write-OK ".env.local 已生成（DATABASE_URL=$dbUrl）"
+    Write-OK ".env.local Generated（DATABASE_URL=$dbUrl）"
 }
 
-# ── 5. 创建 PostgreSQL 数据库 ─────────────────────────────────
-Write-Step "创建 PostgreSQL 数据库..."
-# 读取数据库名
+# ── 5. create PostgreSQL database ─────────────────────────────────
+Write-Step "create PostgreSQL database..."
+# Read database name
 $envContent = Get-Content $envFile -Raw
 if ($envContent -match 'DATABASE_URL="postgresql://[^:]+:([^@]*)@[^/]+/([^"\s]+)"') {
     $pgPass2 = $Matches[1]
@@ -107,7 +107,7 @@ if ($envContent -match 'DATABASE_URL="postgresql://[^:]+:([^@]*)@[^/]+/([^"\s]+)
     $pgPass2 = "postgres"
 }
 
-# 尝试用 psql 创建数据库
+# Try using psql Create database
 $psqlPaths = @(
     "C:\Program Files\PostgreSQL\17\bin\psql.exe",
     "C:\Program Files\PostgreSQL\16\bin\psql.exe",
@@ -119,50 +119,50 @@ $psqlPaths = @(
 if ($psqlPaths) {
     $env:PGPASSWORD = $pgPass2
     & $psqlPaths -U postgres -c "CREATE DATABASE $pgDb2;" 2>&1 | Out-Null
-    Write-OK "数据库 '$pgDb2' 已就绪"
+    Write-OK "database '$pgDb2' Ready"
 } else {
-    Write-Warn "未找到 psql，跳过自动建库。如数据库不存在请手动在 pgAdmin 创建 '$pgDb2'"
+    Write-Warn "not found psql，Skip automatic database creation。If the database does not exist, please manually pgAdmin create '$pgDb2'"
 }
 
-# ── 6. Prisma 生成客户端 ──────────────────────────────────────
-Write-Step "生成 Prisma 客户端..."
+# ── 6. Prisma Generate client ──────────────────────────────────────
+Write-Step "generate Prisma client..."
 pnpm prisma generate
-if ($LASTEXITCODE -ne 0) { Write-Fail "prisma generate 失败" }
-Write-OK "Prisma 客户端生成完成"
+if ($LASTEXITCODE -ne 0) { Write-Fail "prisma generate fail" }
+Write-OK "Prisma Client generation completed"
 
-# ── 7. 数据库迁移 ─────────────────────────────────────────────
-Write-Step "执行数据库迁移 (prisma migrate dev)..."
+# ── 7. Database migration ─────────────────────────────────────────────
+Write-Step "Perform database migration (prisma migrate dev)..."
 $env:DATABASE_URL = ($envContent | Select-String 'DATABASE_URL="([^"]+)"').Matches[0].Groups[1].Value
 pnpm prisma migrate dev --name init
-if ($LASTEXITCODE -ne 0) { Write-Fail "migrate 失败，请检查 DATABASE_URL 和 PostgreSQL 是否运行" }
-Write-OK "数据表创建完成"
+if ($LASTEXITCODE -ne 0) { Write-Fail "migrate fail，Check, please DATABASE_URL and PostgreSQL Whether to run" }
+Write-OK "Data table creation completed"
 
-# ── 8. 填充演示数据 ────────────────────────────────────────────
-Write-Step "填充演示数据 (prisma db seed)..."
+# ── 8. Populate demo data ────────────────────────────────────────────
+Write-Step "Populate demo data (prisma db seed)..."
 pnpm prisma db seed
 if ($LASTEXITCODE -ne 0) {
-    Write-Warn "seed 失败，可能数据已存在，继续..."
+    Write-Warn "seed fail，Maybe the data already exists，continue..."
 } else {
-    Write-OK "演示数据填充完成"
-    Write-Host "    账号: demo@applymate.ai  密码: demo1234" -ForegroundColor Magenta
+    Write-OK "Demo data filling completed"
+    Write-Host "    account: demo@applymate.ai  password: demo1234" -ForegroundColor Magenta
 }
 
-# ── 完成 ──────────────────────────────────────────────────────
+# ── Finish ──────────────────────────────────────────────────────
 Write-Host ""
 Write-Host "╔══════════════════════════════════════════╗" -ForegroundColor Green
-Write-Host "║         ✅ 安装配置全部完成！             ║" -ForegroundColor Green
+Write-Host "║         ✅ All installation and configuration completed！             ║" -ForegroundColor Green
 Write-Host "╚══════════════════════════════════════════╝" -ForegroundColor Green
 Write-Host ""
-Write-Host "  演示账号: demo@applymate.ai" -ForegroundColor White
-Write-Host "  演示密码: demo1234" -ForegroundColor White
+Write-Host "  Demo account: demo@applymate.ai" -ForegroundColor White
+Write-Host "  demo password: demo1234" -ForegroundColor White
 Write-Host ""
 
-$launch = Read-Host "  现在启动开发服务器？(y/n)"
+$launch = Read-Host "  Now start the development server？(y/n)"
 if ($launch -eq 'y' -or $launch -eq 'Y' -or $launch -eq '') {
-    Write-Host "`n  启动中... 浏览器打开 http://localhost:3000" -ForegroundColor Cyan
+    Write-Host "`n  Starting... Browser opens http://localhost:3000" -ForegroundColor Cyan
     Start-Process "http://localhost:3000"
     pnpm dev
 } else {
-    Write-Host "`n  稍后运行: cd apps\web && pnpm dev" -ForegroundColor Yellow
-    Read-Host "按 Enter 退出"
+    Write-Host "`n  run later: cd apps\web && pnpm dev" -ForegroundColor Yellow
+    Read-Host "according to Enter quit"
 }

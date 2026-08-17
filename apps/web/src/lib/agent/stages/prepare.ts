@@ -1,6 +1,6 @@
 /**
  * Stage 3 — Prepare
- * Role: 准备员
+ * Role: preparer
  * For each scored job above minMatchScore:
  *   - Generates cover letter (if autoCoverLetter=true)
  *   - Packages job + score + materials into ApplicationPackage
@@ -121,9 +121,9 @@ export async function runPrepare(
         } })
         tailoredResumeId = saved.id
         tailoredResumeName = saved.name
-        emit('agent_observation', { role: 'writer', observation: `✓ 已基于默认简历生成 ${sj.job.company} 的定制简历，保留职位连接和模板；等待 Reviewer 审核及你的最终确认。` })
+        emit('agent_observation', { role: 'writer', observation: `✓ Already generated based on default resume ${sj.job.company} Custom Resume，Preserve job links and templates；wait Reviewer Review and your final confirmation。` })
       } catch (err) {
-        emit('agent_observation', { role: 'writer', observation: `✗ ${sj.job.company} 简历优化失败：${err instanceof Error ? err.message : 'Unknown error'}` })
+        emit('agent_observation', { role: 'writer', observation: `✗ ${sj.job.company} Resume optimization failed：${err instanceof Error ? err.message : 'Unknown error'}` })
       }
     }
 

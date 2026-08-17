@@ -1,5 +1,5 @@
 /**
- * Stage 1 — Scout (侦察员)
+ * Stage 1 — Scout (scout)
  *
  * THREE-PHASE operation:
  *
@@ -44,8 +44,8 @@ export async function runScout(ctx: PipelineCtx): Promise<StageResult<ScoutOutpu
       emit('agent_action', {
         role:   'scout',
         action: hasLocations
-          ? `搜索 [${agentCfg.targetRoles.slice(0, 3).join(', ')}]，地点：${locSummary}`
-          : `全球搜索 [${agentCfg.targetRoles.slice(0, 3).join(', ')}]`,
+          ? `search [${agentCfg.targetRoles.slice(0, 3).join(', ')}]，Place：${locSummary}`
+          : `Global search [${agentCfg.targetRoles.slice(0, 3).join(', ')}]`,
       })
 
       const existingUrls = new Set(
@@ -64,14 +64,14 @@ export async function runScout(ctx: PipelineCtx): Promise<StageResult<ScoutOutpu
 
       emit('agent_observation', {
         role:        'scout',
-        observation: `🔍 API 搜索返回 ${candidates.length} 个结果${hasLocations ? ` (${agentCfg.targetLocations.join(', ')})` : ''}`,
+        observation: `🔍 API Search returns ${candidates.length} results${hasLocations ? ` (${agentCfg.targetLocations.join(', ')})` : ''}`,
       })
 
       // If location-filtered search returns 0, retry without location restriction
       if (candidates.length === 0 && hasLocations) {
         emit('agent_observation', {
           role:        'scout',
-          observation: `⚠ 在指定地点未找到职位，尝试扩大搜索范围（不限地点）…`,
+          observation: `⚠ No jobs found in the specified location，Try broadening your search（Any location）…`,
         })
         candidates = await discoverJobs({
           userId,
@@ -82,7 +82,7 @@ export async function runScout(ctx: PipelineCtx): Promise<StageResult<ScoutOutpu
         })
         emit('agent_observation', {
           role:        'scout',
-          observation: `🔍 不限地点搜索返回 ${candidates.length} 个结果`,
+          observation: `🔍 Search returns regardless of location ${candidates.length} results`,
         })
       }
 
@@ -118,18 +118,18 @@ export async function runScout(ctx: PipelineCtx): Promise<StageResult<ScoutOutpu
         // Format discovered jobs as a list
         const listText = candidates.slice(0, 8).map(j =>
           `- **${j.company}** · ${j.title}${j.location ? ` · 📍${j.location}` : ''}${j.salary ? ` · ${j.salary}` : ''}`
-        ).join('\n') + (candidates.length > 8 ? `\n- …及 ${candidates.length - 8} 个更多` : '')
+        ).join('\n') + (candidates.length > 8 ? `\n- …and ${candidates.length - 8} more` : '')
 
         emit('agent_observation', {
           role:        'scout',
-          observation: `✓ 发现并保存了 ${discovered} 个新职位${failedWrites > 0 ? `（${failedWrites} 条无效记录已跳过）` : ''}：\n${listText}`,
+          observation: `✓ Found and saved ${discovered} new positions${failedWrites > 0 ? `（${failedWrites} Invalid records have been skipped）` : ''}：\n${listText}`,
         })
 
         await db.activity.create({
           data: {
             userId,
             type:  'agent_action',
-            text:  `Agent 搜索发现 ${discovered} 个新职位 (${agentCfg.targetRoles.slice(0, 2).join(', ')})`,
+            text:  `Agent Search found ${discovered} new positions (${agentCfg.targetRoles.slice(0, 2).join(', ')})`,
             color: '#185FA5',
           },
         })
@@ -193,19 +193,19 @@ export async function runScout(ctx: PipelineCtx): Promise<StageResult<ScoutOutpu
       const expandedCities = locResolved.allDbTerms.slice(0, 8)
       emit('agent_observation', {
         role:        'scout',
-        observation: `📍 地点解析：[${agentCfg.targetLocations.join(', ')}] → 展开为 ${expandedCities.length} 个匹配词（${expandedCities.slice(0, 5).join('、')}${expandedCities.length > 5 ? '…' : ''}）`,
+        observation: `📍 location analysis：[${agentCfg.targetLocations.join(', ')}] → Expand to ${expandedCities.length} matching words（${expandedCities.slice(0, 5).join('、')}${expandedCities.length > 5 ? '…' : ''}）`,
       })
     }
 
     // Emit formatted job list
     if (jobs.length > 0) {
       const jobList = jobs.slice(0, 10).map(j =>
-        `- **${j.company}** · ${j.role}${j.location ? ` · 📍${j.location}` : ''}${j.score != null ? ` · ${j.score}%` : ' · 未评分'}`
-      ).join('\n') + (jobs.length > 10 ? `\n- …及 ${jobs.length - 10} 个更多` : '')
+        `- **${j.company}** · ${j.role}${j.location ? ` · 📍${j.location}` : ''}${j.score != null ? ` · ${j.score}%` : ' · Not rated'}`
+      ).join('\n') + (jobs.length > 10 ? `\n- …and ${jobs.length - 10} more` : '')
 
       emit('agent_observation', {
         role:        'scout',
-        observation: `📋 进入分析队列（共 ${jobs.length} 个）：\n${jobList}`,
+        observation: `📋 Enter analysis queue（common ${jobs.length} indivual）：\n${jobList}`,
       })
     } else if (hasLocations) {
       // Zero results — emit a question via orchestrator
@@ -214,11 +214,11 @@ export async function runScout(ctx: PipelineCtx): Promise<StageResult<ScoutOutpu
         emit('agent_question', {
           role:       'scout',
           questionId: 'no_local_jobs',
-          question:   `已保存的 ${savedTotal} 个职位中没有符合 [${agentCfg.targetLocations.join(', ')}] 的职位，且 API 搜索也未找到新职位。\n\n建议：`,
+          question:   `saved ${savedTotal} None of the positions match [${agentCfg.targetLocations.join(', ')}] position，and API No new positions were found in the search。\n\nsuggestion：`,
           options: [
-            { label: `🌍 移除地点限制，分析全部 ${savedTotal} 个职位`, value: 'remove_location', action: { field: 'targetLocations', value: [] } },
-            { label: '✏ 去 Search Jobs 页面手动搜索',                   value: 'goto_search',   action: { field: '_navigate', value: 'search' } },
-            { label: '✕ 中止本次运行',                                   value: 'abort' },
+            { label: `🌍 Remove location restrictions，Analyze all ${savedTotal} positions`, value: 'remove_location', action: { field: 'targetLocations', value: [] } },
+            { label: '✏ go Search Jobs Page manual search',                   value: 'goto_search',   action: { field: '_navigate', value: 'search' } },
+            { label: '✕ Abort this run',                                   value: 'abort' },
           ],
         })
       }

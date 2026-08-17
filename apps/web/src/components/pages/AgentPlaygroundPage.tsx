@@ -174,7 +174,7 @@ export function AgentPlaygroundPage() {
       const d = JSON.parse(e.data) as { role: string; label: string; model: string; icon: string }
       currentRoleRef.current = d.role
       setCurrentRole(d.role)
-      addLog({ role: d.role, type: 'role_start', message: `${d.icon} [${d.role}] ${d.label} 开始… (${d.model})`, time: new Date() })
+      addLog({ role: d.role, type: 'role_start', message: `${d.icon} [${d.role}] ${d.label} start… (${d.model})`, time: new Date() })
     })
 
     listen('role_done', e => {
@@ -184,12 +184,12 @@ export function AgentPlaygroundPage() {
 
     listen('start', e => {
       const d = JSON.parse(e.data)
-      addLog({ type: 'start', message: `🚀 流水线启动 — ${d.total} 个职位待处理`, time: new Date() })
+      addLog({ type: 'start', message: `🚀 Pipeline start — ${d.total} positions pending`, time: new Date() })
     })
 
     listen('job_done', e => {
       const d = JSON.parse(e.data)
-      const applied = d.autoApplied ? ' ✓ 已投递' : ''
+      const applied = d.autoApplied ? ' ✓ Delivered' : ''
       const kws = d.matchedKeywords?.length ? ` [${d.matchedKeywords.slice(0, 3).join(', ')}]` : ''
       addLog({ role: currentRoleRef.current ?? 'analyst', type: 'job_done', message: `${d.score >= 80 ? '✦' : d.score >= 60 ? '◆' : '◇'} ${d.company} · ${d.role} — ${d.score}%${kws}${applied}`, score: d.score, time: new Date() })
     })
@@ -201,7 +201,7 @@ export function AgentPlaygroundPage() {
 
     listen('orchestrator_thinking', e => {
       const d = JSON.parse(e.data)
-      const modeTag = d.autonomous ? ' [自主模式]' : ''
+      const modeTag = d.autonomous ? ' [autonomous mode]' : ''
       addLog({ type: 'orchestrator_thinking', message: d.thinking + modeTag, time: new Date() })
     })
 
@@ -216,12 +216,12 @@ export function AgentPlaygroundPage() {
       const d = JSON.parse(e.data)
       setWaitingQuestion(null)
       setRunLog(prev => prev.map(l => l.questionId === d.id ? { ...l, answered: true } : l))
-      addLog({ type: 'orchestrator_answer', message: `✓ 已回答：${d.label}`, time: new Date() })
+      addLog({ type: 'orchestrator_answer', message: `✓ Answered：${d.label}`, time: new Date() })
     })
 
     listen('orchestrator_plan', e => {
       const d = JSON.parse(e.data)
-      addLog({ type: 'orchestrator_plan', message: `🧠 Orchestrator 策略：${d.plan}`, time: new Date() })
+      addLog({ type: 'orchestrator_plan', message: `🧠 Orchestrator Strategy：${d.plan}`, time: new Date() })
     })
     listen('orchestrator_fix', e => {
       const d = JSON.parse(e.data)
@@ -233,7 +233,7 @@ export function AgentPlaygroundPage() {
     })
     listen('orchestrator_decision', e => {
       const d = JSON.parse(e.data)
-      addLog({ type: 'orchestrator_decision', message: `⚖ Orchestrator 决策 [${d.stage}]：${d.reason}`, time: new Date() })
+      addLog({ type: 'orchestrator_decision', message: `⚖ Orchestrator decision making [${d.stage}]：${d.reason}`, time: new Date() })
     })
     listen('orchestrator_complete', e => {
       const d = JSON.parse(e.data)
@@ -250,7 +250,7 @@ export function AgentPlaygroundPage() {
       setApplyQueue(prev => prev.some(job => job.jobId === d.jobId)
         ? prev
         : [...prev, { ...d, mode: 'queued' }])
-      addLog({ role: 'executor', type: 'application_queued', message: `⏳ ${d.company} · ${d.role} 已交给后台 Agent 投递`, time: new Date() })
+      addLog({ role: 'executor', type: 'application_queued', message: `⏳ ${d.company} · ${d.role} Has been handed over to the backend Agent delivery`, time: new Date() })
     })
 
     listen('agent_question', e => {
@@ -293,7 +293,7 @@ export function AgentPlaygroundPage() {
       setRunDone(true)
       currentRoleRef.current = null
       setCurrentRole(null)
-      addLog({ type: 'done', message: `✅ 流水线完成 — ${d.processed} 个评分，${d.queued ?? 0} 个已派发，${d.applied} 个确认投递，${d.pending} 个待审核，${d.skipped} 个跳过`, time: new Date() })
+      addLog({ type: 'done', message: `✅ Pipeline completed — ${d.processed} ratings，${d.queued ?? 0} Distributed，${d.applied} Confirmed delivery，${d.pending} pending review，${d.skipped} skipped`, time: new Date() })
       es.close(); esRef.current = null
       setSessionsRefreshVersion(v => v + 1)
       toast.success(
@@ -305,8 +305,8 @@ export function AgentPlaygroundPage() {
     })
 
     listen('error', e => {
-      try { const d = JSON.parse((e as MessageEvent).data ?? '{}'); addLog({ type: 'error', message: `✗ ${d.message ?? '流水线错误'}`, time: new Date() }) }
-      catch { addLog({ type: 'error', message: '✗ 连接断开', time: new Date() }) }
+      try { const d = JSON.parse((e as MessageEvent).data ?? '{}'); addLog({ type: 'error', message: `✗ ${d.message ?? 'Pipeline error'}`, time: new Date() }) }
+      catch { addLog({ type: 'error', message: '✗ Lost connection', time: new Date() }) }
       currentRoleRef.current = null
       setCurrentRole(null); setRunDone(true)
       es.close(); esRef.current = null
@@ -320,7 +320,7 @@ export function AgentPlaygroundPage() {
     setCurrentRole(null); setRunDone(true)
     const sessionId = liveSessionId ?? selectedSessionId
     if (!sessionId) {
-      addLog({ type: 'info', message: '— 已停止前端流；本次运行尚未创建可取消的会话。', time: new Date() })
+      addLog({ type: 'info', message: '— Frontend flow stopped；No cancelable sessions have been created for this run。', time: new Date() })
       return
     }
 
@@ -329,7 +329,7 @@ export function AgentPlaygroundPage() {
       const body = await response.json().catch(() => ({})) as { error?: string }
       throw new Error(body.error ?? 'Could not cancel the Agent execution.')
     }
-    addLog({ type: 'info', message: '— 已取消 Agent 运行；后台不会继续处理或提交新的申请。', time: new Date() })
+    addLog({ type: 'info', message: '— Canceled Agent run；The background will not continue to process or submit new applications.。', time: new Date() })
     window.dispatchEvent(new Event('applymate:sessions-changed'))
   }, [addLog, liveSessionId, selectedSessionId])
 
@@ -349,7 +349,7 @@ export function AgentPlaygroundPage() {
           && action.minMatchScore >= 0 && action.minMatchScore <= 100) {
           const { error } = await apiMutate('/api/agent', 'PATCH', { minMatchScore: action.minMatchScore })
           if (error) {
-            toast.error('匹配阈值更新失败', error)
+            toast.error('Match threshold update failed', error)
             throw new Error(error)
           }
         }
@@ -357,16 +357,16 @@ export function AgentPlaygroundPage() {
           typeof action.chatMessage === 'string' ? action.chatMessage : undefined,
           typeof action.sessionId === 'string' ? action.sessionId : undefined,
         )
-        toast.info('流水线已启动', typeof action.minMatchScore === 'number'
-          ? `匹配阈值：≥${action.minMatchScore}%`
-          : 'Orchestrator 触发运行')
+        toast.info('Pipeline started', typeof action.minMatchScore === 'number'
+          ? `match threshold：≥${action.minMatchScore}%`
+          : 'Orchestrator trigger run')
         break
       case 'stop_run':
         try {
           await stopRun()
-          toast.info('流水线已取消', '后台执行已停止，不会继续处理新的申请。')
+          toast.info('Pipeline canceled', 'Background execution has stopped，New applications will not be processed further。')
         } catch (error) {
-          toast.error('取消运行失败', error instanceof Error ? error.message : 'Could not cancel the Agent execution.')
+          toast.error('Cancel run failed', error instanceof Error ? error.message : 'Could not cancel the Agent execution.')
         }
         break
       case 'toggle_agent': {
@@ -374,11 +374,11 @@ export function AgentPlaygroundPage() {
         const enabled = action.enabled as boolean
         const { error } = await apiMutate(`/api/agent/roles/${role}`, 'PATCH', { enabled })
         if (error) {
-          toast.error('Agent 更新失败', error)
+          toast.error('Agent Update failed', error)
           throw new Error(error)
         }
         window.dispatchEvent(new Event('applymate:agents-changed'))
-        toast.info(enabled ? `${role} 已启用` : `${role} 已禁用`, '')
+        toast.info(enabled ? `${role} Enabled` : `${role} Disabled`, '')
         break
       }
       case 'update_config': {
@@ -386,11 +386,11 @@ export function AgentPlaygroundPage() {
         const value = action.value
         const { error } = await apiMutate('/api/agent', 'PATCH', { [field]: value })
         if (error) {
-          toast.error('设置更新失败', error)
+          toast.error('Settings update failed', error)
           throw new Error(error)
         }
         await refetchAgentConfig()
-        toast.success('设置已更新', `${field} → ${value}`)
+        toast.success('Settings updated', `${field} → ${value}`)
         break
       }
       case 'navigate':
@@ -411,15 +411,15 @@ export function AgentPlaygroundPage() {
         const emailData = JSON.parse(value as string) as { to: string; draft: string; subject: string; jobId: string }
         const { error } = await apiMutate('/api/gmail/send-draft', 'POST', emailData)
         if (error) {
-          toast.error('邮件发送失败', error)
+          toast.error('Email sending failed', error)
           throw new Error(error)
         }
-        toast.success('邮件已发送', `拒信问询已发送至 ${emailData.to}`)
+        toast.success('Email sent', `Rejection inquiry has been sent to ${emailData.to}`)
       }
       else {
         const { error } = await apiMutate('/api/agent', 'PATCH', { [field]: value })
         if (error) {
-          toast.error('设置更新失败', error)
+          toast.error('Settings update failed', error)
           throw new Error(error)
         }
       }
@@ -429,10 +429,10 @@ export function AgentPlaygroundPage() {
     ))
     addLog({
       type: 'question_answered',
-      message: `✓ 你选择了「${opt.label}」${opt.action ? '，偏好已保存' : ''}`,
+      message: `✓ you chose「${opt.label}」${opt.action ? '，Preference saved' : ''}`,
       time: new Date(),
     })
-    toast.success('偏好已记录', opt.action ? '设置已更新，下次运行生效' : '已知悉，继续运行')
+    toast.success('Preference recorded', opt.action ? 'Settings updated，It will take effect next time it is run' : 'Already aware，continue running')
   }, [addLog, toast])
 
   const savedCount   = (jobsData?.jobs ?? []).filter(j => j.status === 'saved').length
@@ -682,14 +682,14 @@ export function AgentPlaygroundPage() {
               if (opt?.action && opt.action.field !== '_navigate') {
                 const { error: patchError } = await apiMutate('/api/agent', 'PATCH', { [opt.action.field]: opt.action.value })
                 if (patchError) {
-                  toast.error('设置更新失败', patchError)
+                  toast.error('Settings update failed', patchError)
                   throw new Error(patchError)
                 }
               }
               // Post answer to DB so pipeline can continue
               const { error } = await apiMutate('/api/agent/answer', 'POST', { questionId, answer })
               if (error) {
-                toast.error('回答提交失败', error)
+                toast.error('Answer submission failed', error)
                 throw new Error(error)
               }
               setWaitingQuestion(null)
@@ -699,11 +699,11 @@ export function AgentPlaygroundPage() {
             onApplied={async (jobId, job) => {
               const { error } = await apiMutate(`/api/jobs/${jobId}/apply`, 'POST', {})
               if (error) {
-                toast.error('标记投递失败', error)
+                toast.error('Tag delivery failed', error)
                 throw new Error(error)
               }
               setApplyQueue(prev => prev.map(j => j.jobId === jobId ? { ...j, url: `_applied_${j.url}` } : j))
-              toast.success('已标记为投递', `${job.company} · ${job.role}`)
+              toast.success('Marked for delivery', `${job.company} · ${job.role}`)
             }}
             onChatAction={handleChatAction}
             onAppendLog={addLog}

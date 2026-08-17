@@ -9,11 +9,11 @@ test("login -> agent page -> run scout -> see results", async ({ app, page }) =>
   await app.installMocks();
   await app.login();
 
-  await app.goTo(/Agent|智能体/);
+  await app.goTo(/Agent|agent/);
   await page.getByRole("button", { name: "Find matching jobs" }).click();
   await page.getByPlaceholder(/Message the Orchestrator/).press("Enter");
 
   await expect(page.getByText(/Scout found 1 result/)).toBeVisible();
   await expect(page.getByText(/Cloudflare · Systems Engineer/)).toBeVisible();
-  await expect(page.getByText(/流水线完成/).first()).toBeVisible();
+  await expect(page.getByText(/Pipeline completed/).first()).toBeVisible();
 });

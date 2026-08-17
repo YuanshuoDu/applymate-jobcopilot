@@ -11,12 +11,12 @@ import { readNotificationPreferences } from '@/lib/settings-preferences'
 // ── Stage definitions ─────────────────────────────────────────────────────────
 
 const STAGES = [
-  { key: 'scout',   icon: '🔍', label: '侦察' },
-  { key: 'analyze', icon: '🤖', label: '分析' },
-  { key: 'prepare', icon: '📝', label: '准备' },
-  { key: 'gate',    icon: '🚦', label: '审核' },
-  { key: 'execute', icon: '🚀', label: '执行' },
-  { key: 'audit',   icon: '✅', label: '验收' },
+  { key: 'scout',   icon: '🔍', label: 'reconnaissance' },
+  { key: 'analyze', icon: '🤖', label: 'analyze' },
+  { key: 'prepare', icon: '📝', label: 'Prepare' },
+  { key: 'gate',    icon: '🚦', label: 'Review' },
+  { key: 'execute', icon: '🚀', label: 'implement' },
+  { key: 'audit',   icon: '✅', label: 'acceptance' },
 ] as const
 
 type StageKey = typeof STAGES[number]['key']

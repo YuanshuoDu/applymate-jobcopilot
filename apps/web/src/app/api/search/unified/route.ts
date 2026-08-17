@@ -255,7 +255,7 @@ function smartRouter(q: string, f: SearchFilters, qa?: QueryAnalysis): RouterDec
     if (sources.length < 3)
       sources.push({ id: 'ats', params: baseParams(loc || (isUS ? 'United States' : '')) })
     return {
-      reasoning: `实习搜索 → ${sources.map(s => s.id).join(' + ')}`,
+      reasoning: `Internship Search → ${sources.map(s => s.id).join(' + ')}`,
       sources: sources.slice(0, 3),
     }
   }
@@ -292,7 +292,7 @@ function smartRouter(q: string, f: SearchFilters, qa?: QueryAnalysis): RouterDec
     sources.push({ id: 'mantiks', params: { q: companyName, datePosted: f.datePosted || 'month' } })
     sources.push({ id: 'linkedin', params: baseParams(loc || 'Worldwide') })
     sources.push({ id: 'ats', params: baseParams(loc || 'Worldwide') })
-    return { reasoning: `公司搜索 → mantiks + linkedin + ats`, sources }
+    return { reasoning: `Company search → mantiks + linkedin + ats`, sources }
   }
 
   // Remote: Jobicy (geo-filtered) + Remotive (tech-focused) + ATS
@@ -396,10 +396,10 @@ function smartRouter(q: string, f: SearchFilters, qa?: QueryAnalysis): RouterDec
   if (sources.length < 2) sources.push({ id: 'ats', params: baseParams(loc) })
 
   const names     = sources.map(s => s.id).join(' + ')
-  const reasoning = isRem        ? `远程 → ${names}`
+  const reasoning = isRem        ? `remote → ${names}`
                   : country === 'ie' ? `🇮🇪 Ireland → ${names}`
                   : isEU         ? `${country!.toUpperCase()} → ${names}`
-                  : `全球/美国 → ${names}`
+                  : `worldwide/USA → ${names}`
 
   // Ireland gets up to 5 sources; others get 4
   const limit = country === 'ie' ? 5 : 4

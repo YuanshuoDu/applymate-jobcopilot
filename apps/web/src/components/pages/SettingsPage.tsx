@@ -735,7 +735,7 @@ export function SettingsPage() {
             </SettingsSection>
 
             {/* ── Chrome Extension ── */}
-            <SettingsSection title="Chrome 扩展">
+            <SettingsSection title="Chrome Expand">
               <div style={{ display: 'flex', alignItems: 'center', gap: 14, padding: 14, background: 'var(--bg-secondary)', borderRadius: 10, border: '0.5px solid var(--border)', marginTop: 4 }}>
                 {/* Chrome puzzle icon */}
                 <div style={{ width: 36, height: 36, borderRadius: 8, background: 'rgba(79,70,229,0.12)', color: 'var(--primary)', display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0 }}>
@@ -745,7 +745,7 @@ export function SettingsPage() {
                 </div>
                 <div style={{ flex: 1 }}>
                   <div style={{ fontSize: 12, fontWeight: 500, color: 'var(--text)', marginBottom: 2 }}>ApplyMate AI for Chrome</div>
-                  <div style={{ fontSize: 10, color: 'var(--text-muted)', lineHeight: 1.5 }}>在 LinkedIn、Indeed 等求职网站上一键保存职位、自动填表、查看简历匹配分</div>
+                  <div style={{ fontSize: 10, color: 'var(--text-muted)', lineHeight: 1.5 }}>exist LinkedIn、Indeed Save jobs on job search websites with one click、Automatic form filling、View resume match score</div>
                 </div>
                 <div style={{ display: 'flex', flexDirection: 'column', gap: 6, alignItems: 'flex-end', flexShrink: 0 }}>
                   <a
@@ -760,7 +760,7 @@ export function SettingsPage() {
                     }}
                   >
                     <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
-                    安装扩展
+                    Install extension
                   </a>
                   <a
                     href="https://github.com/YuanshuoDu/applymate-jobcopilot"
@@ -768,7 +768,7 @@ export function SettingsPage() {
                     rel="noreferrer"
                     style={{ fontSize: 10, color: 'var(--text-muted)', textDecoration: 'none' }}
                   >
-                    查看使用说明 →
+                    View instructions for use →
                   </a>
                 </div>
               </div>
@@ -1142,7 +1142,7 @@ function ApiKeysSettings() {
 // ── AI Model Settings ─────────────────────────────────────────────────────────
 
 const TIER_COLOR = { fast: 'var(--c-warning)', standard: 'var(--primary)', premium: '#5B3DC8' }
-const TIER_LABEL = { fast: '快速', standard: '标准', premium: '旗舰' }
+const TIER_LABEL = { fast: 'fast', standard: 'standard', premium: 'flagship' }
 
 const KEY_HINTS: Partial<Record<Provider, { href: string }>> = {
   anthropic: { href: 'https://console.anthropic.com/settings/keys' },
@@ -1158,18 +1158,18 @@ const PROVIDERS_WITH_MODELS = Array.from(new Set(MODEL_CATALOGUE.map(m => m.prov
 
 const FEATURE_GROUPS: Array<{ label: string; description: string; features: FeatureId[] }> = [
   {
-    label: '简历与岗位分析',
-    description: '简历评分、简历解析、改进建议、面试准备、职位评分与关键词提取',
+    label: 'Resume and job analysis',
+    description: 'Resume scoring、Resume analysis、Improvement suggestions、Interview preparation、Job rating and keyword extraction',
     features: ['scoring', 'parsing', 'suggest', 'interviewPrep', 'jobScoring'],
   },
   {
-    label: '申请材料生成',
-    description: '求职信、字段建议与表单答案修改',
+    label: 'Application material generation',
+    description: 'cover letter、Field suggestions and form answer modifications',
     features: ['coverLetter', 'fieldSuggest', 'formRevise'],
   },
   {
-    label: 'Agent 自动化',
-    description: 'AI Agent、表单自动填写与无人值守自动申请',
+    label: 'Agent automation',
+    description: 'AI Agent、Automatic form filling and unattended automatic application',
     features: ['agent', 'formFill', 'autoApply'],
   },
 ]
@@ -1297,7 +1297,7 @@ function AiModelSettings() {
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 20 }}>
 
-      {/* ── ApplyMate 说明卡 ── */}
+      {/* ── ApplyMate instruction card ── */}
       <div style={{ padding: '14px 16px', background: 'linear-gradient(135deg,rgba(79,70,229,0.08),rgba(91,61,200,0.06))', border: '1px solid rgba(79,70,229,0.20)', borderRadius: 12 }}>
         <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 6 }}>
           <span style={{ fontSize: 20 }}>✦</span>
@@ -1317,10 +1317,10 @@ function AiModelSettings() {
         )}
       </div>
 
-      {/* ── 分功能模型控制 ── */}
+      {/* ── Functional model control ── */}
       <SettingsSection title={t('settings.ai.featuresTitle')}>
         <div style={{ fontSize: 11, color: 'var(--text-muted)', marginBottom: 14, lineHeight: 1.6 }}>
-          {t('settings.ai.featuresDesc').replace('ApplyMate AI', APPLYMATE_LABEL)} 已汇总为三类工作流；选择一个模型会同步应用到该类全部功能。
+          {t('settings.ai.featuresDesc').replace('ApplyMate AI', APPLYMATE_LABEL)} Has been summarized into three types of workflows；Selecting a model will be applied to all functions of that class simultaneously.。
         </div>
         <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
           {FEATURE_GROUPS.map(group => {
@@ -1333,7 +1333,7 @@ function AiModelSettings() {
                   <div style={{ fontSize: 12, fontWeight: 500, color: 'var(--text)' }}>{group.label}</div>
                   <div style={{ fontSize: 10, color: 'var(--text-muted)', marginTop: 2 }}>
                     {mixed
-                      ? '当前存在不同设置；重新选择会统一覆盖本组。'
+                      ? 'There are currently different settings；Reselecting will cover this group uniformly。'
                       : isDefault
                       ? `✦ ${APPLYMATE_LABEL} ${t('settings.ai.defaultLabel')}`
                       : `${PROVIDER_LABELS[current.provider]} · ${current.model}`
@@ -1376,7 +1376,7 @@ function AiModelSettings() {
         </div>
       </SettingsSection>
 
-      {/* ── 提供商 API Key ── */}
+      {/* ── provider API Key ── */}
       <SettingsSection title={t('settings.ai.keysTitle')}>
         <div style={{ display: 'flex', alignItems: 'flex-start', gap: 12, justifyContent: 'space-between', marginBottom: 14 }}>
           <div style={{ fontSize: 11, color: 'var(--text-muted)', lineHeight: 1.6 }}>

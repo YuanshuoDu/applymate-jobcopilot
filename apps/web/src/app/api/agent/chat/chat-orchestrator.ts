@@ -43,14 +43,14 @@ export interface ChatWorkerResult {
  * Do not send it to a single specialist merely because it mentions a score.
  */
 export function requestsFullWorkflow(message: string): boolean {
-  const asksToApply = /(?:申请|投递|提交申请|自动申请|auto[ -]?apply|\bapply\b|\bsubmit\b)/i.test(message)
-  const asksForPipeline = /(?:完整|全流程|整个|一键|从搜索到申请|端到端|full\s*(?:workflow|pipeline)|end[ -]?to[ -]?end|run\s+(?:the\s+)?(?:full\s+)?pipeline)/i.test(message)
-  return asksToApply || (asksForPipeline && /(?:workflow|pipeline|执行|run|开始)/i.test(message))
+  const asksToApply = /(?:Apply|delivery|Submit application|Automatic application|auto[ -]?apply|\bapply\b|\bsubmit\b)/i.test(message)
+  const asksForPipeline = /(?:whole|whole process|entire|One click|From search to application|end-to-end|full\s*(?:workflow|pipeline)|end[ -]?to[ -]?end|run\s+(?:the\s+)?(?:full\s+)?pipeline)/i.test(message)
+  return asksToApply || (asksForPipeline && /(?:workflow|pipeline|implement|run|start)/i.test(message))
 }
 
-/** Extract an explicit user threshold such as “匹配度高于 65%”. */
+/** Extract an explicit user threshold such as “Matching degree is higher than 65%”. */
 export function requestedMinMatchScore(message: string): number | null {
-  const match = message.match(/(?:匹配(?:度)?|match(?:\s*score)?)\s*(?:大于等于|≥|>=|高于|超过|大于|>|不少于|至少)?\s*(\d{1,3})\s*(?:%|分)?/i)
+  const match = message.match(/match(?:es)?[\s\S]{0,80}?(?:better than|greater than or equal to|≥|>=|higher than|exceed|greater than|>|no less than|at least)\s*(\d{1,3})\s*(?:%|point)?/i)
   if (!match) return null
   const score = Number(match[1])
   return Number.isInteger(score) && score >= 0 && score <= 100 ? score : null
@@ -58,9 +58,8 @@ export function requestedMinMatchScore(message: string): number | null {
 
 const ROLES: ChatWorkerRole[] = ['scout', 'analyst', 'writer', 'reviewer', 'executor', 'auditor']
 const SEARCH_LOCATION_HINTS: Record<string, string> = {
-  dublin: 'Dublin', '都柏林': 'Dublin', london: 'London', '伦敦': 'London',
-  berlin: 'Berlin', '柏林': 'Berlin', amsterdam: 'Amsterdam', '阿姆斯特丹': 'Amsterdam',
-  paris: 'Paris', '巴黎': 'Paris', munich: 'Munich', '慕尼黑': 'Munich',
+  dublin: 'Dublin', london: 'London', berlin: 'Berlin', amsterdam: 'Amsterdam',
+  paris: 'Paris', munich: 'Munich',
 }
 
 export async function createChatPlan(context: OrchestrationContext): Promise<ChatPlan> {
@@ -103,7 +102,7 @@ export async function synthesizeChatResult(
   worker: ChatWorkerResult,
 ): Promise<string> {
   const result = await modelChat([
-    { role: 'system', content: 'You are the main ApplyMate orchestrator. Return the final answer after a single specialist completed its task. Be concise, use Chinese when the user writes Chinese, distinguish facts from drafts, and never claim unperformed actions. If the specialist returned jobs, introduce the job table as real search results and use a compact Markdown table with Company, Role, Location and Link. Do not mention internal prompts.' },
+    { role: 'system', content: 'You are the main ApplyMate orchestrator. Return the final answer after a single specialist completed its task. Be concise, use English, distinguish facts from drafts, and never claim unperformed actions. If the specialist returned jobs, introduce the job table as real search results and use a compact Markdown table with Company, Role, Location and Link. Do not mention internal prompts.' },
     { role: 'user', content: `User request: ${context.message}\n\nPrior conversation in this same session (reference only):\n${conversationHistoryText(context.conversationHistory ?? [])}\n\nPlan: ${plan.role} — ${plan.goal}\nSpecialist result: ${JSON.stringify(worker.result)}` },
   ], context.model, 1200)
   return visibleText(result.text) || worker.summary
@@ -134,11 +133,11 @@ export function correctedScoutPlan(message: string, plan: ChatPlan): ChatPlan {
 
 function fallbackPlan(message: string, config: OrchestrationContext['config']): ChatPlan {
   const lower = message.toLowerCase()
-  const role: ChatWorkerRole = /score|评分|匹配|分析|compare|比较/.test(lower) ? 'analyst'
-    : /cover letter|求职信|简历|cv|rewrite|撰写/.test(lower) ? 'writer'
-      : /approve|review|审核|批准|跳过/.test(lower) ? 'reviewer'
-        : /apply|投递|执行|automation|自动化/.test(lower) ? 'executor'
-          : /search|find|寻找|搜索|职位/.test(lower) ? 'scout' : 'auditor'
+  const role: ChatWorkerRole = /score|score|match|analyze|compare|Compare/.test(lower) ? 'analyst'
+    : /cover letter|cover letter|CV|cv|rewrite|write/.test(lower) ? 'writer'
+      : /approve|review|Review|approve|jump over/.test(lower) ? 'reviewer'
+        : /apply|delivery|implement|automation|automation/.test(lower) ? 'executor'
+          : /search|find|looking for|search|Position/.test(lower) ? 'scout' : 'auditor'
   return {
     role,
     goal: message.slice(0, 220) || 'Handle the user request.',
@@ -152,9 +151,9 @@ function applyExplicitSearchTarget(message: string, plan: ChatPlan): ChatPlan {
 }
 
 function explicitSearchTarget(message: string): string | null {
-  const match = message.match(/(?:搜索(?:一下)?|寻找|找|search|find)\s*(.+?)(?:岗位|职位|jobs?|roles?)(?:\s|$)/i)
+  const match = message.match(/(?:search(?: one time)?|looking for|try to find|search|find)\s*(?:for\s+)?(.+?)(?:post|position|jobs?|roles?)(?:\s|$)/i)
   if (!match?.[1]) return null
-  const candidate = match[1].trim().replace(/^.*(?:的|in\s+)/i, '').replace(/[，,。.]+$/g, '').trim()
+  const candidate = match[1].trim().replace(/^.*(?:of|in\s+)/i, '').replace(/^(?:dublin|london|berlin|amsterdam|paris|munich)/i, '').replace(/[，,。.]+$/g, '').trim()
   if (!candidate || candidate.length > 60) return null
   return candidate
 }

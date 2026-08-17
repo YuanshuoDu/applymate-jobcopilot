@@ -3,7 +3,7 @@ import { approvalRequestFrom, automationDraftFrom, resumeTailoringApprovalFrom }
 
 describe('agent chat structured blocks', () => {
   it('extracts automation draft details from a natural-language request', () => {
-    expect(automationDraftFrom('每天 9 点帮我找 Berlin SWE，85 分以上创建自动化')).toMatchObject({
+    expect(automationDraftFrom('every day 9 Click to help me find it Berlin SWE，85 Create automation')).toMatchObject({
       name: 'Berlin SWE automation',
       triggerType: 'daily',
       cron: '0 9 * * *',
@@ -16,11 +16,11 @@ describe('agent chat structured blocks', () => {
   })
 
   it('does not emit automation drafts for ordinary chat', () => {
-    expect(automationDraftFrom('解释一下最近职位评分')).toBeNull()
+    expect(automationDraftFrom('Explain the recent job rating')).toBeNull()
   })
 
   it('creates approval requests for sensitive apply actions', () => {
-    expect(approvalRequestFrom('批准投递 4 个职位', { pendingCount: 2, savedCount: 8 })).toMatchObject({
+    expect(approvalRequestFrom('Approve delivery 4 positions', { pendingCount: 2, savedCount: 8 })).toMatchObject({
       type: 'apply_jobs',
       title: 'Approval required',
       impact: {
@@ -36,11 +36,11 @@ describe('agent chat structured blocks', () => {
   })
 
   it('ignores non-sensitive chat prompts', () => {
-    expect(approvalRequestFrom('帮我解释评分', { pendingCount: 3, savedCount: 6 })).toBeNull()
+    expect(approvalRequestFrom('Help me explain the rating', { pendingCount: 3, savedCount: 6 })).toBeNull()
   })
 
   it('asks for consent before the Writer changes a resume for a named job', () => {
-    expect(resumeTailoringApprovalFrom('请为 N26 的 Backend Engineer 定制并优化我的简历', {
+    expect(resumeTailoringApprovalFrom('please for N26 of Backend Engineer Customize and optimize my resume', {
       resumeId: 'resume_1',
       jobs: [{ id: 'job_1', company: 'N26', role: 'Backend Engineer' }],
     })).toMatchObject({
@@ -51,7 +51,7 @@ describe('agent chat structured blocks', () => {
   })
 
   it('does not guess a job when multiple jobs exist and none is named', () => {
-    expect(resumeTailoringApprovalFrom('优化我的简历', {
+    expect(resumeTailoringApprovalFrom('Optimize my resume', {
       resumeId: 'resume_1',
       jobs: [{ id: 'job_1', company: 'N26', role: 'Backend Engineer' }, { id: 'job_2', company: 'Spotify', role: 'Data Engineer' }],
     })).toBeNull()

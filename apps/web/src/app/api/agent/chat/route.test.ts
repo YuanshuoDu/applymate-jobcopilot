@@ -279,7 +279,7 @@ describe("agent chat API session recording", () => {
     const { POST } = await import("./route")
 
     const res = expectResponse(await POST(postRequest({
-      messages: [{ role: "user", content: "每天 9 点帮我找 Berlin SWE，85 分以上创建自动化" }],
+      messages: [{ role: "user", content: "every day 9 Click to help me find it Berlin SWE，85 Create automation" }],
     }) as never))
     const text = await readSse(res)
 
@@ -321,7 +321,7 @@ describe("agent chat API session recording", () => {
     const { POST } = await import('./route')
 
     const text = await readSse(expectResponse(await POST(postRequest({
-      messages: [{ role: 'user', content: '开始完整工作流' }],
+      messages: [{ role: 'user', content: 'Start the complete workflow' }],
     }) as never)))
 
     expect(text).toContain('event: action')
@@ -339,7 +339,7 @@ describe("agent chat API session recording", () => {
     const { POST } = await import("./route")
 
     const res = expectResponse(await POST(postRequest({
-      messages: [{ role: "user", content: "批准投递 2 个职位" }],
+      messages: [{ role: "user", content: "Approve delivery 2 positions" }],
     }) as never))
     const text = await readSse(res)
 

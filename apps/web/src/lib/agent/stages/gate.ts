@@ -1,6 +1,6 @@
 /**
  * Stage 4 — Gate (Reviewer)
- * Role: 审核员
+ * Role: auditor
  *
  * Two-phase operation:
  *
@@ -88,11 +88,11 @@ export async function runGate(
   let includeBorderline = false
   const borderline = packages.filter(p => p.score >= minMatchScore - 5 && p.score < minMatchScore)
   if (borderline.length > 0) {
-    const question = `${borderline.length} 个职位评分刚好低于阈值 ${minMatchScore}%（差距 1-5 分）：${borderline.slice(0, 3).map(p => `${p.job.company}(${p.score}%)`).join('、')}${borderline.length > 3 ? '…' : ''}。是否将它们纳入待审核？`
+    const question = `${borderline.length} job ratings are just below the threshold ${minMatchScore}%（gap 1-5 point）：${borderline.slice(0, 3).map(p => `${p.job.company}(${p.score}%)`).join('、')}${borderline.length > 3 ? '…' : ''}。whether to include them for review？`
     const options = [
-      { label: '⏳ 纳入待审核（推荐）', value: 'add_to_pending' },
-      { label: '✕ 跳过（保持现有阈值）', value: 'skip' },
-      { label: '⬇ 降低阈值 5%', value: 'lower_threshold', action: { field: 'minMatchScore', value: Math.max(40, minMatchScore - 5) } },
+      { label: '⏳ Included for review（recommend）', value: 'add_to_pending' },
+      { label: '✕ jump over（Keep existing thresholds）', value: 'skip' },
+      { label: '⬇ lower threshold 5%', value: 'lower_threshold', action: { field: 'minMatchScore', value: Math.max(40, minMatchScore - 5) } },
     ]
     if (ctx.askUser) {
       includeBorderline = await ctx.askUser('reviewer', question, options) === 'add_to_pending'
@@ -105,27 +105,27 @@ export async function runGate(
   for (const pkg of packages) {
     emit('agent_action', {
       role:   'reviewer',
-      action: `审核 ${pkg.job.company} · ${pkg.job.role} (${pkg.score}%)`,
+      action: `Review ${pkg.job.company} · ${pkg.job.role} (${pkg.score}%)`,
     })
 
     // ── Phase A: AI quality review ──────────────────────────────────────────
     const quality = await reviewApplicationQuality(pkg, ctx)
     if (quality) {
-      const clTag  = quality.clScore >= 8 ? '✦ 优秀' : quality.clScore >= 6 ? '◆ 合格' : '◇ 偏弱'
-      const readyTag = quality.readyToApply ? '' : ' ⚠ 建议改进后再投递'
+      const clTag  = quality.clScore >= 8 ? '✦ excellent' : quality.clScore >= 6 ? '◆ qualified' : '◇ Weak'
+      const readyTag = quality.readyToApply ? '' : ' ⚠ Suggest improvements before submitting'
       emit('agent_observation', {
         role:        'reviewer',
-        observation: `求职信质量 ${clTag}（${quality.clScore}/10）${readyTag}${quality.fitGap ? ` · 缺口：${quality.fitGap}` : ''} → ${quality.recommendation}`,
+        observation: `Cover letter quality ${clTag}（${quality.clScore}/10）${readyTag}${quality.fitGap ? ` · gap：${quality.fitGap}` : ''} → ${quality.recommendation}`,
       })
 
       // Weak materials are not silently allowed through a queued review. Ask
       // the candidate to decide whether this job remains eligible for review.
       if (quality.clScore < 6 && pkg.coverLetter) {
-        const question = `${pkg.job.company} · ${pkg.job.role} 的求职信质量偏低（${quality.clScore}/10）：${quality.recommendation}。是否继续投递还是跳过？`
+        const question = `${pkg.job.company} · ${pkg.job.role} cover letter quality is low（${quality.clScore}/10）：${quality.recommendation}。Whether to continue delivery or skip？`
         const options = [
-          { label: '📤 继续投递（现有材料）', value: 'continue' },
-          { label: '⏳ 放入待审核', value: 'review' },
-          { label: '✕ 跳过此职位', value: 'skip' },
+          { label: '📤 Continue delivery（Existing materials）', value: 'continue' },
+          { label: '⏳ Place for review', value: 'review' },
+          { label: '✕ Skip this post', value: 'skip' },
         ]
         const decision = ctx.askUser
           ? await ctx.askUser('reviewer', question, options)
@@ -149,7 +149,7 @@ export async function runGate(
       })
       emit('agent_observation', {
         role:        'reviewer',
-        observation: `✕ 跳过：${pkg.score}% < 阈值 ${minMatchScore}%`,
+        observation: `✕ jump over：${pkg.score}% < threshold ${minMatchScore}%`,
       })
       continue
     }
@@ -178,13 +178,13 @@ export async function runGate(
       : null
     emit('agent_observation', {
       role:        'reviewer',
-      observation: `⏳ 进入待审核：材料已保存，必须由你逐个审核并明确授权后才会提交。`,
+      observation: `⏳ Enter to be reviewed：Material saved，They must be reviewed individually by you and explicitly authorized before submission.。`,
     })
     emit('agent_question', {
       role: 'reviewer', questionId: `application_review_${pkg.job.id}`,
-      question: `${pkg.job.company} · ${pkg.job.role} 的申请材料已就绪。请审核材料与职位是否对应、所有答案是否真实；确认后才可授权提交。`,
+      question: `${pkg.job.company} · ${pkg.job.role} The application materials are ready。Please check whether the materials correspond to the position、Are all answers true?；Submit can only be authorized after confirmation.。`,
       options: [
-        { label: '保留待审核', value: 'review' },
+        { label: 'Reserved for review', value: 'review' },
       ],
     })
     if (approval) {

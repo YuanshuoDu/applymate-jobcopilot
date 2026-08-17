@@ -1,54 +1,54 @@
-# ApplyMate AI — Chrome Extension 安装指南
+# ApplyMate AI — Chrome Extension Installation guide
 
-## 开发模式构建
+## Development mode build
 
 ```bash
 cd apps/extension
 pnpm install
-pnpm dev          # watch 模式，文件变化自动重新构建
-# 或
-pnpm build        # 一次性构建
+pnpm dev          # watch model，Automatically rebuild on file changes
+# or
+pnpm build        # Build once
 ```
 
-构建产物在 `apps/extension/dist/`
+The build product is in `apps/extension/dist/`
 
 ---
 
-## 加载到 Chrome
+## load to Chrome
 
-1. 打开 Chrome，地址栏输入 `chrome://extensions/`
-2. 右上角开启 **开发者模式**
-3. 点击 **加载已解压的扩展程序**
-4. 选择 `apps/extension/dist/` 文件夹
-5. 插件出现在扩展列表，图标出现在地址栏右侧
-
----
-
-## 首次使用
-
-1. 确保 Next.js 开发服务器正在运行（`pnpm dev`，默认 http://localhost:3000）
-2. 点击 Chrome 工具栏上的 ApplyMate 图标
-3. 使用你自己的 ApplyMate 账号登录
-4. 登录成功后即可在 LinkedIn/Indeed/Glassdoor 使用
+1. Open Chrome，Address bar input `chrome://extensions/`
+2. Open in the upper right corner **Developer mode**
+3. Click **Load unpacked extension**
+4. choose `apps/extension/dist/` folder
+5. The plugin appears in the extensions list，The icon appears on the right side of the address bar
 
 ---
 
-## 使用方法
+## First time use
 
-### 方式一：浮动按钮
-在任意支持的职位页面，右下角会出现蓝色的 **"Save to ApplyMate"** 按钮，点击一键保存。
-
-### 方式二：Popup 弹窗
-点击扩展图标 → Popup 弹窗显示当前职位信息，可预览后保存。
-
-### 方式三：侧边栏
-Popup 内点击 **"打开侧边栏查看详情"** → 侧边栏展开，显示完整职位详情、状态追踪、备注。
+1. make sure Next.js Development server is running（`pnpm dev`，default http://localhost:3000）
+2. Click Chrome on the toolbar ApplyMate icon
+3. use your own ApplyMate Account login
+4. After successful login, you can LinkedIn/Indeed/Glassdoor use
 
 ---
 
-## 支持的平台
+## How to use
 
-| 平台 | 职位识别 | 一键保存 |
+### Method one：floating button
+On any supported job page，A blue one will appear in the lower right corner **"Save to ApplyMate"** button，One click to save。
+
+### Method 2：Popup Pop-up window
+Click on the extension icon → Popup Pop-up window displays current job information，Can be previewed and saved。
+
+### Method three：sidebar
+Popup click within **"Open the sidebar to view details"** → Expand sidebar，Show full job details、status tracking、Remark。
+
+---
+
+## Supported platforms
+
+| platform | Job identification | Save with one click |
 |---|---|---|
 | LinkedIn | ✅ | ✅ |
 | Indeed | ✅ | ✅ |
@@ -60,9 +60,9 @@ Popup 内点击 **"打开侧边栏查看详情"** → 侧边栏展开，显示�
 
 ---
 
-## 生产构建 & 打包
+## Production build & Pack
 
 ```bash
 pnpm build
-pnpm zip                # 生成 release/ApplyMate-AI-<version>.zip
+pnpm zip                # generate release/ApplyMate-AI-<version>.zip
 ```

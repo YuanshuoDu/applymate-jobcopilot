@@ -376,11 +376,11 @@ When implementing any feature, ask yourself:
 
 ## Part 10 — Current Issue Queue (as of 2026-06-03)
 
-**Phase 1-2 ✅ 完成** — Greenhouse, Lever, Workday CXS, SmartRecruiters, Personio, Multi-source Dedup, registries, enrichment cascade.
+**Phase 1-2 ✅ Finish** — Greenhouse, Lever, Workday CXS, SmartRecruiters, Personio, Multi-source Dedup, registries, enrichment cascade.
 
-**Phase 3 ✅ 完成** — Worker skeleton, CloakBrowser pool, AgentHarness.
+**Phase 3 ✅ Finish** — Worker skeleton, CloakBrowser pool, AgentHarness.
 
-**Phase 4 🔄 进行中:**
+**Phase 4 🔄 in progress:**
 - Workday apply flow ✅, Greenhouse apply flow ✅, Lever apply flow ✅
 - **#162** — SmartRecruiters apply flow ✅ done (PR #165)
 - **#163** — ATS detector ✅ done (PR #166)
@@ -388,45 +388,45 @@ When implementing any feature, ask yourself:
 - **#169** — Shared flow helpers ✅ done (PR #172)
 - **#171** — verify-flow Personio support ✅ done (PR #173)
 
-**Phase 5 — Form-Pattern Cache 护城河 ✅ 全部完成:**
+**Phase 5 — Form-Pattern Cache moat ✅ All done:**
 - **#174** — FormPattern model + CRUD ✅ done
 - **#175** — Pattern replay engine ✅ done
 - **#176** — Confidence decay ✅ done
 - **#177** — AI budget cap ✅ done
 - **#178** — Phase 5 integration wiring ✅ done
 
-**Phase 5 收尾 ✅ 全部完成:**
+**Phase 5 ending ✅ All done:**
 - **#184** — flowUsed="pattern-cache" ✅ done
-- **#185** — Phase 5 单元测试 ✅ done (9 tests, 3 files)
-- **#186** — Dashboard AI budget 显示 ✅ done
+- **#185** — Phase 5 Unit testing ✅ done (9 tests, 3 files)
+- **#186** — Dashboard AI budget show ✅ done
 - **#189** — Vercel build fix ✅ done
 
-**Phase 5.7 已知 Gap:**
-- AgentHarness 成功后写入 FormPattern（等 AgentHarness 暴露 field→selector 映射）
+**Phase 5.7 known Gap:**
+- AgentHarness Write after success FormPattern（wait AgentHarness exposed field→selector mapping）
 
-**Phase 6 — 直接 HTML 抓取:**
-- 合规审查完成: StepStone ⚠️ (robots.txt blocks search), Xing 🔴 (blocked), WTTJ 🔴 (ToS prohibits scraping)
-- **判定: 跳过** — 3 个目标站点均不可行
+**Phase 6 — direct HTML crawl:**
+- Compliance review completed: StepStone ⚠️ (robots.txt blocks search), Xing 🔴 (blocked), WTTJ 🔴 (ToS prohibits scraping)
+- **determination: jump over** — 3 None of the target sites are feasible
 
-**Phase 7 — 生产加固 ✅ 全部完成:**
+**Phase 7 — Production reinforcement ✅ All done:**
 - **#191** — Redis rate limiter + proxy rotation ✅ done
 - **#192** — CAPTCHA detection + CapSolver ✅ done (P0)
 - **#193** — In-app notification system ✅ done
 - **#194** — Observability dashboard ✅ done (P0)
 - **#195** — On-call runbook ✅ done
 
-**Phase 6 — 跳过:** StepStone ⚠️, Xing 🔴, WTTJ 🔴 (合规审查不通过)
+**Phase 6 — jump over:** StepStone ⚠️, Xing 🔴, WTTJ 🔴 (Compliance review failed)
 
-**全部 Phase 完成。队列清空，仓库干净。**
+**all Phase Finish。Queue cleared，Warehouse is clean。**
 
-**收尾 Issue 🔄:**
-- **#202** — AgentHarness field mappings → upsertFormPattern 闭环 ✅ done (PR #205)
-- **#203** — lever-flow 切到共享 helpers ✅ done (PR #206)
-- **#204** — Phase 5 流水线 e2e 集成测试 ✅ done (PR #207)
+**ending Issue 🔄:**
+- **#202** — AgentHarness field mappings → upsertFormPattern closed loop ✅ done (PR #205)
+- **#203** — lever-flow Switch to share helpers ✅ done (PR #206)
+- **#204** — Phase 5 assembly line e2e Integration testing ✅ done (PR #207)
 
-**🎉 全部完成。队列清空，仓库干净。Web 26/26 绿， Worker 23/23 绿。**
+**🎉 All done。Queue cleared，Warehouse is clean。Web 26/26 green， Worker 23/23 green。**
 
-**Phase 5 护城河 (待创建):**
+**Phase 5 moat (To be created):**
 - Form-pattern cache, Pattern replay, Confidence decay, Budget cap
 
 **Later:**

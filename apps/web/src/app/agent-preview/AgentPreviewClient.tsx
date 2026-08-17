@@ -103,8 +103,8 @@ export function AgentPreviewClient() {
         </header>
         <section className="agent-preview-transcript" style={transcriptStyle}>
           {newChat ? <NewChatEmptyState /> : <>
-          <Message speaker="You" body="每天早上 9 点自动找 Berlin 软件工程岗位，85 分以上自动投，但需要我确认。" time="09:11" />
-          <Message speaker="Orchestrator · Automation draft" body="我可以创建一个工作日 09:00 自动化：在 Berlin 搜索软件工程岗位，85 分以上进入投递队列，提交前请求你确认。" time="09:12">
+          <Message speaker="You" body="every morning 9 Click to find automatically Berlin software engineering positions，85 Automatically vote for points or more，But I need to confirm。" time="09:11" />
+          <Message speaker="Orchestrator · Automation draft" body="I can create a working day 09:00 automation：exist Berlin Search software engineering jobs，85 Enter the delivery queue after 1 minute or more，Request your confirmation before submitting。" time="09:12">
             <Grid rows={[['Trigger', 'Weekdays 09:00'], ['Target', 'Berlin · SWE'], ['Score', '85+'], ['Approval', 'Required'], ['Daily cap', '8 applications']]} />
             <ButtonRow labels={['Create automation', 'Edit', 'Cancel']} />
           </Message>
@@ -116,12 +116,12 @@ export function AgentPreviewClient() {
             time={thinkingExpanded ? '09:12 · expanded' : '09:12 · collapsed'}
             muted={!thinkingExpanded}
           />
-          <Message speaker="Orchestrator · Options" body="选择投递策略以优化匹配质量和效率。" time="09:13">
-            <Option name="Conservative" desc="更高匹配阈值，投递更少但质量更高。" />
-            <Option name="Balanced" desc="平衡匹配质量与数量，推荐日常使用。" selected />
-            <Option name="Aggressive" desc="更宽松阈值，获取更多机会。" />
+          <Message speaker="Orchestrator · Options" body="Choose a delivery strategy to optimize match quality and efficiency。" time="09:13">
+            <Option name="Conservative" desc="Higher match threshold，Fewer deliveries but higher quality。" />
+            <Option name="Balanced" desc="Balance matching quality and quantity，Recommended for daily use。" selected />
+            <Option name="Aggressive" desc="looser threshold，Get more opportunities。" />
           </Message>
-          <Message speaker="Executor · Approval Required" body="准备提交以下 4 份申请，请确认是否继续。" time="09:14" warn>
+          <Message speaker="Executor · Approval Required" body="Prepare to submit the following 4 applications，Please confirm whether to continue。" time="09:14" warn>
             <Grid rows={[['Impact', '4 applications · 4 cover letters'], ['LinkedIn', 'No LinkedIn actions'], ['Sensitive fields', 'Ask user if missing']]} />
             <ButtonRow labels={['Approve', 'Review jobs', 'Cancel']} />
           </Message>

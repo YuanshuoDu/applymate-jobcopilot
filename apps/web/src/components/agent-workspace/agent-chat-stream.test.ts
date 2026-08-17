@@ -76,7 +76,7 @@ describe('agent chat stream helpers', () => {
   it('flushes a multibyte final chunk before processing the remaining line', async () => {
     const bytes = new TextEncoder().encode([
       'event: text',
-      'data: {"delta":"你好"}',
+      'data: {"delta":"Hello"}',
     ].join('\n'))
     const text = await readAgentChatStream(streamFromChunks([
       bytes.slice(0, bytes.length - 1),
@@ -87,7 +87,7 @@ describe('agent chat stream helpers', () => {
       onAction: vi.fn(),
     })
 
-    expect(text).toBe('你好')
+    expect(text).toBe('Hello')
   })
 
   it('keeps legacy ACTION lines out of display text', async () => {

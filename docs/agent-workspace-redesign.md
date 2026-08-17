@@ -143,14 +143,14 @@ Example:
 
 ```text
 You
-每天早上 9 点自动找 Berlin 软件工程岗位，85 分以上自动投，但需要我确认。
+every morning 9 Click to find automatically Berlin software engineering positions，85 Automatically vote for points or more，But I need to confirm。
 
 10:41
 ```
 
 ```text
 Orchestrator
-可以。我会创建一个工作日 09:00 的自动化规则，目标是 Berlin 软件工程岗位，匹配分 85+，投递前请求你确认。
+Can。I will create a working day 09:00 Automation rules for，The goal is Berlin software engineering positions，Match points 85+，Please confirm before delivery。
 
 10:42 · 1.1s
 ```
@@ -454,7 +454,7 @@ sequenceDiagram
   participant Q as Worker/Queue
   participant T as Transcript
 
-  U->>C: "每天 9 点自动找 Berlin SWE"
+  U->>C: "every day 9 Click to find automatically Berlin SWE"
   C->>A: POST /api/agent/chat
   A-->>T: automation_draft block
   U->>T: Create automation
@@ -588,7 +588,7 @@ Upgrade `/api/agent/chat` to emit structured blocks.
 
 ```text
 event: text
-data: {"delta":"我可以帮你创建这个自动化。"}
+data: {"delta":"I can help you create this automation。"}
 
 event: block
 data: {

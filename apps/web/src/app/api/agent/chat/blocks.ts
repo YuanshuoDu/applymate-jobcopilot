@@ -22,14 +22,14 @@ export interface ApprovalRequestDraft {
 
 export function automationDraftFrom(text: string): AutomationDraft | null {
   const lower = text.toLowerCase()
-  const asksAutomation = lower.includes('automation') || text.includes('自动化') || text.includes('定时')
+  const asksAutomation = lower.includes('automation') || text.includes('automation') || text.includes('timing')
   if (!asksAutomation) return null
   const targetLocations = /berlin/i.test(text) ? ['Berlin'] : []
-  const targetRoles = /\b(swe|software engineer)\b/i.test(text) || text.includes('软件工程') ? ['SWE'] : []
-  const scoreMatch = text.match(/(\d{2,3})\s*(?:分|score|以上|\+)/i)
+  const targetRoles = /\b(swe|software engineer)\b/i.test(text) || text.includes('software engineering') ? ['SWE'] : []
+  const scoreMatch = text.match(/(\d{2,3})\s*(?:point|score|above|\+)/i)
   const minScore = scoreMatch ? Math.min(100, Math.max(0, Number(scoreMatch[1]))) : 85
-  const triggerType = text.includes('每天') || lower.includes('daily') ? 'daily' : text.includes('工作日') || lower.includes('weekday') ? 'weekdays' : 'manual'
-  const hourMatch = text.match(/(?:早上|上午|at\s*)?(\d{1,2})\s*(?:点|:00)/i)
+  const triggerType = text.includes('every day') || lower.includes('daily') ? 'daily' : text.includes('working days') || lower.includes('weekday') ? 'weekdays' : 'manual'
+  const hourMatch = text.match(/(?:Morning|morning|at\s*)?(\d{1,2})\s*(?:point|:00)/i)
   const hour = hourMatch ? Math.min(23, Math.max(0, Number(hourMatch[1]))) : 9
   return {
     name: `${targetLocations[0] ?? 'Job'} ${targetRoles[0] ?? 'search'} automation`,
@@ -51,7 +51,7 @@ export function approvalRequestFrom(
   context: { pendingCount: number; savedCount: number },
 ): ApprovalRequestDraft | null {
   const lower = text.toLowerCase()
-  const asksApply = /apply|submit|approve/.test(lower) || text.includes('投递') || text.includes('提交') || text.includes('批准')
+  const asksApply = /apply|submit|approve/.test(lower) || text.includes('delivery') || text.includes('submit') || text.includes('approve')
   if (!asksApply) return null
 
   const requestedCount = countFrom(text) ?? Math.max(context.pendingCount, context.savedCount, 1)
@@ -76,7 +76,7 @@ export function resumeTailoringApprovalFrom(
   text: string,
   context: { resumeId: string | null; jobs: Array<{ id: string; company: string; role: string }> },
 ): ApprovalRequestDraft | null {
-  const asksForTailoring = /tailor|tailored|优化.*简历|定制.*简历|修改.*简历|针对.*简历/i.test(text)
+  const asksForTailoring = /tailor|tailored|optim(?:ize|ized|ization).*\b(?:resume|CV)\b|custom(?:ize|ized|ization).*\b(?:resume|CV)\b|revise.*\b(?:resume|CV)\b/i.test(text)
   if (!asksForTailoring || !context.resumeId) return null
   const lower = text.toLowerCase()
   const explicitJob = context.jobs.find(job => lower.includes(job.company.toLowerCase()) || lower.includes(job.role.toLowerCase()))
@@ -92,7 +92,7 @@ export function resumeTailoringApprovalFrom(
 }
 
 function countFrom(text: string): number | null {
-  const match = text.match(/(\d{1,2})\s*(?:个|份|applications?|jobs?)/i)
+  const match = text.match(/(\d{1,2})\s*(?:individual|share|applications?|jobs?|positions?)/i)
   if (!match) return null
   return Math.min(50, Math.max(1, Number(match[1])))
 }

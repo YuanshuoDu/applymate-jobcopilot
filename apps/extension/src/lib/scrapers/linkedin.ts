@@ -74,7 +74,7 @@ export function scrapeLinkedIn(): ScrapedJob | null {
     // 2026+: internal data attributes
     query<HTMLElement>('[data-job-name]')?.innerText.trim() ||
     query<HTMLElement>('[aria-label*="job title" i]')?.innerText.trim() ||
-    query<HTMLElement>('[aria-label*="职位名称" i]')?.innerText.trim() ||
+    query<HTMLElement>('[aria-label*="Job title" i]')?.innerText.trim() ||
     query<HTMLElement>('[data-test-job-title]')?.innerText.trim() ||
     (currentJobId ? query<HTMLAnchorElement>(`a[href*="/jobs/view/${currentJobId}"]`)?.innerText.trim() : '') ||
     // 2025-2026 LinkedIn top card

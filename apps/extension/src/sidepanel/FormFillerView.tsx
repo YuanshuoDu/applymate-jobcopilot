@@ -1234,19 +1234,19 @@ function buildKnownAnswers(persona: string, personaFields: { key: string; label:
 
   if (nameVal && nameVal !== 'N/A') answers.push({
     key: 'name', value: nameVal, confidence: 1.0, source: 'profile',
-    keywords: ['name', 'first name', 'last name', 'full name', 'legal name', '姓名', '名字'],
+    keywords: ['name', 'first name', 'last name', 'full name', 'legal name', 'Name', 'name'],
   })
   if (emailVal) answers.push({
     key: 'email', value: emailVal, confidence: 1.0, source: 'profile',
-    keywords: ['email', 'e-mail', 'email address', '邮箱', '电子邮箱'],
+    keywords: ['email', 'e-mail', 'email address', 'Mail', 'Email'],
   })
   if (phoneVal) answers.push({
     key: 'phone', value: phoneVal, confidence: 1.0, source: 'profile',
-    keywords: ['phone', 'phone number', 'mobile', 'cell', 'telephone', '电话', '手机'],
+    keywords: ['phone', 'phone number', 'mobile', 'cell', 'telephone', 'Telephone', 'cell phone'],
   })
   if (locationVal) answers.push({
     key: 'location', value: locationVal, confidence: 0.95, source: 'profile',
-    keywords: ['location', 'city', 'address', 'where are you', 'country', 'region', 'state', '所在地', '地址', '城市'],
+    keywords: ['location', 'city', 'address', 'where are you', 'country', 'region', 'state', 'location', 'address', 'City'],
   })
   if (linkedinVal && linkedinVal !== 'N/A') answers.push({
     key: 'linkedin', value: linkedinVal, confidence: 1.0, source: 'profile',
@@ -1289,7 +1289,7 @@ function buildKnownAnswers(persona: string, personaFields: { key: string; label:
         value: sk,
         confidence: 0.9,
         source: 'resume',
-        keywords: [sk.toLowerCase(), 'skills', 'skill', 'technical skills', '技术', '技能'],
+        keywords: [sk.toLowerCase(), 'skills', 'skill', 'technical skills', 'technology', 'Skill'],
       })
     }
   }

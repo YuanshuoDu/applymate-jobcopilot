@@ -201,14 +201,14 @@ The existing Settings page already has `AiModelSettings` component with `Feature
 
 | FeatureId | Label | Default Model |
 |---|---|---|
-| `autoApply` | 自动申请 Agent（无人值守） | MiniMax M2.7 |
-| `jobScoring` | 职位评分 + 关键词提取 | MiniMax M2.7 |
+| `autoApply` | Automatic application Agent（unattended） | MiniMax M2.7 |
+| `jobScoring` | job rating + Keyword extraction | MiniMax M2.7 |
 
 Settings UI:
 ```
 Settings → AI Models → 
-  [自动申请 Agent] [下拉选择模型] [API Key 输入框]
-  [职位评分 + 关键词提取] [下拉选择模型] [API Key 输入框]
+  [Automatic application Agent] [Drop down to select model] [API Key Input box]
+  [job rating + Keyword extraction] [Drop down to select model] [API Key Input box]
 ```
 
 Users can switch from MiniMax to Claude/GPT-4o/DeepSeek for better quality, at their own cost.

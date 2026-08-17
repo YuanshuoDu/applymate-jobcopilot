@@ -83,12 +83,12 @@ export function ApplyJobCard({ job, onApplied }: ApplyJobCardProps) {
           </div>
           {job.matchedKeywords.length > 0 && (
             <div style={{ fontSize: 9, color: 'var(--text-muted)', marginTop: 3 }}>
-              匹配：{job.matchedKeywords.slice(0, 5).join(' · ')}
+              match：{job.matchedKeywords.slice(0, 5).join(' · ')}
             </div>
           )}
           {job.coverLetter && (
             <button onClick={() => setShowCL(s => !s)} style={{ marginTop: 4, fontSize: 10, color: 'var(--primary)', background: 'none', border: 'none', cursor: 'pointer', padding: 0, fontFamily: 'inherit' }}>
-              {showCL ? '▲ 收起求职信' : '▼ 查看求职信'}
+              {showCL ? '▲ Close cover letter' : '▼ View cover letter'}
             </button>
           )}
           {showCL && job.coverLetter && (
@@ -101,7 +101,7 @@ export function ApplyJobCard({ job, onApplied }: ApplyJobCardProps) {
           {isQueued ? (
             <WorkerState status={workerStatus} />
           ) : isApplied ? (
-            <span style={{ fontSize: 11, color: 'var(--c-success)', fontWeight: 600 }}>✓ 已投递</span>
+            <span style={{ fontSize: 11, color: 'var(--c-success)', fontWeight: 600 }}>✓ Delivered</span>
           ) : (
             <button
               onClick={handleApply}
@@ -113,7 +113,7 @@ export function ApplyJobCard({ job, onApplied }: ApplyJobCardProps) {
                 fontFamily: 'inherit',
               }}
             >
-              {applying ? '…' : '🚀 立即申请'}
+              {applying ? '…' : '🚀 Apply now'}
             </button>
           )}
         </div>
@@ -124,10 +124,10 @@ export function ApplyJobCard({ job, onApplied }: ApplyJobCardProps) {
 
 function WorkerState({ status }: { status: 'submitted' | 'manual' | 'failed' | null }) {
   const states = {
-    submitted: { label: '✓ 已确认投递', color: 'var(--c-success)' },
-    manual: { label: '⚠ 需要人工处理', color: '#b45309' },
-    failed: { label: '✕ 投递失败', color: 'var(--c-danger)' },
-    queued: { label: '⏳ 后台投递中', color: 'var(--primary)' },
+    submitted: { label: '✓ Delivery confirmed', color: 'var(--c-success)' },
+    manual: { label: '⚠ Requires manual processing', color: '#b45309' },
+    failed: { label: '✕ Delivery failed', color: 'var(--c-danger)' },
+    queued: { label: '⏳ Posting in the background', color: 'var(--primary)' },
   }
   const state = status ? states[status] : states.queued
   return <span style={{ fontSize: 11, color: state.color, fontWeight: 600 }}>{state.label}</span>

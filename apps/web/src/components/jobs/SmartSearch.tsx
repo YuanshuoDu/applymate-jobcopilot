@@ -120,7 +120,7 @@ function parseRoutingFlag(routing: string): string {
   const m = routing.match(/^([A-Z]{2})\s*→/)
   if (m) return FLAG_MAP[m[1].toLowerCase()] ?? ''
   if (/ireland/i.test(routing)) return '🇮🇪'
-  if (/remote|远程/i.test(routing)) return '🌍'
+  if (/remote|remote/i.test(routing)) return '🌍'
   return ''
 }
 
@@ -601,7 +601,7 @@ export function SmartSearch({ onJobSaved, onOpenSettings }: { onJobSaved?: () =>
                   {/* Region routing badge */}
                   {meta.routing && (() => {
                     const flag = parseRoutingFlag(meta.routing)
-                    // Extract region label: "IE → ..." or "Ireland → ..." or "远程 → ..."
+                    // Extract region label: "IE → ..." or "Ireland → ..." or "remote → ..."
                     const m = meta.routing.match(/^(Ireland|[A-Z]{2}|Remote|[^\s→]+)/)
                     const label = m?.[1]?.trim() ?? ''
                     const display = flag || label
@@ -748,7 +748,7 @@ export function SmartSearch({ onJobSaved, onOpenSettings }: { onJobSaved?: () =>
                                     <select
                                       value={tgtLang} onChange={e => setTgtLang(e.target.value)} onClick={e => e.stopPropagation()}
                                       style={{ fontSize: 10, padding: '3px 6px', border: '1px solid var(--border)', borderRadius: 6, background: 'var(--glass-bg)', color: 'var(--text-muted)' }}>
-                                      {['de','en','fr','es','nl','zh','ja'].map(l => <option key={l} value={l}>{l.toUpperCase()}</option>)}
+                                      {['de','en','fr','es','nl','ja'].map(l => <option key={l} value={l}>{l.toUpperCase()}</option>)}
                                     </select>
                                     <button
                                       onClick={e => { e.stopPropagation(); handleTranslate(r) }}
