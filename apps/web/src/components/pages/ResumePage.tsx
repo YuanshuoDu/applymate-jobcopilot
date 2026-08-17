@@ -241,8 +241,8 @@ function AddDirectionDialog({ onClose, onCreate }: {
           />
         </div>
         <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 8 }}>
-          <Btn small variant="ghost" onClick={onClose}>Cancel</Btn>
-          <Btn small variant="primary" onClick={() => { if (name.trim()) onCreate({ name: name.trim(), color, icon: icon.trim() || null }) }} disabled={!name.trim()}>Create</Btn>
+          <Btn small variant="ghost" onClick={onClose}>{t('resume.cancel')}</Btn>
+          <Btn small variant="primary" onClick={() => { if (name.trim()) onCreate({ name: name.trim(), color, icon: icon.trim() || null }) }} disabled={!name.trim()}>{t('resume.create')}</Btn>
         </div>
       </div>
     </div>
@@ -1673,7 +1673,7 @@ export function ResumePage() {
               <small>{selectedResume?.targetJobId ? 'Tailored version linked' : 'Selected resume linked'}</small>
               <div className="resume-opportunity-actions">
                 <button onClick={() => setShowCoverLetter(true)}>{t('resume.coverLetter')}</button>
-                <button onClick={() => toast.info('Saved job', `${linkedJob.company} · ${linkedJob.role} is linked to this resume`)}>View job</button>
+                <button onClick={() => toast.info(t('resume.viewJob'), `${linkedJob.company} · ${linkedJob.role} is linked to this resume`)}>{t('resume.viewJob')}</button>
               </div>
             </> : <>
               <strong>{t('resume.linkSavedJob')}</strong>
