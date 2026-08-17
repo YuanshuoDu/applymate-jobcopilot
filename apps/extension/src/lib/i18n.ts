@@ -375,7 +375,8 @@ export function translateExtension(lang: ExtensionLang, english: string): string
   if (formatting) return `正在整理 ${formatting[1]} 个字段进行分析`
   const generating = english.match(/^Generating answers for (\d+) fields$/)
   if (generating) return `正在为 ${generating[1]} 个字段生成答案`
-  return english
+  if (/^(ApplyMate(?: AI)?|LinkedIn|Indeed|Workday|Greenhouse|Lever|SmartRecruiters|Personio|Gmail|Chrome|PDF|DOCX|ATS|AI|URL|API|Persona)$/i.test(english.trim())) return english
+  return zh['Something went wrong']
 }
 
 export function getExtensionLanguage(): ExtensionLang {

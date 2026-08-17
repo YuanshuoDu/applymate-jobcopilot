@@ -7,8 +7,9 @@ describe('extension language switching', () => {
     expect(translateExtension('zh', 'Loading resumes')).toBe('正在加载简历')
   })
 
-  it('keeps unknown English copy unchanged until it is explicitly translated', () => {
+  it('keeps brand names but does not leak unknown UI copy in Chinese mode', () => {
     expect(translateExtension('zh', 'ApplyMate')).toBe('ApplyMate')
+    expect(translateExtension('zh', 'Unexpected English UI copy')).toBe('出了点问题，请重试')
   })
 
   it('has a Chinese value for every registered extension string', () => {
