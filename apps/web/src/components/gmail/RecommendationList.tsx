@@ -4,6 +4,7 @@ import React from 'react'
 import { BriefcaseBusiness, Euro, ExternalLink, Mail, X } from 'lucide-react'
 import type { GmailRecommendation } from './types'
 import { groupRecommendations } from './recommendations-model'
+import { useI18n } from '@/lib/i18n'
 
 interface RecommendationListProps {
   recommendations: GmailRecommendation[]
@@ -17,6 +18,7 @@ interface RecommendationListProps {
 }
 
 export function RecommendationList({ recommendations, selectedIds, expandedId, busyIds, onToggle, onToggleAll, onExpand, onAction }: RecommendationListProps) {
+  const { t } = useI18n()
   const selectable = recommendations.filter(item => item.status === 'pending')
   const allSelected = selectable.length > 0 && selectable.every(item => selectedIds.has(item.id))
 
@@ -28,10 +30,10 @@ export function RecommendationList({ recommendations, selectedIds, expandedId, b
         <col className="recommendation-col-experience" /><col className="recommendation-col-match" /><col className="recommendation-col-actions" />
       </colgroup>
       <thead><tr>
-        <th className="recommendation-check"><input aria-label="Select all visible jobs" type="checkbox" checked={allSelected} onChange={onToggleAll} /></th>
-        <th>Role &amp; company</th><th>Source</th><th>Location</th><th>Type</th><th>Experience</th><th>Match</th><th>Actions</th>
+        <th className="recommendation-check"><input aria-label={t('jobs.selectAllVisible')} type="checkbox" checked={allSelected} onChange={onToggleAll} /></th>
+        <th>{t('jobs.roleCompany')}</th><th>{t('jobs.source')}</th><th>{t('jobs.location')}</th><th>{t('jobs.type')}</th><th>{t('jobs.experience')}</th><th>{t('jobs.match')}</th><th>{t('jobs.actions')}</th>
       </tr></thead>
-      <tbody>{recommendations.length === 0 ? <tr><td colSpan={8} className="recommendation-empty">No jobs match these filters.</td></tr>
+      <tbody>{recommendations.length === 0 ? <tr><td colSpan={8} className="recommendation-empty">{t('jobs.noMatching')}</td></tr>
         : groupRecommendations(recommendations).map(group => <RecommendationGroup key={group.id} {...{ group, selectedIds, expandedId, busyIds, onToggle, onExpand, onAction }} />)}</tbody>
     </table>
   </div>
@@ -61,26 +63,27 @@ function RecommendationRow({ item, selected, expanded, busy, onToggle, onExpand,
   onExpand: (id: string) => void
   onAction: (id: string, action: 'save' | 'dismiss') => void
 }) {
+  const { t } = useI18n()
   const canSave = item.status === 'pending'
   return <>
     <tr className={`${expanded ? 'is-expanded ' : ''}${selected ? 'is-selected' : ''}`.trim() || undefined} onClick={() => onExpand(item.id)}>
-      <td className="recommendation-check" onClick={event => event.stopPropagation()}><input aria-label={`Select ${item.role ?? 'job'}`} type="checkbox" checked={selected} disabled={!canSave} onChange={() => onToggle(item.id)} /></td>
-      <td><strong>{item.role ?? 'Role details needed'}</strong><span>{item.company ?? 'Details fetched when saved'}</span></td>
+      <td className="recommendation-check" onClick={event => event.stopPropagation()}><input aria-label={`${t('jobs.select')} ${item.role ?? t('jobs.job')}`} type="checkbox" checked={selected} disabled={!canSave} onChange={() => onToggle(item.id)} /></td>
+      <td><strong>{item.role ?? t('jobs.roleDetailsNeeded')}</strong><span>{item.company ?? t('jobs.detailsFetchedWhenSaved')}</span></td>
       <td className="recommendation-source"><PlatformIcon platform={item.platform} /></td>
-      <td>{item.location ?? '—'}</td><td>{employmentType(item.description)}</td><td>{experience(item.description)}</td>
+      <td>{item.location ?? '—'}</td><td>{employmentType(item.description, t)}</td><td>{experience(item.description, t)}</td>
       <td><MatchValue value={item.sourceMessage.matchConfidence} /></td>
       <td className="recommendation-actions" onClick={event => event.stopPropagation()}>
-        {canSave && <button className="recommendation-save" type="button" disabled={busy} onClick={() => onAction(item.id, 'save')}>{busy ? 'Saving…' : 'Save'}</button>}
-        {item.status === 'pending' && <button className="recommendation-dismiss" type="button" disabled={busy} onClick={() => onAction(item.id, 'dismiss')}>Dismiss</button>}
-        {item.status === 'saved' && <span>Saved</span>}
+        {canSave && <button className="recommendation-save" type="button" disabled={busy} onClick={() => onAction(item.id, 'save')}>{busy ? t('jobs.saving') : t('jobs.save')}</button>}
+        {item.status === 'pending' && <button className="recommendation-dismiss" type="button" disabled={busy} onClick={() => onAction(item.id, 'dismiss')}>{t('jobs.dismiss')}</button>}
+        {item.status === 'saved' && <span>{t('jobs.saved')}</span>}
       </td>
     </tr>
     {expanded && <tr className="recommendation-expanded"><td /><td colSpan={7}><div>
-      <span className="recommendation-expanded-salary"><Euro size={14} /><small>Salary (est.)</small><strong>{item.salary || 'Not provided'}</strong></span>
+      <span className="recommendation-expanded-salary"><Euro size={14} /><small>{t('jobs.salaryEstimated')}</small><strong>{item.salary || t('jobs.notProvided')}</strong></span>
       <i className="recommendation-expanded-divider" aria-hidden="true" />
-      <a className="recommendation-expanded-email" href={sourceEmailHref(item.sourceMessage.gmailMessageId)} target="_blank" rel="noreferrer"><Mail size={14} /><small>Source email</small><strong>Open source email</strong></a>
-      {item.url && <><i className="recommendation-expanded-divider" aria-hidden="true" /><a className="recommendation-expanded-job" href={item.url} target="_blank" rel="noreferrer"><ExternalLink size={14} /><small>Job page</small><strong>View job</strong></a></>}
-      <button type="button" aria-label="Close job details" disabled={busy} onClick={() => onExpand(item.id)}><X size={14} /></button>
+      <a className="recommendation-expanded-email" href={sourceEmailHref(item.sourceMessage.gmailMessageId)} target="_blank" rel="noreferrer"><Mail size={14} /><small>{t('jobs.sourceEmail')}</small><strong>{t('jobs.openSourceEmail')}</strong></a>
+      {item.url && <><i className="recommendation-expanded-divider" aria-hidden="true" /><a className="recommendation-expanded-job" href={item.url} target="_blank" rel="noreferrer"><ExternalLink size={14} /><small>{t('jobs.jobPage')}</small><strong>{t('jobs.viewJob')}</strong></a></>}
+      <button type="button" aria-label={t('jobs.closeDetails')} disabled={busy} onClick={() => onExpand(item.id)}><X size={14} /></button>
     </div></td></tr>}
   </>
 }
@@ -113,13 +116,13 @@ function MatchValue({ value }: { value: number | null }) {
   return <span className="recommendation-match"><strong>{score}%</strong><i style={{ width: `${Math.max(0, Math.min(score, 100))}%` }} /></span>
 }
 
-function employmentType(description: string | null) {
+function employmentType(description: string | null, t: (key: string) => string) {
   if (!description) return '—'
-  return /part[-\s]?time/i.test(description) ? 'Part-time' : /contract/i.test(description) ? 'Contract' : /full[-\s]?time/i.test(description) ? 'Full-time' : '—'
+  return /part[-\s]?time/i.test(description) ? t('jobs.partTime') : /contract/i.test(description) ? t('jobs.contract') : /full[-\s]?time/i.test(description) ? t('jobs.fullTime') : '—'
 }
 
-function experience(description: string | null) {
+function experience(description: string | null, t: (key: string) => string) {
   const match = description?.match(/\b(\d+)(?:\s*[-–]\s*(\d+))?\+?\s*(?:years?|yrs?)(?:\s+of)?\s+experience/i)
   if (!match) return '—'
-  return match[2] ? `${match[1]}–${match[2]} years` : `${match[1]}+ years`
+  return match[2] ? `${match[1]}–${match[2]} ${t('jobs.years')}` : `${match[1]}+ ${t('jobs.years')}`
 }

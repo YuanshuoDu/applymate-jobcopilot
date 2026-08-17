@@ -3,6 +3,7 @@
 import { useState } from 'react'
 import type { ResumeContent } from '@/lib/types'
 import { SectionHeader, type DragHandleProps } from './SectionHeader'
+import { useI18n } from '@/lib/i18n'
 
 type LangEntry = NonNullable<ResumeContent['languages']>[number]
 
@@ -18,6 +19,7 @@ export function LanguagesSection({ languages, onChange, dragHandleProps, onRemov
   dragHandleProps?: DragHandleProps
   onRemove?:        () => void
 }) {
+  const { t } = useI18n()
   const [collapsed, setCollapsed] = useState(false)
   const [adding,    setAdding]    = useState(false)
   const [newLang,   setNewLang]   = useState('')
@@ -35,7 +37,7 @@ export function LanguagesSection({ languages, onChange, dragHandleProps, onRemov
   return (
     <div style={{ marginBottom: 20 }}>
       <SectionHeader
-        title="LANGUAGES"
+        title={t('resume.section.languages')}
         count={languages.length}
         collapsed={collapsed}
         onToggle={() => setCollapsed(v => !v)}
@@ -47,7 +49,7 @@ export function LanguagesSection({ languages, onChange, dragHandleProps, onRemov
       {!collapsed && (
         <>
           {languages.length === 0 && !adding && (
-            <div style={{ fontSize: 12, color: 'var(--text-muted)', padding: '4px 0' }}>No languages added — click + Add</div>
+            <div style={{ fontSize: 12, color: 'var(--text-muted)', padding: '4px 0' }}>{t('resume.noLanguages')}</div>
           )}
 
           <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8 }}>
@@ -61,7 +63,7 @@ export function LanguagesSection({ languages, onChange, dragHandleProps, onRemov
                   />
                   <select value={l.level} onChange={e => { const n=[...languages]; n[i]={...n[i],level:e.target.value}; onChange(n) }}
                     style={{ fontSize: 10, border: '0.5px solid var(--border)', borderRadius: 4, padding: '2px 4px', background: 'var(--bg)', color: 'var(--text)', outline: 'none' }}>
-                    {LEVELS.map(lv => <option key={lv}>{lv}</option>)}
+                    {LEVELS.map(lv => <option key={lv} value={lv}>{t(`resume.level.${lv.toLowerCase()}`)}</option>)}
                   </select>
                   <button onClick={() => setEditIdx(null)} style={{ fontSize: 10, color: 'var(--primary)', background: 'none', border: 'none', cursor: 'pointer', fontWeight: 500 }}>Done</button>
                   <button onClick={() => { onChange(languages.filter((_,xi)=>xi!==i)); setEditIdx(null) }}
@@ -73,7 +75,7 @@ export function LanguagesSection({ languages, onChange, dragHandleProps, onRemov
                   onMouseEnter={e => ((e.currentTarget as HTMLDivElement).style.borderColor = 'var(--primary)')}
                   onMouseLeave={e => ((e.currentTarget as HTMLDivElement).style.borderColor = 'var(--border)')}>
                   <span style={{ fontSize: 12, fontWeight: 500 }}>{l.lang}</span>
-                  <span style={{ fontSize: 9, color: LEVEL_COLOR[l.level] ?? 'var(--text-muted)', fontWeight: 500 }}>{l.level}</span>
+                  <span style={{ fontSize: 9, color: LEVEL_COLOR[l.level] ?? 'var(--text-muted)', fontWeight: 500 }}>{t(`resume.level.${l.level.toLowerCase()}`)}</span>
                   <div style={{ display: 'flex', gap: 2, alignItems: 'center' }}>
                     {Array.from({ length: 5 }).map((_, d) => (
                       <div key={d} style={{ width: 5, height: 5, borderRadius: '50%', background: d < (LEVEL_DOTS[l.level] ?? 0) ? (LEVEL_COLOR[l.level] ?? 'var(--primary)') : 'var(--border)' }} />
@@ -88,14 +90,14 @@ export function LanguagesSection({ languages, onChange, dragHandleProps, onRemov
                 <input autoFocus value={newLang}
                   onChange={e => setNewLang(e.target.value)}
                   onKeyDown={e => { if (e.key==='Enter') commit(); if (e.key==='Escape') setAdding(false) }}
-                  placeholder="Language…"
+                  placeholder={t('resume.languagePlaceholder')}
                   style={{ fontSize: 12, border: 'none', outline: 'none', width: 90, background: 'transparent', color: 'var(--text)', fontWeight: 500 }}
                 />
                 <select value={newLevel} onChange={e => setNewLevel(e.target.value)}
                   style={{ fontSize: 10, border: '0.5px solid var(--border)', borderRadius: 4, padding: '2px 4px', background: 'var(--bg)', color: 'var(--text)', outline: 'none' }}>
-                  {LEVELS.map(l => <option key={l}>{l}</option>)}
+                  {LEVELS.map(l => <option key={l} value={l}>{t(`resume.level.${l.toLowerCase()}`)}</option>)}
                 </select>
-                <button onClick={commit} style={{ fontSize: 10, color: 'var(--primary)', background: 'none', border: 'none', cursor: 'pointer', fontWeight: 500 }}>Add</button>
+                <button onClick={commit} style={{ fontSize: 10, color: 'var(--primary)', background: 'none', border: 'none', cursor: 'pointer', fontWeight: 500 }}>{t('resume.add')}</button>
                 <button onClick={() => setAdding(false)} style={{ fontSize: 10, color: 'var(--text-muted)', background: 'none', border: 'none', cursor: 'pointer' }}>✕</button>
               </div>
             )}
