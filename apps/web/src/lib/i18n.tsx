@@ -4649,7 +4649,7 @@ interface I18nContextValue {
 
 const I18nContext = createContext<I18nContextValue>({
   lang: 'en',
-  t:    (key) => key,
+  t:    (key) => translate('en', key),
   setLang: () => {},
 })
 
