@@ -8,6 +8,7 @@ import { AgentTeamList } from './AgentTeamList'
 import { HealthStrip } from './HealthStrip'
 import { AutomationList } from './AutomationList'
 import { SessionFocusPanel } from './SessionFocusPanel'
+import { useI18n } from '@/lib/i18n'
 
 function statusColor(status: string): string {
   if (status === 'running') return 'var(--primary)'
@@ -36,6 +37,7 @@ export function AgentSessionConsole({
   refreshVersion?: number
   onSessionsLoaded?: (data: AgentSessionsResponse) => void
 }) {
+  const { t } = useI18n()
   const { data, loading, error, refetch } = useApi<AgentSessionsResponse>('/api/agent/sessions')
   const [statusFilter, setStatusFilter] = React.useState('all')
   const [confirmingDeleteId, setConfirmingDeleteId] = React.useState<string | null>(null)
@@ -98,10 +100,10 @@ export function AgentSessionConsole({
               boxShadow: '0 8px 18px rgba(79,70,229,0.22)',
             }}
           >
-            + New chat
+            + {t('agent.newChat')}
           </button>
           <select
-            aria-label="Filter sessions"
+            aria-label={t('agent.filterSessions')}
             value={statusFilter}
             onChange={event => setStatusFilter(event.target.value)}
             style={{
@@ -117,35 +119,35 @@ export function AgentSessionConsole({
               padding: '0 4px',
             }}
           >
-            <option value="all">All</option>
-            <option value="running">Run</option>
-            <option value="waiting_for_user">Ask</option>
-            <option value="completed">Done</option>
-            <option value="failed">Fail</option>
+            <option value="all">{t('agent.all')}</option>
+            <option value="running">{t('agent.run')}</option>
+            <option value="waiting_for_user">{t('agent.ask')}</option>
+            <option value="completed">{t('agent.done')}</option>
+            <option value="failed">{t('agent.fail')}</option>
           </select>
         </div>
       </div>
 
       <div style={{ padding: '10px 10px 8px', display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8 }}>
-        <Metric label="Queued Tasks" value={sessions.filter(s => s.status === 'running').length.toString()} />
-        <Metric label="Approvals" value={pendingApprovals.toString()} alert={pendingApprovals > 0} />
+        <Metric label={t('agent.queuedTasks')} value={sessions.filter(s => s.status === 'running').length.toString()} />
+        <Metric label={t('agent.approvals')} value={pendingApprovals.toString()} alert={pendingApprovals > 0} />
       </div>
 
       <div style={{ flex: 1, overflowY: 'auto' }}>
         <div style={{ padding: '0 10px 8px', display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
           <div style={{ fontSize: 10, color: 'var(--text-muted)', textTransform: 'uppercase', letterSpacing: 0, fontWeight: 700 }}>
-            Recent Sessions
+            {t('agent.recentSessions')}
           </div>
           <button onClick={() => { setStatusFilter('all'); void refetch() }} style={{ border: 'none', background: 'transparent', color: 'var(--primary)', fontSize: 10, cursor: 'pointer', fontFamily: 'inherit', padding: 0 }}>
-            View all
+            {t('agent.viewAll')}
           </button>
         </div>
 
         <div style={{ padding: '0 10px 12px', display: 'flex', flexDirection: 'column', gap: 7 }}>
-          {loading && <EmptyText>Loading sessions...</EmptyText>}
-          {error && <EmptyText tone="error" title={error}>Agent sessions unavailable.</EmptyText>}
-          {!loading && !error && sessions.length === 0 && <EmptyText>No sessions recorded yet.</EmptyText>}
-          {!loading && !error && sessions.length > 0 && visibleSessions.length === 0 && <EmptyText>No sessions match this filter.</EmptyText>}
+          {loading && <EmptyText>{t('agent.loadingSessions')}</EmptyText>}
+          {error && <EmptyText tone="error" title={error}>{t('agent.sessionsUnavailable')}</EmptyText>}
+          {!loading && !error && sessions.length === 0 && <EmptyText>{t('agent.noSessions')}</EmptyText>}
+          {!loading && !error && sessions.length > 0 && visibleSessions.length === 0 && <EmptyText>{t('agent.noMatchingSessions')}</EmptyText>}
           {visibleSessions.map(session => {
             const selected = selectedSessionId === session.id
             const confirmingDelete = confirmingDeleteId === session.id
@@ -197,13 +199,13 @@ export function AgentSessionConsole({
                       disabled={deleting}
                       style={{ height: 22, border: 'none', borderRadius: 6, background: 'rgba(220,38,38,0.10)', color: 'var(--c-danger)', cursor: deleting ? 'wait' : 'pointer', fontSize: 9, fontWeight: 750, fontFamily: 'inherit', padding: '0 6px' }}
                     >
-                      {deleting ? '…' : 'Delete?'}
+                      {deleting ? '…' : `${t('agent.delete')}?`}
                     </button>
                     <button
                       type="button"
                       onClick={() => setConfirmingDeleteId(null)}
                       disabled={deleting}
-                      aria-label="Cancel delete"
+                      aria-label={t('agent.cancelDelete')}
                       style={{ width: 22, height: 22, border: 'none', borderRadius: 6, background: 'transparent', color: 'var(--text-muted)', cursor: deleting ? 'wait' : 'pointer', fontSize: 14, lineHeight: 1, fontFamily: 'inherit' }}
                     >
                       ×
@@ -212,8 +214,8 @@ export function AgentSessionConsole({
                 ) : (
                   <button
                     type="button"
-                    aria-label={`Delete ${session.goal}`}
-                    title="Delete conversation"
+                    aria-label={`${t('agent.delete')} ${session.goal}`}
+                    title={t('agent.deleteConversation')}
                     onClick={() => setConfirmingDeleteId(session.id)}
                     style={{ position: 'absolute', top: 8, right: 7, width: 22, height: 22, border: 'none', borderRadius: 6, background: 'transparent', color: 'var(--text-muted)', cursor: 'pointer', fontSize: 15, lineHeight: 1, fontFamily: 'inherit' }}
                   >
