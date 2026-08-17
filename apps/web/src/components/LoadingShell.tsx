@@ -1,4 +1,4 @@
-export function LoadingShell({ text = 'Loading…' }: { text?: string }) {
+export function LoadingShell({ text }: { text?: string }) {
   return (
     <div style={{
       flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'center',
@@ -12,7 +12,7 @@ export function LoadingShell({ text = 'Loading…' }: { text?: string }) {
           borderRadius: '50%',
           animation: 'spin 0.7s linear infinite',
         }} />
-        <div style={{ fontSize: 12, color: 'var(--text-muted)' }}>{text}</div>
+        {text && <div style={{ fontSize: 12, color: 'var(--text-muted)' }}>{text}</div>}
       </div>
     </div>
   )

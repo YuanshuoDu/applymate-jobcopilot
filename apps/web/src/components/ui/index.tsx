@@ -91,13 +91,32 @@ interface ToastCtx { success(t: string, d?: string): void; info(t: string, d?: s
 
 const ToastContext = createContext<ToastCtx | null>(null)
 
+const TOAST_TRANSLATION_KEYS: Record<string, string> = {
+  'Save failed': 'toast.saveFailed', 'Saved': 'toast.saved', 'Error': 'toast.error',
+  'Search failed': 'toast.searchFailed', 'Job saved': 'toast.jobSaved', 'Match scored': 'toast.matchScored',
+  'Generation failed': 'toast.generationFailed', 'Delete failed': 'toast.deleteFailed', 'PDF downloaded': 'toast.pdfDownloaded', 'PDF error': 'toast.pdfError',
+  'Settings saved': 'toast.settingsSaved', 'Profile saved': 'toast.profileSaved', 'Upload failed': 'toast.uploadFailed', 'Export failed': 'toast.exportFailed',
+  'Request failed': 'toast.requestFailed', 'Password updated': 'toast.passwordUpdated', 'Account deleted': 'toast.accountDeleted',
+  'Resume created': 'toast.resumeCreated', 'Resume saved': 'toast.resumeSaved', 'Restore failed': 'toast.restoreFailed', 'Version restored': 'toast.versionRestored', 'Resume deleted': 'toast.resumeDeleted',
+  'No resume selected': 'toast.noResumeSelected', 'Network error': 'toast.networkError', 'Copied': 'toast.copied', 'Jobs deleted': 'toast.jobsDeleted',
+  'Scoring failed': 'toast.scoringFailed', 'All jobs are already scored': 'toast.allJobsScored', 'Match scores ready': 'toast.matchScoresReady',
+  'Inbox refreshed': 'toast.inboxRefreshed', 'Agent resumed': 'toast.agentResumed', 'Preparation could not finish': 'toast.preparationFailed',
+  'Evidence saved to Persona': 'toast.evidenceSaved', 'Audited application pack ready': 'toast.applicationPackReady', 'Job discovery keys saved': 'toast.discoveryKeysSaved',
+}
+
 export function ToastProvider({ children }: { children: React.ReactNode }) {
+  const { lang, t } = useI18n()
   const [toasts, setToasts] = useState<ToastItem[]>([])
+  const localize = useCallback((text?: string) => {
+    if (!text || lang === 'en') return text
+    const key = TOAST_TRANSLATION_KEYS[text]
+    return key ? t(key) : text
+  }, [lang, t])
   const add = useCallback((variant: ToastItem['variant'], title: string, description?: string) => {
     const id = Date.now()
-    setToasts(t => [...t, { id, variant, title, description }])
+    setToasts(items => [...items, { id, variant, title: localize(title) ?? title, description: localize(description) }])
     setTimeout(() => setToasts(t => t.filter(x => x.id !== id)), 4200)
-  }, [])
+  }, [localize])
   // Keep the context value stable while the toast list changes. Consumers such
   // as Gmail use it in effects, so a new object here could trigger avoidable
   // reloads after every notification.

@@ -19,7 +19,7 @@ export default async function Page({
   const hasAuthenticatedUser = Boolean(session?.user?.id?.trim())
   if (hasAuthenticatedUser && !allowAccountSwitch && !adminHost) redirect('/')
   return (
-    <Suspense fallback={<LoadingShell text="Loading login…" />}>
+    <Suspense fallback={<LoadingShell />}>
       <LoginPage
         switchAccount={allowAccountSwitch || (adminHost && hasAuthenticatedUser)}
         adminLogin={adminHost}
