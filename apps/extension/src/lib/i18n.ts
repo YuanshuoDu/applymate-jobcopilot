@@ -4,6 +4,10 @@ export type ExtensionLang = 'en' | 'de' | 'fr' | 'es' | 'nl' | 'zh'
 
 const zh: Record<string, string> = {
   'Loading resumes': '正在加载简历',
+  'ApplyMate navigation': 'ApplyMate 导航',
+  'Open original': '打开原职位页面',
+  'Open in My Jobs': '在我的职位中打开',
+  'Account menu': '账户菜单',
   'Failed to load resumes': '加载简历失败',
   Retry: '重试',
   'No resumes yet': '暂无简历',

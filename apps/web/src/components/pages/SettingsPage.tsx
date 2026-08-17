@@ -505,7 +505,7 @@ export function SettingsPage() {
           overflowY: 'auto',
           display: 'flex', flexDirection: 'column', gap: 2,
         }}>
-          <div style={{ fontSize: 10, fontWeight: 700, color: 'var(--text-subtle)', letterSpacing: '0.08em', textTransform: 'uppercase', padding: '6px 10px 8px' }}>Settings</div>
+          <div style={{ fontSize: 10, fontWeight: 700, color: 'var(--text-subtle)', letterSpacing: '0.08em', textTransform: 'uppercase', padding: '6px 10px 8px' }}>{t('settings.title')}</div>
           {TABS.map(tab => {
             const active = activeTab === tab.id
             return (
@@ -543,7 +543,7 @@ export function SettingsPage() {
               <div className="settings-profile-grid" style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(min(100%, 420px), 1fr))', gap: 16, alignItems: 'start' }}>
                 <SettingsSection title={t('settings.personalInfo')}>
                   {userLoading ? (
-                    <div style={{ fontSize: 12, color: 'var(--text-muted)', padding: '12px 0' }}>Loading...</div>
+                    <div style={{ fontSize: 12, color: 'var(--text-muted)', padding: '12px 0' }}>{t('settings.loading')}</div>
                   ) : userError ? (
                     <div style={{ padding: '12px 0', fontSize: 12, color: 'var(--c-danger)' }}>
                       Could not load your profile: {userError}
@@ -555,16 +555,16 @@ export function SettingsPage() {
                         <div>
                           <input ref={avatarInputRef} type="file" accept="image/png,image/jpeg,image/webp,image/gif" onChange={handleAvatarChange} style={{ display: 'none' }} />
                           <Btn small variant="ghost" disabled={avatarSaving} onClick={() => avatarInputRef.current?.click()}>
-                            {avatarSaving ? 'Uploading...' : 'Upload photo'}
+                            {avatarSaving ? t('settings.uploading') : t('settings.uploadPhoto')}
                           </Btn>
-                          <div style={{ fontSize: 10, color: 'var(--text-muted)', marginTop: 4 }}>JPG, PNG up to 2MB</div>
+                          <div style={{ fontSize: 10, color: 'var(--text-muted)', marginTop: 4 }}>{t('settings.avatarHelp')}</div>
                         </div>
                       </div>
 
-                      <FieldRow label="Full name"><Input value={name} onChange={e => setName(e.target.value)} placeholder="Your name" /></FieldRow>
-                      <FieldRow label="Email"><Input value={user?.email ?? ''} readOnly placeholder="email@example.com" /></FieldRow>
-                      <FieldRow label="Phone"><Input type="tel" value={phone} onChange={e => setPhone(e.target.value)} placeholder="+1 555 000 0000" /></FieldRow>
-                      <FieldRow label="Location"><Input value={location} onChange={e => setLocation(e.target.value)} placeholder="City, Country" /></FieldRow>
+                      <FieldRow label={t('settings.fullName')}><Input value={name} onChange={e => setName(e.target.value)} placeholder={t('settings.yourName')} /></FieldRow>
+                      <FieldRow label={t('settings.email')}><Input value={user?.email ?? ''} readOnly placeholder="email@example.com" /></FieldRow>
+                      <FieldRow label={t('settings.phone')}><Input type="tel" value={phone} onChange={e => setPhone(e.target.value)} placeholder="+1 555 000 0000" /></FieldRow>
+                      <FieldRow label={t('settings.location')}><Input value={location} onChange={e => setLocation(e.target.value)} placeholder="City, Country" /></FieldRow>
                       <FieldRow label="LinkedIn"><Input value={linkedin} onChange={e => setLinkedin(e.target.value)} placeholder="linkedin.com/in/you" /></FieldRow>
                       <FieldRow label="GitHub"><Input value={github} onChange={e => setGithub(e.target.value)} placeholder="github.com/you" /></FieldRow>
                     </>
@@ -572,28 +572,28 @@ export function SettingsPage() {
                 </SettingsSection>
 
                 <SettingsSection title={t('settings.jobPrefs')}>
-                  <FieldRow label="Target roles">    <Input value={prefRoles}     onChange={e => setPrefRoles(e.target.value)}     placeholder="Backend Engineer, SWE" /></FieldRow>
-                  <FieldRow label="Target locations"><Input value={prefLocations} onChange={e => setPrefLocations(e.target.value)} placeholder="Amsterdam, Berlin, Remote" /></FieldRow>
-                  <FieldRow label="Salary expectation"><Input value={prefSalary}   onChange={e => setPrefSalary(e.target.value)}    placeholder="EUR65,000 - EUR90,000" /></FieldRow>
-                  <FieldRow label="Work authorisation">
+                  <FieldRow label={t('settings.targetRoles')}>    <Input value={prefRoles}     onChange={e => setPrefRoles(e.target.value)}     placeholder="Backend Engineer, SWE" /></FieldRow>
+                  <FieldRow label={t('settings.targetLocations')}><Input value={prefLocations} onChange={e => setPrefLocations(e.target.value)} placeholder="Amsterdam, Berlin, Remote" /></FieldRow>
+                  <FieldRow label={t('settings.salary')}><Input value={prefSalary}   onChange={e => setPrefSalary(e.target.value)}    placeholder="EUR65,000 - EUR90,000" /></FieldRow>
+                  <FieldRow label={t('settings.workAuth')}>
                     <select value={prefVisa} onChange={e => setPrefVisa(e.target.value)} style={{ padding: '6px 10px', fontSize: 12, border: '0.5px solid var(--border)', borderRadius: 6, background: 'var(--bg)', color: 'var(--text)', outline: 'none', maxWidth: 260, width: '100%' }}>
-                      <option>EU citizen / no visa required</option>
-                      <option>Requires sponsorship</option>
-                      <option>Open work permit</option>
+                      <option value="EU citizen / no visa required">{t('settings.euCitizen')}</option>
+                      <option value="Requires sponsorship">{t('settings.sponsorship')}</option>
+                      <option value="Open work permit">{t('settings.openWorkPermit')}</option>
                     </select>
                   </FieldRow>
-                  <FieldRow label="Open to relocation"><Toggle label="Open to relocation" value={prefRelocate} onChange={setPrefRelocate} /></FieldRow>
+                  <FieldRow label={t('settings.relocation')}><Toggle label={t('settings.relocation')} value={prefRelocate} onChange={setPrefRelocate} /></FieldRow>
                 </SettingsSection>
 
                 <SettingsSection title={t('settings.password')}>
-                  <FieldRow label="Current password">
-                    <Input type="password" value={passwordCur}  onChange={e => setPasswordCur(e.target.value)}  placeholder="Password" />
+                  <FieldRow label={t('settings.currentPassword')}>
+                    <Input type="password" value={passwordCur}  onChange={e => setPasswordCur(e.target.value)}  placeholder={t('settings.passwordPlaceholder')} />
                   </FieldRow>
-                  <FieldRow label="New password">
-                    <Input type="password" value={passwordNew}  onChange={e => setPasswordNew(e.target.value)}  placeholder="At least 8 characters" />
+                  <FieldRow label={t('settings.newPassword')}>
+                    <Input type="password" value={passwordNew}  onChange={e => setPasswordNew(e.target.value)}  placeholder={t('settings.newPasswordPlaceholder')} />
                   </FieldRow>
-                  <FieldRow label="Confirm password">
-                    <Input type="password" value={passwordConf} onChange={e => setPasswordConf(e.target.value)} placeholder="Repeat new password" />
+                  <FieldRow label={t('settings.confirmPassword')}>
+                    <Input type="password" value={passwordConf} onChange={e => setPasswordConf(e.target.value)} placeholder={t('settings.repeatPasswordPlaceholder')} />
                   </FieldRow>
                   <div style={{ marginTop: 12, display: 'flex', justifyContent: 'flex-end' }}>
                     <Btn variant="ghost" disabled={pwSaving} onClick={async () => {

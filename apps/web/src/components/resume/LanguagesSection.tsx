@@ -65,12 +65,12 @@ export function LanguagesSection({ languages, onChange, dragHandleProps, onRemov
                     style={{ fontSize: 10, border: '0.5px solid var(--border)', borderRadius: 4, padding: '2px 4px', background: 'var(--bg)', color: 'var(--text)', outline: 'none' }}>
                     {LEVELS.map(lv => <option key={lv} value={lv}>{t(`resume.level.${lv.toLowerCase()}`)}</option>)}
                   </select>
-                  <button onClick={() => setEditIdx(null)} style={{ fontSize: 10, color: 'var(--primary)', background: 'none', border: 'none', cursor: 'pointer', fontWeight: 500 }}>Done</button>
+                  <button onClick={() => setEditIdx(null)} style={{ fontSize: 10, color: 'var(--primary)', background: 'none', border: 'none', cursor: 'pointer', fontWeight: 500 }}>{t('common.done')}</button>
                   <button onClick={() => { onChange(languages.filter((_,xi)=>xi!==i)); setEditIdx(null) }}
                     style={{ fontSize: 10, color: 'var(--c-danger)', background: 'none', border: 'none', cursor: 'pointer' }}>Del</button>
                 </div>
               ) : (
-                <div key={i} onClick={() => setEditIdx(i)} title="Click to edit"
+                <div key={i} onClick={() => setEditIdx(i)} title={t('resume.clickToEdit')}
                   style={{ display: 'flex', alignItems: 'center', gap: 6, padding: '4px 10px', background: 'var(--bg-secondary)', borderRadius: 6, border: '0.5px solid var(--border)', cursor: 'pointer' }}
                   onMouseEnter={e => ((e.currentTarget as HTMLDivElement).style.borderColor = 'var(--primary)')}
                   onMouseLeave={e => ((e.currentTarget as HTMLDivElement).style.borderColor = 'var(--border)')}>

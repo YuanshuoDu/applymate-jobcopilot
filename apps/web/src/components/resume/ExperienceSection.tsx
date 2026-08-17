@@ -108,11 +108,11 @@ export function ExperienceSection({ experience, jobContext, onChange, dragHandle
                   display: 'flex', alignItems: 'flex-start', gap: 4 }}
                 onMouseEnter={e => { if(dragOver!==i)(e.currentTarget as HTMLDivElement).style.background='var(--bg-secondary)' }}
                 onMouseLeave={e => { if(dragOver!==i)(e.currentTarget as HTMLDivElement).style.background='transparent' }}>
-                <span title="Drag to reorder" style={{ fontSize: 13, color: 'var(--border)', cursor: 'grab', marginTop: 2, flexShrink: 0, userSelect: 'none' }}>⠿</span>
+                <span title={t('resume.dragToReorder')} style={{ fontSize: 13, color: 'var(--border)', cursor: 'grab', marginTop: 2, flexShrink: 0, userSelect: 'none' }}>⠿</span>
                 <div style={{ flex: 1 }} onClick={() => setEditIdx(i)}>
                   <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 2 }}>
                     <div>
-                      <span style={{ fontSize: 12, fontWeight: 500 }}>{exp.role || <em style={{ color: 'var(--text-muted)' }}>Untitled</em>}</span>
+                      <span style={{ fontSize: 12, fontWeight: 500 }}>{exp.role || <em style={{ color: 'var(--text-muted)' }}>{t('resume.untitled')}</em>}</span>
                       {exp.company && <span style={{ fontSize: 12, color: 'var(--text-muted)' }}> · {exp.company}</span>}
                     </div>
                     <span style={{ fontSize: 11, color: 'var(--text-muted)' }}>{exp.period}</span>

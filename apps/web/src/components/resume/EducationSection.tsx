@@ -74,10 +74,10 @@ export function EducationSection({ education, onChange, dragHandleProps, onRemov
                   background: dragOver===i ? 'rgba(24,95,165,0.03)' : 'transparent' }}
                 onMouseEnter={e => { if(dragOver!==i)(e.currentTarget as HTMLDivElement).style.background='var(--bg-secondary)' }}
                 onMouseLeave={e => { if(dragOver!==i)(e.currentTarget as HTMLDivElement).style.background='transparent' }}>
-                <span title="Drag to reorder" style={{ fontSize: 13, color: 'var(--border)', cursor: 'grab', marginTop: 2, flexShrink: 0, userSelect: 'none' }}>⠿</span>
+                <span title={t('resume.dragToReorder')} style={{ fontSize: 13, color: 'var(--border)', cursor: 'grab', marginTop: 2, flexShrink: 0, userSelect: 'none' }}>⠿</span>
                 <div style={{ flex: 1, display: 'flex', justifyContent: 'space-between' }} onClick={() => setEditIdx(i)}>
                   <div>
-                    <span style={{ fontSize: 12, fontWeight: 500 }}>{e.degree || <em style={{ color: 'var(--text-muted)' }}>Degree</em>}</span>
+                    <span style={{ fontSize: 12, fontWeight: 500 }}>{e.degree || <em style={{ color: 'var(--text-muted)' }}>{t('resume.degree')}</em>}</span>
                     {e.institution && <span style={{ fontSize: 12, color: 'var(--text-muted)' }}> · {e.institution}</span>}
                   </div>
                   <span style={{ fontSize: 11, color: 'var(--text-muted)' }}>{e.year}</span>

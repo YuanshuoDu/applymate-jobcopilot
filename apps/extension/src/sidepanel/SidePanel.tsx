@@ -260,7 +260,7 @@ export function SidePanel() {
           {L.openDashboard} <ArrowRight size={12} aria-hidden="true" />
         </button>
       </header>
-      <nav className="am-tabs" aria-label="ApplyMate navigation">
+      <nav className="am-tabs" aria-label={t('ApplyMate navigation')}>
         {tabs.map(tab => (
           <button key={tab.id} className="am-tab" type="button" role="tab" aria-selected={activeTab === tab.id} onClick={() => selectTab(tab.id)}>
             {tab.label}
@@ -704,7 +704,7 @@ function JobCard({ job, expanded, onToggle, settings, onScore, scoring, onPrepar
       </div>
       {expanded && <div className="am-detail">
         <div className="am-detail-grid"><div className="am-detail-box"><div className="am-detail-label">{t('Notes')}</div><div className="am-notes-meta"><span>{notesSaving ? <span className="am-saving">{t('Saving…')}</span> : notesError ? <span className="am-note-error">{notesError}</span> : notes ? <span className="am-saved">{t('Saved')}</span> : t('Add context for later')}</span></div><textarea className="am-notes" value={notes} onChange={event => { setNotes(event.target.value); setNotesError('') }} placeholder={t('Interview questions, salary, contact…')} /><ApplicationPackSummary hasResume={hasResume} hasCoverLetter={hasCoverLetter} ready={packReady} preparing={packPreparing} stage={packStage} exporting={packExporting} error={packError} onPrepare={() => void handlePackPrepare()} onDownload={() => void handlePackDownload()} /></div><div className="am-detail-box am-detail-insights"><div className="am-detail-label am-detail-label-icon"><Tags size={11} aria-hidden="true" /> {t('Key job tags')}</div>{keyTags.length > 0 ? <div className="am-key-tags">{keyTags.map(tag => <span key={tag} className="am-key-tag">{tag}</span>)}</div> : <div className="am-detail-text">{t('Score this role to extract its main skills and requirements.')}</div>}<div className="am-detail-label am-detail-score-label">{t('Match score')}</div><div className="am-detail-text">{job.score == null ? t('Not scored yet.') : `${t('Scored at')} ${job.score}% ${t('against your resume.')}`}</div>{!job.url && <div className="am-detail-text">{t('No original link saved.')}</div>}</div></div>
-        <div className="am-detail-actions">{job.url && <a className="am-detail-action" href={job.url} target="_blank" rel="noreferrer">Open original <ExternalLink size={11} /></a>}<a className="am-detail-action primary" href={`${settings.apiBaseUrl}/?page=jobs&highlight=${job.id}`} target="_blank" rel="noreferrer">Open in My Jobs <ArrowRight size={11} /></a></div>
+        <div className="am-detail-actions">{job.url && <a className="am-detail-action" href={job.url} target="_blank" rel="noreferrer">{t('Open original')} <ExternalLink size={11} /></a>}<a className="am-detail-action primary" href={`${settings.apiBaseUrl}/?page=jobs&highlight=${job.id}`} target="_blank" rel="noreferrer">{t('Open in My Jobs')} <ArrowRight size={11} /></a></div>
       </div>}
     </article>
   )
