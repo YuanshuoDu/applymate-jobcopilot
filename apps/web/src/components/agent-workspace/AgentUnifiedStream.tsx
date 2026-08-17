@@ -3,6 +3,7 @@
 import React, { useEffect, useRef, useState } from 'react'
 import { useToast } from '@/components/ui'
 import { useApi, apiMutate } from '@/lib/hooks'
+import { useI18n } from '@/lib/i18n'
 import { AgentComposer, type ComposerAttachment, type ComposerJob, type ComposerResume } from './AgentComposer'
 import { AgentLiveStreamBody } from './AgentLiveStreamBody'
 import {
@@ -63,6 +64,7 @@ export function AgentUnifiedStream({
   savedCount, pendingCount, autonomousMode,
   resetVersion, resumeSessionId, conversationTitle, conversationSubtitle, onAnswerQuestion, onAnswerOrchestrator, onApplied, onChatAction, onAppendLog, onSessionRecorded,
 }: AgentUnifiedStreamProps) {
+  const { t } = useI18n()
   const streamEndRef = useRef<HTMLDivElement>(null)
   const streamScrollRef = useRef<HTMLDivElement>(null)
   const inputRef = useRef<HTMLTextAreaElement>(null)
@@ -136,7 +138,7 @@ export function AgentUnifiedStream({
 
     void fetch(`/api/agent/sessions/${resumeSessionId}/events`, { signal: controller.signal })
       .then(async response => {
-        if (!response.ok) throw new Error('Could not restore this session.')
+        if (!response.ok) throw new Error(t('agent.restoreFailed'))
         return response.json() as Promise<{ events?: AgentTranscriptEvent[] }>
       })
       .then(data => {
@@ -148,7 +150,7 @@ export function AgentUnifiedStream({
       .catch(error => {
         if (controller.signal.aborted) return
         setIsRestoringSession(false)
-        toast.error('Session restore failed', error instanceof Error ? error.message : 'Could not restore this session.')
+        toast.error(t('agent.restoreFailed'), error instanceof Error ? error.message : t('agent.restoreFailed'))
       })
 
     return () => controller.abort()
@@ -232,7 +234,7 @@ export function AgentUnifiedStream({
       const existing = new Set(current.map(file => file.id))
       return [...current, ...next.filter(file => !existing.has(file.id))].slice(0, 6)
     })
-    toast.info('Files attached', `${next.length} file${next.length === 1 ? '' : 's'} will be added as context for the Agent.`)
+    toast.info(t('agent.filesAttached'), `${next.length} ${t(next.length === 1 ? 'agent.file' : 'agent.files')} ${t('agent.addedAsContext')}`)
   }
 
   async function handleLiveBlockAction(action: TranscriptAction) {
@@ -247,7 +249,7 @@ export function AgentUnifiedStream({
     }
     if (!chatSessionId) {
       const message = 'Send a message first, then retry this action.'
-      toast.error('Session not ready', message)
+      toast.error(t('agent.sessionNotReady'), message)
       throw new Error(message)
     }
     const { data, error } = await apiMutate<{ event?: AgentTranscriptEvent; events?: AgentTranscriptEvent[] }>(`/api/agent/sessions/${chatSessionId}/actions`, 'POST', action)
@@ -311,7 +313,7 @@ export function AgentUnifiedStream({
       setChatInput(current => current.trim() ? current : draftText)
       setAttachedFiles(current => current.length > 0 ? current : draftFiles)
       onAppendLog({ type: 'error', message, time: new Date() })
-      toast.error('Chat failed', message)
+      toast.error(t('agent.chatFailed'), message)
     } finally {
       if (requestVersion === chatRequestVersionRef.current) {
         chatRequestRef.current = null
@@ -361,7 +363,7 @@ export function AgentUnifiedStream({
           try {
             await handleLiveBlockAction(action)
           } catch (err) {
-            toast.error('Action failed', (err as Error).message || 'Action failed.')
+            toast.error(t('agent.actionFailed'), (err as Error).message || t('agent.actionFailed'))
             throw err
           }
         }}

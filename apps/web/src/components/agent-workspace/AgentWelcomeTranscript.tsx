@@ -1,6 +1,7 @@
 'use client'
 
 import React from 'react'
+import { useI18n } from '@/lib/i18n'
 
 export function AgentWelcomeTranscript({
   savedCount,
@@ -13,43 +14,44 @@ export function AgentWelcomeTranscript({
   autonomousMode: boolean
   onSelectPrompt: (prompt: string) => void
 }) {
+  const { t } = useI18n()
   const now = new Date()
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
       <WelcomeBlock
         speaker="Orchestrator"
-        title="Ready"
+        title={t('agent.ready')}
         accent="var(--primary)"
         time={now}
       >
         <div style={bodyStyle}>
-          I&apos;m ready to take over this job search. You currently have {savedCount} saved role{savedCount === 1 ? '' : 's'}
-          {pendingCount > 0 ? ` and ${pendingCount} waiting for review` : ''}. Sensitive actions will always ask for confirmation first.
+          {t('agent.welcomeReadyPrefix')} {savedCount} {t(savedCount === 1 ? 'agent.savedRole' : 'agent.savedRoles')}
+          {pendingCount > 0 ? `, ${pendingCount} ${t('agent.waitingForReview')}` : ''}. {t('agent.sensitiveConfirmation')}
         </div>
       </WelcomeBlock>
 
       <WelcomeBlock
         speaker="Analyst"
-        title="Thinking summary"
+        title={t('agent.thinkingSummary')}
         accent="#64748b"
         time={now}
       >
         <details style={{ fontSize: 12, color: 'var(--text)', lineHeight: 1.65 }}>
           <summary style={{ cursor: 'pointer', color: 'var(--text-muted)', fontWeight: 650 }}>
-            View the current reasoning summary
+            {t('agent.viewReasoning')}
           </summary>
           <div style={{ marginTop: 8, display: 'grid', gap: 5 }}>
-            <span>Approval policy: {autonomousMode ? 'autonomous decisions are enabled, but external submissions still pass a safety gate' : 'interactive confirmation comes first'}</span>
-            <span>Available context: saved roles, resume, Agent settings, and automation rules.</span>
-            <span>Suggested next step: create an automation, review pending roles, or explain a recent score.</span>
+            <span>{t('agent.approvalPolicy')}: {autonomousMode ? t('agent.autonomousSafety') : t('agent.interactiveConfirmation')}</span>
+            <span>{t('agent.availableContext')}</span>
+            <span>{t('agent.suggestedNext')}</span>
           </div>
         </details>
       </WelcomeBlock>
 
       <WelcomeBlock
         speaker="Orchestrator"
-        title="Options"
+        title={t('agent.options')}
         accent="#7c3aed"
         time={now}
       >
@@ -61,8 +63,8 @@ export function AgentWelcomeTranscript({
               onClick={() => onSelectPrompt(option.prompt)}
               style={optionButtonStyle}
             >
-              <span style={{ fontSize: 12, fontWeight: 700, color: 'var(--text)' }}>{option.label}</span>
-              <span style={{ fontSize: 11, color: 'var(--text-muted)' }}>{option.description}</span>
+              <span style={{ fontSize: 12, fontWeight: 700, color: 'var(--text)' }}>{t(option.label)}</span>
+              <span style={{ fontSize: 11, color: 'var(--text-muted)' }}>{t(option.description)}</span>
             </button>
           ))}
         </div>
@@ -113,18 +115,18 @@ function WelcomeBlock({
 
 const STARTER_OPTIONS = [
   {
-    label: 'Create automation',
-    description: 'Search and score roles on weekdays, then follow your approval rules.',
+    label: 'agent.createAutomationOption',
+    description: 'agent.createAutomationDescription',
     prompt: 'Create a weekday 09:00 automation to find software engineering roles in Berlin and send matches above 85% for approval.',
   },
   {
-    label: 'Review pending',
-    description: 'Review pending roles and recommend approve, skip, or follow-up actions.',
+    label: 'agent.reviewPending',
+    description: 'agent.reviewPendingDescription',
     prompt: 'Review the pending roles and recommend an action based on match, risk, and application readiness.',
   },
   {
-    label: 'Explain score',
-    description: 'Explain why the latest high-match role is worth applying for and identify gaps.',
+    label: 'agent.explainScore',
+    description: 'agent.explainScoreDescription',
     prompt: 'Explain the latest high-match role, including scoring evidence and resume gaps.',
   },
 ]

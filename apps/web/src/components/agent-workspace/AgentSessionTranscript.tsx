@@ -7,6 +7,7 @@ import type { AgentSessionDetail, AgentTranscriptEvent } from './session-view-mo
 import { approvalResponseIds, EVENT_TONE_COLOR, eventChrome, eventSubtitle, sessionStatusLabel, shouldCollapseByDefault } from './session-view-model'
 import { ReplayBanner } from './ReplayBanner'
 import { TranscriptSpecialContent, type TranscriptAction } from './TranscriptSpecialBlocks'
+import { useI18n } from '@/lib/i18n'
 
 interface DetailResponse {
   session: AgentSessionDetail
@@ -20,6 +21,7 @@ export function AgentSessionTranscript({ sessionId, onBackToLive }: {
   sessionId: string
   onBackToLive: () => void
 }) {
+  const { t } = useI18n()
   const { data: detailData, loading: detailLoading, refetch: refetchDetail } = useApi<DetailResponse>(`/api/agent/sessions/${sessionId}`)
   const { data: eventsData, loading: eventsLoading, refetch } = useApi<EventsResponse>(`/api/agent/sessions/${sessionId}/events`)
   const events = React.useMemo(() => eventsData?.events ?? [], [eventsData?.events])
@@ -87,7 +89,7 @@ export function AgentSessionTranscript({ sessionId, onBackToLive }: {
         <div style={{ minWidth: 0 }}>
           <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
             <span style={{ fontSize: 13, fontWeight: 750, color: 'var(--text)' }}>
-              {session?.goal ?? 'Session transcript'}
+              {session?.goal ?? t('agent.sessionTranscript')}
             </span>
             {session && (
               <span style={{ fontSize: 10, border: '1px solid var(--border)', borderRadius: 999, padding: '2px 7px', color: 'var(--text-muted)' }}>
@@ -96,7 +98,7 @@ export function AgentSessionTranscript({ sessionId, onBackToLive }: {
             )}
             {session?.qualityScore != null && (
               <span style={{ fontSize: 10, color: 'var(--c-success)', fontWeight: 650 }}>
-                quality {Math.round(session.qualityScore)}%
+                {t('agent.quality')} {Math.round(session.qualityScore)}%
               </span>
             )}
           </div>
@@ -107,8 +109,8 @@ export function AgentSessionTranscript({ sessionId, onBackToLive }: {
           )}
         </div>
         <div style={{ display: 'flex', gap: 6, flexShrink: 0 }}>
-          <Btn small variant="ghost" onClick={() => { void refreshTranscript() }}>Refresh</Btn>
-          <Btn small variant="glass" onClick={onBackToLive}>Back to live</Btn>
+          <Btn small variant="ghost" onClick={() => { void refreshTranscript() }}>{t('agent.refresh')}</Btn>
+          <Btn small variant="glass" onClick={onBackToLive}>{t('agent.backToLive')}</Btn>
         </div>
       </div>
 
@@ -121,8 +123,8 @@ export function AgentSessionTranscript({ sessionId, onBackToLive }: {
             onBackToLive={onBackToLive}
           />
         )}
-        {(detailLoading || eventsLoading) && <EmptyState>Loading transcript...</EmptyState>}
-        {!eventsLoading && events.length === 0 && <EmptyState>No transcript events yet.</EmptyState>}
+        {(detailLoading || eventsLoading) && <EmptyState>{t('agent.loadingTranscript')}</EmptyState>}
+        {!eventsLoading && events.length === 0 && <EmptyState>{t('agent.noTranscriptEvents')}</EmptyState>}
         {[...events, ...localEvents].map(event => (
           <TranscriptBlock key={event.id} event={event} actedApprovalIds={actedApprovalIds} onAction={handleAction} />
         ))}
