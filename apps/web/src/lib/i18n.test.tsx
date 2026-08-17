@@ -57,4 +57,5 @@ describe('AI settings translations', () => {
       expect(translate('en', key), key).not.toMatch(/[\u3400-\u9fff]/)
     }
   })
+
 })
