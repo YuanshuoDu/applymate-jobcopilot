@@ -60,9 +60,9 @@ export function AgentPreviewClient() {
           </div>
           <MetricGrid />
           <Section title={t('agentPreview.recentSessions')}>
-            <SessionRow active={!newChat} title="Berlin SWE Auto-Apply" meta="Last opened · Running · quality 87% · 09:14" onClick={resumeLastChat} />
-            <SessionRow title="Munich Data Engineer Search" meta="Done · quality 91% · Yesterday" />
-            <SessionRow title="Gmail Follow-up Batch" meta="Approval · quality pending · May 22" />
+            <SessionRow active={!newChat} title={t('agentPreview.sessionBerlin')} meta={t('agentPreview.sessionBerlinMeta')} onClick={resumeLastChat} />
+            <SessionRow title={t('agentPreview.sessionMunich')} meta={t('agentPreview.sessionMunichMeta')} />
+            <SessionRow title={t('agentPreview.sessionGmail')} meta={t('agentPreview.sessionGmailMeta')} />
           </Section>
           <Section title={t('agentPreview.queuedTasks')}>
             <TaskRow role={t('agentPreview.scout')} status={t('agentPreview.livenessGate')} value="94%" />
@@ -95,7 +95,7 @@ export function AgentPreviewClient() {
               <PanelLeftOpen size={17} aria-hidden="true" />
             </button>
             {!newChat && <div>
-              <h1 style={{ margin: 0, fontSize: 17 }}>Berlin SWE Auto-Apply</h1>
+              <h1 style={{ margin: 0, fontSize: 17 }}>{t('agentPreview.sessionBerlin')}</h1>
               <div style={{ marginTop: 4, fontSize: 12, color: 'var(--text-muted)' }}>
                 {t('agentPreview.memory')}
               </div>
@@ -111,9 +111,9 @@ export function AgentPreviewClient() {
             <ButtonRow labels={[t('agentPreview.createAutomation'), t('agentPreview.edit'), t('agentPreview.cancel')]} />
           </Message>
           <Message
-            speaker="Analyst · Thinking"
+            speaker={t('agentPreview.analystThinking')}
             body={thinkingExpanded ? t('agentPreview.thinkingExpanded') : t('agentPreview.thinkingCollapsed')}
-            time={thinkingExpanded ? '09:12 · expanded' : '09:12 · collapsed'}
+            time={thinkingExpanded ? t('agentPreview.expandedTime') : t('agentPreview.collapsedTime')}
             muted={!thinkingExpanded}
           />
           <Message speaker={t('agentPreview.orchestratorOptions')} body={t('agentPreview.strategyMessage')} time="09:13">
