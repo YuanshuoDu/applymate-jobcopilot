@@ -895,7 +895,7 @@ export function ResumePage() {
   }
 
   async function saveAndAuditResume(): Promise<ResumeAuditResult | null> {
-    if (saving) { toast.info('Saving in progress', 'Wait a moment, then start the audit again.'); return null }
+    if (saving) { toast.info(t('resume.toastSaving'), t('resume.toastSavingDetail')); return null }
     if (dirty && !(await handleSave())) return null
     if (!latestContent.current) return null
     // Reuse the same evidence-based Auditor whenever this resume is attached to
@@ -936,7 +936,7 @@ export function ResumePage() {
       setSectionOrder(imported.sectionOrder ?? DEFAULT_ORDER)
       setDirty(true)
       setContentChangedSinceAnalysis(true)
-      toast.success('Resume imported', 'Review the content and save when ready')
+        toast.success(t('resume.toastImported'), t('resume.toastReviewSave'))
     } else {
       // Create a new resume with the imported content
       const name = imported.contact.name ? `${imported.contact.name}'s Resume` : 'Imported Resume'
@@ -947,7 +947,7 @@ export function ResumePage() {
         const item: ResumeListItem = { id: data.id, name: data.name, isDefault: data.isDefault, directionId: null, kind: 'base' as const, parentResumeId: null, targetJobId: null, origin: 'manual' as const, basicsDetached: false, createdAt: data.createdAt, updatedAt: data.updatedAt }
         setResumes(prev => [...prev, item])
         setSelectedResumeId(data.id)
-        toast.success('Resume imported', `"${name}" created`)
+        toast.success(t('resume.toastImported'), `"${name}" ${t('resume.toastCreated')}`)
       } else toast.error('Import failed', error ?? 'Could not create resume')
     }
   }
@@ -1075,14 +1075,14 @@ export function ResumePage() {
           // Also toast for non-skills keywords
           const otherKw = scoreResult.missingItems.filter(m => m.target !== 'skills')
           if (otherKw.length > 0) {
-            toast.success('Review other gaps', `Also check: ${otherKw.map(m => m.keyword).join(', ')}`)
+          toast.success(t('resume.toastOtherGaps'), `${t('resume.toastAlsoCheck')}: ${otherKw.map(m => m.keyword).join(', ')}`)
           }
         } else { toast.success('Noted', 'Suggestion marked as applied') }
         break
 
       case 'experience':
         if (s.action === 'enhance' && hasProposed) {
-          toast.success('Experience tip', 'Open the Experience section and use ✦ AI suggest on a bullet to apply enhancements')
+          toast.success(t('resume.toastExperienceTip'), t('resume.toastExperienceTipDetail'))
         } else { toast.success('Noted', 'Suggestion marked as applied') }
         break
 
@@ -1788,7 +1788,7 @@ export function ResumePage() {
           templateOptions={templateOptions}
           coverLetterContent={finalCoverLetter?.content ?? null}
           onClose={() => setShowFinalConfirm(false)}
-          onReviewSuggestions={() => { setShowFinalConfirm(false); toast.info('Review AI suggestions', 'Apply the remaining suggestions in the AI insights panel') }}
+          onReviewSuggestions={() => { setShowFinalConfirm(false); toast.info(t('resume.toastSuggestions'), t('resume.toastSuggestionsDetail')) }}
           onCreateCoverLetter={() => { setShowFinalConfirm(false); setShowCoverLetter(true) }}
           onLinkJob={() => {
             setShowFinalConfirm(false)

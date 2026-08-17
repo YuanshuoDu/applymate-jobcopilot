@@ -356,6 +356,7 @@ function ModelSelector({ value, onChange }: {
   value: { provider: string; model: string }
   onChange: (v: { provider: string; model: string }) => void
 }) {
+  const { t } = useI18n()
   const byProvider = MODEL_CATALOGUE.filter(m => m.provider !== 'custom').reduce<Record<string, typeof MODEL_CATALOGUE>>((acc, m) => {
     if (!acc[m.provider]) acc[m.provider] = []
     acc[m.provider].push(m)
@@ -372,7 +373,7 @@ function ModelSelector({ value, onChange }: {
       style={{ fontSize: 11, padding: '3px 6px', border: '0.5px solid var(--border)', borderRadius: 5, background: 'var(--bg)', color: 'var(--text)', outline: 'none' }}
     >
       {value.provider === 'custom' && (
-        <option value={`${value.provider}::${value.model}`}>Custom (edit in Settings)</option>
+        <option value={`${value.provider}::${value.model}`}>{t('agent.customEdit')}</option>
       )}
       {Object.entries(byProvider).map(([provider, models]) => (
         <optgroup key={provider} label={PROVIDER_LABELS[provider as keyof typeof PROVIDER_LABELS] ?? provider}>

@@ -164,7 +164,7 @@ export function CoverLetterPanel({ job, resumeContent, resumeName, templateId, t
       generated = data.coverLetter
     } else {
       setGenerating(false)
-      toast.info('No resume content', 'Open this panel from the Resume tab to generate with your resume data')
+      toast.info(t('coverLetter.noResumeContent'), t('coverLetter.noResumeContentDetail'))
       return
     }
 
@@ -356,7 +356,7 @@ export function CoverLetterPanel({ job, resumeContent, resumeName, templateId, t
 
           {/* Generate button */}
           <Btn small variant="primary" onClick={handleGenerate} disabled={generating || loading}>
-            {generating ? 'Generating…' : t('coverLetter.panel.generate')}
+            {generating ? t('coverLetter.generating') : t('coverLetter.panel.generate')}
           </Btn>
         </div>
 

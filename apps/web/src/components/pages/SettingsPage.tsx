@@ -1125,7 +1125,7 @@ function ApiKeysSettings() {
             })}
           </div>
           <Btn variant="primary" onClick={saveKeys} disabled={saving}>
-            {saving ? 'Saving...' : 'Save discovery keys'}
+            {saving ? t('common.saving') : t('settings.saveDiscoveryKeys')}
           </Btn>
         </div>
         {(['adzuna', 'rapidapi'] as const).map(provider => {
@@ -1389,7 +1389,7 @@ function AiModelSettings() {
             onClick={testAllProviders}
             disabled={allTesting}
             style={{ padding: '6px 12px', fontSize: 11, borderRadius: 7, border: '0.5px solid var(--border)', background: 'var(--bg-secondary)', color: 'var(--text)', cursor: allTesting ? 'default' : 'pointer', whiteSpace: 'nowrap', opacity: allTesting ? 0.65 : 1 }}>
-            {allTesting ? 'Testing...' : 'Test all'}
+            {allTesting ? t('settings.testing') : t('settings.testAll')}
           </button>
         </div>
         <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>

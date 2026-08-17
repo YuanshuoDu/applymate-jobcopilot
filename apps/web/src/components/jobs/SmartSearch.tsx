@@ -301,7 +301,7 @@ export function SmartSearch({ onJobSaved, onOpenSettings }: { onJobSaved?: () =>
   async function handleSave(r: JobResult) {
     setSavingIds(prev => new Set(prev).add(r.id))
     await saveAndScore(r,
-      (rid) => { setSavingIds(p => { const n = new Set(p); n.delete(rid); return n }); setSavedIds(p => new Set(p).add(rid)); setScoringIds(p => new Set(p).add(rid)); toast.success('Saved', `${r.company} — scoring match…`); onJobSaved?.() },
+      (rid) => { setSavingIds(p => { const n = new Set(p); n.delete(rid); return n }); setSavedIds(p => new Set(p).add(rid)); setScoringIds(p => new Set(p).add(rid)); toast.success(t('smartSearch.saved'), `${r.company} — ${t('smartSearch.scoringMatch')}`); onJobSaved?.() },
       (rid, score) => { setScoringIds(p => { const n = new Set(p); n.delete(rid); return n }); setScores(p => ({ ...p, [rid]: score })) },
       (msg) => { setSavingIds(p => { const n = new Set(p); n.delete(r.id); return n }); toast.error('Save failed', msg) },
     )

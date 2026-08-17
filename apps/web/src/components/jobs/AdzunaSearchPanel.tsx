@@ -156,7 +156,7 @@ export function AdzunaSearchPanel({ variant = 'panel', onJobSaved, onClose }: Pr
     setPage(next)
     setLoadingMore(true)
     try { await doSearch(next, true) }
-    catch { toast.error('Load more failed', 'Could not fetch next page') }
+    catch { toast.error(t('adzuna.loadMoreFailed'), t('adzuna.loadMoreError')) }
     finally { setLoadingMore(false) }
   }
 
@@ -339,7 +339,7 @@ export function AdzunaSearchPanel({ variant = 'panel', onJobSaved, onClose }: Pr
                 <div style={{ padding: '12px 16px', borderTop: '0.5px solid var(--border)', display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 10 }}>
                   <span style={{ fontSize: 11, color: 'var(--text-muted)' }}>Showing {results.length} of {total.toLocaleString()}</span>
                   <Btn small variant="ghost" disabled={loadingMore} onClick={handleLoadMore}>
-                    {loadingMore ? 'Loading…' : 'Load more'}
+                    {loadingMore ? t('adzuna.loadingMore') : t('adzuna.loadMore')}
                   </Btn>
                 </div>
               )}

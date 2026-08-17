@@ -79,7 +79,7 @@ export function JobRecommendationsPage() {
       setSelectedIds(current => { const next = new Set(current); next.delete(id); return next })
       if (action === 'save') {
         window.dispatchEvent(new Event('applymate:jobs-changed'))
-        toast.success('Saved to My Jobs')
+        toast.success(t('recommendations.savedToJobs'))
       } else toast.info('Job dismissed')
     } catch (error) {
       toast.error('Could not update job', error instanceof Error ? error.message : 'Try again')
