@@ -3,6 +3,7 @@
 import React, { useEffect, useState } from 'react'
 import Link from 'next/link'
 import { ArrowLeft, PauseCircle, PlayCircle, RefreshCw } from 'lucide-react'
+import { useI18n } from '@/lib/i18n'
 
 export interface AdminUserRow { id: string; email: string; name: string; plan: string; accountStatus: string; region: string; createdAt: string; updatedAt: string; suspendedAt: string | null; counts: { resumes: number; jobs: number; applicationTasks: number } }
 interface AdminPlanOption { plan: string; name: string; active: boolean; version: number }
@@ -13,6 +14,7 @@ export function userRowLabel(user: Pick<AdminUserRow, 'name' | 'email' | 'plan' 
 function key() { return typeof crypto !== 'undefined' && 'randomUUID' in crypto ? crypto.randomUUID() : `admin-${Date.now()}` }
 
 export function UsersPage({ userId }: { userId?: string }) {
+  const { t } = useI18n()
   const [users, setUsers] = useState<AdminUserRow[]>([])
   const [user, setUser] = useState<AdminUserRow | null>(null)
   const [planChanges, setPlanChanges] = useState<Array<{ id: string; fromPlan: string; toPlan: string; createdAt: string }>>([])
@@ -24,18 +26,19 @@ export function UsersPage({ userId }: { userId?: string }) {
     try {
       const query = userId ? `/api/admin/v1/users/${userId}` : `/api/admin/v1/users?limit=50${q ? `&q=${encodeURIComponent(q)}` : ''}${status ? `&status=${status}` : ''}${plan ? `&plan=${plan}` : ''}`
       const response = await fetch(query, { cache: 'no-store' }); const body = await response.json() as { items?: AdminUserRow[]; user?: AdminUserRow; planChanges?: typeof planChanges; error?: string }
-      if (!response.ok) throw new Error(body.error ?? 'Unable to load users')
+      if (!response.ok) throw new Error(body.error ?? t('admin.unableLoadUsers'))
       if (userId) { setUser(body.user ?? null); setPlanChanges(body.planChanges ?? []) } else setUsers(body.items ?? [])
-    } catch (loadError) { setError(loadError instanceof Error ? loadError.message : 'Unable to load users') }
+    } catch (loadError) { setError(loadError instanceof Error ? loadError.message : t('admin.unableLoadUsers')) }
     finally { setLoading(false) }
   }
   useEffect(() => { void load() }, [userId])
 
   if (userId) return <UserDetail user={user} planChanges={planChanges} loading={loading} error={error} onReload={() => void load()} />
-  return <div style={{ maxWidth: 1180, margin: '0 auto' }}><header style={headerStyle}><div><div style={eyebrow}>Accounts</div><h1 style={titleStyle}>Users</h1><p style={muted}>Search masked profiles and manage account state.</p></div><button type="button" title="Refresh users" onClick={() => void load()} style={iconButton}><RefreshCw size={16} aria-hidden="true" /></button></header>{error && <ErrorBox text={error} />}<form onSubmit={event => { event.preventDefault(); void load() }} style={filterBar}><input value={q} onChange={event => setQ(event.target.value)} placeholder="Search name or email" style={input} /><select value={plan} onChange={event => setPlan(event.target.value)} style={input}><option value="">All plans</option><option value="free">Free</option><option value="pro">Pro</option><option value="enterprise">Enterprise</option></select><select value={status} onChange={event => setStatus(event.target.value)} style={input}><option value="">All states</option><option value="active">Active</option><option value="suspended">Suspended</option></select><button type="submit" style={primary}>Search</button></form><section style={section}><div style={{ overflowX: 'auto' }}><table style={table}><thead><tr><th>User</th><th>Plan</th><th>State</th><th>Usage metadata</th></tr></thead><tbody>{loading ? <tr><td colSpan={4}>Loading…</td></tr> : users.map(item => <tr key={item.id}><td><Link href={`/admin/users/${item.id}`} style={link}><strong>{item.name || 'Unnamed'}</strong><span style={{ display: 'block', fontSize: 11, color: '#687b90' }}>{item.email}</span></Link></td><td>{item.plan}</td><td><Status value={item.accountStatus} /></td><td>{item.counts.jobs} jobs · {item.counts.resumes} resumes · {item.counts.applicationTasks} tasks</td></tr>)}</tbody></table></div></section></div>
+  return <div style={{ maxWidth: 1180, margin: '0 auto' }}><header style={headerStyle}><div><div style={eyebrow}>{t('admin.accounts')}</div><h1 style={titleStyle}>{t('admin.users')}</h1><p style={muted}>{t('admin.searchMaskedProfiles')}</p></div><button type="button" title={t('admin.refreshUsers')} onClick={() => void load()} style={iconButton}><RefreshCw size={16} aria-hidden="true" /></button></header>{error && <ErrorBox text={error} />}<form onSubmit={event => { event.preventDefault(); void load() }} style={filterBar}><input value={q} onChange={event => setQ(event.target.value)} placeholder={t('admin.searchNameEmail')} style={input} /><select value={plan} onChange={event => setPlan(event.target.value)} style={input}><option value="">{t('admin.allPlans')}</option><option value="free">Free</option><option value="pro">Pro</option><option value="enterprise">Enterprise</option></select><select value={status} onChange={event => setStatus(event.target.value)} style={input}><option value="">{t('admin.allStates')}</option><option value="active">{t('admin.active')}</option><option value="suspended">{t('admin.suspended')}</option></select><button type="submit" style={primary}>{t('admin.search')}</button></form><section style={section}><div style={{ overflowX: 'auto' }}><table style={table}><thead><tr><th>{t('admin.user')}</th><th>{t('admin.plan')}</th><th>{t('admin.state')}</th><th>{t('admin.usageMetadata')}</th></tr></thead><tbody>{loading ? <tr><td colSpan={4}>{t('common.loading')}</td></tr> : users.map(item => <tr key={item.id}><td><Link href={`/admin/users/${item.id}`} style={link}><strong>{item.name || t('admin.unnamed')}</strong><span style={{ display: 'block', fontSize: 11, color: '#687b90' }}>{item.email}</span></Link></td><td>{item.plan}</td><td><Status value={item.accountStatus} /></td><td>{item.counts.jobs} {t('admin.jobs')} · {item.counts.resumes} {t('admin.resumes')} · {item.counts.applicationTasks} {t('admin.tasks')}</td></tr>)}</tbody></table></div></section></div>
 }
 
 function UserDetail({ user, planChanges, loading, error, onReload }: { user: AdminUserRow | null; planChanges: Array<{ id: string; fromPlan: string; toPlan: string; createdAt: string }>; loading: boolean; error: string; onReload: () => void }) {
+  const { t } = useI18n()
   const [busy, setBusy] = useState(false)
   const [plans, setPlans] = useState<AdminPlanOption[]>([])
   const [transitions, setTransitions] = useState<Array<{ fromPlan: string; toPlan: string; enabled: boolean }>>([])
@@ -58,8 +61,8 @@ function UserDetail({ user, planChanges, loading, error, onReload }: { user: Adm
     }).catch(() => undefined)
   }, [user])
   async function changeState(next: 'active' | 'suspended') { if (!user || !window.confirm(`${next === 'suspended' ? 'Suspend' : 'Restore'} this account?`)) return; const reason = window.prompt('Reason (10-500 characters)')?.trim() ?? ''; if (reason.length < 10) return; setBusy(true); const response = await fetch(`/api/admin/v1/users/${user.id}/account-state`, { method: 'PATCH', headers: { 'Content-Type': 'application/json', Origin: window.location.origin, 'Idempotency-Key': key() }, body: JSON.stringify({ status: next, updatedAt: user.updatedAt, reason }) }); setBusy(false); if (response.ok) onReload(); }
-  if (loading) return <div style={muted}>Loading user…</div>
-  if (!user) return <ErrorBox text={error || 'User not found'} />
+  if (loading) return <div style={muted}>{t('admin.loadingUser')}</div>
+  if (!user) return <ErrorBox text={error || t('admin.userNotFound')} />
   async function changePlan() {
     if (!user || selectedPlan === user.plan || reason.trim().length < 10) return
     setBusy(true)
