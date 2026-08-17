@@ -171,9 +171,9 @@ export function AddAgentModal({ onClose, onCreated }: {
             </div>
             <div style={{ flex: 1 }}>
               <div style={{ fontSize: 10, color: 'var(--text-muted)', marginBottom: 5 }}>{t('agent.nameRequired')}</div>
-              <input value={name} onChange={event => setName(event.target.value)} placeholder="e.g. Remote Filter" style={inputStyle} autoFocus />
+              <input value={name} onChange={event => setName(event.target.value)} placeholder={t('agent.remoteFilterPlaceholder')} style={inputStyle} autoFocus />
               <div style={{ fontSize: 10, color: 'var(--text-muted)', marginTop: 8, marginBottom: 5 }}>{t('agent.descriptionOptional')}</div>
-              <input value={description} onChange={event => setDescription(event.target.value)} placeholder="A short description of this Agent's responsibility" style={inputStyle} />
+              <input value={description} onChange={event => setDescription(event.target.value)} placeholder={t('agent.descriptionPlaceholder')} style={inputStyle} />
             </div>
           </div>
 
@@ -182,7 +182,7 @@ export function AddAgentModal({ onClose, onCreated }: {
             <textarea
               value={systemPrompt}
               onChange={event => setSystemPrompt(event.target.value)}
-              placeholder={'e.g.\nYou are a remote-work screening specialist. For every role, decide whether it supports remote work.\nIf it does not, explain why.'}
+              placeholder={t('agent.promptPlaceholder')}
               rows={4}
               style={{ ...inputStyle, resize: 'vertical', lineHeight: 1.6 }}
             />

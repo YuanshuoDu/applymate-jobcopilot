@@ -193,8 +193,8 @@ export function AgentComposer({
                     />
                   ))}
                   <ComposerMenuButton
-                    label="Paste job URL"
-                    meta="Add a new link manually"
+                    label={t('agent.pasteJobUrl')}
+                    meta={t('agent.addLinkManually')}
                     onClick={() => onAppendComposerContext('Analyse and prepare an application for this job link:')}
                   />
                 </ComposerMenuSection>
@@ -203,7 +203,7 @@ export function AgentComposer({
                   {composerResumes.slice(0, 3).map(resume => (
                     <ComposerMenuButton
                       key={resume.id}
-                      label={`${resume.name}${resume.isDefault ? ' · default' : ''}`}
+                      label={`${resume.name}${resume.isDefault ? ` · ${t('agent.default')}` : ''}`}
                       meta={resume.kind ?? 'base'}
                       onClick={() => onAddResumeContext(resume)}
                     />
@@ -212,12 +212,12 @@ export function AgentComposer({
                 <ComposerMenuSection title={t('agent.actions')}>
                   <ComposerMenuButton
                     label={t('agent.createAutomation')}
-                    meta="Start an agent-created routine"
+                    meta={t('agent.startRoutine')}
                     onClick={() => onAppendComposerContext('Create a new automation for me:')}
                   />
                   <ComposerMenuButton
                     label={t('agent.attachFiles')}
-                    meta="Resume, note, or supporting file"
+                    meta={t('agent.fileDescription')}
                     onClick={() => {
                       onAddMenuOpenChange(false)
                       fileInputRef.current?.click()
@@ -243,13 +243,13 @@ export function AgentComposer({
                 <ChevronDown size={13} aria-hidden="true" />
               </button>
               {advancedModelOpen && (
-                <div className="agent-composer-model-dialog" role="dialog" aria-label="Advanced model selection" style={{ position: 'absolute', bottom: 'calc(100% + 10px)', left: 0, width: 276, padding: 12, border: '1px solid rgba(79,70,229,0.14)', borderRadius: 14, background: 'var(--bg)', boxShadow: '0 18px 42px rgba(15,23,42,0.18)', zIndex: 100 }}>
+                <div className="agent-composer-model-dialog" role="dialog" aria-label={t('agent.advancedSelection')} style={{ position: 'absolute', bottom: 'calc(100% + 10px)', left: 0, width: 276, padding: 12, border: '1px solid rgba(79,70,229,0.14)', borderRadius: 14, background: 'var(--bg)', boxShadow: '0 18px 42px rgba(15,23,42,0.18)', zIndex: 100 }}>
                   <div style={{ display: 'flex', alignItems: 'center', gap: 7, fontSize: 12, fontWeight: 700, color: 'var(--text)' }}>
                     <LockKeyhole size={14} color="var(--text-muted)" aria-hidden="true" />
                     {t('agent.advancedModel')}
                   </div>
                   <p style={{ margin: '6px 0 10px', fontSize: 11, lineHeight: 1.5, color: 'var(--text-muted)' }}>
-                    Basic chat uses your default Agent model. Configure an advanced override in Settings.
+                    {t('agent.advancedDescription')}
                   </p>
                   <button
                     type="button"
@@ -263,8 +263,8 @@ export function AgentComposer({
             </div>
           </div>
           <button onClick={() => onSendChat(chatInput)} disabled={!canSend}
-            title="Send message"
-            aria-label="Send message"
+            title={t('agent.sendMessage')}
+            aria-label={t('agent.sendMessage')}
             style={{ width: 38, height: 38, display: 'grid', placeItems: 'center', borderRadius: 14, border: 'none', background: !canSend ? 'rgba(148,163,184,0.35)' : 'var(--brand-gradient)', color: '#fff', cursor: !canSend ? 'not-allowed' : 'pointer', boxShadow: canSend ? '0 8px 16px rgba(79,70,229,0.28)' : 'none', transition: 'transform 160ms ease, box-shadow 160ms ease' }}>
             {chatLoading ? '…' : <ArrowUp size={19} strokeWidth={2.7} aria-hidden="true" />}
           </button>
