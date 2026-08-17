@@ -372,6 +372,7 @@ interface Props {
 }
 
 export function UnifiedJobSearch({ onJobSaved }: Props) {
+  const { t } = useI18n()
   const [source, setSource] = useState<JobSource>('adzuna')
 
   // Shared q state (carried across tab switches)
@@ -395,9 +396,9 @@ export function UnifiedJobSearch({ onJobSaved }: Props) {
       {/* Shared keyword input */}
       <div style={{ display: 'flex', gap: 8, alignItems: 'flex-end', marginBottom: 4 }}>
         <div style={{ flex: '2 1 220px' }}>
-          <label style={labelSt}>Keywords *</label>
+          <label style={labelSt}>{t('jobSearch.keywords')} *</label>
           <input style={INPUT_STYLE} value={q} onChange={e => setQ(e.target.value)}
-            placeholder={source === 'jobicy' ? 'e.g. Python, React, DevOps' : 'e.g. Software Engineer, Product Manager'}
+            placeholder={source === 'jobicy' ? t('jobSearch.keywordExampleTech') : t('jobSearch.keywordExampleRoles')}
             onKeyDown={e => { if (e.key === 'Enter') { const form = (e.target as HTMLElement).closest('form'); form?.requestSubmit() } }}
           />
         </div>
@@ -418,6 +419,7 @@ export function UnifiedJobSearch({ onJobSaved }: Props) {
 // ── Per-source panel wrappers ─────────────────────────────────────────────────
 
 function AdzunaPanel({ q, onJobSaved }: { q: string; onJobSaved?: () => void }) {
+  const { t } = useI18n()
   const fetch_ = useCallback(async (fs: Record<string, string>, page: number) => {
     const p = new URLSearchParams({ q, page: String(page) })
     if (fs.where)    p.set('where', fs.where)
@@ -433,15 +435,16 @@ function AdzunaPanel({ q, onJobSaved }: { q: string; onJobSaved?: () => void }) 
     <SourcePanel
       fetchJobs={fetch_} q={q} placeholder="Adzuna" onJobSaved={onJobSaved}
       formFields={<>
-        <TextField fieldKey="where"   label="Location"    placeholder="e.g. Berlin, London" flex="1 1 140px" />
-        <SelectField fieldKey="country" label="Country"   options={COUNTRIES_ADZUNA.map(c => ({ value: c.code, label: c.label }))} width={100} />
-        <SelectField fieldKey="jobType" label="Type"      options={JOB_TYPES_ADZUNA.map(o => ({ value: o.value, label: o.label }))} width={120} />
+        <TextField fieldKey="where"   label={t('jobSearch.location')} placeholder={t('jobSearch.locationExample')} flex="1 1 140px" />
+        <SelectField fieldKey="country" label={t('jobSearch.country')} options={COUNTRIES_ADZUNA.map(c => ({ value: c.code, label: c.label }))} width={100} />
+        <SelectField fieldKey="jobType" label={t('jobSearch.type')} options={JOB_TYPES_ADZUNA.map(o => ({ value: o.value, label: o.value ? t(`jobSearch.type.${o.value}`) : t('jobSearch.any') }))} width={120} />
       </>}
     />
   )
 }
 
 function JSearchPanel({ q, onJobSaved }: { q: string; onJobSaved?: () => void }) {
+  const { t } = useI18n()
   const fetch_ = useCallback(async (fs: Record<string, string>, page: number) => {
     const p = new URLSearchParams({ q, page: String(page) })
     if (fs.location)    p.set('location', fs.location)
@@ -457,15 +460,16 @@ function JSearchPanel({ q, onJobSaved }: { q: string; onJobSaved?: () => void })
     <SourcePanel
       fetchJobs={fetch_} q={q} placeholder="JSearch" onJobSaved={onJobSaved}
       formFields={<>
-        <TextField fieldKey="location" label="Location" placeholder="e.g. London, Berlin, Remote" flex="1 1 140px" />
-        <SelectField fieldKey="empType" label="Type"    options={EMP_TYPES_JSEARCH.map(o => ({ value: o.value, label: o.label }))} width={120} />
-        <SelectField fieldKey="remote"  label="Remote"  options={[{ value: '', label: 'Any' }, { value: '1', label: 'Remote only' }]} width={110} />
+        <TextField fieldKey="location" label={t('jobSearch.location')} placeholder={t('jobSearch.locationRemoteExample')} flex="1 1 140px" />
+        <SelectField fieldKey="empType" label={t('jobSearch.type')} options={EMP_TYPES_JSEARCH.map(o => ({ value: o.value, label: o.value ? t(`jobSearch.empType.${o.value}`) : t('jobSearch.any') }))} width={120} />
+        <SelectField fieldKey="remote"  label={t('jobSearch.remote')} options={[{ value: '', label: t('jobSearch.any') }, { value: '1', label: t('jobSearch.remoteOnly') }]} width={110} />
       </>}
     />
   )
 }
 
 function JobicyPanel({ q, onJobSaved }: { q: string; onJobSaved?: () => void }) {
+  const { t } = useI18n()
   const fetch_ = useCallback(async (fs: Record<string, string>) => {
     const p = new URLSearchParams({ q })
     if (fs.geo)      p.set('geo', fs.geo)
@@ -480,14 +484,15 @@ function JobicyPanel({ q, onJobSaved }: { q: string; onJobSaved?: () => void }) 
     <SourcePanel
       fetchJobs={fetch_} q={q} placeholder="Jobicy" onJobSaved={onJobSaved}
       formFields={<>
-        <SelectField fieldKey="geo"      label="Region"   options={GEO_JOBICY.map(o => ({ value: o.value, label: o.label }))} width={140} />
-        <TextField  fieldKey="industry" label="Industry" placeholder="e.g. Software, Design" flex="1 1 140px" />
+        <SelectField fieldKey="geo"      label={t('jobSearch.region')} options={GEO_JOBICY.map(o => ({ value: o.value, label: o.value ? t(`jobSearch.geo.${o.value}`) : t('jobSearch.anywhere') }))} width={140} />
+        <TextField  fieldKey="industry" label={t('jobSearch.industry')} placeholder={t('jobSearch.industryExample')} flex="1 1 140px" />
       </>}
     />
   )
 }
 
 function LinkedInPanel({ q, onJobSaved }: { q: string; onJobSaved?: () => void }) {
+  const { t } = useI18n()
   const fetch_ = useCallback(async (fs: Record<string, string>, page: number) => {
     const p = new URLSearchParams({ q, page: String(page) })
     if (fs.location) p.set('location', fs.location)
@@ -501,8 +506,8 @@ function LinkedInPanel({ q, onJobSaved }: { q: string; onJobSaved?: () => void }
     <SourcePanel
       fetchJobs={fetch_} q={q} placeholder="LinkedIn" onJobSaved={onJobSaved}
       formFields={<>
-        <TextField fieldKey="location" label="Location (OR syntax)"
-          placeholder="e.g. Germany OR Netherlands OR United Kingdom" flex="1 1 240px" />
+        <TextField fieldKey="location" label={t('jobSearch.locationOr')}
+          placeholder={t('jobSearch.locationOrExample')} flex="1 1 240px" />
       </>}
     />
   )
