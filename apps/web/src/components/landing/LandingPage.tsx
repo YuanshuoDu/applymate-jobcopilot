@@ -397,15 +397,15 @@ export function LandingPage({ plans = FALLBACK_PLANS }: { plans?: PublicPlan[] }
 
         {/* Headline */}
         <h1 style={{ fontSize: 'clamp(42px, 7.5vw, 84px)', fontWeight: 900, lineHeight: 1.06, letterSpacing: '-0.045em', marginBottom: 26, maxWidth: 860 }}>
-          <span style={gradientText}>Let AI get you</span>
+          <span style={gradientText}>{t('landing.heroLead')}</span>
           <br />
-          <span style={{ color: '#fff' }}>hired in Europe</span>
+          <span style={{ color: '#fff' }}>{t('landing.hiredEurope')}</span>
         </h1>
 
         {/* Sub */}
         <p style={{ fontSize: 'clamp(15px, 2vw, 19px)', color: C.textMuted, maxWidth: 560, lineHeight: 1.72, marginBottom: 44 }}>
-          ApplyMate AI scans jobs, tailors your resume, writes cover letters and applies — automatically.
-          <br />You just show up to interviews.
+          {t('landing.heroDescription')}
+          <br />{t('landing.heroDescription2')}
         </p>
 
         {/* CTA */}
@@ -413,11 +413,11 @@ export function LandingPage({ plans = FALLBACK_PLANS }: { plans?: PublicPlan[] }
           <Link href="/register" className="btn-shine" style={{ display: 'inline-flex', alignItems: 'center', gap: 8, padding: '15px 34px', fontSize: 15, fontWeight: 700, background: 'linear-gradient(135deg, #4F46E5 0%, #7C3AED 100%)', color: '#fff', borderRadius: 14, textDecoration: 'none', boxShadow: '0 6px 30px rgba(79,70,229,0.60), inset 0 1px 0 rgba(255,255,255,0.18)', letterSpacing: '0.01em', transition: 'all 0.22s' }}
             onMouseEnter={e => { e.currentTarget.style.transform='translateY(-2px)'; e.currentTarget.style.boxShadow='0 10px 40px rgba(79,70,229,0.70), inset 0 1px 0 rgba(255,255,255,0.18)' }}
             onMouseLeave={e => { e.currentTarget.style.transform='none'; e.currentTarget.style.boxShadow='0 6px 30px rgba(79,70,229,0.60), inset 0 1px 0 rgba(255,255,255,0.18)' }}
-          >🚀 Start for free</Link>
+          >🚀 {t('landing.startFree')}</Link>
           <a href="#features" style={{ display: 'inline-flex', alignItems: 'center', gap: 8, padding: '15px 28px', fontSize: 15, fontWeight: 600, background: 'rgba(255,255,255,0.07)', backdropFilter: 'blur(12px)', border: '1px solid rgba(255,255,255,0.14)', color: 'rgba(255,255,255,0.85)', borderRadius: 14, textDecoration: 'none', transition: 'all 0.2s' }}
             onMouseEnter={e => { e.currentTarget.style.background='rgba(255,255,255,0.13)'; e.currentTarget.style.borderColor='rgba(255,255,255,0.26)' }}
             onMouseLeave={e => { e.currentTarget.style.background='rgba(255,255,255,0.07)'; e.currentTarget.style.borderColor='rgba(255,255,255,0.14)' }}
-          >See features ↓</a>
+          >{t('landing.seeFeatures')}</a>
         </div>
 
         {/* Stats (animated counters) */}
@@ -440,10 +440,10 @@ export function LandingPage({ plans = FALLBACK_PLANS }: { plans?: PublicPlan[] }
           <div style={{ textAlign: 'center', marginBottom: 60 }}>
             <Label>{t('landing.features')}</Label>
             <h2 style={{ fontSize: 'clamp(28px, 4vw, 46px)', fontWeight: 800, letterSpacing: '-0.035em', marginBottom: 14 }}>
-              Every step of your job search,<br /><span style={gradientText}>handled by AI</span>
+              {t('landing.everyStep')}<br /><span style={gradientText}>{t('landing.handledByAi')}</span>
             </h2>
             <p style={{ fontSize: 15, color: C.textMuted, maxWidth: 480, margin: '0 auto', lineHeight: 1.75 }}>
-              From finding a job to receiving an offer — AI assists at every stage so you can apply 10× faster.
+              {t('landing.featuresDescription')}
             </p>
           </div>
         </Reveal>
@@ -475,7 +475,7 @@ export function LandingPage({ plans = FALLBACK_PLANS }: { plans?: PublicPlan[] }
             <div style={{ textAlign: 'center', marginBottom: 60 }}>
               <Label color="#FB923C" bg="rgba(251,146,60,0.12)" bd="rgba(251,146,60,0.22)">{t('landing.howItWorks')}</Label>
               <h2 style={{ fontSize: 'clamp(28px, 4vw, 46px)', fontWeight: 800, letterSpacing: '-0.035em', marginBottom: 14 }}>
-                Three steps to<span style={{ color: '#FB923C' }}> automated job hunting</span>
+                {t('landing.howItWorks')}<span style={{ color: '#FB923C' }}> {t('landing.automatedHunting')}</span>
               </h2>
             </div>
           </Reveal>
@@ -501,9 +501,9 @@ export function LandingPage({ plans = FALLBACK_PLANS }: { plans?: PublicPlan[] }
         <div style={{ maxWidth: 1140, margin: '0 auto' }}>
           <Reveal>
             <div style={{ textAlign: 'center', marginBottom: 60 }}>
-              <Label color={C.teal} bg="rgba(45,212,191,0.10)" bd="rgba(45,212,191,0.22)">Success Stories</Label>
+              <Label color={C.teal} bg="rgba(45,212,191,0.10)" bd="rgba(45,212,191,0.22)">{t('landing.successStories')}</Label>
               <h2 style={{ fontSize: 'clamp(28px, 4vw, 46px)', fontWeight: 800, letterSpacing: '-0.035em' }}>
-                They already <span style={gradientText}>landed their job</span>
+                {t('landing.landedJob')} <span style={gradientText}>{t('landing.hiredEurope')}</span>
               </h2>
             </div>
           </Reveal>
@@ -535,9 +535,9 @@ export function LandingPage({ plans = FALLBACK_PLANS }: { plans?: PublicPlan[] }
             <div style={{ textAlign: 'center', marginBottom: 60 }}>
               <Label color={C.green} bg="rgba(52,211,153,0.10)" bd="rgba(52,211,153,0.20)">{t('landing.pricing')}</Label>
               <h2 style={{ fontSize: 'clamp(28px, 4vw, 46px)', fontWeight: 800, letterSpacing: '-0.035em', marginBottom: 12 }}>
-                Simple, transparent<span style={gradientText}> pricing</span>
+                {t('landing.simplePricing')}<span style={gradientText}> {t('landing.pricingWord')}</span>
               </h2>
-              <p style={{ fontSize: 15, color: C.textMuted }}>Trial details are shown on each plan. No credit card required.</p>
+              <p style={{ fontSize: 15, color: C.textMuted }}>{t('landing.trialDetails')}</p>
             </div>
           </Reveal>
 
@@ -560,7 +560,7 @@ export function LandingPage({ plans = FALLBACK_PLANS }: { plans?: PublicPlan[] }
                       <span style={{ fontSize: 13, color: C.textMuted }}>{planPeriod(plan)}</span>
                     </div>
                     <div style={{ fontSize: 12, color: C.textMuted, marginBottom: 10 }}>{plan.description}</div>
-                    {plan.trialDays > 0 && <div style={{ fontSize: 11, color: C.green, marginBottom: 18 }}>{plan.trialDays}-day free trial</div>}
+                    {plan.trialDays > 0 && <div style={{ fontSize: 11, color: C.green, marginBottom: 18 }}>{plan.trialDays}-{t('landing.freeTrial')}</div>}
                     <div style={{ flex: 1, marginBottom: 28 }}>
                       {plan.features.map(f => (
                         <div key={f} style={{ display: 'flex', alignItems: 'center', gap: 9, marginBottom: 11, fontSize: 13, color: 'rgba(255,255,255,0.82)' }}>
@@ -587,7 +587,7 @@ export function LandingPage({ plans = FALLBACK_PLANS }: { plans?: PublicPlan[] }
             <div style={{ textAlign: 'center', marginBottom: 60 }}>
               <Label color="#C084FC" bg="rgba(192,132,252,0.10)" bd="rgba(192,132,252,0.22)">{t('landing.faq')}</Label>
               <h2 style={{ fontSize: 'clamp(28px, 4vw, 46px)', fontWeight: 800, letterSpacing: '-0.035em' }}>
-                Frequently asked <span style={gradientText}>questions</span>
+                {t('landing.frequentlyAsked')} <span style={gradientText}>{t('landing.questions')}</span>
               </h2>
             </div>
           </Reveal>
@@ -633,7 +633,7 @@ export function LandingPage({ plans = FALLBACK_PLANS }: { plans?: PublicPlan[] }
                 <form onSubmit={handleContact} style={{ display: 'flex', flexDirection: 'column', gap: 18 }}>
                   <div className="landing-contact-fields" style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 14 }}>
                     <InputField label={t('landing.name')} value={contactForm.name} onChange={v => setContactForm(f => ({ ...f, name: v }))} placeholder={t('landing.yourName')} required />
-                    <InputField label="Email" type="email" value={contactForm.email} onChange={v => setContactForm(f => ({ ...f, email: v }))} placeholder="your@email.com" required />
+                    <InputField label={t('landing.email')} type="email" value={contactForm.email} onChange={v => setContactForm(f => ({ ...f, email: v }))} placeholder="your@email.com" required />
                   </div>
                   <InputField label={t('landing.message')} value={contactForm.message} onChange={v => setContactForm(f => ({ ...f, message: v }))} placeholder={t('landing.messagePlaceholder')} multiline required />
                   {contactError && <div role="alert" style={{ color: '#FCA5A5', fontSize: 12, lineHeight: 1.5, padding: '10px 12px', borderRadius: 9, background: 'rgba(220,38,38,0.12)', border: '1px solid rgba(248,113,113,0.25)' }}>{contactError}</div>}
@@ -655,16 +655,16 @@ export function LandingPage({ plans = FALLBACK_PLANS }: { plans?: PublicPlan[] }
           <Reveal>
             <GlassCard style={{ padding: '60px 48px', textAlign: 'center' }} gradient="linear-gradient(135deg, rgba(79,70,229,0.17) 0%, rgba(124,58,237,0.11) 50%, rgba(251,146,60,0.09) 100%)" border="rgba(99,102,241,0.32)">
               <div style={{ fontSize: 'clamp(24px, 4vw, 40px)', fontWeight: 900, letterSpacing: '-0.035em', lineHeight: 1.2, marginBottom: 16 }}>
-                Your next offer<br /><span style={gradientText}>starts here</span>
+                {t('landing.nextOffer')}<br /><span style={gradientText}>{t('landing.startsHere')}</span>
               </div>
               <p style={{ fontSize: 14, color: C.textMuted, marginBottom: 36, lineHeight: 1.75 }}>
-                Join the job seekers who already landed their role with ApplyMate AI.<br />
-                {proTrialDays > 0 ? `${proTrialDays} days free on Pro, no credit card required.` : 'Start with the free plan and contact us when you are ready to upgrade.'}
+                {t('landing.joinSeekers')}<br />
+                {proTrialDays > 0 ? `${proTrialDays} days free on Pro, no credit card required.` : t('landing.startFreePlan')}
               </p>
               <Link href="/register" className="btn-shine" style={{ display: 'inline-flex', alignItems: 'center', gap: 8, padding: '15px 40px', fontSize: 15, fontWeight: 700, background: 'linear-gradient(135deg, #4F46E5, #7C3AED)', color: '#fff', borderRadius: 14, textDecoration: 'none', boxShadow: '0 6px 30px rgba(79,70,229,0.58)', transition: 'all 0.22s' }}
                 onMouseEnter={e => { e.currentTarget.style.transform='translateY(-2px)'; e.currentTarget.style.boxShadow='0 10px 40px rgba(79,70,229,0.72)' }}
                 onMouseLeave={e => { e.currentTarget.style.transform='none'; e.currentTarget.style.boxShadow='0 6px 30px rgba(79,70,229,0.58)' }}
-              >🚀 Start for free</Link>
+              >🚀 {t('landing.startFree')}</Link>
             </GlassCard>
           </Reveal>
         </div>
@@ -678,7 +678,7 @@ export function LandingPage({ plans = FALLBACK_PLANS }: { plans?: PublicPlan[] }
               <div style={{ width: 28, height: 28, borderRadius: 8, background: 'linear-gradient(135deg, #4F46E5, #7C3AED)', display: 'flex', alignItems: 'center', justifyContent: 'center', color: '#fff', fontSize: 12, fontWeight: 800 }}>A</div>
               <span style={{ fontSize: 14, fontWeight: 700, color: '#fff' }}>ApplyMate AI</span>
             </div>
-            <p style={{ fontSize: 12, color: C.textSubtle, lineHeight: 1.75 }}>AI-powered European job search automation. 50,000+ jobs/day.</p>
+            <p style={{ fontSize: 12, color: C.textSubtle, lineHeight: 1.75 }}>{t('landing.aiFooter')}</p>
             <div style={{ display: 'flex', gap: 10, marginTop: 18 }}>
               {SOCIAL_LINKS.map(link => (
                 <a key={link.label} href={link.href} {...(link.external ? { target: '_blank', rel: 'noreferrer' } : {})} style={{ fontSize: 11, color: C.textSubtle, textDecoration: 'none', background: 'rgba(255,255,255,0.06)', border: '1px solid rgba(255,255,255,0.10)', borderRadius: 7, padding: '4px 9px', transition: 'all 0.15s' }}
