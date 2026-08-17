@@ -1458,19 +1458,19 @@ export function ResumePage() {
       <header className="resume-library-heading">
         <div>
           <h1>{t('resume.library')}</h1>
-          {returnToJobs && <button onClick={() => navigate('jobs')} style={{ marginTop: 4, padding: 0, border: 'none', background: 'none', color: 'var(--primary)', cursor: 'pointer', fontSize: 12 }}>← Back to My Jobs</button>}
+          {returnToJobs && <button onClick={() => navigate('jobs')} style={{ marginTop: 4, padding: 0, border: 'none', background: 'none', color: 'var(--primary)', cursor: 'pointer', fontSize: 12 }}>← {t('resume.backToJobs')}</button>}
         </div>
       <div className="resume-library-toolbar">
         <div className="resume-library-toolbar-actions">
-          <Btn variant="primary" onClick={() => openIntake()}><Upload size={15} />Import &amp; parse</Btn>
+          <Btn variant="primary" onClick={() => openIntake()}><Upload size={15} />{t('resume.importParse')}</Btn>
         </div>
         <span className="resume-toolbar-divider" />
-        <Btn variant="ghost" onClick={() => setShowTemplates(true)}><LayoutTemplate size={15} />Templates</Btn>
+        <Btn variant="ghost" onClick={() => setShowTemplates(true)}><LayoutTemplate size={15} />{t('resume.templates')}</Btn>
         <span className="resume-toolbar-divider" />
-        <Btn variant="ghost" onClick={() => { if (!selectedResumeId) { toast.info('Select a resume first'); return }; fetchVersions(); setShowVersions(true) }}><History size={15} />History</Btn>
+        <Btn variant="ghost" onClick={() => { if (!selectedResumeId) { toast.info(t('resume.selectFirst')); return }; fetchVersions(); setShowVersions(true) }}><History size={15} />{t('resume.history')}</Btn>
         <span className="resume-toolbar-divider" />
         <Btn variant="ghost" onClick={() => {
-          if (!selectedResumeId || !content) { toast.info('Select a resume first'); return }
+          if (!selectedResumeId || !content) { toast.info(t('resume.selectFirst')); return }
           // Snapshot current state into localStorage — print page reads this directly,
           // so PDF always reflects what the user sees regardless of save timing
           const snapshot = {
@@ -1482,11 +1482,11 @@ export function ResumePage() {
           // Also persist to DB in the background (non-blocking)
           if (dirty) handleSave()
           window.open(`/resume/${selectedResumeId}/print`, '_blank')
-        }}><FileDown size={15} />Export PDF</Btn>
+        }}><FileDown size={15} />{t('resume.exportPdf')}</Btn>
         <div className="resume-final-confirm-trigger"><Btn variant="toolbar" onClick={() => {
           if (!selectedResumeId || !content) { toast.info('Select a resume first'); return }
           setShowFinalConfirm(true)
-        }}><ShieldCheck size={15} />Final confirm</Btn></div>
+        }}><ShieldCheck size={15} />{t('resume.finalConfirm')}</Btn></div>
         <span className={`resume-top-save${dirty ? ' is-unsaved' : ''}`}>{saving ? 'Saving…' : dirty ? 'Saving soon' : lastSavedAt && Date.now() - lastSavedAt.getTime() >= 5 * 60_000 ? `Saved ${lastSavedAt.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}` : 'Saved just now'}</span>
       </div>
       </header>
@@ -1509,7 +1509,7 @@ export function ResumePage() {
               {libraryCollapsed ? <PanelLeftOpen size={17} /> : <PanelLeftClose size={17} />}
             </button>
             {libraryCollapsed ? (
-              <div className="resume-library-collapsed-list" aria-label="Resume thumbnails">
+              <div className="resume-library-collapsed-list" aria-label={t('resume.thumbnails')}>
                 {filteredResumes.map(resume => {
                   const isSelected = resume.id === selectedResumeId
                   return (
@@ -1529,10 +1529,10 @@ export function ResumePage() {
             ) : <>
             <div className="resume-library-sidebar-head">
               <div>
-                <span>My resumes</span>
+                <span>{t('resume.myResumes')}</span>
                 <small>{resumes.length} version{resumes.length === 1 ? '' : 's'}</small>
               </div>
-              <button onClick={() => setShowNewResume(true)} disabled={creatingResume}><Plus size={13} />New version</button>
+              <button onClick={() => setShowNewResume(true)} disabled={creatingResume}><Plus size={13} />{t('resume.newVersion')}</button>
             </div>
             <ResumeLibraryPanel
               resumes={filteredResumes}
@@ -1546,7 +1546,7 @@ export function ResumePage() {
             />
             <div
               className={`resume-library-import${libraryImportDragOver ? ' is-drag-over' : ''}`}
-              aria-label="Drop a PDF or DOCX resume to import"
+              aria-label={t('resume.dropResume')}
               onDragOver={event => { event.preventDefault(); event.dataTransfer.dropEffect = 'copy'; setLibraryImportDragOver(true) }}
               onDragLeave={event => { if (!event.currentTarget.contains(event.relatedTarget as Node)) setLibraryImportDragOver(false) }}
               onDrop={handleLibraryImportDrop}
@@ -1662,30 +1662,30 @@ export function ResumePage() {
           <aside className="resume-ai-column">
           <div className="resume-ai-title" style={{ display: 'flex', gap: 6 }}>
             <button onClick={() => setRightPanel('insights')} style={{ border: 0, background: 'transparent', color: rightPanel === 'insights' ? 'var(--text)' : 'var(--text-muted)', font: 'inherit', fontWeight: 700, cursor: 'pointer', padding: 0 }}>{t('resume.aiInsights')}</button>
-            <button onClick={() => setRightPanel('persona')} style={{ border: 0, background: 'transparent', color: rightPanel === 'persona' ? 'var(--primary)' : 'var(--text-muted)', font: 'inherit', fontWeight: 700, cursor: 'pointer', padding: 0 }}>Persona</button>
+            <button onClick={() => setRightPanel('persona')} style={{ border: 0, background: 'transparent', color: rightPanel === 'persona' ? 'var(--primary)' : 'var(--text-muted)', font: 'inherit', fontWeight: 700, cursor: 'pointer', padding: 0 }}>{t('resume.persona')}</button>
           </div>
           {rightPanel === 'persona' ? <PersonaPanel isDefault={selectedResume?.isDefault ?? false} onEditResume={setEditSection} onUseAsProfile={() => { if (selectedResume) void handleSetDefaultResume(selectedResume) }} /> : <>
           <div className="resume-opportunity-card">
-            <span className="resume-opportunity-eyebrow">LINKED OPPORTUNITY</span>
+            <span className="resume-opportunity-eyebrow">{t('resume.linkedOpportunity')}</span>
             {linkedJob ? <>
               <strong>{linkedJob.role}</strong>
               <span>{linkedJob.company}</span>
               <small>{selectedResume?.targetJobId ? 'Tailored version linked' : 'Selected resume linked'}</small>
               <div className="resume-opportunity-actions">
-                <button onClick={() => setShowCoverLetter(true)}>Cover letter</button>
+                <button onClick={() => setShowCoverLetter(true)}>{t('resume.coverLetter')}</button>
                 <button onClick={() => toast.info('Saved job', `${linkedJob.company} · ${linkedJob.role} is linked to this resume`)}>View job</button>
               </div>
             </> : <>
-              <strong>Link a saved job</strong>
+              <strong>{t('resume.linkSavedJob')}</strong>
               <span>AI will tailor this resume to the opportunity you choose.</span>
               <select value={selectedJobId ?? ''} onChange={e => setSelectedJobId(e.target.value || null)}>
-                <option value="">Choose a saved job</option>
+                <option value="">{t('resume.chooseSavedJob')}</option>
                 {jobs.map(job => <option key={job.id} value={job.id}>{job.company} · {job.role}</option>)}
               </select>
               <button className="resume-opportunity-link" onClick={() => {
                 if (!selectedJobId) { toast.info('Select a saved job first', 'Choose the opportunity this resume should be used for'); return }
                 linkResumeToJob(selectedJobId)
-              }}>Link resume</button>
+              }}>{t('resume.linkResume')}</button>
             </>}
           </div>
           <AiPanel
@@ -1740,7 +1740,7 @@ export function ResumePage() {
           onClick={e => { if (e.target === e.currentTarget) setShowVersions(false) }}>
           <div style={{ background: 'var(--bg)', border: '0.5px solid var(--border)', borderRadius: 10, padding: 20, width: 400, maxHeight: '70vh', overflow: 'hidden', display: 'flex', flexDirection: 'column', boxShadow: '0 8px 32px rgba(0,0,0,0.15)' }}>
             <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 14 }}>
-              <span style={{ fontSize: 14, fontWeight: 500 }}>Version History</span>
+              <span style={{ fontSize: 14, fontWeight: 500 }}>{t('resume.versionHistory')}</span>
               <button onClick={() => setShowVersions(false)} style={{ background: 'none', border: 'none', cursor: 'pointer', fontSize: 16, color: 'var(--text-muted)', lineHeight: 1, padding: 0 }}>✕</button>
             </div>
             <div style={{ flex: 1, overflowY: 'auto' }}>
@@ -1748,7 +1748,7 @@ export function ResumePage() {
                 <div style={{ textAlign: 'center', padding: 30, fontSize: 12, color: 'var(--text-muted)' }}>Loading versions…</div>
               ) : versions.length === 0 ? (
                 <div style={{ textAlign: 'center', padding: 30 }}>
-                  <div style={{ fontSize: 13, fontWeight: 500, marginBottom: 4 }}>No versions yet</div>
+                  <div style={{ fontSize: 13, fontWeight: 500, marginBottom: 4 }}>{t('resume.noVersionsShort')}</div>
                   <div style={{ fontSize: 11, color: 'var(--text-muted)' }}>Versions are created automatically when you save your resume.</div>
                 </div>
               ) : (
