@@ -109,7 +109,7 @@ function platformLabel(label: string, t: (key: string) => string) {
 }
 
 export function ObservabilityPage() {
-  const { t } = useI18n()
+  const { lang, t } = useI18n()
   const [days, setDays] = useState('30')
   const [atsType, setAtsType] = useState('')
   const observabilityUrl = `/api/admin/v1/observability?days=${days}${atsType ? `&atsType=${encodeURIComponent(atsType)}` : ''}`
@@ -143,12 +143,12 @@ export function ObservabilityPage() {
       <main style={{ padding: 20, display: 'flex', flexDirection: 'column', gap: 16 }}>
         {error && (
           <Card style={{ padding: 14, borderColor: 'rgba(220,38,38,0.25)', color: 'var(--c-danger)' }}>
-            {error}
+            {lang === 'zh' ? t('common.somethingWentWrong') : error}
           </Card>
         )}
         {platformError && (
           <Card style={{ padding: 14, borderColor: 'rgba(220,38,38,0.25)', color: 'var(--c-danger)' }}>
-            {platformError}
+            {lang === 'zh' ? t('common.somethingWentWrong') : platformError}
           </Card>
         )}
 

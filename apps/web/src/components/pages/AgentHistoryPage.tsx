@@ -160,7 +160,7 @@ function EventLog({ events }: { events: AgentRunEvent[] }) {
 }
 
 export function AgentHistoryPage() {
-  const { t } = useI18n()
+  const { lang, t } = useI18n()
   const { data, loading, error, refetch } = useApi<{ runs: AgentRunHistory[] }>('/api/agent/history')
   const [openRunId, setOpenRunId] = useState<string | null>(null)
   const runs = useMemo(() => data?.runs ?? [], [data])
@@ -187,7 +187,7 @@ export function AgentHistoryPage() {
     return (
       <div style={{ flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'center', background: 'var(--bg-tertiary)' }}>
         <div style={{ textAlign: 'center' }}>
-          <div style={{ fontSize: 13, color: '#A32D2D', marginBottom: 14 }}>{error}</div>
+          <div style={{ fontSize: 13, color: '#A32D2D', marginBottom: 14 }}>{lang === 'zh' ? t('common.somethingWentWrong') : error}</div>
           <Btn variant="ghost" onClick={refetch}>{t('common.retry')}</Btn>
         </div>
       </div>

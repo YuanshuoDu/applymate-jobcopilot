@@ -13,7 +13,7 @@ type Invitation = { id: string; email: string; status: string; expiresAt: string
 type Credential = { id: string; deviceName: string | null; deviceType: string | null; createdAt: string; lastUsedAt: string | null }
 
 export function AdminAccessPage({ canRevoke, canManage, canManageRoles = false, canReview = false, canManageWebAuthn = false }: { canRevoke: boolean; canManage: boolean; canManageRoles?: boolean; canReview?: boolean; canManageWebAuthn?: boolean }) {
-  const { t } = useI18n()
+  const { lang, t } = useI18n()
   const [items, setItems] = useState<Member[]>([])
   const [roles, setRoles] = useState<Role[]>([])
   const [notice, setNotice] = useState('')

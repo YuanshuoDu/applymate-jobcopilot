@@ -241,11 +241,11 @@ export function LandingPage({ plans = FALLBACK_PLANS }: { plans?: PublicPlan[] }
       setContactSent(true)
       setContactForm({ name: '', email: '', message: '' })
     } catch (error) {
-      setContactError(error instanceof Error ? error.message : 'We could not send your message. Please try again.')
+      setContactError(lang === 'zh' ? t('landing.contactError') : error instanceof Error ? error.message : t('landing.contactError'))
     } finally {
       setSending(false)
     }
-  }, [contactForm])
+  }, [contactForm, lang, t])
 
   return (
     <div style={{ background: C.bg, minHeight: '100vh', color: C.text, fontFamily: "'Inter', system-ui, sans-serif", overflowX: 'hidden' }}>
