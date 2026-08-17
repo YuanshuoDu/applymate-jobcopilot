@@ -627,59 +627,59 @@ export function AgentPage() {
         <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 16 }}>
           <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
             <ConfigCard title={t('agent.jobMatchingRules')}>
-              <SliderRow label="Minimum match score" value={cfg.minScore} min={40} max={100} onChange={v => set('minScore', v)} unit="%" />
+              <SliderRow label={t('agent.minMatchScore')} value={cfg.minScore} min={40} max={100} onChange={v => set('minScore', v)} unit="%" />
               <div style={{ padding: '10px 0', borderBottom: '0.5px solid var(--border)' }}>
-                <div style={{ fontSize: 11, color: 'var(--text-muted)', marginBottom: 6 }}>Target roles</div>
-                <PillInput values={cfg.targetRoles} onChange={v => set('targetRoles', v)} placeholder="Add role…" />
+                <div style={{ fontSize: 11, color: 'var(--text-muted)', marginBottom: 6 }}>{t('agent.targetRoles')}</div>
+                <PillInput values={cfg.targetRoles} onChange={v => set('targetRoles', v)} placeholder={t('agent.addRole')} />
               </div>
               <div style={{ padding: '10px 0', borderBottom: '0.5px solid var(--border)' }}>
-                <div style={{ fontSize: 11, color: 'var(--text-muted)', marginBottom: 6 }}>Target locations</div>
-                <PillInput values={cfg.targetLocations} onChange={v => set('targetLocations', v)} placeholder="Add location…" />
+                <div style={{ fontSize: 11, color: 'var(--text-muted)', marginBottom: 6 }}>{t('agent.targetLocations')}</div>
+                <PillInput values={cfg.targetLocations} onChange={v => set('targetLocations', v)} placeholder={t('agent.addLocation')} />
               </div>
-              <SliderRow label="Min salary" value={cfg.salaryMin} min={20000} max={150000} step={5000} onChange={v => set('salaryMin', v)} unit="€" />
-              <SliderRow label="Max salary" value={cfg.salaryMax} min={20000} max={150000} step={5000} onChange={v => set('salaryMax', v)} unit="€" />
+              <SliderRow label={t('agent.minSalary')} value={cfg.salaryMin} min={20000} max={150000} step={5000} onChange={v => set('salaryMin', v)} unit="€" />
+              <SliderRow label={t('agent.maxSalary')} value={cfg.salaryMax} min={20000} max={150000} step={5000} onChange={v => set('salaryMax', v)} unit="€" />
             </ConfigCard>
 
             <ConfigCard title={t('agent.applicationLimits')}>
               <div style={{ padding: '10px 0', borderBottom: '0.5px solid var(--border)', display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
-                <span style={{ fontSize: 12 }}>Max applications / day</span>
+                <span style={{ fontSize: 12 }}>{t('agent.maxApplications')}</span>
                 <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
                   <button onClick={() => set('maxPerDay', Math.max(1, cfg.maxPerDay - 1))} style={{ width: 24, height: 24, borderRadius: 4, border: '0.5px solid var(--border)', background: 'var(--bg-secondary)', cursor: 'pointer', fontSize: 14 }}>−</button>
                   <span style={{ fontSize: 13, fontWeight: 500, minWidth: 24, textAlign: 'center' }}>{cfg.maxPerDay}</span>
                   <button onClick={() => set('maxPerDay', Math.min(50, cfg.maxPerDay + 1))} style={{ width: 24, height: 24, borderRadius: 4, border: '0.5px solid var(--border)', background: 'var(--bg-secondary)', cursor: 'pointer', fontSize: 14 }}>+</button>
                 </div>
               </div>
-              <Toggle label="Skip if already processed today" sub="Deduplication is enforced by the server for every source" value={true} onChange={() => undefined} disabled />
+              <Toggle label={t('agent.skipProcessed')} sub={t('agent.deduplication')} value={true} onChange={() => undefined} disabled />
             </ConfigCard>
           </div>
 
           <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
             <ConfigCard title={t('agent.settings')}>
-              <Toggle label="Auto-prepare when match ≥ min score" sub="Searches, scores, and prepares materials in parallel; it never submits a job." value={cfg.autoApply} onChange={v => set('autoApply', v)} />
-              <Toggle label="Review and final authorization" sub="Always required before a browser task starts. CAPTCHA, login, and MFA require your takeover." value={true} onChange={() => undefined} disabled />
-              <Toggle label="Auto-generate cover letter" sub="AI writes a tailored cover letter per job" value={cfg.autoCoverLetter} onChange={v => set('autoCoverLetter', v)} />
+              <Toggle label={t('agent.autoPrepare')} sub={t('agent.autoPrepareHint')} value={cfg.autoApply} onChange={v => set('autoApply', v)} />
+              <Toggle label={t('agent.finalAuthorization')} sub={t('agent.finalAuthorizationHint')} value={true} onChange={() => undefined} disabled />
+              <Toggle label={t('agent.autoCoverLetter')} sub={t('agent.coverLetterHint')} value={cfg.autoCoverLetter} onChange={v => set('autoCoverLetter', v)} />
               {cfg.autoCoverLetter && (
                 <div style={{ padding: '10px 0', borderBottom: '0.5px solid var(--border)', display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
-                  <span style={{ fontSize: 12 }}>Cover letter tone</span>
+                  <span style={{ fontSize: 12 }}>{t('agent.coverTone')}</span>
                   <select value={cfg.coverTone} onChange={e => set('coverTone', e.target.value)}
                     style={{ fontSize: 11, padding: '3px 6px', border: '0.5px solid var(--border)', borderRadius: 5, background: 'var(--bg)', color: 'var(--text)', outline: 'none' }}>
-                    <option value="professional">Professional</option>
-                    <option value="confident">Confident</option>
-                    <option value="concise">Concise</option>
+                    <option value="professional">{t('agent.professional')}</option>
+                    <option value="confident">{t('agent.confident')}</option>
+                    <option value="concise">{t('agent.concise')}</option>
                   </select>
                 </div>
               )}
-              <Toggle label="Use tailored CV per role" sub="Logs missing keywords for each application" value={cfg.useTailoredCV} onChange={v => set('useTailoredCV', v)} />
+              <Toggle label={t('agent.tailoredCv')} sub={t('agent.tailoredCvHint')} value={cfg.useTailoredCV} onChange={v => set('useTailoredCV', v)} />
             </ConfigCard>
 
             <ConfigCard title={t('agent.notifications')}>
-              <Toggle label="Notify on auto-apply"  value={cfg.notifyApply}      onChange={v => set('notifyApply', v)} />
-              <Toggle label="Notify on rejection"    value={cfg.notifyReject}     onChange={v => set('notifyReject', v)} />
-              <Toggle label="Weekly summary email"   value={cfg.weeklySummary}    onChange={v => set('weeklySummary', v)} />
-              <Toggle label="Follow-up reminders"    value={cfg.followUpReminder} onChange={v => set('followUpReminder', v)} />
+              <Toggle label={t('agent.notifyApply')} value={cfg.notifyApply} onChange={v => set('notifyApply', v)} />
+              <Toggle label={t('agent.notifyReject')} value={cfg.notifyReject} onChange={v => set('notifyReject', v)} />
+              <Toggle label={t('agent.weeklySummary')} value={cfg.weeklySummary} onChange={v => set('weeklySummary', v)} />
+              <Toggle label={t('agent.followUpReminders')} value={cfg.followUpReminder} onChange={v => set('followUpReminder', v)} />
               {cfg.followUpReminder && (
                 <div style={{ padding: '8px 0', display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
-                  <span style={{ fontSize: 11, color: 'var(--text-muted)' }}>Remind after (days)</span>
+                  <span style={{ fontSize: 11, color: 'var(--text-muted)' }}>{t('agent.remindAfter')}</span>
                   <input type="number" value={cfg.followUpDays} min={1} max={30} onChange={e => set('followUpDays', Number(e.target.value))}
                     style={{ width: 48, padding: '3px 6px', fontSize: 11, border: '0.5px solid var(--border)', borderRadius: 5, background: 'var(--bg)', color: 'var(--text)', outline: 'none' }} />
                 </div>
@@ -688,14 +688,14 @@ export function AgentPage() {
 
             <ConfigCard title={t('agent.aiModel')}>
               <div style={{ padding: '10px 0', borderBottom: '0.5px solid var(--border)', display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
-                <span style={{ fontSize: 12 }}>Active model</span>
+                <span style={{ fontSize: 12 }}>{t('agent.activeModel')}</span>
                 <ModelSelector
                   value={{ provider: cfg.aiProvider, model: cfg.aiModel }}
                   onChange={v => { set('aiProvider', v.provider); set('aiModel', v.model) }}
                 />
               </div>
               <div style={{ padding: '8px 0' }}>
-                <div style={{ fontSize: 10, color: 'var(--text-muted)' }}>API Key (optional — uses server key if empty)</div>
+                <div style={{ fontSize: 10, color: 'var(--text-muted)' }}>{t('agent.apiKeyOptional')}</div>
                 <input type="password" value={cfg.aiApiKey} onChange={e => set('aiApiKey', e.target.value)} placeholder="sk-…"
                   style={{ width: '100%', marginTop: 4, padding: '5px 8px', fontSize: 11, border: '0.5px solid var(--border)', borderRadius: 5, background: 'var(--bg)', color: 'var(--text)', outline: 'none', boxSizing: 'border-box' }} />
               </div>
@@ -704,22 +704,22 @@ export function AgentPage() {
         </div>
 
         <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 16 }}>
-          <ConfigCard title="Companies to Avoid">
+          <ConfigCard title={t('agent.companiesAvoid')}>
             <div style={{ padding: '10px 0' }}>
-              <PillInput values={cfg.excludeCompanies} onChange={v => set('excludeCompanies', v)} placeholder="Add company…" />
+              <PillInput values={cfg.excludeCompanies} onChange={v => set('excludeCompanies', v)} placeholder={t('agent.addCompany')} />
             </div>
           </ConfigCard>
-          <ConfigCard title="Priority Companies (Always Apply)">
+          <ConfigCard title={t('agent.priorityCompanies')}>
             <div style={{ padding: '10px 0' }}>
-              <PillInput values={cfg.priorityCompanies} onChange={v => set('priorityCompanies', v)} placeholder="Add company…" />
+              <PillInput values={cfg.priorityCompanies} onChange={v => set('priorityCompanies', v)} placeholder={t('agent.addCompany')} />
             </div>
           </ConfigCard>
         </div>
 
         <div style={{ display: 'flex', gap: 8, justifyContent: 'flex-end', paddingBottom: 8 }}>
-          <Btn variant="ghost" onClick={() => { setCfg(DEFAULT_CFG); toast.info('Reset', 'Settings restored to defaults') }}>Reset to defaults</Btn>
+          <Btn variant="ghost" onClick={() => { setCfg(DEFAULT_CFG); toast.info(t('agent.reset'), t('agent.resetDetail')) }}>{t('agent.resetDefaults')}</Btn>
           <Btn variant="primary" onClick={saveConfig} disabled={saving}>
-            {saving ? 'Saving…' : 'Save changes'}
+            {saving ? t('common.saving') : t('agent.saveChanges')}
           </Btn>
         </div>
       </div>
