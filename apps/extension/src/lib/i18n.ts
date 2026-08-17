@@ -294,6 +294,26 @@ const zh: Record<string, string> = {
   "Your profile data stays private — it's only used for this form fill.": '你的画像数据会保持私密，仅用于本次表单填写。',
   'Field summary': '字段摘要',
   'fields total': '个字段总计',
+  'Save to ApplyMate': '保存到 ApplyMate',
+  'Scanning…': '扫描中……',
+  'No job found': '未找到职位',
+  'Log in first': '请先登录',
+  Error: '错误',
+  'No connection': '无法连接',
+  'Saved to ApplyMate': '已保存到 ApplyMate',
+  'Reading job details…': '正在读取职位详情……',
+  'ApplyMate actions': 'ApplyMate 操作',
+  Close: '关闭',
+  'Open Side Panel': '打开侧边栏',
+  'Review the job before any application is submitted.': '提交任何申请前，请先审核职位。',
+  'Matching…': '匹配中……',
+  'Matching failed.': '匹配失败。',
+  'Open the job details first so ApplyMate can read the full description.': '请先打开职位详情，让 ApplyMate 读取完整描述。',
+  'Could not save this job.': '无法保存此职位。',
+  'Open ApplyMate actions': '打开 ApplyMate 操作',
+  'Saving to ApplyMate': '正在保存到 ApplyMate',
+  'Open ApplyMate actions — saved': '打开 ApplyMate 操作——已保存',
+  'Save failed — click to retry': '保存失败——点击重试',
 }
 
 export const EXTENSION_TRANSLATION_KEYS = Object.keys(zh)
@@ -332,4 +352,8 @@ export function translateExtension(lang: ExtensionLang, english: string): string
   const generating = english.match(/^Generating answers for (\d+) fields$/)
   if (generating) return `正在为 ${generating[1]} 个字段生成答案`
   return english
+}
+
+export function getExtensionLanguage(): ExtensionLang {
+  return getExtensionLang()
 }

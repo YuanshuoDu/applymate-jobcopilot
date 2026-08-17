@@ -323,7 +323,7 @@ export function LandingPage({ plans = FALLBACK_PLANS }: { plans?: PublicPlan[] }
             <div style={{ width: 32, height: 32, borderRadius: 10, background: 'linear-gradient(135deg, #4F46E5, #7C3AED)', display: 'flex', alignItems: 'center', justifyContent: 'center', color: '#fff', fontSize: 14, fontWeight: 800, boxShadow: '0 4px 16px rgba(79,70,229,0.55)', animation: 'pulseGlow 3s ease-in-out infinite' }}>A</div>
             <div>
               <div style={{ fontSize: 14, fontWeight: 700, color: '#fff', lineHeight: 1.1 }}>ApplyMate AI</div>
-              <div style={{ fontSize: 9, color: C.textSubtle, lineHeight: 1 }}>Job Copilot · Europe</div>
+              <div style={{ fontSize: 9, color: C.textSubtle, lineHeight: 1 }}>{t('landing.jobCopilotEurope')}</div>
             </div>
           </div>
 
@@ -705,8 +705,8 @@ export function LandingPage({ plans = FALLBACK_PLANS }: { plans?: PublicPlan[] }
         </div>
 
         <div style={{ maxWidth: 1140, margin: '32px auto 0', paddingTop: 24, borderTop: '1px solid rgba(255,255,255,0.06)', display: 'flex', flexWrap: 'wrap', gap: 12, justifyContent: 'space-between', alignItems: 'center' }}>
-          <div style={{ fontSize: 12, color: C.textSubtle }}>© 2026 ApplyMate AI. All rights reserved.</div>
-          <div style={{ fontSize: 12, color: C.textSubtle }}>Made with ❤️ for European job seekers · 🇪🇺</div>
+          <div style={{ fontSize: 12, color: C.textSubtle }}>© 2026 ApplyMate AI. {t('landing.allRightsReserved')}</div>
+          <div style={{ fontSize: 12, color: C.textSubtle }}>{t('landing.madeForSeekers')}</div>
         </div>
       </footer>
     </div>

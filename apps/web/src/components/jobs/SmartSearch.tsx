@@ -825,7 +825,7 @@ export function SmartSearch({ onJobSaved, onOpenSettings }: { onJobSaved?: () =>
                                   onMouseEnter={e => { if (!savingIds.has(r.id)) { e.currentTarget.style.borderColor = 'rgba(79,70,229,0.35)'; e.currentTarget.style.color = 'var(--primary)' } }}
                                   onMouseLeave={e => { e.currentTarget.style.borderColor = 'var(--border)'; e.currentTarget.style.color = 'var(--text-muted)' }}>
                                   {savingIds.has(r.id)
-                                    ? <><span style={{ width: 13, height: 13, border: '2px solid rgba(79,70,229,0.2)', borderTopColor: 'var(--primary)', borderRadius: '50%', animation: 'spin 0.7s linear infinite', display: 'inline-block' }} />Saving…</>
+                                    ? <><span style={{ width: 13, height: 13, border: '2px solid rgba(79,70,229,0.2)', borderTopColor: 'var(--primary)', borderRadius: '50%', animation: 'spin 0.7s linear infinite', display: 'inline-block' }} />{t('jobs.saving')}</>
                                   : <>{Icon.Bookmark()}{t('jobs.saveToTracker')}</>}
                                 </button>
                               )}

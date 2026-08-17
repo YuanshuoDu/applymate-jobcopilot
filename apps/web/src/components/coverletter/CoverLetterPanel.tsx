@@ -370,10 +370,10 @@ export function CoverLetterPanel({ job, resumeContent, resumeName, templateId, t
           alignItems:    'center',
         }}>
           <Btn small variant="primary" onClick={handleSave} disabled={!activeId || saving}>
-            {saving ? 'Saving…' : t('coverLetter.panel.save')}
+            {saving ? t('coverLetter.panel.saving') : t('coverLetter.panel.save')}
           </Btn>
           <Btn small variant="success" onClick={handleSetFinal} disabled={!activeId || assigning}>
-            {assigning ? 'Setting…' : t('coverLetter.panel.setFinal')}
+            {assigning ? t('coverLetter.panel.setting') : t('coverLetter.panel.setFinal')}
           </Btn>
           <Btn small variant="glass" onClick={() => setPreviewing(value => !value)} disabled={!activeCL}>
             {previewing ? t('coverLetter.panel.edit') : t('coverLetter.panel.preview')}

@@ -313,17 +313,17 @@ export function AdzunaSearchPanel({ variant = 'panel', onJobSaved, onClose }: Pr
                           {scoringIds.has(r.id) ? (
                             <span style={{ fontSize: 10, color: 'var(--text-muted)', display: 'flex', alignItems: 'center', gap: 4 }}>
                               <span style={{ display: 'inline-block', width: 10, height: 10, border: '1.5px solid rgba(79,70,229,0.30)', borderTopColor: 'var(--primary)', borderRadius: '50%', animation: 'spin 0.7s linear infinite' }} />
-                              Scoring…
+                              {t('jobs.scoring')}
                             </span>
                           ) : scores[r.id] !== undefined ? (
                             <ScorePill score={scores[r.id]} />
                           ) : (
-                            <span style={{ fontSize: 10, color: 'var(--c-success)', fontWeight: 500 }}>✓ Saved</span>
+                            <span style={{ fontSize: 10, color: 'var(--c-success)', fontWeight: 500 }}>✓ {t('jobs.saved')}</span>
                           )}
                         </div>
                       ) : (
                         <Btn small variant="primary" disabled={savingIds.has(r.id)} onClick={() => saveJob(r)}>
-                          {savingIds.has(r.id) ? 'Saving…' : '+ Save'}
+                          {savingIds.has(r.id) ? t('jobs.saving') : `+ ${t('jobs.save')}`}
                         </Btn>
                       )}
                       <a href={r.url} target="_blank" rel="noopener noreferrer"

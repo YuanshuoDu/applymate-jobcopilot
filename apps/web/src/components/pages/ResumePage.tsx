@@ -272,6 +272,7 @@ function ResumePreview({ content, templateId, templateOptions }: {
   templateId:      string
   templateOptions: TemplateOptions
 }) {
+  const { t } = useI18n()
   const innerRef                    = useRef<HTMLDivElement>(null)
   const [height, setHeight]         = useState(0)
   const [fit,    setFit]            = useState<PageFit | null>(null)
@@ -302,7 +303,7 @@ function ResumePreview({ content, templateId, templateOptions }: {
               <span style={{ fontSize: 18, lineHeight: 1 }}>📝</span>
               <div>
                 <div style={{ fontSize: 12, fontWeight: 600, color: 'var(--c-danger)' }}>Resume is too sparse — {Math.round(fit.ratio * 100)}% of a page</div>
-                <div style={{ fontSize: 11, color: 'var(--c-danger)', opacity: 0.75, marginTop: 2 }}>Add more experience bullets, skills, or expand your summary to fill the page</div>
+                <div style={{ fontSize: 11, color: 'var(--c-danger)', opacity: 0.75, marginTop: 2 }}>{t('resume.addMoreHint')}</div>
               </div>
             </div>
           )}
@@ -1487,7 +1488,7 @@ export function ResumePage() {
           if (!selectedResumeId || !content) { toast.info('Select a resume first'); return }
           setShowFinalConfirm(true)
         }}><ShieldCheck size={15} />{t('resume.finalConfirm')}</Btn></div>
-        <span className={`resume-top-save${dirty ? ' is-unsaved' : ''}`}>{saving ? 'Saving…' : dirty ? 'Saving soon' : lastSavedAt && Date.now() - lastSavedAt.getTime() >= 5 * 60_000 ? `Saved ${lastSavedAt.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}` : 'Saved just now'}</span>
+        <span className={`resume-top-save${dirty ? ' is-unsaved' : ''}`}>{saving ? t('resume.savingStatus') : dirty ? t('resume.savingSoon') : lastSavedAt && Date.now() - lastSavedAt.getTime() >= 5 * 60_000 ? `${t('resume.savedAt')} ${lastSavedAt.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}` : t('resume.savedJustNow')}</span>
       </div>
       </header>
 
@@ -1495,12 +1496,12 @@ export function ResumePage() {
         <div style={{ flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'center', background: 'var(--bg-tertiary)' }}>
           <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 10 }}>
             <div style={{ width: 28, height: 28, border: '2.5px solid rgba(79,70,229,0.20)', borderTopColor: 'var(--primary)', borderRadius: '50%', animation: 'spin 0.7s linear infinite' }} />
-            <div style={{ fontSize: 12, color: 'var(--text-muted)' }}>Loading resume…</div>
+            <div style={{ fontSize: 12, color: 'var(--text-muted)' }}>{t('resume.loading')}</div>
           </div>
         </div>
       ) : !content ? (
         <div style={{ flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'center', background: 'var(--bg-tertiary)' }}>
-          <div style={{ textAlign: 'center', color: 'var(--text-muted)', fontSize: 13 }}>Select or create a resume to get started.</div>
+          <div style={{ textAlign: 'center', color: 'var(--text-muted)', fontSize: 13 }}>{t('resume.selectOrCreate')}</div>
         </div>
       ) : (
         <div className={`resume-library-layout${libraryCollapsed ? ' is-library-collapsed' : ''}`} style={{ flex: 1, display: 'flex', overflow: 'hidden', background: 'var(--bg-tertiary)' }}>
@@ -1554,7 +1555,7 @@ export function ResumePage() {
               <span className="resume-library-file-icon"><Upload size={18} strokeWidth={1.7} /></span>
               <span className="resume-library-import-copy">
                 <strong>{libraryImportDragOver ? 'Drop to import your resume' : 'Drop a PDF or DOCX to import'}</strong>
-                <small>PDF or DOCX · up to 5 MB</small>
+                <small>{t('resume.pdfDocxLimit')}</small>
               </span>
             </div>
             </>}
@@ -1563,7 +1564,7 @@ export function ResumePage() {
             {/* Empty-state banner: no directions set up */}
             {directions.length === 0 && (
               <div style={{ padding: '8px 12px', background: 'rgba(217,119,6,0.06)', border: '0.5px solid rgba(217,119,6,0.20)', borderRadius: 7, marginBottom: 12, fontSize: 11, color: 'var(--c-warning)', display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
-                <span>Looks like you haven&apos;t set up your directions yet.</span>
+                <span>{t('resume.directionsMissing')}</span>
                 <button
                   onClick={() => toast.info('Setup', 'Go to Settings → Profile to restart onboarding')}
                   style={{ fontSize: 10, color: 'var(--primary)', background: 'none', border: 'none', cursor: 'pointer', textDecoration: 'underline' }}
@@ -1677,7 +1678,7 @@ export function ResumePage() {
               </div>
             </> : <>
               <strong>{t('resume.linkSavedJob')}</strong>
-              <span>AI will tailor this resume to the opportunity you choose.</span>
+              <span>{t('resume.aiTailorOpportunity')}</span>
               <select value={selectedJobId ?? ''} onChange={e => setSelectedJobId(e.target.value || null)}>
                 <option value="">{t('resume.chooseSavedJob')}</option>
                 {jobs.map(job => <option key={job.id} value={job.id}>{job.company} · {job.role}</option>)}
@@ -1745,11 +1746,11 @@ export function ResumePage() {
             </div>
             <div style={{ flex: 1, overflowY: 'auto' }}>
               {loadingVers ? (
-                <div style={{ textAlign: 'center', padding: 30, fontSize: 12, color: 'var(--text-muted)' }}>Loading versions…</div>
+                <div style={{ textAlign: 'center', padding: 30, fontSize: 12, color: 'var(--text-muted)' }}>{t('resume.versionsLoading')}</div>
               ) : versions.length === 0 ? (
                 <div style={{ textAlign: 'center', padding: 30 }}>
                   <div style={{ fontSize: 13, fontWeight: 500, marginBottom: 4 }}>{t('resume.noVersionsShort')}</div>
-                  <div style={{ fontSize: 11, color: 'var(--text-muted)' }}>Versions are created automatically when you save your resume.</div>
+                  <div style={{ fontSize: 11, color: 'var(--text-muted)' }}>{t('resume.versionsAuto')}</div>
                 </div>
               ) : (
                 <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>

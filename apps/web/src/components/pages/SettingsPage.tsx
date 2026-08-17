@@ -667,7 +667,7 @@ export function SettingsPage() {
                 </div>
               )}
               {accountsLoading && (
-                <div style={{ margin: '8px 0 12px', fontSize: 11, color: 'var(--text-muted)' }}>Checking connected accounts…</div>
+                <div style={{ margin: '8px 0 12px', fontSize: 11, color: 'var(--text-muted)' }}>{t('settings.checkingAccounts')}</div>
               )}
               <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
                 {accounts.map(acc => {
@@ -688,7 +688,7 @@ export function SettingsPage() {
                         <div style={{ fontSize: 10, color: 'var(--text-muted)' }}>
                           {acc.connected
                             ? gmailNeedsFix
-                              ? <span>Gmail API access failed. Token scopes: <code style={{ fontSize: 9, background: 'var(--bg-tertiary)', padding: '1px 4px', borderRadius: 3 }}>{gmailHealth.scopes || '(none)'}</code></span>
+                             ? <span>{t('settings.gmailApiFailed')} <code style={{ fontSize: 9, background: 'var(--bg-tertiary)', padding: '1px 4px', borderRadius: 3 }}>{gmailHealth.scopes || t('settings.none')}</code></span>
                               : acc.account
                             : acc.desc}
                         </div>
@@ -709,7 +709,7 @@ export function SettingsPage() {
                                Re-link Gmail
                              </Btn>
                            ) : (
-                             <span style={{ fontSize: 10, color: 'var(--c-success)', background: 'rgba(5,150,105,0.12)', borderRadius: 999, padding: '2px 8px' }}>● Connected</span>
+                             <span style={{ fontSize: 10, color: 'var(--c-success)', background: 'rgba(5,150,105,0.12)', borderRadius: 999, padding: '2px 8px' }}>● {t('settings.connected')}</span>
                            )}
                             {acc.disconnectable !== false && (
                               <Btn small variant="danger" disabled={accountsLoading || accountAction !== null} onClick={() => void disconnectAccount(acc.id, acc.name)}>
@@ -792,7 +792,7 @@ export function SettingsPage() {
                 <Btn variant="ghost" onClick={() => openBillingSupport('manage billing')}>{t('settings.contactBilling')}</Btn>
               </SettingsSection>
 
-              {billingLoading && !billingData && <Card style={{ padding: 16, color: 'var(--text-muted)', fontSize: 12 }}>Loading plans…</Card>}
+              {billingLoading && !billingData && <Card style={{ padding: 16, color: 'var(--text-muted)', fontSize: 12 }}>{t('settings.loadingPlans')}</Card>}
               {billingError && !billingData && <Card style={{ padding: 16, color: 'var(--c-danger)', fontSize: 12 }}>{billingError}</Card>}
               {billingData && <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(min(100%, 200px), 1fr))', gap: 12 }}>
                 {billingData.plans.map(plan => {
@@ -874,7 +874,7 @@ export function SettingsPage() {
                   <Btn variant="ghost" disabled={exporting} onClick={() => void downloadUserData()}>{exporting ? 'Preparing export...' : 'Download my data'}</Btn>
                   <Btn variant="ghost" disabled={deletionRequested} onClick={() => void requestDataDeletion()}>{deletionRequested ? 'Deletion requested' : 'Request data deletion'}</Btn>
                 </div>
-                {deletionRequested && <div style={{ marginTop: 8, fontSize: 10, color: 'var(--text-muted)' }}>Your request is recorded. Support will follow up with the retention timeline.</div>}
+                {deletionRequested && <div style={{ marginTop: 8, fontSize: 10, color: 'var(--text-muted)' }}>{t('settings.deletionRecorded')}</div>}
               </SettingsSection>
 
               <Card style={{ padding: 16, border: '0.5px solid rgba(163,45,45,0.3)', background: 'rgba(163,45,45,0.03)' }}>
@@ -1079,7 +1079,7 @@ function ApiKeysSettings() {
     )
   }
 
-  if (loading) return <div style={{ padding: 24, color: 'var(--text-muted)', fontSize: 13 }}>Loading API key status...</div>
+  if (loading) return <div style={{ padding: 24, color: 'var(--text-muted)', fontSize: 13 }}>{t('settings.apiKeyStatusLoading')}</div>
   if (loadError) return <div style={{ padding: 14, color: 'var(--c-danger)', fontSize: 12, background: 'rgba(220,38,38,0.08)', borderRadius: 8 }}>{loadError}</div>
 
   return (
@@ -1097,8 +1097,8 @@ function ApiKeysSettings() {
           </span>
         </div>
         <div style={{ display: 'grid', gap: 10, padding: '8px 0 4px', fontSize: 11, color: 'var(--text-muted)', lineHeight: 1.55 }}>
-          <div><strong style={{ color: 'var(--text)' }}>Adzuna</strong> — direct European job listings. Requires an App ID and App Key.</div>
-          <div><strong style={{ color: 'var(--text)' }}>RapidAPI</strong> — provider marketplace used for JSearch and other job sources. Requires one API Key.</div>
+          <div><strong style={{ color: 'var(--text)' }}>Adzuna</strong> — {t('settings.adzunaDescription')}</div>
+          <div><strong style={{ color: 'var(--text)' }}>RapidAPI</strong> — {t('settings.rapidApiDescription')}</div>
         </div>
         <SecretField id="adzunaAppId" label="Adzuna App ID" value={adzunaAppId} onChange={setAdzunaAppId} saved={hasSavedDiscoveryKey(status, 'adzuna')} />
         <SecretField id="adzunaAppKey" label="Adzuna App Key" value={adzunaAppKey} onChange={setAdzunaAppKey} saved={hasSavedDiscoveryKey(status, 'adzuna')} />
@@ -1460,7 +1460,7 @@ function AiModelSettings() {
         {saving ? t('settings.ai.saving') : t('settings.ai.saveBtn')}
       </Btn>
       {customConfigInvalid && (
-        <div style={{ fontSize: 11, color: 'var(--c-danger)' }}>Complete each custom model ID and HTTPS endpoint before saving.</div>
+        <div style={{ fontSize: 11, color: 'var(--c-danger)' }}>{t('settings.customModelIncomplete')}</div>
       )}
     </div>
   )

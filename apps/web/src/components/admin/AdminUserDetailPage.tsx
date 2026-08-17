@@ -10,6 +10,7 @@ import { editablePrivacyPreferences, isPrivacyPreferenceAvailable } from '@/lib/
 import { useAdminPrompt } from './AdminPromptDialog'
 import { AdminUserApiKeysPanel } from './AdminUserApiKeysPanel'
 import { adminMutationHeaders } from '@/lib/admin/client'
+import { useI18n } from '@/lib/i18n'
 
 type Detail = {
   user: {
@@ -42,6 +43,7 @@ function dateTimeLocal(value: string | null | undefined) {
 }
 
 function AccountOperations({ userId, user, permissions }: { userId: string; user: Detail['user']; permissions: readonly string[] }) {
+  const { t } = useI18n()
   const [status, setStatus] = useState(user.accountStatus)
   const [plan, setPlan] = useState(user.plan)
   const [subscription, setSubscription] = useState<Subscription | null>(null)
@@ -139,12 +141,12 @@ function AccountOperations({ userId, user, permissions }: { userId: string; user
   const canRestore = permissions.includes('users.restore')
   const canPlan = permissions.includes('billing.update') && permissions.includes('billing.read')
   const canOverride = permissions.includes('users.feature_override')
-  return <><section className="admin-detail-operations"><div className="admin-settings-heading"><div><h2>Account operations</h2><p>Core administrators can manage access, package settings and lifecycle state. Every write is audited.</p></div><span role="status">{notice}{reauthRequired && <> <Link href="/admin/security">Open Security controls to reauthenticate</Link>, then retry.</>}</span></div><div className="admin-operation-grid">
-    <label>Account state<select value={status} disabled={busy || (status === 'active' ? !canSuspend : !canRestore)} onChange={event => { const next = event.target.value as 'active' | 'suspended'; setStatus(next); void mutate(`/api/admin/v1/users/${userId}/account-state`, { status: next }, next === 'suspended' ? 'Account suspended.' : 'Account restored.') }}><option value="active">Active</option><option value="suspended">Suspended</option></select></label>
-    <label>Commercial plan<select value={plan} disabled={busy || !canPlan} onChange={event => setPlan(event.target.value)}><option value="free">Free</option><option value="pro">Pro</option><option value="enterprise">Enterprise</option></select></label>
-    {canPlan && <label>Subscription state<select value={subscriptionStatus} disabled={busy} onChange={event => setSubscriptionStatus(event.target.value as Subscription['status'])}><option value="trialing">Trialing</option><option value="active">Active</option><option value="past_due">Past due</option><option value="cancelled">Cancelled</option><option value="expired">Expired</option></select></label>}
-    {canPlan && <label>Trial ends<input type="datetime-local" value={trialEndsAt} disabled={busy || subscriptionStatus !== 'trialing'} onChange={event => setTrialEndsAt(event.target.value)} /></label>}
-    {canPlan && <label>Current period ends<input type="datetime-local" value={currentPeriodEnd} disabled={busy} onChange={event => setCurrentPeriodEnd(event.target.value)} /></label>}
+  return <><section className="admin-detail-operations"><div className="admin-settings-heading"><div><h2>{t('adminDetail.accountOperations')}</h2><p>{t('adminDetail.accountOperationsDescription')}</p></div><span role="status">{notice}{reauthRequired && <> <Link href="/admin/security">{t('adminDetail.openSecurity')}</Link>, then retry.</>}</span></div><div className="admin-operation-grid">
+    <label>{t('adminDetail.accountState')}<select value={status} disabled={busy || (status === 'active' ? !canSuspend : !canRestore)} onChange={event => { const next = event.target.value as 'active' | 'suspended'; setStatus(next); void mutate(`/api/admin/v1/users/${userId}/account-state`, { status: next }, next === 'suspended' ? t('admin.suspended') : t('admin.active')) }}><option value="active">{t('admin.active')}</option><option value="suspended">{t('admin.suspended')}</option></select></label>
+    <label>{t('adminDetail.commercialPlan')}<select value={plan} disabled={busy || !canPlan} onChange={event => setPlan(event.target.value)}><option value="free">Free</option><option value="pro">Pro</option><option value="enterprise">Enterprise</option></select></label>
+    {canPlan && <label>{t('adminDetail.subscriptionState')}<select value={subscriptionStatus} disabled={busy} onChange={event => setSubscriptionStatus(event.target.value as Subscription['status'])}><option value="trialing">{t('adminDetail.trialing')}</option><option value="active">{t('admin.active')}</option><option value="past_due">{t('adminDetail.pastDue')}</option><option value="cancelled">{t('adminDetail.cancelled')}</option><option value="expired">{t('adminDetail.expired')}</option></select></label>}
+    {canPlan && <label>{t('adminDetail.trialEnds')}<input type="datetime-local" value={trialEndsAt} disabled={busy || subscriptionStatus !== 'trialing'} onChange={event => setTrialEndsAt(event.target.value)} /></label>}
+    {canPlan && <label>{t('adminDetail.currentPeriodEnds')}<input type="datetime-local" value={currentPeriodEnd} disabled={busy} onChange={event => setCurrentPeriodEnd(event.target.value)} /></label>}
   </div>{canPlan && <div className="admin-inline-actions"><label className="admin-operation-checkbox"><input type="checkbox" checked={cancelAtPeriodEnd} disabled={busy} onChange={event => setCancelAtPeriodEnd(event.target.checked)} /> Cancel at period end</label><button type="button" className="admin-secondary" disabled={busy} onClick={() => void saveSubscription()}>Save package settings</button></div>}{canOverride && <><h3>User permissions</h3><p className="admin-operation-help">Grant, deny or temporarily limit a user feature independently from the commercial package. Removing an override returns to package permissions.</p><form className="admin-operation-form" onSubmit={event => { event.preventDefault(); void mutate(`/api/admin/v1/users/${userId}/feature-overrides`, { featureKey, enabled, limit: limit ? Number(limit) : null, expiresAt: expiresAt || null }, 'User permission saved.') }}><input value={featureKey} onChange={event => setFeatureKey(event.target.value)} placeholder="Permission key, e.g. auto_apply" required /><label><input type="checkbox" checked={enabled} onChange={event => setEnabled(event.target.checked)} /> Granted</label><input type="number" min="0" value={limit} onChange={event => setLimit(event.target.value)} placeholder="Limit" /><input type="datetime-local" value={expiresAt} onChange={event => setExpiresAt(event.target.value)} /><button className="admin-secondary" disabled={busy}>Save permission</button></form><div className="admin-override-list">{overrides.length === 0 ? <span>No user permission overrides.</span> : overrides.map(item => <span key={item.id}>{item.featureKey}: {item.enabled ? 'granted' : 'denied'}{item.limit === null ? '' : ` · limit ${item.limit}`}{item.expiresAt ? ` · expires ${new Date(item.expiresAt).toLocaleDateString()}` : ''}<button type="button" className="admin-chip-remove" disabled={busy} onClick={() => void removeOverride(item)}>Remove</button></span>)}</div></>}{permissions.includes('billing.read') && <section className="admin-detail-history"><h3>Plan change history</h3><div className="admin-table-wrap"><table className="admin-table"><thead><tr><th>From</th><th>To</th><th>Reason</th><th>Actor</th><th>Time</th></tr></thead><tbody>{planHistory.length === 0 ? <tr><td colSpan={5}>No plan changes.</td></tr> : planHistory.map(change => <tr key={change.id}><td>{change.fromPlan}</td><td>{change.toPlan}</td><td>{change.reason}</td><td>{change.actorUserId}</td><td>{new Date(change.createdAt).toLocaleString()}</td></tr>)}</tbody></table></div></section>}</section>{dialog}</>
 }
 
@@ -195,6 +197,7 @@ function ToggleList<T extends object>({ labels, values, disabled, onChange, isAv
 }
 
 function SettingsPanel({ userId, canUpdatePreferences }: { userId: string; canUpdatePreferences: boolean }) {
+  const { t } = useI18n()
   const { data, loading, error, refetch } = useApi<SettingsResponse>(`/api/admin/v1/users/${userId}/settings`, { cache: false })
   const [draft, setDraft] = useState<Preferences | null>(null)
   const [saving, setSaving] = useState(false)
@@ -249,6 +252,7 @@ function SettingsPanel({ userId, canUpdatePreferences }: { userId: string; canUp
 }
 
 export function AdminUserDetailPage({ userId, canUpdatePreferences, permissions = [] }: { userId: string; canUpdatePreferences: boolean; permissions?: readonly string[] }) {
+  const { t } = useI18n()
   const { data, loading, error } = useApi<Detail>(`/api/admin/v1/users/${userId}`)
   const user = data?.user
   return <div className="admin-page"><header className="admin-header"><div><Link prefetch={false} className="admin-back" href="/admin/users"><ArrowLeft size={16} /> Users</Link><h1>{loading ? 'Loading user...' : user?.name ?? 'User'}</h1><p>Masked account metadata and safe operational history</p></div><div className="admin-header-time"><CalendarDays size={18} /> Internal console</div></header>

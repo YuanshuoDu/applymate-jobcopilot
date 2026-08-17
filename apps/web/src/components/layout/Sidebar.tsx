@@ -125,7 +125,7 @@ export function Sidebar({ active, onNav, onNavIntent, session, jobCount: jobCoun
               background: 'var(--brand-gradient)',
               WebkitBackgroundClip: 'text', WebkitTextFillColor: 'transparent', backgroundClip: 'text',
             }}>ApplyMate AI</div>
-            <div style={{ fontSize: 10, color: 'var(--text-subtle)', lineHeight: 1.2, marginTop: 1 }}>Job Copilot · Europe</div>
+            <div style={{ fontSize: 10, color: 'var(--text-subtle)', lineHeight: 1.2, marginTop: 1 }}>{t('landing.jobCopilotEurope')}</div>
           </div>
         </div>
       </div>
