@@ -3,6 +3,7 @@
 import React from 'react'
 import { Btn } from '@/components/ui'
 import { useNav } from '@/lib/nav-context'
+import { useI18n } from '@/lib/i18n'
 
 interface Props {
   hasResume: boolean
@@ -14,27 +15,18 @@ const STEPS = [
   {
     key: 'resume',
     icon: '📄',
-    title: 'Create your first resume',
-    desc: 'AI will help you write and optimize your CV for every application.',
-    action: 'Create Resume',
     page: 'resume' as const,
     check: (p: Props) => p.hasResume,
   },
   {
     key: 'jobs',
     icon: '💼',
-    title: 'Add your first job',
-    desc: 'Save jobs manually or install the extension to auto-capture from LinkedIn and Indeed.',
-    action: 'Add Jobs',
     page: 'jobs' as const,
     check: (p: Props) => p.hasJobs,
   },
   {
     key: 'agent',
     icon: '🚀',
-    title: 'Run the AI Agent',
-    desc: 'Let the agent score your matches, tailor your CV, and auto-apply to the best fits.',
-    action: 'Go to Agent',
     page: 'agent' as const,
     check: (p: Props) => p.hasRunAgent,
   },
@@ -42,6 +34,7 @@ const STEPS = [
 
 export function OnboardingChecklist(props: Props) {
   const { navigate } = useNav()
+  const { t } = useI18n()
   const done = STEPS.filter(s => s.check(props)).length
 
   return (
@@ -51,10 +44,10 @@ export function OnboardingChecklist(props: Props) {
     }}>
       <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 4 }}>
         <span style={{ fontSize: 16 }}>👋</span>
-        <span style={{ fontSize: 13, fontWeight: 600, color: 'var(--text)' }}>Welcome to ApplyMate</span>
+        <span style={{ fontSize: 13, fontWeight: 600, color: 'var(--text)' }}>{t('onboarding.welcome')}</span>
       </div>
       <div style={{ fontSize: 11, color: 'var(--text-muted)', marginBottom: 16 }}>
-        {done}/{STEPS.length} steps completed — let&apos;s get your job search automated
+        {done}/{STEPS.length} {t('onboarding.stepsCompleted')} — {t('onboarding.automateSearch')}
       </div>
 
       {/* Progress bar */}
@@ -81,14 +74,14 @@ export function OnboardingChecklist(props: Props) {
               </div>
               <div style={{ flex: 1, minWidth: 0 }}>
                 <div style={{ fontSize: 12, fontWeight: 500, color: 'var(--text)', marginBottom: 1 }}>
-                  {step.title}
+                  {t(`onboarding.${step.key}.title`)}
                 </div>
                 <div style={{ fontSize: 11, color: 'var(--text-muted)', lineHeight: 1.5, marginBottom: 6 }}>
-                  {step.desc}
+                  {t(`onboarding.${step.key}.description`)}
                 </div>
                 {!completed && (
                   <Btn small variant="primary" onClick={() => navigate(step.page)}>
-                    {step.action}
+                    {t(`onboarding.${step.key}.action`)}
                   </Btn>
                 )}
               </div>

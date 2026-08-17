@@ -3,14 +3,11 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import { Download, Pencil, Plus, ShieldCheck, Trash2 } from 'lucide-react'
 import type { PersonaField, PersonaProfile } from '@/lib/persona'
+import { useI18n } from '@/lib/i18n'
 
 const categories = ['personal', 'contact', 'work', 'education', 'preferences'] as const
-const labels: Record<(typeof categories)[number], string> = {
-  personal: 'Personal information', contact: 'Contact details', work: 'Work & career',
-  education: 'Education & qualifications', preferences: 'Job preferences',
-}
-
 export function PersonaPanel({ isDefault, onEditResume, onUseAsProfile }: { isDefault: boolean; onEditResume: (section: string) => void; onUseAsProfile: () => void }) {
+  const { t } = useI18n()
   const [profile, setProfile] = useState<PersonaProfile | null>(null)
   const [loading, setLoading] = useState(true)
   const [draft, setDraft] = useState<Partial<PersonaField> | null>(null)
@@ -22,7 +19,7 @@ export function PersonaPanel({ isDefault, onEditResume, onUseAsProfile }: { isDe
     const response = await fetch('/api/me/persona')
     const payload = await response.json().catch(() => null)
     if (response.ok) setProfile(payload?.profile ?? null)
-    else setError(payload?.error ?? 'Could not load Persona.')
+    else setError(payload?.error ?? t('persona.loadFailed'))
     setLoading(false)
   }, [])
   useEffect(() => { void load() }, [load])
@@ -30,26 +27,26 @@ export function PersonaPanel({ isDefault, onEditResume, onUseAsProfile }: { isDe
   const groups = useMemo(() => categories.map(category => ({ category, fields: (profile?.applicationAnswers ?? []).filter(field => field.category === category) })), [profile])
 
   async function save() {
-    if (!draft?.key || !draft.label || !draft.value) { setError('Add a label and value before saving.'); return }
+    if (!draft?.key || !draft.label || !draft.value) { setError(t('persona.requiredFields')); return }
     const field: PersonaField = {
       key: draft.key.toLowerCase().trim().replace(/[^a-z0-9_]/g, '_'), label: draft.label.trim(), value: draft.value.trim(),
       category: draft.category ?? 'personal', confidence: 1, source: 'manual', updatedAt: new Date().toISOString(), consentAt: new Date().toISOString(),
     }
     const response = await fetch('/api/me/persona/fields', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ fields: [field] }) })
     const payload = await response.json().catch(() => null)
-    if (!response.ok) { setError(payload?.error ?? 'Could not save Persona field.'); return }
+    if (!response.ok) { setError(payload?.error ?? t('persona.saveFailed')); return }
     setDraft(null); setError(''); await load()
   }
 
   async function remove(key: string) {
     const response = await fetch('/api/me/persona/fields', { method: 'DELETE', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ key }) })
     if (response.ok) await load()
-    else setError('Could not delete Persona field.')
+    else setError(t('persona.deleteFailed'))
   }
 
   async function download() {
     const response = await fetch('/api/me/persona/export')
-    if (!response.ok) { setError('Could not export Persona data.'); return }
+    if (!response.ok) { setError(t('persona.exportFailed')); return }
     const blob = new Blob([JSON.stringify(await response.json(), null, 2)], { type: 'application/json' })
     const link = document.createElement('a'); link.href = URL.createObjectURL(blob); link.download = 'applymate-persona-export.json'; link.click(); URL.revokeObjectURL(link.href)
   }
@@ -57,50 +54,50 @@ export function PersonaPanel({ isDefault, onEditResume, onUseAsProfile }: { isDe
   async function buildKnowledgeIndex() {
     setIndexing(true); setError('')
     const response = await fetch('/api/me/persona/knowledge-index', { method: 'POST' })
-    if (!response.ok) setError('Could not build the knowledge index.')
+    if (!response.ok) setError(t('persona.indexFailed'))
     else {
       const payload = await response.json().catch(() => null)
-      setError(payload?.semanticEnabled ? 'Semantic knowledge index is ready for relevant AI tasks.' : 'Knowledge index is ready with lexical retrieval. Configure OPENAI_API_KEY to enable semantic retrieval.')
+      setError(payload?.semanticEnabled ? t('persona.semanticReady') : t('persona.lexicalReady'))
     }
     setIndexing(false)
   }
 
   return <div style={{ padding: 14, overflowY: 'auto', height: '100%', boxSizing: 'border-box' }}>
     <div style={{ display: 'flex', justifyContent: 'space-between', gap: 8, alignItems: 'start', marginBottom: 12 }}>
-      <div><div style={{ fontWeight: 700, fontSize: 15 }}>Persona</div><div style={{ color: 'var(--text-muted)', fontSize: 11, lineHeight: 1.45, marginTop: 3 }}>Your reusable application profile, shared with the extension.</div></div>
-      <button onClick={() => void download()} title="Download my Persona data" style={iconButton}><Download size={15} /></button>
+      <div><div style={{ fontWeight: 700, fontSize: 15 }}>{t('persona.title')}</div><div style={{ color: 'var(--text-muted)', fontSize: 11, lineHeight: 1.45, marginTop: 3 }}>{t('persona.description')}</div></div>
+      <button onClick={() => void download()} title={t('persona.download')} style={iconButton}><Download size={15} /></button>
     </div>
 
-    <div style={privacyStyle}><ShieldCheck size={16} /><span><strong>You stay in control.</strong> Resume facts are read in place; application answers are saved only after you confirm. Sensitive data is not stored here.</span></div>
-    <button onClick={() => void buildKnowledgeIndex()} disabled={indexing} style={indexButton}>{indexing ? 'Building knowledge index…' : 'Build knowledge index'}</button>
-    <div style={{ fontSize: 10, color: 'var(--text-muted)', lineHeight: 1.4, margin: '-7px 0 12px' }}>Indexes approved resume evidence for relevant AI answers. This uses the configured embedding provider.</div>
-    {isDefault ? <div style={sharedProfileStyle}>This is your shared profile resume. The extension uses it for future application forms.</div> : <div style={sharedProfileStyle}>The extension currently uses your default resume. <button onClick={onUseAsProfile} style={profileButton}>Use this resume as the shared Persona base</button></div>}
+    <div style={privacyStyle}><ShieldCheck size={16} /><span><strong>{t('persona.controlled')}</strong> {t('persona.privacy')}</span></div>
+    <button onClick={() => void buildKnowledgeIndex()} disabled={indexing} style={indexButton}>{indexing ? t('persona.indexing') : t('persona.buildIndex')}</button>
+    <div style={{ fontSize: 10, color: 'var(--text-muted)', lineHeight: 1.4, margin: '-7px 0 12px' }}>{t('persona.indexDescription')}</div>
+    {isDefault ? <div style={sharedProfileStyle}>{t('persona.sharedDefault')}</div> : <div style={sharedProfileStyle}>{t('persona.usingDefault')} <button onClick={onUseAsProfile} style={profileButton}>{t('persona.useAsBase')}</button></div>}
 
-    <PanelTitle title={`Confirmed facts · ${profile?.sourceResumeCount ?? 0} base resume${profile?.sourceResumeCount === 1 ? '' : 's'}`} />
-    <ResumeDetailCard title="Identity & contact" details={profile?.identity ?? []} onEdit={() => onEditResume('contact')} />
-    <ResumeDetailCard title="Job preferences" details={profile?.preferences ?? []} onEdit={() => onEditResume('summary')} />
-    <ResumeDetailCard title="Professional summary" details={profile?.summaries ?? []} onEdit={() => onEditResume('summary')} />
-    <ResumeDetailCard title="Experience" details={profile?.experience ?? []} onEdit={() => onEditResume('experience')} />
-    <ResumeDetailCard title="Skills & languages" details={[...(profile?.skills ?? []), ...(profile?.languages ?? [])]} onEdit={() => onEditResume('skills')} />
-    <ResumeDetailCard title="Education & qualifications" details={[...(profile?.education ?? []), ...(profile?.certifications ?? [])]} onEdit={() => onEditResume('education')} />
-    <ResumeDetailCard title="Projects" details={profile?.projects ?? []} onEdit={() => onEditResume('projects')} />
+    <PanelTitle title={`${t('persona.confirmedFacts')} · ${profile?.sourceResumeCount ?? 0} ${t(profile?.sourceResumeCount === 1 ? 'persona.baseResume' : 'persona.baseResumes')}`} />
+    <ResumeDetailCard title={t('persona.identityContact')} details={profile?.identity ?? []} onEdit={() => onEditResume('contact')} t={t} />
+    <ResumeDetailCard title={t('persona.jobPreferences')} details={profile?.preferences ?? []} onEdit={() => onEditResume('summary')} t={t} />
+    <ResumeDetailCard title={t('persona.professionalSummary')} details={profile?.summaries ?? []} onEdit={() => onEditResume('summary')} t={t} />
+    <ResumeDetailCard title={t('persona.experience')} details={profile?.experience ?? []} onEdit={() => onEditResume('experience')} t={t} />
+    <ResumeDetailCard title={t('persona.skillsLanguages')} details={[...(profile?.skills ?? []), ...(profile?.languages ?? [])]} onEdit={() => onEditResume('skills')} t={t} />
+    <ResumeDetailCard title={t('persona.educationQualifications')} details={[...(profile?.education ?? []), ...(profile?.certifications ?? [])]} onEdit={() => onEditResume('education')} t={t} />
+    <ResumeDetailCard title={t('persona.projects')} details={profile?.projects ?? []} onEdit={() => onEditResume('projects')} t={t} />
 
-    <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginTop: 18 }}><PanelTitle title="Saved application answers" /><button onClick={() => { setDraft({ category: 'personal' }); setError('') }} style={addButton}><Plus size={13} /> Add</button></div>
+    <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginTop: 18 }}><PanelTitle title={t('persona.savedAnswers')} /><button onClick={() => { setDraft({ category: 'personal' }); setError('') }} style={addButton}><Plus size={13} /> {t('persona.add')}</button></div>
     {draft && <div style={editorStyle}>
-      <input value={draft.label ?? ''} onChange={event => setDraft(value => ({ ...value, label: event.target.value, key: value?.key || event.target.value }))} placeholder="Question / label" style={inputStyle} />
-      <textarea value={draft.value ?? ''} onChange={event => setDraft(value => ({ ...value, value: event.target.value }))} placeholder="Your answer" rows={2} style={inputStyle} />
-      <select value={draft.category ?? 'personal'} onChange={event => setDraft(value => ({ ...value, category: event.target.value }))} style={inputStyle}>{categories.map(category => <option key={category} value={category}>{labels[category]}</option>)}</select>
-      <div style={{ display: 'flex', gap: 6 }}><button onClick={() => void save()} style={saveButton}>Save to Persona</button><button onClick={() => setDraft(null)} style={cancelButton}>Cancel</button></div>
+      <input value={draft.label ?? ''} onChange={event => setDraft(value => ({ ...value, label: event.target.value, key: value?.key || event.target.value }))} placeholder={t('persona.questionLabel')} style={inputStyle} />
+      <textarea value={draft.value ?? ''} onChange={event => setDraft(value => ({ ...value, value: event.target.value }))} placeholder={t('persona.answer')} rows={2} style={inputStyle} />
+      <select value={draft.category ?? 'personal'} onChange={event => setDraft(value => ({ ...value, category: event.target.value }))} style={inputStyle}>{categories.map(category => <option key={category} value={category}>{t(`persona.category.${category}`)}</option>)}</select>
+      <div style={{ display: 'flex', gap: 6 }}><button onClick={() => void save()} style={saveButton}>{t('persona.save')}</button><button onClick={() => setDraft(null)} style={cancelButton}>{t('common.cancel')}</button></div>
     </div>}
-    {loading ? <div style={{ color: 'var(--text-muted)', fontSize: 12 }}>Loading Persona…</div> : groups.map(group => group.fields.length > 0 && <section key={group.category} style={{ marginTop: 12 }}><PanelTitle title={labels[group.category]} />{group.fields.map(field => <div key={field.key} style={fieldStyle}><div><strong>{field.label}</strong><small>{field.value}</small><em>{field.source === 'form_scan' ? 'Saved from an application' : 'Added by you'}</em></div><button onClick={() => void remove(field.key)} title={`Delete ${field.label}`} style={iconButton}><Trash2 size={14} /></button></div>)}</section>)}
-    {!loading && (profile?.applicationAnswers.length ?? 0) === 0 && !draft && <div style={{ color: 'var(--text-muted)', fontSize: 12, lineHeight: 1.5, padding: '10px 0' }}>Add answers that you want to reuse across applications, such as work authorisation or notice period.</div>}
+    {loading ? <div style={{ color: 'var(--text-muted)', fontSize: 12 }}>{t('persona.loading')}</div> : groups.map(group => group.fields.length > 0 && <section key={group.category} style={{ marginTop: 12 }}><PanelTitle title={t(`persona.category.${group.category}`)} />{group.fields.map(field => <div key={field.key} style={fieldStyle}><div><strong>{field.label}</strong><small>{field.value}</small><em>{field.source === 'form_scan' ? t('persona.savedFromApplication') : t('persona.addedByYou')}</em></div><button onClick={() => void remove(field.key)} title={`${t('persona.delete')} ${field.label}`} style={iconButton}><Trash2 size={14} /></button></div>)}</section>)}
+    {!loading && (profile?.applicationAnswers.length ?? 0) === 0 && !draft && <div style={{ color: 'var(--text-muted)', fontSize: 12, lineHeight: 1.5, padding: '10px 0' }}>{t('persona.emptyAnswers')}</div>}
     {error && <div role="alert" style={{ color: '#b42318', fontSize: 11, marginTop: 10 }}>{error}</div>}
   </div>
 }
 
 function PanelTitle({ title }: { title: string }) { return <div style={{ fontSize: 10, color: 'var(--text-muted)', fontWeight: 700, letterSpacing: '.06em', textTransform: 'uppercase', margin: '10px 0 6px' }}>{title}</div> }
-function ResumeDetailCard({ title, details, onEdit }: { title: string; details: string[]; onEdit: () => void }) {
-  return <div style={resumeDetailStyle}><div style={{ display: 'flex', justifyContent: 'space-between', gap: 8 }}><strong>{title}</strong><button onClick={onEdit} title={`Edit ${title}`} style={iconButton}><Pencil size={13} /></button></div>{details.length ? <div style={{ display: 'grid', gap: 3, marginTop: 5 }}>{details.map((detail, index) => <small key={`${detail}-${index}`} style={{ lineHeight: 1.4 }}>{detail}</small>)}</div> : <small style={{ display: 'block', marginTop: 4 }}>No details added yet</small>}</div>
+function ResumeDetailCard({ title, details, onEdit, t }: { title: string; details: string[]; onEdit: () => void; t: (key: string) => string }) {
+  return <div style={resumeDetailStyle}><div style={{ display: 'flex', justifyContent: 'space-between', gap: 8 }}><strong>{title}</strong><button onClick={onEdit} title={`${t('persona.edit')} ${title}`} style={iconButton}><Pencil size={13} /></button></div>{details.length ? <div style={{ display: 'grid', gap: 3, marginTop: 5 }}>{details.map((detail, index) => <small key={`${detail}-${index}`} style={{ lineHeight: 1.4 }}>{detail}</small>)}</div> : <small style={{ display: 'block', marginTop: 4 }}>{t('persona.noDetails')}</small>}</div>
 }
 const iconButton = { border: 'none', background: 'transparent', color: 'var(--text-muted)', padding: 4, cursor: 'pointer' }
 const inputStyle = { width: '100%', boxSizing: 'border-box' as const, padding: '7px 8px', border: '1px solid var(--border)', borderRadius: 6, font: 'inherit', fontSize: 12, background: 'var(--bg)' }
