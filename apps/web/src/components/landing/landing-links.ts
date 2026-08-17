@@ -1,7 +1,7 @@
 import { authLink } from '@/lib/auth-callback'
 
 export type LandingLink = {
-  label: string
+  labelKey: string
   href: string
   external?: boolean
 }
@@ -21,47 +21,47 @@ export function landingPlanAction(key: string): LandingPlanAction {
 }
 
 export const SOCIAL_LINKS: LandingLink[] = [
-  { label: 'GitHub', href: 'https://github.com/YuanshuoDu/applymate-jobcopilot', external: true },
-  { label: 'Support', href: 'mailto:hello@applymate.ai?subject=ApplyMate%20support' },
-  { label: 'LinkedIn', href: 'https://www.linkedin.com/company/applymate-ai/', external: true },
+  { labelKey: 'landing.footer.github', href: 'https://github.com/YuanshuoDu/applymate-jobcopilot', external: true },
+  { labelKey: 'landing.footer.support', href: 'mailto:hello@applymate.ai?subject=ApplyMate%20support' },
+  { labelKey: 'landing.footer.linkedin', href: 'https://www.linkedin.com/company/applymate-ai/', external: true },
 ]
 
-export const FOOTER_COLUMNS: Array<{ title: string; links: LandingLink[] }> = [
+export const FOOTER_COLUMNS: Array<{ titleKey: string; links: LandingLink[] }> = [
   {
-    title: 'Product',
+    titleKey: 'landing.footer.product',
     links: [
-      { label: 'Features', href: '#features' },
-      { label: 'Pricing', href: '#pricing' },
-      { label: 'Chrome Extension', href: 'https://github.com/YuanshuoDu/applymate-jobcopilot/tree/main/apps/extension', external: true },
-      { label: 'Changelog', href: 'https://github.com/YuanshuoDu/applymate-jobcopilot/releases', external: true },
-      { label: 'API', href: 'https://github.com/YuanshuoDu/applymate-jobcopilot', external: true },
+      { labelKey: 'landing.features', href: '#features' },
+      { labelKey: 'landing.pricing', href: '#pricing' },
+      { labelKey: 'landing.footer.extension', href: 'https://github.com/YuanshuoDu/applymate-jobcopilot/tree/main/apps/extension', external: true },
+      { labelKey: 'landing.footer.changelog', href: 'https://github.com/YuanshuoDu/applymate-jobcopilot/releases', external: true },
+      { labelKey: 'landing.footer.api', href: 'https://github.com/YuanshuoDu/applymate-jobcopilot', external: true },
     ],
   },
   {
-    title: 'Company',
+    titleKey: 'landing.footer.company',
     links: [
-      { label: 'About', href: 'mailto:hello@applymate.ai?subject=About%20ApplyMate' },
-      { label: 'Blog', href: 'https://github.com/YuanshuoDu/applymate-jobcopilot/discussions', external: true },
-      { label: 'Careers', href: 'mailto:hello@applymate.ai?subject=Careers%20at%20ApplyMate' },
-      { label: 'Press', href: 'mailto:hello@applymate.ai?subject=Press%20inquiry' },
+      { labelKey: 'landing.footer.about', href: 'mailto:hello@applymate.ai?subject=About%20ApplyMate' },
+      { labelKey: 'landing.footer.blog', href: 'https://github.com/YuanshuoDu/applymate-jobcopilot/discussions', external: true },
+      { labelKey: 'landing.footer.careers', href: 'mailto:hello@applymate.ai?subject=Careers%20at%20ApplyMate' },
+      { labelKey: 'landing.footer.press', href: 'mailto:hello@applymate.ai?subject=Press%20inquiry' },
     ],
   },
   {
-    title: 'Support',
+    titleKey: 'landing.footer.supportTitle',
     links: [
-      { label: 'Help centre', href: 'mailto:hello@applymate.ai?subject=Help%20request' },
-      { label: 'Contact', href: '#contact' },
-      { label: 'Status', href: 'mailto:hello@applymate.ai?subject=Status%20question' },
-      { label: 'Security', href: 'mailto:security@applymate.ai?subject=Security%20question' },
+      { labelKey: 'landing.footer.help', href: 'mailto:hello@applymate.ai?subject=Help%20request' },
+      { labelKey: 'landing.contact', href: '#contact' },
+      { labelKey: 'landing.footer.status', href: 'mailto:hello@applymate.ai?subject=Status%20question' },
+      { labelKey: 'landing.footer.security', href: 'mailto:security@applymate.ai?subject=Security%20question' },
     ],
   },
   {
-    title: 'Legal',
+    titleKey: 'landing.footer.legal',
     links: [
-      { label: 'Privacy policy', href: 'mailto:legal@applymate.ai?subject=Privacy%20policy' },
-      { label: 'Terms of service', href: 'mailto:legal@applymate.ai?subject=Terms%20of%20service' },
-      { label: 'Cookie settings', href: 'mailto:legal@applymate.ai?subject=Cookie%20settings' },
-      { label: 'GDPR', href: 'mailto:legal@applymate.ai?subject=GDPR%20request' },
+      { labelKey: 'landing.footer.privacy', href: 'mailto:legal@applymate.ai?subject=Privacy%20policy' },
+      { labelKey: 'landing.footer.terms', href: 'mailto:legal@applymate.ai?subject=Terms%20of%20service' },
+      { labelKey: 'landing.footer.cookies', href: 'mailto:legal@applymate.ai?subject=Cookie%20settings' },
+      { labelKey: 'landing.footer.gdpr', href: 'mailto:legal@applymate.ai?subject=GDPR%20request' },
     ],
   },
 ]

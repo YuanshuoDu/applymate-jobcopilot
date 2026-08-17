@@ -3,7 +3,7 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react'
 import Link from 'next/link'
 import { Menu, X } from 'lucide-react'
-import { useI18n } from '@/lib/i18n'
+import { useI18n, LANGUAGES, type Lang } from '@/lib/i18n'
 import { DEFAULT_PLAN_CATALOGUE, toPublicPlan, type PublicPlan } from '@/lib/plan-catalogue-shared'
 import { FOOTER_COLUMNS, SOCIAL_LINKS, landingFeatureHref, landingPlanAction } from './landing-links'
 
@@ -168,12 +168,30 @@ function planColor(key: PublicPlan['key']): string {
   return key === 'pro' ? '#818CF8' : key === 'enterprise' ? '#FB923C' : C.textMuted
 }
 
-function planPeriod(plan: PublicPlan): string {
-  return plan.interval === 'forever' ? 'forever' : plan.interval === 'year' ? '/yr' : '/mo'
+function planPeriod(plan: PublicPlan, t: (key: string) => string): string {
+  if (plan.interval === 'forever') return t('landing.plan.forever')
+  return plan.interval === 'year' ? t('landing.plan.year') : t('landing.plan.month')
+}
+
+function localizePlan(plan: PublicPlan, t: (key: string) => string): PublicPlan {
+  const prefix = `landing.plan.${plan.key}`
+  const name = t(`${prefix}.name`)
+  if (name === `${prefix}.name`) return plan
+  return {
+    ...plan,
+    name,
+    description: t(`${prefix}.description`),
+    features: plan.features.map((feature, index) => {
+      const translated = t(`${prefix}.feature${index + 1}`)
+      return translated === `${prefix}.feature${index + 1}` ? feature : translated
+    }),
+    badge: plan.badge ? t(`${prefix}.badge`) : plan.badge,
+    cta: t(`${prefix}.cta`),
+  }
 }
 
 export function LandingPage({ plans = FALLBACK_PLANS }: { plans?: PublicPlan[] }) {
-  const { t } = useI18n()
+  const { lang, t, setLang } = useI18n()
   const [scrolled, setScrolled]   = useState(false)
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false)
   const [openFaq, setOpenFaq]     = useState<number | null>(null)
@@ -339,6 +357,12 @@ export function LandingPage({ plans = FALLBACK_PLANS }: { plans?: PublicPlan[] }
 
           {/* CTA */}
           <div className="landing-nav-actions">
+            <label style={{ display: 'flex', alignItems: 'center', gap: 6, color: C.textMuted, fontSize: 12 }}>
+              <span className="sr-only">{t('lang.label')}</span>
+              <select aria-label={t('lang.label')} value={lang} onChange={event => setLang(event.target.value as Lang)} style={{ color: C.textMuted, background: 'rgba(255,255,255,0.04)', border: '1px solid rgba(255,255,255,0.12)', borderRadius: 8, padding: '6px 8px', fontSize: 12 }}>
+                {LANGUAGES.map(language => <option key={language.value} value={language.value}>{language.flag} {language.native}</option>)}
+              </select>
+            </label>
             <Link href="/login" style={{ fontSize: 12, fontWeight: 600, color: C.textMuted, textDecoration: 'none', padding: '6px 14px', border: '1px solid rgba(255,255,255,0.12)', borderRadius: 9, background: 'rgba(255,255,255,0.04)', transition: 'all 0.15s' }}
               onMouseEnter={e => { e.currentTarget.style.color='#fff'; e.currentTarget.style.borderColor='rgba(255,255,255,0.24)' }}
               onMouseLeave={e => { e.currentTarget.style.color=C.textMuted; e.currentTarget.style.borderColor='rgba(255,255,255,0.12)' }}
@@ -369,6 +393,12 @@ export function LandingPage({ plans = FALLBACK_PLANS }: { plans?: PublicPlan[] }
                 <a key={href} href={href} onClick={closeMobileMenu} style={{ color: C.textMuted, textDecoration: 'none', fontSize: 13, fontWeight: 600, padding: '0 12px' }}>{label}</a>
               ))}
               <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8, padding: '8px 0 0', borderTop: '1px solid rgba(255,255,255,0.08)', marginTop: 4 }}>
+                <label style={{ gridColumn: '1 / -1', display: 'flex', alignItems: 'center', justifyContent: 'center', color: C.textMuted, fontSize: 12 }}>
+                  <span className="sr-only">{t('lang.label')}</span>
+                  <select aria-label={t('lang.label')} value={lang} onChange={event => setLang(event.target.value as Lang)} style={{ color: C.textMuted, background: 'rgba(255,255,255,0.04)', border: '1px solid rgba(255,255,255,0.12)', borderRadius: 8, padding: '8px 10px', fontSize: 12 }}>
+                    {LANGUAGES.map(language => <option key={language.value} value={language.value}>{language.flag} {language.native}</option>)}
+                  </select>
+                </label>
                 <Link href="/login" onClick={closeMobileMenu} style={{ color: C.textMuted, textDecoration: 'none', fontSize: 12, fontWeight: 600, padding: '10px 12px', textAlign: 'center', border: '1px solid rgba(255,255,255,0.12)', borderRadius: 9 }}>{t('landing.signIn')}</Link>
                 <Link href="/register" onClick={closeMobileMenu} style={{ color: '#fff', textDecoration: 'none', fontSize: 12, fontWeight: 700, padding: '10px 12px', textAlign: 'center', background: 'linear-gradient(135deg, #4F46E5, #7C3AED)', borderRadius: 9 }}>{t('landing.getStartedShort')}</Link>
               </div>
@@ -543,8 +573,9 @@ export function LandingPage({ plans = FALLBACK_PLANS }: { plans?: PublicPlan[] }
 
           <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(min(100%, 300px), 1fr))', gap: 18 }}>
             {plans.map((plan, i) => {
-              const isPro = plan.key === 'pro'
-              const action = landingPlanAction(plan.key)
+              const localizedPlan = localizePlan(plan, t)
+              const isPro = localizedPlan.key === 'pro'
+              const action = landingPlanAction(localizedPlan.key)
               return (
                 <Reveal key={plan.key} delay={i * 100}>
                   <GlassCard
@@ -553,16 +584,16 @@ export function LandingPage({ plans = FALLBACK_PLANS }: { plans?: PublicPlan[] }
                     style={{ padding: '34px 28px', position: 'relative', height: '100%', display: 'flex', flexDirection: 'column' }}
                   >
                     {isPro && <div style={{ position: 'absolute', top: -1, left: 0, right: 0, height: 2, background: 'linear-gradient(90deg, transparent, #6366F1, #7C3AED, transparent)', borderRadius: '20px 20px 0 0' }} />}
-                    {plan.badge && <div style={{ display: 'inline-block', marginBottom: 14, fontSize: 10, fontWeight: 700, letterSpacing: '0.08em', background: 'linear-gradient(135deg, #4F46E5, #7C3AED)', color: '#fff', borderRadius: 999, padding: '3px 10px' }}>{plan.badge}</div>}
-                    <div style={{ fontSize: 13, fontWeight: 600, color: planColor(plan.key), marginBottom: 6 }}>{plan.name}</div>
+                    {localizedPlan.badge && <div style={{ display: 'inline-block', marginBottom: 14, fontSize: 10, fontWeight: 700, letterSpacing: '0.08em', background: 'linear-gradient(135deg, #4F46E5, #7C3AED)', color: '#fff', borderRadius: 999, padding: '3px 10px' }}>{localizedPlan.badge}</div>}
+                    <div style={{ fontSize: 13, fontWeight: 600, color: planColor(localizedPlan.key), marginBottom: 6 }}>{localizedPlan.name}</div>
                     <div style={{ display: 'flex', alignItems: 'baseline', gap: 4, marginBottom: 6 }}>
-                      <span style={{ fontSize: 40, fontWeight: 900, color: '#fff', letterSpacing: '-0.045em' }}>{plan.price}</span>
-                      <span style={{ fontSize: 13, color: C.textMuted }}>{planPeriod(plan)}</span>
+                      <span style={{ fontSize: 40, fontWeight: 900, color: '#fff', letterSpacing: '-0.045em' }}>{localizedPlan.price}</span>
+                      <span style={{ fontSize: 13, color: C.textMuted }}>{planPeriod(localizedPlan, t)}</span>
                     </div>
-                    <div style={{ fontSize: 12, color: C.textMuted, marginBottom: 10 }}>{plan.description}</div>
-                    {plan.trialDays > 0 && <div style={{ fontSize: 11, color: C.green, marginBottom: 18 }}>{plan.trialDays}-{t('landing.freeTrial')}</div>}
+                    <div style={{ fontSize: 12, color: C.textMuted, marginBottom: 10 }}>{localizedPlan.description}</div>
+                    {localizedPlan.trialDays > 0 && <div style={{ fontSize: 11, color: C.green, marginBottom: 18 }}>{localizedPlan.trialDays}-{t('landing.freeTrial')}</div>}
                     <div style={{ flex: 1, marginBottom: 28 }}>
-                      {plan.features.map(f => (
+                      {localizedPlan.features.map(f => (
                         <div key={f} style={{ display: 'flex', alignItems: 'center', gap: 9, marginBottom: 11, fontSize: 13, color: 'rgba(255,255,255,0.82)' }}>
                           <span style={{ color: C.green, fontSize: 12, flexShrink: 0 }}>✓</span>{f}
                         </div>
@@ -571,7 +602,7 @@ export function LandingPage({ plans = FALLBACK_PLANS }: { plans?: PublicPlan[] }
                     <Link href={action.href} onClick={() => action.message && prepareContact(action.message)} className="btn-shine" style={{ display: 'block', textAlign: 'center', padding: '12px 20px', fontSize: 13, fontWeight: 700, borderRadius: 12, textDecoration: 'none', ...(isPro ? { background: 'linear-gradient(135deg, #4F46E5, #7C3AED)', color: '#fff', boxShadow: '0 4px 20px rgba(79,70,229,0.50)' } : { background: 'rgba(255,255,255,0.07)', border: '1px solid rgba(255,255,255,0.14)', color: 'rgba(255,255,255,0.82)' }), transition: 'all 0.18s' }}
                       onMouseEnter={e => { e.currentTarget.style.transform = 'translateY(-1px)' }}
                       onMouseLeave={e => { e.currentTarget.style.transform = 'none' }}
-                  >{plan.cta}</Link>
+                  >{localizedPlan.cta}</Link>
                   </GlassCard>
                 </Reveal>
               )
@@ -659,7 +690,7 @@ export function LandingPage({ plans = FALLBACK_PLANS }: { plans?: PublicPlan[] }
               </div>
               <p style={{ fontSize: 14, color: C.textMuted, marginBottom: 36, lineHeight: 1.75 }}>
                 {t('landing.joinSeekers')}<br />
-                {proTrialDays > 0 ? `${proTrialDays} days free on Pro, no credit card required.` : t('landing.startFreePlan')}
+                {proTrialDays > 0 ? `${proTrialDays} ${t('landing.daysFreeOnPro')}` : t('landing.startFreePlan')}
               </p>
               <Link href="/register" className="btn-shine" style={{ display: 'inline-flex', alignItems: 'center', gap: 8, padding: '15px 40px', fontSize: 15, fontWeight: 700, background: 'linear-gradient(135deg, #4F46E5, #7C3AED)', color: '#fff', borderRadius: 14, textDecoration: 'none', boxShadow: '0 6px 30px rgba(79,70,229,0.58)', transition: 'all 0.22s' }}
                 onMouseEnter={e => { e.currentTarget.style.transform='translateY(-2px)'; e.currentTarget.style.boxShadow='0 10px 40px rgba(79,70,229,0.72)' }}
@@ -681,23 +712,23 @@ export function LandingPage({ plans = FALLBACK_PLANS }: { plans?: PublicPlan[] }
             <p style={{ fontSize: 12, color: C.textSubtle, lineHeight: 1.75 }}>{t('landing.aiFooter')}</p>
             <div style={{ display: 'flex', gap: 10, marginTop: 18 }}>
               {SOCIAL_LINKS.map(link => (
-                <a key={link.label} href={link.href} {...(link.external ? { target: '_blank', rel: 'noreferrer' } : {})} style={{ fontSize: 11, color: C.textSubtle, textDecoration: 'none', background: 'rgba(255,255,255,0.06)', border: '1px solid rgba(255,255,255,0.10)', borderRadius: 7, padding: '4px 9px', transition: 'all 0.15s' }}
+                <a key={link.labelKey} href={link.href} {...(link.external ? { target: '_blank', rel: 'noreferrer' } : {})} style={{ fontSize: 11, color: C.textSubtle, textDecoration: 'none', background: 'rgba(255,255,255,0.06)', border: '1px solid rgba(255,255,255,0.10)', borderRadius: 7, padding: '4px 9px', transition: 'all 0.15s' }}
                   onMouseEnter={e => { e.currentTarget.style.color='#fff'; e.currentTarget.style.borderColor='rgba(255,255,255,0.22)' }}
                   onMouseLeave={e => { e.currentTarget.style.color=C.textSubtle; e.currentTarget.style.borderColor='rgba(255,255,255,0.10)' }}
-                >{link.label}</a>
+                >{t(link.labelKey)}</a>
               ))}
             </div>
           </div>
 
           {FOOTER_COLUMNS.map(col => (
-            <div key={col.title}>
-              <div style={{ fontSize: 11, fontWeight: 700, color: C.textSubtle, letterSpacing: '0.08em', textTransform: 'uppercase', marginBottom: 14 }}>{col.title}</div>
+            <div key={col.titleKey}>
+              <div style={{ fontSize: 11, fontWeight: 700, color: C.textSubtle, letterSpacing: '0.08em', textTransform: 'uppercase', marginBottom: 14 }}>{t(col.titleKey)}</div>
               {col.links.map(link => (
-                <div key={link.label} style={{ marginBottom: 9 }}>
+                <div key={link.labelKey} style={{ marginBottom: 9 }}>
                   <a href={link.href} {...(link.external ? { target: '_blank', rel: 'noreferrer' } : {})} style={{ fontSize: 13, color: C.textMuted, textDecoration: 'none', transition: 'color 0.15s' }}
                     onMouseEnter={e => (e.currentTarget.style.color = '#fff')}
                     onMouseLeave={e => (e.currentTarget.style.color = C.textMuted)}
-                  >{link.label}</a>
+                  >{t(link.labelKey)}</a>
                 </div>
               ))}
             </div>
