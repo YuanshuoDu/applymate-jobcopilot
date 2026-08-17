@@ -3,6 +3,7 @@
 import React, { useEffect, useState } from 'react'
 import { Plus, RefreshCw, Save, ToggleLeft, ToggleRight } from 'lucide-react'
 import { buildEntitlementPatch, buildPlanPatch, toPlanCatalogDto, type EntitlementKind, type EntitlementValue, type PlanCatalogDto, type PlanKey } from '@/lib/admin/plans'
+import { useI18n } from '@/lib/i18n'
 
 export function formatPlanMoney(cents: number, currency: string): string {
   return new Intl.NumberFormat('en-IE', { style: 'currency', currency, minimumFractionDigits: 2 }).format(cents / 100)
@@ -18,6 +19,7 @@ export function groupPlanEntitlements(items: Array<Pick<EntitlementValue, 'featu
 interface Transition { id: string; fromPlan: PlanKey; toPlan: PlanKey; enabled: boolean; note?: string; version: number }
 
 export function PlansPage() {
+  const { t } = useI18n()
   const [plans, setPlans] = useState<PlanCatalogDto[]>([])
   const [transitions, setTransitions] = useState<Transition[]>([])
   const [loading, setLoading] = useState(true)
@@ -30,15 +32,15 @@ export function PlansPage() {
       const [plansResponse, transitionsResponse] = await Promise.all([fetch('/api/admin/v1/plans', { cache: 'no-store' }), fetch('/api/admin/v1/plans/transitions', { cache: 'no-store' })])
       const planBody = await plansResponse.json() as { plans?: unknown[]; error?: string }
       const transitionBody = await transitionsResponse.json() as { items?: Transition[]; error?: string }
-      if (!plansResponse.ok) throw new Error(planBody.error ?? 'Unable to load plans')
+      if (!plansResponse.ok) throw new Error(planBody.error ?? t('admin.plans.unableLoad'))
       setPlans((planBody.plans ?? []).map(toPlanCatalogDto))
       if (!transitionsResponse.ok) {
         setTransitions([])
-        setTransitionError('Transition controls are unavailable until the production plan-transition migration is applied.')
+        setTransitionError(t('admin.plans.transitionUnavailable'))
       } else {
         setTransitions(transitionBody.items ?? [])
       }
-    } catch (loadError) { setError(loadError instanceof Error ? loadError.message : 'Unable to load plans') }
+    } catch (loadError) { setError(loadError instanceof Error ? loadError.message : t('admin.plans.unableLoad')) }
     finally { setLoading(false) }
   }
 
@@ -47,16 +49,17 @@ export function PlansPage() {
   const transitionRows = plans.flatMap(from => plans.filter(to => to.plan !== from.plan).map(to => transitions.find(item => item.fromPlan === from.plan && item.toPlan === to.plan) ?? { id: `new-${from.plan}-${to.plan}`, fromPlan: from.plan as PlanKey, toPlan: to.plan as PlanKey, enabled: false, version: 1 }))
 
   return <div style={{ maxWidth: 1180, margin: '0 auto' }}>
-    <header style={headerStyle}><div><div style={eyebrow}>Commercial controls</div><h1 style={titleStyle}>Plans</h1><p style={muted}>Manage catalogue pricing, entitlements and allowed manual transitions.</p></div><button type="button" title="Refresh plans" onClick={() => void load()} style={iconButton}><RefreshCw size={16} aria-hidden="true" /></button></header>
+    <header style={headerStyle}><div><div style={eyebrow}>{t('admin.plans.commercialControls')}</div><h1 style={titleStyle}>{t('admin.plans.title')}</h1><p style={muted}>{t('admin.plans.description')}</p></div><button type="button" title={t('admin.plans.refresh')} onClick={() => void load()} style={iconButton}><RefreshCw size={16} aria-hidden="true" /></button></header>
     {error && <ErrorBox text={error} />}
-    {loading ? <p style={muted}>Loading plans…</p> : <>
-      <section style={section}><div style={sectionHeader}><h2 style={heading}>Plan catalogue</h2></div>{plans.length > 0 && <div style={planGrid}>{plans.map(plan => <PlanCard key={plan.id} plan={plan} onSaved={load} />)}</div>}{plans.length === 0 && <p style={muted}>No plans have been seeded yet.</p>}</section>
-      <section style={section}><h2 style={heading}>Manual transitions</h2><p style={muted}>Only enabled transitions can be used when changing a user plan.</p>{transitionError ? <ErrorBox text={transitionError} /> : <div style={{ overflowX: 'auto' }}><table style={table}><thead><tr><th>From</th><th>To</th><th>Status</th><th>Note</th><th /></tr></thead><tbody>{transitionRows.map(item => <TransitionRow key={item.id} transition={item} onSaved={load} />)}</tbody></table></div>}</section>
+    {loading ? <p style={muted}>{t('admin.plans.loading')}</p> : <>
+      <section style={section}><div style={sectionHeader}><h2 style={heading}>{t('admin.plans.catalogue')}</h2></div>{plans.length > 0 && <div style={planGrid}>{plans.map(plan => <PlanCard key={plan.id} plan={plan} onSaved={load} />)}</div>}{plans.length === 0 && <p style={muted}>{t('admin.plans.empty')}</p>}</section>
+      <section style={section}><h2 style={heading}>{t('admin.plans.transitions')}</h2><p style={muted}>{t('admin.plans.transitionDescription')}</p>{transitionError ? <ErrorBox text={transitionError} /> : <div style={{ overflowX: 'auto' }}><table style={table}><thead><tr><th>{t('admin.plans.from')}</th><th>{t('admin.plans.to')}</th><th>{t('admin.plans.status')}</th><th>{t('admin.plans.note')}</th><th /></tr></thead><tbody>{transitionRows.map(item => <TransitionRow key={item.id} transition={item} onSaved={load} />)}</tbody></table></div>}</section>
     </>}
   </div>
 }
 
 function PlanCard({ plan, onSaved }: { plan: PlanCatalogDto; onSaved: () => Promise<void> }) {
+  const { t } = useI18n()
   const [draft, setDraft] = useState(plan)
   const [reason, setReason] = useState('')
   const [busy, setBusy] = useState(false)
@@ -66,7 +69,7 @@ function PlanCard({ plan, onSaved }: { plan: PlanCatalogDto; onSaved: () => Prom
     setBusy(true)
     try {
       const response = await fetch(`/api/admin/v1/plans/${plan.plan}`, { method: 'PATCH', headers: headers(), body: JSON.stringify({ ...buildPlanPatch(draft), version: plan.version, reason }) })
-      if (!response.ok) throw new Error('Plan update failed')
+      if (!response.ok) throw new Error(t('admin.plans.updateFailed'))
       await onSaved(); setReason('')
     } finally { setBusy(false) }
   }
@@ -75,7 +78,7 @@ function PlanCard({ plan, onSaved }: { plan: PlanCatalogDto; onSaved: () => Prom
     setBusy(true)
     try {
       const response = await fetch(`/api/admin/v1/plans/${plan.plan}/entitlements`, { method: 'PATCH', headers: headers(), body: JSON.stringify({ version: plan.version, entitlements: buildEntitlementPatch(draft.entitlements), reason }) })
-      if (!response.ok) throw new Error('Entitlement update failed')
+      if (!response.ok) throw new Error(t('admin.plans.entitlementUpdateFailed'))
       await onSaved(); setReason('')
     } finally { setBusy(false) }
   }
@@ -84,18 +87,19 @@ function PlanCard({ plan, onSaved }: { plan: PlanCatalogDto; onSaved: () => Prom
     setBusy(true)
     try {
       const response = await fetch(`/api/admin/v1/plans/${plan.plan}`, { method: 'PATCH', headers: headers(), body: JSON.stringify({ ...buildPlanPatch({ ...draft, active: !draft.active }), version: plan.version, reason }) })
-      if (!response.ok) throw new Error('Plan status update failed')
+      if (!response.ok) throw new Error(t('admin.plans.statusUpdateFailed'))
       await onSaved(); setReason('')
     } finally { setBusy(false) }
   }
-  return <article style={card}><div style={cardHeader}><div><h3 style={{ margin: 0, fontSize: 17 }}>{plan.name}</h3><span style={muted}>{plan.plan} · v{plan.version}</span></div><span style={{ ...status, background: plan.active ? '#e7f6ef' : '#eef1f5', color: plan.active ? '#13734f' : '#5b6b80' }}>{plan.active ? 'Active' : 'Inactive'}</span></div><div style={priceRow}><label>Monthly<input type="number" min="0" value={draft.monthlyPriceCents} onChange={event => setDraft({ ...draft, monthlyPriceCents: Number(event.target.value) })} style={smallInput} /></label><label>Yearly<input type="number" min="0" value={draft.yearlyPriceCents} onChange={event => setDraft({ ...draft, yearlyPriceCents: Number(event.target.value) })} style={smallInput} /></label><div style={{ ...muted, alignSelf: 'end', paddingBottom: 7 }}>{formatPlanMoney(draft.monthlyPriceCents, draft.currency)} / month</div></div><label style={label}>Description<textarea value={draft.description ?? ''} onChange={event => setDraft({ ...draft, description: event.target.value })} rows={2} style={textarea} /></label><label style={label}>Audit reason<input value={reason} onChange={event => setReason(event.target.value)} placeholder="At least 10 characters" style={textInput} /></label><div style={buttonRow}><button type="button" disabled={busy || reason.trim().length < 10} onClick={() => void save()} style={primary}><Save size={14} aria-hidden="true" /> Save plan</button><button type="button" disabled={busy || reason.trim().length < 10} onClick={() => void saveEntitlements()} style={secondary}><Save size={14} aria-hidden="true" /> Save entitlements</button><button type="button" disabled={busy || reason.trim().length < 10} onClick={() => void toggleActive()} style={secondary}>{draft.active ? 'Deactivate' : 'Activate'}</button></div><div style={entitlements}><strong style={{ fontSize: 12 }}>Entitlements</strong>{draft.entitlements.map((item, index) => <div key={item.id} style={entitlementRow}><input value={item.featureKey} onChange={event => updateEntitlement(index, { featureKey: event.target.value }, draft, setDraft)} style={smallInput} /><select value={item.kind} onChange={event => updateEntitlement(index, { kind: event.target.value as EntitlementKind }, draft, setDraft)} style={smallInput}><option value="boolean">Boolean</option><option value="limit">Limit</option><option value="text">Text</option></select><input type="checkbox" checked={item.enabled} onChange={event => updateEntitlement(index, { enabled: event.target.checked }, draft, setDraft)} aria-label={`${item.featureKey} enabled`} />{item.kind === 'limit' && <input type="number" min="0" value={item.limit ?? 0} onChange={event => updateEntitlement(index, { limit: Number(event.target.value) }, draft, setDraft)} style={smallInput} />}{item.kind === 'text' && <input value={item.textValue ?? ''} onChange={event => updateEntitlement(index, { textValue: event.target.value }, draft, setDraft)} placeholder="Text value" style={smallInput} aria-label={`${item.featureKey} text value`} />}</div>)}<button type="button" style={secondary} onClick={() => setDraft({ ...draft, entitlements: [...draft.entitlements, { id: `draft-${Date.now()}`, featureKey: 'new_feature', kind: 'boolean', enabled: false }] })}><Plus size={14} aria-hidden="true" /> Add entitlement</button></div></article>
+  return <article style={card}><div style={cardHeader}><div><h3 style={{ margin: 0, fontSize: 17 }}>{plan.name}</h3><span style={muted}>{plan.plan} · v{plan.version}</span></div><span style={{ ...status, background: plan.active ? '#e7f6ef' : '#eef1f5', color: plan.active ? '#13734f' : '#5b6b80' }}>{plan.active ? t('admin.plans.active') : t('admin.plans.inactive')}</span></div><div style={priceRow}><label>{t('admin.plans.monthly')}<input type="number" min="0" value={draft.monthlyPriceCents} onChange={event => setDraft({ ...draft, monthlyPriceCents: Number(event.target.value) })} style={smallInput} /></label><label>{t('admin.plans.yearly')}<input type="number" min="0" value={draft.yearlyPriceCents} onChange={event => setDraft({ ...draft, yearlyPriceCents: Number(event.target.value) })} style={smallInput} /></label><div style={{ ...muted, alignSelf: 'end', paddingBottom: 7 }}>{formatPlanMoney(draft.monthlyPriceCents, draft.currency)} / {t('admin.plans.month')}</div></div><label style={label}>{t('admin.plans.descriptionLabel')}<textarea value={draft.description ?? ''} onChange={event => setDraft({ ...draft, description: event.target.value })} rows={2} style={textarea} /></label><label style={label}>{t('admin.plans.auditReason')}<input value={reason} onChange={event => setReason(event.target.value)} placeholder={t('admin.plans.reasonPlaceholder')} style={textInput} /></label><div style={buttonRow}><button type="button" disabled={busy || reason.trim().length < 10} onClick={() => void save()} style={primary}><Save size={14} aria-hidden="true" /> {t('admin.plans.savePlan')}</button><button type="button" disabled={busy || reason.trim().length < 10} onClick={() => void saveEntitlements()} style={secondary}><Save size={14} aria-hidden="true" /> {t('admin.plans.saveEntitlements')}</button><button type="button" disabled={busy || reason.trim().length < 10} onClick={() => void toggleActive()} style={secondary}>{draft.active ? t('admin.plans.deactivate') : t('admin.plans.activate')}</button></div><div style={entitlements}><strong style={{ fontSize: 12 }}>{t('admin.plans.entitlements')}</strong>{draft.entitlements.map((item, index) => <div key={item.id} style={entitlementRow}><input value={item.featureKey} onChange={event => updateEntitlement(index, { featureKey: event.target.value }, draft, setDraft)} style={smallInput} /><select value={item.kind} onChange={event => updateEntitlement(index, { kind: event.target.value as EntitlementKind }, draft, setDraft)} style={smallInput}><option value="boolean">{t('admin.plans.boolean')}</option><option value="limit">{t('admin.plans.limit')}</option><option value="text">{t('admin.plans.text')}</option></select><input type="checkbox" checked={item.enabled} onChange={event => updateEntitlement(index, { enabled: event.target.checked }, draft, setDraft)} aria-label={`${item.featureKey} ${t('admin.plans.enabled')}`} />{item.kind === 'limit' && <input type="number" min="0" value={item.limit ?? 0} onChange={event => updateEntitlement(index, { limit: Number(event.target.value) }, draft, setDraft)} style={smallInput} />}{item.kind === 'text' && <input value={item.textValue ?? ''} onChange={event => updateEntitlement(index, { textValue: event.target.value }, draft, setDraft)} placeholder={t('admin.plans.textValue')} style={smallInput} aria-label={`${item.featureKey} ${t('admin.plans.textValue')}`} />}</div>)}<button type="button" style={secondary} onClick={() => setDraft({ ...draft, entitlements: [...draft.entitlements, { id: `draft-${Date.now()}`, featureKey: 'new_feature', kind: 'boolean', enabled: false }] })}><Plus size={14} aria-hidden="true" /> {t('admin.plans.addEntitlement')}</button></div></article>
 }
 
 function updateEntitlement(index: number, patch: Partial<EntitlementValue>, draft: PlanCatalogDto, setDraft: (next: PlanCatalogDto) => void) { setDraft({ ...draft, entitlements: draft.entitlements.map((item, itemIndex) => itemIndex === index ? { ...item, ...patch } : item) }) }
 function TransitionRow({ transition, onSaved }: { transition: Transition; onSaved: () => Promise<void> }) {
+  const { t } = useI18n()
   const [reason, setReason] = useState('')
   async function toggle() { if (reason.trim().length < 10) return; const response = await fetch('/api/admin/v1/plans/transitions', { method: 'PATCH', headers: headers(), body: JSON.stringify({ ...transition, enabled: !transition.enabled, reason }) }); if (response.ok) { setReason(''); await onSaved() } }
-  return <tr><td>{transition.fromPlan}</td><td>{transition.toPlan}</td><td><button type="button" title={transition.enabled ? 'Disable transition' : 'Enable transition'} onClick={() => void toggle()} style={iconButton}>{transition.enabled ? <ToggleRight size={19} color="#13734f" aria-hidden="true" /> : <ToggleLeft size={19} aria-hidden="true" />}</button></td><td>{transition.note || <span style={muted}>No note</span>}</td><td><input value={reason} onChange={event => setReason(event.target.value)} placeholder="Reason" style={smallInput} aria-label={`${transition.fromPlan} to ${transition.toPlan} reason`} /></td></tr>
+  return <tr><td>{transition.fromPlan}</td><td>{transition.toPlan}</td><td><button type="button" title={transition.enabled ? t('admin.plans.disableTransition') : t('admin.plans.enableTransition')} onClick={() => void toggle()} style={iconButton}>{transition.enabled ? <ToggleRight size={19} color="#13734f" aria-hidden="true" /> : <ToggleLeft size={19} aria-hidden="true" />}</button></td><td>{transition.note || <span style={muted}>{t('admin.plans.noNote')}</span>}</td><td><input value={reason} onChange={event => setReason(event.target.value)} placeholder={t('admin.plans.reason')} style={smallInput} aria-label={`${transition.fromPlan} ${t('admin.plans.to')} ${transition.toPlan} ${t('admin.plans.reason')}`} /></td></tr>
 }
 
 function headers(): HeadersInit { return { 'Content-Type': 'application/json', Origin: window.location.origin, 'Idempotency-Key': `${Date.now()}-${Math.random().toString(36).slice(2)}` } }
