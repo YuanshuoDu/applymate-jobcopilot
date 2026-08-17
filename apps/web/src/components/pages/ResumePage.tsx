@@ -382,10 +382,11 @@ function AddSectionMenu({ sectionOrder, onAdd, onAddCustom, onClose }: {
   onAddCustom:  () => void
   onClose:      () => void
 }) {
+  const { t } = useI18n()
   const available = ADDABLE_SECTIONS.filter(s => !sectionOrder.includes(s.id))
   return (
     <div style={{ position: 'absolute', bottom: '100%', left: '50%', transform: 'translateX(-50%)', marginBottom: 6, background: 'var(--bg)', border: '0.5px solid var(--border)', borderRadius: 8, boxShadow: '0 4px 20px rgba(0,0,0,0.12)', zIndex: 50, minWidth: 180, overflow: 'hidden' }}>
-      <div style={{ padding: '6px 10px', fontSize: 9, fontWeight: 600, color: 'var(--text-muted)', borderBottom: '0.5px solid var(--border)' }}>ADD SECTION</div>
+      <div style={{ padding: '6px 10px', fontSize: 9, fontWeight: 600, color: 'var(--text-muted)', borderBottom: '0.5px solid var(--border)' }}>{t('resume.addSection')}</div>
       {available.map(s => (
         <button key={s.id} onClick={() => { onAdd(s.id); onClose() }}
           style={{ display: 'block', width: '100%', textAlign: 'left', padding: '7px 12px', fontSize: 12, color: 'var(--text)', background: 'none', border: 'none', cursor: 'pointer' }}
@@ -399,7 +400,7 @@ function AddSectionMenu({ sectionOrder, onAdd, onAddCustom, onClose }: {
           style={{ display: 'block', width: '100%', textAlign: 'left', padding: '7px 12px', fontSize: 12, color: 'var(--primary)', background: 'none', border: 'none', cursor: 'pointer' }}
           onMouseEnter={e => ((e.currentTarget as HTMLButtonElement).style.background = 'var(--bg-secondary)')}
           onMouseLeave={e => ((e.currentTarget as HTMLButtonElement).style.background = 'none')}>
-          + Custom Section…
+          {t('resume.customSection')}
         </button>
       </div>
     </div>
@@ -461,7 +462,7 @@ function ResumeLibraryPanel({
 
   if (resumes.length === 0) return (
     <div style={{ padding: '10px 0', fontSize: 12, color: 'var(--text-muted)' }}>
-      No resumes in this direction yet.
+      {t('resume.noResumesDirection')}
     </div>
   )
 
@@ -491,27 +492,27 @@ function ResumeLibraryPanel({
               </div>
               {dir && <div className="resume-library-item-detail">{dir.name}</div>}
               {jobCount > 0 && <div ref={openPopoverId === r.id ? popoverRef : undefined} className="resume-library-item-detail is-link" onClick={e => { e.stopPropagation(); openUsedByPopover(r.id) }}>
-                Linked to {jobCount} saved job{jobCount === 1 ? '' : 's'}
+                {t('resume.linkedSavedJob')} ({jobCount})
                 {openPopoverId === r.id && <div className="resume-library-lineage-popover">
-                  <div style={{ fontSize: 10, fontWeight: 500, color: 'var(--text-muted)', marginBottom: 6 }}>Used by saved jobs</div>
-                  {loadingPop ? <div style={{ fontSize: 11, color: 'var(--text-muted)' }}>Loading…</div> : popoverJobs.length === 0 ? <div style={{ fontSize: 11, color: 'var(--text-muted)' }}>No jobs found</div> : popoverJobs.map(j => <div key={j.id} style={{ fontSize: 11, padding: '3px 0', color: 'var(--text)', borderBottom: '0.5px solid var(--border)' }}>{j.company} · {j.role}</div>)}
+                  <div style={{ fontSize: 10, fontWeight: 500, color: 'var(--text-muted)', marginBottom: 6 }}>{t('resume.usedBySavedJobs')}</div>
+                  {loadingPop ? <div style={{ fontSize: 11, color: 'var(--text-muted)' }}>{t('common.loading')}</div> : popoverJobs.length === 0 ? <div style={{ fontSize: 11, color: 'var(--text-muted)' }}>{t('resume.noJobsFound')}</div> : popoverJobs.map(j => <div key={j.id} style={{ fontSize: 11, padding: '3px 0', color: 'var(--text)', borderBottom: '0.5px solid var(--border)' }}>{j.company} · {j.role}</div>)}
                 </div>}
               </div>}
-              <div className="resume-library-item-meta">Last edited: {fmtDate(r.updatedAt)}</div>
+              <div className="resume-library-item-meta">{t('resume.lastEdited')}: {fmtDate(r.updatedAt)}</div>
               <div className="resume-library-item-badges" style={{ display: 'flex', gap: 4, alignItems: 'center' }}>
-                {r.origin === 'upload' && <span className="resume-tag base">Base</span>}
-                {r.kind === 'adapted' && <span className="resume-tag tailored">Tailored</span>}
-                {jobCount > 0 && <span className="resume-tag final">Final</span>}
-                {r.isDefault && <span className="resume-tag default">Default</span>}
+                {r.origin === 'upload' && <span className="resume-tag base">{t('resume.base')}</span>}
+                {r.kind === 'adapted' && <span className="resume-tag tailored">{t('resume.tailored')}</span>}
+                {jobCount > 0 && <span className="resume-tag final">{t('resume.final')}</span>}
+                {r.isDefault && <span className="resume-tag default">{t('resume.default')}</span>}
               </div>
             </div>
             <div className="resume-library-more" onClick={e => e.stopPropagation()}>
               <button type="button" aria-label={`More actions for ${r.name}`} onClick={() => setOpenMenuId(value => value === r.id ? null : r.id)}>⋮</button>
               {openMenuId === r.id && <div role="menu" className="resume-library-item-menu">
-                {!r.isDefault && <button type="button" onClick={() => { setOpenMenuId(null); onSetDefault(r) }}>Set as default</button>}
-                <button type="button" onClick={() => { setOpenMenuId(null); onRename(r) }}>Rename</button>
-                {(r.targetJobId || jobCount > 0) && <button type="button" onClick={() => { setOpenMenuId(null); onUnlink(r) }}>Cancel link</button>}
-                <button type="button" className="danger" onClick={() => { setOpenMenuId(null); onDelete(r) }}>Delete</button>
+                {!r.isDefault && <button type="button" onClick={() => { setOpenMenuId(null); onSetDefault(r) }}>{t('resume.setDefault')}</button>}
+                <button type="button" onClick={() => { setOpenMenuId(null); onRename(r) }}>{t('resume.rename')}</button>
+                {(r.targetJobId || jobCount > 0) && <button type="button" onClick={() => { setOpenMenuId(null); onUnlink(r) }}>{t('resume.cancelLink')}</button>}
+                <button type="button" className="danger" onClick={() => { setOpenMenuId(null); onDelete(r) }}>{t('resume.delete')}</button>
               </div>}
             </div>
           </div>
