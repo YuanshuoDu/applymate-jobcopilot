@@ -210,7 +210,7 @@ export function LoginPage({ switchAccount = false, adminLogin = false }: { switc
               background:'linear-gradient(135deg, #4F46E5 0%, #7C3AED 100%)',
               WebkitBackgroundClip:'text', WebkitTextFillColor:'transparent', backgroundClip:'text',
             }}>ApplyMate AI</div>
-            <div style={{ fontSize:11, color:C.subtle }}>Job Copilot · Europe</div>
+            <div style={{ fontSize:11, color:C.subtle }}>{t('auth.brandTagline')}</div>
           </div>
         </Link>
 
@@ -254,7 +254,7 @@ export function LoginPage({ switchAccount = false, adminLogin = false }: { switc
               {t('auth.login.testimonial')}
             </p>
             <div style={{ fontSize:11, color:C.muted }}>
-              — <span style={{ fontWeight:600, color:C.text }}>Zhang Li</span>, Backend Engineer · Amsterdam
+              — <span style={{ fontWeight:600, color:C.text }}>{t('auth.testimonialAuthor')}</span>, {t('auth.testimonialRole')}
             </div>
           </div>
         </div>
@@ -346,7 +346,7 @@ export function LoginPage({ switchAccount = false, adminLogin = false }: { switc
             <div style={{ display:'flex', flexDirection:'column', gap:7 }}>
               <label htmlFor="login-email" style={{ fontSize:12, fontWeight:500, color:C.muted }}>{t('auth.login.email')}</label>
               <input
-                id="login-email" name="email" type="email" value={email} autoComplete="email" placeholder="you@example.com"
+                id="login-email" name="email" type="email" value={email} autoComplete="email" placeholder={t('auth.emailPlaceholder')}
                 onFocus={() => setFocused('email')} onBlur={() => setFocused(null)}
                 onChange={e => setEmail(e.target.value)}
                 style={{

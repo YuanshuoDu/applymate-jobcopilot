@@ -79,7 +79,7 @@ export function ForgotPasswordPage() {
           <div style={{ width: 32, height: 32, borderRadius: 8, background: C.primary, display: 'flex', alignItems: 'center', justifyContent: 'center', color: '#fff', fontSize: 15, fontWeight: 700 }}>A</div>
           <div>
             <div style={{ fontSize: 15, fontWeight: 600, color: C.text }}>ApplyMate AI</div>
-            <div style={{ fontSize: 11, color: C.muted }}>Job Copilot</div>
+            <div style={{ fontSize: 11, color: C.muted }}>{t('auth.forgotPassword.brandTagline')}</div>
           </div>
         </div>
 
@@ -105,7 +105,7 @@ export function ForgotPasswordPage() {
                   type="email"
                   value={email}
                   autoComplete="email"
-                  placeholder="you@example.com"
+                  placeholder={t('auth.emailPlaceholder')}
                   onChange={e => setEmail(e.target.value)}
                   className="input-base"
                   style={inputStyle}

@@ -139,9 +139,9 @@ export function PopupMainView({ settings, onSettings, onLogout }: {
         {currentJob ? <>
           <JobSummary job={currentJob} score={matchScore} labels={labels} />
           <div style={{ marginTop: 10, background: C.panel, border: `1px solid ${C.border}`, borderRadius: 14, overflow: 'hidden', boxShadow: C.shadow }}>
-            <ActionRow icon={<Bookmark size={21} strokeWidth={1.8} />} title={savedJob ? labels.savedJob : labels.saveJob} subtitle={savedJob ? 'Synced to your ApplyMate workspace' : labels.saveJobSub} onClick={handleSave} loading={saving} success={!!savedJob || message === 'saved'} />
+            <ActionRow icon={<Bookmark size={21} strokeWidth={1.8} />} title={savedJob ? labels.savedJob : labels.saveJob} subtitle={savedJob ? labels.syncedWorkspace : labels.saveJobSub} onClick={handleSave} loading={saving} success={!!savedJob || message === 'saved'} />
             <Divider />
-            <ActionRow icon={<BarChart3 size={21} strokeWidth={1.8} />} title={labels.analyzeMatch} subtitle={analyzing ? 'AI is reviewing your profile…' : labels.analyzeMatchSub} onClick={() => void handleAnalyze()} loading={analyzing} success={message === 'analyzed'} />
+            <ActionRow icon={<BarChart3 size={21} strokeWidth={1.8} />} title={labels.analyzeMatch} subtitle={analyzing ? labels.aiReviewing : labels.analyzeMatchSub} onClick={() => void handleAnalyze()} loading={analyzing} success={message === 'analyzed'} />
             <div style={{ padding: 12 }}><button type="button" onClick={() => void handleOpenSidePanel('resume')} style={primaryAction}><Sparkles size={21} strokeWidth={1.8} /><span style={{ flex: 1, textAlign: 'left' }}><strong>{labels.prepare}</strong><small>{labels.prepareSub}</small></span><ChevronRight size={21} strokeWidth={2} /></button></div>
           </div>
           {message && message !== 'saved' && message !== 'analyzed' && <InlineMessage text={message} />}

@@ -9,15 +9,15 @@ export function DetectionRow({ job, labels }: { job: ScrapedJob | null; labels: 
   const isLinkedIn = job?.source === 'linkedin'
   return <div style={{ display: 'flex', alignItems: 'center', gap: 8, minHeight: 42, padding: '5px 9px', border: `1px solid ${C.border}`, borderRadius: 11, background: C.panel, boxShadow: C.shadow }}>
     <div style={{ width: 28, height: 28, display: 'grid', placeItems: 'center', borderRadius: 8, background: isLinkedIn ? '#0A76B8' : C.lavender, color: isLinkedIn ? '#fff' : C.primary }}>{isLinkedIn ? <Linkedin size={16} strokeWidth={2.2} /> : <Search size={15} strokeWidth={1.8} />}</div>
-    <span style={{ flex: 1, minWidth: 0, fontSize: 11.5, fontWeight: 620, color: C.navy, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{job ? (isLinkedIn ? labels.detected : `${sourceLabel(job.source)} job page detected`) : labels.notDetected}</span>
-    <span aria-label={job ? 'Detected' : 'Not detected'} style={{ width: 21, height: 21, display: 'grid', placeItems: 'center', borderRadius: '50%', background: job ? C.greenBg : '#F3F4F8', color: job ? C.green : C.subtle }}>{job ? <Check size={13} strokeWidth={2.8} /> : <Search size={12} strokeWidth={1.8} />}</span>
+    <span style={{ flex: 1, minWidth: 0, fontSize: 11.5, fontWeight: 620, color: C.navy, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{job ? (isLinkedIn ? labels.detected : `${sourceLabel(job.source)} ${labels.detected.toLowerCase()}`) : labels.notDetected}</span>
+    <span aria-label={job ? labels.detectedLabel : labels.notDetectedLabel} style={{ width: 21, height: 21, display: 'grid', placeItems: 'center', borderRadius: '50%', background: job ? C.greenBg : '#F3F4F8', color: job ? C.green : C.subtle }}>{job ? <Check size={13} strokeWidth={2.8} /> : <Search size={12} strokeWidth={1.8} />}</span>
   </div>
 }
 
 export function JobSummary({ job, score, labels }: { job: ScrapedJob; score: number | null; labels: PopupLabels }) {
   const [logoFailed, setLogoFailed] = useState(false)
   const scoreColors = score == null ? null : scoreColorsFor(score)
-  const summary = score == null ? labels.readyToAnalyze : scoreColors?.tone === 'strong' ? labels.strongFit : scoreColors?.tone === 'normal' ? 'Good fit — review the role details.' : 'Review this role carefully before applying.'
+  const summary = score == null ? labels.readyToAnalyze : scoreColors?.tone === 'strong' ? labels.strongFit : scoreColors?.tone === 'normal' ? labels.goodFit : labels.reviewCarefully
   return <section style={{ marginTop: 10, padding: '14px 12px 12px', border: `1px solid ${C.border}`, borderRadius: 14, background: C.panel, boxShadow: C.shadow }}>
     <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
       <div style={{ width: 56, height: 56, display: 'grid', placeItems: 'center', overflow: 'hidden', flexShrink: 0, borderRadius: 13, background: '#131313', color: '#fff', fontWeight: 650, fontSize: job.company.length > 4 ? 11 : 16 }}>

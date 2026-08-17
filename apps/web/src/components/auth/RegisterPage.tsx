@@ -219,7 +219,7 @@ export function RegisterPage({ callbackUrl: rawCallbackUrl = '/' }: { callbackUr
               background: 'linear-gradient(135deg, #4F46E5 0%, #7C3AED 100%)',
               WebkitBackgroundClip: 'text', WebkitTextFillColor: 'transparent', backgroundClip: 'text',
             }}>ApplyMate AI</div>
-            <div style={{ fontSize: 11, color: C.subtle }}>Job Copilot · Europe</div>
+            <div style={{ fontSize: 11, color: C.subtle }}>{t('auth.brandTagline')}</div>
           </div>
         </Link>
 
@@ -260,10 +260,10 @@ export function RegisterPage({ callbackUrl: rawCallbackUrl = '/' }: { callbackUr
           }}>
             <div style={{ fontSize: 24, lineHeight: 1, color: C.primary, opacity: 0.28, fontFamily: 'Georgia,serif', marginBottom: 4, userSelect: 'none' }}>&ldquo;</div>
             <p style={{ fontSize: 12, color: C.text, lineHeight: 1.80, margin: '0 0 12px' }}>
-              ApplyMate helped me land interviews at Adyen and Booking.com within two weeks, saving me hours of resume work.
+              {t('auth.register.testimonial')}
             </p>
             <div style={{ fontSize: 11, color: C.muted }}>
-              — <span style={{ fontWeight: 600, color: C.text }}>Zhang Li</span>, Backend Engineer · Amsterdam
+              — <span style={{ fontWeight: 600, color: C.text }}>{t('auth.testimonialAuthor')}</span>, {t('auth.testimonialRole')}
             </div>
           </div>
         </div>
@@ -352,7 +352,7 @@ export function RegisterPage({ callbackUrl: rawCallbackUrl = '/' }: { callbackUr
             <div style={{ display: 'flex', flexDirection: 'column', gap: 7 }}>
               <label htmlFor="register-name" style={{ fontSize: 12, fontWeight: 500, color: C.muted }}>{t('auth.register.name')}</label>
               <input
-                id="register-name" name="name" type="text" value={name} autoComplete="name" placeholder="Alex Smith"
+                id="register-name" name="name" type="text" value={name} autoComplete="name" placeholder={t('auth.namePlaceholder')}
                 onFocus={() => setFocused('name')} onBlur={() => setFocused(null)}
                 onChange={e => setName(e.target.value)}
                 style={inputStyle('name')}
@@ -362,7 +362,7 @@ export function RegisterPage({ callbackUrl: rawCallbackUrl = '/' }: { callbackUr
             <div style={{ display: 'flex', flexDirection: 'column', gap: 7 }}>
               <label htmlFor="register-email" style={{ fontSize: 12, fontWeight: 500, color: C.muted }}>{t('auth.register.email')}</label>
               <input
-                id="register-email" name="email" type="email" value={email} autoComplete="email" placeholder="you@example.com"
+                id="register-email" name="email" type="email" value={email} autoComplete="email" placeholder={t('auth.emailPlaceholder')}
                 onFocus={() => setFocused('email')} onBlur={() => setFocused(null)}
                 onChange={e => setEmail(e.target.value)}
                 style={inputStyle('email')}
@@ -403,7 +403,7 @@ export function RegisterPage({ callbackUrl: rawCallbackUrl = '/' }: { callbackUr
               <label htmlFor="register-confirm" style={{ fontSize: 12, fontWeight: 500, color: C.muted }}>{t('auth.register.confirmPassword')}</label>
               <div style={{ position: 'relative' }}>
                 <input
-                  id="register-confirm" name="confirm" type={confirmVisible ? 'text' : 'password'} value={confirm} autoComplete="new-password" placeholder="Enter your password again"
+                  id="register-confirm" name="confirm" type={confirmVisible ? 'text' : 'password'} value={confirm} autoComplete="new-password" placeholder={t('auth.confirmPasswordPlaceholder')}
                   onFocus={() => setFocused('confirm')} onBlur={() => setFocused(null)}
                   onChange={e => setConfirm(e.target.value)}
                   style={{ ...inputStyle('confirm'), paddingRight: 40 }}
