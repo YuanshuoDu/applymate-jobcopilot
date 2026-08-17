@@ -15,6 +15,7 @@ import type { AgentChatAction } from '@/components/agent-workspace/agent-chat-st
 import type { LogEntry, QuestionOption, RunSummary } from '@/components/agent-workspace/live-run-types'
 import type { SubmissionPolicySettings } from '@/components/agent-workspace/automation-policy'
 import { useNav } from '@/lib/nav-context'
+import { useI18n } from '@/lib/i18n'
 
 // ── Role metadata ─────────────────────────────────────────────────────────────
 
@@ -27,6 +28,7 @@ import { useNav } from '@/lib/nav-context'
 export function AgentPlaygroundPage() {
   const toast = useToast()
   const { navigate } = useNav()
+  const { t } = useI18n()
 
   const { data: jobsData }                               = useApi<{ jobs: Array<{ status: string; workflowState: string }> }>('/api/jobs?pageSize=100')
   const { data: agentConfig, refetch: refetchAgentConfig } = useApi<AgentConfig>('/api/agent')
@@ -594,7 +596,7 @@ export function AgentPlaygroundPage() {
         }
       `}</style>
       {/* TopBar */}
-      <TopBar title="AI Agent">
+      <TopBar title={t('agent.title')}>
         <button
           className="agent-session-drawer-trigger"
           type="button"
@@ -603,7 +605,7 @@ export function AgentPlaygroundPage() {
           onClick={() => setMobileSessionDrawerOpen(true)}
         >
           <PanelLeftOpen size={15} aria-hidden="true" />
-          Conversations
+          {t('agent.conversations')}
         </button>
       </TopBar>
 
@@ -622,22 +624,22 @@ export function AgentPlaygroundPage() {
         <button
           className={`agent-session-drawer-scrim${mobileSessionDrawerOpen ? ' is-open' : ''}`}
           type="button"
-          aria-label="Close conversations"
+          aria-label={t('agent.closeConversations')}
           tabIndex={mobileSessionDrawerOpen ? 0 : -1}
           onClick={() => setMobileSessionDrawerOpen(false)}
         />
         <div id="agent-session-drawer" className={`agent-session-drawer${mobileSessionDrawerOpen ? ' is-open' : ''}`}>
           <div className="agent-session-drawer-header">
-            <span>Conversations</span>
+            <span>{t('agent.conversations')}</span>
             <div className="agent-session-drawer-actions">
-              <button className="agent-session-drawer-home" type="button" aria-label="Back to Home" onClick={() => {
+              <button className="agent-session-drawer-home" type="button" aria-label={t('agent.backHome')} onClick={() => {
                 setMobileSessionDrawerOpen(false)
                 navigate('dashboard')
               }}>
                 <Home size={15} aria-hidden="true" />
-                Back to Home
+                {t('agent.backHome')}
               </button>
-              <button className="agent-session-drawer-collapse" type="button" aria-label="Collapse conversations" onClick={() => setMobileSessionDrawerOpen(false)}>
+              <button className="agent-session-drawer-collapse" type="button" aria-label={t('agent.collapseConversations')} onClick={() => setMobileSessionDrawerOpen(false)}>
                 <PanelLeftClose size={17} aria-hidden="true" />
               </button>
             </div>
@@ -682,14 +684,14 @@ export function AgentPlaygroundPage() {
               if (opt?.action && opt.action.field !== '_navigate') {
                 const { error: patchError } = await apiMutate('/api/agent', 'PATCH', { [opt.action.field]: opt.action.value })
                 if (patchError) {
-                  toast.error('Settings update failed', patchError)
+                  toast.error(t('agent.settingsUpdateFailed'), patchError)
                   throw new Error(patchError)
                 }
               }
               // Post answer to DB so pipeline can continue
               const { error } = await apiMutate('/api/agent/answer', 'POST', { questionId, answer })
               if (error) {
-                toast.error('Answer submission failed', error)
+                toast.error(t('agent.answerFailed'), error)
                 throw new Error(error)
               }
               setWaitingQuestion(null)
@@ -699,11 +701,11 @@ export function AgentPlaygroundPage() {
             onApplied={async (jobId, job) => {
               const { error } = await apiMutate(`/api/jobs/${jobId}/apply`, 'POST', {})
               if (error) {
-                toast.error('Tag delivery failed', error)
+                toast.error(t('agent.deliveryFailed'), error)
                 throw new Error(error)
               }
               setApplyQueue(prev => prev.map(j => j.jobId === jobId ? { ...j, url: `_applied_${j.url}` } : j))
-              toast.success('Marked for delivery', `${job.company} · ${job.role}`)
+              toast.success(t('agent.markedForDelivery'), `${job.company} · ${job.role}`)
             }}
             onChatAction={handleChatAction}
             onAppendLog={addLog}

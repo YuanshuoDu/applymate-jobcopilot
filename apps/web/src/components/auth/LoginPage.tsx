@@ -6,6 +6,7 @@ import { useRouter, useSearchParams } from 'next/navigation'
 import Link from 'next/link'
 import { authLink, safeCallbackUrl } from '@/lib/auth-callback'
 import { credentialsSignInMessage, signInUrlErrorMessage } from '@/lib/auth-errors'
+import { useI18n } from '@/lib/i18n'
 
 // ── Design tokens ─────────────────────────────────────────────────────────────
 const C = {
@@ -112,6 +113,7 @@ function OAuthBtn({ icon, label, onClick, loading, dark }: {
 export { safeCallbackUrl } from '@/lib/auth-callback'
 
 export function LoginPage({ switchAccount = false, adminLogin = false }: { switchAccount?: boolean; adminLogin?: boolean }) {
+  const { t } = useI18n()
   const router       = useRouter()
   const searchParams = useSearchParams()
   const callbackUrl  = safeCallbackUrl(searchParams.get('callbackUrl'))
@@ -152,7 +154,7 @@ export function LoginPage({ switchAccount = false, adminLogin = false }: { switc
 
   async function handleCredentials(e: React.FormEvent) {
     e.preventDefault()
-    if (!email || !password) { setError('Please enter your email and password.'); return }
+    if (!email || !password) { setError(t('auth.login.error.emailPasswordRequired')); return }
     setError('')
     setLoading('credentials')
     if (switchAccount) await signOut({ redirect: false })
@@ -169,7 +171,7 @@ export function LoginPage({ switchAccount = false, adminLogin = false }: { switc
   }
 
   function handleUnavailableGoogle() {
-    setError('Google sign-in is not configured. Please use email sign-in.')
+    setError(t('auth.login.error.googleUnavailable'))
   }
 
   return (
@@ -215,16 +217,16 @@ export function LoginPage({ switchAccount = false, adminLogin = false }: { switc
         {/* Hero text */}
         <div className="auth-brand-hero" style={{ marginBottom:40 }}>
           <h1 style={{ fontSize:28, fontWeight:800, color:C.text, lineHeight:1.25, marginBottom:14, letterSpacing:'-0.02em' }}>
-            Let AI help you<br />find your next opportunity
+            {t('auth.login.heroTitle')}
           </h1>
           <p style={{ fontSize:13, color:C.muted, lineHeight:1.75 }}>
-            ApplyMate AI automates your job search, from discovering jobs to submitting applications.
+            {t('auth.login.heroDesc')}
           </p>
         </div>
 
         {/* Features */}
         <div className="auth-features" style={{ display:'flex', flexDirection:'column', gap:22 }}>
-          {FEATURES.map(f => (
+          {FEATURES.map((f, index) => (
             <div key={f.title} style={{ display:'flex', gap:14, alignItems:'flex-start' }}>
               <div style={{
                 width:36, height:36, borderRadius:10, flexShrink:0,
@@ -234,8 +236,8 @@ export function LoginPage({ switchAccount = false, adminLogin = false }: { switc
                 color:C.primary,
               }}>{f.icon}</div>
               <div>
-                <div style={{ fontSize:13, fontWeight:600, color:C.text, marginBottom:3 }}>{f.title}</div>
-                <div style={{ fontSize:11, color:C.muted, lineHeight:1.65 }}>{f.desc}</div>
+                <div style={{ fontSize:13, fontWeight:600, color:C.text, marginBottom:3 }}>{t(`auth.login.feature${index + 1}.title`)}</div>
+                <div style={{ fontSize:11, color:C.muted, lineHeight:1.65 }}>{t(`auth.login.feature${index + 1}.desc`)}</div>
               </div>
             </div>
           ))}
@@ -249,7 +251,7 @@ export function LoginPage({ switchAccount = false, adminLogin = false }: { switc
           }}>
             <div style={{ fontSize:24, lineHeight:1, color:C.primary, opacity:0.28, fontFamily:'Georgia,serif', marginBottom:4, userSelect:'none' }}>&ldquo;</div>
             <p style={{ fontSize:12, color:C.text, lineHeight:1.80, margin:'0 0 12px' }}>
-              ApplyMate helped me land interviews at Adyen and Booking.com within two weeks, saving me hours of resume work.
+              {t('auth.login.testimonial')}
             </p>
             <div style={{ fontSize:11, color:C.muted }}>
               — <span style={{ fontWeight:600, color:C.text }}>Zhang Li</span>, Backend Engineer · Amsterdam
@@ -274,19 +276,19 @@ export function LoginPage({ switchAccount = false, adminLogin = false }: { switc
         }}>
           {/* Header */}
           <div style={{ marginBottom:28 }}>
-            <h2 style={{ fontSize:22, fontWeight:800, color:C.text, marginBottom:6, letterSpacing:'-0.02em' }}>Welcome back 👋</h2>
+            <h2 style={{ fontSize:22, fontWeight:800, color:C.text, marginBottom:6, letterSpacing:'-0.02em' }}>{t('auth.login.welcomeBack')}</h2>
             {adminLogin ? (
               <p style={{ fontSize:13, color:C.muted }}>
-                Administrator access is invitation-only. Sign in with an approved admin account.
+                {t('auth.login.adminOnly')}
               </p>
             ) : (
               <p style={{ fontSize:13, color:C.muted }}>
-                Don&apos;t have an account?{' '}
+                {t('auth.login.noAccount')}{' '}
                 <Link href={authLink('/register', callbackUrl)} style={{
                   color:C.primary, textDecoration:'none', fontWeight:600,
                   background:'linear-gradient(135deg, #4F46E5, #7C3AED)',
                   WebkitBackgroundClip:'text', WebkitTextFillColor:'transparent', backgroundClip:'text',
-                }}>Create a free account</Link>
+                }}>{t('auth.login.signUp')}</Link>
               </p>
             )}
           </div>
@@ -297,7 +299,7 @@ export function LoginPage({ switchAccount = false, adminLogin = false }: { switc
               border: '1px solid rgba(21,128,61,0.22)', borderRadius: 10, marginBottom: 20,
               fontSize: 12, color: C.success,
             }}>
-              Your password was updated. Please sign in again.
+              {t('auth.login.passwordUpdated')}
             </div>
           )}
 
@@ -319,15 +321,15 @@ export function LoginPage({ switchAccount = false, adminLogin = false }: { switc
               <div style={{ display:'flex', flexDirection:'column', gap:10, marginBottom:22 }}>
                 <OAuthBtn
                   icon={<GoogleIcon />}
-                  label={googleAvailable ? 'Sign in with Google' : 'Google sign-in is not configured'}
+                  label={googleAvailable ? t('auth.login.googleLogin') : t('auth.login.googleUnavailableShort')}
                   onClick={() => googleAvailable ? handleOAuth('google') : handleUnavailableGoogle()}
                   loading={loading === 'google'}
                 />
-                {oauthProviders.github && <OAuthBtn icon={<GitHubIcon />} label="Sign in with GitHub" onClick={() => handleOAuth('github')} loading={loading === 'github'} dark />}
+                {oauthProviders.github && <OAuthBtn icon={<GitHubIcon />} label={t('auth.login.githubLogin')} onClick={() => handleOAuth('github')} loading={loading === 'github'} dark />}
               </div>
               <div style={{ display:'flex', alignItems:'center', gap:14, marginBottom:22 }}>
                 <div style={{ flex:1, height:1, background:'linear-gradient(90deg, transparent, rgba(79,70,229,0.20), transparent)' }} />
-                <span style={{ fontSize:11, color:C.subtle, whiteSpace:'nowrap' }}>or continue with email</span>
+                <span style={{ fontSize:11, color:C.subtle, whiteSpace:'nowrap' }}>{t('auth.login.orEmail')}</span>
                 <div style={{ flex:1, height:1, background:'linear-gradient(90deg, transparent, rgba(79,70,229,0.20), transparent)' }} />
               </div>
             </>
@@ -342,7 +344,7 @@ export function LoginPage({ switchAccount = false, adminLogin = false }: { switc
           <form onSubmit={handleCredentials} style={{ display:'flex', flexDirection:'column', gap:15 }}>
             {/* Email */}
             <div style={{ display:'flex', flexDirection:'column', gap:7 }}>
-              <label htmlFor="login-email" style={{ fontSize:12, fontWeight:500, color:C.muted }}>Email</label>
+              <label htmlFor="login-email" style={{ fontSize:12, fontWeight:500, color:C.muted }}>{t('auth.login.email')}</label>
               <input
                 id="login-email" name="email" type="email" value={email} autoComplete="email" placeholder="you@example.com"
                 onFocus={() => setFocused('email')} onBlur={() => setFocused(null)}
@@ -360,8 +362,8 @@ export function LoginPage({ switchAccount = false, adminLogin = false }: { switc
             {/* Password */}
             <div style={{ display:'flex', flexDirection:'column', gap:7 }}>
               <div style={{ display:'flex', justifyContent:'space-between', alignItems:'center' }}>
-                <label htmlFor="login-password" style={{ fontSize:12, fontWeight:500, color:C.muted }}>Password</label>
-                {!adminLogin && <Link href="/forgot-password" style={{ fontSize:11, color:C.primary, textDecoration:'none', fontWeight:500 }}>Forgot password?</Link>}
+                <label htmlFor="login-password" style={{ fontSize:12, fontWeight:500, color:C.muted }}>{t('auth.login.password')}</label>
+                {!adminLogin && <Link href="/forgot-password" style={{ fontSize:11, color:C.primary, textDecoration:'none', fontWeight:500 }}>{t('auth.login.forgotPassword')}</Link>}
               </div>
               <div style={{ position: 'relative' }}>
                 <input
@@ -379,8 +381,8 @@ export function LoginPage({ switchAccount = false, adminLogin = false }: { switc
                 />
                 <button
                   type="button"
-                  aria-label={passwordVisible ? 'Release to hide password' : 'Hold to show password'}
-                  title="Hold to show password"
+                  aria-label={passwordVisible ? t('auth.login.hidePassword') : t('auth.login.showPassword')}
+                  title={t('auth.login.showPassword')}
                   aria-pressed={passwordVisible}
                   onPointerDown={handlePasswordPointerDown}
                   onPointerUp={releasePasswordVisibility}
@@ -416,7 +418,7 @@ export function LoginPage({ switchAccount = false, adminLogin = false }: { switc
               }}
             >
               {loading === 'credentials' && <Spinner />}
-              {loading === 'credentials' ? 'Signing in...' : 'Sign in'}
+              {loading === 'credentials' ? t('auth.login.loggingIn') : t('auth.login.login')}
             </button>
           </form>
         </div>

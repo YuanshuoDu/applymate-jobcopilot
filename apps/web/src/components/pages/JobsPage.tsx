@@ -12,6 +12,7 @@ import { setCachedApiResponse } from '@/lib/api-cache'
 import { useNav } from '@/lib/nav-context'
 import { exportApplicationPackLocally } from '@/lib/bundle'
 import { assessApplicationPreflight } from '@/lib/agent/application-preflight'
+import { useI18n } from '@/lib/i18n'
 
 const KANBAN_COLS: JobStatus[] = ['saved', 'applied', 'interview', 'offer', 'rejected']
 const COL_LABELS: Record<JobStatus, string> = {
@@ -1340,6 +1341,7 @@ function ScoreJobButton({ job, onUpdate }: { job: Job; onUpdate: (updated: Job) 
 export function JobsPage() {
   const toast = useToast()
   const { navigate } = useNav()
+  const { t } = useI18n()
   const { data: session } = useSession()
   const userId = session?.user?.id ?? ''
   const cachedJobs = defaultJobsCache?.userId === userId ? defaultJobsCache : null
@@ -1537,15 +1539,15 @@ export function JobsPage() {
       <header className="jobs-page-header" style={{ minHeight: 62, flexShrink: 0, padding: '8px 30px', background: 'var(--bg-tertiary)' }}>
         <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 24, flexWrap: 'wrap' }}>
           <div style={{ flex: '1 1 360px', display: 'flex', alignItems: 'center', gap: 10, minWidth: 0 }}>
-            <h1 style={{ margin: 0, flexShrink: 0, fontSize: 22, fontWeight: 760, lineHeight: 1.1, letterSpacing: '-0.05em' }}>My Jobs</h1>
+            <h1 style={{ margin: 0, flexShrink: 0, fontSize: 22, fontWeight: 760, lineHeight: 1.1, letterSpacing: '-0.05em' }}>{t('jobs.title')}</h1>
             <span style={{ flexShrink: 0, fontSize: 12, color: 'var(--primary)', background: 'rgba(79,70,229,0.09)', borderRadius: 999, padding: '4px 9px', fontWeight: 600 }}>{total}</span>
-            <span style={{ minWidth: 0, overflow: 'hidden', color: 'var(--text-muted)', fontSize: 12, textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>Track your applications and move closer to your next opportunity.</span>
+            <span style={{ minWidth: 0, overflow: 'hidden', color: 'var(--text-muted)', fontSize: 12, textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{t('jobs.description')}</span>
           </div>
           <div style={{ display: 'flex', alignItems: 'center', gap: 12, flexWrap: 'wrap' }}>
             {([
-              [Bookmark, 'Saved', statusCounts.saved, '#6D5DFB'],
-              [Check, 'Applied', statusCounts.applied, '#185FA5'],
-              [UsersRound, 'Interviews', statusCounts.interview, '#3B6D11'],
+              [Bookmark, t('jobs.saved'), statusCounts.saved, '#6D5DFB'],
+              [Check, t('jobs.applied'), statusCounts.applied, '#185FA5'],
+              [UsersRound, t('jobs.interview'), statusCounts.interview, '#3B6D11'],
             ] as const).map(([Icon, label, count, color], index) => (
               <React.Fragment key={label}>
                 {index > 0 && <span aria-hidden="true" style={{ width: 1, height: 28, margin: '0 3px', background: 'var(--border)' }} />}
@@ -1557,7 +1559,7 @@ export function JobsPage() {
               </React.Fragment>
             ))}
             <span aria-hidden="true" style={{ width: 1, height: 28, margin: '0 3px', background: 'var(--border)' }} />
-            <Btn variant="primary" onClick={() => { setPrefillStatus(null); setShowAdd(true) }} style={{ width: 137, height: 34, justifyContent: 'center', padding: 0, borderRadius: 7, fontSize: 12 }}>+ Add job</Btn>
+            <Btn variant="primary" onClick={() => { setPrefillStatus(null); setShowAdd(true) }} style={{ width: 137, height: 34, justifyContent: 'center', padding: 0, borderRadius: 7, fontSize: 12 }}>{t('jobs.add')}</Btn>
           </div>
         </div>
       </header>
@@ -1566,47 +1568,47 @@ export function JobsPage() {
         <div className="jobs-page-toolbar" style={{ padding: 14, marginBottom: 0, background: 'var(--bg)', border: '0.5px solid var(--border)', borderBottom: 'none', borderRadius: '12px 12px 0 0', display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' }}>
           <div className="jobs-page-search" style={{ width: 420, maxWidth: '100%', display: 'flex', alignItems: 'center', gap: 8, padding: '0 12px', border: '0.5px solid var(--border)', borderRadius: 8, background: 'var(--bg)' }}>
             <Search size={17} color="var(--text-muted)" />
-            <input value={search} onChange={e => doSearch(e.target.value)} placeholder="Search jobs…"
+            <input value={search} onChange={e => doSearch(e.target.value)} placeholder={t('jobs.search')}
               style={{ width: '100%', padding: '10px 0', fontSize: 13, border: 'none', background: 'transparent', color: 'var(--text)', outline: 'none' }} />
           </div>
           <button onClick={scoreAllJobs} disabled={scoringAll} style={{ height: 38, padding: '0 12px', display: 'inline-flex', alignItems: 'center', gap: 7, border: scoringAll || selectedIds.size ? '1px solid rgba(79,70,229,0.38)' : '0.5px solid var(--border)', borderRadius: 8, background: scoringAll || selectedIds.size ? 'rgba(79,70,229,0.08)' : 'var(--bg)', color: scoringAll || selectedIds.size ? 'var(--primary)' : 'var(--text)', cursor: scoringAll ? 'wait' : 'pointer', fontSize: 12, fontWeight: 600, opacity: scoringAll ? 0.9 : 1, animation: scoringAll ? 'glowPulse 1.3s ease-in-out infinite' : 'none', transition: 'background 0.18s, border-color 0.18s, color 0.18s' }}>
-            {scoringAll ? <LoaderCircle size={15} style={{ animation: 'spin 0.8s linear infinite' }} /> : <Sparkles size={15} />} {scoringAll ? 'Scoring…' : selectedIds.size ? `Score ${selectedIds.size}` : 'Score'}
+            {scoringAll ? <LoaderCircle size={15} style={{ animation: 'spin 0.8s linear infinite' }} /> : <Sparkles size={15} />} {scoringAll ? t('jobs.scoring') : selectedIds.size ? `${t('jobs.score')} ${selectedIds.size}` : t('jobs.score')}
           </button>
           <button onClick={deleteSelectedJobs} disabled={!selectedIds.size || bulkDeleting} style={{ height: 38, padding: '0 12px', display: 'inline-flex', alignItems: 'center', gap: 7, border: '0.5px solid', borderColor: selectedIds.size ? '#E5A5A5' : 'var(--border)', borderRadius: 8, background: selectedIds.size ? '#FFF7F7' : 'var(--bg)', color: selectedIds.size ? '#A32D2D' : 'var(--text-muted)', cursor: selectedIds.size && !bulkDeleting ? 'pointer' : 'default', fontSize: 12, fontWeight: 500, opacity: bulkDeleting ? 0.65 : 1 }}>
-            <Trash2 size={15} /> {bulkDeleting ? 'Deleting…' : selectedIds.size ? `Delete ${selectedIds.size}` : 'Delete'}
+            <Trash2 size={15} /> {bulkDeleting ? t('jobs.deleting') : selectedIds.size ? `${t('jobs.delete')} ${selectedIds.size}` : t('jobs.delete')}
           </button>
           <select value={filterStatus} onChange={e => doFilter(e.target.value)} style={{ marginLeft: 'auto', padding: '10px 12px', fontSize: 12, border: '0.5px solid var(--border)', borderRadius: 8, background: 'var(--bg)', color: 'var(--text)', outline: 'none' }}>
-            <option value="all">All statuses</option>
+            <option value="all">{t('jobs.allStatuses')}</option>
             {KANBAN_COLS.map(c => <option key={c} value={c}>{COL_LABELS[c]}</option>)}
           </select>
           <div style={{ display: 'flex', border: '0.5px solid var(--border)', borderRadius: 8, overflow: 'hidden' }}>
-            {([['list', List], ['kanban', LayoutGrid]] as const).map(([v, Icon]) => <button key={v} onClick={() => setView(v)} aria-label={`${v} view`} style={{ padding: '8px 12px', background: view === v ? 'var(--primary)' : 'var(--bg)', color: view === v ? '#fff' : 'var(--text-muted)', border: 'none', cursor: 'pointer', display: 'inline-flex' }}><Icon size={17} /></button>)}
+            {([['list', List, 'jobs.listView'], ['kanban', LayoutGrid, 'jobs.kanbanView']] as const).map(([v, Icon, labelKey]) => <button key={v} onClick={() => setView(v)} aria-label={t(labelKey)} style={{ padding: '8px 12px', background: view === v ? 'var(--primary)' : 'var(--bg)', color: view === v ? '#fff' : 'var(--text-muted)', border: 'none', cursor: 'pointer', display: 'inline-flex' }}><Icon size={17} /></button>)}
           </div>
         </div>
 {loading ? (
           <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 60 }}>
             <div style={{ display: 'flex', alignItems: 'center', gap: 10, color: 'var(--text-muted)', fontSize: 12 }}>
               <div style={{ width: 20, height: 20, border: '2px solid rgba(79,70,229,0.2)', borderTopColor: 'var(--primary)', borderRadius: '50%', animation: 'spin 0.7s linear infinite' }} />
-              Loading jobs…
+              {t('jobs.loading')}
             </div>
           </div>
         ) : fetchError ? (
           <Card style={{ display: 'grid', minHeight: 200, placeItems: 'center', padding: 32, textAlign: 'center' }}>
             <div style={{ display: 'grid', justifyItems: 'center', maxWidth: 310 }}>
               <span style={{ display: 'grid', width: 42, height: 42, marginBottom: 13, placeItems: 'center', borderRadius: 12, color: '#6b58ed', background: '#f1efff' }}><AlertCircle size={21} /></span>
-              <strong style={{ color: 'var(--text)', fontSize: 14 }}>Couldn’t load your jobs</strong>
-              <p style={{ margin: '8px 0 18px', color: 'var(--text-muted)', fontSize: 12, lineHeight: 1.5 }}>Your applications are unchanged. Check your connection and try again.</p>
-              <Btn variant="primary" onClick={triggerRefresh}>Try again</Btn>
+              <strong style={{ color: 'var(--text)', fontSize: 14 }}>{t('jobs.loadError')}</strong>
+              <p style={{ margin: '8px 0 18px', color: 'var(--text-muted)', fontSize: 12, lineHeight: 1.5 }}>{t('jobs.loadErrorDetail')}</p>
+              <Btn variant="primary" onClick={triggerRefresh}>{t('common.retry')}</Btn>
             </div>
           </Card>
         ) : jobs.length === 0 ? (
           <Card style={{ padding: 48, textAlign: 'center' }}>
             <div style={{ fontSize: 32, marginBottom: 12 }}>📋</div>
-            <div style={{ fontSize: 14, fontWeight: 500, marginBottom: 6 }}>No jobs found</div>
+            <div style={{ fontSize: 14, fontWeight: 500, marginBottom: 6 }}>{t('jobs.noJobs')}</div>
             <div style={{ fontSize: 12, color: 'var(--text-muted)', marginBottom: 16 }}>
-              {search || filterStatus !== 'all' ? 'Try adjusting your search or filter.' : 'Add your first job or let the AI Agent find matches for you.'}
+              {search || filterStatus !== 'all' ? t('jobs.adjustSearch') : t('jobs.addFirst')}
             </div>
-            <Btn variant="primary" onClick={() => { setPrefillStatus(null); setShowAdd(true) }}>+ Add Job</Btn>
+            <Btn variant="primary" onClick={() => { setPrefillStatus(null); setShowAdd(true) }}>{t('jobs.add')}</Btn>
           </Card>
         ) : (
           <>

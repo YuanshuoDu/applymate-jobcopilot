@@ -1,4 +1,5 @@
 import type { GmailMessageKind } from '@/lib/gmail-tracking'
+import { useI18n } from '@/lib/i18n'
 import {
   GMAIL_INBOX_FILTER_KINDS,
   GMAIL_TAG_DISPLAY,
@@ -13,13 +14,14 @@ interface GmailInboxSidebarProps {
   onFilterChange: (filter: GmailInboxFilter) => void
 }
 
-const STANDARD_FILTERS: Array<{ key: GmailInboxFilter; label: string; count: (counts: GmailInboxCounts) => number }> = [
-  { key: 'all', label: 'All Emails', count: counts => counts.total },
-  { key: 'unread', label: 'Unread', count: counts => counts.unread },
-  { key: 'starred', label: 'Starred', count: counts => counts.starred },
+const STANDARD_FILTERS: Array<{ key: GmailInboxFilter; labelKey: string; count: (counts: GmailInboxCounts) => number }> = [
+  { key: 'all', labelKey: 'gmail.allEmails', count: counts => counts.total },
+  { key: 'unread', labelKey: 'gmail.unreadFilter', count: counts => counts.unread },
+  { key: 'starred', labelKey: 'gmail.starred', count: counts => counts.starred },
 ]
 
 export function GmailInboxSidebar({ activeFilter, counts, email, onFilterChange }: GmailInboxSidebarProps) {
+  const { t } = useI18n()
   return <aside style={{
     width: 186,
     flexShrink: 0,
@@ -31,12 +33,12 @@ export function GmailInboxSidebar({ activeFilter, counts, email, onFilterChange 
     {STANDARD_FILTERS.map(item => <FilterButton
       key={item.key}
       active={activeFilter === item.key}
-      label={item.label}
+      label={t(item.labelKey)}
       count={item.count(counts)}
       onClick={() => onFilterChange(item.key)}
     />)}
 
-    <div style={sectionLabel}>By Type</div>
+    <div style={sectionLabel}>{t('gmail.byType')}</div>
     {GMAIL_INBOX_FILTER_KINDS.map(kind => <EvidenceFilterButton
       key={kind}
       kind={kind}
@@ -46,7 +48,7 @@ export function GmailInboxSidebar({ activeFilter, counts, email, onFilterChange 
     />)}
 
     {email && <div style={{ marginTop: 16, padding: '8px 10px', borderTop: '0.5px solid var(--border)' }}>
-      <div style={{ fontSize: 9, color: 'var(--text-muted)', marginBottom: 4 }}>Connected as</div>
+      <div style={{ fontSize: 9, color: 'var(--text-muted)', marginBottom: 4 }}>{t('gmail.connectedAs')}</div>
       <div style={{ fontSize: 10, color: 'var(--text)', wordBreak: 'break-all' }}>{email}</div>
     </div>}
   </aside>

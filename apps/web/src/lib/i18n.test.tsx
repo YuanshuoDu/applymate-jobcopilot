@@ -25,4 +25,21 @@ describe('AI settings translations', () => {
     expect(translate('zh', 'nav.dashboard')).toBe('仪表板')
     expect(translate('en', 'nav.dashboard')).not.toBe(translate('zh', 'nav.dashboard'))
   })
+
+  it('provides both language values for the primary user surfaces', () => {
+    const keys = [
+      'dashboard.momentum.title',
+      'jobs.title',
+      'gmail.title',
+      'auth.login.welcomeBack',
+      'auth.register.createAccount',
+      'common.match',
+    ]
+
+    for (const key of keys) {
+      expect(translate('en', key), key).not.toBe(key)
+      expect(translate('zh', key), key).not.toBe(key)
+      expect(translate('en', key), key).not.toBe(translate('zh', key))
+    }
+  })
 })

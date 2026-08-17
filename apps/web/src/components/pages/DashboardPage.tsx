@@ -9,9 +9,11 @@ import { Btn, ScorePill, useToast } from '@/components/ui'
 import type { Activity, DashboardApplicationDay, DashboardData, DashboardInterview, DashboardRecommendation, DashboardSavedJob } from '@/lib/types'
 import { apiMutate, fmtDate, useApi } from '@/lib/hooks'
 import { useNav } from '@/lib/nav-context'
+import { useI18n } from '@/lib/i18n'
 import './DashboardPage.css'
 
-const WEEK_DAYS = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun']
+const WEEK_DAY_KEYS = ['dashboard.day.mon', 'dashboard.day.tue', 'dashboard.day.wed', 'dashboard.day.thu', 'dashboard.day.fri', 'dashboard.day.sat', 'dashboard.day.sun']
+type Translate = (key: string) => string
 
 function getWeekRange(offset: number) {
   const start = new Date()
@@ -62,7 +64,7 @@ function CompanyBadge({ company, logo }: { company: string; logo?: string | null
   return <span className="momentum-company-logo momentum-logo-fallback"><BriefcaseBusiness size={15} /></span>
 }
 
-function WeekGoal({ completed, applicationDays, interviews, range }: { completed: number; applicationDays: DashboardApplicationDay[]; interviews: DashboardInterview[]; range: { start: Date; end: Date } }) {
+function WeekGoal({ completed, applicationDays, interviews, range, t }: { completed: number; applicationDays: DashboardApplicationDay[]; interviews: DashboardInterview[]; range: { start: Date; end: Date }; t: Translate }) {
   const target = 12
   const value = Math.min(completed, target)
   const progress = Math.round((value / target) * 100)
@@ -77,68 +79,69 @@ function WeekGoal({ completed, applicationDays, interviews, range }: { completed
   return (
     <section className="momentum-week-goal">
       <div className="momentum-ring" style={{ '--progress': `${progress * 3.6}deg` } as React.CSSProperties}>
-        <div><strong>{value}</strong><span>of {target}</span><small>quality applications<br />this week</small></div>
+        <div><strong>{value}</strong><span>of {target}</span><small>{t('dashboard.momentum.qualityApplications')}<br />{t('dashboard.momentum.thisWeek')}</small></div>
       </div>
       <div className="momentum-week-copy">
-        <span className="momentum-section-kicker"><Sparkles size={15} /> Keep it up!</span>
-        <h2>You&apos;re building real momentum.</h2>
-        <p>Aim for {target} quality applications this week to maximise your chances and keep your pipeline strong.</p>
+        <span className="momentum-section-kicker"><Sparkles size={15} /> {t('dashboard.momentum.keepGoing')}</span>
+        <h2>{t('dashboard.momentum.building')}</h2>
+        <p>{t('dashboard.momentum.aim').replace('quality applications', `${target} ${t('dashboard.momentum.qualityApplications')}`)}</p>
         <div className="momentum-days" aria-label={`${progress}% of weekly goal complete`}>
-          {WEEK_DAYS.map((day, index) => {
+          {WEEK_DAY_KEYS.map((dayKey, index) => {
             const date = new Date(range.start)
             date.setDate(range.start.getDate() + index)
             const key = dateKey(date)
             const applicationCount = applicationsByDay.get(key) ?? 0
             const interview = interviewsByDay.get(key)?.[0]
             const state = interview ? 'is-interview' : applicationCount > 0 ? 'is-done' : key < todayKey ? 'is-missed' : key === todayKey ? 'is-today' : ''
-            const label = interview ? `Interview · ${formatInterviewSlot(interview.scheduledAt)}` : applicationCount > 0 ? `${applicationCount} application${applicationCount === 1 ? '' : 's'} submitted` : state === 'is-missed' ? 'No application submitted' : state === 'is-today' ? 'Today' : 'Upcoming day'
-            return <div key={key}><small>{day}</small><span className={state} title={label}>{interview ? <CalendarDays size={11} /> : applicationCount > 0 ? <Check size={11} /> : state === 'is-missed' ? <X size={11} /> : null}</span></div>
+            const submitted = applicationCount === 1 ? t('dashboard.momentum.applicationSubmitted') : t('dashboard.momentum.applicationsSubmitted')
+            const label = interview ? `${t('dashboard.momentum.interview')} · ${formatInterviewSlot(interview.scheduledAt)}` : applicationCount > 0 ? `${applicationCount} ${submitted}` : state === 'is-missed' ? t('dashboard.momentum.noApplication') : state === 'is-today' ? t('dashboard.momentum.today') : t('dashboard.momentum.upcoming')
+            return <div key={key}><small>{t(dayKey)}</small><span className={state} title={label}>{interview ? <CalendarDays size={11} /> : applicationCount > 0 ? <Check size={11} /> : state === 'is-missed' ? <X size={11} /> : null}</span></div>
           })}
         </div>
-        <div className="momentum-goal-legend"><span><i className="is-done"><Check size={9} /></i> Applied</span><span><i className="is-interview"><CalendarDays size={9} /></i> Interview</span><span><i className="is-missed"><X size={9} /></i> Missed</span></div>
-        {interviews.length > 0 && <div className="momentum-interview-list">{interviews.slice(0, 2).map(interview => <span key={interview.id}><CalendarDays size={12} /><strong>Interview</strong> {formatInterviewSlot(interview.scheduledAt)}{interview.role ? ` · ${interview.role}` : ''}</span>)}</div>}
+        <div className="momentum-goal-legend"><span><i className="is-done"><Check size={9} /></i> {t('dashboard.momentum.applied')}</span><span><i className="is-interview"><CalendarDays size={9} /></i> {t('dashboard.momentum.interview')}</span><span><i className="is-missed"><X size={9} /></i> {t('dashboard.momentum.missed')}</span></div>
+        {interviews.length > 0 && <div className="momentum-interview-list">{interviews.slice(0, 2).map(interview => <span key={interview.id}><CalendarDays size={12} /><strong>{t('dashboard.momentum.interview')}</strong> {formatInterviewSlot(interview.scheduledAt)}{interview.role ? ` · ${interview.role}` : ''}</span>)}</div>}
       </div>
     </section>
   )
 }
 
-function CoachCard({ hasResume, savedJobs, onAction }: { hasResume: boolean; savedJobs: number; onAction: () => void }) {
-  const title = !hasResume ? 'Finish your resume for tailored matches' : savedJobs > 0 ? 'Focus on your strongest matches' : 'Focus on one high-impact improvement'
+function CoachCard({ hasResume, savedJobs, onAction, t }: { hasResume: boolean; savedJobs: number; onAction: () => void; t: Translate }) {
+  const title = !hasResume ? t('dashboard.momentum.finishResume') : savedJobs > 0 ? t('dashboard.momentum.focusMatches') : t('dashboard.momentum.focusImprovement')
   const detail = !hasResume
-    ? 'Upload your resume and the agent will tailor every recommendation to your experience.'
+    ? t('dashboard.momentum.resumeDetail')
     : savedJobs > 0
-      ? `${savedJobs} high-match role${savedJobs === 1 ? '' : 's'} ${savedJobs === 1 ? 'is' : 'are'} ready for your next step.`
-      : 'Add 2–3 quantified achievements to make your experience easier for recruiters to scan.'
+      ? `${savedJobs} ${t('dashboard.momentum.savedJobsDetail')}`
+      : t('dashboard.momentum.achievementDetail')
 
   return (
     <section className="momentum-coach-card">
       <span className="momentum-coach-icon"><Sparkles size={21} /></span>
-      <div><small>Your AI coach</small><h2>{title}</h2><p>{detail}</p><button onClick={onAction}>{!hasResume ? 'Add your resume' : savedJobs > 0 ? 'Review matches' : 'Improve resume'} <ArrowRight size={14} /></button></div>
+      <div><small>{t('dashboard.momentum.coach')}</small><h2>{title}</h2><p>{detail}</p><button onClick={onAction}>{!hasResume ? t('dashboard.momentum.addResume') : savedJobs > 0 ? t('dashboard.momentum.reviewMatches') : t('dashboard.momentum.improveResume')} <ArrowRight size={14} /></button></div>
       <span className="momentum-coach-document"><FileText size={36} /><Sparkles size={17} /></span>
     </section>
   )
 }
 
-function MatchList({ jobs, threshold, onReview }: { jobs: DashboardSavedJob[]; threshold: number; onReview: () => void }) {
+function MatchList({ jobs, threshold, onReview, t }: { jobs: DashboardSavedJob[]; threshold: number; onReview: () => void; t: Translate }) {
   return (
     <section className="momentum-side-card momentum-matches-card">
-      <div className="momentum-side-title"><Sparkles size={18} /><div><h2>High-match roles</h2><p>{jobs.length > 0 ? `${jobs.length} role${jobs.length === 1 ? '' : 's'} at ${threshold}%+ waiting for approval` : `Saved roles scoring ${threshold}%+ appear here`}</p></div></div>
+      <div className="momentum-side-title"><Sparkles size={18} /><div><h2>{t('dashboard.momentum.highMatchRoles')}</h2><p>{jobs.length > 0 ? `${jobs.length} ${t('dashboard.momentum.savedMatch')} ${threshold}%+ ${t('dashboard.momentum.waitingApproval')}` : `${t('dashboard.momentum.savedRoles')} ${threshold}%+`}</p></div></div>
       <div className="momentum-match-list">
-        {jobs.length === 0 ? <div className="momentum-side-empty"><BriefcaseBusiness size={19} /> Save promising roles to compare them here.</div> : jobs.slice(0, 3).map(job => (
+        {jobs.length === 0 ? <div className="momentum-side-empty"><BriefcaseBusiness size={19} /> {t('dashboard.momentum.savePromising')}</div> : jobs.slice(0, 3).map(job => (
           <article className="momentum-match" key={job.id}>
             <CompanyBadge company={job.company} />
-            <div className="momentum-match-copy"><strong>{job.role}</strong><span>{job.company}</span><small>Saved match</small></div>
+            <div className="momentum-match-copy"><strong>{job.role}</strong><span>{job.company}</span><small>{t('dashboard.momentum.savedMatch')}</small></div>
             <ScorePill score={job.score} />
-            <button onClick={onReview} aria-label={`View ${job.role} at ${job.company}`}>View <ArrowRight size={15} /></button>
+            <button onClick={onReview} aria-label={`${t('dashboard.momentum.view')} ${job.role} at ${job.company}`}>{t('dashboard.momentum.view')} <ArrowRight size={15} /></button>
           </article>
         ))}
       </div>
-      <button className="momentum-link" onClick={onReview}>View all matches <ArrowRight size={15} /></button>
+      <button className="momentum-link" onClick={onReview}>{t('dashboard.momentum.viewAllMatches')} <ArrowRight size={15} /></button>
     </section>
   )
 }
 
-function Timeline({ activities, onJobs }: { activities: Activity[]; onJobs: () => void }) {
+function Timeline({ activities, onJobs, t }: { activities: Activity[]; onJobs: () => void; t: Translate }) {
   const [sortBy, setSortBy] = useState<'recent' | 'company'>('recent')
   const [sortOpen, setSortOpen] = useState(false)
   const [page, setPage] = useState(0)
@@ -153,64 +156,64 @@ function Timeline({ activities, onJobs }: { activities: Activity[]; onJobs: () =
 
   return (
     <section className="momentum-timeline-card">
-      <div className="momentum-timeline-heading"><h2>Your application timeline</h2><div className="momentum-sort"><button onClick={() => setSortOpen(open => !open)} aria-expanded={sortOpen}>{sortBy === 'recent' ? 'Most recent' : 'Company'} <ChevronDown size={14} /></button>{sortOpen && <div><button onClick={() => { setSortBy('recent'); setPage(0); setSortOpen(false) }}>Most recent</button><button onClick={() => { setSortBy('company'); setPage(0); setSortOpen(false) }}>Company</button></div>}</div></div>
+      <div className="momentum-timeline-heading"><h2>{t('dashboard.momentum.applicationTimeline')}</h2><div className="momentum-sort"><button onClick={() => setSortOpen(open => !open)} aria-expanded={sortOpen}>{sortBy === 'recent' ? t('dashboard.momentum.mostRecent') : t('dashboard.cols.company')} <ChevronDown size={14} /></button>{sortOpen && <div><button onClick={() => { setSortBy('recent'); setPage(0); setSortOpen(false) }}>{t('dashboard.momentum.mostRecent')}</button><button onClick={() => { setSortBy('company'); setPage(0); setSortOpen(false) }}>{t('dashboard.cols.company')}</button></div>}</div></div>
       {activities.length === 0 ? (
-        <div className="momentum-timeline-empty"><Target size={20} /> Your application activity will appear here.</div>
+        <div className="momentum-timeline-empty"><Target size={20} /> {t('dashboard.momentum.activityHere')}</div>
       ) : (
         <div className="momentum-table">
           {pageActivities.map(activity => (
             <div className="momentum-row" key={activity.id}>
               <span className={`momentum-row-status ${activity.type === 'rejected' ? 'is-rejected' : 'is-complete'}`}>{activity.type === 'rejected' ? <X size={11} /> : <Check size={11} />}</span>
               <CompanyBadge company={activity.job?.company ?? 'Gmail'} />
-              <div className="momentum-row-role"><strong>{activity.job?.role ?? 'Application update'}</strong><span>{activity.text}</span></div>
-              <span style={{ fontSize: 11, color: 'var(--text-muted)', whiteSpace: 'nowrap' }}>{activityLabel(activity.type)}</span>
+              <div className="momentum-row-role"><strong>{activity.job?.role ?? t('dashboard.momentum.applicationUpdate')}</strong><span>{activity.text}</span></div>
+              <span style={{ fontSize: 11, color: 'var(--text-muted)', whiteSpace: 'nowrap' }}>{activityLabel(activity.type, t)}</span>
               <time>{fmtDate(activity.createdAt)}</time>
-              <button onClick={onJobs}>View <ArrowRight size={12} /></button>
+              <button onClick={onJobs}>{t('dashboard.momentum.view')} <ArrowRight size={12} /></button>
               <MoreVertical size={16} className="momentum-row-more" />
             </div>
           ))}
         </div>
       )}
-      {sortedActivities.length > pageSize && <div className="momentum-timeline-pagination"><button aria-label="Previous timeline page" disabled={currentPage === 0} onClick={() => setPage(value => Math.max(0, value - 1))}><ChevronLeft size={14} /></button><span>{currentPage + 1} / {pageCount}</span><button aria-label="Next timeline page" disabled={currentPage >= pageCount - 1} onClick={() => setPage(value => Math.min(pageCount - 1, value + 1))}><ChevronRight size={14} /></button></div>}
-      <button className="momentum-link momentum-center-link" onClick={onJobs}>View full application history <ArrowRight size={15} /></button>
+      {sortedActivities.length > pageSize && <div className="momentum-timeline-pagination"><button aria-label={t('dashboard.momentum.previousPage')} disabled={currentPage === 0} onClick={() => setPage(value => Math.max(0, value - 1))}><ChevronLeft size={14} /></button><span>{currentPage + 1} / {pageCount}</span><button aria-label={t('dashboard.momentum.nextPage')} disabled={currentPage >= pageCount - 1} onClick={() => setPage(value => Math.min(pageCount - 1, value + 1))}><ChevronRight size={14} /></button></div>}
+      <button className="momentum-link momentum-center-link" onClick={onJobs}>{t('dashboard.momentum.viewHistory')} <ArrowRight size={15} /></button>
     </section>
   )
 }
 
-function activityLabel(type: Activity['type']): string {
-  if (type === 'applied') return 'Applied'
-  if (type === 'interview_scheduled') return 'Interview'
-  if (type === 'offer_received') return 'Offer'
-  if (type === 'rejected') return 'Rejected'
-  if (type === 'email_sent') return 'Follow-up sent'
-  if (type === 'status_changed') return 'Status update'
-  return 'Activity'
+function activityLabel(type: Activity['type'], t: Translate): string {
+  if (type === 'applied') return t('dashboard.momentum.applied')
+  if (type === 'interview_scheduled') return t('dashboard.momentum.interview')
+  if (type === 'offer_received') return t('dashboard.offers')
+  if (type === 'rejected') return t('jobs.rejected')
+  if (type === 'email_sent') return t('dashboard.momentum.followUpSent')
+  if (type === 'status_changed') return t('dashboard.momentum.statusUpdate')
+  return t('dashboard.momentum.activity')
 }
 
-function WeekAtAGlance({ stats, onJobs }: { stats: DashboardData['stats']; onJobs: () => void }) {
+function WeekAtAGlance({ stats, onJobs, t }: { stats: DashboardData['stats']; onJobs: () => void; t: Translate }) {
   const target = 12
   const progress = Math.min((stats.thisWeek / target) * 100, 100)
   return (
     <section className="momentum-side-card momentum-glance-card">
-      <div className="momentum-side-title"><Target size={19} /><div><h2>This week at a glance</h2></div></div>
-      <div className="momentum-glance-line"><span className="momentum-glance-icon"><Send size={17} /></span><div><small>Applications</small><strong>{stats.thisWeek} of {target}</strong><i><b style={{ width: `${progress}%` }} /></i></div></div>
-      <div className="momentum-glance-line"><span className="momentum-glance-icon"><Eye size={17} /></span><div><small>Tracked roles</small><strong>{stats.total}</strong></div></div>
-      <div className="momentum-glance-line"><span className="momentum-glance-icon"><Target size={17} /></span><div><small>Interviews</small><strong>{stats.interviews}</strong></div></div>
-      <button className="momentum-link" onClick={onJobs}>View full insights <ArrowRight size={15} /></button>
+      <div className="momentum-side-title"><Target size={19} /><div><h2>{t('dashboard.momentum.weekGlance')}</h2></div></div>
+      <div className="momentum-glance-line"><span className="momentum-glance-icon"><Send size={17} /></span><div><small>{t('dashboard.momentum.applications')}</small><strong>{stats.thisWeek} of {target}</strong><i><b style={{ width: `${progress}%` }} /></i></div></div>
+      <div className="momentum-glance-line"><span className="momentum-glance-icon"><Eye size={17} /></span><div><small>{t('dashboard.momentum.trackedRoles')}</small><strong>{stats.total}</strong></div></div>
+      <div className="momentum-glance-line"><span className="momentum-glance-icon"><Target size={17} /></span><div><small>{t('dashboard.momentum.interviews')}</small><strong>{stats.interviews}</strong></div></div>
+      <button className="momentum-link" onClick={onJobs}>{t('dashboard.momentum.viewInsights')} <ArrowRight size={15} /></button>
     </section>
   )
 }
 
-function JobNotifications({ recommendations, onReview }: { recommendations: DashboardRecommendation[]; onReview: () => void }) {
+function JobNotifications({ recommendations, onReview, t }: { recommendations: DashboardRecommendation[]; onReview: () => void; t: Translate }) {
   return <section className="momentum-side-card momentum-notifications-card">
-    <div className="momentum-side-title"><MailCheck size={19} /><div><h2>Job notifications</h2><p>{recommendations.length ? `${recommendations.length} new role${recommendations.length === 1 ? '' : 's'} from today’s subscriptions` : 'Today’s subscription emails appear here'}</p></div></div>
-    {recommendations.length === 0 ? <div className="momentum-side-empty"><MailCheck size={19} /> No new job subscriptions today.</div> : <div className="momentum-notification-list">{recommendations.map(job => <button className="momentum-notification" key={job.id} onClick={onReview}><span className="momentum-notification-icon"><BriefcaseBusiness size={15} /></span><span><strong>{job.role ?? 'Job recommendation'}</strong><small>{[job.company, job.location, job.platform].filter(Boolean).join(' · ') || 'Subscription job alert'}</small></span><ArrowRight size={14} /></button>)}</div>}
-    <button className="momentum-link" onClick={onReview}>Review job recommendations <ArrowRight size={15} /></button>
+    <div className="momentum-side-title"><MailCheck size={19} /><div><h2>{t('dashboard.momentum.notifications')}</h2><p>{recommendations.length ? `${recommendations.length} ${t('dashboard.momentum.jobRecommendation')}` : t('dashboard.momentum.subscriptionEmails')}</p></div></div>
+    {recommendations.length === 0 ? <div className="momentum-side-empty"><MailCheck size={19} /> {t('dashboard.momentum.noSubscriptions')}</div> : <div className="momentum-notification-list">{recommendations.map(job => <button className="momentum-notification" key={job.id} onClick={onReview}><span className="momentum-notification-icon"><BriefcaseBusiness size={15} /></span><span><strong>{job.role ?? t('dashboard.momentum.jobRecommendation')}</strong><small>{[job.company, job.location, job.platform].filter(Boolean).join(' · ') || t('dashboard.momentum.subscriptionAlert')}</small></span><ArrowRight size={14} /></button>)}</div>}
+    <button className="momentum-link" onClick={onReview}>{t('dashboard.momentum.reviewRecommendations')} <ArrowRight size={15} /></button>
   </section>
 }
 
-function ActionCard({ followUps, agentConfig, onJobs, onSettings, onUpdated }: {
-  followUps: DashboardData['followUpsDue']; agentConfig: DashboardData['agentConfig']; onJobs: () => void; onSettings: () => void; onUpdated: () => void
+function ActionCard({ followUps, agentConfig, onJobs, onSettings, onUpdated, t }: {
+  followUps: DashboardData['followUpsDue']; agentConfig: DashboardData['agentConfig']; onJobs: () => void; onSettings: () => void; onUpdated: () => void; t: Translate
 }) {
   const toast = useToast()
   const [saving, setSaving] = useState(false)
@@ -220,21 +223,22 @@ function ActionCard({ followUps, agentConfig, onJobs, onSettings, onUpdated }: {
     setSaving(true)
     const { error } = await apiMutate('/api/agent', 'PATCH', { isRunning: !running })
     setSaving(false)
-    if (error) return toast.error('Could not update agent', error)
-    toast.success(running ? 'Agent paused' : 'Agent resumed')
+    if (error) return toast.error(t('dashboard.momentum.couldNotUpdateAgent'), error)
+    toast.success(running ? t('dashboard.momentum.agentPausedToast') : t('dashboard.momentum.agentResumedToast'))
     onUpdated()
   }
 
   return <section className="momentum-side-card momentum-actions-card">
-    <div className="momentum-side-title"><Target size={19} /><div><h2>Next actions</h2><p>{followUps.length ? `${followUps.length} follow-up${followUps.length === 1 ? '' : 's'} due` : 'Your pipeline is up to date'}</p></div></div>
-    {followUps.length > 0 && <button className="momentum-follow-up" onClick={onJobs}><CalendarDays size={16} /><span><strong>{followUps[0].role}</strong><small>{followUps[0].company} · follow up {fmtDate(followUps[0].followUpAt)}</small></span><ArrowRight size={15} /></button>}
-    <div className="momentum-agent-control"><span><i className={running ? 'is-running' : ''} /> Agent {running ? 'running' : 'paused'}</span><button onClick={toggleAgent} disabled={saving}>{saving ? 'Saving…' : running ? 'Pause' : 'Resume'}</button></div>
-    <button className="momentum-link" onClick={onSettings}>Configure agent <ArrowRight size={15} /></button>
+    <div className="momentum-side-title"><Target size={19} /><div><h2>{t('dashboard.momentum.nextActions')}</h2><p>{followUps.length ? `${followUps.length} ${t('dashboard.momentum.followUp')}` : t('dashboard.momentum.pipelineUpToDate')}</p></div></div>
+    {followUps.length > 0 && <button className="momentum-follow-up" onClick={onJobs}><CalendarDays size={16} /><span><strong>{followUps[0].role}</strong><small>{followUps[0].company} · {t('dashboard.momentum.followUp')} {fmtDate(followUps[0].followUpAt)}</small></span><ArrowRight size={15} /></button>}
+    <div className="momentum-agent-control"><span><i className={running ? 'is-running' : ''} /> {running ? t('dashboard.momentum.agentRunning') : t('dashboard.momentum.agentPaused')}</span><button onClick={toggleAgent} disabled={saving}>{saving ? t('dashboard.momentum.saving') : running ? t('dashboard.momentum.pause') : t('dashboard.momentum.resume')}</button></div>
+    <button className="momentum-link" onClick={onSettings}>{t('dashboard.momentum.configureAgent')} <ArrowRight size={15} /></button>
   </section>
 }
 
 export function DashboardPage() {
   const { navigate } = useNav()
+  const { t } = useI18n()
   const [weekOffset, setWeekOffset] = useState(0)
   const [dateMenuOpen, setDateMenuOpen] = useState(false)
   const [calendarMonth, setCalendarMonth] = useState(() => new Date())
@@ -279,8 +283,8 @@ export function DashboardPage() {
     return () => clearInterval(id)
   }, [refetch])
 
-  if (loading) return <div className="momentum-loading">Loading your momentum dashboard…</div>
-  if (error) return <div className="momentum-loading"><div className="momentum-error-state"><span><AlertCircle size={21} /></span><strong>Couldn’t load your dashboard</strong><p>Your application data is unchanged. Check your connection and try again.</p><Btn variant="primary" onClick={refetch}>Try again</Btn></div></div>
+  if (loading) return <div className="momentum-loading">{t('dashboard.momentum.loading')}</div>
+  if (error) return <div className="momentum-loading"><div className="momentum-error-state"><span><AlertCircle size={21} /></span><strong>{t('dashboard.momentum.loadError')}</strong><p>{t('dashboard.momentum.loadErrorDetail')}</p><Btn variant="primary" onClick={refetch}>{t('dashboard.momentum.tryAgain')}</Btn></div></div>
 
   const stats = data?.stats ?? { total: 0, saved: 0, applied: 0, inProgress: 0, interviews: 0, offers: 0, rejected: 0, thisWeek: 0 }
   const savedJobs = data?.savedJobs ?? []
@@ -291,15 +295,15 @@ export function DashboardPage() {
     <div className="momentum-dashboard">
       <main className="momentum-content">
         {!data?.hasResume && !profilePromptDismissed && (
-          <section className="momentum-profile-prompt"><FileText size={18} /><span>Add your resume to unlock tailored matches.</span><button onClick={() => navigate('resume')}>Add resume</button><button aria-label="Dismiss resume reminder" onClick={dismissProfilePrompt}><X size={15} /></button></section>
+          <section className="momentum-profile-prompt"><FileText size={18} /><span>{t('dashboard.momentum.addResumePrompt')}</span><button onClick={() => navigate('resume')}>{t('dashboard.momentum.addResume')}</button><button aria-label={t('dashboard.momentum.dismissResume')} onClick={dismissProfilePrompt}><X size={15} /></button></section>
         )}
         <header className="momentum-header">
-          <div><span><Sparkles size={23} /></span><div><h1>Application Momentum</h1><p>Stay consistent, focus on quality, and keep moving forward.</p></div></div>
+          <div><span><Sparkles size={23} /></span><div><h1>{t('dashboard.momentum.title')}</h1><p>{t('dashboard.momentum.subtitle')}</p></div></div>
           <div className="momentum-date-control" ref={dateControlRef}>
             <button className="momentum-date-picker" onClick={() => { setCalendarMonth(new Date(selectedRange.start)); setDateMenuOpen(open => !open) }} aria-expanded={dateMenuOpen}><CalendarDays size={16} /> <span>{formatWeekRange(selectedRange)}</span> <ChevronDown size={14} /></button>
-            {dateMenuOpen && <div className="momentum-date-menu" role="dialog" aria-label="Choose dashboard week">
-              <div className="momentum-mini-calendar-heading"><button aria-label="Previous month" onClick={() => setCalendarMonth(month => new Date(month.getFullYear(), month.getMonth() - 1, 1))}><ChevronLeft size={14} /></button><strong>{calendarMonth.toLocaleDateString('en-GB', { month: 'long', year: 'numeric' })}</strong><button aria-label="Next month" onClick={() => setCalendarMonth(month => new Date(month.getFullYear(), month.getMonth() + 1, 1))}><ChevronRight size={14} /></button></div>
-              <div className="momentum-mini-calendar-weekdays">{WEEK_DAYS.map(day => <span key={day}>{day.slice(0, 2)}</span>)}</div>
+            {dateMenuOpen && <div className="momentum-date-menu" role="dialog" aria-label={t('dashboard.momentum.chooseWeek')}>
+              <div className="momentum-mini-calendar-heading"><button aria-label={t('dashboard.momentum.previousMonth')} onClick={() => setCalendarMonth(month => new Date(month.getFullYear(), month.getMonth() - 1, 1))}><ChevronLeft size={14} /></button><strong>{calendarMonth.toLocaleDateString('en-GB', { month: 'long', year: 'numeric' })}</strong><button aria-label={t('dashboard.momentum.nextMonth')} onClick={() => setCalendarMonth(month => new Date(month.getFullYear(), month.getMonth() + 1, 1))}><ChevronRight size={14} /></button></div>
+              <div className="momentum-mini-calendar-weekdays">{WEEK_DAY_KEYS.map(dayKey => <span key={dayKey}>{t(dayKey).slice(0, 2)}</span>)}</div>
               <div className="momentum-mini-calendar-days">{getMonthCalendar(calendarMonth).map(date => {
                 const offset = getWeekOffsetForDate(date)
                 const isSelectedWeek = offset === weekOffset
@@ -307,13 +311,13 @@ export function DashboardPage() {
                 const isCurrentMonth = date.getMonth() === calendarMonth.getMonth()
                 return <button key={dateKey(date)} className={`${isSelectedWeek ? 'is-week-selected ' : ''}${isToday ? 'is-today ' : ''}${!isCurrentMonth ? 'is-outside' : ''}`} disabled={offset > 0} onClick={() => { setWeekOffset(offset); setDateMenuOpen(false) }}>{date.getDate()}</button>
               })}</div>
-              <button className="momentum-date-current-week" onClick={() => { setWeekOffset(0); setCalendarMonth(new Date()); setDateMenuOpen(false) }}>This week</button>
+              <button className="momentum-date-current-week" onClick={() => { setWeekOffset(0); setCalendarMonth(new Date()); setDateMenuOpen(false) }}>{t('dashboard.momentum.thisWeekButton')}</button>
             </div>}
           </div>
         </header>
         <div className="momentum-layout">
-          <div className="momentum-primary-column"><WeekGoal completed={stats.thisWeek} applicationDays={data?.applicationDays ?? []} interviews={data?.interviewsScheduled ?? []} range={selectedRange} /><CoachCard hasResume={data?.hasResume ?? false} savedJobs={savedJobs.length} onAction={() => navigate(data?.hasResume ? 'jobs' : 'resume')} /><Timeline activities={activities} onJobs={() => navigate('jobs')} /></div>
-          <aside className="momentum-secondary-column"><MatchList jobs={savedJobs} threshold={data?.minMatchScore ?? 75} onReview={() => navigate('jobs')} /><JobNotifications recommendations={todayRecommendations} onReview={() => navigate('gmail-recommendations')} /><WeekAtAGlance stats={stats} onJobs={() => navigate('jobs')} /><ActionCard followUps={data?.followUpsDue ?? []} agentConfig={data?.agentConfig ?? null} onJobs={() => navigate('jobs')} onSettings={() => navigate('settings')} onUpdated={refetch} /></aside>
+          <div className="momentum-primary-column"><WeekGoal completed={stats.thisWeek} applicationDays={data?.applicationDays ?? []} interviews={data?.interviewsScheduled ?? []} range={selectedRange} t={t} /><CoachCard hasResume={data?.hasResume ?? false} savedJobs={savedJobs.length} onAction={() => navigate(data?.hasResume ? 'jobs' : 'resume')} t={t} /><Timeline activities={activities} onJobs={() => navigate('jobs')} t={t} /></div>
+          <aside className="momentum-secondary-column"><MatchList jobs={savedJobs} threshold={data?.minMatchScore ?? 75} onReview={() => navigate('jobs')} t={t} /><JobNotifications recommendations={todayRecommendations} onReview={() => navigate('gmail-recommendations')} t={t} /><WeekAtAGlance stats={stats} onJobs={() => navigate('jobs')} t={t} /><ActionCard followUps={data?.followUpsDue ?? []} agentConfig={data?.agentConfig ?? null} onJobs={() => navigate('jobs')} onSettings={() => navigate('settings')} onUpdated={refetch} t={t} /></aside>
         </div>
       </main>
     </div>

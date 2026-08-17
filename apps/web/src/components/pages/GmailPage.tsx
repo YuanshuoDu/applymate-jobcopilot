@@ -11,6 +11,7 @@ import { GmailMessageReader } from '@/components/gmail/GmailMessageReader'
 import { countInboxEmails, filterInboxEmails, type GmailEmail, type GmailInboxFilter } from '@/components/gmail/inbox-model'
 import { useNav } from '@/lib/nav-context'
 import { userScopedStorageKey } from '@/lib/user-scoped-storage'
+import { useI18n } from '@/lib/i18n'
 
 interface GmailThreadsResponse {
   emails?: GmailEmail[]
@@ -26,6 +27,7 @@ export function GmailPage() {
   const { data: session } = useSession()
   const userId = session?.user?.id ?? null
   const { navigate } = useNav()
+  const { t } = useI18n()
   const toast = useToast()
   const authTriggeredRef = useRef(false)
   const cachedEmails = useRef(readInboxCache(userId))
@@ -51,7 +53,7 @@ export function GmailPage() {
       setEmails(body.emails ?? [])
       writeInboxCache(body.emails ?? [], userId)
       setConnection('ready')
-      if (silent) toast.success('Refreshed', `${body.emails?.length ?? 0} emails loaded`)
+      if (silent) toast.success(t('gmail.refreshed'), `${body.emails?.length ?? 0} ${t('gmail.emailsLoaded')}`)
     } catch (error) {
       if (error instanceof DOMException && error.name === 'AbortError') return
       setConnection('error')
@@ -65,12 +67,12 @@ export function GmailPage() {
     const params = new URLSearchParams(window.location.search)
     if (params.get('gmailAuth') === '1') {
       removeGmailQueryParam('gmailAuth')
-      toast.success('Google account connected!', 'Loading your Gmail…')
+      toast.success(t('gmail.googleConnected'), t('gmail.loadingYourGmail'))
     }
     const gmailError = params.get('gmailError')
     if (gmailError) {
       removeGmailQueryParam('gmailError')
-      toast.error('Gmail connection failed', gmailError)
+      toast.error(t('gmail.connectionFailed'), gmailError)
     }
     if (!cachedEmails.current) void loadEmails(false, controller.signal)
     return () => controller.abort()
@@ -94,15 +96,15 @@ export function GmailPage() {
     setEmails(current => current.map(email => email.id === id ? { ...email, read: true } : email))
   }, [])
 
-  const recommendationsEntry = <Btn variant="toolbar" onClick={() => navigate('gmail-recommendations')} style={{ marginLeft: 34 }}>Job recommendations</Btn>
+  const recommendationsEntry = <Btn variant="toolbar" onClick={() => navigate('gmail-recommendations')} style={{ marginLeft: 34 }}>{t('gmail.recommendations')}</Btn>
 
   if (connection !== 'ready') return <GmailConnectionScreen state={connection} titleAccessory={recommendationsEntry} onConnect={connectGoogle} onRetry={() => { authTriggeredRef.current = false; void loadEmails() }} />
 
   return <div style={{ flex: 1, display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
-    <TopBar title="Gmail Tracker" titleAccessory={recommendationsEntry}>
-      {counts.unread > 0 && <span style={{ fontSize: 11, background: 'var(--primary)', color: '#fff', borderRadius: 999, padding: '2px 8px', fontWeight: 500 }}>{counts.unread} unread</span>}
-      <input value={search} onChange={event => setSearch(event.target.value)} placeholder="Search emails…" aria-label="Search emails" style={searchStyle} />
-      <Btn variant="toolbar" onClick={() => void loadEmails(true)} disabled={refreshing}>{refreshing ? '…' : '⟳ Refresh'}</Btn>
+    <TopBar title={t('gmail.title')} titleAccessory={recommendationsEntry}>
+      {counts.unread > 0 && <span style={{ fontSize: 11, background: 'var(--primary)', color: '#fff', borderRadius: 999, padding: '2px 8px', fontWeight: 500 }}>{counts.unread} {t('gmail.unread')}</span>}
+      <input value={search} onChange={event => setSearch(event.target.value)} placeholder={t('gmail.search')} aria-label={t('gmail.search')} style={searchStyle} />
+      <Btn variant="toolbar" onClick={() => void loadEmails(true)} disabled={refreshing}>{refreshing ? '…' : `⟳ ${t('gmail.refresh')}`}</Btn>
     </TopBar>
     <div style={{ flex: 1, display: 'flex', overflow: 'hidden' }}>
       <GmailInboxSidebar activeFilter={filter} counts={counts} email={session?.user?.email} onFilterChange={setFilter} />

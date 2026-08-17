@@ -2,6 +2,7 @@
 
 import React, { createContext, useCallback, useContext, useMemo, useState } from 'react'
 import type { JobStatus } from '@/lib/types'
+import { useI18n } from '@/lib/i18n'
 
 export { UserAvatar } from './UserAvatar'
 
@@ -17,6 +18,8 @@ export const STATUS_CONFIG: Record<JobStatus, { label: string; color: string; bg
 // ─── StatusBadge — glass pill ─────────────────────────────────────────────────
 export function StatusBadge({ status }: { status: JobStatus }) {
   const cfg = STATUS_CONFIG[status]
+  const { t } = useI18n()
+  const labelKey: Record<JobStatus, string> = { saved: 'jobs.saved', applied: 'jobs.applied', interview: 'jobs.interview', offer: 'jobs.offer', rejected: 'jobs.rejected' }
   return (
     <span style={{
       display: 'inline-flex', alignItems: 'center', gap: 5,
@@ -34,7 +37,7 @@ export function StatusBadge({ status }: { status: JobStatus }) {
         boxShadow: `0 0 4px ${cfg.color}`,
         flexShrink: 0,
       }} />
-      {cfg.label}
+      {t(labelKey[status])}
     </span>
   )
 }
@@ -57,6 +60,7 @@ export function MatchScoreRing({
   const offset = circ - (score / 100) * circ
   const color = score >= 80 ? '#059669' : score >= 60 ? '#D97706' : '#DC2626'
   const fontSize = size === 'sm' ? 10 : size === 'lg' ? 14 : 11
+  const { t } = useI18n()
   const [animated, setAnimated] = useState(false)
   React.useEffect(() => {
     const t = setTimeout(() => setAnimated(true), 50)
@@ -76,7 +80,7 @@ export function MatchScoreRing({
           {score}%
         </text>
       </svg>
-      {showLabel && <span style={{ fontSize: 9, color: 'var(--text-muted)', letterSpacing: '0.02em' }}>match</span>}
+      {showLabel && <span style={{ fontSize: 9, color: 'var(--text-muted)', letterSpacing: '0.02em' }}>{t('common.match')}</span>}
     </div>
   )
 }
