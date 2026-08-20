@@ -1,28 +1,38 @@
 # ApplyMate AI
 
-> **AI-powered job application co-pilot for the European market.**  
-> Discover relevant roles, tailor CVs and cover letters, and complete supported ATS workflows while keeping humans in control of every decision that matters.
+> **AI-powered job-search and application copilot for the European market.**
+>
+> Discover relevant roles, tailor resumes and cover letters, track replies in Gmail, and run supported ATS workflows with explicit user approval at the point of submission.
 
 Production: [applymate.site](https://applymate.site) · Preview: [preview.applymate.site](https://preview.applymate.site)
 
 [![Next.js](https://img.shields.io/badge/Next.js-15-black?logo=next.js)](https://nextjs.org)
 [![TypeScript](https://img.shields.io/badge/TypeScript-5-blue?logo=typescript)](https://www.typescriptlang.org)
 [![Tailwind CSS](https://img.shields.io/badge/Tailwind-4.0-38bdf8?logo=tailwindcss)](https://tailwindcss.com)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 ---
 
 ## What is ApplyMate AI?
 
-ApplyMate AI is a **Chrome Extension + Web Dashboard + Worker** platform that acts as your personal job application assistant. It discovers relevant jobs, tailors your CV and cover letter for each role, and supports both reviewable form filling and autonomous ATS application workflows. Think of it as a shopping cart for job applications: browse JDs → one-click save → AI optimises → you review → apply.
+ApplyMate AI is a **Web Dashboard + Chrome Extension + Worker** platform for the full job-search loop: discover roles, understand fit, prepare tailored application materials, complete supported ATS forms, and track outcomes. The web app is live at [applymate.site](https://applymate.site); the extension handles in-page job capture and assisted form filling, while the Worker contains queue-backed ATS workflows.
+
+The current product flow is:
+
+```text
+discover jobs → score and shortlist → tailor resume/cover letter →
+review → approve → apply through a supported workflow → track Gmail replies
+```
+
+Final application submission is deliberately approval-gated per job. CAPTCHA, login, MFA, and other steps that require the candidate remain user handoffs rather than actions the system claims to have completed.
 
 Repository: [github.com/YuanshuoDu/applymate-jobcopilot](https://github.com/YuanshuoDu/applymate-jobcopilot)
 
 ### Key Principles
-- **User-controlled automation**: AI prepares applications and can automate supported ATS workflows; you choose what enters the application queue.
-- **Europe-first**: GDPR-compliant, deep ATS support (Workday EMEA, Personio, SmartRecruiters), multi-language cover letters (EN/DE/FR/NL/ES).
+- **User-controlled automation**: AI prepares applications and runs supported ATS workflows, but final submission requires your approval for the specific job.
+- **Europe-first**: GDPR-conscious job discovery and application tooling for European candidates, with multi-language cover letters (EN/DE/FR/NL/ES).
 - **Model-agnostic**: ModelRouter supports MiniMax, Anthropic, OpenAI, DeepSeek, Qwen, Z.ai, Kimi, and compatible custom endpoints.
 - **Privacy-first administration**: Internal roles are isolated from candidate content. Administrators, including `super_admin` and break-glass operators, cannot read API keys, password hashes, OAuth refresh tokens, full resumes, or email bodies.
+- **Azure-backed credential protection**: Production OAuth credentials are encrypted with an Azure Key Vault RSA key; AWS KMS is not required by the current implementation.
 
 ---
 
@@ -33,8 +43,8 @@ Repository: [github.com/YuanshuoDu/applymate-jobcopilot](https://github.com/Yuan
 - **Scout Agent** — Discovers jobs from LinkedIn, Adzuna, Indeed IE, IrishJobs RSS, and company ATS portals
 - **Analyst Agent** — Scores and ranks jobs against your profile; configurable AI throttle
 - **Writer Agent** — Generates tailored cover letters (0–10 quality scoring before sending)
-- **Executor Agent** — Manages a manual-confirm apply queue; you approve each application
-- **Auditor Agent** — Monitors Gmail for interview/offer/rejection emails; drafts follow-up emails for rejections
+- **Executor Agent** — Runs supported ATS tasks from a queue and pauses for approval or user input when required
+- **Auditor Agent** — Monitors Gmail for interview/offer/rejection emails and prepares follow-up drafts
 - **Custom Agents** — Add your own agent roles via the UI; they run as pipeline stages
 
 ### Resume & Cover Letter System
@@ -54,8 +64,20 @@ Repository: [github.com/YuanshuoDu/applymate-jobcopilot](https://github.com/Yuan
 ### Chrome Extension
 - One-click "Save to Basket" button injected on LinkedIn, Indeed, and company career pages
 - Sidebar with Resume Preview / Templates / AI Match / PDF / three-way sync with dashboard
-- iframe-compatible form auto-fill (Workday, Greenhouse, Lever, SmartRecruiters, Personio)
+- iframe-compatible form assistance for Workday, Greenhouse, Lever, SmartRecruiters, and Personio
 - Bidirectional login/logout sync with dashboard (JWT bridge)
+
+### Gmail Tracking
+- OAuth connection with Gmail read and send scopes
+- Job-related inbox tracking with unread counts and application-status recommendations
+- User-confirmed follow-up drafts and Gmail API health checks
+- OAuth credentials encrypted through the configured application credential-encryption provider
+
+### Worker & ATS Workflows
+- BullMQ queues for discovery, agent runs, and application tasks
+- Supported ATS flow modules for Workday, Greenhouse, Lever, SmartRecruiters, and Personio
+- CAPTCHA detection, resumable checkpoints, form-pattern replay, rate limiting, and signed web-to-worker control
+- Approval and handoff states for final submission, login, MFA, CAPTCHA, and other candidate-only steps
 
 ### Dashboard
 - Kanban job board with drag-and-drop
@@ -85,6 +107,7 @@ Repository: [github.com/YuanshuoDu/applymate-jobcopilot](https://github.com/Yuan
 | ORM | Prisma | ^6.8 |
 | Database | PostgreSQL (Neon / Supabase) | 16.x |
 | Auth | NextAuth v5 | ^5.x |
+| Credential encryption | Azure Key Vault (production) | Standard vault + RSA key |
 | AI SDK | Vercel AI SDK | ^4.0 |
 | AI Models | MiniMax, Anthropic, OpenAI, DeepSeek, Qwen, Z.ai, Kimi, custom OpenAI-compatible endpoints | ModelRouter |
 | Rich Text | Tiptap | ^2.10 |
@@ -214,6 +237,15 @@ AUTH_GOOGLE_SECRET=
 AUTH_GITHUB_ID=
 AUTH_GITHUB_SECRET=
 
+# Production credential encryption (Azure Key Vault)
+# Required for production OAuth credential persistence. Use an RSA key in a
+# Standard Key Vault and grant the application Key Vault Crypto User at vault scope.
+AZURE_KEY_VAULT_URL=
+AZURE_KEY_NAME=applymate-credential-key
+AZURE_TENANT_ID=
+AZURE_CLIENT_ID=
+AZURE_CLIENT_SECRET=
+
 # AI Models
 MINIMAX_API_KEY=             # Platform default model
 ANTHROPIC_API_KEY=
@@ -248,6 +280,12 @@ NEXT_PUBLIC_POSTHOG_KEY=
 ```
 
 The complete, environment-specific list is maintained in [`apps/web/.env.example`](apps/web/.env.example). Never commit `.env.local` or provider credentials.
+
+In production, `AZURE_KEY_VAULT_URL`, `AZURE_KEY_NAME`, `AZURE_TENANT_ID`,
+`AZURE_CLIENT_ID`, and `AZURE_CLIENT_SECRET` must be configured together. The
+application uses the Azure Key Vault key to wrap stored OAuth credentials;
+`CREDENTIAL_ENCRYPTION_KEY` is only a local development/test fallback and must
+not be used as a substitute for production Key Vault configuration.
 
 ---
 
@@ -289,14 +327,18 @@ The admin console is a separate internal surface under `/admin` and `/api/admin/
 
 ---
 
-## Roadmap
+## Current boundaries and next work
 
-- [ ] LinkedIn / Indeed direct API key configuration page
-- [x] Agent run history browser (per-day pipeline results)
-- [x] Resume tailoring wizard (AI Adapt — per-job CV customisation)
-- [ ] Extension + Executor bidirectional apply (auto form-fill triggered by pipeline)
-- [ ] Screenshot OCR for non-parseable JDs
-- [ ] AI Auto-Pilot `full` mode (end-to-end autonomous application)
+The repository currently includes job discovery, scoring, resume and cover-letter
+tailoring, Gmail tracking, Chrome-assisted form filling, queue-backed Worker
+flows, and the approval/audit surfaces around application work.
+
+The main remaining product work is:
+
+- Broader direct ATS/source coverage and continued quality improvements for job descriptions.
+- A deeper end-to-end handoff between the Chrome Extension and queued Worker workflows.
+- Screenshot/OCR support for forms and job descriptions that cannot be parsed reliably as text.
+- A future full auto-pilot mode only if it preserves per-job approval, account isolation, and required user handoffs.
 
 ---
 
@@ -308,9 +350,3 @@ The admin console is a separate internal surface under `/admin` and `/api/admin/
 4. Open a pull request
 
 Please run `pnpm lint && pnpm typecheck` before submitting.
-
----
-
-## License
-
-MIT © 2026 ApplyMate AI
