@@ -5,7 +5,21 @@ import { Ban, Eye, Megaphone, RefreshCw, Send, Sparkles } from 'lucide-react'
 import { useI18n } from '@/lib/i18n'
 
 interface Broadcast { id: string; title: string; body: string; audienceType: string; audience: { plan?: string; location?: string; userIds?: string[] }; status: string; scheduledAt: string | null; recipientCount: number; deliveredCount: number; failedCount: number; createdAt: string; updatedAt: string }
-export function audienceLabel(value: Pick<Broadcast, 'audienceType' | 'audience'>, t?: (key: string) => string): string { if (value.audienceType === 'all_active_users') return t?.('broadcasts.allActive') ?? 'All active users'; if (value.audienceType === 'plan') { const plan = value.audience.plan === 'free' ? t?.('admin.free') : value.audience.plan === 'pro' ? t?.('admin.pro') : value.audience.plan === 'enterprise' ? t?.('admin.enterprise') : t?.('broadcasts.unknown') ?? 'Unknown'; return `${plan} ${t?.('broadcasts.plan') ?? 'plan'}` } if (value.audienceType === 'location') return value.audience.location ?? t?.('broadcasts.location') ?? 'Location'; return `${value.audience.userIds?.length ?? 0} ${t?.('broadcasts.selectedAccounts') ?? 'selected accounts'}` }
+export function audienceLabel(value: Pick<Broadcast, 'audienceType' | 'audience'>, t?: (key: string) => string): string {
+  if (value.audienceType === 'all_active_users') return t?.('broadcasts.allActive') ?? 'All active users'
+  if (value.audienceType === 'plan') {
+    const plan = value.audience.plan === 'free'
+      ? t?.('admin.free') ?? 'Free'
+      : value.audience.plan === 'pro'
+        ? t?.('admin.pro') ?? 'Pro'
+        : value.audience.plan === 'enterprise'
+          ? t?.('admin.enterprise') ?? 'Enterprise'
+          : t?.('broadcasts.unknown') ?? 'Unknown'
+    return `${plan} ${t?.('broadcasts.plan') ?? 'plan'}`
+  }
+  if (value.audienceType === 'location') return value.audience.location ?? t?.('broadcasts.location') ?? 'Location'
+  return `${value.audience.userIds?.length ?? 0} ${t?.('broadcasts.selectedAccounts') ?? 'selected accounts'}`
+}
 export function broadcastActionLabel(status: string, t?: (key: string) => string): string { return status === 'draft' ? t?.('broadcasts.submitApproval') ?? 'Submit for approval' : status === 'scheduled' ? t?.('broadcasts.publish') ?? 'Publish' : t?.('broadcasts.noAction') ?? 'No action' }
 
 export function BroadcastsPage() {

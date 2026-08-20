@@ -6,16 +6,16 @@ const source = readFileSync(fileURLToPath(new URL('./AdminDataTable.tsx', import
 
 describe('admin data table safeguards', () => {
   it('uses an actionable status when bulk controls are present', () => {
-    expect(source).toContain("hasOperationalActions ? 'Operational controls' : 'Read-only view'")
+    expect(source).toContain("hasOperationalActions ? t('admin.operationalControls') : t('admin.readOnlyView')")
   })
 
   it('labels searches from the current table instead of hardcoding users', () => {
-    expect(source).toContain('searchLabel ?? `Search ${title.toLowerCase()}`')
-    expect(source).toContain('searchPlaceholder ?? `Search ${title.toLowerCase()}`')
+    expect(source).toContain("searchLabel ?? `${t('admin.search')} ${title.toLowerCase()}`")
+    expect(source).toContain("searchPlaceholder ?? `${t('admin.search')} ${title.toLowerCase()}`")
   })
 
   it('downloads filtered exports without opening a raw CSV page', () => {
-    expect(source).toContain('href={exportHref} download>Export filtered CSV')
+    expect(source).toContain("href={exportHref} download>{t('admin.exportFilteredCsv')}")
   })
 
   it('stops waiting forever when an admin data request is slow', () => {
