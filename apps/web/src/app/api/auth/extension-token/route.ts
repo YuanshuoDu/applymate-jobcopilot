@@ -1,7 +1,7 @@
 /**
  * POST /api/auth/extension-token
- * Chrome Extension 专用登录接口
- * 验证邮箱密码后返回可用于 Bearer 认证的长效 JWT
+ * Chrome Extension Dedicated login interface
+ * After verifying the email password, you can return to Bearer Certified long-lasting JWT
  */
 import { NextRequest, NextResponse } from 'next/server'
 import bcrypt from 'bcryptjs'

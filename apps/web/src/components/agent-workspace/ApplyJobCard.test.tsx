@@ -22,13 +22,13 @@ describe('ApplyJobCard', () => {
       />,
     )
 
-    expect(html).toContain('已投递')
-    expect(html).not.toContain('立即申请')
+    expect(html).toContain('Delivered')
+    expect(html).not.toContain('Apply now')
   })
 
   it('keeps the apply action available before confirmation', () => {
     const html = renderToString(<ApplyJobCard job={job} onApplied={vi.fn()} />)
 
-    expect(html).toContain('立即申请')
+    expect(html).toContain('Apply now')
   })
 })

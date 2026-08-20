@@ -34,7 +34,7 @@ This spec defines the data, APIs, UI, onboarding, and cross-page collaboration t
 | **Final Resume** | The resume the user has chosen to apply with. Stored as `Job.finalResumeId`. Marked with ⭐ badge in UI. |
 | **Cover Letter Version** | One of N drafts for a Job. The chosen one has `CoverLetter.isFinal = true` and is referenced by `Job.finalCoverLetterId`. |
 | **Persona** | The user's stable identity profile (name, email, phone, address, nationality, visa, links). **Source of truth** for identity fields. |
-| **Bundle** | The downloadable ZIP for a Job: `公司/岗位/Resume.pdf [+ CoverLetter.pdf] + meta.json`. |
+| **Bundle** | The downloadable ZIP for a Job: `company/post/Resume.pdf [+ CoverLetter.pdf] + meta.json`. |
 
 ---
 
@@ -46,7 +46,7 @@ This spec defines the data, APIs, UI, onboarding, and cross-page collaboration t
 model Direction {
   id        String   @id @default(cuid())
   userId    String
-  name      String                          // free-form, multilingual (e.g. "市场营销 / Marketing")
+  name      String                          // free-form, multilingual (e.g. "Marketing / Marketing")
   color     String?                         // hex, e.g. "#185FA5", for chip badge
   icon      String?                         // emoji or icon key
   sortOrder Int      @default(0)

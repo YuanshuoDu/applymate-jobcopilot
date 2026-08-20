@@ -1,6 +1,6 @@
 /**
- * ApplyMate AI 功能连通性测试
- * 运行: node test-ai.mjs
+ * ApplyMate AI Functional connectivity testing
+ * run: node test-ai.mjs
  */
 
 import { existsSync, readFileSync } from 'fs'
@@ -79,40 +79,40 @@ async function chatStream(base, key, model, prompt, max = 400, thinking = 'disab
 
 const TESTS = [
   {
-    name: '① ApplyMate 默认 — MiniMax M3 普通调用',
+    name: '① ApplyMate default — MiniMax M3 Ordinary call',
     skip: !MINIMAX_KEY,
     fn: async () => {
       const raw = await chat('https://api.minimax.chat/v1', MINIMAX_KEY, 'MiniMax-M3', 'Reply with only: "MiniMax OK"')
       const stripped = raw.replace(/<think>[\s\S]*?<\/think>/gi, '').trim()
-      if (!stripped) throw new Error(`空回复（原始 ${raw.length} 字符，含 think=${raw.includes('<think>')}）`)
+      if (!stripped) throw new Error(`Empty reply(original ${raw.length} character, Contains think=${raw.includes('<think>')})`)
       return stripped.slice(0, 60)
     },
   },
   {
-    name: '② ApplyMate 默认 — MiniMax M3 流式 + reasoning split',
+    name: '② ApplyMate default — MiniMax M3 streaming + reasoning split',
     skip: !MINIMAX_KEY,
     fn: async () => {
       const { raw, stripped } = await chatStream('https://api.minimax.chat/v1', MINIMAX_KEY, 'MiniMax-M3',
         'Reply with only the text: "Stream OK"')
-      if (stripped.includes('<think>')) throw new Error(`think 块未过滤: ${stripped.slice(0, 80)}`)
-      if (!stripped) throw new Error(`过滤后为空（原始含 think=${raw.includes('<think>')}）`)
-      return `think 过滤=${raw.includes('<think>')} → "${stripped.slice(0, 50)}"`
+      if (stripped.includes('<think>')) throw new Error(`think block unfiltered: ${stripped.slice(0, 80)}`)
+      if (!stripped) throw new Error(`Empty after filtering(original containing think=${raw.includes('<think>')})`)
+      return `think filter=${raw.includes('<think>')} → "${stripped.slice(0, 50)}"`
     },
   },
   {
-    name: '③ JSON 结构化输出 — 简历评分 (MiniMax M3)',
+    name: '③ JSON Structured output — Resume scoring (MiniMax M3)',
     skip: !MINIMAX_KEY,
     fn: async () => {
       const raw = await chat('https://api.minimax.chat/v1', MINIMAX_KEY, 'MiniMax-M3',
         'Return ONLY valid JSON, no markdown:\n{"score":85,"matched":["Python","REST API"],"missing":["Docker","K8s"]}', 400)
       const clean = raw.replace(/<think>[\s\S]*?<\/think>/gi, '').replace(/^```(?:json)?\n?|\n?```$/g, '').trim()
       const p = JSON.parse(clean)
-      if (typeof p.score !== 'number' || !Array.isArray(p.matched)) throw new Error('JSON 结构错误')
+      if (typeof p.score !== 'number' || !Array.isArray(p.matched)) throw new Error('JSON Structure error')
       return `score=${p.score}, matched=[${p.matched.join(',')}], missing=[${p.missing.join(',')}]`
     },
   },
   {
-    name: '④ 独立审核 JSON — MiniMax M3 自适应推理',
+    name: '④ independent audit JSON — MiniMax M3 adaptive reasoning',
     skip: !MINIMAX_KEY,
     fn: async () => {
       const raw = await chat('https://api.minimax.chat/v1', MINIMAX_KEY, 'MiniMax-M3', `Return ONLY JSON:
@@ -124,80 +124,80 @@ Flag every unsupported or contradicted claim.`, 1200, 'adaptive')
       const audit = JSON.parse(raw.replace(/^```(?:json)?\n?|\n?```$/g, '').trim())
       const areas = Array.isArray(audit.findings) ? audit.findings.map(f => f.area) : []
       if (audit.verdict !== 'needs_review' || !areas.includes('resume') || !areas.includes('cover_letter')) {
-        throw new Error('审核未覆盖简历与求职信中的虚构声明')
+        throw new Error('Review of fictitious statements in resumes and cover letters not covered')
       }
       return `verdict=${audit.verdict}, findings=${audit.findings.length}`
     },
   },
   {
-    name: '⑤ 求职信生成 — MiniMax M3',
+    name: '⑤ Cover letter generation — MiniMax M3',
     skip: !MINIMAX_KEY,
     fn: async () => {
       const raw = await chat('https://api.minimax.chat/v1', MINIMAX_KEY, 'MiniMax-M3',
         'Write one sentence cover letter for Backend Engineer at Stripe.', 4096)
       const text = raw.replace(/<think>[\s\S]*?<\/think>/gi, '').trim()
-      if (text.length < 30) throw new Error(`回复过短(${text.length}字符): "${text}"`)
+      if (text.length < 30) throw new Error(`Reply too short(${text.length}character): "${text}"`)
       return text.slice(0, 80) + (text.length > 80 ? '…' : '')
     },
   },
   {
-    name: '⑥ DeepSeek V4 Flash — 普通调用',
+    name: '⑥ DeepSeek V4 Flash — Ordinary call',
     skip: !DEEPSEEK_KEY,
     fn: async () => {
       const raw = await chat('https://api.deepseek.com/v1', DEEPSEEK_KEY, 'deepseek-v4-flash',
         'Reply with only: "Flash OK"')
-      if (!raw.trim()) throw new Error('回复为空')
+      if (!raw.trim()) throw new Error('Reply is empty')
       return raw.trim().slice(0, 60)
     },
   },
   {
-    name: '⑦ DeepSeek V4 Pro — 流式调用',
+    name: '⑦ DeepSeek V4 Pro — Streaming call',
     skip: !DEEPSEEK_KEY,
     fn: async () => {
       const { stripped } = await chatStream('https://api.deepseek.com/v1', DEEPSEEK_KEY, 'deepseek-v4-pro',
         'Reply with only: "Pro Stream OK"', 100)
-      if (!stripped) throw new Error('回复为空')
+      if (!stripped) throw new Error('Reply is empty')
       return stripped.slice(0, 60)
     },
   },
   {
-    name: '⑧ DeepSeek V4 Pro JSON — 简历评分',
+    name: '⑧ DeepSeek V4 Pro JSON — Resume scoring',
     skip: !DEEPSEEK_KEY,
     fn: async () => {
       const raw = await chat('https://api.deepseek.com/v1', DEEPSEEK_KEY, 'deepseek-v4-pro',
         'Return ONLY valid JSON no markdown:\n{"score":72,"matched":["Node.js","TypeScript"],"missing":["AWS","Redis"]}', 300)
       const p = JSON.parse(raw.replace(/^```(?:json)?\n?|\n?```$/g, '').trim())
-      if (typeof p.score !== 'number') throw new Error('score 字段缺失')
+      if (typeof p.score !== 'number') throw new Error('score Field missing')
       return `score=${p.score}`
     },
   },
   {
-    name: '⑨ Agent 流式对话 (MiniMax M3 + system prompt)',
+    name: '⑨ Agent streaming conversation (MiniMax M3 + system prompt)',
     skip: !MINIMAX_KEY,
     fn: async () => {
       const { stripped } = await chatStream('https://api.minimax.chat/v1', MINIMAX_KEY, 'MiniMax-M3',
         JSON.stringify([{ role: 'system', content: 'You are a job search assistant.' },
                         { role: 'user',   content: 'How many jobs in my pipeline? Just say: "Pipeline test OK"' }]),
         300)
-      // 实际 agent 把 system+messages 传进去；这里只测流式是否正常
+      // actual agent Bundle system+messages pass in; Here we only test whether the flow pattern is normal
       const { stripped: s2 } = await chatStream('https://api.minimax.chat/v1', MINIMAX_KEY, 'MiniMax-M3',
         'You are a job assistant. Say: "Agent OK"', 200)
-      if (!s2) throw new Error('Agent 流式回复为空')
+      if (!s2) throw new Error('Agent Streaming reply is empty')
       return `"${s2.slice(0, 50)}"`
     },
   },
 ]
 
 console.log(`\n${C}╔══════════════════════════════════════════════════╗`)
-console.log(`║   ApplyMate AI 功能测试  ${new Date().toLocaleTimeString()}            ║`)
+console.log(`║   ApplyMate AI Functional testing  ${new Date().toLocaleTimeString()}            ║`)
 console.log(`╚══════════════════════════════════════════════════╝${X}\n`)
-console.log(`  MiniMax  key: ${MINIMAX_KEY  ? G+'已配置'+X : R+'未配置'+X}`)
-console.log(`  DeepSeek key: ${DEEPSEEK_KEY ? G+'已配置'+X : R+'未配置'+X}\n`)
+console.log(`  MiniMax  key: ${MINIMAX_KEY  ? G+'configured'+X : R+'Not configured'+X}`)
+console.log(`  DeepSeek key: ${DEEPSEEK_KEY ? G+'configured'+X : R+'Not configured'+X}\n`)
 
 let passed = 0, failed = 0, skipped = 0
 for (const t of TESTS) {
   process.stdout.write(`${Y}${t.name}${X}\n`)
-  if (t.skip) { console.log(`${Y}  ⚠ 跳过（Key 未配置）${X}\n`); skipped++; continue }
+  if (t.skip) { console.log(`${Y}  ⚠ jump over(Key Not configured)${X}\n`); skipped++; continue }
   const start = Date.now()
   try {
     const result = await t.fn()
@@ -210,5 +210,5 @@ for (const t of TESTS) {
 }
 
 console.log(`${C}══════════════════════════════════════════════════${X}`)
-console.log(`通过 ${G}${passed}${X}  失败 ${failed > 0 ? R : X}${failed}${X}  跳过 ${Y}${skipped}${X}\n`)
-if (failed === 0 && skipped === 0) console.log(`${G}✓ 全部通过，所有 AI 功能正常可用${X}\n`)
+console.log(`pass ${G}${passed}${X}  fail ${failed > 0 ? R : X}${failed}${X}  jump over ${Y}${skipped}${X}\n`)
+if (failed === 0 && skipped === 0) console.log(`${G}✓ All passed, all AI Functions available${X}\n`)

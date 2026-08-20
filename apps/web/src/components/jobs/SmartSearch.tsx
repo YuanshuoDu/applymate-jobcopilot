@@ -5,6 +5,7 @@ import { CompanyLogo, ScorePill, useToast } from '@/components/ui'
 import { apiMutate } from '@/lib/hooks'
 import type { Job } from '@/lib/types'
 import { extractSearchQuery } from './search-query'
+import { useI18n } from '@/lib/i18n'
 
 // ── Types ────────────────────────────────────────────────────────────────────
 
@@ -120,7 +121,7 @@ function parseRoutingFlag(routing: string): string {
   const m = routing.match(/^([A-Z]{2})\s*→/)
   if (m) return FLAG_MAP[m[1].toLowerCase()] ?? ''
   if (/ireland/i.test(routing)) return '🇮🇪'
-  if (/remote|远程/i.test(routing)) return '🌍'
+  if (/remote|remote/i.test(routing)) return '🌍'
   return ''
 }
 
@@ -176,6 +177,7 @@ const glassInput: React.CSSProperties = {
 // ── Main component ────────────────────────────────────────────────────────────
 
 export function SmartSearch({ onJobSaved, onOpenSettings }: { onJobSaved?: () => void; onOpenSettings?: () => void }) {
+  const { t } = useI18n()
   const toast = useToast()
   const inputRef = useRef<HTMLInputElement>(null)
   const lastSearch = useRef(loadLast())
@@ -299,7 +301,7 @@ export function SmartSearch({ onJobSaved, onOpenSettings }: { onJobSaved?: () =>
   async function handleSave(r: JobResult) {
     setSavingIds(prev => new Set(prev).add(r.id))
     await saveAndScore(r,
-      (rid) => { setSavingIds(p => { const n = new Set(p); n.delete(rid); return n }); setSavedIds(p => new Set(p).add(rid)); setScoringIds(p => new Set(p).add(rid)); toast.success('Saved', `${r.company} — scoring match…`); onJobSaved?.() },
+      (rid) => { setSavingIds(p => { const n = new Set(p); n.delete(rid); return n }); setSavedIds(p => new Set(p).add(rid)); setScoringIds(p => new Set(p).add(rid)); toast.success(t('smartSearch.saved'), `${r.company} — ${t('smartSearch.scoringMatch')}`); onJobSaved?.() },
       (rid, score) => { setScoringIds(p => { const n = new Set(p); n.delete(rid); return n }); setScores(p => ({ ...p, [rid]: score })) },
       (msg) => { setSavingIds(p => { const n = new Set(p); n.delete(r.id); return n }); toast.error('Save failed', msg) },
     )
@@ -337,8 +339,8 @@ export function SmartSearch({ onJobSaved, onOpenSettings }: { onJobSaved?: () =>
             onKeyDown={e => e.key === 'Enter' && doSearch()}
             onFocus={() => setSearchFocus(true)}
             onBlur={() => setSearchFocus(false)}
-            aria-label="Search jobs"
-            placeholder='Search jobs — e.g. "React Developer Amsterdam" or "Data Engineer Berlin"'
+            aria-label={t('jobs.searchJobs')}
+            placeholder={t('jobs.searchPlaceholder')}
             style={{
               ...glassInput,
               paddingLeft: 38, paddingRight: 12, height: 44, fontSize: 13,
@@ -348,7 +350,7 @@ export function SmartSearch({ onJobSaved, onOpenSettings }: { onJobSaved?: () =>
             }}
           />
           {q && (
-            <button type="button" aria-label="Clear search" title="Clear search" onClick={() => setQ('')} style={{ position: 'absolute', right: 10, top: '50%', transform: 'translateY(-50%)', background: 'none', border: 'none', cursor: 'pointer', color: 'var(--text-muted)', display: 'flex', padding: 2 }}>
+            <button type="button" aria-label={t('jobs.clearSearch')} title={t('jobs.clearSearch')} onClick={() => setQ('')} style={{ position: 'absolute', right: 10, top: '50%', transform: 'translateY(-50%)', background: 'none', border: 'none', cursor: 'pointer', color: 'var(--text-muted)', display: 'flex', padding: 2 }}>
               <Icon.X />
             </button>
           )}
@@ -356,7 +358,7 @@ export function SmartSearch({ onJobSaved, onOpenSettings }: { onJobSaved?: () =>
 
         <button
           type="button"
-          aria-label={searching ? 'Searching jobs' : isStale ? 'Apply job search filters' : 'Search jobs'}
+          aria-label={searching ? t('jobs.searchingJobs') : isStale ? t('jobs.applyFilters') : t('jobs.searchJobs')}
           onClick={doSearch}
           disabled={searching || !q.trim()}
           style={{
@@ -376,16 +378,16 @@ export function SmartSearch({ onJobSaved, onOpenSettings }: { onJobSaved?: () =>
           onMouseLeave={e => { e.currentTarget.style.boxShadow = isStale ? '0 4px 14px rgba(5,150,105,0.45)' : '0 4px 14px rgba(79,70,229,0.40)' }}
         >
           {searching
-            ? <><span style={{ width: 14, height: 14, border: '2px solid rgba(255,255,255,0.3)', borderTopColor: '#fff', borderRadius: '50%', animation: 'spin 0.7s linear infinite', display: 'inline-block' }} /> Searching…</>
+            ? <><span style={{ width: 14, height: 14, border: '2px solid rgba(255,255,255,0.3)', borderTopColor: '#fff', borderRadius: '50%', animation: 'spin 0.7s linear infinite', display: 'inline-block' }} /> {t('jobs.searching')}</>
             : isStale
-              ? <><Icon.Search /> Apply Filters</>
-              : <><Icon.Search /> Search</>
+              ? <><Icon.Search /> {t('jobs.applyFilters')}</>
+              : <><Icon.Search /> {t('jobs.searchButton')}</>
           }
         </button>
 
         <button
           type="button"
-          aria-label={showFilters ? 'Hide search filters' : 'Show search filters'}
+          aria-label={showFilters ? t('jobs.hideFilters') : t('jobs.showFilters')}
           aria-expanded={showFilters}
           aria-controls="search-filters"
           onClick={toggleFilters}
@@ -414,7 +416,7 @@ export function SmartSearch({ onJobSaved, onOpenSettings }: { onJobSaved?: () =>
           boxShadow: 'var(--shadow-md)',
         }} id="search-filters">
           {[
-            { key: 'location', label: 'Location', icon: <Icon.MapPin />, type: 'text', placeholder: 'Amsterdam, Berlin…' },
+            { key: 'location', label: t('jobs.location'), icon: <Icon.MapPin />, type: 'text', placeholder: t('jobs.locationPlaceholder') },
           ].map(f => (
             <div key={f.key}>
               <label style={{ fontSize: 11, fontWeight: 600, color: 'var(--text-muted)', marginBottom: 5, display: 'flex', alignItems: 'center', gap: 5 }}>
@@ -426,59 +428,59 @@ export function SmartSearch({ onJobSaved, onOpenSettings }: { onJobSaved?: () =>
 
           <div>
             <label style={{ fontSize: 11, fontWeight: 600, color: 'var(--text-muted)', marginBottom: 5, display: 'flex', alignItems: 'center', gap: 5 }}>
-              <Icon.Briefcase /> Job Type
+              <Icon.Briefcase /> {t('jobs.jobType')}
             </label>
             <select style={{ ...glassInput, height: 36 }} value={filters.jobType} onChange={e => setFilter('jobType', e.target.value)}>
-              <option value="">Any type</option>
-              <option value="fulltime">Full-time</option>
-              <option value="parttime">Part-time</option>
-              <option value="contract">Contract</option>
-              <option value="internship">Internship</option>
+              <option value="">{t('jobs.anyType')}</option>
+              <option value="fulltime">{t('jobs.fullTime')}</option>
+              <option value="parttime">{t('jobs.partTime')}</option>
+              <option value="contract">{t('jobs.contract')}</option>
+              <option value="internship">{t('jobs.internship')}</option>
             </select>
           </div>
 
           <div>
             <label style={{ fontSize: 11, fontWeight: 600, color: 'var(--text-muted)', marginBottom: 5, display: 'flex', alignItems: 'center', gap: 5 }}>
-              <Icon.Calendar /> Date Posted
+              <Icon.Calendar /> {t('jobs.datePosted')}
             </label>
             <select style={{ ...glassInput, height: 36 }} value={filters.datePosted} onChange={e => setFilter('datePosted', e.target.value)}>
-              <option value="any">Any time</option>
-              <option value="today">Today</option>
-              <option value="week">This week</option>
-              <option value="month">This month</option>
+              <option value="any">{t('jobs.anyTime')}</option>
+              <option value="today">{t('jobs.today')}</option>
+              <option value="week">{t('jobs.thisWeek')}</option>
+              <option value="month">{t('jobs.thisMonth')}</option>
             </select>
           </div>
 
           <div>
             <label style={{ fontSize: 11, fontWeight: 600, color: 'var(--text-muted)', marginBottom: 5, display: 'flex', alignItems: 'center', gap: 5 }}>
-              <Icon.Star /> Experience
+              <Icon.Star /> {t('jobs.experience')}
             </label>
             <select style={{ ...glassInput, height: 36 }} value={filters.experience} onChange={e => setFilter('experience', e.target.value)}>
-              <option value="">Any level</option>
-              <option value="entry">Entry / Junior</option>
-              <option value="mid">Mid-level</option>
-              <option value="senior">Senior</option>
-              <option value="lead">Lead / Manager</option>
+              <option value="">{t('jobs.anyLevel')}</option>
+              <option value="entry">{t('jobs.entryJunior')}</option>
+              <option value="mid">{t('jobs.midLevel')}</option>
+              <option value="senior">{t('jobs.senior')}</option>
+              <option value="lead">{t('jobs.leadManager')}</option>
             </select>
           </div>
 
           <div>
             <label style={{ fontSize: 11, fontWeight: 600, color: 'var(--text-muted)', marginBottom: 5, display: 'flex', alignItems: 'center', gap: 5 }}>
-              <Icon.Dollar /> Min Salary (k€)
+              <Icon.Dollar /> {t('jobs.minSalary')}
             </label>
-            <input style={glassInput} type="number" min={0} max={500} value={filters.salaryMin} onChange={e => setFilter('salaryMin', e.target.value)} placeholder="e.g. 50" />
+            <input style={glassInput} type="number" min={0} max={500} value={filters.salaryMin} onChange={e => setFilter('salaryMin', e.target.value)} placeholder="50" />
           </div>
 
           <div>
             <label style={{ fontSize: 11, fontWeight: 600, color: 'var(--text-muted)', marginBottom: 5, display: 'flex', alignItems: 'center', gap: 5 }}>
-              <Icon.Dollar /> Max Salary (k€)
+              <Icon.Dollar /> {t('jobs.maxSalary')}
             </label>
-            <input style={glassInput} type="number" min={0} max={500} value={filters.salaryMax} onChange={e => setFilter('salaryMax', e.target.value)} placeholder="e.g. 120" />
+            <input style={glassInput} type="number" min={0} max={500} value={filters.salaryMax} onChange={e => setFilter('salaryMax', e.target.value)} placeholder="120" />
           </div>
 
           <div>
             <label style={{ fontSize: 11, fontWeight: 600, color: 'var(--text-muted)', marginBottom: 5, display: 'flex', alignItems: 'center', gap: 5 }}>
-              <Icon.Home /> Remote
+              <Icon.Home /> {t('jobs.remote')}
             </label>
             <button
               onClick={() => setFilter('remote', !filters.remote)}
@@ -490,7 +492,7 @@ export function SmartSearch({ onJobSaved, onOpenSettings }: { onJobSaved?: () =>
                 display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 6,
                 transition: 'all 0.15s',
               }}>
-              {filters.remote ? <><Icon.Home />Remote only</> : 'Any location'}
+              {filters.remote ? <><Icon.Home />{t('jobs.remoteOnly')}</> : t('jobs.anyLocation')}
             </button>
           </div>
 
@@ -505,7 +507,7 @@ export function SmartSearch({ onJobSaved, onOpenSettings }: { onJobSaved?: () =>
                   display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 6,
                   transition: 'all 0.15s',
                 }}>
-                <Icon.Trash /> Clear all
+                <Icon.Trash /> {t('jobs.clearAll')}
               </button>
             </div>
           )}
@@ -530,7 +532,7 @@ export function SmartSearch({ onJobSaved, onOpenSettings }: { onJobSaved?: () =>
       {!searched && recent.length > 0 && (
         <div style={{ display: 'flex', alignItems: 'center', gap: 7, flexWrap: 'wrap', marginBottom: 12 }}>
           <span style={{ fontSize: 11, color: 'var(--text-muted)', display: 'flex', alignItems: 'center', gap: 4, flexShrink: 0 }}>
-            <Icon.Clock /> Recent:
+            <Icon.Clock /> {t('jobs.recent')}:
           </span>
           {recent.slice(0, 6).map(s => (
             <button key={s} onClick={() => { setQ(s); setFilters(DEFAULT_FILTERS); runSearch(s, DEFAULT_FILTERS) }}
@@ -559,8 +561,8 @@ export function SmartSearch({ onJobSaved, onOpenSettings }: { onJobSaved?: () =>
                 <div style={{ position: 'absolute', inset: 6, borderRadius: '50%', border: '2px solid rgba(124,58,237,0.10)', borderBottomColor: '#7C3AED', animation: 'spin 1.2s linear infinite reverse' }} />
                 <div style={{ position: 'absolute', inset: 0, display: 'flex', alignItems: 'center', justifyContent: 'center', color: 'var(--primary)' }}><Icon.Zap /></div>
               </div>
-              <div style={{ fontSize: 14, fontWeight: 600, color: 'var(--text)' }}>Searching across 14 job sources…</div>
-              <div style={{ fontSize: 12, color: 'var(--text-muted)' }}>AI routing to best sources for your query</div>
+              <div style={{ fontSize: 14, fontWeight: 600, color: 'var(--text)' }}>{t('jobs.searchingSources')}</div>
+              <div style={{ fontSize: 12, color: 'var(--text-muted)' }}>{t('jobs.aiRouting')}</div>
             </div>
           ) : results.length === 0 ? (
             /* No results */
@@ -568,18 +570,18 @@ export function SmartSearch({ onJobSaved, onOpenSettings }: { onJobSaved?: () =>
               <div style={{ width: 56, height: 56, borderRadius: 16, background: 'rgba(79,70,229,0.08)', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
                 <Icon.Search />
               </div>
-              <div style={{ fontSize: 15, fontWeight: 600, color: 'var(--text)' }}>No jobs found</div>
+              <div style={{ fontSize: 15, fontWeight: 600, color: 'var(--text)' }}>{t('jobs.noJobsFound')}</div>
               <div style={{ fontSize: 13, color: 'var(--text-muted)', lineHeight: 1.65 }}>
-                Try broader keywords, a different location, or remove some filters.
+                {t('jobs.tryBroader')}
               </div>
               {/* Keep provider configuration helpful without exposing routing internals. */}
               {meta?.apiKeys && !meta.apiKeys.rapidapi && (
                 <div style={{ marginTop: 8, padding: '12px 14px', background: 'rgba(234,179,8,0.08)', border: '1px solid rgba(234,179,8,0.25)', borderRadius: 10, maxWidth: 360, textAlign: 'left' }}>
-                  <div style={{ fontSize: 11, fontWeight: 700, color: '#b45309', marginBottom: 4 }}>Some sources need a connection</div>
+                  <div style={{ fontSize: 11, fontWeight: 700, color: '#b45309', marginBottom: 4 }}>{t('jobs.sourcesNeedConnection')}</div>
                   <div style={{ fontSize: 11, color: 'var(--text-muted)', lineHeight: 1.6 }}>
-                    Add your job-search API keys in Settings, or try broader keywords and a different location. Free sources remain available without a key.
+                    {t('jobs.apiKeysHint')}
                   </div>
-                  {onOpenSettings && <button type="button" onClick={onOpenSettings} style={{ marginTop: 10, padding: '7px 11px', border: '1px solid rgba(180,83,9,0.35)', borderRadius: 8, background: 'rgba(255,255,255,0.62)', color: '#92400e', fontSize: 11, fontWeight: 700, cursor: 'pointer' }}>Open API key settings</button>}
+                  {onOpenSettings && <button type="button" onClick={onOpenSettings} style={{ marginTop: 10, padding: '7px 11px', border: '1px solid rgba(180,83,9,0.35)', borderRadius: 8, background: 'rgba(255,255,255,0.62)', color: '#92400e', fontSize: 11, fontWeight: 700, cursor: 'pointer' }}>{t('jobs.openApiSettings')}</button>}
                 </div>
               )}
             </div>
@@ -593,7 +595,7 @@ export function SmartSearch({ onJobSaved, onOpenSettings }: { onJobSaved?: () =>
                   border: '1px solid var(--border-glass)', borderRadius: 12,
                   display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap',
                 }}>
-                  <span style={{ fontSize: 13, fontWeight: 700, color: 'var(--text)' }}>{results.length} jobs found</span>
+                  <span style={{ fontSize: 13, fontWeight: 700, color: 'var(--text)' }}>{results.length} {t('jobs.jobsFound')}</span>
                   <span style={{ fontSize: 10, color: 'var(--text-muted)' }}>·</span>
                   <span style={{ fontSize: 11, color: 'var(--text-muted)' }}>
                     {meta.sourcesUsed.map(s => SOURCE_STYLE[s]?.label ?? s).join(' · ')}
@@ -601,7 +603,7 @@ export function SmartSearch({ onJobSaved, onOpenSettings }: { onJobSaved?: () =>
                   {/* Region routing badge */}
                   {meta.routing && (() => {
                     const flag = parseRoutingFlag(meta.routing)
-                    // Extract region label: "IE → ..." or "Ireland → ..." or "远程 → ..."
+                    // Extract region label: "IE → ..." or "Ireland → ..." or "remote → ..."
                     const m = meta.routing.match(/^(Ireland|[A-Z]{2}|Remote|[^\s→]+)/)
                     const label = m?.[1]?.trim() ?? ''
                     const display = flag || label
@@ -615,13 +617,13 @@ export function SmartSearch({ onJobSaved, onOpenSettings }: { onJobSaved?: () =>
                   {meta.salaryContext && (
                     <span style={{ display: 'flex', alignItems: 'center', gap: 4, fontSize: 11, color: '#059669', fontWeight: 600, marginLeft: 'auto' }}>
                       <Icon.Dollar />
-                      {meta.salaryContext.currency === 'EUR' ? '€' : meta.salaryContext.currency === 'GBP' ? '£' : '$'}{Math.round(meta.salaryContext.median / 1000)}k median
+                      {meta.salaryContext.currency === 'EUR' ? '€' : meta.salaryContext.currency === 'GBP' ? '£' : '$'}{Math.round(meta.salaryContext.median / 1000)}k {t('jobs.median')}
                     </span>
                   )}
                   <div style={{ display: 'flex', alignItems: 'center', gap: 5 }}>
-                    <span style={{ fontSize: 10, color: 'var(--text-muted)' }}>Score:</span>
+                    <span style={{ fontSize: 10, color: 'var(--text-muted)' }}>{t('jobs.score')}:</span>
                     <button onClick={() => setSortDir(d => d === 'desc' ? 'asc' : 'desc')} style={{ fontSize: 10, padding: '3px 9px', border: '1px solid var(--border)', borderRadius: 6, background: 'var(--glass-bg)', color: 'var(--text-muted)', cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 3 }}>
-                      {sortDir === 'desc' ? <><Icon.ChevronDown /> High first</> : <><Icon.ChevronUp /> Low first</>}
+                      {sortDir === 'desc' ? <><Icon.ChevronDown /> {t('jobs.highFirst')}</> : <><Icon.ChevronUp /> {t('jobs.lowFirst')}</>}
                     </button>
                   </div>
                 </div>
@@ -630,7 +632,7 @@ export function SmartSearch({ onJobSaved, onOpenSettings }: { onJobSaved?: () =>
               {/* ── Skills cloud ── */}
               {meta?.topSkills?.length ? (
                 <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', marginBottom: 10, alignItems: 'center' }}>
-                  <span style={{ fontSize: 10, color: 'var(--text-subtle)', fontWeight: 600, letterSpacing: '0.05em', textTransform: 'uppercase' }}>Trending skills:</span>
+                  <span style={{ fontSize: 10, color: 'var(--text-subtle)', fontWeight: 600, letterSpacing: '0.05em', textTransform: 'uppercase' }}>{t('jobs.trendingSkills')}:</span>
                   {meta.topSkills.slice(0, 10).map(sk => (
                     <span key={sk} style={{ fontSize: 10, padding: '3px 10px', borderRadius: 999, background: 'rgba(79,70,229,0.07)', color: 'var(--primary)', border: '1px solid rgba(79,70,229,0.14)', fontWeight: 500 }}>{sk}</span>
                   ))}
@@ -676,7 +678,7 @@ export function SmartSearch({ onJobSaved, onOpenSettings }: { onJobSaved?: () =>
                             {r.title}
                           </span>
                           {jt && <Badge color={jt.color} bg={jt.bg}>{r.jobType}</Badge>}
-                          {r.directApply && <Badge color="#7C3AED" bg="rgba(124,58,237,0.10)" style={{ gap: 4 }}><Icon.Rocket />Direct Apply</Badge>}
+                          {r.directApply && <Badge color="#7C3AED" bg="rgba(124,58,237,0.10)" style={{ gap: 4 }}><Icon.Rocket />{t('jobs.directApply')}</Badge>}
                         </div>
 
                         {/* Row 2: Company · location · WA · time · source */}
@@ -723,14 +725,14 @@ export function SmartSearch({ onJobSaved, onOpenSettings }: { onJobSaved?: () =>
                               {jt && <Badge color={jt.color} bg={jt.bg}><Icon.Briefcase /> {r.jobType}</Badge>}
                               {r.seniority && <Badge color="var(--text-muted)" bg="var(--bg-secondary)">{r.seniority}</Badge>}
                               {wa && <Badge color={wa.color} bg={wa.bg}>{wa.icon} {wa.label}</Badge>}
-                              {r.directApply && <Badge color="#7C3AED" bg="rgba(124,58,237,0.10)"><Icon.Rocket /> Direct Apply</Badge>}
+                              {r.directApply && <Badge color="#7C3AED" bg="rgba(124,58,237,0.10)"><Icon.Rocket /> {t('jobs.directApply')}</Badge>}
                               <Badge color={src.color} bg={src.bg}>{src.label}</Badge>
                             </div>
 
                             {/* All skills */}
                             {r.keySkills?.length ? (
                               <div style={{ marginBottom: 14 }}>
-                                <div style={{ fontSize: 10, fontWeight: 700, color: 'var(--text-subtle)', textTransform: 'uppercase', letterSpacing: '0.08em', marginBottom: 7 }}>Required Skills</div>
+                                <div style={{ fontSize: 10, fontWeight: 700, color: 'var(--text-subtle)', textTransform: 'uppercase', letterSpacing: '0.08em', marginBottom: 7 }}>{t('jobs.requiredSkills')}</div>
                                 <div style={{ display: 'flex', gap: 5, flexWrap: 'wrap' }}>
                                   {r.keySkills.map(sk => (
                                     <span key={sk} style={{ fontSize: 11, padding: '3px 10px', borderRadius: 999, background: 'rgba(79,70,229,0.08)', color: 'var(--primary)', border: '1px solid rgba(79,70,229,0.15)', fontWeight: 500 }}>{sk}</span>
@@ -742,7 +744,7 @@ export function SmartSearch({ onJobSaved, onOpenSettings }: { onJobSaved?: () =>
                             {/* Description */}
                             <div style={{ marginBottom: 14 }}>
                               <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 8 }}>
-                                <span style={{ fontSize: 10, fontWeight: 700, color: 'var(--text-subtle)', textTransform: 'uppercase', letterSpacing: '0.08em' }}>Job Description</span>
+                                <span style={{ fontSize: 10, fontWeight: 700, color: 'var(--text-subtle)', textTransform: 'uppercase', letterSpacing: '0.08em' }}>{t('jobs.jobDescription')}</span>
                                 {r.description && (
                                   <div style={{ display: 'flex', alignItems: 'center', gap: 5, marginLeft: 'auto' }}>
                                     <select
@@ -754,7 +756,7 @@ export function SmartSearch({ onJobSaved, onOpenSettings }: { onJobSaved?: () =>
                                       onClick={e => { e.stopPropagation(); handleTranslate(r) }}
                                       disabled={translating.has(r.id)}
                                       style={{ fontSize: 10, padding: '3px 9px', borderRadius: 6, border: '1px solid var(--border)', background: 'var(--glass-bg)', color: 'var(--primary)', cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 4 }}>
-                                      <Icon.Globe /> {translating.has(r.id) ? 'Translating…' : 'Translate'}
+                                      <Icon.Globe /> {translating.has(r.id) ? t('jobs.translating') : t('jobs.translate')}
                                     </button>
                                   </div>
                                 )}
@@ -777,18 +779,18 @@ export function SmartSearch({ onJobSaved, onOpenSettings }: { onJobSaved?: () =>
                                         <button
                                           onClick={e => { e.stopPropagation(); setDescExp(prev => { const n = new Set(prev); isExp ? n.delete(r.id) : n.add(r.id); return n }) }}
                                           style={{ fontSize: 11, fontWeight: 600, color: 'var(--primary)', background: 'rgba(79,70,229,0.08)', border: '1px solid rgba(79,70,229,0.20)', borderRadius: 7, cursor: 'pointer', padding: '4px 11px', display: 'flex', alignItems: 'center', gap: 4 }}>
-                                          {isExp ? <><Icon.ChevronUp />Show less</> : <><Icon.ChevronDown />Show more</>}
+                                          {isExp ? <><Icon.ChevronUp />{t('jobs.showLess')}</> : <><Icon.ChevronDown />{t('jobs.showMore')}</>}
                                         </button>
                                       )}
                                       <a href={r.url} target="_blank" rel="noopener noreferrer" onClick={e => e.stopPropagation()} style={{ fontSize: 11, color: 'var(--text-muted)', textDecoration: 'none', display: 'flex', alignItems: 'center', gap: 4, marginLeft: long ? 0 : 'auto' }}>
-                                        <Icon.ExternalLink /> View original
+                                        <Icon.ExternalLink /> {t('jobs.viewOriginal')}
                                       </a>
                                     </div>
                                   </>
                                 )
                               })() : (
                                 <div style={{ fontSize: 12, color: 'var(--text-muted)', padding: '14px 16px', background: 'var(--bg-secondary)', borderRadius: 10, textAlign: 'center' }}>
-                                  No description — <a href={r.url} target="_blank" rel="noopener noreferrer" onClick={e => e.stopPropagation()} style={{ color: 'var(--primary)' }}>view original ↗</a>
+                                  {t('jobs.noDescription')} — <a href={r.url} target="_blank" rel="noopener noreferrer" onClick={e => e.stopPropagation()} style={{ color: 'var(--primary)' }}>{t('jobs.viewOriginal')} ↗</a>
                                 </div>
                               )}
                             </div>
@@ -808,13 +810,13 @@ export function SmartSearch({ onJobSaved, onOpenSettings }: { onJobSaved?: () =>
                             {/* Actions */}
                             <div style={{ display: 'flex', gap: 10, alignItems: 'center', flexWrap: 'wrap' }}>
                               <a href={r.url} target="_blank" rel="noopener noreferrer" onClick={e => e.stopPropagation()} style={{ display: 'inline-flex', alignItems: 'center', gap: 7, padding: '9px 22px', background: 'linear-gradient(135deg, #4F46E5, #7C3AED)', color: '#fff', borderRadius: 10, fontSize: 13, fontWeight: 700, textDecoration: 'none', boxShadow: '0 4px 14px rgba(79,70,229,0.40)' }}>
-                                <Icon.ExternalLink /> View Job Posting
+                                <Icon.ExternalLink /> {t('jobs.viewPosting')}
                               </a>
 
                               {savedIds.has(r.id) ? (
                                 scores[r.id] !== undefined
                                   ? <ScorePill score={scores[r.id]} />
-                                  : <Badge color="#059669" bg="rgba(5,150,105,0.12)">✓ Saved</Badge>
+                                  : <Badge color="#059669" bg="rgba(5,150,105,0.12)">✓ {t('jobs.savedBadge')}</Badge>
                               ) : (
                                 <button
                                   onClick={e => { e.stopPropagation(); handleSave(r) }}
@@ -823,15 +825,15 @@ export function SmartSearch({ onJobSaved, onOpenSettings }: { onJobSaved?: () =>
                                   onMouseEnter={e => { if (!savingIds.has(r.id)) { e.currentTarget.style.borderColor = 'rgba(79,70,229,0.35)'; e.currentTarget.style.color = 'var(--primary)' } }}
                                   onMouseLeave={e => { e.currentTarget.style.borderColor = 'var(--border)'; e.currentTarget.style.color = 'var(--text-muted)' }}>
                                   {savingIds.has(r.id)
-                                    ? <><span style={{ width: 13, height: 13, border: '2px solid rgba(79,70,229,0.2)', borderTopColor: 'var(--primary)', borderRadius: '50%', animation: 'spin 0.7s linear infinite', display: 'inline-block' }} />Saving…</>
-                                    : <>{Icon.Bookmark()}Save to Tracker</>}
+                                    ? <><span style={{ width: 13, height: 13, border: '2px solid rgba(79,70,229,0.2)', borderTopColor: 'var(--primary)', borderRadius: '50%', animation: 'spin 0.7s linear infinite', display: 'inline-block' }} />{t('jobs.saving')}</>
+                                  : <>{Icon.Bookmark()}{t('jobs.saveToTracker')}</>}
                                 </button>
                               )}
 
                               {scoringIds.has(r.id) && (
                                 <span style={{ fontSize: 11, color: 'var(--text-muted)', display: 'flex', alignItems: 'center', gap: 5 }}>
                                   <span style={{ width: 12, height: 12, border: '2px solid rgba(79,70,229,0.18)', borderTopColor: 'var(--primary)', borderRadius: '50%', animation: 'spin 0.7s linear infinite', display: 'inline-block' }} />
-                                  AI scoring match…
+                                  {t('jobs.aiScoring')}
                                 </span>
                               )}
                             </div>
@@ -847,13 +849,13 @@ export function SmartSearch({ onJobSaved, onOpenSettings }: { onJobSaved?: () =>
                           {scoringIds.has(r.id) && <span style={{ width: 10, height: 10, border: '1.5px solid rgba(79,70,229,0.18)', borderTopColor: 'var(--primary)', borderRadius: '50%', animation: 'spin 0.7s linear infinite', display: 'inline-block' }} />}
 
                           {/* View button */}
-                          <a href={r.url} target="_blank" rel="noopener noreferrer" onClick={e => e.stopPropagation()} title="View job posting" style={{ width: 34, height: 34, display: 'flex', alignItems: 'center', justifyContent: 'center', borderRadius: 9, background: 'linear-gradient(135deg, #4F46E5, #7C3AED)', color: '#fff', textDecoration: 'none', boxShadow: '0 3px 10px rgba(79,70,229,0.35)', transition: 'all 0.15s' }}>
+                          <a href={r.url} target="_blank" rel="noopener noreferrer" onClick={e => e.stopPropagation()} title={t('jobs.viewPosting')} style={{ width: 34, height: 34, display: 'flex', alignItems: 'center', justifyContent: 'center', borderRadius: 9, background: 'linear-gradient(135deg, #4F46E5, #7C3AED)', color: '#fff', textDecoration: 'none', boxShadow: '0 3px 10px rgba(79,70,229,0.35)', transition: 'all 0.15s' }}>
                             <Icon.ExternalLink />
                           </a>
 
                           {/* Save button */}
                           {!savedIds.has(r.id) && (
-                            <button onClick={e => { e.stopPropagation(); handleSave(r) }} disabled={savingIds.has(r.id)} title="Save to tracker" style={{ width: 34, height: 34, display: 'flex', alignItems: 'center', justifyContent: 'center', borderRadius: 9, border: '1px solid var(--border)', background: 'var(--glass-bg)', color: 'var(--text-muted)', cursor: 'pointer', transition: 'all 0.15s' }}
+                            <button onClick={e => { e.stopPropagation(); handleSave(r) }} disabled={savingIds.has(r.id)} title={t('jobs.saveTracker')} style={{ width: 34, height: 34, display: 'flex', alignItems: 'center', justifyContent: 'center', borderRadius: 9, border: '1px solid var(--border)', background: 'var(--glass-bg)', color: 'var(--text-muted)', cursor: 'pointer', transition: 'all 0.15s' }}
                               onMouseEnter={e => { e.currentTarget.style.borderColor = 'rgba(79,70,229,0.35)'; e.currentTarget.style.color = 'var(--primary)' }}
                               onMouseLeave={e => { e.currentTarget.style.borderColor = 'var(--border)'; e.currentTarget.style.color = 'var(--text-muted)' }}>
                               {savingIds.has(r.id)
@@ -862,7 +864,7 @@ export function SmartSearch({ onJobSaved, onOpenSettings }: { onJobSaved?: () =>
                             </button>
                           )}
                           {savedIds.has(r.id) && scores[r.id] === undefined && !scoringIds.has(r.id) && (
-                            <span title="Saved" style={{ color: '#059669', display: 'flex' }}>✓</span>
+                            <span title={t('jobs.savedBadge')} style={{ color: '#059669', display: 'flex' }}>✓</span>
                           )}
                         </div>
                       )}
@@ -884,8 +886,8 @@ export function SmartSearch({ onJobSaved, onOpenSettings }: { onJobSaved?: () =>
                       </span>
                       <select value={pageSize} onChange={e => { setPageSize(Number(e.target.value)); setPage(1) }}
                         style={{ padding: '4px 8px', fontSize: 11, border: '1px solid var(--border)', borderRadius: 7, background: 'var(--glass-bg)', color: 'var(--text)', cursor: 'pointer' }}>
-                        <option value={20}>20 / page</option>
-                        <option value={50}>50 / page</option>
+                        <option value={20}>{t('jobs.perPage20')}</option>
+                        <option value={50}>{t('jobs.perPage50')}</option>
                       </select>
                     </div>
 
@@ -922,10 +924,10 @@ export function SmartSearch({ onJobSaved, onOpenSettings }: { onJobSaved?: () =>
             <Icon.Cpu />
           </div>
           <div style={{ textAlign: 'center' }}>
-            <div style={{ fontSize: 18, fontWeight: 800, color: 'var(--text)', marginBottom: 8, letterSpacing: '-0.02em' }}>AI-Powered Job Search</div>
+            <div style={{ fontSize: 18, fontWeight: 800, color: 'var(--text)', marginBottom: 8, letterSpacing: '-0.02em' }}>{t('jobs.aiPoweredSearch')}</div>
             <div style={{ fontSize: 13, color: 'var(--text-muted)', lineHeight: 1.75, maxWidth: 420 }}>
-              Search <strong>14 European job boards</strong> simultaneously — LinkedIn, Indeed, Adzuna, StepStone & more.
-              AI routes your query, deduplicates results, and scores each job against your resume.
+              {t('jobs.searchFourteenBoards')} <strong>{t('jobs.europeanBoards')}</strong> {t('jobs.simultaneously')}
+              {t('jobs.aiRoutesResults')}
             </div>
           </div>
 

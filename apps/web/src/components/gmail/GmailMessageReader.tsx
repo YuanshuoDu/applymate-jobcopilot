@@ -16,7 +16,7 @@ const URL_SPLIT = /(https?:\/\/[^\s<>"]+)/g
 const URL_ONLY = /^https?:\/\//i
 
 export function GmailMessageReader({ email, onClose, onStar, onMarkRead }: GmailMessageReaderProps) {
-  const { lang } = useI18n()
+  const { lang, t } = useI18n()
   const toast = useToast()
   const [body, setBody] = useState<string | null>(null)
   const [loading, setLoading] = useState(true)
@@ -53,7 +53,7 @@ export function GmailMessageReader({ email, onClose, onStar, onMarkRead }: Gmail
       if (!result.translated) throw new Error('Missing translation')
       setTranslated(result.translated); setShowTranslated(true)
     } catch {
-      toast.error('Translation failed', 'Please try again')
+      toast.error(t('gmail.translationFailed'), t('gmail.tryAgain'))
     } finally {
       setTranslating(false)
     }
@@ -71,17 +71,17 @@ export function GmailMessageReader({ email, onClose, onStar, onMarkRead }: Gmail
           </div>
         </div>
         <div style={{ display: 'flex', gap: 4, flexShrink: 0, alignItems: 'center' }}>
-          <button type="button" onClick={() => onStar(email.id)} title="Star" aria-label={email.starred ? 'Unstar email' : 'Star email'} style={{ background: 'none', border: 'none', cursor: 'pointer', fontSize: 18, color: email.starred ? '#F59E0B' : 'var(--text-muted)', padding: '0 4px', lineHeight: 1 }}>{email.starred ? '★' : '☆'}</button>
+          <button type="button" onClick={() => onStar(email.id)} title={email.starred ? t('gmail.unstar') : t('gmail.star')} aria-label={email.starred ? t('gmail.unstar') : t('gmail.star')} style={{ background: 'none', border: 'none', cursor: 'pointer', fontSize: 18, color: email.starred ? '#F59E0B' : 'var(--text-muted)', padding: '0 4px', lineHeight: 1 }}>{email.starred ? '★' : '☆'}</button>
           <Btn small variant="ghost" onClick={onClose}>✕</Btn>
         </div>
       </header>
-      {showTranslated && <div style={{ padding: '4px 18px', background: 'rgba(79,70,229,0.06)', borderBottom: '0.5px solid var(--border)', display: 'flex', alignItems: 'center', gap: 6 }}><span style={{ fontSize: 10, color: 'var(--primary)' }}>🌐 {lang === 'zh' ? 'Translated to English' : '已翻译为中文'}</span><button type="button" onClick={() => setShowTranslated(false)} style={{ marginLeft: 'auto', fontSize: 10, color: 'var(--text-muted)', background: 'none', border: 'none', cursor: 'pointer' }}>Show original</button></div>}
+      {showTranslated && <div style={{ padding: '4px 18px', background: 'rgba(79,70,229,0.06)', borderBottom: '0.5px solid var(--border)', display: 'flex', alignItems: 'center', gap: 6 }}><span style={{ fontSize: 10, color: 'var(--primary)' }}>🌐 {lang === 'zh' ? t('gmail.translatedToEnglish') : t('gmail.translatedToChinese')}</span><button type="button" onClick={() => setShowTranslated(false)} style={{ marginLeft: 'auto', fontSize: 10, color: 'var(--text-muted)', background: 'none', border: 'none', cursor: 'pointer' }}>{t('gmail.showOriginal')}</button></div>}
       <div style={{ flex: 1, overflowY: 'auto', padding: '16px 24px' }}>{loading ? <LoadingMessage /> : displayBody && <RichEmailBody text={displayBody} />}</div>
       <footer style={{ padding: '10px 18px', borderTop: '0.5px solid var(--border)', display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'center' }}>
-        <Btn variant="ghost" onClick={() => window.open(`https://mail.google.com/mail/#inbox/${email.threadId}`, '_blank')}>Open in Gmail ↗</Btn>
-        {!loading && body && <button type="button" onClick={() => void translateMessage()} disabled={translating} style={translateButton(showTranslated, translating)}>{translating ? '⏳ Translating…' : showTranslated ? (lang === 'zh' ? '显示原文' : 'Show original') : (lang === 'zh' ? '🌐 翻译' : '🌐 Translate')}</button>}
-        {!loading && !canReply && <span style={{ marginLeft: 'auto', color: 'var(--text-muted)', fontSize: 11 }}>AI follow-up is available for application emails.</span>}
-        {canReply && !loading && <Btn variant="primary" onClick={() => setShowReply(true)} style={{ marginLeft: 'auto' }}>✨ AI follow-up</Btn>}
+        <Btn variant="ghost" onClick={() => window.open(`https://mail.google.com/mail/#inbox/${email.threadId}`, '_blank')}>{t('gmail.openGmail')}</Btn>
+        {!loading && body && <button type="button" onClick={() => void translateMessage()} disabled={translating} style={translateButton(showTranslated, translating)}>{translating ? `⏳ ${t('gmail.translating')}` : showTranslated ? t('gmail.showOriginal') : `🌐 ${t('gmail.translate')}`}</button>}
+        {!loading && !canReply && <span style={{ marginLeft: 'auto', color: 'var(--text-muted)', fontSize: 11 }}>{t('gmail.aiFollowUpAvailable')}</span>}
+        {canReply && !loading && <Btn variant="primary" onClick={() => setShowReply(true)} style={{ marginLeft: 'auto' }}>✨ {t('gmail.aiFollowUp')}</Btn>}
       </footer>
     </article>
     {showReply && <GmailReplyModal email={email} body={body ?? email.preview} onClose={() => setShowReply(false)} />}
@@ -89,7 +89,8 @@ export function GmailMessageReader({ email, onClose, onStar, onMarkRead }: Gmail
 }
 
 function LoadingMessage() {
-  return <div style={{ display: 'flex', alignItems: 'center', gap: 8, color: 'var(--text-muted)', fontSize: 12 }}><div style={{ width: 14, height: 14, border: '2px solid rgba(79,70,229,0.15)', borderTopColor: 'var(--primary)', borderRadius: '50%', animation: 'spin 0.7s linear infinite' }} />Loading message…</div>
+  const { t } = useI18n()
+  return <div style={{ display: 'flex', alignItems: 'center', gap: 8, color: 'var(--text-muted)', fontSize: 12 }}><div style={{ width: 14, height: 14, border: '2px solid rgba(79,70,229,0.15)', borderTopColor: 'var(--primary)', borderRadius: '50%', animation: 'spin 0.7s linear infinite' }} />{t('gmail.loadingMessage')}</div>
 }
 
 function RichEmailBody({ text }: { text: string }) {

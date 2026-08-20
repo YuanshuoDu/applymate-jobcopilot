@@ -4,6 +4,7 @@ import React from 'react'
 import { apiMutate, useApi } from '@/lib/hooks'
 import { AutomationCreateModal } from './AutomationCreateModal'
 import { AutomationRow, type AgentAutomation } from './AutomationRow'
+import { useI18n } from '@/lib/i18n'
 
 interface AutomationsResponse {
   automations: AgentAutomation[]
@@ -13,6 +14,7 @@ export function AutomationList({ onCreate, onSessionStarted }: {
   onCreate: () => void
   onSessionStarted?: (sessionId: string, policy: Pick<AgentAutomation, 'autoApply' | 'requireApproval'>) => void
 }) {
+  const { t } = useI18n()
   const { data, loading, error, refetch } = useApi<AutomationsResponse>('/api/agent/automations')
   const [pendingId, setPendingId] = React.useState<string | null>(null)
   const [createOpen, setCreateOpen] = React.useState(false)
@@ -94,7 +96,7 @@ export function AutomationList({ onCreate, onSessionStarted }: {
         onAskAgent={() => {
           closeModal()
           window.dispatchEvent(new CustomEvent('applymate:composer-prefill', {
-            detail: '帮我创建一个新的自动化任务：工作日早上 9 点搜索目标职位，85 分以上进入申请队列，提交前需要我批准。',
+            detail: 'Help me create a new automation task: weekday morning 9 Click to search for the target position, 85 Enter the application queue with scores or above, Require my approval before submitting.',
           }))
           onCreate()
         }}
@@ -102,16 +104,16 @@ export function AutomationList({ onCreate, onSessionStarted }: {
       <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 6 }}>
         <div>
           <div style={{ fontSize: 10, color: 'var(--text-muted)', textTransform: 'uppercase', letterSpacing: 0, fontWeight: 700 }}>
-            Automations
+            {t('agent.automations')}
           </div>
           <div style={{ fontSize: 10, color: 'var(--text-muted)', marginTop: 2 }}>
-            Create manually or ask the agent
+            {t('agent.createManually')}
           </div>
         </div>
         <button
           onClick={openCreate}
-          title="Create automation"
-          aria-label="Create automation"
+          title={t('agent.createAutomation')}
+          aria-label={t('agent.createAutomation')}
           style={{ width: 24, height: 24, borderRadius: 7, border: '1px solid var(--border)', background: 'var(--bg)', color: 'var(--primary)', cursor: 'pointer', fontSize: 16, lineHeight: 1 }}
         >
           +
@@ -119,9 +121,9 @@ export function AutomationList({ onCreate, onSessionStarted }: {
       </div>
       {notice && <AutomationNotice tone={notice.tone}>{notice.message}</AutomationNotice>}
       <div style={{ border: '1px solid var(--border)', borderRadius: 8, background: 'var(--bg)', overflow: 'hidden' }}>
-        {loading && <AutomationEmpty>Loading automations...</AutomationEmpty>}
-        {error && <AutomationEmpty tone="error" title={error}>Automations unavailable.</AutomationEmpty>}
-        {!loading && !error && rows.length === 0 && <AutomationEmpty>No automations yet.</AutomationEmpty>}
+        {loading && <AutomationEmpty>{t('agent.loadingAutomations')}</AutomationEmpty>}
+        {error && <AutomationEmpty tone="error" title={error}>{t('agent.automationsUnavailable')}</AutomationEmpty>}
+        {!loading && !error && rows.length === 0 && <AutomationEmpty>{t('agent.noAutomations')}</AutomationEmpty>}
         {rows.map((row, index) => (
           <AutomationRow
             key={row.id}

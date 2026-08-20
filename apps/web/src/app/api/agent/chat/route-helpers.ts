@@ -28,7 +28,7 @@ Action commands (at END of response, on its own line):
   ACTION:open_job:<jobId>
   ACTION:toggle_agent:roleName:true/false
 
-Rules: max 1 action per response, only when asked or obviously needed, be helpful in Chinese or English, use real data from context.`
+Rules: max 1 action per response, only when asked or obviously needed, be helpful in English, use real data from context.`
 
 export interface ChatRequestBody {
   sessionId?: unknown

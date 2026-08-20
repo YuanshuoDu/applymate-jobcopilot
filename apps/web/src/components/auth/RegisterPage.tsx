@@ -5,6 +5,7 @@ import { getProviders, signIn } from 'next-auth/react'
 import { useRouter } from 'next/navigation'
 import Link from 'next/link'
 import { authLink, safeCallbackUrl } from '@/lib/auth-callback'
+import { useI18n } from '@/lib/i18n'
 
 // ── Design tokens (identical to LoginPage) ────────────────────────────────────
 const C = {
@@ -67,13 +68,14 @@ function GoogleIcon() {
 }
 
 function PasswordStrength({ password }: { password: string }) {
+  const { t } = useI18n()
   const score = [
     password.length >= 8,
     /[A-Z]/.test(password),
     /[0-9]/.test(password),
     /[^A-Za-z0-9]/.test(password),
   ].filter(Boolean).length
-  const labels = ['', 'Weak', 'Fair', 'Good', 'Strong']
+  const labels = ['', t('auth.register.pwStrength.weak'), t('auth.register.pwStrength.fair'), t('auth.register.pwStrength.good'), t('auth.register.pwStrength.strong')]
   const colors = ['', C.red, '#D97706', C.primary, C.green]
   return (
     <div style={{ marginTop: 6 }}>
@@ -92,6 +94,7 @@ function PasswordStrength({ password }: { password: string }) {
 }
 
 export function RegisterPage({ callbackUrl: rawCallbackUrl = '/' }: { callbackUrl?: string }) {
+  const { t } = useI18n()
   const router = useRouter()
   const callbackUrl = safeCallbackUrl(rawCallbackUrl)
   const [name,     setName]     = useState('')
@@ -112,11 +115,11 @@ export function RegisterPage({ callbackUrl: rawCallbackUrl = '/' }: { callbackUr
   const googleAvailable = Boolean(oauthProviders?.google)
 
   function validate(): string | null {
-    if (!name.trim())                  return 'Please enter your name'
-    if (!email.trim())                 return 'Please enter your email'
-    if (!/\S+@\S+\.\S+/.test(email))  return 'Please enter a valid email address'
-    if (password.length < 8)          return 'Password must be at least 8 characters'
-    if (password !== confirm)         return 'Passwords do not match'
+    if (!name.trim())                  return t('auth.register.error.nameRequired')
+    if (!email.trim())                 return t('auth.register.error.emailRequired')
+    if (!/\S+@\S+\.\S+/.test(email))  return t('auth.register.error.emailInvalid')
+    if (password.length < 8)          return t('auth.register.error.passwordTooShort')
+    if (password !== confirm)         return t('auth.register.error.passwordMismatch')
     return null
   }
 
@@ -134,7 +137,7 @@ export function RegisterPage({ callbackUrl: rawCallbackUrl = '/' }: { callbackUr
       })
       const data = await res.json().catch(() => ({} as { error?: string }))
       if (!res.ok) {
-        setError(data.error ?? (res.status >= 500 ? 'Server configuration error. Please check the database connection.' : 'Registration failed'))
+        setError(data.error ?? (res.status >= 500 ? t('auth.register.error.serverError') : t('auth.register.error.registerFailed')))
         setLoading(null)
         return
       }
@@ -144,13 +147,13 @@ export function RegisterPage({ callbackUrl: rawCallbackUrl = '/' }: { callbackUr
       else { setStep('success'); setTimeout(() => { router.push(callbackUrl); router.refresh() }, 1800) }
     } catch {
       setLoading(null)
-      setError('Network error. Please try again')
+      setError(t('auth.register.error.networkError'))
     }
   }
 
   async function handleGoogle() {
     if (!googleAvailable) {
-      setError('Google sign-in is not configured. Please use email registration or sign-in.')
+      setError(t('auth.register.error.googleUnavailable'))
       return
     }
     setLoading('google')
@@ -163,8 +166,8 @@ export function RegisterPage({ callbackUrl: rawCallbackUrl = '/' }: { callbackUr
       <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', minHeight: '100vh', background: 'linear-gradient(135deg, #EEF2FF 0%, #F5F3FF 35%, #EDE9FE 65%, #F0F9FF 100%)' }}>
         <div style={{ textAlign: 'center', padding: 32 }}>
           <div style={{ fontSize: 56, marginBottom: 16 }}>🎉</div>
-          <h2 style={{ fontSize: 22, fontWeight: 700, marginBottom: 8, color: C.text }}>Account created successfully!</h2>
-          <p style={{ fontSize: 13, color: C.muted }}>Redirecting to your Dashboard...</p>
+          <h2 style={{ fontSize: 22, fontWeight: 700, marginBottom: 8, color: C.text }}>{t('auth.register.success.title')}</h2>
+          <p style={{ fontSize: 13, color: C.muted }}>{t('auth.register.success.redirecting')}</p>
           <div style={{ marginTop: 20, width: 28, height: 28, border: `3px solid rgba(79,70,229,0.20)`, borderTopColor: C.primary, borderRadius: '50%', animation: 'spin 0.7s linear infinite', margin: '20px auto 0' }} />
         </div>
       </div>
@@ -216,23 +219,23 @@ export function RegisterPage({ callbackUrl: rawCallbackUrl = '/' }: { callbackUr
               background: 'linear-gradient(135deg, #4F46E5 0%, #7C3AED 100%)',
               WebkitBackgroundClip: 'text', WebkitTextFillColor: 'transparent', backgroundClip: 'text',
             }}>ApplyMate AI</div>
-            <div style={{ fontSize: 11, color: C.subtle }}>Job Copilot · Europe</div>
+            <div style={{ fontSize: 11, color: C.subtle }}>{t('auth.brandTagline')}</div>
           </div>
         </Link>
 
         {/* Hero text */}
         <div className="auth-brand-hero" style={{ marginBottom: 40 }}>
           <h1 style={{ fontSize: 28, fontWeight: 800, color: C.text, lineHeight: 1.25, marginBottom: 14, letterSpacing: '-0.02em' }}>
-            Start your<br />AI-powered job search
+            {t('auth.register.heroTitle')}
           </h1>
           <p style={{ fontSize: 13, color: C.muted, lineHeight: 1.75 }}>
-            Create a free account and start using ApplyMate AI, from discovering jobs to submitting applications.
+            {t('auth.register.heroDesc')}
           </p>
         </div>
 
         {/* Features */}
         <div className="auth-features" style={{ display: 'flex', flexDirection: 'column', gap: 22 }}>
-          {FEATURES.map(f => (
+          {FEATURES.map((f, index) => (
             <div key={f.title} style={{ display: 'flex', gap: 14, alignItems: 'flex-start' }}>
               <div style={{
                 width: 36, height: 36, borderRadius: 10, flexShrink: 0,
@@ -242,8 +245,8 @@ export function RegisterPage({ callbackUrl: rawCallbackUrl = '/' }: { callbackUr
                 color: C.primary,
               }}>{f.icon}</div>
               <div>
-                <div style={{ fontSize: 13, fontWeight: 600, color: C.text, marginBottom: 3 }}>{f.title}</div>
-                <div style={{ fontSize: 11, color: C.muted, lineHeight: 1.65 }}>{f.desc}</div>
+                <div style={{ fontSize: 13, fontWeight: 600, color: C.text, marginBottom: 3 }}>{t(`auth.login.feature${index + 1}.title`)}</div>
+                <div style={{ fontSize: 11, color: C.muted, lineHeight: 1.65 }}>{t(`auth.login.feature${index + 1}.desc`)}</div>
               </div>
             </div>
           ))}
@@ -257,10 +260,10 @@ export function RegisterPage({ callbackUrl: rawCallbackUrl = '/' }: { callbackUr
           }}>
             <div style={{ fontSize: 24, lineHeight: 1, color: C.primary, opacity: 0.28, fontFamily: 'Georgia,serif', marginBottom: 4, userSelect: 'none' }}>&ldquo;</div>
             <p style={{ fontSize: 12, color: C.text, lineHeight: 1.80, margin: '0 0 12px' }}>
-              ApplyMate helped me land interviews at Adyen and Booking.com within two weeks, saving me hours of resume work.
+              {t('auth.register.testimonial')}
             </p>
             <div style={{ fontSize: 11, color: C.muted }}>
-              — <span style={{ fontWeight: 600, color: C.text }}>Zhang Li</span>, Backend Engineer · Amsterdam
+              — <span style={{ fontWeight: 600, color: C.text }}>{t('auth.testimonialAuthor')}</span>, {t('auth.testimonialRole')}
             </div>
           </div>
         </div>
@@ -282,14 +285,14 @@ export function RegisterPage({ callbackUrl: rawCallbackUrl = '/' }: { callbackUr
         }}>
           {/* Header */}
           <div style={{ marginBottom: 28 }}>
-            <h2 style={{ fontSize: 22, fontWeight: 800, color: C.text, marginBottom: 6, letterSpacing: '-0.02em' }}>Create your account 👋</h2>
+            <h2 style={{ fontSize: 22, fontWeight: 800, color: C.text, marginBottom: 6, letterSpacing: '-0.02em' }}>{t('auth.register.createAccount')} 👋</h2>
             <p style={{ fontSize: 13, color: C.muted }}>
-              Already have an account?{' '}
+              {t('auth.register.hasAccount')}{' '}
               <Link href={authLink('/login', callbackUrl)} style={{
                 color: C.primary, textDecoration: 'none', fontWeight: 600,
                 background: 'linear-gradient(135deg, #4F46E5, #7C3AED)',
                 WebkitBackgroundClip: 'text', WebkitTextFillColor: 'transparent', backgroundClip: 'text',
-              }}>Sign in</Link>
+              }}>{t('auth.register.loginNow')}</Link>
             </p>
           </div>
 
@@ -326,14 +329,14 @@ export function RegisterPage({ callbackUrl: rawCallbackUrl = '/' }: { callbackUr
                   }}
                 >
                   {loading === 'google' ? <Spinner /> : <GoogleIcon />}
-                  {googleAvailable ? 'Sign up with Google' : 'Google sign-in is not configured'}
+                  {googleAvailable ? t('auth.login.googleLogin') : t('auth.login.googleUnavailableShort')}
                 </button>
               </div>
 
               {/* Divider */}
               <div style={{ display: 'flex', alignItems: 'center', gap: 14, marginBottom: 22 }}>
                 <div style={{ flex: 1, height: 1, background: 'linear-gradient(90deg, transparent, rgba(79,70,229,0.20), transparent)' }} />
-                <span style={{ fontSize: 11, color: C.subtle, whiteSpace: 'nowrap' }}>or register with email</span>
+                <span style={{ fontSize: 11, color: C.subtle, whiteSpace: 'nowrap' }}>{t('auth.register.orEmail')}</span>
                 <div style={{ flex: 1, height: 1, background: 'linear-gradient(90deg, transparent, rgba(79,70,229,0.20), transparent)' }} />
               </div>
             </>
@@ -347,9 +350,9 @@ export function RegisterPage({ callbackUrl: rawCallbackUrl = '/' }: { callbackUr
           <form onSubmit={handleRegister} style={{ display: 'flex', flexDirection: 'column', gap: 15 }}>
             {/* Name */}
             <div style={{ display: 'flex', flexDirection: 'column', gap: 7 }}>
-              <label htmlFor="register-name" style={{ fontSize: 12, fontWeight: 500, color: C.muted }}>Name</label>
+              <label htmlFor="register-name" style={{ fontSize: 12, fontWeight: 500, color: C.muted }}>{t('auth.register.name')}</label>
               <input
-                id="register-name" name="name" type="text" value={name} autoComplete="name" placeholder="Alex Smith"
+                id="register-name" name="name" type="text" value={name} autoComplete="name" placeholder={t('auth.namePlaceholder')}
                 onFocus={() => setFocused('name')} onBlur={() => setFocused(null)}
                 onChange={e => setName(e.target.value)}
                 style={inputStyle('name')}
@@ -357,9 +360,9 @@ export function RegisterPage({ callbackUrl: rawCallbackUrl = '/' }: { callbackUr
             </div>
             {/* Email */}
             <div style={{ display: 'flex', flexDirection: 'column', gap: 7 }}>
-              <label htmlFor="register-email" style={{ fontSize: 12, fontWeight: 500, color: C.muted }}>Email</label>
+              <label htmlFor="register-email" style={{ fontSize: 12, fontWeight: 500, color: C.muted }}>{t('auth.register.email')}</label>
               <input
-                id="register-email" name="email" type="email" value={email} autoComplete="email" placeholder="you@example.com"
+                id="register-email" name="email" type="email" value={email} autoComplete="email" placeholder={t('auth.emailPlaceholder')}
                 onFocus={() => setFocused('email')} onBlur={() => setFocused(null)}
                 onChange={e => setEmail(e.target.value)}
                 style={inputStyle('email')}
@@ -368,8 +371,8 @@ export function RegisterPage({ callbackUrl: rawCallbackUrl = '/' }: { callbackUr
             {/* Password */}
             <div style={{ display: 'flex', flexDirection: 'column', gap: 7 }}>
               <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-                <label htmlFor="register-password" style={{ fontSize: 12, fontWeight: 500, color: C.muted }}>Password</label>
-                <span style={{ fontSize: 11, color: C.subtle }}>At least 8 characters</span>
+                <label htmlFor="register-password" style={{ fontSize: 12, fontWeight: 500, color: C.muted }}>{t('auth.register.password')}</label>
+                <span style={{ fontSize: 11, color: C.subtle }}>{t('auth.register.passwordHint')}</span>
               </div>
               <div style={{ position: 'relative' }}>
                 <input
@@ -380,7 +383,7 @@ export function RegisterPage({ callbackUrl: rawCallbackUrl = '/' }: { callbackUr
                 />
                 <button
                   type="button"
-                  aria-label={passwordVisible ? 'Hide password' : 'Show password'}
+                  aria-label={passwordVisible ? t('auth.register.hidePassword') : t('auth.register.showPassword')}
                   aria-pressed={passwordVisible}
                   onClick={() => setPasswordVisible(value => !value)}
                   style={{
@@ -397,17 +400,17 @@ export function RegisterPage({ callbackUrl: rawCallbackUrl = '/' }: { callbackUr
             </div>
             {/* Confirm */}
             <div style={{ display: 'flex', flexDirection: 'column', gap: 7 }}>
-              <label htmlFor="register-confirm" style={{ fontSize: 12, fontWeight: 500, color: C.muted }}>Confirm password</label>
+              <label htmlFor="register-confirm" style={{ fontSize: 12, fontWeight: 500, color: C.muted }}>{t('auth.register.confirmPassword')}</label>
               <div style={{ position: 'relative' }}>
                 <input
-                  id="register-confirm" name="confirm" type={confirmVisible ? 'text' : 'password'} value={confirm} autoComplete="new-password" placeholder="Enter your password again"
+                  id="register-confirm" name="confirm" type={confirmVisible ? 'text' : 'password'} value={confirm} autoComplete="new-password" placeholder={t('auth.confirmPasswordPlaceholder')}
                   onFocus={() => setFocused('confirm')} onBlur={() => setFocused(null)}
                   onChange={e => setConfirm(e.target.value)}
                   style={{ ...inputStyle('confirm'), paddingRight: 40 }}
                 />
                 <button
                   type="button"
-                  aria-label={confirmVisible ? 'Hide confirmation password' : 'Show confirmation password'}
+                  aria-label={confirmVisible ? t('auth.register.hidePassword') : t('auth.register.showPassword')}
                   aria-pressed={confirmVisible}
                   onClick={() => setConfirmVisible(value => !value)}
                   style={{
@@ -424,10 +427,10 @@ export function RegisterPage({ callbackUrl: rawCallbackUrl = '/' }: { callbackUr
 
             {/* Terms */}
             <p style={{ fontSize: 11, color: C.muted, lineHeight: 1.6, margin: 0 }}>
-              By signing up, you agree to our{' '}
-              <a href="mailto:legal@applymate.ai?subject=Terms%20of%20service" style={{ color: C.primary, textDecoration: 'none', fontWeight: 500 }}>Terms of Service</a>
-              {' '}and{' '}
-              <a href="mailto:legal@applymate.ai?subject=Privacy%20policy" style={{ color: C.primary, textDecoration: 'none', fontWeight: 500 }}>Privacy Policy</a>
+              {t('auth.register.agreeTo')}{' '}
+              <a href="mailto:legal@applymate.ai?subject=Terms%20of%20service" style={{ color: C.primary, textDecoration: 'none', fontWeight: 500 }}>{t('auth.register.terms')}</a>
+              {' '}{t('auth.register.and')}{' '}
+              <a href="mailto:legal@applymate.ai?subject=Privacy%20policy" style={{ color: C.primary, textDecoration: 'none', fontWeight: 500 }}>{t('auth.register.privacy')}</a>
             </p>
 
             {/* Submit */}
@@ -446,7 +449,7 @@ export function RegisterPage({ callbackUrl: rawCallbackUrl = '/' }: { callbackUr
               }}
             >
               {loading === 'register' && <Spinner />}
-              {loading === 'register' ? 'Signing up...' : 'Create free account'}
+              {loading === 'register' ? t('auth.register.registering') : t('auth.register.register')}
             </button>
           </form>
         </div>

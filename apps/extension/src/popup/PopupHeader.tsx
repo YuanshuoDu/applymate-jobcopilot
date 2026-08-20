@@ -33,12 +33,12 @@ export function PopupHeader({ user, onSettings, onLogout, onDashboard, labels }:
         <img src={chrome.runtime.getURL('icons/icon48.png')} alt="ApplyMate AI" width={38} height={38} style={{ display: 'block', borderRadius: 12, boxShadow: '0 5px 12px rgba(81,70,229,0.18)' }} />
         <div style={{ minWidth: 0 }}>
           <div style={{ fontSize: 17, lineHeight: 1.1, fontWeight: 750, color: C.navy, letterSpacing: '-0.03em' }}>ApplyMate AI</div>
-          <div style={{ marginTop: 3, fontSize: 11, color: C.muted, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis', maxWidth: 155 }}>Your AI job copilot</div>
+          <div style={{ marginTop: 3, fontSize: 11, color: C.muted, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis', maxWidth: 155 }}>{labels.yourAiJobCopilot}</div>
         </div>
       </div>
       <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexShrink: 0 }}>
         <IconButton label={labels.menuSettings} onClick={onSettings}><Settings size={19} strokeWidth={1.8} /></IconButton>
-        <button ref={triggerRef} type="button" aria-label="Account menu" aria-haspopup="menu" aria-expanded={menuOpen} onClick={() => setMenuOpen(open => !open)} style={{ width: 34, height: 34, borderRadius: '50%', border: 'none', background: '#EAEAFF', color: C.primary, fontWeight: 700, fontSize: 12, cursor: 'pointer' }}>{initial}</button>
+        <button ref={triggerRef} type="button" aria-label={labels.accountMenu} aria-haspopup="menu" aria-expanded={menuOpen} onClick={() => setMenuOpen(open => !open)} style={{ width: 34, height: 34, borderRadius: '50%', border: 'none', background: '#EAEAFF', color: C.primary, fontWeight: 700, fontSize: 12, cursor: 'pointer' }}>{initial}</button>
       </div>
       {menuOpen && <div ref={menuRef} role="menu" style={{ position: 'absolute', right: 14, top: 61, zIndex: 3, width: 172, padding: 6, background: C.panel, border: `1px solid ${C.border}`, borderRadius: 12, boxShadow: '0 12px 30px rgba(31,38,94,0.16)' }}>
         <MenuButton label={labels.menuDashboard} onClick={() => runMenuAction(onDashboard)} />

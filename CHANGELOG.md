@@ -4,33 +4,33 @@ All notable changes to ApplyMate AI. Dates in YYYY-MM-DD format.
 
 ---
 
-## 2026-05-07 — Adzuna Job Search API 接入
+## 2026-05-07 — Adzuna Job Search API Access
 
 ### Added
-- **`GET /api/adzuna/search`**: 新 API 路由，代理 Adzuna 官方 REST API，归一化响应格式
-  - 参数：`q`（关键词）、`where`（城市）、`country`（gb/de/fr/nl/es/it/at/be/pl/us/ca/au）、`page`、`job_type`
-  - 薪资格式化：`£68k – £137k`；预测薪资加 `~` 前缀区分真实数据
-  - 描述截断：服务端截至 180 字
-  - `cache: 'no-store'`，每次搜索实时数据
-- **`AdzunaSearchPanel` 组件** (`src/components/jobs/AdzunaSearchPanel.tsx`):
-  - 12 国选择器（欧洲优先：🇬🇧🇩🇪🇫🇷🇳🇱🇪🇸🇮🇹🇦🇹🇧🇪🇵🇱 + US/CA/AU）
-  - 职位结果卡片：薪资（绿色）、发布时间（Today/3d ago）、contract_time + contract_type 双 badge
-  - Load more 分页，追加时自动去重（防 Adzuna 分页边界重叠）
-  - 一键 "+ Save" 保存到 My Jobs（`source: 'adzuna'`），保存后显示 "✓ Saved"，外链 "View ↗"
+- **`GET /api/adzuna/search`**: new API routing, acting Adzuna official REST API, Normalized response format
+  - parameter: `q`(keywords), `where`(City), `country`(gb/de/fr/nl/es/it/at/be/pl/us/ca/au), `page`, `job_type`
+  - Salary formatting: `£68k – £137k`; Forecast salary plus `~` Prefix distinguishes real data
+  - description truncation: Server end 180 Character
+  - `cache: 'no-store'`, Live data for every search
+- **`AdzunaSearchPanel` components** (`src/components/jobs/AdzunaSearchPanel.tsx`):
+  - 12 country selector(Europe first: 🇬🇧🇩🇪🇫🇷🇳🇱🇪🇸🇮🇹🇦🇹🇧🇪🇵🇱 + US/CA/AU)
+  - Job Result Card: salary(green), Release time(Today/3d ago), contract_time + contract_type pair badge
+  - Load more Pagination, Automatically remove duplicates when appending(Defend Adzuna Overlapping page boundaries)
+  - One click "+ Save" save to My Jobs(`source: 'adzuna'`), Show after saving "✓ Saved", external link "View ↗"
 
 ### Changed
-- **`JobsPage`**: 替换 `IndeedSearchPanel` → `AdzunaSearchPanel`，按钮文字 "Search Indeed" → "🌍 Search Jobs"
-- **`.env` / `.env.example`**: 新增 `ADZUNA_APP_ID` / `ADZUNA_APP_KEY` 环境变量
+- **`JobsPage`**: replace `IndeedSearchPanel` → `AdzunaSearchPanel`, button text "Search Indeed" → "🌍 Search Jobs"
+- **`.env` / `.env.example`**: New `ADZUNA_APP_ID` / `ADZUNA_APP_KEY` environment variables
 
 ### Removed
-- **`POST /api/indeed/search`**: 路由保留但不再被 UI 调用（Indeed Publisher API 已于 2025 年废弃）
+- **`POST /api/indeed/search`**: The route remains but is no longer used UI call(Indeed Publisher API Already at 2025 Abandoned)
 
-### Fixed（本次优化）
-- `AdzunaSearchPanel`: 移除未使用的 `Card` import
-- API 路由：`next: { revalidate: 60 }` → `cache: 'no-store'`（用户 query 各异，缓存无意义）
-- 增加 `salary_is_predicted` 字段支持，预测薪资用 `~` 前缀区分
-- 增加 `contract_type`（permanent/contract）字段，补全之前只有 `contract_time` 的 badge 缺失
-- Load more 追加去重逻辑，防止 Adzuna 分页重叠导致重复条目
+### Fixed(This optimization)
+- `AdzunaSearchPanel`: Remove unused `Card` import
+- API routing: `next: { revalidate: 60 }` → `cache: 'no-store'`(user query different, Caching is pointless)
+- Increase `salary_is_predicted` Field support, Forecasting salary `~` Prefix distinction
+- Increase `contract_type`(permanent/contract)Field, Before completion, only `contract_time` of badge Missing
+- Load more Add deduplication logic, prevent Adzuna Overlapping pagination results in duplicate entries
 
 ---
 

@@ -294,7 +294,7 @@ export function ResumeIntakeDialog({ onClose, onSaved, directions: initialDirect
 
         {/* Header */}
         <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 16 }}>
-          <div style={{ fontSize: 15, fontWeight: 600, color: 'var(--text)' }}>Add your resume</div>
+          <div style={{ fontSize: 15, fontWeight: 600, color: 'var(--text)' }}>{t('resume.intake.title')}</div>
           {!isLoading && !saving && (
             <button onClick={onClose} style={{ background: 'none', border: 'none', cursor: 'pointer', color: 'var(--text-muted)', fontSize: 16, padding: 4, lineHeight: 1 }}>✕</button>
           )}
@@ -303,7 +303,7 @@ export function ResumeIntakeDialog({ onClose, onSaved, directions: initialDirect
         {/* Direction select */}
         <div style={{ marginBottom: 16 }}>
           <label style={{ fontSize: 11, color: 'var(--text-muted)', display: 'block', marginBottom: 4 }}>
-            Choose a direction (optional)
+            {t('resume.intake.chooseDirection')}
           </label>
           <select
             value={selectedDirId ?? ''}
@@ -314,11 +314,11 @@ export function ResumeIntakeDialog({ onClose, onSaved, directions: initialDirect
               background: 'var(--bg)', color: 'var(--text)', outline: 'none',
             }}
           >
-            <option value="">General resume</option>
+            <option value="">{t('resume.intake.general')}</option>
             {directions.map(d => (
               <option key={d.id} value={d.id}>{d.name}</option>
             ))}
-            <option value="__new__">Create a new direction…</option>
+            <option value="__new__">{t('resume.intake.newDirection')}</option>
           </select>
           {showNewDirInput && (
             <div style={{ display: 'flex', gap: 6, marginTop: 6, alignItems: 'center' }}>
@@ -330,19 +330,19 @@ export function ResumeIntakeDialog({ onClose, onSaved, directions: initialDirect
                   if (e.key === 'Escape') { setShowNewDirInput(false); setNewDirName('') }
                   if (e.key === 'Enter' && newDirName.trim()) await createNewDir()
                 }}
-                placeholder="Direction name…"
+                placeholder={t('resume.intake.directionPlaceholder')}
                 style={{ flex: 1, fontSize: 12, padding: '5px 8px', border: '0.5px solid var(--primary)', borderRadius: 6, outline: 'none', background: 'var(--bg)', color: 'var(--text)' }}
               />
               <button
                 onClick={createNewDir}
                 disabled={!newDirName.trim() || creatingDir}
                 style={{ fontSize: 11, padding: '5px 10px', background: 'var(--primary)', color: '#fff', border: 'none', borderRadius: 6, cursor: newDirName.trim() ? 'pointer' : 'not-allowed', opacity: newDirName.trim() ? 1 : 0.5 }}>
-                {creatingDir ? '…' : 'Add'}
+                {creatingDir ? '…' : t('resume.intake.add')}
               </button>
               <button
                 onClick={() => { setShowNewDirInput(false); setNewDirName('') }}
                 style={{ fontSize: 11, padding: '5px 8px', background: 'var(--bg)', color: 'var(--text-muted)', border: '0.5px solid var(--border)', borderRadius: 6, cursor: 'pointer' }}>
-                Cancel
+                {t('common.cancel')}
               </button>
             </div>
           )}
@@ -370,9 +370,9 @@ export function ResumeIntakeDialog({ onClose, onSaved, directions: initialDirect
                   marginBottom: -1,
                 }}
               >
-                {tab === 'upload'     ? 'Upload file'
-               : tab === 'paste'      ? 'Paste text'
-               :                        'Screenshot (coming soon)'}
+                {tab === 'upload'     ? t('resume.intake.uploadFile')
+               : tab === 'paste'      ? t('resume.intake.pasteText')
+               :                        t('resume.intake.screenshotSoon')}
               </button>
             )
           })}
@@ -396,9 +396,9 @@ export function ResumeIntakeDialog({ onClose, onSaved, directions: initialDirect
             >
               <div style={{ fontSize: 28, marginBottom: 10 }}>📄</div>
               <div style={{ fontSize: 13, fontWeight: 500, color: 'var(--text)', marginBottom: 4 }}>
-                Drop your resume here, or click to browse
+                {t('resume.intake.dropBrowse')}
               </div>
-              <div style={{ fontSize: 11, color: 'var(--text-muted)' }}>PDF or DOCX · up to 5 MB</div>
+              <div style={{ fontSize: 11, color: 'var(--text-muted)' }}>{t('resume.intake.fileHelp')}</div>
               <input
                 ref={inputRef}
                 type="file"
@@ -408,7 +408,7 @@ export function ResumeIntakeDialog({ onClose, onSaved, directions: initialDirect
               />
             </div>
             <div style={{ marginTop: 8, fontSize: 10, color: 'var(--text-muted)', textAlign: 'center' }}>
-              Supports text-based PDFs and DOCX. Scanned/image PDFs are not supported.
+              {t('resume.intake.fileSupport')}
             </div>
           </>
         )}
@@ -419,7 +419,7 @@ export function ResumeIntakeDialog({ onClose, onSaved, directions: initialDirect
             <textarea
               value={pasteText}
               onChange={e => setPasteText(e.target.value)}
-              placeholder="Paste your resume text here…"
+              placeholder={t('resume.intake.pastePlaceholder')}
               style={{
                 width: '100%', minHeight: 180, fontSize: 12, lineHeight: 1.6,
                 padding: '10px 12px', border: '0.5px solid var(--border)', borderRadius: 8,
@@ -429,12 +429,12 @@ export function ResumeIntakeDialog({ onClose, onSaved, directions: initialDirect
             />
             {pasteText.trim().length > 0 && pasteText.trim().length < 50 && (
               <div style={{ fontSize: 10, color: 'var(--c-warning)', marginTop: 4 }}>
-                Paste at least 50 characters of resume text
+                {t('resume.intake.minText')}
               </div>
             )}
             <div style={{ marginTop: 10, display: 'flex', justifyContent: 'flex-end' }}>
               <Btn small variant="primary" onClick={handleParse} disabled={isLoading || pasteText.trim().length < 50}>
-                Parse resume
+                {t('resume.intake.parse')}
               </Btn>
             </div>
           </div>
@@ -444,7 +444,7 @@ export function ResumeIntakeDialog({ onClose, onSaved, directions: initialDirect
         {isLoading && (
           <div style={{ padding: '24px 0', textAlign: 'center' }}>
             <div style={{ fontSize: 11, color: 'var(--text-muted)', marginBottom: 16 }}>
-              {stage === 'uploading' ? 'Uploading file…' : stage === 'extracting' ? 'Extracting text…' : 'AI parsing resume…'}
+              {stage === 'uploading' ? t('resume.intake.uploading') : stage === 'extracting' ? t('resume.intake.extracting') : t('resume.intake.aiParsing')}
             </div>
             <div style={{ height: 4, background: 'var(--border)', borderRadius: 2, overflow: 'hidden', margin: '0 auto', maxWidth: 320 }}>
               <div style={{ height: '100%', borderRadius: 2, background: 'var(--primary)', width: `${progress}%`, transition: 'width 0.6s ease' }} />
@@ -468,7 +468,7 @@ export function ResumeIntakeDialog({ onClose, onSaved, directions: initialDirect
                         {done ? '✓' : i + 1}
                       </div>
                       <span style={{ fontSize: 10, color: current ? 'var(--primary)' : done ? 'var(--text)' : 'var(--text-muted)' }}>
-                        {s === 'uploading' ? 'Upload' : s === 'extracting' ? 'Extract' : 'AI Parse'}
+                        {s === 'uploading' ? t('resume.intake.upload') : s === 'extracting' ? t('resume.intake.extract') : t('resume.intake.aiParse')}
                       </span>
                     </div>
                   )
@@ -506,7 +506,7 @@ export function ResumeIntakeDialog({ onClose, onSaved, directions: initialDirect
               {/* Left: editable contact fields */}
               <div>
                 <div style={{ fontSize: 10, fontWeight: 600, color: 'var(--primary)', marginBottom: 10, textTransform: 'uppercase', letterSpacing: 0.5 }}>
-                  Contact
+                  {t('resume.intake.contact')}
                 </div>
                 {(
                   [
@@ -541,7 +541,7 @@ export function ResumeIntakeDialog({ onClose, onSaved, directions: initialDirect
               {/* Right: summary stats */}
               <div>
                 <div style={{ fontSize: 10, fontWeight: 600, color: 'var(--primary)', marginBottom: 10, textTransform: 'uppercase', letterSpacing: 0.5 }}>
-                  Parsed Content
+                  {t('resume.intake.parsedContent')}
                 </div>
                 <StatRow icon="✓" label={`${parsed.experience.length} experience entr${parsed.experience.length === 1 ? 'y' : 'ies'}`} />
                 <StatRow icon="✓" label={`${parsed.skills.length} skills`} />
@@ -557,7 +557,7 @@ export function ResumeIntakeDialog({ onClose, onSaved, directions: initialDirect
                 )}
                 {parsed.summary && (
                   <div style={{ marginTop: 12 }}>
-                    <div style={{ fontSize: 9, color: 'var(--text-muted)', marginBottom: 4, textTransform: 'uppercase' }}>Summary preview</div>
+                    <div style={{ fontSize: 9, color: 'var(--text-muted)', marginBottom: 4, textTransform: 'uppercase' }}>{t('resume.intake.summaryPreview')}</div>
                     <div style={{
                       fontSize: 10, color: 'var(--text)', lineHeight: 1.5,
                       display: '-webkit-box', WebkitLineClamp: 3, WebkitBoxOrient: 'vertical',

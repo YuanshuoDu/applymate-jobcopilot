@@ -14,7 +14,8 @@ import { clearCachedApiResponses } from '@/lib/api-cache'
 import { pageFromSearch } from './page-routing'
 
 function PageLoading() {
-  return <div style={{ flex: 1, display: 'grid', placeItems: 'center', color: 'var(--text-muted)', fontSize: 13 }}>Loading page…</div>
+  const { t } = useI18n()
+  return <div style={{ flex: 1, display: 'grid', placeItems: 'center', color: 'var(--text-muted)', fontSize: 13 }}>{t('common.loading')}</div>
 }
 
 const DashboardPage = dynamic(() => import('@/components/pages/DashboardPage').then(module => module.DashboardPage), { loading: PageLoading })
@@ -54,20 +55,20 @@ interface NotificationItem {
 type MobileNavItem = { id: Page | 'more'; label: string }
 type MobileMoreItem = { id: Extract<Page, 'gmail' | 'settings'> | 'signout'; label: string }
 
-export function getMobileNavItems(): MobileNavItem[] {
+export function getMobileNavItems(t: (key: string) => string = key => ({ 'nav.jobs': 'Jobs', 'nav.search': 'Search', 'nav.dashboard': 'Home', 'nav.agent': 'Agent', 'common.more': 'More' }[key] ?? key)): MobileNavItem[] {
   return [
-    { id: 'jobs',      label: 'Jobs'   },
-    { id: 'search',    label: 'Search' },
-    { id: 'dashboard', label: 'Home'   },
-    { id: 'agent',     label: 'Agent'  },
-    { id: 'more',      label: 'More'   },
+    { id: 'jobs',      label: t('nav.jobs') },
+    { id: 'search',    label: t('nav.search') },
+    { id: 'dashboard', label: t('nav.dashboard') },
+    { id: 'agent',     label: t('nav.agent') },
+    { id: 'more',      label: t('common.more') },
   ]
 }
 
-export function getMobileMoreItems(signOutLabel = 'Sign out'): MobileMoreItem[] {
+export function getMobileMoreItems(signOutLabel = 'Sign out', t: (key: string) => string = key => ({ 'nav.gmail': 'Gmail', 'nav.settings': 'Settings' }[key] ?? key)): MobileMoreItem[] {
   return [
-    { id: 'gmail',    label: 'Gmail'    },
-    { id: 'settings', label: 'Settings' },
+    { id: 'gmail',    label: t('nav.gmail') },
+    { id: 'settings', label: t('nav.settings') },
     { id: 'signout',  label: signOutLabel },
   ]
 }
@@ -101,35 +102,37 @@ export function getNotificationTargetPage(type: string): Page | null {
   return type.startsWith('apply_') ? 'jobs' : null
 }
 
-function NotificationControl({ unreadCount, onToggle }: {
+function NotificationControl({ unreadCount, onToggle, t }: {
   unreadCount: number
   onToggle: () => void
+  t: (key: string) => string
 }) {
-  return <button type="button" aria-label="Notifications" onClick={onToggle} style={{
+  return <button type="button" aria-label={t('notifications.title')} onClick={onToggle} style={{
     width: 26, height: 26, padding: 0, border: 'none', borderRadius: 6, background: 'transparent', color: 'var(--text-muted)',
     display: 'inline-flex', alignItems: 'center', justifyContent: 'center', cursor: 'pointer', position: 'relative', flexShrink: 0,
   }}>
     <Bell size={16} aria-hidden="true" />
-    {unreadCount > 0 && <span aria-label={`${unreadCount} unread notifications`} style={{
+    {unreadCount > 0 && <span aria-label={`${unreadCount} ${t('notifications.unread')}`} style={{
       position: 'absolute', top: -3, right: -3, minWidth: 13, height: 13, padding: '0 3px', borderRadius: 999,
       background: 'var(--c-danger)', color: '#fff', fontSize: 8, fontWeight: 700, display: 'flex', alignItems: 'center', justifyContent: 'center', border: '1.5px solid var(--bg)', lineHeight: 1,
     }}>{unreadCount > 9 ? '9+' : unreadCount}</span>}
   </button>
 }
 
-function NotificationPanel({ notifications, unreadCount, onMarkRead, onOpenNotification }: {
+function NotificationPanel({ notifications, unreadCount, onMarkRead, onOpenNotification, t }: {
   notifications: NotificationItem[]
   unreadCount: number
   onMarkRead: () => void
   onOpenNotification: (notification: NotificationItem) => void
+  t: (key: string) => string
 }) {
-  return <div role="dialog" aria-label="Notifications" style={{ position: 'absolute', left: 0, right: 0, bottom: 'calc(100% + 8px)', border: '1px solid var(--border)', borderRadius: 12, background: 'var(--bg)', boxShadow: '0 16px 36px rgba(15,23,42,0.16)', overflow: 'hidden', zIndex: 110 }}>
+  return <div role="dialog" aria-label={t('notifications.title')} style={{ position: 'absolute', left: 0, right: 0, bottom: 'calc(100% + 8px)', border: '1px solid var(--border)', borderRadius: 12, background: 'var(--bg)', boxShadow: '0 16px 36px rgba(15,23,42,0.16)', overflow: 'hidden', zIndex: 110 }}>
         <div style={{ padding: '10px 12px', display: 'flex', alignItems: 'center', justifyContent: 'space-between', borderBottom: '1px solid var(--border)' }}>
-          <span style={{ fontSize: 12, fontWeight: 700 }}>Notifications</span>
-          {unreadCount > 0 && <button type="button" onClick={onMarkRead} style={{ border: 'none', background: 'transparent', color: 'var(--primary)', fontSize: 11, cursor: 'pointer', padding: 0 }}>Mark read</button>}
+          <span style={{ fontSize: 12, fontWeight: 700 }}>{t('notifications.title')}</span>
+          {unreadCount > 0 && <button type="button" onClick={onMarkRead} style={{ border: 'none', background: 'transparent', color: 'var(--primary)', fontSize: 11, cursor: 'pointer', padding: 0 }}>{t('notifications.markRead')}</button>}
         </div>
         <div style={{ maxHeight: 260, overflowY: 'auto' }}>
-          {notifications.length === 0 ? <div style={{ padding: 16, fontSize: 12, color: 'var(--text-muted)' }}>No notifications</div> : notifications.slice(0, 5).map(n => (
+          {notifications.length === 0 ? <div style={{ padding: 16, fontSize: 12, color: 'var(--text-muted)' }}>{t('notifications.empty')}</div> : notifications.slice(0, 5).map(n => (
             <button key={n.id} type="button" onClick={() => onOpenNotification(n)} style={{ width: '100%', border: 'none', borderBottom: '1px solid var(--border)', background: n.read ? 'var(--bg)' : 'var(--bg-secondary)', padding: '10px 12px', display: 'flex', alignItems: 'flex-start', gap: 8, textAlign: 'left', cursor: 'pointer' }}>
               <span aria-hidden="true" style={{ width: 7, height: 7, borderRadius: '50%', background: n.read ? 'var(--text-muted)' : 'var(--c-success)', marginTop: 5, flexShrink: 0 }} />
               <span style={{ minWidth: 0, flex: 1 }}>
@@ -386,7 +389,7 @@ export function AppShell() {
             borderTopColor: '#4F46E5',
             animation: 'spin 0.7s linear infinite',
           }} />
-          <div style={{ fontSize: 12, color: 'var(--text-muted)', letterSpacing: '0.02em' }}>Loading…</div>
+          <div style={{ fontSize: 12, color: 'var(--text-muted)', letterSpacing: '0.02em' }}>{t('common.loading')}</div>
         </div>
       </div>
     )
@@ -427,6 +430,7 @@ export function AppShell() {
                     <NotificationControl
                       unreadCount={unreadCount}
                       onToggle={() => setSidebarPopover(current => current === 'notifications' ? null : 'notifications')}
+                      t={t}
                     />
                   }
                   notificationPanel={sidebarPopover === 'notifications' ? (
@@ -435,6 +439,7 @@ export function AppShell() {
                       unreadCount={unreadCount}
                       onMarkRead={() => markNotificationRead()}
                       onOpenNotification={openNotification}
+                      t={t}
                     />
                   ) : null}
                 />
@@ -445,8 +450,8 @@ export function AppShell() {
             </div>
 
             {mobileMoreOpen && (
-              <div className="mobile-more-menu" data-mobile-more-menu role="menu" aria-label="More navigation">
-                {getMobileMoreItems(t('nav.signout')).map(item => (
+              <div className="mobile-more-menu" data-mobile-more-menu role="menu" aria-label={t('nav.moreNavigation')}>
+                {getMobileMoreItems(t('nav.signout'), t).map(item => (
                   <button key={item.id} role="menuitem" data-danger={item.id === 'signout'} onClick={() => {
                     if (item.id === 'signout') void signOut({ callbackUrl: '/login' })
                     else navigatePage(item.id)
@@ -459,7 +464,7 @@ export function AppShell() {
 
             {/* Mobile bottom bar */}
             <div id="mobile-bottom-bar">
-              {getMobileNavItems().map(item => {
+              {getMobileNavItems(t).map(item => {
                 const isMore = item.id === 'more'
                 const isActive = isMore
                   ? mobileMoreOpen || page === 'gmail' || page === 'settings'

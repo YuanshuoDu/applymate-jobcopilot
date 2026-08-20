@@ -9,7 +9,7 @@ test("login -> saved job -> score -> generate cover letter", async ({ app, page 
   await app.installMocks();
   await app.login();
 
-  await app.goTo(/^(My Jobs|我的职位)(?: \d+)?$/);
+  await app.goTo(/^(My Jobs|my position)(?: \d+)?$/);
   await page.getByRole("button", { name: /^Score$/ }).click();
   await expect(page.getByText("91%", { exact: true })).toBeVisible();
   await page.getByText("Cloudflare").first().click();

@@ -80,7 +80,7 @@ export async function POST(req: NextRequest) {
     pendingCount: jobs.filter(j => j.workflowState === 'ready_to_apply').length,
     config: agentCfg as Record<string, unknown> | null, resumeName: resume?.name ?? null,
     recentJobs: jobs.slice(0, 8).map(j => ({ company: j.company, role: j.role, score: j.score, status: j.status })),
-    lastRunAt: lastActivity?.createdAt.toLocaleDateString('zh') ?? null,
+    lastRunAt: lastActivity?.createdAt.toLocaleDateString('en-GB') ?? null,
   }
 
 
@@ -105,15 +105,15 @@ export async function POST(req: NextRequest) {
       const workflowRequested = requestsFullWorkflow(userMessage)
       if (workflowRequested) {
         const requestedScore = requestedMinMatchScore(userMessage)
-        const thresholdText = requestedScore === null ? '当前配置的阈值' : `≥${requestedScore}%`
-        const workflowBody = `已启动完整 Harness 工作流：Scout → Analyst → Writer → Reviewer → Executor → Auditor。将筛选匹配度 ${thresholdText} 的职位；任何外部投递仍会经过确认关卡。`
+        const thresholdText = requestedScore === null ? 'Currently configured threshold' : `≥${requestedScore}%`
+        const workflowBody = `Started complete Harness Workflow: Scout → Analyst → Writer → Reviewer → Executor → Auditor.will filter for matches ${thresholdText} position; Any external deliveries will still go through the confirmation gate.`
         send('action', { type: 'start_run', ...(requestedScore === null ? {} : { minMatchScore: requestedScore }) })
         send('block', { type: 'orchestrator_plan', speaker: 'Orchestrator', title: 'Full workflow', body: workflowBody, data: { workflow: true, minMatchScore: requestedScore } })
         await appendTranscriptEvent(db, {
           sessionId: session.id, type: 'orchestrator_plan', speaker: 'Orchestrator',
           title: 'Full workflow', body: workflowBody, data: { workflow: true, minMatchScore: requestedScore },
         })
-        fullText = '工作流已经开始。Scout 会先查找或读取职位，Analyst 仅保留达到阈值的匹配，Writer 生成材料，Reviewer 审核后才交给 Executor；实际提交前会向你确认。'
+        fullText = 'Workflow has started.Scout Will search or read the position first, Analyst Keep only matches that meet threshold, Writer Generate materials, Reviewer Submitted after review Executor; We will confirm with you before actual submission.'
         send('text', { delta: fullText })
         await appendTranscriptEvent(db, {
           sessionId: session.id, type: 'orchestrator_plan', speaker: 'Orchestrator', title: 'Response', body: fullText,
@@ -136,7 +136,7 @@ export async function POST(req: NextRequest) {
         jobs,
         model,
       })
-      const planBody = `主 Agent 计划：只调用 ${plan.role} 子 Agent。目标：${plan.goal}`
+      const planBody = `host Agent plan: Just call ${plan.role} son Agent.Target: ${plan.goal}`
       send('block', { type: 'orchestrator_plan', speaker: 'Orchestrator', title: 'Plan', body: planBody, data: { plan } })
       await appendTranscriptEvent(db, {
         sessionId: session.id,
@@ -181,13 +181,13 @@ export async function POST(req: NextRequest) {
       send('block', { type: 'subagent_result', speaker: plan.role, title: 'Task completed', body: worker.summary, data: worker })
       const jobRows = Array.isArray(worker.result.jobs) ? worker.result.jobs : []
       if (jobRows.length > 0) {
-        send('block', { type: 'job_results', speaker: plan.role, title: 'Structured results', body: '子 Agent 返回的结构化结果', data: { jobs: jobRows } })
+        send('block', { type: 'job_results', speaker: plan.role, title: 'Structured results', body: 'son Agent Structured results returned', data: { jobs: jobRows } })
         await appendTranscriptEvent(db, {
           sessionId: session.id,
           type: 'job_results',
           speaker: plan.role === 'scout' ? 'Scout' : 'Analyst',
           title: 'Structured results',
-          body: '子 Agent 返回的结构化结果',
+          body: 'son Agent Structured results returned',
           data: { jobs: jobRows },
         })
       }

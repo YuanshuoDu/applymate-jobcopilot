@@ -2,6 +2,7 @@
 
 import React from 'react'
 import { formatSessionClock } from './session-view-model'
+import { useI18n } from '@/lib/i18n'
 
 export function ReplayBanner({
   source,
@@ -14,6 +15,7 @@ export function ReplayBanner({
   eventCount: number
   onBackToLive: () => void
 }) {
+  const { t } = useI18n()
   const sourceLabel = source === 'manual_run' ? 'manual run' : source
   return (
     <div style={{
@@ -28,9 +30,9 @@ export function ReplayBanner({
       padding: '9px 11px',
     }}>
       <div style={{ minWidth: 0 }}>
-        <div style={{ fontSize: 11, fontWeight: 750, color: 'var(--primary)' }}>Viewing session replay</div>
+        <div style={{ fontSize: 11, fontWeight: 750, color: 'var(--primary)' }}>{t('agent.viewReplay')}</div>
         <div style={{ fontSize: 10, color: 'var(--text-muted)', marginTop: 3, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-          {sourceLabel} · {eventCount} events · updated {formatSessionClock(updatedAt)}
+          {sourceLabel} · {eventCount} {t('agent.eventsUpdated')} {formatSessionClock(updatedAt)}
         </div>
       </div>
       <button
@@ -49,7 +51,7 @@ export function ReplayBanner({
           padding: '0 10px',
         }}
       >
-        Live chat
+        {t('agent.liveChat')}
       </button>
     </div>
   )

@@ -12,12 +12,14 @@ import { setCachedApiResponse } from '@/lib/api-cache'
 import { useNav } from '@/lib/nav-context'
 import { exportApplicationPackLocally } from '@/lib/bundle'
 import { assessApplicationPreflight } from '@/lib/agent/application-preflight'
+import { useI18n } from '@/lib/i18n'
 
 const KANBAN_COLS: JobStatus[] = ['saved', 'applied', 'interview', 'offer', 'rejected']
 const COL_LABELS: Record<JobStatus, string> = {
   saved: 'Saved', applied: 'Applied',
   interview: 'Interview', offer: 'Offer', rejected: 'Rejected',
 }
+function colLabel(t: (key: string) => string, status: JobStatus) { return t(`jobs.status.${status}`) }
 const COL_COLORS: Record<JobStatus, string> = {
   saved: '#6B7280', applied: '#185FA5',
   interview: '#3B6D11', offer: '#0E7490', rejected: '#A32D2D',
@@ -100,6 +102,7 @@ function ListView({ jobs, onRowClick, selectedIds, onToggle, onToggleAll }: {
   onToggle: (id: string) => void
   onToggleAll: (ids: string[]) => void
 }) {
+  const { t } = useI18n()
   const [sort, setSort] = useState<{ col: string; dir: 'asc' | 'desc' }>({ col: 'date', dir: 'desc' })
 
   const sorted = useMemo(() => [...jobs].sort((a, b) => {
@@ -135,14 +138,14 @@ function ListView({ jobs, onRowClick, selectedIds, onToggle, onToggleAll }: {
         <thead>
           <tr style={{ background: 'var(--bg-secondary)' }}>
             <th style={{ width: 42, padding: '8px 12px', borderBottom: '0.5px solid var(--border)' }}>
-              <input type="checkbox" aria-label="Select all visible jobs" checked={allVisibleSelected} onChange={() => onToggleAll(visibleIds)} />
+              <input type="checkbox" aria-label={t('jobs.selectAll')} checked={allVisibleSelected} onChange={() => onToggleAll(visibleIds)} />
             </th>
-            <SortTh col="company" label="Company" />
-            <th style={{ padding: '8px 16px', textAlign: 'left', fontSize: 10, color: 'var(--text-muted)', fontWeight: 500, borderBottom: '0.5px solid var(--border)' }}>Role</th>
-            <th style={{ padding: '8px 16px', textAlign: 'left', fontSize: 10, color: 'var(--text-muted)', fontWeight: 500, borderBottom: '0.5px solid var(--border)' }}>Status</th>
+            <SortTh col="company" label={t('jobs.companyLabel')} />
+            <th style={{ padding: '8px 16px', textAlign: 'left', fontSize: 10, color: 'var(--text-muted)', fontWeight: 500, borderBottom: '0.5px solid var(--border)' }}>{t('jobs.roleLabel')}</th>
+            <th style={{ padding: '8px 16px', textAlign: 'left', fontSize: 10, color: 'var(--text-muted)', fontWeight: 500, borderBottom: '0.5px solid var(--border)' }}>{t('jobs.statusLabel')}</th>
             <SortTh col="score" label="Match" />
-            <SortTh col="date"  label="Added" />
-            <th style={{ padding: '8px 16px', textAlign: 'left', fontSize: 10, color: 'var(--text-muted)', fontWeight: 500, borderBottom: '0.5px solid var(--border)' }}>Follow-up</th>
+            <SortTh col="date"  label={t('jobs.added')} />
+            <th style={{ padding: '8px 16px', textAlign: 'left', fontSize: 10, color: 'var(--text-muted)', fontWeight: 500, borderBottom: '0.5px solid var(--border)' }}>{t('jobs.followUp')}</th>
             <th style={{ padding: '8px 16px', borderBottom: '0.5px solid var(--border)' }} />
           </tr>
         </thead>
@@ -203,8 +206,9 @@ function MobileListView({ jobs, onRowClick, selectedIds, onToggle }: {
   selectedIds: Set<string>
   onToggle: (id: string) => void
 }) {
+  const { t } = useI18n()
   return (
-    <div className="jobs-mobile-list" aria-label="Mobile job list">
+    <div className="jobs-mobile-list" aria-label={t('jobs.mobileList')}>
       {jobs.map(job => {
         const card = toMobileJobCard(job)
         return (
@@ -225,7 +229,7 @@ function MobileListView({ jobs, onRowClick, selectedIds, onToggle }: {
                 <CompanyLogo logo={card.logo ?? card.company.slice(0, 2).toUpperCase()} size={28} />
                 <div className="jobs-mobile-card-copy">
                   <strong>{card.company}</strong>
-                  <span>{card.location ?? 'Location not specified'}</span>
+              <span>{card.location ?? t('jobs.locationUnspecified')}</span>
                 </div>
                 {card.score != null && <ScorePill score={card.score} />}
               </div>
@@ -248,6 +252,7 @@ function KanbanView({ jobs, onStatusChange, onAddClick }: {
   onStatusChange: (id: string, status: JobStatus) => void
   onAddClick: (status: JobStatus) => void
 }) {
+  const { t } = useI18n()
   const toast  = useToast()
   const dragId = useRef<string | null>(null)
   const [dragOver, setDragOver] = useState<JobStatus | null>(null)
@@ -293,7 +298,7 @@ function KanbanView({ jobs, onStatusChange, onAddClick }: {
           }}>
           <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 10 }}>
             <span style={{ width: 7, height: 7, borderRadius: '50%', background: COL_COLORS[col] }} />
-            <span style={{ fontSize: 11, fontWeight: 500, color: 'var(--text)' }}>{COL_LABELS[col]}</span>
+            <span style={{ fontSize: 11, fontWeight: 500, color: 'var(--text)' }}>{colLabel(t, col)}</span>
             <span style={{ marginLeft: 'auto', fontSize: 10, color: 'var(--text-muted)', background: 'var(--bg)', border: '0.5px solid var(--border)', borderRadius: 999, padding: '1px 6px' }}>
               {cols[col].length}
             </span>
@@ -330,7 +335,7 @@ function KanbanView({ jobs, onStatusChange, onAddClick }: {
           <button
             onClick={() => onAddClick(col)}
             style={{ width: '100%', padding: '6px 0', border: '0.5px dashed var(--border)', borderRadius: 6, background: 'transparent', color: 'var(--text-muted)', fontSize: 11, cursor: 'pointer' }}>
-            + Add {COL_LABELS[col]}
+            + {t('jobs.addStatus').replace('{status}', colLabel(t, col))}
           </button>
         </div>
       ))}
@@ -344,6 +349,7 @@ function AddJobModal({ onClose, onAdded, prefillStatus }: {
   onAdded: (job: Job) => void
   prefillStatus?: JobStatus | null
 }) {
+  const { t } = useI18n()
   const toast  = useToast()
   const [form, setForm] = useState({ company: '', role: '', location: '', url: '', salary: '', status: (prefillStatus ?? 'saved') as JobStatus })
   const [saving, setSaving] = useState(false)
@@ -353,14 +359,14 @@ function AddJobModal({ onClose, onAdded, prefillStatus }: {
   async function handleSubmit(e: React.FormEvent) {
     e.preventDefault()
     if (!form.company.trim() || !form.role.trim()) {
-      toast.error('Required', 'Company and role are required')
+      toast.error(t('jobs.required'), t('jobs.companyRoleRequired'))
       return
     }
     setSaving(true)
     const { data, error } = await apiMutate<Job>('/api/jobs', 'POST', form)
     setSaving(false)
-    if (error || !data) { toast.error('Error', error ?? 'Failed to add job'); return }
-    toast.success('Job added', `${form.role} at ${form.company}`)
+    if (error || !data) { toast.error(t('common.error'), error ?? t('jobs.addFailed')); return }
+    toast.success(t('jobs.jobAdded'), `${form.role} at ${form.company}`)
     onAdded(data)
     onClose()
   }
@@ -371,47 +377,47 @@ function AddJobModal({ onClose, onAdded, prefillStatus }: {
       <div role="dialog" aria-modal="true" aria-labelledby="add-job-title">
       <Card style={{ width: 'min(460px, calc(100vw - 32px))', maxHeight: 'calc(100dvh - 32px)', overflowY: 'auto', padding: 24 }}>
         <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 20 }}>
-          <h2 id="add-job-title" style={{ margin: 0, fontSize: 16, fontWeight: 600 }}>Add job</h2>
+          <h2 id="add-job-title" style={{ margin: 0, fontSize: 16, fontWeight: 600 }}>{t('jobs.addJobTitle')}</h2>
           <Btn small variant="ghost" onClick={onClose}>✕</Btn>
         </div>
         <form onSubmit={handleSubmit} style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
           <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(180px, 1fr))', gap: 12 }}>
             <div>
-              <label htmlFor="add-job-company" style={labelSt}>Company *</label>
-              <input id="add-job-company" style={INPUT_STYLE} value={form.company} onChange={e => setForm(f => ({ ...f, company: e.target.value }))} placeholder="e.g. Stripe" />
+              <label htmlFor="add-job-company" style={labelSt}>{t('jobs.companyRequired')}</label>
+              <input id="add-job-company" style={INPUT_STYLE} value={form.company} onChange={e => setForm(f => ({ ...f, company: e.target.value }))} placeholder={t('jobs.companyPlaceholder')} />
             </div>
             <div>
-              <label htmlFor="add-job-role" style={labelSt}>Role *</label>
-              <input id="add-job-role" style={INPUT_STYLE} value={form.role} onChange={e => setForm(f => ({ ...f, role: e.target.value }))} placeholder="e.g. Backend Engineer" />
+              <label htmlFor="add-job-role" style={labelSt}>{t('jobs.roleRequired')}</label>
+              <input id="add-job-role" style={INPUT_STYLE} value={form.role} onChange={e => setForm(f => ({ ...f, role: e.target.value }))} placeholder={t('jobs.rolePlaceholder')} />
             </div>
           </div>
           <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(180px, 1fr))', gap: 12 }}>
             <div>
-              <label htmlFor="add-job-location" style={labelSt}>Location</label>
-              <input id="add-job-location" style={INPUT_STYLE} value={form.location} onChange={e => setForm(f => ({ ...f, location: e.target.value }))} placeholder="e.g. Amsterdam, NL" />
+              <label htmlFor="add-job-location" style={labelSt}>{t('jobs.location')}</label>
+              <input id="add-job-location" style={INPUT_STYLE} value={form.location} onChange={e => setForm(f => ({ ...f, location: e.target.value }))} placeholder={t('jobs.locationPlaceholder')} />
             </div>
             <div>
-              <label htmlFor="add-job-salary" style={labelSt}>Salary</label>
-              <input id="add-job-salary" style={INPUT_STYLE} value={form.salary} onChange={e => setForm(f => ({ ...f, salary: e.target.value }))} placeholder="e.g. €70k–90k" />
+              <label htmlFor="add-job-salary" style={labelSt}>{t('jobs.salaryLabel')}</label>
+              <input id="add-job-salary" style={INPUT_STYLE} value={form.salary} onChange={e => setForm(f => ({ ...f, salary: e.target.value }))} placeholder={t('jobs.salaryPlaceholder')} />
             </div>
           </div>
           <div>
-            <label htmlFor="add-job-url" style={labelSt}>Job URL</label>
-            <input id="add-job-url" style={INPUT_STYLE} value={form.url} onChange={e => setForm(f => ({ ...f, url: e.target.value }))} placeholder="https://…" />
+            <label htmlFor="add-job-url" style={labelSt}>{t('jobs.jobUrl')}</label>
+            <input id="add-job-url" style={INPUT_STYLE} value={form.url} onChange={e => setForm(f => ({ ...f, url: e.target.value }))} placeholder={t('jobs.urlPlaceholder')} />
           </div>
           <div>
-            <label htmlFor="add-job-status" style={labelSt}>Initial status</label>
+            <label htmlFor="add-job-status" style={labelSt}>{t('jobs.initialStatus')}</label>
             <select id="add-job-status" style={INPUT_STYLE} value={form.status} onChange={e => setForm(f => ({ ...f, status: e.target.value as JobStatus }))}>
-              {KANBAN_COLS.map(c => <option key={c} value={c}>{COL_LABELS[c]}</option>)}
+              {KANBAN_COLS.map(c => <option key={c} value={c}>{colLabel(t, c)}</option>)}
             </select>
           </div>
           <div style={{ display: 'flex', gap: 8, justifyContent: 'flex-end', marginTop: 4 }}>
-            <Btn variant="ghost" onClick={onClose}>Cancel</Btn>
+            <Btn variant="ghost" onClick={onClose}>{t('common.cancel')}</Btn>
             <button type="submit" disabled={saving} style={{
               padding: '7px 16px', background: 'var(--primary)', color: '#fff', border: 'none', borderRadius: 6,
               fontSize: 12, fontWeight: 500, cursor: saving ? 'not-allowed' : 'pointer', opacity: saving ? 0.7 : 1,
             }}>
-              {saving ? 'Adding…' : 'Add Job'}
+              {saving ? t('jobs.adding') : t('jobs.addButton')}
             </button>
           </div>
         </form>
@@ -430,6 +436,7 @@ function JobDetailDrawer({ job, onClose, onStatusChange, onUpdate, onDelete, onO
   onDelete:       (id: string) => void
   onOpenTailoredResume: (resumeId: string) => void
 }) {
+  const { t } = useI18n()
   const toast = useToast()
   const [confirm, ConfirmDialog] = useConfirm()
   const [notes,        setNotes]        = useState(job.notes ?? '')
@@ -614,7 +621,7 @@ function JobDetailDrawer({ job, onClose, onStatusChange, onUpdate, onDelete, onO
     setTailoringLoading(false)
 
     if (error) {
-      toast.error('Tailoring failed', error)
+      toast.error(t('jobs.tailoringFailed'), error)
       return
     }
     if (!data) return
@@ -624,7 +631,7 @@ function JobDetailDrawer({ job, onClose, onStatusChange, onUpdate, onDelete, onO
       return
     }
 
-    toast.success('Tailored resume created', 'Review and confirm it in Resume before returning here.')
+    toast.success(t('jobs.toastTailored'), t('jobs.toastTailoredDetail'))
     onOpenTailoredResume(data.adaptedResumeId)
   }
 
@@ -803,62 +810,62 @@ function JobDetailDrawer({ job, onClose, onStatusChange, onUpdate, onDelete, onO
         <ReferenceProgress ready={currentPackAudited} />
 
         {applicationPreflight.issues.length > 0 && <div style={{ margin: '18px 28px 0', padding: '12px 14px', borderRadius: 9, border: '1px solid #fbbf24', background: '#fffbeb', color: '#78350f', fontSize: 12, lineHeight: 1.5 }}>
-          <strong>{applicationPreflight.canPrepare ? 'Manual-only listing' : 'Application data needs correction'}</strong>
+          <strong>{applicationPreflight.canPrepare ? t('jobs.drawer.manualOnly') : t('jobs.drawer.dataNeedsCorrection')}</strong>
           <div style={{ marginTop: 4 }}>{applicationPreflight.issues.map(issue => issue.message).join(' ')}</div>
-          <div style={{ marginTop: 5, color: '#92400e' }}>{applicationPreflight.canPrepare ? 'You may prepare materials, but the Agent will not fill or submit this destination.' : 'Materials and form filling are paused until the company and job description are corrected.'}</div>
+          <div style={{ marginTop: 5, color: '#92400e' }}>{applicationPreflight.canPrepare ? t('jobs.drawer.manualOnlyHint') : t('jobs.drawer.correctionHint')}</div>
         </div>}
 
         {/* Body */}
         <div style={{ flex: 1, padding: '26px 28px', display: 'flex', flexDirection: 'column', gap: 24 }}>
 
           <section style={{ borderBottom: '1px solid var(--border)', padding: '18px 0 22px' }}>
-            <div style={{ display: 'flex', alignItems: 'center', gap: 9, fontSize: 11, fontWeight: 700, letterSpacing: '0.03em', color: '#64748b', marginBottom: 18 }}><Sparkles size={16} strokeWidth={2.4} style={{ color: '#2563eb', flexShrink: 0 }} />NEXT BEST ACTION</div>
-            <div style={{ fontSize: 20, lineHeight: 1.25, fontWeight: 700, letterSpacing: '-0.025em' }}>{currentPackAudited ? 'Application pack is ready' : auditRetryOnly ? 'Retry the independent audit' : auditNeedsEvidence ? 'Confirm the missing evidence' : auditNeedsRepair ? 'Correct factual issues before applying' : existingTailoredResume ? 'Resume is tailored for this job' : 'Tailor your resume for this job'}</div>
-            <div style={{ fontSize: 14, lineHeight: 1.5, color: 'var(--text-muted)', margin: '7px 0 16px' }}>{currentPackAudited ? 'The same audited resume and cover letter selected in the extension are ready to review and download.' : auditRetryOnly ? 'Your resume and cover letter are unchanged. The auditor needs to return a structured result before you can continue.' : auditNeedsEvidence ? 'The auditor could not verify a claim from the current Persona. Add the accurate fact below; this is not a finding of fabrication.' : auditNeedsRepair ? 'The Auditor found unsupported claims. AI will rewrite only the affected document sections, then run the audit again.' : existingTailoredResume ? 'Review the AI-tailored version before preparing the application pack.' : 'Create a role-specific version, review it in Resume, then return here.'}</div>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 9, fontSize: 11, fontWeight: 700, letterSpacing: '0.03em', color: '#64748b', marginBottom: 18 }}><Sparkles size={16} strokeWidth={2.4} style={{ color: '#2563eb', flexShrink: 0 }} />{t('jobs.drawer.nextAction')}</div>
+            <div style={{ fontSize: 20, lineHeight: 1.25, fontWeight: 700, letterSpacing: '-0.025em' }}>{currentPackAudited ? t('jobs.drawer.packReady') : auditRetryOnly ? t('jobs.drawer.retryAudit') : auditNeedsEvidence ? t('jobs.drawer.confirmEvidence') : auditNeedsRepair ? t('jobs.drawer.correctFacts') : existingTailoredResume ? t('jobs.drawer.tailored') : t('jobs.drawer.tailor')}</div>
+            <div style={{ fontSize: 14, lineHeight: 1.5, color: 'var(--text-muted)', margin: '7px 0 16px' }}>{currentPackAudited ? t('jobs.pack.sameAudited') : auditRetryOnly ? t('jobs.pack.auditPending') : auditNeedsEvidence ? t('jobs.pack.evidencePrompt') : auditNeedsRepair ? t('jobs.pack.repairPrompt') : existingTailoredResume ? t('jobs.pack.reviewTailored') : t('jobs.pack.createRole')}</div>
 
-            {auditNeedsRepair && <div style={{ marginBottom: 16, padding: '12px 14px', border: '1px solid #fecaca', background: '#fff7f7', borderRadius: 9 }}><div style={{ fontSize: 12, fontWeight: 800, color: '#b42318', marginBottom: 7 }}>FACTUAL ISSUES TO FIX</div>{factualAuditFindings.slice(0, 2).map((finding, index) => <div key={`${finding.title}-${index}`} style={{ color: '#7f1d1d', fontSize: 12, lineHeight: 1.45, marginTop: index ? 6 : 0 }}><strong>{finding.title}</strong><br />{finding.action}</div>)}</div>}
+            {auditNeedsRepair && <div style={{ marginBottom: 16, padding: '12px 14px', border: '1px solid #fecaca', background: '#fff7f7', borderRadius: 9 }}><div style={{ fontSize: 12, fontWeight: 800, color: '#b42318', marginBottom: 7 }}>{t('jobs.drawer.factualIssues')}</div>{factualAuditFindings.slice(0, 2).map((finding, index) => <div key={`${finding.title}-${index}`} style={{ color: '#7f1d1d', fontSize: 12, lineHeight: 1.45, marginTop: index ? 6 : 0 }}><strong>{finding.title}</strong><br />{finding.action}</div>)}</div>}
 
             {existingTailoredResume ? (
               <button onClick={() => onOpenTailoredResume(existingTailoredResume.id)} style={workflowDocumentButton}>
                 <span style={{ width: 48, height: 48, display: 'grid', placeItems: 'center', borderRadius: 10, background: '#eff6ff', color: '#2563eb' }}><FileText size={27} /></span>
-                <span style={{ flex: 1, textAlign: 'left' }}><span style={{ display: 'block', fontSize: 15, fontWeight: 700 }}>{existingTailoredResume.name}</span><span style={{ display: 'block', fontSize: 13, marginTop: 5, color: 'var(--text-muted)', fontWeight: 400 }}>Tailored resume · ready to review</span></span>
-                <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6, color: '#2563eb', fontSize: 14, whiteSpace: 'nowrap' }}>Review in Resume <ChevronRight size={19} /></span>
+                <span style={{ flex: 1, textAlign: 'left' }}><span style={{ display: 'block', fontSize: 15, fontWeight: 700 }}>{existingTailoredResume.name}</span><span style={{ display: 'block', fontSize: 13, marginTop: 5, color: 'var(--text-muted)', fontWeight: 400 }}>{t('jobs.pack.tailoredReady')}</span></span>
+                <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6, color: '#2563eb', fontSize: 14, whiteSpace: 'nowrap' }}>{t('jobs.pack.reviewResume')} <ChevronRight size={19} /></span>
               </button>
             ) : <div style={{ border: '1px solid #dbe1ea', borderRadius: 12, padding: 18 }}>
-              <div style={{ fontSize: 14, color: 'var(--text-muted)', lineHeight: 1.55, marginBottom: 14 }}>Choose a base resume and create a tailored version. You’ll review it in Resume before returning here.</div>
-              {baseResumes.length > 1 && <select value={selectedResumeId} onChange={e => setSelectedResumeId(e.target.value)} style={{ ...drawerInputSt, width: '100%', marginBottom: 12 }}>{baseResumes.map(r => <option key={r.id} value={r.id}>{r.isDefault ? 'Default — ' : ''}{r.name}</option>)}</select>}
-              <Btn variant="primary" onClick={handleTailorResume} disabled={tailoringLoading}>{tailoringLoading ? 'Creating tailored resume…' : 'Tailor in Resume'}</Btn>
+              <div style={{ fontSize: 14, color: 'var(--text-muted)', lineHeight: 1.55, marginBottom: 14 }}>{t('jobs.pack.chooseBase')}</div>
+              {baseResumes.length > 1 && <select value={selectedResumeId} onChange={e => setSelectedResumeId(e.target.value)} style={{ ...drawerInputSt, width: '100%', marginBottom: 12 }}>{baseResumes.map(r => <option key={r.id} value={r.id}>{r.isDefault ? `${t('jobs.defaultResume')} — ` : ''}{r.name}</option>)}</select>}
+              <Btn variant="primary" onClick={handleTailorResume} disabled={tailoringLoading}>{tailoringLoading ? t('jobs.pack.preparing') : t('jobs.pack.tailorInResume')}</Btn>
             </div>}
-            <div style={{ display: 'flex', alignItems: 'center', gap: 12, color: 'var(--text-muted)', margin: '4px 0 20px' }}><span style={{ height: 1, background: 'var(--border)', flex: 1 }} /><span>OR</span><span style={{ height: 1, background: 'var(--border)', flex: 1 }} /></div>
-            <button onClick={() => auditNeedsEvidence ? setOpenPackItem('audit') : void autoTailorAndAudit()} disabled={packActionDisabled || currentPackAudited} style={{ width: '100%', minHeight: 56, padding: '14px', border: `2px solid ${packActionDisabled || currentPackAudited ? '#e2e8f0' : auditNeedsRepair ? '#dc2626' : '#2563eb'}`, borderRadius: 9, background: packActionDisabled || currentPackAudited ? '#f8fafc' : auditNeedsRepair ? '#fff7f7' : '#fff', color: packActionDisabled || currentPackAudited ? '#94a3b8' : auditNeedsRepair ? '#b42318' : '#2563eb', fontSize: 15, fontWeight: 700, cursor: packActionDisabled || currentPackAudited ? 'not-allowed' : 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 10, textAlign: 'center' }}><Sparkles size={19} style={{ flexShrink: 0 }} />{currentPackAudited ? 'Application pack ready' : autoPreparing ? 'Preparing application pack…' : auditNeedsEvidence ? 'Review evidence needed' : auditRetryOnly ? 'Retry independent audit' : auditNeedsRepair ? 'Fix with AI and re-audit' : 'Prepare full application pack automatically'}</button>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 12, color: 'var(--text-muted)', margin: '4px 0 20px' }}><span style={{ height: 1, background: 'var(--border)', flex: 1 }} /><span>{t('jobs.or')}</span><span style={{ height: 1, background: 'var(--border)', flex: 1 }} /></div>
+            <button onClick={() => auditNeedsEvidence ? setOpenPackItem('audit') : void autoTailorAndAudit()} disabled={packActionDisabled || currentPackAudited} style={{ width: '100%', minHeight: 56, padding: '14px', border: `2px solid ${packActionDisabled || currentPackAudited ? '#e2e8f0' : auditNeedsRepair ? '#dc2626' : '#2563eb'}`, borderRadius: 9, background: packActionDisabled || currentPackAudited ? '#f8fafc' : auditNeedsRepair ? '#fff7f7' : '#fff', color: packActionDisabled || currentPackAudited ? '#94a3b8' : auditNeedsRepair ? '#b42318' : '#2563eb', fontSize: 15, fontWeight: 700, cursor: packActionDisabled || currentPackAudited ? 'not-allowed' : 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 10, textAlign: 'center' }}><Sparkles size={19} style={{ flexShrink: 0 }} />{currentPackAudited ? t('jobs.pack.ready') : autoPreparing ? t('jobs.pack.preparing') : auditNeedsEvidence ? t('jobs.pack.reviewEvidence') : auditRetryOnly ? t('jobs.pack.retryAudit') : auditNeedsRepair ? t('jobs.pack.fixAudit') : t('jobs.pack.prepareAutomatically')}</button>
             {autoPreparing && <PreparationProgress stage={packStage} elapsed={preparationElapsed} />}
-            <div style={{ textAlign: 'center', fontSize: 13, lineHeight: 1.55, color: 'var(--text-muted)', margin: '12px 28px 28px' }}>{auditRetryOnly ? 'Retrying the audit reuses your current resume and cover letter; it does not create new documents.' : auditNeedsEvidence ? 'Adding a confirmed fact saves it to Persona, then rewrites only the affected content.' : auditNeedsRepair ? 'This replaces unsupported claims; it does not invent experience, dates, or metrics.' : 'We’ll tailor your resume (if needed), generate a cover letter, and run an independent audit.'}</div>
-            <div style={{ borderTop: '1px solid var(--border)', paddingTop: 22, fontSize: 12, fontWeight: 700, letterSpacing: '0.03em', color: '#64748b' }}>APPLICATION PACK</div>
+            <div style={{ textAlign: 'center', fontSize: 13, lineHeight: 1.55, color: 'var(--text-muted)', margin: '12px 28px 28px' }}>{auditRetryOnly ? t('jobs.auditRetryHint') : auditNeedsEvidence ? t('jobs.auditEvidenceHint') : auditNeedsRepair ? t('jobs.auditRepairHint') : t('jobs.auditPrepareHint')}</div>
+            <div style={{ borderTop: '1px solid var(--border)', paddingTop: 22, fontSize: 12, fontWeight: 700, letterSpacing: '0.03em', color: '#64748b' }}>{t('jobs.drawer.applicationPack')}</div>
             <style>{`@keyframes pack-line-grow { from { transform: scaleY(0) } to { transform: scaleY(1) } } @keyframes pack-pulse { 0%,100% { box-shadow: 0 0 0 0 rgba(37,99,235,.35) } 50% { box-shadow: 0 0 0 7px rgba(37,99,235,0) } }`}</style>
-            <PackRow number="1" title="Resume" detail={packStage === 'resume' ? 'AI tailoring this resume…' : 'Tailored for this role'} done={Boolean(previewResumeId)} active={packStage === 'resume'} open={openPackItem === 'resume'} onToggle={() => setOpenPackItem(current => current === 'resume' ? null : 'resume')}>
+            <PackRow number="1" title={t('jobs.pack.resume')} detail={packStage === 'resume' ? t('jobs.pack.tailoring') : t('jobs.pack.tailoredRole')} done={Boolean(previewResumeId)} active={packStage === 'resume'} open={openPackItem === 'resume'} onToggle={() => setOpenPackItem(current => current === 'resume' ? null : 'resume')}>
               <ResumePackPreview resume={resumePreview} onReview={() => setDocumentPreview('resume')} />
             </PackRow>
-            <PackRow number="2" title="Cover letter" detail={packStage === 'coverLetter' ? 'AI writing a tailored cover letter…' : selectedCoverLetter ? 'Generated for this job' : 'Created during automatic preparation'} done={Boolean(selectedCoverLetter)} active={packStage === 'coverLetter'} open={openPackItem === 'coverLetter'} onToggle={() => setOpenPackItem(current => current === 'coverLetter' ? null : 'coverLetter')}>
+            <PackRow number="2" title={t('jobs.pack.coverLetter')} detail={packStage === 'coverLetter' ? t('jobs.pack.writingCoverLetter') : selectedCoverLetter ? t('jobs.pack.generatedJob') : t('jobs.pack.autoPreparation')} done={Boolean(selectedCoverLetter)} active={packStage === 'coverLetter'} open={openPackItem === 'coverLetter'} onToggle={() => setOpenPackItem(current => current === 'coverLetter' ? null : 'coverLetter')}>
               <CoverLetterPackPreview coverLetter={selectedCoverLetter ?? null} applicant={resumePreview?.content.contact} fallbackName={resumePreview?.name ?? 'Applicant'} company={job.company} role={job.role} templateId={resumePreview?.templateId ?? undefined} templateOptions={resumePreview?.templateOptions ?? undefined} onReview={() => setDocumentPreview('coverLetter')} />
             </PackRow>
-            <PackRow number="3" title="Independent audit" detail={packStage === 'audit' ? 'Checking changes against your original resume…' : auditRetryOnly ? 'Audit response needs a retry' : auditNeedsEvidence ? `${evidenceGapFindings.length} fact${evidenceGapFindings.length === 1 ? '' : 's'} need your confirmation` : auditNeedsRepair ? `${factualAuditFindings.length} factual issue${factualAuditFindings.length === 1 ? '' : 's'} need correction` : displayedAudit ? 'Facts verified against the original resume' : 'Runs after the resume and cover letter are ready'} done={currentPackAudited} failed={auditNeedsRepair || auditNeedsEvidence || auditRetryOnly} active={packStage === 'audit'} open={openPackItem === 'audit'} onToggle={() => setOpenPackItem(current => current === 'audit' ? null : 'audit')}>
+            <PackRow number="3" title={t('jobs.pack.audit')} detail={packStage === 'audit' ? t('jobs.pack.checkingChanges') : auditRetryOnly ? t('jobs.pack.retryResponse') : auditNeedsEvidence ? `${evidenceGapFindings.length} ${t('jobs.auditFactsCount')}` : auditNeedsRepair ? `${factualAuditFindings.length} ${t('jobs.auditIssuesCount')}` : displayedAudit ? t('jobs.pack.verifiedFacts') : t('jobs.pack.readyRun')} done={currentPackAudited} failed={auditNeedsRepair || auditNeedsEvidence || auditRetryOnly} active={packStage === 'audit'} open={openPackItem === 'audit'} onToggle={() => setOpenPackItem(current => current === 'audit' ? null : 'audit')}>
               <AuditPackPreview audit={displayedAudit} onRepair={() => void autoTailorAndAudit()} onAddEvidence={finding => { setEvidenceFinding(finding); setEvidenceText('') }} repairing={autoPreparing} />
             </PackRow>
-            {currentPackAudited && <button onClick={() => void downloadFinalPack()} disabled={downloadingPack} style={{ width: '100%', minHeight: 46, border: 0, borderRadius: 9, background: '#2563eb', color: '#fff', fontWeight: 700, cursor: 'pointer' }}>{downloadingPack ? (exportedPackFolder ? 'Opening job folder…' : 'Saving PDFs…') : exportedPackFolder ? 'Open job folder' : 'Save audited PDFs to D:\\My Jobs resume'}</button>}
-            <PackRow number="4" title="Open & fill application" detail={applicationPreflight.canAutomate ? 'Available after all items are complete' : 'Requires a verified direct ATS application link'} done={false} locked={!currentPackAudited || !applicationPreflight.canAutomate} last onClick={currentPackAudited && applicationPreflight.canAutomate && job.url ? () => window.open(job.url!, '_blank', 'noopener,noreferrer') : undefined} />
-            <div style={{ borderTop: '1px solid var(--border)', marginTop: 8, paddingTop: 22 }}><div style={{ fontSize: 12, fontWeight: 700, color: '#64748b', marginBottom: 12 }}>REVIEW &amp; SUBMIT</div><div style={{ border: '1px solid #bfdbfe', background: '#f8fbff', borderRadius: 9, padding: '14px 16px', display: 'flex', gap: 12, fontSize: 13, lineHeight: 1.55 }}><Info size={22} color="#2563eb" style={{ flexShrink: 0, marginTop: 1 }} /><span><strong>You’ll review and submit on the employer site</strong><br /><span style={{ color: 'var(--text-muted)' }}>We’ll open the job in a new tab when your application pack is ready.</span></span></div></div>
+            {currentPackAudited && <button onClick={() => void downloadFinalPack()} disabled={downloadingPack} style={{ width: '100%', minHeight: 46, border: 0, borderRadius: 9, background: '#2563eb', color: '#fff', fontWeight: 700, cursor: 'pointer' }}>{downloadingPack ? (exportedPackFolder ? t('jobs.pack.openingFolder') : t('jobs.pack.savingPdfs')) : exportedPackFolder ? t('jobs.pack.openFolder') : t('jobs.pack.savePdfs')}</button>}
+            <PackRow number="4" title={t('jobs.pack.openFill')} detail={applicationPreflight.canAutomate ? t('jobs.pack.availableComplete') : t('jobs.pack.requiresLink')} done={false} locked={!currentPackAudited || !applicationPreflight.canAutomate} last onClick={currentPackAudited && applicationPreflight.canAutomate && job.url ? () => window.open(job.url!, '_blank', 'noopener,noreferrer') : undefined} />
+            <div style={{ borderTop: '1px solid var(--border)', marginTop: 8, paddingTop: 22 }}><div style={{ fontSize: 12, fontWeight: 700, color: '#64748b', marginBottom: 12 }}>{t('jobs.drawer.reviewSubmit')}</div><div style={{ border: '1px solid #bfdbfe', background: '#f8fbff', borderRadius: 9, padding: '14px 16px', display: 'flex', gap: 12, fontSize: 13, lineHeight: 1.55 }}><Info size={22} color="#2563eb" style={{ flexShrink: 0, marginTop: 1 }} /><span><strong>{t('jobs.pack.submitEmployer')}</strong><br /><span style={{ color: 'var(--text-muted)' }}>{t('jobs.pack.openWhenReady')}</span></span></div></div>
             <div style={{ borderTop: '1px solid var(--border)', marginTop: 28, paddingTop: 22 }}>
-              <div style={{ fontSize: 12, fontWeight: 700, color: '#64748b', marginBottom: 16 }}>JOB DETAILS</div>
-              <JobDetail label="Company" value={job.company} />
-              {job.location && <JobDetail label="Location" value={job.location} />}
-              {job.url && <JobDetail label="Job posting" value="View original posting" href={job.url} />}
+              <div style={{ fontSize: 12, fontWeight: 700, color: '#64748b', marginBottom: 16 }}>{t('jobs.drawer.jobDetails')}</div>
+              <JobDetail label={t('jobs.companyLabel')} value={job.company} />
+              {job.location && <JobDetail label={t('jobs.location')} value={job.location} />}
+              {job.url && <JobDetail label={t('jobs.jobPosting')} value={t('jobs.viewOriginalPosting')} href={job.url} />}
             </div>
           </section>
 
           {/* Description */}
           {job.description && (
             <div>
-              <div style={{ fontSize: 10, color: 'var(--text-muted)', fontWeight: 500, marginBottom: 6 }}>DESCRIPTION</div>
+              <div style={{ fontSize: 10, color: 'var(--text-muted)', fontWeight: 500, marginBottom: 6 }}>{t('jobs.drawer.description')}</div>
               <div style={{
                 fontSize: 12, color: 'var(--text)', lineHeight: 1.75, whiteSpace: 'pre-wrap',
                 background: 'var(--bg-secondary)', borderRadius: 6, padding: '10px 12px',
@@ -890,7 +897,7 @@ function JobDetailDrawer({ job, onClose, onStatusChange, onUpdate, onDelete, onO
           {/* Agent Analysis */}
           {job.analysisNote && (
             <div>
-              <div style={{ fontSize: 10, color: '#185FA5', fontWeight: 500, marginBottom: 6 }}>AI ANALYSIS</div>
+              <div style={{ fontSize: 10, color: '#185FA5', fontWeight: 500, marginBottom: 6 }}>{t('jobs.drawer.analysis')}</div>
               <div style={{ fontSize: 11, color: 'var(--text)', lineHeight: 1.7, whiteSpace: 'pre-wrap', background: 'rgba(24,95,165,0.06)', border: '0.5px solid rgba(24,95,165,0.15)', borderRadius: 6, padding: '8px 10px', maxHeight: 200, overflowY: 'auto' }}>
                 {job.analysisNote}
               </div>
@@ -900,12 +907,12 @@ function JobDetailDrawer({ job, onClose, onStatusChange, onUpdate, onDelete, onO
           {/* Dates */}
           <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10 }}>
             <div>
-              <div style={{ fontSize: 10, color: 'var(--text-muted)', fontWeight: 500, marginBottom: 2 }}>ADDED</div>
+              <div style={{ fontSize: 10, color: 'var(--text-muted)', fontWeight: 500, marginBottom: 2 }}>{t('jobs.drawer.added')}</div>
               <div style={{ fontSize: 11 }}>{fmtDate(job.createdAt)}</div>
             </div>
             {job.appliedAt && (
               <div>
-                <div style={{ fontSize: 10, color: 'var(--text-muted)', fontWeight: 500, marginBottom: 2 }}>APPLIED</div>
+                <div style={{ fontSize: 10, color: 'var(--text-muted)', fontWeight: 500, marginBottom: 2 }}>{t('jobs.drawer.applied')}</div>
                 <div style={{ fontSize: 11 }}>{fmtDate(job.appliedAt)}</div>
               </div>
             )}
@@ -929,7 +936,7 @@ function JobDetailDrawer({ job, onClose, onStatusChange, onUpdate, onDelete, onO
                 <button
                   onClick={() => { setFollowUpAt(''); saveFollowUpAt('') }}
                   style={{ marginTop: 4, fontSize: 10, color: 'var(--text-muted)', background: 'none', border: 'none', cursor: 'pointer', padding: 0 }}>
-                  ✕ Clear date
+                  ✕ {t('jobs.clearDate')}
                 </button>
               )}
             </div>
@@ -938,26 +945,26 @@ function JobDetailDrawer({ job, onClose, onStatusChange, onUpdate, onDelete, onO
           {/* Notes */}
           <div>
             <div style={{ fontSize: 10, color: 'var(--text-muted)', fontWeight: 500, marginBottom: 6, display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-              <span>NOTES</span>
-              {savingNotes && <span style={{ fontSize: 9, color: 'var(--text-muted)' }}>Saving…</span>}
+              <span>{t('jobs.drawer.notes')}</span>
+              {savingNotes && <span style={{ fontSize: 9, color: 'var(--text-muted)' }}>{t('jobs.saving')}</span>}
             </div>
             <textarea
               value={notes}
               onChange={e => setNotes(e.target.value)}
               onBlur={saveNotes}
               onKeyDown={e => { if ((e.metaKey || e.ctrlKey) && e.key === 's') { e.preventDefault(); saveNotes() } }}
-              placeholder="Add notes, contacts, salary details…"
+              placeholder={t('jobs.notesPlaceholder')}
               style={{ ...drawerInputSt, minHeight: 90, resize: 'vertical', lineHeight: 1.6, padding: '7px 9px' }}
             />
           </div>
 
           {/* Activity log */}
           <div>
-            <div style={{ fontSize: 10, color: 'var(--text-muted)', fontWeight: 500, marginBottom: 8 }}>ACTIVITY</div>
+            <div style={{ fontSize: 10, color: 'var(--text-muted)', fontWeight: 500, marginBottom: 8 }}>{t('jobs.drawer.activity')}</div>
             {loadingAct ? (
-              <div style={{ fontSize: 11, color: 'var(--text-muted)' }}>Loading…</div>
+              <div style={{ fontSize: 11, color: 'var(--text-muted)' }}>{t('jobs.loadingDetail')}</div>
             ) : activity.length === 0 ? (
-              <div style={{ fontSize: 11, color: 'var(--text-muted)' }}>No activity yet</div>
+              <div style={{ fontSize: 11, color: 'var(--text-muted)' }}>{t('jobs.drawer.noActivity')}</div>
             ) : (
               <div style={{ display: 'flex', flexDirection: 'column', gap: 0 }}>
                 {activity.map((a, i) => (
@@ -979,7 +986,7 @@ function JobDetailDrawer({ job, onClose, onStatusChange, onUpdate, onDelete, onO
           {/* Interview Prep */}
           {job.status === 'interview' && (
             <div>
-              <div style={{ fontSize: 10, color: '#3B6D11', fontWeight: 500, marginBottom: 8 }}>INTERVIEW PREP</div>
+              <div style={{ fontSize: 10, color: '#3B6D11', fontWeight: 500, marginBottom: 8 }}>{t('jobs.interviewPrep')}</div>
               {!interviewPrep ? (
                 <button
                   onClick={generateInterviewPrep}
@@ -990,7 +997,7 @@ function JobDetailDrawer({ job, onClose, onStatusChange, onUpdate, onDelete, onO
                     color: '#3B6D11', fontSize: 11, fontWeight: 500, cursor: loadingPrep ? 'not-allowed' : 'pointer',
                     opacity: loadingPrep ? 0.6 : 1,
                   }}>
-                  {loadingPrep ? 'Generating…' : 'Generate Interview Prep'}
+                  {loadingPrep ? t('jobs.interviewGenerating') : t('jobs.generateInterviewPrep')}
                 </button>
               ) : (
                 <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
@@ -1012,13 +1019,13 @@ function JobDetailDrawer({ job, onClose, onStatusChange, onUpdate, onDelete, onO
                     </div>
                   </div>
                   <div>
-                    <div style={{ fontSize: 10, color: 'var(--text-muted)', fontWeight: 500, marginBottom: 4 }}>Company Research</div>
+                    <div style={{ fontSize: 10, color: 'var(--text-muted)', fontWeight: 500, marginBottom: 4 }}>{t('jobs.companyResearch')}</div>
                     <div style={{ fontSize: 11, color: 'var(--text)', lineHeight: 1.7, background: 'var(--bg-secondary)', borderRadius: 6, padding: '8px 10px', whiteSpace: 'pre-wrap' }}>
                       {interviewPrep.companyResearch}
                     </div>
                   </div>
                   <div>
-                    <div style={{ fontSize: 10, color: 'var(--text-muted)', fontWeight: 500, marginBottom: 4 }}>Follow-up Email Template</div>
+                    <div style={{ fontSize: 10, color: 'var(--text-muted)', fontWeight: 500, marginBottom: 4 }}>{t('jobs.followUp')}</div>
                     <div style={{ fontSize: 11, color: 'var(--text)', lineHeight: 1.7, background: 'var(--bg-secondary)', borderRadius: 6, padding: '8px 10px', whiteSpace: 'pre-wrap', position: 'relative' }}>
                       {interviewPrep.followUpEmail}
                       <button
@@ -1040,15 +1047,15 @@ function JobDetailDrawer({ job, onClose, onStatusChange, onUpdate, onDelete, onO
         </div>
 
         {documentPreview === 'resume' && resumePreview && <DocumentPreviewModal title={resumePreview.name} onClose={() => setDocumentPreview(null)}><ResumeRenderer content={resumePreview.content} templateId={resumePreview.templateId} templateOptions={resumePreview.templateOptions} /></DocumentPreviewModal>}
-        {documentPreview === 'coverLetter' && selectedCoverLetter && <DocumentPreviewModal title="AI-generated cover letter" onClose={() => setDocumentPreview(null)}><CoverLetterPreview content={selectedCoverLetter.content} applicant={resumePreview?.content.contact} fallbackName={resumePreview?.name ?? 'Applicant'} company={job.company} role={job.role} templateId={resumePreview?.templateId ?? selectedCoverLetter.templateId ?? 'clean'} templateOptions={resumePreview?.templateOptions ?? selectedCoverLetter.templateOptions ?? {}} /></DocumentPreviewModal>}
+        {documentPreview === 'coverLetter' && selectedCoverLetter && <DocumentPreviewModal title={t('jobs.coverLetterPreview')} onClose={() => setDocumentPreview(null)}><CoverLetterPreview content={selectedCoverLetter.content} applicant={resumePreview?.content.contact} fallbackName={resumePreview?.name ?? 'Applicant'} company={job.company} role={job.role} templateId={resumePreview?.templateId ?? selectedCoverLetter.templateId ?? 'clean'} templateOptions={resumePreview?.templateOptions ?? selectedCoverLetter.templateOptions ?? {}} /></DocumentPreviewModal>}
         {evidenceFinding && <EvidenceCaptureModal finding={evidenceFinding} value={evidenceText} saving={savingEvidence} onChange={setEvidenceText} onClose={() => !savingEvidence && setEvidenceFinding(null)} onSave={() => void saveEvidenceAndRewrite()} />}
 
         {/* Footer */}
         <div style={{ padding: '12px 18px', borderTop: '0.5px solid var(--border)', display: 'flex', gap: 8 }}>
           <Btn variant="danger" small disabled={deleting} onClick={handleDelete} style={{ flex: 1 }}>
-            {deleting ? 'Deleting…' : 'Delete Job'}
+            {deleting ? t('jobs.deleting') : `${t('jobs.delete')} job`}
           </Btn>
-          <Btn variant="primary" small onClick={onClose} style={{ flex: 1 }}>Close</Btn>
+          <Btn variant="primary" small onClick={onClose} style={{ flex: 1 }}>{t('jobs.close')}</Btn>
         </div>
       </div>
     </>
@@ -1117,26 +1124,28 @@ function PackRow({ number, title, detail, done, failed = false, active = false, 
 }
 
 function PreparationProgress({ stage, elapsed }: { stage: 'idle' | 'resume' | 'coverLetter' | 'audit' | 'review'; elapsed: number }) {
+  const { t } = useI18n()
   const current = stage === 'audit' ? 3 : stage === 'coverLetter' ? 2 : 1
-  const labels = ['Preparing resume', 'Preparing cover letter', 'Running independent audit']
+  const labels = [t('jobs.progress.resume'), t('jobs.progress.coverLetter'), t('jobs.progress.audit')]
   return <div role="status" style={{ marginTop: 12, padding: '12px 14px', border: '1px solid #bfdbfe', borderRadius: 9, background: '#f8fbff' }}>
     <div style={{ display: 'flex', justifyContent: 'space-between', gap: 12, fontSize: 12, fontWeight: 700, color: '#1d4ed8' }}><span>{labels[current - 1]}…</span><span style={{ fontVariantNumeric: 'tabular-nums' }}>{formatDuration(elapsed)}</span></div>
     <div style={{ height: 6, overflow: 'hidden', marginTop: 9, borderRadius: 999, background: '#dbeafe' }}><div style={{ width: `${Math.max(12, current * 30)}%`, height: '100%', borderRadius: 999, background: '#2563eb', transition: 'width .35s ease' }} /></div>
-    <div style={{ marginTop: 8, fontSize: 11, color: '#64748b' }}>Usually 1–3 minutes. You can keep this panel open while we work.</div>
+    <div style={{ marginTop: 8, fontSize: 11, color: '#64748b' }}>{t('jobs.progress.hint')}</div>
   </div>
 }
 
 function ResumePackPreview({ resume, onReview }: { resume: Resume | null; onReview: () => void }) {
-  if (!resume) return <div style={{ fontSize: 13, color: 'var(--text-muted)' }}>The tailored resume will appear here once AI tailoring finishes.</div>
+  const { t } = useI18n()
+  if (!resume) return <div style={{ fontSize: 13, color: 'var(--text-muted)' }}>{t('jobs.preview.resumeMissing')}</div>
   const templateLabel = resume.templateId ? `${resume.templateId[0].toUpperCase()}${resume.templateId.slice(1)} template` : 'Clean template'
   return <div>
-    <button onClick={onReview} aria-label="Open the full tailored resume preview" style={{ display: 'block', position: 'relative', width: '100%', height: 420, padding: 0, overflow: 'hidden', contain: 'layout paint', border: '1px solid #dbe1ea', borderRadius: 8, background: '#e9eef5', cursor: 'zoom-in', textAlign: 'left' }}>
+    <button onClick={onReview} aria-label={t('jobs.fullResumePreview')} style={{ display: 'block', position: 'relative', width: '100%', height: 420, padding: 0, overflow: 'hidden', contain: 'layout paint', border: '1px solid #dbe1ea', borderRadius: 8, background: '#e9eef5', cursor: 'zoom-in', textAlign: 'left' }}>
       <div style={{ position: 'absolute', inset: 0, width: '222.23%', transform: 'scale(.45)', transformOrigin: 'top left', pointerEvents: 'none', background: '#fff' }}>
         <ResumeRenderer content={resume.content} templateId={resume.templateId} templateOptions={resume.templateOptions} />
       </div>
-      <span style={{ position: 'absolute', right: 12, bottom: 12, display: 'inline-flex', alignItems: 'center', gap: 5, padding: '8px 10px', borderRadius: 7, background: 'rgba(15,23,42,.86)', color: '#fff', fontSize: 12, fontWeight: 700 }}>View full resume <ChevronRight size={15} /></span>
+      <span style={{ position: 'absolute', right: 12, bottom: 12, display: 'inline-flex', alignItems: 'center', gap: 5, padding: '8px 10px', borderRadius: 7, background: 'rgba(15,23,42,.86)', color: '#fff', fontSize: 12, fontWeight: 700 }}>{t('jobs.preview.viewResume')} <ChevronRight size={15} /></span>
     </button>
-    <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12, marginTop: 10, fontSize: 12, color: '#64748b' }}><span>AI tailored for this job</span><span>{templateLabel}</span></div>
+    <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12, marginTop: 10, fontSize: 12, color: '#64748b' }}><span>{t('jobs.aiTailored')}</span><span>{templateLabel}</span></div>
   </div>
 }
 
@@ -1144,39 +1153,44 @@ function CoverLetterPackPreview({ coverLetter, applicant, fallbackName, company,
   coverLetter: CoverLetter | null; applicant?: Resume['content']['contact']; fallbackName: string; company: string; role: string
   templateId?: string | null; templateOptions?: Resume['templateOptions']; onReview: () => void
 }) {
+  const { t } = useI18n()
   return coverLetter
-    ? <button onClick={onReview} aria-label="Open the full generated cover letter" style={{ display: 'block', position: 'relative', width: '100%', height: 260, padding: 0, overflow: 'hidden', contain: 'layout paint', border: '1px solid #dbe1ea', borderRadius: 8, background: '#e9eef5', cursor: 'zoom-in', textAlign: 'left' }}><div style={{ position: 'absolute', inset: 0, width: '200%', transform: 'scale(.5)', transformOrigin: 'top left', pointerEvents: 'none' }}><CoverLetterPreview content={coverLetter.content} applicant={applicant} fallbackName={fallbackName} company={company} role={role} templateId={templateId ?? coverLetter.templateId ?? 'clean'} templateOptions={templateOptions ?? coverLetter.templateOptions ?? {}} /></div><span style={{ position: 'absolute', right: 12, bottom: 12, display: 'inline-flex', alignItems: 'center', gap: 4, padding: '7px 9px', borderRadius: 6, background: 'rgba(15,23,42,.86)', color: '#fff', fontSize: 11, fontWeight: 700 }}>View full letter <ChevronRight size={14} /></span></button>
-    : <div style={{ fontSize: 13, color: 'var(--text-muted)' }}>The generated cover letter will appear here after automatic preparation.</div>
+    ? <button onClick={onReview} aria-label={t('jobs.fullCoverLetter')} style={{ display: 'block', position: 'relative', width: '100%', height: 260, padding: 0, overflow: 'hidden', contain: 'layout paint', border: '1px solid #dbe1ea', borderRadius: 8, background: '#e9eef5', cursor: 'zoom-in', textAlign: 'left' }}><div style={{ position: 'absolute', inset: 0, width: '200%', transform: 'scale(.5)', transformOrigin: 'top left', pointerEvents: 'none' }}><CoverLetterPreview content={coverLetter.content} applicant={applicant} fallbackName={fallbackName} company={company} role={role} templateId={templateId ?? coverLetter.templateId ?? 'clean'} templateOptions={templateOptions ?? coverLetter.templateOptions ?? {}} /></div><span style={{ position: 'absolute', right: 12, bottom: 12, display: 'inline-flex', alignItems: 'center', gap: 4, padding: '7px 9px', borderRadius: 6, background: 'rgba(15,23,42,.86)', color: '#fff', fontSize: 11, fontWeight: 700 }}>{t('jobs.viewFullLetter')} <ChevronRight size={14} /></span></button>
+    : <div style={{ fontSize: 13, color: 'var(--text-muted)' }}>{t('jobs.preview.coverLetterMissing')}</div>
 }
 
 function DocumentPreviewModal({ title, onClose, children }: { title: string; onClose: () => void; children: React.ReactNode }) {
+  const { t } = useI18n()
   return <div role="dialog" aria-modal="true" aria-label={title} style={{ position: 'fixed', inset: 0, zIndex: 130, display: 'grid', placeItems: 'center', padding: 24, background: 'rgba(15,23,42,.62)' }} onMouseDown={onClose}>
     <div style={{ width: 'min(920px, calc(100vw - 48px))', maxHeight: 'calc(100vh - 48px)', display: 'flex', flexDirection: 'column', overflow: 'hidden', background: '#f1f5f9', borderRadius: 14, boxShadow: '0 24px 80px rgba(15,23,42,.42)' }} onMouseDown={event => event.stopPropagation()}>
-      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 16, padding: '15px 20px', background: '#fff', borderBottom: '1px solid #dbe1ea' }}><div><div style={{ fontSize: 15, fontWeight: 700, color: '#0f172a' }}>{title}</div><div style={{ marginTop: 2, fontSize: 12, color: '#64748b' }}>Full application document preview</div></div><button onClick={onClose} aria-label="Close preview" style={{ display: 'grid', placeItems: 'center', width: 32, height: 32, border: 'none', borderRadius: 8, color: '#475569', background: '#f1f5f9', cursor: 'pointer' }}><X size={18} /></button></div>
+      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 16, padding: '15px 20px', background: '#fff', borderBottom: '1px solid #dbe1ea' }}><div><div style={{ fontSize: 15, fontWeight: 700, color: '#0f172a' }}>{title}</div><div style={{ marginTop: 2, fontSize: 12, color: '#64748b' }}>{t('jobs.documentPreview')}</div></div><button onClick={onClose} aria-label={t('jobs.closePreview')} style={{ display: 'grid', placeItems: 'center', width: 32, height: 32, border: 'none', borderRadius: 8, color: '#475569', background: '#f1f5f9', cursor: 'pointer' }}><X size={18} /></button></div>
       <div style={{ flex: 1, overflow: 'auto', padding: 24 }}>{children}</div>
     </div>
   </div>
 }
 
 function EvidenceCaptureModal({ finding, value, saving, onChange, onClose, onSave }: { finding: ApplicationAuditFinding; value: string; saving: boolean; onChange: (value: string) => void; onClose: () => void; onSave: () => void }) {
-  return <div role="dialog" aria-modal="true" aria-label="Add Persona evidence" style={{ position: 'fixed', inset: 0, zIndex: 140, display: 'grid', placeItems: 'center', padding: 24, background: 'rgba(15,23,42,.62)' }} onMouseDown={onClose}>
+  const { t } = useI18n()
+  return <div role="dialog" aria-modal="true" aria-label={t('jobs.evidence.title')} style={{ position: 'fixed', inset: 0, zIndex: 140, display: 'grid', placeItems: 'center', padding: 24, background: 'rgba(15,23,42,.62)' }} onMouseDown={onClose}>
     <div style={{ width: 'min(560px, calc(100vw - 40px))', padding: 22, borderRadius: 14, background: '#fff', boxShadow: '0 24px 80px rgba(15,23,42,.42)' }} onMouseDown={event => event.stopPropagation()}>
-      <div style={{ display: 'flex', justifyContent: 'space-between', gap: 16 }}><div><div style={{ fontSize: 17, fontWeight: 750, color: '#0f172a' }}>Add verified Persona evidence</div><div style={{ marginTop: 5, fontSize: 13, lineHeight: 1.5, color: '#64748b' }}>This is missing evidence, not a finding of fabrication. Your confirmed fact will be saved to Persona and used only to rewrite the affected content.</div></div><button onClick={onClose} disabled={saving} aria-label="Close" style={{ alignSelf: 'start', border: 0, background: 'transparent', color: '#475569', cursor: 'pointer' }}><X size={20} /></button></div>
+      <div style={{ display: 'flex', justifyContent: 'space-between', gap: 16 }}><div><div style={{ fontSize: 17, fontWeight: 750, color: '#0f172a' }}>{t('jobs.evidence.title')}</div><div style={{ marginTop: 5, fontSize: 13, lineHeight: 1.5, color: '#64748b' }}>{t('jobs.evidence.description')}</div></div><button onClick={onClose} disabled={saving} aria-label={t('jobs.evidence.close')} style={{ alignSelf: 'start', border: 0, background: 'transparent', color: '#475569', cursor: 'pointer' }}><X size={20} /></button></div>
       <div style={{ marginTop: 16, padding: '10px 12px', borderLeft: '3px solid #d97706', background: '#fffbeb', fontSize: 12, lineHeight: 1.5, color: '#475569' }}><strong style={{ color: '#92400e' }}>{finding.title}</strong><br />{finding.evidence}</div>
-      <label style={{ display: 'block', marginTop: 16, fontSize: 13, fontWeight: 700, color: '#1e293b' }}>What is the accurate, confirmed fact?<textarea value={value} onChange={event => onChange(event.target.value)} placeholder="Example: At InsightSec (Apr 2021–Dec 2022), I designed REST APIs for the internal risk platform. I did not manage Azure or Kubernetes deployments." autoFocus style={{ display: 'block', width: '100%', minHeight: 116, marginTop: 7, padding: 10, resize: 'vertical', border: '1px solid #cbd5e1', borderRadius: 8, color: '#0f172a', font: 'inherit', fontSize: 13, lineHeight: 1.5 }} /></label>
-      <div style={{ marginTop: 8, fontSize: 11, lineHeight: 1.45, color: '#64748b' }}>Only enter facts you can personally confirm. Do not add passwords, financial identifiers, government IDs, or sensitive personal data.</div>
-      <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 10, marginTop: 18 }}><button onClick={onClose} disabled={saving} style={{ border: '1px solid #cbd5e1', borderRadius: 8, padding: '8px 12px', background: '#fff', color: '#475569', fontWeight: 700, cursor: 'pointer' }}>Cancel</button><button onClick={onSave} disabled={saving || !value.trim()} style={{ border: 0, borderRadius: 8, padding: '8px 12px', background: saving || !value.trim() ? '#93c5fd' : '#2563eb', color: '#fff', fontWeight: 700, cursor: saving || !value.trim() ? 'default' : 'pointer' }}>{saving ? 'Saving evidence…' : 'Save evidence & rewrite'}</button></div>
+      <label style={{ display: 'block', marginTop: 16, fontSize: 13, fontWeight: 700, color: '#1e293b' }}>{t('jobs.evidence.question')}<textarea value={value} onChange={event => onChange(event.target.value)} placeholder={t('jobs.evidence.example')} autoFocus style={{ display: 'block', width: '100%', minHeight: 116, marginTop: 7, padding: 10, resize: 'vertical', border: '1px solid #cbd5e1', borderRadius: 8, color: '#0f172a', font: 'inherit', fontSize: 13, lineHeight: 1.5 }} /></label>
+      <div style={{ marginTop: 8, fontSize: 11, lineHeight: 1.45, color: '#64748b' }}>{t('jobs.evidence.privacy')}</div>
+      <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 10, marginTop: 18 }}><button onClick={onClose} disabled={saving} style={{ border: '1px solid #cbd5e1', borderRadius: 8, padding: '8px 12px', background: '#fff', color: '#475569', fontWeight: 700, cursor: 'pointer' }}>{t('jobs.evidence.cancel')}</button><button onClick={onSave} disabled={saving || !value.trim()} style={{ border: 0, borderRadius: 8, padding: '8px 12px', background: saving || !value.trim() ? '#93c5fd' : '#2563eb', color: '#fff', fontWeight: 700, cursor: saving || !value.trim() ? 'default' : 'pointer' }}>{saving ? t('jobs.evidence.saving') : t('jobs.evidence.save')}</button></div>
     </div>
   </div>
 }
 
 function AuditPackPreview({ audit, onRepair, onAddEvidence, repairing }: { audit: ApplicationAudit | null; onRepair: () => void; onAddEvidence: (finding: ApplicationAuditFinding) => void; repairing: boolean }) {
-  if (!audit) return <div style={{ fontSize: 13, color: 'var(--text-muted)' }}>No audit result yet. The audit checks the tailored resume and cover letter against the original resume before the application can be opened.</div>
+  const { t } = useI18n()
+  if (!audit) return <div style={{ fontSize: 13, color: 'var(--text-muted)' }}>{t('jobs.auditNoResult')}</div>
   const retryOnly = audit.findings.some(finding => finding.title === 'Audit response needs retry')
   const evidenceGaps = audit.findings.filter(finding => finding.area !== 'job_match' && finding.resolution === 'evidence_needed')
   const issues = audit.findings.filter(finding => finding.area !== 'job_match' && finding.severity !== 'pass' && finding.resolution !== 'evidence_needed')
   const passed = audit.findings.filter(finding => finding.severity === 'pass').length
-  return <div><div style={{ display: 'flex', justifyContent: 'space-between', gap: 10, fontSize: 13, fontWeight: 700 }}><span>{audit.verdict === 'pass' ? 'Factual integrity passed' : retryOnly ? 'Audit response needs retry' : evidenceGaps.length ? `${evidenceGaps.length} fact${evidenceGaps.length === 1 ? '' : 's'} need your confirmation` : `${issues.length} factual issue${issues.length === 1 ? '' : 's'} need correction`}</span><span style={{ color: audit.verdict === 'pass' ? '#3b8c1a' : audit.verdict === 'blocked' ? '#b42318' : '#a16207', whiteSpace: 'nowrap' }}>Role match {audit.matchScore}%</span></div>{evidenceGaps.length > 0 && <div style={{ marginTop: 10, display: 'grid', gap: 8 }}>{evidenceGaps.map((finding, index) => <div key={`${finding.title}-${index}`} style={{ padding: '10px', borderLeft: '3px solid #2563eb', background: '#f8fbff', fontSize: 12, lineHeight: 1.45 }}><strong style={{ color: '#1d4ed8' }}>Evidence needed · {finding.title}</strong><div style={{ marginTop: 3, color: '#475569' }}>{finding.action}</div><button onClick={() => onAddEvidence(finding)} disabled={repairing} style={{ marginTop: 8, border: '1px solid #2563eb', borderRadius: 7, padding: '6px 8px', background: '#fff', color: '#2563eb', fontWeight: 700, cursor: 'pointer' }}>Add evidence & rewrite</button></div>)}</div>}{issues.length > 0 && <div style={{ marginTop: 10, display: 'grid', gap: 8 }}>{issues.map((finding, index) => <div key={`${finding.title}-${index}`} style={{ padding: '9px 10px', borderLeft: `3px solid ${finding.severity === 'critical' ? '#dc2626' : '#d97706'}`, background: finding.severity === 'critical' ? '#fff7f7' : '#fffbeb', fontSize: 12, lineHeight: 1.45 }}><strong style={{ color: finding.severity === 'critical' ? '#b42318' : '#a16207' }}>{finding.title}</strong><div style={{ color: '#475569', marginTop: 3 }}>{finding.action}</div></div>)}</div>}{retryOnly && <div style={{ marginTop: 10, fontSize: 12, lineHeight: 1.5, color: 'var(--text-muted)' }}>{audit.summary}</div>}{passed > 0 && <div style={{ marginTop: 10, color: '#3b8c1a', fontSize: 12 }}>{passed} supported check{passed === 1 ? '' : 's'} passed</div>}{issues.length > 0 && <button onClick={onRepair} disabled={repairing} style={{ marginTop: 12, border: '1px solid #dc2626', background: '#fff', color: '#b42318', borderRadius: 7, padding: '8px 10px', fontWeight: 700, cursor: 'pointer' }}>{repairing ? 'Correcting facts and re-auditing…' : 'Fix with AI and re-audit'}</button>}{retryOnly && <button onClick={onRepair} disabled={repairing} style={{ marginTop: 12, border: '1px solid #2563eb', background: '#fff', color: '#2563eb', borderRadius: 7, padding: '8px 10px', fontWeight: 700, cursor: 'pointer' }}>{repairing ? 'Retrying independent audit…' : 'Retry independent audit'}</button>}</div>
+  const verdict = audit.verdict === 'pass' ? t('jobs.auditPassed') : retryOnly ? t('jobs.auditRetryNeeded') : evidenceGaps.length ? `${evidenceGaps.length} ${t('jobs.auditFactsNeedConfirmation')}` : `${issues.length} ${t('jobs.auditIssuesNeedCorrection')}`
+  return <div><div style={{ display: 'flex', justifyContent: 'space-between', gap: 10, fontSize: 13, fontWeight: 700 }}><span>{verdict}</span><span style={{ color: audit.verdict === 'pass' ? '#3b8c1a' : audit.verdict === 'blocked' ? '#b42318' : '#a16207', whiteSpace: 'nowrap' }}>{t('jobs.roleMatch')} {audit.matchScore}%</span></div>{evidenceGaps.length > 0 && <div style={{ marginTop: 10, display: 'grid', gap: 8 }}>{evidenceGaps.map((finding, index) => <div key={`${finding.title}-${index}`} style={{ padding: '10px', borderLeft: '3px solid #2563eb', background: '#f8fbff', fontSize: 12, lineHeight: 1.45 }}><strong style={{ color: '#1d4ed8' }}>{t('jobs.evidenceNeeded')} · {finding.title}</strong><div style={{ marginTop: 3, color: '#475569' }}>{finding.action}</div><button onClick={() => onAddEvidence(finding)} disabled={repairing} style={{ marginTop: 8, border: '1px solid #2563eb', borderRadius: 7, padding: '6px 8px', background: '#fff', color: '#2563eb', fontWeight: 700, cursor: 'pointer' }}>{t('jobs.addEvidenceRewrite')}</button></div>)}</div>}{issues.length > 0 && <div style={{ marginTop: 10, display: 'grid', gap: 8 }}>{issues.map((finding, index) => <div key={`${finding.title}-${index}`} style={{ padding: '9px 10px', borderLeft: `3px solid ${finding.severity === 'critical' ? '#dc2626' : '#d97706'}`, background: finding.severity === 'critical' ? '#fff7f7' : '#fffbeb', fontSize: 12, lineHeight: 1.45 }}><strong style={{ color: finding.severity === 'critical' ? '#b42318' : '#a16207' }}>{finding.title}</strong><div style={{ color: '#475569', marginTop: 3 }}>{finding.action}</div></div>)}</div>}{retryOnly && <div style={{ marginTop: 10, fontSize: 12, lineHeight: 1.5, color: 'var(--text-muted)' }}>{audit.summary}</div>}{passed > 0 && <div style={{ marginTop: 10, color: '#3b8c1a', fontSize: 12 }}>{passed} {t('jobs.supportedChecks')}</div>}{issues.length > 0 && <button onClick={onRepair} disabled={repairing} style={{ marginTop: 12, border: '1px solid #dc2626', background: '#fff', color: '#b42318', borderRadius: 7, padding: '8px 10px', fontWeight: 700, cursor: 'pointer' }}>{repairing ? t('jobs.correctReaudit') : t('jobs.fixReaudit')}</button>}{retryOnly && <button onClick={onRepair} disabled={repairing} style={{ marginTop: 12, border: '1px solid #2563eb', background: '#fff', color: '#2563eb', borderRadius: 7, padding: '8px 10px', fontWeight: 700, cursor: 'pointer' }}>{repairing ? t('jobs.retryingAudit') : t('jobs.retryAuditButton')}</button>}</div>
 }
 
 function JobDetail({ label, value, href }: { label: string; value: string; href?: string }) {
@@ -1340,6 +1354,7 @@ function ScoreJobButton({ job, onUpdate }: { job: Job; onUpdate: (updated: Job) 
 export function JobsPage() {
   const toast = useToast()
   const { navigate } = useNav()
+  const { t } = useI18n()
   const { data: session } = useSession()
   const userId = session?.user?.id ?? ''
   const cachedJobs = defaultJobsCache?.userId === userId ? defaultJobsCache : null
@@ -1467,7 +1482,7 @@ export function JobsPage() {
       })
     } else {
       defaultJobsCache = null
-      toast.success('Moved', `Job moved to ${COL_LABELS[newStatus]}`)
+      toast.success(t('jobs.moved'), `${t('jobs.movedTo')} ${colLabel(t, newStatus)}`)
     }
   }
 
@@ -1537,15 +1552,15 @@ export function JobsPage() {
       <header className="jobs-page-header" style={{ minHeight: 62, flexShrink: 0, padding: '8px 30px', background: 'var(--bg-tertiary)' }}>
         <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 24, flexWrap: 'wrap' }}>
           <div style={{ flex: '1 1 360px', display: 'flex', alignItems: 'center', gap: 10, minWidth: 0 }}>
-            <h1 style={{ margin: 0, flexShrink: 0, fontSize: 22, fontWeight: 760, lineHeight: 1.1, letterSpacing: '-0.05em' }}>My Jobs</h1>
+            <h1 style={{ margin: 0, flexShrink: 0, fontSize: 22, fontWeight: 760, lineHeight: 1.1, letterSpacing: '-0.05em' }}>{t('jobs.title')}</h1>
             <span style={{ flexShrink: 0, fontSize: 12, color: 'var(--primary)', background: 'rgba(79,70,229,0.09)', borderRadius: 999, padding: '4px 9px', fontWeight: 600 }}>{total}</span>
-            <span style={{ minWidth: 0, overflow: 'hidden', color: 'var(--text-muted)', fontSize: 12, textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>Track your applications and move closer to your next opportunity.</span>
+            <span style={{ minWidth: 0, overflow: 'hidden', color: 'var(--text-muted)', fontSize: 12, textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{t('jobs.description')}</span>
           </div>
           <div style={{ display: 'flex', alignItems: 'center', gap: 12, flexWrap: 'wrap' }}>
             {([
-              [Bookmark, 'Saved', statusCounts.saved, '#6D5DFB'],
-              [Check, 'Applied', statusCounts.applied, '#185FA5'],
-              [UsersRound, 'Interviews', statusCounts.interview, '#3B6D11'],
+              [Bookmark, t('jobs.saved'), statusCounts.saved, '#6D5DFB'],
+              [Check, t('jobs.applied'), statusCounts.applied, '#185FA5'],
+              [UsersRound, t('jobs.interview'), statusCounts.interview, '#3B6D11'],
             ] as const).map(([Icon, label, count, color], index) => (
               <React.Fragment key={label}>
                 {index > 0 && <span aria-hidden="true" style={{ width: 1, height: 28, margin: '0 3px', background: 'var(--border)' }} />}
@@ -1557,7 +1572,7 @@ export function JobsPage() {
               </React.Fragment>
             ))}
             <span aria-hidden="true" style={{ width: 1, height: 28, margin: '0 3px', background: 'var(--border)' }} />
-            <Btn variant="primary" onClick={() => { setPrefillStatus(null); setShowAdd(true) }} style={{ width: 137, height: 34, justifyContent: 'center', padding: 0, borderRadius: 7, fontSize: 12 }}>+ Add job</Btn>
+            <Btn variant="primary" onClick={() => { setPrefillStatus(null); setShowAdd(true) }} style={{ width: 137, height: 34, justifyContent: 'center', padding: 0, borderRadius: 7, fontSize: 12 }}>{t('jobs.add')}</Btn>
           </div>
         </div>
       </header>
@@ -1566,47 +1581,47 @@ export function JobsPage() {
         <div className="jobs-page-toolbar" style={{ padding: 14, marginBottom: 0, background: 'var(--bg)', border: '0.5px solid var(--border)', borderBottom: 'none', borderRadius: '12px 12px 0 0', display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' }}>
           <div className="jobs-page-search" style={{ width: 420, maxWidth: '100%', display: 'flex', alignItems: 'center', gap: 8, padding: '0 12px', border: '0.5px solid var(--border)', borderRadius: 8, background: 'var(--bg)' }}>
             <Search size={17} color="var(--text-muted)" />
-            <input value={search} onChange={e => doSearch(e.target.value)} placeholder="Search jobs…"
+            <input value={search} onChange={e => doSearch(e.target.value)} placeholder={t('jobs.search')}
               style={{ width: '100%', padding: '10px 0', fontSize: 13, border: 'none', background: 'transparent', color: 'var(--text)', outline: 'none' }} />
           </div>
           <button onClick={scoreAllJobs} disabled={scoringAll} style={{ height: 38, padding: '0 12px', display: 'inline-flex', alignItems: 'center', gap: 7, border: scoringAll || selectedIds.size ? '1px solid rgba(79,70,229,0.38)' : '0.5px solid var(--border)', borderRadius: 8, background: scoringAll || selectedIds.size ? 'rgba(79,70,229,0.08)' : 'var(--bg)', color: scoringAll || selectedIds.size ? 'var(--primary)' : 'var(--text)', cursor: scoringAll ? 'wait' : 'pointer', fontSize: 12, fontWeight: 600, opacity: scoringAll ? 0.9 : 1, animation: scoringAll ? 'glowPulse 1.3s ease-in-out infinite' : 'none', transition: 'background 0.18s, border-color 0.18s, color 0.18s' }}>
-            {scoringAll ? <LoaderCircle size={15} style={{ animation: 'spin 0.8s linear infinite' }} /> : <Sparkles size={15} />} {scoringAll ? 'Scoring…' : selectedIds.size ? `Score ${selectedIds.size}` : 'Score'}
+            {scoringAll ? <LoaderCircle size={15} style={{ animation: 'spin 0.8s linear infinite' }} /> : <Sparkles size={15} />} {scoringAll ? t('jobs.scoring') : selectedIds.size ? `${t('jobs.score')} ${selectedIds.size}` : t('jobs.score')}
           </button>
           <button onClick={deleteSelectedJobs} disabled={!selectedIds.size || bulkDeleting} style={{ height: 38, padding: '0 12px', display: 'inline-flex', alignItems: 'center', gap: 7, border: '0.5px solid', borderColor: selectedIds.size ? '#E5A5A5' : 'var(--border)', borderRadius: 8, background: selectedIds.size ? '#FFF7F7' : 'var(--bg)', color: selectedIds.size ? '#A32D2D' : 'var(--text-muted)', cursor: selectedIds.size && !bulkDeleting ? 'pointer' : 'default', fontSize: 12, fontWeight: 500, opacity: bulkDeleting ? 0.65 : 1 }}>
-            <Trash2 size={15} /> {bulkDeleting ? 'Deleting…' : selectedIds.size ? `Delete ${selectedIds.size}` : 'Delete'}
+            <Trash2 size={15} /> {bulkDeleting ? t('jobs.deleting') : selectedIds.size ? `${t('jobs.delete')} ${selectedIds.size}` : t('jobs.delete')}
           </button>
           <select value={filterStatus} onChange={e => doFilter(e.target.value)} style={{ marginLeft: 'auto', padding: '10px 12px', fontSize: 12, border: '0.5px solid var(--border)', borderRadius: 8, background: 'var(--bg)', color: 'var(--text)', outline: 'none' }}>
-            <option value="all">All statuses</option>
-            {KANBAN_COLS.map(c => <option key={c} value={c}>{COL_LABELS[c]}</option>)}
+            <option value="all">{t('jobs.allStatuses')}</option>
+            {KANBAN_COLS.map(c => <option key={c} value={c}>{colLabel(t, c)}</option>)}
           </select>
           <div style={{ display: 'flex', border: '0.5px solid var(--border)', borderRadius: 8, overflow: 'hidden' }}>
-            {([['list', List], ['kanban', LayoutGrid]] as const).map(([v, Icon]) => <button key={v} onClick={() => setView(v)} aria-label={`${v} view`} style={{ padding: '8px 12px', background: view === v ? 'var(--primary)' : 'var(--bg)', color: view === v ? '#fff' : 'var(--text-muted)', border: 'none', cursor: 'pointer', display: 'inline-flex' }}><Icon size={17} /></button>)}
+            {([['list', List, 'jobs.listView'], ['kanban', LayoutGrid, 'jobs.kanbanView']] as const).map(([v, Icon, labelKey]) => <button key={v} onClick={() => setView(v)} aria-label={t(labelKey)} style={{ padding: '8px 12px', background: view === v ? 'var(--primary)' : 'var(--bg)', color: view === v ? '#fff' : 'var(--text-muted)', border: 'none', cursor: 'pointer', display: 'inline-flex' }}><Icon size={17} /></button>)}
           </div>
         </div>
 {loading ? (
           <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 60 }}>
             <div style={{ display: 'flex', alignItems: 'center', gap: 10, color: 'var(--text-muted)', fontSize: 12 }}>
               <div style={{ width: 20, height: 20, border: '2px solid rgba(79,70,229,0.2)', borderTopColor: 'var(--primary)', borderRadius: '50%', animation: 'spin 0.7s linear infinite' }} />
-              Loading jobs…
+              {t('jobs.loading')}
             </div>
           </div>
         ) : fetchError ? (
           <Card style={{ display: 'grid', minHeight: 200, placeItems: 'center', padding: 32, textAlign: 'center' }}>
             <div style={{ display: 'grid', justifyItems: 'center', maxWidth: 310 }}>
               <span style={{ display: 'grid', width: 42, height: 42, marginBottom: 13, placeItems: 'center', borderRadius: 12, color: '#6b58ed', background: '#f1efff' }}><AlertCircle size={21} /></span>
-              <strong style={{ color: 'var(--text)', fontSize: 14 }}>Couldn’t load your jobs</strong>
-              <p style={{ margin: '8px 0 18px', color: 'var(--text-muted)', fontSize: 12, lineHeight: 1.5 }}>Your applications are unchanged. Check your connection and try again.</p>
-              <Btn variant="primary" onClick={triggerRefresh}>Try again</Btn>
+              <strong style={{ color: 'var(--text)', fontSize: 14 }}>{t('jobs.loadError')}</strong>
+              <p style={{ margin: '8px 0 18px', color: 'var(--text-muted)', fontSize: 12, lineHeight: 1.5 }}>{t('jobs.loadErrorDetail')}</p>
+              <Btn variant="primary" onClick={triggerRefresh}>{t('common.retry')}</Btn>
             </div>
           </Card>
         ) : jobs.length === 0 ? (
           <Card style={{ padding: 48, textAlign: 'center' }}>
             <div style={{ fontSize: 32, marginBottom: 12 }}>📋</div>
-            <div style={{ fontSize: 14, fontWeight: 500, marginBottom: 6 }}>No jobs found</div>
+            <div style={{ fontSize: 14, fontWeight: 500, marginBottom: 6 }}>{t('jobs.noJobs')}</div>
             <div style={{ fontSize: 12, color: 'var(--text-muted)', marginBottom: 16 }}>
-              {search || filterStatus !== 'all' ? 'Try adjusting your search or filter.' : 'Add your first job or let the AI Agent find matches for you.'}
+              {search || filterStatus !== 'all' ? t('jobs.adjustSearch') : t('jobs.addFirst')}
             </div>
-            <Btn variant="primary" onClick={() => { setPrefillStatus(null); setShowAdd(true) }}>+ Add Job</Btn>
+            <Btn variant="primary" onClick={() => { setPrefillStatus(null); setShowAdd(true) }}>{t('jobs.add')}</Btn>
           </Card>
         ) : (
           <>

@@ -122,7 +122,7 @@ async function scoreWithFallback(prompt: string, primary: AiConfig): Promise<{ r
     }
   }
 
-  throw new Error(`当前 AI 配置不可用，备用模型也不可用。${errors.join(' | ')}`)
+  throw new Error(`current AI Configuration not available, Alternate models are also not available.${errors.join(' | ')}`)
 }
 
 function dedupeConfigs(configs: AiConfig[]): AiConfig[] {

@@ -5,6 +5,7 @@ import { SmartMessage } from './SmartMessage'
 import { TranscriptSpecialContent, type TranscriptAction } from './TranscriptSpecialBlocks'
 import type { AgentTranscriptEvent, EventTone } from './session-view-model'
 import { EVENT_TONE_COLOR, eventChrome, eventSubtitle, shouldCollapseByDefault } from './session-view-model'
+import { useI18n } from '@/lib/i18n'
 
 export { SmartMessage } from './SmartMessage'
 
@@ -29,12 +30,13 @@ export function LiveLogTranscriptBlock({ entry, speaker, accent, title }: {
   accent: string
   title?: string
 }) {
+  const { t } = useI18n()
   return (
     <article style={transcriptArticleStyle(accent)}>
       <div style={{ display: 'flex', alignItems: 'baseline', gap: 10, marginBottom: 12 }}>
         <div style={{ fontSize: 13, fontWeight: 750, color: accent }}>{speaker}</div>
         <div style={{ fontSize: 11, color: 'var(--text-muted)' }}>
-          {title ?? (entry.type === 'user_message' ? 'Message' : entry.type === 'error' ? 'Error' : 'Thinking summary')}
+          {title ?? (entry.type === 'user_message' ? t('agent.messageTitle') : entry.type === 'error' ? t('agent.errorTitle') : t('agent.thinkingSummary'))}
         </div>
       </div>
       <SmartMessage text={entry.message} color="var(--text)" />
@@ -50,6 +52,7 @@ export function LiveQuestionTranscriptBlock({ entry, speaker, title, accent, onS
   accent: string
   onSelect: (option: QuestionOptionLike) => Promise<void> | void
 }) {
+  const { t } = useI18n()
   const [pendingValue, setPendingValue] = React.useState<string | null>(null)
   const [error, setError] = React.useState<string | null>(null)
 
@@ -60,7 +63,7 @@ export function LiveQuestionTranscriptBlock({ entry, speaker, title, accent, onS
     try {
       await onSelect(option)
     } catch (err) {
-      setError((err as Error).message || 'Failed to record decision.')
+      setError((err as Error).message || t('agent.decisionFailed'))
     } finally {
       setPendingValue(null)
     }
@@ -102,8 +105,8 @@ export function LiveQuestionTranscriptBlock({ entry, speaker, title, accent, onS
                 fontWeight: 650,
               }}
             >
-              <span>{pendingValue === option.value ? 'Working...' : option.label}</span>
-              {option.action && <span style={{ color: 'var(--text-muted)', fontSize: 10 }}>will update setting</span>}
+              <span>{pendingValue === option.value ? t('agent.working') : option.label}</span>
+              {option.action && <span style={{ color: 'var(--text-muted)', fontSize: 10 }}>{t('agent.willUpdateSetting')}</span>}
             </button>
           ))}
         </div>
@@ -115,7 +118,7 @@ export function LiveQuestionTranscriptBlock({ entry, speaker, title, accent, onS
       )}
       {entry.answered && (
         <div style={{ marginTop: 8, fontSize: 11, color: 'var(--c-success)', fontWeight: 650 }}>
-          Decision recorded.
+          {t('agent.decisionRecorded')}
         </div>
       )}
       <TranscriptTime time={entry.time} />

@@ -9,7 +9,7 @@ test("login -> dashboard -> search jobs -> save one -> saved list", async ({ app
   await app.installMocks();
   await app.login();
 
-  await app.goTo(/Search|搜索/);
+  await app.goTo(/Search|search/);
   await page.getByPlaceholder(/Search jobs/).fill("Backend Engineer Dublin");
   await page.getByRole("button", { name: /^Search$/ }).click();
 
@@ -17,7 +17,7 @@ test("login -> dashboard -> search jobs -> save one -> saved list", async ({ app
   await page.getByTitle("Save to tracker").click();
   await expect(page.getByText("✓").first()).toBeVisible();
 
-  await app.goTo(/^(My Jobs|我的职位)(?: \d+)?$/);
+  await app.goTo(/^(My Jobs|my position)(?: \d+)?$/);
   await page.getByPlaceholder("Search jobs…").fill("Acme");
   await expect(page.getByText("Acme Systems", { exact: true }).last()).toBeVisible();
   await expect(page.getByText("Backend Engineer")).toBeVisible();

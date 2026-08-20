@@ -1,11 +1,13 @@
 import type { CSSProperties, ReactNode } from 'react'
 import { Check, ChevronRight, ExternalLink, LoaderCircle, Search } from 'lucide-react'
 import { C, type PopupLabels } from './popup-constants'
+import { getLabels } from './popup-utils'
 
 export function ActionRow({ icon, title, subtitle, onClick, loading, success }: { icon: ReactNode; title: string; subtitle: string; onClick: () => void; loading?: boolean; success?: boolean }) {
+  const labels = getLabels()
   return <button type="button" onClick={onClick} disabled={loading || success} style={{ display: 'flex', alignItems: 'center', gap: 10, width: '100%', padding: '10px 10px', border: 'none', background: C.panel, textAlign: 'left', cursor: loading || success ? 'default' : 'pointer', color: C.navy, opacity: loading ? 0.72 : 1 }}>
     <span style={{ width: 36, height: 36, display: 'grid', placeItems: 'center', flexShrink: 0, border: `1px solid ${success ? '#BFE8D4' : C.border}`, borderRadius: 10, color: success ? C.green : C.primary, background: success ? C.greenBg : '#FCFCFF' }}>{success ? <Check size={18} strokeWidth={2.3} /> : icon}</span>
-    <span style={{ flex: 1, minWidth: 0 }}><strong style={{ display: 'block', fontSize: 13, lineHeight: 1.25, fontWeight: 650 }}>{loading ? 'Analyzing…' : title}</strong><small style={{ display: 'block', marginTop: 3, fontSize: 10, lineHeight: 1.3, color: C.muted, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{subtitle}</small></span>
+    <span style={{ flex: 1, minWidth: 0 }}><strong style={{ display: 'block', fontSize: 13, lineHeight: 1.25, fontWeight: 650 }}>{loading ? labels.aiReviewing : title}</strong><small style={{ display: 'block', marginTop: 3, fontSize: 10, lineHeight: 1.3, color: C.muted, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{subtitle}</small></span>
     {!loading && !success && <ChevronRight size={18} strokeWidth={1.9} color={C.muted} />}
     {loading && <LoaderCircle size={17} color={C.primary} className="am-spin" />}
   </button>

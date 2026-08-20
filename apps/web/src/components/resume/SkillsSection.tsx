@@ -2,6 +2,7 @@
 
 import { useState } from 'react'
 import { SectionHeader, type DragHandleProps } from './SectionHeader'
+import { useI18n } from '@/lib/i18n'
 
 export function SkillsSection({ skills, matchedKeywords, onChange, dragHandleProps, onRemove, flash }: {
   skills:           string[]
@@ -11,6 +12,7 @@ export function SkillsSection({ skills, matchedKeywords, onChange, dragHandlePro
   onRemove?:        () => void
   flash?:           boolean
 }) {
+  const { t } = useI18n()
   const [collapsed, setCollapsed] = useState(false)
   const [adding,    setAdding]    = useState(false)
   const [newSkill,  setNewSkill]  = useState('')
@@ -24,7 +26,7 @@ export function SkillsSection({ skills, matchedKeywords, onChange, dragHandlePro
   return (
     <div style={{ marginBottom: 20 }}>
       <SectionHeader
-        title="SKILLS"
+      title={t('resume.skills')}
         count={skills.length}
         collapsed={collapsed}
         onToggle={() => setCollapsed(v => !v)}
@@ -50,11 +52,11 @@ export function SkillsSection({ skills, matchedKeywords, onChange, dragHandlePro
               onChange={e => setNewSkill(e.target.value)}
               onKeyDown={e => { if (e.key === 'Enter') commit(); if (e.key === 'Escape') setAdding(false) }}
               onBlur={commit}
-              placeholder="Skill…"
+              placeholder={t('resume.skillPlaceholder')}
               style={{ fontSize: 11, border: '0.5px solid var(--primary)', borderRadius: 5, padding: '3px 8px', outline: 'none', width: 100, color: 'var(--text)', background: 'var(--bg)' }} />
           )}
           {skills.length === 0 && !adding && (
-            <span style={{ fontSize: 12, color: 'var(--text-muted)' }}>No skills added — click + Add</span>
+            <span style={{ fontSize: 12, color: 'var(--text-muted)' }}>{t('resume.noSkills')}</span>
           )}
         </div>
       )}

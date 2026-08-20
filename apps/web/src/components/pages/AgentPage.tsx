@@ -7,16 +7,17 @@ import type { AgentConfig, Activity, NotificationPreferences, UserProfile } from
 import { useApi, apiMutate, fmtRelative } from '@/lib/hooks'
 import { APPLYMATE_BACKING, MODEL_CATALOGUE, PROVIDER_LABELS, type AiConfig, type UserAiSettings } from '@/lib/model-router-client'
 import { readNotificationPreferences } from '@/lib/settings-preferences'
+import { useI18n } from '@/lib/i18n'
 
 // ── Stage definitions ─────────────────────────────────────────────────────────
 
 const STAGES = [
-  { key: 'scout',   icon: '🔍', label: '侦察' },
-  { key: 'analyze', icon: '🤖', label: '分析' },
-  { key: 'prepare', icon: '📝', label: '准备' },
-  { key: 'gate',    icon: '🚦', label: '审核' },
-  { key: 'execute', icon: '🚀', label: '执行' },
-  { key: 'audit',   icon: '✅', label: '验收' },
+  { key: 'scout',   icon: '🔍', label: 'reconnaissance' },
+  { key: 'analyze', icon: '🤖', label: 'analyze' },
+  { key: 'prepare', icon: '📝', label: 'Prepare' },
+  { key: 'gate',    icon: '🚦', label: 'Review' },
+  { key: 'execute', icon: '🚀', label: 'implement' },
+  { key: 'audit',   icon: '✅', label: 'acceptance' },
 ] as const
 
 type StageKey = typeof STAGES[number]['key']
@@ -36,9 +37,11 @@ interface LogEntry {
 function StagePipeline({
   statuses,
   current,
+  t,
 }: {
   statuses: Record<StageKey, StageStatus>
   current: StageKey | null
+  t: (key: string) => string
 }) {
   return (
     <div style={{ display: 'flex', alignItems: 'center', gap: 0, padding: '12px 14px', background: 'var(--bg-secondary)', borderBottom: '0.5px solid var(--border)' }}>
@@ -59,7 +62,7 @@ function StagePipeline({
               }}>
                 {st === 'done' ? '✓' : s.icon}
               </div>
-              <span style={{ fontSize: 9, color, fontWeight: isCurrent ? 600 : 400 }}>{s.label}</span>
+              <span style={{ fontSize: 9, color, fontWeight: isCurrent ? 600 : 400 }}>{t(`agent.${s.key === 'gate' ? 'review' : s.key}`)}</span>
             </div>
             {i < STAGES.length - 1 && (
               <div style={{ flex: 1, height: 1.5, background: st === 'done' ? 'var(--c-success)' : 'var(--border)', transition: 'background 0.3s', margin: '0 2px', marginBottom: 14 }} />
@@ -73,7 +76,7 @@ function StagePipeline({
 
 // ── RunPanel ──────────────────────────────────────────────────────────────────
 
-function RunPanel({ onClose }: { onClose: () => void }) {
+function RunPanel({ onClose, t }: { onClose: () => void; t: (key: string) => string }) {
   const toast     = useToast()
   const logEndRef = useRef<HTMLDivElement>(null)
   const esRef     = useRef<EventSource | null>(null)
@@ -124,17 +127,17 @@ function RunPanel({ onClose }: { onClose: () => void }) {
 
     es.addEventListener('start', e => {
       const d = JSON.parse(e.data)
-      addLog({ type: 'start', message: `🚀 Starting pipeline — ${d.total} saved job${d.total !== 1 ? 's' : ''} queued`, time: new Date() })
+      addLog({ type: 'start', message: `🚀 ${t('agent.log.starting')} — ${d.total} ${t('agent.log.savedJobsQueued')}`, time: new Date() })
     })
 
     es.addEventListener('job_start', e => {
       const d = JSON.parse(e.data)
-      addLog({ type: 'info', message: `  ⟳ Scoring ${d.company} · ${d.role}…`, time: new Date() })
+      addLog({ type: 'info', message: `  ⟳ ${t('agent.log.scoring')} ${d.company} · ${d.role}…`, time: new Date() })
     })
 
     es.addEventListener('job_done', e => {
       const d = JSON.parse(e.data)
-      const applied = d.autoApplied ? ' · ✓ Applied' : ''
+      const applied = d.autoApplied ? ` · ✓ ${t('agent.log.applied')}` : ''
       const kws = d.matchedKeywords?.length ? ` [${d.matchedKeywords.slice(0, 3).join(', ')}]` : ''
       addLog({
         type:    d.score >= 70 ? 'job_done' : 'job_skip',
@@ -165,7 +168,7 @@ function RunPanel({ onClose }: { onClose: () => void }) {
       setCurrentStage(null)
       addLog({
         type: 'done',
-        message: `✓ Pipeline complete — ${d.processed} scored, ${d.queued ?? 0} dispatched, ${d.applied} confirmed, ${d.pending} pending review, ${d.skipped} skipped`,
+        message: `✓ ${t('agent.log.pipelineComplete')} — ${d.processed} ${t('agent.summaryScored').toLowerCase()}, ${d.queued ?? 0} ${t('agent.log.dispatched')}, ${d.applied} ${t('agent.log.confirmed')}, ${d.pending} ${t('agent.log.pendingReview')}, ${d.skipped} ${t('agent.log.skipped')}`,
         time: new Date(),
       })
       setRunning(false)
@@ -182,9 +185,9 @@ function RunPanel({ onClose }: { onClose: () => void }) {
     es.addEventListener('error', e => {
       try {
         const d = JSON.parse((e as MessageEvent).data ?? '{}')
-        addLog({ type: 'error', message: `✗ ${d.message ?? 'Agent run failed'}`, time: new Date() })
+        addLog({ type: 'error', message: `✗ ${d.message ?? t('agent.log.runFailed')}`, time: new Date() })
       } catch {
-        addLog({ type: 'error', message: '✗ Connection lost', time: new Date() })
+        addLog({ type: 'error', message: `✗ ${t('agent.log.connectionLost')}`, time: new Date() })
       }
       setCurrentStage(null)
       setRunning(false)
@@ -199,7 +202,7 @@ function RunPanel({ onClose }: { onClose: () => void }) {
     setRunning(false)
     setDone(true)
     setCurrentStage(null)
-    addLog({ type: 'info', message: '— Run stopped by user', time: new Date() })
+    addLog({ type: 'info', message: `— ${t('agent.log.runStopped')}`, time: new Date() })
   }
 
   function logColor(entry: LogEntry): string {
@@ -223,34 +226,34 @@ function RunPanel({ onClose }: { onClose: () => void }) {
       {/* Header */}
       <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '12px 14px', borderBottom: '0.5px solid var(--border)', background: 'var(--bg-secondary)' }}>
         <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-          <span style={{ fontSize: 12, fontWeight: 500 }}>Agent Pipeline</span>
+          <span style={{ fontSize: 12, fontWeight: 500 }}>{t('agent.pipeline')}</span>
           {running && (
             <div style={{ display: 'flex', alignItems: 'center', gap: 5 }}>
               <div style={{ width: 8, height: 8, borderRadius: '50%', background: 'var(--c-success)', boxShadow: '0 0 6px var(--c-success)', animation: 'pulse 1.5s ease-in-out infinite' }} />
-              <span style={{ fontSize: 10, color: 'var(--c-success)' }}>Running…</span>
+              <span style={{ fontSize: 10, color: 'var(--c-success)' }}>{t('agent.running')}…</span>
             </div>
           )}
-          {done && !running && <span style={{ fontSize: 10, color: 'var(--text-muted)' }}>Finished</span>}
+          {done && !running && <span style={{ fontSize: 10, color: 'var(--text-muted)' }}>{t('common.done')}</span>}
         </div>
         <div style={{ display: 'flex', gap: 6 }}>
-          {!running && <Btn small variant="primary" onClick={startRun}>{done ? '↻ Run Again' : '▶ Start Run'}</Btn>}
-          {running   && <Btn small variant="danger"  onClick={stopRun}>⏹ Stop</Btn>}
+          {!running && <Btn small variant="primary" onClick={startRun}>{done ? `↻ ${t('agent.runNow')}` : `▶ ${t('agent.runNow')}`}</Btn>}
+          {running   && <Btn small variant="danger"  onClick={stopRun}>{t('common.stop')}</Btn>}
           <Btn small variant="ghost" onClick={onClose}>✕</Btn>
         </div>
       </div>
 
       {/* Stage progress bar */}
-      <StagePipeline statuses={stageStatuses} current={currentStage} />
+      <StagePipeline statuses={stageStatuses} current={currentStage} t={t} />
 
       {/* Summary row */}
       {summary && (
         <div style={{ display: 'flex', gap: 0, borderBottom: '0.5px solid var(--border)' }}>
           {[
-            { label: 'Scored',   value: summary.processed, color: 'var(--primary)'   },
-            { label: 'Dispatched', value: summary.queued, color: 'var(--primary)' },
-            { label: 'Confirmed', value: summary.applied, color: 'var(--c-success)' },
-            { label: 'Review',   value: summary.pending,   color: 'var(--c-warning)' },
-            { label: 'Skipped',  value: summary.skipped,   color: 'var(--text-muted)' },
+            { label: t('agent.summaryScored'),   value: summary.processed, color: 'var(--primary)'   },
+            { label: t('agent.summaryDispatched'), value: summary.queued, color: 'var(--primary)' },
+            { label: t('agent.summaryConfirmed'), value: summary.applied, color: 'var(--c-success)' },
+            { label: t('agent.summaryReview'),   value: summary.pending,   color: 'var(--c-warning)' },
+            { label: t('agent.summarySkipped'),  value: summary.skipped,   color: 'var(--text-muted)' },
           ].map((s, i) => (
             <div key={s.label} style={{ flex: 1, textAlign: 'center', padding: '8px 0', borderRight: i < 3 ? '0.5px solid var(--border)' : 'none' }}>
               <div style={{ fontSize: 18, fontWeight: 600, color: s.color }}>{s.value}</div>
@@ -264,7 +267,7 @@ function RunPanel({ onClose }: { onClose: () => void }) {
       <div style={{ maxHeight: 220, overflowY: 'auto', padding: '8px 14px', background: 'var(--bg)', fontFamily: 'monospace' }}>
         {log.length === 0 ? (
           <div style={{ fontSize: 11, color: 'var(--text-muted)', padding: '12px 0', textAlign: 'center' }}>
-            Click ▶ Start Run to launch the 6-stage pipeline.
+            {t('agent.startRunHint')}
           </div>
         ) : log.map((entry, i) => (
           <div key={i} style={{ display: 'flex', gap: 10, marginBottom: 3, alignItems: 'flex-start' }}>
@@ -353,6 +356,7 @@ function ModelSelector({ value, onChange }: {
   value: { provider: string; model: string }
   onChange: (v: { provider: string; model: string }) => void
 }) {
+  const { t } = useI18n()
   const byProvider = MODEL_CATALOGUE.filter(m => m.provider !== 'custom').reduce<Record<string, typeof MODEL_CATALOGUE>>((acc, m) => {
     if (!acc[m.provider]) acc[m.provider] = []
     acc[m.provider].push(m)
@@ -369,7 +373,7 @@ function ModelSelector({ value, onChange }: {
       style={{ fontSize: 11, padding: '3px 6px', border: '0.5px solid var(--border)', borderRadius: 5, background: 'var(--bg)', color: 'var(--text)', outline: 'none' }}
     >
       {value.provider === 'custom' && (
-        <option value={`${value.provider}::${value.model}`}>Custom (edit in Settings)</option>
+        <option value={`${value.provider}::${value.model}`}>{t('agent.customEdit')}</option>
       )}
       {Object.entries(byProvider).map(([provider, models]) => (
         <optgroup key={provider} label={PROVIDER_LABELS[provider as keyof typeof PROVIDER_LABELS] ?? provider}>
@@ -422,6 +426,7 @@ const DEFAULT_CFG: UiCfg = {
 }
 
 export function AgentPage() {
+  const { t } = useI18n()
   const toast = useToast()
 
   const { data: agentData, loading: agentLoading } = useApi<AgentConfig>('/api/agent')
@@ -552,18 +557,18 @@ export function AgentPage() {
 
   return (
     <div style={{ flex: 1, overflowY: 'auto', background: 'var(--bg-tertiary)', display: 'flex', flexDirection: 'column' }}>
-      <TopBar title="AI Agent">
+      <TopBar title={t('agent.title')}>
         <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
           <span style={{ width: 7, height: 7, borderRadius: '50%', background: running ? 'var(--c-success)' : 'var(--text-muted)', boxShadow: running ? '0 0 6px var(--c-success)' : 'none' }} />
           <span style={{ fontSize: 11, color: running ? 'var(--c-success)' : 'var(--text-muted)', fontWeight: 500 }}>
-            {running ? 'Running' : 'Paused'}
+            {running ? t('agent.running') : t('agent.paused')}
           </span>
         </div>
         <Btn variant="ghost" onClick={() => setShowRunPanel(s => !s)}>
-          {showRunPanel ? '✕ Close Log' : '▶ Run Now'}
+          {showRunPanel ? `✕ ${t('agent.closeLog')}` : `▶ ${t('agent.runNow')}`}
         </Btn>
         <Btn variant={running ? 'danger' : 'primary'} onClick={toggleRunning}>
-          {running ? '⏸ Pause Agent' : '▶ Resume Agent'}
+          {running ? `⏸ ${t('agent.pause')}` : `▶ ${t('agent.resume')}`}
         </Btn>
       </TopBar>
 
@@ -572,7 +577,7 @@ export function AgentPage() {
         {/* Status card */}
         <Card style={{ padding: 16 }}>
           {agentLoading ? (
-            <div style={{ textAlign: 'center', padding: '16px 0', fontSize: 12, color: 'var(--text-muted)' }}>Loading agent status…</div>
+            <div style={{ textAlign: 'center', padding: '16px 0', fontSize: 12, color: 'var(--text-muted)' }}>{t('agent.loading')}</div>
           ) : (
             <>
               <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4,1fr)', gap: 0, marginBottom: 14 }}>
@@ -591,7 +596,7 @@ export function AgentPage() {
 
               <div style={{ marginBottom: 12 }}>
                 <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 4 }}>
-                  <span style={{ fontSize: 11, color: 'var(--text-muted)' }}>Min match score</span>
+                  <span style={{ fontSize: 11, color: 'var(--text-muted)' }}>{t('agent.minScore')}</span>
                   <span style={{ fontSize: 11, fontWeight: 500 }}>{cfg.minScore}%</span>
                 </div>
                 <div style={{ height: 6, background: 'var(--bg-tertiary)', borderRadius: 3, overflow: 'hidden' }}>
@@ -602,7 +607,7 @@ export function AgentPage() {
               {/* Activity log */}
               <div style={{ background: 'var(--bg-secondary)', borderRadius: 6, padding: 10, maxHeight: 140, overflowY: 'auto' }}>
                 {activities.length === 0 ? (
-                  <div style={{ fontSize: 11, color: 'var(--text-muted)', textAlign: 'center', padding: '8px 0' }}>No activity yet</div>
+                  <div style={{ fontSize: 11, color: 'var(--text-muted)', textAlign: 'center', padding: '8px 0' }}>{t('agent.noActivity')}</div>
                 ) : activities.map(a => (
                   <div key={a.id} style={{ display: 'flex', gap: 8, marginBottom: 6 }}>
                     <span style={{ fontSize: 10, color: 'var(--text-muted)', flexShrink: 0, fontVariantNumeric: 'tabular-nums' }}>
@@ -617,81 +622,81 @@ export function AgentPage() {
         </Card>
 
         {/* Run panel */}
-        {showRunPanel && <RunPanel onClose={() => setShowRunPanel(false)} />}
+        {showRunPanel && <RunPanel onClose={() => setShowRunPanel(false)} t={t} />}
 
         {/* Config grid */}
         <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 16 }}>
           <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
-            <ConfigCard title="Job Matching Rules">
-              <SliderRow label="Minimum match score" value={cfg.minScore} min={40} max={100} onChange={v => set('minScore', v)} unit="%" />
+            <ConfigCard title={t('agent.jobMatchingRules')}>
+              <SliderRow label={t('agent.minMatchScore')} value={cfg.minScore} min={40} max={100} onChange={v => set('minScore', v)} unit="%" />
               <div style={{ padding: '10px 0', borderBottom: '0.5px solid var(--border)' }}>
-                <div style={{ fontSize: 11, color: 'var(--text-muted)', marginBottom: 6 }}>Target roles</div>
-                <PillInput values={cfg.targetRoles} onChange={v => set('targetRoles', v)} placeholder="Add role…" />
+                <div style={{ fontSize: 11, color: 'var(--text-muted)', marginBottom: 6 }}>{t('agent.targetRoles')}</div>
+                <PillInput values={cfg.targetRoles} onChange={v => set('targetRoles', v)} placeholder={t('agent.addRole')} />
               </div>
               <div style={{ padding: '10px 0', borderBottom: '0.5px solid var(--border)' }}>
-                <div style={{ fontSize: 11, color: 'var(--text-muted)', marginBottom: 6 }}>Target locations</div>
-                <PillInput values={cfg.targetLocations} onChange={v => set('targetLocations', v)} placeholder="Add location…" />
+                <div style={{ fontSize: 11, color: 'var(--text-muted)', marginBottom: 6 }}>{t('agent.targetLocations')}</div>
+                <PillInput values={cfg.targetLocations} onChange={v => set('targetLocations', v)} placeholder={t('agent.addLocation')} />
               </div>
-              <SliderRow label="Min salary" value={cfg.salaryMin} min={20000} max={150000} step={5000} onChange={v => set('salaryMin', v)} unit="€" />
-              <SliderRow label="Max salary" value={cfg.salaryMax} min={20000} max={150000} step={5000} onChange={v => set('salaryMax', v)} unit="€" />
+              <SliderRow label={t('agent.minSalary')} value={cfg.salaryMin} min={20000} max={150000} step={5000} onChange={v => set('salaryMin', v)} unit="€" />
+              <SliderRow label={t('agent.maxSalary')} value={cfg.salaryMax} min={20000} max={150000} step={5000} onChange={v => set('salaryMax', v)} unit="€" />
             </ConfigCard>
 
-            <ConfigCard title="Application Limits">
+            <ConfigCard title={t('agent.applicationLimits')}>
               <div style={{ padding: '10px 0', borderBottom: '0.5px solid var(--border)', display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
-                <span style={{ fontSize: 12 }}>Max applications / day</span>
+                <span style={{ fontSize: 12 }}>{t('agent.maxApplications')}</span>
                 <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
                   <button onClick={() => set('maxPerDay', Math.max(1, cfg.maxPerDay - 1))} style={{ width: 24, height: 24, borderRadius: 4, border: '0.5px solid var(--border)', background: 'var(--bg-secondary)', cursor: 'pointer', fontSize: 14 }}>−</button>
                   <span style={{ fontSize: 13, fontWeight: 500, minWidth: 24, textAlign: 'center' }}>{cfg.maxPerDay}</span>
                   <button onClick={() => set('maxPerDay', Math.min(50, cfg.maxPerDay + 1))} style={{ width: 24, height: 24, borderRadius: 4, border: '0.5px solid var(--border)', background: 'var(--bg-secondary)', cursor: 'pointer', fontSize: 14 }}>+</button>
                 </div>
               </div>
-              <Toggle label="Skip if already processed today" sub="Deduplication is enforced by the server for every source" value={true} onChange={() => undefined} disabled />
+              <Toggle label={t('agent.skipProcessed')} sub={t('agent.deduplication')} value={true} onChange={() => undefined} disabled />
             </ConfigCard>
           </div>
 
           <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
-            <ConfigCard title="Application Agent Settings">
-              <Toggle label="Auto-prepare when match ≥ min score" sub="Searches, scores, and prepares materials in parallel; it never submits a job." value={cfg.autoApply} onChange={v => set('autoApply', v)} />
-              <Toggle label="Review and final authorization" sub="Always required before a browser task starts. CAPTCHA, login, and MFA require your takeover." value={true} onChange={() => undefined} disabled />
-              <Toggle label="Auto-generate cover letter" sub="AI writes a tailored cover letter per job" value={cfg.autoCoverLetter} onChange={v => set('autoCoverLetter', v)} />
+            <ConfigCard title={t('agent.settings')}>
+              <Toggle label={t('agent.autoPrepare')} sub={t('agent.autoPrepareHint')} value={cfg.autoApply} onChange={v => set('autoApply', v)} />
+              <Toggle label={t('agent.finalAuthorization')} sub={t('agent.finalAuthorizationHint')} value={true} onChange={() => undefined} disabled />
+              <Toggle label={t('agent.autoCoverLetter')} sub={t('agent.coverLetterHint')} value={cfg.autoCoverLetter} onChange={v => set('autoCoverLetter', v)} />
               {cfg.autoCoverLetter && (
                 <div style={{ padding: '10px 0', borderBottom: '0.5px solid var(--border)', display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
-                  <span style={{ fontSize: 12 }}>Cover letter tone</span>
+                  <span style={{ fontSize: 12 }}>{t('agent.coverTone')}</span>
                   <select value={cfg.coverTone} onChange={e => set('coverTone', e.target.value)}
                     style={{ fontSize: 11, padding: '3px 6px', border: '0.5px solid var(--border)', borderRadius: 5, background: 'var(--bg)', color: 'var(--text)', outline: 'none' }}>
-                    <option value="professional">Professional</option>
-                    <option value="confident">Confident</option>
-                    <option value="concise">Concise</option>
+                    <option value="professional">{t('agent.professional')}</option>
+                    <option value="confident">{t('agent.confident')}</option>
+                    <option value="concise">{t('agent.concise')}</option>
                   </select>
                 </div>
               )}
-              <Toggle label="Use tailored CV per role" sub="Logs missing keywords for each application" value={cfg.useTailoredCV} onChange={v => set('useTailoredCV', v)} />
+              <Toggle label={t('agent.tailoredCv')} sub={t('agent.tailoredCvHint')} value={cfg.useTailoredCV} onChange={v => set('useTailoredCV', v)} />
             </ConfigCard>
 
-            <ConfigCard title="Notifications">
-              <Toggle label="Notify on auto-apply"  value={cfg.notifyApply}      onChange={v => set('notifyApply', v)} />
-              <Toggle label="Notify on rejection"    value={cfg.notifyReject}     onChange={v => set('notifyReject', v)} />
-              <Toggle label="Weekly summary email"   value={cfg.weeklySummary}    onChange={v => set('weeklySummary', v)} />
-              <Toggle label="Follow-up reminders"    value={cfg.followUpReminder} onChange={v => set('followUpReminder', v)} />
+            <ConfigCard title={t('agent.notifications')}>
+              <Toggle label={t('agent.notifyApply')} value={cfg.notifyApply} onChange={v => set('notifyApply', v)} />
+              <Toggle label={t('agent.notifyReject')} value={cfg.notifyReject} onChange={v => set('notifyReject', v)} />
+              <Toggle label={t('agent.weeklySummary')} value={cfg.weeklySummary} onChange={v => set('weeklySummary', v)} />
+              <Toggle label={t('agent.followUpReminders')} value={cfg.followUpReminder} onChange={v => set('followUpReminder', v)} />
               {cfg.followUpReminder && (
                 <div style={{ padding: '8px 0', display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
-                  <span style={{ fontSize: 11, color: 'var(--text-muted)' }}>Remind after (days)</span>
+                  <span style={{ fontSize: 11, color: 'var(--text-muted)' }}>{t('agent.remindAfter')}</span>
                   <input type="number" value={cfg.followUpDays} min={1} max={30} onChange={e => set('followUpDays', Number(e.target.value))}
                     style={{ width: 48, padding: '3px 6px', fontSize: 11, border: '0.5px solid var(--border)', borderRadius: 5, background: 'var(--bg)', color: 'var(--text)', outline: 'none' }} />
                 </div>
               )}
             </ConfigCard>
 
-            <ConfigCard title="AI Model">
+            <ConfigCard title={t('agent.aiModel')}>
               <div style={{ padding: '10px 0', borderBottom: '0.5px solid var(--border)', display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
-                <span style={{ fontSize: 12 }}>Active model</span>
+                <span style={{ fontSize: 12 }}>{t('agent.activeModel')}</span>
                 <ModelSelector
                   value={{ provider: cfg.aiProvider, model: cfg.aiModel }}
                   onChange={v => { set('aiProvider', v.provider); set('aiModel', v.model) }}
                 />
               </div>
               <div style={{ padding: '8px 0' }}>
-                <div style={{ fontSize: 10, color: 'var(--text-muted)' }}>API Key (optional — uses server key if empty)</div>
+                <div style={{ fontSize: 10, color: 'var(--text-muted)' }}>{t('agent.apiKeyOptional')}</div>
                 <input type="password" value={cfg.aiApiKey} onChange={e => set('aiApiKey', e.target.value)} placeholder="sk-…"
                   style={{ width: '100%', marginTop: 4, padding: '5px 8px', fontSize: 11, border: '0.5px solid var(--border)', borderRadius: 5, background: 'var(--bg)', color: 'var(--text)', outline: 'none', boxSizing: 'border-box' }} />
               </div>
@@ -700,22 +705,22 @@ export function AgentPage() {
         </div>
 
         <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 16 }}>
-          <ConfigCard title="Companies to Avoid">
+          <ConfigCard title={t('agent.companiesAvoid')}>
             <div style={{ padding: '10px 0' }}>
-              <PillInput values={cfg.excludeCompanies} onChange={v => set('excludeCompanies', v)} placeholder="Add company…" />
+              <PillInput values={cfg.excludeCompanies} onChange={v => set('excludeCompanies', v)} placeholder={t('agent.addCompany')} />
             </div>
           </ConfigCard>
-          <ConfigCard title="Priority Companies (Always Apply)">
+          <ConfigCard title={t('agent.priorityCompanies')}>
             <div style={{ padding: '10px 0' }}>
-              <PillInput values={cfg.priorityCompanies} onChange={v => set('priorityCompanies', v)} placeholder="Add company…" />
+              <PillInput values={cfg.priorityCompanies} onChange={v => set('priorityCompanies', v)} placeholder={t('agent.addCompany')} />
             </div>
           </ConfigCard>
         </div>
 
         <div style={{ display: 'flex', gap: 8, justifyContent: 'flex-end', paddingBottom: 8 }}>
-          <Btn variant="ghost" onClick={() => { setCfg(DEFAULT_CFG); toast.info('Reset', 'Settings restored to defaults') }}>Reset to defaults</Btn>
+          <Btn variant="ghost" onClick={() => { setCfg(DEFAULT_CFG); toast.info(t('agent.reset'), t('agent.resetDetail')) }}>{t('agent.resetDefaults')}</Btn>
           <Btn variant="primary" onClick={saveConfig} disabled={saving}>
-            {saving ? 'Saving…' : 'Save changes'}
+            {saving ? t('common.saving') : t('agent.saveChanges')}
           </Btn>
         </div>
       </div>

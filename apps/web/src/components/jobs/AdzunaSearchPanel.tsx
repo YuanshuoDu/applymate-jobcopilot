@@ -4,6 +4,7 @@ import React, { useState } from 'react'
 import { Btn, CompanyLogo, INPUT_STYLE, ScorePill, useToast } from '@/components/ui'
 import { apiMutate } from '@/lib/hooks'
 import type { Job } from '@/lib/types'
+import { useI18n } from '@/lib/i18n'
 
 interface AdzunaResult {
   id:            string
@@ -97,6 +98,7 @@ async function runAiScore(
 }
 
 export function AdzunaSearchPanel({ variant = 'panel', onJobSaved, onClose }: Props) {
+  const { t } = useI18n()
   const isPage = variant === 'page'
   const toast  = useToast()
 
@@ -154,7 +156,7 @@ export function AdzunaSearchPanel({ variant = 'panel', onJobSaved, onClose }: Pr
     setPage(next)
     setLoadingMore(true)
     try { await doSearch(next, true) }
-    catch { toast.error('Load more failed', 'Could not fetch next page') }
+    catch { toast.error(t('adzuna.loadMoreFailed'), t('adzuna.loadMoreError')) }
     finally { setLoadingMore(false) }
   }
 
@@ -206,10 +208,10 @@ export function AdzunaSearchPanel({ variant = 'panel', onJobSaved, onClose }: Pr
       {!isPage && (
         <div style={{ padding: '12px 16px', borderBottom: '0.5px solid var(--border)', display: 'flex', alignItems: 'center', justifyContent: 'space-between', background: 'var(--bg-secondary)' }}>
           <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-            <span style={{ fontSize: 13, fontWeight: 600 }}>🌍 Search Jobs via Adzuna</span>
+            <span style={{ fontSize: 13, fontWeight: 600 }}>🌍 {t('jobs.adzunaTitle')}</span>
             {searched && !searching && (
               <span style={{ fontSize: 10, color: 'var(--text-muted)', background: 'var(--bg)', border: '0.5px solid var(--border)', borderRadius: 999, padding: '1px 8px' }}>
-                {total.toLocaleString()} results
+                {t('jobs.resultsCount').replace('{count}', total.toLocaleString())}
               </span>
             )}
           </div>
@@ -222,27 +224,27 @@ export function AdzunaSearchPanel({ variant = 'panel', onJobSaved, onClose }: Pr
       {/* Search form */}
       <form onSubmit={handleSearch} style={{ padding: isPage ? '0 0 16px' : 16, display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'flex-end' }}>
         <div style={{ flex: '2 1 200px' }}>
-          <label style={labelSt}>Keywords *</label>
-          <input style={INPUT_STYLE} value={q} onChange={e => setQ(e.target.value)} placeholder="e.g. Software Engineer, React" />
+          <label style={labelSt}>{t('jobs.keywords')} *</label>
+          <input style={INPUT_STYLE} value={q} onChange={e => setQ(e.target.value)} placeholder={t('jobs.softwareReactExample')} />
         </div>
         <div style={{ flex: '1 1 140px' }}>
-          <label style={labelSt}>Location</label>
-          <input style={INPUT_STYLE} value={where} onChange={e => setWhere(e.target.value)} placeholder="e.g. Berlin, London" />
+          <label style={labelSt}>{t('jobs.location')}</label>
+          <input style={INPUT_STYLE} value={where} onChange={e => setWhere(e.target.value)} placeholder={t('jobs.berlinLondonExample')} />
         </div>
         <div style={{ width: 100 }}>
-          <label style={labelSt}>Country</label>
+          <label style={labelSt}>{t('jobs.country')}</label>
           <select style={INPUT_STYLE} value={country} onChange={e => setCountry(e.target.value)}>
             {COUNTRIES.map(c => <option key={c.code} value={c.code}>{c.label}</option>)}
           </select>
         </div>
         <div style={{ width: 120 }}>
-          <label style={labelSt}>Type</label>
+          <label style={labelSt}>{t('jobs.type')}</label>
           <select style={INPUT_STYLE} value={jobType} onChange={e => setJobType(e.target.value)}>
-            <option value="">Any</option>
-            <option value="fulltime">Full-time</option>
-            <option value="parttime">Part-time</option>
-            <option value="contract">Contract</option>
-            <option value="permanent">Permanent</option>
+            <option value="">{t('jobs.any')}</option>
+            <option value="fulltime">{t('jobs.fullTime')}</option>
+            <option value="parttime">{t('jobs.partTime')}</option>
+            <option value="contract">{t('jobs.contract')}</option>
+            <option value="permanent">{t('jobs.permanent')}</option>
           </select>
         </div>
         <button type="submit" disabled={searching || !q.trim()} style={{
@@ -266,7 +268,7 @@ export function AdzunaSearchPanel({ variant = 'panel', onJobSaved, onClose }: Pr
           {searching ? (
             <div style={{ padding: 40, textAlign: 'center' }}>
               <div style={{ width: 22, height: 22, border: '2px solid rgba(79,70,229,0.20)', borderTopColor: 'var(--primary)', borderRadius: '50%', animation: 'spin 0.7s linear infinite', margin: '0 auto 10px' }} />
-              <div style={{ fontSize: 12, color: 'var(--text-muted)' }}>Searching Adzuna…</div>
+              <div style={{ fontSize: 12, color: 'var(--text-muted)' }}>{t('jobs.searchingAdzuna')}</div>
             </div>
           ) : results.length === 0 ? (
             <div style={{ padding: 40, textAlign: 'center', fontSize: 12, color: 'var(--text-muted)' }}>
@@ -311,17 +313,17 @@ export function AdzunaSearchPanel({ variant = 'panel', onJobSaved, onClose }: Pr
                           {scoringIds.has(r.id) ? (
                             <span style={{ fontSize: 10, color: 'var(--text-muted)', display: 'flex', alignItems: 'center', gap: 4 }}>
                               <span style={{ display: 'inline-block', width: 10, height: 10, border: '1.5px solid rgba(79,70,229,0.30)', borderTopColor: 'var(--primary)', borderRadius: '50%', animation: 'spin 0.7s linear infinite' }} />
-                              Scoring…
+                              {t('jobs.scoring')}
                             </span>
                           ) : scores[r.id] !== undefined ? (
                             <ScorePill score={scores[r.id]} />
                           ) : (
-                            <span style={{ fontSize: 10, color: 'var(--c-success)', fontWeight: 500 }}>✓ Saved</span>
+                            <span style={{ fontSize: 10, color: 'var(--c-success)', fontWeight: 500 }}>✓ {t('jobs.saved')}</span>
                           )}
                         </div>
                       ) : (
                         <Btn small variant="primary" disabled={savingIds.has(r.id)} onClick={() => saveJob(r)}>
-                          {savingIds.has(r.id) ? 'Saving…' : '+ Save'}
+                          {savingIds.has(r.id) ? t('jobs.saving') : `+ ${t('jobs.save')}`}
                         </Btn>
                       )}
                       <a href={r.url} target="_blank" rel="noopener noreferrer"
@@ -337,7 +339,7 @@ export function AdzunaSearchPanel({ variant = 'panel', onJobSaved, onClose }: Pr
                 <div style={{ padding: '12px 16px', borderTop: '0.5px solid var(--border)', display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 10 }}>
                   <span style={{ fontSize: 11, color: 'var(--text-muted)' }}>Showing {results.length} of {total.toLocaleString()}</span>
                   <Btn small variant="ghost" disabled={loadingMore} onClick={handleLoadMore}>
-                    {loadingMore ? 'Loading…' : 'Load more'}
+                    {loadingMore ? t('adzuna.loadingMore') : t('adzuna.loadMore')}
                   </Btn>
                 </div>
               )}

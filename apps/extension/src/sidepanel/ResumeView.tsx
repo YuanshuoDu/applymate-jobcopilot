@@ -30,6 +30,7 @@ import {
   getRecentJobs, saveJob, tailorResume, scoreResume, exportApplicationPackLocally,
 } from '@/lib/api'
 import type { ExtensionSettings, ScrapedJob, ResumeListItem, Resume, ResumeContent, TemplateOptions, ScoreResult } from '@/lib/types'
+import { useExtensionI18n } from '@/lib/i18n'
 
 // ── Design tokens ────────────────────────────────────────────────────────────────
 const C = {
@@ -109,6 +110,7 @@ function sameJobUrl(left: string, right: string): boolean {
 
 // ── Root ─────────────────────────────────────────────────────────────────────────
 export function ResumeView({ settings }: Props) {
+  const { lang, t } = useExtensionI18n()
   const [resumes, setResumes] = useState<ResumeListItem[]>([])
   const [activeId, setActiveId] = useState<string | null>(null)
   const [resume, setResume] = useState<Resume | null>(null)
@@ -166,7 +168,7 @@ export function ResumeView({ settings }: Props) {
       if (auditedResumeId === activeId) return
       setActiveId(auditedResumeId)
       void loadResume(auditedResumeId)
-      showToast('Using this job’s audited resume')
+      showToast(t('Using this job’s audited resume'))
     }).catch(() => {
       // The extension remains usable offline or before a job has been saved.
     })
@@ -202,7 +204,7 @@ export function ResumeView({ settings }: Props) {
       await setCurrentResumeId(id, settings.userEmail)
     } catch (err) {
       const msg = err instanceof Error ? err.message : 'Failed to load'
-      showToast(msg)
+      showToast(lang === 'zh' ? t('Load failed') : msg)
       setLoadError(msg)
     }
     finally { setLoading(false) }
@@ -214,8 +216,8 @@ export function ResumeView({ settings }: Props) {
       const r = await createResume(settings, { name: `Resume ${resumes.length + 1}`, content: EMPTY_CONTENT, templateId: 'clean' })
       setResumes(prev => [r, ...prev]); setActiveId(r.id); setResume(r)
       setContent(EMPTY_CONTENT); setTemplateId('clean'); setTemplateOpts({}); setDirty(false)
-      await setCurrentResumeId(r.id, settings.userEmail); showToast('Created')
-    } catch { showToast('Failed') }
+      await setCurrentResumeId(r.id, settings.userEmail); showToast(t('Created'))
+    } catch { showToast(t('Failed')) }
   }
 
   // ── Upload resume (parse) ──────────────────────────────────────────────────────
@@ -240,8 +242,8 @@ export function ResumeView({ settings }: Props) {
       })
       setResumes(prev => [r, ...prev]); setActiveId(r.id); setResume(r)
       setContent(normalizeResumeContent(r.content)); setTemplateId('clean'); setTemplateOpts({}); setDirty(false)
-      await setCurrentResumeId(r.id, settings.userEmail); showToast('Resume uploaded & parsed!')
-    } catch { showToast('Upload failed') }
+      await setCurrentResumeId(r.id, settings.userEmail); showToast(t('Resume uploaded & parsed!'))
+    } catch { showToast(t('Upload failed')) }
     finally { setUploading(false) }
   }
 
@@ -252,7 +254,7 @@ export function ResumeView({ settings }: Props) {
     try {
       await updateResume(settings, activeId, { content: c, templateId: tid, templateOptions: topts })
       setDirty(false); clearResumeDraft(activeId, settings.userEmail)
-    } catch { showToast('Save failed'); setResumeDraft(activeId, c, settings.userEmail) }
+    } catch { showToast(t('Save failed')); setResumeDraft(activeId, c, settings.userEmail) }
     finally { setSaving(false) }
   }, [settings, activeId])
 
@@ -287,7 +289,8 @@ export function ResumeView({ settings }: Props) {
       }
     }
     markDirty(updated)
-    showToast(`Added ${sectionId} section`)
+    const sectionLabel = sectionId.charAt(0).toUpperCase() + sectionId.slice(1)
+    showToast(`${t('Section added')}: ${t(sectionLabel)}`)
   }
 
   // ── PDF ────────────────────────────────────────────────────────────────────────
@@ -302,9 +305,9 @@ export function ResumeView({ settings }: Props) {
     try {
       const result = await exportApplicationPackLocally(settings, savedJobId, Boolean(exportedPackFolder))
       setExportedPackFolder(result.folderPath)
-      showToast(exportedPackFolder ? 'Opened job folder' : 'Audited PDFs saved to D:')
+      showToast(exportedPackFolder ? t('Opened job folder') : t('Audited PDFs saved to D:'))
     } catch (error) {
-      showToast(error instanceof Error ? error.message : 'Could not save application PDFs')
+      showToast(lang === 'zh' ? t('Could not save application PDFs') : error instanceof Error ? error.message : t('Could not save application PDFs'))
     } finally {
       setExportingPack(false)
     }
@@ -338,11 +341,11 @@ export function ResumeView({ settings }: Props) {
         jobDescription: currentJob.description,
       })
       setTailorResult(analysis)
-      showToast('Resume tailored for this job')
+      showToast(t('Resume tailored for this job'))
     } catch (error) {
       const message = error instanceof Error ? error.message : 'Tailoring failed'
       setTailorError(message)
-      showToast(message)
+      showToast(lang === 'zh' ? t('Tailoring failed') : message)
     } finally {
       setTailoring(false)
     }
@@ -355,7 +358,7 @@ export function ResumeView({ settings }: Props) {
 
   // ── Loading ────────────────────────────────────────────────────────────────────
   if (loading && !resume) {
-    return <div className="am-resume-state am-resume-loading"><LoaderCircle size={20} className="am-spin" aria-label="Loading resumes" /></div>
+    return <div className="am-resume-state am-resume-loading"><LoaderCircle size={20} className="am-spin" aria-label={t('Loading resumes')} /></div>
   }
 
   // ── Load error ─────────────────────────────────────────────────────────────────
@@ -363,10 +366,10 @@ export function ResumeView({ settings }: Props) {
     return (
       <div className="am-resume-view am-resume-state am-resume-error">
         <div className="am-resume-state-icon danger"><AlertTriangle size={19} aria-hidden="true" /></div>
-        <div className="am-resume-state-title">Failed to load resumes</div>
-        <div className="am-resume-state-copy">{loadError}</div>
+        <div className="am-resume-state-title">{t('Failed to load resumes')}</div>
+        <div className="am-resume-state-copy">{lang === 'zh' ? t('Something went wrong') : loadError}</div>
         <div className="am-resume-api">API: {settings.apiBaseUrl}</div>
-        <button className="am-resume-primary-button" type="button" onClick={loadResumeList}><RefreshCw size={13} aria-hidden="true" /> Retry</button>
+        <button className="am-resume-primary-button" type="button" onClick={loadResumeList}><RefreshCw size={13} aria-hidden="true" /> {t('Retry')}</button>
       </div>
     )
   }
@@ -376,10 +379,10 @@ export function ResumeView({ settings }: Props) {
     return (
       <div className="am-resume-view am-resume-state am-resume-empty">
         <div className="am-resume-state-icon"><FileText size={20} aria-hidden="true" /></div>
-        <div className="am-resume-state-title">No resumes yet</div>
-        <div className="am-resume-state-copy">Create one or upload a PDF/DOCX to get started.</div>
+        <div className="am-resume-state-title">{t('No resumes yet')}</div>
+        <div className="am-resume-state-copy">{t('Create one or upload a PDF/DOCX to get started.')}</div>
         <div className="am-resume-state-actions">
-          <button className="am-resume-primary-button" type="button" onClick={handleCreate}><Plus size={13} aria-hidden="true" /> Create resume</button>
+          <button className="am-resume-primary-button" type="button" onClick={handleCreate}><Plus size={13} aria-hidden="true" /> {t('Create resume')}</button>
           <button className="am-resume-secondary-button" type="button" onClick={() => fileInputRef.current?.click()} disabled={uploading}>
             <Upload size={13} aria-hidden="true" /> {uploading ? 'Uploading…' : 'Upload PDF/DOCX'}
           </button>
@@ -406,12 +409,12 @@ export function ResumeView({ settings }: Props) {
     <div className="am-resume-view">
       {/* ════ Top Bar: Selector + New + Upload ════ */}
       <div className="am-resume-toolbar">
-        <div className="am-resume-toolbar-title"><span className="am-resume-toolbar-icon"><FileText size={14} aria-hidden="true" /></span><span><small>Workspace</small><strong>Resume</strong></span></div>
-        <select className="am-resume-select" value={activeId ?? ''} onChange={e => handleSelect(e.target.value)} style={selectStyle(C)} aria-label="Select resume">
+        <div className="am-resume-toolbar-title"><span className="am-resume-toolbar-icon"><FileText size={14} aria-hidden="true" /></span><span><small>{t('Workspace')}</small><strong>{t('Resume')}</strong></span></div>
+        <select className="am-resume-select" value={activeId ?? ''} onChange={e => handleSelect(e.target.value)} style={selectStyle(C)} aria-label={t('Select resume')}>
           {resumes.map(r => (<option key={r.id} value={r.id}>{r.name}{r.isDefault ? ' ★' : ''}</option>))}
         </select>
-        <button className="am-resume-icon-action" type="button" onClick={handleCreate} title="New resume" aria-label="New resume"><Plus size={15} aria-hidden="true" /></button>
-        <button className="am-resume-upload-action" type="button" onClick={() => fileInputRef.current?.click()} title="Upload PDF/DOCX">
+        <button className="am-resume-icon-action" type="button" onClick={handleCreate} title={t('New resume')} aria-label={t('New resume')}><Plus size={15} aria-hidden="true" /></button>
+        <button className="am-resume-upload-action" type="button" onClick={() => fileInputRef.current?.click()} title={t('Upload PDF/DOCX')}>
           <Upload size={12} aria-hidden="true" /> {uploading ? '…' : 'Upload'}
         </button>
         <input ref={fileInputRef} type="file" accept=".pdf,.docx,.doc" style={{ display: 'none' }}
@@ -429,17 +432,17 @@ export function ResumeView({ settings }: Props) {
                 {currentJob.company.slice(0, 2).toUpperCase()}
               </div>
               <div className="am-resume-job-copy">
-                <span className="am-resume-eyebrow">Current job</span>
+                <span className="am-resume-eyebrow">{t('Current job')}</span>
                 <div style={{ fontSize: 11, fontWeight: 600, color: C.text, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{currentJob.title}</div>
                 <div style={{ fontSize: 10, color: C.muted }}>{currentJob.company}{currentJob.location ? ` · ${currentJob.location}` : ''}</div>
               </div>
             </div>
-            {auditedResumeId === activeId && <div style={{ margin: '0 0 9px', fontSize: 10, fontWeight: 600, color: C.green }}>✓ Using the audited resume selected in My Jobs</div>}
-            {packageStatus === 'missing' && <div style={{ margin: '0 0 9px', fontSize: 10, lineHeight: 1.4, fontWeight: 600, color: C.amber }}>No tailored application pack for this job yet. Prepare it in My Jobs before submitting.</div>}
+            {auditedResumeId === activeId && <div style={{ margin: '0 0 9px', fontSize: 10, fontWeight: 600, color: C.green }}>✓ {t('Using the audited resume selected in My Jobs')}</div>}
+            {packageStatus === 'missing' && <div style={{ margin: '0 0 9px', fontSize: 10, lineHeight: 1.4, fontWeight: 600, color: C.amber }}>{t('No tailored application pack for this job yet. Prepare it in My Jobs before submitting.')}</div>}
             <button className="am-resume-match-button" type="button" onClick={handleOpenTailor} disabled={tailoring}>
-              {tailoring ? <LoaderCircle size={13} className="am-spin" aria-hidden="true" /> : <FileText size={13} aria-hidden="true" />} {tailoring ? 'Tailoring resume…' : packageStatus === 'audited' ? 'Review application pack' : 'Tailor resume'}
+              {tailoring ? <LoaderCircle size={13} className="am-spin" aria-hidden="true" /> : <FileText size={13} aria-hidden="true" />} {tailoring ? t('Tailoring resume…') : packageStatus === 'audited' ? t('Review application pack') : t('Tailor resume')}
             </button>
-            {tailorError && <div className="am-resume-tailor-error" role="alert">{tailorError}</div>}
+            {tailorError && <div className="am-resume-tailor-error" role="alert">{lang === 'zh' ? t('Something went wrong') : tailorError}</div>}
             {tailorResult && <TailorAnalysis result={tailorResult} />}
           </div>
         )}
@@ -449,9 +452,9 @@ export function ResumeView({ settings }: Props) {
            ═══════════════════════════════════════════════════════════════════════ */}
         <div className="am-resume-card am-resume-preview-card">
           <div className="am-resume-card-head">
-            <span className="am-resume-card-title"><FileText size={13} aria-hidden="true" /> Resume preview</span>
+            <span className="am-resume-card-title"><FileText size={13} aria-hidden="true" /> {t('Resume preview')}</span>
             <button className={`am-resume-pill-action${editMode ? ' active' : ''}`} type="button" onClick={() => setEditMode(v => !v)}>
-              {editMode ? <><Check size={11} aria-hidden="true" /> Done</> : <><Pencil size={11} aria-hidden="true" /> Quick edit</>}
+              {editMode ? <><Check size={11} aria-hidden="true" /> {t('Done')}</> : <><Pencil size={11} aria-hidden="true" /> {t('Quick edit')}</>}
             </button>
           </div>
 
@@ -466,7 +469,7 @@ export function ResumeView({ settings }: Props) {
             3️⃣  TEMPLATE PICKER — with thumbnails
            ═══════════════════════════════════════════════════════════════════════ */}
         <div className="am-resume-card am-resume-template-card">
-          <div className="am-resume-card-title"><Palette size={13} aria-hidden="true" /> Template</div>
+          <div className="am-resume-card-title"><Palette size={13} aria-hidden="true" /> {t('Template')}</div>
 
           {/* Thumbnail grid */}
           <div style={{ display: 'grid', gridTemplateColumns: 'repeat(5, 1fr)', gap: 6, marginBottom: 10 }}>
@@ -497,17 +500,17 @@ export function ResumeView({ settings }: Props) {
               <button key={c.v} onClick={() => changeAccent(c.v)} title={c.n} style={{ width: 20, height: 20, borderRadius: '50%', background: c.v, border: templateOpts.accentColor === c.v ? `3px solid ${C.text}` : '2px solid transparent', cursor: 'pointer', outline: 'none', flexShrink: 0 }} />
             ))}
             <select value={templateOpts.fontFamily ?? 'sans'} onChange={e => changeFont(e.target.value as TemplateOptions['fontFamily'])} style={{ flex: 1, padding: '4px 6px', fontSize: 9, borderRadius: 5, border: `1px solid ${C.border}`, background: C.bg, color: C.text, fontFamily: 'inherit', outline: 'none', cursor: 'pointer' }}>
-              <option value="sans">Sans</option>
-              <option value="serif">Serif</option>
-              <option value="mono">Mono</option>
+              <option value="sans">{t('Sans')}</option>
+              <option value="serif">{t('Serif')}</option>
+              <option value="mono">{t('Mono')}</option>
             </select>
           </div>
 
           {/* Density */}
           <select value={density} onChange={e => changeDensity(e.target.value as TemplateOptions['density'])} style={{ width: '100%', padding: '5px 8px', fontSize: 10, borderRadius: 6, border: `1px solid ${C.border}`, background: C.bg, color: C.text, fontFamily: 'inherit', outline: 'none', cursor: 'pointer' }}>
-            <option value="compact">Compact</option>
-            <option value="comfortable">Comfortable</option>
-            <option value="spacious">Spacious</option>
+            <option value="compact">{t('Compact')}</option>
+            <option value="comfortable">{t('Comfortable')}</option>
+            <option value="spacious">{t('Spacious')}</option>
           </select>
         </div>
 
@@ -515,7 +518,7 @@ export function ResumeView({ settings }: Props) {
             4️⃣  DOWNLOAD PDF (the only download entry)
            ═══════════════════════════════════════════════════════════════════════ */}
         <div className="am-resume-card am-resume-download-card">
-          <div className="am-resume-card-title"><Download size={13} aria-hidden="true" /> Download PDF</div>
+          <div className="am-resume-card-title"><Download size={13} aria-hidden="true" /> {t('Download PDF')}</div>
           <div className="am-resume-download-copy">{packageStatus === 'audited' ? 'Saves the audited resume and cover letter into this job’s D: folder' : 'Opens print view → save as PDF → drag to upload portal'}</div>
           <button className="am-resume-download-button" type="button" onClick={handleExportApplicationPack} disabled={!activeId || exportingPack}>
             <Download size={14} aria-hidden="true" />
@@ -527,7 +530,7 @@ export function ResumeView({ settings }: Props) {
         <div className="am-resume-sync">
           <span style={{ width: 5, height: 5, borderRadius: '50%', background: dirty ? C.amber : saving ? C.subtle : C.green, display: 'inline-block' }} />
           {saving ? 'Saving...' : dirty ? 'Unsaved' : 'Synced'}
-          <button type="button" onClick={() => activeId && loadResume(activeId)}><RefreshCw size={10} aria-hidden="true" /> Refresh</button>
+          <button type="button" onClick={() => activeId && loadResume(activeId)}><RefreshCw size={10} aria-hidden="true" /> {t('Refresh')}</button>
         </div>
       </div>
 
@@ -540,16 +543,17 @@ export function ResumeView({ settings }: Props) {
 }
 
 function TailorAnalysis({ result }: { result: ScoreResult }) {
+  const { t } = useExtensionI18n()
   const sections = ['Summary', 'Skills', 'Experience', 'Education', 'Projects']
   return <div className="am-resume-tailor-analysis">
-    <div className="am-resume-tailor-score"><div className="am-resume-tailor-score-ring" style={{ '--am-tailor-score': `${result.score}%` } as React.CSSProperties}><strong>{result.score}%</strong></div><div><strong>Match score</strong><span>{result.strengthSummary || 'Tailored to this role'}</span></div></div>
-    <div className="am-resume-section-heading">SECTION ANALYSIS</div>
+    <div className="am-resume-tailor-score"><div className="am-resume-tailor-score-ring" style={{ '--am-tailor-score': `${result.score}%` } as React.CSSProperties}><strong>{result.score}%</strong></div><div><strong>{t('Match score')}</strong><span>{result.strengthSummary || t('Tailored to this role')}</span></div></div>
+    <div className="am-resume-section-heading">{t('SECTION ANALYSIS')}</div>
     <div className="am-resume-section-list">{sections.map(section => {
       const score = result.sectionScores?.[section]
       const match = result.sectionMatches?.find(item => item.section === section)
       const tip = result.sectionTips?.[section]
       if (score === undefined && !match) return null
-      return <div className="am-resume-section-row" key={section}><div className="am-resume-section-row-head"><span>{section}</span><strong>{score ?? match?.score ?? 0}%</strong></div><div className="am-resume-section-bar"><span style={{ width: `${Math.max(0, Math.min(score ?? match?.score ?? 0, 100))}%` }} /></div>{tip && <small>{tip}</small>}</div>
+      return <div className="am-resume-section-row" key={section}><div className="am-resume-section-row-head"><span>{t(section)}</span><strong>{score ?? match?.score ?? 0}%</strong></div><div className="am-resume-section-bar"><span style={{ width: `${Math.max(0, Math.min(score ?? match?.score ?? 0, 100))}%` }} /></div>{tip && <small>{tip}</small>}</div>
     })}</div>
   </div>
 }
@@ -560,6 +564,7 @@ function TemplatePreview({ content, accent, font, density, presentSections, cust
   content: ResumeContent; accent: string; font: string; density: string
   presentSections: string[]; customIds: string[]
 }) {
+  const { t } = useExtensionI18n()
   const pad = DENSITY_PAD[density] ?? DENSITY_PAD.comfortable
   const sec = content
 
@@ -596,9 +601,10 @@ function TemplatePreview({ content, accent, font, density, presentSections, cust
 }
 
 function PreviewSection({ sectionId, content, accent }: { sectionId: string; content: ResumeContent; accent: string }) {
+  const { t } = useExtensionI18n()
   const sec = content
   const title = (s: string) => (
-    <div style={{ fontSize: 9, fontWeight: 700, letterSpacing: '1.5px', textTransform: 'uppercase', color: accent, borderBottom: `1.5px solid ${accent}40`, paddingBottom: 3, marginBottom: 6 }}>{s}</div>
+    <div style={{ fontSize: 9, fontWeight: 700, letterSpacing: '1.5px', textTransform: 'uppercase', color: accent, borderBottom: `1.5px solid ${accent}40`, paddingBottom: 3, marginBottom: 6 }}>{t(s)}</div>
   )
 
   switch (sectionId) {
@@ -614,7 +620,7 @@ function PreviewSection({ sectionId, content, accent }: { sectionId: string; con
           {sec.experience.map((exp, i) => (
             <div key={i} style={{ marginBottom: 10 }}>
               <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline' }}>
-                <span style={{ fontSize: 11, fontWeight: 600, color: '#1a1a1a' }}>{exp.role || 'Role'}</span>
+                <span style={{ fontSize: 11, fontWeight: 600, color: '#1a1a1a' }}>{exp.role || t('Role')}</span>
                 <span style={{ fontSize: 9, color: '#888', flexShrink: 0, marginLeft: 8 }}>{exp.period}</span>
               </div>
               {exp.company && <div style={{ fontSize: 10, color: '#666', marginTop: 1 }}>{exp.company}</div>}
@@ -650,7 +656,7 @@ function PreviewSection({ sectionId, content, accent }: { sectionId: string; con
           {title('Education')}
           {sec.education.map((edu, i) => (
             <div key={i} style={{ display: 'flex', justifyContent: 'space-between', fontSize: 10, marginBottom: 2 }}>
-              <span><span style={{ fontWeight: 600, color: '#1a1a1a' }}>{edu.institution || 'School'}</span>{edu.degree ? <span style={{ color: '#666' }}> — {edu.degree}</span> : null}</span>
+              <span><span style={{ fontWeight: 600, color: '#1a1a1a' }}>{edu.institution || t('School')}</span>{edu.degree ? <span style={{ color: '#666' }}> — {edu.degree}</span> : null}</span>
               <span style={{ color: '#888' }}>{edu.year}</span>
             </div>
           ))}
@@ -746,6 +752,7 @@ function QuickEdit({ content, onChange, settings, presentSections, onAddSection,
   onAddSection: (id: string) => void
   apiBase: string
 }) {
+  const { t } = useExtensionI18n()
   const [expandedSec, setExpandedSec] = useState<string | null>('contact')
 
   // Detect which sections are NOT yet present
@@ -761,7 +768,7 @@ function QuickEdit({ content, onChange, settings, presentSections, onAddSection,
   return (
     <div style={{ padding: '10px 12px', display: 'flex', flexDirection: 'column', gap: 6 }}>
       {/* Contact */}
-      <EditSection label="Contact" expanded={expandedSec === 'contact'} onToggle={() => toggle('contact')}>
+      <EditSection label={t('Contact')} expanded={expandedSec === 'contact'} onToggle={() => toggle('contact')}>
         <Field label="Name" value={content.contact.name} onChange={v => updateContact('name', v)} />
         <Field label="Email" value={content.contact.email} onChange={v => updateContact('email', v)} />
         <Field label="Phone" value={content.contact.phone ?? ''} onChange={v => updateContact('phone', v)} />
@@ -771,8 +778,8 @@ function QuickEdit({ content, onChange, settings, presentSections, onAddSection,
       </EditSection>
 
       {/* Summary */}
-      <EditSection label="Summary" expanded={expandedSec === 'summary'} onToggle={() => toggle('summary')}>
-        <textarea value={content.summary} onChange={e => updateSummary(e.target.value)} placeholder="Professional summary..." style={taStyle(C)} />
+      <EditSection label={t('Summary')} expanded={expandedSec === 'summary'} onToggle={() => toggle('summary')}>
+        <textarea value={content.summary} onChange={e => updateSummary(e.target.value)} placeholder={t('Professional summary...')} style={taStyle(C)} />
       </EditSection>
 
       {/* Experience */}
@@ -780,10 +787,10 @@ function QuickEdit({ content, onChange, settings, presentSections, onAddSection,
         {content.experience.map((exp, i) => (
           <div key={i} style={{ padding: '6px', borderRadius: 6, background: C.bg, border: `0.5px solid ${C.border}`, marginBottom: 6 }}>
             <div style={{ display: 'flex', gap: 4, marginBottom: 3 }}>
-              <input value={exp.role} onChange={e => { const u = [...content.experience]; u[i] = { ...exp, role: e.target.value }; onChange({ ...content, experience: u }) }} placeholder="Role" style={si(C)} />
-              <input value={exp.company} onChange={e => { const u = [...content.experience]; u[i] = { ...exp, company: e.target.value }; onChange({ ...content, experience: u }) }} placeholder="Company" style={si(C)} />
+              <input value={exp.role} onChange={e => { const u = [...content.experience]; u[i] = { ...exp, role: e.target.value }; onChange({ ...content, experience: u }) }} placeholder={t('Role')} style={si(C)} />
+              <input value={exp.company} onChange={e => { const u = [...content.experience]; u[i] = { ...exp, company: e.target.value }; onChange({ ...content, experience: u }) }} placeholder={t('Company')} style={si(C)} />
             </div>
-            <input value={exp.period} onChange={e => { const u = [...content.experience]; u[i] = { ...exp, period: e.target.value }; onChange({ ...content, experience: u }) }} placeholder="Period" style={{ ...si(C), width: 100, marginBottom: 3 }} />
+            <input value={exp.period} onChange={e => { const u = [...content.experience]; u[i] = { ...exp, period: e.target.value }; onChange({ ...content, experience: u }) }} placeholder={t('Period')} style={{ ...si(C), width: 100, marginBottom: 3 }} />
             {exp.bullets.map((b, j) => (
               <div key={j} style={{ display: 'flex', gap: 3, alignItems: 'center', marginBottom: 2 }}>
                 <span style={{ fontSize: 9, color: C.subtle }}>•</span>
@@ -792,12 +799,12 @@ function QuickEdit({ content, onChange, settings, presentSections, onAddSection,
               </div>
             ))}
             <div style={{ display: 'flex', gap: 4 }}>
-              <button onClick={() => { const u = [...content.experience]; u[i] = { ...exp, bullets: [...exp.bullets, ''] }; onChange({ ...content, experience: u }) }} style={minibtn(C)}>+ Bullet</button>
-              <button onClick={() => onChange({ ...content, experience: content.experience.filter((_, j) => j !== i) })} style={{ ...minibtn(C), color: C.red }}>Remove</button>
+              <button onClick={() => { const u = [...content.experience]; u[i] = { ...exp, bullets: [...exp.bullets, ''] }; onChange({ ...content, experience: u }) }} style={minibtn(C)}>+ {t('Bullet')}</button>
+              <button onClick={() => onChange({ ...content, experience: content.experience.filter((_, j) => j !== i) })} style={{ ...minibtn(C), color: C.red }}>{t('Remove')}</button>
             </div>
           </div>
         ))}
-        <button onClick={() => onChange({ ...content, experience: [...content.experience, { company: '', role: '', period: '', bullets: [] }] })} style={addbtn(C)}>+ Add Experience</button>
+        <button onClick={() => onChange({ ...content, experience: [...content.experience, { company: '', role: '', period: '', bullets: [] }] })} style={addbtn(C)}>+ {t('Add Experience')}</button>
       </EditSection>
 
       {/* Education */}
@@ -805,16 +812,16 @@ function QuickEdit({ content, onChange, settings, presentSections, onAddSection,
         {content.education.map((edu, i) => (
           <div key={i} style={{ padding: '6px', borderRadius: 6, background: C.bg, border: `0.5px solid ${C.border}`, marginBottom: 4 }}>
             <div style={{ display: 'flex', gap: 4, marginBottom: 3 }}>
-              <input value={edu.institution} onChange={e => { const u = [...content.education]; u[i] = { ...edu, institution: e.target.value }; onChange({ ...content, education: u }) }} placeholder="School" style={si(C)} />
-              <input value={edu.degree} onChange={e => { const u = [...content.education]; u[i] = { ...edu, degree: e.target.value }; onChange({ ...content, education: u }) }} placeholder="Degree" style={si(C)} />
+              <input value={edu.institution} onChange={e => { const u = [...content.education]; u[i] = { ...edu, institution: e.target.value }; onChange({ ...content, education: u }) }} placeholder={t('School')} style={si(C)} />
+              <input value={edu.degree} onChange={e => { const u = [...content.education]; u[i] = { ...edu, degree: e.target.value }; onChange({ ...content, education: u }) }} placeholder={t('Degree')} style={si(C)} />
             </div>
             <div style={{ display: 'flex', gap: 4, alignItems: 'center' }}>
-              <input value={edu.year} onChange={e => { const u = [...content.education]; u[i] = { ...edu, year: e.target.value }; onChange({ ...content, education: u }) }} placeholder="Year" style={{ ...si(C), width: 80 }} />
-              <button onClick={() => onChange({ ...content, education: content.education.filter((_, j) => j !== i) })} style={{ ...minibtn(C), color: C.red, marginLeft: 'auto' }}>Remove</button>
+              <input value={edu.year} onChange={e => { const u = [...content.education]; u[i] = { ...edu, year: e.target.value }; onChange({ ...content, education: u }) }} placeholder={t('Year')} style={{ ...si(C), width: 80 }} />
+              <button onClick={() => onChange({ ...content, education: content.education.filter((_, j) => j !== i) })} style={{ ...minibtn(C), color: C.red, marginLeft: 'auto' }}>{t('Remove')}</button>
             </div>
           </div>
         ))}
-        <button onClick={() => onChange({ ...content, education: [...content.education, { institution: '', degree: '', year: '' }] })} style={addbtn(C)}>+ Add Education</button>
+        <button onClick={() => onChange({ ...content, education: [...content.education, { institution: '', degree: '', year: '' }] })} style={addbtn(C)}>+ {t('Add Education')}</button>
       </EditSection>
 
       {/* Skills */}
@@ -828,7 +835,7 @@ function QuickEdit({ content, onChange, settings, presentSections, onAddSection,
           ))}
         </div>
         <form onSubmit={e => { e.preventDefault(); const inp = (e.target as HTMLFormElement).querySelector('input'); if (!inp) return; const v = inp.value.trim(); if (!v || content.skills.includes(v)) return; onChange({ ...content, skills: [...content.skills, v] }); inp.value = '' }}>
-          <input placeholder="Type skill + Enter..." style={{ width: '100%', padding: '5px 8px', fontSize: 10, borderRadius: 6, border: `1px solid ${C.border}`, background: C.bg, color: C.text, fontFamily: 'inherit', outline: 'none', boxSizing: 'border-box' }} />
+          <input placeholder={t('Type skill + Enter...')} style={{ width: '100%', padding: '5px 8px', fontSize: 10, borderRadius: 6, border: `1px solid ${C.border}`, background: C.bg, color: C.text, fontFamily: 'inherit', outline: 'none', boxSizing: 'border-box' }} />
         </form>
       </EditSection>
 
@@ -837,12 +844,12 @@ function QuickEdit({ content, onChange, settings, presentSections, onAddSection,
         <EditSection label={`Languages (${(content.languages ?? []).length})`} expanded={expandedSec === 'languages'} onToggle={() => toggle('languages')}>
           {(content.languages ?? []).map((l, i) => (
             <div key={i} style={{ display: 'flex', gap: 3, marginBottom: 3, alignItems: 'center' }}>
-              <input value={l.lang} onChange={e => { const u = [...(content.languages ?? [])]; u[i] = { ...l, lang: e.target.value }; onChange({ ...content, languages: u }) }} placeholder="Language" style={si(C)} />
-              <input value={l.level} onChange={e => { const u = [...(content.languages ?? [])]; u[i] = { ...l, level: e.target.value }; onChange({ ...content, languages: u }) }} placeholder="Level" style={{ ...si(C), width: 70 }} />
+              <input value={l.lang} onChange={e => { const u = [...(content.languages ?? [])]; u[i] = { ...l, lang: e.target.value }; onChange({ ...content, languages: u }) }} placeholder={t('Language')} style={si(C)} />
+              <input value={l.level} onChange={e => { const u = [...(content.languages ?? [])]; u[i] = { ...l, level: e.target.value }; onChange({ ...content, languages: u }) }} placeholder={t('Level')} style={{ ...si(C), width: 70 }} />
               <button onClick={() => onChange({ ...content, languages: (content.languages ?? []).filter((_, j) => j !== i) })} style={xbtn(C)}>×</button>
             </div>
           ))}
-          <button onClick={() => onChange({ ...content, languages: [...(content.languages ?? []), { lang: '', level: '' }] })} style={addbtn(C)}>+ Add Language</button>
+          <button onClick={() => onChange({ ...content, languages: [...(content.languages ?? []), { lang: '', level: '' }] })} style={addbtn(C)}>+ {t('Add Language')}</button>
         </EditSection>
       )}
 
@@ -851,14 +858,14 @@ function QuickEdit({ content, onChange, settings, presentSections, onAddSection,
         <EditSection label={`Projects (${(content.projects ?? []).length})`} expanded={expandedSec === 'projects'} onToggle={() => toggle('projects')}>
           {(content.projects ?? []).map((p, i) => (
             <div key={i} style={{ padding: '6px', borderRadius: 6, background: C.bg, border: `0.5px solid ${C.border}`, marginBottom: 4 }}>
-              <input value={p.name} onChange={e => { const u = [...(content.projects ?? [])]; u[i] = { ...p, name: e.target.value }; onChange({ ...content, projects: u }) }} placeholder="Project name" style={{ ...si(C), width: '100%', marginBottom: 3 }} />
-              <input value={p.url ?? ''} onChange={e => { const u = [...(content.projects ?? [])]; u[i] = { ...p, url: e.target.value }; onChange({ ...content, projects: u }) }} placeholder="URL" style={{ ...si(C), width: '100%', marginBottom: 3 }} />
+              <input value={p.name} onChange={e => { const u = [...(content.projects ?? [])]; u[i] = { ...p, name: e.target.value }; onChange({ ...content, projects: u }) }} placeholder={t('Project name')} style={{ ...si(C), width: '100%', marginBottom: 3 }} />
+              <input value={p.url ?? ''} onChange={e => { const u = [...(content.projects ?? [])]; u[i] = { ...p, url: e.target.value }; onChange({ ...content, projects: u }) }} placeholder={t('URL')} style={{ ...si(C), width: '100%', marginBottom: 3 }} />
               <div style={{ display: 'flex', gap: 4 }}>
-                <button onClick={() => onChange({ ...content, projects: (content.projects ?? []).filter((_, j) => j !== i) })} style={{ ...minibtn(C), color: C.red }}>Remove</button>
+                <button onClick={() => onChange({ ...content, projects: (content.projects ?? []).filter((_, j) => j !== i) })} style={{ ...minibtn(C), color: C.red }}>{t('Remove')}</button>
               </div>
             </div>
           ))}
-          <button onClick={() => onChange({ ...content, projects: [...(content.projects ?? []), { name: '', bullets: [] }] })} style={addbtn(C)}>+ Add Project</button>
+          <button onClick={() => onChange({ ...content, projects: [...(content.projects ?? []), { name: '', bullets: [] }] })} style={addbtn(C)}>+ {t('Add Project')}</button>
         </EditSection>
       )}
 
@@ -867,14 +874,14 @@ function QuickEdit({ content, onChange, settings, presentSections, onAddSection,
         <EditSection label={`Certifications (${(content.certifications ?? []).length})`} expanded={expandedSec === 'certifications'} onToggle={() => toggle('certifications')}>
           {(content.certifications ?? []).map((c, i) => (
             <div key={i} style={{ padding: '6px', borderRadius: 6, background: C.bg, border: `0.5px solid ${C.border}`, marginBottom: 4 }}>
-              <input value={c.name} onChange={e => { const u = [...(content.certifications ?? [])]; u[i] = { ...c, name: e.target.value }; onChange({ ...content, certifications: u }) }} placeholder="Name" style={{ ...si(C), width: '100%', marginBottom: 3 }} />
-              <input value={c.issuer} onChange={e => { const u = [...(content.certifications ?? [])]; u[i] = { ...c, issuer: e.target.value }; onChange({ ...content, certifications: u }) }} placeholder="Issuer" style={{ ...si(C), width: '100%', marginBottom: 3 }} />
+              <input value={c.name} onChange={e => { const u = [...(content.certifications ?? [])]; u[i] = { ...c, name: e.target.value }; onChange({ ...content, certifications: u }) }} placeholder={t('Name')} style={{ ...si(C), width: '100%', marginBottom: 3 }} />
+              <input value={c.issuer} onChange={e => { const u = [...(content.certifications ?? [])]; u[i] = { ...c, issuer: e.target.value }; onChange({ ...content, certifications: u }) }} placeholder={t('Issuer')} style={{ ...si(C), width: '100%', marginBottom: 3 }} />
               <div style={{ display: 'flex', gap: 4 }}>
-                <button onClick={() => onChange({ ...content, certifications: (content.certifications ?? []).filter((_, j) => j !== i) })} style={{ ...minibtn(C), color: C.red }}>Remove</button>
+                <button onClick={() => onChange({ ...content, certifications: (content.certifications ?? []).filter((_, j) => j !== i) })} style={{ ...minibtn(C), color: C.red }}>{t('Remove')}</button>
               </div>
             </div>
           ))}
-          <button onClick={() => onChange({ ...content, certifications: [...(content.certifications ?? []), { name: '', issuer: '', date: '' }] })} style={addbtn(C)}>+ Add Certification</button>
+          <button onClick={() => onChange({ ...content, certifications: [...(content.certifications ?? []), { name: '', issuer: '', date: '' }] })} style={addbtn(C)}>+ {t('Add Certification')}</button>
         </EditSection>
       )}
 
@@ -884,20 +891,20 @@ function QuickEdit({ content, onChange, settings, presentSections, onAddSection,
           <div style={{ padding: '6px', borderRadius: 6, background: C.bg, border: `0.5px solid ${C.border}`, marginBottom: 6 }}>
             <input value={cs.title} onChange={e => {
               const u = [...(content.custom ?? [])]; u[i] = { ...cs, title: e.target.value }; onChange({ ...content, custom: u })
-            }} placeholder="Section title" style={{ ...si(C), width: '100%', marginBottom: 4 }} />
+            }} placeholder={t('Section title')} style={{ ...si(C), width: '100%', marginBottom: 4 }} />
             {cs.items.map((item, j) => (
               <div key={j} style={{ padding: '4px', borderRadius: 4, background: C.card, border: `0.5px solid ${C.border}`, marginBottom: 4 }}>
                 <div style={{ display: 'flex', gap: 3, marginBottom: 2 }}>
                   <input value={item.title ?? ''} onChange={e => {
                     const u = [...(content.custom ?? [])]; u[i] = { ...cs, items: cs.items.map((it, k) => k === j ? { ...it, title: e.target.value } : it) }; onChange({ ...content, custom: u })
-                  }} placeholder="Item title" style={si(C)} />
+                  }} placeholder={t('Item title')} style={si(C)} />
                   <input value={item.subtitle ?? ''} onChange={e => {
                     const u = [...(content.custom ?? [])]; u[i] = { ...cs, items: cs.items.map((it, k) => k === j ? { ...it, subtitle: e.target.value } : it) }; onChange({ ...content, custom: u })
-                  }} placeholder="Subtitle" style={si(C)} />
+                  }} placeholder={t('Subtitle')} style={si(C)} />
                 </div>
                 <input value={item.period ?? ''} onChange={e => {
                   const u = [...(content.custom ?? [])]; u[i] = { ...cs, items: cs.items.map((it, k) => k === j ? { ...it, period: e.target.value } : it) }; onChange({ ...content, custom: u })
-                }} placeholder="Period" style={{ ...si(C), width: 80, marginBottom: 2 }} />
+                }} placeholder={t('Period')} style={{ ...si(C), width: 80, marginBottom: 2 }} />
                 {item.bullets.map((b, k) => (
                   <div key={k} style={{ display: 'flex', gap: 3, alignItems: 'center', marginBottom: 1 }}>
                     <span style={{ fontSize: 9, color: C.subtle }}>•</span>
@@ -912,18 +919,18 @@ function QuickEdit({ content, onChange, settings, presentSections, onAddSection,
                 <div style={{ display: 'flex', gap: 4 }}>
                   <button onClick={() => {
                     const u = [...(content.custom ?? [])]; u[i] = { ...cs, items: cs.items.map((it, idx) => idx === j ? { ...it, bullets: [...it.bullets, ''] } : it) }; onChange({ ...content, custom: u })
-                  }} style={minibtn(C)}>+ Bullet</button>
+                  }} style={minibtn(C)}>+ {t('Bullet')}</button>
                   <button onClick={() => {
                     const u = [...(content.custom ?? [])]; u[i] = { ...cs, items: cs.items.filter((_, idx) => idx !== j) }; onChange({ ...content, custom: u })
-                  }} style={{ ...minibtn(C), color: C.red }}>Remove Item</button>
+                  }} style={{ ...minibtn(C), color: C.red }}>{t('Remove Item')}</button>
                 </div>
               </div>
             ))}
             <div style={{ display: 'flex', gap: 4 }}>
               <button onClick={() => {
                 const u = [...(content.custom ?? [])]; u[i] = { ...cs, items: [...cs.items, { bullets: [] }] }; onChange({ ...content, custom: u })
-              }} style={minibtn(C)}>+ Item</button>
-              <button onClick={() => onChange({ ...content, custom: (content.custom ?? []).filter((_, idx) => idx !== i) })} style={{ ...minibtn(C), color: C.red }}>Delete Section</button>
+              }} style={minibtn(C)}>+ {t('Item')}</button>
+              <button onClick={() => onChange({ ...content, custom: (content.custom ?? []).filter((_, idx) => idx !== i) })} style={{ ...minibtn(C), color: C.red }}>{t('Delete Section')}</button>
             </div>
           </div>
         </EditSection>
@@ -932,15 +939,15 @@ function QuickEdit({ content, onChange, settings, presentSections, onAddSection,
       {/* ── Add Section — show missing sections + custom ── */}
       {(missingSections.length > 0 || true) && (
         <div style={{ borderTop: `1px solid ${C.border}`, paddingTop: 8, marginTop: 4 }}>
-          <div style={{ fontSize: 9, fontWeight: 600, color: C.subtle, marginBottom: 6, textTransform: 'uppercase' }}>Add Section</div>
+          <div style={{ fontSize: 9, fontWeight: 600, color: C.subtle, marginBottom: 6, textTransform: 'uppercase' }}>{t('Add Section')}</div>
           <div style={{ display: 'flex', flexWrap: 'wrap', gap: 4 }}>
             {missingSections.map(id => (
               <button key={id} onClick={() => onAddSection(id)} style={{ fontSize: 9, padding: '4px 10px', borderRadius: 999, background: 'transparent', color: C.primary, border: `1px solid ${C.primary}30`, cursor: 'pointer', fontFamily: 'inherit', fontWeight: 500 }}>
-                + {id.charAt(0).toUpperCase() + id.slice(1)}
+              + {t(id.charAt(0).toUpperCase() + id.slice(1))}
               </button>
             ))}
             <button key="custom" onClick={() => onAddSection('custom')} style={{ fontSize: 9, padding: '4px 10px', borderRadius: 999, background: 'transparent', color: C.teal, border: `1px solid ${C.teal}30`, cursor: 'pointer', fontFamily: 'inherit', fontWeight: 500 }}>
-              + Custom Section
+              + {t('Custom Section')}
             </button>
           </div>
         </div>
@@ -952,10 +959,12 @@ function QuickEdit({ content, onChange, settings, presentSections, onAddSection,
 // ── Tiny Components ──────────────────────────────────────────────────────────────
 
 function EditSection({ label, expanded, onToggle, children }: { label: string; expanded: boolean; onToggle: () => void; children: React.ReactNode }) {
+  const { t } = useExtensionI18n()
+  const translatedLabel = label.replace(/^(Experience|Education|Skills|Languages|Projects|Certifications)/, value => t(value))
   return (
     <div>
       <button onClick={onToggle} style={{ width: '100%', padding: '6px 0', display: 'flex', justifyContent: 'space-between', background: 'none', border: 'none', cursor: 'pointer', fontFamily: 'inherit', fontSize: 10, fontWeight: 600, color: C.text, borderBottom: expanded ? `1px solid ${C.border}` : 'none' }}>
-        {label}<span style={{ fontSize: 9, color: C.subtle }}>{expanded ? '▲' : '▼'}</span>
+        {translatedLabel}<span style={{ fontSize: 9, color: C.subtle }}>{expanded ? '▲' : '▼'}</span>
       </button>
       {expanded && <div style={{ padding: '6px 0' }}>{children}</div>}
     </div>
@@ -963,9 +972,10 @@ function EditSection({ label, expanded, onToggle, children }: { label: string; e
 }
 
 function Field({ label, value, onChange }: { label: string; value: string; onChange: (v: string) => void }) {
+  const { t } = useExtensionI18n()
   return (
     <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 4 }}>
-      <span style={{ fontSize: 9, color: C.muted, width: 50, flexShrink: 0 }}>{label}</span>
+      <span style={{ fontSize: 9, color: C.muted, width: 50, flexShrink: 0 }}>{t(label)}</span>
       <input value={value} onChange={e => onChange(e.target.value)} style={{ flex: 1, padding: '4px 6px', fontSize: 10, borderRadius: 4, border: `0.5px solid ${C.border}`, background: C.bg, color: C.text, fontFamily: 'inherit', outline: 'none' }} />
     </div>
   )

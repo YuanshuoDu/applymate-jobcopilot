@@ -6,7 +6,7 @@ import { Activity, Bell, Bot, CreditCard, FileText, Flag, Home, Inbox, LogOut, R
 import { signOut } from 'next-auth/react'
 import { useEffect, useState, type ReactNode } from 'react'
 import { AdminExportLink } from './AdminExportLink'
-import { useI18n, type Lang } from '@/lib/i18n'
+import { useI18n, LANGUAGES, type Lang } from '@/lib/i18n'
 import { adminMutationHeaders } from '@/lib/admin/client'
 
 const navigation = [
@@ -82,9 +82,9 @@ export function AdminShell({ children, permissions, roleKey }: { children: React
 
   return <div className="admin-shell">
     <aside className="admin-sidebar">
-      <Link prefetch={false} href="/admin" className="admin-brand"><span>ApplyMate</span><small>Internal Admin</small></Link>
+      <Link prefetch={false} href="/admin" className="admin-brand"><span>ApplyMate</span><small>{t('admin.internalAdmin')}</small></Link>
       <button type="button" className="admin-mobile-logout" onClick={handleSignOut} aria-label={t('nav.signout')}><LogOut size={16} aria-hidden="true" /><span>{t('nav.signout')}</span></button>
-      <nav aria-label="Admin navigation" className="admin-nav">
+      <nav aria-label={t('admin.navigation')} className="admin-nav">
         {filterAdminNav(permissions).map(item => {
           const active = item.href === '/admin' ? pathname === '/admin' : pathname.startsWith(item.href)
           const Icon = item.icon
@@ -92,10 +92,10 @@ export function AdminShell({ children, permissions, roleKey }: { children: React
           return <a key={item.href} href={item.href} title={label} aria-label={label} aria-current={active ? 'page' : undefined} data-active={active} className="admin-nav-link"><Icon size={18} aria-hidden="true" />{label}</a>
         })}
       </nav>
-      <div className="admin-identity"><span className="admin-avatar">{roleKey.slice(0, 2).toUpperCase()}</span><div><strong>{roleKey.replaceAll('_', ' ')}</strong><small>Internal role</small></div><button type="button" className="admin-logout" onClick={handleSignOut} aria-label={t('nav.signout')}><LogOut size={15} aria-hidden="true" /></button></div>
+      <div className="admin-identity"><span className="admin-avatar">{roleKey.slice(0, 2).toUpperCase()}</span><div><strong>{roleKey.replaceAll('_', ' ')}</strong><small>{t('admin.internalRole')}</small></div><button type="button" className="admin-logout" onClick={handleSignOut} aria-label={t('nav.signout')}><LogOut size={15} aria-hidden="true" /></button></div>
     </aside>
     <main className="admin-main">
-      <div className="admin-topbar">{exportConfig && permissions.includes(exportConfig.permission) && <AdminExportLink resource={exportConfig.resource} label={t('admin.exportCsv')} />}<label className="admin-language-picker"><span className="sr-only">{t('admin.language')}</span><select aria-label={t('admin.language')} value={lang} onChange={event => setLang(event.target.value as Lang)}><option value="en">EN</option><option value="zh">中文</option></select></label>{canReadNotifications && <div className="admin-notification-center"><button type="button" className="admin-notification-button" aria-label={`${t('admin.notifications')}${unreadCount ? `, ${unreadCount} unread` : ''}`} aria-expanded={notificationsOpen} onClick={() => setNotificationsOpen(current => !current)}><Bell size={17} aria-hidden="true" />{unreadCount > 0 && <span className="admin-notification-badge" aria-live="polite">{unreadCount > 99 ? '99+' : unreadCount}</span>}</button>{notificationsOpen && <div className="admin-notification-panel" role="dialog" aria-label={t('admin.notifications')}><div className="admin-notification-panel-title"><strong>{t('admin.notifications')}</strong><button type="button" onClick={() => void markNotification()}>{t('admin.markAllRead')}</button></div>{notifications.length === 0 ? <p>{t('admin.noNotifications')}</p> : notifications.map(item => <Link prefetch={false} key={item.id} href={item.entityId ? `/admin/contact-us?case=${encodeURIComponent(item.entityId)}` : '/admin'} className="admin-notification-item" data-unread={!item.readAt} onClick={() => { if (!item.readAt) void markNotification(item.id); setNotificationsOpen(false) }}><strong>{item.title}</strong><span>{item.body ?? ''}</span><time>{new Date(item.createdAt).toLocaleString()}</time></Link>)}</div>}</div>}</div>
+      <div className="admin-topbar">{exportConfig && permissions.includes(exportConfig.permission) && <AdminExportLink resource={exportConfig.resource} label={t('admin.exportCsv')} />}<label className="admin-language-picker"><span className="sr-only">{t('admin.language')}</span><select aria-label={t('admin.language')} value={lang} onChange={event => setLang(event.target.value as Lang)}>{LANGUAGES.map(language => <option key={language.value} value={language.value}>{language.flag} {t(`lang.${language.value}`)}</option>)}</select></label>{canReadNotifications && <div className="admin-notification-center"><button type="button" className="admin-notification-button" aria-label={`${t('admin.notifications')}${unreadCount ? `, ${unreadCount} ${t('admin.unread')}` : ''}`} aria-expanded={notificationsOpen} onClick={() => setNotificationsOpen(current => !current)}><Bell size={17} aria-hidden="true" />{unreadCount > 0 && <span className="admin-notification-badge" aria-live="polite">{unreadCount > 99 ? '99+' : unreadCount}</span>}</button>{notificationsOpen && <div className="admin-notification-panel" role="dialog" aria-label={t('admin.notifications')}><div className="admin-notification-panel-title"><strong>{t('admin.notifications')}</strong><button type="button" onClick={() => void markNotification()}>{t('admin.markAllRead')}</button></div>{notifications.length === 0 ? <p>{t('admin.noNotifications')}</p> : notifications.map(item => <Link prefetch={false} key={item.id} href={item.entityId ? `/admin/contact-us?case=${encodeURIComponent(item.entityId)}` : '/admin'} className="admin-notification-item" data-unread={!item.readAt} onClick={() => { if (!item.readAt) void markNotification(item.id); setNotificationsOpen(false) }}><strong>{item.title}</strong><span>{item.body ?? ''}</span><time>{new Date(item.createdAt).toLocaleString()}</time></Link>)}</div>}</div>}</div>
       {children}
     </main>
   </div>

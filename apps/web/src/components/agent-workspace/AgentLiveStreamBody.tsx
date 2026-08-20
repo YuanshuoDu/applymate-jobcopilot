@@ -8,6 +8,7 @@ import type { TranscriptAction } from '@/components/agent-workspace/TranscriptSp
 import { approvalResponseIds, type AgentTranscriptEvent } from '@/components/agent-workspace/session-view-model'
 import type { LogEntry, QuestionOption } from '@/components/agent-workspace/live-run-types'
 import { shouldStickToBottom } from './AgentUnifiedStream.helpers'
+import { useI18n } from '@/lib/i18n'
 
 interface AgentLiveStreamBodyProps {
   log: LogEntry[]
@@ -40,6 +41,7 @@ export function AgentLiveStreamBody({
   onLiveBlockAction,
   onFollowStateChange,
 }: AgentLiveStreamBodyProps) {
+  const { t } = useI18n()
   const applyPending = applyQueue.filter((job) => !job.url?.startsWith('_applied'))
   const actedApprovalIds = React.useMemo(() => approvalResponseIds(liveBlocks), [liveBlocks])
 
@@ -58,7 +60,7 @@ export function AgentLiveStreamBody({
       style={{ flex: 1, minHeight: 0, overflowY: 'auto', overscrollBehavior: 'contain', padding: '18px 20px', display: 'flex', flexDirection: 'column', gap: 12 }}
     >
       {isRestoringSession ? (
-        <p style={{ margin: 'auto', color: 'var(--text-muted)', fontSize: 14 }}>Loading conversation…</p>
+        <p style={{ margin: 'auto', color: 'var(--text-muted)', fontSize: 14 }}>{t('agent.loadingConversation')}</p>
       ) : isEmpty ? (
         <AgentNewChatWelcome />
       ) : (
@@ -82,7 +84,7 @@ export function AgentLiveStreamBody({
                   key={i}
                   entry={entry}
                   speaker="Orchestrator"
-                  title={entry.answered ? 'Answer recorded' : 'Approval required'}
+                  title={entry.answered ? t('agent.answerRecorded') : t('agent.approvalRequired')}
                   accent="#0F766E"
                   onSelect={opt => onAnswerOrchestrator(entry.questionId!, opt.value, entry.options)}
                 />
@@ -95,7 +97,7 @@ export function AgentLiveStreamBody({
                   key={i}
                   entry={entry}
                   speaker={entry.role ? `${entry.role}` : 'Agent'}
-                  title={entry.answered ? 'Answer recorded' : 'Options'}
+                  title={entry.answered ? t('agent.answerRecorded') : t('agent.options')}
                   accent="#7c3aed"
                   onSelect={opt => onAnswerQuestion(entry, opt)}
                 />
@@ -103,7 +105,7 @@ export function AgentLiveStreamBody({
             }
 
             if (entry.type === 'orchestrator_plan' || entry.type === 'orchestrator_complete') {
-              return <LiveLogTranscriptBlock key={i} entry={entry} speaker="Orchestrator" accent="#0F766E" title={entry.type === 'orchestrator_complete' ? 'Complete' : 'Plan'} />
+              return <LiveLogTranscriptBlock key={i} entry={entry} speaker="Orchestrator" accent="#0F766E" title={entry.type === 'orchestrator_complete' ? t('agent.complete') : t('agent.plan')} />
             }
 
             if (entry.type === 'info' && entry.message.includes('queued for manual')) return null
@@ -125,10 +127,10 @@ export function AgentLiveStreamBody({
             <div style={{ flexShrink: 0, margin: '8px 0', borderRadius: 10, border: '1px solid var(--border)', overflow: 'hidden' }}>
               <div style={{ padding: '8px 14px', background: 'var(--bg-secondary)', borderBottom: '0.5px solid var(--border)', display: 'flex', alignItems: 'center', gap: 8 }}>
                 <span style={{ fontSize: 14 }}>📋</span>
-                <span style={{ fontSize: 12, fontWeight: 600 }}>申请队列</span>
+                <span style={{ fontSize: 12, fontWeight: 600 }}>{t('agent.applicationQueue')}</span>
                 <span style={{ fontSize: 10, padding: '1px 7px', borderRadius: 999, background: 'var(--primary)', color: '#fff', fontWeight: 600 }}>{applyPending.length}</span>
                 <span style={{ fontSize: 10, color: 'var(--text-muted)', marginLeft: 'auto' }}>
-                  {applyQueue.some(job => job.mode === 'queued') ? '后台提交结果会自动更新' : '点击「立即申请」确认投递'}
+                  {applyQueue.some(job => job.mode === 'queued') ? t('agent.queueUpdated') : t('agent.confirmDelivery')}
                 </span>
               </div>
               {applyQueue.map(job => (

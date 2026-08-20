@@ -1,6 +1,7 @@
 "use client";
 
 import { useState, useEffect, useRef } from "react";
+import { useI18n } from '@/lib/i18n'
 
 interface ApplyResult {
   id: number;
@@ -13,14 +14,15 @@ interface ApplyResult {
   createdAt: string;
 }
 
-const STATUS_CONFIG: Record<string, { icon: string; label: string; color: string }> = {
-  submitted: { icon: "✅", label: "Submitted",        color: "#22c55e" },
-  manual:    { icon: "⚠️", label: "Needs attention", color: "#f59e0b" },
-  failed:    { icon: "❌", label: "Failed",            color: "#ef4444" },
-  "dry-run": { icon: "🔍", label: "Dry run",          color: "#6b7280" },
+const STATUS_CONFIG: Record<string, { icon: string; labelKey: string; color: string }> = {
+  submitted: { icon: "✅", labelKey: "jobs.applyStatus.submitted",        color: "#22c55e" },
+  manual:    { icon: "⚠️", labelKey: "jobs.applyStatus.needsAttention", color: "#f59e0b" },
+  failed:    { icon: "❌", labelKey: "jobs.applyStatus.failed",            color: "#ef4444" },
+  "dry-run": { icon: "🔍", labelKey: "jobs.applyStatus.dryRun",          color: "#6b7280" },
 };
 
 export default function ApplyStatusCard({ jobId, jobUrl, jobStatus }: { jobId: string; jobUrl?: string; jobStatus?: string }) {
+  const { lang, t } = useI18n()
   const [result, setResult] = useState<ApplyResult | null>(null);
   const [loading, setLoading] = useState(true);
   const [applying, setApplying] = useState(false);
@@ -63,7 +65,7 @@ export default function ApplyStatusCard({ jobId, jobUrl, jobStatus }: { jobId: s
       setResult(null);
       void fetchResult();
     } catch (error) {
-      setRetryError(error instanceof Error ? error.message : "Could not queue the application.");
+      setRetryError(lang === 'zh' ? t('common.somethingWentWrong') : error instanceof Error ? error.message : t('jobs.applyStatus.queueFailed'));
     } finally {
       setApplying(false);
     }
@@ -76,15 +78,15 @@ export default function ApplyStatusCard({ jobId, jobUrl, jobStatus }: { jobId: s
       return (
         <div style={{ marginTop: 8, padding: '8px 12px', borderRadius: 6, background: 'var(--bg-secondary)', border: '1px solid var(--border)', display: 'flex', alignItems: 'center', gap: 8 }}>
           <div style={{ width: 10, height: 10, borderRadius: '50%', border: '2px solid #185FA5', borderTopColor: 'transparent', animation: 'spin 0.8s linear infinite', flexShrink: 0 }} />
-          <span style={{ fontSize: 13, color: 'var(--text-secondary)' }}>Applying in background…</span>
+          <span style={{ fontSize: 13, color: 'var(--text-secondary)' }}>{t('jobs.applyingBackground')}</span>
         </div>
       )
     }
     return null
   }
 
-  const cfg = STATUS_CONFIG[result.status] ?? { icon: "📋", label: result.status, color: "#6b7280" };
-  const flowLabel = result.flowUsed === "pattern-cache" ? "Pattern Replay (cached)" : result.flowUsed === "programmatic" ? "Pre-programmed flow" : result.flowUsed === "llm" ? "AI agent" : result.flowUsed;
+  const cfg = STATUS_CONFIG[result.status] ?? { icon: "📋", labelKey: "jobs.applyStatus.unknown", color: "#6b7280" };
+  const flowLabel = result.flowUsed === "pattern-cache" ? t('jobs.applyStatus.patternReplay') : result.flowUsed === "programmatic" ? t('jobs.applyStatus.programmedFlow') : result.flowUsed === "llm" ? t('jobs.applyStatus.aiAgent') : result.flowUsed;
   const durationSec = Math.round(result.durationMs / 1000);
 
   return (
@@ -97,14 +99,14 @@ export default function ApplyStatusCard({ jobId, jobUrl, jobStatus }: { jobId: s
     }}>
       <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 6 }}>
         <span style={{ fontSize: 18 }}>{cfg.icon}</span>
-        <span style={{ fontWeight: 600, fontSize: 14, color: cfg.color }}>{cfg.label}</span>
+        <span style={{ fontWeight: 600, fontSize: 14, color: cfg.color }}>{t(cfg.labelKey)}</span>
       </div>
 
       <div style={{ fontSize: 12, color: "var(--text-muted)", display: "flex", flexDirection: "column", gap: 4 }}>
         {flowLabel && <span>{flowLabel}  ·  {durationSec}s</span>}
         {result.error && (
           <span style={{ color: "#ef4444" }}>
-            {result.error.length > 120 ? result.error.slice(0, 120) + "…" : result.error}
+            {lang === 'zh' ? t('common.somethingWentWrong') : result.error.length > 120 ? result.error.slice(0, 120) + "…" : result.error}
           </span>
         )}
       </div>
@@ -112,7 +114,7 @@ export default function ApplyStatusCard({ jobId, jobUrl, jobStatus }: { jobId: s
       {result.status === "manual" && result.error && (
         <div style={{ marginTop: 8 }}>
           <a href={jobUrl ?? '#'} target="_blank" rel="noopener noreferrer" style={{ fontSize: 13, color: "#185FA5" }}>
-            Apply manually ↗
+            {t('jobs.applyStatus.applyManually')} ↗
           </a>
         </div>
       )}
@@ -134,9 +136,9 @@ export default function ApplyStatusCard({ jobId, jobUrl, jobStatus }: { jobId: s
               opacity: applying ? 0.6 : 1,
             }}
           >
-            {applying ? "Queueing…" : "🔄 Queue retry"}
+            {applying ? t('jobs.applyStatus.queueing') : `🔄 ${t('jobs.applyStatus.queueRetry')}`}
           </button>
-          {retryError && <div style={{ marginTop: 6, fontSize: 12, color: "#ef4444" }}>{retryError}</div>}
+          {retryError && <div style={{ marginTop: 6, fontSize: 12, color: "#ef4444" }}>{lang === 'zh' ? t('common.somethingWentWrong') : retryError}</div>}
         </>
       )}
     </div>

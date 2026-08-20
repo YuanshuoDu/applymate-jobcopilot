@@ -4,6 +4,7 @@ import { useEffect, useMemo, useState } from 'react'
 import { AlertTriangle, Check, FileCheck2, FileText, Link2, LoaderCircle, Sparkles, X } from 'lucide-react'
 import { ResumeRenderer } from '@/components/resume/ResumeRenderer'
 import type { ApplicationAudit, Job, ResumeContent, TemplateOptions } from '@/lib/types'
+import { useI18n } from '@/lib/i18n'
 
 type ReadinessItem = {
   id: 'suggestions' | 'template' | 'cover-letter' | 'job' | 'audit' | 'copy'
@@ -48,50 +49,51 @@ export function FinalConfirmDialog({
   job, resumeName, templateName, pendingSuggestions, isDirty, packReady, resumeContent, templateId, templateOptions, coverLetterContent,
   onClose, onReviewSuggestions, onCreateCoverLetter, onLinkJob, onAudit, onConfirm, onDownload, exportedPackFolder,
 }: Props) {
+  const { t } = useI18n()
   const [audit, setAudit] = useState<ApplicationAudit | null>(null)
   const items = useMemo<ReadinessItem[]>(() => [
     {
       id: 'suggestions',
-      label: 'Checking AI suggestions',
-      detail: pendingSuggestions ? `${pendingSuggestions} suggestion${pendingSuggestions === 1 ? '' : 's'} still need review` : 'All applicable suggestions are applied',
+      label: t('resume.checkingAiSuggestions'),
+      detail: pendingSuggestions ? `${pendingSuggestions} ${t(pendingSuggestions === 1 ? 'resume.suggestion' : 'resume.suggestions')} ${t('resume.stillNeedReview')}` : t('resume.allSuggestionsApplied'),
       complete: pendingSuggestions === 0,
-      action: pendingSuggestions ? 'Review' : undefined,
+      action: pendingSuggestions ? t('common.review') : undefined,
     },
     {
       id: 'template',
-      label: 'Verifying template',
-      detail: `${templateName} template is applied`,
+      label: t('resume.verifyingTemplate'),
+      detail: `${templateName} ${t('resume.templateApplied')}`,
       complete: Boolean(templateName),
     },
     {
       id: 'cover-letter',
-      label: 'Checking final cover letter',
-      detail: coverLetterContent ? 'A matching final cover letter is linked and will be audited against this resume.' : job ? 'Select a final cover letter made for this resume version before confirming.' : 'Link a job to create and select a cover letter.',
+      label: t('resume.checkingCoverLetter'),
+      detail: coverLetterContent ? t('resume.coverLetterLinked') : job ? t('resume.selectCoverLetter') : t('resume.linkJobForCoverLetter'),
       complete: Boolean(coverLetterContent),
-      action: job && !coverLetterContent ? 'Create now' : undefined,
+      action: job && !coverLetterContent ? t('resume.createNow') : undefined,
     },
     {
       id: 'audit',
-      label: 'Independent Auditor review',
-      detail: audit ? audit.summary : 'Compares the final resume and cover letter with the pre-tailoring resume and job description.',
+      label: t('resume.independentAudit'),
+      detail: audit ? audit.summary : t('resume.auditComparison'),
       complete: audit?.verdict === 'pass',
       blocking: true,
     },
     {
       id: 'job',
-      label: 'Confirming saved job link',
-      detail: job ? `${job.company} · ${job.role}` : 'This resume is not linked to My Jobs yet',
+      label: t('resume.confirmingJobLink'),
+      detail: job ? `${job.company} · ${job.role}` : t('resume.notLinkedToJobs'),
       complete: Boolean(job),
-      action: job ? undefined : 'Link job',
+      action: job ? undefined : t('resume.linkJob'),
     },
     {
       id: 'copy',
-      label: 'Preparing application-ready copy',
-      detail: packReady ? 'PDF application pack is ready to download' : isDirty ? 'Save the latest edits before finalising' : 'It will be generated only after you confirm',
+      label: t('resume.preparingApplicationCopy'),
+      detail: packReady ? t('resume.pdfPackReady') : isDirty ? t('resume.saveLatestEdits') : t('resume.generatedAfterConfirm'),
       complete: packReady,
       blocking: false,
     },
-  ], [audit, coverLetterContent, isDirty, job, packReady, pendingSuggestions, templateName])
+  ], [audit, coverLetterContent, isDirty, job, packReady, pendingSuggestions, templateName, t])
 
   const [checkedCount, setCheckedCount] = useState(0)
   const [confirming, setConfirming] = useState(false)
@@ -130,12 +132,12 @@ export function FinalConfirmDialog({
   return (
     <div className="final-confirm-backdrop" role="presentation" onMouseDown={event => { if (event.target === event.currentTarget) onClose() }}>
       <section className="final-confirm-dialog" role="dialog" aria-modal="true" aria-labelledby="final-confirm-title">
-        <button className="final-confirm-close" onClick={onClose} aria-label="Close final confirmation"><X size={18} /></button>
+        <button className="final-confirm-close" onClick={onClose} aria-label={t('resume.closeFinalConfirmation')}><X size={18} /></button>
         <div className="final-confirm-heading">
           <span className="final-confirm-shield"><Check size={17} /></span>
           <div>
-            <h2 id="final-confirm-title">Final confirm</h2>
-            <p>We&apos;ll run a final check before creating your application-ready PDF.</p>
+            <h2 id="final-confirm-title">{t('resume.finalConfirm')}</h2>
+            <p>{t('resume.finalCheckBeforePdf')}</p>
           </div>
         </div>
 
@@ -155,7 +157,7 @@ export function FinalConfirmDialog({
                   <span>{item.detail}</span>
                 </div>
                 {checked && item.action && <button onClick={() => runAction(item)}>{item.action}</button>}
-                {checked && !item.action && <span className="final-confirm-status">{item.id === 'audit' && confirming ? 'Auditing…' : item.complete ? 'Completed' : item.blocking === false ? 'After confirm' : 'Needs review'}</span>}
+                {checked && !item.action && <span className="final-confirm-status">{item.id === 'audit' && confirming ? t('resume.auditing') : item.complete ? t('resume.completed') : item.blocking === false ? t('resume.afterConfirm') : t('resume.needsReview')}</span>}
               </div>
             )
           })}
@@ -163,34 +165,34 @@ export function FinalConfirmDialog({
 
         {job && <div className="final-confirm-job">
           <Link2 size={16} />
-          <div><strong>{job.role}</strong><span>{job.company} · Linked in My Jobs</span></div>
+          <div><strong>{job.role}</strong><span>{job.company} · {t('resume.linkedInMyJobs')}</span></div>
         </div>}
 
         <div className="final-confirm-footer">
           {confirmed ? <>
-            <div className="final-confirm-ready"><Check size={15} /> Application pack confirmed</div>
-            <button className="final-confirm-primary" onClick={() => void onDownload()}><FileCheck2 size={16} /> {exportedPackFolder ? 'Open job folder' : 'Save PDFs to D:\\My Jobs resume'}</button>
+            <div className="final-confirm-ready"><Check size={15} /> {t('resume.applicationPackConfirmed')}</div>
+            <button className="final-confirm-primary" onClick={() => void onDownload()}><FileCheck2 size={16} /> {exportedPackFolder ? t('resume.openJobFolder') : t('resume.savePdfs')}</button>
           </> : <>
-            <button className="final-confirm-secondary" onClick={onClose}>Back to edit</button>
+            <button className="final-confirm-secondary" onClick={onClose}>{t('resume.backToEdit')}</button>
             <button className="final-confirm-primary" disabled={!ready || confirming} onClick={() => void handleConfirm()}>
               {confirming ? <LoaderCircle size={16} /> : <Check size={16} />}
-              {confirming ? 'Auditing final materials…' : audit?.verdict === 'needs_review' || audit?.verdict === 'blocked' ? 'Audit again' : 'Audit & confirm package'}
+              {confirming ? t('resume.auditingFinal') : audit?.verdict === 'needs_review' || audit?.verdict === 'blocked' ? t('resume.auditAgain') : t('resume.auditConfirmPackage')}
             </button>
           </>}
         </div>
         {audit && audit.verdict !== 'pass' && (
           <div className="final-confirm-audit-results">
-            <strong>{audit.verdict === 'blocked' ? 'Audit blocked confirmation' : 'Audit needs review'}</strong>
+            <strong>{audit.verdict === 'blocked' ? t('resume.auditBlocked') : t('resume.auditNeedsReview')}</strong>
             {audit.findings.filter(finding => finding.severity !== 'pass').map((finding, index) => (
               <div key={`${finding.title}-${index}`}><b>{finding.title}</b><span>{finding.evidence} — {finding.action}</span></div>
             ))}
           </div>
         )}
         {confirmed && <div className="final-material-preview">
-          <div><strong>Final resume</strong><div className="final-material-preview-resume"><ResumeRenderer content={resumeContent} templateId={templateId} templateOptions={templateOptions} scale={0.42} /></div></div>
-          <div><strong>Final cover letter</strong><div className="final-material-preview-letter">{coverLetterContent ?? 'No final cover letter selected.'}</div></div>
+          <div><strong>{t('resume.finalResume')}</strong><div className="final-material-preview-resume"><ResumeRenderer content={resumeContent} templateId={templateId} templateOptions={templateOptions} scale={0.42} /></div></div>
+          <div><strong>{t('resume.finalCoverLetter')}</strong><div className="final-material-preview-letter">{coverLetterContent ?? t('resume.noCoverLetter')}</div></div>
         </div>}
-        {!confirmed && <p className="final-confirm-note">A confirmed copy is available to the writer agent and can be exported as PDF whenever you&apos;re ready to apply.</p>}
+        {!confirmed && <p className="final-confirm-note">{t('resume.confirmedCopyNote')}</p>}
         <span className="final-confirm-resume-name">{resumeName}</span>
       </section>
     </div>

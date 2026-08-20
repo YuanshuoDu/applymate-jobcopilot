@@ -4,6 +4,7 @@ import { useEffect, useRef, useState } from 'react'
 import { useParams } from 'next/navigation'
 import { ResumeRenderer } from '@/components/resume/ResumeRenderer'
 import type { Resume, TemplateOptions } from '@/lib/types'
+import { useI18n } from '@/lib/i18n'
 
 // A4 at 96 dpi: 297mm / 25.4 * 96 = 1122.52 → round up to 1123px
 // CSS print uses exact mm units (297mm / 594mm) for pixel-perfect page alignment
@@ -63,20 +64,20 @@ function applyFit(el: HTMLDivElement): FitResult {
 }
 
 // ── Status pill shown in the toolbar ─────────────────────────────────────────
-function FitBadge({ fit }: { fit: FitResult }) {
+function FitBadge({ fit, t }: { fit: FitResult; t: (key: string) => string }) {
   const pct = Math.round(fit.ratio * 100)
 
   const configs = {
     'too-short':  { color: '#A32D2D', bg: 'rgba(163,45,45,0.08)', border: 'rgba(163,45,45,0.2)',
-                    label: `⚠ Only ${pct}% full — add more content` },
+                    label: `⚠ ${t('print.onlyFull').replace('{pct}', String(pct))}` },
     'one-page':   { color: '#2E6B4F', bg: 'rgba(46,107,79,0.08)',  border: 'rgba(46,107,79,0.2)',
-                    label: `✓ 1 page · ${pct}% full` },
+                    label: `✓ ${t('print.onePage').replace('{pct}', String(pct))}` },
     'scaled-one': { color: '#2E6B4F', bg: 'rgba(46,107,79,0.08)',  border: 'rgba(46,107,79,0.2)',
-                    label: `✓ Fitted to 1 page · ${Math.round((fit as { scale: number }).scale * 100)}% zoom` },
+                    label: `✓ ${t('print.fittedOnePage').replace('{pct}', String(Math.round((fit as { scale: number }).scale * 100)))}` },
     'two-page':   { color: '#185FA5', bg: 'rgba(24,95,165,0.08)',  border: 'rgba(24,95,165,0.2)',
-                    label: `✓ 2 pages · Page 2 ${Math.round((fit.ratio - 1) * 100)}% full` },
+                    label: `✓ ${t('print.twoPages').replace('{pct}', String(Math.round((fit.ratio - 1) * 100)))}` },
     'too-long':   { color: '#A32D2D', bg: 'rgba(163,45,45,0.08)', border: 'rgba(163,45,45,0.2)',
-                    label: `⚠ ${(fit as { pages: number }).pages} pages — consider shortening` },
+                    label: `⚠ ${t('print.tooLong').replace('{pages}', String((fit as { pages: number }).pages))}` },
   }
 
   const c = configs[fit.type]
@@ -89,6 +90,7 @@ function FitBadge({ fit }: { fit: FitResult }) {
 
 // ── Main component ────────────────────────────────────────────────────────────
 export default function PrintResumePage() {
+  const { t } = useI18n()
   const params = useParams<{ id: string }>()
 
   // Read localStorage snapshot written by the PDF button (always current state, no DB lag)
@@ -161,7 +163,7 @@ export default function PrintResumePage() {
     <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', height: '100vh', fontFamily: 'system-ui', color: '#555' }}>
       <div style={{ textAlign: 'center' }}>
         <div style={{ width: 28, height: 28, border: '3px solid #e5e7eb', borderTopColor: '#185FA5', borderRadius: '50%', animation: 'spin 0.7s linear infinite', margin: '0 auto 12px' }} />
-        <div>Preparing resume…</div>
+        <div>{t('print.preparing')}</div>
       </div>
       <style>{`@keyframes spin { to { transform: rotate(360deg) } }`}</style>
     </div>
@@ -171,8 +173,8 @@ export default function PrintResumePage() {
     <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', height: '100vh', fontFamily: 'system-ui' }}>
       <div style={{ textAlign: 'center', color: '#A32D2D' }}>
         <div style={{ fontSize: 32, marginBottom: 8 }}>⚠</div>
-        <div>{error ?? 'Resume not found'}</div>
-        <button onClick={() => window.close()} style={{ marginTop: 16, padding: '6px 16px', border: '1px solid #d1d5db', borderRadius: 6, background: '#fff', cursor: 'pointer' }}>Close</button>
+        <div>{error ?? t('print.notFound')}</div>
+        <button onClick={() => window.close()} style={{ marginTop: 16, padding: '6px 16px', border: '1px solid #d1d5db', borderRadius: 6, background: '#fff', cursor: 'pointer' }}>{t('print.close')}</button>
       </div>
     </div>
   )
@@ -230,9 +232,9 @@ export default function PrintResumePage() {
       {/* Toolbar */}
       <div className="toolbar">
         <span className="resume-name">{resume.name}</span>
-{fit && <FitBadge fit={fit} />}
-        <button className="tb-btn" onClick={() => window.close()}>✕ Close</button>
-        <button className="tb-btn primary" onClick={() => window.print()}>⬇ Save as PDF</button>
+{fit && <FitBadge fit={fit} t={t} />}
+        <button className="tb-btn" onClick={() => window.close()}>✕ {t('print.close')}</button>
+        <button className="tb-btn primary" onClick={() => window.print()}>⬇ {t('print.savePdf')}</button>
       </div>
 
       {/* Resume */}
@@ -240,7 +242,7 @@ export default function PrintResumePage() {
         {/* Page-break line between page 1 and 2 (screen only) */}
         {isTwoPage && (
           <div className="page-break-line">
-            <span className="page-break-label">Page 2</span>
+            <span className="page-break-label">{t('print.pageTwo')}</span>
           </div>
         )}
 

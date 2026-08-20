@@ -5,6 +5,7 @@ import { Btn } from '@/components/ui'
 import type { ResumeContent } from '@/lib/types'
 import { InlineInput } from './InlineInput'
 import { SectionHeader, type DragHandleProps } from './SectionHeader'
+import { useI18n } from '@/lib/i18n'
 
 export function EducationSection({ education, onChange, dragHandleProps, onRemove }: {
   education:        ResumeContent['education']
@@ -12,6 +13,7 @@ export function EducationSection({ education, onChange, dragHandleProps, onRemov
   dragHandleProps?: DragHandleProps
   onRemove?:        () => void
 }) {
+  const { t } = useI18n()
   const [editIdx,   setEditIdx]   = useState<number | null>(null)
   const [collapsed, setCollapsed] = useState(false)
   const [dragOver,  setDragOver]  = useState<number | null>(null)
@@ -33,7 +35,7 @@ export function EducationSection({ education, onChange, dragHandleProps, onRemov
   return (
     <div style={{ marginBottom: 20 }}>
       <SectionHeader
-        title="EDUCATION"
+        title={t('resume.section.education')}
         count={education.length}
         collapsed={collapsed}
         onToggle={() => setCollapsed(v => !v)}
@@ -45,19 +47,19 @@ export function EducationSection({ education, onChange, dragHandleProps, onRemov
       {!collapsed && (
         <>
           {education.length === 0 && (
-            <div style={{ fontSize: 12, color: 'var(--text-muted)', padding: '8px 4px' }}>No education added yet.</div>
+            <div style={{ fontSize: 12, color: 'var(--text-muted)', padding: '8px 4px' }}>{t('resume.noEducation')}</div>
           )}
 
           {education.map((e, i) => (
             editIdx === i ? (
               <div key={i} style={{ border: '0.5px solid var(--primary)', borderRadius: 6, padding: 10, marginBottom: 8 }}>
-                <InlineInput value={e.degree}      onChange={v => { const n=[...education]; n[i]={...n[i],degree:v};      onChange(n) }} placeholder="Degree (e.g. BSc Computer Science)" style={{ marginBottom: 6 }} />
-                <InlineInput value={e.institution} onChange={v => { const n=[...education]; n[i]={...n[i],institution:v}; onChange(n) }} placeholder="Institution" style={{ marginBottom: 6 }} />
-                <InlineInput value={e.year}        onChange={v => { const n=[...education]; n[i]={...n[i],year:v};        onChange(n) }} placeholder="Year (e.g. 2020)" />
+                <InlineInput value={e.degree}      onChange={v => { const n=[...education]; n[i]={...n[i],degree:v};      onChange(n) }} placeholder={t('resume.degreePlaceholder')} style={{ marginBottom: 6 }} />
+                <InlineInput value={e.institution} onChange={v => { const n=[...education]; n[i]={...n[i],institution:v}; onChange(n) }} placeholder={t('resume.institution')} style={{ marginBottom: 6 }} />
+                <InlineInput value={e.year}        onChange={v => { const n=[...education]; n[i]={...n[i],year:v};        onChange(n) }} placeholder={t('resume.yearPlaceholder')} />
                 <div style={{ display: 'flex', justifyContent: 'space-between', marginTop: 8 }}>
                   <button onClick={() => { onChange(education.filter((_,xi)=>xi!==i)); setEditIdx(null) }}
-                    style={{ fontSize: 10, color: 'var(--c-danger)', background: 'none', border: 'none', cursor: 'pointer' }}>Delete</button>
-                  <Btn small variant="primary" onClick={() => setEditIdx(null)}>Done</Btn>
+                    style={{ fontSize: 10, color: 'var(--c-danger)', background: 'none', border: 'none', cursor: 'pointer' }}>{t('common.delete')}</button>
+                  <Btn small variant="primary" onClick={() => setEditIdx(null)}>{t('common.done')}</Btn>
                 </div>
               </div>
             ) : (
@@ -72,10 +74,10 @@ export function EducationSection({ education, onChange, dragHandleProps, onRemov
                   background: dragOver===i ? 'rgba(24,95,165,0.03)' : 'transparent' }}
                 onMouseEnter={e => { if(dragOver!==i)(e.currentTarget as HTMLDivElement).style.background='var(--bg-secondary)' }}
                 onMouseLeave={e => { if(dragOver!==i)(e.currentTarget as HTMLDivElement).style.background='transparent' }}>
-                <span title="Drag to reorder" style={{ fontSize: 13, color: 'var(--border)', cursor: 'grab', marginTop: 2, flexShrink: 0, userSelect: 'none' }}>⠿</span>
+                <span title={t('resume.dragToReorder')} style={{ fontSize: 13, color: 'var(--border)', cursor: 'grab', marginTop: 2, flexShrink: 0, userSelect: 'none' }}>⠿</span>
                 <div style={{ flex: 1, display: 'flex', justifyContent: 'space-between' }} onClick={() => setEditIdx(i)}>
                   <div>
-                    <span style={{ fontSize: 12, fontWeight: 500 }}>{e.degree || <em style={{ color: 'var(--text-muted)' }}>Degree</em>}</span>
+                    <span style={{ fontSize: 12, fontWeight: 500 }}>{e.degree || <em style={{ color: 'var(--text-muted)' }}>{t('resume.degree')}</em>}</span>
                     {e.institution && <span style={{ fontSize: 12, color: 'var(--text-muted)' }}> · {e.institution}</span>}
                   </div>
                   <span style={{ fontSize: 11, color: 'var(--text-muted)' }}>{e.year}</span>

@@ -1,8 +1,10 @@
 import React from 'react'
+import { useI18n } from '@/lib/i18n'
 
 export function AgentNewChatWelcome() {
+  const { t } = useI18n()
   return (
-    <section aria-label="New chat welcome" style={{ flex: 1, minHeight: 0, display: 'grid', placeItems: 'center', padding: 'clamp(28px, 7vh, 88px) 20px' }}>
+    <section aria-label={t('agent.newChatWelcome')} style={{ flex: 1, minHeight: 0, display: 'grid', placeItems: 'center', padding: 'clamp(28px, 7vh, 88px) 20px' }}>
       <div style={{ display: 'grid', justifyItems: 'center', gap: 15, textAlign: 'center' }}>
         <span aria-label="ApplyMate AI" style={{
           width: 58, height: 58, display: 'grid', placeItems: 'center', borderRadius: 18,
@@ -11,10 +13,10 @@ export function AgentNewChatWelcome() {
         }}>A</span>
         <div>
           <h1 style={{ margin: 0, fontSize: 'clamp(23px, 3vw, 32px)', lineHeight: 1.16, letterSpacing: '-0.04em', color: 'var(--text)' }}>
-            What can I help you with?
+            {t('agent.whatHelp')}
           </h1>
           <p style={{ margin: '9px auto 0', fontSize: 13, lineHeight: 1.55, color: 'var(--text-muted)' }}>
-            Start a new ApplyMate conversation below.
+            {t('agent.startConversation')}
           </p>
         </div>
       </div>

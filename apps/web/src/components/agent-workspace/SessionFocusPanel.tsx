@@ -5,16 +5,18 @@ import { useApi } from '@/lib/hooks'
 import type { AgentSessionDetail } from './session-view-model'
 import { confidenceLabel, sessionStatusLabel, taskStatusColor, taskStatusLabel } from './session-view-model'
 import { formQuestionFields } from '@/lib/agent/application-task-input'
+import { useI18n } from '@/lib/i18n'
 
 interface DetailResponse {
   session: AgentSessionDetail
 }
 
 export function SessionFocusPanel({ sessionId }: { sessionId: string | null }) {
+  const { t } = useI18n()
   if (!sessionId) {
     return (
-      <Section title="Queued Tasks">
-        <EmptyText>Select a session to inspect tasks, approvals, and quality.</EmptyText>
+      <Section title={t('agent.queuedTasks')}>
+        <EmptyText>{t('agent.selectSessionDetails')}</EmptyText>
       </Section>
     )
   }
@@ -23,6 +25,7 @@ export function SessionFocusPanel({ sessionId }: { sessionId: string | null }) {
 }
 
 function SessionFocusPanelInner({ sessionId }: { sessionId: string }) {
+  const { t } = useI18n()
   const { data, loading, error, refetch } = useApi<DetailResponse>(`/api/agent/sessions/${sessionId}`)
   const session = data?.session
   const tasks = session?.tasks ?? []
@@ -82,30 +85,30 @@ function SessionFocusPanelInner({ sessionId }: { sessionId: string }) {
 
   return (
     <>
-      <Section title="Queued Tasks">
-        {loading && <EmptyText>Loading tasks...</EmptyText>}
+      <Section title={t('agent.queuedTasks')}>
+        {loading && <EmptyText>{t('agent.loadingTasks')}</EmptyText>}
         {error && <EmptyText>
-          Couldn&apos;t refresh this session&apos;s side-panel details. <button type="button" onClick={() => { void refetch() }} style={retryButtonStyle}>Retry</button>
+          {t('agent.sessionDetailsUnavailable')} <button type="button" onClick={() => { void refetch() }} style={retryButtonStyle}>{t('agent.retry')}</button>
         </EmptyText>}
-        {!loading && !error && visibleTasks.length === 0 && <EmptyText>No task records yet.</EmptyText>}
+        {!loading && !error && visibleTasks.length === 0 && <EmptyText>{t('agent.noTaskRecords')}</EmptyText>}
         {visibleTasks.map(task => <TaskRow key={task.id} task={task} />)}
       </Section>
 
-      <Section title="Approvals">
-        {!loading && pendingApprovals.length === 0 && <EmptyText>No pending approvals.</EmptyText>}
+      <Section title={t('agent.approvals')}>
+        {!loading && pendingApprovals.length === 0 && <EmptyText>{t('agent.noPendingApprovals')}</EmptyText>}
         {pendingApprovals.slice(0, 3).map(approval => (
           <div key={approval.id} style={rowStyle}>
             <div style={{ minWidth: 0, flex: 1 }}>
               <div style={rowTitleStyle}>{approval.title}</div>
               <div style={rowMetaStyle}>{approval.type} · {sessionStatusLabel(approval.status)}</div>
             </div>
-            <span style={{ ...badgeStyle, color: '#d97706' }}>waiting</span>
+            <span style={{ ...badgeStyle, color: '#d97706' }}>{t('agent.waiting')}</span>
           </div>
         ))}
       </Section>
 
-      <Section title="Application Tasks">
-        {!loading && applicationTasks.length === 0 && <EmptyText>No application tasks yet.</EmptyText>}
+      <Section title={t('agent.applicationTasks')}>
+        {!loading && applicationTasks.length === 0 && <EmptyText>{t('agent.noApplicationTasks')}</EmptyText>}
         {applicationTasks.slice(0, 5).map(task => {
           const fields = task.status === 'waiting_for_user' && task.checkpoint === 'form_answer_required' ? formQuestionFields(task.question) : []
           return (
@@ -117,30 +120,30 @@ function SessionFocusPanelInner({ sessionId }: { sessionId: string }) {
               {fields.map(field => (
                 <input key={field} value={answers[`${task.id}:${field}`] ?? ''} onChange={event => setAnswers(current => ({ ...current, [`${task.id}:${field}`]: event.target.value }))} placeholder={field} style={answerInputStyle} />
               ))}
-              {fields.length > 0 && <button onClick={() => { void answerAndResume(task.id, fields) }} style={resumeButtonStyle}>Confirm answers & resume</button>}
+              {fields.length > 0 && <button onClick={() => { void answerAndResume(task.id, fields) }} style={resumeButtonStyle}>{t('agent.confirmAnswersResume')}</button>}
             </div>
             {!['submitted', 'skipped', 'cancelled'].includes(task.status) && (
-              <button onClick={() => { void cancelApplicationTask(task.id) }} style={{ fontSize: 9, color: '#b91c1c', border: '1px solid var(--border)', background: 'transparent', borderRadius: 5, padding: '3px 5px', cursor: 'pointer' }}>Cancel</button>
+              <button onClick={() => { void cancelApplicationTask(task.id) }} style={{ fontSize: 9, color: '#b91c1c', border: '1px solid var(--border)', background: 'transparent', borderRadius: 5, padding: '3px 5px', cursor: 'pointer' }}>{t('agent.cancel')}</button>
             )}
           </div>
           )
         })}
       </Section>
 
-      <Section title="Execution Control">
-        {!loading && !execution && <EmptyText>No durable execution has started for this session.</EmptyText>}
+      <Section title={t('agent.executionControl')}>
+        {!loading && !execution && <EmptyText>{t('agent.noExecution')}</EmptyText>}
         {execution && <div style={rowStyle}>
           <div style={{ minWidth: 0, flex: 1 }}>
             <div style={rowTitleStyle}>{execution.status} · {execution.checkpoint}</div>
             <div style={rowMetaStyle}>attempt {execution.attemptCount}</div>
             {execution.error && <div style={{ ...rowMetaStyle, color: '#b91c1c' }}>{execution.error}</div>}
           </div>
-          {!['completed', 'failed', 'cancelled'].includes(execution.status) && <button onClick={() => { void cancelExecution(execution.id) }} style={{ fontSize: 9, color: '#b91c1c', border: '1px solid var(--border)', background: 'transparent', borderRadius: 5, padding: '3px 5px', cursor: 'pointer' }}>Cancel run</button>}
+          {!['completed', 'failed', 'cancelled'].includes(execution.status) && <button onClick={() => { void cancelExecution(execution.id) }} style={{ fontSize: 9, color: '#b91c1c', border: '1px solid var(--border)', background: 'transparent', borderRadius: 5, padding: '3px 5px', cursor: 'pointer' }}>{t('agent.cancelRun')}</button>}
         </div>}
       </Section>
 
-      <Section title="Questions Waiting for You">
-        {!loading && questions.length === 0 && <EmptyText>No unanswered Agent questions.</EmptyText>}
+      <Section title={t('agent.questionsWaiting')}>
+        {!loading && questions.length === 0 && <EmptyText>{t('agent.noQuestions')}</EmptyText>}
         {questions.map(question => {
           const options = questionOptions(question.options)
           return <div key={question.id} style={rowStyle}>
@@ -155,12 +158,12 @@ function SessionFocusPanelInner({ sessionId }: { sessionId: string }) {
         })}
       </Section>
 
-      <Section title="Session Quality">
+      <Section title={t('agent.sessionQuality')}>
         <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8 }}>
-          <QualityMetric label="Quality" value={session?.qualityScore == null ? '--' : `${Math.round(session.qualityScore)}%`} />
-          <QualityMetric label="Tasks" value={tasks.length.toString()} />
-          <QualityMetric label="Approvals" value={approvals.length.toString()} warn={pendingApprovals.length > 0} />
-          <QualityMetric label="Status" value={session ? sessionStatusLabel(session.status) : '--'} />
+          <QualityMetric label={t('agent.quality')} value={session?.qualityScore == null ? '--' : `${Math.round(session.qualityScore)}%`} />
+          <QualityMetric label={t('agent.tasks')} value={tasks.length.toString()} />
+          <QualityMetric label={t('agent.approvals')} value={approvals.length.toString()} warn={pendingApprovals.length > 0} />
+          <QualityMetric label={t('common.status')} value={session ? sessionStatusLabel(session.status) : '--'} />
         </div>
       </Section>
     </>

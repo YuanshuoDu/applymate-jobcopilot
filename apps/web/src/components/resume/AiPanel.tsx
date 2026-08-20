@@ -3,6 +3,7 @@
 import { useState } from 'react'
 import { MatchScoreRing, Divider } from '@/components/ui'
 import type { Job, ScoreResult, Suggestion } from '@/lib/types'
+import { useI18n } from '@/lib/i18n'
 
 function SectionHeader({ label, count, collapsed, onToggle }: {
   label: string; count?: number; collapsed: boolean; onToggle: () => void
@@ -22,11 +23,11 @@ function SectionHeader({ label, count, collapsed, onToggle }: {
 
 // Keys in both Title Case (sectionMatches) and lowercase (missingItems.target) for safe lookups
 const SEC_LABELS: Record<string, string> = {
-  Summary: '📝 Summary',    summary: '📝 Summary',
-  Experience: '💼 Experience', experience: '💼 Experience',
-  Skills: '🏷 Skills',      skills: '🏷 Skills',
-  Education: '🎓 Education', education: '🎓 Education',
-  Projects: '📦 Projects',  projects: '📦 Projects',
+  Summary: 'resume.aiSection.summary',    summary: 'resume.aiSection.summary',
+  Experience: 'resume.aiSection.experience', experience: 'resume.aiSection.experience',
+  Skills: 'resume.aiSection.skills',      skills: 'resume.aiSection.skills',
+  Education: 'resume.aiSection.education', education: 'resume.aiSection.education',
+  Projects: 'resume.aiSection.projects',  projects: 'resume.aiSection.projects',
 }
 const SEC_ORDER = ['Summary', 'Skills', 'Experience', 'Education', 'Projects']
 
@@ -47,6 +48,7 @@ export function AiPanel({ selectedJob, scoreResult, suggestions, scoring, sugges
   contentChangedSinceAnalysis?: boolean
   onAudit?:                     () => void
 }) {
+  const { t } = useI18n()
   const [suggestCollapsed, setSuggestCollapsed] = useState(false)
   const [scoresCollapsed,  setScoresCollapsed]  = useState(false)
   const [copied,           setCopied]           = useState<number | null>(null)
@@ -70,7 +72,7 @@ export function AiPanel({ selectedJob, scoreResult, suggestions, scoring, sugges
 
       {/* Job context + score */}
       <div style={{ background: 'rgba(79,70,229,0.06)', border: '0.5px solid rgba(79,70,229,0.20)', borderRadius: 7, padding: 10 }}>
-        <div style={{ fontSize: 10, color: 'var(--text-muted)', marginBottom: 4 }}>TAILORING FOR</div>
+        <div style={{ fontSize: 10, color: 'var(--text-muted)', marginBottom: 4 }}>{t('resume.tailoringFor')}</div>
         {selectedJob ? (
           <>
             <div style={{ fontSize: 12, fontWeight: 500 }}>{selectedJob.role}</div>
@@ -79,7 +81,7 @@ export function AiPanel({ selectedJob, scoreResult, suggestions, scoring, sugges
               {scoring ? (
                 <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
                   <div style={{ width: 16, height: 16, border: '2px solid rgba(79,70,229,0.30)', borderTopColor: 'var(--primary)', borderRadius: '50%', animation: 'spin 0.7s linear infinite' }} />
-                  <span style={{ fontSize: 10, color: 'var(--text-muted)' }}>Analyzing…</span>
+                  <span style={{ fontSize: 10, color: 'var(--text-muted)' }}>{t('resume.analyzing')}</span>
                 </div>
               ) : scoreResult ? (
                 <>
@@ -94,34 +96,34 @@ export function AiPanel({ selectedJob, scoreResult, suggestions, scoring, sugges
                     return (<div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
                       <div style={{ textAlign: 'center' }}>
                         <MatchScoreRing score={scoreResult.score} size="sm" showLabel />
-                        <div style={{ fontSize: 7, color: 'var(--text-muted)', marginTop: 1 }}>Position Match</div>
+                        <div style={{ fontSize: 7, color: 'var(--text-muted)', marginTop: 1 }}>{t('resume.positionMatch')}</div>
                       </div>
                       <span style={{ fontSize: 10, color: 'var(--text-muted)' }}>→</span>
                       <div style={{ textAlign: 'center' }}>
                         <MatchScoreRing score={optScore} size="sm" showLabel />
                         <div style={{ fontSize: 7, color: delta > 0 ? 'var(--c-success)' : 'var(--text-muted)', marginTop: 1 }}>
-                          CV Optimisation {delta > 0 ? `↑${delta}` : ''}
+                          {t('resume.cvOptimization')} {delta > 0 ? `↑${delta}` : ''}
                         </div>
                       </div>
-                      <button onClick={onAnalyze} title="Re-analyze" style={{ fontSize: 11, color: 'var(--primary)', background: 'none', border: 'none', cursor: 'pointer', marginLeft: 'auto' }}>↻</button>
+                      <button onClick={onAnalyze} title={t('resume.reAnalyze')} style={{ fontSize: 11, color: 'var(--primary)', background: 'none', border: 'none', cursor: 'pointer', marginLeft: 'auto' }}>↻</button>
                     </div>)})()}
                 </>
               ) : (
                 <button onClick={onAnalyze} style={{ fontSize: 11, color: 'var(--primary)', background: 'rgba(79,70,229,0.08)', border: '0.5px solid rgba(79,70,229,0.20)', borderRadius: 5, padding: '4px 10px', cursor: 'pointer' }}>
-                  ✦ Analyze match
+                  ✦ {t('resume.analyzeMatch')}
                 </button>
               )}
             </div>
             {/* Stale analysis banner — shown when resume was edited after last analysis */}
             {contentChangedSinceAnalysis && scoreResult && !scoring && (
               <div style={{ marginTop: 8, padding: '5px 8px', background: 'rgba(133,79,11,0.07)', border: '0.5px solid rgba(133,79,11,0.22)', borderRadius: 5, display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 6 }}>
-                <span style={{ fontSize: 9, color: 'var(--c-warning)' }}>✎ Resume changed</span>
-                <button onClick={onAnalyze} style={{ fontSize: 9, color: 'var(--c-warning)', background: 'rgba(217,119,6,0.10)', border: '0.5px solid rgba(217,119,6,0.25)', borderRadius: 4, padding: '2px 8px', cursor: 'pointer', fontWeight: 600, whiteSpace: 'nowrap' }}>↻ Re-analyze</button>
+                <span style={{ fontSize: 9, color: 'var(--c-warning)' }}>✎ {t('resume.resumeChanged')}</span>
+                <button onClick={onAnalyze} style={{ fontSize: 9, color: 'var(--c-warning)', background: 'rgba(217,119,6,0.10)', border: '0.5px solid rgba(217,119,6,0.25)', borderRadius: 4, padding: '2px 8px', cursor: 'pointer', fontWeight: 600, whiteSpace: 'nowrap' }}>↻ {t('resume.reAnalyze')}</button>
               </div>
             )}
           </>
         ) : (
-          <div style={{ fontSize: 11, color: 'var(--text-muted)' }}>Select a job above to see how well your resume matches it.</div>
+          <div style={{ fontSize: 11, color: 'var(--text-muted)' }}>{t('resume.selectJobToMatch')}</div>
         )}
       </div>
 
@@ -131,10 +133,10 @@ export function AiPanel({ selectedJob, scoreResult, suggestions, scoring, sugges
           {/* Missing items — section-aware badges */}
           {scoreResult.missingItems?.length > 0 && (
             <div>
-              <div style={{ fontSize: 10, fontWeight: 500, color: 'var(--text-muted)', marginBottom: 8 }}>🔍 GAPS — click to apply to the right section</div>
+              <div style={{ fontSize: 10, fontWeight: 500, color: 'var(--text-muted)', marginBottom: 8 }}>🔍 {t('resume.gapsHint')}</div>
               <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
                 {scoreResult.missingItems.map((mi, i) => {
-                  const secLabel = SEC_LABELS[mi.target] ?? mi.target
+                  const secLabel = t(SEC_LABELS[mi.target] ?? mi.target)
                   return (
                     <button key={i} onClick={() => {
                       if (onApplyTargeted) {
@@ -164,7 +166,7 @@ export function AiPanel({ selectedJob, scoreResult, suggestions, scoring, sugges
 
           {/* Section matches + scores */}
           <div>
-            <SectionHeader label="SECTION ANALYSIS" collapsed={scoresCollapsed} onToggle={() => setScoresCollapsed(v => !v)} />
+            <SectionHeader label={t('resume.sectionAnalysis')} collapsed={scoresCollapsed} onToggle={() => setScoresCollapsed(v => !v)} />
             {!scoresCollapsed && (
               <div style={{ marginTop: 8 }}>
                 {SEC_ORDER.filter(sec => {
@@ -182,7 +184,7 @@ export function AiPanel({ selectedJob, scoreResult, suggestions, scoring, sugges
                       {/* Section header + score bar */}
                       <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 4 }}>
                         <span style={{ fontSize: 11, fontWeight: 500, color: 'var(--text)' }}>
-                          {secSuggestions.some(s => s.applied) ? '✓ ' : ''}{SEC_LABELS[sec] ?? sec}
+                          {secSuggestions.some(s => s.applied) ? '✓ ' : ''}{t(SEC_LABELS[sec] ?? sec)}
                         </span>
                         {score !== undefined && (
                           <span style={{ fontSize: 10, fontWeight: 600, color: score >= 80 ? 'var(--c-success)' : score >= 60 ? 'var(--c-warning)' : 'var(--c-danger)' }}>{score}%</span>
@@ -194,7 +196,7 @@ export function AiPanel({ selectedJob, scoreResult, suggestions, scoring, sugges
                       {/* Matched keywords in this section */}
                       {m?.keywords?.length ? (
                         <div style={{ display: 'flex', flexWrap: 'wrap', gap: 3, marginBottom: 4 }}>
-                          <span style={{ fontSize: 8, color: 'var(--text-muted)' }}>✓ Matched:</span>
+                          <span style={{ fontSize: 8, color: 'var(--text-muted)' }}>✓ {t('resume.matched')}:</span>
                           {m.keywords.map(k => (
                             <span key={k} style={{ fontSize: 9, background: 'rgba(59,109,17,0.08)', color: 'var(--c-success)', borderRadius: 4, padding: '1px 5px' }}>{k}</span>
                           ))}
@@ -205,13 +207,13 @@ export function AiPanel({ selectedJob, scoreResult, suggestions, scoring, sugges
                         {tip && <div style={{ fontSize: 9, color: 'var(--text-muted)', flex: 1 }}>💡 {tip}</div>}
                         <button onClick={() => onEditSection?.(targetKey)}
                           style={{ fontSize: 9, color: 'var(--primary)', background: 'rgba(79,70,229,0.06)', border: '0.5px solid rgba(79,70,229,0.20)', borderRadius: 4, padding: '2px 7px', cursor: 'pointer', whiteSpace: 'nowrap', flexShrink: 0, fontWeight: 500 }}>
-                          ✏️ Edit
+                          ✏️ {t('common.edit')}
                         </button>
                       </div>
                       {/* Suggestions for this section */}
                       {secSuggestions.filter(s => !s.applied).map((s, si) => {
                         const idx = suggestions.indexOf(s)
-                        const actionLabel = s.action === 'rewrite' ? 'Apply rewrite' : s.action === 'reorder' ? 'Apply reorder' : 'Apply'
+                        const actionLabel = s.action === 'rewrite' ? t('resume.applyRewrite') : s.action === 'reorder' ? t('resume.applyReorder') : t('common.apply')
                         return (
                           <div key={si} style={{ marginTop: 6, padding: 6, background: '#FFFBEB', borderRadius: 5, border: '0.5px solid rgba(234,179,8,0.3)' }}>
                             <div style={{ fontSize: 10, color: 'var(--text)', marginBottom: 4, lineHeight: 1.4 }}>{s.text}</div>
@@ -222,7 +224,7 @@ export function AiPanel({ selectedJob, scoreResult, suggestions, scoring, sugges
                             )}
                             <button onClick={() => onApplySuggestion(idx)}
                               style={{ fontSize: 9, color: 'var(--primary)', background: 'rgba(79,70,229,0.08)', border: '0.5px solid rgba(79,70,229,0.20)', borderRadius: 4, padding: '2px 8px', cursor: 'pointer', fontWeight: 600 }}>
-                              {actionLabel} →
+                          {actionLabel} →
                             </button>
                           </div>
                         )
@@ -243,7 +245,7 @@ export function AiPanel({ selectedJob, scoreResult, suggestions, scoring, sugges
         const uncategorized = suggestions.filter(s => !['summary','skills','experience','education','projects'].includes(s.target))
         if (uncategorized.length === 0) return null
         return (<div>
-          <SectionHeader label="OTHER SUGGESTIONS" count={uncategorized.filter(s => !s.applied).length || undefined} collapsed={suggestCollapsed} onToggle={() => setSuggestCollapsed(v => !v)} />
+          <SectionHeader label={t('resume.otherSuggestions')} count={uncategorized.filter(s => !s.applied).length || undefined} collapsed={suggestCollapsed} onToggle={() => setSuggestCollapsed(v => !v)} />
           {!suggestCollapsed && (
             <div style={{ marginTop: 8 }}>
               {uncategorized.filter(s => !s.applied).map((s, i) => {
@@ -257,8 +259,8 @@ export function AiPanel({ selectedJob, scoreResult, suggestions, scoring, sugges
                       </div>
                     )}
                     <div style={{ display: 'flex', gap: 10 }}>
-                      <button onClick={() => onApplySuggestion(idx)} style={{ fontSize: 9, color: 'var(--primary)', background: 'none', border: 'none', cursor: 'pointer', padding: 0, fontWeight: 600 }}>Apply →</button>
-                      <button onClick={() => copySuggestion(s.text, idx)} style={{ fontSize: 9, color: 'var(--text-muted)', background: 'none', border: 'none', cursor: 'pointer', padding: 0 }}>{copied === idx ? '✓ Copied' : 'Copy'}</button>
+                      <button onClick={() => onApplySuggestion(idx)} style={{ fontSize: 9, color: 'var(--primary)', background: 'none', border: 'none', cursor: 'pointer', padding: 0, fontWeight: 600 }}>{t('common.apply')} →</button>
+                      <button onClick={() => copySuggestion(s.text, idx)} style={{ fontSize: 9, color: 'var(--text-muted)', background: 'none', border: 'none', cursor: 'pointer', padding: 0 }}>{copied === idx ? `✓ ${t('resume.copied')}` : t('common.copy')}</button>
                     </div>
                   </div>
                 )
@@ -272,11 +274,11 @@ export function AiPanel({ selectedJob, scoreResult, suggestions, scoring, sugges
       {hasJob && !hasAnalysis && !scoring && !suggesting && (
         <div style={{ padding: 20, textAlign: 'center' }}>
           <div style={{ fontSize: 11, color: 'var(--text-muted)', marginBottom: 10 }}>
-            Job selected — click below to analyse and get targeted suggestions for each section.
+            {t('resume.jobSelectedHint')}
           </div>
           <button onClick={onAnalyze}
             style={{ fontSize: 11, color: 'var(--primary)', background: 'rgba(79,70,229,0.08)', border: '1px solid rgba(79,70,229,0.30)', borderRadius: 6, padding: '6px 16px', cursor: 'pointer', fontWeight: 500 }}>
-            ✦ Analyze Match
+            ✦ {t('resume.analyzeMatch')}
           </button>
         </div>
       )}
@@ -284,12 +286,12 @@ export function AiPanel({ selectedJob, scoreResult, suggestions, scoring, sugges
       {!hasJob && (
         <div className="resume-ai-empty-state">
           <div className="resume-ai-empty-icon">✦</div>
-          <strong>Ready to tailor this version</strong>
-          <span>Link a saved job in the editor, then AI will score the match and suggest improvements section by section.</span>
+          <strong>{t('resume.readyToTailor')}</strong>
+          <span>{t('resume.linkJobToAnalyze')}</span>
         </div>
       )}
       <button onClick={onAudit} style={{ width: '100%', marginTop: 14, display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 6, fontSize: 11, color: 'var(--primary)', background: 'rgba(79,70,229,0.08)', border: '1px solid rgba(79,70,229,0.25)', borderRadius: 7, padding: '8px 10px', cursor: 'pointer', fontWeight: 600 }}>
-        ✓ Audit &amp; save resume
+        ✓ {t('resume.auditSave')}
       </button>
     </div>
   )

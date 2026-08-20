@@ -2,8 +2,10 @@
 
 import { Plus, Trash2 } from 'lucide-react'
 import React, { type CSSProperties } from 'react'
+import { useI18n } from '@/lib/i18n'
 
 export function PlanFeatureListEditor({ values, disabled, onChange }: { values: readonly string[]; disabled?: boolean; onChange: (values: string[]) => void }) {
+  const { t } = useI18n()
   function update(index: number, value: string) {
     onChange(values.map((item, itemIndex) => itemIndex === index ? value : item))
   }
@@ -13,9 +15,9 @@ export function PlanFeatureListEditor({ values, disabled, onChange }: { values: 
   }
 
   return <section style={{ marginTop: 14 }}>
-    <div style={sectionHeader}><div><h3 style={heading}>What users see</h3><p style={help}>Short display labels for the pricing card. These do not control access.</p></div><button type="button" disabled={disabled} onClick={() => onChange([...values, ''])} style={secondary}><Plus size={14} aria-hidden="true" /> Add label</button></div>
-    <div style={list}>{values.map((value, index) => <div key={`feature-${index}`} style={row}><input aria-label={`Displayed feature ${index + 1}`} value={value} disabled={disabled} onChange={event => update(index, event.target.value)} style={input} /><button type="button" aria-label={`Remove displayed feature ${index + 1}`} disabled={disabled} onClick={() => remove(index)} style={icon}><Trash2 size={14} aria-hidden="true" /></button></div>)}</div>
-    {values.length === 0 && <p style={empty}>No display labels. Add one if this plan should show feature highlights.</p>}
+    <div style={sectionHeader}><div><h3 style={heading}>{t('planEditor.visibleHeading')}</h3><p style={help}>{t('planEditor.visibleHelp')}</p></div><button type="button" disabled={disabled} onClick={() => onChange([...values, ''])} style={secondary}><Plus size={14} aria-hidden="true" /> {t('planEditor.addLabel')}</button></div>
+    <div style={list}>{values.map((value, index) => <div key={`feature-${index}`} style={row}><input aria-label={`${t('planEditor.displayedFeature')} ${index + 1}`} value={value} disabled={disabled} onChange={event => update(index, event.target.value)} style={input} /><button type="button" aria-label={`${t('planEditor.removeDisplayedFeature')} ${index + 1}`} disabled={disabled} onClick={() => remove(index)} style={icon}><Trash2 size={14} aria-hidden="true" /></button></div>)}</div>
+    {values.length === 0 && <p style={empty}>{t('planEditor.noDisplayLabels')}</p>}
   </section>
 }
 

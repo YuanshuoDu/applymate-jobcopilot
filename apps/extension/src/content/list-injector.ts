@@ -8,6 +8,11 @@ import { hasUsableDescription, isJobReadyForTailoring, mergeJobDetails } from '@
 import { getJobIdentity, isSameJob, isWeakJobIdentity } from '@/lib/job-identity'
 import { sendRuntimeMessage } from '@/lib/runtime-messaging'
 import type { SavedJob, ScrapedJob } from '@/lib/types'
+import { getExtensionLanguage, translateExtension } from '@/lib/i18n'
+
+function uiText(english: string): string {
+  return translateExtension(getExtensionLanguage(), english)
+}
 
 const ATTR        = 'data-applymate'
 const POPUP_ID  = 'applymate-popup'
@@ -716,10 +721,10 @@ function styleCardButton(btn: HTMLButtonElement) {
 
 function renderCardButtonState(btn: HTMLButtonElement, state: CardButtonState) {
   const visuals: Record<CardButtonState, { icon: string; background: string; opacity: string; title: string }> = {
-    idle: { icon: '＋', background: '#4F46E5', opacity: '1', title: 'Open ApplyMate actions' },
-    saving: { icon: '…', background: '#4F46E5', opacity: '0.72', title: 'Saving to ApplyMate' },
-    saved: { icon: '✓', background: '#3B6D11', opacity: '1', title: 'Open ApplyMate actions — saved' },
-    error: { icon: '!', background: '#A32D2D', opacity: '1', title: 'Save failed — click to retry' },
+    idle: { icon: '＋', background: '#4F46E5', opacity: '1', title: uiText('Open ApplyMate actions') },
+    saving: { icon: '…', background: '#4F46E5', opacity: '0.72', title: uiText('Saving to ApplyMate') },
+    saved: { icon: '✓', background: '#3B6D11', opacity: '1', title: uiText('Open ApplyMate actions — saved') },
+    error: { icon: '!', background: '#A32D2D', opacity: '1', title: uiText('Save failed — click to retry') },
   }
   const visual = visuals[state]
   btn.innerHTML = `<span aria-hidden="true">${visual.icon}</span>`
@@ -936,10 +941,10 @@ async function saveCardJob(card: Element, job: CardJob, button: HTMLButtonElemen
       return
     }
     const fullJob = await resolveJobForSave(card, job)
-    if (!fullJob) throw new Error('Open the job details first so ApplyMate can read the full description.')
+    if (!fullJob) throw new Error(uiText('Open the job details first so ApplyMate can read the full description.'))
     await sendRuntimeMessage({ type: 'JOB_SCRAPED', job: fullJob })
     const response = await sendRuntimeMessage<{ success?: boolean; error?: string; savedJob?: SavedJob }>({ type: 'SAVE_JOB', job: fullJob })
-    if (!response?.success) throw new Error(response?.error ?? 'Could not save this job.')
+    if (!response?.success) throw new Error(response?.error ?? uiText('Could not save this job.'))
     markJobSaved(fullJob, button, cardKey)
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error)
@@ -980,17 +985,17 @@ function openActionCard(card: Element, job: CardJob) {
     <div class="am-action-inner">
       <div class="am-action-head">
         <div>
-          <strong>ApplyMate actions</strong>
+          <strong>${uiText('ApplyMate actions')}</strong>
           <span>${escHtml(job.title)} · ${escHtml(job.company)}</span>
         </div>
-        <button type="button" data-am-action="close" aria-label="Close">×</button>
+        <button type="button" data-am-action="close" aria-label="${uiText('Close')}">×</button>
       </div>
       <div class="am-action-grid">
-        <button type="button" data-am-action="match"><span>◎</span><strong>Match</strong></button>
-        <button type="button" data-am-action="tailor"><span>✦</span><strong>Tailor resume</strong></button>
-        <button type="button" data-am-action="sidebar"><span>☰</span><strong>Open Side Panel</strong></button>
+        <button type="button" data-am-action="match"><span>◎</span><strong>${uiText('Match')}</strong></button>
+        <button type="button" data-am-action="tailor"><span>✦</span><strong>${uiText('Tailor resume')}</strong></button>
+        <button type="button" data-am-action="sidebar"><span>☰</span><strong>${uiText('Open Side Panel')}</strong></button>
       </div>
-      <span class="am-action-hint">Review the job before any application is submitted.</span>
+      <span class="am-action-hint">${uiText('Review the job before any application is submitted.')}</span>
     </div>
   `
 
@@ -1033,21 +1038,21 @@ async function runActionCardAction(action: string, card: Element, job: CardJob, 
     }
 
     const fullJob = await resolveJobForSave(card, job)
-    if (!fullJob) throw new Error('Open the job details first so ApplyMate can read the full description.')
+    if (!fullJob) throw new Error(uiText('Open the job details first so ApplyMate can read the full description.'))
     await sendRuntimeMessage({ type: 'JOB_SCRAPED', job: fullJob })
     const response = await sendRuntimeMessage<{ success?: boolean; error?: string; savedJob?: SavedJob }>({ type: 'SAVE_JOB', job: fullJob })
-    if (!response?.success) throw new Error(response?.error ?? 'Could not save this job.')
+    if (!response?.success) throw new Error(response?.error ?? uiText('Could not save this job.'))
     const cardButton = card.querySelector<HTMLButtonElement>(`.${BTN_CLASS}`)
     markJobSaved(fullJob, cardButton ?? undefined, cardButton?.dataset.applymateCardKey)
 
     if (action === 'match') {
       const savedJob = response.savedJob as SavedJob | undefined
       if (!savedJob?.id) throw new Error('The job was saved, but its record could not be loaded for matching.')
-      button.innerHTML = '<span>◎</span><strong>Matching…</strong>'
+      button.innerHTML = `<span>◎</span><strong>${uiText('Matching…')}</strong>`
       const matchResponse = await sendRuntimeMessage<{ success?: boolean; job?: SavedJob; error?: string }>({ type: 'MATCH_JOB', job: savedJob })
-      if (!matchResponse?.success || !matchResponse.job) throw new Error(matchResponse?.error ?? 'Matching failed.')
+      if (!matchResponse?.success || !matchResponse.job) throw new Error(matchResponse?.error ?? uiText('Matching failed.'))
       const updatedJob = matchResponse.job
-      button.innerHTML = `<span>✓</span><strong>Matched ${updatedJob.score ?? 0}%</strong>`
+      button.innerHTML = `<span>✓</span><strong>${uiText('Matched')} ${updatedJob.score ?? 0}%</strong>`
       button.disabled = false
       return
     }

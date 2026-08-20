@@ -52,7 +52,7 @@ describe('AgentComposer', () => {
     />)
 
     expect(html).toContain('Model')
-    expect(html).toContain('Model selection is an advanced feature')
+    expect(html).toContain('title="Advanced model settings"')
     expect(html).not.toContain('Claude Sonnet')
   })
 })

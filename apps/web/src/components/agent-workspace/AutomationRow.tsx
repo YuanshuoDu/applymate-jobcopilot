@@ -1,6 +1,7 @@
 'use client'
 
 import React from 'react'
+import { useI18n } from '@/lib/i18n'
 
 export interface AgentAutomation {
   id: string
@@ -20,21 +21,21 @@ export interface AgentAutomation {
   nextRunAt: string | null
 }
 
-function automationMeta(row: AgentAutomation) {
-  if (!row.enabled) return 'Paused'
+function automationMeta(row: AgentAutomation, t: (key: string) => string) {
+  if (!row.enabled) return t('agent.pausedAutomation')
   if (row.nextRunAt) {
-    return `Next run: ${new Date(row.nextRunAt).toLocaleString('en', { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' })}`
+    return `${t('agent.nextRun')}: ${new Date(row.nextRunAt).toLocaleString('en', { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' })}`
   }
-  if (row.requireApproval) return 'Approval required'
+  if (row.requireApproval) return t('agent.approvalRequired')
   return `${row.dailyCap} applications/day`
 }
 
-function automationSubMeta(row: AgentAutomation) {
+function automationSubMeta(row: AgentAutomation, t: (key: string) => string) {
   if (row.lastRunAt) {
     return `Last run: ${new Date(row.lastRunAt).toLocaleString('en', { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' })}`
   }
-  if (row.requireApproval) return 'Approval required before submit'
-  return row.autoApply ? 'Autopilot · one attempt per job' : 'Review queue only'
+  if (row.requireApproval) return t('agent.approvalBeforeSubmit')
+  return row.autoApply ? t('agent.autopilotAttempt') : t('agent.reviewQueueOnly')
 }
 
 function automationIcon(row: AgentAutomation) {
@@ -58,6 +59,7 @@ export function AutomationRow({
   onEdit: (row: AgentAutomation) => void
   onRun: (row: AgentAutomation) => void
 }) {
+  const { t } = useI18n()
   return (
     <div style={{
       display: 'flex',
@@ -69,7 +71,7 @@ export function AutomationRow({
       <button
         onClick={() => onToggle(row)}
         disabled={pending}
-        aria-label={`${row.enabled ? 'Disable' : 'Enable'} ${row.name}`}
+        aria-label={`${row.enabled ? t('agent.disable') : t('agent.enable')} ${row.name}`}
         style={{
           width: 29,
           height: 16,
@@ -91,14 +93,14 @@ export function AutomationRow({
       </div>
       <div style={{ minWidth: 0, flex: 1 }}>
         <div style={{ fontSize: 11, fontWeight: 650, color: 'var(--text)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{row.name}</div>
-        <div style={{ fontSize: 9, color: 'var(--text-muted)', marginTop: 2, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{automationMeta(row)}</div>
-        <div style={{ fontSize: 9, color: 'var(--text-muted)', marginTop: 2, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{automationSubMeta(row)}</div>
+        <div style={{ fontSize: 9, color: 'var(--text-muted)', marginTop: 2, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{automationMeta(row, t)}</div>
+        <div style={{ fontSize: 9, color: 'var(--text-muted)', marginTop: 2, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{automationSubMeta(row, t)}</div>
       </div>
       <button
         onClick={() => onEdit(row)}
         disabled={pending}
-        title={`Edit ${row.name}`}
-        aria-label={`Edit ${row.name}`}
+        title={`${t('agent.edit')} ${row.name}`}
+        aria-label={`${t('agent.edit')} ${row.name}`}
         style={iconButtonStyle(pending ? 'wait' : 'pointer', 'var(--text-muted)', pending)}
       >
         ✎
@@ -106,8 +108,8 @@ export function AutomationRow({
       <button
         onClick={() => onRun(row)}
         disabled={pending || !row.enabled}
-        title={row.enabled ? `Run ${row.name}` : `${row.name} is paused`}
-        aria-label={`Run ${row.name}`}
+        title={row.enabled ? `${t('agent.run')} ${row.name}` : `${row.name} ${t('agent.pausedLower')}`}
+        aria-label={`${t('agent.run')} ${row.name}`}
         style={iconButtonStyle(pending ? 'wait' : row.enabled ? 'pointer' : 'not-allowed', row.enabled ? 'var(--primary)' : 'var(--text-muted)', pending || !row.enabled)}
       >
         ▶

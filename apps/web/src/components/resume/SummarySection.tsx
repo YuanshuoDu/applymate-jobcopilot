@@ -3,6 +3,7 @@
 import { useState } from 'react'
 import { SectionHeader, type DragHandleProps } from './SectionHeader'
 import { AiFieldSuggestion, type AiFieldContext } from './AiFieldSuggestion'
+import { useI18n } from '@/lib/i18n'
 
 export function SummarySection({ summary, matchedKeywords, editing, onEdit, onBlur, onChange, jobContext, dragHandleProps, onRemove, flash }: {
   summary:          string
@@ -16,6 +17,7 @@ export function SummarySection({ summary, matchedKeywords, editing, onEdit, onBl
   onRemove?:        () => void
   flash?:           boolean
 }) {
+  const { t } = useI18n()
   const [collapsed, setCollapsed] = useState(false)
   const wordCount   = summary.trim() ? summary.trim().split(/\s+/).filter(Boolean).length : 0
   const wColor      = wordCount === 0 ? 'var(--text-muted)' : wordCount < 20 ? 'var(--c-danger)' : wordCount <= 80 ? 'var(--c-success)' : 'var(--c-warning)'
@@ -25,7 +27,7 @@ export function SummarySection({ summary, matchedKeywords, editing, onEdit, onBl
       <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 0 }}>
         <div style={{ flex: 1 }}>
           <SectionHeader
-            title="SUMMARY"
+            title={t('resume.summary')}
             collapsed={collapsed}
             onToggle={() => setCollapsed(v => !v)}
             onRemove={onRemove}
@@ -41,7 +43,7 @@ export function SummarySection({ summary, matchedKeywords, editing, onEdit, onBl
         editing ? (
           <div>
             <textarea value={summary} onChange={e => onChange(e.target.value)}
-              onBlur={onBlur} autoFocus placeholder="Write a brief professional summary (20–80 words)…"
+              onBlur={onBlur} autoFocus placeholder={t('resume.summaryPlaceholder')}
               className={flash ? 'ai-flash-highlight' : ''}
               style={{ width: '100%', minHeight: 80, fontSize: 12, lineHeight: 1.7, border: '0.5px solid var(--primary)', borderRadius: 5, padding: 8, resize: 'vertical', outline: 'none', color: 'var(--text)', background: 'var(--bg)', boxSizing: 'border-box' }} />
             <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginTop: 4 }}>
@@ -65,7 +67,7 @@ export function SummarySection({ summary, matchedKeywords, editing, onEdit, onBl
                   const isKw = matchedKeywords.some(k => word.toLowerCase().includes(k.toLowerCase()))
                   return <span key={i} style={isKw ? { background: 'rgba(79,70,229,0.12)', borderRadius: 2, padding: '0 1px' } : {}}>{word} </span>
                 })
-              : <span style={{ color: 'var(--text-muted)' }}>Click to add a summary…</span>
+              : <span style={{ color: 'var(--text-muted)' }}>{t('resume.addSummary')}</span>
             }
           </div>
         )

@@ -21,6 +21,7 @@ import { getSettings, saveSettings } from '@/lib/storage'
 import { getPersona, analyzeForm, reviseFormFields, getPersonaFields, savePersonaFields } from '@/lib/api'
 import { getCurrentJob } from '@/lib/storage'
 import type { ExtensionSettings } from '@/lib/types'
+import { useExtensionI18n } from '@/lib/i18n'
 import type { FormFieldSchema, FilledField, FormFillResponse } from '@/lib/form-filler/types'
 import type { PersonaField } from '@/lib/api'
 import { groupFieldIdsByFrame, groupFilledFieldsByFrame } from '@/lib/form-filler/frame-routing'
@@ -239,6 +240,7 @@ export function FormFillerView({ settings, pendingFields, onFieldsConsumed, scan
   personaUpdateTrigger?: number
   onPersonaUpdated?: () => void
 }) {
+  const { lang, t } = useExtensionI18n()
   const [viewState, setViewState] = useState<ViewState>('idle')
   const [fields, setFields] = useState<FormFieldSchema[]>([])
   const [filledFields, setFilledFields] = useState<FilledField[]>([])
@@ -788,39 +790,39 @@ export function FormFillerView({ settings, pendingFields, onFieldsConsumed, scan
         <div className="am-form-context">
           <div className="am-form-context-icon"><FileText size={16} strokeWidth={2.2} /></div>
           <div className="am-form-context-copy">
-            <span className="am-form-eyebrow">APPLICATION FORM</span>
-            <strong>Form auto-fill</strong>
+            <span className="am-form-eyebrow">{t('APPLICATION FORM')}</span>
+            <strong>{t('Form auto-fill')}</strong>
           </div>
-          <span className="am-form-context-status">Ready</span>
+          <span className="am-form-context-status">{t('Ready')}</span>
         </div>
 
         <div className="am-form-hero">
           <div className="am-form-hero-icon"><ScanSearch size={23} strokeWidth={1.8} /></div>
-          <h2>{scanning ? 'Scanning this page' : 'Ready to scan this page'}</h2>
+          <h2>{scanning ? t('Scanning this page') : t('Ready to scan this page')}</h2>
           <p>
             {scanning
-              ? 'Looking for fields on the current application page.'
-              : 'Find application fields and prepare answers from your ApplyMate profile.'}
+              ? t('Looking for fields on the current application page.')
+              : t('Find application fields and prepare answers from your ApplyMate profile.')}
           </p>
           <button className="am-form-button primary" onClick={handleScanPage} disabled={scanning}>
             <ScanSearch size={15} />
-            {scanning ? 'Scanning page' : 'Scan current page'}
+            {scanning ? t('Scanning page') : t('Scan current page')}
             {!scanning && <ArrowRight size={14} />}
           </button>
           <span className="am-form-helper">
             Works with company career sites, Greenhouse, Lever, Workday, and more.
             When you scan, ApplyMate reads field labels and any existing values on this page to prepare suggestions.
             Review everything before filling; it never submits the application.
-            <a href="https://applymate.site/privacy" target="_blank" rel="noreferrer">Privacy &amp; data use</a>
+            <a href="https://applymate.site/privacy" target="_blank" rel="noreferrer">{t('Privacy & data use')}</a>
           </span>
           <div className="am-form-access-card">
             <div>
-              <strong>{allSitesAccess ? 'All websites access enabled' : 'Use on any company career site'}</strong>
-              <span>{allSitesAccess ? 'You can scan custom forms without activating the extension on each new domain.' : 'Grant once to scan custom forms, Workday, and other ATS pages.'}</span>
+              <strong>{allSitesAccess ? t('All websites access enabled') : t('Use on any company career site')}</strong>
+              <span>{allSitesAccess ? t('You can scan custom forms without activating the extension on each new domain.') : t('Grant once to scan custom forms, Workday, and other ATS pages.')}</span>
             </div>
             {!allSitesAccess && (
               <button className="am-form-button ghost small" onClick={handleRequestAllSitesAccess} disabled={requestingAccess}>
-                {requestingAccess ? 'Waiting...' : 'Allow access'}
+                {requestingAccess ? t('Waiting...') : t('Allow access')}
               </button>
             )}
           </div>
@@ -828,7 +830,7 @@ export function FormFillerView({ settings, pendingFields, onFieldsConsumed, scan
 
         <div className="am-form-info-strip">
           <ShieldCheck size={15} />
-          <span>Your profile and scanned form data are used only for the ApplyMate feature you start.</span>
+          <span>{t('Your profile and scanned form data are used only for the ApplyMate feature you start.')}</span>
         </div>
       </div>
     )
@@ -844,18 +846,18 @@ export function FormFillerView({ settings, pendingFields, onFieldsConsumed, scan
       <div className="am-form-view">
         <div className="am-form-state error">
           <div className="am-form-state-icon"><AlertTriangle size={22} /></div>
-          <span className="am-form-eyebrow">FORM AUTO-FILL</span>
-          <h2>We could not scan this page</h2>
-          <p>{errorMsg}</p>
+          <span className="am-form-eyebrow">{t('FORM AUTO-FILL')}</span>
+          <h2>{t('We could not scan this page')}</h2>
+          <p>{lang === 'zh' ? t('Something went wrong') : errorMsg}</p>
           <div className="am-form-actions">
             <button className="am-form-button primary" onClick={() => fields.length > 0 ? analyzeFields(fields) : handleScanPage()}>
               <RefreshCw size={14} />
-              Retry
+              {t('Retry')}
             </button>
             {!allSitesAccess && (
               <button className="am-form-button ghost" onClick={handleRequestAllSitesAccess} disabled={requestingAccess}>
                 <ShieldCheck size={14} />
-                {requestingAccess ? 'Waiting for permission' : 'Allow all websites'}
+                {requestingAccess ? t('Waiting for permission') : t('Allow all websites')}
               </button>
             )}
           </div>
@@ -870,14 +872,14 @@ export function FormFillerView({ settings, pendingFields, onFieldsConsumed, scan
     return (
       <div className="am-form-view am-form-centered">
         <div className="am-form-state-icon primary"><FilePenLine size={22} className="am-form-icon-pulse" /></div>
-        <span className="am-form-eyebrow">APPLYMATE IS WORKING</span>
-        <h2>Filling your form</h2>
-        <p className="am-form-state-copy">Applying reviewed answers to the current page.</p>
-        <div className="am-form-progress" aria-label={`Filled ${appliedCount} of ${fillableCount} fields`}>
+        <span className="am-form-eyebrow">{t('APPLYMATE IS WORKING')}</span>
+        <h2>{t('Filling your form')}</h2>
+        <p className="am-form-state-copy">{t('Applying reviewed answers to the current page.')}</p>
+        <div className="am-form-progress" aria-label={t(`Filled ${appliedCount} of ${fillableCount} fields`)}>
           <span style={{ width: `${progress}%` }} />
         </div>
         <div className="am-form-progress-meta">
-          <strong>{appliedCount} / {fillableCount} fields</strong>
+          <strong>{appliedCount} / {fillableCount} {t('fields')}</strong>
           <span>{Math.round(progress)}%</span>
         </div>
       </div>
@@ -891,25 +893,25 @@ export function FormFillerView({ settings, pendingFields, onFieldsConsumed, scan
       <div className="am-form-view am-form-done">
         <div className="am-form-success">
           <div className="am-form-success-icon"><CheckCircle2 size={25} /></div>
-          <span className="am-form-eyebrow">FORM AUTO-FILL</span>
-          <h2>Form filled</h2>
+          <span className="am-form-eyebrow">{t('FORM AUTO-FILL')}</span>
+          <h2>{t('Form filled')}</h2>
           <p>
             {failedFields.length
-              ? `${appliedCount} fields filled — ${failedFields.length} still need your review.`
-              : `${appliedCount} fields filled — review and submit manually.`}
+              ? `${appliedCount} ${t('fields filled')} — ${failedFields.length} ${t('still need your review')}.`
+              : `${appliedCount} ${t('fields filled')} — ${t('review and submit manually')}.`}
           </p>
         </div>
 
         {failedFields.length > 0 && (
           <div className="am-form-callout warning">
-            <div className="am-form-callout-title"><AlertTriangle size={14} /> Review these fields manually</div>
+            <div className="am-form-callout-title"><AlertTriangle size={14} /> {t('Review these fields manually')}</div>
             <p>
-              Workday custom dropdowns can require a manual selection. Your other answers have already been filled and remain on the form.
+              {t('Workday custom dropdowns can require a manual selection. Your other answers have already been filled and remain on the form.')}
             </p>
             <div className="am-form-chip-list">
               {failedFields.map(field => (
                 <span key={field.id} className="am-form-chip">
-                  {field.label || 'Unmatched field'}
+                  {field.label || t('Unmatched field')}
                 </span>
               ))}
             </div>
@@ -918,17 +920,17 @@ export function FormFillerView({ settings, pendingFields, onFieldsConsumed, scan
 
         {uploadFields.length > 0 && (
           <div className="am-form-card am-form-upload">
-            <div className="am-form-card-title"><Upload size={14} /> Attach reviewed documents</div>
+            <div className="am-form-card-title"><Upload size={14} /> {t('Attach reviewed documents')}</div>
             <p>
-              Choose your audited resume or cover-letter PDF in Chrome&apos;s file picker. ApplyMate cannot select local files for you.
+              {t("Choose your audited resume or cover-letter PDF in Chrome's file picker. ApplyMate cannot select local files for you.")}
             </p>
             {uploadFields.map(field => (
               <div key={field.id} className="am-form-upload-row">
-                <span>{field.label || 'Document upload'}{field.required ? ' *' : ''}</span>
+                <span>{field.label || t('Document upload')}{field.required ? ' *' : ''}</span>
                 {uploadedFiles[field.id] ? (
                   <span className="am-form-uploaded"><CheckCircle2 size={12} /> {uploadedFiles[field.id]}</span>
                 ) : (
-                  <button className="am-form-button small primary" onClick={() => handleUpload(field.id)}><Upload size={12} /> Choose file</button>
+                  <button className="am-form-button small primary" onClick={() => handleUpload(field.id)}><Upload size={12} /> {t('Choose file')}</button>
                 )}
               </div>
             ))}
@@ -939,15 +941,15 @@ export function FormFillerView({ settings, pendingFields, onFieldsConsumed, scan
         {personaMatches.length > 0 && (
           <div className="am-form-card am-form-persona">
             <div className="am-form-card-head">
-              <div className="am-form-card-title"><UserRound size={14} /> Save updates to your profile?</div>
+              <div className="am-form-card-title"><UserRound size={14} /> {t('Save updates to your profile?')}</div>
               <button
                 onClick={handleRefreshPersona}
                 disabled={savingPersona}
-                title="Re-read form values from the page and compare with saved persona"
+                title={t('Re-read form values from the page and compare with saved persona')}
                 className="am-form-icon-button"
               >
                 <RefreshCw size={12} className={savingPersona ? 'am-form-icon-pulse' : undefined} />
-                Refresh
+                {t('Refresh')}
               </button>
             </div>
             <p>
@@ -970,7 +972,7 @@ export function FormFillerView({ settings, pendingFields, onFieldsConsumed, scan
                     )}
                   </div>
                   <span className={`am-form-badge ${m.existingValue ? 'warning' : 'success'}`}>
-                    {m.existingValue ? 'UPDATE' : 'NEW'}
+                    {m.existingValue ? t('UPDATE') : t('NEW')}
                   </span>
                 </div>
               ))}
@@ -978,10 +980,10 @@ export function FormFillerView({ settings, pendingFields, onFieldsConsumed, scan
             <div className="am-form-actions stretch">
               <button className="am-form-button primary" onClick={handleSavePersonaMatches} disabled={savingPersona}>
                 <CheckCircle2 size={14} />
-                {savingPersona ? 'Saving...' : 'Save to Persona'}
+                {savingPersona ? t('Saving...') : t('Save to Persona')}
               </button>
               <button className="am-form-button ghost" onClick={() => setPersonaMatches([])}>
-                Dismiss
+                {t('Dismiss')}
               </button>
             </div>
           </div>
@@ -990,11 +992,11 @@ export function FormFillerView({ settings, pendingFields, onFieldsConsumed, scan
         {/* Next Step */}
         <div className="am-form-next">
           <div>
-            <strong>Continue to the next step?</strong>
-            <span>Open the next page and scan again.</span>
+            <strong>{t('Continue to the next step?')}</strong>
+            <span>{t('Open the next page and scan again.')}</span>
           </div>
           <button className="am-form-button ghost" onClick={handleScanPage}>
-            Scan next step <ArrowRight size={13} />
+          {t('Scan next step')} <ArrowRight size={13} />
           </button>
         </div>
       </div>
@@ -1007,26 +1009,26 @@ export function FormFillerView({ settings, pendingFields, onFieldsConsumed, scan
     <div className="am-form-view am-form-review">
       <div className="am-form-review-head">
         <div>
-          <span className="am-form-eyebrow">REVIEW ANSWERS</span>
-          <h2>Form fields <span>({fields.length})</span></h2>
+          <span className="am-form-eyebrow">{t('REVIEW ANSWERS')}</span>
+          <h2>{t('Form fields')} <span>({fields.length})</span></h2>
           <p className="am-form-review-meta">
-            {filledFields.filter(f => f.confidence === 1.0 && f.reasoning?.includes('already filled')).length} pre-filled ·{' '}
-            {filledFields.filter(f => f.reasoning?.includes('Matched from persona')).length} profile matched ·{' '}
-            {filledFields.filter(f => !(f.confidence === 1.0 && f.reasoning?.includes('already filled')) && !f.reasoning?.includes('Matched from persona') && !f.skip).length} AI suggested
+            {filledFields.filter(f => f.confidence === 1.0 && f.reasoning?.includes('already filled')).length} {t('pre-filled')} ·{' '}
+            {filledFields.filter(f => f.reasoning?.includes('Matched from persona')).length} {t('profile matched')} ·{' '}
+            {filledFields.filter(f => !(f.confidence === 1.0 && f.reasoning?.includes('already filled')) && !f.reasoning?.includes('Matched from persona') && !f.skip).length} {t('AI suggested')}
           </p>
         </div>
         <div className="am-form-review-icon"><FileText size={18} /></div>
       </div>
 
       <div className="am-form-summary">
-        <span><strong>{filledFields.filter(f => f.confidence === 1.0 && f.reasoning?.includes('already filled')).length}</strong> Pre-filled</span>
-        <span><strong>{filledFields.filter(f => f.reasoning?.includes('Matched from persona')).length}</strong> Profile matched</span>
-        <span><strong>{filledFields.filter(f => !(f.confidence === 1.0 && f.reasoning?.includes('already filled')) && !f.reasoning?.includes('Matched from persona') && !f.skip).length}</strong> AI suggested</span>
+        <span><strong>{filledFields.filter(f => f.confidence === 1.0 && f.reasoning?.includes('already filled')).length}</strong> {t('Pre-filled')}</span>
+        <span><strong>{filledFields.filter(f => f.reasoning?.includes('Matched from persona')).length}</strong> {t('Profile matched')}</span>
+        <span><strong>{filledFields.filter(f => !(f.confidence === 1.0 && f.reasoning?.includes('already filled')) && !f.reasoning?.includes('Matched from persona') && !f.skip).length}</strong> {t('AI suggested')}</span>
       </div>
 
       <button className="am-form-button primary am-form-apply-all" onClick={handleApplyAll}>
         <WandSparkles size={16} />
-        Apply all to form
+        {t('Apply all to form')}
         <ArrowRight size={14} />
       </button>
 
@@ -1045,10 +1047,10 @@ export function FormFillerView({ settings, pendingFields, onFieldsConsumed, scan
                 </span>
                 <div className="am-form-field-badges">
                   {f.confidence === 1.0 && f.reasoning?.includes('already filled') && f.value?.trim() && (
-                    <span className="am-form-badge primary">PRE-FILLED</span>
+                    <span className="am-form-badge primary">{t('PRE-FILLED')}</span>
                   )}
                   {f.reasoning?.includes('Matched from persona') && (
-                    <span className="am-form-badge teal">PROFILE</span>
+                    <span className="am-form-badge teal">{t('PROFILE')}</span>
                   )}
                   <span className={`am-form-badge ${tone}`}>{pct}%</span>
                 </div>
@@ -1075,7 +1077,7 @@ export function FormFillerView({ settings, pendingFields, onFieldsConsumed, scan
                     onChange={e => handleFieldEdit(f.fieldId, e.target.value)}
                     className="am-form-input am-form-select"
                   >
-                    <option value="">-- Select --</option>
+                    <option value="">-- {t('Select')} --</option>
                     {fieldSchema.options.map(o => (
                       <option key={o} value={o}>{o}</option>
                     ))}
@@ -1088,13 +1090,13 @@ export function FormFillerView({ settings, pendingFields, onFieldsConsumed, scan
       </div>
 
       <div className="am-form-revise">
-        <div className="am-form-card-title"><Sparkles size={14} /> Revise with natural language</div>
+        <div className="am-form-card-title"><Sparkles size={14} /> {t('Revise with natural language')}</div>
         <div className="am-form-revise-row">
           <input
             type="text"
             value={reviseInstruction}
             onChange={e => setReviseInstruction(e.target.value)}
-            placeholder="e.g. make answers more concise..."
+            placeholder={t('e.g. make answers more concise...')}
             className="am-form-input"
             onKeyDown={e => e.key === 'Enter' && handleRevise()}
           />
@@ -1103,18 +1105,18 @@ export function FormFillerView({ settings, pendingFields, onFieldsConsumed, scan
             disabled={revising || !reviseInstruction.trim()}
             className="am-form-button primary small"
           >
-            {revising ? 'Working...' : 'Revise'}
+            {revising ? t('Working...') : t('Revise')}
           </button>
         </div>
       </div>
 
       <div className="am-form-next">
         <div>
-          <strong>Multi-step form?</strong>
-          <span>Go to the next page and scan again.</span>
+          <strong>{t('Multi-step form?')}</strong>
+          <span>{t('Go to the next page and scan again.')}</span>
         </div>
         <button className="am-form-button ghost" onClick={handleScanPage}>
-          <ScanSearch size={13} /> Scan new step
+          <ScanSearch size={13} /> {t('Scan new step')}
         </button>
       </div>
     </div>
@@ -1131,6 +1133,7 @@ const PHASE_INFO: Record<AnalysisPhase, { icon: LucideIcon; label: string; subLa
 }
 
 function AnalysisProgressView({ phase, totalFields, aiFieldCount, elapsed }: { phase: AnalysisPhase; totalFields: number; aiFieldCount: number; elapsed: number }) {
+  const { t } = useExtensionI18n()
   const info = PHASE_INFO[phase]
   const elapsedStr = elapsed < 60 ? `${elapsed}s` : `${Math.floor(elapsed / 60)}m ${elapsed % 60}s`
   // Rough estimate: ~3s per AI field (MiniMax M3 average)
@@ -1144,39 +1147,39 @@ function AnalysisProgressView({ phase, totalFields, aiFieldCount, elapsed }: { p
       <div className="am-form-context">
         <div className="am-form-context-icon"><Sparkles size={16} strokeWidth={2.2} /></div>
         <div className="am-form-context-copy">
-          <span className="am-form-eyebrow">APPLICATION FORM</span>
-          <strong>Preparing your answers</strong>
+            <span className="am-form-eyebrow">{t('APPLICATION FORM')}</span>
+            <strong>{t('Preparing your answers')}</strong>
         </div>
-        <span className="am-form-context-status active">In progress</span>
+        <span className="am-form-context-status active">{t('In progress')}</span>
       </div>
 
       <div className="am-form-analysis-head">
         <div className="am-form-analysis-icon"><Sparkles size={22} className="am-form-icon-pulse" /></div>
-        <span className="am-form-eyebrow">AI ANALYSIS</span>
-        <h2>{info.label}</h2>
-        <p>{info.subLabel(aiFieldCount)}</p>
+        <span className="am-form-eyebrow">{t('AI ANALYSIS')}</span>
+        <h2>{t(info.label)}</h2>
+        <p>{t(info.subLabel(aiFieldCount))}</p>
       </div>
 
       <div className="am-form-progress-wrap">
         <div className="am-form-progress"><span style={{ width: `${info.pct}%` }} /></div>
         <div className="am-form-progress-meta">
-          <span>Phase {phaseIndex + 1} of {phases.length}</span>
+          <span>{t('Phase')} {phaseIndex + 1} {t('of')} {phases.length}</span>
           <strong>{info.pct}%</strong>
-          <span>Elapsed {elapsedStr}</span>
+          <span>{t('Elapsed')} {elapsedStr}</span>
         </div>
       </div>
 
       <div className="am-form-analysis-card">
         <div className="am-form-card-head">
-          <div className="am-form-card-title"><FileText size={14} /> Field summary</div>
-          <span className="am-form-estimate">Estimated {estStr}</span>
+          <div className="am-form-card-title"><FileText size={14} /> {t('Field summary')}</div>
+          <span className="am-form-estimate">{t('Estimated')} {estStr}</span>
         </div>
         <div className="am-form-analysis-stats">
-          <span><strong>{totalFields}</strong> fields total</span>
+          <span><strong>{totalFields}</strong> {t('fields total')}</span>
           {totalFields - aiFieldCount > 0 && (
-            <span className="am-form-badge primary">{totalFields - aiFieldCount} pre-filled</span>
+            <span className="am-form-badge primary">{totalFields - aiFieldCount} {t('pre-filled')}</span>
           )}
-          <span className="am-form-badge neutral">{aiFieldCount} need AI</span>
+          <span className="am-form-badge neutral">{aiFieldCount} {t('need AI')}</span>
         </div>
         <div className="am-form-phase-list">
           {phases.map((p, index) => {
@@ -1187,7 +1190,7 @@ function AnalysisProgressView({ phase, totalFields, aiFieldCount, elapsed }: { p
                 <span className="am-form-phase-icon">
                   {index < phaseIndex ? <CheckCircle2 size={13} /> : <PhaseIcon size={13} />}
                 </span>
-                <span>{PHASE_INFO[p].label.replace('...', '')}</span>
+                <span>{t(PHASE_INFO[p].label.replace('...', ''))}</span>
                 {index === phaseIndex && <span className="am-form-phase-dot" />}
               </div>
             )
@@ -1198,8 +1201,8 @@ function AnalysisProgressView({ phase, totalFields, aiFieldCount, elapsed }: { p
       <div className="am-form-analysis-tip">
         <ShieldCheck size={13} />
         {phase === 'waitingForAI'
-          ? 'AI is considering each field based on your profile. Higher-confidence answers will be marked clearly.'
-          : 'Your profile data stays private — it\'s only used for this form fill.'
+          ? t('AI is considering each field based on your profile. Higher-confidence answers will be marked clearly.')
+          : t("Your profile data stays private — it's only used for this form fill.")
         }
       </div>
     </div>
@@ -1234,19 +1237,19 @@ function buildKnownAnswers(persona: string, personaFields: { key: string; label:
 
   if (nameVal && nameVal !== 'N/A') answers.push({
     key: 'name', value: nameVal, confidence: 1.0, source: 'profile',
-    keywords: ['name', 'first name', 'last name', 'full name', 'legal name', '姓名', '名字'],
+    keywords: ['name', 'first name', 'last name', 'full name', 'legal name', 'Name', 'name'],
   })
   if (emailVal) answers.push({
     key: 'email', value: emailVal, confidence: 1.0, source: 'profile',
-    keywords: ['email', 'e-mail', 'email address', '邮箱', '电子邮箱'],
+    keywords: ['email', 'e-mail', 'email address', 'Mail', 'Email'],
   })
   if (phoneVal) answers.push({
     key: 'phone', value: phoneVal, confidence: 1.0, source: 'profile',
-    keywords: ['phone', 'phone number', 'mobile', 'cell', 'telephone', '电话', '手机'],
+    keywords: ['phone', 'phone number', 'mobile', 'cell', 'telephone', 'Telephone', 'cell phone'],
   })
   if (locationVal) answers.push({
     key: 'location', value: locationVal, confidence: 0.95, source: 'profile',
-    keywords: ['location', 'city', 'address', 'where are you', 'country', 'region', 'state', '所在地', '地址', '城市'],
+    keywords: ['location', 'city', 'address', 'where are you', 'country', 'region', 'state', 'location', 'address', 'City'],
   })
   if (linkedinVal && linkedinVal !== 'N/A') answers.push({
     key: 'linkedin', value: linkedinVal, confidence: 1.0, source: 'profile',
@@ -1289,7 +1292,7 @@ function buildKnownAnswers(persona: string, personaFields: { key: string; label:
         value: sk,
         confidence: 0.9,
         source: 'resume',
-        keywords: [sk.toLowerCase(), 'skills', 'skill', 'technical skills', '技术', '技能'],
+        keywords: [sk.toLowerCase(), 'skills', 'skill', 'technical skills', 'technology', 'Skill'],
       })
     }
   }

@@ -14,6 +14,7 @@ vi.mock('@/components/ThemeProvider', () => ({
 
 vi.mock('@/lib/i18n', () => ({
   I18nProvider: ({ children }: { children: React.ReactNode }) => children,
+  useI18n: () => ({ lang: 'en', t: (key: string) => key, setLang: () => {} }),
 }))
 
 import { Providers } from './Providers'

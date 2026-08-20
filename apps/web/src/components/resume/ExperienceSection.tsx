@@ -6,6 +6,7 @@ import type { ResumeContent } from '@/lib/types'
 import { InlineInput } from './InlineInput'
 import { SectionHeader, type DragHandleProps } from './SectionHeader'
 import { AiFieldSuggestion, type AiFieldContext } from './AiFieldSuggestion'
+import { useI18n } from '@/lib/i18n'
 
 export function ExperienceSection({ experience, jobContext, onChange, dragHandleProps, onRemove, flashField }: {
   experience:       ResumeContent['experience']
@@ -15,6 +16,7 @@ export function ExperienceSection({ experience, jobContext, onChange, dragHandle
   onRemove?:        () => void
   flashField?:      string
 }) {
+  const { t } = useI18n()
   const [editIdx,   setEditIdx]   = useState<number | null>(null)
   const [collapsed, setCollapsed] = useState(false)
   const [dragOver,  setDragOver]  = useState<number | null>(null)
@@ -36,7 +38,7 @@ export function ExperienceSection({ experience, jobContext, onChange, dragHandle
   return (
     <div style={{ marginBottom: 20 }}>
       <SectionHeader
-        title="EXPERIENCE"
+        title={t('resume.section.experience')}
         count={experience.length}
         collapsed={collapsed}
         onToggle={() => setCollapsed(v => !v)}
@@ -48,17 +50,17 @@ export function ExperienceSection({ experience, jobContext, onChange, dragHandle
       {!collapsed && (
         <>
           {experience.length === 0 && (
-            <div style={{ fontSize: 12, color: 'var(--text-muted)', padding: '8px 4px' }}>No experience added yet.</div>
+            <div style={{ fontSize: 12, color: 'var(--text-muted)', padding: '8px 4px' }}>{t('resume.noExperience')}</div>
           )}
 
           {experience.map((exp, i) => (
             editIdx === i ? (
               <div key={i} style={{ border: '0.5px solid var(--primary)', borderRadius: 6, padding: 10, marginBottom: 10 }}>
                 <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 6, marginBottom: 6 }}>
-                  <InlineInput value={exp.role}    onChange={v => { const n=[...experience]; n[i]={...n[i],role:v};    onChange(n) }} placeholder="Job Title" />
-                  <InlineInput value={exp.company} onChange={v => { const n=[...experience]; n[i]={...n[i],company:v}; onChange(n) }} placeholder="Company" />
+                  <InlineInput value={exp.role}    onChange={v => { const n=[...experience]; n[i]={...n[i],role:v};    onChange(n) }} placeholder={t('resume.jobTitle')} />
+                  <InlineInput value={exp.company} onChange={v => { const n=[...experience]; n[i]={...n[i],company:v}; onChange(n) }} placeholder={t('resume.company')} />
                 </div>
-                <InlineInput value={exp.period} onChange={v => { const n=[...experience]; n[i]={...n[i],period:v}; onChange(n) }} placeholder="e.g. Jan 2022 – Present" style={{ marginBottom: 8 }} />
+                <InlineInput value={exp.period} onChange={v => { const n=[...experience]; n[i]={...n[i],period:v}; onChange(n) }} placeholder={t('resume.periodPlaceholder')} style={{ marginBottom: 8 }} />
                 <div>
                   {exp.bullets.map((b, bi) => (
                     <div key={bi} style={{ marginBottom: 6 }}>
@@ -66,7 +68,7 @@ export function ExperienceSection({ experience, jobContext, onChange, dragHandle
                         <span style={{ fontSize: 12, color: 'var(--text-muted)', marginTop: 7, flexShrink: 0 }}>•</span>
                         <InlineInput value={b} onChange={v => {
                           const n=[...experience]; n[i]={...n[i],bullets:n[i].bullets.map((x,xi)=>xi===bi?v:x)}; onChange(n)
-                        }} multiline placeholder="Describe your accomplishment…" style={{ minHeight: 36 }} />
+                        }} multiline placeholder={t('resume.accomplishmentPlaceholder')} style={{ minHeight: 36 }} />
                         <button onClick={() => {
                           const n=[...experience]; n[i]={...n[i],bullets:n[i].bullets.filter((_,xi)=>xi!==bi)}; onChange(n)
                         }} style={{ fontSize: 11, color: 'var(--c-danger)', background: 'none', border: 'none', cursor: 'pointer', marginTop: 7, flexShrink: 0 }}>✕</button>
@@ -84,13 +86,13 @@ export function ExperienceSection({ experience, jobContext, onChange, dragHandle
                   <button onClick={() => {
                     const n=[...experience]; n[i]={...n[i],bullets:[...n[i].bullets,'']}; onChange(n)
                   }} style={{ fontSize: 10, color: 'var(--primary)', background: 'none', border: 'none', cursor: 'pointer', marginTop: 2 }}>
-                    + Add bullet
+                    + {t('resume.addBullet')}
                   </button>
                 </div>
                 <div style={{ display: 'flex', justifyContent: 'space-between', marginTop: 8 }}>
                   <button onClick={() => { onChange(experience.filter((_,xi)=>xi!==i)); setEditIdx(null) }}
-                    style={{ fontSize: 10, color: 'var(--c-danger)', background: 'none', border: 'none', cursor: 'pointer' }}>Delete</button>
-                  <Btn small variant="primary" onClick={() => setEditIdx(null)}>Done</Btn>
+                    style={{ fontSize: 10, color: 'var(--c-danger)', background: 'none', border: 'none', cursor: 'pointer' }}>{t('common.delete')}</button>
+                  <Btn small variant="primary" onClick={() => setEditIdx(null)}>{t('common.done')}</Btn>
                 </div>
               </div>
             ) : (
@@ -106,11 +108,11 @@ export function ExperienceSection({ experience, jobContext, onChange, dragHandle
                   display: 'flex', alignItems: 'flex-start', gap: 4 }}
                 onMouseEnter={e => { if(dragOver!==i)(e.currentTarget as HTMLDivElement).style.background='var(--bg-secondary)' }}
                 onMouseLeave={e => { if(dragOver!==i)(e.currentTarget as HTMLDivElement).style.background='transparent' }}>
-                <span title="Drag to reorder" style={{ fontSize: 13, color: 'var(--border)', cursor: 'grab', marginTop: 2, flexShrink: 0, userSelect: 'none' }}>⠿</span>
+                <span title={t('resume.dragToReorder')} style={{ fontSize: 13, color: 'var(--border)', cursor: 'grab', marginTop: 2, flexShrink: 0, userSelect: 'none' }}>⠿</span>
                 <div style={{ flex: 1 }} onClick={() => setEditIdx(i)}>
                   <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 2 }}>
                     <div>
-                      <span style={{ fontSize: 12, fontWeight: 500 }}>{exp.role || <em style={{ color: 'var(--text-muted)' }}>Untitled</em>}</span>
+                      <span style={{ fontSize: 12, fontWeight: 500 }}>{exp.role || <em style={{ color: 'var(--text-muted)' }}>{t('resume.untitled')}</em>}</span>
                       {exp.company && <span style={{ fontSize: 12, color: 'var(--text-muted)' }}> · {exp.company}</span>}
                     </div>
                     <span style={{ fontSize: 11, color: 'var(--text-muted)' }}>{exp.period}</span>

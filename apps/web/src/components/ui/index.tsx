@@ -2,6 +2,7 @@
 
 import React, { createContext, useCallback, useContext, useMemo, useState } from 'react'
 import type { JobStatus } from '@/lib/types'
+import { useI18n } from '@/lib/i18n'
 
 export { UserAvatar } from './UserAvatar'
 
@@ -17,6 +18,8 @@ export const STATUS_CONFIG: Record<JobStatus, { label: string; color: string; bg
 // ─── StatusBadge — glass pill ─────────────────────────────────────────────────
 export function StatusBadge({ status }: { status: JobStatus }) {
   const cfg = STATUS_CONFIG[status]
+  const { t } = useI18n()
+  const labelKey: Record<JobStatus, string> = { saved: 'jobs.saved', applied: 'jobs.applied', interview: 'jobs.interview', offer: 'jobs.offer', rejected: 'jobs.rejected' }
   return (
     <span style={{
       display: 'inline-flex', alignItems: 'center', gap: 5,
@@ -34,7 +37,7 @@ export function StatusBadge({ status }: { status: JobStatus }) {
         boxShadow: `0 0 4px ${cfg.color}`,
         flexShrink: 0,
       }} />
-      {cfg.label}
+      {t(labelKey[status])}
     </span>
   )
 }
@@ -57,6 +60,7 @@ export function MatchScoreRing({
   const offset = circ - (score / 100) * circ
   const color = score >= 80 ? '#059669' : score >= 60 ? '#D97706' : '#DC2626'
   const fontSize = size === 'sm' ? 10 : size === 'lg' ? 14 : 11
+  const { t } = useI18n()
   const [animated, setAnimated] = useState(false)
   React.useEffect(() => {
     const t = setTimeout(() => setAnimated(true), 50)
@@ -76,7 +80,7 @@ export function MatchScoreRing({
           {score}%
         </text>
       </svg>
-      {showLabel && <span style={{ fontSize: 9, color: 'var(--text-muted)', letterSpacing: '0.02em' }}>match</span>}
+      {showLabel && <span style={{ fontSize: 9, color: 'var(--text-muted)', letterSpacing: '0.02em' }}>{t('common.match')}</span>}
     </div>
   )
 }
@@ -87,13 +91,34 @@ interface ToastCtx { success(t: string, d?: string): void; info(t: string, d?: s
 
 const ToastContext = createContext<ToastCtx | null>(null)
 
+const TOAST_TRANSLATION_KEYS: Record<string, string> = {
+  'Save failed': 'toast.saveFailed', 'Saved': 'toast.saved', 'Error': 'toast.error',
+  'Search failed': 'toast.searchFailed', 'Job saved': 'toast.jobSaved', 'Match scored': 'toast.matchScored',
+  'Generation failed': 'toast.generationFailed', 'Delete failed': 'toast.deleteFailed', 'PDF downloaded': 'toast.pdfDownloaded', 'PDF error': 'toast.pdfError',
+  'Settings saved': 'toast.settingsSaved', 'Profile saved': 'toast.profileSaved', 'Upload failed': 'toast.uploadFailed', 'Export failed': 'toast.exportFailed',
+  'Request failed': 'toast.requestFailed', 'Password updated': 'toast.passwordUpdated', 'Account deleted': 'toast.accountDeleted',
+  'Resume created': 'toast.resumeCreated', 'Resume saved': 'toast.resumeSaved', 'Restore failed': 'toast.restoreFailed', 'Version restored': 'toast.versionRestored', 'Resume deleted': 'toast.resumeDeleted',
+  'No resume selected': 'toast.noResumeSelected', 'Network error': 'toast.networkError', 'Copied': 'toast.copied', 'Jobs deleted': 'toast.jobsDeleted',
+  'Scoring failed': 'toast.scoringFailed', 'All jobs are already scored': 'toast.allJobsScored', 'Match scores ready': 'toast.matchScoresReady',
+  'Inbox refreshed': 'toast.inboxRefreshed', 'Agent resumed': 'toast.agentResumed', 'Preparation could not finish': 'toast.preparationFailed',
+  'Evidence saved to Persona': 'toast.evidenceSaved', 'Audited application pack ready': 'toast.applicationPackReady', 'Job discovery keys saved': 'toast.discoveryKeysSaved',
+  'Failed': 'toast.failed', 'Indeed Search': 'toast.indeedSearch', 'Filters detected': 'toast.filtersDetected', 'Could not update job': 'toast.jobUpdateFailed', 'Could not download application pack': 'toast.packDownloadFailed', 'No base resume selected': 'toast.noBaseResume', 'Prep failed': 'toast.prepFailed', 'No default resume': 'toast.noDefaultResume', 'Failed to save score': 'toast.scoreSaveFailed', 'GitHub connection failed': 'toast.githubConnectionFailed', 'GitHub connected': 'toast.githubConnected', 'Gmail connection failed': 'toast.gmailConnectionFailed', 'Could not reset Gmail access': 'toast.gmailResetFailed', 'Notification settings failed': 'toast.notificationSettingsFailed', 'Privacy settings failed': 'toast.privacySettingsFailed', 'Invalid image': 'toast.invalidImage', 'Image too large': 'toast.imageTooLarge', 'Data export ready': 'toast.dataExportReady', 'Deletion request submitted': 'toast.deletionRequested', 'Mismatch': 'toast.mismatch', 'Too short': 'toast.tooShort', 'Password change failed': 'toast.passwordChangeFailed', 'Onboarding reset': 'toast.onboardingReset', 'Could not clear discovery key': 'toast.discoveryKeyClearFailed', 'Analysis failed': 'toast.analysisFailed', 'Import failed': 'toast.importFailed', 'Summary updated': 'toast.summaryUpdated', 'Skill added': 'toast.skillAdded', 'Tip noted': 'toast.tipNoted', 'Added': 'toast.added', 'Noted': 'toast.noted', 'Skills reordered': 'toast.skillsReordered', 'Skills updated': 'toast.skillsUpdated', 'Could not link resume': 'toast.resumeLinkFailed', 'Resume linked': 'toast.resumeLinked', 'Audit could not run': 'toast.auditFailed', 'Could not confirm application pack': 'toast.packConfirmFailed', 'Application pack confirmed': 'toast.packConfirmed', 'Could not create application pack': 'toast.packCreateFailed', 'Rename failed': 'toast.renameFailed', 'Resume renamed': 'toast.resumeRenamed', 'Could not set default': 'toast.defaultResumeFailed', 'Default resume updated': 'toast.defaultResumeUpdated', 'Could not cancel link': 'toast.linkCancelFailed', 'Job link removed': 'toast.jobLinkRemoved', 'Keep one resume': 'toast.keepOneResume', 'Template applied': 'toast.templateApplied',
+  'Deleted': 'toast.deleted', 'Cover letter version removed': 'toast.coverLetterDeleted', 'New version created': 'toast.newVersionCreated', 'Cover letter saved as PDF': 'toast.coverLetterPdfDownloaded', 'Could not render cover letter PDF': 'toast.coverLetterPdfError', 'Scanning for new matches': 'toast.scanningMatches', 'Agent paused': 'toast.agentPaused', 'No more auto-actions until resumed': 'toast.agentPausedDetail', 'Agent will use updated configuration': 'toast.agentSettingsSaved', 'Profile photo updated': 'toast.profilePhotoUpdated', 'Enter current and new password': 'toast.passwordRequired', 'New password and confirmation do not match': 'toast.passwordMismatch', 'Sign in again to continue': 'toast.signInAgain', 'Reload the page to restart the setup wizard': 'toast.reloadOnboarding', 'Email template copied to clipboard': 'toast.emailCopied', 'Please try again': 'toast.tryAgain', 'Create or import a resume first': 'toast.createResumeFirst', 'Select a resume first': 'toast.selectResumeFirst', 'Choose a saved job first': 'toast.selectSavedJob', 'Go to Settings → Profile to restart onboarding': 'toast.restartOnboarding', 'Choose the opportunity this resume should be used for': 'toast.chooseOpportunity', 'Choose a job in the Linked opportunity panel': 'toast.chooseLinkedJob', 'Create another version before deleting this resume.': 'toast.createResumeVersion', 'The resume is no longer marked as Final for that job': 'toast.jobLinkRemovedDetail',
+}
+
 export function ToastProvider({ children }: { children: React.ReactNode }) {
+  const { lang, t } = useI18n()
   const [toasts, setToasts] = useState<ToastItem[]>([])
+  const localize = useCallback((text?: string) => {
+    if (!text || lang === 'en') return text
+    const key = TOAST_TRANSLATION_KEYS[text]
+    return key ? t(key) : t(text === 'Error' ? 'toast.error' : 'toast.genericDetail')
+  }, [lang, t])
   const add = useCallback((variant: ToastItem['variant'], title: string, description?: string) => {
     const id = Date.now()
-    setToasts(t => [...t, { id, variant, title, description }])
+    setToasts(items => [...items, { id, variant, title: localize(title) ?? title, description: localize(description) }])
     setTimeout(() => setToasts(t => t.filter(x => x.id !== id)), 4200)
-  }, [])
+  }, [localize])
   // Keep the context value stable while the toast list changes. Consumers such
   // as Gmail use it in effects, so a new object here could trigger avoidable
   // reloads after every notification.

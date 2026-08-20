@@ -453,10 +453,10 @@ export const test = base.extend<E2eFixtures>({
       await page.goto("/login");
       await page.getByPlaceholder("you@example.com").fill(demoUser.email);
       await page.locator('input[type="password"]').fill(demoUser.password);
-      await page.getByRole("button", { name: /^(Sign in|登录)$/ }).click();
+      await page.getByRole("button", { name: /^(Sign in|Log in)$/ }).click();
       await page.waitForURL(url => url.pathname === "/", { timeout: 15_000 });
       await expect(page.getByText("ApplyMate AI").first()).toBeVisible();
-      await expect(page.getByRole("button", { name: /Dashboard|仪表盘/ })).toBeVisible({ timeout: 15_000 });
+      await expect(page.getByRole("button", { name: /Dashboard|Dashboard/ })).toBeVisible({ timeout: 15_000 });
     };
     const goTo = async (label: string | RegExp) => {
       await page.getByRole("button", { name: label }).click();

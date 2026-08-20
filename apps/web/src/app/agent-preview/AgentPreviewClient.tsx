@@ -5,6 +5,7 @@ import { useState, type CSSProperties } from 'react'
 import styles from './AgentPreviewClient.module.css'
 import { Sidebar } from '@/components/layout/Sidebar'
 import type { Page } from '@/lib/types'
+import { useI18n } from '@/lib/i18n'
 
 const previewSession = {
   user: { id: 'agent-preview', email: 'agent-preview@applymate.local', name: 'Agent Preview', plan: 'pro' as const },
@@ -19,6 +20,7 @@ const rows = [
 ]
 
 export function AgentPreviewClient() {
+  const { t } = useI18n()
   const [thinkingExpanded, setThinkingExpanded] = useState(false)
   const [drawerOpen, setDrawerOpen] = useState(false)
   const [newChat, setNewChat] = useState(false)
@@ -38,50 +40,50 @@ export function AgentPreviewClient() {
       <div className="agent-preview-desktop-sidebar">
         <Sidebar active={'agent' as Page} onNav={() => undefined} session={previewSession} jobCount={12} />
       </div>
-      <button className={`agent-preview-drawer-scrim${drawerOpen ? ' is-open' : ''}`} type="button" aria-label="Close conversations" tabIndex={drawerOpen ? 0 : -1} onClick={() => setDrawerOpen(false)} />
+      <button className={`agent-preview-drawer-scrim${drawerOpen ? ' is-open' : ''}`} type="button" aria-label={t('agentPreview.closeConversations')} tabIndex={drawerOpen ? 0 : -1} onClick={() => setDrawerOpen(false)} />
       <div id="agent-preview-drawer" className={`agent-preview-drawer${drawerOpen ? ' is-open' : ''}`}>
         <div className="agent-preview-drawer-header">
-          <span>Conversations</span>
+          <span>{t('agentPreview.conversations')}</span>
           <div className="agent-preview-drawer-actions">
-            <button className="agent-preview-drawer-home" type="button" aria-label="Back to Home" onClick={() => { window.location.assign('/?page=dashboard') }}>
+            <button className="agent-preview-drawer-home" type="button" aria-label={t('agentPreview.backHome')} onClick={() => { window.location.assign('/?page=dashboard') }}>
               <Home size={15} aria-hidden="true" />
-              Back to Home
+              {t('agentPreview.backHome')}
             </button>
-            <button className="agent-preview-drawer-collapse" type="button" aria-label="Collapse conversations" onClick={() => setDrawerOpen(false)}>
+            <button className="agent-preview-drawer-collapse" type="button" aria-label={t('agentPreview.collapseConversations')} onClick={() => setDrawerOpen(false)}>
               <PanelLeftClose size={17} aria-hidden="true" />
             </button>
           </div>
         </div>
         <aside className="agent-preview-console" style={agentSidebar}>
           <div style={{ padding: 14, borderBottom: '1px solid var(--border)' }}>
-            <button type="button" style={primaryButton} onClick={startNewChat}>+ New chat</button>
+            <button type="button" style={primaryButton} onClick={startNewChat}>+ {t('agentPreview.newChat')}</button>
           </div>
           <MetricGrid />
-          <Section title="Recent Sessions">
-            <SessionRow active={!newChat} title="Berlin SWE Auto-Apply" meta="Last opened · Running · quality 87% · 09:14" onClick={resumeLastChat} />
-            <SessionRow title="Munich Data Engineer Search" meta="Done · quality 91% · Yesterday" />
-            <SessionRow title="Gmail Follow-up Batch" meta="Approval · quality pending · May 22" />
+          <Section title={t('agentPreview.recentSessions')}>
+            <SessionRow active={!newChat} title={t('agentPreview.sessionBerlin')} meta={t('agentPreview.sessionBerlinMeta')} onClick={resumeLastChat} />
+            <SessionRow title={t('agentPreview.sessionMunich')} meta={t('agentPreview.sessionMunichMeta')} />
+            <SessionRow title={t('agentPreview.sessionGmail')} meta={t('agentPreview.sessionGmailMeta')} />
           </Section>
-          <Section title="Queued Tasks">
-            <TaskRow role="Scout" status="LivenessGate" value="94%" />
-            <TaskRow role="Analyst" status="JobDecision" value="89%" />
-            <TaskRow role="Executor" status="Approval" value="waiting" warn />
+          <Section title={t('agentPreview.queuedTasks')}>
+            <TaskRow role={t('agentPreview.scout')} status={t('agentPreview.livenessGate')} value="94%" />
+            <TaskRow role={t('agentPreview.analyst')} status={t('agentPreview.jobDecision')} value="89%" />
+            <TaskRow role={t('agentPreview.executor')} status={t('agentPreview.approval')} value={t('agentPreview.waiting')} warn />
           </Section>
-          <Section title="Agent Team">
+          <Section title={t('agentPreview.agentTeam')}>
             {['Orchestrator', 'Scout', 'Analyst', 'Writer', 'Reviewer', 'Executor', 'Auditor'].map((name, index) => (
-              <TaskRow key={name} role={name} status={index < 3 ? 'active' : 'idle'} value={index < 3 ? 'MiniMax' : 'Claude'} />
+              <TaskRow key={name} role={name} status={index < 3 ? t('agentPreview.active') : t('agentPreview.idle')} value={index < 3 ? 'MiniMax' : 'Claude'} />
             ))}
           </Section>
-          <Section title="Automations">
-            <TaskRow role="Weekday 09:00 EU scout" status="enabled" value="run" />
-            <TaskRow role="Auto-apply 85+" status="approval required" value="on" />
+          <Section title={t('agentPreview.automations')}>
+            <TaskRow role={t('agentPreview.weekdayScout')} status={t('agentPreview.enabled')} value={t('agentPreview.run')} />
+            <TaskRow role={t('agentPreview.autoApply85')} status={t('agentPreview.approvalRequired')} value={t('agentPreview.on')} />
           </Section>
-          <Section title="Session Quality">
+          <Section title={t('agentPreview.sessionQuality')}>
             <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10 }}>
-              <Quality label="Quality" value="87%" />
-              <Quality label="Gate pass" value="92%" />
-              <Quality label="Retry" value="8%" />
-              <Quality label="Approvals" value="2" warn />
+              <Quality label={t('agentPreview.quality')} value="87%" />
+              <Quality label={t('agentPreview.gatePass')} value="92%" />
+              <Quality label={t('agentPreview.retry')} value="8%" />
+              <Quality label={t('agentPreview.approvals')} value="2" warn />
             </div>
           </Section>
         </aside>
@@ -89,13 +91,13 @@ export function AgentPreviewClient() {
       <main className="agent-preview-main" style={{ flex: 1, minWidth: 0, display: 'flex', flexDirection: 'column', background: 'var(--bg)' }}>
         <header style={headerStyle}>
           <div style={{ display: 'flex', alignItems: 'center', gap: 10, minWidth: 0 }}>
-            <button className="agent-preview-drawer-trigger" type="button" aria-label="Open conversations" aria-expanded={drawerOpen} aria-controls="agent-preview-drawer" onClick={() => setDrawerOpen(true)}>
+            <button className="agent-preview-drawer-trigger" type="button" aria-label={t('agentPreview.openConversations')} aria-expanded={drawerOpen} aria-controls="agent-preview-drawer" onClick={() => setDrawerOpen(true)}>
               <PanelLeftOpen size={17} aria-hidden="true" />
             </button>
             {!newChat && <div>
-              <h1 style={{ margin: 0, fontSize: 17 }}>Berlin SWE Auto-Apply</h1>
+              <h1 style={{ margin: 0, fontSize: 17 }}>{t('agentPreview.sessionBerlin')}</h1>
               <div style={{ marginTop: 4, fontSize: 12, color: 'var(--text-muted)' }}>
-                Memory: Berlin SWE · min score 85 · approval required · no LinkedIn
+                {t('agentPreview.memory')}
               </div>
             </div>}
           </div>
@@ -103,29 +105,27 @@ export function AgentPreviewClient() {
         </header>
         <section className="agent-preview-transcript" style={transcriptStyle}>
           {newChat ? <NewChatEmptyState /> : <>
-          <Message speaker="You" body="每天早上 9 点自动找 Berlin 软件工程岗位，85 分以上自动投，但需要我确认。" time="09:11" />
-          <Message speaker="Orchestrator · Automation draft" body="我可以创建一个工作日 09:00 自动化：在 Berlin 搜索软件工程岗位，85 分以上进入投递队列，提交前请求你确认。" time="09:12">
-            <Grid rows={[['Trigger', 'Weekdays 09:00'], ['Target', 'Berlin · SWE'], ['Score', '85+'], ['Approval', 'Required'], ['Daily cap', '8 applications']]} />
-            <ButtonRow labels={['Create automation', 'Edit', 'Cancel']} />
+          <Message speaker={t('agentPreview.you')} body={t('agentPreview.userMessage')} time="09:11" />
+          <Message speaker={t('agentPreview.orchestratorDraft')} body={t('agentPreview.orchestratorMessage')} time="09:12">
+            <Grid rows={[[t('agentPreview.trigger'), t('agentPreview.weekdays')], [t('agentPreview.target'), t('agentPreview.berlinSwe')], [t('agentPreview.score'), '85+'], [t('agentPreview.approval'), t('agentPreview.required')], [t('agentPreview.dailyCap'), t('agentPreview.eightApplications')]]} />
+            <ButtonRow labels={[t('agentPreview.createAutomation'), t('agentPreview.edit'), t('agentPreview.cancel')]} />
           </Message>
           <Message
-            speaker="Analyst · Thinking"
-            body={thinkingExpanded
-              ? 'Checked saved preferences, application limits, recent run history, salary constraints, and no-LinkedIn policy. Evidence: 85+ score gate, Berlin SWE target, approval required before submission.'
-              : 'Checked saved preferences, application limits, recent run history, and salary constraints.'}
-            time={thinkingExpanded ? '09:12 · expanded' : '09:12 · collapsed'}
+            speaker={t('agentPreview.analystThinking')}
+            body={thinkingExpanded ? t('agentPreview.thinkingExpanded') : t('agentPreview.thinkingCollapsed')}
+            time={thinkingExpanded ? t('agentPreview.expandedTime') : t('agentPreview.collapsedTime')}
             muted={!thinkingExpanded}
           />
-          <Message speaker="Orchestrator · Options" body="选择投递策略以优化匹配质量和效率。" time="09:13">
-            <Option name="Conservative" desc="更高匹配阈值，投递更少但质量更高。" />
-            <Option name="Balanced" desc="平衡匹配质量与数量，推荐日常使用。" selected />
-            <Option name="Aggressive" desc="更宽松阈值，获取更多机会。" />
+          <Message speaker={t('agentPreview.orchestratorOptions')} body={t('agentPreview.strategyMessage')} time="09:13">
+            <Option name={t('agentPreview.conservative')} desc={t('agentPreview.conservativeDescription')} />
+            <Option name={t('agentPreview.balanced')} desc={t('agentPreview.balancedDescription')} selected />
+            <Option name={t('agentPreview.aggressive')} desc={t('agentPreview.aggressiveDescription')} />
           </Message>
-          <Message speaker="Executor · Approval Required" body="准备提交以下 4 份申请，请确认是否继续。" time="09:14" warn>
-            <Grid rows={[['Impact', '4 applications · 4 cover letters'], ['LinkedIn', 'No LinkedIn actions'], ['Sensitive fields', 'Ask user if missing']]} />
-            <ButtonRow labels={['Approve', 'Review jobs', 'Cancel']} />
+          <Message speaker={t('agentPreview.executorApproval')} body={t('agentPreview.executorMessage')} time="09:14" warn>
+            <Grid rows={[[t('agentPreview.impact'), t('agentPreview.fourApplications')], ['LinkedIn', t('agentPreview.noLinkedInActions')], [t('agentPreview.sensitiveFields'), t('agentPreview.askUserIfMissing')]]} />
+            <ButtonRow labels={[t('agentPreview.approve'), t('agentPreview.reviewJobs'), t('agentPreview.cancel')]} />
           </Message>
-          <Message speaker="Analyst · Top opportunities" body="Top matches for Berlin, Germany" time="09:15">
+          <Message speaker={t('agentPreview.topOpportunities')} body={t('agentPreview.topMatches')} time="09:15">
             <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 11 }}>
               <tbody>{rows.map(row => <tr key={row[0]}>{row.map(cell => <td key={cell} style={tdStyle}>{cell}</td>)}</tr>)}</tbody>
             </table>
@@ -134,17 +134,17 @@ export function AgentPreviewClient() {
         </section>
         <footer style={composerWrap}>
           <div style={chipRowStyle}>
-            {['Automate', 'Review', 'Explain score'].map(label => <button key={label} style={composerChipStyle}><Sparkles size={13} color="var(--primary)" aria-hidden="true" />{label}</button>)}
+            {[t('agentPreview.automate'), t('agentPreview.review'), t('agentPreview.explainScore')].map(label => <button key={label} style={composerChipStyle}><Sparkles size={13} color="var(--primary)" aria-hidden="true" />{label}</button>)}
             <button style={composerChipStyle} onClick={() => setThinkingExpanded(value => !value)}>
               <Sparkles size={13} color="var(--primary)" aria-hidden="true" />
-              {thinkingExpanded ? 'Hide thinking' : 'Thinking'}
+              {thinkingExpanded ? t('agentPreview.hideThinking') : t('agentPreview.thinking')}
             </button>
           </div>
           <div style={composerBox}>
-            <textarea placeholder="Ask ApplyMate to search, score, apply, or create an automation..." style={textareaStyle} />
+            <textarea placeholder={t('agentPreview.composerPlaceholder')} style={textareaStyle} />
             <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
-              <div style={{ display: 'flex', gap: 8 }}><button aria-label="Add context" style={iconButton}><Paperclip size={17} aria-hidden="true" /></button><button style={selectButton}>Model <ChevronDown size={13} aria-hidden="true" /></button></div>
-              <button aria-label="Send message" style={sendButton}><ArrowUp size={19} strokeWidth={2.7} aria-hidden="true" /></button>
+              <div style={{ display: 'flex', gap: 8 }}><button aria-label={t('agentPreview.addContext')} style={iconButton}><Paperclip size={17} aria-hidden="true" /></button><button style={selectButton}>{t('agentPreview.model')} <ChevronDown size={13} aria-hidden="true" /></button></div>
+              <button aria-label={t('agentPreview.sendMessage')} style={sendButton}><ArrowUp size={19} strokeWidth={2.7} aria-hidden="true" /></button>
             </div>
           </div>
         </footer>
@@ -154,7 +154,8 @@ export function AgentPreviewClient() {
 }
 
 function MetricGrid() {
-  return <div style={{ padding: '10px', display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8 }}><Quality label="Queued Tasks" value="3" /><Quality label="Approvals" value="2" warn /></div>
+  const { t } = useI18n()
+  return <div style={{ padding: '10px', display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8 }}><Quality label={t('agentPreview.queuedTasks')} value="3" /><Quality label={t('agentPreview.approvals')} value="2" warn /></div>
 }
 
 function Section({ title, children }: { title: string; children: React.ReactNode }) {
@@ -166,11 +167,12 @@ function SessionRow({ title, meta, active = false, onClick }: { title: string; m
 }
 
 function NewChatEmptyState() {
-  return <div aria-label="New chat welcome" style={{ flex: 1, display: 'grid', placeItems: 'center', textAlign: 'center' }}>
+  const { t } = useI18n()
+  return <div aria-label={t('agentPreview.newChatWelcome')} style={{ flex: 1, display: 'grid', placeItems: 'center', textAlign: 'center' }}>
     <div style={{ display: 'grid', justifyItems: 'center', gap: 14 }}>
       <span aria-label="ApplyMate AI" style={{ width: 58, height: 58, display: 'grid', placeItems: 'center', borderRadius: 18, background: 'var(--brand-gradient)', color: '#fff', fontSize: 25, fontWeight: 800, boxShadow: '0 12px 28px rgba(79,70,229,0.24)' }}>A</span>
-      <div style={{ fontSize: 22, fontWeight: 760, letterSpacing: '-0.03em' }}>What can I help you with?</div>
-      <div style={{ fontSize: 13, color: 'var(--text-muted)' }}>Start a new ApplyMate conversation below.</div>
+      <div style={{ fontSize: 22, fontWeight: 760, letterSpacing: '-0.03em' }}>{t('agentPreview.welcomeTitle')}</div>
+      <div style={{ fontSize: 13, color: 'var(--text-muted)' }}>{t('agentPreview.welcomeDescription')}</div>
     </div>
   </div>
 }

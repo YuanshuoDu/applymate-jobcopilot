@@ -505,7 +505,7 @@ export function SettingsPage() {
           overflowY: 'auto',
           display: 'flex', flexDirection: 'column', gap: 2,
         }}>
-          <div style={{ fontSize: 10, fontWeight: 700, color: 'var(--text-subtle)', letterSpacing: '0.08em', textTransform: 'uppercase', padding: '6px 10px 8px' }}>Settings</div>
+          <div style={{ fontSize: 10, fontWeight: 700, color: 'var(--text-subtle)', letterSpacing: '0.08em', textTransform: 'uppercase', padding: '6px 10px 8px' }}>{t('settings.title')}</div>
           {TABS.map(tab => {
             const active = activeTab === tab.id
             return (
@@ -543,7 +543,7 @@ export function SettingsPage() {
               <div className="settings-profile-grid" style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(min(100%, 420px), 1fr))', gap: 16, alignItems: 'start' }}>
                 <SettingsSection title={t('settings.personalInfo')}>
                   {userLoading ? (
-                    <div style={{ fontSize: 12, color: 'var(--text-muted)', padding: '12px 0' }}>Loading...</div>
+                    <div style={{ fontSize: 12, color: 'var(--text-muted)', padding: '12px 0' }}>{t('settings.loading')}</div>
                   ) : userError ? (
                     <div style={{ padding: '12px 0', fontSize: 12, color: 'var(--c-danger)' }}>
                       Could not load your profile: {userError}
@@ -555,45 +555,45 @@ export function SettingsPage() {
                         <div>
                           <input ref={avatarInputRef} type="file" accept="image/png,image/jpeg,image/webp,image/gif" onChange={handleAvatarChange} style={{ display: 'none' }} />
                           <Btn small variant="ghost" disabled={avatarSaving} onClick={() => avatarInputRef.current?.click()}>
-                            {avatarSaving ? 'Uploading...' : 'Upload photo'}
+                            {avatarSaving ? t('settings.uploading') : t('settings.uploadPhoto')}
                           </Btn>
-                          <div style={{ fontSize: 10, color: 'var(--text-muted)', marginTop: 4 }}>JPG, PNG up to 2MB</div>
+                          <div style={{ fontSize: 10, color: 'var(--text-muted)', marginTop: 4 }}>{t('settings.avatarHelp')}</div>
                         </div>
                       </div>
 
-                      <FieldRow label="Full name"><Input value={name} onChange={e => setName(e.target.value)} placeholder="Your name" /></FieldRow>
-                      <FieldRow label="Email"><Input value={user?.email ?? ''} readOnly placeholder="email@example.com" /></FieldRow>
-                      <FieldRow label="Phone"><Input type="tel" value={phone} onChange={e => setPhone(e.target.value)} placeholder="+1 555 000 0000" /></FieldRow>
-                      <FieldRow label="Location"><Input value={location} onChange={e => setLocation(e.target.value)} placeholder="City, Country" /></FieldRow>
-                      <FieldRow label="LinkedIn"><Input value={linkedin} onChange={e => setLinkedin(e.target.value)} placeholder="linkedin.com/in/you" /></FieldRow>
-                      <FieldRow label="GitHub"><Input value={github} onChange={e => setGithub(e.target.value)} placeholder="github.com/you" /></FieldRow>
+                      <FieldRow label={t('settings.fullName')}><Input value={name} onChange={e => setName(e.target.value)} placeholder={t('settings.yourName')} /></FieldRow>
+                      <FieldRow label={t('settings.email')}><Input value={user?.email ?? ''} readOnly placeholder={t('settings.emailPlaceholder')} /></FieldRow>
+                      <FieldRow label={t('settings.phone')}><Input type="tel" value={phone} onChange={e => setPhone(e.target.value)} placeholder="+1 555 000 0000" /></FieldRow>
+                      <FieldRow label={t('settings.location')}><Input value={location} onChange={e => setLocation(e.target.value)} placeholder={t('settings.cityCountry')} /></FieldRow>
+                      <FieldRow label={t('settings.linkedin')}><Input value={linkedin} onChange={e => setLinkedin(e.target.value)} placeholder={t('settings.linkedinPlaceholder')} /></FieldRow>
+                      <FieldRow label={t('settings.github')}><Input value={github} onChange={e => setGithub(e.target.value)} placeholder={t('settings.githubPlaceholder')} /></FieldRow>
                     </>
                   )}
                 </SettingsSection>
 
                 <SettingsSection title={t('settings.jobPrefs')}>
-                  <FieldRow label="Target roles">    <Input value={prefRoles}     onChange={e => setPrefRoles(e.target.value)}     placeholder="Backend Engineer, SWE" /></FieldRow>
-                  <FieldRow label="Target locations"><Input value={prefLocations} onChange={e => setPrefLocations(e.target.value)} placeholder="Amsterdam, Berlin, Remote" /></FieldRow>
-                  <FieldRow label="Salary expectation"><Input value={prefSalary}   onChange={e => setPrefSalary(e.target.value)}    placeholder="EUR65,000 - EUR90,000" /></FieldRow>
-                  <FieldRow label="Work authorisation">
+                  <FieldRow label={t('settings.targetRoles')}>    <Input value={prefRoles}     onChange={e => setPrefRoles(e.target.value)}     placeholder={t('settings.rolesPlaceholder')} /></FieldRow>
+                  <FieldRow label={t('settings.targetLocations')}><Input value={prefLocations} onChange={e => setPrefLocations(e.target.value)} placeholder={t('settings.locationsPlaceholder')} /></FieldRow>
+                  <FieldRow label={t('settings.salary')}><Input value={prefSalary}   onChange={e => setPrefSalary(e.target.value)}    placeholder={t('settings.salaryPlaceholder')} /></FieldRow>
+                  <FieldRow label={t('settings.workAuth')}>
                     <select value={prefVisa} onChange={e => setPrefVisa(e.target.value)} style={{ padding: '6px 10px', fontSize: 12, border: '0.5px solid var(--border)', borderRadius: 6, background: 'var(--bg)', color: 'var(--text)', outline: 'none', maxWidth: 260, width: '100%' }}>
-                      <option>EU citizen / no visa required</option>
-                      <option>Requires sponsorship</option>
-                      <option>Open work permit</option>
+                      <option value="EU citizen / no visa required">{t('settings.euCitizen')}</option>
+                      <option value="Requires sponsorship">{t('settings.sponsorship')}</option>
+                      <option value="Open work permit">{t('settings.openWorkPermit')}</option>
                     </select>
                   </FieldRow>
-                  <FieldRow label="Open to relocation"><Toggle label="Open to relocation" value={prefRelocate} onChange={setPrefRelocate} /></FieldRow>
+                  <FieldRow label={t('settings.relocation')}><Toggle label={t('settings.relocation')} value={prefRelocate} onChange={setPrefRelocate} /></FieldRow>
                 </SettingsSection>
 
                 <SettingsSection title={t('settings.password')}>
-                  <FieldRow label="Current password">
-                    <Input type="password" value={passwordCur}  onChange={e => setPasswordCur(e.target.value)}  placeholder="Password" />
+                  <FieldRow label={t('settings.currentPassword')}>
+                    <Input type="password" value={passwordCur}  onChange={e => setPasswordCur(e.target.value)}  placeholder={t('settings.passwordPlaceholder')} />
                   </FieldRow>
-                  <FieldRow label="New password">
-                    <Input type="password" value={passwordNew}  onChange={e => setPasswordNew(e.target.value)}  placeholder="At least 8 characters" />
+                  <FieldRow label={t('settings.newPassword')}>
+                    <Input type="password" value={passwordNew}  onChange={e => setPasswordNew(e.target.value)}  placeholder={t('settings.newPasswordPlaceholder')} />
                   </FieldRow>
-                  <FieldRow label="Confirm password">
-                    <Input type="password" value={passwordConf} onChange={e => setPasswordConf(e.target.value)} placeholder="Repeat new password" />
+                  <FieldRow label={t('settings.confirmPassword')}>
+                    <Input type="password" value={passwordConf} onChange={e => setPasswordConf(e.target.value)} placeholder={t('settings.repeatPasswordPlaceholder')} />
                   </FieldRow>
                   <div style={{ marginTop: 12, display: 'flex', justifyContent: 'flex-end' }}>
                     <Btn variant="ghost" disabled={pwSaving} onClick={async () => {
@@ -648,7 +648,7 @@ export function SettingsPage() {
               </FieldRow>
               <FieldRow label={t('lang.label')}>
                 <select value={lang} onChange={event => setLang(event.target.value as Lang)} style={{ minWidth: 210, padding: '7px 10px', border: '1px solid var(--border)', borderRadius: 8, background: 'var(--bg)', color: 'var(--text)', fontFamily: 'inherit', fontSize: 12 }}>
-                  {LANGUAGES.map(language => <option key={language.value} value={language.value}>{language.flag} {language.native}</option>)}
+                  {LANGUAGES.map(language => <option key={language.value} value={language.value}>{language.flag} {t(`lang.${language.value}`)}</option>)}
                 </select>
               </FieldRow>
             </SettingsSection>
@@ -667,7 +667,7 @@ export function SettingsPage() {
                 </div>
               )}
               {accountsLoading && (
-                <div style={{ margin: '8px 0 12px', fontSize: 11, color: 'var(--text-muted)' }}>Checking connected accounts…</div>
+                <div style={{ margin: '8px 0 12px', fontSize: 11, color: 'var(--text-muted)' }}>{t('settings.checkingAccounts')}</div>
               )}
               <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
                 {accounts.map(acc => {
@@ -682,13 +682,13 @@ export function SettingsPage() {
                         <div style={{ fontSize: 12, fontWeight: 500, display: 'flex', alignItems: 'center', gap: 6 }}>
                           {acc.name}
                           {gmailNeedsFix && (
-                            <span style={{ fontSize: 9, background: 'rgba(220,38,38,0.12)', color: 'var(--c-danger)', borderRadius: 999, padding: '1px 6px' }}>Needs fix</span>
+                            <span style={{ fontSize: 9, background: 'rgba(220,38,38,0.12)', color: 'var(--c-danger)', borderRadius: 999, padding: '1px 6px' }}>{t('settings.needsFix')}</span>
                           )}
                         </div>
                         <div style={{ fontSize: 10, color: 'var(--text-muted)' }}>
                           {acc.connected
                             ? gmailNeedsFix
-                              ? <span>Gmail API access failed. Token scopes: <code style={{ fontSize: 9, background: 'var(--bg-tertiary)', padding: '1px 4px', borderRadius: 3 }}>{gmailHealth.scopes || '(none)'}</code></span>
+                             ? <span>{t('settings.gmailApiFailed')} <code style={{ fontSize: 9, background: 'var(--bg-tertiary)', padding: '1px 4px', borderRadius: 3 }}>{gmailHealth.scopes || t('settings.none')}</code></span>
                               : acc.account
                             : acc.desc}
                         </div>
@@ -709,7 +709,7 @@ export function SettingsPage() {
                                Re-link Gmail
                              </Btn>
                            ) : (
-                             <span style={{ fontSize: 10, color: 'var(--c-success)', background: 'rgba(5,150,105,0.12)', borderRadius: 999, padding: '2px 8px' }}>● Connected</span>
+                             <span style={{ fontSize: 10, color: 'var(--c-success)', background: 'rgba(5,150,105,0.12)', borderRadius: 999, padding: '2px 8px' }}>● {t('settings.connected')}</span>
                            )}
                             {acc.disconnectable !== false && (
                               <Btn small variant="danger" disabled={accountsLoading || accountAction !== null} onClick={() => void disconnectAccount(acc.id, acc.name)}>
@@ -718,7 +718,7 @@ export function SettingsPage() {
                             )}
                         </div>
                       ) : !acc.available ? (
-                         <span title={acc.desc}><Btn small variant="ghost" disabled>Unavailable</Btn></span>
+                         <span title={acc.desc}><Btn small variant="ghost" disabled>{t('settings.unavailable')}</Btn></span>
                       ) : (
                          <Btn small variant="primary" disabled={accountsLoading || accountAction !== null} onClick={() => {
                            if (isGmail) {
@@ -726,7 +726,7 @@ export function SettingsPage() {
                           } else if (acc.id === 'github') {
                             void connectGithub()
                           }
-                        }}>Connect</Btn>
+                        }}>{t('settings.connect')}</Btn>
                       )}
                     </div>
                   )
@@ -735,7 +735,7 @@ export function SettingsPage() {
             </SettingsSection>
 
             {/* ── Chrome Extension ── */}
-            <SettingsSection title="Chrome 扩展">
+            <SettingsSection title={t('settings.chromeExpand')}>
               <div style={{ display: 'flex', alignItems: 'center', gap: 14, padding: 14, background: 'var(--bg-secondary)', borderRadius: 10, border: '0.5px solid var(--border)', marginTop: 4 }}>
                 {/* Chrome puzzle icon */}
                 <div style={{ width: 36, height: 36, borderRadius: 8, background: 'rgba(79,70,229,0.12)', color: 'var(--primary)', display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0 }}>
@@ -744,8 +744,8 @@ export function SettingsPage() {
                   </svg>
                 </div>
                 <div style={{ flex: 1 }}>
-                  <div style={{ fontSize: 12, fontWeight: 500, color: 'var(--text)', marginBottom: 2 }}>ApplyMate AI for Chrome</div>
-                  <div style={{ fontSize: 10, color: 'var(--text-muted)', lineHeight: 1.5 }}>在 LinkedIn、Indeed 等求职网站上一键保存职位、自动填表、查看简历匹配分</div>
+                  <div style={{ fontSize: 12, fontWeight: 500, color: 'var(--text)', marginBottom: 2 }}>{t('settings.chromeTitle')}</div>
+                   <div style={{ fontSize: 10, color: 'var(--text-muted)', lineHeight: 1.5 }}>{t('settings.chromeDescription')}</div>
                 </div>
                 <div style={{ display: 'flex', flexDirection: 'column', gap: 6, alignItems: 'flex-end', flexShrink: 0 }}>
                   <a
@@ -760,7 +760,7 @@ export function SettingsPage() {
                     }}
                   >
                     <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
-                    安装扩展
+                    {t('settings.installExtension')}
                   </a>
                   <a
                     href="https://github.com/YuanshuoDu/applymate-jobcopilot"
@@ -768,7 +768,7 @@ export function SettingsPage() {
                     rel="noreferrer"
                     style={{ fontSize: 10, color: 'var(--text-muted)', textDecoration: 'none' }}
                   >
-                    查看使用说明 →
+                    {t('settings.instructions')}
                   </a>
                 </div>
               </div>
@@ -789,10 +789,10 @@ export function SettingsPage() {
                   </div>
                   <span style={{ marginLeft: 'auto', fontSize: 10, background: 'rgba(79,70,229,0.12)', color: 'var(--primary)', borderRadius: 999, padding: '3px 10px', fontWeight: 500 }}>{billingStatus.label}</span>
                 </div>
-                <Btn variant="ghost" onClick={() => openBillingSupport('manage billing')}>Contact billing support</Btn>
+                <Btn variant="ghost" onClick={() => openBillingSupport('manage billing')}>{t('settings.contactBilling')}</Btn>
               </SettingsSection>
 
-              {billingLoading && !billingData && <Card style={{ padding: 16, color: 'var(--text-muted)', fontSize: 12 }}>Loading plans…</Card>}
+              {billingLoading && !billingData && <Card style={{ padding: 16, color: 'var(--text-muted)', fontSize: 12 }}>{t('settings.loadingPlans')}</Card>}
               {billingError && !billingData && <Card style={{ padding: 16, color: 'var(--c-danger)', fontSize: 12 }}>{billingError}</Card>}
               {billingData && <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(min(100%, 200px), 1fr))', gap: 12 }}>
                 {billingData.plans.map(plan => {
@@ -802,7 +802,7 @@ export function SettingsPage() {
                     <Card key={plan.key} style={{ padding: 16, border: isCurrent ? '1.5px solid var(--primary)' : '0.5px solid var(--border)', background: isCurrent ? 'rgba(79,70,229,0.03)' : 'var(--bg)' }}>
                       <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 12 }}>
                         <span style={{ fontSize: 13, fontWeight: 500 }}>{plan.name}</span>
-                        {isCurrent && <span style={{ fontSize: 10, background: 'rgba(79,70,229,0.12)', color: 'var(--primary)', borderRadius: 999, padding: '2px 7px' }}>Current</span>}
+                        {isCurrent && <span style={{ fontSize: 10, background: 'rgba(79,70,229,0.12)', color: 'var(--primary)', borderRadius: 999, padding: '2px 7px' }}>{t('settings.current')}</span>}
                       </div>
                       <div style={{ marginBottom: 12 }}>
                         <span style={{ fontSize: 22, fontWeight: 500 }}>{plan.price}</span>
@@ -874,11 +874,11 @@ export function SettingsPage() {
                   <Btn variant="ghost" disabled={exporting} onClick={() => void downloadUserData()}>{exporting ? 'Preparing export...' : 'Download my data'}</Btn>
                   <Btn variant="ghost" disabled={deletionRequested} onClick={() => void requestDataDeletion()}>{deletionRequested ? 'Deletion requested' : 'Request data deletion'}</Btn>
                 </div>
-                {deletionRequested && <div style={{ marginTop: 8, fontSize: 10, color: 'var(--text-muted)' }}>Your request is recorded. Support will follow up with the retention timeline.</div>}
+                {deletionRequested && <div style={{ marginTop: 8, fontSize: 10, color: 'var(--text-muted)' }}>{t('settings.deletionRecorded')}</div>}
               </SettingsSection>
 
               <Card style={{ padding: 16, border: '0.5px solid rgba(163,45,45,0.3)', background: 'rgba(163,45,45,0.03)' }}>
-                <div style={{ fontSize: 12, fontWeight: 500, color: 'var(--c-danger)', marginBottom: 8 }}>Danger Zone</div>
+                <div style={{ fontSize: 12, fontWeight: 500, color: 'var(--c-danger)', marginBottom: 8 }}>{t('settings.dangerZone')}</div>
                 <div style={{ fontSize: 11, color: 'var(--text-muted)', marginBottom: 12 }}>
                   Once you delete your account, there is no going back. All your data — jobs, resumes, cover letters, settings — will be permanently removed.
                 </div>
@@ -904,7 +904,7 @@ export function SettingsPage() {
                     toast.success('Account deleted', 'Redirecting…')
                     setTimeout(() => window.location.replace('/login'), 1500)
                   }
-                }}>Delete my account</Btn>
+                }}>{t('settings.deleteAccount')}</Btn>
               </Card>
             </>
           )}
@@ -917,13 +917,13 @@ export function SettingsPage() {
         <div style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.3)', zIndex: 200, display: 'flex', alignItems: 'center', justifyContent: 'center' }}
           onClick={e => { if (e.target === e.currentTarget) setShowCancelModal(false) }}>
           <Card style={{ width: 380, padding: 24 }}>
-            <div style={{ fontSize: 14, fontWeight: 500, marginBottom: 8 }}>Cancel {planLabel} plan?</div>
+            <div style={{ fontSize: 14, fontWeight: 500, marginBottom: 8 }}>{t('settings.cancelPlanTitle')} {planLabel}</div>
             <div style={{ fontSize: 12, color: 'var(--text-muted)', marginBottom: 20, lineHeight: 1.7 }}>
-              You&apos;ll lose access to all paid features at the end of your current billing period.
+              {t('settings.cancelPlanDescription')}
             </div>
             <div style={{ display: 'flex', gap: 8 }}>
-              <Btn variant="ghost"  style={{ flex: 1, justifyContent: 'center' }} onClick={() => setShowCancelModal(false)}>Keep plan</Btn>
-              <Btn variant="danger" style={{ flex: 1, justifyContent: 'center' }} onClick={() => { setShowCancelModal(false); openBillingSupport(`cancel ${planLabel} plan`) }}>Contact support</Btn>
+              <Btn variant="ghost"  style={{ flex: 1, justifyContent: 'center' }} onClick={() => setShowCancelModal(false)}>{t('settings.keepPlan')}</Btn>
+              <Btn variant="danger" style={{ flex: 1, justifyContent: 'center' }} onClick={() => { setShowCancelModal(false); openBillingSupport(`cancel ${planLabel} plan`) }}>{t('settings.contactSupport')}</Btn>
             </div>
           </Card>
         </div>
@@ -939,11 +939,12 @@ type ApiKeyStatus = DiscoveryStatusView & { hasAdzuna: boolean; hasRapidapi: boo
 type DiscoveryTestStatus = 'idle' | 'testing' | 'ok' | { error: string }
 
 function KeyManagementSettings() {
+  const { t } = useI18n()
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 20 }}>
-      <SettingsSection title="Keys & connections">
+      <SettingsSection title={t('settings.keysConnections')}>
         <div style={{ padding: '10px 0 2px', fontSize: 12, color: 'var(--text-muted)', lineHeight: 1.65 }}>
-          Keep every credential in one place. <strong style={{ color: 'var(--text)' }}>AI model keys</strong> power resume parsing, tailoring, and writing. <strong style={{ color: 'var(--text)' }}>Job discovery keys</strong> only fetch job listings and use your own provider quota.
+          {t('settings.keepCredentials')} <strong style={{ color: 'var(--text)' }}>{t('settings.aiModelKeys')}</strong> {t('settings.aiModelKeysDescription')} <strong style={{ color: 'var(--text)' }}>{t('settings.discoveryKeys')}</strong> {t('settings.discoveryKeysDescription')}
         </div>
       </SettingsSection>
       <AiModelSettings />
@@ -953,6 +954,7 @@ function KeyManagementSettings() {
 }
 
 function ApiKeysSettings() {
+  const { t } = useI18n()
   const toast = useToast()
   const [status, setStatus] = useState<ApiKeyStatus>({ hasAdzuna: false, hasRapidapi: false })
   const [adzunaAppId, setAdzunaAppId] = useState('')
@@ -1077,12 +1079,12 @@ function ApiKeysSettings() {
     )
   }
 
-  if (loading) return <div style={{ padding: 24, color: 'var(--text-muted)', fontSize: 13 }}>Loading API key status...</div>
+  if (loading) return <div style={{ padding: 24, color: 'var(--text-muted)', fontSize: 13 }}>{t('settings.apiKeyStatusLoading')}</div>
   if (loadError) return <div style={{ padding: 14, color: 'var(--c-danger)', fontSize: 12, background: 'rgba(220,38,38,0.08)', borderRadius: 8 }}>{loadError}</div>
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
-      <SettingsSection title="Job discovery APIs">
+      <SettingsSection title={t('settings.discoveryApis')}>
         <div style={{ fontSize: 11, color: 'var(--text-muted)', lineHeight: 1.6, padding: '10px 0 4px' }}>
           These keys only search job boards. They do not run AI features or parse your resume. Save first, then test the provider; saved values stay masked.
         </div>
@@ -1095,8 +1097,8 @@ function ApiKeysSettings() {
           </span>
         </div>
         <div style={{ display: 'grid', gap: 10, padding: '8px 0 4px', fontSize: 11, color: 'var(--text-muted)', lineHeight: 1.55 }}>
-          <div><strong style={{ color: 'var(--text)' }}>Adzuna</strong> — direct European job listings. Requires an App ID and App Key.</div>
-          <div><strong style={{ color: 'var(--text)' }}>RapidAPI</strong> — provider marketplace used for JSearch and other job sources. Requires one API Key.</div>
+          <div><strong style={{ color: 'var(--text)' }}>Adzuna</strong> — {t('settings.adzunaDescription')}</div>
+          <div><strong style={{ color: 'var(--text)' }}>RapidAPI</strong> — {t('settings.rapidApiDescription')}</div>
         </div>
         <SecretField id="adzunaAppId" label="Adzuna App ID" value={adzunaAppId} onChange={setAdzunaAppId} saved={hasSavedDiscoveryKey(status, 'adzuna')} />
         <SecretField id="adzunaAppKey" label="Adzuna App Key" value={adzunaAppKey} onChange={setAdzunaAppKey} saved={hasSavedDiscoveryKey(status, 'adzuna')} />
@@ -1111,7 +1113,7 @@ function ApiKeysSettings() {
               return (
                 <div key={provider} style={{ display: 'flex', gap: 6 }}>
                   <button type="button" onClick={() => testConnection(provider)} disabled={!configured || test === 'testing' || keyClearing !== null} style={{ padding: '7px 10px', fontSize: 11, borderRadius: 7, border: '0.5px solid var(--border)', background: 'var(--bg-secondary)', color: test === 'ok' ? 'var(--c-success)' : 'var(--text)', cursor: configured && test !== 'testing' && keyClearing === null ? 'pointer' : 'default', opacity: configured ? 1 : 0.5 }} title={typeof test === 'object' ? test.error : undefined}>
-                    {test === 'testing' ? 'Testing…' : test === 'ok' ? 'Connected ✓' : label}
+                    {test === 'testing' ? t('settings.testing') : test === 'ok' ? t('settings.connectedCheck') : label}
                   </button>
                   {userConfigured && (
                     <button type="button" onClick={() => void clearKey(provider)} disabled={keyClearing !== null || saving} style={{ padding: '7px 8px', fontSize: 11, borderRadius: 7, border: '0.5px solid var(--border)', background: 'transparent', color: 'var(--c-danger)', cursor: keyClearing === null && !saving ? 'pointer' : 'default', opacity: keyClearing === provider ? 0.6 : 1 }}>
@@ -1123,7 +1125,7 @@ function ApiKeysSettings() {
             })}
           </div>
           <Btn variant="primary" onClick={saveKeys} disabled={saving}>
-            {saving ? 'Saving...' : 'Save discovery keys'}
+            {saving ? t('common.saving') : t('settings.saveDiscoveryKeys')}
           </Btn>
         </div>
         {(['adzuna', 'rapidapi'] as const).map(provider => {
@@ -1142,7 +1144,7 @@ function ApiKeysSettings() {
 // ── AI Model Settings ─────────────────────────────────────────────────────────
 
 const TIER_COLOR = { fast: 'var(--c-warning)', standard: 'var(--primary)', premium: '#5B3DC8' }
-const TIER_LABEL = { fast: '快速', standard: '标准', premium: '旗舰' }
+const TIER_LABEL = { fast: 'fast', standard: 'standard', premium: 'flagship' }
 
 const KEY_HINTS: Partial<Record<Provider, { href: string }>> = {
   anthropic: { href: 'https://console.anthropic.com/settings/keys' },
@@ -1158,18 +1160,18 @@ const PROVIDERS_WITH_MODELS = Array.from(new Set(MODEL_CATALOGUE.map(m => m.prov
 
 const FEATURE_GROUPS: Array<{ label: string; description: string; features: FeatureId[] }> = [
   {
-    label: '简历与岗位分析',
-    description: '简历评分、简历解析、改进建议、面试准备、职位评分与关键词提取',
+    label: 'Resume and job analysis',
+    description: 'Resume scoring, resume parsing, improvement suggestions, interview preparation, job scoring, and keyword extraction',
     features: ['scoring', 'parsing', 'suggest', 'interviewPrep', 'jobScoring'],
   },
   {
-    label: '申请材料生成',
-    description: '求职信、字段建议与表单答案修改',
+    label: 'Application material generation',
+    description: 'Cover letters, field suggestions, and form answer revisions',
     features: ['coverLetter', 'fieldSuggest', 'formRevise'],
   },
   {
-    label: 'Agent 自动化',
-    description: 'AI Agent、表单自动填写与无人值守自动申请',
+    label: 'Agent automation',
+    description: 'AI Agent, automatic form filling, and unattended applications',
     features: ['agent', 'formFill', 'autoApply'],
   },
 ]
@@ -1297,7 +1299,7 @@ function AiModelSettings() {
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 20 }}>
 
-      {/* ── ApplyMate 说明卡 ── */}
+      {/* ── ApplyMate instruction card ── */}
       <div style={{ padding: '14px 16px', background: 'linear-gradient(135deg,rgba(79,70,229,0.08),rgba(91,61,200,0.06))', border: '1px solid rgba(79,70,229,0.20)', borderRadius: 12 }}>
         <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 6 }}>
           <span style={{ fontSize: 20 }}>✦</span>
@@ -1317,10 +1319,10 @@ function AiModelSettings() {
         )}
       </div>
 
-      {/* ── 分功能模型控制 ── */}
+      {/* ── Functional model control ── */}
       <SettingsSection title={t('settings.ai.featuresTitle')}>
         <div style={{ fontSize: 11, color: 'var(--text-muted)', marginBottom: 14, lineHeight: 1.6 }}>
-          {t('settings.ai.featuresDesc').replace('ApplyMate AI', APPLYMATE_LABEL)} 已汇总为三类工作流；选择一个模型会同步应用到该类全部功能。
+          {t('settings.ai.featuresDesc').replace('ApplyMate AI', APPLYMATE_LABEL)} These settings are grouped into three workflows. Selecting a model applies it to every feature in that workflow.
         </div>
         <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
           {FEATURE_GROUPS.map(group => {
@@ -1333,7 +1335,7 @@ function AiModelSettings() {
                   <div style={{ fontSize: 12, fontWeight: 500, color: 'var(--text)' }}>{group.label}</div>
                   <div style={{ fontSize: 10, color: 'var(--text-muted)', marginTop: 2 }}>
                     {mixed
-                      ? '当前存在不同设置；重新选择会统一覆盖本组。'
+                      ? 'This workflow currently has different settings; selecting a model will apply it uniformly.'
                       : isDefault
                       ? `✦ ${APPLYMATE_LABEL} ${t('settings.ai.defaultLabel')}`
                       : `${PROVIDER_LABELS[current.provider]} · ${current.model}`
@@ -1345,22 +1347,22 @@ function AiModelSettings() {
                 {current?.provider === 'custom' && (
                   <div style={{ flexBasis: '100%', display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(min(100%, 220px), 1fr))', gap: 8, paddingTop: 4 }}>
                     <label style={{ display: 'grid', gap: 4, fontSize: 10, color: 'var(--text-muted)' }}>
-                      Custom model ID
+                      {t('settings.customModelId')}
                       <input
                         aria-label={`${group.label} custom model ID`}
                         value={current.model}
                         onChange={event => setFeatureGroupCfg(group, { ...current, model: event.target.value })}
-                        placeholder="e.g. llama-3.3-70b"
+                        placeholder={t('settings.customModelPlaceholder')}
                         style={{ width: '100%', boxSizing: 'border-box', padding: '7px 9px', border: '1px solid var(--border)', borderRadius: 7, background: 'var(--bg)', color: 'var(--text)', fontSize: 11 }}
                       />
                     </label>
                     <label style={{ display: 'grid', gap: 4, fontSize: 10, color: 'var(--text-muted)' }}>
-                      HTTPS endpoint
+                      {t('settings.httpsEndpoint')}
                       <input
                         aria-label={`${group.label} custom HTTPS endpoint`}
                         value={current.apiBase ?? ''}
                         onChange={event => setFeatureGroupCfg(group, { ...current, apiBase: event.target.value })}
-                        placeholder="https://your-endpoint.example/v1"
+                        placeholder={t('settings.httpsEndpointPlaceholder')}
                         inputMode="url"
                         style={{ width: '100%', boxSizing: 'border-box', padding: '7px 9px', border: '1px solid var(--border)', borderRadius: 7, background: 'var(--bg)', color: 'var(--text)', fontSize: 11 }}
                       />
@@ -1376,7 +1378,7 @@ function AiModelSettings() {
         </div>
       </SettingsSection>
 
-      {/* ── 提供商 API Key ── */}
+      {/* ── provider API Key ── */}
       <SettingsSection title={t('settings.ai.keysTitle')}>
         <div style={{ display: 'flex', alignItems: 'flex-start', gap: 12, justifyContent: 'space-between', marginBottom: 14 }}>
           <div style={{ fontSize: 11, color: 'var(--text-muted)', lineHeight: 1.6 }}>
@@ -1387,7 +1389,7 @@ function AiModelSettings() {
             onClick={testAllProviders}
             disabled={allTesting}
             style={{ padding: '6px 12px', fontSize: 11, borderRadius: 7, border: '0.5px solid var(--border)', background: 'var(--bg-secondary)', color: 'var(--text)', cursor: allTesting ? 'default' : 'pointer', whiteSpace: 'nowrap', opacity: allTesting ? 0.65 : 1 }}>
-            {allTesting ? 'Testing...' : 'Test all'}
+            {allTesting ? t('settings.testing') : t('settings.testAll')}
           </button>
         </div>
         <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
@@ -1458,7 +1460,7 @@ function AiModelSettings() {
         {saving ? t('settings.ai.saving') : t('settings.ai.saveBtn')}
       </Btn>
       {customConfigInvalid && (
-        <div style={{ fontSize: 11, color: 'var(--c-danger)' }}>Complete each custom model ID and HTTPS endpoint before saving.</div>
+        <div style={{ fontSize: 11, color: 'var(--c-danger)' }}>{t('settings.customModelIncomplete')}</div>
       )}
     </div>
   )
@@ -1521,8 +1523,8 @@ function FeatureModelPicker({ value, mixed, onChange }: {
             }}>
               <span style={{ fontSize: 14 }}>⚙</span>
               <div style={{ flex: 1 }}>
-                <div style={{ fontSize: 12, fontWeight: 600, color: 'var(--text)' }}>Custom provider</div>
-                <div style={{ fontSize: 10, color: 'var(--text-muted)' }}>Any OpenAI-compatible HTTPS endpoint</div>
+                <div style={{ fontSize: 12, fontWeight: 600, color: 'var(--text)' }}>{t('settings.customProvider')}</div>
+                <div style={{ fontSize: 10, color: 'var(--text-muted)' }}>{t('settings.customProviderDescription')}</div>
               </div>
               {isCustom && <span style={{ fontSize: 10, color: 'var(--primary)' }}>✓</span>}
             </button>

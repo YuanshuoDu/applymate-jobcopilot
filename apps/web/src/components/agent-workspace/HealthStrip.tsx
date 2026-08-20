@@ -2,6 +2,7 @@
 
 import React from 'react'
 import { useApi } from '@/lib/hooks'
+import { useI18n } from '@/lib/i18n'
 
 interface AgentHealth {
   successRate: number
@@ -22,28 +23,29 @@ function formatDuration(ms: number) {
 
 export function HealthStrip() {
   const { data, loading, error } = useApi<AgentHealth>('/api/agent/health')
+  const { t } = useI18n()
 
   return (
     <div style={{ padding: '0 10px 12px' }}>
       <div style={{ fontSize: 10, color: 'var(--text-muted)', textTransform: 'uppercase', letterSpacing: 0, fontWeight: 700, marginBottom: 6 }}>
-        Session Quality
+        {t('agent.sessionQuality')}
       </div>
       <div style={{ border: '1px solid var(--border)', borderRadius: 8, background: 'var(--bg)', padding: 9 }}>
         {loading ? (
-          <div style={{ fontSize: 10, color: 'var(--text-muted)' }}>Loading health...</div>
+          <div style={{ fontSize: 10, color: 'var(--text-muted)' }}>{t('agent.loadingHealth')}</div>
         ) : error ? (
-          <div title={error} style={{ fontSize: 10, color: 'var(--c-danger)' }}>Health unavailable.</div>
+          <div title={error} style={{ fontSize: 10, color: 'var(--c-danger)' }}>{t('agent.healthUnavailable')}</div>
         ) : (
           <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8 }}>
-            <HealthMetric label="Success" value={`${data?.successRate ?? 0}%`} good />
+            <HealthMetric label={t('agent.success')} value={`${data?.successRate ?? 0}%`} good />
             <HealthMetric label="CAPTCHA" value={`${data?.captchaRate ?? 0}%`} warn={(data?.captchaRate ?? 0) > 0} />
-            <HealthMetric label="Avg" value={formatDuration(data?.avgDurationMs ?? 0)} />
-            <HealthMetric label="Cache" value={`${data?.patternCacheRate ?? 0}%`} />
+            <HealthMetric label={t('agent.average')} value={formatDuration(data?.avgDurationMs ?? 0)} />
+            <HealthMetric label={t('agent.cache')} value={`${data?.patternCacheRate ?? 0}%`} />
           </div>
         )}
         {!loading && !error && (
           <div style={{ marginTop: 8, fontSize: 9, color: 'var(--text-muted)' }}>
-            Last 24h · {data?.last24hRuns ?? 0} runs
+            {t('agent.last24h')} · {data?.last24hRuns ?? 0} runs
           </div>
         )}
       </div>

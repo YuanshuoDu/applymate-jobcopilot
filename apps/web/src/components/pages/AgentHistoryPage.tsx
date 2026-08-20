@@ -4,6 +4,7 @@ import React, { useMemo, useState } from 'react'
 import { TopBar } from '@/components/layout/TopBar'
 import { Btn, Card } from '@/components/ui'
 import { fmtDate, useApi } from '@/lib/hooks'
+import { useI18n } from '@/lib/i18n'
 
 interface AgentRunHistory {
   id: string
@@ -33,9 +34,9 @@ interface AgentRunEvent {
 }
 
 const STATUS: Record<string, { label: string; color: string; bg: string }> = {
-  completed: { label: 'Completed', color: '#16a34a', bg: 'rgba(22,163,74,0.12)' },
-  partial:   { label: 'Partial',   color: '#ca8a04', bg: 'rgba(202,138,4,0.12)' },
-  failed:    { label: 'Failed',    color: '#dc2626', bg: 'rgba(220,38,38,0.12)' },
+  completed: { label: 'agentHistory.completed', color: '#16a34a', bg: 'rgba(22,163,74,0.12)' },
+  partial:   { label: 'agentHistory.partial',   color: '#ca8a04', bg: 'rgba(202,138,4,0.12)' },
+  failed:    { label: 'agentHistory.failed',    color: '#dc2626', bg: 'rgba(220,38,38,0.12)' },
 }
 
 const LOG_EVENTS = new Set([
@@ -58,6 +59,7 @@ const LOG_EVENTS = new Set([
 ])
 
 function StatusBadge({ status }: { status: string }) {
+  const { t } = useI18n()
   const cfg = STATUS[status] ?? { label: status, color: '#64748b', bg: 'rgba(100,116,139,0.12)' }
   return (
     <span style={{
@@ -67,17 +69,18 @@ function StatusBadge({ status }: { status: string }) {
       fontSize: 11, fontWeight: 700, whiteSpace: 'nowrap',
     }}>
       <span style={{ width: 6, height: 6, borderRadius: '50%', background: cfg.color, flexShrink: 0 }} />
-      {cfg.label}
+      {cfg.label.includes('.') ? t(cfg.label) : cfg.label}
     </span>
   )
 }
 
 function Duration({ ms }: { ms: number }) {
+  const { t } = useI18n()
   const safe = Math.max(0, ms)
   const sec = Math.round(safe / 1000)
-  if (sec < 60) return <span>{sec}s</span>
+  if (sec < 60) return <span>{sec}{t('agentHistory.seconds')}</span>
   const min = Math.floor(sec / 60)
-  return <span>{min}m {sec % 60}s</span>
+  return <span>{min}{t('agentHistory.minutes')} {sec % 60}{t('agentHistory.seconds')}</span>
 }
 
 function dataLabel(data: AgentRunEvent['data']) {
@@ -97,13 +100,14 @@ function dataLabel(data: AgentRunEvent['data']) {
 }
 
 function ReportStrip({ report }: { report: AgentRunReport | null }) {
+  const { t } = useI18n()
   const items = [
-    ['Processed', report?.processed ?? 0],
-    ['Dispatched', report?.queued ?? 0],
-    ['Confirmed', report?.applied ?? 0],
-    ['Pending', report?.pending ?? 0],
-    ['Skipped', report?.skipped ?? 0],
-    ['Failed', report?.failed ?? 0],
+    [t('agentHistory.processed'), report?.processed ?? 0],
+    [t('agentHistory.dispatched'), report?.queued ?? 0],
+    [t('agentHistory.confirmed'), report?.applied ?? 0],
+    [t('agentHistory.pending'), report?.pending ?? 0],
+    [t('agentHistory.skipped'), report?.skipped ?? 0],
+    [t('agentHistory.failed'), report?.failed ?? 0],
   ]
   return (
     <div style={{ display: 'grid', gridTemplateColumns: 'repeat(6, minmax(80px, 1fr))', gap: 8, marginTop: 12 }}>
@@ -121,9 +125,10 @@ function ReportStrip({ report }: { report: AgentRunReport | null }) {
 }
 
 function EventLog({ events }: { events: AgentRunEvent[] }) {
+  const { t } = useI18n()
   const visible = events.filter(e => LOG_EVENTS.has(e.event))
   if (visible.length === 0) {
-    return <div style={{ fontSize: 12, color: 'var(--text-muted)', marginTop: 12 }}>No detailed event log captured for this run.</div>
+    return <div style={{ fontSize: 12, color: 'var(--text-muted)', marginTop: 12 }}>{t('agentHistory.noEventLog')}</div>
   }
   return (
     <div style={{ marginTop: 12, borderTop: '1px solid var(--border)' }}>
@@ -155,6 +160,7 @@ function EventLog({ events }: { events: AgentRunEvent[] }) {
 }
 
 export function AgentHistoryPage() {
+  const { lang, t } = useI18n()
   const { data, loading, error, refetch } = useApi<{ runs: AgentRunHistory[] }>('/api/agent/history')
   const [openRunId, setOpenRunId] = useState<string | null>(null)
   const runs = useMemo(() => data?.runs ?? [], [data])
@@ -171,7 +177,7 @@ export function AgentHistoryPage() {
       <div style={{ flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'center', background: 'var(--bg-tertiary)' }}>
         <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 10 }}>
           <div style={{ width: 28, height: 28, border: '2.5px solid rgba(79,70,229,0.18)', borderTopColor: 'var(--primary)', borderRadius: '50%', animation: 'spin 0.7s linear infinite' }} />
-          <div style={{ fontSize: 12, color: 'var(--text-muted)' }}>Loading agent history...</div>
+          <div style={{ fontSize: 12, color: 'var(--text-muted)' }}>{t('agentHistory.loading')}</div>
         </div>
       </div>
     )
@@ -181,8 +187,8 @@ export function AgentHistoryPage() {
     return (
       <div style={{ flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'center', background: 'var(--bg-tertiary)' }}>
         <div style={{ textAlign: 'center' }}>
-          <div style={{ fontSize: 13, color: '#A32D2D', marginBottom: 14 }}>{error}</div>
-          <Btn variant="ghost" onClick={refetch}>Retry</Btn>
+          <div style={{ fontSize: 13, color: '#A32D2D', marginBottom: 14 }}>{lang === 'zh' ? t('common.somethingWentWrong') : error}</div>
+          <Btn variant="ghost" onClick={refetch}>{t('common.retry')}</Btn>
         </div>
       </div>
     )
@@ -190,18 +196,18 @@ export function AgentHistoryPage() {
 
   return (
     <div style={{ flex: 1, overflowY: 'auto', background: 'var(--bg-tertiary)' }}>
-      <TopBar title="Agent History">
-        <Btn variant="ghost" onClick={refetch}>Refresh</Btn>
+      <TopBar title={t('agentHistory.title')}>
+        <Btn variant="ghost" onClick={refetch}>{t('common.refresh')}</Btn>
       </TopBar>
 
       <div style={{ padding: 20 }}>
         <div style={{ display: 'grid', gridTemplateColumns: 'repeat(5, minmax(120px, 1fr))', gap: 12, marginBottom: 16 }}>
           {[
-            ['Runs', totals.runs],
-            ['Jobs Found', totals.jobs],
-            ['Dispatched', totals.queued],
-            ['Applied', totals.applied],
-            ['Failed Runs', totals.failed],
+            [t('agentHistory.runs'), totals.runs],
+            [t('agentHistory.jobsFound'), totals.jobs],
+            [t('agentHistory.dispatched'), totals.queued],
+            [t('agentHistory.applied'), totals.applied],
+            [t('agentHistory.failedRuns'), totals.failed],
           ].map(([label, value]) => (
             <Card key={label} style={{ padding: '14px 16px' }}>
               <div style={{ fontSize: 10, color: 'var(--text-muted)', fontWeight: 700, textTransform: 'uppercase', letterSpacing: 0, marginBottom: 6 }}>{label}</div>
@@ -212,9 +218,9 @@ export function AgentHistoryPage() {
 
         {runs.length === 0 ? (
           <Card style={{ padding: '46px 16px', textAlign: 'center' }}>
-            <div style={{ fontSize: 14, fontWeight: 700, marginBottom: 6, color: 'var(--text)' }}>No agent runs yet</div>
+            <div style={{ fontSize: 14, fontWeight: 700, marginBottom: 6, color: 'var(--text)' }}>{t('agentHistory.emptyTitle')}</div>
             <div style={{ fontSize: 12, color: 'var(--text-muted)', lineHeight: 1.6, maxWidth: 380, margin: '0 auto' }}>
-              Completed and failed agent pipeline runs will appear here after the agent is started.
+              {t('agentHistory.emptyDescription')}
             </div>
           </Card>
         ) : (
@@ -224,7 +230,7 @@ export function AgentHistoryPage() {
               padding: '10px 16px', borderBottom: '1px solid var(--border)',
               background: 'var(--bg-secondary)', borderRadius: '8px 8px 0 0',
             }}>
-              {['Date', 'Duration', 'Stages', 'Jobs Found', 'Status', ''].map(h => (
+              {[t('agentHistory.date'), t('agentHistory.duration'), t('agentHistory.stages'), t('agentHistory.jobsFound'), t('agentHistory.status'), ''].map(h => (
                 <div key={h} style={{ fontSize: 10, color: 'var(--text-muted)', fontWeight: 700, textTransform: 'uppercase', letterSpacing: 0 }}>{h}</div>
               ))}
             </div>

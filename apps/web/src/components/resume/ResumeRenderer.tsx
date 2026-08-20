@@ -13,6 +13,7 @@
 import React from 'react'
 import type { ResumeContent, TemplateOptions } from '@/lib/types'
 import { safeAccentColor } from '@/lib/template-options'
+import { useI18n } from '@/lib/i18n'
 
 // ── Palette ───────────────────────────────────────────────────────────────────
 
@@ -57,12 +58,13 @@ function resolveOpts(opts?: TemplateOptions | null) {
 // ── Section rendering helpers ─────────────────────────────────────────────────
 
 function SecTitle({ label, accent, style }: { label: string; accent: string; style?: React.CSSProperties }) {
+  const { t } = useI18n()
   return (
     <div style={{
       fontSize: 9, fontWeight: 700, letterSpacing: '2px', textTransform: 'uppercase',
       color: accent, borderBottom: `1.5px solid ${accent}`, paddingBottom: 3,
       marginTop: 0, marginBottom: 10, ...style,
-    }}>{label}</div>
+    }}>{t(label)}</div>
   )
 }
 
@@ -228,19 +230,19 @@ function renderSections(
 
   for (const id of sectionOrder) {
     if (id === 'summary' && c.summary) {
-      sections.push(<React.Fragment key="summary"><SecTitle label="Summary" accent={accent} /><p style={{ fontSize: 12, lineHeight: lineH, color: '#444', margin: '0 0 4px' }}>{c.summary}</p></React.Fragment>)
+      sections.push(<React.Fragment key="summary"><SecTitle label="resume.section.summary" accent={accent} /><p style={{ fontSize: 12, lineHeight: lineH, color: '#444', margin: '0 0 4px' }}>{c.summary}</p></React.Fragment>)
     } else if (id === 'experience' && c.experience.length > 0) {
-      sections.push(<React.Fragment key="experience"><SecTitle label="Experience" accent={accent} /><ExperienceBlock exp={c.experience} accent={accent} font={font} lineH={lineH} /></React.Fragment>)
+      sections.push(<React.Fragment key="experience"><SecTitle label="resume.section.experience" accent={accent} /><ExperienceBlock exp={c.experience} accent={accent} font={font} lineH={lineH} /></React.Fragment>)
     } else if (id === 'projects' && (c.projects?.length ?? 0) > 0) {
-      sections.push(<React.Fragment key="projects"><SecTitle label="Projects" accent={accent} /><ProjectsBlock projects={c.projects!} accent={accent} lineH={lineH} /></React.Fragment>)
+      sections.push(<React.Fragment key="projects"><SecTitle label="resume.section.projects" accent={accent} /><ProjectsBlock projects={c.projects!} accent={accent} lineH={lineH} /></React.Fragment>)
     } else if (id === 'skills' && c.skills.length > 0) {
-      sections.push(<React.Fragment key="skills"><SecTitle label="Skills" accent={accent} /><SkillsBlock skills={c.skills} accent={accent} inline={inline} /></React.Fragment>)
+      sections.push(<React.Fragment key="skills"><SecTitle label="resume.section.skills" accent={accent} /><SkillsBlock skills={c.skills} accent={accent} inline={inline} /></React.Fragment>)
     } else if (id === 'certifications' && (c.certifications?.length ?? 0) > 0) {
-      sections.push(<React.Fragment key="certifications"><SecTitle label="Certifications" accent={accent} /><CertsBlock certs={c.certifications!} /></React.Fragment>)
+      sections.push(<React.Fragment key="certifications"><SecTitle label="resume.section.certifications" accent={accent} /><CertsBlock certs={c.certifications!} /></React.Fragment>)
     } else if (id === 'education' && c.education.length > 0) {
-      sections.push(<React.Fragment key="education"><SecTitle label="Education" accent={accent} /><EducationBlock edu={c.education} lineH={lineH} /></React.Fragment>)
+      sections.push(<React.Fragment key="education"><SecTitle label="resume.section.education" accent={accent} /><EducationBlock edu={c.education} lineH={lineH} /></React.Fragment>)
     } else if (id === 'languages' && (c.languages?.length ?? 0) > 0) {
-      sections.push(<React.Fragment key="languages"><SecTitle label="Languages" accent={accent} /><LangBlock langs={c.languages!} /></React.Fragment>)
+      sections.push(<React.Fragment key="languages"><SecTitle label="resume.section.languages" accent={accent} /><LangBlock langs={c.languages!} /></React.Fragment>)
     } else if (id.startsWith('custom_')) {
       const entry = c.custom?.find(x => x.id === id)
       if (entry) sections.push(<CustomBlocks key={id} customs={[entry]} accent={accent} lineH={lineH} />)
@@ -308,6 +310,7 @@ function TemplateExecutive({ c, opts }: { c: ResumeContent; opts?: TemplateOptio
 }
 
 function TemplateSidebar({ c, opts }: { c: ResumeContent; opts?: TemplateOptions | null }) {
+  const { t } = useI18n()
   const { accent, font, den } = resolveOpts(opts)
   const [padV, padH] = den.pagePad.split(' ')
   const mainOrder = (c.sectionOrder ?? DEFAULT_ORDER).filter(id => !['skills','education','languages'].includes(id))
@@ -321,7 +324,7 @@ function TemplateSidebar({ c, opts }: { c: ResumeContent; opts?: TemplateOptions
           <div style={{ fontSize: 10.5, color: 'rgba(255,255,255,0.7)', marginBottom: 16 }}>{c.experience[0].role}</div>
         )}
         {/* Contact in sidebar */}
-        <div style={{ fontSize: 9, fontWeight: 700, letterSpacing: '2px', color: 'rgba(255,255,255,0.55)', borderBottom: '1px solid rgba(255,255,255,0.2)', paddingBottom: 3, marginBottom: 8 }}>CONTACT</div>
+        <div style={{ fontSize: 9, fontWeight: 700, letterSpacing: '2px', color: 'rgba(255,255,255,0.55)', borderBottom: '1px solid rgba(255,255,255,0.2)', paddingBottom: 3, marginBottom: 8 }}>{t('resume.section.contact')}</div>
         <div style={{ fontSize: 10.5, color: 'rgba(255,255,255,0.85)', display: 'flex', flexDirection: 'column', gap: 4, marginBottom: 16 }}>
           {c.contact.email    && <span>{c.contact.email}</span>}
           {c.contact.phone    && <span>{c.contact.phone}</span>}
@@ -331,7 +334,7 @@ function TemplateSidebar({ c, opts }: { c: ResumeContent; opts?: TemplateOptions
         {/* Skills in sidebar */}
         {c.skills.length > 0 && (
           <>
-            <div style={{ fontSize: 9, fontWeight: 700, letterSpacing: '2px', color: 'rgba(255,255,255,0.55)', borderBottom: '1px solid rgba(255,255,255,0.2)', paddingBottom: 3, marginBottom: 8 }}>SKILLS</div>
+            <div style={{ fontSize: 9, fontWeight: 700, letterSpacing: '2px', color: 'rgba(255,255,255,0.55)', borderBottom: '1px solid rgba(255,255,255,0.2)', paddingBottom: 3, marginBottom: 8 }}>{t('resume.section.skills')}</div>
             <div style={{ display: 'flex', flexWrap: 'wrap', gap: 4, marginBottom: 16 }}>
               {c.skills.map(s => (
                 <span key={s} style={{ fontSize: 10, background: 'rgba(255,255,255,0.15)', borderRadius: 3, padding: '2px 7px', color: '#fff' }}>{s}</span>
@@ -342,7 +345,7 @@ function TemplateSidebar({ c, opts }: { c: ResumeContent; opts?: TemplateOptions
         {/* Education in sidebar */}
         {c.education.length > 0 && (
           <>
-            <div style={{ fontSize: 9, fontWeight: 700, letterSpacing: '2px', color: 'rgba(255,255,255,0.55)', borderBottom: '1px solid rgba(255,255,255,0.2)', paddingBottom: 3, marginBottom: 8 }}>EDUCATION</div>
+            <div style={{ fontSize: 9, fontWeight: 700, letterSpacing: '2px', color: 'rgba(255,255,255,0.55)', borderBottom: '1px solid rgba(255,255,255,0.2)', paddingBottom: 3, marginBottom: 8 }}>{t('resume.section.education')}</div>
             {c.education.map((e, i) => (
               <div key={i} style={{ marginBottom: 10 }}>
                 <div style={{ fontSize: 11, fontWeight: 600, color: '#fff' }}>{e.degree}</div>
@@ -355,7 +358,7 @@ function TemplateSidebar({ c, opts }: { c: ResumeContent; opts?: TemplateOptions
         {/* Languages in sidebar */}
         {(c.languages?.length ?? 0) > 0 && (
           <>
-            <div style={{ fontSize: 9, fontWeight: 700, letterSpacing: '2px', color: 'rgba(255,255,255,0.55)', borderBottom: '1px solid rgba(255,255,255,0.2)', paddingBottom: 3, marginBottom: 8 }}>LANGUAGES</div>
+            <div style={{ fontSize: 9, fontWeight: 700, letterSpacing: '2px', color: 'rgba(255,255,255,0.55)', borderBottom: '1px solid rgba(255,255,255,0.2)', paddingBottom: 3, marginBottom: 8 }}>{t('resume.section.languages')}</div>
             {c.languages!.map((l, i) => (
               <div key={i} style={{ fontSize: 10.5, color: 'rgba(255,255,255,0.85)', marginBottom: 3 }}>
                 <strong>{l.lang}</strong><span style={{ opacity: 0.6, marginLeft: 4 }}>{l.level}</span>

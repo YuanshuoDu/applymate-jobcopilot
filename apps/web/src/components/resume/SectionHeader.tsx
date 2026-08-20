@@ -1,6 +1,7 @@
 'use client'
 
 import React from 'react'
+import { useI18n } from '@/lib/i18n'
 
 export type DragHandleProps = {
   draggable:   true
@@ -18,6 +19,13 @@ export function SectionHeader({ title, count, collapsed, onToggle, onAdd, addLab
   dragHandleProps?: DragHandleProps
   onTitleClick?:    () => void
 }) {
+  const { t } = useI18n()
+  const titleKey: Record<string, string> = {
+    SUMMARY: 'resume.section.summary', EXPERIENCE: 'resume.section.experience', EDUCATION: 'resume.section.education',
+    SKILLS: 'resume.section.skills', LANGUAGES: 'resume.section.languages', PROJECTS: 'resume.section.projects',
+    CERTIFICATIONS: 'resume.section.certifications',
+  }
+  const displayTitle = titleKey[title] ? t(titleKey[title]) : title
   return (
     <div style={{
       fontSize: 11, fontWeight: 500, color: 'var(--text)',
@@ -29,17 +37,17 @@ export function SectionHeader({ title, count, collapsed, onToggle, onAdd, addLab
         {dragHandleProps && (
           <span
             {...dragHandleProps}
-            title="Drag to reorder"
+            title={t('resume.dragReorder')}
             style={{ color: 'var(--border)', fontSize: 13, cursor: 'grab', userSelect: 'none', lineHeight: 1, marginRight: 1 }}>
             ⠿
           </span>
         )}
         {onTitleClick ? (
-          <button onClick={e => { e.stopPropagation(); onTitleClick() }} title="Edit section title"
+          <button onClick={e => { e.stopPropagation(); onTitleClick() }} title={t('resume.editSectionTitle')}
             style={{ padding: 0, border: 'none', background: 'none', color: 'inherit', font: 'inherit', cursor: 'text', textAlign: 'left' }}>
-            {title}
+            {displayTitle}
           </button>
-        ) : title}
+        ) : displayTitle}
         {count !== undefined && count > 0 && (
           <span style={{ fontSize: 9, color: 'var(--text-muted)', fontWeight: 400 }}>({count})</span>
         )}
@@ -48,11 +56,11 @@ export function SectionHeader({ title, count, collapsed, onToggle, onAdd, addLab
         {!collapsed && onAdd && (
           <button onClick={e => { e.stopPropagation(); onAdd() }}
             style={{ fontSize: 10, color: 'var(--primary)', background: 'none', border: 'none', cursor: 'pointer' }}>
-            + {addLabel ?? 'Add'}
+            + {addLabel ?? t('resume.add')}
           </button>
         )}
         {onRemove && (
-          <button onClick={e => { e.stopPropagation(); onRemove() }} title="Remove section"
+          <button onClick={e => { e.stopPropagation(); onRemove() }} title={t('resume.removeSection')}
             style={{ fontSize: 11, color: 'var(--text-muted)', background: 'none', border: 'none', cursor: 'pointer', padding: '0 2px', lineHeight: 1 }}>
             ×
           </button>

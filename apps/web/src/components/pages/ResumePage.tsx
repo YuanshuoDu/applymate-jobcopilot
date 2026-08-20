@@ -128,22 +128,23 @@ function calcCompleteness(c: ResumeContent): { score: number; tips: string[] } {
 }
 
 function CompletenessBar({ content }: { content: ResumeContent }) {
+  const { t } = useI18n()
   const { score, tips } = calcCompleteness(content)
   const color = score >= 80 ? 'var(--c-success)' : score >= 50 ? 'var(--primary)' : 'var(--c-warning)'
   const [showTips, setShowTips] = useState(false)
   return (
     <div style={{ marginBottom: 12, padding: '8px 12px', background: 'var(--bg)', border: '0.5px solid var(--border)', borderRadius: 8 }}>
       <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 5 }}>
-        <span style={{ fontSize: 10, fontWeight: 500, color: 'var(--text-muted)' }}>RESUME COMPLETENESS</span>
+        <span style={{ fontSize: 10, fontWeight: 500, color: 'var(--text-muted)' }}>{t('resume.completeness')}</span>
         <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
           <span style={{ fontSize: 11, fontWeight: 600, color }}>{score}%</span>
           {tips.length > 0 && (
             <button onClick={() => setShowTips(v => !v)}
               style={{ fontSize: 9, color: 'var(--primary)', background: 'rgba(79,70,229,0.08)', border: '0.5px solid rgba(79,70,229,0.20)', borderRadius: 10, padding: '1px 7px', cursor: 'pointer' }}>
-              {showTips ? 'Hide tips' : `${tips.length} tip${tips.length > 1 ? 's' : ''}`}
+              {showTips ? t('resume.hideTips') : `${tips.length} ${t('resume.tips')}`}
             </button>
           )}
-          {score === 100 && <span style={{ fontSize: 10, color: 'var(--c-success)' }}>✓ Complete</span>}
+          {score === 100 && <span style={{ fontSize: 10, color: 'var(--c-success)' }}>{t('resume.complete')}</span>}
         </div>
       </div>
       <div style={{ height: 5, background: 'var(--border)', borderRadius: 3, overflow: 'hidden' }}>
@@ -163,20 +164,21 @@ function CompletenessBar({ content }: { content: ResumeContent }) {
 // ── NewResumeModal ────────────────────────────────────────────────────────────
 
 function NewResumeModal({ onClose, onCreate }: { onClose: () => void; onCreate: (name: string) => void }) {
+  const { t } = useI18n()
   const [name, setName] = useState('New Resume')
   return (
     <div style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.3)', zIndex: 100, display: 'flex', alignItems: 'center', justifyContent: 'center' }}
       onClick={e => { if (e.target === e.currentTarget) onClose() }}>
       <div style={{ background: 'var(--bg)', border: '0.5px solid var(--border)', borderRadius: 10, padding: 20, width: 340, boxShadow: '0 8px 32px rgba(0,0,0,0.15)' }}>
-        <div style={{ fontSize: 14, fontWeight: 500, marginBottom: 12 }}>New Resume</div>
+        <div style={{ fontSize: 14, fontWeight: 500, marginBottom: 12 }}>{t('resume.newTitle')}</div>
         <input autoFocus value={name} onChange={e => setName(e.target.value)}
           onKeyDown={e => { if (e.key === 'Enter' && name.trim()) onCreate(name.trim()); if (e.key === 'Escape') onClose() }}
-          placeholder="Resume name…"
+          placeholder={t('resume.namePlaceholder')}
           style={{ width: '100%', fontSize: 13, padding: '8px 10px', border: '0.5px solid var(--primary)', borderRadius: 6, outline: 'none', boxSizing: 'border-box', color: 'var(--text)', background: 'var(--bg)' }}
         />
         <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 8, marginTop: 14 }}>
-          <Btn small variant="ghost" onClick={onClose}>Cancel</Btn>
-          <Btn small variant="primary" onClick={() => { if (name.trim()) onCreate(name.trim()) }} disabled={!name.trim()}>Create</Btn>
+          <Btn small variant="ghost" onClick={onClose}>{t('resume.cancel')}</Btn>
+          <Btn small variant="primary" onClick={() => { if (name.trim()) onCreate(name.trim()) }} disabled={!name.trim()}>{t('resume.create')}</Btn>
         </div>
       </div>
     </div>
@@ -184,13 +186,14 @@ function NewResumeModal({ onClose, onCreate }: { onClose: () => void; onCreate: 
 }
 
 function RenameResumeModal({ resume, onClose, onRename }: { resume: ResumeListItem; onClose: () => void; onRename: (name: string) => void }) {
+  const { t } = useI18n()
   const [name, setName] = useState(resume.name)
   return <div style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.3)', zIndex: 200, display: 'flex', alignItems: 'center', justifyContent: 'center' }} onClick={e => { if (e.target === e.currentTarget) onClose() }}>
     <div style={{ background: 'var(--bg)', border: '0.5px solid var(--border)', borderRadius: 10, padding: 20, width: 340, boxShadow: '0 8px 32px rgba(0,0,0,0.15)' }}>
-      <div style={{ fontSize: 14, fontWeight: 600, marginBottom: 6 }}>Rename resume</div>
-      <div style={{ color: 'var(--text-muted)', fontSize: 11, marginBottom: 12 }}>Choose a clear name for this version.</div>
+      <div style={{ fontSize: 14, fontWeight: 600, marginBottom: 6 }}>{t('resume.renameTitle')}</div>
+      <div style={{ color: 'var(--text-muted)', fontSize: 11, marginBottom: 12 }}>{t('resume.renameHint')}</div>
       <input autoFocus value={name} onChange={e => setName(e.target.value)} onKeyDown={e => { if (e.key === 'Enter' && name.trim()) onRename(name.trim()); if (e.key === 'Escape') onClose() }} style={{ width: '100%', fontSize: 13, padding: '8px 10px', border: '0.5px solid var(--primary)', borderRadius: 6, outline: 'none', boxSizing: 'border-box', color: 'var(--text)', background: 'var(--bg)' }} />
-      <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 8, marginTop: 14 }}><Btn small variant="ghost" onClick={onClose}>Cancel</Btn><Btn small variant="primary" onClick={() => name.trim() && onRename(name.trim())} disabled={!name.trim()}>Save name</Btn></div>
+      <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 8, marginTop: 14 }}><Btn small variant="ghost" onClick={onClose}>{t('resume.cancel')}</Btn><Btn small variant="primary" onClick={() => name.trim() && onRename(name.trim())} disabled={!name.trim()}>{t('resume.saveName')}</Btn></div>
     </div>
   </div>
 }
@@ -238,8 +241,8 @@ function AddDirectionDialog({ onClose, onCreate }: {
           />
         </div>
         <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 8 }}>
-          <Btn small variant="ghost" onClick={onClose}>Cancel</Btn>
-          <Btn small variant="primary" onClick={() => { if (name.trim()) onCreate({ name: name.trim(), color, icon: icon.trim() || null }) }} disabled={!name.trim()}>Create</Btn>
+          <Btn small variant="ghost" onClick={onClose}>{t('resume.cancel')}</Btn>
+          <Btn small variant="primary" onClick={() => { if (name.trim()) onCreate({ name: name.trim(), color, icon: icon.trim() || null }) }} disabled={!name.trim()}>{t('resume.create')}</Btn>
         </div>
       </div>
     </div>
@@ -269,6 +272,7 @@ function ResumePreview({ content, templateId, templateOptions }: {
   templateId:      string
   templateOptions: TemplateOptions
 }) {
+  const { t } = useI18n()
   const innerRef                    = useRef<HTMLDivElement>(null)
   const [height, setHeight]         = useState(0)
   const [fit,    setFit]            = useState<PageFit | null>(null)
@@ -299,7 +303,7 @@ function ResumePreview({ content, templateId, templateOptions }: {
               <span style={{ fontSize: 18, lineHeight: 1 }}>📝</span>
               <div>
                 <div style={{ fontSize: 12, fontWeight: 600, color: 'var(--c-danger)' }}>Resume is too sparse — {Math.round(fit.ratio * 100)}% of a page</div>
-                <div style={{ fontSize: 11, color: 'var(--c-danger)', opacity: 0.75, marginTop: 2 }}>Add more experience bullets, skills, or expand your summary to fill the page</div>
+                <div style={{ fontSize: 11, color: 'var(--c-danger)', opacity: 0.75, marginTop: 2 }}>{t('resume.addMoreHint')}</div>
               </div>
             </div>
           )}
@@ -379,10 +383,11 @@ function AddSectionMenu({ sectionOrder, onAdd, onAddCustom, onClose }: {
   onAddCustom:  () => void
   onClose:      () => void
 }) {
+  const { t } = useI18n()
   const available = ADDABLE_SECTIONS.filter(s => !sectionOrder.includes(s.id))
   return (
     <div style={{ position: 'absolute', bottom: '100%', left: '50%', transform: 'translateX(-50%)', marginBottom: 6, background: 'var(--bg)', border: '0.5px solid var(--border)', borderRadius: 8, boxShadow: '0 4px 20px rgba(0,0,0,0.12)', zIndex: 50, minWidth: 180, overflow: 'hidden' }}>
-      <div style={{ padding: '6px 10px', fontSize: 9, fontWeight: 600, color: 'var(--text-muted)', borderBottom: '0.5px solid var(--border)' }}>ADD SECTION</div>
+      <div style={{ padding: '6px 10px', fontSize: 9, fontWeight: 600, color: 'var(--text-muted)', borderBottom: '0.5px solid var(--border)' }}>{t('resume.addSection')}</div>
       {available.map(s => (
         <button key={s.id} onClick={() => { onAdd(s.id); onClose() }}
           style={{ display: 'block', width: '100%', textAlign: 'left', padding: '7px 12px', fontSize: 12, color: 'var(--text)', background: 'none', border: 'none', cursor: 'pointer' }}
@@ -396,7 +401,7 @@ function AddSectionMenu({ sectionOrder, onAdd, onAddCustom, onClose }: {
           style={{ display: 'block', width: '100%', textAlign: 'left', padding: '7px 12px', fontSize: 12, color: 'var(--primary)', background: 'none', border: 'none', cursor: 'pointer' }}
           onMouseEnter={e => ((e.currentTarget as HTMLButtonElement).style.background = 'var(--bg-secondary)')}
           onMouseLeave={e => ((e.currentTarget as HTMLButtonElement).style.background = 'none')}>
-          + Custom Section…
+          {t('resume.customSection')}
         </button>
       </div>
     </div>
@@ -458,7 +463,7 @@ function ResumeLibraryPanel({
 
   if (resumes.length === 0) return (
     <div style={{ padding: '10px 0', fontSize: 12, color: 'var(--text-muted)' }}>
-      No resumes in this direction yet.
+      {t('resume.noResumesDirection')}
     </div>
   )
 
@@ -488,27 +493,27 @@ function ResumeLibraryPanel({
               </div>
               {dir && <div className="resume-library-item-detail">{dir.name}</div>}
               {jobCount > 0 && <div ref={openPopoverId === r.id ? popoverRef : undefined} className="resume-library-item-detail is-link" onClick={e => { e.stopPropagation(); openUsedByPopover(r.id) }}>
-                Linked to {jobCount} saved job{jobCount === 1 ? '' : 's'}
+                {t('resume.linkedSavedJob')} ({jobCount})
                 {openPopoverId === r.id && <div className="resume-library-lineage-popover">
-                  <div style={{ fontSize: 10, fontWeight: 500, color: 'var(--text-muted)', marginBottom: 6 }}>Used by saved jobs</div>
-                  {loadingPop ? <div style={{ fontSize: 11, color: 'var(--text-muted)' }}>Loading…</div> : popoverJobs.length === 0 ? <div style={{ fontSize: 11, color: 'var(--text-muted)' }}>No jobs found</div> : popoverJobs.map(j => <div key={j.id} style={{ fontSize: 11, padding: '3px 0', color: 'var(--text)', borderBottom: '0.5px solid var(--border)' }}>{j.company} · {j.role}</div>)}
+                  <div style={{ fontSize: 10, fontWeight: 500, color: 'var(--text-muted)', marginBottom: 6 }}>{t('resume.usedBySavedJobs')}</div>
+                  {loadingPop ? <div style={{ fontSize: 11, color: 'var(--text-muted)' }}>{t('common.loading')}</div> : popoverJobs.length === 0 ? <div style={{ fontSize: 11, color: 'var(--text-muted)' }}>{t('resume.noJobsFound')}</div> : popoverJobs.map(j => <div key={j.id} style={{ fontSize: 11, padding: '3px 0', color: 'var(--text)', borderBottom: '0.5px solid var(--border)' }}>{j.company} · {j.role}</div>)}
                 </div>}
               </div>}
-              <div className="resume-library-item-meta">Last edited: {fmtDate(r.updatedAt)}</div>
+              <div className="resume-library-item-meta">{t('resume.lastEdited')}: {fmtDate(r.updatedAt)}</div>
               <div className="resume-library-item-badges" style={{ display: 'flex', gap: 4, alignItems: 'center' }}>
-                {r.origin === 'upload' && <span className="resume-tag base">Base</span>}
-                {r.kind === 'adapted' && <span className="resume-tag tailored">Tailored</span>}
-                {jobCount > 0 && <span className="resume-tag final">Final</span>}
-                {r.isDefault && <span className="resume-tag default">Default</span>}
+                {r.origin === 'upload' && <span className="resume-tag base">{t('resume.base')}</span>}
+                {r.kind === 'adapted' && <span className="resume-tag tailored">{t('resume.tailored')}</span>}
+                {jobCount > 0 && <span className="resume-tag final">{t('resume.final')}</span>}
+                {r.isDefault && <span className="resume-tag default">{t('resume.default')}</span>}
               </div>
             </div>
             <div className="resume-library-more" onClick={e => e.stopPropagation()}>
               <button type="button" aria-label={`More actions for ${r.name}`} onClick={() => setOpenMenuId(value => value === r.id ? null : r.id)}>⋮</button>
               {openMenuId === r.id && <div role="menu" className="resume-library-item-menu">
-                {!r.isDefault && <button type="button" onClick={() => { setOpenMenuId(null); onSetDefault(r) }}>Set as default</button>}
-                <button type="button" onClick={() => { setOpenMenuId(null); onRename(r) }}>Rename</button>
-                {(r.targetJobId || jobCount > 0) && <button type="button" onClick={() => { setOpenMenuId(null); onUnlink(r) }}>Cancel link</button>}
-                <button type="button" className="danger" onClick={() => { setOpenMenuId(null); onDelete(r) }}>Delete</button>
+                {!r.isDefault && <button type="button" onClick={() => { setOpenMenuId(null); onSetDefault(r) }}>{t('resume.setDefault')}</button>}
+                <button type="button" onClick={() => { setOpenMenuId(null); onRename(r) }}>{t('resume.rename')}</button>
+                {(r.targetJobId || jobCount > 0) && <button type="button" onClick={() => { setOpenMenuId(null); onUnlink(r) }}>{t('resume.cancelLink')}</button>}
+                <button type="button" className="danger" onClick={() => { setOpenMenuId(null); onDelete(r) }}>{t('resume.delete')}</button>
               </div>}
             </div>
           </div>
@@ -890,7 +895,7 @@ export function ResumePage() {
   }
 
   async function saveAndAuditResume(): Promise<ResumeAuditResult | null> {
-    if (saving) { toast.info('Saving in progress', 'Wait a moment, then start the audit again.'); return null }
+    if (saving) { toast.info(t('resume.toastSaving'), t('resume.toastSavingDetail')); return null }
     if (dirty && !(await handleSave())) return null
     if (!latestContent.current) return null
     // Reuse the same evidence-based Auditor whenever this resume is attached to
@@ -931,7 +936,7 @@ export function ResumePage() {
       setSectionOrder(imported.sectionOrder ?? DEFAULT_ORDER)
       setDirty(true)
       setContentChangedSinceAnalysis(true)
-      toast.success('Resume imported', 'Review the content and save when ready')
+        toast.success(t('resume.toastImported'), t('resume.toastReviewSave'))
     } else {
       // Create a new resume with the imported content
       const name = imported.contact.name ? `${imported.contact.name}'s Resume` : 'Imported Resume'
@@ -942,7 +947,7 @@ export function ResumePage() {
         const item: ResumeListItem = { id: data.id, name: data.name, isDefault: data.isDefault, directionId: null, kind: 'base' as const, parentResumeId: null, targetJobId: null, origin: 'manual' as const, basicsDetached: false, createdAt: data.createdAt, updatedAt: data.updatedAt }
         setResumes(prev => [...prev, item])
         setSelectedResumeId(data.id)
-        toast.success('Resume imported', `"${name}" created`)
+        toast.success(t('resume.toastImported'), `"${name}" ${t('resume.toastCreated')}`)
       } else toast.error('Import failed', error ?? 'Could not create resume')
     }
   }
@@ -1070,14 +1075,14 @@ export function ResumePage() {
           // Also toast for non-skills keywords
           const otherKw = scoreResult.missingItems.filter(m => m.target !== 'skills')
           if (otherKw.length > 0) {
-            toast.success('Review other gaps', `Also check: ${otherKw.map(m => m.keyword).join(', ')}`)
+          toast.success(t('resume.toastOtherGaps'), `${t('resume.toastAlsoCheck')}: ${otherKw.map(m => m.keyword).join(', ')}`)
           }
         } else { toast.success('Noted', 'Suggestion marked as applied') }
         break
 
       case 'experience':
         if (s.action === 'enhance' && hasProposed) {
-          toast.success('Experience tip', 'Open the Experience section and use ✦ AI suggest on a bullet to apply enhancements')
+          toast.success(t('resume.toastExperienceTip'), t('resume.toastExperienceTipDetail'))
         } else { toast.success('Noted', 'Suggestion marked as applied') }
         break
 
@@ -1453,20 +1458,20 @@ export function ResumePage() {
       <ConfirmDialog />
       <header className="resume-library-heading">
         <div>
-          <h1>Resume library</h1>
-          {returnToJobs && <button onClick={() => navigate('jobs')} style={{ marginTop: 4, padding: 0, border: 'none', background: 'none', color: 'var(--primary)', cursor: 'pointer', fontSize: 12 }}>← Back to My Jobs</button>}
+          <h1>{t('resume.library')}</h1>
+          {returnToJobs && <button onClick={() => navigate('jobs')} style={{ marginTop: 4, padding: 0, border: 'none', background: 'none', color: 'var(--primary)', cursor: 'pointer', fontSize: 12 }}>← {t('resume.backToJobs')}</button>}
         </div>
       <div className="resume-library-toolbar">
         <div className="resume-library-toolbar-actions">
-          <Btn variant="primary" onClick={() => openIntake()}><Upload size={15} />Import &amp; parse</Btn>
+          <Btn variant="primary" onClick={() => openIntake()}><Upload size={15} />{t('resume.importParse')}</Btn>
         </div>
         <span className="resume-toolbar-divider" />
-        <Btn variant="ghost" onClick={() => setShowTemplates(true)}><LayoutTemplate size={15} />Templates</Btn>
+        <Btn variant="ghost" onClick={() => setShowTemplates(true)}><LayoutTemplate size={15} />{t('resume.templates')}</Btn>
         <span className="resume-toolbar-divider" />
-        <Btn variant="ghost" onClick={() => { if (!selectedResumeId) { toast.info('Select a resume first'); return }; fetchVersions(); setShowVersions(true) }}><History size={15} />History</Btn>
+        <Btn variant="ghost" onClick={() => { if (!selectedResumeId) { toast.info(t('resume.selectFirst')); return }; fetchVersions(); setShowVersions(true) }}><History size={15} />{t('resume.history')}</Btn>
         <span className="resume-toolbar-divider" />
         <Btn variant="ghost" onClick={() => {
-          if (!selectedResumeId || !content) { toast.info('Select a resume first'); return }
+          if (!selectedResumeId || !content) { toast.info(t('resume.selectFirst')); return }
           // Snapshot current state into localStorage — print page reads this directly,
           // so PDF always reflects what the user sees regardless of save timing
           const snapshot = {
@@ -1478,12 +1483,12 @@ export function ResumePage() {
           // Also persist to DB in the background (non-blocking)
           if (dirty) handleSave()
           window.open(`/resume/${selectedResumeId}/print`, '_blank')
-        }}><FileDown size={15} />Export PDF</Btn>
+        }}><FileDown size={15} />{t('resume.exportPdf')}</Btn>
         <div className="resume-final-confirm-trigger"><Btn variant="toolbar" onClick={() => {
           if (!selectedResumeId || !content) { toast.info('Select a resume first'); return }
           setShowFinalConfirm(true)
-        }}><ShieldCheck size={15} />Final confirm</Btn></div>
-        <span className={`resume-top-save${dirty ? ' is-unsaved' : ''}`}>{saving ? 'Saving…' : dirty ? 'Saving soon' : lastSavedAt && Date.now() - lastSavedAt.getTime() >= 5 * 60_000 ? `Saved ${lastSavedAt.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}` : 'Saved just now'}</span>
+        }}><ShieldCheck size={15} />{t('resume.finalConfirm')}</Btn></div>
+        <span className={`resume-top-save${dirty ? ' is-unsaved' : ''}`}>{saving ? t('resume.savingStatus') : dirty ? t('resume.savingSoon') : lastSavedAt && Date.now() - lastSavedAt.getTime() >= 5 * 60_000 ? `${t('resume.savedAt')} ${lastSavedAt.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}` : t('resume.savedJustNow')}</span>
       </div>
       </header>
 
@@ -1491,12 +1496,12 @@ export function ResumePage() {
         <div style={{ flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'center', background: 'var(--bg-tertiary)' }}>
           <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 10 }}>
             <div style={{ width: 28, height: 28, border: '2.5px solid rgba(79,70,229,0.20)', borderTopColor: 'var(--primary)', borderRadius: '50%', animation: 'spin 0.7s linear infinite' }} />
-            <div style={{ fontSize: 12, color: 'var(--text-muted)' }}>Loading resume…</div>
+            <div style={{ fontSize: 12, color: 'var(--text-muted)' }}>{t('resume.loading')}</div>
           </div>
         </div>
       ) : !content ? (
         <div style={{ flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'center', background: 'var(--bg-tertiary)' }}>
-          <div style={{ textAlign: 'center', color: 'var(--text-muted)', fontSize: 13 }}>Select or create a resume to get started.</div>
+          <div style={{ textAlign: 'center', color: 'var(--text-muted)', fontSize: 13 }}>{t('resume.selectOrCreate')}</div>
         </div>
       ) : (
         <div className={`resume-library-layout${libraryCollapsed ? ' is-library-collapsed' : ''}`} style={{ flex: 1, display: 'flex', overflow: 'hidden', background: 'var(--bg-tertiary)' }}>
@@ -1505,7 +1510,7 @@ export function ResumePage() {
               {libraryCollapsed ? <PanelLeftOpen size={17} /> : <PanelLeftClose size={17} />}
             </button>
             {libraryCollapsed ? (
-              <div className="resume-library-collapsed-list" aria-label="Resume thumbnails">
+              <div className="resume-library-collapsed-list" aria-label={t('resume.thumbnails')}>
                 {filteredResumes.map(resume => {
                   const isSelected = resume.id === selectedResumeId
                   return (
@@ -1525,10 +1530,10 @@ export function ResumePage() {
             ) : <>
             <div className="resume-library-sidebar-head">
               <div>
-                <span>My resumes</span>
+                <span>{t('resume.myResumes')}</span>
                 <small>{resumes.length} version{resumes.length === 1 ? '' : 's'}</small>
               </div>
-              <button onClick={() => setShowNewResume(true)} disabled={creatingResume}><Plus size={13} />New version</button>
+              <button onClick={() => setShowNewResume(true)} disabled={creatingResume}><Plus size={13} />{t('resume.newVersion')}</button>
             </div>
             <ResumeLibraryPanel
               resumes={filteredResumes}
@@ -1542,7 +1547,7 @@ export function ResumePage() {
             />
             <div
               className={`resume-library-import${libraryImportDragOver ? ' is-drag-over' : ''}`}
-              aria-label="Drop a PDF or DOCX resume to import"
+              aria-label={t('resume.dropResume')}
               onDragOver={event => { event.preventDefault(); event.dataTransfer.dropEffect = 'copy'; setLibraryImportDragOver(true) }}
               onDragLeave={event => { if (!event.currentTarget.contains(event.relatedTarget as Node)) setLibraryImportDragOver(false) }}
               onDrop={handleLibraryImportDrop}
@@ -1550,7 +1555,7 @@ export function ResumePage() {
               <span className="resume-library-file-icon"><Upload size={18} strokeWidth={1.7} /></span>
               <span className="resume-library-import-copy">
                 <strong>{libraryImportDragOver ? 'Drop to import your resume' : 'Drop a PDF or DOCX to import'}</strong>
-                <small>PDF or DOCX · up to 5 MB</small>
+                <small>{t('resume.pdfDocxLimit')}</small>
               </span>
             </div>
             </>}
@@ -1559,7 +1564,7 @@ export function ResumePage() {
             {/* Empty-state banner: no directions set up */}
             {directions.length === 0 && (
               <div style={{ padding: '8px 12px', background: 'rgba(217,119,6,0.06)', border: '0.5px solid rgba(217,119,6,0.20)', borderRadius: 7, marginBottom: 12, fontSize: 11, color: 'var(--c-warning)', display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
-                <span>Looks like you haven&apos;t set up your directions yet.</span>
+                <span>{t('resume.directionsMissing')}</span>
                 <button
                   onClick={() => toast.info('Setup', 'Go to Settings → Profile to restart onboarding')}
                   style={{ fontSize: 10, color: 'var(--primary)', background: 'none', border: 'none', cursor: 'pointer', textDecoration: 'underline' }}
@@ -1657,31 +1662,31 @@ export function ResumePage() {
 
           <aside className="resume-ai-column">
           <div className="resume-ai-title" style={{ display: 'flex', gap: 6 }}>
-            <button onClick={() => setRightPanel('insights')} style={{ border: 0, background: 'transparent', color: rightPanel === 'insights' ? 'var(--text)' : 'var(--text-muted)', font: 'inherit', fontWeight: 700, cursor: 'pointer', padding: 0 }}>AI insights</button>
-            <button onClick={() => setRightPanel('persona')} style={{ border: 0, background: 'transparent', color: rightPanel === 'persona' ? 'var(--primary)' : 'var(--text-muted)', font: 'inherit', fontWeight: 700, cursor: 'pointer', padding: 0 }}>Persona</button>
+            <button onClick={() => setRightPanel('insights')} style={{ border: 0, background: 'transparent', color: rightPanel === 'insights' ? 'var(--text)' : 'var(--text-muted)', font: 'inherit', fontWeight: 700, cursor: 'pointer', padding: 0 }}>{t('resume.aiInsights')}</button>
+            <button onClick={() => setRightPanel('persona')} style={{ border: 0, background: 'transparent', color: rightPanel === 'persona' ? 'var(--primary)' : 'var(--text-muted)', font: 'inherit', fontWeight: 700, cursor: 'pointer', padding: 0 }}>{t('resume.persona')}</button>
           </div>
           {rightPanel === 'persona' ? <PersonaPanel isDefault={selectedResume?.isDefault ?? false} onEditResume={setEditSection} onUseAsProfile={() => { if (selectedResume) void handleSetDefaultResume(selectedResume) }} /> : <>
           <div className="resume-opportunity-card">
-            <span className="resume-opportunity-eyebrow">LINKED OPPORTUNITY</span>
+            <span className="resume-opportunity-eyebrow">{t('resume.linkedOpportunity')}</span>
             {linkedJob ? <>
               <strong>{linkedJob.role}</strong>
               <span>{linkedJob.company}</span>
               <small>{selectedResume?.targetJobId ? 'Tailored version linked' : 'Selected resume linked'}</small>
               <div className="resume-opportunity-actions">
-                <button onClick={() => setShowCoverLetter(true)}>Cover letter</button>
-                <button onClick={() => toast.info('Saved job', `${linkedJob.company} · ${linkedJob.role} is linked to this resume`)}>View job</button>
+                <button onClick={() => setShowCoverLetter(true)}>{t('resume.coverLetter')}</button>
+                <button onClick={() => toast.info(t('resume.viewJob'), `${linkedJob.company} · ${linkedJob.role} is linked to this resume`)}>{t('resume.viewJob')}</button>
               </div>
             </> : <>
-              <strong>Link a saved job</strong>
-              <span>AI will tailor this resume to the opportunity you choose.</span>
+              <strong>{t('resume.linkSavedJob')}</strong>
+              <span>{t('resume.aiTailorOpportunity')}</span>
               <select value={selectedJobId ?? ''} onChange={e => setSelectedJobId(e.target.value || null)}>
-                <option value="">Choose a saved job</option>
+                <option value="">{t('resume.chooseSavedJob')}</option>
                 {jobs.map(job => <option key={job.id} value={job.id}>{job.company} · {job.role}</option>)}
               </select>
               <button className="resume-opportunity-link" onClick={() => {
                 if (!selectedJobId) { toast.info('Select a saved job first', 'Choose the opportunity this resume should be used for'); return }
                 linkResumeToJob(selectedJobId)
-              }}>Link resume</button>
+              }}>{t('resume.linkResume')}</button>
             </>}
           </div>
           <AiPanel
@@ -1736,16 +1741,16 @@ export function ResumePage() {
           onClick={e => { if (e.target === e.currentTarget) setShowVersions(false) }}>
           <div style={{ background: 'var(--bg)', border: '0.5px solid var(--border)', borderRadius: 10, padding: 20, width: 400, maxHeight: '70vh', overflow: 'hidden', display: 'flex', flexDirection: 'column', boxShadow: '0 8px 32px rgba(0,0,0,0.15)' }}>
             <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 14 }}>
-              <span style={{ fontSize: 14, fontWeight: 500 }}>Version History</span>
+              <span style={{ fontSize: 14, fontWeight: 500 }}>{t('resume.versionHistory')}</span>
               <button onClick={() => setShowVersions(false)} style={{ background: 'none', border: 'none', cursor: 'pointer', fontSize: 16, color: 'var(--text-muted)', lineHeight: 1, padding: 0 }}>✕</button>
             </div>
             <div style={{ flex: 1, overflowY: 'auto' }}>
               {loadingVers ? (
-                <div style={{ textAlign: 'center', padding: 30, fontSize: 12, color: 'var(--text-muted)' }}>Loading versions…</div>
+                <div style={{ textAlign: 'center', padding: 30, fontSize: 12, color: 'var(--text-muted)' }}>{t('resume.versionsLoading')}</div>
               ) : versions.length === 0 ? (
                 <div style={{ textAlign: 'center', padding: 30 }}>
-                  <div style={{ fontSize: 13, fontWeight: 500, marginBottom: 4 }}>No versions yet</div>
-                  <div style={{ fontSize: 11, color: 'var(--text-muted)' }}>Versions are created automatically when you save your resume.</div>
+                  <div style={{ fontSize: 13, fontWeight: 500, marginBottom: 4 }}>{t('resume.noVersionsShort')}</div>
+                  <div style={{ fontSize: 11, color: 'var(--text-muted)' }}>{t('resume.versionsAuto')}</div>
                 </div>
               ) : (
                 <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
@@ -1783,7 +1788,7 @@ export function ResumePage() {
           templateOptions={templateOptions}
           coverLetterContent={finalCoverLetter?.content ?? null}
           onClose={() => setShowFinalConfirm(false)}
-          onReviewSuggestions={() => { setShowFinalConfirm(false); toast.info('Review AI suggestions', 'Apply the remaining suggestions in the AI insights panel') }}
+          onReviewSuggestions={() => { setShowFinalConfirm(false); toast.info(t('resume.toastSuggestions'), t('resume.toastSuggestionsDetail')) }}
           onCreateCoverLetter={() => { setShowFinalConfirm(false); setShowCoverLetter(true) }}
           onLinkJob={() => {
             setShowFinalConfirm(false)

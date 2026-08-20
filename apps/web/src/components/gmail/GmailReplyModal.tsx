@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react'
 import { Btn, useToast } from '@/components/ui'
 import type { GmailEmail } from './inbox-model'
+import { useI18n } from '@/lib/i18n'
 
 interface GmailReplyModalProps {
   email: GmailEmail
@@ -9,6 +10,7 @@ interface GmailReplyModalProps {
 }
 
 export function GmailReplyModal({ email, body, onClose }: GmailReplyModalProps) {
+  const { t } = useI18n()
   const toast = useToast()
   const [reply, setReply] = useState('')
   const [loading, setLoading] = useState(true)
@@ -33,11 +35,11 @@ export function GmailReplyModal({ email, body, onClose }: GmailReplyModalProps) 
       .then(async response => ({ ok: response.ok, body: (await response.json()) as { reply?: string } }))
       .then(result => {
         if (result.ok && result.body.reply) setReply(result.body.reply)
-        else setError('Could not generate a reply.')
+        else setError(t('gmail.replyGenerationFailed'))
       })
       .catch(error => {
         if (error instanceof DOMException && error.name === 'AbortError') return
-        setError('Network error. Please try again.')
+        setError(t('gmail.networkRetry'))
       })
       .finally(() => setLoading(false))
     return () => controller.abort()
@@ -47,10 +49,10 @@ export function GmailReplyModal({ email, body, onClose }: GmailReplyModalProps) 
     try {
       await navigator.clipboard.writeText(reply)
       setCopied(true)
-      toast.success('Copied!', 'Reply text copied to clipboard')
+      toast.success(t('gmail.copied'), t('gmail.replyCopied'))
       window.setTimeout(() => setCopied(false), 2_000)
     } catch {
-      toast.error('Could not copy', 'Select the draft and copy it manually.')
+      toast.error(t('gmail.copyFailed'), t('gmail.copyManually'))
     }
   }
 
@@ -62,24 +64,24 @@ export function GmailReplyModal({ email, body, onClose }: GmailReplyModalProps) 
         body: JSON.stringify({ to: email.from, subject: `Re: ${email.subject}`, draft: reply, gmailMessageId: email.id, threadId: email.threadId, messageKind: email.tag }),
       })
       const result = await response.json() as { error?: string; tracked?: boolean }
-      if (!response.ok) throw new Error(result.error ?? 'Could not send follow-up')
+      if (!response.ok) throw new Error(result.error ?? t('gmail.followUpFailed'))
       window.dispatchEvent(new Event('applymate:jobs-changed'))
-      toast.success('Follow-up sent', result.tracked ? 'My Jobs and the activity timeline were updated.' : 'The email was sent. Link it to My Jobs to track future follow-ups.')
+      toast.success(t('gmail.followUpSent'), result.tracked ? t('gmail.trackedUpdated') : t('gmail.sentLinkToTrack'))
       onClose()
     } catch (error) {
-      toast.error('Could not send follow-up', error instanceof Error ? error.message : 'Try again')
+      toast.error(t('gmail.followUpFailed'), error instanceof Error ? error.message : t('common.tryAgain'))
     } finally {
       setSending(false)
     }
   }
 
-  return <div role="dialog" aria-modal="true" aria-label="AI follow-up draft" style={overlayStyle}>
+  return <div role="dialog" aria-modal="true" aria-label={t('gmail.aiFollowUpDraft')} style={overlayStyle}>
     <div style={modalStyle}>
       <header style={headerStyle}>
         <div style={{ flex: 1 }}>
-          <div style={{ fontSize: 14, fontWeight: 500 }}>AI Follow-up Draft</div>
-          <div style={subheaderStyle}>To: <strong>{email.name}</strong> &lt;{email.from}&gt;</div>
-          <div style={subheaderStyle}>Re: {email.subject}</div>
+          <div style={{ fontSize: 14, fontWeight: 500 }}>{t('gmail.aiFollowUpDraft')}</div>
+          <div style={subheaderStyle}>{t('gmail.to')}: <strong>{email.name}</strong> &lt;{email.from}&gt;</div>
+          <div style={subheaderStyle}>{t('gmail.re')}: {email.subject}</div>
         </div>
         <Btn small variant="ghost" onClick={onClose}>✕</Btn>
       </header>
@@ -87,17 +89,18 @@ export function GmailReplyModal({ email, body, onClose }: GmailReplyModalProps) 
         {loading ? <LoadingReply /> : error ? <div style={{ fontSize: 12, color: 'var(--c-danger)' }}>{error}</div> : <textarea value={reply} onChange={event => setReply(event.target.value)} style={textareaStyle} />}
       </div>
       <footer style={footerStyle}>
-        <Btn variant="ghost" onClick={onClose}>Cancel</Btn>
-        {!loading && !error && <><Btn variant="ghost" onClick={() => void copyToClipboard()}>{copied ? '✓ Copied' : '📋 Copy Text'}</Btn><Btn variant="primary" disabled={sending || !reply.trim()} onClick={() => void sendFollowUp()}>{sending ? 'Sending…' : '✉ Send follow-up'}</Btn></>}
+        <Btn variant="ghost" onClick={onClose}>{t('common.cancel')}</Btn>
+        {!loading && !error && <><Btn variant="ghost" onClick={() => void copyToClipboard()}>{copied ? `✓ ${t('gmail.copied')}` : `📋 ${t('gmail.copyText')}`}</Btn><Btn variant="primary" disabled={sending || !reply.trim()} onClick={() => void sendFollowUp()}>{sending ? t('gmail.sending') : `✉ ${t('gmail.sendFollowUp')}`}</Btn></>}
       </footer>
     </div>
   </div>
 }
 
 function LoadingReply() {
+  const { t } = useI18n()
   return <div style={{ display: 'flex', alignItems: 'center', gap: 8, color: 'var(--text-muted)', fontSize: 12 }}>
     <div style={{ width: 14, height: 14, border: '2px solid rgba(79,70,229,0.15)', borderTopColor: 'var(--primary)', borderRadius: '50%', animation: 'spin 0.7s linear infinite' }} />
-    Generating reply with AI…
+    {t('gmail.generatingReply')}
   </div>
 }
 

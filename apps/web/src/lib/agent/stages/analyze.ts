@@ -1,6 +1,6 @@
 /**
  * Stage 2 — Analyze
- * Role: 分析员
+ * Role: analyst
  * Scores each job against the user's resume using AI.
  * Persists score to DB immediately after each call.
  * Emits per-job SSE events: job_start / job_done / job_skip / job_error
@@ -41,10 +41,10 @@ export async function runAnalyze(
   const noDescCount = jobs.filter(j => !j.description && !!j.role).length
   let skipNoDescription = false
   if (noDescCount > 0) {
-    const question = `发现 ${noDescCount} 个职位没有职位描述。我会尝试根据职位名称和公司评分，但准确度可能偏低。建议：在 Jobs 页面为这些职位手动添加描述后再运行。是否继续？`
+    const question = `Discover ${noDescCount} positions have no job description.I would try to rate based on job title and company, But the accuracy may be low.suggestion: exist Jobs The page manually adds descriptions for these positions before running.Do you want to continue??`
     const options = [
-      { label: '✓ 继续（用职位名称评分）', value: 'continue' },
-      { label: '↩ 跳过无描述职位', value: 'skip_no_desc' },
+      { label: '✓ continue(Rate by job title)', value: 'continue' },
+      { label: '↩ Skip jobs without description', value: 'skip_no_desc' },
     ]
     if (ctx.askUser) {
       skipNoDescription = await ctx.askUser('analyst', question, options) === 'skip_no_desc'
@@ -64,7 +64,7 @@ export async function runAnalyze(
     emit('job_start', { jobId: job.id, company: job.company, role: job.role })
     emit('agent_action', {
       role:   'analyst',
-      action: `评分 ${job.company} · ${job.role}${job.location ? ` (${job.location})` : ''}`,
+      action: `score ${job.company} · ${job.role}${job.location ? ` (${job.location})` : ''}`,
     })
 
     // Reject automation-ineligible records before an LLM scores them or the
@@ -79,7 +79,7 @@ export async function runAnalyze(
       emit('job_skip', { jobId: job.id, company: job.company, role: job.role, reason })
       emit('agent_observation', {
         role: 'analyst',
-        observation: `⚠ 跳过 ${job.company} · ${job.role}：申请前校验未通过。${reason}`,
+        observation: `⚠ jump over ${job.company} · ${job.role}: The pre-application verification failed.${reason}`,
       })
       return
     }
@@ -92,7 +92,7 @@ export async function runAnalyze(
       emit('job_skip', { jobId: job.id, company: job.company, role: job.role, reason: 'No job description available' })
       emit('agent_observation', {
         role:        'analyst',
-        observation: `⚠ 跳过 ${job.company} · ${job.role}：无职位描述，无法评分`,
+        observation: `⚠ jump over ${job.company} · ${job.role}: No job description, Unable to rate`,
       })
       return
     }
@@ -124,9 +124,9 @@ export async function runAnalyze(
       scoredJobs.push({ job, ...parsed })
 
       // Emit per-job observation with AI reasoning
-      const matchStr  = parsed.matchedKeywords.length  ? `匹配：${parsed.matchedKeywords.slice(0, 4).join(', ')}` : ''
-      const missStr   = parsed.missingKeywords.length   ? `缺失：${parsed.missingKeywords.slice(0, 3).join(', ')}` : ''
-      const scoreTag  = parsed.score >= 80 ? '✦ 高匹配' : parsed.score >= 60 ? '◆ 中等' : '◇ 偏低'
+      const matchStr  = parsed.matchedKeywords.length  ? `match: ${parsed.matchedKeywords.slice(0, 4).join(', ')}` : ''
+      const missStr   = parsed.missingKeywords.length   ? `Missing: ${parsed.missingKeywords.slice(0, 3).join(', ')}` : ''
+      const scoreTag  = parsed.score >= 80 ? '✦ High match' : parsed.score >= 60 ? '◆ medium' : '◇ On the low side'
       emit('agent_observation', {
         role:        'analyst',
         observation: `${scoreTag} ${parsed.score}%${matchStr ? ' · ' + matchStr : ''}${missStr ? ' · ' + missStr : ''}${parsed.recommendation ? ' → ' + parsed.recommendation : ''}`,
@@ -150,7 +150,7 @@ export async function runAnalyze(
       })
       emit('agent_observation', {
         role:        'analyst',
-        observation: `✗ ${job.company} · ${job.role} 评分失败：${message}`,
+        observation: `✗ ${job.company} · ${job.role} Rating failed: ${message}`,
       })
       emit('job_error', { jobId: job.id, company: job.company, role: job.role, error: message })
     }

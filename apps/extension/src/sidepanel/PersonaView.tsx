@@ -22,6 +22,7 @@ import { getPersona, getPersonaFields, savePersonaFields, deletePersonaField } f
 import type { ExtensionSettings } from '@/lib/types'
 import type { PersonaField } from '@/lib/api'
 import type { PersonaProfile } from '@/lib/api'
+import { useExtensionI18n } from '@/lib/i18n'
 
 const CATEGORY_META: Record<string, { label: string }> = {
   personal:     { label: 'Personal info' },
@@ -48,6 +49,7 @@ interface Props {
 type ViewMode = 'view' | 'editing' | 'adding'
 
 export function PersonaView({ settings, personaUpdateTrigger }: Props) {
+  const { lang, t } = useExtensionI18n()
   const [fields, setFields] = useState<PersonaField[]>([])
   const [profile, setProfile] = useState<PersonaProfile | null>(null)
   const [loading, setLoading] = useState(true)
@@ -63,9 +65,9 @@ export function PersonaView({ settings, personaUpdateTrigger }: Props) {
       setProfile(personaResult.profile)
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err)
-      showToast(`Load failed: ${msg}`)
+      showToast(lang === 'zh' ? t('Load failed') : `${t('Load failed')}: ${msg}`)
     } finally { setLoading(false) }
-  }, [settings])
+  }, [lang, settings, t])
 
   useEffect(() => { loadFields() }, [loadFields, personaUpdateTrigger])
 
@@ -77,8 +79,8 @@ export function PersonaView({ settings, personaUpdateTrigger }: Props) {
       await savePersonaFields(settings, [field])
       await loadFields()
       setMode('view')
-      showToast('Saved!')
-    } catch { showToast('Save failed') }
+      showToast(t('Saved!'))
+    } catch { showToast(t('Save failed')) }
     finally { setSaving(false) }
   }
 
@@ -86,8 +88,8 @@ export function PersonaView({ settings, personaUpdateTrigger }: Props) {
     try {
       await deletePersonaField(settings, key)
       await loadFields()
-      showToast('Deleted')
-    } catch { showToast('Delete failed') }
+      showToast(t('Deleted'))
+    } catch { showToast(t('Delete failed')) }
   }
 
   async function handleAddNew() {
@@ -108,8 +110,8 @@ export function PersonaView({ settings, personaUpdateTrigger }: Props) {
       await loadFields()
       setMode('view')
       setNewField({})
-      showToast('Added!')
-    } catch { showToast('Add failed') }
+      showToast(t('Added!'))
+    } catch { showToast(t('Add failed')) }
     finally { setSaving(false) }
   }
 
@@ -120,7 +122,7 @@ export function PersonaView({ settings, personaUpdateTrigger }: Props) {
   if (loading) {
     return (
       <div className="am-profile-view">
-        <div className="am-spinner am-profile-spinner"><LoaderCircle size={20} className="am-spin" aria-label="Loading profile" /></div>
+        <div className="am-spinner am-profile-spinner"><LoaderCircle size={20} className="am-spin" aria-label={t('Loading profile')} /></div>
       </div>
     )
   }
@@ -130,19 +132,19 @@ export function PersonaView({ settings, personaUpdateTrigger }: Props) {
       <section className="am-profile-card am-profile-intro">
         <div className="am-profile-intro-icon"><UserRound size={17} aria-hidden="true" /></div>
         <div className="am-profile-intro-copy">
-          <span className="am-profile-eyebrow">Profile</span>
-          <h1>Persona profile</h1>
-          <p>Confirmed facts used to auto-fill future applications.</p>
+          <span className="am-profile-eyebrow">{t('Profile')}</span>
+          <h1>{t('Persona profile')}</h1>
+          <p>{t('Confirmed facts used to auto-fill future applications.')}</p>
         </div>
-        <span className="am-profile-status"><Check size={11} aria-hidden="true" /> Synced</span>
+        <span className="am-profile-status"><Check size={11} aria-hidden="true" /> {t('Synced')}</span>
       </section>
 
       {profile && <section className="am-profile-card am-profile-summary">
         <div className="am-profile-card-head">
           <div>
-            <span className="am-profile-eyebrow">Knowledge base</span>
-            <h2>Unified profile</h2>
-            <p>{profile.sourceResumeCount} base resume{profile.sourceResumeCount === 1 ? '' : 's'} connected</p>
+            <span className="am-profile-eyebrow">{t('Knowledge base')}</span>
+            <h2>{t('Unified profile')}</h2>
+            <p>{profile.sourceResumeCount} {t(profile.sourceResumeCount === 1 ? 'base resume connected' : 'base resumes connected')}</p>
           </div>
           <span className="am-profile-card-icon"><FileText size={15} aria-hidden="true" /></span>
         </div>
@@ -151,7 +153,7 @@ export function PersonaView({ settings, personaUpdateTrigger }: Props) {
             const values = profile[group.key]
             if (!Array.isArray(values) || values.length === 0) return null
             return <div key={group.key} className="am-profile-summary-group">
-              <strong>{group.label}</strong>
+              <strong>{t(group.label)}</strong>
               {values.map((value, index) => <span key={`${value}-${index}`}>{value}</span>)}
             </div>
           })}
@@ -159,7 +161,7 @@ export function PersonaView({ settings, personaUpdateTrigger }: Props) {
       </section>}
 
       <div className="am-profile-section-label">
-        <span>Saved answers</span>
+        <span>{t('Saved answers')}</span>
         {fields.length > 0 && <span className="am-profile-count">{fields.length}</span>}
       </div>
 
@@ -167,55 +169,55 @@ export function PersonaView({ settings, personaUpdateTrigger }: Props) {
         <section className="am-profile-card am-profile-editor">
           <div className="am-profile-card-head">
             <div>
-              <span className="am-profile-eyebrow">Manual entry</span>
-              <h2>Add a field</h2>
+              <span className="am-profile-eyebrow">{t('Manual entry')}</span>
+              <h2>{t('Add a field')}</h2>
             </div>
-            <button className="am-profile-icon-button" type="button" onClick={() => { setMode('view'); setNewField({}) }} aria-label="Cancel adding field" title="Cancel">
+            <button className="am-profile-icon-button" type="button" onClick={() => { setMode('view'); setNewField({}) }} aria-label={t('Cancel adding field')} title={t('Cancel')}>
               <X size={14} aria-hidden="true" />
             </button>
           </div>
           <div className="am-profile-form">
-            <label className="am-profile-field"><span>Key</span>
+            <label className="am-profile-field"><span>{t('Key')}</span>
             <input
               value={newField.key ?? ''}
               onChange={e => setNewField(p => ({ ...p, key: e.target.value }))}
-              placeholder="Key (e.g. linkedin_profile)"
+              placeholder={t('Key (e.g. linkedin_profile)')}
               className="am-profile-input"
             />
             </label>
-            <label className="am-profile-field"><span>Label</span>
+            <label className="am-profile-field"><span>{t('Label')}</span>
             <input
               value={newField.label ?? ''}
               onChange={e => setNewField(p => ({ ...p, label: e.target.value }))}
-              placeholder="Label (e.g. LinkedIn Profile URL)"
+              placeholder={t('Label (e.g. LinkedIn Profile URL)')}
               className="am-profile-input"
             />
             </label>
-            <label className="am-profile-field"><span>Answer</span>
+            <label className="am-profile-field"><span>{t('Answer')}</span>
             <input
               value={newField.value ?? ''}
               onChange={e => setNewField(p => ({ ...p, value: e.target.value }))}
-              placeholder="Value (the answer)"
+              placeholder={t('Value (the answer)')}
               className="am-profile-input"
             />
             </label>
-            <label className="am-profile-field"><span>Category</span>
+            <label className="am-profile-field"><span>{t('Category')}</span>
             <select
               value={newField.category ?? 'personal'}
               onChange={e => setNewField(p => ({ ...p, category: e.target.value }))}
               className="am-profile-input"
             >
               {CATEGORIES.map(c => (
-                <option key={c} value={c}>{CATEGORY_META[c]?.label ?? c}</option>
+                <option key={c} value={c}>{t(CATEGORY_META[c]?.label ?? c)}</option>
               ))}
             </select>
             </label>
             <div className="am-profile-actions">
               <button className="am-profile-button primary" type="button" onClick={handleAddNew} disabled={saving}>
-                <Check size={13} aria-hidden="true" /> {saving ? 'Saving…' : 'Save field'}
+                <Check size={13} aria-hidden="true" /> {saving ? t('Saving…') : t('Save field')}
               </button>
               <button className="am-profile-button ghost" type="button" onClick={() => { setMode('view'); setNewField({}) }}>
-                Cancel
+                {t('Cancel')}
               </button>
             </div>
           </div>
@@ -226,7 +228,7 @@ export function PersonaView({ settings, personaUpdateTrigger }: Props) {
           onClick={() => setMode('adding')}
           className="am-profile-add-button"
         >
-          <Plus size={14} aria-hidden="true" /> Add new field
+          <Plus size={14} aria-hidden="true" /> {t('Add new field')}
         </button>
       )}
 
@@ -235,11 +237,11 @@ export function PersonaView({ settings, personaUpdateTrigger }: Props) {
         <div className="am-profile-empty">
           <div className="am-profile-empty-icon"><ContactRound size={18} aria-hidden="true" /></div>
           <div className="am-profile-empty-title">
-            No persona fields yet
+            {t('No persona fields yet')}
           </div>
           <div className="am-profile-empty-copy">
-            After filling a form, you can save your answers here.<br/>
-            They'll be used to auto-fill future applications.
+            {t('After filling a form, you can save your answers here.')}<br/>
+            {t("They'll be used to auto-fill future applications.")}
           </div>
         </div>
       )}
@@ -251,7 +253,7 @@ export function PersonaView({ settings, personaUpdateTrigger }: Props) {
           <section key={group.cat} className="am-profile-field-group">
             <div className="am-profile-group-heading">
               <span className="am-profile-group-icon"><CategoryIcon category={group.cat} /></span>
-              <span>{meta.label}</span>
+              <span>{t(meta.label)}</span>
               <span className="am-profile-group-count">{group.items.length}</span>
             </div>
             {group.items.map(field => (
@@ -283,6 +285,7 @@ function PersonaFieldCard({ field, onSave, onDelete, saving }: {
   onDelete: (key: string) => void
   saving: boolean
 }) {
+  const { t } = useExtensionI18n()
   const [editing, setEditing] = useState(false)
   const [value, setValue] = useState(field.value)
   const [label, setLabel] = useState(field.label)
@@ -291,23 +294,23 @@ function PersonaFieldCard({ field, onSave, onDelete, saving }: {
     <div className={`am-profile-field-card${editing ? ' is-editing' : ''}`}>
       {editing ? (
         <>
-          <label className="am-profile-field"><span>Label</span><input value={label} onChange={e => setLabel(e.target.value)} className="am-profile-input" /></label>
+          <label className="am-profile-field"><span>{t('Label')}</span><input value={label} onChange={e => setLabel(e.target.value)} className="am-profile-input" /></label>
           <textarea
             value={value}
             onChange={e => setValue(e.target.value)}
             rows={2}
             className="am-profile-input am-profile-textarea"
-            aria-label={`Answer for ${label}`}
+            aria-label={`${t('Answer for')} ${label}`}
           />
           <div className="am-profile-actions">
             <button className="am-profile-button primary" type="button" onClick={() => {
               onSave({ ...field, value, label, updatedAt: new Date().toISOString() })
               setEditing(false)
             }} disabled={saving}>
-              <Check size={13} aria-hidden="true" /> {saving ? 'Saving…' : 'Save'}
+              <Check size={13} aria-hidden="true" /> {saving ? t('Saving…') : t('Save')}
             </button>
             <button className="am-profile-button ghost" type="button" onClick={() => { setEditing(false); setValue(field.value); setLabel(field.label) }}>
-              Cancel
+              {t('Cancel')}
             </button>
           </div>
         </>
@@ -320,10 +323,10 @@ function PersonaFieldCard({ field, onSave, onDelete, saving }: {
             </div>
           </div>
           <div className="am-profile-field-actions">
-            <button className="am-profile-icon-button" type="button" onClick={() => setEditing(true)} aria-label={`Edit ${field.label}`} title="Edit">
+            <button className="am-profile-icon-button" type="button" onClick={() => setEditing(true)} aria-label={`${t('Edit')} ${field.label}`} title={t('Edit')}>
               <Pencil size={13} aria-hidden="true" />
             </button>
-            <button className="am-profile-icon-button danger" type="button" onClick={() => onDelete(field.key)} aria-label={`Delete ${field.label}`} title="Delete">
+            <button className="am-profile-icon-button danger" type="button" onClick={() => onDelete(field.key)} aria-label={`${t('Delete')} ${field.label}`} title={t('Delete')}>
               <Trash2 size={13} aria-hidden="true" />
             </button>
           </div>

@@ -76,7 +76,7 @@ export function scrapeIndeedFromDocument(doc: Document, pageUrl: string): Scrape
     query<HTMLElement>('[class*="salary"]')?.innerText.trim() ||
     null
   // Only keep if it looks like a real salary (contains currency symbol or per-year/per-month indicator)
-  const salary = salaryRaw && /[$€£¥]|year|hour|annum|k\b|月|年|Monat|Jahr|an|hr/i.test(salaryRaw) ? salaryRaw : null
+  const salary = salaryRaw && /[$€£¥]|year|hour|annum|k\b|moon|Year|Monat|Jahr|an|hr/i.test(salaryRaw) ? salaryRaw : null
 
   // ── Description ──
   // #jobDescriptionText is the most stable ID Indeed uses across all TLDs.

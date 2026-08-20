@@ -79,6 +79,6 @@ body:
       label: Codex Handoff
       description: Paste the final execution instruction for Codex.
       value: |
-        @codex 请按上述 AC 实现，分支命名 `feat/<issue-id>-<slug>`（bug 用 `fix/<issue-id>-<slug>`），完成后开 PR 并填写 verify 步骤，PR 描述需包含 `Closes #<issue-id>`。
+        @codex Please click above AC accomplish, Branch naming `feat/<issue-id>-<slug>`(bug use `fix/<issue-id>-<slug>`), Open after completion PR and fill in verify step, PR The description must include `Closes #<issue-id>`.
     validations:
       required: true

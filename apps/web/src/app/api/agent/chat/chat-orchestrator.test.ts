@@ -13,7 +13,7 @@ import { createChatPlan, requestedMinMatchScore, requestsFullWorkflow, runChatWo
 
 const context = {
   userId: 'user_1',
-  message: '请搜索 Berlin 的 Backend Engineer 职位',
+  message: 'Please search Berlin of Backend Engineer Position',
   config: { targetRoles: ['Software Engineer'], targetLocations: ['Dublin'] },
   jobs: [{ id: 'job_1', company: 'N26', role: 'Backend Engineer', score: 88, status: 'saved', url: 'https://example.com/job' }],
   model: { provider: 'openai' as const, model: 'test' },
@@ -48,11 +48,11 @@ describe('chat orchestrator', () => {
 
   it('corrects an incompatible scout target and detects mismatched results', async () => {
     mocks.modelChat.mockResolvedValueOnce({ text: '{"role":"scout","goal":"Search jobs","targetRoles":["Software Engineer"],"targetLocations":["Dublin"]}' })
-    const uiPlan = await createChatPlan({ ...context, message: '搜索一下都柏林的UI UX 岗位' })
+    const uiPlan = await createChatPlan({ ...context, message: 'Search for DublinUI UX post' })
 
     expect(uiPlan.targetRoles).toEqual(['UI UX'])
     expect(uiPlan.targetLocations).toEqual(['Dublin'])
-    expect(scoutResultMatchesRequest('搜索一下都柏林的UI UX 岗位', {
+    expect(scoutResultMatchesRequest('Search for DublinUI UX post', {
       role: 'scout', summary: 'Found jobs.', result: { jobs: [{ role: 'Software Engineer' }] }, confidence: 0.8,
     })).toBe(false)
   })
@@ -60,7 +60,7 @@ describe('chat orchestrator', () => {
   it('replaces a previous agent location with the one in the current request', async () => {
     mocks.modelChat.mockResolvedValueOnce({ text: '{"role":"scout","goal":"Search jobs","targetRoles":["UI"],"targetLocations":["Dublin"]}' })
 
-    await expect(createChatPlan({ ...context, message: '搜索 UI London 岗位' })).resolves.toEqual(expect.objectContaining({
+    await expect(createChatPlan({ ...context, message: 'search UI London post' })).resolves.toEqual(expect.objectContaining({
       targetLocations: ['London'],
     }))
   })
@@ -76,14 +76,14 @@ describe('chat orchestrator', () => {
   })
 
   it('routes an apply request to the end-to-end workflow, not a single specialist', () => {
-    expect(requestsFullWorkflow('开始完整的从搜索到申请工作流')).toBe(true)
-    expect(requestsFullWorkflow('帮我申请符合我简历匹配度高于65%的职位')).toBe(true)
-    expect(requestsFullWorkflow('帮我优化简历')).toBe(false)
+    expect(requestsFullWorkflow('Start a complete search-to-apply workflow')).toBe(true)
+    expect(requestsFullWorkflow('Help me apply for a resume that matches my profile better than65%position')).toBe(true)
+    expect(requestsFullWorkflow('Help me optimize my resume')).toBe(false)
   })
 
   it('reads an explicit match threshold from an application request', () => {
-    expect(requestedMinMatchScore('帮我申请符合我简历匹配度高于65%的职位')).toBe(65)
-    expect(requestedMinMatchScore('请申请 match score >= 80% 的岗位')).toBe(80)
-    expect(requestedMinMatchScore('帮我申请合适职位')).toBeNull()
+    expect(requestedMinMatchScore('Help me apply for a resume that matches my profile better than65%position')).toBe(65)
+    expect(requestedMinMatchScore('Please apply match score >= 80% position')).toBe(80)
+    expect(requestedMinMatchScore('Help me apply for suitable positions')).toBeNull()
   })
 })
