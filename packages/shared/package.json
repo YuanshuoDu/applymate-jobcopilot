@@ -40,7 +40,8 @@
     }
   },
   "dependencies": {
-    "@aws-sdk/client-kms": "^3.879.0",
+    "@azure/identity": "^4.12.0",
+    "@azure/keyvault-keys": "^4.9.0",
     "pg": "^8.16.3"
   },
   "scripts": {
