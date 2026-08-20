@@ -1,187 +1,139 @@
 # ApplyMate AI
 
-> **AI-powered job-search and application copilot for the European market.**
+> **AI job-search copilot for the European market.**
 >
-> Discover relevant roles, tailor resumes and cover letters, track replies in Gmail, and run supported ATS workflows with explicit user approval at the point of submission.
+> Discover relevant roles, understand your fit, tailor application materials, and track replies in one reviewable workflow.
 
-Production: [applymate.site](https://applymate.site) · Preview: [preview.applymate.site](https://preview.applymate.site)
+[Production](https://applymate.site) · [Preview](https://preview.applymate.site)
 
-[![Next.js](https://img.shields.io/badge/Next.js-15-black?logo=next.js)](https://nextjs.org)
-[![TypeScript](https://img.shields.io/badge/TypeScript-5-blue?logo=typescript)](https://www.typescriptlang.org)
-[![Tailwind CSS](https://img.shields.io/badge/Tailwind-4.0-38bdf8?logo=tailwindcss)](https://tailwindcss.com)
-
----
-
-## What is ApplyMate AI?
-
-ApplyMate AI is a **Web Dashboard + Chrome Extension + Worker** platform for the full job-search loop: discover roles, understand fit, prepare tailored application materials, complete supported ATS forms, and track outcomes. The web app is live at [applymate.site](https://applymate.site); the extension handles in-page job capture and assisted form filling, while the Worker contains queue-backed ATS workflows.
-
-The current product flow is:
+ApplyMate brings job discovery, application preparation, supported ATS workflows,
+and Gmail tracking into one place:
 
 ```text
-discover jobs → score and shortlist → tailor resume/cover letter →
-review → approve → apply through a supported workflow → track Gmail replies
+discover → shortlist → tailor → review → approve → apply → track replies
 ```
 
-Final application submission is deliberately approval-gated per job. CAPTCHA, login, MFA, and other steps that require the candidate remain user handoffs rather than actions the system claims to have completed.
+The product is designed to keep the candidate in control. Final submission is
+approval-gated per job. Login, MFA, CAPTCHA, and other candidate-only steps are
+explicit handoffs rather than actions the system claims to have completed.
 
-Repository: [github.com/YuanshuoDu/applymate-jobcopilot](https://github.com/YuanshuoDu/applymate-jobcopilot)
+## What it does
 
-### Key Principles
-- **User-controlled automation**: AI prepares applications and runs supported ATS workflows, but final submission requires your approval for the specific job.
-- **Europe-first**: GDPR-conscious job discovery and application tooling for European candidates, with multi-language cover letters (EN/DE/FR/NL/ES).
-- **Model-agnostic**: ModelRouter supports MiniMax, Anthropic, OpenAI, DeepSeek, Qwen, Z.ai, Kimi, and compatible custom endpoints.
-- **Privacy-first administration**: Internal roles are isolated from candidate content. Administrators, including `super_admin` and break-glass operators, cannot read API keys, password hashes, OAuth refresh tokens, full resumes, or email bodies.
-- **Azure-backed credential protection**: Production OAuth credentials are encrypted with an Azure Key Vault RSA key; AWS KMS is not required by the current implementation.
+- **Finds relevant jobs** from public search sources and company ATS portals, with European locations and role matching in mind.
+- **Scores and shortlists roles** against a candidate profile so time is spent on the strongest opportunities.
+- **Tailors resumes and cover letters** for individual jobs, with reusable versions and downloadable application packs.
+- **Assists application workflows** through the web app, Chrome Extension, and supported ATS flow modules.
+- **Tracks Gmail replies** for interview, offer, rejection, and follow-up signals after the candidate connects Google.
+- **Runs queue-backed work** through a separate Worker for discovery, agent runs, and supported application tasks.
 
----
+## Product surfaces
+
+### Web app
+
+The web app is the primary workspace for job search, resume management,
+application preparation, approvals, Gmail tracking, and agent run history.
+
+### Chrome Extension
+
+The Extension helps capture jobs from LinkedIn, Indeed, and company career pages,
+keeps saved jobs in sync with the web app, previews application material, and
+assists with supported form fields.
+
+### Worker
+
+The Worker processes BullMQ jobs for discovery, agent runs, and application
+tasks. It includes supported ATS flows for Workday, Greenhouse, Lever,
+SmartRecruiters, and Personio, together with checkpoints, rate limits, form
+patterns, and candidate handoffs.
 
 ## Features
 
-### Agent Pipeline
-- **OrchestratorAgent** — Claude Code-style harness: Plan → Dispatch → Evaluate → Fix → Retry
-- **Scout Agent** — Discovers jobs from LinkedIn, Adzuna, Indeed IE, IrishJobs RSS, and company ATS portals
-- **Analyst Agent** — Scores and ranks jobs against your profile; configurable AI throttle
-- **Writer Agent** — Generates tailored cover letters (0–10 quality scoring before sending)
-- **Executor Agent** — Runs supported ATS tasks from a queue and pauses for approval or user input when required
-- **Auditor Agent** — Monitors Gmail for interview/offer/rejection emails and prepares follow-up drafts
-- **Custom Agents** — Add your own agent roles via the UI; they run as pipeline stages
+### Job discovery
 
-### Resume & Cover Letter System
-- Upload and parse existing resumes (PDF/DOCX)
-- Multi-direction resume library (Base / Adapted / ⭐ Final badges)
-- AI tailoring with per-section model selection through ModelRouter
-- 3 cover letter PDF templates
-- One-click Bundle ZIP download (CV + CL per job)
-- Version history with restore
+- Job search across public sources and company ATS portals
+- European location matching, including dedicated Ireland routing
+- Job scoring, keyword extraction, and shortlist management
+- Stale-result detection and source-aware pacing
 
-### Smart Job Search
-- NLP city extraction from queries (`"software engineer Dublin"` → `location=Dublin`)
-- Stale-filter detection with auto-apply on panel close
-- Location relevance scoring (+6 for city match, -3 for global-remote mismatch)
-- 60+ EU city mappings; Ireland has dedicated LinkedIn IE + Indeed IE + IrishJobs routing
+### Application preparation
 
-### Chrome Extension
-- One-click "Save to Basket" button injected on LinkedIn, Indeed, and company career pages
-- Sidebar with Resume Preview / Templates / AI Match / PDF / three-way sync with dashboard
-- iframe-compatible form assistance for Workday, Greenhouse, Lever, SmartRecruiters, and Personio
-- Bidirectional login/logout sync with dashboard (JWT bridge)
+- Resume upload and parsing for PDF/DOCX files
+- Base and tailored resume versions with history and restore
+- Per-job resume tailoring and cover-letter generation
+- PDF templates and one-click application-pack downloads
 
-### Gmail Tracking
-- OAuth connection with Gmail read and send scopes
-- Job-related inbox tracking with unread counts and application-status recommendations
-- User-confirmed follow-up drafts and Gmail API health checks
-- OAuth credentials encrypted through the configured application credential-encryption provider
+### Gmail tracking
 
-### Worker & ATS Workflows
-- BullMQ queues for discovery, agent runs, and application tasks
-- Supported ATS flow modules for Workday, Greenhouse, Lever, SmartRecruiters, and Personio
-- CAPTCHA detection, resumable checkpoints, form-pattern replay, rate limiting, and signed web-to-worker control
-- Approval and handoff states for final submission, login, MFA, CAPTCHA, and other candidate-only steps
+- OAuth connection with the Gmail read and send scopes required by the product
+- Job-related inbox tracking, unread counts, and application-status recommendations
+- User-confirmed follow-up drafts
+- Credential encryption through Azure Key Vault in production
 
-### Dashboard
-- Kanban job board with drag-and-drop
-- AI Persona system (auto-classifies user profile, pre-fills application fields)
-- Onboarding flow for new users
-- i18n support (EN baseline + extensible)
-- Real-time SSE event log from the Agent Pipeline
+### Supported ATS workflows
 
-### Secure Admin Console
-- Role- and permission-based access for support, operations, billing, security, platform, and super-admin teams
-- Masked user metadata, safe application diagnostics, ATS source health, queue controls, AI budgets, feature flags, and audit search
-- Contact us support workspace with assignments, SLA status, customer-visible replies, internal notes, and safe context only
-- Broadcast drafts, anonymous audience previews, approval separation, and idempotent delivery through the existing in-app `Notification` records
-- Append-only audit events, CSRF protection, idempotency keys, optimistic versioning, and signed Worker commands for every write
+- Workday
+- Greenhouse
+- Lever
+- SmartRecruiters
+- Personio
 
----
+The system can pause for approval, missing form answers, login, MFA, CAPTCHA,
+or another step that requires the candidate.
 
-## Tech Stack
+## Safety and privacy
 
-| Layer | Technology | Version |
-|-------|-----------|---------|
-| Monorepo | Turborepo + pnpm Workspaces | 2.x / 10.x |
-| Web Dashboard | Next.js App Router | ^15.2 |
-| Chrome Extension | Vite + React (Content Script + Sidebar) | ^6.4 |
-| UI Components | shadcn/ui + Radix UI | latest |
-| Styling | Tailwind CSS | **^4.0** |
-| ORM | Prisma | ^6.8 |
-| Database | PostgreSQL (Neon / Supabase) | 16.x |
-| Auth | NextAuth v5 | ^5.x |
-| Credential encryption | Azure Key Vault (production) | Standard vault + RSA key |
-| AI SDK | Vercel AI SDK | ^4.0 |
-| AI Models | MiniMax, Anthropic, OpenAI, DeepSeek, Qwen, Z.ai, Kimi, custom OpenAI-compatible endpoints | ModelRouter |
-| Rich Text | Tiptap | ^2.10 |
-| PDF | @react-pdf/renderer | ^4.5 |
-| Object Storage | Cloudflare R2 | — |
-| Queue | BullMQ + Redis | ^5.0 |
-| Monitoring | Sentry + PostHog | latest |
-| Drag & Drop | @dnd-kit | — |
-| Testing | Playwright (E2E) | — |
+- Application submission requires explicit approval for the specific job.
+- Candidate-only authentication and challenge steps remain user handoffs.
+- User data and connected accounts are scoped to the owning account.
+- Production OAuth credentials are encrypted with an Azure Key Vault RSA key.
+- Secrets and credential values are never intended for source control or public responses.
 
----
+## Built with
 
-## Project Structure
+| Area | Technology |
+| --- | --- |
+| Web app | Next.js App Router, React, TypeScript |
+| Browser Extension | Vite, React, Chrome Manifest V3 |
+| Data | PostgreSQL, Prisma |
+| Background work | Node.js, BullMQ, Redis |
+| Authentication | Auth.js / NextAuth |
+| AI | ModelRouter with provider and OpenAI-compatible adapters |
+| Deployment | Vercel for the web app, separate deployment for the Worker |
+| Production credential protection | Azure Key Vault |
 
-```
+## Repository layout
+
+```text
 applymate-jobcopilot/
 ├── apps/
-│   ├── web/                  # Next.js Dashboard (port 3000)
-│   │   ├── app/              # App Router pages & API routes
-│   │   ├── components/       # UI components
-│   │   ├── lib/
-│   │   │   ├── agent/        # OrchestratorAgent + pipeline stages
-│   │   │   │   ├── orchestrator.ts   # Main harness (Plan/Dispatch/Evaluate/Fix)
-│   │   │   │   ├── pipeline.ts       # Stage runner + retry loop
-│   │   │   │   └── stages/           # discover / analyze / write / gate / execute / audit / custom
-│   │   │   ├── ai/           # ModelRouter + prompt templates
-│   │   │   └── pdf/          # Resume & cover letter PDF generation
-│   │   └── prisma/           # Schema + migrations
-│   ├── extension/            # Chrome Extension (Vite)
-│   │   ├── src/
-│   │   │   ├── content/      # Content scripts (job capture, form fill)
-│   │   │   ├── sidebar/      # React sidebar app
-│   │   │   └── background/   # Service worker (JWT bridge, message routing)
-│   │   └── vite.config.ts
-│   └── worker/               # BullMQ worker + ATS auto-apply flows
-│       └── src/
-│           ├── flows/        # Workday, Greenhouse, Lever, SmartRecruiters, Personio
-│           └── integration/  # Pipeline and harness tests
+│   ├── web/          # Next.js web app and API routes
+│   ├── extension/    # Chrome Extension
+│   └── worker/       # Queue workers and ATS flows
 ├── packages/
-│   ├── shared/               # Types, Zod schemas, utilities
-│   ├── ui/                   # Shared React components
-│   ├── ai-prompts/           # Versioned prompt templates
-│   └── eslint-config/
-├── docs/                     # API reference, runbooks, architecture docs
-├── e2e/                      # Playwright end-to-end tests
-├── turbo.json
-└── pnpm-workspace.yaml
+│   ├── shared/       # Shared types and utilities
+│   ├── ui/           # Shared UI components
+│   └── ai-prompts/   # Versioned prompt templates
+├── docs/             # Architecture, API, runbooks, and contributor docs
+└── e2e/              # Playwright end-to-end tests
 ```
-
----
 
 ## Documentation
 
-- [API Reference](docs/api-reference.md) — route-by-route request, response, auth, and curl examples.
-- [Auto-Apply Runbook](docs/runbook.md) — production incident response for queues, workers, CAPTCHA, and rate limits.
-- [Scraping & Auto-Apply Design](docs/scraping-autoapply-design.md) — architecture and flow design notes.
-- [Scraping & Auto-Apply Developer Guide](docs/scraping-autoapply-dev-guide.md) — implementation guidance for worker and ATS flows.
-- [Admin Console RBAC Design](docs/admin-console-rbac-design.md) — permissions, data isolation, support, broadcasts, and operational controls.
-- [Admin Console Implementation Plan](docs/admin-console-implementation-plan.md) — delivered controls and deployment release gates.
-- [GitHub Collaboration](docs/github-collaboration.md) — issue, PR, review, and CI workflow.
-- [Docs Index](docs/README.md) — quick map of maintained documentation.
+- [API reference](docs/api-reference.md)
+- [Auto-apply runbook](docs/runbook.md)
+- [Scraping and auto-apply design](docs/scraping-autoapply-design.md)
+- [Scraping and auto-apply developer guide](docs/scraping-autoapply-dev-guide.md)
+- [Documentation index](docs/README.md)
 
----
-
-## Getting Started
+## Getting started
 
 ### Prerequisites
 
-- Node.js ≥ 20
-- pnpm ≥ 9
-- Docker (for local PostgreSQL + Redis)
-- A Neon or Supabase PostgreSQL instance (or local Docker)
+- Node.js 20 or later
+- pnpm 9 or later
+- PostgreSQL and Redis, either locally or through managed services
 
-### 1. Clone & install
+### Install
 
 ```bash
 git clone https://github.com/YuanshuoDu/applymate-jobcopilot.git
@@ -189,128 +141,56 @@ cd applymate-jobcopilot
 pnpm install
 ```
 
-### 2. Configure environment variables
+### Configure the web app
+
+Copy the template and fill in the values needed for your environment:
 
 ```bash
 cp apps/web/.env.example apps/web/.env.local
 ```
 
-Edit `.env.local` — see [Environment Variables](#environment-variables) below.
+At minimum, local development normally needs a PostgreSQL URL, `AUTH_SECRET`,
+Google OAuth credentials, an AI provider configuration, and a Redis URL. Never
+commit `.env.local` or provider credentials.
 
-### 3. Start backing services
-
-```bash
-docker-compose up -d   # PostgreSQL on 5432, Redis on 6379
-```
-
-### 4. Run database migrations
-
-```bash
-pnpm --filter @jobcopilot/web db:push   # prisma db push
-```
-
-### 5. Start the development server
-
-```bash
-pnpm dev   # Starts web (3000) + extension (HMR) in parallel via Turborepo
-```
-
-### 6. Load the extension
-
-1. Build the extension: `pnpm --filter @jobcopilot/extension build`
-2. Open Chrome → `chrome://extensions` → Enable Developer mode
-3. Click "Load unpacked" → select `apps/extension/dist`
-
----
-
-## Environment Variables
+Production OAuth credential persistence requires all of these Azure variables:
 
 ```env
-# Database
-DATABASE_URL=postgresql://user:password@localhost:5432/applymate
-
-# Auth (Auth.js / NextAuth v5)
-AUTH_SECRET=your-secret-here
-NEXTAUTH_URL=http://localhost:3000
-AUTH_GOOGLE_ID=
-AUTH_GOOGLE_SECRET=
-AUTH_GITHUB_ID=
-AUTH_GITHUB_SECRET=
-
-# Production credential encryption (Azure Key Vault)
-# Required for production OAuth credential persistence. Use an RSA key in a
-# Standard Key Vault and grant the application Key Vault Crypto User at vault scope.
 AZURE_KEY_VAULT_URL=
 AZURE_KEY_NAME=applymate-credential-key
 AZURE_TENANT_ID=
 AZURE_CLIENT_ID=
 AZURE_CLIENT_SECRET=
-
-# AI Models
-MINIMAX_API_KEY=             # Platform default model
-ANTHROPIC_API_KEY=
-OPENAI_API_KEY=
-DEEPSEEK_API_KEY=
-QWEN_API_KEY=
-ZHIPU_API_KEY=
-KIMI_API_KEY=
-
-# Job Search APIs
-ADZUNA_APP_ID=
-ADZUNA_APP_KEY=
-
-# Worker and queue control
-REDIS_URL=redis://localhost:6379
-AGENT_WORKER_SECRET=
-WORKER_CONTROL_URL=
-WORKER_CONTROL_SECRET=
-
-# Storage
-CLOUDFLARE_R2_ACCOUNT_ID=
-CLOUDFLARE_R2_ACCESS_KEY_ID=
-CLOUDFLARE_R2_SECRET_ACCESS_KEY=
-CLOUDFLARE_R2_BUCKET=
-
-# Extension security
-EXTENSION_HMAC_SECRET=
-
-# Monitoring (optional)
-NEXT_PUBLIC_SENTRY_DSN=
-NEXT_PUBLIC_POSTHOG_KEY=
 ```
 
-The complete, environment-specific list is maintained in [`apps/web/.env.example`](apps/web/.env.example). Never commit `.env.local` or provider credentials.
+The Azure application must have the appropriate crypto role on the Key Vault.
+`CREDENTIAL_ENCRYPTION_KEY` is a local development/test fallback, not a
+replacement for the production Key Vault configuration.
 
-In production, `AZURE_KEY_VAULT_URL`, `AZURE_KEY_NAME`, `AZURE_TENANT_ID`,
-`AZURE_CLIENT_ID`, and `AZURE_CLIENT_SECRET` must be configured together. The
-application uses the Azure Key Vault key to wrap stored OAuth credentials;
-`CREDENTIAL_ENCRYPTION_KEY` is only a local development/test fallback and must
-not be used as a substitute for production Key Vault configuration.
+### Prepare the database and run the web app
 
----
+```bash
+pnpm --filter @jobcopilot/web db:push
+pnpm dev
+```
+
+### Build the Chrome Extension
+
+```bash
+pnpm --filter @jobcopilot/extension build
+```
+
+Then open `chrome://extensions`, enable Developer mode, choose **Load unpacked**,
+and select `apps/extension/dist`.
 
 ## Deployment
 
-The web dashboard is deployed on **Vercel**. Production is [applymate.site](https://applymate.site); the branch-linked Preview environment is [preview.applymate.site](https://preview.applymate.site).
+The web app is deployed on Vercel at [applymate.site](https://applymate.site),
+with a branch-linked preview at [preview.applymate.site](https://preview.applymate.site).
+The Worker runs separately and consumes the shared queue and control
+configuration described in the environment template.
 
-- A push or merge to `master` creates a Production deployment.
-- The `sync-staging` GitHub Actions workflow mirrors `master` to `staging` after each production-branch push.
-- Vercel tracks `staging`, so `preview.applymate.site` automatically follows the newest Preview deployment without a manual alias command.
-
-```bash
-pnpm build        # Build all apps
-pnpm typecheck    # Type-check all packages
-```
-
-For the Chrome Extension, submit the output of `pnpm --filter @jobcopilot/extension build` to the Chrome Web Store.
-
-The Worker runs separately from the Vercel web deployment and owns BullMQ queues, ATS apply flows, and the signed internal admin control endpoint. Bull Board is not exposed by the production console.
-
----
-
-## Validation
-
-Use these root-level commands before merging changes:
+Useful root-level commands:
 
 ```bash
 pnpm lint
@@ -319,34 +199,20 @@ pnpm test
 pnpm build
 ```
 
-For worker or E2E-heavy changes, also run the targeted commands documented in the relevant PR or issue.
-
-## Security and privacy
-
-The admin console is a separate internal surface under `/admin` and `/api/admin/v1`. Authorization is enforced on the server with explicit permissions; `User.plan` is never an admin role. Admin DTOs use allow-listed metadata only, and audit snapshots exclude secrets and candidate content. Contact us staff may read only messages intentionally submitted to support, while platform broadcasts create standard in-app notifications that remain visible only to the addressed user.
-
----
+For Extension changes, also run the Extension build and its targeted tests. For
+Worker or browser changes, run the targeted integration and Playwright checks
+described in the relevant documentation.
 
 ## Current boundaries and next work
 
-The repository currently includes job discovery, scoring, resume and cover-letter
-tailoring, Gmail tracking, Chrome-assisted form filling, queue-backed Worker
-flows, and the approval/audit surfaces around application work.
-
-The main remaining product work is:
-
-- Broader direct ATS/source coverage and continued quality improvements for job descriptions.
-- A deeper end-to-end handoff between the Chrome Extension and queued Worker workflows.
-- Screenshot/OCR support for forms and job descriptions that cannot be parsed reliably as text.
-- A future full auto-pilot mode only if it preserves per-job approval, account isolation, and required user handoffs.
-
----
+- Broader direct ATS and source coverage
+- Deeper Extension-to-Worker handoff for supported application workflows
+- Screenshot/OCR support for forms and job descriptions that cannot be parsed reliably as text
+- A future full auto-pilot mode only if it preserves approval, account isolation, and required user handoffs
 
 ## Contributing
 
-1. Fork the repository
-2. Create a feature branch: `git checkout -b feat/your-feature`
-3. Commit using [Conventional Commits](https://www.conventionalcommits.org): `feat: add X`, `fix: resolve Y`
-4. Open a pull request
-
-Please run `pnpm lint && pnpm typecheck` before submitting.
+1. Create a feature branch.
+2. Keep changes focused and add tests for new behavior.
+3. Run the relevant validation commands before opening a pull request.
+4. Describe user-facing behavior, security boundaries, and known limitations in the pull request.
