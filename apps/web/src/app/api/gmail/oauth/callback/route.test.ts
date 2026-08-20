@@ -122,7 +122,7 @@ describe('GET /api/gmail/oauth/callback', () => {
   })
 
   it('redirects safely when credential encryption or persistence fails', async () => {
-    mocks.encryptAccountTokenFields.mockRejectedValueOnce(new Error('CREDENTIAL_KMS_KEY_ID is required in production'))
+    mocks.encryptAccountTokenFields.mockRejectedValueOnce(new Error('AZURE_KEY_VAULT_URL and AZURE_KEY_NAME are required in production'))
     const { GET } = await import('./route')
     const response = await GET(new NextRequest(
       `https://applymate.site/api/gmail/oauth/callback?code=c1&state=${encodeURIComponent(await state())}`,
