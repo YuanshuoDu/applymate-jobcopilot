@@ -170,7 +170,7 @@ export function Sidebar({ active, onNav, onNavIntent, session, jobCount: jobCoun
               <div style={{ fontSize: 10, color: 'var(--text-muted)', marginTop: 2, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{user?.email ?? ''}</div>
             </div>
             <AccountMenuItem icon={<UserRound size={14} />} label="Profile & preferences" onClick={() => { onNav('settings'); onDismissSidebarPopovers() }} />
-            <AccountMenuItem icon={<CreditCard size={14} />} label="Plan & billing" badge={planLabel} onClick={() => { onNav('settings'); onDismissSidebarPopovers() }} />
+            <AccountMenuItem icon={<CreditCard size={14} />} label="Plan & billing" badge={planLabel} onClick={() => { window.location.assign('/?page=settings&tab=billing') }} />
             <AccountMenuItem icon={<Settings size={14} />} label={t('nav.settings')} onClick={() => { onNav('settings'); onDismissSidebarPopovers() }} />
             <div style={{ height: 1, background: 'var(--border)', margin: '5px 3px' }} />
             <AccountMenuItem icon={<LogOut size={14} />} label={t('nav.signout')} danger onClick={() => signOut({ callbackUrl: '/login' })} />
