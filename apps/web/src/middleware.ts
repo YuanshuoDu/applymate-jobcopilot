@@ -3,7 +3,7 @@ import type { NextRequest } from 'next/server'
 import { applyAdminSecurityHeaders } from '@/lib/admin/http-security'
 import { adminOrigin, isAdminApiPath, isAdminAuthApiPath, isAdminHost, isAdminPath, isAuthPath, isLocalHost } from '@/lib/host-routing'
 
-const PUBLIC_ROUTES = ['/login', '/register', '/forgot-password', '/reset-password', '/api/auth']
+const PUBLIC_ROUTES = ['/landing', '/login', '/register', '/forgot-password', '/reset-password', '/api/auth']
 const SESSION_COOKIE_NAMES = [
   'authjs.session-token',
   '__Secure-authjs.session-token',

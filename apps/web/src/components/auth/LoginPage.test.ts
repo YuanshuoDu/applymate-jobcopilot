@@ -3,9 +3,16 @@ import { describe, expect, it } from 'vitest'
 
 const loginSource = readFileSync(new URL('./LoginPage.tsx', import.meta.url), 'utf8')
 const registerSource = readFileSync(new URL('./RegisterPage.tsx', import.meta.url), 'utf8')
+const resetPasswordSource = readFileSync(new URL('./ResetPasswordPage.tsx', import.meta.url), 'utf8')
 const globalCss = readFileSync(new URL('../../app/globals.css', import.meta.url), 'utf8')
 
 describe('authentication layout safeguards', () => {
+  it('uses the canonical public Landing route for authentication branding', () => {
+    for (const source of [loginSource, registerSource, resetPasswordSource]) {
+      expect(source).toContain('href="/landing"')
+    }
+  })
+
   it('associates login labels with stable, named form controls', () => {
     expect(loginSource).toMatch(/<label htmlFor="login-email"/)
     expect(loginSource).toMatch(/id="login-email" name="email"/)

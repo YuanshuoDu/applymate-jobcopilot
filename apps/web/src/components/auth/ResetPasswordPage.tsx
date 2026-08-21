@@ -72,7 +72,7 @@ export function ResetPasswordPage() {
   return (
     <main style={{ minHeight: '100vh', display: 'grid', placeItems: 'center', padding: 24, background: 'linear-gradient(135deg, #EEF2FF, #F5F3FF 52%, #F0F9FF)' }}>
       <section style={{ width: '100%', maxWidth: 420, padding: 32, border: `1px solid ${C.border}`, borderRadius: 18, background: 'rgba(255,255,255,0.94)', boxShadow: '0 16px 40px rgba(79,70,229,0.12)' }}>
-        <Link href="/" style={{ display: 'inline-flex', alignItems: 'center', gap: 9, marginBottom: 28, color: C.primary, textDecoration: 'none', fontWeight: 700 }}>
+        <Link href="/landing" style={{ display: 'inline-flex', alignItems: 'center', gap: 9, marginBottom: 28, color: C.primary, textDecoration: 'none', fontWeight: 700 }}>
           <span style={{ display: 'grid', width: 30, height: 30, placeItems: 'center', borderRadius: 8, color: '#fff', background: C.primary }}>A</span>
           ApplyMate AI
         </Link>
