@@ -56,6 +56,15 @@ describe('web middleware entrypoint', () => {
     expect(response.headers.get('location')).toContain('/login?callbackUrl=%2Fdashboard')
   })
 
+  it('keeps the canonical Landing route public even with an active session', async () => {
+    const request = new NextRequest('https://applymate.site/landing')
+    request.cookies.set('authjs.session-token', 'present')
+
+    const response = await middleware(request)
+
+    expect(response.status).toBe(200)
+  })
+
   it('keeps the local Agent preview accessible without a session', async () => {
     const response = await middleware(new NextRequest('http://localhost/agent-preview'))
 

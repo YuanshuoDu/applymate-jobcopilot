@@ -196,7 +196,7 @@ export function LoginPage({ switchAccount = false, adminLogin = false }: { switc
         position: 'relative', zIndex: 1,
       }}>
         {/* Logo — clickable */}
-        <Link href="/" style={{ display:'flex', alignItems:'center', gap:12, marginBottom:52, textDecoration:'none' }}>
+        <Link href="/landing" style={{ display:'flex', alignItems:'center', gap:12, marginBottom:52, textDecoration:'none' }}>
           <div style={{
             width:38, height:38, borderRadius:11,
             background:'linear-gradient(135deg, #4F46E5 0%, #7C3AED 100%)',
