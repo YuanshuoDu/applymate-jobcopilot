@@ -1,4 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server'
+import type { SupportCaseMessage } from '@prisma/client'
 import { isAdminResponse, requireAdmin } from '@/lib/admin/authorization'
 import { AdminMutationConflict, runAdminMutation } from '@/lib/admin/write-transaction'
 import { validateAdminWrite } from '@/lib/admin/csrf'
@@ -20,8 +21,9 @@ export async function POST(request: NextRequest, context: { params: Promise<{ id
   const scope = supportCaseScope(actor)
   const supportCase = await db.supportCase.findFirst({ where: { id, ...scope }, select: { requesterUserId: true } })
   if (!supportCase) return NextResponse.json({ error: 'Not found' }, { status: 404 })
+  const tenantUserId = supportCase.requesterUserId ?? undefined
   try {
-    const result = await runAdminMutation({ actorUserId: actor.userId, action: 'support.internal_note_added', idempotencyKey, targetId: id, audit: { requestId: actor.requestId, actorRoleKey: actor.roleKey, targetType: 'support_case', targetId: id, tenantUserId: supportCase.requesterUserId, reason, outcome: 'success' }, mutate: async (tx) => {
+    const result = await runAdminMutation<SupportCaseMessage>({ actorUserId: actor.userId, action: 'support.internal_note_added', idempotencyKey, targetId: id, audit: { requestId: actor.requestId, actorRoleKey: actor.roleKey, targetType: 'support_case', targetId: id, tenantUserId, reason, outcome: 'success' }, mutate: async (tx) => {
       const claimed = await tx.supportCase.updateMany({ where: { id, ...scope }, data: { version: { increment: 1 } } })
       if (!claimed.count) throw new AdminMutationConflict('Case changed or access is no longer available')
       return tx.supportCaseMessage.create({ data: { caseId: id, authorType: 'internal_note', authorUserId: actor.userId, idempotencyKey, body: note.body, redacted: note.redacted } })
