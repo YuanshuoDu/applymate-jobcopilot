@@ -37,6 +37,7 @@ describe('admin integration status', () => {
     process.env.DATABASE_URL = 'postgres://user:password@example.test/db'
     process.env.WORKER_CONTROL_URL = 'https://worker.internal'
     process.env.WORKER_CONTROL_SECRET = 'worker-secret'
+    process.env.CLEANJOBDATA_API_KEY = 'cleanjobdata-secret'
     const status = platformIntegrationStatus()
 
     expect(status.ai.providers.minimax).toBe(true)
@@ -44,8 +45,10 @@ describe('admin integration status', () => {
     expect(status.infrastructure.workerControl).toBe(true)
     expect(status.infrastructure.workerControlUrl).toBe(true)
     expect(status.infrastructure.workerControlSecret).toBe(true)
+    expect(status.discovery.cleanjobdata).toBe(true)
     expect(JSON.stringify(status)).not.toContain('password')
     expect(JSON.stringify(status)).not.toContain('worker-secret')
+    expect(JSON.stringify(status)).not.toContain('cleanjobdata-secret')
   })
 
   it('does not report a standard Google sign-in as a Gmail connection', () => {

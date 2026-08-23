@@ -16,6 +16,7 @@ describe('getDiscoveryApiKeys', () => {
     process.env.ADZUNA_APP_ID = 'platform-id'
     process.env.ADZUNA_APP_KEY = 'platform-key'
     process.env.RAPIDAPI_KEY = 'platform-rapid'
+    process.env.CLEANJOBDATA_API_KEY = 'platform-clean'
   })
 
   it('prefers a user’s saved keys to platform fallbacks', async () => {
@@ -23,6 +24,7 @@ describe('getDiscoveryApiKeys', () => {
 
     await expect(getDiscoveryApiKeys('user_1')).resolves.toEqual({
       adzunaAppId: 'user-id', adzunaAppKey: 'user-key', rapidapiKey: 'user-rapid',
+      cleanJobDataApiKey: 'platform-clean',
     })
   })
 
@@ -31,6 +33,7 @@ describe('getDiscoveryApiKeys', () => {
 
     await expect(getDiscoveryApiKeys('user_1')).resolves.toEqual({
       adzunaAppId: 'platform-id', adzunaAppKey: 'platform-key', rapidapiKey: 'platform-rapid',
+      cleanJobDataApiKey: 'platform-clean',
     })
   })
 
@@ -39,6 +42,7 @@ describe('getDiscoveryApiKeys', () => {
 
     await expect(getDiscoveryApiKeys('user_1')).resolves.toEqual({
       adzunaAppId: 'user-id', adzunaAppKey: '', rapidapiKey: 'platform-rapid',
+      cleanJobDataApiKey: 'platform-clean',
     })
   })
 

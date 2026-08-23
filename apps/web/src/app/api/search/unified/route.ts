@@ -20,6 +20,7 @@ import { pinnedFetch } from '@jobcopilot/shared'
 import { requireAuth, isErrorResponse, ok, err } from '@/lib/api-helpers'
 import { truncate, fmtSalary } from '@/lib/utils'
 import { getDiscoveryApiKeys } from '@/lib/discovery-api-keys'
+import { fetchCleanJobData } from '@/lib/agent/sources/cleanjobdata'
 import { cleanSearchTitle, postFilter, queryKeywords, scoreSearchJobs, smartDedup, type SearchFilters, type SearchJob } from './search-quality'
 
 // ── Infrastructure ────────────────────────────────────────────────────────────
@@ -36,7 +37,7 @@ const _cache = new Map<string, { data: object; exp: number }>()
 
 function buildCacheKey(q: string, f: SearchFilters): string {
   const discoveryReady = f.discovery
-    ? `${Boolean(f.discovery.adzunaAppId && f.discovery.adzunaAppKey)}:${Boolean(f.discovery.rapidapiKey)}`
+    ? `${Boolean(f.discovery.adzunaAppId && f.discovery.adzunaAppKey)}:${Boolean(f.discovery.rapidapiKey)}:${Boolean(f.discovery.cleanJobDataApiKey)}`
     : 'unknown'
   return [q, f.location, f.remote, f.jobType, f.datePosted,
           f.experience, f.salaryMin ?? '', f.salaryMax ?? '', discoveryReady].join('|')
@@ -228,10 +229,31 @@ function smartRouter(q: string, f: SearchFilters, qa?: QueryAnalysis): RouterDec
   const hasCareerjet = !!process.env.CAREERJET_AFFID
   const hasReed      = !!process.env.REED_API_KEY
   const hasMantiks   = !!process.env.MANTIKS_API_KEY
+  const hasCleanJobData = !!f.discovery?.cleanJobDataApiKey
 
   const loc   = f.location || ''
   const title = cleanSearchTitle(q)
+  const companyQueryName = qa?.isCompanyQuery
+    ? q.replace(/\b(jobs at|hiring at|careers at|openings at)\b/gi, '').trim()
+    : undefined
   const sources: SourceCall[] = []
+
+  const cleanJobDataParams = (companyName?: string): Record<string, string> => ({
+    q: companyName ? '' : title || q,
+    ...(country ? { country } : {}),
+    ...(companyName ? { companyName } : {}),
+    ...(isRem ? { remote: 'true' } : {}),
+    ...(f.datePosted && f.datePosted !== 'any' ? { datePosted: f.datePosted } : {}),
+    ...(f.experience ? { experience: f.experience } : {}),
+    ...(f.jobType ? { jobType: f.jobType } : {}),
+    ...(f.salaryMin ? { salaryMin: String(f.salaryMin) } : {}),
+    ...(f.salaryMax ? { salaryMax: String(f.salaryMax) } : {}),
+  })
+  const addCleanJobData = (companyName?: string) => {
+    if (hasCleanJobData && !sources.some(source => source.id === 'cleanjobdata')) {
+      sources.push({ id: 'cleanjobdata', params: cleanJobDataParams(companyName) })
+    }
+  }
 
   // Shared params builder — only include non-empty filter values
   const baseParams = (locationFilter: string): Record<string, string> => {
@@ -254,9 +276,10 @@ function smartRouter(q: string, f: SearchFilters, qa?: QueryAnalysis): RouterDec
     // Pair with ATS for career-site intern roles not covered by Internships API
     if (sources.length < 3)
       sources.push({ id: 'ats', params: baseParams(loc || (isUS ? 'United States' : '')) })
+    addCleanJobData()
     return {
       reasoning: `Internship Search → ${sources.map(s => s.id).join(' + ')}`,
-      sources: sources.slice(0, 3),
+      sources: sources.slice(0, hasCleanJobData ? 4 : 3),
     }
   }
 
@@ -288,11 +311,12 @@ function smartRouter(q: string, f: SearchFilters, qa?: QueryAnalysis): RouterDec
 
   // Company query (e.g. "jobs at stripe") → Mantiks company endpoint takes priority
   if (qa?.isCompanyQuery && hasMantiks) {
-    const companyName = q.replace(/\b(jobs at|hiring at|careers at|openings at)\b/gi, '').trim()
+    const companyName = companyQueryName ?? ''
     sources.push({ id: 'mantiks', params: { q: companyName, datePosted: f.datePosted || 'month' } })
     sources.push({ id: 'linkedin', params: baseParams(loc || 'Worldwide') })
     sources.push({ id: 'ats', params: baseParams(loc || 'Worldwide') })
-    return { reasoning: `Company search → mantiks + linkedin + ats`, sources }
+    addCleanJobData(companyName)
+    return { reasoning: `Company search → ${sources.map(source => source.id).join(' + ')}`, sources }
   }
 
   // Remote: Jobicy (geo-filtered) + Remotive (tech-focused) + ATS
@@ -394,6 +418,7 @@ function smartRouter(q: string, f: SearchFilters, qa?: QueryAnalysis): RouterDec
 
   // Guarantee minimum 2 sources
   if (sources.length < 2) sources.push({ id: 'ats', params: baseParams(loc) })
+  addCleanJobData(companyQueryName)
 
   const names     = sources.map(s => s.id).join(' + ')
   const reasoning = isRem        ? `remote → ${names}`
@@ -402,11 +427,47 @@ function smartRouter(q: string, f: SearchFilters, qa?: QueryAnalysis): RouterDec
                   : `worldwide/USA → ${names}`
 
   // Ireland gets up to 5 sources; others get 4
-  const limit = country === 'ie' ? 5 : 4
+  const limit = (country === 'ie' ? 5 : 4) + (hasCleanJobData ? 1 : 0)
   return { reasoning, sources: sources.slice(0, limit) }
 }
 
 // ── Source fetchers ───────────────────────────────────────────────────────────
+
+async function fetchCleanJobDataSource(p: Record<string, string>, filters: SearchFilters): Promise<JobResult[]> {
+  const apiKey = filters.discovery?.cleanJobDataApiKey ?? ''
+  if (!apiKey) return []
+  const jobs = await fetchCleanJobData({
+    apiKey,
+    title: p.q ?? '',
+    countryCode: p.country,
+    companyName: p.companyName,
+    remote: p.remote === 'true' || filters.remote,
+    datePosted: p.datePosted || filters.datePosted,
+    experience: p.experience || filters.experience,
+    jobType: p.jobType || filters.jobType,
+    salaryMin: p.salaryMin ? Number(p.salaryMin) : filters.salaryMin,
+    salaryMax: p.salaryMax ? Number(p.salaryMax) : filters.salaryMax,
+    maxPages: 1,
+    maxResults: 20,
+  })
+  return jobs.map(job => ({
+    id: job.externalId,
+    title: job.title,
+    company: job.company,
+    location: job.location,
+    salary: job.salary ?? undefined,
+    description: truncate(job.description),
+    url: job.url,
+    postedAt: job.postedAt,
+    jobType: job.jobType,
+    logo: job.logo,
+    experienceLevel: job.experienceLevel,
+    workArrangement: job.workArrangement,
+    directApply: job.directApply,
+    source: 'cleanjobdata' as const,
+    score: 0,
+  }))
+}
 
 
 async function fetchAdzuna(p: Record<string, string>, filters: SearchFilters): Promise<JobResult[]> {
@@ -1386,6 +1447,7 @@ const FETCHERS: Record<string, (p: Record<string, string>, f: SearchFilters) => 
   reed:          fetchReed,
   mantiks:       fetchMantiks,
   irishjobs:     fetchIrishjobs,
+  cleanjobdata:  fetchCleanJobDataSource,
 }
 
 export async function GET(req: NextRequest) {
@@ -1510,6 +1572,7 @@ export async function GET(req: NextRequest) {
       adzuna:    hasAdzunaKey,
       reed:      !!(process.env.REED_API_KEY),
       careerjet: !!(process.env.CAREERJET_AFFID),
+      cleanjobdata: !!discovery.cleanJobDataApiKey,
     },
   }
 

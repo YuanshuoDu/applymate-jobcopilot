@@ -33,7 +33,7 @@ describe('ObservabilityPage', () => {
           deletionRequests: { requested: 0, processing: 0 },
           integrations: {
             ai: { providers: { minimax: false, openai: true } },
-            discovery: { adzuna: false, rapidapi: false },
+            discovery: { adzuna: false, rapidapi: false, cleanjobdata: true },
             oauth: { google: false, github: false },
             messaging: { resend: false },
             infrastructure: { database: true, redis: false },
@@ -61,6 +61,7 @@ describe('ObservabilityPage', () => {
     expect(html).toContain('Settings migrations: Unavailable')
     expect(html).toContain('Database readiness checks are unavailable.')
     expect(html).toContain('Worker controls need: URL and shared secret')
+    expect(html).toContain('CleanJobData · ready')
     expect(mocks.links).toContain('/admin/users')
   })
 })

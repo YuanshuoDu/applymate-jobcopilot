@@ -1,5 +1,5 @@
 ﻿/**
- * Rate-limit policy registry for ATS discovery sources.
+ * Rate-limit policy registry for ATS and normalized discovery sources.
  *
  * Every ATS source must have an entry here. CI rejects PRs adding
  * a source without a corresponding policy entry.
@@ -14,11 +14,19 @@ export interface RatePolicy {
   rps:  number        // requests per second ceiling
 }
 
-/** Per-ATS rate limits — hard ceiling regardless of user count. */
-export const POLICIES: Record<string, RatePolicy> = ATS_POLICIES
+/** Non-ATS discovery providers remain separate from automatic-apply policy. */
+export const DISCOVERY_POLICIES: Record<string, RatePolicy> = {
+  cleanjobdata: { host: 'api.cleanjobdata.com', rps: 1 },
+}
+
+/** Per-source rate limits — hard ceiling regardless of user count. */
+export const POLICIES: Record<string, RatePolicy> = {
+  ...ATS_POLICIES,
+  ...DISCOVERY_POLICIES,
+}
 
 /**
- * Acquire a rate-limit slot before calling an ATS endpoint.
+ * Acquire a rate-limit slot before calling a discovery endpoint.
  * Blocks until a slot is available. Enforces RPS ceiling per host.
  */
 export async function acquire(opts: { ats: string; host?: string; rps?: number }): Promise<void> {

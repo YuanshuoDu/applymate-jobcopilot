@@ -18,7 +18,7 @@ import { EXPECTED_MIGRATIONS, getDeploymentReadiness } from './deployment-readin
 function integrations(overrides: Partial<PlatformIntegrationStatus['infrastructure']> = {}): PlatformIntegrationStatus {
   return {
     ai: { providers: {} as PlatformIntegrationStatus['ai']['providers'] },
-    discovery: { adzuna: false, rapidapi: false },
+    discovery: { adzuna: false, rapidapi: false, cleanjobdata: false },
     oauth: { google: false, github: false },
     messaging: { resend: false },
     infrastructure: {

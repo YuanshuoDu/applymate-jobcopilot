@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { acquire } from './policies'
+import { ATS_POLICIES } from '@jobcopilot/shared'
+import { acquire, DISCOVERY_POLICIES, POLICIES } from './policies'
 
 describe('ATS pace policies', () => {
   afterEach(() => vi.useRealTimers())
@@ -13,5 +14,11 @@ describe('ATS pace policies', () => {
     expect(timeout).toHaveBeenCalledWith(expect.any(Function), 1_000)
     await vi.advanceTimersByTimeAsync(1_000)
     await pending
+  })
+
+  it('registers CleanJobData as a discovery provider with an explicit host ceiling', () => {
+    expect(DISCOVERY_POLICIES.cleanjobdata).toEqual({ host: 'api.cleanjobdata.com', rps: 1 })
+    expect(POLICIES.cleanjobdata).toEqual(DISCOVERY_POLICIES.cleanjobdata)
+    expect(ATS_POLICIES).not.toHaveProperty('cleanjobdata')
   })
 })

@@ -5,6 +5,7 @@
  *   pnpm --filter web exec tsx scripts/scout-one.ts greenhouse booking
  *   pnpm --filter web exec tsx scripts/scout-one.ts lever spotify
  *   pnpm --filter web exec tsx scripts/scout-one.ts smartrecruiters SmartRecruiters
+ *   pnpm --filter web exec tsx scripts/scout-one.ts cleanjobdata "software engineer" IE
  *
  * Registry mode (batch all employers in the registry):
  *   pnpm --filter web exec tsx scripts/scout-one.ts --registry greenhouse
@@ -19,6 +20,7 @@ import { fetchWorkday } from "../src/lib/agent/sources/workday"
 import { fetchLever } from "../src/lib/agent/sources/lever"
 import { fetchSmartRecruiters } from "../src/lib/agent/sources/smartrecruiters"
 import { fetchPersonio } from "../src/lib/agent/sources/personio"
+import { fetchCleanJobData } from "../src/lib/agent/sources/cleanjobdata"
 import { loadRegistry, loadWorkdayRegistry, type Employer, type WorkdayEmployer } from "../src/lib/agent/registries"
 
 type Ats = "greenhouse" | "lever" | "workday" | "smartrecruiters" | "personio"
@@ -40,14 +42,23 @@ async function main() {
   // Single slug mode: <ats> <slug>
   if (args.length < 2) {
     console.error("Usage: pnpm --filter web exec tsx scripts/scout-one.ts <ats> <slug>")
+    console.error("       pnpm --filter web exec tsx scripts/scout-one.ts cleanjobdata <query> [ISO-country-code]")
     console.error("       pnpm --filter web exec tsx scripts/scout-one.ts --registry <greenhouse|lever|workday|smartrecruiters|personio>")
     process.exit(1)
   }
 
-  const [ats, slug] = args
+  const [ats, slug, countryCode] = args
 
   let jobs
-  if (ats === "greenhouse") {
+  if (ats === "cleanjobdata") {
+    const apiKey = process.env.CLEANJOBDATA_API_KEY?.trim() ?? ""
+    if (!apiKey) {
+      console.error("CLEANJOBDATA_API_KEY is required for the CleanJobData smoke test.")
+      process.exit(1)
+    }
+    console.log(`Scouting cleanjobdata / ${slug}${countryCode ? ` (${countryCode.toUpperCase()})` : ""} ...`)
+    jobs = await fetchCleanJobData({ apiKey, title: slug, countryCode, maxPages: 1, maxResults: 20 })
+  } else if (ats === "greenhouse") {
     console.log(`Scouting greenhouse / ${slug} ...`)
     jobs = await fetchGreenhouse([slug])
   } else if (ats === "lever") {
@@ -69,7 +80,7 @@ async function main() {
     console.log(`Scouting workday / ${employer.name} (${employer.tenant}) ...`)
     jobs = await fetchWorkday([employer])
   } else {
-    console.error(`Unknown ATS: ${ats}. Supported: greenhouse, lever, workday, smartrecruiters, personio`)
+    console.error(`Unknown source: ${ats}. Supported: cleanjobdata, greenhouse, lever, workday, smartrecruiters, personio`)
     process.exit(1)
   }
 

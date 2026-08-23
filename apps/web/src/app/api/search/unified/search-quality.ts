@@ -1,4 +1,5 @@
 import { resolveLocation } from '@/lib/agent/location-resolver'
+import type { DiscoveryApiKeys } from '@/lib/discovery-api-keys'
 
 export interface SearchJob {
   id: string
@@ -17,7 +18,7 @@ export interface SearchJob {
   workArrangement?: string | null
   experienceLevel?: string | null
   hiringManager?: { name: string; title: string; linkedinUrl: string; email: string | null; phone: string | null } | null
-  source: 'adzuna' | 'jsearch' | 'linkedin' | 'jobicy' | 'ats' | 'internships' | 'irishjobs' | 'xing' | 'indeed' | 'remotive' | 'bundesagentur' | 'reed' | 'careerjet' | 'mantiks'
+  source: 'adzuna' | 'jsearch' | 'linkedin' | 'jobicy' | 'ats' | 'internships' | 'irishjobs' | 'xing' | 'indeed' | 'remotive' | 'bundesagentur' | 'reed' | 'careerjet' | 'mantiks' | 'cleanjobdata'
   score: number
 }
 
@@ -30,14 +31,10 @@ export interface SearchFilters {
   salaryMin?: number
   salaryMax?: number
   /** Request-scoped credentials resolved by /lib/discovery-api-keys. */
-  discovery?: {
-    adzunaAppId: string
-    adzunaAppKey: string
-    rapidapiKey: string
-  }
+  discovery?: DiscoveryApiKeys
 }
 
-const REMOTE_VERIFIED_SOURCES = new Set<string>(['jobicy', 'remotive', 'ats', 'internships'])
+const REMOTE_VERIFIED_SOURCES = new Set<string>(['jobicy', 'remotive', 'ats', 'internships', 'cleanjobdata'])
 const STRIP_TITLE = /\b(remote|hybrid|onsite|contract|temp|interim)\b/gi
 const SHORT_ROLE_TERMS = new Set(['ai', 'ml', 'ui', 'ux', 'qa', 'pm', 'hr', 'go', 'c#'])
 
@@ -139,7 +136,8 @@ function parseSalaryNum(salary?: string): { min: number; max: number } | null {
   if (!salary) return null
   const numbers = salary.match(/\d[\d,.]*/g)?.map(value => Number.parseFloat(value.replace(/,/g, ''))) ?? []
   if (numbers.length === 0) return null
-  const scaled = numbers.map(value => value < 1000 ? value * 1000 : value)
+  const isHourly = /(?:\/\s*(?:h|hr|hour)|per\s+hour|hourly)/i.test(salary)
+  const scaled = numbers.map(value => isHourly ? value * 2_080 : value < 1000 ? value * 1000 : value)
   return { min: scaled[0], max: scaled[1] ?? scaled[0] }
 }
 
