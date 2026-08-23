@@ -39,7 +39,7 @@ export async function GET(request: NextRequest) {
     },
   })
   await writeAdminAudit({ requestId: actor.requestId, actorUserId: actor.userId, actorRoleKey: actor.roleKey, action: 'support.case_list_viewed', outcome: 'success' })
-  return NextResponse.json({ cases: cases.map((supportCase) => ({ ...supportCase, requester: toAdminUserMetadata(supportCase.requester) })) }, { headers: { 'Cache-Control': 'no-store' } })
+  return NextResponse.json({ cases: cases.map((supportCase) => ({ ...supportCase, requester: toAdminUserMetadata(supportCase.requester!) })) }, { headers: { 'Cache-Control': 'no-store' } })
 }
 
 type AdminCaseRow = { id: string; subject: string; category: string; status: string; priority: string; assignedAdminId: string | null; slaDueAt: Date | null; firstRespondedAt: Date | null; resolvedAt: Date | null; safeContext: unknown; createdAt: Date; updatedAt: Date; requester: { id: string; email: string; name: string | null; plan: string; accountStatus: string; location: string | null; _count: { jobs: number; applicationTasks: number; resumes: number } }; messages: Array<{ id: string; authorType: string; authorUserId: string | null; body: string; redacted: boolean; createdAt: Date }> }

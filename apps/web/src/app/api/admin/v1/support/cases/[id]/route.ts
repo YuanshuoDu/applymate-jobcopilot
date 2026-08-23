@@ -21,6 +21,7 @@ export async function PATCH(request: NextRequest, context: { params: Promise<{ i
   const scope = supportCaseScope(actor)
   const supportCase = await db.supportCase.findFirst({ where: { id, ...scope }, select: { requesterUserId: true } })
   if (!supportCase) return NextResponse.json({ error: 'Not found' }, { status: 404 })
+  const tenantUserId = supportCase.requesterUserId ?? undefined
   if (input.assignedAdminId) {
     const assignee = await db.adminMembership.findUnique({ where: { userId: input.assignedAdminId }, select: { status: true, role: { select: { key: true } } } })
     if (assignee?.status !== AdminMembershipStatus.active || assignee.role.key !== 'support') return NextResponse.json({ error: 'Assignee must be an active support member' }, { status: 400 })
@@ -32,7 +33,7 @@ export async function PATCH(request: NextRequest, context: { params: Promise<{ i
       action,
       idempotencyKey: key,
       targetId: id,
-      audit: { requestId: actor.requestId, actorRoleKey: actor.roleKey, targetType: 'support_case', targetId: id, tenantUserId: supportCase.requesterUserId, reason, after: { version: input.version + 1 }, outcome: 'success' },
+      audit: { requestId: actor.requestId, actorRoleKey: actor.roleKey, targetType: 'support_case', targetId: id, tenantUserId, reason, after: { version: input.version + 1 }, outcome: 'success' },
       mutate: async (tx) => {
         const update = await tx.supportCase.updateMany({
           where: { id, version: input.version, ...scope },

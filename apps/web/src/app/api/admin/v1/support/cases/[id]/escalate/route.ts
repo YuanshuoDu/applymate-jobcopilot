@@ -5,6 +5,8 @@ import { runAdminMutation } from '@/lib/admin/write-transaction'
 import { supportCaseScope } from '@/lib/admin/support-case'
 import { db } from '@/lib/db'
 
+type EscalationMutation = { incident: { id: string }; escalation: { id: string } }
+
 export async function POST(request: NextRequest, context: { params: Promise<{ id: string }> }) {
   const actor = await requireAdmin('support_cases.escalate', request)
   if (isAdminResponse(actor)) return actor
@@ -18,12 +20,13 @@ export async function POST(request: NextRequest, context: { params: Promise<{ id
   if (!service || !key || reason.length < 10 || reason.length > 500) return NextResponse.json({ error: 'service, reason and Idempotency-Key are required' }, { status: 400 })
   const supportCase = await db.supportCase.findFirst({ where: { id, ...supportCaseScope(actor) }, select: { id: true, requesterUserId: true, category: true, priority: true } })
   if (!supportCase) return NextResponse.json({ error: 'Not found' }, { status: 404 })
-  const result = await runAdminMutation({
+  const tenantUserId = supportCase.requesterUserId ?? undefined
+  const result = await runAdminMutation<EscalationMutation>({
     actorUserId: actor.userId,
     action: 'support.case_escalated',
     idempotencyKey: key,
     targetId: id,
-    audit: { requestId: actor.requestId, actorRoleKey: actor.roleKey, targetType: 'support_case', targetId: id, tenantUserId: supportCase.requesterUserId, reason, outcome: 'success', after: { service, category: supportCase.category, priority: supportCase.priority } },
+    audit: { requestId: actor.requestId, actorRoleKey: actor.roleKey, targetType: 'support_case', targetId: id, tenantUserId, reason, outcome: 'success', after: { service, category: supportCase.category, priority: supportCase.priority } },
     mutate: async (tx) => {
     const incident = await tx.adminIncident.create({ data: { title: `Support escalation ${id.slice(-8)}`, summary: `Escalated ${supportCase.category} case for ${service}. Priority: ${supportCase.priority}.`, service, severity: supportCase.priority === 'urgent' ? 'high' : 'medium', createdById: actor.userId, updatedById: actor.userId } })
     const escalation = await tx.supportCaseEscalation.create({ data: { caseId: id, incidentId: incident.id, service, reason, createdById: actor.userId } })

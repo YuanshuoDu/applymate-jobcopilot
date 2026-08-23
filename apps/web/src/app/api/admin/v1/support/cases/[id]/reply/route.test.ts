@@ -7,10 +7,12 @@ const mocks = vi.hoisted(() => {
     txFindScopedCase: vi.fn(), claimCase: vi.fn(), createMessage: vi.fn(), updateCase: vi.fn(), createNotification: vi.fn(), AdminMutationConflict,
   }
 })
+const pinnedFetch = vi.hoisted(() => vi.fn())
 
 vi.mock('@/lib/admin/authorization', () => ({ requireAdmin: mocks.requireAdmin, isAdminResponse: (value: unknown) => value instanceof Response }))
 vi.mock('@/lib/admin/csrf', () => ({ validateAdminWrite: mocks.validate }))
 vi.mock('@/lib/admin/write-transaction', () => ({ AdminMutationConflict: mocks.AdminMutationConflict, runAdminMutation: mocks.runMutation }))
+vi.mock('@jobcopilot/shared', () => ({ pinnedFetch }))
 vi.mock('@/lib/contact-us', () => ({ parseReply: () => ({ body: 'Reply body', redacted: false }) }))
 vi.mock('@/lib/db', () => ({ db: { supportCase: { findUnique: mocks.findUnique, findFirst: mocks.findScopedCase } } }))
 
