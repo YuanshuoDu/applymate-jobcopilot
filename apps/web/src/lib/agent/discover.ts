@@ -18,6 +18,7 @@ import { getDiscoveryApiKeys } from '@/lib/discovery-api-keys'
 import { isRuntimeFeatureEnabled } from '@/lib/runtime-feature-flags'
 import { dedupJobs } from './dedup'
 import { resolveLocation } from './location-resolver'
+import { fetchCleanJobData } from './sources/cleanjobdata'
 
 export interface DiscoveredJob {
   title:       string
@@ -353,11 +354,13 @@ export async function discoverJobs(params: DiscoverParams): Promise<DiscoveredJo
         rapidapiKey: process.env.RAPIDAPI_KEY?.trim() ?? '',
         adzunaAppId: process.env.ADZUNA_APP_ID?.trim() ?? '',
         adzunaAppKey: process.env.ADZUNA_APP_KEY?.trim() ?? '',
+        cleanJobDataApiKey: process.env.CLEANJOBDATA_API_KEY?.trim() ?? '',
       }
 
   const apiKey    = keys.rapidapiKey
   const adzunaId  = keys.adzunaAppId
   const adzunaKey = keys.adzunaAppKey
+  const cleanJobDataKey = keys.cleanJobDataApiKey
 
   const seen    = new Set(existingUrls)
   const results: DiscoveredJob[] = []
@@ -429,6 +432,18 @@ export async function discoverJobs(params: DiscoverParams): Promise<DiscoveredJo
       // searches. It must not pollute a London/Berlin request with Irish jobs.
       if (!apiKey && !hasAdzuna && (isIreland || !loc)) {
         fetchTasks.push(fetchIrishJobsRss(role, loc || 'ireland'))
+      }
+
+      // CleanJobData is a normalized supplementary feed, not an ATS. Keep it
+      // additive and let the existing location filter/dedup pipeline arbitrate.
+      if (cleanJobDataKey) {
+        fetchTasks.push(fetchCleanJobData({
+          apiKey: cleanJobDataKey,
+          title: role,
+          countryCode: country ?? undefined,
+          maxPages: 1,
+          maxResults: Math.min(20, maxResults - results.length),
+        }))
       }
 
       const allResults = await Promise.all(fetchTasks)

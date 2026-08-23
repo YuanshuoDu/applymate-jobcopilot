@@ -5,6 +5,7 @@ export type DiscoveryApiKeys = {
   adzunaAppId: string
   adzunaAppKey: string
   rapidapiKey: string
+  cleanJobDataApiKey: string
 }
 
 /** Shared user-facing guidance for discovery providers with missing credentials. */
@@ -56,8 +57,9 @@ function resolveKeys(saved: DiscoverySavedKeys): DiscoveryApiKeys {
   const adzunaAppId = hasUserAdzuna ? userId : clean(process.env.ADZUNA_APP_ID)
   const adzunaAppKey = hasUserAdzuna ? userKey : clean(process.env.ADZUNA_APP_KEY)
   const rapidapiKey = clean(saved?.rapidapiKey) || clean(process.env.RAPIDAPI_KEY)
+  const cleanJobDataApiKey = clean(process.env.CLEANJOBDATA_API_KEY)
 
-  return { adzunaAppId, adzunaAppKey, rapidapiKey }
+  return { adzunaAppId, adzunaAppKey, rapidapiKey, cleanJobDataApiKey }
 }
 
 /** Prefer a user's saved discovery credentials, with platform credentials as fallback. */

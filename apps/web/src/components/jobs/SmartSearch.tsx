@@ -27,7 +27,7 @@ interface SearchMeta {
   totalRaw: number; totalDeduped: number; totalFiltered?: number; durationMs: number
   topSkills?: string[]; salaryContext?: { currency: string; median: number; min: number; max: number } | null
   withHiringManager?: number; cached?: boolean
-  apiKeys?: { rapidapi: boolean; adzuna: boolean; reed: boolean; careerjet: boolean }
+  apiKeys?: { rapidapi: boolean; adzuna: boolean; reed: boolean; careerjet: boolean; cleanjobdata: boolean }
 }
 
 const DEFAULT_FILTERS: Filters = {
@@ -65,6 +65,7 @@ const Icon = {
 
 const SOURCE_STYLE: Record<string, { label: string; color: string; bg: string }> = {
   adzuna:        { label: 'Adzuna',         color: '#D97706', bg: 'rgba(217,119,6,0.10)'      },
+  cleanjobdata:  { label: 'CleanJobData',   color: '#0F766E', bg: 'rgba(15,118,110,0.10)'     },
   jsearch:       { label: 'JSearch',        color: '#6366F1', bg: 'rgba(99,102,241,0.10)'     },
   linkedin:      { label: 'LinkedIn',       color: '#0077B5', bg: 'rgba(0,119,181,0.10)'      },
   jobicy:        { label: 'Jobicy',         color: '#059669', bg: 'rgba(5,150,105,0.10)'      },

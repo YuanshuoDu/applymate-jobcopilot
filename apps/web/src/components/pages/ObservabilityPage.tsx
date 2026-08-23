@@ -173,6 +173,7 @@ export function ObservabilityPage() {
               ['ApplyMate AI · MiniMax', platform?.integrations.ai.providers.minimax ?? false],
               ['Adzuna', platform?.integrations.discovery.adzuna ?? false],
               ['RapidAPI', platform?.integrations.discovery.rapidapi ?? false],
+              ['CleanJobData', platform?.integrations.discovery.cleanjobdata ?? false],
               ['Google OAuth', platform?.integrations.oauth.google ?? false],
               ['GitHub OAuth', platform?.integrations.oauth.github ?? false],
               ['Resend', platform?.integrations.messaging.resend ?? false],

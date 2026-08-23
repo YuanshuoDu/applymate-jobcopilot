@@ -54,7 +54,7 @@ describe('SmartSearch', () => {
       totalRaw: 0,
       totalDeduped: 0,
       durationMs: 3,
-      apiKeys: { rapidapi: false, adzuna: false, reed: false, careerjet: false },
+      apiKeys: { rapidapi: false, adzuna: false, reed: false, careerjet: false, cleanjobdata: false },
     })
 
     const html = renderToStaticMarkup(React.createElement(SmartSearch, { onOpenSettings: vi.fn() }))
@@ -64,5 +64,10 @@ describe('SmartSearch', () => {
     expect(html).not.toContain('search API Not configured')
     expect(html).not.toContain('routing: ')
     expect(html).not.toContain('NL → adzuna + ats + linkedin')
+  })
+
+  it('renders the CleanJobData source label', () => {
+    const html = renderToStaticMarkup(React.createElement(SmartSearch))
+    expect(html).toContain('CleanJobData')
   })
 })

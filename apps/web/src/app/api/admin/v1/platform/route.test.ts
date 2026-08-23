@@ -17,7 +17,7 @@ vi.mock('@/lib/admin/settings-access', () => ({ requireSettingsAdmin: mocks.lega
 vi.mock('@/lib/admin/integration-status', () => ({
   platformIntegrationStatus: () => ({
     ai: { providers: { minimax: true } },
-    discovery: { adzuna: false, rapidapi: true },
+    discovery: { adzuna: false, rapidapi: true, cleanjobdata: true },
     oauth: { google: true, github: false },
     messaging: { resend: true },
     infrastructure: { database: true, redis: false, workerControl: false, workerControlUrl: false, workerControlSecret: false },
@@ -67,7 +67,7 @@ describe('GET /api/admin/v1/platform', () => {
       users: { total: 12, byPlan: { free: 8, pro: 4 } },
       applies: { total: 30 },
       deletionRequests: { requested: 1, processing: 2 },
-      integrations: { discovery: { rapidapi: true } },
+      integrations: { discovery: { rapidapi: true, cleanjobdata: true } },
       readiness: { candidateSettings: { superAdminPermission: 'missing' } },
     })
     expect(mocks.readiness).toHaveBeenCalledWith(
