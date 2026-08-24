@@ -73,8 +73,9 @@ export function loadRegistry(ats: "greenhouse" | "lever" | "smartrecruiters" | "
 /**
  * Load the Workday employer registry.
  *
- * Returns verified and pending entries. Unreachable entries
- * (those that returned 401/404/422 during verification) are filtered out.
+ * Returns only verified entries. Pending entries are retained in YAML for
+ * re-verification but must not be sent to a production discovery request.
+ * Unreachable entries are also filtered out.
  */
 export function loadWorkdayRegistry(): WorkdayEmployer[] {
   const key = "workday"
@@ -89,8 +90,8 @@ export function loadWorkdayRegistry(): WorkdayEmployer[] {
     throw new Error(`Invalid registry: ${file} — missing or malformed "employers" key`)
   }
 
-  // Only return employers that might work (skip unreachable)
-  const active = doc.employers.filter(e => e.status !== "unreachable")
+  // Only verified employers may issue production discovery requests.
+  const active = doc.employers.filter(e => e.status === "verified")
   workdayCache.set(key, active)
   return active
 }

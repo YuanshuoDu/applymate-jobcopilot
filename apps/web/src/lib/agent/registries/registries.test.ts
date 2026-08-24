@@ -97,7 +97,7 @@ describe("registries", () => {
   });
 
   describe("Workday quarantine", () => {
-    it("does not activate the stale tenant/siteId registry", () => {
+    it("does not activate pending or unreachable tenant/siteId entries", () => {
       expect(loadWorkdayRegistry()).toHaveLength(0);
     });
   });
