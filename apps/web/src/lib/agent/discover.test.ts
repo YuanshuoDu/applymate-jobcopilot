@@ -4,11 +4,13 @@ const mocks = vi.hoisted(() => ({
   getDiscoveryApiKeys: vi.fn(),
   featureEnabled: vi.fn(),
   fetchCleanJobData: vi.fn(),
+  fetchFantasticJobs: vi.fn(),
 }))
 
 vi.mock('@/lib/discovery-api-keys', () => ({ getDiscoveryApiKeys: mocks.getDiscoveryApiKeys }))
 vi.mock('@/lib/runtime-feature-flags', () => ({ isRuntimeFeatureEnabled: mocks.featureEnabled }))
 vi.mock('./sources/cleanjobdata', () => ({ fetchCleanJobData: mocks.fetchCleanJobData }))
+vi.mock('./sources/fantasticjobs', () => ({ fetchFantasticJobs: mocks.fetchFantasticJobs }))
 
 import { discoverJobs } from './discover'
 
@@ -21,6 +23,7 @@ describe('discoverJobs platform controls', () => {
       adzunaAppId: 'adzuna-id',
       adzunaAppKey: 'adzuna-key',
       cleanJobDataApiKey: '',
+      fantasticJobsApiKey: '',
     })
     vi.stubGlobal('fetch', vi.fn())
   })
@@ -45,6 +48,7 @@ describe('discoverJobs platform controls', () => {
     mocks.featureEnabled.mockResolvedValue(true)
     mocks.getDiscoveryApiKeys.mockResolvedValue({
       rapidapiKey: '', adzunaAppId: '', adzunaAppKey: '', cleanJobDataApiKey: '',
+      fantasticJobsApiKey: '',
     })
 
     await expect(discoverJobs({
@@ -59,6 +63,7 @@ describe('discoverJobs platform controls', () => {
     mocks.featureEnabled.mockResolvedValue(true)
     mocks.getDiscoveryApiKeys.mockResolvedValue({
       rapidapiKey: '', adzunaAppId: '', adzunaAppKey: '', cleanJobDataApiKey: 'clean-key',
+      fantasticJobsApiKey: '',
     })
     mocks.fetchCleanJobData.mockResolvedValue([{
       title: 'Software Engineer', company: 'Acme', location: 'Berlin, Germany',
@@ -75,5 +80,28 @@ describe('discoverJobs platform controls', () => {
       apiKey: 'clean-key', title: 'Software Engineer', countryCode: 'de', maxPages: 1, maxResults: 5,
     })
     expect(jobs).toEqual([expect.objectContaining({ source: 'cleanjobdata', location: 'Berlin, Germany' })])
+  })
+
+  it('adds Fantastic Jobs to the same location and result-cap pipeline', async () => {
+    mocks.featureEnabled.mockResolvedValue(true)
+    mocks.getDiscoveryApiKeys.mockResolvedValue({
+      rapidapiKey: '', adzunaAppId: '', adzunaAppKey: '', cleanJobDataApiKey: '', fantasticJobsApiKey: 'fantastic-key',
+    })
+    mocks.fetchFantasticJobs.mockResolvedValue([{
+      title: 'Platform Engineer', company: 'Acme', location: 'Berlin, Germany',
+      url: 'https://jobs.example.com/fj-1', description: 'Build APIs', salary: null,
+      logo: null, source: 'fantasticjobs', externalId: 'fj-1', postedAt: null,
+      jobType: null, experienceLevel: null, workArrangement: null,
+    }])
+
+    const jobs = await discoverJobs({
+      userId: 'user-1', targetRoles: ['Platform Engineer'], targetLocations: ['Berlin'],
+      existingUrls: new Set(), maxResults: 5,
+    })
+
+    expect(mocks.fetchFantasticJobs).toHaveBeenCalledWith({
+      apiKey: 'fantastic-key', title: 'Platform Engineer', location: 'Berlin', userId: 'user-1',
+    })
+    expect(jobs).toEqual([expect.objectContaining({ source: 'fantasticjobs', location: 'Berlin, Germany' })])
   })
 })

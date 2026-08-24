@@ -19,6 +19,7 @@ import { isRuntimeFeatureEnabled } from '@/lib/runtime-feature-flags'
 import { dedupJobs } from './dedup'
 import { resolveLocation } from './location-resolver'
 import { fetchCleanJobData } from './sources/cleanjobdata'
+import { fetchFantasticJobs } from './sources/fantasticjobs'
 
 export interface DiscoveredJob {
   title:       string
@@ -355,12 +356,14 @@ export async function discoverJobs(params: DiscoverParams): Promise<DiscoveredJo
         adzunaAppId: process.env.ADZUNA_APP_ID?.trim() ?? '',
         adzunaAppKey: process.env.ADZUNA_APP_KEY?.trim() ?? '',
         cleanJobDataApiKey: process.env.CLEANJOBDATA_API_KEY?.trim() ?? '',
+        fantasticJobsApiKey: process.env.FANTASTICJOBS_API_KEY?.trim() || process.env.FANTASTIC_JOBS_API_KEY?.trim() || '',
       }
 
   const apiKey    = keys.rapidapiKey
   const adzunaId  = keys.adzunaAppId
   const adzunaKey = keys.adzunaAppKey
   const cleanJobDataKey = keys.cleanJobDataApiKey
+  const fantasticJobsKey = keys.fantasticJobsApiKey
 
   const seen    = new Set(existingUrls)
   const results: DiscoveredJob[] = []
@@ -443,6 +446,15 @@ export async function discoverJobs(params: DiscoverParams): Promise<DiscoveredJo
           countryCode: country ?? undefined,
           maxPages: 1,
           maxResults: Math.min(20, maxResults - results.length),
+        }))
+      }
+
+      if (fantasticJobsKey) {
+        fetchTasks.push(fetchFantasticJobs({
+          apiKey: fantasticJobsKey,
+          title: role,
+          location: loc,
+          userId,
         }))
       }
 
