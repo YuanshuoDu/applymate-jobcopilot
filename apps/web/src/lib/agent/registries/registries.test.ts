@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeAll } from "vitest";
-import { loadRegistry, filterEmployers, Employer } from "./index";
+import { loadRegistry, loadWorkdayRegistry, filterEmployers, Employer } from "./index";
 
 describe("registries", () => {
   describe("loadRegistry", () => {
@@ -93,6 +93,12 @@ describe("registries", () => {
     it("empty filter arrays behave as no-filter", () => {
       expect(filterEmployers(employers, { countries: [] }).length).toBe(employers.length);
       expect(filterEmployers(employers, { tiers: [] }).length).toBe(employers.length);
+    });
+  });
+
+  describe("Workday quarantine", () => {
+    it("does not activate pending or unreachable tenant/siteId entries", () => {
+      expect(loadWorkdayRegistry()).toHaveLength(0);
     });
   });
 });
