@@ -1,6 +1,7 @@
 export const MANAGED_FEATURES = {
   worker_discovery: { defaultEnabled: true },
   unattended_apply: { defaultEnabled: true },
+  fantasticjobs_shadow: { defaultEnabled: false },
 } as const
 
 export type ManagedFeatureKey = keyof typeof MANAGED_FEATURES

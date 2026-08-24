@@ -29,6 +29,16 @@ describe('managed platform feature flags', () => {
 
   it('allows only registered operational keys', () => {
     expect(isManagedFeatureKey('unattended_apply')).toBe(true)
+    expect(isManagedFeatureKey('fantasticjobs_shadow')).toBe(true)
     expect(isManagedFeatureKey('new_feature')).toBe(false)
+  })
+
+  it('keeps Fantastic.jobs Shadow disabled until explicitly rolled out', () => {
+    expect(evaluateManagedFeature('fantasticjobs_shadow', {
+      environment: 'production',
+      userId: 'user-1',
+      plan: 'pro',
+      flag: null,
+    })).toBe(false)
   })
 })
