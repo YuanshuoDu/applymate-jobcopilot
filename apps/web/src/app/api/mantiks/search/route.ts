@@ -23,8 +23,8 @@
  *   withContact 0|1     — include hiring manager contacts (default 0, costs extra credits)
  */
 import { NextRequest } from 'next/server'
-import { pinnedFetch } from '@jobcopilot/shared'
 import { requireAuth, isErrorResponse, ok, err } from '@/lib/api-helpers'
+import { reportJobApiJobs, trackedJobApiFetch } from '@/lib/api-usage/job-api-usage'
 import { truncate } from '@/lib/utils'
 
 const BASE = 'https://api.mantiks.io'
@@ -145,13 +145,13 @@ export async function GET(req: NextRequest) {
 
   let raw: Response
   try {
-    raw = await pinnedFetch(`${BASE}/company/search?${params}`, {
+    raw = await trackedJobApiFetch(`${BASE}/company/search?${params}`, {
       headers: {
         'X-API-KEY': apiKey,
         'Content-Type': 'application/json',
       },
       cache: 'no-store',
-    })
+    }, { provider: 'mantiks', operation: 'company_search', credentialSource: 'platform', userId: auth.userId })
   } catch { return err('Failed to reach Mantiks API', 502) }
 
   if (!raw.ok) {
@@ -165,6 +165,7 @@ export async function GET(req: NextRequest) {
 
   const limited  = companies.slice(0, limit)
   const jobs     = flattenJobs(limited)
+  await reportJobApiJobs(raw, jobs.length)
   const withHM   = jobs.filter(j => j.hiringManager !== null).length
 
   return ok({

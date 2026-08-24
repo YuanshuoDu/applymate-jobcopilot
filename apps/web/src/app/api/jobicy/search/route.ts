@@ -5,8 +5,8 @@
  * Remote positions only.
  */
 import { NextRequest } from 'next/server'
-import { pinnedFetch } from '@jobcopilot/shared'
 import { requireAuth, isErrorResponse, ok, err } from '@/lib/api-helpers'
+import { reportJobApiJobs, trackedJobApiFetch } from '@/lib/api-usage/job-api-usage'
 import { truncate } from '@/lib/utils'
 
 const BASE = 'https://jobicy.com/api/v2/remote-jobs'
@@ -28,10 +28,10 @@ export async function GET(req: NextRequest) {
 
   let raw: Response
   try {
-    raw = await pinnedFetch(`${BASE}?${params}`, {
+    raw = await trackedJobApiFetch(`${BASE}?${params}`, {
       headers: { 'User-Agent': 'ApplyMate/1.0' },
       cache:   'no-store',
-    })
+    }, { provider: 'jobicy', operation: 'search', credentialSource: 'public', userId: auth.userId })
   } catch {
     return err('Failed to reach Jobicy API', 502)
   }
@@ -58,6 +58,7 @@ export async function GET(req: NextRequest) {
     }>
     jobCount?: number
   }
+  await reportJobApiJobs(raw, json.jobs?.length ?? 0)
 
   const jobs = (json.jobs ?? []).map(r => {
     const hasSalary = r.annualSalaryMin || r.annualSalaryMax

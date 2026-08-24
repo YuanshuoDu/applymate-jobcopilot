@@ -6,6 +6,7 @@ import {
   type AtsPolicyRedis,
   withAtsRetries,
 } from '../admin/ats-policy.js'
+import { recordWorkerJobApiUsage } from '../api-usage/job-api-usage.js'
 
 export interface DiscoveredJob {
   title: string
@@ -91,19 +92,43 @@ async function requestJson(
   try {
     policy = await loadEffectiveAtsPolicy(input.pool, sourceKey)
     if (!canUseAtsSource(policy, input.userId, 'discovery')) return null
-    const response = await withAtsRetries(policy, async () => {
+    return await withAtsRetries(policy, async () => {
       const current = await loadEffectiveAtsPolicy(input.pool, sourceKey)
       if (!canUseAtsSource(current, input.userId, 'discovery')) throw new PolicyBlockedError()
       await acquireAtsPacing(input.redis, current, input.userId, sleep)
-      const result = await request(url, { headers: { Accept: 'application/json' }, signal: AbortSignal.timeout(8_000) })
-      if (result.status === 429 || result.status >= 500) throw new RetryableResponseError(result.status)
-      return result
+      const startedAt = Date.now()
+      let result: Response
+      try {
+        result = await request(url, { headers: { Accept: 'application/json' }, signal: AbortSignal.timeout(8_000) })
+      } catch (error) {
+        await recordWorkerJobApiUsage({ pool: input.pool, userId: input.userId, provider: sourceKey, latencyMs: Date.now() - startedAt, status: 'error' })
+        throw error
+      }
+      if (!result.ok) {
+        await recordWorkerJobApiUsage({ pool: input.pool, userId: input.userId, provider: sourceKey, latencyMs: Date.now() - startedAt, status: 'error', httpStatus: result.status })
+        if (result.status === 429 || result.status >= 500) throw new RetryableResponseError(result.status)
+        return null
+      }
+      let payload: unknown
+      try {
+        payload = await result.json()
+      } catch (error) {
+        await recordWorkerJobApiUsage({ pool: input.pool, userId: input.userId, provider: sourceKey, latencyMs: Date.now() - startedAt, status: 'error', httpStatus: result.status })
+        throw error
+      }
+      await recordWorkerJobApiUsage({ pool: input.pool, userId: input.userId, provider: sourceKey, latencyMs: Date.now() - startedAt, status: 'success', httpStatus: result.status, jobsReturned: returnedJobCount(sourceKey, payload) })
+      return payload
     }, sleep, error => !(error instanceof PolicyBlockedError))
-    return response.ok ? await response.json() : null
   } catch (error) {
     if (!(error instanceof PolicyBlockedError)) logPolicyFailure(sourceKey, error)
     return null
   }
+}
+
+function returnedJobCount(sourceKey: 'greenhouse' | 'lever', payload: unknown): number {
+  if (sourceKey === 'lever') return Array.isArray(payload) ? payload.length : 0
+  if (!payload || typeof payload !== 'object' || Array.isArray(payload)) return 0
+  return Array.isArray((payload as { jobs?: unknown }).jobs) ? (payload as { jobs: unknown[] }).jobs.length : 0
 }
 
 class PolicyBlockedError extends Error {}

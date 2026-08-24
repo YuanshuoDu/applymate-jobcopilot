@@ -29,11 +29,10 @@ import type { AtsMatch } from "./ats-url-detector"
 
 // Helper: create a mock fetch that returns the given JSON
 function mockFetchOnce(body: unknown, status = 200) {
-  vi.stubGlobal("fetch", vi.fn().mockResolvedValue({
-    ok: status >= 200 && status < 300,
+  vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response(JSON.stringify(body), {
     status,
-    json: async () => body,
-  }))
+    headers: { 'Content-Type': 'application/json' },
+  })))
 }
 
 afterEach(() => {

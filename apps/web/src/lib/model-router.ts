@@ -16,7 +16,7 @@ import Anthropic from '@anthropic-ai/sdk'
 import { pinnedFetch } from '@jobcopilot/shared/pinned-outbound'
 import { db }    from '@/lib/db'
 import { isSafeAiEndpoint } from '@jobcopilot/shared/safe-ai-endpoint'
-import { recordAiUsage } from '@/lib/ai-usage'
+import { aiUsageErrorCode, recordAiUsage } from '@/lib/ai-usage'
 import { decryptAiSettings } from '@/lib/ai-credential-settings'
 
 // ── Provider & model catalogue ────────────────────────────────────────────────
@@ -164,6 +164,9 @@ export interface AiConfig {
   apiKey?:    string   // user's own key; falls back to server env var
   apiBase?:   string   // override base URL (required for custom)
   thinking?:  MiniMaxThinkingMode
+  credentialSource?: 'platform' | 'user'
+  usageUserId?: string
+  usageFeatureKey?: string
 }
 
 export type MiniMaxThinkingMode = 'adaptive' | 'disabled'
@@ -183,7 +186,7 @@ export function withMiniMaxThinking(config: AiConfig, thinking: MiniMaxThinkingM
 // ── Resolve effective config ──────────────────────────────────────────────────
 
 /** Merge user config with server env-var fallbacks */
-export function resolveConfig(userConfig?: AiConfig | null, options?: { preserveModel?: boolean }): AiConfig & { resolvedKey: string } {
+export function resolveConfig(userConfig?: AiConfig | null, options?: { preserveModel?: boolean }): AiConfig & { resolvedKey: string; credentialSource: 'platform' | 'user' } {
   const input  = userConfig ?? DEFAULT_AI_CONFIG
   const exact  = MODEL_CATALOGUE.find(m => m.provider === input.provider && m.model === input.model)
   const option = exact
@@ -208,7 +211,8 @@ export function resolveConfig(userConfig?: AiConfig | null, options?: { preserve
     ? cfg.apiBase?.trim() || option?.defaultBase || ''
     : option?.defaultBase || ''
 
-  return { ...cfg, apiBase: resolvedBase, resolvedKey }
+  const credentialSource = cfg.credentialSource ?? (cfg.apiKey?.trim() ? 'user' : 'platform')
+  return { ...cfg, apiBase: resolvedBase, resolvedKey, credentialSource }
 }
 
 function getServerKey(provider: Provider): string {
@@ -260,16 +264,17 @@ export async function modelChat(
   usageContext?: { userId?: string; featureKey?: string },
 ): Promise<ChatResult> {
   const resolved = resolveConfig(config)
+  const effectiveUsage = usageContext ?? { userId: config.usageUserId, featureKey: config.usageFeatureKey }
   const startedAt = Date.now()
   try {
     assertKey(resolved)
     const result = resolved.provider === 'anthropic'
       ? await callAnthropic(messages, resolved, maxTokens)
       : await callOpenAICompat(messages, resolved, maxTokens)
-    void recordAiUsage({ ...usageContext, provider: result.provider, model: result.model, inputTokens: result.inputTokens, outputTokens: result.outputTokens, estimatedCostUsd: aiCost(result.provider, result.model, result.inputTokens ?? 0, result.outputTokens ?? 0), latencyMs: Date.now() - startedAt, status: 'success' })
+    await recordAiUsage({ ...effectiveUsage, credentialSource: resolved.credentialSource, provider: result.provider, model: result.model, inputTokens: result.inputTokens, outputTokens: result.outputTokens, estimatedCostUsd: aiCost(result.provider, result.model, result.inputTokens ?? 0, result.outputTokens ?? 0), latencyMs: Date.now() - startedAt, status: 'success' })
     return result
   } catch (error) {
-    void recordAiUsage({ ...usageContext, provider: resolved.provider, model: resolved.model, estimatedCostUsd: 0, latencyMs: Date.now() - startedAt, status: 'error', errorCode: error instanceof Error ? error.message.slice(0, 120) : 'unknown_error' })
+    await recordAiUsage({ ...effectiveUsage, credentialSource: resolved.credentialSource, provider: resolved.provider, model: resolved.model, estimatedCostUsd: 0, latencyMs: Date.now() - startedAt, status: 'error', errorCode: aiUsageErrorCode(error) })
     throw error
   }
 }
@@ -287,15 +292,22 @@ export async function* modelChatStream(
   messages:  ChatMessage[],
   config:    AiConfig,
   maxTokens: number = 1024,
+  usageContext?: { userId?: string; featureKey?: string },
 ): AsyncGenerator<string> {
   const resolved = resolveConfig(config)
-  assertKey(resolved)
-
-  const raw = resolved.provider === 'anthropic'
-    ? streamAnthropic(messages, resolved, maxTokens)
-    : streamOpenAICompat(messages, resolved, maxTokens)
-
-  yield* stripThinkStream(raw)
+  const effectiveUsage = usageContext ?? { userId: config.usageUserId, featureKey: config.usageFeatureKey }
+  const startedAt = Date.now()
+  try {
+    assertKey(resolved)
+    const raw = resolved.provider === 'anthropic'
+      ? streamAnthropic(messages, resolved, maxTokens)
+      : streamOpenAICompat(messages, resolved, maxTokens)
+    yield* stripThinkStream(raw)
+    await recordAiUsage({ ...effectiveUsage, credentialSource: resolved.credentialSource, provider: resolved.provider, model: resolved.model, latencyMs: Date.now() - startedAt, status: 'success' })
+  } catch (error) {
+    await recordAiUsage({ ...effectiveUsage, credentialSource: resolved.credentialSource, provider: resolved.provider, model: resolved.model, latencyMs: Date.now() - startedAt, status: 'error', errorCode: aiUsageErrorCode(error) })
+    throw error
+  }
 }
 
 // ── Anthropic ─────────────────────────────────────────────────────────────────
@@ -617,7 +629,7 @@ export async function loadUserAiConfig(
   featureId: FeatureId,
 ): Promise<AiConfig & { resolvedKey: string }> {
   const settings = await loadUserAiSettings(userId)
-  return resolveFeatureConfig(featureId, settings)
+  return { ...resolveFeatureConfig(featureId, settings), usageUserId: userId, usageFeatureKey: featureId }
 }
 
 export async function loadUserAiSettings(userId: string): Promise<UserAiSettings> {

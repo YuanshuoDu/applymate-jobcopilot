@@ -4,7 +4,7 @@ const mocks = vi.hoisted(() => ({
   requireAuth: vi.fn(),
   findUnique: vi.fn(),
   update: vi.fn(),
-  getDiscoveryApiKeys: vi.fn(),
+  getDiscoveryApiAccess: vi.fn(),
   getRuntimeAtsPolicy: vi.fn(),
   enrichJob: vi.fn(),
 }))
@@ -16,7 +16,7 @@ vi.mock('@/lib/api-helpers', () => ({
   err: (message: string, status = 400) => Response.json({ error: message }, { status }),
 }))
 vi.mock('@/lib/db', () => ({ db: { job: { findUnique: mocks.findUnique, update: mocks.update } } }))
-vi.mock('@/lib/discovery-api-keys', () => ({ getDiscoveryApiKeys: mocks.getDiscoveryApiKeys }))
+vi.mock('@/lib/discovery-api-keys', () => ({ getDiscoveryApiAccess: mocks.getDiscoveryApiAccess }))
 vi.mock('@/lib/runtime-ats-policy', () => ({ getRuntimeAtsPolicy: mocks.getRuntimeAtsPolicy }))
 vi.mock('@/lib/agent/enrich', () => ({ enrichJob: mocks.enrichJob }))
 
@@ -29,7 +29,7 @@ describe('POST /api/jobs/:id/enrich', () => {
       id: 'job-1', userId: 'user-1', company: 'Acme', role: 'Engineer', location: 'Dublin',
       url: 'https://boards.greenhouse.io/acme/jobs/123', description: null, salary: null, logo: null,
     })
-    mocks.getDiscoveryApiKeys.mockResolvedValue({ rapidapiKey: '', adzunaAppId: '', adzunaAppKey: '' })
+    mocks.getDiscoveryApiAccess.mockResolvedValue({ rapidapiKey: '', rapidapiSource: 'none' })
     mocks.getRuntimeAtsPolicy.mockResolvedValue({ allowed: false, rps: 1 })
     vi.stubGlobal('fetch', vi.fn())
   })

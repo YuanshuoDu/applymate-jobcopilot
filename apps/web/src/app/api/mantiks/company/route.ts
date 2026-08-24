@@ -13,8 +13,8 @@
  *   datePosted string   — today | week | month (default: month)
  */
 import { NextRequest } from 'next/server'
-import { pinnedFetch } from '@jobcopilot/shared'
 import { requireAuth, isErrorResponse, ok, err } from '@/lib/api-helpers'
+import { reportJobApiJobs, trackedJobApiFetch } from '@/lib/api-usage/job-api-usage'
 import { truncate } from '@/lib/utils'
 
 const BASE = 'https://api.mantiks.io'
@@ -48,10 +48,10 @@ export async function GET(req: NextRequest) {
 
   let raw: Response
   try {
-    raw = await pinnedFetch(`${BASE}/company/jobs?${params}`, {
+    raw = await trackedJobApiFetch(`${BASE}/company/jobs?${params}`, {
       headers: { 'X-API-KEY': apiKey },
       cache: 'no-store',
-    })
+    }, { provider: 'mantiks', operation: 'company_jobs', credentialSource: 'platform', userId: auth.userId })
   } catch { return err('Failed to reach Mantiks API', 502) }
 
   if (!raw.ok) {
@@ -71,6 +71,7 @@ export async function GET(req: NextRequest) {
       job_board?:    string
     }>
   }
+  await reportJobApiJobs(raw, json.jobs?.length ?? 0)
 
   const jobs = (json.jobs ?? []).map((j, i) => ({
     id:          `mantiks-co-${i}`,

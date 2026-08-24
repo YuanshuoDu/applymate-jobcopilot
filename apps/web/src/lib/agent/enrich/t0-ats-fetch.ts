@@ -8,12 +8,12 @@
  * See: docs/scraping-autoapply-design.md §5 (Enrichment Cascade)
  */
 
-import { pinnedFetch } from '@jobcopilot/shared'
 import type { EnrichedJob } from "../types"
 import type { AtsMatch } from "./ats-url-detector"
 import { acquire } from "../pace/policies"
 import { db } from "@/lib/db"
 import { getRuntimeAtsPolicy } from '@/lib/runtime-ats-policy'
+import { reportJobApiJobs, trackedJobApiFetch } from '@/lib/api-usage/job-api-usage'
 
 /** Strip HTML tags and decode common entities (local copy). */
 function stripHtml(html: string): string {
@@ -49,8 +49,8 @@ export async function fetchViaAtsApi(
     const policy = await getRuntimeAtsPolicy(match.ats, options.userId)
     if (!policy.allowed) return null
     const result = match.ats === "greenhouse"
-      ? await fetchGreenhouseJob(match, policy.rps)
-      : await fetchLeverJob(match, policy.rps)
+      ? await fetchGreenhouseJob(match, policy.rps, options.userId)
+      : await fetchLeverJob(match, policy.rps, options.userId)
 
     if (!result) return null
 
@@ -72,13 +72,16 @@ export async function fetchViaAtsApi(
 async function fetchGreenhouseJob(
   match: AtsMatch,
   rps: number,
+  userId?: string,
 ): Promise<EnrichedJob | null> {
   await acquire({ ats: "greenhouse", rps })
 
   const url = `https://boards-api.greenhouse.io/v1/boards/${match.slug}/jobs/${match.jobId}?content=true`
-  const r = await pinnedFetch(url, {
+  const r = await trackedJobApiFetch(url, {
     headers: { Accept: "application/json" },
     signal: AbortSignal.timeout(8_000),
+  }, {
+    provider: 'greenhouse', operation: 'detail', credentialSource: 'public', userId,
   })
 
   if (!r.ok) return null
@@ -88,6 +91,7 @@ async function fetchGreenhouseJob(
     content?: string
     absolute_url?: string
   }
+  await reportJobApiJobs(r, 1)
   const description = json.content ? stripHtml(json.content) : ""
   if (!description) return null
 
@@ -111,18 +115,22 @@ interface LeverPosting {
 async function fetchLeverJob(
   match: AtsMatch,
   rps: number,
+  userId?: string,
 ): Promise<EnrichedJob | null> {
   await acquire({ ats: "lever", rps })
 
   const url = `https://api.lever.co/v0/postings/${match.slug}?mode=json`
-  const r = await pinnedFetch(url, {
+  const r = await trackedJobApiFetch(url, {
     headers: { Accept: "application/json" },
     signal: AbortSignal.timeout(8_000),
+  }, {
+    provider: 'lever', operation: 'detail', credentialSource: 'public', userId,
   })
 
   if (!r.ok) return null
 
   const postings = (await r.json()) as LeverPosting[]
+  await reportJobApiJobs(r, Array.isArray(postings) ? postings.length : 0)
   if (!postings?.length) return null
 
   // Find the posting whose hostedUrl matches our UUID

@@ -3,7 +3,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest'
 
 const mocks = vi.hoisted(() => ({
   requireAuth: vi.fn(),
-  getDiscoveryApiKeys: vi.fn(),
+  getDiscoveryApiAccess: vi.fn(),
   fetchCleanJobData: vi.fn(),
   pinnedFetch: vi.fn(),
 }))
@@ -16,7 +16,7 @@ vi.mock('@/lib/api-helpers', () => ({
 }))
 
 vi.mock('@/lib/utils', () => ({ truncate: (value: string) => value, fmtSalary: vi.fn() }))
-vi.mock('@/lib/discovery-api-keys', () => ({ getDiscoveryApiKeys: mocks.getDiscoveryApiKeys }))
+vi.mock('@/lib/discovery-api-keys', () => ({ getDiscoveryApiAccess: mocks.getDiscoveryApiAccess }))
 vi.mock('@/lib/agent/sources/cleanjobdata', () => ({ fetchCleanJobData: mocks.fetchCleanJobData }))
 vi.mock('@jobcopilot/shared', () => ({ pinnedFetch: mocks.pinnedFetch }))
 
@@ -80,6 +80,11 @@ describe('GET /api/search/unified CleanJobData routing', () => {
     mocks.fetchCleanJobData.mockResolvedValue([])
   })
 
+  const access = (cleanJobDataApiKey: string) => ({
+    rapidapiKey: '', adzunaAppId: '', adzunaAppKey: '', cleanJobDataApiKey,
+    rapidapiSource: 'none', adzunaSource: 'none',
+  })
+
   function request(query = 'Software Engineer'): NextRequest {
     const url = new URL('http://localhost/api/search/unified')
     url.searchParams.set('q', query)
@@ -89,9 +94,7 @@ describe('GET /api/search/unified CleanJobData routing', () => {
   }
 
   it('preserves existing routing when the platform key is absent', async () => {
-    mocks.getDiscoveryApiKeys.mockResolvedValue({
-      rapidapiKey: '', adzunaAppId: '', adzunaAppKey: '', cleanJobDataApiKey: '',
-    })
+    mocks.getDiscoveryApiAccess.mockResolvedValue(access(''))
 
     const response = await GET(request())
     const payload = await response.json()
@@ -102,9 +105,7 @@ describe('GET /api/search/unified CleanJobData routing', () => {
   })
 
   it('routes, maps, deduplicates, and reports CleanJobData results', async () => {
-    mocks.getDiscoveryApiKeys.mockResolvedValue({
-      rapidapiKey: '', adzunaAppId: '', adzunaAppKey: '', cleanJobDataApiKey: 'clean-key',
-    })
+    mocks.getDiscoveryApiAccess.mockResolvedValue(access('clean-key'))
     const base = {
       title: 'Software Engineer', company: 'Acme', location: 'Berlin, DE',
       url: 'https://jobs.example.com/1', description: 'Build reliable software', salary: null,
@@ -130,9 +131,7 @@ describe('GET /api/search/unified CleanJobData routing', () => {
   })
 
   it('uses the normalized company filter even when Mantiks is unavailable', async () => {
-    mocks.getDiscoveryApiKeys.mockResolvedValue({
-      rapidapiKey: '', adzunaAppId: '', adzunaAppKey: '', cleanJobDataApiKey: 'clean-key',
-    })
+    mocks.getDiscoveryApiAccess.mockResolvedValue(access('clean-key'))
 
     await GET(request('jobs at Acme'))
 

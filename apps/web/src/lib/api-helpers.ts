@@ -137,7 +137,7 @@ export async function prepareAiRoute(req: NextRequest, featureId: FeatureId, req
   // its provider has no key. Fall back to the platform MiniMax model.
   const cfg = configured.resolvedKey ? configured : await resolvePlatformRoute(featureId)
 
-  return { userId: auth.userId, cfg }
+  return { userId: auth.userId, cfg: { ...cfg, usageUserId: auth.userId, usageFeatureKey: featureId } }
 }
 
 /** Create an SSE ReadableStream response. Pass a body function that receives emit(). */

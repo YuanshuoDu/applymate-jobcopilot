@@ -13,8 +13,8 @@
  *   datePosted string  — today | 3days | week | month
  */
 import { NextRequest } from 'next/server'
-import { pinnedFetch } from '@jobcopilot/shared'
 import { requireAuth, isErrorResponse, ok, err } from '@/lib/api-helpers'
+import { reportJobApiJobs, trackedJobApiFetch } from '@/lib/api-usage/job-api-usage'
 import { truncate } from '@/lib/utils'
 
 const BASE = 'https://rest.arbeitsagentur.de/jobboerse/jobsuche-service/pc/v4/jobs'
@@ -69,10 +69,10 @@ export async function GET(req: NextRequest) {
 
   let raw: Response
   try {
-    raw = await pinnedFetch(`${BASE}?${params}`, {
+    raw = await trackedJobApiFetch(`${BASE}?${params}`, {
       headers: { 'X-API-Key': API_KEY },
       cache: 'no-store',
-    })
+    }, { provider: 'bundesagentur', operation: 'search', credentialSource: 'public', userId: auth.userId })
   } catch { return err('Failed to reach Bundesagentur API', 502) }
 
   if (!raw.ok) {
@@ -97,6 +97,7 @@ export async function GET(req: NextRequest) {
   }
 
   const items = json.stellenangebote ?? []
+  await reportJobApiJobs(raw, items.length)
 
   const jobs = items.map(r => {
     const encodedRef = encodeURIComponent(r.refnr)

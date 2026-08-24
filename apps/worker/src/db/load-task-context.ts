@@ -95,7 +95,8 @@ export async function loadTaskContext(
             ].join("\n"),
           },
         ],
-        aiConfig
+        aiConfig,
+        { userId, featureKey: "coverLetter" },
       ).catch(() => null);
 
       if (result?.text) {

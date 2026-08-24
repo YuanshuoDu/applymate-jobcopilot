@@ -2,6 +2,7 @@ import pg from "pg";
 import { isSafeAiEndpoint } from "./safe-ai-endpoint.js";
 import { credentialContext, decryptSecret } from "./secret-crypto.js";
 import { pinnedFetch } from "./pinned-outbound.js";
+import { recordSharedAiUsage, sharedAiUsageErrorCode } from "./ai-usage.js";
 
 // ── Types ──
 
@@ -13,6 +14,7 @@ export interface AiConfig {
   apiKey?: string;
   apiBase?: string;
   thinking?: "adaptive" | "disabled";
+  credentialSource?: "platform" | "user";
 }
 
 export interface ChatMessage {
@@ -88,9 +90,11 @@ export async function loadWorkerAiConfig(userId: string): Promise<AiConfig> {
 }
 
 function withUserKey(config: AiConfig, keys: Record<string, string> | undefined): AiConfig {
+  const userKey = config.apiKey?.trim() || keys?.[config.provider]?.trim();
   return {
     ...config,
-    apiKey: config.apiKey?.trim() || keys?.[config.provider]?.trim() || undefined,
+    apiKey: userKey || undefined,
+    credentialSource: userKey ? "user" : "platform",
   };
 }
 
@@ -123,11 +127,11 @@ async function loadPlatformRoute(
       );
       const row = providerResult.rows[0] as Record<string, unknown> | undefined;
       if (!row || row.enabled !== true || row.active !== true) continue;
-      const apiKey = (typeof row.secretRef === "string" ? process.env[row.secretRef] : undefined)
-        || keys?.[candidate.provider]?.trim()
-        || getServerKey(candidate.provider);
+      const platformKey = (typeof row.secretRef === "string" ? process.env[row.secretRef] : undefined) || getServerKey(candidate.provider);
+      const userKey = keys?.[candidate.provider]?.trim();
+      const apiKey = platformKey || userKey;
       if (!apiKey && hasFallback && index === 0) continue;
-      return { provider: candidate.provider, model: candidate.model, apiBase: String(row.apiBase ?? ""), apiKey };
+      return { provider: candidate.provider, model: candidate.model, apiBase: String(row.apiBase ?? ""), apiKey, credentialSource: platformKey ? "platform" : "user" };
     }
   } catch {
     // AI configuration tables are additive; older worker deployments fall back
@@ -152,6 +156,7 @@ export function resolveWorkerAiConfig(preferences: unknown): AiConfig {
     ...(apiKey ? { apiKey } : {}),
     ...(configured.apiBase ? { apiBase: configured.apiBase } : {}),
     ...(configured.thinking ? { thinking: configured.thinking } : {}),
+    credentialSource: apiKey ? "user" : "platform",
   };
 }
 
@@ -171,15 +176,21 @@ export function closeSharedPool(): void {
  */
 export async function callLlm(
   messages: ChatMessage[],
-  config: AiConfig
+  config: AiConfig,
+  usageContext?: { userId?: string; featureKey?: string },
 ): Promise<ChatResult> {
   const provider = config.provider;
-
-  if (provider === "anthropic") {
-    return callAnthropic(messages, config);
+  const startedAt = Date.now();
+  try {
+    const result = provider === "anthropic"
+      ? await callAnthropic(messages, config)
+      : await callOpenAICompat(messages, config);
+    if (process.env.NODE_ENV !== "test") await recordSharedAiUsage(getPool(), { ...usageContext, provider: result.provider, model: result.model, credentialSource: config.credentialSource ?? (config.apiKey ? "user" : "platform"), inputTokens: result.inputTokens, outputTokens: result.outputTokens, latencyMs: Date.now() - startedAt, status: "success" });
+    return result;
+  } catch (error) {
+    if (process.env.NODE_ENV !== "test") await recordSharedAiUsage(getPool(), { ...usageContext, provider, model: config.model, credentialSource: config.credentialSource ?? (config.apiKey ? "user" : "platform"), latencyMs: Date.now() - startedAt, status: "error", errorCode: sharedAiUsageErrorCode(error) });
+    throw error;
   }
-  // MiniMax, OpenAI, DeepSeek, custom — all OpenAI-compatible
-  return callOpenAICompat(messages, config);
 }
 
 // ── Provider implementations ──
@@ -402,8 +413,9 @@ async function decryptWorkerAiSettings(preferences: unknown, userId: string): Pr
 /** Convenience: call LLM and return only the text string */
 export async function callLlmText(
   messages: ChatMessage[],
-  config: AiConfig
+  config: AiConfig,
+  usageContext?: { userId?: string; featureKey?: string },
 ): Promise<string> {
-  const result = await callLlm(messages, config);
+  const result = await callLlm(messages, config, usageContext);
   return result.text;
 }

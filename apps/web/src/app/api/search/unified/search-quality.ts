@@ -32,6 +32,7 @@ export interface SearchFilters {
   salaryMax?: number
   /** Request-scoped credentials resolved by /lib/discovery-api-keys. */
   discovery?: DiscoveryApiKeys
+  usage?: { userId: string; rapidapiSource: 'user' | 'platform' | 'none'; adzunaSource: 'user' | 'platform' | 'incomplete' | 'none' }
 }
 
 const REMOTE_VERIFIED_SOURCES = new Set<string>(['jobicy', 'remotive', 'ats', 'internships', 'cleanjobdata'])

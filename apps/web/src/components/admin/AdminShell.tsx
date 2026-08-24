@@ -2,7 +2,7 @@
 
 import Link from 'next/link'
 import { usePathname } from 'next/navigation'
-import { Activity, Bell, Bot, CreditCard, FileText, Flag, Home, Inbox, LogOut, Radio, ServerCog, ShieldAlert, ShieldCheck, Siren, Trash2, Users } from 'lucide-react'
+import { Activity, Bell, Bot, CreditCard, FileText, Flag, Gauge, Home, Inbox, LogOut, Radio, ServerCog, ShieldAlert, ShieldCheck, Siren, Trash2, Users } from 'lucide-react'
 import { signOut } from 'next-auth/react'
 import { useEffect, useState, type ReactNode } from 'react'
 import { AdminExportLink } from './AdminExportLink'
@@ -19,6 +19,7 @@ const navigation = [
   { href: '/admin/applications', labelKey: 'admin.nav.applications', icon: Activity, permission: 'applications.read' },
   { href: '/admin/queues', labelKey: 'admin.nav.queues', icon: ServerCog, permission: 'queues.read' },
   { href: '/admin/ai', labelKey: 'admin.nav.ai', icon: Bot, permission: 'ai_budget.read' },
+  { href: '/admin/api-usage', labelKey: 'admin.nav.apiUsage', icon: Gauge, permission: 'observability.read' },
   { href: '/admin/incidents', labelKey: 'admin.nav.incidents', icon: Siren, permission: 'observability.read' },
   { href: '/admin/platform', labelKey: 'admin.nav.flags', icon: Flag, permission: 'feature_flags.read' },
   { href: '/admin/broadcasts', labelKey: 'admin.nav.broadcasts', icon: Bell, permission: 'broadcasts.create' },

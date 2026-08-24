@@ -14,10 +14,10 @@
  * Requires RAPIDAPI_KEY in environment.
  */
 import { NextRequest } from 'next/server'
-import { pinnedFetch } from '@jobcopilot/shared'
 import { requireAuth, isErrorResponse, ok, err } from '@/lib/api-helpers'
 import { truncate } from '@/lib/utils'
-import { DISCOVERY_KEY_ERROR_MESSAGES, getDiscoveryApiKeys } from '@/lib/discovery-api-keys'
+import { DISCOVERY_KEY_ERROR_MESSAGES, getDiscoveryApiAccess } from '@/lib/discovery-api-keys'
+import { reportJobApiJobs, trackedJobApiFetch } from '@/lib/api-usage/job-api-usage'
 
 const HOST      = 'internships-api.p.rapidapi.com'
 const PAGE_SIZE = 10  // API hard limit
@@ -119,7 +119,7 @@ export async function GET(req: NextRequest) {
   const auth = await requireAuth(req, 'job_discovery')
   if (isErrorResponse(auth)) return auth
 
-  const { rapidapiKey: apiKey } = await getDiscoveryApiKeys(auth.userId)
+  const { rapidapiKey: apiKey, rapidapiSource } = await getDiscoveryApiAccess(auth.userId)
   if (!apiKey) return err(DISCOVERY_KEY_ERROR_MESSAGES.rapidapi, 501)
 
   const sp         = req.nextUrl.searchParams
@@ -144,9 +144,11 @@ export async function GET(req: NextRequest) {
 
   let raw: Response
   try {
-    raw = await pinnedFetch(`https://${HOST}/active-jb-7d?${params}`, {
+    raw = await trackedJobApiFetch(`https://${HOST}/active-jb-7d?${params}`, {
       headers: { 'x-rapidapi-key': apiKey, 'x-rapidapi-host': HOST },
       cache: 'no-store',
+    }, {
+      provider: 'rapidapi-internships', operation: 'search', credentialSource: rapidapiSource === 'user' ? 'user' : 'platform', userId: auth.userId,
     })
   } catch { return err('Failed to reach Internships API', 502) }
 
@@ -157,6 +159,7 @@ export async function GET(req: NextRequest) {
 
   const json = await raw.json()
   if (!Array.isArray(json)) return err('Unexpected Internships API response', 502)
+  await reportJobApiJobs(raw, json.length)
 
   const jobs = (json as RawJob[]).map(normalizeJob)
   const total = jobs.length >= PAGE_SIZE ? page * PAGE_SIZE + PAGE_SIZE : page * PAGE_SIZE

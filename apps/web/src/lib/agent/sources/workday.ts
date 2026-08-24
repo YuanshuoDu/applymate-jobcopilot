@@ -15,11 +15,11 @@
  *      Issue #30 (Phase 2.1+2.2)
  */
 
-import { pinnedFetch } from '@jobcopilot/shared'
 import type { DiscoveredJob } from "../discover"
 import { acquire } from "../pace/policies"
 import { stripHtml } from "../strip-html"
 import type { WorkdayEmployer } from "../registries"
+import { reportJobApiJobs, trackedJobApiFetch } from '@/lib/api-usage/job-api-usage'
 
 const MAX_JOBS_PER_EMPLOYER = 500
 const PAGE_SIZE = 20
@@ -57,7 +57,7 @@ async function fetchSearch(
 ): Promise<CxsSearchResult | null> {
   const url = `${employer.baseUrl}/wday/cxs/${employer.tenant}/${employer.siteId}/jobs`
   try {
-    const r = await pinnedFetch(url, {
+    const r = await trackedJobApiFetch(url, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
@@ -70,10 +70,13 @@ async function fetchSearch(
         searchText: "",
       }),
       signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+    }, {
+      provider: 'workday', operation: 'list', credentialSource: 'public',
     })
 
     if (!r.ok) return null
     const json = (await r.json()) as CxsSearchResult
+    await reportJobApiJobs(r, json.jobPostings?.length ?? 0)
     if (!json.jobPostings?.length) return null
     return json
   } catch {
@@ -87,15 +90,18 @@ async function fetchDetail(
 ): Promise<CxsDetail | null> {
   const url = `${employer.baseUrl}/wday/cxs/${employer.tenant}/${employer.siteId}${externalPath}`
   try {
-    const r = await pinnedFetch(url, {
+    const r = await trackedJobApiFetch(url, {
       headers: {
         "Accept": "application/json",
         "User-Agent": USER_AGENT,
       },
       signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+    }, {
+      provider: 'workday', operation: 'detail', credentialSource: 'public',
     })
 
     if (!r.ok) return null
+    await reportJobApiJobs(r, 1)
     return (await r.json()) as CxsDetail
   } catch {
     return null

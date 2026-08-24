@@ -6,6 +6,7 @@ vi.mock('@/lib/db', () => ({ db: { userApiKeys: { findUnique } } }))
 
 import {
   DISCOVERY_KEY_ERROR_MESSAGES,
+  getDiscoveryApiAccess,
   getDiscoveryApiKeyStatus,
   getDiscoveryApiKeys,
 } from './discovery-api-keys'
@@ -35,6 +36,14 @@ describe('getDiscoveryApiKeys', () => {
       adzunaAppId: 'platform-id', adzunaAppKey: 'platform-key', rapidapiKey: 'platform-rapid',
       cleanJobDataApiKey: 'platform-clean',
     })
+  })
+
+  it('reports the credential owner used for provider quota accounting', async () => {
+    findUnique.mockResolvedValue({ adzunaAppId: null, adzunaAppKey: null, rapidapiKey: 'user-rapid' })
+
+    await expect(getDiscoveryApiAccess('user_1')).resolves.toEqual(expect.objectContaining({
+      adzunaSource: 'platform', rapidapiSource: 'user',
+    }))
   })
 
   it('does not mix a partial user Adzuna pair with platform credentials', async () => {

@@ -13,8 +13,8 @@
  *   page      number  — 1-based page
  */
 import { NextRequest } from 'next/server'
-import { pinnedFetch } from '@jobcopilot/shared'
 import { requireAuth, isErrorResponse, ok, err } from '@/lib/api-helpers'
+import { reportJobApiJobs, trackedJobApiFetch } from '@/lib/api-usage/job-api-usage'
 
 const BASE = 'https://www.irishjobs.ie'
 
@@ -100,10 +100,11 @@ export async function GET(req: NextRequest) {
   ]
 
   let xml: string | null = null
+  let successfulResponse: Response | null = null
 
   for (const url of urlCandidates) {
     try {
-      const res = await pinnedFetch(url, {
+      const res = await trackedJobApiFetch(url, {
         headers: {
           'User-Agent':      'Mozilla/5.0 (compatible; ApplyMate/1.0; +https://applymate.ai/bot)',
           'Accept':          'application/rss+xml, application/xml, text/xml, */*',
@@ -112,12 +113,13 @@ export async function GET(req: NextRequest) {
         },
         signal: AbortSignal.timeout(8_000),
         cache:  'no-store',
-      })
+      }, { provider: 'irishjobs', operation: 'rss_search', credentialSource: 'public', userId: auth.userId })
       if (res.ok) {
         const contentType = res.headers.get('content-type') ?? ''
         const text = await res.text()
         if (text.includes('<rss') || text.includes('<?xml') || contentType.includes('xml')) {
           xml = text
+          successfulResponse = res
           break
         }
       }
@@ -130,6 +132,7 @@ export async function GET(req: NextRequest) {
   }
 
   const items = parseRss(xml)
+  if (successfulResponse) await reportJobApiJobs(successfulResponse, items.length)
 
   const jobs = items.map((item, i) => ({
     id:          `ij-${page}-${i}`,

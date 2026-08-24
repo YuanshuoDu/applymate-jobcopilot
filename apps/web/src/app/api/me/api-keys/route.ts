@@ -5,10 +5,10 @@
  * Stores user-provided discovery API keys. GET never returns secret values.
  */
 import { NextRequest } from 'next/server'
-import { pinnedFetch } from '@jobcopilot/shared'
 import { requireAuth, isErrorResponse, ok, err } from '@/lib/api-helpers'
 import { db } from '@/lib/db'
-import { encryptDiscoveryApiKey, getDiscoveryApiKeyStatus, getDiscoveryApiKeys } from '@/lib/discovery-api-keys'
+import { encryptDiscoveryApiKey, getDiscoveryApiAccess, getDiscoveryApiKeyStatus } from '@/lib/discovery-api-keys'
+import { trackedJobApiFetch } from '@/lib/api-usage/job-api-usage'
 
 type ApiKeyPatch = {
   adzunaAppId?: string | null
@@ -73,20 +73,20 @@ async function testConnection(req: NextRequest, body: ApiKeyTestRequest) {
   if (isErrorResponse(auth)) return auth
   if (body.provider !== 'adzuna' && body.provider !== 'rapidapi') return err('Choose Adzuna or RapidAPI to test')
 
-  const keys = await getDiscoveryApiKeys(auth.userId)
+  const keys = await getDiscoveryApiAccess(auth.userId)
   if (body.provider === 'adzuna') {
     if (!keys.adzunaAppId || !keys.adzunaAppKey) return err('Save both Adzuna credentials before testing')
     const params = new URLSearchParams({ app_id: keys.adzunaAppId, app_key: keys.adzunaAppKey, results_per_page: '1', what: 'software engineer' })
-    const response = await pinnedFetch(`https://api.adzuna.com/v1/api/jobs/gb/search/1?${params}`, { cache: 'no-store', signal: AbortSignal.timeout(10_000), redirect: 'error' }).catch(() => null)
+    const response = await trackedJobApiFetch(`https://api.adzuna.com/v1/api/jobs/gb/search/1?${params}`, { cache: 'no-store', signal: AbortSignal.timeout(10_000), redirect: 'error' }, { provider: 'adzuna', operation: 'credential_test', credentialSource: keys.adzunaSource === 'user' ? 'user' : 'platform', userId: auth.userId }).catch(() => null)
     if (!response?.ok) return err(`Adzuna rejected the credentials (${response?.status ?? 'network error'})`)
   } else {
     if (!keys.rapidapiKey) return err('Save your RapidAPI key before testing')
-    const response = await pinnedFetch('https://jsearch.p.rapidapi.com/search?query=software%20engineer&page=1&num_pages=1', {
+    const response = await trackedJobApiFetch('https://jsearch.p.rapidapi.com/search?query=software%20engineer&page=1&num_pages=1', {
       headers: { 'X-RapidAPI-Key': keys.rapidapiKey, 'X-RapidAPI-Host': 'jsearch.p.rapidapi.com' },
       cache: 'no-store',
       signal: AbortSignal.timeout(10_000),
       redirect: 'error',
-    }).catch(() => null)
+    }, { provider: 'rapidapi-jsearch', operation: 'credential_test', credentialSource: keys.rapidapiSource === 'user' ? 'user' : 'platform', userId: auth.userId }).catch(() => null)
     if (!response?.ok) return err(`RapidAPI rejected the credentials (${response?.status ?? 'network error'})`)
   }
 
