@@ -104,11 +104,18 @@ This is the bedrock data structure. Every employer we add to the registry shows 
 |---|---|---|---|
 | **Greenhouse** | `boards-api.greenhouse.io/v1/boards/{slug}/jobs?content=true` (full JD inline) | Pre-programmed flow | Booking.com, N26, GitLab, HelloFresh, Babbel, Blinkist |
 | **Lever** | `api.lever.co/v0/postings/{company}?mode=json` | Pre-programmed flow | Spotify, Klarna, Tier Mobility, Personio (HR) |
-| **Workday CXS** | `POST {tenant}.wd{N}.myworkdayjobs.com/wday/cxs/{tenant}/{site}/jobs` | Pre-programmed flow (5 stages) | SAP, Siemens, Volkswagen, Adidas, Allianz, Daimler |
+| **Workday CXS** | `POST {tenant}.wd{N}.myworkdayjobs.com/wday/cxs/{tenant}/{site}/jobs` | Pre-programmed flow (5 stages) | Employer-specific; registry entries require live verification |
 | **SmartRecruiters** | `api.smartrecruiters.com/v1/companies/{company}/postings` | Pre-programmed flow | Bayer, Puma, Visa-EU (selected) |
 | **SAP SuccessFactors** | `jobs.sap.com/career?site=...` (HTML, JSON-LD inside) | AI fallback (varied tenants) | SAP itself, Lufthansa, BASF |
 | **Personio** | `{company}.jobs.personio.com/xml` | Pre-programmed flow | Mid-size German employers (very long tail) |
 | **iCIMS / Taleo** | HTML scrape | AI fallback | Legacy ATS, common in industrial EU firms |
+
+> **Registry maintenance (2026-08-24):** the current Workday employer registry is
+> quarantined until each tenant/siteId pair is re-verified against a live CXS
+> endpoint. All 33 catalogued entries currently return HTTP 401/404/422. SAP's
+> public careers site now runs on SuccessFactors at `jobs.sap.com`; it must not
+> be treated as a Workday CXS tenant until a dedicated SuccessFactors source is
+> maintained.
 
 ### Why public APIs are safe
 
