@@ -1,7 +1,7 @@
-import { Redis } from "ioredis";
 import type { RateLimitResult } from "@jobcopilot/shared";
+import { redisCommandConnection } from "./redis.js";
 
-const redis = new Redis(process.env.REDIS_URL ?? "redis://localhost:6379");
+const redis = redisCommandConnection;
 
 const MAX_PER_USER_HOUR = Number(process.env.RATE_LIMIT_PER_USER_HOUR ?? "30");
 const MAX_PER_DOMAIN_4H = 5;

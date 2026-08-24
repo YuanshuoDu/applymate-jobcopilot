@@ -4,6 +4,7 @@ import { BullMQAdapter } from "@bull-board/api/bullMQAdapter";
 import { ExpressAdapter } from "@bull-board/express";
 import { createWorkerControlHandler, resolveWorkerAdminHost } from "./admin/control-plane.js";
 import { getWorkerRuntimeState, restoreWorkerRuntimeState } from "./admin/worker-state.js";
+import { closeSharedRedisConnections } from "./redis.js";
 
 async function main() {
   const adminHost = resolveWorkerAdminHost();
@@ -121,7 +122,7 @@ async function main() {
     automationScheduler.close();
     await closeAllSlots();
     await closePool();
-    connection.disconnect();
+    await closeSharedRedisConnections();
     process.exit(0);
   };
 
