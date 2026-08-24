@@ -2,8 +2,8 @@
  * EU employer registries for ATS sources.
  *
  * Count summary (Issue #212): Greenhouse 45, Lever 45, Personio 35,
- * SmartRecruiters 25, Workday 33 catalogued entries (currently quarantined
- * until their tenant/siteId pairs are re-verified).
+ * SmartRecruiters 25, Ashby 19, Workday 33 catalogued entries (currently
+ * quarantined until their tenant/siteId pairs are re-verified).
  *
  * Loads YAML files containing curated, verified employer slugs.
  * Each entry maps to a real company with >= 1 active job posting.
@@ -54,7 +54,7 @@ const workdayCache = new Map<string, WorkdayEmployer[]>();
  * YAML is read synchronously — the files are small and this runs
  * server-side at import time or on first call.
  */
-export function loadRegistry(ats: "greenhouse" | "lever" | "smartrecruiters" | "personio"): Employer[] {
+export function loadRegistry(ats: "greenhouse" | "lever" | "smartrecruiters" | "personio" | "ashby"): Employer[] {
   const cached = employerCache.get(ats);
   if (cached) return cached;
 

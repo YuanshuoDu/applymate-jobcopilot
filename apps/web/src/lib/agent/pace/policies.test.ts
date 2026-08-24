@@ -26,4 +26,10 @@ describe('ATS pace policies', () => {
     expect(DISCOVERY_POLICIES.fantasticjobs).toEqual({ host: 'data.fantastic.jobs', rps: 1 })
     expect(POLICIES.fantasticjobs).toEqual(DISCOVERY_POLICIES.fantasticjobs)
   })
+
+  it('registers Ashby with a conservative public API ceiling', () => {
+    expect(DISCOVERY_POLICIES.ashby).toEqual({ host: 'api.ashbyhq.com', rps: 1 })
+    expect(POLICIES.ashby).toEqual(DISCOVERY_POLICIES.ashby)
+    expect(ATS_POLICIES).not.toHaveProperty('ashby')
+  })
 })

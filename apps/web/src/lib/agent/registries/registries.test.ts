@@ -13,6 +13,17 @@ describe("registries", () => {
       expect(employers.length).toBeGreaterThanOrEqual(30);
     });
 
+    it("loads the verified Ashby registry", () => {
+      const employers = loadRegistry("ashby");
+      expect(employers.length).toBeGreaterThanOrEqual(15);
+      for (const e of employers) {
+        expect(e.slug).toMatch(/^[a-z0-9-]+$/);
+        expect(e.name.length).toBeGreaterThan(0);
+        expect(e.country).toMatch(/^[a-z]{2}$/);
+        expect([1, 2, 3]).toContain(e.tier);
+      }
+    });
+
     it("every greenhouse entry has all required fields", () => {
       const employers = loadRegistry("greenhouse");
       for (const e of employers) {
@@ -47,6 +58,12 @@ describe("registries", () => {
 
     it("no duplicate slugs in lever", () => {
       const employers = loadRegistry("lever");
+      const slugs = employers.map((e) => e.slug);
+      expect(new Set(slugs).size).toBe(slugs.length);
+    });
+
+    it("no duplicate slugs in Ashby", () => {
+      const employers = loadRegistry("ashby");
       const slugs = employers.map((e) => e.slug);
       expect(new Set(slugs).size).toBe(slugs.length);
     });

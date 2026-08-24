@@ -108,6 +108,7 @@ This is the bedrock data structure. Every employer we add to the registry shows 
 | **SmartRecruiters** | `api.smartrecruiters.com/v1/companies/{company}/postings` | Pre-programmed flow | Bayer, Puma, Visa-EU (selected) |
 | **SAP SuccessFactors** | `jobs.sap.com/career?site=...` (HTML, JSON-LD inside) | AI fallback (varied tenants) | SAP itself, Lufthansa, BASF |
 | **Personio** | `{company}.jobs.personio.com/xml` | Pre-programmed flow | Mid-size German employers (very long tail) |
+| **Ashby** | `GET api.ashbyhq.com/posting-api/job-board/{board}` (full description inline) | AI fallback (discovery-only initially) | OpenAI, Ramp, Notion, DeepL, Deliveroo, Miro |
 | **iCIMS / Taleo** | HTML scrape | AI fallback | Legacy ATS, common in industrial EU firms |
 
 > **Registry maintenance (2026-08-24):** the current Workday employer registry is
