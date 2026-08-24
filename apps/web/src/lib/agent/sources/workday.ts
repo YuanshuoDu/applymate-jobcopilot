@@ -101,8 +101,9 @@ async function fetchDetail(
     })
 
     if (!r.ok) return null
-    await reportJobApiJobs(r, 1)
-    return (await r.json()) as CxsDetail
+    const detail = (await r.json()) as CxsDetail
+    await reportJobApiJobs(r, detail?.jobPostingInfo ? 1 : 0)
+    return detail
   } catch {
     return null
   }

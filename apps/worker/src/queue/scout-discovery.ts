@@ -29,7 +29,7 @@ type DiscoveryInput = {
 }
 
 type GreenhouseJob = { id: number; title: string; absolute_url: string; location: { name: string }; content?: string }
-type LeverPosting = { text: string; hostedUrl: string; descriptionPlain?: string; description?: string; categories?: { location?: string } }
+type LeverPosting = { text: string; hostedUrl: string; applyUrl?: string; descriptionPlain?: string; description?: string; categories?: { location?: string } }
 
 export async function discoverGreenhouseJobs(input: DiscoveryInput): Promise<DiscoveredJob[]> {
   const jobs = await discover(input, 'greenhouse', slug => `https://boards-api.greenhouse.io/v1/boards/${slug}/jobs?content=true`)
@@ -54,7 +54,7 @@ export async function discoverLeverJobs(input: DiscoveryInput): Promise<Discover
     title: posting.text,
     company: slug,
     location: posting.categories?.location ?? '',
-    url: posting.hostedUrl,
+    url: posting.applyUrl ?? posting.hostedUrl,
     description: posting.descriptionPlain ?? (posting.description ? stripHtml(posting.description) : ''),
     salary: null,
     logo: null,

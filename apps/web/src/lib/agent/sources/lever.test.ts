@@ -15,6 +15,7 @@ function leverPostings(overrides: Record<string, unknown> = {}) {
     id: "abc123",
     text: "Senior Backend Engineer",
     hostedUrl: "https://jobs.lever.co/spotify/abc123",
+    applyUrl: "https://jobs.lever.co/spotify/abc123/apply",
     descriptionPlain: "Join our platform team to build distributed systems at scale.",
     description: "<p>Join our <strong>platform team</strong>.</p>",
     categories: {
@@ -44,7 +45,7 @@ describe("fetchLever", () => {
       title:    "Senior Backend Engineer",
       company:  "spotify",
       location: "Stockholm, Sweden",
-      url:      "https://jobs.lever.co/spotify/abc123",
+      url:      "https://jobs.lever.co/spotify/abc123/apply",
       source:   "lever",
     })
     expect(jobs[0].description).toContain("Join our platform team")

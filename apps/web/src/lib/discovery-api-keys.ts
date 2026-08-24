@@ -6,6 +6,7 @@ export type DiscoveryApiKeys = {
   adzunaAppKey: string
   rapidapiKey: string
   cleanJobDataApiKey: string
+  fantasticJobsApiKey?: string
 }
 
 export type DiscoveryApiAccess = DiscoveryApiKeys & {
@@ -63,8 +64,9 @@ function resolveKeys(saved: DiscoverySavedKeys): DiscoveryApiKeys {
   const adzunaAppKey = hasUserAdzuna ? userKey : clean(process.env.ADZUNA_APP_KEY)
   const rapidapiKey = clean(saved?.rapidapiKey) || clean(process.env.RAPIDAPI_KEY)
   const cleanJobDataApiKey = clean(process.env.CLEANJOBDATA_API_KEY)
+  const fantasticJobsApiKey = clean(process.env.FANTASTICJOBS_API_KEY) || clean(process.env.FANTASTIC_JOBS_API_KEY)
 
-  return { adzunaAppId, adzunaAppKey, rapidapiKey, cleanJobDataApiKey }
+  return { adzunaAppId, adzunaAppKey, rapidapiKey, cleanJobDataApiKey, ...(fantasticJobsApiKey ? { fantasticJobsApiKey } : {}) }
 }
 
 function resolveAccess(saved: DiscoverySavedKeys): DiscoveryApiAccess {
@@ -85,7 +87,13 @@ function resolveAccess(saved: DiscoverySavedKeys): DiscoveryApiAccess {
 /** Prefer a user's saved discovery credentials, with platform credentials as fallback. */
 export async function getDiscoveryApiKeys(userId: string): Promise<DiscoveryApiKeys> {
   const access = await getDiscoveryApiAccess(userId)
-  return { adzunaAppId: access.adzunaAppId, adzunaAppKey: access.adzunaAppKey, rapidapiKey: access.rapidapiKey, cleanJobDataApiKey: access.cleanJobDataApiKey }
+  return {
+    adzunaAppId: access.adzunaAppId,
+    adzunaAppKey: access.adzunaAppKey,
+    rapidapiKey: access.rapidapiKey,
+    cleanJobDataApiKey: access.cleanJobDataApiKey,
+    ...(access.fantasticJobsApiKey ? { fantasticJobsApiKey: access.fantasticJobsApiKey } : {}),
+  }
 }
 
 /** Resolve effective credentials together with their billable owner. */

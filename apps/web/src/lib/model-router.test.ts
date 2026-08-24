@@ -1,7 +1,9 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
 const pinnedFetch = vi.hoisted(() => vi.fn((input: string | URL, init?: unknown) => globalThis.fetch(String(input), init as RequestInit)))
+const recordAiUsage = vi.hoisted(() => vi.fn())
 vi.mock('@jobcopilot/shared/pinned-outbound', () => ({ pinnedFetch }))
+vi.mock('@/lib/ai-usage', () => ({ aiUsageErrorCode: () => 'provider_error', recordAiUsage }))
 
 vi.mock('@/lib/db', () => ({ db: {} }))
 
@@ -10,6 +12,7 @@ import {
   DEFAULT_AI_CONFIG,
   MODEL_CATALOGUE,
   modelChat,
+  modelChatStream,
   resolveConfig,
 } from './model-router'
 
@@ -36,7 +39,26 @@ describe('model catalogue and MiniMax compatibility', () => {
     })
     expect(JSON.parse(String(request.body))).not.toHaveProperty('max_tokens')
     expect(JSON.parse(String(request.body))).toMatchObject({ thinking: { type: 'adaptive' } })
-    expect(fetchMock.mock.calls[0][0]).toBe('https://api.minimax.chat/v1/chat/completions')
+    expect(fetchMock.mock.calls[0][0]).toBe('https://api.minimax.io/v1/chat/completions')
+  })
+
+  it('requests and records usage for OpenAI-compatible streams', async () => {
+    const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response([
+      'data: {"choices":[{"delta":{"content":"hello"}}]}',
+      'data: {"choices":[{"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":11,"completion_tokens":7}}',
+      'data: [DONE]',
+      '',
+    ].join('\n')))
+
+    const chunks: string[] = []
+    for await (const chunk of modelChatStream([{ role: 'user', content: 'Say hello.' }], {
+      provider: 'minimax', model: 'MiniMax-M3', apiKey: 'test-key',
+    })) chunks.push(chunk)
+
+    expect(chunks.join('')).toBe('hello')
+    const body = JSON.parse(String((fetchMock.mock.calls[0][1] as RequestInit).body))
+    expect(body.stream_options).toEqual({ include_usage: true })
+    expect(recordAiUsage).toHaveBeenLastCalledWith(expect.objectContaining({ inputTokens: 11, outputTokens: 7 }))
   })
 
   it('reports an empty final answer with the provider finish reason', async () => {

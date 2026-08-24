@@ -23,6 +23,7 @@ import { NextRequest } from 'next/server'
 import { requireAuth, isErrorResponse, ok, err } from '@/lib/api-helpers'
 import { reportJobApiJobs, trackedJobApiFetch } from '@/lib/api-usage/job-api-usage'
 import { truncate } from '@/lib/utils'
+import { getClientIp } from '@/lib/request-client-ip'
 
 const BASE = 'https://search.api.careerjet.net/v4/query'
 
@@ -67,10 +68,10 @@ export async function GET(req: NextRequest) {
     sort,
     pagesize: String(pageSize),
     page:     String(page),
-    // user_ip and user_agent are required by some partner agreements
-    user_ip:    '1.1.1.1',
     user_agent: 'ApplyMate/1.0',
   })
+  const clientIp = getClientIp(req.headers)
+  if (clientIp) params.set('user_ip', clientIp)
   if (q)        params.set('keywords', q)
   if (location) params.set('location', location)
   if (CONTRACT_MAP[jobType]) params.set('contracttype', CONTRACT_MAP[jobType])

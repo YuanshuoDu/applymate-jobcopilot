@@ -21,6 +21,8 @@ import { truncate, fmtSalary } from '@/lib/utils'
 import { getDiscoveryApiAccess } from '@/lib/discovery-api-keys'
 import { trackedJobApiFetch, type ApiCredentialSource } from '@/lib/api-usage/job-api-usage'
 import { fetchCleanJobData } from '@/lib/agent/sources/cleanjobdata'
+import { fetchFantasticJobs } from '@/lib/agent/sources/fantasticjobs'
+import { getClientIp } from '@/lib/request-client-ip'
 import { cleanSearchTitle, postFilter, queryKeywords, scoreSearchJobs, smartDedup, type SearchFilters, type SearchJob } from './search-quality'
 
 // ── Infrastructure ────────────────────────────────────────────────────────────
@@ -37,7 +39,7 @@ const _cache = new Map<string, { data: object; exp: number }>()
 
 function buildCacheKey(q: string, f: SearchFilters): string {
   const discoveryReady = f.discovery
-    ? `${Boolean(f.discovery.adzunaAppId && f.discovery.adzunaAppKey)}:${Boolean(f.discovery.rapidapiKey)}:${Boolean(f.discovery.cleanJobDataApiKey)}`
+    ? `${Boolean(f.discovery.adzunaAppId && f.discovery.adzunaAppKey)}:${Boolean(f.discovery.rapidapiKey)}:${Boolean(f.discovery.cleanJobDataApiKey)}:${Boolean(f.discovery.fantasticJobsApiKey)}`
     : 'unknown'
   return [q, f.location, f.remote, f.jobType, f.datePosted,
           f.experience, f.salaryMin ?? '', f.salaryMax ?? '', discoveryReady].join('|')
@@ -478,6 +480,35 @@ async function fetchCleanJobDataSource(p: Record<string, string>, filters: Searc
   }))
 }
 
+async function fetchFantasticJobsSource(p: Record<string, string>, filters: SearchFilters): Promise<JobResult[]> {
+  const apiKey = filters.discovery?.fantasticJobsApiKey ?? ''
+  if (!apiKey) return []
+  const jobs = await fetchFantasticJobs({
+    apiKey,
+    title: p.title ?? p.q ?? cleanSearchTitle(p.query ?? ''),
+    location: p.location ?? filters.location,
+    datePosted: p.datePosted || filters.datePosted,
+    userId: filters.usage?.userId,
+  })
+  return jobs.map(job => ({
+    id: job.externalId,
+    title: job.title,
+    company: job.company,
+    location: job.location,
+    salary: job.salary ?? undefined,
+    description: truncate(job.description),
+    url: job.url,
+    postedAt: job.postedAt,
+    jobType: job.jobType,
+    logo: job.logo,
+    experienceLevel: job.experienceLevel,
+    workArrangement: job.workArrangement,
+    directApply: true,
+    source: 'fantasticjobs' as const,
+    score: 0,
+  }))
+}
+
 
 async function fetchAdzuna(p: Record<string, string>, filters: SearchFilters): Promise<JobResult[]> {
   const country = p.country || 'gb'
@@ -529,7 +560,7 @@ async function fetchJSearch(p: Record<string, string>, filters: SearchFilters): 
   }
   if (p.remote === 'true' || filters.remote) params.set('remote_jobs_only', 'true')
   if (filters.datePosted === 'today') params.set('date_posted', 'today')
-  if (filters.datePosted === 'week')  params.set('date_posted', '3days')
+  if (filters.datePosted === 'week')  params.set('date_posted', 'week')
 
   const res = await trackedJobApiFetch(`https://jsearch.p.rapidapi.com/search-v2?${params}`, {
     headers: { 'X-RapidAPI-Key': apiKey, 'X-RapidAPI-Host': 'jsearch.p.rapidapi.com' },
@@ -1014,8 +1045,9 @@ async function fetchCareerjet(p: Record<string, string>, filters: SearchFilters)
   const params = new URLSearchParams({
     affid, locale: p.locale || 'en_GB', sort: 'date',
     pagesize: '20', page: '1',
-    user_ip: '1.1.1.1', user_agent: 'ApplyMate/1.0',
+    user_agent: 'ApplyMate/1.0',
   })
+  if (filters.usage?.clientIp) params.set('user_ip', filters.usage.clientIp)
   if (q)   params.set('keywords', q)
   if (loc) params.set('location', loc)
 
@@ -1458,6 +1490,7 @@ const FETCHERS: Record<string, (p: Record<string, string>, f: SearchFilters) => 
   mantiks:       fetchMantiks,
   irishjobs:     fetchIrishjobs,
   cleanjobdata:  fetchCleanJobDataSource,
+  fantasticjobs: fetchFantasticJobsSource,
 }
 
 export async function GET(req: NextRequest) {
@@ -1470,6 +1503,7 @@ export async function GET(req: NextRequest) {
     adzunaAppId: access.adzunaAppId,
     adzunaAppKey: access.adzunaAppKey,
     cleanJobDataApiKey: access.cleanJobDataApiKey,
+    fantasticJobsApiKey: access.fantasticJobsApiKey,
   }
 
   const sp      = req.nextUrl.searchParams
@@ -1486,7 +1520,7 @@ export async function GET(req: NextRequest) {
     salaryMin:  sp.get('salaryMin') ? Number(sp.get('salaryMin')) * 1000 : undefined,
     salaryMax:  sp.get('salaryMax') ? Number(sp.get('salaryMax')) * 1000 : undefined,
     discovery,
-    usage: { userId: auth.userId, rapidapiSource: access.rapidapiSource, adzunaSource: access.adzunaSource },
+    usage: { userId: auth.userId, rapidapiSource: access.rapidapiSource, adzunaSource: access.adzunaSource, clientIp: getClientIp(req.headers) },
   }
 
   // ① Cache check — identical queries return cached results
@@ -1503,6 +1537,13 @@ export async function GET(req: NextRequest) {
 
   // ③ Smart routing (deterministic)
   const decision = smartRouter(q, filters, qa)
+  if (discovery.fantasticJobsApiKey && !decision.sources.some(source => source.id === 'fantasticjobs')) {
+    decision.sources.push({ id: 'fantasticjobs', params: {
+      title: cleanSearchTitle(q) || q,
+      location: filters.location,
+      datePosted: filters.datePosted,
+    } })
+  }
 
   // ④ Detect country code for salary context
   const country = detectCountry((q + ' ' + filters.location).toLowerCase())
@@ -1590,6 +1631,7 @@ export async function GET(req: NextRequest) {
       reed:      !!(process.env.REED_API_KEY),
       careerjet: !!(process.env.CAREERJET_AFFID),
       cleanjobdata: !!discovery.cleanJobDataApiKey,
+      fantasticjobs: !!discovery.fantasticJobsApiKey,
     },
   }
 

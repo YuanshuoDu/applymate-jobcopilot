@@ -46,6 +46,7 @@ describe('admin integration status', () => {
     expect(status.infrastructure.workerControlUrl).toBe(true)
     expect(status.infrastructure.workerControlSecret).toBe(true)
     expect(status.discovery.cleanjobdata).toBe(true)
+    expect(status.discovery.fantasticjobs).toBe(false)
     expect(JSON.stringify(status)).not.toContain('password')
     expect(JSON.stringify(status)).not.toContain('worker-secret')
     expect(JSON.stringify(status)).not.toContain('cleanjobdata-secret')

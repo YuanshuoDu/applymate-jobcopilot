@@ -17,6 +17,7 @@ export interface RatePolicy {
 /** Non-ATS discovery providers remain separate from automatic-apply policy. */
 export const DISCOVERY_POLICIES: Record<string, RatePolicy> = {
   cleanjobdata: { host: 'api.cleanjobdata.com', rps: 1 },
+  fantasticjobs: { host: 'data.fantastic.jobs', rps: 1 },
 }
 
 /** Per-source rate limits — hard ceiling regardless of user count. */

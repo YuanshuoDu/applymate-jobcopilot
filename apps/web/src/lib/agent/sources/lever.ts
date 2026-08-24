@@ -23,6 +23,7 @@ interface LeverPosting {
   id:               string
   text:             string
   hostedUrl:        string
+  applyUrl?:        string
   descriptionPlain?: string
   description?:     string
   categories?: {
@@ -67,7 +68,9 @@ export async function fetchLever(
           title:       p.text,
           company:     slug,
           location:    p.categories?.location ?? "",
-          url:         p.hostedUrl,
+          // Lever distinguishes the public posting page from the application form.
+          // Store the application URL so downstream auto-apply opens the right flow.
+          url:         p.applyUrl ?? p.hostedUrl,
           description: p.descriptionPlain ?? (p.description ? stripHtml(p.description) : ""),
           salary:      null,
           logo:        null,

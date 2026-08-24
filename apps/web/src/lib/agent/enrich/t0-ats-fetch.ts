@@ -108,6 +108,7 @@ interface LeverPosting {
   id: string
   text: string
   hostedUrl: string
+  applyUrl?: string
   descriptionPlain?: string
   description?: string
 }
@@ -133,9 +134,9 @@ async function fetchLeverJob(
   await reportJobApiJobs(r, Array.isArray(postings) ? postings.length : 0)
   if (!postings?.length) return null
 
-  // Find the posting whose hostedUrl matches our UUID
+  // Find the posting whose hostedUrl or applyUrl matches our UUID.
   const posting = postings.find((p) =>
-    match.jobId ? p.hostedUrl.includes(match.jobId) : false,
+    match.jobId ? p.hostedUrl.includes(match.jobId) || Boolean(p.applyUrl?.includes(match.jobId)) : false,
   )
   if (!posting) return null
 
@@ -146,7 +147,7 @@ async function fetchLeverJob(
 
   return {
     description,
-    applyUrl: posting.hostedUrl,
+    applyUrl: posting.applyUrl ?? posting.hostedUrl,
     method: "t0-ats",
   }
 }

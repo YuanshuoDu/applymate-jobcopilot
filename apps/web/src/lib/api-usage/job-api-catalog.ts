@@ -8,7 +8,7 @@ export type JobApiProvider = {
 
 export const JOB_API_PROVIDERS: readonly JobApiProvider[] = [
   { key: 'cleanjobdata', label: 'CleanJobData', access: 'platform', maxJobsPerResponse: 20, fullJobData: true },
-  { key: 'fantasticjobs', label: 'Fantastic Jobs', access: 'future' },
+  { key: 'fantasticjobs', label: 'Fantastic Jobs', access: 'platform', maxJobsPerResponse: 20, fullJobData: true },
   { key: 'adzuna', label: 'Adzuna', access: 'byok' },
   { key: 'rapidapi-jsearch', label: 'RapidAPI · JSearch', access: 'byok' },
   { key: 'rapidapi-linkedin', label: 'RapidAPI · LinkedIn Jobs', access: 'byok' },

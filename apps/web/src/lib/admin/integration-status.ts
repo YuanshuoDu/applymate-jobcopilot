@@ -30,7 +30,7 @@ export type UserIntegrationStatus = {
 
 export type PlatformIntegrationStatus = {
   ai: { providers: Record<Provider, boolean> }
-  discovery: { adzuna: boolean; rapidapi: boolean; cleanjobdata: boolean }
+  discovery: { adzuna: boolean; rapidapi: boolean; cleanjobdata: boolean; fantasticjobs: boolean }
   oauth: { google: boolean; github: boolean }
   messaging: { resend: boolean }
   infrastructure: {
@@ -105,6 +105,7 @@ export function platformIntegrationStatus(): PlatformIntegrationStatus {
       adzuna: hasValue(process.env.ADZUNA_APP_ID) && hasValue(process.env.ADZUNA_APP_KEY),
       rapidapi: hasValue(process.env.RAPIDAPI_KEY),
       cleanjobdata: hasValue(process.env.CLEANJOBDATA_API_KEY),
+      fantasticjobs: hasValue(process.env.FANTASTICJOBS_API_KEY) || hasValue(process.env.FANTASTIC_JOBS_API_KEY),
     },
     oauth: {
       google: oauthStateReady && hasValue(process.env.AUTH_GOOGLE_ID) && hasValue(process.env.AUTH_GOOGLE_SECRET),

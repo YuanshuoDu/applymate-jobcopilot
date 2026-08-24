@@ -18,7 +18,7 @@ vi.mock('@/lib/api-helpers', () => ({
 vi.mock('@/lib/utils', () => ({ truncate: (value: string) => value, fmtSalary: vi.fn() }))
 vi.mock('@/lib/discovery-api-keys', () => ({ getDiscoveryApiAccess: mocks.getDiscoveryApiAccess }))
 vi.mock('@/lib/agent/sources/cleanjobdata', () => ({ fetchCleanJobData: mocks.fetchCleanJobData }))
-vi.mock('@jobcopilot/shared', () => ({ pinnedFetch: mocks.pinnedFetch }))
+vi.mock('@jobcopilot/shared', () => ({ pinnedFetch: mocks.pinnedFetch, ATS_POLICIES: {} }))
 
 import { cleanSearchTitle, postFilter, queryKeywords, scoreSearchJobs, smartDedup } from './search-quality'
 import { GET } from './route'

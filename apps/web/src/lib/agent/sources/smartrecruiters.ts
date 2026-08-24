@@ -112,8 +112,9 @@ async function fetchDetail(slug: string, posting: SmartRecruitersPosting): Promi
     })
 
     if (!r.ok) return null
-    await reportJobApiJobs(r, 1)
-    return (await r.json()) as SmartRecruitersDetail
+    const detail = (await r.json()) as SmartRecruitersDetail
+    await reportJobApiJobs(r, detail ? 1 : 0)
+    return detail
   } catch {
     return null
   }
