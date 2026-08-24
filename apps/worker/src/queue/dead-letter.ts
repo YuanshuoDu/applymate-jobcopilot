@@ -1,9 +1,8 @@
 import { Queue, type Worker, type Job } from 'bullmq'
-import { Redis } from 'ioredis'
+import { redisConnection } from '../redis.js'
 
 export const DEAD_LETTER_QUEUE_NAME = 'dead-letter'
-const redisUrl = process.env.REDIS_URL ?? 'redis://localhost:6379'
-const connection = new Redis(redisUrl, { maxRetriesPerRequest: null })
+const connection = redisConnection
 
 export type DeadLetterRecord = {
   sourceQueue: string
@@ -15,7 +14,7 @@ export type DeadLetterRecord = {
   userId?: string
 }
 
-export const deadLetterQueue = new Queue<DeadLetterRecord>(DEAD_LETTER_QUEUE_NAME, { connection })
+export const deadLetterQueue = new Queue<DeadLetterRecord>(DEAD_LETTER_QUEUE_NAME, { connection, skipVersionCheck: true })
 
 function safeUserId(job: Job<unknown>): string | undefined {
   const data = job.data
@@ -54,5 +53,4 @@ export function registerDeadLetterListeners(workers: Array<{ name: string; worke
 
 export async function closeDeadLetterResources(): Promise<void> {
   await deadLetterQueue.close()
-  connection.disconnect()
 }

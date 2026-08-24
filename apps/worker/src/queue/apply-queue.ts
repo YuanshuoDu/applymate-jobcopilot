@@ -1,5 +1,4 @@
 import { Queue, Worker } from "bullmq";
-import { Redis } from "ioredis";
 import type { ApplyTaskPayload } from "@jobcopilot/shared";
 import { checkRateLimit } from "../rate-limit.js";
 import { withCloakContext } from "../cloak/pool.js";
@@ -34,9 +33,9 @@ import {
   evaluateUnattendedApplyControl,
   UNATTENDED_APPLY_UNAVAILABLE_MESSAGE,
 } from "./unattended-apply-control.js";
+import { redisConnection } from "../redis.js";
 
-const redisUrl = process.env.REDIS_URL ?? "redis://localhost:6379";
-export const connection = new Redis(redisUrl, { maxRetriesPerRequest: null });
+export const connection = redisConnection;
 
 const APPLY_TIMEOUT_MS = Number(process.env.APPLY_TIMEOUT_MS ?? '300000');
 
@@ -45,6 +44,7 @@ export const QUEUE_NAME = "apply-tasks";
 /** The queue used to enqueue apply tasks */
 export const applyQueue = new Queue<ApplyTaskPayload>(QUEUE_NAME, {
   connection,
+  skipVersionCheck: true,
 });
 
 export const applyWorker = new Worker<ApplyTaskPayload>(
@@ -450,6 +450,7 @@ export const applyWorker = new Worker<ApplyTaskPayload>(
   },
   {
     connection,
+    skipVersionCheck: true,
     ...workerPollingOptions(),
     concurrency: Number(process.env.CLOAK_MAX_WORKERS ?? "1"),
   }
