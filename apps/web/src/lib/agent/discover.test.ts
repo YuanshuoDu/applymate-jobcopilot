@@ -82,7 +82,7 @@ describe('discoverJobs platform controls', () => {
     expect(jobs).toEqual([expect.objectContaining({ source: 'cleanjobdata', location: 'Berlin, Germany' })])
   })
 
-  it('adds Fantastic Jobs to the same location and result-cap pipeline', async () => {
+  it('keeps Fantastic Jobs in Shadow and never returns them as visible discovery results', async () => {
     mocks.featureEnabled.mockResolvedValue(true)
     mocks.getDiscoveryApiKeys.mockResolvedValue({
       rapidapiKey: '', adzunaAppId: '', adzunaAppKey: '', cleanJobDataApiKey: '', fantasticJobsApiKey: 'fantastic-key',
@@ -102,6 +102,7 @@ describe('discoverJobs platform controls', () => {
     expect(mocks.fetchFantasticJobs).toHaveBeenCalledWith({
       apiKey: 'fantastic-key', title: 'Platform Engineer', location: 'Berlin', userId: 'user-1',
     })
-    expect(jobs).toEqual([expect.objectContaining({ source: 'fantasticjobs', location: 'Berlin, Germany' })])
+    expect(jobs).toEqual([])
+    expect(mocks.featureEnabled).toHaveBeenCalledWith('fantasticjobs_shadow', 'user-1')
   })
 })

@@ -16,6 +16,8 @@ import { pinnedFetch } from '@jobcopilot/shared'
 import { truncate } from '@/lib/utils'
 import { getDiscoveryApiKeys } from '@/lib/discovery-api-keys'
 import { isRuntimeFeatureEnabled } from '@/lib/runtime-feature-flags'
+import { recordDiscoveryOptimization } from '@/lib/discovery/metrics'
+import { compareShadowJobs } from '@/lib/discovery/shadow'
 import { dedupJobs } from './dedup'
 import { resolveLocation } from './location-resolver'
 import { fetchCleanJobData } from './sources/cleanjobdata'
@@ -364,6 +366,7 @@ export async function discoverJobs(params: DiscoverParams): Promise<DiscoveredJo
   const adzunaKey = keys.adzunaAppKey
   const cleanJobDataKey = keys.cleanJobDataApiKey
   const fantasticJobsKey = keys.fantasticJobsApiKey
+  const fantasticShadowEnabled = Boolean(fantasticJobsKey && userId) && await isRuntimeFeatureEnabled('fantasticjobs_shadow', userId!).catch(() => false)
 
   const seen    = new Set(existingUrls)
   const results: DiscoveredJob[] = []
@@ -449,16 +452,22 @@ export async function discoverJobs(params: DiscoverParams): Promise<DiscoveredJo
         }))
       }
 
-      if (fantasticJobsKey) {
-        fetchTasks.push(fetchFantasticJobs({
-          apiKey: fantasticJobsKey,
-          title: role,
-          location: loc,
-          userId,
-        }))
-      }
+      const [allResults, shadowResults] = await Promise.all([
+        Promise.all(fetchTasks),
+        fantasticShadowEnabled
+          ? fetchFantasticJobs({ apiKey: fantasticJobsKey!, title: role, location: loc, userId })
+          : Promise.resolve([]),
+      ])
 
-      const allResults = await Promise.all(fetchTasks)
+      if (fantasticShadowEnabled) {
+        const evidence = compareShadowJobs(allResults.flat(), shadowResults)
+        void recordDiscoveryOptimization({
+          userId, eventType: 'shadow_comparison', provider: 'fantasticjobs', credentialScope: 'platform',
+          jobsReturned: evidence.shadowJobs, netNewJobs: evidence.netNewJobs,
+          validApplyUrls: evidence.validApplyUrls, completeDescriptions: evidence.completeDescriptions,
+          metadata: { route: 'worker_discovery', role, location: loc },
+        })
+      }
 
       // Enforce the requested location before ranking. Source-side location
       // filters are advisory, so without this a fallback can leak other cities.

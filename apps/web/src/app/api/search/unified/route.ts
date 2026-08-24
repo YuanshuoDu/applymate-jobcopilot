@@ -23,39 +23,20 @@ import { trackedJobApiFetch, type ApiCredentialSource } from '@/lib/api-usage/jo
 import { fetchCleanJobData } from '@/lib/agent/sources/cleanjobdata'
 import { fetchFantasticJobs } from '@/lib/agent/sources/fantasticjobs'
 import { getClientIp } from '@/lib/request-client-ip'
+import { isRuntimeFeatureEnabled } from '@/lib/runtime-feature-flags'
+import { credentialCacheScope, createDiscoveryCacheKey, getDiscoveryCache, runDiscoverySingleflight, setDiscoveryCache } from '@/lib/discovery/cache'
+import { recordDiscoveryOptimization } from '@/lib/discovery/metrics'
+import { loadProviderStates, reserveProviderQuota } from '@/lib/discovery/quota'
+import { executeProviderPlan, type ProviderCall } from '@/lib/discovery/provider-router'
+import { compareShadowJobs } from '@/lib/discovery/shadow'
 import { cleanSearchTitle, postFilter, queryKeywords, scoreSearchJobs, smartDedup, type SearchFilters, type SearchJob } from './search-quality'
 
 // ── Infrastructure ────────────────────────────────────────────────────────────
 
-const CACHE_TTL_MS            = 15 * 60 * 1000   // 15-min result cache
 const SOURCE_TIMEOUT_MS       = 5_000             // drop a source after 5 s
 const MIN_RESULTS_FOR_FALLBACK = 5                // expand sources when < 5 results
 
 // Sources that guarantee remote=true on every returned job
-
-// ── Simple in-memory result cache ────────────────────────────────────────────
-// Works for single-instance Next.js. Swap for Redis/KV in multi-instance deploys.
-const _cache = new Map<string, { data: object; exp: number }>()
-
-function buildCacheKey(q: string, f: SearchFilters): string {
-  const discoveryReady = f.discovery
-    ? `${Boolean(f.discovery.adzunaAppId && f.discovery.adzunaAppKey)}:${Boolean(f.discovery.rapidapiKey)}:${Boolean(f.discovery.cleanJobDataApiKey)}:${Boolean(f.discovery.fantasticJobsApiKey)}`
-    : 'unknown'
-  return [q, f.location, f.remote, f.jobType, f.datePosted,
-          f.experience, f.salaryMin ?? '', f.salaryMax ?? '', discoveryReady].join('|')
-}
-function cacheGet(key: string): object | null {
-  const e = _cache.get(key)
-  if (!e || Date.now() > e.exp) { _cache.delete(key); return null }
-  return e.data
-}
-function cacheSet(key: string, data: object): void {
-  if (_cache.size > 500) {
-    const oldest = [..._cache.entries()].sort((a, b) => a[1].exp - b[1].exp)[0]
-    if (oldest) _cache.delete(oldest[0])
-  }
-  _cache.set(key, { data, exp: Date.now() + CACHE_TTL_MS })
-}
 
 // Wraps a promise with a hard timeout; returns fallback on expiry.
 async function withTimeout<T>(p: Promise<T>, ms: number, fallback: T): Promise<T> {
@@ -1493,6 +1474,81 @@ const FETCHERS: Record<string, (p: Record<string, string>, f: SearchFilters) => 
   fantasticjobs: fetchFantasticJobsSource,
 }
 
+const FREE_PROVIDER_IDS = ['bundesagentur', 'irishjobs', 'jobicy', 'remotive'] as const
+const RAPID_PROVIDER_IDS = ['ats', 'careerjet', 'indeed', 'internships', 'jsearch', 'linkedin', 'mantiks', 'reed', 'xing'] as const
+
+function providerCredentialSource(provider: string, filters: SearchFilters): ApiCredentialSource {
+  if (provider === 'cleanjobdata' || provider === 'fantasticjobs' || provider === 'reed' || provider === 'careerjet' || provider === 'mantiks') return 'platform'
+  if (provider === 'adzuna') return filters.usage?.adzunaSource === 'user' ? 'user' : 'platform'
+  if (FREE_PROVIDER_IDS.includes(provider as typeof FREE_PROVIDER_IDS[number])) return 'public'
+  return rapidSource(filters)
+}
+
+function availableProviders(filters: SearchFilters): Set<string> {
+  const available = new Set<string>(FREE_PROVIDER_IDS)
+  const discovery = filters.discovery
+  if (discovery?.cleanJobDataApiKey) available.add('cleanjobdata')
+  if (discovery?.fantasticJobsApiKey) available.add('fantasticjobs')
+  if (discovery?.adzunaAppId && discovery.adzunaAppKey) available.add('adzuna')
+  if (discovery?.rapidapiKey) for (const provider of RAPID_PROVIDER_IDS) available.add(provider)
+  if (process.env.REED_API_KEY) available.add('reed')
+  if (process.env.CAREERJET_AFFID) available.add('careerjet')
+  if (process.env.MANTIKS_API_KEY) available.add('mantiks')
+  return available
+}
+
+function cacheProviderScopes(calls: readonly SourceCall[], filters: SearchFilters): Record<string, 'platform' | 'user' | 'public'> {
+  return Object.fromEntries(calls.map(call => [call.id, providerCredentialSource(call.id, filters)]))
+}
+
+async function executeSearchProviders(
+  calls: readonly SourceCall[],
+  filters: SearchFilters,
+  shadowEnabled: boolean,
+  shadowParams: Record<string, string>,
+): Promise<{ items: JobResult[]; decisions: Awaited<ReturnType<typeof executeProviderPlan<JobResult>>>['decisions']; shadowItems: JobResult[]; shadowDecisions: Awaited<ReturnType<typeof executeProviderPlan<JobResult>>>['decisions'] }> {
+  const uniqueCalls = [...new Map(calls.map(call => [
+    `${call.id}|${Object.entries(call.params).sort(([a], [b]) => a.localeCompare(b)).map(([key, value]) => `${key}=${value}`).join('&')}`,
+    call,
+  ])).values()]
+  const available = availableProviders(filters)
+  const providerIds = [...new Set(uniqueCalls.map(call => call.id).concat(shadowEnabled ? ['fantasticjobs'] : []))]
+  const scopeGroups = new Map<'platform' | 'user' | 'public', string[]>([['platform', []], ['user', []], ['public', []]])
+  for (const provider of providerIds) scopeGroups.get(providerCredentialSource(provider, filters))?.push(provider)
+  const stateEntries = await Promise.all([...scopeGroups.entries()].map(async ([scope, ids]) => [scope, await loadProviderStates(ids, scope)] as const))
+  const states = new Map(stateEntries.flatMap(([, values]) => [...values.entries()]))
+  const execute = (call: ProviderCall) => {
+    const fetcher = FETCHERS[call.id]
+    return fetcher ? withTimeout(fetcher(call.params, filters), SOURCE_TIMEOUT_MS, [] as JobResult[]) : Promise.resolve([] as JobResult[])
+  }
+  const reserve = (call: ProviderCall) => reserveProviderQuota({
+    provider: call.id,
+    operation: 'list',
+    credentialSource: providerCredentialSource(call.id, filters),
+    expectedJobs: 20,
+  })
+  const visible = await executeProviderPlan({
+    calls: uniqueCalls.map(call => ({ ...call, expectedJobs: 20 })),
+    availableProviders: available,
+    states,
+    targetResults: MIN_RESULTS_FOR_FALLBACK,
+    execute,
+    count: items => items.length,
+    reserve,
+  })
+  if (!shadowEnabled || !filters.discovery?.fantasticJobsApiKey) return { items: visible.items, decisions: visible.decisions, shadowItems: [], shadowDecisions: [] }
+  const shadow = await executeProviderPlan({
+    calls: [{ id: 'fantasticjobs', params: shadowParams, expectedJobs: 20 }],
+    availableProviders: available,
+    states,
+    targetResults: Number.MAX_SAFE_INTEGER,
+    execute,
+    count: items => items.length,
+    reserve,
+  })
+  return { items: visible.items, decisions: visible.decisions, shadowItems: shadow.items, shadowDecisions: shadow.decisions }
+}
+
 export async function GET(req: NextRequest) {
   const auth = await requireAuth(req, 'job_discovery')
   if (isErrorResponse(auth)) return auth
@@ -1523,94 +1579,92 @@ export async function GET(req: NextRequest) {
     usage: { userId: auth.userId, rapidapiSource: access.rapidapiSource, adzunaSource: access.adzunaSource, clientIp: getClientIp(req.headers) },
   }
 
-  // ① Cache check — identical queries return cached results
-  const cKey = `${auth.userId}:${buildCacheKey(q, filters)}`
+  // ① Analyze intent and build a credential-scoped cache identity before any I/O.
+  const qa = analyzeQuery(q, filters)
+  const decision = smartRouter(q, filters, qa)
+  const shadowEnabled = Boolean(discovery.fantasticJobsApiKey) && await isRuntimeFeatureEnabled('fantasticjobs_shadow', auth.userId).catch(() => false)
+  const cacheCalls = shadowEnabled
+    ? [...decision.sources, { id: 'fantasticjobs' as SourceId, params: {} }]
+    : decision.sources
+  const cKey = createDiscoveryCacheKey({
+    query: { q, location: filters.location, remote: filters.remote, jobType: filters.jobType, datePosted: filters.datePosted, experience: filters.experience, salaryMin: filters.salaryMin, salaryMax: filters.salaryMax },
+    providers: cacheCalls.map(call => call.id),
+    credentialScope: credentialCacheScope({ userId: auth.userId, providerScopes: cacheProviderScopes(cacheCalls, filters) }),
+  })
   if (!noCache) {
-    const hit = cacheGet(cKey)
-    if (hit) return ok({ ...(hit as object), meta: { ...(hit as { meta: object }).meta, cached: true } })
+    const hit = await getDiscoveryCache<{ jobs: JobResult[]; meta: Record<string, unknown> }>(cKey)
+    if (hit) {
+      void recordDiscoveryOptimization({ userId: auth.userId, eventType: 'cache_hit', credentialScope: 'user', requestsAvoided: 1, metadata: { layer: hit.layer } })
+      return ok({ ...hit.value, meta: { ...hit.value.meta, cached: true, cacheLayer: hit.layer } })
+    }
   }
 
   const t0 = Date.now()
 
-  // ② Analyze query intent
-  const qa = analyzeQuery(q, filters)
-
-  // ③ Smart routing (deterministic)
-  const decision = smartRouter(q, filters, qa)
-  if (discovery.fantasticJobsApiKey && !decision.sources.some(source => source.id === 'fantasticjobs')) {
-    decision.sources.push({ id: 'fantasticjobs', params: {
-      title: cleanSearchTitle(q) || q,
-      location: filters.location,
-      datePosted: filters.datePosted,
-    } })
-  }
-
-  // ④ Detect country code for salary context
+  // ② Detect country code for salary context
   const country = detectCountry((q + ' ' + filters.location).toLowerCase())
   const ccForSalary = country === 'gb' || country === 'ie' ? 'gb'
                     : DACH_COUNTRIES.has(country ?? '') ? 'de'
                     : country ?? 'us'
 
-  // ⑤ Parallel: job sources (with per-source timeout) + salary context
-  const [jobResults, salaryCtx] = await Promise.all([
-    Promise.allSettled(
-      decision.sources.map(s => {
-        const fn = FETCHERS[s.id]
-        return fn
-          ? withTimeout(fn(s.params, filters), SOURCE_TIMEOUT_MS, [] as JobResult[])
-          : Promise.resolve([] as JobResult[])
-      })
-    ),
-    fetchSalaryCtx(q, ccForSalary, discovery.rapidapiKey, filters),   // fires in parallel, best-effort
+  // ③ Provider execution is cacheable and singleflight-protected. Free sources
+  // run together; paid sources are selected one at a time until the result gap
+  // is filled or quota/health policy skips them.
+  const providerPromise = runDiscoverySingleflight(cKey, () => executeSearchProviders(decision.sources, filters, shadowEnabled, {
+    title: cleanSearchTitle(q) || q,
+    location: filters.location,
+    datePosted: filters.datePosted,
+  }))
+  const [providerResult, salaryCtx] = await Promise.all([
+    providerPromise,
+    fetchSalaryCtx(q, ccForSalary, discovery.rapidapiKey, filters),
   ])
-
-  let raw: JobResult[] = jobResults.flatMap(r => r.status === 'fulfilled' ? r.value : [])
+  if (providerResult.joined) {
+    void recordDiscoveryOptimization({ userId: auth.userId, eventType: 'singleflight_hit', credentialScope: 'user', requestsAvoided: 1 })
+  }
+  if (!providerResult.joined) {
+    void Promise.all(providerResult.value.decisions.map(decision => recordDiscoveryOptimization({
+      userId: auth.userId,
+      eventType: decision.action === 'selected' ? 'provider_selected' : 'provider_skipped',
+      provider: decision.provider,
+      credentialScope: providerCredentialSource(decision.provider, filters),
+      reasonCode: decision.reason,
+      metadata: { quotaBand: decision.quotaBand },
+    })))
+  }
+  const raw: JobResult[] = providerResult.value.items
+  const shadowJobs = providerResult.value.shadowItems
   const totalRaw = raw.length
 
-  // ⑥ Smart fallback A: if < MIN_RESULTS, try LinkedIn globally
-  if (raw.length < MIN_RESULTS_FOR_FALLBACK && !decision.sources.find(s => s.id === 'linkedin')) {
-    const extra = await tryFallback(raw, q, filters)
-    raw = [...raw, ...extra]
-  }
-
-  // ⑥b Zero-result guarantee: if STILL 0 results, try free-tier sources that need no API key.
-  // This ensures search still returns something when neither user nor platform
-  // RapidAPI credentials are available (or when the provider rejects them).
-  // Free sources: Remotive (remote jobs), Jobicy (remote jobs), IrishJobs (Ireland RSS).
-  if (raw.length === 0 && (!filters.location || filters.remote)) {
-    const hasRapidKey = !!discovery.rapidapiKey
-    const freeFallbacks: Array<Promise<JobResult[]>> = [
-      withTimeout(fetchRemotive({ q }, filters), SOURCE_TIMEOUT_MS, []),
-      withTimeout(fetchJobicy({ q, geo: 'worldwide' }, filters), SOURCE_TIMEOUT_MS, []),
-    ]
-    // IrishJobs for Ireland/Dublin searches
-    const isIreland = /\b(ireland|dublin|cork|galway)\b/i.test(q + ' ' + filters.location)
-    if (isIreland) freeFallbacks.push(withTimeout(fetchIrishjobs({ q, location: filters.location || 'ireland' }, filters), SOURCE_TIMEOUT_MS, []))
-
-    const freeResults = (await Promise.allSettled(freeFallbacks)).flatMap(r => r.status === 'fulfilled' ? r.value : [])
-    raw = [...raw, ...freeResults]
-
-    // Log diagnostic if paid APIs were supposed to be used
-    if (!hasRapidKey) {
-      console.warn('[search/unified] RapidAPI not configured — paid sources skipped, using free sources only')
-    }
-  }
-
-  // ⑦ Score → smart dedup → post-filter → sort
-  const scored   = scoreSearchJobs(raw, q, filters)
+  // ④ Dedup → score → post-filter → sort. Removing duplicate payloads before
+  // scoring keeps repeated provider results from consuming downstream work.
+  const preDeduped = smartDedup(raw)
+  const scored   = scoreSearchJobs(preDeduped, q, filters)
   const deduped  = smartDedup(scored)
   const filtered = postFilter(deduped, filters)
   const sorted   = filtered.sort((a, b) => b.score - a.score)
 
-  // ⑧ Build enriched meta
+  if (!providerResult.joined && shadowEnabled) {
+    const evidence = compareShadowJobs(sorted, shadowJobs)
+    void recordDiscoveryOptimization({
+      userId: auth.userId, eventType: 'shadow_comparison', provider: 'fantasticjobs', credentialScope: 'platform',
+      jobsReturned: evidence.shadowJobs, netNewJobs: evidence.netNewJobs,
+      validApplyUrls: evidence.validApplyUrls, completeDescriptions: evidence.completeDescriptions,
+      metadata: { visibleJobs: sorted.length, route: 'unified_search' },
+    })
+  }
+
+  // ⑤ Build enriched meta
   const withHM = sorted.filter(j => j.hiringManager).length
   const hasRapidKey  = !!discovery.rapidapiKey
   const hasAdzunaKey = !!(discovery.adzunaAppId && discovery.adzunaAppKey)
 
   const meta = {
-    sourcesUsed:       decision.sources.map(s => s.id),
+    sourcesUsed:       providerResult.value.decisions.filter(decision => decision.action === 'selected').map(decision => decision.provider),
     sourceBreakdown:   buildSourceBreakdown(sorted),
     routing:           decision.reasoning,
+    providerDecisions: providerResult.value.decisions,
+    shadow: shadowEnabled ? { enabled: true, provider: 'fantasticjobs' } : { enabled: false },
     queryAnalysis: {
       isCompanyQuery: qa.isCompanyQuery,
       isRemote:       qa.isRemote,
@@ -1637,8 +1691,9 @@ export async function GET(req: NextRequest) {
 
   const response = { jobs: sorted, meta }
 
-  // ⑨ Cache result
-  if (!noCache) cacheSet(cKey, response)
+  // ⑥ Cache the normalized result after scoring so future requests skip all
+  // provider calls but still receive the current request's route metadata.
+  if (!noCache) await setDiscoveryCache(cKey, response)
 
   return ok(response)
 }
