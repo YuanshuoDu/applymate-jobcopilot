@@ -1606,6 +1606,10 @@ export async function GET(req: NextRequest) {
   const ccForSalary = country === 'gb' || country === 'ie' ? 'gb'
                     : DACH_COUNTRIES.has(country ?? '') ? 'de'
                     : country ?? 'us'
+  const salaryScope = credentialCacheScope({
+    userId: auth.userId,
+    providerScopes: { salary: filters.usage?.rapidapiSource === 'user' ? 'user' : 'platform' },
+  })
 
   // ③ Provider execution is cacheable and singleflight-protected. Free sources
   // run together; paid sources are selected one at a time until the result gap
@@ -1615,12 +1619,16 @@ export async function GET(req: NextRequest) {
     location: filters.location,
     datePosted: filters.datePosted,
   }))
-  const [providerResult, salaryCtx] = await Promise.all([
+  const salaryPromise = runDiscoverySingleflight(`${cKey}:salary:${salaryScope}`, () => fetchSalaryCtx(q, ccForSalary, discovery.rapidapiKey, filters))
+  const [providerResult, salaryResult] = await Promise.all([
     providerPromise,
-    fetchSalaryCtx(q, ccForSalary, discovery.rapidapiKey, filters),
+    salaryPromise,
   ])
   if (providerResult.joined) {
     void recordDiscoveryOptimization({ userId: auth.userId, eventType: 'singleflight_hit', credentialScope: 'user', requestsAvoided: 1 })
+  }
+  if (salaryResult.joined) {
+    void recordDiscoveryOptimization({ userId: auth.userId, eventType: 'singleflight_hit', credentialScope: 'user', requestsAvoided: 1, metadata: { route: 'salary_context' } })
   }
   if (!providerResult.joined) {
     void Promise.all(providerResult.value.decisions.map(decision => recordDiscoveryOptimization({
@@ -1675,7 +1683,7 @@ export async function GET(req: NextRequest) {
     totalFiltered:     sorted.length,
     withHiringManager: withHM,
     topSkills:         aggregateTopSkills(sorted),
-    salaryContext:     salaryCtx,
+    salaryContext:     salaryResult.value,
     durationMs:        Date.now() - t0,
     cached:            false,
     // API key status — helps diagnose "no results" issues

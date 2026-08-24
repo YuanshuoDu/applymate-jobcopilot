@@ -28,6 +28,16 @@ function text(value: unknown): string {
   return typeof value === 'string' ? value.trim() : ''
 }
 
+function validUrl(value: unknown): string {
+  const candidate = text(value)
+  try {
+    const url = new URL(candidate)
+    return url.protocol === 'https:' || url.protocol === 'http:' ? candidate : ''
+  } catch {
+    return ''
+  }
+}
+
 function number(value: unknown): number | null {
   return typeof value === 'number' && Number.isFinite(value) ? value : null
 }
@@ -56,7 +66,7 @@ function mapJob(value: unknown): FantasticJob | null {
   const organization = record(job.organization)
   const title = text(job.title)
   const company = text(organization.name) || text(job.organization) || text(job.company)
-  const url = text(job.url)
+  const url = validUrl(job.url)
   if (!title || !company || !url) return null
   const id = text(job.id) || url
   const arrangement = text(job.ai_work_arrangement)

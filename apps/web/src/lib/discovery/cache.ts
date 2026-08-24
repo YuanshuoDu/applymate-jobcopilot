@@ -4,6 +4,7 @@ import { Redis as IORedis } from 'ioredis'
 
 const KEY_PREFIX = 'applymate:discovery:v1:'
 const DEFAULT_TTL_SECONDS = 15 * 60
+const REDIS_L1_PROMOTION_TTL_SECONDS = 30
 const MAX_LOCAL_ENTRIES = 500
 
 type CacheBackend = {
@@ -128,7 +129,10 @@ export async function getDiscoveryCache<T>(key: string): Promise<CacheLookup<T> 
   try {
     const value = await store.get<T>(key)
     if (value === null) return null
-    localSet(key, value, DEFAULT_TTL_SECONDS)
+    // Redis does not return the remaining TTL with GET. Keep the local
+    // promotion short so an entry near Redis expiry cannot remain stale for
+    // another full discovery-cache window.
+    localSet(key, value, REDIS_L1_PROMOTION_TTL_SECONDS)
     return { value, layer: 'redis' }
   } catch (error) {
     console.warn('[discovery-cache] Redis read failed; continuing without shared cache', error instanceof Error ? error.message : 'unknown')

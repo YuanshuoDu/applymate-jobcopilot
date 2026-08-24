@@ -12,13 +12,14 @@ export type ShadowComparison = {
   completeDescriptions: number
 }
 
-const TRACKING_PARAMS = /^(utm_|ref$|source$|src$|trk$)/i
+const TRACKING_PARAMS = /^(utm_|ref$|source$|src$|trk$|origin$|referer$|viewid$|trackingid$|sid$|cid$)/i
 
 export function canonicalJobKey(url: string): string {
   try {
     const parsed = new URL(url.trim())
     parsed.hash = ''
     for (const key of [...parsed.searchParams.keys()]) if (TRACKING_PARAMS.test(key)) parsed.searchParams.delete(key)
+    parsed.searchParams.sort()
     return `${parsed.protocol}//${parsed.host}${parsed.pathname.replace(/\/+$/, '')}${parsed.search}`.toLowerCase()
   } catch {
     return url.trim().toLowerCase()

@@ -13,10 +13,12 @@ vi.mock('./sources/cleanjobdata', () => ({ fetchCleanJobData: mocks.fetchCleanJo
 vi.mock('./sources/fantasticjobs', () => ({ fetchFantasticJobs: mocks.fetchFantasticJobs }))
 
 import { discoverJobs } from './discover'
+import { clearDiscoveryCacheForTests } from '@/lib/discovery/cache'
 
 describe('discoverJobs platform controls', () => {
   beforeEach(() => {
     vi.clearAllMocks()
+    clearDiscoveryCacheForTests()
     mocks.featureEnabled.mockResolvedValue(false)
     mocks.getDiscoveryApiKeys.mockResolvedValue({
       rapidapiKey: 'rapidapi-key',
@@ -104,5 +106,27 @@ describe('discoverJobs platform controls', () => {
     })
     expect(jobs).toEqual([])
     expect(mocks.featureEnabled).toHaveBeenCalledWith('fantasticjobs_shadow', 'user-1')
+  })
+
+  it('shares concurrent Scout requests through the discovery Singleflight', async () => {
+    mocks.featureEnabled.mockResolvedValue(true)
+    mocks.getDiscoveryApiKeys.mockResolvedValue({
+      rapidapiKey: '', adzunaAppId: '', adzunaAppKey: '', cleanJobDataApiKey: 'clean-key',
+      fantasticJobsApiKey: '',
+    })
+    mocks.fetchCleanJobData.mockResolvedValue([{
+      title: 'Software Engineer', company: 'Acme', location: 'Berlin, Germany',
+      url: 'https://jobs.example.com/1', description: 'Build software', salary: null,
+      logo: null, source: 'cleanjobdata',
+    }])
+    const params = {
+      userId: 'user-1', targetRoles: ['Software Engineer'], targetLocations: ['Berlin'],
+      existingUrls: new Set<string>(), maxResults: 5,
+    }
+
+    const [first, second] = await Promise.all([discoverJobs(params), discoverJobs(params)])
+
+    expect(mocks.fetchCleanJobData).toHaveBeenCalledTimes(1)
+    expect(first).toEqual(second)
   })
 })

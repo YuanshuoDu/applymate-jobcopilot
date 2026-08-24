@@ -14,8 +14,9 @@
  */
 import { pinnedFetch } from '@jobcopilot/shared'
 import { truncate } from '@/lib/utils'
-import { getDiscoveryApiKeys } from '@/lib/discovery-api-keys'
+import { getDiscoveryApiKeys, type DiscoveryApiKeys } from '@/lib/discovery-api-keys'
 import { isRuntimeFeatureEnabled } from '@/lib/runtime-feature-flags'
+import { credentialCacheScope, createDiscoveryCacheKey, getDiscoveryCache, runDiscoverySingleflight, setDiscoveryCache } from '@/lib/discovery/cache'
 import { recordDiscoveryOptimization } from '@/lib/discovery/metrics'
 import { compareShadowJobs } from '@/lib/discovery/shadow'
 import { dedupJobs } from './dedup'
@@ -337,7 +338,7 @@ async function fetchIrishJobsRss(q: string, location: string): Promise<Discovere
 // ── Main discovery function ───────────────────────────────────────────────────
 
 export async function discoverJobs(params: DiscoverParams): Promise<DiscoveredJob[]> {
-  const { userId, targetRoles, targetLocations, existingUrls, maxResults } = params
+  const { userId } = params
 
   if (userId) {
     try {
@@ -351,7 +352,7 @@ export async function discoverJobs(params: DiscoverParams): Promise<DiscoveredJo
     }
   }
 
-  const keys = userId
+  const keys: DiscoveryApiKeys = userId
     ? await getDiscoveryApiKeys(userId)
     : {
         rapidapiKey: process.env.RAPIDAPI_KEY?.trim() ?? '',
@@ -360,13 +361,49 @@ export async function discoverJobs(params: DiscoverParams): Promise<DiscoveredJo
         cleanJobDataApiKey: process.env.CLEANJOBDATA_API_KEY?.trim() ?? '',
         fantasticJobsApiKey: process.env.FANTASTICJOBS_API_KEY?.trim() || process.env.FANTASTIC_JOBS_API_KEY?.trim() || '',
       }
+  const fantasticShadowEnabled = Boolean(keys.fantasticJobsApiKey && userId) && await isRuntimeFeatureEnabled('fantasticjobs_shadow', userId!).catch(() => false)
+  const cacheKey = createDiscoveryCacheKey({
+    query: {
+      roles: params.targetRoles.filter(Boolean).map(role => role.trim().toLowerCase()).sort().join('\u001f'),
+      locations: params.targetLocations.filter(Boolean).map(location => location.trim().toLowerCase()).sort().join('\u001f'),
+      existingUrls: [...params.existingUrls].sort().join('\u001f'),
+      maxResults: params.maxResults,
+      fantasticShadow: fantasticShadowEnabled,
+    },
+    providers: ['worker-discovery-v1'],
+    credentialScope: credentialCacheScope({
+      userId: userId ?? 'anonymous',
+      providerScopes: { worker: userId ? 'user' : 'public' },
+    }),
+  })
+  const cached = await getDiscoveryCache<DiscoveredJob[]>(cacheKey)
+  if (cached) {
+    void recordDiscoveryOptimization({ userId, eventType: 'cache_hit', credentialScope: userId ? 'user' : 'public', requestsAvoided: 1, metadata: { route: 'worker_discovery', layer: cached.layer } })
+    return cached.value
+  }
+
+  const flight = await runDiscoverySingleflight(cacheKey, async () => {
+    const secondLook = await getDiscoveryCache<DiscoveredJob[]>(cacheKey)
+    if (secondLook) return secondLook.value
+    const value = await discoverJobsUncached(params, fantasticShadowEnabled, keys)
+    await setDiscoveryCache(cacheKey, value)
+    return value
+  })
+  if (flight.joined) {
+    void recordDiscoveryOptimization({ userId, eventType: 'singleflight_hit', credentialScope: userId ? 'user' : 'public', requestsAvoided: 1, metadata: { route: 'worker_discovery' } })
+  }
+  return flight.value
+}
+
+async function discoverJobsUncached(params: DiscoverParams, fantasticShadowEnabled: boolean, keys: DiscoveryApiKeys): Promise<DiscoveredJob[]> {
+  const { userId, targetRoles, targetLocations, existingUrls, maxResults } = params
 
   const apiKey    = keys.rapidapiKey
   const adzunaId  = keys.adzunaAppId
   const adzunaKey = keys.adzunaAppKey
   const cleanJobDataKey = keys.cleanJobDataApiKey
   const fantasticJobsKey = keys.fantasticJobsApiKey
-  const fantasticShadowEnabled = Boolean(fantasticJobsKey && userId) && await isRuntimeFeatureEnabled('fantasticjobs_shadow', userId!).catch(() => false)
+  const fantasticShadowActive = fantasticShadowEnabled && Boolean(fantasticJobsKey)
 
   const seen    = new Set(existingUrls)
   const results: DiscoveredJob[] = []
@@ -454,12 +491,12 @@ export async function discoverJobs(params: DiscoverParams): Promise<DiscoveredJo
 
       const [allResults, shadowResults] = await Promise.all([
         Promise.all(fetchTasks),
-        fantasticShadowEnabled
+        fantasticShadowActive
           ? fetchFantasticJobs({ apiKey: fantasticJobsKey!, title: role, location: loc, userId })
           : Promise.resolve([]),
       ])
 
-      if (fantasticShadowEnabled) {
+      if (fantasticShadowActive) {
         const evidence = compareShadowJobs(allResults.flat(), shadowResults)
         void recordDiscoveryOptimization({
           userId, eventType: 'shadow_comparison', provider: 'fantasticjobs', credentialScope: 'platform',

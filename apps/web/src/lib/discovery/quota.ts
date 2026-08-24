@@ -104,7 +104,7 @@ export async function reserveProviderQuota(input: ProviderQuotaInput): Promise<P
       if (quotas.length === 0) return [] as ReservationRow[]
 
       const now = new Date()
-      const rows: ReservationRow[] = []
+      const pending: Array<{ quota: QuotaRow; periodStart: Date; periodEnd: Date; requested: number }> = []
       for (const quota of quotas.filter(row => matchingQuota(row, input.operation))) {
         const bounds = quotaPeriodBounds(quota.period as QuotaPeriod, quota.resetDay, now)
         const usage = await tx.jobApiUsageEvent.aggregate({
@@ -121,17 +121,16 @@ export async function reserveProviderQuota(input: ProviderQuotaInput): Promise<P
         const requested = unitsFor(quota.metric, input.expectedJobs)
         const available = quota.limit - reserveFloor(quota, input.priority) - used - Number(reserved._sum.requestedUnits ?? 0)
         if (available < requested) return null
-        const reservation = await tx.apiQuotaReservation.create({
-          data: {
-            quotaId: quota.id, provider: input.provider, operation: input.operation, metric: quota.metric,
-            credentialScope: 'platform', periodStart: bounds.start, periodEnd: bounds.end,
-            requestedUnits: requested, expiresAt: new Date(now.getTime() + RESERVATION_TTL_MS),
-          },
-          select: { id: true, metric: true },
-        })
-        rows.push(reservation)
+        pending.push({ quota, periodStart: bounds.start, periodEnd: bounds.end, requested })
       }
-      return rows
+      return Promise.all(pending.map(({ quota, periodStart, periodEnd, requested }) => tx.apiQuotaReservation.create({
+        data: {
+          quotaId: quota.id, provider: input.provider, operation: input.operation, metric: quota.metric,
+          credentialScope: 'platform', periodStart, periodEnd,
+          requestedUnits: requested, expiresAt: new Date(now.getTime() + RESERVATION_TTL_MS),
+        },
+        select: { id: true, metric: true },
+      })))
     }, { isolationLevel: Prisma.TransactionIsolationLevel.Serializable }))
 
     if (created === null) return null
@@ -145,8 +144,8 @@ export async function reserveProviderQuota(input: ProviderQuotaInput): Promise<P
       },
     }
   } catch (error) {
-    if (!isMissingTable(error)) console.warn('[discovery-quota] reservation failed open', error instanceof Error ? error.message : 'unknown')
-    return noOpReservation()
+    if (!isMissingTable(error)) console.warn('[discovery-quota] reservation unavailable; provider will be skipped', error instanceof Error ? error.message : 'unknown')
+    return null
   }
 }
 
@@ -163,8 +162,11 @@ export async function loadProviderStates(providers: readonly string[], credentia
 
   try {
     const since = new Date(Date.now() - HEALTH_WINDOW_MS)
+    const quotaQuery = credentialSource === 'platform'
+      ? db.apiQuota.findMany({ where: { category: 'job', enabled: true, provider: { in: [...providers] } } }) as Promise<QuotaRow[]>
+      : Promise.resolve([] as QuotaRow[])
     const [quotas, events] = await Promise.all([
-      db.apiQuota.findMany({ where: { category: 'job', enabled: true, provider: { in: [...providers] } } }) as Promise<QuotaRow[]>,
+      quotaQuery,
       db.jobApiUsageEvent.findMany({ where: { provider: { in: [...providers] }, credentialSource, createdAt: { gte: since } }, select: { provider: true, status: true, httpStatus: true, rateLimitLimit: true, rateLimitRemaining: true, createdAt: true } }),
     ])
     for (const provider of providers) {

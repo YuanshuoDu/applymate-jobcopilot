@@ -4,6 +4,7 @@ import { canonicalJobKey, compareShadowJobs } from './shadow'
 describe('Fantastic Jobs shadow comparison', () => {
   it('canonicalizes tracking parameters before comparing providers', () => {
     expect(canonicalJobKey('https://jobs.example/1?utm_source=fantastic#top')).toBe('https://jobs.example/1')
+    expect(canonicalJobKey('https://jobs.example/1?b=2&trackingId=x&a=1')).toBe('https://jobs.example/1?a=1&b=2')
   })
 
   it('reports only aggregate quality evidence', () => {
