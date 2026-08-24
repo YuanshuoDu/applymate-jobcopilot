@@ -48,9 +48,13 @@ const PREFERRED_ORDER = new Map([
   ['fantasticjobs', 1],
   ['adzuna', 10],
   ['linkedin', 11],
+  ['rapidapi-linkedin', 11],
   ['indeed', 12],
+  ['rapidapi-jobs-api14', 12],
   ['ats', 13],
+  ['rapidapi-active-jobs', 13],
   ['jsearch', 14],
+  ['rapidapi-jsearch', 14],
   ['careerjet', 15],
   ['reed', 16],
   ['xing', 17],
@@ -128,7 +132,15 @@ export async function executeProviderPlan<T>(options: ProviderPlanOptions<T>): P
   const items: T[] = []
 
   const freeResults = await Promise.allSettled(free.map(call => executeOne(call, stateFor(call.id, options.states), options.execute, options.count, options.reserve, decisions)))
-  for (const result of freeResults) if (result.status === 'fulfilled') items.push(...result.value)
+  for (let index = 0; index < freeResults.length; index += 1) {
+    const result = freeResults[index]
+    if (result.status === 'fulfilled') {
+      items.push(...result.value)
+    } else {
+      const call = free[index]
+      decisions.push({ provider: call.id, action: 'skipped', reason: 'provider_error', quotaBand: stateFor(call.id, options.states).quotaBand })
+    }
+  }
 
   for (const call of paid) {
     if (options.count(items) >= options.targetResults) {

@@ -61,4 +61,21 @@ describe('discovery provider router', () => {
     expect(result.items).toEqual([{ id: 1 }])
     expect(result.decisions).toContainEqual(expect.objectContaining({ provider: 'cleanjobdata', reason: 'quota_reservation_denied' }))
   })
+
+  it('records a free-provider error and continues to paid fallback', async () => {
+    const result = await executeProviderPlan({
+      calls: [{ id: 'irishjobs', params: {} }, { id: 'adzuna', params: {} }],
+      availableProviders: new Set(['irishjobs', 'adzuna']),
+      states: new Map([['irishjobs', green], ['adzuna', green]]),
+      targetResults: 1,
+      execute: async call => {
+        if (call.id === 'irishjobs') throw new Error('rss_unavailable')
+        return [{ id: 1 }]
+      },
+      count: items => items.length,
+    })
+    expect(result.items).toEqual([{ id: 1 }])
+    expect(result.decisions).toContainEqual(expect.objectContaining({ provider: 'irishjobs', reason: 'provider_error' }))
+    expect(result.decisions).toContainEqual(expect.objectContaining({ provider: 'adzuna', action: 'selected' }))
+  })
 })

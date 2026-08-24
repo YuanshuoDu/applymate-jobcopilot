@@ -1,14 +1,22 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 const mocks = vi.hoisted(() => ({
-  getDiscoveryApiKeys: vi.fn(),
+  getDiscoveryApiAccess: vi.fn(),
   featureEnabled: vi.fn(),
   fetchCleanJobData: vi.fn(),
   fetchFantasticJobs: vi.fn(),
+  loadProviderStates: vi.fn(),
+  reserveProviderQuota: vi.fn(),
+  pinnedFetch: vi.fn((input: string | URL, init?: unknown) => globalThis.fetch(String(input), init as RequestInit)),
 }))
 
-vi.mock('@/lib/discovery-api-keys', () => ({ getDiscoveryApiKeys: mocks.getDiscoveryApiKeys }))
+vi.mock('@jobcopilot/shared', () => ({ pinnedFetch: mocks.pinnedFetch }))
+vi.mock('@/lib/discovery-api-keys', () => ({ getDiscoveryApiAccess: mocks.getDiscoveryApiAccess }))
 vi.mock('@/lib/runtime-feature-flags', () => ({ isRuntimeFeatureEnabled: mocks.featureEnabled }))
+vi.mock('@/lib/discovery/quota', () => ({
+  loadProviderStates: mocks.loadProviderStates,
+  reserveProviderQuota: mocks.reserveProviderQuota,
+}))
 vi.mock('./sources/cleanjobdata', () => ({ fetchCleanJobData: mocks.fetchCleanJobData }))
 vi.mock('./sources/fantasticjobs', () => ({ fetchFantasticJobs: mocks.fetchFantasticJobs }))
 
@@ -20,7 +28,11 @@ describe('discoverJobs platform controls', () => {
     vi.clearAllMocks()
     clearDiscoveryCacheForTests()
     mocks.featureEnabled.mockResolvedValue(false)
-    mocks.getDiscoveryApiKeys.mockResolvedValue({
+    mocks.loadProviderStates.mockImplementation(async (providers: string[]) => new Map(providers.map(provider => [provider, {
+      quotaBand: 'green', circuitOpen: false, recentErrorRate: 0, remainingRatio: 1,
+    }])))
+    mocks.reserveProviderQuota.mockResolvedValue({ settle: async () => undefined })
+    mocks.getDiscoveryApiAccess.mockResolvedValue({
       rapidapiKey: 'rapidapi-key',
       adzunaAppId: 'adzuna-id',
       adzunaAppKey: 'adzuna-key',
@@ -42,13 +54,13 @@ describe('discoverJobs platform controls', () => {
     })).resolves.toEqual([])
 
     expect(mocks.featureEnabled).toHaveBeenCalledWith('worker_discovery', 'user-1')
-    expect(mocks.getDiscoveryApiKeys).not.toHaveBeenCalled()
+    expect(mocks.getDiscoveryApiAccess).not.toHaveBeenCalled()
     expect(globalThis.fetch).not.toHaveBeenCalled()
   })
 
   it('preserves the existing source path when CleanJobData is not configured', async () => {
     mocks.featureEnabled.mockResolvedValue(true)
-    mocks.getDiscoveryApiKeys.mockResolvedValue({
+    mocks.getDiscoveryApiAccess.mockResolvedValue({
       rapidapiKey: '', adzunaAppId: '', adzunaAppKey: '', cleanJobDataApiKey: '',
       fantasticJobsApiKey: '',
     })
@@ -63,7 +75,7 @@ describe('discoverJobs platform controls', () => {
 
   it('adds CleanJobData jobs to the existing location and result-cap pipeline', async () => {
     mocks.featureEnabled.mockResolvedValue(true)
-    mocks.getDiscoveryApiKeys.mockResolvedValue({
+    mocks.getDiscoveryApiAccess.mockResolvedValue({
       rapidapiKey: '', adzunaAppId: '', adzunaAppKey: '', cleanJobDataApiKey: 'clean-key',
       fantasticJobsApiKey: '',
     })
@@ -79,14 +91,14 @@ describe('discoverJobs platform controls', () => {
     })
 
     expect(mocks.fetchCleanJobData).toHaveBeenCalledWith({
-      apiKey: 'clean-key', title: 'Software Engineer', countryCode: 'de', maxPages: 1, maxResults: 5,
+      apiKey: 'clean-key', userId: 'user-1', title: 'Software Engineer', countryCode: 'de', maxPages: 1, maxResults: 5,
     })
     expect(jobs).toEqual([expect.objectContaining({ source: 'cleanjobdata', location: 'Berlin, Germany' })])
   })
 
   it('keeps Fantastic Jobs in Shadow and never returns them as visible discovery results', async () => {
     mocks.featureEnabled.mockResolvedValue(true)
-    mocks.getDiscoveryApiKeys.mockResolvedValue({
+    mocks.getDiscoveryApiAccess.mockResolvedValue({
       rapidapiKey: '', adzunaAppId: '', adzunaAppKey: '', cleanJobDataApiKey: '', fantasticJobsApiKey: 'fantastic-key',
     })
     mocks.fetchFantasticJobs.mockResolvedValue([{
@@ -110,7 +122,7 @@ describe('discoverJobs platform controls', () => {
 
   it('shares concurrent Scout requests through the discovery Singleflight', async () => {
     mocks.featureEnabled.mockResolvedValue(true)
-    mocks.getDiscoveryApiKeys.mockResolvedValue({
+    mocks.getDiscoveryApiAccess.mockResolvedValue({
       rapidapiKey: '', adzunaAppId: '', adzunaAppKey: '', cleanJobDataApiKey: 'clean-key',
       fantasticJobsApiKey: '',
     })
@@ -128,5 +140,53 @@ describe('discoverJobs platform controls', () => {
 
     expect(mocks.fetchCleanJobData).toHaveBeenCalledTimes(1)
     expect(first).toEqual(second)
+  })
+
+  it('keeps paid providers out when the free IrishJobs result target is met', async () => {
+    mocks.featureEnabled.mockResolvedValue(true)
+    mocks.getDiscoveryApiAccess.mockResolvedValue({
+      rapidapiKey: 'rapidapi-key', adzunaAppId: '', adzunaAppKey: '', cleanJobDataApiKey: '',
+      fantasticJobsApiKey: '', adzunaSource: 'none', rapidapiSource: 'platform',
+    })
+    const fetchMock = vi.fn().mockResolvedValue(new Response(
+      '<rss><item><title>Software Engineer</title><link>https://jobs.example.com/irish-1</link><description>Company: Acme | Location: Dublin</description></item></rss>',
+      { status: 200, headers: { 'content-type': 'application/rss+xml' } },
+    ))
+    vi.stubGlobal('fetch', fetchMock)
+
+    const jobs = await discoverJobs({
+      userId: 'user-1', targetRoles: ['Software Engineer'], targetLocations: ['Dublin'],
+      existingUrls: new Set(), maxResults: 1,
+    })
+
+    expect(jobs).toHaveLength(1)
+    expect(fetchMock.mock.calls.every(([url]) => !String(url).includes('rapidapi'))).toBe(true)
+    expect(mocks.reserveProviderQuota.mock.calls.every(([call]) => (call as { provider: string }).provider === 'irishjobs')).toBe(true)
+  })
+
+  it('falls through to RapidAPI when a platform provider reservation is denied', async () => {
+    mocks.featureEnabled.mockResolvedValue(true)
+    mocks.getDiscoveryApiAccess.mockResolvedValue({
+      rapidapiKey: 'rapidapi-key', adzunaAppId: '', adzunaAppKey: '', cleanJobDataApiKey: 'clean-key',
+      fantasticJobsApiKey: '', adzunaSource: 'none', rapidapiSource: 'platform',
+    })
+    mocks.fetchCleanJobData.mockResolvedValue([])
+    mocks.reserveProviderQuota.mockImplementation(async (call: { provider: string }) => call.provider === 'cleanjobdata'
+      ? null
+      : { settle: async () => undefined })
+    const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify([]), {
+      status: 200, headers: { 'content-type': 'application/json' },
+    }))
+    vi.stubGlobal('fetch', fetchMock)
+
+    await discoverJobs({
+      userId: 'user-1', targetRoles: ['Software Engineer'], targetLocations: ['Berlin'],
+      existingUrls: new Set(), maxResults: 1,
+    })
+
+    const reservedProviders = mocks.reserveProviderQuota.mock.calls.map(([call]) => (call as { provider: string }).provider)
+    expect(reservedProviders[0]).toBe('cleanjobdata')
+    expect(reservedProviders).toContain('rapidapi-linkedin')
+    expect(fetchMock).toHaveBeenCalled()
   })
 })
