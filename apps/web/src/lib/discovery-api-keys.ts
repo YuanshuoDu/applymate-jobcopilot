@@ -6,6 +6,12 @@ export type DiscoveryApiKeys = {
   adzunaAppKey: string
   rapidapiKey: string
   cleanJobDataApiKey: string
+  fantasticJobsApiKey?: string
+}
+
+export type DiscoveryApiAccess = DiscoveryApiKeys & {
+  adzunaSource: Extract<DiscoveryKeySource, 'user' | 'platform' | 'incomplete' | 'none'>
+  rapidapiSource: Extract<DiscoveryKeySource, 'user' | 'platform' | 'none'>
 }
 
 /** Shared user-facing guidance for discovery providers with missing credentials. */
@@ -58,12 +64,40 @@ function resolveKeys(saved: DiscoverySavedKeys): DiscoveryApiKeys {
   const adzunaAppKey = hasUserAdzuna ? userKey : clean(process.env.ADZUNA_APP_KEY)
   const rapidapiKey = clean(saved?.rapidapiKey) || clean(process.env.RAPIDAPI_KEY)
   const cleanJobDataApiKey = clean(process.env.CLEANJOBDATA_API_KEY)
+  const fantasticJobsApiKey = clean(process.env.FANTASTICJOBS_API_KEY) || clean(process.env.FANTASTIC_JOBS_API_KEY)
 
-  return { adzunaAppId, adzunaAppKey, rapidapiKey, cleanJobDataApiKey }
+  return { adzunaAppId, adzunaAppKey, rapidapiKey, cleanJobDataApiKey, ...(fantasticJobsApiKey ? { fantasticJobsApiKey } : {}) }
+}
+
+function resolveAccess(saved: DiscoverySavedKeys): DiscoveryApiAccess {
+  const keys = resolveKeys(saved)
+  const userAdzunaId = clean(saved?.adzunaAppId)
+  const userAdzunaKey = clean(saved?.adzunaAppKey)
+  const hasUserAdzuna = Boolean(userAdzunaId || userAdzunaKey)
+  const userRapidapi = clean(saved?.rapidapiKey)
+  return {
+    ...keys,
+    adzunaSource: hasPair(keys.adzunaAppId, keys.adzunaAppKey)
+      ? hasUserAdzuna ? 'user' : 'platform'
+      : hasUserAdzuna ? 'incomplete' : 'none',
+    rapidapiSource: keys.rapidapiKey ? userRapidapi ? 'user' : 'platform' : 'none',
+  }
 }
 
 /** Prefer a user's saved discovery credentials, with platform credentials as fallback. */
 export async function getDiscoveryApiKeys(userId: string): Promise<DiscoveryApiKeys> {
+  const access = await getDiscoveryApiAccess(userId)
+  return {
+    adzunaAppId: access.adzunaAppId,
+    adzunaAppKey: access.adzunaAppKey,
+    rapidapiKey: access.rapidapiKey,
+    cleanJobDataApiKey: access.cleanJobDataApiKey,
+    ...(access.fantasticJobsApiKey ? { fantasticJobsApiKey: access.fantasticJobsApiKey } : {}),
+  }
+}
+
+/** Resolve effective credentials together with their billable owner. */
+export async function getDiscoveryApiAccess(userId: string): Promise<DiscoveryApiAccess> {
   const saved = await db.userApiKeys.findUnique({
     where: { userId },
     select: {
@@ -77,7 +111,7 @@ export async function getDiscoveryApiKeys(userId: string): Promise<DiscoveryApiK
     adzunaAppKey: await decryptSecret(saved.adzunaAppKeyEnc ?? saved.adzunaAppKey, discoveryCredentialContext('adzunaAppKey')),
     rapidapiKey: await decryptSecret(saved.rapidapiKeyEnc ?? saved.rapidapiKey, discoveryCredentialContext('rapidapiKey')),
   } : null
-  return resolveKeys(decrypted)
+  return resolveAccess(decrypted)
 }
 
 /** Return safe readiness/source metadata for the candidate/admin UI. */

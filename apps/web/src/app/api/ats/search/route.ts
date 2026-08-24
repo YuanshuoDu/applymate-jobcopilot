@@ -16,10 +16,10 @@
  * Requires RAPIDAPI_KEY in environment.
  */
 import { NextRequest } from 'next/server'
-import { pinnedFetch } from '@jobcopilot/shared'
 import { requireAuth, isErrorResponse, ok, err } from '@/lib/api-helpers'
 import { truncate } from '@/lib/utils'
-import { DISCOVERY_KEY_ERROR_MESSAGES, getDiscoveryApiKeys } from '@/lib/discovery-api-keys'
+import { DISCOVERY_KEY_ERROR_MESSAGES, getDiscoveryApiAccess } from '@/lib/discovery-api-keys'
+import { reportJobApiJobs, trackedJobApiFetch } from '@/lib/api-usage/job-api-usage'
 
 const HOST      = 'active-jobs-db.p.rapidapi.com'
 const PAGE_SIZE = 20
@@ -66,7 +66,7 @@ export async function GET(req: NextRequest) {
   const auth = await requireAuth(req, 'job_discovery')
   if (isErrorResponse(auth)) return auth
 
-  const { rapidapiKey: apiKey } = await getDiscoveryApiKeys(auth.userId)
+  const { rapidapiKey: apiKey, rapidapiSource } = await getDiscoveryApiAccess(auth.userId)
   if (!apiKey) return err(DISCOVERY_KEY_ERROR_MESSAGES.rapidapi, 501)
 
   const sp          = req.nextUrl.searchParams
@@ -103,9 +103,11 @@ export async function GET(req: NextRequest) {
 
   let raw: Response
   try {
-    raw = await pinnedFetch(`https://${HOST}/active-ats-7d?${params}`, {
+    raw = await trackedJobApiFetch(`https://${HOST}/active-ats-7d?${params}`, {
       headers: { 'x-rapidapi-key': apiKey, 'x-rapidapi-host': HOST },
       cache: 'no-store',
+    }, {
+      provider: 'rapidapi-active-jobs', operation: 'search', credentialSource: rapidapiSource === 'user' ? 'user' : 'platform', userId: auth.userId,
     })
   } catch { return err('Failed to reach Active Jobs DB', 502) }
 
@@ -147,6 +149,7 @@ export async function GET(req: NextRequest) {
   }>
 
   if (!Array.isArray(json)) return err('Unexpected Active Jobs DB response', 502)
+  await reportJobApiJobs(raw, json.length)
 
   const jobs = json.map(r => {
     const salary = fmtAiSalary(

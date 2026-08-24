@@ -1,7 +1,7 @@
-import { pinnedFetch } from '@jobcopilot/shared'
 import type { DiscoveredJob } from '../discover'
 import { acquire } from '../pace/policies'
 import { stripHtml } from '../strip-html'
+import { reportJobApiJobs, trackedJobApiFetch } from '@/lib/api-usage/job-api-usage'
 
 const BASE_URL = 'https://api.cleanjobdata.com/jobs'
 const MAX_PAGES = 3
@@ -10,6 +10,7 @@ const PAGE_SIZE = 20
 
 export interface CleanJobDataQuery {
   apiKey: string
+  userId?: string
   title: string
   countryCode?: string
   companyName?: string
@@ -157,15 +158,18 @@ export async function fetchCleanJobData(query: CleanJobDataQuery): Promise<Clean
 
     await acquire({ ats: 'cleanjobdata' })
     try {
-      const response = await pinnedFetch(`${BASE_URL}?${params}`, {
+      const response = await trackedJobApiFetch(`${BASE_URL}?${params}`, {
         headers: { Accept: 'application/json', 'x-api-key': apiKey },
         signal: AbortSignal.timeout(5_000),
         cache: 'no-store',
         redirect: 'error',
+      }, {
+        provider: 'cleanjobdata', operation: 'list', credentialSource: 'platform', userId: query.userId,
       })
       if (!response.ok) return page === 0 ? [] : results
 
       const envelope = asRecord(await response.json())
+      await reportJobApiJobs(response, Array.isArray(envelope.data) ? envelope.data.length : 0)
       if (!Array.isArray(envelope.data)) return page === 0 ? [] : results
       for (const value of envelope.data) {
         const job = mapJob(value)

@@ -10,10 +10,10 @@
  * See: docs/scraping-autoapply-design.md §4 (ATS Coverage Matrix)
  */
 
-import { pinnedFetch } from '@jobcopilot/shared'
 import type { DiscoveredJob } from "../discover"
 import { acquire } from "../pace/policies"
 import { stripHtml } from "../strip-html"
+import { reportJobApiJobs, trackedJobApiFetch } from '@/lib/api-usage/job-api-usage'
 
 const BASE = "https://api.smartrecruiters.com/v1/companies"
 const PAGE_SIZE = 100
@@ -101,16 +101,20 @@ async function fetchDetail(slug: string, posting: SmartRecruitersPosting): Promi
 
   try {
     await acquire({ ats: "smartrecruiters" })
-    const r = await pinnedFetch(url, {
+    const r = await trackedJobApiFetch(url, {
       headers: {
         "Accept": "application/json",
         "User-Agent": "ApplyMate/1.0",
       },
       signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+    }, {
+      provider: 'smartrecruiters', operation: 'detail', credentialSource: 'public',
     })
 
     if (!r.ok) return null
-    return (await r.json()) as SmartRecruitersDetail
+    const detail = (await r.json()) as SmartRecruitersDetail
+    await reportJobApiJobs(r, detail ? 1 : 0)
+    return detail
   } catch {
     return null
   }
@@ -132,18 +136,21 @@ export async function fetchSmartRecruiters(slug: string): Promise<DiscoveredJob[
     while (offset < totalReported && offset < MAX_JOBS_PER_COMPANY) {
       await acquire({ ats: "smartrecruiters" })
       const url = `${BASE}/${slug}/postings?offset=${offset}&limit=${PAGE_SIZE}`
-      const r = await pinnedFetch(url, {
+      const r = await trackedJobApiFetch(url, {
         headers: {
           "Accept": "application/json",
           "User-Agent": "ApplyMate/1.0",
         },
         signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+      }, {
+        provider: 'smartrecruiters', operation: 'list', credentialSource: 'public',
       })
 
       if (!r.ok) break
 
       const json = (await r.json()) as SmartRecruitersListResponse
       const postings = json.content ?? []
+      await reportJobApiJobs(r, postings.length)
       if (!postings.length) break
 
       if (offset === 0 && typeof json.totalFound === "number") {

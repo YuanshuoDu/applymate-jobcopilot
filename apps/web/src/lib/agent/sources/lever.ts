@@ -11,10 +11,10 @@
  * See: docs/scraping-autoapply-design.md §4 (ATS Coverage Matrix)
  */
 
-import { pinnedFetch } from '@jobcopilot/shared'
 import type { DiscoveredJob } from "../discover"
 import { acquire } from "../pace/policies"
 import { stripHtml } from "../strip-html"
+import { reportJobApiJobs, trackedJobApiFetch } from '@/lib/api-usage/job-api-usage'
 
 const BASE = "https://api.lever.co/v0/postings"
 
@@ -23,6 +23,7 @@ interface LeverPosting {
   id:               string
   text:             string
   hostedUrl:        string
+  applyUrl?:        string
   descriptionPlain?: string
   description?:     string
   categories?: {
@@ -49,14 +50,17 @@ export async function fetchLever(
 
     try {
       const url = `${BASE}/${slug}?mode=json`
-      const r = await pinnedFetch(url, {
+      const r = await trackedJobApiFetch(url, {
         headers: { "Accept": "application/json" },
         signal: AbortSignal.timeout(8_000),
+      }, {
+        provider: 'lever', operation: 'list', credentialSource: 'public',
       })
 
       if (!r.ok) continue
 
       const postings = (await r.json()) as LeverPosting[]
+      await reportJobApiJobs(r, Array.isArray(postings) ? postings.length : 0)
       if (!postings?.length) continue
 
       for (const p of postings) {
@@ -64,7 +68,9 @@ export async function fetchLever(
           title:       p.text,
           company:     slug,
           location:    p.categories?.location ?? "",
-          url:         p.hostedUrl,
+          // Lever distinguishes the public posting page from the application form.
+          // Store the application URL so downstream auto-apply opens the right flow.
+          url:         p.applyUrl ?? p.hostedUrl,
           description: p.descriptionPlain ?? (p.description ? stripHtml(p.description) : ""),
           salary:      null,
           logo:        null,

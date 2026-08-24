@@ -16,7 +16,7 @@ import Anthropic from '@anthropic-ai/sdk'
 import { pinnedFetch } from '@jobcopilot/shared/pinned-outbound'
 import { db }    from '@/lib/db'
 import { isSafeAiEndpoint } from '@jobcopilot/shared/safe-ai-endpoint'
-import { recordAiUsage } from '@/lib/ai-usage'
+import { aiUsageErrorCode, recordAiUsage } from '@/lib/ai-usage'
 import { decryptAiSettings } from '@/lib/ai-credential-settings'
 
 // ── Provider & model catalogue ────────────────────────────────────────────────
@@ -103,13 +103,13 @@ export const MODEL_CATALOGUE: ModelOption[] = [
     provider: 'minimax', model: 'MiniMax-M3',
     label: 'MiniMax M3', description: 'Platform default text model',
     tier: 'standard', priceIn: 0.6, priceOut: 2.4, contextK: 512,
-    defaultBase: 'https://api.minimax.chat/v1',
+    defaultBase: 'https://api.minimax.io/v1',
   },
   {
     provider: 'minimax', model: 'MiniMax-M2.7-highspeed',
     label: 'MiniMax M2.7 Highspeed', description: 'A low-latency version with the same capabilities',
     tier: 'fast', priceIn: 0.6, priceOut: 2.4, contextK: 200,
-    defaultBase: 'https://api.minimax.chat/v1',
+    defaultBase: 'https://api.minimax.io/v1',
   },
 
   // ── Qwen / Tongyi Qianwen ───────────────────────────────────────
@@ -164,6 +164,9 @@ export interface AiConfig {
   apiKey?:    string   // user's own key; falls back to server env var
   apiBase?:   string   // override base URL (required for custom)
   thinking?:  MiniMaxThinkingMode
+  credentialSource?: 'platform' | 'user'
+  usageUserId?: string
+  usageFeatureKey?: string
 }
 
 export type MiniMaxThinkingMode = 'adaptive' | 'disabled'
@@ -183,7 +186,7 @@ export function withMiniMaxThinking(config: AiConfig, thinking: MiniMaxThinkingM
 // ── Resolve effective config ──────────────────────────────────────────────────
 
 /** Merge user config with server env-var fallbacks */
-export function resolveConfig(userConfig?: AiConfig | null, options?: { preserveModel?: boolean }): AiConfig & { resolvedKey: string } {
+export function resolveConfig(userConfig?: AiConfig | null, options?: { preserveModel?: boolean }): AiConfig & { resolvedKey: string; credentialSource: 'platform' | 'user' } {
   const input  = userConfig ?? DEFAULT_AI_CONFIG
   const exact  = MODEL_CATALOGUE.find(m => m.provider === input.provider && m.model === input.model)
   const option = exact
@@ -208,7 +211,8 @@ export function resolveConfig(userConfig?: AiConfig | null, options?: { preserve
     ? cfg.apiBase?.trim() || option?.defaultBase || ''
     : option?.defaultBase || ''
 
-  return { ...cfg, apiBase: resolvedBase, resolvedKey }
+  const credentialSource = cfg.credentialSource ?? (cfg.apiKey?.trim() ? 'user' : 'platform')
+  return { ...cfg, apiBase: resolvedBase, resolvedKey, credentialSource }
 }
 
 function getServerKey(provider: Provider): string {
@@ -260,16 +264,17 @@ export async function modelChat(
   usageContext?: { userId?: string; featureKey?: string },
 ): Promise<ChatResult> {
   const resolved = resolveConfig(config)
+  const effectiveUsage = usageContext ?? { userId: config.usageUserId, featureKey: config.usageFeatureKey }
   const startedAt = Date.now()
   try {
     assertKey(resolved)
     const result = resolved.provider === 'anthropic'
       ? await callAnthropic(messages, resolved, maxTokens)
       : await callOpenAICompat(messages, resolved, maxTokens)
-    void recordAiUsage({ ...usageContext, provider: result.provider, model: result.model, inputTokens: result.inputTokens, outputTokens: result.outputTokens, estimatedCostUsd: aiCost(result.provider, result.model, result.inputTokens ?? 0, result.outputTokens ?? 0), latencyMs: Date.now() - startedAt, status: 'success' })
+    await recordAiUsage({ ...effectiveUsage, credentialSource: resolved.credentialSource, provider: result.provider, model: result.model, inputTokens: result.inputTokens, outputTokens: result.outputTokens, estimatedCostUsd: aiCost(result.provider, result.model, result.inputTokens ?? 0, result.outputTokens ?? 0), latencyMs: Date.now() - startedAt, status: 'success' })
     return result
   } catch (error) {
-    void recordAiUsage({ ...usageContext, provider: resolved.provider, model: resolved.model, estimatedCostUsd: 0, latencyMs: Date.now() - startedAt, status: 'error', errorCode: error instanceof Error ? error.message.slice(0, 120) : 'unknown_error' })
+    await recordAiUsage({ ...effectiveUsage, credentialSource: resolved.credentialSource, provider: resolved.provider, model: resolved.model, estimatedCostUsd: 0, latencyMs: Date.now() - startedAt, status: 'error', errorCode: aiUsageErrorCode(error) })
     throw error
   }
 }
@@ -287,15 +292,33 @@ export async function* modelChatStream(
   messages:  ChatMessage[],
   config:    AiConfig,
   maxTokens: number = 1024,
+  usageContext?: { userId?: string; featureKey?: string },
 ): AsyncGenerator<string> {
   const resolved = resolveConfig(config)
-  assertKey(resolved)
-
-  const raw = resolved.provider === 'anthropic'
-    ? streamAnthropic(messages, resolved, maxTokens)
-    : streamOpenAICompat(messages, resolved, maxTokens)
-
-  yield* stripThinkStream(raw)
+  const effectiveUsage = usageContext ?? { userId: config.usageUserId, featureKey: config.usageFeatureKey }
+  const startedAt = Date.now()
+  try {
+    assertKey(resolved)
+    const streamUsage: StreamUsage = {}
+    const raw = resolved.provider === 'anthropic'
+      ? streamAnthropic(messages, resolved, maxTokens, streamUsage)
+      : streamOpenAICompat(messages, resolved, maxTokens, streamUsage)
+    yield* stripThinkStream(raw)
+    await recordAiUsage({
+      ...effectiveUsage,
+      credentialSource: resolved.credentialSource,
+      provider: resolved.provider,
+      model: resolved.model,
+      inputTokens: streamUsage.inputTokens,
+      outputTokens: streamUsage.outputTokens,
+      estimatedCostUsd: aiCost(resolved.provider, resolved.model, streamUsage.inputTokens ?? 0, streamUsage.outputTokens ?? 0),
+      latencyMs: Date.now() - startedAt,
+      status: 'success',
+    })
+  } catch (error) {
+    await recordAiUsage({ ...effectiveUsage, credentialSource: resolved.credentialSource, provider: resolved.provider, model: resolved.model, latencyMs: Date.now() - startedAt, status: 'error', errorCode: aiUsageErrorCode(error) })
+    throw error
+  }
 }
 
 // ── Anthropic ─────────────────────────────────────────────────────────────────
@@ -335,6 +358,7 @@ async function* streamAnthropic(
   messages:  ChatMessage[],
   config:    AiConfig & { resolvedKey: string },
   maxTokens: number,
+  usage: StreamUsage,
 ): AsyncGenerator<string> {
   const client = new Anthropic({ apiKey: config.resolvedKey })
   const { systemMsg, chatMsgs } = splitSystemMessages(messages)
@@ -348,6 +372,8 @@ async function* streamAnthropic(
   })
 
   for await (const chunk of stream) {
+    if (chunk.type === 'message_start') usage.inputTokens = chunk.message.usage.input_tokens
+    if (chunk.type === 'message_delta') usage.outputTokens = chunk.usage.output_tokens
     if (chunk.type === 'content_block_delta' && chunk.delta.type === 'text_delta') {
       yield chunk.delta.text
     }
@@ -367,6 +393,11 @@ interface OaiRequestConfig {
   thinking?: MiniMaxThinkingMode
 }
 
+type StreamUsage = {
+  inputTokens?: number
+  outputTokens?: number
+}
+
 function oaiFetch(c: OaiRequestConfig): Promise<Response> {
   if (c.provider === 'custom' && !isSafeAiEndpoint(c.base, { allowLocalDevelopment: process.env.NODE_ENV !== 'production' })) {
     return Promise.reject(new Error('Custom AI endpoint is not an allowed public HTTPS destination'))
@@ -383,8 +414,12 @@ function oaiFetch(c: OaiRequestConfig): Promise<Response> {
         max_completion_tokens: c.maxTokens,
         reasoning_split: true,
         ...(c.model === 'MiniMax-M3' ? { thinking: { type: c.thinking ?? 'adaptive' } } : {}),
+        ...(c.stream ? { stream_options: { include_usage: true } } : {}),
       }
-    : { max_tokens: c.maxTokens }
+    : {
+        max_tokens: c.maxTokens,
+        ...(c.stream ? { stream_options: { include_usage: true } } : {}),
+      }
   const request = {
     method:  'POST',
     headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${c.key}` },
@@ -429,6 +464,7 @@ async function* streamOpenAICompat(
   messages:  ChatMessage[],
   config:    AiConfig & { resolvedKey: string; apiBase?: string },
   maxTokens: number,
+  usage: StreamUsage,
 ): AsyncGenerator<string> {
   if (!config.apiBase) throw new Error(`No API base URL for provider "${config.provider}"`)
   const resp = await oaiFetch({ base: config.apiBase, provider: config.provider, model: config.model, key: config.resolvedKey, messages, maxTokens, stream: true, thinking: config.thinking })
@@ -450,6 +486,10 @@ async function* streamOpenAICompat(
         if (payload === '[DONE]') return
         try {
           const json = JSON.parse(payload)
+          const inputTokens = json.usage?.prompt_tokens
+          const outputTokens = json.usage?.completion_tokens
+          if (typeof inputTokens === 'number') usage.inputTokens = inputTokens
+          if (typeof outputTokens === 'number') usage.outputTokens = outputTokens
           const delta = json.choices?.[0]?.delta?.content
           if (delta) yield delta
         } catch { /* skip malformed SSE lines */ }
@@ -617,7 +657,7 @@ export async function loadUserAiConfig(
   featureId: FeatureId,
 ): Promise<AiConfig & { resolvedKey: string }> {
   const settings = await loadUserAiSettings(userId)
-  return resolveFeatureConfig(featureId, settings)
+  return { ...resolveFeatureConfig(featureId, settings), usageUserId: userId, usageFeatureKey: featureId }
 }
 
 export async function loadUserAiSettings(userId: string): Promise<UserAiSettings> {

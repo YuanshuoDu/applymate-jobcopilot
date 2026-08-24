@@ -78,7 +78,8 @@ export class AgentHarness {
     const config = await this.getAiConfig();
     return callLlmText(
       messages as Array<{ role: "system" | "user" | "assistant"; content: string }>,
-      config
+      config,
+      { userId: this.config.userId, featureKey: "autoApply" },
     );
   }
 

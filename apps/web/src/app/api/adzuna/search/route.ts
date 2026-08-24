@@ -4,10 +4,10 @@
  * Proxies Adzuna job search API. Uses candidate credentials first, then the platform pair.
  */
 import { NextRequest } from 'next/server'
-import { pinnedFetch } from '@jobcopilot/shared'
 import { requireAuth, isErrorResponse, ok, err } from '@/lib/api-helpers'
-import { DISCOVERY_KEY_ERROR_MESSAGES, getDiscoveryApiKeys } from '@/lib/discovery-api-keys'
+import { DISCOVERY_KEY_ERROR_MESSAGES, getDiscoveryApiAccess } from '@/lib/discovery-api-keys'
 import { truncate, fmtSalary as fmtSal } from '@/lib/utils'
+import { reportJobApiJobs, trackedJobApiFetch } from '@/lib/api-usage/job-api-usage'
 
 const ADZUNA_BASE = 'https://api.adzuna.com/v1/api/jobs'
 
@@ -21,7 +21,7 @@ export async function GET(req: NextRequest) {
   const auth = await requireAuth(req, 'job_discovery')
   if (isErrorResponse(auth)) return auth
 
-  const { adzunaAppId: appId, adzunaAppKey: appKey } = await getDiscoveryApiKeys(auth.userId)
+  const { adzunaAppId: appId, adzunaAppKey: appKey, adzunaSource } = await getDiscoveryApiAccess(auth.userId)
   if (!appId || !appKey) {
     return err(DISCOVERY_KEY_ERROR_MESSAGES.adzuna, 501)
   }
@@ -52,7 +52,9 @@ export async function GET(req: NextRequest) {
 
   let raw: Response
   try {
-    raw = await pinnedFetch(url, { cache: 'no-store', redirect: 'error' })
+    raw = await trackedJobApiFetch(url, { cache: 'no-store', redirect: 'error' }, {
+      provider: 'adzuna', operation: 'search', credentialSource: adzunaSource === 'user' ? 'user' : 'platform', userId: auth.userId,
+    })
   } catch {
     return err('Failed to reach Adzuna API', 502)
   }
@@ -79,6 +81,7 @@ export async function GET(req: NextRequest) {
     }>
     count: number
   }
+  await reportJobApiJobs(raw, json.results?.length ?? 0)
 
   const jobs = (json.results ?? []).map(r => ({
     id:             r.id,

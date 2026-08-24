@@ -4,7 +4,7 @@ const mocks = vi.hoisted(() => ({
   requireAuth: vi.fn(),
   findUnique: vi.fn(),
   upsert: vi.fn(),
-  getDiscoveryApiKeys: vi.fn(),
+  getDiscoveryApiAccess: vi.fn(),
   getDiscoveryApiKeyStatus: vi.fn(),
   encryptDiscoveryApiKey: vi.fn(async (_field: unknown, value: string) => `enc:${value}`),
 }))
@@ -17,8 +17,9 @@ vi.mock('@/lib/api-helpers', () => ({
 }))
 vi.mock('@/lib/db', () => ({ db: { userApiKeys: { findUnique: mocks.findUnique, upsert: mocks.upsert } } }))
 vi.mock('@/lib/discovery-api-keys', () => ({
-  getDiscoveryApiKeys: mocks.getDiscoveryApiKeys,
+  getDiscoveryApiAccess: mocks.getDiscoveryApiAccess,
   getDiscoveryApiKeyStatus: mocks.getDiscoveryApiKeyStatus,
+  encryptDiscoveryApiKey: mocks.encryptDiscoveryApiKey,
 }))
 
 function request(body: unknown) {

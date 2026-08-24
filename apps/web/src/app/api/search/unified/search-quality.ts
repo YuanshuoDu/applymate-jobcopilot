@@ -18,7 +18,7 @@ export interface SearchJob {
   workArrangement?: string | null
   experienceLevel?: string | null
   hiringManager?: { name: string; title: string; linkedinUrl: string; email: string | null; phone: string | null } | null
-  source: 'adzuna' | 'jsearch' | 'linkedin' | 'jobicy' | 'ats' | 'internships' | 'irishjobs' | 'xing' | 'indeed' | 'remotive' | 'bundesagentur' | 'reed' | 'careerjet' | 'mantiks' | 'cleanjobdata'
+  source: 'adzuna' | 'jsearch' | 'linkedin' | 'jobicy' | 'ats' | 'internships' | 'irishjobs' | 'xing' | 'indeed' | 'remotive' | 'bundesagentur' | 'reed' | 'careerjet' | 'mantiks' | 'cleanjobdata' | 'fantasticjobs'
   score: number
 }
 
@@ -32,6 +32,7 @@ export interface SearchFilters {
   salaryMax?: number
   /** Request-scoped credentials resolved by /lib/discovery-api-keys. */
   discovery?: DiscoveryApiKeys
+  usage?: { userId: string; rapidapiSource: 'user' | 'platform' | 'none'; adzunaSource: 'user' | 'platform' | 'incomplete' | 'none'; clientIp?: string }
 }
 
 const REMOTE_VERIFIED_SOURCES = new Set<string>(['jobicy', 'remotive', 'ats', 'internships', 'cleanjobdata'])

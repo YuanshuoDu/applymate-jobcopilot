@@ -41,6 +41,7 @@ describe("worker platform AI routing", () => {
       model: "deepseek-managed",
       apiBase: "https://deepseek.example/v1",
       apiKey: "deepseek-platform-key",
+      credentialSource: "platform",
     });
   });
 

@@ -17,8 +17,8 @@
  *   postedByDirect 0|1     — 1 = direct employers only
  */
 import { NextRequest } from 'next/server'
-import { pinnedFetch } from '@jobcopilot/shared'
 import { requireAuth, isErrorResponse, ok, err } from '@/lib/api-helpers'
+import { reportJobApiJobs, trackedJobApiFetch } from '@/lib/api-usage/job-api-usage'
 import { truncate } from '@/lib/utils'
 
 const BASE      = 'https://www.reed.co.uk/api/1.0/search'
@@ -65,10 +65,10 @@ export async function GET(req: NextRequest) {
 
   let raw: Response
   try {
-    raw = await pinnedFetch(`${BASE}?${params}`, {
+    raw = await trackedJobApiFetch(`${BASE}?${params}`, {
       headers: { Authorization: `Basic ${credentials}` },
       cache: 'no-store',
-    })
+    }, { provider: 'reed', operation: 'search', credentialSource: 'platform', userId: auth.userId })
   } catch { return err('Failed to reach Reed API', 502) }
 
   if (!raw.ok) {
@@ -94,6 +94,7 @@ export async function GET(req: NextRequest) {
       contractTime?:  string
     }>
   }
+  await reportJobApiJobs(raw, json.results?.length ?? 0)
 
   const jobs = (json.results ?? []).map(r => {
     const min = r.minimumSalary

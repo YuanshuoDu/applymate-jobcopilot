@@ -11,8 +11,8 @@
  *   limit    number  — max results (default 20, max 100)
  */
 import { NextRequest } from 'next/server'
-import { pinnedFetch } from '@jobcopilot/shared'
 import { requireAuth, isErrorResponse, ok, err } from '@/lib/api-helpers'
+import { reportJobApiJobs, trackedJobApiFetch } from '@/lib/api-usage/job-api-usage'
 import { truncate } from '@/lib/utils'
 
 // Map our generic jobType to Remotive categories
@@ -60,10 +60,10 @@ export async function GET(req: NextRequest) {
 
   let raw: Response
   try {
-    raw = await pinnedFetch(`https://remotive.com/api/remote-jobs?${params}`, {
+    raw = await trackedJobApiFetch(`https://remotive.com/api/remote-jobs?${params}`, {
       headers: { 'User-Agent': 'ApplyMate/1.0' },
       next: { revalidate: 900 },  // cache 15 min to respect rate limits
-    })
+    }, { provider: 'remotive', operation: 'search', credentialSource: 'public', userId: auth.userId })
   } catch { return err('Failed to reach Remotive API', 502) }
 
   if (!raw.ok) {
@@ -88,6 +88,7 @@ export async function GET(req: NextRequest) {
       description:                 string
     }>
   }
+  await reportJobApiJobs(raw, json.jobs?.length ?? 0)
 
   const JOB_TYPE_MAP: Record<string, string> = {
     full_time: 'Full Time',

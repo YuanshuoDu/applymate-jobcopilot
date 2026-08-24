@@ -10,10 +10,10 @@
  * See: docs/scraping-autoapply-design.md §4 (ATS Coverage Matrix)
  */
 
-import { pinnedFetch } from '@jobcopilot/shared'
 import type { DiscoveredJob } from "../discover"
 import { acquire } from "../pace/policies"
 import { stripHtml } from "../strip-html"
+import { reportJobApiJobs, trackedJobApiFetch } from '@/lib/api-usage/job-api-usage'
 
 const BASE = "https://boards-api.greenhouse.io/v1/boards"
 
@@ -48,14 +48,17 @@ export async function fetchGreenhouse(
 
     try {
       const url = `${BASE}/${slug}/jobs?content=true`
-      const r = await pinnedFetch(url, {
+      const r = await trackedJobApiFetch(url, {
         headers: { "Accept": "application/json" },
         signal: AbortSignal.timeout(8_000),
+      }, {
+        provider: 'greenhouse', operation: 'list', credentialSource: 'public',
       })
 
       if (!r.ok) continue   // 404, 429, etc. — skip this slug
 
       const json = (await r.json()) as GreenhouseResponse
+      await reportJobApiJobs(r, json.jobs?.length ?? 0)
       if (!json.jobs?.length) continue
 
       for (const j of json.jobs) {

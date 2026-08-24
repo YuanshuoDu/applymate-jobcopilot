@@ -12,12 +12,12 @@
  * Safe to call multiple times — always overwrites with fresher data.
  */
 import { NextRequest } from 'next/server'
-import { pinnedFetch } from '@jobcopilot/shared'
 import { requireAuth, isErrorResponse, ok, err } from '@/lib/api-helpers'
 import { db } from '@/lib/db'
 import { truncate } from '@/lib/utils'
 import { enrichJob } from '@/lib/agent/enrich'
-import { getDiscoveryApiKeys } from '@/lib/discovery-api-keys'
+import { getDiscoveryApiAccess } from '@/lib/discovery-api-keys'
+import { reportJobApiJobs, trackedJobApiFetch } from '@/lib/api-usage/job-api-usage'
 import { getRuntimeAtsPolicy } from '@/lib/runtime-ats-policy'
 import { detectAtsSource } from '@jobcopilot/shared/ats-url'
 import { fetchExternalText } from '@/lib/safe-outbound-url'
@@ -56,7 +56,8 @@ export async function POST(_req: NextRequest, { params }: Params) {
   const job = await db.job.findUnique({ where: { id } })
   if (!job || job.userId !== auth.userId) return err('Not found', 404)
 
-  const { rapidapiKey: rapidKey, adzunaAppId: adzunaId, adzunaAppKey: adzunaKey } = await getDiscoveryApiKeys(auth.userId)
+  const { rapidapiKey: rapidKey, rapidapiSource } = await getDiscoveryApiAccess(auth.userId)
+  const rapidOwner = rapidapiSource === 'user' ? 'user' : 'platform'
   const mantisKey  = process.env.MANTIKS_API_KEY ?? ''
 
   const result: EnrichmentResult = { sources: [] }
@@ -93,14 +94,15 @@ export async function POST(_req: NextRequest, { params }: Params) {
       })
       if (job.company) p.set('organization_description_filter', job.company)
 
-      const atsRes = await pinnedFetch(`https://active-jobs-db.p.rapidapi.com/active-ats-7d?${p}`, {
+      const atsRes = await trackedJobApiFetch(`https://active-jobs-db.p.rapidapi.com/active-ats-7d?${p}`, {
         headers: { 'x-rapidapi-key': rapidKey, 'x-rapidapi-host': 'active-jobs-db.p.rapidapi.com' },
         signal: AbortSignal.timeout(5_000), cache: 'no-store',
-      })
+      }, { provider: 'rapidapi-active-jobs', operation: 'enrich', credentialSource: rapidOwner, userId: auth.userId })
 
       if (atsRes.ok) {
         const jobs = await atsRes.json()
         if (Array.isArray(jobs)) {
+          await reportJobApiJobs(atsRes, jobs.length)
           // Find best match: same company name (case-insensitive)
           const co = job.company.toLowerCase()
           const match = jobs.find((j: { organization?: string }) =>
@@ -141,10 +143,10 @@ export async function POST(_req: NextRequest, { params }: Params) {
         age_in_days: '30',
         keyword:     job.role,
       })
-      const mantRes = await pinnedFetch(`https://api.mantiks.io/company/jobs?${p}`, {
+      const mantRes = await trackedJobApiFetch(`https://api.mantiks.io/company/jobs?${p}`, {
         headers: { 'X-API-KEY': mantisKey },
         signal: AbortSignal.timeout(6_000), cache: 'no-store',
-      })
+      }, { provider: 'mantiks', operation: 'company_jobs', credentialSource: 'platform', userId: auth.userId })
       if (mantRes.ok) {
         const data = await mantRes.json() as {
           jobs?: Array<{
@@ -154,6 +156,7 @@ export async function POST(_req: NextRequest, { params }: Params) {
             }
           }>
         }
+        await reportJobApiJobs(mantRes, data.jobs?.length ?? 0)
         const withContact = data.jobs?.find(j => j.contact?.name)
         if (withContact?.contact?.name) {
           result.hiringManager = {
@@ -187,10 +190,10 @@ export async function POST(_req: NextRequest, { params }: Params) {
 
       const cleanRole = job.role.replace(/\b(senior|sr|junior|jr|lead|staff|principal)\b/gi, '').trim()
       const p = new URLSearchParams({ query: cleanRole, countryCode: cc })
-      const salRes = await pinnedFetch(`https://jobs-api14.p.rapidapi.com/v2/salary/range?${p}`, {
+      const salRes = await trackedJobApiFetch(`https://jobs-api14.p.rapidapi.com/v2/salary/range?${p}`, {
         headers: { 'x-rapidapi-key': rapidKey, 'x-rapidapi-host': 'jobs-api14.p.rapidapi.com' },
         next: { revalidate: 3600 },
-      })
+      }, { provider: 'rapidapi-jobs-api14', operation: 'salary_range', credentialSource: rapidOwner, userId: auth.userId })
       if (salRes.ok) {
         const salJson = await salRes.json() as {
           data?: { currency?: string; yearlySalary?: { min: number; max: number; median: number } }

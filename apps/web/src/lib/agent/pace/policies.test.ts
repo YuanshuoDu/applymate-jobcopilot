@@ -21,4 +21,9 @@ describe('ATS pace policies', () => {
     expect(POLICIES.cleanjobdata).toEqual(DISCOVERY_POLICIES.cleanjobdata)
     expect(ATS_POLICIES).not.toHaveProperty('cleanjobdata')
   })
+
+  it('registers Fantastic Jobs with its API host ceiling', () => {
+    expect(DISCOVERY_POLICIES.fantasticjobs).toEqual({ host: 'data.fantastic.jobs', rps: 1 })
+    expect(POLICIES.fantasticjobs).toEqual(DISCOVERY_POLICIES.fantasticjobs)
+  })
 })

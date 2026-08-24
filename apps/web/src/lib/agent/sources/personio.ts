@@ -36,9 +36,9 @@
  * See: docs/scraping-autoapply-design.md §4 (ATS Coverage Matrix)
  */
 
-import { pinnedFetch } from '@jobcopilot/shared'
 import type { DiscoveredJob } from "../discover"
 import { acquire } from "../pace/policies"
+import { reportJobApiJobs, trackedJobApiFetch } from '@/lib/api-usage/job-api-usage'
 
 const REQUEST_TIMEOUT_MS = 10_000
 
@@ -92,12 +92,14 @@ export async function fetchPersonio(slug: string): Promise<DiscoveredJob[]> {
 
   try {
     await acquire({ ats: "personio" })
-  const r = await pinnedFetch(url, {
+  const r = await trackedJobApiFetch(url, {
       headers: {
         "User-Agent": "ApplyMate/1.0",
         "Accept": "application/xml, text/xml, */*",
       },
       signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+    }, {
+      provider: 'personio', operation: 'list', credentialSource: 'public',
     })
 
     if (!r.ok) return []
@@ -111,6 +113,7 @@ export async function fetchPersonio(slug: string): Promise<DiscoveredJob[]> {
     // Extract each job block
     const blockRe = new RegExp(`<${wrapperTag}[^>]*>([\\s\\S]*?)<\\/${wrapperTag}>`, "gi")
     const blocks = [...xml.matchAll(blockRe)]
+    await reportJobApiJobs(r, blocks.length)
 
     for (const match of blocks) {
       const block = match[1]

@@ -20,9 +20,10 @@
  *   jobType    string  — fulltime | parttime | contract
  */
 import { NextRequest } from 'next/server'
-import { pinnedFetch } from '@jobcopilot/shared'
 import { requireAuth, isErrorResponse, ok, err } from '@/lib/api-helpers'
+import { reportJobApiJobs, trackedJobApiFetch } from '@/lib/api-usage/job-api-usage'
 import { truncate } from '@/lib/utils'
+import { getClientIp } from '@/lib/request-client-ip'
 
 const BASE = 'https://search.api.careerjet.net/v4/query'
 
@@ -67,17 +68,19 @@ export async function GET(req: NextRequest) {
     sort,
     pagesize: String(pageSize),
     page:     String(page),
-    // user_ip and user_agent are required by some partner agreements
-    user_ip:    '1.1.1.1',
     user_agent: 'ApplyMate/1.0',
   })
+  const clientIp = getClientIp(req.headers)
+  if (clientIp) params.set('user_ip', clientIp)
   if (q)        params.set('keywords', q)
   if (location) params.set('location', location)
   if (CONTRACT_MAP[jobType]) params.set('contracttype', CONTRACT_MAP[jobType])
 
   let raw: Response
   try {
-    raw = await pinnedFetch(`${BASE}?${params}`, { cache: 'no-store', redirect: 'error' })
+    raw = await trackedJobApiFetch(`${BASE}?${params}`, { cache: 'no-store', redirect: 'error' }, {
+      provider: 'careerjet', operation: 'search', credentialSource: 'platform', userId: auth.userId,
+    })
   } catch { return err('Failed to reach CareerJet API', 502) }
 
   if (!raw.ok) {
@@ -102,6 +105,7 @@ export async function GET(req: NextRequest) {
   }
 
   if (json.type === 'error') return err(`CareerJet: ${json.message ?? 'Unknown error'}`, 502)
+  await reportJobApiJobs(raw, json.jobs?.length ?? 0)
 
   const jobs = (json.jobs ?? []).map((r, i) => ({
     id:          `cj-${page}-${i}`,

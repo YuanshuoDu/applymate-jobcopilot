@@ -29,11 +29,10 @@ import type { AtsMatch } from "./ats-url-detector"
 
 // Helper: create a mock fetch that returns the given JSON
 function mockFetchOnce(body: unknown, status = 200) {
-  vi.stubGlobal("fetch", vi.fn().mockResolvedValue({
-    ok: status >= 200 && status < 300,
+  vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response(JSON.stringify(body), {
     status,
-    json: async () => body,
-  }))
+    headers: { 'Content-Type': 'application/json' },
+  })))
 }
 
 afterEach(() => {
@@ -69,6 +68,7 @@ describe("fetchViaAtsApi", () => {
         id: "abc-123",
         text: "Data Scientist",
         hostedUrl: "https://jobs.lever.co/stripe/abc-123",
+        applyUrl: "https://jobs.lever.co/stripe/abc-123/apply",
         descriptionPlain: "We are hiring a Data Scientist to build predictive models and analyze large-scale datasets. You will work closely with our product and engineering teams to drive data-informed decisions across the organization.",
       },
     ])
@@ -80,7 +80,7 @@ describe("fetchViaAtsApi", () => {
     expect(result!.method).toBe("t0-ats")
     expect(result!.description).toContain("Data Scientist")
     expect(result!.description).toContain("predictive models")
-    expect(result!.applyUrl).toBe("https://jobs.lever.co/stripe/abc-123")
+    expect(result!.applyUrl).toBe("https://jobs.lever.co/stripe/abc-123/apply")
   })
 
   it("returns null when API returns 404", async () => {

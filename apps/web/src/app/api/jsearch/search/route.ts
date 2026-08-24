@@ -5,10 +5,10 @@
  * Uses the candidate RapidAPI key first, then the platform key.
  */
 import { NextRequest } from 'next/server'
-import { pinnedFetch } from '@jobcopilot/shared'
 import { requireAuth, isErrorResponse, ok, err } from '@/lib/api-helpers'
-import { DISCOVERY_KEY_ERROR_MESSAGES, getDiscoveryApiKeys } from '@/lib/discovery-api-keys'
+import { DISCOVERY_KEY_ERROR_MESSAGES, getDiscoveryApiAccess } from '@/lib/discovery-api-keys'
 import { truncate, fmtSalary } from '@/lib/utils'
+import { reportJobApiJobs, trackedJobApiFetch } from '@/lib/api-usage/job-api-usage'
 
 const HOST = 'jsearch.p.rapidapi.com'
 
@@ -16,7 +16,7 @@ export async function GET(req: NextRequest) {
   const auth = await requireAuth(req, 'job_discovery')
   if (isErrorResponse(auth)) return auth
 
-  const { rapidapiKey: apiKey } = await getDiscoveryApiKeys(auth.userId)
+  const { rapidapiKey: apiKey, rapidapiSource } = await getDiscoveryApiAccess(auth.userId)
   if (!apiKey) return err(DISCOVERY_KEY_ERROR_MESSAGES.rapidapi, 501)
 
   const { searchParams } = req.nextUrl
@@ -36,9 +36,11 @@ export async function GET(req: NextRequest) {
 
   let raw: Response
   try {
-    raw = await pinnedFetch(`https://${HOST}/search-v2?${params}`, {
+    raw = await trackedJobApiFetch(`https://${HOST}/search-v2?${params}`, {
       headers: { 'X-RapidAPI-Key': apiKey, 'X-RapidAPI-Host': HOST },
       cache: 'no-store',
+    }, {
+      provider: 'rapidapi-jsearch', operation: 'search', credentialSource: rapidapiSource === 'user' ? 'user' : 'platform', userId: auth.userId,
     })
   } catch { return err('Failed to reach JSearch API', 502) }
 
@@ -70,6 +72,7 @@ export async function GET(req: NextRequest) {
       total_count?: number
     }
   }
+  await reportJobApiJobs(raw, json.data?.jobs?.length ?? 0)
 
   const jobs = (json.data?.jobs ?? []).map(r => {
     const loc = [r.job_city, r.job_state, r.job_country].filter(Boolean).join(', ')

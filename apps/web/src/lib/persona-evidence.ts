@@ -40,7 +40,7 @@ export async function syncPersonaEvidence(userId: string) {
   const pending = await db.personaEvidenceChunk.findMany({ where: { userId, status: 'confirmed', embeddedAt: null }, select: { id: true, content: true } })
   let embedded = 0
   for (const chunk of pending) {
-    const embedding = await embedPersonaText(chunk.content)
+    const embedding = await embedPersonaText(chunk.content, userId)
     if (!embedding) break
     await db.$executeRaw`UPDATE "persona_evidence_chunks" SET "embedding" = ${vectorLiteral(embedding)}::vector, "embedding_model" = ${PERSONA_EMBEDDING_MODEL}, "embedded_at" = NOW() WHERE "id" = ${chunk.id}`
     embedded++
@@ -49,7 +49,7 @@ export async function syncPersonaEvidence(userId: string) {
 }
 
 export async function retrievePersonaEvidence(userId: string, use: PersonaAllowedUse, query: string, limit = 5): Promise<PersonaEvidence[]> {
-  const embedding = await embedPersonaText(query)
+  const embedding = await embedPersonaText(query, userId)
   if (!embedding) return lexicalEvidence(userId, use, query, limit)
   const rows = await db.$queryRaw<Array<{ content: string; sourceType: string; sourceRef: string; score: number }>>`
     SELECT "content", "source_type" AS "sourceType", "source_ref" AS "sourceRef", (1 - ("embedding" <=> ${vectorLiteral(embedding)}::vector))::float8 AS "score"

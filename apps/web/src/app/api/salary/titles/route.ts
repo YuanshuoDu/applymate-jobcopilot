@@ -4,9 +4,9 @@
  * (used to map fuzzy titles → canonical titles before calling /salary/range).
  */
 import { NextRequest } from 'next/server'
-import { pinnedFetch } from '@jobcopilot/shared'
 import { requireAuth, isErrorResponse, ok, err } from '@/lib/api-helpers'
-import { DISCOVERY_KEY_ERROR_MESSAGES, getDiscoveryApiKeys } from '@/lib/discovery-api-keys'
+import { DISCOVERY_KEY_ERROR_MESSAGES, getDiscoveryApiAccess } from '@/lib/discovery-api-keys'
+import { trackedJobApiFetch } from '@/lib/api-usage/job-api-usage'
 
 const HOST = 'jobs-api14.p.rapidapi.com'
 
@@ -14,7 +14,7 @@ export async function GET(req: NextRequest) {
   const auth = await requireAuth(req)
   if (isErrorResponse(auth)) return auth
 
-  const { rapidapiKey: apiKey } = await getDiscoveryApiKeys(auth.userId)
+  const { rapidapiKey: apiKey, rapidapiSource } = await getDiscoveryApiAccess(auth.userId)
   if (!apiKey) return err(DISCOVERY_KEY_ERROR_MESSAGES.rapidapi, 501)
 
   const { searchParams } = req.nextUrl
@@ -26,10 +26,10 @@ export async function GET(req: NextRequest) {
 
   let raw: Response
   try {
-    raw = await pinnedFetch(`https://${HOST}/v2/salary/titles?${params}`, {
+    raw = await trackedJobApiFetch(`https://${HOST}/v2/salary/titles?${params}`, {
       headers: { 'x-rapidapi-key': apiKey, 'x-rapidapi-host': HOST },
       cache: 'no-store',
-    })
+    }, { provider: 'rapidapi-jobs-api14', operation: 'salary_titles', credentialSource: rapidapiSource === 'user' ? 'user' : 'platform', userId: auth.userId })
   } catch { return err('Failed to reach salary API', 502) }
 
   if (!raw.ok) {

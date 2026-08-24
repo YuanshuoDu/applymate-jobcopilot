@@ -116,6 +116,7 @@ model User {
   adminNotifications        AdminNotification[]        @relation("AdminNotificationRecipient")
   broadcastDeliveries       AdminBroadcastDelivery[]
   aiUsageEvents             AiUsageEvent[]             @relation("AiUsageUser")
+  jobApiUsageEvents         JobApiUsageEvent[]          @relation("JobApiUsageUser")
   adminWebAuthnCredentials  AdminWebAuthnCredential[]
   adminWebAuthnChallenges   AdminWebAuthnChallenge[]
   adminReauthGrants         AdminReauthGrant[]
@@ -1312,6 +1313,7 @@ model AiUsageEvent {
   featureKey      String    @map("feature_key")
   provider        String
   model           String
+  credentialSource String   @default("platform") @map("credential_source")
   inputTokens     Int       @default(0) @map("input_tokens")
   outputTokens    Int       @default(0) @map("output_tokens")
   estimatedCostUsd Float    @default(0) @map("estimated_cost_usd")
@@ -1324,7 +1326,52 @@ model AiUsageEvent {
   @@index([createdAt, status])
   @@index([featureKey, createdAt])
   @@index([provider, model, createdAt])
+  @@index([credentialSource, createdAt])
   @@map("ai_usage_events")
+}
+
+model JobApiUsageEvent {
+  id                 String    @id @default(cuid())
+  userId             String?   @map("user_id")
+  provider           String
+  operation          String
+  credentialSource   String    @default("public") @map("credential_source")
+  requestCount       Int       @default(1) @map("request_count")
+  jobsReturned       Int       @default(0) @map("jobs_returned")
+  latencyMs          Int       @map("latency_ms")
+  status             String
+  httpStatus         Int?      @map("http_status")
+  rateLimitLimit     Int?      @map("rate_limit_limit")
+  rateLimitRemaining Int?      @map("rate_limit_remaining")
+  rateLimitResetAt   DateTime? @map("rate_limit_reset_at")
+  createdAt          DateTime  @default(now()) @map("created_at")
+  user               User?     @relation("JobApiUsageUser", fields: [userId], references: [id], onDelete: SetNull)
+
+  @@index([createdAt, status])
+  @@index([provider, operation, createdAt])
+  @@index([credentialSource, createdAt])
+  @@index([userId, createdAt])
+  @@map("job_api_usage_events")
+}
+
+model ApiQuota {
+  id          String   @id @default(cuid())
+  category    String
+  provider    String
+  operation   String   @default("*")
+  metric      String
+  planName    String   @map("plan_name")
+  period      String
+  limit       Float
+  resetDay    Int      @default(1) @map("reset_day")
+  enabled     Boolean  @default(true)
+  version     Int      @default(1)
+  updatedById String?  @map("updated_by_id")
+  updatedAt   DateTime @updatedAt @map("updated_at")
+
+  @@unique([category, provider, operation, metric])
+  @@index([category, enabled, provider])
+  @@map("api_quotas")
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

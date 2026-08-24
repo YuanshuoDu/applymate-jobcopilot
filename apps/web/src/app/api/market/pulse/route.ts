@@ -14,11 +14,11 @@
  * Falls back gracefully if API keys are not configured.
  */
 import { NextRequest } from 'next/server'
-import { pinnedFetch } from '@jobcopilot/shared'
 import { requireAuth, isErrorResponse, ok } from '@/lib/api-helpers'
 import { db } from '@/lib/db'
 import { truncate } from '@/lib/utils'
-import { getDiscoveryApiKeys } from '@/lib/discovery-api-keys'
+import { getDiscoveryApiAccess } from '@/lib/discovery-api-keys'
+import { reportJobApiJobs, trackedJobApiFetch, type ApiCredentialSource } from '@/lib/api-usage/job-api-usage'
 
 // In-memory cache per userId (market data changes slowly)
 const _pulseCache = new Map<string, { data: object; exp: number }>()
@@ -54,12 +54,13 @@ export async function GET(req: NextRequest) {
   const primaryRole     = roles[0]     ?? ''
   const primaryLocation = locations[0] ?? ''
 
-  const { rapidapiKey: rapidKey, adzunaAppId: adzunaId, adzunaAppKey: adzunaKey } = await getDiscoveryApiKeys(userId)
+  const { rapidapiKey: rapidKey, rapidapiSource } = await getDiscoveryApiAccess(userId)
+  const credentialSource: ApiCredentialSource = rapidapiSource === 'user' ? 'user' : 'platform'
 
   // ── Parallel data collection ──────────────────────────────────────────────
   const [salaryData, jobsData] = await Promise.all([
-    primaryRole && rapidKey ? fetchSalary(primaryRole, primaryLocation, rapidKey) : Promise.resolve(null),
-    primaryRole && rapidKey ? fetchRecentJobs(primaryRole, primaryLocation, rapidKey, adzunaId, adzunaKey) : Promise.resolve([]),
+    primaryRole && rapidKey ? fetchSalary(primaryRole, primaryLocation, rapidKey, userId, credentialSource) : Promise.resolve(null),
+    primaryRole && rapidKey ? fetchRecentJobs(primaryRole, primaryLocation, rapidKey, userId, credentialSource) : Promise.resolve([]),
   ])
 
   // ── Aggregate job intelligence ────────────────────────────────────────────
@@ -90,6 +91,8 @@ async function fetchSalary(
   role: string,
   location: string,
   rapidKey: string,
+  userId: string,
+  credentialSource: ApiCredentialSource,
 ): Promise<{ currency: string; median: number; min: number; max: number } | null> {
   const loc = location.toLowerCase()
   const ccMap: Record<string, string> = {
@@ -110,10 +113,10 @@ async function fetchSalary(
   const cleanRole = role.replace(/\b(senior|sr|junior|jr|lead|staff|principal)\b/gi, '').trim()
   try {
     const p = new URLSearchParams({ query: cleanRole, countryCode: cc })
-    const res = await pinnedFetch(`https://jobs-api14.p.rapidapi.com/v2/salary/range?${p}`, {
+    const res = await trackedJobApiFetch(`https://jobs-api14.p.rapidapi.com/v2/salary/range?${p}`, {
       headers: { 'x-rapidapi-key': rapidKey, 'x-rapidapi-host': 'jobs-api14.p.rapidapi.com' },
       next: { revalidate: 3600 },
-    })
+    }, { provider: 'rapidapi-jobs-api14', operation: 'salary_range', credentialSource, userId })
     if (!res.ok) return null
     const json = await res.json() as {
       data?: { currency?: string; yearlySalary?: { min: number; max: number; median: number } }
@@ -139,8 +142,8 @@ async function fetchRecentJobs(
   role: string,
   location: string,
   rapidKey: string,
-  adzunaId: string,
-  adzunaKey: string,
+  userId: string,
+  credentialSource: ApiCredentialSource,
 ): Promise<PulseJob[]> {
   const results: PulseJob[] = []
 
@@ -153,13 +156,14 @@ async function fetchRecentJobs(
       include_ai:       'true',
     })
     if (location) p.set('location_filter', location)
-    const res = await pinnedFetch(`https://active-jobs-db.p.rapidapi.com/active-ats-7d?${p}`, {
+    const res = await trackedJobApiFetch(`https://active-jobs-db.p.rapidapi.com/active-ats-7d?${p}`, {
       headers: { 'x-rapidapi-key': rapidKey, 'x-rapidapi-host': 'active-jobs-db.p.rapidapi.com' },
       signal: AbortSignal.timeout(6_000), cache: 'no-store',
-    })
+    }, { provider: 'rapidapi-active-jobs', operation: 'market_pulse', credentialSource, userId })
     if (res.ok) {
       const json = await res.json()
       if (Array.isArray(json)) {
+        await reportJobApiJobs(res, json.length)
         for (const j of json) {
           results.push({
             company:         j.organization ?? '',
@@ -181,13 +185,14 @@ async function fetchRecentJobs(
       exclude_ats_duplicate: 'true',
     })
     if (location) p.set('location_filter', location)
-    const res = await pinnedFetch(`https://linkedin-job-search-api.p.rapidapi.com/active-jb-24h?${p}`, {
+    const res = await trackedJobApiFetch(`https://linkedin-job-search-api.p.rapidapi.com/active-jb-24h?${p}`, {
       headers: { 'x-rapidapi-key': rapidKey, 'x-rapidapi-host': 'linkedin-job-search-api.p.rapidapi.com' },
       signal: AbortSignal.timeout(5_000), cache: 'no-store',
-    })
+    }, { provider: 'rapidapi-linkedin', operation: 'market_pulse', credentialSource, userId })
     if (res.ok) {
       const json = await res.json()
       if (Array.isArray(json)) {
+        await reportJobApiJobs(res, json.length)
         for (const j of json) {
           results.push({
             company:         j.organization ?? '',
