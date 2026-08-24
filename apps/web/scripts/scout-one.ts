@@ -5,6 +5,7 @@
  *   pnpm --filter web exec tsx scripts/scout-one.ts greenhouse booking
  *   pnpm --filter web exec tsx scripts/scout-one.ts lever spotify
  *   pnpm --filter web exec tsx scripts/scout-one.ts smartrecruiters SmartRecruiters
+ *   pnpm --filter web exec tsx scripts/scout-one.ts ashby OpenAI
  *   pnpm --filter web exec tsx scripts/scout-one.ts cleanjobdata "software engineer" IE
  *
  * Registry mode (batch all employers in the registry):
@@ -20,10 +21,11 @@ import { fetchWorkday } from "../src/lib/agent/sources/workday"
 import { fetchLever } from "../src/lib/agent/sources/lever"
 import { fetchSmartRecruiters } from "../src/lib/agent/sources/smartrecruiters"
 import { fetchPersonio } from "../src/lib/agent/sources/personio"
+import { fetchAshby } from "../src/lib/agent/sources/ashby"
 import { fetchCleanJobData } from "../src/lib/agent/sources/cleanjobdata"
 import { loadRegistry, loadWorkdayRegistry, type Employer, type WorkdayEmployer } from "../src/lib/agent/registries"
 
-type Ats = "greenhouse" | "lever" | "workday" | "smartrecruiters" | "personio"
+type Ats = "greenhouse" | "lever" | "workday" | "smartrecruiters" | "personio" | "ashby"
 
 async function main() {
   const args = process.argv.slice(2)
@@ -31,8 +33,8 @@ async function main() {
   // Registry mode: --registry <ats>
   if (args[0] === "--registry") {
     const ats = args[1] as Ats | undefined
-    if (!ats || !["greenhouse", "lever", "workday", "smartrecruiters", "personio"].includes(ats)) {
-      console.error("Usage: pnpm --filter web exec tsx scripts/scout-one.ts --registry <greenhouse|lever|workday|smartrecruiters|personio>")
+    if (!ats || !["greenhouse", "lever", "workday", "smartrecruiters", "personio", "ashby"].includes(ats)) {
+      console.error("Usage: pnpm --filter web exec tsx scripts/scout-one.ts --registry <greenhouse|lever|workday|smartrecruiters|personio|ashby>")
       process.exit(1)
     }
     await runRegistry(ats)
@@ -43,7 +45,7 @@ async function main() {
   if (args.length < 2) {
     console.error("Usage: pnpm --filter web exec tsx scripts/scout-one.ts <ats> <slug>")
     console.error("       pnpm --filter web exec tsx scripts/scout-one.ts cleanjobdata <query> [ISO-country-code]")
-    console.error("       pnpm --filter web exec tsx scripts/scout-one.ts --registry <greenhouse|lever|workday|smartrecruiters|personio>")
+    console.error("       pnpm --filter web exec tsx scripts/scout-one.ts --registry <greenhouse|lever|workday|smartrecruiters|personio|ashby>")
     process.exit(1)
   }
 
@@ -70,6 +72,9 @@ async function main() {
   } else if (ats === "personio") {
     console.log(`Scouting personio / ${slug} ...`)
     jobs = await fetchPersonio(slug)
+  } else if (ats === "ashby") {
+    console.log(`Scouting ashby / ${slug} ...`)
+    jobs = await fetchAshby([slug])
   } else if (ats === "workday") {
     const employers = loadWorkdayRegistry()
     const employer = employers.find((e: WorkdayEmployer) => e.tenant === slug)
@@ -80,7 +85,7 @@ async function main() {
     console.log(`Scouting workday / ${employer.name} (${employer.tenant}) ...`)
     jobs = await fetchWorkday([employer])
   } else {
-    console.error(`Unknown source: ${ats}. Supported: cleanjobdata, greenhouse, lever, workday, smartrecruiters, personio`)
+    console.error(`Unknown source: ${ats}. Supported: cleanjobdata, greenhouse, lever, workday, smartrecruiters, personio, ashby`)
     process.exit(1)
   }
 
@@ -135,7 +140,9 @@ async function runRegistry(ats: Ats) {
       ? fetchLever
       : ats === "personio"
         ? async (slugs: string[]) => (await Promise.all(slugs.map(fetchPersonio))).flat()
-        : async (slugs: string[]) => (await Promise.all(slugs.map(fetchSmartRecruiters))).flat()
+        : ats === "ashby"
+          ? fetchAshby
+          : async (slugs: string[]) => (await Promise.all(slugs.map(fetchSmartRecruiters))).flat()
 
   console.log(`Fetching ${slugs.length} employers (${ats})...\n`)
   const jobs = await fetcher(slugs)
