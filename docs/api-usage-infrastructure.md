@@ -7,9 +7,11 @@ Tracked event providers:
 - Gmail API and Google OAuth (user-owned credentials)
 - GitHub API (user-owned credentials)
 - Resend (platform email; set `EXTERNAL_API_COST_PER_REQUEST_RESEND` when the plan is metered)
+- Azure Key Vault (platform credential wrapping; set `EXTERNAL_API_COST_PER_REQUEST_AZURE_KEY_VAULT` when metered)
 - Worker control and scheduled agent-run calls (internal operational metadata)
 - Upstash Redis (server-only `INFO` snapshot; no Redis command body is stored)
+- Vercel Speed Insights (browser telemetry; provider-side usage is not exposed to the server)
 
-Upstash configuration is server-only. Set `PAID_REDIS_KV_REST_API_URL`, `PAID_REDIS_KV_REST_API_TOKEN`, and `REDIS_COST_PER_100K_COMMANDS=0.20`. `REDIS_COST_ALERT_USD=5` marks the dashboard warning threshold, while `REDIS_MAX_BUDGET_USD=20` documents the provider-side stop cap. The Upstash console remains authoritative for the actual budget stop; the application alert does not stop Redis.
+Upstash configuration is server-only. For current-month requests, bandwidth, and billed cost, set `PAID_REDIS_DATABASE_ID`, `UPSTASH_API_EMAIL`, and `UPSTASH_API_KEY` (Upstash Developer API credentials), in addition to `PAID_REDIS_KV_REST_API_URL` and `PAID_REDIS_KV_REST_API_TOKEN`. If management credentials are not configured, the dashboard falls back to the Redis `INFO` snapshot and labels it `instance_lifetime`; that fallback is a command-only estimate and is not a billing-period total. `REDIS_COST_ALERT_USD=5` marks the dashboard warning threshold and is evaluated by the five-minute `/api/admin/observability/alerts/evaluate` cron, which creates a deduplicated admin incident/notification without stopping Redis. `REDIS_MAX_BUDGET_USD=20` documents the provider-side stop cap. The Upstash console remains authoritative for the actual budget stop.
 
 Neon/Postgres is listed as an inventory item but intentionally reports telemetry unavailable: database billing is not request-count based and no provider billing API is queried. No API keys, access tokens, URLs, request bodies, response bodies, email contents, prompts, or exception text are persisted in usage events.

@@ -5,6 +5,8 @@ import { writeAdminAudit } from '@/lib/admin/audit'
 import { notifyAdministrators } from '@/lib/admin/admin-notifications'
 import { db } from '@/lib/db'
 import { getQueueSloSnapshot } from '@/lib/admin/queue-slo'
+import { readRedisUsage } from '@/lib/admin/redis-usage'
+import { redisBudgetAlert } from '@/lib/admin/redis-cost-alert'
 
 function authorized(request: NextRequest) {
   const authorization = request.headers.get('authorization')
@@ -35,8 +37,20 @@ function breached(value: number, operator: string, threshold: number) {
 async function evaluate(request: NextRequest) {
   if (!authorized(request)) return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
   const rules = await db.adminAlertRule.findMany({ where: { enabled: true } })
-  const [snapshot, queue] = await Promise.all([getObservabilitySnapshot({ days: 1 }), getQueueSloSnapshot()])
+  const [snapshot, queue, redisSnapshot] = await Promise.all([getObservabilitySnapshot({ days: 1 }), getQueueSloSnapshot(), readRedisUsage()])
   const fired: string[] = []
+  const redisAlert = redisBudgetAlert(redisSnapshot)
+  if (redisAlert) {
+    const monthStart = new Date(Date.UTC(new Date().getUTCFullYear(), new Date().getUTCMonth(), 1))
+    const existing = await db.adminAlertEvent.findFirst({ where: { ruleKey: redisAlert.ruleKey, status: 'open', createdAt: { gte: monthStart } }, select: { id: true } })
+    if (!existing) {
+      const event = await db.adminAlertEvent.create({ data: { ruleKey: redisAlert.ruleKey, metric: redisAlert.metric, value: redisAlert.value, threshold: redisAlert.threshold, severity: redisAlert.severity } })
+      const incident = await db.adminIncident.create({ data: { title: redisAlert.title, summary: redisAlert.body, service: 'upstash-redis', severity: redisAlert.severity, createdById: 'system', updatedById: 'system' } })
+      await db.adminAlertEvent.update({ where: { id: event.id }, data: { incidentId: incident.id } })
+      await notifyAdministrators({ permission: 'observability.read', type: 'external_api_budget_alert', title: redisAlert.title, body: redisAlert.body, entityType: 'incident', entityId: incident.id, dedupeKey: redisAlert.dedupeKey }).catch(() => undefined)
+      fired.push(redisAlert.ruleKey)
+    }
+  }
   for (const rule of rules) {
     const value = metricValue(rule.metric, snapshot, queue)
     if (value === null || !breached(value, rule.operator, rule.threshold)) continue

@@ -1,6 +1,7 @@
 import { DefaultAzureCredential } from '@azure/identity'
 import { CryptographyClient, KeyClient } from '@azure/keyvault-keys'
 import { createCipheriv, createDecipheriv, randomBytes } from 'node:crypto'
+import { recordSharedExternalApiUsage, sharedExternalApiErrorCode } from './external-api-usage.js'
 
 const PREFIX = 'enc:v2:'
 const LEGACY_PREFIX = 'enc:v1:'
@@ -160,7 +161,7 @@ async function getEncryptionKey(): Promise<CachedDataKey> {
 
   const dataKey = randomBytes(DATA_KEY_BYTES)
   const client = await getCryptographyClient()
-  const response = await client.wrapKey(WRAP_ALGORITHM, dataKey)
+  const response = await withAzureUsage('wrap_key', () => client.wrapKey(WRAP_ALGORITHM, dataKey), DATA_KEY_BYTES)
   const keyId = response.keyID ?? client.keyID
   if (!response.result || !keyId) throw new Error('Azure Key Vault did not return a wrapped data key')
   cachedDataKey = {
@@ -179,7 +180,8 @@ async function getDecryptionKey(envelope: SecretEnvelope): Promise<Buffer> {
   }
 
   const client = await getCryptographyClient(envelope.keyId)
-  const response = await client.unwrapKey(WRAP_ALGORITHM, Buffer.from(envelope.wrappedKey, 'base64'))
+  const wrappedKey = Buffer.from(envelope.wrappedKey, 'base64')
+  const response = await withAzureUsage('unwrap_key', () => client.unwrapKey(WRAP_ALGORITHM, wrappedKey), wrappedKey.length)
   if (!response.result || response.result.length !== DATA_KEY_BYTES) throw new Error('Azure Key Vault returned an invalid data key')
   return Buffer.from(response.result)
 }
@@ -196,7 +198,7 @@ async function getCryptographyClient(keyId?: string): Promise<CryptographyClient
       throw new Error('Encrypted credential references an untrusted Azure Key Vault key')
     }
   } else {
-    const key = await new KeyClient(config.vaultUrl, credential).getKey(config.keyName)
+    const key = await withAzureUsage('get_key', () => new KeyClient(config.vaultUrl, credential).getKey(config.keyName))
     resolvedKeyId = key.id
   }
   if (!resolvedKeyId) throw new Error('Azure Key Vault credential key was not found')
@@ -205,6 +207,30 @@ async function getCryptographyClient(keyId?: string): Promise<CryptographyClient
   const client = new CryptographyClient(resolvedKeyId, credential)
   cryptographyClients.set(resolvedKeyId, client)
   return client
+}
+
+async function withAzureUsage<T>(operation: string, task: () => Promise<T>, inputBytes = 0): Promise<T> {
+  const startedAt = Date.now()
+  try {
+    const result = await task()
+    await recordSharedExternalApiUsage({ provider: 'azure-key-vault', operation, status: 'success', latencyMs: Date.now() - startedAt, inputBytes, outputBytes: resultBytes(result) })
+    return result
+  } catch (error) {
+    await recordSharedExternalApiUsage({ provider: 'azure-key-vault', operation, status: 'error', latencyMs: Date.now() - startedAt, inputBytes, errorCode: sharedExternalApiErrorCode(error), httpStatus: statusCode(error) })
+    throw error
+  }
+}
+
+function resultBytes(value: unknown): number {
+  if (!value || typeof value !== 'object' || !('result' in value)) return 0
+  const result = (value as { result?: unknown }).result
+  return result instanceof Uint8Array ? result.byteLength : 0
+}
+
+function statusCode(value: unknown): number | undefined {
+  return value && typeof value === 'object' && 'statusCode' in value && typeof (value as { statusCode?: unknown }).statusCode === 'number'
+    ? (value as { statusCode: number }).statusCode
+    : undefined
 }
 
 function getAzureKeyConfig(): AzureKeyConfig | null {

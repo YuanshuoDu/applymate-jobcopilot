@@ -16,6 +16,10 @@
     {
       "path": "/api/admin/audit-checkpoint",
       "schedule": "0 2 * * *"
+    },
+    {
+      "path": "/api/admin/observability/alerts/evaluate",
+      "schedule": "*/5 * * * *"
     }
   ]
 }
