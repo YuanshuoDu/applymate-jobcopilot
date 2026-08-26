@@ -6,6 +6,7 @@ import { isUserActive } from '../db/application-task-state.js'
 import { isWorkerFeatureEnabled } from '../admin/runtime-feature-flags.js'
 import { workerPollingOptions } from './worker-polling-options.js'
 import { discoverGreenhouseJobs, discoverLeverJobs, type DiscoveredJob } from './scout-discovery.js'
+import { loadEnabledAtsSlugs } from './ats-registry.js'
 import { redisConnection } from '../redis.js'
 
 const connection = redisConnection
@@ -18,11 +19,11 @@ export interface ScoutTaskPayload {
 
 export const scoutQueue = new Queue<ScoutTaskPayload>(SCOUT_QUEUE_NAME, { connection, skipVersionCheck: true })
 
-const GREENHOUSE_SLUGS = [
+const GREENHOUSE_STAGED_FALLBACK = [
   'n26', 'personio', 'contentful', 'deliveroo', 'zalando', 'spotify', 'revolut', 'klarna', 'checkout', 'stripe',
   'datadog', 'figma', 'airtable', 'notion', 'vercel', 'hubspot', 'gitlab', 'databricks', 'snowflake', 'confluent',
 ]
-const LEVER_SLUGS = [
+const LEVER_STAGED_FALLBACK = [
   'spotify', 'klarna', 'tiermobility', 'n26', 'deliveroo', 'monzo', 'revolut', 'checkout', 'wefox', 'tradeRepublic',
   'personio', 'zalando', 'deliveryHero', 'bolt', 'northvolt',
 ]
@@ -54,11 +55,22 @@ export const scoutWorker = new Worker<ScoutTaskPayload>(
       return { skipped: true, reason: 'no-target-roles' }
     }
 
+    let greenhouseSlugs: string[]
+    let leverSlugs: string[]
+    try {
+      [greenhouseSlugs, leverSlugs] = await Promise.all([
+        loadEnabledAtsSlugs(pool, 'greenhouse', GREENHOUSE_STAGED_FALLBACK),
+        loadEnabledAtsSlugs(pool, 'lever', LEVER_STAGED_FALLBACK),
+      ])
+    } catch (error) {
+      console.warn('[scout-worker] ATS registry unavailable', { error: error instanceof Error ? error.message : String(error) })
+      return { skipped: true, reason: 'ats-registry-unavailable' }
+    }
     const existingResult = await pool.query('SELECT url FROM "Job" WHERE "userId" = $1 AND url IS NOT NULL', [userId])
     const existingUrls = new Set<string>(existingResult.rows.map((row: { url: string }) => row.url).filter(Boolean))
     const [greenhouseJobs, leverJobs] = await Promise.all([
-      discoverGreenhouseJobs({ pool, redis: connection, userId, slugs: GREENHOUSE_SLUGS }),
-      discoverLeverJobs({ pool, redis: connection, userId, slugs: LEVER_SLUGS }),
+      discoverGreenhouseJobs({ pool, redis: connection, userId, slugs: greenhouseSlugs }),
+      discoverLeverJobs({ pool, redis: connection, userId, slugs: leverSlugs }),
     ])
     const discovered = [...greenhouseJobs, ...leverJobs]
     const matching = discovered.filter(job => matchesRole(job, config.targetRoles!, existingUrls))

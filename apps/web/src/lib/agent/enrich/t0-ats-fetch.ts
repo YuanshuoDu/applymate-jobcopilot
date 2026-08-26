@@ -55,10 +55,11 @@ export async function fetchViaAtsApi(
     if (!result) return null
 
     // Upsert employer into dynamic registry
+    const seenAt = new Date()
     await db.atsEmployer.upsert({
       where: { atsType_slug: { atsType: match.ats, slug: match.slug } },
-      update: { lastSeen: new Date(), jobCount: { increment: 1 } },
-      create: { atsType: match.ats, slug: match.slug },
+      update: { lastSeen: seenAt, jobCount: { increment: 1 } },
+      create: { atsType: match.ats, slug: match.slug, firstSeen: seenAt, lastSeen: seenAt },
     }).catch(() => { /* non-blocking */ })
 
     return result

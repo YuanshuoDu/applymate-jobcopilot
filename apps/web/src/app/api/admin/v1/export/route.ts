@@ -48,10 +48,12 @@ export async function GET(request: NextRequest) {
     filename = 'applymate-users.csv'; rowCount = rows.length
   } else if (resource === 'ats') {
     const ids = requestedIds.map(Number).filter(Number.isInteger)
-    const where: Prisma.AtsEmployerWhereInput = { ...(ids.length ? { id: { in: ids } } : {}), ...(query ? { OR: [{ atsType: { contains: query, mode: 'insensitive' } }, { slug: { contains: query, mode: 'insensitive' } }, { name: { contains: query, mode: 'insensitive' } }] } : {}) }
-    const orderBy: Prisma.AtsEmployerOrderByWithRelationInput = sort === 'jobCount' ? { jobCount: direction } : sort === 'lastSeen' ? { lastSeen: direction } : { id: direction }
-    const rows = await db.atsEmployer.findMany({ where, orderBy, take: limit, select: { atsType: true, slug: true, name: true, jobCount: true, firstSeen: true, lastSeen: true } })
-    content = csv(['ats_type', 'slug', 'name', 'job_count', 'first_seen', 'last_seen'], rows.map(row => [row.atsType, row.slug, row.name, row.jobCount, row.firstSeen.toISOString(), row.lastSeen.toISOString()]))
+    const atsType = request.nextUrl.searchParams.get('atsType')?.trim().toLowerCase()
+    const enabled = request.nextUrl.searchParams.get('enabled')
+    const where: Prisma.AtsEmployerWhereInput = { ...(ids.length ? { id: { in: ids } } : {}), ...(atsType ? { atsType } : {}), ...(enabled && ['true', 'false'].includes(enabled) ? { enabled: enabled === 'true' } : {}), ...(query ? { OR: [{ atsType: { contains: query, mode: 'insensitive' } }, { slug: { contains: query, mode: 'insensitive' } }, { name: { contains: query, mode: 'insensitive' } }, { country: { contains: query, mode: 'insensitive' } }] } : {}) }
+    const orderBy: Prisma.AtsEmployerOrderByWithRelationInput = sort === 'jobCount' ? { jobCount: direction } : sort === 'lastSeen' ? { lastSeen: direction } : sort === 'name' ? { name: direction } : sort === 'source' ? { atsType: direction } : { id: direction }
+    const rows = await db.atsEmployer.findMany({ where, orderBy, take: limit, select: { atsType: true, slug: true, name: true, country: true, enabled: true, jobCount: true, firstSeen: true, lastSeen: true } })
+    content = csv(['ats_type', 'slug', 'name', 'country', 'enabled', 'job_count', 'first_seen', 'last_seen'], rows.map(row => [row.atsType, row.slug, row.name, row.country, row.enabled, row.jobCount, row.firstSeen?.toISOString() ?? '', row.lastSeen?.toISOString() ?? '']))
     filename = 'applymate-ats-sources.csv'; rowCount = rows.length
   } else if (resource === 'ats-quality') {
     const days = Math.min(Math.max(Number(request.nextUrl.searchParams.get('days') ?? '30') || 30, 1), 365)

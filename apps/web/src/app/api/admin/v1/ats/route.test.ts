@@ -15,4 +15,26 @@ describe('GET /api/admin/v1/ats', () => {
     await expect(response.json()).resolves.toEqual(expect.objectContaining({ items: [expect.objectContaining({ rateLimitRps: 5, credentialRequirement: 'none' })] }))
     expect(mocks.requireAdmin).toHaveBeenCalledWith('ats.read', expect.any(Request))
   })
+
+  it('applies employer search and enabled/source filters', async () => {
+    mocks.requireAdmin.mockResolvedValue({ userId: 'admin-1', roleKey: 'operations', requestId: 'req-1' })
+    mocks.findMany.mockResolvedValue([])
+    const { GET } = await import('./route')
+    const response = await GET(new Request('http://localhost/api/admin/v1/ats?q=trade&atsType=lever&enabled=false&sort=name&direction=desc') as never)
+
+    expect(response.status).toBe(200)
+    expect(mocks.findMany).toHaveBeenCalledWith(expect.objectContaining({
+      where: { atsType: 'lever', enabled: false, OR: expect.arrayContaining([{ name: { contains: 'trade', mode: 'insensitive' } }]) },
+      orderBy: [{ name: 'desc' }, { id: 'asc' }],
+    }))
+  })
+
+  it('does not advertise unmanaged ATS registries as Worker controls', async () => {
+    mocks.requireAdmin.mockResolvedValue({ userId: 'admin-1', roleKey: 'operations', requestId: 'req-1' })
+    const { GET } = await import('./route')
+    const response = await GET(new Request('http://localhost/api/admin/v1/ats?atsType=personio') as never)
+
+    expect(response.status).toBe(400)
+    expect(mocks.findMany).not.toHaveBeenCalled()
+  })
 })

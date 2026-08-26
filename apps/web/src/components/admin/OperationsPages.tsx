@@ -2,6 +2,7 @@
 
 import { AdminDataTable, values, type BulkAction } from './AdminDataTable'
 import { AdminAtsControls } from './AdminAtsControls'
+import { AdminAtsRegistry } from './AdminAtsRegistry'
 import { AdminAtsQualityTrends } from './AdminAtsQualityTrends'
 import { AdminBudgetControls } from './AdminBudgetControls'
 import { AdminAiConfigPanel } from './AdminAiConfigPanel'
@@ -9,6 +10,7 @@ import { AdminAiUsageTrends } from './AdminAiUsageTrends'
 import { useAdminPrompt } from './AdminPromptDialog'
 import { adminMutationHeaders } from '@/lib/admin/client'
 import Link from 'next/link'
+import { CalendarDays } from 'lucide-react'
 import { useI18n } from '@/lib/i18n'
 
 function ApplicationActions({ row, permissions }: { row: Record<string, unknown>; permissions: readonly string[] }) {
@@ -47,10 +49,7 @@ export function AdminUsersPage({ canExport = false, permissions = [] }: { canExp
 
 export function AdminAtsPage({ permissions }: { permissions: readonly string[] }) {
   const { t } = useI18n()
-  return <><AdminDataTable title={t('ops.atsTitle')} subtitle={t('ops.atsSubtitle')} endpoint="/api/admin/v1/ats" columns={[
-    { label: t('ops.source'), sortKey: 'name', value: (row) => `${row.atsType} · ${row.name ?? row.slug}` }, { label: t('ops.jobs'), sortKey: 'jobCount', value: values.text('jobCount') },
-    { label: t('ops.rpsCeiling'), value: (row) => row.rateLimitRps ? `${row.rateLimitRps} rps` : t('ops.notRegistered') }, { label: t('ops.lastSeen'), sortKey: 'lastSeen', value: values.date('lastSeen') }, { label: t('ops.credential'), value: (row) => row.credentialRequirement === 'none' ? t('ops.notRequired') : row.credentialConfigured ? t('ops.configured') : t('ops.notReported') },
-  ]} exportEndpoint="/api/admin/v1/export?resource=ats" /><AdminAtsControls permissions={permissions} /><AdminAtsQualityTrends /></>
+  return <div className="admin-page"><header className="admin-header"><div><h1>{t('ops.atsTitle')}</h1><p>{t('ops.atsSubtitle')}</p></div><div className="admin-header-time"><CalendarDays size={18} /> {t('admin.operationalControls')}</div></header><AdminAtsRegistry canManage={permissions.includes('ats.registry.manage')} /><AdminAtsControls permissions={permissions} /><AdminAtsQualityTrends /></div>
 }
 
 export function AdminApplicationsPage({ permissions = [] }: { permissions?: readonly string[] }) {

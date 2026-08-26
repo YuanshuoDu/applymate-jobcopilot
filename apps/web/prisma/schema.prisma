@@ -558,15 +558,21 @@ model AgentRole {
 }
 
 model AtsEmployer {
-  id        Int      @id @default(autoincrement())
+  id        Int       @id @default(autoincrement())
   atsType   String
   slug      String
   name      String?
-  firstSeen DateTime @default(now())
-  lastSeen  DateTime @updatedAt
-  jobCount  Int      @default(0)
+  country   String?   @db.VarChar(2)
+  enabled   Boolean   @default(true)
+  version   Int       @default(1)
+  firstSeen DateTime?
+  lastSeen  DateTime?
+  jobCount  Int       @default(0)
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
 
   @@unique([atsType, slug])
+  @@index([atsType, enabled])
   @@map("ats_employers")
 }
 
