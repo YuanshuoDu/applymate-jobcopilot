@@ -155,7 +155,7 @@ export async function GET(request: NextRequest) {
   const externalProviders = EXTERNAL_API_PROVIDERS.filter(item => !provider || item.key === provider).map(item => {
     const rows = externalStats.get(item.key) ?? []
     const snapshot = item.key === 'upstash-redis' && redisSnapshot
-      ? { calls: redisSnapshot.totalCommands, inputBytes: redisSnapshot.inputBytes, outputBytes: redisSnapshot.outputBytes, cost: redisSnapshot.estimatedCostUsd, costKnown: true, sampledAt: redisSnapshot.sampledAt, period: redisSnapshot.period, source: redisSnapshot.source, alertThresholdUsd: redisSnapshot.alertThresholdUsd, maxBudgetUsd: redisSnapshot.maxBudgetUsd, alertTriggered: redisSnapshot.alertTriggered, metrics: [] }
+      ? { calls: redisSnapshot.totalCommands, inputBytes: redisSnapshot.inputBytes, outputBytes: redisSnapshot.outputBytes, cost: redisSnapshot.estimatedCostUsd, costKnown: true, sampledAt: redisSnapshot.sampledAt, period: redisSnapshot.period, source: redisSnapshot.source, alertThresholdUsd: redisSnapshot.alertThresholdUsd, maxBudgetUsd: redisSnapshot.maxBudgetUsd, alertTriggered: redisSnapshot.alertTriggered, metrics: redisSnapshot.metrics }
       : item.key === 'neon-postgres' && neonSnapshot
         ? { calls: 0, inputBytes: neonSnapshot.inputBytes, outputBytes: neonSnapshot.outputBytes, cost: neonSnapshot.estimatedCostUsd ?? 0, costKnown: neonSnapshot.estimatedCostUsd !== null, sampledAt: neonSnapshot.sampledAt, period: neonSnapshot.period, source: neonSnapshot.source, alertThresholdUsd: neonSnapshot.alertThresholdUsd, maxBudgetUsd: null, alertTriggered: neonSnapshot.alertTriggered, metrics: neonSnapshot.metrics }
         : null
@@ -168,7 +168,10 @@ export async function GET(request: NextRequest) {
   const externalCost = externalProviders.reduce((sum, row) => sum + row.cost, 0)
   // A zero-cost row can mean either a genuinely free provider or an unknown
   // unit price. Only active providers affect whether the aggregate is known.
-  const externalAggregateCostKnown = externalProviders.filter(row => row.calls > 0).every(row => row.costKnown !== false)
+  const externalAggregateCostKnown = externalProviders.every(row => {
+    const hasUsage = row.calls > 0 || row.inputBytes > 0 || row.outputBytes > 0 || row.metrics.length > 0 || row.lastEventAt !== null
+    return !hasUsage || row.costKnown !== false
+  })
   const optimization = optimizationRows.reduce((summary, row) => ({
     cacheHits: summary.cacheHits + (row.eventType === 'cache_hit' ? number(row.requestsAvoided) : 0),
     singleflightHits: summary.singleflightHits + (row.eventType === 'singleflight_hit' ? number(row.requestsAvoided) : 0),

@@ -10,6 +10,7 @@ export interface RedisUsageSnapshot {
   alertThresholdUsd: number | null
   maxBudgetUsd: number | null
   alertTriggered: boolean
+  metrics: Array<{ name: 'read_requests' | 'write_requests' | 'script_requests'; value: number; unit: 'requests'; estimatedCostUsd: null }>
 }
 type Environment = Record<string, string | undefined>
 type RedisInfoResponse = { result?: unknown }
@@ -25,6 +26,9 @@ export function parseRedisInfo(info: string): Pick<RedisUsageSnapshot, 'totalCom
 }
 type RedisManagementStats = {
   total_monthly_requests?: unknown
+  total_monthly_read_requests?: unknown
+  total_monthly_write_requests?: unknown
+  total_monthly_script_requests?: unknown
   total_monthly_bandwidth?: unknown
   total_monthly_billing?: unknown
 }
@@ -44,6 +48,19 @@ export function parseRedisManagementStats(value: unknown): Pick<RedisUsageSnapsh
   const billing = nonNegativeNumber(stats.total_monthly_billing)
   if (totalCommands === null || bandwidth === null || billing === null) return null
   return { totalCommands, inputBytes: 0, outputBytes: bandwidth, estimatedCostUsd: Number(billing.toFixed(6)) }
+}
+
+export function parseRedisManagementMetrics(value: unknown): RedisUsageSnapshot['metrics'] {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return []
+  const stats = value as RedisManagementStats
+  return [
+    ['read_requests', stats.total_monthly_read_requests],
+    ['write_requests', stats.total_monthly_write_requests],
+    ['script_requests', stats.total_monthly_script_requests],
+  ].flatMap(([name, raw]) => {
+    const parsed = positiveInteger(raw)
+    return parsed === null ? [] : [{ name: name as RedisUsageSnapshot['metrics'][number]['name'], value: parsed, unit: 'requests' as const, estimatedCostUsd: null }]
+  })
 }
 export function redisUsageConfig(env: Environment = process.env) {
   return {
@@ -69,8 +86,9 @@ export async function readRedisUsage(env: Environment = process.env, request: Re
         signal: AbortSignal.timeout(10_000),
       })
       if (response.ok) {
-        const parsed = parseRedisManagementStats(await response.json())
-        if (parsed) return { available: true, ...parsed, sampledAt: new Date().toISOString(), period: 'current_month', source: 'upstash_management_stats', alertThresholdUsd, maxBudgetUsd, alertTriggered: alertThresholdUsd !== null && parsed.estimatedCostUsd >= alertThresholdUsd }
+        const body = await response.json()
+        const parsed = parseRedisManagementStats(body)
+        if (parsed) return { available: true, ...parsed, sampledAt: new Date().toISOString(), period: 'current_month', source: 'upstash_management_stats', alertThresholdUsd, maxBudgetUsd, alertTriggered: alertThresholdUsd !== null && parsed.estimatedCostUsd >= alertThresholdUsd, metrics: parseRedisManagementMetrics(body) }
       }
     } catch { /* Fall back to the database REST INFO endpoint below. */ }
   }
@@ -86,7 +104,7 @@ export async function readRedisUsage(env: Environment = process.env, request: Re
     // INFO exposes an instance-lifetime counter, so it cannot prove a monthly
     // budget breach. Keep the estimate visible, but defer alerting to the
     // current-month management-stats path.
-    return { available: true, ...parsed, estimatedCostUsd, sampledAt: new Date().toISOString(), period: 'instance_lifetime', source: 'upstash_rest_info', alertThresholdUsd, maxBudgetUsd, alertTriggered: false }
+    return { available: true, ...parsed, estimatedCostUsd, sampledAt: new Date().toISOString(), period: 'instance_lifetime', source: 'upstash_rest_info', alertThresholdUsd, maxBudgetUsd, alertTriggered: false, metrics: [] }
   } catch { return null }
 }
 import { pinnedFetch } from '@jobcopilot/shared'
