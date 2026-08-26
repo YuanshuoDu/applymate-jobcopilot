@@ -166,6 +166,9 @@ export async function GET(request: NextRequest) {
   const externalErrors = externalProviders.reduce((sum, row) => sum + row.errors, 0)
   const externalDataBytes = externalProviders.reduce((sum, row) => sum + row.inputBytes + row.outputBytes, 0)
   const externalCost = externalProviders.reduce((sum, row) => sum + row.cost, 0)
+  // A zero-cost row can mean either a genuinely free provider or an unknown
+  // unit price. Only active providers affect whether the aggregate is known.
+  const externalAggregateCostKnown = externalProviders.filter(row => row.calls > 0).every(row => row.costKnown !== false)
   const optimization = optimizationRows.reduce((summary, row) => ({
     cacheHits: summary.cacheHits + (row.eventType === 'cache_hit' ? number(row.requestsAvoided) : 0),
     singleflightHits: summary.singleflightHits + (row.eventType === 'singleflight_hit' ? number(row.requestsAvoided) : 0),
@@ -180,7 +183,7 @@ export async function GET(request: NextRequest) {
     freshness: { lastEventAt: latestEvent([...providers, ...aiProviders, ...externalProviders.map(row => ({ lastEventAt: row.lastEventAt ?? row.sampledAt }))]), external: { upstashRedis: redisSnapshot ? { source: redisSnapshot.source, period: redisSnapshot.period, sampledAt: redisSnapshot.sampledAt, status: 'live' } : { source: 'unavailable', period: null, sampledAt: null, status: 'unavailable' }, neonPostgres: neonSnapshot ? { source: neonSnapshot.source, period: neonSnapshot.period, sampledAt: neonSnapshot.sampledAt, status: 'live' } : { source: 'unavailable', period: null, sampledAt: null, status: 'unavailable' } } },
     job: { summary: { calls: jobCalls, jobs: providers.reduce((sum, row) => sum + row.jobs, 0), errors: jobErrors, errorRate: jobCalls ? Number((jobErrors / jobCalls * 100).toFixed(1)) : 0 }, providers },
     ai: { summary: { calls: aiCalls, tokens: aiProviders.reduce((sum, row) => sum + row.inputTokens + row.outputTokens, 0), costUsd: Number(aiProviders.reduce((sum, row) => sum + row.cost, 0).toFixed(6)), errors: aiErrors, errorRate: aiCalls ? Number((aiErrors / aiCalls * 100).toFixed(1)) : 0 }, providers: aiProviders },
-    external: { summary: { calls: externalCalls, dataBytes: externalDataBytes, costUsd: Number(externalCost.toFixed(6)), errors: externalErrors, errorRate: externalCalls ? Number((externalErrors / externalCalls * 100).toFixed(1)) : 0 }, providers: externalProviders },
+    external: { summary: { calls: externalCalls, dataBytes: externalDataBytes, costUsd: Number(externalCost.toFixed(6)), costKnown: externalAggregateCostKnown, errors: externalErrors, errorRate: externalCalls ? Number((externalErrors / externalCalls * 100).toFixed(1)) : 0 }, providers: externalProviders },
     quotas: quotaUsage, optimization, trend: trend.map(row => ({ ...row, calls: number(row.calls), errors: number(row.errors), units: number(row.units), cost: number(row.cost) })),
   }, { headers: { 'Cache-Control': 'no-store', 'x-request-id': actor.requestId } })
 }

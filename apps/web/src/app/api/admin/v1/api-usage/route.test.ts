@@ -21,7 +21,7 @@ describe('GET /api/admin/v1/api-usage', () => {
     expect(payload.days).toBe(7)
     expect(payload.job.summary).toMatchObject({ calls: 4, jobs: 40, errors: 1 })
     expect(payload.ai.summary).toMatchObject({ calls: 2, tokens: 120 })
-    expect(payload.external.summary).toMatchObject({ calls: 3, dataBytes: 90, errors: 1 })
+    expect(payload.external.summary).toMatchObject({ calls: 3, dataBytes: 90, costKnown: false, errors: 1 })
     expect(payload.external.providers.find((row: { key: string }) => row.key === 'upstash-redis')).toMatchObject({ calls: 0, source: 'unavailable' })
     expect(payload.external.providers.find((row: { key: string }) => row.key === 'neon-postgres')).toMatchObject({ calls: 0, source: 'unavailable', period: null })
     expect(payload.external.providers.find((row: { key: string }) => row.key === 'resend')).toMatchObject({ costKnown: false })
