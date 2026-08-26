@@ -1,3 +1,6 @@
+import { getPool } from "../db/apply-results.js";
+import { recordWorkerExternalApiUsage } from "../api-usage/external-api-usage.js";
+
 const DEFAULT_INTERVAL_MS = 5 * 60_000;
 const MINIMUM_INTERVAL_MS = 60_000;
 const AUDIT_CHECKPOINT_INTERVAL_MS = 24 * 60 * 60_000;
@@ -33,7 +36,17 @@ export interface AutomationSchedulerConfig {
   tasks: ReadonlyArray<{ name: string; endpoint: string; secret: string; intervalMs?: number }>;
   intervalMs: number;
   request?: typeof fetch;
+  recordUsage?: SchedulerUsageRecorder;
 }
+
+type SchedulerUsageRecorder = (input: {
+  operation: string;
+  status: "success" | "error";
+  latencyMs: number;
+  httpStatus?: number;
+  outputBytes?: number;
+  errorCode?: string;
+}) => Promise<void>;
 
 export function automationSchedulerConfig(
   env: NodeJS.ProcessEnv = process.env,
@@ -65,6 +78,7 @@ export function automationSchedulerConfig(
 
 export function createAutomationScheduler(config: AutomationSchedulerConfig): AutomationScheduler {
   const request = config.request ?? fetch;
+  const recordUsage = config.recordUsage ?? defaultSchedulerUsageRecorder;
   const state: AutomationSchedulerStatus = {
     enabled: true,
     running: false,
@@ -85,16 +99,35 @@ export function createAutomationScheduler(config: AutomationSchedulerConfig): Au
         const taskInterval = task.intervalMs ?? config.intervalMs;
         const lastSuccessfulAt = lastSuccessfulTaskAt.get(task.name);
         if (lastSuccessfulAt !== undefined && Date.now() - lastSuccessfulAt < taskInterval) continue;
-        const response = await request(task.endpoint, {
-          method: "POST",
-          headers: { Authorization: `Bearer ${task.secret}` },
-          signal: AbortSignal.timeout(30_000),
-        });
-        if (!response.ok) {
-          failures.push(`${task.name} returned ${response.status} (${httpErrorCode(response.status)})`);
-          continue;
+        const startedAt = Date.now();
+        try {
+          const response = await request(task.endpoint, {
+            method: "POST",
+            headers: { Authorization: `Bearer ${task.secret}` },
+            signal: AbortSignal.timeout(30_000),
+          });
+          await recordUsage({
+            operation: `scheduler_${task.name}`,
+            status: response.ok ? "success" : "error",
+            httpStatus: response.status,
+            outputBytes: responseBytes(response),
+            errorCode: response.ok ? undefined : httpErrorCode(response.status),
+            latencyMs: Date.now() - startedAt,
+          });
+          if (!response.ok) {
+            failures.push(`${task.name} returned ${response.status} (${httpErrorCode(response.status)})`);
+            continue;
+          }
+          lastSuccessfulTaskAt.set(task.name, Date.now());
+        } catch (error) {
+          await recordUsage({
+            operation: `scheduler_${task.name}`,
+            status: "error",
+            errorCode: errorCode(error),
+            latencyMs: Date.now() - startedAt,
+          });
+          throw error;
         }
-        lastSuccessfulTaskAt.set(task.name, Date.now());
       }
       if (failures.length) {
         state.lastError = failures.join("; ");
@@ -124,6 +157,25 @@ export function createAutomationScheduler(config: AutomationSchedulerConfig): Au
       return { ...state };
     },
   };
+}
+
+function responseBytes(response: Response): number {
+  const value = Number(response.headers.get("content-length") ?? 0);
+  return Number.isSafeInteger(value) && value > 0 ? value : 0;
+}
+
+async function defaultSchedulerUsageRecorder(input: Parameters<SchedulerUsageRecorder>[0]): Promise<void> {
+  if (process.env.NODE_ENV === "test") return;
+  await recordWorkerExternalApiUsage({
+    pool: getPool(),
+    provider: "internal-worker",
+    operation: input.operation,
+    status: input.status,
+    latencyMs: input.latencyMs,
+    httpStatus: input.httpStatus,
+    outputBytes: input.outputBytes,
+    errorCode: input.errorCode,
+  });
 }
 
 function httpErrorCode(status: number): string {
