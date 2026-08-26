@@ -62,6 +62,24 @@ describe("automation scheduler", () => {
     expect(scheduler.status().lastError).toBeNull();
   });
 
+  it("does not issue scheduler requests while the worker runtime is paused", async () => {
+    const request = vi.fn();
+    const recordUsage = vi.fn();
+    const scheduler = createAutomationScheduler({
+      tasks: [{ name: "automations", endpoint: "https://app.applymate.test/api/agent/automations/due", secret: "scheduler-secret" }],
+      intervalMs: 300_000,
+      request,
+      recordUsage,
+      shouldRun: () => false,
+    });
+
+    await scheduler.run();
+
+    expect(request).not.toHaveBeenCalled();
+    expect(recordUsage).not.toHaveBeenCalled();
+    expect(scheduler.status()).toMatchObject({ running: false, lastAttemptAt: null, lastSuccessAt: null, lastError: null });
+  });
+
   it("requires the production web origin and secret", () => {
     expect(() => automationSchedulerConfig({ AGENT_AUTOMATION_CRON_SECRET: "secret" }))
       .toThrow("AGENT_WEB_URL");

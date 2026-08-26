@@ -1,5 +1,6 @@
 import { getPool } from "../db/apply-results.js";
 import { recordWorkerExternalApiUsage } from "../api-usage/external-api-usage.js";
+import { getWorkerRuntimeState } from "../admin/worker-state.js";
 
 const DEFAULT_INTERVAL_MS = 5 * 60_000;
 const MINIMUM_INTERVAL_MS = 60_000;
@@ -37,6 +38,7 @@ export interface AutomationSchedulerConfig {
   intervalMs: number;
   request?: typeof fetch;
   recordUsage?: SchedulerUsageRecorder;
+  shouldRun?: () => boolean;
 }
 
 type SchedulerUsageRecorder = (input: {
@@ -90,6 +92,7 @@ export function createAutomationScheduler(config: AutomationSchedulerConfig): Au
 
   async function run() {
     if (state.running) return;
+    if (config.shouldRun && !config.shouldRun()) return;
     state.running = true;
     state.lastAttemptAt = new Date().toISOString();
 
@@ -208,7 +211,10 @@ export function startAutomationScheduler(
     };
   }
 
-  const scheduler = createAutomationScheduler(automationSchedulerConfig(env));
+  const scheduler = createAutomationScheduler({
+    ...automationSchedulerConfig(env),
+    shouldRun: () => getWorkerRuntimeState().status !== "paused",
+  });
   const interval = setInterval(() => void scheduler.run(), automationSchedulerConfig(env).intervalMs);
   void scheduler.run();
 

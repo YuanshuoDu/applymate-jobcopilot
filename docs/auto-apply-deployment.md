@@ -90,18 +90,24 @@ HTTP REST SDK, while BullMQ and ioredis require the Redis protocol endpoint.
 The Web and Worker must point to the same Upstash database so queue state,
 rate limits, pause state, and dead-letter records remain shared.
 
-The application alert reads only Redis `INFO` statistics on the server and
-estimates command cost using `REDIS_COST_PER_100K_COMMANDS`. It creates the
-existing admin alert/incident and notification when `REDIS_COST_ALERT_USD` is
-reached; it never changes the Upstash budget or stops the database. Upstash's
-console remains the billing source of truth, and its `$20` Max Budget is the
-independent hard stop.
+The dashboard can read current-month request, bandwidth, and billed-cost
+statistics from the Upstash management API when `PAID_REDIS_DATABASE_ID`,
+`UPSTASH_API_EMAIL`, and `UPSTASH_API_KEY` are configured. Without those
+management credentials it falls back to Redis `INFO` and estimates command
+cost using `REDIS_COST_PER_100K_COMMANDS`; that fallback is instance-lifetime
+telemetry and cannot trigger the monthly application alert. With current-month
+management stats, `REDIS_COST_ALERT_USD` creates the existing admin
+alert/incident and notification; it never changes the Upstash budget or stops
+the database. Upstash's console remains the billing source of truth, and its
+`$20` Max Budget is the independent hard stop.
 
 The Worker invokes `/api/agent/automations/due`, `/api/notifications/broadcasts/due`,
 and `/api/admin/observability/alerts/evaluate` every five minutes by default.
 This avoids Vercel Hobby Cron's daily-only restriction while retaining a secured,
-private scheduler. Set `AGENT_SCHEDULER_ENABLED=0` only for a Worker instance that
-must not schedule automations.
+private scheduler. Set `AGENT_SCHEDULER_ENABLED=0` for a Worker instance that
+must not schedule automations. A globally paused Worker also suppresses
+scheduler requests at runtime, so pausing queues does not continue generating
+maintenance traffic.
 
 ## Fly.io Worker deployment
 

@@ -9,7 +9,7 @@ Tracked event providers:
 - Resend (platform email; set `EXTERNAL_API_COST_PER_REQUEST_RESEND` when the plan is metered)
 - Azure Key Vault (platform credential wrapping; set `EXTERNAL_API_COST_PER_REQUEST_AZURE_KEY_VAULT` when metered)
 - Worker control, scheduled agent-run, and maintenance-scheduler calls (internal operational metadata)
-- Upstash Redis (server-only `INFO` snapshot; no Redis command body is stored)
+- Upstash Redis (server-only management/`INFO` snapshot; no Redis command body is stored)
 - Neon Postgres (server-only consumption snapshot; compute, storage, branch, restore, and network metrics)
 - Vercel Speed Insights (browser telemetry; provider-side usage is not exposed to the server)
 
