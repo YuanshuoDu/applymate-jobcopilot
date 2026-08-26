@@ -4,8 +4,8 @@ The admin API Usage page now has an **Other APIs** tab for non-job and non-model
 
 Tracked event providers:
 
-- Gmail API and Google OAuth (user-owned credentials)
-- GitHub API (user-owned credentials)
+- Gmail API and Google OAuth (user-owned credentials, including Auth.js sign-in calls)
+- GitHub API (user-owned credentials, including Auth.js sign-in calls)
 - Resend (platform email; set `EXTERNAL_API_COST_PER_REQUEST_RESEND` when the plan is metered)
 - Azure Key Vault (platform credential wrapping; set `EXTERNAL_API_COST_PER_REQUEST_AZURE_KEY_VAULT` when metered)
 - Worker control and scheduled agent-run calls (internal operational metadata)
