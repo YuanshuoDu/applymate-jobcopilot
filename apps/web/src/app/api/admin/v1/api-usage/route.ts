@@ -13,6 +13,8 @@ type JobRow = { provider: string; operation: string; credentialSource: string; c
 type AiRow = { provider: string; model: string; credentialSource: string; calls: number; inputTokens: number; outputTokens: number; cost: number; errors: number; avgLatency: number | null; lastEventAt: Date | null }
 type ExternalRow = { provider: string; operation: string; credentialSource: string; calls: number; inputBytes: number; outputBytes: number; cost: number; errors: number; avgLatency: number | null; lastEventAt: Date | null }
 type TrendRow = { day: Date; category: string; calls: number; errors: number; units: number; cost: number }
+type UserSummaryRow = { userId: string; category: 'job' | 'ai'; calls: number; jobs: number; tokens: number; cost: number; errors: number; avgLatency: number | null; lastEventAt: Date | null }
+type UserDetailRow = UserSummaryRow & { provider: string; operationModel: string; featureKey: string | null; runtime: string; credentialSource: string }
 type OptimizationRow = { eventType: string; provider: string | null; events: number; requestsAvoided: number; jobsReturned: number; netNewJobs: number; validApplyUrls: number; completeDescriptions: number }
 
 const number = (value: unknown) => Number(value ?? 0)
@@ -73,11 +75,14 @@ export async function GET(request: NextRequest) {
   const rawProvider = request.nextUrl.searchParams.get('provider')?.trim().toLowerCase() ?? ''
   if (rawProvider && !/^[a-z0-9._-]{1,120}$/.test(rawProvider)) return NextResponse.json({ error: 'Invalid provider filter' }, { status: 400 })
   const provider = rawProvider || undefined
+  const rawUserId = request.nextUrl.searchParams.get('userId')?.trim() ?? ''
+  if (rawUserId && !/^[a-zA-Z0-9._:-]{1,120}$/.test(rawUserId)) return NextResponse.json({ error: 'Invalid user filter' }, { status: 400 })
+  const selectedUserId = rawUserId || undefined
   const jobProviderFilter = provider ? Prisma.sql`AND provider = ${provider}` : Prisma.empty
   const aiProviderFilter = provider ? Prisma.sql`AND provider = ${provider}` : Prisma.empty
   const externalProviderFilter = provider ? Prisma.sql`AND provider = ${provider}` : Prisma.empty
   const since = new Date(Date.now() - days * 86_400_000)
-  const [jobRows, aiRows, externalRows, trend, quotas, optimizationRows, redisSnapshot, neonSnapshot] = await Promise.all([
+  const [jobRows, aiRows, externalRows, trend, userRows, userDetails, quotas, optimizationRows, redisSnapshot, neonSnapshot] = await Promise.all([
     db.$queryRaw<JobRow[]>`
       SELECT provider, operation, credential_source AS "credentialSource",
         SUM(request_count)::int AS calls, SUM(jobs_returned)::int AS jobs,
@@ -110,6 +115,48 @@ export async function GET(request: NextRequest) {
           SUM(input_bytes + output_bytes), SUM(estimated_cost_usd)
         FROM external_api_usage_events WHERE created_at >= ${since} ${externalProviderFilter} GROUP BY DATE_TRUNC('day', created_at)
       ) usage GROUP BY day, category ORDER BY day ASC`,
+    db.$queryRaw<UserSummaryRow[]>`
+      SELECT user_id AS "userId", 'job' AS category,
+        SUM(request_count)::int AS calls, SUM(jobs_returned)::int AS jobs,
+        0::int AS tokens, 0::float AS cost,
+        COUNT(*) FILTER (WHERE status = 'error')::int AS errors,
+        ROUND(AVG(latency_ms))::int AS "avgLatency", MAX(created_at) AS "lastEventAt"
+      FROM job_api_usage_events
+      WHERE user_id IS NOT NULL AND created_at >= ${since} ${jobProviderFilter}
+      GROUP BY user_id
+      UNION ALL
+      SELECT user_id AS "userId", 'ai' AS category,
+        COUNT(*)::int AS calls, 0::int AS jobs,
+        SUM(input_tokens + output_tokens)::int AS tokens,
+        COALESCE(SUM(estimated_cost_usd), 0)::float AS cost,
+        COUNT(*) FILTER (WHERE status = 'error')::int AS errors,
+        ROUND(AVG(latency_ms))::int AS "avgLatency", MAX(created_at) AS "lastEventAt"
+      FROM ai_usage_events
+      WHERE user_id IS NOT NULL AND created_at >= ${since} ${aiProviderFilter}
+      GROUP BY user_id
+      ORDER BY "lastEventAt" DESC`,
+    selectedUserId ? db.$queryRaw<UserDetailRow[]>`
+      SELECT user_id AS "userId", 'job' AS category, provider,
+        operation AS "operationModel", NULL::text AS "featureKey", runtime,
+        credential_source AS "credentialSource", SUM(request_count)::int AS calls,
+        SUM(jobs_returned)::int AS jobs, 0::int AS tokens, 0::float AS cost,
+        COUNT(*) FILTER (WHERE status = 'error')::int AS errors,
+        ROUND(AVG(latency_ms))::int AS "avgLatency", MAX(created_at) AS "lastEventAt"
+      FROM job_api_usage_events
+      WHERE user_id = ${selectedUserId} AND created_at >= ${since} ${jobProviderFilter}
+      GROUP BY user_id, provider, operation, runtime, credential_source
+      UNION ALL
+      SELECT user_id AS "userId", 'ai' AS category, provider,
+        model AS "operationModel", feature_key AS "featureKey", runtime,
+        credential_source AS "credentialSource", COUNT(*)::int AS calls,
+        0::int AS jobs, SUM(input_tokens + output_tokens)::int AS tokens,
+        COALESCE(SUM(estimated_cost_usd), 0)::float AS cost,
+        COUNT(*) FILTER (WHERE status = 'error')::int AS errors,
+        ROUND(AVG(latency_ms))::int AS "avgLatency", MAX(created_at) AS "lastEventAt"
+      FROM ai_usage_events
+      WHERE user_id = ${selectedUserId} AND created_at >= ${since} ${aiProviderFilter}
+      GROUP BY user_id, provider, model, feature_key, runtime, credential_source
+      ORDER BY "lastEventAt" DESC` : Promise.resolve([] as UserDetailRow[]),
     db.apiQuota.findMany({ where: { enabled: true, ...(provider ? { provider } : {}) }, orderBy: [{ category: 'asc' }, { provider: 'asc' }, { operation: 'asc' }] }),
     loadOptimizationRows(since, provider),
     provider === 'upstash-redis' || !provider ? (process.env.NODE_ENV === 'test' ? Promise.resolve(null) : readRedisUsage()) : Promise.resolve(null),
@@ -181,12 +228,14 @@ export async function GET(request: NextRequest) {
     shadowValidApplyUrls: summary.shadowValidApplyUrls + (row.eventType === 'shadow_comparison' ? number(row.validApplyUrls) : 0),
     shadowCompleteDescriptions: summary.shadowCompleteDescriptions + (row.eventType === 'shadow_comparison' ? number(row.completeDescriptions) : 0),
   }), { cacheHits: 0, singleflightHits: 0, providerSkips: 0, shadowJobs: 0, shadowNetNewJobs: 0, shadowValidApplyUrls: 0, shadowCompleteDescriptions: 0 })
-  return NextResponse.json({ generatedAt: new Date(), days, provider: provider ?? null,
+  return NextResponse.json({ generatedAt: new Date(), days, provider: provider ?? null, selectedUserId: selectedUserId ?? null,
     catalog: { job: JOB_API_PROVIDERS.map(item => ({ key: item.key, label: item.label })), ai: aiCatalogue, external: EXTERNAL_API_PROVIDERS.map(item => ({ key: item.key, label: item.label })) },
     freshness: { lastEventAt: latestEvent([...providers, ...aiProviders, ...externalProviders.map(row => ({ lastEventAt: row.lastEventAt ?? row.sampledAt }))]), external: { upstashRedis: redisSnapshot ? { source: redisSnapshot.source, period: redisSnapshot.period, sampledAt: redisSnapshot.sampledAt, status: 'live' } : { source: 'unavailable', period: null, sampledAt: null, status: 'unavailable' }, neonPostgres: neonSnapshot ? { source: neonSnapshot.source, period: neonSnapshot.period, sampledAt: neonSnapshot.sampledAt, status: 'live' } : { source: 'unavailable', period: null, sampledAt: null, status: 'unavailable' } } },
     job: { summary: { calls: jobCalls, jobs: providers.reduce((sum, row) => sum + row.jobs, 0), errors: jobErrors, errorRate: jobCalls ? Number((jobErrors / jobCalls * 100).toFixed(1)) : 0 }, providers },
     ai: { summary: { calls: aiCalls, tokens: aiProviders.reduce((sum, row) => sum + row.inputTokens + row.outputTokens, 0), costUsd: Number(aiProviders.reduce((sum, row) => sum + row.cost, 0).toFixed(6)), errors: aiErrors, errorRate: aiCalls ? Number((aiErrors / aiCalls * 100).toFixed(1)) : 0 }, providers: aiProviders },
     external: { summary: { calls: externalCalls, dataBytes: externalDataBytes, costUsd: Number(externalCost.toFixed(6)), costKnown: externalAggregateCostKnown, errors: externalErrors, errorRate: externalCalls ? Number((externalErrors / externalCalls * 100).toFixed(1)) : 0 }, providers: externalProviders },
     quotas: quotaUsage, optimization, trend: trend.map(row => ({ ...row, calls: number(row.calls), errors: number(row.errors), units: number(row.units), cost: number(row.cost) })),
+    users: (userRows ?? []).map(row => ({ ...row, calls: number(row.calls), jobs: number(row.jobs), tokens: number(row.tokens), cost: number(row.cost), errors: number(row.errors), avgLatency: number(row.avgLatency) })),
+    userDetails: (userDetails ?? []).map(row => ({ ...row, calls: number(row.calls), jobs: number(row.jobs), tokens: number(row.tokens), cost: number(row.cost), errors: number(row.errors), avgLatency: number(row.avgLatency) })),
   }, { headers: { 'Cache-Control': 'no-store', 'x-request-id': actor.requestId } })
 }

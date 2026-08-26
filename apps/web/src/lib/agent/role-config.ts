@@ -126,10 +126,15 @@ export function roleAiConfig(
   if (isLegacyDefault || isRetiredPlatformDefault || isCurrentPlatformDefault) return fallback
 
   const provider = config.provider as Provider
-  if (provider === fallback.provider) {
-    return { ...fallback, model: config.model, apiKey: config.apiKey ?? fallback.apiKey }
+  const usageContext = {
+    ...(fallback.usageUserId ? { usageUserId: fallback.usageUserId } : {}),
+    ...(fallback.usageFeatureKey ? { usageFeatureKey: fallback.usageFeatureKey } : {}),
+    ...(fallback.usageRuntime ? { usageRuntime: fallback.usageRuntime } : {}),
   }
-  return { provider, model: config.model, ...(config.apiKey ? { apiKey: config.apiKey } : {}) }
+  if (provider === fallback.provider) {
+    return { ...fallback, ...usageContext, model: config.model, apiKey: config.apiKey ?? fallback.apiKey }
+  }
+  return { provider, model: config.model, ...usageContext, ...(config.apiKey ? { apiKey: config.apiKey } : {}) }
 }
 
 /** Load all 6 role configs for a user, creating defaults for any missing ones. */

@@ -79,7 +79,7 @@ export class AgentHarness {
     return callLlmText(
       messages as Array<{ role: "system" | "user" | "assistant"; content: string }>,
       config,
-      { userId: this.config.userId, featureKey: "autoApply" },
+      { userId: this.config.userId, featureKey: "autoApply", runtime: "worker" },
     );
   }
 

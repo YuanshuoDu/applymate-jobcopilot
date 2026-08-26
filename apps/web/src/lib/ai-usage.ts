@@ -2,6 +2,7 @@ import { db } from '@/lib/db'
 import { getEffectiveEntitlements } from './entitlements'
 
 export type AiUsageStatus = 'success' | 'error'
+export type AiUsageRuntime = 'web' | 'worker' | 'admin' | 'unknown'
 
 const STABLE_ERROR_CODES = new Set([
   'configuration_error',
@@ -57,6 +58,7 @@ export async function recordAiUsage(input: {
   status: AiUsageStatus
   errorCode?: string
   credentialSource?: 'platform' | 'user'
+  runtime?: AiUsageRuntime
   chargeBudget?: boolean
 }): Promise<void> {
   if (typeof db.aiUsageEvent?.create === 'function') {
@@ -71,7 +73,8 @@ export async function recordAiUsage(input: {
       latencyMs: Math.max(0, Math.trunc(input.latencyMs)),
       status: input.status,
       errorCode: stableErrorCode(input.errorCode),
-      credentialSource: input.credentialSource ?? 'platform',
+    credentialSource: input.credentialSource ?? 'platform',
+    runtime: input.runtime ?? 'web',
     } }).catch(() => undefined)
   }
 

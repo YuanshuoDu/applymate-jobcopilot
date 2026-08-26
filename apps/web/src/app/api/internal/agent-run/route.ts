@@ -56,7 +56,19 @@ export async function POST(req: NextRequest) {
   if (autonomous && !await hasEffectiveEntitlement(input.userId, 'auto_apply')) return err("Your current plan does not include autonomous applications.", 403)
 
   const configured = await loadUserAiConfig(input.userId, "autoApply");
-  const aiConfig = configured.resolvedKey ? configured : resolveConfig(APPLYMATE_BACKING);
+  const aiConfig = configured.resolvedKey
+    ? {
+        ...configured,
+        usageUserId: input.userId,
+        usageFeatureKey: "autoApply",
+        usageRuntime: "worker" as const,
+      }
+    : {
+        ...resolveConfig(APPLYMATE_BACKING),
+        usageUserId: input.userId,
+        usageFeatureKey: "autoApply",
+        usageRuntime: "worker" as const,
+      };
   const report = await runAgentPipeline({
     userId: input.userId,
     sessionId: session.id,

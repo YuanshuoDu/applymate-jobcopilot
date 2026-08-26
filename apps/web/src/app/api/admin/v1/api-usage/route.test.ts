@@ -61,4 +61,22 @@ describe('GET /api/admin/v1/api-usage', () => {
     const payload = await response.json()
     expect(payload.external.providers.map((row: { key: string }) => row.key)).toEqual(['resend'])
   })
+
+  it('returns user-attributed summaries and drill-down rows', async () => {
+    mocks.queryRaw.mockReset()
+    mocks.queryRaw
+      .mockResolvedValueOnce([])
+      .mockResolvedValueOnce([])
+      .mockResolvedValueOnce([])
+      .mockResolvedValueOnce([])
+      .mockResolvedValueOnce([{ userId: 'user-1', category: 'job', calls: 2, jobs: 18, tokens: 0, cost: 0, errors: 0, avgLatency: 100, lastEventAt: new Date('2026-08-23T12:00:00Z') }])
+      .mockResolvedValueOnce([{ userId: 'user-1', category: 'job', provider: 'cleanjobdata', operationModel: 'list', featureKey: null, runtime: 'worker', credentialSource: 'platform', calls: 2, jobs: 18, tokens: 0, cost: 0, errors: 0, avgLatency: 100, lastEventAt: new Date('2026-08-23T12:00:00Z') }])
+    mocks.quotaFindMany.mockResolvedValue([])
+
+    const response = await GET(new NextRequest('http://localhost/api/admin/v1/api-usage?userId=user-1'))
+    const payload = await response.json()
+    expect(payload.selectedUserId).toBe('user-1')
+    expect(payload.users).toEqual([expect.objectContaining({ userId: 'user-1', category: 'job', calls: 2, jobs: 18 })])
+    expect(payload.userDetails).toEqual([expect.objectContaining({ provider: 'cleanjobdata', runtime: 'worker', calls: 2 })])
+  })
 })
