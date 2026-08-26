@@ -66,3 +66,14 @@
 .admin-filter-panel textarea { min-height: 100px; resize: vertical; }
 .admin-filter-panel .admin-primary-button { min-height: 38px; margin: 0; white-space: nowrap; }
 @media (max-width: 700px) { .admin-filter-panel { grid-template-columns: 1fr; }.admin-filter-panel .admin-primary-button { width: 100%; } }
+.ats-registry-section { padding-bottom: 20px; }
+.ats-registry-form { display: grid; grid-template-columns: 140px minmax(150px, 1fr) minmax(180px, 1.2fr) 90px auto auto; gap: 12px; align-items: end; margin-bottom: 18px; padding: 16px; border: 1px solid #dfe3f5; border-radius: 8px; background: #fff; }
+.ats-registry-form label { display: grid; gap: 6px; min-width: 0; color: #5e6980; font-size: 12px; font-weight: 600; }
+.ats-registry-form input, .ats-registry-form select { width: 100%; min-width: 0; min-height: 38px; padding: 8px 10px; border: 1px solid #dfe4ec; border-radius: 6px; background: #fff; color: #2d3850; font: inherit; }
+.ats-registry-form .flag-check { display: flex; align-items: center; min-height: 38px; white-space: nowrap; }.ats-registry-form .flag-check input { width: 16px; min-height: 16px; accent-color: #5146e9; }
+.admin-primary-button { min-height: 38px; display: inline-flex; align-items: center; justify-content: center; gap: 6px; padding: 0 13px; border: 1px solid #5146e9; border-radius: 6px; background: #5146e9; color: #fff; font: inherit; font-size: 12px; font-weight: 650; cursor: pointer; }.admin-primary-button:disabled { opacity: .5; cursor: not-allowed; }
+.ats-registry-table td:first-child strong, .ats-registry-table td:first-child small { display: block; }.ats-registry-table td:first-child small { margin-top: 3px; color: #758096; text-transform: capitalize; }.ats-registry-table .admin-action-group { flex-wrap: nowrap; }
+.admin-status-pill { display: inline-flex; padding: 3px 7px; border-radius: 999px; background: #f1f3f7; color: #68748b; font-size: 10px; font-weight: 700; }.admin-status-pill[data-active="true"] { background: #e9f8f0; color: #147a53; }
+.ats-inline-alert { margin: 0 0 16px; display: flex; align-items: center; justify-content: space-between; gap: 12px; }.ats-inline-alert .admin-secondary { flex: 0 0 auto; }
+@media (max-width: 1100px) { .ats-registry-form { grid-template-columns: repeat(2, minmax(0, 1fr)); }.ats-registry-form .admin-action-group { align-self: end; } }
+@media (max-width: 700px) { .ats-registry-form { grid-template-columns: 1fr; }.ats-registry-form .admin-action-group, .ats-registry-form .admin-primary-button, .ats-registry-form .admin-secondary { width: 100%; }.ats-registry-table { min-width: 820px; }.ats-inline-alert { align-items: flex-start; flex-direction: column; } }

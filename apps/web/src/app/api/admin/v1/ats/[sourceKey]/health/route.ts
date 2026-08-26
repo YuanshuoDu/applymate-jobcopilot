@@ -12,7 +12,7 @@ export async function GET(request: NextRequest, context: { params: Promise<{ sou
   if (!isAtsSourceKey(sourceKey)) return NextResponse.json({ error: 'Unknown ATS source' }, { status: 404 })
   const [policy, registry] = await Promise.all([
     db.atsSourcePolicy.findUnique({ where: { sourceKey }, select: { state: true, enabled: true, rolloutPercent: true, globalRpsLimit: true, perTenantRpsLimit: true, maxRetries: true, backoffBaseMs: true, allowAutoApply: true, version: true, lastAcknowledgedVersion: true, updatedAt: true } }),
-    db.atsEmployer.aggregate({ where: { atsType: sourceKey }, _count: { id: true }, _max: { lastSeen: true } }),
+    db.atsEmployer.aggregate({ where: { atsType: sourceKey, enabled: true }, _count: { id: true }, _max: { lastSeen: true } }),
   ])
   await writeAdminAudit({ requestId: actor.requestId, actorUserId: actor.userId, actorRoleKey: actor.roleKey, action: 'ats.health_viewed', targetType: 'ats_source', targetId: sourceKey, outcome: 'success' })
   const effectivePolicy = policy

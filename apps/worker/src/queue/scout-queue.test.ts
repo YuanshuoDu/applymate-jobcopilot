@@ -7,6 +7,7 @@ const mocks = vi.hoisted(() => ({
   isUserActive: vi.fn(),
   discoverGreenhouse: vi.fn(),
   discoverLever: vi.fn(),
+  loadRegistry: vi.fn(),
 }))
 
 vi.mock('bullmq', () => ({
@@ -23,6 +24,7 @@ vi.mock('./scout-discovery.js', () => ({
   discoverGreenhouseJobs: mocks.discoverGreenhouse,
   discoverLeverJobs: mocks.discoverLever,
 }))
+vi.mock('./ats-registry.js', () => ({ loadEnabledAtsSlugs: mocks.loadRegistry }))
 vi.mock('../admin/runtime-feature-flags.js', () => ({ isWorkerFeatureEnabled: mocks.featureEnabled }))
 vi.mock('../db/application-task-state.js', () => ({ isUserActive: mocks.isUserActive }))
 
@@ -39,6 +41,7 @@ describe('Scout queue platform controls', () => {
     mocks.isUserActive.mockResolvedValue(true)
     mocks.featureEnabled.mockResolvedValue(false)
     mocks.query.mockRejectedValue(new Error('target config must not be read'))
+    mocks.loadRegistry.mockReset()
   })
 
   it('stops before source work when Worker discovery is disabled', async () => {
@@ -56,6 +59,32 @@ describe('Scout queue platform controls', () => {
 
     expect(mocks.featureEnabled).not.toHaveBeenCalled()
     expect(mocks.query).not.toHaveBeenCalled()
+    expect(mocks.discoverGreenhouse).not.toHaveBeenCalled()
+    expect(mocks.discoverLever).not.toHaveBeenCalled()
+  })
+
+  it('uses the database-backed employer registry for discovery', async () => {
+    mocks.featureEnabled.mockResolvedValue(true)
+    mocks.query
+      .mockResolvedValueOnce({ rows: [{ targetRoles: ['Engineer'], targetLocations: [] }] })
+      .mockResolvedValueOnce({ rows: [] })
+    mocks.loadRegistry.mockResolvedValueOnce(['n26']).mockResolvedValueOnce(['spotify'])
+    mocks.discoverGreenhouse.mockResolvedValue([])
+    mocks.discoverLever.mockResolvedValue([])
+
+    await expect(runScout()).resolves.toMatchObject({ discovered: 0, inserted: 0 })
+
+    expect(mocks.discoverGreenhouse).toHaveBeenCalledWith(expect.objectContaining({ slugs: ['n26'] }))
+    expect(mocks.discoverLever).toHaveBeenCalledWith(expect.objectContaining({ slugs: ['spotify'] }))
+  })
+
+  it('fails closed before provider calls when the registry is unavailable', async () => {
+    mocks.featureEnabled.mockResolvedValue(true)
+    mocks.query.mockResolvedValueOnce({ rows: [{ targetRoles: ['Engineer'], targetLocations: [] }] })
+    mocks.loadRegistry.mockRejectedValue(new Error('database unavailable'))
+
+    await expect(runScout()).resolves.toEqual({ skipped: true, reason: 'ats-registry-unavailable' })
+
     expect(mocks.discoverGreenhouse).not.toHaveBeenCalled()
     expect(mocks.discoverLever).not.toHaveBeenCalled()
   })
