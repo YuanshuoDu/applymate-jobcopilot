@@ -186,7 +186,8 @@ function httpErrorCode(status: number): string {
 }
 
 function errorCode(error: unknown): string {
-  if (error instanceof DOMException && error.name === "AbortError") return "timeout";
+  if (error instanceof DOMException && (error.name === "AbortError" || error.name === "TimeoutError")) return "timeout";
+  if (error instanceof Error && error.name.toLowerCase() === "timeouterror") return "timeout";
   return error instanceof TypeError ? "network_error" : "provider_error";
 }
 

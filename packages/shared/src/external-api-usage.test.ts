@@ -15,5 +15,6 @@ describe('shared external API usage', () => {
     expect(sharedExternalApiErrorCode({ statusCode: 429, message: 'provider response body' })).toBe('http_429')
     expect(sharedExternalApiErrorCode(new TypeError('network body'))).toBe('network_error')
     expect(sharedExternalApiErrorCode(new Error('sensitive provider body'))).toBe('provider_error')
+    expect(sharedExternalApiErrorCode(new DOMException('private body', 'TimeoutError'))).toBe('timeout')
   })
 })

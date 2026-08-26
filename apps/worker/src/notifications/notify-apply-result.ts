@@ -93,7 +93,7 @@ export async function notifyApplyResult(p: NotifyApplyResultParams): Promise<voi
     if (process.env.NODE_ENV !== 'test') await recordWorkerExternalApiUsage({ pool: getPool(), userId: p.userId, provider: 'resend', operation: 'apply_result', status: result.ok ? 'success' : 'error', httpStatus: result.status, errorCode: result.ok ? undefined : result.status === 429 ? 'http_429' : result.status >= 500 ? 'http_5xx' : 'http_4xx', latencyMs: Date.now() - startedAt, inputBytes: Buffer.byteLength(JSON.stringify({ to: user.email, subject })) })
     return result
   }).catch(async (err: Error) => {
-    if (process.env.NODE_ENV !== 'test') await recordWorkerExternalApiUsage({ pool: getPool(), userId: p.userId, provider: 'resend', operation: 'apply_result', status: 'error', errorCode: err.name === 'AbortError' ? 'timeout' : 'network_error', latencyMs: Date.now() - startedAt, inputBytes: Buffer.byteLength(JSON.stringify({ to: user.email, subject })) })
+    if (process.env.NODE_ENV !== 'test') await recordWorkerExternalApiUsage({ pool: getPool(), userId: p.userId, provider: 'resend', operation: 'apply_result', status: 'error', errorCode: isTimeoutError(err) ? 'timeout' : 'network_error', latencyMs: Date.now() - startedAt, inputBytes: Buffer.byteLength(JSON.stringify({ to: user.email, subject })) })
     console.warn('[notify] fetch failed:', err.message)
     return null
   })
@@ -101,4 +101,9 @@ export async function notifyApplyResult(p: NotifyApplyResultParams): Promise<voi
   if (response && !response.ok) {
     console.warn('[notify] Resend returned', response.status)
   }
+}
+
+function isTimeoutError(error: unknown): boolean {
+  return (error instanceof DOMException && (error.name === 'AbortError' || error.name === 'TimeoutError')) ||
+    (error instanceof Error && error.name.toLowerCase() === 'timeouterror')
 }

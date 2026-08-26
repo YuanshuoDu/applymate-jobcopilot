@@ -44,7 +44,7 @@ export const agentRunWorker = new Worker<AgentRunTaskPayload>(
       });
       if (process.env.NODE_ENV !== "test") await recordWorkerExternalApiUsage({ pool: getPool(), userId: task.data.userId, provider: "internal-worker", operation: "agent_run", status: response.ok ? "success" : "error", httpStatus: response.status, errorCode: response.ok ? undefined : response.status === 429 ? "http_429" : response.status >= 500 ? "http_5xx" : "http_4xx", latencyMs: Date.now() - startedAt, inputBytes: Buffer.byteLength(requestBody) });
     } catch (error) {
-      if (process.env.NODE_ENV !== "test") await recordWorkerExternalApiUsage({ pool: getPool(), userId: task.data.userId, provider: "internal-worker", operation: "agent_run", status: "error", errorCode: error instanceof DOMException && error.name === "AbortError" ? "timeout" : "network_error", latencyMs: Date.now() - startedAt, inputBytes: Buffer.byteLength(requestBody) });
+      if (process.env.NODE_ENV !== "test") await recordWorkerExternalApiUsage({ pool: getPool(), userId: task.data.userId, provider: "internal-worker", operation: "agent_run", status: "error", errorCode: isTimeoutError(error) ? "timeout" : "network_error", latencyMs: Date.now() - startedAt, inputBytes: Buffer.byteLength(requestBody) });
       throw error;
     }
     // Suspension and entitlement changes are terminal for this queued run.
@@ -63,6 +63,11 @@ export const agentRunWorker = new Worker<AgentRunTaskPayload>(
   },
   { connection, skipVersionCheck: true, ...workerPollingOptions(), concurrency: 1 },
 );
+
+function isTimeoutError(error: unknown): boolean {
+  return (error instanceof DOMException && (error.name === "AbortError" || error.name === "TimeoutError")) ||
+    (error instanceof Error && error.name.toLowerCase() === "timeouterror");
+}
 
 export async function closeAgentRunResources() {
   await agentRunWorker.close();

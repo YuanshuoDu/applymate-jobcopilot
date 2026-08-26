@@ -33,5 +33,9 @@ async function responseSize(response: Response): Promise<number> {
 }
 function estimateCost(provider: string): number { const key = `EXTERNAL_API_COST_PER_REQUEST_${provider.toUpperCase().replace(/[^A-Z0-9]/g, '_')}`; const value = Number(process.env[key] ?? 0); return Number.isFinite(value) && value > 0 ? value : 0 }
 function classifyHttp(status: number): string { return status === 429 ? 'http_429' : status >= 500 ? 'http_5xx' : status >= 400 ? 'http_4xx' : 'provider_error' }
-function classifyError(error: unknown): string { return error instanceof DOMException && error.name === 'AbortError' ? 'timeout' : error instanceof TypeError ? 'network_error' : 'provider_error' }
+function classifyError(error: unknown): string {
+  if (error instanceof DOMException && (error.name === 'AbortError' || error.name === 'TimeoutError')) return 'timeout'
+  if (error instanceof Error && error.name.toLowerCase() === 'timeouterror') return 'timeout'
+  return error instanceof TypeError ? 'network_error' : 'provider_error'
+}
 async function persistUsage(input: UsageRecord): Promise<void> { if (process.env.NODE_ENV === 'test' || typeof db.externalApiUsageEvent?.create !== 'function') return; await db.externalApiUsageEvent.create({ data: { ...input, requestCount: 1, inputBytes: Math.max(0, Math.trunc(input.inputBytes)), outputBytes: Math.max(0, Math.trunc(input.outputBytes)), estimatedCostUsd: Math.max(0, input.estimatedCostUsd), latencyMs: Math.max(0, Math.trunc(input.latencyMs)) } }).catch(() => undefined) }

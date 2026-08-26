@@ -141,6 +141,23 @@ describe("automation scheduler", () => {
     expect(scheduler.status().lastError).toBe("network_error");
   });
 
+  it("records native timeout errors as timeout", async () => {
+    const request = vi.fn().mockRejectedValue(new DOMException("private response body", "TimeoutError"));
+    const recordUsage = vi.fn().mockResolvedValue(undefined);
+    const scheduler = createAutomationScheduler({
+      tasks: [{ name: "alerts", endpoint: "https://app.applymate.test/api/admin/observability/alerts/evaluate", secret: "scheduler-secret" }],
+      intervalMs: 300_000,
+      request,
+      recordUsage,
+    });
+
+    await scheduler.run();
+
+    expect(recordUsage).toHaveBeenCalledWith(expect.objectContaining({ operation: "scheduler_alerts", status: "error", errorCode: "timeout" }));
+    expect(scheduler.status().lastError).toBe("timeout");
+    expect(JSON.stringify(recordUsage.mock.calls[0][0])).not.toContain("private response body");
+  });
+
   it("can be explicitly disabled for local worker usage", () => {
     const scheduler = startAutomationScheduler({ AGENT_SCHEDULER_ENABLED: "0" });
     expect(scheduler.status().enabled).toBe(false);

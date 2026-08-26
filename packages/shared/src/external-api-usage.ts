@@ -29,7 +29,8 @@ export async function recordSharedExternalApiUsage(input: SharedExternalApiUsage
 }
 
 export function sharedExternalApiErrorCode(error: unknown): string {
-  if (error instanceof DOMException && error.name === 'AbortError') return 'timeout'
+  if (error instanceof DOMException && (error.name === 'AbortError' || error.name === 'TimeoutError')) return 'timeout'
+  if (error instanceof Error && error.name.toLowerCase() === 'timeouterror') return 'timeout'
   if (isStatusError(error)) {
     if (error.statusCode === 429) return 'http_429'
     if (error.statusCode >= 500) return 'http_5xx'
