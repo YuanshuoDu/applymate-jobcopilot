@@ -6,6 +6,7 @@ import { NextRequest } from 'next/server'
 import { trackedExternalApiFetch } from '@/lib/api-usage/external-api-usage'
 import { requireAuth, isErrorResponse, ok, err } from '@/lib/api-helpers'
 import { getGoogleAccessToken, extractPlainText } from '@/lib/gmail-helpers'
+import { aiUsageErrorCode } from '@/lib/ai-usage'
 
 type Params = { params: Promise<{ id: string }> }
 
@@ -30,7 +31,7 @@ export async function GET(req: NextRequest, { params }: Params) {
 
     return ok({ id, body: body.trim() })
   } catch (e) {
-    console.error('[/api/gmail/message] error:', e)
+    console.error('[/api/gmail/message] error', { errorCode: aiUsageErrorCode(e) })
     return err('Failed to fetch message', 500)
   }
 }

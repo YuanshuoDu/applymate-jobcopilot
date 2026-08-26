@@ -91,7 +91,7 @@ describe("automation scheduler", () => {
   });
 
   it("keeps the worker alive and reports a failed scheduler request", async () => {
-    const request = vi.fn().mockResolvedValue(new Response("Unavailable", { status: 503 }));
+    const request = vi.fn().mockResolvedValue(new Response("private upstream response", { status: 503 }));
     const scheduler = createAutomationScheduler({
       tasks: [{ name: "automations", endpoint: "https://app.applymate.test/api/agent/automations/due", secret: "scheduler-secret" }],
       intervalMs: 300_000,
@@ -101,7 +101,8 @@ describe("automation scheduler", () => {
     await scheduler.run();
 
     expect(scheduler.status()).toMatchObject({ running: false, lastSuccessAt: null });
-    expect(scheduler.status().lastError).toContain("503");
+    expect(scheduler.status().lastError).toBe("automations returned 503 (http_5xx)");
+    expect(scheduler.status().lastError).not.toContain("private upstream response");
   });
 
   it("can be explicitly disabled for local worker usage", () => {

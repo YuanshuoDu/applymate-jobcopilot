@@ -14,6 +14,7 @@ import { NextRequest } from 'next/server'
 import { trackedExternalApiFetch } from '@/lib/api-usage/external-api-usage'
 import { requireAuth, isErrorResponse, ok, err } from '@/lib/api-helpers'
 import { findGmailConnection, getGoogleAccessToken, classifyEmail } from '@/lib/gmail-helpers'
+import { aiUsageErrorCode } from '@/lib/ai-usage'
 
 export async function GET(req: NextRequest) {
   const auth = await requireAuth(req)
@@ -58,8 +59,7 @@ export async function GET(req: NextRequest) {
         return err('TOKEN_EXPIRED', 401)
       }
       if (listRes.status === 403) {
-        const errorBody = await listRes.text()
-        console.error('[gmail/threads] Gmail returned 403 → GMAIL_SCOPE_MISSING. Body:', errorBody.slice(0, 200))
+        console.error('[gmail/threads] Gmail returned 403 → GMAIL_SCOPE_MISSING')
         return err('GMAIL_SCOPE_MISSING', 403)
       }
       console.error('[gmail/threads] Gmail API unexpected error:', listRes.status)
@@ -118,7 +118,7 @@ export async function GET(req: NextRequest) {
 
     return ok({ emails, hasGmail: true })
   } catch (e) {
-    console.error('[/api/gmail/threads] error:', e)
+    console.error('[/api/gmail/threads] error', { errorCode: aiUsageErrorCode(e) })
     return err('GMAIL_ERROR', 500)
   }
 }

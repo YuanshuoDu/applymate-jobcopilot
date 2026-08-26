@@ -238,10 +238,7 @@ async function callOpenAICompat(
   });
 
   if (!res.ok) {
-    const errBody = await res.text().catch(() => "");
-    throw new Error(
-      `LLM API error ${res.status} from ${config.provider}: ${errBody.substring(0, 300)}`
-    );
+    throw new Error(`LLM API error ${res.status} from ${config.provider}`);
   }
 
   const data = (await res.json()) as {
@@ -295,10 +292,7 @@ async function callAnthropic(
   });
 
   if (!res.ok) {
-    const errBody = await res.text().catch(() => "");
-    throw new Error(
-      `Anthropic API error ${res.status}: ${errBody.substring(0, 300)}`
-    );
+    throw new Error(`Anthropic API error ${res.status}`);
   }
 
   const data = (await res.json()) as {

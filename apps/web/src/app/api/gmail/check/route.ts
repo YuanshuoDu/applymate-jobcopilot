@@ -5,6 +5,7 @@
 import { trackedExternalApiFetch } from '@/lib/api-usage/external-api-usage'
 import { requireAuth, isErrorResponse, ok } from '@/lib/api-helpers'
 import { findGmailConnection, getGoogleAccessToken } from '@/lib/gmail-helpers'
+import { aiUsageErrorCode } from '@/lib/ai-usage'
 
 export async function GET() {
   const auth = await requireAuth()
@@ -31,8 +32,8 @@ export async function GET() {
       return ok({ connected: true, hasGmail: true, scopes, reason: null })
     }
 
-    const errorBody = await gmailRes.text()
-    console.error('[gmail/check] Gmail API call failed:', gmailRes.status, errorBody.slice(0, 300))
+    const errorCode = aiUsageErrorCode(new Error(`HTTP ${gmailRes.status}`))
+    console.error('[gmail/check] Gmail API call failed', { status: gmailRes.status, errorCode })
     console.error('[gmail/check] DB scope:', account.scope ?? '(null)')
     console.error('[gmail/check] Token scopes:', scopes || '(empty)')
 
@@ -41,10 +42,10 @@ export async function GET() {
       hasGmail: false,
       reason: gmailRes.status === 403 ? 'scope_missing' : 'gmail_api_error',
       scopes,
-      gmailError: errorBody.slice(0, 200),
+      gmailError: gmailRes.status === 403 ? 'scope_missing' : errorCode,
     })
   } catch (e) {
-    console.error('[gmail/check] network error:', e)
+    console.error('[gmail/check] network error', { errorCode: aiUsageErrorCode(e) })
     return ok({ connected: true, hasGmail: false, reason: 'check_failed' })
   }
 }

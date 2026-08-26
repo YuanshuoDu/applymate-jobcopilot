@@ -48,8 +48,7 @@ export async function POST(req: NextRequest) {
   }, { provider: 'gmail', operation: 'send_message', credentialSource: 'user', userId: auth.userId })
 
   if (!sendRes.ok) {
-    const errText = await sendRes.text()
-    return err(`Gmail send failed: ${errText}`, 500)
+    return err(`Gmail send failed (HTTP ${sendRes.status})`, 500)
   }
 
   const matchedJob = await findFollowUpJob(auth.userId, jobId, gmailMessageId)

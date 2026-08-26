@@ -71,6 +71,18 @@ describe('model catalogue and MiniMax compatibility', () => {
     })).rejects.toThrow('minimax returned no final content (finish reason: length)')
   })
 
+  it('does not propagate an upstream response body into the thrown error', async () => {
+    vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response('{"error":"private response body"}', { status: 429 }))
+
+    const error = await modelChat([{ role: 'user', content: 'Ping' }], {
+      provider: 'minimax', model: 'MiniMax-M3', apiKey: 'test-key',
+    }).catch(value => value)
+
+    expect(error).toBeInstanceOf(Error)
+    expect((error as Error).message).toBe('minimax API error 429')
+    expect((error as Error).message).not.toContain('private response body')
+  })
+
   it('uses M3 as both platform defaults', () => {
     expect(DEFAULT_AI_CONFIG).toMatchObject({ provider: 'minimax', model: 'MiniMax-M3' })
     expect(APPLYMATE_BACKING).toMatchObject({ provider: 'minimax', model: 'MiniMax-M3', thinking: 'adaptive' })

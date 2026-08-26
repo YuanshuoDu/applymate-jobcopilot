@@ -91,20 +91,23 @@ export function createAutomationScheduler(config: AutomationSchedulerConfig): Au
           signal: AbortSignal.timeout(30_000),
         });
         if (!response.ok) {
-          const body = await response.text().catch(() => "");
-          failures.push(`${task.name} returned ${response.status}: ${body.slice(0, 300)}`);
+          failures.push(`${task.name} returned ${response.status} (${httpErrorCode(response.status)})`);
           continue;
         }
         lastSuccessfulTaskAt.set(task.name, Date.now());
       }
-      if (failures.length) throw new Error(failures.join("; "));
+      if (failures.length) {
+        state.lastError = failures.join("; ");
+        console.error(`[automation-scheduler] run failed (${state.lastError})`);
+        return;
+      }
 
       state.lastSuccessAt = new Date().toISOString();
       state.lastError = null;
     } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
+      const message = errorCode(error);
       state.lastError = message;
-      console.error(`[automation-scheduler] ${message}`);
+      console.error(`[automation-scheduler] run failed (${message})`);
     } finally {
       state.running = false;
     }
@@ -121,6 +124,18 @@ export function createAutomationScheduler(config: AutomationSchedulerConfig): Au
       return { ...state };
     },
   };
+}
+
+function httpErrorCode(status: number): string {
+  if (status === 429) return "http_429";
+  if (status >= 500) return "http_5xx";
+  if (status >= 400) return "http_4xx";
+  return "provider_error";
+}
+
+function errorCode(error: unknown): string {
+  if (error instanceof DOMException && error.name === "AbortError") return "timeout";
+  return error instanceof TypeError ? "network_error" : "provider_error";
 }
 
 export function startAutomationScheduler(

@@ -67,4 +67,16 @@ describe('shared/llm exports — existence guards', () => {
     expect(fetchMock.mock.calls[0][0]).toBe(`${base}/chat/completions`)
     expect((fetchMock.mock.calls[0][1] as RequestInit).headers).toMatchObject({ Authorization: `Bearer ${provider}-key` })
   })
+
+  it('does not propagate provider response bodies from failed requests', async () => {
+    vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response('{"error":"private response body"}', { status: 503 }))
+
+    const error = await callLlm([{ role: 'user', content: 'Ping' }], {
+      provider: 'minimax', model: 'MiniMax-M3', apiKey: 'test-key',
+    }).catch(value => value)
+
+    expect(error).toBeInstanceOf(Error)
+    expect((error as Error).message).toBe('LLM API error 503 from minimax')
+    expect((error as Error).message).not.toContain('private response body')
+  })
 })
