@@ -1,4 +1,5 @@
 import { db } from '@/lib/db'
+import { getEffectiveEntitlements } from './entitlements'
 
 export type AiUsageStatus = 'success' | 'error'
 
@@ -27,6 +28,23 @@ function stableErrorCode(value: string | undefined): string | undefined {
   return aiUsageErrorCode(value)
 }
 
+function currentMonth(now = new Date()): string {
+  return `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}`
+}
+
+async function recordAiBudgetCredit(userId: string, now = new Date()): Promise<void> {
+  if (typeof db.aiBudget?.upsert !== 'function') return
+  const limit = (await getEffectiveEntitlements(userId)).limits.ai_credits
+  if (limit === null || limit === undefined) return
+
+  const month = currentMonth(now)
+  await db.aiBudget.upsert({
+    where: { userId_month: { userId, month } },
+    create: { userId, month, used: 1, limit },
+    update: { used: { increment: 1 } },
+  })
+}
+
 export async function recordAiUsage(input: {
   userId?: string
   featureKey?: string
@@ -39,19 +57,25 @@ export async function recordAiUsage(input: {
   status: AiUsageStatus
   errorCode?: string
   credentialSource?: 'platform' | 'user'
+  chargeBudget?: boolean
 }): Promise<void> {
-  if (typeof db.aiUsageEvent?.create !== 'function') return
-  await db.aiUsageEvent.create({ data: {
-    userId: input.userId,
-    featureKey: input.featureKey ?? 'unclassified',
-    provider: input.provider,
-    model: input.model,
-    inputTokens: Math.max(0, Math.trunc(input.inputTokens ?? 0)),
-    outputTokens: Math.max(0, Math.trunc(input.outputTokens ?? 0)),
-    estimatedCostUsd: Math.max(0, input.estimatedCostUsd ?? 0),
-    latencyMs: Math.max(0, Math.trunc(input.latencyMs)),
-    status: input.status,
-    errorCode: stableErrorCode(input.errorCode),
-    credentialSource: input.credentialSource ?? 'platform',
-  } }).catch(() => undefined)
+  if (typeof db.aiUsageEvent?.create === 'function') {
+    await db.aiUsageEvent.create({ data: {
+      userId: input.userId,
+      featureKey: input.featureKey ?? 'unclassified',
+      provider: input.provider,
+      model: input.model,
+      inputTokens: Math.max(0, Math.trunc(input.inputTokens ?? 0)),
+      outputTokens: Math.max(0, Math.trunc(input.outputTokens ?? 0)),
+      estimatedCostUsd: Math.max(0, input.estimatedCostUsd ?? 0),
+      latencyMs: Math.max(0, Math.trunc(input.latencyMs)),
+      status: input.status,
+      errorCode: stableErrorCode(input.errorCode),
+      credentialSource: input.credentialSource ?? 'platform',
+    } }).catch(() => undefined)
+  }
+
+  // Provider tests have no usageUserId and remain telemetry-only. User-scoped
+  // calls consume exactly one monthly credit, including failed upstream calls.
+  if (input.userId && input.chargeBudget !== false) await recordAiBudgetCredit(input.userId).catch(() => undefined)
 }

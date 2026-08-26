@@ -1,11 +1,12 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
 const findUnique = vi.fn()
+const budgetCreate = vi.fn()
 const updateMany = vi.fn()
 const create = vi.fn()
 const resetFindUnique = vi.fn()
 const resetUpdateMany = vi.fn()
-vi.mock('@/lib/db', () => ({ db: { $transaction: (callback: (tx: unknown) => unknown) => callback({ aiBudget: { findUnique, updateMany }, aiBudgetAdjustment: { create }, aiBudgetResetRequest: { findUnique: resetFindUnique, updateMany: resetUpdateMany } }) } }))
+vi.mock('@/lib/db', () => ({ db: { $transaction: (callback: (tx: unknown) => unknown) => callback({ aiBudget: { findUnique, updateMany, create: budgetCreate }, aiBudgetAdjustment: { create }, aiBudgetResetRequest: { findUnique: resetFindUnique, updateMany: resetUpdateMany } }) } }))
 import { approveBudgetReset, updateBudgetLimit } from './budget-service'
 
 describe('budget overrides', () => {
@@ -25,5 +26,14 @@ describe('budget overrides', () => {
     create.mockResolvedValue({ id: 'adjustment' })
     await expect(approveBudgetReset({ requestId: 'reset', approverId: 'approver', idempotencyKey: 'approval-key' })).resolves.toEqual({ budgetId: 'budget', version: 4, previousUsed: 8 })
     expect(create).toHaveBeenCalledWith(expect.objectContaining({ data: expect.objectContaining({ kind: 'usage_reset', previousUsed: 8, nextUsed: 0 }) }))
+  })
+
+  it('initializes a missing monthly budget through the same audited update path', async () => {
+    findUnique.mockResolvedValue(null)
+    budgetCreate.mockResolvedValue({ id: 'created-budget' })
+    create.mockResolvedValue({ id: 'adjustment' })
+    await expect(updateBudgetLimit({ userId: 'user', month: '2026-08', limit: 12, version: 1, actorUserId: 'admin', reason: 'Set the initial monthly AI credit budget', idempotencyKey: 'initial-key', initialLimit: 25 })).resolves.toEqual({ used: 0, limit: 12, version: 2 })
+    expect(budgetCreate).toHaveBeenCalledWith({ data: { userId: 'user', month: '2026-08', used: 0, limit: 12, version: 2 } })
+    expect(create).toHaveBeenCalledWith(expect.objectContaining({ data: expect.objectContaining({ previousLimit: 25, nextLimit: 12 }) }))
   })
 })

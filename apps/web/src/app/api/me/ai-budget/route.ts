@@ -18,10 +18,9 @@ export async function GET(req: NextRequest) {
 
   const month = currentMonth()
   const entitlement = await resolveEntitlement(auth.userId, 'ai_credits')
-  const entitlementLimit = entitlement?.kind === 'limit' && entitlement.limit !== null
+  const defaultLimit = entitlement?.kind === 'limit' && entitlement.limit !== null
     ? entitlement.enabled ? entitlement.limit : 0
-    : undefined
-  const defaultLimit = entitlementLimit ?? MONTHLY_LIMIT
+    : MONTHLY_LIMIT
 
   let rows: BudgetRow[]
   try {
@@ -43,6 +42,6 @@ export async function GET(req: NextRequest) {
   }
 
   const used = Number(row.used)
-  const limit = entitlementLimit ?? Number(row.limit)
+  const limit = Number(row.limit)
   return ok({ used, limit, remaining: Math.max(limit - used, 0), hasBudget: true })
 }
