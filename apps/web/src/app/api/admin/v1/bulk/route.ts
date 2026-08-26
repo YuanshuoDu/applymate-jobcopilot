@@ -68,10 +68,7 @@ export async function POST(request: NextRequest) {
     return NextResponse.json(result.duplicate ? { duplicate: true } : { resource: body.resource, action: body.action, affected: result.value.affected }, { headers: { 'Cache-Control': 'no-store', 'x-request-id': actor.requestId } })
   }
 
-  const numericIds = body.ids.map(Number).filter(Number.isInteger)
-  if (!numericIds.length) return NextResponse.json({ error: 'Application IDs must be numeric' }, { status: 400 })
-  const results = await db.applyResult.findMany({ where: { id: { in: numericIds } }, select: { id: true, userId: true, jobId: true } })
-  const tasks = results.length ? await db.applicationTask.findMany({ where: { OR: results.map(row => ({ userId: row.userId, jobId: row.jobId })) }, select: { id: true, userId: true, jobId: true, status: true } }) : []
+  const tasks = await db.applicationTask.findMany({ where: { id: { in: body.ids } }, select: { id: true, userId: true, jobId: true, status: true } })
   const eligible = tasks.filter(task => body.action === 'cancel' ? !['submitted', 'skipped', 'cancelled'].includes(task.status) : !['submitted', 'cancelled'].includes(task.status))
   const next = body.action === 'cancel' ? { status: 'cancelled', checkpoint: 'cancelled_by_admin', error: body.reason } : { status: 'waiting_for_user', checkpoint: 'admin_review', error: 'Manual review requested by an administrator' }
   const result = await runAdminMutation({

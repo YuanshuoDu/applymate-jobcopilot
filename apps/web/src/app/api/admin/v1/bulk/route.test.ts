@@ -101,4 +101,18 @@ describe('POST /api/admin/v1/bulk', () => {
     expect(response.status).toBe(403)
     expect(mocks.requireAdmin).not.toHaveBeenCalled()
   })
+
+  it('updates selected application tasks directly, including tasks without results', async () => {
+    mocks.taskFindMany.mockResolvedValue([{ id: 'task-only', userId: 'user_1', jobId: 'job_1', status: 'waiting_for_user' }])
+    mocks.taskUpdateMany.mockResolvedValue({ count: 1 })
+    const { POST } = await import('./route')
+    const response = await POST(new NextRequest('http://localhost/api/admin/v1/bulk', {
+      method: 'POST', headers: { Origin: 'http://localhost', 'Idempotency-Key': 'bulk-app-1', 'Content-Type': 'application/json' },
+      body: JSON.stringify({ resource: 'applications', action: 'cancel', ids: ['task-only'], reason: 'Stop this application task after an operator review' }),
+    }))
+    expect(response.status).toBe(200)
+    await expect(response.json()).resolves.toMatchObject({ resource: 'applications', action: 'cancel', affected: 1 })
+    expect(mocks.taskFindMany).toHaveBeenCalledWith({ where: { id: { in: ['task-only'] } }, select: { id: true, userId: true, jobId: true, status: true } })
+    expect(mocks.taskUpdateMany).toHaveBeenCalledWith(expect.objectContaining({ where: { id: 'task-only', status: 'waiting_for_user' } }))
+  })
 })
