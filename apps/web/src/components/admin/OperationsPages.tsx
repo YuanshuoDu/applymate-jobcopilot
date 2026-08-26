@@ -111,7 +111,7 @@ export function AdminAiPage({ permissions }: { permissions: readonly string[] })
   return <><AdminDataTable title={t('ops.aiTitle')} subtitle={t('ops.aiSubtitle')} endpoint="/api/admin/v1/ai/budgets" columns={[
     { label: t('ops.userId'), value: values.text('userId') }, { label: t('ops.month'), value: values.text('month') }, { label: t('ops.used'), sortKey: 'used', value: values.text('used') },
     { label: t('ops.limit'), sortKey: 'limit', value: values.text('limit') }, { label: t('ops.remaining'), value: values.text('remaining') }, { label: t('ops.updated'), sortKey: 'updatedAt', value: values.date('updatedAt') },
-  ]} exportEndpoint="/api/admin/v1/export?resource=ai-budgets" /><AdminBudgetControls canUpdate={permissions.includes('ai_budget.update')} /><AdminAiConfigPanel canUpdate={permissions.includes('ai_budget.update')} /><AdminAiUsageTrends /></>
+  ]} exportEndpoint="/api/admin/v1/export?resource=ai-budgets" emptyMessage={t('ops.aiEmpty')} /><AdminBudgetControls canUpdate={permissions.includes('ai_budget.update')} /><AdminAiConfigPanel canUpdate={permissions.includes('ai_budget.update')} /><AdminAiUsageTrends /></>
 }
 
 export function AdminAuditPage() {

@@ -14,6 +14,7 @@ const metricOptions = [
   ['avg_duration_ms', 'Average duration'],
   ['ai_error_rate', 'AI error rate'],
   ['ai_cost_usd', 'AI cost'],
+  ['redis_cost_usd', 'Redis estimated cost'],
   ['queue_stuck_jobs', 'Stuck queue jobs'],
   ['queue_failed_jobs', 'Failed queue jobs'],
   ['queue_dead_letter_jobs', 'Dead-letter queue jobs'],
