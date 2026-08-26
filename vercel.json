@@ -19,7 +19,7 @@
     },
     {
       "path": "/api/admin/observability/alerts/evaluate",
-      "schedule": "*/5 * * * *"
+      "schedule": "45 8 * * *"
     }
   ]
 }
