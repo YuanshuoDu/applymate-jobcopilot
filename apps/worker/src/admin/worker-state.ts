@@ -16,7 +16,27 @@ export type WorkerControlQueue = Readonly<{
   isPaused: () => Promise<boolean>
 }>
 
+type WorkerRuntimeControl = Readonly<{
+  pause: (doNotWaitActive?: boolean) => Promise<unknown>
+  resume: () => void | Promise<unknown>
+}>
+
 export const WORKER_RUNTIME_STATE_KEY = 'admin-control:worker-runtime-state'
+
+/** Bind queue state changes to the BullMQ Worker so pause also stops idle polling. */
+export function bindWorkerControl(queue: WorkerControlQueue, worker: WorkerRuntimeControl): WorkerControlQueue {
+  return {
+    isPaused: () => queue.isPaused(),
+    pause: async () => {
+      await queue.pause()
+      await worker.pause(true)
+    },
+    resume: async () => {
+      await queue.resume()
+      await worker.resume()
+    },
+  }
+}
 
 const defaultState: WorkerRuntimeState = Object.freeze({
   status: 'running',

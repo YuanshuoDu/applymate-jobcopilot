@@ -3,7 +3,7 @@ import { createBullBoard } from "@bull-board/api";
 import { BullMQAdapter } from "@bull-board/api/bullMQAdapter";
 import { ExpressAdapter } from "@bull-board/express";
 import { createWorkerControlHandler, resolveWorkerAdminHost } from "./admin/control-plane.js";
-import { getWorkerRuntimeState, restoreWorkerRuntimeState } from "./admin/worker-state.js";
+import { bindWorkerControl, getWorkerRuntimeState, restoreWorkerRuntimeState } from "./admin/worker-state.js";
 import { closeSharedRedisConnections } from "./redis.js";
 
 async function main() {
@@ -61,11 +61,12 @@ async function main() {
     process.exit(1);
   }
 
-  const workerRuntimeState = await restoreWorkerRuntimeState(connection, {
-    "apply-tasks": applyQueue,
-    "scout-tasks": scoutQueue,
-    "agent-runs": agentRunQueue,
-  });
+  const workerControls = {
+    "apply-tasks": bindWorkerControl(applyQueue, applyWorker),
+    "scout-tasks": bindWorkerControl(scoutQueue, scoutWorker),
+    "agent-runs": bindWorkerControl(agentRunQueue, agentRunQueueModule.agentRunWorker),
+  };
+  const workerRuntimeState = await restoreWorkerRuntimeState(connection, workerControls);
   console.log(`[worker] Runtime control state: ${workerRuntimeState.status}`);
 
   console.log(`[worker] Listening on queue 'apply-tasks' (concurrency: ${process.env.CLOAK_MAX_WORKERS ?? "1"})`);

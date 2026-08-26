@@ -4,7 +4,7 @@ import { getPool } from '../db/apply-results.js'
 import { isAtsSourceKey } from '@jobcopilot/shared'
 import { loadEffectiveAtsPolicy } from './ats-policy.js'
 import { verifyWorkerCommand } from './control-auth.js'
-import { getWorkerRuntimeState, pauseWorkerRuntime, readWorkerRuntimeState, resumeWorkerRuntime, WORKER_RUNTIME_STATE_KEY } from './worker-state.js'
+import { bindWorkerControl, getWorkerRuntimeState, pauseWorkerRuntime, readWorkerRuntimeState, resumeWorkerRuntime, WORKER_RUNTIME_STATE_KEY } from './worker-state.js'
 
 const loopbackAdminHosts = new Set(['127.0.0.1', '::1', 'localhost'])
 const DEAD_LETTER_QUEUE_NAME = 'dead-letter'
@@ -80,7 +80,7 @@ export function createWorkerControlHandler() {
           throw error
         }
       }
-      const { queues, deadLetterQueue } = await loadWorkerQueueResources()
+      const { queues, controls, deadLetterQueue } = await loadWorkerQueueResources()
       if (command.action === 'dead_letter_jobs') {
         const jobs = await deadLetterQueue.getJobs(['waiting', 'delayed', 'failed'], 0, 49, true)
         return response.json({ receipt: randomUUID(), queue: DEAD_LETTER_QUEUE_NAME, jobs: jobs.map(job => ({ ...job.data, id: job.id })) })
@@ -102,8 +102,8 @@ export function createWorkerControlHandler() {
       const queueName = typeof command.params.queue === 'string' ? command.params.queue : ''
       if (command.action === 'pause_worker' || command.action === 'resume_worker') {
         const state = command.action === 'pause_worker'
-          ? await pauseWorkerRuntime(connection, queues, command.actorId, command.reason)
-          : await resumeWorkerRuntime(connection, queues, command.actorId, command.reason)
+          ? await pauseWorkerRuntime(connection, controls, command.actorId, command.reason)
+          : await resumeWorkerRuntime(connection, controls, command.actorId, command.reason)
         return response.json({ receipt: randomUUID(), action: command.action, worker: workerHealth(state) })
       }
       const queue = queues[queueName as keyof typeof queues]
@@ -122,13 +122,14 @@ export function createWorkerControlHandler() {
       }
       const state = await readWorkerRuntimeState(connection)
       if (command.action === 'resume_queue' && state.status === 'paused') return response.status(409).json({ error: 'Worker is globally paused' })
+      const control = controls[queueName as keyof typeof controls]
       if (command.action === 'pause_queue') {
-        await queue.pause()
+        await control.pause()
         if (state.status === 'paused' && !state.pausedQueues.includes(queueName)) {
           await connection.set(WORKER_RUNTIME_STATE_KEY, JSON.stringify({ ...state, pausedQueues: [...state.pausedQueues, queueName] }))
         }
       }
-      if (command.action === 'resume_queue') await queue.resume()
+      if (command.action === 'resume_queue') await control.resume()
       return response.json({ receipt: randomUUID(), queue: queueName, action: command.action })
     } catch (error) {
       console.error('[worker-control] command failed', { action: command.action, requestId: command.requestId })
@@ -166,12 +167,19 @@ async function loadWorkerQueueResources() {
   ])
   const { deadLetterQueue } = await import('../queue/dead-letter.js')
 
+  const queues = {
+    'apply-tasks': applyQueueModule.applyQueue,
+    'scout-tasks': scoutQueueModule.scoutQueue,
+    'agent-runs': agentRunQueueModule.agentRunQueue,
+  }
+
   return {
     connection: applyQueueModule.connection,
-    queues: {
-      'apply-tasks': applyQueueModule.applyQueue,
-      'scout-tasks': scoutQueueModule.scoutQueue,
-      'agent-runs': agentRunQueueModule.agentRunQueue,
+    queues,
+    controls: {
+      'apply-tasks': bindWorkerControl(queues['apply-tasks'], applyQueueModule.applyWorker),
+      'scout-tasks': bindWorkerControl(queues['scout-tasks'], scoutQueueModule.scoutWorker),
+      'agent-runs': bindWorkerControl(queues['agent-runs'], agentRunQueueModule.agentRunWorker),
     },
     deadLetterQueue,
   }

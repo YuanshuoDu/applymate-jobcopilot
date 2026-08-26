@@ -106,8 +106,9 @@ and `/api/admin/observability/alerts/evaluate` every five minutes by default.
 This avoids Vercel Hobby Cron's daily-only restriction while retaining a secured,
 private scheduler. Set `AGENT_SCHEDULER_ENABLED=0` for a Worker instance that
 must not schedule automations. A globally paused Worker also suppresses
-scheduler requests at runtime, so pausing queues does not continue generating
-maintenance traffic.
+scheduler requests at runtime and pauses the BullMQ Worker consumers, so
+pausing queues does not continue generating maintenance or idle polling
+traffic.
 
 ## Fly.io Worker deployment
 
