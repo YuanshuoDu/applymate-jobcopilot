@@ -22,6 +22,18 @@ const latestEvent = (rows: Array<{ lastEventAt: Date | string | null }>) => rows
   return !latest || current > latest ? current : latest
 }, null)
 
+function configuredExternalCost(provider: string): boolean {
+  const key = `EXTERNAL_API_COST_PER_REQUEST_${provider.toUpperCase().replace(/[^A-Z0-9]/g, '_')}`
+  const value = Number(process.env[key])
+  return Number.isFinite(value) && value > 0
+}
+
+function externalCostKnown(provider: (typeof EXTERNAL_API_PROVIDERS)[number]): boolean {
+  if (provider.billing === 'free') return true
+  if (provider.billing === 'unknown') return false
+  return configuredExternalCost(provider.key)
+}
+
 async function loadOptimizationRows(since: Date, provider: string | undefined): Promise<OptimizationRow[]> {
   const providerFilter = provider ? Prisma.sql`AND provider = ${provider}` : Prisma.empty
   try {
@@ -148,7 +160,7 @@ export async function GET(request: NextRequest) {
         ? { calls: 0, inputBytes: neonSnapshot.inputBytes, outputBytes: neonSnapshot.outputBytes, cost: neonSnapshot.estimatedCostUsd ?? 0, costKnown: neonSnapshot.estimatedCostUsd !== null, sampledAt: neonSnapshot.sampledAt, period: neonSnapshot.period, source: neonSnapshot.source, alertThresholdUsd: neonSnapshot.alertThresholdUsd, maxBudgetUsd: null, alertTriggered: neonSnapshot.alertTriggered, metrics: neonSnapshot.metrics }
         : null
     const fallbackSource = item.telemetry === 'snapshot' ? 'unavailable' : item.telemetry
-    return { ...item, calls: snapshot?.calls ?? rows.reduce((sum, row) => sum + number(row.calls), 0), inputBytes: snapshot?.inputBytes ?? rows.reduce((sum, row) => sum + number(row.inputBytes), 0), outputBytes: snapshot?.outputBytes ?? rows.reduce((sum, row) => sum + number(row.outputBytes), 0), cost: snapshot?.cost ?? rows.reduce((sum, row) => sum + number(row.cost), 0), costKnown: snapshot?.costKnown ?? true, errors: rows.reduce((sum, row) => sum + number(row.errors), 0), avgLatency: rows.length ? Math.round(rows.reduce((sum, row) => sum + number(row.avgLatency), 0) / rows.length) : 0, lastEventAt: latestEvent(rows), source: snapshot?.source ?? fallbackSource, period: snapshot?.period ?? null, sampledAt: snapshot?.sampledAt ?? null, alertThresholdUsd: snapshot?.alertThresholdUsd ?? null, maxBudgetUsd: snapshot?.maxBudgetUsd ?? null, alertTriggered: snapshot?.alertTriggered ?? false, metrics: snapshot?.metrics ?? [], operations: rows }
+    return { ...item, calls: snapshot?.calls ?? rows.reduce((sum, row) => sum + number(row.calls), 0), inputBytes: snapshot?.inputBytes ?? rows.reduce((sum, row) => sum + number(row.inputBytes), 0), outputBytes: snapshot?.outputBytes ?? rows.reduce((sum, row) => sum + number(row.outputBytes), 0), cost: snapshot?.cost ?? rows.reduce((sum, row) => sum + number(row.cost), 0), costKnown: snapshot?.costKnown ?? externalCostKnown(item), errors: rows.reduce((sum, row) => sum + number(row.errors), 0), avgLatency: rows.length ? Math.round(rows.reduce((sum, row) => sum + number(row.avgLatency), 0) / rows.length) : 0, lastEventAt: latestEvent(rows), source: snapshot?.source ?? fallbackSource, period: snapshot?.period ?? null, sampledAt: snapshot?.sampledAt ?? null, alertThresholdUsd: snapshot?.alertThresholdUsd ?? null, maxBudgetUsd: snapshot?.maxBudgetUsd ?? null, alertTriggered: snapshot?.alertTriggered ?? false, metrics: snapshot?.metrics ?? [], operations: rows }
   })
   const externalCalls = externalProviders.reduce((sum, row) => sum + row.calls, 0)
   const externalErrors = externalProviders.reduce((sum, row) => sum + row.errors, 0)
