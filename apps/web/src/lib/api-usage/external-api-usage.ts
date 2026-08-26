@@ -15,7 +15,7 @@ export async function trackedExternalApiFetch(url: string | URL, init: PinnedFet
   const inputBytes = bodySize(init.body)
   try {
     const response = await request(url, init)
-    await create({ ...safeMeta(meta), requestCount: 1, inputBytes, outputBytes: headerSize(response.headers), estimatedCostUsd: estimateCost(meta.provider), latencyMs: Date.now() - startedAt, status: response.ok ? 'success' : 'error', httpStatus: response.status, ...(response.ok ? {} : { errorCode: classifyHttp(response.status) }) })
+    await create({ ...safeMeta(meta), requestCount: 1, inputBytes, outputBytes: await responseSize(response), estimatedCostUsd: estimateCost(meta.provider), latencyMs: Date.now() - startedAt, status: response.ok ? 'success' : 'error', httpStatus: response.status, ...(response.ok ? {} : { errorCode: classifyHttp(response.status) }) })
     return response
   } catch (error) {
     await create({ ...safeMeta(meta), requestCount: 1, inputBytes, outputBytes: 0, estimatedCostUsd: estimateCost(meta.provider), latencyMs: Date.now() - startedAt, status: 'error', errorCode: classifyError(error) })
@@ -26,7 +26,11 @@ export async function trackedExternalApiFetch(url: string | URL, init: PinnedFet
 function safeMeta(meta: ExternalApiRequestMeta): ExternalApiRequestMeta { return { provider: isExternalApiProvider(meta.provider) ? meta.provider : 'unknown', operation: safeKey(meta.operation, 'request'), credentialSource: meta.credentialSource, userId: meta.userId?.slice(0, 120) } }
 function safeKey(value: string, fallback: string): string { const normalized = value.trim().toLowerCase().replace(/[^a-z0-9._-]+/g, '_').slice(0, 80); return normalized || fallback }
 function bodySize(body: unknown): number { if (typeof body === 'string') return new TextEncoder().encode(body).byteLength; if (body instanceof Uint8Array) return body.byteLength; if (body instanceof URLSearchParams) return new TextEncoder().encode(body.toString()).byteLength; return 0 }
-function headerSize(headers: Headers): number { const value = Number(headers.get('content-length') ?? 0); return Number.isSafeInteger(value) && value > 0 ? value : 0 }
+async function responseSize(response: Response): Promise<number> {
+  const headerValue = Number(response.headers.get('content-length') ?? 0)
+  if (Number.isSafeInteger(headerValue) && headerValue > 0) return headerValue
+  try { return (await response.clone().arrayBuffer()).byteLength } catch { return 0 }
+}
 function estimateCost(provider: string): number { const key = `EXTERNAL_API_COST_PER_REQUEST_${provider.toUpperCase().replace(/[^A-Z0-9]/g, '_')}`; const value = Number(process.env[key] ?? 0); return Number.isFinite(value) && value > 0 ? value : 0 }
 function classifyHttp(status: number): string { return status === 429 ? 'http_429' : status >= 500 ? 'http_5xx' : status >= 400 ? 'http_4xx' : 'provider_error' }
 function classifyError(error: unknown): string { return error instanceof DOMException && error.name === 'AbortError' ? 'timeout' : error instanceof TypeError ? 'network_error' : 'provider_error' }

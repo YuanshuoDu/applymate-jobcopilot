@@ -16,4 +16,13 @@ describe('trackedExternalApiFetch', () => {
     expect(create).toHaveBeenCalledWith(expect.objectContaining({ errorCode: 'timeout' }))
     expect(JSON.stringify(create.mock.calls[0][0])).not.toContain('secret response body')
   })
+
+  it('measures a response body when content-length is missing', async () => {
+    const create = vi.fn().mockResolvedValue(undefined)
+    const request = vi.fn().mockResolvedValue(new Response('provider payload'))
+
+    await trackedExternalApiFetch('https://gmail.example.test', {}, { provider: 'gmail', operation: 'list', credentialSource: 'user' }, { request, create })
+
+    expect(create).toHaveBeenCalledWith(expect.objectContaining({ outputBytes: new TextEncoder().encode('provider payload').byteLength }))
+  })
 })
