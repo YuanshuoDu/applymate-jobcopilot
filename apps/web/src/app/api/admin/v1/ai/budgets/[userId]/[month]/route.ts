@@ -4,6 +4,7 @@ import { parseBudgetLimit, updateBudgetLimitInTransaction } from '@/lib/admin/bu
 import { validateAdminWrite } from '@/lib/admin/csrf'
 import { AdminMutationConflict, runAdminMutation } from '@/lib/admin/write-transaction'
 import { db } from '@/lib/db'
+import { resolveEntitlement } from '@/lib/entitlements'
 
 function validMonth(value: string) { return /^20\d{2}-(0[1-9]|1[0-2])$/.test(value) }
 type BudgetLimitResult = { used: number; limit: number; version: number }
@@ -21,8 +22,14 @@ export async function PATCH(request: NextRequest, context: { params: Promise<{ u
   const key = request.headers.get('idempotency-key')
   if (!validMonth(month) || limit === null || version < 1 || reason.length < 10 || reason.length > 500 || !key) return NextResponse.json({ error: 'Invalid budget override' }, { status: 400 })
   const current = await db.aiBudget.findUnique({ where: { userId_month: { userId, month } }, select: { used: true, version: true } })
-  if (!current) return NextResponse.json({ error: 'Budget not found' }, { status: 404 })
-  if (limit < current.used && payload?.confirmBelowUsed !== true) return NextResponse.json({ error: 'Reducing below used credits requires confirmation' }, { status: 400 })
+  let initialLimit: number | undefined
+  if (!current) {
+    const user = await db.user.findUnique({ where: { id: userId }, select: { id: true } })
+    if (!user) return NextResponse.json({ error: 'Budget user not found' }, { status: 404 })
+    const entitlement = await resolveEntitlement(userId, 'ai_credits')
+    initialLimit = entitlement?.kind === 'limit' && entitlement.limit !== null ? entitlement.limit : 30
+  }
+  if (limit < (current?.used ?? 0) && payload?.confirmBelowUsed !== true) return NextResponse.json({ error: 'Reducing below used credits requires confirmation' }, { status: 400 })
   try {
     const result = await runAdminMutation<BudgetLimitResult>({
       actorUserId: actor.userId,
@@ -31,7 +38,7 @@ export async function PATCH(request: NextRequest, context: { params: Promise<{ u
       targetId: `${userId}:${month}`,
       audit: { requestId: actor.requestId, actorRoleKey: actor.roleKey, targetType: 'ai_budget', targetId: `${userId}:${month}`, tenantUserId: userId, reason, after: { limit, version: version + 1 }, outcome: 'success' },
       mutate: async (tx) => {
-        const updated = await updateBudgetLimitInTransaction(tx, { userId, month, limit, version, actorUserId: actor.userId, reason, idempotencyKey: key })
+        const updated = await updateBudgetLimitInTransaction(tx, { userId, month, limit, version, actorUserId: actor.userId, reason, idempotencyKey: key, initialLimit })
         if (!updated) throw new AdminMutationConflict('Budget changed or was not found')
         return updated
       },

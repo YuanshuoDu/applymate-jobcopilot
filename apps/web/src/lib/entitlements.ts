@@ -122,10 +122,11 @@ export async function resolveAiAccess(userId: string, now = new Date()): Promise
   if (limit === null) return 'allowed'
   const month = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}`
   try {
-    const rows = await db.$queryRaw<Array<{ used: number }>>`
-      SELECT used FROM ai_budgets WHERE user_id = ${userId} AND month = ${month} LIMIT 1
+    const rows = await db.$queryRaw<Array<{ used: number; limit: number }>>`
+      SELECT used, "limit" FROM ai_budgets WHERE user_id = ${userId} AND month = ${month} LIMIT 1
     `
-    return Number(rows[0]?.used ?? 0) < limit ? 'allowed' : 'exhausted'
+    const budgetLimit = rows[0] ? Number(rows[0].limit) : limit
+    return Number(rows[0]?.used ?? 0) < budgetLimit ? 'allowed' : 'exhausted'
   } catch {
     return 'allowed'
   }

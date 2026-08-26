@@ -5,11 +5,17 @@ export function parseBudgetLimit(value: unknown) {
   return typeof value === 'number' && Number.isInteger(value) && value >= 0 && value <= 10_000 ? value : null
 }
 
-export type BudgetLimitInput = { userId: string; month: string; limit: number; version: number; actorUserId: string; reason: string; idempotencyKey: string }
+export type BudgetLimitInput = { userId: string; month: string; limit: number; version: number; actorUserId: string; reason: string; idempotencyKey: string; initialLimit?: number }
 
 export async function updateBudgetLimitInTransaction(tx: Prisma.TransactionClient, input: BudgetLimitInput) {
   const budget = await tx.aiBudget.findUnique({ where: { userId_month: { userId: input.userId, month: input.month } }, select: { id: true, used: true, limit: true, version: true } })
-  if (!budget || budget.version !== input.version) return null
+  if (!budget) {
+    if (input.version !== 1) return null
+    const created = await tx.aiBudget.create({ data: { userId: input.userId, month: input.month, used: 0, limit: input.limit, version: 2 } })
+    await tx.aiBudgetAdjustment.create({ data: { budgetId: created.id, actorUserId: input.actorUserId, kind: 'limit_override', previousLimit: input.initialLimit ?? 30, nextLimit: input.limit, reason: input.reason, idempotencyKey: input.idempotencyKey } })
+    return { used: 0, limit: input.limit, version: 2 }
+  }
+  if (budget.version !== input.version) return null
   const updated = await tx.aiBudget.updateMany({ where: { id: budget.id, version: input.version }, data: { limit: input.limit, version: { increment: 1 } } })
   if (!updated.count) return null
   await tx.aiBudgetAdjustment.create({ data: { budgetId: budget.id, actorUserId: input.actorUserId, kind: 'limit_override', previousLimit: budget.limit, nextLimit: input.limit, reason: input.reason, idempotencyKey: input.idempotencyKey } })

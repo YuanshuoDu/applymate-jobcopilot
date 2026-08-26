@@ -62,14 +62,14 @@ describe('GET /api/me/ai-budget', () => {
     })
   })
 
-  it('uses the current plan entitlement as the limit for an existing budget row', async () => {
+  it('uses the persisted budget limit for an existing budget row', async () => {
     mocks.resolveEntitlement.mockResolvedValueOnce({ kind: 'limit', enabled: true, limit: 100 })
     mocks.queryRaw.mockResolvedValueOnce([{ used: 18, limit: 30 }])
     const { GET } = await import('@/app/api/me/ai-budget/route')
 
     const res = await GET(request() as never)
 
-    await expect(res.json()).resolves.toMatchObject({ used: 18, limit: 100, remaining: 82, hasBudget: true })
+    await expect(res.json()).resolves.toMatchObject({ used: 18, limit: 30, remaining: 12, hasBudget: true })
   })
 
   it('fails open when the budget table is not available yet', async () => {
