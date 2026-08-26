@@ -10,4 +10,8 @@ describe('external API catalogue', () => {
     expect(isExternalApiProvider('resend')).toBe(true)
     expect(isExternalApiProvider('unknown-provider')).toBe(false)
   })
+
+  it('marks worker control traffic as event-backed telemetry', () => {
+    expect(EXTERNAL_API_PROVIDERS.find(provider => provider.key === 'internal-worker')?.telemetry).toBe('events')
+  })
 })
