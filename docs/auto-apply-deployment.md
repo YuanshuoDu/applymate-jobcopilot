@@ -42,8 +42,16 @@ Set the following Web environment variables in Vercel:
 | `MINIMAX_API_KEY` | Platform default model, unless every user brings a key |
 | `PAID_REDIS_KV_REST_API_URL` | Server-only Upstash REST endpoint used for the Redis usage alert |
 | `PAID_REDIS_KV_REST_API_TOKEN` | Server-only Upstash standard REST token; never expose as `NEXT_PUBLIC_*` |
+| `PAID_REDIS_DATABASE_ID` | Upstash database ID used by the current-month management stats endpoint |
+| `UPSTASH_API_EMAIL` | Server-only Upstash Developer API email for monthly usage stats |
+| `UPSTASH_API_KEY` | Server-only Upstash Developer API key for monthly usage stats |
 | `REDIS_COST_PER_100K_COMMANDS` | Pay-as-you-go estimate rate; set to `0.2` for the current `$0.20/100K` rate |
 | `REDIS_COST_ALERT_USD` | Application notification threshold; set to `5` without stopping Redis |
+| `REDIS_MAX_BUDGET_USD` | Documents the provider-side Max Budget cap; set to `20` and enforce it in the Upstash console |
+| `NEON_API_KEY` | Server-only Neon API key for current-month consumption metrics |
+| `NEON_ORG_ID` | Neon organization ID required by the consumption endpoint |
+| `NEON_PROJECT_ID` | Optional Neon project scope for project-level fallback metrics |
+| `NEON_PLAN` / `NEON_COST_*` | Optional plan and rate overrides for estimated Neon cost |
 
 Set the following Worker secrets in Fly.io (or the chosen long-running host):
 
