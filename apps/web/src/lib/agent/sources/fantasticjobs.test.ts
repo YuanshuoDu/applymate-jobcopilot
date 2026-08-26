@@ -36,4 +36,15 @@ describe('fetchFantasticJobs', () => {
     mocks.pinnedFetch.mockResolvedValue(new Response(null, { status: 401 }))
     await expect(fetchFantasticJobs({ apiKey: 'secret' })).resolves.toEqual([])
   })
+
+  it('drops non-http application destinations before they can enter discovery', async () => {
+    mocks.pinnedFetch.mockResolvedValue(new Response(JSON.stringify([
+      { id: 'safe', title: 'Engineer', organization: { name: 'Acme' }, url: 'https://jobs.example/safe' },
+      { id: 'unsafe', title: 'Engineer', organization: { name: 'Acme' }, url: 'javascript:alert(1)' },
+    ]), { status: 200 }))
+
+    const jobs = await fetchFantasticJobs({ apiKey: 'secret' })
+
+    expect(jobs.map(job => job.externalId)).toEqual(['safe'])
+  })
 })

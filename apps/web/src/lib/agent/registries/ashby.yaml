@@ -1,0 +1,27 @@
+# Ashby public job-board registry
+# Verified 2026-08-24: each board returned HTTP 200 with at least one listed job
+# from https://api.ashbyhq.com/posting-api/job-board/{board}.
+# Country is the employer's primary operating base; jobs may be global or remote.
+employers:
+  # --- Tier 1: major EU/US technology employers ---
+  - { slug: "openai",       name: "OpenAI",       country: "us", tier: 1 }
+  - { slug: "ramp",         name: "Ramp",         country: "us", tier: 1 }
+  - { slug: "notion",       name: "Notion",       country: "us", tier: 1 }
+  - { slug: "plaid",        name: "Plaid",        country: "us", tier: 1 }
+  - { slug: "perplexity",   name: "Perplexity",   country: "us", tier: 1 }
+  - { slug: "deepl",        name: "DeepL",        country: "de", tier: 1 }
+  - { slug: "sentry",       name: "Sentry",       country: "us", tier: 1 }
+  - { slug: "miro",         name: "Miro",         country: "nl", tier: 1 }
+  - { slug: "deliveroo",    name: "Deliveroo",    country: "gb", tier: 1 }
+  - { slug: "vanta",        name: "Vanta",        country: "us", tier: 1 }
+
+  # --- Tier 2: high-growth technology employers ---
+  - { slug: "linear",       name: "Linear",       country: "us", tier: 2 }
+  - { slug: "replit",       name: "Replit",       country: "us", tier: 2 }
+  - { slug: "supabase",     name: "Supabase",     country: "us", tier: 2 }
+  - { slug: "airbyte",      name: "Airbyte",      country: "us", tier: 2 }
+  - { slug: "posthog",      name: "PostHog",      country: "gb", tier: 2 }
+  - { slug: "temporal",     name: "Temporal",     country: "us", tier: 2 }
+  - { slug: "cohere",       name: "Cohere",       country: "ca", tier: 2 }
+  - { slug: "hightouch",    name: "Hightouch",    country: "us", tier: 2 }
+  - { slug: "ashby",        name: "Ashby",        country: "us", tier: 2 }

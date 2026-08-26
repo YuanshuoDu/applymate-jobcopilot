@@ -11,6 +11,7 @@ type AiRow = { provider: string; model: string; credentialSource: string; calls:
 type TrendRow = { day: Date; category: string; calls: number; errors: number; units: number; cost: number }
 type UserSummaryRow = { userId: string; category: 'job' | 'ai'; calls: number; jobs: number; tokens: number; cost: number; errors: number; avgLatency: number | null; lastEventAt: Date | null }
 type UserDetailRow = UserSummaryRow & { provider: string; operationModel: string; featureKey: string | null; runtime: string; credentialSource: string }
+type OptimizationRow = { eventType: string; provider: string | null; events: number; requestsAvoided: number; jobsReturned: number; netNewJobs: number; validApplyUrls: number; completeDescriptions: number }
 
 const number = (value: unknown) => Number(value ?? 0)
 const latestEvent = (rows: Array<{ lastEventAt: Date | string | null }>) => rows.reduce<Date | null>((latest, row) => {
@@ -18,6 +19,22 @@ const latestEvent = (rows: Array<{ lastEventAt: Date | string | null }>) => rows
   const current = new Date(row.lastEventAt)
   return !latest || current > latest ? current : latest
 }, null)
+
+async function loadOptimizationRows(since: Date, provider: string | undefined): Promise<OptimizationRow[]> {
+  const providerFilter = provider ? Prisma.sql`AND provider = ${provider}` : Prisma.empty
+  try {
+    return (await db.$queryRaw<OptimizationRow[]>`
+      SELECT event_type AS "eventType", provider, COUNT(*)::int AS events,
+        SUM(requests_avoided)::int AS "requestsAvoided", SUM(jobs_returned)::int AS "jobsReturned",
+        SUM(net_new_jobs)::int AS "netNewJobs", SUM(valid_apply_urls)::int AS "validApplyUrls",
+        SUM(complete_descriptions)::int AS "completeDescriptions"
+      FROM discovery_optimization_events
+      WHERE created_at >= ${since} ${providerFilter}
+      GROUP BY event_type, provider ORDER BY "requestsAvoided" DESC`) ?? []
+  } catch {
+    return []
+  }
+}
 
 export async function GET(request: NextRequest) {
   const actor = await requireAdmin('observability.read', request)
@@ -32,7 +49,7 @@ export async function GET(request: NextRequest) {
   const jobProviderFilter = provider ? Prisma.sql`AND provider = ${provider}` : Prisma.empty
   const aiProviderFilter = provider ? Prisma.sql`AND provider = ${provider}` : Prisma.empty
   const since = new Date(Date.now() - days * 86_400_000)
-  const [jobRows, aiRows, trend, userRows, userDetails, quotas] = await Promise.all([
+  const [jobRows, aiRows, trend, userRows, userDetails, quotas, optimizationRows] = await Promise.all([
     db.$queryRaw<JobRow[]>`
       SELECT provider, operation, credential_source AS "credentialSource",
         SUM(request_count)::int AS calls, SUM(jobs_returned)::int AS jobs,
@@ -103,6 +120,7 @@ export async function GET(request: NextRequest) {
       GROUP BY user_id, provider, model, feature_key, runtime, credential_source
       ORDER BY "lastEventAt" DESC` : Promise.resolve([] as UserDetailRow[]),
     db.apiQuota.findMany({ where: { enabled: true, ...(provider ? { provider } : {}) }, orderBy: [{ category: 'asc' }, { provider: 'asc' }, { operation: 'asc' }] }),
+    loadOptimizationRows(since, provider),
   ])
 
   const jobStats = new Map<string, JobRow[]>()
@@ -139,12 +157,21 @@ export async function GET(request: NextRequest) {
   const aiCalls = aiProviders.reduce((sum, row) => sum + row.calls, 0)
   const aiErrors = aiProviders.reduce((sum, row) => sum + row.errors, 0)
   const aiCatalogue = [...new Set(MODEL_CATALOGUE.map(model => model.provider))].sort().map(key => ({ key, label: key }))
+  const optimization = optimizationRows.reduce((summary, row) => ({
+    cacheHits: summary.cacheHits + (row.eventType === 'cache_hit' ? number(row.requestsAvoided) : 0),
+    singleflightHits: summary.singleflightHits + (row.eventType === 'singleflight_hit' ? number(row.requestsAvoided) : 0),
+    providerSkips: summary.providerSkips + (row.eventType === 'provider_skipped' ? number(row.events) : 0),
+    shadowJobs: summary.shadowJobs + (row.eventType === 'shadow_comparison' ? number(row.jobsReturned) : 0),
+    shadowNetNewJobs: summary.shadowNetNewJobs + (row.eventType === 'shadow_comparison' ? number(row.netNewJobs) : 0),
+    shadowValidApplyUrls: summary.shadowValidApplyUrls + (row.eventType === 'shadow_comparison' ? number(row.validApplyUrls) : 0),
+    shadowCompleteDescriptions: summary.shadowCompleteDescriptions + (row.eventType === 'shadow_comparison' ? number(row.completeDescriptions) : 0),
+  }), { cacheHits: 0, singleflightHits: 0, providerSkips: 0, shadowJobs: 0, shadowNetNewJobs: 0, shadowValidApplyUrls: 0, shadowCompleteDescriptions: 0 })
   return NextResponse.json({ generatedAt: new Date(), days, provider: provider ?? null, selectedUserId: selectedUserId ?? null,
     catalog: { job: JOB_API_PROVIDERS.map(item => ({ key: item.key, label: item.label })), ai: aiCatalogue },
     freshness: { lastEventAt: latestEvent([...providers, ...aiProviders]) },
     job: { summary: { calls: jobCalls, jobs: providers.reduce((sum, row) => sum + row.jobs, 0), errors: jobErrors, errorRate: jobCalls ? Number((jobErrors / jobCalls * 100).toFixed(1)) : 0 }, providers },
     ai: { summary: { calls: aiCalls, tokens: aiProviders.reduce((sum, row) => sum + row.inputTokens + row.outputTokens, 0), costUsd: Number(aiProviders.reduce((sum, row) => sum + row.cost, 0).toFixed(6)), errors: aiErrors, errorRate: aiCalls ? Number((aiErrors / aiCalls * 100).toFixed(1)) : 0 }, providers: aiProviders },
-    quotas: quotaUsage, trend: trend.map(row => ({ ...row, calls: number(row.calls), errors: number(row.errors), units: number(row.units), cost: number(row.cost) })),
+    quotas: quotaUsage, optimization, trend: trend.map(row => ({ ...row, calls: number(row.calls), errors: number(row.errors), units: number(row.units), cost: number(row.cost) })),
     users: (userRows ?? []).map(row => ({ ...row, calls: number(row.calls), jobs: number(row.jobs), tokens: number(row.tokens), cost: number(row.cost), errors: number(row.errors), avgLatency: number(row.avgLatency) })),
     userDetails: (userDetails ?? []).map(row => ({ ...row, calls: number(row.calls), jobs: number(row.jobs), tokens: number(row.tokens), cost: number(row.cost), errors: number(row.errors), avgLatency: number(row.avgLatency) })),
   }, { headers: { 'Cache-Control': 'no-store', 'x-request-id': actor.requestId } })

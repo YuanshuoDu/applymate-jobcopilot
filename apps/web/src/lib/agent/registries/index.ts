@@ -2,7 +2,8 @@
  * EU employer registries for ATS sources.
  *
  * Count summary (Issue #212): Greenhouse 45, Lever 45, Personio 35,
- * SmartRecruiters 25, Workday 33 active entries.
+ * SmartRecruiters 25, Ashby 19, Workday 33 catalogued entries (currently
+ * quarantined until their tenant/siteId pairs are re-verified).
  *
  * Loads YAML files containing curated, verified employer slugs.
  * Each entry maps to a real company with >= 1 active job posting.
@@ -53,7 +54,7 @@ const workdayCache = new Map<string, WorkdayEmployer[]>();
  * YAML is read synchronously — the files are small and this runs
  * server-side at import time or on first call.
  */
-export function loadRegistry(ats: "greenhouse" | "lever" | "smartrecruiters" | "personio"): Employer[] {
+export function loadRegistry(ats: "greenhouse" | "lever" | "smartrecruiters" | "personio" | "ashby"): Employer[] {
   const cached = employerCache.get(ats);
   if (cached) return cached;
 
@@ -72,8 +73,9 @@ export function loadRegistry(ats: "greenhouse" | "lever" | "smartrecruiters" | "
 /**
  * Load the Workday employer registry.
  *
- * Returns verified and pending entries. Unreachable entries
- * (those that returned 401/404/422 during verification) are filtered out.
+ * Returns only verified entries. Pending entries are retained in YAML for
+ * re-verification but must not be sent to a production discovery request.
+ * Unreachable entries are also filtered out.
  */
 export function loadWorkdayRegistry(): WorkdayEmployer[] {
   const key = "workday"
@@ -88,8 +90,8 @@ export function loadWorkdayRegistry(): WorkdayEmployer[] {
     throw new Error(`Invalid registry: ${file} — missing or malformed "employers" key`)
   }
 
-  // Only return employers that might work (skip unreachable)
-  const active = doc.employers.filter(e => e.status !== "unreachable")
+  // Only verified employers may issue production discovery requests.
+  const active = doc.employers.filter(e => e.status === "verified")
   workdayCache.set(key, active)
   return active
 }

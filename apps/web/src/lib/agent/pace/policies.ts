@@ -18,6 +18,9 @@ export interface RatePolicy {
 export const DISCOVERY_POLICIES: Record<string, RatePolicy> = {
   cleanjobdata: { host: 'api.cleanjobdata.com', rps: 1 },
   fantasticjobs: { host: 'data.fantastic.jobs', rps: 1 },
+  // Ashby is currently discovery-only; keep it out of auto-apply ATS policy
+  // until a dedicated flow exists.
+  ashby: { host: 'api.ashbyhq.com', rps: 1 },
 }
 
 /** Per-source rate limits — hard ceiling regardless of user count. */

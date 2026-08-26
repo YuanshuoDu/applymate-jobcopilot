@@ -29,7 +29,7 @@ export async function POST(request: NextRequest, { params }: Params) {
     httpStatus = response.status
     status = response.ok ? 'ok' : response.status === 401 || response.status === 403 ? 'invalid_credential' : 'provider_error'
   } catch { status = 'timeout_or_unreachable' }
-  await recordAiUsage({ userId: actor.userId, featureKey: 'providerTest', provider: provider.key, model: 'models-catalog', credentialSource: 'platform', runtime: 'admin', latencyMs: Date.now() - started, status: status === 'ok' ? 'success' : 'error', errorCode: status === 'ok' ? undefined : status })
+  await recordAiUsage({ userId: actor.userId, featureKey: 'providerTest', provider: provider.key, model: 'models-catalog', credentialSource: 'platform', runtime: 'admin', latencyMs: Date.now() - started, status: status === 'ok' ? 'success' : 'error', errorCode: status === 'ok' ? undefined : status, chargeBudget: false })
   await writeAdminAudit({ requestId: actor.requestId, actorUserId: actor.userId, actorRoleKey: actor.roleKey, action: 'ai_provider.connection_tested', targetType: 'ai_provider', targetId: id, reason: 'Testing provider reachability without persisting credentials', outcome: status === 'ok' ? 'success' : 'failed', errorCode: status === 'ok' ? undefined : status })
   return NextResponse.json({ status, httpStatus, latencyMs: Date.now() - started, credentialConfigured: true }, { headers: { 'Cache-Control': 'no-store', 'x-request-id': actor.requestId } })
 }

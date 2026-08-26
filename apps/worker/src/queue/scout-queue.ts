@@ -1,15 +1,14 @@
 /** Automated job discovery via Greenhouse and Lever public APIs. */
 import { Queue, Worker } from 'bullmq'
-import { Redis } from 'ioredis'
 import { randomUUID } from 'node:crypto'
 import { getPool } from '../db/apply-results.js'
 import { isUserActive } from '../db/application-task-state.js'
 import { isWorkerFeatureEnabled } from '../admin/runtime-feature-flags.js'
 import { workerPollingOptions } from './worker-polling-options.js'
 import { discoverGreenhouseJobs, discoverLeverJobs, type DiscoveredJob } from './scout-discovery.js'
+import { redisConnection } from '../redis.js'
 
-const redisUrl = process.env.REDIS_URL ?? 'redis://localhost:6379'
-const connection = new Redis(redisUrl, { maxRetriesPerRequest: null })
+const connection = redisConnection
 
 export const SCOUT_QUEUE_NAME = 'scout-tasks'
 
@@ -17,7 +16,7 @@ export interface ScoutTaskPayload {
   userId: string
 }
 
-export const scoutQueue = new Queue<ScoutTaskPayload>(SCOUT_QUEUE_NAME, { connection })
+export const scoutQueue = new Queue<ScoutTaskPayload>(SCOUT_QUEUE_NAME, { connection, skipVersionCheck: true })
 
 const GREENHOUSE_SLUGS = [
   'n26', 'personio', 'contentful', 'deliveroo', 'zalando', 'spotify', 'revolut', 'klarna', 'checkout', 'stripe',
@@ -81,7 +80,7 @@ export const scoutWorker = new Worker<ScoutTaskPayload>(
     console.log('[scout-worker] User %s: %d discovered, %d matching, %d inserted, %dms', userId, discovered.length, matching.length, inserted, durationMs)
     return { discovered: discovered.length, matching: matching.length, inserted, duplicates: discovered.length - matching.length, durationMs }
   },
-  { connection, ...workerPollingOptions(), concurrency: 1 },
+  { connection, skipVersionCheck: true, ...workerPollingOptions(), concurrency: 1 },
 )
 
 function matchesRole(job: DiscoveredJob, targetRoles: string[], existingUrls: Set<string>): boolean {

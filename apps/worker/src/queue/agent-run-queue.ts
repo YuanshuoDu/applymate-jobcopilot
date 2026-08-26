@@ -1,7 +1,7 @@
 import { pinnedFetch } from "@jobcopilot/shared";
 import { Queue, Worker } from "bullmq";
-import { Redis } from "ioredis";
 import { workerPollingOptions } from "./worker-polling-options.js";
+import { redisConnection } from "../redis.js";
 
 export const AGENT_RUN_QUEUE_NAME = "agent-runs";
 
@@ -10,11 +10,9 @@ export interface AgentRunTaskPayload {
   sessionId: string;
 }
 
-const connection = new Redis(process.env.REDIS_URL ?? "redis://localhost:6379", {
-  maxRetriesPerRequest: null,
-});
+const connection = redisConnection;
 
-export const agentRunQueue = new Queue<AgentRunTaskPayload>(AGENT_RUN_QUEUE_NAME, { connection });
+export const agentRunQueue = new Queue<AgentRunTaskPayload>(AGENT_RUN_QUEUE_NAME, { connection, skipVersionCheck: true });
 
 function internalRunUrl() {
   const base = process.env.AGENT_WEB_URL?.replace(/\/$/, "");
@@ -53,11 +51,10 @@ export const agentRunWorker = new Worker<AgentRunTaskPayload>(
     console.log(`[agent-run-worker] Session ${task.data.sessionId}: ${result?.status ?? "completed"}`);
     return result;
   },
-  { connection, ...workerPollingOptions(), concurrency: 1 },
+  { connection, skipVersionCheck: true, ...workerPollingOptions(), concurrency: 1 },
 );
 
 export async function closeAgentRunResources() {
   await agentRunWorker.close();
   await agentRunQueue.close();
-  connection.disconnect();
 }
