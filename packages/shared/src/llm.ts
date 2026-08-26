@@ -7,6 +7,7 @@ import { recordSharedAiUsage, sharedAiUsageErrorCode } from "./ai-usage.js";
 // ── Types ──
 
 export type Provider = "minimax" | "openai" | "anthropic" | "deepseek" | "qwen" | "zhipu" | "kimi" | "custom";
+type UsageRuntime = "web" | "worker" | "admin" | "unknown";
 
 export interface AiConfig {
   provider: Provider;
@@ -177,7 +178,7 @@ export function closeSharedPool(): void {
 export async function callLlm(
   messages: ChatMessage[],
   config: AiConfig,
-  usageContext?: { userId?: string; featureKey?: string },
+  usageContext?: { userId?: string; featureKey?: string; runtime?: UsageRuntime },
 ): Promise<ChatResult> {
   const provider = config.provider;
   const startedAt = Date.now();
@@ -414,7 +415,7 @@ async function decryptWorkerAiSettings(preferences: unknown, userId: string): Pr
 export async function callLlmText(
   messages: ChatMessage[],
   config: AiConfig,
-  usageContext?: { userId?: string; featureKey?: string },
+  usageContext?: { userId?: string; featureKey?: string; runtime?: UsageRuntime },
 ): Promise<string> {
   const result = await callLlm(messages, config, usageContext);
   return result.text;

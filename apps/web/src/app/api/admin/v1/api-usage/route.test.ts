@@ -10,7 +10,10 @@ describe('GET /api/admin/v1/api-usage', () => {
   beforeEach(() => {
     vi.clearAllMocks()
     mocks.requireAdmin.mockResolvedValue({ userId: 'admin-1', permissions: ['observability.read'], roleKey: 'ops', requestId: 'req-1' })
-    mocks.queryRaw.mockResolvedValueOnce([{ provider: 'cleanjobdata', operation: 'list', credentialSource: 'platform', calls: 4, jobs: 40, errors: 1, avgLatency: 120, lastEventAt: new Date('2026-08-23T10:00:00Z') }]).mockResolvedValueOnce([{ provider: 'minimax', model: 'MiniMax-M3', credentialSource: 'platform', calls: 2, inputTokens: 100, outputTokens: 20, cost: 0.001, errors: 0, avgLatency: 80, lastEventAt: new Date('2026-08-23T11:00:00Z') }]).mockResolvedValueOnce([])
+    mocks.queryRaw.mockResolvedValueOnce([{ provider: 'cleanjobdata', operation: 'list', credentialSource: 'platform', calls: 4, jobs: 40, errors: 1, avgLatency: 120, lastEventAt: new Date('2026-08-23T10:00:00Z') }]).mockResolvedValueOnce([{ provider: 'minimax', model: 'MiniMax-M3', credentialSource: 'platform', calls: 2, inputTokens: 100, outputTokens: 20, cost: 0.001, errors: 0, avgLatency: 80, lastEventAt: new Date('2026-08-23T11:00:00Z') }]).mockResolvedValueOnce([]).mockResolvedValueOnce([
+      { userId: 'user-1', category: 'job', calls: 4, jobs: 40, tokens: 0, cost: 0, errors: 1, avgLatency: 120, lastEventAt: new Date('2026-08-23T10:00:00Z') },
+      { userId: 'user-1', category: 'ai', calls: 2, jobs: 0, tokens: 120, cost: 0.001, errors: 0, avgLatency: 80, lastEventAt: new Date('2026-08-23T11:00:00Z') },
+    ])
     mocks.quotaFindMany.mockResolvedValue([])
     mocks.aiAggregate.mockResolvedValue({ _sum: { inputTokens: 111, outputTokens: 22, estimatedCostUsd: 0.75 }, _count: 3 })
   })
@@ -24,6 +27,7 @@ describe('GET /api/admin/v1/api-usage', () => {
     expect(payload.job.providers.find((row: { key: string }) => row.key === 'fantasticjobs')).toMatchObject({ calls: 0, jobs: 0 })
     expect(payload.job.providers.find((row: { key: string }) => row.key === 'cleanjobdata').lastEventAt).toBe('2026-08-23T10:00:00.000Z')
     expect(payload.freshness.lastEventAt).toBe('2026-08-23T11:00:00.000Z')
+    expect(payload.users).toEqual(expect.arrayContaining([expect.objectContaining({ userId: 'user-1', category: 'job', calls: 4, jobs: 40 })]))
     expect(JSON.stringify(payload)).not.toContain('apiKey')
   })
 
@@ -50,5 +54,19 @@ describe('GET /api/admin/v1/api-usage', () => {
     const response = await GET(new NextRequest('http://localhost/api/admin/v1/api-usage?provider=bad%20provider'))
     expect(response.status).toBe(400)
     expect(mocks.queryRaw).not.toHaveBeenCalled()
+  })
+
+  it('returns selected user details with the worker runtime dimension', async () => {
+    mocks.queryRaw.mockReset()
+    mocks.queryRaw
+      .mockResolvedValueOnce([])
+      .mockResolvedValueOnce([])
+      .mockResolvedValueOnce([])
+      .mockResolvedValueOnce([{ userId: 'user-1', category: 'ai', calls: 1, jobs: 0, tokens: 20, cost: 0.01, errors: 0, avgLatency: 40, lastEventAt: new Date() }])
+      .mockResolvedValueOnce([{ userId: 'user-1', category: 'ai', provider: 'minimax', operationModel: 'MiniMax-M3', featureKey: 'autoApply', runtime: 'worker', credentialSource: 'platform', calls: 1, jobs: 0, tokens: 20, cost: 0.01, errors: 0, avgLatency: 40, lastEventAt: new Date() }])
+    const response = await GET(new NextRequest('http://localhost/api/admin/v1/api-usage?userId=user-1'))
+    const payload = await response.json()
+    expect(payload.selectedUserId).toBe('user-1')
+    expect(payload.userDetails).toEqual([expect.objectContaining({ featureKey: 'autoApply', runtime: 'worker' })])
   })
 })

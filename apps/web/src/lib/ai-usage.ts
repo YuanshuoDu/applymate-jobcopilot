@@ -1,6 +1,7 @@
 import { db } from '@/lib/db'
 
 export type AiUsageStatus = 'success' | 'error'
+export type AiUsageRuntime = 'web' | 'worker' | 'admin' | 'unknown'
 
 const STABLE_ERROR_CODES = new Set([
   'configuration_error',
@@ -39,6 +40,7 @@ export async function recordAiUsage(input: {
   status: AiUsageStatus
   errorCode?: string
   credentialSource?: 'platform' | 'user'
+  runtime?: AiUsageRuntime
 }): Promise<void> {
   if (typeof db.aiUsageEvent?.create !== 'function') return
   await db.aiUsageEvent.create({ data: {
@@ -53,5 +55,6 @@ export async function recordAiUsage(input: {
     status: input.status,
     errorCode: stableErrorCode(input.errorCode),
     credentialSource: input.credentialSource ?? 'platform',
+    runtime: input.runtime ?? 'web',
   } }).catch(() => undefined)
 }

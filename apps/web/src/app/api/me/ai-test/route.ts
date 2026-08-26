@@ -121,10 +121,17 @@ function explicitConfig(body: RecordValue, settings: UserAiSettings): AiConfig |
 async function effectiveConfig(body: RecordValue, userId: string): Promise<AiConfig & { resolvedKey: string } | { error: string }> {
   const feature = body.feature
   if (feature !== undefined && !isFeature(feature)) return { error: 'Unknown AI feature' }
+  const usageFeatureKey = isFeature(feature) ? feature : 'aiTest'
+  const withUsageContext = (config: AiConfig & { resolvedKey: string }) => ({
+    ...config,
+    usageUserId: userId,
+    usageFeatureKey,
+    usageRuntime: 'web' as const,
+  })
 
   if (feature && body.provider === undefined && body.model === undefined && body.apiKey === undefined && body.apiBase === undefined) {
     const settings = await loadSettings(userId)
-    return resolveFeatureConfig(feature, settings)
+    return withUsageContext(resolveFeatureConfig(feature, settings))
   }
 
   if (body.provider === undefined || body.model === undefined) {
@@ -134,7 +141,7 @@ async function effectiveConfig(body: RecordValue, userId: string): Promise<AiCon
   const settings = await loadSettings(userId)
   const parsed = explicitConfig(body, settings)
   if ('error' in parsed) return parsed
-  return resolveConfig(parsed)
+  return withUsageContext(resolveConfig(parsed))
 }
 
 export async function POST(req: NextRequest) {

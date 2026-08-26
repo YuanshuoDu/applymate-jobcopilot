@@ -12,9 +12,9 @@
  *   2. LinkedIn 24h (freshest postings)
  *   3. Adzuna (EU) or JSearch (US/global) based on location
  */
-import { pinnedFetch } from '@jobcopilot/shared'
+import { reportJobApiJobs, trackedJobApiFetch, type ApiCredentialSource } from '@/lib/api-usage/job-api-usage'
 import { truncate } from '@/lib/utils'
-import { getDiscoveryApiKeys } from '@/lib/discovery-api-keys'
+import { getDiscoveryApiAccess } from '@/lib/discovery-api-keys'
 import { isRuntimeFeatureEnabled } from '@/lib/runtime-feature-flags'
 import { dedupJobs } from './dedup'
 import { resolveLocation } from './location-resolver'
@@ -107,21 +107,26 @@ function fmtLoc(remote?: boolean, locs?: string[]): string {
 
 // ── Source fetchers (server-side, no auth required) ───────────────────────────
 
-async function fetchAts(q: string, location: string, key: string): Promise<DiscoveredJob[]> {
+async function fetchDiscoveryApi(url: string, init: Parameters<typeof trackedJobApiFetch>[1], provider: string, userId: string | undefined, credentialSource: ApiCredentialSource): Promise<Response> {
+  return trackedJobApiFetch(url, init, { provider, operation: 'search', credentialSource, userId })
+}
+
+async function fetchAts(q: string, location: string, key: string, userId: string | undefined, credentialSource: ApiCredentialSource): Promise<DiscoveredJob[]> {
   const p = new URLSearchParams({
     title_filter: q, description_type: 'text',
     limit: '15', include_ai: 'true',
   })
   if (location) p.set('location_filter', location)
   try {
-    const r = await pinnedFetch(`https://active-jobs-db.p.rapidapi.com/active-ats-7d?${p}`, {
+    const r = await fetchDiscoveryApi(`https://active-jobs-db.p.rapidapi.com/active-ats-7d?${p}`, {
       headers: { 'x-rapidapi-key': key, 'x-rapidapi-host': 'active-jobs-db.p.rapidapi.com' },
       signal: AbortSignal.timeout(5_000),
       cache: 'no-store',
-    })
+    }, 'rapidapi-active-jobs', userId, credentialSource)
     if (!r.ok) return []
     const json = await r.json()
     if (!Array.isArray(json)) return []
+    await reportJobApiJobs(r, json.length)
     return json.map((j: {
       title: string; organization: string; apply_url?: string; url: string
       locations_derived?: string[]; remote_derived?: boolean
@@ -145,21 +150,22 @@ async function fetchAts(q: string, location: string, key: string): Promise<Disco
   } catch { return [] }
 }
 
-async function fetchLinkedIn(q: string, location: string, key: string): Promise<DiscoveredJob[]> {
+async function fetchLinkedIn(q: string, location: string, key: string, userId: string | undefined, credentialSource: ApiCredentialSource): Promise<DiscoveredJob[]> {
   const p = new URLSearchParams({
     title_filter: q, description_type: 'text',
     limit: '15', include_ai: 'true', exclude_ats_duplicate: 'true',
   })
   if (location) p.set('location_filter', location)
   try {
-    const r = await pinnedFetch(`https://linkedin-job-search-api.p.rapidapi.com/active-jb-24h?${p}`, {
+    const r = await fetchDiscoveryApi(`https://linkedin-job-search-api.p.rapidapi.com/active-jb-24h?${p}`, {
       headers: { 'x-rapidapi-key': key, 'x-rapidapi-host': 'linkedin-job-search-api.p.rapidapi.com' },
       signal: AbortSignal.timeout(5_000),
       cache: 'no-store',
-    })
+    }, 'rapidapi-linkedin', userId, credentialSource)
     if (!r.ok) return []
     const json = await r.json()
     if (!Array.isArray(json)) return []
+    await reportJobApiJobs(r, json.length)
     return json.map((j: {
       title: string; organization: string; external_apply_url?: string; url: string
       locations_derived?: string[]; remote_derived?: boolean
@@ -181,6 +187,7 @@ async function fetchLinkedIn(q: string, location: string, key: string): Promise<
 async function fetchAdzuna(
   q: string, location: string,
   appId: string, appKey: string, country: string,
+  userId: string | undefined, credentialSource: ApiCredentialSource,
 ): Promise<DiscoveredJob[]> {
   const sym = { gb: '£', ie: '£', us: '$' }[country] ?? '€'
   const p = new URLSearchParams({
@@ -189,16 +196,16 @@ async function fetchAdzuna(
   })
   if (location) p.set('where', location)
   try {
-    const r = await pinnedFetch(`https://api.adzuna.com/v1/api/jobs/${country}/search/1?${p}`, {
+    const r = await fetchDiscoveryApi(`https://api.adzuna.com/v1/api/jobs/${country}/search/1?${p}`, {
       signal: AbortSignal.timeout(5_000), cache: 'no-store',
-    })
+    }, 'adzuna', userId, credentialSource)
     if (!r.ok) return []
     const json = await r.json() as { results?: Array<{
       title: string; company?: { display_name: string }; location?: { display_name: string }
       redirect_url: string; description?: string
       salary_min?: number; salary_max?: number
     }> }
-    return (json.results ?? []).map(j => ({
+    const jobs = (json.results ?? []).map(j => ({
       title:       j.title,
       company:     j.company?.display_name ?? '',
       location:    j.location?.display_name ?? '',
@@ -208,27 +215,29 @@ async function fetchAdzuna(
       logo:        null,
       source:      'adzuna',
     }))
+    await reportJobApiJobs(r, jobs.length)
+    return jobs
   } catch { return [] }
 }
 
-async function fetchJSearch(q: string, location: string, key: string): Promise<DiscoveredJob[]> {
+async function fetchJSearch(q: string, location: string, key: string, userId: string | undefined, credentialSource: ApiCredentialSource): Promise<DiscoveredJob[]> {
   const p = new URLSearchParams({
     query:       q + (location ? ` in ${location}` : ''),
     num_pages:   '1',
     date_posted: 'week',
   })
   try {
-    const r = await pinnedFetch(`https://jsearch.p.rapidapi.com/search-v2?${p}`, {
+    const r = await fetchDiscoveryApi(`https://jsearch.p.rapidapi.com/search-v2?${p}`, {
       headers: { 'X-RapidAPI-Key': key, 'X-RapidAPI-Host': 'jsearch.p.rapidapi.com' },
       signal: AbortSignal.timeout(5_000), cache: 'no-store',
-    })
+    }, 'rapidapi-jsearch', userId, credentialSource)
     if (!r.ok) return []
     const json = await r.json() as { data?: { jobs?: Array<{
       job_title: string; employer_name?: string; job_apply_link: string
       job_city?: string; job_country?: string; job_is_remote?: boolean
       job_description?: string; job_min_salary?: number; job_max_salary?: number
     }> } }
-    return (json.data?.jobs ?? []).map(j => {
+    const jobs = (json.data?.jobs ?? []).map(j => {
       const loc = j.job_is_remote ? 'Remote' : [j.job_city, j.job_country].filter(Boolean).join(', ')
       return {
         title:       j.job_title,
@@ -241,11 +250,13 @@ async function fetchJSearch(q: string, location: string, key: string): Promise<D
         source:      'jsearch',
       }
     })
+    await reportJobApiJobs(r, jobs.length)
+    return jobs
   } catch { return [] }
 }
 
 // Indeed IE — mirrors unified route's Ireland strategy (countryCode=ie, verified working)
-async function fetchIndeedIE(q: string, location: string, key: string): Promise<DiscoveredJob[]> {
+async function fetchIndeedIE(q: string, location: string, key: string, userId: string | undefined, credentialSource: ApiCredentialSource): Promise<DiscoveredJob[]> {
   const p = new URLSearchParams({
     query:       q,
     countryCode: 'ie',
@@ -253,10 +264,10 @@ async function fetchIndeedIE(q: string, location: string, key: string): Promise<
   })
   if (location) p.set('location', location || 'Ireland')
   try {
-    const r = await pinnedFetch(`https://jobs-api14.p.rapidapi.com/v2/indeed/search?${p}`, {
+    const r = await fetchDiscoveryApi(`https://jobs-api14.p.rapidapi.com/v2/indeed/search?${p}`, {
       headers: { 'x-rapidapi-key': key, 'x-rapidapi-host': 'jobs-api14.p.rapidapi.com' },
       signal: AbortSignal.timeout(5_000), cache: 'no-store',
-    })
+    }, 'rapidapi-jobs-api14', userId, credentialSource)
     if (!r.ok) return []
     const json = await r.json() as {
       data?: Array<{
@@ -268,7 +279,7 @@ async function fetchIndeedIE(q: string, location: string, key: string): Promise<
       hasError?: boolean
     }
     if (json.hasError || !Array.isArray(json.data)) return []
-    return json.data.map(j => ({
+    const jobs = json.data.map(j => ({
       title:       j.title,
       company:     j.company?.name ?? '',
       location:    j.location?.location ?? j.location?.country ?? 'Ireland',
@@ -278,6 +289,8 @@ async function fetchIndeedIE(q: string, location: string, key: string): Promise<
       logo:        j.company?.image ?? null,
       source:      'indeed',
     })).filter(j => j.url)
+    await reportJobApiJobs(r, jobs.length)
+    return jobs
   } catch { return [] }
 }
 
@@ -294,7 +307,7 @@ function stripHtml(h: string): string {
   return h.replace(/<[^>]+>/g,' ').replace(/&amp;/g,'&').replace(/&nbsp;/g,' ').replace(/\s+/g,' ').trim()
 }
 
-async function fetchIrishJobsRss(q: string, location: string): Promise<DiscoveredJob[]> {
+async function fetchIrishJobsRss(q: string, location: string, userId?: string): Promise<DiscoveredJob[]> {
   const keySlug = slugifyIE(q)
   const locSlug = slugifyIE(location || 'ireland')
   const urls = [
@@ -303,14 +316,14 @@ async function fetchIrishJobsRss(q: string, location: string): Promise<Discovere
   ]
   for (const url of urls) {
     try {
-      const r = await pinnedFetch(url, {
+      const r = await fetchDiscoveryApi(url, {
         headers: { 'User-Agent': 'ApplyMate/1.0', 'Accept': 'application/rss+xml, text/xml' },
         signal: AbortSignal.timeout(7_000), cache: 'no-store',
-      })
+      }, 'irishjobs', userId, 'public')
       if (!r.ok) continue
       const xml = await r.text()
       if (!xml.includes('<item')) continue
-      return [...xml.matchAll(/<item[^>]*>([\s\S]*?)<\/item>/gi)].map((m, i) => {
+      const jobs = [...xml.matchAll(/<item[^>]*>([\s\S]*?)<\/item>/gi)].map((m, i) => {
         const it    = m[1]
         const title = stripHtml(extractRssTag(it, 'title'))
         const link  = extractRssTag(it, 'link')
@@ -350,13 +363,15 @@ export async function discoverJobs(params: DiscoverParams): Promise<DiscoveredJo
   }
 
   const keys = userId
-    ? await getDiscoveryApiKeys(userId)
+    ? await getDiscoveryApiAccess(userId)
     : {
         rapidapiKey: process.env.RAPIDAPI_KEY?.trim() ?? '',
         adzunaAppId: process.env.ADZUNA_APP_ID?.trim() ?? '',
         adzunaAppKey: process.env.ADZUNA_APP_KEY?.trim() ?? '',
         cleanJobDataApiKey: process.env.CLEANJOBDATA_API_KEY?.trim() ?? '',
         fantasticJobsApiKey: process.env.FANTASTICJOBS_API_KEY?.trim() || process.env.FANTASTIC_JOBS_API_KEY?.trim() || '',
+        rapidapiSource: 'platform' as const,
+        adzunaSource: 'platform' as const,
       }
 
   const apiKey    = keys.rapidapiKey
@@ -364,6 +379,10 @@ export async function discoverJobs(params: DiscoverParams): Promise<DiscoveredJo
   const adzunaKey = keys.adzunaAppKey
   const cleanJobDataKey = keys.cleanJobDataApiKey
   const fantasticJobsKey = keys.fantasticJobsApiKey
+  // These values are only used inside guards that prove the corresponding
+  // credential is ready. Keep incomplete/none states out of usage metadata.
+  const rapidapiSource: ApiCredentialSource = keys.rapidapiSource === 'user' ? 'user' : 'platform'
+  const adzunaSource: ApiCredentialSource = keys.adzunaSource === 'user' ? 'user' : 'platform'
 
   const seen    = new Set(existingUrls)
   const results: DiscoveredJob[] = []
@@ -395,46 +414,46 @@ export async function discoverJobs(params: DiscoverParams): Promise<DiscoveredJo
 
         if (apiKey) {
           // 1. LinkedIn Ireland — broadened to country level for best coverage
-          fetchTasks.push(fetchLinkedIn(role, loc ? `${loc}, Ireland` : 'Ireland', apiKey))
+          fetchTasks.push(fetchLinkedIn(role, loc ? `${loc}, Ireland` : 'Ireland', apiKey, userId, rapidapiSource))
           // 2. Indeed IE — direct Irish listings via countryCode=ie
-          fetchTasks.push(fetchIndeedIE(role, loc || 'Ireland', apiKey))
+          fetchTasks.push(fetchIndeedIE(role, loc || 'Ireland', apiKey, userId, rapidapiSource))
           // 3. ATS — career sites (Google IE, Meta IE, Stripe, HubSpot...)
-          fetchTasks.push(fetchAts(role, loc || 'Ireland OR Dublin', apiKey))
+          fetchTasks.push(fetchAts(role, loc || 'Ireland OR Dublin', apiKey, userId, rapidapiSource))
         }
         // 4. IrishJobs.ie RSS — free, native, no key needed
-        fetchTasks.push(fetchIrishJobsRss(role, loc || 'ireland'))
+        fetchTasks.push(fetchIrishJobsRss(role, loc || 'ireland', userId))
 
       } else if (isDACH) {
         // DACH: LinkedIn + Adzuna (strong in DE/AT/CH)
-        if (apiKey)  fetchTasks.push(fetchLinkedIn(role, loc, apiKey))
-        if (hasAdzuna) fetchTasks.push(fetchAdzuna(role, loc, adzunaId, adzunaKey, country!))
-        if (apiKey)  fetchTasks.push(fetchAts(role, loc, apiKey))
+        if (apiKey)  fetchTasks.push(fetchLinkedIn(role, loc, apiKey, userId, rapidapiSource))
+        if (hasAdzuna) fetchTasks.push(fetchAdzuna(role, loc, adzunaId, adzunaKey, country!, userId, adzunaSource))
+        if (apiKey)  fetchTasks.push(fetchAts(role, loc, apiKey, userId, rapidapiSource))
 
       } else if (isGB) {
         // UK: Adzuna (best UK coverage) + LinkedIn + ATS
-        if (hasAdzuna) fetchTasks.push(fetchAdzuna(role, loc, adzunaId, adzunaKey, 'gb'))
-        if (apiKey)  fetchTasks.push(fetchLinkedIn(role, loc || 'United Kingdom', apiKey))
-        if (apiKey)  fetchTasks.push(fetchAts(role, loc || 'United Kingdom', apiKey))
+        if (hasAdzuna) fetchTasks.push(fetchAdzuna(role, loc, adzunaId, adzunaKey, 'gb', userId, adzunaSource))
+        if (apiKey)  fetchTasks.push(fetchLinkedIn(role, loc || 'United Kingdom', apiKey, userId, rapidapiSource))
+        if (apiKey)  fetchTasks.push(fetchAts(role, loc || 'United Kingdom', apiKey, userId, rapidapiSource))
 
       } else if (isEU && hasAdzuna) {
         // Other EU: Adzuna + LinkedIn + ATS
-        fetchTasks.push(fetchAdzuna(role, loc, adzunaId, adzunaKey, country!))
-        if (apiKey) fetchTasks.push(fetchLinkedIn(role, loc, apiKey))
-        if (apiKey) fetchTasks.push(fetchAts(role, loc, apiKey))
+        fetchTasks.push(fetchAdzuna(role, loc, adzunaId, adzunaKey, country!, userId, adzunaSource))
+        if (apiKey) fetchTasks.push(fetchLinkedIn(role, loc, apiKey, userId, rapidapiSource))
+        if (apiKey) fetchTasks.push(fetchAts(role, loc, apiKey, userId, rapidapiSource))
 
       } else {
         // Global / no location: ATS + LinkedIn + JSearch
         if (apiKey) {
-          fetchTasks.push(fetchAts(role, loc, apiKey))
-          fetchTasks.push(fetchLinkedIn(role, loc, apiKey))
-          fetchTasks.push(fetchJSearch(role, loc, apiKey))
+          fetchTasks.push(fetchAts(role, loc, apiKey, userId, rapidapiSource))
+          fetchTasks.push(fetchLinkedIn(role, loc, apiKey, userId, rapidapiSource))
+          fetchTasks.push(fetchJSearch(role, loc, apiKey, userId, rapidapiSource))
         }
       }
 
       // IrishJobs is a useful free fallback only for Irish or unrestricted
       // searches. It must not pollute a London/Berlin request with Irish jobs.
       if (!apiKey && !hasAdzuna && (isIreland || !loc)) {
-        fetchTasks.push(fetchIrishJobsRss(role, loc || 'ireland'))
+        fetchTasks.push(fetchIrishJobsRss(role, loc || 'ireland', userId))
       }
 
       // CleanJobData is a normalized supplementary feed, not an ATS. Keep it
@@ -446,6 +465,7 @@ export async function discoverJobs(params: DiscoverParams): Promise<DiscoveredJo
           countryCode: country ?? undefined,
           maxPages: 1,
           maxResults: Math.min(20, maxResults - results.length),
+          userId,
         }))
       }
 

@@ -3,11 +3,13 @@ import { db } from '@/lib/db'
 import { isJobApiProvider } from './job-api-catalog'
 
 export type ApiCredentialSource = 'platform' | 'user' | 'public'
+export type ApiUsageRuntime = 'web' | 'worker' | 'admin' | 'unknown'
 
 export type JobApiRequestMeta = {
   provider: string
   operation: string
   credentialSource: ApiCredentialSource
+  runtime?: ApiUsageRuntime
   userId?: string
 }
 
@@ -73,6 +75,7 @@ function safeMeta(meta: JobApiRequestMeta): JobApiRequestMeta {
     provider: isJobApiProvider(meta.provider) ? meta.provider : 'unknown',
     operation: safeKey(meta.operation, 'request'),
     credentialSource: meta.credentialSource,
+    runtime: meta.runtime ?? 'web',
     userId: meta.userId?.slice(0, 120),
   }
 }
