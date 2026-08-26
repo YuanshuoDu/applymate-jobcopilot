@@ -83,7 +83,10 @@ export async function readRedisUsage(env: Environment = process.env, request: Re
     const parsed = parseRedisInfo(body.result)
     if (!parsed) return null
     const estimatedCostUsd = Number(((parsed.totalCommands / 100_000) * config.costPer100KCommands).toFixed(6))
-    return { available: true, ...parsed, estimatedCostUsd, sampledAt: new Date().toISOString(), period: 'instance_lifetime', source: 'upstash_rest_info', alertThresholdUsd, maxBudgetUsd, alertTriggered: alertThresholdUsd !== null && estimatedCostUsd >= alertThresholdUsd }
+    // INFO exposes an instance-lifetime counter, so it cannot prove a monthly
+    // budget breach. Keep the estimate visible, but defer alerting to the
+    // current-month management-stats path.
+    return { available: true, ...parsed, estimatedCostUsd, sampledAt: new Date().toISOString(), period: 'instance_lifetime', source: 'upstash_rest_info', alertThresholdUsd, maxBudgetUsd, alertTriggered: false }
   } catch { return null }
 }
 import { pinnedFetch } from '@jobcopilot/shared'

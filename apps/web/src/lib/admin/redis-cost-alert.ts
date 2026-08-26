@@ -13,7 +13,7 @@ export type RedisBudgetAlert = {
 
 /** Convert a provider snapshot into one deduplicated monthly admin alert. */
 export function redisBudgetAlert(snapshot: RedisUsageSnapshot | null, now = new Date()): RedisBudgetAlert | null {
-  if (!snapshot?.alertTriggered || snapshot.alertThresholdUsd === null) return null
+  if (!snapshot?.alertTriggered || snapshot.period !== 'current_month' || snapshot.alertThresholdUsd === null) return null
   const month = `${now.getUTCFullYear()}-${String(now.getUTCMonth() + 1).padStart(2, '0')}`
   const value = Number(snapshot.estimatedCostUsd.toFixed(6))
   const threshold = Number(snapshot.alertThresholdUsd.toFixed(6))

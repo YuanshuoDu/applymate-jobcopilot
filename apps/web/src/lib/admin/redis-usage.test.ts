@@ -15,6 +15,10 @@ describe('redis usage', () => {
     await expect(readRedisUsage({ PAID_REDIS_KV_REST_API_URL: 'https://redis.example.test', PAID_REDIS_KV_REST_API_TOKEN: 'server-token', REDIS_COST_ALERT_USD: '5', REDIS_MAX_BUDGET_USD: '20' }, request)).resolves.toMatchObject({ totalCommands: 361030, estimatedCostUsd: 0.72206, period: 'instance_lifetime', source: 'upstash_rest_info', alertThresholdUsd: 5, maxBudgetUsd: 20, alertTriggered: false })
     expect(request).toHaveBeenCalledWith('https://redis.example.test/info', expect.objectContaining({ method: 'POST' }))
   })
+  it('does not treat the lifetime INFO estimate as a monthly alert', async () => {
+    const request = vi.fn<typeof fetch>().mockResolvedValue(new Response(JSON.stringify({ result: '# Stats\ntotal_commands_processed:2500000\n' }), { status: 200 }))
+    await expect(readRedisUsage({ PAID_REDIS_KV_REST_API_URL: 'https://redis.example.test', PAID_REDIS_KV_REST_API_TOKEN: 'server-token', REDIS_COST_ALERT_USD: '5' }, request)).resolves.toMatchObject({ period: 'instance_lifetime', estimatedCostUsd: 5, alertTriggered: false })
+  })
   it('prefers current-month stats when management credentials are configured', async () => {
     const request = vi.fn<typeof fetch>().mockResolvedValue(new Response(JSON.stringify({ total_monthly_requests: 362926, total_monthly_bandwidth: 4096, total_monthly_billing: 0.725852 }), { status: 200 }))
     await expect(readRedisUsage({ PAID_REDIS_DATABASE_ID: 'db-1', UPSTASH_API_EMAIL: 'owner@example.com', UPSTASH_API_KEY: 'management-key', REDIS_COST_ALERT_USD: '0.70', REDIS_MAX_BUDGET_USD: '20' }, request)).resolves.toMatchObject({ totalCommands: 362926, estimatedCostUsd: 0.725852, period: 'current_month', source: 'upstash_management_stats', alertTriggered: true })
