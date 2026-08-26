@@ -9,6 +9,7 @@ import { NextRequest } from 'next/server'
 import { prepareAiRoute, err, ok } from '@/lib/api-helpers'
 import { modelChat } from '@/lib/model-router'
 import { db } from '@/lib/db'
+import { aiUsageErrorCode } from '@/lib/ai-usage'
 
 export async function POST(req: NextRequest) {
   const prep = await prepareAiRoute(req, 'coverLetter', ['cover_letter', 'gmail_tracking'])
@@ -82,7 +83,7 @@ Write the reply now:`
 
     return ok({ reply, hrEmail: senderEmail, hrName: senderName })
   } catch (e) {
-    console.error('[gmail/ai-reply] error:', e)
+    console.error('[gmail/ai-reply] error', { errorCode: aiUsageErrorCode(e) })
     return err('Failed to generate reply', 500)
   }
 }

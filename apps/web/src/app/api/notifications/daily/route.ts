@@ -1,5 +1,5 @@
 import { NextRequest } from 'next/server'
-import { pinnedFetch } from '@jobcopilot/shared'
+import { trackedExternalApiFetch } from '@/lib/api-usage/external-api-usage'
 import { db } from '@/lib/db'
 import { err, ok } from '@/lib/api-helpers'
 import { configuredAppOrigin } from '@/lib/app-url'
@@ -58,7 +58,7 @@ async function sendEmail(user: UserRow, subject: string, lines: string[]): Promi
   if (!apiKey || !user.email) return false
   const baseUrl = configuredAppOrigin('https://applymate.site')
   const htmlLines = lines.map(line => `<li>${escapeHtml(line)}</li>`).join('')
-  const response = await pinnedFetch('https://api.resend.com/emails', {
+  const response = await trackedExternalApiFetch('https://api.resend.com/emails', {
     method: 'POST',
     headers: { Authorization: `Bearer ${apiKey}`, 'Content-Type': 'application/json' },
     body: JSON.stringify({
@@ -68,7 +68,7 @@ async function sendEmail(user: UserRow, subject: string, lines: string[]): Promi
       html: `<p>Hi ${escapeHtml(user.name?.trim() || 'there')},</p><ul>${htmlLines}</ul><p><a href="${baseUrl}/?page=dashboard">Open ApplyMate</a></p>`,
     }),
     signal: AbortSignal.timeout(10_000),
-  }).catch(() => null)
+  }, { provider: 'resend', operation: 'daily_notification', credentialSource: 'platform', userId: user.id }).catch(() => null)
   return Boolean(response?.ok)
 }
 

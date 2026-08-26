@@ -12,7 +12,7 @@
  * explicitly move it by starting OAuth with transfer=1 and authorizing Google.
  */
 import { NextRequest, NextResponse } from 'next/server'
-import { pinnedFetch } from '@jobcopilot/shared'
+import { trackedExternalApiFetch } from '@/lib/api-usage/external-api-usage'
 import { jwtVerify } from 'jose'
 import { db } from '@/lib/db'
 import { safeAuth } from '@/lib/safe-auth'
@@ -27,6 +27,16 @@ import {
   hasMatchingOAuthStateCookie,
 } from '@/lib/oauth-state'
 import { isCurrentAuthVersion } from '@/lib/auth-version'
+import { aiUsageErrorCode } from '@/lib/ai-usage'
+
+type GoogleTokenResponse = {
+  access_token?: string
+  refresh_token?: string
+  id_token?: string
+  expires_in?: number
+  token_type?: string
+  scope?: string
+}
 
 function safeReturnTo(value: unknown): string | null {
   if (typeof value !== 'string' || !value.startsWith('/')) return null
@@ -56,8 +66,8 @@ export async function GET(req: NextRequest) {
   }
 
   if (errParam) {
-    console.error('[gmail/oauth/callback] google returned error:', errParam)
-    return back(errParam)
+    console.warn('[gmail/oauth/callback] Google OAuth denied', { errorCode: 'oauth_denied' })
+    return back('oauth_denied')
   }
   if (!code || !state) return back('missing_code_or_state')
 
@@ -83,7 +93,7 @@ export async function GET(req: NextRequest) {
     returnTo = safeReturnTo(payload.returnTo) ?? returnTo
     transferRequested = payload.transfer === true
   } catch (e) {
-    console.error('[gmail/oauth/callback] state verify failed:', e)
+    console.error('[gmail/oauth/callback] state verify failed', { errorCode: aiUsageErrorCode(e) })
     return back('invalid_state')
   }
 
@@ -100,7 +110,7 @@ export async function GET(req: NextRequest) {
 
   // Exchange code for tokens
   const redirectUri = configuredRedirectUri(req.url, '/api/gmail/oauth/callback')
-  const tokenRes = await pinnedFetch('https://oauth2.googleapis.com/token', {
+  const tokenRes = await trackedExternalApiFetch('https://oauth2.googleapis.com/token', {
     method:  'POST',
     headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
     body:    new URLSearchParams({
@@ -110,21 +120,27 @@ export async function GET(req: NextRequest) {
       redirect_uri:  redirectUri,
       grant_type:    'authorization_code',
     }),
-  })
-  const tokens = await tokenRes.json()
-  if (!tokenRes.ok || !tokens.access_token) {
-    console.error('[gmail/oauth/callback] token exchange failed:', tokens)
+  }, { provider: 'google-oauth', operation: 'token_exchange', credentialSource: 'user', userId })
+  const tokens = await tokenRes.json().catch(() => null) as GoogleTokenResponse | null
+  if (!tokenRes.ok || typeof tokens?.access_token !== 'string' || !tokens.access_token) {
+    console.error('[gmail/oauth/callback] token exchange failed', {
+      status: tokenRes.status,
+      errorCode: tokenRes.ok ? 'provider_error' : aiUsageErrorCode(new Error(`HTTP ${tokenRes.status}`)),
+    })
     return back('token_exchange_failed')
   }
 
   // Fetch Google user id (sub) — needed for providerAccountId uniqueness
-  const profileRes = await pinnedFetch('https://www.googleapis.com/oauth2/v3/userinfo', {
+  const profileRes = await trackedExternalApiFetch('https://www.googleapis.com/oauth2/v3/userinfo', {
     headers: { Authorization: `Bearer ${tokens.access_token}` },
-  })
-  const profile = await profileRes.json()
-  const providerAccountId = profile.sub as string | undefined
+  }, { provider: 'google-oauth', operation: 'userinfo', credentialSource: 'user', userId })
+  const profile = await profileRes.json().catch(() => null) as { sub?: string } | null
+  const providerAccountId = profileRes.ok && typeof profile?.sub === 'string' ? profile.sub : undefined
   if (!providerAccountId) {
-    console.error('[gmail/oauth/callback] no sub in userinfo:', profile)
+    console.error('[gmail/oauth/callback] userinfo did not return a provider id', {
+      status: profileRes.status,
+      errorCode: profileRes.ok ? 'provider_error' : aiUsageErrorCode(new Error(`HTTP ${profileRes.status}`)),
+    })
     return back('no_provider_account_id')
   }
 
@@ -201,8 +217,7 @@ export async function GET(req: NextRequest) {
     })
   } catch (error) {
     console.error('[gmail/oauth/callback] credential persistence failed', {
-      name: error instanceof Error ? error.name : 'UnknownError',
-      message: error instanceof Error ? error.message : String(error).slice(0, 200),
+      errorCode: aiUsageErrorCode(error),
     })
     return back('credential_storage_unavailable')
   }

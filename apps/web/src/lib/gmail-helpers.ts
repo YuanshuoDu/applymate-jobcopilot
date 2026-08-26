@@ -1,10 +1,11 @@
 /**
  * Shared Gmail helpers — token refresh and email body extraction.
  */
-import { pinnedFetch } from '@jobcopilot/shared'
+import { trackedExternalApiFetch } from '@/lib/api-usage/external-api-usage'
 import { db } from '@/lib/db'
 import { classifyGmailMessage, type GmailMessageKind } from '@/lib/gmail-tracking'
 import { decryptAccountTokens, encryptAccountTokenFields } from '@/lib/credential-secrets'
+import { aiUsageErrorCode } from '@/lib/ai-usage'
 
 // ── Token management ─────────────────────────────────────────────────────────
 
@@ -100,7 +101,7 @@ export async function getGoogleAccessToken(userId: string): Promise<string | nul
       return null
     }
     try {
-      const res = await pinnedFetch('https://oauth2.googleapis.com/token', {
+      const res = await trackedExternalApiFetch('https://oauth2.googleapis.com/token', {
         method:  'POST',
         headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
         body:    new URLSearchParams({
@@ -109,10 +110,10 @@ export async function getGoogleAccessToken(userId: string): Promise<string | nul
           refresh_token: account.refresh_token,
           grant_type:    'refresh_token',
         }),
-      })
-      const data = await res.json()
-      console.log('[gmail] token refresh response:', JSON.stringify({ ok: res.ok, status: res.status, hasToken: !!data.access_token, error: data.error }))
-      if (data.access_token) {
+      }, { provider: 'google-oauth', operation: 'token_refresh', credentialSource: 'user', userId })
+      const data = await res.json().catch(() => null) as { access_token?: string; expires_in?: number } | null
+      console.log('[gmail] token refresh response:', { ok: res.ok, status: res.status, hasToken: Boolean(data?.access_token) })
+      if (res.ok && data?.access_token) {
         await db.account.update({
           where: { id: account.id },
           data:  {
@@ -127,10 +128,13 @@ export async function getGoogleAccessToken(userId: string): Promise<string | nul
         })
         return data.access_token
       }
-      console.error('[gmail] refresh returned no access_token, error:', data.error)
+      console.error('[gmail] refresh returned no access_token', {
+        status: res.status,
+        errorCode: res.ok ? 'provider_error' : aiUsageErrorCode(new Error(`HTTP ${res.status}`)),
+      })
       return null
     } catch (e) {
-      console.error('[gmail] token refresh failed:', e)
+      console.error('[gmail] token refresh failed', { errorCode: aiUsageErrorCode(e) })
       return null
     }
   }

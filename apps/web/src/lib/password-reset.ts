@@ -1,4 +1,4 @@
-import { pinnedFetch } from '@jobcopilot/shared'
+import { trackedExternalApiFetch } from '@/lib/api-usage/external-api-usage'
 import { createHash, randomBytes } from 'node:crypto'
 import { normalizeEmail as normalizeAuthEmail } from '@/lib/auth-identifiers'
 import { configuredAppOrigin } from '@/lib/app-url'
@@ -62,7 +62,7 @@ export async function sendPasswordResetEmail(email: string, resetUrl: string): P
   if (!apiKey || !from) return false
 
   try {
-  const response = await pinnedFetch('https://api.resend.com/emails', {
+    const response = await trackedExternalApiFetch('https://api.resend.com/emails', {
       method: 'POST',
       headers: {
         Authorization: `Bearer ${apiKey}`,
@@ -75,7 +75,7 @@ export async function sendPasswordResetEmail(email: string, resetUrl: string): P
         text: `Use this link to reset your ApplyMate password: ${resetUrl}\n\nThis link expires in 1 hour.`,
         html: `<p>Use the link below to reset your ApplyMate password.</p><p><a href="${resetUrl}">Reset password</a></p><p>This link expires in 1 hour.</p>`,
       }),
-    })
+    }, { provider: 'resend', operation: 'password_reset', credentialSource: 'platform' })
     return response.ok
   } catch {
     return false

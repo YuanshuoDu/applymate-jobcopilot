@@ -59,4 +59,17 @@ describe('POST /api/gmail/send-draft', () => {
     expect(mocks.jobUpdate).toHaveBeenCalledWith({ where: { id: 'job-1' }, data: { followUpAt: null } })
     expect(mocks.activityCreate).toHaveBeenCalledWith(expect.objectContaining({ data: expect.objectContaining({ jobId: 'job-1', type: 'email_sent' }) }))
   })
+
+  it('returns only a stable status when Gmail rejects a send', async () => {
+    vi.stubGlobal('fetch', vi.fn()
+      .mockResolvedValueOnce(Response.json({ emailAddress: 'me@example.com' }))
+      .mockResolvedValueOnce(new Response('{"error":"private provider response"}', { status: 429 })))
+    const { POST } = await import('./route')
+
+    const response = await POST(new Request('http://localhost/api/gmail/send-draft', {
+      method: 'POST', body: JSON.stringify({ to: 'recruiter@example.com', draft: 'Thank you.' }),
+    }) as never)
+
+    await expect(response.json()).resolves.toEqual({ error: 'Gmail send failed (HTTP 429)' })
+  })
 })

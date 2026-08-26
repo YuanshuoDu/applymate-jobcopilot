@@ -47,6 +47,12 @@ export const EXPECTED_MIGRATIONS = [
   '20260810120000_add_credential_encryption_columns',
   '20260811090000_add_user_auth_version',
   '20260812100000_enforce_normalized_user_email',
+  '20260813190000_add_agent_session_last_viewed',
+  '20260815090000_repair_admin_webauthn_backed_up',
+  '20260823221500_add_api_usage_center',
+  '20260824160000_add_discovery_optimization',
+  '20260826120000_add_external_api_usage',
+  '20260826120000_backfill_ai_budgets_from_usage',
 ] as const
 
 export const RLS_TABLES = [
@@ -54,7 +60,7 @@ export const RLS_TABLES = [
   'user_feature_overrides', 'Job', 'application_tasks', 'application_task_events',
   'Resume', 'ResumeVersion', 'persona_facts', 'persona_evidence_chunks', 'Activity',
   'user_api_keys', 'AgentConfig', 'AgentRole', 'apply_results', 'ai_budgets',
-  'ai_budget_adjustments', 'ai_budget_reset_requests', 'notifications', 'gmail_sync_states',
+  'job_api_usage_events', 'discovery_optimization_events', 'ai_budget_adjustments', 'ai_budget_reset_requests', 'notifications', 'gmail_sync_states',
   'gmail_messages', 'gmail_recommendations', 'AgentRunQuestion', 'agent_runs',
   'agent_executions', 'agent_sessions', 'sub_agent_tasks', 'agent_transcript_events',
   'agent_approvals', 'agent_automations', 'CustomAgentRole', 'Direction', 'CoverLetter',

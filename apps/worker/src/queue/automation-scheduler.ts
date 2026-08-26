@@ -1,3 +1,7 @@
+import { getPool } from "../db/apply-results.js";
+import { recordWorkerExternalApiUsage } from "../api-usage/external-api-usage.js";
+import { getWorkerRuntimeState } from "../admin/worker-state.js";
+
 const DEFAULT_INTERVAL_MS = 5 * 60_000;
 const MINIMUM_INTERVAL_MS = 60_000;
 const AUDIT_CHECKPOINT_INTERVAL_MS = 24 * 60 * 60_000;
@@ -33,7 +37,18 @@ export interface AutomationSchedulerConfig {
   tasks: ReadonlyArray<{ name: string; endpoint: string; secret: string; intervalMs?: number }>;
   intervalMs: number;
   request?: typeof fetch;
+  recordUsage?: SchedulerUsageRecorder;
+  shouldRun?: () => boolean;
 }
+
+type SchedulerUsageRecorder = (input: {
+  operation: string;
+  status: "success" | "error";
+  latencyMs: number;
+  httpStatus?: number;
+  outputBytes?: number;
+  errorCode?: string;
+}) => Promise<void>;
 
 export function automationSchedulerConfig(
   env: NodeJS.ProcessEnv = process.env,
@@ -65,6 +80,7 @@ export function automationSchedulerConfig(
 
 export function createAutomationScheduler(config: AutomationSchedulerConfig): AutomationScheduler {
   const request = config.request ?? fetch;
+  const recordUsage = config.recordUsage ?? defaultSchedulerUsageRecorder;
   const state: AutomationSchedulerStatus = {
     enabled: true,
     running: false,
@@ -76,6 +92,7 @@ export function createAutomationScheduler(config: AutomationSchedulerConfig): Au
 
   async function run() {
     if (state.running) return;
+    if (config.shouldRun && !config.shouldRun()) return;
     state.running = true;
     state.lastAttemptAt = new Date().toISOString();
 
@@ -85,26 +102,48 @@ export function createAutomationScheduler(config: AutomationSchedulerConfig): Au
         const taskInterval = task.intervalMs ?? config.intervalMs;
         const lastSuccessfulAt = lastSuccessfulTaskAt.get(task.name);
         if (lastSuccessfulAt !== undefined && Date.now() - lastSuccessfulAt < taskInterval) continue;
-        const response = await request(task.endpoint, {
-          method: "POST",
-          headers: { Authorization: `Bearer ${task.secret}` },
-          signal: AbortSignal.timeout(30_000),
-        });
-        if (!response.ok) {
-          const body = await response.text().catch(() => "");
-          failures.push(`${task.name} returned ${response.status}: ${body.slice(0, 300)}`);
-          continue;
+        const startedAt = Date.now();
+        try {
+          const response = await request(task.endpoint, {
+            method: "POST",
+            headers: { Authorization: `Bearer ${task.secret}` },
+            signal: AbortSignal.timeout(30_000),
+          });
+          await recordUsage({
+            operation: `scheduler_${task.name}`,
+            status: response.ok ? "success" : "error",
+            httpStatus: response.status,
+            outputBytes: responseBytes(response),
+            errorCode: response.ok ? undefined : httpErrorCode(response.status),
+            latencyMs: Date.now() - startedAt,
+          });
+          if (!response.ok) {
+            failures.push(`${task.name} returned ${response.status} (${httpErrorCode(response.status)})`);
+            continue;
+          }
+          lastSuccessfulTaskAt.set(task.name, Date.now());
+        } catch (error) {
+          await recordUsage({
+            operation: `scheduler_${task.name}`,
+            status: "error",
+            errorCode: errorCode(error),
+            latencyMs: Date.now() - startedAt,
+          });
+          throw error;
         }
-        lastSuccessfulTaskAt.set(task.name, Date.now());
       }
-      if (failures.length) throw new Error(failures.join("; "));
+      if (failures.length) {
+        state.lastError = failures.join("; ");
+        console.error(`[automation-scheduler] run failed (${state.lastError})`);
+        return;
+      }
 
       state.lastSuccessAt = new Date().toISOString();
       state.lastError = null;
     } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
+      const message = errorCode(error);
       state.lastError = message;
-      console.error(`[automation-scheduler] ${message}`);
+      console.error(`[automation-scheduler] run failed (${message})`);
     } finally {
       state.running = false;
     }
@@ -121,6 +160,38 @@ export function createAutomationScheduler(config: AutomationSchedulerConfig): Au
       return { ...state };
     },
   };
+}
+
+function responseBytes(response: Response): number {
+  const value = Number(response.headers.get("content-length") ?? 0);
+  return Number.isSafeInteger(value) && value > 0 ? value : 0;
+}
+
+async function defaultSchedulerUsageRecorder(input: Parameters<SchedulerUsageRecorder>[0]): Promise<void> {
+  if (process.env.NODE_ENV === "test") return;
+  await recordWorkerExternalApiUsage({
+    pool: getPool(),
+    provider: "internal-worker",
+    operation: input.operation,
+    status: input.status,
+    latencyMs: input.latencyMs,
+    httpStatus: input.httpStatus,
+    outputBytes: input.outputBytes,
+    errorCode: input.errorCode,
+  });
+}
+
+function httpErrorCode(status: number): string {
+  if (status === 429) return "http_429";
+  if (status >= 500) return "http_5xx";
+  if (status >= 400) return "http_4xx";
+  return "provider_error";
+}
+
+function errorCode(error: unknown): string {
+  if (error instanceof DOMException && (error.name === "AbortError" || error.name === "TimeoutError")) return "timeout";
+  if (error instanceof Error && error.name.toLowerCase() === "timeouterror") return "timeout";
+  return error instanceof TypeError ? "network_error" : "provider_error";
 }
 
 export function startAutomationScheduler(
@@ -140,7 +211,10 @@ export function startAutomationScheduler(
     };
   }
 
-  const scheduler = createAutomationScheduler(automationSchedulerConfig(env));
+  const scheduler = createAutomationScheduler({
+    ...automationSchedulerConfig(env),
+    shouldRun: () => getWorkerRuntimeState().status !== "paused",
+  });
   const interval = setInterval(() => void scheduler.run(), automationSchedulerConfig(env).intervalMs);
   void scheduler.run();
 

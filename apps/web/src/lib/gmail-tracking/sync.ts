@@ -47,7 +47,7 @@ export async function syncGmailForUser(userId: string, now = new Date()): Promis
 
   try {
     const [messages, jobs] = await Promise.all([
-      fetchRecentGmailMessages(accessToken, since),
+      fetchRecentGmailMessages(accessToken, since, userId),
       db.job.findMany({
         where: { userId },
         select: { id: true, company: true, role: true, status: true, appliedAt: true },

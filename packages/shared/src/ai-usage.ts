@@ -16,6 +16,8 @@ export type SharedAiUsageInput = {
 type Queryable = { query: (text: string, values?: unknown[]) => Promise<unknown> };
 
 const prices: Record<string, { input: number; output: number }> = {
+  "anthropic:claude-sonnet-5": { input: 3, output: 15 },
+  "anthropic:claude-fable-5": { input: 10, output: 50 },
   "minimax:MiniMax-M3": { input: 0.6, output: 2.4 },
   "minimax:MiniMax-M2.7-highspeed": { input: 0.6, output: 2.4 },
   "openai:gpt-5.5": { input: 5, output: 30 },
@@ -24,6 +26,11 @@ const prices: Record<string, { input: number; output: number }> = {
   "openai:gpt-5.6-luna": { input: 1, output: 6 },
   "deepseek:deepseek-v4-pro": { input: 0.435, output: 0.87 },
   "deepseek:deepseek-v4-flash": { input: 0.14, output: 0.28 },
+  "qwen:qwen3.7-plus": { input: 0.28, output: 1.12 },
+  "qwen:qwen3.7-flash": { input: 0, output: 0 },
+  "zhipu:glm-5.1": { input: 1.05, output: 3.5 },
+  "zhipu:glm-5-turbo": { input: 0, output: 0 },
+  "kimi:kimi-k2.5": { input: 0, output: 0 },
 };
 
 const STABLE_ERROR_CODES = new Set(["configuration_error", "network_error", "provider_error", "timeout"]);

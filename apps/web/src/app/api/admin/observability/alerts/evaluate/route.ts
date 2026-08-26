@@ -19,7 +19,9 @@ function metricValue(metric: string, snapshot: Awaited<ReturnType<typeof getObse
   if (metric === 'avg_duration_ms') return snapshot.overall.avgDurationMs
   if (metric === 'ai_error_rate') return snapshot.ai.errorRate
   if (metric === 'ai_cost_usd') return snapshot.ai.estimatedCostUsd
-  if (metric === 'redis_cost_usd') return redis?.estimatedCostUsd ?? null
+  // The REST INFO fallback is an instance-lifetime counter, so it must not
+  // satisfy a monthly cost alert. Only management API stats are alertable.
+  if (metric === 'redis_cost_usd') return redis?.period === 'current_month' ? redis.estimatedCostUsd : null
   if (metric.startsWith('queue_') && !queue.available) return null
   if (metric === 'queue_stuck_jobs') return queue.stuck
   if (metric === 'queue_failed_jobs') return queue.failed
@@ -40,7 +42,11 @@ async function evaluate(request: NextRequest) {
   if (!rules.some((rule) => rule.metric === 'redis_cost_usd')) {
     const threshold = redisCostAlertThreshold()
     const redisConfig = redisUsageConfig()
-    if (threshold !== null && redisConfig.url && redisConfig.token) {
+    const canReadRedis = Boolean(
+      (redisConfig.url && redisConfig.token) ||
+      (redisConfig.databaseId && redisConfig.managementEmail && redisConfig.managementKey),
+    )
+    if (threshold !== null && canReadRedis) {
       const rule = await db.adminAlertRule.upsert({
         where: { key: 'redis.payg_cost' },
         create: { key: 'redis.payg_cost', name: 'Redis estimated cost', metric: 'redis_cost_usd', operator: 'gte', threshold, windowMin: 5, severity: 'high', enabled: true, createdById: 'system', updatedById: 'system' },

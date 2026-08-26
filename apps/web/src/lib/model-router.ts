@@ -436,8 +436,7 @@ function oaiFetch(c: OaiRequestConfig): Promise<Response> {
 
 async function oaiCheck(resp: Response, provider: Provider): Promise<void> {
   if (!resp.ok) {
-    const errText = await resp.text().catch(() => '')
-    throw new Error(`${provider} API error ${resp.status}: ${errText.slice(0, 200)}`)
+    throw new Error(`${provider} API error ${resp.status}`)
   }
 }
 

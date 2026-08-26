@@ -1,4 +1,4 @@
-import NextAuth from 'next-auth'
+import NextAuth, { customFetch } from 'next-auth'
 import type { Provider } from 'next-auth/providers'
 import { PrismaAdapter } from '@auth/prisma-adapter'
 import Google from 'next-auth/providers/google'
@@ -19,6 +19,7 @@ import {
 } from '@/lib/auth-session-token'
 import { authVersionFromClaim } from '@/lib/auth-version'
 import { shouldSuppressAuthSessionErrorLog } from '@/lib/safe-auth-errors'
+import { authProviderFetch } from '@/lib/api-usage/auth-provider-fetch'
 
 assertNoAuthOriginOverride()
 const AUTH_SECRET = getAuthSecret()
@@ -55,6 +56,7 @@ if (process.env.AUTH_GOOGLE_ID && process.env.AUTH_GOOGLE_SECRET) {
         prompt: 'select_account',
       },
     },
+    [customFetch]: authProviderFetch('google-oauth'),
   }))
 }
 
@@ -63,6 +65,7 @@ if (process.env.AUTH_GITHUB_ID && process.env.AUTH_GITHUB_SECRET) {
   providers.push(GitHub({
     clientId:     process.env.AUTH_GITHUB_ID,
     clientSecret: process.env.AUTH_GITHUB_SECRET,
+    [customFetch]: authProviderFetch('github'),
   }))
 }
 

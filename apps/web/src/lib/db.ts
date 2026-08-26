@@ -20,7 +20,7 @@ const tenantModels = new Set([
   'AgentRunQuestion', 'AgentRun', 'AgentExecution', 'AgentSession', 'SubAgentTask',
   'AgentTranscriptEvent', 'AgentApproval', 'AgentAutomation', 'CustomAgentRole', 'Direction',
   'CoverLetter', 'SupportCase', 'SupportCaseMessage', 'AdminDataDeletionRequest', 'AiUsageEvent',
-  'FormPattern', 'JobApiUsageEvent', 'DiscoveryOptimizationEvent',
+  'FormPattern', 'JobApiUsageEvent', 'ExternalApiUsageEvent', 'DiscoveryOptimizationEvent',
 ])
 
 function modelDelegate(tx: unknown, model: string, operation: string) {

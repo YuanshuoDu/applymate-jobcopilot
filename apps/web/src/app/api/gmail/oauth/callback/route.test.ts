@@ -94,6 +94,17 @@ describe('GET /api/gmail/oauth/callback', () => {
     expect(mocks.upsert).not.toHaveBeenCalled()
   })
 
+  it('does not return the provider error description from OAuth redirects', async () => {
+    const { GET } = await import('./route')
+    const response = await GET(new NextRequest(
+      'https://applymate.site/api/gmail/oauth/callback?error=access_denied&error_description=private-provider-response',
+    ))
+    const location = new URL(response.headers.get('location') ?? '')
+
+    expect(location.searchParams.get('gmailError')).toBe('oauth_denied')
+    expect(location.toString()).not.toContain('private-provider-response')
+  })
+
   it('does not attach Gmail credentials after the initiating session is replaced', async () => {
     mocks.safeAuth.mockResolvedValue({ user: { id: 'user_2', authVersion: 1 } })
     const { GET } = await import('./route')

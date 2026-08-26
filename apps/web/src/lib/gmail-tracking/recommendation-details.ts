@@ -22,7 +22,7 @@ export interface SourceRecommendation extends RecommendationDetails {
 
 /** Reload the source email before saving so My Jobs receives real job details. */
 export async function hydrateRecommendationDetails(input: SourceRecommendation, accessToken: string, userId?: string): Promise<RecommendationDetails> {
-  const source = await fetchGmailMessage(accessToken, input.gmailMessageId).catch(() => null)
+  const source = await fetchGmailMessage(accessToken, input.gmailMessageId, userId).catch(() => null)
   const card = source ? matchingCard(input, extractRecommendationCards({ html: source.html, text: source.text, platform: input.platform })) : null
   const fromEmail = mergeDetails(input, card)
   if (!isLikelyJobDetailUrl(fromEmail.url)) return fromEmail

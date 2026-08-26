@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from 'vitest'
 import {
+  bindWorkerControl,
   WORKER_RUNTIME_STATE_KEY,
   pauseWorkerRuntime,
   readWorkerRuntimeState,
@@ -20,6 +21,20 @@ function createConnection(value: string | null = null) {
 }
 
 describe('worker runtime state', () => {
+  it('pauses the queue and BullMQ worker together', async () => {
+    const queue = createQueue()
+    const worker = { pause: vi.fn(async () => undefined), resume: vi.fn(async () => undefined) }
+    const control = bindWorkerControl(queue, worker)
+
+    await control.pause()
+    await control.resume()
+
+    expect(queue.pause).toHaveBeenCalledOnce()
+    expect(queue.resume).toHaveBeenCalledOnce()
+    expect(worker.pause).toHaveBeenCalledWith(true)
+    expect(worker.resume).toHaveBeenCalledOnce()
+  })
+
   it('pauses every queue and remembers queues already paused', async () => {
     const connection = createConnection()
     const queues = { apply: createQueue(), scout: createQueue(true) }

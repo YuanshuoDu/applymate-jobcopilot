@@ -33,6 +33,9 @@ ALTER TABLE "apply_results" ENABLE ROW LEVEL SECURITY;
 ALTER TABLE "form_patterns" ENABLE ROW LEVEL SECURITY;
 ALTER TABLE "ai_budgets" ENABLE ROW LEVEL SECURITY;
 ALTER TABLE "ai_usage_events" ENABLE ROW LEVEL SECURITY;
+ALTER TABLE "external_api_usage_events" ENABLE ROW LEVEL SECURITY;
+ALTER TABLE "job_api_usage_events" ENABLE ROW LEVEL SECURITY;
+ALTER TABLE "discovery_optimization_events" ENABLE ROW LEVEL SECURITY;
 ALTER TABLE "ai_budget_adjustments" ENABLE ROW LEVEL SECURITY;
 ALTER TABLE "ai_budget_reset_requests" ENABLE ROW LEVEL SECURITY;
 ALTER TABLE "notifications" ENABLE ROW LEVEL SECURITY;
@@ -99,6 +102,12 @@ DROP POLICY IF EXISTS candidate_ai_budget_isolation ON "ai_budgets";
 CREATE POLICY candidate_ai_budget_isolation ON "ai_budgets" USING ("user_id" = app_current_user_id()) WITH CHECK ("user_id" = app_current_user_id());
 DROP POLICY IF EXISTS candidate_ai_usage_event_isolation ON "ai_usage_events";
 CREATE POLICY candidate_ai_usage_event_isolation ON "ai_usage_events" USING ("user_id" = app_current_user_id()) WITH CHECK ("user_id" = app_current_user_id());
+DROP POLICY IF EXISTS candidate_external_api_usage_event_isolation ON "external_api_usage_events";
+CREATE POLICY candidate_external_api_usage_event_isolation ON "external_api_usage_events" USING ("user_id" = app_current_user_id()) WITH CHECK ("user_id" = app_current_user_id());
+DROP POLICY IF EXISTS candidate_job_api_usage_event_isolation ON "job_api_usage_events";
+CREATE POLICY candidate_job_api_usage_event_isolation ON "job_api_usage_events" USING ("user_id" = app_current_user_id()) WITH CHECK ("user_id" = app_current_user_id());
+DROP POLICY IF EXISTS candidate_discovery_optimization_event_isolation ON "discovery_optimization_events";
+CREATE POLICY candidate_discovery_optimization_event_isolation ON "discovery_optimization_events" USING ("user_id" = app_current_user_id()) WITH CHECK ("user_id" = app_current_user_id());
 DROP POLICY IF EXISTS candidate_ai_budget_adjustment_isolation ON "ai_budget_adjustments";
 CREATE POLICY candidate_ai_budget_adjustment_isolation ON "ai_budget_adjustments"
   USING (EXISTS (SELECT 1 FROM "ai_budgets" budget WHERE budget."id" = "budget_id" AND budget."user_id" = app_current_user_id()))
