@@ -14,4 +14,8 @@ describe('external API catalogue', () => {
   it('marks worker control traffic as event-backed telemetry', () => {
     expect(EXTERNAL_API_PROVIDERS.find(provider => provider.key === 'internal-worker')?.telemetry).toBe('events')
   })
+
+  it('uses the Neon consumption snapshot for infrastructure billing telemetry', () => {
+    expect(EXTERNAL_API_PROVIDERS.find(provider => provider.key === 'neon-postgres')).toMatchObject({ billing: 'configurable', telemetry: 'snapshot' })
+  })
 })

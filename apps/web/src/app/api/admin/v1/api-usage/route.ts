@@ -5,6 +5,7 @@ import { db } from '@/lib/db'
 import { JOB_API_PROVIDERS } from '@/lib/api-usage/job-api-catalog'
 import { EXTERNAL_API_PROVIDERS } from '@/lib/api-usage/external-api-catalog'
 import { readRedisUsage } from '@/lib/admin/redis-usage'
+import { readNeonUsage } from '@/lib/admin/neon-usage'
 import { quotaPeriodBounds, type QuotaPeriod } from '@/lib/api-usage/quota-period'
 import { MODEL_CATALOGUE } from '@/lib/model-router'
 
@@ -64,7 +65,7 @@ export async function GET(request: NextRequest) {
   const aiProviderFilter = provider ? Prisma.sql`AND provider = ${provider}` : Prisma.empty
   const externalProviderFilter = provider ? Prisma.sql`AND provider = ${provider}` : Prisma.empty
   const since = new Date(Date.now() - days * 86_400_000)
-  const [jobRows, aiRows, externalRows, trend, quotas, optimizationRows, redisSnapshot] = await Promise.all([
+  const [jobRows, aiRows, externalRows, trend, quotas, optimizationRows, redisSnapshot, neonSnapshot] = await Promise.all([
     db.$queryRaw<JobRow[]>`
       SELECT provider, operation, credential_source AS "credentialSource",
         SUM(request_count)::int AS calls, SUM(jobs_returned)::int AS jobs,
@@ -100,6 +101,7 @@ export async function GET(request: NextRequest) {
     db.apiQuota.findMany({ where: { enabled: true, ...(provider ? { provider } : {}) }, orderBy: [{ category: 'asc' }, { provider: 'asc' }, { operation: 'asc' }] }),
     loadOptimizationRows(since, provider),
     provider === 'upstash-redis' || !provider ? (process.env.NODE_ENV === 'test' ? Promise.resolve(null) : readRedisUsage()) : Promise.resolve(null),
+    provider === 'neon-postgres' || !provider ? (process.env.NODE_ENV === 'test' ? Promise.resolve(null) : readNeonUsage()) : Promise.resolve(null),
   ])
 
   const jobStats = new Map<string, JobRow[]>()
@@ -140,8 +142,13 @@ export async function GET(request: NextRequest) {
   for (const row of externalRows) externalStats.set(row.provider, [...(externalStats.get(row.provider) ?? []), row])
   const externalProviders = EXTERNAL_API_PROVIDERS.filter(item => !provider || item.key === provider).map(item => {
     const rows = externalStats.get(item.key) ?? []
-    const snapshot = item.key === 'upstash-redis' && redisSnapshot ? { calls: redisSnapshot.totalCommands, inputBytes: redisSnapshot.inputBytes, outputBytes: redisSnapshot.outputBytes, cost: redisSnapshot.estimatedCostUsd, sampledAt: redisSnapshot.sampledAt, period: redisSnapshot.period, source: redisSnapshot.source, alertThresholdUsd: redisSnapshot.alertThresholdUsd, maxBudgetUsd: redisSnapshot.maxBudgetUsd, alertTriggered: redisSnapshot.alertTriggered } : null
-    return { ...item, calls: snapshot?.calls ?? rows.reduce((sum, row) => sum + number(row.calls), 0), inputBytes: snapshot?.inputBytes ?? rows.reduce((sum, row) => sum + number(row.inputBytes), 0), outputBytes: snapshot?.outputBytes ?? rows.reduce((sum, row) => sum + number(row.outputBytes), 0), cost: snapshot?.cost ?? rows.reduce((sum, row) => sum + number(row.cost), 0), errors: rows.reduce((sum, row) => sum + number(row.errors), 0), avgLatency: rows.length ? Math.round(rows.reduce((sum, row) => sum + number(row.avgLatency), 0) / rows.length) : 0, lastEventAt: latestEvent(rows), source: snapshot?.source ?? (item.key === 'upstash-redis' ? 'unavailable' : item.telemetry), period: snapshot?.period ?? null, sampledAt: snapshot?.sampledAt ?? null, alertThresholdUsd: snapshot?.alertThresholdUsd ?? null, maxBudgetUsd: snapshot?.maxBudgetUsd ?? null, alertTriggered: snapshot?.alertTriggered ?? false, operations: rows }
+    const snapshot = item.key === 'upstash-redis' && redisSnapshot
+      ? { calls: redisSnapshot.totalCommands, inputBytes: redisSnapshot.inputBytes, outputBytes: redisSnapshot.outputBytes, cost: redisSnapshot.estimatedCostUsd, costKnown: true, sampledAt: redisSnapshot.sampledAt, period: redisSnapshot.period, source: redisSnapshot.source, alertThresholdUsd: redisSnapshot.alertThresholdUsd, maxBudgetUsd: redisSnapshot.maxBudgetUsd, alertTriggered: redisSnapshot.alertTriggered, metrics: [] }
+      : item.key === 'neon-postgres' && neonSnapshot
+        ? { calls: 0, inputBytes: neonSnapshot.inputBytes, outputBytes: neonSnapshot.outputBytes, cost: neonSnapshot.estimatedCostUsd ?? 0, costKnown: neonSnapshot.estimatedCostUsd !== null, sampledAt: neonSnapshot.sampledAt, period: neonSnapshot.period, source: neonSnapshot.source, alertThresholdUsd: neonSnapshot.alertThresholdUsd, maxBudgetUsd: null, alertTriggered: neonSnapshot.alertTriggered, metrics: neonSnapshot.metrics }
+        : null
+    const fallbackSource = item.telemetry === 'snapshot' ? 'unavailable' : item.telemetry
+    return { ...item, calls: snapshot?.calls ?? rows.reduce((sum, row) => sum + number(row.calls), 0), inputBytes: snapshot?.inputBytes ?? rows.reduce((sum, row) => sum + number(row.inputBytes), 0), outputBytes: snapshot?.outputBytes ?? rows.reduce((sum, row) => sum + number(row.outputBytes), 0), cost: snapshot?.cost ?? rows.reduce((sum, row) => sum + number(row.cost), 0), costKnown: snapshot?.costKnown ?? true, errors: rows.reduce((sum, row) => sum + number(row.errors), 0), avgLatency: rows.length ? Math.round(rows.reduce((sum, row) => sum + number(row.avgLatency), 0) / rows.length) : 0, lastEventAt: latestEvent(rows), source: snapshot?.source ?? fallbackSource, period: snapshot?.period ?? null, sampledAt: snapshot?.sampledAt ?? null, alertThresholdUsd: snapshot?.alertThresholdUsd ?? null, maxBudgetUsd: snapshot?.maxBudgetUsd ?? null, alertTriggered: snapshot?.alertTriggered ?? false, metrics: snapshot?.metrics ?? [], operations: rows }
   })
   const externalCalls = externalProviders.reduce((sum, row) => sum + row.calls, 0)
   const externalErrors = externalProviders.reduce((sum, row) => sum + row.errors, 0)
@@ -158,7 +165,7 @@ export async function GET(request: NextRequest) {
   }), { cacheHits: 0, singleflightHits: 0, providerSkips: 0, shadowJobs: 0, shadowNetNewJobs: 0, shadowValidApplyUrls: 0, shadowCompleteDescriptions: 0 })
   return NextResponse.json({ generatedAt: new Date(), days, provider: provider ?? null,
     catalog: { job: JOB_API_PROVIDERS.map(item => ({ key: item.key, label: item.label })), ai: aiCatalogue, external: EXTERNAL_API_PROVIDERS.map(item => ({ key: item.key, label: item.label })) },
-    freshness: { lastEventAt: latestEvent([...providers, ...aiProviders, ...externalProviders.map(row => ({ lastEventAt: row.lastEventAt ?? row.sampledAt }))]), external: { upstashRedis: redisSnapshot ? { source: redisSnapshot.source, period: redisSnapshot.period, sampledAt: redisSnapshot.sampledAt, status: 'live' } : { source: 'unavailable', period: null, sampledAt: null, status: 'unavailable' } } },
+    freshness: { lastEventAt: latestEvent([...providers, ...aiProviders, ...externalProviders.map(row => ({ lastEventAt: row.lastEventAt ?? row.sampledAt }))]), external: { upstashRedis: redisSnapshot ? { source: redisSnapshot.source, period: redisSnapshot.period, sampledAt: redisSnapshot.sampledAt, status: 'live' } : { source: 'unavailable', period: null, sampledAt: null, status: 'unavailable' }, neonPostgres: neonSnapshot ? { source: neonSnapshot.source, period: neonSnapshot.period, sampledAt: neonSnapshot.sampledAt, status: 'live' } : { source: 'unavailable', period: null, sampledAt: null, status: 'unavailable' } } },
     job: { summary: { calls: jobCalls, jobs: providers.reduce((sum, row) => sum + row.jobs, 0), errors: jobErrors, errorRate: jobCalls ? Number((jobErrors / jobCalls * 100).toFixed(1)) : 0 }, providers },
     ai: { summary: { calls: aiCalls, tokens: aiProviders.reduce((sum, row) => sum + row.inputTokens + row.outputTokens, 0), costUsd: Number(aiProviders.reduce((sum, row) => sum + row.cost, 0).toFixed(6)), errors: aiErrors, errorRate: aiCalls ? Number((aiErrors / aiCalls * 100).toFixed(1)) : 0 }, providers: aiProviders },
     external: { summary: { calls: externalCalls, dataBytes: externalDataBytes, costUsd: Number(externalCost.toFixed(6)), errors: externalErrors, errorRate: externalCalls ? Number((externalErrors / externalCalls * 100).toFixed(1)) : 0 }, providers: externalProviders },
