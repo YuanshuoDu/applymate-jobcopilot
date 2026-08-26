@@ -5,8 +5,7 @@ import { writeAdminAudit } from '@/lib/admin/audit'
 import { notifyAdministrators } from '@/lib/admin/admin-notifications'
 import { db } from '@/lib/db'
 import { getQueueSloSnapshot } from '@/lib/admin/queue-slo'
-import { readRedisUsage } from '@/lib/admin/redis-usage'
-import { redisBudgetAlert } from '@/lib/admin/redis-cost-alert'
+import { readRedisUsage, redisCostAlertThreshold, redisUsageConfig } from '@/lib/admin/redis-usage'
 
 function authorized(request: NextRequest) {
   const authorization = request.headers.get('authorization')
@@ -14,12 +13,15 @@ function authorized(request: NextRequest) {
   return secrets.some(secret => authorization === `Bearer ${secret}`)
 }
 
-function metricValue(metric: string, snapshot: Awaited<ReturnType<typeof getObservabilitySnapshot>>, queue: Awaited<ReturnType<typeof getQueueSloSnapshot>>) {
+function metricValue(metric: string, snapshot: Awaited<ReturnType<typeof getObservabilitySnapshot>>, queue: Awaited<ReturnType<typeof getQueueSloSnapshot>>, redis: Awaited<ReturnType<typeof readRedisUsage>>) {
   if (metric === 'success_rate') return snapshot.overall.successRate
   if (metric === 'captcha_rate') return snapshot.overall.captchaRate
   if (metric === 'avg_duration_ms') return snapshot.overall.avgDurationMs
   if (metric === 'ai_error_rate') return snapshot.ai.errorRate
   if (metric === 'ai_cost_usd') return snapshot.ai.estimatedCostUsd
+  // The REST INFO fallback is an instance-lifetime counter, so it must not
+  // satisfy a monthly cost alert. Only management API stats are alertable.
+  if (metric === 'redis_cost_usd') return redis?.period === 'current_month' ? redis.estimatedCostUsd : null
   if (metric.startsWith('queue_') && !queue.available) return null
   if (metric === 'queue_stuck_jobs') return queue.stuck
   if (metric === 'queue_failed_jobs') return queue.failed
@@ -36,23 +38,28 @@ function breached(value: number, operator: string, threshold: number) {
 
 async function evaluate(request: NextRequest) {
   if (!authorized(request)) return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
-  const rules = await db.adminAlertRule.findMany({ where: { enabled: true } })
-  const [snapshot, queue, redisSnapshot] = await Promise.all([getObservabilitySnapshot({ days: 1 }), getQueueSloSnapshot(), readRedisUsage()])
-  const fired: string[] = []
-  const redisAlert = redisBudgetAlert(redisSnapshot)
-  if (redisAlert) {
-    const monthStart = new Date(Date.UTC(new Date().getUTCFullYear(), new Date().getUTCMonth(), 1))
-    const existing = await db.adminAlertEvent.findFirst({ where: { ruleKey: redisAlert.ruleKey, status: 'open', createdAt: { gte: monthStart } }, select: { id: true } })
-    if (!existing) {
-      const event = await db.adminAlertEvent.create({ data: { ruleKey: redisAlert.ruleKey, metric: redisAlert.metric, value: redisAlert.value, threshold: redisAlert.threshold, severity: redisAlert.severity } })
-      const incident = await db.adminIncident.create({ data: { title: redisAlert.title, summary: redisAlert.body, service: 'upstash-redis', severity: redisAlert.severity, createdById: 'system', updatedById: 'system' } })
-      await db.adminAlertEvent.update({ where: { id: event.id }, data: { incidentId: incident.id } })
-      await notifyAdministrators({ permission: 'observability.read', type: 'external_api_budget_alert', title: redisAlert.title, body: redisAlert.body, entityType: 'incident', entityId: incident.id, dedupeKey: redisAlert.dedupeKey }).catch(() => undefined)
-      fired.push(redisAlert.ruleKey)
+  let rules = await db.adminAlertRule.findMany({ where: { enabled: true } })
+  if (!rules.some((rule) => rule.metric === 'redis_cost_usd')) {
+    const threshold = redisCostAlertThreshold()
+    const redisConfig = redisUsageConfig()
+    const canReadRedis = Boolean(
+      (redisConfig.url && redisConfig.token) ||
+      (redisConfig.databaseId && redisConfig.managementEmail && redisConfig.managementKey),
+    )
+    if (threshold !== null && canReadRedis) {
+      const rule = await db.adminAlertRule.upsert({
+        where: { key: 'redis.payg_cost' },
+        create: { key: 'redis.payg_cost', name: 'Redis estimated cost', metric: 'redis_cost_usd', operator: 'gte', threshold, windowMin: 5, severity: 'high', enabled: true, createdById: 'system', updatedById: 'system' },
+        update: {},
+      }).catch(() => null)
+      if (rule?.enabled) rules = [...rules, rule]
     }
   }
+  const [snapshot, queue] = await Promise.all([getObservabilitySnapshot({ days: 1 }), getQueueSloSnapshot()])
+  const redis = rules.some((rule) => rule.metric === 'redis_cost_usd') ? await readRedisUsage() : null
+  const fired: string[] = []
   for (const rule of rules) {
-    const value = metricValue(rule.metric, snapshot, queue)
+    const value = metricValue(rule.metric, snapshot, queue, redis)
     if (value === null || !breached(value, rule.operator, rule.threshold)) continue
     const since = new Date(Date.now() - rule.windowMin * 60_000)
     const existing = await db.adminAlertEvent.findFirst({ where: { ruleKey: rule.key, status: 'open', createdAt: { gte: since } }, select: { id: true } })
