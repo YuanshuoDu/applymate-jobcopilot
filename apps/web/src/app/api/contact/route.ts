@@ -1,4 +1,4 @@
-import { pinnedFetch } from '@jobcopilot/shared'
+import { trackedExternalApiFetch } from '@/lib/api-usage/external-api-usage'
 import { err, ok } from '@/lib/api-helpers'
 import { contactEmailConfig, contactEmailPayload, parseContactMessage } from '@/lib/contact-message'
 
@@ -11,14 +11,14 @@ export async function POST(req: Request) {
   if ('error' in config) return err(config.error, 503)
 
   try {
-  const response = await pinnedFetch('https://api.resend.com/emails', {
+    const response = await trackedExternalApiFetch('https://api.resend.com/emails', {
       method: 'POST',
       headers: {
         Authorization: `Bearer ${config.apiKey}`,
         'Content-Type': 'application/json',
       },
       body: JSON.stringify(contactEmailPayload(message, config)),
-    })
+    }, { provider: 'resend', operation: 'contact_email', credentialSource: 'platform' })
     if (!response.ok) return err('We could not send your message. Please try again or email hello@applymate.ai.', 503)
   } catch {
     return err('We could not send your message. Please try again or email hello@applymate.ai.', 503)

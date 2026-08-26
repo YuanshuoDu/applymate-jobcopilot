@@ -16,7 +16,7 @@ GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE
   "User", "Account", "Session", "user_plan_changes", "user_plan_subscriptions", "user_feature_overrides",
   "Job", "application_tasks", "application_task_events", "Resume", "ResumeVersion", "persona_facts",
   "persona_evidence_chunks", "Activity", "user_api_keys", "AgentConfig", "AgentRole", "apply_results",
-  "form_patterns", "ai_budgets", "ai_budget_adjustments", "ai_budget_reset_requests", "ai_usage_events", "notifications", "gmail_sync_states",
+  "form_patterns", "ai_budgets", "ai_budget_adjustments", "ai_budget_reset_requests", "ai_usage_events", "external_api_usage_events", "notifications", "gmail_sync_states",
   "gmail_messages", "gmail_recommendations", "AgentRunQuestion", "agent_runs", "agent_executions",
   "agent_sessions", "sub_agent_tasks", "agent_transcript_events", "agent_approvals", "agent_automations",
   "CustomAgentRole", "Direction", "CoverLetter", "support_cases", "support_case_messages",

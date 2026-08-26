@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server'
-import { pinnedFetch } from '@jobcopilot/shared'
+import { trackedExternalApiFetch } from '@/lib/api-usage/external-api-usage'
 import { jwtVerify } from 'jose'
 import { db } from '@/lib/db'
 import { safeAuth } from '@/lib/safe-auth'
@@ -70,17 +70,17 @@ export async function GET(req: NextRequest) {
   const clientSecret = process.env.AUTH_GITHUB_SECRET
   if (!clientId || !clientSecret) return back('oauth_not_configured')
 
-  const tokenResponse = await pinnedFetch('https://github.com/login/oauth/access_token', {
+  const tokenResponse = await trackedExternalApiFetch('https://github.com/login/oauth/access_token', {
     method: 'POST',
     headers: { Accept: 'application/json', 'Content-Type': 'application/json' },
     body: JSON.stringify({ client_id: clientId, client_secret: clientSecret, code, redirect_uri: configuredRedirectUri(req.url, '/api/github/oauth/callback') }),
-  }).catch(() => null)
+  }, { provider: 'github', operation: 'token_exchange', credentialSource: 'user', userId }).catch(() => null)
   const token = await tokenResponse?.json().catch(() => null) as GithubToken | null
   if (!tokenResponse?.ok || typeof token?.access_token !== 'string' || !token.access_token) return back('token_exchange_failed')
 
-  const profileResponse = await pinnedFetch('https://api.github.com/user', {
+  const profileResponse = await trackedExternalApiFetch('https://api.github.com/user', {
     headers: { Accept: 'application/vnd.github+json', Authorization: `Bearer ${token.access_token}`, 'User-Agent': 'ApplyMate' },
-  }).catch(() => null)
+  }, { provider: 'github', operation: 'profile', credentialSource: 'user', userId }).catch(() => null)
   const profile = await profileResponse?.json().catch(() => null) as GithubProfile | null
   if (!profileResponse?.ok || (typeof profile?.id !== 'number' && typeof profile?.id !== 'string')) return back('profile_fetch_failed')
   const providerAccountId = String(profile.id)

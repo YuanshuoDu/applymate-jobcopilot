@@ -2,7 +2,7 @@
  * GET /api/gmail/check — verify Gmail access by actually calling the Gmail API.
  * Returns { connected, hasGmail, reason, scopes, gmailError }.
  */
-import { pinnedFetch } from '@jobcopilot/shared'
+import { trackedExternalApiFetch } from '@/lib/api-usage/external-api-usage'
 import { requireAuth, isErrorResponse, ok } from '@/lib/api-helpers'
 import { findGmailConnection, getGoogleAccessToken } from '@/lib/gmail-helpers'
 
@@ -22,9 +22,10 @@ export async function GET() {
 
   // 2. Actually try a Gmail API call — the authoritative check
   try {
-  const gmailRes = await pinnedFetch(
+  const gmailRes = await trackedExternalApiFetch(
       'https://gmail.googleapis.com/gmail/v1/users/me/profile',
       { headers: { Authorization: `Bearer ${token}` } },
+      { provider: 'gmail', operation: 'profile', credentialSource: 'user', userId: auth.userId },
     )
     if (gmailRes.ok) {
       return ok({ connected: true, hasGmail: true, scopes, reason: null })

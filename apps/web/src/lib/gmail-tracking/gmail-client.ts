@@ -1,4 +1,4 @@
-import { pinnedFetch } from '@jobcopilot/shared'
+import { trackedExternalApiFetch } from '@/lib/api-usage/external-api-usage'
 import { extractHtml, extractPlainText } from '@/lib/gmail-helpers'
 
 const MAX_MESSAGE_FETCH_CONCURRENCY = 8
@@ -25,16 +25,17 @@ export class GmailApiError extends Error {
 export async function fetchRecentGmailMessages(
   accessToken: string,
   since: Date | null,
+  userId?: string,
 ): Promise<GmailRemoteMessage[]> {
   const query = buildSearchQuery(since)
   const listUrl = new URL('https://gmail.googleapis.com/gmail/v1/users/me/messages')
   listUrl.searchParams.set('maxResults', '100')
   listUrl.searchParams.set('q', query)
 
-  const listResponse = await pinnedFetch(listUrl, {
+  const listResponse = await trackedExternalApiFetch(listUrl, {
     headers: { Authorization: `Bearer ${accessToken}` },
     signal: AbortSignal.timeout(12_000),
-  })
+  }, { provider: 'gmail', operation: 'list_messages', credentialSource: 'user', userId })
   if (!listResponse.ok) throw new GmailApiError('Could not list Gmail messages', listResponse.status)
 
   const listPayload = await listResponse.json() as unknown
@@ -42,7 +43,7 @@ export async function fetchRecentGmailMessages(
   const messages = await mapWithConcurrency(
     ids,
     MAX_MESSAGE_FETCH_CONCURRENCY,
-    (id) => fetchGmailMessage(accessToken, id).catch(() => null),
+    (id) => fetchGmailMessage(accessToken, id, userId).catch(() => null),
   )
   return messages.flatMap((message) => message ? [message] : [])
 }
@@ -82,10 +83,11 @@ function messageIds(payload: unknown): string[] {
   })
 }
 
-export async function fetchGmailMessage(accessToken: string, id: string): Promise<GmailRemoteMessage | null> {
-  const response = await pinnedFetch(
+export async function fetchGmailMessage(accessToken: string, id: string, userId?: string): Promise<GmailRemoteMessage | null> {
+  const response = await trackedExternalApiFetch(
     `https://gmail.googleapis.com/gmail/v1/users/me/messages/${encodeURIComponent(id)}?format=full`,
     { headers: { Authorization: `Bearer ${accessToken}` }, signal: AbortSignal.timeout(8_000) },
+    { provider: 'gmail', operation: 'message_full', credentialSource: 'user', userId },
   )
   if (!response.ok) return null
   return parseMessage(await response.json() as unknown)

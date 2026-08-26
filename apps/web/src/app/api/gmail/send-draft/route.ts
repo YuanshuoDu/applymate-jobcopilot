@@ -4,7 +4,7 @@
  * Body: { to, subject, draft, gmailMessageId?, threadId?, jobId? }
  */
 import { NextRequest }                          from 'next/server'
-import { pinnedFetch }                           from '@jobcopilot/shared'
+import { trackedExternalApiFetch }                from '@/lib/api-usage/external-api-usage'
 import { requireAuth, isErrorResponse, ok, err } from '@/lib/api-helpers'
 import { getGoogleAccessToken }                  from '@/lib/gmail-helpers'
 import { db }                                    from '@/lib/db'
@@ -24,9 +24,9 @@ export async function POST(req: NextRequest) {
   if (!token) return err('Gmail not connected. Please connect Google account in Settings.')
 
   // Build RFC 2822 message
-  const fromRes = await pinnedFetch('https://gmail.googleapis.com/gmail/v1/users/me/profile', {
+  const fromRes = await trackedExternalApiFetch('https://gmail.googleapis.com/gmail/v1/users/me/profile', {
     headers: { Authorization: `Bearer ${token}` },
-  })
+  }, { provider: 'gmail', operation: 'profile', credentialSource: 'user', userId: auth.userId })
   const profile = fromRes.ok ? await fromRes.json() as { emailAddress?: string } : {}
   const from = profile.emailAddress ?? 'me'
 
@@ -41,11 +41,11 @@ export async function POST(req: NextRequest) {
   ]
   const raw = Buffer.from(messageParts.join('\r\n')).toString('base64url')
 
-  const sendRes = await pinnedFetch('https://gmail.googleapis.com/gmail/v1/users/me/messages/send', {
+  const sendRes = await trackedExternalApiFetch('https://gmail.googleapis.com/gmail/v1/users/me/messages/send', {
     method:  'POST',
     headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
     body:    JSON.stringify({ raw, ...(typeof threadId === 'string' && threadId ? { threadId } : {}) }),
-  })
+  }, { provider: 'gmail', operation: 'send_message', credentialSource: 'user', userId: auth.userId })
 
   if (!sendRes.ok) {
     const errText = await sendRes.text()

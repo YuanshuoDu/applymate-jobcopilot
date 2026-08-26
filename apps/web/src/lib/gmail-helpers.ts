@@ -1,7 +1,7 @@
 /**
  * Shared Gmail helpers — token refresh and email body extraction.
  */
-import { pinnedFetch } from '@jobcopilot/shared'
+import { trackedExternalApiFetch } from '@/lib/api-usage/external-api-usage'
 import { db } from '@/lib/db'
 import { classifyGmailMessage, type GmailMessageKind } from '@/lib/gmail-tracking'
 import { decryptAccountTokens, encryptAccountTokenFields } from '@/lib/credential-secrets'
@@ -100,7 +100,7 @@ export async function getGoogleAccessToken(userId: string): Promise<string | nul
       return null
     }
     try {
-      const res = await pinnedFetch('https://oauth2.googleapis.com/token', {
+      const res = await trackedExternalApiFetch('https://oauth2.googleapis.com/token', {
         method:  'POST',
         headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
         body:    new URLSearchParams({
@@ -109,7 +109,7 @@ export async function getGoogleAccessToken(userId: string): Promise<string | nul
           refresh_token: account.refresh_token,
           grant_type:    'refresh_token',
         }),
-      })
+      }, { provider: 'google-oauth', operation: 'token_refresh', credentialSource: 'user', userId })
       const data = await res.json()
       console.log('[gmail] token refresh response:', JSON.stringify({ ok: res.ok, status: res.status, hasToken: !!data.access_token, error: data.error }))
       if (data.access_token) {

@@ -11,7 +11,7 @@
  *   GMAIL_ERROR         — other Gmail API error
  */
 import { NextRequest } from 'next/server'
-import { pinnedFetch } from '@jobcopilot/shared'
+import { trackedExternalApiFetch } from '@/lib/api-usage/external-api-usage'
 import { requireAuth, isErrorResponse, ok, err } from '@/lib/api-helpers'
 import { findGmailConnection, getGoogleAccessToken, classifyEmail } from '@/lib/gmail-helpers'
 
@@ -44,9 +44,10 @@ export async function GET(req: NextRequest) {
     const q = encodeURIComponent(
       'subject:(application OR interview OR offer OR "thank you for applying" OR "your application" OR "position" OR "candidacy" OR "hiring" OR "opportunity") -from:me'
     )
-    const listRes = await pinnedFetch(
+    const listRes = await trackedExternalApiFetch(
       `https://gmail.googleapis.com/gmail/v1/users/me/messages?maxResults=25&q=${q}`,
-      { headers: { Authorization: `Bearer ${accessToken}` } }
+      { headers: { Authorization: `Bearer ${accessToken}` } },
+      { provider: 'gmail', operation: 'list_messages', credentialSource: 'user', userId: auth.userId },
     )
 
     console.log('[gmail/threads] Gmail API response status:', listRes.status)
@@ -75,10 +76,11 @@ export async function GET(req: NextRequest) {
     // 4. Fetch metadata for each message (parallel)
     const details = await Promise.allSettled(
       messages.slice(0, 20).map(msg =>
-        pinnedFetch(
+        trackedExternalApiFetch(
           `https://gmail.googleapis.com/gmail/v1/users/me/messages/${msg.id}?format=metadata` +
           `&metadataHeaders=From&metadataHeaders=Subject&metadataHeaders=Date`,
-          { headers: { Authorization: `Bearer ${accessToken}` } }
+          { headers: { Authorization: `Bearer ${accessToken}` } },
+          { provider: 'gmail', operation: 'message_metadata', credentialSource: 'user', userId: auth.userId },
         ).then(r => r.ok ? r.json() : null)
       )
     )

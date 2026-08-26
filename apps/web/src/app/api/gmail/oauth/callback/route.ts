@@ -12,7 +12,7 @@
  * explicitly move it by starting OAuth with transfer=1 and authorizing Google.
  */
 import { NextRequest, NextResponse } from 'next/server'
-import { pinnedFetch } from '@jobcopilot/shared'
+import { trackedExternalApiFetch } from '@/lib/api-usage/external-api-usage'
 import { jwtVerify } from 'jose'
 import { db } from '@/lib/db'
 import { safeAuth } from '@/lib/safe-auth'
@@ -100,7 +100,7 @@ export async function GET(req: NextRequest) {
 
   // Exchange code for tokens
   const redirectUri = configuredRedirectUri(req.url, '/api/gmail/oauth/callback')
-  const tokenRes = await pinnedFetch('https://oauth2.googleapis.com/token', {
+  const tokenRes = await trackedExternalApiFetch('https://oauth2.googleapis.com/token', {
     method:  'POST',
     headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
     body:    new URLSearchParams({
@@ -110,7 +110,7 @@ export async function GET(req: NextRequest) {
       redirect_uri:  redirectUri,
       grant_type:    'authorization_code',
     }),
-  })
+  }, { provider: 'google-oauth', operation: 'token_exchange', credentialSource: 'user', userId })
   const tokens = await tokenRes.json()
   if (!tokenRes.ok || !tokens.access_token) {
     console.error('[gmail/oauth/callback] token exchange failed:', tokens)
@@ -118,9 +118,9 @@ export async function GET(req: NextRequest) {
   }
 
   // Fetch Google user id (sub) — needed for providerAccountId uniqueness
-  const profileRes = await pinnedFetch('https://www.googleapis.com/oauth2/v3/userinfo', {
+  const profileRes = await trackedExternalApiFetch('https://www.googleapis.com/oauth2/v3/userinfo', {
     headers: { Authorization: `Bearer ${tokens.access_token}` },
-  })
+  }, { provider: 'google-oauth', operation: 'userinfo', credentialSource: 'user', userId })
   const profile = await profileRes.json()
   const providerAccountId = profile.sub as string | undefined
   if (!providerAccountId) {

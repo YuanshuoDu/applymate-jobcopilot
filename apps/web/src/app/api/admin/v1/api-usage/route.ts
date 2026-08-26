@@ -3,11 +3,14 @@ import { Prisma } from '@prisma/client'
 import { isAdminResponse, requireAdmin } from '@/lib/admin/authorization'
 import { db } from '@/lib/db'
 import { JOB_API_PROVIDERS } from '@/lib/api-usage/job-api-catalog'
+import { EXTERNAL_API_PROVIDERS } from '@/lib/api-usage/external-api-catalog'
+import { readRedisUsage } from '@/lib/admin/redis-usage'
 import { quotaPeriodBounds, type QuotaPeriod } from '@/lib/api-usage/quota-period'
 import { MODEL_CATALOGUE } from '@/lib/model-router'
 
 type JobRow = { provider: string; operation: string; credentialSource: string; calls: number; jobs: number; errors: number; avgLatency: number | null; lastEventAt: Date | null }
 type AiRow = { provider: string; model: string; credentialSource: string; calls: number; inputTokens: number; outputTokens: number; cost: number; errors: number; avgLatency: number | null; lastEventAt: Date | null }
+type ExternalRow = { provider: string; operation: string; credentialSource: string; calls: number; inputBytes: number; outputBytes: number; cost: number; errors: number; avgLatency: number | null; lastEventAt: Date | null }
 type TrendRow = { day: Date; category: string; calls: number; errors: number; units: number; cost: number }
 type OptimizationRow = { eventType: string; provider: string | null; events: number; requestsAvoided: number; jobsReturned: number; netNewJobs: number; validApplyUrls: number; completeDescriptions: number }
 
@@ -34,6 +37,22 @@ async function loadOptimizationRows(since: Date, provider: string | undefined): 
   }
 }
 
+async function loadExternalRows(since: Date, provider: string | undefined): Promise<ExternalRow[]> {
+  const providerFilter = provider ? Prisma.sql`AND provider = ${provider}` : Prisma.empty
+  try {
+    return await db.$queryRaw<ExternalRow[]>`
+      SELECT provider, operation, credential_source AS "credentialSource", SUM(request_count)::int AS calls,
+        SUM(input_bytes)::int AS "inputBytes", SUM(output_bytes)::int AS "outputBytes",
+        COALESCE(SUM(estimated_cost_usd), 0)::float AS cost,
+        COUNT(*) FILTER (WHERE status = 'error')::int AS errors,
+        ROUND(AVG(latency_ms))::int AS "avgLatency", MAX(created_at) AS "lastEventAt"
+      FROM external_api_usage_events WHERE created_at >= ${since} ${providerFilter}
+      GROUP BY provider, operation, credential_source ORDER BY cost DESC, calls DESC`
+  } catch {
+    return []
+  }
+}
+
 export async function GET(request: NextRequest) {
   const actor = await requireAdmin('observability.read', request)
   if (isAdminResponse(actor)) return actor
@@ -43,8 +62,9 @@ export async function GET(request: NextRequest) {
   const provider = rawProvider || undefined
   const jobProviderFilter = provider ? Prisma.sql`AND provider = ${provider}` : Prisma.empty
   const aiProviderFilter = provider ? Prisma.sql`AND provider = ${provider}` : Prisma.empty
+  const externalProviderFilter = provider ? Prisma.sql`AND provider = ${provider}` : Prisma.empty
   const since = new Date(Date.now() - days * 86_400_000)
-  const [jobRows, aiRows, trend, quotas, optimizationRows] = await Promise.all([
+  const [jobRows, aiRows, externalRows, trend, quotas, optimizationRows, redisSnapshot] = await Promise.all([
     db.$queryRaw<JobRow[]>`
       SELECT provider, operation, credential_source AS "credentialSource",
         SUM(request_count)::int AS calls, SUM(jobs_returned)::int AS jobs,
@@ -60,6 +80,7 @@ export async function GET(request: NextRequest) {
         ROUND(AVG(latency_ms))::int AS "avgLatency", MAX(created_at) AS "lastEventAt"
       FROM ai_usage_events WHERE created_at >= ${since} ${aiProviderFilter}
       GROUP BY provider, model, credential_source ORDER BY cost DESC, calls DESC`,
+    loadExternalRows(since, provider),
     db.$queryRaw<TrendRow[]>`
       SELECT day, category, SUM(calls)::int AS calls, SUM(errors)::int AS errors,
         SUM(units)::float AS units, SUM(cost)::float AS cost FROM (
@@ -71,9 +92,14 @@ export async function GET(request: NextRequest) {
         SELECT DATE_TRUNC('day', created_at), 'ai', COUNT(*), COUNT(*) FILTER (WHERE status = 'error'),
           SUM(input_tokens + output_tokens), SUM(estimated_cost_usd)
         FROM ai_usage_events WHERE created_at >= ${since} ${aiProviderFilter} GROUP BY DATE_TRUNC('day', created_at)
+        UNION ALL
+        SELECT DATE_TRUNC('day', created_at), 'external', SUM(request_count), COUNT(*) FILTER (WHERE status = 'error'),
+          SUM(input_bytes + output_bytes), SUM(estimated_cost_usd)
+        FROM external_api_usage_events WHERE created_at >= ${since} ${externalProviderFilter} GROUP BY DATE_TRUNC('day', created_at)
       ) usage GROUP BY day, category ORDER BY day ASC`,
     db.apiQuota.findMany({ where: { enabled: true, ...(provider ? { provider } : {}) }, orderBy: [{ category: 'asc' }, { provider: 'asc' }, { operation: 'asc' }] }),
     loadOptimizationRows(since, provider),
+    provider === 'upstash-redis' || !provider ? (process.env.NODE_ENV === 'test' ? Promise.resolve(null) : readRedisUsage()) : Promise.resolve(null),
   ])
 
   const jobStats = new Map<string, JobRow[]>()
@@ -110,6 +136,17 @@ export async function GET(request: NextRequest) {
   const aiCalls = aiProviders.reduce((sum, row) => sum + row.calls, 0)
   const aiErrors = aiProviders.reduce((sum, row) => sum + row.errors, 0)
   const aiCatalogue = [...new Set(MODEL_CATALOGUE.map(model => model.provider))].sort().map(key => ({ key, label: key }))
+  const externalStats = new Map<string, ExternalRow[]>()
+  for (const row of externalRows) externalStats.set(row.provider, [...(externalStats.get(row.provider) ?? []), row])
+  const externalProviders = EXTERNAL_API_PROVIDERS.filter(item => !provider || item.key === provider).map(item => {
+    const rows = externalStats.get(item.key) ?? []
+    const snapshot = item.key === 'upstash-redis' && redisSnapshot ? { calls: redisSnapshot.totalCommands, inputBytes: redisSnapshot.inputBytes, outputBytes: redisSnapshot.outputBytes, cost: redisSnapshot.estimatedCostUsd, sampledAt: redisSnapshot.sampledAt, alertThresholdUsd: redisSnapshot.alertThresholdUsd, maxBudgetUsd: redisSnapshot.maxBudgetUsd, alertTriggered: redisSnapshot.alertTriggered } : null
+    return { ...item, calls: snapshot?.calls ?? rows.reduce((sum, row) => sum + number(row.calls), 0), inputBytes: snapshot?.inputBytes ?? rows.reduce((sum, row) => sum + number(row.inputBytes), 0), outputBytes: snapshot?.outputBytes ?? rows.reduce((sum, row) => sum + number(row.outputBytes), 0), cost: snapshot?.cost ?? rows.reduce((sum, row) => sum + number(row.cost), 0), errors: rows.reduce((sum, row) => sum + number(row.errors), 0), avgLatency: rows.length ? Math.round(rows.reduce((sum, row) => sum + number(row.avgLatency), 0) / rows.length) : 0, lastEventAt: latestEvent(rows), source: snapshot ? 'snapshot' : item.key === 'upstash-redis' ? 'unavailable' : item.telemetry, sampledAt: snapshot?.sampledAt ?? null, alertThresholdUsd: snapshot?.alertThresholdUsd ?? null, maxBudgetUsd: snapshot?.maxBudgetUsd ?? null, alertTriggered: snapshot?.alertTriggered ?? false, operations: rows }
+  })
+  const externalCalls = externalProviders.reduce((sum, row) => sum + row.calls, 0)
+  const externalErrors = externalProviders.reduce((sum, row) => sum + row.errors, 0)
+  const externalDataBytes = externalProviders.reduce((sum, row) => sum + row.inputBytes + row.outputBytes, 0)
+  const externalCost = externalProviders.reduce((sum, row) => sum + row.cost, 0)
   const optimization = optimizationRows.reduce((summary, row) => ({
     cacheHits: summary.cacheHits + (row.eventType === 'cache_hit' ? number(row.requestsAvoided) : 0),
     singleflightHits: summary.singleflightHits + (row.eventType === 'singleflight_hit' ? number(row.requestsAvoided) : 0),
@@ -120,10 +157,11 @@ export async function GET(request: NextRequest) {
     shadowCompleteDescriptions: summary.shadowCompleteDescriptions + (row.eventType === 'shadow_comparison' ? number(row.completeDescriptions) : 0),
   }), { cacheHits: 0, singleflightHits: 0, providerSkips: 0, shadowJobs: 0, shadowNetNewJobs: 0, shadowValidApplyUrls: 0, shadowCompleteDescriptions: 0 })
   return NextResponse.json({ generatedAt: new Date(), days, provider: provider ?? null,
-    catalog: { job: JOB_API_PROVIDERS.map(item => ({ key: item.key, label: item.label })), ai: aiCatalogue },
-    freshness: { lastEventAt: latestEvent([...providers, ...aiProviders]) },
+    catalog: { job: JOB_API_PROVIDERS.map(item => ({ key: item.key, label: item.label })), ai: aiCatalogue, external: EXTERNAL_API_PROVIDERS.map(item => ({ key: item.key, label: item.label })) },
+    freshness: { lastEventAt: latestEvent([...providers, ...aiProviders, ...externalProviders.map(row => ({ lastEventAt: row.lastEventAt ?? row.sampledAt }))]), external: { upstashRedis: redisSnapshot ? { source: 'upstash_rest_info', sampledAt: redisSnapshot.sampledAt, status: 'live' } : { source: 'unavailable', sampledAt: null, status: 'unavailable' } } },
     job: { summary: { calls: jobCalls, jobs: providers.reduce((sum, row) => sum + row.jobs, 0), errors: jobErrors, errorRate: jobCalls ? Number((jobErrors / jobCalls * 100).toFixed(1)) : 0 }, providers },
     ai: { summary: { calls: aiCalls, tokens: aiProviders.reduce((sum, row) => sum + row.inputTokens + row.outputTokens, 0), costUsd: Number(aiProviders.reduce((sum, row) => sum + row.cost, 0).toFixed(6)), errors: aiErrors, errorRate: aiCalls ? Number((aiErrors / aiCalls * 100).toFixed(1)) : 0 }, providers: aiProviders },
+    external: { summary: { calls: externalCalls, dataBytes: externalDataBytes, costUsd: Number(externalCost.toFixed(6)), errors: externalErrors, errorRate: externalCalls ? Number((externalErrors / externalCalls * 100).toFixed(1)) : 0 }, providers: externalProviders },
     quotas: quotaUsage, optimization, trend: trend.map(row => ({ ...row, calls: number(row.calls), errors: number(row.errors), units: number(row.units), cost: number(row.cost) })),
   }, { headers: { 'Cache-Control': 'no-store', 'x-request-id': actor.requestId } })
 }

@@ -117,6 +117,7 @@ model User {
   broadcastDeliveries         AdminBroadcastDelivery[]
   aiUsageEvents               AiUsageEvent[]               @relation("AiUsageUser")
   jobApiUsageEvents           JobApiUsageEvent[]           @relation("JobApiUsageUser")
+  externalApiUsageEvents      ExternalApiUsageEvent[]      @relation("ExternalApiUsageUser")
   discoveryOptimizationEvents DiscoveryOptimizationEvent[] @relation("DiscoveryOptimizationUser")
   adminWebAuthnCredentials    AdminWebAuthnCredential[]
   adminWebAuthnChallenges     AdminWebAuthnChallenge[]
@@ -1353,6 +1354,30 @@ model JobApiUsageEvent {
   @@index([credentialSource, createdAt])
   @@index([userId, createdAt])
   @@map("job_api_usage_events")
+}
+
+model ExternalApiUsageEvent {
+  id                String   @id @default(cuid())
+  userId            String?  @map("user_id")
+  provider          String
+  operation         String
+  credentialSource  String   @default("platform") @map("credential_source")
+  requestCount      Int      @default(1) @map("request_count")
+  inputBytes        Int      @default(0) @map("input_bytes")
+  outputBytes       Int      @default(0) @map("output_bytes")
+  estimatedCostUsd  Float    @default(0) @map("estimated_cost_usd")
+  latencyMs         Int      @map("latency_ms")
+  status            String
+  httpStatus        Int?     @map("http_status")
+  errorCode         String?  @map("error_code")
+  createdAt         DateTime @default(now()) @map("created_at")
+  user              User?    @relation("ExternalApiUsageUser", fields: [userId], references: [id], onDelete: SetNull)
+
+  @@index([createdAt, status])
+  @@index([provider, operation, createdAt])
+  @@index([credentialSource, createdAt])
+  @@index([userId, createdAt])
+  @@map("external_api_usage_events")
 }
 
 model ApiQuota {
