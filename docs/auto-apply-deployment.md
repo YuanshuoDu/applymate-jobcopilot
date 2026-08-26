@@ -40,6 +40,10 @@ Set the following Web environment variables in Vercel:
 | `WORKER_CONTROL_URL` | Worker base URL without `/internal/admin/control`; for Fly use `https://applymate-worker.fly.dev` |
 | `WORKER_CONTROL_SECRET` | HMAC secret that exactly matches the Worker secret for admin queue and ATS controls |
 | `MINIMAX_API_KEY` | Platform default model, unless every user brings a key |
+| `PAID_REDIS_KV_REST_API_URL` | Server-only Upstash REST endpoint used for the Redis usage alert |
+| `PAID_REDIS_KV_REST_API_TOKEN` | Server-only Upstash standard REST token; never expose as `NEXT_PUBLIC_*` |
+| `REDIS_COST_PER_100K_COMMANDS` | Pay-as-you-go estimate rate; set to `0.2` for the current `$0.20/100K` rate |
+| `REDIS_COST_ALERT_USD` | Application notification threshold; set to `5` without stopping Redis |
 
 Set the following Worker secrets in Fly.io (or the chosen long-running host):
 
@@ -85,6 +89,13 @@ characters in the password. Do not put `UPSTASH_REDIS_REST_URL` or
 HTTP REST SDK, while BullMQ and ioredis require the Redis protocol endpoint.
 The Web and Worker must point to the same Upstash database so queue state,
 rate limits, pause state, and dead-letter records remain shared.
+
+The application alert reads only Redis `INFO` statistics on the server and
+estimates command cost using `REDIS_COST_PER_100K_COMMANDS`. It creates the
+existing admin alert/incident and notification when `REDIS_COST_ALERT_USD` is
+reached; it never changes the Upstash budget or stops the database. Upstash's
+console remains the billing source of truth, and its `$20` Max Budget is the
+independent hard stop.
 
 The Worker invokes `/api/agent/automations/due`, `/api/notifications/broadcasts/due`,
 and `/api/admin/observability/alerts/evaluate` every five minutes by default.
