@@ -12,6 +12,26 @@ import { aiUsageErrorCode } from '@/lib/ai-usage'
 /** Keep Gmail integration credentials separate from Auth.js Google sign-in rows. */
 export const GMAIL_ACCOUNT_PROVIDER = 'gmail'
 
+type GoogleTokenResponse = {
+  access_token?: unknown
+  expires_in?: unknown
+  error?: unknown
+}
+
+const GOOGLE_REFRESH_ERROR_CODES = new Set([
+  'invalid_grant',
+  'invalid_client',
+  'invalid_request',
+  'unauthorized_client',
+  'temporarily_unavailable',
+])
+
+function refreshErrorCode(status: number, data: GoogleTokenResponse | null): string {
+  const providerCode = typeof data?.error === 'string' ? data.error.trim().toLowerCase() : ''
+  if (GOOGLE_REFRESH_ERROR_CODES.has(providerCode)) return providerCode
+  return status >= 400 ? `http_${status}` : 'provider_error'
+}
+
 export async function findGmailConnection(userId: string) {
   const select = {
     id: true,
@@ -88,7 +108,7 @@ export async function findGmailConnection(userId: string) {
 export async function getGoogleAccessToken(userId: string): Promise<string | null> {
   const account = await findGmailConnection(userId)
   if (!account?.access_token) {
-    console.error('[gmail] getGoogleAccessToken: no access_token in DB for user', userId)
+    console.warn('[gmail] Gmail connection requires reauthorization: no access token')
     return null
   }
 
@@ -97,7 +117,7 @@ export async function getGoogleAccessToken(userId: string): Promise<string | nul
 
   if (isExpired) {
     if (!account.refresh_token) {
-      console.error('[gmail] token expired and no refresh_token — cannot refresh, returning null')
+      console.warn('[gmail] Gmail connection requires reauthorization: no refresh token')
       return null
     }
     try {
@@ -111,9 +131,15 @@ export async function getGoogleAccessToken(userId: string): Promise<string | nul
           grant_type:    'refresh_token',
         }),
       }, { provider: 'google-oauth', operation: 'token_refresh', credentialSource: 'user', userId })
-      const data = await res.json().catch(() => null) as { access_token?: string; expires_in?: number } | null
+      const data = await res.json().catch(() => null) as GoogleTokenResponse | null
+      const accessToken = typeof data?.access_token === 'string' && data.access_token.length > 0
+        ? data.access_token
+        : null
+      const expiresIn = typeof data?.expires_in === 'number' && Number.isFinite(data.expires_in) && data.expires_in > 0
+        ? data.expires_in
+        : 3600
       console.log('[gmail] token refresh response:', { ok: res.ok, status: res.status, hasToken: Boolean(data?.access_token) })
-      if (res.ok && data?.access_token) {
+      if (res.ok && accessToken) {
         await db.account.update({
           where: { id: account.id },
           data:  {
@@ -121,20 +147,20 @@ export async function getGoogleAccessToken(userId: string): Promise<string | nul
             accessTokenEnc: await encryptAccountTokenFields({
               provider: GMAIL_ACCOUNT_PROVIDER,
               providerAccountId: account.providerAccountId,
-              accessToken: data.access_token,
+              accessToken,
             }).then(tokens => tokens.accessTokenEnc),
-            expires_at:   Math.floor(Date.now() / 1000) + (data.expires_in ?? 3600),
+            expires_at:   Math.floor(Date.now() / 1000) + expiresIn,
           },
         })
-        return data.access_token
+        return accessToken
       }
-      console.error('[gmail] refresh returned no access_token', {
+      console.warn('[gmail] Gmail connection requires reauthorization after token refresh', {
         status: res.status,
-        errorCode: res.ok ? 'provider_error' : aiUsageErrorCode(new Error(`HTTP ${res.status}`)),
+        errorCode: refreshErrorCode(res.status, data),
       })
       return null
     } catch (e) {
-      console.error('[gmail] token refresh failed', { errorCode: aiUsageErrorCode(e) })
+      console.warn('[gmail] Gmail token refresh failed; reauthorization may be required', { errorCode: aiUsageErrorCode(e) })
       return null
     }
   }
