@@ -60,4 +60,10 @@ describe('redis usage', () => {
     }, request)).resolves.toMatchObject({ totalCommands: 637273, period: 'instance_lifetime', source: 'upstash_rest_info' })
     expect(request).toHaveBeenNthCalledWith(2, 'https://redis-prod-binding.example.test/info', expect.objectContaining({ headers: { Authorization: 'Bearer redis/password' } }))
   })
+  it('supports standard Upstash/KV aliases and derives the REST host from REDIS_URL', async () => {
+    const request = vi.fn<typeof fetch>().mockResolvedValue(new Response(JSON.stringify({ result: '# Stats\ntotal_commands_processed:12\n' }), { status: 200 }))
+    expect(redisUsageConfig({ KV_REST_API_URL: 'https://redis-alias.example.test/', KV_REST_API_READ_ONLY_TOKEN: 'alias-read-only' })).toMatchObject({ url: 'https://redis-alias.example.test', token: 'alias-read-only' })
+    await expect(readRedisUsage({ REDIS_URL: 'rediss://default:alias%2Fpassword@redis-derived.example.test:6379' }, request)).resolves.toMatchObject({ totalCommands: 12, source: 'upstash_rest_info' })
+    expect(request).toHaveBeenCalledWith('https://redis-derived.example.test/info', expect.objectContaining({ headers: { Authorization: 'Bearer alias/password' } }))
+  })
 })

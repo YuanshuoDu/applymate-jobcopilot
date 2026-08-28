@@ -78,9 +78,21 @@ export function parseRedisManagementMetrics(value: unknown): RedisUsageSnapshot[
   })
 }
 export function redisUsageConfig(env: Environment = process.env) {
-  const url = firstValue(env, ['PAID_REDIS_KV_REST_API_URL', 'UPSTASH_KV_REST_API_URL', 'UPSTASH_REDIS_REST_URL']).replace(/\/$/, '')
-  const readOnlyToken = firstValue(env, ['PAID_REDIS_KV_REST_API_READ_ONLY_TOKEN'])
-  const writeToken = firstValue(env, ['PAID_REDIS_KV_REST_API_TOKEN', 'UPSTASH_KV_REST_API_TOKEN', 'UPSTASH_REDIS_REST_TOKEN'])
+  const redisUrl = firstValue(env, ['PAID_REDIS_REDIS_URL', 'REDIS_URL', 'PAID_REDIS_KV_URL', 'KV_URL'])
+  const configuredUrl = firstValue(env, ['PAID_REDIS_KV_REST_API_URL', 'KV_REST_API_URL', 'UPSTASH_KV_REST_API_URL', 'UPSTASH_REDIS_REST_URL'])
+  const url = (configuredUrl || restUrlFromRedisUrl(redisUrl)).replace(/\/$/, '')
+  const readOnlyToken = firstValue(env, [
+    'PAID_REDIS_KV_REST_API_READ_ONLY_TOKEN',
+    'KV_REST_API_READ_ONLY_TOKEN',
+    'UPSTASH_KV_REST_API_READ_ONLY_TOKEN',
+    'UPSTASH_REDIS_REST_READ_ONLY_TOKEN',
+  ])
+  const writeToken = firstValue(env, [
+    'PAID_REDIS_KV_REST_API_TOKEN',
+    'KV_REST_API_TOKEN',
+    'UPSTASH_KV_REST_API_TOKEN',
+    'UPSTASH_REDIS_REST_TOKEN',
+  ])
   const redisUrlPassword = sameHostRedisPassword(env, url)
   return {
     url,
@@ -100,9 +112,18 @@ export function redisUsageConfig(env: Environment = process.env) {
   }
 }
 
+function restUrlFromRedisUrl(rawRedisUrl: string): string {
+  if (!rawRedisUrl) return ''
+  try {
+    const redis = new URL(rawRedisUrl)
+    if (!['redis:', 'rediss:'].includes(redis.protocol) || !redis.hostname) return ''
+    return `https://${redis.hostname}`
+  } catch { return '' }
+}
+
 /** Extract a Redis URL password only when it is bound to the same REST host. */
 function sameHostRedisPassword(env: Environment, restUrl: string): string {
-  const redisUrl = firstValue(env, ['PAID_REDIS_REDIS_URL', 'REDIS_URL'])
+  const redisUrl = firstValue(env, ['PAID_REDIS_REDIS_URL', 'REDIS_URL', 'PAID_REDIS_KV_URL', 'KV_URL'])
   if (!redisUrl || !restUrl) return ''
   try {
     const redis = new URL(redisUrl)
