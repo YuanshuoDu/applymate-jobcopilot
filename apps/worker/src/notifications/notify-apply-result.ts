@@ -5,7 +5,7 @@
  */
 import { pinnedFetch } from '@jobcopilot/shared'
 import { getPool } from '../db/apply-results.js'
-import { recordWorkerExternalApiUsage } from '../api-usage/external-api-usage.js'
+import { measureWorkerResponseBytes, recordWorkerExternalApiUsage } from '../api-usage/external-api-usage.js'
 
 export interface NotifyApplyResultParams {
   userId: string
@@ -90,7 +90,7 @@ export async function notifyApplyResult(p: NotifyApplyResultParams): Promise<voi
     }),
     signal: AbortSignal.timeout(10_000),
   }).then(async result => {
-    if (process.env.NODE_ENV !== 'test') await recordWorkerExternalApiUsage({ pool: getPool(), userId: p.userId, provider: 'resend', operation: 'apply_result', status: result.ok ? 'success' : 'error', httpStatus: result.status, errorCode: result.ok ? undefined : result.status === 429 ? 'http_429' : result.status >= 500 ? 'http_5xx' : 'http_4xx', latencyMs: Date.now() - startedAt, inputBytes: Buffer.byteLength(JSON.stringify({ to: user.email, subject })) })
+    if (process.env.NODE_ENV !== 'test') await recordWorkerExternalApiUsage({ pool: getPool(), userId: p.userId, provider: 'resend', operation: 'apply_result', status: result.ok ? 'success' : 'error', httpStatus: result.status, errorCode: result.ok ? undefined : result.status === 429 ? 'http_429' : result.status >= 500 ? 'http_5xx' : 'http_4xx', latencyMs: Date.now() - startedAt, inputBytes: Buffer.byteLength(JSON.stringify({ to: user.email, subject })), outputBytes: await measureWorkerResponseBytes(result) })
     return result
   }).catch(async (err: Error) => {
     if (process.env.NODE_ENV !== 'test') await recordWorkerExternalApiUsage({ pool: getPool(), userId: p.userId, provider: 'resend', operation: 'apply_result', status: 'error', errorCode: isTimeoutError(err) ? 'timeout' : 'network_error', latencyMs: Date.now() - startedAt, inputBytes: Buffer.byteLength(JSON.stringify({ to: user.email, subject })) })

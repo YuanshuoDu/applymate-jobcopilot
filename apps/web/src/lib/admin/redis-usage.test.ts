@@ -18,12 +18,25 @@ describe('redis usage', () => {
   })
   it('converts Upstash commands to a pay-as-you-go estimate', async () => {
     const request = vi.fn<typeof fetch>().mockResolvedValue(new Response(JSON.stringify({ result: '# Stats\ntotal_commands_processed:361030\n' }), { status: 200 }))
-    await expect(readRedisUsage({ PAID_REDIS_KV_REST_API_URL: 'https://redis.example.test', PAID_REDIS_KV_REST_API_TOKEN: 'server-token', REDIS_COST_ALERT_USD: '5', REDIS_MAX_BUDGET_USD: '20' }, request)).resolves.toMatchObject({ totalCommands: 361030, estimatedCostUsd: 0.72206, period: 'instance_lifetime', source: 'upstash_rest_info', alertThresholdUsd: 5, maxBudgetUsd: 20, alertTriggered: false })
-    expect(request).toHaveBeenCalledWith('https://redis.example.test/info', expect.objectContaining({ method: 'POST' }))
+    await expect(readRedisUsage({ PAID_REDIS_KV_REST_API_URL: 'https://redis-lifetime.example.test', PAID_REDIS_KV_REST_API_TOKEN: 'server-token', REDIS_COST_ALERT_USD: '5', REDIS_MAX_BUDGET_USD: '20' }, request)).resolves.toMatchObject({ totalCommands: 361030, estimatedCostUsd: 0.72206, period: 'instance_lifetime', source: 'upstash_rest_info', alertThresholdUsd: 5, maxBudgetUsd: 20, alertTriggered: false })
+    expect(request).toHaveBeenCalledWith('https://redis-lifetime.example.test/info', expect.objectContaining({ method: 'POST' }))
   })
   it('does not treat the lifetime INFO estimate as a monthly alert', async () => {
     const request = vi.fn<typeof fetch>().mockResolvedValue(new Response(JSON.stringify({ result: '# Stats\ntotal_commands_processed:2500000\n' }), { status: 200 }))
-    await expect(readRedisUsage({ PAID_REDIS_KV_REST_API_URL: 'https://redis.example.test', PAID_REDIS_KV_REST_API_TOKEN: 'server-token', REDIS_COST_ALERT_USD: '5' }, request)).resolves.toMatchObject({ period: 'instance_lifetime', estimatedCostUsd: 5, alertTriggered: false })
+    await expect(readRedisUsage({ PAID_REDIS_KV_REST_API_URL: 'https://redis-alert.example.test', PAID_REDIS_KV_REST_API_TOKEN: 'server-token', REDIS_COST_ALERT_USD: '5' }, request)).resolves.toMatchObject({ period: 'instance_lifetime', estimatedCostUsd: 5, alertTriggered: false })
+  })
+  it('reuses a successful INFO snapshot within the configured TTL', async () => {
+    const request = vi.fn<typeof fetch>().mockImplementation(async () => new Response(JSON.stringify({ result: '# Stats\ntotal_commands_processed:7\n' }), { status: 200 }))
+    const env = { PAID_REDIS_KV_REST_API_URL: 'https://redis-cache.example.test', PAID_REDIS_KV_REST_API_TOKEN: 'server-token', REDIS_INFO_CACHE_TTL_SECONDS: '600', REDIS_COST_ALERT_USD: '5' }
+    const first = await readRedisUsage(env, request)
+    const second = await readRedisUsage({ ...env, REDIS_COST_ALERT_USD: '1' }, request)
+    expect(request).toHaveBeenCalledTimes(1)
+    expect(second).toMatchObject({ totalCommands: 7, alertThresholdUsd: 1, sampledAt: first?.sampledAt })
+  })
+  it('can disable the INFO fallback to avoid any Redis command', async () => {
+    const request = vi.fn<typeof fetch>()
+    await expect(readRedisUsage({ PAID_REDIS_KV_REST_API_URL: 'https://redis-disabled.example.test', PAID_REDIS_KV_REST_API_TOKEN: 'server-token', REDIS_INFO_FALLBACK_ENABLED: '0' }, request)).resolves.toBeNull()
+    expect(request).not.toHaveBeenCalled()
   })
   it('prefers current-month stats when management credentials are configured', async () => {
     const request = vi.fn<typeof fetch>().mockResolvedValue(new Response(JSON.stringify({ total_monthly_requests: 362926, total_monthly_read_requests: 300000, total_monthly_bandwidth: 4096, total_monthly_billing: 0.725852 }), { status: 200 }))

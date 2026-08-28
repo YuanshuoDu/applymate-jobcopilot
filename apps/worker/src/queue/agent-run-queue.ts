@@ -3,7 +3,7 @@ import { Queue, Worker } from "bullmq";
 import { workerPollingOptions } from "./worker-polling-options.js";
 import { redisConnection } from "../redis.js";
 import { getPool } from "../db/apply-results.js";
-import { recordWorkerExternalApiUsage } from "../api-usage/external-api-usage.js";
+import { measureWorkerResponseBytes, recordWorkerExternalApiUsage } from "../api-usage/external-api-usage.js";
 
 export const AGENT_RUN_QUEUE_NAME = "agent-runs";
 
@@ -42,7 +42,7 @@ export const agentRunWorker = new Worker<AgentRunTaskPayload>(
         body: requestBody,
         signal: AbortSignal.timeout(Number(process.env.AGENT_RUN_TIMEOUT_MS ?? "300000")),
       });
-      if (process.env.NODE_ENV !== "test") await recordWorkerExternalApiUsage({ pool: getPool(), userId: task.data.userId, provider: "internal-worker", operation: "agent_run", status: response.ok ? "success" : "error", httpStatus: response.status, errorCode: response.ok ? undefined : response.status === 429 ? "http_429" : response.status >= 500 ? "http_5xx" : "http_4xx", latencyMs: Date.now() - startedAt, inputBytes: Buffer.byteLength(requestBody) });
+      if (process.env.NODE_ENV !== "test") await recordWorkerExternalApiUsage({ pool: getPool(), userId: task.data.userId, provider: "internal-worker", operation: "agent_run", status: response.ok ? "success" : "error", httpStatus: response.status, errorCode: response.ok ? undefined : response.status === 429 ? "http_429" : response.status >= 500 ? "http_5xx" : "http_4xx", latencyMs: Date.now() - startedAt, inputBytes: Buffer.byteLength(requestBody), outputBytes: await measureWorkerResponseBytes(response) });
     } catch (error) {
       if (process.env.NODE_ENV !== "test") await recordWorkerExternalApiUsage({ pool: getPool(), userId: task.data.userId, provider: "internal-worker", operation: "agent_run", status: "error", errorCode: isTimeoutError(error) ? "timeout" : "network_error", latencyMs: Date.now() - startedAt, inputBytes: Buffer.byteLength(requestBody) });
       throw error;

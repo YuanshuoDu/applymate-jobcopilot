@@ -1,5 +1,5 @@
 import { getPool } from "../db/apply-results.js";
-import { recordWorkerExternalApiUsage } from "../api-usage/external-api-usage.js";
+import { measureWorkerResponseBytes, recordWorkerExternalApiUsage } from "../api-usage/external-api-usage.js";
 import { getWorkerRuntimeState } from "../admin/worker-state.js";
 
 const DEFAULT_INTERVAL_MS = 5 * 60_000;
@@ -113,7 +113,7 @@ export function createAutomationScheduler(config: AutomationSchedulerConfig): Au
             operation: `scheduler_${task.name}`,
             status: response.ok ? "success" : "error",
             httpStatus: response.status,
-            outputBytes: responseBytes(response),
+            outputBytes: await measureWorkerResponseBytes(response),
             errorCode: response.ok ? undefined : httpErrorCode(response.status),
             latencyMs: Date.now() - startedAt,
           });
@@ -160,11 +160,6 @@ export function createAutomationScheduler(config: AutomationSchedulerConfig): Au
       return { ...state };
     },
   };
-}
-
-function responseBytes(response: Response): number {
-  const value = Number(response.headers.get("content-length") ?? 0);
-  return Number.isSafeInteger(value) && value > 0 ? value : 0;
 }
 
 async function defaultSchedulerUsageRecorder(input: Parameters<SchedulerUsageRecorder>[0]): Promise<void> {
