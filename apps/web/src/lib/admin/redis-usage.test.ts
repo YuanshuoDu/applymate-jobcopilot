@@ -48,4 +48,16 @@ describe('redis usage', () => {
   it('prefers the read-only integration token for usage snapshots', () => {
     expect(redisUsageConfig({ PAID_REDIS_KV_REST_API_READ_ONLY_TOKEN: 'read-only', PAID_REDIS_KV_REST_API_TOKEN: 'write-capable' }).token).toBe('read-only')
   })
+  it('tries the same-host Redis URL password when the read-only token is unavailable', async () => {
+    const request = vi.fn<typeof fetch>()
+      .mockResolvedValueOnce(new Response('', { status: 401 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ result: '# Stats\ntotal_commands_processed:637273\n' }), { status: 200 }))
+    await expect(readRedisUsage({
+      PAID_REDIS_KV_REST_API_URL: 'https://redis-prod-binding.example.test',
+      PAID_REDIS_KV_REST_API_READ_ONLY_TOKEN: 'unavailable-token',
+      PAID_REDIS_REDIS_URL: 'rediss://default:redis%2Fpassword@redis-prod-binding.example.test:6379',
+      REDIS_COST_PER_100K_COMMANDS: '0.2',
+    }, request)).resolves.toMatchObject({ totalCommands: 637273, period: 'instance_lifetime', source: 'upstash_rest_info' })
+    expect(request).toHaveBeenNthCalledWith(2, 'https://redis-prod-binding.example.test/info', expect.objectContaining({ headers: { Authorization: 'Bearer redis/password' } }))
+  })
 })
