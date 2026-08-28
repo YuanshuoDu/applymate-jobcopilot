@@ -1322,6 +1322,7 @@ model AiUsageEvent {
   provider         String
   model            String
   credentialSource String   @default("platform") @map("credential_source")
+  runtime          String   @default("unknown")
   inputTokens      Int      @default(0) @map("input_tokens")
   outputTokens     Int      @default(0) @map("output_tokens")
   estimatedCostUsd Float    @default(0) @map("estimated_cost_usd")
@@ -1335,6 +1336,7 @@ model AiUsageEvent {
   @@index([featureKey, createdAt])
   @@index([provider, model, createdAt])
   @@index([credentialSource, createdAt])
+  @@index([runtime, createdAt])
   @@map("ai_usage_events")
 }
 
@@ -1344,6 +1346,7 @@ model JobApiUsageEvent {
   provider           String
   operation          String
   credentialSource   String    @default("public") @map("credential_source")
+  runtime            String    @default("unknown")
   requestCount       Int       @default(1) @map("request_count")
   jobsReturned       Int       @default(0) @map("jobs_returned")
   latencyMs          Int       @map("latency_ms")
@@ -1359,6 +1362,7 @@ model JobApiUsageEvent {
   @@index([provider, operation, createdAt])
   @@index([credentialSource, createdAt])
   @@index([userId, createdAt])
+  @@index([runtime, createdAt])
   @@map("job_api_usage_events")
 }
 

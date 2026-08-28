@@ -167,6 +167,7 @@ export interface AiConfig {
   credentialSource?: 'platform' | 'user'
   usageUserId?: string
   usageFeatureKey?: string
+  usageRuntime?: 'web' | 'worker' | 'admin' | 'unknown'
 }
 
 export type MiniMaxThinkingMode = 'adaptive' | 'disabled'
@@ -261,10 +262,10 @@ export async function modelChat(
   messages:  ChatMessage[],
   config:    AiConfig,
   maxTokens: number = 1024,
-  usageContext?: { userId?: string; featureKey?: string },
+  usageContext?: { userId?: string; featureKey?: string; runtime?: AiConfig['usageRuntime'] },
 ): Promise<ChatResult> {
   const resolved = resolveConfig(config)
-  const effectiveUsage = usageContext ?? { userId: config.usageUserId, featureKey: config.usageFeatureKey }
+  const effectiveUsage = usageContext ?? { userId: config.usageUserId, featureKey: config.usageFeatureKey, runtime: config.usageRuntime }
   const startedAt = Date.now()
   try {
     assertKey(resolved)
@@ -292,10 +293,10 @@ export async function* modelChatStream(
   messages:  ChatMessage[],
   config:    AiConfig,
   maxTokens: number = 1024,
-  usageContext?: { userId?: string; featureKey?: string },
+  usageContext?: { userId?: string; featureKey?: string; runtime?: AiConfig['usageRuntime'] },
 ): AsyncGenerator<string> {
   const resolved = resolveConfig(config)
-  const effectiveUsage = usageContext ?? { userId: config.usageUserId, featureKey: config.usageFeatureKey }
+  const effectiveUsage = usageContext ?? { userId: config.usageUserId, featureKey: config.usageFeatureKey, runtime: config.usageRuntime }
   const startedAt = Date.now()
   try {
     assertKey(resolved)
@@ -656,7 +657,7 @@ export async function loadUserAiConfig(
   featureId: FeatureId,
 ): Promise<AiConfig & { resolvedKey: string }> {
   const settings = await loadUserAiSettings(userId)
-  return { ...resolveFeatureConfig(featureId, settings), usageUserId: userId, usageFeatureKey: featureId }
+  return { ...resolveFeatureConfig(featureId, settings), usageUserId: userId, usageFeatureKey: featureId, usageRuntime: 'web' as const }
 }
 
 export async function loadUserAiSettings(userId: string): Promise<UserAiSettings> {

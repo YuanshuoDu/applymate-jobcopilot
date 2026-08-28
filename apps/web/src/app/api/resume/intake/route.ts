@@ -28,6 +28,7 @@ const MAX_BYTES = 5 * 1024 * 1024 // 5 MB
 export async function POST(req: NextRequest) {
   const auth = await requireAuth(req)
   if (isErrorResponse(auth)) return auth
+  const userId = auth.userId
   const aiAccess = await resolveAiAccess(auth.userId)
   if (aiAccess === 'disabled') return err('This feature is not included in your current plan', 403)
   if (aiAccess === 'exhausted') return err('Monthly AI credits exhausted', 429)
@@ -152,7 +153,7 @@ Rules:
   async function tryParse(): Promise<string> {
     const attempts = [primaryCfg, ...PARSE_FALLBACKS.filter(f =>
       !(f.provider === primaryCfg.provider && f.model === primaryCfg.model)
-    )]
+    ).map(f => ({ ...f, usageUserId: userId, usageFeatureKey: 'parsing', usageRuntime: 'web' as const }))]
     let lastErr: unknown
     for (const attempt of attempts) {
       try {

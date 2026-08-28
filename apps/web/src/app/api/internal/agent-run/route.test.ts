@@ -63,6 +63,7 @@ describe("POST /api/internal/agent-run", () => {
     });
     expect(mocks.runAgentPipeline).toHaveBeenCalledWith(expect.objectContaining({
       userId: "user_1", sessionId: "session_1", autonomous: true,
+      aiConfig: expect.objectContaining({ usageUserId: "user_1", usageFeatureKey: "autoApply", usageRuntime: "worker" }),
     }));
     await expect(response.json()).resolves.toMatchObject({ status: "completed" });
   });

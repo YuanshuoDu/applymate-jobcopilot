@@ -14,7 +14,7 @@
  */
 import type { Job }       from '@prisma/client'
 import { db }             from '@/lib/db'
-import { modelChat }      from '@/lib/model-router'
+import { modelChat, type AiConfig } from '@/lib/model-router'
 import type { CustomAgentObservation, CustomAgentRunResult, PipelineCtx } from '../types'
 
 interface CustomAgentRow {
@@ -80,7 +80,13 @@ export async function runCustomAgents(
 
         const result = await modelChat(
           messages,
-          { provider: agent.provider as any, model: agent.model },
+          {
+            provider: agent.provider as AiConfig['provider'],
+            model: agent.model,
+            usageUserId: userId,
+            usageFeatureKey: roleKey,
+            usageRuntime: ctx.aiConfig.usageRuntime ?? 'web',
+          },
           256,
         )
 

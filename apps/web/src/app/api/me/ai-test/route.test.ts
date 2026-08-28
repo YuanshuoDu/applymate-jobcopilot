@@ -65,7 +65,7 @@ describe('POST /api/me/ai-test', () => {
     expect(mocks.resolveFeatureConfig).toHaveBeenCalledWith('agent', expect.any(Object))
     expect(mocks.modelChat).toHaveBeenCalledWith(
       expect.any(Array),
-      expect.objectContaining({ provider: 'custom', model: 'llama-3.3', apiBase: 'https://llm.example.test/v1', resolvedKey: 'feature-secret' }),
+      expect.objectContaining({ provider: 'custom', model: 'llama-3.3', apiBase: 'https://llm.example.test/v1', resolvedKey: 'feature-secret', usageUserId: 'user_1', usageFeatureKey: 'agent', usageRuntime: 'web' }),
       300,
     )
   })
