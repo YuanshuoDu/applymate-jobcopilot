@@ -67,6 +67,28 @@
 .admin-filter-panel textarea { min-height: 100px; resize: vertical; }
 .admin-filter-panel .admin-primary-button { min-height: 38px; margin: 0; white-space: nowrap; }
 @media (max-width: 700px) { .admin-filter-panel { grid-template-columns: 1fr; }.admin-filter-panel .admin-primary-button { width: 100%; } }
+.admin-application-summary { display: grid; grid-template-columns: repeat(6, minmax(110px, 1fr)); gap: 10px; margin: 0 0 18px; }
+.admin-application-summary article { min-width: 0; padding: 13px 14px; border: 1px solid #e3e7ee; border-radius: 8px; background: #fff; }
+.admin-application-summary span { display: block; overflow: hidden; color: #68758e; font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
+.admin-application-summary strong { display: block; margin-top: 7px; color: #202a43; font-size: 22px; }
+.admin-application-primary, .admin-application-state { display: grid; gap: 3px; min-width: 0; }
+.admin-application-primary small, .admin-application-state small { overflow: hidden; color: #748097; font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
+.admin-status-badge { display: inline-flex; width: fit-content; padding: 3px 7px; border-radius: 999px; background: #eef1f7; color: #526079; font-size: 11px; font-weight: 700; line-height: 1.2; }
+.admin-status-badge[data-status="submitted"] { background: #e5f6ed; color: #167045; }
+.admin-status-badge[data-status="failed"] { background: #fff0f0; color: #a33232; }
+.admin-status-badge[data-status="cancelled"], .admin-status-badge[data-status="skipped"] { background: #f1f2f5; color: #667085; }
+.admin-status-badge[data-status="waiting_for_user"], .admin-status-badge[data-status="waiting_for_authorization"] { background: #fff6dd; color: #8b5b00; }
+.admin-status-badge[data-status="filling"], .admin-status-badge[data-status="analyzing"], .admin-status-badge[data-status="generating_materials"] { background: #eaf1ff; color: #315ea8; }
+.admin-muted { color: #8a94a8; }
+.admin-operation-status { margin: 0 0 14px; padding: 10px 12px; border: 1px solid #cfe7da; border-radius: 7px; background: #f1fbf5; color: #19683f; font-size: 12px; }
+.admin-empty-table { display: grid; gap: 5px; padding: 10px 0; text-align: left; }
+.admin-empty-table strong { color: #2b3650; }
+.admin-empty-table small { color: #748097; }
+.admin-detail-inline { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px 20px; margin: 0; }
+.admin-detail-inline dt { color: #718098; font-size: 11px; }
+.admin-detail-inline dd { margin: 0; color: #29354e; font-size: 13px; font-weight: 600; }
+@media (max-width: 900px) { .admin-application-summary { grid-template-columns: repeat(3, minmax(110px, 1fr)); }.admin-detail-inline { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+@media (max-width: 700px) { .admin-application-summary { grid-template-columns: repeat(2, minmax(110px, 1fr)); }.admin-detail-inline { grid-template-columns: 1fr; } }
 .ats-registry-section { padding-bottom: 20px; }
 .ats-registry-form { display: grid; grid-template-columns: 140px minmax(150px, 1fr) minmax(180px, 1.2fr) 90px auto auto; gap: 12px; align-items: end; margin-bottom: 18px; padding: 16px; border: 1px solid #dfe3f5; border-radius: 8px; background: #fff; }
 .ats-registry-form label { display: grid; gap: 6px; min-width: 0; color: #5e6980; font-size: 12px; font-weight: 600; }

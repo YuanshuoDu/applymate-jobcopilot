@@ -1,8 +1,9 @@
 import { createHmac } from 'node:crypto'
 import { NextRequest, NextResponse } from 'next/server'
-import type { Prisma } from '@prisma/client'
+import { Prisma } from '@prisma/client'
 import { isAdminResponse, requireAdmin } from '@/lib/admin/authorization'
 import { writeAdminAudit } from '@/lib/admin/audit'
+import { applicationErrorClass } from '@/lib/admin/application-dto'
 import { db } from '@/lib/db'
 
 function cell(value: unknown): string { return `"${String(value ?? '').replaceAll('"', '""')}"` }
@@ -70,14 +71,35 @@ export async function GET(request: NextRequest) {
     content = csv(['ats_type', 'applications', 'successes', 'direct_apply', 'direct_successes', 'avg_duration_ms'], rows.map(row => [row.atsType, row.calls, row.successes, row.directCalls, row.directSuccesses, row.avgDuration ?? 0]))
     filename = 'applymate-ats-quality.csv'; rowCount = rows.length
   } else if (resource === 'applications') {
-    const ids = requestedIds.map(Number).filter(Number.isInteger)
     const status = request.nextUrl.searchParams.get('status')?.trim()
+    const outcome = request.nextUrl.searchParams.get('outcome')?.trim()
     const mode = request.nextUrl.searchParams.get('mode')?.trim()
     const atsType = request.nextUrl.searchParams.get('atsType')?.trim()
-    const where: Prisma.ApplyResultWhereInput = { ...(ids.length ? { id: { in: ids } } : {}), ...(status ? { status } : {}), ...(mode ? { mode } : {}), ...(atsType ? { atsType } : {}) }
-    const orderBy: Prisma.ApplyResultOrderByWithRelationInput = sort === 'status' ? { status: direction } : sort === 'durationMs' ? { durationMs: direction } : { createdAt: direction }
-    const rows = await db.applyResult.findMany({ where, orderBy, take: limit, select: { id: true, status: true, mode: true, atsType: true, flowUsed: true, durationMs: true, createdAt: true } })
-    content = csv(['id', 'status', 'mode', 'ats_type', 'flow_used', 'duration_ms', 'created_at'], rows.map(row => [row.id, row.status, row.mode, row.atsType, row.flowUsed, row.durationMs, row.createdAt.toISOString()]))
+    const resultWhere: Prisma.ApplyResultWhereInput = { ...(outcome ? { status: outcome } : {}), ...(mode ? { mode } : {}), ...(atsType ? { atsType } : {}) }
+    const latestResultTaskIds = outcome || mode || atsType
+      ? (await db.$queryRaw<Array<{ id: string }>>(Prisma.sql`
+          SELECT task.id
+          FROM application_tasks task
+          JOIN LATERAL (
+            SELECT result.status, result.mode, result.ats_type
+            FROM apply_results result
+            WHERE result.job_id = task.job_id AND result.user_id = task.user_id
+            ORDER BY result.created_at DESC, result.id DESC
+            LIMIT 1
+          ) latest ON TRUE
+          WHERE (${outcome || null}::text IS NULL OR latest.status = ${outcome || null})
+            AND (${mode || null}::text IS NULL OR latest.mode = ${mode || null})
+            AND (${atsType || null}::text IS NULL OR latest.ats_type = ${atsType || null})
+        `)).map(row => row.id)
+      : undefined
+    const filters: Prisma.ApplicationTaskWhereInput[] = []
+    if (query) filters.push({ OR: [{ id: { contains: query, mode: 'insensitive' } }, { userId: { contains: query, mode: 'insensitive' } }, { jobId: { contains: query, mode: 'insensitive' } }, { job: { is: { OR: [{ company: { contains: query, mode: 'insensitive' } }, { role: { contains: query, mode: 'insensitive' } }] } } }] })
+    if (outcome || mode || atsType) filters.push({ job: { is: { applyResults: { some: resultWhere } } } })
+    const taskIds = latestResultTaskIds ? (requestedIds.length ? requestedIds.filter(id => latestResultTaskIds.includes(id)) : latestResultTaskIds) : requestedIds
+    const where: Prisma.ApplicationTaskWhereInput = { ...(taskIds.length ? { id: { in: taskIds } } : latestResultTaskIds ? { id: { in: [] } } : {}), ...(status ? { status } : {}), ...(filters.length ? { AND: filters } : {}) }
+    const orderBy: Prisma.ApplicationTaskOrderByWithRelationInput = sort === 'status' ? { status: direction } : sort === 'createdAt' ? { createdAt: direction } : { updatedAt: direction }
+    const rows = await db.applicationTask.findMany({ where, orderBy, take: limit, select: { id: true, status: true, checkpoint: true, error: true, createdAt: true, updatedAt: true, job: { select: { applyResults: { orderBy: { createdAt: 'desc' }, take: 1, select: { status: true, mode: true, atsType: true, flowUsed: true, error: true, durationMs: true, createdAt: true } } } } } })
+    content = csv(['task_id', 'status', 'checkpoint', 'error_class', 'outcome', 'mode', 'ats_type', 'flow_used', 'result_error_class', 'duration_ms', 'created_at', 'updated_at', 'result_created_at'], rows.map(row => { const result = row.job.applyResults[0]; return [row.id, row.status, row.checkpoint, applicationErrorClass(row.error), result?.status, result?.mode, result?.atsType, result?.flowUsed, applicationErrorClass(result?.error ?? null), result?.durationMs, row.createdAt.toISOString(), row.updatedAt.toISOString(), result?.createdAt.toISOString()] }))
     filename = 'applymate-applications.csv'; rowCount = rows.length
   } else if (resource === 'ai-budgets') {
     const where: Prisma.AiBudgetWhereInput = { ...(requestedIds.length ? { id: { in: requestedIds } } : {}), ...(query ? { OR: [{ userId: { contains: query, mode: 'insensitive' } }, { month: { contains: query, mode: 'insensitive' } }] } : {}) }
