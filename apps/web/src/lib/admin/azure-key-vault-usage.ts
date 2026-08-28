@@ -124,6 +124,20 @@ export function azureKeyVaultMaxBudget(env: Environment = process.env): number |
 const defaultRequest: AzureRequest = (url, init) => pinnedFetch(url, init)
 const defaultToken: AzureTokenProvider = () => getAzureManagementToken()
 
+async function readJson(request: AzureRequest, url: string, init: Parameters<AzureRequest>[1]): Promise<unknown | null> {
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    try {
+      const response = await request(url, init)
+      if (response.ok) return await response.json() as unknown
+      if (response.status !== 429 || attempt === 1) return null
+      await new Promise(resolve => setTimeout(resolve, 500))
+    } catch {
+      return null
+    }
+  }
+  return null
+}
+
 export async function readAzureKeyVaultUsage(env: Environment = process.env, request: AzureRequest = defaultRequest, tokenProvider: AzureTokenProvider = defaultToken): Promise<AzureKeyVaultUsageSnapshot | null> {
   const config = azureKeyVaultUsageConfig(env)
   if (!config) return null
@@ -139,8 +153,8 @@ export async function readAzureKeyVaultUsage(env: Environment = process.env, req
   const metricUrl = `https://management.azure.com${config.resourceId}/providers/Microsoft.Insights/metrics?${metricParams}`
   const costUrl = config.costScope ? `https://management.azure.com${config.costScope}/providers/Microsoft.CostManagement/query?api-version=${COST_API_VERSION}` : null
   const [metrics, cost] = await Promise.all([
-    request(metricUrl, { headers, signal: AbortSignal.timeout(10_000) }).then(async response => response.ok ? parseAzureMonitorMetrics(await response.json()) : null).catch(() => null),
-    costUrl ? request(costUrl, { method: 'POST', headers: { ...headers, 'content-type': 'application/json' }, body: JSON.stringify({ type: 'ActualCost', timeframe: 'MonthToDate', dataset: { granularity: 'Daily', aggregation: { totalCost: { name: 'PreTaxCost', function: 'Sum' } }, filter: { dimensions: { name: 'ResourceId', operator: 'In', values: [config.resourceId] } } } }), signal: AbortSignal.timeout(10_000) }).then(async response => response.ok ? parseAzureCostManagement(await response.json()) : null).catch(() => null) : Promise.resolve(null),
+    readJson(request, metricUrl, { headers, signal: AbortSignal.timeout(10_000) }).then(parseAzureMonitorMetrics),
+    costUrl ? readJson(request, costUrl, { method: 'POST', headers: { ...headers, 'content-type': 'application/json' }, body: JSON.stringify({ type: 'ActualCost', timeframe: 'MonthToDate', dataset: { granularity: 'Daily', aggregation: { totalCost: { name: 'PreTaxCost', function: 'Sum' } }, filter: { dimensions: { name: 'ResourceId', operator: 'In', values: [config.resourceId] } } } }), signal: AbortSignal.timeout(10_000) }).then(parseAzureCostManagement) : Promise.resolve(null),
   ])
   if (!metrics && !cost) return null
   const snapshot: AzureKeyVaultUsageSnapshot = {

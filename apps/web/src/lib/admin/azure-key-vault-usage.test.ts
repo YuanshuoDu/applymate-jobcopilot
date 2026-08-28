@@ -35,4 +35,17 @@ describe('Azure Key Vault usage', () => {
     expect(azureKeyVaultUsageConfig({ AZURE_KEY_VAULT_RESOURCE_ID: '/subscriptions/not-valid' })).toBeNull()
     expect(azureKeyVaultCostAlert({ AZURE_COST_ALERT_USD: '5' })).toBe(5)
   })
+
+  it('retries one rate-limited platform request', async () => {
+    const retryResource = `${resourceId}-retry`
+    let costAttempts = 0
+    const request = vi.fn<typeof fetch>().mockImplementation(async (url) => {
+      if (String(url).includes('CostManagement') && costAttempts++ === 0) return response({}, 429)
+      return String(url).includes('CostManagement')
+        ? response({ properties: { columns: [{ name: 'PreTaxCost' }, { name: 'Currency' }], rows: [[1, 'USD']] } })
+        : response({ value: [] })
+    })
+    await expect(readAzureKeyVaultUsage({ AZURE_KEY_VAULT_RESOURCE_ID: retryResource, AZURE_SUBSCRIPTION_ID: '11111111-1111-4111-8111-111111111111' }, request, async () => 'arm-token')).resolves.toMatchObject({ cost: 1, currency: 'USD' })
+    expect(request).toHaveBeenCalledTimes(3)
+  })
 })
