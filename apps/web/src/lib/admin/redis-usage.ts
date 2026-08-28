@@ -1,3 +1,5 @@
+import { pinnedFetch } from '@jobcopilot/shared'
+
 export interface RedisUsageSnapshot {
   available: boolean
   totalCommands: number
@@ -16,9 +18,22 @@ type Environment = Record<string, string | undefined>
 type RedisInfoResponse = { result?: unknown }
 type RedisRequest = (url: string, init?: { method?: string; headers?: Record<string, string>; signal?: AbortSignal }) => Promise<Response>
 const DEFAULT_COST_PER_100K_COMMANDS = 0.2
+const DEFAULT_INFO_CACHE_TTL_SECONDS = 15 * 60
+const MIN_INFO_CACHE_TTL_SECONDS = 60
+const MAX_INFO_CACHE_TTL_SECONDS = 24 * 60 * 60
+
+type RedisInfoCache = { key: string; expiresAt: number; snapshot: RedisUsageSnapshot }
+let infoCache: RedisInfoCache | null = null
 
 function firstValue(env: Environment, names: string[]): string { return names.map(name => env[name]?.trim()).find(Boolean) ?? '' }
 function costPer100KCommands(env: Environment): number { const configured = Number(env.REDIS_COST_PER_100K_COMMANDS); return Number.isFinite(configured) && configured >= 0 ? configured : DEFAULT_COST_PER_100K_COMMANDS }
+function infoCacheTtlSeconds(env: Environment): number {
+  const configured = Number(env.REDIS_INFO_CACHE_TTL_SECONDS)
+  return Number.isFinite(configured) && configured >= MIN_INFO_CACHE_TTL_SECONDS
+    ? Math.min(Math.trunc(configured), MAX_INFO_CACHE_TTL_SECONDS)
+    : DEFAULT_INFO_CACHE_TTL_SECONDS
+}
+function infoFallbackEnabled(env: Environment): boolean { return env.REDIS_INFO_FALLBACK_ENABLED?.trim() !== '0' }
 function infoNumber(info: string, key: string): number { const match = info.match(new RegExp(`(?:^|\\n)${key}:(\\d+)(?:\\r?\\n|$)`)); const value = Number(match?.[1] ?? 0); return Number.isSafeInteger(value) && value >= 0 ? value : 0 }
 export function parseRedisInfo(info: string): Pick<RedisUsageSnapshot, 'totalCommands' | 'inputBytes' | 'outputBytes'> | null {
   if (!/(?:^|\n)total_commands_processed:\d+(?:\r?\n|$)/.test(info)) return null
@@ -70,11 +85,15 @@ export function redisUsageConfig(env: Environment = process.env) {
     managementEmail: firstValue(env, ['UPSTASH_API_EMAIL']),
     managementKey: firstValue(env, ['UPSTASH_API_KEY']),
     costPer100KCommands: costPer100KCommands(env),
+    infoCacheTtlSeconds: infoCacheTtlSeconds(env),
+    infoFallbackEnabled: infoFallbackEnabled(env),
   }
 }
 export function redisCostAlertThreshold(env: Environment = process.env): number | null { const configured = Number(env.REDIS_COST_ALERT_USD); return Number.isFinite(configured) && configured > 0 ? configured : null }
 export function redisMaxBudget(env: Environment = process.env): number | null { const configured = Number(env.REDIS_MAX_BUDGET_USD); return Number.isFinite(configured) && configured > 0 ? configured : null }
-export async function readRedisUsage(env: Environment = process.env, request: RedisRequest = (url, init) => pinnedFetch(url, init)): Promise<RedisUsageSnapshot | null> {
+const defaultRedisRequest: RedisRequest = (url, init) => pinnedFetch(url, init)
+
+export async function readRedisUsage(env: Environment = process.env, request: RedisRequest = defaultRedisRequest): Promise<RedisUsageSnapshot | null> {
   const config = redisUsageConfig(env)
   const alertThresholdUsd = redisCostAlertThreshold(env)
   const maxBudgetUsd = redisMaxBudget(env)
@@ -92,7 +111,11 @@ export async function readRedisUsage(env: Environment = process.env, request: Re
       }
     } catch { /* Fall back to the database REST INFO endpoint below. */ }
   }
-  if (!config.url || !config.token) return null
+  if (!config.infoFallbackEnabled || !config.url || !config.token) return null
+  const cacheKey = config.url
+  if (infoCache && infoCache.key === cacheKey && infoCache.expiresAt > Date.now()) {
+    return { ...infoCache.snapshot, alertThresholdUsd, maxBudgetUsd }
+  }
   try {
     const response = await request(`${config.url}/info`, { method: 'POST', headers: { Authorization: `Bearer ${config.token}` }, signal: AbortSignal.timeout(10_000) })
     if (!response.ok) return null
@@ -104,7 +127,8 @@ export async function readRedisUsage(env: Environment = process.env, request: Re
     // INFO exposes an instance-lifetime counter, so it cannot prove a monthly
     // budget breach. Keep the estimate visible, but defer alerting to the
     // current-month management-stats path.
-    return { available: true, ...parsed, estimatedCostUsd, sampledAt: new Date().toISOString(), period: 'instance_lifetime', source: 'upstash_rest_info', alertThresholdUsd, maxBudgetUsd, alertTriggered: false, metrics: [] }
+    const snapshot: RedisUsageSnapshot = { available: true, ...parsed, estimatedCostUsd, sampledAt: new Date().toISOString(), period: 'instance_lifetime', source: 'upstash_rest_info', alertThresholdUsd, maxBudgetUsd, alertTriggered: false, metrics: [] }
+    infoCache = { key: cacheKey, expiresAt: Date.now() + config.infoCacheTtlSeconds * 1000, snapshot }
+    return snapshot
   } catch { return null }
 }
-import { pinnedFetch } from '@jobcopilot/shared'

@@ -51,6 +51,8 @@ Set the following Web environment variables in Vercel:
 | `REDIS_COST_PER_100K_COMMANDS` | Pay-as-you-go estimate rate; set to `0.2` for the current `$0.20/100K` rate |
 | `REDIS_COST_ALERT_USD` | Application notification threshold; set to `5` without stopping Redis |
 | `REDIS_MAX_BUDGET_USD` | Documents the provider-side Max Budget cap; set to `20` and enforce it in the Upstash console |
+| `REDIS_INFO_CACHE_TTL_SECONDS` | Successful Redis `INFO` fallback cache lifetime; defaults to `900` (15 minutes), bounded to 60 seconds–24 hours |
+| `REDIS_INFO_FALLBACK_ENABLED` | Set to `0` to disable the command-based INFO fallback when management stats are available |
 | `NEON_API_KEY` | Server-only Neon API key for current-month consumption metrics |
 | `NEON_ORG_ID` | Neon organization ID required by the consumption endpoint |
 | `NEON_PROJECT_ID` | Optional Neon project scope for project-level fallback metrics |
@@ -110,7 +112,10 @@ telemetry and cannot trigger the monthly application alert. With current-month
 management stats, `REDIS_COST_ALERT_USD` creates the existing admin
 alert/incident and notification; it never changes the Upstash budget or stops
 the database. Upstash's console remains the billing source of truth, and its
-`$20` Max Budget is the independent hard stop.
+`$20` Max Budget is the independent hard stop. The INFO fallback is cached for
+15 minutes by default (`REDIS_INFO_CACHE_TTL_SECONDS`, bounded to 60 seconds–24
+hours), so a dashboard refresh does not issue a Redis command every minute; set
+`REDIS_INFO_FALLBACK_ENABLED=0` to disable it.
 
 The Worker invokes `/api/agent/automations/due`, `/api/notifications/broadcasts/due`,
 and `/api/admin/observability/alerts/evaluate` every five minutes by default.
