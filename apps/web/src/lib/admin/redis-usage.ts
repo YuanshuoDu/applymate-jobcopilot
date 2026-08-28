@@ -80,7 +80,10 @@ export function parseRedisManagementMetrics(value: unknown): RedisUsageSnapshot[
 export function redisUsageConfig(env: Environment = process.env) {
   return {
     url: firstValue(env, ['PAID_REDIS_KV_REST_API_URL', 'UPSTASH_KV_REST_API_URL', 'UPSTASH_REDIS_REST_URL']).replace(/\/$/, ''),
-    token: firstValue(env, ['PAID_REDIS_KV_REST_API_TOKEN', 'UPSTASH_KV_REST_API_TOKEN', 'UPSTASH_REDIS_REST_TOKEN']),
+    // Prefer the integration's read-only token for usage snapshots. The
+    // write-capable token remains a compatibility fallback for deployments
+    // created before Upstash exposed a dedicated read-only credential.
+    token: firstValue(env, ['PAID_REDIS_KV_REST_API_READ_ONLY_TOKEN', 'PAID_REDIS_KV_REST_API_TOKEN', 'UPSTASH_KV_REST_API_TOKEN', 'UPSTASH_REDIS_REST_TOKEN']),
     databaseId: firstValue(env, ['PAID_REDIS_DATABASE_ID', 'UPSTASH_REDIS_DATABASE_ID']),
     managementEmail: firstValue(env, ['UPSTASH_API_EMAIL']),
     managementKey: firstValue(env, ['UPSTASH_API_KEY']),

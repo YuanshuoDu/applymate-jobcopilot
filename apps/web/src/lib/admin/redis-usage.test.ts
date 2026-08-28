@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest'
-import { parseRedisInfo, parseRedisManagementMetrics, parseRedisManagementStats, readRedisUsage, redisCostAlertThreshold, redisMaxBudget } from './redis-usage'
+import { parseRedisInfo, parseRedisManagementMetrics, parseRedisManagementStats, readRedisUsage, redisCostAlertThreshold, redisMaxBudget, redisUsageConfig } from './redis-usage'
 
 describe('redis usage', () => {
   it('parses counters without retaining the INFO response', () => {
@@ -45,4 +45,7 @@ describe('redis usage', () => {
   })
   it('does not call Redis without server credentials', async () => { const request = vi.fn<typeof fetch>(); await expect(readRedisUsage({}, request)).resolves.toBeNull(); expect(request).not.toHaveBeenCalled() })
   it('accepts a positive application alert and budget cap', () => { expect(redisCostAlertThreshold({ REDIS_COST_ALERT_USD: '5' })).toBe(5); expect(redisMaxBudget({ REDIS_MAX_BUDGET_USD: '20' })).toBe(20) })
+  it('prefers the read-only integration token for usage snapshots', () => {
+    expect(redisUsageConfig({ PAID_REDIS_KV_REST_API_READ_ONLY_TOKEN: 'read-only', PAID_REDIS_KV_REST_API_TOKEN: 'write-capable' }).token).toBe('read-only')
+  })
 })
