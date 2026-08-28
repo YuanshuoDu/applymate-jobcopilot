@@ -15,6 +15,8 @@ const metricOptions = [
   ['ai_error_rate', 'AI error rate'],
   ['ai_cost_usd', 'AI cost'],
   ['redis_cost_usd', 'Redis estimated cost'],
+  ['neon_cost_usd', 'Neon estimated cost'],
+  ['azure_key_vault_cost_usd', 'Azure Key Vault actual cost'],
   ['queue_stuck_jobs', 'Stuck queue jobs'],
   ['queue_failed_jobs', 'Failed queue jobs'],
   ['queue_dead_letter_jobs', 'Dead-letter queue jobs'],
