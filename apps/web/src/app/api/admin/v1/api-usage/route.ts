@@ -13,10 +13,9 @@ type JobRow = { provider: string; operation: string; credentialSource: string; c
 type AiRow = { provider: string; model: string; credentialSource: string; calls: number; inputTokens: number; outputTokens: number; cost: number; errors: number; avgLatency: number | null; lastEventAt: Date | null }
 type ExternalRow = { provider: string; operation: string; credentialSource: string; calls: number; inputBytes: number; outputBytes: number; cost: number; errors: number; avgLatency: number | null; lastEventAt: Date | null }
 type TrendRow = { day: Date; category: string; calls: number; errors: number; units: number; cost: number }
-type UserSummaryRow = { userId: string; category: 'job' | 'ai'; calls: number; jobs: number; tokens: number; cost: number; errors: number; avgLatency: number | null; lastEventAt: Date | null }
+type UserSummaryRow = { userId: string; category: 'job' | 'ai' | 'external'; calls: number; jobs: number; tokens: number; bytes: number; cost: number; errors: number; avgLatency: number | null; lastEventAt: Date | null }
 type UserDetailRow = UserSummaryRow & { provider: string; operationModel: string; featureKey: string | null; runtime: string; credentialSource: string }
 type OptimizationRow = { eventType: string; provider: string | null; events: number; requestsAvoided: number; jobsReturned: number; netNewJobs: number; validApplyUrls: number; completeDescriptions: number }
-
 const number = (value: unknown) => Number(value ?? 0)
 const latestEvent = (rows: Array<{ lastEventAt: Date | string | null }>) => rows.reduce<Date | null>((latest, row) => {
   if (!row.lastEventAt) return latest
@@ -29,7 +28,6 @@ function configuredExternalCost(provider: string): boolean {
   const value = Number(process.env[key])
   return Number.isFinite(value) && value > 0
 }
-
 function externalCostKnown(provider: (typeof EXTERNAL_API_PROVIDERS)[number]): boolean {
   if (provider.billing === 'free') return true
   if (provider.billing === 'unknown') return false
@@ -118,7 +116,7 @@ export async function GET(request: NextRequest) {
     db.$queryRaw<UserSummaryRow[]>`
       SELECT user_id AS "userId", 'job' AS category,
         SUM(request_count)::int AS calls, SUM(jobs_returned)::int AS jobs,
-        0::int AS tokens, 0::float AS cost,
+        0::int AS tokens, 0::int AS bytes, 0::float AS cost,
         COUNT(*) FILTER (WHERE status = 'error')::int AS errors,
         ROUND(AVG(latency_ms))::int AS "avgLatency", MAX(created_at) AS "lastEventAt"
       FROM job_api_usage_events
@@ -127,19 +125,24 @@ export async function GET(request: NextRequest) {
       UNION ALL
       SELECT user_id AS "userId", 'ai' AS category,
         COUNT(*)::int AS calls, 0::int AS jobs,
-        SUM(input_tokens + output_tokens)::int AS tokens,
+        SUM(input_tokens + output_tokens)::int AS tokens, 0::int AS bytes,
         COALESCE(SUM(estimated_cost_usd), 0)::float AS cost,
         COUNT(*) FILTER (WHERE status = 'error')::int AS errors,
         ROUND(AVG(latency_ms))::int AS "avgLatency", MAX(created_at) AS "lastEventAt"
       FROM ai_usage_events
       WHERE user_id IS NOT NULL AND created_at >= ${since} ${aiProviderFilter}
       GROUP BY user_id
+      UNION ALL
+      SELECT user_id AS "userId", 'external' AS category, SUM(request_count)::int AS calls, 0::int AS jobs,
+        0::int AS tokens, SUM(input_bytes + output_bytes)::int AS bytes, COALESCE(SUM(estimated_cost_usd), 0)::float AS cost,
+        COUNT(*) FILTER (WHERE status = 'error')::int AS errors, ROUND(AVG(latency_ms))::int AS "avgLatency", MAX(created_at) AS "lastEventAt"
+      FROM external_api_usage_events WHERE user_id IS NOT NULL AND created_at >= ${since} ${externalProviderFilter} GROUP BY user_id
       ORDER BY "lastEventAt" DESC`,
     selectedUserId ? db.$queryRaw<UserDetailRow[]>`
       SELECT user_id AS "userId", 'job' AS category, provider,
         operation AS "operationModel", NULL::text AS "featureKey", runtime,
         credential_source AS "credentialSource", SUM(request_count)::int AS calls,
-        SUM(jobs_returned)::int AS jobs, 0::int AS tokens, 0::float AS cost,
+        SUM(jobs_returned)::int AS jobs, 0::int AS tokens, 0::int AS bytes, 0::float AS cost,
         COUNT(*) FILTER (WHERE status = 'error')::int AS errors,
         ROUND(AVG(latency_ms))::int AS "avgLatency", MAX(created_at) AS "lastEventAt"
       FROM job_api_usage_events
@@ -149,13 +152,19 @@ export async function GET(request: NextRequest) {
       SELECT user_id AS "userId", 'ai' AS category, provider,
         model AS "operationModel", feature_key AS "featureKey", runtime,
         credential_source AS "credentialSource", COUNT(*)::int AS calls,
-        0::int AS jobs, SUM(input_tokens + output_tokens)::int AS tokens,
+        0::int AS jobs, SUM(input_tokens + output_tokens)::int AS tokens, 0::int AS bytes,
         COALESCE(SUM(estimated_cost_usd), 0)::float AS cost,
         COUNT(*) FILTER (WHERE status = 'error')::int AS errors,
         ROUND(AVG(latency_ms))::int AS "avgLatency", MAX(created_at) AS "lastEventAt"
       FROM ai_usage_events
       WHERE user_id = ${selectedUserId} AND created_at >= ${since} ${aiProviderFilter}
       GROUP BY user_id, provider, model, feature_key, runtime, credential_source
+      UNION ALL
+      SELECT user_id AS "userId", 'external' AS category, provider, operation AS "operationModel",
+        NULL::text AS "featureKey", 'unknown' AS runtime, credential_source AS "credentialSource", SUM(request_count)::int AS calls,
+        0::int AS jobs, 0::int AS tokens, SUM(input_bytes + output_bytes)::int AS bytes, COALESCE(SUM(estimated_cost_usd), 0)::float AS cost,
+        COUNT(*) FILTER (WHERE status = 'error')::int AS errors, ROUND(AVG(latency_ms))::int AS "avgLatency", MAX(created_at) AS "lastEventAt"
+      FROM external_api_usage_events WHERE user_id = ${selectedUserId} AND created_at >= ${since} ${externalProviderFilter} GROUP BY user_id, provider, operation, credential_source
       ORDER BY "lastEventAt" DESC` : Promise.resolve([] as UserDetailRow[]),
     db.apiQuota.findMany({ where: { enabled: true, ...(provider ? { provider } : {}) }, orderBy: [{ category: 'asc' }, { provider: 'asc' }, { operation: 'asc' }] }),
     loadOptimizationRows(since, provider),
