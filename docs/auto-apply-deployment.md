@@ -20,7 +20,9 @@ Apply pending Prisma migrations before deploying this version. The auto-apply
 workflow needs the queued/submitting states and control-plane tables; the
 admin-settings work also needs `20260603170000_add_ai_budget` and
 `20260807110000_add_user_preferences_admin_permission`. `migrate deploy`
-applies every missing migration in order.
+applies every missing migration in order. When using a Neon pooled runtime URL,
+set `DIRECT_DATABASE_URL` to the direct endpoint for this migration step; the
+Vercel build script prefers it without changing the runtime `DATABASE_URL`.
 
 ```powershell
 pnpm --filter @jobcopilot/web exec prisma migrate status
@@ -32,6 +34,7 @@ Set the following Web environment variables in Vercel:
 | Variable | Purpose |
 | --- | --- |
 | `DATABASE_URL` | Production Neon/Postgres database |
+| `DIRECT_DATABASE_URL` | Optional direct Neon/Postgres URL used by Prisma migrations; keep `DATABASE_URL` pooled for runtime traffic |
 | `REDIS_URL` | Same Redis instance used by the Worker |
 | `CRON_SECRET` | Vercel's daily Gmail-sync Cron authentication secret |
 | `AGENT_AUTOMATION_CRON_SECRET` | Shared secret for the Worker to invoke due automations |
