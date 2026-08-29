@@ -53,6 +53,8 @@ export const EXPECTED_MIGRATIONS = [
   '20260824160000_add_discovery_optimization',
   '20260826120000_add_external_api_usage',
   '20260826120000_backfill_ai_budgets_from_usage',
+  '20260826133000_make_ats_registry_operational',
+  '20260826143000_add_api_usage_runtime',
 ] as const
 
 export const RLS_TABLES = [
@@ -60,6 +62,7 @@ export const RLS_TABLES = [
   'user_feature_overrides', 'Job', 'application_tasks', 'application_task_events',
   'Resume', 'ResumeVersion', 'persona_facts', 'persona_evidence_chunks', 'Activity',
   'user_api_keys', 'AgentConfig', 'AgentRole', 'apply_results', 'ai_budgets',
+  'form_patterns', 'ai_usage_events', 'external_api_usage_events',
   'job_api_usage_events', 'discovery_optimization_events', 'ai_budget_adjustments', 'ai_budget_reset_requests', 'notifications', 'gmail_sync_states',
   'gmail_messages', 'gmail_recommendations', 'AgentRunQuestion', 'agent_runs',
   'agent_executions', 'agent_sessions', 'sub_agent_tasks', 'agent_transcript_events',

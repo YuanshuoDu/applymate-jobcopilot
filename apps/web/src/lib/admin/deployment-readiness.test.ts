@@ -14,6 +14,7 @@ vi.mock('@/lib/db', () => ({
 
 import type { PlatformIntegrationStatus } from './integration-status'
 import { EXPECTED_MIGRATIONS, getDeploymentReadiness } from './deployment-readiness'
+import { RLS_TABLES } from './deployment-readiness-manifest'
 
 function integrations(overrides: Partial<PlatformIntegrationStatus['infrastructure']> = {}): PlatformIntegrationStatus {
   return {
@@ -46,6 +47,18 @@ describe('deployment readiness', () => {
     vi.stubEnv('DATABASE_URL', 'postgresql://readiness.test/db')
     mocks.queryRaw.mockReset()
     mocks.findRole.mockReset()
+  })
+
+  it('keeps the readiness manifest aligned with the latest migration and RLS inventories', () => {
+    expect(EXPECTED_MIGRATIONS).toEqual(expect.arrayContaining([
+      '20260826133000_make_ats_registry_operational',
+      '20260826143000_add_api_usage_runtime',
+    ]))
+    expect(RLS_TABLES).toEqual(expect.arrayContaining([
+      'form_patterns',
+      'ai_usage_events',
+      'external_api_usage_events',
+    ]))
   })
 
   it('reports ready when required migrations, role permission, actor permission, and worker control are ready', async () => {
