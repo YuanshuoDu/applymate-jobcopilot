@@ -78,12 +78,31 @@ export function parseRedisManagementMetrics(value: unknown): RedisUsageSnapshot[
   })
 }
 export function redisUsageConfig(env: Environment = process.env) {
+  const redisUrl = firstValue(env, ['PAID_REDIS_REDIS_URL', 'REDIS_URL', 'PAID_REDIS_KV_URL', 'KV_URL'])
+  const configuredUrl = firstValue(env, ['PAID_REDIS_KV_REST_API_URL', 'KV_REST_API_URL', 'UPSTASH_KV_REST_API_URL', 'UPSTASH_REDIS_REST_URL'])
+  const url = (configuredUrl || restUrlFromRedisUrl(redisUrl)).replace(/\/$/, '')
+  const readOnlyToken = firstValue(env, [
+    'PAID_REDIS_KV_REST_API_READ_ONLY_TOKEN',
+    'KV_REST_API_READ_ONLY_TOKEN',
+    'UPSTASH_KV_REST_API_READ_ONLY_TOKEN',
+    'UPSTASH_REDIS_REST_READ_ONLY_TOKEN',
+  ])
+  const writeToken = firstValue(env, [
+    'PAID_REDIS_KV_REST_API_TOKEN',
+    'KV_REST_API_TOKEN',
+    'UPSTASH_KV_REST_API_TOKEN',
+    'UPSTASH_REDIS_REST_TOKEN',
+  ])
+  const redisUrlPassword = sameHostRedisPassword(env, url)
   return {
-    url: firstValue(env, ['PAID_REDIS_KV_REST_API_URL', 'UPSTASH_KV_REST_API_URL', 'UPSTASH_REDIS_REST_URL']).replace(/\/$/, ''),
+    url,
     // Prefer the integration's read-only token for usage snapshots. The
     // write-capable token remains a compatibility fallback for deployments
     // created before Upstash exposed a dedicated read-only credential.
-    token: firstValue(env, ['PAID_REDIS_KV_REST_API_READ_ONLY_TOKEN', 'PAID_REDIS_KV_REST_API_TOKEN', 'UPSTASH_KV_REST_API_TOKEN', 'UPSTASH_REDIS_REST_TOKEN']),
+    token: readOnlyToken || redisUrlPassword || writeToken,
+    readOnlyToken,
+    writeToken,
+    redisUrlPassword,
     databaseId: firstValue(env, ['PAID_REDIS_DATABASE_ID', 'UPSTASH_REDIS_DATABASE_ID']),
     managementEmail: firstValue(env, ['UPSTASH_API_EMAIL']),
     managementKey: firstValue(env, ['UPSTASH_API_KEY']),
@@ -91,6 +110,27 @@ export function redisUsageConfig(env: Environment = process.env) {
     infoCacheTtlSeconds: infoCacheTtlSeconds(env),
     infoFallbackEnabled: infoFallbackEnabled(env),
   }
+}
+
+function restUrlFromRedisUrl(rawRedisUrl: string): string {
+  if (!rawRedisUrl) return ''
+  try {
+    const redis = new URL(rawRedisUrl)
+    if (!['redis:', 'rediss:'].includes(redis.protocol) || !redis.hostname) return ''
+    return `https://${redis.hostname}`
+  } catch { return '' }
+}
+
+/** Extract a Redis URL password only when it is bound to the same REST host. */
+function sameHostRedisPassword(env: Environment, restUrl: string): string {
+  const redisUrl = firstValue(env, ['PAID_REDIS_REDIS_URL', 'REDIS_URL', 'PAID_REDIS_KV_URL', 'KV_URL'])
+  if (!redisUrl || !restUrl) return ''
+  try {
+    const redis = new URL(redisUrl)
+    const rest = new URL(restUrl)
+    if (redis.hostname.toLowerCase() !== rest.hostname.toLowerCase()) return ''
+    return redis.password ? decodeURIComponent(redis.password) : ''
+  } catch { return '' }
 }
 export function redisCostAlertThreshold(env: Environment = process.env): number | null { const configured = Number(env.REDIS_COST_ALERT_USD); return Number.isFinite(configured) && configured > 0 ? configured : null }
 export function redisMaxBudget(env: Environment = process.env): number | null { const configured = Number(env.REDIS_MAX_BUDGET_USD); return Number.isFinite(configured) && configured > 0 ? configured : null }
@@ -119,19 +159,23 @@ export async function readRedisUsage(env: Environment = process.env, request: Re
   if (infoCache && infoCache.key === cacheKey && infoCache.expiresAt > Date.now()) {
     return { ...infoCache.snapshot, alertThresholdUsd, maxBudgetUsd }
   }
-  try {
-    const response = await request(`${config.url}/info`, { method: 'POST', headers: { Authorization: `Bearer ${config.token}` }, signal: AbortSignal.timeout(10_000) })
-    if (!response.ok) return null
-    const body = await response.json() as RedisInfoResponse
-    if (typeof body.result !== 'string') return null
-    const parsed = parseRedisInfo(body.result)
-    if (!parsed) return null
-    const estimatedCostUsd = Number(((parsed.totalCommands / 100_000) * config.costPer100KCommands).toFixed(6))
-    // INFO exposes an instance-lifetime counter, so it cannot prove a monthly
-    // budget breach. Keep the estimate visible, but defer alerting to the
-    // current-month management-stats path.
-    const snapshot: RedisUsageSnapshot = { available: true, ...parsed, estimatedCostUsd, sampledAt: new Date().toISOString(), period: 'instance_lifetime', source: 'upstash_rest_info', alertThresholdUsd, maxBudgetUsd, alertTriggered: false, metrics: [] }
-    infoCache = { key: cacheKey, expiresAt: Date.now() + config.infoCacheTtlSeconds * 1000, snapshot }
-    return snapshot
-  } catch { return null }
+  const infoTokens = [...new Set([config.readOnlyToken, config.redisUrlPassword, config.writeToken, config.token].filter(Boolean))]
+  for (const token of infoTokens) {
+    try {
+      const response = await request(`${config.url}/info`, { method: 'POST', headers: { Authorization: `Bearer ${token}` }, signal: AbortSignal.timeout(10_000) })
+      if (!response.ok) continue
+      const body = await response.json() as RedisInfoResponse
+      if (typeof body.result !== 'string') continue
+      const parsed = parseRedisInfo(body.result)
+      if (!parsed) continue
+      const estimatedCostUsd = Number(((parsed.totalCommands / 100_000) * config.costPer100KCommands).toFixed(6))
+      // INFO exposes an instance-lifetime counter, so it cannot prove a monthly
+      // budget breach. Keep the estimate visible, but defer alerting to the
+      // current-month management-stats path.
+      const snapshot: RedisUsageSnapshot = { available: true, ...parsed, estimatedCostUsd, sampledAt: new Date().toISOString(), period: 'instance_lifetime', source: 'upstash_rest_info', alertThresholdUsd, maxBudgetUsd, alertTriggered: false, metrics: [] }
+      infoCache = { key: cacheKey, expiresAt: Date.now() + config.infoCacheTtlSeconds * 1000, snapshot }
+      return snapshot
+    } catch { /* Try the next credential bound to the same Redis resource. */ }
+  }
+  return null
 }
