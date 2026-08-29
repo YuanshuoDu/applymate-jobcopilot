@@ -51,10 +51,12 @@ describe('unified search precision', () => {
   it('keeps remote-source jobs available when a city is requested', () => {
     const results = postFilter([
       job({ id: 'remote-anywhere', location: 'Anywhere', source: 'jobicy' }),
+      job({ id: 'remote-europe', location: 'Europe', source: 'remotive' }),
       job({ id: 'different-city', location: 'London, United Kingdom', source: 'jobicy' }),
+      job({ id: 'different-region', location: 'USA', source: 'jobicy' }),
     ], { ...baseFilters, location: 'Dublin' })
 
-    expect(results.map(result => result.id)).toEqual(['remote-anywhere'])
+    expect(results.map(result => result.id)).toEqual(['remote-anywhere', 'remote-europe'])
   })
 
   it('preserves distinct junior and senior openings at the same company', () => {
