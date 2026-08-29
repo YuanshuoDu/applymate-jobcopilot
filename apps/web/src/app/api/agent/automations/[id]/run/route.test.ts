@@ -5,7 +5,10 @@ const mocks = vi.hoisted(() => ({
   automationFindFirst: vi.fn(),
   automationUpdateMany: vi.fn(),
   sessionCreate: vi.fn(),
+  sessionFindFirst: vi.fn(),
+  sessionDeleteMany: vi.fn(),
   sessionUpdate: vi.fn(),
+  executionFindFirst: vi.fn(),
   transcriptCreate: vi.fn(),
   executionUpdate: vi.fn(),
   ensureExecution: vi.fn(),
@@ -30,8 +33,8 @@ vi.mock("@/lib/db", () => ({
       findFirst: mocks.automationFindFirst,
       updateMany: mocks.automationUpdateMany,
     },
-    agentSession: { create: mocks.sessionCreate, update: mocks.sessionUpdate },
-    agentExecution: { update: mocks.executionUpdate },
+    agentSession: { create: mocks.sessionCreate, findFirst: mocks.sessionFindFirst, deleteMany: mocks.sessionDeleteMany, update: mocks.sessionUpdate },
+    agentExecution: { findFirst: mocks.executionFindFirst, update: mocks.executionUpdate },
     agentTranscriptEvent: { create: mocks.transcriptCreate },
   },
 }))
@@ -65,6 +68,7 @@ describe("agent automation run API", () => {
       dailyCap: 8,
       requireApproval: true,
       autoApply: true,
+      sessionId: null,
     })
     mocks.sessionCreate.mockResolvedValue({
       id: "session_1",
@@ -78,6 +82,8 @@ describe("agent automation run API", () => {
       updatedAt: new Date("2026-06-18T08:00:00Z"),
       completedAt: null,
     })
+    mocks.sessionFindFirst.mockResolvedValue(null)
+    mocks.sessionDeleteMany.mockResolvedValue({ count: 1 })
     mocks.transcriptCreate.mockResolvedValue({
       id: "event_1",
       sessionId: "session_1",
@@ -157,6 +163,72 @@ describe("agent automation run API", () => {
     expect(res.status).toBe(404)
     await expect(res.json()).resolves.toEqual({ error: "Automation not found" })
     expect(mocks.sessionCreate).not.toHaveBeenCalled()
+  })
+
+  it("reuses the canonical session for a later automation run", async () => {
+    const existing = {
+      id: "session_1",
+      goal: "Run automation: Weekday Berlin SWE Scout",
+      status: "failed",
+      source: "automation",
+      memorySummary: "Dispatch failed",
+      qualityScore: null,
+      currentTaskId: null,
+      createdAt: new Date("2026-06-18T08:00:00Z"),
+      updatedAt: new Date("2026-06-18T08:05:00Z"),
+      completedAt: new Date("2026-06-18T08:05:00Z"),
+    }
+    mocks.automationFindFirst.mockResolvedValueOnce({
+      id: "automation_1",
+      name: "Weekday Berlin SWE Scout",
+      enabled: true,
+      cron: "0 9 * * 1-5",
+      timezone: "Europe/Berlin",
+      triggerType: "weekdays",
+      targetRoles: ["SWE"],
+      targetLocations: ["Berlin"],
+      minScore: 85,
+      dailyCap: 8,
+      requireApproval: true,
+      autoApply: true,
+      sessionId: "session_1",
+    })
+    mocks.sessionFindFirst.mockResolvedValueOnce(existing)
+    mocks.transcriptCreate.mockResolvedValueOnce({
+      id: "event_2", sessionId: "session_1", type: "automation_started", speaker: "Orchestrator",
+      title: "Automation started", body: "Started automation: Weekday Berlin SWE Scout", data: {}, durationMs: null,
+      createdAt: new Date("2026-06-18T09:00:00Z"),
+    })
+    const { POST } = await import("./route")
+
+    const res = await POST(postRequest() as never, ctx())
+
+    expect(res.status).toBe(201)
+    expect(mocks.sessionCreate).not.toHaveBeenCalled()
+    expect(mocks.sessionUpdate).toHaveBeenCalledWith({
+      where: { id: "session_1" },
+      data: { status: "running", completedAt: null, memorySummary: "Automation queued for execution." },
+    })
+    expect(mocks.ensureExecution).toHaveBeenCalledWith({
+      userId: "user_1", sessionId: "session_1", autonomous: true, restartForRun: true,
+    })
+  })
+
+  it("does not queue a second run while the canonical execution is active", async () => {
+    mocks.automationFindFirst.mockResolvedValueOnce({
+      id: "automation_1", name: "Weekday Berlin SWE Scout", enabled: true, cron: null,
+      timezone: "Europe/Berlin", triggerType: "manual", targetRoles: [], targetLocations: [],
+      minScore: 85, dailyCap: 8, requireApproval: true, autoApply: true, sessionId: "session_1",
+    })
+    mocks.executionFindFirst.mockResolvedValueOnce({ status: "running" })
+    const { POST } = await import("./route")
+
+    const res = await POST(postRequest() as never, ctx())
+
+    expect(res.status).toBe(409)
+    await expect(res.json()).resolves.toEqual({ error: "Automation is already running" })
+    expect(mocks.automationUpdateMany).not.toHaveBeenCalled()
+    expect(mocks.enqueueAgentRun).not.toHaveBeenCalled()
   })
 
   it("returns 409 without starting a paused automation", async () => {

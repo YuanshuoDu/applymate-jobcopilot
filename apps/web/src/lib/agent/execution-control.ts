@@ -16,7 +16,31 @@ export class AgentExecutionCancelledError extends Error {
   }
 }
 
-export async function ensureAgentExecution(input: { userId: string; sessionId: string; autonomous?: boolean }) {
+export async function ensureAgentExecution(input: { userId: string; sessionId: string; autonomous?: boolean; restartForRun?: boolean }) {
+  if (input.restartForRun) {
+    const reset = await db.agentExecution.updateMany({
+      where: {
+        userId: input.userId,
+        sessionId: input.sessionId,
+        status: { in: ["completed", "failed", "cancelled"] },
+      },
+      data: {
+        status: "queued",
+        checkpoint: "scout",
+        state: { nextStage: "scout", startedAt: new Date().toISOString(), autonomous: input.autonomous ?? false },
+        error: null,
+        workerTaskId: null,
+        attemptCount: 0,
+        startedAt: null,
+        completedAt: null,
+        cancelledAt: null,
+      },
+    })
+    if (reset.count > 0) {
+      return db.agentExecution.findFirst({ where: { userId: input.userId, sessionId: input.sessionId } })
+    }
+  }
+
   return db.agentExecution.upsert({
     where: { sessionId: input.sessionId },
     create: { userId: input.userId, sessionId: input.sessionId, status: "queued", checkpoint: "scout", state: { nextStage: "scout", startedAt: new Date().toISOString(), autonomous: input.autonomous ?? false } },

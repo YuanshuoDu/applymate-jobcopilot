@@ -4,6 +4,7 @@ import { err, isErrorResponse, ok, requireAuth } from "@/lib/api-helpers"
 import { nextRunAfterCurrent } from "@/lib/agent/automation-schedule"
 import { enqueueAgentRun } from "@/lib/agent-run-queue-client"
 import { ensureAgentExecution } from "@/lib/agent/execution-control"
+import { isActiveAutomationExecution, resolveAutomationSession } from "@/lib/agent/automation-session"
 import { hasEffectiveEntitlement } from '@/lib/entitlements'
 
 type RouteCtx = { params: Promise<{ id: string }> }
@@ -21,6 +22,7 @@ type AutomationForRun = {
   dailyCap: number
   requireApproval: boolean
   autoApply: boolean
+  sessionId: string | null
 }
 
 type SessionRow = {
@@ -85,6 +87,14 @@ export async function POST(req: NextRequest, ctx: RouteCtx) {
   if (!automation) return err("Automation not found", 404)
   if (!automation.enabled) return err("Automation is paused", 409)
 
+  if (automation.sessionId) {
+    const execution = await db.agentExecution.findFirst({
+      where: { userId: auth.userId, sessionId: automation.sessionId },
+      select: { status: true },
+    })
+    if (isActiveAutomationExecution(execution?.status)) return err("Automation is already running", 409)
+  }
+
   const runAt = new Date()
   const claim = await db.agentAutomation.updateMany({
     where: { id, userId: auth.userId, enabled: true },
@@ -95,15 +105,18 @@ export async function POST(req: NextRequest, ctx: RouteCtx) {
   })
   if (claim.count === 0) return err("Automation is paused", 409)
 
-  const session = await db.agentSession.create({
-    data: {
-      userId: auth.userId,
-      goal: `Run automation: ${automation.name}`,
-      source: "automation",
-      status: "running",
-      memorySummary: "Automation queued for execution.",
-    },
+  const { session, created } = await resolveAutomationSession(db, {
+    automationId: automation.id,
+    userId: auth.userId,
+    sessionId: automation.sessionId,
+    name: automation.name,
   })
+  if (!created) {
+    await db.agentSession.update({
+      where: { id: session.id },
+      data: { status: "running", completedAt: null, memorySummary: "Automation queued for execution." },
+    })
+  }
 
   const event = await db.agentTranscriptEvent.create({
     data: {
@@ -121,14 +134,20 @@ export async function POST(req: NextRequest, ctx: RouteCtx) {
     },
   })
 
+  let executionId: string | null = null
   try {
-    const execution = await ensureAgentExecution({ userId: auth.userId, sessionId: session.id, autonomous: true })
+    const execution = await ensureAgentExecution({ userId: auth.userId, sessionId: session.id, autonomous: true, restartForRun: true })
+    if (!execution) throw new Error("Could not prepare automation execution")
+    executionId = execution.id
     const taskId = await enqueueAgentRun({ userId: auth.userId, sessionId: session.id })
     await db.agentExecution.update({ where: { id: execution.id }, data: { workerTaskId: taskId } })
     return ok({ session: serializeSession(session as SessionRow), event: serializeEvent(event), executionId: execution.id, taskId }, 201)
   } catch (error) {
     const message = error instanceof Error ? error.message : "Could not dispatch automation"
-    await db.agentSession.update({ where: { id: session.id }, data: { status: "failed", completedAt: new Date(), memorySummary: `Dispatch failed: ${message}` } })
+    await Promise.allSettled([
+      db.agentSession.update({ where: { id: session.id }, data: { status: "failed", completedAt: new Date(), memorySummary: `Dispatch failed: ${message}` } }),
+      ...(executionId ? [db.agentExecution.update({ where: { id: executionId }, data: { status: "failed", completedAt: new Date(), error: message } })] : []),
+    ])
     return err(message, 503)
   }
 

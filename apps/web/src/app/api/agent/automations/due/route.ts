@@ -4,6 +4,7 @@ import { err, ok } from "@/lib/api-helpers"
 import { nextRunAfterCurrent } from "@/lib/agent/automation-schedule"
 import { enqueueAgentRun } from "@/lib/agent-run-queue-client"
 import { ensureAgentExecution } from "@/lib/agent/execution-control"
+import { isActiveAutomationExecution, resolveAutomationSession } from "@/lib/agent/automation-session"
 import { hasEffectiveEntitlement } from '@/lib/entitlements'
 
 type AutomationForRun = {
@@ -19,6 +20,7 @@ type AutomationForRun = {
   dailyCap: number
   requireApproval: boolean
   autoApply: boolean
+  sessionId: string | null
 }
 
 function authorized(req: NextRequest) {
@@ -42,6 +44,20 @@ function automationPayload(automation: AutomationForRun) {
 }
 
 async function startAutomation(automation: AutomationForRun, now: Date) {
+  if (automation.sessionId) {
+    const execution = await db.agentExecution.findFirst({
+      where: { userId: automation.userId, sessionId: automation.sessionId },
+      select: { status: true },
+    })
+    if (isActiveAutomationExecution(execution?.status)) {
+      await db.agentAutomation.updateMany({
+        where: { id: automation.id, userId: automation.userId, enabled: true, nextRunAt: { lte: now }, user: { accountStatus: 'active' } },
+        data: { lastRunAt: now, nextRunAt: nextRunAfterCurrent(automation.cron, now, automation.timezone) },
+      })
+      return null
+    }
+  }
+
   const claimed = await db.agentAutomation.updateMany({
     where: { id: automation.id, userId: automation.userId, enabled: true, nextRunAt: { lte: now }, user: { accountStatus: 'active' } },
     data: {
@@ -51,15 +67,19 @@ async function startAutomation(automation: AutomationForRun, now: Date) {
   })
   if (claimed.count === 0) return null
 
-  const session = await db.agentSession.create({
-    data: {
-      userId: automation.userId,
-      goal: `Run automation: ${automation.name}`,
-      source: "automation",
-      status: "running",
-      memorySummary: "Automation picked up by scheduler.",
-    },
+  const { session, created } = await resolveAutomationSession(db, {
+    automationId: automation.id,
+    userId: automation.userId,
+    sessionId: automation.sessionId,
+    name: automation.name,
+    memorySummary: "Automation picked up by scheduler.",
   })
+  if (!created) {
+    await db.agentSession.update({
+      where: { id: session.id },
+      data: { status: "running", completedAt: null, memorySummary: "Automation picked up by scheduler." },
+    })
+  }
 
   await db.agentTranscriptEvent.create({
     data: {
@@ -74,8 +94,11 @@ async function startAutomation(automation: AutomationForRun, now: Date) {
     },
   })
 
+  let executionId: string | null = null
   try {
-    const execution = await ensureAgentExecution({ userId: automation.userId, sessionId: session.id, autonomous: true })
+    const execution = await ensureAgentExecution({ userId: automation.userId, sessionId: session.id, autonomous: true, restartForRun: true })
+    if (!execution) throw new Error("Could not prepare automation execution")
+    executionId = execution.id
     const taskId = await enqueueAgentRun({ userId: automation.userId, sessionId: session.id })
     await db.agentExecution.update({ where: { id: execution.id }, data: { workerTaskId: taskId } })
     await db.agentTranscriptEvent.create({
@@ -98,6 +121,7 @@ async function startAutomation(automation: AutomationForRun, now: Date) {
         where: { id: session.id },
         data: { status: "failed", completedAt: new Date(), memorySummary: `Dispatch failed: ${message}` },
       }),
+      ...(executionId ? [db.agentExecution.update({ where: { id: executionId }, data: { status: "failed", completedAt: new Date(), error: message } })] : []),
       db.agentTranscriptEvent.create({
         data: {
           sessionId: session.id, taskId: null, type: "error", speaker: "Scheduler",

@@ -1650,6 +1650,7 @@ model AgentSession {
   approvals        AgentApproval[]
   applicationTasks ApplicationTask[]
   execution        AgentExecution?
+  automation       AgentAutomation?
 
   @@index([userId, createdAt(sort: Desc)])
   @@index([userId, lastViewedAt(sort: Desc)])
@@ -1738,12 +1739,14 @@ model AgentAutomation {
   requireApproval Boolean   @default(true)
   autoApply       Boolean   @default(false)
   createdBy       String    @default("user")
+  sessionId       String?   @unique
   lastRunAt       DateTime?
   nextRunAt       DateTime?
   createdAt       DateTime  @default(now())
   updatedAt       DateTime  @updatedAt
 
   user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+  session AgentSession? @relation(fields: [sessionId], references: [id], onDelete: SetNull)
 
   @@index([userId, enabled, createdAt])
   @@index([userId, nextRunAt])
