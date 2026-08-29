@@ -5,9 +5,12 @@ const mocks = vi.hoisted(() => ({
   automationUpdateMany: vi.fn(),
   automationUpdate: vi.fn(),
   sessionCreate: vi.fn(),
+  sessionFindFirst: vi.fn(),
+  sessionDeleteMany: vi.fn(),
   sessionUpdate: vi.fn(),
   transcriptCreate: vi.fn(),
   enqueueAgentRun: vi.fn(),
+  executionFindFirst: vi.fn(),
   executionUpdate: vi.fn(),
   ensureExecution: vi.fn(),
   hasEffectiveEntitlement: vi.fn(),
@@ -29,8 +32,8 @@ vi.mock("@/lib/db", () => ({
       updateMany: mocks.automationUpdateMany,
       update: mocks.automationUpdate,
     },
-    agentSession: { create: mocks.sessionCreate, update: mocks.sessionUpdate },
-    agentExecution: { update: mocks.executionUpdate },
+    agentSession: { create: mocks.sessionCreate, findFirst: mocks.sessionFindFirst, deleteMany: mocks.sessionDeleteMany, update: mocks.sessionUpdate },
+    agentExecution: { findFirst: mocks.executionFindFirst, update: mocks.executionUpdate },
     agentTranscriptEvent: { create: mocks.transcriptCreate },
   },
 }))
@@ -62,9 +65,12 @@ describe("agent automation due scheduler API", () => {
         dailyCap: 8,
         requireApproval: true,
         autoApply: true,
+        sessionId: null,
       },
     ])
     mocks.sessionCreate.mockResolvedValue({ id: "session_1" })
+    mocks.sessionFindFirst.mockResolvedValue(null)
+    mocks.sessionDeleteMany.mockResolvedValue({ count: 1 })
     mocks.transcriptCreate.mockResolvedValue({ id: "event_1" })
     mocks.enqueueAgentRun.mockResolvedValue("task_1")
     mocks.automationUpdateMany.mockResolvedValue({ count: 1 })
@@ -132,6 +138,26 @@ describe("agent automation due scheduler API", () => {
     await expect(res.json()).resolves.toMatchObject({ started: [] })
     expect(mocks.sessionCreate).not.toHaveBeenCalled()
     expect(mocks.transcriptCreate).not.toHaveBeenCalled()
+  })
+
+  it("keeps a due automation in one session and skips overlapping execution", async () => {
+    mocks.automationFindMany.mockResolvedValueOnce([{
+      id: "automation_1", userId: "user_1", name: "Weekday Berlin SWE Scout", cron: "0 9 * * 1-5",
+      timezone: "Europe/Berlin", triggerType: "weekdays", targetRoles: ["SWE"], targetLocations: ["Berlin"],
+      minScore: 85, dailyCap: 8, requireApproval: true, autoApply: true, sessionId: "session_1",
+    }])
+    mocks.executionFindFirst.mockResolvedValueOnce({ status: "queued" })
+    const { POST } = await import("./route")
+
+    const res = await POST(postRequest() as never)
+
+    expect(res.status).toBe(200)
+    await expect(res.json()).resolves.toMatchObject({ started: [] })
+    expect(mocks.sessionCreate).not.toHaveBeenCalled()
+    expect(mocks.enqueueAgentRun).not.toHaveBeenCalled()
+    expect(mocks.automationUpdateMany).toHaveBeenCalledWith(expect.objectContaining({
+      data: { lastRunAt: expect.any(Date), nextRunAt: expect.any(Date) },
+    }))
   })
 
   it("requires the configured cron secret", async () => {

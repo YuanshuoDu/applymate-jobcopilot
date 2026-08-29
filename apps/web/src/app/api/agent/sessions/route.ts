@@ -50,7 +50,13 @@ export async function GET(req: NextRequest) {
 
   const [sessions, lastOpenedSession] = await Promise.all([
     db.agentSession.findMany({
-      where: { userId: auth.userId },
+      where: {
+        userId: auth.userId,
+        OR: [
+          { source: { not: "automation" } },
+          { source: "automation", automation: { isNot: null } },
+        ],
+      },
       orderBy: { updatedAt: "desc" },
       take: 50,
       select: {
@@ -67,7 +73,14 @@ export async function GET(req: NextRequest) {
       },
     }),
     db.agentSession.findFirst({
-      where: { userId: auth.userId, lastViewedAt: { not: null } },
+      where: {
+        userId: auth.userId,
+        lastViewedAt: { not: null },
+        OR: [
+          { source: { not: "automation" } },
+          { source: "automation", automation: { isNot: null } },
+        ],
+      },
       orderBy: { lastViewedAt: "desc" },
       select: { id: true },
     }),

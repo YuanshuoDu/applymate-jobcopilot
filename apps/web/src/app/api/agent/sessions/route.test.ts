@@ -83,7 +83,13 @@ describe("agent sessions API", () => {
       lastOpenedSessionId: "session_1",
     })
     expect(mocks.findMany).toHaveBeenCalledWith({
-      where: { userId: "user_1" },
+      where: {
+        userId: "user_1",
+        OR: [
+          { source: { not: "automation" } },
+          { source: "automation", automation: { isNot: null } },
+        ],
+      },
       orderBy: { updatedAt: "desc" },
       take: 50,
       select: {
@@ -100,7 +106,14 @@ describe("agent sessions API", () => {
       },
     })
     expect(mocks.findFirst).toHaveBeenCalledWith({
-      where: { userId: "user_1", lastViewedAt: { not: null } },
+      where: {
+        userId: "user_1",
+        lastViewedAt: { not: null },
+        OR: [
+          { source: { not: "automation" } },
+          { source: "automation", automation: { isNot: null } },
+        ],
+      },
       orderBy: { lastViewedAt: "desc" },
       select: { id: true },
     })
