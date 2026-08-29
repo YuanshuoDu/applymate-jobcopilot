@@ -32,8 +32,10 @@ type Environment = Record<string, string | undefined>
 type NeonRequest = (url: string, init?: { method?: string; headers?: Record<string, string>; signal?: AbortSignal }) => Promise<Response>
 type ConsumptionResponse = { projects?: unknown; pagination?: { cursor?: unknown } }
 type MetricRate = { rateUsd: number | null }
+type UsageCache = { key: string; expiresAt: number; snapshot: NeonUsageSnapshot }
 
 const GB = 1_000_000_000
+const DEFAULT_CACHE_TTL_SECONDS = 15 * 60
 const DEFAULT_RATES: Record<'launch' | 'scale', Record<NeonMetricName, MetricRate>> = {
   launch: {
     compute_unit_seconds: { rateUsd: 0.106 / 3600 }, root_branch_bytes_month: { rateUsd: 0.35 / GB }, child_branch_bytes_month: { rateUsd: 0.35 / GB },
@@ -46,6 +48,7 @@ const DEFAULT_RATES: Record<'launch' | 'scale', Record<NeonMetricName, MetricRat
     extra_branches_month: { rateUsd: 0.002 * 730 }, snapshot_storage_bytes_month: { rateUsd: 0.09 / GB },
   },
 }
+let usageCache: UsageCache | null = null
 
 function text(value: unknown): string | null { return typeof value === 'string' && value.trim() ? value.trim() : null }
 function number(value: unknown): number | null {
@@ -67,6 +70,10 @@ function planName(value: string | null): 'launch' | 'scale' | null {
 }
 function metricUnit(name: NeonMetricName): NeonMetricUnit {
   return name === 'compute_unit_seconds' ? 'cu_seconds' : name === 'extra_branches_month' ? 'branch_months' : 'bytes'
+}
+function cacheTtl(env: Environment): number {
+  const value = Number(env.NEON_USAGE_CACHE_TTL_SECONDS)
+  return Number.isFinite(value) && value >= 60 ? Math.min(Math.trunc(value), 86_400) : DEFAULT_CACHE_TTL_SECONDS
 }
 
 function metricValue(value: unknown): number | null {
@@ -173,7 +180,7 @@ async function readConsumption(request: NeonRequest, orgId: string, projectId: s
   let plan: string | null = null
   let cursor: string | null = null
   for (let page = 0; page < 100; page += 1) {
-    const params = new URLSearchParams({ org_id: orgId, from: monthStart(now), to: now.toISOString(), granularity: 'monthly', metrics: NEON_METRIC_NAMES.join(',') })
+    const params = new URLSearchParams({ org_id: orgId, from: monthStart(now), to: now.toISOString(), granularity: 'daily', metrics: NEON_METRIC_NAMES.join(',') })
     if (projectId) params.set('project_ids', projectId)
     if (cursor) params.set('cursor', cursor)
     const response = await request(`https://console.neon.tech/api/v2/consumption_history/v2/projects?${params.toString()}`, { headers, signal: AbortSignal.timeout(10_000) })
@@ -194,6 +201,9 @@ export async function readNeonUsage(env: Environment = process.env, request: Neo
   const orgId = text(env.NEON_ORG_ID)
   const projectId = text(env.NEON_PROJECT_ID)
   if (!apiKey) return null
+  const cacheKey = `${orgId ?? ''}|${projectId ?? ''}|${text(env.NEON_PLAN) ?? ''}`
+  const alert = neonCostAlertThreshold(env)
+  if (usageCache && usageCache.key === cacheKey && usageCache.expiresAt > Date.now()) return withAlert(usageCache.snapshot, alert)
   const now = new Date()
   const headers = { Authorization: `Bearer ${apiKey}` }
   if (orgId) {
@@ -201,8 +211,9 @@ export async function readNeonUsage(env: Environment = process.env, request: Neo
       const parsed = await readConsumption(request, orgId, projectId, now, headers)
       if (parsed) {
         const cost = estimateNeonCost(parsed.metrics, env, parsed.plan)
-        const alert = neonCostAlertThreshold(env)
-        return { available: true, period: 'current_month', source: 'neon_consumption_api', sampledAt: now.toISOString(), plan: parsed.plan, metrics: parsed.metrics.map(metric => ({ ...metric, unit: metricUnit(metric.name), estimatedCostUsd: metricCost(metric, env, parsed.plan) })), inputBytes: 0, outputBytes: parsed.metrics.filter(metric => metric.name === 'public_network_transfer_bytes' || metric.name === 'private_network_transfer_bytes').reduce((sum, metric) => sum + metric.value, 0), estimatedCostUsd: cost, alertThresholdUsd: alert, alertTriggered: cost !== null && alert !== null && cost >= alert }
+        const snapshot: NeonUsageSnapshot = { available: true, period: 'current_month', source: 'neon_consumption_api', sampledAt: now.toISOString(), plan: parsed.plan, metrics: parsed.metrics.map(metric => ({ ...metric, unit: metricUnit(metric.name), estimatedCostUsd: metricCost(metric, env, parsed.plan) })), inputBytes: 0, outputBytes: parsed.metrics.filter(metric => metric.name === 'public_network_transfer_bytes' || metric.name === 'private_network_transfer_bytes').reduce((sum, metric) => sum + metric.value, 0), estimatedCostUsd: cost, alertThresholdUsd: alert, alertTriggered: false }
+        usageCache = { key: cacheKey, expiresAt: Date.now() + cacheTtl(env) * 1000, snapshot }
+        return withAlert(snapshot, alert)
       }
     } catch { /* Fall back to project details, which is available on all plans. */ }
   }
@@ -214,7 +225,12 @@ export async function readNeonUsage(env: Environment = process.env, request: Neo
     if (bytes === null) return null
     const metrics = [{ name: 'public_network_transfer_bytes' as const, value: bytes }]
     const cost = estimateNeonCost(metrics, env)
-    const alert = neonCostAlertThreshold(env)
-    return { available: true, period: 'current_billing_period', source: 'neon_project_details', sampledAt: now.toISOString(), plan: text(env.NEON_PLAN), metrics: [{ ...metrics[0], unit: 'bytes', estimatedCostUsd: cost }], inputBytes: 0, outputBytes: bytes, estimatedCostUsd: cost, alertThresholdUsd: alert, alertTriggered: cost !== null && alert !== null && cost >= alert }
+    const snapshot: NeonUsageSnapshot = { available: true, period: 'current_billing_period', source: 'neon_project_details', sampledAt: now.toISOString(), plan: text(env.NEON_PLAN), metrics: [{ ...metrics[0], unit: 'bytes', estimatedCostUsd: cost }], inputBytes: 0, outputBytes: bytes, estimatedCostUsd: cost, alertThresholdUsd: alert, alertTriggered: false }
+    usageCache = { key: cacheKey, expiresAt: Date.now() + cacheTtl(env) * 1000, snapshot }
+    return withAlert(snapshot, alert)
   } catch { return null }
+}
+
+function withAlert(snapshot: NeonUsageSnapshot, alert: number | null): NeonUsageSnapshot {
+  return { ...snapshot, alertThresholdUsd: alert, alertTriggered: snapshot.estimatedCostUsd !== null && alert !== null && snapshot.estimatedCostUsd >= alert }
 }

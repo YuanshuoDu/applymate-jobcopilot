@@ -19,7 +19,16 @@ describe('Neon usage', () => {
     const [url, init] = request.mock.calls[0] ?? []
     expect(new URL(url).searchParams.get('metrics')).toContain('compute_unit_seconds')
     expect(new URL(url).searchParams.get('project_ids')).toBe('project-1')
+    expect(new URL(url).searchParams.get('granularity')).toBe('daily')
     expect(init?.headers).toEqual({ Authorization: 'Bearer secret' })
+  })
+
+  it('caches a successful snapshot to avoid polling Neon on every dashboard refresh', async () => {
+    const request = vi.fn<(url: string, init?: { headers?: Record<string, string>; signal?: AbortSignal }) => Promise<Response>>(async (_url) => response({ projects: [{ periods: [{ period_plan: 'launch', consumption: [{ metrics: [{ metric_name: 'compute_unit_seconds', value: 60 }] }] }] }] }))
+    const env = { NEON_API_KEY: 'secret', NEON_ORG_ID: 'org-cache', NEON_PROJECT_ID: 'project-cache' }
+    await expect(readNeonUsage(env, request)).resolves.toMatchObject({ source: 'neon_consumption_api' })
+    await expect(readNeonUsage(env, request)).resolves.toMatchObject({ source: 'neon_consumption_api' })
+    expect(request).toHaveBeenCalledTimes(1)
   })
 
   it('follows Neon pagination when an organization has more than one page', async () => {
