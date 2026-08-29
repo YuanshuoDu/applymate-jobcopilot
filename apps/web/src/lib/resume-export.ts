@@ -7,9 +7,11 @@ function safeFilename(value: string) {
 export function resumePdfFilename(name: string, applicantName?: string) {
   const cleanName = name.replace(/^tailored\s+for\s+/i, '').trim()
   const cleanApplicant = applicantName?.trim() ?? ''
-  const filenameBase = cleanApplicant && !cleanName.toLowerCase().startsWith(cleanApplicant.toLowerCase())
-    ? `${cleanApplicant} - ${cleanName}`
-    : cleanName
+  const filenameBase = !cleanName
+    ? cleanApplicant
+    : cleanApplicant && !cleanName.toLowerCase().startsWith(cleanApplicant.toLowerCase())
+      ? `${cleanApplicant} - ${cleanName}`
+      : cleanName
   return safeFilename(filenameBase)
 }
 
