@@ -25,16 +25,20 @@ type MetricSeries = { name?: { value?: unknown }; timeseries?: unknown }
 type CostResponse = { properties?: { columns?: unknown; rows?: unknown } }
 type ParsedMetrics = { totalOperations: number; totalResults: number; avgLatencyMs: number; metrics: AzureKeyVaultMetric[] }
 type ParsedCost = { cost: number; currency: string | null }
-type UsageConfig = { resourceId: string; costScope: string | null; cacheTtlSeconds: number }
+type UsageConfig = { resourceId: string; costScope: string | null; cacheTtlSeconds: number; costCacheTtlSeconds: number }
 type UsageCache = { key: string; expiresAt: number; snapshot: AzureKeyVaultUsageSnapshot }
+type CostCache = { key: string; expiresAt: number; cost: ParsedCost | null }
 
 const METRICS_API_VERSION = '2023-10-01'
 const COST_API_VERSION = '2025-03-01'
 const DEFAULT_CACHE_TTL_SECONDS = 15 * 60
+const DEFAULT_COST_CACHE_TTL_SECONDS = 24 * 60 * 60
+const MAX_COST_CACHE_TTL_SECONDS = 7 * 24 * 60 * 60
 const UUID = '[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}'
 const RESOURCE_ID = new RegExp(`^/subscriptions/${UUID}/resourceGroups/[^/]+/providers/Microsoft\\.KeyVault/vaults/[^/]+$`, 'i')
 const SCOPE = new RegExp(`^/subscriptions/${UUID}(?:/resourceGroups/[^/]+)?$`, 'i')
 let usageCache: UsageCache | null = null
+let costCache: CostCache | null = null
 
 function text(value: unknown): string | null { return typeof value === 'string' && value.trim() ? value.trim() : null }
 function nonNegative(value: unknown): number | null {
@@ -50,6 +54,10 @@ function cacheTtl(env: Environment): number {
   const value = Number(env.AZURE_USAGE_CACHE_TTL_SECONDS)
   return Number.isFinite(value) && value >= 60 ? Math.min(Math.trunc(value), 86_400) : DEFAULT_CACHE_TTL_SECONDS
 }
+function costCacheTtl(env: Environment): number {
+  const value = Number(env.AZURE_COST_CACHE_TTL_SECONDS)
+  return Number.isFinite(value) && value >= 900 ? Math.min(Math.trunc(value), MAX_COST_CACHE_TTL_SECONDS) : DEFAULT_COST_CACHE_TTL_SECONDS
+}
 
 export function azureKeyVaultUsageConfig(env: Environment = process.env): UsageConfig | null {
   const resourceId = text(env.AZURE_KEY_VAULT_RESOURCE_ID)
@@ -57,7 +65,7 @@ export function azureKeyVaultUsageConfig(env: Environment = process.env): UsageC
   const configuredScope = text(env.AZURE_COST_MANAGEMENT_SCOPE)
   const subscriptionId = text(env.AZURE_SUBSCRIPTION_ID)
   const costScope = configuredScope ?? (subscriptionId ? `/subscriptions/${subscriptionId}` : null)
-  return { resourceId, costScope: costScope && SCOPE.test(costScope) ? costScope : null, cacheTtlSeconds: cacheTtl(env) }
+  return { resourceId, costScope: costScope && SCOPE.test(costScope) ? costScope : null, cacheTtlSeconds: cacheTtl(env), costCacheTtlSeconds: costCacheTtl(env) }
 }
 
 export function parseAzureMonitorMetrics(value: unknown): ParsedMetrics | null {
@@ -148,13 +156,21 @@ export async function readAzureKeyVaultUsage(env: Environment = process.env, req
   const threshold = azureKeyVaultCostAlert(env)
   const currencyOverride = text(env.AZURE_COST_CURRENCY)?.toUpperCase() ?? null
   if (usageCache && usageCache.key === cacheKey && usageCache.expiresAt > Date.now()) return withAlert(usageCache.snapshot, threshold, currencyOverride, env)
-  const headers = { Authorization: `Bearer ${token}` }
+  const headers = { Authorization: `Bearer ${token}`, ClientType: 'ApplyMate-api-usage' }
   const metricParams = new URLSearchParams({ timespan: `${monthStart(now)}/${now.toISOString()}`, interval: 'PT1H', metricnames: 'ServiceApiHit,ServiceApiResult,ServiceApiLatency', aggregation: 'total,average', 'api-version': METRICS_API_VERSION, metricnamespace: 'Microsoft.KeyVault/vaults' })
   const metricUrl = `https://management.azure.com${config.resourceId}/providers/Microsoft.Insights/metrics?${metricParams}`
   const costUrl = config.costScope ? `https://management.azure.com${config.costScope}/providers/Microsoft.CostManagement/query?api-version=${COST_API_VERSION}` : null
+  const costPromise = costUrl && costCache && costCache.key === cacheKey && costCache.expiresAt > Date.now()
+    ? Promise.resolve(costCache.cost)
+    : costUrl
+      ? readJson(request, costUrl, { method: 'POST', headers: { ...headers, 'content-type': 'application/json' }, body: JSON.stringify({ type: 'ActualCost', timeframe: 'MonthToDate', dataset: { granularity: 'Daily', aggregation: { totalCost: { name: 'PreTaxCost', function: 'Sum' } }, filter: { and: [{ dimensions: { name: 'ResourceId', operator: 'In', values: [config.resourceId] } }, { dimensions: { name: 'ResourceType', operator: 'In', values: ['Microsoft.KeyVault/vaults'] } }] } } }), signal: AbortSignal.timeout(10_000) }).then(parseAzureCostManagement).then(value => {
+          costCache = { key: cacheKey, expiresAt: Date.now() + config.costCacheTtlSeconds * 1000, cost: value }
+          return value
+        })
+      : Promise.resolve(null)
   const [metrics, cost] = await Promise.all([
     readJson(request, metricUrl, { headers, signal: AbortSignal.timeout(10_000) }).then(parseAzureMonitorMetrics),
-    costUrl ? readJson(request, costUrl, { method: 'POST', headers: { ...headers, 'content-type': 'application/json' }, body: JSON.stringify({ type: 'ActualCost', timeframe: 'MonthToDate', dataset: { granularity: 'Daily', aggregation: { totalCost: { name: 'PreTaxCost', function: 'Sum' } }, filter: { dimensions: { name: 'ResourceId', operator: 'In', values: [config.resourceId] } } } }), signal: AbortSignal.timeout(10_000) }).then(parseAzureCostManagement) : Promise.resolve(null),
+    costPromise,
   ])
   if (!metrics && !cost) return null
   const snapshot: AzureKeyVaultUsageSnapshot = {
