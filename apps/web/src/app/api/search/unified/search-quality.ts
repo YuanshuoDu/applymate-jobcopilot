@@ -36,6 +36,8 @@ export interface SearchFilters {
 }
 
 const REMOTE_VERIFIED_SOURCES = new Set<string>(['jobicy', 'remotive', 'ats', 'internships', 'cleanjobdata'])
+const REMOTE_FIRST_SOURCES = new Set<string>(['jobicy', 'remotive'])
+const EUROPEAN_COUNTRIES = new Set(['at', 'be', 'bg', 'ch', 'cz', 'de', 'dk', 'ee', 'es', 'fi', 'fr', 'gb', 'gr', 'hr', 'hu', 'ie', 'it', 'lt', 'lu', 'lv', 'nl', 'no', 'pl', 'pt', 'ro', 'se', 'sk'])
 const STRIP_TITLE = /\b(remote|hybrid|onsite|contract|temp|interim)\b/gi
 const SHORT_ROLE_TERMS = new Set(['ai', 'ml', 'ui', 'ux', 'qa', 'pm', 'hr', 'go', 'c#'])
 
@@ -142,18 +144,25 @@ function parseSalaryNum(salary?: string): { min: number; max: number } | null {
   return { min: scaled[0], max: scaled[1] ?? scaled[0] }
 }
 
-function matchesRequestedLocation(jobLocation: string, requestedLocation: string) {
+function matchesRequestedLocation(jobLocation: string, requestedLocation: string, source?: string) {
   const job = jobLocation.trim().toLowerCase()
   if (!job) return false
   const requested = requestedLocation.trim().toLowerCase()
   if (job.includes(requested)) return true
   const resolved = resolveLocation(requestedLocation)
-  return resolved.isCountry && resolved.dbTerms.some(term => job.includes(term))
+  if (resolved.isCountry && resolved.dbTerms.some(term => job.includes(term))) return true
+  // Jobicy and Remotive are remote-first sources. Their "Anywhere", "Remote",
+  // and "Worldwide" locations are valid for a city search even though they do
+  // not contain the requested city name.
+  if (!REMOTE_FIRST_SOURCES.has(source ?? '')) return false
+  if (/\b(remote|anywhere|worldwide)\b/i.test(job)) return true
+  const requestedCountry = resolveLocation(requestedLocation).countryCode
+  return Boolean(requestedCountry && EUROPEAN_COUNTRIES.has(requestedCountry) && /\b(europe|emea|eu)\b/i.test(job))
 }
 
 export function postFilter(jobs: SearchJob[], filters: SearchFilters): SearchJob[] {
   return jobs.filter(job => {
-    if (filters.location && !matchesRequestedLocation(job.location, filters.location)) return false
+    if (filters.location && !matchesRequestedLocation(job.location, filters.location, job.source)) return false
     if (filters.salaryMin || filters.salaryMax) {
       const salary = parseSalaryNum(job.salary)
       if (salary && ((filters.salaryMin && salary.max < filters.salaryMin) || (filters.salaryMax && salary.min > filters.salaryMax))) return false
