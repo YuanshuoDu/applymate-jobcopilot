@@ -85,10 +85,10 @@ describe('GET /api/search/unified CleanJobData routing', () => {
     rapidapiSource: 'none', adzunaSource: 'none',
   })
 
-  function request(query = 'Software Engineer'): NextRequest {
+  function request(query = 'Software Engineer', location = 'Berlin'): NextRequest {
     const url = new URL('http://localhost/api/search/unified')
     url.searchParams.set('q', query)
-    url.searchParams.set('location', 'Berlin')
+    if (location) url.searchParams.set('location', location)
     url.searchParams.set('noCache', '1')
     return new NextRequest(url)
   }
@@ -102,6 +102,34 @@ describe('GET /api/search/unified CleanJobData routing', () => {
     expect(mocks.fetchCleanJobData).not.toHaveBeenCalled()
     expect(payload.meta.sourcesUsed).not.toContain('cleanjobdata')
     expect(payload.meta.apiKeys.cleanjobdata).toBe(false)
+  })
+
+  it('keeps manual search working with public fallbacks when paid keys are absent', async () => {
+    mocks.getDiscoveryApiAccess.mockResolvedValue(access(''))
+    mocks.pinnedFetch.mockImplementation(async (input: string | URL) => {
+      const url = String(input)
+      if (url.startsWith('https://jobicy.com/')) {
+        return new Response(JSON.stringify({ jobs: [{
+          id: 1, url: 'https://jobicy.com/jobs/software-engineer', jobTitle: 'Software Engineer',
+          companyName: 'Acme', jobType: ['Full Time'], jobGeo: 'Anywhere',
+          jobExcerpt: 'Build software', pubDate: '2026-08-28T10:00:00.000Z',
+        }] }), { status: 200, headers: { 'content-type': 'application/json' } })
+      }
+      if (url.startsWith('https://remotive.com/')) {
+        return new Response(JSON.stringify({ jobs: [] }), { status: 200, headers: { 'content-type': 'application/json' } })
+      }
+      return new Response(null, { status: 503 })
+    })
+
+    const response = await GET(request('Software Engineer', ''))
+    const payload = await response.json()
+    const urls = mocks.pinnedFetch.mock.calls.map(([url]) => String(url))
+
+    expect(payload.jobs).toHaveLength(1)
+    expect(payload.jobs[0]).toMatchObject({ source: 'jobicy', title: 'Software Engineer' })
+    expect(payload.meta.sourcesUsed).toContain('jobicy')
+    expect(urls.some(url => url.startsWith('https://jobicy.com/') && new URL(url).searchParams.get('geo') === 'anywhere')).toBe(true)
+    expect(urls.some(url => url.startsWith('https://remotive.com/'))).toBe(true)
   })
 
   it('routes, maps, deduplicates, and reports CleanJobData results', async () => {

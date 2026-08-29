@@ -124,7 +124,9 @@ private scheduler. Set `AGENT_SCHEDULER_ENABLED=0` for a Worker instance that
 must not schedule automations. A globally paused Worker also suppresses
 scheduler requests at runtime and pauses the BullMQ Worker consumers, so
 pausing queues does not continue generating maintenance or idle polling
-traffic.
+traffic. Manual Search Jobs is a separate Web request to `/api/search/unified`
+and remains available while the Worker is paused; Scout returns a clear
+conflict instead of accumulating an unprocessable queue job.
 
 ## Fly.io Worker deployment
 
@@ -132,6 +134,12 @@ The repository includes the production configuration at `apps/worker/fly.toml`.
 It creates one always-on Worker Machine in London (`lhr`), keeps the Bull Board
 disabled, and uses `/healthz` for the Fly health check. The `cloak_profiles`
 volume preserves per-user browser state between Machine restarts.
+
+The admin pause control is an application-level automation off switch: it stops
+BullMQ consumers and scheduled callbacks while keeping the lightweight health
+listener available for a later resume. It prevents background Redis polling and
+provider work, but it does not scale the Fly Machine to zero; machine-level
+cost control remains a separate Fly deployment decision.
 
 Because the Web app runs on Vercel, `REDIS_URL` must be a public TLS Redis
 endpoint (`rediss://...`) that both Vercel and Fly can reach. Do not use the
