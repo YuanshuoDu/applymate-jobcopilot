@@ -25,7 +25,10 @@ describe('Azure Key Vault usage', () => {
     const snapshot = await readAzureKeyVaultUsage({ AZURE_KEY_VAULT_RESOURCE_ID: resourceId, AZURE_SUBSCRIPTION_ID: '11111111-1111-4111-8111-111111111111', AZURE_COST_ALERT_USD: '2', AZURE_MAX_BUDGET_USD: '10' }, request, async () => 'arm-token')
     expect(snapshot).toMatchObject({ source: 'azure_cost_management', totalOperations: 9, cost: 2.5, currency: 'USD', alertTriggered: true, maxBudget: 10 })
     expect(request).toHaveBeenCalledTimes(2)
-    expect(request.mock.calls.find(([url]) => String(url).includes('CostManagement'))?.[1]).toMatchObject({ method: 'POST' })
+    const costCall = request.mock.calls.find(([url]) => String(url).includes('CostManagement'))?.[1]
+    expect(costCall).toMatchObject({ method: 'POST', headers: expect.objectContaining({ ClientType: 'ApplyMate-api-usage' }) })
+    const query = JSON.parse(String(costCall?.body)) as { dataset?: { filter?: { and?: unknown[] } } }
+    expect(query.dataset?.filter?.and).toHaveLength(2)
   })
 
   it('does not call Azure when the resource scope is not configured', async () => {
