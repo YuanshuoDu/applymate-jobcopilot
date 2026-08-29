@@ -30,6 +30,7 @@ import { loadProviderStates, reserveProviderQuota } from '@/lib/discovery/quota'
 import { executeProviderPlan, type ProviderCall } from '@/lib/discovery/provider-router'
 import { compareShadowJobs } from '@/lib/discovery/shadow'
 import { cleanSearchTitle, postFilter, queryKeywords, scoreSearchJobs, smartDedup, type SearchFilters, type SearchJob } from './search-quality'
+import { canonicalizeJobSearchQuery, correctSearchSpelling, normalizeSearchText } from './search-query'
 
 // ── Infrastructure ────────────────────────────────────────────────────────────
 
@@ -236,7 +237,7 @@ function smartRouter(q: string, f: SearchFilters, qa?: QueryAnalysis): RouterDec
   const hasCleanJobData = !!f.discovery?.cleanJobDataApiKey
 
   const loc   = f.location || ''
-  const title = cleanSearchTitle(q)
+  const title = canonicalizeJobSearchQuery(cleanSearchTitle(q))
   const freeSearchTitle = titleWithoutLocation(title, loc) || title || q
   const companyQueryName = qa?.isCompanyQuery
     ? q.replace(/\b(jobs at|hiring at|careers at|openings at)\b/gi, '').trim()
@@ -1401,8 +1402,8 @@ function scoreJobs(jobs: JobResult[], q: string, f: SearchFilters): JobResult[] 
 
     // ── Location relevance ───────────────────────────────────────────────────
     if (f.location) {
-      const filterLocL = f.location.toLowerCase()
-      const jobLocL    = j.location.toLowerCase()
+      const filterLocL = normalizeSearchText(correctSearchSpelling(f.location))
+      const jobLocL    = normalizeSearchText(j.location)
       if (jobLocL.includes(filterLocL)) {
         s += 6  // exact city match in location field
       } else {
@@ -1598,7 +1599,7 @@ export async function GET(req: NextRequest) {
   if (!q) return err('q is required')
 
   const filters: SearchFilters = {
-    location:   sp.get('location')?.trim() ?? '',
+    location:   correctSearchSpelling(sp.get('location')?.trim() ?? ''),
     remote:     sp.get('remote') === '1',
     jobType:    sp.get('jobType') ?? '',
     datePosted: sp.get('datePosted') ?? 'any',
@@ -1645,7 +1646,7 @@ export async function GET(req: NextRequest) {
   // run together; paid sources are selected one at a time until the result gap
   // is filled or quota/health policy skips them.
   const providerPromise = runDiscoverySingleflight(cKey, () => executeSearchProviders(decision.sources, filters, shadowEnabled, {
-    title: cleanSearchTitle(q) || q,
+    title: canonicalizeJobSearchQuery(cleanSearchTitle(q)) || q,
     location: filters.location,
     datePosted: filters.datePosted,
   }))
