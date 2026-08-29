@@ -13,4 +13,8 @@ describe('resumePdfFilename', () => {
   it('falls back to Resume when the name is empty', () => {
     expect(resumePdfFilename('   ')).toBe('Resume.pdf')
   })
+
+  it('uses the applicant name without a dangling separator when the title is empty', () => {
+    expect(resumePdfFilename('Tailored for ', 'Alex Example')).toBe('Alex Example.pdf')
+  })
 })
