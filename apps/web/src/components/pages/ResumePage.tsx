@@ -83,6 +83,7 @@ import { ResumeIntakeDialog } from '@/components/resume/ResumeIntakeDialog'
 import type { DragHandleProps } from '@/components/resume/SectionHeader'
 import type { AiFieldContext } from '@/components/resume/AiFieldSuggestion'
 import { exportApplicationPackLocally } from '@/lib/bundle'
+import { downloadResumePdf } from '@/lib/resume-export'
 import { auditResume, type ResumeAuditResult } from '@/lib/resume-audit'
 
 // ── Constants ─────────────────────────────────────────────────────────────────
@@ -554,6 +555,7 @@ export function ResumePage() {
   const [resumeName,      setResumeName]      = useState('My Resume')
   const [templateId,      setTemplateId]      = useState('clean')
   const [templateOptions, setTemplateOptions] = useState<TemplateOptions>({})
+  const [exportingPdf,    setExportingPdf]    = useState(false)
   const [previewMode,     setPreviewMode]     = useState(false)
   const [rightPanel,      setRightPanel]      = useState<'insights' | 'persona'>('insights')
   const [loadingCont,     setLoadingCont]     = useState(false)
@@ -1281,6 +1283,28 @@ export function ResumePage() {
     }
   }
 
+  async function exportCurrentResumePdf() {
+    if (!selectedResumeId || !content || !selectedResume) { toast.info(t('resume.selectFirst')); return }
+    if (exportingPdf) return
+    setExportingPdf(true)
+    try {
+      if (dirty && !(await handleSave())) return
+      await downloadResumePdf({
+        ...selectedResume,
+        name: latestResumeName.current,
+        content: { ...(latestContent.current ?? content), sectionOrder: latestSectionOrder.current },
+        templateId: latestTemplateId.current,
+        templateOptions: latestTemplateOptions.current,
+      })
+      toast.success(t('resume.exportSuccess'))
+    } catch (error) {
+      console.error('[resume] PDF export failed', error)
+      toast.error(t('resume.exportError'), t('resume.exportErrorFallback'))
+    } finally {
+      setExportingPdf(false)
+    }
+  }
+
   async function handleRenameResume(resume: ResumeListItem, name: string) {
     if (!name || name === resume.name) { setRenamingResume(null); return }
     const { data, error } = await apiMutate<Resume>(`/api/resume/${resume.id}`, 'PATCH', { name })
@@ -1470,20 +1494,7 @@ export function ResumePage() {
         <span className="resume-toolbar-divider" />
         <Btn variant="ghost" onClick={() => { if (!selectedResumeId) { toast.info(t('resume.selectFirst')); return }; fetchVersions(); setShowVersions(true) }}><History size={15} />{t('resume.history')}</Btn>
         <span className="resume-toolbar-divider" />
-        <Btn variant="ghost" onClick={() => {
-          if (!selectedResumeId || !content) { toast.info(t('resume.selectFirst')); return }
-          // Snapshot current state into localStorage — print page reads this directly,
-          // so PDF always reflects what the user sees regardless of save timing
-          const snapshot = {
-            content: { ...content, sectionOrder },
-            templateId, templateOptions, name: resumeName,
-            ts: Date.now(),
-          }
-          localStorage.setItem(`print:${selectedResumeId}`, JSON.stringify(snapshot))
-          // Also persist to DB in the background (non-blocking)
-          if (dirty) handleSave()
-          window.open(`/resume/${selectedResumeId}/print`, '_blank')
-        }}><FileDown size={15} />{t('resume.exportPdf')}</Btn>
+        <Btn variant="ghost" onClick={() => void exportCurrentResumePdf()} disabled={exportingPdf}><FileDown size={15} />{exportingPdf ? t('resume.exportPreparing') : t('resume.exportPdf')}</Btn>
         <div className="resume-final-confirm-trigger"><Btn variant="toolbar" onClick={() => {
           if (!selectedResumeId || !content) { toast.info('Select a resume first'); return }
           setShowFinalConfirm(true)
