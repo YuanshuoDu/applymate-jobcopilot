@@ -4,6 +4,7 @@ import React, { useCallback, useEffect, useRef, useState } from 'react'
 import { Btn, useToast } from '@/components/ui'
 import { useI18n } from '@/lib/i18n'
 import { apiMutate } from '@/lib/hooks'
+import { fillMissingResumeContactFields, type PersonaContactFields } from '@/lib/resume-contact-merge'
 import type { ResumeContent, Resume, ResumeListItem, Direction } from '@/lib/types'
 
 // ── Types ─────────────────────────────────────────────────────────────────────
@@ -18,14 +19,6 @@ interface Props {
 
 type TabId   = 'upload' | 'paste' | 'screenshot'
 type Stage   = 'idle' | 'uploading' | 'extracting' | 'parsing' | 'preview' | 'error'
-
-interface PersonaFields {
-  name?:     boolean
-  email?:    boolean
-  phone?:    boolean
-  location?: boolean
-  linkedin?: boolean
-}
 
 // ── Component ─────────────────────────────────────────────────────────────────
 
@@ -42,7 +35,7 @@ export function ResumeIntakeDialog({ onClose, onSaved, directions: initialDirect
   const [pasteText,      setPasteText]      = useState('')
   const [parsed,         setParsed]         = useState<ResumeContent | null>(null)
   const [mergedContent,  setMergedContent]  = useState<ResumeContent | null>(null)
-  const [personaFields,  setPersonaFields]  = useState<PersonaFields>({})
+  const [personaFields,  setPersonaFields]  = useState<PersonaContactFields>({})
   const [saving,         setSaving]         = useState(false)
 
   // Directions state (local copy so we can add new ones)
@@ -94,31 +87,13 @@ export function ResumeIntakeDialog({ onClose, onSaved, directions: initialDirect
 
   // ── Persona merge ──────────────────────────────────────────────────────────
 
-  async function mergeWithPersona(content: ResumeContent): Promise<{ merged: ResumeContent; persona: PersonaFields }> {
+  async function mergeWithPersona(content: ResumeContent): Promise<{ merged: ResumeContent; persona: PersonaContactFields }> {
     try {
       const res  = await fetch('/api/me')
       const body = await res.json()
       if (!res.ok) return { merged: content, persona: {} }
 
-      const merged  = { ...content, contact: { ...content.contact } }
-      const persona: PersonaFields = {}
-
-      const map: Array<[keyof PersonaFields, string]> = [
-        ['name',     body.name],
-        ['email',    body.email],
-        ['phone',    body.phone],
-        ['location', body.location],
-        ['linkedin', body.linkedin],
-      ]
-
-      for (const [field, profileVal] of map) {
-        if (profileVal && typeof profileVal === 'string' && profileVal.trim()) {
-          merged.contact[field as keyof typeof merged.contact] = profileVal.trim()
-          persona[field] = true
-        }
-      }
-
-      return { merged, persona }
+      return fillMissingResumeContactFields(content, body)
     } catch {
       return { merged: content, persona: {} }
     }
@@ -529,7 +504,7 @@ export function ResumeIntakeDialog({ onClose, onSaved, directions: initialDirect
                         boxSizing: 'border-box',
                       }}
                     />
-                    {personaFields[field as keyof PersonaFields] && (
+                    {personaFields[field as keyof PersonaContactFields] && (
                       <div style={{ fontSize: 9, color: 'var(--primary)', marginTop: 2, opacity: 0.8 }}>
                         {t('resume.intake.personaHint')}
                       </div>
