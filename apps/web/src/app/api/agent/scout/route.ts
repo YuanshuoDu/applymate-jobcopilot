@@ -15,6 +15,9 @@ import { requireAuth, isErrorResponse, ok, err } from '@/lib/api-helpers'
 const redisUrl = process.env.REDIS_URL ?? 'redis://localhost:6379'
 const SCOUT_QUEUE_NAME = 'scout-tasks'
 const COOLDOWN_SECONDS = 86_400 // 24 hours
+// Keep this key aligned with the Worker control plane. A paused Worker must
+// not accumulate Scout jobs that cannot be processed until a later resume.
+const WORKER_RUNTIME_STATE_KEY = 'admin-control:worker-runtime-state'
 
 interface ScoutTaskPayload {
   userId: string
@@ -28,6 +31,11 @@ export async function POST(req: NextRequest) {
   const scoutQueue = new Queue<ScoutTaskPayload>(SCOUT_QUEUE_NAME, { connection })
 
   try {
+    const runtimeState = await connection.get(WORKER_RUNTIME_STATE_KEY)
+    if (isWorkerPaused(runtimeState)) {
+      return err('Automatic Scout is currently off. Search Jobs remains available.', 409)
+    }
+
     const cooldownKey = `scout:cooldown:${auth.userId}`
     const existing = await connection.get(cooldownKey)
     if (existing) {
@@ -55,5 +63,15 @@ export async function POST(req: NextRequest) {
   } finally {
     await scoutQueue.close()
     connection.disconnect()
+  }
+}
+
+function isWorkerPaused(raw: string | null): boolean {
+  if (!raw) return false
+  try {
+    const state = JSON.parse(raw) as { status?: unknown }
+    return state.status === 'paused'
+  } catch {
+    return false
   }
 }

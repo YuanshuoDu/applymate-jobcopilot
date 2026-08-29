@@ -157,7 +157,7 @@ const DUBLIN_TECH_COMPANIES = new Set([
 const IRELAND_TECH_KEYWORDS = /\b(software|engineer|developer|data|cloud|devops|fintech|pharma|medtech|sre|platform|backend|frontend|fullstack|security|product|ux|ui)\b/i
 
 const JOBICY_GEO: Record<string, string> = {
-  gb: 'uk', ie: 'uk',
+  gb: 'uk', ie: 'ireland',
   nl: 'netherlands', de: 'germany', fr: 'europe', at: 'europe', ch: 'europe',
   be: 'europe', es: 'europe', it: 'europe', pl: 'europe', se: 'europe',
   dk: 'europe', fi: 'europe', no: 'europe', pt: 'europe',
@@ -256,6 +256,19 @@ function smartRouter(q: string, f: SearchFilters, qa?: QueryAnalysis): RouterDec
     return p
   }
 
+  // Keep manual Search Jobs useful when paid credentials are absent or
+  // exhausted. These public sources are a zero-cost safety net and the
+  // provider router executes them before any paid source.
+  const addFreeFallbacks = () => {
+    const geo = country ? (JOBICY_GEO[country] ?? (isEU ? 'europe' : 'anywhere')) : isUS ? 'usa' : 'anywhere'
+    if (!sources.some(source => source.id === 'jobicy')) {
+      sources.push({ id: 'jobicy', params: { tag: title || q, geo } })
+    }
+    if (!sources.some(source => source.id === 'remotive')) {
+      sources.push({ id: 'remotive', params: { q: title || q } })
+    }
+  }
+
   // Internship search → dedicated Internships API (free, specialized) takes priority
   if (isInternship) {
     sources.push({ id: 'internships', params: {
@@ -268,9 +281,10 @@ function smartRouter(q: string, f: SearchFilters, qa?: QueryAnalysis): RouterDec
     if (sources.length < 3)
       sources.push({ id: 'ats', params: baseParams(loc || (isUS ? 'United States' : '')) })
     addCleanJobData()
+    addFreeFallbacks()
     return {
       reasoning: `Internship Search → ${sources.map(s => s.id).join(' + ')}`,
-      sources: sources.slice(0, hasCleanJobData ? 4 : 3),
+      sources: sources.slice(0, (hasCleanJobData ? 4 : 3) + 2),
     }
   }
 
@@ -307,12 +321,13 @@ function smartRouter(q: string, f: SearchFilters, qa?: QueryAnalysis): RouterDec
     sources.push({ id: 'linkedin', params: baseParams(loc || 'Worldwide') })
     sources.push({ id: 'ats', params: baseParams(loc || 'Worldwide') })
     addCleanJobData(companyName)
+    addFreeFallbacks()
     return { reasoning: `Company search → ${sources.map(source => source.id).join(' + ')}`, sources }
   }
 
   // Remote: Jobicy (geo-filtered) + Remotive (tech-focused) + ATS
   if (isRem) {
-    const geo = country ? (JOBICY_GEO[country] ?? 'europe') : isUS ? 'usa' : 'worldwide'
+    const geo = country ? (JOBICY_GEO[country] ?? 'europe') : isUS ? 'usa' : 'anywhere'
     sources.push({ id: 'jobicy', params: { tag: title || q, geo } })
     sources.push({ id: 'remotive', params: { q: title || q } })
     if (sources.length < 3)
@@ -410,6 +425,7 @@ function smartRouter(q: string, f: SearchFilters, qa?: QueryAnalysis): RouterDec
   // Guarantee minimum 2 sources
   if (sources.length < 2) sources.push({ id: 'ats', params: baseParams(loc) })
   addCleanJobData(companyQueryName)
+  addFreeFallbacks()
 
   const names     = sources.map(s => s.id).join(' + ')
   const reasoning = isRem        ? `remote → ${names}`
@@ -418,7 +434,7 @@ function smartRouter(q: string, f: SearchFilters, qa?: QueryAnalysis): RouterDec
                   : `worldwide/USA → ${names}`
 
   // Ireland gets up to 5 sources; others get 4
-  const limit = (country === 'ie' ? 5 : 4) + (hasCleanJobData ? 1 : 0)
+  const limit = (country === 'ie' ? 5 : 4) + (hasCleanJobData ? 1 : 0) + 2
   return { reasoning, sources: sources.slice(0, limit) }
 }
 
