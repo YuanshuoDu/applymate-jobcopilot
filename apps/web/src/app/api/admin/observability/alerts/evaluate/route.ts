@@ -6,6 +6,8 @@ import { notifyAdministrators } from '@/lib/admin/admin-notifications'
 import { db } from '@/lib/db'
 import { getQueueSloSnapshot } from '@/lib/admin/queue-slo'
 import { readRedisUsage, redisCostAlertThreshold, redisUsageConfig } from '@/lib/admin/redis-usage'
+import { readNeonUsage, neonCostAlertThreshold } from '@/lib/admin/neon-usage'
+import { azureKeyVaultCostAlert, azureKeyVaultUsageConfig, readAzureKeyVaultUsage } from '@/lib/admin/azure-key-vault-usage'
 
 function authorized(request: NextRequest) {
   const authorization = request.headers.get('authorization')
@@ -13,7 +15,10 @@ function authorized(request: NextRequest) {
   return secrets.some(secret => authorization === `Bearer ${secret}`)
 }
 
-function metricValue(metric: string, snapshot: Awaited<ReturnType<typeof getObservabilitySnapshot>>, queue: Awaited<ReturnType<typeof getQueueSloSnapshot>>, redis: Awaited<ReturnType<typeof readRedisUsage>>) {
+type NeonSnapshot = Awaited<ReturnType<typeof readNeonUsage>>
+type AzureKeyVaultSnapshot = Awaited<ReturnType<typeof readAzureKeyVaultUsage>>
+
+function metricValue(metric: string, snapshot: Awaited<ReturnType<typeof getObservabilitySnapshot>>, queue: Awaited<ReturnType<typeof getQueueSloSnapshot>>, redis: Awaited<ReturnType<typeof readRedisUsage>>, neon: NeonSnapshot, azureKeyVault: AzureKeyVaultSnapshot) {
   if (metric === 'success_rate') return snapshot.overall.successRate
   if (metric === 'captcha_rate') return snapshot.overall.captchaRate
   if (metric === 'avg_duration_ms') return snapshot.overall.avgDurationMs
@@ -22,6 +27,12 @@ function metricValue(metric: string, snapshot: Awaited<ReturnType<typeof getObse
   // The REST INFO fallback is an instance-lifetime counter, so it must not
   // satisfy a monthly cost alert. Only management API stats are alertable.
   if (metric === 'redis_cost_usd') return redis?.period === 'current_month' ? redis.estimatedCostUsd : null
+  if (metric === 'neon_cost_usd') return neon?.period === 'current_month' ? neon.estimatedCostUsd : null
+  if (metric === 'azure_key_vault_cost_usd') {
+    const currency = azureKeyVault?.currency?.toUpperCase()
+    const alertCurrency = process.env.AZURE_COST_ALERT_CURRENCY?.trim().toUpperCase() || 'USD'
+    return azureKeyVault?.period === 'current_month' && azureKeyVault.cost !== null && (currency === 'USD' || currency === alertCurrency) ? azureKeyVault.cost : null
+  }
   if (metric.startsWith('queue_') && !queue.available) return null
   if (metric === 'queue_stuck_jobs') return queue.stuck
   if (metric === 'queue_failed_jobs') return queue.failed
@@ -55,11 +66,36 @@ async function evaluate(request: NextRequest) {
       if (rule?.enabled) rules = [...rules, rule]
     }
   }
+  if (!rules.some((rule) => rule.metric === 'neon_cost_usd')) {
+    const threshold = neonCostAlertThreshold()
+    const canReadNeon = Boolean(process.env.NEON_API_KEY?.trim() && (process.env.NEON_ORG_ID?.trim() || process.env.NEON_PROJECT_ID?.trim()))
+    if (threshold !== null && canReadNeon) {
+      const rule = await db.adminAlertRule.upsert({
+        where: { key: 'neon.payg_cost' },
+        create: { key: 'neon.payg_cost', name: 'Neon estimated cost', metric: 'neon_cost_usd', operator: 'gte', threshold, windowMin: 15, severity: 'high', enabled: true, createdById: 'system', updatedById: 'system' },
+        update: {},
+      }).catch(() => null)
+      if (rule?.enabled) rules = [...rules, rule]
+    }
+  }
+  if (!rules.some((rule) => rule.metric === 'azure_key_vault_cost_usd')) {
+    const threshold = azureKeyVaultCostAlert()
+    if (threshold !== null && azureKeyVaultUsageConfig()) {
+      const rule = await db.adminAlertRule.upsert({
+        where: { key: 'azure.key_vault_cost' },
+        create: { key: 'azure.key_vault_cost', name: 'Azure Key Vault actual cost', metric: 'azure_key_vault_cost_usd', operator: 'gte', threshold, windowMin: 15, severity: 'high', enabled: true, createdById: 'system', updatedById: 'system' },
+        update: {},
+      }).catch(() => null)
+      if (rule?.enabled) rules = [...rules, rule]
+    }
+  }
   const [snapshot, queue] = await Promise.all([getObservabilitySnapshot({ days: 1 }), getQueueSloSnapshot()])
   const redis = rules.some((rule) => rule.metric === 'redis_cost_usd') ? await readRedisUsage() : null
+  const neon = rules.some((rule) => rule.metric === 'neon_cost_usd') ? await readNeonUsage() : null
+  const azureKeyVault = rules.some((rule) => rule.metric === 'azure_key_vault_cost_usd') ? await readAzureKeyVaultUsage() : null
   const fired: string[] = []
   for (const rule of rules) {
-    const value = metricValue(rule.metric, snapshot, queue, redis)
+    const value = metricValue(rule.metric, snapshot, queue, redis, neon, azureKeyVault)
     if (value === null || !breached(value, rule.operator, rule.threshold)) continue
     const since = new Date(Date.now() - rule.windowMin * 60_000)
     const existing = await db.adminAlertEvent.findFirst({ where: { ruleKey: rule.key, status: 'open', createdAt: { gte: since } }, select: { id: true } })

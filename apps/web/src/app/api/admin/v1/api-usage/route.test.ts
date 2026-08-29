@@ -24,6 +24,8 @@ describe('GET /api/admin/v1/api-usage', () => {
     expect(payload.external.summary).toMatchObject({ calls: 3, dataBytes: 90, costKnown: false, errors: 1 })
     expect(payload.external.providers.find((row: { key: string }) => row.key === 'upstash-redis')).toMatchObject({ calls: 0, source: 'unavailable' })
     expect(payload.external.providers.find((row: { key: string }) => row.key === 'neon-postgres')).toMatchObject({ calls: 0, source: 'unavailable', period: null })
+    expect(payload.external.providers.find((row: { key: string }) => row.key === 'azure-key-vault')).toMatchObject({ calls: 0, source: 'unavailable', period: null })
+    expect(payload.external.summary.currency).toBeNull()
     expect(payload.external.providers.find((row: { key: string }) => row.key === 'resend')).toMatchObject({ costKnown: false })
     expect(payload.job.providers.find((row: { key: string }) => row.key === 'fantasticjobs')).toMatchObject({ calls: 0, jobs: 0 })
     expect(payload.job.providers.find((row: { key: string }) => row.key === 'cleanjobdata').lastEventAt).toBe('2026-08-23T10:00:00.000Z')

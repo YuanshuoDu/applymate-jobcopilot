@@ -16,7 +16,7 @@ export const EXTERNAL_API_PROVIDERS: ExternalApiProvider[] = [
   { key: 'github', label: 'GitHub API', category: 'oauth', access: 'user', billing: 'free', telemetry: 'events' },
   { key: 'internal-worker', label: 'Worker control API', category: 'internal', access: 'internal', billing: 'unknown', telemetry: 'events' },
   { key: 'neon-postgres', label: 'Neon Postgres', category: 'infrastructure', access: 'platform', billing: 'configurable', telemetry: 'snapshot' },
-  { key: 'azure-key-vault', label: 'Azure Key Vault', category: 'infrastructure', access: 'platform', billing: 'configurable', telemetry: 'events' },
+  { key: 'azure-key-vault', label: 'Azure Key Vault', category: 'infrastructure', access: 'platform', billing: 'configurable', telemetry: 'snapshot' },
   { key: 'vercel-speed-insights', label: 'Vercel Speed Insights', category: 'infrastructure', access: 'platform', billing: 'free', telemetry: 'unavailable' },
 ]
 
