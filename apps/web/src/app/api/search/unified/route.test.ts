@@ -48,6 +48,15 @@ describe('unified search precision', () => {
     expect(results.map(result => result.id)).toEqual(['dublin'])
   })
 
+  it('accepts a case-insensitive city typo after spelling correction', () => {
+    const results = postFilter([
+      job({ id: 'dublin', location: 'Dublin, Ireland' }),
+      job({ id: 'london', location: 'London, United Kingdom' }),
+    ], { ...baseFilters, location: 'dUbLeN' })
+
+    expect(results.map(result => result.id)).toEqual(['dublin'])
+  })
+
   it('keeps remote-source jobs available when a city is requested', () => {
     const results = postFilter([
       job({ id: 'remote-anywhere', location: 'Anywhere', source: 'jobicy' }),
@@ -80,6 +89,15 @@ describe('unified search precision', () => {
     ], 'UI UX Designer', { ...baseFilters, location: 'London' })
 
     expect(results.sort((a, b) => b.score - a.score).map(result => result.id)).toEqual(['match', 'fresh-unrelated'])
+  })
+
+  it('corrects a misspelled role and ranks its synonym above an unrelated role', () => {
+    const results = scoreSearchJobs([
+      job({ id: 'synonym', title: 'Senior Software Developer', location: 'Dublin' }),
+      job({ id: 'unrelated', title: 'Product Manager', location: 'Dublin' }),
+    ], 'Sofware Enginer', { ...baseFilters, location: 'Dublin' })
+
+    expect(results.sort((a, b) => b.score - a.score).map(result => result.id)).toEqual(['synonym', 'unrelated'])
   })
 })
 

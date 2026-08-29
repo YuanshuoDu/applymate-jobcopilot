@@ -1,3 +1,5 @@
+import { correctSearchSpelling, normalizeSearchText } from '@/app/api/search/unified/search-query'
+
 export interface DetectedSearchFilters {
   location?: string
   remote?: boolean
@@ -22,14 +24,15 @@ function removeTerm(query: string, term: string) {
 }
 
 export function extractSearchQuery(query: string): { cleanQ: string; filters: DetectedSearchFilters } {
-  let cleanQ = query.trim()
+  let cleanQ = correctSearchSpelling(query.trim())
   const filters: DetectedSearchFilters = {}
 
   for (const [hint, city] of Object.entries(CITY_HINTS)) {
-    const match = new RegExp(`(?:^|\\s|,)${hint}(?:\\s|,|$)`, 'i')
-    if (match.test(cleanQ)) {
+    const normalizedHint = normalizeSearchText(hint)
+    const match = new RegExp(`(?:^|\\s|,)${normalizedHint}(?:\\s|,|$)`, 'i').test(normalizeSearchText(cleanQ))
+    if (match) {
       filters.location = city
-      cleanQ = removeTerm(cleanQ, hint)
+      cleanQ = removeTerm(cleanQ, normalizedHint)
       break
     }
   }

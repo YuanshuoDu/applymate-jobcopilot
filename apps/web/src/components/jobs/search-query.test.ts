@@ -15,4 +15,18 @@ describe('search query extraction', () => {
       filters: { jobType: 'internship', datePosted: 'week' },
     })
   })
+
+  it('corrects a misspelled location before extracting filters', () => {
+    expect(extractSearchQuery('Sofware Enginer Dublen')).toEqual({
+      cleanQ: 'Software Engineer',
+      filters: { location: 'Dublin' },
+    })
+  })
+
+  it('keeps accented city aliases discoverable after normalization', () => {
+    expect(extractSearchQuery('Backend Engineer München')).toEqual({
+      cleanQ: 'Backend Engineer',
+      filters: { location: 'Munich' },
+    })
+  })
 })

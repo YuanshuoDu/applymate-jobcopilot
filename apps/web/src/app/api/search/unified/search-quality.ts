@@ -1,5 +1,6 @@
 import { resolveLocation } from '@/lib/agent/location-resolver'
 import type { DiscoveryApiKeys } from '@/lib/discovery-api-keys'
+import { correctSearchSpelling, createSearchIntent, normalizeSearchText, semanticRoleScore } from './search-query'
 
 export interface SearchJob {
   id: string
@@ -49,14 +50,20 @@ export function cleanSearchTitle(query: string): string {
 }
 
 export function queryKeywords(query: string): string[] {
-  return query.toLowerCase().split(/\s+/).filter(word => word.length > 2 || SHORT_ROLE_TERMS.has(word))
+  const intent = createSearchIntent(query)
+  return intent.tokens.filter(word => word.length > 2 || SHORT_ROLE_TERMS.has(word))
 }
 
 export function scoreSearchJobs(jobs: SearchJob[], query: string, filters: SearchFilters): SearchJob[] {
-  const queryText = query.toLowerCase()
-  const words = queryKeywords(queryText)
+  const rawQueryText = normalizeSearchText(query)
+  const intent = createSearchIntent(cleanSearchTitle(query))
+  const queryText = intent.normalizedQuery
+  const words = [...new Set([
+    ...intent.tokens.filter(word => word.length > 2 || SHORT_ROLE_TERMS.has(word)),
+    ...intent.semanticTokens,
+  ])]
   const titleTerms = words.filter(word => !['senior', 'junior', 'entry', 'graduate', 'lead', 'remote'].includes(word))
-  const remote = filters.remote || /\b(remote|wfh|distributed)\b/.test(queryText)
+  const remote = filters.remote || /\b(remote|wfh|distributed)\b/.test(rawQueryText)
   const experiencePatterns: Record<string, RegExp> = {
     entry: /\b(junior|entry|graduate|intern|fresher)\b/i,
     mid: /\b(mid|intermediate|ii|level 2)\b/i,
@@ -64,14 +71,15 @@ export function scoreSearchJobs(jobs: SearchJob[], query: string, filters: Searc
     lead: /\b(lead|manager|head|director|vp|principal)\b/i,
   }
   return jobs.map(job => {
-    const title = job.title.toLowerCase()
-    const description = job.description.toLowerCase().slice(0, 300)
+    const title = normalizeSearchText(job.title)
+    const description = normalizeSearchText(job.description).slice(0, 300)
     const titleMatches = titleTerms.filter(term => title.includes(term)).length
     let score = titleMatches * 5
-    if (title.includes(queryText)) score += 8
+    if (queryText && title.includes(queryText)) score += 8
     if (titleTerms.length >= 2 && titleMatches === 0) score -= 8
     if (job.description) score += 2 + Math.min(words.filter(term => description.includes(term)).length, 3)
-    if (job.keySkills?.length) score += Math.min(job.keySkills.filter(skill => words.some(term => skill.toLowerCase().includes(term))).length * 2, 6)
+    if (job.keySkills?.length) score += Math.min(job.keySkills.filter(skill => words.some(term => normalizeSearchText(skill).includes(term))).length * 2, 6)
+    score += semanticRoleScore(job.title, job.description, job.keySkills, intent)
     if (remote && (job.workArrangement === 'Remote Solely' || job.workArrangement === 'Remote OK')) score += 3
     if (job.postedAt) {
       const days = (Date.now() - new Date(job.postedAt).getTime()) / 86_400_000
@@ -145,18 +153,19 @@ function parseSalaryNum(salary?: string): { min: number; max: number } | null {
 }
 
 function matchesRequestedLocation(jobLocation: string, requestedLocation: string, source?: string) {
-  const job = jobLocation.trim().toLowerCase()
+  const job = normalizeSearchText(jobLocation)
   if (!job) return false
-  const requested = requestedLocation.trim().toLowerCase()
+  const correctedRequestedLocation = correctSearchSpelling(requestedLocation)
+  const requested = normalizeSearchText(correctedRequestedLocation)
   if (job.includes(requested)) return true
-  const resolved = resolveLocation(requestedLocation)
+  const resolved = resolveLocation(correctedRequestedLocation)
   if (resolved.isCountry && resolved.dbTerms.some(term => job.includes(term))) return true
   // Jobicy and Remotive are remote-first sources. Their "Anywhere", "Remote",
   // and "Worldwide" locations are valid for a city search even though they do
   // not contain the requested city name.
   if (!REMOTE_FIRST_SOURCES.has(source ?? '')) return false
   if (/\b(remote|anywhere|worldwide)\b/i.test(job)) return true
-  const requestedCountry = resolveLocation(requestedLocation).countryCode
+  const requestedCountry = resolveLocation(correctedRequestedLocation).countryCode
   return Boolean(requestedCountry && EUROPEAN_COUNTRIES.has(requestedCountry) && /\b(europe|emea|eu)\b/i.test(job))
 }
 
