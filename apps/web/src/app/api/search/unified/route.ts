@@ -156,6 +156,19 @@ const DUBLIN_TECH_COMPANIES = new Set([
 // Irish tech roles that dominate the Dublin market
 const IRELAND_TECH_KEYWORDS = /\b(software|engineer|developer|data|cloud|devops|fintech|pharma|medtech|sre|platform|backend|frontend|fullstack|security|product|ux|ui)\b/i
 
+function titleWithoutLocation(title: string, location: string): string {
+  const candidates = [location.trim(), location.split(',')[0]?.trim() ?? '']
+    .filter(Boolean)
+    .sort((a, b) => b.length - a.length)
+  for (const candidate of candidates) {
+    const escaped = candidate.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+    const suffix = new RegExp(`(?:\\s+(?:in|near|at)\\s+)?${escaped}\\s*$`, 'i')
+    const stripped = title.replace(suffix, '').replace(/\s+(?:in|near|at)\s*$/i, '').trim()
+    if (stripped !== title.trim()) return stripped
+  }
+  return title.trim()
+}
+
 const JOBICY_GEO: Record<string, string> = {
   gb: 'uk', ie: 'ireland',
   nl: 'netherlands', de: 'germany', fr: 'europe', at: 'europe', ch: 'europe',
@@ -224,6 +237,7 @@ function smartRouter(q: string, f: SearchFilters, qa?: QueryAnalysis): RouterDec
 
   const loc   = f.location || ''
   const title = cleanSearchTitle(q)
+  const freeSearchTitle = titleWithoutLocation(title, loc) || title || q
   const companyQueryName = qa?.isCompanyQuery
     ? q.replace(/\b(jobs at|hiring at|careers at|openings at)\b/gi, '').trim()
     : undefined
@@ -262,10 +276,10 @@ function smartRouter(q: string, f: SearchFilters, qa?: QueryAnalysis): RouterDec
   const addFreeFallbacks = () => {
     const geo = country ? (JOBICY_GEO[country] ?? (isEU ? 'europe' : 'anywhere')) : isUS ? 'usa' : 'anywhere'
     if (!sources.some(source => source.id === 'jobicy')) {
-      sources.push({ id: 'jobicy', params: { tag: title || q, geo } })
+      sources.push({ id: 'jobicy', params: { tag: freeSearchTitle, geo } })
     }
     if (!sources.some(source => source.id === 'remotive')) {
-      sources.push({ id: 'remotive', params: { q: title || q } })
+      sources.push({ id: 'remotive', params: { q: freeSearchTitle } })
     }
   }
 
@@ -328,8 +342,8 @@ function smartRouter(q: string, f: SearchFilters, qa?: QueryAnalysis): RouterDec
   // Remote: Jobicy (geo-filtered) + Remotive (tech-focused) + ATS
   if (isRem) {
     const geo = country ? (JOBICY_GEO[country] ?? 'europe') : isUS ? 'usa' : 'anywhere'
-    sources.push({ id: 'jobicy', params: { tag: title || q, geo } })
-    sources.push({ id: 'remotive', params: { q: title || q } })
+    sources.push({ id: 'jobicy', params: { tag: freeSearchTitle, geo } })
+    sources.push({ id: 'remotive', params: { q: freeSearchTitle } })
     if (sources.length < 3)
       sources.push({ id: 'ats', params: baseParams(loc || (isUS ? 'United States' : '')) })
   }

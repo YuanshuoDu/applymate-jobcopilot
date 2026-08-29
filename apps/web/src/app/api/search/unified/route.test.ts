@@ -48,6 +48,15 @@ describe('unified search precision', () => {
     expect(results.map(result => result.id)).toEqual(['dublin'])
   })
 
+  it('keeps remote-source jobs available when a city is requested', () => {
+    const results = postFilter([
+      job({ id: 'remote-anywhere', location: 'Anywhere', source: 'jobicy' }),
+      job({ id: 'different-city', location: 'London, United Kingdom', source: 'jobicy' }),
+    ], { ...baseFilters, location: 'Dublin' })
+
+    expect(results.map(result => result.id)).toEqual(['remote-anywhere'])
+  })
+
   it('preserves distinct junior and senior openings at the same company', () => {
     const results = smartDedup([
       job({ id: 'junior', title: 'Junior UX Designer', url: 'https://example.com/jobs/junior' }),
@@ -130,6 +139,32 @@ describe('GET /api/search/unified CleanJobData routing', () => {
     expect(payload.meta.sourcesUsed).toContain('jobicy')
     expect(urls.some(url => url.startsWith('https://jobicy.com/') && new URL(url).searchParams.get('geo') === 'anywhere')).toBe(true)
     expect(urls.some(url => url.startsWith('https://remotive.com/'))).toBe(true)
+  })
+
+  it('separates the city from the free-provider keyword search', async () => {
+    mocks.getDiscoveryApiAccess.mockResolvedValue(access(''))
+    mocks.pinnedFetch.mockImplementation(async (input: string | URL) => {
+      const url = String(input)
+      if (url.startsWith('https://jobicy.com/')) {
+        expect(new URL(url).searchParams.get('tag')).toBe('Data Engineer')
+        return new Response(JSON.stringify({ jobs: [{
+          id: 2, url: 'https://jobicy.com/jobs/data-engineer', jobTitle: 'Data Engineer',
+          companyName: 'Acme', jobType: ['Full Time'], jobGeo: 'Anywhere',
+          jobExcerpt: 'Build data systems', pubDate: '2026-08-28T10:00:00.000Z',
+        }] }), { status: 200, headers: { 'content-type': 'application/json' } })
+      }
+      if (url.startsWith('https://remotive.com/')) {
+        expect(new URL(url).searchParams.get('search')).toBe('Data Engineer')
+        return new Response(JSON.stringify({ jobs: [] }), { status: 200, headers: { 'content-type': 'application/json' } })
+      }
+      return new Response(null, { status: 503 })
+    })
+
+    const response = await GET(request('Data Engineer Dublin', 'Dublin'))
+    const payload = await response.json()
+
+    expect(payload.jobs).toHaveLength(1)
+    expect(payload.jobs[0]).toMatchObject({ source: 'jobicy', title: 'Data Engineer', location: 'Anywhere' })
   })
 
   it('routes, maps, deduplicates, and reports CleanJobData results', async () => {
