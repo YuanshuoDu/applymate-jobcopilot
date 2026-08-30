@@ -1,6 +1,6 @@
 # ApplyMate Agent Harness 2.0 技术设计
 
-> **状态：** Proposed / implementation-ready
+> **状态：** Proposed / implementation-ready（第二轮 Codex-chat 审阅已补强）
 > **日期：** 2026-08-30
 > **适用范围：** ApplyMate Web、Worker、Shared packages、Agent Workspace、Auto-Apply
 > **ApplyMate 基线：** `855567b8ca16dfda2282026d26d8f2e91695c014`（`origin/master`）
@@ -36,6 +36,18 @@ ApplyMate 不应该把 Codex CLI、Codex app-server 或 Claude Code 直接嵌入
 ```
 
 这份设计不包含 Prompt 文案。Prompt、角色说明和模型调优应在协议与运行时稳定后单独设计，不能反过来替代架构。
+
+第二轮审阅结论需要说得更明确：**原方案足以建设一个可靠的 Agent 后端，但仅按原方案实施，仍不能保证得到“Codex 聊天”的交互效果。** 原因不是 UI 不像，而是此前没有把以下行为规定为一等协议：同一 Turn 内连续多次模型调用、工具结果回灌后原地继续、运行中追加指令、进度消息与最终回答分相、审批/提问后恢复、流式快照与细粒度 delta 分层、消息分支与重试。
+
+本次补强将“像 Codex”定义为可测试的运行时行为，而不是视觉模仿：
+
+- 用户消息被快速接收并立即出现在 timeline；
+- Agent 在一个 Turn 中可以多次思考摘要、发进度、调用工具、分发任务、等待、继续，最后只交付一个权威 final answer；
+- 用户在任务运行时可 steer 当前 Turn、排队下一 Turn 或 interrupt，三者语义不混淆；
+- 审批、用户回答、异步工具和 Subagent 返回都恢复原 Turn，不伪装成新的独立聊天请求；
+- 浏览器断线不取消后台工作，重连后从 durable snapshot + sequence tail 恢复；
+- 模型供应商的会话 ID 只是加速游标，ApplyMate 的 Session/Turn/Item/Event 始终是事实源；
+- 用户看到的是结构化工作过程和结果，不是原始 chain-of-thought，也不是不可审计的文本动作暗号。
 
 ---
 
@@ -108,6 +120,10 @@ Harness 2.0 的目标是把这些能力收敛为一个闭环，而不是再增�
 Codex app-server 对外采用 Thread、Turn、Item 模型：Thread 保存长期对话，Turn 表示一次用户驱动的工作，Item 表示消息、计划、推理摘要、命令、文件修改、工具调用或协作 Agent 活动。它支持 `turn/start`、`turn/steer`、`turn/interrupt`，并通过 `item/started`、delta、`item/completed` 等事件流展示生命周期。[Codex App Server](https://developers.openai.com/codex/app-server)
 
 `turn/steer` 需要 `expectedTurnId`，以避免用户输入被错误写入另一个并发 Turn；手动 compaction 也作为标准 Turn/Item 生命周期流式发布，而不是静默覆盖历史。[Codex App Server](https://developers.openai.com/codex/app-server)
+
+Codex 的 Agent message 还带有 `commentary` 与 `final_answer` phase；`item/completed` 是该 Item 的权威状态，`turn/completed` 才表示整轮结束。审批不是另开一轮聊天，而是 Turn 内的 server request：客户端提交决定后，原 Item 完成，原 Turn 继续执行。这三点直接决定客户端不能把“收到一段文本”误判为“任务完成”。[Codex App Server](https://developers.openai.com/codex/app-server)
+
+Codex 还支持从指定 Turn fork Thread、分页读取 Turns/Items，并将 Subagent 并发限制在 Session 级。ApplyMate 不需要复制全部接口，但应保留分支历史、Session 级并发和按 Turn/Item 恢复的语义，否则长任务、重试和多 Agent 结果会在聊天层失真。[Codex App Server](https://developers.openai.com/codex/app-server)、[Codex Subagents](https://developers.openai.com/codex/subagents)
 
 ### 3.2 Codex 源码中真正值得复用的结构
 
@@ -222,6 +238,21 @@ Harness 2.0 必须规定：
 - 一个自动化 session 中每次调度对应哪次运行；
 - Turn 级模型、预算、错误、最终答复与 token 使用。
 
+#### P0：当前 Chat 不是可持续的 Agent Loop
+
+当前 `/api/agent/chat` 的真实路径是：
+
+```text
+createChatPlan（固定只选一个 specialist）
+  → runChatWorker（单次同步执行）
+  → synthesizeChatResult（第二次模型总结）
+  → HTTP stream done
+```
+
+这条链路缺少 Turn 内 Step 循环、tool-result feedback、input queue、suspension/resume 和 final phase。`AgentPlaygroundPage` 另开 Pipeline EventSource，`agent-chat-stream.ts` 只累加 text/block/action，结果是“聊天”和“执行”仍是两个相邻系统。若不先解决这一点，新增更多 specialist 只会形成更复杂的路由器，不会形成 Codex chat。
+
+因此升级顺序必须是：**先建立 AgentStep + conversation loop + typed items，再迁移 specialist/subagent；不能先把单 specialist 改成多 specialist 并行后继续由一次 synthesis 收尾。**
+
 #### P1：三套 Orchestrator 逻辑互不统一
 
 - Chat planner 只选择一个 specialist；
@@ -288,7 +319,7 @@ flowchart TB
   end
 
   subgraph Runtime[Worker Execution Plane]
-    TurnEngine[Turn Engine]
+    TurnEngine[Conversation / Turn Engine]
     Planner[Goal Interpreter / Planner]
     Tree[Agent Tree Manager]
     Context[Context Engine / Compactor]
@@ -308,7 +339,7 @@ flowchart TB
   end
 
   subgraph Data[Durable State]
-    PG[(PostgreSQL\nSessions/Turns/Items/Events/Approvals)]
+    PG[(PostgreSQL\nSessions/Turns/Steps/Inputs/Items/Events/Approvals)]
     Redis[(Redis/BullMQ\nDispatch/Wakeup/Lease)]
     Artifacts[(Artifacts/Evidence)]
   end
@@ -319,6 +350,7 @@ flowchart TB
   Gateway --> Redis
   Query --> PG
   Stream --> PG
+  Redis --> Stream
   ApprovalUI --> Approval
   Approval --> PG
   Approval --> Redis
@@ -380,9 +412,55 @@ Worker 负责：
 - Redis 丢失后可以从 PostgreSQL 重新扫描 queued/running-stale work。
 - 不把会话完整上下文只存 Redis。
 
+### 5.3 “Codex 聊天效果”的行为契约
+
+UI 样式、打字动画和侧栏不是 Codex 体验的核心。ApplyMate 的 Chat Harness 必须满足以下九条可观察行为：
+
+| 行为 | 用户看到什么 | 运行时保证 |
+|---|---|---|
+| 快速接受 | 发送后立即出现自己的消息和“已接收/排队”状态 | Web 在事务内持久化 `AgentInput`、user Item、Turn/outbox 后返回，不等待模型 |
+| 持续工作 | 同一轮中持续出现计划、进度、工具、Subagent 和产物 | 一个 Turn 包含多个 `AgentStep`；每次工具结果可触发下一 Step |
+| 可改向 | Agent 正在运行时仍可发送“先只看 Dublin” | `delivery=steer` 写入 active Turn input queue，并要求 `expectedTurnId` |
+| 可排队 | 用户可把另一项工作放到当前任务之后 | `delivery=follow_up` 创建 queued input；当前 Turn 不吸收该输入 |
+| 可停止 | Stop 后后台真实停止可取消工作 | interrupt 级联 AbortSignal、task、tool、browser；不可逆调用进入证据核对 |
+| 可暂停恢复 | 审批、敏感问题、登录/MFA 后从原位置继续 | suspension 保留 Turn/Step/Item；回答只解除等待，不创建伪造的新任务 |
+| 可断线续传 | 刷新或离线后回来仍看到准确进度 | snapshot + durable event sequence 恢复；浏览器连接不拥有执行生命周期 |
+| 可解释但不泄露思维链 | 显示简短计划、依据和状态，不显示隐藏推理 | 只发布 `reasoning_summary`/`commentary`；原始 chain-of-thought 不持久化、不返回 |
+| 权威完成 | 最终答案清楚区分已完成、未完成和下一步 | 每个 completed Turn 最多一个权威 `final_answer` Item；由 Finalizer 基于事实生成 |
+
+### 5.4 Chat Kernel 在目标架构中的位置
+
+原图中的 TurnEngine 需要展开为真正的对话内核，而不是“规划一次、执行一次、总结一次”：
+
+```mermaid
+flowchart LR
+  Input[AgentInput\nsteer / follow_up] --> Inbox[Turn Input Queue]
+  Inbox --> Loop[Conversation Loop]
+  Loop --> Context[Step Context Builder]
+  Context --> Model[Model Adapter Stream]
+  Model --> Message[commentary/final Item]
+  Model --> Calls[Typed Tool Calls]
+  Calls --> Policy[Policy / Approval]
+  Policy -->|allow| Exec[Tool or Subagent]
+  Policy -->|suspend| Wait[Waiting State]
+  Exec --> Results[Tool/Subagent Results]
+  Results --> Loop
+  Wait -->|decision/answer| Loop
+  Loop -->|terminal verified| Final[Authoritative Final Answer]
+```
+
+关键约束：
+
+1. **一个 Session 同时最多一个 active root Turn。** Subagent 可以并发，但不能有两个根 Turn 同时争抢同一会话上下文。
+2. **一个 Turn 可以有多个 AgentStep。** Step 是一次 provider model response/attempt；Turn 不是一次 HTTP 模型调用。
+3. **一个 Step 可以产生多个 Item。** 例如 commentary、两个并行只读 tool call、usage 和 step completion。
+4. **工具/审批结果必须回到同一 Turn。** 只有 Turn 达到经过验证的 terminal condition 才产生 final answer。
+5. **事件连接不是任务所有者。** SSE 断开、页面隐藏或客户端进程退出都不能隐式 interrupt。
+6. **外部写与 final answer 解耦。** final answer 可以报告 `waiting_for_user`、`uncertain` 或部分完成，绝不能为了“聊天完整”而假报成功。
+
 ---
 
-## 6. 核心协议：Session → Turn → Item → Event
+## 6. 核心协议：Session → Turn → Step → Item → Event
 
 ### 6.1 AgentSession
 
@@ -405,6 +483,8 @@ Turn 是一次明确的用户或调度触发工作。
 type AgentTurnStatus =
   | 'queued'
   | 'in_progress'
+  | 'waiting_for_dependency'
+  | 'waiting_for_approval'
   | 'waiting_for_user'
   | 'interrupted'
   | 'completed'
@@ -424,7 +504,48 @@ Turn 必须拥有：
 - token、cost、duration；
 - optimistic `revision`。
 
-### 6.3 AgentItem
+合法状态转换：
+
+```text
+queued → in_progress
+in_progress ↔ waiting_for_dependency
+in_progress ↔ waiting_for_approval
+in_progress ↔ waiting_for_user
+queued|in_progress|waiting_* → interrupted|cancelled|failed
+in_progress → completed
+```
+
+`waiting_*` 是可恢复的 active Turn，不是 terminal。只有 `completed|failed|interrupted|cancelled` 释放 Session 的 root-turn slot 并允许 queued follow-up 启动。
+
+### 6.3 AgentStep
+
+`AgentStep` 是本次补强新增的关键层：它表示 Turn 内的一次模型响应或恢复尝试。当前 `/api/agent/chat` 把整个请求绑定为固定的“plan call → specialist call → synthesis call”，无法表示工具回灌、审批恢复和 steer 后继续。显式 Step 后，Turn 可以保持同一个用户目标而进行多次模型调用。
+
+```ts
+type AgentStepStatus =
+  | 'queued'
+  | 'streaming'
+  | 'waiting_for_tool'
+  | 'waiting_for_approval'
+  | 'waiting_for_user'
+  | 'completed'
+  | 'failed'
+  | 'interrupted'
+```
+
+Step 必须记录：
+
+- `ordinal` 和 `attempt`，支持精确重放与故障诊断；
+- `inputSnapshotId` 和 `inputThroughSequence`，说明模型实际看到了哪些事实；
+- provider/model/capability snapshot；
+- provider response/conversation cursor，但这些不是事实源；
+- finish reason、tool call IDs、usage、latency 和错误分类；
+- `consumedInputIds`，证明哪些 steer/回答已经进入本 Step；
+- parent Step，用于 repair、fallback 或恢复链路。
+
+Turn 与 Step 的关系是 `1:N`。同一个 active Turn 中只允许一个 root Step 正在调用模型；并行性发生在其创建的只读工具或 Subagent 上。
+
+### 6.4 AgentItem
 
 Item 是 Turn 中可被 UI、模型或审计理解的工作单元：
 
@@ -451,7 +572,18 @@ Item 状态统一为：
 type ItemStatus = 'started' | 'streaming' | 'completed' | 'failed' | 'interrupted'
 ```
 
-### 6.4 AgentEvent
+`agent_message` 必须有 phase：
+
+```ts
+type AgentMessagePhase = 'commentary' | 'final_answer'
+```
+
+- `commentary`：简短进度、计划变化、可读依据或阶段总结；允许一个 Turn 多条。
+- `final_answer`：Turn 的权威交付；completed Turn 最多一条。
+- `reasoning_summary`：独立可选 Item；不得包含原始 chain-of-thought。
+- `tool_call` 和 `approval_request` 不是 assistant 文本的附件字符串，而是独立、可交互 Item。
+
+### 6.5 AgentEvent
 
 Event 是 append-only 的事实流；Item 是 Event reducer 后的实体。两者不能混为一张展示表。
 
@@ -483,7 +615,34 @@ interface AgentEventEnvelope<T = unknown> {
 - started、delta、completed 共享 itemId；
 - 业务写与 event/outbox 在同一数据库事务中提交。
 
-### 6.5 兼容现有表
+### 6.6 AgentInput 与会话输入队列
+
+用户在 Agent 运行时发送的消息不能直接拼进下一次 prompt，也不能仅保存在 React state。每条输入先持久化为 `AgentInput`：
+
+```ts
+interface AgentInputCommand {
+  clientMessageId: string
+  sessionId: string
+  expectedTurnId: string | null
+  delivery: 'steer' | 'follow_up'
+  content: Array<TextPart | AttachmentRefPart>
+}
+```
+
+状态：`accepted | queued | consumed | cancelled | rejected`。
+
+规则：
+
+- Session idle 时，任意有效输入创建新 Turn；
+- Session active 时，composer 默认显示“添加到当前任务”，发送 `steer`；
+- 用户选择“下一项任务”时发送 `follow_up`，待当前 Turn terminal 后创建新 Turn；
+- `steer` 必须匹配 `expectedTurnId`，否则 `409 active_turn_changed`，客户端刷新状态后让用户重发或改为 follow-up；
+- 同一 `clientMessageId` 在 Session 内幂等；重连/双击不会生成两条 user Item；
+- accepted steer 按 sequence FIFO 消费；多个尚未消费的纯约束 steer 可由确定性 collector 合并，但原始输入不可改写；
+- approval decision 和 question answer 使用各自 typed command，不混入普通 steer 文本；
+- Automation 输入只创建独立 queued Turn，不 steer 用户当前正在运行的 Turn。
+
+### 6.7 兼容现有表
 
 - `AgentTranscriptEvent` 在迁移期保留为 UI projection，不再作为最终事实源。
 - `AgentRun` 保留为历史 summary，逐步改为 Turn 完成后的 projection。
@@ -534,6 +693,77 @@ claim turn lease
 ```
 
 每一步最多执行一个可恢复 side effect。任何可能重试的 side effect 必须有 idempotency key。
+
+#### 7.2.1 同一 Turn 的多 Step 对话循环
+
+TurnEngine 的实际循环应接近以下伪代码：
+
+```ts
+while (!turn.isTerminal()) {
+  assertLeaseAndBudget(turn)
+  const inputs = await inputQueue.claimUnconsumedSteer(turn.id)
+  const context = await contextEngine.buildStepContext(turn, inputs)
+  const step = await stepRepository.start(turn, context)
+
+  const outcome = await modelAdapter.streamStep({
+    context,
+    tools: toolRegistry.visibleTo(turn.rootTaskId),
+    signal: turn.abortSignal,
+  })
+
+  await stepReducer.persist(outcome)
+
+  if (outcome.kind === 'tool_calls') {
+    const calls = await toolRouter.validateAndSchedule(outcome.calls)
+    const results = await toolCoordinator.awaitRequiredResults(calls)
+    await contextEngine.attachToolResults(step.id, results)
+    continue // 在同一个 Turn 中启动下一 AgentStep
+  }
+
+  if (outcome.kind === 'suspended') {
+    await turn.suspend(outcome.reason) // approval/question/login/MFA
+    return
+  }
+
+  if (outcome.kind === 'candidate_final') {
+    const verified = await finalizer.verifyCandidate(turn, outcome)
+    if (verified.ok) return turn.complete(verified.finalItem)
+    await contextEngine.attachVerifierFeedback(step.id, verified.feedback)
+    continue
+  }
+
+  if (outcome.kind === 'retryable_error') continue
+  return turn.fail(outcome.error)
+}
+```
+
+这里的 `awaitRequiredResults` 不表示阻塞一个 HTTP 请求，而是持久化等待条件并释放 Worker。工具、审批、用户回答或 Subagent 结果到达后，通过 outbox/wakeup 重新 claim Turn。
+
+#### 7.2.2 安全边界与终止条件
+
+每次循环都必须检查：
+
+- 新 steer 是否使尚未执行的 plan/tool 参数失效；
+- 已有 artifact 是否因目标变化变为 `possibly_stale`；
+- approval scope/hash 是否仍匹配；
+- context/token/tool/cost/wall-clock/subagent budget；
+- interrupt 是否已请求；
+- 是否正在重复无进展的 model/tool pattern。
+
+终止原因必须是程序可验证的枚举，而不是模型说“完成了”：
+
+```ts
+type TurnTerminalReason =
+  | 'goal_satisfied'
+  | 'partial_result'
+  | 'waiting_requires_new_turn'
+  | 'user_interrupted'
+  | 'budget_exhausted'
+  | 'policy_denied'
+  | 'unrecoverable_error'
+```
+
+防止死循环：默认每 Turn 最多 24 个 root model steps、64 个 tool calls、8 个 repair/fallback steps；达到上限时 Finalizer 生成明确的 partial/failed 结果，不继续静默消耗。
 
 ### 7.3 GoalInterpreter 与 Planner
 
@@ -847,6 +1077,9 @@ interface ModelCapabilityProfile {
   supportsStructuredOutput: boolean
   supportsStreamingToolArgs: boolean
   supportsReasoningSummary: boolean
+  supportsResponseContinuation: boolean
+  supportsProviderConversation: boolean
+  supportsBackgroundResponse: boolean
   maxContextTokens: number | null
   maxOutputTokens: number | null
   costClass: 'low' | 'medium' | 'high' | 'unknown'
@@ -861,8 +1094,12 @@ interface HarnessModelRequest {
   tools: ToolSpec[]
   outputSchema?: JsonSchema
   toolChoice?: 'auto' | 'none' | { name: string }
+  continuation?: {
+    providerResponseId?: string
+    providerConversationId?: string
+  }
   abortSignal: AbortSignal
-  metadata: { sessionId: string; turnId: string; taskId: string }
+  metadata: { sessionId: string; turnId: string; stepId: string; taskId: string }
 }
 ```
 
@@ -898,6 +1135,35 @@ type HarnessModelEvent =
 - Finalizer：低成本模型或模板优先。
 
 路由依据应是 capability 和任务风险，而不仅是 featureId。
+
+### 10.4 Provider continuation 只是优化，不是会话事实源
+
+OpenAI Responses API 可使用 `previous_response_id` 或 Conversation 对象延续模型状态；其他 provider 可能有不同 cursor，或完全没有原生延续。ApplyMate adapter 可以利用这些能力降低上下文组装延迟，但必须遵守：
+
+1. `AgentEvent`、`AgentItem`、`AgentContextSnapshot` 是 canonical history；provider cursor 只记录在 `AgentStep`。
+2. provider cursor 失效、过期、切换模型或 fallback 时，由 ContextEngine 重建完整输入，不能丢失会话。
+3. 不假设 provider 保存期满足 ApplyMate 的数据保留和 GDPR 策略；BYOK 默认也不能依赖第三方长期存储。
+4. 工具结果、审批和 user steer 必须先落 ApplyMate 数据库，再作为下一 Step 输入；不能只注入 provider 对话。
+5. 切换 provider/model 必须生成 `model.rerouted` event，并记录原因、前后 capability profile 和费用。
+6. 同一 Step 失败后，只能在未发生不可逆 side effect 或已完成证据核对时 fallback。
+
+[OpenAI Conversation State](https://developers.openai.com/api/docs/guides/conversation-state) 提供的是 provider 级多轮延续能力；它不能替代产品级 Session/Turn/Item/Event。
+
+### 10.5 Instruction 与不可信上下文分层
+
+本设计不提供 Prompt 文案，但实现必须固定输入层次，避免业务数据改变系统规则：
+
+```text
+1. harness safety invariants
+2. product/domain policy
+3. task role and allowed tools
+4. durable session goal and confirmed user constraints
+5. verified business records and artifact references
+6. tool/subagent observations marked as untrusted data
+7. latest user/steer input
+```
+
+第三方 job description、网页 DOM、邮件和工具输出永远属于不可信 data layer；其中出现的“忽略规则”“自动提交”等文本不能提升为 instruction。
 
 ---
 
@@ -938,20 +1204,74 @@ model AgentTurn {
   @@map("agent_turns")
 }
 
+model AgentStep {
+  id                     String   @id @default(cuid())
+  sessionId              String
+  turnId                 String
+  taskId                 String?
+  parentStepId           String?
+  ordinal                Int
+  attempt                Int      @default(1)
+  status                 String   @default("queued")
+  inputSnapshotId        String?
+  inputThroughSequence   BigInt
+  consumedInputIds       Json
+  modelProfileSnapshot   Json
+  providerResponseId     String?
+  providerConversationId String?
+  finishReason           String?
+  errorCode              String?
+  inputTokens            Int      @default(0)
+  outputTokens           Int      @default(0)
+  estimatedCostUsd       Decimal  @default(0) @db.Decimal(12, 8)
+  startedAt              DateTime?
+  completedAt            DateTime?
+  createdAt              DateTime @default(now())
+
+  @@unique([turnId, ordinal, attempt])
+  @@index([turnId, status, createdAt])
+  @@index([providerResponseId])
+  @@map("agent_steps")
+}
+
+model AgentInput {
+  id               String   @id @default(cuid())
+  sessionId        String
+  targetTurnId     String?
+  userId           String
+  clientMessageId  String
+  delivery         String
+  status           String   @default("accepted")
+  content          Json
+  acceptedSequence BigInt
+  consumedByStepId String?
+  consumedAt       DateTime?
+  cancelledAt      DateTime?
+  createdAt        DateTime @default(now())
+
+  @@unique([sessionId, clientMessageId])
+  @@index([sessionId, status, acceptedSequence])
+  @@index([targetTurnId, status, acceptedSequence])
+  @@map("agent_inputs")
+}
+
 model AgentItem {
   id          String   @id
   sessionId   String
   turnId      String
+  stepId      String?
   taskId      String?
   type        String
   status      String
+  phase       String?
+  revision    Int      @default(0)
   content     Json
   startedAt   DateTime?
   completedAt DateTime?
   createdAt   DateTime @default(now())
   updatedAt   DateTime @updatedAt
 
-  @@index([turnId, createdAt])
+  @@index([turnId, stepId, createdAt])
   @@index([sessionId, type, createdAt])
   @@map("agent_items")
 }
@@ -1088,6 +1408,8 @@ Approval 不是一个布尔值，而是一个有范围的一次性能力票据�
 |---|---|---|
 | 会话长期状态 | AgentSession + reducer | Session API DTO |
 | 一轮工作 | AgentTurn | UI current turn state |
+| 一次模型调用/恢复尝试 | AgentStep | provider trace/usage view |
+| 用户运行中输入 | AgentInput + user Item | composer optimistic state |
 | 执行事实 | AgentEvent | AgentItem、Transcript |
 | 任务树 | SubAgentTask + mailbox | task tree DTO |
 | 用户知识 | PersonaFact/EvidenceChunk | legacy personaFields |
@@ -1104,13 +1426,17 @@ Approval 不是一个布尔值，而是一个有范围的一次性能力票据�
 
 ```text
 POST /api/agent/sessions
+POST /api/agent/sessions/:sessionId/messages
 POST /api/agent/sessions/:sessionId/turns
 POST /api/agent/sessions/:sessionId/turns/:turnId/steer
 POST /api/agent/sessions/:sessionId/turns/:turnId/interrupt
+POST /api/agent/sessions/:sessionId/fork
 POST /api/agent/sessions/:sessionId/approvals/:approvalId/decision
 POST /api/agent/sessions/:sessionId/questions/:questionId/answer
 POST /api/agent/sessions/:sessionId/tasks/:taskId/retry
 ```
+
+`/messages` 是 Composer 的推荐入口；它根据 Session runtime status 和 `delivery` 原子决定 start、steer 或 follow-up。显式 `/turns` 与 `/steer` 保留给内部客户端和测试，二者必须调用同一个 command service，不能形成两套语义。
 
 ### 12.2 Query API
 
@@ -1163,6 +1489,38 @@ GET /api/agent/sessions/:sessionId/events
 - 已生成但未审批的材料标记 `possibly_stale`；
 - external action 一律重新做 scope/hash 检查。
 
+#### 12.4.1 Composer command 示例
+
+```json
+{
+  "clientMessageId": "01J...",
+  "expectedTurnId": "turn_123",
+  "delivery": "steer",
+  "content": [{ "type": "text", "text": "先停止生成材料，只比较薪资和签证要求。" }]
+}
+```
+
+返回必须说明服务端实际接受方式：
+
+```json
+{
+  "inputId": "input_456",
+  "disposition": "steered",
+  "turnId": "turn_123",
+  "sequence": "1045"
+}
+```
+
+`disposition` 只能是 `started | steered | queued_follow_up | duplicate`。客户端不得仅根据本地 `isRunning` 猜测消息属于哪一轮。
+
+#### 12.4.2 Retry、Edit 与 Fork
+
+- **Retry step：** 仅重试失败且满足幂等条件的 Step/Tool；不是复制整个用户消息。
+- **Regenerate final：** 从最后一个无副作用 checkpoint 创建新 Step；旧 final Item 保留并标记 superseded。
+- **Edit old user message：** 不修改历史；从该 Turn 前一边界 fork 新 Session，再提交编辑后的输入。
+- **Fork：** 请求必须带 `lastTurnId`，新 Session 复制到该 Turn 的上下文引用和历史 projection，但拥有独立 budget、task tree、approval scope 和后续 sequence。
+- fork 不继承未消费 approval，也不自动重放外部 side effect。
+
 ### 12.5 SSE
 
 ```text
@@ -1180,6 +1538,45 @@ data: { ... }
 ```
 
 客户端只维护一个 session timeline stream。Chat 文本、Pipeline 进度、Subagent、审批和浏览器工具都来自同一个事件序列。
+
+### 12.6 流式双通道：durable lifecycle + transient delta
+
+如果把每个 token 都写 PostgreSQL，成本和锁争用会迅速放大；如果 delta 只在 HTTP response 中，断线又无法恢复。采用双通道：
+
+1. **Durable channel（PostgreSQL/Event）：** command accepted、turn/step/item started、item snapshot、tool/approval lifecycle、item completed、turn completed。
+2. **Transient channel（Redis Stream/PubSub → SSE）：** 细粒度 text delta、tool progress、浏览器 progress；带 itemId、baseRevision 和短期 replay window。
+3. Worker 每 250–1000ms 或每 2–8KB 合并一次 `item.snapshot`，更新 `AgentItem.content/revision` 并追加 durable event。
+4. `item.completed` 包含权威完整内容；客户端用它覆盖拼接中的文本。
+5. 重连先读取 timeline snapshot，再用 `afterSequence` 订阅 durable tail；短期 delta 不完整时，从最新 item revision 继续，而不是重复整个答案。
+6. 客户端 reducer 用 `(itemId, revision)` 幂等；不能假定 SSE 永不重复或严格只投递一次。
+
+建议事件最小集合：
+
+```text
+input.accepted
+turn.started | turn.waiting | turn.completed
+step.started | step.completed | step.failed
+item.started | item.delta | item.snapshot | item.completed
+tool.approval_requested | tool.progress
+input.consumed
+model.rerouted
+```
+
+### 12.7 Typed content parts
+
+Agent message 与 user input 的 `content` 使用 tagged union，不把表格、审批和命令塞进 Markdown：
+
+```ts
+type ContentPart =
+  | { type: 'text'; text: string }
+  | { type: 'attachment_ref'; artifactId: string; hash: string }
+  | { type: 'job_table'; jobIds: string[]; columns: string[] }
+  | { type: 'artifact_card'; artifactId: string; label: string }
+  | { type: 'suggested_action'; command: string; arguments: unknown }
+  | { type: 'citation'; evidenceId: string; label: string }
+```
+
+`suggested_action` 仅渲染按钮；点击后仍发 typed command 并经过服务端授权。模型文本绝不直接触发前端导航、配置修改、邮件发送或申请提交。
 
 ---
 
@@ -1247,6 +1644,39 @@ Worker 在 tool_call.started 后崩溃
   → non-repeatable external tool：检查 receipt consumed、submission guard、远端证据
   → 无法证明未执行：标记 uncertain，等待用户审查，禁止自动重试
 ```
+
+### 13.4 运行中 steer 与审批后原地恢复
+
+```mermaid
+sequenceDiagram
+  participant U as User
+  participant W as Web/Gateway
+  participant E as TurnEngine
+  participant M as Model
+  participant P as Policy/Approval
+  participant T as Tool
+
+  U->>W: message(delivery=steer, expectedTurnId)
+  W->>W: persist AgentInput + user Item + event
+  W-->>U: accepted/steered
+  W-->>E: wake active Turn
+  E->>E: consume steer, invalidate stale plan/artifact
+  E->>M: start next AgentStep with updated context
+  M-->>E: external_write tool call
+  E->>P: evaluate scope
+  P-->>W: approval_request Item
+  E->>E: suspend Turn/Step, release worker lease
+  U->>W: typed approval decision
+  W->>W: validate nonce/hash/revision, consume receipt
+  W-->>E: wake same Turn
+  E->>T: execute authorized tool with idempotency key
+  T-->>E: durable result/evidence
+  E->>M: next AgentStep with tool result
+  M-->>E: candidate final_answer
+  E-->>U: verified item.completed + turn.completed
+```
+
+审批等待期间 Session 的 runtime status 是 active/waiting，而不是 completed。用户刷新页面后审批卡片仍属于原 `turnId/itemId/toolCallId`；批准后也不能重新执行批准前已经成功的 read/tool steps。
 
 ---
 
@@ -1341,6 +1771,23 @@ publisher 把 outbox 发布到 BullMQ 后写 `publishedAt`。重复发布由 job
 
 当资源不足时 task 保持 queued 并发事件说明，不把容量不足误报为业务失败。
 
+#### 15.4.1 Session 串行、任务并行
+
+- 数据库约束/conditional update 保证每个 Session 最多一个 `in_progress|waiting_*` root Turn；
+- follow-up inputs 按 acceptedSequence 创建后续 Turn；
+- read-only、互不依赖且在同一 policy snapshot 下的工具可以并行；
+- draft/internal/external writes 默认串行，除非工具定义明确声明可并发和冲突键；
+- Subagent 并发受 Session limiter、用户套餐、provider 配额和 root budget 四层共同限制；
+- root Turn 不通过轮询持续占用 Worker；等待 mailbox/tool/approval 时释放 lease，由 durable wakeup 恢复。
+
+#### 15.4.2 Stream backpressure
+
+- 模型 token delta 在 Worker 内聚合，SSE 慢客户端不能反压 provider stream 到超时；
+- 每个连接有有界内存队列；超过阈值时丢弃可重建的 transient delta，保留 durable lifecycle，通知客户端执行 snapshot refresh；
+- tool/browser progress 做采样与去重；状态未变化时不持续写“仍在运行”；
+- 大工具结果写 Artifact/Object storage，Item 只保存摘要、schema 版本、hash 和引用；
+- timeline 首屏按 Turn/Item 分页，不能每次加载整个 Session event log。
+
 ### 15.5 Cancel/Interrupt
 
 interrupt 必须传播到：
@@ -1403,6 +1850,61 @@ Main
 - UI 明确 button command；或
 - structured item 中的建议操作，用户点击后发 command。
 
+### 16.4 Composer 在 active Turn 中的精确行为
+
+Composer 不能在运行时被整体禁用。建议交互：
+
+```text
+Session idle
+  [输入消息……] [Send]
+
+Turn running
+  [输入补充或改向……] [Add to current task ▼] [Stop]
+                           └ Run next
+
+Turn waiting_for_user
+  [先完成上方问题/审批；也可发送普通补充信息]
+```
+
+- 默认 `Add to current task` 发送 steer；菜单可选 `Run next`。
+- 发送后 optimistic user bubble 显示 `sending → accepted → consumed`；失败显示可重试原因。
+- 如果 `expectedTurnId` 冲突，UI 不静默改投下一轮，应显示“当前任务已经变化”，让用户选择 steer 新 Turn 或排队。
+- Stop 只针对 active Turn；不能删除 Session，也不能撤回已经发生的外部动作。
+- 等待审批时，普通补充输入仍可接受，但审批 card 必须独立回答；不能把“可以”从自由文本猜成授权。
+- 客户端关闭 stream 仅停止观察；明确 Stop command 才 interrupt。
+
+### 16.5 Timeline 投影规则
+
+内部 Event 很多，用户 timeline 不应成为日志洪流。Projection 规则：
+
+| Item | 默认呈现 | 细节 |
+|---|---|---|
+| user_message | 普通气泡 + delivery 状态 | 可显示“已加入当前任务/下一项” |
+| commentary | 紧凑进度文本 | 不冒充 final answer |
+| plan | 可折叠 checklist | plan 更新覆盖状态，不重复整块追加 |
+| tool_call/result | 折叠卡片 | 名称、风险、状态、耗时、结果摘要；敏感参数脱敏 |
+| subagent_activity | task tree + timeline milestone | 不把每个 heartbeat 变成消息 |
+| approval/question | 强交互卡片 | 作用域、后果、过期、按钮；回答后只读保存 |
+| artifact/job_table | 原生结构化组件 | 数据来自 ID 查询，不信任模型 Markdown |
+| final_answer | 唯一突出回答 | 已完成/未完成/阻塞/下一步 |
+
+客户端必须以 `item.completed` 的完整内容覆盖 streaming 拼接版本；commentary 与 final 分开存储和渲染，不能把进度文本累加进最终回答。
+
+### 16.6 “真的像 Codex”发布门槛
+
+在 `AGENT_UI_TIMELINE_V2` 对普通用户开启前，必须通过以下端到端剧本：
+
+1. 用户提出复合目标，Agent 在同一 Turn 至少经历 3 个 Step、2 个工具并生成唯一 final answer；
+2. 工具运行时用户发送 steer，未开始任务采用新约束，旧约束产物标记 stale；
+3. 用户发送 follow-up，当前 Turn 不受影响，完成后自动启动下一 Turn；
+4. 审批请求出现后刷新页面，审批仍存在；批准后原 Turn 恢复且不重复前序工具；
+5. Stop 在目标 SLO 内中断 model stream 和 descendants，并生成 interrupted terminal state；
+6. SSE 人为断线 30 秒，后台继续；重连无重复气泡、无丢失 completed Item；
+7. provider continuation cursor 故意失效，系统从 canonical context 重建并继续；
+8. 一个 Subagent 失败、另一个成功，root 能总结 partial result 而不整体假失败；
+9. 模型在文本中输出类似 `ACTION:submit`，UI 和服务端均不执行；
+10. 手机与桌面端都能发送 steer、Stop、审批、查看最终结果，且选定语言不混用。
+
 ---
 
 ## 17. 建议目录结构
@@ -1413,6 +1915,8 @@ packages/
     src/
       session.ts
       turn.ts
+      step.ts
+      input.ts
       item.ts
       event.ts
       tool.ts
@@ -1505,7 +2009,7 @@ apps/worker/src/runtime/
 实施文件：
 
 - 新增 `packages/agent-protocol`；
-- Prisma 新增 AgentTurn、AgentItem、AgentEvent、AgentOutbox；
+- Prisma 新增 AgentTurn、AgentStep、AgentInput、AgentItem、AgentEvent、AgentOutbox；
 - Web command/query/event repository；
 - 旧 recorder dual-write 到 AgentEvent；
 - event sequence allocator；
@@ -1517,6 +2021,8 @@ apps/worker/src/runtime/
 - 所有旧 transcript 仍可显示；
 - 未知事件可保存与 replay；
 - SSE 断线后按 sequence 恢复，无重复 UI item。
+- 同一个 clientMessageId 重试只产生一条 AgentInput/user Item；
+- 数据库层阻止同一 Session 出现两个 active root Turn。
 
 回滚：关闭 `AGENT_PROTOCOL_V2_DUAL_WRITE`，旧表继续工作。
 
@@ -1529,6 +2035,7 @@ apps/worker/src/runtime/
 - ModelRouter/Shared LLM 增加 capability profile；
 - 新增 ToolRegistry、ToolRouter、lifecycle、schema validation；
 - 支持 native tools 和 structured-step fallback；
+- provider continuation cursor、model reroute 和完整上下文 fallback；
 - 工具调用写 started/completed/failed item；
 - 接入 cancellation 和 usage metadata。
 
@@ -1540,6 +2047,7 @@ apps/worker/src/runtime/
 - provider 输出非法工具名或 schema 时不能执行；
 - tool event 可完整 replay；
 - tool timeout 会中断且不遗留 running item。
+- 同一 Turn 可完成 `model step → read tool → model step → final`，而不是另开 chat request。
 
 ### Phase 3：PolicyEngine 与 Approval Receipt
 
@@ -1568,6 +2076,8 @@ apps/worker/src/runtime/
 实施：
 
 - Worker Turn queue/engine/lease/recovery；
+- 多 Step conversation loop、Step budget 和 no-progress detector；
+- AgentInput steer/follow-up queue 与 consume checkpoint；
 - `pipeline.run` 作为 coarse-grained tool；
 - Web `/api/internal/agent-run` 仅作迁移适配；
 - checkpoint 事件映射；
@@ -1580,6 +2090,8 @@ apps/worker/src/runtime/
 - Worker restart 后从 Pipeline checkpoint 恢复；
 - interrupt 会真正停止后续 stage/queue，不只是关 UI stream；
 - 旧 AgentRun/history 仍通过 projection 可用。
+- waiting/approval/tool result 到达后恢复原 Turn，不重复已完成 Step；
+- provider response cursor 丢失时可从 ContextSnapshot + Items 重建下一 Step。
 
 ### Phase 5：真实 Subagent Manager
 
@@ -1664,6 +2176,7 @@ Browser `AgentHarness` 变为 `browser.fill_form` executor：
 - task tree；
 - turn history；
 - steer/interrupt；
+- active Turn composer 的 steer/follow-up 选择与 accepted/consumed 状态；
 - context compaction block；
 - tool/approval/artifact block；
 - 移除 `liveSessionId`/`selectedSessionId` 双写逻辑；
@@ -1677,6 +2190,8 @@ Browser `AgentHarness` 变为 `browser.fill_form` executor：
 - 多语言 UI 不混用语言；
 - mobile/desktop 完整浏览器验证；
 - 所有 action 失败有可见状态。
+- commentary 与 final_answer 分相，completed Turn 恰有一个权威 final；
+- 通过 16.6 的十个 Codex-chat 端到端剧本。
 
 ### Phase 9：Evals、优化和遗留清理
 
@@ -1806,6 +2321,25 @@ Browser `AgentHarness` 变为 `browser.fill_form` executor：
 
 评分维度：goal adherence、factuality、tool correctness、approval correctness、recovery、summary completeness、cost、latency。
 
+### 20.6 Chat protocol contract tests
+
+这些测试不依赖模型措辞，使用 scripted adapter 验证 Harness 行为：
+
+| Case | Scripted model/tool 行为 | 必须断言 |
+|---|---|---|
+| multi-step | Step 1 tool call，Step 2 commentary + tool call，Step 3 final | 同一 turnId、ordinal 递增、唯一 final |
+| steer race | model streaming 时收到匹配/不匹配 expectedTurnId | 匹配输入被下一 Step 消费；不匹配返回 409 |
+| follow-up | active Turn 收到 run-next 输入 | 当前 context 不含该输入；terminal 后创建下一 Turn |
+| approval resume | external tool 请求审批，Worker 退出后批准 | 原 toolCallId 恢复，receipt 只消费一次 |
+| disconnect | SSE 断开后继续产生 events | 执行未取消；snapshot + tail 得到同一最终 projection |
+| delta duplicate | 重放重复/乱序 transient delta | completed Item 权威覆盖，无重复文本 |
+| provider cursor loss | continuation 返回 not found | full context fallback，新 Step 成功且历史不丢 |
+| model reroute | provider 在工具前失败 | reroute event 完整；无不可逆动作重复 |
+| interrupt | tool/subagent/model 同时活动 | cancel 级联，Turn terminal 为 interrupted |
+| stale material | steer 改变 job/材料约束 | artifact 和 approval 失效，external tool 被拒绝 |
+| no progress | 模型重复同一无效工具调用 | 命中循环 guard，返回可解释 partial/failed final |
+| text command injection | 文本输出 `ACTION:submit` | 零 command、零 tool execution |
+
 ---
 
 ## 21. 可观测性与 SLO
@@ -1836,13 +2370,26 @@ provider, model, queueJobId, correlationId
 | event projection lag | UI 新鲜度 |
 | stale lease recovery count | Worker 稳定性 |
 | duplicate dispatch suppressed | 幂等性 |
+| input accepted/consumed latency | Composer 是否真正可交互 |
+| time to first commentary/final delta | 聊天主观响应速度 |
+| longest progress silence | 长任务是否让用户误以为卡死 |
+| reconnect catch-up latency | 刷新后的恢复体验 |
+| interrupt propagation latency | Stop 是否真实生效 |
+| steps per turn / no-progress abort | 多步循环效率和死循环风险 |
+| final answers per completed turn | 应恒为 1 |
 
 ### 21.3 初始 SLO
 
 - command 接收 p95 < 500ms；
+- user Item/`input.accepted` 首次可见 p95 < 800ms；
+- 有容量时首个 commentary/plan lifecycle p95 < 2s，首个模型文本 delta p95 < 5s；
 - event 写入到 SSE 可见 p95 < 2s；
 - queued turn 在有容量时 p95 < 10s 开始；
+- 运行中无进度静默不超过 15s；超过时发基于真实状态的 heartbeat/progress，而非模型编造文本；
+- SSE 重连后的 snapshot + tail catch-up p95 < 3s（最近 500 Items 范围）；
+- interrupt command 接收后，model/subagent/tool 可取消路径 p95 < 5s 观察到 interrupted/cancelling；
 - timeline replay 事件缺失率 0；
+- completed Turn 的权威 final_answer 数量必须恰为 1；interrupted Turn 可为 0；
 - external side effect duplicate rate 0；
 - tenant scope violation 0；
 - approval scope mismatch 必须 100% 拒绝；
@@ -1857,6 +2404,8 @@ provider, model, queueJobId, correlationId
 ```text
 AGENT_PROTOCOL_V2_DUAL_WRITE
 AGENT_EVENT_SSE_V2
+AGENT_INPUT_QUEUE_V2
+AGENT_CHAT_LOOP_V2
 AGENT_TURN_WORKER_V2
 AGENT_TOOL_KERNEL_V2
 AGENT_POLICY_V2
@@ -1935,12 +2484,17 @@ AGENT_UI_TIMELINE_V2
 Harness 2.0 只有在以下全部成立时才算完成：
 
 - [ ] Chat、manual run、automation、browser apply 都创建统一 AgentTurn；
+- [ ] 一个 Turn 可包含多个 AgentStep，工具/审批/Subagent 结果能触发原 Turn 的下一 Step；
+- [ ] 同一 Session 最多一个 active root Turn，steer 与 follow-up 有独立、幂等输入队列；
 - [ ] UI 从单一 AgentEvent timeline replay；
+- [ ] commentary 与 final_answer 分相；completed Turn 恰有一个权威 final；
 - [ ] `ACTION:` 文本协议已移除；
 - [ ] 模型调用支持 provider-neutral tools/structured steps；
 - [ ] 工具全部经过 schema、policy、lifecycle 和 telemetry；
 - [ ] Subagent 有真实 task tree、mailbox、lease、budget 和 interrupt；
 - [ ] 用户 steer 能安全进入 expected active turn；
+- [ ] 断开 SSE 不取消任务，snapshot + sequence tail 可无重复恢复；
+- [ ] provider continuation cursor 失效或切换模型时可从 canonical history 重建；
 - [ ] 长会话支持可验证 compaction；
 - [ ] Persona、artifact、FormPattern 各自保持明确 ownership；
 - [ ] external submit/send 默认拒绝，只有匹配的一次性 approval receipt 可放行；
@@ -1959,11 +2513,11 @@ Harness 2.0 只有在以下全部成立时才算完成：
 
 1. 修复 submit guard fail-open；
 2. 建立 `packages/agent-protocol`；
-3. 添加 AgentTurn/AgentEvent/AgentItem/Outbox；
+3. 添加 AgentTurn/AgentStep/AgentInput/AgentEvent/AgentItem/Outbox；
 4. 对现有 Pipeline 做 dual-write；
 5. 建立 provider-neutral ToolRegistry，先迁只读工具；
 6. 建立统一 PolicyEngine 和 scoped approval receipt；
-7. 再实现 Worker TurnEngine；
+7. 再实现 Worker TurnEngine 的多 Step conversation loop、input queue 和 suspension/resume；
 8. 最后才开放真实 Subagent spawn 和上下文压缩。
 
 这样每一步都有产品价值、有回滚路径，也不会牺牲当前已经工作的求职申请流程。
@@ -1977,6 +2531,8 @@ Harness 2.0 只有在以下全部成立时才算完成：
 - [Codex App Server](https://developers.openai.com/codex/app-server)
 - [Codex as a platform: build on the open agent harness](https://developers.openai.com/blog/codex-as-a-platform)
 - [Codex SDK](https://developers.openai.com/codex/sdk)
+- [Codex Subagents](https://developers.openai.com/codex/subagents)
+- [OpenAI Conversation State](https://developers.openai.com/api/docs/guides/conversation-state)
 
 ### Codex 开源源码（研究基线 commit `88f7765`）
 
