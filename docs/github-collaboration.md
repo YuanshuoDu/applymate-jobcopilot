@@ -85,6 +85,15 @@ Good subagent tasks include repository reconnaissance, independent provider adap
 
 Subagent completion is not Issue completion. Primary Codex must inspect the returned diff or evidence, reject out-of-scope changes, integrate it on the primary branch, and rerun the Issue-level checks before requesting Claude review.
 
+## Issue and Roadmap Conflict Protocol
+
+When an Issue and `docs/agent-harness-v2-development-roadmap.md` appear inconsistent, Primary Codex must compare the Issue, the roadmap, the upstream technical design, and current repository evidence before changing code.
+
+- If the Issue is the outlier and the roadmap is coherent, Primary Codex comments `@claude clarification needed` and waits for Issue correction.
+- If repository evidence proves that the roadmap omitted a required module, dependency, safety boundary, or verification step, Primary Codex makes the smallest roadmap correction in a reviewable commit and comments `@claude roadmap corrected — please reread the relevant section` with file/line evidence.
+- A roadmap correction must not silently alter the active Issue's AC. If it changes scope, dependency ordering, or safety behavior, Claude must update or reconfirm the Issue before implementation continues.
+- If evidence cannot distinguish the two cases, the task remains blocked rather than guessing.
+
 ## Label Taxonomy
 
 ### Type

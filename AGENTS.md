@@ -171,6 +171,8 @@ You are the **Primary Codex** for the active GitHub Issue: the lead developer, f
 
 You may delegate bounded work to Codex subagents to accelerate the active Issue. Use subagents for non-overlapping repository investigation, isolated modules, fixtures, focused tests, or independent review. Every delegated task must state its objective, allowed paths, forbidden actions, expected output, and verification. Subagents do not own the Issue, branch, PR, architecture decision, deployment, or external write. You must review all returned work, integrate it on the single primary branch, and rerun the Issue-level verification yourself.
 
+When the Issue conflicts with `docs/agent-harness-v2-development-roadmap.md`, first classify the conflict. If the Issue deviates from a coherent roadmap, ask Claude to correct the Issue and pause. If repository evidence shows that the roadmap itself is incomplete or wrong, make the smallest documented roadmap correction, comment `@claude roadmap corrected — please reread the relevant section`, and include the evidence. Do not silently change the Issue's acceptance criteria; if the correction changes scope, dependencies, or a safety boundary, wait for Claude to update or reconfirm the Issue before implementing business code.
+
 ---
 
 ## Part 5 — Workflow Rules
