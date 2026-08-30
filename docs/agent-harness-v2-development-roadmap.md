@@ -36,6 +36,10 @@
 10. 自动化复用 canonical Session，但每次执行创建独立 Turn；不能不断创建重复 Session。
 11. CAPTCHA、登录、MFA 和未知敏感字段进入 `waiting_for_user`，不实施 solver 绕过。
 12. 每个 PR 从 `origin/master` 的最新状态创建 `codex/ah2-<issue>-<slug>` 分支，禁止直接提交到 `master`。
+13. Claude 是 PM、Issue dispatcher 和 reviewer；一个 Issue 只分派给一个 Primary Codex。
+14. Primary Codex 是当前 Issue 的唯一实现、集成和验证 owner，可在 Issue 内把边界明确的子任务并行分发给 Subagent。
+15. Subagent 不拥有 Issue、branch 或 PR，不直接 merge/push，也不能自行改变架构、AC、产品范围或外部系统状态。
+16. Subagent 输出只是候选 patch/evidence；Primary Codex 必须逐项审阅、解决冲突并在统一分支上重跑完整验证后才能交付。
 
 ### 0.2 Issue 标准标签
 
@@ -118,24 +122,86 @@ AH2-001
   → AH2-052
 ```
 
-### 1.4 可并行工作流
+### 1.4 Agent-native 开发与管理模型
 
-| Lane | 负责范围 | 可并行区间 |
+```mermaid
+flowchart TD
+  U[User / Product Owner] --> C[Claude\nPM + Issue Dispatcher + Reviewer]
+  C --> I[GitHub Issue\nScope + AC + Dependencies + Verification]
+  I --> P[Primary Codex\nLead Developer + Integrator + Verification Owner]
+  P --> S1[Subagent: repository scout]
+  P --> S2[Subagent: isolated implementation]
+  P --> S3[Subagent: tests / adversarial review]
+  S1 --> P
+  S2 --> P
+  S3 --> P
+  P --> R[One branch + one primary PR]
+  R --> C
+  C -->|changes requested| P
+  C -->|AC and gates pass| M[Merge / next Issue]
+```
+
+| 角色 | 核心职责 | 明确不负责 |
 |---|---|---|
-| A — Protocol/Control | schema、Prisma、command/query、SSE | Phase 1–2；随后支持 UI |
-| B — Model/Runtime | adapters、tools、TurnEngine、Subagents、Context | Phase 3–7，受 Protocol Gate 约束 |
-| C — Domain/Safety | policy、approval、Pipeline、Browser、Gmail | Phase 0、4、8 |
-| D — UI/Evals | reducer、Composer、renderers、E2E、observability | Phase 2 后可做 reducer；切流必须等 Phase 8 |
+| User | 产品目标、重大取舍、敏感动作授权 | 日常代码集成与逐行审查 |
+| Claude | Phase/Issue 拆分、依赖排序、AC、派发、PR 复审、merge/rollout Gate | 与 Primary Codex 同时修改同一 Issue 的业务代码；直接管理其内部 patch |
+| Primary Codex | 理解 Issue、制定执行图、实现关键路径、调度 Subagent、集成、完整验证、commit/push/PR、响应 review | 修改 Issue AC、扩大范围、把最终责任转交 Subagent |
+| Codex Subagent | 完成有边界、可独立验证的调查、实现、fixture、测试或 review 子任务 | 创建竞争性 PR、外部发布/提交、架构拍板、声称整个 Issue 完成 |
 
-三人团队可让 A/B/C 并行；D 在 Phase 2 后加入。任何并行不得绕过 Phase Exit Gate。
+这里有两种不同粒度的并行，必须严格区分：
+
+1. **Issue 层保持串行：** Claude 一次只把一个 GitHub Issue 置为 `in-progress`，该 Issue 只有一个 Primary Codex、一个主分支和一个主 PR。
+2. **Issue 内允许并行：** Primary Codex 可以并行运行 Subagent，但任务必须文件不重叠、输入输出明确，并能单独验收；所有结果回到主 Codex 汇合。
+3. **Phase Lane 是规划视图：** 下表用于识别依赖和可拆分边界，不等于允许绕过“一次一个 Issue”规则。只有 User/Claude 明确改变调度策略时，才可同时推进多个 Issue。
+
+| Lane | 负责范围 | 适合分发给 Subagent 的工作 | 必须由 Primary Codex 汇合的工作 |
+|---|---|---|---|
+| A — Protocol/Control | schema、Prisma、command/query、SSE | schema inventory、contract fixtures、migration review | canonical schema、事务边界、迁移/回滚结论 |
+| B — Model/Runtime | adapters、tools、TurnEngine、Subagents、Context | 独立 provider adapter、scripted stream tests、fault cases | runtime loop、capability semantics、恢复与预算约束 |
+| C — Domain/Safety | policy、approval、Pipeline、Browser、Gmail | threat cases、read-only adapter、negative fixtures | 外部写 policy、receipt scope、用户确认与幂等性 |
+| D — UI/Evals | reducer、Composer、renderers、E2E、observability | 独立 renderer、locale audit、E2E case authoring | timeline contract、端到端行为、发布判断 |
+
+#### 1.4.1 Primary Codex 的 Subagent 调度协议
+
+每个 Subagent 必须收到结构化 task contract：
+
+```yaml
+task_id: AH2-xxx/subtask-name
+objective: 单一、可验证的目标
+allowed_paths: [允许读取或修改的路径]
+forbidden_actions: [不得 push/merge/deploy、不得外部写、不得改 AC]
+inputs: [Issue、接口、fixture、依赖 commit]
+expected_output: patch | findings | tests | review
+verification: [子任务需要运行的命令和期望结果]
+done_when: [可观测完成条件]
+```
+
+默认规则：
+
+- 普通 Issue 同时运行不超过 3 个 Subagent；L 级 Issue 只有在文件和依赖完全分离时才可提高到 4–6 个。
+- 默认只允许一层委派；Subagent 不得继续 spawn Subagent，除非 Issue 明确授权并定义总 fan-out/depth/budget。
+- 优先分发只读调查、独立 adapter、fixture、测试、文档核对和对抗性 review；共享核心状态机、migration、审批/外部写和最终 integration 由 Primary Codex 掌握。
+- 两个 Subagent 不得同时修改同一文件；发现重叠时停止其中一个并回到 Primary Codex 重新切分。
+- Subagent 的“完成”只表示子任务完成。Issue 只有在 Primary Codex 完成集成、focused/full tests、diff review 和证据报告后才能进入 `code_complete`。
+
+#### 1.4.2 单个 Issue 的标准闭环
+
+1. Claude 创建/审阅 Issue，并向一个 Primary Codex 发出 `@codex` handoff。
+2. Primary Codex 读取全部 spec，建立依赖图和主关键路径，标出可安全并行的子任务。
+3. Primary Codex 为每个 Subagent 写 task contract，同时自己继续关键路径，不能只等待下游结果。
+4. Subagent 返回 patch、findings 和验证证据；不自行开 PR 或宣告 Issue 完成。
+5. Primary Codex 逐项审查结果，拒绝越界或无证据输出，解决接口和语义冲突。
+6. Primary Codex 在单一分支集成，运行 Issue 所需 V1–V5 验证，形成一个主 PR 和两层 AC self-check。
+7. Claude 对照 Issue、架构目标、CI 和环境证据 review；不满足则明确 `@codex` 请求修改。
+8. Primary Codex 修复并重新验证；Claude Gate 通过后 merge，再派发下一个 Issue。
 
 ### 1.5 推荐排期
 
-| 团队 | 粗略周期 | 说明 |
+| 执行模式 | 粗略周期 | 说明 |
 |---|---:|---|
-| 1 名工程师 | 18–24 周 | 严格串行，含 staging 观察 |
-| 2 名工程师 | 12–16 周 | Control/UI 与 Runtime/Domain 双线 |
-| 3 名工程师 | 9–12 周 | A/B/C 三线，Phase 5/8 仍需汇合 |
+| Primary Codex 串行实现 | 18–24 周 | 不使用 Subagent，含 staging 观察 |
+| Primary Codex + 1–3 Subagents | 12–16 周 | 单 Issue 内调查/实现/测试并行；主 Codex 汇合 |
+| Primary Codex + 受控 4–6 Subagents | 10–14 周 | 仅适用于边界清晰的 L Issue；Phase 5/8 和安全 Gate 仍不可压缩 |
 
 排期是容量参考，不是承诺。数据库迁移、真实 Worker 恢复和外部提交安全 Gate 不允许为了日期压缩。
 
@@ -307,6 +373,11 @@ Production  shadow metrics and canary, never live external submit without consen
 - exact commands
 - migration/staging/manual evidence if required
 
+## Primary Codex / Subagent plan
+- Primary Codex critical path:
+- Delegated subtasks and allowed paths:
+- Integration and re-verification owner: Primary Codex
+
 ## Rollback
 - feature flag/down migration/projection fallback
 
@@ -349,6 +420,7 @@ draft
 ```markdown
 ## Development checklist
 - [ ] 读取上游设计、依赖 Issue 和目标文件
+- [ ] 记录 Primary Codex 关键路径；为每个 Subagent 定义 objective、allowed paths、output 和 verification
 - [ ] 写失败测试或 contract fixture
 - [ ] 实现最小纵向切片
 - [ ] 补齐负向、并发、tenant、idempotency 测试
@@ -356,6 +428,7 @@ draft
 - [ ] 运行 focused tests 和必要 typecheck/build
 - [ ] 更新文档、事件/指标和 PR AC 表
 - [ ] push commit，记录 CI/Preview/环境证据
+- [ ] Primary Codex 已审查所有 Subagent 输出并在统一分支重跑验证
 - [ ] 满足 observation gate 后标记 done
 ```
 
@@ -1216,10 +1289,12 @@ git diff --check
 7. AH2-007 Web/Worker store；
 8. AH2-008 dual-write/projector。
 
-### Batch C — Phase 1 数据验证后并行
+### Batch C — Phase 1 数据验证后准备并行 Lane
 
 - Lane A：AH2-009 → 010/011 → 012；
 - Lane B：AH2-013 → 014/015 → 016 → 017；
 - Lane C：准备 AH2-018–021 的 policy matrix 和 negative fixtures，但不提前合并 runtime code。
+
+上述 Lane 默认作为后续 Issue 规划和单 Issue 内 Subagent 切分依据；在当前“一次一个 Issue”策略下，不同时创建多个竞争性开发分支或 PR。
 
 最先应该交给开发的 Issue 是 **AH2-001**。在它合并之前，不开始新的 unattended external-write 能力。

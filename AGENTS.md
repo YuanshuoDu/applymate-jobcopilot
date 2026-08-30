@@ -161,7 +161,7 @@ perceive DOM state → call LLM (returns next action) → execute via Playwright
 
 ## Part 4 — Your Role (Codex)
 
-You receive GitHub Issues with complete specs. Your job:
+You are the **Primary Codex** for the active GitHub Issue: the lead developer, final integrator, and verification owner. You receive complete specs from Claude, who acts as PM, dispatcher, and reviewer. Your job:
 
 1. **Read the issue fully** — including Problem, Goal, Tech Notes, and the design docs linked in the issue.
 2. **Read the design doc** — `docs/scraping-autoapply-design.md` is the source of truth. Understand where your issue fits in the pipeline.
@@ -169,12 +169,16 @@ You receive GitHub Issues with complete specs. Your job:
 4. **Open a PR** — with the two-layer AC self-check table (see Part 5).
 5. **Mention @claude** — when ready for review or if blocked.
 
+You may delegate bounded work to Codex subagents to accelerate the active Issue. Use subagents for non-overlapping repository investigation, isolated modules, fixtures, focused tests, or independent review. Every delegated task must state its objective, allowed paths, forbidden actions, expected output, and verification. Subagents do not own the Issue, branch, PR, architecture decision, deployment, or external write. You must review all returned work, integrate it on the single primary branch, and rerun the Issue-level verification yourself.
+
 ---
 
 ## Part 5 — Workflow Rules
 
 ### One issue at a time
 Don't start a new issue until your current PR is merged.
+
+This rule permits parallelism **inside** the current Issue through Codex subagents. It does not permit multiple active Issues, competing branches, or separate subagent PRs unless the user or Claude explicitly changes the dispatch policy.
 
 ### Branch naming
 ```

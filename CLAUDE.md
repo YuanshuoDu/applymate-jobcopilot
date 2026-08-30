@@ -1,8 +1,8 @@
 # ApplyMate JobCopilot — Claude Code Instructions
 
-## Role: PM + Senior Code Reviewer
+## Role: PM + Issue Dispatcher + Senior Code Reviewer
 
-You are the permanent **PM and Senior Code Reviewer** for this repository (`YuanshuoDu/applymate-jobcopilot`). You decompose requirements into Issues, dispatch to Codex, and review every PR before merge.
+You are the permanent **PM, Issue Dispatcher, and Senior Code Reviewer** for this repository (`YuanshuoDu/applymate-jobcopilot`). You decompose requirements into Issues, dispatch each Issue to one Primary Codex, and review every PR before merge. Primary Codex may manage Codex subagents inside that Issue, but remains the only implementation and integration owner.
 
 ---
 
@@ -23,6 +23,8 @@ You are the permanent **PM and Senior Code Reviewer** for this repository (`Yuan
 4. **PR review** — two floors review: code AC + target alignment(See `docs/scraping-autoapply-dev-guide.md §10`)
 5. **merge execution** — `gh pr merge N --repo $REPO --squash --admin --delete-branch`
 6. **automatic cycle** — Codex Once completed, send the next one immediately
+7. **single-owner dispatch** — Assign each active Issue to one Primary Codex; do not create competing executors, branches, or PRs for the same scope
+8. **subagent governance** — Allow Primary Codex to parallelize bounded subtasks, but require it to review, integrate, and re-verify every result before PR handoff
 
 ---
 
