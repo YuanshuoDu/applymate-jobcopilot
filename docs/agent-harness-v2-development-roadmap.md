@@ -139,6 +139,76 @@ AH2-001
 
 排期是容量参考，不是承诺。数据库迁移、真实 Worker 恢复和外部提交安全 Gate 不允许为了日期压缩。
 
+### 1.6 Phase 状态机
+
+```text
+not_started → active → implementation_complete → verifying → observing → completed
+                          ↘ blocked              ↗
+```
+
+- `implementation_complete`：本 Phase 的所有 Issue 已 merge，但不能进入下一 Phase。
+- `verifying`：执行 Phase Gate 的完整自动化、迁移、故障和浏览器验证。
+- `observing`：在 staging/production shadow 中满足规定窗口。
+- `completed`：Phase Exit Report 已审阅，所有 Gate 有证据，下一 Phase 才可 active。
+- `blocked`：记录具体 blocker、已完成范围和恢复条件；不能把未验证项标记为完成。
+
+### 1.7 Phase 完成与验证矩阵
+
+| Phase | 开始条件 | 实现完成条件 | 最终验证证据 | 完成后解锁 |
+|---|---|---|---|---|
+| 0 | 本路线图合并 | AH2-001–003 merged | 全外部动作负向矩阵、flags 默认关闭、baseline | Phase 1 |
+| 1 | Phase 0 completed | AH2-004–008 merged | migration + 48h dual-write integrity report | Phase 2/3 |
+| 2 | Store contracts 固定 | AH2-009–012 merged | command race、500 Items、SSE disconnect/reconnect | UI reducer foundations、Phase 4 |
+| 3 | Protocol/Store 可用 | AH2-013–017 merged | 三 provider contract + model→tool→model scripted trace | Phase 4/5 |
+| 4 | Control + Tool Kernel | AH2-018–021 merged | approval race/scope/expiry、PII、staging resume | Phase 5 |
+| 5 | Policy/Store ready | AH2-022–027 merged | 3+ Steps、wait/restart、interrupt、no-progress | Phase 6/7/8 adapter |
+| 6 | TurnEngine stable | AH2-028–033 merged | task concurrency、mailbox、partial success、role isolation | Phase 8 multi-agent |
+| 7 | Step context stable | AH2-034–036 merged | 100+ Items、compaction invariants、fork/cursor loss | Phase 8/long chat |
+| 8 | Runtime/Policy/Subagents | AH2-037–042 merged | full job workflow、dry-run、explicit-approved submit/send | Phase 9 cutover |
+| 9 | Domain loop stable | AH2-043–048 merged | 10 E2E、desktop/mobile、EN/ZH、single stream | Phase 10 rollout |
+| 10 | 全功能稳定 | AH2-049–052 merged | fault suite、SLO、canary、rollback、zero legacy traffic | Harness 2.0 GA |
+
+### 1.8 Phase Exit Report 模板
+
+```markdown
+# Phase N Exit Report
+
+## Scope
+- Issues completed: AH2-xxx ...
+- PRs / commits:
+- Feature flags and current values:
+- Migrations deployed:
+
+## Goal result
+- Planned outcome:
+- Actual outcome:
+- Partial/blocked items:
+
+## Verification
+- V1 unit/contract:
+- V2 integration/fault:
+- V3 CI/staging:
+- V4 browser/manual:
+- V5 production observation:
+
+## Gate metrics
+- correctness:
+- security/authorization:
+- replay/recovery:
+- latency/cost:
+- tenant/PII:
+
+## Rollback
+- rehearsal result:
+- rollback trigger:
+- owner:
+
+## Decision
+- GO / NO-GO
+- reviewer:
+- next Phase activation date:
+```
+
 ---
 
 ## 2. 统一技术决策
@@ -246,6 +316,80 @@ Production  shadow metrics and canary, never live external submit without consen
 
 每个 PR body 继续使用项目规定的 Layer 1 AC Self-Check 和 Layer 2 Goal Alignment。
 
+### 3.1 每个 Issue 的执行状态机
+
+```text
+draft
+  → spec_ready
+  → in_progress
+  → code_complete
+  → verified_local
+  → verified_ci_preview
+  → merged
+  → observed
+  → done
+```
+
+| 状态 | 进入条件 | 退出证据 |
+|---|---|---|
+| `draft` | 只有问题描述 | 完成依赖、范围、AC、风险审阅 |
+| `spec_ready` | Definition of Ready 全部满足 | 分支、owner、实施 checklist 已建立 |
+| `in_progress` | 上游依赖已合并 | 代码、migration、测试和文档完成 |
+| `code_complete` | 作者自检完成 | focused tests、typecheck、diff check 通过 |
+| `verified_local` | 本地自动验证通过 | commit push、PR、CI/Preview 启动 |
+| `verified_ci_preview` | 所需 CI 和 Preview 通过 | reviewer 批准并合并 |
+| `merged` | 代码进入 master | staging migration/smoke/metrics 通过；纯协议 Issue 可直接进入 observed |
+| `observed` | 在目标环境运行 | 达到该 Issue 规定的观察窗口和无回滚条件 |
+| `done` | 所有 AC 和环境证据完整 | 更新映射表、Phase report、关闭 Issue |
+
+`code_complete`、PR 已开或 CI green 都不等于 `done`。涉及 migration、Worker recovery、SSE、浏览器、审批、外部动作或 rollout 的 Issue，必须提供相应环境证据。
+
+### 3.2 每个 Issue 必须维护的执行 checklist
+
+```markdown
+## Development checklist
+- [ ] 读取上游设计、依赖 Issue 和目标文件
+- [ ] 写失败测试或 contract fixture
+- [ ] 实现最小纵向切片
+- [ ] 补齐负向、并发、tenant、idempotency 测试
+- [ ] 验证 feature flag / migration / rollback
+- [ ] 运行 focused tests 和必要 typecheck/build
+- [ ] 更新文档、事件/指标和 PR AC 表
+- [ ] push commit，记录 CI/Preview/环境证据
+- [ ] 满足 observation gate 后标记 done
+```
+
+### 3.3 验证证据分级
+
+| Level | 证据 | 适用范围 |
+|---|---|---|
+| V1 | Unit/contract tests | 所有 Issue |
+| V2 | Integration + DB/queue/fault test | store、runtime、policy、subagent、context |
+| V3 | CI、Preview、staging smoke | API、migration、stream、Worker、UI |
+| V4 | 实际 browser/manual evidence | Workbench、ATS fill、approval resume |
+| V5 | production metrics/canary observation | rollout、external submit/send、legacy cleanup |
+
+每个 Issue 下方的“验证与证据”会指定最低等级；不能用低等级证据替代高等级证据。
+
+### 3.4 完成报告模板
+
+```markdown
+## Completion report
+- Logical issue: AH2-xxx
+- Commit / PR:
+- Feature flag:
+- Migration:
+- AC passed: N/N
+- V1 unit/contract:
+- V2 integration/fault:
+- V3 CI/staging:
+- V4 browser/manual:
+- V5 production observation:
+- Rollback tested:
+- Known residual risk:
+- Final status: verified | partial | blocked
+```
+
 ---
 
 ## 4. Phase 0 — 安全基线
@@ -257,9 +401,10 @@ Production  shadow metrics and canary, never live external submit without consen
 - **类型 / 优先级 / Size：** `fix` / P0 / M
 - **依赖：** 无
 - **主要文件：** `apps/worker/src/harness/agent-harness.ts`、`apps/worker/src/flows/helpers.ts`、所有 `*-flow.test.ts`
-- **实施：** `beforeSubmit`/authorization guard 缺失、抛错、超时或返回非明确 `true` 时一律拒绝 submit；fill-for-review 不受影响。
-- **AC：** 缺 guard、guard false、guard error、过期 authorization 均为 `submission_blocked`；没有任何 flow 能直接调用 submit 绕过 helper。
-- **验证：** `pnpm --filter @jobcopilot/worker test`；为 Workday、Greenhouse、Lever、SmartRecruiters、Personio 各增加负向测试。
+- **开发目标：** 把“未提供授权即可提交”的隐式默认彻底改为“只有明确、有效授权才提交”，并保持 fill-for-review 可用。
+- **实施步骤：** 1) 枚举五类 ATS 和 Browser fallback 的所有 submit call site；2) 建立唯一 `assertSubmissionAuthorized()` 入口；3) 缺 guard、false、error、timeout、非 boolean 全部返回 typed blocked result；4) 每个 flow 删除直达 submit 的旁路；5) 增加 blocked reason event/metric。
+- **完成标准：** 缺 guard、guard false、guard error、过期 authorization 均为 `submission_blocked`；没有任何 flow 能绕过 helper；fill-only fixture 仍成功；代码搜索与测试证明所有 call site 已覆盖。
+- **验证与证据（V1+V2）：** `pnpm --filter @jobcopilot/worker test`；Workday、Greenhouse、Lever、SmartRecruiters、Personio 各有正/负向测试；提交 call-site inventory 附在 PR；staging dry-run 证明表单可填但不能提交。
 - **回滚：** 不允许回滚为 fail-open；若生产受影响，只能关闭 unattended submit feature，保留 fill-for-review。
 
 ### AH2-002 — 外部动作安全矩阵与 CAPTCHA detection-only 收敛
@@ -267,9 +412,10 @@ Production  shadow metrics and canary, never live external submit without consen
 - **类型 / 优先级 / Size：** `fix/docs` / P0 / M
 - **依赖：** AH2-001
 - **主要文件：** Worker queue/flow 配置、`docs/scraping-autoapply-design.md`、`docs/runbook.md`、相关测试。
-- **实施：** 建立 `external_action_policy` matrix：application submit、Gmail send、resume overwrite、automation mutation；清除/禁用 solver 路径，CAPTCHA/login/MFA 统一映射 `waiting_for_user`。
-- **AC：** 代码搜索不存在可达的 solver 执行路径；运行时检测 CAPTCHA 后不提交、不自动重试；文档不再指导绕过。
-- **验证：** Worker CAPTCHA tests、queue pipeline tests、文档链接检查。
+- **开发目标：** 建立现有外部动作的单一安全清单，并把所有 CAPTCHA/login/MFA 行为收敛为用户接管。
+- **实施步骤：** 1) 盘点 application/Gmail/resume/automation mutation；2) 为每项记录 risk、approval、idempotency、retry、owner；3) 删除或硬禁用 solver executor/config；4) 统一 waiting reason/error code；5) 同步设计、runbook 和监控说明。
+- **完成标准：** matrix 覆盖全部入口；代码搜索不存在可达 solver；CAPTCHA 后不提交、不自动重试；登录/MFA 具有相同暂停语义；旧文档没有绕过指导。
+- **验证与证据（V1+V2）：** Worker CAPTCHA/queue tests、每类外部动作 negative fixture、`rg` 可达路径审计、文档链接检查；PR 附安全矩阵。
 - **Out of scope：** 统一 PolicyEngine 在 AH2-018 开始；本 Issue 先修现有路径。
 
 ### AH2-003 — Harness ADR、Feature Flags 与基线指标
@@ -277,9 +423,10 @@ Production  shadow metrics and canary, never live external submit without consen
 - **类型 / 优先级 / Size：** `docs/chore` / P0 / S
 - **依赖：** AH2-001、AH2-002
 - **主要文件：** `docs/adr/`、shared feature flags、health/observability tests。
-- **实施：** ADR 固定 Postgres source of truth、Redis dispatch only、no direct Codex runtime dependency、provider-neutral API；声明设计中的 10 个 V2 flags，默认全部关闭。
-- **AC：** flags 在 Web/Worker 使用同一类型和默认值；未知/缺失 flag fail-safe；记录 legacy baseline：chat latency、pipeline completion、approval、duplicate suppression、AI cost。
-- **验证：** shared build/test、Web focused tests、Worker focused tests。
+- **开发目标：** 在写 V2 数据前固定不可轻易改变的架构决策、开关命名和 legacy 对照基线。
+- **实施步骤：** 1) 编写 ADR；2) 在 shared 中声明 typed flags/defaults；3) Web/Worker 使用同一 resolver；4) unknown/missing flag 走 legacy 或 deny-risk；5) 采集 chat/pipeline/approval/duplicate/cost 基线查询。
+- **完成标准：** ADR 通过审阅；10 个 flags 默认关闭；Web/Worker 解析一致；缺失配置不会开启 V2 或外部动作；基线时间窗、查询和结果已记录。
+- **验证与证据（V1+V3）：** shared build/test、Web/Worker focused tests；staging health 输出确认 flags；PR 附 baseline snapshot 和 ADR 链接。
 
 **Phase 0 Exit Gate**
 
@@ -299,18 +446,20 @@ Production  shadow metrics and canary, never live external submit without consen
 - **类型 / 优先级 / Size：** `feat` / P0 / L
 - **依赖：** AH2-003
 - **主要文件：** `packages/agent-protocol/package.json`、`src/session.ts`、`turn.ts`、`step.ts`、`input.ts`、`item.ts`、`event.ts`、`tool.ts`、`approval.ts`、`model.ts`。
-- **实施：** TypeBox + Ajv；定义 versioned schemas、tagged unions、状态枚举、ContentPart、HarnessModelEvent、ToolDefinition wire types；导出 validator factory。
-- **AC：** Web/Worker 都能 import；非法状态/type/phase 被拒绝；未知 event type 可由 envelope 保存；package 不依赖 Prisma/React/provider SDK。
-- **验证：** `pnpm --filter @jobcopilot/agent-protocol test`、build、typecheck；lockfile diff 只包含新增 direct deps。
+- **开发目标：** 建立 Web、Worker、模型 adapter 和 UI 共用且可运行时验证的唯一 wire protocol。
+- **实施步骤：** 1) scaffold package/exports/build；2) 按领域拆 TypeBox schema；3) 建立 Ajv validator cache 和 schemaVersion；4) 添加 tagged-union/unknown-event compatibility；5) 接入 Web/Worker compile-only imports。
+- **完成标准：** 所有协议均可静态推导和运行时验证；非法状态/type/phase 拒绝；未知 event envelope 可保存；package 无 Prisma/React/provider SDK；导出面经 review 固定。
+- **验证与证据（V1+V3）：** package test/build/typecheck；Web/Worker compile；schema golden/round-trip/backward-compat tests；lockfile 仅含 direct deps。
 
 ### AH2-005 — AgentTurn、AgentStep、AgentInput 数据模型
 
 - **类型 / 优先级 / Size：** `feat` / P0 / L
 - **依赖：** AH2-004
 - **主要文件：** `apps/web/prisma/schema.prisma`、新 migration、migration tests。
-- **实施：** 增加三张表及 Session relations；`clientMessageId` 幂等；Step `(turnId, ordinal, attempt)` unique；raw partial unique index 限制一个 active root Turn。
-- **AC：** 两个并发 active Turn 只有一个可创建；重复 client message 只一条；waiting 状态仍占 root slot；terminal 后 follow-up 可开始。
-- **验证：** Prisma generate、migration SQL static tests、Postgres integration test（需要测试 DB 时在 PR 明确）。
+- **开发目标：** 让数据库能无歧义表达长期 Session、一次用户 Turn、Turn 内模型 Step 和运行中输入。
+- **实施步骤：** 1) 添加 additive models/relations/indexes；2) 编写 partial unique active-root index；3) 加 clientMessage/step ordinal 幂等约束；4) 生成 Prisma client；5) 构造并发 migration integration fixtures。
+- **完成标准：** 并发 active Turn 只能成功一个；重复 client message 一条；waiting 仍占 root slot；terminal 后可创建 follow-up；现有 AgentSession 数据无需 destructive backfill。
+- **验证与证据（V1+V2+V3）：** Prisma generate、migration static test、真实 Postgres concurrency test；staging migration apply 和 schema introspection；记录 rollback 为 flag-off/additive retain。
 - **回滚：** additive migration；flag 关闭后无新写入，不删除表。
 
 ### AH2-006 — AgentItem、AgentEvent、AgentOutbox 与 sequence allocator
@@ -318,27 +467,30 @@ Production  shadow metrics and canary, never live external submit without consen
 - **类型 / 优先级 / Size：** `feat` / P0 / L
 - **依赖：** AH2-004、AH2-005
 - **主要文件：** Prisma schema/migration、session repository、migration tests。
-- **实施：** 增加 Item/Event/Outbox；Session 增加 `nextEventSequence BigInt`；事务内 `UPDATE ... RETURNING` 分配 sequence；event idempotency unique。
-- **AC：** 100 个并发 append 得到连续、唯一、单调 sequence；Item revision 可幂等覆盖；outbox 与 event 不会只写一半。
-- **验证：** repository concurrency tests、migration tests、Prisma typecheck。
+- **开发目标：** 建立 append-only 事实流、可更新 Item projection 和可靠 dispatch outbox。
+- **实施步骤：** 1) 添加三表及索引；2) Session 增加 sequence counter；3) 实现事务内 allocate+append+outbox；4) 实现 Item revision compare-and-update；5) 编写并发和事务回滚测试。
+- **完成标准：** 100 并发 append sequence 唯一单调；重复 idempotency key 返回原 event；Item 旧 revision 不能覆盖新 revision；任何故障都不会只写 event 或只写 outbox。
+- **验证与证据（V1+V2+V3）：** repository concurrency/rollback tests、migration tests、Prisma typecheck；staging 运行 sequence integrity query。
 
 ### AH2-007 — Web/Worker V2 Store 与 Unit of Work
 
 - **类型 / 优先级 / Size：** `feat` / P0 / L
 - **依赖：** AH2-005、AH2-006
 - **主要文件：** `apps/web/src/lib/agent/control-plane/store/`、`apps/worker/src/runtime/store/`。
-- **实施：** Web Prisma repository 负责 command/query；Worker `pg` repository 负责 lease、Step、Item/Event append；定义相同 contract tests；提供 transaction callback。
-- **AC：** tenant scope 由服务端注入；Worker SQL 所有 mutation 带 session/turn 条件；Web 与 Worker repository 对同一 fixture 得到相同 projection。
-- **验证：** focused Vitest；故意跨 userId 查询必须为空/拒绝。
+- **开发目标：** 为控制面和执行面提供语义一致、tenant-safe、可事务化的持久层。
+- **实施步骤：** 1) 定义 repository contracts；2) Web Prisma 实现 command/query UoW；3) Worker pg 实现 lease/step/event UoW；4) 共用 fixtures/contract suite；5) 添加跨租户和 stale revision 防护。
+- **完成标准：** tenant scope 只能服务端注入；所有 mutation 带 ownership/expected state；两端对同一 fixture projection 一致；事务异常无部分写；SQL 无字符串拼接 ID。
+- **验证与证据（V1+V2）：** Web/Worker focused Vitest、repository contract suite、跨 userId negative tests、transaction failure fixtures。
 
 ### AH2-008 — Legacy dual-write、Transcript Projector 与历史兼容
 
 - **类型 / 优先级 / Size：** `feat` / P1 / L
 - **依赖：** AH2-007
 - **主要文件：** `apps/web/src/lib/agent/session/run-recorder.ts`、repository、projector、chat/run/automation routes。
-- **实施：** `AGENT_PROTOCOL_V2_DUAL_WRITE` 开启时，legacy chat、manual pipeline、automation 都创建 Turn/Item/Event；未知 legacy event 保存为 opaque event，不丢弃；旧 Transcript 仍由 projector 生成。
-- **AC：** 关闭 flag 时行为不变；开启时 legacy 和 V2 projection 语义一致；同一 automation 复用 Session、每次新 Turn；失败 automation 不创建重复 Session。
-- **验证：** chat/run/automation/session repository tests；golden projection fixtures。
+- **开发目标：** 在不切换产品行为的前提下，让 legacy chat/manual/automation 产生可比较的 V2 事实流。
+- **实施步骤：** 1) 建立 legacy→V2 mapping 表；2) recorder 事务 dual-write；3) unknown event 作为 opaque 保存；4) projector 生成旧 Transcript；5) 对 chat/run/automation 做 golden compare。
+- **完成标准：** flag off 完全 legacy；flag on 两种 projection 语义一致；automation canonical Session 不变且每次新 Turn；失败 run 不制造重复 Session；mapping 不丢未知事件。
+- **验证与证据（V1+V2+V5）：** focused tests/golden fixtures；shadow 48 小时 integrity report，包含 event count、projection mismatch、duplicate session、sequence errors。
 
 **Phase 1 Exit Gate**
 
@@ -358,36 +510,40 @@ Production  shadow metrics and canary, never live external submit without consen
 - **类型 / 优先级 / Size：** `feat` / P0 / L
 - **依赖：** AH2-007
 - **主要文件：** `apps/web/src/lib/agent/control-plane/commands/`。
-- **实施：** `startTurn`、`steerTurn`、`queueFollowUp`、`interruptTurn`；事务内写 AgentInput/user Item/event/outbox；expected revision/turn 检查；Idempotency-Key。
-- **AC：** start race 只有一条 active root Turn；duplicate command 返回原 disposition；steer 不匹配返回 typed `409 active_turn_changed`；Automation 不能 steer 用户 active Turn。
-- **验证：** command concurrency/tenant/idempotency tests。
+- **开发目标：** 将所有用户/调度输入转换为原子、幂等、可审计的 Session command。
+- **实施步骤：** 1) 定义四个 command handler；2) 实现 expected revision/turn 和 partial index 协作；3) 同事务写 Input/Item/Event/Outbox；4) 返回 typed disposition；5) 加 automation source policy。
+- **完成标准：** start race 只有一条 active Turn；duplicate 返回原 disposition；wrong expectedTurn typed 409；Automation 不 steer 用户 Turn；事务失败不出现孤立 user Item。
+- **验证与证据（V1+V2）：** command concurrency、tenant、idempotency、transaction rollback tests；附 disposition matrix。
 
 ### AH2-010 — Composer Message、Interrupt、Approval/Question Command API
 
 - **类型 / 优先级 / Size：** `feat` / P0 / M
 - **依赖：** AH2-009
 - **主要文件：** `apps/web/src/app/api/agent/sessions/[id]/messages/`、`turns/[turnId]/interrupt/`，共享 route helpers。
-- **实施：** `POST /messages` 原子决定 `started|steered|queued_follow_up|duplicate`；输入只接收 tagged ContentPart；响应返回 inputId/turnId/sequence。
-- **AC：** auth 和 owner scope；payload 大小/附件引用限制；浏览器重发不重复 user bubble；关闭 SSE 不触发 interrupt。
-- **验证：** route tests + command service tests；非法 expectedTurnId/attachment owner 返回明确错误。
+- **开发目标：** 提供 Composer 和控制按钮唯一、稳定、tenant-safe 的 HTTP command surface。
+- **实施步骤：** 1) 实现 request/response schema；2) Auth/owner/size/attachment checks；3) 调用 CommandService；4) 映射 typed 202/409/422 错误；5) interrupt 与连接生命周期解耦。
+- **完成标准：** 四种 disposition 正确；浏览器重发无重复 bubble；错误附件 owner 拒绝；关闭 SSE 不 interrupt；API 不接受客户端 userId/tool command。
+- **验证与证据（V1+V2+V3）：** route/command tests、payload boundary、owner、expectedTurn cases；Preview API smoke。
 
 ### AH2-011 — Session/Turn/Item/Task Query API 与分页 DTO
 
 - **类型 / 优先级 / Size：** `feat` / P1 / M
 - **依赖：** AH2-007
 - **主要文件：** session API、`timeline`、`turns`、`tasks` query routes。
-- **实施：** cursor pagination；Session DTO 含 runtime status、activeTurn、queuedInputCount；timeline 以 Item projection 为主，可查询 afterSequence。
-- **AC：** 默认不返回原始敏感 event payload；历史读取不 resume Turn；跨租户 404；500+ Items 分页稳定无重复。
-- **验证：** API pagination/tenant/redaction tests。
+- **开发目标：** 让 UI 能分页读取完整会话状态而不加载/恢复执行进程或泄露原始事件。
+- **实施步骤：** 1) 定义 DTO/cursor；2) 实现 Session/Turn/Item/Task queries；3) activeTurn/queued count projection；4) redaction/tenant guards；5) 加 500+ Item fixture。
+- **完成标准：** 分页无重漏；历史 read 不 resume；跨租户 404；默认无原始敏感 payload；cursor 对新增事件稳定。
+- **验证与证据（V1+V2+V3）：** pagination/tenant/redaction tests、500+ Item load test、Preview query smoke。
 
 ### AH2-012 — Durable SSE、Item Snapshot 与 transient delta bridge
 
 - **类型 / 优先级 / Size：** `feat` / P0 / L
 - **依赖：** AH2-006、AH2-011
 - **主要文件：** `sessions/[id]/events/route.ts`、Web stream service、Worker event/delta publisher。
-- **实施：** `Last-Event-ID`/afterSequence；Postgres durable lifecycle；Redis Stream transient delta；慢消费者 overflow 后发 `snapshot_required`；heartbeat 不伪造工作进度。
-- **AC：** 断线 30 秒后台继续；重连 projection 无重复；丢 transient delta 后从 Item revision 恢复；completed content 权威覆盖。
-- **验证：** stream reconnect、duplicate/out-of-order、slow consumer contract tests。
+- **开发目标：** 建立可重连、可降级、不会因慢客户端拖垮执行的统一 Session stream。
+- **实施步骤：** 1) durable afterSequence SSE；2) Redis Stream delta bridge；3) coalesced Item snapshot/revision；4) bounded client buffer/overflow signal；5) heartbeat/reconnect auth。
+- **完成标准：** 断线 30 秒后台继续；重连无重复；delta 丢失可从 snapshot 恢复；completed 覆盖临时内容；慢客户端不反压 provider/Worker。
+- **验证与证据（V1+V2+V3）：** reconnect、duplicate/out-of-order、slow consumer tests；staging 断网/刷新演练及 latency 数据。
 - **回滚：** `AGENT_EVENT_SSE_V2` 关闭后继续使用 legacy session events。
 
 **Phase 2 Exit Gate**
@@ -408,45 +564,50 @@ Production  shadow metrics and canary, never live external submit without consen
 - **类型 / 优先级 / Size：** `feat` / P0 / L
 - **依赖：** AH2-004
 - **主要文件：** `packages/agent-model/`、现有 `apps/web/src/lib/model-router.ts`、`packages/shared/src/llm.ts` 的 compatibility facade。
-- **实施：** 定义 `HarnessModelRequest`、normalized stream、capability profile、abort、usage、provider cursor、reroute reason；不改变现有 ModelRouter 配置解析顺序。
-- **AC：** adapter 不接触 Prisma/业务 mutation；metadata 始终含 session/turn/step/task；现有 modelChat 调用可继续工作；V2 flag 关闭不改 legacy 输出。
-- **验证：** package build/test、Web/Worker compile、legacy model-router tests。
+- **开发目标：** 建立 server-only、provider-neutral 的模型调用边界，并保留现有用户配置、平台默认和 BYOK 行为。
+- **实施步骤：** 1) scaffold package；2) 定义 request/event/capability/error contracts；3) 建 adapter registry/resolver；4) 加 usage/abort/cursor metadata；5) 用 compatibility facade 接现有 ModelRouter/shared LLM。
+- **完成标准：** adapter 不依赖 Prisma/业务 mutation；metadata 含 session/turn/step/task；legacy modelChat 结果不变；V2 off 无行为差异；package 无浏览器可导入 secret 路径。
+- **验证与证据（V1+V3）：** package build/test、Web/Worker compile、legacy model-router/shared LLM tests、bundle/export inspection。
 
 ### AH2-014 — OpenAI-compatible Chat Completions / Responses adapter
 
 - **类型 / 优先级 / Size：** `feat` / P0 / L
 - **依赖：** AH2-013
 - **主要文件：** `packages/agent-model/src/adapters/openai-compatible/`。
-- **实施：** 解析 text delta、tool call argument delta、usage、finish reason；能力允许时支持 response continuation；自定义 endpoint 继续经过 existing safe endpoint/pinned outbound policy。
-- **AC：** 多 tool call 能按 callId 重组；不完整 arguments 不执行；cursor 404/过期返回可 fallback error；AbortSignal 关闭上游请求。
-- **验证：** 无 live network 的 fixture stream tests；SSRF/custom endpoint negative tests。
+- **开发目标：** 把 OpenAI-compatible Chat Completions/Responses 的流式差异归一为 Harness events。
+- **实施步骤：** 1) 建 HTTP request builder；2) 解析 text/tool/usage/finish deltas；3) 按 callId 聚合 arguments；4) 实现 continuation capability；5) 接 safe endpoint、timeout 和 AbortSignal。
+- **完成标准：** 多 tool calls 顺序和 callId 正确；截断 arguments 不执行；cursor 失效返回 typed recoverable error；自定义 endpoint 经过 SSRF/DNS pin policy；cancel 关闭请求。
+- **验证与证据（V1+V2）：** fixture stream contract tests、chunk boundary fuzz、429/5xx/cursor loss/SSRF negative tests；零 live network unit call。
 
 ### AH2-015 — Anthropic Messages adapter
 
 - **类型 / 优先级 / Size：** `feat` / P0 / M
 - **依赖：** AH2-013
 - **主要文件：** `packages/agent-model/src/adapters/anthropic/`。
-- **实施：** 映射 system/user/assistant、`tool_use`、`tool_result`、stream usage、stop reason；复用现有 Anthropic SDK 和 BYOK secret resolution。
-- **AC：** content block 顺序稳定；tool result 关联原 toolUseId；reasoning/private blocks 不进入用户 final；cancel/timeout 可观测。
-- **验证：** SDK mock contract tests、malformed block tests、legacy Anthropic tests。
+- **开发目标：** 提供与 OpenAI-compatible 相同 Harness 语义的 Anthropic Messages/tool_use adapter。
+- **实施步骤：** 1) message/system mapper；2) content block stream reducer；3) tool_use/result mapping；4) usage/stop/error normalization；5) 复用 BYOK resolution 和 abort。
+- **完成标准：** content block 顺序稳定；tool result 关联 toolUseId；private reasoning 不进入 final；malformed block typed fail；timeout/cancel/usage 可观测；legacy Anthropic 不回退。
+- **验证与证据（V1+V2）：** SDK mocks、fragmented/malformed blocks、tool round-trip、cancel、legacy tests。
 
 ### AH2-016 — Structured/text fallback、continuation recovery 与 model reroute
 
 - **类型 / 优先级 / Size：** `feat` / P0 / L
 - **依赖：** AH2-014、AH2-015
 - **主要文件：** agent-model fallback/selection modules。
-- **实施：** 原生 tool 不可用时返回 TypeBox `NextStep` envelope；Ajv 验证，最多一次 repair；provider cursor 失效时 full-context rebuild；模型切换发布 `model.rerouted`。
-- **AC：** 非法工具名/schema 永不执行；repair 仍失败则 Step failed；发生不可逆 side effect 后禁止自动 reroute/retry；MiniMax/OpenAI-compatible/Anthropic contract matrix 全通过。
-- **验证：** scripted adapter tests，覆盖 cursor loss、truncated JSON、duplicate callId、provider 429/5xx。
+- **开发目标：** 让不支持原生工具或 continuation 的自有模型 API 也能安全参与 Harness，而不降低工具执行边界。
+- **实施步骤：** 1) 定义 NextStep envelope；2) Ajv validate + 一次 repair；3) cursor loss full-context rebuild；4) capability-aware reroute；5) 记录 model.rerouted/attempt/usage。
+- **完成标准：** 非法工具永不执行；repair 上限固定；不可逆动作后不 reroute；cursor 丢失可恢复；三类 provider contract matrix 一致；失败原因进入 Step。
+- **验证与证据（V1+V2）：** scripted tests 覆盖 truncation、duplicate callId、429/5xx、cursor loss、repair failure、unsafe reroute。
 
 ### AH2-017 — ToolRegistry、ToolRouter、lifecycle 与首批只读工具
 
 - **类型 / 优先级 / Size：** `feat` / P0 / L
 - **依赖：** AH2-007、AH2-013
 - **主要文件：** `apps/worker/src/runtime/tools/`、tool protocol schemas。
-- **实施：** registry/version、Ajv input/output、capability/tenant、timeout/AbortSignal、idempotency metadata、started/result Items；实现 `jobs.get/search`、`persona.retrieve`、`resume.get_base`、`application.get_state`。
-- **AC：** 模型不可指定 userId；未注册/version mismatch 拒绝；只读工具无业务 mutation；大结果转 artifact/reference；所有结果 redacted 后进入 event。
-- **验证：** registry/router/tool sibling tests；跨租户和 schema fuzz tests。
+- **开发目标：** 建立模型唯一可用的 typed 工具入口，并用四个只读工具证明完整生命周期。
+- **实施步骤：** 1) registry/version/capability；2) input/output validator cache；3) router timeout/abort/idempotency；4) started/progress/result Items；5) 实现四个 owner-scoped read tools；6) 大结果引用化和 redaction。
+- **完成标准：** userId 只能来自 runtime；unknown/version mismatch/schema error 拒绝；read tools 零 mutation；每个 call 有完整 lifecycle；敏感/大 payload 不直接进入 event。
+- **验证与证据（V1+V2）：** registry/router/tool tests、schema fuzz、tenant negative、timeout/cancel、event replay assertions。
 
 **Phase 3 Exit Gate**
 
@@ -466,36 +627,40 @@ Production  shadow metrics and canary, never live external submit without consen
 - **类型 / 优先级 / Size：** `feat` / P0 / L
 - **依赖：** AH2-017
 - **主要文件：** `apps/worker/src/runtime/policy/`、policy protocol。
-- **实施：** `Before/AfterModelCall`、`Before/AfterToolUse`、`BeforeBusinessMutation`、`BeforeExternalSubmission`、`BeforeContextCompaction`、`BeforeFinalResponse`；决策为 allow/deny/require_approval/require_user_input/rewrite_input。
-- **AC：** Policy 不调用 LLM；每次决策有 policy version、理由 code、scope；工具不能绕过 hook 直接执行；缺策略默认 deny external write。
-- **验证：** policy matrix table-driven tests，覆盖 role/tool/risk/user/plan/target domain。
+- **开发目标：** 将权限、安全和业务前置条件变成确定性程序，而不是模型建议。
+- **实施步骤：** 1) 定义 hook/decision contracts；2) build ordered hook pipeline；3) role/tool/risk/domain matrix；4) decision event/telemetry；5) fail-closed defaults 和 policy versioning。
+- **完成标准：** Policy 无 LLM；每次决策有 version/reason/scope；所有 ToolRouter 路径强制经过 hook；缺策略 external write deny；rewrite 不扩大权限。
+- **验证与证据（V1+V2）：** table-driven matrix、hook order、bypass attempt、unknown policy/version、role/domain negative tests。
 
 ### AH2-019 — Scoped Approval Receipt schema 与原子消费
 
 - **类型 / 优先级 / Size：** `feat` / P0 / L
 - **依赖：** AH2-005、AH2-018
 - **主要文件：** Prisma `AgentApproval` 演进、migration、Web/Worker approval store。
-- **实施：** turnId/itemId/toolCallId、scopeType/scopeHash、artifact hashes、destination、expiry、nonce、consumedAt/revision；canonical JSON + SHA-256；事务内 compare-and-consume。
-- **AC：** approval 不能跨 user/session/turn/job/tool 复用；材料或答案 hash 变化失效；并发消费只有一个成功；raw sensitive answers 不进入 hash log。
-- **验证：** migration tests、scope canonicalization、race、expiry、stale revision tests。
+- **开发目标：** 把一次用户批准变成范围明确、可过期、不可重放的一次性能力票据。
+- **实施步骤：** 1) additive schema/migration；2) canonical scope serializer/hash；3) issue/validate/consume store；4) compare revision/expiry/nonce；5) audit event 和敏感字段处理。
+- **完成标准：** 不能跨 user/session/turn/job/tool；材料/答案/目标变化失效；并发消费一个成功；raw sensitive answer 不入 log；消费和 external action reservation 同事务。
+- **验证与证据（V1+V2+V3）：** migration、canonicalization、race、expiry、stale revision tests；staging DB consume race。
 
 ### AH2-020 — Approval/Question Broker、API 与原 Turn resume
 
 - **类型 / 优先级 / Size：** `feat` / P0 / L
 - **依赖：** AH2-010、AH2-019
 - **主要文件：** Web approval/question command routes、Worker wakeup consumer、Item projector。
-- **实施：** 创建 typed approval/question Item；Turn 进入 waiting；Web 决策校验后写 event/outbox；Worker 恢复同一 turnId/step lineage/toolCallId。
-- **AC：** refresh 后卡片仍存在；回答/批准不新建伪 Turn；过期/重复/错误 owner 被拒绝；pending request 被 interrupt 时 resolved/cancelled。
-- **验证：** command→outbox→resume integration tests、reconnect tests。
+- **开发目标：** 让审批/提问成为可刷新、可审计、可恢复的 Turn suspension，而不是独立聊天。
+- **实施步骤：** 1) broker 创建 typed Item/wait state；2) Web decision/answer routes；3) owner/scope/revision validation；4) event/outbox wakeup；5) Worker 恢复相同 lineage；6) interrupt cleanup。
+- **完成标准：** refresh 后 pending 可操作；decision 不新建 Turn；wrong owner/expired/duplicate 拒绝；原 toolCallId 恢复；interrupt 后 request resolved/cancelled。
+- **验证与证据（V1+V2+V3）：** end-to-end command→wait→decision→wakeup→resume、duplicate/reconnect/interrupt tests；Preview 刷新演练。
 
 ### AH2-021 — 现有高风险路径迁入 policy 与统一 redaction
 
 - **类型 / 优先级 / Size：** `refactor` / P0 / L
 - **依赖：** AH2-018、AH2-019、AH2-020
 - **主要文件：** resume tailoring、application control/preflight、Gmail send、automation mutations、event redaction。
-- **实施：** 先把现有入口作为 policy-protected adapters，不创建新 external tools；PersonaFact provenance/confirmed answer 检查；日志只保留引用、hash 和脱敏摘要。
-- **AC：** 四类高风险路径都调用相同 PolicyEngine；自由文本“可以/提交吧”不等于 receipt；未知工作许可/薪资/敏感回答进入 question。
-- **验证：** existing focused suites + new cross-entry policy tests；PII snapshot tests。
+- **开发目标：** 在新 TurnEngine 上线前，先让所有现有高风险入口使用同一 policy/receipt/redaction。
+- **实施步骤：** 1) 盘点四类入口；2) 包装 policy-protected adapters；3) provenance/confirmed-answer checks；4) scope receipt 接入；5)统一 redaction/event；6) 删除局部隐式批准判断。
+- **完成标准：** 四类入口同一 PolicyEngine；自由文本不等于批准；未知敏感事实进入 question；PII/secret 不入 event；legacy behavior 仅在有合法 receipt 时继续。
+- **验证与证据（V1+V2+V3）：** existing suites、cross-entry negative matrix、PII snapshots；staging approval/decline/expired smoke。
 
 **Phase 4 Exit Gate**
 
@@ -515,54 +680,60 @@ Production  shadow metrics and canary, never live external submit without consen
 - **类型 / 优先级 / Size：** `feat` / P0 / L
 - **依赖：** AH2-007、AH2-009
 - **主要文件：** `apps/worker/src/runtime/turns/`、`queue/turn-queue.ts`。
-- **实施：** BullMQ job 仅携带 turnId；Worker 从 Postgres claim lease；heartbeat 条件更新；stale lease scanner；DLQ；queued/outbox repair scanner。
-- **AC：** 重复 delivery 只有一个 lease owner；heartbeat 丢失主动 abort；Worker 重启后可 reclaim；Redis 丢 job 可由 Postgres 重建。
-- **验证：** fake clock/pg repository tests、duplicate delivery、stale lease、DLQ tests。
+- **开发目标：** 让 Turn 执行权由数据库 lease 决定，可承受重复投递、Worker 崩溃和 Redis 丢失。
+- **实施步骤：** 1) BullMQ payload 最小化；2) conditional lease claim/heartbeat/release；3) stale scanner；4) outbox/queued repair；5) retry/DLQ classification；6) shutdown abort。
+- **完成标准：** 重复 delivery 单 owner；heartbeat 失败中止；重启可 reclaim；Redis 丢 job 可重建；terminal Turn 不再执行；DLQ 原因可观测。
+- **验证与证据（V1+V2+V3）：** fake clock/pg、duplicate/stale/DLQ tests；staging kill Worker/restart 演练和 recovery trace。
 
 ### AH2-023 — StepContextBuilder 与 AgentInput 消费 checkpoint
 
 - **类型 / 优先级 / Size：** `feat` / P0 / L
 - **依赖：** AH2-016、AH2-022
 - **主要文件：** `apps/worker/src/runtime/context/step-context-builder.ts`、input store。
-- **实施：** 分层组装 safety/domain/task/business/working/untrusted/user context；FIFO claim steer；Step 记录 consumedInputIds/inputThroughSequence；附件只通过 owner-checked artifact refs。
-- **AC：** 同一 input 只被一个 root Step 消费；steer 不改写历史；untrusted JD/DOM/email 不能进入 instruction layer；provider cursor 可选且可丢弃。
-- **验证：** context golden tests、input race、tenant/attachment scope、prompt-injection placement tests。
+- **开发目标：** 为每个模型 Step 构造可重现、分层、tenant-safe 的精确输入，并记录消费边界。
+- **实施步骤：** 1) 定义层级 builder；2) owner-check business/artifact refs；3) FIFO claim inputs；4) 持久 consumed IDs/throughSequence；5) 标记 untrusted blocks；6) 支持 full rebuild/cursor optional。
+- **完成标准：** input 单次消费；steer 历史不可变；JD/DOM/email 不进入 instruction；附件跨用户拒绝；同一 snapshot/sequence 构建结果 deterministic。
+- **验证与证据（V1+V2）：** golden context、race、tenant/attachment、prompt-injection placement、cursor-drop rebuild tests。
 
 ### AH2-024 — Multi-step Conversation Loop
 
 - **类型 / 优先级 / Size：** `feat` / P0 / L
 - **依赖：** AH2-017、AH2-018、AH2-022、AH2-023
 - **主要文件：** `apps/worker/src/runtime/turns/turn-engine.ts` 及拆分 modules。
-- **实施：** claim → build context → start Step → stream model → validate calls → policy → tools → attach results → next Step → verify candidate final；持久状态间释放 Worker。
-- **AC：** 一个 Turn 至少支持 3 Steps；tool result 回到原 Turn；completed Turn 恰有一个 final_answer；commentary 与 final 分相；HTTP/SSE 断开不停止循环。
-- **验证：** scripted model/tool integration tests；step ordinal、event causation、唯一 final assertions。
+- **开发目标：** 实现 Harness 核心循环，使一个 Turn 能持续使用模型和工具直到验证完成或明确暂停/失败。
+- **实施步骤：** 1) lease/step coordinator；2) stream model/item events；3) validate/policy/schedule tools；4) attach results；5) next Step；6) candidate final verification；7) 持久边界释放 Worker。
+- **完成标准：** 同 Turn 3+ Steps/2+ tools；tool result 原地回灌；commentary/final 分相；completed 恰一个 final；连接断开不停止；每个 event causation 可追溯。
+- **验证与证据（V1+V2+V3）：** scripted integration、ordinal/causation/unique-final tests；staging fake-provider full loop trace。
 
 ### AH2-025 — Suspension、durable wait conditions 与 wakeup
 
 - **类型 / 优先级 / Size：** `feat` / P0 / L
 - **依赖：** AH2-020、AH2-024
 - **主要文件：** runtime wait/wakeup modules、outbox consumers。
-- **实施：** waiting_for_dependency/approval/user；保存 wait predicate、required IDs、deadline；释放 lease；tool/subagent/input/decision 到达写 wakeup。
-- **AC：** wakeup 至少一次但恢复幂等；不靠进程内 Promise 保持等待；approval/user answer 后不重跑已完成 Step/tool；timeout 产生明确 Item。
-- **验证：** restart-while-waiting、duplicate wakeup、timeout、wrong dependency tests。
+- **开发目标：** 让等待成为数据库状态，可跨进程和部署恢复，而不是内存 Promise。
+- **实施步骤：** 1) wait predicate schema/store；2) suspend transition/release lease；3) wakeup producer/consumer；4) predicate recheck；5) deadline/timeout Item；6) duplicate wakeup suppression。
+- **完成标准：** restart 不丢 wait；wakeup 幂等；错误 dependency 不恢复；批准/回答后不重跑已完成 Step；timeout 可见且可由 Planner 处理。
+- **验证与证据（V1+V2+V3）：** restart-while-waiting、duplicate/wrong/timeout tests；staging deploy while waiting 后恢复。
 
 ### AH2-026 — Interrupt/cancel 级联与不可逆动作核对
 
 - **类型 / 优先级 / Size：** `feat` / P0 / M
 - **依赖：** AH2-022、AH2-024、AH2-025
 - **主要文件：** turn cancel service、model/tool/browser AbortSignal bridge。
-- **实施：** interruptRequestedAt；root signal 级联 Step/tool/task/browser/wait；不可逆请求已发出时进入 verification/uncertain，不声称 cancelled。
-- **AC：** Stop 不是关闭 EventSource；可取消路径 p95 目标内进入 interrupted/cancelling；新 task/tool 不再启动；terminal event 只产生一次。
-- **验证：** concurrent model/tool/wait cancellation tests；submit-request-in-flight fixture。
+- **开发目标：** 让 Stop 真正终止所有可取消执行，同时准确处理已经发出的不可逆请求。
+- **实施步骤：** 1) persist interrupt request；2) root AbortController registry；3) 级联 model/tool/task/browser/wait；4) 阻止新工作；5) external in-flight evidence reconciliation；6) terminal reducer。
+- **完成标准：** Stop 与 SSE 解耦；可取消路径达 SLO；后续工作不启动；不可逆请求标 completed/uncertain 而非虚假 cancelled；terminal event 唯一。
+- **验证与证据（V1+V2+V3）：** concurrent cancel、submit-in-flight、duplicate Stop tests；staging latency/trace 演练。
 
 ### AH2-027 — Budget、no-progress detector、Verifier 与 Finalizer
 
 - **类型 / 优先级 / Size：** `feat` / P0 / L
 - **依赖：** AH2-024
 - **主要文件：** runtime budget/verifier/finalizer modules。
-- **实施：** 24 root Steps、64 tools、8 repair 默认上限；token/cost/time/subagent budget；重复 call signature/no state progress detector；Finalizer 从 verified events/artifacts/business state 生成 final。
-- **AC：** 模型说“完成”不直接 complete；循环上限产生 partial/failed final；final 明确 completed/not completed/blocker/next step；usage 归因到 Step/Turn/Session。
-- **验证：** no-progress fixtures、budget exhaustion、false completion、partial result tests。
+- **开发目标：** 防止无限循环和虚假完成，并交付基于事实、成本可归因的最终总结。
+- **实施步骤：** 1) budget reservation/accounting；2) repeated signature/state fingerprint；3) candidate final verifier；4) business/evidence checks；5) deterministic final shape；6) partial/failure paths。
+- **完成标准：** 模型不能自行 complete；达到上限停止；final 含 completed/not completed/blocker/next；usage 可归因；无进展 pattern 有事件和 reason code。
+- **验证与证据（V1+V2）：** no-progress、budget、false completion、partial/conflicting evidence tests；cost accounting reconciliation。
 
 **Phase 5 Exit Gate**
 
@@ -583,54 +754,60 @@ Production  shadow metrics and canary, never live external submit without consen
 - **类型 / 优先级 / Size：** `feat` / P1 / L
 - **依赖：** AH2-005、AH2-006
 - **主要文件：** Prisma schema/migration、`session/subagent-task-runner.ts` compatibility types。
-- **实施：** 增加 turnId/rootTaskId/parentTaskId/path/depth、snapshot/model/tool/budget、attempt/lease/interrupt/closed、output artifacts；新建 mailbox 表和幂等键。
-- **AC：** path/depth 可查询；跨 Session parent 拒绝；mailbox message 只能消费一次；旧 `passed` projection 仍可显示。
-- **验证：** migration/static relation tests、task tree fixtures、mailbox concurrency tests。
+- **开发目标：** 让 Subagent 从同步 wrapper 数据行升级为可持久化任务树和消息通信实体。
+- **实施步骤：** 1) additive task fields/migration；2) mailbox schema/index/idempotency；3) task status mapping；4) parent/root/path constraints；5) compatibility projection；6) migration fixtures。
+- **完成标准：** path/depth 可查询；跨 Session parent 拒绝；mailbox 单次消费；lease/interrupt/output refs 可表达；旧 passed UI 不破坏。
+- **验证与证据（V1+V2+V3）：** migration/relation/task-tree/mailbox race tests；staging migration/query smoke。
 
 ### AH2-029 — AgentTreeManager、task queue、lease 与并发 limiter
 
 - **类型 / 优先级 / Size：** `feat` / P1 / L
 - **依赖：** AH2-022、AH2-028
 - **主要文件：** `apps/worker/src/runtime/subagents/`、`queue/subagent-queue.ts`。
-- **实施：** Session 级 registry/limiter；spawn claim；depth/fan-out/concurrency；task heartbeat/retry/close；parent/root cancel inheritance；slot 原子 reserve/release。
-- **AC：** 超限不创建 orphan task；完成/失败/close 都释放 slot；重复 job 不双跑；root interrupt 级联 descendants；Worker restart 可恢复。
-- **验证：** limiter race、depth、fan-out、stale lease、slot leak tests。
+- **开发目标：** 建立 Session 隔离的 Subagent 调度器，控制并发、深度、预算和生命周期。
+- **实施步骤：** 1) registry/limiter；2) atomic slot reservation；3) queue/lease/heartbeat；4) retry/close/release；5) parent/root policy inheritance；6) recovery scanner。
+- **完成标准：** 超限无 orphan；所有 terminal/close 释放 slot；重复 job 单执行；root cancel 级联；重启恢复；跨 Session 不共享 limiter。
+- **验证与证据（V1+V2+V3）：** limiter race/depth/fan-out/stale lease/slot leak tests；staging parallel task/restart trace。
 
 ### AH2-030 — Coordination tools：spawn/send/wait/list/interrupt/close
 
 - **类型 / 优先级 / Size：** `feat` / P1 / L
 - **依赖：** AH2-017、AH2-025、AH2-029
 - **主要文件：** runtime tool definitions/executors、mailbox store。
-- **实施：** typed contracts；spawn 返回 taskId/path；send 只投现有 inbox；wait 保存有界 predicate，在 mailbox/task/steer/timeout 任一事件唤醒。
-- **AC：** model 不能伪造 owner/task path；wait 不长期占 Worker；send 不隐式创建任务；close 只允许 terminal/idle；所有操作产生 subagent activity Items。
-- **验证：** tool contract、mailbox wakeup、tenant scope、timeout、interrupt tests。
+- **开发目标：** 为 Root Agent 提供完整、typed、可审计的 Subagent 管理工具集。
+- **实施步骤：** 1) 六类 tool schemas；2) policy/tool visibility；3) manager/store executors；4) durable wait/wakeup；5) activity Items；6) close/interrupt cleanup。
+- **完成标准：** owner/path 不可伪造；send 不隐式 spawn；wait 不占 Worker；close 状态受限；每个操作可 replay；错误 taskId 不泄露存在性。
+- **验证与证据（V1+V2）：** tool contracts、mailbox/wakeup、tenant、timeout、interrupt/close tests；完整 spawn→send→wait→close scripted trace。
 
 ### AH2-031 — 迁移 Scout 与 Analyst Subagents
 
 - **类型 / 优先级 / Size：** `refactor` / P1 / L
 - **依赖：** AH2-017、AH2-030
 - **主要文件：** chat orchestrator compatibility、Scout/Analyst task handlers、role config。
-- **实施：** Orchestrator 可并行 spawn；仅授予 discovery/job/persona read tools；结果按 `AgentTaskResult` schema 返回 artifact/job IDs、evidence 和 summary。
-- **AC：** 不再在 root 调用栈同步执行；两个任务可并发；任一失败不抹掉另一个结果；不允许 Analyst 生成/提交申请。
-- **验证：** scripted multi-agent integration、role capability negative tests。
+- **开发目标：** 用首批只读角色证明真实并行 Subagent 和部分成功汇总。
+- **实施步骤：** 1) 定义 role contracts/tool allowlist；2) 实现 queue handlers；3) root spawn/wait orchestration；4) structured result/evidence；5) legacy role adapter；6) partial failure reducer。
+- **完成标准：** 不在 root 栈同步执行；Scout/Analyst 可并行；一个失败不抹结果；Analyst 无 draft/submit；结果含真实 IDs/evidence。
+- **验证与证据（V1+V2+V3）：** multi-agent scripted integration、capability negatives、one-fail-one-pass；staging trace/task tree。
 
 ### AH2-032 — 迁移 Writer 与 Reviewer Subagents
 
 - **类型 / 优先级 / Size：** `refactor` / P1 / L
 - **依赖：** AH2-021、AH2-030
 - **主要文件：** Writer/Reviewer task handlers、artifact adapters。
-- **实施：** Writer 只能创建 draft artifact；Reviewer 使用独立 context/model profile，输出 findings/quality gate，不直接修改 Writer output 或执行申请。
-- **AC：** Writer/Reviewer tool scopes 分离；Reviewer 引用 artifact hash；用户 steer 改材料约束后旧 review 标 stale；结果可被 root Finalizer 汇总。
-- **验证：** task contract、artifact hash、stale steer、role separation tests。
+- **开发目标：** 建立“生成草稿”和“独立审查”职责分离，防止模型自批自通过。
+- **实施步骤：** 1) Writer draft-only contract；2) Reviewer read/review-only contract；3) 独立 model/context profile；4) artifact hash/findings schema；5) stale invalidation；6) root aggregation。
+- **完成标准：** scopes 分离；Reviewer 不修改/执行；findings 引用 hash；steer 后旧 review stale；无 evidence 的通过被拒绝。
+- **验证与证据（V1+V2）：** contracts、role separation、artifact hash/stale/evidence tests；scripted writer→reviewer→root trace。
 
 ### AH2-033 — 迁移 Auditor 与受限 Executor Subagents
 
 - **类型 / 优先级 / Size：** `refactor` / P1 / L
 - **依赖：** AH2-021、AH2-030；本 Issue 不启用 Phase 8 的外部写工具
 - **主要文件：** Auditor/Executor handlers、role policy。
-- **实施：** Auditor 只读事件/业务状态并生成证据摘要；Executor 第一阶段只做 preflight/建议，不获得 external write，待 Phase 8 tool flag 开启后再按 policy 注入。
-- **AC：** Executor 无 receipt 时看不到 submit/send tool；Auditor 不读取未脱敏 payload；root 可等待/消息/关闭两者。
-- **验证：** dynamic tool visibility matrix、audit evidence、external capability negative tests。
+- **开发目标：** 完成六角色生命周期，同时确保 Executor 在外部工具上线前只做 preflight。
+- **实施步骤：** 1) Auditor read-only evidence contract；2) Executor preflight contract；3) dynamic tool visibility；4) redacted event reader；5) root wait/message/close；6) legacy result compatibility。
+- **完成标准：** 无 receipt 不显示 submit/send；Auditor 只读脱敏事实；Executor 不执行外部动作；两者可管理并进入 final summary。
+- **验证与证据（V1+V2）：** visibility matrix、audit evidence/redaction、external capability negatives、task lifecycle tests。
 
 **Phase 6 Exit Gate**
 
@@ -650,27 +827,30 @@ Production  shadow metrics and canary, never live external submit without consen
 - **类型 / 优先级 / Size：** `feat` / P1 / L
 - **依赖：** AH2-023、AH2-028
 - **主要文件：** Prisma snapshot migration、Worker context snapshot modules。
-- **实施：** goal、constraints、confirmed decisions/evidence、completed/open tasks、pending approvals、artifacts/hashes、facts/sources、failed attempts/do-not-repeat、budgets、throughSequence/checksum。
-- **AC：** builder 只使用 verified records/events；snapshot 可重建 Step context；token 估算按 provider/model profile 记录；memorySummary 降为 UI projection。
-- **验证：** deterministic snapshot golden tests、checksum、tenant scope、missing reference tests。
+- **开发目标：** 建立可校验、可重建、带来源的长期会话工作快照。
+- **实施步骤：** 1) additive schema；2) deterministic collector；3) verified refs only；4) token accounting；5) checksum/version；6) memorySummary projection migration。
+- **完成标准：** 相同 throughSequence 结果 deterministic；snapshot 可重建 Step；缺失/跨租户 ref 拒绝；token 按 profile 记录；关键字段完整。
+- **验证与证据（V1+V2+V3）：** golden/checksum/tenant/missing-ref tests；staging snapshot build 和 reconstruction diff。
 
 ### AH2-035 — Compaction lifecycle、deterministic collector 与 invariant validator
 
 - **类型 / 优先级 / Size：** `feat` / P1 / L
 - **依赖：** AH2-016、AH2-018、AH2-034
 - **主要文件：** context compactor/collector/validator、compaction Items。
-- **实施：** threshold/manual/Turn boundary trigger；程序先收集 IDs/状态，模型只总结叙事；validator 检查 goal、approval、sensitive answers、artifact hash、open tasks、do-not-repeat。
-- **AC：** compaction 失败保留旧 snapshot；不物理删除用户历史；压缩前后 invariant 完全一致；发布 started/snapshot/completed 生命周期。
-- **验证：** 100+ Item fixtures、malicious summary、missing approval/hash、token reduction tests。
+- **开发目标：** 压缩长会话叙事成本，同时保证所有安全和业务不变量原样保留。
+- **实施步骤：** 1) trigger policy；2) deterministic facts/state collector；3) narrative summarizer；4) invariant compare；5) atomic snapshot publish；6) lifecycle events/failure rollback。
+- **完成标准：** 失败保留旧 snapshot；不删历史；goal/approvals/answers/hashes/open tasks/do-not-repeat 零丢失；输入 token 明显下降；生命周期完整。
+- **验证与证据（V1+V2）：** 100+ Item、malicious/missing-field、token-reduction、atomic publish failure tests；附 before/after invariant report。
 
 ### AH2-036 — Session fork、provider cursor loss recovery 与长会话 restore
 
 - **类型 / 优先级 / Size：** `feat` / P1 / L
 - **依赖：** AH2-011、AH2-034、AH2-035
 - **主要文件：** fork command/query API、Context restore、model reroute integration。
-- **实施：** fork 到指定 lastTurnId；复制历史引用/快照，不继承 pending receipt/task lease；cursor loss 时 canonical rebuild；edit old message 通过 fork 实现。
-- **AC：** fork 后 sequence/budget/task tree 独立；不重放 external side effect；100+ Items Session 在 Worker restart/provider change 后继续；旧历史仍可审计。
-- **验证：** fork boundary、receipt exclusion、cursor loss、cross-provider continuation tests。
+- **开发目标：** 支持安全分支/编辑和完全不依赖 provider 状态的长会话恢复。
+- **实施步骤：** 1) fork command/lastTurn boundary；2) copy refs/new counters；3) exclude receipt/lease/pending side effect；4) canonical restore；5) cursor-loss reroute；6) edit-as-fork API/UI contract。
+- **完成标准：** fork state 独立；不继承批准/lease；不重放 side effect；100+ Items 跨重启/provider 继续；源历史不可变。
+- **验证与证据（V1+V2+V3）：** fork boundary/receipt exclusion/cursor/cross-provider tests；staging long-session restart/fork trace。
 
 **Phase 7 Exit Gate**
 
@@ -690,54 +870,60 @@ Production  shadow metrics and canary, never live external submit without consen
 - **类型 / 优先级 / Size：** `refactor` / P0 / L
 - **依赖：** AH2-024、AH2-025、AH2-027
 - **主要文件：** `apps/web/src/lib/agent/pipeline.ts`、Worker `agent-run-queue.ts`、`apps/web/src/app/api/internal/agent-run/route.ts`。
-- **实施：** 暂以 `pipeline.run` coarse tool 调度现有 stages；checkpoint 映射 Item/Event；Automation run 复用 canonical Session、新建 Turn；Web internal route 降为 compatibility adapter。
-- **AC：** legacy pipeline 结果进入原 Turn；Worker restart 从 checkpoint；interrupt 停止后续 stage；重复 automation delivery 不创建新 Session/重复外部动作。
-- **验证：** pipeline resume、automation scheduler/session、agent-run queue integration tests。
+- **开发目标：** 先用 coarse adapter 把已工作的 Pipeline 纳入 TurnEngine，而不立即重写 stages。
+- **实施步骤：** 1) pipeline.run tool contract；2) Worker executor；3) checkpoint→Item/Event mapping；4) automation canonical Session/new Turn；5) internal Web route compatibility；6) interrupt/recovery wiring。
+- **完成标准：** Pipeline 结果回原 Turn；重启从 checkpoint；interrupt 阻止后续 stage；重复 automation 无新 Session/副作用；legacy fallback 可切回。
+- **验证与证据（V1+V2+V3）：** pipeline resume、automation/session、queue duplicate tests；staging Worker restart/automation two-run trace。
 
 ### AH2-038 — Discovery 与 scoring/analysis typed tools
 
 - **类型 / 优先级 / Size：** `refactor` / P1 / L
 - **依赖：** AH2-017、AH2-037
 - **主要文件：** discovery、sources、enrichment、analyze stage adapters。
-- **实施：** `jobs.discover`、`jobs.enrich`、`jobs.score`、`jobs.compare`；输出 job IDs/evidence/usage，不返回任意整库；保留 ATS pace policy、dedup 和 full_description 逻辑。
-- **AC：** free ATS/cost/data quality 行为不回退；每次外部请求继续写 usage ledger；一个 job 失败可单独重试；Subagent 只获得允许的数据范围。
-- **验证：** existing discovery/source/stage suites + tool contract tests；无 live network unit tests。
+- **开发目标：** 将发现和分析拆成可单独调度、重试、计费和授权的领域工具。
+- **实施步骤：** 1) 四个 schemas；2) wrap existing discovery/enrich/score/compare；3) IDs/evidence pagination；4) usage/pace/dedup；5) per-job error isolation；6) role visibility。
+- **完成标准：** ATS/cost/data quality 不回退；usage ledger 完整；单 job 可重试；不返回越权整库；full_description/dedup/pace 保持。
+- **验证与证据（V1+V2+V3）：** existing suites + tool contracts，无 live unit network；staging shadow 对比 job count/source/description/cost。
 
 ### AH2-039 — Resume/Cover Letter artifact 与 review/preflight tools
 
 - **类型 / 优先级 / Size：** `refactor` / P1 / L
 - **依赖：** AH2-021、AH2-034、AH2-037
 - **主要文件：** resume tailoring、prepare/gate stages、artifact repository。
-- **实施：** `resume.create_draft`、`cover_letter.create_draft`、`application.preflight`、`artifact.review`；所有输出 version/hash/source refs；模型不直接覆盖 base resume。
-- **AC：** draft 与 approved artifact 分离；事实只能来自 PersonaFact/evidence；约束变化标 stale；review gate 引用确切 hash；无授权不产生 external side effect。
-- **验证：** resume/preflight/stage tests、unsupported claim/provenance/hash tests。
+- **开发目标：** 把求职材料生成与审查变成有版本、来源和 hash 的可审批产物链。
+- **实施步骤：** 1) artifact schemas/versioning；2) wrap draft generators；3) provenance guard；4) preflight/review tools；5) stale invalidation；6) policy/Item integration。
+- **完成标准：** base/draft/approved 分离；事实有 Persona evidence；constraint change stale；review 引用 hash；无授权不覆盖/提交；产物可回溯。
+- **验证与证据（V1+V2+V3）：** resume/preflight/stage、unsupported claim/provenance/hash/stale tests；Preview artifact review flow。
 
 ### AH2-040 — Browser fill-for-review、ATS flow 与 AI fallback executor
 
 - **类型 / 优先级 / Size：** `refactor` / P0 / L
 - **依赖：** AH2-021、AH2-025、AH2-039
 - **主要文件：** `apps/worker/src/flows/`、`harness/agent-harness.ts`、patterns/form-patterns。
-- **实施：** `browser.fill_form` tool；known ATS deterministic flow 优先，pattern replay 次之，LLM fallback 最后；每个动作 child Item；FormPattern 输出 selector mapping artifact；CAPTCHA/login/MFA suspend。
-- **AC：** 默认 `submit=false`；browser crash 不自动重试未知 submit；DOM/JD untrusted；AI budget/cycle cap；fill result 可供用户 review。
-- **验证：** 全部 Worker flow/harness/pattern tests；staging dry-run，不做实际提交。
+- **开发目标：** 把现有 ATS/Browser 能力变成默认只填不提交、可观察、可暂停的工具。
+- **实施步骤：** 1) fill_form schema；2) deterministic→pattern→AI selector；3) child action Items/redaction；4) mapping artifact；5) wait reasons；6) budget/cancel/crash classification。
+- **完成标准：** submit 默认 false 且不可由模型覆盖；crash 不重试未知 submit；DOM/JD untrusted；预算有效；结果可 review；CAPTCHA/login/MFA 原 Turn 暂停。
+- **验证与证据（V1+V2+V4）：** 全 Worker suites；每 ATS staging dry-run screenshot/trace，不做实际提交；AI fallback budget/cancel test。
 
 ### AH2-041 — `application.submit` external-write tool
 
 - **类型 / 优先级 / Size：** `feat` / P0 / L
 - **依赖：** AH2-019、AH2-020、AH2-026、AH2-040
 - **主要文件：** Worker submit executor、application control/preflight、ApplyResult verification。
-- **实施：** tool visibility 由 policy 动态授予；参数只接受 job/application/artifact IDs；原子消费 scoped receipt；idempotency key；提交后验证 URL/confirmation/evidence；未知结果标 uncertain。
-- **AC：** 无 receipt 100% 拒绝；材料/答案/目标变化使 receipt 失效；重复 job/Worker crash 不二次提交；用户停止后不继续新提交；LinkedIn 等禁区始终 deny。
-- **验证：** exhaustive negative matrix、duplicate/crash/fault injection；真实站点仅在用户明确批准的 staging run 中验证。
+- **开发目标：** 在完整审批、幂等和证据核对下开放唯一 application submit 工具。
+- **实施步骤：** 1) ID-only schema/dynamic visibility；2) preflight/scope revalidation；3) atomic receipt consume + idempotency reservation；4) executor；5) confirmation evidence；6) uncertain/recovery path。
+- **完成标准：** 无 receipt 100% deny；任何 hash/target change 失效；重复/崩溃不二次提交；Stop 后不启动新 submit；禁区 deny；未知结果不自动重试。
+- **验证与证据（V1+V2+V4+V5）：** exhaustive negative/fault/duplicate tests；仅用户明确批准的 staging/real run 提供 confirmation evidence；canary duplicate/unauthorized metric 0。
 
 ### AH2-042 — Gmail draft/send typed tools
 
 - **类型 / 优先级 / Size：** `refactor` / P0 / L
 - **依赖：** AH2-019、AH2-020、AH2-026
 - **主要文件：** Gmail helpers/client/tracking、send-draft route compatibility。
-- **实施：** `gmail.create_draft` 为 draft_write；`gmail.send` 为 external_write；recipient/subject/body hash/linked application 在 approval scope；OAuth error 转 waiting_for_user/reconnect。
-- **AC：** draft 不等于 send；无 receipt 或 token 无效不发送；重复 delivery 不重复邮件；发送结果与 Gmail message/thread ID 持久化；跨用户 token 永不混用。
-- **验证：** Gmail focused tests、OAuth failure、scope/hash、duplicate send tests；不在 unit tests 调 live Gmail。
+- **开发目标：** 分离 Gmail 草稿和发送权限，保证 OAuth/user scope、审批和重复投递安全。
+- **实施步骤：** 1) draft/send schemas；2) existing client adapters；3) approval scope hashes；4) OAuth waiting/reconnect；5) send idempotency/evidence IDs；6) tracking event integration。
+- **完成标准：** draft 不发送；无 receipt/token 不发送；重复 delivery 单邮件；message/thread ID 持久化；跨用户 token 不可访问；OAuth 恢复原 Turn。
+- **验证与证据（V1+V2+V4+V5）：** focused/OAuth/scope/duplicate tests，无 live unit call；用户授权 staging send evidence；canary duplicate/tenant violation 0。
 
 **Phase 8 Exit Gate**
 
@@ -758,54 +944,60 @@ Production  shadow metrics and canary, never live external submit without consen
 - **类型 / 优先级 / Size：** `feat` / P1 / L
 - **依赖：** AH2-011、AH2-012
 - **主要文件：** `apps/web/src/components/agent-workspace/v2/` 或 focused hooks/reducers。
-- **实施：** reducer 输入 Session/Turn/Item/Event DTO；按 itemId/revision/sequence 幂等；snapshot + durable tail + transient delta；`item.completed` 覆盖 streaming。
-- **AC：** live/replay 得到相同 state；重复/乱序 delta 不重复文本；未知 Item 安全 fallback；断线显示 reconnect，不标任务失败。
-- **验证：** reducer golden/duplicate/out-of-order/reconnect tests。
+- **开发目标：** 建立 Agent Workspace 唯一、确定性的 timeline 状态投影，统一 replay 和 live。
+- **实施步骤：** 1) normalized client DTO；2) reducer/state indexes；3) snapshot+tail hydrate；4) transient delta merge；5) completed authoritative replace；6) reconnect/unknown fallback。
+- **完成标准：** live/replay state 相同；重复/乱序不重复；未知 Item 可显示；断线不标失败；reducer 无网络/组件副作用。
+- **验证与证据（V1+V2）：** golden、duplicate/out-of-order/reconnect/property tests；same-events replay/live deepEqual。
 
 ### AH2-044 — Session state、URL 与 active Turn Composer
 
 - **类型 / 优先级 / Size：** `feat` / P1 / L
 - **依赖：** AH2-009、AH2-010、AH2-043
 - **主要文件：** `AgentPlaygroundPage.tsx` 拆分、AgentComposer、session hooks。
-- **实施：** URL 只使用 sessionId；activeTurn 从 DTO；Composer 支持 start、Add to current task、Run next、Stop；optimistic message 用 clientMessageId 对账。
-- **AC：** active Turn 时 Composer 不被禁用；409 不静默改投；发送状态 `sending/accepted/consumed/failed` 可见；关闭页面不 interrupt；Stop 调真实 API。
-- **验证：** page/composer tests、fake stream/API tests。
+- **开发目标：** 让用户在运行中继续输入、排队或停止，并由服务端状态决定消息归属。
+- **实施步骤：** 1) URL/session hook；2) activeTurn DTO state；3) Composer delivery selector；4) optimistic clientMessage reconciliation；5) typed 409/failed UX；6) real interrupt command。
+- **完成标准：** active 时可输入；steer/follow-up 明确；409 不静默；sending→accepted→consumed/failed 可见；页面关闭不 Stop；URL 无 liveSession 双源。
+- **验证与证据（V1+V2+V4）：** page/composer/fake API tests；Preview 手动 start/steer/follow-up/409/Stop/refresh 录屏或截图。
 
 ### AH2-045 — Commentary/final、Plan、Tool 与 structured content renderers
 
 - **类型 / 优先级 / Size：** `feat` / P1 / L
 - **依赖：** AH2-043
 - **主要文件：** AgentUnifiedStream、Transcript blocks 拆分为 typed Item components。
-- **实施：** commentary 与 final 分相；plan checklist；tool lifecycle 折叠卡片；job_table/artifact_card/citation/suggested_action 原生组件；suggested action 点击后发 typed command。
-- **AC：** Markdown/`ACTION:` 不触发行为；final 每 Turn 唯一突出；reasoning 只显示 summary；敏感参数脱敏；未知 content part 可降级显示。
-- **验证：** component tests、XSS/unsafe markdown tests、i18n snapshots。
+- **开发目标：** 将 Harness Item 原生呈现为可理解、可交互、不会执行文本暗号的 Codex-style timeline。
+- **实施步骤：** 1) phase-aware message components；2) plan reducer UI；3) tool lifecycle card；4) typed content parts；5) suggested-action command button；6) redaction/unknown fallback/i18n。
+- **完成标准：** commentary/final 分开；每 Turn final 唯一突出；ACTION/Markdown 不执行；reasoning 仅 summary；敏感数据脱敏；unknown part 不崩溃。
+- **验证与证据（V1+V4）：** component/XSS/unsafe markdown/i18n snapshots；Preview typed Items visual evidence。
 
 ### AH2-046 — Task tree、Approval/Question、Artifact 与 Budget UI
 
 - **类型 / 优先级 / Size：** `feat` / P1 / L
 - **依赖：** AH2-020、AH2-030、AH2-034、AH2-043
 - **主要文件：** AgentTeamList、ApprovalBlock、SessionFocusPanel、HealthStrip。
-- **实施：** task hierarchy/status/cost；approval 显示 job/material hash/destination/expiry；question typed options/free answer；artifact version/stale state；context compaction milestone。
-- **AC：** 刷新后 pending cards 可继续；回答后只读保留；跨 Turn card 不误操作；task heartbeat 不刷屏；budget/partial/uncertain 可见。
-- **验证：** component/API integration tests、stale approval/answered question fixtures。
+- **开发目标：** 为用户提供任务树、风险决策、产物版本和成本状态的完整控制面。
+- **实施步骤：** 1) task tree projection；2) approval scope/details/actions；3) question states；4) artifact/version/stale cards；5) budget/compaction/uncertain status；6) collapse/noise policy。
+- **完成标准：** refresh 可继续 pending；已回答只读；跨 Turn 不误操作；heartbeat 不刷屏；用户能看清影响/目标/版本/成本/不确定状态。
+- **验证与证据（V1+V2+V4）：** component/API fixtures、stale/answered/cross-turn tests；Preview refresh/approval/task-tree evidence。
 
 ### AH2-047 — 移除 `/api/agent/chat` 动作协议与双 EventSource 状态
 
 - **类型 / 优先级 / Size：** `refactor` / P0 / L
 - **依赖：** AH2-037、AH2-043、AH2-044、AH2-045
 - **主要文件：** `/api/agent/chat`、`agent-chat-stream.ts`、`AgentPlaygroundPage.tsx`、legacy run SSE adapters。
-- **实施：** chat route 仅作为 `/messages` compatibility adapter；删除 `ACTION:` prompt/parser/handler；移除 selectedSessionId/liveSessionId 双写和 chat/run 两条独立用户流。
-- **AC：** repo search 无生产 `ACTION:` parser；一个 Session 一个 timeline connection；chat 触发 Pipeline 仍在同 Turn；flag 关闭可回 legacy projection但不能恢复文本动作执行。
-- **验证：** affected route/page/stream tests、full Web test、search assertion test。
+- **开发目标：** 完成协议收敛，消除当前普通聊天和 Pipeline 两套运行/前端状态。
+- **实施步骤：** 1) chat route 转 messages adapter；2) 删除 ACTION prompt/parser/handler；3) run/chat events 投同 timeline；4) 移除 live/selected 双写；5) 清 legacy stream client；6) 保留只读 projection rollback。
+- **完成标准：** production 无 ACTION parser；每 Session 一 stream；chat 触发工作仍同 Turn；无双 state；rollback 不恢复文本执行；旧链接/历史可读。
+- **验证与证据（V1+V2+V3）：** route/page/stream/full Web tests、repo search assertion；Preview connection count/timeline trace。
 
 ### AH2-048 — Codex-chat 浏览器 E2E、移动端和中英双语验收
 
 - **类型 / 优先级 / Size：** `test` / P0 / L
 - **依赖：** AH2-044–AH2-047
 - **主要文件：** Playwright E2E、fixtures、i18n resources。
-- **实施：** 自动化覆盖设计 16.6 的 10 个剧本；desktop + 320x568；English 默认、Chinese 全量切换；scripted backend 避免真实模型/外部提交。
-- **AC：** steer/follow-up/Stop/approval/reconnect/final 都通过；无混合语言；keyboard/focus/aria 可用；移动端可访问 task/approval/final。
-- **验证：** `pnpm test:e2e` 的 focused project；保存失败 screenshot/trace，不把本地通过冒充生产通过。
+- **开发目标：** 用浏览器级证据证明产品真的具备 Codex-chat 行为，而非只通过 reducer/unit tests。
+- **实施步骤：** 1) scripted Harness fixtures；2) 10 场景 Playwright；3) desktop/mobile projects；4) English/Chinese locale matrix；5) keyboard/a11y checks；6) trace/screenshot artifacts。
+- **完成标准：** steer/follow-up/Stop/approval/reconnect/final 全过；无混合语言；移动端可完成关键操作；失败可重放；测试不触发真实外部提交。
+- **验证与证据（V1+V3+V4）：** focused `pnpm test:e2e`、CI traces；Preview desktop/320x568 和双语 evidence；明确区分自动、Preview、生产证据。
 
 **Phase 9 Exit Gate**
 
@@ -826,36 +1018,40 @@ Production  shadow metrics and canary, never live external submit without consen
 - **类型 / 优先级 / Size：** `test` / P0 / L
 - **依赖：** AH2-027、AH2-030、AH2-035、AH2-041、AH2-042
 - **主要文件：** Worker/Web integration fixtures、scripted model/tool adapters。
-- **实施：** 覆盖 multi-step、steer race、follow-up、approval resume、disconnect、duplicate delta、cursor loss、reroute、interrupt、stale material、no progress、text command injection；8 个 crash 点。
-- **AC：** 所有 case 可重复、无 live provider；外部副作用 duplicate rate 0；event replay deterministic；失败输出完整 session/turn/step/item trace IDs。
-- **验证：** dedicated Vitest project/CI job；可设置固定 seed 重放。
+- **开发目标：** 建立发布前不可跳过的确定性 Harness 验证门，覆盖协议和崩溃边界。
+- **实施步骤：** 1) scripted adapter DSL；2) 12 chat contract cases；3) 8 crash injection points；4) deterministic seed/replay；5) side-effect ledger assertions；6) dedicated CI job/artifacts。
+- **完成标准：** 无 live provider；所有 case 可重复；duplicate external side effect 0；event replay deterministic；失败有完整 trace；CI 不允许标记 flaky 后忽略。
+- **验证与证据（V1+V2+V3）：** dedicated suite/CI、固定 seed rerun、fault matrix completion report。
 
 ### AH2-050 — Harness SLO、trace、usage 与 admin observability
 
 - **类型 / 优先级 / Size：** `feat` / P1 / L
 - **依赖：** AH2-012、AH2-027、AH2-049
 - **主要文件：** usage/event metrics、admin queue/agent dashboards、runbook。
-- **实施：** accepted/consumed、first commentary/model delta、progress silence、reconnect、interrupt、steps/turn、tool/task/approval、cost、projection lag、stale lease、duplicate suppression；trace IDs 全链路。
-- **AC：** 指标可按 provider/model/user plan/tool/version 聚合但不暴露 PII；SLO breach 有告警/runbook；Admin 只看授权范围；成本可归因 Session→Turn→Step→Task。
-- **验证：** metric emission tests、admin RBAC tests、staging dashboard evidence。
+- **开发目标：** 让延迟、成本、恢复、安全和队列状态可度量、可告警、可定位。
+- **实施步骤：** 1) metric/event taxonomy；2) trace propagation；3) usage aggregation；4) admin dashboards/RBAC；5) SLO alerts；6) runbook 查询和排障步骤。
+- **完成标准：** 指标覆盖设计列表；无 PII；成本可逐层归因；SLO breach 告警可执行；Admin scope 正确；每个 trace 能从 Session 到 tool/task。
+- **验证与证据（V1+V2+V3）：** emission/RBAC tests、synthetic breach、staging dashboard screenshots/query outputs、runbook drill。
 
 ### AH2-051 — Shadow compare、内部 canary 与用户 rollout
 
 - **类型 / 优先级 / Size：** `chore` / P0 / L
 - **依赖：** AH2-048、AH2-049、AH2-050
 - **主要文件：** feature flag rollout config、shadow comparator、operations docs。
-- **实施：** 先 dual-write/replay shadow，不双执行 external tools；内部账号 → 1% → 5% → 25% → 50% → 100%；每级至少观察一个完整业务周期；自动 rollback thresholds。
-- **AC：** completion 不低于 legacy；unauthorized/duplicate external action 0；replay ≥99.9%；SLO/cost guardrail 达标；每级有明确 go/no-go report。
-- **验证：** staging + production fresh metrics；不能只以 CI green 作为 rollout 证明。
+- **开发目标：** 用分级真实流量证明 V2 至少与 legacy 同样可靠，并可在异常时快速回退。
+- **实施步骤：** 1) shadow comparator；2) no-double-external-execution guard；3) internal→1→5→25→50→100 flags；4) per-stage observation window；5) automated rollback thresholds；6) go/no-go reports。
+- **完成标准：** completion 不低于 legacy；unauthorized/duplicate 0；replay≥99.9%；SLO/cost 达标；每级有签字报告；任一阈值失败自动停止升级。
+- **验证与证据（V3+V5）：** staging + fresh production metrics、每级 canary report、rollback exercise；CI green 不能替代 observation。
 
 ### AH2-052 — Legacy 清理、GA 与长期维护契约
 
 - **类型 / 优先级 / Size：** `chore/refactor` / P1 / L
 - **依赖：** AH2-051 完成 100% 稳定观察期
 - **主要文件：** legacy chat/run recorder/projection、AgentRun compatibility、docs/runbook/README。
-- **实施：** 删除不再读取的 ACTION/dual stream/lossy recorder；AgentRun 保留只读 projection 或归档；保留 emergency pipeline adapter；document event/schema versioning 和 migration policy。
-- **AC：** 删除前 telemetry 证明旧路径 0 traffic；数据库列/表删除另开 migration，不与代码删除同 PR；GA docs、runbook、ownership、on-call checklist 完整。
-- **验证：** repository-wide tests/build/typecheck、production smoke、rollback rehearsal。
+- **开发目标：** 在有生产证据和回退演练后完成 GA，安全删除不再使用的 legacy 代码和状态。
+- **实施步骤：** 1) telemetry 证明零流量；2) 删除旧 readers/writers；3) AgentRun projection/archive；4) destructive DB cleanup 另 Issue/PR；5) emergency adapter/runbook；6) schema/version ownership 和 GA checklist。
+- **完成标准：** legacy 零流量；代码删除不与 destructive migration 混合；repo tests/build/typecheck 通过；生产 smoke/rollback rehearsal；on-call owner 和维护契约完整。
+- **验证与证据（V1+V3+V5）：** repository-wide checks、production smoke、零流量查询、rollback rehearsal、GA completion report；未满足任一项不得关闭 Initiative。
 
 **Phase 10 / GA Exit Gate**
 
