@@ -40,6 +40,9 @@
 14. Primary Codex 是当前 Issue 的唯一实现、集成和验证 owner，可在 Issue 内把边界明确的子任务并行分发给 Subagent。
 15. Subagent 不拥有 Issue、branch 或 PR，不直接 merge/push，也不能自行改变架构、AC、产品范围或外部系统状态。
 16. Subagent 输出只是候选 patch/evidence；Primary Codex 必须逐项审阅、解决冲突并在统一分支上重跑完整验证后才能交付。
+17. 当 Issue 与本路线图冲突时，Primary Codex 必须先判断是 Issue 偏离路线图，还是路线图本身漏项/错误；不能把任何一方静默当作正确。
+18. 若仓库证据证明路线图有缺陷，Primary Codex 应做最小、可审阅的路线图修正，并在 GitHub 用 `@claude` 明确要求重新阅读修正章节；不得借路线图修正静默改变 Issue 的 AC。
+19. 若路线图修正会改变当前 Issue 的范围、依赖、安全边界或验收方式，必须等待 Claude 重新确认/更新 Issue 后再继续业务代码；证据不足时保持 blocked 并请求澄清。
 
 ### 0.2 Issue 标准标签
 
