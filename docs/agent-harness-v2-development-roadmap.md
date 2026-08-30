@@ -1,6 +1,6 @@
 # ApplyMate Agent Harness 2.0 详细开发路线图
 
-> **状态：** Proposed / issue-ready
+> **状态：** Active — Phase 0 (AH2-001/002/003) created as #335/#336/#337, AH2-001 in progress
 > **日期：** 2026-08-30
 > **上游设计：** [Agent Harness 2.0 Technical Design](./agent-harness-v2-technical-design.md)
 > **适用代码：** `packages/agent-protocol`、`packages/agent-model`、`apps/web`、`apps/worker`
@@ -1143,9 +1143,9 @@ draft
 
 | Logical ID | Title short | Depends on | GitHub Issue | PR | State |
 |---|---|---|---|---|---|
-| AH2-001 | fail-closed submit | — | TBD | TBD | spec-ready |
-| AH2-002 | external action/CAPTCHA matrix | 001 | TBD | TBD | pending |
-| AH2-003 | ADR/flags/baseline | 001,002 | TBD | TBD | pending |
+| AH2-001 | fail-closed submit | — | [#335](https://github.com/YuanshuoDu/applymate-jobcopilot/issues/335) | TBD | in-progress |
+| AH2-002 | external action/CAPTCHA matrix | #335 | [#336](https://github.com/YuanshuoDu/applymate-jobcopilot/issues/336) | TBD | spec-ready |
+| AH2-003 | ADR/flags/baseline | #335,#336 | [#337](https://github.com/YuanshuoDu/applymate-jobcopilot/issues/337) | TBD | spec-ready |
 | AH2-004 | agent-protocol package | 003 | TBD | TBD | pending |
 | AH2-005 | Turn/Step/Input schema | 004 | TBD | TBD | pending |
 | AH2-006 | Item/Event/Outbox/sequence | 004,005 | TBD | TBD | pending |
