@@ -6,6 +6,7 @@
 > **ApplyMate 基线：** `855567b8ca16dfda2282026d26d8f2e91695c014`（`origin/master`）
 > **Codex 源码研究基线：** `88f776588f5e73467e7659c268f8358a9a2378b6`（`openai/codex`）
 > **相关现有文档：** [Agent Session Quality & Auto-Apply Redesign](./2026-06-18-agent-session-quality-auto-apply-redesign.md)、[Agent Workspace Redesign](./agent-workspace-redesign.md)、[Scraping & Auto-Apply Architecture](./scraping-autoapply-design.md)、[Persona Knowledge Base Design](./persona-knowledge-base-design.md)
+> **详细实施路线图：** [Agent Harness 2.0 Development Roadmap](./agent-harness-v2-development-roadmap.md)
 
 ## 0. 执行结论
 
@@ -1982,7 +1983,7 @@ apps/worker/src/runtime/
 
 ## 18. 分阶段实施计划
 
-每阶段应是独立 PR，带 migration、feature flag、focused tests 和回滚说明。不要做“大爆炸式”替换。
+本节定义架构级 Phase Gate；[详细开发路线图](./agent-harness-v2-development-roadmap.md) 将其拆成 52 个 issue-ready 单元并作为实施顺序、依赖和 AC 的事实源。每个实际 Issue 应是独立 PR，带 migration、feature flag、focused tests 和回滚说明。不要把一个 Phase 做成一个“大爆炸式”PR。
 
 ### Phase 0：架构护栏与安全基线
 
@@ -2217,7 +2218,9 @@ Browser `AgentHarness` 变为 `browser.fill_form` executor：
 
 ---
 
-## 19. 建议 PR 切分
+## 19. 高层工作包（已由详细路线图进一步拆分）
+
+以下 20 项是架构能力包，不应再直接作为单个开发 PR；实际开发必须使用详细路线图中的 `AH2-001`～`AH2-052`，避免 migration、runtime、UI 和 rollout 重新耦合。
 
 1. `fix(agent): make all external submission guards fail closed`
 2. `docs(agent): retire captcha solver paths and add harness ADR`
@@ -2240,7 +2243,7 @@ Browser `AgentHarness` 变为 `browser.fill_form` executor：
 19. `test(agent): add fault injection and full harness eval suite`
 20. `chore(agent): retire legacy projections after rollout gate`
 
-每个 PR 必须限制文件范围，保持新 source file ≤ 250 lines，并有 sibling tests。
+每个实际 PR 必须限制文件范围，保持新 source file ≤ 250 lines，并有 sibling tests；依赖、AC、验证与回滚以详细开发路线图为准。
 
 ---
 
@@ -2473,6 +2476,7 @@ AGENT_UI_TIMELINE_V2
 - `2026-06-18-agent-session-quality-auto-apply-redesign.md` 记录 Session/Task/Gate 的历史演进；
 - `scraping-autoapply-design.md` 继续定义 ATS/浏览器业务架构；
 - `persona-knowledge-base-design.md` 继续定义事实与 provenance；
+- `agent-harness-v2-development-roadmap.md` 将本设计拆成 11 个 Phase Gate、52 个 issue-ready 开发单元；
 - 本文件定义这些系统如何通过 Turn、Tool、Policy、Subagent、Event 和 Context 组成闭环。
 
 冲突时以本文件的运行时、安全和 source-of-truth 规则为准。特别是：当前 CAPTCHA 实现为 detection-only，任何旧文档中的 solver/CapSolver 路径不应继续实施。
@@ -2510,6 +2514,8 @@ Harness 2.0 只有在以下全部成立时才算完成：
 ## 26. 第一批执行建议
 
 开发团队不要从“写一个更强 Orchestrator Prompt”开始。建议立即按以下顺序开工：
+
+具体第一批 Issue 为详细开发路线图中的 AH2-001～AH2-003；以下列表只表示能力顺序。
 
 1. 修复 submit guard fail-open；
 2. 建立 `packages/agent-protocol`；
