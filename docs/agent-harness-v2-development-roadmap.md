@@ -476,7 +476,8 @@ draft
 
 - **类型 / 优先级 / Size：** `fix` / P0 / M
 - **依赖：** 无
-- **主要文件：** `apps/worker/src/harness/agent-harness.ts`、`apps/worker/src/flows/helpers.ts`、所有 `*-flow.test.ts`
+- **主要文件：** `apps/worker/src/harness/agent-harness.ts`、`apps/worker/src/flows/helpers.ts`、五个 ATS flow 源文件与 browser fallback（`workday-flow.ts` / `greenhouse-flow.ts` / `lever-flow.ts` / `smartrecruiters-flow.ts` / `personio-flow.ts`）、`apps/worker/src/patterns/replay.ts`、`packages/shared/src/index.ts`（`ApplyResult.status` 增加 `submission_blocked`）、`apps/worker/src/queue/apply-queue.ts`（blocked 持久化/通知处理）、所有 `*-flow.test.ts` 与对应 focused tests
+  - *修正记录（2026-08-30，规则 17–19）：Codex 在 #335 澄清时用仓库证据证明 flow 源文件、`replay.ts`、`shared/index.ts`、`apply-queue.ts` 均属于 submit 调用点，原主要文件列表不完整；经 Claude 确认后扩展，Issue #335 范围同步更新。*
 - **开发目标：** 把“未提供授权即可提交”的隐式默认彻底改为“只有明确、有效授权才提交”，并保持 fill-for-review 可用。
 - **实施步骤：** 1) 枚举五类 ATS 和 Browser fallback 的所有 submit call site；2) 建立唯一 `assertSubmissionAuthorized()` 入口；3) 缺 guard、false、error、timeout、非 boolean 全部返回 typed blocked result；4) 每个 flow 删除直达 submit 的旁路；5) 增加 blocked reason event/metric。
 - **完成标准：** 缺 guard、guard false、guard error、过期 authorization 均为 `submission_blocked`；没有任何 flow 能绕过 helper；fill-only fixture 仍成功；代码搜索与测试证明所有 call site 已覆盖。
