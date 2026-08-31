@@ -12,6 +12,8 @@ import {
 } from "@jobcopilot/agent-protocol"
 
 import { appendAgentEventWithOutboxInTransaction } from "../session/fact-store"
+import { projectApprovalWaitInTransaction } from "../broker/item-projector"
+import { resolvePendingApprovalInTransaction } from "./decision"
 import {
   ApprovalStoreError,
   assertScopeInput,
@@ -125,6 +127,20 @@ export async function issueApprovalReceipt(db: PrismaClient, input: IssueApprova
           scopeHash, nonceHash, revision: input.scope.revision, expiresAt: input.scope.expiresAt,
         },
       })
+      await projectApprovalWaitInTransaction(tx, {
+        sessionId: input.scope.sessionId,
+        userId: input.scope.userId,
+        approvalId,
+        turnId: input.scope.turnId,
+        toolCallId: input.scope.toolCallId,
+        action: input.scope.action,
+        title: input.title,
+        body: input.body,
+        impact: input.impact,
+        scopeHash,
+        receiptRevision: input.scope.revision,
+        expiresAt: input.scope.expiresAt,
+      })
       await appendAgentEventWithOutboxInTransaction(tx, {
         sessionId: input.scope.sessionId, turnId: input.scope.turnId, itemId: null, taskId: input.taskId ?? null,
         type: "approval.requested", actor: "orchestrator", correlationId: approvalId, causationId: null,
@@ -150,13 +166,7 @@ export async function validateApproval(db: PrismaClient, id: string, expected: A
 export async function resolveApproval(db: PrismaClient, input: { id: string; userId: string; sessionId: string; decision: ApprovalDecision; now?: Date }): Promise<void> {
   const now = input.now ?? new Date()
   await db.$transaction(async (tx) => {
-    const row = await tx.agentApproval.findFirst({ where: { id: input.id, userId: input.userId, sessionId: input.sessionId } })
-    if (!row) throw new ApprovalStoreError("approval_not_found", "Approval receipt was not found")
-    if (!row.turnId) throw new ApprovalStoreError("approval_integrity_error", "Legacy approval records cannot become scoped receipts")
-    if (row.status !== "pending") throw new ApprovalStoreError(row.status === "consumed" ? "approval_already_consumed" : "approval_not_approved", "Approval receipt is no longer pending")
-    if (row.expiresAt && row.expiresAt <= now) throw new ApprovalStoreError("approval_expired", "Approval receipt has expired")
-    const updated = await tx.agentApproval.updateMany({ where: { id: input.id, userId: input.userId, sessionId: input.sessionId, status: "pending" }, data: { status: input.decision, decidedAt: now } })
-    if (updated.count !== 1) throw new ApprovalStoreError("approval_not_approved", "Approval receipt resolution raced with another decision")
+    const row = await resolvePendingApprovalInTransaction(tx, { ...input, now })
     await appendAgentEventWithOutboxInTransaction(tx, {
       sessionId: input.sessionId, turnId: row.turnId, itemId: null, taskId: row.taskId,
       type: "approval.resolved", actor: "user", correlationId: input.id, causationId: null,

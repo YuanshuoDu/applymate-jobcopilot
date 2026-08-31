@@ -59,7 +59,10 @@ function makeDb(options: { ownerId?: string; failOutbox?: boolean } = {}) {
         items.push(data)
         return data
       }),
+      findMany: vi.fn(async () => []),
+      updateMany: vi.fn(async () => ({ count: 1 })),
     },
+    agentApproval: { updateMany: vi.fn(async () => ({ count: 1 })) },
     agentEvent: {
       findFirst: vi.fn(async (args: unknown) => {
         const where = whereOf(args)

@@ -29,7 +29,11 @@ function mockDb(row: Prisma.AgentApprovalGetPayload<{}>) {
   const tx = {
     $queryRaw: vi.fn(async () => [{ eventSequence: BigInt(9) }]),
     agentSession: { findFirst: vi.fn(async () => ({ id: row.sessionId })) },
-    agentTurn: { findFirst: vi.fn(async () => ({ id: row.turnId })) },
+    agentTurn: {
+      findFirst: vi.fn(async () => ({ id: row.turnId, status: "in_progress", revision: scopeInput.revision })),
+      updateMany: vi.fn(async () => ({ count: 1 })),
+    },
+    agentItem: { create: vi.fn(async ({ data }: { data: Record<string, unknown> }) => data) },
     job: { findFirst: vi.fn(async () => ({ id: row.jobId })) },
     agentApproval: {
       findFirst: vi.fn(async () => row),

@@ -2,7 +2,7 @@ import { schemaVersion } from "@jobcopilot/agent-protocol"
 
 import { toIso, type CursorRow } from "./query-helpers"
 
-const SENSITIVE_KEY = /(api[_-]?key|access[_-]?token|refresh[_-]?token|authorization|cookie|password|secret|private[_-]?key|credential|token|(?:full[_-]?)?resume(?:[_-]?(text|content|data))?|cv(?:[_-]?(text|content|data))?|raw[_-]?(content|text))/i
+const SENSITIVE_KEY = /(api[_-]?key|access[_-]?token|refresh[_-]?token|authorization|cookie|password|secret|private[_-]?key|credential|token|answer|(?:full[_-]?)?resume(?:[_-]?(text|content|data))?|cv(?:[_-]?(text|content|data))?|raw[_-]?(content|text))/i
 const SENSITIVE_TOKEN = /\bBearer\s+[a-z0-9._~+/=-]{8,}/gi
 const SENSITIVE_KEY_TOKEN = /\b(?:sk-|xox[baprs]-)[a-z0-9._~+/=-]{8,}/gi
 
@@ -71,6 +71,28 @@ export function itemDto(row: ItemQueryRow) {
   let content: unknown
   if (row.type === "user_message") content = { parts: displayParts(row.content) }
   else if (row.type === "agent_message") content = { text: displayText(row.content) }
+  else if (row.type === "approval_request") content = {
+    waitKind: "approval",
+    approvalId: typeof raw.approvalId === "string" ? raw.approvalId : null,
+    toolCallId: typeof raw.toolCallId === "string" ? raw.toolCallId : null,
+    action: typeof raw.action === "string" ? redactString(raw.action) : null,
+    title: typeof raw.title === "string" ? redactString(raw.title) : "Approval required",
+    body: typeof raw.body === "string" ? redactString(raw.body) : "",
+    impact: raw.impact === undefined || raw.impact === null ? null : redactValue(raw.impact),
+    expiresAt: typeof raw.expiresAt === "string" ? raw.expiresAt : null,
+    decision: typeof raw.decision === "string" ? raw.decision : null,
+    pending: row.status === "started",
+  }
+  else if (row.type === "question") content = {
+    waitKind: "question",
+    questionId: typeof raw.questionId === "string" ? raw.questionId : null,
+    toolCallId: typeof raw.toolCallId === "string" ? raw.toolCallId : null,
+    stage: typeof raw.stage === "string" ? redactString(raw.stage) : null,
+    question: typeof raw.question === "string" ? redactString(raw.question) : "",
+    options: redactValue(raw.options),
+    answerAvailable: raw.answerAvailable === true || row.status === "completed",
+    pending: row.status === "started",
+  }
   else if (row.type === "tool_call") content = {
     toolCallId: typeof raw.toolCallId === "string" ? raw.toolCallId : null,
     toolName: typeof raw.toolName === "string" ? raw.toolName : null,

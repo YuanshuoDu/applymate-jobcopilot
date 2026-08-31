@@ -3,6 +3,8 @@ import { ActorSchema, IdSchema, JsonValueSchema, NullableIdSchema, SchemaVersion
 
 export const AgentEventTypeSchema = Type.Union([
   Type.Literal('turn.started'),
+  Type.Literal('turn.wakeup'),
+  Type.Literal('turn.resumed'),
   Type.Literal('turn.completed'),
   Type.Literal('turn.failed'),
   Type.Literal('step.started'),
@@ -21,6 +23,8 @@ export const AgentEventTypeSchema = Type.Union([
   Type.Literal('approval.resolved'),
   Type.Literal('approval.consumed'),
   Type.Literal('approval.expired'),
+  Type.Literal('question.answered'),
+  Type.Literal('question.cancelled'),
   Type.Literal('external_action.reserved'),
 ])
 

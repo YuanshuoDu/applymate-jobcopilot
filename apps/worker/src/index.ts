@@ -6,6 +6,7 @@ import { createWorkerControlHandler, resolveWorkerAdminHost } from "./admin/cont
 import { bindWorkerControl, getWorkerRuntimeState, restoreWorkerRuntimeState } from "./admin/worker-state.js";
 import { closeSharedRedisConnections } from "./redis.js";
 import { workerHarnessFeatureHealth } from "./admin/harness-health.js";
+import { startAgentWakeupConsumer } from "./runtime/wakeup/consumer.js";
 
 async function main() {
   const adminHost = resolveWorkerAdminHost();
@@ -61,6 +62,9 @@ async function main() {
     console.error("[worker] Redis connection failed:", err);
     process.exit(1);
   }
+
+  const agentWakeupConsumer = startAgentWakeupConsumer();
+  console.log("[worker] Agent Turn wakeup consumer started");
 
   const workerControls = {
     "apply-tasks": bindWorkerControl(applyQueue, applyWorker),
@@ -124,6 +128,7 @@ async function main() {
     await closeDeadLetterResources();
     automationScheduler.close();
     await closeAllSlots();
+    await agentWakeupConsumer.close();
     await closePool();
     await closeSharedRedisConnections();
     process.exit(0);
