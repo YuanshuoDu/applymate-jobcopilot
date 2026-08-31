@@ -1,6 +1,6 @@
 # ApplyMate Agent Harness 2.0 详细开发路线图
 
-> **状态：** Phase 0/1/2 complete — Phase 3 (AH2-013..017) as #362..#366; AH2-013 done (#367), AH2-014 done (#368), AH2-015 in progress. *Gates follow-up: 48h dual-write shadow + staging SSE drill pending staging credentials.*
+> **状态：** Phase 0/1/2 complete — Phase 3 (AH2-013..017) as #362..#366 + MiniMax (#369 AH2-014-M, #370 AH2-024-M); AH2-013 done (#367), AH2-014 done (#368), AH2-015 in progress. *Gates follow-up: 48h dual-write shadow + staging SSE drill pending staging credentials.*
 > **日期：** 2026-08-30
 > **上游设计：** [Agent Harness 2.0 Technical Design](./agent-harness-v2-technical-design.md)
 > **适用代码：** `packages/agent-protocol`、`packages/agent-model`、`apps/web`、`apps/worker`
@@ -1164,6 +1164,7 @@ draft
 | AH2-012 | durable/transient stream | #346,#356 | [#357](https://github.com/YuanshuoDu/applymate-jobcopilot/issues/357) | [#361](https://github.com/YuanshuoDu/applymate-jobcopilot/pull/361) | done |
 | AH2-013 | agent-model contract | #344 | [#362](https://github.com/YuanshuoDu/applymate-jobcopilot/issues/362) | [#367](https://github.com/YuanshuoDu/applymate-jobcopilot/pull/367) | done |
 | AH2-014 | OpenAI-compatible adapter | #362 | [#363](https://github.com/YuanshuoDu/applymate-jobcopilot/issues/363) | [#368](https://github.com/YuanshuoDu/applymate-jobcopilot/pull/368) | done |
+| AH2-014-M | MiniMax M3 provider profile | #363,#367 | [#369](https://github.com/YuanshuoDu/applymate-jobcopilot/issues/369) | TBD | spec-ready |
 | AH2-015 | Anthropic adapter | #362 | [#364](https://github.com/YuanshuoDu/applymate-jobcopilot/issues/364) | TBD | spec-ready |
 | AH2-016 | fallback/recovery/reroute | #363,#364 | [#365](https://github.com/YuanshuoDu/applymate-jobcopilot/issues/365) | TBD | spec-ready |
 | AH2-017 | ToolRegistry/read tools | #347,#362 | [#366](https://github.com/YuanshuoDu/applymate-jobcopilot/issues/366) | TBD | spec-ready |
@@ -1174,6 +1175,7 @@ draft
 | AH2-022 | Turn lease/recovery | 007,009 | TBD | TBD | pending |
 | AH2-023 | Step context/input consume | 016,022 | TBD | TBD | pending |
 | AH2-024 | conversation loop | 017,018,022,023 | TBD | TBD | pending |
+| AH2-024-M | MiniMax M3 Harness default | AH2-024, AH2-017, #369 | [#370](https://github.com/YuanshuoDu/applymate-jobcopilot/issues/370) | TBD | spec-ready |
 | AH2-025 | suspension/wakeup | 020,024 | TBD | TBD | pending |
 | AH2-026 | interrupt cascade | 022,024,025 | TBD | TBD | pending |
 | AH2-027 | budget/verifier/finalizer | 024 | TBD | TBD | pending |
