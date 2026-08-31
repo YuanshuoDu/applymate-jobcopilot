@@ -1149,7 +1149,7 @@ draft
 | Logical ID | Title short | Depends on | GitHub Issue | PR | State |
 |---|---|---|---|---|---|
 | AH2-001 | fail-closed submit | — | [#335](https://github.com/YuanshuoDu/applymate-jobcopilot/issues/335) | [#341](https://github.com/YuanshuoDu/applymate-jobcopilot/pull/341) | done |
-| AH2-002 | external action/CAPTCHA matrix | #335 | [#336](https://github.com/YuanshuoDu/applymate-jobcopilot/issues/336) | TBD | spec-ready |
+| AH2-002 | external action/CAPTCHA matrix | #335 | [#336](https://github.com/YuanshuoDu/applymate-jobcopilot/issues/336) | [#342](https://github.com/YuanshuoDu/applymate-jobcopilot/pull/342) | done |
 | AH2-003 | ADR/flags/baseline | #335,#336 | [#337](https://github.com/YuanshuoDu/applymate-jobcopilot/issues/337) | TBD | spec-ready |
 | AH2-004 | agent-protocol package | 003 | TBD | TBD | pending |
 | AH2-005 | Turn/Step/Input schema | 004 | TBD | TBD | pending |
