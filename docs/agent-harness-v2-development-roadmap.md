@@ -1162,11 +1162,11 @@ draft
 | AH2-010 | message/interrupt API | #354 | [#355](https://github.com/YuanshuoDu/applymate-jobcopilot/issues/355) | [#359](https://github.com/YuanshuoDu/applymate-jobcopilot/pull/359) | done |
 | AH2-011 | query API | #347 | [#356](https://github.com/YuanshuoDu/applymate-jobcopilot/issues/356) | [#360](https://github.com/YuanshuoDu/applymate-jobcopilot/pull/360) | done |
 | AH2-012 | durable/transient stream | #346,#356 | [#357](https://github.com/YuanshuoDu/applymate-jobcopilot/issues/357) | [#361](https://github.com/YuanshuoDu/applymate-jobcopilot/pull/361) | done |
-| AH2-013 | agent-model contract | 004 | TBD | TBD | pending |
-| AH2-014 | OpenAI-compatible adapter | 013 | TBD | TBD | pending |
-| AH2-015 | Anthropic adapter | 013 | TBD | TBD | pending |
-| AH2-016 | fallback/recovery/reroute | 014,015 | TBD | TBD | pending |
-| AH2-017 | ToolRegistry/read tools | 007,013 | TBD | TBD | pending |
+| AH2-013 | agent-model contract | #344 | [#362](https://github.com/YuanshuoDu/applymate-jobcopilot/issues/362) | TBD | in-progress |
+| AH2-014 | OpenAI-compatible adapter | #362 | [#363](https://github.com/YuanshuoDu/applymate-jobcopilot/issues/363) | TBD | spec-ready |
+| AH2-015 | Anthropic adapter | #362 | [#364](https://github.com/YuanshuoDu/applymate-jobcopilot/issues/364) | TBD | spec-ready |
+| AH2-016 | fallback/recovery/reroute | #363,#364 | [#365](https://github.com/YuanshuoDu/applymate-jobcopilot/issues/365) | TBD | spec-ready |
+| AH2-017 | ToolRegistry/read tools | #347,#362 | [#366](https://github.com/YuanshuoDu/applymate-jobcopilot/issues/366) | TBD | spec-ready |
 | AH2-018 | PolicyEngine | 017 | TBD | TBD | pending |
 | AH2-019 | approval receipt | 005,018 | TBD | TBD | pending |
 | AH2-020 | approval/question broker | 010,019 | TBD | TBD | pending |
