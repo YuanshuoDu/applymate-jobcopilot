@@ -1,6 +1,6 @@
 # ApplyMate Agent Harness 2.0 详细开发路线图
 
-> **状态：** Phase 0 complete — Phase 1 (AH2-004..008) as #344..#348; AH2-004/005/006/007 done (#349/#350/#351/#352), AH2-008 in progress
+> **状态：** Phase 0 complete — Phase 1 complete (AH2-004..008 merged: #349/#350/#351/#352/#353). Phase 2 (AH2-009..012) created as #354..#357, AH2-009 in progress. *Phase 1 Gate follow-up: 48h dual-write shadow report pending staging credentials.*
 > **日期：** 2026-08-30
 > **上游设计：** [Agent Harness 2.0 Technical Design](./agent-harness-v2-technical-design.md)
 > **适用代码：** `packages/agent-protocol`、`packages/agent-model`、`apps/web`、`apps/worker`
@@ -1157,7 +1157,7 @@ draft
 | AH2-005 | Turn/Step/Input schema | #344 | [#345](https://github.com/YuanshuoDu/applymate-jobcopilot/issues/345) | [#350](https://github.com/YuanshuoDu/applymate-jobcopilot/pull/350) | done |
 | AH2-006 | Item/Event/Outbox/sequence | #344,#345 | [#346](https://github.com/YuanshuoDu/applymate-jobcopilot/issues/346) | [#351](https://github.com/YuanshuoDu/applymate-jobcopilot/pull/351) | done |
 | AH2-007 | Web/Worker stores | #345,#346 | [#347](https://github.com/YuanshuoDu/applymate-jobcopilot/issues/347) | [#352](https://github.com/YuanshuoDu/applymate-jobcopilot/pull/352) | done |
-| AH2-008 | legacy dual-write/projector | #347 | [#348](https://github.com/YuanshuoDu/applymate-jobcopilot/issues/348) | TBD | spec-ready |
+| AH2-008 | legacy dual-write/projector | #347 | [#348](https://github.com/YuanshuoDu/applymate-jobcopilot/issues/348) | [#353](https://github.com/YuanshuoDu/applymate-jobcopilot/pull/353) | done |
 | AH2-009 | command service | 007 | TBD | TBD | pending |
 | AH2-010 | message/interrupt API | 009 | TBD | TBD | pending |
 | AH2-011 | query API | 007 | TBD | TBD | pending |
