@@ -1,6 +1,6 @@
 import type { Page } from "playwright-core";
 import type { FormPatternRow } from "../db/form-patterns.js";
-import { clickSubmit, humanType } from "../flows/helpers.js";
+import { clickSubmit, humanType, type SubmissionGuard } from "../flows/helpers.js";
 import type { HarnessResult } from "../harness/agent-harness.js";
 
 const SUBMIT_SELECTORS = [
@@ -22,7 +22,7 @@ export async function replayPattern(
   page: Page,
   pattern: FormPatternRow,
   persona: Record<string, string>,
-  beforeSubmit?: () => Promise<boolean>,
+  beforeSubmit?: SubmissionGuard,
 ): Promise<HarnessResult> {
   const startedAt = Date.now();
   const log: ReplayLogEntry[] = [];
@@ -62,17 +62,17 @@ export async function replayPattern(
   }
 
   const submission = await clickSubmit(page, SUBMIT_SELECTORS, beforeSubmit);
-  if (submission === 'blocked') {
+  if (submission.outcome === "blocked") {
+    log.push({ field: submission.reason, selector: "submit", action: "submission_blocked" });
     return {
-      status: "manual",
+      status: "submission_blocked",
       turns: 1,
-      error: "Form filled and ready for user review.",
+      error: submission.message,
       durationMs: Date.now() - startedAt,
       log,
-      reviewReady: true,
     };
   }
-  if (submission === 'missing') {
+  if (submission.outcome === "missing") {
     return {
       status: "manual",
       turns: 1,

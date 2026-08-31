@@ -84,6 +84,7 @@ describe("runLeverFlow", () => {
       jobTitle: "Senior Engineer",
       jobCompany: "Spotify",
       resumePath: "/resume.pdf",
+      beforeSubmit: vi.fn().mockResolvedValue(true),
     });
 
     expect(result.status).toBe("submitted");
@@ -125,6 +126,6 @@ describe("runLeverFlow", () => {
     });
 
     expect(beforeSubmit).toHaveBeenCalledOnce();
-    expect(result).toMatchObject({ status: "manual", reviewReady: true });
+    expect(result).toMatchObject({ status: "submission_blocked" });
   });
 });

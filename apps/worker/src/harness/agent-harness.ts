@@ -9,6 +9,11 @@ import {
   type AgentAction,
   type TurnLog,
 } from "./harness-prompt.js";
+import {
+  assertSubmissionAuthorized,
+  type SubmissionAuthorization,
+  type SubmissionGuard,
+} from "../flows/helpers.js";
 
 const SENSITIVE_FIELD = /salary|compensation|pay|visa|sponsor|work.?authori[sz]|citizen|nationality|legal|criminal|disability|gender|race|ethnic|signature|e-?sign/i;
 
@@ -42,7 +47,7 @@ export interface ApplyTask {
   dryRun?: boolean;
   allowSubmit?: boolean;
   /** Re-evaluates runtime controls before a submit or generic click can advance a form. */
-  beforeSubmit?: () => Promise<boolean>;
+  beforeSubmit?: SubmissionGuard;
   /** Per-application values explicitly entered by the candidate after a pause. */
   confirmedAnswers?: Record<string, string>;
 }
@@ -134,8 +139,12 @@ export class AgentHarness {
           };
           this.turns.push(logEntry);
           this.logTurn(logEntry);
-          if (task.allowSubmit === false || !await submissionAuthorized(task)) {
+          if (task.allowSubmit === false) {
             return this.buildUncertainSubmissionResult(task.jobId, Date.now() - startedAt, fieldMappings);
+          }
+          const authorization = await submissionAuthorized(task);
+          if (!authorization.authorized) {
+            return this.buildSubmissionBlockedResult(task.jobId, Date.now() - startedAt, authorization, fieldMappings);
           }
           return this.buildResult("submitted", task.jobId, Date.now() - startedAt, undefined, fieldMappings);
         }
@@ -185,8 +194,9 @@ export class AgentHarness {
           if (task.allowSubmit === false) {
             return this.buildReviewResult(task.jobId, Date.now() - startedAt);
           }
-          if (!await submissionAuthorized(task)) {
-            return this.buildReviewResult(task.jobId, Date.now() - startedAt);
+          const authorization = await submissionAuthorized(task);
+          if (!authorization.authorized) {
+            return this.buildSubmissionBlockedResult(task.jobId, Date.now() - startedAt, authorization);
           }
           return this.buildResult("submitted", task.jobId, Date.now() - startedAt, undefined, this.collectFieldMappings());
         }
@@ -203,8 +213,12 @@ export class AgentHarness {
           return this.buildResult("manual", task.jobId, Date.now() - startedAt, action.reasoning);
         }
         if (action.type === "submit") {
-          if (task.allowSubmit === false || !await submissionAuthorized(task)) {
+          if (task.allowSubmit === false) {
             return this.buildReviewResult(task.jobId, Date.now() - startedAt);
+          }
+          const authorization = await submissionAuthorized(task);
+          if (!authorization.authorized) {
+            return this.buildSubmissionBlockedResult(task.jobId, Date.now() - startedAt, authorization);
           }
         }
         if (action.type === "click" && action.selector) {
@@ -219,8 +233,11 @@ export class AgentHarness {
             // A live Worker authorization gates every generic click because a
             // custom form control can submit through a JavaScript handler.
             const needsAuthorization = task.beforeSubmit ? true : await clickMaySubmit(page, action.selector);
-            if (needsAuthorization && !await submissionAuthorized(task)) {
-              return this.buildReviewResult(task.jobId, Date.now() - startedAt);
+            if (needsAuthorization) {
+              const authorization = await submissionAuthorized(task);
+              if (!authorization.authorized) {
+                return this.buildSubmissionBlockedResult(task.jobId, Date.now() - startedAt, authorization);
+              }
             }
           }
         }
@@ -349,6 +366,23 @@ export class AgentHarness {
     );
   }
 
+  private buildSubmissionBlockedResult(
+    jobId: string,
+    durationMs: number,
+    authorization: Exclude<SubmissionAuthorization, { authorized: true }>,
+    fieldMappings = this.collectFieldMappings(),
+  ): HarnessResult {
+    const logEntry = {
+      action: "submission_blocked",
+      reason: authorization.reason,
+    };
+    console.warn("[submission-guard] blocked", authorization.reason);
+    return {
+      ...this.buildResult("submission_blocked", jobId, durationMs, authorization.message, fieldMappings),
+      log: [logEntry],
+    };
+  }
+
   private collectFieldMappings(): Record<string, string> {
     const fieldMappings: Record<string, string> = {};
     for (const turn of this.turns) {
@@ -378,12 +412,8 @@ export class AgentHarness {
   }
 }
 
-async function submissionAuthorized(task: ApplyTask): Promise<boolean> {
-  try {
-    return task.beforeSubmit ? await task.beforeSubmit() : true;
-  } catch {
-    return false;
-  }
+async function submissionAuthorized(task: ApplyTask): Promise<SubmissionAuthorization> {
+  return assertSubmissionAuthorized(task.beforeSubmit);
 }
 
 async function clickMaySubmit(page: Page, selector: string): Promise<boolean> {

@@ -1,5 +1,4 @@
 import type { Page } from "playwright-core";
-import type { ApplyTask } from "../harness/agent-harness.js";
 
 export type FlowLogEntry = { field?: string; selector?: string; action: string };
 
@@ -142,33 +141,86 @@ export async function fillCustomQuestions(
   }
 }
 
-export type SubmitAttempt = 'submitted' | 'missing' | 'blocked';
+export type SubmissionBlockedReason =
+  | "missing_guard"
+  | "guard_false"
+  | "guard_error"
+  | "guard_timeout"
+  | "guard_non_boolean";
+export type SubmissionAuthorization =
+  | { authorized: true }
+  | { authorized: false; reason: SubmissionBlockedReason; message: string };
+
+export type SubmissionGuard = () => Promise<unknown> | unknown;
+
+export type SubmitAttempt =
+  | { outcome: "submitted" }
+  | { outcome: "missing" }
+  | { outcome: "blocked"; reason: SubmissionBlockedReason; message: string };
+
+const SUBMISSION_AUTH_TIMEOUT_MS = 5_000;
+const SUBMISSION_AUTH_TIMEOUT = Symbol("submission-authorization-timeout");
+
+function blocked(reason: SubmissionBlockedReason): SubmissionAuthorization {
+  const messages: Record<SubmissionBlockedReason, string> = {
+    missing_guard: "Submission blocked: no runtime authorization guard was provided.",
+    guard_false: "Submission blocked: runtime authorization guard denied the submit.",
+    guard_error: "Submission blocked: runtime authorization guard failed.",
+    guard_timeout: "Submission blocked: runtime authorization guard timed out.",
+    guard_non_boolean: "Submission blocked: runtime authorization guard returned a non-boolean value.",
+  };
+  return { authorized: false, reason, message: messages[reason] };
+}
+
+export async function assertSubmissionAuthorized(
+  beforeSubmit?: SubmissionGuard,
+): Promise<SubmissionAuthorization> {
+  if (!beforeSubmit) return blocked("missing_guard");
+
+  let timeoutHandle: ReturnType<typeof setTimeout> | undefined;
+  try {
+    const timeout = new Promise<typeof SUBMISSION_AUTH_TIMEOUT>((resolve) => {
+      timeoutHandle = setTimeout(() => resolve(SUBMISSION_AUTH_TIMEOUT), SUBMISSION_AUTH_TIMEOUT_MS);
+    });
+    const result = await Promise.race([
+      Promise.resolve().then(() => beforeSubmit()),
+      timeout,
+    ]);
+    if (result === SUBMISSION_AUTH_TIMEOUT) return blocked("guard_timeout");
+    if (typeof result !== "boolean") return blocked("guard_non_boolean");
+    return result ? { authorized: true } : blocked("guard_false");
+  } catch {
+    return blocked("guard_error");
+  } finally {
+    if (timeoutHandle) clearTimeout(timeoutHandle);
+  }
+}
 
 export async function clickSubmit(
   page: Page,
   selectors: string[],
-  beforeSubmit?: () => Promise<boolean>,
+  beforeSubmit?: SubmissionGuard,
 ): Promise<SubmitAttempt> {
   for (const selector of selectors) {
     try {
       const button = page.locator(selector).first();
       if (!(await button.count())) continue;
       if (!(await button.isVisible().catch(() => false))) continue;
-      if (beforeSubmit && !await beforeSubmit()) return 'blocked';
+      const authorization = await assertSubmissionAuthorized(beforeSubmit);
+      if (!authorization.authorized) {
+        console.warn("[submission-guard] blocked", authorization.reason);
+        return {
+          outcome: "blocked",
+          reason: authorization.reason,
+          message: authorization.message,
+        };
+      }
       await button.click();
       await page.waitForLoadState("networkidle", { timeout: 20_000 }).catch(() => {});
-      return 'submitted';
+      return { outcome: "submitted" };
     } catch {
       continue;
     }
   }
-  return 'missing';
-}
-
-export async function isSubmissionAuthorized(task: Pick<ApplyTask, 'beforeSubmit'>): Promise<boolean> {
-  try {
-    return task.beforeSubmit ? await task.beforeSubmit() : true;
-  } catch {
-    return false;
-  }
+  return { outcome: "missing" };
 }

@@ -56,4 +56,21 @@ describe("createNotification", () => {
     expect(mocks.query).toHaveBeenCalledTimes(1);
     expect(mocks.query.mock.calls[0][0]).not.toContain("INSERT INTO notifications");
   });
+
+  it("inserts a distinct blocked notification row", async () => {
+    const { createNotification } = await import("./create-notification.js");
+
+    mocks.query.mockResolvedValueOnce({ rows: [{ preferences: {} }] });
+    await createNotification("user-1", {
+      type: "apply_blocked",
+      title: "Example submission blocked",
+      body: "Engineer",
+      jobId: "job-1",
+    });
+
+    expect(mocks.query).toHaveBeenLastCalledWith(
+      expect.stringContaining("INSERT INTO notifications"),
+      ["user-1", "apply_blocked", "Example submission blocked", "Engineer", "job-1"],
+    );
+  });
 });

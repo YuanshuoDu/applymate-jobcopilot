@@ -11,7 +11,7 @@ export interface NotifyApplyResultParams {
   userId: string
   jobTitle: string
   jobCompany: string
-  status: 'submitted' | 'manual' | 'failed'
+  status: 'submitted' | 'manual' | 'failed' | 'submission_blocked'
   error?: string | null
   flowUsed?: string | null
   jobUrl?: string | null
@@ -50,6 +50,7 @@ export async function notifyApplyResult(p: NotifyApplyResultParams): Promise<voi
   const subject =
     p.status === 'submitted' ? `✅ Applied to ${p.jobCompany} — ${p.jobTitle}` :
     p.status === 'manual'    ? `⚠️ Action needed: ${p.jobCompany} — ${p.jobTitle}` :
+    p.status === 'submission_blocked' ? `⚠️ Submission blocked: ${p.jobCompany} — ${p.jobTitle}` :
                                `❌ Apply failed: ${p.jobCompany} — ${p.jobTitle}`
 
   const flowLabel = p.flowUsed === 'programmatic' ? 'Pre-programmed flow'
@@ -64,6 +65,10 @@ export async function notifyApplyResult(p: NotifyApplyResultParams): Promise<voi
     p.status === 'manual'
       ? `<p>The agent could not complete the application automatically and needs your attention.</p>
          ${p.jobUrl ? `<p><a href="${p.jobUrl}" style="color:#185FA5">Complete application manually →</a></p>` : ''}`
+      : '',
+    p.status === 'submission_blocked'
+      ? `<p>ApplyMate filled the form but refused to submit because runtime authorization was missing, expired, or denied.</p>
+         ${p.jobUrl ? `<p><a href="${p.jobUrl}" style="color:#185FA5">Review application manually →</a></p>` : ''}`
       : '',
     p.status === 'failed' && p.error
       ? `<p style="color:#ef4444">Error: ${p.error.slice(0, 300)}</p>`

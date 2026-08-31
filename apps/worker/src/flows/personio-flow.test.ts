@@ -67,7 +67,7 @@ describe("runPersonioFlow", () => {
 
   it("fills personal fields from persona", async () => {
     const page = mockPersonioPage();
-    const result = await runPersonioFlow(page, baseTask());
+    const result = await runPersonioFlow(page, { ...baseTask(), beforeSubmit: vi.fn().mockResolvedValue(true) });
 
     expect(result.status).toBe("submitted");
     expect(result.log).toEqual(
@@ -99,7 +99,7 @@ describe("runPersonioFlow", () => {
     const result = await runPersonioFlow(mockPersonioPage(), { ...baseTask(), beforeSubmit });
 
     expect(beforeSubmit).toHaveBeenCalledOnce();
-    expect(result).toMatchObject({ status: "manual", reviewReady: true });
+    expect(result).toMatchObject({ status: "submission_blocked" });
   });
 });
 

@@ -69,7 +69,7 @@ describe("runSmartRecruitersFlow", () => {
 
   it("fills personal fields from persona", async () => {
     const page = mockSmartRecruitersPage();
-    const result = await runSmartRecruitersFlow(page, baseTask());
+    const result = await runSmartRecruitersFlow(page, { ...baseTask(), beforeSubmit: vi.fn().mockResolvedValue(true) });
 
     expect(result.status).toBe("submitted");
     expect(result.log).toEqual(
@@ -101,7 +101,7 @@ describe("runSmartRecruitersFlow", () => {
     const result = await runSmartRecruitersFlow(mockSmartRecruitersPage(), { ...baseTask(), beforeSubmit });
 
     expect(beforeSubmit).toHaveBeenCalledOnce();
-    expect(result).toMatchObject({ status: "manual", reviewReady: true });
+    expect(result).toMatchObject({ status: "submission_blocked" });
   });
 });
 

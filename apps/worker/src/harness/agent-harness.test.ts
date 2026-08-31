@@ -68,6 +68,7 @@ describe("AgentHarness", () => {
       jobTitle: "Software Engineer",
       jobCompany: "Acme Corp",
       resumePath: "/resume.pdf",
+      beforeSubmit: vi.fn().mockResolvedValue(true),
     });
 
     expect(result.status).toBe("submitted");
@@ -192,6 +193,7 @@ describe("AgentHarness", () => {
     await new AgentHarness({ userId: "user-1", maxTurns: 2, dryRun: false, mode: "dom" }).run(page, {
       jobId: "job-9", applyUrl: "https://jobs.example.com/apply", persona: {},
       jobTitle: "Dev", jobCompany: "Inc", resumePath: "/safe/resume.pdf",
+      beforeSubmit: vi.fn().mockResolvedValue(true),
     });
 
     expect(page.setInputFiles).toHaveBeenCalledWith("#resume", "/safe/resume.pdf");
@@ -209,7 +211,7 @@ describe("AgentHarness", () => {
     });
 
     expect(beforeSubmit).toHaveBeenCalledOnce();
-    expect(result).toMatchObject({ status: "manual", reviewReady: true });
+    expect(result).toMatchObject({ status: "submission_blocked" });
   });
 
   it("does not execute a submit-like click after submission authorization is revoked", async () => {
@@ -227,7 +229,7 @@ describe("AgentHarness", () => {
 
     expect(beforeSubmit).toHaveBeenCalledOnce();
     expect(page.click).not.toHaveBeenCalled();
-    expect(result).toMatchObject({ status: "manual", reviewReady: true });
+    expect(result).toMatchObject({ status: "submission_blocked" });
   });
 
   it("does not execute an explicit submit after submission authorization is revoked", async () => {
@@ -245,7 +247,7 @@ describe("AgentHarness", () => {
 
     expect(beforeSubmit).toHaveBeenCalledOnce();
     expect(page.click).not.toHaveBeenCalled();
-    expect(result).toMatchObject({ status: "manual", reviewReady: true });
+    expect(result).toMatchObject({ status: "submission_blocked" });
   });
 
   it("does not execute an unclassified click after submission authorization is revoked", async () => {
@@ -263,7 +265,7 @@ describe("AgentHarness", () => {
 
     expect(beforeSubmit).toHaveBeenCalledOnce();
     expect(page.click).not.toHaveBeenCalled();
-    expect(result).toMatchObject({ status: "manual", reviewReady: true });
+    expect(result).toMatchObject({ status: "submission_blocked" });
   });
 
   it("does not report a success URL as submitted after authorization is revoked", async () => {
@@ -278,8 +280,8 @@ describe("AgentHarness", () => {
     );
 
     expect(beforeSubmit).toHaveBeenCalledOnce();
-    expect(result).toMatchObject({ status: "manual" });
-    expect(result.error).toContain("could not be confirmed");
+    expect(result).toMatchObject({ status: "submission_blocked" });
+    expect(result.error).toContain("denied");
   });
 
   it("does not execute submit-like clicks during a fill-only pass", async () => {
