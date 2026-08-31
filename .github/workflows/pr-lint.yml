@@ -26,8 +26,8 @@ jobs:
               errors.push('PR body must contain `Closes #<issue-number>` linking the GitHub issue.');
             }
 
-            // 2. Branch naming: AH2 issues use codex/ah2-<n>-<slug>; everything else uses conventional prefixes
-            const isAh2 = /^codex\/ah2-\d+-[a-z0-9-]+$/i.test(branch);
+            // 2. Branch naming: AH2 issues use codex/ah2-<n>-<slug> (optional letter suffix for sub-issues, e.g. ah2-014m-minimax-profile); everything else uses conventional prefixes
+            const isAh2 = /^codex\/ah2-\d+[a-z]?-[a-z0-9-]+$/i.test(branch);
             const isConventional = /^(feat|fix|refactor|chore|docs|test|release)\/[a-z0-9-]+$/i.test(branch);
             if (!isAh2 && !isConventional) {
               errors.push(`Branch \`${branch}\` must be \`codex/ah2-<n>-<slug>\` (AH2 issues) or \`feat|fix|refactor|chore|docs|test|release/<slug>\`.`);
