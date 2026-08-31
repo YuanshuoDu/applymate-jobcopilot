@@ -58,6 +58,7 @@ export const EXPECTED_MIGRATIONS = [
   '20260829090000_reuse_automation_sessions',
   '20260831030000_add_agent_turn_step_input',
   '20260831040000_add_agent_item_event_outbox',
+  '20260831140000_add_scoped_agent_approvals',
 ] as const
 
 export const RLS_TABLES = [
@@ -70,7 +71,7 @@ export const RLS_TABLES = [
   'gmail_messages', 'gmail_recommendations', 'AgentRunQuestion', 'agent_runs',
   'agent_executions', 'agent_sessions', 'agent_turns', 'agent_steps', 'agent_inputs',
   'agent_items', 'agent_events', 'agent_outbox', 'sub_agent_tasks', 'agent_transcript_events',
-  'agent_approvals', 'agent_automations', 'CustomAgentRole', 'Direction', 'CoverLetter',
+  'agent_approvals', 'agent_action_reservations', 'agent_automations', 'CustomAgentRole', 'Direction', 'CoverLetter',
   'support_cases', 'support_case_messages', 'support_case_escalations',
   'admin_data_deletion_requests',
 ] as const

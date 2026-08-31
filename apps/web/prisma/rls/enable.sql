@@ -55,6 +55,7 @@ ALTER TABLE "agent_outbox" ENABLE ROW LEVEL SECURITY;
 ALTER TABLE "sub_agent_tasks" ENABLE ROW LEVEL SECURITY;
 ALTER TABLE "agent_transcript_events" ENABLE ROW LEVEL SECURITY;
 ALTER TABLE "agent_approvals" ENABLE ROW LEVEL SECURITY;
+ALTER TABLE "agent_action_reservations" ENABLE ROW LEVEL SECURITY;
 ALTER TABLE "agent_automations" ENABLE ROW LEVEL SECURITY;
 ALTER TABLE "CustomAgentRole" ENABLE ROW LEVEL SECURITY;
 ALTER TABLE "Direction" ENABLE ROW LEVEL SECURITY;
@@ -172,6 +173,8 @@ CREATE POLICY candidate_agent_transcript_isolation ON "agent_transcript_events"
   WITH CHECK (EXISTS (SELECT 1 FROM "agent_sessions" session WHERE session."id" = "sessionId" AND session."userId" = app_current_user_id()));
 DROP POLICY IF EXISTS candidate_agent_approval_isolation ON "agent_approvals";
 CREATE POLICY candidate_agent_approval_isolation ON "agent_approvals" USING ("userId" = app_current_user_id()) WITH CHECK ("userId" = app_current_user_id());
+DROP POLICY IF EXISTS candidate_agent_action_reservation_isolation ON "agent_action_reservations";
+CREATE POLICY candidate_agent_action_reservation_isolation ON "agent_action_reservations" USING ("userId" = app_current_user_id()) WITH CHECK ("userId" = app_current_user_id());
 DROP POLICY IF EXISTS candidate_agent_automation_isolation ON "agent_automations";
 CREATE POLICY candidate_agent_automation_isolation ON "agent_automations" USING ("userId" = app_current_user_id()) WITH CHECK ("userId" = app_current_user_id());
 DROP POLICY IF EXISTS candidate_custom_agent_role_isolation ON "CustomAgentRole";

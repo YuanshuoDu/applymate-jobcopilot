@@ -39,4 +39,18 @@ describe('Prisma migration dependencies', () => {
     expect(migration).toContain('agent_runs_userId_createdAt_idx')
     expect(migration).toContain('agent_runs_userId_fkey')
   })
+
+  it('adds scoped approval fields and an atomic action reservation table', () => {
+    const migrationPath = join(migrationsRoot, '20260831140000_add_scoped_agent_approvals', 'migration.sql')
+    const migration = readFileSync(migrationPath, 'utf8')
+
+    expect(migration).toContain('ADD COLUMN "scopeHash" TEXT')
+    expect(migration).toContain('ADD COLUMN "nonceHash" TEXT')
+    expect(migration).toContain('CREATE TABLE "agent_action_reservations"')
+    expect(migration).toContain('agent_approvals_userId_nonceHash_key')
+    expect(migration).toContain('agent_action_reservations_approvalId_key')
+    expect(migration).toContain('agent_approvals_turnId_fkey')
+    expect(migration).toContain('agent_approvals_scope_columns_check')
+    expect(migration).toContain("agent_approvals_hash_format_check")
+  })
 })
