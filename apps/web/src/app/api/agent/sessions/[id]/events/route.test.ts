@@ -107,6 +107,26 @@ describe("agent session events API", () => {
     expect(mocks.findEvents).not.toHaveBeenCalled()
   })
 
+  it("does not expose dual-write projector metadata to legacy clients", async () => {
+    mocks.findSession.mockResolvedValueOnce({ id: "session_1" })
+    mocks.findEvents.mockResolvedValueOnce([{
+      id: "event_2",
+      taskId: null,
+      type: "job_results",
+      speaker: "Analyst",
+      title: "Jobs",
+      body: "N26",
+      data: { jobs: [{ id: "job_1" }], __agentHarnessV2: { eventId: "v2_event_2", opaque: false, wrapped: false } },
+      durationMs: null,
+      createdAt: new Date("2026-06-18T08:02:00Z"),
+    }])
+    const { GET } = await import("./route")
+
+    const res = await GET(getRequest() as never, params)
+
+    await expect(res.json()).resolves.toMatchObject({ events: [{ data: { jobs: [{ id: "job_1" }] } }] })
+  })
+
   it("returns auth errors without querying", async () => {
     mocks.requireAuth.mockResolvedValueOnce(Response.json({ error: "Unauthorized" }, { status: 401 }))
     const { GET } = await import("./route")

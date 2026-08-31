@@ -1,4 +1,6 @@
 import type { RunReport } from "@/lib/agent/types"
+import type { PrismaClient } from "@prisma/client"
+import { createDualWriteSession, type DualWriteSession } from "./dual-write"
 import {
   appendTranscriptEvent,
   completeSubAgentTask,
@@ -8,12 +10,16 @@ import {
   type AgentSessionDb,
 } from "./repository"
 import type { AgentSessionStatus, SubAgentRole, TranscriptEventType } from "./types"
+import type { V2TurnSource } from "./v2-turn"
 
 interface RunSessionRecorderInput {
   userId: string
   goal: string
   /** Bind a pipeline to an existing, already-authorized conversation. */
   sessionId?: string
+  /** Enable the shadow V2 projection without changing legacy behavior when off. */
+  dualWrite?: boolean
+  source?: V2TurnSource
 }
 
 interface FinalizeInput {
@@ -223,6 +229,14 @@ export async function createRunSessionRecorder(db: AgentSessionDb, input: RunSes
       completedAt: null,
     })
   }
+  const dualWrite: DualWriteSession | null = input.dualWrite
+    ? await createDualWriteSession(db as unknown as PrismaClient, {
+      sessionId: session.id,
+      userId: input.userId,
+      goal: input.goal,
+      source: input.source ?? "system",
+    })
+    : null
   const taskIdsByRole = new Map<PipelineSubAgentRole, string>()
 
   return {
@@ -264,8 +278,19 @@ export async function createRunSessionRecorder(db: AgentSessionDb, input: RunSes
       }
 
       const mapped = mapPipelineEventToTranscript(event, payload)
-      if (!mapped) return null
-      return appendTranscriptEvent(db, {
+      if (!mapped) {
+        if (!dualWrite) return null
+        return dualWrite.record({
+          sessionId: session.id,
+          taskId,
+          type: "error",
+          speaker: "System",
+          title: "Opaque agent event",
+          body: `Preserved an unrecognized pipeline event: ${event}`,
+          data: { opaque: true, event, payload },
+        }, { name: event, payload })
+      }
+      const transcript = {
         sessionId: session.id,
         taskId,
         type: mapped.type,
@@ -273,16 +298,27 @@ export async function createRunSessionRecorder(db: AgentSessionDb, input: RunSes
         title: mapped.title,
         body: mapped.body,
         data: { event, payload },
-      })
+      }
+      return dualWrite
+        ? dualWrite.record(transcript, { name: event, payload })
+        : appendTranscriptEvent(db, transcript)
     },
     async finalize(input: FinalizeInput) {
-      return updateAgentSession(db, {
+      const result = await updateAgentSession(db, {
         sessionId: session.id,
         status: input.status,
         completedAt: new Date(),
         qualityScore: qualityScore(input.report, input.status),
         memorySummary: summarizeReport(input.report),
       })
+      if (dualWrite) {
+        await dualWrite.finalize({
+          status: input.status,
+          finalResponse: summarizeReport(input.report),
+          error: input.status === "failed" ? summarizeReport(input.report) : null,
+        })
+      }
+      return result
     },
     async pause(message: string, role?: PipelineSubAgentRole) {
       const taskId = role ? taskIdsByRole.get(role) : undefined
@@ -293,13 +329,15 @@ export async function createRunSessionRecorder(db: AgentSessionDb, input: RunSes
           failureReason: message,
         })
       }
-      return updateAgentSession(db, {
+      const result = await updateAgentSession(db, {
         sessionId: session.id,
         status: "waiting_for_user",
         ...(taskId ? { currentTaskId: taskId } : {}),
         completedAt: null,
         memorySummary: message,
       })
+      if (dualWrite) await dualWrite.finalize({ status: "waiting_for_user", finalResponse: message })
+      return result
     },
   }
 

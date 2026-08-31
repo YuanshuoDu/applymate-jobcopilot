@@ -3,6 +3,7 @@ import { db } from "@/lib/db";
 import { runPipeline } from "@/lib/agent/pipeline";
 import { AgentPauseError } from "@/lib/agent/orchestrator";
 import { createRunSessionRecorder } from "@/lib/agent/session/run-recorder";
+import { isRuntimeAgentHarnessFeatureEnabled } from "@/lib/runtime-feature-flags";
 import { resumeToText, type RunReport } from "@/lib/agent/types";
 import { loadRoleConfigs, toRoleConfigMap } from "@/lib/agent/role-config";
 import { pipelineAgentConfigFrom } from "@/app/api/agent/run/run-helpers";
@@ -10,6 +11,7 @@ import { automationRunOverrides, withAutomationOverrides } from "@/lib/agent/aut
 import { AgentExecutionCancelledError, claimAgentExecution, ensureAgentExecution, finishAgentExecution, saveExecutionCheckpoint, type PipelineCheckpointState } from "@/lib/agent/execution-control";
 import type { AiConfig } from "@/lib/model-router";
 import type { ResumeContent } from "@/lib/types";
+import type { V2TurnSource } from "@/lib/agent/session/v2-turn";
 
 type HistoryEvent = { event: string; at: string; data: unknown };
 
@@ -20,6 +22,7 @@ export interface AgentPipelineRunInput {
   /** Optional durable control-plane row supplied by the background worker. */
   executionId?: string;
   autonomous: boolean;
+  source?: V2TurnSource;
   emit?: (event: string, data: unknown) => void;
 }
 
@@ -91,10 +94,16 @@ async function saveHistory(
 export async function runAgentPipeline(input: AgentPipelineRunInput): Promise<RunReport | null> {
   const startedAt = Date.now();
   const events: HistoryEvent[] = [];
+  const dualWrite = await isRuntimeAgentHarnessFeatureEnabled(
+    "AGENT_PROTOCOL_V2_DUAL_WRITE",
+    input.userId,
+  ).catch(() => false);
   const recorder = await createRunSessionRecorder(db, {
     userId: input.userId,
     goal: input.sessionId ? "Agent Pipeline Run" : "Manual Agent Pipeline Run",
     sessionId: input.sessionId,
+    dualWrite,
+    source: input.source ?? "system",
   });
   const execution = input.executionId
     ? await db.agentExecution.findFirst({ where: { id: input.executionId, userId: input.userId, sessionId: recorder.sessionId } })

@@ -6,6 +6,9 @@ import { enqueueAgentRun } from "@/lib/agent-run-queue-client"
 import { ensureAgentExecution } from "@/lib/agent/execution-control"
 import { isActiveAutomationExecution, resolveAutomationSession } from "@/lib/agent/automation-session"
 import { hasEffectiveEntitlement } from '@/lib/entitlements'
+import { isRuntimeAgentHarnessFeatureEnabled } from '@/lib/runtime-feature-flags'
+import { createDualWriteSession } from '@/lib/agent/session/dual-write'
+import { appendTranscriptEvent, type AppendTranscriptEventInput } from '@/lib/agent/session/repository'
 
 type AutomationForRun = {
   id: string
@@ -81,17 +84,30 @@ async function startAutomation(automation: AutomationForRun, now: Date) {
     })
   }
 
-  await db.agentTranscriptEvent.create({
-    data: {
+  const dualWriteEnabled = await isRuntimeAgentHarnessFeatureEnabled(
+    'AGENT_PROTOCOL_V2_DUAL_WRITE',
+    automation.userId,
+  ).catch(() => false)
+  const dualWrite = dualWriteEnabled
+    ? await createDualWriteSession(db, {
       sessionId: session.id,
-      taskId: null,
-      type: "automation_started",
-      speaker: "Orchestrator",
-      title: "Automation started",
-      body: `Started scheduled automation: ${automation.name}`,
-      data: { automationId: automation.id, automation: automationPayload(automation) },
-      durationMs: null,
-    },
+      userId: automation.userId,
+      goal: `Run scheduled automation: ${automation.name}`,
+      source: 'automation',
+    })
+    : null
+  const recordTranscript = (input: AppendTranscriptEventInput) =>
+    dualWrite ? dualWrite.record(input) : appendTranscriptEvent(db, input)
+
+  await recordTranscript({
+    sessionId: session.id,
+    taskId: null,
+    type: "automation_started",
+    speaker: "Orchestrator",
+    title: "Automation started",
+    body: `Started scheduled automation: ${automation.name}`,
+    data: { automationId: automation.id, automation: automationPayload(automation) },
+    durationMs: null,
   })
 
   let executionId: string | null = null
@@ -101,17 +117,15 @@ async function startAutomation(automation: AutomationForRun, now: Date) {
     executionId = execution.id
     const taskId = await enqueueAgentRun({ userId: automation.userId, sessionId: session.id })
     await db.agentExecution.update({ where: { id: execution.id }, data: { workerTaskId: taskId } })
-    await db.agentTranscriptEvent.create({
-      data: {
-        sessionId: session.id,
-        taskId: null,
-        type: "subagent_result",
-        speaker: "Scheduler",
-        title: "Automation dispatched",
-        body: "The unattended Agent worker accepted this scheduled run.",
-        data: { automationId: automation.id, taskId },
-        durationMs: null,
-      },
+    await recordTranscript({
+      sessionId: session.id,
+      taskId: null,
+      type: "subagent_result",
+      speaker: "Scheduler",
+      title: "Automation dispatched",
+      body: "The unattended Agent worker accepted this scheduled run.",
+      data: { automationId: automation.id, taskId },
+      durationMs: null,
     })
     return { automationId: automation.id, sessionId: session.id, executionId: execution.id, taskId }
   } catch (error) {
@@ -122,13 +136,12 @@ async function startAutomation(automation: AutomationForRun, now: Date) {
         data: { status: "failed", completedAt: new Date(), memorySummary: `Dispatch failed: ${message}` },
       }),
       ...(executionId ? [db.agentExecution.update({ where: { id: executionId }, data: { status: "failed", completedAt: new Date(), error: message } })] : []),
-      db.agentTranscriptEvent.create({
-        data: {
-          sessionId: session.id, taskId: null, type: "error", speaker: "Scheduler",
-          title: "Automation dispatch failed", body: message, data: { automationId: automation.id }, durationMs: null,
-        },
+      recordTranscript({
+        sessionId: session.id, taskId: null, type: "error", speaker: "Scheduler",
+        title: "Automation dispatch failed", body: message, data: { automationId: automation.id }, durationMs: null,
       }),
       db.agentAutomation.update({ where: { id: automation.id }, data: { nextRunAt: now } }),
+      ...(dualWrite ? [dualWrite.finalize({ status: 'failed', error: message })] : []),
     ])
     throw error
   }

@@ -15,6 +15,8 @@ import type { Prisma }                                from '@prisma/client'
 import { db }                                          from '@/lib/db'
 import { prepareAiRoute, sseResponse, err }             from '@/lib/api-helpers'
 import { appendTranscriptEvent, createAgentSession, updateAgentSession } from '@/lib/agent/session/repository'
+import { createDualWriteSession, type DualWriteSession } from '@/lib/agent/session/dual-write'
+import { isRuntimeAgentHarnessFeatureEnabled } from '@/lib/runtime-feature-flags'
 import { runSubAgentTask } from '@/lib/agent/session/subagent-task-runner'
 import { approvalRequestFrom, automationDraftFrom, resumeTailoringApprovalFrom } from './blocks'
 import { correctedScoutPlan, createChatPlan, requestedMinMatchScore, requestsFullWorkflow, runChatWorker, scoutResultMatchesRequest, synthesizeChatResult, type ChatPlan, type ChatWorkerResult } from './chat-orchestrator'
@@ -65,6 +67,21 @@ export async function POST(req: NextRequest) {
   const userMessage = latestUserMessage(bodyMessages)
   const session = await resolveChatSession(prep.userId, body, userMessage)
   if (session instanceof Response) return session
+  const dualWriteEnabled = await isRuntimeAgentHarnessFeatureEnabled(
+    'AGENT_PROTOCOL_V2_DUAL_WRITE',
+    prep.userId,
+  ).catch(() => false)
+  const dualWrite: DualWriteSession | null = dualWriteEnabled
+    ? await createDualWriteSession(db, {
+      sessionId: session.id,
+      userId: prep.userId,
+      goal: sessionGoalFrom(userMessage),
+      source: 'user',
+    })
+    : null
+  const recordTranscript = (
+    input: Parameters<typeof appendTranscriptEvent>[1],
+  ) => dualWrite ? dualWrite.record(input) : appendTranscriptEvent(db, input)
 
   const [agentCfg, jobs, resume, lastActivity, conversationHistory] = await Promise.all([
     db.agentConfig.findUnique({ where: { userId: prep.userId } }),
@@ -85,7 +102,7 @@ export async function POST(req: NextRequest) {
 
 
   if (userMessage) {
-    await appendTranscriptEvent(db, {
+    await recordTranscript({
       sessionId: session.id,
       type: 'user_message',
       speaker: 'You',
@@ -109,13 +126,13 @@ export async function POST(req: NextRequest) {
         const workflowBody = `Started complete Harness Workflow: Scout → Analyst → Writer → Reviewer → Executor → Auditor.will filter for matches ${thresholdText} position; Any external deliveries will still go through the confirmation gate.`
         send('action', { type: 'start_run', ...(requestedScore === null ? {} : { minMatchScore: requestedScore }) })
         send('block', { type: 'orchestrator_plan', speaker: 'Orchestrator', title: 'Full workflow', body: workflowBody, data: { workflow: true, minMatchScore: requestedScore } })
-        await appendTranscriptEvent(db, {
+        await recordTranscript({
           sessionId: session.id, type: 'orchestrator_plan', speaker: 'Orchestrator',
           title: 'Full workflow', body: workflowBody, data: { workflow: true, minMatchScore: requestedScore },
         })
         fullText = 'Workflow has started.Scout Will search or read the position first, Analyst Keep only matches that meet threshold, Writer Generate materials, Reviewer Submitted after review Executor; We will confirm with you before actual submission.'
         send('text', { delta: fullText })
-        await appendTranscriptEvent(db, {
+        await recordTranscript({
           sessionId: session.id, type: 'orchestrator_plan', speaker: 'Orchestrator', title: 'Response', body: fullText,
         })
         // The browser now starts the pipeline with this exact session ID. Its
@@ -138,7 +155,7 @@ export async function POST(req: NextRequest) {
       })
       const planBody = `host Agent plan: Just call ${plan.role} son Agent.Target: ${plan.goal}`
       send('block', { type: 'orchestrator_plan', speaker: 'Orchestrator', title: 'Plan', body: planBody, data: { plan } })
-      await appendTranscriptEvent(db, {
+      await recordTranscript({
         sessionId: session.id,
         type: 'orchestrator_plan',
         speaker: 'Orchestrator',
@@ -160,7 +177,7 @@ export async function POST(req: NextRequest) {
           confidence: worker.confidence,
           summary: worker.summary,
         }
-      })
+      }, { recordTranscript: input => recordTranscript(input) })
       send('block', { type: 'subagent_task_started', speaker: plan.role, title: 'Task started', body: plan.goal, data: { role: plan.role } })
       let task = await dispatch(plan)
 
@@ -171,7 +188,7 @@ export async function POST(req: NextRequest) {
         plan = correctedScoutPlan(userMessage, plan)
         const correction = `Scout returned roles that do not match the request. Correcting the search target to: ${plan.targetRoles.join(', ')}.`
         send('block', { type: 'quality_gate', speaker: 'Orchestrator', title: 'Result mismatch', body: correction, data: { status: 'failed', retryRecommended: true } })
-        await appendTranscriptEvent(db, { sessionId: session.id, type: 'quality_gate', speaker: 'Orchestrator', title: 'Result mismatch', body: correction, data: { status: 'failed', retryRecommended: true } })
+        await recordTranscript({ sessionId: session.id, type: 'quality_gate', speaker: 'Orchestrator', title: 'Result mismatch', body: correction, data: { status: 'failed', retryRecommended: true } })
         send('block', { type: 'subagent_task_started', speaker: 'scout', title: 'Corrected retry', body: plan.goal, data: { role: 'scout' } })
         task = await dispatch(plan)
         worker = task.status === 'passed' && task.result && typeof task.result === 'object'
@@ -182,7 +199,7 @@ export async function POST(req: NextRequest) {
       const jobRows = Array.isArray(worker.result.jobs) ? worker.result.jobs : []
       if (jobRows.length > 0) {
         send('block', { type: 'job_results', speaker: plan.role, title: 'Structured results', body: 'son Agent Structured results returned', data: { jobs: jobRows } })
-        await appendTranscriptEvent(db, {
+        await recordTranscript({
           sessionId: session.id,
           type: 'job_results',
           speaker: plan.role === 'scout' ? 'Scout' : 'Analyst',
@@ -196,7 +213,7 @@ export async function POST(req: NextRequest) {
     } catch (error) {
       const message = error instanceof Error ? error.message : 'Agent chat failed.'
       send('error', { message })
-      await appendTranscriptEvent(db, {
+      await recordTranscript({
         sessionId: session.id,
         type: 'error',
         speaker: 'System',
@@ -209,6 +226,9 @@ export async function POST(req: NextRequest) {
         status: 'failed',
         memorySummary: responseMemory(message),
       })
+      if (dualWrite) {
+        await dualWrite.finalize({ status: 'failed', error: message }).catch(() => undefined)
+      }
       return
     }
 
@@ -216,7 +236,7 @@ export async function POST(req: NextRequest) {
     if (automationDraft) {
       const body = 'I drafted an automation from your request. Please confirm before I save it.'
       send('block', { type: 'automation_draft', draft: automationDraft })
-      await appendTranscriptEvent(db, {
+      await recordTranscript({
         sessionId: session.id,
         type: 'automation_draft',
         speaker: 'Orchestrator',
@@ -245,7 +265,7 @@ export async function POST(req: NextRequest) {
       })
       const approvalPayload = { id: approval.id, ...approvalDraft, status: 'pending' }
       send('block', { type: 'approval_request', approval: approvalPayload })
-      await appendTranscriptEvent(db, {
+      await recordTranscript({
         sessionId: session.id,
         type: 'approval_request',
         speaker: 'Executor',
@@ -256,7 +276,7 @@ export async function POST(req: NextRequest) {
     }
 
     if (fullText) {
-      await appendTranscriptEvent(db, {
+      await recordTranscript({
         sessionId: session.id,
         type: 'orchestrator_plan',
         speaker: 'Orchestrator',
@@ -270,6 +290,12 @@ export async function POST(req: NextRequest) {
       memorySummary: responseMemory(fullText),
       completedAt: approvalDraft || automationDraft ? null : new Date(),
     })
+    if (dualWrite) {
+      await dualWrite.finalize({
+        status: approvalDraft || automationDraft ? 'waiting_for_user' : 'completed',
+        finalResponse: fullText,
+      })
+    }
     send('done', {})
   })
 }

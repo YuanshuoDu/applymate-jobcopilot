@@ -1,6 +1,7 @@
 import { NextRequest } from "next/server"
 import { db } from "@/lib/db"
 import { err, isErrorResponse, ok, requireAuth } from "@/lib/api-helpers"
+import { legacyTranscriptData } from "@/lib/agent/session/transcript-projector"
 
 interface RouteCtx {
   params: Promise<{ id: string }>
@@ -19,6 +20,7 @@ function serializeEvent(event: {
 }) {
   return {
     ...event,
+    data: legacyTranscriptData(event.data),
     createdAt: event.createdAt.toISOString(),
   }
 }

@@ -117,41 +117,7 @@ export async function appendAgentEventWithOutbox(
   if (existing) return { event: existing, duplicate: true }
 
   try {
-    return await db.$transaction(async (tx) => {
-      const transactionExisting = await findExistingEvent(tx, input)
-      if (transactionExisting) return { event: transactionExisting, duplicate: true }
-
-      const sequence = await allocateSessionSequence(tx, input.sessionId)
-      const eventId = randomUUID()
-      const event = await tx.agentEvent.create({
-        data: {
-          id: eventId,
-          sessionId: input.sessionId,
-          turnId: input.turnId,
-          itemId: input.itemId ?? null,
-          taskId: input.taskId ?? null,
-          sequence,
-          type: input.type,
-          actor: input.actor,
-          correlationId: input.correlationId,
-          causationId: input.causationId ?? null,
-          idempotencyKey: input.idempotencyKey ?? null,
-          payload: input.payload,
-        },
-      })
-
-      await tx.agentOutbox.create({
-        data: {
-          id: randomUUID(),
-          topic: input.outboxTopic,
-          aggregateId: input.sessionId,
-          idempotencyKey: `agent-event:${eventId}`,
-          payload: buildOutboxPayload(input, eventId, sequence),
-        },
-      })
-
-      return { event, duplicate: false }
-    })
+    return await db.$transaction((tx) => appendAgentEventWithOutboxInTransaction(tx, input))
   } catch (error: unknown) {
     if (!isUniqueViolation(error)) throw error
 
@@ -159,6 +125,50 @@ export async function appendAgentEventWithOutbox(
     if (duplicate) return { event: duplicate, duplicate: true }
     throw error
   }
+}
+
+/**
+ * Appends a fact and its outbox dispatch inside a caller-owned transaction.
+ * The dual writer uses this to commit the legacy projection and V2 fact
+ * together, preserving the atomicity guarantee of the fact store.
+ */
+export async function appendAgentEventWithOutboxInTransaction(
+  tx: Prisma.TransactionClient,
+  input: AppendAgentEventInput,
+): Promise<{ event: AgentEventRecord; duplicate: boolean }> {
+  const transactionExisting = await findExistingEvent(tx, input)
+  if (transactionExisting) return { event: transactionExisting, duplicate: true }
+
+  const sequence = await allocateSessionSequence(tx, input.sessionId)
+  const eventId = randomUUID()
+  const event = await tx.agentEvent.create({
+    data: {
+      id: eventId,
+      sessionId: input.sessionId,
+      turnId: input.turnId,
+      itemId: input.itemId ?? null,
+      taskId: input.taskId ?? null,
+      sequence,
+      type: input.type,
+      actor: input.actor,
+      correlationId: input.correlationId,
+      causationId: input.causationId ?? null,
+      idempotencyKey: input.idempotencyKey ?? null,
+      payload: input.payload,
+    },
+  })
+
+  await tx.agentOutbox.create({
+    data: {
+      id: randomUUID(),
+      topic: input.outboxTopic,
+      aggregateId: input.sessionId,
+      idempotencyKey: `agent-event:${eventId}`,
+      payload: buildOutboxPayload(input, eventId, sequence),
+    },
+  })
+
+  return { event, duplicate: false }
 }
 
 export async function updateAgentItemRevision(
