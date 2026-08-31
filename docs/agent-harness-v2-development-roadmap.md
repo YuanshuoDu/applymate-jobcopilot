@@ -554,7 +554,8 @@ draft
 
 - **类型 / 优先级 / Size：** `feat` / P0 / L
 - **依赖：** AH2-005、AH2-006
-- **主要文件：** `apps/web/src/lib/agent/control-plane/store/`、`apps/worker/src/runtime/store/`。
+- **主要文件：** `packages/agent-protocol/src/repository.ts`（type-only repository contracts）、`apps/web/src/lib/agent/control-plane/store/`、`apps/worker/src/runtime/store/`。
+  - *修正记录（2026-08-31，规则 17–19）：Codex 在 #347 澄清时指出 Worker 不能 import Web 代码（设计 §5.2 部署边界），共享 contract 必须放独立纯协议包；经 Claude 确认后补列 `agent-protocol` repository contract，Issue #347 范围同步。*
 - **开发目标：** 为控制面和执行面提供语义一致、tenant-safe、可事务化的持久层。
 - **实施步骤：** 1) 定义 repository contracts；2) Web Prisma 实现 command/query UoW；3) Worker pg 实现 lease/step/event UoW；4) 共用 fixtures/contract suite；5) 添加跨租户和 stale revision 防护。
 - **完成标准：** tenant scope 只能服务端注入；所有 mutation 带 ownership/expected state；两端对同一 fixture projection 一致；事务异常无部分写；SQL 无字符串拼接 ID。
