@@ -2,8 +2,11 @@ import { describe, expect, it } from "vitest"
 
 import {
   AgentModelError,
+  MAX_MODEL_REROUTES,
+  MAX_REPAIR_ATTEMPTS,
   MODEL_SCHEMA_VERSION,
   ModelAdapterRegistry,
+  NextStepSchema,
   createLegacyModelFacade,
 } from "./index.js"
 
@@ -13,5 +16,8 @@ describe("agent-model public entrypoint", () => {
     expect(ModelAdapterRegistry).toBeDefined()
     expect(createLegacyModelFacade).toBeDefined()
     expect(AgentModelError).toBeDefined()
+    expect(MAX_REPAIR_ATTEMPTS).toBe(1)
+    expect(MAX_MODEL_REROUTES).toBe(2)
+    expect(NextStepSchema.$id).toBe("agent.model.next-step")
   })
 })
