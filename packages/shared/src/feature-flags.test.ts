@@ -1,5 +1,12 @@
 import { describe, expect, it } from 'vitest'
-import { evaluateManagedFeature, isManagedFeatureKey } from './feature-flags.js'
+import {
+  AGENT_HARNESS_FEATURES,
+  evaluateAgentHarnessFeature,
+  evaluateManagedFeature,
+  getAgentHarnessFeatureHealth,
+  isAgentHarnessFeatureKey,
+  isManagedFeatureKey,
+} from './feature-flags.js'
 
 describe('managed platform feature flags', () => {
   it('keeps the current product behavior when no active override exists', () => {
@@ -40,5 +47,43 @@ describe('managed platform feature flags', () => {
       plan: 'pro',
       flag: null,
     })).toBe(false)
+  })
+
+  it('declares the complete V2 catalog with every default disabled', () => {
+    expect(Object.keys(AGENT_HARNESS_FEATURES)).toHaveLength(11)
+    expect(Object.values(AGENT_HARNESS_FEATURES).every((feature) => feature.defaultEnabled === false)).toBe(true)
+    expect(isAgentHarnessFeatureKey('AGENT_SUBAGENTS_V2')).toBe(true)
+    expect(isAgentHarnessFeatureKey('AGENT_UNKNOWN_V2')).toBe(false)
+  })
+
+  it('uses the safe default for unknown or missing V2 controls', () => {
+    const input = { environment: 'staging' as const, userId: 'user-1', plan: 'pro', flag: null }
+    expect(evaluateAgentHarnessFeature('AGENT_PROTOCOL_V2_DUAL_WRITE', input)).toBe(false)
+    expect(evaluateAgentHarnessFeature('AGENT_UNKNOWN_V2', input)).toBe(false)
+  })
+
+  it('only enables a V2 control through an active reviewed override', () => {
+    const input = {
+      environment: 'staging' as const,
+      userId: 'user-1',
+      plan: 'pro',
+      flag: {
+        enabled: true,
+        rolloutPercent: 100,
+        targetPlans: [],
+        targetUserIds: [],
+        status: 'active',
+        rollbackAt: null,
+      },
+    }
+    expect(evaluateAgentHarnessFeature('AGENT_TOOL_KERNEL_V2', input)).toBe(true)
+    expect(evaluateAgentHarnessFeature('AGENT_TOOL_KERNEL_V2', { ...input, flag: { ...input.flag, status: 'draft' } })).toBe(false)
+  })
+
+  it('publishes a non-sensitive health snapshot with safe defaults', () => {
+    const snapshot = getAgentHarnessFeatureHealth('staging')
+    expect(snapshot).toMatchObject({ environment: 'staging', source: 'safe_defaults', allDefaultOff: true })
+    expect(Object.values(snapshot.flags)).toHaveLength(11)
+    expect(Object.values(snapshot.flags).every((flag) => flag.enabled === false && flag.defaultEnabled === false)).toBe(true)
   })
 })
