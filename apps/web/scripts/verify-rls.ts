@@ -1,7 +1,10 @@
 import { db } from '../src/lib/db'
 
 type OwnerCount = { userId: string; count: number }
-type Counts = { expected: number[]; first: number; second: number; empty: number }
+type V2Check = { name: string; enabled: boolean; readable: boolean }
+type Counts = { expected: number[]; first: number; second: number; empty: number; v2: V2Check[] }
+
+const V2_TABLES = ['agent_turns', 'agent_steps', 'agent_inputs', 'agent_items', 'agent_events', 'agent_outbox'] as const
 
 const rollbackPrefix = '__ROLLBACK__'
 
@@ -28,6 +31,9 @@ async function main() {
     await db.$executeRawUnsafe(`GRANT ${quotedRole} TO CURRENT_USER`)
     await db.$executeRawUnsafe(`GRANT USAGE ON SCHEMA public TO ${quotedRole}`)
     await db.$executeRawUnsafe(`GRANT SELECT ON "Job" TO ${quotedRole}`)
+    for (const table of V2_TABLES) {
+      await db.$executeRawUnsafe(`GRANT SELECT ON "${table}" TO ${quotedRole}`)
+    }
 
     try {
       await db.$transaction(async (tx) => {
@@ -47,6 +53,18 @@ async function main() {
           WITH CHECK ("userId" = app_current_user_id())
         `)
         await tx.$executeRawUnsafe(`SET LOCAL ROLE ${quotedRole}`)
+        const v2 = await tx.$queryRaw<Array<{ name: string; enabled: boolean; readable: boolean }>>`
+          WITH expected(name) AS (VALUES
+            ('agent_turns'), ('agent_steps'), ('agent_inputs'),
+            ('agent_items'), ('agent_events'), ('agent_outbox')
+          )
+          SELECT expected.name,
+                 COALESCE(c.relrowsecurity, false) AS enabled,
+                 has_table_privilege(current_user, expected.name, 'SELECT') AS readable
+          FROM expected
+          LEFT JOIN pg_class c ON c.relname = expected.name
+            AND c.relnamespace = (SELECT oid FROM pg_namespace WHERE nspname = 'public')
+        `
         await tx.$executeRaw`SELECT set_config('app.user_id', ${owners[0].userId}, true)`
         const first = await tx.$queryRaw<Array<{ count: number }>>`SELECT count(*)::int AS count FROM "Job"`
         await tx.$executeRaw`SELECT set_config('app.user_id', ${owners[1].userId}, true)`
@@ -58,6 +76,7 @@ async function main() {
           first: first[0]?.count ?? 0,
           second: second[0]?.count ?? 0,
           empty: empty[0]?.count ?? 0,
+          v2,
         }
         throw new Error(`${rollbackPrefix}${JSON.stringify(result)}`)
       })
@@ -65,7 +84,8 @@ async function main() {
       const message = error instanceof Error ? error.message : String(error)
       if (!message.startsWith(rollbackPrefix)) throw error
       const result = JSON.parse(message.slice(rollbackPrefix.length)) as Counts
-      if (result.first !== result.expected[0] || result.second !== result.expected[1] || result.empty !== 0) {
+      const v2Ready = result.v2.length === V2_TABLES.length && result.v2.every(table => table.enabled && table.readable)
+      if (result.first !== result.expected[0] || result.second !== result.expected[1] || result.empty !== 0 || !v2Ready) {
         throw new Error(`RLS isolation mismatch: ${JSON.stringify(result)}`)
       }
       console.log(JSON.stringify({ status: 'passed', result }))
@@ -74,6 +94,9 @@ async function main() {
     if (created) {
       await db.$executeRawUnsafe(`REVOKE ${quotedRole} FROM CURRENT_USER`)
       await db.$executeRawUnsafe(`REVOKE ALL PRIVILEGES ON "Job" FROM ${quotedRole}`)
+      for (const table of V2_TABLES) {
+        await db.$executeRawUnsafe(`REVOKE ALL PRIVILEGES ON "${table}" FROM ${quotedRole}`)
+      }
       await db.$executeRawUnsafe(`REVOKE ALL PRIVILEGES ON SCHEMA public FROM ${quotedRole}`)
       await db.$executeRawUnsafe(`DROP ROLE ${quotedRole}`)
     }

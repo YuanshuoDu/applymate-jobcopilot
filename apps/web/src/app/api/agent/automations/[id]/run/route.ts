@@ -6,6 +6,8 @@ import { enqueueAgentRun } from "@/lib/agent-run-queue-client"
 import { ensureAgentExecution } from "@/lib/agent/execution-control"
 import { isActiveAutomationExecution, resolveAutomationSession } from "@/lib/agent/automation-session"
 import { hasEffectiveEntitlement } from '@/lib/entitlements'
+import { isRuntimeAgentHarnessFeatureEnabled } from '@/lib/runtime-feature-flags'
+import { createDualWriteSession } from '@/lib/agent/session/dual-write'
 
 type RouteCtx = { params: Promise<{ id: string }> }
 
@@ -118,21 +120,44 @@ export async function POST(req: NextRequest, ctx: RouteCtx) {
     })
   }
 
-  const event = await db.agentTranscriptEvent.create({
-    data: {
+  const dualWriteEnabled = await isRuntimeAgentHarnessFeatureEnabled(
+    'AGENT_PROTOCOL_V2_DUAL_WRITE',
+    auth.userId,
+  ).catch(() => false)
+  const dualWrite = dualWriteEnabled
+    ? await createDualWriteSession(db, {
       sessionId: session.id,
-      taskId: null,
-      type: "automation_started",
-      speaker: "Orchestrator",
-      title: "Automation started",
-      body: `Started automation: ${automation.name}`,
-      data: {
-        automationId: automation.id,
-        automation: automationPayload(automation),
-      },
-      durationMs: null,
+      userId: auth.userId,
+      goal: `Run automation: ${automation.name}`,
+      source: 'automation',
+    })
+    : null
+  const eventInput = {
+    sessionId: session.id,
+    taskId: null,
+    type: "automation_started" as const,
+    speaker: "Orchestrator",
+    title: "Automation started",
+    body: `Started automation: ${automation.name}`,
+    data: {
+      automationId: automation.id,
+      automation: automationPayload(automation),
     },
-  })
+  }
+  let event: Parameters<typeof serializeEvent>[0]
+  try {
+    event = (dualWrite
+      ? await dualWrite.record(eventInput)
+      : await db.agentTranscriptEvent.create({ data: { ...eventInput, durationMs: null } })) as Parameters<typeof serializeEvent>[0]
+  } catch (error) {
+    if (dualWrite) {
+      await dualWrite.finalize({
+        status: 'failed',
+        error: error instanceof Error ? error.message : 'Could not record automation start',
+      }).catch(() => undefined)
+    }
+    throw error
+  }
 
   let executionId: string | null = null
   try {
@@ -147,6 +172,7 @@ export async function POST(req: NextRequest, ctx: RouteCtx) {
     await Promise.allSettled([
       db.agentSession.update({ where: { id: session.id }, data: { status: "failed", completedAt: new Date(), memorySummary: `Dispatch failed: ${message}` } }),
       ...(executionId ? [db.agentExecution.update({ where: { id: executionId }, data: { status: "failed", completedAt: new Date(), error: message } })] : []),
+      ...(dualWrite ? [dualWrite.finalize({ status: 'failed', error: message })] : []),
     ])
     return err(message, 503)
   }

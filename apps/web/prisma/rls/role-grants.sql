@@ -18,7 +18,8 @@ GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE
   "persona_evidence_chunks", "Activity", "user_api_keys", "AgentConfig", "AgentRole", "apply_results",
   "form_patterns", "ai_budgets", "job_api_usage_events", "discovery_optimization_events", "ai_budget_adjustments", "ai_budget_reset_requests", "ai_usage_events", "external_api_usage_events", "notifications", "gmail_sync_states",
   "gmail_messages", "gmail_recommendations", "AgentRunQuestion", "agent_runs", "agent_executions",
-  "agent_sessions", "sub_agent_tasks", "agent_transcript_events", "agent_approvals", "agent_automations",
+  "agent_sessions", "agent_turns", "agent_steps", "agent_inputs", "agent_items", "agent_events", "agent_outbox",
+  "sub_agent_tasks", "agent_transcript_events", "agent_approvals", "agent_automations",
   "CustomAgentRole", "Direction", "CoverLetter", "support_cases", "support_case_messages",
   "support_case_escalations", "admin_data_deletion_requests"
 TO applymate_candidate;

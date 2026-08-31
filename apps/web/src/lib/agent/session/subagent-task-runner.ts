@@ -4,6 +4,7 @@ import {
   createSubAgentTask,
   updateAgentSession,
   type AgentSessionDb,
+  type AppendTranscriptEventInput,
   type CreateSubAgentTaskInput,
 } from "./repository"
 import type { QualityGateResult } from "./types"
@@ -25,6 +26,10 @@ export interface SubAgentTaskRunResult {
   failureReason: string | null
 }
 
+export interface SubAgentTaskRunOptions {
+  recordTranscript?: (input: AppendTranscriptEventInput) => Promise<unknown>
+}
+
 function speakerFor(role: string) {
   return role.charAt(0).toUpperCase() + role.slice(1)
 }
@@ -37,15 +42,17 @@ export async function runSubAgentTask(
   db: AgentSessionDb,
   contract: CreateSubAgentTaskInput,
   handler: () => Promise<SubAgentTaskSuccess>,
+  options: SubAgentTaskRunOptions = {},
 ): Promise<SubAgentTaskRunResult> {
   const task = await createSubAgentTask(db, contract) as { id: string }
   const speaker = speakerFor(contract.role)
+  const recordTranscript = options.recordTranscript ?? ((input: AppendTranscriptEventInput) => appendTranscriptEvent(db, input))
 
   await updateAgentSession(db, {
     sessionId: contract.sessionId,
     currentTaskId: task.id,
   })
-  await appendTranscriptEvent(db, {
+  await recordTranscript({
     sessionId: contract.sessionId,
     taskId: task.id,
     type: "subagent_task_started",
@@ -64,7 +71,7 @@ export async function runSubAgentTask(
       confidence: output.confidence,
       qualityGateResult: output.qualityGateResult ?? null,
     })
-    await appendTranscriptEvent(db, {
+    await recordTranscript({
       sessionId: contract.sessionId,
       taskId: task.id,
       type: "subagent_result",
@@ -93,7 +100,7 @@ export async function runSubAgentTask(
       confidence: 0,
       failureReason: reason,
     })
-    await appendTranscriptEvent(db, {
+    await recordTranscript({
       sessionId: contract.sessionId,
       taskId: task.id,
       type: "error",

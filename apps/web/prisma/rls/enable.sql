@@ -46,6 +46,12 @@ ALTER TABLE "AgentRunQuestion" ENABLE ROW LEVEL SECURITY;
 ALTER TABLE "agent_runs" ENABLE ROW LEVEL SECURITY;
 ALTER TABLE "agent_executions" ENABLE ROW LEVEL SECURITY;
 ALTER TABLE "agent_sessions" ENABLE ROW LEVEL SECURITY;
+ALTER TABLE "agent_turns" ENABLE ROW LEVEL SECURITY;
+ALTER TABLE "agent_steps" ENABLE ROW LEVEL SECURITY;
+ALTER TABLE "agent_inputs" ENABLE ROW LEVEL SECURITY;
+ALTER TABLE "agent_items" ENABLE ROW LEVEL SECURITY;
+ALTER TABLE "agent_events" ENABLE ROW LEVEL SECURITY;
+ALTER TABLE "agent_outbox" ENABLE ROW LEVEL SECURITY;
 ALTER TABLE "sub_agent_tasks" ENABLE ROW LEVEL SECURITY;
 ALTER TABLE "agent_transcript_events" ENABLE ROW LEVEL SECURITY;
 ALTER TABLE "agent_approvals" ENABLE ROW LEVEL SECURITY;
@@ -132,6 +138,30 @@ DROP POLICY IF EXISTS candidate_agent_execution_isolation ON "agent_executions";
 CREATE POLICY candidate_agent_execution_isolation ON "agent_executions" USING ("userId" = app_current_user_id()) WITH CHECK ("userId" = app_current_user_id());
 DROP POLICY IF EXISTS candidate_agent_session_isolation ON "agent_sessions";
 CREATE POLICY candidate_agent_session_isolation ON "agent_sessions" USING ("userId" = app_current_user_id()) WITH CHECK ("userId" = app_current_user_id());
+DROP POLICY IF EXISTS candidate_agent_turn_isolation ON "agent_turns";
+CREATE POLICY candidate_agent_turn_isolation ON "agent_turns"
+  USING ("userId" = app_current_user_id() AND EXISTS (SELECT 1 FROM "agent_sessions" session WHERE session."id" = "sessionId" AND session."userId" = app_current_user_id()))
+  WITH CHECK ("userId" = app_current_user_id() AND EXISTS (SELECT 1 FROM "agent_sessions" session WHERE session."id" = "sessionId" AND session."userId" = app_current_user_id()));
+DROP POLICY IF EXISTS candidate_agent_step_isolation ON "agent_steps";
+CREATE POLICY candidate_agent_step_isolation ON "agent_steps"
+  USING (EXISTS (SELECT 1 FROM "agent_sessions" session WHERE session."id" = "sessionId" AND session."userId" = app_current_user_id()))
+  WITH CHECK (EXISTS (SELECT 1 FROM "agent_sessions" session WHERE session."id" = "sessionId" AND session."userId" = app_current_user_id()));
+DROP POLICY IF EXISTS candidate_agent_input_isolation ON "agent_inputs";
+CREATE POLICY candidate_agent_input_isolation ON "agent_inputs"
+  USING ("userId" = app_current_user_id() AND EXISTS (SELECT 1 FROM "agent_sessions" session WHERE session."id" = "sessionId" AND session."userId" = app_current_user_id()))
+  WITH CHECK ("userId" = app_current_user_id() AND EXISTS (SELECT 1 FROM "agent_sessions" session WHERE session."id" = "sessionId" AND session."userId" = app_current_user_id()));
+DROP POLICY IF EXISTS candidate_agent_item_isolation ON "agent_items";
+CREATE POLICY candidate_agent_item_isolation ON "agent_items"
+  USING (EXISTS (SELECT 1 FROM "agent_sessions" session WHERE session."id" = "sessionId" AND session."userId" = app_current_user_id()))
+  WITH CHECK (EXISTS (SELECT 1 FROM "agent_sessions" session WHERE session."id" = "sessionId" AND session."userId" = app_current_user_id()));
+DROP POLICY IF EXISTS candidate_agent_event_isolation ON "agent_events";
+CREATE POLICY candidate_agent_event_isolation ON "agent_events"
+  USING (EXISTS (SELECT 1 FROM "agent_sessions" session WHERE session."id" = "sessionId" AND session."userId" = app_current_user_id()))
+  WITH CHECK (EXISTS (SELECT 1 FROM "agent_sessions" session WHERE session."id" = "sessionId" AND session."userId" = app_current_user_id()));
+DROP POLICY IF EXISTS candidate_agent_outbox_isolation ON "agent_outbox";
+CREATE POLICY candidate_agent_outbox_isolation ON "agent_outbox"
+  USING (EXISTS (SELECT 1 FROM "agent_sessions" session WHERE session."id" = "aggregateId" AND session."userId" = app_current_user_id()))
+  WITH CHECK (EXISTS (SELECT 1 FROM "agent_sessions" session WHERE session."id" = "aggregateId" AND session."userId" = app_current_user_id()));
 DROP POLICY IF EXISTS candidate_sub_agent_task_isolation ON "sub_agent_tasks";
 CREATE POLICY candidate_sub_agent_task_isolation ON "sub_agent_tasks"
   USING (EXISTS (SELECT 1 FROM "agent_sessions" session WHERE session."id" = "sessionId" AND session."userId" = app_current_user_id()))

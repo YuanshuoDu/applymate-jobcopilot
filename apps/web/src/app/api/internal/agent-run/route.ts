@@ -72,6 +72,7 @@ export async function POST(req: NextRequest) {
   const report = await runAgentPipeline({
     userId: input.userId,
     sessionId: session.id,
+    source: "automation",
     aiConfig,
     autonomous,
   });
