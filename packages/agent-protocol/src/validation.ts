@@ -22,7 +22,7 @@ export function validate(schema: TSchema, value: unknown): boolean {
 export function assertValid(schema: TSchema, value: unknown, label = 'protocol value'): void {
   const validator = getValidator(schema)
   if (validator(value)) return
-  const issues = (validator.errors ?? []).map(({ instancePath, keyword, message, params }) => ({ instancePath, keyword, message, params }))
+  const issues: ValidationIssue[] = (validator.errors ?? []).map(({ instancePath, keyword, message, params }) => ({ instancePath, keyword, message, params }))
   throw new ProtocolValidationError(`${label} failed schema validation`, issues)
 }
 

@@ -19,6 +19,9 @@ function waitForRetry() {
 
 function main(env = process.env) {
   if (!run(['--filter', '@jobcopilot/shared', 'build'], env)) process.exit(1)
+  // agent-protocol ships pre-built types (dist) consumed by Web/Worker imports;
+  // a clean Vercel build has no dist until we build it here.
+  if (!run(['--filter', '@jobcopilot/agent-protocol', 'build'], env)) process.exit(1)
 
   if (env.VERCEL_ENV === 'production') {
     const migrationArgs = ['--filter', '@jobcopilot/web', 'exec', 'prisma', 'migrate', 'deploy']
