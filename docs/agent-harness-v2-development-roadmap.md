@@ -565,7 +565,8 @@ draft
 
 - **类型 / 优先级 / Size：** `feat` / P1 / L
 - **依赖：** AH2-007
-- **主要文件：** `apps/web/src/lib/agent/session/run-recorder.ts`、repository、projector、chat/run/automation routes。
+- **主要文件：** `apps/web/src/lib/agent/session/run-recorder.ts`、repository、projector、chat/run/automation routes、`apps/web/prisma/rls/enable.sql` 与 `verify-rls.ts`/`rls-policies.test.ts`/`deployment-readiness-probes.ts`（RLS 最小更新）。
+  - *修正记录（2026-08-31，规则 17–19）：Codex 在 #348 澄清时证明六个 AH2 V2 表不在 RLS 清单中，`RLS_RUNTIME_MODE=on` 时生产 dual-write 无权限；经 Claude 确认后补列 RLS/readiness 文件，Issue #348 范围同步（AC5）。*
 - **开发目标：** 在不切换产品行为的前提下，让 legacy chat/manual/automation 产生可比较的 V2 事实流。
 - **实施步骤：** 1) 建立 legacy→V2 mapping 表；2) recorder 事务 dual-write；3) unknown event 作为 opaque 保存；4) projector 生成旧 Transcript；5) 对 chat/run/automation 做 golden compare。
 - **完成标准：** flag off 完全 legacy；flag on 两种 projection 语义一致；automation canonical Session 不变且每次新 Turn；失败 run 不制造重复 Session；mapping 不丢未知事件。
