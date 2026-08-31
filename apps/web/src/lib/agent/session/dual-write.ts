@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto"
 
 import { Prisma, PrismaClient } from "@prisma/client"
+import { redactAgentEvent, redactSensitiveValue } from "@jobcopilot/shared"
 
 import { appendAgentEventWithOutboxInTransaction } from "./fact-store"
 import { mapLegacyTranscriptToV2 } from "./legacy-v2-mapping"
@@ -72,6 +73,8 @@ export async function createDualWriteSession(
         if (!session || !currentTurn) throw new Error("Cannot dual-write an unauthorized agent turn")
 
         const mapping = mapLegacyTranscriptToV2(legacy, raw?.name)
+        const safeLegacy = redactAgentEvent(legacy)
+        const safeSourcePayload = redactSensitiveValue(raw?.payload ?? legacy.data ?? null)
         const eventIdempotencyKey = `legacy-transcript:${turn.turnId}:${randomUUID()}`
         const itemId = randomUUID()
         const timestamp = new Date()
@@ -79,11 +82,11 @@ export async function createDualWriteSession(
           legacyType: legacy.type,
           speaker: legacy.speaker,
           title: legacy.title ?? null,
-          body: legacy.body,
+          body: safeLegacy.body,
           durationMs: legacy.durationMs ?? null,
-          data: legacy.data ?? null,
+          data: safeLegacy.data,
           sourceEvent: raw?.name ?? legacy.type,
-          sourcePayload: raw?.payload ?? legacy.data ?? null,
+          sourcePayload: safeSourcePayload,
           opaque: mapping.opaque,
         }
         await tx.agentItem.create({
@@ -117,12 +120,12 @@ export async function createDualWriteSession(
               type: legacy.type,
               speaker: legacy.speaker,
               title: legacy.title ?? null,
-              body: legacy.body,
+              body: safeLegacy.body,
               durationMs: legacy.durationMs ?? null,
-              data: legacy.data ?? null,
+              data: safeLegacy.data,
             },
             sourceEvent: raw?.name ?? legacy.type,
-            sourcePayload: raw?.payload ?? legacy.data ?? null,
+            sourcePayload: safeSourcePayload,
             opaque: mapping.opaque,
           }),
           outboxTopic: "agent.session.event",
@@ -143,7 +146,7 @@ export async function createDualWriteSession(
           })
         }
         const projected = await insertProjectedTranscript(tx, event)
-        return restoreLegacyResponse(projected, legacy.data)
+        return restoreLegacyResponse(projected, safeLegacy.data)
       })
     },
     async finalize(finalizeInput) {

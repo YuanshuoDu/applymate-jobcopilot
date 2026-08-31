@@ -2,6 +2,7 @@ import { NextRequest } from "next/server"
 import { db } from "@/lib/db"
 import { err, isErrorResponse, ok, requireAuth } from "@/lib/api-helpers"
 import { nextRunAtFromCron } from "@/lib/agent/automation-schedule"
+import { requireLegacyPolicy } from "@/lib/agent/policy/legacy"
 
 type RouteCtx = { params: Promise<{ id: string }> }
 
@@ -90,6 +91,16 @@ export async function PATCH(req: NextRequest, ctx: RouteCtx) {
   if (isErrorResponse(auth)) return auth
 
   const { id } = await ctx.params
+  try {
+    requireLegacyPolicy({
+      userId: auth.userId, sessionId: `automation-api:${auth.userId}`, turnId: `automation:${id}`,
+      stepId: "automation.mutate", toolCallId: `automation:${id}`, toolName: "automation.mutate",
+      domain: "automation", risk: "internal_write", capabilities: ["read", "write"],
+      input: { mutation: "patch", requiresReceipt: false, unknownSensitiveFacts: false },
+    })
+  } catch (error) {
+    return err(error instanceof Error ? error.message : "Automation policy denied this mutation", 403)
+  }
   const body = await req.json().catch(() => null)
   const needsScheduleContext = Boolean(body && typeof body === "object" && ("cron" in body || "timezone" in body))
   const current = needsScheduleContext
@@ -122,6 +133,16 @@ export async function DELETE(req: NextRequest, ctx: RouteCtx) {
   if (isErrorResponse(auth)) return auth
 
   const { id } = await ctx.params
+  try {
+    requireLegacyPolicy({
+      userId: auth.userId, sessionId: `automation-api:${auth.userId}`, turnId: `automation:${id}`,
+      stepId: "automation.mutate", toolCallId: `automation:${id}`, toolName: "automation.mutate",
+      domain: "automation", risk: "internal_write", capabilities: ["read", "write"],
+      input: { mutation: "delete", requiresReceipt: false, unknownSensitiveFacts: false },
+    })
+  } catch (error) {
+    return err(error instanceof Error ? error.message : "Automation policy denied this mutation", 403)
+  }
   const result = await db.agentAutomation.deleteMany({
     where: { id, userId: auth.userId },
   })

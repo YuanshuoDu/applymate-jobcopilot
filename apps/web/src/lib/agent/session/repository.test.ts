@@ -101,6 +101,48 @@ describe("agent session repository", () => {
     })
   })
 
+  it("preserves automation drafts and opaque approval references through transcript redaction", async () => {
+    const db = mockDb()
+
+    const event = await appendTranscriptEvent(db, {
+      sessionId: "session_1",
+      type: "automation_draft",
+      speaker: "Orchestrator",
+      body: "Review the automation before saving it.",
+      data: {
+        draft: {
+          name: "Berlin SWE weekdays",
+          triggerType: "weekdays",
+          cron: "0 8 * * 1-5",
+          timezone: "Europe/Berlin",
+          targetRoles: ["Software Engineer"],
+          targetLocations: ["Berlin"],
+          minScore: 85,
+          dailyCap: 8,
+          requireApproval: true,
+          autoApply: false,
+        },
+        approval: { id: "approval_1", receiptNonce: "nonce_1", scopeHash: "hash_1" },
+      },
+    }) as { data: unknown }
+
+    expect(event.data).toEqual({
+      draft: {
+        name: "Berlin SWE weekdays",
+        triggerType: "weekdays",
+        cron: "0 8 * * 1-5",
+        timezone: "Europe/Berlin",
+        targetRoles: ["Software Engineer"],
+        targetLocations: ["Berlin"],
+        minScore: 85,
+        dailyCap: 8,
+        requireApproval: true,
+        autoApply: false,
+      },
+      approval: { id: "approval_1", receiptNonce: "nonce_1", scopeHash: "hash_1" },
+    })
+  })
+
   it("creates a queued subagent task with a narrow task contract", async () => {
     const db = mockDb()
     const schema = {

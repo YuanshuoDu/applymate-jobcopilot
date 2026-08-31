@@ -7,6 +7,7 @@ import type { AgentSessionDetail, AgentTranscriptEvent } from './session-view-mo
 import { approvalResponseIds, EVENT_TONE_COLOR, eventChrome, eventSubtitle, sessionStatusLabel, shouldCollapseByDefault } from './session-view-model'
 import { ReplayBanner } from './ReplayBanner'
 import { TranscriptSpecialContent, type TranscriptAction } from './TranscriptSpecialBlocks'
+import { ensureActionReceipt } from './approval-receipt-client'
 import { useI18n } from '@/lib/i18n'
 
 interface DetailResponse {
@@ -62,10 +63,11 @@ export function AgentSessionTranscript({ sessionId, onBackToLive }: {
       }])
       return
     }
+    const authorizedAction = await ensureActionReceipt(sessionId, action)
     const res = await fetch(`/api/agent/sessions/${sessionId}/actions`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(action),
+      body: JSON.stringify(authorizedAction),
     })
     if (!res.ok) throw new Error(await readableActionError(res))
     if (action.type === 'create_automation') {

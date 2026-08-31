@@ -4,6 +4,7 @@
  * Tailors a base resume to the target job and saves an adapted resume.
  */
 import { NextRequest } from 'next/server'
+import { randomUUID } from 'node:crypto'
 import { Prisma } from '@prisma/client'
 import { db } from '@/lib/db'
 import { prepareAiRoute, ok, err } from '@/lib/api-helpers'
@@ -12,6 +13,7 @@ import { buildPersona } from '@/lib/persona'
 import { personaEvidenceContext } from '@/lib/persona-evidence'
 import { hasEffectiveEntitlement } from '@/lib/entitlements'
 import type { ApplicationAuditFinding } from '@/lib/types'
+import { requireLegacyPolicy } from '@/lib/agent/policy/legacy'
 
 type Params = { params: Promise<{ id: string }> }
 
@@ -103,6 +105,19 @@ export async function POST(req: NextRequest, { params }: Params) {
     ? await db.resume.findFirst({ where: { id: existing.parentResumeId, userId: prep.userId } })
     : resume
   if (!sourceResume) return err('The original resume for this tailored version could not be found', 404)
+
+  requireLegacyPolicy({
+    userId: prep.userId,
+    sessionId: `legacy-resume:${jobId}`,
+    turnId: `legacy-tailor:${jobId}:${resumeId}`,
+    stepId: `tailor:${jobId}`,
+    toolCallId: randomUUID(),
+    toolName: 'resume.tailor',
+    domain: 'resume',
+    risk: 'draft_write',
+    capabilities: ['read', 'write'],
+    input: { jobId, resumeId, sourceResumeId: sourceResume.id, unknownSensitiveFacts: false },
+  })
 
   const resumeContent = sourceResume.content as Record<string, unknown>
   const persona = await buildPersona(prep.userId, 'tailor')

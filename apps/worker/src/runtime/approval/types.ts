@@ -23,6 +23,7 @@ export interface IssueApprovalReceiptInput {
   impact?: unknown
   payload: unknown
   nonce?: string
+  projectWait?: boolean
 }
 
 export interface ApprovalScopeMatch extends ApprovalScopeInput { nonce: string }

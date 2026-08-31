@@ -6,6 +6,7 @@ import type {
   SubAgentTaskStatus,
   TranscriptEventType,
 } from "./types"
+import { redactAgentEvent } from "@jobcopilot/shared"
 
 type JsonValue = unknown
 
@@ -85,6 +86,7 @@ export async function createAgentSession(db: AgentSessionDb, input: CreateAgentS
 }
 
 export async function appendTranscriptEvent(db: AgentSessionDb, input: AppendTranscriptEventInput) {
+  const safe = redactAgentEvent(input)
   return db.agentTranscriptEvent.create({
     data: {
       sessionId: input.sessionId,
@@ -92,8 +94,8 @@ export async function appendTranscriptEvent(db: AgentSessionDb, input: AppendTra
       type: input.type,
       speaker: input.speaker,
       title: input.title ?? null,
-      body: input.body,
-      data: input.data ?? null,
+      body: safe.body,
+      data: safe.data,
       durationMs: input.durationMs ?? null,
     },
   })

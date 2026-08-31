@@ -8,17 +8,23 @@ import type {
   TenantScope,
   UpdateItemInput,
 } from "@jobcopilot/agent-protocol"
+import { redactAgentEvent } from "@jobcopilot/shared"
 
 import { AgentRepositoryConflictError } from "./errors"
 import { mapEvent, mapItem, mapStep, mapTurn } from "./mapping"
 
 type Transaction = Prisma.TransactionClient
 
+function safeEventPayload(input: AppendEventInput): Prisma.InputJsonValue {
+  return redactAgentEvent({ type: input.type, body: "", data: input.payload }).data as Prisma.InputJsonValue
+}
+
 function conflict(resource: string): AgentRepositoryConflictError {
   return new AgentRepositoryConflictError(`Agent repository state conflict: ${resource}`)
 }
 
 function outboxPayload(input: AppendEventInput, sequence: bigint): Prisma.InputJsonObject {
+  const payload = safeEventPayload(input)
   return {
     eventId: input.id,
     sessionId: input.sessionId,
@@ -31,7 +37,7 @@ function outboxPayload(input: AppendEventInput, sequence: bigint): Prisma.InputJ
     correlationId: input.correlationId,
     causationId: input.causationId,
     idempotencyKey: input.idempotencyKey,
-    payload: input.payload,
+    payload,
   } as Prisma.InputJsonObject
 }
 
@@ -165,7 +171,7 @@ function createUnitOfWork(tx: Transaction, scope: TenantScope): AgentRepositoryU
           correlationId: input.correlationId,
           causationId: input.causationId,
           idempotencyKey: input.idempotencyKey,
-          payload: input.payload as Prisma.InputJsonValue,
+          payload: safeEventPayload(input),
         },
       })
 

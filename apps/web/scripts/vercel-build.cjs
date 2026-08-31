@@ -18,10 +18,13 @@ function waitForRetry() {
 }
 
 function main(env = process.env) {
-  if (!run(['--filter', '@jobcopilot/shared', 'build'], env)) process.exit(1)
   // agent-protocol ships pre-built types (dist) consumed by Web/Worker imports;
   // a clean Vercel build has no dist until we build it here.
   if (!run(['--filter', '@jobcopilot/agent-protocol', 'build'], env)) process.exit(1)
+  if (!run(['--filter', '@jobcopilot/shared', 'build'], env)) process.exit(1)
+  // agent-policy consumes the protocol package and is imported directly by Web.
+  // Build it explicitly so a clean Vercel checkout never relies on stale dist.
+  if (!run(['--filter', '@jobcopilot/agent-policy', 'build'], env)) process.exit(1)
   // agent-model is a workspace dependency whose package exports resolve to dist;
   // build it explicitly because Vercel invokes this script outside Turbo.
   if (!run(['--filter', '@jobcopilot/agent-model', 'build'], env)) process.exit(1)

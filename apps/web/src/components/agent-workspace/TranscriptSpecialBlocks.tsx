@@ -64,13 +64,14 @@ function ResumeArtifactBlock({ event, border }: { event: AgentTranscriptEvent; b
 export interface TranscriptAction {
   type: 'approval_response' | 'create_automation' | 'edit_automation_draft' | 'cancel_automation_draft'
   approvalId?: string | null
+  receiptNonce?: string | null
   decision?: 'approved' | 'rejected' | 'cancelled' | 'review'
   body?: string
   draft?: AutomationDraftAction
   prompt?: string
 }
 
-interface AutomationDraftAction { name: string; triggerType: string; cron: string | null; timezone: string; targetRoles: string[]; targetLocations: string[]; minScore: number; dailyCap: number; requireApproval: boolean; autoApply: boolean }
+interface AutomationDraftAction { name: string; triggerType: string; cron: string | null; timezone: string; targetRoles: string[]; targetLocations: string[]; minScore: number; dailyCap: number; requireApproval: boolean; autoApply: boolean; approvalId?: string; receiptNonce?: string }
 function AutomationDraftBlock({ event, border, onAction }: {
   event: AgentTranscriptEvent
   border: string
@@ -78,7 +79,8 @@ function AutomationDraftBlock({ event, border, onAction }: {
 }) {
   const { t } = useI18n()
   const draft = nestedRecord(event, 'draft')
-  const actionDraft = toAutomationDraftAction(draft)
+  const approval = nestedRecord(event, 'approval')
+  const actionDraft = toAutomationDraftAction(draft, approval)
   const rows: Array<[string, string]> = [
     [t('agent.name'), text(draft.name) ?? t('agent.newAutomation')],
     [t('agent.trigger'), text(draft.trigger) ?? text(draft.triggerType) ?? text(draft.cron) ?? t('agent.manual')],
@@ -92,7 +94,7 @@ function AutomationDraftBlock({ event, border, onAction }: {
       <BodyText>{event.body}</BodyText>
       <KeyValueGrid border={border} rows={rows} />
       <TranscriptActionButtons actions={[
-        { label: t('agent.createAutomation'), onClick: () => onAction?.({ type: 'create_automation', draft: actionDraft }) },
+        { label: t('agent.createAutomation'), onClick: () => onAction?.({ type: 'create_automation', draft: actionDraft, approvalId: actionDraft.approvalId, receiptNonce: actionDraft.receiptNonce }) },
         { label: t('agent.edit'), onClick: () => onAction?.({ type: 'edit_automation_draft', draft: actionDraft, prompt: draftPrompt(actionDraft) }) },
         { label: t('agent.cancel'), onClick: () => onAction?.({ type: 'cancel_automation_draft', body: `${t('agent.cancelledAutomationDraft')}: ${actionDraft.name}` }) },
       ]} />
@@ -106,7 +108,7 @@ function draftPrompt(draft: AutomationDraftAction) {
   return `Edit this automation draft: name ${draft.name}; trigger ${draft.triggerType}${draft.cron ? ` (${draft.cron})` : ''}; target ${roles} roles in ${locations}; minimum score ${draft.minScore}+; daily limit ${draft.dailyCap}; ${draft.requireApproval ? 'approval required before submission' : 'no approval required before submission'}.`
 }
 
-function toAutomationDraftAction(draft: Record<string, unknown>): AutomationDraftAction {
+function toAutomationDraftAction(draft: Record<string, unknown>, approval: Record<string, unknown>): AutomationDraftAction {
   return {
     name: text(draft.name) ?? 'New automation',
     triggerType: text(draft.triggerType) ?? triggerTypeFromLabel(text(draft.trigger)),
@@ -118,6 +120,8 @@ function toAutomationDraftAction(draft: Record<string, unknown>): AutomationDraf
     dailyCap: boundedNumber(draft.dailyCap, 8, 1, 50),
     requireApproval: draft.requireApproval === false ? false : true,
     autoApply: draft.autoApply === true,
+    approvalId: text(approval.id) ?? undefined,
+    receiptNonce: text(approval.receiptNonce) ?? undefined,
   }
 }
 

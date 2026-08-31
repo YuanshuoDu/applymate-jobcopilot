@@ -24,6 +24,8 @@ export interface IssueApprovalReceiptInput {
   impact?: Prisma.InputJsonValue | null
   payload: Prisma.InputJsonValue
   nonce?: string
+  /** Parallel legacy waits may be receipt-backed without occupying the one active V2 wait slot. */
+  projectWait?: boolean
 }
 
 export interface ApprovalScopeMatch extends ApprovalScopeInput {

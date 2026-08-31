@@ -1,11 +1,6 @@
 import { createHash } from "node:crypto"
 import type { RepositoryJsonValue } from "@jobcopilot/agent-protocol"
-
-const SENSITIVE_KEY = /(?:api[_-]?key|access[_-]?token|refresh[_-]?token|authorization|cookie|password|secret|private[_-]?key|credential|token|email|phone|address|linkedin|github|resume|cv|raw[_-]?(?:content|text|data)|content|value|question|sensitive|confirmed[_-]?answers|\bname\b)/i
-const SENSITIVE_TOKEN = /\bBearer\s+[a-z0-9._~+/=-]{8,}/gi
-const SENSITIVE_KEY_TOKEN = /\b(?:sk-|xox[baprs]-)[a-z0-9._~+/=-]{8,}/gi
-const SENSITIVE_EMAIL = /\b[a-z0-9.!#$%&'*+/=?^_`{|}~-]+@[a-z0-9-]+(?:\.[a-z0-9-]+)+\b/gi
-const SENSITIVE_ASSIGNMENT = /\b(password|secret|token|api[_-]?key|authorization)\s*[:=]\s*[^\s,;]+/gi
+import { redactSensitiveValue } from "@jobcopilot/shared"
 export const DEFAULT_MAX_LIFECYCLE_BYTES = 8 * 1024
 
 export interface ToolResultReference {
@@ -13,7 +8,6 @@ export interface ToolResultReference {
   readonly sizeBytes: number
   readonly sha256: string
 }
-
 export interface ToolResultReferenceStore {
   put(value: RepositoryJsonValue): Promise<ToolResultReference>
 }
@@ -42,20 +36,9 @@ export async function sanitizeForLifecycle(
   references: ToolResultReferenceStore,
   maxBytes = DEFAULT_MAX_LIFECYCLE_BYTES,
 ): Promise<RepositoryJsonValue> {
-  const safe = redact(value)
+  const safe = redactSensitiveValue(value)
   const encoded = JSON.stringify(safe)
   if (Buffer.byteLength(encoded) <= maxBytes) return safe
   const reference = await references.put(safe)
   return { $ref: reference.ref, sizeBytes: reference.sizeBytes, sha256: reference.sha256 }
-}
-
-function redact(value: unknown, key: string | null = null, depth = 0): RepositoryJsonValue {
-  if (key && SENSITIVE_KEY.test(key)) return "[REDACTED]"
-  if (typeof value === "string") return value.replace(SENSITIVE_TOKEN, "Bearer [REDACTED]").replace(SENSITIVE_KEY_TOKEN, "[REDACTED]").replace(SENSITIVE_EMAIL, "[REDACTED_EMAIL]").replace(SENSITIVE_ASSIGNMENT, "$1=[REDACTED]")
-  if (value === null || typeof value === "boolean") return value
-  if (typeof value === "number") return Number.isFinite(value) ? value : "[REDACTED]"
-  if (depth >= 8) return "[REDACTED]"
-  if (Array.isArray(value)) return value.map((entry) => redact(entry, null, depth + 1))
-  if (typeof value !== "object" || value === undefined) return "[REDACTED]"
-  return Object.fromEntries(Object.entries(value).map(([entryKey, entryValue]) => [entryKey, redact(entryValue, entryKey, depth + 1)]))
 }

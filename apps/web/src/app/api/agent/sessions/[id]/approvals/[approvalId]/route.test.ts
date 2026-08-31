@@ -4,6 +4,7 @@ import { AgentWaitError } from "@/lib/agent/broker/errors"
 const mocks = vi.hoisted(() => ({
   requireAuth: vi.fn(),
   decideApproval: vi.fn(),
+  reissueApprovalNonce: vi.fn(),
 }))
 
 vi.mock("@/lib/api-helpers", () => ({
@@ -13,6 +14,7 @@ vi.mock("@/lib/api-helpers", () => ({
 }))
 vi.mock("@/lib/db", () => ({ db: {} }))
 vi.mock("@/lib/agent/broker/store", () => ({ decideApproval: mocks.decideApproval }))
+vi.mock("@/lib/agent/approval/legacy-receipt", () => ({ reissueApprovalNonce: mocks.reissueApprovalNonce }))
 
 const context = { params: Promise.resolve({ id: "session_1", approvalId: "approval_1" }) }
 
@@ -28,8 +30,19 @@ describe("approval decision command API", () => {
   beforeEach(() => {
     mocks.requireAuth.mockReset()
     mocks.decideApproval.mockReset()
+    mocks.reissueApprovalNonce.mockReset()
     mocks.requireAuth.mockResolvedValue({ userId: "user_1" })
     mocks.decideApproval.mockResolvedValue({ waitKind: "approval", waitId: "approval_1", disposition: "resolved", status: "approved", turnId: "turn_1", itemId: "item_1", toolCallId: "call_1", nextTurnRevision: 6, sequence: "12" })
+    mocks.reissueApprovalNonce.mockResolvedValue({ approvalId: "approval_1", receiptNonce: "nonce_1", scopeHash: "a".repeat(64), expiresAt: "2026-09-01T00:00:00.000Z" })
+  })
+
+  it("reissues a scoped nonce without exposing it in the transcript", async () => {
+    const { GET } = await import("./route")
+    const response = await GET(request({}) as never, context)
+
+    expect(response.status).toBe(200)
+    await expect(response.json()).resolves.toEqual(expect.objectContaining({ approvalId: "approval_1", receiptNonce: "nonce_1" }))
+    expect(mocks.reissueApprovalNonce).toHaveBeenCalledWith(expect.anything(), { approvalId: "approval_1", sessionId: "session_1", userId: "user_1" })
   })
 
   it("accepts a typed decision with the authenticated owner and expected revision", async () => {

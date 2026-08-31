@@ -1,5 +1,7 @@
 import { Prisma } from "@prisma/client"
 import { db } from "@/lib/db"
+import { redactAgentEvent } from "@jobcopilot/shared"
+import { requireLegacyPolicy } from "./policy/legacy"
 
 export const APPLICATION_TASK_STATUSES = [
   "discovered",
@@ -29,6 +31,18 @@ type ReviewInput = {
 
 /** Create or refresh the durable review checkpoint. This never submits externally. */
 export async function holdForApplicationReview(input: ReviewInput) {
+  requireLegacyPolicy({
+    userId: input.userId,
+    sessionId: input.sessionId ?? `application-review:${input.jobId}`,
+    turnId: `review:${input.jobId}`,
+    stepId: "application.review",
+    toolCallId: `review:${input.jobId}`,
+    toolName: "application.review",
+    domain: "application",
+    risk: "internal_write",
+    capabilities: ["read", "write"],
+    input: { requiresReceipt: false, unknownSensitiveFacts: false, jobId: input.jobId },
+  })
   const task = await db.applicationTask.upsert({
     where: { userId_jobId: { userId: input.userId, jobId: input.jobId } },
     create: {
@@ -60,6 +74,18 @@ export async function requestUserTakeover(input: {
   reason: UserTakeoverReason
   detail: string
 }) {
+  requireLegacyPolicy({
+    userId: input.userId,
+    sessionId: `application-takeover:${input.jobId}`,
+    turnId: `takeover:${input.jobId}`,
+    stepId: "application.user_takeover",
+    toolCallId: `takeover:${input.jobId}`,
+    toolName: "application.user_takeover",
+    domain: "application",
+    risk: "internal_write",
+    capabilities: ["read", "write"],
+    input: { requiresReceipt: false, unknownSensitiveFacts: false, reason: input.reason },
+  })
   const task = await db.applicationTask.update({
     where: { userId_jobId: { userId: input.userId, jobId: input.jobId } },
     data: {
@@ -80,7 +106,8 @@ export async function appendApplicationTaskEvent(
   body: string,
   data?: Record<string, unknown>,
 ) {
+  const safe = redactAgentEvent({ type, body, data })
   return db.applicationTaskEvent.create({
-    data: { taskId, type, actor, body, ...(data ? { data: data as Prisma.InputJsonValue } : {}) },
+    data: { taskId, type, actor, body: safe.body, data: safe.data as Prisma.InputJsonValue },
   })
 }

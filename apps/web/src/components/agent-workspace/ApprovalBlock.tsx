@@ -32,6 +32,7 @@ export function ApprovalBlock({ event, border, acted, onAction }: {
   const payload = nestedRecord(event, 'approval')
   const impact = isRecord(payload.impact) ? payload.impact : {}
   const approvalId = text(payload.id) ?? text(payload.approvalId)
+  const receiptNonce = text(payload.receiptNonce)
   const status = acted ? 'recorded' : text(payload.status) ?? 'pending'
 
   return (
@@ -48,9 +49,9 @@ export function ApprovalBlock({ event, border, acted, onAction }: {
         </div>
       ) : (
         <TranscriptActionButtons actions={[
-          { label: t('agent.approve'), onClick: () => onAction?.({ type: 'approval_response', approvalId, decision: 'approved', body: 'Approved the requested action.' }) },
-          { label: t('agent.reviewAction'), onClick: () => onAction?.({ type: 'approval_response', approvalId, decision: 'review', body: 'Asked to review the requested action.' }) },
-          { label: t('agent.cancelAction'), onClick: () => onAction?.({ type: 'approval_response', approvalId, decision: 'cancelled', body: 'Cancelled the requested action.' }) },
+          { label: t('agent.approve'), onClick: () => onAction?.({ type: 'approval_response', approvalId, receiptNonce, decision: 'approved', body: 'Approved the requested action.' }) },
+          { label: t('agent.reviewAction'), onClick: () => onAction?.({ type: 'approval_response', approvalId, receiptNonce, decision: 'review', body: 'Asked to review the requested action.' }) },
+          { label: t('agent.cancelAction'), onClick: () => onAction?.({ type: 'approval_response', approvalId, receiptNonce, decision: 'cancelled', body: 'Cancelled the requested action.' }) },
         ]} />
       )}
     </div>

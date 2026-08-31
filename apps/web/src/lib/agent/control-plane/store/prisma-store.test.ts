@@ -189,6 +189,44 @@ describe("Prisma agent repository", () => {
     expect(fake.transaction).toHaveBeenCalledOnce()
   })
 
+  it("redacts sensitive V2 event payloads before event and outbox writes", async () => {
+    const f = fixture()
+    const fake = makeFakeDb(f.scope.userId, false, "append")
+    const store = createPrismaAgentStore(fake.db, f.scope)
+
+    await store.withUnitOfWork((uow) => uow.appendEvent({
+      id: f.eventId,
+      sessionId: f.sessionId,
+      turnId: f.turnId,
+      itemId: null,
+      taskId: null,
+      type: "approval.requested",
+      actor: "orchestrator",
+      correlationId: "c",
+      causationId: null,
+      idempotencyKey: f.idempotencyKey,
+      payload: {
+        approvalId: "approval_fixture",
+        email: "candidate@example.com",
+        resumeContent: "raw resume content",
+        draft: { name: "Berlin scout", targetRoles: ["Engineer"] },
+      },
+      outboxTopic: "agent.events",
+    }))
+
+    const eventCreate = fake.tx.agentEvent.create as unknown as { mock: { calls: unknown[][] } }
+    const outboxCreate = fake.tx.agentOutbox.create as unknown as { mock: { calls: unknown[][] } }
+    const eventPayload = dataOf(eventCreate.mock.calls[0]?.[0] as { data: Where }).payload
+    const outboxPayload = dataOf(outboxCreate.mock.calls[0]?.[0] as { data: Where }).payload
+    expect(eventPayload).toEqual({
+      approvalId: "approval_fixture",
+      email: "[REDACTED]",
+      resumeContent: "[REDACTED]",
+      draft: { name: "Berlin scout", targetRoles: ["Engineer"] },
+    })
+    expect(outboxPayload).toEqual(expect.objectContaining({ payload: eventPayload }))
+  })
+
   it("uses Prisma parameterized SQL for the atomic Item revision update", async () => {
     const f = fixture()
     const fake = makeFakeDb()

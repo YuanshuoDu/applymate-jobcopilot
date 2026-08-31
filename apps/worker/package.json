@@ -18,6 +18,7 @@
     "@bull-board/api": "^7.1.5",
     "@bull-board/express": "^7.1.5",
     "@jobcopilot/agent-model": "workspace:*",
+    "@jobcopilot/agent-policy": "workspace:*",
     "@jobcopilot/agent-protocol": "workspace:*",
     "@jobcopilot/shared": "workspace:*",
     "@sinclair/typebox": "^0.34.52",

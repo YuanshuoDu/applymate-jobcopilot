@@ -11,6 +11,9 @@ const mocks = vi.hoisted(() => ({
   transcriptCreate: vi.fn(),
   transcriptFindMany: vi.fn(),
   approvalCreate: vi.fn(),
+  issueLegacyReceipt: vi.fn(),
+  clientReceipt: vi.fn(),
+  ensureV2Turn: vi.fn(),
   taskCreate: vi.fn(),
   taskUpdate: vi.fn(),
   createChatPlan: vi.fn(),
@@ -67,6 +70,14 @@ vi.mock("@/lib/model-router", () => ({
   ],
 }))
 
+vi.mock("@/lib/agent/approval/legacy-receipt", () => ({
+  issueLegacyReceipt: mocks.issueLegacyReceipt,
+  clientReceipt: mocks.clientReceipt,
+}))
+vi.mock("@/lib/agent/session/v2-turn", () => ({
+  ensureV2Turn: mocks.ensureV2Turn,
+}))
+
 vi.mock('./chat-orchestrator', () => ({
   createChatPlan: mocks.createChatPlan,
   runChatWorker: mocks.runChatWorker,
@@ -117,6 +128,15 @@ describe("agent chat API session recording", () => {
     mocks.transcriptFindMany.mockResolvedValue([])
     mocks.sessionUpdate.mockResolvedValue({})
     mocks.approvalCreate.mockResolvedValue({ id: "approval_1" })
+    mocks.issueLegacyReceipt.mockResolvedValue({
+      approval: { id: "approval_1", type: "apply_jobs", title: "Approval required", body: "Review the applications", impact: {} },
+      nonce: "nonce_1",
+    })
+    mocks.clientReceipt.mockImplementation((result: { approval: unknown; nonce: string }) => ({
+      ...(result.approval as object),
+      receiptNonce: result.nonce,
+    }))
+    mocks.ensureV2Turn.mockResolvedValue({ sessionId: "session_1", turnId: "turn_1", revision: 0 })
     mocks.taskCreate.mockResolvedValue({ id: 'task_1' })
     mocks.taskUpdate.mockResolvedValue({})
     mocks.createChatPlan.mockResolvedValue({ role: 'scout', goal: 'Find jobs', targetRoles: ['Engineer'], targetLocations: ['Berlin'] })
@@ -295,14 +315,19 @@ describe("agent chat API session recording", () => {
         speaker: "Orchestrator",
         title: "Automation draft",
         data: expect.objectContaining({
-          draft: expect.objectContaining({
-            name: "Berlin SWE automation",
-            triggerType: "daily",
-            targetRoles: ["SWE"],
-            targetLocations: ["Berlin"],
+          draft: {
+            autoApply: true,
+            cron: "0 9 * * *",
+            dailyCap: 8,
             minScore: 85,
+            name: "Berlin SWE automation",
             requireApproval: true,
-          }),
+            targetLocations: ["Berlin"],
+            targetRoles: ["SWE"],
+            timezone: "Europe/Berlin",
+            trigger: "Daily 09:00",
+            triggerType: "daily",
+          },
         }),
       }),
     }))
@@ -347,20 +372,17 @@ describe("agent chat API session recording", () => {
     expect(text).toContain("event: block")
     expect(text).toContain("\"type\":\"approval_request\"")
     expect(text).toContain("\"id\":\"approval_1\"")
-    expect(mocks.approvalCreate).toHaveBeenCalledWith({
-      data: expect.objectContaining({
+    expect(mocks.issueLegacyReceipt).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
         sessionId: "session_1",
         userId: "user_1",
-        type: "apply_jobs",
-        status: "pending",
+        action: "apply_jobs",
         title: "Approval required",
         impact: expect.objectContaining({
           applications: 2,
           coverLetters: 2,
           linkedinActions: false,
         }),
-      }),
-    })
+      }))
     expect(mocks.transcriptCreate).toHaveBeenCalledWith(expect.objectContaining({
       data: expect.objectContaining({
         sessionId: "session_1",

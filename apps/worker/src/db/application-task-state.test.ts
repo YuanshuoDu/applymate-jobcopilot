@@ -1,5 +1,12 @@
 import type { Pool } from "pg";
 import { describe, expect, it, vi } from "vitest";
+
+const approvalIssue = vi.hoisted(() => vi.fn());
+
+vi.mock("../runtime/approval/pg-store.js", () => ({
+  createPgApprovalStore: () => ({ issue: approvalIssue }),
+}));
+
 import {
   CAPTCHA_USER_TAKEOVER_MESSAGE,
   CHALLENGE_DETECTION_FAILED_MESSAGE,
@@ -28,14 +35,31 @@ describe("completeFillForReview", () => {
   it("creates the final authorization only after the fill state transition succeeds", async () => {
     const { pool, query } = testPool();
     query
-      .mockResolvedValueOnce({ rowCount: 1, rows: [{ sessionId: "session_1" }] })
+      .mockResolvedValueOnce({ rowCount: 1, rows: [{ sessionId: "session_1", resumeId: "resume_1", coverLetterId: null, confirmedAnswers: null }] })
+      .mockResolvedValueOnce({ rowCount: 1, rows: [{ id: "turn_1", revision: 3 }] })
       .mockResolvedValue({ rowCount: 1, rows: [] });
+    approvalIssue.mockResolvedValue({
+      approval: { id: "approval_1", scopeHash: "scope-hash" },
+      nonce: "nonce-never-persisted",
+    });
 
     await expect(completeFillForReview(pool, "task_1", "user_1", "job_1")).resolves.toBe(true);
 
     expect(query).toHaveBeenCalledTimes(5);
     expect(query.mock.calls[0]?.[0]).toContain("RETURNING \"sessionId\"");
-    expect(query.mock.calls[1]?.[0]).toContain("INSERT INTO agent_approvals");
+    expect(query.mock.calls[1]?.[0]).toContain("FROM agent_turns");
+    expect(approvalIssue).toHaveBeenCalledWith(expect.objectContaining({
+      approvalId: expect.stringMatching(/^approval_/),
+      taskId: "task_1",
+      scope: expect.objectContaining({
+        userId: "user_1",
+        sessionId: "session_1",
+        turnId: "turn_1",
+        jobId: "job_1",
+        action: "submit_application",
+        revision: 3,
+      }),
+    }));
   });
 });
 

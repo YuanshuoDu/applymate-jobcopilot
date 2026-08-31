@@ -20,6 +20,7 @@ import { AgentUnifiedStreamHeader } from './AgentUnifiedStreamHeader'
 import { sessionSubmissionPolicy } from './automation-policy'
 import type { TranscriptAction } from './TranscriptSpecialBlocks'
 import { streamAgentChat } from './agent-chat-stream'
+import { ensureActionReceipt } from './approval-receipt-client'
 import type { AgentTranscriptEvent } from './session-view-model'
 import type { AgentUnifiedStreamProps, ComposerJobsResponse } from './AgentUnifiedStream.types'
 
@@ -252,7 +253,8 @@ export function AgentUnifiedStream({
       toast.error(t('agent.sessionNotReady'), message)
       throw new Error(message)
     }
-    const { data, error } = await apiMutate<{ event?: AgentTranscriptEvent; events?: AgentTranscriptEvent[] }>(`/api/agent/sessions/${chatSessionId}/actions`, 'POST', action)
+    const authorizedAction = await ensureActionReceipt(chatSessionId, action)
+    const { data, error } = await apiMutate<{ event?: AgentTranscriptEvent; events?: AgentTranscriptEvent[] }>(`/api/agent/sessions/${chatSessionId}/actions`, 'POST', authorizedAction)
     if (error) throw new Error(error)
     const eventType = data?.event?.type
     if (action.type === 'create_automation' || eventType === 'automation_created' || eventType === 'automation_updated') {

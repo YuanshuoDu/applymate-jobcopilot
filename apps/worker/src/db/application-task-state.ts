@@ -1,5 +1,7 @@
 import type { Pool } from "pg";
 import type { FormReviewNeeds } from "../harness/form-review.js";
+import { hashAgentReceiptValue, redactSensitiveText } from "@jobcopilot/shared";
+import { createPgApprovalStore } from "../runtime/approval/pg-store.js";
 
 type TerminalStatus = "submitted" | "failed" | "waiting_for_user" | "waiting_for_authorization";
 
@@ -58,7 +60,7 @@ export async function finishApplicationTask(
   await pool.query(
     `INSERT INTO application_task_events (id, "taskId", type, actor, body, "createdAt")
      VALUES ('evt_' || md5(random()::text || clock_timestamp()::text), $1, $2, 'worker', $3, NOW())`,
-    [taskId, status, error ?? checkpoint],
+    [taskId, status, redactSensitiveText(error ?? checkpoint)],
   );
   if (sessionId) await refreshSessionStatus(pool, sessionId);
 }
@@ -101,11 +103,11 @@ export async function completeFillForReview(
   userId: string,
   jobId: string,
 ): Promise<boolean> {
-  const transitioned = await pool.query<{ sessionId: string | null }>(
+  const transitioned = await pool.query<{ sessionId: string | null; resumeId: string | null; coverLetterId: string | null; confirmedAnswers: unknown }>(
     `UPDATE application_tasks
        SET status = 'waiting_for_authorization', "checkpoint" = 'form_filled', error = NULL, "updatedAt" = NOW()
      WHERE id = $1 AND "userId" = $2 AND "jobId" = $3 AND status = 'filling'
-     RETURNING "sessionId"`,
+       RETURNING "sessionId", "resumeId", "coverLetterId", "confirmedAnswers"`,
     [taskId, userId, jobId],
   );
   if (transitioned.rowCount !== 1) return false;
@@ -114,18 +116,32 @@ export async function completeFillForReview(
   const approvalId = `approval_${randomId()}`;
   const title = "Final submission authorization";
   const body = "The form was filled without submission. Review the current job, material alignment, required answers, and any sensitive declarations before authorizing this external submission.";
-  const payload = { applicationTaskId: taskId, jobId };
-  await pool.query(
-    `INSERT INTO agent_approvals (id, "sessionId", "taskId", "userId", type, status, title, body, impact, payload, "createdAt")
-     VALUES ($1, $2, NULL, $3, 'submit_application', 'pending', $4, $5,
-             jsonb_build_object('externalSubmission', true, 'jobId', $6), $7::jsonb, NOW())`,
-    [approvalId, sessionId, userId, title, body, jobId, JSON.stringify(payload)],
+  const payload = { applicationTaskId: taskId, jobId, resumeId: transitioned.rows[0]?.resumeId ?? null, coverLetterId: transitioned.rows[0]?.coverLetterId ?? null };
+  const turn = await pool.query<{ id: string; revision: number }>(
+    `SELECT "id", "revision" FROM agent_turns WHERE "sessionId" = $1 AND "userId" = $2 ORDER BY "createdAt" DESC LIMIT 1`,
+    [sessionId, userId],
   );
+  const turnRow = turn.rows[0];
+  if (!turnRow) throw new Error("Filled application is missing its Agent turn");
+  const receipt = await createPgApprovalStore(pool, { userId }).issue({
+    approvalId,
+    taskId,
+    scope: {
+      userId, sessionId, turnId: turnRow.id, jobId, toolCallId: `application-submit:${taskId}`,
+      action: "submit_application",
+      resourceHash: await hashAgentReceiptValue("resource", { jobId }),
+      materialHash: await hashAgentReceiptValue("material", payload),
+      answersHash: await hashAgentReceiptValue("answers", transitioned.rows[0]?.confirmedAnswers ?? null),
+      revision: turnRow.revision,
+      expiresAt: new Date(Date.now() + 15 * 60 * 1000),
+    },
+    title, body, impact: { externalSubmission: true, jobId }, payload,
+  });
   await pool.query(
     `INSERT INTO agent_transcript_events (id, "sessionId", "taskId", type, speaker, title, body, data, "createdAt")
      VALUES ($1, $2, NULL, 'approval_request', 'Executor', $3, $4,
-             jsonb_build_object('approval', jsonb_build_object('id', $5, 'type', 'submit_application', 'title', $3, 'body', $4, 'impact', jsonb_build_object('externalSubmission', true, 'jobId', $6), 'payload', $7::jsonb, 'status', 'pending')), NOW())`,
-    [`evt_${randomId()}`, sessionId, title, body, approvalId, jobId, JSON.stringify(payload)],
+             jsonb_build_object('approval', jsonb_build_object('id', $5, 'type', 'submit_application', 'title', $3, 'body', $4, 'impact', jsonb_build_object('externalSubmission', true, 'jobId', $6), 'payload', $7::jsonb, 'scopeHash', $8, 'status', 'pending')), NOW())`,
+    [`evt_${randomId()}`, sessionId, title, body, approvalId, jobId, JSON.stringify(payload), receipt.approval.scopeHash],
   );
   await pool.query(
     `INSERT INTO application_task_events (id, "taskId", type, actor, body, "createdAt")
@@ -152,16 +168,16 @@ export async function pauseForFormInput(
        SET status = 'waiting_for_user', "checkpoint" = 'form_answer_required', error = $2,
            question = jsonb_build_object('detail', $2, 'missing', $3::jsonb, 'sensitive', $4::jsonb), "updatedAt" = NOW()
      WHERE id = $1`,
-    [taskId, detail, JSON.stringify(needs.missing), JSON.stringify(needs.sensitive)],
+    [taskId, redactSensitiveText(detail), JSON.stringify(needs.missing), JSON.stringify(needs.sensitive)],
   );
   await pool.query(
     `INSERT INTO application_task_events (id, "taskId", type, actor, body, "createdAt") VALUES ($1, $2, 'form_answer_required', 'worker', $3, NOW())`,
-    [`evt_${randomId()}`, taskId, detail],
+    [`evt_${randomId()}`, taskId, redactSensitiveText(detail)],
   );
   if (sessionId) {
     await pool.query(
       `INSERT INTO agent_transcript_events (id, "sessionId", "taskId", type, speaker, title, body, "createdAt") VALUES ($1, $2, NULL, 'subagent_result', 'Executor', 'Information required', $3, NOW())`,
-      [`evt_${randomId()}`, sessionId, detail],
+      [`evt_${randomId()}`, sessionId, redactSensitiveText(detail)],
     );
     await pool.query(`UPDATE agent_sessions SET status = 'waiting_for_user', "completedAt" = NULL, "updatedAt" = NOW() WHERE id = $1`, [sessionId]);
   }
