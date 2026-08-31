@@ -1,6 +1,6 @@
 # ApplyMate Agent Harness 2.0 详细开发路线图
 
-> **状态：** Phase 0 complete — Phase 1 (AH2-004..008) as #344..#348; AH2-004 done (#349), AH2-005 done (#350), AH2-006 in progress
+> **状态：** Phase 0 complete — Phase 1 (AH2-004..008) as #344..#348; AH2-004/005/006 done (#349/#350/#351), AH2-007 in progress
 > **日期：** 2026-08-30
 > **上游设计：** [Agent Harness 2.0 Technical Design](./agent-harness-v2-technical-design.md)
 > **适用代码：** `packages/agent-protocol`、`packages/agent-model`、`apps/web`、`apps/worker`
@@ -1153,7 +1153,7 @@ draft
 | AH2-003 | ADR/flags/baseline | #335,#336 | [#337](https://github.com/YuanshuoDu/applymate-jobcopilot/issues/337) | [#343](https://github.com/YuanshuoDu/applymate-jobcopilot/pull/343) | done |
 | AH2-004 | agent-protocol package | #337 | [#344](https://github.com/YuanshuoDu/applymate-jobcopilot/issues/344) | [#349](https://github.com/YuanshuoDu/applymate-jobcopilot/pull/349) | done |
 | AH2-005 | Turn/Step/Input schema | #344 | [#345](https://github.com/YuanshuoDu/applymate-jobcopilot/issues/345) | [#350](https://github.com/YuanshuoDu/applymate-jobcopilot/pull/350) | done |
-| AH2-006 | Item/Event/Outbox/sequence | #344,#345 | [#346](https://github.com/YuanshuoDu/applymate-jobcopilot/issues/346) | TBD | spec-ready |
+| AH2-006 | Item/Event/Outbox/sequence | #344,#345 | [#346](https://github.com/YuanshuoDu/applymate-jobcopilot/issues/346) | [#351](https://github.com/YuanshuoDu/applymate-jobcopilot/pull/351) | done |
 | AH2-007 | Web/Worker stores | #345,#346 | [#347](https://github.com/YuanshuoDu/applymate-jobcopilot/issues/347) | TBD | spec-ready |
 | AH2-008 | legacy dual-write/projector | #347 | [#348](https://github.com/YuanshuoDu/applymate-jobcopilot/issues/348) | TBD | spec-ready |
 | AH2-009 | command service | 007 | TBD | TBD | pending |
