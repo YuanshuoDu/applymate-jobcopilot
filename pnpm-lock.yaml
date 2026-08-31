@@ -260,6 +260,9 @@ importers:
       '@jobcopilot/shared':
         specifier: workspace:*
         version: link:../../packages/shared
+      '@sinclair/typebox':
+        specifier: ^0.34.52
+        version: 0.34.52
       '@types/express':
         specifier: ^5.0.6
         version: 5.0.6

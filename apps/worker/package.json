@@ -20,6 +20,7 @@
     "@jobcopilot/agent-model": "workspace:*",
     "@jobcopilot/agent-protocol": "workspace:*",
     "@jobcopilot/shared": "workspace:*",
+    "@sinclair/typebox": "^0.34.52",
     "@types/express": "^5.0.6",
     "bullmq": "^5.52.2",
     "cloakbrowser": "^0.3.30",
