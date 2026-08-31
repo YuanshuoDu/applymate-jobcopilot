@@ -3,6 +3,13 @@ import type { FormReviewNeeds } from "../harness/form-review.js";
 
 type TerminalStatus = "submitted" | "failed" | "waiting_for_user" | "waiting_for_authorization";
 
+/** Stable checkpoint shared by CAPTCHA, login-wall, and MFA user handoffs. */
+export const USER_TAKEOVER_CHECKPOINT = "user_takeover" as const;
+export const CAPTCHA_USER_TAKEOVER_MESSAGE =
+  "CAPTCHA detected. User takeover is required; no bypass was attempted.";
+export const CHALLENGE_DETECTION_FAILED_MESSAGE =
+  "Challenge detection failed. User takeover is required; no bypass was attempted.";
+
 /** Worker-side account guard.  A state lookup failure must not open a browser. */
 export async function isUserActive(pool: Pool, userId: string): Promise<boolean> {
   try {

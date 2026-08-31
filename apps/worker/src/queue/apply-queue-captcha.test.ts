@@ -12,7 +12,6 @@ const mocks = vi.hoisted(() => ({
   query: vi.fn().mockResolvedValue({ rowCount: 1 }),
   loadTaskContext: vi.fn(),
   detectCaptcha: vi.fn(),
-  solveCaptcha: vi.fn(),
   detectFlow: vi.fn(),
   runGreenhouseFlow: vi.fn(),
   runSmartRecruitersFlow: vi.fn(),
@@ -24,6 +23,7 @@ const mocks = vi.hoisted(() => ({
   applicationTaskStillActive: vi.fn().mockResolvedValue(true),
   createNotification: vi.fn().mockResolvedValue(undefined),
   notifyApplyResult: vi.fn().mockResolvedValue(undefined),
+  agentRun: vi.fn(),
   runtimeFeatureEnabled: vi.fn().mockResolvedValue(true),
   loadAtsPolicy: vi.fn(),
   canUseAtsSource: vi.fn().mockReturnValue(true),
@@ -47,7 +47,6 @@ vi.mock("../cloak/pool.js", () => ({
 }));
 vi.mock("../cloak/captcha.js", () => ({
   detectCaptcha: mocks.detectCaptcha,
-  solveCaptcha: mocks.solveCaptcha,
 }));
 vi.mock("../db/apply-results.js", () => ({
   insertApplyResult: mocks.insertApplyResult,
@@ -66,7 +65,7 @@ vi.mock("../db/load-task-context.js", () => ({
 }));
 vi.mock("../harness/agent-harness.js", () => ({
   AgentHarness: vi.fn().mockImplementation(() => ({
-    run: vi.fn().mockResolvedValue({ status: "submitted", durationMs: 1 }),
+    run: mocks.agentRun,
   })),
 }));
 vi.mock("../flows/index.js", () => ({ detectFlow: mocks.detectFlow }));
@@ -95,6 +94,9 @@ vi.mock("../admin/ats-policy.js", () => ({
   canUseAtsSource: mocks.canUseAtsSource,
 }));
 vi.mock("../db/application-task-state.js", () => ({
+  CAPTCHA_USER_TAKEOVER_MESSAGE: "CAPTCHA detected. User takeover is required; no bypass was attempted.",
+  CHALLENGE_DETECTION_FAILED_MESSAGE: "Challenge detection failed. User takeover is required; no bypass was attempted.",
+  USER_TAKEOVER_CHECKPOINT: "user_takeover",
   claimApplicationTask: mocks.claimApplicationTask,
   completeFillForReview: mocks.completeFillForReview,
   finishApplicationTask: mocks.finishApplicationTask,
@@ -136,13 +138,13 @@ describe("apply-queue CAPTCHA handling", () => {
       resumeTempPath: null,
     });
     mocks.detectCaptcha.mockResolvedValue(false);
-    mocks.solveCaptcha.mockResolvedValue(false);
     mocks.detectFlow.mockReturnValue(null);
     mocks.runtimeFeatureEnabled.mockResolvedValue(true);
     mocks.loadAtsPolicy.mockResolvedValue({ configured: true, version: 1, allowAutoApply: true });
     mocks.canUseAtsSource.mockReturnValue(true);
     mocks.runGreenhouseFlow.mockResolvedValue({ status: "submitted", durationMs: 1 });
     mocks.runSmartRecruitersFlow.mockResolvedValue({ status: "submitted", durationMs: 1 });
+    mocks.agentRun.mockResolvedValue({ status: "submitted", durationMs: 1 });
     await import("./apply-queue.js");
   });
 
@@ -151,7 +153,6 @@ describe("apply-queue CAPTCHA handling", () => {
 
     await expect(mocks.workerHandler?.({ data: payload })).resolves.toBeUndefined();
 
-    expect(mocks.solveCaptcha).not.toHaveBeenCalled();
     expect(mocks.insertApplyResult).toHaveBeenCalledWith(
       expect.objectContaining({
         userId: "user-1",
@@ -193,6 +194,43 @@ describe("apply-queue CAPTCHA handling", () => {
     expect(mocks.query).toHaveBeenLastCalledWith(
       expect.stringContaining('"workflowState" = $2'),
       ["applied", "submitted", "job-1", "user-1"]
+    );
+  });
+
+  it("fails closed when challenge detection is unavailable", async () => {
+    mocks.detectCaptcha.mockRejectedValueOnce(new Error("page evaluation failed"));
+
+    await expect(mocks.workerHandler?.({ data: payload })).resolves.toBeUndefined();
+
+    expect(mocks.runGreenhouseFlow).not.toHaveBeenCalled();
+    expect(mocks.insertApplyResult).toHaveBeenCalledWith(expect.objectContaining({
+      status: "manual",
+      error: "Challenge detection failed. User takeover is required; no bypass was attempted.",
+    }));
+    expect(mocks.finishApplicationTask).toHaveBeenCalledWith(
+      expect.anything(), "application-task-1", "waiting_for_user", "user_takeover",
+      "Challenge detection failed. User takeover is required; no bypass was attempted.",
+    );
+  });
+
+  it("stops before submit when a challenge appears during the browser pass", async () => {
+    mocks.detectCaptcha.mockResolvedValueOnce(false).mockResolvedValueOnce(true);
+    mocks.agentRun.mockImplementationOnce(async (_page: unknown, task: { beforeSubmit?: () => Promise<boolean> }) => {
+      const allowed = await task.beforeSubmit?.();
+      return allowed
+        ? { status: "submitted", durationMs: 1 }
+        : { status: "submission_blocked", durationMs: 1, error: "Submission blocked: runtime authorization guard denied the submit." };
+    });
+
+    await expect(mocks.workerHandler?.({ data: payload })).resolves.toBeUndefined();
+
+    expect(mocks.insertApplyResult).toHaveBeenCalledWith(expect.objectContaining({
+      status: "manual",
+      error: "CAPTCHA detected. User takeover is required; no bypass was attempted.",
+    }));
+    expect(mocks.finishApplicationTask).toHaveBeenCalledWith(
+      expect.anything(), "application-task-1", "waiting_for_user", "user_takeover",
+      "CAPTCHA detected. User takeover is required; no bypass was attempted.",
     );
   });
 

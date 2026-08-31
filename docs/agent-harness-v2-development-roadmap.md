@@ -489,7 +489,7 @@ draft
 - **类型 / 优先级 / Size：** `fix/docs` / P0 / M
 - **依赖：** AH2-001
 - **主要文件：** Worker queue/flow 配置、`docs/scraping-autoapply-design.md`、`docs/runbook.md`、相关旧 auto-apply 文档（当前审计范围：`docs/auto-apply-deployment.md`、`docs/scraping-autoapply-dev-guide.md`、`docs/scraping-autoapply-roadmap.md`、`docs/superpowers/specs/2026-05-21-auto-apply-architecture-design.md`）与相关测试。
-  - *修正记录（2026-08-31，规则 17–19）：仓库审计发现上述旧文档仍包含 CapSolver/solver 或自动挑战绕过指导；仅列 design/runbook 无法满足“旧文档没有绕过指导”的完成标准，故补充最小文档审计范围。此修正只扩大文档同步与代码搜索证据，不改变运行时安全边界；Issue #336 需由 Claude 重新确认范围后继续。*
+  - *修正记录（2026-08-31，规则 17–19）：仓库审计发现上述旧文档仍包含 CapSolver/solver 或自动挑战绕过指导；仅列 design/runbook 无法满足“旧文档没有绕过指导”的完成标准，故补充最小文档审计范围。此修正只扩大文档同步与代码搜索证据，不改变运行时安全边界；Claude 已在 #336 中重新确认范围，Codex 按修正后的 Issue 继续。*
 - **开发目标：** 建立现有外部动作的单一安全清单，并把所有 CAPTCHA/login/MFA 行为收敛为用户接管。
 - **实施步骤：** 1) 盘点 application/Gmail/resume/automation mutation；2) 为每项记录 risk、approval、idempotency、retry、owner；3) 删除或硬禁用 solver executor/config；4) 统一 waiting reason/error code；5) 同步设计、runbook 和监控说明。
 - **完成标准：** matrix 覆盖全部入口；代码搜索不存在可达 solver；CAPTCHA 后不提交、不自动重试；登录/MFA 具有相同暂停语义；旧文档没有绕过指导。

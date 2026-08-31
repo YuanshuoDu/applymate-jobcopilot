@@ -17,7 +17,7 @@ Two pain points dominate the product economics:
 
 The competitor study (`ApplyPilot` open-source repo, 1k+ stars) confirmed the technical primitives that work: **direct ATS JSON APIs**, **3-tier enrichment cascade**, and a **headless browser agent** that submits applications without supervision.
 
-A subsequent discovery — [`CloakBrowser`](https://github.com/CloakHQ/CloakBrowser) (17.9k stars, MIT) — fills the remaining gap: a source-patched Chromium binary that passes every bot-detection test we have to clear (Cloudflare Turnstile, FingerprintJS, reCAPTCHA v3 ≥ 0.9). It is a drop-in Playwright replacement, so adopting it costs one import line.
+A subsequent discovery — [`CloakBrowser`](https://github.com/CloakHQ/CloakBrowser) — provides a Playwright-compatible browser runtime with per-user profile support. It may improve compatibility, but it does not guarantee access to a protected site and it is never used to bypass a CAPTCHA, login wall, MFA, or other platform control.
 
 This document is the plan to build on those primitives.
 
@@ -31,7 +31,7 @@ This document is the plan to build on those primitives.
 - **Reach 200+ EU employer coverage** via Workday / Greenhouse / Lever / SmartRecruiters / Personio registries.
 - **Ship a server-side worker** that can submit applications without the user's browser being open.
 - **Achieve ≥ 80% auto-submission success on standardized ATS** (Workday, Greenhouse, Lever) via pre-programmed flows.
-- **Survive Cloudflare/Turnstile/reCAPTCHA-v3** on European job sites by routing all browser automation through CloakBrowser.
+- **Handle browser challenges safely:** detect Cloudflare/Turnstile/reCAPTCHA and pause for user takeover; routing through CloakBrowser must never be treated as a challenge bypass.
 - **Stay within ToS** for every source we use — default to public APIs; treat HTML scraping as a last resort with strict rate limits.
 
 ### Non-Goals (deliberately out of scope)
@@ -89,7 +89,7 @@ This document is the plan to build on those primitives.
 | Stock Playwright + `playwright-stealth` | ❌ | JS-injection-based; detected by FingerprintJS and Cloudflare Turnstile. Breaks on every Chrome update. |
 | Stock Puppeteer + `puppeteer-extra-plugin-stealth` | ❌ | Same class of issue. |
 | Browserless / ScrapingBee (managed) | ⚠️ | Works but $$$ at scale; opaque; can't persist per-user state easily. |
-| **CloakBrowser** | ✅ | C++ source-patched Chromium. MIT license. Drop-in Playwright API. Passes Cloudflare Turnstile, reCAPTCHA v3 0.9, BrowserScan. Supports per-profile fingerprints + proxies. |
+| **CloakBrowser** | ✅ | Playwright-compatible browser runtime with per-user profiles and proxy configuration. It may improve compatibility, but challenge detection remains authoritative and detection-only. |
 | Anthropic Computer Use directly | ⚠️ | Powerful but slow (~30s/turn) and expensive. Reserved as fallback only. |
 
 **Decision:** all server-side browser automation runs on CloakBrowser. AI fallback for unknown forms uses Anthropic Computer Use **inside** a CloakBrowser session.
@@ -185,10 +185,12 @@ Modes A and B are already in the codebase. **This initiative focuses on Mode C.*
    ├─ Cached pattern → replay field mapping from form_patterns table
    └─ Unknown    → AI driver (Computer Use inside CloakBrowser)
 6. Fill fields from persona; upload tailored resume + cover letter
-7. CAPTCHA check: CloakBrowser prevents most; if one appears → escalate
-   ├─ CapSolver API (if key present)
-   └─ Fall back to "manual" status, notify user via push
-8. Submit (or dry-run if flag set)
+7. Challenge check before any flow and before any submit
+   ├─ CAPTCHA detected → `manual`, checkpoint `user_takeover`, notify user
+   ├─ Login/MFA detected by the harness → the same `waiting_for_user` boundary
+   ├─ Challenge detection errors → `manual`, checkpoint `user_takeover`
+   └─ No challenge signal → continue without attempting to bypass platform controls
+8. Submit only when the existing runtime authorization guard allows it (or dry-run)
 9. Verify submission (URL change, success element, confirmation email check)
 10. Persist storage_state (preserves cookies for next time)
 11. Write outcome to apply_results table
@@ -273,7 +275,7 @@ CREATE TABLE apply_results (
   mode            TEXT NOT NULL,                   -- 'assisted' | 'semi' | 'unattended'
   ats_type        TEXT,
   flow_used       TEXT,                            -- 'workday' | 'ai-fallback' | 'pattern-cache'
-  status          TEXT NOT NULL,                   -- 'submitted' | 'manual' | 'failed' | 'dry-run'
+  status          TEXT NOT NULL,                   -- 'submitted' | 'manual' | 'failed' | 'submission_blocked' | 'dry-run'
   verification    JSONB,                           -- screenshots, URL trail, confirmation email
   duration_ms     INT,
   error           TEXT,
@@ -287,6 +289,42 @@ Existing tables (`jobs`, `users`, `persona`, `resume`) remain unchanged except f
 
 ## 8. Compliance & Safety
 
+### External-action safety matrix
+
+This matrix is the Phase 0 inventory for every action that can affect a third-party system, upload candidate data, schedule future work, or record a claim that an external action occurred. A read-only provider call is included where it shares credentials or can trigger a provider-side state change.
+
+| Action and entry point | External target / effect | Risk | Approval boundary | Idempotency key or guard | Retry policy | Owner and enforcement |
+|---|---|---|---|---|---|---|
+| Resume ingestion: `POST /api/resume/intake`, `POST /api/resume` | ApplyMate storage and model provider; the intake route parses the candidate file/text and does not publish it to an employer | High privacy, no employer-side effect | User-initiated upload; AI parsing is not submission consent | Authenticated `userId`; resume/job ownership checks | Safe user retry after an extraction/provider error; rate limited; never retries an external submission | Web resume routes and `ModelRouter`; no Worker submit path is implied |
+| Manual application record: `POST /api/jobs/[id]/apply` | Records that the candidate already applied outside ApplyMate | Medium data-integrity risk; does not send to the employer | Candidate explicitly reports a completed manual application | Job is scoped to the authenticated `userId`; one job row is updated | No automatic replay; a duplicate request is a state write, not a new employer submission | Web route; database ownership check |
+| Extension-assisted fill: `apps/extension/src/content/form-injector.ts`, `apps/extension/src/lib/form-filler/auto-fill.ts` | ATS form DOM and optional ATS-hosted file upload; the candidate remains on the employer page | High privacy; no unattended submit | Candidate clicks the extension action and reviews the result; candidate submits manually | Extension has no final-submit authority; the browser page remains user-controlled | No background retry; candidate can rescan or refill deliberately | Chrome Extension; no Worker submission path |
+| Fill-only application pass: `/api/agent/application-tasks`, `/api/agent/sessions/[id]/actions` `review_application`, admin review action → `queueApplicationFill` → `apply-tasks(operation=fill)` | ATS form DOM and ATS-hosted file upload; no final submit | High privacy; candidate material reaches the ATS form | Review approval permits form filling only; `allowSubmit=false` and no submit authorization | `applicationTaskId` state transition plus authenticated user/job ownership | No automatic replay once a browser attempt starts; user can request a new review pass | Web queue client + Worker flows/Harness; fill-only tests |
+| Legacy auto-apply request: `POST /api/jobs/[id]/auto-apply` | No external effect; the endpoint rejects direct job-page auto-apply requests | Low external risk; important fail-closed boundary | Agent-session review and approval are required instead | Job ownership check followed by an unconditional conflict response | No retry; it must not enqueue a submit task | Web route; explicit 409 guard |
+| Unattended application submit: `/api/agent/application-tasks` approval creation, `/api/agent/sessions/[id]/actions` approved `submit_application` → `queueAutonomousApplication` → `apply-tasks(operation=submit)` | ATS final submit and employer application record | Critical, irreversible external action | Explicit per-job approval; global settings never substitute for it | Approval payload binds `approvalId`, task, user and job; `claimUnattendedSubmission`; `assertSubmissionAuthorized` at every submit call site | No automatic retry after browser start, uncertain result, CAPTCHA, login, MFA, or challenge-detection failure; only deliberate human/admin review | Web control plane + Worker queue/flows/pattern/Harness; fail-closed gate from AH2-001 |
+| Gmail OAuth connect: `/api/gmail/oauth/start` → `/api/gmail/oauth/callback` | Google OAuth grants and ApplyMate credential storage | High credential/privacy risk | User completes Google consent; signed state, nonce, session and auth-version checks | OAuth state is browser-bound and user-bound; provider account identity is checked before upsert | User must restart/re-authorize; no background replay of a consent exchange | Web Gmail OAuth routes; encrypted account tokens |
+| Gmail read/sync: `/api/gmail/tracking?refresh=1`, `syncGmailForUser`, Agent audit stage | Reads job-related messages and writes normalized tracking/recommendation records; does not send or modify Gmail | High privacy, no send effect | Prior Gmail read consent; user-scoped connection | Gmail message/thread IDs and sync state prevent duplicate imports; every DB query is user-scoped | Provider-transient retry only; never converts a read failure into a send or apply action | Web Gmail tracking/sync service |
+| Gmail draft generation: `POST /api/gmail/ai-reply` | Model provider generates text; ApplyMate records a local activity; it does not send Gmail | Medium privacy/content risk | User requests a draft; sending is a separate action | `jobId` ownership check; no send side effect | Safe to regenerate; no Gmail send retry | Web route + ModelRouter |
+| Gmail send: `POST /api/gmail/send-draft` → `users/me/messages/send` | Sends an email to an employer from the user’s Gmail | Critical external communication | Separate user confirmation in the follow-up UI; AH2-019 may add a durable receipt later | Gmail API has no request idempotency key in this route; do not retry an ambiguous response | No automatic retry and no client retry without fresh user confirmation | Web route; provider usage ledger; send is never called by the Worker apply loop |
+| ApplyMate notification email: Worker `notifyApplyResult`, `POST /api/contact`, `POST /api/notifications/daily`, password-reset and broadcast delivery services | Sends status, support, or account email through Resend; cannot submit an application or change ATS state | Medium communication risk | Product notification preference, account workflow, or support request | Notification is non-blocking and must not be used as an action authorization | Best effort; provider failure is logged and never triggers ATS replay | Worker/Web notification services |
+| Automation create/update/delete/run: `/api/agent/automations`, `/api/agent/automations/[id]`, `/api/agent/automations/[id]/run`, session `create_automation`, signed `/api/agent/automations/due` | Mutates scheduled automation state and may schedule future discovery/apply work | High future-action risk | Authenticated user action; autonomous execution still passes the per-job approval boundary | `(automationId,userId)` ownership; atomic due-run claim; canonical automation session/execution | Scheduler may revisit an unclaimed due run; never duplicate an accepted execution; mutation errors require a new request | Web automation routes + Worker scheduler; signed cron secret for due runs |
+| Admin queue control: `/api/admin/v1/queues/[queue]/retry` and pause/resume routes | Replays, pauses, or resumes Worker jobs | High operational risk; can cause duplicate external activity | Admin authentication and deliberate operator action | Queue/job IDs; inspect task/result state before retry | Never bulk-retry CAPTCHA, login, MFA, or ambiguous browser failures | Admin control plane + runbook |
+
+The matrix deliberately distinguishes “form fill/upload” from “final submit”. Uploading a resume to an ATS is still a privacy-sensitive external write, but it is not permission to submit. Every challenge boundary uses the same persisted checkpoint, `user_takeover`, and the Worker returns normally so BullMQ does not schedule an automatic retry.
+
+### Negative-fixture evidence
+
+The matrix is backed by these existing and AH2-002 regression fixtures:
+
+| Action class | Negative fixture | Required assertion |
+|---|---|---|
+| ATS submit / browser fallback | `apps/worker/src/queue/apply-queue-captcha.test.ts`, `apps/worker/src/queue/apply-queue-pipeline.test.ts`, and the five `*-flow.test.ts` files | Challenge, missing authorization, or revoked authorization produces no click/submit; task remains reviewable and is not replayed |
+| ATS resume or cover-letter upload | `apps/worker/src/harness/agent-harness.test.ts` and fill-only cases in `apps/worker/src/queue/apply-queue-pipeline.test.ts` | Upload path is constrained to the task material; fill-only work has no submit authorization and submit-like clicks do not execute |
+| Gmail send | `apps/web/src/app/api/gmail/send-draft/route.test.ts` | Provider rejection returns a stable error and does not write the “email sent” activity |
+| Resume ingestion | `apps/web/src/app/api/resume/intake/route.test.ts` | Disabled or exhausted AI access rejects the intake before parsing/persistence |
+| Automation mutation and dispatch | `apps/web/src/app/api/agent/automations/route.test.ts` and `apps/worker/src/queue/automation-scheduler.test.ts` | Same-name automation is updated rather than duplicated; protected scheduler failures remain observable without leaking provider details |
+
+The extension-assisted path is intentionally user-driven: it can fill fields but has no unattended submit capability. Its final employer-page submit is therefore outside the Worker replay boundary.
+
 ### Mandatory rules (enforced in code, not just docs)
 
 1. **Rate limits per ATS host:** hard-coded ceiling, regardless of user count.
@@ -294,14 +332,16 @@ Existing tables (`jobs`, `users`, `persona`, `resume`) remain unchanged except f
    - Workday CXS: 1 RPS per tenant, 5 RPS aggregate.
    - HTML scrape sources: 1 RPS per host with random 5–15s jitter between page fetches.
 2. **Per-user submit ceiling:** 30 unattended apply submissions per user per hour, 100 per day. Configurable per plan but never bypassable.
-3. **Per-domain submit ceiling:** at most 5 applications per user per company per week. Stops accidental spam.
-4. **No credential creation:** the worker never registers a new account on a candidate's behalf. If a flow requires login and no session cookie exists, the task is flagged "needs_user_action" and surfaces in the UI.
-5. **robots.txt respected** for every HTML-scrape source. Blocked paths are skipped.
-6. **No LinkedIn / Indeed auto-submit.** They are kept as discovery sources (via official APIs only); the apply queue refuses to dispatch tasks whose `apply_url` matches their domains.
+3. **Challenge handling is detection-only:** CAPTCHA, login walls, MFA, verification-code prompts, and challenge-detector errors become `manual` / `waiting_for_user` with checkpoint `user_takeover`.
+4. **No challenge bypass or retry:** no solver, token injection, automatic challenge completion, or automatic retry may be configured or called. An operator must inspect the task before any deliberate retry.
+5. **Per-domain submit ceiling:** at most 5 applications per user per company per week. Stops accidental spam.
+6. **No credential creation:** the worker never registers a new account on a candidate's behalf. If a flow requires login and no session cookie exists, the task uses `waiting_for_user` with checkpoint `user_takeover` and surfaces in the UI.
+7. **robots.txt respected** for every HTML-scrape source. Blocked paths are skipped.
+8. **No LinkedIn / Indeed auto-submit.** They are kept as discovery sources (via official APIs only); the apply queue refuses to dispatch tasks whose `apply_url` matches their domains.
 
 ### Sensitive data
 
-- Resumes and persona answers never leave our backend. CloakBrowser runs on infrastructure we control.
+- Resumes and persona answers leave our backend only through an explicitly approved ATS form/upload or the configured model provider. CloakBrowser runs on infrastructure we control.
 - Per-user CloakBrowser profile dirs are encrypted at rest.
 - Form-pattern cache stores only field mappings — no candidate data.
 

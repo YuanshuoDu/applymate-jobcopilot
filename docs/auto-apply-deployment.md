@@ -71,7 +71,6 @@ Set the following Worker secrets in Fly.io (or the chosen long-running host):
 | `WORKER_CONTROL_SECRET` | Exact same HMAC value as the Web app; required for every non-loopback listener |
 | `AGENT_SCHEDULER_INTERVAL_MS` | Optional due-check interval; defaults to `300000` (five minutes) |
 | `CLOAK_MAX_WORKERS` | Start at `1` to respect ATS rate limits |
-| `CAPSOLVER_API_KEY` | Optional CAPTCHA solver |
 
 When the Vercel variables are marked hidden, `vercel env pull` cannot return
 their plaintext values. Run the checked-in synchronizer from the repository

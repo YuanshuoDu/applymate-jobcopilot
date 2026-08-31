@@ -180,17 +180,23 @@ const decision = await modelChat(messages, aiConfig, 2048)
 
 ## 6. CAPTCHA Strategy
 
-CloakBrowser prevents most CAPTCHAs from appearing (reCAPTCHA v3 score 0.9, Turnstile auto-pass). For the remainder:
+This historical design is superseded by the Phase 0 detection-only boundary.
+CloakBrowser is only a browser runtime; it does not guarantee access to a
+protected page and must not be used to bypass a platform challenge.
 
 ```
-CAPTCHA detected?
+Challenge or protected-page signal detected?
   │
-  ├─ Cloudflare Turnstile → CloakBrowser handles automatically
-  ├─ reCAPTCHA v3 (score-based) → CloakBrowser score ≥ 0.7 → passes
-  ├─ reCAPTCHA v2 (checkbox) → CapSolver API (if key present) → ~$0.001/solve
-  └─ Phone verification / unsolvable → agent returns type: 'manual'
-                                       → user gets push notification
-                                       → task saved, user can complete manually
+  ├─ CAPTCHA / Turnstile / reCAPTCHA / hCaptcha → manual takeover
+  ├─ Login wall / MFA / verification code        → manual takeover
+  ├─ Challenge detector error                    → manual takeover
+  └─ No signal                                  → continue normal fill flow
+
+Every takeover result:
+  status = 'manual'
+  task status = 'waiting_for_user'
+  checkpoint = 'user_takeover'
+  no submit, no token injection, no automatic retry
 ```
 
 ---
@@ -263,7 +269,7 @@ The auto-apply system is "shipped" when:
 
 - [ ] User toggles "Auto-Apply" in Settings → system starts processing queued jobs
 - [ ] AgentHarness successfully submits a real application on Greenhouse (dry-run verified first)
-- [ ] CloakBrowser passes all 8 target sites in PoC (#31)
+- [ ] CloakBrowser navigation is compatible with all 8 target sites in PoC (#31), or records a manual takeover when a challenge appears; no challenge bypass is required
 - [ ] MiniMax M2.7 (platform default) can fill a standard Greenhouse form in ≤ 15 turns
 - [ ] Per-application LLM cost ≤ $0.005 for MiniMax (Free tier)
 - [ ] CAPTCHA encounter rate < 5% across all apply attempts

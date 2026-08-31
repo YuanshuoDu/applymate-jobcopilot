@@ -167,7 +167,7 @@ The worker logs the full flow to stdout; screenshots dump to `apps/worker/.tmp/<
 # One-off, doesn't require the worker harness
 pnpm --filter worker exec tsx scripts/cloak-smoke.ts \
   --url https://www.stepstone.de/jobs/software-engineer/in-berlin
-# → prints title, screenshot path, reCAPTCHA score (if any), Turnstile result
+# → prints title, screenshot path, and detection-only challenge signals
 ```
 
 The PoC for Phase 2.6 lives here. Run it before opening the Phase 3 issues — if CloakBrowser fails on any blocker site, the whole stack changes.
@@ -289,15 +289,15 @@ Try AI fallback (Computer Use) ─► fails ─► escalate
    submitted (write new cache entry)
 
 Escalate:
-   CAPTCHA?  ─► CapSolver (if key) ─► retry once
-                       │ fails
-                       ▼
-                  status = 'manual', notify user, save resume state
-   Login required?  ─► status = 'needs_user_action', notify user
+   CAPTCHA?  ─► status = 'manual', checkpoint = 'user_takeover'
+                notify user, save resume state, do not submit or retry
+   Login/MFA required? ─► status = 'manual', checkpoint = 'user_takeover'
+                         notify user, do not submit or retry
+   Challenge detector error? ─► same manual takeover boundary
    Other?           ─► status = 'failed', error logged, NO auto-retry
 ```
 
-**Never auto-retry a failed submission silently.** Either user-visible or queued for human review. The form-pattern cache invalidates after 3 consecutive failures regardless.
+**Never bypass or auto-retry a challenge silently.** The Worker returns normally after the handoff so BullMQ does not replay the job. Any later retry must be a deliberate, user-visible or operator-reviewed action after the challenge state is understood. The form-pattern cache invalidates after 3 consecutive failures regardless.
 
 ---
 
