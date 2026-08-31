@@ -2,8 +2,10 @@ import { beforeEach, describe, expect, it, vi } from "vitest"
 
 const mocks = vi.hoisted(() => ({
   requireAuth: vi.fn(),
+  featureEnabled: vi.fn(),
   findSession: vi.fn(),
   findEvents: vi.fn(),
+  findAgentEvents: vi.fn(),
 }))
 
 vi.mock("@/lib/api-helpers", () => ({
@@ -18,14 +20,21 @@ vi.mock("@/lib/db", () => ({
     agentSession: {
       findFirst: mocks.findSession,
     },
+    agentEvent: {
+      findMany: mocks.findAgentEvents,
+    },
     agentTranscriptEvent: {
       findMany: mocks.findEvents,
     },
   },
 }))
 
-function getRequest() {
-  return new Request("http://localhost/api/agent/sessions/session_1/events")
+vi.mock("@/lib/runtime-feature-flags", () => ({
+  isRuntimeAgentHarnessFeatureEnabled: mocks.featureEnabled,
+}))
+
+function getRequest(path = "", init?: RequestInit) {
+  return new Request(`http://localhost/api/agent/sessions/session_1/events${path}`, init)
 }
 
 const params = { params: Promise.resolve({ id: "session_1" }) }
@@ -34,9 +43,12 @@ describe("agent session events API", () => {
   beforeEach(() => {
     vi.resetModules()
     mocks.requireAuth.mockReset()
+    mocks.featureEnabled.mockReset()
     mocks.findSession.mockReset()
     mocks.findEvents.mockReset()
+    mocks.findAgentEvents.mockReset()
     mocks.requireAuth.mockResolvedValue({ userId: "user_1" })
+    mocks.featureEnabled.mockResolvedValue(false)
   })
 
   it("returns transcript events for an owned session", async () => {
@@ -136,5 +148,55 @@ describe("agent session events API", () => {
     expect(res.status).toBe(401)
     expect(mocks.findSession).not.toHaveBeenCalled()
     expect(mocks.findEvents).not.toHaveBeenCalled()
+  })
+
+  it("serves V2 SSE from the durable cursor when the rollout flag is enabled", async () => {
+    const controller = new AbortController()
+    mocks.featureEnabled.mockResolvedValueOnce(true)
+    mocks.findSession.mockResolvedValueOnce({ id: "session_1" })
+    mocks.findAgentEvents.mockResolvedValueOnce([{
+      id: "event_2",
+      sessionId: "session_1",
+      turnId: "turn_1",
+      itemId: "item_1",
+      taskId: null,
+      sequence: BigInt(2),
+      type: "item.completed",
+      actor: "orchestrator",
+      correlationId: "turn_1",
+      causationId: null,
+      idempotencyKey: null,
+      payload: { text: "done", accessToken: "private" },
+      createdAt: new Date(),
+    }])
+    const { GET } = await import("./route")
+
+    const res = await GET(getRequest("?afterSequence=1", { signal: controller.signal }) as never, params)
+    const reader = res.body?.getReader()
+    const first = await reader?.read()
+    const text = new TextDecoder().decode(first?.value)
+
+    expect(res.status).toBe(200)
+    expect(res.headers.get("content-type")).toContain("text/event-stream")
+    expect(text).toContain("event: item.completed")
+    expect(text).toContain("id: 2")
+    expect(text).toContain('"accessToken":"[REDACTED]"')
+    expect(mocks.findAgentEvents).toHaveBeenCalledWith(expect.objectContaining({
+      where: { sessionId: "session_1", sequence: { gt: BigInt(1) } },
+    }))
+
+    controller.abort()
+    await reader?.cancel()
+  })
+
+  it("rejects an invalid durable cursor before querying the session", async () => {
+    mocks.featureEnabled.mockResolvedValueOnce(true)
+    const { GET } = await import("./route")
+
+    const res = await GET(getRequest("?afterSequence=not-a-sequence") as never, params)
+
+    expect(res.status).toBe(400)
+    await expect(res.json()).resolves.toMatchObject({ error: { code: "invalid_after_sequence" } })
+    expect(mocks.findSession).not.toHaveBeenCalled()
   })
 })
