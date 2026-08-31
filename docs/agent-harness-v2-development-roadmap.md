@@ -1,6 +1,6 @@
 # ApplyMate Agent Harness 2.0 详细开发路线图
 
-> **状态：** Phase 0-3 complete (AH2-001..017 + MiniMax profile merged). Phase 4 (AH2-018..021) as #376..#379, AH2-018 in progress. *Gates follow-up: 48h dual-write shadow + staging SSE drill pending staging credentials.*
+> **状态：** Phase 0-3 implementation complete (AH2-001..017 + MiniMax profile merged). Phase 3 Exit Gate is satisfied by provider/tool-kernel evidence; its scripted Turn prerequisite was corrected to remain with AH2-024. Phase 4 (AH2-018..021) as #376..#379, AH2-018 in progress. *Gates follow-up: 48h dual-write shadow + staging SSE drill pending staging credentials.*
 > **日期：** 2026-08-30
 > **上游设计：** [Agent Harness 2.0 Technical Design](./agent-harness-v2-technical-design.md)
 > **适用代码：** `packages/agent-protocol`、`packages/agent-model`、`apps/web`、`apps/worker`
@@ -228,9 +228,9 @@ not_started → active → implementation_complete → verifying → observing �
 | 0 | 本路线图合并 | AH2-001–003 merged | 全外部动作负向矩阵、flags 默认关闭、baseline | Phase 1 |
 | 1 | Phase 0 completed | AH2-004–008 merged | migration + 48h dual-write integrity report | Phase 2/3 |
 | 2 | Store contracts 固定 | AH2-009–012 merged | command race、500 Items、SSE disconnect/reconnect | UI reducer foundations、Phase 4 |
-| 3 | Protocol/Store 可用 | AH2-013–017 merged | 三 provider contract + model→tool→model scripted trace | Phase 4/5 |
-| 4 | Control + Tool Kernel | AH2-018–021 merged | approval race/scope/expiry、PII、staging resume | Phase 5 |
-| 5 | Policy/Store ready | AH2-022–027 merged | 3+ Steps、wait/restart、interrupt、no-progress | Phase 6/7/8 adapter |
+| 3 | Protocol/Store 可用 | AH2-013–017 merged | 三 provider contract + ToolRouter/lifecycle replay + read-only/tenant negative matrix | Phase 4 |
+| 4 | Phase 3 Exit Gate complete | AH2-018–021 merged | approval race/scope/expiry、PII、staging resume | Phase 5 |
+| 5 | Phase 4 Exit Gate complete | AH2-022–027 merged | 3+ Steps、wait/restart、interrupt、no-progress | Phase 6/7/8 adapter |
 | 6 | TurnEngine stable | AH2-028–033 merged | task concurrency、mailbox、partial success、role isolation | Phase 8 multi-agent |
 | 7 | Step context stable | AH2-034–036 merged | 100+ Items、compaction invariants、fork/cursor loss | Phase 8/long chat |
 | 8 | Runtime/Policy/Subagents | AH2-037–042 merged | full job workflow、dry-run、explicit-approved submit/send | Phase 9 cutover |
@@ -693,8 +693,10 @@ draft
 
 - 三类 provider adapter 通过同一 contract suite；
 - tool lifecycle 可 replay；
-- scripted Turn 可完成 `model step → read tool → model step → final`；
+- ToolRouter 的 schema/version/tenant/timeout/cancel 负向矩阵通过，且首批工具保持 owner-scoped read-only；
 - 仍没有任何 external-write tool。
+
+> **边界纠偏（2026-08-31）：** `model step → read tool → model step → final` 是 TurnEngine 的集成行为，不是 Protocol/Tool Kernel 的 Phase 3 门禁。完整 scripted Turn 由 AH2-024（Phase 5）实现并在 Phase 5 Exit Gate 验收；Phase 3 不得因为尚未存在的 TurnEngine 而阻塞 PolicyEngine。
 
 ---
 
