@@ -43,6 +43,26 @@ export {
 export type { AgentItem, AgentMessageItem, AgentMessagePhase, GenericItem, ItemStatus, ToolCallItem, ToolResultItem } from './item.js'
 export { AgentEventEnvelopeSchema, AgentEventTypeSchema, KnownAgentEventEnvelopeSchema, isKnownAgentEventType } from './event.js'
 export type { AgentEventEnvelope, AgentEventType, KnownAgentEventEnvelope } from './event.js'
+export type {
+  AgentEventRecord,
+  AgentItemRecord,
+  AgentProjection,
+  AgentRepositoryUnitOfWork,
+  AgentStepRecord,
+  AgentStore,
+  AgentTurnRecord,
+  AppendEventInput,
+  ClaimTurnInput,
+  RepositoryJsonValue,
+  StartStepInput,
+  TenantScope,
+  UpdateItemInput,
+} from './repository.js'
+export type {
+  RepositoryFixture,
+  RepositoryProjectionFingerprint,
+} from './repository-contract.js'
+export { isRepositoryJsonValue, runRepositoryFixture } from './repository-contract.js'
 export { ToolCallSchema, ToolCallStatusSchema, ToolCapabilitySchema, ToolDefinitionSchema } from './tool.js'
 export type { ToolCall, ToolCallStatus, ToolCapability, ToolDefinition } from './tool.js'
 export { AgentApprovalSchema, ApprovalScopeSchema, ApprovalStatusSchema, ApprovalTypeSchema } from './approval.js'

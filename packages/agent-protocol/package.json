@@ -13,6 +13,8 @@
     "./input": { "types": "./dist/input.d.ts", "default": "./dist/input.js" },
     "./item": { "types": "./dist/item.d.ts", "default": "./dist/item.js" },
     "./event": { "types": "./dist/event.d.ts", "default": "./dist/event.js" },
+    "./repository": { "types": "./dist/repository.d.ts", "default": "./dist/repository.js" },
+    "./repository-contract": { "types": "./dist/repository-contract.d.ts", "default": "./dist/repository-contract.js" },
     "./tool": { "types": "./dist/tool.d.ts", "default": "./dist/tool.js" },
     "./approval": { "types": "./dist/approval.d.ts", "default": "./dist/approval.js" },
     "./model": { "types": "./dist/model.d.ts", "default": "./dist/model.js" },
