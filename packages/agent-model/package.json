@@ -10,6 +10,10 @@
     "./adapters/openai-compatible": {
       "types": "./dist/adapters/openai-compatible/index.d.ts",
       "default": "./dist/adapters/openai-compatible/index.js"
+    },
+    "./adapters/minimax": {
+      "types": "./dist/adapters/minimax/index.d.ts",
+      "default": "./dist/adapters/minimax/index.js"
     }
   },
   "sideEffects": false,
