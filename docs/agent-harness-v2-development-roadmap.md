@@ -1,6 +1,6 @@
 # ApplyMate Agent Harness 2.0 详细开发路线图
 
-> **状态：** Phase 0/1 complete — Phase 2 (AH2-009..012) as #354..#357; AH2-009/010/011 done (#358/#359/#360), AH2-012 in progress. *Phase 1 Gate follow-up: 48h dual-write shadow report pending staging credentials.*
+> **状态：** Phase 0/1/2 complete (AH2-001..012 merged, PRs #341..#361). Phase 3 (AH2-013..017) created as #362..#366, AH2-013 in progress. *Gates follow-up: 48h dual-write shadow + staging SSE drill pending staging credentials.*
 > **日期：** 2026-08-30
 > **上游设计：** [Agent Harness 2.0 Technical Design](./agent-harness-v2-technical-design.md)
 > **适用代码：** `packages/agent-protocol`、`packages/agent-model`、`apps/web`、`apps/worker`
@@ -1161,7 +1161,7 @@ draft
 | AH2-009 | command service | #347 | [#354](https://github.com/YuanshuoDu/applymate-jobcopilot/issues/354) | [#358](https://github.com/YuanshuoDu/applymate-jobcopilot/pull/358) | done |
 | AH2-010 | message/interrupt API | #354 | [#355](https://github.com/YuanshuoDu/applymate-jobcopilot/issues/355) | [#359](https://github.com/YuanshuoDu/applymate-jobcopilot/pull/359) | done |
 | AH2-011 | query API | #347 | [#356](https://github.com/YuanshuoDu/applymate-jobcopilot/issues/356) | [#360](https://github.com/YuanshuoDu/applymate-jobcopilot/pull/360) | done |
-| AH2-012 | durable/transient stream | #346,#356 | [#357](https://github.com/YuanshuoDu/applymate-jobcopilot/issues/357) | TBD | spec-ready |
+| AH2-012 | durable/transient stream | #346,#356 | [#357](https://github.com/YuanshuoDu/applymate-jobcopilot/issues/357) | [#361](https://github.com/YuanshuoDu/applymate-jobcopilot/pull/361) | done |
 | AH2-013 | agent-model contract | 004 | TBD | TBD | pending |
 | AH2-014 | OpenAI-compatible adapter | 013 | TBD | TBD | pending |
 | AH2-015 | Anthropic adapter | 013 | TBD | TBD | pending |
