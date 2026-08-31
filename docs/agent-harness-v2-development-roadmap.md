@@ -1,6 +1,6 @@
 # ApplyMate Agent Harness 2.0 详细开发路线图
 
-> **状态：** Phase 0-3 implementation complete (AH2-001..017 + MiniMax profile merged). Phase 3 Exit Gate is satisfied by provider/tool-kernel evidence; its scripted Turn prerequisite was corrected to remain with AH2-024. Phase 4 (AH2-018..021) as #376..#379; AH2-018 done (#382), AH2-019 in progress. *Gates follow-up: 48h dual-write shadow + staging SSE drill pending staging credentials.*
+> **状态：** Phase 0-3 implementation complete (AH2-001..017 + MiniMax profile merged). Phase 3 Exit Gate is satisfied by provider/tool-kernel evidence; its scripted Turn prerequisite was corrected to remain with AH2-024. Phase 4 (AH2-018..021) as #376..#379; AH2-018/019 done (#382/#383), AH2-020 in progress. *Gates follow-up: 48h dual-write shadow + staging SSE drill pending staging credentials.*
 > **日期：** 2026-08-30
 > **上游设计：** [Agent Harness 2.0 Technical Design](./agent-harness-v2-technical-design.md)
 > **适用代码：** `packages/agent-protocol`、`packages/agent-model`、`apps/web`、`apps/worker`
