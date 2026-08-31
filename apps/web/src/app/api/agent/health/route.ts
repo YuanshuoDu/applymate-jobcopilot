@@ -1,4 +1,5 @@
 import { NextRequest } from "next/server"
+import { getAgentHarnessFeatureHealth, platformEnvironment } from "@jobcopilot/shared/feature-flags"
 import { db } from "@/lib/db"
 import { isErrorResponse, ok, requireAuth } from "@/lib/api-helpers"
 
@@ -51,5 +52,8 @@ export async function GET(req: NextRequest) {
     },
   })
 
-  return ok(summarize(rows))
+  return ok({
+    ...summarize(rows),
+    agentHarnessFlags: getAgentHarnessFeatureHealth(platformEnvironment(process.env)),
+  })
 }

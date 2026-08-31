@@ -42,13 +42,16 @@ describe("agent health API", () => {
     const res = await GET(request() as never)
 
     expect(res.status).toBe(200)
-    await expect(res.json()).resolves.toEqual({
+    const body = await res.json()
+    expect(body).toMatchObject({
       successRate: 66.7,
       captchaRate: 33.3,
       avgDurationMs: 150000,
       patternCacheRate: 33.3,
       last24hRuns: 2,
     })
+    expect(body.agentHarnessFlags).toMatchObject({ environment: 'development', source: 'safe_defaults', allDefaultOff: true })
+    expect(Object.values(body.agentHarnessFlags.flags)).toHaveLength(11)
     expect(mocks.findMany).toHaveBeenCalledWith({
       where: { userId: "user_1" },
       orderBy: { createdAt: "desc" },
@@ -69,13 +72,15 @@ describe("agent health API", () => {
 
     const res = await GET(request() as never)
 
-    await expect(res.json()).resolves.toEqual({
+    const body = await res.json()
+    expect(body).toMatchObject({
       successRate: 0,
       captchaRate: 0,
       avgDurationMs: 0,
       patternCacheRate: 0,
       last24hRuns: 0,
     })
+    expect(body.agentHarnessFlags.allDefaultOff).toBe(true)
   })
 
   it("returns auth errors without querying health data", async () => {

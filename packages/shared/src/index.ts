@@ -20,13 +20,24 @@ export { pinnedFetch, validatePinnedUrl, type PinnedFetchOptions } from "./pinne
 export { normalizeExternalApiErrorCode, sharedExternalApiErrorCode, type ExternalApiErrorCode, type SharedExternalApiUsage, recordSharedExternalApiUsage } from "./external-api-usage.js";
 export { getAzureManagementToken, type AzureManagementTokenCredential } from "./azure-management.js";
 export {
+  AGENT_HARNESS_FEATURES,
   evaluateManagedFeature,
+  evaluateAgentHarnessFeature,
+  getAgentHarnessFeatureHealth,
+  isAgentHarnessFeatureKey,
   isManagedFeatureKey,
+  isPlatformFeatureKey,
   MANAGED_FEATURES,
+  PLATFORM_FEATURES,
   platformEnvironment,
+  type AgentHarnessFeatureFallback,
+  type AgentHarnessFeatureHealth,
+  type AgentHarnessFeatureKey,
+  type FeatureFlagEvaluationInput,
   type ManagedFeatureKey,
   type ManagedFeatureOverride,
   type PlatformEnvironment,
+  type PlatformFeatureKey,
 } from "./feature-flags.js";
 
 /** Job payload pushed to the apply-tasks queue */

@@ -5,6 +5,7 @@ import { ExpressAdapter } from "@bull-board/express";
 import { createWorkerControlHandler, resolveWorkerAdminHost } from "./admin/control-plane.js";
 import { bindWorkerControl, getWorkerRuntimeState, restoreWorkerRuntimeState } from "./admin/worker-state.js";
 import { closeSharedRedisConnections } from "./redis.js";
+import { workerHarnessFeatureHealth } from "./admin/harness-health.js";
 
 async function main() {
   const adminHost = resolveWorkerAdminHost();
@@ -80,6 +81,7 @@ async function main() {
     status: getWorkerRuntimeState().status === "paused" ? "paused" : "ok",
     workerState: getWorkerRuntimeState().status,
     automationScheduler: publicAutomationSchedulerStatus(automationScheduler.status()),
+    agentHarnessFlags: workerHarnessFeatureHealth(),
   }));
   adminApp.post("/internal/admin/control", express.text({ type: "application/json", limit: "16kb" }), createWorkerControlHandler());
 
