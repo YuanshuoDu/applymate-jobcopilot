@@ -1,4 +1,14 @@
 export { schemaVersion, protocolRevision } from './version.js'
+export {
+  AGENT_DELTA_STREAM_MAX_LENGTH,
+  AGENT_STREAM_SCHEMA_VERSION,
+  agentDeltaChannel,
+  agentDeltaStream,
+  agentEventChannel,
+  createDeltaEnvelope,
+  createDurableEnvelope,
+} from './stream.js'
+export type { AgentDeltaEnvelope, AgentStreamEnvelope } from './stream.js'
 export { assertValid, getValidator, ProtocolValidationError, validate, validatorCacheSize } from './validation.js'
 export type { ValidationIssue } from './validation.js'
 
