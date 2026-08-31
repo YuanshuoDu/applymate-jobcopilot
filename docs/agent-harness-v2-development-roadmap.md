@@ -1168,10 +1168,10 @@ draft
 | AH2-015 | Anthropic adapter | #362 | [#364](https://github.com/YuanshuoDu/applymate-jobcopilot/issues/364) | [#371](https://github.com/YuanshuoDu/applymate-jobcopilot/pull/371) | done |
 | AH2-016 | fallback/recovery/reroute | #363,#364 | [#365](https://github.com/YuanshuoDu/applymate-jobcopilot/issues/365) | [#374](https://github.com/YuanshuoDu/applymate-jobcopilot/pull/374) | done |
 | AH2-017 | ToolRegistry/read tools | #347,#362 | [#366](https://github.com/YuanshuoDu/applymate-jobcopilot/issues/366) | [#375](https://github.com/YuanshuoDu/applymate-jobcopilot/pull/375) | done |
-| AH2-018 | PolicyEngine | 017 | TBD | TBD | pending |
-| AH2-019 | approval receipt | 005,018 | TBD | TBD | pending |
-| AH2-020 | approval/question broker | 010,019 | TBD | TBD | pending |
-| AH2-021 | migrate high-risk policy | 018–020 | TBD | TBD | pending |
+| AH2-018 | PolicyEngine | #366 | [#376](https://github.com/YuanshuoDu/applymate-jobcopilot/issues/376) | TBD | in-progress |
+| AH2-019 | approval receipt | #345,#376 | [#377](https://github.com/YuanshuoDu/applymate-jobcopilot/issues/377) | TBD | spec-ready |
+| AH2-020 | approval/question broker | #355,#377 | [#378](https://github.com/YuanshuoDu/applymate-jobcopilot/issues/378) | TBD | spec-ready |
+| AH2-021 | migrate high-risk policy | #376–#378 | [#379](https://github.com/YuanshuoDu/applymate-jobcopilot/issues/379) | TBD | spec-ready |
 | AH2-022 | Turn lease/recovery | 007,009 | TBD | TBD | pending |
 | AH2-023 | Step context/input consume | 016,022 | TBD | TBD | pending |
 | AH2-024 | conversation loop | 017,018,022,023 | TBD | TBD | pending |
