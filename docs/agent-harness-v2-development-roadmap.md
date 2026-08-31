@@ -1158,10 +1158,10 @@ draft
 | AH2-006 | Item/Event/Outbox/sequence | #344,#345 | [#346](https://github.com/YuanshuoDu/applymate-jobcopilot/issues/346) | [#351](https://github.com/YuanshuoDu/applymate-jobcopilot/pull/351) | done |
 | AH2-007 | Web/Worker stores | #345,#346 | [#347](https://github.com/YuanshuoDu/applymate-jobcopilot/issues/347) | [#352](https://github.com/YuanshuoDu/applymate-jobcopilot/pull/352) | done |
 | AH2-008 | legacy dual-write/projector | #347 | [#348](https://github.com/YuanshuoDu/applymate-jobcopilot/issues/348) | [#353](https://github.com/YuanshuoDu/applymate-jobcopilot/pull/353) | done |
-| AH2-009 | command service | 007 | TBD | TBD | pending |
-| AH2-010 | message/interrupt API | 009 | TBD | TBD | pending |
-| AH2-011 | query API | 007 | TBD | TBD | pending |
-| AH2-012 | durable/transient stream | 006,011 | TBD | TBD | pending |
+| AH2-009 | command service | #347 | [#354](https://github.com/YuanshuoDu/applymate-jobcopilot/issues/354) | TBD | in-progress |
+| AH2-010 | message/interrupt API | #354 | [#355](https://github.com/YuanshuoDu/applymate-jobcopilot/issues/355) | TBD | spec-ready |
+| AH2-011 | query API | #347 | [#356](https://github.com/YuanshuoDu/applymate-jobcopilot/issues/356) | TBD | spec-ready |
+| AH2-012 | durable/transient stream | #346,#356 | [#357](https://github.com/YuanshuoDu/applymate-jobcopilot/issues/357) | TBD | spec-ready |
 | AH2-013 | agent-model contract | 004 | TBD | TBD | pending |
 | AH2-014 | OpenAI-compatible adapter | 013 | TBD | TBD | pending |
 | AH2-015 | Anthropic adapter | 013 | TBD | TBD | pending |
