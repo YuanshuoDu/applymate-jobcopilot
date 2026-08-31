@@ -19,6 +19,9 @@ export const AgentEventTypeSchema = Type.Union([
   Type.Literal('policy.decision'),
   Type.Literal('approval.requested'),
   Type.Literal('approval.resolved'),
+  Type.Literal('approval.consumed'),
+  Type.Literal('approval.expired'),
+  Type.Literal('external_action.reserved'),
 ])
 
 export const AgentEventEnvelopeSchema = Type.Object({

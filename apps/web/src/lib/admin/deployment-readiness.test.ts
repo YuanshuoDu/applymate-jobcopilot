@@ -55,12 +55,14 @@ describe('deployment readiness', () => {
       '20260826143000_add_api_usage_runtime',
       '20260831030000_add_agent_turn_step_input',
       '20260831040000_add_agent_item_event_outbox',
+      '20260831140000_add_scoped_agent_approvals',
     ]))
     expect(RLS_TABLES).toEqual(expect.arrayContaining([
       'form_patterns',
       'ai_usage_events',
       'external_api_usage_events',
       'agent_turns', 'agent_steps', 'agent_inputs', 'agent_items', 'agent_events', 'agent_outbox',
+      'agent_action_reservations',
     ]))
   })
 

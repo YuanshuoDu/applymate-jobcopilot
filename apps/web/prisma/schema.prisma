@@ -99,6 +99,8 @@ model User {
   agentRuns                   AgentRun[]
   agentExecutions             AgentExecution[]
   agentSessions               AgentSession[]
+  agentApprovals              AgentApproval[]
+  agentActionReservations     AgentActionReservation[]
   agentTurns                  AgentTurn[]
   agentInputs                 AgentInput[]
   applicationTasks            ApplicationTask[]
@@ -1651,6 +1653,7 @@ model AgentSession {
   tasks            SubAgentTask[]
   transcript       AgentTranscriptEvent[]
   approvals        AgentApproval[]
+  actionReservations AgentActionReservation[]
   applicationTasks ApplicationTask[]
   turns            AgentTurn[]
   steps            AgentStep[]
@@ -1699,6 +1702,7 @@ model AgentTurn {
   inputs  AgentInput[] @relation("AgentTurnInputs")
   items   AgentItem[]
   events  AgentEvent[]
+  approvals AgentApproval[]
 
   @@index([sessionId, createdAt])
   @@index([userId, status, updatedAt(sort: Desc)])
@@ -1882,24 +1886,69 @@ model AgentTranscriptEvent {
 }
 
 model AgentApproval {
-  id        String    @id @default(cuid())
-  sessionId String
-  taskId    String?
-  userId    String
-  type      String
-  status    String    @default("pending")
-  title     String
-  body      String    @db.Text
-  impact    Json?
-  payload   Json
-  decidedAt DateTime?
-  createdAt DateTime  @default(now())
+  id           String    @id @default(cuid())
+  sessionId    String
+  taskId       String?
+  userId       String
+  // Nullable during the additive migration; new receipts always populate it.
+  turnId       String?
+  toolCallId   String?
+  jobId        String?
+  type         String
+  status       String    @default("pending")
+  title        String
+  body         String    @db.Text
+  impact       Json?
+  payload      Json
+  resourceHash String?
+  materialHash String?
+  answersHash  String?
+  scopeHash    String?
+  nonceHash    String?
+  revision     Int       @default(0)
+  expiresAt    DateTime?
+  decidedAt    DateTime?
+  consumedAt   DateTime?
+  createdAt    DateTime  @default(now())
 
   session AgentSession @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+  user    User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+  turn    AgentTurn?   @relation(fields: [turnId], references: [id], onDelete: Cascade)
+  reservations AgentActionReservation[]
 
   @@index([userId, status, createdAt])
   @@index([sessionId, status])
+  @@index([userId, status, expiresAt])
+  @@index([sessionId, turnId, status])
+  @@unique([userId, nonceHash])
   @@map("agent_approvals")
+}
+
+// Durable single-use reservation created in the same transaction as receipt
+// consumption. The eventual broker/executor owns its state transitions.
+model AgentActionReservation {
+  id             String   @id @default(cuid())
+  approvalId     String
+  userId         String
+  sessionId      String
+  turnId         String
+  jobId          String
+  toolCallId     String
+  action         String
+  resourceHash   String
+  idempotencyKey String   @unique
+  status         String   @default("reserved")
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @default(now()) @updatedAt
+
+  approval AgentApproval @relation(fields: [approvalId], references: [id], onDelete: Cascade)
+  session AgentSession   @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+  user    User           @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([approvalId])
+  @@index([userId, status, createdAt])
+  @@index([sessionId, turnId, status])
+  @@map("agent_action_reservations")
 }
 
 model AgentAutomation {
