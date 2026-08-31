@@ -1,6 +1,6 @@
 # ApplyMate Agent Harness 2.0 详细开发路线图
 
-> **状态：** Phase 0/1/2 complete — Phase 3 (AH2-013..017) as #362..#366 + MiniMax (#369 AH2-014-M done, #370 AH2-024-M spec-ready); AH2-013/014/015/014-M/016 done (#367/#368/#371/#372/#374), AH2-017 in progress. *Gates follow-up: 48h dual-write shadow + staging SSE drill pending staging credentials.*
+> **状态：** Phase 0-3 complete (AH2-001..017 + MiniMax profile merged). Phase 4 (AH2-018..021) as #376..#379, AH2-018 in progress. *Gates follow-up: 48h dual-write shadow + staging SSE drill pending staging credentials.*
 > **日期：** 2026-08-30
 > **上游设计：** [Agent Harness 2.0 Technical Design](./agent-harness-v2-technical-design.md)
 > **适用代码：** `packages/agent-protocol`、`packages/agent-model`、`apps/web`、`apps/worker`
@@ -1167,7 +1167,7 @@ draft
 | AH2-014-M | MiniMax M3 provider profile | #363,#367 | [#369](https://github.com/YuanshuoDu/applymate-jobcopilot/issues/369) | [#372](https://github.com/YuanshuoDu/applymate-jobcopilot/pull/372) | done |
 | AH2-015 | Anthropic adapter | #362 | [#364](https://github.com/YuanshuoDu/applymate-jobcopilot/issues/364) | [#371](https://github.com/YuanshuoDu/applymate-jobcopilot/pull/371) | done |
 | AH2-016 | fallback/recovery/reroute | #363,#364 | [#365](https://github.com/YuanshuoDu/applymate-jobcopilot/issues/365) | [#374](https://github.com/YuanshuoDu/applymate-jobcopilot/pull/374) | done |
-| AH2-017 | ToolRegistry/read tools | #347,#362 | [#366](https://github.com/YuanshuoDu/applymate-jobcopilot/issues/366) | TBD | spec-ready |
+| AH2-017 | ToolRegistry/read tools | #347,#362 | [#366](https://github.com/YuanshuoDu/applymate-jobcopilot/issues/366) | [#375](https://github.com/YuanshuoDu/applymate-jobcopilot/pull/375) | done |
 | AH2-018 | PolicyEngine | 017 | TBD | TBD | pending |
 | AH2-019 | approval receipt | 005,018 | TBD | TBD | pending |
 | AH2-020 | approval/question broker | 010,019 | TBD | TBD | pending |
