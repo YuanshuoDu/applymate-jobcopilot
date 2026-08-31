@@ -2,12 +2,16 @@ import type { TSchema } from "@sinclair/typebox"
 import {
   schemaVersion,
   type RepositoryJsonValue,
+  type PolicyDomain,
+  type PolicyRole,
+  type ToolRisk as ProtocolToolRisk,
   type TenantScope,
   type ToolCapability,
   type ToolDefinition,
 } from "@jobcopilot/agent-protocol"
 
-export type ToolRisk = "read" | "draft_write" | "internal_write" | "external_write"
+export type ToolRisk = ProtocolToolRisk
+export type ToolDomain = PolicyDomain
 export type ToolIdempotency = "read_only" | "idempotent" | "requires_key" | "non_repeatable"
 
 export interface ToolExecutionContext {
@@ -29,6 +33,7 @@ export interface RuntimeToolDefinition<TInput = unknown, TOutput = unknown> {
   readonly inputSchema: TSchema
   readonly outputSchema: TSchema
   readonly risk: ToolRisk
+  readonly domain: ToolDomain
   readonly idempotency: ToolIdempotency
   readonly timeoutMs: number
   readonly requiredCapabilities: readonly string[]
@@ -39,6 +44,7 @@ export type PublicToolDefinition = Omit<ToolDefinition, "inputSchema" | "outputS
   inputSchema: TSchema
   outputSchema: TSchema
   risk: ToolRisk
+  domain: ToolDomain
   idempotency: ToolIdempotency
   timeoutMs: number
   requiredCapabilities: readonly string[]
@@ -58,6 +64,8 @@ export interface ToolRouterContext {
   readonly stepId: string
   readonly signal?: AbortSignal
   readonly capabilities?: readonly string[]
+  /** Runtime-owned actor role; the model cannot supply or override this value. */
+  readonly actorRole?: PolicyRole
 }
 
 export interface ToolExecutionResult {

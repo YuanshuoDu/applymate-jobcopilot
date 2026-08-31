@@ -1,6 +1,7 @@
 import { ToolSchemaValidationError } from "./schema-validator.js"
 import { containsModelUserId, ToolRegistryError, type ToolRegistry } from "./registry.js"
 import { ToolLifecycle, type LifecycleCall } from "./lifecycle.js"
+import { PolicyEngine, type RuntimePolicyDecision } from "../policy/index.js"
 import type {
   RuntimeToolDefinition,
   ToolCallRequest,
@@ -9,7 +10,7 @@ import type {
   ToolExecutionContext,
 } from "./types.js"
 
-export type ToolRouterErrorCode = "runtime_scope_error" | "capability_denied" | "idempotency_conflict" | "timeout" | "cancelled" | "tool_execution_failed"
+export type ToolRouterErrorCode = "runtime_scope_error" | "capability_denied" | "idempotency_conflict" | "timeout" | "cancelled" | "tool_execution_failed" | "policy_denied" | "policy_requires_approval" | "policy_requires_user_input" | "policy_version_unknown" | "policy_rewrite_expands_permissions"
 
 export class ToolRouterError extends Error {
   constructor(readonly code: ToolRouterErrorCode, message: string) {
@@ -29,6 +30,7 @@ export class ToolRouter {
   constructor(
     private readonly registry: ToolRegistry,
     private readonly lifecycle: ToolLifecycle,
+    private readonly policy: PolicyEngine = new PolicyEngine(),
   ) {}
 
   execute(context: ToolRouterContext, request: ToolCallRequest): Promise<ToolExecutionResult> {
@@ -54,7 +56,29 @@ export class ToolRouter {
       const definition = this.registry.resolve(request.toolName, request.toolVersion)
       this.assertCapabilities(definition, context.capabilities ?? [])
       this.registry.validators.validate(definition.inputSchema, request.input, `${request.toolName} input`)
-      const execution = this.createExecution(context, request, definition)
+      const policyDecision = this.policy.evaluate({
+        scope: context.scope,
+        sessionId: context.sessionId,
+        turnId: context.turnId,
+        stepId: context.stepId,
+        toolCallId: request.id,
+        actorRole: context.actorRole ?? "orchestrator",
+        capabilities: context.capabilities ?? [],
+        tool: {
+          name: definition.name,
+          version: definition.version,
+          risk: definition.risk,
+          domain: definition.domain,
+          capabilities: definition.capabilities,
+          requiredCapabilities: definition.requiredCapabilities,
+        },
+        input: request.input,
+      })
+      this.assertPolicy(policyDecision)
+      const effectiveInput = policyDecision.safeInput === undefined ? request.input : policyDecision.safeInput
+      if (containsModelUserId(effectiveInput)) throw new ToolRouterError("policy_rewrite_expands_permissions", "A policy rewrite attempted to override tenant scope")
+      this.registry.validators.validate(definition.inputSchema, effectiveInput, `${request.toolName} rewritten input`)
+      const execution = this.createExecution(context, request, definition, effectiveInput)
       const output = await execution.run()
       this.registry.validators.validate(definition.outputSchema, output, `${request.toolName} output`)
       const safeOutput = await this.lifecycle.completed(call, output)
@@ -67,7 +91,7 @@ export class ToolRouter {
     }
   }
 
-  private createExecution(context: ToolRouterContext, request: ToolCallRequest, definition: RuntimeToolDefinition): { run(): Promise<unknown> } {
+  private createExecution(context: ToolRouterContext, request: ToolCallRequest, definition: RuntimeToolDefinition, input: unknown): { run(): Promise<unknown> } {
     const controller = new AbortController()
     let timedOut = false
     const parent = context.signal
@@ -91,7 +115,7 @@ export class ToolRouter {
       async run() {
         try {
           if (controller.signal.aborted) throw new ToolRouterError(timedOut ? "timeout" : "cancelled", "Tool execution was interrupted")
-          return await definition.execute(executionContext, request.input)
+          return await definition.execute(executionContext, input)
         } catch (error: unknown) {
           if (controller.signal.aborted) throw new ToolRouterError(timedOut ? "timeout" : "cancelled", "Tool execution was interrupted")
           throw error
@@ -106,6 +130,15 @@ export class ToolRouter {
   private assertCapabilities(definition: RuntimeToolDefinition, capabilities: readonly string[]): void {
     const missing = definition.requiredCapabilities.filter((capability) => !capabilities.includes(capability))
     if (missing.length > 0) throw new ToolRouterError("capability_denied", `Missing tool capabilities: ${missing.join(", ")}`)
+  }
+
+  private assertPolicy(decision: RuntimePolicyDecision): void {
+    if (decision.outcome === "allow") return
+    if (decision.reasonCode === "policy_version_unknown") throw new ToolRouterError("policy_version_unknown", decision.reason)
+    if (decision.reasonCode === "rewrite_expands_permissions") throw new ToolRouterError("policy_rewrite_expands_permissions", decision.reason)
+    if (decision.outcome === "require_approval") throw new ToolRouterError("policy_requires_approval", decision.reason)
+    if (decision.outcome === "require_user_input") throw new ToolRouterError("policy_requires_user_input", decision.reason)
+    throw new ToolRouterError("policy_denied", decision.reason)
   }
 
   private errorCode(error: unknown): string {

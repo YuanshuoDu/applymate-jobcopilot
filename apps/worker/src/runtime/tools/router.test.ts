@@ -2,6 +2,7 @@ import { Type } from "@sinclair/typebox"
 import { describe, expect, it, vi } from "vitest"
 
 import { InMemoryToolLifecycleSink, ToolLifecycle } from "./lifecycle.js"
+import { PolicyEngine } from "../policy/engine.js"
 import { ToolRegistry } from "./registry.js"
 import { InMemoryToolResultReferenceStore } from "./redaction.js"
 import { ToolRouter } from "./router.js"
@@ -13,7 +14,7 @@ function makeRouter(execute: RuntimeToolDefinition["execute"] = async () => ({ r
   const sink = new InMemoryToolLifecycleSink()
   const registry = new ToolRegistry([{
     schemaVersion: "agent-harness.v2", name: "test.read", version: "1", description: "test",
-    capabilities: ["read"], inputSchema: Type.Object({ query: Type.String() }, { additionalProperties: false }),
+    capabilities: ["read"], domain: "jobs", inputSchema: Type.Object({ query: Type.String() }, { additionalProperties: false }),
     outputSchema: Type.Object({ result: Type.String() }, { additionalProperties: false }), risk: "read", idempotency: "read_only", timeoutMs, requiredCapabilities, execute,
   }])
   const router = new ToolRouter(registry, new ToolLifecycle({ sink, references: new InMemoryToolResultReferenceStore(), now: () => "2026-08-31T12:00:00.000Z" }))
@@ -68,5 +69,56 @@ describe("ToolRouter", () => {
     }
     const badOutput = makeRouter(async () => ({ result: 42 }))
     await expect(badOutput.router.execute(context, { ...request, id: "bad-output" })).resolves.toMatchObject({ status: "failed", errorCode: "schema_error" })
+  })
+
+  it("forces every executable read call through the deterministic policy hook", async () => {
+    const execute = vi.fn(async () => ({ result: "ok" }))
+    const sink = new InMemoryToolLifecycleSink()
+    const registry = new ToolRegistry([{
+      schemaVersion: "agent-harness.v2", name: "test.read", version: "1", description: "test",
+      capabilities: ["read"], domain: "jobs", inputSchema: Type.Object({ query: Type.String() }, { additionalProperties: false }),
+      outputSchema: Type.Object({ result: Type.String() }, { additionalProperties: false }), risk: "read", idempotency: "read_only", timeoutMs: 100, requiredCapabilities: [], execute,
+    }])
+    const router = new ToolRouter(
+      registry,
+      new ToolLifecycle({ sink, references: new InMemoryToolResultReferenceStore(), now: () => "2026-08-31T12:00:00.000Z" }),
+      new PolicyEngine({ snapshot: { version: "policy.v1", rules: [] } }),
+    )
+    await expect(router.execute(context, request)).resolves.toMatchObject({ status: "failed", errorCode: "policy_denied" })
+    expect(execute).not.toHaveBeenCalled()
+    expect(sink.events.at(-1)?.payload).toMatchObject({ errorCode: "policy_denied" })
+  })
+
+  it("denies an external write when no explicit policy is configured", async () => {
+    const execute = vi.fn(async () => ({ ok: true }))
+    const sink = new InMemoryToolLifecycleSink()
+    const registry = new ToolRegistry([{
+      schemaVersion: "agent-harness.v2", name: "application.submit", version: "1", description: "test write",
+      capabilities: ["external_write"], domain: "application", inputSchema: Type.Object({ jobId: Type.String() }, { additionalProperties: false }),
+      outputSchema: Type.Object({ ok: Type.Boolean() }, { additionalProperties: false }), risk: "external_write", idempotency: "non_repeatable", timeoutMs: 100, requiredCapabilities: [], execute,
+    }])
+    const router = new ToolRouter(
+      registry,
+      new ToolLifecycle({ sink, references: new InMemoryToolResultReferenceStore(), now: () => "2026-08-31T12:00:00.000Z" }),
+    )
+    await expect(router.execute(context, { id: "submit-1", toolName: "application.submit", toolVersion: "1", input: { jobId: "job-1" } })).resolves.toMatchObject({ status: "failed", errorCode: "policy_denied" })
+    expect(execute).not.toHaveBeenCalled()
+  })
+
+  it("executes only the safe input produced by a policy rewrite", async () => {
+    const execute = vi.fn(async (_toolContext, input) => ({ result: (input as { query: string }).query }))
+    const sink = new InMemoryToolLifecycleSink()
+    const registry = new ToolRegistry([{
+      schemaVersion: "agent-harness.v2", name: "test.read", version: "1", description: "test",
+      capabilities: ["read"], domain: "jobs", inputSchema: Type.Object({ query: Type.String() }, { additionalProperties: false }),
+      outputSchema: Type.Object({ result: Type.String() }, { additionalProperties: false }), risk: "read", idempotency: "read_only", timeoutMs: 100, requiredCapabilities: [], execute,
+    }])
+    const router = new ToolRouter(
+      registry,
+      new ToolLifecycle({ sink, references: new InMemoryToolResultReferenceStore(), now: () => "2026-08-31T12:00:00.000Z" }),
+      new PolicyEngine({ hooks: [{ name: "normalize-location", order: 10, stage: "before_tool_use", evaluate: () => ({ outcome: "rewrite_input", rewrite: { safeInput: { query: "Dublin" } } }) }] }),
+    )
+    await expect(router.execute(context, request)).resolves.toMatchObject({ status: "completed", output: { result: "Dublin" } })
+    expect(execute).toHaveBeenCalledWith(expect.anything(), { query: "Dublin" })
   })
 })

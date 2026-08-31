@@ -73,8 +73,10 @@ export type {
   RepositoryProjectionFingerprint,
 } from './repository-contract.js'
 export { isRepositoryJsonValue, runRepositoryFixture } from './repository-contract.js'
-export { ToolCallSchema, ToolCallStatusSchema, ToolCapabilitySchema, ToolDefinitionSchema } from './tool.js'
-export type { ToolCall, ToolCallStatus, ToolCapability, ToolDefinition } from './tool.js'
+export { ToolCallSchema, ToolCallStatusSchema, ToolCapabilitySchema, ToolDefinitionSchema, ToolRiskSchema } from './tool.js'
+export type { ToolCall, ToolCallStatus, ToolCapability, ToolDefinition, ToolRisk } from './tool.js'
+export { PolicyDecisionSchema, PolicyDomainSchema, PolicyHookNameSchema, PolicyOutcomeSchema, PolicyRoleSchema, PolicyRuleOutcomeSchema, PolicyRuleSchema, PolicyScopeSchema, PolicySnapshotSchema } from './policy.js'
+export type { PolicyDecision, PolicyDomain, PolicyHookName, PolicyOutcome, PolicyRole, PolicyRule, PolicyRuleOutcome, PolicyScope, PolicySnapshot } from './policy.js'
 export { AgentApprovalSchema, ApprovalScopeSchema, ApprovalStatusSchema, ApprovalTypeSchema } from './approval.js'
 export type { AgentApproval, ApprovalScope, ApprovalStatus, ApprovalType } from './approval.js'
 export {

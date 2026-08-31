@@ -11,6 +11,7 @@ function definition(name = "test.read"): RuntimeToolDefinition {
     version: "1",
     description: "A read-only test tool",
     capabilities: ["read"],
+    domain: "jobs",
     inputSchema: Type.Object({ value: Type.String() }, { additionalProperties: false }),
     outputSchema: Type.Object({ ok: Type.Boolean() }, { additionalProperties: false }),
     risk: "read",

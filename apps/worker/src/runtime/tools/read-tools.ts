@@ -125,17 +125,17 @@ const ApplicationResultSchema = Type.Object({
   approvals: Type.Array(Type.Object({ id: Type.String(), type: Type.String(), status: Type.String(), title: Type.String(), impact: Type.Unknown(), decidedAt: nullableText, createdAt: Type.String() }, { additionalProperties: false })),
 }, { additionalProperties: false })
 
-function readMetadata(name: string, description: string) {
-  return { schemaVersion, name, version: "1", description, capabilities: ["read"] as const, risk: "read" as const, idempotency: "read_only" as const, timeoutMs: 10_000, requiredCapabilities: [] as const } as const
+function readMetadata(name: string, description: string, domain: "jobs" | "persona" | "resume" | "application") {
+  return { schemaVersion, name, version: "1", description, capabilities: ["read"] as const, risk: "read" as const, domain, idempotency: "read_only" as const, timeoutMs: 10_000, requiredCapabilities: [] as const } as const
 }
 
 export function createReadOnlyTools(source: ReadToolDataSource): RuntimeToolDefinition[] {
   return [
-    { ...readMetadata("jobs.search", "Search the current user's saved and discovered jobs"), inputSchema: JobSearchInputSchema, outputSchema: JobSearchResultSchema, execute: (context, input) => source.searchJobs(userId(context), input as JobSearchInput) },
-    { ...readMetadata("jobs.get", "Read one job owned by the current user"), inputSchema: JobIdInputSchema, outputSchema: Type.Object({ job: Type.Union([JobRecordSchema, Type.Null()]) }, { additionalProperties: false }), execute: async (context, input) => ({ job: await source.getJob(userId(context), (input as JobIdInput).jobId) }) },
-    { ...readMetadata("persona.retrieve", "Retrieve confirmed candidate facts with provenance"), inputSchema: PersonaRetrieveInputSchema, outputSchema: PersonaResultSchema, execute: (context, input) => source.retrievePersona(userId(context), input as PersonaRetrieveInput) },
-    { ...readMetadata("resume.get_base", "Read an immutable base resume owned by the current user"), inputSchema: BaseResumeInputSchema, outputSchema: ResumeResultSchema, execute: (context, input) => source.getBaseResume(userId(context), input as BaseResumeInput) },
-    { ...readMetadata("application.get_state", "Read application preparation state and pending approvals"), inputSchema: ApplicationStateInputSchema, outputSchema: ApplicationResultSchema, execute: (context, input) => source.getApplicationState(userId(context), input as ApplicationStateInput) },
+    { ...readMetadata("jobs.search", "Search the current user's saved and discovered jobs", "jobs"), inputSchema: JobSearchInputSchema, outputSchema: JobSearchResultSchema, execute: (context, input) => source.searchJobs(userId(context), input as JobSearchInput) },
+    { ...readMetadata("jobs.get", "Read one job owned by the current user", "jobs"), inputSchema: JobIdInputSchema, outputSchema: Type.Object({ job: Type.Union([JobRecordSchema, Type.Null()]) }, { additionalProperties: false }), execute: async (context, input) => ({ job: await source.getJob(userId(context), (input as JobIdInput).jobId) }) },
+    { ...readMetadata("persona.retrieve", "Retrieve confirmed candidate facts with provenance", "persona"), inputSchema: PersonaRetrieveInputSchema, outputSchema: PersonaResultSchema, execute: (context, input) => source.retrievePersona(userId(context), input as PersonaRetrieveInput) },
+    { ...readMetadata("resume.get_base", "Read an immutable base resume owned by the current user", "resume"), inputSchema: BaseResumeInputSchema, outputSchema: ResumeResultSchema, execute: (context, input) => source.getBaseResume(userId(context), input as BaseResumeInput) },
+    { ...readMetadata("application.get_state", "Read application preparation state and pending approvals", "application"), inputSchema: ApplicationStateInputSchema, outputSchema: ApplicationResultSchema, execute: (context, input) => source.getApplicationState(userId(context), input as ApplicationStateInput) },
   ]
 }
 

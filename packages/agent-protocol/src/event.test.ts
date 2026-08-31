@@ -25,6 +25,7 @@ describe('AgentEvent envelopes', () => {
     expect(validate(AgentEventEnvelopeSchema, unknown)).toBe(true)
     expect(JSON.parse(JSON.stringify(unknown))).toEqual(unknown)
     expect(isKnownAgentEventType('item.completed')).toBe(true)
+    expect(isKnownAgentEventType('policy.decision')).toBe(true)
     expect(isKnownAgentEventType('future.event.v3')).toBe(false)
   })
 
