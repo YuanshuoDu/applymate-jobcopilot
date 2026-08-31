@@ -99,6 +99,8 @@ model User {
   agentRuns                   AgentRun[]
   agentExecutions             AgentExecution[]
   agentSessions               AgentSession[]
+  agentTurns                  AgentTurn[]
+  agentInputs                 AgentInput[]
   applicationTasks            ApplicationTask[]
   formPatterns                FormPattern[]
   agentAutomations            AgentAutomation[]
@@ -1649,6 +1651,9 @@ model AgentSession {
   transcript       AgentTranscriptEvent[]
   approvals        AgentApproval[]
   applicationTasks ApplicationTask[]
+  turns            AgentTurn[]
+  steps            AgentStep[]
+  inputs           AgentInput[]
   execution        AgentExecution?
   automation       AgentAutomation?
 
@@ -1656,6 +1661,106 @@ model AgentSession {
   @@index([userId, lastViewedAt(sort: Desc)])
   @@index([userId, status])
   @@map("agent_sessions")
+}
+
+// Harness 2.0 durable Turn boundary. Active root serialization is enforced
+// by the partial unique index in the additive migration, not by a global
+// sessionId unique constraint, so terminal history remains append-only.
+model AgentTurn {
+  id                   String    @id @default(cuid())
+  sessionId            String
+  userId               String
+  status               String    @default("queued")
+  source               String
+  input                Json
+  finalResponse        String?   @db.Text
+  error                String?   @db.Text
+  rootTaskId           String?
+  contextSnapshotId    String?
+  modelProfileSnapshot Json
+  toolPolicySnapshot   Json
+  budgetSnapshot       Json
+  revision             Int       @default(0)
+  inputTokens          Int       @default(0)
+  outputTokens         Int       @default(0)
+  estimatedCostUsd     Decimal   @default(0) @db.Decimal(12, 8)
+  durationMs           Int?
+  startedAt            DateTime?
+  completedAt          DateTime?
+  createdAt            DateTime  @default(now())
+  updatedAt            DateTime  @updatedAt
+
+  session AgentSession @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+  user    User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+  steps   AgentStep[]
+  inputs  AgentInput[] @relation("AgentTurnInputs")
+
+  @@index([sessionId, createdAt])
+  @@index([userId, status, updatedAt(sort: Desc)])
+  @@map("agent_turns")
+}
+
+model AgentStep {
+  id                     String    @id @default(cuid())
+  sessionId              String
+  turnId                 String
+  taskId                 String?
+  parentStepId           String?
+  ordinal                Int
+  attempt                Int       @default(1)
+  status                 String    @default("queued")
+  inputSnapshotId        String?
+  inputThroughSequence   BigInt
+  consumedInputIds       Json
+  modelProfileSnapshot   Json
+  providerResponseId     String?
+  providerConversationId String?
+  finishReason           String?
+  errorCode              String?
+  inputTokens            Int       @default(0)
+  outputTokens           Int       @default(0)
+  estimatedCostUsd       Decimal   @default(0) @db.Decimal(12, 8)
+  durationMs             Int?
+  startedAt              DateTime?
+  completedAt            DateTime?
+  createdAt              DateTime  @default(now())
+
+  session        AgentSession @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+  turn           AgentTurn    @relation(fields: [turnId], references: [id], onDelete: Cascade)
+  parentStep     AgentStep?   @relation("AgentStepRepairChain", fields: [parentStepId], references: [id], onDelete: SetNull)
+  childSteps     AgentStep[]  @relation("AgentStepRepairChain")
+  consumedInputs AgentInput[] @relation("AgentStepConsumedInputs")
+
+  @@unique([turnId, ordinal, attempt])
+  @@index([turnId, status, createdAt])
+  @@index([providerResponseId])
+  @@map("agent_steps")
+}
+
+model AgentInput {
+  id               String    @id @default(cuid())
+  sessionId        String
+  targetTurnId     String?
+  userId           String
+  clientMessageId  String
+  delivery         String
+  status           String    @default("accepted")
+  content          Json
+  acceptedSequence BigInt
+  consumedByStepId String?
+  consumedAt       DateTime?
+  cancelledAt      DateTime?
+  createdAt        DateTime  @default(now())
+
+  session        AgentSession @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+  targetTurn     AgentTurn?   @relation("AgentTurnInputs", fields: [targetTurnId], references: [id], onDelete: SetNull)
+  user           User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+  consumedByStep AgentStep?   @relation("AgentStepConsumedInputs", fields: [consumedByStepId], references: [id], onDelete: SetNull)
+
+  @@unique([sessionId, clientMessageId])
+  @@index([sessionId, status, acceptedSequence])
+  @@index([targetTurnId, status, acceptedSequence])
+  @@map("agent_inputs")
 }
 
 model SubAgentTask {
