@@ -100,6 +100,25 @@ async function assertScope(row: ApprovalRow, expected: ApprovalScopeMatch, now: 
   return actual
 }
 
+/** Verifies a pending receipt before a decision can mutate its state. */
+async function assertPendingScope(row: ApprovalRow, expected: ApprovalScopeMatch, now: Date): Promise<ApprovalScope> {
+  if (row.status !== "pending") throw new ApprovalStoreError("approval_not_approved", "Approval receipt is no longer pending")
+  if (row.expiresAt && row.expiresAt <= now) throw new ApprovalStoreError("approval_expired", "Approval receipt has expired")
+
+  const actual = scopeFromRow(row)
+  if (row.scopeHash !== await hashApprovalScope(actual)) {
+    throw new ApprovalStoreError("approval_integrity_error", "Approval receipt scope integrity check failed")
+  }
+  const expectedNonceHash = await hashApprovalNonce(expected.nonce)
+  if (row.nonceHash !== expectedNonceHash) throw new ApprovalStoreError("approval_nonce_mismatch", "Approval receipt nonce does not match")
+  const expectedScope = protocolScope(expected, expectedNonceHash)
+  if (row.scopeHash !== await hashApprovalScope(expectedScope)) {
+    if (row.revision !== expected.revision) throw new ApprovalStoreError("approval_revision_mismatch", "Approval receipt revision is stale")
+    throw new ApprovalStoreError("approval_scope_mismatch", "Approval receipt scope does not match the requested action")
+  }
+  return actual
+}
+
 export async function issueApprovalReceipt(db: PrismaClient, input: IssueApprovalReceiptInput): Promise<ApprovalReceiptResult> {
   assertScopeInput(input.scope)
   const nonce = input.nonce ?? createApprovalNonce()
@@ -127,7 +146,7 @@ export async function issueApprovalReceipt(db: PrismaClient, input: IssueApprova
           scopeHash, nonceHash, revision: input.scope.revision, expiresAt: input.scope.expiresAt,
         },
       })
-      await projectApprovalWaitInTransaction(tx, {
+      if (input.projectWait !== false) await projectApprovalWaitInTransaction(tx, {
         sessionId: input.scope.sessionId,
         userId: input.scope.userId,
         approvalId,
@@ -160,6 +179,13 @@ export async function validateApproval(db: PrismaClient, id: string, expected: A
   assertScopeInput(expected)
   const row = await loadApproval(db, id, expected.userId)
   await assertScope(row, expected, now)
+  return mapApproval(row)
+}
+
+export async function validatePendingApprovalReceipt(db: PrismaClient, id: string, expected: ApprovalScopeMatch, now = new Date()): Promise<AgentApproval> {
+  assertScopeInput(expected)
+  const row = await loadApproval(db, id, expected.userId)
+  await assertPendingScope(row, expected, now)
   return mapApproval(row)
 }
 

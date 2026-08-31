@@ -9,6 +9,7 @@ import { hasEffectiveEntitlement } from '@/lib/entitlements'
 import { isRuntimeAgentHarnessFeatureEnabled } from '@/lib/runtime-feature-flags'
 import { createDualWriteSession } from '@/lib/agent/session/dual-write'
 import { appendTranscriptEvent, type AppendTranscriptEventInput } from '@/lib/agent/session/repository'
+import { requireLegacyPolicy } from '@/lib/agent/policy/legacy'
 
 type AutomationForRun = {
   id: string
@@ -47,6 +48,12 @@ function automationPayload(automation: AutomationForRun) {
 }
 
 async function startAutomation(automation: AutomationForRun, now: Date) {
+  requireLegacyPolicy({
+    userId: automation.userId, sessionId: automation.sessionId ?? `automation-scheduler:${automation.id}`,
+    turnId: `automation-scheduler:${automation.id}`, stepId: "automation.schedule", toolCallId: `automation-schedule:${automation.id}`,
+    role: "system", toolName: "automation.run", domain: "automation", risk: "internal_write",
+    capabilities: ["read", "write", "coordination"], input: { mutation: "scheduled_run", requiresReceipt: false, unknownSensitiveFacts: false },
+  })
   if (automation.sessionId) {
     const execution = await db.agentExecution.findFirst({
       where: { userId: automation.userId, sessionId: automation.sessionId },

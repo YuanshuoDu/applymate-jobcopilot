@@ -1,4 +1,6 @@
 import { NextRequest } from "next/server"
+import { Prisma } from "@prisma/client"
+import { redactAgentEvent } from "@jobcopilot/shared"
 import { db } from "@/lib/db"
 import { err, isErrorResponse, ok, requireAuth } from "@/lib/api-helpers"
 import { nextRunAtFromCron } from "@/lib/agent/automation-schedule"
@@ -7,6 +9,9 @@ import { loadUserAiConfig } from "@/lib/model-router"
 import { isFeatureAllowed, resolveAiAccess } from "@/lib/entitlements"
 import { tailorResumeForAgent } from "@/lib/agent/resume-tailoring"
 import { queueApplicationFill, queueAutonomousApplication } from "@/lib/auto-apply"
+import { clientReceipt, consumeLegacyReceipt, issueLegacyReceipt, resolveLegacyApproval, validateLegacyReceipt, type ScopedApprovalRecord } from "@/lib/agent/approval/legacy-receipt"
+import { ensureV2Turn } from "@/lib/agent/session/v2-turn"
+import { requireLegacyPolicy } from "@/lib/agent/policy/legacy"
 
 interface RouteCtx {
   params: Promise<{ id: string }>
@@ -19,14 +24,23 @@ type ApprovalAction = {
   approvalId: string | null
   decision: ApprovalDecision
   body: string
+  receiptNonce: string | null
 }
 
 type CreateAutomationAction = {
   type: "create_automation"
   draft: AutomationDraft
+  approvalId: string | null
+  receiptNonce: string | null
 }
 
 type SessionAction = ApprovalAction | CreateAutomationAction
+
+type ScopedApproval = ScopedApprovalRecord & {
+  resourceHash: string | null
+  materialHash: string | null
+  answersHash: string | null
+}
 
 type AutomationDraft = {
   name: string
@@ -48,11 +62,16 @@ function readBody(body: unknown): SessionAction | null {
     approvalId?: unknown
     decision?: unknown
     body?: unknown
+    receiptNonce?: unknown
     draft?: unknown
   }
   if (row.type === "create_automation") {
     const draft = readAutomationDraft(row.draft)
-    return draft ? { type: "create_automation", draft } : null
+    return draft ? {
+      type: "create_automation", draft,
+      approvalId: typeof row.approvalId === "string" && row.approvalId ? row.approvalId : null,
+      receiptNonce: typeof row.receiptNonce === "string" && row.receiptNonce ? row.receiptNonce : null,
+    } : null
   }
   if (row.type !== "approval_response") return null
   const rawDecision = typeof row.decision === "string" ? row.decision : "review"
@@ -64,6 +83,7 @@ function readBody(body: unknown): SessionAction | null {
     body: typeof row.body === "string" && row.body.trim()
       ? row.body.trim()
       : approvalBody(decision),
+    receiptNonce: typeof row.receiptNonce === "string" && row.receiptNonce.trim() ? row.receiptNonce.trim() : null,
   }
 }
 
@@ -167,6 +187,29 @@ export async function POST(req: NextRequest, ctx: RouteCtx) {
   if (!action) return err("Unsupported action type", 400)
 
   if (action.type === "create_automation") {
+    if (!action.approvalId || !action.receiptNonce) return err("Saving an automation requires a scoped approval receipt", 428)
+    const automationApproval = await db.agentApproval.findFirst({
+      where: { id: action.approvalId, sessionId: id, userId: auth.userId, status: "pending", type: "automation_mutation" },
+      select: {
+        id: true, type: true, payload: true, turnId: true, toolCallId: true, jobId: true,
+        revision: true, expiresAt: true, resourceHash: true, materialHash: true, answersHash: true,
+      },
+    })
+    if (!automationApproval) return err("Automation approval is no longer pending", 409)
+    try {
+      requireLegacyPolicy({
+        userId: auth.userId, sessionId: id, turnId: automationApproval.turnId ?? `automation:${id}`,
+        stepId: `automation:${action.approvalId}`, toolCallId: automationApproval.toolCallId ?? `automation:${id}`,
+        toolName: "automation.mutate", domain: "automation", risk: "internal_write", capabilities: ["read", "write"],
+        input: { requiresReceipt: true, receiptValidated: true, unknownSensitiveFacts: false },
+      })
+      await validateReceiptForApproval(db, automationApproval, action.receiptNonce, auth.userId, id, { automationName: action.draft.name })
+      await resolveLegacyApproval(db, { approval: automationApproval, userId: auth.userId, sessionId: id, decision: "approved" })
+      if (automationApproval.turnId) await db.agentTurn.update({ where: { id: automationApproval.turnId }, data: { status: "in_progress" } })
+      await consumeReceiptForApproval(db, automationApproval, action.receiptNonce, auth.userId, id, { automationName: action.draft.name })
+    } catch (error) {
+      return err(error instanceof Error ? error.message : "Automation approval could not be consumed", 409)
+    }
     const existing = await db.agentAutomation.findFirst({
       where: { userId: auth.userId, name: action.draft.name },
       select: { id: true },
@@ -184,14 +227,9 @@ export async function POST(req: NextRequest, ctx: RouteCtx) {
         type: eventType,
         speaker: "Orchestrator",
         title: existing ? "Automation updated" : "Automation created",
-        body: `${existing ? "Updated" : "Created"} automation: ${action.draft.name}`,
-        data: {
-          automationId: automation.id,
-          draft: action.draft,
-          mode: existing ? "updated_existing" : "created_new",
-        },
         durationMs: null,
-      },
+        ...safeEventFields(eventType, `${existing ? "Updated" : "Created"} automation: ${action.draft.name}`, { automationId: automation.id, draft: action.draft, mode: existing ? "updated_existing" : "created_new" }),
+        },
     })
 
     return ok({
@@ -200,32 +238,61 @@ export async function POST(req: NextRequest, ctx: RouteCtx) {
     })
   }
 
-  let approval: { type: string; payload: unknown } | null = null
+  let approval: ScopedApproval | null = null
   if (action.approvalId) {
     approval = await db.agentApproval.findFirst({
       where: { id: action.approvalId, sessionId: id, userId: auth.userId, status: 'pending' },
-      select: { type: true, payload: true },
+      select: {
+        id: true, type: true, payload: true, turnId: true, toolCallId: true, jobId: true,
+        revision: true, expiresAt: true, resourceHash: true, materialHash: true, answersHash: true,
+      },
     })
     if (!approval) return err("Approval is no longer pending", 409)
+    const policy = approvalPolicyInput(approval)
+    try {
+      requireLegacyPolicy({
+        userId: auth.userId,
+        sessionId: id,
+        turnId: approval.turnId ?? `legacy-approval:${action.approvalId}`,
+        stepId: `approval:${action.approvalId}`,
+        toolCallId: approval.toolCallId ?? `approval:${action.approvalId}`,
+        toolName: policy.toolName,
+        domain: policy.domain,
+        risk: policy.risk,
+        capabilities: policy.capabilities,
+        input: {
+          requiresReceipt: action.decision === "approved",
+          receiptValidated: Boolean(action.receiptNonce),
+          unknownSensitiveFacts: false,
+        },
+      })
+    } catch (error) {
+      return policyErrorResponse(error)
+    }
+    if (action.decision === "approved" && !action.receiptNonce) return err("A scoped receipt is required to approve this action", 428)
     if (action.decision === "approved" && approval.type === "tailor_resume") {
       if (!(await isFeatureAllowed(auth.userId, "tailored_resume"))) return err("This feature is not included in your current plan", 403)
       const aiAccess = await resolveAiAccess(auth.userId)
       if (aiAccess === "disabled") return err("This feature is not included in your current plan", 403)
       if (aiAccess === "exhausted") return err("Monthly AI credits exhausted", 429)
     }
-    const result = await db.agentApproval.updateMany({
-      where: {
-        id: action.approvalId,
-        sessionId: id,
+    try {
+      if (action.decision === "approved") await validateReceiptForApproval(db, approval, action.receiptNonce!, auth.userId, id)
+      await resolveLegacyApproval(db, {
+        approval,
         userId: auth.userId,
-        status: "pending",
-      },
-      data: {
-        status: action.decision,
-        decidedAt: new Date(),
-      },
-    })
-    if (result.count === 0) return err("Approval is no longer pending", 409)
+        sessionId: id,
+        decision: action.decision === "approved" ? "approved" : "rejected",
+      })
+      if (approval.turnId) {
+        await db.agentTurn.update({ where: { id: approval.turnId }, data: { status: "in_progress" } })
+      }
+      if (action.decision === "approved" && approval.type !== "submit_application") {
+        await consumeReceiptForApproval(db, approval, action.receiptNonce!, auth.userId, id)
+      }
+    } catch (error) {
+      return err(error instanceof Error ? error.message : "Approval could not be resolved", 409)
+    }
   }
 
   if (action.decision === 'approved' && approval?.type === 'tailor_resume') {
@@ -242,24 +309,37 @@ export async function POST(req: NextRequest, ctx: RouteCtx) {
         data: {
           sessionId: id, taskId: null, type: 'resume_tailored', speaker: 'Writer',
           title: 'Tailored resume ready',
-          body: `${artifact.name} is ready for Reviewer and your final confirmation.`,
-          data: { resume: { ...artifact } }, durationMs: null,
+          durationMs: null,
+          ...safeEventFields('resume_tailored', `${artifact.name} is ready for Reviewer and your final confirmation.`, { resume: { ...artifact } }),
         },
       })
-      const finalApproval = await db.agentApproval.create({
-        data: {
-          sessionId: id, userId: auth.userId, type: 'confirm_tailored_resume', status: 'pending',
-          title: 'Confirm tailored resume',
-          body: `Reviewer: confirm ${artifact.name} as the final resume for ${artifact.company} · ${artifact.role} before handing it to Executor.`,
-          impact: { resume: artifact.name, company: artifact.company, role: artifact.role },
-          payload: { resumeId: artifact.id, jobId: artifact.jobId },
-        },
+      const turn = await ensureV2Turn(db, {
+        sessionId: id,
+        userId: auth.userId,
+        goal: `Confirm tailored resume for ${artifact.company} · ${artifact.role}`,
+        source: "user",
+      })
+      const currentTurn = await db.agentTurn.findFirst({ where: { id: turn.turnId, sessionId: id, userId: auth.userId }, select: { revision: true } })
+      const finalApproval = await issueLegacyReceipt(db, {
+        userId: auth.userId,
+        sessionId: id,
+        turnId: turn.turnId,
+        toolCallId: `resume-confirm:${artifact.id}`,
+        jobId: artifact.jobId,
+        action: "confirm_tailored_resume",
+        title: "Confirm tailored resume",
+        body: `Reviewer: confirm ${artifact.name} as the final resume for ${artifact.company} · ${artifact.role} before handing it to Executor.`,
+        impact: { resume: artifact.name, company: artifact.company, role: artifact.role },
+        payload: { resumeId: artifact.id, jobId: artifact.jobId },
+        resource: { jobId: artifact.jobId },
+        material: { resumeId: artifact.id, jobId: artifact.jobId },
+        revision: currentTurn?.revision ?? 0,
       })
       const reviewEvent = await db.agentTranscriptEvent.create({
         data: {
           sessionId: id, taskId: null, type: 'approval_request', speaker: 'Reviewer',
-          title: 'Final resume review', body: finalApproval.body,
-          data: { approval: { id: finalApproval.id, type: finalApproval.type, title: finalApproval.title, body: finalApproval.body, impact: finalApproval.impact, payload: finalApproval.payload, status: finalApproval.status } }, durationMs: null,
+          title: 'Final resume review', durationMs: null,
+          ...safeEventFields('approval_request', finalApproval.approval.body, { approval: clientReceipt(finalApproval, { resume: artifact.name, company: artifact.company, role: artifact.role }) }),
         },
       })
       await updateAgentSession(db, { sessionId: id, status: 'waiting_for_user', completedAt: null })
@@ -267,7 +347,7 @@ export async function POST(req: NextRequest, ctx: RouteCtx) {
     } catch (error) {
       const message = error instanceof Error ? error.message : 'Could not tailor the resume.'
       const event = await db.agentTranscriptEvent.create({
-        data: { sessionId: id, taskId: null, type: 'error', speaker: 'Writer', title: 'Tailoring failed', body: message, data: { approvalId: action.approvalId }, durationMs: null },
+        data: { sessionId: id, taskId: null, type: 'error', speaker: 'Writer', title: 'Tailoring failed', durationMs: null, ...safeEventFields('error', message, { approvalId: action.approvalId }) },
       })
       return ok({ event: serializeEvent(event) })
     }
@@ -291,10 +371,10 @@ export async function POST(req: NextRequest, ctx: RouteCtx) {
     const event = await db.agentTranscriptEvent.create({
       data: {
         sessionId: id, taskId: null, type: 'resume_finalized', speaker: 'Reviewer', title: 'Application pack ready',
-        body: job.url
+        durationMs: null,
+        ...safeEventFields('resume_finalized', job.url
           ? `${resume.name} is confirmed for ${job.company} · ${job.role}. Open the employer form, let the extension fill the fields, review everything, then submit it yourself.`
-          : `${resume.name} is confirmed and linked to ${job.company} · ${job.role}, but this job has no application URL.`,
-        data: { resume: { id: resume.id, name: resume.name }, job }, durationMs: null,
+          : `${resume.name} is confirmed and linked to ${job.company} · ${job.role}, but this job has no application URL.`, { resume: { id: resume.id, name: resume.name }, job }),
       },
     })
     await updateAgentSession(db, { sessionId: id, status: 'completed', completedAt: new Date() })
@@ -310,7 +390,7 @@ export async function POST(req: NextRequest, ctx: RouteCtx) {
         data: { status: "cancelled", checkpoint: "review_declined", completedAt: new Date() },
       })
       await db.applicationTaskEvent.create({
-        data: { taskId: payload.applicationTaskId, type: "review_declined", actor: "user", body: action.body },
+        data: { taskId: payload.applicationTaskId, type: "review_declined", actor: "user", body: safeEventFields("review_declined", action.body, {}).body },
       })
     } else {
       const job = await db.job.findFirst({ where: { id: payload.jobId, userId: auth.userId }, select: { company: true, role: true, url: true } })
@@ -318,7 +398,7 @@ export async function POST(req: NextRequest, ctx: RouteCtx) {
       try {
         const queued = await queueApplicationFill({ userId: auth.userId, jobId: payload.jobId, applyUrl: job.url, applicationTaskId: payload.applicationTaskId })
         const event = await db.agentTranscriptEvent.create({
-          data: { sessionId: id, taskId: null, type: "application_queued", speaker: "Executor", title: "Form fill queued", body: "The worker will fill this form without submitting it. Refresh this session when it is ready for final review.", data: { ...queued, jobId: payload.jobId, operation: "fill" }, durationMs: null },
+          data: { sessionId: id, taskId: null, type: "application_queued", speaker: "Executor", title: "Form fill queued", durationMs: null, ...safeEventFields("application_queued", "The worker will fill this form without submitting it. Refresh this session when it is ready for final review.", { ...queued, jobId: payload.jobId, operation: "fill" }) },
         })
         await updateAgentSession(db, { sessionId: id, status: "running", completedAt: null })
         return ok({ event: serializeEvent(event) })
@@ -340,9 +420,11 @@ export async function POST(req: NextRequest, ctx: RouteCtx) {
         applyUrl: job.url,
         applicationTaskId: payload.applicationTaskId,
         approvalId: action.approvalId!,
+        receiptNonce: action.receiptNonce!,
+        sessionId: id,
       })
       const event = await db.agentTranscriptEvent.create({
-        data: { sessionId: id, taskId: null, type: "application_queued", speaker: "Executor", title: "Submission queued", body: "Your approved application was queued for background execution.", data: { ...queued, jobId: payload.jobId }, durationMs: null },
+        data: { sessionId: id, taskId: null, type: "application_queued", speaker: "Executor", title: "Submission queued", durationMs: null, ...safeEventFields("application_queued", "Your approved application was queued for background execution.", { ...queued, jobId: payload.jobId }) },
       })
       await updateAgentSession(db, { sessionId: id, status: "running", completedAt: null })
       return ok({ event: serializeEvent(event) })
@@ -365,7 +447,7 @@ export async function POST(req: NextRequest, ctx: RouteCtx) {
         },
       })
       await db.applicationTaskEvent.create({
-        data: { taskId: payload.applicationTaskId, type: `submission_${action.decision}`, actor: "user", body: action.body },
+        data: { taskId: payload.applicationTaskId, type: `submission_${action.decision}`, actor: "user", body: safeEventFields(`submission_${action.decision}`, action.body, {}).body },
       })
     }
   }
@@ -377,13 +459,9 @@ export async function POST(req: NextRequest, ctx: RouteCtx) {
       type: "approval_response",
       speaker: "You",
       title: approvalTitle(action.decision),
-      body: action.body,
-      data: {
-        approvalId: action.approvalId,
-        decision: action.decision,
-      },
       durationMs: null,
-    },
+      ...safeEventFields("approval_response", action.body, { approvalId: action.approvalId, decision: action.decision }),
+      },
   })
 
   await updateAgentSession(db, {
@@ -407,4 +485,67 @@ function applicationPayload(value: unknown) {
   const applicationTaskId = text(payload.applicationTaskId)
   const jobId = text(payload.jobId)
   return applicationTaskId && jobId ? { applicationTaskId, jobId } : null
+}
+
+function approvalPolicyInput(approval: ScopedApproval) {
+  if (approval.type === "submit_application") return { toolName: "application.submit", domain: "application" as const, risk: "external_write" as const, capabilities: ["read", "write", "external_write"] as const }
+  if (approval.type === "review_application") return { toolName: "application.fill", domain: "application" as const, risk: "internal_write" as const, capabilities: ["read", "write", "browser"] as const }
+  if (approval.type === "send_gmail") return { toolName: "gmail.send", domain: "gmail" as const, risk: "external_write" as const, capabilities: ["read", "write", "external_write"] as const }
+  if (approval.type === "automation_mutation") return { toolName: "automation.mutate", domain: "automation" as const, risk: "internal_write" as const, capabilities: ["read", "write"] as const }
+  return { toolName: "resume.tailor", domain: "resume" as const, risk: "draft_write" as const, capabilities: ["read", "write"] as const }
+}
+
+function policyErrorResponse(error: unknown) {
+  const message = error instanceof Error ? error.message : "The policy did not permit this action"
+  const status = error && typeof error === "object" && "outcome" in error && (error as { outcome?: unknown }).outcome === "require_user_input"
+    ? 422
+    : 428
+  return err(message, status)
+}
+
+async function consumeReceiptForApproval(db: Parameters<typeof consumeLegacyReceipt>[0], approval: ScopedApproval, nonce: string, userId: string, sessionId: string, resource?: unknown) {
+  if (!approval.turnId || !approval.toolCallId || !approval.jobId || !approval.expiresAt) {
+    throw new Error("Approval is missing its immutable receipt scope")
+  }
+  await consumeLegacyReceipt(db, {
+    approvalId: approval.id,
+    userId,
+    sessionId,
+    turnId: approval.turnId,
+    toolCallId: approval.toolCallId,
+    jobId: approval.jobId,
+    action: approval.type as never,
+    nonce,
+    resource: resource ?? { jobId: approval.jobId },
+    material: approval.payload,
+    answers: null,
+    revision: approval.revision,
+    expiresAt: approval.expiresAt,
+  })
+}
+
+async function validateReceiptForApproval(db: Parameters<typeof validateLegacyReceipt>[0], approval: ScopedApproval, nonce: string, userId: string, sessionId: string, resource?: unknown) {
+  if (!approval.turnId || !approval.toolCallId || !approval.jobId || !approval.expiresAt) {
+    throw new Error("Approval is missing its immutable receipt scope")
+  }
+  await validateLegacyReceipt(db, {
+    approvalId: approval.id,
+    userId,
+    sessionId,
+    turnId: approval.turnId,
+    toolCallId: approval.toolCallId,
+    jobId: approval.jobId,
+    action: approval.type as never,
+    nonce,
+    resource: resource ?? { jobId: approval.jobId },
+    material: approval.payload,
+    answers: null,
+    revision: approval.revision,
+    expiresAt: approval.expiresAt,
+  })
+}
+
+function safeEventFields(type: string, body: string, data: unknown) {
+  const safe = redactAgentEvent({ type, body, data })
+  return { body: safe.body, ...(safe.data === null ? {} : { data: safe.data as Prisma.InputJsonValue }) }
 }

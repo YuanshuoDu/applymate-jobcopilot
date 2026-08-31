@@ -162,7 +162,7 @@ export function createPgApprovalStore(pool: pg.Pool, scope: { userId: string }) 
           const job = await client.query(`SELECT "id" FROM "Job" WHERE "id" = $1 AND "userId" = $2`, [input.scope.jobId, scope.userId])
           if (!job.rows[0]) throw new ApprovalStoreError("approval_scope_mismatch", "Approval job is not owned by the Worker tenant")
           const result = await client.query<ApprovalRow>(`INSERT INTO "agent_approvals" ("id", "sessionId", "taskId", "userId", "turnId", "toolCallId", "jobId", "type", "status", "title", "body", "impact", "payload", "resourceHash", "materialHash", "answersHash", "scopeHash", "nonceHash", "revision", "expiresAt") VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'pending', $9, $10, $11::jsonb, $12::jsonb, $13, $14, $15, $16, $17, $18, $19) RETURNING *`, [id, input.scope.sessionId, input.taskId ?? null, scope.userId, input.scope.turnId, input.scope.toolCallId, input.scope.jobId, input.scope.action, input.title, input.body, JSON.stringify(input.impact ?? null), JSON.stringify(input.payload), input.scope.resourceHash, input.scope.materialHash, input.scope.answersHash, scopeHash, nonceHash, input.scope.revision, input.scope.expiresAt])
-          await projectApprovalWait(client, input, id, scopeHash)
+          if (input.projectWait !== false) await projectApprovalWait(client, input, id, scopeHash)
           await appendAudit(client, { sessionId: input.scope.sessionId, turnId: input.scope.turnId, taskId: input.taskId ?? null, type: "approval.requested", actor: "orchestrator", approvalId: id, payload: auditPayload(id, input.scope.action, scopeHash, input.scope.revision), key: `approval:${id}:requested` })
           return result.rows[0]
         })

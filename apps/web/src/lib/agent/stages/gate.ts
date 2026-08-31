@@ -22,6 +22,10 @@ import type {
 import { stageOk } from '../types'
 import { roleAiConfig } from '../role-config'
 import { holdForApplicationReview } from '../application-control'
+import { requireLegacyPolicy } from '../policy/legacy'
+import { clientReceipt, issueLegacyReceipt } from '../approval/legacy-receipt'
+import { ensureV2Turn } from '../session/v2-turn'
+import { randomUUID } from 'node:crypto'
 
 // ── AI Quality Review ─────────────────────────────────────────────────────────
 
@@ -82,6 +86,7 @@ export async function runGate(
   const skipped:  ApplicationPackage[] = []
 
   const { emit } = ctx
+  let projectedWaitIssued = false
 
   // Proactive question: borderline jobs (within 5% of threshold). In a
   // controlled run this is a durable pause, not a best-effort UI suggestion.
@@ -155,6 +160,13 @@ export async function runGate(
     }
 
     pending.push(pkg)
+    if (ctx.sessionId) {
+      requireLegacyPolicy({
+        userId: ctx.userId, sessionId: ctx.sessionId, turnId: `gate:${ctx.sessionId}`, stepId: `review:${pkg.job.id}`,
+        toolCallId: `review:${pkg.job.id}`, toolName: 'application.review', domain: 'application', risk: 'internal_write',
+        capabilities: ['read', 'write'], input: { requiresReceipt: false, unknownSensitiveFacts: false, jobId: pkg.job.id },
+      })
+    }
     const task = await holdForApplicationReview({
       userId: ctx.userId,
       jobId: pkg.job.id,
@@ -163,19 +175,9 @@ export async function runGate(
       coverLetterId: pkg.coverLetterId,
     })
     const approval = ctx.sessionId
-      ? await db.agentApproval.create({
-          data: {
-            sessionId: ctx.sessionId,
-            userId: ctx.userId,
-            type: "review_application",
-            status: "pending",
-            title: `Review application: ${pkg.job.company} · ${pkg.job.role}`,
-            body: "Review the job, tailored materials, and every proposed answer. Approval here only unlocks the final submit authorization; it never submits by itself.",
-            impact: { externalSubmission: false, jobId: pkg.job.id },
-            payload: { applicationTaskId: task.id, jobId: pkg.job.id },
-          },
-        })
+      ? await createReviewReceipt(ctx, task.id, pkg, projectedWaitIssued)
       : null
+    if (approval?.projectedWait) projectedWaitIssued = true
     emit('agent_observation', {
       role:        'reviewer',
       observation: `⏳ Enter to be reviewed: Material saved, They must be reviewed individually by you and explicitly authorized before submission..`,
@@ -190,13 +192,7 @@ export async function runGate(
     if (approval) {
       emit("application_review_ready", {
         approval: {
-          id: approval.id,
-          type: approval.type,
-          title: approval.title,
-          body: approval.body,
-          impact: approval.impact,
-          payload: approval.payload,
-          status: approval.status,
+          ...approval.receipt,
         },
       })
     }
@@ -209,4 +205,46 @@ export async function runGate(
     approved.length + pending.length + skipped.length,
     total,
   )
+}
+
+async function createReviewReceipt(
+  ctx: PipelineCtx,
+  applicationTaskId: string,
+  pkg: ApplicationPackage,
+  projectedWaitAlreadyIssued: boolean,
+) {
+  const sessionId = ctx.sessionId
+  if (!sessionId) throw new Error("Application review is missing its Agent session")
+  const turn = await ensureV2Turn(db, {
+    sessionId,
+    userId: ctx.userId,
+    goal: `Review application for ${pkg.job.company} · ${pkg.job.role}`,
+    source: "user",
+  })
+  const currentTurn = await db.agentTurn.findFirst({
+    where: { id: turn.turnId, sessionId, userId: ctx.userId },
+    select: { revision: true, status: true },
+  })
+  const payload = { applicationTaskId, jobId: pkg.job.id }
+  const projectedWait = !projectedWaitAlreadyIssued && currentTurn?.status !== "waiting_for_approval"
+  const result = await issueLegacyReceipt(db, {
+    userId: ctx.userId,
+    sessionId,
+    turnId: turn.turnId,
+    toolCallId: `application-review:${randomUUID()}`,
+    jobId: pkg.job.id,
+    action: "review_application",
+    title: `Review application: ${pkg.job.company} · ${pkg.job.role}`,
+    body: "Review the job, tailored materials, and every proposed answer. Approval here only unlocks the form-fill pass; it never submits by itself.",
+    impact: { externalSubmission: false, jobId: pkg.job.id },
+    payload,
+    resource: { jobId: pkg.job.id },
+    material: payload,
+    revision: currentTurn?.revision ?? 0,
+    projectWait: projectedWait,
+  })
+  return {
+    projectedWait,
+    receipt: clientReceipt(result, { externalSubmission: false, jobId: pkg.job.id }),
+  }
 }

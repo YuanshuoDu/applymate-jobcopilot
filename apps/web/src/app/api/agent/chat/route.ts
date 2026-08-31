@@ -11,14 +11,16 @@
  *   navigate       path           — navigate to a page
  */
 import { NextRequest }                                from 'next/server'
-import type { Prisma }                                from '@prisma/client'
+import type { ApprovalType }                           from '@jobcopilot/agent-protocol'
 import { db }                                          from '@/lib/db'
 import { prepareAiRoute, sseResponse, err }             from '@/lib/api-helpers'
 import { appendTranscriptEvent, createAgentSession, updateAgentSession } from '@/lib/agent/session/repository'
 import { createDualWriteSession, type DualWriteSession } from '@/lib/agent/session/dual-write'
+import { ensureV2Turn } from '@/lib/agent/session/v2-turn'
+import { clientReceipt, issueLegacyReceipt } from '@/lib/agent/approval/legacy-receipt'
 import { isRuntimeAgentHarnessFeatureEnabled } from '@/lib/runtime-feature-flags'
 import { runSubAgentTask } from '@/lib/agent/session/subagent-task-runner'
-import { approvalRequestFrom, automationDraftFrom, resumeTailoringApprovalFrom } from './blocks'
+import { approvalRequestFrom, automationDraftFrom, resumeTailoringApprovalFrom, type AutomationDraft } from './blocks'
 import { correctedScoutPlan, createChatPlan, requestedMinMatchScore, requestsFullWorkflow, runChatWorker, scoutResultMatchesRequest, synthesizeChatResult, type ChatPlan, type ChatWorkerResult } from './chat-orchestrator'
 import { readSessionConversationHistory } from './session-history'
 import {
@@ -235,14 +237,18 @@ export async function POST(req: NextRequest) {
     const automationDraft = automationDraftFrom(userMessage)
     if (automationDraft) {
       const body = 'I drafted an automation from your request. Please confirm before I save it.'
-      send('block', { type: 'automation_draft', draft: automationDraft })
+      const anchorJob = jobs[0]
+      const automationReceipt = anchorJob
+        ? await createLegacyAutomationReceipt(session.id, prep.userId, userMessage, automationDraft, anchorJob.id)
+        : null
+      send('block', { type: 'automation_draft', draft: automationDraft, ...(automationReceipt ? { approval: automationReceipt } : {}) })
       await recordTranscript({
         sessionId: session.id,
         type: 'automation_draft',
         speaker: 'Orchestrator',
         title: 'Automation draft',
         body,
-        data: { draft: automationDraft },
+        data: { draft: automationDraft, ...(automationReceipt ? { approval: automationReceipt } : {}) },
       })
     }
 
@@ -251,19 +257,32 @@ export async function POST(req: NextRequest) {
       jobs: jobs.map(job => ({ id: job.id, company: job.company, role: job.role })),
     }) ?? approvalRequestFrom(userMessage, ctxData)
     if (approvalDraft) {
-      const approval = await db.agentApproval.create({
-        data: {
-          sessionId: session.id,
-          userId: prep.userId,
-          type: approvalDraft.type,
-          status: 'pending',
-          title: approvalDraft.title,
-          body: approvalDraft.body,
-          impact: approvalDraft.impact as Prisma.InputJsonValue,
-          payload: approvalDraft.payload as Prisma.InputJsonValue,
-        },
+      const jobId = typeof approvalDraft.payload.jobId === 'string'
+        ? approvalDraft.payload.jobId
+        : jobs[0]?.id
+      if (!jobId) throw new Error('A scoped approval requires at least one user-owned job target.')
+      const turn = await ensureV2Turn(db, {
+        sessionId: session.id,
+        userId: prep.userId,
+        goal: sessionGoalFrom(userMessage),
+        source: 'user',
       })
-      const approvalPayload = { id: approval.id, ...approvalDraft, status: 'pending' }
+      const payload = { ...approvalDraft.payload, jobId }
+      const receipt = await issueLegacyReceipt(db, {
+        userId: prep.userId,
+        sessionId: session.id,
+        turnId: turn.turnId,
+        toolCallId: `chat-approval:${session.id}:${jobId}`,
+        jobId,
+        action: approvalDraft.type as ApprovalType,
+        title: approvalDraft.title,
+        body: approvalDraft.body,
+        impact: approvalDraft.impact,
+        payload,
+        resource: { jobId },
+        material: payload,
+      })
+      const approvalPayload = { ...clientReceipt(receipt, approvalDraft.impact), ...approvalDraft, payload }
       send('block', { type: 'approval_request', approval: approvalPayload })
       await recordTranscript({
         sessionId: session.id,
@@ -298,4 +317,15 @@ export async function POST(req: NextRequest) {
     }
     send('done', {})
   })
+}
+
+async function createLegacyAutomationReceipt(sessionId: string, userId: string, message: string, draft: AutomationDraft, jobId: string) {
+  const turn = await ensureV2Turn(db, { sessionId, userId, goal: sessionGoalFrom(message), source: 'user' })
+  const payload = { draft }
+  const result = await issueLegacyReceipt(db, {
+    userId, sessionId, turnId: turn.turnId, toolCallId: `automation-mutate:${sessionId}:${jobId}`, jobId,
+    action: 'automation_mutation', title: 'Confirm automation', body: 'Review the automation settings. It will be saved only after this explicit confirmation.',
+    impact: { durableMutation: true, autoApply: draft.autoApply }, payload, resource: { automationName: draft.name }, material: payload,
+  })
+  return clientReceipt(result, { durableMutation: true, autoApply: draft.autoApply })
 }

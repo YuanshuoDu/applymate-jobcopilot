@@ -72,7 +72,15 @@ export async function PATCH(req: NextRequest) {
       : {}
     await db.$transaction(async tx => {
       await tx.applicationTask.update({ where: { id: task.id }, data: { confirmedAnswers: { ...existing, ...answers } as Prisma.InputJsonValue } })
-      await tx.applicationTaskEvent.create({ data: { taskId: task.id, type: "user_answers_confirmed", actor: "user", body: "Candidate explicitly confirmed application-specific form answers.", data: answers as Prisma.InputJsonValue } })
+      await tx.applicationTaskEvent.create({ data: {
+        taskId: task.id,
+        type: "user_answers_confirmed",
+        actor: "user",
+        body: "Candidate explicitly confirmed application-specific form answers.",
+        // Keep the event useful for audit without copying the sensitive values
+        // that are required by the worker to fill the form.
+        data: { answeredFieldCount: Object.keys(answers).length } as Prisma.InputJsonValue,
+      } })
     })
   }
   try {

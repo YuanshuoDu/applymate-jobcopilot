@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto"
 
 import { Prisma, PrismaClient } from "@prisma/client"
 import type { Actor, AgentMessagePhase, ItemStatus } from "@jobcopilot/agent-protocol"
+import { redactAgentEvent } from "@jobcopilot/shared"
 
 export interface AppendAgentEventInput {
   sessionId: string
@@ -105,8 +106,12 @@ function buildOutboxPayload(
     correlationId: input.correlationId,
     causationId: input.causationId ?? null,
     idempotencyKey: input.idempotencyKey ?? null,
-    payload: input.payload,
+    payload: safeEventPayload(input),
   }
+}
+
+function safeEventPayload(input: Pick<AppendAgentEventInput, "type" | "payload">): Prisma.InputJsonValue {
+  return redactAgentEvent({ type: input.type, body: "", data: input.payload }).data as Prisma.InputJsonValue
 }
 
 export async function appendAgentEventWithOutbox(
@@ -154,7 +159,7 @@ export async function appendAgentEventWithOutboxInTransaction(
       correlationId: input.correlationId,
       causationId: input.causationId ?? null,
       idempotencyKey: input.idempotencyKey ?? null,
-      payload: input.payload,
+      payload: safeEventPayload(input),
     },
   })
 

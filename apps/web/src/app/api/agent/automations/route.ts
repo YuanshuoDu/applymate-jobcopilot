@@ -2,6 +2,7 @@ import { NextRequest } from "next/server"
 import { db } from "@/lib/db"
 import { err, isErrorResponse, ok, requireAuth } from "@/lib/api-helpers"
 import { nextRunAtFromCron } from "@/lib/agent/automation-schedule"
+import { requireLegacyPolicy } from "@/lib/agent/policy/legacy"
 
 type AutomationRow = {
   id: string
@@ -89,6 +90,16 @@ export async function POST(req: NextRequest) {
 
   const input = readCreateInput(await req.json().catch(() => null))
   if (!input.name) return err("Automation name is required", 400)
+  try {
+    requireLegacyPolicy({
+      userId: auth.userId, sessionId: `automation-api:${auth.userId}`, turnId: `automation-create:${input.name}`,
+      stepId: "automation.create", toolCallId: `automation-create:${input.name}`, toolName: "automation.mutate",
+      domain: "automation", risk: "internal_write", capabilities: ["read", "write"],
+      input: { mutation: "create_or_update", requiresReceipt: false, unknownSensitiveFacts: false },
+    })
+  } catch (error) {
+    return err(error instanceof Error ? error.message : "Automation policy denied this mutation", 403)
+  }
 
   const existing = await db.agentAutomation.findFirst({
     where: { userId: auth.userId, name: input.name },

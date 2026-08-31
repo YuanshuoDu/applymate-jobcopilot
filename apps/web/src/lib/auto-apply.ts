@@ -4,6 +4,8 @@ import { enqueueApplyTask } from "@/lib/apply-queue-client";
 import { assessApplicationPreflight, isSupportedAutomatedApplyUrl } from "@/lib/agent/application-preflight";
 import { isRuntimeFeatureEnabled } from '@/lib/runtime-feature-flags'
 import { isFeatureAllowed, resolveAiAccess } from '@/lib/entitlements'
+import { consumeLegacyReceipt } from '@/lib/agent/approval/legacy-receipt'
+import { requireLegacyPolicy } from '@/lib/agent/policy/legacy'
 
 export class AutoApplyError extends Error {}
 
@@ -55,6 +57,15 @@ async function assertJobPreflight(input: { userId: string; jobId: string }) {
     select: { company: true, description: true, source: true, url: true },
   })
   if (!job) throw new AutoApplyError("The job could not be found for application preflight.")
+  try {
+    requireLegacyPolicy({
+      userId: input.userId, sessionId: `application-preflight:${input.jobId}`, turnId: `preflight:${input.jobId}`,
+      stepId: "application.preflight", toolCallId: `preflight:${input.jobId}`, toolName: "application.preflight",
+      domain: "application", risk: "read", capabilities: ["read"], input: { jobId: input.jobId, unknownSensitiveFacts: false },
+    })
+  } catch (error) {
+    throw new AutoApplyError(error instanceof Error ? error.message : "Application preflight was denied by policy.")
+  }
   const preflight = assessApplicationPreflight(job)
   if (!preflight.canAutomate) throw new AutoApplyError(preflight.issues.map(issue => issue.message).join(" "))
 }
@@ -71,6 +82,16 @@ export async function queueApplicationFill(input: {
   await assertUnattendedApplyEnabled(input.userId)
   const applyUrl = validateAutoApplyUrl(input.applyUrl);
   await assertJobPreflight(input)
+  try {
+    requireLegacyPolicy({
+      userId: input.userId, sessionId: `application:${input.applicationTaskId}`, turnId: `fill:${input.applicationTaskId}`,
+      stepId: "application.fill", toolCallId: `fill:${input.applicationTaskId}`, toolName: "application.fill",
+      domain: "application", risk: "internal_write", capabilities: ["read", "write", "browser"],
+      input: { requiresReceipt: false, unknownSensitiveFacts: false, resumeAfterUserInput: input.resumeAfterUserInput === true },
+    })
+  } catch (error) {
+    throw new AutoApplyError(error instanceof Error ? error.message : "Application fill was denied by policy.")
+  }
   const claimed = await db.applicationTask.updateMany({
     where: {
       id: input.applicationTaskId,
@@ -101,6 +122,8 @@ export async function queueAutonomousApplication(input: {
   applicationTaskId: string;
   /** Approved per-job authorization. Global settings can never replace this. */
   approvalId: string;
+  receiptNonce?: string;
+  sessionId?: string;
 }): Promise<{ taskId: string }> {
   await assertActiveAccount(input.userId)
   await assertUnattendedApplyEnabled(input.userId)
@@ -108,11 +131,43 @@ export async function queueAutonomousApplication(input: {
   await assertJobPreflight(input)
   const approval = await db.agentApproval.findFirst({
     where: { id: input.approvalId, userId: input.userId, status: "approved", type: "submit_application" },
-    select: { payload: true },
+    select: { payload: true, sessionId: true, turnId: true, toolCallId: true, jobId: true, revision: true, expiresAt: true },
   });
-  const payload = approval?.payload as { applicationTaskId?: unknown; jobId?: unknown } | undefined;
-  if (payload?.applicationTaskId !== input.applicationTaskId || payload.jobId !== input.jobId) {
+  const payload = asRecord(approval?.payload);
+  const taskSnapshot = await db.applicationTask.findFirst({
+    where: { id: input.applicationTaskId, userId: input.userId, jobId: input.jobId },
+    select: { sessionId: true, resumeId: true, coverLetterId: true, confirmedAnswers: true },
+  });
+  const material = {
+    applicationTaskId: input.applicationTaskId,
+    jobId: input.jobId,
+    resumeId: taskSnapshot?.resumeId ?? null,
+    coverLetterId: taskSnapshot?.coverLetterId ?? null,
+  };
+  if (!approval || payload.applicationTaskId !== input.applicationTaskId || payload.jobId !== input.jobId ||
+    payload.resumeId !== material.resumeId || payload.coverLetterId !== material.coverLetterId ||
+    ("confirmedAnswers" in payload && JSON.stringify(payload.confirmedAnswers ?? null) !== JSON.stringify(taskSnapshot?.confirmedAnswers ?? null)) ||
+    !approval.turnId || !approval.toolCallId || approval.jobId !== input.jobId || !approval.expiresAt || !input.receiptNonce) {
     throw new AutoApplyError("A current, explicit approval is required before this application can be submitted.");
+  }
+  const receiptSessionId = input.sessionId ?? approval.sessionId ?? taskSnapshot?.sessionId;
+  if (!receiptSessionId) throw new AutoApplyError("The application is missing its scoped Agent session.");
+
+  try {
+    requireLegacyPolicy({
+      userId: input.userId,
+      sessionId: receiptSessionId,
+      turnId: approval.turnId,
+      stepId: `submit:${input.applicationTaskId}`,
+      toolCallId: approval.toolCallId,
+      toolName: "application.submit",
+      domain: "application",
+      risk: "external_write",
+      capabilities: ["read", "write", "external_write"],
+      input: { requiresReceipt: true, receiptValidated: true, unknownSensitiveFacts: false },
+    });
+  } catch (error) {
+    throw new AutoApplyError(error instanceof Error ? error.message : "Submission policy denied this application.");
   }
 
   const claimed = await db.$transaction(async tx => {
@@ -181,6 +236,31 @@ export async function queueAutonomousApplication(input: {
   }
 
   try {
+    await consumeLegacyReceipt(db, {
+      approvalId: input.approvalId,
+      userId: input.userId,
+      sessionId: receiptSessionId,
+      turnId: approval.turnId,
+      toolCallId: approval.toolCallId,
+      jobId: input.jobId,
+      action: "submit_application",
+      nonce: input.receiptNonce,
+      resource: { jobId: input.jobId },
+      material,
+      answers: taskSnapshot?.confirmedAnswers ?? null,
+      revision: approval.revision,
+      expiresAt: approval.expiresAt,
+      reservationKey: `application-submit:${input.applicationTaskId}`,
+    });
+  } catch (error) {
+    await db.$transaction(async tx => {
+      await tx.job.updateMany({ where: { id: input.jobId, userId: input.userId, workflowState: "queued" }, data: { workflowState: "ready_to_apply" } });
+      await tx.applicationTask.updateMany({ where: { id: input.applicationTaskId, status: "filling" }, data: { status: "waiting_for_authorization", checkpoint: "receipt_rejected" } });
+    }).catch(() => undefined);
+    throw new AutoApplyError(error instanceof Error ? error.message : "The scoped submission receipt could not be consumed.");
+  }
+
+  try {
     const taskId = await enqueueApplyTask({
       applicationTaskId: input.applicationTaskId,
       jobId: input.jobId,
@@ -215,4 +295,8 @@ export async function queueAutonomousApplication(input: {
     }).catch(() => undefined);
     throw error;
   }
+}
+
+function asRecord(value: unknown): Record<string, unknown> {
+  return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {};
 }

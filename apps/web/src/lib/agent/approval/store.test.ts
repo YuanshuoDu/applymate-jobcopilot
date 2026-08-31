@@ -3,7 +3,8 @@ import { describe, expect, it, vi } from "vitest"
 import type { Prisma, PrismaClient } from "@prisma/client"
 import { hashApprovalNonce, hashApprovalScope } from "@jobcopilot/agent-protocol"
 
-import { consumeApprovalAndReserve, issueApprovalReceipt, validateApproval } from "./store"
+import { consumeApprovalAndReserve, issueApprovalReceipt, validateApproval, validatePendingApprovalReceipt } from "./store"
+import { reissueApprovalNonce } from "./receipt-rotation"
 import { protocolScope, ApprovalStoreError, type ApprovalScopeInput } from "./types"
 
 const scopeInput: ApprovalScopeInput = {
@@ -33,7 +34,11 @@ function mockDb(row: Prisma.AgentApprovalGetPayload<{}>) {
       findFirst: vi.fn(async () => ({ id: row.turnId, status: "in_progress", revision: scopeInput.revision })),
       updateMany: vi.fn(async () => ({ count: 1 })),
     },
-    agentItem: { create: vi.fn(async ({ data }: { data: Record<string, unknown> }) => data) },
+    agentItem: {
+      create: vi.fn(async ({ data }: { data: Record<string, unknown> }) => data),
+      findFirst: vi.fn(async (): Promise<{ id: string; content: Prisma.JsonValue } | null> => null),
+      update: vi.fn(async ({ data }: { data: Record<string, unknown> }) => data),
+    },
     job: { findFirst: vi.fn(async () => ({ id: row.jobId })) },
     agentApproval: {
       findFirst: vi.fn(async () => row),
@@ -77,6 +82,14 @@ describe("Web approval receipt store", () => {
     await expect(validateApproval(db, row.id, { ...scopeInput, nonce: "nonce_1" }, new Date("2026-09-01T00:00:00.000Z"))).rejects.toMatchObject({ code: "approval_expired" })
   })
 
+  it("validates the nonce and scope while the receipt is still pending", async () => {
+    const row = { ...(await approvalRow()), status: "pending", decidedAt: null }
+    const { db } = mockDb(row)
+
+    await expect(validatePendingApprovalReceipt(db, row.id, { ...scopeInput, nonce: "nonce_1" }, new Date("2026-08-31T12:00:00.000Z"))).resolves.toMatchObject({ id: row.id, status: "pending" })
+    await expect(validatePendingApprovalReceipt(db, row.id, { ...scopeInput, nonce: "wrong_nonce" }, new Date("2026-08-31T12:00:00.000Z"))).rejects.toMatchObject({ code: "approval_nonce_mismatch" })
+  })
+
   it("consumes exactly one approved receipt with its external reservation in one transaction", async () => {
     const row = await approvalRow()
     const { db, tx } = mockDb(row)
@@ -95,5 +108,24 @@ describe("Web approval receipt store", () => {
     tx.agentApproval.updateMany.mockResolvedValue({ count: 0 })
     await expect(consumeApprovalAndReserve(db, row.id, { ...scopeInput, nonce: "nonce_1" }, { idempotencyKey: "submit:task_1" })).rejects.toBeInstanceOf(ApprovalStoreError)
     await expect(consumeApprovalAndReserve(db, row.id, { ...scopeInput, nonce: "nonce_1" }, { idempotencyKey: "submit:task_2" })).rejects.toMatchObject({ code: "approval_already_consumed" })
+  })
+
+  it("rotates a pending nonce and keeps the broker item scope synchronized", async () => {
+    const row = { ...(await approvalRow()), status: "pending" }
+    const { db, tx } = mockDb(row)
+    tx.agentItem.findFirst.mockResolvedValue({ id: "agent-wait:approval:approval_1", content: { approvalId: row.id, scopeHash: row.scopeHash } })
+
+    const result = await reissueApprovalNonce(db, { approvalId: row.id, sessionId: row.sessionId, userId: row.userId })
+
+    expect(result).toMatchObject({ approvalId: row.id, receiptNonce: expect.any(String), scopeHash: expect.not.stringMatching(row.scopeHash!) })
+    expect(tx.agentApproval.updateMany).toHaveBeenCalledWith({
+      where: expect.objectContaining({ id: row.id, status: "pending", scopeHash: row.scopeHash, nonceHash: row.nonceHash }),
+      data: { scopeHash: result.scopeHash, nonceHash: expect.any(String) },
+    })
+    expect(tx.agentItem.update).toHaveBeenCalledWith({
+      where: { id: "agent-wait:approval:approval_1" },
+      data: { content: { approvalId: row.id, scopeHash: result.scopeHash } },
+    })
+    expect(tx.agentEvent.create).toHaveBeenCalledWith({ data: expect.objectContaining({ type: "approval.receipt_rotated" }) })
   })
 })

@@ -17,8 +17,10 @@ export function GmailReplyModal({ email, body, onClose }: GmailReplyModalProps) 
   const [sending, setSending] = useState(false)
   const [error, setError] = useState('')
   const [copied, setCopied] = useState(false)
+  const [sendApproval, setSendApproval] = useState<{ id: string; receiptNonce: string; sessionId: string; draft: string } | null>(null)
 
   useEffect(() => {
+    setSendApproval(null)
     const controller = new AbortController()
     void fetch('/api/gmail/ai-reply', {
       method: 'POST',
@@ -59,12 +61,23 @@ export function GmailReplyModal({ email, body, onClose }: GmailReplyModalProps) 
   async function sendFollowUp() {
     setSending(true)
     try {
+      const reusableApproval = sendApproval?.draft === reply ? sendApproval : null
       const response = await fetch('/api/gmail/send-draft', {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ to: email.from, subject: `Re: ${email.subject}`, draft: reply, gmailMessageId: email.id, threadId: email.threadId, messageKind: email.tag }),
+        body: JSON.stringify({
+          to: email.from, subject: `Re: ${email.subject}`, draft: reply, gmailMessageId: email.id,
+          threadId: email.threadId, messageKind: email.tag,
+          ...(reusableApproval ? { approvalId: reusableApproval.id, receiptNonce: reusableApproval.receiptNonce, sessionId: reusableApproval.sessionId } : {}),
+        }),
       })
-      const result = await response.json() as { error?: string; tracked?: boolean }
+      const result = await response.json() as { error?: string; tracked?: boolean; approvalRequired?: boolean; approval?: { id?: unknown; receiptNonce?: unknown }; sessionId?: unknown }
       if (!response.ok) throw new Error(result.error ?? t('gmail.followUpFailed'))
+      if (result.approvalRequired && typeof result.approval?.id === 'string' && typeof result.approval.receiptNonce === 'string' && typeof result.sessionId === 'string') {
+        setSendApproval({ id: result.approval.id, receiptNonce: result.approval.receiptNonce, sessionId: result.sessionId, draft: reply })
+        toast.info(t('gmail.reviewBeforeSend'))
+        return
+      }
+      setSendApproval(null)
       window.dispatchEvent(new Event('applymate:jobs-changed'))
       toast.success(t('gmail.followUpSent'), result.tracked ? t('gmail.trackedUpdated') : t('gmail.sentLinkToTrack'))
       onClose()
@@ -90,7 +103,7 @@ export function GmailReplyModal({ email, body, onClose }: GmailReplyModalProps) 
       </div>
       <footer style={footerStyle}>
         <Btn variant="ghost" onClick={onClose}>{t('common.cancel')}</Btn>
-        {!loading && !error && <><Btn variant="ghost" onClick={() => void copyToClipboard()}>{copied ? `✓ ${t('gmail.copied')}` : `📋 ${t('gmail.copyText')}`}</Btn><Btn variant="primary" disabled={sending || !reply.trim()} onClick={() => void sendFollowUp()}>{sending ? t('gmail.sending') : `✉ ${t('gmail.sendFollowUp')}`}</Btn></>}
+        {!loading && !error && <><Btn variant="ghost" onClick={() => void copyToClipboard()}>{copied ? `✓ ${t('gmail.copied')}` : `📋 ${t('gmail.copyText')}`}</Btn><Btn variant="primary" disabled={sending || !reply.trim()} onClick={() => void sendFollowUp()}>{sending ? t('gmail.sending') : sendApproval?.draft === reply ? `✉ ${t('gmail.confirmSend')}` : `✉ ${t('gmail.sendFollowUp')}`}</Btn></>}
       </footer>
     </div>
   </div>

@@ -1,4 +1,6 @@
 import { NextRequest } from "next/server"
+import { Prisma } from "@prisma/client"
+import { redactAgentEvent } from "@jobcopilot/shared"
 import { db } from "@/lib/db"
 import { err, isErrorResponse, ok, requireAuth } from "@/lib/api-helpers"
 import { nextRunAfterCurrent } from "@/lib/agent/automation-schedule"
@@ -8,6 +10,7 @@ import { isActiveAutomationExecution, resolveAutomationSession } from "@/lib/age
 import { hasEffectiveEntitlement } from '@/lib/entitlements'
 import { isRuntimeAgentHarnessFeatureEnabled } from '@/lib/runtime-feature-flags'
 import { createDualWriteSession } from '@/lib/agent/session/dual-write'
+import { requireLegacyPolicy } from '@/lib/agent/policy/legacy'
 
 type RouteCtx = { params: Promise<{ id: string }> }
 
@@ -83,6 +86,16 @@ export async function POST(req: NextRequest, ctx: RouteCtx) {
   if (!await hasEffectiveEntitlement(auth.userId, 'auto_apply')) return err('Your current plan does not include autonomous applications.', 403)
 
   const { id } = await ctx.params
+  try {
+    requireLegacyPolicy({
+      userId: auth.userId, sessionId: `automation-api:${auth.userId}`, turnId: `automation-run:${id}`,
+      stepId: "automation.run", toolCallId: `automation-run:${id}`, toolName: "automation.run",
+      domain: "automation", risk: "internal_write", capabilities: ["read", "write", "coordination"],
+      input: { mutation: "run", requiresReceipt: false, unknownSensitiveFacts: false },
+    })
+  } catch (error) {
+    return err(error instanceof Error ? error.message : "Automation policy denied this run", 403)
+  }
   const automation = await db.agentAutomation.findFirst({
     where: { id, userId: auth.userId },
   }) as AutomationForRun | null
@@ -144,11 +157,12 @@ export async function POST(req: NextRequest, ctx: RouteCtx) {
       automation: automationPayload(automation),
     },
   }
+  const safeEvent = redactAgentEvent(eventInput)
   let event: Parameters<typeof serializeEvent>[0]
   try {
     event = (dualWrite
       ? await dualWrite.record(eventInput)
-      : await db.agentTranscriptEvent.create({ data: { ...eventInput, durationMs: null } })) as Parameters<typeof serializeEvent>[0]
+      : await db.agentTranscriptEvent.create({ data: { ...eventInput, body: safeEvent.body, data: safeEvent.data ?? Prisma.JsonNull, durationMs: null } })) as Parameters<typeof serializeEvent>[0]
   } catch (error) {
     if (dualWrite) {
       await dualWrite.finalize({
