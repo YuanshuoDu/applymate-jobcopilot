@@ -17,6 +17,7 @@
   "dependencies": {
     "@bull-board/api": "^7.1.5",
     "@bull-board/express": "^7.1.5",
+    "@jobcopilot/agent-model": "workspace:*",
     "@jobcopilot/agent-protocol": "workspace:*",
     "@jobcopilot/shared": "workspace:*",
     "@types/express": "^5.0.6",

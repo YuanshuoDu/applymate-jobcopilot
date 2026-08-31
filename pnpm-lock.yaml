@@ -70,6 +70,9 @@ importers:
       '@auth/prisma-adapter':
         specifier: ^2.8.0
         version: 2.11.3(@prisma/client@6.19.3(prisma@6.19.3(typescript@5.9.3))(typescript@5.9.3))(@simplewebauthn/browser@9.0.1)(@simplewebauthn/server@9.0.3)
+      '@jobcopilot/agent-model':
+        specifier: workspace:*
+        version: link:../../packages/agent-model
       '@jobcopilot/agent-protocol':
         specifier: workspace:*
         version: link:../../packages/agent-protocol
@@ -248,6 +251,9 @@ importers:
       '@bull-board/express':
         specifier: ^7.1.5
         version: 7.2.1
+      '@jobcopilot/agent-model':
+        specifier: workspace:*
+        version: link:../../packages/agent-model
       '@jobcopilot/agent-protocol':
         specifier: workspace:*
         version: link:../../packages/agent-protocol
@@ -297,6 +303,19 @@ importers:
       vitest:
         specifier: ^3.1.4
         version: 3.2.7(@types/node@22.20.1)(jiti@2.7.0)(lightningcss@1.32.0)(tsx@4.23.11)
+
+  packages/agent-model:
+    dependencies:
+      '@jobcopilot/agent-protocol':
+        specifier: workspace:*
+        version: link:../agent-protocol
+    devDependencies:
+      typescript:
+        specifier: 5.9.3
+        version: 5.9.3
+      vitest:
+        specifier: ^3.1.4
+        version: 3.2.7(@types/node@26.2.0)(jiti@2.7.0)(lightningcss@1.32.0)(tsx@4.23.11)
 
   packages/agent-protocol:
     dependencies:
