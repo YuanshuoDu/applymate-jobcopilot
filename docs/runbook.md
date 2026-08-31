@@ -18,7 +18,7 @@ Use it to stabilize incidents first, then gather evidence for Claude/PM or a Cod
 - Key columns: `user_id`, `job_id`, `ats_type`, `flow_used`, `status`, `error`, `duration_ms`, `created_at`
 - Redis env: `REDIS_URL`
 - Database env: `DATABASE_URL`
-- Worker env: `CLOAK_MAX_WORKERS`, `APPLY_TIMEOUT_MS`, `CAPSOLVER_API_KEY`, `RATE_LIMIT_PER_USER_HOUR`, `AGENT_WEB_URL`, `AGENT_WORKER_SECRET`
+- Worker env: `CLOAK_MAX_WORKERS`, `APPLY_TIMEOUT_MS`, `RATE_LIMIT_PER_USER_HOUR`, `AGENT_WEB_URL`, `AGENT_WORKER_SECRET`
 - Bull Board env: `ENABLE_BULL_BOARD=1`, `BULL_BOARD_PASSWORD`, `BULL_BOARD_PORT`
 - Worker health endpoint: `GET /healthz` on `BULL_BOARD_PORT` (default `3001`)
 
@@ -30,6 +30,12 @@ the Worker calls the protected internal pipeline endpoint, and the original
 session receives the transcript and final report. The Web and Worker deployments
 must share `REDIS_URL` and `AGENT_WORKER_SECRET`; set `AGENT_WEB_URL` on the
 Worker to the public Web origin.
+
+The authoritative external-action inventory is in
+[`scraping-autoapply-design.md`](./scraping-autoapply-design.md#external-action-safety-matrix).
+Use its distinction between fill/upload and final submit when investigating any
+task. CAPTCHA, login, MFA, verification-code, and challenge-detection failures
+all use `waiting_for_user` with checkpoint `user_takeover`.
 
 ## First Five Minutes
 
@@ -88,9 +94,9 @@ gh pr list --repo YuanshuoDu/applymate-jobcopilot --state merged --search "flow 
 
 ## Scenario 2: CAPTCHA Spike
 
-**Symptoms:** `/admin/observability` shows rising `overall.captchaRate`, `apply_results.error` contains "captcha", users see more manual applications, or CapSolver balance/latency is unhealthy.
+**Symptoms:** `/admin/observability` shows rising `overall.captchaRate`, `apply_results.error` contains "captcha", users see more manual applications, or challenge-detection errors increase.
 
-**Diagnosis:** Check dashboard, DB, worker env, and solver logs:
+**Diagnosis:** Check the dashboard, database, Worker logs, and the affected ATS host. There is no challenge-solver credential or service to inspect:
 
 ```bash
 curl -sS https://<web-host>/api/admin/observability | jq '.overall | {total,captchaRate,captchaErrors,successRate,last24h}'
@@ -101,19 +107,22 @@ WHERE created_at > NOW() - INTERVAL '24 hours'
   AND error ILIKE '%captcha%'
 ORDER BY created_at DESC
 LIMIT 50;"
-fly secrets list -a <worker-app> | grep CAPSOLVER_API_KEY
-fly ssh console -a <worker-app> -C 'printenv CAPSOLVER_API_KEY | wc -c'
-fly logs -a <worker-app> | grep -i "captcha\|capsolver"
+fly logs -a <worker-app> | grep -i "captcha\|challenge\|user takeover"
 ```
 
-**Recovery:** If `CAPSOLVER_API_KEY` is missing, set it and restart:
+**Recovery:** Do not add a solver key, inject a token, or retry the task automatically. A detected or uncertain challenge must remain a manual handoff:
 
 ```bash
-fly secrets set CAPSOLVER_API_KEY=<value> -a <worker-app>
-fly apps restart <worker-app>
+# Confirm the task is waiting for the candidate.
+psql "$DATABASE_URL" -c "
+SELECT id, status, checkpoint, LEFT(error, 240) AS error
+FROM application_tasks
+WHERE checkpoint = 'user_takeover'
+ORDER BY \"updatedAt\" DESC
+LIMIT 50;"
 ```
 
-If CapSolver balance is empty, top it up or rotate to a funded key. If CAPTCHA is caused by aggressive throughput, slow the worker:
+If the spike is correlated with a deployment or one ATS host, pause `apply-tasks`, preserve the task IDs, and open a flow/detector issue. If the browser challenge is gone and the candidate explicitly asks to continue, re-enter through the normal approval path. Never bulk-retry challenge tasks or reuse an ambiguous browser result:
 
 ```bash
 fly secrets set APPLY_TIMEOUT_MS=60000 -a <worker-app>
@@ -123,7 +132,7 @@ fly apps restart <worker-app>
 
 Pause `apply-tasks` in Bull Board if CAPTCHA/manual exceeds 20 percent of recent applies and the cause is unknown.
 
-**Prevention:** Monitor `captchaRate`, keep CapSolver balance visible, avoid raising `CLOAK_MAX_WORKERS` without checking CAPTCHA rate, and track domain-specific spikes before pausing everything.
+**Prevention:** Monitor `captchaRate`, `user_takeover` checkpoints, detector errors, and domain-specific spikes. Keep concurrency conservative and preserve the detection-only boundary in every flow change.
 
 ## Scenario 3: Worker OOM / Stall
 

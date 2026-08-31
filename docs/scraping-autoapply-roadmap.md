@@ -153,7 +153,7 @@ Exit criteria: docs PR merged to master, Phase 1 issues all in `spec-ready` stat
 | # | Issue | Type | Depends on | Effort |
 |---|---|---|---|---|
 | 7.1 | Proxy pool integration (residential for HTML, datacenter for APIs) | `feat` | 3.2 | 1.5 days |
-| 7.2 | CAPTCHA fallback to CapSolver (escape hatch) | `feat` | 4.6 | 1 day |
+| 7.2 | Challenge bypass fallback | `cancelled` | 4.6 | Replaced by Phase 0 AH2-002 detection-only user takeover; no bypass or automatic retry |
 | 7.3 | Push notification when task needs user action (manual escalation) | `feat` | 3.4 | 1 day |
 | 7.4 | Observability dashboard (success rate, CAPTCHA rate, source mix) | `feat` | 3.4 | 1.5 days |
 | 7.5 | Runbook for on-call: stalls, ATS structure changes, captcha spikes | `docs` | 7.4 | 0.5 day |

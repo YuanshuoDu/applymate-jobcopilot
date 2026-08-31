@@ -33,6 +33,17 @@ describe("captcha", () => {
     await expect(detectCaptcha(page as never)).resolves.toBe(false);
   });
 
+  it("surfaces page inspection failures so the queue can fail closed", async () => {
+    const { detectCaptcha } = await import("./captcha.js");
+    const page = {
+      locator: vi.fn(() => ({ count: vi.fn().mockRejectedValue(new Error("page closed")) })),
+      textContent: vi.fn(),
+    };
+
+    await expect(detectCaptcha(page as never)).rejects.toThrow("page closed");
+    expect(page.textContent).not.toHaveBeenCalled();
+  });
+
   it("exports detection only, so the worker cannot solve or inject CAPTCHA tokens", async () => {
     const captcha = await import("./captcha.js");
     expect("solveCaptcha" in captcha).toBe(false);

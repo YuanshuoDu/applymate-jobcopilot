@@ -1,6 +1,13 @@
 import type { Pool } from "pg";
 import { describe, expect, it, vi } from "vitest";
-import { completeFillForReview, isUserActive } from "./application-task-state.js";
+import {
+  CAPTCHA_USER_TAKEOVER_MESSAGE,
+  CHALLENGE_DETECTION_FAILED_MESSAGE,
+  completeFillForReview,
+  needsUserTakeover,
+  USER_TAKEOVER_CHECKPOINT,
+  isUserActive,
+} from "./application-task-state.js";
 
 function testPool() {
   const query = vi.fn();
@@ -46,5 +53,26 @@ describe("isUserActive", () => {
     query.mockRejectedValueOnce(new Error('column "accountStatus" does not exist'));
 
     await expect(isUserActive(pool, "user_1")).resolves.toBe(false);
+  });
+});
+
+describe("user takeover classification", () => {
+  it.each([
+    "CAPTCHA detected",
+    "Login required",
+    "MFA / two-factor verification required",
+    "Verification code required",
+  ])("classifies %s with the shared takeover checkpoint", (error) => {
+    expect(needsUserTakeover(error)).toBe(true);
+    expect(USER_TAKEOVER_CHECKPOINT).toBe("user_takeover");
+  });
+
+  it("keeps ordinary execution failures out of takeover", () => {
+    expect(needsUserTakeover("Submit button not found")).toBe(false);
+  });
+
+  it("keeps challenge messages stable for persisted task events", () => {
+    expect(CAPTCHA_USER_TAKEOVER_MESSAGE).toContain("no bypass was attempted");
+    expect(CHALLENGE_DETECTION_FAILED_MESSAGE).toContain("no bypass was attempted");
   });
 });

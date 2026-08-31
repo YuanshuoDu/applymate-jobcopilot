@@ -12,7 +12,6 @@ const mocks = vi.hoisted(() => {
     query: vi.fn().mockResolvedValue({ rowCount: 1 }),
     loadTaskContext: vi.fn(),
     detectCaptcha: vi.fn().mockResolvedValue(false),
-    solveCaptcha: vi.fn().mockResolvedValue(false),
     detectFlow: vi.fn().mockReturnValue(null),
     runGreenhouseFlow: vi.fn(),
     runWorkdayFlow: vi.fn(),
@@ -57,7 +56,6 @@ vi.mock("../rate-limit.js", () => ({ checkRateLimit: mocks.checkRateLimit }));
 vi.mock("../cloak/pool.js", () => ({ withCloakContext: mocks.withCloakContext }));
 vi.mock("../cloak/captcha.js", () => ({
   detectCaptcha: mocks.detectCaptcha,
-  solveCaptcha: mocks.solveCaptcha,
 }));
 vi.mock("../db/apply-results.js", () => ({
   insertApplyResult: mocks.insertApplyResult,
@@ -93,6 +91,7 @@ vi.mock("../admin/ats-policy.js", () => ({
   canUseAtsSource: mocks.canUseAtsSource,
 }));
 vi.mock("../db/application-task-state.js", () => ({
+  USER_TAKEOVER_CHECKPOINT: "user_takeover",
   claimApplicationTask: mocks.claimApplicationTask,
   applicationTaskStillActive: mocks.applicationTaskStillActive,
   completeFillForReview: mocks.completeFillForReview,

@@ -26,7 +26,18 @@ import { purgeTemporaryGeneratedCoverLetters } from "../notifications/purge-cove
 import { shouldUsePattern } from "../patterns/confidence.js";
 import { replayPattern } from "../patterns/replay.js";
 import { unlinkSync } from "node:fs";
-import { applicationTaskStillActive, claimApplicationTask, completeFillForReview, finishApplicationTask, isUserActive, needsUserTakeover, pauseForFormInput } from "../db/application-task-state.js";
+import {
+  applicationTaskStillActive,
+  CAPTCHA_USER_TAKEOVER_MESSAGE,
+  CHALLENGE_DETECTION_FAILED_MESSAGE,
+  claimApplicationTask,
+  completeFillForReview,
+  finishApplicationTask,
+  isUserActive,
+  needsUserTakeover,
+  pauseForFormInput,
+  USER_TAKEOVER_CHECKPOINT,
+} from "../db/application-task-state.js";
 import { formNeedsMessage, inspectFormReviewNeeds } from "../harness/form-review.js";
 import { workerPollingOptions } from "./worker-polling-options.js";
 import {
@@ -160,6 +171,21 @@ export const applyWorker = new Worker<ApplyTaskPayload>(
           throw new Error("Application page redirected outside the approved ATS origin.");
         }
 
+        let challengeBoundary: "captcha" | "detection_error" | null = null;
+        const challengeAllowsAction = async (): Promise<boolean> => {
+          try {
+            if (await detectCaptcha(page)) {
+              challengeBoundary = "captcha";
+              return false;
+            }
+            return true;
+          } catch (error) {
+            challengeBoundary = "detection_error";
+            console.warn("[apply-worker] Challenge detection failed; requesting user takeover.", error);
+            return false;
+          }
+        };
+
         const applyTask: ApplyTask = {
           jobId,
           applyUrl: taskCtx.applyUrl,
@@ -177,6 +203,7 @@ export const applyWorker = new Worker<ApplyTaskPayload>(
           confirmedAnswers: taskCtx.confirmedAnswers,
           ...(operation === "submit" ? {
             beforeSubmit: async () => {
+              if (!await challengeAllowsAction()) return false;
               if (await applyQueue.isPaused()) return false;
               if (!await applicationTaskStillActive(getPool(), applicationTaskId, userId, jobId)) return false;
               if (!isAllowedAtsDestination(page.url(), flow, taskCtx.applyUrl)) return false;
@@ -189,15 +216,17 @@ export const applyWorker = new Worker<ApplyTaskPayload>(
         let harnessResult: HarnessResult | null = null;
         let usedFlow: string | null = flow ? "programmatic" : null;
 
-        const hasCaptcha = await detectCaptcha(page).catch(() => false);
+        const hasCaptcha = await challengeAllowsAction() === false;
         if (hasCaptcha) {
           // CAPTCHA, login and MFA are explicit human handoff boundaries.
           // Do not use third-party solvers or attempt to bypass platform controls.
-          console.log("[apply-worker] CAPTCHA detected; requesting user takeover.");
+          console.log("[apply-worker] Challenge boundary reached; requesting user takeover.");
           harnessResult = {
             status: "manual",
             turns: 0,
-            error: "CAPTCHA detected. User takeover is required; no bypass was attempted.",
+            error: challengeBoundary === "detection_error"
+              ? CHALLENGE_DETECTION_FAILED_MESSAGE
+              : CAPTCHA_USER_TAKEOVER_MESSAGE,
             durationMs: 0,
             log: [],
           };
@@ -299,6 +328,20 @@ export const applyWorker = new Worker<ApplyTaskPayload>(
           throw new Error("Apply completed without a harness result");
         }
 
+        // A challenge can appear after navigation while a flow is filling the
+        // form. The submit guard returns a generic blocked result in that case;
+        // normalize it to the same human-handoff state as the preflight path.
+        if (challengeBoundary) {
+          harnessResult = {
+            ...harnessResult,
+            status: "manual",
+            error: challengeBoundary === "detection_error"
+              ? CHALLENGE_DETECTION_FAILED_MESSAGE
+              : CAPTCHA_USER_TAKEOVER_MESSAGE,
+          };
+          usedFlow = null;
+        }
+
         if (operation === "fill" && harnessResult.reviewReady) {
           const needs = await inspectFormReviewNeeds(page);
           const needMessage = formNeedsMessage(needs);
@@ -385,7 +428,7 @@ export const applyWorker = new Worker<ApplyTaskPayload>(
           getPool(),
           applicationTaskId,
           isSubmitted ? "submitted" : isSubmissionBlocked ? "waiting_for_authorization" : requiresUserTakeover ? "waiting_for_user" : "failed",
-          isSubmitted ? "submission_verified" : isSubmissionBlocked ? "submission_blocked" : requiresUserTakeover ? "user_takeover" : "execution_failed",
+          isSubmitted ? "submission_verified" : isSubmissionBlocked ? "submission_blocked" : requiresUserTakeover ? USER_TAKEOVER_CHECKPOINT : "execution_failed",
           harnessResult.error ?? null,
         );
 

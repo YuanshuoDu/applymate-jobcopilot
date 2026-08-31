@@ -14,8 +14,8 @@ const CAPTCHA_TEXT_PATTERNS = [/verify you are human/i, /captcha/i];
 /** Detection only. CAPTCHA solving and token injection are intentionally unsupported. */
 export async function detectCaptcha(page: Page): Promise<boolean> {
   for (const selector of CAPTCHA_SELECTORS) {
-    if (await page.locator(selector).count().catch(() => 0)) return true;
+    if (await page.locator(selector).count()) return true;
   }
-  const bodyText = await page.textContent("body").catch(() => null);
+  const bodyText = await page.textContent("body");
   return CAPTCHA_TEXT_PATTERNS.some(pattern => pattern.test(bodyText ?? ""));
 }
