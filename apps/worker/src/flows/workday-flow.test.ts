@@ -2,10 +2,10 @@ import { describe, it, expect, vi } from "vitest";
 import { runWorkdayFlow } from "./workday-flow.js";
 import type { ApplyTask } from "../harness/agent-harness.js";
 
-function mockPage() {
+function mockPage(title = "Review and Submit") {
   return {
     url: () => "https://sap.wd3.myworkdayjobs.com/SAP",
-    title: () => Promise.resolve("Review and Submit"),
+    title: () => Promise.resolve(title),
     locator: vi.fn().mockReturnValue({
       first: () => ({
         isVisible: () => Promise.resolve(true),
@@ -72,6 +72,31 @@ describe("runWorkdayFlow", () => {
     });
 
     expect(beforeSubmit).toHaveBeenCalledOnce();
-    expect(result).toMatchObject({ status: "manual", reviewReady: true });
+    expect(result).toMatchObject({ status: "submission_blocked" });
+  });
+
+  it("submits only after explicit authorization", async () => {
+    const page = mockPage("Application submitted");
+    const beforeSubmit = vi.fn().mockResolvedValue(true);
+
+    const result = await runWorkdayFlow(page, {
+      jobId: "j3", applyUrl: "https://sap.wd3.myworkdayjobs.com/SAP",
+      persona: { firstName: "Jean", lastName: "Dupont", email: "jean@test.com" },
+      jobTitle: "Engineer", jobCompany: "SAP", resumePath: "/resume.pdf", beforeSubmit,
+    });
+
+    expect(beforeSubmit).toHaveBeenCalledOnce();
+    expect(result.status).toBe("submitted");
+  });
+
+  it("blocks a visible submit button when authorization is missing", async () => {
+    const result = await runWorkdayFlow(mockPage(), {
+      jobId: "j4", applyUrl: "https://sap.wd3.myworkdayjobs.com/SAP",
+      persona: { firstName: "Jean" },
+      jobTitle: "Engineer", jobCompany: "SAP", resumePath: "/resume.pdf",
+    });
+
+    expect(result).toMatchObject({ status: "submission_blocked" });
+    expect(result.error).toContain("no runtime authorization guard");
   });
 });

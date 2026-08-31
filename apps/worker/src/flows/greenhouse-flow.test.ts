@@ -61,6 +61,7 @@ describe("runGreenhouseFlow", () => {
       jobTitle: "Senior Engineer",
       jobCompany: "Booking.com",
       resumePath: "/resume.pdf",
+      beforeSubmit: vi.fn().mockResolvedValue(true),
     });
 
     expect(result.status).toBe("submitted");
@@ -76,6 +77,7 @@ describe("runGreenhouseFlow", () => {
       jobTitle: "Engineer",
       jobCompany: "Corp",
       resumePath: "/r.pdf",
+      beforeSubmit: vi.fn().mockResolvedValue(true),
     });
 
     expect(["submitted", "manual"]).toContain(result.status);
@@ -111,8 +113,8 @@ describe("runGreenhouseFlow", () => {
     });
 
     expect(beforeSubmit).toHaveBeenCalledOnce();
-    expect(result.status).toBe("manual");
-    expect(result.reviewReady).toBe(true);
+    expect(result.status).toBe("submission_blocked");
+    expect(result.error).toContain("denied");
   });
 });
 

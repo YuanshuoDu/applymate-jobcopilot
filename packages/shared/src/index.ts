@@ -52,7 +52,7 @@ export interface ApplyResult {
   mode: 'unattended' | 'assisted';
   atsType?: string | null;
   flowUsed?: string | null;
-  status: 'submitted' | 'manual' | 'failed' | 'dry-run';
+  status: 'submitted' | 'manual' | 'failed' | 'dry-run' | 'submission_blocked';
   error?: string | null;
   durationMs?: number | null;
   createdAt?: string;

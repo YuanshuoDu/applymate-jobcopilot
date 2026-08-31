@@ -3,7 +3,8 @@ import { getPool } from "../db/apply-results.js";
 export type ApplyNotificationType =
   | "apply_submitted"
   | "apply_manual"
-  | "apply_failed";
+  | "apply_failed"
+  | "apply_blocked";
 
 export interface CreateNotificationParams {
   type: ApplyNotificationType;

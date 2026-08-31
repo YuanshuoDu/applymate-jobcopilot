@@ -191,6 +191,46 @@ describe("apply-queue Phase 5 pipeline", () => {
     );
   });
 
+  it("pattern cache authorization block is terminal and does not fall back to AI", async () => {
+    mocks.findFormPattern.mockResolvedValueOnce(formPattern);
+    mocks.shouldUsePattern.mockReturnValueOnce(true);
+    mocks.replayPattern.mockResolvedValueOnce({
+      status: "submission_blocked",
+      durationMs: 7,
+      error: "Submission blocked: runtime authorization guard denied the submit.",
+    });
+
+    await expect(runApplyJob()).resolves.toBeUndefined();
+
+    expect(mocks.AgentHarness).not.toHaveBeenCalled();
+    expect(mocks.agentRun).not.toHaveBeenCalled();
+    expect(mocks.recordPatternFailure).not.toHaveBeenCalled();
+    expect(mocks.insertApplyResult).toHaveBeenCalledWith(
+      expect.objectContaining({
+        status: "submission_blocked",
+        flowUsed: "pattern-cache",
+        error: expect.stringContaining("Submission blocked"),
+      }),
+    );
+    expect(mocks.createNotification).toHaveBeenCalledWith(
+      "user-1",
+      expect.objectContaining({
+        type: "apply_blocked",
+        title: "Example submission blocked",
+      }),
+    );
+    expect(mocks.notifyApplyResult).toHaveBeenCalledWith(
+      expect.objectContaining({ status: "submission_blocked" }),
+    );
+    expect(mocks.finishApplicationTask).toHaveBeenCalledWith(
+      expect.anything(),
+      "application-task-1",
+      "waiting_for_authorization",
+      "submission_blocked",
+      expect.stringContaining("Submission blocked"),
+    );
+  });
+
   it("pattern cache miss -> AI fallback -> budget incremented on success", async () => {
     mocks.findFormPattern.mockResolvedValueOnce(null);
     mocks.agentRun.mockResolvedValueOnce({ status: "submitted", durationMs: 13, error: null });

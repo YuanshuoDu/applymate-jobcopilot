@@ -251,7 +251,9 @@ export const applyWorker = new Worker<ApplyTaskPayload>(
               );
               harnessResult = await replayPattern(page, pattern, applyTask.persona, applyTask.beforeSubmit);
 
-              if (harnessResult.status !== "submitted") {
+              if (harnessResult.status === "submission_blocked") {
+                usedFlow = "pattern-cache";
+              } else if (harnessResult.status !== "submitted") {
                 await recordPatternFailure(pattern.id).catch((e: Error) =>
                   console.warn("[apply-worker] Pattern failure record failed:", e.message)
                 );
@@ -336,7 +338,8 @@ export const applyWorker = new Worker<ApplyTaskPayload>(
         if (
           harnessResult.status === "submitted" ||
           harnessResult.status === "manual" ||
-          harnessResult.status === "failed"
+          harnessResult.status === "failed" ||
+          harnessResult.status === "submission_blocked"
         ) {
           createApplyResultNotification({
             userId,
@@ -353,7 +356,7 @@ export const applyWorker = new Worker<ApplyTaskPayload>(
             userId,
             jobTitle:   taskCtx.jobTitle,
             jobCompany: taskCtx.jobCompany,
-            status:     harnessResult.status as 'submitted' | 'manual' | 'failed',
+            status:     harnessResult.status,
             error:      harnessResult.error ?? null,
             flowUsed:   usedFlow,
             jobUrl:     taskCtx.applyUrl,
@@ -362,6 +365,7 @@ export const applyWorker = new Worker<ApplyTaskPayload>(
 
         // Update Job status based on actual outcome
         const isSubmitted = harnessResult.status === 'submitted';
+        const isSubmissionBlocked = harnessResult.status === "submission_blocked";
         const newJobStatus = isSubmitted ? 'applied' : 'saved';
         const newWorkflowState = isSubmitted ? 'submitted' : 'ready_to_apply';
 
@@ -380,8 +384,8 @@ export const applyWorker = new Worker<ApplyTaskPayload>(
         await finishApplicationTask(
           getPool(),
           applicationTaskId,
-          isSubmitted ? "submitted" : requiresUserTakeover ? "waiting_for_user" : "failed",
-          isSubmitted ? "submission_verified" : requiresUserTakeover ? "user_takeover" : "execution_failed",
+          isSubmitted ? "submitted" : isSubmissionBlocked ? "waiting_for_authorization" : requiresUserTakeover ? "waiting_for_user" : "failed",
+          isSubmitted ? "submission_verified" : isSubmissionBlocked ? "submission_blocked" : requiresUserTakeover ? "user_takeover" : "execution_failed",
           harnessResult.error ?? null,
         );
 
@@ -461,7 +465,7 @@ async function createApplyResultNotification(params: {
   jobId: string;
   jobTitle: string | null;
   jobCompany: string;
-  status: "submitted" | "manual" | "failed";
+  status: "submitted" | "manual" | "failed" | "submission_blocked";
 }): Promise<void> {
   await createNotification(params.userId, {
     type: notificationTypeForStatus(params.status),
@@ -547,18 +551,22 @@ function isAllowedAtsDestination(rawUrl: string, flow: FlowType | null, approved
 }
 
 function notificationTypeForStatus(
-  status: "submitted" | "manual" | "failed"
-): "apply_submitted" | "apply_manual" | "apply_failed" {
+  status: "submitted" | "manual" | "failed" | "submission_blocked"
+): "apply_submitted" | "apply_manual" | "apply_failed" | "apply_blocked" {
   return status === "submitted"
     ? "apply_submitted"
+    : status === "submission_blocked"
+      ? "apply_blocked"
     : status === "manual"
       ? "apply_manual"
       : "apply_failed";
 }
 
-function notificationTitle(company: string, status: "submitted" | "manual" | "failed"): string {
+function notificationTitle(company: string, status: "submitted" | "manual" | "failed" | "submission_blocked"): string {
   return status === "submitted"
     ? `${company} ✅`
+    : status === "submission_blocked"
+      ? `${company} submission blocked`
     : status === "manual"
       ? `${company} ⚠️`
       : `${company} ❌`;

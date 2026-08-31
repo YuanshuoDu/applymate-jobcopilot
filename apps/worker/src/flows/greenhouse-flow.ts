@@ -1,6 +1,6 @@
 import type { Page } from "playwright-core";
 import type { ApplyTask, HarnessResult } from "../harness/agent-harness.js";
-import { clickSubmit, fillCustomQuestions, getPersonaValue, isSubmissionAuthorized, tryFill, uploadResume } from "./helpers.js";
+import { clickSubmit, fillCustomQuestions, getPersonaValue, tryFill, uploadResume } from "./helpers.js";
 
 /** Field map: try each selector in order, fill from persona if found */
 const PERSONAL_FIELDS = [
@@ -84,11 +84,12 @@ export async function runGreenhouseFlow(
     ".submit-button",
     "#submit-app",
   ];
-  const submission = await clickSubmit(page, submitSelectors, () => isSubmissionAuthorized(task));
-  if (submission === 'blocked') {
-    return { status: "manual", turns: 1, error: "Form filled and ready for user review.", durationMs: Date.now() - startedAt, log, reviewReady: true };
+  const submission = await clickSubmit(page, submitSelectors, task.beforeSubmit);
+  if (submission.outcome === "blocked") {
+    log.push({ field: submission.reason, selector: "submit", action: "submission_blocked" });
+    return { status: "submission_blocked", turns: 1, error: submission.message, durationMs: Date.now() - startedAt, log };
   }
-  if (submission === 'missing') {
+  if (submission.outcome === "missing") {
     return { status: "manual", error: "No submit button found", durationMs: Date.now() - startedAt, log };
   }
 

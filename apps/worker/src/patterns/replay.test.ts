@@ -69,7 +69,8 @@ describe("replayPattern", () => {
     const result = await replayPattern(
       page,
       pattern({ "#name": "fullName", "#email": "email" }),
-      { fullName: "Ada Lovelace", email: "ada@example.com" }
+      { fullName: "Ada Lovelace", email: "ada@example.com" },
+      vi.fn().mockResolvedValue(true),
     );
 
     expect(result.status).toBe("submitted");
@@ -124,6 +125,6 @@ describe("replayPattern", () => {
 
     expect(beforeSubmit).toHaveBeenCalledOnce();
     expect(page.click).not.toHaveBeenCalled();
-    expect(result).toMatchObject({ status: "manual", reviewReady: true });
+    expect(result).toMatchObject({ status: "submission_blocked" });
   });
 });
