@@ -309,6 +309,9 @@ importers:
       '@jobcopilot/agent-protocol':
         specifier: workspace:*
         version: link:../agent-protocol
+      '@jobcopilot/shared':
+        specifier: workspace:*
+        version: link:../shared
     devDependencies:
       typescript:
         specifier: 5.9.3
