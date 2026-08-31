@@ -1151,11 +1151,11 @@ draft
 | AH2-001 | fail-closed submit | — | [#335](https://github.com/YuanshuoDu/applymate-jobcopilot/issues/335) | [#341](https://github.com/YuanshuoDu/applymate-jobcopilot/pull/341) | done |
 | AH2-002 | external action/CAPTCHA matrix | #335 | [#336](https://github.com/YuanshuoDu/applymate-jobcopilot/issues/336) | [#342](https://github.com/YuanshuoDu/applymate-jobcopilot/pull/342) | done |
 | AH2-003 | ADR/flags/baseline | #335,#336 | [#337](https://github.com/YuanshuoDu/applymate-jobcopilot/issues/337) | [#343](https://github.com/YuanshuoDu/applymate-jobcopilot/pull/343) | done |
-| AH2-004 | agent-protocol package | 003 | TBD | TBD | pending |
-| AH2-005 | Turn/Step/Input schema | 004 | TBD | TBD | pending |
-| AH2-006 | Item/Event/Outbox/sequence | 004,005 | TBD | TBD | pending |
-| AH2-007 | Web/Worker stores | 005,006 | TBD | TBD | pending |
-| AH2-008 | legacy dual-write/projector | 007 | TBD | TBD | pending |
+| AH2-004 | agent-protocol package | #337 | [#344](https://github.com/YuanshuoDu/applymate-jobcopilot/issues/344) | TBD | in-progress |
+| AH2-005 | Turn/Step/Input schema | #344 | [#345](https://github.com/YuanshuoDu/applymate-jobcopilot/issues/345) | TBD | spec-ready |
+| AH2-006 | Item/Event/Outbox/sequence | #344,#345 | [#346](https://github.com/YuanshuoDu/applymate-jobcopilot/issues/346) | TBD | spec-ready |
+| AH2-007 | Web/Worker stores | #345,#346 | [#347](https://github.com/YuanshuoDu/applymate-jobcopilot/issues/347) | TBD | spec-ready |
+| AH2-008 | legacy dual-write/projector | #347 | [#348](https://github.com/YuanshuoDu/applymate-jobcopilot/issues/348) | TBD | spec-ready |
 | AH2-009 | command service | 007 | TBD | TBD | pending |
 | AH2-010 | message/interrupt API | 009 | TBD | TBD | pending |
 | AH2-011 | query API | 007 | TBD | TBD | pending |
