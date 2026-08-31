@@ -22,6 +22,7 @@
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.39.0",
+    "@jobcopilot/agent-model": "workspace:*",
     "@auth/prisma-adapter": "^2.8.0",
     "@jobcopilot/agent-protocol": "workspace:*",
     "@jobcopilot/shared": "workspace:*",
