@@ -2,6 +2,7 @@ import {
   assertValid,
   ToolDefinitionSchema,
   schemaVersion,
+  PolicyDomainSchema,
   type ToolCapability,
 } from "@jobcopilot/agent-protocol"
 
@@ -37,6 +38,7 @@ function publicDefinition(definition: RuntimeToolDefinition): PublicToolDefiniti
     idempotency: definition.idempotency,
     timeoutMs: definition.timeoutMs,
     requiredCapabilities: [...definition.requiredCapabilities],
+    domain: definition.domain,
   }
 }
 
@@ -108,6 +110,11 @@ export class ToolRegistry {
     }
     if (definition.risk === "read" && !definition.capabilities.includes("read" as ToolCapability)) {
       throw new ToolRegistryError("invalid_definition", `Read tool ${definition.name} must declare read capability`)
+    }
+    try {
+      assertValid(PolicyDomainSchema, definition.domain, "tool domain")
+    } catch (error: unknown) {
+      throw new ToolRegistryError("invalid_definition", error instanceof Error ? error.message : "Invalid tool domain")
     }
   }
 
