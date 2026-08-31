@@ -1,0 +1,35 @@
+{
+  "name": "@jobcopilot/agent-protocol",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": { "types": "./dist/index.d.ts", "default": "./dist/index.js" },
+    "./session": { "types": "./dist/session.d.ts", "default": "./dist/session.js" },
+    "./turn": { "types": "./dist/turn.d.ts", "default": "./dist/turn.js" },
+    "./step": { "types": "./dist/step.d.ts", "default": "./dist/step.js" },
+    "./input": { "types": "./dist/input.d.ts", "default": "./dist/input.js" },
+    "./item": { "types": "./dist/item.d.ts", "default": "./dist/item.js" },
+    "./event": { "types": "./dist/event.d.ts", "default": "./dist/event.js" },
+    "./tool": { "types": "./dist/tool.d.ts", "default": "./dist/tool.js" },
+    "./approval": { "types": "./dist/approval.d.ts", "default": "./dist/approval.js" },
+    "./model": { "types": "./dist/model.d.ts", "default": "./dist/model.js" },
+    "./validation": { "types": "./dist/validation.d.ts", "default": "./dist/validation.js" },
+    "./version": { "types": "./dist/version.d.ts", "default": "./dist/version.js" }
+  },
+  "dependencies": {
+    "@sinclair/typebox": "^0.34.52",
+    "ajv": "^8.20.0"
+  },
+  "scripts": {
+    "build": "tsc",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run"
+  },
+  "devDependencies": {
+    "typescript": "5.9.3",
+    "vitest": "^3.1.4"
+  }
+}
