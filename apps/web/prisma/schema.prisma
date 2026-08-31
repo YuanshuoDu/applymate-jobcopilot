@@ -1645,6 +1645,7 @@ model AgentSession {
   completedAt   DateTime?
   createdAt     DateTime  @default(now())
   updatedAt     DateTime  @updatedAt
+  eventSequence BigInt    @default(0)
 
   user             User                   @relation(fields: [userId], references: [id], onDelete: Cascade)
   tasks            SubAgentTask[]
@@ -1654,6 +1655,8 @@ model AgentSession {
   turns            AgentTurn[]
   steps            AgentStep[]
   inputs           AgentInput[]
+  items            AgentItem[]
+  events           AgentEvent[]
   execution        AgentExecution?
   automation       AgentAutomation?
 
@@ -1694,6 +1697,8 @@ model AgentTurn {
   user    User         @relation(fields: [userId], references: [id], onDelete: Cascade)
   steps   AgentStep[]
   inputs  AgentInput[] @relation("AgentTurnInputs")
+  items   AgentItem[]
+  events  AgentEvent[]
 
   @@index([sessionId, createdAt])
   @@index([userId, status, updatedAt(sort: Desc)])
@@ -1730,6 +1735,7 @@ model AgentStep {
   parentStep     AgentStep?   @relation("AgentStepRepairChain", fields: [parentStepId], references: [id], onDelete: SetNull)
   childSteps     AgentStep[]  @relation("AgentStepRepairChain")
   consumedInputs AgentInput[] @relation("AgentStepConsumedInputs")
+  items          AgentItem[]
 
   @@unique([turnId, ordinal, attempt])
   @@index([turnId, status, createdAt])
@@ -1761,6 +1767,73 @@ model AgentInput {
   @@index([sessionId, status, acceptedSequence])
   @@index([targetTurnId, status, acceptedSequence])
   @@map("agent_inputs")
+}
+
+model AgentItem {
+  id          String   @id
+  sessionId   String
+  turnId      String
+  stepId      String?
+  taskId      String?
+  type        String
+  status      String
+  phase       String?
+  revision    Int      @default(0)
+  content     Json
+  startedAt   DateTime?
+  completedAt DateTime?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  session AgentSession @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+  turn    AgentTurn    @relation(fields: [turnId], references: [id], onDelete: Cascade)
+  step    AgentStep?   @relation(fields: [stepId], references: [id], onDelete: SetNull)
+  events  AgentEvent[]
+
+  @@index([turnId, stepId, createdAt])
+  @@index([sessionId, type, createdAt])
+  @@map("agent_items")
+}
+
+model AgentEvent {
+  id             String   @id @default(cuid())
+  sessionId      String
+  turnId         String
+  itemId         String?
+  taskId         String?
+  sequence       BigInt
+  type           String
+  actor          String
+  correlationId  String
+  causationId    String?
+  idempotencyKey String?
+  payload        Json
+  createdAt      DateTime @default(now())
+
+  session AgentSession @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+  turn    AgentTurn    @relation(fields: [turnId], references: [id], onDelete: Cascade)
+  item    AgentItem?   @relation(fields: [itemId], references: [id], onDelete: SetNull)
+
+  @@unique([sessionId, sequence])
+  @@unique([sessionId, idempotencyKey])
+  @@index([turnId, sequence])
+  @@index([taskId, sequence])
+  @@map("agent_events")
+}
+
+model AgentOutbox {
+  id             String   @id @default(cuid())
+  topic          String
+  aggregateId    String
+  idempotencyKey String   @unique
+  payload        Json
+  publishedAt    DateTime?
+  attemptCount   Int      @default(0)
+  lastError      String?  @db.Text
+  createdAt      DateTime @default(now())
+
+  @@index([publishedAt, createdAt])
+  @@map("agent_outbox")
 }
 
 model SubAgentTask {
