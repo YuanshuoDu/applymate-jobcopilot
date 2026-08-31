@@ -2,6 +2,7 @@ import type { PrismaClient } from "@prisma/client"
 import type { InputContentPart } from "@jobcopilot/agent-protocol"
 
 import { AgentCommandError, activeTurnChanged, automationCannotSteerUserTurn, invalidCommand, isUniqueViolation } from "./errors"
+import { cancelPendingWaitsInTransaction } from "../../broker/interrupt"
 import {
   acceptInputFacts,
   assertExpectedTurn,
@@ -163,6 +164,13 @@ export class AgentCommandService {
         data: { status: "interrupted", revision: { increment: 1 }, completedAt: new Date() },
       })
       if (interrupted.count !== 1) throw activeTurnChanged(command.expectedTurnId, active.id)
+
+      await cancelPendingWaitsInTransaction(tx, {
+        sessionId: command.sessionId,
+        userId: command.userId,
+        turnId: active.id,
+        clientMessageId: command.clientMessageId,
+      })
 
       const content: InputContentPart[] = [{ type: "text", text: "Interrupt requested" }]
       return acceptInputFacts(tx, command, content, active, "steer", "interrupted", false)

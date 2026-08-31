@@ -91,7 +91,7 @@ async function assertScope(row: ApprovalRow, expected: ApprovalScopeMatch, now: 
   return actual
 }
 
-async function appendAudit(client: Client, input: { sessionId: string; turnId: string; taskId: string | null; type: string; actor: "user" | "orchestrator" | "system"; approvalId: string; payload: Record<string, unknown>; key: string }): Promise<void> {
+async function appendAudit(client: Client, input: { sessionId: string; turnId: string; itemId?: string | null; taskId: string | null; type: string; actor: "user" | "orchestrator" | "system"; approvalId: string; payload: Record<string, unknown>; key: string }): Promise<void> {
   const session = await client.query<{ id: string }>(`SELECT "id" FROM "agent_sessions" WHERE "id" = $1 FOR UPDATE`, [input.sessionId])
   if (!session.rows[0]) throw new ApprovalStoreError("approval_scope_mismatch", "Approval session does not exist")
   const sequence = await client.query<{ eventSequence: bigint | string }>(`UPDATE "agent_sessions" SET "eventSequence" = "eventSequence" + 1 WHERE "id" = $1 RETURNING "eventSequence"`, [input.sessionId])
@@ -99,8 +99,30 @@ async function appendAudit(client: Client, input: { sessionId: string; turnId: s
   if (next === undefined) throw new ApprovalStoreError("approval_scope_mismatch", "Approval session sequence is unavailable")
   const eventId = randomUUID()
   const eventSequence = BigInt(next)
-  await client.query(`INSERT INTO "agent_events" ("id", "sessionId", "turnId", "itemId", "taskId", "sequence", "type", "actor", "correlationId", "causationId", "idempotencyKey", "payload") VALUES ($1, $2, $3, NULL, $4, $5, $6, $7, $8, NULL, $9, $10::jsonb)`, [eventId, input.sessionId, input.turnId, input.taskId, eventSequence.toString(), input.type, input.actor, input.approvalId, input.key, JSON.stringify(input.payload)])
-  await client.query(`INSERT INTO "agent_outbox" ("id", "topic", "aggregateId", "idempotencyKey", "payload") VALUES ($1, 'agent.session.event', $2, $3, $4::jsonb)`, [`agent-outbox-${eventId}`, input.sessionId, `agent-event:${eventId}`, JSON.stringify({ eventId, sessionId: input.sessionId, turnId: input.turnId, taskId: input.taskId, sequence: eventSequence.toString(), type: input.type, actor: input.actor, correlationId: input.approvalId, causationId: null, idempotencyKey: input.key, payload: input.payload })])
+  await client.query(`INSERT INTO "agent_events" ("id", "sessionId", "turnId", "itemId", "taskId", "sequence", "type", "actor", "correlationId", "causationId", "idempotencyKey", "payload") VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NULL, $10, $11::jsonb)`, [eventId, input.sessionId, input.turnId, input.itemId ?? null, input.taskId, eventSequence.toString(), input.type, input.actor, input.approvalId, input.key, JSON.stringify(input.payload)])
+  await client.query(`INSERT INTO "agent_outbox" ("id", "topic", "aggregateId", "idempotencyKey", "payload") VALUES ($1, 'agent.session.event', $2, $3, $4::jsonb)`, [`agent-outbox-${eventId}`, input.sessionId, `agent-event:${eventId}`, JSON.stringify({ eventId, sessionId: input.sessionId, turnId: input.turnId, itemId: input.itemId ?? null, taskId: input.taskId, sequence: eventSequence.toString(), type: input.type, actor: input.actor, correlationId: input.approvalId, causationId: null, idempotencyKey: input.key, payload: input.payload })])
+}
+
+async function projectApprovalWait(client: Client, input: IssueApprovalReceiptInput, approvalId: string, scopeHash: string): Promise<string> {
+  const session = await client.query<{ id: string }>(`SELECT "id" FROM "agent_sessions" WHERE "id" = $1 AND "userId" = $2 FOR UPDATE`, [input.scope.sessionId, input.scope.userId])
+  if (!session.rows[0]) throw new ApprovalStoreError("approval_scope_mismatch", "Approval session is not owned by the Worker tenant")
+  const turnResult = await client.query<{ id: string; status: string; revision: number }>(
+    `SELECT "id", "status", "revision" FROM "agent_turns" WHERE "id" = $1 AND "sessionId" = $2 AND "userId" = $3 FOR UPDATE`,
+    [input.scope.turnId, input.scope.sessionId, input.scope.userId],
+  )
+  const turn = turnResult.rows[0]
+  if (!turn || !["queued", "in_progress", "waiting_for_dependency"].includes(turn.status) || turn.revision !== input.scope.revision) {
+    throw new ApprovalStoreError("approval_revision_mismatch", "Approval Turn revision is stale")
+  }
+  const itemId = `agent-wait:approval:${approvalId}`
+  await client.query(
+    `INSERT INTO "agent_items" ("id", "sessionId", "turnId", "type", "status", "phase", "revision", "content", "startedAt", "updatedAt") VALUES ($1, $2, $3, 'approval_request', 'started', 'commentary', 0, $4::jsonb, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`,
+    [itemId, input.scope.sessionId, input.scope.turnId, JSON.stringify({ waitKind: "approval", approvalId, toolCallId: input.scope.toolCallId, action: input.scope.action, title: input.title, body: input.body, impact: input.impact ?? null, scopeHash, receiptRevision: input.scope.revision, expiresAt: input.scope.expiresAt.toISOString(), decision: null })],
+  )
+  const updated = await client.query(`UPDATE "agent_turns" SET "status" = 'waiting_for_approval', "revision" = "revision" + 1, "completedAt" = NULL, "updatedAt" = CURRENT_TIMESTAMP WHERE "id" = $1 AND "sessionId" = $2 AND "revision" = $3`, [input.scope.turnId, input.scope.sessionId, input.scope.revision])
+  if (updated.rowCount !== 1) throw new ApprovalStoreError("approval_revision_mismatch", "Approval Turn changed while creating the wait")
+  await appendAudit(client, { sessionId: input.scope.sessionId, turnId: input.scope.turnId, itemId, taskId: input.taskId ?? null, type: "item.started", actor: "orchestrator", approvalId: itemId, payload: { itemId, waitKind: "approval", approvalId, toolCallId: input.scope.toolCallId }, key: `agent-wait:${itemId}:started` })
+  return itemId
 }
 
 async function withTransaction<T>(pool: pg.Pool, userId: string, work: (client: Client) => Promise<T>): Promise<T> {
@@ -140,6 +162,7 @@ export function createPgApprovalStore(pool: pg.Pool, scope: { userId: string }) 
           const job = await client.query(`SELECT "id" FROM "Job" WHERE "id" = $1 AND "userId" = $2`, [input.scope.jobId, scope.userId])
           if (!job.rows[0]) throw new ApprovalStoreError("approval_scope_mismatch", "Approval job is not owned by the Worker tenant")
           const result = await client.query<ApprovalRow>(`INSERT INTO "agent_approvals" ("id", "sessionId", "taskId", "userId", "turnId", "toolCallId", "jobId", "type", "status", "title", "body", "impact", "payload", "resourceHash", "materialHash", "answersHash", "scopeHash", "nonceHash", "revision", "expiresAt") VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'pending', $9, $10, $11::jsonb, $12::jsonb, $13, $14, $15, $16, $17, $18, $19) RETURNING *`, [id, input.scope.sessionId, input.taskId ?? null, scope.userId, input.scope.turnId, input.scope.toolCallId, input.scope.jobId, input.scope.action, input.title, input.body, JSON.stringify(input.impact ?? null), JSON.stringify(input.payload), input.scope.resourceHash, input.scope.materialHash, input.scope.answersHash, scopeHash, nonceHash, input.scope.revision, input.scope.expiresAt])
+          await projectApprovalWait(client, input, id, scopeHash)
           await appendAudit(client, { sessionId: input.scope.sessionId, turnId: input.scope.turnId, taskId: input.taskId ?? null, type: "approval.requested", actor: "orchestrator", approvalId: id, payload: auditPayload(id, input.scope.action, scopeHash, input.scope.revision), key: `approval:${id}:requested` })
           return result.rows[0]
         })

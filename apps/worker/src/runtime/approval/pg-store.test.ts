@@ -29,6 +29,7 @@ function fakePool(row: Record<string, unknown>) {
       calls.push(text)
       if (text.includes('SELECT "id", "sessionId"')) return { rows: [row], rowCount: 1 }
       if (text.includes('SELECT "id" FROM "agent_sessions"')) return { rows: [{ id: scope.sessionId }], rowCount: 1 }
+      if (text.includes('SELECT "id", "status", "revision" FROM "agent_turns"')) return { rows: [{ id: scope.turnId, status: "in_progress", revision: scope.revision }], rowCount: 1 }
       if (text.includes('SELECT "id" FROM "agent_turns"')) return { rows: [{ id: scope.turnId }], rowCount: 1 }
       if (text.includes('SELECT "id" FROM "Job"')) return { rows: [{ id: scope.jobId }], rowCount: 1 }
       if (text.includes('INSERT INTO "agent_approvals"')) return { rows: [row], rowCount: 1 }

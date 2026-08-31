@@ -45,4 +45,18 @@ describe("agent query DTO redaction", () => {
       { type: "attachment_ref", mediaType: "application/pdf", filename: "resume.pdf" },
     ] })
   })
+
+  it("projects refreshable waits without returning the private answer or receipt payload", () => {
+    const dto = itemDto({
+      id: "agent-wait:question:q1", sessionId: "session_1", turnId: "turn_1", stepId: null, taskId: null,
+      type: "question", status: "completed", phase: "commentary", revision: 1,
+      content: { waitKind: "question", questionId: "q1", toolCallId: "call_1", stage: "profile", question: "Work authorisation?", options: [{ value: "yes", label: "Yes" }], answer: "secret-answer", answerAvailable: true },
+      startedAt: date, completedAt: date, createdAt: date, updatedAt: date,
+    })
+    expect(dto.content).toEqual({
+      waitKind: "question", questionId: "q1", toolCallId: "call_1", stage: "profile", question: "Work authorisation?",
+      options: [{ value: "yes", label: "Yes" }], answerAvailable: true, pending: false,
+    })
+    expect(JSON.stringify(dto.content)).not.toContain("secret-answer")
+  })
 })
