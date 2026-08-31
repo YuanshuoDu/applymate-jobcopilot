@@ -1171,7 +1171,7 @@ draft
 | AH2-016 | fallback/recovery/reroute | #363,#364 | [#365](https://github.com/YuanshuoDu/applymate-jobcopilot/issues/365) | [#374](https://github.com/YuanshuoDu/applymate-jobcopilot/pull/374) | done |
 | AH2-017 | ToolRegistry/read tools | #347,#362 | [#366](https://github.com/YuanshuoDu/applymate-jobcopilot/issues/366) | [#375](https://github.com/YuanshuoDu/applymate-jobcopilot/pull/375) | done |
 | AH2-018 | PolicyEngine | #366 | [#376](https://github.com/YuanshuoDu/applymate-jobcopilot/issues/376) | [#382](https://github.com/YuanshuoDu/applymate-jobcopilot/pull/382) | done |
-| AH2-019 | approval receipt | #345,#376 | [#377](https://github.com/YuanshuoDu/applymate-jobcopilot/issues/377) | TBD | spec-ready |
+| AH2-019 | approval receipt | #345,#376 | [#377](https://github.com/YuanshuoDu/applymate-jobcopilot/issues/377) | [#383](https://github.com/YuanshuoDu/applymate-jobcopilot/pull/383) | done |
 | AH2-020 | approval/question broker | #355,#377 | [#378](https://github.com/YuanshuoDu/applymate-jobcopilot/issues/378) | TBD | spec-ready |
 | AH2-021 | migrate high-risk policy | #376–#378 | [#379](https://github.com/YuanshuoDu/applymate-jobcopilot/issues/379) | TBD | spec-ready |
 | AH2-022 | Turn lease/recovery | 007,009 | TBD | TBD | pending |
