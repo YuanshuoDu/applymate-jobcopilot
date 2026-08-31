@@ -6,11 +6,16 @@
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
   "exports": {
-    ".": { "types": "./dist/index.d.ts", "default": "./dist/index.js" }
+    ".": { "types": "./dist/index.d.ts", "default": "./dist/index.js" },
+    "./adapters/openai-compatible": {
+      "types": "./dist/adapters/openai-compatible/index.d.ts",
+      "default": "./dist/adapters/openai-compatible/index.js"
+    }
   },
   "sideEffects": false,
   "dependencies": {
-    "@jobcopilot/agent-protocol": "workspace:*"
+    "@jobcopilot/agent-protocol": "workspace:*",
+    "@jobcopilot/shared": "workspace:*"
   },
   "scripts": {
     "build": "tsc",
