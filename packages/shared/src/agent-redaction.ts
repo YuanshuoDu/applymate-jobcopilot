@@ -7,6 +7,7 @@ const SENSITIVE_EMAIL = /\b[a-z0-9.!#$%&'*+/=?^_`{|}~-]+@[a-z0-9-]+(?:\.[a-z0-9-
 const SENSITIVE_PHONE = /(?<!\w)(?:\+?\d[\d\s().-]{7,}\d)(?!\w)/g
 const SENSITIVE_ASSIGNMENT = /\b(password|secret|token|api[_-]?key|authorization)\s*[:=]\s*[^\s,;]+/gi
 const EVENT_SENSITIVE_KEY = /(?:api[_-]?key|access[_-]?token|refresh[_-]?token|authorization|cookie|password|secret|private[_-]?key|credential|token|nonce|email|phone|address|linkedin|github|(?:full[_-]?)?resume(?:[_-]?(?:text|content|data))?|cv(?:[_-]?(?:text|content|data))?|raw[_-]?(?:content|text|data)|content|value|question|answer|sensitive|confirmed[_-]?answers)/i
+const EVENT_SAFE_KEY = new Set(["approvalid", "draft", "id", "receiptnonce", "scopehash"])
 
 export function redactSensitiveText(value: string): string {
   return value
@@ -46,7 +47,8 @@ export function redactAgentEvent(input: { type: string; body: string; data?: unk
  */
 function redactEventValue(value: unknown, key: string | null = null, depth = 0, maxDepth = 8, insideResume = false): RepositoryJsonValue {
   const resumeContainer = insideResume || key === "resume" || key === "cv"
-  if (key && EVENT_SENSITIVE_KEY.test(key) && key !== "resume" && key !== "cv") return "[REDACTED]"
+  const safeKey = key ? EVENT_SAFE_KEY.has(key.toLowerCase()) : false
+  if (key && !safeKey && EVENT_SENSITIVE_KEY.test(key) && key !== "resume" && key !== "cv") return "[REDACTED]"
   if (insideResume && key === "content") return "[REDACTED]"
   if (typeof value === "string") return redactSensitiveText(value)
   if (value === null || typeof value === "boolean") return value
@@ -54,8 +56,13 @@ function redactEventValue(value: unknown, key: string | null = null, depth = 0, 
   if (depth >= maxDepth) return "[REDACTED]"
   if (Array.isArray(value)) return value.map((entry) => redactEventValue(entry, null, depth + 1, maxDepth, resumeContainer))
   if (typeof value !== "object" || value === undefined) return "[REDACTED]"
-  return Object.fromEntries(Object.entries(value).map(([entryKey, entryValue]) => [
-    entryKey,
-    redactEventValue(entryValue, entryKey, depth + 1, maxDepth, resumeContainer),
-  ]))
+  const entries: Array<[string, RepositoryJsonValue]> = []
+  for (const [entryKey, entryValue] of Object.entries(value)) {
+    // Undefined means the optional field was not supplied. Omitting it keeps
+    // reconnect clients on the receipt-rotation path instead of fabricating a
+    // truthy redaction marker that looks like a usable nonce.
+    if (entryValue === undefined) continue
+    entries.push([entryKey, redactEventValue(entryValue, entryKey, depth + 1, maxDepth, resumeContainer)])
+  }
+  return Object.fromEntries(entries)
 }

@@ -3,7 +3,7 @@ import { describe, expect, it } from "vitest"
 import { redactAgentEvent, redactSensitiveValue } from "./agent-redaction"
 
 describe("agent event redaction", () => {
-  it("removes credentials and direct PII from nested event data", () => {
+  it("removes credentials and direct PII while preserving opaque receipt references", () => {
     const safe = redactAgentEvent({
       type: "tool_call.completed",
       body: "Sent to recruiter@example.com from Bearer abcdefghijk",
@@ -22,7 +22,7 @@ describe("agent event redaction", () => {
         "data": {
           "apiKey": "[REDACTED]",
           "phone": "[REDACTED]",
-          "receiptNonce": "[REDACTED]",
+          "receiptNonce": "nonce-secret",
           "recipientEmail": "[REDACTED]",
           "status": "sent",
         },
@@ -49,6 +49,22 @@ describe("agent event redaction", () => {
     })
 
     expect(safe.data).toEqual({ draft: { name: "Berlin SWE automation", minScore: 85, autoApply: false } })
+  })
+
+  it("keeps opaque approval references and omits absent optional values", () => {
+    const safe = redactAgentEvent({
+      type: "automation_draft",
+      body: "Review the automation before saving it.",
+      data: {
+        draft: { name: "Berlin SWE automation", triggerType: "weekdays" },
+        approval: { id: "approval_1", receiptNonce: undefined, scopeHash: "hash_1" },
+      },
+    })
+
+    expect(safe.data).toEqual({
+      draft: { name: "Berlin SWE automation", triggerType: "weekdays" },
+      approval: { id: "approval_1", scopeHash: "hash_1" },
+    })
   })
 
   it("keeps resume metadata but removes the resume content", () => {
