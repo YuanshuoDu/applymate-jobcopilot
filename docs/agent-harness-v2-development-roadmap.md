@@ -1177,8 +1177,8 @@ draft
 | AH2-020 | approval/question broker | #355,#377 | [#378](https://github.com/YuanshuoDu/applymate-jobcopilot/issues/378) | [#384](https://github.com/YuanshuoDu/applymate-jobcopilot/pull/384) | done |
 | AH2-021 | migrate high-risk policy | #376–#378 | [#379](https://github.com/YuanshuoDu/applymate-jobcopilot/issues/379) | [#385](https://github.com/YuanshuoDu/applymate-jobcopilot/pull/385) | done (Gate pending #387) |
 | AH2-022 | Turn lease/recovery | 007,009 | [#386](https://github.com/YuanshuoDu/applymate-jobcopilot/issues/386) | [#391](https://github.com/YuanshuoDu/applymate-jobcopilot/pull/391) | done |
-| AH2-023 | Step context/input consume | 016,022 | [#397](https://github.com/YuanshuoDu/applymate-jobcopilot/issues/397) | TBD | in-progress |
-| AH2-024 | conversation loop | 017,018,022,023 | TBD | TBD | pending |
+| AH2-023 | Step context/input consume | 016,022 | [#397](https://github.com/YuanshuoDu/applymate-jobcopilot/issues/397) | [#399](https://github.com/YuanshuoDu/applymate-jobcopilot/pull/399) | done |
+| AH2-024 | conversation loop | 017,018,022,023 | [#400](https://github.com/YuanshuoDu/applymate-jobcopilot/issues/400) | TBD | in-progress |
 | AH2-024-M | MiniMax M3 Harness default | AH2-024, AH2-017, #369 | [#370](https://github.com/YuanshuoDu/applymate-jobcopilot/issues/370) | TBD | spec-ready |
 | AH2-025 | suspension/wakeup | 020,024 | TBD | TBD | pending |
 | AH2-026 | interrupt cascade | 022,024,025 | TBD | TBD | pending |
