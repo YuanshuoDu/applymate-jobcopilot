@@ -85,6 +85,11 @@ selected window that have this prefix but do not have the expected `payload.lega
 object as a marker-shape anomaly; they are not silently reclassified as native
 events.
 
+The Prisma `Json` columns used here are PostgreSQL `jsonb` columns. Every
+`?`, `->`, and `->>` operation below is guarded by `jsonb_typeof` or a guarded
+`CASE`, so malformed JSON values are measured as anomalies rather than causing
+the evidence query itself to fail.
+
 ## Reproducible staging collection
 
 The operator must run the following against a read-only, access-controlled
@@ -111,14 +116,24 @@ WITH v2 AS (
   WHERE "createdAt" >= :window_start
     AND "createdAt" < :window_end
     AND "idempotencyKey" LIKE 'legacy-transcript:%'
-), projected AS (
+), projected_marker_rows AS (
   SELECT
     "id" AS "projectionId",
     "sessionId",
-    "data" -> '__agentHarnessV2' ->> 'eventId' AS "eventId"
+    "data" -> '__agentHarnessV2' AS "marker"
   FROM "agent_transcript_events"
-  WHERE "data" IS NOT NULL
+  WHERE jsonb_typeof("data") = 'object'
     AND "data" ? '__agentHarnessV2'
+), projected AS (
+  SELECT
+    "projectionId",
+    "sessionId",
+    CASE
+      WHEN jsonb_typeof("marker") = 'object'
+        THEN "marker" ->> 'eventId'
+      ELSE NULL
+    END AS "eventId"
+  FROM projected_marker_rows
 ), projected_by_event AS (
   SELECT "eventId", COUNT(*)::int AS "allProjectionCount"
   FROM projected
@@ -188,6 +203,7 @@ SELECT
   COUNT(*)::int AS "ah2008PrefixEventCount",
   COUNT(*) FILTER (
     WHERE "payload" IS NULL
+       OR jsonb_typeof("payload") <> 'object'
        OR NOT ("payload" ? 'legacy')
   )::int AS "dualWriteMarkerShapeAnomalyCount"
 FROM "agent_events"
@@ -204,14 +220,24 @@ outside the selected 48-hour window. The latter must not be counted as a
 missing projection for the selected window.
 
 ```sql
-WITH markers AS (
+WITH marker_rows AS (
   SELECT
     t."id" AS "projectionId",
     t."sessionId" AS "projectedSessionId",
-    t."data" -> '__agentHarnessV2' ->> 'eventId' AS "eventId"
+    t."data" -> '__agentHarnessV2' AS "marker"
   FROM "agent_transcript_events" t
-  WHERE t."data" IS NOT NULL
+  WHERE jsonb_typeof(t."data") = 'object'
     AND t."data" ? '__agentHarnessV2'
+), markers AS (
+  SELECT
+    "projectionId",
+    "projectedSessionId",
+    CASE
+      WHEN jsonb_typeof("marker") = 'object'
+        THEN "marker" ->> 'eventId'
+      ELSE NULL
+    END AS "eventId"
+  FROM marker_rows
 ), linked AS (
   SELECT
     m.*,
@@ -262,10 +288,29 @@ permitted when displaying redacted mismatch references after the complete
 count has been calculated.
 
 ```sql
+WITH transcript_marker_rows AS (
+  SELECT
+    t."id",
+    t."sessionId",
+    t."type",
+    t."speaker",
+    t."title",
+    t."body",
+    t."data",
+    t."durationMs",
+    t."data" -> '__agentHarnessV2' AS "marker"
+  FROM "agent_transcript_events" t
+  WHERE jsonb_typeof(t."data") = 'object'
+    AND t."data" ? '__agentHarnessV2'
+)
 SELECT
   e."id" AS "v2EventId",
   e."sessionId",
-  e."payload" -> 'legacy' AS "legacyPayload",
+  CASE
+    WHEN jsonb_typeof(e."payload") = 'object'
+      THEN e."payload" -> 'legacy'
+    ELSE NULL
+  END AS "legacyPayload",
   t."id" AS "projectionId",
   t."type",
   t."speaker",
@@ -274,14 +319,16 @@ SELECT
   t."data",
   t."durationMs"
 FROM "agent_events" e
-JOIN "agent_transcript_events" t
-  ON t."data" -> '__agentHarnessV2' ->> 'eventId' = e."id"
+JOIN transcript_marker_rows t
+  ON CASE
+       WHEN jsonb_typeof(t."marker") = 'object'
+         THEN t."marker" ->> 'eventId'
+       ELSE NULL
+     END = e."id"
  AND t."sessionId" = e."sessionId"
 WHERE e."createdAt" >= :window_start
   AND e."createdAt" < :window_end
   AND e."idempotencyKey" LIKE 'legacy-transcript:%'
-  AND t."data" IS NOT NULL
-  AND t."data" ? '__agentHarnessV2'
 ORDER BY e."sessionId", e."sequence", t."id";
 ```
 
@@ -324,7 +371,8 @@ WITH automation_sessions AS (
   WHERE t."type" = 'automation_started'
     AND t."createdAt" >= :window_start
     AND t."createdAt" < :window_end
-    AND t."data" IS NOT NULL
+    AND jsonb_typeof(t."data") = 'object'
+    AND t."data" ? 'automationId'
     AND t."data" ->> 'automationId' IS NOT NULL
 ), automation_groups AS (
   SELECT
