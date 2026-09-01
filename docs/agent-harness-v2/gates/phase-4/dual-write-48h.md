@@ -383,11 +383,12 @@ FROM linked;
 ### 3. Semantic projection mismatches
 
 The comparison must use the named, executable `phase4-transcript-comparison-
-runner.ts` below. The authorized operator must copy it to an access-controlled
-temporary workspace (not commit it to this repository), run it from the
-`apps/web` package, and record the runner's source revision as the current
-evidence commit. The runner uses Prisma's parameterized query API, keeps raw
-fields in process memory only, disables row/query logging, and writes only
+runner.ts` below. The authorized operator must materialize it as the untracked
+temporary file `apps/web/phase4-transcript-comparison-runner.ts` in an
+access-controlled workspace (do not commit it), run it from the `apps/web`
+package, and record the runner's source revision as the current evidence
+commit. The runner uses Prisma's parameterized query API, keeps raw fields in
+process memory only, disables row/query logging, and writes only
 aggregate counts plus hashed opaque IDs and difference-field names. Do not run
 the internal query in `psql`, CI with query logging, shell tracing, or an output
 file. The runner must process **every** paired row and must not use `LIMIT 5`;
