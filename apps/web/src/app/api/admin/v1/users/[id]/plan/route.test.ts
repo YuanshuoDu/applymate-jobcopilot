@@ -36,6 +36,7 @@ vi.mock('@/lib/admin/write-transaction', () => ({
 }))
 
 const params = Promise.resolve({ id: 'user_1' })
+const futureIso = (days: number) => new Date(Date.now() + days * 24 * 60 * 60 * 1000).toISOString()
 
 describe('/api/admin/v1/users/:id/plan', () => {
   beforeEach(() => {
@@ -60,7 +61,7 @@ describe('/api/admin/v1/users/:id/plan', () => {
     const response = await PATCH(new Request('http://localhost/admin', {
       method: 'PATCH',
       headers: { 'Content-Type': 'application/json', Origin: 'http://localhost', Host: 'localhost', 'Idempotency-Key': 'plan-key-1' },
-      body: JSON.stringify({ toPlan: 'pro', status: 'trialing', trialEndsAt: '2026-09-01T00:00:00.000Z', currentPeriodEnd: '2026-09-30T00:00:00.000Z', cancelAtPeriodEnd: false, version: 3, reason: 'Granting a reviewed Pro trial to this candidate' }),
+      body: JSON.stringify({ toPlan: 'pro', status: 'trialing', trialEndsAt: futureIso(1), currentPeriodEnd: futureIso(30), cancelAtPeriodEnd: false, version: 3, reason: 'Granting a reviewed Pro trial to this candidate' }),
     }) as never, { params })
 
     expect(response.status).toBe(200)

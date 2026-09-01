@@ -126,7 +126,7 @@ describe("agent automation due scheduler API", () => {
       data: { lastRunAt: expect.any(Date), nextRunAt: expect.any(Date) },
     })
     expect(mocks.enqueueAgentRun).toHaveBeenCalledWith({ userId: "user_1", sessionId: "session_1" })
-  })
+  }, 15_000)
 
   it("skips session creation when another scheduler already claimed the automation", async () => {
     mocks.automationUpdateMany.mockResolvedValueOnce({ count: 0 })

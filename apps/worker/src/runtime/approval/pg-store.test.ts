@@ -1,14 +1,17 @@
-import { describe, expect, it, vi } from "vitest"
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 import type pg from "pg"
 import { hashApprovalNonce, hashApprovalScope } from "@jobcopilot/agent-protocol"
 
 import { createPgApprovalStore } from "./pg-store.js"
 import { protocolScope, type ApprovalScopeInput } from "./types.js"
 
+const TEST_NOW_MS = Date.parse("2026-09-01T00:00:00.000Z")
+const timeAt = (minutes: number): Date => new Date(TEST_NOW_MS + minutes * 60_000)
+
 const scope: ApprovalScopeInput = {
   userId: "user_1", sessionId: "session_1", turnId: "turn_1", jobId: "job_1", toolCallId: "call_1", action: "submit_application",
   resourceHash: "a".repeat(64), materialHash: "b".repeat(64), answersHash: "c".repeat(64), revision: 1,
-  expiresAt: new Date("2026-09-01T00:00:00.000Z"),
+  expiresAt: timeAt(60),
 }
 
 async function makeRow(): Promise<Record<string, unknown>> {
@@ -44,6 +47,15 @@ function fakePool(row: Record<string, unknown>) {
   return { pool, client, calls }
 }
 
+beforeEach(() => {
+  vi.useFakeTimers()
+  vi.setSystemTime(timeAt(0))
+})
+
+afterEach(() => {
+  vi.useRealTimers()
+})
+
 describe("Worker PG approval store", () => {
   it("uses the tenant transaction and persists a scoped receipt", async () => {
     const row = await makeRow()
@@ -72,15 +84,15 @@ describe("Worker PG approval store", () => {
     const row = await makeRow()
     const { pool } = fakePool(row)
     const store = createPgApprovalStore(pool, { userId: scope.userId })
-    await expect(store.validate(row.id as string, { ...scope, revision: 2, nonce: "nonce_1" }, new Date("2026-08-31T12:00:00.000Z"))).rejects.toMatchObject({ code: "approval_revision_mismatch" })
-    await expect(store.validate(row.id as string, { ...scope, nonce: "nonce_1" }, new Date("2026-09-01T00:00:00.000Z"))).rejects.toMatchObject({ code: "approval_expired" })
+    await expect(store.validate(row.id as string, { ...scope, revision: 2, nonce: "nonce_1" }, timeAt(1))).rejects.toMatchObject({ code: "approval_revision_mismatch" })
+    await expect(store.validate(row.id as string, { ...scope, nonce: "nonce_1" }, timeAt(60))).rejects.toMatchObject({ code: "approval_expired" })
   })
 
   it("consumes and reserves the external action in the same transaction", async () => {
     const row = await makeRow()
     const { pool, client, calls } = fakePool(row)
     const store = createPgApprovalStore(pool, { userId: scope.userId })
-    const result = await store.consumeAndReserve(row.id as string, { ...scope, nonce: "nonce_1" }, { idempotencyKey: "submit:task_1" }, new Date("2026-08-31T12:00:00.000Z"))
+    const result = await store.consumeAndReserve(row.id as string, { ...scope, nonce: "nonce_1" }, { idempotencyKey: "submit:task_1" }, timeAt(1))
 
     expect(result.reservationId).toEqual(expect.any(String))
     expect(calls).toContain("COMMIT")

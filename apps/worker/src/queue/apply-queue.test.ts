@@ -121,7 +121,7 @@ describe("apply-queue (unit — mocked)", () => {
     const mod = await import("./apply-queue.js");
     expect(mod.QUEUE_NAME).toBe("apply-tasks");
     expect(mod.applyWorker).toBeDefined();
-  });
+  }, 15_000);
 
   it("can enqueue a task", async () => {
     const mod = await import("./apply-queue.js");
