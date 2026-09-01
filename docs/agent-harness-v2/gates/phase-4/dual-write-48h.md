@@ -52,6 +52,9 @@ appended completion block would make the Gate ambiguous.
 | Cross-session event count / marker-row count | `BLOCKED` | Requires session-aware validation; record both event groups and wrong-session rows |
 | Duplicate projection event groups / extra rows | `BLOCKED` | Requires all paired projection rows, not a capped query |
 | Duplicate session count | `INCOMPLETE/BLOCKED` | Automation is queryable; chat/manual requires an approved run manifest because no canonical cross-session run key is persisted |
+| Automation orphan / unusable run-key observations | `BLOCKED` | Missing automation rows and malformed `automationId` values must remain visible in the aggregate |
+| NULL-idempotency marker references | `BLOCKED` | NULL is not allowed to disappear through SQL three-valued logic |
+| Chat/manual manifest validation errors | `INCOMPLETE/BLOCKED` | A manifest must have one canonical session per `(runClass, runKey)` and one row per observed session |
 | Sequence / ordering errors | `BLOCKED` | Requires window-bounded transitions and an explicit left-edge predecessor check |
 
 ## Authoritative data sources
@@ -90,6 +93,24 @@ The Prisma `Json` columns used here are PostgreSQL `jsonb` columns. Every
 `?`, `->`, and `->>` operation below is guarded by `jsonb_typeof` or a guarded
 `CASE`, so malformed JSON values are measured as anomalies rather than causing
 the evidence query itself to fail.
+
+The runtime marker contract is also part of the query contract. A marker is
+valid only when all of the following are true:
+
+```sql
+jsonb_typeof("marker") = 'object'
+AND jsonb_typeof("marker" -> 'eventId') = 'string'
+AND jsonb_typeof("marker" -> 'opaque') = 'boolean'
+AND (
+  NOT ("marker" ? 'wrapped')
+  OR jsonb_typeof("marker" -> 'wrapped') = 'boolean'
+)
+```
+
+This mirrors `transcriptProjectionMarker()`: `eventId` and `opaque` are
+required, while `wrapped` is optional but must be boolean when present. No
+`->>` extraction is allowed before these type checks. Invalid markers are
+counted as invalid-marker anomalies and are never eligible for an exact pair.
 
 ## Reproducible staging collection
 
@@ -131,6 +152,23 @@ WITH v2 AS (
     "sessionId",
     CASE
       WHEN jsonb_typeof("marker") = 'object'
+       AND jsonb_typeof("marker" -> 'eventId') = 'string'
+       AND jsonb_typeof("marker" -> 'opaque') = 'boolean'
+       AND (
+         NOT ("marker" ? 'wrapped')
+         OR jsonb_typeof("marker" -> 'wrapped') = 'boolean'
+       )
+        THEN TRUE
+      ELSE FALSE
+    END AS "isValidMarker",
+    CASE
+      WHEN jsonb_typeof("marker") = 'object'
+       AND jsonb_typeof("marker" -> 'eventId') = 'string'
+       AND jsonb_typeof("marker" -> 'opaque') = 'boolean'
+       AND (
+         NOT ("marker" ? 'wrapped')
+         OR jsonb_typeof("marker" -> 'wrapped') = 'boolean'
+       )
         THEN "marker" ->> 'eventId'
       ELSE NULL
     END AS "eventId"
@@ -138,12 +176,12 @@ WITH v2 AS (
 ), projected_by_event AS (
   SELECT "eventId", COUNT(*)::int AS "allProjectionCount"
   FROM projected
-  WHERE "eventId" IS NOT NULL
+  WHERE "isValidMarker" = TRUE
   GROUP BY "eventId"
 ), projected_by_pair AS (
   SELECT "eventId", "sessionId", COUNT(*)::int AS "exactPairProjectionCount"
   FROM projected
-  WHERE "eventId" IS NOT NULL
+  WHERE "isValidMarker" = TRUE
   GROUP BY "eventId", "sessionId"
 ), joined AS (
   SELECT
@@ -265,6 +303,23 @@ WITH marker_rows AS (
     "projectedSessionId",
     CASE
       WHEN jsonb_typeof("marker") = 'object'
+       AND jsonb_typeof("marker" -> 'eventId') = 'string'
+       AND jsonb_typeof("marker" -> 'opaque') = 'boolean'
+       AND (
+         NOT ("marker" ? 'wrapped')
+         OR jsonb_typeof("marker" -> 'wrapped') = 'boolean'
+       )
+        THEN TRUE
+      ELSE FALSE
+    END AS "isValidMarker",
+    CASE
+      WHEN jsonb_typeof("marker") = 'object'
+       AND jsonb_typeof("marker" -> 'eventId') = 'string'
+       AND jsonb_typeof("marker" -> 'opaque') = 'boolean'
+       AND (
+         NOT ("marker" ? 'wrapped')
+         OR jsonb_typeof("marker" -> 'wrapped') = 'boolean'
+       )
         THEN "marker" ->> 'eventId'
       ELSE NULL
     END AS "eventId"
@@ -281,30 +336,44 @@ WITH marker_rows AS (
 )
 SELECT
   COUNT(*) FILTER (
-    WHERE "eventId" IS NULL
+    WHERE "isValidMarker" = FALSE
   )::int AS "invalidProjectionMarkerCount",
   COUNT(*) FILTER (
-    WHERE "eventId" IS NOT NULL
+    WHERE "isValidMarker" = TRUE
+      AND "eventId" IS NOT NULL
       AND "existingEventId" IS NULL
   )::int AS "nonexistentEventMarkerCount",
   COUNT(*) FILTER (
-    WHERE "eventId" IS NOT NULL
+    WHERE "isValidMarker" = TRUE
+      AND "eventId" IS NOT NULL
       AND "existingEventId" IS NOT NULL
       AND NOT ("eventCreatedAt" >= :window_start AND "eventCreatedAt" < :window_end)
   )::int AS "existingEventOutsideSelectedWindowCount",
   COUNT(*) FILTER (
-    WHERE "eventId" IS NOT NULL
+    WHERE "isValidMarker" = TRUE
+      AND "eventId" IS NOT NULL
       AND "existingEventId" IS NOT NULL
       AND "eventCreatedAt" >= :window_start
       AND "eventCreatedAt" < :window_end
   )::int AS "existingEventInsideSelectedWindowCount",
   COUNT(*) FILTER (
-    WHERE "eventId" IS NOT NULL
+    WHERE "isValidMarker" = TRUE
+      AND "eventId" IS NOT NULL
       AND "existingEventId" IS NOT NULL
-      AND "eventIdempotencyKey" NOT LIKE 'legacy-transcript:%'
+      AND (
+        "eventIdempotencyKey" IS NULL
+        OR "eventIdempotencyKey" NOT LIKE 'legacy-transcript:%'
+      )
   )::int AS "markerPointsToNonDualWriteEventCount",
   COUNT(*) FILTER (
-    WHERE "eventId" IS NOT NULL
+    WHERE "isValidMarker" = TRUE
+      AND "eventId" IS NOT NULL
+      AND "existingEventId" IS NOT NULL
+      AND "eventIdempotencyKey" IS NULL
+  )::int AS "markerPointsToNullIdempotencyKeyCount",
+  COUNT(*) FILTER (
+    WHERE "isValidMarker" = TRUE
+      AND "eventId" IS NOT NULL
       AND "existingEventId" IS NOT NULL
       AND "eventSessionId" <> "projectedSessionId"
   )::int AS "crossSessionMarkerRowCount"
@@ -313,76 +382,195 @@ FROM linked;
 
 ### 3. Semantic projection mismatches
 
-First extract **every** paired projection row in the selected window. Do not
-use `LIMIT 5` in the extraction or comparison query; a maximum of five is only
-permitted when displaying redacted mismatch references after the complete
-count has been calculated.
+The comparison must use the named, executable `phase4-transcript-comparison-
+runner.ts` below. The authorized operator must copy it to an access-controlled
+temporary workspace (not commit it to this repository), run it from the
+`apps/web` package, and record the runner's source revision as the current
+evidence commit. The runner uses Prisma's parameterized query API, keeps raw
+fields in process memory only, disables row/query logging, and writes only
+aggregate counts plus hashed opaque IDs and difference-field names. Do not run
+the internal query in `psql`, CI with query logging, shell tracing, or an output
+file. The runner must process **every** paired row and must not use `LIMIT 5`;
+five is only a display cap for the redacted hash sample.
 
-```sql
-WITH valid_dual_write_events AS (
-  SELECT
-    e.*,
-    CASE
-      WHEN jsonb_typeof(e."payload") = 'object'
-        THEN e."payload" -> 'legacy'
-      ELSE NULL
-    END AS "legacyPayload"
-  FROM "agent_events" e
-  WHERE e."createdAt" >= :window_start
-    AND e."createdAt" < :window_end
-    AND e."idempotencyKey" LIKE 'legacy-transcript:%'
-    AND jsonb_typeof(e."payload") = 'object'
-    AND e."payload" ? 'legacy'
-    AND jsonb_typeof(e."payload" -> 'legacy') = 'object'
-    AND jsonb_typeof(e."payload" -> 'legacy' -> 'type') = 'string'
-    AND jsonb_typeof(e."payload" -> 'legacy' -> 'speaker') = 'string'
-    AND jsonb_typeof(e."payload" -> 'legacy' -> 'body') = 'string'
-), transcript_marker_rows AS (
-  SELECT
-    t."id",
-    t."sessionId",
-    t."type",
-    t."speaker",
-    t."title",
-    t."body",
-    t."data",
-    t."durationMs",
-    t."data" -> '__agentHarnessV2' AS "marker"
-  FROM "agent_transcript_events" t
-  WHERE jsonb_typeof(t."data") = 'object'
-    AND t."data" ? '__agentHarnessV2'
-)
-SELECT
-  e."id" AS "v2EventId",
-  e."sessionId",
-  e."legacyPayload",
-  t."id" AS "projectionId",
-  t."type",
-  t."speaker",
-  t."title",
-  t."body",
-  t."data",
-  t."durationMs"
-FROM valid_dual_write_events e
-JOIN transcript_marker_rows t
-  ON CASE
-       WHEN jsonb_typeof(t."marker") = 'object'
-         THEN t."marker" ->> 'eventId'
-       ELSE NULL
-     END = e."id"
- AND t."sessionId" = e."sessionId"
-ORDER BY e."sessionId", e."sequence", t."id";
+```ts
+// phase4-transcript-comparison-runner.ts (operator-supplied, not committed)
+import { createHash } from "node:crypto"
+import { Prisma, PrismaClient } from "@prisma/client"
+import { compareTranscriptGolden } from "../src/lib/agent/session/transcript-projector"
+
+type PairRow = {
+  v2EventId: string
+  projectionId: string
+  legacyPayload: unknown
+  projectedType: string
+  projectedSpeaker: string
+  projectedTitle: string | null
+  projectedBody: string
+  projectedData: unknown
+  projectedDurationMs: number | null
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value)
+}
+
+function opaqueId(value: string): string {
+  return createHash("sha256").update(value).digest("hex").slice(0, 16)
+}
+
+function requiredArgument(name: string): string {
+  const index = process.argv.indexOf(name)
+  const value = index >= 0 ? process.argv[index + 1] : undefined
+  if (!value) throw new Error(`Missing ${name}`)
+  return value
+}
+
+const prisma = new PrismaClient({ log: [] })
+const windowStart = new Date(requiredArgument("--window-start"))
+const windowEnd = new Date(requiredArgument("--window-end"))
+
+try {
+  const rows = await prisma.$queryRaw<PairRow[]>(Prisma.sql`
+    WITH valid_dual_write_events AS (
+      SELECT
+        e."id",
+        e."sessionId",
+        e."sequence",
+        CASE
+          WHEN jsonb_typeof(e."payload") = 'object'
+            THEN e."payload" -> 'legacy'
+          ELSE NULL
+        END AS "legacyPayload"
+      FROM "agent_events" e
+      WHERE e."createdAt" >= ${windowStart}
+        AND e."createdAt" < ${windowEnd}
+        AND e."idempotencyKey" LIKE 'legacy-transcript:%'
+        AND jsonb_typeof(e."payload") = 'object'
+        AND e."payload" ? 'legacy'
+        AND jsonb_typeof(e."payload" -> 'legacy') = 'object'
+        AND jsonb_typeof(e."payload" -> 'legacy' -> 'type') = 'string'
+        AND jsonb_typeof(e."payload" -> 'legacy' -> 'speaker') = 'string'
+        AND jsonb_typeof(e."payload" -> 'legacy' -> 'body') = 'string'
+    ), transcript_marker_rows AS (
+      SELECT
+        t."id",
+        t."sessionId",
+        t."type" AS "projectedType",
+        t."speaker" AS "projectedSpeaker",
+        t."title" AS "projectedTitle",
+        t."body" AS "projectedBody",
+        t."data" AS "projectedData",
+        t."durationMs" AS "projectedDurationMs",
+        t."data" -> '__agentHarnessV2' AS "marker"
+      FROM "agent_transcript_events" t
+      WHERE jsonb_typeof(t."data") = 'object'
+        AND t."data" ? '__agentHarnessV2'
+    ), valid_marker_rows AS (
+      SELECT
+        "id",
+        "sessionId",
+        "projectedType",
+        "projectedSpeaker",
+        "projectedTitle",
+        "projectedBody",
+        "projectedData",
+        "projectedDurationMs",
+        "marker" ->> 'eventId' AS "eventId"
+      FROM transcript_marker_rows
+      WHERE jsonb_typeof("marker") = 'object'
+        AND jsonb_typeof("marker" -> 'eventId') = 'string'
+        AND jsonb_typeof("marker" -> 'opaque') = 'boolean'
+        AND (
+          NOT ("marker" ? 'wrapped')
+          OR jsonb_typeof("marker" -> 'wrapped') = 'boolean'
+        )
+    )
+    SELECT
+      e."id" AS "v2EventId",
+      e."legacyPayload",
+      t."id" AS "projectionId",
+      t."projectedType",
+      t."projectedSpeaker",
+      t."projectedTitle",
+      t."projectedBody",
+      t."projectedData",
+      t."projectedDurationMs"
+    FROM valid_dual_write_events e
+    JOIN valid_marker_rows t
+      ON t."eventId" = e."id"
+     AND t."sessionId" = e."sessionId"
+    ORDER BY e."sessionId", e."sequence", t."id"
+  `)
+
+  let projectionMismatchCount = 0
+  const mismatchSample: Array<{
+    v2EventIdHash: string
+    projectionIdHash: string
+    differences: string[]
+  }> = []
+
+  for (const row of rows) {
+    if (!isRecord(row.legacyPayload)) throw new Error("Unexpected legacy payload shape")
+    const legacy = {
+      type: row.legacyPayload.type as string,
+      speaker: row.legacyPayload.speaker as string,
+      title: typeof row.legacyPayload.title === "string" ? row.legacyPayload.title : null,
+      body: row.legacyPayload.body as string,
+      durationMs: typeof row.legacyPayload.durationMs === "number" ? row.legacyPayload.durationMs : null,
+      data: row.legacyPayload.data ?? null,
+    }
+    const projected = {
+      type: row.projectedType,
+      speaker: row.projectedSpeaker,
+      title: row.projectedTitle,
+      body: row.projectedBody,
+      durationMs: row.projectedDurationMs,
+      data: row.projectedData,
+    }
+    const comparison = compareTranscriptGolden(legacy, projected)
+    if (!comparison.matches) {
+      projectionMismatchCount += 1
+      if (mismatchSample.length < 5) {
+        mismatchSample.push({
+          v2EventIdHash: opaqueId(row.v2EventId),
+          projectionIdHash: opaqueId(row.projectionId),
+          differences: comparison.differences,
+        })
+      }
+    }
+  }
+
+  process.stdout.write(JSON.stringify({
+    comparedPairCount: rows.length,
+    projection_mismatch_count: projectionMismatchCount,
+    mismatchSample,
+  }) + "\n")
+} finally {
+  await prisma.$disconnect()
+}
 ```
 
-In a controlled comparison script, map `legacyPayload` to the comparable
-fields (`type`, `speaker`, `title`, `body`, `durationMs`, and `data`) and call
-`compareTranscriptGolden` from the projector module for **every** returned
-paired row, including duplicate projection rows. Record the exact number of
-rows whose `matches` value is false as `projection_mismatch_count`. The report
-may retain at most five redacted `(v2EventId, projectionId, differences)`
-references for review; the sample must never replace the complete count.
-Structural anomalies (`missing`, `cross-session`, and `duplicate`) remain
-separate metrics even when semantic comparison is possible.
+Run it as follows, with the exact timestamps used by the other queries:
+
+```powershell
+pnpm --filter web exec tsx phase4-transcript-comparison-runner.ts `
+  --window-start 2026-08-30T00:00:00.000Z `
+  --window-end 2026-09-01T00:00:00.000Z
+```
+
+The timestamps above are placeholders and must be replaced before execution.
+The runner maps `legacyPayload` exactly as `legacyFromPayload()` does: string
+`type`, `speaker`, and `body` are required; non-string `title` becomes `null`;
+non-number `durationMs` becomes `null`; and missing `data` becomes `null`.
+`compareTranscriptGolden` then removes the valid marker before comparing
+`data`. Duplicate projection rows are intentionally included. Record the
+exact `projection_mismatch_count` from the runner; the hash sample must never
+replace the complete count. Structural anomalies (`missing`, `cross-session`,
+and `duplicate`) remain separate metrics even when semantic comparison is
+possible. If the operator cannot run this exact in-memory runner, the
+`Projection mismatch count` must remain `UNSUPPORTED/BLOCKED` and the Gate
+cannot pass; it must not be estimated from a sample.
 
 ### 4. Duplicate canonical sessions for every required run class
 
@@ -402,78 +590,141 @@ If the staging exercise includes chat or manual runs without a supplied run
 manifest, the full duplicate-session metric must remain
 `INCOMPLETE/BLOCKED`; it must not be reported as zero.
 
-For automation runs, run:
+For automation runs, run the observation-driven query below. It starts from
+every `automation_started` observation and uses a `LEFT JOIN`, so deleted,
+unknown, or malformed automation records cannot disappear before aggregation.
+Rows without a usable string `automationId` are counted separately.
 
 ```sql
-WITH automation_sessions AS (
+WITH automation_observations AS (
   SELECT
-    t."data" ->> 'automationId' AS "automationId",
+    CASE
+      WHEN jsonb_typeof(t."data") = 'object'
+       AND t."data" ? 'automationId'
+       AND jsonb_typeof(t."data" -> 'automationId') = 'string'
+       AND NULLIF(BTRIM(t."data" ->> 'automationId'), '') IS NOT NULL
+        THEN t."data" ->> 'automationId'
+      ELSE NULL
+    END AS "automationId",
     t."sessionId" AS "observedSessionId"
   FROM "agent_transcript_events" t
   WHERE t."type" = 'automation_started'
     AND t."createdAt" >= :window_start
     AND t."createdAt" < :window_end
-    AND jsonb_typeof(t."data") = 'object'
-    AND t."data" ? 'automationId'
-    AND t."data" ->> 'automationId' IS NOT NULL
 ), automation_groups AS (
   SELECT
-    a."id" AS "automationId",
+    o."automationId",
+    a."id" AS "canonicalAutomationId",
     a."sessionId" AS "canonicalSessionId",
-    COUNT(DISTINCT s."observedSessionId")::int AS "observedSessionCount",
+    COUNT(*)::int AS "observationCount",
+    COUNT(DISTINCT o."observedSessionId")::int AS "observedSessionCount",
     COUNT(*) FILTER (
-      WHERE s."observedSessionId" IS DISTINCT FROM a."sessionId"
+      WHERE o."observedSessionId" IS DISTINCT FROM a."sessionId"
     )::int AS "nonCanonicalObservationCount"
-  FROM "agent_automations" a
-  JOIN automation_sessions s
-    ON s."automationId" = a."id"
-  GROUP BY a."id", a."sessionId"
+  FROM automation_observations o
+  LEFT JOIN "agent_automations" a
+    ON a."id" = o."automationId"
+  WHERE o."automationId" IS NOT NULL
+  GROUP BY o."automationId", a."id", a."sessionId"
 )
 SELECT
   COUNT(*) FILTER (
-    WHERE "canonicalSessionId" IS NOT NULL
+    WHERE "canonicalAutomationId" IS NOT NULL
+      AND "canonicalSessionId" IS NOT NULL
       AND "observedSessionCount" > 1
   )::int
     AS "duplicateAutomationSessionGroups",
   COUNT(*) FILTER (WHERE "canonicalSessionId" IS NULL)::int
-    AS "automationWithoutCanonicalSessionCount",
+    AS "automationWithoutCanonicalSessionGroupCount",
+  COUNT(*) FILTER (WHERE "canonicalAutomationId" IS NULL)::int
+    AS "orphanAutomationGroupCount",
+  COALESCE(SUM("observationCount") FILTER (
+    WHERE "canonicalAutomationId" IS NULL
+  ), 0)::int AS "orphanAutomationObservationCount",
   COALESCE(SUM("nonCanonicalObservationCount"), 0)::int
-    AS "nonCanonicalAutomationObservationCount"
+    AS "nonCanonicalAutomationObservationCount",
+  (
+    SELECT COUNT(*)::int
+    FROM automation_observations
+    WHERE "automationId" IS NULL
+  ) AS "automationWithoutUsableRunKeyCount"
 FROM automation_groups;
 ```
 
-For chat/manual runs, the authorized operator must create an access-controlled
-temporary manifest from the staging exercise, with one row per observed
-session:
+`orphanAutomationGroupCount` and `orphanAutomationObservationCount` cover
+usable automation IDs with no current `agent_automations` row. The
+`automationWithoutCanonicalSessionGroupCount` also covers existing automation
+rows whose nullable `sessionId` is absent. Either orphan or malformed metric is
+a Gate failure, not a reason to report a clean zero.
+
+For chat/manual runs, the authorized operator must supply an access-controlled
+manifest from the staging exercise, with one row per observed session. Use the
+parameterized `VALUES` CTE below; do not create a temporary table on the
+read-only connection:
 
 ```sql
-CREATE TEMP TABLE phase4_run_manifest (
-  "runClass" text NOT NULL CHECK ("runClass" IN ('chat', 'manual')),
-  "runKey" text NOT NULL,
-  "canonicalSessionId" text NOT NULL,
-  "observedSessionId" text NOT NULL
-);
--- Insert the operator-approved exercise mapping here. Do not infer it from
--- goals, timestamps, user IDs, or similar text.
-
-SELECT
-  COUNT(*) FILTER (WHERE "observedSessionCount" > 1)::int
-    AS "duplicateChatManualSessionGroups",
-  COALESCE(SUM("nonCanonicalObservationCount"), 0)::int
-    AS "nonCanonicalChatManualObservationCount"
-FROM (
+WITH phase4_run_manifest("runClass", "runKey", "canonicalSessionId", "observedSessionId") AS (
+  VALUES
+    (CAST(:run_class_1 AS text), CAST(:run_key_1 AS text),
+     CAST(:canonical_session_id_1 AS text), CAST(:observed_session_id_1 AS text))
+    -- Add one parameterized row per operator-approved observed session.
+), manifest_rows AS (
+  SELECT
+    *,
+    CASE
+      WHEN "runClass" IN ('chat', 'manual')
+       AND NULLIF(BTRIM("runKey"), '') IS NOT NULL
+       AND NULLIF(BTRIM("canonicalSessionId"), '') IS NOT NULL
+       AND NULLIF(BTRIM("observedSessionId"), '') IS NOT NULL
+        THEN TRUE
+      ELSE FALSE
+    END AS "isValidRow"
+  FROM phase4_run_manifest
+), manifest_groups AS (
   SELECT
     "runClass",
     "runKey",
-    "canonicalSessionId",
+    COUNT(*)::int AS "rowCount",
+    COUNT(DISTINCT "canonicalSessionId")::int AS "canonicalSessionCount",
     COUNT(DISTINCT "observedSessionId")::int AS "observedSessionCount",
+    (COUNT(*) - COUNT(DISTINCT "observedSessionId"))::int
+      AS "duplicateManifestRowCount",
     COUNT(*) FILTER (
       WHERE "observedSessionId" IS DISTINCT FROM "canonicalSessionId"
-    )::int AS "nonCanonicalObservationCount"
-  FROM phase4_run_manifest
-  GROUP BY "runClass", "runKey", "canonicalSessionId"
-) grouped_runs;
+    )::int AS "nonCanonicalObservationCount",
+    COUNT(*) FILTER (WHERE NOT "isValidRow")::int AS "invalidManifestRowCount"
+  FROM manifest_rows
+  GROUP BY "runClass", "runKey"
+), grouped_metrics AS (
+  SELECT
+    COUNT(*) FILTER (
+      WHERE "observedSessionCount" > 1
+        AND "canonicalSessionCount" = 1
+        AND "duplicateManifestRowCount" = 0
+        AND "invalidManifestRowCount" = 0
+    )::int AS "duplicateChatManualSessionGroups",
+    COALESCE(SUM("nonCanonicalObservationCount"), 0)::int
+      AS "nonCanonicalChatManualObservationCount",
+    COUNT(*) FILTER (
+      WHERE "canonicalSessionCount" <> 1
+        OR "duplicateManifestRowCount" > 0
+        OR "invalidManifestRowCount" > 0
+    )::int AS "invalidChatManualManifestGroupCount",
+    COALESCE(SUM("duplicateManifestRowCount"), 0)::int
+      AS "duplicateChatManualManifestRowCount"
+  FROM manifest_groups
+)
+SELECT *
+FROM grouped_metrics;
 ```
+
+The operator must not infer manifest rows from goals, timestamps, user IDs, or
+similar text. Grouping is intentionally by `(runClass, runKey)` only. Thus one
+authoritative run key mapped to two canonical sessions is one invalid group,
+not two singleton groups. The consistency checks require exactly one
+canonical session per run key and one manifest row per observed session. Any
+invalid group or duplicate manifest row keeps the duplicate-session metric
+`INCOMPLETE/BLOCKED`.
 
 The final duplicate-session metric is complete only after the automation
 result and all manifest-backed chat/manual results have been reconciled. Until
@@ -561,6 +812,43 @@ The schema's `(sessionId, sequence)` unique constraint protects against exact
 duplicates, while the continuity check detects committed sequence gaps. The
 operator must still record retry or projection anomalies observed during the
 window and explain any session whose first observed event has no predecessor.
+
+## Executable Gate thresholds
+
+The operator must apply these thresholds when replacing the single
+authoritative metrics record. A real staging run is **NOT PASSED** if any
+required metric is non-zero, if the comparison runner cannot produce a
+complete count, or if a required run class is incomplete. The report must not
+interpret "observed" as "passed".
+
+| Metric or condition | Required value for Gate PASS |
+|---|---:|
+| `dualWriteEventCount` | Equals `validLegacyPayloadCount`; `opaqueProjectionCandidateCount = 0` |
+| `exactlyOneProjectionPairCount` | Equals `dualWriteEventCount` |
+| `projection_mismatch_count` | `0`, produced by the complete in-memory runner |
+| `missingProjectionCount` | `0` |
+| `existingEventOutsideSelectedWindowCount` | `0` |
+| `invalidProjectionMarkerCount` | `0` |
+| `nonexistentEventMarkerCount` | `0` |
+| `markerPointsToNonDualWriteEventCount` | `0` |
+| `markerPointsToNullIdempotencyKeyCount` | `0` |
+| `crossSessionEventCount` and `crossSessionMarkerRowCount` | `0` |
+| `duplicateProjectionEventCount` and `duplicateProjectionExtraRowCount` | `0` |
+| `duplicateAutomationSessionGroups` | `0` |
+| `automationWithoutCanonicalSessionGroupCount` | `0` |
+| `orphanAutomationGroupCount`, `orphanAutomationObservationCount`, and `automationWithoutUsableRunKeyCount` | `0` |
+| `nonCanonicalAutomationObservationCount` | `0` |
+| `duplicateChatManualSessionGroups` and `nonCanonicalChatManualObservationCount` | `0` |
+| `invalidChatManualManifestGroupCount` and `duplicateChatManualManifestRowCount` | `0` |
+| Duplicate-session metric completeness | Not `INCOMPLETE/BLOCKED`; every included run class has an authoritative key |
+| `sequenceGapOrOrderingErrorCount` | `0` |
+| `leftEdgeWithoutPredecessorCount` | Informational only; explain affected sessions, but do not treat absence as an error |
+| AC1 approval smoke and AC3 SSE drill | Real staging evidence for every required scenario |
+
+Any threshold failure keeps the **Gate decision** `NOT PASSED`, records the
+failed metric and redacted evidence reference, and prevents Phase 5 unlock.
+Only an authorized operator may replace the blocked values after all required
+thresholds and real staging scenarios pass.
 
 ## Authorized completion procedure
 
