@@ -48,6 +48,7 @@ appended completion block would make the Gate ambiguous.
 | Missing projection count | `BLOCKED` | Counts only a dual-write event with no marker anywhere |
 | Existing projection outside selected window | `BLOCKED` | Must be reported separately from nonexistent-event markers |
 | Invalid projection marker count | `BLOCKED` | Marker rows without a string event ID must not be silently omitted |
+| Opaque projection candidate count | `BLOCKED` | Prefix events whose `payload.legacy` fails the projector shape are classified separately and excluded from golden comparison |
 | Cross-session event count / marker-row count | `BLOCKED` | Requires session-aware validation; record both event groups and wrong-session rows |
 | Duplicate projection event groups / extra rows | `BLOCKED` | Requires all paired projection rows, not a capped query |
 | Duplicate session count | `INCOMPLETE/BLOCKED` | Automation is queryable; chat/manual requires an approved run manifest because no canonical cross-session run key is persisted |
@@ -199,18 +200,48 @@ must not collapse those two categories or discard the extra rows.
 The operator must also audit the AH2-008 source predicate itself:
 
 ```sql
+WITH dual_write_events AS (
+  SELECT
+    e.*,
+    CASE
+      WHEN jsonb_typeof(e."payload") = 'object'
+        THEN e."payload" -> 'legacy'
+      ELSE NULL
+    END AS "legacyPayload"
+  FROM "agent_events" e
+  WHERE e."createdAt" >= :window_start
+    AND e."createdAt" < :window_end
+    AND e."idempotencyKey" LIKE 'legacy-transcript:%'
+), classified AS (
+  SELECT
+    *,
+    CASE
+      WHEN jsonb_typeof("payload") = 'object'
+       AND "payload" ? 'legacy'
+       AND jsonb_typeof("legacyPayload") = 'object'
+       AND jsonb_typeof("legacyPayload" -> 'type') = 'string'
+       AND jsonb_typeof("legacyPayload" -> 'speaker') = 'string'
+       AND jsonb_typeof("legacyPayload" -> 'body') = 'string'
+        THEN TRUE
+      ELSE FALSE
+    END AS "hasValidLegacyPayload"
+  FROM dual_write_events
+)
 SELECT
   COUNT(*)::int AS "ah2008PrefixEventCount",
-  COUNT(*) FILTER (
-    WHERE "payload" IS NULL
-       OR jsonb_typeof("payload") <> 'object'
-       OR NOT ("payload" ? 'legacy')
-  )::int AS "dualWriteMarkerShapeAnomalyCount"
-FROM "agent_events"
-WHERE "createdAt" >= :window_start
-  AND "createdAt" < :window_end
-  AND "idempotencyKey" LIKE 'legacy-transcript:%';
+  COUNT(*) FILTER (WHERE "hasValidLegacyPayload")::int
+    AS "validLegacyPayloadCount",
+  COUNT(*) FILTER (WHERE NOT "hasValidLegacyPayload")::int
+    AS "opaqueProjectionCandidateCount"
+FROM classified;
 ```
+
+`legacyFromPayload` in the projector requires `legacy` to be an object with
+string `type`, `speaker`, and `body`. A prefix event that fails that full shape
+is classified as an `opaqueProjectionCandidate`, matching the projector's
+`opaqueProjection` fallback. It is excluded from the golden comparison query
+below and must be retained as a separate structural metric; an AH2-008
+dual-write Gate PASS requires this candidate count to be zero.
 
 ### 2. Existing markers outside the selected event window
 
@@ -288,7 +319,25 @@ permitted when displaying redacted mismatch references after the complete
 count has been calculated.
 
 ```sql
-WITH transcript_marker_rows AS (
+WITH valid_dual_write_events AS (
+  SELECT
+    e.*,
+    CASE
+      WHEN jsonb_typeof(e."payload") = 'object'
+        THEN e."payload" -> 'legacy'
+      ELSE NULL
+    END AS "legacyPayload"
+  FROM "agent_events" e
+  WHERE e."createdAt" >= :window_start
+    AND e."createdAt" < :window_end
+    AND e."idempotencyKey" LIKE 'legacy-transcript:%'
+    AND jsonb_typeof(e."payload") = 'object'
+    AND e."payload" ? 'legacy'
+    AND jsonb_typeof(e."payload" -> 'legacy') = 'object'
+    AND jsonb_typeof(e."payload" -> 'legacy' -> 'type') = 'string'
+    AND jsonb_typeof(e."payload" -> 'legacy' -> 'speaker') = 'string'
+    AND jsonb_typeof(e."payload" -> 'legacy' -> 'body') = 'string'
+), transcript_marker_rows AS (
   SELECT
     t."id",
     t."sessionId",
@@ -306,11 +355,7 @@ WITH transcript_marker_rows AS (
 SELECT
   e."id" AS "v2EventId",
   e."sessionId",
-  CASE
-    WHEN jsonb_typeof(e."payload") = 'object'
-      THEN e."payload" -> 'legacy'
-    ELSE NULL
-  END AS "legacyPayload",
+  e."legacyPayload",
   t."id" AS "projectionId",
   t."type",
   t."speaker",
@@ -318,7 +363,7 @@ SELECT
   t."body",
   t."data",
   t."durationMs"
-FROM "agent_events" e
+FROM valid_dual_write_events e
 JOIN transcript_marker_rows t
   ON CASE
        WHEN jsonb_typeof(t."marker") = 'object'
@@ -326,9 +371,6 @@ JOIN transcript_marker_rows t
        ELSE NULL
      END = e."id"
  AND t."sessionId" = e."sessionId"
-WHERE e."createdAt" >= :window_start
-  AND e."createdAt" < :window_end
-  AND e."idempotencyKey" LIKE 'legacy-transcript:%'
 ORDER BY e."sessionId", e."sequence", t."id";
 ```
 
