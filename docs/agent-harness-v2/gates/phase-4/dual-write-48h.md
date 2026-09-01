@@ -1,6 +1,6 @@
 # Phase 4 Gate — 48-hour dual-write integrity report
 
-**Current status:** `PENDING_STAGING_SHADOW` / `blocked — staging access not available`
+**Current status:** `PENDING_STAGING_SHADOW` / `blocked — staging access is available, but the required 48-hour observation is not complete`
 
 This artifact records the evidence state for the Phase 4 Exit Gate. It does
 not claim that a 48-hour staging observation was run. No counts, mismatch
@@ -10,10 +10,12 @@ here.
 ## Authoritative gate state
 
 The status, run metadata, and required-metrics tables in this document are one
-authoritative completion record. An authorized staging operator must replace
-the current placeholder values in those tables in one reviewed commit. Do not
-append a second PASS/FAIL record below the current record; a stale table and an
-appended completion block would make the Gate ambiguous.
+authoritative completion record. The staging baseline below is evidence of
+access and setup only; it is not a 48-hour result. An authorized staging
+operator must replace the remaining placeholder values in those tables in one
+reviewed commit after the full observation window. Do not append a second
+PASS/FAIL record below the current record; a stale table and an appended
+completion block would make the Gate ambiguous.
 
 | Field | Current value |
 |---|---|
@@ -28,20 +30,43 @@ appended completion block would make the Gate ambiguous.
 |---|---|
 | Logical scope | AH2-008 dual-write and transcript projection |
 | Required observation window | Trailing 48 hours, set at the time of the staging run |
-| Operator | Codex (repository-only verification) |
-| Staging access provider | None available to Codex |
-| Vercel Preview URL | https://web-git-codex-ah2-388-phase-4-705c21-stevens-projects-894c8977.vercel.app |
-| Preview access probe | HTTP HEAD returned 302 to Vercel SSO at 2026-09-01T01:20:35Z |
-| Staging operator credentials | Not available |
-| Artifact recorded at | 2026-09-01T01:01:15Z |
-| Database snapshot | Not captured |
+| Operator | Codex (user-authorized staging verification) |
+| Staging access provider | Isolated Neon `applymate-staging` / `main` plus authenticated Vercel Preview |
+| Vercel Preview URL | https://web-12asu6jof-stevens-projects-894c8977.vercel.app |
+| Vercel deployment | `dpl_GFoQyyXsFdumQvLppbrMmLf1PUcY`, commit `126b708f18790993e1537323b752a86b313b3142` |
+| Preview environment | `PLATFORM_ENV=staging` (Preview-only) |
+| Preview access probe | Authenticated browser session reached the deployed application and SSE route |
+| Staging operator credentials | Used transiently; no credential or secret retained in this artifact |
+| Artifact recorded at | 2026-09-01T13:28:57Z |
+| Observation window | `NOT STARTED` — must run for 48 hours after dual-write is enabled with eligible traffic |
+| Database snapshot | Baseline counts only; no 48-hour snapshot captured |
 | Gate decision | **NOT PASSED** |
+
+## Staging baseline (not the 48-hour report)
+
+The authorized staging session established access and captured a read-only
+baseline at `2026-09-01T13:28:57Z`. Both Harness 2.0 flags were retired when
+this baseline was recorded:
+
+| Baseline check | Observed value | Interpretation |
+|---|---:|---|
+| `AGENT_PROTOCOL_V2_DUAL_WRITE` | `enabled=false`, `status=retired` | No eligible dual-write window is active |
+| `AGENT_EVENT_SSE_V2` | `enabled=false`, `status=retired` | Temporary SSE drill flag was reverted after the drill |
+| All staging `agent_events` rows | `12` | Includes synthetic control-plane/SSE fixture rows; not a dual-write count |
+| All staging `agent_transcript_events` rows | `10` | Includes synthetic fixture rows; not a 48-hour projection result |
+| Eligible AH2-008 dual-write events | `0` | Baseline only; no 48-hour observation exists |
+| MiniMax-backed real staging chat | Not available | Preview request returned HTTP `401`; no real dual-write chat run was counted |
+
+The approval and SSE fixtures were synthetic internal control-plane tests with
+`externalAction=false`. They are excluded from the AH2-008 golden comparison
+and cannot substitute for a real 48-hour dual-write observation. The Gate
+therefore remains `NOT PASSED`.
 
 ## Required metrics
 
 | Metric | Result | Evidence status |
 |---|---:|---|
-| AH2-008 dual-write event count | `BLOCKED` | Requires the scoped staging query below; native V2 control-plane events are excluded |
+| AH2-008 dual-write event count | `0 (baseline only; 48-hour result not available)` | No eligible dual-write flag window was active; native V2 control-plane events are excluded |
 | Exact event/projection pair count | `BLOCKED` | Requires `(eventId, sessionId)` pairing over the real 48-hour window |
 | Projection mismatch count | `BLOCKED` | Must compare every paired row, not a sample |
 | Projection mismatch sample (maximum five) | `BLOCKED` | A sample is display-only after the complete mismatch count is calculated |
