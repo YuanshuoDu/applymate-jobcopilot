@@ -1,7 +1,7 @@
 # ApplyMate Agent Harness 2.0 详细开发路线图
 
-> **状态：** Phase 0-3 implementation complete (AH2-001..017 + MiniMax profile merged). Phase 3 Exit Gate is satisfied by provider/tool-kernel evidence; its scripted Turn prerequisite was corrected to remain with AH2-024. Phase 4 (AH2-018..021) as #376..#379; AH2-018/019/020 done (#382/#383/#384), AH2-021 in progress. *Gates follow-up: 48h dual-write shadow + staging SSE drill pending staging credentials.*
-> **日期：** 2026-08-30
+> **状态（2026-09-01）：** Phase 0–3 implementation complete (AH2-001..017 + MiniMax profile merged). Phase 3 Exit Gate is satisfied by provider/tool-kernel evidence; its scripted Turn prerequisite was corrected to remain with AH2-024. **Phase 4: `verifying` — Gate evidence deferred by owner authorization (2026-09-01)** — AH2-018/019/020/021 all merged (#382/#383/#384/#385); PR #385 commit 36c8d9e fixed two P1 redaction bugs surfaced during Layer 1 review. Phase 4 implementation and runbook are complete (runbook: PR #389 + #390, master); the §1.7 environmental evidence (a) staging approval/decline/expired browser smoke, (b) 48h dual-write integrity report, (c) staging SSE drill — requires staging credentials/operator that Codex does not hold. **Per owner authorization, Phase 5 now proceeds on a conditional basis**: Phase 4 is NOT declared `completed`; the deferred evidence remains tracked on **#387** and is a prerequisite for the eventual §1.8 Phase 4 Exit Report. Phase 5 development builds on the merged Phase 2/4 implementation; Phase 5 Issue merges do NOT imply Phase 4 Gate passed. Dispatch order begins with AH2-022 (#386).
+> **日期：** 2026-08-30（状态头更新于 2026-08-31）
 > **上游设计：** [Agent Harness 2.0 Technical Design](./agent-harness-v2-technical-design.md)
 > **适用代码：** `packages/agent-protocol`、`packages/agent-model`、`apps/web`、`apps/worker`
 > **目标：** 将架构设计拆成可直接创建 GitHub Issue、逐 PR 实施、逐 Gate 验收的开发计划
@@ -751,6 +751,8 @@ draft
 - approval 后可唤醒原 Turn；
 - event/log 不包含 API key、OAuth token、原始简历全文或敏感答案。
 
+**Phase 4 Exit Gate 状态（2026-09-01）：`verifying`，环境证据经 owner 授权 deferred。** 所有四项代码层面证据（统一 policy、approval race/scope/expiry 100% 拒绝、broker wakeup、`EVENT_SAFE_KEY` allow-list redaction）已通过 PR #382/#383/#384/#385 的 Layer 1/2 审查；runbook 已合并（PR #389/#390）。§1.7 要求的环境证据（staging approval/decline/expired smoke、48h dual-write integrity report、staging SSE drill）因缺 staging 凭据/operator 而 defer，见 **#387**。Phase 4 不声明 `completed`，Exit Report（§1.8）须在这些证据补齐后签署；但 **owner 已授权 Phase 5 以条件方式启动**（AH2-022 开始，见 #386），Phase 5 Issue 的合并不构成 Phase 4 Gate 通过。
+
 ---
 
 ## 9. Phase 5 — Conversation Runtime
@@ -1173,9 +1175,9 @@ draft
 | AH2-018 | PolicyEngine | #366 | [#376](https://github.com/YuanshuoDu/applymate-jobcopilot/issues/376) | [#382](https://github.com/YuanshuoDu/applymate-jobcopilot/pull/382) | done |
 | AH2-019 | approval receipt | #345,#376 | [#377](https://github.com/YuanshuoDu/applymate-jobcopilot/issues/377) | [#383](https://github.com/YuanshuoDu/applymate-jobcopilot/pull/383) | done |
 | AH2-020 | approval/question broker | #355,#377 | [#378](https://github.com/YuanshuoDu/applymate-jobcopilot/issues/378) | [#384](https://github.com/YuanshuoDu/applymate-jobcopilot/pull/384) | done |
-| AH2-021 | migrate high-risk policy | #376–#378 | [#379](https://github.com/YuanshuoDu/applymate-jobcopilot/issues/379) | TBD | spec-ready |
-| AH2-022 | Turn lease/recovery | 007,009 | TBD | TBD | pending |
-| AH2-023 | Step context/input consume | 016,022 | TBD | TBD | pending |
+| AH2-021 | migrate high-risk policy | #376–#378 | [#379](https://github.com/YuanshuoDu/applymate-jobcopilot/issues/379) | [#385](https://github.com/YuanshuoDu/applymate-jobcopilot/pull/385) | done (Gate pending #387) |
+| AH2-022 | Turn lease/recovery | 007,009 | [#386](https://github.com/YuanshuoDu/applymate-jobcopilot/issues/386) | [#391](https://github.com/YuanshuoDu/applymate-jobcopilot/pull/391) | done |
+| AH2-023 | Step context/input consume | 016,022 | [#397](https://github.com/YuanshuoDu/applymate-jobcopilot/issues/397) | TBD | in-progress |
 | AH2-024 | conversation loop | 017,018,022,023 | TBD | TBD | pending |
 | AH2-024-M | MiniMax M3 Harness default | AH2-024, AH2-017, #369 | [#370](https://github.com/YuanshuoDu/applymate-jobcopilot/issues/370) | TBD | spec-ready |
 | AH2-025 | suspension/wakeup | 020,024 | TBD | TBD | pending |
