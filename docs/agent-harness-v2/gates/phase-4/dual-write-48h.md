@@ -1,6 +1,6 @@
 # Phase 4 Gate — 48-hour dual-write integrity report
 
-**Current status:** `PENDING_STAGING_SHADOW` / `blocked — staging access is available, but the required 48-hour observation is not complete`
+**Current status:** `ACTIVE_STAGING_UNDER_OWNER_WAIVER` / `48-hour observation waived — not verified`
 
 This artifact records the evidence state for the Phase 4 Exit Gate. It does
 not claim that a 48-hour staging observation was run. No counts, mismatch
@@ -19,10 +19,10 @@ completion block would make the Gate ambiguous.
 
 | Field | Current value |
 |---|---|
-| Report status | `PENDING_STAGING_SHADOW` |
-| Gate decision | **NOT PASSED** |
-| Evidence authority | Authorized staging operator with Vercel and Prisma access |
-| Phase sequencing | Phase 5 remains locked until the Gate is passed with real evidence |
+| Report status | `WAIVED_NOT_VERIFIED` |
+| Gate decision | **GO BY OWNER WAIVER FOR PHASE 5; AC2 NOT VERIFIED** |
+| Evidence authority | Owner-approved exception; ordinary completion still requires an authorized staging operator |
+| Phase sequencing | Phase 5 is unlocked by the named waiver; production remains separately gated |
 
 ## Run metadata
 
@@ -32,17 +32,17 @@ completion block would make the Gate ambiguous.
 | Required observation window | Trailing 48 hours, set at the time of the staging run |
 | Operator | Codex (user-authorized staging verification) |
 | Staging access provider | Isolated Neon `applymate-staging` / `main` plus authenticated Vercel Preview |
-| Vercel Preview URL | https://web-12asu6jof-stevens-projects-894c8977.vercel.app |
-| Vercel deployment | `dpl_GFoQyyXsFdumQvLppbrMmLf1PUcY`, commit `126b708f18790993e1537323b752a86b313b3142` |
+| Vercel Preview URL | https://web-git-staging-stevens-projects-894c8977.vercel.app |
+| Vercel deployment | Current staging branch commit `c15e4e996701bc55d83df82db13fd51d44e2742a`; historical drill deployment remains linked in the SSE artifact |
 | Preview environment | `PLATFORM_ENV=staging` (Preview-only) |
 | Preview access probe | Authenticated browser session reached the deployed application and SSE route |
 | Staging operator credentials | Used transiently; no credential or secret retained in this artifact |
 | Artifact recorded at | 2026-09-01T13:28:57Z |
-| Observation window | `NOT STARTED` — must run for 48 hours after dual-write is enabled with eligible traffic |
+| Observation window | `WAIVED — NOT STARTED`; no 48-hour result is claimed |
 | Database snapshot | Baseline counts only; no 48-hour snapshot captured |
-| Gate decision | **NOT PASSED** |
+| Gate decision | **GO BY OWNER WAIVER FOR PHASE 5; ordinary 48-hour evidence remains NOT VERIFIED** |
 
-## Staging baseline (not the 48-hour report)
+## Historical staging baseline (not the 48-hour report)
 
 The authorized staging session established access and captured a read-only
 baseline at `2026-09-01T13:28:57Z`. Both Harness 2.0 flags were retired when
@@ -59,8 +59,23 @@ this baseline was recorded:
 
 The approval and SSE fixtures were synthetic internal control-plane tests with
 `externalAction=false`. They are excluded from the AH2-008 golden comparison
-and cannot substitute for a real 48-hour dual-write observation. The Gate
-therefore remains `NOT PASSED`.
+and cannot substitute for a real 48-hour dual-write observation. The ordinary
+evidence-complete Gate therefore remains `NOT PASSED`; Phase 5 is allowed only
+under the owner waiver recorded in `owner-waiver.md`.
+
+## Current control-plane state observed after the waiver
+
+The authenticated admin Platform controls page was rechecked on 2026-09-01.
+It showed the following current values:
+
+| Control | Environment | Enabled | Rollout | Version | Status |
+|---|---|---:|---:|---:|---|
+| `AGENT_PROTOCOL_V2_DUAL_WRITE` | Staging | `true` | `100%` | `v3` | `Active` |
+| `fantasticjobs_shadow` | Production | `true` | `0%` | `v3` | `Active` |
+
+`fantasticjobs_shadow` being Active at 0% does not expose the shadow path to
+production traffic. This control-state observation is not a substitute for
+the waived 48-hour dual-write integrity report.
 
 ## Required metrics
 
@@ -871,10 +886,11 @@ interpret "observed" as "passed".
 | `leftEdgeWithoutPredecessorCount` | Informational only; explain affected sessions, but do not treat absence as an error |
 | AC1 approval smoke and AC3 SSE drill | Real staging evidence for every required scenario |
 
-Any threshold failure keeps the **Gate decision** `NOT PASSED`, records the
-failed metric and redacted evidence reference, and prevents Phase 5 unlock.
-Only an authorized operator may replace the blocked values after all required
-thresholds and real staging scenarios pass.
+Any threshold failure keeps the ordinary evidence-complete **Gate decision**
+`NOT PASSED`, records the failed metric and redacted evidence reference, and
+does not revoke the owner-waiver decision automatically. Only an authorized
+operator may replace the blocked values after all required thresholds and real
+staging scenarios pass.
 
 ## Authorized completion procedure
 

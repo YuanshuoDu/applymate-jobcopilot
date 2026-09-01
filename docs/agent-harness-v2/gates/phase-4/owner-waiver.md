@@ -22,7 +22,8 @@ This document records an explicit owner exception. It does not manufacture a 48h
 - The runbook and gate evidence package are merged in PRs [#389](https://github.com/YuanshuoDu/applymate-jobcopilot/pull/389) and [#390](https://github.com/YuanshuoDu/applymate-jobcopilot/pull/390).
 - Staging approval-control and SSE evidence are recorded in PR [#392](https://github.com/YuanshuoDu/applymate-jobcopilot/pull/392). Those records establish the tested behavior and its stated boundaries; they do not establish a 48h observation window.
 - On the current staging Preview, the Agent page completed a synthetic, non-application request using the configured CN MiniMax path: `Reply only: CN MiniMax smoke OK.` The UI recorded a completed chat, an Auditor task with `Passed · 80% confidence`, and no pending application approval. The current Preview branch commit was `c15e4e996701bc55d83df82db13fd51d44e2742a`.
-- The staging flag `AGENT_PROTOCOL_V2_DUAL_WRITE` was created with 100% rollout for all plans and submitted for approval. It remains `Pending Approval`; the creator cannot approve it, and the admin tenant currently has no independent internal approver. No self-approval or database bypass was attempted.
+- The authenticated admin Platform controls page was rechecked after approval. `AGENT_PROTOCOL_V2_DUAL_WRITE` is now `Active` in Staging with `Enabled`, `100%` rollout for all plans, and version `v3`. No self-approval or database bypass was attempted.
+- The same page shows `fantasticjobs_shadow` as `Active` in Production with `Enabled`, `0%` rollout for all plans, and version `v3`; its active configuration receives no production traffic.
 
 ## Explicitly waived item
 
@@ -50,13 +51,13 @@ This exception does not waive any of the following:
 
 - The system has not observed dual-write integrity continuously for 48 hours.
 - Short-lived drift, delayed projection, or an orphan record could exist outside the tested windows.
-- The current staging dual-write flag is not active because independent approval is unavailable.
+- The 48-hour integrity window still has no empirical result; the staging dual-write flag is now active at 100% under the owner waiver.
 
 ### Required follow-up
 
 - Keep [#387](https://github.com/YuanshuoDu/applymate-jobcopilot/issues/387) and [#388](https://github.com/YuanshuoDu/applymate-jobcopilot/issues/388) as the audit trail for the deferred evidence and owner decision.
 - Do not represent Phase 5 merges as retroactive evidence that Phase 4 had a 48h PASS.
-- When an independent approver and staging control-plane access are available, run the 48h observation if operationally valuable and append the report; this is follow-up evidence, not a prerequisite for the owner-waiver activation.
+- When operationally valuable, run the 48h observation from the now-active staging window and append the report; this is follow-up evidence, not a prerequisite for the owner-waiver activation.
 - Revoke or pause the waiver if staging shows policy bypass, scope leakage, PII exposure, duplicate external writes, or unexplained dual-write divergence.
 
 ## Reviewer handoff
