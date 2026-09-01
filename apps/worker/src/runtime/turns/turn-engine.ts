@@ -1,9 +1,11 @@
 import { randomUUID } from "node:crypto"
+import type { ModelContinuation } from "@jobcopilot/agent-model"
 import type { ToolCallRequest, ToolExecutionResult, ToolRouterContext } from "../tools/types.js"
 import { TurnLeaseError, type TurnLease } from "./lease.js"
 import { buildModelRequest } from "./turn-engine-messages.js"
 import { runModelStep, type ModelStepResult } from "./turn-engine-model.js"
 import { TurnEventWriter, itemContent, type TurnItemHandle } from "./turn-engine-events.js"
+import { findToolObservation, stableJson } from "./turn-engine-replay.js"
 import {
   toRepositoryJson,
   TurnEngineError,
@@ -34,6 +36,7 @@ export class TurnEngine {
     let consumedInputIds: readonly string[] = []
     let steps = 0
     let toolCalls = 0
+    let continuation: ModelContinuation | undefined
     const seenCallIds = new Set<string>()
     try {
       await writer.append("turn.started", this.options.lease.turnId, null, { goal: this.options.goal }, "turn-started")
@@ -75,8 +78,15 @@ export class TurnEngine {
             taskId: this.options.rootTaskId ?? this.options.lease.turnId,
             userId: this.options.scope.userId,
             signal: this.signal,
+            continuation,
           })
           const output = await runModelStep(this.options.model, request, this.options.validateToolArguments)
+          continuation = output.continuation ?? undefined
+          await writer.append("model.usage", step.id, null, {
+            provider: output.provider,
+            model: output.model,
+            usage: output.usage,
+          }, `model-usage:${step.id}`)
           await this.publishReasoning(writer, step, output.reasoningSummary)
           if (output.toolCalls.length > 0) {
             if (output.text) await this.publishCommentary(writer, step, output.text)
@@ -123,6 +133,13 @@ export class TurnEngine {
       this.assertAlive()
       if (seenCallIds.has(call.id)) throw new TurnEngineError("invalid_output", `Tool call ${call.id} was repeated in the Turn`)
       seenCallIds.add(call.id)
+      const replayed = findToolObservation(snapshot, call.id)
+      if (replayed) {
+        if (replayed.toolName !== call.name || stableJson(replayed.input) !== stableJson(call.arguments)) {
+          throw new TurnEngineError("invalid_output", `Tool call ${call.id} does not match its persisted replay record`)
+        }
+        continue
+      }
       const result = await this.executeTool(writer, step, call)
       if (result.status === "failed" && result.errorCode === "policy_requires_approval") return { wait: { status: "waiting_for_approval", stepCount: 0, toolCallCount: 0, errorCode: result.errorCode }, snapshot }
       if (result.status === "failed" && result.errorCode === "policy_requires_user_input") return { wait: { status: "waiting_for_user", stepCount: 0, toolCallCount: 0, errorCode: result.errorCode }, snapshot }
@@ -130,7 +147,7 @@ export class TurnEngine {
         ...snapshot,
         toolObservations: [...snapshot.toolObservations, {
           id: `tool-result:${call.id}`,
-          content: toRepositoryJson({ toolCallId: call.id, toolName: call.name, status: result.status, output: result.output ?? null, errorCode: result.errorCode }),
+          content: toRepositoryJson({ toolCallId: call.id, toolName: call.name, input: call.arguments, status: result.status, output: result.output ?? null, errorCode: result.errorCode }),
         }],
       }
     }
@@ -142,7 +159,7 @@ export class TurnEngine {
     await writer.append("tool_call.started", call.id, callItem.id, { toolCallId: call.id, toolName: call.name }, `tool-started:${call.id}`)
     let result
     try {
-      result = await this.options.executeTool({ scope: this.options.scope, sessionId: this.options.lease.sessionId, turnId: this.options.lease.turnId, stepId: step.id, signal: this.signal, call: { id: call.id, toolName: call.name, toolVersion: "1", input: call.arguments } })
+      result = await this.options.executeTool({ scope: this.options.scope, sessionId: this.options.lease.sessionId, turnId: this.options.lease.turnId, stepId: step.id, signal: this.signal, capabilities: this.options.capabilities, call: { id: call.id, toolName: call.name, toolVersion: "1", input: call.arguments } })
     } catch {
       result = { id: call.id, toolName: call.name, toolVersion: "1", status: "failed" as const, errorCode: "tool_execution_failed" }
     }
@@ -154,7 +171,7 @@ export class TurnEngine {
   }
 
   private async publishReasoning(writer: TurnEventWriter, step: TurnEngineStep, text: string): Promise<void> {
-    if (!text) return
+    if (!text || this.options.publishReasoningSummary !== true) return
     const item = await writer.startItem({ id: this.makeId(`item:reasoning:${step.id}`), stepId: step.id, type: "reasoning_summary", phase: "commentary", content: { body: "" }, now: this.now() })
     await writer.updateItem(item, "streaming", { body: text }, this.now(), "reasoning-delta")
     await writer.completeItem(item, { body: text }, this.now(), "reasoning-completed")
@@ -221,6 +238,7 @@ export function createToolRouterExecutor(router: {
     turnId: input.turnId,
     stepId: input.stepId,
     signal: input.signal,
+    capabilities: input.capabilities,
     actorRole: "orchestrator",
   }, input.call)
 }

@@ -1,4 +1,4 @@
-import type { HarnessModelRequest, ModelMessage } from "@jobcopilot/agent-model"
+import type { HarnessModelRequest, ModelContinuation, ModelMessage } from "@jobcopilot/agent-model"
 import type { ModelCapabilityProfile, ModelAdapter } from "@jobcopilot/agent-model"
 
 import type { StepContext } from "../context/step-context-builder.js"
@@ -19,6 +19,23 @@ function blockText(block: StepContext["blocks"][number]): string {
 export function contextToModelMessages(context: StepContext): ModelMessage[] {
   const messages: ModelMessage[] = []
   for (const block of context.blocks) {
+    const observation = block.layer === "tool_observation" ? asToolObservation(block.content) : null
+    if (observation) {
+      messages.push({
+        role: "assistant",
+        content: [{ type: "tool_use", id: observation.toolCallId, name: observation.toolName, input: observation.input }],
+      })
+      messages.push({
+        role: "tool",
+        content: [{
+          type: "tool_result",
+          toolUseId: observation.toolCallId,
+          content: stableJson(observation.output),
+          ...(observation.status !== "completed" ? { isError: true } : {}),
+        }],
+      })
+      continue
+    }
     messages.push({
       role: block.role === "instruction" ? "system" : "user",
       content: [{ type: "text", text: blockText(block) }],
@@ -26,6 +43,28 @@ export function contextToModelMessages(context: StepContext): ModelMessage[] {
   }
   if (messages.length === 0) messages.push({ role: "user", content: [{ type: "text", text: "Continue the Turn according to the harness contract." }] })
   return messages
+}
+
+type ToolObservation = {
+  toolCallId: string
+  toolName: string
+  input: unknown
+  output: unknown
+  status: string
+}
+
+function asToolObservation(value: unknown): ToolObservation | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null
+  const record = value as Record<string, unknown>
+  if (typeof record.toolCallId !== "string" || !record.toolCallId.trim() ||
+    typeof record.toolName !== "string" || !record.toolName.trim() || typeof record.status !== "string") return null
+  return {
+    toolCallId: record.toolCallId,
+    toolName: record.toolName,
+    input: record.input ?? {},
+    output: record.output ?? null,
+    status: record.status,
+  }
 }
 
 function capabilities(profile: ModelCapabilityProfile) {
@@ -48,6 +87,7 @@ export function buildModelRequest(input: {
   taskId: string
   signal: AbortSignal
   maxOutputTokens?: number
+  continuation?: ModelContinuation
 }): HarnessModelRequest {
   return {
     schemaVersion: "agent-harness.v2",
@@ -57,6 +97,7 @@ export function buildModelRequest(input: {
     tools: [...input.tools],
     capabilities: capabilities(input.model.profile),
     ...(input.model.profile.nativeTools && input.tools.length > 0 ? { toolChoice: "auto" as const } : {}),
+    ...(input.model.profile.continuationCursor && input.continuation ? { continuation: input.continuation } : {}),
     ...(input.maxOutputTokens === undefined ? {} : { maxOutputTokens: input.maxOutputTokens }),
     signal: input.signal,
     metadata: {
