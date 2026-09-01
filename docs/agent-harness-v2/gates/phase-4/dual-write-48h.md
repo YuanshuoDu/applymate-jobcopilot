@@ -47,6 +47,7 @@ appended completion block would make the Gate ambiguous.
 | Projection mismatch sample (maximum five) | `BLOCKED` | A sample is display-only after the complete mismatch count is calculated |
 | Missing projection count | `BLOCKED` | Counts only a dual-write event with no marker anywhere |
 | Existing projection outside selected window | `BLOCKED` | Must be reported separately from nonexistent-event markers |
+| Invalid projection marker count | `BLOCKED` | Marker rows without a string event ID must not be silently omitted |
 | Cross-session event count / marker-row count | `BLOCKED` | Requires session-aware validation; record both event groups and wrong-session rows |
 | Duplicate projection event groups / extra rows | `BLOCKED` | Requires all paired projection rows, not a capped query |
 | Duplicate session count | `INCOMPLETE/BLOCKED` | Automation is queryable; chat/manual requires an approved run manifest because no canonical cross-session run key is persisted |
@@ -220,27 +221,34 @@ WITH markers AS (
     e."idempotencyKey" AS "eventIdempotencyKey"
   FROM markers m
   LEFT JOIN "agent_events" e ON e."id" = m."eventId"
-  WHERE m."eventId" IS NOT NULL
 )
 SELECT
   COUNT(*) FILTER (
-    WHERE "existingEventId" IS NULL
+    WHERE "eventId" IS NULL
+  )::int AS "invalidProjectionMarkerCount",
+  COUNT(*) FILTER (
+    WHERE "eventId" IS NOT NULL
+      AND "existingEventId" IS NULL
   )::int AS "nonexistentEventMarkerCount",
   COUNT(*) FILTER (
-    WHERE "existingEventId" IS NOT NULL
+    WHERE "eventId" IS NOT NULL
+      AND "existingEventId" IS NOT NULL
       AND NOT ("eventCreatedAt" >= :window_start AND "eventCreatedAt" < :window_end)
   )::int AS "existingEventOutsideSelectedWindowCount",
   COUNT(*) FILTER (
-    WHERE "existingEventId" IS NOT NULL
+    WHERE "eventId" IS NOT NULL
+      AND "existingEventId" IS NOT NULL
       AND "eventCreatedAt" >= :window_start
       AND "eventCreatedAt" < :window_end
   )::int AS "existingEventInsideSelectedWindowCount",
   COUNT(*) FILTER (
-    WHERE "existingEventId" IS NOT NULL
+    WHERE "eventId" IS NOT NULL
+      AND "existingEventId" IS NOT NULL
       AND "eventIdempotencyKey" NOT LIKE 'legacy-transcript:%'
   )::int AS "markerPointsToNonDualWriteEventCount",
   COUNT(*) FILTER (
-    WHERE "existingEventId" IS NOT NULL
+    WHERE "eventId" IS NOT NULL
+      AND "existingEventId" IS NOT NULL
       AND "eventSessionId" <> "projectedSessionId"
   )::int AS "crossSessionMarkerRowCount"
 FROM linked;
@@ -390,6 +398,11 @@ first selected event against the immediately preceding event before the
 window, when such a predecessor exists. It does not scan or count unrelated
 post-window history, and an absent left-edge predecessor is not itself an
 error.
+
+Unlike the parity query, this invariant is evaluated over all `agent_events`
+rows because native V2 events also consume the session sequence. Only
+transitions with a right-hand event inside the measured window contribute to
+the reported error count.
 
 ```sql
 WITH window_events AS (
