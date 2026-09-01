@@ -2,14 +2,16 @@
 
 import Link from 'next/link'
 import { usePathname } from 'next/navigation'
-import { Activity, Bell, Bot, CreditCard, FileText, Flag, Gauge, Home, Inbox, LogOut, Radio, ServerCog, ShieldAlert, ShieldCheck, Siren, Trash2, Users } from 'lucide-react'
+import { Activity, Bell, Bot, CreditCard, FileText, Flag, Gauge, Home, Inbox, LogOut, Radio, ServerCog, ShieldAlert, ShieldCheck, Siren, Trash2, Users, type LucideIcon } from 'lucide-react'
 import { signOut } from 'next-auth/react'
 import { useEffect, useState, type ReactNode } from 'react'
 import { AdminExportLink } from './AdminExportLink'
 import { useI18n, LANGUAGES, type Lang } from '@/lib/i18n'
 import { adminMutationHeaders } from '@/lib/admin/client'
 
-const navigation = [
+type AdminNavItem = { href: string; labelKey: string; icon: LucideIcon; permission?: string; always?: boolean }
+
+const navigation: AdminNavItem[] = [
   { href: '/admin', labelKey: 'admin.nav.overview', icon: Home, permission: 'observability.read' },
   { href: '/admin/contact-us', labelKey: 'admin.nav.support', icon: Inbox, permission: 'support_cases.read' },
   { href: '/admin/users', labelKey: 'admin.nav.users', icon: Users, permission: 'users.read' },
@@ -25,11 +27,13 @@ const navigation = [
   { href: '/admin/broadcasts', labelKey: 'admin.nav.broadcasts', icon: Bell, permission: 'broadcasts.create' },
   { href: '/admin/audit', labelKey: 'admin.nav.audit', icon: FileText, permission: 'audit.read' },
   { href: '/admin/access', labelKey: 'admin.nav.access', icon: ShieldCheck, permission: 'admin_members.read' },
-  { href: '/admin/security', labelKey: 'admin.nav.security', icon: ShieldAlert, permission: 'break_glass.request' },
+  // Every authenticated administrator needs access to self-service WebAuthn.
+  // The page hides break-glass controls unless the matching permission exists.
+  { href: '/admin/security', labelKey: 'admin.nav.security', icon: ShieldAlert, always: true },
 ]
 
 export function filterAdminNav(permissions: readonly string[]) {
-  return navigation.filter(item => permissions.includes(item.permission))
+  return navigation.filter(item => item.always || (item.permission && permissions.includes(item.permission)))
 }
 
 const notificationPermissions = ['support_cases.read', 'audit.read', 'observability.read']
