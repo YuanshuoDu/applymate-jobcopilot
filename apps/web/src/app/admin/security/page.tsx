@@ -1,9 +1,9 @@
 import { redirect } from 'next/navigation'
 import { AdminSecurityPage } from '@/components/admin/AdminSecurityPage'
-import { isAdminResponse, requireAdmin } from '@/lib/admin/authorization'
+import { isAdminResponse, requireAdminMembership } from '@/lib/admin/authorization'
 
 export default async function SecurityAdminPage() {
-  const actor = await requireAdmin('break_glass.request')
+  const actor = await requireAdminMembership()
   if (isAdminResponse(actor)) redirect('/login?callbackUrl=/admin/security')
-  return <AdminSecurityPage canApprove={actor.permissions.includes('break_glass.approve')} />
+  return <AdminSecurityPage canRequest={actor.permissions.includes('break_glass.request')} canApprove={actor.permissions.includes('break_glass.approve')} />
 }
