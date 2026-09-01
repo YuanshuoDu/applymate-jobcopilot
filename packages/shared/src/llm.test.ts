@@ -10,7 +10,10 @@ import { callLlm, loadWorkerAiConfig, callLlmText, closeSharedPool } from './ind
 import { resolveWorkerAiConfig } from './llm.js'
 
 describe('shared/llm exports — existence guards', () => {
-  afterEach(() => vi.restoreAllMocks())
+  afterEach(() => {
+    vi.restoreAllMocks()
+    vi.unstubAllEnvs()
+  })
 
   it('callLlm is a function', () => {
     expect(typeof callLlm).toBe('function')
@@ -44,6 +47,20 @@ describe('shared/llm exports — existence guards', () => {
     })
     expect(JSON.parse(String(request.body))).not.toHaveProperty('max_tokens')
     expect(JSON.parse(String(request.body))).not.toHaveProperty('reasoning_split')
+    expect(fetchMock.mock.calls[0][0]).toBe('https://api.minimax.io/v1/chat/completions')
+  })
+
+  it('uses the China endpoint for a MiniMax Token Plan deployment', async () => {
+    vi.stubEnv('MINIMAX_REGION', 'cn')
+    const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response(JSON.stringify({
+      choices: [{ message: { content: 'ok' } }],
+    })))
+
+    await callLlm([{ role: 'user', content: 'Ping' }], {
+      provider: 'minimax', model: 'MiniMax-M3', apiKey: 'test-key', apiBase: 'https://api.minimax.io/v1',
+    })
+
+    expect(fetchMock.mock.calls[0][0]).toBe('https://api.minimax.cn/v1/chat/completions')
   })
 
   it.each([

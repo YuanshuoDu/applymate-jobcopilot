@@ -4,10 +4,20 @@ import type {
   ModelCapabilityProfile,
   ModelStreamEvent,
 } from "../../contracts.js"
+import type { MiniMaxRegion } from "@jobcopilot/shared/minimax"
 import type { OpenAiFetch } from "../openai-compatible/types.js"
+export type { MiniMaxRegion } from "@jobcopilot/shared/minimax"
+
+export {
+  MINIMAX_CN_ANTHROPIC_BASE_URL,
+  MINIMAX_CN_OPENAI_BASE_URL,
+  MINIMAX_DEFAULT_ANTHROPIC_BASE_URL,
+  MINIMAX_DEFAULT_BASE_URL,
+  MINIMAX_INTERNATIONAL_ANTHROPIC_BASE_URL,
+  MINIMAX_INTERNATIONAL_OPENAI_BASE_URL,
+} from "@jobcopilot/shared/minimax"
 
 export const MINIMAX_DEFAULT_MODEL = "MiniMax-M3"
-export const MINIMAX_DEFAULT_BASE_URL = "https://api.minimax.io/v1"
 export const MINIMAX_DEFAULT_MAX_COMPLETION_TOKENS = 4_096
 
 export type MiniMaxThinkingMode = "adaptive" | "disabled"
@@ -21,6 +31,8 @@ export interface MiniMaxConfig {
   baseUrl?: string
   /** Compatibility alias for the existing ModelRouter/shared AI config shape. */
   apiBase?: string
+  /** Optional region used when no explicit endpoint override is supplied. */
+  region?: MiniMaxRegion
   thinking?: MiniMaxThinkingMode
   reasoningSplit?: boolean
   maxCompletionTokens?: number
@@ -36,7 +48,7 @@ export interface MiniMaxAdapterOptions {
 }
 
 export interface MiniMaxAdapter extends ModelAdapter {
-  readonly config: Readonly<Pick<MiniMaxConfig, "model" | "baseUrl">>
+  readonly config: Readonly<Pick<MiniMaxConfig, "model" | "baseUrl" | "region">>
   readonly credentialSource: "platform" | "user"
   readonly reasoningSplit: boolean
   readonly thinking: MiniMaxThinkingMode

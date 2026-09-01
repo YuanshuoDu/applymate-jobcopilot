@@ -1,11 +1,25 @@
 import { AgentModelError } from "../../errors.js"
 import {
+  resolveMiniMaxBaseUrl as resolveSharedMiniMaxBaseUrl,
+} from "@jobcopilot/shared/minimax"
+import {
   MINIMAX_DEFAULT_MAX_COMPLETION_TOKENS,
   type MiniMaxConfig,
   type MiniMaxCredentials,
   type MiniMaxRequestOptions,
   type MiniMaxThinkingMode,
 } from "./types.js"
+
+export function resolveMiniMaxBaseUrl(
+  config: Pick<MiniMaxConfig, "baseUrl" | "apiBase" | "region"> = {},
+): string {
+  const environment = readEnvironment()
+  return resolveSharedMiniMaxBaseUrl({
+    ...config,
+    environmentBaseUrl: environment.MINIMAX_BASE_URL,
+    environmentRegion: environment.MINIMAX_REGION,
+  })
+}
 
 export function resolveMiniMaxCredentials(config: Pick<MiniMaxConfig, "apiKey" | "platformApiKey"> = {}): MiniMaxCredentials {
   const userKey = clean(config.apiKey)
@@ -57,10 +71,14 @@ export function buildMiniMaxRequestBody(body: string, options: MiniMaxRequestOpt
 }
 
 function environmentPlatformKey(): string | undefined {
+  return clean(readEnvironment().MINIMAX_API_KEY)
+}
+
+function readEnvironment(): Record<string, string | undefined> {
   const runtime = globalThis as typeof globalThis & {
     process?: { env?: Record<string, string | undefined> }
   }
-  return clean(runtime.process?.env?.MINIMAX_API_KEY)
+  return runtime.process?.env ?? {}
 }
 
 function clean(value: string | undefined): string | undefined {

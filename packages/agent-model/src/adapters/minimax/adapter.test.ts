@@ -1,7 +1,9 @@
-import { describe, expect, it, vi } from "vitest"
+import { afterEach, describe, expect, it, vi } from "vitest"
 
 import { MODEL_SCHEMA_VERSION, type HarnessModelRequest } from "../../contracts.js"
 import { createMiniMaxAdapter, createMiniMaxM3Adapter } from "./adapter.js"
+
+afterEach(() => vi.unstubAllEnvs())
 
 function request(signal = new AbortController().signal): HarnessModelRequest {
   return {
@@ -25,6 +27,12 @@ describe("MiniMax provider profile", () => {
     const adapter = createMiniMaxM3Adapter({ provider: "minimax", apiBase: "https://api.minimax.io/v1", platformApiKey: "platform-key" })
     expect(adapter.config).toEqual({ model: "MiniMax-M3", baseUrl: "https://api.minimax.io/v1" })
     expect(adapter.credentialSource).toBe("platform")
+  })
+
+  it("resolves the China Token Plan endpoint from MINIMAX_REGION", () => {
+    vi.stubEnv("MINIMAX_REGION", "cn")
+    const adapter = createMiniMaxM3Adapter({ platformApiKey: "platform-key" })
+    expect(adapter.config).toMatchObject({ model: "MiniMax-M3", baseUrl: "https://api.minimax.cn/v1" })
   })
 
   it("uses the generic adapter while sending MiniMax M3 options and normalizing reasoning", async () => {

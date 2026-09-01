@@ -3,6 +3,7 @@ import { isSafeAiEndpoint } from "./safe-ai-endpoint.js";
 import { credentialContext, decryptSecret } from "./secret-crypto.js";
 import { pinnedFetch } from "./pinned-outbound.js";
 import { recordSharedAiUsage, sharedAiUsageErrorCode } from "./ai-usage.js";
+import { MINIMAX_DEFAULT_BASE_URL, resolveMiniMaxBaseUrl } from "./minimax.js";
 
 // ── Types ──
 
@@ -40,7 +41,7 @@ export const APPLYMATE_BACKING: AiConfig = {
 };
 
 const DEFAULT_API_BASES: Record<Provider, string> = {
-  minimax: "https://api.minimax.io/v1",
+  minimax: MINIMAX_DEFAULT_BASE_URL,
   openai: "https://api.openai.com/v1",
   anthropic: "https://api.anthropic.com",
   deepseek: "https://api.deepseek.com/v1",
@@ -200,7 +201,13 @@ async function callOpenAICompat(
   messages: ChatMessage[],
   config: AiConfig
 ): Promise<ChatResult> {
-  const base = config.apiBase || DEFAULT_API_BASES[config.provider];
+  const base = config.provider === "minimax"
+    ? resolveMiniMaxBaseUrl({
+        apiBase: config.apiBase,
+        environmentBaseUrl: process.env.MINIMAX_BASE_URL,
+        environmentRegion: process.env.MINIMAX_REGION,
+      })
+    : config.apiBase || DEFAULT_API_BASES[config.provider];
   if (config.provider === "custom" && !isSafeAiEndpoint(base)) {
     throw new Error("Custom AI endpoint is not an allowed public HTTPS destination");
   }

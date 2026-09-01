@@ -127,6 +127,23 @@ describe('model catalogue and MiniMax compatibility', () => {
     })).toMatchObject({ apiBase: minimaxBase })
   })
 
+  it('resolves MiniMax CN for the platform while ignoring a stale saved international endpoint', () => {
+    vi.stubEnv('MINIMAX_REGION', 'cn')
+    expect(resolveConfig({
+      provider: 'minimax',
+      model: 'MiniMax-M3',
+      apiKey: 'platform-key',
+      apiBase: 'https://api.minimax.io/v1',
+    })).toMatchObject({ apiBase: 'https://api.minimax.cn/v1' })
+  })
+
+  it('lets an explicit MiniMax deployment base URL win over the region selector', () => {
+    vi.stubEnv('MINIMAX_BASE_URL', 'https://api.minimax.cn/v1/')
+    vi.stubEnv('MINIMAX_REGION', 'international')
+    expect(resolveConfig({ provider: 'minimax', model: 'MiniMax-M3', apiKey: 'platform-key' }))
+      .toMatchObject({ apiBase: 'https://api.minimax.cn/v1' })
+  })
+
   it('does not use a server API key for a user-controlled custom endpoint', () => {
     process.env.CUSTOM_API_KEY = 'platform-custom-secret'
 

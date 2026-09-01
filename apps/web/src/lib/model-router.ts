@@ -14,6 +14,7 @@
 
 import Anthropic from '@anthropic-ai/sdk'
 import { pinnedFetch } from '@jobcopilot/shared/pinned-outbound'
+import { resolveMiniMaxBaseUrl } from '@jobcopilot/shared/minimax'
 import { db }    from '@/lib/db'
 import { isSafeAiEndpoint } from '@jobcopilot/shared/safe-ai-endpoint'
 import { aiUsageErrorCode, recordAiUsage } from '@/lib/ai-usage'
@@ -210,7 +211,13 @@ export function resolveConfig(userConfig?: AiConfig | null, options?: { preserve
   // their curated base so a persisted override cannot receive a platform key.
   const resolvedBase = cfg.provider === 'custom'
     ? cfg.apiBase?.trim() || option?.defaultBase || ''
-    : option?.defaultBase || ''
+    : cfg.provider === 'minimax'
+      ? resolveMiniMaxBaseUrl({
+          baseUrl: option?.defaultBase,
+          environmentBaseUrl: process.env.MINIMAX_BASE_URL,
+          environmentRegion: process.env.MINIMAX_REGION,
+        })
+      : option?.defaultBase || ''
 
   const credentialSource = cfg.credentialSource ?? (cfg.apiKey?.trim() ? 'user' : 'platform')
   return { ...cfg, apiBase: resolvedBase, resolvedKey, credentialSource }

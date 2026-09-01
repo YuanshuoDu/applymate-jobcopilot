@@ -2,10 +2,9 @@ import { pinnedFetch } from "@jobcopilot/shared/pinned-outbound"
 import { AgentModelError } from "../../errors.js"
 import { createOpenAiCompatibleAdapter } from "../openai-compatible/adapter.js"
 import type { ModelCapabilityProfile } from "../../contracts.js"
-import { buildMiniMaxRequestBody, miniMaxRequestOptions, resolveMiniMaxCredentials } from "./request.js"
+import { buildMiniMaxRequestBody, miniMaxRequestOptions, resolveMiniMaxBaseUrl, resolveMiniMaxCredentials } from "./request.js"
 import { normalizeMiniMaxReasoningResponse } from "./response.js"
 import {
-  MINIMAX_DEFAULT_BASE_URL,
   MINIMAX_DEFAULT_MODEL,
   type MiniMaxAdapter,
   type MiniMaxAdapterOptions,
@@ -22,7 +21,7 @@ export function createMiniMaxAdapter(
 ): MiniMaxAdapter {
   assertMiniMaxConfiguration(config)
   const model = config.model ?? MINIMAX_DEFAULT_MODEL
-  const baseUrl = config.baseUrl ?? config.apiBase ?? MINIMAX_DEFAULT_BASE_URL
+  const baseUrl = resolveMiniMaxBaseUrl(config)
   const credentials = resolveMiniMaxCredentials(config)
   const providerOptions = miniMaxRequestOptions(config, model)
   const fetcher = createMiniMaxFetch(options, providerOptions)
@@ -40,7 +39,7 @@ export function createMiniMaxAdapter(
   return {
     ...delegate,
     id: `minimax:${model}`,
-    config: { model, baseUrl },
+    config: { model, baseUrl, ...(config.region ? { region: config.region } : {}) },
     credentialSource: credentials.credentialSource,
     reasoningSplit: providerOptions.reasoningSplit,
     thinking: providerOptions.thinking,
