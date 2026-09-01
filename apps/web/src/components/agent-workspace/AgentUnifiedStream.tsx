@@ -20,6 +20,7 @@ import { AgentUnifiedStreamHeader } from './AgentUnifiedStreamHeader'
 import { sessionSubmissionPolicy } from './automation-policy'
 import type { TranscriptAction } from './TranscriptSpecialBlocks'
 import { streamAgentChat } from './agent-chat-stream'
+import { streamAgentSessionEvents } from './agent-session-stream'
 import { ensureActionReceipt } from './approval-receipt-client'
 import type { AgentTranscriptEvent } from './session-view-model'
 import type { AgentUnifiedStreamProps, ComposerJobsResponse } from './AgentUnifiedStream.types'
@@ -137,14 +138,22 @@ export function AgentUnifiedStream({
     // authorized transcript is loading.
     setLiveBlocks([])
 
-    void fetch(`/api/agent/sessions/${resumeSessionId}/events`, { signal: controller.signal })
-      .then(async response => {
-        if (!response.ok) throw new Error(t('agent.restoreFailed'))
-        return response.json() as Promise<{ events?: AgentTranscriptEvent[] }>
-      })
-      .then(data => {
+    void streamAgentSessionEvents({
+      sessionId: resumeSessionId,
+      signal: controller.signal,
+      onConnected: () => {
         if (controller.signal.aborted) return
-        setLiveBlocks(data.events ?? [])
+        setIsRestoringSession(false)
+      },
+      onEvent: event => {
+        if (controller.signal.aborted) return
+        setLiveBlocks(blocks => blocks.some(block => block.id === event.id) ? blocks : [...blocks, event])
+        setIsRestoringSession(false)
+        requestAnimationFrame(scrollToBottom)
+      },
+    })
+      .then(() => {
+        if (controller.signal.aborted) return
         setIsRestoringSession(false)
         requestAnimationFrame(scrollToBottom)
       })
