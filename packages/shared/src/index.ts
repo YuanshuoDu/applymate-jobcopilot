@@ -6,6 +6,20 @@
 export type { AiConfig, ChatMessage, ChatResult, Provider } from "./llm.js";
 export { callLlm, callLlmText, loadWorkerAiConfig, resolveWorkerAiConfig, closeSharedPool } from "./llm.js";
 export {
+  MINIMAX_CN_ANTHROPIC_BASE_URL,
+  MINIMAX_CN_OPENAI_BASE_URL,
+  MINIMAX_DEFAULT_ANTHROPIC_BASE_URL,
+  MINIMAX_DEFAULT_BASE_URL,
+  MINIMAX_INTERNATIONAL_ANTHROPIC_BASE_URL,
+  MINIMAX_INTERNATIONAL_OPENAI_BASE_URL,
+  miniMaxAnthropicBaseUrl,
+  miniMaxOpenAiBaseUrl,
+  parseMiniMaxRegion,
+  resolveMiniMaxBaseUrl,
+  type MiniMaxBaseUrlOptions,
+  type MiniMaxRegion,
+} from "./minimax.js";
+export {
   ATS_POLICIES,
   getDefaultAtsPolicy,
   getHardRpsLimit,

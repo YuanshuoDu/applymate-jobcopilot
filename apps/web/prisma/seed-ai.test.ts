@@ -11,5 +11,8 @@ describe('seedAiConfiguration', () => {
     expect(modelUpsert).toHaveBeenCalled()
     expect(routeUpsert).toHaveBeenCalled()
     expect(JSON.stringify(providerUpsert.mock.calls)).not.toContain('sk-')
+    expect(providerUpsert.mock.calls[0][0]).toMatchObject({
+      create: { apiBase: 'https://api.minimax.io/v1' },
+    })
   })
 })

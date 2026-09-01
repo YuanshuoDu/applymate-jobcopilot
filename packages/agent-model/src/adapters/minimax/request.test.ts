@@ -4,6 +4,7 @@ import { AgentModelError } from "../../errors.js"
 import {
   buildMiniMaxRequestBody,
   miniMaxRequestOptions,
+  resolveMiniMaxBaseUrl,
   resolveMiniMaxCredentials,
 } from "./request.js"
 
@@ -19,6 +20,17 @@ describe("MiniMax request profile", () => {
       apiKey: "platform-key", credentialSource: "platform",
     })
     expect(resolveMiniMaxCredentials()).toEqual({ apiKey: "environment-key", credentialSource: "platform" })
+  })
+
+  it("resolves the CN endpoint from the deployment region", () => {
+    vi.stubEnv("MINIMAX_REGION", "cn")
+    expect(resolveMiniMaxBaseUrl({ apiBase: "https://api.minimax.io/v1" })).toBe("https://api.minimax.cn/v1")
+  })
+
+  it("allows an explicit deployment base URL and normalizes its trailing slash", () => {
+    vi.stubEnv("MINIMAX_BASE_URL", "https://api.minimax.cn/v1/")
+    vi.stubEnv("MINIMAX_REGION", "international")
+    expect(resolveMiniMaxBaseUrl()).toBe("https://api.minimax.cn/v1")
   })
 
   it("replaces deprecated max_tokens and adds M3 reasoning controls", () => {

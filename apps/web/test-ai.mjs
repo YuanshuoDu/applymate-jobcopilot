@@ -18,6 +18,10 @@ if (envPath) {
 
 const MINIMAX_KEY  = env.MINIMAX_API_KEY  || ''
 const DEEPSEEK_KEY = env.DEEPSEEK_API_KEY || ''
+const MINIMAX_REGION = (env.MINIMAX_REGION || '').trim().toLowerCase()
+const MINIMAX_BASE_URL = (env.MINIMAX_BASE_URL || (MINIMAX_REGION === 'cn' || MINIMAX_REGION === 'china'
+  ? 'https://api.minimax.cn/v1'
+  : 'https://api.minimax.io/v1')).replace(/\/+$/, '')
 
 const G = '\x1b[32m'; const R = '\x1b[31m'; const Y = '\x1b[33m'; const C = '\x1b[36m'; const X = '\x1b[0m'
 
@@ -82,7 +86,7 @@ const TESTS = [
     name: '① ApplyMate default — MiniMax M3 Ordinary call',
     skip: !MINIMAX_KEY,
     fn: async () => {
-      const raw = await chat('https://api.minimax.chat/v1', MINIMAX_KEY, 'MiniMax-M3', 'Reply with only: "MiniMax OK"')
+      const raw = await chat(MINIMAX_BASE_URL, MINIMAX_KEY, 'MiniMax-M3', 'Reply with only: "MiniMax OK"')
       const stripped = raw.replace(/<think>[\s\S]*?<\/think>/gi, '').trim()
       if (!stripped) throw new Error(`Empty reply(original ${raw.length} character, Contains think=${raw.includes('<think>')})`)
       return stripped.slice(0, 60)
@@ -92,7 +96,7 @@ const TESTS = [
     name: '② ApplyMate default — MiniMax M3 streaming + reasoning split',
     skip: !MINIMAX_KEY,
     fn: async () => {
-      const { raw, stripped } = await chatStream('https://api.minimax.chat/v1', MINIMAX_KEY, 'MiniMax-M3',
+      const { raw, stripped } = await chatStream(MINIMAX_BASE_URL, MINIMAX_KEY, 'MiniMax-M3',
         'Reply with only the text: "Stream OK"')
       if (stripped.includes('<think>')) throw new Error(`think block unfiltered: ${stripped.slice(0, 80)}`)
       if (!stripped) throw new Error(`Empty after filtering(original containing think=${raw.includes('<think>')})`)
@@ -103,7 +107,7 @@ const TESTS = [
     name: '③ JSON Structured output — Resume scoring (MiniMax M3)',
     skip: !MINIMAX_KEY,
     fn: async () => {
-      const raw = await chat('https://api.minimax.chat/v1', MINIMAX_KEY, 'MiniMax-M3',
+      const raw = await chat(MINIMAX_BASE_URL, MINIMAX_KEY, 'MiniMax-M3',
         'Return ONLY valid JSON, no markdown:\n{"score":85,"matched":["Python","REST API"],"missing":["Docker","K8s"]}', 400)
       const clean = raw.replace(/<think>[\s\S]*?<\/think>/gi, '').replace(/^```(?:json)?\n?|\n?```$/g, '').trim()
       const p = JSON.parse(clean)
@@ -115,7 +119,7 @@ const TESTS = [
     name: '④ independent audit JSON — MiniMax M3 adaptive reasoning',
     skip: !MINIMAX_KEY,
     fn: async () => {
-      const raw = await chat('https://api.minimax.chat/v1', MINIMAX_KEY, 'MiniMax-M3', `Return ONLY JSON:
+      const raw = await chat(MINIMAX_BASE_URL, MINIMAX_KEY, 'MiniMax-M3', `Return ONLY JSON:
 {"verdict":"needs_review","findings":[{"area":"resume|cover_letter","severity":"critical|warning","title":"..."}]}
 SOURCE: Ada was a Support Engineer at Acme from 2020 to 2022. She documented incidents.
 FINAL RESUME: Ada is currently a Senior Backend Engineer at Acme and deployed Kubernetes services.
@@ -133,7 +137,7 @@ Flag every unsupported or contradicted claim.`, 1200, 'adaptive')
     name: '⑤ Cover letter generation — MiniMax M3',
     skip: !MINIMAX_KEY,
     fn: async () => {
-      const raw = await chat('https://api.minimax.chat/v1', MINIMAX_KEY, 'MiniMax-M3',
+      const raw = await chat(MINIMAX_BASE_URL, MINIMAX_KEY, 'MiniMax-M3',
         'Write one sentence cover letter for Backend Engineer at Stripe.', 4096)
       const text = raw.replace(/<think>[\s\S]*?<\/think>/gi, '').trim()
       if (text.length < 30) throw new Error(`Reply too short(${text.length}character): "${text}"`)
@@ -175,12 +179,12 @@ Flag every unsupported or contradicted claim.`, 1200, 'adaptive')
     name: '⑨ Agent streaming conversation (MiniMax M3 + system prompt)',
     skip: !MINIMAX_KEY,
     fn: async () => {
-      const { stripped } = await chatStream('https://api.minimax.chat/v1', MINIMAX_KEY, 'MiniMax-M3',
+      const { stripped } = await chatStream(MINIMAX_BASE_URL, MINIMAX_KEY, 'MiniMax-M3',
         JSON.stringify([{ role: 'system', content: 'You are a job search assistant.' },
                         { role: 'user',   content: 'How many jobs in my pipeline? Just say: "Pipeline test OK"' }]),
         300)
       // actual agent Bundle system+messages pass in; Here we only test whether the flow pattern is normal
-      const { stripped: s2 } = await chatStream('https://api.minimax.chat/v1', MINIMAX_KEY, 'MiniMax-M3',
+      const { stripped: s2 } = await chatStream(MINIMAX_BASE_URL, MINIMAX_KEY, 'MiniMax-M3',
         'You are a job assistant. Say: "Agent OK"', 200)
       if (!s2) throw new Error('Agent Streaming reply is empty')
       return `"${s2.slice(0, 50)}"`
