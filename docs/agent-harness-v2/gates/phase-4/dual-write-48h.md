@@ -15,7 +15,9 @@ here.
 | Required observation window | Trailing 48 hours, set at the time of the staging run |
 | Operator | Codex (repository-only verification) |
 | Staging access provider | None available to Codex |
-| Staging URL | Not available |
+| Vercel Preview URL | https://web-git-codex-ah2-388-phase-4-705c21-stevens-projects-894c8977.vercel.app |
+| Preview access probe | HTTP HEAD returned 302 to Vercel SSO at 2026-09-01T01:20:35Z |
+| Staging operator credentials | Not available |
 | Artifact recorded at | 2026-09-01T01:01:15Z |
 | Database snapshot | Not captured |
 | Gate decision | **NOT PASSED** |
@@ -49,10 +51,12 @@ the join key.
 
 The operator must run the following against a read-only, access-controlled
 staging connection after recording the exact `window_start`, `window_end`,
-deployment URL, deployment commit, operator, and timezone. The report must
-retain aggregate results and a redacted sample only; do not paste raw resume,
-contact, credential, answer, cookie, or provider-token data into this file or
-the GitHub issue.
+deployment URL, deployment commit, operator, and timezone. The current PR
+Preview URL is recorded above, but it redirects unauthenticated requests to
+Vercel SSO; it is not evidence that a staging operator session exists. The
+report must retain aggregate results and a redacted sample only; do not paste
+raw resume, contact, credential, answer, cookie, or provider-token data into
+this file or the GitHub issue.
 
 ### 1. Event/projection parity and duplicate projections
 
