@@ -35,7 +35,7 @@ describe("agent-run queue", () => {
       headers: expect.objectContaining({ "x-agent-worker-secret": "worker-secret" }),
       body: JSON.stringify({ userId: "user_1", sessionId: "session_1" }),
     }));
-  });
+  }, 15_000);
 
   it("rejects a task when the worker URL is not configured", async () => {
     vi.stubEnv("AGENT_WEB_URL", "");

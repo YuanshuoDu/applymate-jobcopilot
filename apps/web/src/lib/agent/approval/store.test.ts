@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from "vitest"
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 
 import type { Prisma, PrismaClient } from "@prisma/client"
 import { hashApprovalNonce, hashApprovalScope } from "@jobcopilot/agent-protocol"
@@ -7,10 +7,13 @@ import { consumeApprovalAndReserve, issueApprovalReceipt, validateApproval, vali
 import { reissueApprovalNonce } from "./receipt-rotation"
 import { protocolScope, ApprovalStoreError, type ApprovalScopeInput } from "./types"
 
+const TEST_NOW_MS = Date.parse("2026-09-01T00:00:00.000Z")
+const timeAt = (minutes: number): Date => new Date(TEST_NOW_MS + minutes * 60_000)
+
 const scopeInput: ApprovalScopeInput = {
   userId: "user_1", sessionId: "session_1", turnId: "turn_1", jobId: "job_1", toolCallId: "call_1", action: "submit_application",
   resourceHash: "a".repeat(64), materialHash: "b".repeat(64), answersHash: "c".repeat(64), revision: 3,
-  expiresAt: new Date("2026-09-01T00:00:00.000Z"),
+  expiresAt: timeAt(60),
 }
 
 async function approvalRow(nonce = "nonce_1"): Promise<Prisma.AgentApprovalGetPayload<{}>> {
@@ -21,8 +24,8 @@ async function approvalRow(nonce = "nonce_1"): Promise<Prisma.AgentApprovalGetPa
     toolCallId: scopeInput.toolCallId, jobId: scopeInput.jobId, type: scopeInput.action, status: "approved", title: "Submit",
     body: "Review", impact: null, payload: { jobId: scopeInput.jobId }, resourceHash: scopeInput.resourceHash,
     materialHash: scopeInput.materialHash, answersHash: scopeInput.answersHash, scopeHash, nonceHash, revision: scopeInput.revision,
-    expiresAt: scopeInput.expiresAt, decidedAt: new Date("2026-08-31T00:00:00.000Z"), consumedAt: null,
-    createdAt: new Date("2026-08-30T00:00:00.000Z"),
+    expiresAt: scopeInput.expiresAt, decidedAt: timeAt(-60), consumedAt: null,
+    createdAt: timeAt(-24 * 60),
   }
 }
 
@@ -56,6 +59,15 @@ function mockDb(row: Prisma.AgentApprovalGetPayload<{}>) {
   return { db, tx }
 }
 
+beforeEach(() => {
+  vi.useFakeTimers()
+  vi.setSystemTime(timeAt(0))
+})
+
+afterEach(() => {
+  vi.useRealTimers()
+})
+
 describe("Web approval receipt store", () => {
   it("issues a scoped receipt and emits only a safe audit payload", async () => {
     const row = await approvalRow()
@@ -72,28 +84,28 @@ describe("Web approval receipt store", () => {
   it("rejects a cross-job validation attempt", async () => {
     const row = await approvalRow()
     const { db } = mockDb(row)
-    await expect(validateApproval(db, row.id, { ...scopeInput, jobId: "job_2", nonce: "nonce_1" }, new Date("2026-08-31T12:00:00.000Z"))).rejects.toMatchObject({ code: "approval_scope_mismatch" })
+    await expect(validateApproval(db, row.id, { ...scopeInput, jobId: "job_2", nonce: "nonce_1" }, timeAt(1))).rejects.toMatchObject({ code: "approval_scope_mismatch" })
   })
 
   it("rejects stale revisions and expired receipts", async () => {
     const row = await approvalRow()
     const { db } = mockDb(row)
-    await expect(validateApproval(db, row.id, { ...scopeInput, revision: 4, nonce: "nonce_1" }, new Date("2026-08-31T12:00:00.000Z"))).rejects.toMatchObject({ code: "approval_revision_mismatch" })
-    await expect(validateApproval(db, row.id, { ...scopeInput, nonce: "nonce_1" }, new Date("2026-09-01T00:00:00.000Z"))).rejects.toMatchObject({ code: "approval_expired" })
+    await expect(validateApproval(db, row.id, { ...scopeInput, revision: 4, nonce: "nonce_1" }, timeAt(1))).rejects.toMatchObject({ code: "approval_revision_mismatch" })
+    await expect(validateApproval(db, row.id, { ...scopeInput, nonce: "nonce_1" }, timeAt(60))).rejects.toMatchObject({ code: "approval_expired" })
   })
 
   it("validates the nonce and scope while the receipt is still pending", async () => {
     const row = { ...(await approvalRow()), status: "pending", decidedAt: null }
     const { db } = mockDb(row)
 
-    await expect(validatePendingApprovalReceipt(db, row.id, { ...scopeInput, nonce: "nonce_1" }, new Date("2026-08-31T12:00:00.000Z"))).resolves.toMatchObject({ id: row.id, status: "pending" })
-    await expect(validatePendingApprovalReceipt(db, row.id, { ...scopeInput, nonce: "wrong_nonce" }, new Date("2026-08-31T12:00:00.000Z"))).rejects.toMatchObject({ code: "approval_nonce_mismatch" })
+    await expect(validatePendingApprovalReceipt(db, row.id, { ...scopeInput, nonce: "nonce_1" }, timeAt(1))).resolves.toMatchObject({ id: row.id, status: "pending" })
+    await expect(validatePendingApprovalReceipt(db, row.id, { ...scopeInput, nonce: "wrong_nonce" }, timeAt(1))).rejects.toMatchObject({ code: "approval_nonce_mismatch" })
   })
 
   it("consumes exactly one approved receipt with its external reservation in one transaction", async () => {
     const row = await approvalRow()
     const { db, tx } = mockDb(row)
-    const result = await consumeApprovalAndReserve(db, row.id, { ...scopeInput, nonce: "nonce_1" }, { idempotencyKey: "submit:task_1" }, new Date("2026-08-31T12:00:00.000Z"))
+    const result = await consumeApprovalAndReserve(db, row.id, { ...scopeInput, nonce: "nonce_1" }, { idempotencyKey: "submit:task_1" }, timeAt(1))
 
     expect(result).toMatchObject({ approvalId: row.id, reservationId: expect.any(String) })
     expect(db.$transaction).toHaveBeenCalledOnce()
