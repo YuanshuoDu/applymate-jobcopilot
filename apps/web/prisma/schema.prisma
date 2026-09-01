@@ -1693,6 +1693,10 @@ model AgentTurn {
   durationMs           Int?
   startedAt            DateTime?
   completedAt          DateTime?
+  leaseOwnerId         String?
+  leaseExpiresAt       DateTime?
+  leaseStartedAt       DateTime?
+  leaseVersion         Int       @default(0)
   createdAt            DateTime  @default(now())
   updatedAt            DateTime  @updatedAt
 
@@ -1706,6 +1710,7 @@ model AgentTurn {
 
   @@index([sessionId, createdAt])
   @@index([userId, status, updatedAt(sort: Desc)])
+  @@index([status, leaseExpiresAt])
   @@map("agent_turns")
 }
 
