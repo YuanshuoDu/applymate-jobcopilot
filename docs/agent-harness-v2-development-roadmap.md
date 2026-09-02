@@ -1,6 +1,6 @@
 # ApplyMate Agent Harness 2.0 详细开发路线图
 
-> **状态（2026-09-01）：** Phase 0–3 implementation complete (AH2-001..017 + MiniMax profile merged). Phase 3 Exit Gate is satisfied by provider/tool-kernel evidence; its scripted Turn prerequisite was corrected to remain with AH2-024. **Phase 4: `verifying` — Gate evidence deferred by owner authorization (2026-09-01)** — AH2-018/019/020/021 all merged (#382/#383/#384/#385); PR #385 commit 36c8d9e fixed two P1 redaction bugs surfaced during Layer 1 review. Phase 4 implementation and runbook are complete (runbook: PR #389 + #390, master); the §1.7 environmental evidence (a) staging approval/decline/expired browser smoke, (b) 48h dual-write integrity report, (c) staging SSE drill — requires staging credentials/operator that Codex does not hold. **Per owner authorization, Phase 5 now proceeds on a conditional basis**: Phase 4 is NOT declared `completed`; the deferred evidence remains tracked on **#387** and is a prerequisite for the eventual §1.8 Phase 4 Exit Report. Phase 5 development builds on the merged Phase 2/4 implementation; Phase 5 Issue merges do NOT imply Phase 4 Gate passed. Dispatch order began with AH2-022 (#386); AH2-024 is now merged as PR #401, and the next eligible tracked prerequisite is AH2-024-M (#370).
+> **状态（2026-09-01）：** Phase 0–3 implementation complete (AH2-001..017 + MiniMax profile merged). Phase 3 Exit Gate is satisfied by provider/tool-kernel evidence; its scripted Turn prerequisite was corrected to remain with AH2-024. **Phase 4：`accepted_by_owner_waiver` — owner 已明确接受 48h 观察豁免（2026-09-01）** — AH2-018/019/020/021 all merged (#382/#383/#384/#385); PR #385 commit 36c8d9e fixed two P1 redaction bugs surfaced during Layer 1 review. Phase 4 implementation and runbook are complete (runbook: PR #389 + #390, master); staging approval smoke and SSE evidence are recorded in PR #392 and the current MiniMax smoke is recorded on **#387/#388**. **48h dual-write integrity observation was not run and is explicitly waived by the owner; it remains `not_verified`, not fabricated as a measurement.** The exception record is [`docs/agent-harness-v2/gates/phase-4/owner-waiver.md`](agent-harness-v2/gates/phase-4/owner-waiver.md). Phase 5 is unlocked for implementation under this named exception; its own Exit Gate remains mandatory. The staging `AGENT_PROTOCOL_V2_DUAL_WRITE` flag is now `Active`, `100%`, `v3` in the authenticated Platform controls page; `fantasticjobs_shadow` is `Active` in Production at `0%`, so it receives no production traffic. This state does not waive the remaining ordinary evidence requirement or authorize production rollout. Dispatch order continues with AH2-022 (#386), then AH2-024-M (#370).
 > **日期：** 2026-08-30（状态头更新于 2026-08-31）
 > **上游设计：** [Agent Harness 2.0 Technical Design](./agent-harness-v2-technical-design.md)
 > **适用代码：** `packages/agent-protocol`、`packages/agent-model`、`apps/web`、`apps/worker`
@@ -220,6 +220,7 @@ not_started → active → implementation_complete → verifying → observing �
 - `observing`：在 staging/production shadow 中满足规定窗口。
 - `completed`：Phase Exit Report 已审阅，所有 Gate 有证据，下一 Phase 才可 active。
 - `blocked`：记录具体 blocker、已完成范围和恢复条件；不能把未验证项标记为完成。
+- `accepted_by_owner_waiver`：Owner 对列明的未验证 Gate 项作出书面豁免，允许指定的下一 Phase 进入实现；该状态不等同于实测证据完整的 `completed`，且必须记录风险、范围、回滚责任人和后续补证条件。
 
 ### 1.7 Phase 完成与验证矩阵
 
@@ -229,7 +230,7 @@ not_started → active → implementation_complete → verifying → observing �
 | 1 | Phase 0 completed | AH2-004–008 merged | migration + 48h dual-write integrity report | Phase 2/3 |
 | 2 | Store contracts 固定 | AH2-009–012 merged | command race、500 Items、SSE disconnect/reconnect | UI reducer foundations、Phase 4 |
 | 3 | Protocol/Store 可用 | AH2-013–017 merged | 三 provider contract + ToolRouter/lifecycle replay + read-only/tenant negative matrix | Phase 4 |
-| 4 | Phase 3 Exit Gate complete | AH2-018–021 merged | approval race/scope/expiry、PII、staging resume | Phase 5 |
+| 4 | Phase 3 Exit Gate complete | AH2-018–021 merged | approval race/scope/expiry、PII、staging resume；或 owner waiver 明确列出未完成环境观察项 | Phase 5（正常 Gate 或 owner-waiver activation） |
 | 5 | Phase 4 Exit Gate complete | AH2-022–027 merged | 3+ Steps、wait/restart、interrupt、no-progress | Phase 6/7/8 adapter |
 | 6 | TurnEngine stable | AH2-028–033 merged | task concurrency、mailbox、partial success、role isolation | Phase 8 multi-agent |
 | 7 | Step context stable | AH2-034–036 merged | 100+ Items、compaction invariants、fork/cursor loss | Phase 8/long chat |
@@ -751,7 +752,7 @@ draft
 - approval 后可唤醒原 Turn；
 - event/log 不包含 API key、OAuth token、原始简历全文或敏感答案。
 
-**Phase 4 Exit Gate 状态（2026-09-01）：`verifying`，环境证据经 owner 授权 deferred。** 所有四项代码层面证据（统一 policy、approval race/scope/expiry 100% 拒绝、broker wakeup、`EVENT_SAFE_KEY` allow-list redaction）已通过 PR #382/#383/#384/#385 的 Layer 1/2 审查；runbook 已合并（PR #389/#390）。§1.7 要求的环境证据（staging approval/decline/expired smoke、48h dual-write integrity report、staging SSE drill）因缺 staging 凭据/operator 而 defer，见 **#387**。Phase 4 不声明 `completed`，Exit Report（§1.8）须在这些证据补齐后签署；但 **owner 已授权 Phase 5 以条件方式启动**（AH2-022 开始，见 #386），Phase 5 Issue 的合并不构成 Phase 4 Gate 通过。
+**Phase 4 Exit Gate 状态（2026-09-01）：`accepted_by_owner_waiver`。** 所有四项代码层面证据（统一 policy、approval race/scope/expiry 100% 拒绝、broker wakeup、`EVENT_SAFE_KEY` allow-list redaction）已通过 PR #382/#383/#384/#385 的 Layer 1/2 审查；runbook 已合并（PR #389/#390）；staging approval smoke 与 SSE 证据已记录在 PR #392，当前 MiniMax Harness smoke 已在 **#387/#388** 留痕。Owner 明确决定不等待 48h，**因此 48h dual-write integrity observation 作为命名 Gate 例外予以豁免，但不改写为已完成的 48h 实测报告**。Phase 4 允许 Phase 5 进入实现（见 #386/#370）；当前认证 Platform controls 页面显示 `AGENT_PROTOCOL_V2_DUAL_WRITE` 为 Staging / Enabled / 100% / v3 / Active，`fantasticjobs_shadow` 为 Production / Enabled / 0% / v3 / Active。后者没有生产流量；本 waiver 仍不授权生产放量或跳过 Phase 5 自身 Gate。完整记录见 [`owner-waiver.md`](agent-harness-v2/gates/phase-4/owner-waiver.md) 与 [`dual-write-48h.md`](agent-harness-v2/gates/phase-4/dual-write-48h.md)。
 
 ---
 
@@ -1175,7 +1176,7 @@ draft
 | AH2-018 | PolicyEngine | #366 | [#376](https://github.com/YuanshuoDu/applymate-jobcopilot/issues/376) | [#382](https://github.com/YuanshuoDu/applymate-jobcopilot/pull/382) | done |
 | AH2-019 | approval receipt | #345,#376 | [#377](https://github.com/YuanshuoDu/applymate-jobcopilot/issues/377) | [#383](https://github.com/YuanshuoDu/applymate-jobcopilot/pull/383) | done |
 | AH2-020 | approval/question broker | #355,#377 | [#378](https://github.com/YuanshuoDu/applymate-jobcopilot/issues/378) | [#384](https://github.com/YuanshuoDu/applymate-jobcopilot/pull/384) | done |
-| AH2-021 | migrate high-risk policy | #376–#378 | [#379](https://github.com/YuanshuoDu/applymate-jobcopilot/issues/379) | [#385](https://github.com/YuanshuoDu/applymate-jobcopilot/pull/385) | done (Gate pending #387) |
+| AH2-021 | migrate high-risk policy | #376–#378 | [#379](https://github.com/YuanshuoDu/applymate-jobcopilot/issues/379) | [#385](https://github.com/YuanshuoDu/applymate-jobcopilot/pull/385) | done (Phase 4 Gate exception accepted; 48h observation waived in #387) |
 | AH2-022 | Turn lease/recovery | 007,009 | [#386](https://github.com/YuanshuoDu/applymate-jobcopilot/issues/386) | [#391](https://github.com/YuanshuoDu/applymate-jobcopilot/pull/391) | done |
 | AH2-023 | Step context/input consume | 016,022 | [#397](https://github.com/YuanshuoDu/applymate-jobcopilot/issues/397) | [#399](https://github.com/YuanshuoDu/applymate-jobcopilot/pull/399) | done |
 | AH2-024 | conversation loop | 017,018,022,023 | [#400](https://github.com/YuanshuoDu/applymate-jobcopilot/issues/400) | [#401](https://github.com/YuanshuoDu/applymate-jobcopilot/pull/401) | done |
