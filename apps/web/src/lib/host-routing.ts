@@ -47,6 +47,7 @@ export function isAdminAuthApiPath(pathname: string): boolean {
 export function isAdminApiPath(pathname: string): boolean {
   return pathname === '/api/admin/v1'
     || pathname.startsWith('/api/admin/v1/')
+    || pathname === '/api/admin/invitations/register'
     || pathname === '/api/admin/invitations/accept'
 }
 

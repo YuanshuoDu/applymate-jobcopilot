@@ -126,11 +126,14 @@ describe('web middleware entrypoint', () => {
   it('keeps public registration off the administrator host', async () => {
     const page = await middleware(new NextRequest('https://admin.applymate.site/register'))
     const api = await middleware(new NextRequest('https://admin.applymate.site/api/auth/register', { method: 'POST' }))
+    const invitationRegistration = await middleware(new NextRequest('https://admin.applymate.site/api/admin/invitations/register', { method: 'POST' }))
 
     expect(page.status).toBe(307)
     expect(page.headers.get('location')).toBe('https://admin.applymate.site/login?callbackUrl=%2Fadmin&error=admin_registration_disabled')
     expect(api.status).toBe(404)
     expect(api.headers.get('X-Frame-Options')).toBe('DENY')
+    expect(invitationRegistration.status).toBe(200)
+    expect(invitationRegistration.headers.get('X-Frame-Options')).toBe('DENY')
   })
 
   it('allows the Auth.js endpoints required for credential sign-in while blocking other providers', async () => {
