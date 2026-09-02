@@ -58,4 +58,20 @@ describe('POST /api/admin/invitations/accept', () => {
     await expect(response.json()).resolves.toEqual({ error: 'The signed-in account does not match the invited email', code: 'INVITATION_EMAIL_MISMATCH' })
     expect(mocks.membershipFindUnique).not.toHaveBeenCalled()
   })
+
+  it('rejects a revoked invitation token', async () => {
+    mocks.safeAuth.mockResolvedValue({ user: { id: 'user_1', email: 'invited@example.com', authVersion: 1 } })
+    mocks.userFindUnique.mockResolvedValue({ email: 'invited@example.com', accountStatus: 'active', authVersion: 1 })
+    mocks.invitationFindUnique.mockResolvedValue({ id: 'invite_1', email: 'invited@example.com', roleId: 'role_1', status: 'revoked', expiresAt: new Date(Date.now() + 60_000) })
+    const { POST } = await import('./route')
+
+    const response = await POST(new NextRequest('https://admin.applymate.site/api/admin/invitations/accept', {
+      method: 'POST',
+      body: JSON.stringify({ token: 'a'.repeat(20) }),
+    }))
+
+    expect(response.status).toBe(400)
+    await expect(response.json()).resolves.toEqual({ error: 'Invitation is invalid or expired', code: 'INVITATION_INVALID' })
+    expect(mocks.transaction).not.toHaveBeenCalled()
+  })
 })

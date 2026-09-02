@@ -74,6 +74,16 @@ describe('POST /api/admin/invitations/register', () => {
     expect(mocks.userCreate).not.toHaveBeenCalled()
   })
 
+  it('rejects a revoked invitation before creating an account', async () => {
+    mocks.invitationFindUnique.mockResolvedValue({ id: 'inv-1', email: 'new@example.com', status: 'revoked', expiresAt: new Date(Date.now() + 60_000) })
+    const { POST } = await import('./route')
+    const response = await POST(request({ token: 'a'.repeat(32), email: 'new@example.com', name: 'New Admin', password: 'password-123' }))
+
+    expect(response.status).toBe(400)
+    await expect(response.json()).resolves.toEqual({ error: 'Invitation is invalid or expired' })
+    expect(mocks.userCreate).not.toHaveBeenCalled()
+  })
+
   it('does not expose the registration endpoint on the public application host', async () => {
     const { POST } = await import('./route')
     const response = await POST(request({ token: 'a'.repeat(32), email: 'new@example.com', name: 'New Admin', password: 'password-123' }, 'applymate.site'))
