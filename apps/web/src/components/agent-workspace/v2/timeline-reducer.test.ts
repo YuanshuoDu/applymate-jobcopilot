@@ -27,6 +27,13 @@ describe('timeline reducer', () => {
     expect(state.itemsById['item-1'].source).toBe('transient')
   })
 
+  it('applies a durable item.delta event delivered through the event path', () => {
+    let state = timelineReducer(createTimelineState('session-1'), { type: 'replay', items: [baseItem('item-1')] })
+    state = timelineReducer(state, { type: 'event', event: event({ kind: undefined, revision: undefined, payload: { itemId: 'item-1', status: 'streaming', content: { text: 'durable delta' } } }) })
+    expect(state.itemsById['item-1']).toMatchObject({ revision: 1, content: { text: 'durable delta' } })
+    expect(state.processedEventIds['event-1']).toBe(true)
+  })
+
   it('replaces transient content with a completed authoritative item and ignores duplicates/out-of-order regressions', () => {
     let state = timelineReducer(createTimelineState('session-1'), { type: 'replay', items: [baseItem('item-1', { revision: 2 })] })
     state = timelineReducer(state, { type: 'delta', delta: event({ id: 'delta-1', revision: 3, payload: { text: 'partial' } }) })

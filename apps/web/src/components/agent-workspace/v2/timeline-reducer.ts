@@ -158,7 +158,7 @@ function reduceEvent(state: TimelineState, value: unknown): TimelineState {
   if (event.type === 'stream.overflow') return { ...next, snapshotRequired: true, connection: 'reconnecting' }
   if (event.type === 'item.delta') {
     const existingRevision = state.itemsById[event.itemId ?? '']?.revision ?? 0
-    return reduceDelta(next, { ...event, kind: 'delta', revision: event.revision ?? existingRevision + 1 })
+    return reduceDelta(next, { ...event, kind: 'delta', revision: event.revision ?? existingRevision + 1 }, event.id)
   }
   if (!event.itemId) return KNOWN_EVENT_TYPES.has(event.type) ? next : addUnknownEvent(next, event)
   const existing = state.itemsById[event.itemId]
@@ -168,10 +168,12 @@ function reduceEvent(state: TimelineState, value: unknown): TimelineState {
   return item ? upsertItem(next, item, item.source === 'unknown' ? 'unknown' : 'durable') : next
 }
 
-function reduceDelta(state: TimelineState, value: unknown): TimelineState {
+function reduceDelta(state: TimelineState, value: unknown, preprocessedId?: string): TimelineState {
   const delta = normalizeTimelineEvent(value)
-  if (!delta || delta.sessionId !== state.sessionId || !delta.itemId || state.processedEventIds[delta.id]) return state
-  const processedEventIds: Record<string, true> = { ...state.processedEventIds, [delta.id]: true }
+  if (!delta || delta.sessionId !== state.sessionId || !delta.itemId || (preprocessedId === undefined && state.processedEventIds[delta.id])) return state
+  const processedEventIds: Record<string, true> = preprocessedId === undefined
+    ? { ...state.processedEventIds, [delta.id]: true }
+    : state.processedEventIds
   state = { ...state, processedEventIds }
   const payload = isRecord(delta.payload) ? delta.payload : {}
   const revision = delta.revision ?? numberOrUndefined(payload.revision)
