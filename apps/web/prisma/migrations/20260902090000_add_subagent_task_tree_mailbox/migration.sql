@@ -82,3 +82,16 @@ CREATE INDEX "agent_mailbox_messages_toTaskId_consumedAt_createdAt_idx"
   ON "agent_mailbox_messages"("toTaskId", "consumedAt", "createdAt");
 CREATE INDEX "agent_mailbox_messages_sessionId_turnId_consumedAt_createdAt_idx"
   ON "agent_mailbox_messages"("sessionId", "turnId", "consumedAt", "createdAt");
+
+-- Message lineage is session-scoped too. These references prevent a caller
+-- from attaching a message to a turn/task owned by another session.
+ALTER TABLE "agent_mailbox_messages"
+  ADD CONSTRAINT "agent_mailbox_messages_turnId_sessionId_fkey"
+  FOREIGN KEY ("turnId", "sessionId") REFERENCES "agent_turns"("id", "sessionId")
+  ON DELETE CASCADE ON UPDATE CASCADE,
+  ADD CONSTRAINT "agent_mailbox_messages_fromTaskId_sessionId_fkey"
+  FOREIGN KEY ("fromTaskId", "sessionId") REFERENCES "sub_agent_tasks"("id", "sessionId")
+  ON DELETE CASCADE ON UPDATE CASCADE,
+  ADD CONSTRAINT "agent_mailbox_messages_toTaskId_sessionId_fkey"
+  FOREIGN KEY ("toTaskId", "sessionId") REFERENCES "sub_agent_tasks"("id", "sessionId")
+  ON DELETE CASCADE ON UPDATE CASCADE;

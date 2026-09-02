@@ -1709,6 +1709,7 @@ model AgentTurn {
   events  AgentEvent[]
   approvals AgentApproval[]
   subAgentTasks SubAgentTask[]
+  mailboxMessages AgentMailboxMessage[]
 
   @@index([sessionId, createdAt])
   @@index([userId, status, updatedAt(sort: Desc)])
@@ -1891,6 +1892,8 @@ model SubAgentTask {
   childTasks SubAgentTask[] @relation("SubAgentTaskTree")
   rootTask SubAgentTask? @relation("SubAgentTaskRoot", fields: [rootTaskId, sessionId], references: [id, sessionId], onDelete: Cascade)
   rootDescendants SubAgentTask[] @relation("SubAgentTaskRoot")
+  mailboxMessagesSent AgentMailboxMessage[] @relation("AgentMailboxFromTask")
+  mailboxMessagesReceived AgentMailboxMessage[] @relation("AgentMailboxToTask")
 
   @@index([sessionId, status])
   @@index([sessionId, role])
@@ -1915,6 +1918,9 @@ model AgentMailboxMessage {
   createdAt      DateTime @default(now())
 
   session AgentSession @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+  turn AgentTurn @relation(fields: [turnId, sessionId], references: [id, sessionId], onDelete: Cascade)
+  fromTask SubAgentTask? @relation("AgentMailboxFromTask", fields: [fromTaskId, sessionId], references: [id, sessionId], onDelete: Cascade)
+  toTask SubAgentTask? @relation("AgentMailboxToTask", fields: [toTaskId, sessionId], references: [id, sessionId], onDelete: Cascade)
 
   @@unique([sessionId, idempotencyKey])
   @@index([toTaskId, consumedAt, createdAt])

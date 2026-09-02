@@ -28,4 +28,10 @@ describe("AH2-028 migration fixture", () => {
     expect(migrationSql).toContain('"toTaskId", "consumedAt", "createdAt"')
     expect(migrationSql).toContain('"consumedAt" TIMESTAMP(3)')
   })
+
+  it("keeps mailbox lineage inside the owning session", () => {
+    expect(migrationSql).toContain('FOREIGN KEY ("turnId", "sessionId") REFERENCES "agent_turns"("id", "sessionId")')
+    expect(migrationSql).toContain('FOREIGN KEY ("fromTaskId", "sessionId") REFERENCES "sub_agent_tasks"("id", "sessionId")')
+    expect(migrationSql).toContain('FOREIGN KEY ("toTaskId", "sessionId") REFERENCES "sub_agent_tasks"("id", "sessionId")')
+  })
 })
