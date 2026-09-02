@@ -1,7 +1,7 @@
 import { NextResponse } from 'next/server'
 import type { NextRequest } from 'next/server'
 import { applyAdminSecurityHeaders } from '@/lib/admin/http-security'
-import { adminOrigin, isAdminApiPath, isAdminAuthApiPath, isAdminHost, isAdminPath, isAuthPath, isLocalHost } from '@/lib/host-routing'
+import { adminOrigin, isAdminApiPath, isAdminAuthApiPath, isAdminHost, isAdminInvitationPath, isAdminPath, isAuthPath, isLocalHost } from '@/lib/host-routing'
 
 const PUBLIC_ROUTES = ['/landing', '/login', '/register', '/forgot-password', '/reset-password', '/api/auth']
 const SESSION_COOKIE_NAMES = [
@@ -58,6 +58,14 @@ export async function middleware(req: NextRequest) {
   // local non-production developer session. It does not expose account data.
   if (pathname === '/agent-preview' && isLocalHost(hostname) && process.env.NODE_ENV !== 'production') {
     return NextResponse.next()
+  }
+
+  // Invitation pages must remain reachable after the current account signs
+  // out. The page itself validates the token and renders the invited-account
+  // registration/sign-in flow; accepting the invitation remains protected by
+  // the route handler.
+  if (isAdminInvitationPath(pathname)) {
+    return applyAdminSecurityHeaders(NextResponse.next())
   }
 
   // ── Allow public routes through ────────────────────────────

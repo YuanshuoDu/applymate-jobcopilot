@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { adminOrigin, isAdminApiPath, isAdminAuthApiPath, isAdminHost, isAdminPath, isAuthPath, isLocalHost } from './host-routing'
+import { adminOrigin, isAdminApiPath, isAdminAuthApiPath, isAdminHost, isAdminInvitationPath, isAdminPath, isAuthPath, isLocalHost } from './host-routing'
 
 describe('host routing', () => {
   it('recognizes only the configured administrator host', () => {
@@ -13,6 +13,9 @@ describe('host routing', () => {
     expect(isAdminPath('/admin/users')).toBe(true)
     expect(isAdminPath('/invite/admin')).toBe(true)
     expect(isAdminPath('/dashboard')).toBe(false)
+    expect(isAdminInvitationPath('/invite/admin')).toBe(true)
+    expect(isAdminInvitationPath('/invite/admin/')).toBe(true)
+    expect(isAdminInvitationPath('/invite/administrator')).toBe(false)
     expect(isAuthPath('/login')).toBe(true)
     expect(isAuthPath('/api/auth/session')).toBe(true)
     expect(isAdminAuthApiPath('/api/auth/callback/credentials')).toBe(true)
