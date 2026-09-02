@@ -1,7 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { NextRequest } from 'next/server'
 
-const mocks = vi.hoisted(() => ({ safeAuth: vi.fn(), userFindUnique: vi.fn(), invitationFindUnique: vi.fn(), membershipFindUnique: vi.fn(), transaction: vi.fn() }))
+const mocks = vi.hoisted(() => ({ safeAuth: vi.fn(), userFindUnique: vi.fn(), invitationFindUnique: vi.fn(), membershipFindUnique: vi.fn(), membershipCreate: vi.fn(), invitationUpdateMany: vi.fn(), transaction: vi.fn() }))
 
 vi.mock('@/lib/safe-auth', () => ({ safeAuth: mocks.safeAuth }))
 vi.mock('@/lib/db', () => ({ db: { user: { findUnique: mocks.userFindUnique }, adminInvitation: { findUnique: mocks.invitationFindUnique }, adminMembership: { findUnique: mocks.membershipFindUnique }, $transaction: mocks.transaction } }))
@@ -14,7 +14,12 @@ describe('POST /api/admin/invitations/accept', () => {
     mocks.userFindUnique.mockReset()
     mocks.invitationFindUnique.mockReset()
     mocks.membershipFindUnique.mockReset()
+    mocks.membershipCreate.mockReset()
+    mocks.invitationUpdateMany.mockReset()
     mocks.transaction.mockReset()
+    mocks.membershipCreate.mockResolvedValue({ id: 'membership-1' })
+    mocks.invitationUpdateMany.mockResolvedValue({ count: 1 })
+    mocks.transaction.mockImplementation(async (callback: (tx: unknown) => Promise<unknown>) => callback({ adminMembership: { create: mocks.membershipCreate }, adminInvitation: { updateMany: mocks.invitationUpdateMany } }))
   })
 
   it('rejects invitation acceptance on the public application host before reading a session', async () => {
@@ -73,5 +78,41 @@ describe('POST /api/admin/invitations/accept', () => {
     expect(response.status).toBe(400)
     await expect(response.json()).resolves.toEqual({ error: 'Invitation is invalid or expired', code: 'INVITATION_INVALID' })
     expect(mocks.transaction).not.toHaveBeenCalled()
+  })
+
+  it('consumes the invitation before creating membership', async () => {
+    mocks.safeAuth.mockResolvedValue({ user: { id: 'user_1', email: 'invited@example.com', authVersion: 1 } })
+    mocks.userFindUnique.mockResolvedValue({ email: 'invited@example.com', accountStatus: 'active', authVersion: 1 })
+    mocks.invitationFindUnique.mockResolvedValue({ id: 'invite_1', email: 'invited@example.com', roleId: 'role_1', status: 'pending', expiresAt: new Date(Date.now() + 60_000) })
+    mocks.membershipFindUnique.mockResolvedValue(null)
+    const { POST } = await import('./route')
+
+    const response = await POST(new NextRequest('https://admin.applymate.site/api/admin/invitations/accept', {
+      method: 'POST',
+      body: JSON.stringify({ token: 'a'.repeat(20) }),
+    }))
+
+    expect(response.status).toBe(200)
+    await expect(response.json()).resolves.toEqual({ accepted: true })
+    expect(mocks.invitationUpdateMany).toHaveBeenCalledWith(expect.objectContaining({ where: expect.objectContaining({ id: 'invite_1', status: 'pending', expiresAt: expect.any(Object) }), data: expect.objectContaining({ status: 'accepted', acceptedAt: expect.any(Date) }) }))
+    expect(mocks.membershipCreate).toHaveBeenCalledWith({ data: { userId: 'user_1', roleId: 'role_1' } })
+  })
+
+  it('rejects when revocation wins the acceptance race before creating membership', async () => {
+    mocks.safeAuth.mockResolvedValue({ user: { id: 'user_1', email: 'invited@example.com', authVersion: 1 } })
+    mocks.userFindUnique.mockResolvedValue({ email: 'invited@example.com', accountStatus: 'active', authVersion: 1 })
+    mocks.invitationFindUnique.mockResolvedValue({ id: 'invite_1', email: 'invited@example.com', roleId: 'role_1', status: 'pending', expiresAt: new Date(Date.now() + 60_000) })
+    mocks.membershipFindUnique.mockResolvedValue(null)
+    mocks.invitationUpdateMany.mockResolvedValue({ count: 0 })
+    const { POST } = await import('./route')
+
+    const response = await POST(new NextRequest('https://admin.applymate.site/api/admin/invitations/accept', {
+      method: 'POST',
+      body: JSON.stringify({ token: 'a'.repeat(20) }),
+    }))
+
+    expect(response.status).toBe(400)
+    await expect(response.json()).resolves.toEqual({ error: 'Invitation is invalid or expired', code: 'INVITATION_INVALID' })
+    expect(mocks.membershipCreate).not.toHaveBeenCalled()
   })
 })

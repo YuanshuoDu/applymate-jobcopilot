@@ -7,6 +7,8 @@ import { checkAuthRateLimit } from '@/lib/auth-rate-limit'
 import { isAdminHost, isLocalHost } from '@/lib/host-routing'
 import { createAdminAuditData, requestIdFor } from '@/lib/admin/audit'
 
+class InvitationStateConflict extends Error {}
+
 /**
  * Create the ordinary ApplyMate account required to accept an administrator
  * invitation. The invitation token is the only authority for this public
@@ -62,6 +64,8 @@ export async function POST(request: NextRequest) {
   const requestId = requestIdFor(request)
   try {
     const user = await db.$transaction(async (tx) => {
+      const available = await tx.adminInvitation.updateMany({ where: { id: invitation.id, status: 'pending', expiresAt: { gt: new Date() } }, data: { status: 'pending' } })
+      if (available.count !== 1) throw new InvitationStateConflict()
       const created = await tx.user.create({
         data: { email, name, password: passwordHash },
         select: { id: true, email: true, name: true },
@@ -85,6 +89,7 @@ export async function POST(request: NextRequest) {
 
     return NextResponse.json({ created: true, user }, { status: 201, headers: { 'Cache-Control': 'no-store', 'x-request-id': requestId } })
   } catch (error) {
+    if (error instanceof InvitationStateConflict) return NextResponse.json({ error: 'Invitation is invalid or expired' }, { status: 400 })
     if (typeof error === 'object' && error !== null && 'code' in error && error.code === 'P2002') {
       return NextResponse.json({ error: 'An account already exists for this invitation email', code: 'ACCOUNT_EXISTS' }, { status: 409 })
     }
