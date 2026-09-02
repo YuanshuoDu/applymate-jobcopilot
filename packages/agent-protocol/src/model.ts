@@ -2,6 +2,26 @@ import { Type, type Static } from '@sinclair/typebox'
 import { IdSchema, NonEmptyTextSchema, SchemaVersionSchema } from './common.js'
 import { InputContentPartSchema } from './input.js'
 
+export const ModelToolUsePartSchema = Type.Object({
+  type: Type.Literal('tool_use'),
+  id: IdSchema,
+  name: IdSchema,
+  input: Type.Unknown(),
+}, { additionalProperties: false })
+
+export const ModelToolResultPartSchema = Type.Object({
+  type: Type.Literal('tool_result'),
+  toolUseId: IdSchema,
+  content: NonEmptyTextSchema,
+  isError: Type.Optional(Type.Boolean()),
+}, { additionalProperties: false })
+
+export const ModelContentPartSchema = Type.Union([
+  InputContentPartSchema,
+  ModelToolUsePartSchema,
+  ModelToolResultPartSchema,
+])
+
 export const ModelRoleSchema = Type.Union([
   Type.Literal('system'),
   Type.Literal('user'),
@@ -11,7 +31,7 @@ export const ModelRoleSchema = Type.Union([
 
 export const ModelMessageSchema = Type.Object({
   role: ModelRoleSchema,
-  content: Type.Array(InputContentPartSchema, { minItems: 1 }),
+  content: Type.Array(ModelContentPartSchema, { minItems: 1 }),
 }, { additionalProperties: false })
 
 export const ModelCapabilitiesSchema = Type.Object({
@@ -60,6 +80,9 @@ export const ModelResponseSchema = Type.Object({
 }, { $id: 'agent.model.response', additionalProperties: false })
 
 export type ModelRole = Static<typeof ModelRoleSchema>
+export type ModelToolUsePart = Static<typeof ModelToolUsePartSchema>
+export type ModelToolResultPart = Static<typeof ModelToolResultPartSchema>
+export type ModelContentPart = Static<typeof ModelContentPartSchema>
 export type ModelMessage = Static<typeof ModelMessageSchema>
 export type ModelCapabilities = Static<typeof ModelCapabilitiesSchema>
 export type ModelToolCall = Static<typeof ModelToolCallSchema>

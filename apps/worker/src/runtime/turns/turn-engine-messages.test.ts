@@ -33,4 +33,26 @@ describe("TurnEngine model message mapping", () => {
     const messages = contextToModelMessages({ ...context(), blocks: [] })
     expect(messages).toEqual([{ role: "user", content: [{ type: "text", text: expect.any(String) }] }])
   })
+
+  it("reconstructs provider-neutral assistant/tool correlation from observations", () => {
+    const messages = contextToModelMessages({
+      ...context(),
+      blocks: [...context().blocks, {
+        id: "observation-1",
+        layer: "tool_observation",
+        role: "data",
+        trust: "external_untrusted",
+        source: "tool_or_subagent",
+        content: { toolCallId: "call-1", toolName: "jobs.search", input: { query: "Dublin" }, status: "completed", output: { jobs: 2 } },
+      }],
+    })
+    expect(messages.at(-2)).toEqual({
+      role: "assistant",
+      content: [{ type: "tool_use", id: "call-1", name: "jobs.search", input: { query: "Dublin" } }],
+    })
+    expect(messages.at(-1)).toEqual({
+      role: "tool",
+      content: [{ type: "tool_result", toolUseId: "call-1", content: '{"jobs":2}' }],
+    })
+  })
 })

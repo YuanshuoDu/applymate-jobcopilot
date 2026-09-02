@@ -103,6 +103,7 @@ export type TurnEngineToolExecutor = (input: {
   turnId: string
   stepId: string
   signal: AbortSignal
+  capabilities?: readonly string[]
   call: { id: string; toolName: string; toolVersion: string; input: unknown }
 }) => Promise<TurnEngineToolResult>
 
@@ -139,6 +140,8 @@ export type TurnEngineOptions = {
   readonly now?: () => Date
   readonly idFactory?: (prefix: string) => string
   readonly subscribe?: TurnEngineEventSubscriber
+  /** Provider reasoning is private by default; only explicitly safe summaries may be published. */
+  readonly publishReasoningSummary?: boolean
 }
 
 export type TurnEngineResult = {

@@ -78,7 +78,7 @@ export type ModelStreamEvent =
   | { type: "tool_call_started"; callId: string; name: string }
   | { type: "tool_arguments_delta"; callId: string; delta: string }
   | { type: "tool_call_completed"; callId: string; name: string; arguments: unknown }
-  | { type: "usage"; inputTokens: number; outputTokens: number; estimatedCostUsd?: number }
+  | { type: "usage"; inputTokens: number; outputTokens: number; estimatedCostUsd?: number; provider?: string; model?: string }
   | { type: "continuation"; continuation: ModelContinuation }
   | { type: "completed"; finishReason: ModelFinishReason }
 

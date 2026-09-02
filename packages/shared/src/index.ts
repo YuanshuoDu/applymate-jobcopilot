@@ -5,6 +5,7 @@
 // (Prisma dependency) — this shared package is the isolation layer.
 export type { AiConfig, ChatMessage, ChatResult, Provider } from "./llm.js";
 export { callLlm, callLlmText, loadWorkerAiConfig, resolveWorkerAiConfig, closeSharedPool } from "./llm.js";
+export { estimateSharedAiCost, recordSharedAiUsage, sharedAiUsageErrorCode } from "./ai-usage.js";
 export {
   MINIMAX_CN_ANTHROPIC_BASE_URL,
   MINIMAX_CN_OPENAI_BASE_URL,

@@ -88,6 +88,7 @@ describe("TurnEngine", () => {
     expect(fixture.fake.steps.map((step) => step.status)).toEqual(["completed", "completed", "completed"])
     expect(fixture.fake.events.filter((event) => event.type === "turn.completed")).toHaveLength(1)
     expect(fixture.fake.items.filter((item) => item.type === "agent_message" && item.phase === "final_answer")).toHaveLength(1)
+    expect(fixture.fake.items.filter((item) => item.type === "reasoning_summary")).toHaveLength(0)
     expect(fixture.requests[1].messages.flatMap((message) => message.content).some((part) => JSON.stringify(part).includes("jobs.search"))).toBe(true)
     expect(fixture.requests[2].messages.flatMap((message) => message.content).some((part) => JSON.stringify(part).includes("jobs.get"))).toBe(true)
     expect(fixture.fake.events.slice(1).every((event, index) => event.causationId === fixture.fake.events[index].id)).toBe(true)
@@ -116,7 +117,36 @@ describe("TurnEngine", () => {
     const execute = vi.fn(async (context, call) => ({ ...call, status: "completed" as const, output: { ok: true }, errorCode: null, actorRole: context.actorRole }))
     const router = { execute }
     const executor = createToolRouterExecutor(router)
-    await expect(executor({ scope: { userId: "user-1" }, sessionId: "session-1", turnId: "turn-1", stepId: "step-1", signal: new AbortController().signal, call: { id: "call-1", toolName: "jobs.get", toolVersion: "1", input: { jobId: "job-1" } } })).resolves.toMatchObject({ status: "completed", actorRole: "orchestrator" })
-    expect(execute).toHaveBeenCalledWith(expect.objectContaining({ scope: { userId: "user-1" }, actorRole: "orchestrator" }), expect.objectContaining({ id: "call-1" }))
+    await expect(executor({ scope: { userId: "user-1" }, sessionId: "session-1", turnId: "turn-1", stepId: "step-1", signal: new AbortController().signal, capabilities: ["read"], call: { id: "call-1", toolName: "jobs.get", toolVersion: "1", input: { jobId: "job-1" } } })).resolves.toMatchObject({ status: "completed", actorRole: "orchestrator" })
+    expect(execute).toHaveBeenCalledWith(expect.objectContaining({ scope: { userId: "user-1" }, actorRole: "orchestrator", capabilities: ["read"] }), expect.objectContaining({ id: "call-1" }))
+  })
+
+  it("replays a previously completed tool call without executing it again", async () => {
+    const executeTool = vi.fn(async ({ call }: Parameters<TurnEngineOptions["executeTool"]>[0]) => ({
+      id: call.id, toolName: call.toolName, toolVersion: call.toolVersion, status: "completed" as const, output: { replaySafe: true }, errorCode: null,
+    }))
+    const fixture = baseOptions({
+      snapshot: {
+        system: [], profile: [], steerHistory: [], businessRefs: [],
+        toolObservations: [{ id: "tool-result:call-1", content: { toolCallId: "call-1", toolName: "jobs.search", input: { location: "Dublin" }, status: "completed", output: { jobs: [{ id: "job-1" }] }, errorCode: null } }],
+      },
+      executeTool,
+    })
+    await expect(new TurnEngine(fixture.options).run()).resolves.toMatchObject({ status: "completed", toolCallCount: 2 })
+    expect(executeTool).toHaveBeenCalledTimes(1)
+    expect(executeTool).toHaveBeenCalledWith(expect.objectContaining({ call: expect.objectContaining({ id: "call-2" }) }))
+  })
+
+  it("fails closed when a replayed call id has different arguments", async () => {
+    const executeTool = vi.fn()
+    const fixture = baseOptions({
+      snapshot: {
+        system: [], profile: [], steerHistory: [], businessRefs: [],
+        toolObservations: [{ id: "tool-result:call-1", content: { toolCallId: "call-1", toolName: "jobs.search", input: { location: "Berlin" }, status: "completed", output: { jobs: [] }, errorCode: null } }],
+      },
+      executeTool,
+    })
+    await expect(new TurnEngine(fixture.options).run()).resolves.toMatchObject({ status: "failed", errorCode: "invalid_output" })
+    expect(executeTool).not.toHaveBeenCalled()
   })
 })

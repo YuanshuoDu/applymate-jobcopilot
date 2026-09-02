@@ -82,11 +82,25 @@ export type { AgentApproval, ApprovalScope, ApprovalStatus, ApprovalType } from 
 export { createApprovalNonce, hashApprovalNonce, hashApprovalScope, sha256Hex } from './approval-crypto.js'
 export {
   ModelCapabilitiesSchema,
+  ModelContentPartSchema,
   ModelMessageSchema,
   ModelRequestSchema,
   ModelResponseSchema,
+  ModelToolResultPartSchema,
+  ModelToolUsePartSchema,
   ModelRoleSchema,
   ModelToolCallSchema,
   ModelUsageSchema,
 } from './model.js'
-export type { ModelCapabilities, ModelMessage, ModelRequest, ModelResponse, ModelRole, ModelToolCall, ModelUsage } from './model.js'
+export type {
+  ModelCapabilities,
+  ModelContentPart,
+  ModelMessage,
+  ModelRequest,
+  ModelResponse,
+  ModelRole,
+  ModelToolCall,
+  ModelToolResultPart,
+  ModelToolUsePart,
+  ModelUsage,
+} from './model.js'

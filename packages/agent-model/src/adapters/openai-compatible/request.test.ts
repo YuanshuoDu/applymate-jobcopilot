@@ -44,6 +44,26 @@ describe("OpenAI-compatible request builder", () => {
     expect(result.body.input).toEqual([{ role: "user", content: [{ type: "input_text", text: "Find Berlin jobs" }] }])
   })
 
+  it("preserves assistant tool-call and tool-result correlation in both wire modes", () => {
+    const messages = [
+      { role: "user", content: [{ type: "text", text: "Search" }] },
+      { role: "assistant", content: [{ type: "tool_use", id: "call-1", name: "jobs.search", input: { query: "Berlin" } }] },
+      { role: "tool", content: [{ type: "tool_result", toolUseId: "call-1", content: '{"jobs":2}' }] },
+    ] as const
+    const chat = buildOpenAiRequest(request({ messages }), config)
+    expect(chat.body.messages).toEqual([
+      { role: "user", content: "Search" },
+      { role: "assistant", content: null, tool_calls: [{ id: "call-1", type: "function", function: { name: "jobs.search", arguments: '{"query":"Berlin"}' } }] },
+      { role: "tool", tool_call_id: "call-1", content: '{"jobs":2}' },
+    ])
+    const responses = buildOpenAiRequest(request({ messages }), config, { mode: "responses" })
+    expect(responses.body.input).toEqual([
+      { role: "user", content: [{ type: "input_text", text: "Search" }] },
+      { type: "function_call", call_id: "call-1", name: "jobs.search", arguments: '{"query":"Berlin"}' },
+      { type: "function_call_output", call_id: "call-1", output: '{"jobs":2}' },
+    ])
+  })
+
   it("rejects unsafe endpoints and unsupported Chat Completions continuation", () => {
     expect(() => buildOpenAiRequest(request(), { ...config, baseUrl: "http://127.0.0.1:8080/v1" })).toThrow(AgentModelError)
     expect(() => buildOpenAiRequest(request(), { ...config, baseUrl: "https://metadata.google.internal/v1" })).toThrow(AgentModelError)

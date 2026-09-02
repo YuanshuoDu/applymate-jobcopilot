@@ -7,9 +7,15 @@ import type {
   OpenAiRequest,
   OpenAiWireMode,
 } from "./types.js"
-
-type TextMessage = { role: "system" | "user" | "assistant"; content: string }
-
+type ProviderMessage =
+  | { role: "system" | "user"; content: string }
+  | { role: "assistant"; content: string | null; tool_calls?: readonly ProviderToolCall[] }
+  | { role: "tool"; tool_call_id: string; content: string }
+type ProviderToolCall = {
+  id: string
+  type: "function"
+  function: { name: string; arguments: string }
+}
 export function buildOpenAiRequest(
   request: HarnessModelRequest,
   config: OpenAiCompatibleConfig,
@@ -18,7 +24,7 @@ export function buildOpenAiRequest(
   const mode = options.mode ?? config.mode ?? "chat_completions"
   const baseUrl = validateBaseUrl(config.baseUrl, options.allowLocalDevelopment === true)
   if (!config.apiKey.trim()) throw configurationError("OpenAI-compatible adapter requires an API key", config)
-  const messages = request.messages.map((message) => toTextMessage(message, config))
+  const messages = request.messages.flatMap((message) => toProviderMessages(message, config))
   const tools = request.tools.map((tool) => toProviderTool(tool, mode, config))
   const body = mode === "responses"
     ? buildResponsesBody(request, config, messages, tools)
@@ -31,7 +37,6 @@ export function buildOpenAiRequest(
   if (config.organization) headers["OpenAI-Organization"] = config.organization
   return { url: endpointUrl(baseUrl, mode), headers, body, mode }
 }
-
 export function capabilityProfile(
   config: Pick<OpenAiCompatibleConfig, "provider" | "model">,
   mode: OpenAiWireMode,
@@ -57,11 +62,10 @@ export function capabilityProfile(
     ...overrides,
   }
 }
-
 function buildChatCompletionsBody(
   request: HarnessModelRequest,
   config: OpenAiCompatibleConfig,
-  messages: TextMessage[],
+  messages: ProviderMessage[],
   tools: unknown[],
 ): Record<string, unknown> {
   const body: Record<string, unknown> = {
@@ -84,19 +88,15 @@ function buildChatCompletionsBody(
   }
   return body
 }
-
 function buildResponsesBody(
   request: HarnessModelRequest,
   config: OpenAiCompatibleConfig,
-  messages: TextMessage[],
+  messages: ProviderMessage[],
   tools: unknown[],
 ): Record<string, unknown> {
   const body: Record<string, unknown> = {
     model: config.model,
-    input: messages.map((message) => ({
-      role: message.role,
-      content: [{ type: "input_text", text: message.content }],
-    })),
+    input: messages.flatMap(toResponsesInput),
     stream: true,
   }
   if (request.maxOutputTokens !== undefined) body.max_output_tokens = request.maxOutputTokens
@@ -114,28 +114,43 @@ function buildResponsesBody(
   if (continuation?.providerConversationId) body.conversation = continuation.providerConversationId
   return body
 }
-
-function toTextMessage(message: HarnessModelRequest["messages"][number], config: OpenAiCompatibleConfig): TextMessage {
-  if (message.role === "tool") throw new AgentModelError({
-    code: "unsupported_input",
-    message: "OpenAI-compatible adapter requires a tool call id for tool messages",
-    provider: config.provider,
-    model: config.model,
-    recoverable: true,
-  })
-  const text = message.content.map((part) => {
-    if (part.type !== "text") throw new AgentModelError({
-      code: "unsupported_input",
-      message: "OpenAI-compatible adapter supports text content only",
-      provider: config.provider,
-      model: config.model,
-      recoverable: true,
-    })
-    return part.text
-  }).join("")
-  return { role: message.role, content: text }
+function toProviderMessages(message: HarnessModelRequest["messages"][number], config: OpenAiCompatibleConfig): ProviderMessage[] {
+  const text = message.content.filter((part) => part.type === "text").map((part) => part.text).join("")
+  const toolUses = message.content.filter((part): part is Extract<typeof part, { type: "tool_use" }> => part.type === "tool_use")
+  const toolResults = message.content.filter((part): part is Extract<typeof part, { type: "tool_result" }> => part.type === "tool_result")
+  if (message.role === "tool") {
+    if (toolResults.length === 0) throw unsupportedInput("OpenAI-compatible tool messages require tool_result blocks", config)
+    return toolResults.map((part) => ({ role: "tool", tool_call_id: part.toolUseId, content: part.content }))
+  }
+  if (toolUses.length > 0) {
+    if (message.role !== "assistant" || toolResults.length > 0) throw unsupportedInput("Tool calls are only valid in assistant messages", config)
+    return [{
+      role: "assistant",
+      content: text || null,
+      tool_calls: toolUses.map((part) => ({
+        id: part.id,
+        type: "function" as const,
+        function: { name: part.name, arguments: jsonArguments(part.input) },
+      })),
+    }]
+  }
+  if (toolResults.length > 0 || message.role === "assistant" && !text) throw unsupportedInput("OpenAI-compatible messages contain unsupported content", config)
+  if (message.role === "system" || message.role === "user" || message.role === "assistant") return [{ role: message.role, content: text }]
+  throw unsupportedInput("OpenAI-compatible messages contain unsupported content", config)
 }
-
+function toResponsesInput(message: ProviderMessage): Array<Record<string, unknown>> {
+  if (message.role === "tool") return [{ type: "function_call_output", call_id: message.tool_call_id, output: message.content }]
+  const items: Array<Record<string, unknown>> = []
+  if (message.content) items.push({ role: message.role, content: [{ type: "input_text", text: message.content }] })
+  if (message.role === "assistant" && message.tool_calls) {
+    for (const call of message.tool_calls) items.push({ type: "function_call", call_id: call.id, name: call.function.name, arguments: call.function.arguments })
+  }
+  return items
+}
+function jsonArguments(value: unknown): string {
+  const result = JSON.stringify(value)
+  return result === undefined ? "{}" : result
+}
 function toProviderTool(tool: unknown, mode: OpenAiWireMode, config: OpenAiCompatibleConfig): unknown {
   const value = asRecord(tool, "OpenAI-compatible tool")
   if (value.type === "function") {

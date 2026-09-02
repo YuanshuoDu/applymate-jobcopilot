@@ -21,6 +21,16 @@ describe('provider-neutral model protocol', () => {
     })).toBe(true)
   })
 
+  it('accepts correlated assistant tool-use and tool-result messages', () => {
+    expect(validate(ModelRequestSchema, {
+      ...request,
+      messages: [
+        { role: 'assistant', content: [{ type: 'tool_use', id: 'call-1', name: 'jobs.search', input: { query: 'Dublin' } }] },
+        { role: 'tool', content: [{ type: 'tool_result', toolUseId: 'call-1', content: '{"jobs":2}' }] },
+      ],
+    })).toBe(true)
+  })
+
   it('rejects empty model messages and unsupported finish reasons', () => {
     expect(validate(ModelRequestSchema, { ...request, messages: [] })).toBe(false)
     expect(validate(ModelResponseSchema, {
