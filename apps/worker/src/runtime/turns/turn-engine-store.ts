@@ -57,7 +57,7 @@ export function createPgTurnEngineStore(pool: TurnEnginePool): TurnEngineStore {
           `UPDATE "agent_steps" AS step
            SET "status" = $1, "finishReason" = $2, "errorCode" = $3,
                "inputTokens" = $4, "outputTokens" = $5, "estimatedCostUsd" = $6,
-               "completedAt" = CASE WHEN $1 IN ('completed', 'failed', 'waiting_for_tool', 'waiting_for_approval', 'waiting_for_user') THEN $7 ELSE NULL END
+               "completedAt" = CASE WHEN $1 IN ('completed', 'failed', 'interrupted', 'waiting_for_tool', 'waiting_for_approval', 'waiting_for_user') THEN $7 ELSE NULL END
            FROM "agent_turns" AS turn
            WHERE step."id" = $8 AND step."sessionId" = $9 AND step."turnId" = $10
              AND turn."id" = step."turnId" AND turn."sessionId" = step."sessionId"

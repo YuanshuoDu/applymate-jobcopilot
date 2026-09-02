@@ -10,7 +10,7 @@ export function turnErrorCode(error: unknown): string {
   return "turn_execution_failed"
 }
 
-export function makeStepUpdate(lease: TurnLease, stepId: string, output: ModelStepResult | null, status: "completed" | "failed" | "waiting_for_tool" | "waiting_for_approval" | "waiting_for_user", now: Date, errorCode: string | null = null) {
+export function makeStepUpdate(lease: TurnLease, stepId: string, output: ModelStepResult | null, status: "completed" | "failed" | "interrupted" | "waiting_for_tool" | "waiting_for_approval" | "waiting_for_user", now: Date, errorCode: string | null = null) {
   return {
     lease, stepId, status, finishReason: output?.finishReason ?? null, errorCode,
     inputTokens: output?.usage?.inputTokens ?? 0, outputTokens: output?.usage?.outputTokens ?? 0,

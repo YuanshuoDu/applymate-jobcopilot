@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from "vitest"
 import type { ModelAdapter, ModelStreamEvent } from "@jobcopilot/agent-model"
 
 import type { StepContext, StepContextSnapshot } from "../context/step-context-builder.js"
+import { RootAbortController } from "../interrupt/registry.js"
 import { TurnLeaseError } from "./lease.js"
 import { createToolRouterExecutor, TurnEngine } from "./turn-engine.js"
 import { toRepositoryJson, type TurnEngineOptions, type TurnEngineStore } from "./turn-engine-types.js"
@@ -105,6 +106,22 @@ describe("TurnEngine", () => {
     const fixture = baseOptions({ signal: controller.signal, executeTool: async ({ call }) => { controller.abort(); return { id: call.id, toolName: call.toolName, toolVersion: "1", status: "completed" as const, output: {}, errorCode: null } } })
     await expect(new TurnEngine(fixture.options).run()).rejects.toBeInstanceOf(TurnLeaseError)
     expect(fixture.fake.events.some((event) => event.type === "turn.completed")).toBe(false)
+  })
+
+  it("returns interrupted for a root Stop and does not start another step", async () => {
+    const root = new RootAbortController({ userId: lease.userId, sessionId: lease.sessionId, turnId: lease.turnId })
+    const fixture = baseOptions({
+      signal: root.signal,
+      executeTool: async ({ call }) => {
+        root.stop("user_stop")
+        return { id: call.id, toolName: call.toolName, toolVersion: "1", status: "completed" as const, output: {}, errorCode: null }
+      },
+    })
+    await expect(new TurnEngine(fixture.options).run()).resolves.toMatchObject({ status: "interrupted", stepCount: 1, toolCallCount: 0, errorCode: "interrupt_requested" })
+    expect(fixture.requests).toHaveLength(1)
+    expect(fixture.fake.steps[0].status).toBe("interrupted")
+    expect(fixture.fake.events.filter((event) => event.type === "turn.completed")).toHaveLength(0)
+    expect(fixture.fake.events.filter((event) => event.type === "turn.interrupted")).toHaveLength(1)
   })
 
   it("fails closed when a stop response has no verifiable final", async () => {

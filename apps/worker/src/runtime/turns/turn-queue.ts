@@ -26,6 +26,8 @@ import {
   turnJobId,
   type TurnDispatchQueue,
 } from "./recovery-scanner.js"
+import { linkAbortSignals } from "../interrupt/bridge.js"
+import { signalWasInterrupted, type RootAbortControllerRegistry } from "../interrupt/registry.js"
 
 export const TURN_QUEUE_NAME = "agent-turns"
 
@@ -58,6 +60,8 @@ export interface RunTurnJobOptions {
   pool: LeasePool
   execute: TurnExecutor
   active?: TurnExecutionRegistry
+  /** Optional process-local root shared with TurnCancelService. */
+  interrupts?: RootAbortControllerRegistry
   leaseMs?: number
   heartbeatMs?: number
   now?: () => Date
@@ -109,18 +113,31 @@ export async function runTurnJob(
     expire: (current, now) => expireTurnLease(options.pool, current, now),
   })
   const active = options.active ?? new TurnExecutionRegistry()
-  active.add({ lease, abort: () => heartbeat.abort("Turn interrupted by Worker shutdown") })
+  const root = options.interrupts?.getOrCreate({ userId: lease.userId, sessionId: lease.sessionId, turnId: lease.turnId })
+  const linked = root ? linkAbortSignals([heartbeat.signal, root.signal]) : { signal: heartbeat.signal, dispose: () => undefined }
+  active.add({
+    lease,
+    abort: async () => {
+      root?.stop("worker_shutdown")
+      await heartbeat.abort("Turn interrupted by Worker shutdown")
+    },
+  })
   heartbeat.start()
 
   try {
     const result = await Promise.race([
-      options.execute({ lease, signal: heartbeat.signal }),
+      options.execute({ lease, signal: linked.signal }),
       heartbeat.lost.then((error) => { throw error }),
     ])
     const released = await releaseTurnLease(options.pool, heartbeat.currentLease, result.status, options.now?.() ?? new Date())
+    if (!released && root?.stopped) return { status: "interrupted", summary: "Turn stopped by a persisted interrupt" }
     if (!released) throw new TurnLeaseError("lease_lost", "Turn lease was fenced before completion")
     return result
   } catch (error: unknown) {
+    if (root?.stopped || signalWasInterrupted(linked.signal)) {
+      await releaseTurnLease(options.pool, heartbeat.currentLease, "interrupted", options.now?.() ?? new Date()).catch(() => undefined)
+      return { status: "interrupted", summary: "Turn stopped by a persisted interrupt" }
+    }
     const decision = classifyTurnFailure(error, job.attemptsMade, TURN_MAX_ATTEMPTS)
     if (decision.disposition === "skip") return { status: "skipped", reasonCode: decision.reasonCode }
     if (decision.disposition === "retry") {
@@ -135,6 +152,8 @@ export async function runTurnJob(
     await releaseTurnLease(options.pool, heartbeat.currentLease, "failed", options.now?.() ?? new Date()).catch(() => undefined)
     return { status: "dead_lettered", reasonCode: decision.reasonCode }
   } finally {
+    linked.dispose()
+    if (root) options.interrupts?.release(root.target)
     heartbeat.stop()
     active.remove(lease.turnId)
   }
@@ -154,6 +173,7 @@ export function createTurnQueue(options: {
   pool: LeasePool
   execute: TurnExecutor
   queue?: TurnQueueLike
+  interrupts?: RootAbortControllerRegistry
   leaseMs?: number
   heartbeatMs?: number
 }): { queue: TurnQueueLike; worker: Worker<TurnJobPayload>; active: TurnExecutionRegistry; close: () => Promise<void> } {
@@ -165,6 +185,7 @@ export function createTurnQueue(options: {
       pool: options.pool,
       execute: options.execute,
       active,
+      interrupts: options.interrupts,
       leaseMs: options.leaseMs,
       heartbeatMs: options.heartbeatMs,
     }),
