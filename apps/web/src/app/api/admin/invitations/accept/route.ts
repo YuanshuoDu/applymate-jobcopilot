@@ -7,6 +7,8 @@ import { isAdminHost, isLocalHost } from '@/lib/host-routing'
 import { normalizeEmail } from '@/lib/auth-identifiers'
 import { isCurrentAuthVersion } from '@/lib/auth-version'
 
+class InvitationStateConflict extends Error {}
+
 export async function POST(request: NextRequest) {
   if (!isAdminHost(request.nextUrl.hostname) && !isLocalHost(request.nextUrl.hostname)) {
     return NextResponse.json({ error: 'Administrator API is only available on the administrator host' }, { status: 404, headers: { 'Cache-Control': 'no-store' } })
@@ -28,10 +30,17 @@ export async function POST(request: NextRequest) {
   if (normalizeEmail(invitation.email) !== email) return NextResponse.json({ error: 'The signed-in account does not match the invited email', code: 'INVITATION_EMAIL_MISMATCH' }, { status: 403 })
   const membership = await db.adminMembership.findUnique({ where: { userId }, select: { id: true } })
   if (membership) return NextResponse.json({ error: 'This account already has administrator access' }, { status: 409 })
-  await db.$transaction(async (tx) => {
-    await tx.adminMembership.create({ data: { userId, roleId: invitation.roleId } })
-    await tx.adminInvitation.updateMany({ where: { id: invitation.id, status: 'pending' }, data: { status: 'accepted', acceptedAt: new Date() } })
-  })
+  try {
+    await db.$transaction(async (tx) => {
+      const acceptedAt = new Date()
+      const consumed = await tx.adminInvitation.updateMany({ where: { id: invitation.id, status: 'pending', expiresAt: { gt: acceptedAt } }, data: { status: 'accepted', acceptedAt } })
+      if (consumed.count !== 1) throw new InvitationStateConflict()
+      await tx.adminMembership.create({ data: { userId, roleId: invitation.roleId } })
+    })
+  } catch (error) {
+    if (error instanceof InvitationStateConflict) return NextResponse.json({ error: 'Invitation is invalid or expired', code: 'INVITATION_INVALID' }, { status: 400 })
+    throw error
+  }
   await writeAdminAudit({ requestId: request.headers.get('x-request-id') ?? crypto.randomUUID(), actorUserId: userId, action: 'admin_invitation.accepted', targetType: 'admin_member', tenantUserId: userId, outcome: 'success', after: { invitationId: invitation.id } })
   return NextResponse.json({ accepted: true }, { headers: { 'Cache-Control': 'no-store' } })
 }

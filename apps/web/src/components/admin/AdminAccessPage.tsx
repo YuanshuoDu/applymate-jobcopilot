@@ -2,6 +2,7 @@
 
 import { KeyRound, ShieldCheck } from 'lucide-react'
 import { useEffect, useState, type FormEvent } from 'react'
+import { AdminPendingInvitations, type PendingAdminInvitation } from './AdminPendingInvitations'
 import { useAdminPrompt } from './AdminPromptDialog'
 import { adminMutationHeaders } from '@/lib/admin/client'
 import { useI18n } from '@/lib/i18n'
@@ -9,7 +10,6 @@ import { useI18n } from '@/lib/i18n'
 type Member = { id: string; status: string; mfaLevel: string; sessionVersion: number; grantedAt: string; user: { name: string | null; email: string }; role: { key: string; name: string } }
 type Role = { id: string; key: string; name: string; permissions: string[]; system: boolean }
 type Review = { id: string; userId: string; status: string; mfaLevel: string; role: { key: string; name: string }; user: { name: string | null; email: string }; review: { id: string | null; status: string; reviewedAt: string | null; notes: string | null } }
-type Invitation = { id: string; email: string; status: string; expiresAt: string; createdAt: string; role: { key: string; name: string } }
 type Credential = { id: string; deviceName: string | null; deviceType: string | null; createdAt: string; lastUsedAt: string | null }
 
 export function AdminAccessPage({ canRevoke, canManage, canManageRoles = false, canReview = false, canManageWebAuthn = false }: { canRevoke: boolean; canManage: boolean; canManageRoles?: boolean; canReview?: boolean; canManageWebAuthn?: boolean }) {
@@ -28,7 +28,7 @@ export function AdminAccessPage({ canRevoke, canManage, canManageRoles = false, 
   const [reviewStatus, setReviewStatus] = useState('approved')
   const [reviewReason, setReviewReason] = useState('')
   const [reviewNotes, setReviewNotes] = useState('')
-  const [invitations, setInvitations] = useState<Invitation[]>([])
+  const [invitations, setInvitations] = useState<PendingAdminInvitation[]>([])
   const [inviteUrl, setInviteUrl] = useState('')
   const [credentialMemberState, setCredentialMember] = useState<Member | null>(null)
   const credentialMember = credentialMemberState as Member
@@ -50,7 +50,7 @@ export function AdminAccessPage({ canRevoke, canManage, canManageRoles = false, 
     setRoles(rolePayload?.roles ?? [])
     setAvailablePermissions(rolePayload?.permissions ?? [])
     if (invitationResponse) {
-      const invitationPayload = await invitationResponse.json().catch(() => null) as { invitations?: Invitation[] } | null
+      const invitationPayload = await invitationResponse.json().catch(() => null) as { invitations?: PendingAdminInvitation[] } | null
       setInvitations(invitationPayload?.invitations ?? [])
     }
     if (reviewResponse) {
@@ -123,6 +123,15 @@ export function AdminAccessPage({ canRevoke, canManage, canManageRoles = false, 
     if (response.ok) { setInviteUrl(payload?.inviteUrl ?? ''); setNewEmail(''); setNewRole(''); await load() }
   }
 
+  async function revokeInvitation(invitation: PendingAdminInvitation) {
+    const reason = await request({ title: t('access.revokeInvitationTitle'), label: t('access.auditReason'), kind: 'reason', description: t('access.revokeInvitationDescription'), submitLabel: t('access.revokeInvitation') })
+    if (!reason) return
+    const response = await fetch(`/api/admin/v1/access/invitations/${encodeURIComponent(invitation.id)}/revoke`, { method: 'POST', headers: adminMutationHeaders(), body: JSON.stringify({ reason }) })
+    const payload = await response.json().catch(() => null) as { error?: string } | null
+    setNotice(response.ok ? t('access.invitationRevoked') : payload?.error ?? t('access.revokeInvitationFailed'))
+    if (response.ok) await load()
+  }
+
   async function copyInviteUrl() {
     if (!inviteUrl) return
     try {
@@ -164,7 +173,7 @@ export function AdminAccessPage({ canRevoke, canManage, canManageRoles = false, 
           <span className="admin-action-group"><button className="admin-primary-button" type="submit">{t('access.grant')}</button><button className="admin-secondary" type="button" onClick={() => void inviteMember()}>{t('access.invite')}</button></span>
         </form>}
         {inviteUrl && <section className="admin-detail-history"><h2>{t('access.invitationLink')}</h2><div className="admin-inline-actions"><input aria-label={t('access.invitationLink')} readOnly value={inviteUrl} onFocus={event => event.currentTarget.select()} /><button className="admin-secondary" type="button" onClick={() => void copyInviteUrl()}>{t('common.copy')}</button></div></section>}
-        {canManage && invitations.length > 0 && <section className="admin-detail-history"><h2>{t('access.pendingInvitations')}</h2><div className="admin-table-wrap"><table className="admin-table"><thead><tr><th>{t('access.email')}</th><th>{t('access.role')}</th><th>{t('access.expires')}</th></tr></thead><tbody>{invitations.map(invitation => <tr key={invitation.id}><td>{invitation.email}</td><td>{invitation.role.name}</td><td>{new Date(invitation.expiresAt).toLocaleString()}</td></tr>)}</tbody></table></div></section>}
+        {canManage && <AdminPendingInvitations invitations={invitations} onRevoke={invitation => void revokeInvitation(invitation)} />}
         <div className="admin-table-wrap"><table className="admin-table"><thead><tr><th>{t('access.member')}</th><th>{t('access.role')}</th><th>{t('access.status')}</th><th>MFA</th><th>{t('access.session')}</th><th>{t('access.granted')}</th><th aria-label={t('access.actions')} /></tr></thead><tbody>{items.length === 0 ? <tr><td colSpan={7}>{t('access.noMembers')}</td></tr> : items.map(member => <tr key={member.id}><td>{member.user.name ?? t('access.unnamed')} · {member.user.email}</td><td>{canManage ? <select aria-label={`${t('access.role')} ${member.user.email}`} value={member.role.key} onChange={event => void update(member, event.target.value, member.status)}>{roles.map(role => <option key={role.key} value={role.key}>{role.name}</option>)}</select> : member.role.name}</td><td>{canManage ? <select aria-label={`${t('access.status')} ${member.user.email}`} value={member.status} onChange={event => void update(member, member.role.key, event.target.value)}><option value="active">{t('access.active')}</option><option value="suspended">{t('access.suspended')}</option><option value="revoked">{t('access.revoked')}</option></select> : statusLabel(member.status)}</td><td>{member.mfaLevel}</td><td>v{member.sessionVersion}</td><td>{new Date(member.grantedAt).toLocaleString()}</td><td>{canManageWebAuthn && <button className="admin-row-action" type="button" title={t('access.manageKeys')} onClick={() => void loadCredentials(member)}><KeyRound size={15} /></button>}{canRevoke && member.status === 'active' && <button className="admin-row-action" type="button" title={t('access.revokeSessions')} onClick={() => void revoke(member)}><KeyRound size={15} /></button>}</td></tr>)}</tbody></table></div>
         {canReview && <section className="admin-detail-history access-review-section"><div><h2>{t('access.reviewTitle')}</h2><p>{t('access.reviewDescription')}</p></div><div className="admin-table-wrap"><table className="admin-table"><thead><tr><th>{t('access.member')}</th><th>{t('access.role')}</th><th>{t('access.review')}</th><th>{t('access.action')}</th></tr></thead><tbody>{reviews.map(review => <tr key={review.id}><td>{review.user.name ?? t('access.unnamed')} · {review.user.email}</td><td>{review.role.name}</td><td>{reviewStatusLabel(review.review.status)}</td><td><button className="admin-row-action" type="button" onClick={() => setReviewId(review.id)}>{t('access.review')}</button></td></tr>)}</tbody></table></div>{reviewId && <form className="admin-filter-panel" onSubmit={event => void submitReview(event)}><label>{t('access.decision')}<select value={reviewStatus} onChange={event => setReviewStatus(event.target.value)}><option value="approved">{t('access.approve')}</option><option value="exception">{t('access.exception')}</option><option value="revoked">{t('access.revokeAccess')}</option></select></label><label>{t('access.reason')}<textarea required minLength={10} maxLength={500} value={reviewReason} onChange={event => setReviewReason(event.target.value)} /></label><label>{t('access.notes')}<textarea maxLength={2000} value={reviewNotes} onChange={event => setReviewNotes(event.target.value)} /></label><button className="admin-primary-button" type="submit" disabled={reviewReason.trim().length < 10}>{t('access.recordReview')}</button></form>}</section>}
         {canManageRoles && <section className="admin-role-matrix"><h2>{t('access.permissionMatrix')}</h2>{roles.map(role => <article key={role.id}><strong>{role.name}</strong><small>{role.system ? t('access.systemRole') : t('access.customRole')} · {role.permissions.length} {t('access.permission')}</small><span>{role.permissions.join(' · ')}</span></article>)}</section>}

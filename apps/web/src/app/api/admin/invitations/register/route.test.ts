@@ -3,6 +3,7 @@ import { NextRequest } from 'next/server'
 
 const mocks = vi.hoisted(() => ({
   invitationFindUnique: vi.fn(),
+  invitationUpdateMany: vi.fn(),
   userFindMany: vi.fn(),
   userCreate: vi.fn(),
   auditCreate: vi.fn(),
@@ -40,10 +41,11 @@ describe('POST /api/admin/invitations/register', () => {
     mocks.requestId.mockReturnValue('req-1')
     mocks.auditData.mockImplementation((value: unknown) => value)
     mocks.invitationFindUnique.mockResolvedValue({ id: 'inv-1', email: 'new@example.com', status: 'pending', expiresAt: new Date(Date.now() + 60_000) })
+    mocks.invitationUpdateMany.mockResolvedValue({ count: 1 })
     mocks.userFindMany.mockResolvedValue([])
     mocks.hash.mockResolvedValue('password-hash')
     mocks.userCreate.mockResolvedValue({ id: 'user-1', email: 'new@example.com', name: 'New Admin' })
-    mocks.transaction.mockImplementation(async (callback: (tx: unknown) => Promise<unknown>) => callback({ user: { create: mocks.userCreate }, adminAuditLog: { create: mocks.auditCreate } }))
+    mocks.transaction.mockImplementation(async (callback: (tx: unknown) => Promise<unknown>) => callback({ user: { create: mocks.userCreate }, adminInvitation: { updateMany: mocks.invitationUpdateMany }, adminAuditLog: { create: mocks.auditCreate } }))
   })
 
   it('creates an ordinary account from a valid invitation without requiring an existing user', async () => {
@@ -71,6 +73,26 @@ describe('POST /api/admin/invitations/register', () => {
 
     expect(response.status).toBe(409)
     await expect(response.json()).resolves.toEqual({ error: 'An account already exists for this invitation email', code: 'ACCOUNT_EXISTS' })
+    expect(mocks.userCreate).not.toHaveBeenCalled()
+  })
+
+  it('rejects a revoked invitation before creating an account', async () => {
+    mocks.invitationFindUnique.mockResolvedValue({ id: 'inv-1', email: 'new@example.com', status: 'revoked', expiresAt: new Date(Date.now() + 60_000) })
+    const { POST } = await import('./route')
+    const response = await POST(request({ token: 'a'.repeat(32), email: 'new@example.com', name: 'New Admin', password: 'password-123' }))
+
+    expect(response.status).toBe(400)
+    await expect(response.json()).resolves.toEqual({ error: 'Invitation is invalid or expired' })
+    expect(mocks.userCreate).not.toHaveBeenCalled()
+  })
+
+  it('rejects when revocation wins the registration race before creating an account', async () => {
+    mocks.invitationUpdateMany.mockResolvedValue({ count: 0 })
+    const { POST } = await import('./route')
+    const response = await POST(request({ token: 'a'.repeat(32), email: 'new@example.com', name: 'New Admin', password: 'password-123' }))
+
+    expect(response.status).toBe(400)
+    await expect(response.json()).resolves.toEqual({ error: 'Invitation is invalid or expired' })
     expect(mocks.userCreate).not.toHaveBeenCalled()
   })
 
