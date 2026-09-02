@@ -143,7 +143,7 @@ describe("run session recorder", () => {
     expect(db.subAgentTask.update).toHaveBeenCalledWith({
       where: { id: "task_1" },
       data: expect.objectContaining({
-        status: "passed",
+        status: "completed",
         result: { role: "scout", summary: "42 jobs queued", count: 42, durationMs: 1200 },
         confidence: 1,
         failureReason: null,

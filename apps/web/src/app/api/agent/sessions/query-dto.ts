@@ -1,4 +1,5 @@
 import { schemaVersion } from "@jobcopilot/agent-protocol"
+import { projectLegacySubAgentTask } from "@/lib/agent/session/subagent-task-compat"
 
 import { toIso, type CursorRow } from "./query-helpers"
 
@@ -170,13 +171,14 @@ export interface TaskQueryRow extends CursorRow {
 }
 
 export function taskDto(row: TaskQueryRow) {
+  const legacy = projectLegacySubAgentTask(row)
   return {
     schemaVersion,
     id: row.id,
     sessionId: row.sessionId,
     role: row.role,
     taskType: row.taskType,
-    status: row.status,
+    status: legacy.status,
     goal: redactString(row.goal),
     confidence: row.confidence,
     failureReason: row.failureReason ? redactString(row.failureReason) : null,

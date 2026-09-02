@@ -91,7 +91,7 @@ describe("runSubAgentTask", () => {
     expect(db.subAgentTask.update).toHaveBeenCalledWith({
       where: { id: "task_1" },
       data: expect.objectContaining({
-        status: "passed",
+        status: "completed",
         result: { status: "active", evidence: ["apply button visible"] },
         confidence: 0.94,
         failureReason: null,

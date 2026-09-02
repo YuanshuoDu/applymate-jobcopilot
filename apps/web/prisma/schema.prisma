@@ -1651,6 +1651,7 @@ model AgentSession {
 
   user             User                   @relation(fields: [userId], references: [id], onDelete: Cascade)
   tasks            SubAgentTask[]
+  mailboxMessages  AgentMailboxMessage[]
   transcript       AgentTranscriptEvent[]
   approvals        AgentApproval[]
   actionReservations AgentActionReservation[]
@@ -1707,10 +1708,12 @@ model AgentTurn {
   items   AgentItem[]
   events  AgentEvent[]
   approvals AgentApproval[]
+  subAgentTasks SubAgentTask[]
 
   @@index([sessionId, createdAt])
   @@index([userId, status, updatedAt(sort: Desc)])
   @@index([status, leaseExpiresAt])
+  @@unique([id, sessionId])
   @@map("agent_turns")
 }
 
@@ -1848,6 +1851,11 @@ model AgentOutbox {
 model SubAgentTask {
   id                   String   @id @default(cuid())
   sessionId            String
+  turnId               String?
+  rootTaskId           String?
+  parentTaskId         String?
+  path                 String   @default("/")
+  depth                Int      @default(0)
   role                 String
   taskType             String
   status               String
@@ -1861,14 +1869,57 @@ model SubAgentTask {
   confidence           Float?
   failureReason        String?  @db.Text
   qualityGateResult    Json?
+  contextSnapshotId    String?
+  modelProfileSnapshot Json     @default("{}")
+  toolPolicySnapshot   Json     @default("{}")
+  budgetSnapshot       Json     @default("{}")
+  attemptCount         Int      @default(0)
+  maxAttempts          Int      @default(1)
+  leaseOwner           String?
+  leaseExpiresAt       DateTime?
+  startedAt            DateTime?
+  completedAt          DateTime?
+  interruptRequestedAt DateTime?
+  closedAt             DateTime?
+  outputArtifactIds    Json     @default("[]")
   createdAt            DateTime @default(now())
   updatedAt            DateTime @updatedAt
 
   session AgentSession @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+  turn    AgentTurn? @relation(fields: [turnId, sessionId], references: [id, sessionId], onDelete: Cascade)
+  parentTask SubAgentTask? @relation("SubAgentTaskTree", fields: [parentTaskId, sessionId], references: [id, sessionId], onDelete: Cascade)
+  childTasks SubAgentTask[] @relation("SubAgentTaskTree")
+  rootTask SubAgentTask? @relation("SubAgentTaskRoot", fields: [rootTaskId, sessionId], references: [id, sessionId], onDelete: Cascade)
+  rootDescendants SubAgentTask[] @relation("SubAgentTaskRoot")
 
   @@index([sessionId, status])
   @@index([sessionId, role])
+  @@index([sessionId, path])
+  @@index([sessionId, rootTaskId, path])
+  @@index([sessionId, parentTaskId, createdAt])
+  @@unique([id, sessionId])
   @@map("sub_agent_tasks")
+}
+
+model AgentMailboxMessage {
+  id             String   @id @default(cuid())
+  sessionId      String
+  turnId         String
+  fromTaskId     String?
+  toTaskId       String?
+  kind           String
+  payload        Json
+  idempotencyKey String
+  deliveredAt    DateTime?
+  consumedAt     DateTime?
+  createdAt      DateTime @default(now())
+
+  session AgentSession @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+
+  @@unique([sessionId, idempotencyKey])
+  @@index([toTaskId, consumedAt, createdAt])
+  @@index([sessionId, turnId, consumedAt, createdAt])
+  @@map("agent_mailbox_messages")
 }
 
 model AgentTranscriptEvent {
