@@ -12,6 +12,12 @@ function migrationEnvironment(env = process.env) {
   return directUrl ? { ...env, DATABASE_URL: directUrl } : env
 }
 
+function shouldBootstrapStagingAdmin(env = process.env) {
+  return env.VERCEL_ENV === 'preview'
+    && env.STAGING_ADMIN_BOOTSTRAP === 'true'
+    && Boolean(env.INITIAL_SUPER_ADMIN_EMAIL?.trim())
+}
+
 function waitForRetry() {
   const signal = new Int32Array(new SharedArrayBuffer(4))
   Atomics.wait(signal, 0, 0, 10_000)
@@ -48,8 +54,25 @@ function main(env = process.env) {
 
   if (!run(['--filter', '@jobcopilot/web', 'exec', 'prisma', 'generate'], env)) process.exit(1)
   if (!run(['--filter', '@jobcopilot/web', 'build'], env)) process.exit(1)
+
+  // Bootstrap the first staging admin only when explicitly enabled for a Preview build.
+  // The seed script enforces that the target user already exists and applies the
+  // production safety guard; temporary bootstrap variables must be removed afterward.
+  if (shouldBootstrapStagingAdmin(env)) {
+    const seedArgs = [
+      '--filter',
+      '@jobcopilot/web',
+      'exec',
+      'ts-node',
+      '--project',
+      'prisma/tsconfig.seed.json',
+      'prisma/seed-admin-roles.ts',
+    ]
+    if (!run(seedArgs, env)) process.exit(1)
+    console.log('Staging admin bootstrap completed.')
+  }
 }
 
-module.exports = { migrationEnvironment }
+module.exports = { migrationEnvironment, shouldBootstrapStagingAdmin }
 
 if (require.main === module) main()
