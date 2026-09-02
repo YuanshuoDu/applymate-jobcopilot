@@ -149,4 +149,28 @@ describe("TurnEngine", () => {
     await expect(new TurnEngine(fixture.options).run()).resolves.toMatchObject({ status: "failed", errorCode: "invalid_output" })
     expect(executeTool).not.toHaveBeenCalled()
   })
+
+  it("stops at a reserved step budget and emits a typed budget event", async () => {
+    const fixture = baseOptions({ budget: { maxSteps: 1 } })
+    const result = await new TurnEngine(fixture.options).run()
+    expect(result).toMatchObject({ status: "failed", errorCode: "budget_exhausted", finalItemId: expect.any(String) })
+    expect(fixture.fake.events.some((event) => event.type === "turn.budget_exhausted")).toBe(true)
+    expect(fixture.fake.items.filter((item) => item.type === "agent_message" && item.phase === "final_answer")).toHaveLength(1)
+  })
+
+  it("stops repeated no-op tool results with a reason-coded event", async () => {
+    let modelCall = 0
+    const fixture = baseOptions({
+      model: { id: "loop", profile: profile(), async *stream() {
+        modelCall += 1
+        yield { type: "tool_call_completed", callId: `loop-${modelCall}`, name: "jobs.search", arguments: { location: "Dublin" } }
+        yield { type: "completed", finishReason: "tool_calls" }
+      } },
+      maxSteps: 10,
+      executeTool: async ({ call }) => ({ id: call.id, toolName: call.toolName, toolVersion: call.toolVersion, status: "completed" as const, output: { same: true }, errorCode: null }),
+    })
+    const result = await new TurnEngine(fixture.options).run()
+    expect(result).toMatchObject({ status: "failed", errorCode: "no_progress" })
+    expect(fixture.fake.events.some((event) => event.type === "turn.no_progress")).toBe(true)
+  })
 })
