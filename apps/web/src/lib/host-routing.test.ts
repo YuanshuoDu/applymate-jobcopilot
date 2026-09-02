@@ -20,6 +20,7 @@ describe('host routing', () => {
     expect(isAdminAuthApiPath('/api/auth/callback/google')).toBe(false)
     expect(isAuthPath('/register')).toBe(false)
     expect(isAdminApiPath('/api/admin/v1/users')).toBe(true)
+    expect(isAdminApiPath('/api/admin/invitations/register')).toBe(true)
     expect(isAdminApiPath('/api/admin/invitations/accept')).toBe(true)
     expect(isAdminApiPath('/api/users')).toBe(false)
   })

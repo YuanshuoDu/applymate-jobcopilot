@@ -67,7 +67,7 @@ export async function middleware(req: NextRequest) {
 
   // Route handlers own admin authorization so callers receive API-appropriate
   // 401/403 responses. The middleware supplies defense-in-depth headers only.
-  if (pathname.startsWith('/api/admin/v1')) {
+  if (isAdminApiPath(pathname)) {
     return applyAdminSecurityHeaders(NextResponse.next())
   }
 

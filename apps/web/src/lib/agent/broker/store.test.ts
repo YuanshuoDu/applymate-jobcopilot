@@ -108,7 +108,7 @@ describe("Agent wait broker", () => {
     fake.item.content = { waitKind: "approval", approvalId: "approval_1", toolCallId: "call_approval", scopeHash: "scope_hash" }
     const result = await decideApproval(fake.db, {
       waitId: "approval_1", sessionId: "session_1", userId: "user_1", expectedTurnId: "turn_1", expectedRevision: 5,
-      clientMessageId: "approval_1_decision", decision: "approved",
+      clientMessageId: "approval_1_decision", decision: "approved", now: new Date("2026-09-01T00:00:00.000Z"),
     })
 
     expect(result).toMatchObject({ status: "approved", turnId: "turn_1", toolCallId: "call_approval" })
