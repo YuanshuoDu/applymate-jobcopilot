@@ -15,15 +15,17 @@ export async function POST(request: NextRequest) {
   const userId = session?.user?.id
   const body = await request.json().catch(() => null) as { token?: string } | null
   const token = typeof body?.token === 'string' ? body.token.trim() : ''
-  if (!userId || token.length < 20) return NextResponse.json({ error: 'Sign in with the invited email before accepting this invitation' }, { status: 401 })
+  if (!userId) return NextResponse.json({ error: 'Sign in with the invited email before accepting this invitation', code: 'SESSION_REQUIRED' }, { status: 401 })
+  if (token.length < 20) return NextResponse.json({ error: 'Invitation is invalid or expired', code: 'INVITATION_INVALID' }, { status: 400 })
   const user = await db.user.findUnique({ where: { id: userId }, select: { email: true, accountStatus: true, authVersion: true } })
   if (!user) return NextResponse.json({ error: 'Not authenticated' }, { status: 401 })
   if (user.accountStatus !== 'active') return NextResponse.json({ error: 'Account unavailable' }, { status: 403 })
-  if (!isCurrentAuthVersion(session?.user?.authVersion, user.authVersion)) return NextResponse.json({ error: 'Session expired' }, { status: 401 })
+  if (!isCurrentAuthVersion(session?.user?.authVersion, user.authVersion)) return NextResponse.json({ error: 'Session expired', code: 'SESSION_EXPIRED' }, { status: 401 })
   const email = normalizeEmail(user.email)
   const tokenHash = createHash('sha256').update(token).digest('hex')
   const invitation = await db.adminInvitation.findUnique({ where: { tokenHash }, select: { id: true, email: true, roleId: true, expiresAt: true, status: true } })
-  if (!invitation || normalizeEmail(invitation.email) !== email || invitation.status !== 'pending' || invitation.expiresAt <= new Date()) return NextResponse.json({ error: 'Invitation is invalid or expired' }, { status: 400 })
+  if (!invitation || invitation.status !== 'pending' || invitation.expiresAt <= new Date()) return NextResponse.json({ error: 'Invitation is invalid or expired', code: 'INVITATION_INVALID' }, { status: 400 })
+  if (normalizeEmail(invitation.email) !== email) return NextResponse.json({ error: 'The signed-in account does not match the invited email', code: 'INVITATION_EMAIL_MISMATCH' }, { status: 403 })
   const membership = await db.adminMembership.findUnique({ where: { userId }, select: { id: true } })
   if (membership) return NextResponse.json({ error: 'This account already has administrator access' }, { status: 409 })
   await db.$transaction(async (tx) => {

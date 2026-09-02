@@ -1,7 +1,7 @@
 'use client'
 
 import { useEffect, useState, type FormEvent } from 'react'
-import { signIn, useSession } from 'next-auth/react'
+import { signIn, signOut, useSession } from 'next-auth/react'
 import Link from 'next/link'
 import { useI18n } from '@/lib/i18n'
 
@@ -15,16 +15,16 @@ const inputStyle = {
 }
 
 export default function AdminInvitationPage() {
-  const { status } = useSession()
+  const { data: session, status } = useSession()
   const { lang } = useI18n()
   const token = typeof window === 'undefined' ? '' : new URLSearchParams(window.location.search).get('token') ?? ''
   const copy = lang === 'zh'
     ? {
-        checking: '正在检查邀请……', signIn: '请使用受邀邮箱登录以接受邀请。', accepted: '邀请已接受。现在可以打开管理员控制台。', failed: '无法接受邀请。',
+        checking: '正在检查登录状态……', accepted: '邀请已接受。现在可以打开管理员控制台。', failed: '无法接受邀请。', invalid: '邀请链接无效或已过期。', emailMismatch: '当前登录账号与受邀邮箱不一致。', sessionStale: '当前登录状态已失效，请切换到受邀账号后重试。', switchHint: '请先退出当前账号，再使用受邀邮箱登录，然后重新打开此邀请链接。', switchAccount: '退出并切换账号',
         signInLink: '已有账号？登录', console: '打开管理员控制台', title: 'ApplyMate 管理员邀请', createTitle: '创建受邀账号', email: '受邀邮箱', name: '姓名', password: '密码', confirm: '确认密码', create: '创建账号并接受邀请', creating: '正在创建账号……', mismatch: '两次输入的密码不一致。', createFailed: '无法创建账号。', exists: '该邮箱已有账号，请先登录后再接受邀请。', security: '创建后请使用你自己的设备注册 WebAuthn 安全密钥。',
       }
     : {
-        checking: 'Checking invitation…', signIn: 'Sign in with the invited email to accept this invitation.', accepted: 'Invitation accepted. You can now open the administrator console.', failed: 'Invitation could not be accepted.',
+        checking: 'Checking sign-in status…', accepted: 'Invitation accepted. You can now open the administrator console.', failed: 'Invitation could not be accepted.', invalid: 'This invitation link is invalid or expired.', emailMismatch: 'The currently signed-in account does not match the invited email.', sessionStale: 'The current sign-in session is no longer valid. Switch to the invited account and try again.', switchHint: 'Sign out of the current account, sign in with the invited email, and then reopen this invitation link.', switchAccount: 'Sign out and switch account',
         signInLink: 'Already have an account? Sign in', console: 'Open admin console', title: 'ApplyMate administrator invitation', createTitle: 'Create your invited account', email: 'Invited email', name: 'Name', password: 'Password', confirm: 'Confirm password', create: 'Create account and accept invitation', creating: 'Creating account…', mismatch: 'The passwords do not match.', createFailed: 'Unable to create the account.', exists: 'An account already exists for this email. Sign in first, then accept the invitation.', security: 'After creating the account, register your own WebAuthn security key.',
       }
   const [message, setMessage] = useState(copy.checking)
@@ -37,19 +37,26 @@ export default function AdminInvitationPage() {
 
   useEffect(() => {
     if (status === 'loading') return
-    if (status !== 'authenticated') {
-      setMessage(copy.signIn)
-      return
-    }
+    if (status !== 'authenticated') return
     void fetch('/api/admin/invitations/accept', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ token }),
     }).then(async response => {
-      const payload = await response.json().catch(() => null) as { error?: string } | null
-      setMessage(response.ok ? copy.accepted : lang === 'zh' ? copy.failed : payload?.error ?? copy.failed)
+      const payload = await response.json().catch(() => null) as { error?: string; code?: string } | null
+      if (response.ok) {
+        setMessage(copy.accepted)
+      } else if (payload?.code === 'INVITATION_EMAIL_MISMATCH') {
+        setMessage(copy.emailMismatch)
+      } else if (payload?.code === 'SESSION_REQUIRED' || payload?.code === 'SESSION_EXPIRED' || response.status === 401) {
+        setMessage(copy.sessionStale)
+      } else if (payload?.code === 'INVITATION_INVALID') {
+        setMessage(copy.invalid)
+      } else {
+        setMessage(copy.failed)
+      }
     }).catch(() => setMessage(copy.failed))
-  }, [status, token, copy.accepted, copy.failed, copy.signIn, lang])
+  }, [status, token, copy.accepted, copy.emailMismatch, copy.failed, copy.invalid, copy.sessionStale])
 
   async function createInvitedAccount(event: FormEvent<HTMLFormElement>) {
     event.preventDefault()
@@ -81,10 +88,19 @@ export default function AdminInvitationPage() {
   return (
     <main style={{ maxWidth: 520, margin: '10vh auto', padding: 24, fontFamily: 'system-ui', color: '#0F172A' }}>
       <h1>{copy.title}</h1>
-      {status === 'authenticated' ? (
+      {status === 'loading' ? (
+        <p>{copy.checking}</p>
+      ) : status === 'authenticated' ? (
         <>
           <p>{message}</p>
           {message === copy.accepted && <Link href="/admin">{copy.console}</Link>}
+          {(message === copy.emailMismatch || message === copy.sessionStale) && (
+            <>
+              <p style={{ color: '#475569', fontSize: 13 }}>{copy.switchHint}</p>
+              {session?.user?.email && <p style={{ color: '#475569', fontSize: 13 }}>Current account: {session.user.email}</p>}
+              <button type="button" onClick={() => void signOut({ callbackUrl })} style={{ padding: '10px 12px', border: '1px solid #CBD5E1', borderRadius: 8, background: '#fff', cursor: 'pointer' }}>{copy.switchAccount}</button>
+            </>
+          )}
         </>
       ) : (
         <>
