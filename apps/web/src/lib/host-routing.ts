@@ -25,7 +25,11 @@ export function isAdminHost(hostname: string): boolean {
 export function isAdminPath(pathname: string): boolean {
   return pathname === '/admin'
     || pathname.startsWith('/admin/')
-    || pathname === '/invite/admin'
+    || isAdminInvitationPath(pathname)
+}
+
+export function isAdminInvitationPath(pathname: string): boolean {
+  return pathname === '/invite/admin'
     || pathname.startsWith('/invite/admin/')
 }
 
