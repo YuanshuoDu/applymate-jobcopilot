@@ -12,6 +12,10 @@ describe("candidate final verifier", () => {
     expect(verifyCandidateFinal({ goal: "Find a role", candidate: { text: "Done", finishReason: "stop", evidenceRefs: ["job-1"] }, evidence: [{ id: "job-1" }], businessChecks: [{ name: "approval", ok: false, message: "Approval is required" }] })).toMatchObject({ ok: false, code: "business_precondition_failed" })
   })
 
+  it("rejects an evidence reference that is not present in the verified evidence set", () => {
+    expect(verifyCandidateFinal({ goal: "Find a role", candidate: { text: "Done", finishReason: "stop", evidenceRefs: ["unknown"] } })).toMatchObject({ ok: false, code: "evidence_missing" })
+  })
+
   it("accepts only a stopped response with verified evidence", () => {
     expect(verifyCandidateFinal({ goal: "Find a role", candidate: { text: "Done", finishReason: "stop", evidenceRefs: ["job-1"] }, evidence: [{ id: "job-1" }] })).toMatchObject({ ok: true, evidenceRefs: ["job-1"] })
   })

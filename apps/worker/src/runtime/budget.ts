@@ -87,11 +87,20 @@ export function createTurnBudgetLedger(limits: TurnBudgetLimits, idFactory = (()
     reserved.toolCalls += count
   }
 
-  function reserveModel(estimate: Partial<TurnUsage> = {}): BudgetReservation {
+  function remaining(metric: "inputTokens" | "outputTokens" | "estimatedCostUsd"): number {
+    const limit = metric === "inputTokens" ? limits.maxInputTokens : metric === "outputTokens" ? limits.maxOutputTokens : limits.maxCostUsd
+    const current = used[metric] + reserved[metric]
+    return limit === undefined ? 0 : Math.max(0, limit - current)
+  }
+
+  function reserveModel(estimate?: Partial<TurnUsage>): BudgetReservation {
     const reservation: TurnUsage = {
-      inputTokens: nonNegative(estimate.inputTokens ?? 0, "input token reservation"),
-      outputTokens: nonNegative(estimate.outputTokens ?? 0, "output token reservation"),
-      estimatedCostUsd: nonNegative(estimate.estimatedCostUsd ?? 0, "cost reservation"),
+      // A caller-provided estimate is preferred. Without one, reserve the
+      // remaining allowance so work cannot silently consume capacity before
+      // the provider reports actual usage.
+      inputTokens: nonNegative(estimate?.inputTokens ?? (estimate === undefined ? remaining("inputTokens") : 0), "input token reservation"),
+      outputTokens: nonNegative(estimate?.outputTokens ?? (estimate === undefined ? remaining("outputTokens") : 0), "output token reservation"),
+      estimatedCostUsd: nonNegative(estimate?.estimatedCostUsd ?? (estimate === undefined ? remaining("estimatedCostUsd") : 0), "cost reservation"),
     }
     check("input_tokens", used.inputTokens + reserved.inputTokens + reservation.inputTokens, used.inputTokens + reserved.inputTokens, limits.maxInputTokens)
     check("output_tokens", used.outputTokens + reserved.outputTokens + reservation.outputTokens, used.outputTokens + reserved.outputTokens, limits.maxOutputTokens)
@@ -119,12 +128,17 @@ export function createTurnBudgetLedger(limits: TurnBudgetLimits, idFactory = (()
           estimatedCostUsd: nonNegative(actual.estimatedCostUsd, "estimated cost"),
         }
         const next = add(used, normalized)
-        check("input_tokens", next.inputTokens, used.inputTokens, limits.maxInputTokens)
-        check("output_tokens", next.outputTokens, used.outputTokens, limits.maxOutputTokens)
-        check("cost_usd", next.estimatedCostUsd, used.estimatedCostUsd, limits.maxCostUsd)
+        const exceeded = limits.maxInputTokens !== undefined && next.inputTokens > limits.maxInputTokens
+          ? { metric: "input_tokens" as const, limit: limits.maxInputTokens, attempted: next.inputTokens, used: used.inputTokens }
+          : limits.maxOutputTokens !== undefined && next.outputTokens > limits.maxOutputTokens
+            ? { metric: "output_tokens" as const, limit: limits.maxOutputTokens, attempted: next.outputTokens, used: used.outputTokens }
+            : limits.maxCostUsd !== undefined && next.estimatedCostUsd > limits.maxCostUsd
+              ? { metric: "cost_usd" as const, limit: limits.maxCostUsd, attempted: next.estimatedCostUsd, used: used.estimatedCostUsd }
+              : undefined
         used.inputTokens = next.inputTokens
         used.outputTokens = next.outputTokens
         used.estimatedCostUsd = next.estimatedCostUsd
+        if (exceeded) throw new BudgetExceededError(exceeded.metric, exceeded.limit, exceeded.attempted, exceeded.used)
       },
     }
   }

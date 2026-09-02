@@ -20,6 +20,8 @@ import {
   type TurnEngineToolExecutor,
 } from "./turn-engine-types.js"
 
+const DEFAULT_MAX_STEPS = 32
+
 export class TurnEngine {
   private readonly signal: AbortSignal
   private readonly now: () => Date
@@ -33,7 +35,7 @@ export class TurnEngine {
 
   async run(): Promise<TurnEngineResult> {
     const writer = new TurnEventWriter(this.options)
-    const budget = createTurnBudgetLedger({ ...this.options.budget, maxSteps: this.options.budget?.maxSteps ?? this.options.maxSteps ?? 24 })
+    const budget = createTurnBudgetLedger({ ...this.options.budget, maxSteps: this.options.budget?.maxSteps ?? this.options.maxSteps ?? DEFAULT_MAX_STEPS })
     const progress = createProgressDetector(this.options.noProgressRepeatLimit ?? 2)
     let snapshot = this.options.snapshot
     let inputThroughSequence = 0n
@@ -62,6 +64,7 @@ export class TurnEngine {
         })
         lastStep = step
         await writer.append("step.started", step.id, null, { stepId: step.id, ordinal }, `step-started:${step.id}`)
+        let stepOutput: ModelStepResult | null = null
         try {
           const context = await this.options.contextBuilder.build({
             scope: this.options.scope,
@@ -89,6 +92,7 @@ export class TurnEngine {
           })
           const reservation = budget.reserveModel()
           const output = await runModelStep(this.options.model, request, this.options.validateToolArguments)
+          stepOutput = output
           reservation.settle(output.usage ?? { inputTokens: 0, outputTokens: 0, estimatedCostUsd: 0 })
           continuation = output.continuation ?? undefined
           await writer.append("model.usage", step.id, null, {
@@ -101,12 +105,16 @@ export class TurnEngine {
             progress.observe({ snapshot, toolCalls: output.toolCalls })
             budget.reserveToolCalls(output.toolCalls.length)
             if (output.text) await this.publishCommentary(writer, step, output.text)
-            const toolOutcome = await this.executeTools(writer, step, output, snapshot, seenCallIds)
+            let toolOutcome: { wait: TurnEngineResult | null; snapshot: TurnEngineOptions["snapshot"] }
+            try {
+              toolOutcome = await this.executeTools(writer, step, output, snapshot, seenCallIds)
+            } finally {
+              budget.accountToolCalls(output.toolCalls.length)
+              toolCalls += output.toolCalls.length
+            }
             snapshot = toolOutcome.snapshot
             const wait = toolOutcome.wait
-            budget.accountToolCalls(output.toolCalls.length)
-            toolCalls += output.toolCalls.length
-          await this.options.store.updateStep({ ...makeStepUpdate(this.options.lease, step.id, output, wait?.status === "waiting_for_approval" || wait?.status === "waiting_for_user" ? wait.status : "completed", this.now()), errorCode: wait?.errorCode ?? null })
+            await this.options.store.updateStep({ ...makeStepUpdate(this.options.lease, step.id, output, wait?.status === "waiting_for_approval" || wait?.status === "waiting_for_user" ? wait.status : "completed", this.now()), errorCode: wait?.errorCode ?? null })
             await writer.append("step.completed", step.id, null, { stepId: step.id, status: wait?.status ?? "completed", toolCallCount: output.toolCalls.length }, `step-completed:${step.id}`)
             if (wait) return { ...wait, stepCount: steps, toolCallCount: toolCalls }
             continue
@@ -130,7 +138,7 @@ export class TurnEngine {
           await writer.append("turn.completed", step.id, finalItem.id, { turnId: this.options.lease.turnId, finalItemId: finalItem.id, usage: finalResponse.usage }, "turn-completed")
           return { status: "completed", stepCount: steps, toolCallCount: toolCalls, finalItemId: finalItem.id }
         } catch (error: unknown) {
-          await this.options.store.updateStep(makeStepUpdate(this.options.lease, step.id, null, "failed", this.now(), turnErrorCode(error))).catch(() => undefined)
+          await this.options.store.updateStep(makeStepUpdate(this.options.lease, step.id, stepOutput, "failed", this.now(), turnErrorCode(error))).catch(() => undefined)
           await writer.append("step.completed", step.id, null, { stepId: step.id, status: "failed", errorCode: turnErrorCode(error) }, `step-failed:${step.id}`).catch(() => undefined)
           throw error
         }

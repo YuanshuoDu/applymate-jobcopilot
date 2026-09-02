@@ -20,4 +20,12 @@ describe("Turn budget ledger", () => {
     const reservation = ledger.reserveModel({ estimatedCostUsd: 0.1 })
     expect(() => reservation.settle({ inputTokens: 0, outputTokens: 0, estimatedCostUsd: 0.2 })).toThrowError(BudgetExceededError)
   })
+
+  it("reserves remaining provider capacity when no estimate is available", () => {
+    const ledger = createTurnBudgetLedger({ maxInputTokens: 100, maxOutputTokens: 50, maxCostUsd: 1 })
+    const reservation = ledger.reserveModel()
+    expect(ledger.snapshot().reserved).toMatchObject({ inputTokens: 100, outputTokens: 50, estimatedCostUsd: 1 })
+    reservation.settle({ inputTokens: 8, outputTokens: 12, estimatedCostUsd: 0.2 })
+    expect(ledger.snapshot()).toMatchObject({ used: { inputTokens: 8, outputTokens: 12, estimatedCostUsd: 0.2 }, reserved: { inputTokens: 0, outputTokens: 0, estimatedCostUsd: 0 } })
+  })
 })

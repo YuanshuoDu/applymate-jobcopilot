@@ -54,12 +54,13 @@ export function verifyCandidateFinal(input: VerifyCandidateInput): FinalVerifica
   }
   const expected = uniqueSorted(input.expectedEvidence ?? [])
   const available = new Map(evidence.map((entry) => [entry.id, entry.status ?? "verified"]))
-  const missing = expected.filter((id) => available.get(id) !== "verified")
+  const requiredRefs = uniqueSorted([...expected, ...evidenceRefs])
+  const missing = requiredRefs.filter((id) => !available.has(id) || available.get(id) === "missing")
   if (missing.length > 0 || (expected.length === 0 && evidenceRefs.length === 0)) {
     const blocker = missing.length > 0 ? `Missing evidence: ${missing.join(", ")}` : "No verifiable evidence is attached to the candidate final"
     return rejected("evidence_missing", blocker, "Attach verified business or tool evidence before claiming completion", evidenceRefs, businessChecks)
   }
-  const conflicting = evidenceRefs.filter((id) => available.get(id) === "conflicting" || available.get(id) === "missing")
+  const conflicting = requiredRefs.filter((id) => available.get(id) === "conflicting")
   if (conflicting.length > 0) return rejected("evidence_conflict", `Conflicting evidence: ${conflicting.join(", ")}`, "Resolve conflicting evidence before claiming completion", evidenceRefs, businessChecks)
   const failed = businessChecks.filter((check) => !check.ok)
   if (failed.length > 0) return rejected("business_precondition_failed", failed.map((check) => check.message ?? check.name).join("; "), "Complete the business prerequisites before claiming completion", evidenceRefs, businessChecks)
