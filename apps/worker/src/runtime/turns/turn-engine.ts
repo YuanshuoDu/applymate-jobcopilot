@@ -1,11 +1,16 @@
 import { randomUUID } from "node:crypto"
 import type { ModelContinuation } from "@jobcopilot/agent-model"
-import type { ToolCallRequest, ToolExecutionResult, ToolRouterContext } from "../tools/types.js"
 import { TurnLeaseError, type TurnLease } from "./lease.js"
+import { signalWasInterrupted } from "../interrupt/registry.js"
 import { buildModelRequest } from "./turn-engine-messages.js"
 import { runModelStep, type ModelStepResult } from "./turn-engine-model.js"
 import { TurnEventWriter, itemContent, type TurnItemHandle } from "./turn-engine-events.js"
 import { findToolObservation, stableJson } from "./turn-engine-replay.js"
+import { BudgetExceededError, createTurnBudgetLedger } from "../budget.js"
+import { finalizeTurn, serializeFinalResponse, type FinalResponse } from "../finalizer.js"
+import { NoProgressError, createProgressDetector } from "../progress.js"
+import { snapshotEvidence, verifyCandidateFinal } from "../verifier.js"
+import { isTurnLeaseLoss, makeStepUpdate, turnErrorCode } from "./turn-engine-helpers.js"
 import {
   toRepositoryJson,
   TurnEngineError,
@@ -31,6 +36,8 @@ export class TurnEngine {
 
   async run(): Promise<TurnEngineResult> {
     const writer = new TurnEventWriter(this.options)
+    const budget = createTurnBudgetLedger({ ...this.options.budget, maxSteps: this.options.budget?.maxSteps ?? this.options.maxSteps ?? DEFAULT_MAX_STEPS })
+    const progress = createProgressDetector(this.options.noProgressRepeatLimit ?? 2)
     let snapshot = this.options.snapshot
     let inputThroughSequence = 0n
     let consumedInputIds: readonly string[] = []
@@ -38,10 +45,12 @@ export class TurnEngine {
     let toolCalls = 0
     let continuation: ModelContinuation | undefined
     const seenCallIds = new Set<string>()
+    let lastStep: TurnEngineStep | null = null
     try {
       await writer.append("turn.started", this.options.lease.turnId, null, { goal: this.options.goal }, "turn-started")
-      for (let ordinal = 0; ordinal < (this.options.maxSteps ?? DEFAULT_MAX_STEPS); ordinal += 1) {
+      for (let ordinal = 0; ; ordinal += 1) {
         this.assertAlive()
+        budget.reserveStep()
         steps += 1
         const stepId = this.makeId(`step:${ordinal}`)
         const step = await this.options.store.startStep({
@@ -54,7 +63,9 @@ export class TurnEngine {
           modelProfileSnapshot: toRepositoryJson(this.options.model.profile),
           now: this.now(),
         })
+        lastStep = step
         await writer.append("step.started", step.id, null, { stepId: step.id, ordinal }, `step-started:${step.id}`)
+        let stepOutput: ModelStepResult | null = null
         try {
           const context = await this.options.contextBuilder.build({
             scope: this.options.scope,
@@ -80,7 +91,10 @@ export class TurnEngine {
             signal: this.signal,
             continuation,
           })
+          const reservation = budget.reserveModel()
           const output = await runModelStep(this.options.model, request, this.options.validateToolArguments)
+          stepOutput = output
+          reservation.settle(output.usage ?? { inputTokens: 0, outputTokens: 0, estimatedCostUsd: 0 })
           continuation = output.continuation ?? undefined
           await writer.append("model.usage", step.id, null, {
             provider: output.provider,
@@ -89,36 +103,65 @@ export class TurnEngine {
           }, `model-usage:${step.id}`)
           await this.publishReasoning(writer, step, output.reasoningSummary)
           if (output.toolCalls.length > 0) {
+            progress.observe({ snapshot, toolCalls: output.toolCalls })
+            budget.reserveToolCalls(output.toolCalls.length)
             if (output.text) await this.publishCommentary(writer, step, output.text)
-            const toolOutcome = await this.executeTools(writer, step, output, snapshot, seenCallIds)
+            let toolOutcome: { wait: TurnEngineResult | null; snapshot: TurnEngineOptions["snapshot"] }
+            try {
+              toolOutcome = await this.executeTools(writer, step, output, snapshot, seenCallIds)
+              toolCalls += output.toolCalls.length
+            } finally {
+              budget.accountToolCalls(output.toolCalls.length)
+            }
             snapshot = toolOutcome.snapshot
             const wait = toolOutcome.wait
-            toolCalls += output.toolCalls.length
-            await this.options.store.updateStep({ ...stepUpdate(this.options.lease, step.id, output, wait?.status === "waiting_for_approval" || wait?.status === "waiting_for_user" ? wait.status : "completed", this.now()), errorCode: wait?.errorCode ?? null })
+            this.assertAlive()
+            await this.options.store.updateStep({ ...makeStepUpdate(this.options.lease, step.id, output, wait?.status === "waiting_for_approval" || wait?.status === "waiting_for_user" ? wait.status : "completed", this.now()), errorCode: wait?.errorCode ?? null })
             await writer.append("step.completed", step.id, null, { stepId: step.id, status: wait?.status ?? "completed", toolCallCount: output.toolCalls.length }, `step-completed:${step.id}`)
             if (wait) return { ...wait, stepCount: steps, toolCallCount: toolCalls }
             continue
           }
 
-          await this.options.store.updateStep(stepUpdate(this.options.lease, step.id, output, "completed", this.now()))
+          await this.options.store.updateStep(makeStepUpdate(this.options.lease, step.id, output, "completed", this.now()))
           await writer.append("step.completed", step.id, null, { stepId: step.id, status: "completed" }, `step-completed:${step.id}`)
-          const finalText = verifyFinal(output)
-          const finalItem = await this.publishFinal(writer, step, finalText)
-          await this.options.store.recordFinalResponse({ lease: this.options.lease, response: finalText, now: this.now() })
-          await writer.append("turn.completed", step.id, finalItem.id, { turnId: this.options.lease.turnId, finalItemId: finalItem.id }, "turn-completed")
+          const verification = verifyCandidateFinal({
+            goal: this.options.goal,
+            candidate: { text: output.text, finishReason: output.finishReason },
+            evidence: snapshotEvidence(snapshot), expectedEvidence: this.options.expectedEvidence,
+            businessChecks: this.options.businessChecks,
+          })
+          if (!verification.ok) {
+            await writer.append("final.rejected", step.id, null, { code: verification.code, blocker: verification.blocker, feedback: verification.feedback }, `final-rejected:${step.id}`)
+            throw new TurnEngineError(verification.code, verification.blocker)
+          }
+          const finalResponse = finalizeTurn({ goal: this.options.goal, verification, terminalReason: "goal_satisfied", response: output.text, usage: budget.usage(), stepCount: steps, toolCallCount: toolCalls })
+          const finalItem = await this.publishFinal(writer, step, finalResponse)
+          await this.options.store.recordFinalResponse({ lease: this.options.lease, response: serializeFinalResponse(finalResponse), now: this.now() })
+          await writer.append("turn.completed", step.id, finalItem.id, { turnId: this.options.lease.turnId, finalItemId: finalItem.id, usage: finalResponse.usage }, "turn-completed")
           return { status: "completed", stepCount: steps, toolCallCount: toolCalls, finalItemId: finalItem.id }
         } catch (error: unknown) {
-          await this.options.store.updateStep(stepUpdate(this.options.lease, step.id, null, "failed", this.now(), errorCode(error))).catch(() => undefined)
-          await writer.append("step.completed", step.id, null, { stepId: step.id, status: "failed", errorCode: errorCode(error) }, `step-failed:${step.id}`).catch(() => undefined)
+          const status = signalWasInterrupted(this.signal) ? "interrupted" : "failed"
+          await this.options.store.updateStep(makeStepUpdate(this.options.lease, step.id, stepOutput, status, this.now(), turnErrorCode(error))).catch(() => undefined)
+          await writer.append("step.completed", step.id, null, { stepId: step.id, status, errorCode: turnErrorCode(error) }, `step-failed:${step.id}`).catch(() => undefined)
           throw error
         }
       }
-      throw new TurnEngineError("step_limit", `Turn exceeded the ${this.options.maxSteps ?? DEFAULT_MAX_STEPS} step limit`)
     } catch (error: unknown) {
-      if (this.isLeaseLoss(error)) throw error instanceof TurnLeaseError ? error : new TurnLeaseError("lease_lost", "Turn execution lease was lost")
-      const code = errorCode(error)
-      await writer.append("turn.failed", this.options.lease.turnId, null, { turnId: this.options.lease.turnId, errorCode: code }, `turn-failed:${code}`).catch(() => undefined)
-      return { status: "failed", stepCount: steps, toolCallCount: toolCalls, errorCode: code }
+      if (signalWasInterrupted(this.signal)) {
+        const code = turnErrorCode(error)
+        await writer.append("turn.interrupted", this.options.lease.turnId, null, { turnId: this.options.lease.turnId, errorCode: code }, "turn-interrupted").catch(() => undefined)
+        return { status: "interrupted", stepCount: steps, toolCallCount: toolCalls, errorCode: code }
+      }
+      if (isTurnLeaseLoss(error, this.signal)) throw error instanceof TurnLeaseError ? error : new TurnLeaseError("lease_lost", "Turn execution lease was lost")
+      const code = turnErrorCode(error)
+      if (error instanceof NoProgressError) await writer.append("turn.no_progress", this.options.lease.turnId, null, { reasonCode: error.reasonCode, signature: error.observation.signature, stateFingerprint: error.observation.stateFingerprint }, "turn-no-progress").catch(() => undefined)
+      if (error instanceof BudgetExceededError) await writer.append("turn.budget_exhausted", this.options.lease.turnId, null, { reasonCode: error.code, metric: error.metric, limit: error.limit, attempted: error.attempted, used: error.used }, "turn-budget-exhausted").catch(() => undefined)
+      const terminalReason = error instanceof BudgetExceededError ? "budget_exhausted" : error instanceof NoProgressError ? "no_progress" : code === "final_unverified" || code.startsWith("evidence_") || code === "business_precondition_failed" ? "final_unverified" : "unrecoverable_error"
+      const finalResponse = finalizeTurn({ goal: this.options.goal, terminalReason, blocker: error instanceof Error ? error.message : code, usage: budget.usage(), stepCount: steps, toolCallCount: toolCalls, next: ["Review the blocker and resume the Turn"] })
+      const finalItem = await this.publishFinal(writer, lastStep, finalResponse).catch(() => null)
+      if (finalItem) await this.options.store.recordFinalResponse({ lease: this.options.lease, response: serializeFinalResponse(finalResponse), now: this.now() }).catch(() => undefined)
+      await writer.append("turn.failed", this.options.lease.turnId, finalItem?.id ?? null, { turnId: this.options.lease.turnId, errorCode: code, finalItemId: finalItem?.id ?? null, final: finalResponse }, `turn-failed:${code}`).catch(() => undefined)
+      return { status: "failed", stepCount: steps, toolCallCount: toolCalls, errorCode: code, ...(finalItem ? { finalItemId: finalItem.id } : {}) }
     }
   }
 
@@ -141,6 +184,7 @@ export class TurnEngine {
         continue
       }
       const result = await this.executeTool(writer, step, call)
+      this.assertAlive()
       if (result.status === "failed" && result.errorCode === "policy_requires_approval") return { wait: { status: "waiting_for_approval", stepCount: 0, toolCallCount: 0, errorCode: result.errorCode }, snapshot }
       if (result.status === "failed" && result.errorCode === "policy_requires_user_input") return { wait: { status: "waiting_for_user", stepCount: 0, toolCallCount: 0, errorCode: result.errorCode }, snapshot }
       snapshot = {
@@ -160,7 +204,8 @@ export class TurnEngine {
     let result
     try {
       result = await this.options.executeTool({ scope: this.options.scope, sessionId: this.options.lease.sessionId, turnId: this.options.lease.turnId, stepId: step.id, signal: this.signal, capabilities: this.options.capabilities, call: { id: call.id, toolName: call.name, toolVersion: "1", input: call.arguments } })
-    } catch {
+    } catch (error: unknown) {
+      if (signalWasInterrupted(this.signal)) throw error
       result = { id: call.id, toolName: call.name, toolVersion: "1", status: "failed" as const, errorCode: "tool_execution_failed" }
     }
     await writer.completeItem(callItem, { toolCallId: call.id, toolName: call.name, status: result.status, errorCode: result.errorCode }, this.now(), `tool-call-completed:${call.id}`)
@@ -183,62 +228,23 @@ export class TurnEngine {
     await writer.completeItem(item, itemContent(text), this.now(), "commentary-completed")
   }
 
-  private async publishFinal(writer: TurnEventWriter, step: TurnEngineStep, text: string): Promise<TurnItemHandle> {
-    const item = await writer.startItem({ id: this.makeId(`item:final:${step.id}`), stepId: step.id, type: "agent_message", phase: "final_answer", content: itemContent(""), now: this.now() })
-    await writer.completeItem(item, itemContent(text), this.now(), "final-completed")
+  private async publishFinal(writer: TurnEventWriter, step: TurnEngineStep | null, response: FinalResponse): Promise<TurnItemHandle> {
+    const stepId = step?.id ?? null
+    const item = await writer.startItem({ id: this.makeId(`item:final:${stepId ?? "turn"}`), stepId, type: "agent_message", phase: "final_answer", content: itemContent(""), now: this.now() })
+    await writer.completeItem(item, { text: response.response, final: toRepositoryJson(response) }, this.now(), "final-completed")
     return item
   }
 
   private assertAlive(): void {
+    if (signalWasInterrupted(this.signal)) {
+      throw this.signal.reason instanceof Error ? this.signal.reason : new Error("Turn execution was interrupted")
+    }
     if (this.signal.aborted) throw new TurnLeaseError("lease_lost", "Turn execution stopped after lease loss")
   }
 
-  private isLeaseLoss(error: unknown): boolean {
-    return error instanceof TurnLeaseError || this.signal.aborted
-  }
-
 }
-
-function verifyFinal(output: ModelStepResult): string {
-  if (output.finishReason !== "stop" || output.text.trim().length === 0) throw new TurnEngineError("final_unverified", "Model did not produce a verifiable final answer")
-  return output.text
-}
-
-function errorCode(error: unknown): string {
-  if (error instanceof TurnEngineError) return error.code
-  if (error instanceof TurnLeaseError) return error.code
-  if (error && typeof error === "object" && "code" in error && typeof error.code === "string") return error.code
-  return "turn_execution_failed"
-}
-
-function stepUpdate(lease: TurnLease, stepId: string, output: ModelStepResult | null, status: "completed" | "failed" | "waiting_for_tool" | "waiting_for_approval" | "waiting_for_user", now: Date, errorCodeValue: string | null = null) {
-  return {
-    lease,
-    stepId,
-    status,
-    finishReason: output?.finishReason ?? null,
-    errorCode: errorCodeValue,
-    inputTokens: output?.usage?.inputTokens ?? 0,
-    outputTokens: output?.usage?.outputTokens ?? 0,
-    estimatedCostUsd: output?.usage?.estimatedCostUsd ?? 0,
-    now,
-  }
-}
-
 export function createTurnEngineExecutor(base: Omit<TurnEngineOptions, "lease" | "signal">) {
   return (input: { lease: TurnLease; signal: AbortSignal }): Promise<TurnEngineResult> => new TurnEngine({ ...base, ...input }).run()
 }
 
-export function createToolRouterExecutor(router: {
-  execute(context: ToolRouterContext, request: ToolCallRequest): Promise<ToolExecutionResult>
-}): TurnEngineToolExecutor {
-  return (input) => router.execute({
-    scope: input.scope,
-    sessionId: input.sessionId,
-    turnId: input.turnId,
-    stepId: input.stepId,
-    signal: input.signal,
-    capabilities: input.capabilities,
-    actorRole: "orchestrator",
-  }, input.call)
-}
+export { createToolRouterExecutor } from "./turn-engine-helpers.js"

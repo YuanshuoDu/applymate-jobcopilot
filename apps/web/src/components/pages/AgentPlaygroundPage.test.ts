@@ -41,4 +41,16 @@ describe('Agent workspace responsive layout', () => {
     expect(source).toContain("method: 'PATCH'")
     expect(source).toContain('onSessionsLoaded={restoreLastSession}')
   })
+
+  it('uses the URL session as the single page identity and provides the active Turn composer', () => {
+    expect(source).toContain('useAgentSessionUrl')
+    expect(source).toContain('useAgentSessionState(sessionId)')
+    expect(source).toContain('<AgentTurnComposerProvider value={turnComposer}>')
+    expect(source).toContain('resumeSessionId={sessionId}')
+    expect(source).not.toContain('liveSessionId')
+  })
+
+  it('does not stop an active Turn from page cleanup', () => {
+    expect(source).not.toContain('beforeunload')
+  })
 })

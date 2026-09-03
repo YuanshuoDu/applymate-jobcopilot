@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from "vitest"
 import type { ModelAdapter, ModelStreamEvent } from "@jobcopilot/agent-model"
 
 import type { StepContext, StepContextSnapshot } from "../context/step-context-builder.js"
+import { RootAbortController } from "../interrupt/registry.js"
 import { TurnLeaseError } from "./lease.js"
 import { createToolRouterExecutor, TurnEngine } from "./turn-engine.js"
 import { toRepositoryJson, type TurnEngineOptions, type TurnEngineStore } from "./turn-engine-types.js"
@@ -107,6 +108,22 @@ describe("TurnEngine", () => {
     expect(fixture.fake.events.some((event) => event.type === "turn.completed")).toBe(false)
   })
 
+  it("returns interrupted for a root Stop and does not start another step", async () => {
+    const root = new RootAbortController({ userId: lease.userId, sessionId: lease.sessionId, turnId: lease.turnId })
+    const fixture = baseOptions({
+      signal: root.signal,
+      executeTool: async ({ call }) => {
+        root.stop("user_stop")
+        return { id: call.id, toolName: call.toolName, toolVersion: "1", status: "completed" as const, output: {}, errorCode: null }
+      },
+    })
+    await expect(new TurnEngine(fixture.options).run()).resolves.toMatchObject({ status: "interrupted", stepCount: 1, toolCallCount: 0, errorCode: "interrupt_requested" })
+    expect(fixture.requests).toHaveLength(1)
+    expect(fixture.fake.steps[0].status).toBe("interrupted")
+    expect(fixture.fake.events.filter((event) => event.type === "turn.completed")).toHaveLength(0)
+    expect(fixture.fake.events.filter((event) => event.type === "turn.interrupted")).toHaveLength(1)
+  })
+
   it("fails closed when a stop response has no verifiable final", async () => {
     const fixture = baseOptions({ maxSteps: 1, model: { id: "empty", profile: profile(), async *stream() { yield { type: "completed", finishReason: "stop" } } } })
     await expect(new TurnEngine(fixture.options).run()).resolves.toMatchObject({ status: "failed", errorCode: "final_unverified" })
@@ -148,5 +165,29 @@ describe("TurnEngine", () => {
     })
     await expect(new TurnEngine(fixture.options).run()).resolves.toMatchObject({ status: "failed", errorCode: "invalid_output" })
     expect(executeTool).not.toHaveBeenCalled()
+  })
+
+  it("stops at a reserved step budget and emits a typed budget event", async () => {
+    const fixture = baseOptions({ budget: { maxSteps: 1 } })
+    const result = await new TurnEngine(fixture.options).run()
+    expect(result).toMatchObject({ status: "failed", errorCode: "budget_exhausted", finalItemId: expect.any(String) })
+    expect(fixture.fake.events.some((event) => event.type === "turn.budget_exhausted")).toBe(true)
+    expect(fixture.fake.items.filter((item) => item.type === "agent_message" && item.phase === "final_answer")).toHaveLength(1)
+  })
+
+  it("stops repeated no-op tool results with a reason-coded event", async () => {
+    let modelCall = 0
+    const fixture = baseOptions({
+      model: { id: "loop", profile: profile(), async *stream() {
+        modelCall += 1
+        yield { type: "tool_call_completed", callId: `loop-${modelCall}`, name: "jobs.search", arguments: { location: "Dublin" } }
+        yield { type: "completed", finishReason: "tool_calls" }
+      } },
+      maxSteps: 10,
+      executeTool: async ({ call }) => ({ id: call.id, toolName: call.toolName, toolVersion: call.toolVersion, status: "completed" as const, output: { same: true }, errorCode: null }),
+    })
+    const result = await new TurnEngine(fixture.options).run()
+    expect(result).toMatchObject({ status: "failed", errorCode: "no_progress" })
+    expect(fixture.fake.events.some((event) => event.type === "turn.no_progress")).toBe(true)
   })
 })

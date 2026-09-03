@@ -91,8 +91,10 @@ export class ToolRegistry {
     }
   }
 
-  list(): PublicToolDefinition[] {
-    return [...this.definitions.values()].map(publicDefinition)
+  list(capabilities?: readonly string[]): PublicToolDefinition[] {
+    return [...this.definitions.values()]
+      .filter((definition) => !capabilities || definition.requiredCapabilities.every((capability) => capabilities.includes(capability)))
+      .map(publicDefinition)
   }
 
   private validateDefinition(definition: RuntimeToolDefinition): void {

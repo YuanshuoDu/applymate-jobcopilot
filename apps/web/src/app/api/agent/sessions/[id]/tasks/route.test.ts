@@ -41,6 +41,17 @@ describe("agent task query API", () => {
     expect(body.tasks[0]).not.toHaveProperty("context")
   })
 
+  it("projects durable completed status to the legacy passed UI status", async () => {
+    mocks.taskFindMany.mockResolvedValueOnce([{
+      id: "task_2", sessionId: "session_1", role: "scout", taskType: "job_search", status: "completed", goal: "Find EU roles",
+      confidence: 1, failureReason: null, result: { jobs: [] },
+      createdAt: new Date("2026-08-31T00:00:00Z"), updatedAt: new Date("2026-08-31T00:01:00Z"),
+    }])
+    const { GET } = await import("./route")
+    const response = await GET(request() as never, params)
+    expect((await response.json()).tasks[0].status).toBe("passed")
+  })
+
   it("uses the authenticated owner guard and supports bounded pagination", async () => {
     const { GET } = await import("./route")
     const response = await GET(request("?limit=10") as never, params)

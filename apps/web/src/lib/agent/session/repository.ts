@@ -6,6 +6,7 @@ import type {
   SubAgentTaskStatus,
   TranscriptEventType,
 } from "./types"
+import { toDurableSubAgentTaskStatus } from "./types"
 import { redactAgentEvent } from "@jobcopilot/shared"
 
 type JsonValue = unknown
@@ -18,10 +19,15 @@ interface UpdateDelegate {
   update(args: { where: { id: string }; data: Record<string, unknown> }): Promise<unknown>
 }
 
+interface UpdateManyDelegate {
+  updateMany(args: { where: Record<string, unknown>; data: Record<string, unknown> }): Promise<{ count: number }>
+}
+
 export interface AgentSessionDb {
   agentSession: CreateDelegate & UpdateDelegate
   agentTranscriptEvent: CreateDelegate
   subAgentTask: CreateDelegate & UpdateDelegate
+  agentMailboxMessage?: CreateDelegate & UpdateManyDelegate
 }
 
 export interface CreateAgentSessionInput {
@@ -45,6 +51,11 @@ export interface AppendTranscriptEventInput {
 
 export interface CreateSubAgentTaskInput {
   sessionId: string
+  turnId?: string | null
+  rootTaskId?: string | null
+  parentTaskId?: string | null
+  path?: string
+  depth?: number
   role: SubAgentRole
   taskType: string
   goal: string
@@ -53,15 +64,38 @@ export interface CreateSubAgentTaskInput {
   allowedActions: string[]
   context: JsonValue
   expectedOutputSchema: JsonValue
+  contextSnapshotId?: string | null
+  modelProfileSnapshot?: JsonValue
+  toolPolicySnapshot?: JsonValue
+  budgetSnapshot?: JsonValue
+  attemptCount?: number
+  maxAttempts?: number
 }
 
 export interface CompleteSubAgentTaskInput {
   taskId: string
-  status: Extract<SubAgentTaskStatus, "passed" | "failed" | "waiting_for_user">
+  status: Extract<SubAgentTaskStatus, "passed" | "completed" | "failed" | "waiting" | "waiting_for_user" | "interrupted" | "cancelled" | "closed">
   result?: JsonValue | null
   confidence?: number | null
   failureReason?: string | null
   qualityGateResult?: QualityGateResult | null
+}
+
+export interface CreateAgentMailboxMessageInput {
+  sessionId: string
+  turnId: string
+  fromTaskId?: string | null
+  toTaskId?: string | null
+  kind: string
+  payload: JsonValue
+  idempotencyKey: string
+}
+
+export interface ConsumeAgentMailboxMessageInput {
+  messageId: string
+  sessionId: string
+  toTaskId?: string | null
+  consumedAt?: Date
 }
 
 export interface UpdateAgentSessionInput {
@@ -119,6 +153,11 @@ export async function createSubAgentTask(db: AgentSessionDb, input: CreateSubAge
   return db.subAgentTask.create({
     data: {
       sessionId: input.sessionId,
+      turnId: input.turnId ?? null,
+      rootTaskId: input.rootTaskId ?? null,
+      parentTaskId: input.parentTaskId ?? null,
+      path: input.path ?? "/",
+      depth: input.depth ?? 0,
       role: input.role,
       taskType: input.taskType,
       status: "queued",
@@ -128,6 +167,13 @@ export async function createSubAgentTask(db: AgentSessionDb, input: CreateSubAge
       allowedActions: input.allowedActions,
       context: input.context,
       expectedOutputSchema: input.expectedOutputSchema,
+      contextSnapshotId: input.contextSnapshotId ?? null,
+      modelProfileSnapshot: input.modelProfileSnapshot ?? {},
+      toolPolicySnapshot: input.toolPolicySnapshot ?? {},
+      budgetSnapshot: input.budgetSnapshot ?? {},
+      attemptCount: input.attemptCount ?? 0,
+      maxAttempts: input.maxAttempts ?? 1,
+      outputArtifactIds: [],
     },
   })
 }
@@ -136,11 +182,44 @@ export async function completeSubAgentTask(db: AgentSessionDb, input: CompleteSu
   return db.subAgentTask.update({
     where: { id: input.taskId },
     data: {
-      status: input.status,
+      status: toDurableSubAgentTaskStatus(input.status),
       result: input.result ?? null,
       confidence: input.confidence ?? null,
       failureReason: input.failureReason ?? null,
       qualityGateResult: input.qualityGateResult ?? null,
     },
   })
+}
+
+function mailboxDelegate(db: AgentSessionDb) {
+  if (!db.agentMailboxMessage) throw new Error("Agent mailbox persistence is unavailable")
+  return db.agentMailboxMessage
+}
+
+export async function createAgentMailboxMessage(db: AgentSessionDb, input: CreateAgentMailboxMessageInput) {
+  return mailboxDelegate(db).create({
+    data: {
+      sessionId: input.sessionId,
+      turnId: input.turnId,
+      fromTaskId: input.fromTaskId ?? null,
+      toTaskId: input.toTaskId ?? null,
+      kind: input.kind,
+      payload: input.payload,
+      idempotencyKey: input.idempotencyKey,
+    },
+  })
+}
+
+/** Atomically consumes a message; only the winner of the null consumedAt race gets true. */
+export async function consumeAgentMailboxMessage(db: AgentSessionDb, input: ConsumeAgentMailboxMessageInput) {
+  const result = await mailboxDelegate(db).updateMany({
+    where: {
+      id: input.messageId,
+      sessionId: input.sessionId,
+      ...(input.toTaskId === undefined ? {} : { toTaskId: input.toTaskId }),
+      consumedAt: null,
+    },
+    data: { consumedAt: input.consumedAt ?? new Date() },
+  })
+  return result.count === 1
 }
