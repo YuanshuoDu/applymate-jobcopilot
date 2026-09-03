@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto"
+import { CanonicalJsonError, hashContent } from "@jobcopilot/shared"
 
 export type ArtifactRef = {
   readonly id: string
@@ -52,23 +52,13 @@ export class ArtifactAdapterError extends Error {
   }
 }
 
-export function canonicalArtifactJson(value: unknown): string {
-  if (value === null) return "null"
-  if (typeof value === "string" || typeof value === "boolean") return JSON.stringify(value)
-  if (typeof value === "number") {
-    if (!Number.isFinite(value)) throw new ArtifactAdapterError("invalid_artifact", "Artifact content contains a non-finite number")
-    return JSON.stringify(value)
-  }
-  if (Array.isArray(value)) return `[${value.map(canonicalArtifactJson).join(",")}]`
-  if (typeof value === "object") {
-    const entries = Object.entries(value as Record<string, unknown>).sort(([left], [right]) => left.localeCompare(right))
-    return `{${entries.map(([key, child]) => `${JSON.stringify(key)}:${canonicalArtifactJson(child)}`).join(",")}}`
-  }
-  throw new ArtifactAdapterError("invalid_artifact", "Artifact content must be JSON-compatible")
-}
-
 export function hashArtifactContent(value: unknown): string {
-  return `sha256:${createHash("sha256").update(canonicalArtifactJson(value)).digest("hex")}`
+  try {
+    return hashContent(value)
+  } catch (error: unknown) {
+    if (error instanceof CanonicalJsonError) throw new ArtifactAdapterError("invalid_artifact", error.message)
+    throw error
+  }
 }
 
 export function artifactRef(record: ArtifactRecord): ArtifactRef {

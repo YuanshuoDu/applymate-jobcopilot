@@ -36,6 +36,8 @@ export { redactAgentEvent, redactSensitiveText, redactSensitiveValue } from "./a
 export { hashAgentReceiptValue } from "./agent-receipt.js";
 export { normalizeExternalApiErrorCode, sharedExternalApiErrorCode, type ExternalApiErrorCode, type SharedExternalApiUsage, recordSharedExternalApiUsage } from "./external-api-usage.js";
 export { getAzureManagementToken, type AzureManagementTokenCredential } from "./azure-management.js";
+export { canonicalJson, CanonicalJsonError, hashContent } from "./canonical-json.js";
+export { canonicalJsonFixtures, type CanonicalJsonFixture } from "./fixtures/canonical-json-fixtures.js";
 export {
   AGENT_HARNESS_FEATURES,
   evaluateManagedFeature,

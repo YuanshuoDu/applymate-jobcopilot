@@ -7,8 +7,13 @@ import {
   validateFinding,
   type ArtifactFinding,
 } from "./artifact-adapters.js"
+import { canonicalJsonFixtures } from "@jobcopilot/shared"
 
 describe("subagent artifact adapters", () => {
+  it("matches the shared canonical hash baseline", () => {
+    for (const fixture of canonicalJsonFixtures) expect(hashArtifactContent(fixture.value)).toBe(fixture.hash)
+  })
+
   it("hashes equivalent object content deterministically and versions drafts", async () => {
     expect(hashArtifactContent({ b: 2, a: 1 })).toBe(hashArtifactContent({ a: 1, b: 2 }))
     const adapter = new InMemoryArtifactAdapter()
