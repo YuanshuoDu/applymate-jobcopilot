@@ -30,6 +30,10 @@
       "types": "./dist/safe-ai-endpoint.d.ts",
       "default": "./dist/safe-ai-endpoint.js"
     },
+    "./agent-redaction": {
+      "types": "./dist/agent-redaction.d.ts",
+      "default": "./dist/agent-redaction.js"
+    },
     "./pinned-outbound": {
       "types": "./dist/pinned-outbound.d.ts",
       "default": "./dist/pinned-outbound.js"

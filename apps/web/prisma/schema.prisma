@@ -1651,12 +1651,14 @@ model AgentSession {
 
   user             User                   @relation(fields: [userId], references: [id], onDelete: Cascade)
   tasks            SubAgentTask[]
+  mailboxMessages  AgentMailboxMessage[]
   transcript       AgentTranscriptEvent[]
   approvals        AgentApproval[]
   actionReservations AgentActionReservation[]
   applicationTasks ApplicationTask[]
   turns            AgentTurn[]
   steps            AgentStep[]
+  contextSnapshots AgentContextSnapshot[]
   inputs           AgentInput[]
   items            AgentItem[]
   events           AgentEvent[]
@@ -1707,10 +1709,13 @@ model AgentTurn {
   items   AgentItem[]
   events  AgentEvent[]
   approvals AgentApproval[]
+  subAgentTasks SubAgentTask[]
+  mailboxMessages AgentMailboxMessage[]
 
   @@index([sessionId, createdAt])
   @@index([userId, status, updatedAt(sort: Desc)])
   @@index([status, leaseExpiresAt])
+  @@unique([id, sessionId])
   @@map("agent_turns")
 }
 
@@ -1750,6 +1755,33 @@ model AgentStep {
   @@index([turnId, status, createdAt])
   @@index([providerResponseId])
   @@map("agent_steps")
+}
+
+// Immutable, source-attributed context material used to rebuild a Step after
+// a worker restart. The JSON content is checksummed by the Worker; the
+// database constraints keep its cursor and accounting columns additive.
+model AgentContextSnapshot {
+  id                String   @id @default(cuid())
+  sessionId         String
+  throughSequence   BigInt
+  version           Int
+  schemaVersion     String   @default("agent-harness.context.v1")
+  content           Json
+  summary           String   @db.Text
+  checksum          String
+  inputTokens       Int      @default(0)
+  outputTokens      Int      @default(0)
+  estimatedCostUsd  Decimal  @default(0) @db.Decimal(12, 8)
+  tokenAccounting   Json     @default("{}")
+  createdAt         DateTime @default(now())
+
+  session AgentSession @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+
+  @@unique([sessionId, version])
+  @@unique([sessionId, throughSequence])
+  @@index([sessionId, createdAt(sort: Desc)])
+  @@index([sessionId, throughSequence])
+  @@map("agent_context_snapshots")
 }
 
 model AgentInput {
@@ -1848,6 +1880,11 @@ model AgentOutbox {
 model SubAgentTask {
   id                   String   @id @default(cuid())
   sessionId            String
+  turnId               String?
+  rootTaskId           String?
+  parentTaskId         String?
+  path                 String   @default("/")
+  depth                Int      @default(0)
   role                 String
   taskType             String
   status               String
@@ -1861,14 +1898,62 @@ model SubAgentTask {
   confidence           Float?
   failureReason        String?  @db.Text
   qualityGateResult    Json?
+  contextSnapshotId    String?
+  modelProfileSnapshot Json     @default("{}")
+  toolPolicySnapshot   Json     @default("{}")
+  budgetSnapshot       Json     @default("{}")
+  attemptCount         Int      @default(0)
+  maxAttempts          Int      @default(1)
+  leaseOwner           String?
+  leaseExpiresAt       DateTime?
+  startedAt            DateTime?
+  completedAt          DateTime?
+  interruptRequestedAt DateTime?
+  closedAt             DateTime?
+  outputArtifactIds    Json     @default("[]")
   createdAt            DateTime @default(now())
   updatedAt            DateTime @updatedAt
 
   session AgentSession @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+  turn    AgentTurn? @relation(fields: [turnId, sessionId], references: [id, sessionId], onDelete: Cascade)
+  parentTask SubAgentTask? @relation("SubAgentTaskTree", fields: [parentTaskId, sessionId], references: [id, sessionId], onDelete: Cascade)
+  childTasks SubAgentTask[] @relation("SubAgentTaskTree")
+  rootTask SubAgentTask? @relation("SubAgentTaskRoot", fields: [rootTaskId, sessionId], references: [id, sessionId], onDelete: Cascade)
+  rootDescendants SubAgentTask[] @relation("SubAgentTaskRoot")
+  mailboxMessagesSent AgentMailboxMessage[] @relation("AgentMailboxFromTask")
+  mailboxMessagesReceived AgentMailboxMessage[] @relation("AgentMailboxToTask")
 
   @@index([sessionId, status])
   @@index([sessionId, role])
+  @@index([sessionId, path])
+  @@index([sessionId, rootTaskId, path])
+  @@index([sessionId, parentTaskId, createdAt])
+  @@unique([id, sessionId])
   @@map("sub_agent_tasks")
+}
+
+model AgentMailboxMessage {
+  id             String   @id @default(cuid())
+  sessionId      String
+  turnId         String
+  fromTaskId     String?
+  toTaskId       String?
+  kind           String
+  payload        Json
+  idempotencyKey String
+  deliveredAt    DateTime?
+  consumedAt     DateTime?
+  createdAt      DateTime @default(now())
+
+  session AgentSession @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+  turn AgentTurn @relation(fields: [turnId, sessionId], references: [id, sessionId], onDelete: Cascade)
+  fromTask SubAgentTask? @relation("AgentMailboxFromTask", fields: [fromTaskId, sessionId], references: [id, sessionId], onDelete: Cascade)
+  toTask SubAgentTask? @relation("AgentMailboxToTask", fields: [toTaskId, sessionId], references: [id, sessionId], onDelete: Cascade)
+
+  @@unique([sessionId, idempotencyKey])
+  @@index([toTaskId, consumedAt, createdAt])
+  @@index([sessionId, turnId, consumedAt, createdAt])
+  @@map("agent_mailbox_messages")
 }
 
 model AgentTranscriptEvent {

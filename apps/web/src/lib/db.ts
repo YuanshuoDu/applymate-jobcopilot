@@ -17,7 +17,7 @@ const tenantModels = new Set([
   'Job', 'ApplicationTask', 'ApplicationTaskEvent', 'Resume', 'ResumeVersion', 'PersonaFact',
   'PersonaEvidenceChunk', 'Activity', 'UserApiKeys', 'AgentConfig', 'AgentRole', 'ApplyResult',
   'AiBudget', 'Notification', 'GmailSyncState', 'GmailMessage', 'GmailRecommendation',
-  'AgentRunQuestion', 'AgentRun', 'AgentExecution', 'AgentSession', 'SubAgentTask',
+  'AgentRunQuestion', 'AgentRun', 'AgentExecution', 'AgentSession', 'SubAgentTask', 'AgentMailboxMessage',
   'AgentTranscriptEvent', 'AgentApproval', 'AgentAutomation', 'CustomAgentRole', 'Direction',
   'CoverLetter', 'SupportCase', 'SupportCaseMessage', 'AdminDataDeletionRequest', 'AiUsageEvent',
   'FormPattern', 'JobApiUsageEvent', 'ExternalApiUsageEvent', 'DiscoveryOptimizationEvent',

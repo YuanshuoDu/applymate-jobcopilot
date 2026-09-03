@@ -19,10 +19,14 @@ GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE
   "form_patterns", "ai_budgets", "job_api_usage_events", "discovery_optimization_events", "ai_budget_adjustments", "ai_budget_reset_requests", "ai_usage_events", "external_api_usage_events", "notifications", "gmail_sync_states",
   "gmail_messages", "gmail_recommendations", "AgentRunQuestion", "agent_runs", "agent_executions",
   "agent_sessions", "agent_turns", "agent_steps", "agent_inputs", "agent_items", "agent_events", "agent_outbox",
-  "sub_agent_tasks", "agent_transcript_events", "agent_approvals", "agent_action_reservations", "agent_automations",
+  "sub_agent_tasks", "agent_mailbox_messages", "agent_transcript_events", "agent_approvals", "agent_action_reservations", "agent_automations", "agent_context_snapshots",
   "CustomAgentRole", "Direction", "CoverLetter", "support_cases", "support_case_messages",
   "support_case_escalations", "admin_data_deletion_requests"
 TO applymate_candidate;
+
+-- Context snapshots are append-only. Parent-session retention cascades remain
+-- available, but candidate callers must not rewrite or delete snapshot rows.
+REVOKE UPDATE, DELETE ON TABLE "agent_context_snapshots" FROM applymate_candidate;
 
 -- These are platform catalogues, not tenant data. Candidate pages may read them,
 -- but they must not be writable by the candidate role.

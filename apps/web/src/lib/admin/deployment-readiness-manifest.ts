@@ -59,6 +59,7 @@ export const EXPECTED_MIGRATIONS = [
   '20260831030000_add_agent_turn_step_input',
   '20260831040000_add_agent_item_event_outbox',
   '20260831140000_add_scoped_agent_approvals',
+  '20260902090000_add_subagent_task_tree_mailbox',
 ] as const
 
 export const RLS_TABLES = [
@@ -70,7 +71,7 @@ export const RLS_TABLES = [
   'job_api_usage_events', 'discovery_optimization_events', 'ai_budget_adjustments', 'ai_budget_reset_requests', 'notifications', 'gmail_sync_states',
   'gmail_messages', 'gmail_recommendations', 'AgentRunQuestion', 'agent_runs',
   'agent_executions', 'agent_sessions', 'agent_turns', 'agent_steps', 'agent_inputs',
-  'agent_items', 'agent_events', 'agent_outbox', 'sub_agent_tasks', 'agent_transcript_events',
+  'agent_items', 'agent_events', 'agent_outbox', 'sub_agent_tasks', 'agent_mailbox_messages', 'agent_transcript_events',
   'agent_approvals', 'agent_action_reservations', 'agent_automations', 'CustomAgentRole', 'Direction', 'CoverLetter',
   'support_cases', 'support_case_messages', 'support_case_escalations',
   'admin_data_deletion_requests',

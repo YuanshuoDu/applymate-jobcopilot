@@ -1,6 +1,8 @@
 import { describe, expect, it, vi } from "vitest"
 import {
   appendTranscriptEvent,
+  consumeAgentMailboxMessage,
+  createAgentMailboxMessage,
   createAgentSession,
   createSubAgentTask,
   completeSubAgentTask,
@@ -46,6 +48,10 @@ function mockDb() {
         id: "task_1",
         ...data,
       })),
+    },
+    agentMailboxMessage: {
+      create: vi.fn(async ({ data }) => ({ id: "message_1", ...data })),
+      updateMany: vi.fn(),
     },
   }
 }
@@ -199,7 +205,7 @@ describe("agent session repository", () => {
     expect(db.subAgentTask.update).toHaveBeenCalledWith({
       where: { id: "task_1" },
       data: {
-        status: "passed",
+        status: "completed",
         result: { status: "active", confidence: 0.94 },
         confidence: 0.94,
         failureReason: null,
@@ -214,6 +220,66 @@ describe("agent session repository", () => {
         },
       },
     })
-    expect(task).toMatchObject({ status: "passed", confidence: 0.94 })
+    expect(task).toMatchObject({ status: "completed", confidence: 0.94 })
+  })
+
+  it("normalizes the legacy passed status for durable writes", async () => {
+    const db = mockDb()
+
+    await completeSubAgentTask(db, { taskId: "task_1", status: "passed" })
+
+    expect(db.subAgentTask.update).toHaveBeenCalledWith({
+      where: { id: "task_1" },
+      data: expect.objectContaining({ status: "completed" }),
+    })
+  })
+
+  it("creates mailbox messages with a session-scoped idempotency key", async () => {
+    const db = mockDb()
+
+    await createAgentMailboxMessage(db, {
+      sessionId: "session_1",
+      turnId: "turn_1",
+      fromTaskId: "task_1",
+      toTaskId: "task_2",
+      kind: "task.result",
+      payload: { summary: "done" },
+      idempotencyKey: "result:task_1:1",
+    })
+
+    expect(db.agentMailboxMessage.create).toHaveBeenCalledWith({
+      data: {
+        sessionId: "session_1",
+        turnId: "turn_1",
+        fromTaskId: "task_1",
+        toTaskId: "task_2",
+        kind: "task.result",
+        payload: { summary: "done" },
+        idempotencyKey: "result:task_1:1",
+      },
+    })
+  })
+
+  it("allows only one concurrent consumer to win the atomic null check", async () => {
+    const db = mockDb()
+    let consumed = false
+    db.agentMailboxMessage.updateMany.mockImplementation(async ({ where }) => {
+      if (where.consumedAt === null && !consumed) {
+        consumed = true
+        return { count: 1 }
+      }
+      return { count: 0 }
+    })
+
+    const results = await Promise.all([
+      consumeAgentMailboxMessage(db, { messageId: "message_1", sessionId: "session_1", toTaskId: "task_2", consumedAt: new Date("2026-09-02T00:00:00Z") }),
+      consumeAgentMailboxMessage(db, { messageId: "message_1", sessionId: "session_1", toTaskId: "task_2", consumedAt: new Date("2026-09-02T00:00:01Z") }),
+    ])
+
+    expect(results.sort()).toEqual([false, true])
+    expect(db.agentMailboxMessage.updateMany).toHaveBeenCalledTimes(2)
+    expect(db.agentMailboxMessage.updateMany).toHaveBeenCalledWith(expect.objectContaining({
+      where: { id: "message_1", sessionId: "session_1", toTaskId: "task_2", consumedAt: null },
+    }))
   })
 })
