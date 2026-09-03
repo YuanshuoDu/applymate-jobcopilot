@@ -22,6 +22,12 @@ export type ParsedInterruptCommand = {
   expectedRevision: number | null
 }
 
+export type ParsedForkCommand = {
+  clientMessageId: string
+  lastTurnId: string
+  editContent?: InputContentPart[]
+}
+
 type RecordBody = Record<string, unknown>
 
 function isRecord(value: unknown): value is RecordBody {
@@ -140,6 +146,18 @@ export function parseInterruptBody(body: unknown, request: Request): ParsedInter
   const expectedRevision = optionalRevision(body.expectedRevision)
   if (!clientMessageId || expectedRevision === undefined) return invalid("Invalid interrupt command payload")
   return { clientMessageId, expectedRevision }
+}
+
+export function parseForkBody(body: unknown, request: Request): ParsedForkCommand | NextResponse {
+  if (!isRecord(body) || !isAllowedKeys(body, ["schemaVersion", "clientMessageId", "lastTurnId", "editContent"])) {
+    return invalid("Unsupported or forbidden fork field")
+  }
+  if (body.schemaVersion !== undefined && body.schemaVersion !== schemaVersion) return invalid("Unsupported command schema version")
+  const clientMessageId = commandId(body, request)
+  const lastTurnId = stringValue(body.lastTurnId)
+  const editContent = body.editContent === undefined ? undefined : parseContent(body.editContent)
+  if (!clientMessageId || !lastTurnId || (body.editContent !== undefined && !editContent)) return invalid("Invalid fork command payload")
+  return { clientMessageId, lastTurnId, ...(editContent ? { editContent } : {}) }
 }
 
 export async function verifyAttachmentOwnership(
