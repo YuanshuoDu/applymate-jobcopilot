@@ -42,6 +42,12 @@ function scopeUser(scope: TenantScope): string {
   return nonEmpty(scope.userId, "scope.userId")
 }
 
+function assertSnapshotOwner(snapshot: AgentContextSnapshot, userId: string): void {
+  if (snapshot.content.ownerId !== userId) {
+    throw new ContextSnapshotError("reference_cross_tenant", "Context snapshot content is outside the tenant scope")
+  }
+}
+
 function integer(value: number | string | bigint, field: string): number {
   const result = typeof value === "number" ? value : Number(value)
   if (!Number.isSafeInteger(result) || result < 0) throw new ContextSnapshotError("store_conflict", `Invalid ${field}`)
@@ -141,6 +147,7 @@ export function createPgContextSnapshotStore(pool: Pick<pg.Pool, "connect">): Co
     async save(snapshot, scope): Promise<AgentContextSnapshot> {
       const userId = scopeUser(scope)
       assertSnapshotIntegrity(snapshot)
+      assertSnapshotOwner(snapshot, userId)
       const id = snapshot.id ?? randomUUID()
       return withTransaction(pool, userId, async (client) => {
         await sessionOwner(client, snapshot, userId)
@@ -190,7 +197,10 @@ export function createPgContextSnapshotStore(pool: Pick<pg.Pool, "connect">): Co
              AND session."userId" = $3`,
           [input.sessionId, input.throughSequence.toString(), userId],
         )
-        return result.rows[0] ? mapRow(result.rows[0]) : null
+        if (!result.rows[0]) return null
+        const snapshot = mapRow(result.rows[0])
+        assertSnapshotOwner(snapshot, userId)
+        return snapshot
       })
     },
   }

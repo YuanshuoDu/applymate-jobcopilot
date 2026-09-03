@@ -127,4 +127,12 @@ describe("PostgreSQL context snapshot store", () => {
     const corruptStore = createPgContextSnapshotStore(poolFor(corrupt))
     await expect(corruptStore.load({ scope, sessionId: "session-a", throughSequence: 3n })).rejects.toMatchObject({ code: "checksum_mismatch" })
   })
+
+  it("rejects a snapshot whose content owner does not match the persistence scope", async () => {
+    const value = snapshot()
+    const client = new FakeClient(value)
+    const store = createPgContextSnapshotStore({ connect: async () => client as unknown as pg.PoolClient })
+    await expect(store.save(value, { userId: "user-b" })).rejects.toMatchObject({ code: "reference_cross_tenant" })
+    expect(client.calls).toHaveLength(0)
+  })
 })

@@ -7,6 +7,7 @@ const schemaPath = fileURLToPath(new URL("../../prisma/schema.prisma", import.me
 const migration = readFileSync(migrationPath, "utf8")
 const schema = readFileSync(schemaPath, "utf8")
 const rls = readFileSync(fileURLToPath(new URL("../../prisma/rls/enable.sql", import.meta.url)), "utf8")
+const grants = readFileSync(fileURLToPath(new URL("../../prisma/rls/role-grants.sql", import.meta.url)), "utf8")
 
 describe("AH2-034 context snapshot migration contract", () => {
   it("adds the versioned snapshot table and scoped uniqueness", () => {
@@ -28,5 +29,6 @@ describe("AH2-034 context snapshot migration contract", () => {
     expect(schema).toContain('@@map("agent_context_snapshots")')
     expect(rls).toContain('ALTER TABLE "agent_context_snapshots" ENABLE ROW LEVEL SECURITY')
     expect(rls).toContain("candidate_agent_context_snapshot_isolation")
+    expect(grants).toContain('REVOKE UPDATE, DELETE ON TABLE "agent_context_snapshots" FROM applymate_candidate')
   })
 })

@@ -24,6 +24,10 @@ GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE
   "support_case_escalations", "admin_data_deletion_requests"
 TO applymate_candidate;
 
+-- Context snapshots are append-only. Parent-session retention cascades remain
+-- available, but candidate callers must not rewrite or delete snapshot rows.
+REVOKE UPDATE, DELETE ON TABLE "agent_context_snapshots" FROM applymate_candidate;
+
 -- These are platform catalogues, not tenant data. Candidate pages may read them,
 -- but they must not be writable by the candidate role.
 GRANT SELECT ON TABLE "plan_catalogue" TO applymate_candidate;
