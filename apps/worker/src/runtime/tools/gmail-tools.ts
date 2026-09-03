@@ -29,7 +29,7 @@ export function createGmailTools(options: GmailToolOptions): RuntimeToolDefiniti
 }
 
 async function createDraft(context: ToolExecutionContext, input: GmailCreateDraftInput, options: GmailToolOptions) {
-  return withCredential(context, options, "send", async (token) => {
+  return withCredential(context, options, "draft", async (token) => {
     const ids = await options.client.createDraft(token, input, context.signal)
     return {
       draftId: ids.draftId, messageId: ids.messageId, threadId: ids.threadId,
@@ -62,14 +62,22 @@ async function sendDraft(context: ToolExecutionContext, input: GmailSendInput, o
   }).then((evidence) => ({ status: "sent" as const, messageId: evidence.messageId, threadId: evidence.threadId, evidenceId: evidence.evidenceId, tracked: evidence.tracked, jobId: evidence.jobId }))
 }
 
-async function withCredential<T>(context: ToolExecutionContext, options: GmailToolOptions, operation: "read" | "send", work: (token: string) => Promise<T>): Promise<T> {
+async function withCredential<T>(context: ToolExecutionContext, options: GmailToolOptions, operation: "read" | "draft" | "send", work: (token: string) => Promise<T>): Promise<T> {
   const credential = await options.credentials.getAccessToken(context.scope.userId)
   if (!credential) {
     const wait = await options.oauth.suspend({ context, reason: "gmail_reauthorization_required" })
     throw new ToolExecutionError("gmail_oauth_required", "Reconnect Gmail to continue this Turn", { status: "waiting_for_oauth", waitId: wait.waitId, reconnectUrl: wait.reconnectUrl })
   }
-  if (operation === "send" && credential.scope && !credential.scope.split(/\s+/).includes("https://www.googleapis.com/auth/gmail.send")) {
-    throw new ToolExecutionError("gmail_scope_denied", "The connected Gmail account has no send permission")
+  if (credential.scope) {
+    const scopes = new Set(credential.scope.split(/\s+/))
+    const required = operation === "send"
+      ? ["https://www.googleapis.com/auth/gmail.send", "https://mail.google.com/"]
+      : operation === "draft"
+        ? ["https://www.googleapis.com/auth/gmail.compose", "https://www.googleapis.com/auth/gmail.modify", "https://mail.google.com/"]
+        : []
+    if (required.length > 0 && !required.some(scope => scopes.has(scope))) {
+      throw new ToolExecutionError("gmail_scope_denied", operation === "send" ? "The connected Gmail account has no send permission" : "The connected Gmail account has no draft permission")
+    }
   }
   return work(credential.accessToken)
 }

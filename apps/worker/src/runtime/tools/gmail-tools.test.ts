@@ -9,7 +9,7 @@ function context(userId = "user-a") {
 
 function options(overrides: Partial<GmailToolOptions> = {}): GmailToolOptions {
   return {
-    credentials: { getAccessToken: vi.fn(async () => ({ accessToken: "opaque-token", scope: "https://www.googleapis.com/auth/gmail.send" })) },
+    credentials: { getAccessToken: vi.fn(async () => ({ accessToken: "opaque-token", scope: "https://www.googleapis.com/auth/gmail.compose https://www.googleapis.com/auth/gmail.send" })) },
     client: { getThread: vi.fn(async () => ({ threadId: "thread-a", messages: [] })), createDraft: vi.fn(async () => ({ draftId: "draft-a", messageId: "message-a", threadId: "thread-a" })), sendDraft: vi.fn(async () => ({ messageId: "sent-a", threadId: "thread-a" })) },
     approvals: () => ({ consumeAndReserve: vi.fn(async () => ({ approvalId: "approval-a", reservationId: "reservation-a", consumedAt: new Date() })) }),
     evidence: { findSendEvidence: vi.fn(async () => null), hasSendReservation: vi.fn(async () => false), persistSendEvidence: vi.fn(async (input) => ({ evidenceId: "evidence-a", messageId: input.messageId, threadId: input.threadId, jobId: input.jobId, idempotencyKey: input.idempotencyKey, tracked: true })) },
