@@ -1,5 +1,8 @@
 import { detectAtsSource, type AtsSourceKey } from '@jobcopilot/shared/ats-url'
 
+export { FillFormInputSchema, FILL_FORM_TOOL, executeBrowserFill, parseFillFormInput } from './browser-fill-executor.js'
+export type { FillFormInput, BrowserFillExecutorContext } from './browser-fill-executor.js'
+
 export type FlowType = AtsSourceKey | null;
 
 export function detectFlow(url: string): FlowType {

@@ -60,7 +60,7 @@ export async function runLeverFlow(
   await fillCustomQuestions(page, task.persona, log, task.confirmedAnswers);
 
   // 5. Submit
-  if (task.allowSubmit === false) {
+  if (task.allowSubmit !== true) {
     return { status: "manual", turns: 1, error: "Form filled and ready for user review.", durationMs: Date.now() - startedAt, log, reviewReady: true };
   }
   const submission = await clickSubmit(page, SELECTORS.submit, task.beforeSubmit);

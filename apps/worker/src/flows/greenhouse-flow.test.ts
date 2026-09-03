@@ -61,6 +61,7 @@ describe("runGreenhouseFlow", () => {
       jobTitle: "Senior Engineer",
       jobCompany: "Booking.com",
       resumePath: "/resume.pdf",
+      allowSubmit: true,
       beforeSubmit: vi.fn().mockResolvedValue(true),
     });
 
@@ -77,6 +78,7 @@ describe("runGreenhouseFlow", () => {
       jobTitle: "Engineer",
       jobCompany: "Corp",
       resumePath: "/r.pdf",
+      allowSubmit: true,
       beforeSubmit: vi.fn().mockResolvedValue(true),
     });
 
@@ -92,6 +94,7 @@ describe("runGreenhouseFlow", () => {
       jobTitle: "Dev",
       jobCompany: "Inc",
       resumePath: "/r.pdf",
+      allowSubmit: true,
     });
 
     expect(result.status).toBe("manual");
@@ -109,6 +112,7 @@ describe("runGreenhouseFlow", () => {
       jobTitle: "Dev",
       jobCompany: "Inc",
       resumePath: "/r.pdf",
+      allowSubmit: true,
       beforeSubmit,
     });
 

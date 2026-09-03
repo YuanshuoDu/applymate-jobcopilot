@@ -69,7 +69,7 @@ describe("runSmartRecruitersFlow", () => {
 
   it("fills personal fields from persona", async () => {
     const page = mockSmartRecruitersPage();
-    const result = await runSmartRecruitersFlow(page, { ...baseTask(), beforeSubmit: vi.fn().mockResolvedValue(true) });
+    const result = await runSmartRecruitersFlow(page, { ...baseTask(), allowSubmit: true, beforeSubmit: vi.fn().mockResolvedValue(true) });
 
     expect(result.status).toBe("submitted");
     expect(result.log).toEqual(
@@ -90,7 +90,7 @@ describe("runSmartRecruitersFlow", () => {
       return visibleLocator(1);
     });
 
-    const result = await runSmartRecruitersFlow(page, baseTask());
+    const result = await runSmartRecruitersFlow(page, { ...baseTask(), allowSubmit: true });
 
     expect(result.status).toBe("manual");
     expect(result.error).toContain("Submit button not found");
@@ -98,7 +98,7 @@ describe("runSmartRecruitersFlow", () => {
 
   it("stops at review when submission authorization is revoked", async () => {
     const beforeSubmit = vi.fn().mockResolvedValue(false);
-    const result = await runSmartRecruitersFlow(mockSmartRecruitersPage(), { ...baseTask(), beforeSubmit });
+    const result = await runSmartRecruitersFlow(mockSmartRecruitersPage(), { ...baseTask(), allowSubmit: true, beforeSubmit });
 
     expect(beforeSubmit).toHaveBeenCalledOnce();
     expect(result).toMatchObject({ status: "submission_blocked" });

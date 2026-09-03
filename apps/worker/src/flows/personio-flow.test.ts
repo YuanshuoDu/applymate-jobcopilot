@@ -67,7 +67,7 @@ describe("runPersonioFlow", () => {
 
   it("fills personal fields from persona", async () => {
     const page = mockPersonioPage();
-    const result = await runPersonioFlow(page, { ...baseTask(), beforeSubmit: vi.fn().mockResolvedValue(true) });
+    const result = await runPersonioFlow(page, { ...baseTask(), allowSubmit: true, beforeSubmit: vi.fn().mockResolvedValue(true) });
 
     expect(result.status).toBe("submitted");
     expect(result.log).toEqual(
@@ -88,7 +88,7 @@ describe("runPersonioFlow", () => {
       return visibleLocator(1);
     });
 
-    const result = await runPersonioFlow(page, baseTask());
+    const result = await runPersonioFlow(page, { ...baseTask(), allowSubmit: true });
 
     expect(result.status).toBe("manual");
     expect(result.error).toContain("Submit button not found");
@@ -96,7 +96,7 @@ describe("runPersonioFlow", () => {
 
   it("stops at review when submission authorization is revoked", async () => {
     const beforeSubmit = vi.fn().mockResolvedValue(false);
-    const result = await runPersonioFlow(mockPersonioPage(), { ...baseTask(), beforeSubmit });
+    const result = await runPersonioFlow(mockPersonioPage(), { ...baseTask(), allowSubmit: true, beforeSubmit });
 
     expect(beforeSubmit).toHaveBeenCalledOnce();
     expect(result).toMatchObject({ status: "submission_blocked" });
