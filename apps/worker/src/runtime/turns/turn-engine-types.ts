@@ -65,6 +65,7 @@ export type TurnEngineStore = {
     estimatedCostUsd: number
     now: Date
   }): Promise<void>
+  waitForUser?(input: { lease: TurnLease; now: Date }): Promise<void>
   createItem(input: {
     lease: TurnLease
     itemId: string

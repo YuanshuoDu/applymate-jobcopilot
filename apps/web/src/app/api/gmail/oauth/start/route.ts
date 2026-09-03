@@ -61,8 +61,10 @@ export async function GET(req: NextRequest) {
   // Bind the signed callback state to the browser that initiated this flow.
   const returnTo = safeReturnTo(req.nextUrl.searchParams.get('returnTo'))
   const transfer = req.nextUrl.searchParams.get('transfer') === '1'
+  const requestedWaitId = req.nextUrl.searchParams.get('agentWaitId')
+  const agentWaitId = requestedWaitId && /^[a-f0-9-]{20,100}$/i.test(requestedWaitId) ? requestedWaitId : undefined
   const nonce = crypto.randomUUID()
-  const state = await new SignJWT({ uid: session.user.id, authVersion: user.authVersion, nonce, returnTo, transfer })
+  const state = await new SignJWT({ uid: session.user.id, authVersion: user.authVersion, nonce, returnTo, transfer, ...(agentWaitId ? { agentWaitId } : {}) })
     .setProtectedHeader({ alg: 'HS256' })
     .setExpirationTime('10m')
     .sign(stateSecret)

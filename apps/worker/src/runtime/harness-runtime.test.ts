@@ -128,4 +128,12 @@ describe("MiniMax Harness runtime integration", () => {
   it("rejects a write-capable tool set at the Harness boundary", () => {
     expect(() => assertReadOnlyHarnessTools([{ ...tool(), risk: "external_write", idempotency: "non_repeatable", capabilities: ["external_write"] }])).toThrow(/non-read-only/)
   })
+
+  it("allows only the typed approval-bound Gmail write tools", () => {
+    expect(() => assertReadOnlyHarnessTools([
+      { ...tool(), name: "gmail.create_draft", domain: "gmail", risk: "internal_write", idempotency: "requires_key", capabilities: ["read", "write"] },
+      { ...tool(), name: "gmail.send", domain: "gmail", risk: "external_write", idempotency: "non_repeatable", capabilities: ["read", "write", "external_write"] },
+    ])).not.toThrow()
+    expect(() => assertReadOnlyHarnessTools([{ ...tool(), name: "gmail.send", domain: "gmail", risk: "external_write", idempotency: "requires_key", capabilities: ["read", "write", "external_write"] }])).toThrow(/non-read-only/)
+  })
 })

@@ -18,7 +18,7 @@ import { db } from '@/lib/db'
 import { safeAuth } from '@/lib/safe-auth'
 import { GMAIL_ACCOUNT_PROVIDER } from '@/lib/gmail-helpers'
 import { encryptAccountTokenFields } from '@/lib/credential-secrets'
-import { canRecoverStaleGmailConnection } from '@/lib/gmail-connection-recovery'
+import { canRecoverStaleGmailConnection, resumeGmailOAuthWait } from '@/lib/gmail-connection-recovery'
 import { configuredRedirectUri } from '@/lib/app-url'
 import { configuredAppOrigin } from '@/lib/app-url'
 import {
@@ -57,6 +57,7 @@ export async function GET(req: NextRequest) {
 
   let returnTo = '/?page=gmail'
   let transferRequested = false
+  let agentWaitId: string | null = null
   const back = (msg: string) => {
     const u = new URL(returnTo, configuredAppOrigin(req.url))
     u.searchParams.set('gmailError', msg)
@@ -92,6 +93,7 @@ export async function GET(req: NextRequest) {
     stateAuthVersion = payload.authVersion
     returnTo = safeReturnTo(payload.returnTo) ?? returnTo
     transferRequested = payload.transfer === true
+    agentWaitId = typeof payload.agentWaitId === 'string' && /^[a-f0-9-]{20,100}$/i.test(payload.agentWaitId) ? payload.agentWaitId : null
   } catch (e) {
     console.error('[gmail/oauth/callback] state verify failed', { errorCode: aiUsageErrorCode(e) })
     return back('invalid_state')
@@ -220,6 +222,16 @@ export async function GET(req: NextRequest) {
       errorCode: aiUsageErrorCode(error),
     })
     return back('credential_storage_unavailable')
+  }
+
+  if (agentWaitId) {
+    try {
+      const resumed = await resumeGmailOAuthWait(db, { userId, waitId: agentWaitId })
+      if (!resumed) return back('oauth_wait_not_found')
+    } catch (error) {
+      console.error('[gmail/oauth/callback] origin Turn resume failed', { errorCode: aiUsageErrorCode(error) })
+      return back('oauth_wait_resume_failed')
+    }
   }
 
   console.log(

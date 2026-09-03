@@ -41,4 +41,11 @@ describe("PostgreSQL TurnEngine store", () => {
     expect(calls.some((sql) => sql.includes("INSERT INTO \"agent_events\""))).toBe(true)
     expect(calls.some((sql) => sql.includes("INSERT INTO \"agent_outbox\""))).toBe(true)
   })
+
+  it("transitions only the leased in-progress Turn to waiting_for_user", async () => {
+    const client = { query: vi.fn(async () => ({ rows: [], rowCount: 1 })), release: vi.fn() }
+    const store = createPgTurnEngineStore({ connect: vi.fn(async () => client) } as unknown as Pick<pg.Pool, "connect">)
+    await store.waitForUser?.({ lease, now })
+    expect(client.query).toHaveBeenCalledWith(expect.stringContaining('"status" = \'in_progress\''), [now, lease.turnId, lease.sessionId, lease.userId, lease.ownerId, lease.leaseVersion])
+  })
 })

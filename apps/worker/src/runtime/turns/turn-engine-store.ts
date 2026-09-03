@@ -72,6 +72,22 @@ export function createPgTurnEngineStore(pool: TurnEnginePool): TurnEngineStore {
       } finally { client.release() }
     },
 
+    async waitForUser(input): Promise<void> {
+      const client = await pool.connect()
+      try {
+        const result = await client.query(
+          `UPDATE "agent_turns"
+           SET "status" = 'waiting_for_user', "revision" = "revision" + 1,
+               "completedAt" = NULL, "updatedAt" = $1
+           WHERE "id" = $2 AND "sessionId" = $3 AND "userId" = $4
+             AND "leaseOwnerId" = $5 AND "leaseVersion" = $6
+             AND "leaseExpiresAt" > $1 AND "status" = 'in_progress'`,
+          [input.now, input.lease.turnId, input.lease.sessionId, input.lease.userId, input.lease.ownerId, input.lease.leaseVersion],
+        )
+        if (result.rowCount !== 1) throw conflict(`turn ${input.lease.turnId} wait state`)
+      } finally { client.release() }
+    },
+
     async createItem(input): Promise<TurnEngineItem> {
       const client = await pool.connect()
       try {

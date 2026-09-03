@@ -77,7 +77,7 @@ export interface ToolRouterContext {
 }
 
 export class ToolExecutionError extends Error {
-  constructor(readonly code: string, message: string) {
+  constructor(readonly code: string, message: string, readonly safeOutput?: unknown) {
     super(message)
     this.name = "ToolExecutionError"
   }
