@@ -9,7 +9,12 @@ import { modelChat, stripFences } from '@/lib/model-router'
 import { db } from '@/lib/db'
 import { Prisma } from '@prisma/client'
 import { buildPersona } from '@/lib/persona'
-import { personaEvidenceContext } from '@/lib/persona-evidence'
+import { personaEvidenceContext, retrievePersonaEvidence } from '@/lib/persona-evidence'
+import { assertSupportedClaims, type EvidenceInput } from '../artifacts/provenance'
+import { buildDraftArtifactSummary } from '../artifacts/repository'
+import { hashArtifactContent } from '../artifacts/hash'
+import { artifactItemData } from '../artifacts/item'
+import type { ArtifactConstraintSet, ArtifactSummary } from '../artifacts/types'
 import type { AiConfig } from '@/lib/model-router'
 import type {
   PipelineCtx, ScoredJob, ApplicationPackage, PrepareOutput,
@@ -107,10 +112,23 @@ export async function runPrepare(
       personaEvidenceContext(userId, 'tailor', `${sj.job.role} ${sj.job.description ?? ''}`).catch(() => ''),
       personaEvidenceContext(userId, 'cover_letter', `${sj.job.role} ${sj.job.description ?? ''}`).catch(() => ''),
     ])
+    const [evidenceRows, coverEvidenceRows] = await Promise.all([
+      retrievePersonaEvidence(userId, 'tailor', `${sj.job.role} ${sj.job.description ?? ''}`, 12).catch(() => []),
+      retrievePersonaEvidence(userId, 'cover_letter', `${sj.job.role} ${sj.job.description ?? ''}`, 12).catch(() => []),
+    ])
+    const evidenceInputs: EvidenceInput[] = [
+      { sourceType: 'resume', sourceRef: `resume:${defaultResume.id}`, content: JSON.stringify(resumeContent) },
+      ...evidenceRows.map(row => ({ sourceType: row.sourceType === 'persona_fact' ? 'persona_fact' as const : 'persona_evidence' as const, sourceRef: row.sourceRef, content: row.content })),
+    ]
+    const constraints = tailoringConstraints(sj, agentCfg)
+    const baseHash = hashArtifactContent(resumeContent)
+    let tailoredResumeArtifact: ArtifactSummary | undefined
+    let coverLetterArtifact: ArtifactSummary | undefined
 
     if (allowResumeTailoring) {
       try {
         const tailored = await generateTailoredResume(sj, resumeContent, effectiveAiConfig, writerSystemPrompt, tailorPersona, tailorEvidence)
+        const provenance = assertSupportedClaims({ content: tailored, evidence: evidenceInputs, allowedContext: [sj.job.company, sj.job.role, tailorEvidence] })
         const saved = await db.resume.create({ data: {
           userId, name: `Tailored for ${sj.job.company} - ${sj.job.role}`,
           content: tailored as Prisma.InputJsonValue, templateId: defaultResume.templateId,
@@ -121,6 +139,8 @@ export async function runPrepare(
         } })
         tailoredResumeId = saved.id
         tailoredResumeName = saved.name
+        tailoredResumeArtifact = buildDraftArtifactSummary({ id: saved.id, kind: 'resume', content: tailored, baseArtifactId: defaultResume.id, baseHash, constraints, provenance })
+        emit('artifact_created', { role: 'writer', artifact: artifactItemData(tailoredResumeArtifact) })
         emit('agent_observation', { role: 'writer', observation: `✓ Already generated based on default resume ${sj.job.company} Custom Resume, Preserve job links and templates; wait Reviewer Review and your final confirmation.` })
       } catch (err) {
         emit('agent_observation', { role: 'writer', observation: `✗ ${sj.job.company} Resume optimization failed: ${err instanceof Error ? err.message : 'Unknown error'}` })
@@ -130,6 +150,11 @@ export async function runPrepare(
     if (agentCfg.autoCoverLetter) {
       try {
         coverLetter = await generateCoverLetter(sj, agentCfg, resumeContent, effectiveAiConfig, writerSystemPrompt, coverLetterPersona, coverEvidence)
+        const coverInputs: EvidenceInput[] = [
+          { sourceType: 'resume', sourceRef: `resume:${defaultResume.id}`, content: JSON.stringify(resumeContent) },
+          ...coverEvidenceRows.map(row => ({ sourceType: row.sourceType === 'persona_fact' ? 'persona_fact' as const : 'persona_evidence' as const, sourceRef: row.sourceRef, content: row.content })),
+        ]
+        const coverProvenance = assertSupportedClaims({ content: coverLetter, evidence: coverInputs, allowedContext: [sj.job.company, sj.job.role, coverEvidence] })
         const saved = await saveAgentCoverLetter({
           userId,
           jobId: sj.job.id,
@@ -138,6 +163,13 @@ export async function runPrepare(
           tone: agentCfg.coverTone,
         })
         coverLetterId = saved.id
+        coverLetterArtifact = buildDraftArtifactSummary({
+          id: saved.id, kind: 'cover_letter', content: coverLetter,
+          baseArtifactId: tailoredResumeArtifact?.id ?? defaultResume.id,
+          baseHash: tailoredResumeArtifact?.hash ?? baseHash,
+          constraints, provenance: coverProvenance,
+        })
+        emit('artifact_created', { role: 'writer', artifact: artifactItemData(coverLetterArtifact) })
         pendingLetters.push({ jobId: sj.job.id, coverLetter })
         await new Promise(r => setTimeout(r, THROTTLE_MS))
       } catch (err) {
@@ -151,6 +183,8 @@ export async function runPrepare(
       ...(coverLetter ? { coverLetter } : {}),
       ...(coverLetterId ? { coverLetterId } : {}),
       ...(tailoredResumeId ? { tailoredResumeId, tailoredResumeName } : {}),
+      ...(tailoredResumeArtifact ? { tailoredResumeArtifact } : {}),
+      ...(coverLetterArtifact ? { coverLetterArtifact } : {}),
       tailoredKeywords: sj.missingKeywords.length ? sj.missingKeywords : undefined,
     })
   })
@@ -166,6 +200,21 @@ export async function runPrepare(
   }
 
   return stageOk('prepare', { packages }, packages.length, Date.now() - t0)
+}
+
+export function tailoringConstraints(sj: ScoredJob, cfg: AgentConfigFull): ArtifactConstraintSet {
+  const sorted = (values: readonly string[]) => [...values].map(value => value.trim()).filter(Boolean).sort()
+  return {
+    jobId: sj.job.id,
+    role: sj.job.role,
+    company: sj.job.company,
+    targetRoles: sorted(cfg.targetRoles),
+    targetLocations: sorted(cfg.targetLocations),
+    excludeCompanies: sorted(cfg.excludeCompanies),
+    priorityCompanies: sorted(cfg.priorityCompanies),
+    minMatchScore: cfg.minMatchScore,
+    coverTone: cfg.coverTone,
+  }
 }
 
 async function saveAgentCoverLetter(input: {

@@ -24,6 +24,8 @@ const PIPELINE_EVENTS = new Set([
   "agent_reflect",
   "job_done",
   "application_queued",
+  "artifact_created",
+  "artifact_reviewed",
   "custom_agent_result",
   "custom_agent_summary",
   "done",
