@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest"
-import { resolveAutomationSession } from "./automation-session"
+import { ensureAutomationTurn, resolveAutomationSession } from "./automation-session"
 
 function session(id: string) {
   return {
@@ -44,5 +44,37 @@ describe("resolveAutomationSession", () => {
       where: { id: "automation_1", userId: "user_1", sessionId: null },
       data: { sessionId: "session_1" },
     })
+  })
+})
+
+describe("ensureAutomationTurn", () => {
+  it("creates one queued Turn after terminal history", async () => {
+    const db = { agentTurn: { findFirst: vi.fn().mockResolvedValue(null), create: vi.fn().mockResolvedValue({ id: "turn_2" }) } }
+
+    await expect(ensureAutomationTurn(db, { sessionId: "session_1", userId: "user_1", name: "Weekday Scout" }))
+      .resolves.toEqual({ turnId: "turn_2", created: true })
+    expect(db.agentTurn.create).toHaveBeenCalledWith(expect.objectContaining({
+      data: expect.objectContaining({ sessionId: "session_1", userId: "user_1", source: "automation", status: "queued" }),
+    }))
+  })
+
+  it("reuses an active Turn and does not create a duplicate run", async () => {
+    const db = { agentTurn: { findFirst: vi.fn().mockResolvedValue({ id: "turn_active" }), create: vi.fn() } }
+
+    await expect(ensureAutomationTurn(db, { sessionId: "session_1", userId: "user_1", name: "Weekday Scout" }))
+      .resolves.toEqual({ turnId: "turn_active", created: false })
+    expect(db.agentTurn.create).not.toHaveBeenCalled()
+  })
+
+  it("handles a concurrent create race by returning the active Turn", async () => {
+    const db = {
+      agentTurn: {
+        findFirst: vi.fn().mockResolvedValueOnce(null).mockResolvedValueOnce({ id: "turn_raced" }),
+        create: vi.fn().mockRejectedValue({ code: "P2002" }),
+      },
+    }
+
+    await expect(ensureAutomationTurn(db, { sessionId: "session_1", userId: "user_1", name: "Weekday Scout" }))
+      .resolves.toEqual({ turnId: "turn_raced", created: false })
   })
 })

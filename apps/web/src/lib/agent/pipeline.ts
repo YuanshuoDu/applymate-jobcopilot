@@ -20,10 +20,29 @@ import { runAudit                  } from './stages/audit'
 import { recordRoleRun, ROLE_META  } from './role-config'
 import { runCustomAgents, summarizeCustomAgentResults } from './stages/custom'
 import { OrchestratorAgent         } from './orchestrator'
-import type { ApplicationPackage, CustomAgentRunResult, ExecuteOutput, GateOutput, PipelineCheckpointState, PipelineCtx, RunReport, ScoredJob } from './types'
+import type { ApplicationPackage, CustomAgentRunResult, ExecuteOutput, GateOutput, PipelineCheckpointState, PipelineCtx, RunReport, ScoredJob, PipelineRunToolInput, PipelineRunToolOutput } from './types'
 import { emptyReport } from './types'
 
 export type { PipelineCtx }
+
+/** Stable Agent-column coarse tool contract. userId is always runtime-owned. */
+export const PIPELINE_RUN_TOOL = Object.freeze({
+  name: 'pipeline.run',
+  version: '1',
+  description: 'Run or resume the job application preparation pipeline.',
+  input: { type: 'object', additionalProperties: false, properties: { mode: { enum: ['resume', 'start'] } } },
+})
+
+export type { PipelineRunToolInput, PipelineRunToolOutput }
+
+export class PipelineInterruptedError extends Error {
+  readonly code = 'pipeline_interrupted'
+
+  constructor() {
+    super('Pipeline interrupted before the next stage could start')
+    this.name = 'PipelineInterruptedError'
+  }
+}
 
 function emitRole(ctx: PipelineCtx, role: string, event: 'start' | 'done', extra: Record<string, unknown> = {}) {
   const meta  = ROLE_META[role as keyof typeof ROLE_META]
@@ -43,20 +62,39 @@ function needsStage(state: PipelineCheckpointState, stage: keyof typeof STAGE_OR
 
 export async function runPipeline(ctx: PipelineCtx): Promise<RunReport> {
   const t0   = Date.now()
-  const orch = new OrchestratorAgent(ctx, ctx.autonomous ?? false)
+  let state: PipelineCheckpointState = ctx.resumeState ?? { nextStage: 'scout', startedAt: new Date().toISOString() }
+  let eventIndex = state.eventIndex ?? 0
+  const canonicalWrites: Promise<unknown>[] = []
+  const emit = (event: string, data: unknown) => {
+    ctx.emit(event, data)
+    const index = eventIndex++
+    if (ctx.onCanonicalEvent) {
+      canonicalWrites.push(Promise.resolve(ctx.onCanonicalEvent({
+        event, data, index,
+        idempotencyKey: `pipeline:${ctx.sessionId ?? ctx.userId}:${index}`,
+      })))
+    }
+  }
+  const flushCanonical = async () => { await Promise.all(canonicalWrites.splice(0)) }
+  const assertAlive = () => {
+    if (ctx.signal?.aborted) throw new PipelineInterruptedError()
+  }
+  const pipelineCtx: PipelineCtx = { ...ctx, emit }
+  const orch = new OrchestratorAgent(pipelineCtx, ctx.autonomous ?? false)
   const controlledCtx: PipelineCtx = {
-    ...ctx,
+    ...pipelineCtx,
     askUser: async (stage, question, options) => {
       const answer = await orch.ask(stage, question, options)
       await orch.applyOptionAction(answer, options)
       return answer
     },
   }
-  const { emit } = ctx
-  let state: PipelineCheckpointState = ctx.resumeState ?? { nextStage: 'scout', startedAt: new Date().toISOString() }
   let customAgentResults: CustomAgentRunResult[] = state.customAgentResults ?? []
   const persist = async (nextStage: PipelineCheckpointState['nextStage'], patch: Partial<PipelineCheckpointState> = {}) => {
-    state = { ...state, ...patch, customAgentResults, nextStage }
+    assertAlive()
+    emit('pipeline_checkpoint', { nextStage, eventIndex })
+    await flushCanonical()
+    state = { ...state, ...patch, customAgentResults, eventIndex, nextStage }
     await ctx.checkpoint?.(state)
   }
   const collectCustomResults = async (jobs: Parameters<typeof runCustomAgents>[1], afterStage: string) => {
@@ -65,6 +103,7 @@ export async function runPipeline(ctx: PipelineCtx): Promise<RunReport> {
   }
 
   // ── Orchestrator: plan ─────────────────────────────────────────────────────
+  assertAlive()
   await orch.plan()
 
   // ── Stage 1: Scout ─────────────────────────────────────────────────────────
@@ -73,7 +112,7 @@ export async function runPipeline(ctx: PipelineCtx): Promise<RunReport> {
   let scoutDiscovered = 0
   if (needsStage(state, 'scout')) {
   orch.beginStage('scout', 3)
-  emitRole(ctx, 'scout', 'start')
+  emitRole(pipelineCtx, 'scout', 'start')
   emit('agent_plan', {
     role: 'scout',
     plan: hasTargets
@@ -86,14 +125,15 @@ export async function runPipeline(ctx: PipelineCtx): Promise<RunReport> {
     const attempt = orch.nextAttempt('scout')
     if (attempt > 1) orch.emitRetry('scout', attempt, 3, 'Rescan jobs…')
 
-    const s1 = await runScout(ctx)
+    const s1 = await runScout(pipelineCtx)
+    assertAlive()
     const a1 = acceptScout(s1)
 
     if (!a1.ok) {
       orch.recordFailure('scout', a1.reason ?? 'Scout failed')
       if (orch.isExhausted('scout')) {
         const decision = await orch.decideOnExhaustion('scout', a1.reason ?? '', { jobsProcessed: 0 })
-        if (decision === 'abort') { emit('done', emptyReport(Date.now() - t0)); return emptyReport(Date.now() - t0) }
+        if (decision === 'abort') { const report = emptyReport(Date.now() - t0); emit('done', report); await flushCanonical(); return report }
         break scoutLoop
       }
       orch.applyFix('scout', 'scout_failed')
@@ -106,14 +146,14 @@ export async function runPipeline(ctx: PipelineCtx): Promise<RunReport> {
       { jobCount: s1.data!.jobs.length, discovered: scoutDiscovered, targetRoles: ctx.agentCfg.targetRoles.length },
     )
     if (dec1.decision === 'abort') {
-      emit('done', emptyReport(Date.now() - t0)); return emptyReport(Date.now() - t0)
+      const report = emptyReport(Date.now() - t0); emit('done', report); await flushCanonical(); return report
     }
     if (dec1.decision === 'ask_user' && dec1.ask_question) {
       const answer = await orch.ask('scout', dec1.ask_question, dec1.ask_options ?? [
         { label: 'continue', value: 'continue' },
         { label: 'abort', value: 'abort' },
       ])
-      if (answer === 'abort') { emit('done', emptyReport(Date.now() - t0)); return emptyReport(Date.now() - t0) }
+      if (answer === 'abort') { const report = emptyReport(Date.now() - t0); emit('done', report); await flushCanonical(); return report }
       // Apply option action if any
       await orch.applyOptionAction(answer, dec1.ask_options ?? [])
     }
@@ -132,7 +172,7 @@ export async function runPipeline(ctx: PipelineCtx): Promise<RunReport> {
       role: 'scout',
       reflect: `Reconnaissance completed: ${scoutDiscovered > 0 ? `Discover ${scoutDiscovered} new positions, ` : ''}common ${scoutedJobs.length} positions enter the analysis queue(time consuming ${(s1.metrics.durationMs / 1000).toFixed(1)}s)`,
     })
-    emitRole(ctx, 'scout', 'done', { count: scoutedJobs.length, discovered: scoutDiscovered, durationMs: s1.metrics.durationMs, summary: scoutSummary })
+    emitRole(pipelineCtx, 'scout', 'done', { count: scoutedJobs.length, discovered: scoutDiscovered, durationMs: s1.metrics.durationMs, summary: scoutSummary })
     emit('stage_done', { stage: 'scout', count: scoutedJobs.length, durationMs: s1.metrics.durationMs })
     await recordRoleRun(ctx.userId, 'scout', { count: scoutedJobs.length, durationMs: s1.metrics.durationMs, summary: scoutSummary }).catch(() => {})
     await collectCustomResults(scoutedJobs, 'scout')
@@ -148,8 +188,10 @@ export async function runPipeline(ctx: PipelineCtx): Promise<RunReport> {
       ? 'No jobs found. Try broadening your target roles or locations in Settings.'
       : 'No saved jobs to process. Configure target roles in Settings so the agent can discover jobs automatically.'
     emit('info', { message: msg })
-    emit('done', emptyReport(Date.now() - t0))
-    return emptyReport(Date.now() - t0)
+    const report = emptyReport(Date.now() - t0)
+    emit('done', report)
+    await flushCanonical()
+    return report
   }
 
   emit('start', { total: scoutedJobs.length })
@@ -159,7 +201,7 @@ export async function runPipeline(ctx: PipelineCtx): Promise<RunReport> {
   let analysisFailed = state.analysisFailed ?? 0
   if (needsStage(state, 'analyze')) {
   orch.beginStage('analyst', 2)
-  emitRole(ctx, 'analyst', 'start')
+  emitRole(pipelineCtx, 'analyst', 'start')
   emit('agent_plan', {
     role: 'analyst',
     plan: `plan: right ${scoutedJobs.length} positions one by one AI match score, Extract matches/Missing keywords(minimum score threshold: ${ctx.agentCfg.minMatchScore}%)`,
@@ -171,13 +213,14 @@ export async function runPipeline(ctx: PipelineCtx): Promise<RunReport> {
     if (attempt > 1) orch.emitRetry('analyst', attempt, 2, 'Switch alternate model to rescore…')
 
     const s2 = await runAnalyze(scoutedJobs, controlledCtx)
+    assertAlive()
     const a2 = acceptAnalyze(s2)
 
     if (!a2.ok || !s2.data) {
       orch.recordFailure('analyst', a2.ok ? 'No data' : a2.reason)
       if (orch.isExhausted('analyst')) {
         const decision = await orch.decideOnExhaustion('analyst', 'All scoring failed', { jobsProcessed: 0 })
-        if (decision === 'abort') { emit('done', emptyReport(Date.now() - t0)); return emptyReport(Date.now() - t0) }
+        if (decision === 'abort') { const report = emptyReport(Date.now() - t0); emit('done', report); await flushCanonical(); return report }
         break analyzeLoop
       }
       orch.applyFix('analyst', 'all_scoring_failed')
@@ -194,7 +237,7 @@ export async function runPipeline(ctx: PipelineCtx): Promise<RunReport> {
       { scored: s2.data.scoredJobs.length, avgScore: avgScoreEval, aboveThreshold: aboveEval, failed: s2.data.failed ?? 0, threshold: ctx.agentCfg.minMatchScore },
     )
     if (dec2.decision === 'abort') {
-      emit('done', emptyReport(Date.now() - t0)); return emptyReport(Date.now() - t0)
+      const report = emptyReport(Date.now() - t0); emit('done', report); await flushCanonical(); return report
     }
     if (dec2.decision === 'ask_user' && dec2.ask_question) {
       const answer = await orch.ask('analyst', dec2.ask_question, dec2.ask_options ?? [
@@ -202,7 +245,7 @@ export async function runPipeline(ctx: PipelineCtx): Promise<RunReport> {
         { label: 'lower threshold 5%', value: 'lower', action: { field: 'minMatchScore', value: Math.max(40, ctx.agentCfg.minMatchScore - 5) } },
       ])
       await orch.applyOptionAction(answer, dec2.ask_options ?? [])
-      if (answer === 'abort') { emit('done', emptyReport(Date.now() - t0)); return emptyReport(Date.now() - t0) }
+      if (answer === 'abort') { const report = emptyReport(Date.now() - t0); emit('done', report); await flushCanonical(); return report }
     }
     if (dec2.decision === 'retry' && dec2.retry_fix && attempt < 2) {
       orch.applyFix(dec2.retry_fix, 'analyst')
@@ -221,7 +264,7 @@ export async function runPipeline(ctx: PipelineCtx): Promise<RunReport> {
       role: 'analyst',
       reflect: `Analysis completed: ${scoredJobs.length} rated, average score ${avgScore}%, ${aboveThreshold} reaches the threshold(≥${ctx.agentCfg.minMatchScore}%), ${analysisFailed} a failure(time consuming ${(s2.metrics.durationMs / 1000).toFixed(1)}s)`,
     })
-    emitRole(ctx, 'analyst', 'done', { count: scoredJobs.length, durationMs: s2.metrics.durationMs, summary: analystSummary, avgScore })
+    emitRole(pipelineCtx, 'analyst', 'done', { count: scoredJobs.length, durationMs: s2.metrics.durationMs, summary: analystSummary, avgScore })
     emit('stage_done', { stage: 'analyze', count: scoredJobs.length, durationMs: s2.metrics.durationMs })
     await recordRoleRun(ctx.userId, 'analyst', { count: scoredJobs.length, durationMs: s2.metrics.durationMs, summary: analystSummary }).catch(() => {})
     await collectCustomResults(scoutedJobs, 'analyst')
@@ -236,15 +279,17 @@ export async function runPipeline(ctx: PipelineCtx): Promise<RunReport> {
   if (scoredJobs.length === 0) {
     emit('info', { message: 'No jobs scored successfully. Check AI API keys.' })
     orch.complete({ processed: scoutedJobs.length, applied: 0, queued: 0, pending: 0, skipped: scoutedJobs.length })
-    emit('done', emptyReport(Date.now() - t0))
-    return emptyReport(Date.now() - t0)
+    const report = emptyReport(Date.now() - t0)
+    emit('done', report)
+    await flushCanonical()
+    return report
   }
 
   // ── Stage 3: Prepare (Writer) ──────────────────────────────────────────────
   let preparedPackages: ApplicationPackage[] = state.preparedPackages ?? []
   if (needsStage(state, 'prepare')) {
   orch.beginStage('writer', 2)
-  emitRole(ctx, 'writer', 'start')
+  emitRole(pipelineCtx, 'writer', 'start')
   const qualifiedCount = scoredJobs.filter(j => j.score >= ctx.agentCfg.minMatchScore).length
   emit('agent_plan', {
     role: 'writer',
@@ -280,6 +325,7 @@ export async function runPipeline(ctx: PipelineCtx): Promise<RunReport> {
     if (attempt > 1) orch.emitRetry('writer', attempt, 2, 'Regenerate your cover letter using a simplified template…')
 
     const s3 = await runPrepare(scoredJobs, controlledCtx, { allowResumeTailoring })
+    assertAlive()
     // Prepare is non-fatal; acceptPrepare returns ok=true even with partial failures
     const lettersCount = s3.data!.packages.filter(p => p.coverLetter).length
     const writerSummary = ctx.agentCfg.autoCoverLetter
@@ -302,7 +348,7 @@ export async function runPipeline(ctx: PipelineCtx): Promise<RunReport> {
         ? `Completed: generate ${lettersCount} cover letter, ${preparedPackages.length - lettersCount} no need to generate(time consuming ${(s3.metrics.durationMs / 1000).toFixed(1)}s)`
         : `Material preparation completed: ${preparedPackages.length} Application packages are ready(time consuming ${(s3.metrics.durationMs / 1000).toFixed(1)}s)`,
     })
-    emitRole(ctx, 'writer', 'done', { count: preparedPackages.length, durationMs: s3.metrics.durationMs, summary: writerSummary, letters: lettersCount })
+    emitRole(pipelineCtx, 'writer', 'done', { count: preparedPackages.length, durationMs: s3.metrics.durationMs, summary: writerSummary, letters: lettersCount })
     emit('stage_done', { stage: 'prepare', count: preparedPackages.length, durationMs: s3.metrics.durationMs })
     await recordRoleRun(ctx.userId, 'writer', { count: preparedPackages.length, durationMs: s3.metrics.durationMs, summary: writerSummary }).catch(() => {})
     await collectCustomResults(scoutedJobs, 'writer')
@@ -317,7 +363,7 @@ export async function runPipeline(ctx: PipelineCtx): Promise<RunReport> {
   let gateOutput: GateOutput = state.gateOutput ?? { approved: [], pending: [], skipped: [] }
   if (needsStage(state, 'gate')) {
   orch.beginStage('reviewer', 1)
-  emitRole(ctx, 'reviewer', 'start')
+  emitRole(pipelineCtx, 'reviewer', 'start')
   const gateRule = ctx.agentCfg.autoApply && !ctx.agentCfg.requireApproval
     ? `automatic preparation mode: point ≥ ${ctx.agentCfg.minMatchScore}% → Automatically complete material and form preparation; Each application must still be reviewed by the user and submitted with separate authorization`
     : 'Audit mode: All positions are queued for review; Position-by-position authorization is required before submission'
@@ -328,6 +374,7 @@ export async function runPipeline(ctx: PipelineCtx): Promise<RunReport> {
   await persist('gate', { scoutedJobs, scoredJobs, analysisFailed, preparedPackages })
 
     const s4 = await runGate(preparedPackages, controlledCtx)
+    assertAlive()
   gateOutput = s4.data ?? gateOutput
 
   const reviewerSummary = `${gateOutput.approved.length} approved, ${gateOutput.pending.length} pending, ${gateOutput.skipped.length} skipped`
@@ -335,7 +382,7 @@ export async function runPipeline(ctx: PipelineCtx): Promise<RunReport> {
     role: 'reviewer',
     reflect: `Review completed: ${gateOutput.approved.length} Approved to enter the application queue, ${gateOutput.pending.length} pending review, ${gateOutput.skipped.length} below the threshold to skip(time consuming ${(s4.metrics.durationMs / 1000).toFixed(1)}s)`,
   })
-  emitRole(ctx, 'reviewer', 'done', { count: gateOutput.approved.length + gateOutput.pending.length, durationMs: s4.metrics.durationMs, summary: reviewerSummary, approved: gateOutput.approved.length, pending: gateOutput.pending.length })
+  emitRole(pipelineCtx, 'reviewer', 'done', { count: gateOutput.approved.length + gateOutput.pending.length, durationMs: s4.metrics.durationMs, summary: reviewerSummary, approved: gateOutput.approved.length, pending: gateOutput.pending.length })
   emit('stage_done', { stage: 'gate', approved: gateOutput.approved.length, pending: gateOutput.pending.length, skipped: gateOutput.skipped.length, durationMs: s4.metrics.durationMs })
   await recordRoleRun(ctx.userId, 'reviewer', { count: gateOutput.approved.length + gateOutput.pending.length, durationMs: s4.metrics.durationMs, summary: reviewerSummary }).catch(() => {})
   await collectCustomResults(scoutedJobs, 'reviewer')
@@ -368,7 +415,7 @@ export async function runPipeline(ctx: PipelineCtx): Promise<RunReport> {
   let executorFailed: string[] = executeOutput.failed
   if (needsStage(state, 'execute')) {
   orch.beginStage('executor', 3)
-  emitRole(ctx, 'executor', 'start')
+  emitRole(pipelineCtx, 'executor', 'start')
   emit('agent_plan', {
     role: 'executor',
     plan: gateOutput.approved.length > 0
@@ -385,7 +432,8 @@ export async function runPipeline(ctx: PipelineCtx): Promise<RunReport> {
       orch.emitRetry('executor', attempt, 3, `DB write retry(wait ${backoffMs}ms)…`)
     }
 
-    const s5 = await runExecute(gateOutput.approved, ctx)
+    const s5 = await runExecute(gateOutput.approved, pipelineCtx)
+    assertAlive()
 
     // If the queue was temporarily unavailable, retry only the failed packages.
     if (s5.data!.failed.length > 0 && attempt < 3) {
@@ -415,7 +463,7 @@ export async function runPipeline(ctx: PipelineCtx): Promise<RunReport> {
         : `Ready to complete: No applications have been distributed in this round; All qualified positions are still pending review, Awaiting your explicit authorization`,
     })
     const executorSummary = `${executorQueued.length} explicitly authorized application(s) queued, ${executorFailed.length} failed`
-    emitRole(ctx, 'executor', 'done', { count: executorQueued.length, durationMs: s5.metrics.durationMs, summary: executorSummary, queued: executorQueued.length, failed: executorFailed.length })
+    emitRole(pipelineCtx, 'executor', 'done', { count: executorQueued.length, durationMs: s5.metrics.durationMs, summary: executorSummary, queued: executorQueued.length, failed: executorFailed.length })
     emit('stage_done', { stage: 'execute', queued: executorQueued.length, durationMs: s5.metrics.durationMs })
     await recordRoleRun(ctx.userId, 'executor', { count: executorQueued.length, durationMs: s5.metrics.durationMs, summary: executorSummary }).catch(() => {})
     await collectCustomResults(scoutedJobs, 'executor')
@@ -434,7 +482,7 @@ export async function runPipeline(ctx: PipelineCtx): Promise<RunReport> {
     return restored
   }
   orch.beginStage('auditor', 2)
-  emitRole(ctx, 'auditor', 'start')
+  emitRole(pipelineCtx, 'auditor', 'start')
   emit('agent_plan', {
     role: 'auditor',
     plan: `plan: Verify DB state, Statistical results(${executorQueued.length} Dispatched to unattended Worker / ${gateOutput.pending.length} Pending review / ${gateOutput.skipped.length} jump over), scanning Gmail mail`,
@@ -450,7 +498,8 @@ export async function runPipeline(ctx: PipelineCtx): Promise<RunReport> {
     }
 
     const fakeExecuteOutput = { queued: executorQueued, failed: executorFailed }
-    const s6 = await runAudit(fakeExecuteOutput, scoutedJobs, ctx)
+    const s6 = await runAudit(fakeExecuteOutput, scoutedJobs, pipelineCtx)
+    assertAlive()
     auditWarnings = s6.data!.warnings ?? []
 
     if (auditWarnings.length > 0) {
@@ -472,7 +521,7 @@ export async function runPipeline(ctx: PipelineCtx): Promise<RunReport> {
       role: 'auditor',
       reflect: `✅ This operation report: deal with ${report.processed} positions · 🚀 Distributed ${report.queued} indivual · ✅ Submission confirmed ${report.applied} indivual · ⏳ Pending review ${report.pending} indivual · ⏭ jump over ${report.skipped} indivual · ❌ fail ${report.failed} indivual${auditWarnings.length > 0 ? ` · ⚠ ${auditWarnings.length} warning` : ''} · Total time spent ${((Date.now() - t0) / 1000).toFixed(1)}s`,
     })
-    emitRole(ctx, 'auditor', 'done', { count: report.processed, durationMs: s6.metrics.durationMs, summary: auditorSummary, warnings: auditWarnings.length })
+    emitRole(pipelineCtx, 'auditor', 'done', { count: report.processed, durationMs: s6.metrics.durationMs, summary: auditorSummary, warnings: auditWarnings.length })
     emit('stage_done', { stage: 'audit', durationMs: s6.metrics.durationMs })
     await recordRoleRun(ctx.userId, 'auditor', { count: report.processed, durationMs: s6.metrics.durationMs, summary: auditorSummary }).catch(() => {})
     await collectCustomResults(scoutedJobs, 'auditor')
@@ -513,5 +562,6 @@ export async function runPipeline(ctx: PipelineCtx): Promise<RunReport> {
   }
 
   // Should never reach here, but TS needs it
+  await flushCanonical()
   return emptyReport(Date.now() - t0)
 }

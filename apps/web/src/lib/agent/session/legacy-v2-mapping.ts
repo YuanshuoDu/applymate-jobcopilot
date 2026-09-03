@@ -32,6 +32,7 @@ const PIPELINE_EVENTS = new Set([
   "start",
   "role_start",
   "role_done",
+  "pipeline_checkpoint",
 ])
 
 const TRANSCRIPT_EVENT_MAP: Record<string, Omit<LegacyV2Mapping, "opaque">> = {
@@ -53,6 +54,7 @@ const TRANSCRIPT_EVENT_MAP: Record<string, Omit<LegacyV2Mapping, "opaque">> = {
   session_memory: { eventType: "item.completed", actor: "system", itemType: "context_compaction", itemStatus: "completed", phase: "commentary" },
   final_report: { eventType: "turn.completed", actor: "orchestrator", itemType: "artifact", itemStatus: "completed", phase: "final_answer" },
   error: { eventType: "item.failed", actor: "system", itemType: "error", itemStatus: "failed", phase: "commentary" },
+  pipeline_checkpoint: { eventType: "step.completed", actor: "orchestrator", itemType: "artifact", itemStatus: "completed", phase: "commentary" },
 }
 
 function actorFromSpeaker(speaker: string): Actor {

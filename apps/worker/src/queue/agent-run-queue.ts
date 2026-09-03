@@ -4,12 +4,16 @@ import { workerPollingOptions } from "./worker-polling-options.js";
 import { redisConnection } from "../redis.js";
 import { getPool } from "../db/apply-results.js";
 import { measureWorkerResponseBytes, recordWorkerExternalApiUsage } from "../api-usage/external-api-usage.js";
+import { runCanonicalAgentTurn } from "./agent-run-turn-executor.js";
 
 export const AGENT_RUN_QUEUE_NAME = "agent-runs";
 
 export interface AgentRunTaskPayload {
   userId: string;
   sessionId: string;
+  /** Present for TurnEngine dispatch; omitted for reversible legacy fallback. */
+  turnId?: string;
+  executionId?: string;
 }
 
 const connection = redisConnection;
@@ -24,6 +28,7 @@ function internalRunUrl() {
 export const agentRunWorker = new Worker<AgentRunTaskPayload>(
   AGENT_RUN_QUEUE_NAME,
   async task => {
+    if (task.data.turnId) return runCanonicalAgentTurn(task, getPool());
     const url = internalRunUrl();
     const secret = process.env.AGENT_WORKER_SECRET;
     if (!url) throw new Error("AGENT_WEB_URL is required for scheduled agent runs");

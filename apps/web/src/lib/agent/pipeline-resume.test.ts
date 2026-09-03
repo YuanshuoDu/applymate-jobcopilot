@@ -61,4 +61,25 @@ describe("pipeline checkpoint recovery", () => {
     expect(result.processed).toBe(1)
     expect(mocks.checkpoint).toHaveBeenLastCalledWith(expect.objectContaining({ nextStage: "completed" }))
   })
+
+  it("maps checkpoints to canonical events and stops before the next stage when interrupted", async () => {
+    const { runPipeline, PipelineInterruptedError } = await import("./pipeline")
+    const controller = new AbortController()
+    const canonicalEvents: Array<{ event: string; index: number }> = []
+    mocks.scout.mockImplementation(async () => {
+      controller.abort()
+      return { data: { jobs: [job], discovered: 1 }, metrics: { durationMs: 1, count: 1 } }
+    })
+
+    await expect(runPipeline({
+      userId: "user_1", sessionId: "session_1", agentCfg: { dailyLimit: 5, minMatchScore: 70, autoApply: false, requireApproval: true, targetLocations: [], targetRoles: [], excludeCompanies: [], priorityCompanies: [], autoCoverLetter: false, coverTone: "professional", useTailoredCV: false, model: "test" } as never,
+      roleConfigs: {} as never, resumeText: "resume", resumeContent: {} as never, defaultResume: { id: "resume_1", name: "CV", templateId: null, templateOptions: null, directionId: null, basicsDetached: false },
+      aiConfig: { provider: "minimax", model: "test", apiKey: "key" }, autonomous: true, emit: vi.fn(), checkpoint: mocks.checkpoint, signal: controller.signal,
+      onCanonicalEvent: event => { canonicalEvents.push({ event: event.event, index: event.index }) },
+    })).rejects.toBeInstanceOf(PipelineInterruptedError)
+
+    expect(mocks.analyze).not.toHaveBeenCalled()
+    expect(canonicalEvents.find(event => event.event === "pipeline_checkpoint")).toEqual(expect.objectContaining({ event: "pipeline_checkpoint" }))
+    expect(mocks.checkpoint).toHaveBeenCalledWith(expect.objectContaining({ nextStage: "scout", eventIndex: expect.any(Number) }))
+  })
 })

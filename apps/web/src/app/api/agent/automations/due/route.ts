@@ -4,7 +4,7 @@ import { err, ok } from "@/lib/api-helpers"
 import { nextRunAfterCurrent } from "@/lib/agent/automation-schedule"
 import { enqueueAgentRun } from "@/lib/agent-run-queue-client"
 import { ensureAgentExecution } from "@/lib/agent/execution-control"
-import { isActiveAutomationExecution, resolveAutomationSession } from "@/lib/agent/automation-session"
+import { ensureAutomationTurn, isActiveAutomationExecution, resolveAutomationSession } from "@/lib/agent/automation-session"
 import { hasEffectiveEntitlement } from '@/lib/entitlements'
 import { isRuntimeAgentHarnessFeatureEnabled } from '@/lib/runtime-feature-flags'
 import { createDualWriteSession } from '@/lib/agent/session/dual-write'
@@ -91,6 +91,12 @@ async function startAutomation(automation: AutomationForRun, now: Date) {
     })
   }
 
+  const canonicalTurn = await ensureAutomationTurn(db, {
+    sessionId: session.id,
+    userId: automation.userId,
+    name: automation.name,
+  })
+
   const dualWriteEnabled = await isRuntimeAgentHarnessFeatureEnabled(
     'AGENT_PROTOCOL_V2_DUAL_WRITE',
     automation.userId,
@@ -101,6 +107,7 @@ async function startAutomation(automation: AutomationForRun, now: Date) {
       userId: automation.userId,
       goal: `Run scheduled automation: ${automation.name}`,
       source: 'automation',
+      turnId: canonicalTurn.turnId,
     })
     : null
   const recordTranscript = (input: AppendTranscriptEventInput) =>
@@ -122,7 +129,7 @@ async function startAutomation(automation: AutomationForRun, now: Date) {
     const execution = await ensureAgentExecution({ userId: automation.userId, sessionId: session.id, autonomous: true, restartForRun: true })
     if (!execution) throw new Error("Could not prepare automation execution")
     executionId = execution.id
-    const taskId = await enqueueAgentRun({ userId: automation.userId, sessionId: session.id })
+    const taskId = await enqueueAgentRun({ userId: automation.userId, sessionId: session.id, turnId: canonicalTurn.turnId, executionId: execution.id })
     await db.agentExecution.update({ where: { id: execution.id }, data: { workerTaskId: taskId } })
     await recordTranscript({
       sessionId: session.id,

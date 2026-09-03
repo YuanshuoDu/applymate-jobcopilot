@@ -6,7 +6,7 @@ import { err, isErrorResponse, ok, requireAuth } from "@/lib/api-helpers"
 import { nextRunAfterCurrent } from "@/lib/agent/automation-schedule"
 import { enqueueAgentRun } from "@/lib/agent-run-queue-client"
 import { ensureAgentExecution } from "@/lib/agent/execution-control"
-import { isActiveAutomationExecution, resolveAutomationSession } from "@/lib/agent/automation-session"
+import { ensureAutomationTurn, isActiveAutomationExecution, resolveAutomationSession } from "@/lib/agent/automation-session"
 import { hasEffectiveEntitlement } from '@/lib/entitlements'
 import { isRuntimeAgentHarnessFeatureEnabled } from '@/lib/runtime-feature-flags'
 import { createDualWriteSession } from '@/lib/agent/session/dual-write'
@@ -133,6 +133,12 @@ export async function POST(req: NextRequest, ctx: RouteCtx) {
     })
   }
 
+  const canonicalTurn = await ensureAutomationTurn(db, {
+    sessionId: session.id,
+    userId: auth.userId,
+    name: automation.name,
+  })
+
   const dualWriteEnabled = await isRuntimeAgentHarnessFeatureEnabled(
     'AGENT_PROTOCOL_V2_DUAL_WRITE',
     auth.userId,
@@ -143,6 +149,7 @@ export async function POST(req: NextRequest, ctx: RouteCtx) {
       userId: auth.userId,
       goal: `Run automation: ${automation.name}`,
       source: 'automation',
+      turnId: canonicalTurn.turnId,
     })
     : null
   const eventInput = {
@@ -178,7 +185,7 @@ export async function POST(req: NextRequest, ctx: RouteCtx) {
     const execution = await ensureAgentExecution({ userId: auth.userId, sessionId: session.id, autonomous: true, restartForRun: true })
     if (!execution) throw new Error("Could not prepare automation execution")
     executionId = execution.id
-    const taskId = await enqueueAgentRun({ userId: auth.userId, sessionId: session.id })
+    const taskId = await enqueueAgentRun({ userId: auth.userId, sessionId: session.id, turnId: canonicalTurn.turnId, executionId: execution.id })
     await db.agentExecution.update({ where: { id: execution.id }, data: { workerTaskId: taskId } })
     return ok({ session: serializeSession(session as SessionRow), event: serializeEvent(event), executionId: execution.id, taskId }, 201)
   } catch (error) {

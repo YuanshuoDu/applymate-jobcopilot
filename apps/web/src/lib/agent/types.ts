@@ -58,8 +58,19 @@ export interface PipelineCtx {
   resumeState?:  PipelineCheckpointState
   /** Program-owned persistence hook; models never receive or control it. */
   checkpoint?:   (state: PipelineCheckpointState) => Promise<void>
+  /** Canonical Turn adapter sink. Legacy callers leave this unset. */
+  onCanonicalEvent?: (event: PipelineCanonicalEvent) => Promise<void> | void
+  /** Abort-aware boundary owned by the canonical Turn executor. */
+  signal?:        AbortSignal
   /** Durable human-decision boundary supplied by the Orchestrator. */
   askUser?: (stage: string, question: string, options: AgentQuestionOption[]) => Promise<string>
+}
+
+export type PipelineCanonicalEvent = {
+  event: string
+  data: unknown
+  index: number
+  idempotencyKey: string
 }
 
 export type AgentQuestionOption = {
@@ -69,6 +80,13 @@ export type AgentQuestionOption = {
 }
 
 export type PipelineStage = "scout" | "analyze" | "prepare" | "gate" | "execute" | "audit" | "completed"
+
+export type PipelineRunToolInput = { mode?: "resume" | "start" }
+export type PipelineRunToolOutput = {
+  status: "completed" | "failed" | "interrupted"
+  report: RunReport | null
+  checkpoint: PipelineStage
+}
 
 /** Serializable stage boundary. All values are saved only after a stage succeeds. */
 export interface PipelineCheckpointState {
@@ -83,6 +101,8 @@ export interface PipelineCheckpointState {
   customAgentResults?: CustomAgentRunResult[]
   autonomous?: boolean
   startedAt?: string
+  /** Number of canonical pipeline events durably emitted before this checkpoint. */
+  eventIndex?: number
 }
 
 export type CustomAgentObservation = {

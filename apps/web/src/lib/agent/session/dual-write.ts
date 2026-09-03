@@ -45,6 +45,7 @@ function turnInput(input: EnsureV2TurnInput) {
     userId: input.userId,
     goal: input.goal,
     source: input.source,
+    turnId: input.turnId,
   }
 }
 

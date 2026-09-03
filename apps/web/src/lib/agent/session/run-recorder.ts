@@ -20,6 +20,10 @@ interface RunSessionRecorderInput {
   /** Enable the shadow V2 projection without changing legacy behavior when off. */
   dualWrite?: boolean
   source?: V2TurnSource
+  /** Bind the recorder to the canonical Turn created for this automation run. */
+  turnId?: string
+  /** Canonical TurnEngine owns the V2 terminal status for this run. */
+  manageV2Lifecycle?: boolean
 }
 
 interface FinalizeInput {
@@ -182,6 +186,15 @@ export function mapPipelineEventToTranscript(event: string, data: unknown): Tran
     }
   }
 
+  if (event === "pipeline_checkpoint") {
+    return {
+      type: "thinking_summary",
+      speaker: "Orchestrator",
+      title: "Pipeline checkpoint",
+      body: messageBody(data, ["nextStage"], "Pipeline checkpoint persisted."),
+    }
+  }
+
   if (event === "error") {
     return {
       type: "error",
@@ -235,6 +248,7 @@ export async function createRunSessionRecorder(db: AgentSessionDb, input: RunSes
       userId: input.userId,
       goal: input.goal,
       source: input.source ?? "system",
+      turnId: input.turnId,
     })
     : null
   const taskIdsByRole = new Map<PipelineSubAgentRole, string>()
@@ -303,19 +317,19 @@ export async function createRunSessionRecorder(db: AgentSessionDb, input: RunSes
         ? dualWrite.record(transcript, { name: event, payload })
         : appendTranscriptEvent(db, transcript)
     },
-    async finalize(input: FinalizeInput) {
+    async finalize(finalizeInput: FinalizeInput) {
       const result = await updateAgentSession(db, {
         sessionId: session.id,
-        status: input.status,
+        status: finalizeInput.status,
         completedAt: new Date(),
-        qualityScore: qualityScore(input.report, input.status),
-        memorySummary: summarizeReport(input.report),
+        qualityScore: qualityScore(finalizeInput.report, finalizeInput.status),
+        memorySummary: summarizeReport(finalizeInput.report),
       })
-      if (dualWrite) {
+      if (dualWrite && input.manageV2Lifecycle !== false) {
         await dualWrite.finalize({
-          status: input.status,
-          finalResponse: summarizeReport(input.report),
-          error: input.status === "failed" ? summarizeReport(input.report) : null,
+          status: finalizeInput.status,
+          finalResponse: summarizeReport(finalizeInput.report),
+          error: finalizeInput.status === "failed" ? summarizeReport(finalizeInput.report) : null,
         })
       }
       return result
@@ -336,7 +350,7 @@ export async function createRunSessionRecorder(db: AgentSessionDb, input: RunSes
         completedAt: null,
         memorySummary: message,
       })
-      if (dualWrite) await dualWrite.finalize({ status: "waiting_for_user", finalResponse: message })
+      if (dualWrite && input.manageV2Lifecycle !== false) await dualWrite.finalize({ status: "waiting_for_user", finalResponse: message })
       return result
     },
   }

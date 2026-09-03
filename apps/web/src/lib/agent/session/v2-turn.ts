@@ -9,6 +9,8 @@ export interface EnsureV2TurnInput {
   userId: string
   goal: string
   source: V2TurnSource
+  /** Bind a compatibility recorder to a Turn already created by the queue adapter. */
+  turnId?: string
 }
 
 export interface V2TurnHandle {
@@ -46,6 +48,15 @@ export async function ensureV2Turn(db: PrismaClient, input: EnsureV2TurnInput): 
         select: { id: true },
       })
       if (!session) throw new Error(`Agent session ${input.sessionId} does not exist for this user`)
+
+      if (input.turnId) {
+        const owned = await tx.agentTurn.findFirst({
+          where: { id: input.turnId, sessionId: input.sessionId, userId: input.userId },
+          select: { id: true },
+        })
+        if (!owned) throw new Error(`Agent turn ${input.turnId} does not belong to this user session`)
+        return { sessionId: input.sessionId, turnId: owned.id, userId: input.userId }
+      }
 
       const active = await findActiveTurn(tx, input)
       if (active) return { sessionId: input.sessionId, turnId: active.id, userId: input.userId }
