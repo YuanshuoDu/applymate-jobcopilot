@@ -1,6 +1,6 @@
 import type { SubagentJobPayload, SubagentLease, SubagentExecutionResult } from "./types.js"
 import { AgentTreeManager, type SubagentRunOutcome } from "./manager.js"
-import { assertMigratedRole, assertRoleActionAllowed, roleContract, type MigratedRole, type RoleContract } from "./role-contracts.js"
+import { assertMigratedRole, assertRoleActionAllowed, roleContract, type MigratedRole, type RoleContract } from "./scout-analyst-contracts.js"
 import { validateRoleResult, type StructuredRoleResult } from "./role-results.js"
 
 export type RoleWorkInput = {

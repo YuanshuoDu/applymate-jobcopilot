@@ -1,5 +1,5 @@
 import { makeEvidence, validateRoleResult, type AnalystFinding, type AnalystResult, type RoleEvidence, type ScoutCandidate, type ScoutResult } from "./role-results.js"
-import type { MigratedRole } from "./role-contracts.js"
+import type { MigratedRole } from "./scout-analyst-contracts.js"
 
 export function adaptLegacyRoleResult(role: MigratedRole, value: unknown, source = "legacy-role-adapter"): ScoutResult | AnalystResult {
   if (isStructured(value)) return validateRoleResult(value, role)

@@ -1,6 +1,6 @@
 import type { DurableWaitPort } from "../tools/coordination-types.js"
 import { AgentTreeManager } from "./manager.js"
-import { roleContract, type MigratedRole } from "./role-contracts.js"
+import { roleContract, type MigratedRole } from "./scout-analyst-contracts.js"
 import type { SubagentTaskRecord, SubagentTaskSpec } from "./types.js"
 
 export type RootRoleSpawnInput = {

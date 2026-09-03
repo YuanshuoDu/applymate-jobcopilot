@@ -1,5 +1,5 @@
 import { validateRoleResult, type AnalystResult, type RoleEvidence, type ScoutResult, type StructuredRoleResult } from "./role-results.js"
-import type { MigratedRole } from "./role-contracts.js"
+import type { MigratedRole } from "./scout-analyst-contracts.js"
 
 export type RoleExecutionOutcome = {
   readonly role: MigratedRole

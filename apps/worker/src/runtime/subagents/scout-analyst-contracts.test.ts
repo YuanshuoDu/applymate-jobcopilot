@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest"
 
-import { ANALYST_ROLE_CONTRACT, SCOUT_ROLE_CONTRACT, assertRoleActionAllowed, assertRoleToolAllowed, ROLE_TOOL_CONTRACTS } from "./role-contracts.js"
+import { ANALYST_ROLE_CONTRACT, SCOUT_ROLE_CONTRACT, assertRoleActionAllowed, assertRoleToolAllowed, ROLE_TOOL_CONTRACTS } from "./scout-analyst-contracts.js"
 
 describe("migrated role contracts", () => {
   it("keeps Scout and Analyst on explicit read-only allowlists", () => {
