@@ -53,6 +53,7 @@ ALTER TABLE "agent_items" ENABLE ROW LEVEL SECURITY;
 ALTER TABLE "agent_events" ENABLE ROW LEVEL SECURITY;
 ALTER TABLE "agent_outbox" ENABLE ROW LEVEL SECURITY;
 ALTER TABLE "sub_agent_tasks" ENABLE ROW LEVEL SECURITY;
+ALTER TABLE "agent_mailbox_messages" ENABLE ROW LEVEL SECURITY;
 ALTER TABLE "agent_transcript_events" ENABLE ROW LEVEL SECURITY;
 ALTER TABLE "agent_approvals" ENABLE ROW LEVEL SECURITY;
 ALTER TABLE "agent_action_reservations" ENABLE ROW LEVEL SECURITY;
@@ -165,6 +166,10 @@ CREATE POLICY candidate_agent_outbox_isolation ON "agent_outbox"
   WITH CHECK (EXISTS (SELECT 1 FROM "agent_sessions" session WHERE session."id" = "aggregateId" AND session."userId" = app_current_user_id()));
 DROP POLICY IF EXISTS candidate_sub_agent_task_isolation ON "sub_agent_tasks";
 CREATE POLICY candidate_sub_agent_task_isolation ON "sub_agent_tasks"
+  USING (EXISTS (SELECT 1 FROM "agent_sessions" session WHERE session."id" = "sessionId" AND session."userId" = app_current_user_id()))
+  WITH CHECK (EXISTS (SELECT 1 FROM "agent_sessions" session WHERE session."id" = "sessionId" AND session."userId" = app_current_user_id()));
+DROP POLICY IF EXISTS candidate_agent_mailbox_message_isolation ON "agent_mailbox_messages";
+CREATE POLICY candidate_agent_mailbox_message_isolation ON "agent_mailbox_messages"
   USING (EXISTS (SELECT 1 FROM "agent_sessions" session WHERE session."id" = "sessionId" AND session."userId" = app_current_user_id()))
   WITH CHECK (EXISTS (SELECT 1 FROM "agent_sessions" session WHERE session."id" = "sessionId" AND session."userId" = app_current_user_id()));
 DROP POLICY IF EXISTS candidate_agent_transcript_isolation ON "agent_transcript_events";

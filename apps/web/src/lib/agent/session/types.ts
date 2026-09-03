@@ -21,11 +21,27 @@ export type SubAgentRole =
 export type SubAgentTaskStatus =
   | "queued"
   | "running"
+  | "waiting"
+  | "completed"
+  | "interrupted"
+  | "cancelled"
+  | "closed"
+  // Legacy rows and the pre-Harness UI use `passed` for completed work.
   | "passed"
   | "failed"
   | "retrying"
   | "waiting_for_user"
   | "skipped"
+
+export type DurableSubAgentTaskStatus = Exclude<SubAgentTaskStatus, "passed">
+
+export function toDurableSubAgentTaskStatus(status: SubAgentTaskStatus): DurableSubAgentTaskStatus {
+  return status === "passed" ? "completed" : status
+}
+
+export function toLegacySubAgentTaskStatus(status: string): string {
+  return status === "completed" ? "passed" : status
+}
 
 export type TranscriptEventType =
   | "user_message"
