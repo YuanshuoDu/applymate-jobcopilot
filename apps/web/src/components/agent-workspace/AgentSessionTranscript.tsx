@@ -5,6 +5,7 @@ import { Btn } from '@/components/ui'
 import { useApi } from '@/lib/hooks'
 import type { AgentSessionDetail, AgentTranscriptEvent } from './session-view-model'
 import { approvalResponseIds, EVENT_TONE_COLOR, eventChrome, eventSubtitle, sessionStatusLabel, shouldCollapseByDefault } from './session-view-model'
+import { isNoiseEvent } from './agent-workspace-projection'
 import { ReplayBanner } from './ReplayBanner'
 import { TranscriptSpecialContent, type TranscriptAction } from './TranscriptSpecialBlocks'
 import { ensureActionReceipt } from './approval-receipt-client'
@@ -25,7 +26,7 @@ export function AgentSessionTranscript({ sessionId, onBackToLive }: {
   const { t } = useI18n()
   const { data: detailData, loading: detailLoading, refetch: refetchDetail } = useApi<DetailResponse>(`/api/agent/sessions/${sessionId}`)
   const { data: eventsData, loading: eventsLoading, refetch } = useApi<EventsResponse>(`/api/agent/sessions/${sessionId}/events`)
-  const events = React.useMemo(() => eventsData?.events ?? [], [eventsData?.events])
+  const events = React.useMemo(() => (eventsData?.events ?? []).filter(event => !isNoiseEvent(event.type)), [eventsData?.events])
   const session = detailData?.session
   const bottomRef = useRef<HTMLDivElement>(null)
   const [localEvents, setLocalEvents] = useState<AgentTranscriptEvent[]>([])

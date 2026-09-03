@@ -1,3 +1,5 @@
+import { isHeartbeatEvent } from './agent-workspace-projection'
+
 export interface AgentSessionSummary {
   id: string
   goal: string
@@ -28,6 +30,40 @@ export interface AgentTranscriptEvent {
   createdAt: string
 }
 
+export interface AgentWorkspaceArtifact {
+  id: string
+  title: string
+  type: string
+  version: number | string | null
+  hash: string | null
+  stale?: boolean
+  staleReason?: string | null
+  turnId?: string | null
+  updatedAt?: string
+}
+
+export interface AgentWorkspaceBudget {
+  used: number | null
+  limit: number | null
+  unit?: string
+  warning?: string | null
+}
+
+export interface AgentWorkspaceCompaction {
+  status: string
+  beforeTokens?: number | null
+  afterTokens?: number | null
+  lastCompactedAt?: string | null
+  message?: string | null
+}
+
+export interface AgentWorkspaceUncertainty {
+  id: string
+  label: string
+  detail: string
+  severity?: 'low' | 'medium' | 'high'
+}
+
 export interface AgentSessionDetail {
   id: string
   goal: string
@@ -41,9 +77,11 @@ export interface AgentSessionDetail {
   completedAt: string | null
   tasks: Array<{
     id: string
+    parentTaskId?: string | null
     role: string
     taskType: string
     status: string
+    goal?: string
     confidence: number | null
     failureReason: string | null
     createdAt: string
@@ -56,6 +94,10 @@ export interface AgentSessionDetail {
     title: string
     createdAt: string
   }>
+  artifacts?: AgentWorkspaceArtifact[]
+  budget?: AgentWorkspaceBudget
+  compaction?: AgentWorkspaceCompaction
+  uncertain?: AgentWorkspaceUncertainty[]
   applicationTasks: Array<{
     id: string
     status: string
@@ -65,7 +107,7 @@ export interface AgentSessionDetail {
     job: { company: string; role: string }
   }>
   execution: { id: string; status: string; checkpoint: string; error: string | null; attemptCount: number } | null
-  questions: Array<{ id: string; stage: string; question: string; options: unknown }>
+  questions: Array<{ id: string; stage: string; question: string; options: unknown; pending?: boolean; answered?: boolean; answerAvailable?: boolean }>
 }
 
 export function sessionStatusLabel(status: string): string {
@@ -158,7 +200,7 @@ export function eventChrome(type: string): { tone: EventTone; label: string } {
 }
 
 export function shouldCollapseByDefault(type: string): boolean {
-  return type === "thinking_summary"
+  return type === "thinking_summary" || isHeartbeatEvent(type)
 }
 
 export function eventSubtitle(

@@ -227,7 +227,7 @@ export function AgentSessionConsole({
           })}
         </div>
         <SessionFocusPanel sessionId={selectedSessionId} />
-        <AgentTeamList onAddAgent={onAddAgent} />
+        <AgentTeamList onAddAgent={onAddAgent} sessionId={selectedSessionId} />
         <AutomationList
           onCreate={onNewChat}
           onSessionStarted={(sessionId, policy) => {
