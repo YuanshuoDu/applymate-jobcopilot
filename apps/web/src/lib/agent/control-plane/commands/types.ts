@@ -39,6 +39,11 @@ export interface InterruptCommand extends CommandIdentity {
   expectedRevision?: number | null
 }
 
+export interface ForkCommand extends CommandIdentity {
+  lastTurnId: string
+  editContent?: InputContentPart[]
+}
+
 export interface CommandResult {
   inputId: string
   turnId: string
@@ -53,4 +58,11 @@ export interface InterruptResult {
   disposition: InterruptDisposition
   originalDisposition?: "interrupted"
   sequence: string
+}
+
+export interface ForkResult {
+  sessionId: string
+  turnId: string
+  lastTurnId: string
+  disposition: "forked" | "duplicate"
 }

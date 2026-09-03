@@ -4,6 +4,9 @@ export type AgentCommandErrorCode =
   | "automation_cannot_steer_user_turn"
   | "invalid_command"
   | "turn_not_active"
+  | "fork_boundary_not_found"
+  | "fork_boundary_active"
+  | "fork_idempotency_conflict"
 
 export class AgentCommandError extends Error {
   readonly status: 404 | 409 | 422
@@ -62,6 +65,18 @@ export function turnNotActive(turnId: string | null): AgentCommandError {
     409,
     { turnId },
   )
+}
+
+export function forkBoundaryNotFound(turnId: string): AgentCommandError {
+  return new AgentCommandError("fork_boundary_not_found", `Turn ${turnId} is not in the source session`, 409, { turnId })
+}
+
+export function forkBoundaryActive(turnId: string): AgentCommandError {
+  return new AgentCommandError("fork_boundary_active", "Fork boundary must be a terminal Turn", 409, { turnId })
+}
+
+export function forkIdempotencyConflict(): AgentCommandError {
+  return new AgentCommandError("fork_idempotency_conflict", "The idempotency key was already used for a different fork", 409)
 }
 
 export function isUniqueViolation(error: unknown): boolean {

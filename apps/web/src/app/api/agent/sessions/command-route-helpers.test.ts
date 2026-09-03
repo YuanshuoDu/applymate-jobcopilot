@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest"
 
-import { MAX_COMMAND_BODY_BYTES, parseInterruptBody, parseMessageBody } from "./command-route-helpers"
+import { MAX_COMMAND_BODY_BYTES, parseForkBody, parseInterruptBody, parseMessageBody } from "./command-route-helpers"
 
 function request(body: unknown, headers: HeadersInit = {}) {
   return new Request("http://localhost/api/agent/sessions/session_1/messages", {
@@ -40,5 +40,16 @@ describe("agent command route boundaries", () => {
     const response = await import("./command-route-helpers").then(({ readJsonBody }) => readJsonBody(oversized))
     expect(response).toBeInstanceOf(Response)
     expect((response as Response).status).toBe(422)
+  })
+
+  it("requires a URL-scoped last Turn and accepts edit-as-fork content only", async () => {
+    expect(parseForkBody({ clientMessageId: "fork_1", lastTurnId: "turn_1", editContent: [{ type: "text", text: "Use Dublin" }] }, request({}))).toMatchObject({
+      clientMessageId: "fork_1", lastTurnId: "turn_1", editContent: [{ type: "text", text: "Use Dublin" }],
+    })
+    const forbidden = parseForkBody({ clientMessageId: "fork_2", lastTurnId: "turn_1", userId: "other" }, request({}))
+    expect(forbidden).toBeInstanceOf(Response)
+    await expect((forbidden as Response).json()).resolves.toMatchObject({ error: { code: "invalid_command" } })
+    const header = parseForkBody({ lastTurnId: "turn_1" }, request({}, { "idempotency-key": "fork_3" }))
+    expect(header).toMatchObject({ clientMessageId: "fork_3", lastTurnId: "turn_1" })
   })
 })
