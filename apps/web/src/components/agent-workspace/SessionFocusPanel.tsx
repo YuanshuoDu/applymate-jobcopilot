@@ -3,14 +3,16 @@
 import React from 'react'
 import { useApi } from '@/lib/hooks'
 import type { AgentSessionDetail } from './session-view-model'
-import { confidenceLabel, sessionStatusLabel, taskStatusColor, taskStatusLabel } from './session-view-model'
+import { sessionStatusLabel } from './session-view-model'
 import { formQuestionFields } from '@/lib/agent/application-task-input'
 import { useI18n } from '@/lib/i18n'
+import { projectTaskTree } from './agent-workspace-projection'
+import { SessionStatusCards } from './SessionStatusCards'
+import { FocusTaskTree, focusQuestionOptions } from './session-focus-parts'
 
 interface DetailResponse {
   session: AgentSessionDetail
 }
-
 export function SessionFocusPanel({ sessionId }: { sessionId: string | null }) {
   const { t } = useI18n()
   if (!sessionId) {
@@ -20,7 +22,6 @@ export function SessionFocusPanel({ sessionId }: { sessionId: string | null }) {
       </Section>
     )
   }
-
   return <SessionFocusPanelInner sessionId={sessionId} />
 }
 
@@ -33,17 +34,14 @@ function SessionFocusPanelInner({ sessionId }: { sessionId: string }) {
   const applicationTasks = session?.applicationTasks ?? []
   const execution = session?.execution
   const questions = session?.questions ?? []
-  const queuedTasks = tasks.filter(task => ['queued', 'running', 'retrying', 'waiting_for_user'].includes(task.status))
-  const visibleTasks = queuedTasks.length > 0 ? queuedTasks : tasks.slice(-4)
+  const taskTree = React.useMemo(() => projectTaskTree(tasks), [tasks])
   const pendingApprovals = approvals.filter(approval => approval.status === 'pending')
   const [answers, setAnswers] = React.useState<Record<string, string>>({})
-
   React.useEffect(() => {
     const refresh = () => { void refetch() }
     window.addEventListener('applymate:sessions-changed', refresh)
     return () => window.removeEventListener('applymate:sessions-changed', refresh)
   }, [refetch])
-
   async function cancelApplicationTask(id: string) {
     const response = await fetch(`/api/agent/application-tasks?id=${encodeURIComponent(id)}`, { method: 'DELETE' })
     if (response.ok) {
@@ -51,7 +49,6 @@ function SessionFocusPanelInner({ sessionId }: { sessionId: string }) {
       window.dispatchEvent(new Event('applymate:sessions-changed'))
     }
   }
-
   async function cancelExecution(id: string) {
     const response = await fetch(`/api/agent/executions?id=${encodeURIComponent(id)}`, { method: 'DELETE' })
     if (response.ok) {
@@ -85,13 +82,14 @@ function SessionFocusPanelInner({ sessionId }: { sessionId: string }) {
 
   return (
     <>
+      <Section title="Session focus"><div style={{ padding: '9px 10px' }}><div style={{ fontSize: 12, fontWeight: 750, color: 'var(--text)' }}>{session?.goal ?? 'Goal unavailable'}</div>{session && <div style={rowMetaStyle}>Session {session.id} · {sessionStatusLabel(session.status)} · updated {new Date(session.updatedAt).toLocaleString('en-GB')}</div>}</div></Section>
       <Section title={t('agent.queuedTasks')}>
         {loading && <EmptyText>{t('agent.loadingTasks')}</EmptyText>}
         {error && <EmptyText>
           {t('agent.sessionDetailsUnavailable')} <button type="button" onClick={() => { void refetch() }} style={retryButtonStyle}>{t('agent.retry')}</button>
         </EmptyText>}
-        {!loading && !error && visibleTasks.length === 0 && <EmptyText>{t('agent.noTaskRecords')}</EmptyText>}
-        {visibleTasks.map(task => <TaskRow key={task.id} task={task} />)}
+        {!loading && !error && taskTree.length === 0 && <EmptyText>{t('agent.noTaskRecords')}</EmptyText>}
+        <FocusTaskTree nodes={taskTree} />
       </Section>
 
       <Section title={t('agent.approvals')}>
@@ -145,18 +143,22 @@ function SessionFocusPanelInner({ sessionId }: { sessionId: string }) {
       <Section title={t('agent.questionsWaiting')}>
         {!loading && questions.length === 0 && <EmptyText>{t('agent.noQuestions')}</EmptyText>}
         {questions.map(question => {
-          const options = questionOptions(question.options)
+          const options = focusQuestionOptions(question.options)
+          const answered = question.answered === true || (question.answerAvailable === true && question.pending === false)
+          const pending = !answered && question.pending !== false
           return <div key={question.id} style={rowStyle}>
             <div style={{ minWidth: 0, flex: 1 }}>
               <div style={rowTitleStyle}>{question.stage}</div>
               <div style={{ ...rowMetaStyle, whiteSpace: 'normal' }}>{question.question}</div>
               <div style={{ display: 'flex', flexWrap: 'wrap', gap: 5, marginTop: 7 }}>
-                {options.map(option => <button key={option.value} onClick={() => { void answerQuestion(question.id, option.value) }} style={resumeButtonStyle}>{option.label}</button>)}
+                {answered ? <span style={{ ...rowMetaStyle, color: 'var(--c-success)' }}>Answered · read-only</span> : pending ? options.map(option => <button key={option.value} onClick={() => { void answerQuestion(question.id, option.value) }} style={resumeButtonStyle}>{option.label}</button>) : <span style={{ ...rowMetaStyle, color: '#d97706' }}>Answer state uncertain · refresh before acting.</span>}
               </div>
             </div>
           </div>
         })}
       </Section>
+
+      <SessionStatusCards artifacts={session?.artifacts} budget={session?.budget} compaction={session?.compaction} uncertain={session?.uncertain} />
 
       <Section title={t('agent.sessionQuality')}>
         <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8 }}>
@@ -167,26 +169,6 @@ function SessionFocusPanelInner({ sessionId }: { sessionId: string }) {
         </div>
       </Section>
     </>
-  )
-}
-
-function TaskRow({ task }: { task: AgentSessionDetail['tasks'][number] }) {
-  const color = taskStatusColor(task.status)
-  return (
-    <div style={rowStyle}>
-      <span style={{ width: 7, height: 7, borderRadius: '50%', background: color, marginTop: 5, flexShrink: 0 }} />
-      <div style={{ minWidth: 0, flex: 1 }}>
-        <div style={rowTitleStyle}>{task.role} · {task.taskType}</div>
-        <div style={rowMetaStyle}>
-          {taskStatusLabel(task.status)} · {confidenceLabel(task.confidence)}
-        </div>
-        {task.failureReason && (
-          <div style={{ ...rowMetaStyle, color: 'var(--c-danger)', marginTop: 3 }}>
-            {task.failureReason}
-          </div>
-        )}
-      </div>
-    </div>
   )
 }
 
@@ -264,12 +246,3 @@ const badgeStyle: React.CSSProperties = {
 const answerInputStyle: React.CSSProperties = { display: 'block', width: '100%', boxSizing: 'border-box', marginTop: 6, padding: '5px 6px', fontSize: 10, border: '1px solid var(--border)', borderRadius: 5, background: 'var(--bg)' }
 const resumeButtonStyle: React.CSSProperties = { marginTop: 6, fontSize: 9, color: '#0f766e', border: '1px solid var(--border)', background: 'transparent', borderRadius: 5, padding: '3px 5px', cursor: 'pointer' }
 const retryButtonStyle: React.CSSProperties = { marginLeft: 4, padding: 0, border: 0, color: 'var(--primary)', background: 'transparent', cursor: 'pointer', font: 'inherit', fontWeight: 700, textDecoration: 'underline' }
-
-function questionOptions(value: unknown): Array<{ label: string; value: string }> {
-  if (!Array.isArray(value)) return []
-  return value.flatMap(option => {
-    if (!option || typeof option !== 'object') return []
-    const record = option as { label?: unknown; value?: unknown }
-    return typeof record.label === 'string' && typeof record.value === 'string' ? [{ label: record.label, value: record.value }] : []
-  })
-}

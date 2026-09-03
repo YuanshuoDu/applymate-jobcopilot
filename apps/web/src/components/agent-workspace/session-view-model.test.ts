@@ -13,6 +13,7 @@ import {
   taskStatusColor,
   taskStatusLabel,
 } from "./session-view-model"
+import { isNoiseEvent } from './agent-workspace-projection'
 
 describe("agent session view model", () => {
   it("uses distinct colors for the user and the primary agent", () => {
@@ -80,7 +81,9 @@ describe("agent session view model", () => {
 
   it("collapses thinking summaries by default", () => {
     expect(shouldCollapseByDefault("thinking_summary")).toBe(true)
+    expect(shouldCollapseByDefault("agent_heartbeat")).toBe(true)
     expect(shouldCollapseByDefault("subagent_result")).toBe(false)
+    expect(isNoiseEvent("agent_heartbeat")).toBe(true)
   })
 
   it("puts the time below the content through the subtitle helper", () => {
