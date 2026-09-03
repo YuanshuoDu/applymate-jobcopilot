@@ -2,9 +2,10 @@
 
 import React from 'react'
 import { ArrowUp, Sparkles } from 'lucide-react'
-import { ComposerMenuButton, ComposerMenuEmpty, ComposerMenuSection, formatBytes } from '@/components/agent-workspace/ComposerParts'
+import { formatBytes } from '@/components/agent-workspace/ComposerParts'
 import { useI18n } from '@/lib/i18n'
-import { useAgentTurnComposerContext } from './agent-turn-commands'
+import { appendComposerText, useAgentTurnComposerContext } from './agent-turn-commands'
+import { attachmentComposerContext, jobComposerContext, resumeComposerContext } from './AgentUnifiedStream.helpers'
 import { AgentComposerActiveTurn } from './AgentComposerActiveTurn'
 import { AgentComposerTools } from './AgentComposerTools'
 
@@ -85,7 +86,32 @@ export function AgentComposer({
   const composerInput = turnComposer?.chatInput ?? chatInput
   const composerLoading = turnComposer?.sending ?? chatLoading
   const handleInputChange = turnComposer?.setChatInput ?? onChatInputChange
-  const handleSend = turnComposer?.send ?? onSendChat
+  const handleSend = (text: string) => {
+    if (!turnComposer) {
+      onSendChat(text)
+      return
+    }
+    const outgoing = [text.trim(), attachmentComposerContext(attachedFiles)].filter(Boolean).join('\n\n')
+    turnComposer.send(outgoing)
+    for (const file of attachedFiles) onRemoveAttachedFile(file.id)
+  }
+  const appendContext = (text: string) => {
+    if (!turnComposer) {
+      onAppendComposerContext(text)
+      return
+    }
+    turnComposer.setChatInput(appendComposerText(turnComposer.chatInput, text))
+    onAddMenuOpenChange(false)
+    setTimeout(() => inputRef.current?.focus(), 0)
+  }
+  const handleAddJobContext = (job: ComposerJob) => {
+    if (turnComposer) appendContext(jobComposerContext(job))
+    else onAddJobContext(job)
+  }
+  const handleAddResumeContext = (resume: ComposerResume) => {
+    if (turnComposer) appendContext(resumeComposerContext(resume))
+    else onAddResumeContext(resume)
+  }
   const canSend = composerInput.trim().length > 0 && !composerLoading
   return (
     <div className="agent-composer" style={{ borderTop: '1px solid rgba(79,70,229,0.08)', padding: '12px 14px max(14px, env(safe-area-inset-bottom))', background: 'linear-gradient(180deg, rgba(248,250,252,0.72), var(--bg-secondary))', flexShrink: 0 }}>
@@ -172,9 +198,9 @@ export function AgentComposer({
             fileInputRef={fileInputRef}
             onAddMenuOpenChange={onAddMenuOpenChange}
             onAddSelectedFiles={onAddSelectedFiles}
-            onAddJobContext={onAddJobContext}
-            onAddResumeContext={onAddResumeContext}
-            onAppendComposerContext={onAppendComposerContext}
+            onAddJobContext={handleAddJobContext}
+            onAddResumeContext={handleAddResumeContext}
+            onAppendComposerContext={appendContext}
           />
           <button onClick={() => handleSend(composerInput)} disabled={!canSend}
             title={t('agent.sendMessage')}

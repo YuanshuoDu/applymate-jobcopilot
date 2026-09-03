@@ -17,6 +17,13 @@ export interface ComposerMessage {
   error?: string
 }
 
+export function appendComposerText(current: string, addition: string): string {
+  const next = addition.trim()
+  if (!next) return current
+  const existing = current.trim()
+  return existing ? `${existing}\n\n${next}` : next
+}
+
 export interface TurnCommandResult {
   inputId: string
   turnId: string

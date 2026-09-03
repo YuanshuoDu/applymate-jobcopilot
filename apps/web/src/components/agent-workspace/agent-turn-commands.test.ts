@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from 'vitest'
 import type { ActiveTurnDto } from './agent-session-state'
 import {
+  appendComposerText,
   reconcileComposerMessage,
   sendAgentInterrupt,
   sendAgentTurnMessage,
@@ -15,6 +16,12 @@ function response(body: unknown, status = 202) {
 }
 
 describe('agent Turn commands', () => {
+  it('appends Composer context into the active typed input', () => {
+    expect(appendComposerText('', '  Role context  ')).toBe('Role context')
+    expect(appendComposerText('Existing request', 'Role context')).toBe('Existing request\n\nRole context')
+    expect(appendComposerText('Existing request', '   ')).toBe('Existing request')
+  })
+
   it('sends an explicit steer command and reconciles its optimistic message', async () => {
     const fetcher = vi.fn<typeof fetch>().mockResolvedValue(response({ inputId: 'input_1', turnId: 'turn_1', disposition: 'steered', sequence: '8' }))
     const result = await sendAgentTurnMessage('session_1', 'Change direction', 'steer', activeTurn, 'message_1', fetcher)
