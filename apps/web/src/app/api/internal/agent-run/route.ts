@@ -12,12 +12,18 @@ function authorized(req: NextRequest) {
   return Boolean(secret) && req.headers.get("x-agent-worker-secret") === secret;
 }
 
-function taskInput(value: unknown): { userId: string; sessionId: string } | null {
+function taskInput(value: unknown): { userId: string; sessionId: string; turnId?: string; executionId?: string } | null {
   if (!value || typeof value !== "object") return null;
   const row = value as Record<string, unknown>;
+  const optional = (key: string) => row[key] === undefined || (typeof row[key] === "string" && row[key].length > 0)
   return typeof row.userId === "string" && typeof row.sessionId === "string"
-    && row.userId.length > 0 && row.sessionId.length > 0
-    ? { userId: row.userId, sessionId: row.sessionId }
+    && row.userId.length > 0 && row.sessionId.length > 0 && optional("turnId") && optional("executionId")
+    ? {
+        userId: row.userId,
+        sessionId: row.sessionId,
+        ...(typeof row.turnId === "string" ? { turnId: row.turnId } : {}),
+        ...(typeof row.executionId === "string" ? { executionId: row.executionId } : {}),
+      }
     : null;
 }
 
@@ -75,6 +81,9 @@ export async function POST(req: NextRequest) {
     source: "automation",
     aiConfig,
     autonomous,
+    turnId: input.turnId,
+    executionId: input.executionId,
+    signal: req.signal,
   });
 
   return ok({ status: report ? "completed" : "failed", report });

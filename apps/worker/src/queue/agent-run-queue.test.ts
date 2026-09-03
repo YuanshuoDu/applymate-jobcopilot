@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
-const mocks = vi.hoisted(() => ({ handler: undefined as undefined | ((job: { data: unknown }) => Promise<unknown>) }));
+const mocks = vi.hoisted(() => ({ handler: undefined as undefined | ((job: { data: unknown }) => Promise<unknown>), canonical: vi.fn() }));
 const pinnedFetch = vi.hoisted(() => vi.fn((input: string | URL, init?: unknown) => globalThis.fetch(String(input), init as RequestInit)));
 
 vi.mock("@jobcopilot/shared", async () => {
@@ -16,11 +16,13 @@ vi.mock("bullmq", () => ({
   }),
 }));
 vi.mock("ioredis", () => ({ Redis: vi.fn().mockImplementation(() => ({ disconnect: vi.fn() })) }));
+vi.mock("./agent-run-turn-executor.js", () => ({ runCanonicalAgentTurn: mocks.canonical }));
 
 describe("agent-run queue", () => {
   beforeEach(() => {
     vi.resetModules();
     mocks.handler = undefined;
+    mocks.canonical.mockReset();
     vi.stubEnv("AGENT_WEB_URL", "https://app.applymate.test/");
     vi.stubEnv("AGENT_WORKER_SECRET", "worker-secret");
     vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response(JSON.stringify({ status: "completed" }))));
@@ -50,5 +52,15 @@ describe("agent-run queue", () => {
     await expect(mocks.handler?.({ data: { userId: "user_1", sessionId: "session_1" } })).resolves.toEqual({
       status: "skipped", reason: "authorization-revoked",
     });
+  });
+
+  it("dispatches the canonical TurnEngine adapter only for a Turn-bound task", async () => {
+    mocks.canonical.mockResolvedValue({ status: "completed", summary: "pipeline complete" });
+    await import("./agent-run-queue.js");
+
+    await expect(mocks.handler?.({ data: { userId: "user_1", sessionId: "session_1", turnId: "turn_1", executionId: "execution_1" } }))
+      .resolves.toEqual({ status: "completed", summary: "pipeline complete" });
+    expect(mocks.canonical).toHaveBeenCalledWith(expect.objectContaining({ data: expect.objectContaining({ turnId: "turn_1", executionId: "execution_1" }) }), expect.anything());
+    expect(fetch).not.toHaveBeenCalled();
   });
 });

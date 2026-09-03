@@ -1,6 +1,6 @@
 import { Prisma } from "@prisma/client";
 import { db } from "@/lib/db";
-import { runPipeline } from "@/lib/agent/pipeline";
+import { PipelineInterruptedError, runPipeline } from "@/lib/agent/pipeline";
 import { AgentPauseError } from "@/lib/agent/orchestrator";
 import { createRunSessionRecorder } from "@/lib/agent/session/run-recorder";
 import { isRuntimeAgentHarnessFeatureEnabled } from "@/lib/runtime-feature-flags";
@@ -21,6 +21,9 @@ export interface AgentPipelineRunInput {
   sessionId?: string;
   /** Optional durable control-plane row supplied by the background worker. */
   executionId?: string;
+  /** Canonical automation Turn supplied by the TurnEngine queue adapter. */
+  turnId?: string;
+  signal?: AbortSignal;
   autonomous: boolean;
   source?: V2TurnSource;
   emit?: (event: string, data: unknown) => void;
@@ -97,13 +100,15 @@ export async function runAgentPipeline(input: AgentPipelineRunInput): Promise<Ru
   const dualWrite = await isRuntimeAgentHarnessFeatureEnabled(
     "AGENT_PROTOCOL_V2_DUAL_WRITE",
     input.userId,
-  ).catch(() => false);
+  ).catch(() => false) || Boolean(input.turnId);
   const recorder = await createRunSessionRecorder(db, {
     userId: input.userId,
     goal: input.sessionId ? "Agent Pipeline Run" : "Manual Agent Pipeline Run",
     sessionId: input.sessionId,
     dualWrite,
     source: input.source ?? "system",
+    turnId: input.turnId,
+    manageV2Lifecycle: !input.turnId,
   });
   const execution = input.executionId
     ? await db.agentExecution.findFirst({ where: { id: input.executionId, userId: input.userId, sessionId: recorder.sessionId } })
@@ -195,6 +200,7 @@ export async function runAgentPipeline(input: AgentPipelineRunInput): Promise<Ru
       // the per-application review and submit authorization checkpoints.
       autonomous: input.autonomous,
       emit,
+      signal: input.signal,
       resumeState: checkpointState(execution.state),
       checkpoint: async state => {
         if (!await isActiveAccount(input.userId)) throw new Error("Account is not active")
@@ -230,6 +236,10 @@ export async function runAgentPipeline(input: AgentPipelineRunInput): Promise<Ru
       if (paused) {
         await recorder.pause(`Waiting for your answer at ${error.stage}.`, error.stage as "scout" | "analyst" | "writer" | "reviewer" | "executor" | "auditor")
       }
+      return null
+    }
+    if (error instanceof PipelineInterruptedError) {
+      await Promise.allSettled(writes)
       return null
     }
     emit("error", { message: error instanceof Error ? error.message : "Agent run failed" });

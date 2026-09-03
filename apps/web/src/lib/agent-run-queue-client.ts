@@ -4,6 +4,9 @@ import { Redis } from "ioredis";
 export interface AgentRunTaskInput {
   userId: string;
   sessionId: string;
+  /** Canonical TurnEngine dispatch; omitted for reversible legacy fallback. */
+  turnId?: string;
+  executionId?: string;
 }
 
 let queue: Queue<AgentRunTaskInput> | null = null;
