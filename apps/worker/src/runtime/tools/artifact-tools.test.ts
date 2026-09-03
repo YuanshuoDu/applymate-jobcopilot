@@ -11,6 +11,7 @@ describe('typed Agent artifact tools', () => {
     }) as { artifact: Record<string, unknown>; item: Record<string, unknown> }
     expect(result.artifact.content).toBeUndefined()
     expect(result.item).toMatchObject({ type: 'artifact', lifecycle: 'draft', version: 1, hash: expect.stringMatching(/^sha256:/) })
+    expect(tool.capabilities).toEqual(['read', 'write'])
   })
 
   it('fails closed for stale preflight and review hashes', async () => {
@@ -34,5 +35,15 @@ describe('typed Agent artifact tools', () => {
     await expect(tool.execute({ scope: { userId: 'user-a' } } as never, {
       baseArtifactId: base.id, baseHash: base.hash, content: 'Engineer at Acme Corp from 2022 with 80% growth', constraints: {}, evidence: [{ sourceRef: 'resume:resume-base', content: 'Engineer at ApplyMate from 2022.' }],
     })).rejects.toMatchObject({ code: 'invalid_provenance' })
+  })
+
+  it('does not expose an artifact across tenants', async () => {
+    const store = new InMemoryArtifactToolStore()
+    const base = store.registerBase({ id: 'resume-base', type: 'resume', content: 'base', userId: 'user-a' })
+    await expect(store.read('user-b', base.id)).resolves.toBeNull()
+    await expect(store.writeDraft('user-b', {
+      baseArtifactId: base.id, baseHash: base.hash, content: 'draft', constraints: {},
+      evidence: [{ sourceRef: 'resume:resume-base', content: 'base' }], type: 'resume',
+    })).rejects.toMatchObject({ code: 'not_found' })
   })
 })

@@ -21,6 +21,7 @@ export type ArtifactToolRecord = {
   readonly constraintHash: string
   readonly provenanceRefs: readonly string[]
   readonly content: unknown
+  readonly ownerUserId?: string
 }
 
 export interface ArtifactToolStore {
@@ -75,7 +76,7 @@ function item(artifact: ArtifactToolRecord, reviewHash?: string): ArtifactItem {
 }
 
 function metadata(name: string, description: string, risk: 'read' | 'draft_write', idempotency: 'read_only' | 'idempotent' | 'requires_key'): Pick<RuntimeToolDefinition, 'schemaVersion' | 'name' | 'version' | 'description' | 'capabilities' | 'risk' | 'domain' | 'idempotency' | 'timeoutMs' | 'requiredCapabilities'> {
-  return { schemaVersion: 'agent-harness.v2' as const, name, version: '1', description, capabilities: ['read'] as const, risk, domain: 'resume' as const, idempotency, timeoutMs: 30_000, requiredCapabilities: [] as const }
+  return { schemaVersion: 'agent-harness.v2' as const, name, version: '1', description, capabilities: risk === 'read' ? ['read'] as const : ['read', 'write'] as const, risk, domain: 'resume' as const, idempotency, timeoutMs: 30_000, requiredCapabilities: [] as const }
 }
 
 export function createArtifactTools(store: ArtifactToolStore): RuntimeToolDefinition[] {
@@ -133,23 +134,28 @@ export function createArtifactTools(store: ArtifactToolStore): RuntimeToolDefini
 /** Small deterministic store for tool contract tests and local harness wiring. */
 export class InMemoryArtifactToolStore implements ArtifactToolStore {
   private readonly records = new Map<string, ArtifactToolRecord>()
-  registerBase(input: { id: string; type: ArtifactToolRecord['type']; content: unknown; constraintHash?: string }): ArtifactToolRecord {
+  registerBase(input: { id: string; type: ArtifactToolRecord['type']; content: unknown; constraintHash?: string; userId?: string }): ArtifactToolRecord {
     if (this.records.has(input.id)) throw new ArtifactToolError('stale_hash', 'A base artifact cannot be overwritten.')
     const hash = hashArtifactContent(input.content)
-    const record: ArtifactToolRecord = { id: input.id, type: input.type, lifecycle: 'base', version: 1, hash, baseArtifactId: input.id, baseHash: hash, constraintHash: input.constraintHash ?? hash, provenanceRefs: [`${input.type}:${input.id}`], content: input.content }
+    const record: ArtifactToolRecord = { id: input.id, type: input.type, lifecycle: 'base', version: 1, hash, baseArtifactId: input.id, baseHash: hash, constraintHash: input.constraintHash ?? hash, provenanceRefs: [`${input.type}:${input.id}`], content: input.content, ...(input.userId ? { ownerUserId: input.userId } : {}) }
     this.records.set(input.id, record)
     return record
   }
-  async read(userId: string, artifactId: string): Promise<ArtifactToolRecord | null> { return userId.trim() ? this.records.get(artifactId) ?? null : null }
+  async read(userId: string, artifactId: string): Promise<ArtifactToolRecord | null> {
+    if (!userId.trim()) return null
+    const record = this.records.get(artifactId)
+    return record && (!record.ownerUserId || record.ownerUserId === userId) ? record : null
+  }
   async writeDraft(_userId: string, input: ArtifactToolDraftInput & { type: ArtifactToolRecord['type'] }): Promise<ArtifactToolRecord> {
     const base = this.records.get(input.baseArtifactId)
+    if (base?.ownerUserId && base.ownerUserId !== _userId) throw new ArtifactToolError('not_found', 'Artifact is not available in the current tenant.')
     if (!base || base.hash !== input.baseHash) throw new ArtifactToolError('stale_hash', 'Draft base hash is stale or unavailable.')
     if (base.lifecycle !== 'base') throw new ArtifactToolError('stale_hash', 'Drafts must be based on an immutable base artifact.')
     if (input.evidence.length === 0) throw new ArtifactToolError('invalid_provenance', 'Draft requires evidence.')
     const id = input.artifactId ?? `${input.type}:${input.baseArtifactId}`
     const previous = this.records.get(id)
     if (previous?.lifecycle === 'draft' && input.expectedPreviousHash !== undefined && input.expectedPreviousHash !== previous.hash) throw new ArtifactToolError('stale_hash', 'Draft update has a stale previous hash.')
-    const record: ArtifactToolRecord = { id, type: input.type, lifecycle: 'draft', version: (previous?.version ?? 0) + 1, hash: hashArtifactContent(input.content), baseArtifactId: input.baseArtifactId, baseHash: input.baseHash, constraintHash: hashArtifactContent(input.constraints), provenanceRefs: input.evidence.map(entry => entry.sourceRef), content: input.content }
+    const record: ArtifactToolRecord = { id, type: input.type, lifecycle: 'draft', version: (previous?.version ?? 0) + 1, hash: hashArtifactContent(input.content), baseArtifactId: input.baseArtifactId, baseHash: input.baseHash, constraintHash: hashArtifactContent(input.constraints), provenanceRefs: input.evidence.map(entry => entry.sourceRef), content: input.content, ownerUserId: base.ownerUserId ?? _userId }
     this.records.set(id, record)
     return record
   }
