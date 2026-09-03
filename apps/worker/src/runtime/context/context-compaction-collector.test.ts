@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest"
 
-import { collectCompactionState } from "./context-compaction-collector.js"
+import { cloneCompactionState, collectCompactionState } from "./context-compaction-collector.js"
 import type { CompactionSource, CompactionState } from "./context-compaction-types.js"
 
 const state: CompactionState = {
@@ -41,5 +41,14 @@ describe("deterministic compaction collector", () => {
     expect(() => collectCompactionState(source([item, item]))).toThrow("duplicate ids")
     expect(() => collectCompactionState(source([item]), 1)).not.toThrow()
     expect(() => collectCompactionState({ state: { ...state, answers: undefined } as unknown as CompactionState, items: [item] })).toThrow("answers")
+  })
+
+  it("clones the normalized state before it is handed to snapshot persistence", () => {
+    const cloned = cloneCompactionState(state)
+    expect(cloned).toEqual(state)
+    expect(cloned.userConstraints).not.toBe(state.userConstraints)
+    expect(cloned.approvals).not.toBe(state.approvals)
+    expect(cloned.approvals[0]).not.toBe(state.approvals[0])
+    expect(cloned.openTasks).not.toBe(state.openTasks)
   })
 })

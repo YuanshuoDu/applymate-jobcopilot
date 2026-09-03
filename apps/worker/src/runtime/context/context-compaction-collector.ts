@@ -157,3 +157,19 @@ export function collectCompactionState(source: CompactionSource, maxNarrativeInp
 export function compactionStateCanonicalJson(state: CompactionState): string {
   return canonicalJson(state)
 }
+
+export function cloneCompactionState(state: CompactionState): CompactionState {
+  return {
+    ownerId: state.ownerId,
+    sessionId: state.sessionId,
+    throughSequence: state.throughSequence,
+    goal: state.goal,
+    userConstraints: [...state.userConstraints],
+    approvals: state.approvals.map(approval => ({ ...approval })),
+    answers: state.answers.map(answer => ({ ...answer })),
+    artifacts: state.artifacts.map(artifact => ({ ...artifact })),
+    openTasks: state.openTasks.map(task => ({ ...task })),
+    doNotRepeat: [...state.doNotRepeat],
+    facts: state.facts.map(fact => ({ ...fact })),
+  }
+}

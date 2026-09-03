@@ -30,6 +30,7 @@ export function completeCompactionItem(started: CompactionItemRecord, input: { s
   }
 }
 
-export function failCompactionItem(started: CompactionItemRecord, error: CompactionError): CompactionItemRecord {
-  return { ...started, status: "failed", body: `Context compaction failed (${error.code}); previous snapshot retained`, data: { ...started.data, errorCode: error.code, previousSnapshotRetained: true } }
+export function failCompactionItem(started: CompactionItemRecord, error: CompactionError, previousSnapshotRetained = true): CompactionItemRecord {
+  const snapshotMessage = previousSnapshotRetained ? "previous snapshot retained" : "no previous snapshot was available"
+  return { ...started, status: "failed", body: `Context compaction failed (${error.code}); ${snapshotMessage}`, data: { ...started.data, errorCode: error.code, previousSnapshotRetained } }
 }

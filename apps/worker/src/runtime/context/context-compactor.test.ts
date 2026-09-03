@@ -45,6 +45,16 @@ describe("ContextCompactor", () => {
     expect(result.item?.body).toContain("previous snapshot retained")
   })
 
+  it("does not claim a snapshot was retained when none existed", async () => {
+    const runtime = port({
+      loadLatest: vi.fn(async () => null),
+      publishAtomically: vi.fn(async () => { throw new Error("database unavailable") }),
+    })
+    const result = await new ContextCompactor(runtime, () => "safe summary", () => "compaction-item").compact(request())
+    expect(result.item).toMatchObject({ status: "failed", data: { previousSnapshotRetained: false } })
+    expect(result.item?.body).toContain("no previous snapshot was available")
+  })
+
   it("rejects a summarizer that cannot reduce tokens and reports the failure", async () => {
     const runtime = port()
     const result = await new ContextCompactor(runtime, (input) => "x".repeat(input.maxOutputCharacters), () => "compaction-item").compact(request({ source: { state: source.state, items: [source.items[0]] }, requested: true }))

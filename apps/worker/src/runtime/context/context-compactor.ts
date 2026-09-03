@@ -1,10 +1,11 @@
 import { redactSensitiveText } from "@jobcopilot/shared"
 
-import { collectCompactionState, estimateCompactionTokens } from "./context-compaction-collector.js"
+import { cloneCompactionState, collectCompactionState, estimateCompactionTokens } from "./context-compaction-collector.js"
 import { canonicalJson } from "./context-compaction-canonical.js"
 import { completeCompactionItem, createCompactionStartedItem, failCompactionItem, type CompactionItemIdFactory } from "./context-compaction-items.js"
 import { assertCompactionInvariantsPreserved } from "./context-compaction-validator.js"
 import { evaluateCompactionTrigger } from "./context-compaction-trigger.js"
+import type { CompactionSnapshotRef } from "./context-snapshot-compaction-seam.js"
 import type { ContextSnapshotCompactionPort } from "./context-snapshot-compaction-seam.js"
 import { CompactionError, type CompactionBounds, type CompactionRequest, type CompactionResult, type CompactionState, type CompactionTokenMeasurement, type NarrativeSummarizer } from "./context-compaction-types.js"
 
@@ -47,20 +48,24 @@ export class ContextCompactor {
 
     const started = createCompactionStartedItem({ sessionId: collection.state.sessionId, turnId: request.turnId, throughSequence: collection.state.throughSequence, source: request.source, reason: trigger.reason, id: request.itemId }, this.idFactory)
     let lifecycleStarted = false
+    let previousSnapshot: CompactionSnapshotRef | null = null
+    let previousSnapshotLoaded = false
     try {
       lifecycleStarted = true
       await this.port.recordStarted(started, request.scope)
+      previousSnapshot = await this.port.loadLatest({ scope: request.scope, sessionId: collection.state.sessionId })
+      previousSnapshotLoaded = true
       const narrativeSummary = boundedSummary(await this.summarizer({ sessionId: collection.state.sessionId, throughSequence: collection.state.throughSequence, narrativeText: collection.narrativeText, state: collection.state, itemCount: collection.sourceItemIds.length, maxOutputCharacters: limits.maxSummaryCharacters }), limits.maxSummaryCharacters)
-      const report = assertCompactionInvariantsPreserved(collection.state, collection.state)
-      const measurement = tokenMeasurement(collection.state, narrativeSummary, collection.beforeInputTokens)
-      const draft = { scope: request.scope, turnId: request.turnId, state: collection.state, narrativeSummary, tokenMeasurement: measurement, sourceItemIds: collection.sourceItemIds, reason: trigger.reason }
-      const startedSnapshot = await this.port.loadLatest({ scope: request.scope, sessionId: collection.state.sessionId })
+      const candidateState = cloneCompactionState(collection.state)
+      const report = assertCompactionInvariantsPreserved(collection.state, candidateState)
+      const measurement = tokenMeasurement(candidateState, narrativeSummary, collection.beforeInputTokens)
+      const draft = { scope: request.scope, turnId: request.turnId, state: candidateState, narrativeSummary, tokenMeasurement: measurement, sourceItemIds: collection.sourceItemIds, reason: trigger.reason }
       const completed = completeCompactionItem(started, { summary: narrativeSummary, measurement, report })
-      const snapshot = await this.port.publishAtomically({ scope: request.scope, previousSnapshot: startedSnapshot, draft, startedItem: started, completedItem: completed })
+      const snapshot = await this.port.publishAtomically({ scope: request.scope, previousSnapshot, draft, startedItem: started, completedItem: completed })
       return { status: "compacted", trigger, item: completed, snapshot, invariantReport: report, tokenMeasurement: measurement, failureRecorded: false }
     } catch (error: unknown) {
       const failure = error instanceof CompactionError ? error : new CompactionError("publish_failed", "Compaction failed")
-      const failed = failCompactionItem(started, failure)
+      const failed = failCompactionItem(started, failure, previousSnapshotLoaded && previousSnapshot !== null)
       let failureRecorded = false
       if (lifecycleStarted) {
         try { await this.port.recordFailed(failed, request.scope); failureRecorded = true } catch { failureRecorded = false }
