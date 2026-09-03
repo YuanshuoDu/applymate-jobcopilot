@@ -33,6 +33,14 @@ function packageFor(score: number, tailoredResumeId?: string): ApplicationPackag
   }
 }
 
+function draftArtifact(constraintHash: string) {
+  return {
+    id: 'resume:draft', kind: 'resume' as const, lifecycle: 'draft' as const, version: 1,
+    hash: 'sha256:' + 'a'.repeat(64), baseArtifactId: 'resume_1', baseHash: 'sha256:' + 'b'.repeat(64),
+    constraintHash, provenance: [{ sourceType: 'resume' as const, sourceRef: 'resume:resume_1', evidenceHash: 'sha256:' + 'b'.repeat(64) }],
+  }
+}
+
 describe('runGate', () => {
   it('keeps a threshold-matching tailored resume in review even when autopilot is configured', async () => {
     const result = await runGate([packageFor(75, 'tailored_1')], context())
@@ -54,5 +62,13 @@ describe('runGate', () => {
     expect(result.data?.pending).toHaveLength(1)
     expect(result.data?.skipped).toHaveLength(0)
     expect(ctx.askUser).toHaveBeenCalledWith('reviewer', expect.any(String), expect.any(Array))
+  })
+
+  it('stales an artifact when Agent tailoring constraints changed', async () => {
+    const ctx = context()
+    const result = await runGate([{ ...packageFor(75, 'tailored_1'), tailoredResumeArtifact: draftArtifact('sha256:' + 'c'.repeat(64)) }], ctx)
+    expect(result.data?.pending).toHaveLength(0)
+    expect(result.data?.skipped).toHaveLength(1)
+    expect(ctx.emit).toHaveBeenCalledWith('artifact_reviewed', expect.objectContaining({ status: 'stale' }))
   })
 })

@@ -6,6 +6,7 @@ import type { Job }          from '@prisma/client'
 import type { AiConfig }     from '@/lib/model-router'
 import type { ResumeContent } from '@/lib/types'
 import type { AgentRoleType } from '@/lib/agent/role-config'
+import type { ArtifactReview, ArtifactSummary } from '@/lib/agent/artifacts/types'
 
 export type { AgentRoleType }
 
@@ -144,6 +145,10 @@ export interface ApplicationPackage extends ScoredJob {
   tailoredKeywords?: string[]
   tailoredResumeId?: string
   tailoredResumeName?: string
+  tailoredResumeArtifact?: ArtifactSummary
+  coverLetterArtifact?: ArtifactSummary
+  artifactReview?: ArtifactReview
+  artifactReviews?: ArtifactReview[]
 }
 
 export interface PrepareOutput {

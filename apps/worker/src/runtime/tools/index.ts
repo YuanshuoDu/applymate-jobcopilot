@@ -8,6 +8,7 @@ import { InMemoryToolResultReferenceStore } from "./redaction.js"
 import { ToolRouter } from "./router.js"
 import type { PolicyEngine } from "../policy/index.js"
 import { createCoordinationTools } from "./coordination-tools.js"
+import { createArtifactTools, type ArtifactToolStore } from "./artifact-tools.js"
 import type { CoordinationRuntimeOptions, DurableWaitPort, CoordinationStore } from "./coordination-types.js"
 import { PgCoordinationStore } from "../mailbox/store.js"
 import type { AgentTreeManager } from "../subagents/manager.js"
@@ -29,6 +30,7 @@ export * from "./gmail-client.js"
 export * from "./gmail-store.js"
 export * from "./gmail-tools.js"
 export * from "./gmail-types.js"
+export * from "./artifact-tools.js"
 export * from "../policy/index.js"
 
 export type WorkerCoordinationOptions = {
@@ -38,6 +40,7 @@ export type WorkerCoordinationOptions = {
 }
 
 export type WorkerGmailOptions = GmailToolOptions
+export type WorkerArtifactOptions = { readonly store: ArtifactToolStore }
 
 export function createWorkerToolRuntime(
   pool: pg.Pool,
@@ -45,6 +48,7 @@ export function createWorkerToolRuntime(
   policy?: PolicyEngine,
   coordination?: WorkerCoordinationOptions,
   gmail?: WorkerGmailOptions,
+  artifacts?: WorkerArtifactOptions,
 ): { registry: ToolRegistry; router: ToolRouter; references: ToolLifecycleOptions["references"] } {
   const references = lifecycleOptions.references ?? new InMemoryToolResultReferenceStore()
   const definitions = createReadOnlyTools(createPostgresReadToolDataSource(pool))
@@ -57,6 +61,7 @@ export function createWorkerToolRuntime(
     definitions.push(...createCoordinationTools(options))
   }
   if (gmail) definitions.push(...createGmailTools(gmail))
+  if (artifacts) definitions.push(...createArtifactTools(artifacts.store))
   const registry = new ToolRegistry(definitions)
   const lifecycle = new ToolLifecycle({ ...lifecycleOptions, references })
   return { registry, router: new ToolRouter(registry, lifecycle, policy), references }

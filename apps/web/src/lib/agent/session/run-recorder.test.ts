@@ -87,6 +87,12 @@ describe("run session recorder", () => {
       title: "Unattended submission queued",
       body: "N26 · Software Engineer is queued for background submission.",
     })
+
+    expect(mapPipelineEventToTranscript("artifact_created", { role: "writer", artifact: { artifactId: "resume-1", artifactType: "resume", version: 2, hash: "sha256:1234567890123456" } })).toMatchObject({
+      type: "quality_gate",
+      speaker: "Writer",
+      body: expect.stringContaining("resume resume-1 v2"),
+    })
   })
 
   it("records mapped pipeline events as transcript rows", async () => {

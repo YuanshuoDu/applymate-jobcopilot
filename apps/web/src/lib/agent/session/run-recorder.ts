@@ -100,6 +100,21 @@ export function mapPipelineEventToTranscript(event: string, data: unknown): Tran
     }
   }
 
+  if (event === "artifact_created" || event === "artifact_reviewed") {
+    const record = data && typeof data === "object" ? data as { artifact?: { artifactId?: unknown; artifactType?: unknown; version?: unknown; hash?: unknown }; artifacts?: Array<{ artifactId?: unknown; artifactType?: unknown; version?: unknown; hash?: unknown }>; reviews?: Array<{ artifact?: { artifactId?: unknown; artifactType?: unknown; version?: unknown; hash?: unknown } }>; status?: unknown } : {}
+    const artifact = record.artifact ?? record.reviews?.[0]?.artifact ?? record.artifacts?.[0]
+    const id = typeof artifact?.artifactId === "string" ? artifact.artifactId : "artifact"
+    const kind = typeof artifact?.artifactType === "string" ? artifact.artifactType : "material"
+    const version = typeof artifact?.version === "number" ? ` v${artifact.version}` : ""
+    const hash = typeof artifact?.hash === "string" ? ` (${artifact.hash.slice(0, 19)}…)` : ""
+    return {
+      type: "quality_gate",
+      speaker: roleSpeaker(data, event === "artifact_created" ? "Writer" : "Reviewer"),
+      title: event === "artifact_created" ? "Artifact draft" : "Artifact review",
+      body: `${kind} ${id}${version}${hash}${record.status ? ` · ${String(record.status)}` : ""}`,
+    }
+  }
+
   if (event === "agent_plan") {
     return {
       type: "orchestrator_plan",

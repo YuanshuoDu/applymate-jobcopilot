@@ -2,7 +2,12 @@ import { Prisma } from '@prisma/client'
 import { db } from '@/lib/db'
 import { modelChat, parseAiJson, type AiConfig } from '@/lib/model-router'
 import { buildPersona } from '@/lib/persona'
-import { personaEvidenceContext } from '@/lib/persona-evidence'
+import { personaEvidenceContext, retrievePersonaEvidence } from '@/lib/persona-evidence'
+import { assertSupportedClaims, type EvidenceInput } from './artifacts/provenance'
+import { buildDraftArtifactSummary } from './artifacts/repository'
+import type { ArtifactConstraintSet } from './artifacts/types'
+import { hashArtifactContent } from './artifacts/hash'
+import type { ArtifactSummary } from './artifacts/types'
 
 export interface TailoredResumeArtifact {
   id: string
@@ -11,6 +16,8 @@ export interface TailoredResumeArtifact {
   company: string
   role: string
   reused: boolean
+  artifact: ArtifactSummary
+  provenanceChecked: true
 }
 
 type TailoringInput = {
@@ -34,16 +41,28 @@ export async function tailorResumeForAgent(input: TailoringInput): Promise<Tailo
   if (!job) throw new Error('Selected job was not found.')
   if (!job.description?.trim()) throw new Error('This job needs a description before tailoring the resume.')
   const evidence = await personaEvidenceContext(input.userId, 'tailor', `${job.role} ${job.description}`).catch(() => '')
+  const evidenceRows = await retrievePersonaEvidence(input.userId, 'tailor', `${job.role} ${job.description}`, 12).catch(() => [])
+  const evidenceInputs: EvidenceInput[] = [
+    { sourceType: 'resume', sourceRef: `resume:${resume.id}`, content: JSON.stringify(resume.content) },
+    ...evidenceRows.map(row => ({ sourceType: row.sourceType === 'persona_fact' ? 'persona_fact' as const : 'persona_evidence' as const, sourceRef: row.sourceRef, content: row.content })),
+  ]
+  const constraints: ArtifactConstraintSet = { jobId: job.id, role: job.role, company: job.company }
 
   const existing = await db.resume.findFirst({
     where: { userId: input.userId, parentResumeId: resume.id, targetJobId: job.id, origin: 'ai-adapted' },
     orderBy: { updatedAt: 'desc' },
   })
-  if (existing) return artifact(existing, job, true)
+  if (existing) {
+    const content = existing.content ?? null
+    const provenance = assertSupportedClaims({ content, evidence: evidenceInputs, allowedContext: [job.company, job.role, evidence] })
+    const summary = buildDraftArtifactSummary({ id: existing.id, kind: 'resume', content, baseArtifactId: resume.id, baseHash: hashArtifactContent(resume.content), constraints, provenance })
+    return artifact(existing, job, true, summary)
+  }
 
   const result = await modelChat([{ role: 'user', content: prompt(resume.content, job, persona, evidence) }], input.aiConfig, 2400)
   const content = parseAiJson<Record<string, unknown>>(result.text)
   if (!content || Array.isArray(content)) throw new Error('The writer returned an invalid resume document.')
+  const provenance = assertSupportedClaims({ content, evidence: evidenceInputs, allowedContext: [job.company, job.role, evidence] })
 
   const created = await db.resume.create({
     data: {
@@ -70,11 +89,13 @@ export async function tailorResumeForAgent(input: TailoringInput): Promise<Tailo
       color: '#3B6D11',
     },
   }).catch(() => undefined)
-  return artifact(created, job, false)
+  return artifact(created, job, false, buildDraftArtifactSummary({
+    id: created.id, kind: 'resume', content, baseArtifactId: resume.id, baseHash: hashArtifactContent(resume.content), constraints, provenance,
+  }))
 }
 
-function artifact(resume: { id: string; name: string }, job: { id: string; company: string; role: string }, reused: boolean): TailoredResumeArtifact {
-  return { id: resume.id, name: resume.name, jobId: job.id, company: job.company, role: job.role, reused }
+function artifact(resume: { id: string; name: string }, job: { id: string; company: string; role: string }, reused: boolean, artifact: ArtifactSummary): TailoredResumeArtifact {
+  return { id: resume.id, name: resume.name, jobId: job.id, company: job.company, role: job.role, reused, artifact, provenanceChecked: true }
 }
 
 function prompt(content: unknown, job: { company: string; role: string; description: string | null; keywords: string | null }, persona: string, evidence: string) {

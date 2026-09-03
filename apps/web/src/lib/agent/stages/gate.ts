@@ -26,6 +26,10 @@ import { requireLegacyPolicy } from '../policy/legacy'
 import { clientReceipt, issueLegacyReceipt } from '../approval/legacy-receipt'
 import { ensureV2Turn } from '../session/v2-turn'
 import { randomUUID } from 'node:crypto'
+import { hashArtifactConstraints } from '../artifacts/hash'
+import { preflightArtifact, reviewArtifact } from '../artifacts/review'
+import { artifactItemData } from '../artifacts/item'
+import { tailoringConstraints } from './prepare'
 
 // ── AI Quality Review ─────────────────────────────────────────────────────────
 
@@ -159,7 +163,33 @@ export async function runGate(
       continue
     }
 
-    pending.push(pkg)
+    const artifactSummaries = [pkg.tailoredResumeArtifact, pkg.coverLetterArtifact].filter((item): item is NonNullable<typeof item> => Boolean(item))
+    let reviewedPackage = pkg
+    if (artifactSummaries.length > 0) {
+      const constraintHash = hashArtifactConstraints(tailoringConstraints(pkg, ctx.agentCfg))
+      const preflightIssues = artifactSummaries.flatMap(artifact => {
+        const result = preflightArtifact(artifact, constraintHash)
+        return result.ok ? [] : result.issues.map(issue => `${artifact.kind}:${issue}`)
+      })
+      if (preflightIssues.length > 0) {
+        skipped.push(pkg)
+        emit('artifact_reviewed', { role: 'reviewer', status: 'stale', issues: preflightIssues, artifacts: artifactSummaries.map(artifact => artifactItemData(artifact)) })
+        emit('agent_observation', { role: 'reviewer', observation: `✕ Material preflight blocked ${pkg.job.company}: ${preflightIssues.join(', ')}` })
+        continue
+      }
+      const reviews = artifactSummaries.map(artifact => reviewArtifact({
+        artifact,
+        expectedHash: artifact.hash,
+        reviewerId: ctx.userId,
+        decision: 'passed',
+        evidence: [],
+        constraintHash,
+      }))
+      reviewedPackage = { ...pkg, artifactReview: reviews[0], artifactReviews: reviews }
+      emit('artifact_reviewed', { role: 'reviewer', status: 'passed', reviews: reviews.map((review, index) => ({ review: { ...review, evidence: undefined }, artifact: artifactItemData(artifactSummaries[index], review) })) })
+    }
+
+    pending.push(reviewedPackage)
     if (ctx.sessionId) {
       requireLegacyPolicy({
         userId: ctx.userId, sessionId: ctx.sessionId, turnId: `gate:${ctx.sessionId}`, stepId: `review:${pkg.job.id}`,
@@ -171,11 +201,11 @@ export async function runGate(
       userId: ctx.userId,
       jobId: pkg.job.id,
       sessionId: ctx.sessionId,
-      resumeId: pkg.tailoredResumeId ?? ctx.defaultResume.id,
-      coverLetterId: pkg.coverLetterId,
+      resumeId: reviewedPackage.tailoredResumeId ?? ctx.defaultResume.id,
+      coverLetterId: reviewedPackage.coverLetterId,
     })
     const approval = ctx.sessionId
-      ? await createReviewReceipt(ctx, task.id, pkg, projectedWaitIssued)
+      ? await createReviewReceipt(ctx, task.id, reviewedPackage, projectedWaitIssued)
       : null
     if (approval?.projectedWait) projectedWaitIssued = true
     emit('agent_observation', {
@@ -225,7 +255,17 @@ async function createReviewReceipt(
     where: { id: turn.turnId, sessionId, userId: ctx.userId },
     select: { revision: true, status: true },
   })
-  const payload = { applicationTaskId, jobId: pkg.job.id }
+  const artifactBindings = (pkg.artifactReviews ?? []).map(review => ({
+    artifactId: review.artifactId,
+    artifactHash: review.artifactHash,
+    constraintHash: review.constraintHash,
+    status: review.status,
+  }))
+  const payload = {
+    applicationTaskId,
+    jobId: pkg.job.id,
+    ...(artifactBindings.length ? { artifactBindings } : {}),
+  }
   const projectedWait = !projectedWaitAlreadyIssued && currentTurn?.status !== "waiting_for_approval"
   const result = await issueLegacyReceipt(db, {
     userId: ctx.userId,
