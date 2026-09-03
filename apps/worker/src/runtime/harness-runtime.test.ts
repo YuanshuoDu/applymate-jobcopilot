@@ -136,4 +136,13 @@ describe("MiniMax Harness runtime integration", () => {
     ])).not.toThrow()
     expect(() => assertReadOnlyHarnessTools([{ ...tool(), name: "gmail.send", domain: "gmail", risk: "external_write", idempotency: "requires_key", capabilities: ["read", "write", "external_write"] }])).toThrow(/non-read-only/)
   })
+
+  it("allows only the typed provenance-bound artifact draft tools", () => {
+    expect(() => assertReadOnlyHarnessTools([
+      { ...tool(), name: "resume.draft", domain: "resume", risk: "draft_write", idempotency: "requires_key", capabilities: ["read", "write"] },
+      { ...tool(), name: "cover_letter.draft", domain: "resume", risk: "draft_write", idempotency: "requires_key", capabilities: ["read", "write"] },
+    ])).not.toThrow()
+    expect(() => assertReadOnlyHarnessTools([{ ...tool(), name: "resume.draft", domain: "resume", risk: "internal_write", idempotency: "requires_key", capabilities: ["read", "write"] }])).toThrow(/non-read-only/)
+    expect(() => assertReadOnlyHarnessTools([{ ...tool(), name: "resume.draft", domain: "resume", risk: "draft_write", idempotency: "requires_key", capabilities: ["read"] }])).toThrow(/non-read-only/)
+  })
 })

@@ -25,7 +25,7 @@ export function assertReadOnlyHarnessTools(tools: readonly unknown[]): void {
   for (const tool of tools) {
     if (!tool || typeof tool !== "object" || Array.isArray(tool)) throw new TypeError("Harness tool definitions must be objects")
     const value = tool as Record<string, unknown>
-    if (!isReadOnly(value) && !isApprovalBoundGmailTool(value)) {
+    if (!isReadOnly(value) && !isApprovalBoundGmailTool(value) && !isApprovalBoundArtifactTool(value)) {
       throw new Error(`Harness refuses non-read-only tool: ${String(value.name ?? "unknown")}`)
     }
     if (!Array.isArray(value.capabilities) || !value.capabilities.includes("read")) {
@@ -42,6 +42,12 @@ function isApprovalBoundGmailTool(value: Record<string, unknown>): boolean {
   if (value.domain !== "gmail" || !Array.isArray(value.capabilities) || !value.capabilities.includes("read") || !value.capabilities.includes("write")) return false
   if (value.name === "gmail.create_draft") return value.risk === "internal_write" && value.idempotency === "requires_key"
   return value.name === "gmail.send" && value.risk === "external_write" && value.idempotency === "non_repeatable" && value.capabilities.includes("external_write")
+}
+
+function isApprovalBoundArtifactTool(value: Record<string, unknown>): boolean {
+  if (value.domain !== "resume" || value.risk !== "draft_write" || value.idempotency !== "requires_key") return false
+  if (!Array.isArray(value.capabilities) || !value.capabilities.includes("read") || !value.capabilities.includes("write")) return false
+  return value.name === "resume.draft" || value.name === "cover_letter.draft"
 }
 
 /** Compose the queue-facing executor from the canonical TurnEngine and model runtime. */
