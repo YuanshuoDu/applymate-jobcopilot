@@ -2,7 +2,7 @@ name: PR Lint
 on:
   pull_request:
     types: [opened, edited, synchronize, reopened]
-    branches: [master]
+    branches: [master, staging]
 permissions:
   contents: read
   pull-requests: write
@@ -18,7 +18,13 @@ jobs:
             const { owner, repo } = context.repo;
             const body = (pr.body || '').trim();
             const branch = pr.head.ref;
+            const base = pr.base.ref;
             const errors = [];
+
+            // Development PRs must target master; staging is a deployment mirror.
+            if (base !== 'master') {
+              errors.push(`Base branch \`${base}\` is not allowed. Development PRs must target \`master\`; \`staging\` is a deployment mirror.`);
+            }
 
             // 1. Must reference the issue. Evidence/docs-only PRs that must not
             // auto-close a still-blocked Gate issue may use Related to instead.
