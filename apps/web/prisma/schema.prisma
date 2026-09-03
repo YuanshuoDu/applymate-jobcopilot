@@ -351,6 +351,36 @@ enum JobWorkflowState {
   submitted
 }
 
+enum AgentArtifactLifecycle {
+  base
+  draft
+}
+
+// Durable source of truth for recruitment artifacts consumed by the Worker.
+// The Worker uses pg SQL; Web owns this Prisma schema and its migrations.
+model AgentArtifact {
+  id              String                @id
+  userId          String
+  jobId           String
+  artifactType    String
+  lifecycle       AgentArtifactLifecycle
+  baseId          String?
+  baseHash        String?
+  content         Json
+  hash            String
+  constraintHash  String
+  provenanceRefs  String[]              @default([])
+  evidenceRefs    String[]              @default([])
+  previousHash    String?
+  version         Int                   @default(1)
+  createdAt       DateTime              @default(now())
+  updatedAt       DateTime              @updatedAt
+
+  @@unique([userId, jobId, lifecycle, artifactType])
+  @@index([userId, jobId, lifecycle])
+  @@map("agent_artifact")
+}
+
 model Resume {
   id              String   @id @default(cuid())
   userId          String

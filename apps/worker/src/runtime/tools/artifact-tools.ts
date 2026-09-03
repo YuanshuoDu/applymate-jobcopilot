@@ -1,6 +1,8 @@
 import { Type, type Static } from '@sinclair/typebox'
+import type { Pool } from 'pg'
 import { hashArtifactContent } from '../subagents/artifact-adapters.js'
 import type { RuntimeToolDefinition, ToolExecutionContext } from './types.js'
+import { PgArtifactToolStore } from './artifact-store-pg.js'
 
 const Id = Type.String({ minLength: 1, maxLength: 256 })
 const Evidence = Type.Array(Type.Object({ sourceRef: Id, content: Type.String({ minLength: 1, maxLength: 8_000 }) }, { additionalProperties: false }), { minItems: 1, maxItems: 32 })
@@ -10,6 +12,14 @@ const ReviewInput = Type.Object({ artifactId: Id, expectedArtifactHash: Id, cons
 
 export type ArtifactToolDraftInput = Static<typeof DraftInput>
 export type ArtifactToolReviewInput = Static<typeof ReviewInput>
+export type ArtifactBaseInput = {
+  readonly id: string
+  readonly type: ArtifactToolRecord['type']
+  readonly jobId: string
+  readonly content: unknown
+  readonly constraintHash?: string
+  readonly userId: string
+}
 export type ArtifactToolRecord = {
   readonly id: string
   readonly type: 'resume' | 'cover_letter'
@@ -22,11 +32,14 @@ export type ArtifactToolRecord = {
   readonly provenanceRefs: readonly string[]
   readonly content: unknown
   readonly ownerUserId?: string
+  readonly jobId?: string
 }
 
 export interface ArtifactToolStore {
   read(userId: string, artifactId: string): Promise<ArtifactToolRecord | null>
   writeDraft(userId: string, input: ArtifactToolDraftInput & { type: ArtifactToolRecord['type'] }): Promise<ArtifactToolRecord>
+  registerBase(input: ArtifactBaseInput): ArtifactToolRecord | Promise<ArtifactToolRecord>
+  listForUser(userId: string, jobId: string): Promise<ArtifactToolRecord[]>
 }
 
 export type ArtifactItem = {
@@ -43,7 +56,7 @@ export type ArtifactItem = {
 }
 
 export class ArtifactToolError extends Error {
-  constructor(readonly code: 'not_found' | 'stale_hash' | 'invalid_provenance', message: string) {
+  constructor(readonly code: 'not_found' | 'stale_hash' | 'invalid_provenance' | 'precondition_failed', message: string) {
     super(message)
     this.name = 'ArtifactToolError'
   }
@@ -134,10 +147,13 @@ export function createArtifactTools(store: ArtifactToolStore): RuntimeToolDefini
 /** Small deterministic store for tool contract tests and local harness wiring. */
 export class InMemoryArtifactToolStore implements ArtifactToolStore {
   private readonly records = new Map<string, ArtifactToolRecord>()
-  registerBase(input: { id: string; type: ArtifactToolRecord['type']; content: unknown; constraintHash?: string; userId?: string }): ArtifactToolRecord {
+  registerBase(input: Omit<ArtifactBaseInput, 'jobId' | 'userId'> & { jobId?: string; userId?: string }): ArtifactToolRecord {
     if (this.records.has(input.id)) throw new ArtifactToolError('stale_hash', 'A base artifact cannot be overwritten.')
+    if (input.jobId && input.userId && [...this.records.values()].some(record => record.lifecycle === 'base' && record.jobId === input.jobId && record.ownerUserId === input.userId && record.type === input.type)) {
+      throw new ArtifactToolError('stale_hash', 'A base artifact cannot be overwritten.')
+    }
     const hash = hashArtifactContent(input.content)
-    const record: ArtifactToolRecord = { id: input.id, type: input.type, lifecycle: 'base', version: 1, hash, baseArtifactId: input.id, baseHash: hash, constraintHash: input.constraintHash ?? hash, provenanceRefs: [`${input.type}:${input.id}`], content: input.content, ...(input.userId ? { ownerUserId: input.userId } : {}) }
+    const record: ArtifactToolRecord = { id: input.id, type: input.type, lifecycle: 'base', version: 1, hash, baseArtifactId: input.id, baseHash: hash, constraintHash: input.constraintHash ?? hash, provenanceRefs: [`${input.type}:${input.id}`], content: input.content, ...(input.userId ? { ownerUserId: input.userId } : {}), ...(input.jobId ? { jobId: input.jobId } : {}) }
     this.records.set(input.id, record)
     return record
   }
@@ -154,9 +170,20 @@ export class InMemoryArtifactToolStore implements ArtifactToolStore {
     if (input.evidence.length === 0) throw new ArtifactToolError('invalid_provenance', 'Draft requires evidence.')
     const id = input.artifactId ?? `${input.type}:${input.baseArtifactId}`
     const previous = this.records.get(id)
-    if (previous?.lifecycle === 'draft' && input.expectedPreviousHash !== undefined && input.expectedPreviousHash !== previous.hash) throw new ArtifactToolError('stale_hash', 'Draft update has a stale previous hash.')
-    const record: ArtifactToolRecord = { id, type: input.type, lifecycle: 'draft', version: (previous?.version ?? 0) + 1, hash: hashArtifactContent(input.content), baseArtifactId: input.baseArtifactId, baseHash: input.baseHash, constraintHash: hashArtifactContent(input.constraints), provenanceRefs: input.evidence.map(entry => entry.sourceRef), content: input.content, ownerUserId: base.ownerUserId ?? _userId }
+    if (previous?.lifecycle === 'draft' && input.expectedPreviousHash !== undefined && input.expectedPreviousHash !== previous.hash) throw new ArtifactToolError('precondition_failed', 'Draft update has a stale previous hash.')
+    if (previous?.lifecycle === 'base') throw new ArtifactToolError('precondition_failed', 'A base artifact cannot be replaced by a draft.')
+    if (previous?.lifecycle === 'draft' && ((previous.jobId && base.jobId && previous.jobId !== base.jobId) || previous.baseArtifactId !== base.id || previous.type !== input.type)) throw new ArtifactToolError('precondition_failed', 'Draft identity does not match its base artifact.')
+    const record: ArtifactToolRecord = { id, type: input.type, lifecycle: 'draft', version: (previous?.version ?? 0) + 1, hash: hashArtifactContent(input.content), baseArtifactId: input.baseArtifactId, baseHash: input.baseHash, constraintHash: hashArtifactContent(input.constraints), provenanceRefs: input.evidence.map(entry => entry.sourceRef), content: input.content, ownerUserId: base.ownerUserId ?? _userId, ...(base.jobId ? { jobId: base.jobId } : {}) }
     this.records.set(id, record)
     return record
   }
+
+  async listForUser(userId: string, jobId: string): Promise<ArtifactToolRecord[]> {
+    return [...this.records.values()].filter(record => (!record.ownerUserId || record.ownerUserId === userId) && record.jobId === jobId)
+  }
+}
+
+/** Build the durable Worker store; the caller owns pool lifecycle and injection. */
+export function createArtifactToolStore(pool: Pool): ArtifactToolStore {
+  return new PgArtifactToolStore(pool)
 }
