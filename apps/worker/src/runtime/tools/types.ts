@@ -19,6 +19,11 @@ export interface ToolExecutionContext {
   readonly sessionId: string
   readonly turnId: string
   readonly stepId: string
+  readonly toolCallId?: string
+  /** Runtime-owned task lineage; never accepted from model tool input. */
+  readonly taskId?: string
+  readonly rootTaskId?: string
+  readonly actorRole?: PolicyRole
   readonly signal: AbortSignal
   readonly capabilities: readonly string[]
   reportProgress(progress: unknown): Promise<void>
@@ -62,10 +67,20 @@ export interface ToolRouterContext {
   readonly sessionId: string
   readonly turnId: string
   readonly stepId: string
+  /** Runtime-owned task lineage; never accepted from model tool input. */
+  readonly taskId?: string
+  readonly rootTaskId?: string
   readonly signal?: AbortSignal
   readonly capabilities?: readonly string[]
   /** Runtime-owned actor role; the model cannot supply or override this value. */
   readonly actorRole?: PolicyRole
+}
+
+export class ToolExecutionError extends Error {
+  constructor(readonly code: string, message: string) {
+    super(message)
+    this.name = "ToolExecutionError"
+  }
 }
 
 export interface ToolExecutionResult {

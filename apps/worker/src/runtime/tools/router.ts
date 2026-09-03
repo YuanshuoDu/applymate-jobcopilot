@@ -9,6 +9,7 @@ import type {
   ToolRouterContext,
   ToolExecutionContext,
 } from "./types.js"
+import { ToolExecutionError } from "./types.js"
 
 export type ToolRouterErrorCode = "runtime_scope_error" | "capability_denied" | "idempotency_conflict" | "timeout" | "cancelled" | "tool_execution_failed" | "policy_denied" | "policy_requires_approval" | "policy_requires_user_input" | "policy_version_unknown" | "policy_rewrite_expands_permissions"
 
@@ -108,6 +109,10 @@ export class ToolRouter {
       sessionId: context.sessionId,
       turnId: context.turnId,
       stepId: context.stepId,
+      toolCallId: request.id,
+      taskId: context.taskId,
+      rootTaskId: context.rootTaskId,
+      actorRole: context.actorRole,
       signal: controller.signal,
       capabilities: context.capabilities ?? [],
       reportProgress: async (progress) => {
@@ -146,6 +151,7 @@ export class ToolRouter {
   }
 
   private errorCode(error: unknown): string {
+    if (error instanceof ToolExecutionError) return error.code
     if (error instanceof ToolSchemaValidationError) return error.code
     if (error instanceof ToolRegistryError) return error.code
     if (error instanceof ToolRouterError) return error.code
