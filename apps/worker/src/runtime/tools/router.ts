@@ -48,6 +48,10 @@ export class ToolRouter {
 
   private async run(context: ToolRouterContext, request: ToolCallRequest): Promise<ToolExecutionResult> {
     const call: LifecycleCall = { ...context, id: request.id, toolName: request.toolName, toolVersion: request.toolVersion }
+    if (context.signal?.aborted) {
+      await this.lifecycle.failed(call, "cancelled", "cancelled", { message: "Tool execution was interrupted before it started" })
+      return { ...request, status: "cancelled", errorCode: "cancelled" }
+    }
     await this.lifecycle.started(call, request.input)
     try {
       if (!context.scope.userId.trim() || containsModelUserId(request.input)) {

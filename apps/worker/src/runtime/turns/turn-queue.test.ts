@@ -4,6 +4,7 @@ vi.mock("ioredis", () => ({ Redis: vi.fn().mockImplementation(() => ({ disconnec
 
 import { runTurnJob, TurnExecutionRegistry } from "./turn-queue.js"
 import type { TurnLease } from "./lease.js"
+import { RootAbortControllerRegistry } from "../interrupt/registry.js"
 
 const lease: TurnLease = {
   turnId: "turn_1", sessionId: "session_1", ownerId: "owner_1", userId: "user_1", leaseVersion: 1,
@@ -49,5 +50,23 @@ describe("Turn queue processor", () => {
     expect(result).toEqual({ status: "dead_lettered", reasonCode: "schema_invalid_payload" })
     expect(execute).not.toHaveBeenCalled()
     expect(fake.calls.some((sql) => sql.includes('INSERT INTO "agent_outbox"'))).toBe(true)
+  })
+
+  it("passes the shared root signal and returns interrupted without lease-loss requeue", async () => {
+    const fake = pool()
+    const interrupts = new RootAbortControllerRegistry()
+    const execute = vi.fn(async ({ lease: current, signal }: { lease: TurnLease; signal: AbortSignal }) => {
+      interrupts.stop({ userId: current.userId, sessionId: current.sessionId, turnId: current.turnId }, "user_stop")
+      if (!signal.aborted) await new Promise<void>((resolve) => signal.addEventListener("abort", () => resolve(), { once: true }))
+      return { status: "interrupted" as const }
+    })
+    const result = await runTurnJob(
+      { data: { turnId: "turn_1", sessionId: "session_1", ownerId: "owner_1" }, attemptsMade: 0 },
+      { pool: fake.pool, execute, interrupts },
+    )
+    expect(result).toEqual({ status: "interrupted" })
+    expect(execute).toHaveBeenCalledWith(expect.objectContaining({ signal: expect.any(AbortSignal) }))
+    expect(interrupts.size).toBe(0)
+    expect(fake.calls.some((sql) => sql.includes('SET "status" = $5'))).toBe(true)
   })
 })

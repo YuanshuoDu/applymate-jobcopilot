@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto"
 import type { ModelContinuation } from "@jobcopilot/agent-model"
 import { TurnLeaseError, type TurnLease } from "./lease.js"
+import { signalWasInterrupted } from "../interrupt/registry.js"
 import { buildModelRequest } from "./turn-engine-messages.js"
 import { runModelStep, type ModelStepResult } from "./turn-engine-model.js"
 import { TurnEventWriter, itemContent, type TurnItemHandle } from "./turn-engine-events.js"
@@ -108,12 +109,13 @@ export class TurnEngine {
             let toolOutcome: { wait: TurnEngineResult | null; snapshot: TurnEngineOptions["snapshot"] }
             try {
               toolOutcome = await this.executeTools(writer, step, output, snapshot, seenCallIds)
+              toolCalls += output.toolCalls.length
             } finally {
               budget.accountToolCalls(output.toolCalls.length)
-              toolCalls += output.toolCalls.length
             }
             snapshot = toolOutcome.snapshot
             const wait = toolOutcome.wait
+            this.assertAlive()
             await this.options.store.updateStep({ ...makeStepUpdate(this.options.lease, step.id, output, wait?.status === "waiting_for_approval" || wait?.status === "waiting_for_user" ? wait.status : "completed", this.now()), errorCode: wait?.errorCode ?? null })
             await writer.append("step.completed", step.id, null, { stepId: step.id, status: wait?.status ?? "completed", toolCallCount: output.toolCalls.length }, `step-completed:${step.id}`)
             if (wait) return { ...wait, stepCount: steps, toolCallCount: toolCalls }
@@ -138,12 +140,18 @@ export class TurnEngine {
           await writer.append("turn.completed", step.id, finalItem.id, { turnId: this.options.lease.turnId, finalItemId: finalItem.id, usage: finalResponse.usage }, "turn-completed")
           return { status: "completed", stepCount: steps, toolCallCount: toolCalls, finalItemId: finalItem.id }
         } catch (error: unknown) {
-          await this.options.store.updateStep(makeStepUpdate(this.options.lease, step.id, stepOutput, "failed", this.now(), turnErrorCode(error))).catch(() => undefined)
-          await writer.append("step.completed", step.id, null, { stepId: step.id, status: "failed", errorCode: turnErrorCode(error) }, `step-failed:${step.id}`).catch(() => undefined)
+          const status = signalWasInterrupted(this.signal) ? "interrupted" : "failed"
+          await this.options.store.updateStep(makeStepUpdate(this.options.lease, step.id, stepOutput, status, this.now(), turnErrorCode(error))).catch(() => undefined)
+          await writer.append("step.completed", step.id, null, { stepId: step.id, status, errorCode: turnErrorCode(error) }, `step-failed:${step.id}`).catch(() => undefined)
           throw error
         }
       }
     } catch (error: unknown) {
+      if (signalWasInterrupted(this.signal)) {
+        const code = turnErrorCode(error)
+        await writer.append("turn.interrupted", this.options.lease.turnId, null, { turnId: this.options.lease.turnId, errorCode: code }, "turn-interrupted").catch(() => undefined)
+        return { status: "interrupted", stepCount: steps, toolCallCount: toolCalls, errorCode: code }
+      }
       if (isTurnLeaseLoss(error, this.signal)) throw error instanceof TurnLeaseError ? error : new TurnLeaseError("lease_lost", "Turn execution lease was lost")
       const code = turnErrorCode(error)
       if (error instanceof NoProgressError) await writer.append("turn.no_progress", this.options.lease.turnId, null, { reasonCode: error.reasonCode, signature: error.observation.signature, stateFingerprint: error.observation.stateFingerprint }, "turn-no-progress").catch(() => undefined)
@@ -176,6 +184,7 @@ export class TurnEngine {
         continue
       }
       const result = await this.executeTool(writer, step, call)
+      this.assertAlive()
       if (result.status === "failed" && result.errorCode === "policy_requires_approval") return { wait: { status: "waiting_for_approval", stepCount: 0, toolCallCount: 0, errorCode: result.errorCode }, snapshot }
       if (result.status === "failed" && result.errorCode === "policy_requires_user_input") return { wait: { status: "waiting_for_user", stepCount: 0, toolCallCount: 0, errorCode: result.errorCode }, snapshot }
       snapshot = {
@@ -195,7 +204,8 @@ export class TurnEngine {
     let result
     try {
       result = await this.options.executeTool({ scope: this.options.scope, sessionId: this.options.lease.sessionId, turnId: this.options.lease.turnId, stepId: step.id, signal: this.signal, capabilities: this.options.capabilities, call: { id: call.id, toolName: call.name, toolVersion: "1", input: call.arguments } })
-    } catch {
+    } catch (error: unknown) {
+      if (signalWasInterrupted(this.signal)) throw error
       result = { id: call.id, toolName: call.name, toolVersion: "1", status: "failed" as const, errorCode: "tool_execution_failed" }
     }
     await writer.completeItem(callItem, { toolCallId: call.id, toolName: call.name, status: result.status, errorCode: result.errorCode }, this.now(), `tool-call-completed:${call.id}`)
@@ -226,6 +236,9 @@ export class TurnEngine {
   }
 
   private assertAlive(): void {
+    if (signalWasInterrupted(this.signal)) {
+      throw this.signal.reason instanceof Error ? this.signal.reason : new Error("Turn execution was interrupted")
+    }
     if (this.signal.aborted) throw new TurnLeaseError("lease_lost", "Turn execution stopped after lease loss")
   }
 

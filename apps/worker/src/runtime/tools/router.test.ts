@@ -61,6 +61,16 @@ describe("ToolRouter", () => {
     await expect(pending).resolves.toMatchObject({ status: "cancelled", errorCode: "cancelled" })
   })
 
+  it("does not emit a started event or invoke a tool after the root is stopped", async () => {
+    const execute = vi.fn(async () => ({ result: "should-not-run" }))
+    const { router, sink } = makeRouter(execute)
+    const controller = new AbortController()
+    controller.abort()
+    await expect(router.execute({ ...context, signal: controller.signal }, { ...request, id: "pre-stopped" })).resolves.toMatchObject({ status: "cancelled", errorCode: "cancelled" })
+    expect(execute).not.toHaveBeenCalled()
+    expect(sink.events.map((event) => event.phase)).toEqual(["cancelled"])
+  })
+
   it("rejects malformed inputs and outputs without invoking an unsafe result", async () => {
     const execute = vi.fn(async () => ({ result: "ok" }))
     const { router } = makeRouter(execute)

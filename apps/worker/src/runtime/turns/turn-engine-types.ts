@@ -57,7 +57,7 @@ export type TurnEngineStore = {
   updateStep(input: {
     lease: TurnLease
     stepId: string
-    status: "completed" | "failed" | "waiting_for_tool" | "waiting_for_approval" | "waiting_for_user"
+    status: "completed" | "failed" | "interrupted" | "waiting_for_tool" | "waiting_for_approval" | "waiting_for_user"
     finishReason: string | null
     errorCode: string | null
     inputTokens: number
@@ -151,7 +151,7 @@ export type TurnEngineOptions = {
 }
 
 export type TurnEngineResult = {
-  readonly status: "completed" | "waiting_for_dependency" | "waiting_for_approval" | "waiting_for_user" | "failed"
+  readonly status: "completed" | "waiting_for_dependency" | "waiting_for_approval" | "waiting_for_user" | "interrupted" | "failed"
   readonly stepCount: number
   readonly toolCallCount: number
   readonly finalItemId?: string
