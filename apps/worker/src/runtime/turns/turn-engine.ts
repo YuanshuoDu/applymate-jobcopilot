@@ -118,7 +118,10 @@ export class TurnEngine {
             this.assertAlive()
             await this.options.store.updateStep({ ...makeStepUpdate(this.options.lease, step.id, output, wait?.status === "waiting_for_approval" || wait?.status === "waiting_for_user" ? wait.status : "completed", this.now()), errorCode: wait?.errorCode ?? null })
             await writer.append("step.completed", step.id, null, { stepId: step.id, status: wait?.status ?? "completed", toolCallCount: output.toolCalls.length }, `step-completed:${step.id}`)
-            if (wait) return { ...wait, stepCount: steps, toolCallCount: toolCalls }
+            if (wait) {
+              if (wait.status === "waiting_for_user") await this.options.store.waitForUser?.({ lease: this.options.lease, now: this.now() })
+              return { ...wait, stepCount: steps, toolCallCount: toolCalls }
+            }
             continue
           }
 
@@ -187,6 +190,7 @@ export class TurnEngine {
       this.assertAlive()
       if (result.status === "failed" && result.errorCode === "policy_requires_approval") return { wait: { status: "waiting_for_approval", stepCount: 0, toolCallCount: 0, errorCode: result.errorCode }, snapshot }
       if (result.status === "failed" && result.errorCode === "policy_requires_user_input") return { wait: { status: "waiting_for_user", stepCount: 0, toolCallCount: 0, errorCode: result.errorCode }, snapshot }
+      if (result.status === "failed" && result.errorCode === "gmail_oauth_required") return { wait: { status: "waiting_for_user", stepCount: 0, toolCallCount: 0, errorCode: result.errorCode }, snapshot }
       snapshot = {
         ...snapshot,
         toolObservations: [...snapshot.toolObservations, {
