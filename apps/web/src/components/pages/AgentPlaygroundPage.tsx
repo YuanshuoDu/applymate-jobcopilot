@@ -14,6 +14,8 @@ import { sessionHeaderSubtitle, type AgentSessionsResponse } from '@/components/
 import type { AgentChatAction } from '@/components/agent-workspace/agent-chat-stream'
 import type { LogEntry, QuestionOption, RunSummary } from '@/components/agent-workspace/live-run-types'
 import type { SubmissionPolicySettings } from '@/components/agent-workspace/automation-policy'
+import { useAgentSessionState, useAgentSessionUrl } from '@/components/agent-workspace/agent-session-state'
+import { AgentTurnComposerProvider, useAgentTurnComposer } from '@/components/agent-workspace/agent-turn-commands'
 import { useNav } from '@/lib/nav-context'
 import { useI18n } from '@/lib/i18n'
 
@@ -35,8 +37,10 @@ export function AgentPlaygroundPage() {
 
   const [showAddModal,  setShowAddModal]  = useState(false)
   const [applyQueue,    setApplyQueue]    = useState<ApplyReadyJob[]>([])
-  const [selectedSessionId, setSelectedSessionId] = useState<string | null>(null)
-  const [liveSessionId, setLiveSessionId] = useState<string | null>(null)
+  const { sessionId, setSessionId } = useAgentSessionUrl()
+  const selectedSessionId = sessionId
+  const { activeTurn, refetch: refetchTurnState } = useAgentSessionState(sessionId)
+  const turnComposer = useAgentTurnComposer(sessionId, activeTurn, refetchTurnState)
   const [conversationTitle, setConversationTitle] = useState<string | null>(null)
   const [conversationSubtitle, setConversationSubtitle] = useState<string | null>(null)
   const [sessionsRefreshVersion, setSessionsRefreshVersion] = useState(0)
@@ -81,8 +85,7 @@ export function AgentPlaygroundPage() {
     runIdRef.current += 1
     esRef.current?.close()
     esRef.current = null
-    setSelectedSessionId(null)
-    setLiveSessionId(null)
+    setSessionId(null)
     setConversationTitle(null)
     setConversationSubtitle(null)
     currentRoleRef.current = null
@@ -107,8 +110,7 @@ export function AgentPlaygroundPage() {
     setApplyQueue([])
     setRunSummary(null)
     setActiveRunPolicy(null)
-    setLiveSessionId(sessionId)
-    setSelectedSessionId(sessionId)
+    setSessionId(sessionId)
     setConversationTitle(goal)
     setConversationSubtitle(subtitle)
     // The server owns this preference and scopes it to the authenticated user.
@@ -118,19 +120,19 @@ export function AgentPlaygroundPage() {
   const restoreLastSession = useCallback((data: AgentSessionsResponse) => {
     if (initialSessionRestoredRef.current) return
     initialSessionRestoredRef.current = true
+    if (sessionId) return
     const session = data.sessions.find(item => item.id === data.lastOpenedSessionId)
     if (session) selectSession(session.id, session.goal, sessionHeaderSubtitle(session))
-  }, [selectSession])
+  }, [selectSession, sessionId])
 
-  const handleDeletedSession = useCallback((sessionId: string) => {
-    // A chat session is writable through liveSessionId even when it was never
-    // selected in the sidebar. Clear either reference before another message
-    // can reuse the deleted ID.
-    if (sessionId === selectedSessionId || sessionId === liveSessionId) {
+  const handleDeletedSession = useCallback((deletedSessionId: string) => {
+    // The URL is the only session identity. Clear it before another message
+    // can reuse a deleted ID.
+    if (deletedSessionId === sessionId) {
       resetLiveWorkspace()
     }
     setSessionsRefreshVersion(v => v + 1)
-  }, [liveSessionId, resetLiveWorkspace, selectedSessionId])
+  }, [resetLiveWorkspace, sessionId])
 
   // ── SSE Run ────────────────────────────────────────────────────────────────
 
@@ -320,20 +322,20 @@ export function AgentPlaygroundPage() {
     esRef.current?.close(); esRef.current = null
     currentRoleRef.current = null
     setCurrentRole(null); setRunDone(true)
-    const sessionId = liveSessionId ?? selectedSessionId
-    if (!sessionId) {
+    const currentSessionId = sessionId
+    if (!currentSessionId) {
       addLog({ type: 'info', message: '— Frontend flow stopped; No cancelable sessions have been created for this run.', time: new Date() })
       return
     }
 
-    const response = await fetch(`/api/agent/executions?sessionId=${encodeURIComponent(sessionId)}`, { method: 'DELETE' })
+    const response = await fetch(`/api/agent/executions?sessionId=${encodeURIComponent(currentSessionId)}`, { method: 'DELETE' })
     if (!response.ok && response.status !== 404) {
       const body = await response.json().catch(() => ({})) as { error?: string }
       throw new Error(body.error ?? 'Could not cancel the Agent execution.')
     }
     addLog({ type: 'info', message: '— Canceled Agent run; The background will not continue to process or submit new applications..', time: new Date() })
     window.dispatchEvent(new Event('applymate:sessions-changed'))
-  }, [addLog, liveSessionId, selectedSessionId])
+  }, [addLog, sessionId])
 
   const isRunning = !!currentRole || (runLog.length > 0 && !runDone)
   const visibleWaitingQuestion = waitingQuestion && runLog.some(entry =>
@@ -665,7 +667,8 @@ export function AgentPlaygroundPage() {
             onSessionsLoaded={restoreLastSession}
           />
         </div>
-        <AgentUnifiedStream
+        <AgentTurnComposerProvider value={turnComposer}>
+          <AgentUnifiedStream
             log={runLog}
             running={isRunning}
             summary={runSummary}
@@ -675,7 +678,7 @@ export function AgentPlaygroundPage() {
             pendingCount={pendingCount}
             autonomousMode={autonomousMode}
             resetVersion={chatResetVersion}
-            resumeSessionId={liveSessionId}
+            resumeSessionId={sessionId}
             conversationTitle={conversationTitle}
             conversationSubtitle={conversationSubtitle}
             onAnswerQuestion={handleAnswerQuestion}
@@ -709,15 +712,15 @@ export function AgentPlaygroundPage() {
             }}
             onChatAction={handleChatAction}
             onAppendLog={addLog}
-            onSessionRecorded={(sessionId, goal, subtitle) => {
-              setLiveSessionId(sessionId)
-              setSelectedSessionId(sessionId)
+            onSessionRecorded={(recordedSessionId, goal, subtitle) => {
+              setSessionId(recordedSessionId)
               if (goal) setConversationTitle(goal)
               if (subtitle) setConversationSubtitle(subtitle)
-              void fetch(`/api/agent/sessions/${encodeURIComponent(sessionId)}`, { method: 'PATCH' }).catch(() => undefined)
+              void fetch(`/api/agent/sessions/${encodeURIComponent(recordedSessionId)}`, { method: 'PATCH' }).catch(() => undefined)
               setSessionsRefreshVersion(v => v + 1)
             }}
-        />
+          />
+        </AgentTurnComposerProvider>
       </div>
     </div>
   )
