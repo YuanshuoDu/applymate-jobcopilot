@@ -9,6 +9,9 @@ import { approvalResponseIds, type AgentTranscriptEvent } from '@/components/age
 import type { LogEntry, QuestionOption } from '@/components/agent-workspace/live-run-types'
 import { shouldStickToBottom } from './AgentUnifiedStream.helpers'
 import { useI18n } from '@/lib/i18n'
+import { HarnessItem } from './v2/HarnessItem'
+import { highlightedFinalItemIds } from './v2/HarnessTimeline'
+import { normalizeTimelineItem, type TimelineItem } from './v2/timeline-reducer'
 
 interface AgentLiveStreamBodyProps {
   log: LogEntry[]
@@ -44,6 +47,8 @@ export function AgentLiveStreamBody({
   const { t } = useI18n()
   const applyPending = applyQueue.filter((job) => !job.url?.startsWith('_applied'))
   const actedApprovalIds = React.useMemo(() => approvalResponseIds(liveBlocks), [liveBlocks])
+  const harnessItems = React.useMemo(() => liveBlocks.map(toHarnessItem).filter((item): item is TimelineItem => item !== null), [liveBlocks])
+  const highlightedFinalIds = React.useMemo(() => highlightedFinalItemIds(harnessItems), [harnessItems])
 
   React.useEffect(() => {
     if (!revealThinkingVersion) return
@@ -113,15 +118,11 @@ export function AgentLiveStreamBody({
             return <LiveLogTranscriptBlock key={i} entry={entry} speaker={entrySpeaker(entry)} accent={entryAccent(entry)} title={entryTitle(entry)} />
           })}
 
-          {liveBlocks.map(block => (
-            <LiveTranscriptBlock
-              key={block.id}
-              event={block}
-              actedApprovalIds={actedApprovalIds}
-              revealThinkingVersion={revealThinkingVersion}
-              onAction={onLiveBlockAction}
-            />
-          ))}
+          {liveBlocks.map(block => {
+            const harnessItem = toHarnessItem(block)
+            if (harnessItem) return <HarnessItem key={block.id} item={harnessItem} highlightedFinal={highlightedFinalIds.has(harnessItem.id)} />
+            return <LiveTranscriptBlock key={block.id} event={block} actedApprovalIds={actedApprovalIds} revealThinkingVersion={revealThinkingVersion} onAction={onLiveBlockAction} />
+          })}
 
           {applyQueue.length > 0 && (
             <div style={{ flexShrink: 0, margin: '8px 0', borderRadius: 10, border: '1px solid var(--border)', overflow: 'hidden' }}>
@@ -143,6 +144,14 @@ export function AgentLiveStreamBody({
       <div ref={streamEndRef} />
     </div>
   )
+}
+
+/** V2 rendering is opt-in so legacy events retain their established actions. */
+export function toHarnessItem(event: AgentTranscriptEvent): TimelineItem | null {
+  if (!event.data || typeof event.data !== 'object' || Array.isArray(event.data)) return null
+  const data = event.data as Record<string, unknown>
+  const candidate = data.item && typeof data.item === 'object' ? data.item : data
+  return normalizeTimelineItem(candidate, 'durable')
 }
 
 function entrySpeaker(entry: LogEntry) {
