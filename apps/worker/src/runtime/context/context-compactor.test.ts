@@ -63,6 +63,22 @@ describe("ContextCompactor", () => {
     expect(runtime.publishAtomically).not.toHaveBeenCalled()
   })
 
+  it("isolates invariant state from a summarizer mutation", async () => {
+    const runtime = port()
+    const result = await new ContextCompactor(runtime, (input) => {
+      const state = input.state as unknown as { goal: string; answers: Array<{ answer: string }> }
+      state.goal = "attacker goal"
+      state.answers[0].answer = "attacker answer"
+      return "safe summary"
+    }, () => "compaction-item").compact(request())
+    expect(result.status).toBe("compacted")
+    expect(result.snapshot).toMatchObject({ throughSequence: 120n })
+    expect(result.invariantReport).toMatchObject({ preserved: true, changedFields: [], missingFields: [] })
+    const published = (runtime.publishAtomically as ReturnType<typeof vi.fn>).mock.calls[0][0] as { draft: { state: { goal: string; answers: Array<{ answer: string }> } } }
+    expect(published.draft.state.goal).toBe("Find a role")
+    expect(published.draft.state.answers[0].answer).toBe("yes")
+  })
+
   it("does not create lifecycle Items when the trigger is not due", async () => {
     const runtime = port()
     const result = await new ContextCompactor(runtime, () => "summary", () => "compaction-item").compact(request({ policy: { inputTokenThreshold: 999_999, itemCountThreshold: 999_999, compactAtTurnBoundary: false } }))

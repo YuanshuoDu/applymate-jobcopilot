@@ -55,9 +55,10 @@ export class ContextCompactor {
       await this.port.recordStarted(started, request.scope)
       previousSnapshot = await this.port.loadLatest({ scope: request.scope, sessionId: collection.state.sessionId })
       previousSnapshotLoaded = true
-      const narrativeSummary = boundedSummary(await this.summarizer({ sessionId: collection.state.sessionId, throughSequence: collection.state.throughSequence, narrativeText: collection.narrativeText, state: collection.state, itemCount: collection.sourceItemIds.length, maxOutputCharacters: limits.maxSummaryCharacters }), limits.maxSummaryCharacters)
-      const candidateState = cloneCompactionState(collection.state)
-      const report = assertCompactionInvariantsPreserved(collection.state, candidateState)
+      const preservedState = cloneCompactionState(collection.state)
+      const narrativeSummary = boundedSummary(await this.summarizer({ sessionId: preservedState.sessionId, throughSequence: preservedState.throughSequence, narrativeText: collection.narrativeText, state: cloneCompactionState(preservedState), itemCount: collection.sourceItemIds.length, maxOutputCharacters: limits.maxSummaryCharacters }), limits.maxSummaryCharacters)
+      const candidateState = cloneCompactionState(preservedState)
+      const report = assertCompactionInvariantsPreserved(preservedState, candidateState)
       const measurement = tokenMeasurement(candidateState, narrativeSummary, collection.beforeInputTokens)
       const draft = { scope: request.scope, turnId: request.turnId, state: candidateState, narrativeSummary, tokenMeasurement: measurement, sourceItemIds: collection.sourceItemIds, reason: trigger.reason }
       const completed = completeCompactionItem(started, { summary: narrativeSummary, measurement, report })
