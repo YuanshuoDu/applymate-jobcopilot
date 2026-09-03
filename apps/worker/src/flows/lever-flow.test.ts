@@ -84,6 +84,7 @@ describe("runLeverFlow", () => {
       jobTitle: "Senior Engineer",
       jobCompany: "Spotify",
       resumePath: "/resume.pdf",
+      allowSubmit: true,
       beforeSubmit: vi.fn().mockResolvedValue(true),
     });
 
@@ -111,6 +112,7 @@ describe("runLeverFlow", () => {
       jobTitle: "Dev",
       jobCompany: "Klarna",
       resumePath: "/resume.pdf",
+      allowSubmit: true,
     });
 
     expect(result.status).toBe("manual");
@@ -122,7 +124,7 @@ describe("runLeverFlow", () => {
     const result = await runLeverFlow(mockLeverPage(), {
       jobId: "job-4", applyUrl: "https://jobs.lever.co/spotify/abc123/apply",
       persona: { fullName: "Jean Dupont", email: "jean@example.com" },
-      jobTitle: "Engineer", jobCompany: "Spotify", resumePath: "/resume.pdf", beforeSubmit,
+      jobTitle: "Engineer", jobCompany: "Spotify", resumePath: "/resume.pdf", allowSubmit: true, beforeSubmit,
     });
 
     expect(beforeSubmit).toHaveBeenCalledOnce();

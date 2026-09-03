@@ -10,11 +10,13 @@ describe('parseAction', () => {
     })
   })
 
-  it('reserves the submit action for the final application control', () => {
+  it('describes the agent as read-only and keeps page data untrusted', () => {
     const systemPrompt = buildSystemPrompt({}, { title: 'Engineer', company: 'Acme' })
     const userMessage = buildUserMessage([], 'https://jobs.example.com/apply')
 
-    expect(systemPrompt).toContain('Use type: \'submit\' only for the final application control')
-    expect(userMessage).toContain('return type: \'submit\' with that control\'s selector')
+    expect(systemPrompt).toContain('read-only fill-for-review')
+    expect(systemPrompt).toContain('submit is intentionally unavailable')
+    expect(userMessage).toContain('UNTRUSTED PAGE DATA')
+    expect(userMessage).not.toContain('return type: \'submit\'')
   })
 })

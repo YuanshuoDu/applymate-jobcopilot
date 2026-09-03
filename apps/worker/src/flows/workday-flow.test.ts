@@ -68,7 +68,7 @@ describe("runWorkdayFlow", () => {
     const result = await runWorkdayFlow(page, {
       jobId: "j2", applyUrl: "https://sap.wd3.myworkdayjobs.com/SAP",
       persona: { firstName: "Jean", lastName: "Dupont", email: "jean@test.com" },
-      jobTitle: "Engineer", jobCompany: "SAP", resumePath: "/resume.pdf", beforeSubmit,
+      jobTitle: "Engineer", jobCompany: "SAP", resumePath: "/resume.pdf", allowSubmit: true, beforeSubmit,
     });
 
     expect(beforeSubmit).toHaveBeenCalledOnce();
@@ -82,7 +82,7 @@ describe("runWorkdayFlow", () => {
     const result = await runWorkdayFlow(page, {
       jobId: "j3", applyUrl: "https://sap.wd3.myworkdayjobs.com/SAP",
       persona: { firstName: "Jean", lastName: "Dupont", email: "jean@test.com" },
-      jobTitle: "Engineer", jobCompany: "SAP", resumePath: "/resume.pdf", beforeSubmit,
+      jobTitle: "Engineer", jobCompany: "SAP", resumePath: "/resume.pdf", allowSubmit: true, beforeSubmit,
     });
 
     expect(beforeSubmit).toHaveBeenCalledOnce();
@@ -93,7 +93,7 @@ describe("runWorkdayFlow", () => {
     const result = await runWorkdayFlow(mockPage(), {
       jobId: "j4", applyUrl: "https://sap.wd3.myworkdayjobs.com/SAP",
       persona: { firstName: "Jean" },
-      jobTitle: "Engineer", jobCompany: "SAP", resumePath: "/resume.pdf",
+      jobTitle: "Engineer", jobCompany: "SAP", resumePath: "/resume.pdf", allowSubmit: true,
     });
 
     expect(result).toMatchObject({ status: "submission_blocked" });
