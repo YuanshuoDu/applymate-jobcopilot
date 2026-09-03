@@ -1658,6 +1658,7 @@ model AgentSession {
   applicationTasks ApplicationTask[]
   turns            AgentTurn[]
   steps            AgentStep[]
+  contextSnapshots AgentContextSnapshot[]
   inputs           AgentInput[]
   items            AgentItem[]
   events           AgentEvent[]
@@ -1754,6 +1755,33 @@ model AgentStep {
   @@index([turnId, status, createdAt])
   @@index([providerResponseId])
   @@map("agent_steps")
+}
+
+// Immutable, source-attributed context material used to rebuild a Step after
+// a worker restart. The JSON content is checksummed by the Worker; the
+// database constraints keep its cursor and accounting columns additive.
+model AgentContextSnapshot {
+  id                String   @id @default(cuid())
+  sessionId         String
+  throughSequence   BigInt
+  version           Int
+  schemaVersion     String   @default("agent-harness.context.v1")
+  content           Json
+  summary           String   @db.Text
+  checksum          String
+  inputTokens       Int      @default(0)
+  outputTokens      Int      @default(0)
+  estimatedCostUsd  Decimal  @default(0) @db.Decimal(12, 8)
+  tokenAccounting   Json     @default("{}")
+  createdAt         DateTime @default(now())
+
+  session AgentSession @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+
+  @@unique([sessionId, version])
+  @@unique([sessionId, throughSequence])
+  @@index([sessionId, createdAt(sort: Desc)])
+  @@index([sessionId, throughSequence])
+  @@map("agent_context_snapshots")
 }
 
 model AgentInput {
