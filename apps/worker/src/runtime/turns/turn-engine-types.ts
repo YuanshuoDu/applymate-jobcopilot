@@ -2,6 +2,8 @@ import type { ModelAdapter, ModelCapabilityProfile } from "@jobcopilot/agent-mod
 import type { RepositoryJsonValue, TenantScope } from "@jobcopilot/agent-protocol"
 
 import type { StepContext, StepContextSnapshot } from "../context/step-context-builder.js"
+import type { TurnBudgetLimits } from "../budget.js"
+import type { BusinessCheck } from "../verifier.js"
 import type { TurnLease } from "./lease.js"
 
 export type TurnEngineItemType = "agent_message" | "reasoning_summary" | "tool_call" | "tool_result" | "error"
@@ -142,6 +144,10 @@ export type TurnEngineOptions = {
   readonly subscribe?: TurnEngineEventSubscriber
   /** Provider reasoning is private by default; only explicitly safe summaries may be published. */
   readonly publishReasoningSummary?: boolean
+  readonly budget?: TurnBudgetLimits
+  readonly expectedEvidence?: readonly string[]
+  readonly businessChecks?: readonly BusinessCheck[]
+  readonly noProgressRepeatLimit?: number
 }
 
 export type TurnEngineResult = {
@@ -156,7 +162,7 @@ export type ModelProfileSnapshot = Pick<ModelCapabilityProfile, "provider" | "mo
 
 export class TurnEngineError extends Error {
   constructor(
-    readonly code: "final_unverified" | "step_limit" | "model_incomplete" | "persistence_conflict" | "invalid_output",
+    readonly code: "final_unverified" | "step_limit" | "model_incomplete" | "persistence_conflict" | "invalid_output" | "budget_exhausted" | "no_progress" | "evidence_missing" | "evidence_conflict" | "business_precondition_failed",
     message: string,
   ) {
     super(message)
