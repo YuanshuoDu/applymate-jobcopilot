@@ -1,7 +1,7 @@
 'use client'
 
 import React from 'react'
-import { redactSensitiveValue } from '@jobcopilot/shared'
+import { redactSensitiveValue } from '@jobcopilot/shared/agent-redaction'
 import { useI18n } from '@/lib/i18n'
 import type { TimelineItem } from './timeline-reducer'
 import { contentParts, itemText, type HarnessContentPart, type SuggestedActionCommand } from './harness-item-types'
