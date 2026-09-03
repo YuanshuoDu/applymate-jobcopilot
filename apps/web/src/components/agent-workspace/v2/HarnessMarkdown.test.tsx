@@ -16,10 +16,11 @@ describe('HarnessMarkdown', () => {
   })
 
   it('allows only ordinary HTTP(S) links', () => {
-    const html = renderToStaticMarkup(<HarnessMarkdown markdown="[docs](https://example.com) [bad](data:text/html,attack)" />)
+    const html = renderToStaticMarkup(<HarnessMarkdown markdown="[docs](https://example.com) [bad](data:text/html,attack) [external](//example.com)" />)
 
     expect(html).toContain('href="https://example.com"')
     expect(html).toContain('[bad](data:text/html,attack)')
+    expect(html).toContain('[external](//example.com)')
     expect(html).not.toContain('href="data:')
   })
 })

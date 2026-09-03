@@ -64,6 +64,7 @@ function renderInline(value: string): React.ReactNode[] {
 
 function safeHref(value: string): string | null {
   try {
+    if (!/^https?:\/\//i.test(value)) return null
     const url = new URL(value, 'https://applymate.invalid')
     return url.protocol === 'https:' || url.protocol === 'http:' ? value : null
   } catch {
