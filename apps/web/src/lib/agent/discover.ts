@@ -37,12 +37,22 @@ export interface DiscoveredJob {
   source:      string
 }
 
-interface DiscoverParams {
+export interface DiscoverProviderEvent {
+  provider: string
+  role: string
+  location: string
+  jobsReturned: number
+  status: 'success' | 'error'
+  latencyMs: number
+}
+
+export interface DiscoverParams {
   userId?:          string
   targetRoles:     string[]
   targetLocations: string[]  // empty → global search
   existingUrls:    Set<string>
   maxResults:      number    // total cap across all queries
+  onProviderCall?:  (event: DiscoverProviderEvent) => void | Promise<void>
 }
 
 // EU country code detector — mirrors unified route's EU_COUNTRY_MAP for consistency
@@ -608,7 +618,17 @@ async function discoverJobsUncached(params: DiscoverParams, fantasticShadowEnabl
         }))
       }
 
-      const execute = (call: ProviderCall) => executions.get(providerCallKey(call))?.() ?? Promise.resolve([])
+      const execute = async (call: ProviderCall) => {
+        const startedAt = Date.now()
+        try {
+          const items = await (executions.get(providerCallKey(call))?.() ?? Promise.resolve([]))
+          await params.onProviderCall?.({ provider: call.id, role, location: loc, jobsReturned: items.length, status: 'success', latencyMs: Date.now() - startedAt })
+          return items
+        } catch (error) {
+          await params.onProviderCall?.({ provider: call.id, role, location: loc, jobsReturned: 0, status: 'error', latencyMs: Date.now() - startedAt })
+          throw error
+        }
+      }
       const visible = await executeProviderPlan({
         calls,
         availableProviders: available,
