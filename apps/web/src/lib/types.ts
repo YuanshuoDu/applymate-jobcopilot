@@ -403,3 +403,4 @@ export type Page =
   | 'agent-history'
   | 'observability'
   | 'settings'
+  | 'contact-us'

@@ -9,6 +9,7 @@ type NotificationRow = {
   body: string | null;
   read: boolean;
   jobId: string | null;
+  broadcastId: string | null;
   createdAt: Date;
 };
 
@@ -39,6 +40,7 @@ export async function GET(req: NextRequest) {
       body,
       read,
       job_id     AS "jobId",
+      broadcast_id AS "broadcastId",
       created_at AS "createdAt"
     FROM notifications
     WHERE user_id = ${auth.userId}

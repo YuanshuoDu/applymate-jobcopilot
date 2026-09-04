@@ -25,6 +25,6 @@ export async function POST(request: NextRequest, context: { params: Promise<{ id
   const result = await db.supportCase.updateMany({ where: { id, requesterUserId: auth.userId, status: { not: 'closed' } }, data: { status: 'in_progress' } })
   if (!result.count) return NextResponse.json({ error: 'Not found' }, { status: 404 })
   const created = await db.supportCaseMessage.create({ data: { caseId: id, authorType: 'customer_reply', authorUserId: auth.userId, body: message.body, redacted: message.redacted }, select: { id: true, authorType: true, body: true, redacted: true, createdAt: true, supportCase: { select: { subject: true } } } })
-  await notifySupportAdmins({ caseId: id, messageId: created.id, subject: created.supportCase.subject, event: 'customer_reply' })
+  await Promise.resolve(notifySupportAdmins({ caseId: id, messageId: created.id, subject: created.supportCase.subject, event: 'customer_reply' })).catch(() => undefined)
   return NextResponse.json({ message: created }, { status: 201 })
 }

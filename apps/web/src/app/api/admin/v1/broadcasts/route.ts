@@ -14,7 +14,7 @@ export async function GET(request: NextRequest) {
   const limit = adminPageLimit(params.get('limit'))
   const cursor = params.get('cursor')
   const rows = await db.adminBroadcast.findMany({
-    select: { id: true, title: true, body: true, audienceType: true, status: true, approvedById: true, recipientCount: true, deliveredCount: true, failedCount: true, scheduledAt: true, createdAt: true, updatedAt: true },
+    select: { id: true, title: true, body: true, audienceType: true, audience: true, status: true, createdById: true, approvedById: true, recipientCount: true, deliveredCount: true, failedCount: true, scheduledAt: true, createdAt: true, updatedAt: true },
     orderBy: { id: 'desc' }, cursor: cursor ? { id: cursor } : undefined, skip: cursor ? 1 : undefined, take: limit + 1,
   })
   await writeAdminAudit({ requestId: actor.requestId, actorUserId: actor.userId, actorRoleKey: actor.roleKey, action: 'broadcasts.list_viewed', outcome: 'success' })

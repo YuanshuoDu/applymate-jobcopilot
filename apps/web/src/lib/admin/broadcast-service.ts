@@ -38,10 +38,11 @@ export function parseAudience(type: string, value: unknown): BroadcastAudience |
 }
 
 export function audienceWhere(audience: BroadcastAudience): Prisma.UserWhereInput {
-  if (audience.type === 'plan') return { plan: audience.value.plan }
-  if (audience.type === 'location') return { location: audience.value.location }
-  if (audience.type === 'explicit_user_ids') return { id: { in: audience.value.userIds } }
-  return {}
+  const active = { accountStatus: 'active' as const }
+  if (audience.type === 'plan') return { ...active, plan: audience.value.plan }
+  if (audience.type === 'location') return { ...active, location: audience.value.location }
+  if (audience.type === 'explicit_user_ids') return { ...active, id: { in: audience.value.userIds } }
+  return active
 }
 
 export function storedAudience(value: unknown, type: string): BroadcastAudience | null {

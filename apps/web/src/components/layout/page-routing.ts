@@ -11,6 +11,7 @@ const knownPages: Record<Page, true> = {
   'agent-history': true,
   observability: true,
   settings: true,
+  'contact-us': true,
 }
 
 export function pageFromSearch(search: string): Page {

@@ -1,7 +1,7 @@
 'use client'
 
-import { AlertTriangle, CalendarDays, Filter, LockKeyhole, MoreVertical, Send, ShieldCheck } from 'lucide-react'
-import { useEffect, useMemo, useState } from 'react'
+import { AlertTriangle, CalendarDays, Filter, LockKeyhole, MoreVertical, RefreshCw, Send, ShieldCheck } from 'lucide-react'
+import { useCallback, useEffect, useMemo, useState } from 'react'
 import { adminMutationHeaders } from '@/lib/admin/client'
 import { useI18n } from '@/lib/i18n'
 
@@ -43,17 +43,26 @@ export function ContactUsPage({ actorId, permissions }: { actorId: string; permi
   const [escalationReason, setEscalationReason] = useState('')
   const selected = useMemo(() => cases.find((item) => item.id === selectedId) ?? cases[0], [cases, selectedId])
 
-  async function loadCases() {
+  const loadCases = useCallback(async () => {
     setLoading(true)
-    const params = new URLSearchParams(Object.entries(filters).filter(([, value]) => Boolean(value)))
-    const response = await fetch(`/api/admin/v1/support/cases${params.toString() ? `?${params}` : ''}`, { cache: 'no-store' })
-    const payload = await response.json().catch(() => null) as { cases?: Case[]; error?: string } | null
-    if (!response.ok) setError(payload?.error ?? t('support.loadFailed'))
-    else { setCases(payload?.cases ?? []); setSelectedId((current) => current ?? payload?.cases?.[0]?.id ?? null) }
-    setLoading(false)
-  }
+    setError('')
+    try {
+      const params = new URLSearchParams(Object.entries(filters).filter(([, value]) => Boolean(value)))
+      const response = await fetch(`/api/admin/v1/support/cases${params.toString() ? `?${params}` : ''}`, { cache: 'no-store' })
+      const payload = await response.json().catch(() => null) as { cases?: Case[]; error?: string } | null
+      if (!response.ok) throw new Error(payload?.error ?? t('support.loadFailed'))
+      const nextCases = payload?.cases ?? []
+      setCases(nextCases)
+      setSelectedId((current) => {
+        const requested = new URLSearchParams(window.location.search).get('case')
+        if (requested && nextCases.some(item => item.id === requested)) return requested
+        if (current && nextCases.some(item => item.id === current)) return current
+        return nextCases[0]?.id ?? null
+      })
+    } catch (loadError) { setError(loadError instanceof Error ? loadError.message : t('support.loadFailed')) } finally { setLoading(false) }
+  }, [filters, t])
 
-  useEffect(() => { void loadCases() }, [filters])
+  useEffect(() => { void loadCases() }, [loadCases])
   useEffect(() => {
     if (!permissions.includes('support_cases.assign')) return
     void fetch('/api/admin/v1/access/members?limit=100', { cache: 'no-store' }).then(response => response.json()).then(payload => setMembers(payload.items ?? [])).catch(() => undefined)
@@ -75,6 +84,14 @@ export function ContactUsPage({ actorId, permissions }: { actorId: string; permi
       window.history.replaceState(null, '', `${window.location.pathname}${params.toString() ? `?${params}` : ''}`)
       return next
     })
+  }
+
+  function selectCase(id: string) {
+    setSelectedId(id)
+    const url = new URL(window.location.href)
+    url.searchParams.set('case', id)
+    window.history.replaceState(null, '', `${url.pathname}${url.search}${url.hash}`)
+    setError('')
   }
 
   async function sendMessage() {
@@ -119,12 +136,12 @@ export function ContactUsPage({ actorId, permissions }: { actorId: string; permi
   const canEscalate = permissions.includes('support_cases.escalate')
 
   return <div className="admin-page">
-    <header className="admin-header"><div><h1>{t('support.title')}</h1><p>{t('support.description')}</p></div><div className="admin-header-time"><CalendarDays size={18} /> {t('support.workspace')}</div></header>
+    <header className="admin-header"><div><h1>{t('support.title')}</h1><p>{t('support.description')}</p></div><div className="support-header-actions"><button className="admin-secondary" type="button" onClick={() => void loadCases()} disabled={loading}><RefreshCw size={15} /> {t('common.refresh')}</button><CalendarDays size={18} /> {t('support.workspace')}</div></header>
     <div className="admin-privacy"><ShieldCheck size={30} /><span><strong>{t('support.privacyFirst')}</strong> {t('support.privacyDescription')}</span></div>
-    {error && <div className="admin-alert">{error}</div>}
+    {error && <div className="admin-alert" role="alert">{error}</div>}
     <div className="support-workspace">
-      <section className="support-queue" aria-label={t('support.conversationQueue')}><div className="support-panel-title"><h2>{t('support.conversationQueue')}</h2><button title={t('support.filterCases')} onClick={() => setFilterOpen(current => !current)}><Filter size={17} /> {t('support.filter')}</button></div>{filterOpen && <div className="support-filter-panel"><label>{t('support.status')}<select value={filters.status} onChange={event => setFilter('status', event.target.value)}><option value="">{t('support.allStatuses')}</option><option value="open">{t('support.open')}</option><option value="in_progress">{t('support.inProgress')}</option><option value="waiting_on_customer">{t('support.waitingCustomer')}</option><option value="resolved">{t('support.resolved')}</option><option value="closed">{t('support.closed')}</option></select></label><label>{t('support.priority')}<select value={filters.priority} onChange={event => setFilter('priority', event.target.value)}><option value="">{t('support.allPriorities')}</option><option value="low">{t('support.low')}</option><option value="normal">{t('support.normal')}</option><option value="high">{t('support.high')}</option><option value="urgent">{t('support.urgent')}</option></select></label><label>{t('support.assignment')}<select value={filters.assigned} onChange={event => setFilter('assigned', event.target.value)}><option value="">{t('support.everyone')}</option><option value="unassigned">{t('support.unassigned')}</option>{members.map(member => <option key={member.id} value={member.id}>{member.user.name ?? member.user.email}</option>)}</select></label><label>{t('support.sla')}<select value={filters.sla} onChange={event => setFilter('sla', event.target.value)}><option value="">{t('support.allSla')}</option><option value="overdue">{t('support.overdueCapital')}</option><option value="due_soon">{t('support.dueSoon')}</option></select></label></div>}<div className="support-sort">{t('support.filteredCases')} <span>{cases.length}</span></div>
-        <div className="support-list">{loading ? <p>{t('support.loadingCases')}</p> : cases.length === 0 ? <p>{t('support.noOpenCases')}</p> : cases.map((item) => <button key={item.id} className="support-case-row" data-active={selected?.id === item.id} onClick={() => setSelectedId(item.id)}><span className="support-initials">{(item.requester.name ?? 'C').slice(0, 2).toUpperCase()}</span><span><strong>{item.subject}</strong><small>{item.requester.name ?? t('support.customer')}</small><em>{item.assignedAdminId ? t('support.assigned') : t('support.unassigned')}</em></span><time>{relativeSla(item.slaDueAt, t)}</time></button>)}</div>
+      <section className="support-queue" aria-label={t('support.conversationQueue')}><div className="support-panel-title"><h2>{t('support.conversationQueue')}</h2><button type="button" title={t('support.filterCases')} onClick={() => setFilterOpen(current => !current)}><Filter size={17} /> {t('support.filter')}</button></div>{filterOpen && <div className="support-filter-panel"><label>{t('support.status')}<select value={filters.status} onChange={event => setFilter('status', event.target.value)}><option value="">{t('support.allStatuses')}</option><option value="open">{t('support.open')}</option><option value="in_progress">{t('support.inProgress')}</option><option value="waiting_on_customer">{t('support.waitingCustomer')}</option><option value="resolved">{t('support.resolved')}</option><option value="closed">{t('support.closed')}</option></select></label><label>{t('support.priority')}<select value={filters.priority} onChange={event => setFilter('priority', event.target.value)}><option value="">{t('support.allPriorities')}</option><option value="low">{t('support.low')}</option><option value="normal">{t('support.normal')}</option><option value="high">{t('support.high')}</option><option value="urgent">{t('support.urgent')}</option></select></label><label>{t('support.category')}<select value={filters.category} onChange={event => setFilter('category', event.target.value)}><option value="">{t('support.allCategories')}</option><option value="account">{t('contact.category.account')}</option><option value="billing">{t('contact.category.billing')}</option><option value="technical">{t('contact.category.technical')}</option><option value="auto_apply">{t('contact.category.auto_apply')}</option><option value="feedback">{t('contact.category.feedback')}</option><option value="other">{t('contact.category.other')}</option></select></label><label>{t('support.assignment')}<select value={filters.assigned} onChange={event => setFilter('assigned', event.target.value)}><option value="">{t('support.everyone')}</option><option value="unassigned">{t('support.unassigned')}</option>{members.map(member => <option key={member.id} value={member.id}>{member.user.name ?? member.user.email}</option>)}</select></label><label>{t('support.sla')}<select value={filters.sla} onChange={event => setFilter('sla', event.target.value)}><option value="">{t('support.allSla')}</option><option value="overdue">{t('support.overdueCapital')}</option><option value="due_soon">{t('support.dueSoon')}</option></select></label></div>}<div className="support-sort">{t('support.filteredCases')} <span>{cases.length}</span></div>
+        <div className="support-list">{loading ? <p>{t('support.loadingCases')}</p> : cases.length === 0 ? <p>{t('support.noOpenCases')}</p> : cases.map((item) => <button type="button" key={item.id} className="support-case-row" data-active={selected?.id === item.id} onClick={() => selectCase(item.id)}><span className="support-initials">{(item.requester.name ?? 'C').slice(0, 2).toUpperCase()}</span><span><strong>{item.subject}</strong><small>{item.requester.name ?? t('support.customer')}</small><em>{item.assignedAdminId ? t('support.assigned') : t('support.unassigned')}</em></span><time>{relativeSla(item.slaDueAt, t)}</time></button>)}</div>
       </section>
       <section className="support-thread">{selected ? <><div className="support-thread-top"><div><h2>{selected.subject}</h2><span>#{selected.id.slice(-6)} · {selected.category.replaceAll('_', ' ')}</span></div><button title={t('support.escalate')} disabled={!canEscalate} onClick={() => setEscalationOpen(true)}><MoreVertical size={18} /></button></div><div className="support-controls"><label className="support-select">{t('support.status')}<select value={selected.status} disabled={sending || (!canAssign && !(canResolve && selected.status !== 'resolved'))} onChange={(event) => void updateCase({ status: event.target.value }, `${t('support.updatingStatus')} ${event.target.value}`)}><option value="open">{t('support.open')}</option><option value="in_progress">{t('support.inProgress')}</option><option value="waiting_on_customer">{t('support.waitingCustomer')}</option>{canResolve && <option value="resolved">{t('support.resolved')}</option>}<option value="closed">{t('support.closed')}</option></select></label><label className="support-select">{t('support.priority')}<select value={selected.priority} disabled={sending || !canAssign} onChange={(event) => void updateCase({ priority: event.target.value }, `${t('support.updatingPriority')} ${event.target.value}`)}><option value="low">{t('support.low')}</option><option value="normal">{t('support.normal')}</option><option value="high">{t('support.high')}</option><option value="urgent">{t('support.urgent')}</option></select></label>{canAssign && <label className="support-select">{t('support.owner')}<select value={selected.assignedAdminId ?? ''} disabled={sending} onChange={(event) => void updateCase({ assignedAdminId: event.target.value || null }, t('support.updatingOwner'))}><option value="">{t('support.unassigned')}</option>{members.map(member => <option key={member.id} value={member.id}>{member.user.name ?? member.user.email}</option>)}</select></label>}<span className="support-sla">SLA {relativeSla(selected.slaDueAt, t)}</span></div>
         <div className="support-messages" aria-live="polite">{selected.messages.map((message) => <article key={message.id} className={`support-message ${message.authorType}`}><span>{message.authorType === 'staff_reply' ? t('support.team') : message.authorType === 'internal_note' ? t('support.internalNote') : selected.requester.name ?? t('support.customer')}</span><p>{message.body}</p><time>{new Date(message.createdAt).toLocaleString()}</time></article>)}</div>
