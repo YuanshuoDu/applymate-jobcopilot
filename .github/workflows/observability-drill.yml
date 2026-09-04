@@ -1,0 +1,42 @@
+name: Harness Observability Drill
+
+on:
+  pull_request:
+    branches: [master]
+    paths:
+      - 'apps/web/src/lib/observability/**'
+      - 'apps/web/scripts/observability/**'
+      - 'docs/observability/**'
+      - '.github/workflows/observability-drill.yml'
+  push:
+    branches: [master]
+    paths:
+      - 'apps/web/src/lib/observability/**'
+      - 'apps/web/scripts/observability/**'
+      - 'docs/observability/**'
+      - '.github/workflows/observability-drill.yml'
+
+concurrency:
+  group: observability-drill-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  synthetic-slo-breach:
+    name: Synthetic SLO breach (no provider or database)
+    runs-on: ubuntu-latest
+    env:
+      OBSERVABILITY_DRILL_TURN_P95_LATENCY_MS: '60000'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - name: Inject 60s p95 and assert the latency alert
+        working-directory: apps/web
+        run: pnpm exec tsx scripts/observability/slo-breach-drill.ts
