@@ -1,87 +1,49 @@
 'use client'
 
-import React, { useEffect, useRef, useState } from 'react'
+import React, { useEffect, useMemo, useRef, useState } from 'react'
 import { useToast } from '@/components/ui'
 import { useApi, apiMutate } from '@/lib/hooks'
 import { useI18n } from '@/lib/i18n'
 import { AgentComposer, type ComposerAttachment, type ComposerJob, type ComposerResume } from './AgentComposer'
 import { AgentLiveStreamBody } from './AgentLiveStreamBody'
 import {
-  appendAssistantResponse,
   attachmentComposerContext,
-  fallbackActionEvent,
   jobComposerContext,
-  liveBlockEvent,
-  localCancelEvent,
   resumeComposerContext,
-  shouldStickToBottom,
 } from './AgentUnifiedStream.helpers'
 import { AgentUnifiedStreamHeader } from './AgentUnifiedStreamHeader'
 import { sessionSubmissionPolicy } from './automation-policy'
 import type { TranscriptAction } from './TranscriptSpecialBlocks'
-import { streamAgentChat } from './agent-chat-stream'
-import { streamAgentSessionEvents } from './agent-session-stream'
 import { ensureActionReceipt } from './approval-receipt-client'
-import type { AgentTranscriptEvent } from './session-view-model'
+import { sendAgentTurnMessage, useAgentTurnComposerContext } from './agent-turn-commands'
+import { createTimelineState, selectTimelineItems, timelineReducer, type TimelineState } from './v2/timeline-reducer'
+import { streamAgentTimeline } from './v2/stream-client'
+import { createReadOnlySessionProjection, projectTimelineItems } from './v2/session-projection'
 import type { AgentUnifiedStreamProps, ComposerJobsResponse } from './AgentUnifiedStream.types'
 
-type ApplyResultRow = {
-  status?: unknown
-  flowUsed?: unknown
-  error?: unknown
-  durationMs?: unknown
-}
-
-async function pollForAuditResult(
-  jobId: string,
-  job: Record<string, unknown>,
-  setBlocks: React.Dispatch<React.SetStateAction<AgentTranscriptEvent[]>>,
-) {
-  for (let attempt = 0; attempt < 90; attempt++) {
-    await new Promise(resolve => window.setTimeout(resolve, 5_000))
-    try {
-      const response = await fetch(`/api/jobs/${jobId}/apply-results`)
-      if (!response.ok) continue
-      const payload = await response.json() as { results?: ApplyResultRow[] }
-      const result = payload.results?.[0]
-      if (!result) continue
-      const status = typeof result.status === 'string' ? result.status : 'completed'
-      const detail = typeof result.error === 'string' && result.error
-        ? `Error: ${result.error}`
-        : `Flow: ${typeof result.flowUsed === 'string' ? result.flowUsed : 'worker'}${typeof result.durationMs === 'number' ? ` · ${Math.round(result.durationMs / 1000)}s` : ''}`
-      setBlocks(blocks => [...blocks, liveBlockEvent('audit_result', {
-        speaker: 'Auditor', title: 'Application result',
-        body: `Auditor result for ${typeof job.company === 'string' ? job.company : 'application'}: ${status}. ${detail}`,
-        data: { jobId, job, result },
-      }, blocks.length)])
-      return
-    } catch {
-      // Worker/network lag is expected; retry within the bounded observation window.
-    }
-  }
+function newClientMessageId() {
+  if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') return `message-${crypto.randomUUID()}`
+  return `message-${Date.now()}-${Math.random().toString(36).slice(2)}`
 }
 
 export function AgentUnifiedStream({
   log, running, summary, applyQueue, waitingQuestion,
   savedCount, pendingCount, autonomousMode,
-  resetVersion, resumeSessionId, conversationTitle, conversationSubtitle, onAnswerQuestion, onAnswerOrchestrator, onApplied, onChatAction, onAppendLog, onSessionRecorded,
+  resetVersion, resumeSessionId, conversationTitle, conversationSubtitle, onAnswerQuestion, onAnswerOrchestrator, onApplied, onSessionRecorded,
 }: AgentUnifiedStreamProps) {
   const { t } = useI18n()
   const streamEndRef = useRef<HTMLDivElement>(null)
   const streamScrollRef = useRef<HTMLDivElement>(null)
   const inputRef = useRef<HTMLTextAreaElement>(null)
   const fileInputRef = useRef<HTMLInputElement>(null)
-  const activeSessionRef = useRef<string | null>(null)
   const chatRequestRef = useRef<AbortController | null>(null)
   const chatRequestVersionRef = useRef(0)
   const shouldFollowScrollRef = useRef(true)
-  const auditedJobIdsRef = useRef(new Set<string>())
   const [chatInput, setChatInput] = useState('')
   const [chatLoading, setChatLoading] = useState(false)
-  const [chatSessionId, setChatSessionId] = useState<string | null>(null)
   const [isRestoringSession, setIsRestoringSession] = useState(false)
   const [addMenuOpen, setAddMenuOpen] = useState(false)
-  const [liveBlocks, setLiveBlocks] = useState<AgentTranscriptEvent[]>([])
+  const [timelineState, setTimelineState] = useState<TimelineState>(() => createTimelineState(resumeSessionId ?? 'draft'))
   const [revealThinkingVersion, setRevealThinkingVersion] = useState(0)
   const [attachedFiles, setAttachedFiles] = useState<ComposerAttachment[]>([])
   const { data: jobsData } = useApi<ComposerJobsResponse>('/api/jobs?pageSize=6')
@@ -89,6 +51,17 @@ export function AgentUnifiedStream({
   const toast = useToast()
   const composerJobs = jobsData?.jobs ?? []
   const composerResumes = resumesData ?? []
+  const turnComposer = useAgentTurnComposerContext()
+  const timelineItems = useMemo(() => selectTimelineItems(timelineState), [timelineState])
+  // Once a Session exists, the V2 projection is the sole transcript source.
+  // The page-level run log remains an operational control signal, not a second
+  // rendered conversation state.
+  const transcriptLog = resumeSessionId ? [] : log
+  const projection = useMemo(
+    () => createReadOnlySessionProjection(resumeSessionId ?? 'draft', timelineItems),
+    [resumeSessionId, timelineItems],
+  )
+  const liveBlocks = useMemo(() => projectTimelineItems(projection), [projection])
 
   function scrollToBottom() {
     const stream = streamScrollRef.current
@@ -104,51 +77,42 @@ export function AgentUnifiedStream({
 
   useEffect(() => {
     if (shouldFollowScrollRef.current) scrollToBottom()
-  }, [log.length, liveBlocks.length, applyQueue.length])
-
-  useEffect(() => {
-    activeSessionRef.current = chatSessionId
-  }, [chatSessionId])
+  }, [transcriptLog.length, timelineItems.length, applyQueue.length])
 
   useEffect(() => {
     shouldFollowScrollRef.current = true
     cancelChatRequest()
-    activeSessionRef.current = null
-    setChatSessionId(null)
     setIsRestoringSession(false)
     setChatInput('')
-    setLiveBlocks([])
+    setTimelineState(createTimelineState('draft'))
     setRevealThinkingVersion(0)
     setAttachedFiles([])
   }, [resetVersion])
 
   useEffect(() => {
-    // A newly-created chat reports its session ID to the parent before its
-    // SSE blocks finish arriving. Do not treat that echo as a history restore.
-    if (!resumeSessionId || resumeSessionId === activeSessionRef.current) return
+    if (!resumeSessionId) {
+      setTimelineState(createTimelineState('draft'))
+      setIsRestoringSession(false)
+      return
+    }
     const controller = new AbortController()
     cancelChatRequest()
     shouldFollowScrollRef.current = true
-    activeSessionRef.current = resumeSessionId
-    setChatSessionId(resumeSessionId)
+    setTimelineState(createTimelineState(resumeSessionId))
     setIsRestoringSession(true)
     setChatInput('')
     setAttachedFiles([])
-    // Do not leave the prior conversation visible while the next session's
-    // authorized transcript is loading.
-    setLiveBlocks([])
 
-    void streamAgentSessionEvents({
+    void streamAgentTimeline({
       sessionId: resumeSessionId,
       signal: controller.signal,
       onConnected: () => {
         if (controller.signal.aborted) return
         setIsRestoringSession(false)
       },
-      onEvent: event => {
+      dispatch: action => {
         if (controller.signal.aborted) return
-        setLiveBlocks(blocks => blocks.some(block => block.id === event.id) ? blocks : [...blocks, event])
-        setIsRestoringSession(false)
+        setTimelineState(current => timelineReducer(current, action))
         requestAnimationFrame(scrollToBottom)
       },
     })
@@ -164,27 +128,7 @@ export function AgentUnifiedStream({
       })
 
     return () => controller.abort()
-  }, [resumeSessionId, toast])
-
-  // The worker persists the eventual submission result. Once Executor queues a
-  // user-confirmed package, surface that result in the same conversation as an
-  // Auditor event instead of asking the user to hunt through another page.
-  useEffect(() => {
-    const queued = liveBlocks.filter(block => block.type === 'application_queued')
-    for (const block of queued) {
-      const rawData = block.data && typeof block.data === 'object' ? block.data as Record<string, unknown> : {}
-      const data = rawData.payload && typeof rawData.payload === 'object'
-        ? rawData.payload as Record<string, unknown>
-        : rawData
-      const job = data.job && typeof data.job === 'object' ? data.job as Record<string, unknown> : data
-      const jobId = typeof data.jobId === 'string'
-        ? data.jobId
-        : typeof job.id === 'string' ? job.id : null
-      if (!jobId || auditedJobIdsRef.current.has(jobId)) continue
-      auditedJobIdsRef.current.add(jobId)
-      void pollForAuditResult(jobId, job, setLiveBlocks)
-    }
-  }, [liveBlocks])
+  }, [resumeSessionId, t, toast])
 
   useEffect(() => {
     function prefillComposer(event: Event) {
@@ -197,7 +141,7 @@ export function AgentUnifiedStream({
     return () => window.removeEventListener('applymate:composer-prefill', prefillComposer)
   }, [])
 
-  const isEmpty = !isRestoringSession && log.length === 0 && applyQueue.length === 0 && liveBlocks.length === 0
+  const isEmpty = !isRestoringSession && transcriptLog.length === 0 && applyQueue.length === 0 && liveBlocks.length === 0
   const isNewChatDraft = isEmpty
   const restoredPolicy = sessionSubmissionPolicy(liveBlocks)
   const effectiveAutonomousMode = restoredPolicy
@@ -208,10 +152,6 @@ export function AgentUnifiedStream({
     if (!isEmpty) return
     streamScrollRef.current?.scrollTo({ top: 0 })
   }, [isEmpty, resetVersion])
-
-  function appendLiveBlock(type: string, data: unknown) {
-    setLiveBlocks(blocks => [...blocks, liveBlockEvent(type, data, blocks.length)])
-  }
 
   function appendComposerContext(text: string) {
     setChatInput(current => current.trim() ? `${current.trim()}\n\n${text}` : text)
@@ -254,25 +194,29 @@ export function AgentUnifiedStream({
       return
     }
     if (action.type === 'cancel_automation_draft') {
-      setLiveBlocks(blocks => [...blocks, localCancelEvent(action)])
+      toast.info('Automation draft canceled', action.body ?? 'The draft was not saved.')
       return
     }
-    if (!chatSessionId) {
+    if (!resumeSessionId) {
       const message = 'Send a message first, then retry this action.'
       toast.error(t('agent.sessionNotReady'), message)
       throw new Error(message)
     }
-    const authorizedAction = await ensureActionReceipt(chatSessionId, action)
-    const { data, error } = await apiMutate<{ event?: AgentTranscriptEvent; events?: AgentTranscriptEvent[] }>(`/api/agent/sessions/${chatSessionId}/actions`, 'POST', authorizedAction)
+    const authorizedAction = await ensureActionReceipt(resumeSessionId, action)
+    const { data, error } = await apiMutate<unknown>(`/api/agent/sessions/${resumeSessionId}/actions`, 'POST', authorizedAction)
     if (error) throw new Error(error)
-    const eventType = data?.event?.type
+    const dataRecord = data && typeof data === 'object' && !Array.isArray(data)
+      ? data as Record<string, unknown>
+      : null
+    const eventRecord = dataRecord?.event && typeof dataRecord.event === 'object' && !Array.isArray(dataRecord.event)
+      ? dataRecord.event as Record<string, unknown>
+      : null
+    const eventType = typeof eventRecord?.type === 'string' ? eventRecord.type : null
     if (action.type === 'create_automation' || eventType === 'automation_created' || eventType === 'automation_updated') {
       window.dispatchEvent(new Event('applymate:automations-changed'))
     }
     window.dispatchEvent(new Event('applymate:sessions-changed'))
-    onSessionRecorded(chatSessionId)
-    const events = data?.events?.length ? data.events : [data?.event ?? fallbackActionEvent(action)]
-    setLiveBlocks(blocks => [...blocks, ...events])
+    onSessionRecorded(resumeSessionId)
   }
 
   async function sendChat(text: string) {
@@ -280,11 +224,14 @@ export function AgentUnifiedStream({
     const draftText = text.trim()
     const draftFiles = attachedFiles
     const outgoing = [draftText, attachmentComposerContext(attachedFiles)].filter(Boolean).join('\n\n')
+    if (turnComposer) {
+      turnComposer.send(outgoing)
+      setAttachedFiles([])
+      return
+    }
     setChatInput('')
     setAttachedFiles([])
     setChatLoading(true)
-    onAppendLog({ type: 'user_message', message: outgoing, time: new Date() })
-    let recordedSessionId = chatSessionId
     const requestVersion = chatRequestVersionRef.current + 1
     chatRequestVersionRef.current = requestVersion
     const controller = new AbortController()
@@ -292,38 +239,36 @@ export function AgentUnifiedStream({
     chatRequestRef.current = controller
 
     try {
-      const full = await streamAgentChat({
-        sessionId: chatSessionId,
+      const sessionResponse = await fetch('/api/agent/sessions', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ goal: draftText }),
         signal: controller.signal,
-        messages: [{ role: 'user', content: outgoing }],
-        onSession: sessionId => {
-          if (controller.signal.aborted || requestVersion !== chatRequestVersionRef.current) return
-          shouldFollowScrollRef.current = true
-          recordedSessionId = sessionId
-          activeSessionRef.current = sessionId
-          setChatSessionId(sessionId)
-          onSessionRecorded(sessionId, draftText, 'Chat · Running')
-        },
-        onBlock: (type, data) => {
-          if (controller.signal.aborted || requestVersion !== chatRequestVersionRef.current) return
-          appendLiveBlock(type, data)
-        },
-        // The pipeline start resets its operational log. Keep the originating
-        // user message as the first transcript item instead of losing it.
-        onAction: action => {
-          if (controller.signal.aborted || requestVersion !== chatRequestVersionRef.current) return
-          return onChatAction({ ...action, chatMessage: outgoing, sessionId: activeSessionRef.current })
-        },
       })
+      const sessionBody = await sessionResponse.json().catch(() => null) as unknown
+      const sessionRecord = sessionBody && typeof sessionBody === 'object' && !Array.isArray(sessionBody)
+        ? (sessionBody as Record<string, unknown>).session
+        : null
+      const recordedSessionId = sessionRecord && typeof sessionRecord === 'object' && !Array.isArray(sessionRecord)
+        && typeof (sessionRecord as Record<string, unknown>).id === 'string'
+        ? (sessionRecord as Record<string, unknown>).id as string
+        : null
+      if (!sessionResponse.ok || !recordedSessionId) throw new Error('Could not create an Agent session.')
       if (controller.signal.aborted || requestVersion !== chatRequestVersionRef.current) return
-      appendAssistantResponse(full, onAppendLog)
-      if (recordedSessionId) onSessionRecorded(recordedSessionId)
+      const fetcher: typeof fetch = (input, init) => fetch(input, { ...init, signal: controller.signal })
+      await sendAgentTurnMessage(recordedSessionId, outgoing, 'steer', null, newClientMessageId(), fetcher)
+      if (controller.signal.aborted || requestVersion !== chatRequestVersionRef.current) return
+      // Publish the URL only after the typed command is accepted. This avoids
+      // switching the composer context while the draft request is still busy.
+      shouldFollowScrollRef.current = true
+      chatRequestRef.current = null
+      setChatLoading(false)
+      onSessionRecorded(recordedSessionId, draftText, 'Chat · Running')
     } catch (err) {
       if (controller.signal.aborted || requestVersion !== chatRequestVersionRef.current) return
       const message = (err as Error).message || 'Agent chat failed.'
       setChatInput(current => current.trim() ? current : draftText)
       setAttachedFiles(current => current.length > 0 ? current : draftFiles)
-      onAppendLog({ type: 'error', message, time: new Date() })
       toast.error(t('agent.chatFailed'), message)
     } finally {
       if (requestVersion === chatRequestVersionRef.current) {
@@ -359,7 +304,7 @@ export function AgentUnifiedStream({
       />
 
       <AgentLiveStreamBody
-        log={log}
+        log={transcriptLog}
         liveBlocks={liveBlocks}
         applyQueue={applyQueue}
         isEmpty={isEmpty}
