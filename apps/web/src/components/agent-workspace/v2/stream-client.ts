@@ -1,3 +1,5 @@
+/** CANONICAL Phase 9 timeline state root — do not duplicate. See #459. */
+
 import { normalizeTimelineEvent, type TimelineAction } from './timeline-reducer'
 
 interface TimelinePageResponse {

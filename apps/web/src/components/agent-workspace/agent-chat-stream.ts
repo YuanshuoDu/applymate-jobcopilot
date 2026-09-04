@@ -1,3 +1,5 @@
+/** @deprecated Phase 9 — use v2/timeline-reducer + v2/stream-client. Removal: AH2-047. */
+
 export interface AgentChatAction {
   type: string
   [key: string]: unknown

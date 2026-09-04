@@ -1,5 +1,7 @@
+/** CANONICAL Phase 9 timeline state root — do not duplicate. See #459. */
+
 import { AGENT_STREAM_SCHEMA_VERSION } from '@jobcopilot/agent-protocol'
-import { buildIndexes, compareItems, integer, isAfter, isRecord, mergeContent, numberOrUndefined, sequence, stringOrNull, timestamp } from './timeline-reducer-utils'
+import { appendFallbackEvent, appendTimelineEvent, buildIndexes, compareItems, integer, isAfter, isRecord, itemFromTimelineEvent, mergeContent, numberOrUndefined, sequence, stringOrNull, timestamp } from './timeline-reducer-utils'
 
 export type TimelineConnection = 'idle' | 'connected' | 'reconnecting'
 export type TimelineItemSource = 'replay' | 'durable' | 'transient' | 'unknown'
@@ -43,6 +45,13 @@ export interface TimelineEvent {
 
 export interface TimelineState {
   sessionId: string
+  events: TimelineEvent[]
+  byId: Map<string, TimelineEvent>
+  byTurnId: Map<string, TimelineEvent[]>
+  byToolCallId: Map<string, TimelineEvent[]>
+  lastEventId: string | null
+  transientItems: Map<string, TimelineItem>
+  fallbackItems: TimelineEvent[]
   itemIds: string[]
   itemsById: Record<string, TimelineItem>
   itemIdsByTurnId: Record<string, string[]>
@@ -74,7 +83,9 @@ const KNOWN_EVENT_TYPES = new Set([
 
 export function createTimelineState(sessionId: string): TimelineState {
   return {
-    sessionId, itemIds: [], itemsById: {}, itemIdsByTurnId: {}, itemIdsByTaskId: {},
+    sessionId, events: [], byId: new Map(), byTurnId: new Map(), byToolCallId: new Map(), lastEventId: null,
+    transientItems: new Map(), fallbackItems: [],
+    itemIds: [], itemsById: {}, itemIdsByTurnId: {}, itemIdsByTaskId: {},
     processedEventIds: {}, lastSequence: null, connection: 'idle', snapshotRequired: false,
   }
 }
@@ -150,11 +161,12 @@ function reduceEvent(state: TimelineState, value: unknown): TimelineState {
   if (!event || event.sessionId !== state.sessionId || state.processedEventIds[event.id]) return state
   if (event.sequence !== null && !isAfter(event.sequence, state.lastSequence)) return state
   const processedEventIds: Record<string, true> = { ...state.processedEventIds, [event.id]: true }
-  const next: TimelineState = {
+  let next: TimelineState = {
     ...state,
     processedEventIds,
     lastSequence: event.sequence && isAfter(event.sequence, state.lastSequence) ? event.sequence : state.lastSequence,
   }
+  next = { ...next, ...appendTimelineEvent(next.events, event), lastEventId: event.id }
   if (event.type === 'stream.overflow') return { ...next, snapshotRequired: true, connection: 'reconnecting' }
   if (event.type === 'item.delta') {
     const existingRevision = state.itemsById[event.itemId ?? '']?.revision ?? 0
@@ -164,17 +176,24 @@ function reduceEvent(state: TimelineState, value: unknown): TimelineState {
   const existing = state.itemsById[event.itemId]
   const status = event.type === 'item.completed' ? 'completed' : event.type === 'item.failed' ? 'failed' : existing?.status ?? 'started'
   if (existing && TERMINAL_STATUSES.has(existing.status) && status !== 'completed') return next
-  const item = itemFromEvent(event, status, existing)
+  if (!KNOWN_EVENT_TYPES.has(event.type)) next = { ...next, fallbackItems: appendFallbackEvent(next.fallbackItems, event) }
+  const item = itemFromTimelineEvent(event, status, existing, undefined, normalizeTimelineItem)
   return item ? upsertItem(next, item, item.source === 'unknown' ? 'unknown' : 'durable') : next
 }
 
 function reduceDelta(state: TimelineState, value: unknown, preprocessedId?: string): TimelineState {
   const delta = normalizeTimelineEvent(value)
   if (!delta || delta.sessionId !== state.sessionId || !delta.itemId || (preprocessedId === undefined && state.processedEventIds[delta.id])) return state
+  if (preprocessedId === undefined && delta.sequence !== null && !isAfter(delta.sequence, state.lastSequence)) return state
   const processedEventIds: Record<string, true> = preprocessedId === undefined
     ? { ...state.processedEventIds, [delta.id]: true }
     : state.processedEventIds
-  state = { ...state, processedEventIds }
+  state = {
+    ...state,
+    processedEventIds,
+    lastSequence: delta.sequence && isAfter(delta.sequence, state.lastSequence) ? delta.sequence : state.lastSequence,
+  }
+  if (preprocessedId === undefined) state = { ...state, ...appendTimelineEvent(state.events, delta), lastEventId: delta.id }
   const payload = isRecord(delta.payload) ? delta.payload : {}
   const revision = delta.revision ?? numberOrUndefined(payload.revision)
   if (revision === undefined) return state
@@ -183,7 +202,7 @@ function reduceDelta(state: TimelineState, value: unknown, preprocessedId?: stri
   if (delta.kind === 'delta' && delta.baseRevision !== undefined && delta.baseRevision > (existing?.revision ?? 0)) {
     return { ...state, snapshotRequired: true, connection: 'reconnecting' }
   }
-  const item = itemFromEvent(delta, 'streaming', existing, revision)
+  const item = itemFromTimelineEvent(delta, 'streaming', existing, revision, normalizeTimelineItem)
   if (!item) return state
   const next = upsertItem(state, { ...item, revision, source: 'transient' }, 'transient', delta.kind === 'snapshot')
   return delta.kind === 'snapshot' ? { ...next, snapshotRequired: false } : next
@@ -203,31 +222,9 @@ function reduceLegacy(state: TimelineState, value: unknown): TimelineState {
   return upsertItem(state, item, 'replay')
 }
 
-function itemFromEvent(event: TimelineEvent, status: string, existing?: TimelineItem, revision?: number): TimelineItem | null {
-  const payload = isRecord(event.payload) ? event.payload : {}
-  const candidate = normalizeTimelineItem(payload.item, event.kind ? 'transient' : 'durable') ??
-    (payload.id === event.itemId ? normalizeTimelineItem(payload, event.kind ? 'transient' : 'durable') : null)
-  if (candidate) return { ...candidate, status, revision: revision ?? candidate.revision, sequence: event.sequence ?? candidate.sequence }
-  if (!existing && event.itemId) return {
-    schemaVersion: event.schemaVersion, id: event.itemId, sessionId: event.sessionId, turnId: event.turnId,
-    stepId: null, taskId: event.taskId, type: 'unknown', status, phase: null, revision: revision ?? 0,
-    content: { eventType: event.type, payload: event.payload, opaque: true }, startedAt: event.createdAt ?? null,
-    completedAt: status === 'completed' ? event.createdAt ?? null : null,
-    createdAt: event.createdAt ?? new Date(0).toISOString(), updatedAt: event.createdAt ?? new Date(0).toISOString(),
-    source: event.kind ? 'transient' : 'unknown', sequence: event.sequence,
-  }
-  if (!existing) return null
-  const content = event.type === 'item.completed' || event.type === 'item.failed' || event.kind === 'snapshot'
-    ? payload.content ?? payload
-    : mergeContent(existing.content, payload.content ?? payload)
-  return { ...existing, taskId: event.taskId ?? existing.taskId, status, revision: revision ?? existing.revision,
-    content, completedAt: status === 'completed' ? event.createdAt ?? existing.completedAt : existing.completedAt,
-    updatedAt: event.createdAt ?? existing.updatedAt, sequence: event.sequence ?? existing.sequence }
-}
-
 function addUnknownEvent(state: TimelineState, event: TimelineEvent): TimelineState {
   const itemId = `unknown:${event.id}`
-  return upsertItem(state, {
+  return upsertItem({ ...state, fallbackItems: appendFallbackEvent(state.fallbackItems, event) }, {
     schemaVersion: event.schemaVersion, id: itemId, sessionId: event.sessionId, turnId: event.turnId,
     stepId: null, taskId: event.taskId, type: 'unknown', status: 'completed', phase: 'commentary', revision: 0,
     content: { eventType: event.type, payload: event.payload, opaque: true }, startedAt: event.createdAt ?? null,
@@ -245,5 +242,8 @@ function upsertItem(state: TimelineState, item: TimelineItem, source: TimelineIt
     : { ...existing, ...item, source }
   const itemsById = { ...state.itemsById, [item.id]: nextItem }
   const itemIds = Object.values(itemsById).sort(compareItems).map((entry) => entry.id)
-  return { ...state, itemsById, itemIds, ...buildIndexes(itemsById) }
+  const transientItems = new Map(state.transientItems)
+  if (source === 'transient') transientItems.set(item.id, nextItem)
+  else transientItems.delete(item.id)
+  return { ...state, itemsById, itemIds, transientItems, ...buildIndexes(itemsById) }
 }
