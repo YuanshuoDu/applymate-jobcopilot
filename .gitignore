@@ -42,6 +42,7 @@ prisma/*.db
 
 # MCP / Tool caches
 .playwright-mcp/
+apps/web/tests/e2e/__artifacts__/
 
 # Temporary
 *.tmp
