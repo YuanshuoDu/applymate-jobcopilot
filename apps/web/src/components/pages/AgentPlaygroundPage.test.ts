@@ -51,13 +51,14 @@ describe('Agent workspace responsive layout', () => {
   })
 
   it('keeps one execution stream and delegates session rendering to the V2 timeline client', () => {
+    const retiredChatStreamModule = ['agent', 'chat', 'stream'].join('-')
     expect(source.match(/new EventSource\(/g) ?? []).toHaveLength(1)
     expect(streamSource).toContain('streamAgentTimeline')
     expect(streamSource).toContain('sendAgentTurnMessage')
     expect(streamSource).toContain("fetch('/api/agent/sessions'")
     expect(streamSource).not.toContain('/api/agent/chat')
     expect(streamSource).not.toContain('streamAgentChat')
-    expect(streamSource).not.toContain('agent-chat-stream')
+    expect(streamSource).not.toContain(retiredChatStreamModule)
   })
 
   it('does not stop an active Turn from page cleanup', () => {

@@ -1,4 +1,4 @@
-export { schemaVersion, protocolRevision } from './version.js'
+export { AGENT_HARNESS_PROTOCOL_VERSION, schemaVersion, protocolRevision } from './version.js'
 export {
   AGENT_DELTA_STREAM_MAX_LENGTH,
   AGENT_STREAM_SCHEMA_VERSION,

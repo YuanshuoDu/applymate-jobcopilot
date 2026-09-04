@@ -1,5 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { NextRequest } from 'next/server'
+import { legacyTrafficSnapshot } from '@/lib/observability/legacy-counter'
 
 const mocks = vi.hoisted(() => ({
   prepareAiRoute: vi.fn(),
@@ -36,6 +37,7 @@ describe('agent run API session binding', () => {
   it('refuses to start a pipeline for a deleted or foreign requested session', async () => {
     mocks.findFirst.mockResolvedValueOnce(null)
     const { GET } = await import('./route')
+    const before = legacyTrafficSnapshot()
 
     const response = await GET(new NextRequest('http://localhost/api/agent/run?sessionId=deleted_session') as never)
     if (!response) throw new Error('Expected a response')
@@ -47,5 +49,7 @@ describe('agent run API session binding', () => {
       where: { id: 'deleted_session', userId: 'user_1' },
       select: { id: true },
     })
+    expect(legacyTrafficSnapshot().windowByKey.agent_run_endpoint).toBe(before.windowByKey.agent_run_endpoint + 1)
+    expect(legacyTrafficSnapshot().windowByKey.agent_stream_connect).toBe(before.windowByKey.agent_stream_connect + 1)
   })
 })

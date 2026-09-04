@@ -1,5 +1,10 @@
 # ApplyMate JobCopilot — Codex Agent Instructions
 
+Agent Harness V2 is the canonical production path for agent behavior. New
+agent code must use the typed session/turn/item/event/tool contracts; legacy
+paths are compatibility or explicitly fail-closed emergency paths and cannot
+be expanded without a reviewed issue and rollout evidence.
+
 > **Read this file completely before touching any code.**
 > This file is for Codex (the implementation executor). For Claude (PM + Reviewer) instructions, see `CLAUDE.md`.
 
