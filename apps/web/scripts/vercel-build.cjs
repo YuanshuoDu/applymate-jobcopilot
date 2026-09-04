@@ -2,6 +2,7 @@ const { spawnSync } = require('node:child_process')
 
 const pnpm = process.platform === 'win32' ? 'pnpm.cmd' : 'pnpm'
 const guestSupportMigration = '20260904170000_allow_guest_support_cases'
+const migrationRetryDelaysMs = [10_000, 15_000, 30_000, 30_000, 30_000]
 
 function run(args, env = process.env) {
   const result = spawnSync(pnpm, args, { stdio: 'inherit', env })
@@ -19,9 +20,24 @@ function shouldRecoverFailedGuestSupportMigration(output) {
   return output.includes(guestSupportMigration) && /\bP(?:3009|3018)\b/.test(output)
 }
 
+function neonDirectUrl(value) {
+  try {
+    const url = new URL(value)
+    if (!url.hostname.includes('-pooler.')) return value
+    url.hostname = url.hostname.replace('-pooler.', '.')
+    return url.toString()
+  } catch {
+    return value
+  }
+}
+
 function migrationEnvironment(env = process.env) {
   const directUrl = env.DIRECT_DATABASE_URL?.trim()
-  return directUrl ? { ...env, DATABASE_URL: directUrl } : env
+  if (directUrl) return { ...env, DATABASE_URL: neonDirectUrl(directUrl) }
+  const databaseUrl = env.DATABASE_URL?.trim()
+  if (!databaseUrl) return env
+  const normalizedUrl = neonDirectUrl(databaseUrl)
+  return normalizedUrl === databaseUrl ? env : { ...env, DATABASE_URL: normalizedUrl }
 }
 
 function shouldBootstrapStagingAdmin(env = process.env) {
@@ -30,9 +46,9 @@ function shouldBootstrapStagingAdmin(env = process.env) {
     && Boolean(env.INITIAL_SUPER_ADMIN_EMAIL?.trim())
 }
 
-function waitForRetry() {
+function waitForRetry(delayMs = 10_000) {
   const signal = new Int32Array(new SharedArrayBuffer(4))
-  Atomics.wait(signal, 0, 0, 10_000)
+  Atomics.wait(signal, 0, 0, delayMs)
 }
 
 function main(env = process.env) {
@@ -59,11 +75,10 @@ function main(env = process.env) {
       attempt += 1
       migrationResult = runWithOutput(migrationArgs, migrationEnv)
     }
-    while (!migrationResult.succeeded && attempt < 3) {
-      if (attempt < 3) {
-        console.log(`Prisma migration attempt ${attempt} failed; retrying in 10 seconds.`)
-        waitForRetry()
-      }
+    while (!migrationResult.succeeded && attempt < 6) {
+      const delayMs = migrationRetryDelaysMs[attempt - 1] ?? 30_000
+      console.log(`Prisma migration attempt ${attempt} failed; retrying in ${delayMs / 1000} seconds.`)
+      waitForRetry(delayMs)
       attempt += 1
       migrationResult = runWithOutput(migrationArgs, migrationEnv)
     }
