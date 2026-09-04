@@ -1,10 +1,22 @@
 const { spawnSync } = require('node:child_process')
 
 const pnpm = process.platform === 'win32' ? 'pnpm.cmd' : 'pnpm'
+const guestSupportMigration = '20260904170000_allow_guest_support_cases'
 
 function run(args, env = process.env) {
   const result = spawnSync(pnpm, args, { stdio: 'inherit', env })
   return result.status === 0
+}
+
+function runWithOutput(args, env = process.env) {
+  const result = spawnSync(pnpm, args, { encoding: 'utf8', env })
+  const output = [result.stdout, result.stderr].filter(Boolean).join('')
+  if (output) process.stdout.write(output)
+  return { output, succeeded: result.status === 0 }
+}
+
+function shouldRecoverFailedGuestSupportMigration(output) {
+  return output.includes(guestSupportMigration) && /\bP(?:3009|3018)\b/.test(output)
 }
 
 function migrationEnvironment(env = process.env) {
@@ -37,19 +49,25 @@ function main(env = process.env) {
 
   if (env.VERCEL_ENV === 'production') {
     const migrationArgs = ['--filter', '@jobcopilot/web', 'exec', 'prisma', 'migrate', 'deploy']
+    const resolveMigrationArgs = ['--filter', '@jobcopilot/web', 'exec', 'prisma', 'migrate', 'resolve', '--rolled-back', guestSupportMigration]
     const migrationEnv = migrationEnvironment(env)
-    let migrated = false
-    for (let attempt = 1; attempt <= 3; attempt += 1) {
-      if (run(migrationArgs, migrationEnv)) {
-        migrated = true
-        break
-      }
+    let attempt = 1
+    let migrationResult = runWithOutput(migrationArgs, migrationEnv)
+    if (!migrationResult.succeeded && shouldRecoverFailedGuestSupportMigration(migrationResult.output)) {
+      console.log(`Recovering failed Prisma migration ${guestSupportMigration}.`)
+      if (!run(resolveMigrationArgs, migrationEnv)) process.exit(1)
+      attempt += 1
+      migrationResult = runWithOutput(migrationArgs, migrationEnv)
+    }
+    while (!migrationResult.succeeded && attempt < 3) {
       if (attempt < 3) {
         console.log(`Prisma migration attempt ${attempt} failed; retrying in 10 seconds.`)
         waitForRetry()
       }
+      attempt += 1
+      migrationResult = runWithOutput(migrationArgs, migrationEnv)
     }
-    if (!migrated) process.exit(1)
+    if (!migrationResult.succeeded) process.exit(1)
   }
 
   if (!run(['--filter', '@jobcopilot/web', 'exec', 'prisma', 'generate'], env)) process.exit(1)
@@ -73,6 +91,10 @@ function main(env = process.env) {
   }
 }
 
-module.exports = { migrationEnvironment, shouldBootstrapStagingAdmin }
+module.exports = {
+  migrationEnvironment,
+  shouldBootstrapStagingAdmin,
+  shouldRecoverFailedGuestSupportMigration,
+}
 
 if (require.main === module) main()
