@@ -25,4 +25,16 @@ describe('GET /api/admin/v1/support/cases', () => {
     expect(response.status).toBe(400)
     expect(mocks.findMany).not.toHaveBeenCalled()
   })
+
+  it('returns a safe external requester shape for landing-page cases', async () => {
+    mocks.findMany.mockResolvedValueOnce([{ id: 'case-guest', subject: 'Landing page contact', category: 'other', status: 'open', priority: 'normal', assignedAdminId: null, slaDueAt: null, version: 1, createdAt: new Date('2026-09-04T12:00:00.000Z'), updatedAt: new Date('2026-09-04T12:00:00.000Z'), safeContext: { source: 'landing_contact' }, requesterName: 'Ada Lovelace', requesterEmail: 'ada@example.com', requester: null, messages: [] }])
+    const { GET } = await import('./route')
+    const response = await GET(new NextRequest('http://localhost/api/admin/v1/support/cases'))
+    const payload = await response.json() as { cases: Array<{ requester: { id: string; name: string; email: string; plan: string } }> }
+
+    expect(response.status).toBe(200)
+    expect(payload.cases[0].requester).toEqual(expect.objectContaining({ id: 'external:case-guest', name: 'A*** L***', email: 'a***@example.com', plan: 'external' }))
+    expect(payload.cases[0]).not.toHaveProperty('requesterEmail')
+    expect(payload.cases[0]).not.toHaveProperty('requesterName')
+  })
 })

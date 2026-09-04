@@ -5,6 +5,7 @@ import { AdminMutationConflict, runAdminMutation } from '@/lib/admin/write-trans
 import { validateAdminWrite } from '@/lib/admin/csrf'
 import { supportCaseScope } from '@/lib/admin/support-case'
 import { parseReply } from '@/lib/contact-us'
+import { sendSupportCaseReplyEmail } from '@/lib/support-case-email'
 import { db } from '@/lib/db'
 
 export async function POST(request: NextRequest, context: { params: Promise<{ id: string }> }) {
@@ -19,7 +20,7 @@ export async function POST(request: NextRequest, context: { params: Promise<{ id
   const idempotencyKey = request.headers.get('idempotency-key')
   if (!message || reason.length < 10 || reason.length > 500 || !idempotencyKey) return NextResponse.json({ error: 'Invalid support reply' }, { status: 400 })
   const scope = supportCaseScope(actor)
-  const supportCase = await db.supportCase.findFirst({ where: { id, ...scope }, select: { requesterUserId: true } })
+  const supportCase = await db.supportCase.findFirst({ where: { id, ...scope }, select: { requesterUserId: true, requesterEmail: true, subject: true } })
   if (!supportCase) return NextResponse.json({ error: 'Not found' }, { status: 404 })
   const tenantUserId = supportCase.requesterUserId ?? undefined
   try {
@@ -30,12 +31,15 @@ export async function POST(request: NextRequest, context: { params: Promise<{ id
       })
       if (!claimed.count) throw new AdminMutationConflict('Case changed or access is no longer available')
       const staffReply = await tx.supportCaseMessage.create({ data: { caseId: id, authorType: 'staff_reply', authorUserId: actor.userId, idempotencyKey, body: message.body, redacted: message.redacted } })
-      await tx.notification.create({ data: { userId: supportCase.requesterUserId, type: 'contact_us_reply', title: 'New support reply', body: 'A support team member replied to your case.' } })
+      if (supportCase.requesterUserId) await tx.notification.create({ data: { userId: supportCase.requesterUserId, type: 'contact_us_reply', title: 'New support reply', body: 'A support team member replied to your case.' } })
       return staffReply
     } })
     if (result.duplicate) return NextResponse.json({ duplicate: true })
     const created = result.value
-    return NextResponse.json({ message: created }, { status: 201, headers: { 'Cache-Control': 'no-store' } })
+    const emailSent = !supportCase.requesterUserId && supportCase.requesterEmail
+      ? await sendSupportCaseReplyEmail({ recipient: supportCase.requesterEmail, subject: supportCase.subject, body: message.body })
+      : null
+    return NextResponse.json({ message: created, emailSent }, { status: 201, headers: { 'Cache-Control': 'no-store' } })
   } catch (error) {
     if (error instanceof AdminMutationConflict) return NextResponse.json({ error: error.message }, { status: 409 })
     throw error

@@ -33,21 +33,25 @@ export async function GET(request: NextRequest) {
     where: { ...statusFilter, ...priorityFilter, ...assignmentFilter, ...categoryFilter, ...slaFilter, ...scope },
     orderBy: [{ priority: 'desc' }, { slaDueAt: 'asc' }], take: 100,
     select: {
-      id: true, subject: true, category: true, status: true, priority: true, assignedAdminId: true, slaDueAt: true, version: true, createdAt: true, updatedAt: true, safeContext: true,
+      id: true, subject: true, category: true, status: true, priority: true, assignedAdminId: true, slaDueAt: true, version: true, createdAt: true, updatedAt: true, safeContext: true, requesterName: true, requesterEmail: true,
       requester: { select: adminUserMetadataSelect },
       messages: { select: { id: true, authorType: true, body: true, redacted: true, createdAt: true }, orderBy: { createdAt: 'asc' } },
     },
   })
   await writeAdminAudit({ requestId: actor.requestId, actorUserId: actor.userId, actorRoleKey: actor.roleKey, action: 'support.case_list_viewed', outcome: 'success' })
-  return NextResponse.json({ cases: cases.map((supportCase) => ({ ...supportCase, requester: toAdminUserMetadata(supportCase.requester!) })) }, { headers: { 'Cache-Control': 'no-store' } })
+  return NextResponse.json({ cases: cases.map(toAdminCaseDto) }, { headers: { 'Cache-Control': 'no-store' } })
 }
 
-type AdminCaseRow = { id: string; subject: string; category: string; status: string; priority: string; assignedAdminId: string | null; slaDueAt: Date | null; firstRespondedAt: Date | null; resolvedAt: Date | null; safeContext: unknown; createdAt: Date; updatedAt: Date; requester: { id: string; email: string; name: string | null; plan: string; accountStatus: string; location: string | null; _count: { jobs: number; applicationTasks: number; resumes: number } }; messages: Array<{ id: string; authorType: string; authorUserId: string | null; body: string; redacted: boolean; createdAt: Date }> }
+type AdminCaseRow = { id: string; subject: string; category: string; status: string; priority: string; assignedAdminId: string | null; slaDueAt: Date | null; version: number; createdAt: Date; updatedAt: Date; safeContext: unknown; requesterName: string | null; requesterEmail: string | null; requester: { id: string; email: string; name: string | null; plan: string; accountStatus: string; location: string | null; createdAt: Date; _count: { jobs: number; resumes: number; notifications: number }; gmailSyncState: { lastSyncedAt: Date | null; lastError: string | null } | null } | null; messages: Array<{ id: string; authorType: string; body: string; redacted: boolean; createdAt: Date }> }
 
 function toAdminCaseDto(value: AdminCaseRow) {
-  const requester = value.requester
-  return { id: value.id, subject: value.subject, category: value.category, status: value.status, priority: value.priority, assignedAdminId: value.assignedAdminId, slaDueAt: value.slaDueAt?.toISOString() ?? null, firstRespondedAt: value.firstRespondedAt?.toISOString() ?? null, resolvedAt: value.resolvedAt?.toISOString() ?? null, createdAt: value.createdAt.toISOString(), updatedAt: value.updatedAt.toISOString(), safeContext: value.safeContext, requester: { id: requester.id, email: maskEmail(requester.email), name: maskName(requester.name), plan: requester.plan, accountStatus: requester.accountStatus, region: requester.location ? requester.location.split(',').at(-1)?.trim() ?? '' : '', counts: requester._count }, messages: value.messages.map(message => ({ ...message, createdAt: message.createdAt.toISOString() })) }
+  return { id: value.id, subject: value.subject, category: value.category, status: value.status, priority: value.priority, assignedAdminId: value.assignedAdminId, slaDueAt: value.slaDueAt?.toISOString() ?? null, version: value.version, createdAt: value.createdAt.toISOString(), updatedAt: value.updatedAt.toISOString(), safeContext: value.safeContext, requester: toAdminSupportRequester(value), messages: value.messages.map(message => ({ ...message, createdAt: message.createdAt.toISOString() })) }
 }
 
-function maskEmail(value: string): string { const [local, domain] = value.split('@'); return `${local?.slice(0, 1) ?? '*'}***@${domain ?? 'redacted'}` }
+function toAdminSupportRequester(value: AdminCaseRow) {
+  if (value.requester) return toAdminUserMetadata(value.requester)
+  return { id: `external:${value.id}`, email: maskEmail(value.requesterEmail), name: maskName(value.requesterName), plan: 'external', accountStatus: 'external', location: null, createdAt: new Date(0), jobsCount: 0, resumeExists: false, notificationsCount: 0, gmail: { connected: false, lastSyncedAt: null, hasError: false } }
+}
+
+function maskEmail(value: string | null): string { if (!value) return 'Unknown contact'; const [local, domain] = value.split('@'); return `${local?.slice(0, 1) ?? '*'}***@${domain ?? 'redacted'}` }
 function maskName(value: string | null): string { if (!value) return ''; return value.split(/\s+/).map(part => part ? `${part[0]}***` : '').join(' ') }
