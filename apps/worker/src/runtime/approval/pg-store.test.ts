@@ -99,4 +99,14 @@ describe("Worker PG approval store", () => {
     expect(client.query).toHaveBeenCalledWith(expect.stringContaining("INSERT INTO \"agent_action_reservations\""), expect.any(Array))
     expect(calls.filter((call) => call.includes("INSERT INTO \"agent_events\"")).length).toBe(2)
   })
+
+  it("supports the locked submit input without exposing the approval nonce", async () => {
+    const row = await makeRow()
+    const { pool } = fakePool(row)
+    const store = createPgApprovalStore(pool, { userId: scope.userId })
+    const expected = { userId: scope.userId, jobId: scope.jobId, scopeHash: row.scopeHash as string }
+
+    await expect(store.inspectSubmission(row.id as string, expected, timeAt(1))).resolves.toMatchObject({ id: row.id, status: "approved", scope: { jobId: scope.jobId, resourceHash: scope.resourceHash } })
+    await expect(store.consumeSubmission(row.id as string, expected, timeAt(1))).resolves.toMatchObject({ id: row.id, status: "consumed" })
+  })
 })

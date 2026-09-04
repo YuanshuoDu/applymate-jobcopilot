@@ -356,6 +356,12 @@ enum AgentArtifactLifecycle {
   draft
 }
 
+enum SubmissionAttemptState {
+  reserved
+  submitted
+  failed
+}
+
 // Durable source of truth for recruitment artifacts consumed by the Worker.
 // The Worker uses pg SQL; Web owns this Prisma schema and its migrations.
 model AgentArtifact {
@@ -379,6 +385,25 @@ model AgentArtifact {
   @@unique([userId, jobId, lifecycle, artifactType])
   @@index([userId, jobId, lifecycle])
   @@map("agent_artifact")
+}
+
+// Durable idempotency ledger for the single external application-submit path.
+// The Worker owns execution through pg.Pool; Web owns this Prisma schema.
+model SubmissionAttempt {
+  id             String                @id @default(cuid())
+  userId         String
+  jobId          String
+  receiptId      String                @unique
+  constraintHash String
+  artifactHash   String
+  state          SubmissionAttemptState
+  responseRef    String?
+  errorCode      String?
+  createdAt      DateTime              @default(now())
+  updatedAt      DateTime              @updatedAt
+
+  @@index([userId, jobId, state])
+  @@map("submission_attempt")
 }
 
 model Resume {
