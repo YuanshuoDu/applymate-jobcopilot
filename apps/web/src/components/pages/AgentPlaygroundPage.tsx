@@ -11,7 +11,6 @@ import { AgentUnifiedStream } from '@/components/agent-workspace/AgentUnifiedStr
 import type { ApplyReadyJob } from '@/components/agent-workspace/ApplyJobCard'
 import { AgentSessionConsole } from '@/components/agent-workspace/AgentSessionConsole'
 import { sessionHeaderSubtitle, type AgentSessionsResponse } from '@/components/agent-workspace/session-view-model'
-import type { AgentChatAction } from '@/components/agent-workspace/agent-chat-stream'
 import type { LogEntry, QuestionOption, RunSummary } from '@/components/agent-workspace/live-run-types'
 import type { SubmissionPolicySettings } from '@/components/agent-workspace/automation-policy'
 import { useAgentSessionState, useAgentSessionUrl } from '@/components/agent-workspace/agent-session-state'
@@ -33,7 +32,7 @@ export function AgentPlaygroundPage() {
   const { t } = useI18n()
 
   const { data: jobsData }                               = useApi<{ jobs: Array<{ status: string; workflowState: string }> }>('/api/jobs?pageSize=100')
-  const { data: agentConfig, refetch: refetchAgentConfig } = useApi<AgentConfig>('/api/agent')
+  const { data: agentConfig } = useApi<AgentConfig>('/api/agent')
 
   const [showAddModal,  setShowAddModal]  = useState(false)
   const [applyQueue,    setApplyQueue]    = useState<ApplyReadyJob[]>([])
@@ -344,65 +343,6 @@ export function AgentPlaygroundPage() {
       && !entry.answered,
   ) ? waitingQuestion : null
 
-  // ── Chat action handler ────────────────────────────────────────────────────
-
-  const handleChatAction = useCallback(async (action: { type: string; [k: string]: unknown }) => {
-    switch (action.type) {
-      case 'start_run':
-        if (typeof action.minMatchScore === 'number' && Number.isInteger(action.minMatchScore)
-          && action.minMatchScore >= 0 && action.minMatchScore <= 100) {
-          const { error } = await apiMutate('/api/agent', 'PATCH', { minMatchScore: action.minMatchScore })
-          if (error) {
-            toast.error('Match threshold update failed', error)
-            throw new Error(error)
-          }
-        }
-        startRun(
-          typeof action.chatMessage === 'string' ? action.chatMessage : undefined,
-          typeof action.sessionId === 'string' ? action.sessionId : undefined,
-        )
-        toast.info('Pipeline started', typeof action.minMatchScore === 'number'
-          ? `match threshold: ≥${action.minMatchScore}%`
-          : 'Orchestrator trigger run')
-        break
-      case 'stop_run':
-        try {
-          await stopRun()
-          toast.info('Pipeline canceled', 'Background execution has stopped, New applications will not be processed further.')
-        } catch (error) {
-          toast.error('Cancel run failed', error instanceof Error ? error.message : 'Could not cancel the Agent execution.')
-        }
-        break
-      case 'toggle_agent': {
-        const role    = action.role    as string
-        const enabled = action.enabled as boolean
-        const { error } = await apiMutate(`/api/agent/roles/${role}`, 'PATCH', { enabled })
-        if (error) {
-          toast.error('Agent Update failed', error)
-          throw new Error(error)
-        }
-        window.dispatchEvent(new Event('applymate:agents-changed'))
-        toast.info(enabled ? `${role} Enabled` : `${role} Disabled`, '')
-        break
-      }
-      case 'update_config': {
-        const field = action.field as string
-        const value = action.value
-        const { error } = await apiMutate('/api/agent', 'PATCH', { [field]: value })
-        if (error) {
-          toast.error('Settings update failed', error)
-          throw new Error(error)
-        }
-        await refetchAgentConfig()
-        toast.success('Settings updated', `${field} → ${value}`)
-        break
-      }
-      case 'navigate':
-        if (action.path === 'jobs') window.location.href = '/?page=jobs'
-        break
-    }
-  }, [refetchAgentConfig, startRun, stopRun, toast])
-
   const handleAnswerQuestion = useCallback(async (entry: LogEntry, opt: QuestionOption) => {
     // Apply action
     if (opt.action) {
@@ -710,8 +650,6 @@ export function AgentPlaygroundPage() {
               setApplyQueue(prev => prev.map(j => j.jobId === jobId ? { ...j, url: `_applied_${j.url}` } : j))
               toast.success(t('agent.markedForDelivery'), `${job.company} · ${job.role}`)
             }}
-            onChatAction={handleChatAction}
-            onAppendLog={addLog}
             onSessionRecorded={(recordedSessionId, goal, subtitle) => {
               setSessionId(recordedSessionId)
               if (goal) setConversationTitle(goal)

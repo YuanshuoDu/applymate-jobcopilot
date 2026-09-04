@@ -1,6 +1,5 @@
 import type { ApplyReadyJob } from './ApplyJobCard'
 import type { ComposerJob } from './AgentComposer'
-import type { AgentChatAction } from './agent-chat-stream'
 import type { LogEntry, QuestionOption, RunSummary } from './live-run-types'
 
 export interface ComposerJobsResponse {
@@ -21,8 +20,6 @@ export interface AgentUnifiedStreamProps {
   onAnswerQuestion: (entry: LogEntry, opt: QuestionOption) => Promise<void> | void
   onAnswerOrchestrator: (questionId: string, answer: string, options?: QuestionOption[]) => Promise<void> | void
   onApplied: (jobId: string, job: ApplyReadyJob) => void
-  onChatAction: (action: AgentChatAction) => void | Promise<void>
-  onAppendLog: (entry: LogEntry) => void
   onSessionRecorded: (sessionId: string, goal?: string, subtitle?: string) => void
   conversationTitle?: string | null
   conversationSubtitle?: string | null
