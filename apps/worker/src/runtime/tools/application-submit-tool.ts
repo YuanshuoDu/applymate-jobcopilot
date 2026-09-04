@@ -100,7 +100,7 @@ function providerError(error: unknown): string {
 function executionError(error: unknown): string {
   if (error && typeof error === "object" && "code" in error && typeof (error as { code?: unknown }).code === "string") {
     const code = String((error as { code: string }).code)
-    if (code.startsWith("approval_") || ["idempotency_replay", "invalid_state", "not_found"].includes(code)) return code
+    if (code.startsWith("approval_") || ["browser_412", "browser_manual", "browser_failed", "idempotency_replay", "invalid_state", "not_found"].includes(code)) return code
   }
   return providerError(error)
 }

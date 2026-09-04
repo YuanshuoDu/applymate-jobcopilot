@@ -77,7 +77,7 @@ export { ToolCallSchema, ToolCallStatusSchema, ToolCapabilitySchema, ToolDefinit
 export type { ToolCall, ToolCallStatus, ToolCapability, ToolDefinition, ToolRisk } from './tool.js'
 export { PolicyDecisionSchema, PolicyDomainSchema, PolicyHookNameSchema, PolicyOutcomeSchema, PolicyRoleSchema, PolicyRuleOutcomeSchema, PolicyRuleSchema, PolicyScopeSchema, PolicySnapshotSchema } from './policy.js'
 export type { PolicyDecision, PolicyDomain, PolicyHookName, PolicyOutcome, PolicyRole, PolicyRule, PolicyRuleOutcome, PolicyScope, PolicySnapshot } from './policy.js'
-export { AgentApprovalSchema, ApprovalHashSchema, ApprovalScopeSchema, ApprovalStatusSchema, ApprovalTypeSchema, serializeApprovalScope } from './approval.js'
+export { AgentApprovalSchema, ApprovalHashSchema, ApprovalScopeSchema, ApprovalStatusSchema, ApprovalTypeSchema, isApprovalHash, serializeApprovalScope } from './approval.js'
 export type { AgentApproval, ApprovalScope, ApprovalStatus, ApprovalType } from './approval.js'
 export { createApprovalNonce, hashApprovalNonce, hashApprovalScope, sha256Hex } from './approval-crypto.js'
 export {

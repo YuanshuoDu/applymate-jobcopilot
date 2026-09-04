@@ -22,7 +22,7 @@ export type ArtifactBaseInput = {
 }
 export type ArtifactToolRecord = {
   readonly id: string
-  readonly type: 'resume' | 'cover_letter'
+  readonly type: 'resume' | 'cover_letter' | 'application'
   readonly lifecycle: 'base' | 'draft'
   readonly version: number
   readonly hash: string

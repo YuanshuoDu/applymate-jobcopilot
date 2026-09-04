@@ -4,7 +4,6 @@ import { enqueueApplyTask } from "@/lib/apply-queue-client";
 import { assessApplicationPreflight, isSupportedAutomatedApplyUrl } from "@/lib/agent/application-preflight";
 import { isRuntimeFeatureEnabled } from '@/lib/runtime-feature-flags'
 import { isFeatureAllowed, resolveAiAccess } from '@/lib/entitlements'
-import { consumeLegacyReceipt } from '@/lib/agent/approval/legacy-receipt'
 import { requireLegacyPolicy } from '@/lib/agent/policy/legacy'
 
 export class AutoApplyError extends Error {}
@@ -131,7 +130,7 @@ export async function queueAutonomousApplication(input: {
   await assertJobPreflight(input)
   const approval = await db.agentApproval.findFirst({
     where: { id: input.approvalId, userId: input.userId, status: "approved", type: "submit_application" },
-    select: { payload: true, sessionId: true, turnId: true, toolCallId: true, jobId: true, revision: true, expiresAt: true },
+    select: { payload: true, sessionId: true, turnId: true, toolCallId: true, jobId: true, revision: true, expiresAt: true, scopeHash: true },
   });
   const payload = asRecord(approval?.payload);
   const taskSnapshot = await db.applicationTask.findFirst({
@@ -147,7 +146,8 @@ export async function queueAutonomousApplication(input: {
   if (!approval || payload.applicationTaskId !== input.applicationTaskId || payload.jobId !== input.jobId ||
     payload.resumeId !== material.resumeId || payload.coverLetterId !== material.coverLetterId ||
     ("confirmedAnswers" in payload && JSON.stringify(payload.confirmedAnswers ?? null) !== JSON.stringify(taskSnapshot?.confirmedAnswers ?? null)) ||
-    !approval.turnId || !approval.toolCallId || approval.jobId !== input.jobId || !approval.expiresAt || !input.receiptNonce) {
+    !approval.turnId || !approval.toolCallId || approval.jobId !== input.jobId || !approval.expiresAt ||
+    !approval.scopeHash || !input.receiptNonce) {
     throw new AutoApplyError("A current, explicit approval is required before this application can be submitted.");
   }
   const receiptSessionId = input.sessionId ?? approval.sessionId ?? taskSnapshot?.sessionId;
@@ -236,37 +236,14 @@ export async function queueAutonomousApplication(input: {
   }
 
   try {
-    await consumeLegacyReceipt(db, {
-      approvalId: input.approvalId,
-      userId: input.userId,
-      sessionId: receiptSessionId,
-      turnId: approval.turnId,
-      toolCallId: approval.toolCallId,
-      jobId: input.jobId,
-      action: "submit_application",
-      nonce: input.receiptNonce,
-      resource: { jobId: input.jobId },
-      material,
-      answers: taskSnapshot?.confirmedAnswers ?? null,
-      revision: approval.revision,
-      expiresAt: approval.expiresAt,
-      reservationKey: `application-submit:${input.applicationTaskId}`,
-    });
-  } catch (error) {
-    await db.$transaction(async tx => {
-      await tx.job.updateMany({ where: { id: input.jobId, userId: input.userId, workflowState: "queued" }, data: { workflowState: "ready_to_apply" } });
-      await tx.applicationTask.updateMany({ where: { id: input.applicationTaskId, status: "filling" }, data: { status: "waiting_for_authorization", checkpoint: "receipt_rejected" } });
-    }).catch(() => undefined);
-    throw new AutoApplyError(error instanceof Error ? error.message : "The scoped submission receipt could not be consumed.");
-  }
-
-  try {
     const taskId = await enqueueApplyTask({
       applicationTaskId: input.applicationTaskId,
       jobId: input.jobId,
       userId: input.userId,
       applyUrl,
       operation: "submit",
+      receiptId: input.approvalId,
+      constraintHash: approval.scopeHash ?? undefined,
     });
     await db.activity.create({
       data: {

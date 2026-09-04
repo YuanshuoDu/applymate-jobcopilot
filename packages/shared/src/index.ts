@@ -72,6 +72,10 @@ export interface ApplyTaskPayload {
   resumePath: string;
   coverLetterPath?: string;
   dryRun?: boolean;
+  /** Canonical approval receipt forwarded to the Worker submit tool; paired with constraintHash. */
+  receiptId?: string;
+  /** Canonical approval scope hash; paired with receiptId and rejected when stale. */
+  constraintHash?: string;
 }
 
 /** Outcome written to apply_results after each task */

@@ -14,7 +14,7 @@ function mapError(error: unknown): never {
 }
 
 function toRecord(row: AgentArtifactRow): ArtifactToolRecord {
-  if (row.artifactType !== "resume" && row.artifactType !== "cover_letter") {
+  if (row.artifactType !== "resume" && row.artifactType !== "cover_letter" && row.artifactType !== "application") {
     throw new ArtifactToolError("precondition_failed", "The database returned an unsupported artifact type.")
   }
   return {

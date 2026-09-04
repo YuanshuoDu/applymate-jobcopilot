@@ -29,6 +29,16 @@ describe('AgentApproval schema', () => {
     expect(validate(AgentApprovalSchema, approval)).toBe(true)
   })
 
+  it('accepts artifact hashes with the canonical sha256 prefix', () => {
+    expect(validate(AgentApprovalSchema, {
+      ...approval,
+      scope: {
+        ...approval.scope,
+        resourceHash: `sha256:${'a'.repeat(64)}`,
+      },
+    })).toBe(true)
+  })
+
   it('rejects an unknown scoped action and unknown status', () => {
     expect(validate(AgentApprovalSchema, { ...approval, scope: { ...approval.scope, action: 'unknown_action' } })).toBe(false)
     expect(validate(AgentApprovalSchema, { ...approval, status: 'accepted' })).toBe(false)

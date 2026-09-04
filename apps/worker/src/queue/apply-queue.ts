@@ -45,6 +45,8 @@ import {
   UNATTENDED_APPLY_UNAVAILABLE_MESSAGE,
 } from "./unattended-apply-control.js";
 import { redisConnection } from "../redis.js";
+import { createPgApplicationSubmitTool, type ApplicationSubmitOutput } from "../runtime/tools/application-submit-tool.js";
+import { createBrowserApplicationSubmitProvider } from "../runtime/tools/browser-submit-provider.js";
 
 export const connection = redisConnection;
 
@@ -61,7 +63,7 @@ export const applyQueue = new Queue<ApplyTaskPayload>(QUEUE_NAME, {
 export const applyWorker = new Worker<ApplyTaskPayload>(
   QUEUE_NAME,
   async (job) => {
-    const { applicationTaskId, operation, userId, jobId, applyUrl, personaId, resumePath, coverLetterPath, dryRun } =
+    const { applicationTaskId, operation, userId, jobId, applyUrl, personaId, resumePath, coverLetterPath, dryRun, receiptId, constraintHash } =
       job.data;
 
     // Extract domain from applyUrl for per-domain rate limiting
@@ -79,6 +81,9 @@ export const applyWorker = new Worker<ApplyTaskPayload>(
     let ctx: Awaited<ReturnType<typeof loadTaskContext>> | null = null;
 
     try {
+      if (operation === "submit" && Boolean(receiptId) !== Boolean(constraintHash)) {
+        throw new Error("Canonical application submission requires both receiptId and constraintHash.");
+      }
       if (!(await isUserActive(getPool(), userId))) {
         await finishApplicationTask(getPool(), applicationTaskId, "failed", "account_suspended", "Account suspended by an administrator.");
         console.warn(`[apply-worker] Skipping suspended account for job=${jobId}`);
@@ -212,81 +217,112 @@ export const applyWorker = new Worker<ApplyTaskPayload>(
           } : {}),
         };
 
-        // Use the preflighted ATS flow when available, else AI fallback.
-        let harnessResult: HarnessResult | null = null;
-        let usedFlow: string | null = flow ? "programmatic" : null;
+        // Keep the existing ATS/pattern/harness execution as one provider so
+        // the typed tool owns receipt validation, artifact freshness, and
+        // idempotency before this callback can reach an external submit.
+        const runBrowserFlow = async (typedSubmitGuard?: () => Promise<boolean>): Promise<HarnessResult> => {
+          const browserTask: ApplyTask = typedSubmitGuard
+            ? {
+                ...applyTask,
+                beforeSubmit: async () => {
+                  if (!await typedSubmitGuard()) return false;
+                  return applyTask.beforeSubmit ? applyTask.beforeSubmit() : true;
+                },
+              }
+            : applyTask;
+          let result: HarnessResult | null = null;
+          usedFlow = flow ? "programmatic" : null;
 
-        const hasCaptcha = await challengeAllowsAction() === false;
-        if (hasCaptcha) {
-          // CAPTCHA, login and MFA are explicit human handoff boundaries.
-          // Do not use third-party solvers or attempt to bypass platform controls.
-          console.log("[apply-worker] Challenge boundary reached; requesting user takeover.");
-          harnessResult = {
-            status: "manual",
-            turns: 0,
-            error: challengeBoundary === "detection_error"
-              ? CHALLENGE_DETECTION_FAILED_MESSAGE
-              : CAPTCHA_USER_TAKEOVER_MESSAGE,
-            durationMs: 0,
-            log: [],
-          };
-          usedFlow = null;
-        }
-
-        if (harnessResult) {
-          // CAPTCHA branch already decided the outcome.
-        } else if (flow === "greenhouse") {
-          console.log(`[apply-worker] Using Greenhouse pre-programmed flow`);
-          harnessResult = await runGreenhouseFlow(page, applyTask);
-        } else if (flow === "lever") {
-          console.log(`[apply-worker] Using Lever pre-programmed flow`);
-          harnessResult = await runLeverFlow(page, applyTask);
-        } else if (flow === "workday") {
-          console.log(`[apply-worker] Using Workday pre-programmed flow`);
-          harnessResult = await runWorkdayFlow(page, applyTask);
-        } else if (flow === "personio") {
-          console.log(`[apply-worker] Using Personio pre-programmed flow`);
-          harnessResult = await runPersonioFlow(page, applyTask);
-        } else if (flow === "smartrecruiters") {
-          console.log(`[apply-worker] Using SmartRecruiters pre-programmed flow`);
-          harnessResult = await runSmartRecruitersFlow(page, applyTask);
-        } else {
-          // Phase 5: pattern cache -> replay -> AI fallback with budget cap.
-          const budget = await checkBudget(userId);
-          if (!budget.allowed) {
-            console.log(`[apply-worker] AI budget exceeded: ${budget.used}/${budget.limit}`);
-            harnessResult = {
+          const hasCaptcha = await challengeAllowsAction() === false;
+          if (hasCaptcha) {
+            // CAPTCHA, login and MFA are explicit human handoff boundaries.
+            // Do not use third-party solvers or attempt to bypass platform controls.
+            console.log("[apply-worker] Challenge boundary reached; requesting user takeover.");
+            result = {
               status: "manual",
               turns: 0,
-              error: `AI fallback budget exceeded (${budget.used}/${budget.limit} this month)`,
+              error: challengeBoundary === "detection_error"
+                ? CHALLENGE_DETECTION_FAILED_MESSAGE
+                : CAPTCHA_USER_TAKEOVER_MESSAGE,
               durationMs: 0,
               log: [],
             };
+            usedFlow = null;
+          }
+
+          if (result) {
+            // CAPTCHA branch already decided the outcome.
+          } else if (flow === "greenhouse") {
+            console.log(`[apply-worker] Using Greenhouse pre-programmed flow`);
+            result = await runGreenhouseFlow(page, browserTask);
+          } else if (flow === "lever") {
+            console.log(`[apply-worker] Using Lever pre-programmed flow`);
+            result = await runLeverFlow(page, browserTask);
+          } else if (flow === "workday") {
+            console.log(`[apply-worker] Using Workday pre-programmed flow`);
+            result = await runWorkdayFlow(page, browserTask);
+          } else if (flow === "personio") {
+            console.log(`[apply-worker] Using Personio pre-programmed flow`);
+            result = await runPersonioFlow(page, browserTask);
+          } else if (flow === "smartrecruiters") {
+            console.log(`[apply-worker] Using SmartRecruiters pre-programmed flow`);
+            result = await runSmartRecruitersFlow(page, browserTask);
           } else {
-            let host = "unknown";
-            try { host = new URL(taskCtx.applyUrl).hostname; } catch { /* invalid URL: cache miss */ }
-            const pathParts = taskCtx.applyUrl.replace(/^https?:\/\/[^/]+\//, "").split("/");
-            const urlPattern = pathParts.slice(0, 2).join("/") + "/";
+            // Phase 5: pattern cache -> replay -> AI fallback with budget cap.
+            const budget = await checkBudget(userId);
+            if (!budget.allowed) {
+              console.log(`[apply-worker] AI budget exceeded: ${budget.used}/${budget.limit}`);
+              result = {
+                status: "manual",
+                turns: 0,
+                error: `AI fallback budget exceeded (${budget.used}/${budget.limit} this month)`,
+                durationMs: 0,
+                log: [],
+              };
+            } else {
+              let host = "unknown";
+              try { host = new URL(taskCtx.applyUrl).hostname; } catch { /* invalid URL: cache miss */ }
+              const pathParts = taskCtx.applyUrl.replace(/^https?:\/\/[^/]+\//, "").split("/");
+              const urlPattern = pathParts.slice(0, 2).join("/") + "/";
 
-            const pattern = await findFormPattern(userId, host, urlPattern).catch((e: Error) => {
-              console.warn("[apply-worker] Pattern lookup failed:", e.message);
-              return null;
-            });
+              const pattern = await findFormPattern(userId, host, urlPattern).catch((e: Error) => {
+                console.warn("[apply-worker] Pattern lookup failed:", e.message);
+                return null;
+              });
 
-            if (operation === "submit" && pattern && shouldUsePattern(pattern)) {
-              const attempts = pattern.successCount + pattern.failureCount;
-              console.log(
-                `[apply-worker] Pattern cache hit: ${host}/${urlPattern} (confidence=${pattern.successCount}/${attempts})`
-              );
-              harnessResult = await replayPattern(page, pattern, applyTask.persona, applyTask.beforeSubmit);
-
-              if (harnessResult.status === "submission_blocked") {
-                usedFlow = "pattern-cache";
-              } else if (harnessResult.status !== "submitted") {
-                await recordPatternFailure(pattern.id).catch((e: Error) =>
-                  console.warn("[apply-worker] Pattern failure record failed:", e.message)
+              if (operation === "submit" && pattern && shouldUsePattern(pattern)) {
+                const attempts = pattern.successCount + pattern.failureCount;
+                console.log(
+                  `[apply-worker] Pattern cache hit: ${host}/${urlPattern} (confidence=${pattern.successCount}/${attempts})`
                 );
-                console.log("[apply-worker] Pattern replay failed, falling back to AgentHarness");
+                result = await replayPattern(page, pattern, browserTask.persona, browserTask.beforeSubmit);
+
+                if (result.status === "submission_blocked") {
+                  usedFlow = "pattern-cache";
+                } else if (result.status !== "submitted") {
+                  await recordPatternFailure(pattern.id).catch((e: Error) =>
+                    console.warn("[apply-worker] Pattern failure record failed:", e.message)
+                  );
+                  console.log("[apply-worker] Pattern replay failed, falling back to AgentHarness");
+                  usedFlow = "llm";
+                  const harness = new AgentHarness({
+                    userId,
+                    maxTurns: 30,
+                    dryRun: dryRun ?? false,
+                    mode: "dom",
+                  });
+                  result = await harness.run(page, browserTask);
+                  if (result.status === "submitted") {
+                    await incrementBudget(userId).catch((e: Error) =>
+                      console.warn("[apply-worker] Budget increment failed:", e.message)
+                    );
+                    writeFormPattern(userId, taskCtx.applyUrl, result);
+                  }
+                } else {
+                  usedFlow = "pattern-cache";
+                }
+              } else {
+                console.log(`[apply-worker] AI fallback: budget ${budget.used}/${budget.limit}`);
                 usedFlow = "llm";
                 const harness = new AgentHarness({
                   userId,
@@ -294,38 +330,63 @@ export const applyWorker = new Worker<ApplyTaskPayload>(
                   dryRun: dryRun ?? false,
                   mode: "dom",
                 });
-                harnessResult = await harness.run(page, applyTask);
-                if (harnessResult.status === "submitted") {
+                result = await harness.run(page, browserTask);
+                if (result.status === "submitted") {
                   await incrementBudget(userId).catch((e: Error) =>
                     console.warn("[apply-worker] Budget increment failed:", e.message)
                   );
-                  writeFormPattern(userId, taskCtx.applyUrl, harnessResult);
+                  writeFormPattern(userId, taskCtx.applyUrl, result);
                 }
-              } else {
-                usedFlow = "pattern-cache";
-              }
-            } else {
-              console.log(`[apply-worker] AI fallback: budget ${budget.used}/${budget.limit}`);
-              usedFlow = "llm";
-              const harness = new AgentHarness({
-                userId,
-                maxTurns: 30,
-                dryRun: dryRun ?? false,
-                mode: "dom",
-              });
-              harnessResult = await harness.run(page, applyTask);
-              if (harnessResult.status === "submitted") {
-                await incrementBudget(userId).catch((e: Error) =>
-                  console.warn("[apply-worker] Budget increment failed:", e.message)
-                );
-                writeFormPattern(userId, taskCtx.applyUrl, harnessResult);
               }
             }
           }
-        }
 
-        if (!harnessResult) {
-          throw new Error("Apply completed without a harness result");
+          if (!result) throw new Error("Apply completed without a harness result");
+          return result;
+        };
+
+        let usedFlow: string | null = null;
+        let harnessResult: HarnessResult;
+        const hasCanonicalReceipt = operation === "submit" && Boolean(receiptId && constraintHash);
+        if (hasCanonicalReceipt) {
+          const submit = createBrowserApplicationSubmitProvider({
+            run: runBrowserFlow,
+            confirmationId: `application:${applicationTaskId}`,
+            postSubmitUrl: () => page.url(),
+          });
+          const tool = createPgApplicationSubmitTool({ pool: getPool(), submit });
+          const toolResult = await tool.execute(
+            {
+              scope: { userId },
+              sessionId: applicationTaskId,
+              turnId: applicationTaskId,
+              stepId: "application.submit",
+              toolCallId: `application-submit:${applicationTaskId}`,
+              taskId: applicationTaskId,
+              signal: AbortSignal.timeout(APPLY_TIMEOUT_MS),
+              capabilities: ["submission", "write", "external_write", "coordination"],
+              reportProgress: async () => undefined,
+            },
+            { applicationTargetId: jobId, receiptId: receiptId!, constraintHash: constraintHash! },
+          ) as ApplicationSubmitOutput;
+          usedFlow = "application.submit";
+          harnessResult = toolResult.status === "submitted" || toolResult.status === "replayed"
+            ? { status: "submitted", turns: toolResult.status === "replayed" ? 0 : 1, durationMs: Date.now() - startedAt, error: null, log: [] }
+            : {
+                status: toolResult.errorCode === "browser_412"
+                  ? "submission_blocked"
+                  : toolResult.errorCode === "browser_manual"
+                    ? "manual"
+                    : "failed",
+                turns: 0,
+                durationMs: Date.now() - startedAt,
+                error: toolResult.errorCode ?? "submission_failed",
+                log: [],
+              };
+        } else {
+          // Legacy queue payloads remain a fail-safe compatibility path while
+          // all Web-created submit jobs now carry the canonical receipt.
+          harnessResult = await runBrowserFlow();
         }
 
         // A challenge can appear after navigation while a flow is filling the

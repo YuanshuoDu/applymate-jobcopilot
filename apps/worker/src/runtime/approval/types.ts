@@ -1,4 +1,4 @@
-import type { AgentApproval, ApprovalScope, ApprovalType } from "@jobcopilot/agent-protocol"
+import { isApprovalHash, type AgentApproval, type ApprovalScope, type ApprovalType } from "@jobcopilot/agent-protocol"
 
 export interface ApprovalScopeInput {
   userId: string
@@ -58,7 +58,7 @@ export function assertScopeInput(input: ApprovalScopeInput): void {
   if (values.some((value) => !value.trim()) || !Number.isInteger(input.revision) || input.revision < 0) {
     throw new ApprovalStoreError("approval_scope_mismatch", "Approval receipt scope is incomplete")
   }
-  if (![input.resourceHash, input.materialHash, input.answersHash].every((value) => /^[a-f0-9]{64}$/.test(value))) {
+  if (![input.resourceHash, input.materialHash, input.answersHash].every(isApprovalHash)) {
     throw new ApprovalStoreError("approval_scope_mismatch", "Approval receipt hashes are invalid")
   }
   if (Number.isNaN(input.expiresAt.getTime()) || input.expiresAt <= new Date()) {
