@@ -1,6 +1,4 @@
-import { Prisma, type PrismaClient } from "@prisma/client"
-
-import { db } from "@/lib/db"
+import type { PrismaClient } from "@prisma/client"
 
 export const USAGE_AGGREGATION_INTERVAL_MS = 5 * 60 * 1_000
 
@@ -79,10 +77,16 @@ type UsageRollupRow = {
 /** Reads the Web-owned five-minute projection; it never reads payload JSON. */
 export async function queryUsageRollups(
   options: UsageAggregationOptions = {},
-  client: Pick<PrismaClient, "$queryRaw"> = db,
+  client?: Pick<PrismaClient, "$queryRaw">,
 ): Promise<UsageAggregate[]> {
+  // Keep the pure in-memory aggregation path usable by CI drills and Worker
+  // tooling that intentionally run without a generated Prisma client.
+  const [{ Prisma }, { db }] = await Promise.all([
+    import("@prisma/client"),
+    client ? Promise.resolve({ db: client }) : import("@/lib/db"),
+  ])
   const window = defaultWindow(options)
-  const rows = await client.$queryRaw<UsageRollupRow[]>(Prisma.sql`
+  const rows = await db.$queryRaw<UsageRollupRow[]>(Prisma.sql`
     SELECT "aggregation_key", "user_id", "session_id", "turn_id", "tool_name", "model", "bucket_start",
            "event_count", "input_tokens", "output_tokens", "cost_micros"
     FROM "usage_event"
