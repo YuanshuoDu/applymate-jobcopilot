@@ -13,6 +13,7 @@ export interface TraceCarrier {
 }
 
 export type TraceIdFactory = () => string
+const MAX_TRACE_IDENTIFIER_LENGTH = 128
 
 export interface CreateTraceContextInput {
   traceId?: string
@@ -26,7 +27,7 @@ function defaultIdFactory(): string {
 }
 
 function requireId(value: string, label: string): string {
-  if (typeof value !== "string" || value.trim().length === 0) {
+  if (typeof value !== "string" || value.trim().length === 0 || value.length > MAX_TRACE_IDENTIFIER_LENGTH || /\s|[\u0000-\u001f\u007f]/u.test(value)) {
     throw new Error(`${label} must be a non-empty string`)
   }
   return value

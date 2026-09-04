@@ -1,3 +1,7 @@
+import { Prisma, type PrismaClient } from "@prisma/client"
+
+import { db } from "@/lib/db"
+
 export const USAGE_AGGREGATION_INTERVAL_MS = 5 * 60 * 1_000
 
 export interface UsageEventRecord {
@@ -10,6 +14,7 @@ export interface UsageEventRecord {
   inputTokens: number
   outputTokens: number
   costMicros: number
+  eventCount?: number
   occurredAt: Date | string
 }
 
@@ -57,6 +62,49 @@ export interface UsageAggregationOptions {
   userId?: string
 }
 
+type UsageRollupRow = {
+  user_id: string | null
+  session_id: string | null
+  turn_id: string | null
+  tool_name: string | null
+  model: string
+  bucket_start: Date
+  aggregation_key: string
+  event_count: number
+  input_tokens: number
+  output_tokens: number
+  cost_micros: number
+}
+
+/** Reads the Web-owned five-minute projection; it never reads payload JSON. */
+export async function queryUsageRollups(
+  options: UsageAggregationOptions = {},
+  client: Pick<PrismaClient, "$queryRaw"> = db,
+): Promise<UsageAggregate[]> {
+  const window = defaultWindow(options)
+  const rows = await client.$queryRaw<UsageRollupRow[]>(Prisma.sql`
+    SELECT "aggregation_key", "user_id", "session_id", "turn_id", "tool_name", "model", "bucket_start",
+           "event_count", "input_tokens", "output_tokens", "cost_micros"
+    FROM "usage_event"
+    WHERE "bucket_start" >= ${window.from} AND "bucket_start" < ${window.to}
+      ${window.userId ? Prisma.sql`AND "user_id" = ${window.userId}` : Prisma.empty}
+    ORDER BY "bucket_start" ASC, "aggregation_key" ASC
+  `)
+  return aggregateUsage(rows.map((row) => ({
+    userId: row.user_id ?? "anonymous",
+    model: row.model,
+    toolName: row.tool_name,
+    sessionId: row.session_id ?? "system",
+    turnId: row.turn_id,
+    traceId: row.aggregation_key,
+    inputTokens: Number(row.input_tokens),
+    outputTokens: Number(row.output_tokens),
+    costMicros: Number(row.cost_micros),
+    eventCount: Number(row.event_count),
+    occurredAt: row.bucket_start,
+  })))
+}
+
 function asDate(value: Date | string, label: string): Date {
   const date = value instanceof Date ? new Date(value.getTime()) : new Date(value)
   if (Number.isNaN(date.getTime())) throw new Error(`${label} must be a valid date`)
@@ -96,6 +144,8 @@ export function aggregateUsage(records: readonly UsageEventRecord[]): UsageAggre
     const inputTokens = nonNegative(record.inputTokens, "inputTokens")
     const outputTokens = nonNegative(record.outputTokens, "outputTokens")
     const costMicros = nonNegative(record.costMicros, "costMicros")
+    const eventCount = record.eventCount === undefined ? 1 : record.eventCount
+    if (!Number.isSafeInteger(eventCount) || eventCount < 0) throw new Error("eventCount must be a non-negative integer")
     const day = utcDay(record.occurredAt)
     const toolName = record.toolName === null ? null : String(record.toolName)
     if (toolName !== null && (!toolName.trim() || toolName.length > 256 || /[\u0000-\u001f\u007f]/u.test(toolName))) throw new Error("toolName must be a bounded string")
@@ -105,7 +155,7 @@ export function aggregateUsage(records: readonly UsageEventRecord[]): UsageAggre
       totalTokens: 0, costMicros: 0, sessionCount: 0, turnCount: 0, traceCount: 0,
       lineage: [], sessions: new Set<string>(), turns: new Set<string>(), traces: new Set<string>(), lineageByKey: new Map(),
     }
-    bucket.eventCount += 1
+    bucket.eventCount += eventCount
     bucket.inputTokens += inputTokens
     bucket.outputTokens += outputTokens
     bucket.totalTokens += inputTokens + outputTokens
@@ -118,7 +168,7 @@ export function aggregateUsage(records: readonly UsageEventRecord[]): UsageAggre
       sessionId: record.sessionId, turnId: record.turnId, traceId: record.traceId,
       eventCount: 0, inputTokens: 0, outputTokens: 0, costMicros: 0,
     }
-    lineage.eventCount += 1
+    lineage.eventCount += eventCount
     lineage.inputTokens += inputTokens
     lineage.outputTokens += outputTokens
     lineage.costMicros += costMicros

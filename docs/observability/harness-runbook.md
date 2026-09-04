@@ -26,12 +26,13 @@ the dashboard shows a synthetic `60000` ms breach.
 **First query.** In the Agents dashboard, query the window for:
 
 ```sql
-SELECT model, queueName, percentile_cont(0.95)
-  WITHIN GROUP (ORDER BY durationMs) AS p95_ms,
+SELECT "model", percentile_cont(0.95)
+  WITHIN GROUP (ORDER BY "duration_ms") AS p95_ms,
        count(*) AS turns
-FROM harness_turn_metrics
-WHERE occurredAt >= <window.start> AND occurredAt < <window.end>
-GROUP BY model, queueName;
+FROM "harness_metric_events"
+WHERE "event_type" IN ('turn.completed', 'turn.failed')
+  AND "occurred_at" >= <window.start> AND "occurred_at" < <window.end>
+GROUP BY "model";
 ```
 
 If the implementation exposes this through the admin API rather than SQL,
@@ -52,20 +53,24 @@ do not replay an external tool automatically.
 ## 2. Tool error-rate breach
 
 **Trigger.** `tool_error_rate > 1%` in the SLO window, calculated from
-`tool.failed / (tool.completed + tool.failed)` for the same tool/version.
+`tool.failed / tool.invoked` for the same tool/version. A zero-invocation
+window is a passing zero rather than an error.
 
 **First query.** In the Agents dashboard, group `tool.invoked`,
 `tool.completed`, and `tool.failed` by `toolName`, `toolVersion`, and
 `failureCode`:
 
 ```sql
-SELECT toolName, toolVersion, failureCode,
-       sum(invoked) AS invoked,
-       sum(completed) AS completed,
-       sum(failed) AS failed
-FROM harness_tool_metrics
-WHERE occurredAt >= <window.start> AND occurredAt < <window.end>
-GROUP BY toolName, toolVersion, failureCode;
+SELECT payload->>'toolName' AS tool_name,
+       payload->>'toolVersion' AS tool_version,
+       COALESCE(payload->>'failureCode', '') AS failure_code,
+       count(*) FILTER (WHERE "event_type" = 'tool.invoked') AS invoked,
+       count(*) FILTER (WHERE "event_type" = 'tool.completed') AS completed,
+       count(*) FILTER (WHERE "event_type" = 'tool.failed') AS failed
+FROM "harness_metric_events"
+WHERE "event_type" IN ('tool.invoked', 'tool.completed', 'tool.failed')
+  AND "occurred_at" >= <window.start> AND "occurred_at" < <window.end>
+GROUP BY tool_name, tool_version, failure_code;
 ```
 
 **Expected result.** The failing tool/version and a finite code such as
@@ -88,13 +93,15 @@ runbook; never loosen a safety guard to clear the metric.
 `approvalScope` and `toolName`, returning counts and median/maximum age:
 
 ```sql
-SELECT approvalScope, toolName,
-       sum(requested) AS requested,
-       sum(expired) AS expired,
-       max(ageMs) AS max_age_ms
-FROM harness_approval_metrics
-WHERE occurredAt >= <window.start> AND occurredAt < <window.end>
-GROUP BY approvalScope, toolName;
+SELECT payload->>'approvalScope' AS approval_scope,
+       payload->>'toolName' AS tool_name,
+       count(*) FILTER (WHERE "event_type" = 'approval.requested') AS requested,
+       count(*) FILTER (WHERE "event_type" = 'approval.expired') AS expired,
+       max((payload->>'ageMs')::double precision) AS max_age_ms
+FROM "harness_metric_events"
+WHERE "event_type" IN ('approval.requested', 'approval.expired')
+  AND "occurred_at" >= <window.start> AND "occurred_at" < <window.end>
+GROUP BY approval_scope, tool_name;
 ```
 
 **Expected result.** The result distinguishes expired approvals from denied
@@ -117,12 +124,16 @@ incident.
 `flowVersion`, `preflightStatus`, and finite `failureCode`:
 
 ```sql
-SELECT atsType, flowVersion, preflightStatus, failureCode,
-       sum(attempted) AS attempted,
-       sum(failed) AS failed
-FROM harness_submission_metrics
-WHERE occurredAt >= <window.start> AND occurredAt < <window.end>
-GROUP BY atsType, flowVersion, preflightStatus, failureCode;
+SELECT payload->>'atsType' AS ats_type,
+       payload->>'flowVersion' AS flow_version,
+       payload->>'preflightStatus' AS preflight_status,
+       COALESCE(payload->>'failureCode', '') AS failure_code,
+       count(*) FILTER (WHERE "event_type" = 'submission.attempted') AS attempted,
+       count(*) FILTER (WHERE "event_type" = 'submission.failed') AS failed
+FROM "harness_metric_events"
+WHERE "event_type" IN ('submission.attempted', 'submission.failed')
+  AND "occurred_at" >= <window.start> AND "occurred_at" < <window.end>
+GROUP BY ats_type, flow_version, preflight_status, failure_code;
 ```
 
 **Expected result.** The first query identifies a flow/version or ATS cluster
@@ -146,21 +157,25 @@ visibility exceeds its SLO, or the SSE dashboard shows reconnect gaps,
 window:
 
 ```sql
-SELECT queueName, max(depth) AS peak_depth,
-       max(oldestAgeMs) AS oldest_age_ms
-FROM harness_queue_metrics
-WHERE sampledAt >= <window.start> AND sampledAt < <window.end>
-GROUP BY queueName;
+SELECT payload->>'queueName' AS queue_name,
+       max((payload->>'depth')::double precision) AS peak_depth,
+       max((payload->>'oldestAgeMs')::double precision) AS oldest_age_ms
+FROM "harness_metric_events"
+WHERE "event_type" = 'queue.depth'
+  AND "occurred_at" >= <window.start> AND "occurred_at" < <window.end>
+GROUP BY queue_name;
 
-SELECT eventType, count(*) AS count, max(lagMs) AS max_lag_ms
-FROM harness_stream_metrics
-WHERE occurredAt >= <window.start> AND occurredAt < <window.end>
-GROUP BY eventType;
+SELECT "event_type", count(*) AS count, max("occurred_at") AS latest_event_at
+FROM "harness_metric_events"
+WHERE "occurred_at" >= <window.start> AND "occurred_at" < <window.end>
+GROUP BY "event_type";
 ```
 
-Then select one opaque `<trace-id>` from the aggregate result and verify the
-ordered `session → turn → tool/submission` event chain through the admin
-trace query. Never query or display raw event payloads.
+Then select one opaque `<trace-id>` from the aggregate result and call
+`queryHarnessTrace({ traceId: <trace-id> })` (or the equivalent admin trace
+query) to verify the ordered `session → turn → tool/submission` event chain.
+The trace query deliberately selects metadata columns only; never query or
+display raw event payloads.
 
 **Expected result.** The queue result shows whether work is saturated or
 stalled; the stream result shows whether events were written but delayed to
@@ -177,10 +192,10 @@ version, and aggregate timestamps only.
 
 ## Alert and evidence recording
 
-Each SLO rule emits an alert event containing only `ruleKey`, `measuredValue`,
-`threshold`, `windowStart`, `windowEnd`, `severity`, and an opaque trace/query
-reference. Record the alert ID, deployment/version, query window, dashboard
-result, and operator decision in the incident system. A synthetic CI breach
+Each SLO rule emits one persisted alert row containing only `ruleKey`, `metric`,
+`value`, `threshold`, `traceId`, `status`, and created/resolved timestamps. Record
+the alert ID, deployment/version, query window, dashboard result, and operator
+decision in the incident system. A synthetic CI breach
 must use `turn_p95_latency_ms=60000`, assert the alert, and use no database,
 provider, browser, or secret. Passing the drill proves rule wiring only; it
 does not replace staging or production observation.
