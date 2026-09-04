@@ -23,9 +23,13 @@ export function parseContactMessage(value: unknown): ContactMessage | { error: s
   const email = text(input.email).toLowerCase()
   const message = text(input.message)
   if (!name || name.length > 120) return { error: 'Name is required and must be at most 120 characters' }
-  if (!email || email.length > 320 || !EMAIL_PATTERN.test(email)) return { error: 'A valid email is required' }
+  if (!email || email.length > 320 || !isValidContactEmail(email)) return { error: 'A valid email is required' }
   if (!message || message.length > 4000) return { error: 'Message is required and must be at most 4000 characters' }
   return { name, email, message }
+}
+
+export function isValidContactEmail(value: string): boolean {
+  return EMAIL_PATTERN.test(value)
 }
 
 export function contactEmailConfig(env: NodeJS.ProcessEnv = process.env): ContactEmailConfig | { error: string } {

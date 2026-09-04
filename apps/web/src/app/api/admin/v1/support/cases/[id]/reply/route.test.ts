@@ -4,7 +4,7 @@ const mocks = vi.hoisted(() => {
   class AdminMutationConflict extends Error {}
   return {
     requireAdmin: vi.fn(), validate: vi.fn(), findUnique: vi.fn(), findScopedCase: vi.fn(), runMutation: vi.fn(),
-    txFindScopedCase: vi.fn(), claimCase: vi.fn(), createMessage: vi.fn(), updateCase: vi.fn(), createNotification: vi.fn(), AdminMutationConflict,
+    txFindScopedCase: vi.fn(), claimCase: vi.fn(), createMessage: vi.fn(), updateCase: vi.fn(), createNotification: vi.fn(), sendReplyEmail: vi.fn(), AdminMutationConflict,
   }
 })
 const pinnedFetch = vi.hoisted(() => vi.fn())
@@ -14,6 +14,7 @@ vi.mock('@/lib/admin/csrf', () => ({ validateAdminWrite: mocks.validate }))
 vi.mock('@/lib/admin/write-transaction', () => ({ AdminMutationConflict: mocks.AdminMutationConflict, runAdminMutation: mocks.runMutation }))
 vi.mock('@jobcopilot/shared', () => ({ pinnedFetch }))
 vi.mock('@/lib/contact-us', () => ({ parseReply: () => ({ body: 'Reply body', redacted: false }) }))
+vi.mock('@/lib/support-case-email', () => ({ sendSupportCaseReplyEmail: mocks.sendReplyEmail }))
 vi.mock('@/lib/db', () => ({ db: { supportCase: { findUnique: mocks.findUnique, findFirst: mocks.findScopedCase } } }))
 
 describe('POST /api/admin/v1/support/cases/:id/reply', () => {
@@ -23,12 +24,13 @@ describe('POST /api/admin/v1/support/cases/:id/reply', () => {
     mocks.requireAdmin.mockResolvedValue({ userId: 'support-user', roleKey: 'support', permissions: ['support_cases.reply'], requestId: 'request' })
     mocks.validate.mockReturnValue(null)
     mocks.findUnique.mockResolvedValue({ requesterUserId: 'candidate-user' })
-    mocks.findScopedCase.mockResolvedValue({ requesterUserId: 'candidate-user' })
+    mocks.findScopedCase.mockResolvedValue({ requesterUserId: 'candidate-user', requesterEmail: null, subject: 'Existing support case' })
     mocks.txFindScopedCase.mockResolvedValue({ requesterUserId: 'candidate-user' })
     mocks.claimCase.mockResolvedValue({ count: 1 })
     mocks.createMessage.mockResolvedValue({ id: 'message-1' })
     mocks.updateCase.mockResolvedValue({ id: 'case-1' })
     mocks.createNotification.mockResolvedValue({ id: 'notification-1' })
+    mocks.sendReplyEmail.mockResolvedValue(true)
     mocks.runMutation.mockResolvedValue({ duplicate: false, value: { id: 'message-1' } })
   })
 
@@ -60,5 +62,16 @@ describe('POST /api/admin/v1/support/cases/:id/reply', () => {
 
     expect(response.status).toBe(409)
     expect(mocks.createMessage).not.toHaveBeenCalled()
+  })
+
+  it('emails the stored contact when replying to a landing-page case', async () => {
+    mocks.findScopedCase.mockResolvedValueOnce({ requesterUserId: null, requesterEmail: 'visitor@example.com', subject: 'Landing page contact' })
+    const { POST } = await import('./route')
+    const request = new Request('http://localhost/api/admin/v1/support/cases/case-guest/reply', { method: 'POST', headers: { 'content-type': 'application/json', origin: 'http://localhost', host: 'localhost', 'idempotency-key': 'reply-guest-key' }, body: JSON.stringify({ body: 'Reply body', reason: 'Replying after reviewing the public contact request' }) })
+
+    const response = await POST(request as never, { params: Promise.resolve({ id: 'case-guest' }) })
+
+    expect(response.status).toBe(201)
+    expect(mocks.sendReplyEmail).toHaveBeenCalledWith({ recipient: 'visitor@example.com', subject: 'Landing page contact', body: 'Reply body' })
   })
 })

@@ -28,6 +28,7 @@ const AgentPlaygroundPage = dynamic(() => import('@/components/pages/AgentPlaygr
 const AgentHistoryPage = dynamic(() => import('@/components/pages/AgentHistoryPage').then(module => module.AgentHistoryPage), { loading: PageLoading })
 const SettingsPage = dynamic(() => import('@/components/pages/SettingsPage').then(module => module.SettingsPage), { loading: PageLoading })
 const ObservabilityPage = dynamic(() => import('@/components/pages/ObservabilityPage').then(module => module.ObservabilityPage), { loading: PageLoading })
+const ContactUsPage = dynamic(() => import('@/components/pages/ContactUsPage').then(module => module.ContactUsPage), { loading: PageLoading })
 
 const PAGE_PRELOADERS: Record<Page, () => Promise<unknown>> = {
   dashboard: () => import('@/components/pages/DashboardPage'),
@@ -40,6 +41,7 @@ const PAGE_PRELOADERS: Record<Page, () => Promise<unknown>> = {
   'agent-history': () => import('@/components/pages/AgentHistoryPage'),
   settings: () => import('@/components/pages/SettingsPage'),
   observability: () => import('@/components/pages/ObservabilityPage'),
+  'contact-us': () => import('@/components/pages/ContactUsPage'),
 }
 
 interface NotificationItem {
@@ -49,11 +51,12 @@ interface NotificationItem {
   body: string | null
   read: boolean
   jobId: string | null
+  broadcastId: string | null
   createdAt: string
 }
 
 type MobileNavItem = { id: Page | 'more'; label: string }
-type MobileMoreItem = { id: Extract<Page, 'gmail' | 'settings'> | 'signout'; label: string }
+type MobileMoreItem = { id: Extract<Page, 'gmail' | 'settings' | 'contact-us'> | 'signout'; label: string }
 
 export function getMobileNavItems(t: (key: string) => string = key => ({ 'nav.jobs': 'Jobs', 'nav.search': 'Search', 'nav.dashboard': 'Home', 'nav.agent': 'Agent', 'common.more': 'More' }[key] ?? key)): MobileNavItem[] {
   return [
@@ -65,10 +68,11 @@ export function getMobileNavItems(t: (key: string) => string = key => ({ 'nav.jo
   ]
 }
 
-export function getMobileMoreItems(signOutLabel = 'Sign out', t: (key: string) => string = key => ({ 'nav.gmail': 'Gmail', 'nav.settings': 'Settings' }[key] ?? key)): MobileMoreItem[] {
+export function getMobileMoreItems(signOutLabel = 'Sign out', t: (key: string) => string = key => ({ 'nav.gmail': 'Gmail', 'nav.settings': 'Settings', 'nav.contactUs': 'Contact us' }[key] ?? key)): MobileMoreItem[] {
   return [
     { id: 'gmail',    label: t('nav.gmail') },
     { id: 'settings', label: t('nav.settings') },
+    { id: 'contact-us', label: t('nav.contactUs') },
     { id: 'signout',  label: signOutLabel },
   ]
 }
@@ -81,6 +85,7 @@ const MOB_ICONS: Record<string, React.ReactNode> = {
   agent:     <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="12" r="3"/><path d="M12 1v4M12 19v4M4.22 4.22l2.83 2.83M16.95 16.95l2.83 2.83M1 12h4M19 12h4M4.22 19.78l2.83-2.83M16.95 7.05l2.83-2.83"/></svg>,
   more:      <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><circle cx="5" cy="12" r="1"/><circle cx="12" cy="12" r="1"/><circle cx="19" cy="12" r="1"/></svg>,
   settings:  <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>,
+  'contact-us': <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M21 11.5a8.38 8.38 0 0 1-9 8.5 8.5 8.5 0 0 1-4.1-1.05L3 20l1.2-4.5A8.5 8.5 0 1 1 21 11.5Z"/><path d="M8 12h.01M12 12h.01M16 12h.01"/></svg>,
 }
 
 const PAGES: Record<Page, React.ComponentType> = {
@@ -94,11 +99,13 @@ const PAGES: Record<Page, React.ComponentType> = {
   'agent-history': AgentHistoryPage,
   settings:  SettingsPage,
   observability: ObservabilityPage,
+  'contact-us': ContactUsPage,
 }
 
 export function getNotificationTargetPage(type: string): Page | null {
   if (type === 'gmail_recommendations') return 'gmail-recommendations'
   if (type.startsWith('gmail_')) return 'gmail'
+  if (type === 'contact_us_reply') return 'contact-us'
   return type.startsWith('apply_') ? 'jobs' : null
 }
 
@@ -137,7 +144,7 @@ function NotificationPanel({ notifications, unreadCount, onMarkRead, onOpenNotif
               <span aria-hidden="true" style={{ width: 7, height: 7, borderRadius: '50%', background: n.read ? 'var(--text-muted)' : 'var(--c-success)', marginTop: 5, flexShrink: 0 }} />
               <span style={{ minWidth: 0, flex: 1 }}>
                 <span style={{ display: 'block', fontSize: 12, fontWeight: 600, color: 'var(--text)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{n.title}</span>
-                {n.body && <span style={{ display: 'block', fontSize: 11, color: 'var(--text-muted)', marginTop: 2, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{n.body}</span>}
+                {n.body && <span style={{ display: '-webkit-box', fontSize: 11, color: 'var(--text-muted)', marginTop: 2, overflow: 'hidden', lineHeight: 1.35, whiteSpace: 'normal', WebkitBoxOrient: 'vertical', WebkitLineClamp: 3 }}>{n.body}</span>}
               </span>
             </button>
           ))}
@@ -352,9 +359,13 @@ export function AppShell() {
 
   async function openNotification(n: NotificationItem) {
     await markNotificationRead(n.id)
-    setSidebarPopover(null)
     const target = getNotificationTargetPage(n.type)
-    if (target) navigatePage(target)
+    if (target) {
+      setSidebarPopover(null)
+      navigatePage(target)
+    } else if (!n.type.startsWith('platform_broadcast')) {
+      setSidebarPopover(null)
+    }
   }
 
   useEffect(() => {
@@ -467,7 +478,7 @@ export function AppShell() {
               {getMobileNavItems(t).map(item => {
                 const isMore = item.id === 'more'
                 const isActive = isMore
-                  ? mobileMoreOpen || page === 'gmail' || page === 'settings'
+                  ? mobileMoreOpen || page === 'gmail' || page === 'settings' || page === 'contact-us'
                   : page === item.id
                 return (
                   <button key={item.id}

@@ -1252,7 +1252,9 @@ model AdminIdempotencyKey {
 
 model SupportCase {
   id               String                  @id @default(cuid())
-  requesterUserId  String                  @map("requester_user_id")
+  requesterUserId  String?                 @map("requester_user_id")
+  requesterName    String?                 @map("requester_name")
+  requesterEmail   String?                 @map("requester_email")
   subject          String
   category         String
   status           SupportCaseStatus       @default(open)
@@ -1265,12 +1267,13 @@ model SupportCase {
   version          Int                     @default(1)
   createdAt        DateTime                @default(now())
   updatedAt        DateTime                @updatedAt
-  requester        User                    @relation("SupportRequester", fields: [requesterUserId], references: [id], onDelete: Cascade)
+  requester        User?                   @relation("SupportRequester", fields: [requesterUserId], references: [id], onDelete: Cascade)
   messages         SupportCaseMessage[]
   escalations      SupportCaseEscalation[]
 
   @@index([status, priority, slaDueAt])
   @@index([requesterUserId, updatedAt(sort: Desc)])
+  @@index([requesterEmail, updatedAt(sort: Desc)])
   @@map("support_cases")
 }
 
