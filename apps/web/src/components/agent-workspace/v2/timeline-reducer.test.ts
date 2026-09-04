@@ -27,6 +27,29 @@ describe('timeline reducer', () => {
     expect(state.itemsById['item-1'].source).toBe('transient')
   })
 
+  it('maintains canonical event indexes and clears transient state on authoritative completion', () => {
+    let state = timelineReducer(createTimelineState('session-1'), {
+      type: 'delta', delta: event({ id: 'delta-1', sequence: '1', payload: { text: 'working', toolCallId: 'tool-1' } }),
+    })
+
+    expect(state.events).toHaveLength(1)
+    expect(state.byId.get('delta-1')).toMatchObject({ id: 'delta-1' })
+    expect(state.byTurnId.get('turn-1')?.map(item => item.id)).toEqual(['delta-1'])
+    expect(state.byToolCallId.get('tool-1')?.map(item => item.id)).toEqual(['delta-1'])
+    expect(state.lastEventId).toBe('delta-1')
+    expect(state.transientItems.has('item-1')).toBe(true)
+
+    state = timelineReducer(state, {
+      type: 'event', event: event({
+        id: 'completed-1', type: 'item.completed', kind: undefined, sequence: '2',
+        payload: baseItem('item-1', { status: 'completed', revision: 2, content: { text: 'done' }, source: 'durable' }),
+      }),
+    })
+
+    expect(state.events.map(item => item.id)).toEqual(['delta-1', 'completed-1'])
+    expect(state.transientItems.has('item-1')).toBe(false)
+  })
+
   it('applies a durable item.delta event delivered through the event path', () => {
     let state = timelineReducer(createTimelineState('session-1'), { type: 'replay', items: [baseItem('item-1')] })
     state = timelineReducer(state, { type: 'event', event: event({ kind: undefined, revision: undefined, payload: { itemId: 'item-1', status: 'streaming', content: { text: 'durable delta' } } }) })
@@ -55,18 +78,29 @@ describe('timeline reducer', () => {
     expect(state.connection).toBe('reconnecting')
     expect(state.itemsById['future-item']).toMatchObject({ type: 'unknown', status: 'started', source: 'unknown' })
     expect(state.itemsById['future-item'].content).toMatchObject({ eventType: 'future.item.v3', opaque: true })
+    expect(state.fallbackItems.map(item => item.id)).toEqual(['future-1'])
   })
 
-  it('produces the same state for replay and live delivery of the same events', () => {
+  it('produces the same state for replay and live delivery across deterministic event logs', () => {
     const items = [baseItem('item-1')]
-    const events = [
-      event({ id: 'delta-1', revision: 1, payload: { text: 'hello' } }),
-      event({ id: 'completed-1', type: 'item.completed', kind: undefined, sequence: '4', payload: baseItem('item-1', { status: 'completed', revision: 1, content: { text: 'hello' }, source: 'durable' }) }),
+    const logs: TimelineEvent[][] = [
+      [],
+      [event({ id: 'started-1', type: 'item.started', kind: undefined, sequence: '1', payload: { item: baseItem('item-1', { status: 'started' }) } })],
+      [
+        event({ id: 'delta-1', revision: 1, sequence: '3', payload: { text: 'hello' } }),
+        event({ id: 'completed-1', type: 'item.completed', kind: undefined, sequence: '4', payload: baseItem('item-1', { status: 'completed', revision: 1, content: { text: 'hello' }, source: 'durable' }) }),
+      ],
+      [event({ id: 'unknown-1', type: 'future.item.v3', itemId: null, sequence: '5', kind: undefined, payload: { value: 1 } })],
     ]
-    let replay = timelineReducer(createTimelineState('session-1'), { type: 'hydrate', items, tail: events })
-    let live = timelineReducer(createTimelineState('session-1'), { type: 'replay', items })
-    for (const current of events) live = timelineReducer(live, { type: current.kind ? 'delta' : 'event', [current.kind ? 'delta' : 'event']: current } as never)
-    expect(live).toEqual(replay)
+
+    for (const events of logs) {
+      const replay = timelineReducer(createTimelineState('session-1'), { type: 'hydrate', items, tail: events })
+      let live = timelineReducer(createTimelineState('session-1'), { type: 'replay', items })
+      for (const current of events) {
+        live = timelineReducer(live, current.kind ? { type: 'delta', delta: current } : { type: 'event', event: current })
+      }
+      expect(live).toEqual(replay)
+    }
   })
 
   it('replaces a snapshot and requests recovery when a delta has a revision gap', () => {
