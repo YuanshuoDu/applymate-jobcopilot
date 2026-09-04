@@ -23,7 +23,12 @@ export const ApprovalStatusSchema = Type.Union([
   Type.Literal('consumed'),
 ])
 
-export const ApprovalHashSchema = Type.String({ pattern: '^[a-f0-9]{64}$' })
+export const ApprovalHashSchema = Type.String({ pattern: '^(?:[a-f0-9]{64}|sha256:[a-f0-9]{64})$' })
+
+/** Approval hashes accept the legacy bare digest and the artifact digest form. */
+export function isApprovalHash(value: unknown): value is string {
+  return typeof value === 'string' && /^(?:[a-f0-9]{64}|sha256:[a-f0-9]{64})$/.test(value)
+}
 
 export const ApprovalScopeSchema = Type.Object({
   userId: IdSchema,

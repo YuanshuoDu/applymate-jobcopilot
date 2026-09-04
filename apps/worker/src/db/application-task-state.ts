@@ -2,6 +2,7 @@ import type { Pool } from "pg";
 import type { FormReviewNeeds } from "../harness/form-review.js";
 import { hashAgentReceiptValue, redactSensitiveText } from "@jobcopilot/shared";
 import { createPgApprovalStore } from "../runtime/approval/pg-store.js";
+import { ensureSubmissionArtifact } from "./submission-artifact.js";
 
 type TerminalStatus = "submitted" | "failed" | "waiting_for_user" | "waiting_for_authorization";
 
@@ -123,15 +124,24 @@ export async function completeFillForReview(
   );
   const turnRow = turn.rows[0];
   if (!turnRow) throw new Error("Filled application is missing its Agent turn");
+  const answersHash = await hashAgentReceiptValue("answers", transitioned.rows[0]?.confirmedAnswers ?? null);
+  const artifact = await ensureSubmissionArtifact(pool, {
+    applicationTaskId: taskId,
+    userId,
+    jobId,
+    resumeId: transitioned.rows[0]?.resumeId ?? null,
+    coverLetterId: transitioned.rows[0]?.coverLetterId ?? null,
+    answersHash,
+  });
   const receipt = await createPgApprovalStore(pool, { userId }).issue({
     approvalId,
     taskId,
     scope: {
       userId, sessionId, turnId: turnRow.id, jobId, toolCallId: `application-submit:${taskId}`,
       action: "submit_application",
-      resourceHash: await hashAgentReceiptValue("resource", { jobId }),
+      resourceHash: artifact.hash,
       materialHash: await hashAgentReceiptValue("material", payload),
-      answersHash: await hashAgentReceiptValue("answers", transitioned.rows[0]?.confirmedAnswers ?? null),
+      answersHash,
       revision: turnRow.revision,
       expiresAt: new Date(Date.now() + 15 * 60 * 1000),
     },

@@ -1,11 +1,13 @@
 import type { Pool } from "pg";
-import { describe, expect, it, vi } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const approvalIssue = vi.hoisted(() => vi.fn());
+const ensureSubmissionArtifact = vi.hoisted(() => vi.fn());
 
 vi.mock("../runtime/approval/pg-store.js", () => ({
   createPgApprovalStore: () => ({ issue: approvalIssue }),
 }));
+vi.mock("./submission-artifact.js", () => ({ ensureSubmissionArtifact }));
 
 import {
   CAPTCHA_USER_TAKEOVER_MESSAGE,
@@ -22,6 +24,16 @@ function testPool() {
 }
 
 describe("completeFillForReview", () => {
+  beforeEach(() => {
+    approvalIssue.mockReset();
+    ensureSubmissionArtifact.mockReset();
+    ensureSubmissionArtifact.mockResolvedValue({ hash: "sha256:" + "a".repeat(64) });
+    approvalIssue.mockResolvedValue({
+      approval: { id: "approval_1", scopeHash: "scope-hash" },
+      nonce: "nonce-never-persisted",
+    });
+  });
+
   it("does not create an authorization when the task was cancelled before the fill pass finished", async () => {
     const { pool, query } = testPool();
     query.mockResolvedValueOnce({ rowCount: 0, rows: [] });
@@ -38,11 +50,6 @@ describe("completeFillForReview", () => {
       .mockResolvedValueOnce({ rowCount: 1, rows: [{ sessionId: "session_1", resumeId: "resume_1", coverLetterId: null, confirmedAnswers: null }] })
       .mockResolvedValueOnce({ rowCount: 1, rows: [{ id: "turn_1", revision: 3 }] })
       .mockResolvedValue({ rowCount: 1, rows: [] });
-    approvalIssue.mockResolvedValue({
-      approval: { id: "approval_1", scopeHash: "scope-hash" },
-      nonce: "nonce-never-persisted",
-    });
-
     await expect(completeFillForReview(pool, "task_1", "user_1", "job_1")).resolves.toBe(true);
 
     expect(query).toHaveBeenCalledTimes(5);
@@ -58,8 +65,17 @@ describe("completeFillForReview", () => {
         jobId: "job_1",
         action: "submit_application",
         revision: 3,
+        resourceHash: "sha256:" + "a".repeat(64),
       }),
     }));
+    expect(ensureSubmissionArtifact).toHaveBeenCalledWith(expect.anything(), {
+      applicationTaskId: "task_1",
+      userId: "user_1",
+      jobId: "job_1",
+      resumeId: "resume_1",
+      coverLetterId: null,
+      answersHash: expect.stringMatching(/^[a-f0-9]{64}$/),
+    });
   });
 });
 

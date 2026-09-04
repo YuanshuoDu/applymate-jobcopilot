@@ -26,6 +26,8 @@ export interface EnqueueApplyInput {
   /** The worker generates an ephemeral PDF from the selected resume. */
   resumePath?: string;
   dryRun?: boolean;
+  receiptId?: string;
+  constraintHash?: string;
 }
 
 export async function enqueueApplyTask(input: EnqueueApplyInput): Promise<string> {

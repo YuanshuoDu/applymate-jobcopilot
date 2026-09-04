@@ -17,7 +17,6 @@ const mocks = vi.hoisted(() => ({
   hasEffectiveEntitlement: vi.fn(),
   isFeatureAllowed: vi.fn(),
   resolveAiAccess: vi.fn(),
-  consumeLegacyReceipt: vi.fn(),
 }));
 
 vi.mock("@/lib/db", () => ({
@@ -37,7 +36,6 @@ vi.mock("@/lib/db", () => ({
 vi.mock("@/lib/apply-queue-client", () => ({ enqueueApplyTask: mocks.enqueueApplyTask }));
 vi.mock("@/lib/runtime-feature-flags", () => ({ isRuntimeFeatureEnabled: mocks.runtimeFeatureEnabled }));
 vi.mock("@/lib/entitlements", () => ({ hasEffectiveEntitlement: mocks.hasEffectiveEntitlement, isFeatureAllowed: mocks.isFeatureAllowed, resolveAiAccess: mocks.resolveAiAccess }));
-vi.mock("@/lib/agent/approval/legacy-receipt", () => ({ consumeLegacyReceipt: mocks.consumeLegacyReceipt }));
 
 describe("auto-apply authorization", () => {
   const input = {
@@ -52,7 +50,7 @@ describe("auto-apply authorization", () => {
     mocks.approvalFindFirst.mockResolvedValue({
       payload: { applicationTaskId: "application_1", jobId: "job_1", resumeId: "resume_1", coverLetterId: null },
       sessionId: "session_1", turnId: "turn_1", toolCallId: "call_1", jobId: "job_1", revision: 0,
-      expiresAt: new Date(Date.now() + 60_000),
+      expiresAt: new Date(Date.now() + 60_000), scopeHash: "s".repeat(64),
     });
     mocks.taskFindFirst.mockResolvedValue({ sessionId: "session_1", resumeId: "resume_1", coverLetterId: null, confirmedAnswers: null });
     mocks.resumeFindFirst.mockResolvedValue({ id: "resume_1" });
@@ -80,7 +78,6 @@ describe("auto-apply authorization", () => {
     mocks.taskEventCreate.mockResolvedValue({});
     mocks.isFeatureAllowed.mockResolvedValue(true);
     mocks.resolveAiAccess.mockResolvedValue('allowed');
-    mocks.consumeLegacyReceipt.mockResolvedValue({ approvalId: "approval_1", reservationId: "reservation_1", consumedAt: new Date() });
   });
 
   it("queues only after matching explicit per-job authorization", async () => {
@@ -88,6 +85,7 @@ describe("auto-apply authorization", () => {
     await expect(queueAutonomousApplication(input)).resolves.toEqual({ taskId: "worker_1" });
     expect(mocks.enqueueApplyTask).toHaveBeenCalledWith({
       applicationTaskId: "application_1", jobId: "job_1", userId: "user_1", applyUrl: input.applyUrl, operation: "submit",
+      receiptId: "approval_1", constraintHash: "s".repeat(64),
     });
     expect(mocks.transaction).toHaveBeenCalled();
   });
@@ -141,11 +139,23 @@ describe("auto-apply authorization", () => {
     expect(mocks.enqueueApplyTask).not.toHaveBeenCalled();
   });
 
+  it("rejects a legacy approval that has no canonical scope hash", async () => {
+    mocks.approvalFindFirst.mockResolvedValueOnce({
+      payload: { applicationTaskId: "application_1", jobId: "job_1", resumeId: "resume_1", coverLetterId: null },
+      sessionId: "session_1", turnId: "turn_1", toolCallId: "call_1", jobId: "job_1", revision: 0,
+      expiresAt: new Date(Date.now() + 60_000), scopeHash: null,
+    });
+    const { queueAutonomousApplication } = await import("./auto-apply");
+
+    await expect(queueAutonomousApplication(input)).rejects.toThrow("explicit approval");
+    expect(mocks.enqueueApplyTask).not.toHaveBeenCalled();
+  });
+
   it("rejects a stale task whose resume does not belong to this job or the current default", async () => {
     mocks.approvalFindFirst.mockResolvedValueOnce({
       payload: { applicationTaskId: "application_1", jobId: "job_1", resumeId: null, coverLetterId: null },
       sessionId: "session_1", turnId: "turn_1", toolCallId: "call_1", jobId: "job_1", revision: 0,
-      expiresAt: new Date(Date.now() + 60_000),
+      expiresAt: new Date(Date.now() + 60_000), scopeHash: "s".repeat(64),
     });
     mocks.taskFindFirst.mockResolvedValueOnce(null).mockResolvedValueOnce(null);
     mocks.resumeFindFirst.mockResolvedValueOnce(null);
@@ -163,7 +173,7 @@ describe("auto-apply authorization", () => {
     mocks.approvalFindFirst.mockResolvedValueOnce({
       payload: { applicationTaskId: "application_1", jobId: "job_1", resumeId: "resume_1", coverLetterId: "cover_other" },
       sessionId: "session_1", turnId: "turn_1", toolCallId: "call_1", jobId: "job_1", revision: 0,
-      expiresAt: new Date(Date.now() + 60_000),
+      expiresAt: new Date(Date.now() + 60_000), scopeHash: "s".repeat(64),
     });
     mocks.coverLetterFindFirst.mockResolvedValueOnce(null);
     const { queueAutonomousApplication } = await import("./auto-apply");

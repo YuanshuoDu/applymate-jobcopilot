@@ -8,6 +8,10 @@ const mockCompleteFillForReview = vi.fn().mockResolvedValue(undefined);
 const mockHarnessRun = vi.fn();
 const mockWithCloakContext = vi.fn();
 const mockIsUserActive = vi.fn().mockResolvedValue(true);
+const submitToolMocks = vi.hoisted(() => ({
+  create: vi.fn(),
+  execute: vi.fn(),
+}));
 
 vi.mock("ioredis", () => ({
   Redis: vi.fn().mockImplementation(() => ({
@@ -28,6 +32,7 @@ vi.mock("bullmq", () => {
   });
   const mockQueueCtor = vi.fn().mockReturnValue({
     add: vi.fn().mockResolvedValue({ id: "test-job-1" }),
+    isPaused: vi.fn().mockResolvedValue(false),
   });
   return {
     Worker: mockWorkerCtor,
@@ -107,11 +112,16 @@ vi.mock("../harness/agent-harness.js", () => ({
     run: mockHarnessRun,
   })),
 }));
+vi.mock("../runtime/tools/application-submit-tool.js", () => ({
+  createPgApplicationSubmitTool: submitToolMocks.create,
+}));
 
 describe("apply-queue (unit — mocked)", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     mockIsUserActive.mockResolvedValue(true);
+    submitToolMocks.create.mockReset();
+    submitToolMocks.execute.mockReset();
     mockHarnessRun.mockImplementation(async (_page: unknown, task: { allowSubmit?: boolean }) => task.allowSubmit === false
       ? { status: "manual", error: "Form filled and ready for user review.", durationMs: 123, reviewReady: true }
       : { status: "submitted", error: null, durationMs: 123, fieldMappings: { "#name": "fullName" } });
@@ -165,6 +175,31 @@ describe("apply-queue (unit — mocked)", () => {
       status: "submitted",
       flowUsed: "llm",
     }));
+  });
+
+  it("routes a receipt-backed submit through application.submit before the browser flow", async () => {
+    submitToolMocks.execute.mockResolvedValue({
+      status: "submitted", confirmationId: "application:application-task-1", postSubmitUrl: "https://example.com/confirmation", errorCode: null, output: null,
+    });
+    submitToolMocks.create.mockImplementation(({ submit }: { submit: (input: unknown) => Promise<unknown> }) => ({
+      execute: async () => {
+        await submit({ target: {}, artifact: {}, context: {}, beforeSubmit: async () => true });
+        return submitToolMocks.execute();
+      },
+    }));
+
+    await import("./apply-queue.js");
+    await mockProcessor({
+      data: {
+        applicationTaskId: "application-task-1", operation: "submit", jobId: "job-1", userId: "user-1",
+        applyUrl: "https://example.com/jobs/123/apply", personaId: "persona-1", resumePath: "/resume.pdf", dryRun: false,
+        receiptId: "approval-1", constraintHash: "c".repeat(64),
+      },
+    });
+
+    expect(submitToolMocks.create).toHaveBeenCalledWith(expect.objectContaining({ pool: expect.anything(), submit: expect.any(Function) }));
+    expect(mockHarnessRun).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({ allowSubmit: true }));
+    expect(mockInsertApplyResult).toHaveBeenCalledWith(expect.objectContaining({ status: "submitted", flowUsed: "application.submit" }));
   });
 
   it("fills without submission, then creates the durable final-review checkpoint", async () => {
