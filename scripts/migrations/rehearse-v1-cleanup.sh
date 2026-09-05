@@ -169,25 +169,27 @@ SELECT 'v2_read_shape' AS check_name,
         ) AS event_shape) = 0 AS passed;
 SQL
 
-inventory="$(run_psql -At -F '|' -c '
-SELECT ''agent_runs'', COUNT(*)::text, COALESCE(MAX("updatedAt")::text, ''never'') FROM "agent_runs"
-UNION ALL SELECT ''AgentRunQuestion'', COUNT(*)::text, COALESCE(MAX(COALESCE("answeredAt", "createdAt"))::text, ''never'') FROM "AgentRunQuestion"
-UNION ALL SELECT ''agent_executions'', COUNT(*)::text, COALESCE(MAX("updatedAt")::text, ''never'') FROM "agent_executions"
-UNION ALL SELECT ''agent_transcript_events'', COUNT(*)::text, COALESCE(MAX("createdAt")::text, ''never'') FROM "agent_transcript_events"
-UNION ALL SELECT ''application_tasks'', COUNT(*)::text, COALESCE(MAX("updatedAt")::text, ''never'') FROM "application_tasks"
-UNION ALL SELECT ''application_task_events'', COUNT(*)::text, COALESCE(MAX("createdAt")::text, ''never'') FROM "application_task_events"
-UNION ALL SELECT ''form_patterns'', COUNT(*)::text, COALESCE(MAX("updated_at")::text, ''never'') FROM "form_patterns"
-UNION ALL SELECT ''agent_sessions'', COUNT(*)::text, COALESCE(MAX("updatedAt")::text, ''never'') FROM "agent_sessions"
-UNION ALL SELECT ''agent_turns'', COUNT(*)::text, COALESCE(MAX("updatedAt")::text, ''never'') FROM "agent_turns"
-UNION ALL SELECT ''agent_steps'', COUNT(*)::text, COALESCE(MAX("createdAt")::text, ''never'') FROM "agent_steps"
-UNION ALL SELECT ''agent_inputs'', COUNT(*)::text, COALESCE(MAX("createdAt")::text, ''never'') FROM "agent_inputs"
-UNION ALL SELECT ''agent_items'', COUNT(*)::text, COALESCE(MAX("updatedAt")::text, ''never'') FROM "agent_items"
-UNION ALL SELECT ''agent_outbox'', COUNT(*)::text, COALESCE(MAX("createdAt")::text, ''never'') FROM "agent_outbox"
-UNION ALL SELECT ''sub_agent_tasks'', COUNT(*)::text, COALESCE(MAX("updatedAt")::text, ''never'') FROM "sub_agent_tasks"
-UNION ALL SELECT ''agent_mailbox_messages'', COUNT(*)::text, COALESCE(MAX("createdAt")::text, ''never'') FROM "agent_mailbox_messages"
-UNION ALL SELECT ''agent_approvals'', COUNT(*)::text, COALESCE(MAX("createdAt")::text, ''never'') FROM "agent_approvals"
-UNION ALL SELECT ''agent_action_reservations'', COUNT(*)::text, COALESCE(MAX("updatedAt")::text, ''never'') FROM "agent_action_reservations"
-ORDER BY 1')"
+inventory="$(run_psql -At -F '|' <<'SQL'
+SELECT 'agent_runs', COUNT(*)::text, COALESCE(MAX("updatedAt")::text, 'never') FROM "agent_runs"
+UNION ALL SELECT 'AgentRunQuestion', COUNT(*)::text, COALESCE(MAX(COALESCE("answeredAt", "createdAt"))::text, 'never') FROM "AgentRunQuestion"
+UNION ALL SELECT 'agent_executions', COUNT(*)::text, COALESCE(MAX("updatedAt")::text, 'never') FROM "agent_executions"
+UNION ALL SELECT 'agent_transcript_events', COUNT(*)::text, COALESCE(MAX("createdAt")::text, 'never') FROM "agent_transcript_events"
+UNION ALL SELECT 'application_tasks', COUNT(*)::text, COALESCE(MAX("updatedAt")::text, 'never') FROM "application_tasks"
+UNION ALL SELECT 'application_task_events', COUNT(*)::text, COALESCE(MAX("createdAt")::text, 'never') FROM "application_task_events"
+UNION ALL SELECT 'form_patterns', COUNT(*)::text, COALESCE(MAX("updated_at")::text, 'never') FROM "form_patterns"
+UNION ALL SELECT 'agent_sessions', COUNT(*)::text, COALESCE(MAX("updatedAt")::text, 'never') FROM "agent_sessions"
+UNION ALL SELECT 'agent_turns', COUNT(*)::text, COALESCE(MAX("updatedAt")::text, 'never') FROM "agent_turns"
+UNION ALL SELECT 'agent_steps', COUNT(*)::text, COALESCE(MAX("createdAt")::text, 'never') FROM "agent_steps"
+UNION ALL SELECT 'agent_inputs', COUNT(*)::text, COALESCE(MAX("createdAt")::text, 'never') FROM "agent_inputs"
+UNION ALL SELECT 'agent_items', COUNT(*)::text, COALESCE(MAX("updatedAt")::text, 'never') FROM "agent_items"
+UNION ALL SELECT 'agent_outbox', COUNT(*)::text, COALESCE(MAX("createdAt")::text, 'never') FROM "agent_outbox"
+UNION ALL SELECT 'sub_agent_tasks', COUNT(*)::text, COALESCE(MAX("updatedAt")::text, 'never') FROM "sub_agent_tasks"
+UNION ALL SELECT 'agent_mailbox_messages', COUNT(*)::text, COALESCE(MAX("createdAt")::text, 'never') FROM "agent_mailbox_messages"
+UNION ALL SELECT 'agent_approvals', COUNT(*)::text, COALESCE(MAX("createdAt")::text, 'never') FROM "agent_approvals"
+UNION ALL SELECT 'agent_action_reservations', COUNT(*)::text, COALESCE(MAX("updatedAt")::text, 'never') FROM "agent_action_reservations"
+ORDER BY 1;
+SQL
+)"
 
 run_psql <<'SQL'
 BEGIN;
