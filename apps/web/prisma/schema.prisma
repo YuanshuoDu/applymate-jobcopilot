@@ -1502,6 +1502,55 @@ model HarnessSloAlert {
   @@map("harness_slo_alerts")
 }
 
+// Current server-side rollout decision. One row per environment keeps the
+// session-start decision atomic and makes a rollback immediately observable.
+model RolloutStage {
+  id                    String   @id @default(cuid())
+  environment           String   @unique
+  stageKey              String   @map("stage_key")
+  rolloutPercent        Int      @default(0) @map("rollout_percent")
+  enabled               Boolean  @default(true)
+  internalUserIds       String[] @default([]) @map("internal_user_ids")
+  observationStartedAt  DateTime? @map("observation_started_at")
+  observationEndsAt     DateTime? @map("observation_ends_at")
+  version               Int      @default(1)
+  status                String   @default("active")
+  rollbackReason        String?  @map("rollback_reason")
+  lastTransitionAt      DateTime @default(now()) @map("last_transition_at")
+  createdById           String   @default("system") @map("created_by_id")
+  updatedById           String   @default("system") @map("updated_by_id")
+  createdAt             DateTime @default(now()) @map("created_at")
+  updatedAt             DateTime @updatedAt @map("updated_at")
+
+  @@index([environment, status])
+  @@index([stageKey, updatedAt])
+  @@map("rollout_stage")
+}
+
+// Metrics-only V1/V2 comparison facts. Raw model output, candidate content,
+// prompts, and external responses are intentionally not representable here.
+model RolloutDiff {
+  id               String   @id @default(cuid())
+  comparisonId     String   @map("comparison_id")
+  environment      String
+  stageKey         String   @map("stage_key")
+  sessionId        String   @map("session_id")
+  traceId          String?  @map("trace_id")
+  metricKey        String   @map("metric_key")
+  legacyValue      Float    @map("legacy_value")
+  v2Value          Float    @map("v2_value")
+  delta            Float
+  withinThreshold  Boolean  @map("within_threshold")
+  occurredAt       DateTime @default(now()) @map("occurred_at")
+  createdAt        DateTime @default(now()) @map("created_at")
+
+  @@unique([comparisonId, metricKey])
+  @@index([environment, stageKey, createdAt])
+  @@index([sessionId, createdAt])
+  @@index([metricKey, createdAt])
+  @@map("rollout_diff")
+}
+
 model JobApiUsageEvent {
   id                 String    @id @default(cuid())
   userId             String?   @map("user_id")
