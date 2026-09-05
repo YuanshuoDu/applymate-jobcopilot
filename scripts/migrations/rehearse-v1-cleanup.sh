@@ -231,10 +231,10 @@ cat > "$REPORT_FILE" <<EOF
 
 ## Metadata-only inventory
 
-```text
+\`\`\`text
 object|row_count|last_write
 ${inventory}
-```
+\`\`\`
 
 ## Limitations
 
