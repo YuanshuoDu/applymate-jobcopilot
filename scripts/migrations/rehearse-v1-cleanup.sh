@@ -198,11 +198,12 @@ DECLARE
   session_id TEXT := 'rehearsal-session-' || substr(md5(clock_timestamp()::text), 1, 20);
   turn_id TEXT := 'rehearsal-turn-' || substr(md5(clock_timestamp()::text || 'turn'), 1, 20);
   event_id TEXT := 'rehearsal-event-' || substr(md5(clock_timestamp()::text || 'event'), 1, 20);
+  now_at TIMESTAMP := clock_timestamp();
 BEGIN
-  INSERT INTO "agent_sessions" ("id", "userId", "goal", "status", "source")
-  VALUES (session_id, 'rehearsal-user', 'disposable rehearsal', 'queued', 'system');
-  INSERT INTO "agent_turns" ("id", "sessionId", "userId", "status", "source", "input", "modelProfileSnapshot", "toolPolicySnapshot", "budgetSnapshot")
-  VALUES (turn_id, session_id, 'rehearsal-user', 'queued', 'system', '{"rehearsal":true}'::jsonb, '{}'::jsonb, '{}'::jsonb, '{}'::jsonb);
+  INSERT INTO "agent_sessions" ("id", "userId", "goal", "status", "source", "createdAt", "updatedAt")
+  VALUES (session_id, 'rehearsal-user', 'disposable rehearsal', 'queued', 'system', now_at, now_at);
+  INSERT INTO "agent_turns" ("id", "sessionId", "userId", "status", "source", "input", "modelProfileSnapshot", "toolPolicySnapshot", "budgetSnapshot", "createdAt", "updatedAt")
+  VALUES (turn_id, session_id, 'rehearsal-user', 'queued', 'system', '{"rehearsal":true}'::jsonb, '{}'::jsonb, '{}'::jsonb, '{}'::jsonb, now_at, now_at);
   INSERT INTO "agent_events" ("id", "sessionId", "turnId", "sequence", "type", "actor", "correlationId", "payload")
   VALUES (event_id, session_id, turn_id, 1, 'rehearsal', 'system', event_id, '{"rehearsal":true}'::jsonb);
 END $$;
