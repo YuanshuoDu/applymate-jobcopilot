@@ -133,8 +133,8 @@ else
 fi
 
 run_psql <<'SQL'
-INSERT INTO "User" ("id", "email", "onboardingGoals")
-VALUES ('rehearsal-user', 'rehearsal.invalid', '{}')
+INSERT INTO "User" ("id", "email", "createdAt", "updatedAt", "onboardingGoals")
+VALUES ('rehearsal-user', 'rehearsal.invalid', NOW(), NOW(), '{}')
 ON CONFLICT ("id") DO NOTHING;
 SQL
 
