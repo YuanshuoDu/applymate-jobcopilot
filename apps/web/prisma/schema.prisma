@@ -120,6 +120,8 @@ model User {
   adminNotifications          AdminNotification[]          @relation("AdminNotificationRecipient")
   broadcastDeliveries         AdminBroadcastDelivery[]
   aiUsageEvents               AiUsageEvent[]               @relation("AiUsageUser")
+  harnessMetricEvents         HarnessMetricEvent[]         @relation("HarnessMetricEventUser")
+  usageEvents                 UsageEvent[]                 @relation("UsageEventUser")
   jobApiUsageEvents           JobApiUsageEvent[]           @relation("JobApiUsageUser")
   externalApiUsageEvents      ExternalApiUsageEvent[]      @relation("ExternalApiUsageUser")
   discoveryOptimizationEvents DiscoveryOptimizationEvent[] @relation("DiscoveryOptimizationUser")
@@ -365,22 +367,22 @@ enum SubmissionAttemptState {
 // Durable source of truth for recruitment artifacts consumed by the Worker.
 // The Worker uses pg SQL; Web owns this Prisma schema and its migrations.
 model AgentArtifact {
-  id              String                @id
-  userId          String
-  jobId           String
-  artifactType    String
-  lifecycle       AgentArtifactLifecycle
-  baseId          String?
-  baseHash        String?
-  content         Json
-  hash            String
-  constraintHash  String
-  provenanceRefs  String[]              @default([])
-  evidenceRefs    String[]              @default([])
-  previousHash    String?
-  version         Int                   @default(1)
-  createdAt       DateTime              @default(now())
-  updatedAt       DateTime              @updatedAt
+  id             String                 @id
+  userId         String
+  jobId          String
+  artifactType   String
+  lifecycle      AgentArtifactLifecycle
+  baseId         String?
+  baseHash       String?
+  content        Json
+  hash           String
+  constraintHash String
+  provenanceRefs String[]               @default([])
+  evidenceRefs   String[]               @default([])
+  previousHash   String?
+  version        Int                    @default(1)
+  createdAt      DateTime               @default(now())
+  updatedAt      DateTime               @updatedAt
 
   @@unique([userId, jobId, lifecycle, artifactType])
   @@index([userId, jobId, lifecycle])
@@ -390,17 +392,17 @@ model AgentArtifact {
 // Durable idempotency ledger for the single external application-submit path.
 // The Worker owns execution through pg.Pool; Web owns this Prisma schema.
 model SubmissionAttempt {
-  id             String                @id @default(cuid())
+  id             String                 @id @default(cuid())
   userId         String
   jobId          String
-  receiptId      String                @unique
+  receiptId      String                 @unique
   constraintHash String
   artifactHash   String
   state          SubmissionAttemptState
   responseRef    String?
   errorCode      String?
-  createdAt      DateTime              @default(now())
-  updatedAt      DateTime              @updatedAt
+  createdAt      DateTime               @default(now())
+  updatedAt      DateTime               @updatedAt
 
   @@index([userId, jobId, state])
   @@map("submission_attempt")
@@ -1402,6 +1404,104 @@ model AiUsageEvent {
   @@map("ai_usage_events")
 }
 
+// Append-only Harness 2.0 telemetry. The Worker writes this table with raw
+// pg.Pool; Web owns the schema and the admin read models.
+model HarnessMetricEvent {
+  id                String   @id @default(cuid())
+  eventType         String   @map("event_type")
+  schemaVersion     String   @default("harness-event.v1") @map("schema_version")
+  correlationId     String   @map("correlation_id")
+  traceId           String   @map("trace_id")
+  spanId            String   @map("span_id")
+  parentSpanId      String?  @map("parent_span_id")
+  userId            String?  @map("user_id")
+  sessionId         String   @map("session_id")
+  turnId            String?  @map("turn_id")
+  taskId            String?  @map("task_id")
+  itemId            String?  @map("item_id")
+  toolCallId        String?  @map("tool_call_id")
+  applicationTaskId String?  @map("application_task_id")
+  jobId             String?  @map("job_id")
+  automationId      String?  @map("automation_id")
+  queueJobId        String?  @map("queue_job_id")
+  toolName          String?  @map("tool_name")
+  provider          String?
+  model             String?
+  source            String   @default("unknown")
+  environment       String   @default("unknown")
+  idempotencyKey    String   @map("idempotency_key")
+  status            String?
+  errorCode         String?  @map("error_code")
+  value             Float?
+  durationMs        Int?     @map("duration_ms")
+  inputTokens       Int      @default(0) @map("input_tokens")
+  outputTokens      Int      @default(0) @map("output_tokens")
+  costMicros        Int      @default(0) @map("cost_micros")
+  estimatedCostUsd  Float    @default(0) @map("estimated_cost_usd")
+  payload           Json     @default("{}")
+  occurredAt        DateTime @default(now()) @map("occurred_at")
+  createdAt         DateTime @default(now()) @map("created_at")
+
+  user User? @relation("HarnessMetricEventUser", fields: [userId], references: [id], onDelete: SetNull)
+
+  @@unique([traceId, idempotencyKey])
+  @@index([traceId, occurredAt])
+  @@index([sessionId, occurredAt])
+  @@index([eventType, occurredAt])
+  @@index([userId, model, toolName, occurredAt])
+  @@map("harness_metric_events")
+}
+
+// Five-minute usage rollups. aggregationKey is deterministic and prevents a
+// scheduler retry from double-counting the same bucket.
+model UsageEvent {
+  id               String   @id @default(cuid())
+  aggregationKey   String   @unique @map("aggregation_key")
+  userId           String?  @map("user_id")
+  sessionId        String?  @map("session_id")
+  turnId           String?  @map("turn_id")
+  toolName         String?  @map("tool_name")
+  provider         String?
+  model            String
+  eventType        String   @map("event_type")
+  bucketStart      DateTime @map("bucket_start")
+  day              DateTime @db.Date
+  eventCount       Int      @default(0) @map("event_count")
+  inputTokens      Int      @default(0) @map("input_tokens")
+  outputTokens     Int      @default(0) @map("output_tokens")
+  costMicros       Int      @default(0) @map("cost_micros")
+  estimatedCostUsd Float    @default(0) @map("estimated_cost_usd")
+  totalLatencyMs   Int      @default(0) @map("total_latency_ms")
+  lastOccurredAt   DateTime @map("last_occurred_at")
+  createdAt        DateTime @default(now()) @map("created_at")
+  updatedAt        DateTime @updatedAt @map("updated_at")
+
+  user User? @relation("UsageEventUser", fields: [userId], references: [id], onDelete: SetNull)
+
+  @@index([userId, model, toolName, day])
+  @@index([bucketStart, model])
+  @@index([sessionId, turnId, toolName, bucketStart])
+  @@map("usage_event")
+}
+
+// Durable SLO breach facts. Alerts are kept separate from AdminAlertEvent so
+// Harness telemetry remains provider-neutral and can be emitted by the Worker.
+model HarnessSloAlert {
+  id         String    @id @default(cuid())
+  ruleKey    String    @map("rule_key")
+  metric     String
+  value      Float
+  threshold  Float
+  traceId    String?   @map("trace_id")
+  status     String    @default("open")
+  createdAt  DateTime  @default(now()) @map("created_at")
+  resolvedAt DateTime? @map("resolved_at")
+
+  @@index([ruleKey, status, createdAt])
+  @@index([metric, createdAt])
+  @@map("harness_slo_alerts")
+}
+
 model JobApiUsageEvent {
   id                 String    @id @default(cuid())
   userId             String?   @map("user_id")
@@ -1429,21 +1529,21 @@ model JobApiUsageEvent {
 }
 
 model ExternalApiUsageEvent {
-  id                String   @id @default(cuid())
-  userId            String?  @map("user_id")
-  provider          String
-  operation         String
-  credentialSource  String   @default("platform") @map("credential_source")
-  requestCount      Int      @default(1) @map("request_count")
-  inputBytes        Int      @default(0) @map("input_bytes")
-  outputBytes       Int      @default(0) @map("output_bytes")
-  estimatedCostUsd  Float    @default(0) @map("estimated_cost_usd")
-  latencyMs         Int      @map("latency_ms")
-  status            String
-  httpStatus        Int?     @map("http_status")
-  errorCode         String?  @map("error_code")
-  createdAt         DateTime @default(now()) @map("created_at")
-  user              User?    @relation("ExternalApiUsageUser", fields: [userId], references: [id], onDelete: SetNull)
+  id               String   @id @default(cuid())
+  userId           String?  @map("user_id")
+  provider         String
+  operation        String
+  credentialSource String   @default("platform") @map("credential_source")
+  requestCount     Int      @default(1) @map("request_count")
+  inputBytes       Int      @default(0) @map("input_bytes")
+  outputBytes      Int      @default(0) @map("output_bytes")
+  estimatedCostUsd Float    @default(0) @map("estimated_cost_usd")
+  latencyMs        Int      @map("latency_ms")
+  status           String
+  httpStatus       Int?     @map("http_status")
+  errorCode        String?  @map("error_code")
+  createdAt        DateTime @default(now()) @map("created_at")
+  user             User?    @relation("ExternalApiUsageUser", fields: [userId], references: [id], onDelete: SetNull)
 
   @@index([createdAt, status])
   @@index([provider, operation, createdAt])
@@ -1707,21 +1807,21 @@ model AgentSession {
   updatedAt     DateTime  @updatedAt
   eventSequence BigInt    @default(0)
 
-  user             User                   @relation(fields: [userId], references: [id], onDelete: Cascade)
-  tasks            SubAgentTask[]
-  mailboxMessages  AgentMailboxMessage[]
-  transcript       AgentTranscriptEvent[]
-  approvals        AgentApproval[]
+  user               User                     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  tasks              SubAgentTask[]
+  mailboxMessages    AgentMailboxMessage[]
+  transcript         AgentTranscriptEvent[]
+  approvals          AgentApproval[]
   actionReservations AgentActionReservation[]
-  applicationTasks ApplicationTask[]
-  turns            AgentTurn[]
-  steps            AgentStep[]
+  applicationTasks   ApplicationTask[]
+  turns              AgentTurn[]
+  steps              AgentStep[]
   contextSnapshots AgentContextSnapshot[]
-  inputs           AgentInput[]
-  items            AgentItem[]
-  events           AgentEvent[]
-  execution        AgentExecution?
-  automation       AgentAutomation?
+  inputs             AgentInput[]
+  items              AgentItem[]
+  events             AgentEvent[]
+  execution          AgentExecution?
+  automation         AgentAutomation?
 
   @@index([userId, createdAt(sort: Desc)])
   @@index([userId, lastViewedAt(sort: Desc)])
@@ -1760,14 +1860,14 @@ model AgentTurn {
   createdAt            DateTime  @default(now())
   updatedAt            DateTime  @updatedAt
 
-  session AgentSession @relation(fields: [sessionId], references: [id], onDelete: Cascade)
-  user    User         @relation(fields: [userId], references: [id], onDelete: Cascade)
-  steps   AgentStep[]
-  inputs  AgentInput[] @relation("AgentTurnInputs")
-  items   AgentItem[]
-  events  AgentEvent[]
-  approvals AgentApproval[]
-  subAgentTasks SubAgentTask[]
+  session         AgentSession          @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+  user            User                  @relation(fields: [userId], references: [id], onDelete: Cascade)
+  steps           AgentStep[]
+  inputs          AgentInput[]          @relation("AgentTurnInputs")
+  items           AgentItem[]
+  events          AgentEvent[]
+  approvals       AgentApproval[]
+  subAgentTasks   SubAgentTask[]
   mailboxMessages AgentMailboxMessage[]
 
   @@index([sessionId, createdAt])
@@ -1819,19 +1919,19 @@ model AgentStep {
 // a worker restart. The JSON content is checksummed by the Worker; the
 // database constraints keep its cursor and accounting columns additive.
 model AgentContextSnapshot {
-  id                String   @id @default(cuid())
-  sessionId         String
-  throughSequence   BigInt
-  version           Int
-  schemaVersion     String   @default("agent-harness.context.v1")
-  content           Json
-  summary           String   @db.Text
-  checksum          String
-  inputTokens       Int      @default(0)
-  outputTokens      Int      @default(0)
-  estimatedCostUsd  Decimal  @default(0) @db.Decimal(12, 8)
-  tokenAccounting   Json     @default("{}")
-  createdAt         DateTime @default(now())
+  id               String   @id @default(cuid())
+  sessionId        String
+  throughSequence  BigInt
+  version          Int
+  schemaVersion    String   @default("agent-harness.context.v1")
+  content          Json
+  summary          String   @db.Text
+  checksum         String
+  inputTokens      Int      @default(0)
+  outputTokens     Int      @default(0)
+  estimatedCostUsd Decimal  @default(0) @db.Decimal(12, 8)
+  tokenAccounting  Json     @default("{}")
+  createdAt        DateTime @default(now())
 
   session AgentSession @relation(fields: [sessionId], references: [id], onDelete: Cascade)
 
@@ -1869,7 +1969,7 @@ model AgentInput {
 }
 
 model AgentItem {
-  id          String   @id
+  id          String    @id
   sessionId   String
   turnId      String
   stepId      String?
@@ -1877,12 +1977,12 @@ model AgentItem {
   type        String
   status      String
   phase       String?
-  revision    Int      @default(0)
+  revision    Int       @default(0)
   content     Json
   startedAt   DateTime?
   completedAt DateTime?
-  createdAt   DateTime @default(now())
-  updatedAt   DateTime @updatedAt
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
 
   session AgentSession @relation(fields: [sessionId], references: [id], onDelete: Cascade)
   turn    AgentTurn    @relation(fields: [turnId], references: [id], onDelete: Cascade)
@@ -1921,32 +2021,32 @@ model AgentEvent {
 }
 
 model AgentOutbox {
-  id             String   @id @default(cuid())
+  id             String    @id @default(cuid())
   topic          String
   aggregateId    String
-  idempotencyKey String   @unique
+  idempotencyKey String    @unique
   payload        Json
   publishedAt    DateTime?
-  attemptCount   Int      @default(0)
-  lastError      String?  @db.Text
-  createdAt      DateTime @default(now())
+  attemptCount   Int       @default(0)
+  lastError      String?   @db.Text
+  createdAt      DateTime  @default(now())
 
   @@index([publishedAt, createdAt])
   @@map("agent_outbox")
 }
 
 model SubAgentTask {
-  id                   String   @id @default(cuid())
+  id                   String    @id @default(cuid())
   sessionId            String
   turnId               String?
   rootTaskId           String?
   parentTaskId         String?
-  path                 String   @default("/")
-  depth                Int      @default(0)
+  path                 String    @default("/")
+  depth                Int       @default(0)
   role                 String
   taskType             String
   status               String
-  goal                 String   @db.Text
+  goal                 String    @db.Text
   constraints          Json
   successCriteria      Json
   allowedActions       Json
@@ -1954,31 +2054,31 @@ model SubAgentTask {
   expectedOutputSchema Json
   result               Json?
   confidence           Float?
-  failureReason        String?  @db.Text
+  failureReason        String?   @db.Text
   qualityGateResult    Json?
   contextSnapshotId    String?
-  modelProfileSnapshot Json     @default("{}")
-  toolPolicySnapshot   Json     @default("{}")
-  budgetSnapshot       Json     @default("{}")
-  attemptCount         Int      @default(0)
-  maxAttempts          Int      @default(1)
+  modelProfileSnapshot Json      @default("{}")
+  toolPolicySnapshot   Json      @default("{}")
+  budgetSnapshot       Json      @default("{}")
+  attemptCount         Int       @default(0)
+  maxAttempts          Int       @default(1)
   leaseOwner           String?
   leaseExpiresAt       DateTime?
   startedAt            DateTime?
   completedAt          DateTime?
   interruptRequestedAt DateTime?
   closedAt             DateTime?
-  outputArtifactIds    Json     @default("[]")
-  createdAt            DateTime @default(now())
-  updatedAt            DateTime @updatedAt
+  outputArtifactIds    Json      @default("[]")
+  createdAt            DateTime  @default(now())
+  updatedAt            DateTime  @updatedAt
 
-  session AgentSession @relation(fields: [sessionId], references: [id], onDelete: Cascade)
-  turn    AgentTurn? @relation(fields: [turnId, sessionId], references: [id, sessionId], onDelete: Cascade)
-  parentTask SubAgentTask? @relation("SubAgentTaskTree", fields: [parentTaskId, sessionId], references: [id, sessionId], onDelete: Cascade)
-  childTasks SubAgentTask[] @relation("SubAgentTaskTree")
-  rootTask SubAgentTask? @relation("SubAgentTaskRoot", fields: [rootTaskId, sessionId], references: [id, sessionId], onDelete: Cascade)
-  rootDescendants SubAgentTask[] @relation("SubAgentTaskRoot")
-  mailboxMessagesSent AgentMailboxMessage[] @relation("AgentMailboxFromTask")
+  session                 AgentSession          @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+  turn                    AgentTurn?            @relation(fields: [turnId, sessionId], references: [id, sessionId], onDelete: Cascade)
+  parentTask              SubAgentTask?         @relation("SubAgentTaskTree", fields: [parentTaskId, sessionId], references: [id, sessionId], onDelete: Cascade)
+  childTasks              SubAgentTask[]        @relation("SubAgentTaskTree")
+  rootTask                SubAgentTask?         @relation("SubAgentTaskRoot", fields: [rootTaskId, sessionId], references: [id, sessionId], onDelete: Cascade)
+  rootDescendants         SubAgentTask[]        @relation("SubAgentTaskRoot")
+  mailboxMessagesSent     AgentMailboxMessage[] @relation("AgentMailboxFromTask")
   mailboxMessagesReceived AgentMailboxMessage[] @relation("AgentMailboxToTask")
 
   @@index([sessionId, status])
@@ -1991,7 +2091,7 @@ model SubAgentTask {
 }
 
 model AgentMailboxMessage {
-  id             String   @id @default(cuid())
+  id             String    @id @default(cuid())
   sessionId      String
   turnId         String
   fromTaskId     String?
@@ -2001,12 +2101,12 @@ model AgentMailboxMessage {
   idempotencyKey String
   deliveredAt    DateTime?
   consumedAt     DateTime?
-  createdAt      DateTime @default(now())
+  createdAt      DateTime  @default(now())
 
-  session AgentSession @relation(fields: [sessionId], references: [id], onDelete: Cascade)
-  turn AgentTurn @relation(fields: [turnId, sessionId], references: [id, sessionId], onDelete: Cascade)
+  session  AgentSession  @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+  turn     AgentTurn     @relation(fields: [turnId, sessionId], references: [id, sessionId], onDelete: Cascade)
   fromTask SubAgentTask? @relation("AgentMailboxFromTask", fields: [fromTaskId, sessionId], references: [id, sessionId], onDelete: Cascade)
-  toTask SubAgentTask? @relation("AgentMailboxToTask", fields: [toTaskId, sessionId], references: [id, sessionId], onDelete: Cascade)
+  toTask   SubAgentTask? @relation("AgentMailboxToTask", fields: [toTaskId, sessionId], references: [id, sessionId], onDelete: Cascade)
 
   @@unique([sessionId, idempotencyKey])
   @@index([toTaskId, consumedAt, createdAt])
@@ -2059,9 +2159,9 @@ model AgentApproval {
   consumedAt   DateTime?
   createdAt    DateTime  @default(now())
 
-  session AgentSession @relation(fields: [sessionId], references: [id], onDelete: Cascade)
-  user    User         @relation(fields: [userId], references: [id], onDelete: Cascade)
-  turn    AgentTurn?   @relation(fields: [turnId], references: [id], onDelete: Cascade)
+  session      AgentSession             @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+  user         User                     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  turn         AgentTurn?               @relation(fields: [turnId], references: [id], onDelete: Cascade)
   reservations AgentActionReservation[]
 
   @@index([userId, status, createdAt])
@@ -2090,8 +2190,8 @@ model AgentActionReservation {
   updatedAt      DateTime @default(now()) @updatedAt
 
   approval AgentApproval @relation(fields: [approvalId], references: [id], onDelete: Cascade)
-  session AgentSession   @relation(fields: [sessionId], references: [id], onDelete: Cascade)
-  user    User           @relation(fields: [userId], references: [id], onDelete: Cascade)
+  session  AgentSession  @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+  user     User          @relation(fields: [userId], references: [id], onDelete: Cascade)
 
   @@unique([approvalId])
   @@index([userId, status, createdAt])
@@ -2120,7 +2220,7 @@ model AgentAutomation {
   createdAt       DateTime  @default(now())
   updatedAt       DateTime  @updatedAt
 
-  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+  user    User          @relation(fields: [userId], references: [id], onDelete: Cascade)
   session AgentSession? @relation(fields: [sessionId], references: [id], onDelete: SetNull)
 
   @@index([userId, enabled, createdAt])
