@@ -21,8 +21,11 @@ import { db }                                       from '@/lib/db'
 import { err, prepareAiRoute, sseResponse }          from '@/lib/api-helpers'
 import { runAgentPipeline }                          from '@/lib/agent/run-service'
 import { hasEffectiveEntitlement }                   from '@/lib/entitlements'
+import { recordLegacyTraffic }                       from '@/lib/observability/legacy-counter'
 
 export async function GET(req: NextRequest) {
+  recordLegacyTraffic('agent_run_endpoint')
+  recordLegacyTraffic('agent_stream_connect')
   const prep = await prepareAiRoute(req, 'agent', 'job_discovery')
   if ('error' in prep) return prep.error
   if (!(await hasEffectiveEntitlement(prep.userId, 'auto_apply'))) return err('Your current plan does not include autonomous applications.', 403)

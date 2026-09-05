@@ -1,8 +1,10 @@
 import { describe, expect, it } from 'vitest'
+import { legacyTrafficSnapshot } from '@/lib/observability/legacy-counter'
 
 describe('retired agent chat route', () => {
   it('returns a typed canonical Session message link without running chat work', async () => {
     const { POST } = await import('./route')
+    const before = legacyTrafficSnapshot()
     const response = await POST()
     const body = await response.json()
 
@@ -19,5 +21,6 @@ describe('retired agent chat route', () => {
         href: '/api/agent/sessions/:id/messages',
       },
     })
+    expect(legacyTrafficSnapshot().windowByKey.agent_chat_endpoint).toBe(before.windowByKey.agent_chat_endpoint + 1)
   })
 })

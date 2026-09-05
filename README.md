@@ -13,6 +13,11 @@
 > complete supported application workflows, and track replies in one reviewable
 > workspace.
 
+ApplyMate Agent Harness V2 is the canonical production agent path. New agent
+features use the typed session/turn/event/tool contracts; legacy paths remain
+read-only or fail-closed emergency compatibility until the documented GA gate
+and rollback evidence are complete.
+
 [Live app](https://applymate.site) · [Preview](https://preview.applymate.site) · [Documentation](docs/README.md) · [Issues](https://github.com/YuanshuoDu/applymate-jobcopilot/issues)
 
 ## Contents

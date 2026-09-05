@@ -1,4 +1,5 @@
 import { NextResponse } from 'next/server'
+import { recordLegacyTraffic } from '@/lib/observability/legacy-counter'
 
 const CANONICAL_MESSAGE_ROUTE = '/api/agent/sessions/:id/messages'
 
@@ -8,6 +9,7 @@ const CANONICAL_MESSAGE_ROUTE = '/api/agent/sessions/:id/messages'
  * any model work or mutating a session.
  */
 export async function POST() {
+  recordLegacyTraffic('agent_chat_endpoint')
   return NextResponse.json({
     error: {
       code: 'agent_chat_route_retired',
