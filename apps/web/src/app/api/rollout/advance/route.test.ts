@@ -41,7 +41,9 @@ describe('POST /api/rollout/advance', () => {
   })
 
   it('does not write while the observation window is open', async () => {
-    mocks.findUnique.mockResolvedValue({ ...currentStage, observationStartedAt: new Date('2026-09-04T00:00:00.000Z'), stageKey: 'internal-only' })
+    // Keep the fixture relative to the test clock so this regression test does not
+    // silently expire when the calendar moves past the hard-coded date.
+    mocks.findUnique.mockResolvedValue({ ...currentStage, observationStartedAt: new Date(Date.now() + 60_000), stageKey: 'internal-only' })
     const { POST } = await import('./route')
     const request = new Request('http://localhost/api/rollout/advance', { method: 'POST', headers: { 'Content-Type': 'application/json', 'Idempotency-Key': 'advance-key-3' }, body: JSON.stringify({ stage: '1%', reason: 'Advance after the internal observation window', metrics: passingMetrics }) })
     const response = await POST(request as never)
