@@ -59,16 +59,25 @@ fs.writeFileSync(path.join(DIST, 'background.js'), finalBg)
 const contentPath = path.join(DIST, 'content.js')
 if (fs.existsSync(contentPath)) {
   let contentJs = fs.readFileSync(contentPath, 'utf-8')
-  // Content scripts are classic scripts, not ES modules. When a utility is
-  // shared with background Vite emits it as a chunk, leaving an `import` here
-  // that Chrome rejects before any ApplyMate UI can run. Inline it explicitly.
-  const jobIdentityPath = path.join(chunkDir, 'job-identity.js')
-  if (fs.existsSync(jobIdentityPath)) {
-    let jobIdentity = fs.readFileSync(jobIdentityPath, 'utf-8')
-    jobIdentity = jobIdentity.replace(/^export \{[\s\S]*?\};\s*/gm, '')
-    contentJs = contentJs.replace(/^import [^\n]+ from "\.\/chunks\/job-identity\.js";\n/gm, '')
-    contentJs = `${jobIdentity}\n${contentJs}`
+  // Content scripts are classic scripts, not ES modules. Inline the complete
+  // static chunk graph that Vite emits for this entry, including side-effect
+  // imports such as `import "./chunks/index.js";`.
+  const contentChunkNames = ['index', 'i18n', 'job-identity']
+  let contentPrelude = ''
+  for (const name of contentChunkNames) {
+    const chunkPath = path.join(chunkDir, `${name}.js`)
+    if (!fs.existsSync(chunkPath)) continue
+    let chunk = fs.readFileSync(chunkPath, 'utf-8')
+    chunk = chunk
+      .replace(/^import [^\n]+ from ["']\.\/[^"']+\.js["'];\r?\n/gm, '')
+      .replace(/^import ["']\.\/[^"']+\.js["'];\r?\n/gm, '')
+      .replace(/^export \{[\s\S]*?\};\s*/gm, '')
+    contentPrelude += `${chunk}\n`
   }
+  contentJs = contentJs
+    .replace(/^import [^\n]+ from ["']\.\/chunks\/[^"']+\.js["'];\r?\n/gm, '')
+    .replace(/^import ["']\.\/chunks\/[^"']+\.js["'];\r?\n/gm, '')
+  contentJs = `${contentPrelude}${contentJs}`
   if (/^\s*import\s/m.test(contentJs)) {
     throw new Error('content.js still contains an ES module import after post-build inlining')
   }

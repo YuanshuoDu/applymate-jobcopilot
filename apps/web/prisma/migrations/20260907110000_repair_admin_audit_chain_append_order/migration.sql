@@ -5,6 +5,38 @@ CREATE INDEX "AdminAuditLog_previous_hash_idx"
   ON "AdminAuditLog"("previous_hash")
   WHERE "previous_hash" IS NOT NULL;
 
+CREATE OR REPLACE FUNCTION admin_audit_record_hash(
+  previous TEXT,
+  audit_id TEXT,
+  request_id TEXT,
+  actor_user_id TEXT,
+  actor_role_key TEXT,
+  action TEXT,
+  target_type TEXT,
+  target_id TEXT,
+  tenant_user_id TEXT,
+  reason TEXT,
+  outcome TEXT,
+  error_code TEXT,
+  before_json JSONB,
+  after_json JSONB
+)
+RETURNS TEXT
+LANGUAGE SQL
+IMMUTABLE
+AS $$
+  SELECT encode(digest(
+    coalesce(previous, '') || '|' || audit_id || '|' || request_id || '|' ||
+    coalesce(actor_user_id, '') || '|' || coalesce(actor_role_key, '') || '|' ||
+    action || '|' || coalesce(target_type, '') || '|' ||
+    coalesce(target_id, '') || '|' || coalesce(tenant_user_id, '') || '|' ||
+    coalesce(reason, '') || '|' || outcome || '|' ||
+    coalesce(error_code, '') || '|' || coalesce(before_json::text, '') || '|' ||
+    coalesce(after_json::text, ''),
+    'sha256'
+  ), 'hex');
+$$;
+
 CREATE OR REPLACE FUNCTION set_admin_audit_hash()
 RETURNS trigger
 LANGUAGE plpgsql
@@ -27,16 +59,22 @@ BEGIN
   END IF;
 
   NEW."previous_hash" := previous;
-  NEW."record_hash" := encode(digest(
-    coalesce(previous, '') || '|' || NEW."id" || '|' || NEW."requestId" || '|' ||
-    coalesce(NEW."actorUserId", '') || '|' || coalesce(NEW."actorRoleKey", '') || '|' ||
-    NEW."action" || '|' || coalesce(NEW."targetType"::text, '') || '|' ||
-    coalesce(NEW."targetId", '') || '|' || coalesce(NEW."tenantUserId", '') || '|' ||
-    coalesce(NEW."reason", '') || '|' || NEW."outcome"::text || '|' ||
-    coalesce(NEW."errorCode", '') || '|' || coalesce(NEW."before"::text, '') || '|' ||
-    coalesce(NEW."after"::text, ''),
-    'sha256'
-  ), 'hex');
+  NEW."record_hash" := admin_audit_record_hash(
+    previous,
+    NEW."id",
+    NEW."requestId",
+    NEW."actorUserId",
+    NEW."actorRoleKey",
+    NEW."action",
+    NEW."targetType"::text,
+    NEW."targetId",
+    NEW."tenantUserId",
+    NEW."reason",
+    NEW."outcome"::text,
+    NEW."errorCode",
+    NEW."before",
+    NEW."after"
+  );
   RETURN NEW;
 END;
 $$;

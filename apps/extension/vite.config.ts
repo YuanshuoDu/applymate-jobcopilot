@@ -11,6 +11,7 @@ function postBuild() {
         execSync('node build.cjs', { cwd: __dirname, stdio: 'inherit' })
       } catch (e) {
         console.error('postbuild error:', e)
+        throw e
       }
     },
   }

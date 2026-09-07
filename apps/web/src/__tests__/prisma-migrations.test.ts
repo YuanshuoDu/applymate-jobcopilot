@@ -39,6 +39,8 @@ describe('Prisma migration dependencies', () => {
     expect(migration).toContain('WHERE NOT EXISTS')
     expect(migration).toContain('child."previous_hash" = leaf."record_hash"')
     expect(migration).toContain('AdminAuditLog_previous_hash_idx')
+    expect(migration).toContain('CREATE OR REPLACE FUNCTION admin_audit_record_hash')
+    expect(migration).toContain('NEW."record_hash" := admin_audit_record_hash')
     expect(migration).not.toContain('ORDER BY "createdAt" DESC')
   })
 

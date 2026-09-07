@@ -1,6 +1,7 @@
+import { Prisma } from '@prisma/client'
 import { db } from '@/lib/db'
 
-type AuditRow = { id: string; previousHash: string | null; recordHash: string | null }
+type AuditRow = { id: string; previousHash: string | null; recordHash: string | null; computedRecordHash: string | null }
 
 type AuditVerification = {
   verified: boolean
@@ -21,7 +22,29 @@ function failure(rows: AuditRow[], brokenAt: string): AuditVerification {
 }
 
 export async function verifyAdminAuditChain() {
-  const rows = await db.adminAuditLog.findMany({ select: { id: true, previousHash: true, recordHash: true } }) as AuditRow[]
+  const rows = await db.$queryRaw<AuditRow[]>(Prisma.sql`
+    SELECT
+      "id",
+      "previous_hash" AS "previousHash",
+      "record_hash" AS "recordHash",
+      admin_audit_record_hash(
+        "previous_hash",
+        "id",
+        "requestId",
+        "actorUserId",
+        "actorRoleKey",
+        "action",
+        "targetType"::text,
+        "targetId",
+        "tenantUserId",
+        "reason",
+        "outcome"::text,
+        "errorCode",
+        "before",
+        "after"
+      ) AS "computedRecordHash"
+    FROM "AdminAuditLog"
+  `)
   if (rows.length === 0) return { verified: true, recordCount: 0, brokenAt: null, firstRecordHash: null, lastRecordHash: null }
 
   const rowsByHash = new Map<string, AuditRow>()
@@ -29,7 +52,7 @@ export async function verifyAdminAuditChain() {
   let root: AuditRow | undefined
 
   for (const row of rows) {
-    if (!row.recordHash || rowsByHash.has(row.recordHash)) return failure(rows, row.id)
+    if (!row.recordHash || row.recordHash !== row.computedRecordHash || rowsByHash.has(row.recordHash)) return failure(rows, row.id)
     rowsByHash.set(row.recordHash, row)
 
     if (row.previousHash === null) {
