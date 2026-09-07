@@ -65,4 +65,16 @@ describe('GET /api/admin/v1/audit/integrity', () => {
       after: { verified: true, recordCount: 2, brokenAt: null },
     }))
   })
+
+  it('returns 503 without an audit write when the verifier or helper migration is unavailable', async () => {
+    mocks.verifyAdminAuditChain.mockRejectedValue(new Error('function admin_audit_record_hash does not exist'))
+
+    const { GET } = await import('./route')
+    const response = await GET(new Request('http://localhost/api/admin/v1/audit/integrity') as never)
+
+    expect(response.status).toBe(503)
+    await expect(response.json()).resolves.toMatchObject({ verified: false, errorCode: 'integrity_unavailable' })
+    expect(mocks.writeAdminAudit).not.toHaveBeenCalled()
+    expect(errorSpy).toHaveBeenCalledWith('ADMIN_AUDIT_INTEGRITY_UNAVAILABLE', { requestId: 'req-1', errorCode: 'integrity_unavailable' })
+  })
 })
