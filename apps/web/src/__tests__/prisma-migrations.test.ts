@@ -39,7 +39,18 @@ describe('Prisma migration dependencies', () => {
     expect(migration).toContain('WHERE NOT EXISTS')
     expect(migration).toContain('child."previous_hash" = leaf."record_hash"')
     expect(migration).toContain('AdminAuditLog_previous_hash_idx')
+    expect(migration).not.toContain('CREATE OR REPLACE FUNCTION admin_audit_record_hash')
+    expect(migration).not.toContain('NEW."record_hash" := admin_audit_record_hash')
     expect(migration).not.toContain('ORDER BY "createdAt" DESC')
+  })
+
+  it('adds the audit hash helper without rewriting the deployed append-order migration', () => {
+    const migrationPath = join(migrationsRoot, '20260907120000_add_admin_audit_record_hash_function', 'migration.sql')
+    const migration = readFileSync(migrationPath, 'utf8')
+
+    expect(migration).toContain('CREATE OR REPLACE FUNCTION admin_audit_record_hash')
+    expect(migration).toContain('NEW."record_hash" := admin_audit_record_hash')
+    expect(migration).toContain('WHERE NOT EXISTS')
   })
 
   it('creates the agent run history table required by the Prisma schema', () => {

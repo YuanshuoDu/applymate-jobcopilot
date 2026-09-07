@@ -59,18 +59,38 @@ fs.writeFileSync(path.join(DIST, 'background.js'), finalBg)
 const contentPath = path.join(DIST, 'content.js')
 if (fs.existsSync(contentPath)) {
   let contentJs = fs.readFileSync(contentPath, 'utf-8')
-  // Content scripts are classic scripts, not ES modules. When a utility is
-  // shared with background Vite emits it as a chunk, leaving an `import` here
-  // that Chrome rejects before any ApplyMate UI can run. Inline it explicitly.
-  const jobIdentityPath = path.join(chunkDir, 'job-identity.js')
-  if (fs.existsSync(jobIdentityPath)) {
-    let jobIdentity = fs.readFileSync(jobIdentityPath, 'utf-8')
-    jobIdentity = jobIdentity.replace(/^export \{[\s\S]*?\};\s*/gm, '')
-    contentJs = contentJs.replace(/^import [^\n]+ from "\.\/chunks\/job-identity\.js";\n/gm, '')
-    contentJs = `${jobIdentity}\n${contentJs}`
+  // Content scripts are classic scripts, not ES modules. Inline the complete
+  // static chunk graph that Vite emits for this entry, including side-effect
+  // imports such as `import "./chunks/index.js";`.
+  const createStaticImportPattern = () => /^import\s+(?:[^'"]*?\s+from\s+)?["'](\.\/(?:chunks\/)?[^"']+\.js)["'];?\r?\n?/gm
+  const seenContentChunks = new Set()
+  const inlineContentChunk = (relativePath) => {
+    const name = relativePath.replace(/^\.\/chunks\//, '').replace(/^\.\//, '')
+    if (seenContentChunks.has(name)) return ''
+    const chunkPath = path.join(chunkDir, name)
+    if (!fs.existsSync(chunkPath)) {
+      throw new Error(`content.js references missing chunk: ${relativePath}`)
+    }
+    seenContentChunks.add(name)
+    let chunk = fs.readFileSync(chunkPath, 'utf-8')
+    let dependencies = ''
+    chunk = chunk.replace(createStaticImportPattern(), (_match, dependencyPath) => {
+      dependencies += inlineContentChunk(dependencyPath)
+      return ''
+    })
+    chunk = chunk.replace(/^export \{[\s\S]*?\}\s*(?:from\s+["'][^"']+["'])?;\s*/gm, '')
+    return `${dependencies}${chunk}\n`
   }
-  if (/^\s*import\s/m.test(contentJs)) {
-    throw new Error('content.js still contains an ES module import after post-build inlining')
+
+  let contentPrelude = ''
+  contentJs = contentJs.replace(createStaticImportPattern(), (_match, relativePath) => {
+    contentPrelude += inlineContentChunk(relativePath)
+    return ''
+  })
+  contentJs = `${contentPrelude}${contentJs}`
+  const remainingModuleSyntax = contentJs.match(/^\s*(?:import|export)\s.*$/gm)
+  if (remainingModuleSyntax) {
+    throw new Error(`content.js still contains ES module syntax after post-build inlining: ${remainingModuleSyntax.slice(0, 3).join(' | ')}`)
   }
   // A reload of an unpacked extension can keep the page's isolated-world
   // globals while replacing chrome.runtime. Give each build a fresh marker so
