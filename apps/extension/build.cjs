@@ -62,24 +62,35 @@ if (fs.existsSync(contentPath)) {
   // Content scripts are classic scripts, not ES modules. Inline the complete
   // static chunk graph that Vite emits for this entry, including side-effect
   // imports such as `import "./chunks/index.js";`.
-  const contentChunkNames = ['index', 'i18n', 'job-identity']
-  let contentPrelude = ''
-  for (const name of contentChunkNames) {
-    const chunkPath = path.join(chunkDir, `${name}.js`)
-    if (!fs.existsSync(chunkPath)) continue
+  const createStaticImportPattern = () => /^import\s+(?:[^'"]*?\s+from\s+)?["'](\.\/(?:chunks\/)?[^"']+\.js)["'];?\r?\n?/gm
+  const seenContentChunks = new Set()
+  const inlineContentChunk = (relativePath) => {
+    const name = relativePath.replace(/^\.\/chunks\//, '').replace(/^\.\//, '')
+    if (seenContentChunks.has(name)) return ''
+    const chunkPath = path.join(chunkDir, name)
+    if (!fs.existsSync(chunkPath)) {
+      throw new Error(`content.js references missing chunk: ${relativePath}`)
+    }
+    seenContentChunks.add(name)
     let chunk = fs.readFileSync(chunkPath, 'utf-8')
-    chunk = chunk
-      .replace(/^import [^\n]+ from ["']\.\/[^"']+\.js["'];\r?\n/gm, '')
-      .replace(/^import ["']\.\/[^"']+\.js["'];\r?\n/gm, '')
-      .replace(/^export \{[\s\S]*?\};\s*/gm, '')
-    contentPrelude += `${chunk}\n`
+    let dependencies = ''
+    chunk = chunk.replace(createStaticImportPattern(), (_match, dependencyPath) => {
+      dependencies += inlineContentChunk(dependencyPath)
+      return ''
+    })
+    chunk = chunk.replace(/^export \{[\s\S]*?\}\s*(?:from\s+["'][^"']+["'])?;\s*/gm, '')
+    return `${dependencies}${chunk}\n`
   }
-  contentJs = contentJs
-    .replace(/^import [^\n]+ from ["']\.\/chunks\/[^"']+\.js["'];\r?\n/gm, '')
-    .replace(/^import ["']\.\/chunks\/[^"']+\.js["'];\r?\n/gm, '')
+
+  let contentPrelude = ''
+  contentJs = contentJs.replace(createStaticImportPattern(), (_match, relativePath) => {
+    contentPrelude += inlineContentChunk(relativePath)
+    return ''
+  })
   contentJs = `${contentPrelude}${contentJs}`
-  if (/^\s*import\s/m.test(contentJs)) {
-    throw new Error('content.js still contains an ES module import after post-build inlining')
+  const remainingModuleSyntax = contentJs.match(/^\s*(?:import|export)\s.*$/gm)
+  if (remainingModuleSyntax) {
+    throw new Error(`content.js still contains ES module syntax after post-build inlining: ${remainingModuleSyntax.slice(0, 3).join(' | ')}`)
   }
   // A reload of an unpacked extension can keep the page's isolated-world
   // globals while replacing chrome.runtime. Give each build a fresh marker so
