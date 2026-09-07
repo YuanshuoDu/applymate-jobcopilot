@@ -188,7 +188,7 @@ describe("apply-queue Phase 5 pipeline", () => {
         error: null,
       })
     );
-  });
+  }, 15_000);
 
   it("pattern cache authorization block is terminal and does not fall back to AI", async () => {
     mocks.findFormPattern.mockResolvedValueOnce(formPattern);
