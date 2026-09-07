@@ -1,6 +1,8 @@
 # ApplyMate Agent Harness 2.0 详细开发路线图
 
 > **状态（2026-09-01）：** Phase 0–3 implementation complete (AH2-001..017 + MiniMax profile merged). Phase 3 Exit Gate is satisfied by provider/tool-kernel evidence; its scripted Turn prerequisite was corrected to remain with AH2-024. **Phase 4：`accepted_by_owner_waiver` — owner 已明确接受 48h 观察豁免（2026-09-01）** — AH2-018/019/020/021 all merged (#382/#383/#384/#385); PR #385 commit 36c8d9e fixed two P1 redaction bugs surfaced during Layer 1 review. Phase 4 implementation and runbook are complete (runbook: PR #389 + #390, master); staging approval smoke and SSE evidence are recorded in PR #392 and the current MiniMax smoke is recorded on **#387/#388**. **48h dual-write integrity observation was not run and is explicitly waived by the owner; it remains `not_verified`, not fabricated as a measurement.** The exception record is [`docs/agent-harness-v2/gates/phase-4/owner-waiver.md`](agent-harness-v2/gates/phase-4/owner-waiver.md). Phase 5 is unlocked for implementation under this named exception; its own Exit Gate remains mandatory. The staging `AGENT_PROTOCOL_V2_DUAL_WRITE` flag is now `Active`, `100%`, `v3` in the authenticated Platform controls page; `fantasticjobs_shadow` is `Active` in Production at `0%`, so it receives no production traffic. This state does not waive the remaining ordinary evidence requirement or authorize production rollout. Dispatch order continues with AH2-022 (#386), then AH2-024-M (#370).
+
+> **Phase 10 / GA reconciliation (2026-09-07):** AH2-048–053 implementation PRs are merged and their code/CI evidence is recorded. The GA checklist is now reconciled into `PASS`, `WAIVED / NOT VERIFIED`, and `PENDING` instead of treating every item as unsigned. This is a documentation/evidence correction, not a GA approval: staging/production observation, rollback evidence, zero-legacy-traffic measurement, and owner sign-off remain explicit blockers until recorded. See [`docs/ga/agent-harness-2.0-checklist.md`](ga/agent-harness-2.0-checklist.md) and AH2-054 ([#490](https://github.com/YuanshuoDu/applymate-jobcopilot/issues/490)).
 > **日期：** 2026-08-30（状态头更新于 2026-08-31）
 > **上游设计：** [Agent Harness 2.0 Technical Design](./agent-harness-v2-technical-design.md)
 > **适用代码：** `packages/agent-protocol`、`packages/agent-model`、`apps/web`、`apps/worker`
@@ -1147,6 +1149,10 @@ draft
 - 生产 browser/manual evidence 完成；
 - legacy traffic 为 0 且已完成 rollback rehearsal。
 
+**当前状态（2026-09-07）：`implementation_complete_operational_gate_pending`.**
+
+代码和 CI 已完成的项目不得继续显示为“全部未签署”；但任一 `PENDING` 或 `WAIVED / NOT VERIFIED` 项仍表示不能宣布 GA。`docs/ga/agent-harness-2.0-checklist.md` 是当前逐项证据索引，生产证据不得用 CI、合成 fixture 或 owner waiver 替代。
+
 ---
 
 ## 15. Issue 依赖与状态映射表
@@ -1180,35 +1186,37 @@ draft
 | AH2-022 | Turn lease/recovery | 007,009 | [#386](https://github.com/YuanshuoDu/applymate-jobcopilot/issues/386) | [#391](https://github.com/YuanshuoDu/applymate-jobcopilot/pull/391) | done |
 | AH2-023 | Step context/input consume | 016,022 | [#397](https://github.com/YuanshuoDu/applymate-jobcopilot/issues/397) | [#399](https://github.com/YuanshuoDu/applymate-jobcopilot/pull/399) | done |
 | AH2-024 | conversation loop | 017,018,022,023 | [#400](https://github.com/YuanshuoDu/applymate-jobcopilot/issues/400) | [#401](https://github.com/YuanshuoDu/applymate-jobcopilot/pull/401) | done |
-| AH2-024-M | MiniMax M3 Harness default | AH2-024, AH2-017, #369 | [#370](https://github.com/YuanshuoDu/applymate-jobcopilot/issues/370) | TBD | spec-ready |
-| AH2-025 | suspension/wakeup | 020,024 | TBD | TBD | pending |
-| AH2-026 | interrupt cascade | 022,024,025 | TBD | TBD | pending |
-| AH2-027 | budget/verifier/finalizer | 024 | TBD | TBD | pending |
-| AH2-028 | task/mailbox schema | 005,006 | TBD | TBD | pending |
-| AH2-029 | AgentTreeManager | 022,028 | TBD | TBD | pending |
-| AH2-030 | coordination tools | 017,025,029 | TBD | TBD | pending |
-| AH2-031 | Scout/Analyst migration | 017,030 | TBD | TBD | pending |
-| AH2-032 | Writer/Reviewer migration | 021,030 | TBD | TBD | pending |
-| AH2-033 | Auditor/Executor migration | 021,030 | TBD | TBD | pending |
-| AH2-034 | context snapshot | 023,028 | TBD | TBD | pending |
-| AH2-035 | compaction | 016,018,034 | TBD | TBD | pending |
-| AH2-036 | fork/restore | 011,034,035 | TBD | TBD | pending |
-| AH2-037 | Pipeline/Automation adapter | 024,025,027 | TBD | TBD | pending |
-| AH2-038 | discovery/analysis tools | 017,037 | TBD | TBD | pending |
-| AH2-039 | artifact/review tools | 021,034,037 | TBD | TBD | pending |
-| AH2-040 | browser fill executor | 021,025,039 | TBD | TBD | pending |
-| AH2-041 | application.submit tool | 019,020,026,040 | TBD | TBD | pending |
-| AH2-042 | Gmail tools | 019,020,026 | TBD | TBD | pending |
-| AH2-043 | timeline reducer/client | 011,012 | TBD | TBD | pending |
-| AH2-044 | session/composer | 009,010,043 | TBD | TBD | pending |
-| AH2-045 | message/tool renderers | 043 | TBD | TBD | pending |
-| AH2-046 | task/approval/artifact UI | 020,030,034,043 | TBD | TBD | pending |
-| AH2-047 | remove ACTION/dual stream | 037,043–045 | TBD | TBD | pending |
-| AH2-048 | browser E2E/i18n/mobile | 044–047 | TBD | TBD | pending |
-| AH2-049 | contract/fault suite | 027,030,035,041,042 | TBD | TBD | pending |
-| AH2-050 | SLO/observability | 012,027,049 | TBD | TBD | pending |
-| AH2-051 | shadow/canary rollout | 048–050 | TBD | TBD | pending |
-| AH2-052 | legacy cleanup/GA | 051 | TBD | TBD | pending |
+| AH2-024-M | MiniMax M3 Harness default | AH2-024, AH2-017, #369 | [#370](https://github.com/YuanshuoDu/applymate-jobcopilot/issues/370) | [#403](https://github.com/YuanshuoDu/applymate-jobcopilot/pull/403) | done |
+| AH2-025 | suspension/wakeup | 020,024 | [#412](https://github.com/YuanshuoDu/applymate-jobcopilot/issues/412) | — | superseded; behavior covered by #391/#401, no standalone PR |
+| AH2-026 | interrupt cascade | 022,024,025 | [#415](https://github.com/YuanshuoDu/applymate-jobcopilot/issues/415) | [#422](https://github.com/YuanshuoDu/applymate-jobcopilot/pull/422), recovered by [#434](https://github.com/YuanshuoDu/applymate-jobcopilot/pull/434) | done |
+| AH2-027 | budget/verifier/finalizer | 024 | [#413](https://github.com/YuanshuoDu/applymate-jobcopilot/issues/413) | [#420](https://github.com/YuanshuoDu/applymate-jobcopilot/pull/420), recovered by [#434](https://github.com/YuanshuoDu/applymate-jobcopilot/pull/434) | done |
+| AH2-028 | task/mailbox schema | 005,006 | [#414](https://github.com/YuanshuoDu/applymate-jobcopilot/issues/414) | [#421](https://github.com/YuanshuoDu/applymate-jobcopilot/pull/421), recovered by [#434](https://github.com/YuanshuoDu/applymate-jobcopilot/pull/434) | done |
+| AH2-029 | AgentTreeManager | 022,028 | [#423](https://github.com/YuanshuoDu/applymate-jobcopilot/issues/423) | [#429](https://github.com/YuanshuoDu/applymate-jobcopilot/pull/429), recovered by [#434](https://github.com/YuanshuoDu/applymate-jobcopilot/pull/434) | done |
+| AH2-030 | coordination tools | 017,025,029 | [#424](https://github.com/YuanshuoDu/applymate-jobcopilot/issues/424) | [#432](https://github.com/YuanshuoDu/applymate-jobcopilot/pull/432), recovered by [#434](https://github.com/YuanshuoDu/applymate-jobcopilot/pull/434) | done |
+| AH2-031 | Scout/Analyst migration | 017,030 | [#436](https://github.com/YuanshuoDu/applymate-jobcopilot/issues/436) | [#442](https://github.com/YuanshuoDu/applymate-jobcopilot/pull/442) | done |
+| AH2-032 | Writer/Reviewer migration | 021,030 | [#437](https://github.com/YuanshuoDu/applymate-jobcopilot/issues/437) | [#441](https://github.com/YuanshuoDu/applymate-jobcopilot/pull/441) | done |
+| AH2-033 | Auditor/Executor migration | 021,030 | [#438](https://github.com/YuanshuoDu/applymate-jobcopilot/issues/438) | [#443](https://github.com/YuanshuoDu/applymate-jobcopilot/pull/443) | done |
+| AH2-034 | context snapshot | 023,028 | [#416](https://github.com/YuanshuoDu/applymate-jobcopilot/issues/416) | [#428](https://github.com/YuanshuoDu/applymate-jobcopilot/pull/428), recovered by [#434](https://github.com/YuanshuoDu/applymate-jobcopilot/pull/434) | done |
+| AH2-035 | compaction | 016,018,034 | [#425](https://github.com/YuanshuoDu/applymate-jobcopilot/issues/425) | [#433](https://github.com/YuanshuoDu/applymate-jobcopilot/pull/433) superseded by [#434](https://github.com/YuanshuoDu/applymate-jobcopilot/pull/434) | done |
+| AH2-036 | fork/restore | 011,034,035 | [#439](https://github.com/YuanshuoDu/applymate-jobcopilot/issues/439) | [#445](https://github.com/YuanshuoDu/applymate-jobcopilot/pull/445) | done |
+| AH2-037 | Pipeline/Automation adapter | 024,025,027 | [#446](https://github.com/YuanshuoDu/applymate-jobcopilot/issues/446) | [#451](https://github.com/YuanshuoDu/applymate-jobcopilot/pull/451) | done |
+| AH2-038 | discovery/analysis tools | 017,037 | [#448](https://github.com/YuanshuoDu/applymate-jobcopilot/issues/448) | [#453](https://github.com/YuanshuoDu/applymate-jobcopilot/pull/453) | done |
+| AH2-039 | artifact/review tools | 021,034,037 | [#449](https://github.com/YuanshuoDu/applymate-jobcopilot/issues/449) | [#454](https://github.com/YuanshuoDu/applymate-jobcopilot/pull/454) | done |
+| AH2-040 | browser fill executor | 021,025,039 | [#450](https://github.com/YuanshuoDu/applymate-jobcopilot/issues/450) | [#455](https://github.com/YuanshuoDu/applymate-jobcopilot/pull/455) | done |
+| AH2-041 | application.submit tool | 019,020,026,040 | [#456](https://github.com/YuanshuoDu/applymate-jobcopilot/issues/456) | [#465](https://github.com/YuanshuoDu/applymate-jobcopilot/pull/465), follow-up [#469](https://github.com/YuanshuoDu/applymate-jobcopilot/pull/469) | done |
+| AH2-042 | Gmail tools | 019,020,026 | [#447](https://github.com/YuanshuoDu/applymate-jobcopilot/issues/447) | [#452](https://github.com/YuanshuoDu/applymate-jobcopilot/pull/452) | done |
+| AH2-043 | timeline reducer/client | 011,012 | [#417](https://github.com/YuanshuoDu/applymate-jobcopilot/issues/417) | [#470](https://github.com/YuanshuoDu/applymate-jobcopilot/pull/470) | done |
+| AH2-044 | session/composer | 009,010,043 | [#426](https://github.com/YuanshuoDu/applymate-jobcopilot/issues/426) | [#430](https://github.com/YuanshuoDu/applymate-jobcopilot/pull/430), recovered by [#434](https://github.com/YuanshuoDu/applymate-jobcopilot/pull/434) | done |
+| AH2-045 | message/tool renderers | 043 | [#427](https://github.com/YuanshuoDu/applymate-jobcopilot/issues/427) | [#431](https://github.com/YuanshuoDu/applymate-jobcopilot/pull/431), recovered by [#434](https://github.com/YuanshuoDu/applymate-jobcopilot/pull/434) | done |
+| AH2-046 | task/approval/artifact UI | 020,030,034,043 | [#440](https://github.com/YuanshuoDu/applymate-jobcopilot/issues/440) | [#444](https://github.com/YuanshuoDu/applymate-jobcopilot/pull/444), canonical controls [#462](https://github.com/YuanshuoDu/applymate-jobcopilot/pull/462) | done |
+| AH2-047 | remove ACTION/dual stream | 037,043–045 | [#471](https://github.com/YuanshuoDu/applymate-jobcopilot/issues/471) | [#479](https://github.com/YuanshuoDu/applymate-jobcopilot/pull/479) | done |
+| AH2-048 | browser E2E/i18n/mobile | 044–047 | [#477](https://github.com/YuanshuoDu/applymate-jobcopilot/issues/477) | [#482](https://github.com/YuanshuoDu/applymate-jobcopilot/pull/482) | implementation done; gate evidence pending |
+| AH2-049 | contract/fault suite | 027,030,035,041,042 | [#478](https://github.com/YuanshuoDu/applymate-jobcopilot/issues/478) | [#483](https://github.com/YuanshuoDu/applymate-jobcopilot/pull/483) | implementation done; gate evidence pending |
+| AH2-050 | SLO/observability | 012,027,049 | [#474](https://github.com/YuanshuoDu/applymate-jobcopilot/issues/474) | [#484](https://github.com/YuanshuoDu/applymate-jobcopilot/pull/484) | implementation done; gate evidence pending |
+| AH2-051 | shadow/canary rollout | 048–050 | [#475](https://github.com/YuanshuoDu/applymate-jobcopilot/issues/475) | [#486](https://github.com/YuanshuoDu/applymate-jobcopilot/pull/486) | implementation done; observation/rollback gate pending |
+| AH2-052 | legacy cleanup/GA | 051 | [#476](https://github.com/YuanshuoDu/applymate-jobcopilot/issues/476) | [#487](https://github.com/YuanshuoDu/applymate-jobcopilot/pull/487) | implementation done; GA gate pending |
+| AH2-053 | safe DB cleanup inventory | 052 | [#485](https://github.com/YuanshuoDu/applymate-jobcopilot/issues/485) | [#489](https://github.com/YuanshuoDu/applymate-jobcopilot/pull/489) | implementation done; production DROP gates pending |
+| AH2-054 | GA checklist evidence reconciliation | 048–053 | [#490](https://github.com/YuanshuoDu/applymate-jobcopilot/issues/490) | this PR | in review |
 
 ---
 
