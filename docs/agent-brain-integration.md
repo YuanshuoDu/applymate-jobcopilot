@@ -143,9 +143,9 @@ Luna verification of the current canonical runtime and admission bridge passed:
 - Web usage broker and internal route tests: 2 files, 7 tests.
 - Worker TypeScript and its shared-package build; direct Web `tsc --noEmit`.
 
-The full Web typecheck command attempted Prisma regeneration and encountered a Windows `EPERM` engine-file rename lock. The direct TypeScript phase passed. This is a tooling boundary, not evidence of successful regeneration.
+An earlier Web typecheck encountered a Windows `EPERM` Prisma engine-file rename lock. The later managed browser run completed the Web production build, including generation, and direct Web TypeScript passed. This does not verify a database connection or migration application.
 
-These are local automated results. Real database/RLS execution, actual process restart, child execution/wait composition and the supervisor browser fixture are not yet accepted. Large lifecycle outputs still use process-local result references and require durable storage before long-session acceptance. No provider call, employer submission, database migration, staging gate or production deployment is claimed by this checkpoint.
+These are local automated results. Real database/RLS execution, actual process restart and child execution/wait composition are not yet accepted. The supervisor fixture has since passed the browser checks below. Large lifecycle outputs still use process-local result references and require durable storage before long-session acceptance. No provider call, employer submission, database migration, staging gate or production deployment is claimed by this checkpoint.
 
 ## Follow-up sequence
 
@@ -153,11 +153,19 @@ These are local automated results. Real database/RLS execution, actual process r
 
 The next checkpoint contains candidate supervisor UI, owner-neutral loop extraction and additive private-result/wait schema source. It remains a draft, not an accepted implementation of child execution or durable joins.
 
-- Luna reported 52 passing tests across 11 Worker files and a passing Worker typecheck for the extraction/startup candidate. The existing startup security test caught static queue imports; those imports now occur after listener validation. A new extraction test still needs a stronger assertion before its description can be treated as proof of model observation delivery.
-- Luna reported 15 passing storage tests and Prisma validation. Subsequent size-limit/schema-alignment and queued-parent corrections need their final validation result recovered or rerun; there is no real PostgreSQL/RLS or migration-application evidence.
-- Luna reported 26 passing UI/DTO tests, a passing Web typecheck and one passing desktop-English supervisor browser run. The final four-project supervisor matrix was not collected before the quota interruption. The preview's URL fallback and its hydration behavior remain review items; a stale-props explanation is an inference, not established evidence.
+- Luna reported 52 passing tests across 11 Worker files and a passing Worker typecheck for the extraction/startup candidate. The existing startup security test caught static queue imports; those imports now occur after listener validation. The reviewed extraction test now inspects the actual second model request and its tool-result observation. The private-result contract test now executes the read tool and validates its output schema. Those two files passed all three focused tests.
+- Luna reported 15 passing storage tests and Prisma validation. The pushed `d710a9d` checkpoint subsequently passed CI Tests, TypeScript, Build, Lockfile and Harness contract checks. Private storage is still not bound to production execution, and there is no real PostgreSQL/RLS or migration-application evidence.
+- Luna reported 26 passing UI/DTO tests. The final supervisor browser run passed all four projects: desktop/mobile in English/Chinese. It used the actual workbench with mocked APIs under a managed production build. Root reviewed desktop/mobile screenshots. Preview access and middleware tests passed 22/22; Web TypeScript passed. The browser URL render fallback was removed, and the fixture uses server-provided mode selection. These overlapping checks are not a unique-test total or authenticated staging evidence.
 
 The owner requested lower usage. Subsequent work uses at most one active Luna worker, bounded tasks, reused evidence and focused checks. Astra retains design and final review. Avoid repeating broad matrices or repository surveys without a new failure or relevant change. The full goal remains active and incomplete.
+
+### Next implementation contracts
+
+Different supervisor browser projects previously encountered `/agent-preview` HTTP 500 with a JSON parse error under `next dev`; the exact parse source remains unknown. The fixture now runs against a production-build test server, and the four-project run passed. This is a validation-design change, not a claim that HMR caused the failure. An explicit `AGENT_PREVIEW_FIXTURE=1` flag and loopback host checks enable the fixture; ordinary production rejects it even with an authentication cookie. The test server binds `127.0.0.1:3100`, never reuses another server, uses placeholder local database configuration and does not apply migrations. Public or forwarded non-loopback hosts are covered by denial tests. Full browser CI on the next pushed commit remains a delivery gate because this changes the shared Playwright server configuration.
+
+1. Bind the shared loop to real persistence. Root steps and items carry their root task ID. Child writes carry their actual task ID and task attempt; their stored ordinal is allocated under a Turn lock. Child writers never update the root active-step pointer, final response or terminal status. Historical root reads retain legacy rows without a task ID while excluding child rows; joined results enter context explicitly.
+2. Extend trusted account admission to the child owner/attempt fence, then compose the child model/tool executor with scoped context, inherited policy and durable result storage. A current child lease remains valid while its nonterminal root is queued or waiting. Budget recovery must not reset prior usage or multiply the inherited allowance across parallel children.
+3. Implement the wait handoff contract above and register child consumers only with the completed executor. Acceptance requires two real scoped child executions, an early completion, duplicate wakeup, timeout, cancellation and recovery. Standalone store tests and fake child-result callbacks cannot replace that composition evidence.
 
 ### Full owner-goal acceptance ledger
 

@@ -19,13 +19,7 @@ const previewSession = {
 }
 
 /** Dev-only browser fixture for the real Agent page and V2 supervisor panel. */
-export function AgentSupervisorPreviewClient({ supervisorMode: initialSupervisorMode = false, locale }: { supervisorMode?: boolean; locale?: Lang }) {
-  // The server resolves the query for the initial render. During repeated
-  // dev navigations, a client hydration pass can briefly receive stale RSC
-  // props, so keep the explicit URL flag as a deterministic fallback.
-  const supervisorMode = initialSupervisorMode || (
-    typeof window !== 'undefined' && new URLSearchParams(window.location.search).get('supervisor') === '1'
-  )
+export function AgentSupervisorPreviewClient({ supervisorMode = false, locale }: { supervisorMode?: boolean; locale?: Lang }) {
   if (!supervisorMode) return <AgentPreviewClient />
 
   return (

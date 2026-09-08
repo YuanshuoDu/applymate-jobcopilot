@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest"
 
-import type { ModelAdapter, ModelStreamEvent } from "@jobcopilot/agent-model"
+import type { HarnessModelRequest, ModelAdapter, ModelStreamEvent } from "@jobcopilot/agent-model"
 import type { StepContext } from "../context/step-context-builder.js"
 
 import { runTurnExecutionLoop } from "./turn-execution-loop.js"
@@ -19,7 +19,7 @@ function identity(kind: TurnExecutionIdentity["kind"], taskId: string, attemptCo
   return { ...common, kind, attemptCount }
 }
 
-type Fixture = { options: TurnExecutionOptions; events: Array<{ id: string; type: string; itemId: string | null; taskId: string }>; items: TurnEngineItem[]; finalResponses: string[]; stepTasks: string[]; stepAttempts: number[] }
+type Fixture = { options: TurnExecutionOptions; events: Array<{ id: string; type: string; itemId: string | null; taskId: string }>; items: TurnEngineItem[]; finalResponses: string[]; stepTasks: string[]; stepAttempts: number[]; requests: HarnessModelRequest[] }
 
 function fixture(owner: TurnExecutionIdentity): Fixture {
   const events: Fixture["events"] = []
@@ -27,6 +27,7 @@ function fixture(owner: TurnExecutionIdentity): Fixture {
   const finalResponses: string[] = []
   const stepTasks: string[] = []
   const stepAttempts: number[] = []
+  const requests: HarnessModelRequest[] = []
   const revisions = new Map<string, number>()
   const store: TurnExecutionStore = {
     startStep: async ({ identity, stepId, attempt }) => { stepTasks.push(identity.taskId); stepAttempts.push(attempt); return { id: stepId } },
@@ -39,7 +40,8 @@ function fixture(owner: TurnExecutionIdentity): Fixture {
   let calls = 0
   const model: ModelAdapter = {
     id: "fixture-model", profile,
-    async *stream(): AsyncGenerator<ModelStreamEvent> {
+    async *stream(request: HarnessModelRequest): AsyncGenerator<ModelStreamEvent> {
+      requests.push(request)
       calls += 1
       if (calls === 1) {
         yield { type: "tool_call_completed", callId: `call:${owner.taskId}`, name: "jobs.search", arguments: { location: "Dublin" } }
@@ -53,7 +55,12 @@ function fixture(owner: TurnExecutionIdentity): Fixture {
   const contextBuilder: TurnExecutionOptions["contextBuilder"] = {
     build: async ({ identity, stepId, snapshot }): Promise<StepContext> => ({
       schemaVersion: "agent-harness.v2", sessionId: identity.sessionId, turnId: identity.turnId, stepId,
-      inputThroughSequence: BigInt(snapshot.toolObservations.length + 1), consumedInputIds: [], blocks: [], canonicalJson: "{}",
+      inputThroughSequence: BigInt(snapshot.toolObservations.length + 1), consumedInputIds: [],
+      blocks: snapshot.toolObservations.map(observation => ({
+        id: `observation:${observation.id}`, layer: "tool_observation", role: "data", trust: "external_untrusted",
+        source: "tool_or_subagent", content: observation.content,
+      })),
+      canonicalJson: JSON.stringify(snapshot.toolObservations),
     }),
   }
   const options: TurnExecutionOptions = {
@@ -62,7 +69,7 @@ function fixture(owner: TurnExecutionIdentity): Fixture {
     idFactory: prefix => prefix,
     subscribe: event => { events.push({ id: event.id, type: event.type, itemId: event.itemId, taskId: owner.taskId }) },
   }
-  return { options, events, items, finalResponses, stepTasks, stepAttempts }
+  return { options, events, items, finalResponses, stepTasks, stepAttempts, requests }
 }
 
 describe("owner-agnostic turn execution loop", () => {
@@ -74,6 +81,10 @@ describe("owner-agnostic turn execution loop", () => {
     expect(root.stepAttempts).toEqual([1, 1])
     expect(root.finalResponses).toHaveLength(1)
     expect(root.events.some(event => event.type === "turn.completed")).toBe(true)
+    expect(root.requests[1]?.messages).toEqual(expect.arrayContaining([
+      { role: "assistant", content: [{ type: "tool_use", id: "call:root-1", name: "jobs.search", input: { location: "Dublin" } }] },
+      { role: "tool", content: [{ type: "tool_result", toolUseId: "call:root-1", content: '{"job":"job-1"}' }] },
+    ]))
   })
 
   it("runs child work under its own task identity without root final persistence or completion", async () => {

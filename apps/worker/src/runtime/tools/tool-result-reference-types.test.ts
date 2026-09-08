@@ -1,23 +1,37 @@
-import { describe, expect, it } from "vitest"
+import { Value } from "@sinclair/typebox/value"
+import { describe, expect, it, vi } from "vitest"
 
-import {
-  MAX_TOOL_RESULT_BYTES, MAX_TOOL_RESULT_READ_BYTES,
-  type ToolResultChunk, type ToolResultReadInput, type ToolResultReferenceRecord,
-} from "./tool-result-reference-types.js"
+import type { ExecutionOwner } from "../execution-owner.js"
+import type { ToolExecutionContext } from "./types.js"
+import { createToolResultsReadTool } from "./tool-results-read-tool.js"
+import type { ToolResultChunk, ToolResultReferenceRepository } from "./tool-result-reference-types.js"
 
-describe("tool result reference contracts", () => {
-  it("represents a resumable private chunk without exposing storage-only fields", () => {
-    const input: ToolResultReadInput = { referenceId: "ref-1", cursor: "4096" }
-    const chunk: ToolResultChunk = { ref: input.referenceId, sha256: "a".repeat(64), byteCount: 8192, chunk: "x".repeat(4096), nextCursor: "8192" }
-    const record: Pick<ToolResultReferenceRecord, "id" | "sha256" | "byteCount"> = { id: chunk.ref, sha256: chunk.sha256, byteCount: chunk.byteCount }
+const owner = {
+  kind: "turn" as const,
+  taskId: "root-1",
+  lease: {
+    turnId: "turn-1", sessionId: "session-1", ownerId: "worker-1", userId: "user-1", leaseVersion: 1,
+    leaseStartedAt: new Date("2026-09-08T02:59:00Z"), leaseExpiresAt: new Date("2099-01-01T00:00:00Z"),
+  },
+} satisfies ExecutionOwner
 
-    expect(chunk.nextCursor).toBe(String(chunk.byteCount))
-    expect(record).toEqual({ id: "ref-1", sha256: "a".repeat(64), byteCount: 8192 })
-    expect("sanitizedJson" in chunk).toBe(false)
-  })
+const context: ToolExecutionContext = {
+  scope: { userId: "user-1" }, sessionId: "session-1", turnId: "turn-1", stepId: "step-1", taskId: "root-1",
+  signal: new AbortController().signal, capabilities: ["read"], reportProgress: vi.fn(async () => undefined),
+}
 
-  it("keeps each read chunk budget below the retained result budget", () => {
-    expect(MAX_TOOL_RESULT_READ_BYTES).toBeLessThan(MAX_TOOL_RESULT_BYTES)
-    expect(MAX_TOOL_RESULT_READ_BYTES).toBe(4096)
+describe("tool result reference runtime contract", () => {
+  it("keeps the declared chunk type aligned with the registered read schema", async () => {
+    const chunk: ToolResultChunk = { ref: "ref-1", sha256: "a".repeat(64), byteCount: 16, chunk: '{"ok":true}', nextCursor: null }
+    const repository: ToolResultReferenceRepository = { put: vi.fn(), read: vi.fn(async () => chunk) }
+    const resolveOwner = vi.fn(() => owner)
+    const tool = createToolResultsReadTool(repository, resolveOwner)
+
+    const result = await tool.execute(context, { referenceId: "ref-1" })
+
+    expect(Value.Check(tool.outputSchema, result)).toBe(true)
+    expect(result).toEqual(chunk)
+    expect(resolveOwner).toHaveBeenCalledWith(context)
+    expect(repository.read).toHaveBeenCalledWith(owner, { referenceId: "ref-1" })
   })
 })
