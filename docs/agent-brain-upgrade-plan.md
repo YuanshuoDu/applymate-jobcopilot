@@ -1,0 +1,474 @@
+# ApplyMate Agent Harness：从可执行对话到可监督的任务系统
+
+版本：2026-09-08。性质：后续架构与实施计划，尚未实现的能力均为规划。
+
+本计划服务于用户提出的完整目标：Agent 栏目具有长期 session、规划、任务拆分、worker 调度、工具与权限、暂停/恢复、失败重试、状态持久化、事件流、人工审批和可靠结果闭环。它补充现有 V2 roadmap 与 `docs/agent-brain-integration.md`，不另起 Agent V3，也不把一个 PR 的完成等同于整个目标完成。
+
+## 1. 核心判断与当前基线
+
+下一步优先级是：**先让现有 V2 真正驱动执行，再让模型在这条可靠执行链上规划、委派、调整和验证。**
+
+所谓“大脑”应表现为以下可观察能力，而不是一个更长的 system prompt：
+
+1. 将自然语言目标整理成约束、成功条件、已知事实和待解决问题。
+2. 选择直接处理、调用工具、委派或请求必要信息。
+3. 持续维护计划，根据新证据修改后续工作。
+4. 为子任务提供必要上下文、权限和预算，并收回可验证结果。
+5. 跨轮次、刷新和重启保留工作状态；恢复时不重复已完成动作。
+6. 区分完成、部分完成、失败、等待与外部结果不确定。
+7. 用任务、事实、材料和执行回执支持最终结论。
+
+### 1.1 当前证据，不沿用附件中的旧完成度
+
+开发基线为 `e484bd5cb1a8982c0c0ba3aa3af1eb4442588438`，当前集成位于 `codex/ah2-495-agent-brain-supervisor`、Issue #495、草稿 PR #497。附件主要参考 #487 前后的状态，不能直接作为当前完成清单。
+
+| 模块 | 当前可以确认的进展 | 仍欠缺的证明或实现 |
+| --- | --- | --- |
+| V2 根任务入口 | 消息与 dispatch outbox 原子写入；Worker 注册 canonical consumer/recovery；真实配置的 ModelAdapter 与 ToolRouter 已组合 | 实际 PostgreSQL 与进程重启证明；完整领域能力接入 |
+| 模型与用量 | 根执行的可信配置、账户额度准入、幂等结算已有实现与测试 | 子 Task owner/attempt 的准入与整树预算共享 |
+| 根/子执行循环 | owner-neutral loop 已提取；测试覆盖子任务身份与后续模型观察 | 真实 child store/executor 与生产启动组合尚未接通 |
+| 结果存储与等待 | 私有工具结果、wait 的两个附加模型及迁移源码已准备 | 生命周期绑定、真实数据库/RLS、持久化等待与唤醒闭环 |
+| Supervisor UI | 共享 timeline、任务树、证据选择、分页已加入；生产构建的桌面/手机中英文 fixture 4/4 通过 | 已登录环境、真实子任务和审批恢复的联调 |
+| CI | `d710a9d` 的主要 CI 曾通过；`2f8c9ce` 暴露新增测试的 TypeScript 错误 | 一行 fixture 类型修复已由 Luna 完成，针对性 2/2 与 Worker build 通过；修复后新 head CI 仍需确认 |
+| 上线 | PR 仍为 draft | 未合并、未部署、未应用迁移；未宣称生产已具备完整能力 |
+
+测试、类型检查、浏览器 fixture、真实数据库、真实模型和生产运行分别记录，不能互相替代。上述代码进展来自本任务已有调查和验证，本次规划不重复进行全仓审计。
+
+### 1.2 对附件建议的五处调整
+
+- 接受“模型提出语义行动，runtime 执行控制规则”的核心原则。
+- 原生协调工具必须在真实 child executor、wait store 和预算围栏完成后启用；不能先向模型公布未接通的工具。
+- 先完成父子任务和持久化 join，再引入一般 DAG。当前最缺的是执行接线，不是更多协议类型。
+- 保留 Pipeline 的领域业务能力，逐个迁入受控工具或模板；经过回归和切流后再退出旧调度入口。
+- 不承诺所有第三方提交具有严格 exactly-once。内部用原子状态、幂等和 fencing；支持幂等键的第三方使用它；无幂等接口的超时提交进入核实流程，不能盲目重试。
+
+## 2. 目标架构与边界
+
+```mermaid
+flowchart TD
+  U[Agent 工作台] --> C[已认证命令与目标修订]
+  C --> O[PostgreSQL 状态与 Outbox]
+  O --> S[调度、依赖、租约与预算]
+  S --> E[统一根/子执行循环]
+  X[上下文投影与证据记忆] --> E
+  E --> M[现有 ModelAdapter 与配置]
+  M --> P[结构化计划或行动提议]
+  P --> V[运行时校验]
+  V --> T[ToolRouter 与 PolicyEngine]
+  T --> A[需要时等待人工批准]
+  A --> T
+  T --> R[结果、材料、回执]
+  R --> O
+  R --> X
+  V --> S
+  O --> F[验证与结果归并]
+  F --> U
+  O --> D[可重放事件流]
+  D --> U
+```
+
+| 层 | 拥有的职责 | 不应拥有的权力 |
+| --- | --- | --- |
+| 模型/Planner | 理解目标、提出计划、选择能力、解释取舍、建议重新规划 | 自行批准操作、改身份、改预算上限、宣告数据库完成 |
+| Runtime | 状态转换、校验、调度、租约、预算、重试、完成判定 | 凭空补充用户职业事实或替代用户作敏感授权 |
+| Tool/Policy | schema、资源范围、权限、审批、执行和回执 | 绕过当前 owner 或信任模型传入的 userId |
+| Context | 选择相关事实、历史和证据，控制上下文大小 | 将外部网页指令提升为系统指令，将摘要当作原始事实 |
+| Web | 接收命令、呈现执行、审批和材料 review | 在浏览器运行平台密钥，承担长期执行循环 |
+| Worker | 执行模型与工具循环、恢复未完成工作 | 成为唯一持有状态的地方 |
+| PostgreSQL / Redis | PG 保存权威状态；Redis/BullMQ 分发与加速 | 让消息队列投递成功代替任务执行成功 |
+
+暂不新增 `packages/agent-runtime`。首先在 `apps/worker/src/runtime` 内形成清晰接口；只有第二个真实运行宿主需要复用，且边界已经稳定时，才抽取纯状态机/调度算法。Web 不因此加载 Worker 执行器或 provider 凭据。
+
+## 3. 不可破坏的执行契约
+
+### 3.1 统一身份、独立所有权
+
+- 一个根 Turn 内运行多个子 Task，不制造新的 child Turn，不伪造根 TurnLease。
+- 根执行由当前 Turn owner/version/expiry 校验；子执行由实际 Task owner/attempt/expiry 校验。
+- 任意写入还必须匹配 user、session、turn、task，且根任务未终止。
+- 子任务结果不能修改根 finalResponse、根 activeStep 或发出根完成事件。
+- 根任务 queued/waiting 期间，其他仍持有有效租约的子任务可以继续；根取消或终止会撤销这种资格。
+- Step/Item 写入真实 taskId，序号在 Turn 锁内分配，不能用并发进程内计数器。
+- 根历史读取保留旧 taskId=null 的兼容行，排除子任务私有行；子结果经过明确 join/message 才进入根上下文。
+
+### 3.2 一次模型循环
+
+```text
+校验当前 owner 与中断状态
+→ 读取当前目标修订、已认领输入、上下文快照
+→ 检查整树剩余额度与上下文上限
+→ 持久化 Step / 获取本次 provider 准入
+→ 模型提出 typed action
+→ schema 与 runtime 校验
+→ 工具策略、必要审批、执行
+→ 持久化 observation / receipt / items / usage
+→ 再次检查取消、租约与目标修订
+→ 继续、持久化等待，或提交待验证的完成提议
+```
+
+模型输出无效时，在同一步骤的已记录尝试内做有限修复；仍无效则显式失败。不得默认为 proceed。允许的模型 fallback 仍需能力匹配和独立用量准入；不可逆操作开始后不因解析问题换模型重做操作。
+
+### 3.3 等待与恢复
+
+沿用已设计的两阶段交接：先登记 wait，不释放租约；工具回执、items 和 step 持久化后，才执行 fenced suspension transaction。
+
+| 时序 | 必须产生的行为 |
+| --- | --- |
+| 子任务先完成，父任务尚未登记 wait | 登记时读取已有结果，不丢失完成 |
+| wait 已登记，父任务尚未 suspend | resolver 可标记 ready，不抢走父 lease，不提前派发 |
+| 父任务 suspend 时结果已 ready | 同一事务释放 ownership、置为可调度并写 outbox |
+| 父任务已经等待，结果随后到达 | 对 suspended 且未 consumed 的 wait 原子唤醒 |
+| 重复通知、重复 scanner | 不重复创建父执行或消费结果 |
+| 父任务恢复 | 在新租约下消费 wait outcome 一次，随后进入下一模型步骤 |
+
+wait 的 outcome 与 `suspendedAt`、`consumedAt` 分别表达结果和交接状态。queue driver 识别已持久化的交接回执，不能再用普通 release 覆盖已 queued 的父任务。
+
+### 3.4 停止、重试与完成
+
+- `agent.interrupt(child)` 仅影响该子树；用户 Stop 根任务才传播至整树。
+- Stop 同时作用于 durable state、模型 AbortSignal、浏览器操作和可取消工具；中断中的外部写入按回执核实，不能虚报取消成功。
+- 重试保留 Task 身份、attempt 和累计用量。只读瞬时失败可有限重试；权限、预算、schema 持续无效、未知外部结果不能无限重试。
+- 进程退出释放执行权以待恢复，不等同用户取消。
+- 根 final 必须经过完成检查：没有仍需运行的子任务、没有未处理审批/问题、成功条件满足、关键回执存在。模型的 final 文本本身不是完成凭据。
+
+## 4. 以工作切片推进，而不是一次重写
+
+下表编号是规划中的工作包，不是已经创建的 GitHub Issue/PR。先在 #495/#497 内完成当前验收；之后按单个主分支、单个活动 Issue 的项目流程逐项交付。
+
+| 阶段 | 可交付结果 | 依赖 | 主要验收 |
+| --- | --- | --- | --- |
+| P0 当前收尾 | 修复 CI、冻结已验证基线与欠缺清单 | 无 | 最新提交 CI；草稿边界准确 |
+| P1 真实执行基础 | owner-bound 存储、私有结果、真实 child executor | P0 | 两个真实子任务各自运行模型/工具，不污染根 |
+| P2 持久化监督 | 原生协调、等待、恢复、取消、预算与并发 | P1 | spawn → wait → child result → parent resume 跨重启通过 |
+| P3 动态计划 | 可验证计划、依赖、重规划、模板选择 | P2 | 同一工具集合根据不同目标产生不同合法执行路径 |
+| P4 领域能力迁移 | 搜索/分析/写作/审查/申请通过受控能力执行 | P2；与 P3 联调 | 旧功能回归；不可绕过审批和 provider 准入 |
+| P5 长期上下文 | 证据保留的压缩、恢复、可纠正记忆 | P1；P3 提供目标语义 | 长会话压缩和重启后约束、待办、引用完整 |
+| P6 完整工作台 | 实时监督、steer、任务操作、审批与材料版本 | 对应后端能力完成后逐项启用 | 已登录环境端到端，双语和移动端 |
+| P7 验证与发布 | Verifier/Reducer、评测、故障注入、渐进开放 | P1–P6 | 独立数据库/Worker/模型/浏览器证据与发布门槛 |
+
+P4 的副作用防绕过检查从第一项领域工具迁入时开始，不能留到最后才检查。P7 的故障测试也随相应阶段建立，最终阶段负责完整组合验收。
+
+## 5. P1–P2：先得到一个真的能带队执行的根 Agent
+
+### 工作包 1A：根/子持久化所有权
+
+现有入口：`apps/worker/src/runtime/execution-owner.ts`、`turns/turn-engine-store.ts`、`turns/turn-execution-*.ts`、`subagents/pg-store.ts`、`subagents/root-task-store.ts`。
+
+具体工作：
+
+- 绑定 root/child store adapter；每次 step、item、event 和结果写入均执行真实 owner 检查。
+- 在数据库内分配 Turn 全局序号，保留 child 的逻辑 step/attempt 身份。
+- 修正 root history、预算恢复和 context rebuild 的查询范围。
+- 把根终结权限与子结果落库分开，禁止 child adapter 调用根终结。
+
+数据库策略：优先复用现有表与字段。需要额外索引或约束时附查询证据，采用附加迁移；不重置历史 Turn，不改变现有 source 枚举绕过限制。
+
+验收：并发两个 child 的序号不冲突；过期 owner 写入被拒绝；新 attempt 接管后旧结果不可提交；根恢复排除 child 私有观察；不同用户/session 不可互读。
+
+### 工作包 1B：私有工具结果真正接入
+
+现有入口：`tools/tool-result-reference-repo.ts`、`tool-result-reference-types.ts`、`tool-results-read-tool.ts`，以及本分支已准备的 `20260908030000_add_agent_tool_result_references` 迁移。
+
+具体工作：
+
+- 替换 lifecycle 中大结果的进程内引用，使用已清理、可校验的 durable JSON。
+- 引用绑定 task/step/toolCall 身份；相同操作重复写入必须返回同一结果，冲突内容不能静默覆盖。
+- 在真实 registry 中启用有权限校验的分块读取工具。
+- 保持当前设计上限：单结果 canonical JSON 1 MiB；读取响应最多 4,096 bytes；超限显式报错，不悄悄丢证据。
+- 根可按权限读取同一用户/session 的既往结果；子任务仅能读取当前任务及允许的后代，不能读取兄弟私有结果。
+
+验收：保存后销毁执行器，再创建新执行器仍可读取；跨 owner/用户/session 和伪造引用拒绝；JSONB 往返后 hash/大小验证一致；Unicode 分块不损坏。
+
+### 工作包 1C：真实子执行器与账户预算
+
+现有入口：`subagents/executor.ts`、`subagents/manager.ts`、`subagents/role-profiles.ts`、`subagents/role-policy.ts`、`turns/turn-execution-loop.ts` 与已接入的 Web internal usage broker。
+
+具体工作：
+
+- 子任务认领真实 Task lease，加载冻结的目标、policy/model/context/budget snapshot。
+- 调用与根相同的模型/工具循环，向本 Task 写入结果。
+- 将账户准入从仅根 Turn fence 扩展到 child owner/attempt fence。
+- 整树预算从同一账本预留、结算；创建子任务不复制一份可独立花完的根额度。
+- provider 已被调用但结果/结算未知时保留 reservation，不能重试出第二次免费或重复调用。
+
+验收：两个子任务分别完成真实工具观察循环；根等待期间 child 仍可被准入；并发预留总额不越界；retry 不清零累计用量；子任务不能扩大工具范围或更换其他用户凭据。
+
+### 工作包 2A：持久化 wait、唤醒与恢复
+
+现有入口：`tools/coordination-types.ts`、`coordination-executors.ts`、subagent store/queue/recovery 和已准备的 AgentWaitCondition。建议新增实现位于 `apps/worker/src/runtime/subagents/`，最终文件由 Luna 按单一职责拆分。
+
+具体工作：按第 3.3 节实现 register → receipt → suspend → resolve → outbox → consume；scanner 用持久化状态补偿中断；wait 只接受授权范围内、无自依赖/循环的有限目标集合。
+
+验收：两个 read child 的真实组合；all/any；早完成；重复唤醒；失败 child；超时；停止；父/子 lease loss；suspend 前后进程退出；恢复不重跑已完成 tool。
+
+### 工作包 2B：原生协调工具与容量控制
+
+现有入口：`tools/coordination-tools.ts`、`coordination-executors.ts`、`subagents/limiter.ts`、manager、mailbox、production bootstrap。沿用现有协议标识；以下名称表达目标语义，若已有等价名称则不重复新增。
+
+| 工具语义 | 返回与边界 |
+| --- | --- |
+| `agent.spawn` | 返回 durable taskId/path/status；校验模板、上下文、深度、预算、权限和幂等键 |
+| `agent.send` | 给运行任务投递持久化 steering；只在安全边界消费，不伪装为中途已执行 |
+| `agent.followup` | 对终态任务创建新的可追溯工作修订；保留旧结果，不把完成过的外部操作自动重跑 |
+| `agent.wait` | all/any、目标集合、期限；通过 durable handoff 释放容量 |
+| `agent.interrupt` | 当前子树中断；未核实的外部结果保持 uncertain |
+| `agent.list` | 有范围和分页的实际状态、剩余容量与结果引用 |
+
+初始产品参数建议：同 session 同时最多 2 个执行中的 child、深度最多 2、单轮最多创建 8 个 child；通过并发/预算测试后再评估放宽至 4。模型额度、浏览器容量和 external-write lock 分开计算，用户级限额之外还要有全局限额与公平排队。等待中的任务不占执行 slot。具体时间、token、费用上限从现有套餐与运行配置读取，禁止在 prompt 中代替硬限制。
+
+这组产品运行参数与开发协作分开：本次开发始终最多一个 Luna worker，不能因为产品支持并发就启动多个开发子智能体。
+
+退出 P2 的最小演示：根提出两个搜索任务，两个真实 child 使用各自上下文和工具运行；根持久化等待并释放容量；重启 Worker；两份结果回到根；根引用证据给出结果一次。UI 中看到的状态必须来自这条链路。
+
+## 6. P3：让 Agent 会规划、分工和修正
+
+### 6.1 目标契约与计划提议
+
+建议建立以下逻辑契约，先映射现有 typed item/task/snapshot，不能直接据此新增同名数据表：
+
+```text
+GoalContract
+  objective / revision
+  constraints[] / successCriteria[]
+  knownFacts[] / unresolvedQuestions[]
+  approvalBoundaries[] / budgetRef
+
+PlanProposal
+  basedOnGoalRevision / basedOnPlanRevision
+  nodes[{ localId, templateOrTool, objective, inputRefs,
+          dependsOn, successCriteria, outputSchemaRef, budgetRequest }]
+  completionCriteria / briefRationale
+
+TaskResult
+  taskId / attempt / goalRevision
+  outcome / evidenceRefs / artifactRefs
+  verifiedFacts / conflicts / failures / nextOptions
+```
+
+模型只提供提议；身份、实际 taskId、权限、可花预算和实际状态由 runtime 填充。
+
+首次目标解析要区分必须询问与可自主决定的内容。例如“20 个 Dublin/remote Java 职位”可自主拆分搜索；工作许可、签证状态、薪资底线或最终提交授权缺失时不能代填。小型任务直接执行，不强制为每次问答建立复杂计划。
+
+### 6.2 计划校验与有限依赖图
+
+第一版支持明确的前置依赖、all/any join、失败处理策略以及人工审批屏障。任务树表达谁委派谁，dependency 表达谁等待谁，两者分开校验。
+
+运行时检查：引用存在、同租户/session、无循环、规模有界、工具与模板存在、输出可满足下游输入、预算合法、审批边界未被绕过。
+
+父子等待使用已实现的 wait 机制。若跨父任务依赖确实需要持久化 edge，才准备最小附加结构；不得仅把 dependsOn 放进模型 JSON 后靠内存调度。
+
+### 6.3 重新规划
+
+触发来自具体事实：结果不足、证据矛盾、某来源失败、用户变更约束、审批拒绝或预算缩小。用 progress signature 防止同一失败反复产生同一计划。
+
+- 新计划绑定旧 revision，compare-and-swap 接受；过时提议拒绝。
+- 已完成节点和外部回执不可改写；新工作引用旧结果。
+- 只替换受影响的未开始工作；对运行中的任务发送明确 steering 或停止。
+- 约束改变后，旧结果可保留为历史，但不能继续标记为满足新目标。
+- 无进展重试达到硬上限后，进入 blocked/需要输入，而不是不停“反思”。
+
+示例：“只考虑 Dublin”改成“只考虑 Ireland remote”，只使地点筛选、评分和受影响材料失效；不必重新抓取仍然有效的全部 JD。签证信息冲突时先做证据核查，不扩大无关搜索。
+
+### 6.4 模板迁移
+
+复用 `subagents/role-profiles.ts`、role contracts/handlers 和现有 Scout/Analyst/Writer/Reviewer/Executor/Auditor 业务实现。模板包含描述、输入/输出 schema、允许工具、上下文选择、能力要求、成功条件和预算默认值。
+
+CustomAgent 逐步迁出 `insertAfter` 的固定插入模式；旧配置通过兼容模板映射，不能删除用户已保存配置。自定义 prompt 可以提供专业方法，不能修改用户身份、审批或预算规则。
+
+验收：同样工具下，“解释一个 JD”“比较三家公司”“准备五份申请材料”采用不同规模和依赖的计划；额外派 Agent 必须由独立任务收益支持。伪造工具、循环依赖、越权输入、重复 spawn、过时 revision 和提前 final 都被拒绝。
+
+## 7. P4：把已有求职能力变成大脑的可调用能力
+
+迁移入口包括 `apps/web/src/lib/agent/pipeline.ts`、`orchestrator.ts`、`stages/`，Worker 的 role handlers 与现有 typed tool registry；不要另造一份求职业务逻辑。
+
+建议先接入 read 工具：职位发现、JD 获取、用户已验证资料检索、职位事实/匹配解释；再接可恢复的材料草稿；最后接审批后的上传、发送与申请执行。
+
+每个领域能力的交付同时回答四件事：输入来自哪里、模型如何准入、权限在哪里执行、输出凭什么判定成功。
+
+- 所有 Harness 模型调用逐步迁入已有 `packages/agent-model`，保留 capability-aware 选择、取消、usage 与 continuation；不硬编码具体模型名做修复。
+- 旧 `modelChat()` 调用仅在迁移过渡边界保留并可观测；新 Harness 路径不得直接调用它绕过准入。
+- “准备材料”产出不可变版本与来源引用；业务方法成功返回不等于“已申请”。
+- 逐条核对所有 upload/send/submit/update 路径都经过 ToolRouter/Policy、当前权限与必要的 reservation/approval/receipt。
+- 旧 Pipeline 可先作为受控模板编排，以保持行为兼容；动态计划逐步接管已验收能力。禁止一次性删除旧路径后再补业务回归。
+
+副作用状态至少在语义上区分 prepared、awaiting approval、reserved、executing、succeeded、failed、uncertain；优先映射现有 schema。执行前核对 resource/material/answers hash、revision、expiry 与 nonce；用户改材料后旧授权失效。
+
+对没有幂等接口的 ATS：执行前落库意图，执行后落回执；如果在外部成功与本地回执之间崩溃，必须查询外部证据或进入人工核实，不能自动重新提交。目标是避免重复和虚假成功，并准确表达未知结果。
+
+## 8. P5：长期上下文与可纠正记忆
+
+现有入口：`apps/worker/src/runtime/context/step-context-builder.ts`、`context-snapshot-*.ts`，配合私有结果引用、已有 facts 与 artifact store。
+
+### 8.1 分层上下文
+
+| 层 | 内容 | 规则 |
+| --- | --- | --- |
+| 固定约束 | 当前用户要求、权限、执行限制 | 不因压缩或子模型建议而丢失 |
+| 当前任务 | goal/plan revision、成功条件、依赖、待办 | 必须与实际状态一致 |
+| 已验证事实 | 有来源的职业经历、技能、职位事实 | 事实与推断分开；保留版本和来源 |
+| 当前证据 | 有关工具结果、材料、子任务返回 | 用引用和有界摘录，保留原始证据 |
+| 近期交互 | 当前行动相关的用户输入和回复 | 优先保留 steering 与未回答问题 |
+| 历史摘要 | 决策、已完成、失败、遗漏范围 | 有覆盖范围和 checksum，可重建 |
+
+Child 默认只接收 task contract、必要事实与引用、允许工具和限制。完整聊天复制是有理由才采用的例外。
+
+### 8.2 压缩协议
+
+采用所选模型的可用 context window，预留输出和工具结果空间；在 runtime 达到预算阈值时触发，不依赖模型自己察觉。阈值为配置，需用真实 token accounting 校准。
+
+压缩产物至少包括 activeGoals、constraints、decisions、unresolvedQuestions、verifiedFacts、taskRefs、artifactRefs、eventRefs、omittedRanges 和 covered sequence。安装快照使用明确源 revision/sequence；压缩期间到达的新输入随后补入，不能被覆盖。
+
+摘要通过引用存在性、未完成任务、审批和用户约束保留检查后才安装。失败时沿用旧有效快照或显式缩小可选上下文；不能用损坏摘要替换历史。原始事件保持不可变。
+
+### 8.3 记忆不是自动把所有文本变成事实
+
+区分 session memory 与长期候选人事实。长期事实记录来源、确认程度、更新时间和纠正/删除状态；用户明确改正应优先于旧摘要。签证、工作授权和经历内容不能从模型猜测升级为已验证事实。网页、JD、邮件及工具输出保持 untrusted data 标签。
+
+第一版先用既有结构化事实与按范围检索，不因为“记忆”二字就引入向量数据库。只有固定评测证明检索不足时再增加检索能力。
+
+验收：长会话强制压缩、多次压缩、模型切换、Worker 重启、session fork 后均保留目标与待审批项；材料引用可解析；事实纠正生效；不同用户的数据和记忆完全隔离；fork 不复制可消费的授权或外部 reservation。
+
+## 9. P6：用户能看懂、能干预的 Supervisor
+
+现有入口：`apps/web/src/components/pages/AgentPlaygroundPage.tsx`、`components/agent-workspace/v2/AgentSupervisorPanel.tsx`、共享 timeline 与 `e2e/agent-supervisor.spec.ts`。
+
+桌面维持 sessions / 主对话 / tasks 三栏。移动端用抽屉或分区切换，保证输入、待批准事项和停止操作可访问。
+
+| 用户需求 | 必须连接的真实行为 |
+| --- | --- |
+| 看它在做什么 | 当前目标/plan revision、执行中任务、等待原因、已完成数量与 evidence |
+| 查看子任务 | goal、输入引用、状态、模型配置摘要、权限、预算、messages、结果和错误 |
+| 中途补充要求 | steer 命令持久化、显示已接收/待消费/已应用，不把发出当作已应用 |
+| 停止一个任务 | scoped subtree interrupt，不误停兄弟任务 |
+| 稍后继续 | durable pause/wait/resume，刷新后状态不丢失 |
+| 重试或继续修改 | 展示允许重试的原因与 attempt；follow-up 保留旧结果与版本 |
+| 审批 | 当前材料/答案版本、变化、作用范围、批准或拒绝后真实恢复 |
+| 看材料 | 每个职位独立 Application Workspace，版本/来源/审查状态明确 |
+| 看成本 | 已知用量、预留量、预算余量及未结算状态；未知值不显示成零 |
+
+显示简短、可核对的行动理由和决策记录，例如“公司页面未明确签证支持，正在核查”；不设计依赖 provider 私有思维链的功能，也不制造虚假的 thinking 动画证明执行。
+
+只启用已经有真实命令处理器的按钮。状态来自同一共享订阅；生命周期事件触发合并刷新，不在每个 token 上反复请求全部任务。切 session 时取消旧请求、丢弃旧事件与选中项。
+
+材料版本以 job/workspace 隔离：并行 Writer 写各自 draft，Reviewer 审查固定版本；Executor 只能消费当前授权匹配的不可变版本。共享候选人事实的修改应显式版本化，不能让一个职位的 tailoring 改掉全局履历。
+
+## 10. P7：Verifier、Reducer 和能力评测
+
+复用已有 `subagents/partial-failure-reducer.ts`、`aggregation.ts`、`role-results.ts`、auditor/reviewer 契约；先界定职责，不新造同名层。
+
+Verifier 先做确定性检查：成功条件、schema、引用、版本、任务状态、必需回执、审批有效性。需要事实质量判断时再调用模型，输出引用与置信度；不能只让同一段生成文本“自评通过”。
+
+Reducer 从 TaskResults、ToolReceipts、Artifacts、VerifiedFacts、Failures、PendingApprovals 汇总。数量从数据库或结构化结果计算，模型负责说明意义和下一步；每个关键数字可点回证据。
+
+### 10.1 验收场景
+
+以下是必须建立的测试集合，不是当前已经全部通过的声明：
+
+| 类别 | 关键场景 |
+| --- | --- |
+| 会话 | 新消息 dispatch、重复命令、reload、跨轮次恢复、session 切换隔离 |
+| 子任务 | 两 child 真执行、不同上下文、深度/并发上限、目标结果 schema 错误 |
+| 等待 | 早完成、all/any、重复 wakeup、timeout、parent suspend 两侧崩溃 |
+| 所有权 | lease loss、late worker、attempt 接管、根取消、仅中断一个子树 |
+| 计划 | DAG cycle、未授权工具、过时 revision、用户改要求、无进展循环 |
+| 预算 | 并发预留、provider 超时、重复结算、BYOK/platform 区分、retry 不重置 |
+| 上下文 | overflow、压缩失败、未决审批保留、引用失效、事实纠正、外部提示注入 |
+| 审批/提交 | 拒绝、过期、材料改变、重复批准、外部结果未知、禁止盲目重复提交 |
+| UI | 中英文、桌面/手机、共享订阅、重连、选中任务证据、错误与等待可解释 |
+| 回归 | Jobs、Resume、Settings、Extension assisted fill、旧 automation 与用户隔离 |
+
+### 10.2 证据层级与拟定指标
+
+1. 单元与组件测试：纯函数、schema、policy、projection 和事务边界。
+2. 真实本地/隔离 PostgreSQL、Redis、Worker 集成：RLS、并发、outbox 和重启。
+3. 浏览器 fixture：布局与交互，API 用固定数据。
+4. 已登录 staging：真实命令到 Worker 到 UI 的组合链路。
+5. 有预算限制的真实 provider 评测：检验实际计划质量与工具使用，不自动做真实申请。
+6. 单独明确授权的外部提交核实：与普通开发测试分开记录。
+
+拟定发布门槛：确定性身份/审批/重复执行用例全部通过；核心组合链路没有缺失 consumer/依赖；固定评测集的完成质量不低于旧流程，且成本/延迟可解释。建议先整理 20 个代表性目标作为回归样本，扩充后再设置统计比例门槛，不宣称已有成功率。
+
+记录每个成功任务的模型调用数、输入/输出 tokens、已知费用、工具数、elapsed time、等待恢复时间、重试数和人工介入次数。按有用结果比较成本，不按“启动多少 Agent”评价聪明程度。
+
+## 11. 省额度的工程与产品策略
+
+### 开发协作
+
+- Astra 负责理解、架构、拆分、风险和最终 Review；读代码、实现、debug、类型修复、测试交给显式 Luna xhigh。
+- 同时最多一个 Luna；复用当前 worker，但新任务给精简上下文与准确路径，不复制全部历史。
+- 每项任务一次完成实现和针对性测试；Astra 仅根据具体发现返修。
+- 改测试代码也要运行受影响 package 的类型/build 检查，避免 Vitest 只转译通过却在 CI 编译失败。
+- 日常只跑相关验证；接口/全局配置变化、阶段集成和发布前才扩大检查范围。
+- 不因额度不足改用其他子智能体模型，不自动兑换额度重置；保存可恢复的已知状态。
+
+### 产品运行
+
+- 简单问题直接回答，纯计算用代码，独立且有收益的任务才 spawn。
+- 使用已配置模型的能力与预算要求；不把 Codex UI 中的模型标签硬编码为公开 API model ID。
+- 根模型承担语义规划和归并，子任务采用满足能力的已配置模型；不新加 provider。
+- 先批量检索和确定性去重，再对有价值候选做深度分析和材料生成。
+- Child selective context，工具大结果用引用，缓存绑定内容/版本/权限与必要 TTL。
+- 同一目标修订下可复用仍有效的结果；隐私上下文和授权不得跨租户共享缓存。
+- 预算为硬限制。UI 明确展示为什么等待或停止，不能用便宜但不具备必要能力的模型偷偷降级。
+
+## 12. 可直接派给 Luna 的任务模板
+
+每个工作包在派发前由 Astra 给出冻结的文件清单。目录只用于规划定位，不能让 worker 自由扩展修改范围。
+
+```text
+Objective:
+Implement [one work package] against the current primary branch and contract.
+
+Model and ownership:
+Use Luna xhigh only. Do not spawn other agents. Astra owns architecture,
+integration, GitHub delivery and final review.
+
+Allowed paths:
+[exact existing files and explicitly approved new modules/tests]
+
+Required behavior:
+[observable input -> durable transition -> result]
+[owner/tenant/budget/approval invariants]
+
+Forbidden actions:
+No unrelated refactor, dependency/provider addition, public model-ID guess,
+production migration, deployment, real provider call or employer submission.
+No commit, push, PR creation, merge or external message.
+
+Verification:
+[focused tests] + [affected package type/build check]
+Use real composition for integration AC; deterministic providers in tests.
+
+Return:
+Changed files; behavior; exact checks; limitations; review risks.
+If a contract is missing, report the concrete dependency before editing
+outside the allowed paths. Do not create a fake working implementation.
+```
+
+第一项实际开发任务是 1A：真实 step/item owner 与根历史范围。之后 1B、1C、2A、2B 按依赖串行完成；不要把“再画任务树”排在前面。
+
+## 13. 渐进发布与最终场景
+
+每项能力有 server-side enable gate，默认只对受控测试环境启用；复用现有配置体系，具体 flag 名在实现时冻结。只有真实 executor/wait/budget store 全部可用，startup 才将对应协调能力注册为可用。
+
+发布顺序：read-only 根/子执行 → 材料草稿 → 审查与人工批准 → 可核实的受控外部动作。配套迁移先做隔离数据库演练、RLS 验证和恢复方案；数据库迁移与部署仍是单独的操作边界。
+
+回滚策略是阻止新受影响工作并保留 durable state，由兼容版本恢复；不在运行中将同一个外部动作移交旧 Pipeline 重跑。对于 active tasks，要证明前后版本可读其状态，或者先安全排空。
+
+最终示范目标：
+
+> 找适合我的 Dublin / Ireland remote Java 后端岗位，优先有明确签证支持信息的；高匹配岗位准备简历与 cover letter，申请前让我确认。
+
+必须观察到：目标与未决问题被记录；搜索按合法来源并行；缺失签证信息被标为未知并定向核查；去重和分析后选择值得生成材料的岗位；Reviewer 驳回时 Writer 收到限定修改任务；用户改变一个材料版本后其批准失效；其余获准工作继续；中途刷新和 Worker 重启可恢复；未知提交结果进入核实；最后的职位数量、材料数量、提交状态与未完成项都能追溯。
+
+完整目标只有在上述组合场景和第 10 节的关键失败场景通过后才能标为完成。能聊天、能显示任务树或单个子任务测试通过，均不构成完整验收。
+
+## 14. 参考依据与适用范围
+
+- 当前仓库实施依据：`docs/agent-brain-integration.md`、现有 V2 roadmap、Issue #495 与 draft PR #497；本计划中的新增模块与参数均为设计建议。
+- 用户 2026-09-08 附件作为输入建议。附件对现状的百分比、未逐项复核的源码断言和旧基线不作为已验证事实。
+- Claude 官方文档说明 subagent 的独立上下文、工具和权限范围，可借鉴这些语义：[Subagents](https://code.claude.com/docs/en/subagents)、[Permissions](https://code.claude.com/docs/en/permissions)。
+- Codex App 官方介绍强调多个 Agent 的监督、任务切换与隔离工作；这里将隔离映射到申请材料版本，不照搬代码 worktree：[Introducing the Codex app](https://openai.com/index/introducing-the-codex-app/)。
+- [OpenAI Codex public repository](https://github.com/openai/codex) 是公开参照，不代表取得 Codex Desktop 或其他产品的私有实现；本计划不承诺复制其全部能力。
+
+参考网页于 2026-09-08 本轮读取。实现顺序、数据边界、工作包与验收门槛是针对 ApplyMate 当前状态作出的架构判断。
