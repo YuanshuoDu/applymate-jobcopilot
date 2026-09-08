@@ -1,0 +1,105 @@
+import type { ModelAdapter } from "@jobcopilot/agent-model"
+import type { PolicyRole, RepositoryJsonValue, TenantScope } from "@jobcopilot/agent-protocol"
+
+import type { ExecutionOwnerFence } from "../execution-owner.js"
+import type { StepContext, StepContextSnapshot } from "../context/step-context-builder.js"
+import type { BusinessCheck } from "../verifier.js"
+import type { TurnBudgetLimits } from "../budget.js"
+import type {
+  TurnEngineItemPhase,
+  TurnEngineItemStatus,
+  TurnEngineItemType,
+  TurnEngineItem,
+  TurnEngineResult,
+  TurnEngineStep,
+  TurnEngineStore,
+  TurnEngineToolExecutor,
+  TurnResumeState,
+} from "./turn-engine-types.js"
+
+/** Identity is owner normalized; the loop never receives a raw lease. */
+export type TurnExecutionIdentity = ExecutionOwnerFence
+
+type StoreInput<K extends keyof TurnEngineStore> = Omit<Parameters<NonNullable<TurnEngineStore[K]>>[0], "lease"> & { identity: TurnExecutionIdentity }
+
+export type TurnExecutionStore = {
+  startStep(input: StoreInput<"startStep">): Promise<TurnEngineStep>
+  updateStep(input: StoreInput<"updateStep">): Promise<void>
+  waitForUser?(input: StoreInput<"waitForUser">): Promise<void>
+  createItem(input: StoreInput<"createItem">): Promise<TurnEngineItem>
+  updateItem(input: StoreInput<"updateItem">): Promise<TurnEngineItem>
+  appendEvent(input: StoreInput<"appendEvent">): Promise<{ id: string }>
+  recordFinalResponse?(input: StoreInput<"recordFinalResponse">): Promise<void>
+}
+
+export type TurnExecutionContextBuilder = {
+  build(request: {
+    scope: TenantScope
+    identity: TurnExecutionIdentity
+    stepId: string
+    snapshot: StepContextSnapshot
+    rootInputId?: string
+    now: Date
+  }): Promise<StepContext>
+}
+
+export type TurnExecutionLifecycle = {
+  readonly mapEventType?: (type: string) => string
+  readonly persistFinalResponse?: boolean
+  readonly emitTurnCompleted?: boolean
+}
+
+export type TurnExecutionOptions = {
+  readonly identity: TurnExecutionIdentity
+  readonly scope: TenantScope
+  readonly goal: string
+  readonly snapshot: StepContextSnapshot
+  readonly contextBuilder: TurnExecutionContextBuilder
+  readonly store: TurnExecutionStore
+  readonly model: ModelAdapter
+  readonly tools: readonly unknown[]
+  readonly executeTool: TurnEngineToolExecutor
+  readonly rootInputId?: string
+  readonly actorRole?: PolicyRole
+  readonly capabilities?: readonly string[]
+  readonly validateToolArguments?: (toolName: string, input: unknown) => boolean | string
+  readonly signal?: AbortSignal
+  readonly maxSteps?: number
+  readonly now?: () => Date
+  readonly idFactory?: (prefix: string) => string
+  readonly subscribe?: (event: { id: string; type: string; itemId: string | null; correlationId: string; causationId: string | null; payload: RepositoryJsonValue }) => void | Promise<void>
+  readonly publishReasoningSummary?: boolean
+  readonly budget?: TurnBudgetLimits
+  readonly expectedEvidence?: readonly string[]
+  readonly businessChecks?: readonly BusinessCheck[]
+  readonly noProgressRepeatLimit?: number
+  readonly resume?: TurnResumeState
+  readonly lifecycle?: TurnExecutionLifecycle
+  readonly signalError?: () => Error
+  /** Allows a root or child adapter to classify a lost owner without coupling the loop to a lease type. */
+  readonly isOwnershipLost?: (error: unknown, signal: AbortSignal) => boolean
+}
+
+export type TurnExecutionOutcome = TurnEngineResult
+
+export function executionKey(identity: TurnExecutionIdentity): string {
+  return identity.kind === "turn" ? `turn:${identity.turnId}` : `task:${identity.taskId}`
+}
+
+/** Prefix every generated identity with its owner so concurrent child work cannot collide. */
+export function executionId(identity: TurnExecutionIdentity, prefix: string): string {
+  return `${executionKey(identity)}:${prefix}`
+}
+
+export type ExecutionItemInput = {
+  readonly id: string
+  readonly stepId: string | null
+  readonly type: TurnEngineItemType
+  readonly phase: TurnEngineItemPhase
+  readonly content: unknown
+  readonly now: Date
+}
+
+export type ExecutionItemHandle = { id: string; type: TurnEngineItemType; phase: TurnEngineItemPhase; revision: number }
+
+export type ExecutionItemState = TurnEngineItemStatus

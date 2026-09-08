@@ -129,6 +129,8 @@ model User {
   adminWebAuthnChallenges     AdminWebAuthnChallenge[]
   adminReauthGrants           AdminReauthGrant[]
   supportCases                SupportCase[]                @relation("SupportRequester")
+  agentToolResultReferences   AgentToolResultReference[]
+  agentWaitConditions         AgentWaitCondition[]
   planChanges                 UserPlanChange[]
   planSubscription            UserPlanSubscription?
   featureOverrides            UserFeatureOverride[]
@@ -1868,12 +1870,15 @@ model AgentSession {
   inputs             AgentInput[]
   items              AgentItem[]
   events             AgentEvent[]
+  toolResultReferences AgentToolResultReference[]
+  waitConditions     AgentWaitCondition[]
   execution          AgentExecution?
   automation         AgentAutomation?
 
   @@index([userId, createdAt(sort: Desc)])
   @@index([userId, lastViewedAt(sort: Desc)])
   @@index([userId, status])
+  @@unique([id, userId])
   @@map("agent_sessions")
 }
 
@@ -1917,11 +1922,14 @@ model AgentTurn {
   approvals       AgentApproval[]
   subAgentTasks   SubAgentTask[]
   mailboxMessages AgentMailboxMessage[]
+  toolResultReferences AgentToolResultReference[] @relation("AgentToolResultReferenceTurn")
+  waitConditions AgentWaitCondition[] @relation("AgentWaitConditionTurn")
 
   @@index([sessionId, createdAt])
   @@index([userId, status, updatedAt(sort: Desc)])
   @@index([status, leaseExpiresAt])
   @@unique([id, sessionId])
+  @@unique([id, sessionId, userId])
   @@map("agent_turns")
 }
 
@@ -1956,10 +1964,13 @@ model AgentStep {
   childSteps     AgentStep[]  @relation("AgentStepRepairChain")
   consumedInputs AgentInput[] @relation("AgentStepConsumedInputs")
   items          AgentItem[]
+  toolResultReferences AgentToolResultReference[] @relation("AgentToolResultReferenceStep")
+  waitConditions AgentWaitCondition[] @relation("AgentWaitConditionStep")
 
   @@unique([turnId, ordinal, attempt])
   @@index([turnId, status, createdAt])
   @@index([providerResponseId])
+  @@unique([id, turnId, sessionId])
   @@map("agent_steps")
 }
 
@@ -2128,6 +2139,8 @@ model SubAgentTask {
   rootDescendants         SubAgentTask[]        @relation("SubAgentTaskRoot")
   mailboxMessagesSent     AgentMailboxMessage[] @relation("AgentMailboxFromTask")
   mailboxMessagesReceived AgentMailboxMessage[] @relation("AgentMailboxToTask")
+  toolResultReferences     AgentToolResultReference[] @relation("AgentToolResultReferenceTask")
+  waitConditions           AgentWaitCondition[] @relation("AgentWaitConditionParentTask")
 
   @@index([sessionId, status])
   @@index([sessionId, role])
@@ -2160,6 +2173,68 @@ model AgentMailboxMessage {
   @@index([toTaskId, consumedAt, createdAt])
   @@index([sessionId, turnId, consumedAt, createdAt])
   @@map("agent_mailbox_messages")
+}
+
+// Private, redacted tool output retained across worker restarts. The Worker
+// enforces lease and lineage fences before writing or reading these rows.
+model AgentToolResultReference {
+  id            String   @id @default(cuid())
+  userId        String
+  sessionId     String
+  turnId        String
+  stepId        String
+  taskId        String
+  toolCallId    String
+  sanitizedJson Json
+  sha256        String
+  byteCount     Int
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  user    User        @relation(fields: [userId], references: [id], onDelete: Cascade, map: "agent_tool_result_references_userId_fkey")
+  session AgentSession @relation(fields: [sessionId, userId], references: [id, userId], onDelete: Cascade, map: "agent_tool_result_references_sessionId_fkey")
+  turn    AgentTurn @relation("AgentToolResultReferenceTurn", fields: [turnId, sessionId, userId], references: [id, sessionId, userId], onDelete: Cascade, map: "agent_tool_result_references_turnId_sessionId_fkey")
+  step    AgentStep @relation("AgentToolResultReferenceStep", fields: [stepId, turnId, sessionId], references: [id, turnId, sessionId], onDelete: Cascade, map: "agent_tool_result_references_stepId_fkey")
+  task    SubAgentTask @relation("AgentToolResultReferenceTask", fields: [taskId, sessionId], references: [id, sessionId], onDelete: Cascade, map: "agent_tool_result_references_taskId_sessionId_fkey")
+
+  @@unique([stepId, toolCallId])
+  @@index([userId, sessionId, turnId, taskId])
+  @@index([sessionId, taskId, createdAt])
+  @@map("agent_tool_result_references")
+}
+
+// Durable wait intent. Runtime matching/consumption is intentionally owned by
+// the coordination phase and is not registered in the current tool runtime.
+model AgentWaitCondition {
+  id             String   @id @default(cuid())
+  userId         String
+  sessionId      String
+  turnId         String
+  parentTaskId   String
+  stepId         String
+  idempotencyKey String
+  targetTaskIds  Json
+  mode           String
+  status         String
+  deadlineAt     DateTime
+  matchedTaskIds Json     @default("[]")
+  result         Json?
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+  resolvedAt     DateTime?
+  suspendedAt    DateTime?
+  consumedAt     DateTime?
+
+  user       User         @relation(fields: [userId], references: [id], onDelete: Cascade, map: "agent_wait_conditions_userId_fkey")
+  session    AgentSession @relation(fields: [sessionId, userId], references: [id, userId], onDelete: Cascade, map: "agent_wait_conditions_sessionId_fkey")
+  turn       AgentTurn    @relation("AgentWaitConditionTurn", fields: [turnId, sessionId, userId], references: [id, sessionId, userId], onDelete: Cascade, map: "agent_wait_conditions_turnId_sessionId_fkey")
+  step       AgentStep    @relation("AgentWaitConditionStep", fields: [stepId, turnId, sessionId], references: [id, turnId, sessionId], onDelete: Cascade, map: "agent_wait_conditions_stepId_fkey")
+  parentTask SubAgentTask @relation("AgentWaitConditionParentTask", fields: [parentTaskId, sessionId], references: [id, sessionId], onDelete: Cascade, map: "agent_wait_conditions_parentTaskId_sessionId_fkey")
+
+  @@unique([parentTaskId, idempotencyKey])
+  @@index([sessionId, turnId, status])
+  @@index([sessionId, deadlineAt])
+  @@map("agent_wait_conditions")
 }
 
 model AgentTranscriptEvent {

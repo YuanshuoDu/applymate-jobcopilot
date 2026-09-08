@@ -7,8 +7,6 @@ import { bindWorkerControl, getWorkerRuntimeState, restoreWorkerRuntimeState } f
 import { closeSharedRedisConnections } from "./redis.js";
 import { workerHarnessFeatureHealth } from "./admin/harness-health.js";
 import { startAgentWakeupConsumer } from "./runtime/wakeup/consumer.js";
-import { createProductionWorkerBootstrap } from "./queue/production-bootstrap.js";
-import { createWorkerUsageAuthorizer } from "./queue/ai-usage-bridge.js";
 
 async function main() {
   const adminHost = resolveWorkerAdminHost();
@@ -21,6 +19,8 @@ async function main() {
     cloakPoolModule,
     deadLetterModule,
     canonicalRuntimeModule,
+    aiUsageBridgeModule,
+    productionBootstrapModule,
   ] = await Promise.all([
     import("./db/apply-results.js"),
     import("./queue/apply-queue.js"),
@@ -30,6 +30,8 @@ async function main() {
     import("./cloak/pool.js"),
     import("./queue/dead-letter.js"),
     import("./runtime/canonical-turn-runtime.js"),
+    import("./queue/ai-usage-bridge.js"),
+    import("./queue/production-bootstrap.js"),
   ]);
   const { ensureApplyResultsTable, closePool, getPool } = applyResultsModule;
   const { applyWorker, applyQueue, connection } = applyQueueModule;
@@ -69,9 +71,9 @@ async function main() {
 
   const canonicalRuntime = await canonicalRuntimeModule.createCanonicalTurnRuntime(getPool(), {
     workerId: process.env.WORKER_ID ?? `worker-${process.pid}`,
-    authorizeUsage: createWorkerUsageAuthorizer(),
+    authorizeUsage: aiUsageBridgeModule.createWorkerUsageAuthorizer(),
   });
-  const canonicalBootstrap = await createProductionWorkerBootstrap({
+  const canonicalBootstrap = await productionBootstrapModule.createProductionWorkerBootstrap({
     pool: getPool(),
     runtime: canonicalRuntime,
   });

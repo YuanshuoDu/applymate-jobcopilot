@@ -10,11 +10,13 @@ import { AddAgentModal } from '@/components/agent-workspace/AddAgentModal'
 import { AgentUnifiedStream } from '@/components/agent-workspace/AgentUnifiedStream'
 import type { ApplyReadyJob } from '@/components/agent-workspace/ApplyJobCard'
 import { AgentSessionConsole } from '@/components/agent-workspace/AgentSessionConsole'
+import { AgentSupervisorPanel } from '@/components/agent-workspace/v2/AgentSupervisorPanel'
 import { sessionHeaderSubtitle, type AgentSessionsResponse } from '@/components/agent-workspace/session-view-model'
 import type { LogEntry, QuestionOption, RunSummary } from '@/components/agent-workspace/live-run-types'
 import type { SubmissionPolicySettings } from '@/components/agent-workspace/automation-policy'
 import { useAgentSessionState, useAgentSessionUrl } from '@/components/agent-workspace/agent-session-state'
 import { AgentTurnComposerProvider, useAgentTurnComposer } from '@/components/agent-workspace/agent-turn-commands'
+import { useAgentTimeline } from '@/components/agent-workspace/v2/use-agent-timeline'
 import { useNav } from '@/lib/nav-context'
 import { useI18n } from '@/lib/i18n'
 
@@ -38,6 +40,7 @@ export function AgentPlaygroundPage() {
   const [applyQueue,    setApplyQueue]    = useState<ApplyReadyJob[]>([])
   const { sessionId, setSessionId } = useAgentSessionUrl()
   const selectedSessionId = sessionId
+  const timeline = useAgentTimeline(selectedSessionId)
   const { activeTurn, refetch: refetchTurnState } = useAgentSessionState(sessionId)
   const turnComposer = useAgentTurnComposer(sessionId, activeTurn, refetchTurnState)
   const [conversationTitle, setConversationTitle] = useState<string | null>(null)
@@ -390,6 +393,7 @@ export function AgentPlaygroundPage() {
             position: relative;
             min-height: 0 !important;
             overflow: hidden !important;
+            flex-direction: column !important;
           }
 
           .agent-session-drawer-trigger {
@@ -619,6 +623,7 @@ export function AgentPlaygroundPage() {
             autonomousMode={autonomousMode}
             resetVersion={chatResetVersion}
             resumeSessionId={sessionId}
+            timeline={timeline}
             conversationTitle={conversationTitle}
             conversationSubtitle={conversationSubtitle}
             onAnswerQuestion={handleAnswerQuestion}
@@ -659,6 +664,7 @@ export function AgentPlaygroundPage() {
             }}
           />
         </AgentTurnComposerProvider>
+        <AgentSupervisorPanel sessionId={selectedSessionId} timeline={timeline} />
       </div>
     </div>
   )

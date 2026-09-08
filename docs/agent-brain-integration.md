@@ -92,6 +92,22 @@ The next implementation must share the model/tool loop while binding persistence
 
 Steps carry the actual task ID. Their stored ordinal is allocated atomically within the Turn to satisfy its existing uniqueness constraint during concurrent children. Logical step/item identities include task identity. Child completion stores a child result and child activity; it cannot overwrite the root final response or publish a root completion. Root resume accounting and context reconstruction must exclude child steps and observations except results deliberately returned through the wait/join boundary.
 
+The root completion verifier must inspect durable descendant state. A model's terminal proposal cannot complete the root while descendants are still runnable or waiting. Child failure and uncertain external results remain explicit evidence for the final outcome rather than being flattened into success. User cancellation propagates through the tree; process shutdown only releases execution ownership for recovery.
+
+### Durable wait handoff
+
+Wait registration does not release execution ownership inside a tool callback. The current owner first persists the tool receipt, timeline items and completed step. A separate fenced suspension transaction then records `suspendedAt` and releases the parent. This keeps later evidence writes from running under an already-released lease.
+
+Resolution and delivery are separate dimensions. The wait outcome is `waiting`, `ready`, `timed_out`, `interrupted` or `closed`; `suspendedAt` and `consumedAt` track the handoff. A resolver can record a result before suspension, but it must not change the running parent's lease or dispatch that parent. At suspension, an already-resolved wait queues its parent and writes the dispatch outbox in the same transaction. A still-waiting parent moves to the dependency-wait state. Later resolution queues only a suspended, unconsumed parent. A restart scanner applies the same transaction rules.
+
+The queue driver must recognize a durable handoff receipt and skip its ordinary lease-release update. It cannot overwrite a parent already queued by wait resolution. A resumed owner consumes the stored result once, under its new lease, before its next model step. Duplicate notifications and a crash on either side of suspension therefore have an authoritative recovery path.
+
+Child model admission uses the child's task owner and attempt fence, including while its root Turn is waiting. It never borrows the root Turn lease. Root supervision may read retained results from prior turns in the same user's session; a child can read its own and descendant results only within its current turn and task tree. An explicit message or join supplies any additional shared result.
+
+A root queued for resume is still nonterminal. With an `any` wait, other children can remain active while the resolved parent is queued. Their current task leases remain valid across that transition; neither result storage nor model admission may require the root to be exclusively `in_progress`. Root cancellation and terminal closure still fence them out.
+
+Native interrupt semantics distinguish a target subtree from a session-wide stop. Interrupting one child must not silently interrupt the root and unrelated siblings. The existing whole-tree interrupt helper must remain reserved for an explicit root/session cancellation until scoped child interruption has been implemented and verified.
+
 ## Recovery and safety invariants
 
 - Queue delivery may repeat; lease/state checks decide whether execution may proceed.
@@ -132,6 +148,16 @@ The full Web typecheck command attempted Prisma regeneration and encountered a W
 These are local automated results. Real database/RLS execution, actual process restart, child execution/wait composition and the supervisor browser fixture are not yet accepted. Large lifecycle outputs still use process-local result references and require durable storage before long-session acceptance. No provider call, employer submission, database migration, staging gate or production deployment is claimed by this checkpoint.
 
 ## Follow-up sequence
+
+### Review checkpoint and execution budget, 2026-09-08
+
+The next checkpoint contains candidate supervisor UI, owner-neutral loop extraction and additive private-result/wait schema source. It remains a draft, not an accepted implementation of child execution or durable joins.
+
+- Luna reported 52 passing tests across 11 Worker files and a passing Worker typecheck for the extraction/startup candidate. The existing startup security test caught static queue imports; those imports now occur after listener validation. A new extraction test still needs a stronger assertion before its description can be treated as proof of model observation delivery.
+- Luna reported 15 passing storage tests and Prisma validation. Subsequent size-limit/schema-alignment and queued-parent corrections need their final validation result recovered or rerun; there is no real PostgreSQL/RLS or migration-application evidence.
+- Luna reported 26 passing UI/DTO tests, a passing Web typecheck and one passing desktop-English supervisor browser run. The final four-project supervisor matrix was not collected before the quota interruption. The preview's URL fallback and its hydration behavior remain review items; a stale-props explanation is an inference, not established evidence.
+
+The owner requested lower usage. Subsequent work uses at most one active Luna worker, bounded tasks, reused evidence and focused checks. Astra retains design and final review. Avoid repeating broad matrices or repository surveys without a new failure or relevant change. The full goal remains active and incomplete.
 
 ### Full owner-goal acceptance ledger
 

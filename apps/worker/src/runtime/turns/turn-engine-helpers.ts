@@ -1,9 +1,13 @@
+import { randomUUID } from "node:crypto"
 import type { ToolCallRequest, ToolExecutionResult, ToolRouterContext } from "../tools/types.js"
 import type { ModelAdapter } from "@jobcopilot/agent-model"
 
+import { signalWasInterrupted } from "../interrupt/registry.js"
+import { BudgetExceededError, createTurnBudgetLedger } from "../budget.js"
 import { TurnLeaseError, type TurnLease } from "./lease.js"
 import type { ModelStepResult } from "./turn-engine-model.js"
 import type { TurnEngineToolExecutor, TurnResumeState } from "./turn-engine-types.js"
+import { executionId, type TurnExecutionOptions, type TurnExecutionStore } from "./turn-execution-types.js"
 import type { TurnBudgetLimits, TurnUsage } from "../budget.js"
 
 export function turnErrorCode(error: unknown): string {
@@ -51,4 +55,41 @@ export function totalTurnUsage(previous: TurnUsage | undefined, current: TurnUsa
 
 export function isTurnLeaseLoss(error: unknown, signal: AbortSignal): boolean {
   return error instanceof TurnLeaseError || signal.aborted
+}
+
+export function makeExecutionId(options: TurnExecutionOptions, prefix: string): string {
+  const scoped = executionId(options.identity, prefix)
+  return options.idFactory?.(scoped) ?? `${scoped}:${randomUUID()}`
+}
+
+export function assertExecutionAlive(options: TurnExecutionOptions, signal: AbortSignal): void {
+  if (signalWasInterrupted(signal)) {
+    throw signal.reason instanceof Error ? signal.reason : new Error("Execution was interrupted")
+  }
+  if (signal.aborted) throw options.signalError?.() ?? new Error("execution_lost")
+}
+
+export function canPersistFinalResponse(options: TurnExecutionOptions): boolean {
+  return options.identity.kind === "turn" && options.lifecycle?.persistFinalResponse !== false
+}
+
+export function canEmitTurnCompleted(options: TurnExecutionOptions): boolean {
+  return options.identity.kind === "turn" && options.lifecycle?.emitTurnCompleted !== false
+}
+
+type BudgetSnapshot = ReturnType<ReturnType<typeof createTurnBudgetLedger>["snapshot"]>
+
+export function assertModelAllowance(snapshot: BudgetSnapshot): void {
+  const checks = [
+    ["input_tokens", snapshot.limits.maxInputTokens, snapshot.used.inputTokens + snapshot.reserved.inputTokens],
+    ["output_tokens", snapshot.limits.maxOutputTokens, snapshot.used.outputTokens + snapshot.reserved.outputTokens],
+    ["cost_usd", snapshot.limits.maxCostUsd, snapshot.used.estimatedCostUsd + snapshot.reserved.estimatedCostUsd],
+  ] as const
+  for (const [metric, limit, used] of checks) {
+    if (limit !== undefined && used >= limit) throw new BudgetExceededError(metric, limit, used + 1, used)
+  }
+}
+
+export function updateExecutionStep(options: TurnExecutionOptions, input: Omit<Parameters<TurnExecutionStore["updateStep"]>[0], "identity">): Promise<void> {
+  return options.store.updateStep({ identity: options.identity, ...input })
 }
