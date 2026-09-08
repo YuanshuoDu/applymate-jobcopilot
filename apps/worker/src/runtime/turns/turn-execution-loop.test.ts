@@ -58,7 +58,7 @@ function fixture(owner: TurnExecutionIdentity): Fixture {
       inputThroughSequence: BigInt(snapshot.toolObservations.length + 1), consumedInputIds: [],
       blocks: snapshot.toolObservations.map(observation => ({
         id: `observation:${observation.id}`, layer: "tool_observation", role: "data", trust: "external_untrusted",
-        source: "tool_or_subagent", content: observation.content,
+        source: "tool_or_subagent", content: observation.content as { readonly job: string },
       })),
       canonicalJson: JSON.stringify(snapshot.toolObservations),
     }),
