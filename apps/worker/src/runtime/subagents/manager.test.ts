@@ -75,6 +75,13 @@ class MemoryStore implements SubagentStore {
     return true
   }
 
+  async release(input: { taskId: string; sessionId: string; ownerId: string; attemptCount: number; now: Date }): Promise<boolean> {
+    const task = this.records.get(input.taskId)
+    if (!task || task.sessionId !== input.sessionId || task.leaseOwner !== input.ownerId || task.attemptCount !== input.attemptCount || task.interruptRequestedAt || task.status !== "running") return false
+    this.records.set(task.id, { ...task, status: "queued", leaseOwner: null, leaseExpiresAt: null })
+    return true
+  }
+
   async interruptTree(input: { sessionId: string; rootTaskId: string; now: Date }): Promise<number> {
     let count = 0
     for (const task of this.records.values()) {
@@ -140,5 +147,19 @@ describe("AgentTreeManager", () => {
     await expect(manager.close(task.id, task.sessionId)).resolves.toBe(true)
     await expect(manager.run(payload(task), async () => ({ status: "completed" }))).resolves.toMatchObject({ status: "skipped" })
     expect(store.records.get(task.id)?.status).toBe("closed")
+  })
+
+  it("aborts active work and releases its lease for restart during Worker shutdown", async () => {
+    const store = new MemoryStore()
+    const manager = new AgentTreeManager(store, { clock: new FakeClock() })
+    const task = await manager.spawn(spec())
+    const running = manager.run(payload(task), async ({ lease }) => new Promise<SubagentExecutionResult>(resolve => {
+      lease.signal.addEventListener("abort", () => resolve({ status: "failed" }), { once: true })
+    }))
+    await new Promise(resolve => setTimeout(resolve, 0))
+    await manager.shutdown()
+    await expect(running).resolves.toMatchObject({ status: "lease_lost" })
+    expect(store.records.get(task.id)).toMatchObject({ status: "queued", leaseOwner: null, leaseExpiresAt: null })
+    expect(manager.activeCount(task.sessionId)).toBe(0)
   })
 })

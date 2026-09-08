@@ -194,8 +194,9 @@ export async function releaseTurnLease(
            "completedAt" = CASE WHEN $5 IN ('interrupted', 'failed', 'completed') THEN $6 ELSE NULL END,
            "updatedAt" = $6
        WHERE "id" = $1 AND "sessionId" = $2 AND "leaseOwnerId" = $3
-         AND "leaseVersion" = $4 AND "status" = 'in_progress'`,
-      [current.turnId, current.sessionId, current.ownerId, current.leaseVersion, status, now],
+         AND "leaseVersion" = $4 AND "userId" = $7 AND "leaseExpiresAt" > $6
+         AND ("status" = 'in_progress' OR ("status" = 'waiting_for_user' AND $5 = 'waiting_for_user'))`,
+      [current.turnId, current.sessionId, current.ownerId, current.leaseVersion, status, now, current.userId],
     )
     return result.rowCount === 1
   } finally {

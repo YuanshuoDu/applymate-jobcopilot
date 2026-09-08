@@ -7,6 +7,8 @@ import { bindWorkerControl, getWorkerRuntimeState, restoreWorkerRuntimeState } f
 import { closeSharedRedisConnections } from "./redis.js";
 import { workerHarnessFeatureHealth } from "./admin/harness-health.js";
 import { startAgentWakeupConsumer } from "./runtime/wakeup/consumer.js";
+import { createProductionWorkerBootstrap } from "./queue/production-bootstrap.js";
+import { createWorkerUsageAuthorizer } from "./queue/ai-usage-bridge.js";
 
 async function main() {
   const adminHost = resolveWorkerAdminHost();
@@ -18,6 +20,7 @@ async function main() {
     automationSchedulerModule,
     cloakPoolModule,
     deadLetterModule,
+    canonicalRuntimeModule,
   ] = await Promise.all([
     import("./db/apply-results.js"),
     import("./queue/apply-queue.js"),
@@ -26,8 +29,9 @@ async function main() {
     import("./queue/automation-scheduler.js"),
     import("./cloak/pool.js"),
     import("./queue/dead-letter.js"),
+    import("./runtime/canonical-turn-runtime.js"),
   ]);
-  const { ensureApplyResultsTable, closePool } = applyResultsModule;
+  const { ensureApplyResultsTable, closePool, getPool } = applyResultsModule;
   const { applyWorker, applyQueue, connection } = applyQueueModule;
   const { scoutWorker, scoutQueue, SCOUT_QUEUE_NAME } = scoutQueueModule;
   const { agentRunQueue, AGENT_RUN_QUEUE_NAME, closeAgentRunResources } = agentRunQueueModule;
@@ -63,6 +67,16 @@ async function main() {
     process.exit(1);
   }
 
+  const canonicalRuntime = await canonicalRuntimeModule.createCanonicalTurnRuntime(getPool(), {
+    workerId: process.env.WORKER_ID ?? `worker-${process.pid}`,
+    authorizeUsage: createWorkerUsageAuthorizer(),
+  });
+  const canonicalBootstrap = await createProductionWorkerBootstrap({
+    pool: getPool(),
+    runtime: canonicalRuntime,
+  });
+  console.log("[worker] Canonical Turn consumer and recovery scanner started");
+
   const agentWakeupConsumer = startAgentWakeupConsumer();
   console.log("[worker] Agent Turn wakeup consumer started");
 
@@ -77,6 +91,7 @@ async function main() {
   console.log(`[worker] Listening on queue 'apply-tasks' (concurrency: ${process.env.CLOAK_MAX_WORKERS ?? "1"})`);
   console.log(`[worker] Listening on queue '${SCOUT_QUEUE_NAME}' (concurrency: 1)`);
   console.log(`[worker] Listening on queue '${AGENT_RUN_QUEUE_NAME}' (concurrency: 1)`);
+  console.log("[worker] Listening on queue 'agent-turns' (concurrency: 1)");
   const automationScheduler = startAutomationScheduler();
   console.log(`[worker] Automation scheduler ${automationScheduler.status().enabled ? "started" : "disabled"}`);
 
@@ -125,6 +140,7 @@ async function main() {
     await scoutWorker.close();
     await applyWorker.close();
     await closeAgentRunResources();
+    await canonicalBootstrap.close();
     await closeDeadLetterResources();
     automationScheduler.close();
     await closeAllSlots();

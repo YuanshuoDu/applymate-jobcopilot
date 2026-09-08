@@ -154,6 +154,36 @@ describe("AgentCommandService", () => {
     expect(fake.state.inputs).toHaveLength(1)
   })
 
+  it("collapses concurrent duplicate commands to one Turn and dispatch identity", async () => {
+    const fake = makeDb()
+    const service = new AgentCommandService(fake.db)
+    const command = startCommand("client_concurrent_duplicate")
+
+    const [first, second] = await Promise.all([service.start(command), service.start(command)])
+
+    expect(second.disposition).toBe("duplicate")
+    expect(second.turnId).toBe(first.turnId)
+    expect(fake.state.inputs).toHaveLength(1)
+    expect(fake.state.items).toHaveLength(1)
+    expect(fake.state.outbox.filter((entry) => entry.topic === "agent.turn.dispatch")).toHaveLength(1)
+  })
+
+  it("writes one canonical Turn dispatch intent with the root in the command transaction", async () => {
+    const fake = makeDb()
+    const service = new AgentCommandService(fake.db)
+
+    const first = await service.start(startCommand("client_dispatch"))
+    await service.start(startCommand("client_dispatch"))
+
+    const dispatches = fake.state.outbox.filter((outbox) => outbox.topic === "agent.turn.dispatch")
+    expect(dispatches).toHaveLength(1)
+    expect(dispatches[0]).toMatchObject({
+      aggregateId: first.turnId,
+      idempotencyKey: `turn-dispatch:${first.turnId}`,
+      payload: { turnId: first.turnId, sessionId: "session_1", ownerId: `web:${first.turnId}` },
+    })
+  })
+
   it("rejects stale expected Turn before writing a steer", async () => {
     const fake = makeDb()
     const service = new AgentCommandService(fake.db)

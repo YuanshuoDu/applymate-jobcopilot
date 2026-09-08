@@ -86,6 +86,17 @@ describe("database Turn lease", () => {
     await expect(expireTurnLease(fake.pool, current, now)).resolves.toBe(false)
   })
 
+  it("releases a matching persisted user wait with the same live fence", async () => {
+    const fake = fakePool()
+    const current: TurnLease = { ...payload, userId: row.userId, leaseVersion: row.leaseVersion, leaseStartedAt: now, leaseExpiresAt: row.leaseExpiresAt }
+    await expect(releaseTurnLease(fake.pool, current, "waiting_for_user", now)).resolves.toBe(true)
+    const [sql, params] = fake.calls.find(([text]) => text.includes('SET "status" = $5')) ?? ["", []]
+    expect(sql).toContain('"status" = \'in_progress\' OR ("status" = \'waiting_for_user\' AND $5 = \'waiting_for_user\')')
+    expect(sql).toContain('"userId" = $7')
+    expect(sql).toContain('"leaseExpiresAt" > $6')
+    expect(params).toEqual([current.turnId, current.sessionId, current.ownerId, current.leaseVersion, "waiting_for_user", now, current.userId])
+  })
+
   it("can fence an already-expired heartbeat before a scanner reclaims it", async () => {
     const fake = fakePool([row])
     const current: TurnLease = { ...payload, userId: row.userId, leaseVersion: row.leaseVersion, leaseStartedAt: now, leaseExpiresAt: row.leaseExpiresAt }

@@ -14,7 +14,7 @@ function fakePool() {
   const client = {
     query: vi.fn(async (sql: string, params?: unknown[]) => {
       calls.push([sql, params])
-      if (sql.includes('FROM "agent_outbox"')) return { rows: [{ id: "outbox-1", payload }], rowCount: 1 }
+      if (sql.includes('FROM "agent_outbox"')) return { rows: [{ id: "outbox-1", payload, attemptCount: 0 }], rowCount: 1 }
       return { rows: [], rowCount: 1 }
     }),
     release: vi.fn(),
@@ -26,7 +26,7 @@ describe("Subagent queue", () => {
   it("uses a strict payload and deterministic job id", async () => {
     const queue = { add: vi.fn().mockResolvedValue(undefined) }
     await enqueueSubagentTask(queue, payload)
-    expect(queue.add).toHaveBeenCalledWith("subagent", payload, { jobId: subagentJobId("task-1"), attempts: 3 })
+    expect(queue.add).toHaveBeenCalledWith("subagent", payload, { jobId: subagentJobId("task-1", 0), attempts: 3 })
     await expect(enqueueSubagentTask(queue, { ...payload, extra: true } as never)).rejects.toThrow("Invalid")
   })
 
@@ -41,9 +41,23 @@ describe("Subagent queue", () => {
     const fake = fakePool()
     const queue = { add: vi.fn().mockResolvedValue(undefined) }
     await expect(dispatchPendingSubagentOutbox(fake.pool, queue)).resolves.toBe(1)
-    expect(queue.add).toHaveBeenCalledWith("subagent", payload, { jobId: subagentJobId("task-1"), attempts: 3 })
+    expect(queue.add).toHaveBeenCalledWith("subagent", payload, { jobId: subagentJobId("task-1", 0), attempts: 3 })
     const mark = fake.calls.find(([sql]) => sql.startsWith("UPDATE"))
     expect(mark?.[0]).toContain('"publishedAt"')
+  })
+
+  it("encodes task IDs and advances the generation after a recovered delivery", async () => {
+    expect(subagentJobId("task:with spaces", 4)).toBe("agent-subagent-dGFzazp3aXRoIHNwYWNlcw-4")
+    expect(subagentJobId("task:with spaces", 4)).not.toContain(":")
+    const fake = fakePool()
+    const queue = { add: vi.fn().mockResolvedValue(undefined) }
+    const client = fake.pool.connect as ReturnType<typeof vi.fn>
+    client.mockImplementation(async () => ({
+      query: vi.fn(async (sql: string) => sql.includes('FROM "agent_outbox"') ? { rows: [{ id: "outbox-1", payload, attemptCount: 2 }], rowCount: 1 } : { rows: [], rowCount: 1 }),
+      release: vi.fn(),
+    }))
+    await dispatchPendingSubagentOutbox(fake.pool, queue)
+    expect(queue.add).toHaveBeenCalledWith("subagent", payload, { jobId: subagentJobId("task-1", 2), attempts: 3 })
   })
 
   it("runs one recovery scan immediately and can shut down cleanly", async () => {

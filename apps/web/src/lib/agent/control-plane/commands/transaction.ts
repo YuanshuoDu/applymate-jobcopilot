@@ -15,6 +15,13 @@ export const ACTIVE_TURN_STATUSES = [
   "waiting_for_user",
 ] as const
 
+/** Durable topic consumed by the Worker's canonical Turn queue. */
+export const TURN_DISPATCH_TOPIC = "agent.turn.dispatch"
+
+export function turnDispatchKey(turnId: string): string {
+  return `turn-dispatch:${turnId}`
+}
+
 export type CommandTransaction = Prisma.TransactionClient
 
 export interface ActiveTurn {
@@ -113,6 +120,22 @@ export async function createRootTurn(
     },
     select: { id: true },
   })
+  // The command transaction owns both the new root and its first dispatch
+  // intent. A committed command can therefore never strand a queued Turn
+  // waiting for a second, non-atomic publisher operation.
+  await tx.agentOutbox.create({
+    data: {
+      id: randomUUID(),
+      topic: TURN_DISPATCH_TOPIC,
+      aggregateId: turn.id,
+      idempotencyKey: turnDispatchKey(turn.id),
+      payload: json({
+        turnId: turn.id,
+        sessionId: command.sessionId,
+        ownerId: `web:${turn.id}`,
+      }),
+    },
+  })
   return { id: turn.id, source: command.source, status: "queued", revision: 0 }
 }
 
@@ -210,7 +233,6 @@ export async function acceptInputFacts(
       outboxTopic: "agent.session.event",
     })
   }
-
   return { inputId, turnId: turn.id, sequence: accepted.event.sequence.toString() }
 }
 

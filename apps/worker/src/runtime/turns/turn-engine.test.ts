@@ -175,6 +175,17 @@ describe("TurnEngine", () => {
     expect(fixture.fake.items.filter((item) => item.type === "agent_message" && item.phase === "final_answer")).toHaveLength(1)
   })
 
+  it("does not invoke the model when a resumed finite model budget has no allowance", async () => {
+    const fixture = baseOptions({
+      budget: { maxInputTokens: 10 },
+      resume: { nextOrdinal: 1, stepCount: 1, toolCallCount: 0, inputThroughSequence: 1n, consumedInputIds: [], usage: { inputTokens: 10, outputTokens: 0, estimatedCostUsd: 0 } },
+      model: { id: "must-not-run", profile: profile(), async *stream() { throw new Error("provider invoked") } },
+    })
+    const result = await new TurnEngine(fixture.options).run()
+    expect(result).toMatchObject({ status: "failed", errorCode: "budget_exhausted" })
+    expect(fixture.requests).toHaveLength(0)
+  })
+
   it("stops repeated no-op tool results with a reason-coded event", async () => {
     let modelCall = 0
     const fixture = baseOptions({

@@ -1,5 +1,5 @@
 import type { ModelAdapter, ModelCapabilityProfile } from "@jobcopilot/agent-model"
-import type { RepositoryJsonValue, TenantScope } from "@jobcopilot/agent-protocol"
+import type { PolicyRole, RepositoryJsonValue, TenantScope } from "@jobcopilot/agent-protocol"
 
 import type { StepContext, StepContextSnapshot } from "../context/step-context-builder.js"
 import type { TurnBudgetLimits } from "../budget.js"
@@ -105,6 +105,12 @@ export type TurnEngineToolExecutor = (input: {
   sessionId: string
   turnId: string
   stepId: string
+  /** Runtime-owned current task; never accepted from model tool arguments. */
+  taskId?: string
+  /** Runtime-owned root task; never accepted from model tool arguments. */
+  rootTaskId?: string
+  /** Runtime-owned actor role used by the policy engine. */
+  actorRole?: PolicyRole
   signal: AbortSignal
   capabilities?: readonly string[]
   call: { id: string; toolName: string; toolVersion: string; input: unknown }
@@ -135,7 +141,11 @@ export type TurnEngineOptions = {
   readonly tools: readonly unknown[]
   readonly executeTool: TurnEngineToolExecutor
   readonly rootInputId?: string
+  /** Runtime-owned current task identity. Root turns use rootTaskId. */
+  readonly taskId?: string
   readonly rootTaskId?: string
+  /** Runtime-owned actor role; never supplied by model output. */
+  readonly actorRole?: PolicyRole
   readonly capabilities?: readonly string[]
   readonly validateToolArguments?: (toolName: string, input: unknown) => boolean | string
   readonly signal?: AbortSignal
@@ -149,6 +159,21 @@ export type TurnEngineOptions = {
   readonly expectedEvidence?: readonly string[]
   readonly businessChecks?: readonly BusinessCheck[]
   readonly noProgressRepeatLimit?: number
+  /** Durable state recovered before starting the next fenced execution attempt. */
+  readonly resume?: TurnResumeState
+}
+
+export type TurnResumeState = {
+  readonly nextOrdinal: number
+  readonly stepCount: number
+  readonly toolCallCount: number
+  readonly inputThroughSequence: bigint
+  readonly consumedInputIds: readonly string[]
+  readonly usage: {
+    readonly inputTokens: number
+    readonly outputTokens: number
+    readonly estimatedCostUsd: number
+  }
 }
 
 export type TurnEngineResult = {

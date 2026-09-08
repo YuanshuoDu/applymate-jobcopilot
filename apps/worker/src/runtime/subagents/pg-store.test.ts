@@ -103,6 +103,20 @@ describe("PgSubagentTaskStore", () => {
     await expect(store.finish({ taskId: "task-1", sessionId: "session-1", ownerId: "worker-1", status: "completed", now })).resolves.toBeNull()
   })
 
+  it("releases only the fenced running lease and republishes its outbox row", async () => {
+    const fake = fakePool(sql => sql.startsWith("UPDATE") ? { rowCount: 1 } : {})
+    const store = new PgSubagentTaskStore(fake.pool)
+    await expect(store.release({ taskId: "task-1", sessionId: "session-1", ownerId: "worker-1", attemptCount: 1, now })).resolves.toBe(true)
+    const updates = fake.calls.filter(([sql]) => sql.startsWith("UPDATE"))
+    expect(updates).toHaveLength(2)
+    expect(updates[0]?.[0]).toContain('"leaseOwner" = $3')
+    expect(updates[0]?.[0]).toContain('"status" = \'running\'')
+    expect(updates[0]?.[0]).toContain('"attemptCount" = $4')
+    expect(updates[0]?.[0]).toContain('"interruptRequestedAt" IS NULL')
+    expect(updates[1]?.[0]).toContain("publishedAt")
+    expect(updates[1]?.[1]).toEqual(["task-1"])
+  })
+
   it("surfaces a durable interrupt during heartbeat instead of renewing", async () => {
     const fake = fakePool(sql => {
       if (sql.startsWith("UPDATE")) return { rows: [{ interruptRequestedAt: now }], rowCount: 1 }

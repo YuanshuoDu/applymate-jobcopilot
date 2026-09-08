@@ -157,6 +157,23 @@ export class AgentTreeManager {
     return count
   }
 
+  /** Stop active children and release their leases before Worker resources close. */
+  async shutdown(): Promise<void> {
+    const active = [...this.active.values()]
+    let firstError: unknown
+    await Promise.all(active.map(async execution => {
+      const error = new SubagentLeaseError("lost", "Worker shutdown")
+      execution.controller.abort(error)
+      execution.resolveLost(error)
+      await this.store.release?.({
+        taskId: execution.lease.id, sessionId: execution.lease.sessionId, ownerId: execution.lease.ownerId,
+        attemptCount: execution.lease.attemptCount, now: this.now(),
+      }).catch(error => { if (firstError === undefined) firstError = error })
+      this.dispose(execution.lease.id)
+    }))
+    if (firstError !== undefined) throw firstError
+  }
+
   async recover(limit = 50): Promise<{ rows: SubagentTaskRecord[]; reclaimed: number; terminal: number }> {
     const rows = await this.store.recoverExpired({ now: this.now(), limit })
     for (const row of rows) {

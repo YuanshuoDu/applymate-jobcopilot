@@ -1,4 +1,4 @@
-import { interruptTurnLease, releaseTurnLease, type LeasePool } from "./lease.js"
+import { expireTurnLease, releaseTurnLease, type LeasePool } from "./lease.js"
 import { TurnExecutionRegistry } from "./turn-queue.js"
 
 export interface ShutdownProcess {
@@ -9,13 +9,15 @@ export interface ShutdownProcess {
 export interface TurnShutdownDependencies {
   pool: LeasePool
   active: TurnExecutionRegistry
+  /** Pause intake without waiting for active jobs; they are aborted below. */
+  stopIntake?: () => Promise<void>
   closeQueue: () => Promise<void>
   closeScanner?: () => Promise<void>
 }
 
 /**
  * Shutdown ordering is deliberate: stop new dispatch, abort active steps,
- * fence them as interrupted, then let BullMQ finish closing its connections.
+ * requeue their leases for a later recovery scan, then close BullMQ resources.
  */
 export class TurnShutdownController {
   private closing: Promise<void> | null = null
@@ -30,14 +32,17 @@ export class TurnShutdownController {
 
   private async run(signal: string): Promise<void> {
     console.log(`[turn-shutdown] received ${signal}`)
-    await this.dependencies.closeScanner?.()
+    let firstError: unknown
+    try { await this.dependencies.stopIntake?.() } catch (error: unknown) { firstError = error }
+    try { await this.dependencies.closeScanner?.() } catch (error: unknown) { if (firstError === undefined) firstError = error }
     const active = this.dependencies.active.values()
     await Promise.all(active.map((execution) => execution.abort().catch(() => undefined)))
     await Promise.all(active.map(async (execution) => {
-      const released = await releaseTurnLease(this.dependencies.pool, execution.lease, "interrupted").catch(() => false)
-      if (!released) await interruptTurnLease(this.dependencies.pool, execution.lease).catch(() => false)
+      const released = await releaseTurnLease(this.dependencies.pool, execution.lease, "queued").catch(() => false)
+      if (!released) await expireTurnLease(this.dependencies.pool, execution.lease).catch(() => false)
     }))
-    await this.dependencies.closeQueue()
+    try { await this.dependencies.closeQueue() } catch (error: unknown) { if (firstError === undefined) firstError = error }
+    if (firstError !== undefined) throw firstError
   }
 }
 

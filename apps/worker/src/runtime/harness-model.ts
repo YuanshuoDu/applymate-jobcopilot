@@ -37,6 +37,8 @@ export type HarnessModelRuntimeOptions = {
   fallbacks?: readonly AiConfig[]
   fetch?: HarnessFetch
   allowLocalDevelopment?: boolean
+  /** Preserve legacy environment route discovery unless an owner disables it. */
+  allowEnvironmentFallbacks?: boolean
   maxReroutes?: number
   irreversibleActionStarted?: boolean | (() => boolean)
   onSelectionEvent?: (event: ModelSelectionEvent) => void
@@ -50,11 +52,12 @@ export type HarnessModelRuntime = {
 
 /** Build the executable model path used by TurnEngine. MiniMax M3 is the default route. */
 export function createHarnessModelRuntime(options: HarnessModelRuntimeOptions = {}): HarnessModelRuntime {
+  const allowEnvironment = options.allowEnvironmentFallbacks !== false
   const configs = uniqueConfigs([
     options.primary ?? APPLYMATE_BACKING,
     ...(options.fallbacks ?? []),
-    ...environmentFallbacks(),
-  ]).filter(hasCredential)
+    ...(allowEnvironment ? environmentFallbacks() : []),
+  ]).filter((config) => hasCredential(config, allowEnvironment))
   if (configs.length === 0) throw new AgentModelError({
     code: "configuration_error",
     message: "No Harness model route has an API key configured",
@@ -107,6 +110,7 @@ async function* routeStream(
 function createAdapter(config: AiConfig, options: HarnessModelRuntimeOptions): ModelAdapter {
   const fetchOptions = options.fetch ? { fetch: options.fetch } : {}
   const common = { allowLocalDevelopment: options.allowLocalDevelopment }
+  const environmentCredential = (provider: Provider) => options.allowEnvironmentFallbacks === false ? undefined : environmentKey(provider)
   if (config.provider === "minimax") {
     const adapterOptions: MiniMaxAdapterOptions = { ...common, ...fetchOptions }
     return createMiniMaxM3Adapter({
@@ -116,7 +120,7 @@ function createAdapter(config: AiConfig, options: HarnessModelRuntimeOptions): M
   }
   if (config.provider === "anthropic") {
     return createAnthropicAdapter({
-      provider: "anthropic", model: config.model, baseUrl: config.apiBase, apiKey: config.apiKey ?? environmentKey(config.provider) ?? "",
+      provider: "anthropic", model: config.model, baseUrl: config.apiBase, apiKey: config.apiKey ?? environmentCredential(config.provider) ?? "",
     }, { ...common, ...fetchOptions })
   }
   const baseUrl = config.apiBase ?? OPENAI_COMPATIBLE_BASE_URLS[config.provider]
@@ -125,7 +129,7 @@ function createAdapter(config: AiConfig, options: HarnessModelRuntimeOptions): M
   })
   const adapterOptions: OpenAiCompatibleAdapterOptions = { ...common, ...fetchOptions }
   return createOpenAiCompatibleAdapter({
-    provider: config.provider, model: config.model, baseUrl, apiKey: config.apiKey ?? environmentKey(config.provider) ?? "",
+    provider: config.provider, model: config.model, baseUrl, apiKey: config.apiKey ?? environmentCredential(config.provider) ?? "",
   }, adapterOptions)
 }
 
@@ -175,8 +179,8 @@ function uniqueConfigs(configs: readonly AiConfig[]): AiConfig[] {
   })
 }
 
-function hasCredential(config: AiConfig): boolean {
-  return Boolean(config.apiKey?.trim() || environmentKey(config.provider))
+function hasCredential(config: AiConfig, allowEnvironmentFallbacks = true): boolean {
+  return Boolean(config.apiKey?.trim() || (allowEnvironmentFallbacks && environmentKey(config.provider)))
 }
 
 function credential(config: AiConfig): "platform" | "user" {

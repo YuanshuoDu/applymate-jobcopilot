@@ -155,6 +155,20 @@ export class PgSubagentTaskStore implements SubagentStore {
     })
   }
 
+  async release(input: { taskId: string; sessionId: string; ownerId: string; attemptCount: number; now: Date }): Promise<boolean> {
+    return transaction(this.pool, async client => {
+      const updated = await client.query(`UPDATE "sub_agent_tasks"
+        SET "status" = 'queued', "leaseOwner" = NULL, "leaseExpiresAt" = NULL, "updatedAt" = $4
+        WHERE "id" = $1 AND "sessionId" = $2 AND "leaseOwner" = $3 AND "attemptCount" = $4
+          AND "interruptRequestedAt" IS NULL AND "status" = 'running'`,
+      [input.taskId, input.sessionId, input.ownerId, input.attemptCount, input.now])
+      if (updated.rowCount !== 1) return false
+      await client.query(`UPDATE "agent_outbox" SET "publishedAt" = NULL, "attemptCount" = "attemptCount" + 1, "lastError" = NULL
+        WHERE "topic" = 'agent.subagent.dispatch' AND "aggregateId" = $1`, [input.taskId])
+      return true
+    })
+  }
+
   async close(input: { taskId: string; sessionId: string; now: Date }): Promise<boolean> {
     const client = await this.pool.connect()
     try {

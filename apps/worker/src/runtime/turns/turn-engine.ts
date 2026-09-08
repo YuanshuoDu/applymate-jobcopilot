@@ -6,11 +6,11 @@ import { buildModelRequest } from "./turn-engine-messages.js"
 import { runModelStep, type ModelStepResult } from "./turn-engine-model.js"
 import { TurnEventWriter, itemContent, type TurnItemHandle } from "./turn-engine-events.js"
 import { findToolObservation, stableJson } from "./turn-engine-replay.js"
-import { BudgetExceededError, createTurnBudgetLedger } from "../budget.js"
+import { BudgetExceededError, createTurnBudgetLedger, type TurnBudgetLimits } from "../budget.js"
 import { finalizeTurn, serializeFinalResponse, type FinalResponse } from "../finalizer.js"
 import { NoProgressError, createProgressDetector } from "../progress.js"
 import { snapshotEvidence, verifyCandidateFinal } from "../verifier.js"
-import { isTurnLeaseLoss, makeStepUpdate, turnErrorCode } from "./turn-engine-helpers.js"
+import { isTurnLeaseLoss, makeStepUpdate, resumedBudgetLimits, totalTurnUsage, turnErrorCode } from "./turn-engine-helpers.js"
 import {
   toRepositoryJson,
   TurnEngineError,
@@ -36,19 +36,20 @@ export class TurnEngine {
 
   async run(): Promise<TurnEngineResult> {
     const writer = new TurnEventWriter(this.options)
-    const budget = createTurnBudgetLedger({ ...this.options.budget, maxSteps: this.options.budget?.maxSteps ?? this.options.maxSteps ?? DEFAULT_MAX_STEPS })
+    const baseBudget: TurnBudgetLimits = { ...this.options.budget, maxSteps: this.options.budget?.maxSteps ?? this.options.maxSteps ?? DEFAULT_MAX_STEPS }
+    const budget = createTurnBudgetLedger(resumedBudgetLimits(baseBudget, this.options.resume) ?? {})
     const progress = createProgressDetector(this.options.noProgressRepeatLimit ?? 2)
     let snapshot = this.options.snapshot
-    let inputThroughSequence = 0n
-    let consumedInputIds: readonly string[] = []
-    let steps = 0
-    let toolCalls = 0
+    let inputThroughSequence = this.options.resume?.inputThroughSequence ?? 0n
+    let consumedInputIds: readonly string[] = this.options.resume?.consumedInputIds ?? []
+    let steps = this.options.resume?.stepCount ?? 0
+    let toolCalls = this.options.resume?.toolCallCount ?? 0
     let continuation: ModelContinuation | undefined
     const seenCallIds = new Set<string>()
     let lastStep: TurnEngineStep | null = null
     try {
       await writer.append("turn.started", this.options.lease.turnId, null, { goal: this.options.goal }, "turn-started")
-      for (let ordinal = 0; ; ordinal += 1) {
+      for (let ordinal = this.options.resume?.nextOrdinal ?? 0; ; ordinal += 1) {
         this.assertAlive()
         budget.reserveStep()
         steps += 1
@@ -86,11 +87,12 @@ export class TurnEngine {
             sessionId: this.options.lease.sessionId,
             turnId: this.options.lease.turnId,
             stepId: step.id,
-            taskId: this.options.rootTaskId ?? this.options.lease.turnId,
+            taskId: this.options.taskId ?? this.options.rootTaskId ?? this.options.lease.turnId,
             userId: this.options.scope.userId,
             signal: this.signal,
             continuation,
           })
+          assertModelAllowance(budget.snapshot())
           const reservation = budget.reserveModel()
           const output = await runModelStep(this.options.model, request, this.options.validateToolArguments)
           stepOutput = output
@@ -137,7 +139,7 @@ export class TurnEngine {
             await writer.append("final.rejected", step.id, null, { code: verification.code, blocker: verification.blocker, feedback: verification.feedback }, `final-rejected:${step.id}`)
             throw new TurnEngineError(verification.code, verification.blocker)
           }
-          const finalResponse = finalizeTurn({ goal: this.options.goal, verification, terminalReason: "goal_satisfied", response: output.text, usage: budget.usage(), stepCount: steps, toolCallCount: toolCalls })
+          const finalResponse = finalizeTurn({ goal: this.options.goal, verification, terminalReason: "goal_satisfied", response: output.text, usage: totalTurnUsage(this.options.resume?.usage, budget.usage()), stepCount: steps, toolCallCount: toolCalls })
           const finalItem = await this.publishFinal(writer, step, finalResponse)
           await this.options.store.recordFinalResponse({ lease: this.options.lease, response: serializeFinalResponse(finalResponse), now: this.now() })
           await writer.append("turn.completed", step.id, finalItem.id, { turnId: this.options.lease.turnId, finalItemId: finalItem.id, usage: finalResponse.usage }, "turn-completed")
@@ -160,7 +162,7 @@ export class TurnEngine {
       if (error instanceof NoProgressError) await writer.append("turn.no_progress", this.options.lease.turnId, null, { reasonCode: error.reasonCode, signature: error.observation.signature, stateFingerprint: error.observation.stateFingerprint }, "turn-no-progress").catch(() => undefined)
       if (error instanceof BudgetExceededError) await writer.append("turn.budget_exhausted", this.options.lease.turnId, null, { reasonCode: error.code, metric: error.metric, limit: error.limit, attempted: error.attempted, used: error.used }, "turn-budget-exhausted").catch(() => undefined)
       const terminalReason = error instanceof BudgetExceededError ? "budget_exhausted" : error instanceof NoProgressError ? "no_progress" : code === "final_unverified" || code.startsWith("evidence_") || code === "business_precondition_failed" ? "final_unverified" : "unrecoverable_error"
-      const finalResponse = finalizeTurn({ goal: this.options.goal, terminalReason, blocker: error instanceof Error ? error.message : code, usage: budget.usage(), stepCount: steps, toolCallCount: toolCalls, next: ["Review the blocker and resume the Turn"] })
+      const finalResponse = finalizeTurn({ goal: this.options.goal, terminalReason, blocker: error instanceof Error ? error.message : code, usage: totalTurnUsage(this.options.resume?.usage, budget.usage()), stepCount: steps, toolCallCount: toolCalls, next: ["Review the blocker and resume the Turn"] })
       const finalItem = await this.publishFinal(writer, lastStep, finalResponse).catch(() => null)
       if (finalItem) await this.options.store.recordFinalResponse({ lease: this.options.lease, response: serializeFinalResponse(finalResponse), now: this.now() }).catch(() => undefined)
       await writer.append("turn.failed", this.options.lease.turnId, finalItem?.id ?? null, { turnId: this.options.lease.turnId, errorCode: code, finalItemId: finalItem?.id ?? null, final: finalResponse }, `turn-failed:${code}`).catch(() => undefined)
@@ -207,7 +209,7 @@ export class TurnEngine {
     await writer.append("tool_call.started", call.id, callItem.id, { toolCallId: call.id, toolName: call.name }, `tool-started:${call.id}`)
     let result
     try {
-      result = await this.options.executeTool({ scope: this.options.scope, sessionId: this.options.lease.sessionId, turnId: this.options.lease.turnId, stepId: step.id, signal: this.signal, capabilities: this.options.capabilities, call: { id: call.id, toolName: call.name, toolVersion: "1", input: call.arguments } })
+      result = await this.options.executeTool({ scope: this.options.scope, sessionId: this.options.lease.sessionId, turnId: this.options.lease.turnId, stepId: step.id, taskId: this.options.taskId ?? this.options.rootTaskId, rootTaskId: this.options.rootTaskId, actorRole: this.options.actorRole, signal: this.signal, capabilities: this.options.capabilities, call: { id: call.id, toolName: call.name, toolVersion: "1", input: call.arguments } })
     } catch (error: unknown) {
       if (signalWasInterrupted(this.signal)) throw error
       result = { id: call.id, toolName: call.name, toolVersion: "1", status: "failed" as const, errorCode: "tool_execution_failed" }
@@ -246,6 +248,17 @@ export class TurnEngine {
     if (this.signal.aborted) throw new TurnLeaseError("lease_lost", "Turn execution stopped after lease loss")
   }
 
+}
+
+function assertModelAllowance(snapshot: ReturnType<ReturnType<typeof createTurnBudgetLedger>["snapshot"]>): void {
+  const checks = [
+    ["input_tokens", snapshot.limits.maxInputTokens, snapshot.used.inputTokens + snapshot.reserved.inputTokens],
+    ["output_tokens", snapshot.limits.maxOutputTokens, snapshot.used.outputTokens + snapshot.reserved.outputTokens],
+    ["cost_usd", snapshot.limits.maxCostUsd, snapshot.used.estimatedCostUsd + snapshot.reserved.estimatedCostUsd],
+  ] as const
+  for (const [metric, limit, used] of checks) {
+    if (limit !== undefined && used >= limit) throw new BudgetExceededError(metric, limit, used + 1, used)
+  }
 }
 export function createTurnEngineExecutor(base: Omit<TurnEngineOptions, "lease" | "signal">) {
   return (input: { lease: TurnLease; signal: AbortSignal }): Promise<TurnEngineResult> => new TurnEngine({ ...base, ...input }).run()

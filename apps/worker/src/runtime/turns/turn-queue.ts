@@ -104,7 +104,14 @@ export async function runTurnJob(
     throw error
   }
 
-  await markTurnDispatchClaimed(options.pool, payload)
+  try {
+    await markTurnDispatchClaimed(options.pool, payload)
+  } catch (error: unknown) {
+    // Dispatch bookkeeping is part of the claim boundary. If it fails, put
+    // the fenced Turn back in the queue before letting BullMQ retry the job.
+    await releaseTurnLease(options.pool, lease, "queued", options.now?.() ?? new Date()).catch(() => undefined)
+    throw error
+  }
   const heartbeat = new TurnHeartbeat(lease, {
     pool: options.pool,
     intervalMs: options.heartbeatMs,
@@ -118,7 +125,6 @@ export async function runTurnJob(
   active.add({
     lease,
     abort: async () => {
-      root?.stop("worker_shutdown")
       await heartbeat.abort("Turn interrupted by Worker shutdown")
     },
   })
