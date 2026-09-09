@@ -9,12 +9,14 @@ export class TurnEngine {
   constructor(private readonly options: TurnEngineOptions) {}
 
   run(): Promise<TurnEngineResult> {
-    const taskId = this.options.taskId ?? this.options.rootTaskId ?? this.options.lease.turnId
+    if (!this.options.rootTaskId.trim()) throw new TypeError("rootTaskId is required")
+    const taskId = this.options.taskId ?? this.options.rootTaskId
+    if (taskId !== this.options.rootTaskId) throw new TypeError("Turn taskId must equal rootTaskId")
     const identity = executionOwnerFence({ kind: "turn", taskId, lease: this.options.lease })
     return runTurnExecutionLoop({
       ...this.options,
       identity,
-      store: bindStore(this.options.store, this.options.lease),
+      store: bindStore(this.options.store),
       contextBuilder: bindContextBuilder(this.options, identity),
       signalError: () => new TurnLeaseError("lease_lost", "Turn execution stopped after lease loss"),
       isOwnershipLost: (error, signal) => error instanceof TurnLeaseError || signal.aborted,
@@ -22,15 +24,18 @@ export class TurnEngine {
   }
 }
 
-function bindStore(store: TurnEngineOptions["store"], lease: TurnLease): TurnExecutionStore {
+function bindStore(store: TurnEngineOptions["store"]): TurnExecutionStore {
   return {
-    startStep: (input) => store.startStep({ ...withoutIdentity(input), lease }),
-    updateStep: (input) => store.updateStep({ ...withoutIdentity(input), lease }),
-    waitForUser: store.waitForUser ? (input) => store.waitForUser!({ ...withoutIdentity(input), lease }) : undefined,
-    createItem: (input) => store.createItem({ ...withoutIdentity(input), lease }),
-    updateItem: (input) => store.updateItem({ ...withoutIdentity(input), lease }),
-    appendEvent: (input) => store.appendEvent({ ...withoutIdentity(input), lease }),
-    recordFinalResponse: store.recordFinalResponse ? (input) => store.recordFinalResponse!({ ...withoutIdentity(input), lease }) : undefined,
+    startStep: (input) => store.startStep({ ...withoutIdentity(input), owner: input.identity }),
+    updateStep: (input) => store.updateStep({ ...withoutIdentity(input), owner: input.identity }),
+    waitForUser: store.waitForUser ? (input) => store.waitForUser!({ ...withoutIdentity(input), owner: input.identity }) : undefined,
+    createItem: (input) => store.createItem({ ...withoutIdentity(input), owner: input.identity }),
+    updateItem: (input) => store.updateItem({ ...withoutIdentity(input), owner: input.identity }),
+    appendEvent: (input) => store.appendEvent({ ...withoutIdentity(input), owner: input.identity }),
+    recordFinalResponse: store.recordFinalResponse ? (input) => {
+      if (input.identity.kind !== "turn") throw new TurnLeaseError("lease_lost", "Child execution cannot persist a Turn final response")
+      return store.recordFinalResponse!({ ...withoutIdentity(input), owner: input.identity })
+    } : undefined,
   }
 }
 

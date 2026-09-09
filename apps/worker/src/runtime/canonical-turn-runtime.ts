@@ -20,6 +20,7 @@ import { loadCanonicalTurnState, type CanonicalTurnState } from "./canonical-tur
 import { AgentTreeManager } from "./subagents/manager.js"
 import { PgSubagentTaskStore } from "./subagents/pg-store.js"
 import { createPgRootTaskStore, type RootTaskStore } from "./subagents/root-task-store.js"
+import { executionOwnerFence, type ExecutionOwnerFence } from "./execution-owner.js"
 
 export type UsageAuthorization = {
   settle(input: { status: "success" | "error"; inputTokens: number; outputTokens: number; estimatedCostUsd: number; errorCode?: string }): Promise<void> | void
@@ -35,7 +36,7 @@ export type CanonicalTurnRuntimeOptions = {
   readonly rootTaskStore?: RootTaskStore
   readonly turnEngineStoreFactory?: (pool: pg.Pool) => TurnEngineStore
   readonly contextBuilderFactory?: (input: { pool: pg.Pool; scope: { userId: string } }) => TurnEngineOptions["contextBuilder"]
-  readonly lifecycleSinkFactory?: (input: { lease: TurnLease; store: TurnEngineStore }) => ToolLifecycleSink
+  readonly lifecycleSinkFactory?: (input: { lease: TurnLease; store: TurnEngineStore; owner: ExecutionOwnerFence }) => ToolLifecycleSink
   readonly now?: () => Date
 }
 
@@ -122,18 +123,18 @@ function modelErrorCode(error: unknown): string {
 }
 
 /** Persists lifecycle receipts even when TurnEngine's own item stream is incomplete. */
-function durableLifecycleSink(store: TurnEngineStore, lease: TurnLease): ToolLifecycleSink {
+function durableLifecycleSink(store: TurnEngineStore, owner: ExecutionOwnerFence): ToolLifecycleSink {
   return {
     async append(event: ToolLifecycleEvent): Promise<void> {
       const digest = createHash("sha256").update(JSON.stringify(event.payload)).digest("hex").slice(0, 24)
       await store.appendEvent({
-        lease,
+        owner,
         id: `tool-lifecycle:${event.item.toolCallId}:${event.phase}:${digest}`,
         itemId: null,
         type: event.eventType,
         correlationId: event.item.toolCallId,
         causationId: null,
-        idempotencyKey: `turn:${lease.turnId}:tool-lifecycle:${event.item.toolCallId}:${event.phase}:${digest}`,
+        idempotencyKey: `${owner.kind}:${owner.taskId}:tool-lifecycle:${event.item.toolCallId}:${event.phase}:${digest}`,
         payload: toRepositoryJson(event.payload),
       })
     },
@@ -159,13 +160,19 @@ export async function createCanonicalTurnRuntime(pool: pg.Pool, options: Canonic
     const selectedPolicy = policy(state.toolPolicySnapshot)
     const toolCapabilities = capabilities(state.toolPolicySnapshot)
     const turnStore = options.turnEngineStoreFactory?.(pool) ?? createPgTurnEngineStore(pool)
-    const sink = options.lifecycleSinkFactory?.({ lease, store: turnStore }) ?? durableLifecycleSink(turnStore, lease)
-    const toolRuntime = options.toolRuntimeFactory?.({ pool, policy: selectedPolicy, manager, state }) ?? createWorkerToolRuntime(pool, { sink }, selectedPolicy, { manager })
+    let lifecycleSink: ToolLifecycleSink | null = null
+    const sinkProxy: ToolLifecycleSink = { append: async (event) => {
+      if (!lifecycleSink) throw new Error("root_task_not_bound")
+      await lifecycleSink.append(event)
+    } }
+    const toolRuntime = options.toolRuntimeFactory?.({ pool, policy: selectedPolicy, manager, state }) ?? createWorkerToolRuntime(pool, { sink: sinkProxy }, selectedPolicy, { manager })
     const allowedActions = toolRuntime.registry.list(toolCapabilities).flatMap((definition) => {
       const name = definition && typeof definition === "object" && "name" in definition ? (definition as { name?: unknown }).name : undefined
       return typeof name === "string" ? [name] : []
     })
     const root = await rootTasks.ensure({ lease, goal: state.goal, modelProfileSnapshot: state.modelProfileSnapshot, toolPolicySnapshot: state.toolPolicySnapshot, budgetSnapshot: state.budgetSnapshot, allowedActions, now: now() })
+    const owner = executionOwnerFence({ kind: "turn", taskId: root.id, lease })
+    lifecycleSink = options.lifecycleSinkFactory?.({ lease, store: turnStore, owner }) ?? durableLifecycleSink(turnStore, owner)
     const config = options.modelRuntimeFactory ? undefined : await loadWorkerAiConfig(lease.userId)
     const modelRuntime = await (options.modelRuntimeFactory?.({ userId: lease.userId, config, state }) ?? createHarnessModelRuntime({ primary: config, fallbacks: [], allowEnvironmentFallbacks: false }))
     const authorize = options.authorizeUsage ?? defaultAuthorization

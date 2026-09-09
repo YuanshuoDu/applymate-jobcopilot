@@ -30,7 +30,7 @@ function fixture(owner: TurnExecutionIdentity): Fixture {
   const requests: HarnessModelRequest[] = []
   const revisions = new Map<string, number>()
   const store: TurnExecutionStore = {
-    startStep: async ({ identity, stepId, attempt }) => { stepTasks.push(identity.taskId); stepAttempts.push(attempt); return { id: stepId } },
+    startStep: async ({ identity, stepId, attempt, ordinal }) => { stepTasks.push(identity.taskId); stepAttempts.push(attempt); return { id: stepId, ordinal } },
     updateStep: async () => undefined,
     createItem: async ({ identity, itemId }) => { const item = { id: itemId, revision: 0 }; items.push(item); revisions.set(`${identity.taskId}:${itemId}`, 0); return item },
     updateItem: async ({ identity, itemId, expectedRevision }) => { const key = `${identity.taskId}:${itemId}`; expect(revisions.get(key)).toBe(expectedRevision); const revision = expectedRevision + 1; revisions.set(key, revision); return { id: itemId, revision } },

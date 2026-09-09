@@ -8,11 +8,15 @@ const lease = {
 }
 
 function pool(rows: { turn?: Record<string, unknown>; steps?: Record<string, unknown>[]; items?: Record<string, unknown>[]; inputs?: Record<string, unknown>[]; events?: Record<string, unknown>[]; snapshots?: Record<string, unknown>[] }) {
-  const client = { query: vi.fn(async (sql: string) => {
+  const client = { query: vi.fn(async (sql: string, values?: readonly unknown[]) => {
     if (sql.includes('SELECT "input"') && sql.includes('FROM "agent_turns"')) return { rows: rows.turn ? [rows.turn] : [], rowCount: rows.turn ? 1 : 0 }
-    if (sql.includes('FROM "agent_steps"')) return { rows: rows.steps ?? [], rowCount: rows.steps?.length ?? 0 }
-    if (sql.includes('FROM "agent_events"')) return { rows: rows.events ?? [], rowCount: rows.events?.length ?? 0 }
-    if (sql.includes('FROM "agent_items"')) return { rows: rows.items ?? [], rowCount: rows.items?.length ?? 0 }
+    if (sql.includes('MAX("ordinal")')) return { rows: [{ maxOrdinal: Math.max(...(rows.steps ?? []).map(step => Number(step.ordinal ?? -1)), -1) }], rowCount: 1 }
+    if (sql.includes('FROM "agent_steps"')) return { rows: (rows.steps ?? []).filter(step => step.taskId === undefined || step.taskId === null || step.taskId === values?.[2]), rowCount: rows.steps?.length ?? 0 }
+    if (sql.includes('FROM "agent_events"')) return { rows: (rows.events ?? []).filter(event => event.taskId === undefined || event.taskId === null || event.taskId === values?.[2]), rowCount: rows.events?.length ?? 0 }
+    if (sql.includes('FROM "agent_items"')) {
+      const filtered = sql.includes('item_task') ? (rows.items ?? []).filter(item => item.taskId === undefined || item.taskId === null || item.taskId === "root-1") : (rows.items ?? []).filter(item => item.taskId === undefined || item.taskId === null || item.taskId === values?.[2])
+      return { rows: filtered, rowCount: filtered.length }
+    }
     if (sql.includes('FROM "agent_context_snapshots"')) return { rows: rows.snapshots ?? [], rowCount: rows.snapshots?.length ?? 0 }
     if (sql.includes('FROM "agent_inputs"')) return { rows: rows.inputs ?? [], rowCount: rows.inputs?.length ?? 0 }
     return { rows: [], rowCount: 0 }
@@ -77,5 +81,26 @@ describe("loadCanonicalTurnState", () => {
       { id: "history:user:new-input", content: { role: "user", text: "Use Dublin" } },
       { id: "history:assistant:new-agent", content: { role: "assistant", text: "Current reply" } },
     ])
+  })
+
+  it("restores root rows while excluding child-private records and keeps legacy null rows", async () => {
+    const fake = pool({
+      turn: { input: { goal: "Continue" }, rootTaskId: "root-1", contextSnapshotId: null, modelProfileSnapshot: {}, toolPolicySnapshot: {}, budgetSnapshot: {} },
+      steps: [
+        { taskId: "root-1", ordinal: 2, attempt: 1, inputThroughSequence: "4", consumedInputIds: [], inputTokens: 1, outputTokens: 1, estimatedCostUsd: 0.01 },
+        { taskId: "child-1", ordinal: 3, attempt: 1, inputThroughSequence: "9", consumedInputIds: [], inputTokens: 50, outputTokens: 50, estimatedCostUsd: 5 },
+        { taskId: null, ordinal: 4, attempt: 1, inputThroughSequence: "5", consumedInputIds: [], inputTokens: 2, outputTokens: 2, estimatedCostUsd: 0.02 },
+      ],
+      items: [
+        { id: "root-message", turnId: "old-turn", taskId: "root-1", type: "agent_message", status: "completed", content: { text: "root history" }, historyRole: "assistant", historySequence: "5" },
+        { id: "child-message", turnId: "old-turn", taskId: "child-1", type: "agent_message", status: "completed", content: { text: "private child" }, historySequence: "6" },
+      ],
+    })
+    const value = await loadCanonicalTurnState(fake, lease)
+    expect(value.resume).toMatchObject({ nextOrdinal: 5, stepCount: 2, usage: { inputTokens: 3, outputTokens: 3 } })
+    expect(value.snapshot.steerHistory).toEqual([{ id: "history:assistant:root-message", content: { role: "assistant", text: "root history" } }])
+    expect(JSON.stringify(value.snapshot)).not.toContain("private child")
+    const stepQuery = fake.client.query.mock.calls.find(([sql]) => typeof sql === "string" && sql.includes('FROM "agent_steps"') && !sql.includes('MAX'))
+    expect(stepQuery?.[0]).toContain('"taskId" IS NULL OR "taskId" = $3')
   })
 })

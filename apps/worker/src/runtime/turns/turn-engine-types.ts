@@ -4,6 +4,7 @@ import type { PolicyRole, RepositoryJsonValue, TenantScope } from "@jobcopilot/a
 import type { StepContext, StepContextSnapshot } from "../context/step-context-builder.js"
 import type { TurnBudgetLimits } from "../budget.js"
 import type { BusinessCheck } from "../verifier.js"
+import type { ExecutionOwnerFence, TurnExecutionOwnerFence } from "../execution-owner.js"
 import type { TurnLease } from "./lease.js"
 
 export type TurnEngineItemType = "agent_message" | "reasoning_summary" | "tool_call" | "tool_result" | "error"
@@ -12,6 +13,8 @@ export type TurnEngineItemStatus = "started" | "streaming" | "completed" | "fail
 
 export type TurnEngineStep = {
   readonly id: string
+  /** Stored order allocated while holding the Turn row lock. */
+  readonly ordinal: number
 }
 
 export type TurnEngineItem = {
@@ -45,7 +48,7 @@ export type TurnEngineToolResult = {
 
 export type TurnEngineStore = {
   startStep(input: {
-    lease: TurnLease
+    owner: ExecutionOwnerFence
     stepId: string
     ordinal: number
     attempt: number
@@ -55,7 +58,7 @@ export type TurnEngineStore = {
     now: Date
   }): Promise<TurnEngineStep>
   updateStep(input: {
-    lease: TurnLease
+    owner: ExecutionOwnerFence
     stepId: string
     status: "completed" | "failed" | "interrupted" | "waiting_for_tool" | "waiting_for_approval" | "waiting_for_user"
     finishReason: string | null
@@ -65,9 +68,9 @@ export type TurnEngineStore = {
     estimatedCostUsd: number
     now: Date
   }): Promise<void>
-  waitForUser?(input: { lease: TurnLease; now: Date }): Promise<void>
+  waitForUser?(input: { owner: ExecutionOwnerFence; now: Date }): Promise<void>
   createItem(input: {
-    lease: TurnLease
+    owner: ExecutionOwnerFence
     itemId: string
     stepId: string | null
     type: TurnEngineItemType
@@ -77,7 +80,7 @@ export type TurnEngineStore = {
     now: Date
   }): Promise<TurnEngineItem>
   updateItem(input: {
-    lease: TurnLease
+    owner: ExecutionOwnerFence
     itemId: string
     expectedRevision: number
     status: TurnEngineItemStatus
@@ -88,7 +91,7 @@ export type TurnEngineStore = {
     now: Date
   }): Promise<TurnEngineItem>
   appendEvent(input: {
-    lease: TurnLease
+    owner: ExecutionOwnerFence
     id: string
     itemId: string | null
     type: string
@@ -97,7 +100,7 @@ export type TurnEngineStore = {
     idempotencyKey: string
     payload: RepositoryJsonValue
   }): Promise<{ id: string }>
-  recordFinalResponse(input: { lease: TurnLease; response: string; now: Date }): Promise<void>
+  recordFinalResponse(input: { owner: TurnExecutionOwnerFence; response: string; now: Date }): Promise<void>
 }
 
 export type TurnEngineToolExecutor = (input: {
@@ -143,7 +146,8 @@ export type TurnEngineOptions = {
   readonly rootInputId?: string
   /** Runtime-owned current task identity. Root turns use rootTaskId. */
   readonly taskId?: string
-  readonly rootTaskId?: string
+  /** A real durable root task is required; the Turn id is never a substitute. */
+  readonly rootTaskId: string
   /** Runtime-owned actor role; never supplied by model output. */
   readonly actorRole?: PolicyRole
   readonly capabilities?: readonly string[]

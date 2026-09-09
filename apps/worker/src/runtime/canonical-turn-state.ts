@@ -144,15 +144,16 @@ export async function loadCanonicalTurnState(pool: Pick<pg.Pool, "connect">, lea
     if (!turn) throw new Error("turn_not_owned")
     const stepsResult = await client.query<Row>(
       `SELECT "ordinal", "attempt", "inputThroughSequence", "consumedInputIds", "inputTokens", "outputTokens", "estimatedCostUsd"
-       FROM "agent_steps" WHERE "turnId" = $1 AND "sessionId" = $2 ORDER BY "ordinal" ASC, "attempt" ASC`, [lease.turnId, lease.sessionId],
+       FROM "agent_steps" WHERE "turnId" = $1 AND "sessionId" = $2 AND ("taskId" IS NULL OR "taskId" = $3)
+       ORDER BY "ordinal" ASC, "attempt" ASC`, [lease.turnId, lease.sessionId, turn.rootTaskId],
     )
     const itemsResult = await client.query<Row>(
       `SELECT "id", "type", "content" FROM "agent_items" WHERE "turnId" = $1 AND "sessionId" = $2
-       AND "type" IN ('tool_call', 'tool_result') ORDER BY "createdAt" ASC`, [lease.turnId, lease.sessionId],
+       AND ("taskId" IS NULL OR "taskId" = $3) AND "type" IN ('tool_call', 'tool_result') ORDER BY "createdAt" ASC`, [lease.turnId, lease.sessionId, turn.rootTaskId],
     )
     const eventsResult = await client.query<Row>(
       `SELECT "type", "payload" FROM "agent_events" WHERE "turnId" = $1 AND "sessionId" = $2
-       AND "type" IN ('tool_call.completed', 'tool_call.failed') ORDER BY "sequence" ASC`, [lease.turnId, lease.sessionId],
+       AND ("taskId" IS NULL OR "taskId" = $3) AND "type" IN ('tool_call.completed', 'tool_call.failed') ORDER BY "sequence" ASC`, [lease.turnId, lease.sessionId, turn.rootTaskId],
     )
     const priorInputs = await client.query<Row>(
       `SELECT "id", "targetTurnId", "content", "acceptedSequence", 'user' AS "historyRole", "acceptedSequence" AS "historySequence" FROM "agent_inputs"
@@ -163,7 +164,9 @@ export async function loadCanonicalTurnState(pool: Pick<pg.Pool, "connect">, lea
       `SELECT item."id", item."turnId", item."content", 'assistant' AS "historyRole",
               COALESCE(MAX(event."sequence"), 0) AS "historySequence"
        FROM "agent_items" AS item LEFT JOIN "agent_events" AS event ON event."itemId" = item."id"
+       LEFT JOIN "sub_agent_tasks" AS item_task ON item_task."id" = item."taskId"
        WHERE item."sessionId" = $1 AND item."turnId" <> $2 AND item."type" = 'agent_message' AND item."status" = 'completed'
+         AND (item."taskId" IS NULL OR item_task."rootTaskId" = item_task."id")
        GROUP BY item."id", item."turnId", item."content" ORDER BY "historySequence" ASC, item."id" ASC`, [lease.sessionId, lease.turnId],
     )
     const rootInput = await client.query<{ id: string }>(
@@ -207,18 +210,23 @@ export async function loadCanonicalTurnState(pool: Pick<pg.Pool, "connect">, lea
     }
     const steps = stepsResult.rows
     const last = steps[steps.length - 1]
+    const ordinalResult = await client.query<Row>(
+      `SELECT MAX("ordinal") AS "maxOrdinal" FROM "agent_steps" WHERE "turnId" = $1 AND "sessionId" = $2`, [lease.turnId, lease.sessionId],
+    )
+    const maxOrdinal = ordinalResult.rows[0]?.maxOrdinal === null || ordinalResult.rows[0]?.maxOrdinal === undefined
+      ? null : Number(ordinalResult.rows[0].maxOrdinal)
     const usage = steps.reduce<{ inputTokens: number; outputTokens: number; estimatedCostUsd: number }>((total, step) => {
       total.inputTokens += Number(step.inputTokens ?? 0)
       total.outputTokens += Number(step.outputTokens ?? 0)
       total.estimatedCostUsd += Number(step.estimatedCostUsd ?? 0)
       return total
     }, { inputTokens: 0, outputTokens: 0, estimatedCostUsd: 0 })
-    const resume = last ? {
-      nextOrdinal: Number(last.ordinal) + 1,
+    const resume = last || maxOrdinal !== null ? {
+      nextOrdinal: (maxOrdinal ?? Number(last.ordinal)) + 1,
       stepCount: steps.length,
       toolCallCount: itemsResult.rows.filter(item => item.type === "tool_call").length,
-      inputThroughSequence: BigInt(String(last.inputThroughSequence ?? 0)),
-      consumedInputIds: Array.isArray(last.consumedInputIds) ? last.consumedInputIds.filter((id): id is string => typeof id === "string") : [],
+      inputThroughSequence: BigInt(String(last?.inputThroughSequence ?? 0)),
+      consumedInputIds: Array.isArray(last?.consumedInputIds) ? last.consumedInputIds.filter((id): id is string => typeof id === "string") : [],
       usage,
     } satisfies TurnResumeState : undefined
     const result = { scope, goal: text(turn.input), modelProfileSnapshot: json(turn.modelProfileSnapshot), toolPolicySnapshot: turn.toolPolicySnapshot ?? {}, budgetSnapshot: turn.budgetSnapshot ?? {}, ...(typeof turn.rootTaskId === "string" ? { rootTaskId: turn.rootTaskId } : {}), ...(rootInput.rows[0] ? { rootInputId: rootInput.rows[0].id } : {}), snapshot, ...(resume ? { resume } : {}) }

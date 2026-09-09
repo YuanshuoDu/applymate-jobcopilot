@@ -12,7 +12,7 @@ const lease = {
 
 function options(store: TurnEngineStore): TurnEngineOptions {
   return {
-    lease, scope: { userId: "user-1" }, goal: "goal", snapshot: { system: [], profile: [], steerHistory: [], businessRefs: [], toolObservations: [] },
+    lease, rootTaskId: "root-1", scope: { userId: "user-1" }, goal: "goal", snapshot: { system: [], profile: [], steerHistory: [], businessRefs: [], toolObservations: [] },
     contextBuilder: { build: async () => { throw new Error("not used") } }, store,
     model: {} as ModelAdapter, tools: [], executeTool: async () => { throw new Error("not used") },
     idFactory: (() => { let index = 0; return (prefix: string) => `${prefix}:${++index}` })(),
@@ -24,7 +24,7 @@ function store(): { value: TurnEngineStore; events: Array<{ id: string; causatio
   const events: Array<{ id: string; causationId: string | null; type: string }> = []
   let revisions = 0
   const value: TurnEngineStore = {
-    startStep: async () => ({ id: "step-1" }), updateStep: async () => undefined,
+    startStep: async ({ ordinal }) => ({ id: "step-1", ordinal }), updateStep: async () => undefined,
     createItem: async ({ itemId }) => ({ id: itemId, revision: 0 }),
     updateItem: async ({ itemId }) => ({ id: itemId, revision: ++revisions }),
     appendEvent: async ({ id, causationId, type }) => { events.push({ id, causationId, type }); return { id } },

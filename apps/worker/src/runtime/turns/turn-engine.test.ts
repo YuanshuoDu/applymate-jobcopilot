@@ -27,7 +27,7 @@ function fakeStore() {
   const items: Array<{ id: string; type: string; phase: string | null; status: string; revision: number }> = []
   const steps: Array<{ id: string; status: string; errorCode: string | null }> = []
   const value: TurnEngineStore = {
-    startStep: async ({ stepId }) => { steps.push({ id: stepId, status: "streaming", errorCode: null }); return { id: stepId } },
+    startStep: async ({ stepId, ordinal }) => { steps.push({ id: stepId, status: "streaming", errorCode: null }); return { id: stepId, ordinal } },
     updateStep: async ({ stepId, status, errorCode }) => { const step = steps.find((entry) => entry.id === stepId)!; step.status = status; step.errorCode = errorCode },
     createItem: async ({ itemId, type, phase, status }) => { items.push({ id: itemId, type, phase, status, revision: 0 }); return { id: itemId, revision: 0 } },
     updateItem: async ({ itemId, expectedRevision, status }) => { const item = items.find((entry) => entry.id === itemId)!; expect(item.revision).toBe(expectedRevision); item.revision += 1; item.status = status; return { id: itemId, revision: item.revision } },
@@ -71,7 +71,7 @@ function baseOptions(overrides: Partial<TurnEngineOptions> = {}) {
     },
   }
   const options: TurnEngineOptions = {
-    lease, scope: { userId: "user-1" }, goal: "Find jobs", snapshot: { system: [], profile: [], steerHistory: [], businessRefs: [], toolObservations: [] },
+    lease, rootTaskId: "root-1", scope: { userId: "user-1" }, goal: "Find jobs", snapshot: { system: [], profile: [], steerHistory: [], businessRefs: [], toolObservations: [] },
     contextBuilder: contextBuilder(snapshots), store: fake.value, model, tools: [{ name: "jobs.search", version: "1" }, { name: "jobs.get", version: "1" }],
     executeTool: async ({ call }) => ({ id: call.id, toolName: call.toolName, toolVersion: call.toolVersion, status: "completed" as const, output: call.toolName === "jobs.search" ? { jobs: [{ id: "job-1" }] } : { job: { id: "job-1", role: "Engineer" } }, errorCode: null }),
     now: () => now, maxSteps: 5,

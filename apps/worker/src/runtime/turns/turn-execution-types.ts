@@ -20,7 +20,7 @@ import type {
 /** Identity is owner normalized; the loop never receives a raw lease. */
 export type TurnExecutionIdentity = ExecutionOwnerFence
 
-type StoreInput<K extends keyof TurnEngineStore> = Omit<Parameters<NonNullable<TurnEngineStore[K]>>[0], "lease"> & { identity: TurnExecutionIdentity }
+type StoreInput<K extends keyof TurnEngineStore> = Omit<Parameters<NonNullable<TurnEngineStore[K]>>[0], "owner"> & { identity: TurnExecutionIdentity }
 
 export type TurnExecutionStore = {
   startStep(input: StoreInput<"startStep">): Promise<TurnEngineStep>

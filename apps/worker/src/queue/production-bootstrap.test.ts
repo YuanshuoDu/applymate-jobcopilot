@@ -34,7 +34,7 @@ function runtime(events: string[]): CanonicalTurnRuntime {
 function compositionStore(): TurnEngineStore {
   const items = new Map<string, { revision: number }>()
   return {
-    startStep: async ({ stepId }) => ({ id: stepId }),
+    startStep: async ({ stepId, ordinal }) => ({ id: stepId, ordinal }),
     updateStep: async () => undefined,
     createItem: async ({ itemId }) => {
       items.set(itemId, { revision: 0 })

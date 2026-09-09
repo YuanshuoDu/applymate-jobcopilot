@@ -66,6 +66,7 @@ describe("createPgRootTaskStore", () => {
     const fake = fakePool()
     await createPgRootTaskStore(fake.pool).finish({ lease, rootTaskId: "root-turn-1", result: { status: "completed", stepCount: 1, toolCallCount: 0 } })
     expect(fake.calls.some(sql => sql.includes('"leaseVersion" = $5') && sql.includes('"leaseExpiresAt" > $6'))).toBe(true)
+    expect(fake.calls.some(sql => sql.includes('"attemptCount" = 1') && sql.includes('"leaseExpiresAt" > CURRENT_TIMESTAMP'))).toBe(true)
   })
 
   it("does not rebind a terminal root task", async () => {

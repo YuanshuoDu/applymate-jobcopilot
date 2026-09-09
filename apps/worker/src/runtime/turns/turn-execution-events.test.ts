@@ -14,7 +14,7 @@ function identity(kind: TurnExecutionIdentity["kind"], taskId: string): TurnExec
 
 function options(owner: TurnExecutionIdentity, events: Array<{ id: string; type: string; itemId: string | null; identity: TurnExecutionIdentity }>): TurnExecutionOptions {
   const store: TurnExecutionStore = {
-    startStep: async () => ({ id: "step-1" }), updateStep: async () => undefined,
+    startStep: async ({ ordinal }) => ({ id: "step-1", ordinal }), updateStep: async () => undefined,
     createItem: async ({ itemId }) => ({ id: itemId, revision: 0 }),
     updateItem: async ({ itemId, expectedRevision }) => ({ id: itemId, revision: expectedRevision + 1 }),
     appendEvent: async ({ id, type, itemId, identity }) => { events.push({ id, type, itemId, identity }); return { id } },

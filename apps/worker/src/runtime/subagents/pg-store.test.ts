@@ -89,8 +89,11 @@ describe("PgSubagentTaskStore", () => {
       return {}
     })
     const store = new PgSubagentTaskStore(fake.pool)
-    await expect(store.finish({ taskId: "task-1", sessionId: "session-1", ownerId: "worker-1", status: "failed", failureReason: "timeout", now })).resolves.toBe("retrying")
-    expect(fake.calls.find(([sql]) => sql.startsWith("UPDATE"))?.[1]).toContain("queued")
+    await expect(store.finish({ taskId: "task-1", sessionId: "session-1", ownerId: "worker-1", attemptCount: 1, status: "failed", failureReason: "timeout", now })).resolves.toBe("retrying")
+    const update = fake.calls.find(([sql]) => sql.startsWith("UPDATE"))
+    expect(update?.[0]).toContain('"attemptCount" = $9')
+    expect(update?.[0]).toContain('"leaseExpiresAt" > CURRENT_TIMESTAMP')
+    expect(update?.[1]).toContain(1)
   })
 
   it("does not report completion when the lease fence update loses a race", async () => {
@@ -100,7 +103,7 @@ describe("PgSubagentTaskStore", () => {
       return {}
     })
     const store = new PgSubagentTaskStore(fake.pool)
-    await expect(store.finish({ taskId: "task-1", sessionId: "session-1", ownerId: "worker-1", status: "completed", now })).resolves.toBeNull()
+    await expect(store.finish({ taskId: "task-1", sessionId: "session-1", ownerId: "worker-1", attemptCount: 1, status: "completed", now })).resolves.toBeNull()
   })
 
   it("releases only the fenced running lease and republishes its outbox row", async () => {
@@ -112,6 +115,7 @@ describe("PgSubagentTaskStore", () => {
     expect(updates[0]?.[0]).toContain('"leaseOwner" = $3')
     expect(updates[0]?.[0]).toContain('"status" = \'running\'')
     expect(updates[0]?.[0]).toContain('"attemptCount" = $4')
+    expect(updates[0]?.[0]).toContain('"updatedAt" = $5')
     expect(updates[0]?.[0]).toContain('"interruptRequestedAt" IS NULL')
     expect(updates[1]?.[0]).toContain("publishedAt")
     expect(updates[1]?.[1]).toEqual(["task-1"])
@@ -123,7 +127,7 @@ describe("PgSubagentTaskStore", () => {
       return {}
     })
     const store = new PgSubagentTaskStore(fake.pool)
-    await expect(store.heartbeat({ taskId: "task-1", sessionId: "session-1", ownerId: "worker-1", now })).resolves.toBe("interrupted")
+    await expect(store.heartbeat({ taskId: "task-1", sessionId: "session-1", ownerId: "worker-1", attemptCount: 1, now })).resolves.toBe("interrupted")
   })
 
   it("marks the whole root tree for interruption without cancelling terminal tasks", async () => {

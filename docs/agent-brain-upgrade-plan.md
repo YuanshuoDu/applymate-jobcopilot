@@ -86,7 +86,7 @@ flowchart TD
 - 一个根 Turn 内运行多个子 Task，不制造新的 child Turn，不伪造根 TurnLease。
 - 根执行由当前 Turn owner/version/expiry 校验；子执行由实际 Task owner/attempt/expiry 校验。
 - 任意写入还必须匹配 user、session、turn、task，且根任务未终止。
-- 子任务结果不能修改根 finalResponse、根 activeStep 或发出根完成事件。
+- 子任务结果不能修改根 finalResponse、根步骤恢复状态或发出根完成事件。当前并无数据库 activeStep 字段，恢复次序来自 Step 行。
 - 根任务 queued/waiting 期间，其他仍持有有效租约的子任务可以继续；根取消或终止会撤销这种资格。
 - Step/Item 写入真实 taskId，序号在 Turn 锁内分配，不能用并发进程内计数器。
 - 根历史读取保留旧 taskId=null 的兼容行，排除子任务私有行；子结果经过明确 join/message 才进入根上下文。
@@ -147,6 +147,18 @@ wait 的 outcome 与 `suspendedAt`、`consumedAt` 分别表达结果和交接状
 | P7 验证与发布 | Verifier/Reducer、评测、故障注入、渐进开放 | P1–P6 | 独立数据库/Worker/模型/浏览器证据与发布门槛 |
 
 P4 的副作用防绕过检查从第一项领域工具迁入时开始，不能留到最后才检查。P7 的故障测试也随相应阶段建立，最终阶段负责完整组合验收。
+
+### 4.1 执行进度口径（2026-09-08 更新）
+
+本计划共 8 个阶段（P0–P7）。只有阶段所需验收全部成立才计为完成；部分实现单独标注。阶段数量比例不等于代码量、工程工时或产品成熟度比例。
+
+当前完整验收 **1/8，12.5%**。P0 已完成：`28a4bf0` 的 [CI](https://github.com/YuanshuoDu/applymate-jobcopilot/actions/runs/34269901452)、[浏览器矩阵](https://github.com/YuanshuoDu/applymate-jobcopilot/actions/runs/34269901309) 和 [Harness contract/build](https://github.com/YuanshuoDu/applymate-jobcopilot/actions/runs/34269901461) 均已成功。真实数据库 dump rehearsal 跳过，不能算数据库验证。
+
+当前推进 P1 的工作包 1A。根循环、owner-neutral loop 和私有结果源码已有部分基础；真实 child executor/持久化等待仍未接通。P6 已有工作台 fixture 证据，但真实子任务和审批联调尚未满足其完整验收。其余阶段保持未完成。后续新提交仍须通过对应检查，P0 基线通过不代表未来 head 自动通过。
+
+2026-09-09：1A 已形成经过 Astra Review 和 Luna 返修的候选代码，覆盖真实 owner 传递、存储锁与任务/attempt 校验、全局步骤序号、根历史过滤及租约修复。两组针对性检查曾通过 26 和 29 项；最终锁/lineage 修复后重跑的 8 项及 Worker build 通过，数量有重叠。真实 PostgreSQL 验证尚缺，P1 未完整验收，阶段比例仍为 1/8。详见集成文档中的 Ownership persistence candidate。
+
+额度接近上限时报告：总阶段数、完整验收数与比例、当前工作包、此次新增证据、尚未完成及已提交/推送状态。最高产品验收仍是目标驱动的真实规划、执行、证据反馈和重新规划，而不是界面或状态字段数量。
 
 ## 5. P1–P2：先得到一个真的能带队执行的根 Agent
 

@@ -142,11 +142,11 @@ export function createPgRootTaskStore(pool: PgSubagentPool): RootTaskStore {
         if (!ownedTurn.rows[0]) throw new Error("root_turn_fenced")
         const updated = await client.query(
           `UPDATE "sub_agent_tasks" SET "status" = $1, "result" = $2::jsonb,
-             "failureReason" = $3, "leaseOwner" = NULL, "leaseExpiresAt" = NULL,
+           "failureReason" = $3, "leaseOwner" = NULL, "leaseExpiresAt" = NULL,
              "completedAt" = CASE WHEN $1 IN ('completed', 'failed', 'interrupted') THEN $4 ELSE NULL END, "updatedAt" = $4
            WHERE "id" = $5 AND "sessionId" = $6 AND "turnId" = $7 AND "rootTaskId" = $5
-             AND "leaseOwner" = $8 AND "status" = 'running'`,
-          [next, result, input.result.errorCode ?? null, now, input.rootTaskId, input.lease.sessionId, input.lease.turnId, input.lease.ownerId, input.lease.leaseExpiresAt],
+             AND "leaseOwner" = $8 AND "attemptCount" = 1 AND "leaseExpiresAt" > CURRENT_TIMESTAMP AND "status" = 'running'`,
+          [next, result, input.result.errorCode ?? null, now, input.rootTaskId, input.lease.sessionId, input.lease.turnId, input.lease.ownerId],
         )
         if (updated.rowCount !== 1) throw new Error("root_task_fenced")
       })

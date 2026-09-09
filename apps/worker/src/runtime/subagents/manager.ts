@@ -112,6 +112,7 @@ export class AgentTreeManager {
       }
       const status = await this.store.finish({
         taskId: payload.taskId, sessionId: payload.sessionId, ownerId: payload.ownerId,
+        attemptCount: lease.attemptCount,
         status: result.status, result: result.result, failureReason: result.failureReason, now: this.now(),
       })
       if (!status) return { taskId: payload.taskId, status: "lease_lost", reason: "Subagent lease was fenced" }
@@ -124,7 +125,7 @@ export class AgentTreeManager {
   async heartbeat(taskId: string, now = this.now()): Promise<boolean> {
     const active = this.active.get(taskId)
     if (!active || active.failed) return false
-    const result = await this.store.heartbeat({ taskId, sessionId: active.lease.sessionId, ownerId: active.lease.ownerId, now }).catch(() => "lost" as const)
+    const result = await this.store.heartbeat({ taskId, sessionId: active.lease.sessionId, ownerId: active.lease.ownerId, attemptCount: active.lease.attemptCount, now }).catch(() => "lost" as const)
     if (result === "renewed") return true
     active.failed = true
     const error = new SubagentLeaseError("lost", result === "interrupted" ? "Subagent tree was interrupted" : "Subagent lease renewal was rejected")

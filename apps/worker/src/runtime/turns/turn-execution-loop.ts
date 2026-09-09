@@ -51,7 +51,7 @@ export async function runTurnExecutionLoop(options: TurnExecutionOptions): Promi
       })
       lastStep = step
       await writer.append(
-        "step.started", step.id, null, { stepId: step.id, ordinal, taskId: options.identity.taskId },
+        "step.started", step.id, null, { stepId: step.id, ordinal: step.ordinal, taskId: options.identity.taskId },
         `step-started:${step.id}`,
       )
       let stepOutput: ModelStepResult | null = null

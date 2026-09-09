@@ -18,7 +18,7 @@ function state(): CanonicalTurnState {
 
 function store(events: Array<{ type: string; payload: unknown }> = []): TurnEngineStore {
   return {
-    startStep: async ({ stepId }) => ({ id: stepId }), updateStep: async () => undefined,
+    startStep: async ({ stepId, ordinal }) => ({ id: stepId, ordinal }), updateStep: async () => undefined,
     createItem: async ({ itemId }) => ({ id: itemId, revision: 0 }), updateItem: async ({ itemId, expectedRevision }) => ({ id: itemId, revision: expectedRevision + 1 }),
     appendEvent: async ({ id, type, payload }) => { events.push({ type, payload }); return { id } }, recordFinalResponse: async () => undefined,
   }
