@@ -28,6 +28,7 @@ export type UsageAuthorization = {
 
 export type CanonicalTurnRuntimeOptions = {
   readonly workerId: string
+  readonly consumeWaitOutcomes?: boolean
   readonly stateLoader?: (pool: Pick<pg.Pool, "connect">, lease: TurnLease, now?: Date) => Promise<CanonicalTurnState>
   readonly modelRuntimeFactory?: (input: { userId: string; config?: AiConfig; state: CanonicalTurnState }) => Promise<HarnessModelRuntime> | HarnessModelRuntime
   readonly authorizeUsage?: (input: { userId: string; sessionId: string; turnId: string; stepId: string; leaseOwnerId: string; leaseVersion: number; featureKey: string; provider: string; model: string }) => Promise<UsageAuthorization> | UsageAuthorization
@@ -152,11 +153,12 @@ export async function createCanonicalTurnRuntime(pool: pg.Pool, options: Canonic
   const now = options.now ?? (() => new Date())
   const manager = options.manager ?? new AgentTreeManager(new PgSubagentTaskStore(pool), { now })
   const rootTasks = options.rootTaskStore ?? createPgRootTaskStore(pool)
-  const loadState = options.stateLoader ?? loadCanonicalTurnState
   let closed = false
   const execute: TurnExecutor = async ({ lease, signal }): Promise<TurnExecutionResult> => {
     if (closed) throw new Error("canonical_runtime_closed")
-    const state = await loadState(pool, lease, now())
+    const state = options.stateLoader
+      ? await options.stateLoader(pool, lease, now())
+      : await loadCanonicalTurnState(pool, lease, now(), { consumeWaitOutcomes: options.consumeWaitOutcomes === true })
     const selectedPolicy = policy(state.toolPolicySnapshot)
     const toolCapabilities = capabilities(state.toolPolicySnapshot)
     const turnStore = options.turnEngineStoreFactory?.(pool) ?? createPgTurnEngineStore(pool)

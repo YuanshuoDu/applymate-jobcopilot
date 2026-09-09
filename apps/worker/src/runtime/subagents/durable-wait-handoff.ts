@@ -165,6 +165,11 @@ export async function suspendAndReleaseWait(pool: LeasePool, input: DurableWaitH
       if (released.rowCount !== 1) failLease("Turn lease was fenced during wait handoff")
       return { waitId: String(wait.id), handoff: "suspended", waitStatus: "waiting", idempotent: false }
     }
+    await client.query(
+      `UPDATE "agent_wait_conditions" SET "suspendedAt" = COALESCE("suspendedAt", $2), "updatedAt" = $2
+       WHERE "id" = $1 AND "userId" = $3 AND "sessionId" = $4 AND "status" IN ('ready', 'timed_out') AND "consumedAt" IS NULL`,
+      [input.waitId, now, lease.userId, lease.sessionId],
+    )
     const queued = await client.query(
       `UPDATE "agent_turns" SET "status" = 'queued', "leaseOwnerId" = NULL,
          "leaseExpiresAt" = NULL, "leaseStartedAt" = NULL, "revision" = "revision" + 1,

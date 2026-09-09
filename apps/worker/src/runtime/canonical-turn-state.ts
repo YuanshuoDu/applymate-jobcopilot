@@ -5,6 +5,7 @@ import { parseSnapshotContent } from "./context/context-snapshot-canonical.js"
 import type { StepContextSnapshot } from "./context/step-context-builder.js"
 import type { TurnLease } from "./turns/lease.js"
 import type { TurnResumeState } from "./turns/turn-engine-types.js"
+import { consumeDurableWaitOutcomes } from "./subagents/durable-wait-consumer.js"
 
 export type CanonicalTurnState = {
   readonly scope: TenantScope
@@ -126,7 +127,9 @@ function priorConversation(rows: readonly Row[], currentTurnId: string, throughS
   })
 }
 
-export async function loadCanonicalTurnState(pool: Pick<pg.Pool, "connect">, lease: TurnLease, now = new Date()): Promise<CanonicalTurnState> {
+export type CanonicalTurnStateLoadOptions = { readonly consumeWaitOutcomes?: boolean }
+
+export async function loadCanonicalTurnState(pool: Pick<pg.Pool, "connect">, lease: TurnLease, now = new Date(), options: CanonicalTurnStateLoadOptions = {}): Promise<CanonicalTurnState> {
   const client = await pool.connect()
   let committed = false
   try {
@@ -134,7 +137,8 @@ export async function loadCanonicalTurnState(pool: Pick<pg.Pool, "connect">, lea
     await client.query("SELECT set_config($1, $2, true)", ["app.user_id", lease.userId])
     const scope = { userId: lease.userId } satisfies TenantScope
     const turnResult = await client.query<Row>(
-      `SELECT "input", "rootTaskId", "contextSnapshotId", "modelProfileSnapshot", "toolPolicySnapshot", "budgetSnapshot"
+      `SELECT "id", "sessionId", "userId", "status", "leaseOwnerId", "leaseVersion", "leaseExpiresAt",
+              "input", "rootTaskId", "contextSnapshotId", "modelProfileSnapshot", "toolPolicySnapshot", "budgetSnapshot"
        FROM "agent_turns" WHERE "id" = $1 AND "sessionId" = $2 AND "userId" = $3
          AND "leaseOwnerId" = $4 AND "leaseVersion" = $5 AND "leaseExpiresAt" > $6 AND "status" = 'in_progress'
        FOR UPDATE`,
@@ -142,6 +146,7 @@ export async function loadCanonicalTurnState(pool: Pick<pg.Pool, "connect">, lea
     )
     const turn = turnResult.rows[0]
     if (!turn) throw new Error("turn_not_owned")
+    const consumedWaits = options.consumeWaitOutcomes ? await consumeDurableWaitOutcomes({ client, lease, turn, now }) : []
     const stepsResult = await client.query<Row>(
       `SELECT "ordinal", "attempt", "inputThroughSequence", "consumedInputIds", "inputTokens", "outputTokens", "estimatedCostUsd"
        FROM "agent_steps" WHERE "turnId" = $1 AND "sessionId" = $2 AND ("taskId" IS NULL OR "taskId" = $3)
@@ -194,6 +199,8 @@ export async function loadCanonicalTurnState(pool: Pick<pg.Pool, "connect">, lea
     }
     const restored = observations(itemsResult.rows, eventsResult.rows)
     const seen = new Set(snapshot.toolObservations.map(item => item.id))
+    const restoredNew = restored.filter(item => !seen.has(item.id))
+    const seenWithRestored = new Set([...seen, ...restoredNew.map(item => item.id)])
     const history = [...priorConversation(priorInputs.rows, lease.turnId, snapshotThroughSequence), ...priorConversation(priorItems.rows, lease.turnId, snapshotThroughSequence)]
       .sort((left, right) => {
         if (left.sequence === null && right.sequence === null) return left.id.localeCompare(right.id)
@@ -206,7 +213,7 @@ export async function loadCanonicalTurnState(pool: Pick<pg.Pool, "connect">, lea
       ...snapshot,
       goal: { id: `turn-goal:${lease.turnId}`, content: text(turn.input) },
       steerHistory: [...snapshot.steerHistory, ...history.filter(item => !seenHistory.has(item.id)).map(({ sequence: _sequence, ...item }) => item)],
-      toolObservations: [...snapshot.toolObservations, ...restored.filter(item => !seen.has(item.id))],
+      toolObservations: [...snapshot.toolObservations, ...restoredNew, ...consumedWaits.filter(item => !seenWithRestored.has(item.id))],
     }
     const steps = stepsResult.rows
     const last = steps[steps.length - 1]

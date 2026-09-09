@@ -67,7 +67,7 @@ describe("durable dependency wait handoff", () => {
     await expect(suspendAndReleaseWait(fake.pool as never, { lease, waitId: "wait-1", now })).resolves.toMatchObject({ handoff: "queued" })
     const second = await suspendAndReleaseWait(fake.pool as never, { lease, waitId: "wait-1", now })
     expect(second).toMatchObject({ handoff: "queued", idempotent: true })
-    expect(fake.state.updates).toEqual(["queue"])
+    expect(fake.state.updates).toEqual(["wait", "queue"])
     expect(fake.state.outbox).toBe(true)
     expect(fake.state.outboxWrites).toBe(1)
   })

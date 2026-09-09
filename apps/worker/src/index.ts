@@ -71,17 +71,20 @@ async function main() {
     process.exit(1);
   }
 
+  const childExecutionEnabled = productionChildRuntimeModule.childExecutionEnabled();
+  const consumeWaitOutcomes = process.env.ENABLE_AGENT_WAIT_RESOLVER === "1" && childExecutionEnabled;
   const canonicalRuntime = await canonicalRuntimeModule.createCanonicalTurnRuntime(getPool(), {
     workerId: process.env.WORKER_ID ?? `worker-${process.pid}`,
     authorizeUsage: aiUsageBridgeModule.createWorkerUsageAuthorizer(),
+    consumeWaitOutcomes,
   });
   // Child execution is opt-in. Keep tree-budget and child queue construction
   // out of the default startup path until the explicit feature flag is set.
   const childExecutor = productionChildRuntimeModule.createOptionalProductionChildExecutor({
-    enabled: productionChildRuntimeModule.childExecutionEnabled(),
+    enabled: childExecutionEnabled,
     pool: getPool(),
   });
-  const waitResolver = process.env.ENABLE_AGENT_WAIT_RESOLVER === "1" && childExecutor ? {} : undefined;
+  const waitResolver = consumeWaitOutcomes && childExecutor ? {} : undefined;
   const canonicalBootstrap = await productionBootstrapModule.createProductionWorkerBootstrap({
     pool: getPool(),
     runtime: canonicalRuntime,
