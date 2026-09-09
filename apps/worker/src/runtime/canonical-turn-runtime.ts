@@ -24,6 +24,7 @@ import { PgSubagentTaskStore } from "./subagents/pg-store.js"
 import { createPgRootTaskStore, type RootTaskStore } from "./subagents/root-task-store.js"
 import { executionOwnerFence, type ExecutionOwner, type ExecutionOwnerFence } from "./execution-owner.js"
 import { createCanonicalPolicy } from "./policy/canonical-policy.js"
+import { PLAN_MAX_NODES } from "./planning/goal-plan-contract.js"
 
 export type UsageAuthorization = {
   settle(input: { status: "success" | "error"; inputTokens: number; outputTokens: number; estimatedCostUsd: number; errorCode?: string }): Promise<void> | void
@@ -34,6 +35,8 @@ export type CanonicalTurnRuntimeOptions = {
   readonly consumeWaitOutcomes?: boolean
   /** Server-derived production gate; user policy cannot enable coordination. */
   readonly coordinationEnabled?: boolean
+  /** Server-derived planning gate; model policy cannot enable this option. */
+  readonly planningEnabled?: boolean
   readonly stateLoader?: (pool: Pick<pg.Pool, "connect">, lease: TurnLease, now?: Date) => Promise<CanonicalTurnState>
   readonly modelRuntimeFactory?: (input: { userId: string; config?: AiConfig; state: CanonicalTurnState }) => Promise<HarnessModelRuntime> | HarnessModelRuntime
   readonly authorizeUsage?: (input: { userId: string; sessionId: string; turnId: string; stepId: string; leaseOwnerId: string; leaseVersion: number; featureKey: string; provider: string; model: string }) => Promise<UsageAuthorization> | UsageAuthorization
@@ -159,11 +162,13 @@ export async function createCanonicalTurnRuntime(pool: pg.Pool, options: Canonic
     const state = options.stateLoader
       ? await options.stateLoader(pool, lease, now())
       : await loadCanonicalTurnState(pool, lease, now(), { consumeWaitOutcomes: options.consumeWaitOutcomes === true })
-    const selectedPolicy = createCanonicalPolicy(state.toolPolicySnapshot, options.coordinationEnabled === true)
-    const configuredCapabilities = capabilities(state.toolPolicySnapshot)
-    const toolCapabilities = options.coordinationEnabled
-      ? [...new Set([...configuredCapabilities, "canManageChildren"])]
-      : configuredCapabilities.filter(capability => capability !== "canManageChildren")
+    const selectedPolicy = createCanonicalPolicy(state.toolPolicySnapshot, options.coordinationEnabled === true, options.planningEnabled === true)
+    const configuredCapabilities = capabilities(state.toolPolicySnapshot).filter(capability => capability !== "canManageChildren" && capability !== "canPlan")
+    const toolCapabilities = [...new Set([
+      ...configuredCapabilities,
+      ...(options.coordinationEnabled ? ["canManageChildren"] : []),
+      ...(options.planningEnabled ? ["canPlan"] : []),
+    ])]
     const turnStore = options.turnEngineStoreFactory?.(pool) ?? createPgTurnEngineStore(pool)
     let lifecycleSink: ToolLifecycleSink | null = null
     let lifecycleOwner: ExecutionOwner | null = null
@@ -180,7 +185,12 @@ export async function createCanonicalTurnRuntime(pool: pg.Pool, options: Canonic
       store: new PgCoordinationStore(pool),
       wait: createPgDurableWaitPort(pool),
     } : undefined
-    const toolRuntime = options.toolRuntimeFactory?.({ pool, policy: selectedPolicy, manager, state }) ?? createWorkerToolRuntime(pool, { sink: sinkProxy, resolveOwner }, selectedPolicy, coordination)
+    const planning = options.planningEnabled ? {
+      goal: { revision: 1, objective: state.goal, constraints: [], successCriteria: [], knownFacts: [], unresolvedQuestions: [], approvalBoundaries: [], budgetRef: "runtime:turn" },
+      allowedTools: ["jobs.search", "jobs.get", "persona.retrieve", "resume.get_base", "application.get_state", "tool_results.read"],
+      allowedTemplates: [], allowedRoles: ["scout", "analyst"], maxNodes: PLAN_MAX_NODES,
+    } : undefined
+    const toolRuntime = options.toolRuntimeFactory?.({ pool, policy: selectedPolicy, manager, state }) ?? createWorkerToolRuntime(pool, { sink: sinkProxy, resolveOwner }, selectedPolicy, coordination, undefined, undefined, undefined, planning)
     const allowedActions = toolRuntime.registry.list(toolCapabilities).flatMap((definition) => {
       const name = definition && typeof definition === "object" && "name" in definition ? (definition as { name?: unknown }).name : undefined
       return typeof name === "string" ? [name] : []

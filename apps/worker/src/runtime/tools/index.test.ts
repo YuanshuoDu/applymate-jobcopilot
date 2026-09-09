@@ -4,6 +4,7 @@ import { createWorkerToolRuntime } from "./index.js"
 import { InMemoryToolLifecycleSink } from "./lifecycle.js"
 import type { ExecutionOwner } from "../execution-owner.js"
 import type { CoordinationStore, DurableWaitPort } from "./coordination-types.js"
+import type { PlanProposalToolOptions } from "../planning/plan-proposal-tool.js"
 
 const owner: ExecutionOwner = {
   kind: "turn", taskId: "root-1", lease: {
@@ -75,5 +76,13 @@ describe("worker tool runtime entry point", () => {
     const definition = runtime.registry.resolve("wait_subagents", "1")
     await definition.execute({ scope: { userId: "user-1" }, sessionId: "session-1", turnId: "turn-1", stepId: "step-1", signal: new AbortController().signal, capabilities: ["canManageChildren"], reportProgress: async () => undefined }, { idempotencyKey: "wait-1", taskIds: ["child-1"], mode: "any", timeoutMs: 1000 })
     expect(wait.wait).toHaveBeenCalledWith(expect.objectContaining({ userId: "user-1", targetTaskIds: ["child-1"], idempotencyKey: "wait-1" }))
+  })
+
+  it("registers the planning tool only when server-owned planning options are supplied", () => {
+    const options: PlanProposalToolOptions = { goal: { revision: 1, objective: "Find jobs", constraints: [], successCriteria: ["review"], knownFacts: [], unresolvedQuestions: [], approvalBoundaries: [], budgetRef: "runtime:turn" }, allowedTools: ["jobs.search"], allowedTemplates: [], allowedRoles: ["scout", "analyst"], maxNodes: 8 }
+    const disabled = createWorkerToolRuntime({} as never, { sink: new InMemoryToolLifecycleSink(), resolveOwner: () => owner })
+    expect(() => disabled.registry.resolve("agent.plan.propose", "1")).toThrow("not registered")
+    const enabled = createWorkerToolRuntime({} as never, { sink: new InMemoryToolLifecycleSink(), resolveOwner: () => owner }, undefined, undefined, undefined, undefined, undefined, options)
+    expect(enabled.registry.resolve("agent.plan.propose", "1")).toMatchObject({ requiredCapabilities: ["canPlan"], risk: "internal_write" })
   })
 })

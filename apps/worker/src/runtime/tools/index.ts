@@ -17,6 +17,7 @@ import { createGmailTools } from "./gmail-tools.js"
 import type { GmailToolOptions } from "./gmail-types.js"
 import { createWriteTools, type WriteToolOptions } from "./write-tools.js"
 import type { RuntimeToolDefinition } from "./types.js"
+import { createPlanProposalTool, type PlanProposalToolOptions } from "../planning/plan-proposal-tool.js"
 
 export * from "./lifecycle.js"
 export * from "./read-data-source.js"
@@ -39,6 +40,7 @@ export * from "./write-tools.js"
 export * from "./tool-result-reference-repo.js"
 export * from "./tool-result-reference-types.js"
 export * from "./tool-results-read-tool.js"
+export * from "../planning/plan-proposal-tool.js"
 export * from "../policy/index.js"
 
 export type WorkerCoordinationOptions = {
@@ -59,6 +61,7 @@ export function createWorkerToolRuntime(
   gmail?: WorkerGmailOptions,
   artifacts?: WorkerArtifactOptions,
   write?: WorkerWriteOptions,
+  planning?: PlanProposalToolOptions,
 ): { registry: ToolRegistry; router: ToolRouter; references: ToolLifecycleOptions["references"] } {
   const durableResults = lifecycleOptions.durableResults ?? createToolResultReferenceRepository(pool)
   const definitions = createReadOnlyTools(createPostgresReadToolDataSource(pool))
@@ -77,6 +80,7 @@ export function createWorkerToolRuntime(
   if (gmail) definitions.push(...createGmailTools(gmail))
   if (artifacts) definitions.push(...createArtifactTools(artifacts.store))
   if (write) definitions.push(...createWriteTools({ pool, ...write }))
+  if (planning) definitions.push(createPlanProposalTool(planning) as RuntimeToolDefinition)
   const registry = new ToolRegistry(definitions)
   const lifecycle = new ToolLifecycle({ ...lifecycleOptions, durableResults })
   return { registry, router: new ToolRouter(registry, lifecycle, policy), references: lifecycleOptions.references }

@@ -9,6 +9,9 @@ const coordinationTool: PolicyToolDescriptor = {
 const coordinationReadTool: PolicyToolDescriptor = {
   name: "list_subagents", version: "1", risk: "read", domain: "coordination", capabilities: ["read", "coordination"], requiredCapabilities: ["canManageChildren"],
 }
+const planningTool: PolicyToolDescriptor = {
+  name: "agent.plan.propose", version: "1", risk: "internal_write", domain: "coordination", capabilities: ["coordination"], requiredCapabilities: ["canPlan"],
+}
 const readTool: PolicyToolDescriptor = { name: "jobs.search", version: "1", risk: "read", domain: "jobs", capabilities: ["read"], requiredCapabilities: [] }
 const writeTool: PolicyToolDescriptor = { name: "application.submit", version: "1", risk: "external_write", domain: "application", capabilities: ["external_write"], requiredCapabilities: [] }
 
@@ -37,6 +40,11 @@ describe("canonical root policy", () => {
 
   it("keeps coordination denied when the server gate is off", () => {
     expect(createCanonicalPolicy({}, false).evaluate(context(coordinationTool))).toMatchObject({ outcome: "deny", reasonCode: "missing_policy" })
+  })
+
+  it("allows planning only with the planning gate and derived capability", () => {
+    expect(createCanonicalPolicy({}, false, true).evaluate(context(planningTool, ["read", "canPlan"]))).toMatchObject({ outcome: "allow", reasonCode: "server_planning_gate" })
+    expect(createCanonicalPolicy({}, true, false).evaluate(context(planningTool))).toMatchObject({ outcome: "deny" })
   })
 
   it("fails closed for a present but malformed snapshot instead of falling back", () => {

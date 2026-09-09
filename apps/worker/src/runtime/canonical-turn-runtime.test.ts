@@ -123,10 +123,10 @@ function setup(overrides: Record<string, unknown> = {}) {
   return { runtime, roots, tool, getModelCalls: () => calls }
 }
 
-async function rootToolNames(coordinationEnabled: boolean): Promise<string[]> {
+async function rootToolNames(coordinationEnabled: boolean, planningEnabled = false, capabilities = ["read"]): Promise<string[]> {
   const requests: HarnessModelRequest[] = []
   const runtime = await createCanonicalTurnRuntime({ connect: vi.fn() } as never, {
-    workerId: "worker-1", coordinationEnabled, stateLoader: async () => ({ ...state(), toolPolicySnapshot: { capabilities: ["read"] } }),
+    workerId: "worker-1", coordinationEnabled, planningEnabled, stateLoader: async () => ({ ...state(), toolPolicySnapshot: { capabilities } }),
     rootTaskStore: rootStore() as never, turnEngineStoreFactory: () => store(), contextBuilderFactory: () => contextBuilder(),
     modelRuntimeFactory: async () => ({ adapter: {
       ...model(() => []),
@@ -151,6 +151,13 @@ describe("createCanonicalTurnRuntime", () => {
     expect(disabled).not.toEqual(expect.arrayContaining(["spawn_subagent", "wait_subagents", "list_subagents", "send_message", "interrupt_subagent", "close_subagent"]))
     const enabled = await rootToolNames(true)
     expect(enabled).toEqual(expect.arrayContaining(["spawn_subagent", "wait_subagents", "list_subagents", "send_message", "interrupt_subagent", "close_subagent"]))
+  })
+
+  it("derives root planning capability only from the planning gate", async () => {
+    const forged = await rootToolNames(false, false, ["read", "canPlan"])
+    expect(forged).not.toContain("agent.plan.propose")
+    const enabled = await rootToolNames(false, true)
+    expect(enabled).toContain("agent.plan.propose")
   })
 
   it("settles the root after the real wait transition and releases its task lease", async () => {
