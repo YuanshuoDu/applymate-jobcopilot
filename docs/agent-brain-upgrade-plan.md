@@ -212,6 +212,14 @@ P3-13 提交 `46a19c38`（2026-09-09）已推送到当前分支：canonical stat
 
 Astra 独立复核为 3 个文件、29/29 tests；Worker TypeScript、shared build 和 `git diff --check` 均通过。没有数据库、provider、queue、migration 或 Web 变更；当前还没有 goal-update event，只接受 revision 1，真实 PostgreSQL/RLS、provider、queue、进程重启和 child-parent E2E 仍未验证。总体完整验收保持 **1/8（12.5%）**，P3-13 不计作阶段完成。
 
+## P3-14 update
+
+P3-14 提交 `f5638ff6`，随后由修复提交 `48901262` 补齐 replay durability。`agent.goal.update` 只接受严格 `changes` patch，服务器从当前 GoalContract 合并并执行连续 CAS、`MAX_GOAL_REVISIONS=8` 上限和 `budgetRef=runtime:turn`；超限保留可见 `goal_revision_limit`。成功结果写入有界 `goal.revision` receipt，canonical state 按连续 event sequence 恢复最新 GoalContract，并使旧 plan revision/hash 失效。
+
+Turn replay 在已持久化 accepted goal-update tool result、但缺少对应 `goal.revision` 时，会校验原 tool name/input、解析持久化 receipt、以幂等键补写事件并更新有界 snapshot；已有 projection 不重复写入。每个 Turn 的 server-owned `GoalContractRef` 同步 goal update、plan proposal、canonical plan bridge 和 final verification/finalizer，goal revision 变化会清空旧 plan revision/hash，支持同一 Turn 内重新规划。
+
+Astra 独立验证：focused 10 个文件、86/86 tests；regression 5 个文件、53/53 tests；agent-protocol event checks 2/2；Worker TypeScript、shared/protocol build 和 `git diff --check` 均通过。当前候选只完成源码/单元与 focused composition 证据；未运行 live PostgreSQL/RLS、Redis、provider、queue、进程 restart 或跨进程恢复，因此总体完整验收保持 **1/8（12.5%）**，P3-14 不计作阶段完成。
+
 ## P2-OUTBOX-1 update
 
 P2-OUTBOX-1 提交 `57dd0ac9`（2026-09-09）已推送到当前分支：canonical Turn dispatch 在 `queue.add` 成功后使用同一 outbox row 做 guarded publishedAt/attemptCount/lastError 记账；queue.add 失败记录 `queue_add_failed` 并保持未发布；enqueue 成功但记账不确定时返回 `turn_dispatch_delivery_uncertain`，下一次使用相同 generation/jobId 依靠 BullMQ 幂等。该语义是 at-least-once 加 idempotent job ID，不承诺 exactly-once。

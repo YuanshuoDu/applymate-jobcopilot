@@ -290,6 +290,14 @@ Commit `46a19c38` adds runtime hydration for the canonical structured GoalContra
 
 The planner now receives constraints, successCriteria, knownFacts, unresolvedQuestions and approvalBoundaries from the hydrated contract. Hard budget remains server-owned by budgetSnapshot. Evidence: Astra independently reran **3 files / 29 tests**, Worker TypeScript, shared package build and `git diff --check`. No database, provider, queue, migration or Web behavior changed. A goal-update event and revisions beyond 1 are not implemented; real PostgreSQL/RLS, provider, queue delivery, process restart and child-parent E2E remain unverified. The phase metric remains **1/8 (12.5%)**.
 
+## P3-14 update
+
+Commit `f5638ff6` adds the server-owned `agent.goal.update` candidate; repair commit `48901262` closes the replay durability gap. The tool accepts only the bounded semantic `changes` patch, merges against the current GoalContract, advances by contiguous CAS, forces `budgetRef=runtime:turn`, enforces `MAX_GOAL_REVISIONS=8`, and preserves visible `goal_revision_limit`. Accepted receipts are bounded `goal.revision` events; canonical restore accepts only the continuous sequence and filters old plan revisions/hashes.
+
+Replay verifies the persisted tool name/input as before. When an accepted goal-update result exists without its matching goal-revision projection, the loop parses the persisted receipt, appends the deterministic idempotent `goal.revision`, and updates the bounded snapshot; an existing projection is not duplicated. A server-owned per-Turn `GoalContractRef` is shared by goal update, plan proposal, canonical bridge and final verification/finalization; goal changes reset old plan revision/hash state so a same-Turn replan uses the current goal.
+
+Astra independently verified **10 files / 86 focused tests** and **5 files / 53 regression tests**; the agent-protocol event check passed **2/2**; Worker TypeScript, shared/protocol builds and `git diff --check` passed. No live DB/PostgreSQL/RLS, Redis, provider, queue, process restart or cross-process recovery was run. The phase metric remains **1/8 (12.5%)**.
+
 ## P2-OUTBOX-1 update
 
 Commit `57dd0ac9` repairs canonical Turn dispatch bookkeeping after enqueue. A successful `queue.add` is followed by a guarded outbox update using the same row ID, setting `publishedAt`, incrementing `attemptCount` and clearing `lastError`; a second drain therefore does not dispatch the same published row again. Queue-add failure records bounded `queue_add_failed` state while leaving the row unpublished for retry. If enqueue succeeds but the bookkeeping update is uncertain, recovery returns `turn_dispatch_delivery_uncertain` and reuses the same generation/job ID rather than inventing another delivery generation.
