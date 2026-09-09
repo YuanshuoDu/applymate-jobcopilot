@@ -25,27 +25,14 @@ import { createPgRootTaskStore, type RootTaskStore } from "./subagents/root-task
 import { executionOwnerFence, type ExecutionOwner, type ExecutionOwnerFence } from "./execution-owner.js"
 import { createCanonicalPolicy } from "./policy/canonical-policy.js"
 import { PLAN_MAX_NODES } from "./planning/goal-plan-contract.js"
+import { createCanonicalPlanExecutionFactory, type CanonicalPlanExecutionOptions } from "./planning/canonical-plan-execution.js"
 
 export type UsageAuthorization = {
   settle(input: { status: "success" | "error"; inputTokens: number; outputTokens: number; estimatedCostUsd: number; errorCode?: string }): Promise<void> | void
 }
 
-type CanonicalToolRegistry = {
-  list(capabilities?: readonly string[]): readonly unknown[]
-  validateArguments(name: string, input: unknown, version?: string): true | string
-}
-
-/** Server-owned inputs for the optional plan execution seam. */
-export type CanonicalPlanExecutionFactoryInput = {
-  readonly lease: TurnLease
-  readonly rootTaskId: string
-  readonly taskId: string
-  readonly state: CanonicalTurnState
-  readonly scope: CanonicalTurnState["scope"]
-  readonly router: ToolRouter
-  readonly registry: CanonicalToolRegistry
-  readonly policy: PolicyEngine
-}
+/** Server-owned inputs for the gated default or custom plan execution bridge. */
+export type CanonicalPlanExecutionFactoryInput = CanonicalPlanExecutionOptions & { readonly state: CanonicalTurnState }
 
 export type CanonicalTurnRuntimeOptions = {
   readonly workerId: string
@@ -56,7 +43,7 @@ export type CanonicalTurnRuntimeOptions = {
   readonly planningEnabled?: boolean
   /** Independent server gate for the optional plan execution hook; default is disabled. */
   readonly planningExecutionEnabled?: boolean
-  /** Server-owned factory; absent or undefined result keeps plan execution unconnected. */
+  /** Optional server-owned override; absent uses the default bridge when both gates are on. */
   readonly planExecutionFactory?: (input: CanonicalPlanExecutionFactoryInput) => TurnEngineOptions["executePlan"] | undefined
   readonly stateLoader?: (pool: Pick<pg.Pool, "connect">, lease: TurnLease, now?: Date) => Promise<CanonicalTurnState>
   readonly modelRuntimeFactory?: (input: { userId: string; config?: AiConfig; state: CanonicalTurnState }) => Promise<HarnessModelRuntime> | HarnessModelRuntime
@@ -220,8 +207,10 @@ export async function createCanonicalTurnRuntime(pool: pg.Pool, options: Canonic
     const owner = executionOwnerFence({ kind: "turn", taskId: root.id, lease })
     lifecycleOwner = { kind: "turn", taskId: root.id, lease }
     lifecycleSink = options.lifecycleSinkFactory?.({ lease, store: turnStore, owner }) ?? durableLifecycleSink(turnStore, owner)
-    const executePlan = options.planningEnabled === true && options.planningExecutionEnabled === true && options.planExecutionFactory
-      ? options.planExecutionFactory({ lease, rootTaskId: root.id, taskId: root.id, state, scope: state.scope, router: toolRuntime.router, registry: toolRuntime.registry, policy: selectedPolicy })
+    const actorRole = (record(state.toolPolicySnapshot).role as PolicyRole | undefined) ?? "orchestrator"
+    const planFactory = options.planExecutionFactory ?? createCanonicalPlanExecutionFactory
+    const executePlan = options.planningEnabled === true && options.planningExecutionEnabled === true && planning
+      ? planFactory({ lease, rootTaskId: root.id, taskId: root.id, state, scope: state.scope, router: toolRuntime.router, registry: toolRuntime.registry, policy: selectedPolicy, goal: planning.goal, allowedTools: planning.allowedTools, allowedTemplates: planning.allowedTemplates, allowedRoles: planning.allowedRoles, maxNodes: planning.maxNodes, capabilities: toolCapabilities, actorRole })
       : undefined
     const config = options.modelRuntimeFactory ? undefined : await loadWorkerAiConfig(lease.userId)
     const modelRuntime = await (options.modelRuntimeFactory?.({ userId: lease.userId, config, state }) ?? createHarnessModelRuntime({ primary: config, fallbacks: [], allowEnvironmentFallbacks: false }))
@@ -233,7 +222,7 @@ export async function createCanonicalTurnRuntime(pool: pg.Pool, options: Canonic
       lease, scope: state.scope, goal: state.goal, snapshot: state.snapshot, contextBuilder,
       store: turnStore, model, tools: toolRuntime.registry.list(toolCapabilities),
       executeTool: createToolRouterExecutor(toolRuntime.router), rootInputId: state.rootInputId, rootTaskId: root.id, taskId: root.id,
-      actorRole: (record(state.toolPolicySnapshot).role as PolicyRole | undefined) ?? "orchestrator", capabilities: toolCapabilities,
+      actorRole, capabilities: toolCapabilities,
       validateToolArguments: (name, input) => toolRuntime.registry.validateArguments(name, input, "1"), signal,
       budget: limits(state.budgetSnapshot), resume: state.resume, now, publishReasoningSummary: false,
       ...(executePlan ? { executePlan } : {}),

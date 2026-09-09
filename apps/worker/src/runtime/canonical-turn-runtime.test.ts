@@ -145,6 +145,51 @@ async function rootToolNames(coordinationEnabled: boolean, planningEnabled = fal
   }) ?? []
 }
 
+async function runDefaultPlanBridge(planningExecutionEnabled: boolean) {
+  const roots = rootStore()
+  const calls: string[] = []
+  let modelCalls = 0
+  const proposal = {
+    schemaVersion: "agent-harness.plan.v1", basedOnGoalRevision: 1, basedOnPlanRevision: null,
+    nodes: [{ localId: "read", kind: "use_tool", objective: "Read jobs", inputRefs: [], dependsOn: [], successCriteria: ["done"], outputSchemaRef: null, toolName: "jobs.search" }],
+    completionCriteria: ["finish"], briefRationale: "bounded",
+  }
+  const tool = {
+    execute: vi.fn(async (_context: unknown, call: { id: string; toolName: string; toolVersion: string; input: unknown }) => {
+      calls.push(call.toolName)
+      return { ...call, status: "completed" as const, output: call.toolName === "agent.plan.propose" ? { status: "accepted", goalRevision: 1, planRevision: 1, basedOnPlanRevision: null, proposal, intents: [] } : { found: true }, errorCode: null }
+    }),
+    registry: {
+      list: () => [
+        { name: "agent.plan.propose", version: "1", risk: "internal_write", capabilities: ["coordination"] },
+        { name: "jobs.search", version: "1", risk: "read", capabilities: ["read"] },
+      ],
+      validateArguments: () => true as const,
+    },
+    router: { execute: async (context: unknown, call: { id: string; toolName: string; toolVersion: string; input: unknown }) => tool.execute(context, call) },
+  }
+  const runtime = await createCanonicalTurnRuntime({ connect: vi.fn() } as never, {
+    workerId: "worker-1", planningEnabled: true, planningExecutionEnabled, stateLoader: async () => state(), rootTaskStore: roots as never,
+    modelRuntimeFactory: async () => ({ adapter: {
+      ...model(() => []),
+      async *stream() {
+        modelCalls += 1
+        if (modelCalls === 1) {
+          yield { type: "tool_call_completed", callId: "plan-call", name: "agent.plan.propose", arguments: { proposal } }
+          yield { type: "completed", finishReason: "tool_calls" }
+        } else {
+          yield { type: "text_delta", text: "done" }
+          yield { type: "completed", finishReason: "stop" }
+        }
+      },
+    }, registry: {} as never, candidates: [] }),
+    toolRuntimeFactory: () => tool as never, turnEngineStoreFactory: () => store(), contextBuilderFactory: () => contextBuilder(),
+    authorizeUsage: async () => ({ settle: async () => undefined }),
+  })
+  const result = await runtime.execute({ lease, signal: new AbortController().signal })
+  return { result, calls }
+}
+
 describe("createCanonicalTurnRuntime", () => {
   it("derives root coordination capability from the production gate", async () => {
     const disabled = await rootToolNames(false)
@@ -158,6 +203,15 @@ describe("createCanonicalTurnRuntime", () => {
     expect(forged).not.toContain("agent.plan.propose")
     const enabled = await rootToolNames(false, true)
     expect(enabled).toContain("agent.plan.propose")
+  })
+
+  it("uses the default plan bridge only when planning execution is explicitly enabled", async () => {
+    const disabled = await runDefaultPlanBridge(false)
+    expect(disabled.result.status).toBe("completed")
+    expect(disabled.calls).toEqual(["agent.plan.propose"])
+    const enabled = await runDefaultPlanBridge(true)
+    expect(enabled.result.status).toBe("completed")
+    expect(enabled.calls).toEqual(["agent.plan.propose", "jobs.search"])
   })
 
   it("keeps plan execution behind both server gates and passes server-owned context", async () => {
