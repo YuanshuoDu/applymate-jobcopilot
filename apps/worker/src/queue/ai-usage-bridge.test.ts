@@ -34,6 +34,25 @@ describe("Worker AI usage bridge", () => {
     expect(JSON.parse(String(fetcher.mock.calls[1]?.[1]?.body))).toEqual(expect.objectContaining({ operation: "settle", input: expect.objectContaining({ operationId: "agent-usage-1", userId: "user-1", provider: "minimax", model: "MiniMax-M3" }) }))
   })
 
+  it("accepts a child Task owner envelope without retaining root lease fields", async () => {
+    const fetcher = vi.fn().mockResolvedValueOnce(response({ status: "authorized", operationId: "child-usage-1" }))
+    const { leaseOwnerId: _leaseOwnerId, leaseVersion: _leaseVersion, ...common } = input
+    const childInput = {
+      ...common,
+      executionOwner: { kind: "task" as const, taskId: "child-1", rootTaskId: "root-1", ownerId: "child-worker", attemptCount: 2 },
+    }
+    const authorizer = createWorkerUsageAuthorizer({ endpointUrl: "https://applymate.example/api/internal/agent-runtime/usage", secret: "secret", fetch: fetcher })
+    await authorizer(childInput)
+    expect(JSON.parse(String(fetcher.mock.calls[0]?.[1]?.body))).toEqual(expect.objectContaining({ operation: "authorize", input: childInput }))
+  })
+
+  it("rejects a mixed legacy and child owner", async () => {
+    const fetcher = vi.fn()
+    const authorizer = createWorkerUsageAuthorizer({ endpointUrl: "https://applymate.example/api/internal/agent-runtime/usage", secret: "secret", fetch: fetcher })
+    await expect(authorizer({ ...input, executionOwner: { kind: "task", taskId: "child-1", rootTaskId: "root-1", ownerId: "child-worker", attemptCount: 2 } } as never)).rejects.toMatchObject({ code: "usage_context_unavailable" })
+    expect(fetcher).not.toHaveBeenCalled()
+  })
+
   it("does not retry an uncertain admission or expose response text", async () => {
     const fetcher = vi.fn().mockResolvedValue(response({ code: "provider_error", error: "secret key leaked" }, 503))
     const authorizer = createWorkerUsageAuthorizer({ endpointUrl: "https://applymate.example/api/internal/agent-runtime/usage", secret: "secret", fetch: fetcher })

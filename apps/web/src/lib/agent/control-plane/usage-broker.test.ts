@@ -56,6 +56,38 @@ describe("AI usage broker", () => {
     await expect(admitAiUsage(settled.db, input)).rejects.toMatchObject({ code: "usage_attempt_settled", status: 409 })
   })
 
+  it("admits a running child Task fence and distinguishes its captured attempts", async () => {
+    mocked.getEffectiveEntitlements.mockResolvedValue({ limits: { ai_credits: 2 } })
+    const { leaseOwnerId: _leaseOwnerId, leaseVersion: _leaseVersion, ...common } = input
+    const child = {
+      ...common,
+      executionOwner: { kind: "task" as const, taskId: "child-1", rootTaskId: "root-1", ownerId: "child-worker", attemptCount: 2 },
+    }
+    const admitChild = async (attemptCount: number) => {
+      const { db, tx } = database(async () => {
+        const count = tx.$queryRaw.mock.calls.length
+        if (count === 2) return [{ id: child.stepId }]
+        if (count === 6) return [{ used: 1 }]
+        return []
+      })
+      return admitAiUsage(db, { ...child, executionOwner: { ...child.executionOwner, attemptCount } }, new Date("2026-09-07T12:00:00.000Z"))
+    }
+    const first = await admitChild(2)
+    const second = await admitChild(3)
+    expect(first.operationId).not.toBe(second.operationId)
+  })
+
+  it("rejects an unowned or expired child fence before reserving credit", async () => {
+    mocked.getEffectiveEntitlements.mockResolvedValue({ limits: { ai_credits: 2 } })
+    const { leaseOwnerId: _leaseOwnerId, leaseVersion: _leaseVersion, ...common } = input
+    const { db, tx } = database(async () => [])
+    await expect(admitAiUsage(db, {
+      ...common,
+      executionOwner: { kind: "task", taskId: "child-1", rootTaskId: "root-1", ownerId: "child-worker", attemptCount: 2 },
+    })).rejects.toMatchObject({ code: "usage_fence_rejected", status: 409 })
+    expect(tx.$queryRaw).toHaveBeenCalledTimes(2)
+  })
+
   it("settles a reserved attempt idempotently and refuses a conflicting outcome", async () => {
     const operationId = "agent-usage-test"
     const settlement = { operationId, userId: input.userId, provider: input.provider, model: input.model, status: "success" as const, inputTokens: 10, outputTokens: 4, estimatedCostUsd: 0.01 }

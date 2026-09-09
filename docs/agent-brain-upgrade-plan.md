@@ -162,7 +162,9 @@ P4 的副作用防绕过约束从第一项领域工具迁入时保留。按用�
 
 开发顺序继续为 1B → 1C → 2A/2B → P3 首个目标驱动切片。1A 的 PostgreSQL/并发/RLS 欠账不作为启动这些开发工作的前置门槛；已实现、快速检查通过、完整验收通过分别记录。2026-09-09 的有界环境探查确认本机 Docker backend 不可用，未创建数据库或运行迁移；不继续排查宿主环境。最终可采用隔离 CI PostgreSQL service 做集成证明。
 
-1B 随后的候选代码已接入根运行时：大工具最终结果写入私有存储，实际 registry 注册分块读取，根 Task 创建后绑定当前 owner；输入/进度和异常使用有界清理结果。Astra Review 发现的异常返回绕过路径已由 Luna 修正。初始相关组 14 项、修正后的 router 组 9 项与 Worker 编译通过；真实数据库/跨进程读取延后验证。下一开发包为 1C，阶段完整验收仍为 1/8。
+1B 随后的候选代码已接入根运行时：大工具最终结果写入私有存储，实际 registry 注册分块读取，根 Task 创建后绑定当前 owner；输入/进度和异常使用有界清理结果。Astra Review 发现的异常返回绕过路径已由 Luna 修正。初始相关组 14 项、修正后的 router 组 9 项与 Worker 编译通过；真实数据库/跨进程读取延后验证。
+
+1C-A1（2026-09-09）已完成候选实现：Worker/Web usage admission 接受明确的 root/child owner envelope；根可使用真实 root Task Step 或旧 null-task 兼容行，child 必须通过同一树、当前 attempt、租约、状态和 streaming Step 校验。混合身份在 bridge、route、broker normalization 均 fail closed。Web admission 13/13、Worker bridge 5/5、shared package build 及 diff check 通过。生产 child executor、整树持久化预算和 consumer 注册仍未实现，阶段完整验收仍为 1/8；下一包为 1C-B（共享树预算与真实 child executor）。
 
 ### 4.2 用户可观察的交付节点
 
@@ -212,6 +214,8 @@ P3 的第一个切片只使用已接通的少量只读能力，不等待所有�
 ### 工作包 1C：真实子执行器与账户预算
 
 现有入口：`subagents/executor.ts`、`subagents/manager.ts`、`subagents/role-profiles.ts`、`subagents/role-policy.ts`、`turns/turn-execution-loop.ts` 与已接入的 Web internal usage broker。
+
+2026-09-09 的接线调查将此包拆为几个可提交切片：先扩展 Worker/Web 的子任务账户准入身份；随后补充共享树预算预留、按 child attempt 认领输入/构建上下文和真实模型/工具执行器；最后在 production bootstrap 中注册。现有 `StepContextBuilder` 的输入认领只有根 Turn leaseVersion，不能直接当作 child attempt fence 使用；现有 `ai_budgets` 约束账户额度，但尚无独立的持久化整树预留来源。子任务沿用父 `budgetSnapshot` 不能被解释为获得另一份可独立花完的额度。只完成准入身份切片时，生产 child consumer 仍保持未启用。
 
 具体工作：
 

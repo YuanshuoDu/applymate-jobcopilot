@@ -1,4 +1,8 @@
-export type WorkerUsageAuthorizationInput = {
+export type WorkerUsageExecutionOwner =
+  | { kind: "turn"; leaseOwnerId: string; leaseVersion: number }
+  | { kind: "task"; taskId: string; rootTaskId: string; ownerId: string; attemptCount: number }
+
+type WorkerUsageCommon = {
   userId: string
   featureKey: string
   turnId: string
@@ -6,10 +10,12 @@ export type WorkerUsageAuthorizationInput = {
   provider: string
   model: string
   sessionId: string
-  leaseOwnerId: string
-  leaseVersion: number
   attemptId?: string
 }
+
+type WorkerLegacyTurnOwner = { executionOwner?: never; leaseOwnerId: string; leaseVersion: number }
+type WorkerEnvelopedOwner = { executionOwner: WorkerUsageExecutionOwner; leaseOwnerId?: never; leaseVersion?: never }
+export type WorkerUsageAuthorizationInput = WorkerUsageCommon & (WorkerLegacyTurnOwner | WorkerEnvelopedOwner)
 
 export type WorkerUsageSettlementInput = {
   status: "success" | "error"
@@ -55,7 +61,23 @@ function safeCode(value: unknown, fallback: string): string {
 }
 
 function requiredContext(input: WorkerUsageAuthorizationInput): void {
-  if (!input.sessionId.trim() || !input.leaseOwnerId.trim() || !Number.isSafeInteger(input.leaseVersion) || input.leaseVersion < 0) {
+  if (!input.sessionId.trim()) throw new UsageBridgeError("usage_context_unavailable")
+  const row = input as unknown as Record<string, unknown>
+  const hasEnvelope = Object.prototype.hasOwnProperty.call(row, "executionOwner")
+  const hasLegacy = Object.prototype.hasOwnProperty.call(row, "leaseOwnerId") || Object.prototype.hasOwnProperty.call(row, "leaseVersion")
+  const hasTaskFields = ["taskId", "rootTaskId", "ownerId", "attemptCount"].some(key => Object.prototype.hasOwnProperty.call(row, key))
+  if (hasTaskFields && (hasEnvelope || hasLegacy)) throw new UsageBridgeError("usage_context_unavailable")
+  if (hasEnvelope === hasLegacy) throw new UsageBridgeError("usage_context_unavailable")
+  if (hasEnvelope) {
+    const owner = row.executionOwner as Record<string, unknown> | null
+    if (!owner || typeof owner !== "object" || Array.isArray(owner)) throw new UsageBridgeError("usage_context_unavailable")
+    const hasTaskFields = ["taskId", "rootTaskId", "ownerId", "attemptCount"].some(key => Object.prototype.hasOwnProperty.call(owner, key))
+    const hasTurnFields = ["leaseOwnerId", "leaseVersion"].some(key => Object.prototype.hasOwnProperty.call(owner, key))
+    if (owner.kind === "turn" && !hasTaskFields && typeof owner.leaseOwnerId === "string" && owner.leaseOwnerId.trim() && Number.isSafeInteger(owner.leaseVersion) && Number(owner.leaseVersion) >= 0) return
+    if (owner.kind === "task" && !hasTurnFields && typeof owner.taskId === "string" && owner.taskId.trim() && typeof owner.rootTaskId === "string" && owner.rootTaskId.trim() && typeof owner.ownerId === "string" && owner.ownerId.trim() && Number.isSafeInteger(owner.attemptCount) && Number(owner.attemptCount) >= 1) return
+    throw new UsageBridgeError("usage_context_unavailable")
+  }
+  if (typeof row.leaseOwnerId !== "string" || !row.leaseOwnerId.trim() || !Number.isSafeInteger(row.leaseVersion) || Number(row.leaseVersion) < 0) {
     throw new UsageBridgeError("usage_context_unavailable")
   }
 }

@@ -49,6 +49,19 @@ describe("internal agent runtime usage route", () => {
     expect(mocks.admitAiUsage).not.toHaveBeenCalled()
   })
 
+  it("accepts a child Task owner envelope and rejects mixed owner identity", async () => {
+    const { leaseOwnerId: _leaseOwnerId, leaseVersion: _leaseVersion, ...common } = admission
+    const child = {
+      ...common,
+      executionOwner: { kind: "task", taskId: "child-1", rootTaskId: "root-1", ownerId: "child-worker", attemptCount: 2 },
+    }
+    const { POST } = await import("./route")
+    const request = (input: unknown) => new Request("http://localhost", { method: "POST", headers: { "x-agent-worker-secret": "secret", "content-type": "application/json" }, body: JSON.stringify({ operation: "authorize", input }) }) as never
+    expect((await POST(request(child))).status).toBe(200)
+    expect(mocks.admitAiUsage).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({ executionOwner: child.executionOwner }))
+    expect((await POST(request({ ...admission, executionOwner: child.executionOwner }))).status).toBe(400)
+  })
+
   it("settles through the same authenticated endpoint without rechecking model configuration", async () => {
     const { POST } = await import("./route")
     const response = await POST(new Request("http://localhost", {

@@ -3,6 +3,8 @@ import { Prisma } from "@prisma/client"
 
 import { getEffectiveEntitlements } from "@/lib/entitlements"
 
+import { normalizeUsageOwner, UsageOwnerFenceError, type UsageAdmissionOwnerInput, type UsageExecutionOwner } from "./usage-owner-fence"
+
 export type UsageBrokerQuery = {
   $queryRaw<T>(query: Prisma.Sql): Promise<T>
 }
@@ -11,13 +13,11 @@ export type UsageBrokerDatabase = {
   $transaction<T>(work: (tx: UsageBrokerQuery) => Promise<T>): Promise<T>
 }
 
-export type UsageAdmissionInput = {
+type UsageAdmissionCommon = {
   userId: string
   sessionId: string
   turnId: string
   stepId: string
-  leaseOwnerId: string
-  leaseVersion: number
   featureKey: string
   provider: string
   model: string
@@ -25,6 +25,8 @@ export type UsageAdmissionInput = {
   /** Resolved by the trusted route from the server-side AI configuration. */
   credentialSource?: "platform" | "user"
 }
+
+export type UsageAdmissionInput = UsageAdmissionCommon & UsageAdmissionOwnerInput
 
 export type UsageSettlementInput = {
   operationId: string
@@ -51,8 +53,11 @@ function month(now: Date): string {
   return `${now.getUTCFullYear()}-${String(now.getUTCMonth() + 1).padStart(2, "0")}`
 }
 
-function operationId(input: UsageAdmissionInput): string {
-  const identity = [input.userId, input.sessionId, input.turnId, input.stepId, input.attemptId ?? "1", input.featureKey, input.provider, input.model].join("\u001f")
+function operationId(input: UsageAdmissionInput, owner: UsageExecutionOwner): string {
+  const ownerIdentity = owner.kind === "task"
+    ? [owner.kind, owner.taskId, owner.rootTaskId, owner.ownerId, owner.attemptCount]
+    : []
+  const identity = [input.userId, input.sessionId, input.turnId, input.stepId, ...ownerIdentity, input.attemptId ?? "1", input.featureKey, input.provider, input.model].join("\u001f")
   return `agent-usage-${createHash("sha256").update(identity).digest("hex")}`
 }
 
@@ -66,16 +71,52 @@ function stableErrorCode(value: string | undefined): string | null {
   return /^[a-z0-9_.-]{1,64}$/i.test(value) ? value : "provider_error"
 }
 
-async function assertTurnStep(tx: UsageBrokerQuery, input: UsageAdmissionInput): Promise<void> {
+async function assertOwnerStep(tx: UsageBrokerQuery, input: UsageAdmissionInput, owner: UsageExecutionOwner): Promise<void> {
+  if (owner.kind === "task") {
+    const rows = await tx.$queryRaw<Array<{ id: string }>>(Prisma.sql`
+      SELECT task."id"
+      FROM "sub_agent_tasks" AS task
+      JOIN "sub_agent_tasks" AS root_task
+        ON root_task."id" = task."rootTaskId" AND root_task."sessionId" = task."sessionId"
+       AND root_task."rootTaskId" = root_task."id" AND root_task."turnId" = task."turnId"
+      JOIN "agent_sessions" AS session ON session."id" = task."sessionId"
+      JOIN "agent_turns" AS turn
+        ON turn."id" = task."turnId" AND turn."sessionId" = task."sessionId"
+       AND turn."rootTaskId" = root_task."id"
+      JOIN "agent_steps" AS step
+        ON step."turnId" = task."turnId" AND step."sessionId" = task."sessionId"
+       AND step."taskId" = task."id"
+      WHERE task."id" = ${owner.taskId} AND task."sessionId" = ${input.sessionId}
+        AND task."rootTaskId" = ${owner.rootTaskId} AND task."turnId" = ${input.turnId}
+        AND session."userId" = ${input.userId} AND turn."userId" = ${input.userId}
+        AND task."id" <> root_task."id" AND task."status" = 'running'
+        AND task."leaseOwner" = ${owner.ownerId} AND task."attemptCount" = ${owner.attemptCount}
+        AND task."leaseExpiresAt" > CURRENT_TIMESTAMP AND task."interruptRequestedAt" IS NULL
+        AND root_task."status" IN ('queued', 'running', 'retrying', 'waiting', 'waiting_for_user')
+        AND root_task."interruptRequestedAt" IS NULL
+        AND turn."status" IN ('queued', 'in_progress', 'waiting_for_dependency', 'waiting_for_approval', 'waiting_for_user')
+        AND step."id" = ${input.stepId} AND step."attempt" = ${owner.attemptCount}
+        AND step."status" = 'streaming'
+      FOR UPDATE OF task, root_task, turn, step`)
+    if (!rows[0]) throw new UsageBrokerError("usage_fence_rejected", 409)
+    return
+  }
   const rows = await tx.$queryRaw<Array<{ id: string }>>(Prisma.sql`
     SELECT step."id"
     FROM "agent_turns" AS turn
     JOIN "agent_steps" AS step ON step."turnId" = turn."id" AND step."sessionId" = turn."sessionId"
     WHERE turn."id" = ${input.turnId} AND turn."sessionId" = ${input.sessionId}
       AND turn."userId" = ${input.userId} AND turn."status" = 'in_progress'
-      AND turn."leaseOwnerId" = ${input.leaseOwnerId} AND turn."leaseVersion" = ${input.leaseVersion}
+      AND turn."leaseOwnerId" = ${owner.leaseOwnerId} AND turn."leaseVersion" = ${owner.leaseVersion}
       AND turn."leaseExpiresAt" > CURRENT_TIMESTAMP AND step."id" = ${input.stepId}
-      AND step."status" = 'streaming'
+      AND step."attempt" = 1 AND step."status" = 'streaming'
+      AND (step."taskId" IS NULL OR EXISTS (
+        SELECT 1 FROM "sub_agent_tasks" AS root_task
+        WHERE root_task."id" = step."taskId" AND root_task."sessionId" = step."sessionId"
+          AND root_task."turnId" = turn."id" AND root_task."rootTaskId" = root_task."id"
+          AND root_task."status" IN ('queued', 'running', 'retrying', 'waiting', 'waiting_for_user')
+          AND root_task."interruptRequestedAt" IS NULL AND root_task."attemptCount" = 1
+      ))
     FOR UPDATE`)
   if (!rows[0]) throw new UsageBrokerError("usage_fence_rejected", 409)
 }
@@ -104,14 +145,18 @@ export async function admitAiUsage(
   input: UsageAdmissionInput,
   now = new Date(),
 ): Promise<UsageAdmissionResult> {
-  if (!Number.isInteger(input.leaseVersion) || input.leaseVersion < 0) throw new UsageBrokerError("usage_fence_rejected", 409)
+  let owner: UsageExecutionOwner
+  try { owner = normalizeUsageOwner(input) } catch (error: unknown) {
+    if (error instanceof UsageOwnerFenceError) throw new UsageBrokerError("usage_fence_rejected", 409)
+    throw error
+  }
   const entitlements = await getEffectiveEntitlements(input.userId)
   if (!Object.prototype.hasOwnProperty.call(entitlements.limits, "ai_credits")) throw new UsageBrokerError("ai_credits_disabled", 403)
   const limit = entitlements.limits.ai_credits
-  const id = operationId(input)
+  const id = operationId(input, owner)
   return db.$transaction(async (tx) => {
     await setUserScope(tx, input.userId)
-    await assertTurnStep(tx, input)
+    await assertOwnerStep(tx, input, owner)
     const existing = await tx.$queryRaw<Array<{ id: string; status: string; userId: string | null; provider: string; model: string }>>(Prisma.sql`
       SELECT id, user_id AS "userId", provider, model, status FROM ai_usage_events WHERE id = ${id} FOR UPDATE`)
     const row = existing[0]
