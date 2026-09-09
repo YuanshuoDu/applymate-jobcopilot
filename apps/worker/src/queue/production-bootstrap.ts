@@ -14,6 +14,7 @@ import type {
 import type { startTurnRecoveryScanner, TurnDispatchQueue } from "../runtime/turns/recovery-scanner.js"
 import type { RootAbortControllerRegistry } from "../runtime/interrupt/registry.js"
 import { TurnShutdownController } from "../runtime/turns/shutdown.js"
+import { createPgDurableWaitPort } from "../runtime/subagents/durable-wait-store.js"
 
 type LeasePool = Pick<pg.Pool, "connect">
 
@@ -110,6 +111,9 @@ export async function createProductionWorkerBootstrap(
       pool: options.pool,
       execute: options.runtime.execute,
       interrupts: options.interrupts,
+      waitHandoff: async input => {
+        await createPgDurableWaitPort(options.pool).suspendAndRelease(input)
+      },
     })
     turnRecovery = recoveryFactory(options.pool, turns.queue, options.ownerId, options.turnRecoveryIntervalMs)
 

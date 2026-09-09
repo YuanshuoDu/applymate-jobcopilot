@@ -154,17 +154,21 @@ P4 的副作用防绕过约束从第一项领域工具迁入时保留。按用�
 
 当前完整验收 **1/8，12.5%**。P0 已完成：`28a4bf0` 的 [CI](https://github.com/YuanshuoDu/applymate-jobcopilot/actions/runs/34269901452)、[浏览器矩阵](https://github.com/YuanshuoDu/applymate-jobcopilot/actions/runs/34269901309) 和 [Harness contract/build](https://github.com/YuanshuoDu/applymate-jobcopilot/actions/runs/34269901461) 均已成功。真实数据库 dump rehearsal 跳过，不能算数据库验证。
 
-当前推进 P1 的工作包 1B；1A 候选实现已提交，真实数据库验证记入最终验收清单。根循环、owner-neutral loop 和私有结果源码已有部分基础；真实 child executor/持久化等待仍未接通。P6 已有工作台 fixture 证据，但真实子任务和审批联调尚未满足其完整验收。其余阶段保持未完成。后续新提交仍须记录自身验证状态，P0 基线通过不代表未来 head 自动通过。
+当前推进 P2 的工作包 2A；1A/1B/1C 候选实现已提交，真实数据库验证记入最终验收清单。根循环、owner-neutral loop、真实 child executor 门控、持久化 wait 注册和原子挂起交接已有候选基础；resolver/wakeup、恢复消费和真实 child → wait → resume 组合仍未接通。P6 已有工作台 fixture 证据，但真实子任务和审批联调尚未满足其完整验收。其余阶段保持未完成。后续新提交仍须记录自身验证状态，P0 基线通过不代表未来 head 自动通过。
 
 2026-09-09：1A 已形成经过 Astra Review 和 Luna 返修的候选代码，覆盖真实 owner 传递、存储锁与任务/attempt 校验、全局步骤序号、根历史过滤及租约修复。两组针对性检查曾通过 26 和 29 项；最终锁/lineage 修复后重跑的 8 项及 Worker build 通过，数量有重叠。真实 PostgreSQL 验证尚缺，P1 未完整验收，阶段比例仍为 1/8。详见集成文档中的 Ownership persistence candidate。
 
 额度接近上限时报告：总阶段数、完整验收数与比例、当前工作包、此次新增证据、尚未完成及已提交/推送状态。最高产品验收仍是目标驱动的真实规划、执行、证据反馈和重新规划，而不是界面或状态字段数量。
 
-开发顺序继续为 1B → 1C → 2A/2B → P3 首个目标驱动切片。1A 的 PostgreSQL/并发/RLS 欠账不作为启动这些开发工作的前置门槛；已实现、快速检查通过、完整验收通过分别记录。2026-09-09 的有界环境探查确认本机 Docker backend 不可用，未创建数据库或运行迁移；不继续排查宿主环境。最终可采用隔离 CI PostgreSQL service 做集成证明。
+开发顺序继续为 2A-C3-C（resolver/wakeup）→ 2A-C3-D（恢复消费）→ 2B 原生协调工具 → P3 首个目标驱动切片。1A 的 PostgreSQL/并发/RLS 欠账不作为启动这些开发工作的前置门槛；已实现、快速检查通过、完整验收通过分别记录。2026-09-09 的有界环境探查确认本机 Docker backend 不可用，未创建数据库或运行迁移；不继续排查宿主环境。最终可采用隔离 CI PostgreSQL service 做集成证明。
 
 1B 随后的候选代码已接入根运行时：大工具最终结果写入私有存储，实际 registry 注册分块读取，根 Task 创建后绑定当前 owner；输入/进度和异常使用有界清理结果。Astra Review 发现的异常返回绕过路径已由 Luna 修正。初始相关组 14 项、修正后的 router 组 9 项与 Worker 编译通过；真实数据库/跨进程读取延后验证。
 
 1C-A1（2026-09-09）已完成候选实现：Worker/Web usage admission 接受明确的 root/child owner envelope；根可使用真实 root Task Step 或旧 null-task 兼容行，child 必须通过同一树、当前 attempt、租约、状态和 streaming Step 校验。混合身份在 bridge、route、broker normalization 均 fail closed。Web admission 13/13、Worker bridge 5/5、shared package build 及 diff check 通过。生产 child executor、整树持久化预算和 consumer 注册仍未实现，阶段完整验收仍为 1/8；下一包为 1C-B（共享树预算与真实 child executor）。
+
+1C-B/C1/C2（2026-09-09）已形成候选实现：树步骤预算账本、真实 child executor 以及默认关闭的生产 child queue seam 已接通；child 只获得 owner/policy 允许的读取能力，并保留私有结果读取边界。C1 focused 31 项、C2 focused 17 项及 Worker/shared 编译检查通过；真实 PostgreSQL/RLS、队列运行、重启和父子结果闭环仍未证明。
+
+2A-C3-A/B1/B2（2026-09-09）已形成候选实现：durable wait 注册/resolve/cancel、合法等待回执的 TurnEngine 停止，以及带 user/session/root/step/lease fence 的原子 suspend/requeue handoff 已接入 canonical turn bootstrap。C3-A focused 8 项、B1 相关 loop/store/child 16 项、B2 handoff/queue/store/loop/bootstrap 31 项通过；Worker TypeScript 与 diff checks 通过。当前仍缺 resolver/wakeup scanner、outbox 交付后的父恢复、wait outcome 一次性消费和真实跨进程/重启证据，因此 P2 尚未完成。
 
 ### 4.2 用户可观察的交付节点
 

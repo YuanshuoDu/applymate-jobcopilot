@@ -147,6 +147,19 @@ describe("Turn queue processor", () => {
     expect(fake.calls.some((sql) => sql.includes('SET "status" = $5'))).toBe(true)
   })
 
+  it("uses the atomic wait handoff before ordinary lease release", async () => {
+    const fake = pool()
+    const execute = vi.fn().mockResolvedValue({ status: "waiting_for_dependency", waitId: "wait-1" })
+    const waitHandoff = vi.fn().mockResolvedValue({ handoff: "suspended" })
+    const result = await runTurnJob(
+      { data: { turnId: "turn_1", sessionId: "session_1", ownerId: "owner_1" }, attemptsMade: 0 },
+      { pool: fake.pool, execute, waitHandoff, now: () => new Date("2026-09-01T00:00:30.000Z") },
+    )
+    expect(result).toEqual({ status: "waiting_for_dependency", waitId: "wait-1" })
+    expect(waitHandoff).toHaveBeenCalledWith(expect.objectContaining({ waitId: "wait-1", lease }))
+    expect(fake.calls.some((sql) => sql.includes('SET "status" = $5'))).toBe(false)
+  })
+
   it("records malformed payloads and never calls the executor", async () => {
     const fake = pool()
     const execute = vi.fn()

@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto"
 import type pg from "pg"
 
 import type { DurableWaitPort, DurableWaitResult } from "../tools/coordination-types.js"
+import { suspendAndReleaseWait, type DurableWaitHandoffInput, type DurableWaitHandoffResult } from "./durable-wait-handoff.js"
 
 const MAX_WAIT_MS = 24 * 60 * 60 * 1_000
 const MAX_TARGETS = 8
@@ -13,7 +14,10 @@ type Queryable = Pick<pg.PoolClient, "query">
 type Row = Record<string, unknown>
 
 export type DurableWaitResolveInput = { readonly userId: string; readonly sessionId: string; readonly waitId: string; readonly now?: Date }
-export type DurableWaitStore = DurableWaitPort & { resolve(input: DurableWaitResolveInput): Promise<DurableWaitResult | null> }
+export type DurableWaitStore = DurableWaitPort & {
+  resolve(input: DurableWaitResolveInput): Promise<DurableWaitResult | null>
+  suspendAndRelease(input: DurableWaitHandoffInput): Promise<DurableWaitHandoffResult>
+}
 
 export class DurableWaitStoreError extends Error {
   constructor(readonly code: "wait_invalid" | "wait_scope_error" | "wait_conflict" | "wait_not_found", message: string) {
@@ -174,7 +178,7 @@ export function createPgDurableWaitPort(pool: Pool): DurableWaitStore {
     })
   }
 
-  return { wait, resolve, cancel }
+  return { wait, resolve, cancel, suspendAndRelease: input => suspendAndReleaseWait(pool, input) }
 }
 
 /** Compatibility name for callers that prefer the repository terminology. */
