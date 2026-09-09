@@ -134,10 +134,10 @@ export function createPgRootTaskStore(pool: PgSubagentPool): RootTaskStore {
       const result = JSON.stringify({ status: input.result.status, stepCount: input.result.stepCount, toolCallCount: input.result.toolCallCount, finalItemId: input.result.finalItemId ?? null })
       await transaction(pool, input.lease.userId, async (client) => {
         const ownedTurn = await client.query(
-          `SELECT "id" FROM "agent_turns" WHERE "id" = $1 AND "sessionId" = $2 AND "userId" = $3
-             AND "leaseOwnerId" = $4 AND "leaseVersion" = $5 AND "leaseExpiresAt" > $6
+           `SELECT "id" FROM "agent_turns" WHERE "id" = $1 AND "sessionId" = $2 AND "userId" = $3
+             AND "leaseOwnerId" = $4 AND "leaseVersion" = $5 AND "leaseExpiresAt" > CURRENT_TIMESTAMP
              AND ${waitState ? `"status" IN ('in_progress', 'waiting_for_user')` : `"status" = 'in_progress'`} FOR UPDATE`,
-          [input.lease.turnId, input.lease.sessionId, input.lease.userId, input.lease.ownerId, input.lease.leaseVersion, now],
+           [input.lease.turnId, input.lease.sessionId, input.lease.userId, input.lease.ownerId, input.lease.leaseVersion],
         )
         if (!ownedTurn.rows[0]) throw new Error("root_turn_fenced")
         const updated = await client.query(
@@ -145,7 +145,7 @@ export function createPgRootTaskStore(pool: PgSubagentPool): RootTaskStore {
            "failureReason" = $3, "leaseOwner" = NULL, "leaseExpiresAt" = NULL,
              "completedAt" = CASE WHEN $1 IN ('completed', 'failed', 'interrupted') THEN $4 ELSE NULL END, "updatedAt" = $4
            WHERE "id" = $5 AND "sessionId" = $6 AND "turnId" = $7 AND "rootTaskId" = $5
-             AND "leaseOwner" = $8 AND "attemptCount" = 1 AND "leaseExpiresAt" > CURRENT_TIMESTAMP AND "status" = 'running'`,
+             AND "leaseOwner" = $8 AND "attemptCount" = 1 AND "status" = 'running'`,
           [next, result, input.result.errorCode ?? null, now, input.rootTaskId, input.lease.sessionId, input.lease.turnId, input.lease.ownerId],
         )
         if (updated.rowCount !== 1) throw new Error("root_task_fenced")

@@ -65,8 +65,34 @@ describe("createPgRootTaskStore", () => {
   it("requires the current turn fence while finishing", async () => {
     const fake = fakePool()
     await createPgRootTaskStore(fake.pool).finish({ lease, rootTaskId: "root-turn-1", result: { status: "completed", stepCount: 1, toolCallCount: 0 } })
-    expect(fake.calls.some(sql => sql.includes('"leaseVersion" = $5') && sql.includes('"leaseExpiresAt" > $6'))).toBe(true)
-    expect(fake.calls.some(sql => sql.includes('"attemptCount" = 1') && sql.includes('"leaseExpiresAt" > CURRENT_TIMESTAMP'))).toBe(true)
+    expect(fake.calls.some(sql => sql.includes('"leaseVersion" = $5') && sql.includes('"leaseExpiresAt" > CURRENT_TIMESTAMP'))).toBe(true)
+    const taskUpdate = fake.calls.find(sql => sql.includes('UPDATE "sub_agent_tasks" SET'))
+    expect(taskUpdate).toContain('"attemptCount" = 1')
+    expect(taskUpdate).not.toContain('"leaseExpiresAt" > CURRENT_TIMESTAMP')
+  })
+
+  it("finishes when copied root-task expiry is stale but the Turn lease is current", async () => {
+    const fake = fakePool(row({ leaseExpiresAt: new Date("2026-09-07T00:00:30.000Z") }))
+    await createPgRootTaskStore(fake.pool).finish({ lease, rootTaskId: "root-turn-1", result: { status: "completed", stepCount: 1, toolCallCount: 0 }, now: new Date("2026-09-07T00:02:00.000Z") })
+    const taskUpdate = fake.calls.find(sql => sql.includes('UPDATE "sub_agent_tasks" SET'))
+    expect(taskUpdate).toBeDefined()
+    expect(taskUpdate).not.toContain('"leaseExpiresAt" > CURRENT_TIMESTAMP')
+  })
+
+  it("rejects a stale or expired actual Turn owner before root settlement", async () => {
+    const calls: string[] = []
+    const client = {
+      query: vi.fn(async (sql: string) => {
+        calls.push(sql)
+        if (sql === "BEGIN" || sql === "COMMIT" || sql === "ROLLBACK" || sql.includes("set_config")) return { rows: [], rowCount: 0 }
+        if (sql.includes('SELECT "id" FROM "agent_turns"')) return { rows: [], rowCount: 0 }
+        return { rows: [], rowCount: 1 }
+      }),
+      release: vi.fn(),
+    }
+    const pool = { connect: vi.fn(async () => client) } as never
+    await expect(createPgRootTaskStore(pool).finish({ lease, rootTaskId: "root-turn-1", result: { status: "completed", stepCount: 1, toolCallCount: 0 } })).rejects.toThrow("root_turn_fenced")
+    expect(calls.some(sql => sql.includes('UPDATE "sub_agent_tasks"'))).toBe(false)
   })
 
   it("does not rebind a terminal root task", async () => {
