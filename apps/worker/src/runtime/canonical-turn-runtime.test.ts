@@ -16,12 +16,12 @@ function state(): CanonicalTurnState {
   return { scope: { userId: "user-1" }, goal: "Find jobs", modelProfileSnapshot: { provider: "fixture", model: "fixture" }, toolPolicySnapshot: {}, budgetSnapshot: { limits: { maxSteps: 4 } }, snapshot: { system: [], profile: [], steerHistory: [], businessRefs: [], toolObservations: [] } }
 }
 
-function store(events: Array<{ type: string; payload: unknown }> = []): TurnEngineStore {
+function store(events: Array<{ type: string; payload: unknown; correlationId?: string; idempotencyKey?: string; owner?: unknown }> = []): TurnEngineStore {
   return {
     startStep: async ({ stepId, ordinal }) => ({ id: stepId, ordinal }), updateStep: async () => undefined,
     createItem: async ({ itemId }) => ({ id: itemId, revision: 0 }), updateItem: async ({ itemId, expectedRevision }) => ({ id: itemId, revision: expectedRevision + 1 }),
-    appendEvent: async ({ id, type, payload }) => { events.push({ type, payload }); return { id } }, recordFinalResponse: async () => undefined,
-    appendEvents: async inputs => { events.push(...inputs.map(input => ({ type: input.type, payload: input.payload }))); return inputs.map(input => ({ id: input.id })) },
+    appendEvent: async ({ id, type, payload, correlationId, idempotencyKey, owner }) => { events.push({ type, payload, correlationId, idempotencyKey, owner }); return { id } }, recordFinalResponse: async () => undefined,
+    appendEvents: async inputs => { events.push(...inputs.map(input => ({ type: input.type, payload: input.payload, correlationId: input.correlationId, idempotencyKey: input.idempotencyKey, owner: input.owner }))); return inputs.map(input => ({ id: input.id })) },
   }
 }
 
@@ -149,6 +149,7 @@ async function rootToolNames(coordinationEnabled: boolean, planningEnabled = fal
 async function runDefaultPlanBridge(planningExecutionEnabled: boolean) {
   const roots = rootStore()
   const calls: string[] = []
+  const events: Array<{ type: string; payload: unknown; correlationId?: string; idempotencyKey?: string; owner?: unknown }> = []
   let modelCalls = 0
   const proposal = {
     schemaVersion: "agent-harness.plan.v1", basedOnGoalRevision: 1, basedOnPlanRevision: null,
@@ -184,11 +185,11 @@ async function runDefaultPlanBridge(planningExecutionEnabled: boolean) {
         }
       },
     }, registry: {} as never, candidates: [] }),
-    toolRuntimeFactory: () => tool as never, turnEngineStoreFactory: () => store(), contextBuilderFactory: () => contextBuilder(),
+    toolRuntimeFactory: () => tool as never, turnEngineStoreFactory: () => store(events), contextBuilderFactory: () => contextBuilder(),
     authorizeUsage: async () => ({ settle: async () => undefined }),
   })
   const result = await runtime.execute({ lease, signal: new AbortController().signal })
-  return { result, calls }
+  return { result, calls, events }
 }
 
 describe("createCanonicalTurnRuntime", () => {
@@ -213,6 +214,7 @@ describe("createCanonicalTurnRuntime", () => {
     const enabled = await runDefaultPlanBridge(true)
     expect(enabled.result.status).toBe("completed")
     expect(enabled.calls).toEqual(["agent.plan.propose", "jobs.search"])
+    expect(enabled.events).toEqual(expect.arrayContaining([expect.objectContaining({ type: "plan.command", correlationId: "plan-call", idempotencyKey: expect.stringContaining("plan-command"), owner: expect.objectContaining({ taskId: "root-1" }) })]))
   })
 
   it("keeps plan execution behind both server gates and passes server-owned context", async () => {

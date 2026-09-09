@@ -6,6 +6,7 @@ import type { PolicyRole, TenantScope } from "@jobcopilot/agent-protocol"
 import { PLAN_MAX_NODES, isPlainJsonObject, type GoalContract } from "./goal-plan-contract.js"
 import { PlanDispatchError, dispatchPlanProposal } from "./plan-intent-dispatcher.js"
 import { PlanCommandExecutionError, executePlanCommands, type PlanCommandExecutionRecord, type PlanCommandExecutionRuntime, type PlanControlRecord } from "./plan-command-executor.js"
+import { createPlanCommandReceipt, type PlanCommandReceipt } from "./plan-command-receipt.js"
 import type { ToolCallRequest, ToolExecutionResult, ToolRouterContext } from "../tools/types.js"
 import type { TurnEnginePlanExecutionHook, TurnEnginePlanExecutionHookResult } from "../turns/turn-engine-types.js"
 import type { StepContextSnapshot } from "../context/step-context-builder.js"
@@ -34,6 +35,7 @@ export type CanonicalPlanExecutionOptions = {
   readonly router: Router
   readonly registry: Registry
   readonly policy: PolicyEngine
+  readonly persistOutcome?: (receipt: PlanCommandReceipt) => Promise<void> | void
 }
 
 class CanonicalPlanError extends Error {
@@ -132,6 +134,11 @@ function controlObservation(callId: string, control: PlanControlRecord): { id: s
   return safeObservation(id("plan-control", callId, control.localId), content)
 }
 
+function outcomeReceipt(callId: string, planRevision: number, recordValue: PlanCommandExecutionRecord | PlanControlRecord): PlanCommandReceipt {
+  const observation = "result" in recordValue ? recordObservation(callId, recordValue) : controlObservation(callId, recordValue)
+  return createPlanCommandReceipt({ planCallId: callId, planRevision, observationId: observation.id, content: observation.content })
+}
+
 function failureObservation(callId: string, code: string): { id: string; content: Record<string, unknown> } {
   return safeObservation(`plan-error:${callId}`, { kind: "plan_error", status: "failed", errorCode: code.slice(0, 64) })
 }
@@ -180,6 +187,7 @@ export function createCanonicalPlanExecutionFactory(options: CanonicalPlanExecut
       const commandRuntime: PlanCommandExecutionRuntime = {
         router: options.router,
         createContext: request => ({ scope: options.scope, sessionId: options.lease.sessionId, turnId: options.lease.turnId, stepId: `${input.stepId}:plan:${request.localId}`, taskId: options.taskId, rootTaskId: options.rootTaskId, actorRole: options.actorRole, capabilities: [...options.capabilities], signal: input.signal }),
+        ...(options.persistOutcome ? { observe: async recordValue => options.persistOutcome!(outcomeReceipt(input.call.id, output.planRevision, recordValue)) } : {}),
       }
       const executed = await executePlanCommands(dispatched, commandRuntime)
       const records = boundedRecords(executed)

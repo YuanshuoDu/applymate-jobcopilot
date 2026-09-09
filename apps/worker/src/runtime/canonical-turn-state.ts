@@ -3,10 +3,10 @@ import type pg from "pg"
 import type { TenantScope, RepositoryJsonValue } from "@jobcopilot/agent-protocol"
 import { parseSnapshotContent } from "./context/context-snapshot-canonical.js"
 import type { StepContextSnapshot } from "./context/step-context-builder.js"
-import type { TurnLease } from "./turns/lease.js"
-import type { TurnResumeState } from "./turns/turn-engine-types.js"
+import type { TurnLease } from "./turns/lease.js"; import type { TurnResumeState } from "./turns/turn-engine-types.js"
 import { consumeDurableWaitOutcomes } from "./subagents/durable-wait-consumer.js"
 import { isBoundedPlanJson, parsePlanRevisionEvent, parsePlanRevisionReceipt, planRevisionObservation, type PlanRevisionReceipt } from "./planning/plan-revision-receipt.js"
+import { parsePlanCommandReceipt, planCommandObservation } from "./planning/plan-command-receipt.js"
 export type CanonicalTurnState = {
   readonly scope: TenantScope
   readonly goal: string
@@ -19,8 +19,7 @@ export type CanonicalTurnState = {
   readonly planRevision?: number | null
   readonly resume?: TurnResumeState
 }
-type Row = Record<string, unknown>
-function object(value: unknown): Record<string, unknown> { return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {} }
+type Row = Record<string, unknown>; function object(value: unknown): Record<string, unknown> { return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {} }
 function json(value: unknown): RepositoryJsonValue {
   if (value === null || typeof value === "string" || typeof value === "boolean") return value
   if (typeof value === "number" && Number.isFinite(value)) return value
@@ -83,6 +82,7 @@ function planObservations(events: readonly Row[]): StepContextSnapshot["toolObse
     const encoded = JSON.stringify(content); return encoded === undefined || Buffer.byteLength(encoded, "utf8") > 8 * 1024 ? [] : [{ id, content: json(content) }]
   })
 }
+function planCommandObservations(events: readonly Row[]): StepContextSnapshot["toolObservations"] { return events.filter(event => event.type === "plan.command").flatMap(event => { const receipt = parsePlanCommandReceipt(eventPayload(event.payload)); return receipt ? [planCommandObservation(receipt)] : [] }) }
 function restoredPlanRevision(events: readonly Row[]): PlanRevisionReceipt | null {
   let latest: PlanRevisionReceipt | null = null
   for (const event of events) {
@@ -155,7 +155,7 @@ export async function loadCanonicalTurnState(pool: Pick<pg.Pool, "connect">, lea
        AND ("taskId" IS NULL OR "taskId" = $3) AND "type" IN ('tool_call', 'tool_result') ORDER BY "createdAt" ASC`, [lease.turnId, lease.sessionId, turn.rootTaskId],
     )
     const eventsResult = await client.query<Row>(
-       `SELECT event."type", event."payload" FROM "agent_events" AS event JOIN "agent_sessions" AS event_session ON event_session."id" = event."sessionId" AND event_session."userId" = $4 JOIN "agent_turns" AS event_turn ON event_turn."id" = event."turnId" AND event_turn."sessionId" = event."sessionId" AND event_turn."userId" = $4 WHERE event."turnId" = $1 AND event."sessionId" = $2 AND (event."taskId" IS NULL OR event."taskId" = $3) AND event."type" IN ('tool_call.completed', 'tool_call.failed', 'plan.observation', 'plan.revision') ORDER BY event."sequence" ASC`, [lease.turnId, lease.sessionId, turn.rootTaskId, lease.userId],
+       `SELECT event."type", event."payload" FROM "agent_events" AS event JOIN "agent_sessions" AS event_session ON event_session."id" = event."sessionId" AND event_session."userId" = $4 JOIN "agent_turns" AS event_turn ON event_turn."id" = event."turnId" AND event_turn."sessionId" = event."sessionId" AND event_turn."userId" = $4 WHERE event."turnId" = $1 AND event."sessionId" = $2 AND (event."taskId" IS NULL OR event."taskId" = $3) AND event."type" IN ('tool_call.completed', 'tool_call.failed', 'plan.observation', 'plan.command', 'plan.revision') ORDER BY event."sequence" ASC`, [lease.turnId, lease.sessionId, turn.rootTaskId, lease.userId],
     )
     const priorInputs = await client.query<Row>(
       `SELECT "id", "targetTurnId", "content", "acceptedSequence", 'user' AS "historyRole", "acceptedSequence" AS "historySequence" FROM "agent_inputs"
@@ -195,7 +195,7 @@ export async function loadCanonicalTurnState(pool: Pick<pg.Pool, "connect">, lea
       }
     }
     const revision = restoredPlanRevision(eventsResult.rows)
-    const restored = [...observations(itemsResult.rows, eventsResult.rows), ...planObservations(eventsResult.rows), ...(revision ? [planRevisionObservation(revision)] : [])]
+    const restored = [...observations(itemsResult.rows, eventsResult.rows), ...planObservations(eventsResult.rows), ...planCommandObservations(eventsResult.rows), ...(revision ? [planRevisionObservation(revision)] : [])]
     const seen = new Set(snapshot.toolObservations.map(item => item.id))
     const restoredIds = new Set<string>()
     const restoredNew = restored.filter(item => {

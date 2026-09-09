@@ -5,6 +5,7 @@ import type { StepContextSnapshot } from "../context/step-context-builder.js"
 import { executionOwnerFence } from "../execution-owner.js"
 import { PLAN_PROPOSAL_SCHEMA_VERSION, type PlanProposal } from "./goal-plan-contract.js"
 import { createCanonicalPlanExecutionFactory, type CanonicalPlanExecutionOptions } from "./canonical-plan-execution.js"
+import type { PlanCommandReceipt } from "./plan-command-receipt.js"
 
 const lease = {
   turnId: "turn-1", sessionId: "session-1", ownerId: "worker-1", userId: "user-1", leaseVersion: 2,
@@ -29,13 +30,13 @@ function output(value: PlanProposal, overrides: Record<string, unknown> = {}): R
   return { status: "accepted", goalRevision: 1, planRevision: 1, basedOnPlanRevision: null, proposal: value, intents: [], ...overrides }
 }
 
-function fixture(router: { execute(context: ToolRouterContext, request: ToolCallRequest): Promise<ToolExecutionResult> } = { execute: async (_context, request) => ({ ...request, status: "completed", output: { ok: true }, errorCode: null }) }, initialPlanRevision?: number) {
+function fixture(router: { execute(context: ToolRouterContext, request: ToolCallRequest): Promise<ToolExecutionResult> } = { execute: async (_context, request) => ({ ...request, status: "completed", output: { ok: true }, errorCode: null }) }, initialPlanRevision?: number, persistOutcome?: (receipt: PlanCommandReceipt) => Promise<void> | void) {
   const options: CanonicalPlanExecutionOptions = {
     goal, allowedTools: ["jobs.search"], allowedTemplates: [], allowedRoles: ["scout"], maxNodes: 8,
     capabilities: ["read", "canPlan"], actorRole: "orchestrator", scope: { userId: "user-1" }, lease,
     rootTaskId: "root-1", taskId: "root-1", initialPlanRevision, router,
     registry: { list: () => [{ name: "jobs.search", version: "1", risk: "read", capabilities: ["read"] }] },
-    policy: {} as PolicyEngine,
+    policy: {} as PolicyEngine, ...(persistOutcome ? { persistOutcome } : {}),
   }
   return createCanonicalPlanExecutionFactory(options)
 }
@@ -68,6 +69,26 @@ describe("createCanonicalPlanExecutionFactory", () => {
     expect(requests[1]?.input).toMatchObject({ role: "scout", taskType: "research" })
     expect(JSON.stringify(requests[1]?.input)).not.toMatch(/userId|taskId|parentTaskId|rootTaskId|lease|budgetLimit|maxBudget/)
     expect(result.observations).toHaveLength(2)
+  })
+
+  it("persists each command outcome before the next command and includes failures/controls", async () => {
+    const order: string[] = []
+    const receipts: PlanCommandReceipt[] = []
+    const router = { execute: vi.fn(async (_context: ToolRouterContext, request: ToolCallRequest) => { order.push(`router:${request.toolName}`); return { ...request, status: "completed" as const, output: { ok: true }, errorCode: null } }) }
+    const hook = fixture(router, undefined, receipt => { order.push(`receipt:${receipt.observationId}`); receipts.push(receipt) })
+    await hook(input(output(proposal([use("read"), delegate("child", { dependsOn: ["read"] })]))))
+    expect(order).toEqual(["router:jobs.search", "receipt:plan-result:proposal-1:read", "router:spawn_subagent", "receipt:plan-result:proposal-1:child"])
+    const failed = fixture({ execute: async (_context, request) => ({ ...request, status: "failed" as const, output: { safe: true }, errorCode: "denied" }) }, undefined, receipt => { receipts.push(receipt) })
+    await failed(input(output(proposal([use("failed")]))))
+    expect(receipts.map(receipt => receipt.content)).toEqual(expect.arrayContaining([expect.objectContaining({ status: "failed" })]))
+    const control = fixture(undefined, undefined, receipt => { receipts.push(receipt) })
+    await control(input(output(proposal([{ ...baseNode, localId: "ask", kind: "request_input", objective: "Need location", question: "Where?" } as PlanProposal["nodes"][number]]))))
+    expect(receipts.map(receipt => receipt.content)).toEqual(expect.arrayContaining([expect.objectContaining({ status: "waiting_for_user" })]))
+  })
+
+  it("returns a visible failure when the durable outcome sink fails", async () => {
+    const hook = fixture(undefined, undefined, async () => { throw new Error("outcome_persist_failed") })
+    expect(observationCode(await hook(input(output(proposal([use("read")])))))).toBe("observer_failed")
   })
 
   it("returns bounded failures for malformed, conflicting, unknown, and unresolved plans", async () => {

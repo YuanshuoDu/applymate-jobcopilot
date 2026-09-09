@@ -26,6 +26,7 @@ import { executionOwnerFence, type ExecutionOwner, type ExecutionOwnerFence } fr
 import { createCanonicalPolicy } from "./policy/canonical-policy.js"
 import { PLAN_MAX_NODES } from "./planning/goal-plan-contract.js"
 import { createCanonicalPlanExecutionFactory, type CanonicalPlanExecutionOptions } from "./planning/canonical-plan-execution.js"
+import type { PlanCommandReceipt } from "./planning/plan-command-receipt.js"
 
 export type UsageAuthorization = {
   settle(input: { status: "success" | "error"; inputTokens: number; outputTokens: number; estimatedCostUsd: number; errorCode?: string }): Promise<void> | void
@@ -153,6 +154,14 @@ export function durableLifecycleSink(store: TurnEngineStore, owner: ExecutionOwn
   }
 }
 
+function durablePlanCommandSink(store: TurnEngineStore, owner: ExecutionOwnerFence): NonNullable<CanonicalPlanExecutionOptions["persistOutcome"]> {
+  return async (receipt: PlanCommandReceipt) => {
+    const key = `${owner.userId}:${owner.sessionId}:${owner.turnId}:${owner.taskId}:${receipt.planCallId}:${receipt.observationId}`
+    const receiptKey = `${receipt.planCallId}:${receipt.observationId}`
+    await store.appendEvent({ owner, id: `plan-command:${createHash("sha256").update(key).digest("hex").slice(0, 24)}`, itemId: null, type: "plan.command", correlationId: receipt.planCallId, causationId: null, idempotencyKey: `${owner.kind}:${owner.taskId}:plan-command:${receiptKey}`, payload: toRepositoryJson(receipt) })
+  }
+}
+
 function defaultAuthorization(): never {
   const error = new Error("usage_authorization_unavailable")
   Object.assign(error, { code: "usage_authorization_unavailable" })
@@ -210,7 +219,7 @@ export async function createCanonicalTurnRuntime(pool: pg.Pool, options: Canonic
     const actorRole = (record(state.toolPolicySnapshot).role as PolicyRole | undefined) ?? "orchestrator"
     const planFactory = options.planExecutionFactory ?? createCanonicalPlanExecutionFactory
     const executePlan = options.planningEnabled === true && options.planningExecutionEnabled === true && planning
-      ? planFactory({ lease, rootTaskId: root.id, taskId: root.id, state, scope: state.scope, router: toolRuntime.router, registry: toolRuntime.registry, policy: selectedPolicy, goal: planning.goal, allowedTools: planning.allowedTools, allowedTemplates: planning.allowedTemplates, allowedRoles: planning.allowedRoles, maxNodes: planning.maxNodes, initialPlanRevision: planning.initialPlanRevision, capabilities: toolCapabilities, actorRole })
+      ? planFactory({ lease, rootTaskId: root.id, taskId: root.id, state, scope: state.scope, router: toolRuntime.router, registry: toolRuntime.registry, policy: selectedPolicy, goal: planning.goal, allowedTools: planning.allowedTools, allowedTemplates: planning.allowedTemplates, allowedRoles: planning.allowedRoles, maxNodes: planning.maxNodes, initialPlanRevision: planning.initialPlanRevision, capabilities: toolCapabilities, actorRole, persistOutcome: durablePlanCommandSink(turnStore, owner) })
       : undefined
     const config = options.modelRuntimeFactory ? undefined : await loadWorkerAiConfig(lease.userId)
     const modelRuntime = await (options.modelRuntimeFactory?.({ userId: lease.userId, config, state }) ?? createHarnessModelRuntime({ primary: config, fallbacks: [], allowEnvironmentFallbacks: false }))

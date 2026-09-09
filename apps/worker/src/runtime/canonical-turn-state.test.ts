@@ -98,6 +98,24 @@ describe("loadCanonicalTurnState", () => {
     expect(value.snapshot.toolObservations).toEqual(expect.arrayContaining([{ id: "plan-revision:receipt-2", content: { kind: "plan_revision", planCallId: "receipt-2", goalRevision: 1, planRevision: 2, basedOnPlanRevision: 1 } }]))
   })
 
+  it("restores bounded plan command outcomes with observation deduplication", async () => {
+    const command = { planCallId: "plan-1", planRevision: 1, observationId: "plan-result:plan-1:read", content: { kind: "plan_command", status: "completed", output: { found: true } } }
+    const fake = pool({
+      turn: { input: { goal: "Find jobs" }, rootTaskId: "root-1", contextSnapshotId: null, modelProfileSnapshot: {}, toolPolicySnapshot: {}, budgetSnapshot: {} },
+      events: [
+        { type: "plan.command", payload: command },
+        { type: "plan.observation", payload: { planCallId: "plan-1", observationId: command.observationId, content: command.content } },
+        { type: "plan.command", payload: { ...command, observationId: "foreign", content: { ok: false } }, taskId: "child-1" },
+        { type: "plan.command", payload: { ...command, observationId: "bad", content: "raw" } },
+      ],
+    })
+    const value = await loadCanonicalTurnState(fake, lease)
+    expect(value.snapshot.toolObservations).toEqual(expect.arrayContaining([{ id: command.observationId, content: command.content }]))
+    expect(value.snapshot.toolObservations.filter(item => item.id === command.observationId)).toHaveLength(1)
+    const eventQuery = fake.client.query.mock.calls.find(([sql]) => typeof sql === "string" && sql.includes('FROM "agent_events"') && sql.includes("plan.command"))?.[0]
+    expect(eventQuery).toContain("'plan.command'")
+  })
+
   it("falls back to a scoped legacy accepted plan receipt when no revision event exists", async () => {
     const fake = pool({
       turn: { input: { goal: "Find jobs" }, rootTaskId: "root-1", contextSnapshotId: null, modelProfileSnapshot: {}, toolPolicySnapshot: {}, budgetSnapshot: {} },
