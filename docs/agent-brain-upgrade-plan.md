@@ -160,7 +160,7 @@ P4 的副作用防绕过约束从第一项领域工具迁入时保留。按用�
 
 额度接近上限时报告：总阶段数、完整验收数与比例、当前工作包、此次新增证据、尚未完成及已提交/推送状态。最高产品验收仍是目标驱动的真实规划、执行、证据反馈和重新规划，而不是界面或状态字段数量。
 
-开发顺序已完成 P3 首个目标驱动接线候选、P3-3 accepted intent materializer、P3-4 runtime execution adapter、P3-5 owner-neutral loop hook、P3-6a TurnEngine/canonical runtime gate 和 P3-6b 默认 server-owned bridge，下一片是运行时输入引用与有界结果持久化。2B-1/2B-2 的原生协调工具和 server-side policy gate 仍关闭，P3 planning gate 也默认关闭，且未宣称 child 真实执行。1A 的 PostgreSQL/并发/RLS 欠账不作为启动这些开发工作的前置门槛；已实现、快速检查通过、完整验收通过分别记录。2026-09-09 的有界环境探查确认本机 Docker backend 不可用，未创建数据库或运行迁移；不继续排查宿主环境。最终可采用隔离 CI PostgreSQL service 做集成证明。
+开发顺序已完成 P3 首个目标驱动接线候选、P3-3 accepted intent materializer、P3-4 runtime execution adapter、P3-5 owner-neutral loop hook、P3-6a TurnEngine/canonical runtime gate、P3-6b 默认 server-owned bridge 和 P3-7 runtime-owned input hydration/有界 plan observation 持久化候选，下一片是原子批量写入或 replay-only materialization，再接 durable plan revisions、outbox/queue delivery 与 recovery。2B-1/2B-2 的原生协调工具和 server-side policy gate 仍关闭，P3 planning gate 也默认关闭，且未宣称 child 真实执行。1A 的 PostgreSQL/并发/RLS 欠账不作为启动这些开发工作的前置门槛；已实现、快速检查通过、完整验收通过分别记录。2026-09-09 的有界环境探查确认本机 Docker backend 不可用，未创建数据库或运行迁移；不继续排查宿主环境。最终可采用隔离 CI PostgreSQL service 做集成证明。
 
 1B 随后的候选代码已接入根运行时：大工具最终结果写入私有存储，实际 registry 注册分块读取，根 Task 创建后绑定当前 owner；输入/进度和异常使用有界清理结果。Astra Review 发现的异常返回绕过路径已由 Luna 修正。初始相关组 14 项、修正后的 router 组 9 项与 Worker 编译通过；真实数据库/跨进程读取延后验证。
 
@@ -189,6 +189,8 @@ P3-5 提交 `419a928f`（2026-09-09）已推送到当前分支：在 owner-neutr
 P3-6a 提交 `77a42427`（2026-09-09）已推送到当前分支：将 P3-5 hook contract 提升为共享 `TurnEnginePlanExecutionHook`，加入 `TurnEngineOptions.executePlan`，并在 canonical runtime 增加独立 `planningExecutionEnabled` 与 server-owned `planExecutionFactory`。只有 planning gate 和 execution gate 同时开启且 factory 返回 hook 时才注入；gate 关闭、单门控或无 factory 继续旧路径。TurnEngine/canonical runtime focused 20 项、Worker TypeScript 与 diff checks 通过；没有默认 bridge、dispatcher、数据库、队列、provider 或 child 执行。
 
 P3-6b 提交 `c7ee291a`（2026-09-09）已推送到当前分支：canonical runtime 在双重 planning gate 开启时默认构造 server-owned `createCanonicalPlanExecutionFactory`，也允许服务端显式 override。bridge 对 accepted plan envelope、goal/plan revision、plain JSON 和 payload 做边界校验，使用 registry 解析只读工具版本与 delegate actions，使用服务端 scope、task、root task、lease、step 和 actor context 生成调用信息，并复用 P3-3 dispatcher 与 P3-4 adapter 执行。命令回执、失败、控制和显式等待以有界 observation 返回下一模型步；`request_input` 进入 `waiting_for_user`，ToolRouter 产生的策略审批仍进入 `waiting_for_approval`，`propose_completion` 只作为反馈不会自动完成。非空 inputRefs 在 runtime resolver 接入前 fail closed，避免猜测数据 schema。Bridge、canonical runtime、TurnEngine 与 loop 组合父级重跑 38 项、Worker TypeScript 与 diff checks 通过；此次仍没有 durable plan revision/outcome、数据库/队列/provider/真实 child→wait→resume 或重启证明。
+
+P3-7 提交 `591c7d2f`（2026-09-09）已推送到当前分支：canonical plan bridge 现在只从 server-supplied snapshot 的精确 observation ID 解析 `inputRefs`，优先读取 observation `output`，要求 plain JSON object，并对缺失、非对象、冲突和同计划 local ID 引用 fail closed。owner-neutral loop 在验证后逐条写入有界 `plan.observation` 事件；canonical state loader 在 tenant/session/turn/root-task 范围内恢复这些事件，限制 256 字符 observation ID、8 KiB UTF-8 内容并对 snapshot/event/tool observations 去重。持久化失败会显式使 Turn failed，不会伪装成功。Worker focused checks 为 27/27，agent-protocol event checks 为 2/2，protocol build、Worker TypeScript（含 shared build）与 diff checks 通过。P3-7 仍是候选实现，不计入阶段完成；逐条 append 的 partial crash recovery、durable plan revisions、outbox/queue/recovery 及 PostgreSQL/RLS、provider、真实 child→wait→resume、restart 证据仍待最终验收。
 
 ### 4.2 用户可观察的交付节点
 
