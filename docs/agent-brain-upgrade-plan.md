@@ -160,7 +160,7 @@ P4 的副作用防绕过约束从第一项领域工具迁入时保留。按用�
 
 额度接近上限时报告：总阶段数、完整验收数与比例、当前工作包、此次新增证据、尚未完成及已提交/推送状态。最高产品验收仍是目标驱动的真实规划、执行、证据反馈和重新规划，而不是界面或状态字段数量。
 
-开发顺序现在进入 P3 首个目标驱动切片。2B-1/2B-2 已把原生协调工具和其 server-side policy gate 接到 canonical root，但双门控仍关闭，且未宣称 child 真实执行。1A 的 PostgreSQL/并发/RLS 欠账不作为启动这些开发工作的前置门槛；已实现、快速检查通过、完整验收通过分别记录。2026-09-09 的有界环境探查确认本机 Docker backend 不可用，未创建数据库或运行迁移；不继续排查宿主环境。最终可采用隔离 CI PostgreSQL service 做集成证明。
+开发顺序已完成 P3 首个目标驱动接线候选，下一片是 accepted intent dispatcher。2B-1/2B-2 的原生协调工具和 server-side policy gate 仍关闭，P3 planning gate 也默认关闭，且未宣称 child 真实执行。1A 的 PostgreSQL/并发/RLS 欠账不作为启动这些开发工作的前置门槛；已实现、快速检查通过、完整验收通过分别记录。2026-09-09 的有界环境探查确认本机 Docker backend 不可用，未创建数据库或运行迁移；不继续排查宿主环境。最终可采用隔离 CI PostgreSQL service 做集成证明。
 
 1B 随后的候选代码已接入根运行时：大工具最终结果写入私有存储，实际 registry 注册分块读取，根 Task 创建后绑定当前 owner；输入/进度和异常使用有界清理结果。Astra Review 发现的异常返回绕过路径已由 Luna 修正。初始相关组 14 项、修正后的 router 组 9 项与 Worker 编译通过；真实数据库/跨进程读取延后验证。
 
@@ -175,6 +175,10 @@ P4 的副作用防绕过约束从第一项领域工具迁入时保留。按用�
 2B-1 提交 `f923b7a`（2026-09-09）已推送到当前分支：canonical root runtime 在双门控开启时才注册并向模型公布 `spawn_subagent`、`send_message`、`wait_subagents`、`list_subagents`、`interrupt_subagent`、`close_subagent` 六个现有工具；`canManageChildren` 由 server gate 补入并在 gate 关闭时剥离，child runtime 仍不获得协调工具。canonical runtime/tool registry focused 11 项、Worker TypeScript 与 diff checks 通过。此次只证明工具接线和模型可见性，不证明真实 child 或 wait 恢复。
 
 2B-2 提交 `d21bccb`（2026-09-09）已推送到当前分支：canonical root 使用 scoped policy adapter；缺少显式 `PolicySnapshot` 时，双门控 fallback 只允许 orchestrator 使用六个协调工具和安全 read baseline，非协调写入继续拒绝。旧的 `role/capabilities` 元数据保持兼容；显式有效策略保持权威，带有不完整 `version`/`rules` 的策略 fail closed；gate 关闭继续使用默认只读策略。canonical policy/runtime/tool registry 组合 17 项 focused tests、Worker TypeScript 与 diff checks 通过。此次没有 Web 策略迁移、数据库迁移、真实 PostgreSQL/RLS、provider、队列或重启证明。
+
+P3-1 提交 `b7924df6`（2026-09-09）已推送到当前分支：新增纯 `GoalContract`、`PlanProposal`、确定性计划校验和 runtime intent 转换。模型输入必须是有界 plain JSON；身份、租约、能力、硬预算及外部写入字段被拒绝；校验包含 goal/plan revision CAS、allowlist、节点唯一、依赖存在/自引用/环、重复语义委派与规范化副本。P3-1 focused suite 为 15 项，Worker TypeScript 与 diff checks 通过；没有接入 canonical loop 或持久化。
+
+P3-2 提交 `86304046`（2026-09-09）已推送到当前分支：新增 `agent.plan.propose`，仅在 server-owned `planningEnabled` gate 开启时注册并公布给 canonical root。它接收严格 `{ proposal }` envelope，按服务端目标、只读工具、模板和 `scout|analyst` 角色 allowlist 做 CAS 校验，接受后在本次 tool runtime 闭包内递增 plan revision，返回规范化 proposal 与语义 intents；不生成 task、lease、user、idempotency 或硬预算字段，也不自动 dispatch。`canPlan` 由 gate 注入，模型快照不能伪造开启；显式 policy 仍权威。P3-1/P3-2 相关 7 个文件共 38 项 focused tests、Worker TypeScript 与 diff checks 通过。该 gate 默认关闭，revision 仍是进程内候选，intent 执行、持久化计划、child 调度与重启恢复留待下一片。
 
 ### 4.2 用户可观察的交付节点
 
