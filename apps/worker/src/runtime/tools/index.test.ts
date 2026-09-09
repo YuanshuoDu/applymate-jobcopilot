@@ -5,6 +5,7 @@ import { InMemoryToolLifecycleSink } from "./lifecycle.js"
 import type { ExecutionOwner } from "../execution-owner.js"
 import type { CoordinationStore, DurableWaitPort } from "./coordination-types.js"
 import type { PlanProposalToolOptions } from "../planning/plan-proposal-tool.js"
+import type { GoalUpdateToolOptions } from "../planning/goal-update-tool.js"
 
 const owner: ExecutionOwner = {
   kind: "turn", taskId: "root-1", lease: {
@@ -84,5 +85,15 @@ describe("worker tool runtime entry point", () => {
     expect(() => disabled.registry.resolve("agent.plan.propose", "1")).toThrow("not registered")
     const enabled = createWorkerToolRuntime({} as never, { sink: new InMemoryToolLifecycleSink(), resolveOwner: () => owner }, undefined, undefined, undefined, undefined, undefined, options)
     expect(enabled.registry.resolve("agent.plan.propose", "1")).toMatchObject({ requiredCapabilities: ["canPlan"], risk: "internal_write" })
+  })
+
+  it("registers goal updates only alongside the server planning gate and canPlan capability", () => {
+    const goal: GoalUpdateToolOptions = { goal: { revision: 1, objective: "Find jobs", constraints: [], successCriteria: [], knownFacts: [], unresolvedQuestions: [], approvalBoundaries: [], budgetRef: "runtime:turn" } }
+    const disabled = createWorkerToolRuntime({} as never, { sink: new InMemoryToolLifecycleSink(), resolveOwner: () => owner })
+    expect(() => disabled.registry.resolve("agent.goal.update", "1")).toThrow("not registered")
+    const gateOff = createWorkerToolRuntime({} as never, { sink: new InMemoryToolLifecycleSink(), resolveOwner: () => owner }, undefined, undefined, undefined, undefined, undefined, undefined, goal)
+    expect(() => gateOff.registry.resolve("agent.goal.update", "1")).toThrow("not registered")
+    const enabled = createWorkerToolRuntime({} as never, { sink: new InMemoryToolLifecycleSink(), resolveOwner: () => owner }, undefined, undefined, undefined, undefined, undefined, { ...goal, allowedTools: ["jobs.search"], allowedTemplates: [], allowedRoles: ["scout"], maxNodes: 8 }, goal)
+    expect(enabled.registry.resolve("agent.goal.update", "1")).toMatchObject({ requiredCapabilities: ["canPlan"], risk: "internal_write", domain: "coordination" })
   })
 })

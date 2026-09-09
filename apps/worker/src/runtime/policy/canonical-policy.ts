@@ -16,7 +16,7 @@ const FALLBACK_POLICY: PolicySnapshot = {
     },
     {
       id: "canonical-root-planning",
-      roles: ["orchestrator"], tools: ["agent.plan.propose"], risks: ["internal_write"], domains: ["coordination"], requiredCapabilities: ["canPlan"],
+      roles: ["orchestrator"], tools: ["agent.plan.propose", "agent.goal.update"], risks: ["internal_write"], domains: ["coordination"], requiredCapabilities: ["canPlan"],
       outcome: "allow", reasonCode: "server_planning_gate", reason: "The server enabled bounded plan proposals",
     },
     {

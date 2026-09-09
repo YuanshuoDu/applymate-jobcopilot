@@ -6,6 +6,7 @@ import type { StepContextSnapshot } from "./context/step-context-builder.js"
 import type { TurnLease } from "./turns/lease.js"; import type { TurnResumeState } from "./turns/turn-engine-types.js"
 import { consumeDurableWaitOutcomes } from "./subagents/durable-wait-consumer.js"
 import { isBoundedPlanJson, planRevisionObservation, restorePlanRevisions } from "./planning/plan-revision-receipt.js"
+import { filterPlanRevisionEvents, goalRevisionObservation, restoreGoalRevisions } from "./planning/goal-revision-receipt.js"
 import { parsePlanCommandReceipt, planCommandObservation } from "./planning/plan-command-receipt.js"
 import { hydrateGoalContract } from "./planning/goal-contract-hydration.js"
 import type { GoalContract } from "./planning/goal-plan-contract.js"
@@ -57,7 +58,7 @@ function authoritativeOutputs(events: readonly Row[]): Map<string, unknown> {
   }
   return outputs
 }
-function observations(items: readonly Row[], events: readonly Row[]): StepContextSnapshot["toolObservations"] {
+function observations(items: readonly Row[], events: readonly Row[], currentGoalRevision: number): StepContextSnapshot["toolObservations"] {
   const calls = new Map<string, Row>()
   const outputs = authoritativeOutputs(events)
   for (const item of items) {
@@ -72,6 +73,7 @@ function observations(items: readonly Row[], events: readonly Row[]): StepContex
     const output = Object.prototype.hasOwnProperty.call(content, "output") && content.output !== null
       ? content.output
       : outputs.get(content.toolCallId) ?? content.output ?? null
+    if (call.toolName === "agent.plan.propose" && object(output).status === "accepted" && object(output).goalRevision !== currentGoalRevision) return []
     return [{ id: `tool-result:${content.toolCallId}`, content: json({
       toolCallId: content.toolCallId, toolName: call.toolName, input: call.input ?? {}, status: call.status ?? (content.errorCode ? "failed" : "completed"),
       output, errorCode: content.errorCode ?? null,
@@ -147,7 +149,7 @@ export async function loadCanonicalTurnState(pool: Pick<pg.Pool, "connect">, lea
        AND ("taskId" IS NULL OR "taskId" = $3) AND "type" IN ('tool_call', 'tool_result') ORDER BY "createdAt" ASC`, [lease.turnId, lease.sessionId, turn.rootTaskId],
     )
     const eventsResult = await client.query<Row>(
-       `SELECT event."type", event."payload" FROM "agent_events" AS event JOIN "agent_sessions" AS event_session ON event_session."id" = event."sessionId" AND event_session."userId" = $4 JOIN "agent_turns" AS event_turn ON event_turn."id" = event."turnId" AND event_turn."sessionId" = event."sessionId" AND event_turn."userId" = $4 WHERE event."turnId" = $1 AND event."sessionId" = $2 AND (event."taskId" IS NULL OR event."taskId" = $3) AND event."type" IN ('tool_call.completed', 'tool_call.failed', 'plan.observation', 'plan.command', 'plan.revision') ORDER BY event."sequence" ASC`, [lease.turnId, lease.sessionId, turn.rootTaskId, lease.userId],
+       `SELECT event."type", event."payload" FROM "agent_events" AS event JOIN "agent_sessions" AS event_session ON event_session."id" = event."sessionId" AND event_session."userId" = $4 JOIN "agent_turns" AS event_turn ON event_turn."id" = event."turnId" AND event_turn."sessionId" = event."sessionId" AND event_turn."userId" = $4 WHERE event."turnId" = $1 AND event."sessionId" = $2 AND (event."taskId" IS NULL OR event."taskId" = $3) AND event."type" IN ('tool_call.completed', 'tool_call.failed', 'plan.observation', 'plan.command', 'plan.revision', 'goal.revision') ORDER BY event."sequence" ASC`, [lease.turnId, lease.sessionId, turn.rootTaskId, lease.userId],
     )
     const priorInputs = await client.query<Row>(
       `SELECT "id", "targetTurnId", "content", "acceptedSequence", 'user' AS "historyRole", "acceptedSequence" AS "historySequence" FROM "agent_inputs"
@@ -187,9 +189,11 @@ export async function loadCanonicalTurnState(pool: Pick<pg.Pool, "connect">, lea
       }
     }
     const hydratedGoal = hydrateGoalContract(turn.input)
-    const revisionState = restorePlanRevisions(eventsResult.rows.map(event => ({ type: event.type, payload: eventPayload(event.payload) })))
+    const goalState = restoreGoalRevisions(hydratedGoal.goalContract, eventsResult.rows.map(event => ({ type: event.type, payload: eventPayload(event.payload) })))
+    const revisionState = restorePlanRevisions(filterPlanRevisionEvents(eventsResult.rows.map(event => ({ type: event.type, payload: event.payload })), goalState.goalContract.revision).map(event => ({ type: event.type, payload: eventPayload(event.payload) })))
     const revision = revisionState.latest
-    const restored = [...observations(itemsResult.rows, eventsResult.rows), ...planObservations(eventsResult.rows), ...planCommandObservations(eventsResult.rows), ...(revision ? [planRevisionObservation(revision)] : [])]
+    const restored = [...observations(itemsResult.rows, eventsResult.rows, goalState.goalContract.revision), ...planObservations(eventsResult.rows), ...planCommandObservations(eventsResult.rows), ...(goalState.receipt ? [goalRevisionObservation(goalState.receipt)] : []), ...(revision ? [planRevisionObservation(revision)] : [])]
+    snapshot = { ...snapshot, toolObservations: snapshot.toolObservations.filter(item => { const content = object(item.content); const output = object(content.output); return (content.kind !== "plan_revision" || content.goalRevision === goalState.goalContract.revision) && (content.toolName !== "agent.plan.propose" || output.status !== "accepted" || output.goalRevision === goalState.goalContract.revision) }) }
     const seen = new Set(snapshot.toolObservations.map(item => item.id))
     const restoredIds = new Set<string>()
     const restoredNew = restored.filter(item => {
@@ -208,7 +212,7 @@ export async function loadCanonicalTurnState(pool: Pick<pg.Pool, "connect">, lea
     const seenHistory = new Set(snapshot.steerHistory.map(item => item.id))
     snapshot = {
       ...snapshot,
-      goal: { id: `turn-goal:${lease.turnId}`, content: hydratedGoal.goal },
+      goal: { id: `turn-goal:${lease.turnId}`, content: goalState.goalContract.objective },
       steerHistory: [...snapshot.steerHistory, ...history.filter(item => !seenHistory.has(item.id)).map(({ sequence: _sequence, ...item }) => item)],
       toolObservations: [...snapshot.toolObservations, ...restoredNew, ...consumedWaits.filter(item => !seenWithRestored.has(item.id))],
     }
@@ -233,7 +237,7 @@ export async function loadCanonicalTurnState(pool: Pick<pg.Pool, "connect">, lea
       consumedInputIds: Array.isArray(last?.consumedInputIds) ? last.consumedInputIds.filter((id): id is string => typeof id === "string") : [],
       usage,
     } satisfies TurnResumeState : undefined
-    const result = { scope, goal: hydratedGoal.goal, goalContract: hydratedGoal.goalContract, modelProfileSnapshot: json(turn.modelProfileSnapshot), toolPolicySnapshot: turn.toolPolicySnapshot ?? {}, budgetSnapshot: turn.budgetSnapshot ?? {}, planRevision: revision?.planRevision ?? null, planProposalHashes: revisionState.hashes, ...(typeof turn.rootTaskId === "string" ? { rootTaskId: turn.rootTaskId } : {}), ...(rootInput.rows[0] ? { rootInputId: rootInput.rows[0].id } : {}), snapshot, ...(resume ? { resume } : {}) }
+     const result = { scope, goal: goalState.goalContract.objective, goalContract: goalState.goalContract, modelProfileSnapshot: json(turn.modelProfileSnapshot), toolPolicySnapshot: turn.toolPolicySnapshot ?? {}, budgetSnapshot: turn.budgetSnapshot ?? {}, planRevision: revision?.planRevision ?? null, planProposalHashes: revisionState.hashes, ...(typeof turn.rootTaskId === "string" ? { rootTaskId: turn.rootTaskId } : {}), ...(rootInput.rows[0] ? { rootInputId: rootInput.rows[0].id } : {}), snapshot, ...(resume ? { resume } : {}) }
     await client.query("COMMIT")
     committed = true
     return result

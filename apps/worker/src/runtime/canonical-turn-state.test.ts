@@ -42,6 +42,36 @@ describe("loadCanonicalTurnState", () => {
     expect(value.goalContract).toMatchObject({ constraints: ["EU only"], successCriteria: ["ranked roles"], knownFacts: ["Dublin"], unresolvedQuestions: ["salary"], approvalBoundaries: ["submit after approval"], budgetRef: "runtime:turn" })
   })
 
+  it("restores the latest goal revision and invalidates plans from the prior goal", async () => {
+    const current = { revision: 2, objective: "Find senior jobs", constraints: ["EU"], successCriteria: [], knownFacts: [], unresolvedQuestions: [], approvalBoundaries: [], budgetRef: "runtime:turn" }
+    const value = await loadCanonicalTurnState(pool({
+      turn: { input: { goal: "Find jobs" }, rootTaskId: "root-1", contextSnapshotId: null, modelProfileSnapshot: {}, toolPolicySnapshot: {}, budgetSnapshot: {} },
+      snapshots: [{ throughSequence: "0", version: 1, content: {
+        schemaVersion: "agent-harness.context.v1", ownerId: "user-1", sessionId: "session-1", throughSequence: "0", goal: "Find jobs",
+        userConstraints: [], confirmedDecisions: [], completedWork: [], openWork: [], pendingApprovals: [], artifacts: [], facts: [], failedAttempts: [], references: [], consumedInputIds: [],
+        context: { system: [], profile: [], steerHistory: [], toolObservations: [
+          { id: "plan-revision:old-plan", content: { kind: "plan_revision", planCallId: "old-plan", goalRevision: 1, planRevision: 1, basedOnPlanRevision: null } },
+          { id: "tool-result:old-plan-call", content: { toolCallId: "old-plan-call", toolName: "agent.plan.propose", status: "completed", output: { status: "accepted", goalRevision: 1, planRevision: 1, basedOnPlanRevision: null } } },
+        ] },
+        tokenAccounting: { profiles: [], totalInputTokens: 0, totalOutputTokens: 0, totalCostUsd: 0 },
+      } }],
+      events: [
+        { type: "goal.revision", payload: { goalRevision: 2, basedOnGoalRevision: 1, goalContract: current } },
+        { type: "plan.revision", payload: { planCallId: "old-plan", goalRevision: 1, planRevision: 1, basedOnPlanRevision: null } },
+        { type: "plan.revision", payload: { planCallId: "new-plan", goalRevision: 2, planRevision: 1, basedOnPlanRevision: null } },
+      ],
+    }), lease)
+    expect(value.goal).toBe("Find senior jobs")
+    expect(value.goalContract).toEqual(current)
+    expect(value.planRevision).toBe(1)
+    expect(value.snapshot.toolObservations).toEqual(expect.arrayContaining([
+      { id: "goal-revision:2", content: expect.objectContaining({ kind: "goal_revision", goalRevision: 2 }) },
+      { id: "plan-revision:new-plan", content: expect.objectContaining({ planRevision: 1, goalRevision: 2 }) },
+    ]))
+    expect(value.snapshot.toolObservations.some(item => item.id === "plan-revision:old-plan")).toBe(false)
+    expect(value.snapshot.toolObservations.some(item => item.id === "tool-result:old-plan-call")).toBe(false)
+  })
+
   it("rebuilds durable tool observations and usage for resume", async () => {
     const value = await loadCanonicalTurnState(pool({
       turn: { input: { goal: "Find jobs" }, rootTaskId: "root-1", contextSnapshotId: null, modelProfileSnapshot: {}, toolPolicySnapshot: {}, budgetSnapshot: { limits: { maxSteps: 3 } } },

@@ -14,6 +14,7 @@ import { executeToolWithItems, publishCommentary, publishFinalResponse, publishR
 import type { TurnExecutionOptions } from "./turn-execution-types.js"
 import { assertExecutionAlive, assertModelAllowance, canEmitTurnCompleted, canPersistFinalResponse, makeExecutionId, resumedBudgetLimits, totalTurnUsage, turnErrorCode, updateExecutionStep } from "./turn-engine-helpers.js"
 import { parsePlanRevisionReceipt, planRevisionObservation } from "../planning/plan-revision-receipt.js"
+import { goalRevisionObservation, parseGoalRevisionOutput } from "../planning/goal-revision-receipt.js"
 
 const DEFAULT_MAX_STEPS = 32
 const PLAN_OBSERVATION_MAX_BYTES = 8 * 1024
@@ -282,6 +283,17 @@ async function executeTools(
         })))
         if (plan.observations.length > 0) snapshot = { ...snapshot, toolObservations: [...snapshot.toolObservations, ...plan.observations] }
         if (plan.wait) return { wait: plan.wait, snapshot }
+      }
+      if (call.name === "agent.goal.update") {
+        const revision = parseGoalRevisionOutput(result.output)
+        if (!revision) throw new TurnEngineError("invalid_output", "Goal update returned an invalid receipt")
+        await writer.append("goal.revision", call.id, null, revision, `goal-revision:${call.id}`)
+        const projection = goalRevisionObservation(revision)
+        snapshot = {
+          ...snapshot,
+          goal: { id: `turn-goal:${options.identity.turnId}`, content: revision.goalContract.objective },
+          toolObservations: snapshot.toolObservations.some(observation => observation.id === projection.id) ? snapshot.toolObservations : [...snapshot.toolObservations, projection],
+        }
       }
     }
     const dependencyWait = result.status === "completed" ? dependencyWaitReceipt(result.output) : null

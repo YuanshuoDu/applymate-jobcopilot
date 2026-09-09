@@ -18,6 +18,7 @@ import type { GmailToolOptions } from "./gmail-types.js"
 import { createWriteTools, type WriteToolOptions } from "./write-tools.js"
 import type { RuntimeToolDefinition } from "./types.js"
 import { createPlanProposalTool, type PlanProposalToolOptions } from "../planning/plan-proposal-tool.js"
+import { createGoalUpdateTool, type GoalUpdateToolOptions } from "../planning/goal-update-tool.js"
 
 export * from "./lifecycle.js"
 export * from "./read-data-source.js"
@@ -41,6 +42,7 @@ export * from "./tool-result-reference-repo.js"
 export * from "./tool-result-reference-types.js"
 export * from "./tool-results-read-tool.js"
 export * from "../planning/plan-proposal-tool.js"
+export * from "../planning/goal-update-tool.js"
 export * from "../policy/index.js"
 
 export type WorkerCoordinationOptions = {
@@ -62,6 +64,7 @@ export function createWorkerToolRuntime(
   artifacts?: WorkerArtifactOptions,
   write?: WorkerWriteOptions,
   planning?: PlanProposalToolOptions,
+  goalUpdate?: GoalUpdateToolOptions,
 ): { registry: ToolRegistry; router: ToolRouter; references: ToolLifecycleOptions["references"] } {
   const durableResults = lifecycleOptions.durableResults ?? createToolResultReferenceRepository(pool)
   const definitions = createReadOnlyTools(createPostgresReadToolDataSource(pool))
@@ -81,6 +84,7 @@ export function createWorkerToolRuntime(
   if (artifacts) definitions.push(...createArtifactTools(artifacts.store))
   if (write) definitions.push(...createWriteTools({ pool, ...write }))
   if (planning) definitions.push(createPlanProposalTool(planning) as RuntimeToolDefinition)
+  if (goalUpdate && planning) definitions.push(createGoalUpdateTool(goalUpdate) as RuntimeToolDefinition)
   const registry = new ToolRegistry(definitions)
   const lifecycle = new ToolLifecycle({ ...lifecycleOptions, durableResults })
   return { registry, router: new ToolRouter(registry, lifecycle, policy), references: lifecycleOptions.references }

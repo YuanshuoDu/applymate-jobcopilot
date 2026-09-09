@@ -31,6 +31,7 @@ describe('AgentEvent envelopes', () => {
     expect(isKnownAgentEventType('plan.observation')).toBe(true)
     expect(isKnownAgentEventType('plan.revision')).toBe(true)
     expect(isKnownAgentEventType('plan.command')).toBe(true)
+    expect(isKnownAgentEventType('goal.revision')).toBe(true)
     expect(isKnownAgentEventType('future.event.v3')).toBe(false)
   })
 

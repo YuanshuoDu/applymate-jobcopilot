@@ -4,6 +4,7 @@ export const GOAL_CONTRACT_SCHEMA_VERSION = "agent-harness.goal-contract.v1"
 export const PLAN_PROPOSAL_SCHEMA_VERSION = "agent-harness.plan.v1"
 export const PLAN_MAX_NODES = SUBAGENT_MAX_FAN_OUT
 export const PLAN_MAX_REVISIONS = 8
+export const MAX_GOAL_REVISIONS = 8
 
 export type GoalContract = {
   readonly revision: number
@@ -106,6 +107,7 @@ export function normalizeGoalContract(value: unknown): GoalContract {
     if (GOAL_IDENTITY_KEYS.has(key)) issues.push({ path: key, code: "forbidden_field", message: "Runtime identity and permission fields are server-owned" })
     else if (!allowed.has(key)) issues.push({ path: key, code: "unknown_field", message: "Unknown goal contract field" })
   }
+  for (const key of GOAL_KEYS) if (!Object.prototype.hasOwnProperty.call(parsed, key)) issues.push({ path: key, code: "missing_field", message: "Goal contract field is required" })
   const revision = parsed.revision
   if (typeof revision !== "number" || !Number.isSafeInteger(revision) || revision < 1) issues.push({ path: "revision", code: "invalid_revision", message: "Revision must be a positive integer" })
   const objective = goalString(parsed.objective, "objective", issues, 4_000)
