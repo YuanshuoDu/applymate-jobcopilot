@@ -302,6 +302,12 @@ Commit `2c27010c` adds a server-owned completion gate for root Turns. After `ver
 
 `RootTaskStore.checkCompletion` runs in a tenant transaction, locks and fences the current root Turn by owner/session/user/root identity, and queries descendants in the same session/turn/root scope. Terminal `completed`, `failed`, `interrupted`, `cancelled` and `closed` children allow completion; queued, running, waiting or unknown statuses block it with at most eight bounded task IDs. Both canonical runtime and the legacy agent-run executor pass the gate. Astra independently verified **3 files / 42 tests**, Worker TypeScript and `git diff --check`. Real PostgreSQL concurrency, cross-process recovery and exactly-once behavior remain unverified and are reserved for final unified acceptance.
 
+## P2-SUBAGENT-OUTBOX-1 update
+
+Commit `73945bf3` aligns child dispatch outbox failure semantics with the canonical Turn path. A failed `queue.add` records `queue_add_failed`, increments the attempt count and keeps the row unpublished before rethrowing the original queue error. If enqueue succeeds but published bookkeeping fails, recovery returns `subagent_dispatch_delivery_uncertain` and preserves the same generation/job ID for retry; successful delivery uses a guarded `publishedAt`/`attemptCount`/`lastError` update. Invalid payloads remain terminal and existing idempotency remains intact.
+
+Astra independently verified **1 file / 7 tests**, Worker TypeScript and `git diff --check`. No live Redis/PostgreSQL, cross-process recovery or exactly-once behavior was verified; those remain final integration evidence.
+
 ### Remaining implementation order
 
 Different supervisor browser projects previously encountered `/agent-preview` HTTP 500 with a JSON parse error under `next dev`; the exact parse source remains unknown. The fixture now runs against a production-build test server, and the four-project run passed. This is a validation-design change, not a claim that HMR caused the failure. An explicit `AGENT_PREVIEW_FIXTURE=1` flag and loopback host checks enable the fixture; ordinary production rejects it even with an authentication cookie. The test server binds `127.0.0.1:3100`, never reuses another server, uses placeholder local database configuration and does not apply migrations. Public or forwarded non-loopback hosts are covered by denial tests. Browser CI subsequently passed on `9391232`; final real-flow verification remains deferred with the owner's development-first instruction.

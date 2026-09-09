@@ -224,6 +224,12 @@ P2-COMPLETION-1 提交 `2c27010c`（2026-09-09）已推送到当前分支：root
 
 `RootTaskStore.checkCompletion` 在租户事务中锁定并校验当前 root Turn 的 owner/session/user/root fence，再查询同 session/turn/root 的 descendant；terminal 状态 completed/failed/interrupted/cancelled/closed 允许完成，queued/running/waiting/未知状态阻止完成，反馈最多 8 个 task ID。canonical runtime 与旧 agent-run executor 均接入该 gate。Astra 独立复核为 3 个文件、42/42 tests；Worker TypeScript 和 `git diff --check` 均通过。真实 PostgreSQL 并发、跨进程恢复和 exactly-once 仍未验证，留待最终统一验收。总体完整验收保持 **1/8（12.5%）**。
 
+## P2-SUBAGENT-OUTBOX-1 update
+
+P2-SUBAGENT-OUTBOX-1 提交 `73945bf3`（2026-09-09）已推送到当前分支：child dispatch 的 `queue.add` 失败记录 `queue_add_failed`、attempt+1 并保持 unpublished；enqueue 成功但 published bookkeeping 失败时返回 `subagent_dispatch_delivery_uncertain`，generation/jobId 不变；成功路径使用 guarded `publishedAt`/`attemptCount`/`lastError` 记账。invalid payload 的 terminal 行为与既有幂等性保持不变。
+
+Astra 独立复核为 1 个文件、7/7 tests；Worker TypeScript 和 `git diff --check` 均通过。没有 live Redis/PostgreSQL、跨进程恢复或 exactly-once 证据，留待最终统一验收。总体完整验收保持 **1/8（12.5%）**。
+
 ### 4.2 用户可观察的交付节点
 
 八个工程阶段按依赖实施；每次演示同时回答“它现在能替用户完成什么”。下列节点不增加阶段数量，也不表示相关能力已经实现。
