@@ -72,6 +72,26 @@ describe("PostgreSQL TurnEngine store", () => {
     expect(client.query).toHaveBeenCalledWith(expect.stringContaining('"status" = \'in_progress\''), [now, owner.turnId, owner.sessionId, owner.userId, owner.ownerId, owner.leaseVersion, owner.taskId])
   })
 
+  it("records child events as subagent actor while preserving root orchestration actor", async () => {
+    const calls: Array<{ sql: string; values?: readonly unknown[] }> = []
+    const client = { query: vi.fn(async (sql: string, values?: readonly unknown[]) => {
+      calls.push({ sql, values })
+      if (sql.includes("FROM \"agent_events\"")) return { rows: [] }
+      if (sql.includes('SELECT turn."id"')) return { rows: [{ id: "turn-1" }] }
+      if (sql.includes("UPDATE \"agent_sessions\"")) return { rows: [{ eventSequence: 1n }] }
+      return { rows: [], rowCount: 1 }
+    }), release: vi.fn() }
+    const store = createPgTurnEngineStore({ connect: vi.fn(async () => client) } as unknown as Pick<pg.Pool, "connect">)
+    await store.appendEvent({ owner: childOwner, id: "child-event", itemId: null, type: "tool.result", correlationId: "child-1", causationId: null, idempotencyKey: "child-key", payload: {} })
+    await store.appendEvent({ owner, id: "root-event", itemId: null, type: "turn.started", correlationId: "turn-1", causationId: null, idempotencyKey: "root-key", payload: {} })
+    const eventInserts = calls.filter(call => call.sql.includes('INSERT INTO "agent_events"'))
+    expect(eventInserts[0]?.values).toContain("subagent")
+    expect(eventInserts[1]?.values).toContain("orchestrator")
+    const outboxInserts = calls.filter(call => call.sql.includes('INSERT INTO "agent_outbox"'))
+    expect(JSON.parse(String(outboxInserts[0]?.values?.[3])).actor).toBe("subagent")
+    expect(JSON.parse(String(outboxInserts[1]?.values?.[3])).actor).toBe("orchestrator")
+  })
+
   it("fences child persistence and allocates a Turn-global ordinal", async () => {
     const calls: Array<{ sql: string; values?: readonly unknown[] }> = []
     const client = { query: vi.fn(async (sql: string, values?: readonly unknown[]) => {

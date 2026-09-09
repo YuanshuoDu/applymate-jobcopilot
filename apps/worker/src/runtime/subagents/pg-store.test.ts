@@ -62,6 +62,39 @@ describe("PgSubagentTaskStore", () => {
     expect(update).toContain('"interruptRequestedAt" IS NULL')
   })
 
+  it("inherits the parent model route and only permits a requested action subset", async () => {
+    const parent = taskRow({ id: "parent-1", rootTaskId: "parent-1", path: "/parent-1", status: "running", allowedActions: ["jobs.search", "persona.read"], modelProfileSnapshot: { provider: "fixture", model: "parent-model" } })
+    const fake = fakePool(sql => {
+      if (sql.includes('FROM "agent_sessions"')) return { rows: [{ id: "session-1" }], rowCount: 1 }
+      if (sql.includes('FROM "sub_agent_tasks" task')) return { rows: [taskRow({ id: "child-1", rootTaskId: "parent-1", parentTaskId: "parent-1", modelProfileSnapshot: parent.modelProfileSnapshot, allowedActions: ["jobs.search"] })], rowCount: 1 }
+      if (sql.includes('FROM "sub_agent_tasks"') && sql.includes('FOR UPDATE')) return { rows: [parent], rowCount: 1 }
+      if (sql.startsWith("INSERT INTO")) return { rows: [{ id: "child-1" }], rowCount: 1 }
+      return {}
+    })
+    const store = new PgSubagentTaskStore(fake.pool)
+    await store.create({ userId: "user-1", sessionId: "session-1", turnId: "turn-1", parentTaskId: "parent-1", role: "analyst", taskType: "research", goal: "inspect", allowedActions: ["jobs.search"], modelProfileSnapshot: { provider: "fixture", model: "override" }, policy })
+    const insert = fake.calls.find(([sql]) => sql.startsWith("INSERT INTO"))?.[1] ?? []
+    expect(insert[12]).toBe(JSON.stringify(["jobs.search"]))
+    expect(insert[15]).toBe(JSON.stringify(parent.modelProfileSnapshot))
+    expect(insert[17]).toBe(JSON.stringify({ subagentPolicy: policy }))
+  })
+
+  it("inherits all parent actions when the child request is empty and rejects expansion", async () => {
+    const parent = taskRow({ id: "parent-1", rootTaskId: "parent-1", path: "/parent-1", status: "running", allowedActions: ["jobs.search"], modelProfileSnapshot: { provider: "fixture", model: "parent-model" } })
+    const fake = fakePool(sql => {
+      if (sql.includes('FROM "agent_sessions"')) return { rows: [{ id: "session-1" }], rowCount: 1 }
+      if (sql.includes('FROM "sub_agent_tasks" task')) return { rows: [taskRow({ id: "child-1", rootTaskId: "parent-1", parentTaskId: "parent-1", modelProfileSnapshot: parent.modelProfileSnapshot, allowedActions: ["jobs.search"] })], rowCount: 1 }
+      if (sql.includes('FROM "sub_agent_tasks"') && sql.includes('FOR UPDATE')) return { rows: [parent], rowCount: 1 }
+      if (sql.startsWith("INSERT INTO")) return { rows: [{ id: "child-1" }], rowCount: 1 }
+      return {}
+    })
+    const store = new PgSubagentTaskStore(fake.pool)
+    await store.create({ userId: "user-1", sessionId: "session-1", parentTaskId: "parent-1", role: "scout", taskType: "research", goal: "inspect", allowedActions: [], policy })
+    const insert = fake.calls.find(([sql]) => sql.startsWith("INSERT INTO"))?.[1] ?? []
+    expect(insert[12]).toBe(JSON.stringify(["jobs.search"]))
+    await expect(store.create({ userId: "user-1", sessionId: "session-1", parentTaskId: "parent-1", role: "scout", taskType: "research", goal: "inspect", allowedActions: ["gmail.send"], policy })).rejects.toThrow("exceed parent")
+  })
+
   it("rejects a child that would exceed the inherited depth or fan-out", async () => {
     const parent = taskRow({ id: "parent-1", rootTaskId: "parent-1", path: "/parent-1", depth: 2, status: "running" })
     const depthFake = fakePool(sql => {
@@ -128,6 +161,8 @@ describe("PgSubagentTaskStore", () => {
     })
     const store = new PgSubagentTaskStore(fake.pool)
     await expect(store.heartbeat({ taskId: "task-1", sessionId: "session-1", ownerId: "worker-1", attemptCount: 1, now })).resolves.toBe("interrupted")
+    const update = fake.calls.find(([sql]) => sql.startsWith("UPDATE"))?.[0] ?? ""
+    expect(update).toContain('"attemptCount" = $5')
   })
 
   it("marks the whole root tree for interruption without cancelling terminal tasks", async () => {

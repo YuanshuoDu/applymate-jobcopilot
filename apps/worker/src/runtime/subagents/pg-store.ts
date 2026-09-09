@@ -14,8 +14,16 @@ import {
 
 type Queryable = Pick<pg.PoolClient, "query">
 
-function json(value: unknown, fallback: unknown): string {
-  try { return JSON.stringify(value ?? fallback) } catch { return JSON.stringify(fallback) }
+function containsSecret(value: unknown): boolean {
+  if (Array.isArray(value)) return value.some(containsSecret)
+  if (!value || typeof value !== "object") return false
+  return Object.entries(value).some(([key, child]) => /api.?key|secret|password|(?:access|refresh).?token|authorization/i.test(key) || containsSecret(child))
+}
+
+function json(value: unknown, fallback: unknown, field = "snapshot"): string {
+  const candidate = value ?? fallback
+  if (containsSecret(candidate)) throw new Error(`${field}_contains_secret`)
+  try { return JSON.stringify(candidate) } catch { return JSON.stringify(fallback) }
 }
 
 function date(value: Date | string | null): Date | null {
@@ -33,7 +41,7 @@ function rowToTask(row: Record<string, unknown>): SubagentTaskRecord {
     failureReason: row.failureReason ? String(row.failureReason) : null, attemptCount: Number(row.attemptCount),
     maxAttempts: Number(row.maxAttempts), leaseOwner: row.leaseOwner ? String(row.leaseOwner) : null,
     leaseExpiresAt: dateValue(row.leaseExpiresAt), interruptRequestedAt: dateValue(row.interruptRequestedAt),
-    budgetSnapshot: row.budgetSnapshot, toolPolicySnapshot: row.toolPolicySnapshot,
+    modelProfileSnapshot: row.modelProfileSnapshot, budgetSnapshot: row.budgetSnapshot, toolPolicySnapshot: row.toolPolicySnapshot,
   }
 }
 async function transaction<T>(pool: PgSubagentPool, work: (client: pg.PoolClient) => Promise<T>): Promise<T> {
@@ -68,7 +76,7 @@ export class PgSubagentTaskStore implements SubagentStore {
       const session = await client.query(`SELECT "id" FROM "agent_sessions" WHERE "id" = $1 AND "userId" = $2 FOR UPDATE`, [input.sessionId, input.userId])
       if (!session.rows[0]) throw new Error("Session is unavailable")
       const parent = input.parentTaskId
-        ? await client.query(`SELECT "id", "rootTaskId", "path", "depth", "status", "budgetSnapshot", "toolPolicySnapshot"
+        ? await client.query(`SELECT "id", "rootTaskId", "path", "depth", "status", "allowedActions", "modelProfileSnapshot", "budgetSnapshot", "toolPolicySnapshot"
              FROM "sub_agent_tasks" WHERE "id" = $1 AND "sessionId" = $2 FOR UPDATE`, [input.parentTaskId, input.sessionId])
         : { rows: [] }
       if (input.parentTaskId && !parent.rows[0]) throw new Error("Parent task is unavailable")
@@ -85,14 +93,21 @@ export class PgSubagentTaskStore implements SubagentStore {
       const id = `subagent-${randomUUID()}`
       const rootTaskId = parentRow ? String(parentRow.rootTaskId ?? input.parentTaskId) : id
       const path = parentRow ? `${String(parentRow.path).replace(/\/$/, "")}/${id}` : `/${id}`
-      const inheritedBudget = parentRow ? asObject(parentRow.budgetSnapshot) : asObject(input.budgetSnapshot)
-      const budget = { ...inheritedBudget, subagentPolicy: input.policy }
+      // Tree step limits are shared through AgentTreeBudgetReservation; copying
+      // the parent snapshot here would create a second spendable allowance.
+      const budget = { subagentPolicy: input.policy }
       const toolPolicy = parentRow ? asObject(parentRow.toolPolicySnapshot) : asObject(input.toolPolicySnapshot)
+      const inheritedModel = parentRow?.modelProfileSnapshot
+      const modelProfile = parentRow ? (inheritedModel ?? input.modelProfileSnapshot ?? {}) : (input.modelProfileSnapshot ?? {})
+      const parentActions = parentRow ? actionList(parentRow.allowedActions) : []
+      const requestedActions = actionList(input.allowedActions)
+      if (parentRow && requestedActions.some(action => !parentActions.includes(action))) throw new Error("Child allowed actions exceed parent policy")
+      const allowedActions = parentRow && requestedActions.length === 0 ? parentActions : requestedActions
       const result = await client.query(`${INSERT_TASK} RETURNING "id"`, [
         id, input.sessionId, input.turnId ?? null, rootTaskId, input.parentTaskId ?? null, path, depth,
         input.role, input.taskType, input.goal, json(input.constraints, []), json(input.successCriteria, []),
-        json(input.allowedActions, []), json(input.context, {}), json(input.expectedOutputSchema, {}),
-        json(input.modelProfileSnapshot, {}), json(toolPolicy, {}), json(budget, {}), input.policy.maxAttempts,
+        json(allowedActions, []), json(input.context, {}), json(input.expectedOutputSchema, {}),
+        json(modelProfile, {}, "model_profile"), json(toolPolicy, {}, "tool_policy"), json(budget, {}, "budget"), input.policy.maxAttempts,
       ])
       return this.read(client, result.rows[0].id, input.sessionId)
     })
@@ -127,7 +142,7 @@ export class PgSubagentTaskStore implements SubagentStore {
       const result = await client.query(`UPDATE "sub_agent_tasks"
         SET "leaseExpiresAt" = LEAST(CURRENT_TIMESTAMP + ($4 * INTERVAL '1 millisecond'),
           COALESCE("startedAt", CURRENT_TIMESTAMP) + (300000 * INTERVAL '1 millisecond')), "updatedAt" = CURRENT_TIMESTAMP
-        WHERE "id" = $1 AND "sessionId" = $2 AND "leaseOwner" = $3 AND "attemptCount" = $6 AND "status" = 'running'
+        WHERE "id" = $1 AND "sessionId" = $2 AND "leaseOwner" = $3 AND "attemptCount" = $5 AND "status" = 'running'
           AND "leaseExpiresAt" > CURRENT_TIMESTAMP AND EXISTS (SELECT 1 FROM "sub_agent_tasks" AS root JOIN "agent_turns" AS turn ON turn."id" = root."turnId"
             WHERE root."id" = "sub_agent_tasks"."rootTaskId" AND root."sessionId" = "sub_agent_tasks"."sessionId"
               AND root."status" NOT IN ('completed', 'failed', 'interrupted', 'cancelled', 'closed')
@@ -231,6 +246,10 @@ export class PgSubagentTaskStore implements SubagentStore {
 
 function asObject(value: unknown): Record<string, unknown> {
   return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {}
+}
+
+function actionList(value: unknown): string[] {
+  return Array.isArray(value) ? value.filter((item): item is string => typeof item === "string" && item.trim().length > 0) : []
 }
 
 function dateValue(value: unknown): Date | null {

@@ -38,7 +38,7 @@ function task(row: Row): SubagentTaskRecord {
     rootTaskId: String(row.rootTaskId ?? row.id), parentTaskId: row.parentTaskId ? String(row.parentTaskId) : null,
     path: String(row.path), depth: Number(row.depth), role: String(row.role), taskType: String(row.taskType), status: String(row.status) as SubagentTaskStatus,
     goal: String(row.goal), constraints: row.constraints, successCriteria: row.successCriteria, allowedActions: row.allowedActions,
-    context: row.context, expectedOutputSchema: row.expectedOutputSchema, result: row.result ?? null, failureReason: row.failureReason ? String(row.failureReason) : null,
+    context: row.context, expectedOutputSchema: row.expectedOutputSchema, modelProfileSnapshot: row.modelProfileSnapshot, result: row.result ?? null, failureReason: row.failureReason ? String(row.failureReason) : null,
     attemptCount: Number(row.attemptCount), maxAttempts: Number(row.maxAttempts), leaseOwner: row.leaseOwner ? String(row.leaseOwner) : null,
     leaseExpiresAt: date(row.leaseExpiresAt), interruptRequestedAt: date(row.interruptRequestedAt), budgetSnapshot: row.budgetSnapshot, toolPolicySnapshot: row.toolPolicySnapshot,
   }

@@ -77,6 +77,8 @@ export type SubagentTaskRecord = {
   allowedActions: unknown
   context: unknown
   expectedOutputSchema: unknown
+  /** Server-side model route metadata; credentials are rejected at persistence boundaries. */
+  modelProfileSnapshot?: unknown
   result: unknown | null
   failureReason: string | null
   attemptCount: number
