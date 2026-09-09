@@ -6,6 +6,7 @@ import type { CanonicalTurnState } from "./canonical-turn-state.js"
 import type { TurnEngineStore } from "./turns/turn-engine-types.js"
 import { createCanonicalTurnRuntime } from "./canonical-turn-runtime.js"
 import { createPgRootTaskStore } from "./subagents/root-task-store.js"
+import { PLAN_MAX_REVISIONS } from "./planning/goal-plan-contract.js"
 
 const lease = {
   turnId: "turn-1", sessionId: "session-1", ownerId: "worker-1", userId: "user-1", leaseVersion: 2,
@@ -249,8 +250,9 @@ describe("createCanonicalTurnRuntime", () => {
   })
 
   it("passes the recovered plan revision to the proposal and execution bridges", async () => {
-    const factory = vi.fn((input: { initialPlanRevision?: number | null }) => {
+    const factory = vi.fn((input: { initialPlanRevision?: number | null; maxPlanRevisions?: number }) => {
       expect(input.initialPlanRevision).toBe(2)
+      expect(input.maxPlanRevisions).toBe(PLAN_MAX_REVISIONS)
       return async () => ({ observations: [] })
     })
     const fixture = setup({ planningEnabled: true, planningExecutionEnabled: true, stateLoader: async () => ({ ...state(), planRevision: 2 }), planExecutionFactory: factory })

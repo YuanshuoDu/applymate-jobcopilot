@@ -30,13 +30,13 @@ function output(value: PlanProposal, overrides: Record<string, unknown> = {}): R
   return { status: "accepted", goalRevision: 1, planRevision: 1, basedOnPlanRevision: null, proposal: value, intents: [], ...overrides }
 }
 
-function fixture(router: { execute(context: ToolRouterContext, request: ToolCallRequest): Promise<ToolExecutionResult> } = { execute: async (_context, request) => ({ ...request, status: "completed", output: { ok: true }, errorCode: null }) }, initialPlanRevision?: number, persistOutcome?: (receipt: PlanCommandReceipt) => Promise<void> | void) {
+function fixture(router: { execute(context: ToolRouterContext, request: ToolCallRequest): Promise<ToolExecutionResult> } = { execute: async (_context, request) => ({ ...request, status: "completed", output: { ok: true }, errorCode: null }) }, initialPlanRevision?: number, persistOutcome?: (receipt: PlanCommandReceipt) => Promise<void> | void, maxPlanRevisions?: number) {
   const options: CanonicalPlanExecutionOptions = {
     goal, allowedTools: ["jobs.search"], allowedTemplates: [], allowedRoles: ["scout"], maxNodes: 8,
     capabilities: ["read", "canPlan"], actorRole: "orchestrator", scope: { userId: "user-1" }, lease,
     rootTaskId: "root-1", taskId: "root-1", initialPlanRevision, router,
     registry: { list: () => [{ name: "jobs.search", version: "1", risk: "read", capabilities: ["read"] }] },
-    policy: {} as PolicyEngine, ...(persistOutcome ? { persistOutcome } : {}),
+    policy: {} as PolicyEngine, ...(persistOutcome ? { persistOutcome } : {}), ...(maxPlanRevisions === undefined ? {} : { maxPlanRevisions }),
   }
   return createCanonicalPlanExecutionFactory(options)
 }
@@ -108,6 +108,19 @@ describe("createCanonicalPlanExecutionFactory", () => {
     expect(accepted.observations).toEqual([])
     const stale = await hook(input(output(recoveredProposal, { planRevision: 3, basedOnPlanRevision: 2 })))
     expect(observationCode(stale)).toBe("revision_conflict")
+  })
+
+  it("rejects accepted output beyond the server revision bound", async () => {
+    const hook = fixture(undefined, undefined, undefined, 1)
+    await expect(hook(input(output(proposal([]))))).resolves.toEqual({ observations: [] })
+    const next = await hook(input(output(proposal([]), { planRevision: 2, basedOnPlanRevision: 1 })))
+    expect(observationCode(next)).toBe("plan_revision_limit")
+  })
+
+  it("constructs from a recovered bound and returns a bounded limit observation", async () => {
+    const hook = fixture(undefined, 8)
+    const next = await hook(input(output(proposal([]), { planRevision: 9, basedOnPlanRevision: 8 })))
+    expect(observationCode(next)).toBe("plan_revision_limit")
   })
 
   it("feeds command failure back and maps request input to a wait", async () => {

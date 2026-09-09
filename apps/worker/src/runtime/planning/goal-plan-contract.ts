@@ -3,6 +3,7 @@ import { SUBAGENT_MAX_FAN_OUT } from "../subagents/types.js"
 export const GOAL_CONTRACT_SCHEMA_VERSION = "agent-harness.goal-contract.v1"
 export const PLAN_PROPOSAL_SCHEMA_VERSION = "agent-harness.plan.v1"
 export const PLAN_MAX_NODES = SUBAGENT_MAX_FAN_OUT
+export const PLAN_MAX_REVISIONS = 8
 
 export type GoalContract = {
   readonly revision: number

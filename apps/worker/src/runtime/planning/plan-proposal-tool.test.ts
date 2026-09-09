@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest"
 
 import { createPlanProposalTool } from "./plan-proposal-tool.js"
-import { PLAN_MAX_NODES, PLAN_PROPOSAL_SCHEMA_VERSION, type GoalContract, type PlanProposal } from "./goal-plan-contract.js"
+import { PLAN_MAX_NODES, PLAN_MAX_REVISIONS, PLAN_PROPOSAL_SCHEMA_VERSION, type GoalContract, type PlanProposal } from "./goal-plan-contract.js"
 
 const goal: GoalContract = { revision: 1, objective: "Find jobs", constraints: [], successCriteria: ["review results"], knownFacts: [], unresolvedQuestions: [], approvalBoundaries: [], budgetRef: "runtime:turn" }
 const baseNode = { localId: "read", kind: "use_tool" as const, objective: "Read jobs", inputRefs: [], dependsOn: [], successCriteria: ["results"], outputSchemaRef: null, toolName: "jobs.search" }
@@ -16,8 +16,11 @@ describe("plan proposal tool", () => {
   it("rejects invalid server-owned bounds at factory construction", () => {
     expect(() => createPlanProposalTool({ ...toolOptions(), maxNodes: 0 })).toThrow("maxNodes")
     expect(() => createPlanProposalTool({ ...toolOptions(), maxNodes: PLAN_MAX_NODES + 1 })).toThrow("maxNodes")
+    expect(() => createPlanProposalTool(toolOptions({ maxPlanRevisions: 0 }))).toThrow("maxPlanRevisions")
+    expect(() => createPlanProposalTool(toolOptions({ maxPlanRevisions: PLAN_MAX_REVISIONS + 1 }))).toThrow("maxPlanRevisions")
     expect(() => createPlanProposalTool({ ...toolOptions(), goal: { ...goal, revision: 0 } })).toThrow("goal revision")
     expect(() => createPlanProposalTool(toolOptions({ initialPlanRevision: 0 }))).toThrow("initial plan revision")
+    expect(() => createPlanProposalTool(toolOptions({ initialPlanRevision: PLAN_MAX_REVISIONS + 1 }))).toThrow("initial plan revision")
   })
 
   it("snapshots server allowlists so later caller mutation cannot widen planning", async () => {
@@ -34,6 +37,18 @@ describe("plan proposal tool", () => {
     expect(first.intents[0]).not.toHaveProperty("taskId")
     const second = await definition.execute(context(), { proposal: plan({ basedOnPlanRevision: 1, nodes: [{ ...baseNode, localId: "read-again", objective: "Read more jobs" }] }) })
     expect(second).toMatchObject({ planRevision: 2, basedOnPlanRevision: 1 })
+  })
+
+  it("accepts through the server revision bound and rejects the next proposal", async () => {
+    const definition = createPlanProposalTool(toolOptions({ maxPlanRevisions: 2 }))
+    await expect(definition.execute(context(), { proposal: plan() })).resolves.toMatchObject({ planRevision: 1 })
+    await expect(definition.execute(context(), { proposal: plan({ basedOnPlanRevision: 1 }) })).resolves.toMatchObject({ planRevision: 2 })
+    await expect(definition.execute(context(), { proposal: plan({ basedOnPlanRevision: 2 }) })).rejects.toMatchObject({ code: "plan_revision_limit", safeOutput: { maxPlanRevisions: 2 } })
+  })
+
+  it("restores at the revision bound and rejects the next proposal", async () => {
+    const definition = createPlanProposalTool(toolOptions({ initialPlanRevision: PLAN_MAX_REVISIONS }))
+    await expect(definition.execute(context(), { proposal: plan({ basedOnPlanRevision: PLAN_MAX_REVISIONS }) })).rejects.toMatchObject({ code: "plan_revision_limit", safeOutput: { maxPlanRevisions: PLAN_MAX_REVISIONS } })
   })
 
   it("rejects stale CAS and does not advance the private revision", async () => {

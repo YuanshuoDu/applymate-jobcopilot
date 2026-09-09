@@ -3,7 +3,7 @@ import { Buffer } from "node:buffer"
 import type { PolicyEngine } from "@jobcopilot/agent-policy"
 import type { PolicyRole, TenantScope } from "@jobcopilot/agent-protocol"
 
-import { PLAN_MAX_NODES, isPlainJsonObject, type GoalContract } from "./goal-plan-contract.js"
+import { PLAN_MAX_NODES, PLAN_MAX_REVISIONS, isPlainJsonObject, type GoalContract } from "./goal-plan-contract.js"
 import { PlanDispatchError, dispatchPlanProposal } from "./plan-intent-dispatcher.js"
 import { PlanCommandExecutionError, executePlanCommands, type PlanCommandExecutionRecord, type PlanCommandExecutionRuntime, type PlanControlRecord } from "./plan-command-executor.js"
 import { createPlanCommandReceipt, type PlanCommandReceipt } from "./plan-command-receipt.js"
@@ -36,6 +36,8 @@ export type CanonicalPlanExecutionOptions = {
   readonly registry: Registry
   readonly policy: PolicyEngine
   readonly persistOutcome?: (receipt: PlanCommandReceipt) => Promise<void> | void
+  /** Server-owned upper bound for accepted revisions. */
+  readonly maxPlanRevisions?: number
 }
 
 class CanonicalPlanError extends Error {
@@ -56,13 +58,14 @@ function plainJson(value: unknown, seen = new Set<object>()): boolean {
   return valid
 }
 
-function accepted(value: unknown, goalRevision: number, expectedPlanRevision: number | null): { planRevision: number; basedOnPlanRevision: number | null; proposal: unknown } {
+function accepted(value: unknown, goalRevision: number, expectedPlanRevision: number | null, maxPlanRevisions: number): { planRevision: number; basedOnPlanRevision: number | null; proposal: unknown } {
   if (!isPlainJsonObject(value) || !plainJson(value) || Object.keys(value).some(key => !OUTPUT_KEYS.includes(key))) throw new CanonicalPlanError("invalid_plan_output")
   if (value.status !== "accepted" || value.goalRevision !== goalRevision) throw new CanonicalPlanError("revision_conflict")
   const planRevision = value.planRevision
   const basedOnPlanRevision = value.basedOnPlanRevision
   if (typeof planRevision !== "number" || !Number.isSafeInteger(planRevision) || planRevision < 1 ||
     (basedOnPlanRevision !== null && (typeof basedOnPlanRevision !== "number" || !Number.isSafeInteger(basedOnPlanRevision) || basedOnPlanRevision < 0))) throw new CanonicalPlanError("invalid_plan_output")
+  if (planRevision > maxPlanRevisions || (expectedPlanRevision !== null && expectedPlanRevision >= maxPlanRevisions)) throw new CanonicalPlanError("plan_revision_limit")
   if (basedOnPlanRevision !== expectedPlanRevision || planRevision !== (expectedPlanRevision === null ? 1 : expectedPlanRevision + 1)) throw new CanonicalPlanError("revision_conflict")
   if (!isPlainJsonObject(value.proposal) || !Array.isArray(value.intents) || value.intents.length > MAX_OBSERVATIONS) throw new CanonicalPlanError("invalid_plan_output")
   const encoded = JSON.stringify(value)
@@ -163,7 +166,9 @@ function boundedRecords(result: { readonly completed: readonly PlanCommandExecut
 
 export function createCanonicalPlanExecutionFactory(options: CanonicalPlanExecutionOptions): (input: Parameters<TurnEnginePlanExecutionHook>[0]) => Promise<TurnEnginePlanExecutionHookResult> {
   if (!Number.isSafeInteger(options.goal.revision) || options.goal.revision < 1 || !Number.isSafeInteger(options.maxNodes) || options.maxNodes < 1 || options.maxNodes > PLAN_MAX_NODES) throw new TypeError("Invalid server plan execution bounds")
-  if (options.initialPlanRevision !== undefined && options.initialPlanRevision !== null && (!Number.isSafeInteger(options.initialPlanRevision) || options.initialPlanRevision < 1)) throw new TypeError("Invalid initial plan revision")
+  const maxPlanRevisions = options.maxPlanRevisions ?? PLAN_MAX_REVISIONS
+  if (!Number.isSafeInteger(maxPlanRevisions) || maxPlanRevisions < 1 || maxPlanRevisions > PLAN_MAX_REVISIONS) throw new TypeError("Invalid max plan revisions")
+  if (options.initialPlanRevision !== undefined && options.initialPlanRevision !== null && (!Number.isSafeInteger(options.initialPlanRevision) || options.initialPlanRevision < 1 || options.initialPlanRevision > maxPlanRevisions)) throw new TypeError("Invalid initial plan revision")
   const allowedTools = Object.freeze([...options.allowedTools])
   const allowedTemplates = Object.freeze([...options.allowedTemplates])
   const allowedRoles = Object.freeze([...options.allowedRoles])
@@ -172,7 +177,7 @@ export function createCanonicalPlanExecutionFactory(options: CanonicalPlanExecut
     const baseError = (code: string): TurnEnginePlanExecutionHookResult => ({ observations: [failureObservation(input.call.id, code)] })
     try {
       if (input.result.status !== "completed" || input.result.toolName !== "agent.plan.propose") throw new CanonicalPlanError("invalid_plan_output")
-      const output = accepted(input.result.output, options.goal.revision, currentPlanRevision)
+      const output = accepted(input.result.output, options.goal.revision, currentPlanRevision, maxPlanRevisions)
       const dispatched = dispatchPlanProposal(output.proposal, {
         goalRevision: options.goal.revision, planRevision: output.basedOnPlanRevision, maxNodes: options.maxNodes,
         allowedActions: [...PLAN_ACTIONS], allowedTools, allowedTemplates, allowedRoles,
