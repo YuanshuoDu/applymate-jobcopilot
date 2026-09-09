@@ -212,6 +212,12 @@ P3-13 提交 `46a19c38`（2026-09-09）已推送到当前分支：canonical stat
 
 Astra 独立复核为 3 个文件、29/29 tests；Worker TypeScript、shared build 和 `git diff --check` 均通过。没有数据库、provider、queue、migration 或 Web 变更；当前还没有 goal-update event，只接受 revision 1，真实 PostgreSQL/RLS、provider、queue、进程重启和 child-parent E2E 仍未验证。总体完整验收保持 **1/8（12.5%）**，P3-13 不计作阶段完成。
 
+## P2-OUTBOX-1 update
+
+P2-OUTBOX-1 提交 `57dd0ac9`（2026-09-09）已推送到当前分支：canonical Turn dispatch 在 `queue.add` 成功后使用同一 outbox row 做 guarded publishedAt/attemptCount/lastError 记账；queue.add 失败记录 `queue_add_failed` 并保持未发布；enqueue 成功但记账不确定时返回 `turn_dispatch_delivery_uncertain`，下一次使用相同 generation/jobId 依靠 BullMQ 幂等。该语义是 at-least-once 加 idempotent job ID，不承诺 exactly-once。
+
+Astra 独立复核为 2 个文件、16/16 tests；Worker TypeScript、shared build 和 `git diff --check` 均通过。没有 DB schema、provider 或 Web 变更；真实 Redis/PostgreSQL、跨进程恢复和 exactly-once 仍未验证。总体完整验收保持 **1/8（12.5%）**。
+
 ### 4.2 用户可观察的交付节点
 
 八个工程阶段按依赖实施；每次演示同时回答“它现在能替用户完成什么”。下列节点不增加阶段数量，也不表示相关能力已经实现。
