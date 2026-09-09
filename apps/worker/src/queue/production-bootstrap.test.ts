@@ -136,12 +136,14 @@ describe("production Worker bootstrap", () => {
       return turnQueue
     }) as unknown as Parameters<typeof createProductionWorkerBootstrap>[0]["turnQueueFactory"]
     const recover = (() => turnRecovery) as unknown as Parameters<typeof createProductionWorkerBootstrap>[0]["turnRecoveryFactory"]
+    const waitResolverFactory = vi.fn()
 
     const bootstrap = await createProductionWorkerBootstrap({
       pool: { connect: vi.fn() },
       runtime: canonical,
       turnQueueFactory: turns,
       turnRecoveryFactory: recover,
+      waitResolverFactory,
     })
 
     expect(turnOptions?.execute).toBe(canonical.execute)
@@ -151,6 +153,24 @@ describe("production Worker bootstrap", () => {
     await bootstrap.close()
     await bootstrap.close()
     expect(events).toEqual(["execute", "turn.pause", "turn.recovery.close", "turn.close", "manager.shutdown", "runtime.close"])
+    expect(waitResolverFactory).not.toHaveBeenCalled()
+  })
+
+  it("starts and closes the dependency resolver only when explicitly configured", async () => {
+    const canonical = runtime([])
+    const turnQueueFactory = vi.fn(() => ({ queue: { add: vi.fn() }, worker: {}, active: { size: 0, values: () => [] }, close: vi.fn() }) as never)
+    const turnRecoveryFactory = vi.fn(() => ({ close: vi.fn(async () => undefined) })) as never
+    const resolver = { close: vi.fn(async () => undefined) }
+    const resolverFactory = vi.fn(() => resolver)
+    const bootstrap = await createProductionWorkerBootstrap({
+      pool: { connect: vi.fn() }, runtime: canonical,
+      turnQueueFactory: turnQueueFactory as never, turnRecoveryFactory,
+      waitResolver: { intervalMs: 60_000, batchSize: 1 }, waitResolverFactory: resolverFactory,
+    })
+    expect(resolverFactory).toHaveBeenCalledWith(expect.anything(), { intervalMs: 60_000, batchSize: 1 })
+    expect(bootstrap.waitResolver).toBe(resolver)
+    await bootstrap.close()
+    expect(resolver.close).toHaveBeenCalledOnce()
   })
 
   it("keeps child queue registration behind an explicit executor seam", async () => {

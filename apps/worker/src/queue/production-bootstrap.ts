@@ -15,6 +15,7 @@ import type { startTurnRecoveryScanner, TurnDispatchQueue } from "../runtime/tur
 import type { RootAbortControllerRegistry } from "../runtime/interrupt/registry.js"
 import { TurnShutdownController } from "../runtime/turns/shutdown.js"
 import { createPgDurableWaitPort } from "../runtime/subagents/durable-wait-store.js"
+import { startDurableWaitResolver, type DurableWaitResolverOptions } from "../runtime/subagents/durable-wait-resolver.js"
 
 type LeasePool = Pick<pg.Pool, "connect">
 
@@ -34,6 +35,8 @@ type TurnRecoveryFactory = (
   ownerId?: string,
   intervalMs?: number,
 ) => TurnRecovery
+type WaitResolver = ReturnType<typeof startDurableWaitResolver>
+type WaitResolverFactory = (pool: LeasePool, options: DurableWaitResolverOptions) => WaitResolver
 type SubagentConsumer = ReturnType<typeof createSubagentQueue>
 type SubagentConsumerFactory = (options: Parameters<typeof createSubagentQueue>[0]) => SubagentConsumer
 type SubagentRecovery = ReturnType<typeof startSubagentRecoveryScanner>
@@ -52,6 +55,9 @@ export interface ProductionBootstrapOptions {
   readonly interrupts?: RootAbortControllerRegistry
   readonly turnQueueFactory?: TurnConsumerFactory
   readonly turnRecoveryFactory?: TurnRecoveryFactory
+  readonly waitResolverFactory?: WaitResolverFactory
+  /** Optional dependency wait reconciliation; startup keeps this disabled by default. */
+  readonly waitResolver?: DurableWaitResolverOptions
   /** Child execution is intentionally opt-in until its production executor is bound. */
   readonly subagents?: {
     readonly execute: SubagentExecutor
@@ -66,6 +72,7 @@ export interface ProductionWorkerBootstrap {
   readonly runtime: CanonicalTurnRuntime
   readonly turns: TurnConsumer
   readonly turnRecovery: TurnRecovery
+  readonly waitResolver?: WaitResolver
   readonly subagents?: {
     readonly queue: SubagentConsumer
     readonly recovery: SubagentRecovery
@@ -99,6 +106,7 @@ export async function createProductionWorkerBootstrap(
   let recoveryFactory = options.turnRecoveryFactory
   let turns: TurnConsumer | null = null
   let turnRecovery: TurnRecovery | null = null
+  let waitResolver: WaitResolver | null = null
   let subagentConsumer: SubagentConsumer | null = null
   let subagentRecovery: SubagentRecovery | null = null
   try {
@@ -116,6 +124,10 @@ export async function createProductionWorkerBootstrap(
       },
     })
     turnRecovery = recoveryFactory(options.pool, turns.queue, options.ownerId, options.turnRecoveryIntervalMs)
+    if (options.waitResolver) {
+      const resolverFactory = options.waitResolverFactory ?? startDurableWaitResolver
+      waitResolver = resolverFactory(options.pool, options.waitResolver)
+    }
 
     if (options.subagents) {
       const subagentModule = options.subagents.queueFactory && options.subagents.recoveryFactory
@@ -151,6 +163,7 @@ export async function createProductionWorkerBootstrap(
       runtime: options.runtime,
       turns: createdTurns,
       turnRecovery,
+      ...(waitResolver ? { waitResolver } : {}),
       ...(subagentConsumer && subagentRecovery ? { subagents: { queue: subagentConsumer, recovery: subagentRecovery } } : {}),
       async close() {
         if (closed) return
@@ -158,6 +171,7 @@ export async function createProductionWorkerBootstrap(
         await closeAll([
           subagentConsumer ? async () => { await subagentConsumer!.worker.pause?.(true) } : undefined,
           subagentRecovery ? () => subagentRecovery!.close() : undefined,
+          waitResolver ? () => waitResolver!.close() : undefined,
           () => turnShutdown.shutdown("worker_close"),
           () => options.runtime.manager.shutdown(),
           subagentConsumer ? () => subagentConsumer!.close() : undefined,
@@ -169,6 +183,7 @@ export async function createProductionWorkerBootstrap(
     await closeAll([
       subagentConsumer ? async () => { await subagentConsumer!.worker.pause?.(true) } : undefined,
       subagentRecovery ? () => subagentRecovery!.close() : undefined,
+      waitResolver ? () => waitResolver!.close() : undefined,
       turns ? () => options.runtime.manager.shutdown() : undefined,
       turnRecovery ? () => turnRecovery!.close() : undefined,
       subagentConsumer ? () => subagentConsumer!.close() : undefined,

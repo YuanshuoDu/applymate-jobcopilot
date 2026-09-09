@@ -3,6 +3,7 @@ import type pg from "pg"
 
 import type { DurableWaitPort, DurableWaitResult } from "../tools/coordination-types.js"
 import { suspendAndReleaseWait, type DurableWaitHandoffInput, type DurableWaitHandoffResult } from "./durable-wait-handoff.js"
+import { reconcileDurableWaits, type DurableWaitReconcileOptions, type DurableWaitReconcileReport } from "./durable-wait-resolver.js"
 
 const MAX_WAIT_MS = 24 * 60 * 60 * 1_000
 const MAX_TARGETS = 8
@@ -17,6 +18,7 @@ export type DurableWaitResolveInput = { readonly userId: string; readonly sessio
 export type DurableWaitStore = DurableWaitPort & {
   resolve(input: DurableWaitResolveInput): Promise<DurableWaitResult | null>
   suspendAndRelease(input: DurableWaitHandoffInput): Promise<DurableWaitHandoffResult>
+  reconcile(input?: DurableWaitReconcileOptions): Promise<DurableWaitReconcileReport>
 }
 
 export class DurableWaitStoreError extends Error {
@@ -178,7 +180,11 @@ export function createPgDurableWaitPort(pool: Pool): DurableWaitStore {
     })
   }
 
-  return { wait, resolve, cancel, suspendAndRelease: input => suspendAndReleaseWait(pool, input) }
+  return {
+    wait, resolve, cancel,
+    suspendAndRelease: input => suspendAndReleaseWait(pool, input),
+    reconcile: input => reconcileDurableWaits(pool, input),
+  }
 }
 
 /** Compatibility name for callers that prefer the repository terminology. */

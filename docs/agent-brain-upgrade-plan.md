@@ -26,8 +26,8 @@
 | --- | --- | --- |
 | V2 根任务入口 | 消息与 dispatch outbox 原子写入；Worker 注册 canonical consumer/recovery；真实配置的 ModelAdapter 与 ToolRouter 已组合 | 实际 PostgreSQL 与进程重启证明；完整领域能力接入 |
 | 模型与用量 | 根执行的可信配置、账户额度准入、幂等结算已有实现与测试 | 子 Task owner/attempt 的准入与整树预算共享 |
-| 根/子执行循环 | owner-neutral loop 已提取；测试覆盖子任务身份与后续模型观察 | 真实 child store/executor 与生产启动组合尚未接通 |
-| 结果存储与等待 | 私有工具结果、wait 的两个附加模型及迁移源码已准备 | 生命周期绑定、真实数据库/RLS、持久化等待与唤醒闭环 |
+| 根/子执行循环 | owner-neutral loop、真实 child executor 与默认关闭的生产启动 seam 已接通 | child queue 实际运行、真实数据库/RLS、重启和父子结果闭环 |
+| 结果存储与等待 | 私有工具结果、durable wait 注册、原子 handoff 与 gated resolver 候选已接通 | 迁移应用、真实数据库/RLS、恢复消费和一次性结果闭环 |
 | Supervisor UI | 共享 timeline、任务树、证据选择、分页已加入；生产构建的桌面/手机中英文 fixture 4/4 通过 | 已登录环境、真实子任务和审批恢复的联调 |
 | CI | P0 基线 `28a4bf0` 已通过完整 CI；`9391232` 的 Tests、类型、构建、Harness、浏览器矩阵均已通过 | 真实数据库 dump rehearsal 跳过，不计作数据库证明；之后的修改另行记录检查范围 |
 | 上线 | PR 仍为 draft | 未合并、未部署、未应用迁移；未宣称生产已具备完整能力 |
@@ -160,7 +160,7 @@ P4 的副作用防绕过约束从第一项领域工具迁入时保留。按用�
 
 额度接近上限时报告：总阶段数、完整验收数与比例、当前工作包、此次新增证据、尚未完成及已提交/推送状态。最高产品验收仍是目标驱动的真实规划、执行、证据反馈和重新规划，而不是界面或状态字段数量。
 
-开发顺序继续为 2A-C3-C（resolver/wakeup）→ 2A-C3-D（恢复消费）→ 2B 原生协调工具 → P3 首个目标驱动切片。1A 的 PostgreSQL/并发/RLS 欠账不作为启动这些开发工作的前置门槛；已实现、快速检查通过、完整验收通过分别记录。2026-09-09 的有界环境探查确认本机 Docker backend 不可用，未创建数据库或运行迁移；不继续排查宿主环境。最终可采用隔离 CI PostgreSQL service 做集成证明。
+开发顺序继续为 2A-C3-D（恢复消费）→ 2B 原生协调工具 → P3 首个目标驱动切片。1A 的 PostgreSQL/并发/RLS 欠账不作为启动这些开发工作的前置门槛；已实现、快速检查通过、完整验收通过分别记录。2026-09-09 的有界环境探查确认本机 Docker backend 不可用，未创建数据库或运行迁移；不继续排查宿主环境。最终可采用隔离 CI PostgreSQL service 做集成证明。
 
 1B 随后的候选代码已接入根运行时：大工具最终结果写入私有存储，实际 registry 注册分块读取，根 Task 创建后绑定当前 owner；输入/进度和异常使用有界清理结果。Astra Review 发现的异常返回绕过路径已由 Luna 修正。初始相关组 14 项、修正后的 router 组 9 项与 Worker 编译通过；真实数据库/跨进程读取延后验证。
 
@@ -168,7 +168,7 @@ P4 的副作用防绕过约束从第一项领域工具迁入时保留。按用�
 
 1C-B/C1/C2（2026-09-09）已形成候选实现：树步骤预算账本、真实 child executor 以及默认关闭的生产 child queue seam 已接通；child 只获得 owner/policy 允许的读取能力，并保留私有结果读取边界。C1 focused 31 项、C2 focused 17 项及 Worker/shared 编译检查通过；真实 PostgreSQL/RLS、队列运行、重启和父子结果闭环仍未证明。
 
-2A-C3-A/B1/B2（2026-09-09）已形成候选实现：durable wait 注册/resolve/cancel、合法等待回执的 TurnEngine 停止，以及带 user/session/root/step/lease fence 的原子 suspend/requeue handoff 已接入 canonical turn bootstrap。C3-A focused 8 项、B1 相关 loop/store/child 16 项、B2 handoff/queue/store/loop/bootstrap 31 项通过；Worker TypeScript 与 diff checks 通过。当前仍缺 resolver/wakeup scanner、outbox 交付后的父恢复、wait outcome 一次性消费和真实跨进程/重启证据，因此 P2 尚未完成。
+2A-C3-A/B1/B2/C（2026-09-09）已形成候选实现：durable wait 注册/resolve/cancel、合法等待回执的 TurnEngine 停止、带 user/session/root/step/lease fence 的原子 suspend/requeue handoff，以及按 active Turn、租户上下文和有限批次运行的 resolver/wakeup 已接入 canonical bootstrap 的显式 gate。C3-A focused 8 项、B1 相关 loop/store/child 16 项、B2 handoff/queue/store/loop/bootstrap 31 项、C3-C resolver/bootstrap/store/queue 27 项通过；Worker TypeScript 与 diff checks 通过。当前仍缺 outbox 交付后的父恢复、wait outcome 一次性消费和真实跨进程/重启证据，因此 P2 尚未完成。
 
 ### 4.2 用户可观察的交付节点
 

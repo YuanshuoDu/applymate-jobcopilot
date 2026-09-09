@@ -81,10 +81,12 @@ async function main() {
     enabled: productionChildRuntimeModule.childExecutionEnabled(),
     pool: getPool(),
   });
+  const waitResolver = process.env.ENABLE_AGENT_WAIT_RESOLVER === "1" && childExecutor ? {} : undefined;
   const canonicalBootstrap = await productionBootstrapModule.createProductionWorkerBootstrap({
     pool: getPool(),
     runtime: canonicalRuntime,
     ...(childExecutor ? { subagents: { execute: childExecutor } } : {}),
+    ...(waitResolver ? { waitResolver } : {}),
   });
   console.log("[worker] Canonical Turn consumer and recovery scanner started");
 
