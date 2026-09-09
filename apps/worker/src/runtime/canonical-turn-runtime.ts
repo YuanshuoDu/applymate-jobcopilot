@@ -30,6 +30,23 @@ export type UsageAuthorization = {
   settle(input: { status: "success" | "error"; inputTokens: number; outputTokens: number; estimatedCostUsd: number; errorCode?: string }): Promise<void> | void
 }
 
+type CanonicalToolRegistry = {
+  list(capabilities?: readonly string[]): readonly unknown[]
+  validateArguments(name: string, input: unknown, version?: string): true | string
+}
+
+/** Server-owned inputs for the optional plan execution seam. */
+export type CanonicalPlanExecutionFactoryInput = {
+  readonly lease: TurnLease
+  readonly rootTaskId: string
+  readonly taskId: string
+  readonly state: CanonicalTurnState
+  readonly scope: CanonicalTurnState["scope"]
+  readonly router: ToolRouter
+  readonly registry: CanonicalToolRegistry
+  readonly policy: PolicyEngine
+}
+
 export type CanonicalTurnRuntimeOptions = {
   readonly workerId: string
   readonly consumeWaitOutcomes?: boolean
@@ -37,6 +54,10 @@ export type CanonicalTurnRuntimeOptions = {
   readonly coordinationEnabled?: boolean
   /** Server-derived planning gate; model policy cannot enable this option. */
   readonly planningEnabled?: boolean
+  /** Independent server gate for the optional plan execution hook; default is disabled. */
+  readonly planningExecutionEnabled?: boolean
+  /** Server-owned factory; absent or undefined result keeps plan execution unconnected. */
+  readonly planExecutionFactory?: (input: CanonicalPlanExecutionFactoryInput) => TurnEngineOptions["executePlan"] | undefined
   readonly stateLoader?: (pool: Pick<pg.Pool, "connect">, lease: TurnLease, now?: Date) => Promise<CanonicalTurnState>
   readonly modelRuntimeFactory?: (input: { userId: string; config?: AiConfig; state: CanonicalTurnState }) => Promise<HarnessModelRuntime> | HarnessModelRuntime
   readonly authorizeUsage?: (input: { userId: string; sessionId: string; turnId: string; stepId: string; leaseOwnerId: string; leaseVersion: number; featureKey: string; provider: string; model: string }) => Promise<UsageAuthorization> | UsageAuthorization
@@ -199,6 +220,9 @@ export async function createCanonicalTurnRuntime(pool: pg.Pool, options: Canonic
     const owner = executionOwnerFence({ kind: "turn", taskId: root.id, lease })
     lifecycleOwner = { kind: "turn", taskId: root.id, lease }
     lifecycleSink = options.lifecycleSinkFactory?.({ lease, store: turnStore, owner }) ?? durableLifecycleSink(turnStore, owner)
+    const executePlan = options.planningEnabled === true && options.planningExecutionEnabled === true && options.planExecutionFactory
+      ? options.planExecutionFactory({ lease, rootTaskId: root.id, taskId: root.id, state, scope: state.scope, router: toolRuntime.router, registry: toolRuntime.registry, policy: selectedPolicy })
+      : undefined
     const config = options.modelRuntimeFactory ? undefined : await loadWorkerAiConfig(lease.userId)
     const modelRuntime = await (options.modelRuntimeFactory?.({ userId: lease.userId, config, state }) ?? createHarnessModelRuntime({ primary: config, fallbacks: [], allowEnvironmentFallbacks: false }))
     const authorize = options.authorizeUsage ?? defaultAuthorization
@@ -212,6 +236,7 @@ export async function createCanonicalTurnRuntime(pool: pg.Pool, options: Canonic
       actorRole: (record(state.toolPolicySnapshot).role as PolicyRole | undefined) ?? "orchestrator", capabilities: toolCapabilities,
       validateToolArguments: (name, input) => toolRuntime.registry.validateArguments(name, input, "1"), signal,
       budget: limits(state.budgetSnapshot), resume: state.resume, now, publishReasoningSummary: false,
+      ...(executePlan ? { executePlan } : {}),
     })
     const result = await engine.run()
     await rootTasks.finish({ lease, rootTaskId: root.id, result, now: now() })

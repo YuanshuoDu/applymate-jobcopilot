@@ -14,9 +14,9 @@ import type {
   TurnEngineStep,
   TurnEngineStore,
   TurnEngineToolExecutor,
-  TurnEngineToolCall,
-  TurnEngineToolResult,
   TurnResumeState,
+  TurnEnginePlanExecutionHook,
+  TurnEnginePlanExecutionHookResult,
 } from "./turn-engine-types.js"
 
 /** Identity is owner normalized; the loop never receives a raw lease. */
@@ -51,27 +51,8 @@ export type TurnExecutionLifecycle = {
   readonly emitTurnCompleted?: boolean
 }
 
-export type PlanExecutionHookInput = {
-  readonly identity: TurnExecutionIdentity
-  readonly scope: TenantScope
-  readonly sessionId: string
-  readonly turnId: string
-  readonly stepId: string
-  readonly signal: AbortSignal
-  readonly call: TurnEngineToolCall
-  readonly result: TurnEngineToolResult
-  readonly completedToolResults: readonly TurnEngineToolResult[]
-  readonly snapshot: StepContextSnapshot
-}
-
-export type PlanExecutionHookResult = {
-  readonly observations: readonly { readonly id: string; readonly content: unknown }[]
-  readonly wait?: {
-    readonly status: "waiting_for_dependency" | "waiting_for_approval" | "waiting_for_user"
-    readonly waitId?: string
-    readonly errorCode?: string
-  }
-}
+export type PlanExecutionHookInput = Parameters<TurnEnginePlanExecutionHook>[0]
+export type PlanExecutionHookResult = TurnEnginePlanExecutionHookResult
 
 export type TurnExecutionOptions = {
   readonly identity: TurnExecutionIdentity
@@ -103,7 +84,7 @@ export type TurnExecutionOptions = {
   /** Allows a root or child adapter to classify a lost owner without coupling the loop to a lease type. */
   readonly isOwnershipLost?: (error: unknown, signal: AbortSignal) => boolean
   /** Executes accepted plan commands through a server-owned adapter; omitted keeps legacy behavior. */
-  readonly executePlan?: (input: PlanExecutionHookInput) => Promise<PlanExecutionHookResult> | PlanExecutionHookResult
+  readonly executePlan?: TurnEnginePlanExecutionHook
 }
 
 export type TurnExecutionOutcome = TurnEngineResult

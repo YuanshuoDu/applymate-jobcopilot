@@ -46,6 +46,30 @@ export type TurnEngineToolResult = {
   readonly errorCode: string | null
 }
 
+/** Server-owned result for executing an accepted plan after its proposal receipt. */
+export type TurnEnginePlanExecutionHookResult = {
+  readonly observations: readonly { readonly id: string; readonly content: unknown }[]
+  readonly wait?: {
+    readonly status: "waiting_for_dependency" | "waiting_for_approval" | "waiting_for_user"
+    readonly waitId?: string
+    readonly errorCode?: string
+  }
+}
+
+/** Server-owned seam for executing an accepted plan after its proposal receipt. */
+export type TurnEnginePlanExecutionHook = (input: {
+  readonly identity: ExecutionOwnerFence
+  readonly scope: TenantScope
+  readonly sessionId: string
+  readonly turnId: string
+  readonly stepId: string
+  readonly signal: AbortSignal
+  readonly call: TurnEngineToolCall
+  readonly result: TurnEngineToolResult
+  readonly completedToolResults: readonly TurnEngineToolResult[]
+  readonly snapshot: StepContextSnapshot
+}) => Promise<TurnEnginePlanExecutionHookResult> | TurnEnginePlanExecutionHookResult
+
 export type TurnEngineStore = {
   startStep(input: {
     owner: ExecutionOwnerFence
@@ -143,6 +167,8 @@ export type TurnEngineOptions = {
   readonly model: ModelAdapter
   readonly tools: readonly unknown[]
   readonly executeTool: TurnEngineToolExecutor
+  /** Optional server-owned plan execution seam; omitted preserves the legacy loop. */
+  readonly executePlan?: TurnEnginePlanExecutionHook
   readonly rootInputId?: string
   /** Runtime-owned current task identity. Root turns use rootTaskId. */
   readonly taskId?: string

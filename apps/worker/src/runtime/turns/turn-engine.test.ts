@@ -154,6 +154,32 @@ describe("TurnEngine", () => {
     expect(executeTool).toHaveBeenCalledWith(expect.objectContaining({ call: expect.objectContaining({ id: "call-2" }) }))
   })
 
+  it("passes the server-owned plan hook through with the fenced turn identity", async () => {
+    let modelCall = 0
+    const executePlan = vi.fn(async (input: Parameters<NonNullable<TurnEngineOptions["executePlan"]>>[0]) => {
+      expect(input.identity).toMatchObject({ kind: "turn", taskId: "root-1", turnId: "turn-1" })
+      expect(input.scope).toEqual({ userId: "user-1" })
+      return { observations: [{ id: "plan-accepted", content: { accepted: true } }] }
+    })
+    const fixture = baseOptions({
+      model: {
+        id: "plan-model", profile: profile(), async *stream() {
+          modelCall += 1
+          if (modelCall === 1) {
+            yield { type: "tool_call_completed", callId: "plan-call", name: "agent.plan.propose", arguments: { proposal: { nodes: [] } } }
+            yield { type: "completed", finishReason: "tool_calls" }
+          } else {
+            yield { type: "text_delta", text: "Plan accepted." }
+            yield { type: "completed", finishReason: "stop" }
+          }
+        },
+      },
+      executePlan,
+    })
+    await expect(new TurnEngine(fixture.options).run()).resolves.toMatchObject({ status: "completed" })
+    expect(executePlan).toHaveBeenCalledTimes(1)
+  })
+
   it("fails closed when a replayed call id has different arguments", async () => {
     const executeTool = vi.fn()
     const fixture = baseOptions({

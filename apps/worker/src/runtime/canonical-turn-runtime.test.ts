@@ -160,6 +160,37 @@ describe("createCanonicalTurnRuntime", () => {
     expect(enabled).toContain("agent.plan.propose")
   })
 
+  it("keeps plan execution behind both server gates and passes server-owned context", async () => {
+    const disabledFactory = vi.fn(() => async () => ({ observations: [] }))
+    const disabled = setup({ planningEnabled: false, planningExecutionEnabled: true, planExecutionFactory: disabledFactory })
+    const disabledRuntime = await disabled.runtime
+    await disabledRuntime.execute({ lease, signal: new AbortController().signal })
+    expect(disabledFactory).not.toHaveBeenCalled()
+
+    const partialFactory = vi.fn(() => async () => ({ observations: [] }))
+    const partial = setup({ planningEnabled: true, planningExecutionEnabled: false, planExecutionFactory: partialFactory })
+    const partialRuntime = await partial.runtime
+    await partialRuntime.execute({ lease, signal: new AbortController().signal })
+    expect(partialFactory).not.toHaveBeenCalled()
+
+    const enabledFactory = vi.fn((input: { rootTaskId: string; taskId: string; lease: typeof lease; router: unknown; registry: unknown; policy: unknown }) => {
+      expect(input.rootTaskId).toBe("root-1")
+      expect(input.taskId).toBe("root-1")
+      expect(input.lease).toBe(lease)
+      expect(input.router).toBeDefined()
+      expect(input.registry).toBeDefined()
+      expect(input.policy).toBeDefined()
+      return async () => ({ observations: [] })
+    })
+    const enabled = setup({ planningEnabled: true, planningExecutionEnabled: true, planExecutionFactory: enabledFactory })
+    const enabledRuntime = await enabled.runtime
+    await enabledRuntime.execute({ lease, signal: new AbortController().signal })
+    expect(enabledFactory).toHaveBeenCalledTimes(1)
+
+    const noFactory = setup({ planningEnabled: true, planningExecutionEnabled: true })
+    await (await noFactory.runtime).execute({ lease, signal: new AbortController().signal })
+  })
+
   it("settles the root after the real wait transition and releases its task lease", async () => {
     const boundary = waitBoundary()
     const tool = waitingTools()
