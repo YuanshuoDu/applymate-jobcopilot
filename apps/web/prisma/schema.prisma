@@ -131,6 +131,7 @@ model User {
   supportCases                SupportCase[]                @relation("SupportRequester")
   agentToolResultReferences   AgentToolResultReference[]
   agentWaitConditions         AgentWaitCondition[]
+  agentTreeBudgetReservations AgentTreeBudgetReservation[]
   planChanges                 UserPlanChange[]
   planSubscription            UserPlanSubscription?
   featureOverrides            UserFeatureOverride[]
@@ -1872,6 +1873,7 @@ model AgentSession {
   events             AgentEvent[]
   toolResultReferences AgentToolResultReference[]
   waitConditions     AgentWaitCondition[]
+  treeBudgetReservations AgentTreeBudgetReservation[]
   execution          AgentExecution?
   automation         AgentAutomation?
 
@@ -1924,6 +1926,7 @@ model AgentTurn {
   mailboxMessages AgentMailboxMessage[]
   toolResultReferences AgentToolResultReference[] @relation("AgentToolResultReferenceTurn")
   waitConditions AgentWaitCondition[] @relation("AgentWaitConditionTurn")
+  treeBudgetReservations AgentTreeBudgetReservation[] @relation("AgentTreeBudgetReservationTurn")
 
   @@index([sessionId, createdAt])
   @@index([userId, status, updatedAt(sort: Desc)])
@@ -1966,6 +1969,7 @@ model AgentStep {
   items          AgentItem[]
   toolResultReferences AgentToolResultReference[] @relation("AgentToolResultReferenceStep")
   waitConditions AgentWaitCondition[] @relation("AgentWaitConditionStep")
+  treeBudgetReservations AgentTreeBudgetReservation[]
 
   @@unique([turnId, ordinal, attempt])
   @@index([turnId, status, createdAt])
@@ -2141,6 +2145,8 @@ model SubAgentTask {
   mailboxMessagesReceived AgentMailboxMessage[] @relation("AgentMailboxToTask")
   toolResultReferences     AgentToolResultReference[] @relation("AgentToolResultReferenceTask")
   waitConditions           AgentWaitCondition[] @relation("AgentWaitConditionParentTask")
+  treeBudgetReservationsAsRoot AgentTreeBudgetReservation[] @relation("AgentTreeBudgetReservationRootTask")
+  treeBudgetReservationsAsTask AgentTreeBudgetReservation[] @relation("AgentTreeBudgetReservationTask")
 
   @@index([sessionId, status])
   @@index([sessionId, role])
@@ -2149,6 +2155,37 @@ model SubAgentTask {
   @@index([sessionId, parentTaskId, createdAt])
   @@unique([id, sessionId])
   @@map("sub_agent_tasks")
+}
+
+// One durable unit per model step shared by every task in a root tree.
+model AgentTreeBudgetReservation {
+  id             String   @id @default(cuid())
+  userId         String
+  sessionId      String
+  turnId         String
+  rootTaskId     String
+  taskId         String
+  stepId         String
+  attempt        Int
+  units          Int      @default(1)
+  status         String   @default("reserved")
+  idempotencyKey String
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+  settledAt      DateTime?
+
+  user     User        @relation(fields: [userId], references: [id], onDelete: Cascade)
+  session  AgentSession @relation(fields: [sessionId, userId], references: [id, userId], onDelete: Cascade)
+  turn     AgentTurn   @relation("AgentTreeBudgetReservationTurn", fields: [turnId, sessionId, userId], references: [id, sessionId, userId], onDelete: Cascade)
+  rootTask SubAgentTask @relation("AgentTreeBudgetReservationRootTask", fields: [rootTaskId, sessionId], references: [id, sessionId], onDelete: Cascade)
+  task     SubAgentTask @relation("AgentTreeBudgetReservationTask", fields: [taskId, sessionId], references: [id, sessionId], onDelete: Cascade)
+  step     AgentStep   @relation(fields: [stepId, turnId, sessionId], references: [id, turnId, sessionId], onDelete: Cascade)
+
+  @@unique([rootTaskId, taskId, stepId, attempt])
+  @@unique([sessionId, idempotencyKey])
+  @@index([userId, sessionId, turnId, rootTaskId, status])
+  @@index([rootTaskId, status, createdAt])
+  @@map("agent_tree_budget_reservations")
 }
 
 model AgentMailboxMessage {
