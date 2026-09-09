@@ -19,10 +19,11 @@ function identity(kind: TurnExecutionIdentity["kind"], taskId: string, attemptCo
   return { ...common, kind, attemptCount }
 }
 
-type Fixture = { options: TurnExecutionOptions; events: Array<{ id: string; type: string; itemId: string | null; taskId: string }>; items: TurnEngineItem[]; finalResponses: string[]; stepTasks: string[]; stepAttempts: number[]; stepStatuses: string[]; requests: HarnessModelRequest[] }
+type Fixture = { options: TurnExecutionOptions; events: Array<{ id: string; type: string; itemId: string | null; taskId: string }>; planEvents: unknown[]; items: TurnEngineItem[]; finalResponses: string[]; stepTasks: string[]; stepAttempts: number[]; stepStatuses: string[]; requests: HarnessModelRequest[] }
 
-function fixture(owner: TurnExecutionIdentity, toolResult?: TurnEngineToolResult, planHook?: NonNullable<TurnExecutionOptions["executePlan"]>, initialToolObservations: Array<{ id: string; content: unknown }> = []): Fixture {
+function fixture(owner: TurnExecutionIdentity, toolResult?: TurnEngineToolResult, planHook?: NonNullable<TurnExecutionOptions["executePlan"]>, initialToolObservations: Array<{ id: string; content: unknown }> = [], failPlanObservation = false): Fixture {
   const events: Fixture["events"] = []
+  const planEvents: unknown[] = []
   const items: TurnEngineItem[] = []
   const finalResponses: string[] = []
   const stepTasks: string[] = []
@@ -35,7 +36,7 @@ function fixture(owner: TurnExecutionIdentity, toolResult?: TurnEngineToolResult
     updateStep: async ({ status }) => { stepStatuses.push(status) },
     createItem: async ({ identity, itemId }) => { const item = { id: itemId, revision: 0 }; items.push(item); revisions.set(`${identity.taskId}:${itemId}`, 0); return item },
     updateItem: async ({ identity, itemId, expectedRevision }) => { const key = `${identity.taskId}:${itemId}`; expect(revisions.get(key)).toBe(expectedRevision); const revision = expectedRevision + 1; revisions.set(key, revision); return { id: itemId, revision } },
-    appendEvent: async ({ identity, id, type, itemId }) => { events.push({ id, type, itemId, taskId: identity.taskId }); return { id } },
+    appendEvent: async ({ identity, id, type, itemId, payload }) => { if (type === "plan.observation") { if (failPlanObservation) throw new Error("durable_event_failed"); planEvents.push(payload) }; events.push({ id, type, itemId, taskId: identity.taskId }); return { id } },
     recordFinalResponse: async ({ identity, response }) => { finalResponses.push(`${identity.taskId}:${response}`) },
   }
   let calls = 0
@@ -72,7 +73,7 @@ function fixture(owner: TurnExecutionIdentity, toolResult?: TurnEngineToolResult
     subscribe: event => { events.push({ id: event.id, type: event.type, itemId: event.itemId, taskId: owner.taskId }) },
     ...(planHook ? { executePlan: planHook } : {}),
   }
-  return { options, events, items, finalResponses, stepTasks, stepAttempts, stepStatuses, requests }
+  return { options, events, planEvents, items, finalResponses, stepTasks, stepAttempts, stepStatuses, requests }
 }
 
 describe("owner-agnostic turn execution loop", () => {
@@ -154,6 +155,21 @@ describe("owner-agnostic turn execution loop", () => {
     expect(result).toMatchObject({ status: "waiting_for_dependency", waitId: "wait-plan-1", stepCount: 1, toolCallCount: 1, errorCode: "child_pending" })
     expect(child.requests).toHaveLength(1)
     expect(child.stepStatuses).toContain("waiting_for_tool")
+  })
+
+  it("persists validated plan observations as durable events", async () => {
+    const hook: NonNullable<TurnExecutionOptions["executePlan"]> = async () => ({ observations: [{ id: "plan-observation", content: { marker: "durable" } }] })
+    const root = fixture(identity("turn", "root-1"), undefined, hook)
+    await expect(runTurnExecutionLoop(root.options)).resolves.toMatchObject({ status: "completed" })
+    expect(root.planEvents).toEqual([{ planCallId: "call:root-1", observationId: "plan-observation", content: { marker: "durable" } }])
+  })
+
+  it("fails the turn when a plan observation cannot be persisted", async () => {
+    const hook: NonNullable<TurnExecutionOptions["executePlan"]> = async () => ({ observations: [{ id: "unpersisted", content: { marker: "must-fail" } }] })
+    const root = fixture(identity("turn", "root-1"), undefined, hook, [], true)
+    const result = await runTurnExecutionLoop(root.options)
+    expect(result).toMatchObject({ status: "failed", errorCode: "turn_execution_failed" })
+    expect(root.requests).toHaveLength(1)
   })
 
   it("does not repeat the plan hook for a replayed proposal call", async () => {

@@ -8,6 +8,7 @@ import { PlanDispatchError, dispatchPlanProposal } from "./plan-intent-dispatche
 import { PlanCommandExecutionError, executePlanCommands, type PlanCommandExecutionRecord, type PlanCommandExecutionRuntime, type PlanControlRecord } from "./plan-command-executor.js"
 import type { ToolCallRequest, ToolExecutionResult, ToolRouterContext } from "../tools/types.js"
 import type { TurnEnginePlanExecutionHook, TurnEnginePlanExecutionHookResult } from "../turns/turn-engine-types.js"
+import type { StepContextSnapshot } from "../context/step-context-builder.js"
 
 const MAX_OBSERVATIONS = 8
 const MAX_RESULT_BYTES = 8 * 1024
@@ -87,6 +88,28 @@ function actions(registry: Registry, capabilities: readonly string[], allowedToo
 
 function row(value: unknown): Record<string, unknown> | null { return isPlainJsonObject(value) ? value : null }
 
+function stableJson(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(stableJson).join(",")}]`
+  if (isPlainJsonObject(value)) return `{${Object.keys(value).sort().map(key => `${JSON.stringify(key)}:${stableJson(value[key])}`).join(",")}}`
+  return JSON.stringify(value) ?? "undefined"
+}
+
+function resolveInputRefs(snapshot: StepContextSnapshot, refs: readonly string[]): Record<string, unknown> {
+  const merged: Record<string, unknown> = {}
+  for (const ref of refs) {
+    const observation = snapshot.toolObservations.find(item => item.id === ref)
+    if (!observation) throw new CanonicalPlanError("input_reference_unavailable")
+    const content = row(observation.content)
+    const source = content && Object.prototype.hasOwnProperty.call(content, "output") ? content.output : observation.content
+    if (!isPlainJsonObject(source) || !plainJson(source)) throw new CanonicalPlanError("input_reference_unavailable")
+    for (const key of Object.keys(source).sort()) {
+      if (Object.prototype.hasOwnProperty.call(merged, key) && stableJson(merged[key]) !== stableJson(source[key])) throw new CanonicalPlanError("input_reference_conflict")
+      merged[key] = source[key]
+    }
+  }
+  return merged
+}
+
 function safeObservation(idValue: string, content: Record<string, unknown>): { id: string; content: Record<string, unknown> } {
   const encoded = JSON.stringify(content)
   if (encoded !== undefined && Buffer.byteLength(encoded, "utf8") <= MAX_RESULT_BYTES) return { id: idValue, content }
@@ -148,6 +171,7 @@ export function createCanonicalPlanExecutionFactory(options: CanonicalPlanExecut
         resolveToolVersion: name => version(options.registry, options.capabilities, name),
         createToolCallId: localId => id("plan-call", input.call.id, localId),
         createIdempotencyKey: localId => id("plan-idempotency", input.call.id, localId),
+        resolveInputRefs: request => resolveInputRefs(input.snapshot, request.inputRefs),
         resolveDelegateActions: () => actions(options.registry, options.capabilities, allowedTools),
       })
       currentPlanRevision = output.planRevision

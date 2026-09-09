@@ -58,6 +58,30 @@ describe("loadCanonicalTurnState", () => {
     expect(fake.client.query.mock.calls.at(-1)?.[0]).toBe("COMMIT")
   })
 
+  it("restores bounded plan observations once and preserves the snapshot projection", async () => {
+    const observationId = "plan-result:proposal-1:read"
+    const snapshotContent = {
+      schemaVersion: "agent-harness.context.v1", ownerId: "user-1", sessionId: "session-1", throughSequence: "0", goal: "Find jobs",
+      userConstraints: [], confirmedDecisions: [], completedWork: [], openWork: [], pendingApprovals: [], artifacts: [], facts: [], failedAttempts: [], references: [], consumedInputIds: [],
+      context: { system: [], profile: [], steerHistory: [], toolObservations: [{ id: observationId, content: { marker: "snapshot" } }] },
+      tokenAccounting: { profiles: [], totalInputTokens: 0, totalOutputTokens: 0, totalCostUsd: 0 },
+    }
+    const fake = pool({
+      turn: { input: { goal: "Find jobs" }, rootTaskId: "root-1", contextSnapshotId: null, modelProfileSnapshot: {}, toolPolicySnapshot: {}, budgetSnapshot: {} },
+      snapshots: [{ throughSequence: "0", version: 1, content: snapshotContent }],
+      events: [
+        { type: "plan.observation", payload: { observationId, content: { marker: "event" } } },
+        { type: "plan.observation", payload: { observationId, content: { marker: "duplicate" } } },
+        { type: "plan.observation", payload: { observationId: "oversized", content: "x".repeat(8 * 1024 + 1) } },
+      ],
+    })
+    const value = await loadCanonicalTurnState(fake, lease)
+    expect(value.snapshot.toolObservations).toEqual([{ id: observationId, content: { marker: "snapshot" } }])
+    const eventQuery = fake.client.query.mock.calls.find(([sql]) => typeof sql === "string" && sql.includes('FROM "agent_events"') && sql.includes("tool_call.completed"))?.[0]
+    expect(eventQuery).toContain("'plan.observation'")
+    expect(eventQuery).toContain('event_session."userId" = $4')
+  })
+
   it("uses the latest session snapshot and appends ordered role-tagged history after its cursor", async () => {
     const fake = pool({
       turn: { input: { goal: "Continue" }, rootTaskId: null, contextSnapshotId: null, modelProfileSnapshot: {}, toolPolicySnapshot: {}, budgetSnapshot: {} },

@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vitest"
 import type { PolicyEngine } from "@jobcopilot/agent-policy"
 import type { ToolCallRequest, ToolExecutionResult, ToolRouterContext } from "../tools/types.js"
+import type { StepContextSnapshot } from "../context/step-context-builder.js"
 import { executionOwnerFence } from "../execution-owner.js"
 import { PLAN_PROPOSAL_SCHEMA_VERSION, type PlanProposal } from "./goal-plan-contract.js"
 import { createCanonicalPlanExecutionFactory, type CanonicalPlanExecutionOptions } from "./canonical-plan-execution.js"
@@ -39,12 +40,12 @@ function fixture(router: { execute(context: ToolRouterContext, request: ToolCall
   return createCanonicalPlanExecutionFactory(options)
 }
 
-function input(value: unknown, stepId = "step-1") {
+function input(value: unknown, stepId = "step-1", toolObservations: StepContextSnapshot["toolObservations"] = []) {
   return {
     identity: executionOwnerFence({ kind: "turn", taskId: "root-1", lease }), scope: { userId: "user-1" }, sessionId: "session-1", turnId: "turn-1", stepId,
     signal: new AbortController().signal, call: { id: "proposal-1", name: "agent.plan.propose", arguments: {} },
     result: { id: "proposal-1", toolName: "agent.plan.propose", toolVersion: "1", status: "completed" as const, output: value, errorCode: null },
-    completedToolResults: [], snapshot: { system: [], profile: [], steerHistory: [], businessRefs: [], toolObservations: [] },
+    completedToolResults: [], snapshot: { system: [], profile: [], steerHistory: [], businessRefs: [], toolObservations },
   }
 }
 
@@ -88,6 +89,27 @@ describe("createCanonicalPlanExecutionFactory", () => {
     expect(waiting.wait).toMatchObject({ status: "waiting_for_user", errorCode: "plan_request_input" })
     expect(waiting.observations[0]?.content).toMatchObject({ status: "waiting_for_user", approvalBoundary: "before submission" })
     expect(waiting.observations).toHaveLength(1)
+  })
+
+  it("hydrates only exact plain object snapshot references", async () => {
+    const requests: ToolCallRequest[] = []
+    const router = { execute: vi.fn(async (_context: ToolRouterContext, request: ToolCallRequest) => { requests.push(request); return { ...request, status: "completed" as const, output: { ok: true }, errorCode: null } }) }
+    const observations = [
+      { id: "prior-a", content: { output: { alpha: 1 } } },
+      { id: "prior-b", content: { beta: "two" } },
+    ]
+    const hook = fixture(router)
+    const hydrated = await hook(input(output(proposal([use("read", { inputRefs: ["prior-b", "prior-a"] })])), "step-1", observations))
+    expect(hydrated.wait).toBeUndefined()
+    expect(requests[0]?.input).toEqual({ alpha: 1, beta: "two" })
+    expect(observationCode(await fixture()(input(output(proposal([use("missing", { inputRefs: ["same-plan-node"] })])))))).toBe("input_reference_unavailable")
+    const badInput = input(output(proposal([use("bad", { inputRefs: ["bad"] })])), "step-1", [{ id: "bad", content: { output: "raw" } }])
+    expect(observationCode(await fixture()(badInput))).toBe("input_reference_unavailable")
+    const conflictInput = input(output(proposal([use("conflict", { inputRefs: ["left", "right"] })])), "step-1", [
+      { id: "left", content: { output: { key: "one" } } }, { id: "right", content: { output: { key: "two" } } },
+    ])
+    const conflict = await fixture()(conflictInput)
+    expect(observationCode(conflict)).toBe("input_reference_unavailable")
   })
 
   it("maps an explicit dependency wait without guessing malformed waits", async () => {

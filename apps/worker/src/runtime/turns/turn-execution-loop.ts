@@ -248,6 +248,13 @@ async function executeTools(
       completedToolResults.push(result)
       if (call.name === "agent.plan.propose" && options.executePlan) {
         const plan = await executePlanHook(options, step, call, result, completedToolResults, snapshot, signal)
+        for (const observation of plan.observations) {
+          await writer.append(
+            "plan.observation", call.id, null,
+            { planCallId: call.id, observationId: observation.id, content: observation.content },
+            `plan-observation:${call.id}:${observation.id}`,
+          )
+        }
         if (plan.observations.length > 0) snapshot = { ...snapshot, toolObservations: [...snapshot.toolObservations, ...plan.observations] }
         if (plan.wait) return { wait: plan.wait, snapshot }
       }
