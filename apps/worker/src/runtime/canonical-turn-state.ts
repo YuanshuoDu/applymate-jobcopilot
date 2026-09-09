@@ -7,9 +7,12 @@ import type { TurnLease } from "./turns/lease.js"; import type { TurnResumeState
 import { consumeDurableWaitOutcomes } from "./subagents/durable-wait-consumer.js"
 import { isBoundedPlanJson, planRevisionObservation, restorePlanRevisions } from "./planning/plan-revision-receipt.js"
 import { parsePlanCommandReceipt, planCommandObservation } from "./planning/plan-command-receipt.js"
+import { hydrateGoalContract } from "./planning/goal-contract-hydration.js"
+import type { GoalContract } from "./planning/goal-plan-contract.js"
 export type CanonicalTurnState = {
   readonly scope: TenantScope
   readonly goal: string
+  readonly goalContract?: GoalContract
   readonly modelProfileSnapshot: RepositoryJsonValue
   readonly toolPolicySnapshot: unknown
   readonly budgetSnapshot: unknown
@@ -28,7 +31,6 @@ function json(value: unknown): RepositoryJsonValue {
   if (value && typeof value === "object") return Object.fromEntries(Object.entries(value).filter(([, child]) => child !== undefined).map(([key, child]) => [key, json(child)]))
   return null
 }
-function text(input: unknown): string { const value = object(input).goal ?? object(input).content; if (typeof value !== "string" || value.trim().length === 0) throw new Error("turn_goal_missing"); return value.trim() }
 function snapshotFromContent(value: unknown, scope: TenantScope, sessionId: string): StepContextSnapshot {
   const content = parseSnapshotContent(value)
   if (content.ownerId !== scope.userId || content.sessionId !== sessionId) throw new Error("context_snapshot_scope_mismatch")
@@ -184,6 +186,7 @@ export async function loadCanonicalTurnState(pool: Pick<pg.Pool, "connect">, lea
         snapshotThroughSequence = BigInt(String(contextResult.rows[0].throughSequence ?? object(contextResult.rows[0].content).throughSequence ?? 0))
       }
     }
+    const hydratedGoal = hydrateGoalContract(turn.input)
     const revisionState = restorePlanRevisions(eventsResult.rows.map(event => ({ type: event.type, payload: eventPayload(event.payload) })))
     const revision = revisionState.latest
     const restored = [...observations(itemsResult.rows, eventsResult.rows), ...planObservations(eventsResult.rows), ...planCommandObservations(eventsResult.rows), ...(revision ? [planRevisionObservation(revision)] : [])]
@@ -205,7 +208,7 @@ export async function loadCanonicalTurnState(pool: Pick<pg.Pool, "connect">, lea
     const seenHistory = new Set(snapshot.steerHistory.map(item => item.id))
     snapshot = {
       ...snapshot,
-      goal: { id: `turn-goal:${lease.turnId}`, content: text(turn.input) },
+      goal: { id: `turn-goal:${lease.turnId}`, content: hydratedGoal.goal },
       steerHistory: [...snapshot.steerHistory, ...history.filter(item => !seenHistory.has(item.id)).map(({ sequence: _sequence, ...item }) => item)],
       toolObservations: [...snapshot.toolObservations, ...restoredNew, ...consumedWaits.filter(item => !seenWithRestored.has(item.id))],
     }
@@ -230,7 +233,7 @@ export async function loadCanonicalTurnState(pool: Pick<pg.Pool, "connect">, lea
       consumedInputIds: Array.isArray(last?.consumedInputIds) ? last.consumedInputIds.filter((id): id is string => typeof id === "string") : [],
       usage,
     } satisfies TurnResumeState : undefined
-    const result = { scope, goal: text(turn.input), modelProfileSnapshot: json(turn.modelProfileSnapshot), toolPolicySnapshot: turn.toolPolicySnapshot ?? {}, budgetSnapshot: turn.budgetSnapshot ?? {}, planRevision: revision?.planRevision ?? null, planProposalHashes: revisionState.hashes, ...(typeof turn.rootTaskId === "string" ? { rootTaskId: turn.rootTaskId } : {}), ...(rootInput.rows[0] ? { rootInputId: rootInput.rows[0].id } : {}), snapshot, ...(resume ? { resume } : {}) }
+    const result = { scope, goal: hydratedGoal.goal, goalContract: hydratedGoal.goalContract, modelProfileSnapshot: json(turn.modelProfileSnapshot), toolPolicySnapshot: turn.toolPolicySnapshot ?? {}, budgetSnapshot: turn.budgetSnapshot ?? {}, planRevision: revision?.planRevision ?? null, planProposalHashes: revisionState.hashes, ...(typeof turn.rootTaskId === "string" ? { rootTaskId: turn.rootTaskId } : {}), ...(rootInput.rows[0] ? { rootInputId: rootInput.rows[0].id } : {}), snapshot, ...(resume ? { resume } : {}) }
     await client.query("COMMIT")
     committed = true
     return result

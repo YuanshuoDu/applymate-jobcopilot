@@ -26,6 +26,7 @@ import { executionOwnerFence, type ExecutionOwner, type ExecutionOwnerFence } fr
 import { createCanonicalPolicy } from "./policy/canonical-policy.js"
 import { PLAN_MAX_NODES, PLAN_MAX_REVISIONS } from "./planning/goal-plan-contract.js"
 import { createCanonicalPlanExecutionFactory, type CanonicalPlanExecutionOptions } from "./planning/canonical-plan-execution.js"
+import { hydrateGoalContract } from "./planning/goal-contract-hydration.js"
 import type { PlanCommandReceipt } from "./planning/plan-command-receipt.js"
 
 export type UsageAuthorization = {
@@ -202,8 +203,9 @@ export async function createCanonicalTurnRuntime(pool: pg.Pool, options: Canonic
       store: new PgCoordinationStore(pool),
       wait: createPgDurableWaitPort(pool),
     } : undefined
+    const planningGoal = state.goalContract ?? hydrateGoalContract({ goal: state.goal }).goalContract
     const planning = options.planningEnabled ? {
-      goal: { revision: 1, objective: state.goal, constraints: [], successCriteria: [], knownFacts: [], unresolvedQuestions: [], approvalBoundaries: [], budgetRef: "runtime:turn" },
+      goal: planningGoal,
       allowedTools: ["jobs.search", "jobs.get", "persona.retrieve", "resume.get_base", "application.get_state", "tool_results.read"],
       allowedTemplates: [], allowedRoles: ["scout", "analyst"], maxNodes: PLAN_MAX_NODES, maxPlanRevisions: PLAN_MAX_REVISIONS, initialPlanRevision: state.planRevision ?? null, initialPlanHashes: state.planProposalHashes ?? [],
     } : undefined

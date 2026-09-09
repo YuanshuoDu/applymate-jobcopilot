@@ -29,8 +29,17 @@ describe("loadCanonicalTurnState", () => {
     const fake = pool({ turn: { input: { goal: "Find jobs" }, rootTaskId: null, contextSnapshotId: null, modelProfileSnapshot: { provider: "fixture" }, toolPolicySnapshot: {}, budgetSnapshot: {} }, inputs: [{ id: "input-1" }] })
     const value = await loadCanonicalTurnState(fake, lease)
     expect(value).toMatchObject({ goal: "Find jobs", rootInputId: "input-1", scope: { userId: "user-1" } })
+    expect(value.goalContract).toEqual({ revision: 1, objective: "Find jobs", constraints: [], successCriteria: [], knownFacts: [], unresolvedQuestions: [], approvalBoundaries: [], budgetRef: "runtime:turn" })
     expect(value.snapshot.goal).toEqual({ id: "turn-goal:turn-1", content: "Find jobs" })
     expect(fake.client.query.mock.calls.some(([sql]) => typeof sql === "string" && sql.includes('agent_wait_conditions'))).toBe(false)
+  })
+
+  it("hydrates the structured goal contract from the owned turn input", async () => {
+    const value = await loadCanonicalTurnState(pool({
+      turn: { input: { goal: "Find jobs", goalContract: { revision: 1, objective: "Find jobs", constraints: ["EU only"], successCriteria: ["ranked roles"], knownFacts: ["Dublin"], unresolvedQuestions: ["salary"], approvalBoundaries: ["submit after approval"], budgetRef: "runtime:turn" } }, rootTaskId: null, contextSnapshotId: null, modelProfileSnapshot: {}, toolPolicySnapshot: {}, budgetSnapshot: {} },
+    }), lease)
+    expect(value.goal).toBe("Find jobs")
+    expect(value.goalContract).toMatchObject({ constraints: ["EU only"], successCriteria: ["ranked roles"], knownFacts: ["Dublin"], unresolvedQuestions: ["salary"], approvalBoundaries: ["submit after approval"], budgetRef: "runtime:turn" })
   })
 
   it("rebuilds durable tool observations and usage for resume", async () => {

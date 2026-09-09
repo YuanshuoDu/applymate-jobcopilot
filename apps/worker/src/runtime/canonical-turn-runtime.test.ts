@@ -264,6 +264,21 @@ describe("createCanonicalTurnRuntime", () => {
     expect(factory).toHaveBeenCalledTimes(1)
   })
 
+  it("passes the server-hydrated goal semantics to the planning bridge", async () => {
+    const factory = vi.fn((input: { goal: { constraints: readonly string[]; successCriteria: readonly string[]; knownFacts: readonly string[] } }) => {
+      expect(input.goal).toMatchObject({ constraints: ["EU only"], successCriteria: ["ranked"], knownFacts: ["Dublin"] })
+      return async () => ({ observations: [] })
+    })
+    const fixture = setup({
+      planningEnabled: true,
+      planningExecutionEnabled: true,
+      stateLoader: async () => ({ ...state(), goalContract: { revision: 1, objective: "Find jobs", constraints: ["EU only"], successCriteria: ["ranked"], knownFacts: ["Dublin"], unresolvedQuestions: [], approvalBoundaries: [], budgetRef: "runtime:turn" } }),
+      planExecutionFactory: factory,
+    })
+    await (await fixture.runtime).execute({ lease, signal: new AbortController().signal })
+    expect(factory).toHaveBeenCalledTimes(1)
+  })
+
   it("settles the root after the real wait transition and releases its task lease", async () => {
     const boundary = waitBoundary()
     const tool = waitingTools()
