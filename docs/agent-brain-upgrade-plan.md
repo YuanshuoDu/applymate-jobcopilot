@@ -220,6 +220,14 @@ Turn replay 在已持久化 accepted goal-update tool result、但缺少对应 `
 
 Astra 独立验证：focused 10 个文件、86/86 tests；regression 5 个文件、53/53 tests；agent-protocol event checks 2/2；Worker TypeScript、shared/protocol build 和 `git diff --check` 均通过。当前候选只完成源码/单元与 focused composition 证据；未运行 live PostgreSQL/RLS、Redis、provider、queue、进程 restart 或跨进程恢复，因此总体完整验收保持 **1/8（12.5%）**，P3-14 不计作阶段完成。
 
+## P3-15 update
+
+P3-15 提交 `70a9809b`（2026-09-09）已推送到当前分支：planning action capability 现在由 server-owned `allowedPlanActions` 控制，旧调用者省略该选项时兼容四种既有 action。canonical runtime 根据 coordination gate 传入 action allowlist；coordination 关闭时只允许 `use_tool`、`request_input` 和 `propose_completion`，因此模型不能提出必然会被 ToolRouter 拒绝的 `delegate` 计划。非法 server allowlist fail closed，model/policy snapshot 不能扩权。
+
+proposal tool 在 server validation context 中执行 action gate，canonical bridge 在 accepted output 进入 dispatcher/router 前再次执行同一 gate，分别覆盖 gate-off 拒绝、gate-on 接受和 forged delegate revalidation。Astra 独立复核为 gate-focused 3 个文件、38/38 tests，contract regression 4 个文件、22/22 tests；Worker TypeScript、shared build 和 `git diff --check` 均通过。该切片没有 Web、schema、provider、数据库或 lockfile 改动；总体完整验收保持 **1/8（12.5%）**。
+
+仍未运行 live PostgreSQL/RLS、Redis、provider、queue delivery、进程 restart、跨进程恢复或真实 child→parent 闭环；这些边界仍需最终组合验收。
+
 ## P2-OUTBOX-1 update
 
 P2-OUTBOX-1 提交 `57dd0ac9`（2026-09-09）已推送到当前分支：canonical Turn dispatch 在 `queue.add` 成功后使用同一 outbox row 做 guarded publishedAt/attemptCount/lastError 记账；queue.add 失败记录 `queue_add_failed` 并保持未发布；enqueue 成功但记账不确定时返回 `turn_dispatch_delivery_uncertain`，下一次使用相同 generation/jobId 依靠 BullMQ 幂等。该语义是 at-least-once 加 idempotent job ID，不承诺 exactly-once。

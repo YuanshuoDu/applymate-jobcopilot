@@ -298,6 +298,14 @@ Replay verifies the persisted tool name/input as before. When an accepted goal-u
 
 Astra independently verified **10 files / 86 focused tests** and **5 files / 53 regression tests**; the agent-protocol event check passed **2/2**; Worker TypeScript, shared/protocol builds and `git diff --check` passed. No live DB/PostgreSQL/RLS, Redis, provider, queue, process restart or cross-process recovery was run. The phase metric remains **1/8 (12.5%)**.
 
+## P3-15 update
+
+Commit `70a9809b` adds a server-owned planning action capability gate. `allowedPlanActions` is optional for compatibility with existing callers and defaults to the four existing plan actions; malformed server configuration fails closed, and model or policy snapshots cannot expand the list. Canonical runtime derives the list from the coordination gate: when coordination is off, `delegate` is excluded and only `use_tool`, `request_input` and `propose_completion` remain available.
+
+The proposal tool applies the server-owned action allowlist in its validation context. The canonical bridge revalidates the accepted proposal with the same allowlist immediately before dispatch/router execution, so a forged `delegate` cannot cross the bridge when coordination is disabled. Gate-off rejection, gate-on acceptance, forged-delegate revalidation and legacy default behavior are covered. Astra independently verified the gate-focused suite at **3 files / 38 tests** and the contract regression suite at **4 files / 22 tests**; Worker TypeScript, shared package build and `git diff --check` passed. No Web, schema, provider, database or lockfile behavior changed; the phase metric remains **1/8 (12.5%)**.
+
+No live PostgreSQL/RLS, Redis, provider, queue delivery, process restart, cross-process recovery or real child-to-parent execution was run. Those boundaries remain reserved for final integration evidence.
+
 ## P2-OUTBOX-1 update
 
 Commit `57dd0ac9` repairs canonical Turn dispatch bookkeeping after enqueue. A successful `queue.add` is followed by a guarded outbox update using the same row ID, setting `publishedAt`, incrementing `attemptCount` and clearing `lastError`; a second drain therefore does not dispatch the same published row again. Queue-add failure records bounded `queue_add_failed` state while leaving the row unpublished for retry. If enqueue succeeds but the bookkeeping update is uncertain, recovery returns `turn_dispatch_delivery_uncertain` and reuses the same generation/job ID rather than inventing another delivery generation.
