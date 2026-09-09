@@ -184,6 +184,7 @@ export type TurnEngineResult = {
   readonly status: "completed" | "waiting_for_dependency" | "waiting_for_approval" | "waiting_for_user" | "interrupted" | "failed"
   readonly stepCount: number
   readonly toolCallCount: number
+  readonly waitId?: string
   readonly finalItemId?: string
   readonly errorCode?: string
 }

@@ -91,7 +91,9 @@ export async function runTurnExecutionLoop(options: TurnExecutionOptions): Promi
           snapshot = outcome.snapshot
           assertExecutionAlive(options, signal)
           const wait = outcome.wait
-          const stepStatus = wait?.status === "waiting_for_approval" || wait?.status === "waiting_for_user" ? wait.status : "completed"
+          const stepStatus = wait?.status === "waiting_for_dependency"
+            ? "waiting_for_tool"
+            : wait?.status === "waiting_for_approval" || wait?.status === "waiting_for_user" ? wait.status : "completed"
           await updateExecutionStep(options, {
             stepId: step.id, status: stepStatus, finishReason: output.finishReason, errorCode: wait?.errorCode ?? null,
             inputTokens: output.usage?.inputTokens ?? 0, outputTokens: output.usage?.outputTokens ?? 0,
@@ -239,6 +241,20 @@ async function executeTools(
         content: toRepositoryJson({ toolCallId: call.id, toolName: call.name, input: call.arguments, status: result.status, output: result.output ?? null, errorCode: result.errorCode }),
       }],
     }
+    const dependencyWait = result.status === "completed" ? dependencyWaitReceipt(result.output) : null
+    if (dependencyWait) {
+      return { wait: { status: "waiting_for_dependency", waitId: dependencyWait.waitId, stepCount: 0, toolCallCount: 0 }, snapshot }
+    }
   }
   return { wait: null, snapshot }
+}
+
+type DependencyWaitReceipt = { readonly waitId: string; readonly deadlineAt: string; readonly matchedTaskIds: readonly string[] }
+
+function dependencyWaitReceipt(value: unknown): DependencyWaitReceipt | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null
+  const record = value as Record<string, unknown>
+  if (record.status !== "waiting" || typeof record.waitId !== "string" || record.waitId.trim().length === 0 || typeof record.deadlineAt !== "string" || record.deadlineAt.trim().length === 0 || !Array.isArray(record.matchedTaskIds)) return null
+  if (!record.matchedTaskIds.every(item => typeof item === "string" && item.trim().length > 0)) return null
+  return { waitId: record.waitId, deadlineAt: record.deadlineAt, matchedTaskIds: record.matchedTaskIds }
 }

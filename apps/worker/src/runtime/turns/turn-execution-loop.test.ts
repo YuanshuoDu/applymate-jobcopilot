@@ -4,7 +4,7 @@ import type { HarnessModelRequest, ModelAdapter, ModelStreamEvent } from "@jobco
 import type { StepContext } from "../context/step-context-builder.js"
 
 import { runTurnExecutionLoop } from "./turn-execution-loop.js"
-import type { TurnEngineItem, TurnEngineStore } from "./turn-engine-types.js"
+import type { TurnEngineItem, TurnEngineStore, TurnEngineToolResult } from "./turn-engine-types.js"
 import type { TurnExecutionIdentity, TurnExecutionOptions, TurnExecutionStore } from "./turn-execution-types.js"
 
 const profile = {
@@ -19,19 +19,20 @@ function identity(kind: TurnExecutionIdentity["kind"], taskId: string, attemptCo
   return { ...common, kind, attemptCount }
 }
 
-type Fixture = { options: TurnExecutionOptions; events: Array<{ id: string; type: string; itemId: string | null; taskId: string }>; items: TurnEngineItem[]; finalResponses: string[]; stepTasks: string[]; stepAttempts: number[]; requests: HarnessModelRequest[] }
+type Fixture = { options: TurnExecutionOptions; events: Array<{ id: string; type: string; itemId: string | null; taskId: string }>; items: TurnEngineItem[]; finalResponses: string[]; stepTasks: string[]; stepAttempts: number[]; stepStatuses: string[]; requests: HarnessModelRequest[] }
 
-function fixture(owner: TurnExecutionIdentity): Fixture {
+function fixture(owner: TurnExecutionIdentity, toolResult?: TurnEngineToolResult): Fixture {
   const events: Fixture["events"] = []
   const items: TurnEngineItem[] = []
   const finalResponses: string[] = []
   const stepTasks: string[] = []
   const stepAttempts: number[] = []
+  const stepStatuses: string[] = []
   const requests: HarnessModelRequest[] = []
   const revisions = new Map<string, number>()
   const store: TurnExecutionStore = {
     startStep: async ({ identity, stepId, attempt, ordinal }) => { stepTasks.push(identity.taskId); stepAttempts.push(attempt); return { id: stepId, ordinal } },
-    updateStep: async () => undefined,
+    updateStep: async ({ status }) => { stepStatuses.push(status) },
     createItem: async ({ identity, itemId }) => { const item = { id: itemId, revision: 0 }; items.push(item); revisions.set(`${identity.taskId}:${itemId}`, 0); return item },
     updateItem: async ({ identity, itemId, expectedRevision }) => { const key = `${identity.taskId}:${itemId}`; expect(revisions.get(key)).toBe(expectedRevision); const revision = expectedRevision + 1; revisions.set(key, revision); return { id: itemId, revision } },
     appendEvent: async ({ identity, id, type, itemId }) => { events.push({ id, type, itemId, taskId: identity.taskId }); return { id } },
@@ -65,11 +66,11 @@ function fixture(owner: TurnExecutionIdentity): Fixture {
   }
   const options: TurnExecutionOptions = {
     identity: owner, scope: { userId: "user-1" }, goal: "find jobs", snapshot: { system: [], profile: [], steerHistory: [], businessRefs: [], toolObservations: [] },
-    contextBuilder, store, model, tools: [{ name: "jobs.search", version: "1" }], executeTool: async ({ call }) => ({ id: call.id, toolName: call.toolName, toolVersion: call.toolVersion, status: "completed", output: { job: "job-1" }, errorCode: null }),
+    contextBuilder, store, model, tools: [{ name: "jobs.search", version: "1" }], executeTool: async ({ call }) => toolResult ?? ({ id: call.id, toolName: call.toolName, toolVersion: call.toolVersion, status: "completed", output: { job: "job-1" }, errorCode: null }),
     idFactory: prefix => prefix,
     subscribe: event => { events.push({ id: event.id, type: event.type, itemId: event.itemId, taskId: owner.taskId }) },
   }
-  return { options, events, items, finalResponses, stepTasks, stepAttempts, requests }
+  return { options, events, items, finalResponses, stepTasks, stepAttempts, stepStatuses, requests }
 }
 
 describe("owner-agnostic turn execution loop", () => {
@@ -98,5 +99,30 @@ describe("owner-agnostic turn execution loop", () => {
     expect(child.events.some(event => event.type === "turn.completed")).toBe(false)
     expect(child.finalResponses).toHaveLength(0)
     expect(child.items.some(item => item.id.startsWith("task:child-1:"))).toBe(true)
+  })
+
+  it("persists a waiting tool result before returning a dependency wait", async () => {
+    const child = fixture(identity("task", "child-wait", 2), {
+      id: "wait-call", toolName: "wait_subagents", toolVersion: "1", status: "completed",
+      output: { waitId: "wait-1", status: "waiting", deadlineAt: "2026-09-09T13:00:00.000Z", matchedTaskIds: [], taskIds: ["child-a"] }, errorCode: null,
+    })
+    const result = await runTurnExecutionLoop(child.options)
+    expect(result).toMatchObject({ status: "waiting_for_dependency", waitId: "wait-1", stepCount: 1, toolCallCount: 1 })
+    expect(child.requests).toHaveLength(1)
+    expect(child.stepStatuses).toContain("waiting_for_tool")
+    expect(child.events.some(event => event.type === "tool_call.completed")).toBe(true)
+    expect(child.events.some(event => event.type === "step.completed")).toBe(true)
+    expect(child.events.some(event => event.type === "turn.completed" || event.type === "turn.failed")).toBe(false)
+  })
+
+  it.each([
+    { label: "ready", output: { waitId: "wait-ready", status: "ready", deadlineAt: "2026-09-09T13:00:00.000Z", matchedTaskIds: ["child-a"] } },
+    { label: "malformed", output: { waitId: "wait-invalid", status: "waiting", deadlineAt: 123, matchedTaskIds: "child-a" } },
+  ])("continues to the next model step for $label wait output", async ({ output }) => {
+    const root = fixture(identity("turn", "root-1"), { id: "wait-call", toolName: "wait_subagents", toolVersion: "1", status: "completed", output, errorCode: null })
+    const result = await runTurnExecutionLoop(root.options)
+    expect(result.status).toBe("completed")
+    expect(root.requests).toHaveLength(2)
+    expect(root.stepStatuses).toEqual(["completed", "completed"])
   })
 })
