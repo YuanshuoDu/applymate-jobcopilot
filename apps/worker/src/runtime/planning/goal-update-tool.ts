@@ -2,7 +2,7 @@ import { Type, type Static } from "@sinclair/typebox"
 import { schemaVersion } from "@jobcopilot/agent-protocol"
 
 import { ToolExecutionError, type RuntimeToolDefinition } from "../tools/types.js"
-import { isPlainJsonObject, MAX_GOAL_REVISIONS, normalizeGoalContract, type GoalContract } from "./goal-plan-contract.js"
+import { isPlainJsonObject, MAX_GOAL_REVISIONS, normalizeGoalContract, type GoalContract, type GoalContractRef } from "./goal-plan-contract.js"
 
 const Text = Type.String({ minLength: 1, maxLength: 4_000 })
 const List = Type.Array(Type.String({ minLength: 1, maxLength: 1_000 }), { maxItems: 32 })
@@ -16,7 +16,7 @@ const GoalUpdateOutputSchema = Type.Object({
 }, { additionalProperties: false })
 
 export type GoalUpdateInput = Static<typeof GoalUpdateInputSchema>
-export type GoalUpdateToolOptions = { readonly goal: GoalContract }
+export type GoalUpdateToolOptions = { readonly goal: GoalContract; readonly goalRef?: GoalContractRef }
 type ChangeKey = keyof GoalUpdateInput["changes"]
 const CHANGE_KEYS: readonly ChangeKey[] = ["objective", "constraints", "successCriteria", "knownFacts", "unresolvedQuestions", "approvalBoundaries"]
 
@@ -42,15 +42,17 @@ export function createGoalUpdateTool(options: GoalUpdateToolOptions): RuntimeToo
       try {
         if (!isPlainJsonObject(input) || !Object.prototype.hasOwnProperty.call(input, "changes") || Object.keys(input).some(key => key !== "changes") || !isPlainJsonObject(input.changes)) throw new Error("invalid_goal_update")
         const changes = input.changes
+        const base = normalizeGoalContract(options.goalRef?.get() ?? current)
         const keys = Object.keys(changes)
         if (keys.length === 0 || keys.some(key => !(CHANGE_KEYS as readonly string[]).includes(key))) throw new Error("invalid_goal_update")
-        const merged: Record<string, unknown> = { ...current, revision: current.revision + 1, budgetRef: "runtime:turn" }
-        if (current.revision >= MAX_GOAL_REVISIONS) throw new ToolExecutionError("goal_revision_limit", "Goal revision limit reached", { maxGoalRevisions: MAX_GOAL_REVISIONS })
+        const merged: Record<string, unknown> = { ...base, revision: base.revision + 1, budgetRef: "runtime:turn" }
+        if (base.revision >= MAX_GOAL_REVISIONS) throw new ToolExecutionError("goal_revision_limit", "Goal revision limit reached", { maxGoalRevisions: MAX_GOAL_REVISIONS })
         for (const key of CHANGE_KEYS) if (Object.prototype.hasOwnProperty.call(changes, key)) merged[key] = changes[key]
         const next = normalizeGoalContract(merged)
-        if (next.revision !== current.revision + 1 || next.budgetRef !== "runtime:turn") throw new Error("invalid_goal_update")
-        const basedOnGoalRevision = current.revision
-        current = next
+        if (next.revision !== base.revision + 1 || next.budgetRef !== "runtime:turn") throw new Error("invalid_goal_update")
+        const basedOnGoalRevision = base.revision
+        if (options.goalRef) options.goalRef.update(next)
+        else current = next
         return { status: "accepted" as const, goalRevision: next.revision, basedOnGoalRevision, goalContract: next }
       } catch (error: unknown) {
         if (error instanceof ToolExecutionError) throw error

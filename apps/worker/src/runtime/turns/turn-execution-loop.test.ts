@@ -1,11 +1,16 @@
 import { describe, expect, it, vi } from "vitest"
 
 import type { HarnessModelRequest, ModelAdapter, ModelStreamEvent } from "@jobcopilot/agent-model"
+import type { PolicyEngine } from "@jobcopilot/agent-policy"
 import type { StepContext } from "../context/step-context-builder.js"
 
 import { runTurnExecutionLoop } from "./turn-execution-loop.js"
 import { fingerprintPlanProposal } from "../planning/plan-fingerprint.js"
-import { PLAN_PROPOSAL_SCHEMA_VERSION, type PlanProposal } from "../planning/goal-plan-contract.js"
+import { PLAN_PROPOSAL_SCHEMA_VERSION, type GoalContract, type GoalContractRef, type PlanProposal } from "../planning/goal-plan-contract.js"
+import { createGoalUpdateTool } from "../planning/goal-update-tool.js"
+import { createPlanProposalTool } from "../planning/plan-proposal-tool.js"
+import { createCanonicalPlanExecutionFactory } from "../planning/canonical-plan-execution.js"
+import type { ToolExecutionContext } from "../tools/types.js"
 import type { TurnEngineItem, TurnEngineStore, TurnEngineToolResult } from "./turn-engine-types.js"
 import type { TurnExecutionIdentity, TurnExecutionOptions, TurnExecutionStore } from "./turn-execution-types.js"
 
@@ -21,9 +26,10 @@ function identity(kind: TurnExecutionIdentity["kind"], taskId: string, attemptCo
   return { ...common, kind, attemptCount }
 }
 
+type FixtureTool = { readonly id?: string; readonly name: string; readonly arguments: unknown; readonly output?: unknown }
 type Fixture = { options: TurnExecutionOptions; events: Array<{ id: string; type: string; itemId: string | null; taskId: string; payload?: unknown; idempotencyKey?: string }>; notifications: string[]; planEvents: unknown[]; items: TurnEngineItem[]; finalResponses: string[]; stepTasks: string[]; stepAttempts: number[]; stepStatuses: string[]; requests: HarnessModelRequest[] }
 
-function fixture(owner: TurnExecutionIdentity, toolResult?: TurnEngineToolResult, planHook?: NonNullable<TurnExecutionOptions["executePlan"]>, initialToolObservations: Array<{ id: string; content: unknown }> = [], failPlanObservation = false, completionGate?: NonNullable<TurnExecutionOptions["completionGate"]>, firstTool?: { name: string; arguments: unknown; output?: unknown }, failGoalRevision = false): Fixture {
+function fixture(owner: TurnExecutionIdentity, toolResult?: TurnEngineToolResult, planHook?: NonNullable<TurnExecutionOptions["executePlan"]>, initialToolObservations: Array<{ id: string; content: unknown }> = [], failPlanObservation = false, completionGate?: NonNullable<TurnExecutionOptions["completionGate"]>, firstTool?: FixtureTool, failGoalRevision = false, goalRef?: GoalContractRef, toolExecutor?: TurnExecutionOptions["executeTool"], firstTools?: readonly FixtureTool[]): Fixture {
   const events: Fixture["events"] = []
   const planEvents: unknown[] = []
   const notifications: string[] = []
@@ -48,13 +54,14 @@ function fixture(owner: TurnExecutionIdentity, toolResult?: TurnEngineToolResult
   const planInput = { proposal: planProposal }
   const acceptedPlanOutput = { status: "accepted", goalRevision: 1, planRevision: 1, basedOnPlanRevision: null, proposal: planInput.proposal, intents: [], proposalHash: fingerprintPlanProposal(planInput.proposal) }
   const initialTool = firstTool ?? { name: planHook ? "agent.plan.propose" : "jobs.search", arguments: planHook ? planInput : { location: "Dublin" } }
+  const initialTools = firstTools ?? [initialTool]
   const model: ModelAdapter = {
     id: "fixture-model", profile,
     async *stream(request: HarnessModelRequest): AsyncGenerator<ModelStreamEvent> {
       requests.push(request)
       calls += 1
       if (calls === 1) {
-        yield { type: "tool_call_completed", callId: `call:${owner.taskId}`, name: initialTool.name, arguments: initialTool.arguments }
+        for (const [index, tool] of initialTools.entries()) yield { type: "tool_call_completed", callId: tool.id ?? (index === 0 ? `call:${owner.taskId}` : `call:${owner.taskId}:${index}`), name: tool.name, arguments: tool.arguments }
         yield { type: "completed", finishReason: "tool_calls" }
       } else {
         yield { type: "text_delta", text: `done:${owner.taskId}` }
@@ -74,8 +81,8 @@ function fixture(owner: TurnExecutionIdentity, toolResult?: TurnEngineToolResult
     }),
   }
   const options: TurnExecutionOptions = {
-    identity: owner, scope: { userId: "user-1" }, goal: "find jobs", snapshot: { system: [], profile: [], steerHistory: [], businessRefs: [], toolObservations: initialToolObservations },
-    contextBuilder, store, model, tools: [{ name: "jobs.search", version: "1" }, { name: initialTool.name, version: "1" }], executeTool: async ({ call }) => toolResult ?? ({ id: call.id, toolName: call.toolName, toolVersion: call.toolVersion, status: "completed", output: call.toolName === "agent.plan.propose" ? acceptedPlanOutput : initialTool.output ?? { job: "job-1" }, errorCode: null }),
+    identity: owner, scope: { userId: "user-1" }, goal: "find jobs", ...(goalRef ? { goalRef } : {}), snapshot: { system: [], profile: [], steerHistory: [], businessRefs: [], toolObservations: initialToolObservations },
+    contextBuilder, store, model, tools: [{ name: "jobs.search", version: "1" }, ...initialTools.map(tool => ({ name: tool.name, version: "1" }))], executeTool: toolExecutor ?? (async ({ call }) => toolResult ?? ({ id: call.id, toolName: call.toolName, toolVersion: "1", status: "completed", output: call.toolName === "agent.plan.propose" ? acceptedPlanOutput : initialTool.output ?? { job: "job-1" }, errorCode: null })),
     idFactory: prefix => prefix,
     subscribe: event => { notifications.push(event.type); events.push({ id: event.id, type: event.type, itemId: event.itemId, taskId: owner.taskId }) },
     ...(planHook ? { executePlan: planHook } : {}),
@@ -114,6 +121,40 @@ describe("owner-agnostic turn execution loop", () => {
     expect(JSON.stringify(root.requests[1]?.messages)).toContain("Find senior jobs")
   })
 
+  it("uses the revised goal for a following plan proposal and execution bridge in one loop", async () => {
+    const initialGoal: GoalContract = { revision: 1, objective: "Find jobs", constraints: [], successCriteria: [], knownFacts: [], unresolvedQuestions: [], approvalBoundaries: [], budgetRef: "runtime:turn" }
+    const current = { value: initialGoal }
+    const goalRef: GoalContractRef = { get: () => current.value, update: next => { current.value = next } }
+    const goalTool = createGoalUpdateTool({ goal: initialGoal, goalRef })
+    const planTool = createPlanProposalTool({ goal: initialGoal, goalRef, allowedTools: ["jobs.search"], allowedTemplates: [], allowedRoles: ["scout"], maxNodes: 8 })
+    const bridge = createCanonicalPlanExecutionFactory({
+      goal: initialGoal, goalRef, allowedTools: ["jobs.search"], allowedTemplates: [], allowedRoles: ["scout"], maxNodes: 8,
+      capabilities: ["read", "canPlan"], actorRole: "orchestrator", scope: { userId: "user-1" }, lease: { sessionId: "session-1", turnId: "turn-1" },
+      rootTaskId: "root-1", taskId: "root-1", router: { execute: async () => ({ id: "unused", toolName: "unused", toolVersion: "1", status: "completed" as const, errorCode: null }) },
+      registry: { list: () => [] }, policy: {} as PolicyEngine,
+    })
+    const proposal: PlanProposal = { schemaVersion: PLAN_PROPOSAL_SCHEMA_VERSION, basedOnGoalRevision: 2, basedOnPlanRevision: null, nodes: [], completionCriteria: [], briefRationale: "Replan after goal update" }
+    const root = fixture(
+      identity("turn", "root-1"), undefined, bridge, [], false, undefined, undefined, false, goalRef,
+      async input => {
+        const context: ToolExecutionContext = { scope: input.scope, sessionId: input.sessionId, turnId: input.turnId, stepId: input.stepId, signal: input.signal, capabilities: ["canPlan"], reportProgress: async () => undefined }
+        if (input.call.toolName === "agent.goal.update") return { id: input.call.id, toolName: input.call.toolName, toolVersion: "1", status: "completed" as const, output: await goalTool.execute(context, input.call.input as { changes: { objective: string } }), errorCode: null }
+        if (input.call.toolName === "agent.plan.propose") return { id: input.call.id, toolName: input.call.toolName, toolVersion: "1", status: "completed" as const, output: await planTool.execute(context, input.call.input as { proposal: PlanProposal }), errorCode: null }
+        return { id: input.call.id, toolName: input.call.toolName, toolVersion: "1", status: "failed" as const, errorCode: "unexpected_tool" }
+      },
+      [
+        { id: "goal-call", name: "agent.goal.update", arguments: { changes: { objective: "Find senior jobs" } } },
+        { id: "plan-call", name: "agent.plan.propose", arguments: { proposal } },
+      ],
+    )
+    const result = await runTurnExecutionLoop(root.options)
+    expect(result).toMatchObject({ status: "completed", stepCount: 2, toolCallCount: 2 })
+    expect(current.value).toMatchObject({ revision: 2, objective: "Find senior jobs" })
+    expect(root.events.some(event => event.type === "goal.revision")).toBe(true)
+    expect(root.events.some(event => event.type === "plan.revision")).toBe(true)
+    expect(root.finalResponses[0]).toContain("Find senior jobs")
+  })
+
   it("fails visibly when a goal update output or revision append is invalid", async () => {
     const root = fixture(identity("turn", "root-1"), undefined, undefined, [], false, undefined, {
       name: "agent.goal.update", arguments: { changes: { objective: "Find senior jobs" } },
@@ -141,10 +182,26 @@ describe("owner-agnostic turn execution loop", () => {
     const goalContract = { revision: 2, objective: "Find senior jobs", constraints: ["EU"], successCriteria: [], knownFacts: [], unresolvedQuestions: [], approvalBoundaries: [], budgetRef: "runtime:turn" }
     const input = { changes: { objective: "Find senior jobs" } }
     const persisted = [{ id: "tool-result:call:root-1", content: { toolCallId: "call:root-1", toolName: "agent.goal.update", input, status: "completed", output: { status: "accepted", goalRevision: 2, basedOnGoalRevision: 1, goalContract }, errorCode: null } }]
-    const root = fixture(identity("turn", "root-1"), undefined, undefined, persisted, false, undefined, { name: "agent.goal.update", arguments: input, output: persisted[0]!.content.output })
+    const revisionObservation = { id: "goal-revision:2", content: { kind: "goal_revision", goalRevision: 2, basedOnGoalRevision: 1, goalContract } }
+    const root = fixture(identity("turn", "root-1"), undefined, undefined, [...persisted, revisionObservation], false, undefined, { name: "agent.goal.update", arguments: input, output: persisted[0]!.content.output })
     const result = await runTurnExecutionLoop(root.options)
     expect(result.status).toBe("completed")
     expect(root.events.some(event => event.type === "goal.revision")).toBe(false)
+  })
+
+  it("repairs a missing goal revision for a replayed accepted update", async () => {
+    const goalContract = { revision: 2, objective: "Find senior jobs", constraints: ["EU"], successCriteria: [], knownFacts: [], unresolvedQuestions: [], approvalBoundaries: [], budgetRef: "runtime:turn" }
+    const input = { changes: { objective: "Find senior jobs" } }
+    const persisted = [{ id: "tool-result:call:root-1", content: { toolCallId: "call:root-1", toolName: "agent.goal.update", input, status: "completed", output: { status: "accepted", goalRevision: 2, basedOnGoalRevision: 1, goalContract }, errorCode: null } }]
+    const root = fixture(identity("turn", "root-1"), undefined, undefined, persisted, false, undefined, { name: "agent.goal.update", arguments: input, output: persisted[0]!.content.output })
+    const result = await runTurnExecutionLoop(root.options)
+    expect(result).toMatchObject({ status: "completed", stepCount: 2, toolCallCount: 1 })
+    expect(root.events.filter(event => event.type === "goal.revision" && event.payload)).toHaveLength(1)
+    expect(root.events.find(event => event.type === "goal.revision" && event.payload)).toMatchObject({
+      payload: { goalRevision: 2, basedOnGoalRevision: 1, goalContract },
+      idempotencyKey: expect.stringContaining("goal-revision:call:root-1"),
+    })
+    expect(JSON.stringify(root.requests[1]?.messages)).toContain("Find senior jobs")
   })
 
   it("runs the completion gate before final persistence and blocks an unfinished child tree", async () => {

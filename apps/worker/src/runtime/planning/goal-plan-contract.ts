@@ -17,6 +17,11 @@ export type GoalContract = {
   readonly budgetRef: string
 }
 
+export type GoalContractRef = {
+  readonly get: () => GoalContract
+  readonly update: (next: GoalContract) => void
+}
+
 export type PlanActionKind = "use_tool" | "delegate" | "request_input" | "propose_completion"
 
 export type PlanBudgetRequest = string | {

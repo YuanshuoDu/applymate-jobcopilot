@@ -8,7 +8,7 @@ import { NoProgressError, createProgressDetector } from "../progress.js"
 import { snapshotEvidence, verifyCandidateFinal } from "../verifier.js"
 import { buildModelRequest } from "./turn-engine-messages.js"
 import { runModelStep, type ModelStepResult } from "./turn-engine-model.js"
-import { findToolObservation, stableJson } from "./turn-engine-replay.js"
+import { findToolObservation, findToolResultObservation, stableJson } from "./turn-engine-replay.js"
 import { TurnEngineError, toRepositoryJson, type TurnEngineResult, type TurnEngineStep, type TurnEngineToolCall, type TurnEngineToolResult } from "./turn-engine-types.js"
 import { executeToolWithItems, publishCommentary, publishFinalResponse, publishReasoningSummary, TurnExecutionEventWriter } from "./turn-execution-events.js"
 import type { TurnExecutionOptions } from "./turn-execution-types.js"
@@ -124,7 +124,7 @@ export async function runTurnExecutionLoop(options: TurnExecutionOptions): Promi
           `step-completed:${step.id}`,
         )
         const verification = verifyCandidateFinal({
-          goal: options.goal, candidate: { text: output.text, finishReason: output.finishReason },
+          goal: options.goalRef?.get().objective ?? options.goal, candidate: { text: output.text, finishReason: output.finishReason },
           evidence: snapshotEvidence(snapshot), expectedEvidence: options.expectedEvidence, businessChecks: options.businessChecks,
         })
         if (!verification.ok) {
@@ -137,7 +137,7 @@ export async function runTurnExecutionLoop(options: TurnExecutionOptions): Promi
         }
         await assertCompletionAllowed(options, writer, step, signal, now)
         const finalResponse = finalizeTurn({
-          goal: options.goal, verification, terminalReason: "goal_satisfied", response: output.text,
+          goal: options.goalRef?.get().objective ?? options.goal, verification, terminalReason: "goal_satisfied", response: output.text,
           usage: totalTurnUsage(options.resume?.usage, budget.usage()), stepCount: steps, toolCallCount: toolCalls,
         })
         const finalItem = await publishFinalResponse(writer, options, step, finalResponse, now)
@@ -189,7 +189,7 @@ export async function runTurnExecutionLoop(options: TurnExecutionOptions): Promi
           ? "final_unverified"
           : "unrecoverable_error"
     const finalResponse = finalizeTurn({
-      goal: options.goal, terminalReason, blocker: error instanceof Error ? error.message : code,
+      goal: options.goalRef?.get().objective ?? options.goal, terminalReason, blocker: error instanceof Error ? error.message : code,
       usage: totalTurnUsage(options.resume?.usage, budget.usage()), stepCount: steps, toolCallCount: toolCalls,
       next: ["Review the blocker and resume the Turn"],
     })
@@ -247,6 +247,27 @@ async function executeTools(
       if (replayed.toolName !== call.name || stableJson(replayed.input) !== stableJson(call.arguments)) {
         throw new TurnEngineError("invalid_output", `Tool call ${call.id} does not match its persisted replay record`)
       }
+      if (call.name === "agent.goal.update") {
+        const persisted = findToolResultObservation(snapshot, call.id)
+        if (persisted?.status === "completed") {
+          const revision = parseGoalRevisionOutput(persisted.output)
+          if (!revision) throw new TurnEngineError("invalid_output", "Goal update returned an invalid persisted receipt")
+          const projection = goalRevisionObservation(revision)
+          const hasProjection = snapshot.toolObservations.some(observation => observation.id === projection.id)
+          if (!hasProjection) {
+            await writer.append("goal.revision", call.id, null, revision, `goal-revision:${call.id}`)
+          }
+          const currentGoal = options.goalRef?.get()
+          if (!currentGoal || currentGoal.revision <= revision.goalRevision) {
+            options.goalRef?.update(revision.goalContract)
+            snapshot = {
+              ...snapshot,
+              goal: { id: `turn-goal:${options.identity.turnId}`, content: revision.goalContract.objective },
+              toolObservations: hasProjection ? snapshot.toolObservations : [...snapshot.toolObservations, projection],
+            }
+          }
+        }
+      }
       continue
     }
     const result = await executeToolWithItems(options, writer, step, call, now)
@@ -288,6 +309,7 @@ async function executeTools(
         const revision = parseGoalRevisionOutput(result.output)
         if (!revision) throw new TurnEngineError("invalid_output", "Goal update returned an invalid receipt")
         await writer.append("goal.revision", call.id, null, revision, `goal-revision:${call.id}`)
+        options.goalRef?.update(revision.goalContract)
         const projection = goalRevisionObservation(revision)
         snapshot = {
           ...snapshot,

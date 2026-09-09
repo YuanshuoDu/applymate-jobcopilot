@@ -3,7 +3,7 @@ import { Buffer } from "node:buffer"
 import type { PolicyEngine } from "@jobcopilot/agent-policy"
 import type { PolicyRole, TenantScope } from "@jobcopilot/agent-protocol"
 
-import { PLAN_MAX_NODES, PLAN_MAX_REVISIONS, isPlainJsonObject, type GoalContract } from "./goal-plan-contract.js"
+import { PLAN_MAX_NODES, PLAN_MAX_REVISIONS, isPlainJsonObject, type GoalContract, type GoalContractRef } from "./goal-plan-contract.js"
 import { PlanDispatchError, dispatchPlanProposal } from "./plan-intent-dispatcher.js"
 import { copyPlanFingerprints, fingerprintPlanProposal, isPlanFingerprint } from "./plan-fingerprint.js"
 import { PlanValidationError, validatePlanProposal } from "./goal-plan-validator.js"
@@ -23,6 +23,7 @@ type Router = { execute(context: ToolRouterContext, request: ToolCallRequest): P
 
 export type CanonicalPlanExecutionOptions = {
   readonly goal: GoalContract
+  readonly goalRef?: GoalContractRef
   readonly allowedTools: readonly string[]
   readonly allowedTemplates: readonly string[]
   readonly allowedRoles: readonly string[]
@@ -178,17 +179,24 @@ export function createCanonicalPlanExecutionFactory(options: CanonicalPlanExecut
   const allowedRoles = Object.freeze([...options.allowedRoles])
   const seenPlanHashes = new Set(copyPlanFingerprints(options.initialPlanHashes))
   let currentPlanRevision: number | null = options.initialPlanRevision ?? null
+  let goalRevision = options.goal.revision
   return async input => {
     const baseError = (code: string): TurnEnginePlanExecutionHookResult => ({ observations: [failureObservation(input.call.id, code)] })
     try {
+      const goal = options.goalRef?.get() ?? options.goal
+      if (goal.revision !== goalRevision) {
+        currentPlanRevision = null
+        seenPlanHashes.clear()
+        goalRevision = goal.revision
+      }
       if (input.result.status !== "completed" || input.result.toolName !== "agent.plan.propose") throw new CanonicalPlanError("invalid_plan_output")
-      const output = accepted(input.result.output, options.goal.revision, currentPlanRevision, maxPlanRevisions)
+      const output = accepted(input.result.output, goal.revision, currentPlanRevision, maxPlanRevisions)
       const validation = {
-        goalRevision: options.goal.revision, planRevision: output.basedOnPlanRevision, maxNodes: options.maxNodes,
+        goalRevision: goal.revision, planRevision: output.basedOnPlanRevision, maxNodes: options.maxNodes,
         allowedActions: [...PLAN_ACTIONS], allowedTools, allowedTemplates, allowedRoles,
       } as const
       let normalized: ReturnType<typeof validatePlanProposal>
-      try { normalized = validatePlanProposal(output.proposal, { goalRevision: options.goal.revision }) } catch (error: unknown) { if (error instanceof PlanValidationError) throw new CanonicalPlanError("invalid_plan_output"); throw error }
+      try { normalized = validatePlanProposal(output.proposal, { goalRevision: goal.revision }) } catch (error: unknown) { if (error instanceof PlanValidationError) throw new CanonicalPlanError("invalid_plan_output"); throw error }
       const computedHash = fingerprintPlanProposal(normalized)
       if (computedHash !== output.proposalHash) throw new CanonicalPlanError("invalid_plan_output")
       if (seenPlanHashes.has(computedHash)) throw new CanonicalPlanError("plan_no_progress")

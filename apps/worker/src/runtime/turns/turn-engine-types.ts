@@ -1,12 +1,12 @@
 import type { ModelAdapter, ModelCapabilityProfile } from "@jobcopilot/agent-model"
 import type { PolicyRole, RepositoryJsonValue, TenantScope } from "@jobcopilot/agent-protocol"
-
 import type { StepContext, StepContextSnapshot } from "../context/step-context-builder.js"
 import type { TurnBudgetLimits } from "../budget.js"
 import type { BusinessCheck } from "../verifier.js"
 import type { ExecutionOwnerFence, TurnExecutionOwnerFence } from "../execution-owner.js"
 import type { TurnLease } from "./lease.js"
 import type { TurnEngineCompletionGate } from "./turn-execution-types.js"
+import type { GoalContractRef } from "../planning/goal-plan-contract.js"
 
 export type TurnEngineItemType = "agent_message" | "reasoning_summary" | "tool_call" | "tool_result" | "error"
 export type TurnEngineItemPhase = "commentary" | "final_answer" | null
@@ -152,7 +152,7 @@ export type TurnEngineEventSubscriber = (event: TurnEngineEvent) => void | Promi
 export type TurnEngineOptions = {
   readonly lease: TurnLease
   readonly scope: TenantScope
-  readonly goal: string
+  readonly goal: string; readonly goalRef?: GoalContractRef
   readonly snapshot: StepContextSnapshot
   readonly contextBuilder: {
     build(request: {

@@ -18,6 +18,7 @@ import type {
   TurnEnginePlanExecutionHook,
   TurnEnginePlanExecutionHookResult,
 } from "./turn-engine-types.js"
+import type { GoalContractRef } from "../planning/goal-plan-contract.js"
 
 export type TurnEngineCompletionGateResult =
   | { readonly ok: true }
@@ -72,6 +73,7 @@ export type TurnExecutionOptions = {
   readonly identity: TurnExecutionIdentity
   readonly scope: TenantScope
   readonly goal: string
+  readonly goalRef?: GoalContractRef
   readonly snapshot: StepContextSnapshot
   readonly contextBuilder: TurnExecutionContextBuilder
   readonly store: TurnExecutionStore

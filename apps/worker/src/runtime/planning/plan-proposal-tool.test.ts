@@ -43,6 +43,16 @@ describe("plan proposal tool", () => {
     expect(second).toMatchObject({ planRevision: 2, basedOnPlanRevision: 1 })
   })
 
+  it("reads the current server goal and resets old plan state after a goal revision", async () => {
+    const current = { value: goal }
+    const goalRef = { get: () => current.value, update: (next: GoalContract) => { current.value = next } }
+    const definition = createPlanProposalTool({ ...toolOptions(), goalRef })
+    await expect(definition.execute(context(), { proposal: plan() })).resolves.toMatchObject({ goalRevision: 1, planRevision: 1, basedOnPlanRevision: null })
+    current.value = { ...goal, revision: 2, objective: "Find senior jobs" }
+    const next = await definition.execute(context(), { proposal: plan({ basedOnGoalRevision: 2, basedOnPlanRevision: null }) })
+    expect(next).toMatchObject({ goalRevision: 2, planRevision: 1, basedOnPlanRevision: null })
+  })
+
   it("accepts through the server revision bound and rejects the next proposal", async () => {
     const definition = createPlanProposalTool(toolOptions({ maxPlanRevisions: 2 }))
     await expect(definition.execute(context(), { proposal: plan() })).resolves.toMatchObject({ planRevision: 1 })

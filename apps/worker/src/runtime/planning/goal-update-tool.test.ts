@@ -12,6 +12,15 @@ describe("goal update tool", () => {
     await expect(tool.execute(context, { changes: { objective: "Find senior jobs", knownFacts: ["Dublin"] } })).resolves.toMatchObject({ status: "accepted", goalRevision: 2, basedOnGoalRevision: 1, goalContract: { objective: "Find senior jobs", constraints: ["EU"], knownFacts: ["Dublin"], budgetRef: "runtime:turn" } })
   })
 
+  it("updates the server-owned goal reference used by sibling planning tools", async () => {
+    const current = { value: goal }
+    const goalRef = { get: () => current.value, update: (next: GoalContract) => { current.value = next } }
+    const tool = createGoalUpdateTool({ goal, goalRef })
+    const result = await tool.execute(context, { changes: { objective: "Find senior jobs" } })
+    expect(result.goalRevision).toBe(2)
+    expect(current.value).toMatchObject({ revision: 2, objective: "Find senior jobs" })
+  })
+
   it("rejects empty, forbidden and malformed patches without advancing", async () => {
     const tool = createGoalUpdateTool({ goal })
     await expect(tool.execute(context, { changes: {} })).rejects.toMatchObject({ code: "goal_update_invalid" })

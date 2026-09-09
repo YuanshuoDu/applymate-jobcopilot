@@ -3,7 +3,7 @@ import type { PolicyEngine } from "@jobcopilot/agent-policy"
 import type { ToolCallRequest, ToolExecutionResult, ToolRouterContext } from "../tools/types.js"
 import type { StepContextSnapshot } from "../context/step-context-builder.js"
 import { executionOwnerFence } from "../execution-owner.js"
-import { PLAN_PROPOSAL_SCHEMA_VERSION, type PlanProposal } from "./goal-plan-contract.js"
+import { PLAN_PROPOSAL_SCHEMA_VERSION, type GoalContract, type GoalContractRef, type PlanProposal } from "./goal-plan-contract.js"
 import { fingerprintPlanProposal } from "./plan-fingerprint.js"
 import { createCanonicalPlanExecutionFactory, type CanonicalPlanExecutionOptions } from "./canonical-plan-execution.js"
 import type { PlanCommandReceipt } from "./plan-command-receipt.js"
@@ -31,13 +31,13 @@ function output(value: PlanProposal, overrides: Record<string, unknown> = {}): R
   return { status: "accepted", goalRevision: 1, planRevision: 1, basedOnPlanRevision: null, proposal: value, intents: [], proposalHash: fingerprintPlanProposal(value), ...overrides }
 }
 
-function fixture(router: { execute(context: ToolRouterContext, request: ToolCallRequest): Promise<ToolExecutionResult> } = { execute: async (_context, request) => ({ ...request, status: "completed", output: { ok: true }, errorCode: null }) }, initialPlanRevision?: number, persistOutcome?: (receipt: PlanCommandReceipt) => Promise<void> | void, maxPlanRevisions?: number, initialPlanHashes?: readonly string[]) {
+function fixture(router: { execute(context: ToolRouterContext, request: ToolCallRequest): Promise<ToolExecutionResult> } = { execute: async (_context, request) => ({ ...request, status: "completed", output: { ok: true }, errorCode: null }) }, initialPlanRevision?: number, persistOutcome?: (receipt: PlanCommandReceipt) => Promise<void> | void, maxPlanRevisions?: number, initialPlanHashes?: readonly string[], goalRef?: GoalContractRef) {
   const options: CanonicalPlanExecutionOptions = {
     goal, allowedTools: ["jobs.search"], allowedTemplates: [], allowedRoles: ["scout"], maxNodes: 8,
     capabilities: ["read", "canPlan"], actorRole: "orchestrator", scope: { userId: "user-1" }, lease,
     rootTaskId: "root-1", taskId: "root-1", initialPlanRevision, router,
     registry: { list: () => [{ name: "jobs.search", version: "1", risk: "read", capabilities: ["read"] }] },
-    policy: {} as PolicyEngine, ...(persistOutcome ? { persistOutcome } : {}), ...(maxPlanRevisions === undefined ? {} : { maxPlanRevisions }), ...(initialPlanHashes ? { initialPlanHashes } : {}),
+    policy: {} as PolicyEngine, ...(persistOutcome ? { persistOutcome } : {}), ...(maxPlanRevisions === undefined ? {} : { maxPlanRevisions }), ...(initialPlanHashes ? { initialPlanHashes } : {}), ...(goalRef ? { goalRef } : {}),
   }
   return createCanonicalPlanExecutionFactory(options)
 }
@@ -109,6 +109,17 @@ describe("createCanonicalPlanExecutionFactory", () => {
     expect(accepted.observations).toEqual([])
     const stale = await hook(input(output(recoveredProposal, { planRevision: 3, basedOnPlanRevision: 2 })))
     expect(observationCode(stale)).toBe("revision_conflict")
+  })
+
+  it("reads a revised goal and resets old plan state through the bridge", async () => {
+    const current: { value: GoalContract } = { value: goal }
+    const goalRef: GoalContractRef = { get: () => current.value, update: next => { current.value = next } }
+    const hook = fixture(undefined, undefined, undefined, undefined, undefined, goalRef)
+    await expect(hook(input(output(proposal([]))))).resolves.toEqual({ observations: [] })
+    current.value = { ...goal, revision: 2, objective: "Find senior jobs" }
+    const nextProposal = { ...proposal([]), basedOnGoalRevision: 2 }
+    const accepted = await hook(input(output(nextProposal, { goalRevision: 2, planRevision: 1, basedOnPlanRevision: null })))
+    expect(accepted.observations).toEqual([])
   })
 
   it("rejects accepted output beyond the server revision bound", async () => {

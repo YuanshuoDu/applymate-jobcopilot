@@ -2,7 +2,7 @@ import { Type, type Static } from "@sinclair/typebox"
 import { schemaVersion } from "@jobcopilot/agent-protocol"
 
 import { ToolExecutionError, type RuntimeToolDefinition } from "../tools/types.js"
-import { PLAN_MAX_NODES, PLAN_MAX_REVISIONS, type GoalContract, type PlanProposal } from "./goal-plan-contract.js"
+import { PLAN_MAX_NODES, PLAN_MAX_REVISIONS, type GoalContract, type GoalContractRef, type PlanProposal } from "./goal-plan-contract.js"
 import { copyPlanFingerprints, fingerprintPlanProposal } from "./plan-fingerprint.js"
 import { toRuntimeActionIntents, type RuntimeActionIntent } from "./goal-plan-actions.js"
 import { PlanValidationError, validatePlanProposal } from "./goal-plan-validator.js"
@@ -27,6 +27,7 @@ export type PlanProposalToolOutput = {
 
 export type PlanProposalToolOptions = {
   readonly goal: GoalContract
+  readonly goalRef?: GoalContractRef
   readonly allowedTools: readonly string[]
   readonly allowedTemplates: readonly string[]
   readonly allowedRoles: readonly string[]
@@ -55,16 +56,23 @@ export function createPlanProposalTool(options: PlanProposalToolOptions): Runtim
   const allowedRoles = copyAllowlist("role", options.allowedRoles)
   const seenPlanHashes = new Set(copyPlanFingerprints(options.initialPlanHashes))
   let planRevision: number | null = options.initialPlanRevision ?? null
+  let goalRevision = options.goal.revision
   return {
     schemaVersion, name: "agent.plan.propose", version: "1", description: "Propose a bounded read-only plan for the current goal",
     capabilities: ["coordination"], inputSchema: PlanProposalEnvelopeSchema, outputSchema: PlanProposalOutputSchema,
     risk: "internal_write", domain: "coordination", idempotency: "idempotent", timeoutMs: 10_000, requiredCapabilities: ["canPlan"],
     execute: async (_context, input) => {
       try {
+        const goal = options.goalRef?.get() ?? options.goal
+        if (goal.revision !== goalRevision) {
+          planRevision = null
+          seenPlanHashes.clear()
+          goalRevision = goal.revision
+        }
         const nextRevision = (planRevision ?? 0) + 1
         if (nextRevision > maxPlanRevisions) throw new ToolExecutionError("plan_revision_limit", "Plan revision limit reached", { maxPlanRevisions })
         const proposal = validatePlanProposal(input.proposal, {
-          goalRevision: options.goal.revision, planRevision, maxNodes: options.maxNodes,
+          goalRevision: goal.revision, planRevision, maxNodes: options.maxNodes,
           allowedActions: ["use_tool", "delegate", "request_input", "propose_completion"], allowedTools,
           allowedTemplates, allowedRoles,
         })
@@ -73,7 +81,7 @@ export function createPlanProposalTool(options: PlanProposalToolOptions): Runtim
         const basedOnPlanRevision = planRevision
         planRevision = nextRevision
         seenPlanHashes.add(proposalHash)
-        return { status: "accepted" as const, goalRevision: options.goal.revision, planRevision, basedOnPlanRevision, proposal, intents: toRuntimeActionIntents(proposal), proposalHash }
+        return { status: "accepted" as const, goalRevision: goal.revision, planRevision, basedOnPlanRevision, proposal, intents: toRuntimeActionIntents(proposal), proposalHash }
       } catch (error: unknown) {
         if (error instanceof PlanValidationError) throw new ToolExecutionError("plan_invalid", "Plan proposal failed deterministic validation", { issues: error.issues.slice(0, 16).map(issue => ({ path: issue.path.slice(0, 256), code: issue.code.slice(0, 64), message: issue.message.slice(0, 256) })) })
         throw error
