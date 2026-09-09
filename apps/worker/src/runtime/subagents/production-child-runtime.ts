@@ -38,6 +38,7 @@ function bindStore(store: TurnEngineStore): TurnExecutionStore {
     createItem: input => store.createItem({ ...withoutIdentity(input), owner: input.identity }),
     updateItem: input => store.updateItem({ ...withoutIdentity(input), owner: input.identity }),
     appendEvent: input => store.appendEvent({ ...withoutIdentity(input), owner: input.identity }),
+    appendEvents: store.appendEvents ? (inputs) => store.appendEvents!(inputs.map(input => ({ ...withoutIdentity(input), owner: input.identity }))) : undefined,
   }
 }
 

@@ -32,6 +32,7 @@ function bindStore(store: TurnEngineOptions["store"]): TurnExecutionStore {
     createItem: (input) => store.createItem({ ...withoutIdentity(input), owner: input.identity }),
     updateItem: (input) => store.updateItem({ ...withoutIdentity(input), owner: input.identity }),
     appendEvent: (input) => store.appendEvent({ ...withoutIdentity(input), owner: input.identity }),
+    appendEvents: store.appendEvents ? (inputs) => store.appendEvents!(inputs.map(input => ({ ...withoutIdentity(input), owner: input.identity }))) : undefined,
     recordFinalResponse: store.recordFinalResponse ? (input) => {
       if (input.identity.kind !== "turn") throw new TurnLeaseError("lease_lost", "Child execution cannot persist a Turn final response")
       return store.recordFinalResponse!({ ...withoutIdentity(input), owner: input.identity })

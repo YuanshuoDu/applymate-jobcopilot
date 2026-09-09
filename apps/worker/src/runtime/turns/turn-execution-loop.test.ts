@@ -19,11 +19,12 @@ function identity(kind: TurnExecutionIdentity["kind"], taskId: string, attemptCo
   return { ...common, kind, attemptCount }
 }
 
-type Fixture = { options: TurnExecutionOptions; events: Array<{ id: string; type: string; itemId: string | null; taskId: string }>; planEvents: unknown[]; items: TurnEngineItem[]; finalResponses: string[]; stepTasks: string[]; stepAttempts: number[]; stepStatuses: string[]; requests: HarnessModelRequest[] }
+type Fixture = { options: TurnExecutionOptions; events: Array<{ id: string; type: string; itemId: string | null; taskId: string }>; notifications: string[]; planEvents: unknown[]; items: TurnEngineItem[]; finalResponses: string[]; stepTasks: string[]; stepAttempts: number[]; stepStatuses: string[]; requests: HarnessModelRequest[] }
 
 function fixture(owner: TurnExecutionIdentity, toolResult?: TurnEngineToolResult, planHook?: NonNullable<TurnExecutionOptions["executePlan"]>, initialToolObservations: Array<{ id: string; content: unknown }> = [], failPlanObservation = false): Fixture {
   const events: Fixture["events"] = []
   const planEvents: unknown[] = []
+  const notifications: string[] = []
   const items: TurnEngineItem[] = []
   const finalResponses: string[] = []
   const stepTasks: string[] = []
@@ -37,6 +38,7 @@ function fixture(owner: TurnExecutionIdentity, toolResult?: TurnEngineToolResult
     createItem: async ({ identity, itemId }) => { const item = { id: itemId, revision: 0 }; items.push(item); revisions.set(`${identity.taskId}:${itemId}`, 0); return item },
     updateItem: async ({ identity, itemId, expectedRevision }) => { const key = `${identity.taskId}:${itemId}`; expect(revisions.get(key)).toBe(expectedRevision); const revision = expectedRevision + 1; revisions.set(key, revision); return { id: itemId, revision } },
     appendEvent: async ({ identity, id, type, itemId, payload }) => { if (type === "plan.observation") { if (failPlanObservation) throw new Error("durable_event_failed"); planEvents.push(payload) }; events.push({ id, type, itemId, taskId: identity.taskId }); return { id } },
+    appendEvents: async inputs => { for (const input of inputs) { if (input.type === "plan.observation") { if (failPlanObservation) throw new Error("durable_event_failed"); planEvents.push(input.payload) }; events.push({ id: input.id, type: input.type, itemId: input.itemId, taskId: input.identity.taskId }) }; return inputs.map(input => ({ id: input.id })) },
     recordFinalResponse: async ({ identity, response }) => { finalResponses.push(`${identity.taskId}:${response}`) },
   }
   let calls = 0
@@ -70,10 +72,10 @@ function fixture(owner: TurnExecutionIdentity, toolResult?: TurnEngineToolResult
     identity: owner, scope: { userId: "user-1" }, goal: "find jobs", snapshot: { system: [], profile: [], steerHistory: [], businessRefs: [], toolObservations: initialToolObservations },
     contextBuilder, store, model, tools: [{ name: "jobs.search", version: "1" }], executeTool: async ({ call }) => toolResult ?? ({ id: call.id, toolName: call.toolName, toolVersion: call.toolVersion, status: "completed", output: { job: "job-1" }, errorCode: null }),
     idFactory: prefix => prefix,
-    subscribe: event => { events.push({ id: event.id, type: event.type, itemId: event.itemId, taskId: owner.taskId }) },
+    subscribe: event => { notifications.push(event.type); events.push({ id: event.id, type: event.type, itemId: event.itemId, taskId: owner.taskId }) },
     ...(planHook ? { executePlan: planHook } : {}),
   }
-  return { options, events, planEvents, items, finalResponses, stepTasks, stepAttempts, stepStatuses, requests }
+  return { options, events, notifications, planEvents, items, finalResponses, stepTasks, stepAttempts, stepStatuses, requests }
 }
 
 describe("owner-agnostic turn execution loop", () => {
@@ -170,6 +172,9 @@ describe("owner-agnostic turn execution loop", () => {
     const result = await runTurnExecutionLoop(root.options)
     expect(result).toMatchObject({ status: "failed", errorCode: "turn_execution_failed" })
     expect(root.requests).toHaveLength(1)
+    expect(root.planEvents).toEqual([])
+    expect(root.events.some(event => event.type === "plan.observation")).toBe(false)
+    expect(root.notifications.some(type => type === "plan.observation")).toBe(false)
   })
 
   it("does not repeat the plan hook for a replayed proposal call", async () => {

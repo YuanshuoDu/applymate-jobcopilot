@@ -7,6 +7,8 @@ import { toRepositoryJson, type TurnEngineItemPhase, type TurnEngineItemStatus, 
 import { executionId, executionKey, type ExecutionItemHandle, type TurnExecutionOptions } from "./turn-execution-types.js"
 import type { TurnEngineStep, TurnEngineToolCall, TurnEngineToolResult } from "./turn-engine-types.js"
 
+type BatchAppendEntry = { type: string; correlationId: string; itemId: string | null; payload: unknown; key: string }
+
 export class TurnExecutionEventWriter {
   private causationId: string | null = null
   private readonly key: string
@@ -26,6 +28,30 @@ export class TurnExecutionEventWriter {
     this.causationId = event.id
     await this.notify({ id: event.id, type: mappedType, itemId, correlationId, causationId, payload: toRepositoryJson(payload) })
     return event.id
+  }
+
+  async appendBatch(entries: readonly BatchAppendEntry[]): Promise<readonly string[]> {
+    if (entries.length === 0) return []
+    const appendEvents = this.options.store.appendEvents
+    if (!appendEvents) throw new Error("plan_observation_batch_unavailable")
+    let causationId = this.causationId
+    const pending = entries.map(entry => {
+      const id = this.id(`event:${entry.key}`)
+      const mappedType = this.options.lifecycle?.mapEventType?.(entry.type) ?? ownerEventType(this.options.identity.kind, entry.type)
+      const payload = toRepositoryJson(entry.payload)
+      const event = { identity: this.options.identity, id, itemId: entry.itemId, type: mappedType, correlationId: entry.correlationId, causationId, idempotencyKey: `${this.key}:event:${entry.key}`, payload }
+      causationId = id
+      return { ...entry, id, mappedType, payload, event, causationId: event.causationId }
+    })
+    const saved = await appendEvents(pending.map(entry => entry.event))
+    if (saved.length !== pending.length || saved.some(event => typeof event.id !== "string" || !event.id.trim())) throw new Error("plan_observation_batch_result_mismatch")
+    const ids = saved.map(event => event.id)
+    this.causationId = ids[ids.length - 1] ?? this.causationId
+    for (let index = 0; index < pending.length; index += 1) {
+      const entry = pending[index]!
+      await this.notify({ id: ids[index]!, type: entry.mappedType, itemId: entry.itemId, correlationId: entry.correlationId, causationId: index === 0 ? entry.causationId : ids[index - 1]!, payload: entry.payload })
+    }
+    return ids
   }
 
   async startItem(input: { id: string; stepId: string | null; type: TurnEngineItemType; phase: TurnEngineItemPhase; content: unknown; now: Date }): Promise<ExecutionItemHandle> {

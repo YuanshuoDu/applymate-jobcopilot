@@ -31,6 +31,7 @@ export type TurnExecutionStore = {
   createItem(input: StoreInput<"createItem">): Promise<TurnEngineItem>
   updateItem(input: StoreInput<"updateItem">): Promise<TurnEngineItem>
   appendEvent(input: StoreInput<"appendEvent">): Promise<{ id: string }>
+  appendEvents?(inputs: readonly StoreInput<"appendEvent">[]): Promise<readonly { id: string }[]>
   recordFinalResponse?(input: StoreInput<"recordFinalResponse">): Promise<void>
 }
 

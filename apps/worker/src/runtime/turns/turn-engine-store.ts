@@ -3,7 +3,7 @@ import type { RepositoryJsonValue } from "@jobcopilot/agent-protocol"
 
 import type { ExecutionOwnerFence } from "../execution-owner.js"
 import { ownerFenceSql } from "./turn-engine-owner-sql.js"
-import { toRepositoryJson, type TurnEngineItem, type TurnEngineStore, type TurnEngineStep } from "./turn-engine-types.js"
+import { toRepositoryJson, type TurnEngineEventInput, type TurnEngineItem, type TurnEngineStore, type TurnEngineStep } from "./turn-engine-types.js"
 
 type TurnEnginePool = Pick<pg.Pool, "connect">
 type QueryClient = Pick<pg.PoolClient, "query" | "release">
@@ -66,6 +66,46 @@ async function assertCurrentItemLineage(client: QueryClient, owner: ExecutionOwn
           AND owner_step."turnId" = item."turnId" AND owner_step."taskId" = item."taskId" AND owner_step."attempt" = $5))`,
   [itemId, owner.sessionId, owner.turnId, owner.taskId, attempt])
   if (!result.rows[0]) throw conflict(`item ${itemId} lineage`)
+}
+
+async function appendEventBatch(pool: TurnEnginePool, inputs: readonly TurnEngineEventInput[]): Promise<readonly { id: string }[]> {
+  if (inputs.length === 0) return []
+  const owner = inputs[0]!.owner
+  if (inputs.some(input => input.owner.kind !== owner.kind || input.owner.userId !== owner.userId || input.owner.sessionId !== owner.sessionId
+    || input.owner.turnId !== owner.turnId || input.owner.taskId !== owner.taskId || input.owner.rootTaskId !== owner.rootTaskId
+    || input.owner.ownerId !== owner.ownerId || input.owner.leaseExpiresAt.getTime() !== owner.leaseExpiresAt.getTime()
+    || (owner.kind === "task" ? input.owner.attemptCount !== owner.attemptCount : input.owner.leaseVersion !== owner.leaseVersion))) throw conflict("event batch owner")
+  for (const input of inputs) if (input.owner.kind === "task" && ["turn.completed", "turn.failed", "turn.interrupted"].includes(input.type)) throw conflict(`child root lifecycle ${input.type}`)
+  return tenantTransaction(pool, owner.userId, async client => {
+    if (!await lockOwnedTurn(client, owner, true)) throw conflict(`turn ${owner.turnId}`)
+    const result: { id: string }[] = []; let previousId: string | null = null
+    for (const input of inputs) {
+      if (input.itemId) await assertCurrentItemLineage(client, owner, input.itemId)
+      const existing = await client.query<Row>(`SELECT "id", "taskId", "turnId", "itemId", "type", "correlationId", "causationId", "sequence", "actor", "payload"
+        FROM "agent_events" WHERE "sessionId" = $1 AND "idempotencyKey" = $2`, [owner.sessionId, input.idempotencyKey])
+      const causationId = previousId ?? input.causationId
+      if (existing.rows[0]) {
+        const row = existing.rows[0]
+        if (row.taskId !== owner.taskId || row.turnId !== owner.turnId || row.itemId !== input.itemId || row.type !== input.type
+          || row.correlationId !== input.correlationId || row.causationId !== causationId || !sameJson(row.payload, input.payload)) throw conflict(`event ${input.idempotencyKey} identity`)
+        await client.query(`INSERT INTO "agent_outbox" ("id", "topic", "aggregateId", "idempotencyKey", "payload") VALUES ($1, 'agent.events', $2, $3, $4::jsonb) ON CONFLICT ("idempotencyKey") DO NOTHING`,
+          [`agent-outbox-${row.id}`, owner.sessionId, `agent-event:${row.id}`, json(toRepositoryJson({ eventId: String(row.id), sessionId: owner.sessionId, turnId: owner.turnId, taskId: owner.taskId, itemId: input.itemId, sequence: String(row.sequence), type: input.type, actor: String(row.actor), correlationId: input.correlationId, causationId: row.causationId, idempotencyKey: input.idempotencyKey, payload: input.payload }))])
+        result.push({ id: String(row.id) }); previousId = String(row.id); continue
+      }
+      if (input.itemId) {
+        const item = await client.query(`SELECT "id" FROM "agent_items" WHERE "id" = $1 AND "sessionId" = $2 AND "turnId" = $3 AND "taskId" = $4`, [input.itemId, owner.sessionId, owner.turnId, owner.taskId])
+        if (!item.rows[0]) throw conflict(`item ${input.itemId}`)
+      }
+      const sequence = await client.query<{ eventSequence: bigint | string }>(`UPDATE "agent_sessions" SET "eventSequence" = "eventSequence" + 1 WHERE "id" = $1 AND "userId" = $2 RETURNING "eventSequence"`, [owner.sessionId, owner.userId])
+      const next = sequence.rows[0]?.eventSequence
+      if (next === undefined) throw conflict(`session ${owner.sessionId}`)
+      const actor = owner.kind === "task" ? "subagent" : "orchestrator"
+      await client.query(`INSERT INTO "agent_events" ("id", "sessionId", "turnId", "itemId", "taskId", "sequence", "type", "actor", "correlationId", "causationId", "idempotencyKey", "payload") VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12::jsonb)`, [input.id, owner.sessionId, owner.turnId, input.itemId, owner.taskId, BigInt(next).toString(), input.type, actor, input.correlationId, causationId, input.idempotencyKey, json(input.payload)])
+      await client.query(`INSERT INTO "agent_outbox" ("id", "topic", "aggregateId", "idempotencyKey", "payload") VALUES ($1, 'agent.events', $2, $3, $4::jsonb)`, [`agent-outbox-${input.id}`, owner.sessionId, `agent-event:${input.id}`, json({ eventId: input.id, sessionId: owner.sessionId, turnId: owner.turnId, taskId: owner.taskId, itemId: input.itemId, sequence: BigInt(next).toString(), type: input.type, actor, correlationId: input.correlationId, causationId, idempotencyKey: input.idempotencyKey, payload: input.payload })])
+      result.push({ id: input.id }); previousId = input.id
+    }
+    return result
+  })
 }
 
 export function createPgTurnEngineStore(pool: TurnEnginePool): TurnEngineStore {
@@ -165,36 +205,8 @@ export function createPgTurnEngineStore(pool: TurnEnginePool): TurnEngineStore {
         return result.rows[0]
       })
     },
-    async appendEvent(input): Promise<{ id: string }> {
-      if (input.owner.kind === "task" && ["turn.completed", "turn.failed", "turn.interrupted"].includes(input.type)) throw conflict(`child root lifecycle ${input.type}`)
-      const client = await pool.connect(); let committed = false
-      try {
-        await client.query("BEGIN"); await client.query("SELECT set_config($1, $2, true)", ["app.user_id", input.owner.userId])
-        if (!await lockOwnedTurn(client, input.owner, true)) throw conflict(`turn ${input.owner.turnId}`)
-        if (input.itemId) await assertCurrentItemLineage(client, input.owner, input.itemId)
-        const existing = await client.query<Row>(`SELECT "id", "taskId", "turnId", "itemId", "type", "correlationId", "causationId", "payload"
-          FROM "agent_events" WHERE "sessionId" = $1 AND "idempotencyKey" = $2`, [input.owner.sessionId, input.idempotencyKey])
-        if (existing.rows[0]) {
-          const row = existing.rows[0]
-          if (row.taskId !== input.owner.taskId || row.turnId !== input.owner.turnId || row.itemId !== input.itemId || row.type !== input.type
-            || row.correlationId !== input.correlationId || row.causationId !== input.causationId || !sameJson(row.payload, input.payload)) throw conflict(`event ${input.idempotencyKey} identity`)
-          await client.query("COMMIT"); committed = true; return { id: String(row.id) }
-        }
-        if (input.itemId) {
-          const item = await client.query(`SELECT "id" FROM "agent_items" WHERE "id" = $1 AND "sessionId" = $2 AND "turnId" = $3 AND "taskId" = $4`, [input.itemId, input.owner.sessionId, input.owner.turnId, input.owner.taskId])
-          if (!item.rows[0]) throw conflict(`item ${input.itemId}`)
-        }
-        const sequence = await client.query<{ eventSequence: bigint | string }>(`UPDATE "agent_sessions" SET "eventSequence" = "eventSequence" + 1 WHERE "id" = $1 AND "userId" = $2 RETURNING "eventSequence"`, [input.owner.sessionId, input.owner.userId])
-        const next = sequence.rows[0]?.eventSequence
-        if (next === undefined) throw conflict(`session ${input.owner.sessionId}`)
-        const actor = input.owner.kind === "task" ? "subagent" : "orchestrator"
-        await client.query(`INSERT INTO "agent_events" ("id", "sessionId", "turnId", "itemId", "taskId", "sequence", "type", "actor", "correlationId", "causationId", "idempotencyKey", "payload")
-          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12::jsonb)`, [input.id, input.owner.sessionId, input.owner.turnId, input.itemId, input.owner.taskId, BigInt(next).toString(), input.type, actor, input.correlationId, input.causationId, input.idempotencyKey, json(input.payload)])
-        await client.query(`INSERT INTO "agent_outbox" ("id", "topic", "aggregateId", "idempotencyKey", "payload") VALUES ($1, 'agent.events', $2, $3, $4::jsonb)`, [`agent-outbox-${input.id}`, input.owner.sessionId, `agent-event:${input.id}`, json({ eventId: input.id, sessionId: input.owner.sessionId, turnId: input.owner.turnId, taskId: input.owner.taskId, itemId: input.itemId, sequence: BigInt(next).toString(), type: input.type, actor, correlationId: input.correlationId, causationId: input.causationId, idempotencyKey: input.idempotencyKey, payload: input.payload })])
-        await client.query("COMMIT"); committed = true; return { id: input.id }
-      } catch (error: unknown) { if (!committed) await client.query("ROLLBACK").catch(() => undefined); throw error }
-      finally { client.release() }
-    },
+    async appendEvent(input): Promise<{ id: string }> { return (await appendEventBatch(pool, [input]))[0]! },
+    async appendEvents(inputs): Promise<readonly { id: string }[]> { return appendEventBatch(pool, inputs) },
     async recordFinalResponse(input): Promise<void> {
       if (input.owner.kind !== "turn") throw conflict(`child final response ${input.owner.taskId}`)
       return tenantTransaction(pool, input.owner.userId, async (client: QueryClient) => {

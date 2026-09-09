@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest"
+import { describe, expect, it, vi } from "vitest"
 
 import type { ModelAdapter } from "@jobcopilot/agent-model"
 import type { RepositoryJsonValue } from "@jobcopilot/agent-protocol"
@@ -12,12 +12,13 @@ function identity(kind: TurnExecutionIdentity["kind"], taskId: string): TurnExec
   return { ...common, kind, attemptCount: 1 }
 }
 
-function options(owner: TurnExecutionIdentity, events: Array<{ id: string; type: string; itemId: string | null; identity: TurnExecutionIdentity }>): TurnExecutionOptions {
+function options(owner: TurnExecutionIdentity, events: Array<{ id: string; type: string; itemId: string | null; identity: TurnExecutionIdentity }>, appendEvents?: TurnExecutionStore["appendEvents"]): TurnExecutionOptions {
   const store: TurnExecutionStore = {
     startStep: async ({ ordinal }) => ({ id: "step-1", ordinal }), updateStep: async () => undefined,
     createItem: async ({ itemId }) => ({ id: itemId, revision: 0 }),
     updateItem: async ({ itemId, expectedRevision }) => ({ id: itemId, revision: expectedRevision + 1 }),
     appendEvent: async ({ id, type, itemId, identity }) => { events.push({ id, type, itemId, identity }); return { id } },
+    ...(appendEvents ? { appendEvents } : {}),
   }
   return {
     identity: owner, scope: { userId: "user-1" }, goal: "goal", snapshot: { system: [], profile: [], steerHistory: [], businessRefs: [], toolObservations: [] },
@@ -44,5 +45,35 @@ describe("TurnExecutionEventWriter", () => {
     await writer.append("turn.started", "turn-1", null, { goal: "child" } satisfies RepositoryJsonValue, "started")
     expect(events[0]).toMatchObject({ type: "task.started", itemId: null, identity: { taskId: "child-1" } })
     expect(events[0]?.id).toContain("task:child-1:event:started")
+  })
+
+  it("persists a plan observation batch before notifying subscribers and chains causation", async () => {
+    const events: Array<{ id: string; type: string; itemId: string | null; identity: TurnExecutionIdentity }> = []
+    const saved: Array<{ id: string; causationId: string | null }> = []
+    let committed = false
+    let subscriberSawCommit = false
+    const appendEvents: NonNullable<TurnExecutionStore["appendEvents"]> = vi.fn(async (inputs: Parameters<NonNullable<TurnExecutionStore["appendEvents"]>>[0]) => {
+      saved.push(...inputs.map(input => ({ id: input.id, causationId: input.causationId })))
+      committed = true
+      return inputs.map(input => ({ id: input.id }))
+    })
+    const base = options(identity("turn", "root-1"), events, appendEvents)
+    const writer = new TurnExecutionEventWriter({ ...base, subscribe: () => { subscriberSawCommit = committed } })
+    await expect(writer.appendBatch([
+      { type: "plan.observation", correlationId: "plan-1", itemId: null, payload: { marker: "a" }, key: "plan-1:a" },
+      { type: "plan.observation", correlationId: "plan-1", itemId: null, payload: { marker: "b" }, key: "plan-1:b" },
+    ])).resolves.toEqual(["turn:turn-1:event:plan-1:a", "turn:turn-1:event:plan-1:b"])
+    expect(appendEvents).toHaveBeenCalledOnce()
+    expect(saved.map(event => event.causationId)).toEqual([null, "turn:turn-1:event:plan-1:a"])
+    expect(subscriberSawCommit).toBe(true)
+  })
+
+  it("fails closed when the batch seam is absent or returns the wrong cardinality", async () => {
+    const events: Array<{ id: string; type: string; itemId: string | null; identity: TurnExecutionIdentity }> = []
+    const entry = { type: "plan.observation", correlationId: "plan-1", itemId: null, payload: { marker: "a" }, key: "plan-1:a" }
+    const missing = new TurnExecutionEventWriter(options(identity("turn", "root-1"), events))
+    await expect(missing.appendBatch([entry])).rejects.toThrow("plan_observation_batch_unavailable")
+    const mismatched = new TurnExecutionEventWriter(options(identity("turn", "root-1"), events, async () => []))
+    await expect(mismatched.appendBatch([entry])).rejects.toThrow("plan_observation_batch_result_mismatch")
   })
 })

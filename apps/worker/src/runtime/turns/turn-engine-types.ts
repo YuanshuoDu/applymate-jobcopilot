@@ -31,6 +31,17 @@ export type TurnEngineEvent = {
   readonly payload: RepositoryJsonValue
 }
 
+export type TurnEngineEventInput = {
+  readonly owner: ExecutionOwnerFence
+  readonly id: string
+  readonly itemId: string | null
+  readonly type: string
+  readonly correlationId: string
+  readonly causationId: string | null
+  readonly idempotencyKey: string
+  readonly payload: RepositoryJsonValue
+}
+
 export type TurnEngineToolCall = {
   readonly id: string
   readonly name: string
@@ -114,16 +125,8 @@ export type TurnEngineStore = {
     completedAt: Date | null
     now: Date
   }): Promise<TurnEngineItem>
-  appendEvent(input: {
-    owner: ExecutionOwnerFence
-    id: string
-    itemId: string | null
-    type: string
-    correlationId: string
-    causationId: string | null
-    idempotencyKey: string
-    payload: RepositoryJsonValue
-  }): Promise<{ id: string }>
+  appendEvent(input: TurnEngineEventInput): Promise<{ id: string }>
+  appendEvents?(inputs: readonly TurnEngineEventInput[]): Promise<readonly { id: string }[]>
   recordFinalResponse(input: { owner: TurnExecutionOwnerFence; response: string; now: Date }): Promise<void>
 }
 

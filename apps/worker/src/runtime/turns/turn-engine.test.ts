@@ -24,6 +24,7 @@ function profile() {
 
 function fakeStore() {
   const events: Array<{ id: string; type: string; causationId: string | null; itemId: string | null }> = []
+  const batches: string[][] = []
   const items: Array<{ id: string; type: string; phase: string | null; status: string; revision: number }> = []
   const steps: Array<{ id: string; status: string; errorCode: string | null }> = []
   const value: TurnEngineStore = {
@@ -32,9 +33,10 @@ function fakeStore() {
     createItem: async ({ itemId, type, phase, status }) => { items.push({ id: itemId, type, phase, status, revision: 0 }); return { id: itemId, revision: 0 } },
     updateItem: async ({ itemId, expectedRevision, status }) => { const item = items.find((entry) => entry.id === itemId)!; expect(item.revision).toBe(expectedRevision); item.revision += 1; item.status = status; return { id: itemId, revision: item.revision } },
     appendEvent: async ({ id, type, causationId, itemId }) => { events.push({ id, type, causationId, itemId }); return { id } },
+    appendEvents: async inputs => { batches.push(inputs.map(input => input.id)); for (const input of inputs) events.push({ id: input.id, type: input.type, causationId: input.causationId, itemId: input.itemId }); return inputs.map(input => ({ id: input.id })) },
     recordFinalResponse: vi.fn(async () => undefined),
   }
-  return { value, events, items, steps }
+  return { value, events, batches, items, steps }
 }
 
 function contextBuilder(seen: StepContextSnapshot[]) {
@@ -178,6 +180,7 @@ describe("TurnEngine", () => {
     })
     await expect(new TurnEngine(fixture.options).run()).resolves.toMatchObject({ status: "completed" })
     expect(executePlan).toHaveBeenCalledTimes(1)
+    expect(fixture.fake.batches[0]?.[0]).toContain("turn:turn-1:event:plan-observation:plan-call:plan-accepted")
   })
 
   it("fails closed when a replayed call id has different arguments", async () => {

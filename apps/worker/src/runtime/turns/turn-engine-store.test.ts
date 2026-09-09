@@ -65,6 +65,58 @@ describe("PostgreSQL TurnEngine store", () => {
     expect(calls.some((sql) => sql.includes("INSERT INTO \"agent_outbox\""))).toBe(true)
   })
 
+  it("writes a mixed existing/new event batch atomically and restores a missing outbox", async () => {
+    const calls: Array<{ sql: string; values?: readonly unknown[] }> = []
+    let eventLookups = 0
+    const client = { query: vi.fn(async (sql: string, values?: readonly unknown[]) => {
+      calls.push({ sql, values })
+      if (sql.includes('FROM "agent_events"')) {
+        eventLookups += 1
+        return eventLookups === 1
+          ? { rows: [{ id: "existing-event", taskId: owner.taskId, turnId: owner.turnId, itemId: null, type: "plan.observation", correlationId: "plan-1", causationId: null, sequence: 4n, actor: "orchestrator", payload: { marker: "a" } }] }
+          : { rows: [] }
+      }
+      if (sql.includes('SELECT turn."id"')) return { rows: [{ id: owner.turnId }] }
+      if (sql.includes('UPDATE "agent_sessions"')) return { rows: [{ eventSequence: 5n }] }
+      return { rows: [], rowCount: 1 }
+    }), release: vi.fn() }
+    const store = createPgTurnEngineStore({ connect: vi.fn(async () => client) } as unknown as Pick<pg.Pool, "connect">)
+    await expect(store.appendEvents?.([
+      { owner, id: "requested-existing", itemId: null, type: "plan.observation", correlationId: "plan-1", causationId: null, idempotencyKey: "plan-event-a", payload: { marker: "a" } },
+      { owner, id: "new-event", itemId: null, type: "plan.observation", correlationId: "plan-1", causationId: "requested-existing", idempotencyKey: "plan-event-b", payload: { marker: "b" } },
+    ])).resolves.toEqual([{ id: "existing-event" }, { id: "new-event" }])
+    expect(calls.filter(call => call.sql === "BEGIN")).toHaveLength(1)
+    expect(calls.filter(call => call.sql === "COMMIT")).toHaveLength(1)
+    expect(calls.some(call => call.sql === "ROLLBACK")).toBe(false)
+    expect(calls.filter(call => call.sql.includes('INSERT INTO "agent_events"'))).toHaveLength(1)
+    expect(calls.filter(call => call.sql.includes('INSERT INTO "agent_outbox"'))).toHaveLength(2)
+    const newEventInsert = calls.filter(call => call.sql.includes('INSERT INTO "agent_events"'))[0]
+    expect(newEventInsert?.values).toContain("new-event")
+    expect(newEventInsert?.values).toContain("existing-event")
+    const outboxInserts = calls.filter(call => call.sql.includes('INSERT INTO "agent_outbox"'))
+    expect(outboxInserts[0]?.sql).toContain('ON CONFLICT ("idempotencyKey") DO NOTHING')
+    expect(outboxInserts[1]?.sql).not.toContain("ON CONFLICT")
+  })
+
+  it("rolls back the entire batch when a later event insert fails", async () => {
+    const calls: string[] = []
+    let eventInserts = 0
+    const client = { query: vi.fn(async (sql: string) => {
+      calls.push(sql)
+      if (sql.includes('INSERT INTO "agent_events"')) { eventInserts += 1; if (eventInserts === 2) throw new Error("batch insert failed") }
+      if (sql.includes('SELECT turn."id"')) return { rows: [{ id: owner.turnId }] }
+      if (sql.includes('UPDATE "agent_sessions"')) return { rows: [{ eventSequence: 1n }] }
+      if (sql.includes('FROM "agent_events"')) return { rows: [] }
+      return { rows: [], rowCount: 1 }
+    }), release: vi.fn() }
+    const store = createPgTurnEngineStore({ connect: vi.fn(async () => client) } as unknown as Pick<pg.Pool, "connect">)
+    const input = (id: string, causationId: string | null) => ({ owner, id, itemId: null, type: "plan.observation", correlationId: "plan-rollback", causationId, idempotencyKey: `rollback:${id}`, payload: { id } })
+    await expect(store.appendEvents!([input("event-a", null), input("event-b", "event-a")])).rejects.toThrow("batch insert failed")
+    expect(calls.filter(sql => sql === "BEGIN")).toHaveLength(1)
+    expect(calls.filter(sql => sql === "COMMIT")).toHaveLength(0)
+    expect(calls.filter(sql => sql === "ROLLBACK")).toHaveLength(1)
+  })
+
   it("transitions only the leased in-progress Turn to waiting_for_user", async () => {
     const client = { query: vi.fn(async () => ({ rows: [], rowCount: 1 })), release: vi.fn() }
     const store = createPgTurnEngineStore({ connect: vi.fn(async () => client) } as unknown as Pick<pg.Pool, "connect">)
