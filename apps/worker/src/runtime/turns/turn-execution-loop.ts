@@ -1,4 +1,5 @@
 import type { ModelContinuation } from "@jobcopilot/agent-model"
+import { Buffer } from "node:buffer"
 
 import { signalWasInterrupted } from "../interrupt/registry.js"
 import { BudgetExceededError, createTurnBudgetLedger, type TurnBudgetLimits } from "../budget.js"
@@ -8,12 +9,13 @@ import { snapshotEvidence, verifyCandidateFinal } from "../verifier.js"
 import { buildModelRequest } from "./turn-engine-messages.js"
 import { runModelStep, type ModelStepResult } from "./turn-engine-model.js"
 import { findToolObservation, stableJson } from "./turn-engine-replay.js"
-import { TurnEngineError, toRepositoryJson, type TurnEngineResult, type TurnEngineStep, type TurnEngineToolCall } from "./turn-engine-types.js"
+import { TurnEngineError, toRepositoryJson, type TurnEngineResult, type TurnEngineStep, type TurnEngineToolCall, type TurnEngineToolResult } from "./turn-engine-types.js"
 import { executeToolWithItems, publishCommentary, publishFinalResponse, publishReasoningSummary, TurnExecutionEventWriter } from "./turn-execution-events.js"
 import type { TurnExecutionOptions } from "./turn-execution-types.js"
 import { assertExecutionAlive, assertModelAllowance, canEmitTurnCompleted, canPersistFinalResponse, makeExecutionId, resumedBudgetLimits, totalTurnUsage, turnErrorCode, updateExecutionStep } from "./turn-engine-helpers.js"
 
 const DEFAULT_MAX_STEPS = 32
+const PLAN_OBSERVATION_MAX_BYTES = 8 * 1024
 
 export async function runTurnExecutionLoop(options: TurnExecutionOptions): Promise<TurnEngineResult> {
   const signal = options.signal ?? new AbortController().signal
@@ -213,6 +215,7 @@ async function executeTools(
   now: () => Date,
 ): Promise<{ wait: TurnEngineResult | null; snapshot: typeof options.snapshot }> {
   let snapshot = initial
+  const completedToolResults: TurnEngineToolResult[] = []
   for (const call of output.toolCalls) {
     assertExecutionAlive(options, signal)
     if (seen.has(call.id)) {
@@ -241,12 +244,71 @@ async function executeTools(
         content: toRepositoryJson({ toolCallId: call.id, toolName: call.name, input: call.arguments, status: result.status, output: result.output ?? null, errorCode: result.errorCode }),
       }],
     }
+    if (result.status === "completed") {
+      completedToolResults.push(result)
+      if (call.name === "agent.plan.propose" && options.executePlan) {
+        const plan = await executePlanHook(options, step, call, result, completedToolResults, snapshot, signal)
+        if (plan.observations.length > 0) snapshot = { ...snapshot, toolObservations: [...snapshot.toolObservations, ...plan.observations] }
+        if (plan.wait) return { wait: plan.wait, snapshot }
+      }
+    }
     const dependencyWait = result.status === "completed" ? dependencyWaitReceipt(result.output) : null
     if (dependencyWait) {
       return { wait: { status: "waiting_for_dependency", waitId: dependencyWait.waitId, stepCount: 0, toolCallCount: 0 }, snapshot }
     }
   }
   return { wait: null, snapshot }
+}
+
+type PlanHookResult = {
+  readonly observations: readonly { readonly id: string; readonly content: ReturnType<typeof toRepositoryJson> }[]
+  readonly wait: TurnEngineResult | null
+}
+
+async function executePlanHook(
+  options: TurnExecutionOptions,
+  step: TurnEngineStep,
+  call: TurnEngineToolCall,
+  result: TurnEngineToolResult,
+  completedToolResults: readonly TurnEngineToolResult[],
+  snapshot: typeof options.snapshot,
+  signal: AbortSignal,
+): Promise<PlanHookResult> {
+  let value: Awaited<ReturnType<NonNullable<TurnExecutionOptions["executePlan"]>>>
+  try {
+    value = await options.executePlan!({
+      identity: options.identity, scope: options.scope, sessionId: options.identity.sessionId, turnId: options.identity.turnId,
+      stepId: step.id, signal, call, result, completedToolResults: [...completedToolResults], snapshot,
+    })
+  } catch {
+    throw new TurnEngineError("invalid_output", "Plan execution hook failed")
+  }
+  if (!value || typeof value !== "object" || Array.isArray(value) || !Array.isArray(value.observations) || value.observations.length > 8) throw new TurnEngineError("invalid_output", "Plan execution hook returned invalid observations")
+  const usedIds = new Set(snapshot.toolObservations.map(observation => observation.id))
+  usedIds.add(`tool-result:${call.id}`)
+  const observations: Array<{ readonly id: string; readonly content: ReturnType<typeof toRepositoryJson> }> = []
+  for (const observation of value.observations) {
+    if (!observation || typeof observation !== "object" || Array.isArray(observation) || typeof observation.id !== "string" || observation.id.trim().length === 0 || observation.id.length > 256 || usedIds.has(observation.id)) throw new TurnEngineError("invalid_output", "Plan execution hook returned an invalid observation id")
+    const id = observation.id.trim()
+    if (usedIds.has(id)) throw new TurnEngineError("invalid_output", "Plan execution hook returned a duplicate observation id")
+    let content: ReturnType<typeof toRepositoryJson>
+    try {
+      content = toRepositoryJson(observation.content)
+      const serialized = JSON.stringify(content)
+      if (serialized === undefined || Buffer.byteLength(serialized, "utf8") > PLAN_OBSERVATION_MAX_BYTES) throw new Error("observation_too_large")
+    } catch { throw new TurnEngineError("invalid_output", "Plan execution hook returned invalid observation content") }
+    usedIds.add(id)
+    observations.push({ id, content })
+  }
+  let wait: TurnEngineResult | null = null
+  if (value.wait !== undefined) {
+    if (!value.wait || typeof value.wait !== "object" || Array.isArray(value.wait) || !["waiting_for_dependency", "waiting_for_approval", "waiting_for_user"].includes(value.wait.status)) throw new TurnEngineError("invalid_output", "Plan execution hook returned an invalid wait")
+    if (value.wait.waitId !== undefined && (typeof value.wait.waitId !== "string" || value.wait.waitId.trim().length === 0 || value.wait.waitId.length > 256)) throw new TurnEngineError("invalid_output", "Plan execution hook returned an invalid wait id")
+    if (value.wait.status === "waiting_for_dependency" && (typeof value.wait.waitId !== "string" || value.wait.waitId.trim().length === 0)) throw new TurnEngineError("invalid_output", "Dependency waits require a wait id")
+    if (value.wait.errorCode !== undefined && (typeof value.wait.errorCode !== "string" || value.wait.errorCode.trim().length === 0 || value.wait.errorCode.length > 256)) throw new TurnEngineError("invalid_output", "Plan execution hook returned an invalid wait code")
+    wait = { status: value.wait.status, stepCount: 0, toolCallCount: 0, ...(value.wait.waitId ? { waitId: value.wait.waitId } : {}), ...(value.wait.errorCode ? { errorCode: value.wait.errorCode } : {}) }
+  }
+  return { observations, wait }
 }
 
 type DependencyWaitReceipt = { readonly waitId: string; readonly deadlineAt: string; readonly matchedTaskIds: readonly string[] }

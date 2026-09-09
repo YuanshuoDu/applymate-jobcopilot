@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest"
+import { describe, expect, it, vi } from "vitest"
 
 import type { HarnessModelRequest, ModelAdapter, ModelStreamEvent } from "@jobcopilot/agent-model"
 import type { StepContext } from "../context/step-context-builder.js"
@@ -21,7 +21,7 @@ function identity(kind: TurnExecutionIdentity["kind"], taskId: string, attemptCo
 
 type Fixture = { options: TurnExecutionOptions; events: Array<{ id: string; type: string; itemId: string | null; taskId: string }>; items: TurnEngineItem[]; finalResponses: string[]; stepTasks: string[]; stepAttempts: number[]; stepStatuses: string[]; requests: HarnessModelRequest[] }
 
-function fixture(owner: TurnExecutionIdentity, toolResult?: TurnEngineToolResult): Fixture {
+function fixture(owner: TurnExecutionIdentity, toolResult?: TurnEngineToolResult, planHook?: NonNullable<TurnExecutionOptions["executePlan"]>, initialToolObservations: Array<{ id: string; content: unknown }> = []): Fixture {
   const events: Fixture["events"] = []
   const items: TurnEngineItem[] = []
   const finalResponses: string[] = []
@@ -39,13 +39,14 @@ function fixture(owner: TurnExecutionIdentity, toolResult?: TurnEngineToolResult
     recordFinalResponse: async ({ identity, response }) => { finalResponses.push(`${identity.taskId}:${response}`) },
   }
   let calls = 0
+  const planInput = { proposal: { schemaVersion: "agent-harness.plan.v1" } }
   const model: ModelAdapter = {
     id: "fixture-model", profile,
     async *stream(request: HarnessModelRequest): AsyncGenerator<ModelStreamEvent> {
       requests.push(request)
       calls += 1
       if (calls === 1) {
-        yield { type: "tool_call_completed", callId: `call:${owner.taskId}`, name: "jobs.search", arguments: { location: "Dublin" } }
+        yield { type: "tool_call_completed", callId: `call:${owner.taskId}`, name: planHook ? "agent.plan.propose" : "jobs.search", arguments: planHook ? planInput : { location: "Dublin" } }
         yield { type: "completed", finishReason: "tool_calls" }
       } else {
         yield { type: "text_delta", text: `done:${owner.taskId}` }
@@ -65,10 +66,11 @@ function fixture(owner: TurnExecutionIdentity, toolResult?: TurnEngineToolResult
     }),
   }
   const options: TurnExecutionOptions = {
-    identity: owner, scope: { userId: "user-1" }, goal: "find jobs", snapshot: { system: [], profile: [], steerHistory: [], businessRefs: [], toolObservations: [] },
+    identity: owner, scope: { userId: "user-1" }, goal: "find jobs", snapshot: { system: [], profile: [], steerHistory: [], businessRefs: [], toolObservations: initialToolObservations },
     contextBuilder, store, model, tools: [{ name: "jobs.search", version: "1" }], executeTool: async ({ call }) => toolResult ?? ({ id: call.id, toolName: call.toolName, toolVersion: call.toolVersion, status: "completed", output: { job: "job-1" }, errorCode: null }),
     idFactory: prefix => prefix,
     subscribe: event => { events.push({ id: event.id, type: event.type, itemId: event.itemId, taskId: owner.taskId }) },
+    ...(planHook ? { executePlan: planHook } : {}),
   }
   return { options, events, items, finalResponses, stepTasks, stepAttempts, stepStatuses, requests }
 }
@@ -124,5 +126,57 @@ describe("owner-agnostic turn execution loop", () => {
     expect(result.status).toBe("completed")
     expect(root.requests).toHaveLength(2)
     expect(root.stepStatuses).toEqual(["completed", "completed"])
+  })
+
+  it("passes owner context and completed results to the plan hook, then resumes with its observations", async () => {
+    const hook = vi.fn(async (input: NonNullable<TurnExecutionOptions["executePlan"]> extends (input: infer T) => unknown ? T : never) => ({
+      observations: [{ id: "plan-observation", content: { marker: "hook-result" } }],
+    }))
+    const root = fixture(identity("turn", "root-1"), undefined, hook)
+    const result = await runTurnExecutionLoop(root.options)
+    expect(result).toMatchObject({ status: "completed", stepCount: 2, toolCallCount: 1 })
+    expect(hook).toHaveBeenCalledWith(expect.objectContaining({
+      identity: expect.objectContaining({ kind: "turn", taskId: "root-1", ownerId: "worker-1" }),
+      scope: { userId: "user-1" }, sessionId: "session-1", turnId: "turn-1", stepId: expect.any(String), signal: expect.any(Object),
+      call: expect.objectContaining({ name: "agent.plan.propose" }),
+      result: expect.objectContaining({ status: "completed" }), completedToolResults: [expect.objectContaining({ status: "completed" })],
+    }))
+    expect(JSON.stringify(root.requests[1]?.messages)).toContain("hook-result")
+  })
+
+  it("maps an explicit plan wait to the existing turn wait result without another model call", async () => {
+    const hook: NonNullable<TurnExecutionOptions["executePlan"]> = async () => ({
+      observations: [{ id: "plan-wait-observation", content: "child still running" }],
+      wait: { status: "waiting_for_dependency", waitId: "wait-plan-1", errorCode: "child_pending" },
+    })
+    const child = fixture(identity("task", "child-plan", 2), undefined, hook)
+    const result = await runTurnExecutionLoop(child.options)
+    expect(result).toMatchObject({ status: "waiting_for_dependency", waitId: "wait-plan-1", stepCount: 1, toolCallCount: 1, errorCode: "child_pending" })
+    expect(child.requests).toHaveLength(1)
+    expect(child.stepStatuses).toContain("waiting_for_tool")
+  })
+
+  it("does not repeat the plan hook for a replayed proposal call", async () => {
+    const hook = vi.fn(async () => ({ observations: [{ id: "should-not-appear", content: "replayed" }] }))
+    const persisted = [{ id: "tool-result:call:root-1", content: { toolCallId: "call:root-1", toolName: "agent.plan.propose", input: { proposal: { schemaVersion: "agent-harness.plan.v1" } }, status: "completed", output: { job: "job-1" }, errorCode: null } }]
+    const root = fixture(identity("turn", "root-1"), undefined, hook, persisted)
+    const result = await runTurnExecutionLoop(root.options)
+    expect(result.status).toBe("completed")
+    expect(root.requests).toHaveLength(2)
+    expect(hook).not.toHaveBeenCalled()
+  })
+
+  it.each([
+    { label: "duplicate existing id", observations: [{ id: "tool-result:call:root-1", content: "duplicate" }] },
+    { label: "duplicate ids", observations: [{ id: "same", content: "one" }, { id: "same", content: "two" }] },
+    { label: "too many observations", observations: Array.from({ length: 9 }, (_, index) => ({ id: `observation-${index}`, content: index })) },
+    { label: "oversized content", observations: [{ id: "large-content", content: "x".repeat(8 * 1024 + 1) }] },
+    { label: "non JSON content", observations: [{ id: "bad-content", content: BigInt(1) }] },
+  ])("fails closed for $label from the plan hook", async ({ observations }) => {
+    const hook: NonNullable<TurnExecutionOptions["executePlan"]> = async () => ({ observations })
+    const root = fixture(identity("turn", "root-1"), undefined, hook)
+    const result = await runTurnExecutionLoop(root.options)
+    expect(result).toMatchObject({ status: "failed", errorCode: "invalid_output" })
+    expect(root.requests).toHaveLength(1)
   })
 })
