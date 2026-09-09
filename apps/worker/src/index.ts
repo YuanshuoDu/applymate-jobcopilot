@@ -21,6 +21,7 @@ async function main() {
     canonicalRuntimeModule,
     aiUsageBridgeModule,
     productionBootstrapModule,
+    productionChildRuntimeModule,
   ] = await Promise.all([
     import("./db/apply-results.js"),
     import("./queue/apply-queue.js"),
@@ -32,6 +33,7 @@ async function main() {
     import("./runtime/canonical-turn-runtime.js"),
     import("./queue/ai-usage-bridge.js"),
     import("./queue/production-bootstrap.js"),
+    import("./runtime/subagents/production-child-runtime.js"),
   ]);
   const { ensureApplyResultsTable, closePool, getPool } = applyResultsModule;
   const { applyWorker, applyQueue, connection } = applyQueueModule;
@@ -73,9 +75,16 @@ async function main() {
     workerId: process.env.WORKER_ID ?? `worker-${process.pid}`,
     authorizeUsage: aiUsageBridgeModule.createWorkerUsageAuthorizer(),
   });
+  // Child execution is opt-in. Keep tree-budget and child queue construction
+  // out of the default startup path until the explicit feature flag is set.
+  const childExecutor = productionChildRuntimeModule.createOptionalProductionChildExecutor({
+    enabled: productionChildRuntimeModule.childExecutionEnabled(),
+    pool: getPool(),
+  });
   const canonicalBootstrap = await productionBootstrapModule.createProductionWorkerBootstrap({
     pool: getPool(),
     runtime: canonicalRuntime,
+    ...(childExecutor ? { subagents: { execute: childExecutor } } : {}),
   });
   console.log("[worker] Canonical Turn consumer and recovery scanner started");
 

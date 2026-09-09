@@ -14,8 +14,11 @@ import { createUsageAwareModelAdapter, type UsageAwareModelOptions } from "../tu
 import type { TreeBudgetReservationStore } from "./tree-budget-types.js"
 import type { RuntimeToolDefinition, ToolRouterContext, ToolExecutionResult, ToolCallRequest } from "../tools/types.js"
 
+/** Public metadata keeps the runtime's readonly tool contracts without exposing execution functions to the model. */
+export type ChildPublicDefinition = Omit<RuntimeToolDefinition, "execute">
+
 export type ChildToolRuntime = {
-  readonly definitions: readonly RuntimeToolDefinition[]
+  readonly definitions: readonly ChildPublicDefinition[]
   readonly router: { execute(context: ToolRouterContext, request: ToolCallRequest): Promise<ToolExecutionResult> }
   readonly validateArguments?: (name: string, input: unknown, version?: string) => true | string
 }
@@ -25,7 +28,7 @@ export type ChildExecutorOptions = {
   readonly treeBudget: TreeBudgetReservationStore
   readonly authorizeUsage: UsageAwareModelOptions["authorize"]
   readonly modelRuntimeFactory?: (input: { task: SubagentTaskRecord }) => Promise<ModelAdapter> | ModelAdapter
-  readonly toolRuntimeFactory: (input: { task: SubagentTaskRecord; owner: ReturnType<typeof executionOwnerFence> }) => ChildToolRuntime
+  readonly toolRuntimeFactory: (input: { task: SubagentTaskRecord; lease: SubagentLease; owner: ReturnType<typeof executionOwnerFence> }) => ChildToolRuntime
   readonly now?: () => Date
 }
 
@@ -46,14 +49,22 @@ async function defaultModel(task: SubagentTaskRecord): Promise<ModelAdapter> {
   return (await createHarnessModelRuntime({ primary: config, fallbacks: [], allowEnvironmentFallbacks: false })).adapter
 }
 
-function visibleDefinitions(task: SubagentTaskRecord, definitions: readonly RuntimeToolDefinition[]): RuntimeToolDefinition[] {
+function visibleDefinitions(task: SubagentTaskRecord, definitions: readonly ChildPublicDefinition[]): ChildPublicDefinition[] {
   const policy = getSubagentRolePolicy(task.role)
   if (!policy) throw new Error("subagent_role_unknown")
   const allowedActions = new Set(Array.isArray(task.allowedActions) ? task.allowedActions.filter((action): action is string => typeof action === "string") : [])
-  return definitions.filter(definition => allowedActions.has(definition.name)
-    && definition.domain !== "coordination"
-    && !/^(spawn_subagent|send_message|wait_subagents|list_subagents|interrupt_subagent|close_subagent)$/.test(definition.name)
-    && visibleToolPolicy(task.role, definition).visible)
+  return definitions.filter(definition => {
+    if (!allowedActions.has(definition.name)) return false
+    if (definition.name === "tool_results.read") {
+      return definition.risk === "read"
+        && definition.idempotency === "read_only"
+        && definition.capabilities.includes("read")
+        && policy.allowedRisks.includes("read")
+        && definition.requiredCapabilities.every(capability => policy.capabilities.includes(capability))
+    }
+    if (definition.domain === "coordination") return false
+    return visibleToolPolicy(task.role, definition).visible
+  })
 }
 
 function resultStatus(status: "completed" | "waiting_for_dependency" | "waiting_for_approval" | "waiting_for_user" | "interrupted" | "failed"): SubagentExecutionResult["status"] {
@@ -64,17 +75,12 @@ function resultStatus(status: "completed" | "waiting_for_dependency" | "waiting_
   return "failed"
 }
 
-function publicDefinition(definition: RuntimeToolDefinition): Omit<RuntimeToolDefinition, "execute"> {
-  const { execute: _execute, ...publicMetadata } = definition
-  return publicMetadata
-}
-
 export function createChildExecutor(options: ChildExecutorOptions): (input: { lease: SubagentLease }) => Promise<SubagentExecutionResult> {
   if (!options.treeBudget) throw new TypeError("treeBudget is required for child execution")
   return async ({ lease }) => {
     if (!lease.turnId) return { status: "failed", failureReason: "child_turn_missing" }
     const owner = executionOwnerFence({ kind: "task", lease })
-    const runtime = options.toolRuntimeFactory({ task: lease, owner })
+    const runtime = options.toolRuntimeFactory({ task: lease, owner, lease })
     const definitions = visibleDefinitions(lease, runtime.definitions)
     const policy = getSubagentRolePolicy(lease.role)
     if (!policy) return { status: "failed", failureReason: "subagent_role_unknown" }
@@ -82,7 +88,7 @@ export function createChildExecutor(options: ChildExecutorOptions): (input: { le
     const model = createUsageAwareModelAdapter(adapter, { owner, authorize: options.authorizeUsage, treeBudget: options.treeBudget })
     const result = await runTurnExecutionLoop({
       identity: owner, scope: { userId: lease.userId }, goal: lease.goal, snapshot: childContextSnapshot(lease),
-      contextBuilder: createChildContextBuilder(lease), store: options.store, model, tools: definitions.map(publicDefinition),
+      contextBuilder: createChildContextBuilder(lease), store: options.store, model, tools: definitions,
       executeTool: createToolRouterExecutor(runtime.router), actorRole: policy.actorRole, capabilities: policy.capabilities,
       validateToolArguments: runtime.validateArguments, signal: lease.signal, now: options.now, publishReasoningSummary: false,
       // A retry is a new durable attempt. Keep IDs deterministic within that

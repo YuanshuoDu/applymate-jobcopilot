@@ -123,7 +123,7 @@ function modelErrorCode(error: unknown): string {
 }
 
 /** Persists lifecycle receipts even when TurnEngine's own item stream is incomplete. */
-function durableLifecycleSink(store: TurnEngineStore, owner: ExecutionOwnerFence): ToolLifecycleSink {
+export function durableLifecycleSink(store: TurnEngineStore, owner: ExecutionOwnerFence): ToolLifecycleSink {
   return {
     async append(event: ToolLifecycleEvent): Promise<void> {
       const digest = createHash("sha256").update(JSON.stringify(event.payload)).digest("hex").slice(0, 24)

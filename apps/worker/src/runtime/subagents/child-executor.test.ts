@@ -98,6 +98,23 @@ describe("child executor composition", () => {
     expect(budget.statuses).toEqual(["released"])
   })
 
+  it("exposes only the private result reader from the coordination domain", async () => {
+    const child = { ...lease(), allowedActions: ["tool_results.read", "spawn_subagent", "wait_subagents"] }
+    const requests: HarnessModelRequest[] = []
+    const model: ModelAdapter = {
+      id: "fixture-model", profile,
+      async *stream(request) { requests.push(request); yield { type: "text_delta", text: "summary" }; yield { type: "completed", finishReason: "stop" } },
+    }
+    const executor = createChildExecutor({
+      store: executionStore([], requests), treeBudget: budgetStore().store, authorizeUsage: async () => ({ settle: async () => undefined }),
+      modelRuntimeFactory: () => model,
+      toolRuntimeFactory: () => ({ definitions: [tool("tool_results.read", "coordination"), tool("spawn_subagent", "coordination"), tool("wait_subagents", "coordination")], router: { execute: async (_context, request) => ({ ...request, status: "completed", errorCode: null }) } }),
+    })
+
+    await executor({ lease: child })
+    expect(requests[0]?.tools.map(tool => (tool as { name: string }).name)).toEqual(["tool_results.read"])
+  })
+
   it("keeps a reserved tree step when settlement is unknown", async () => {
     const budget = budgetStore(true)
     const model: ModelAdapter = { id: "fixture-model", profile, async *stream() { yield { type: "completed", finishReason: "stop" } } }
