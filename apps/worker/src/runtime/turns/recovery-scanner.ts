@@ -162,10 +162,37 @@ export async function dispatchPendingTurnOutbox(
       await markDispatchError(pool, row.id, "schema_invalid_payload", true)
       continue
     }
-    await queue.add("turn", payload, { jobId: turnJobId(payload.turnId, row.attemptCount ?? 0), attempts: 5 })
+    try {
+      await queue.add("turn", payload, { jobId: turnJobId(payload.turnId, row.attemptCount ?? 0), attempts: 5 })
+    } catch (error: unknown) {
+      await markDispatchError(pool, row.id, "queue_add_failed")
+      throw error
+    }
+    try {
+      await markDispatchPublished(pool, row.id)
+    } catch (error: unknown) {
+      // The BullMQ job may already exist. Keep the row unpublished and reuse
+      // the same generation/job ID on the next scan instead of inventing a new
+      // delivery attempt for an uncertain enqueue.
+      throw new Error("turn_dispatch_delivery_uncertain", { cause: error })
+    }
     dispatched += 1
   }
   return dispatched
+}
+
+async function markDispatchPublished(pool: LeasePool, outboxId: string): Promise<void> {
+  const client = await pool.connect()
+  try {
+    await client.query(
+      `UPDATE "agent_outbox"
+       SET "publishedAt" = CURRENT_TIMESTAMP, "attemptCount" = "attemptCount" + 1, "lastError" = NULL
+       WHERE "id" = $1 AND "publishedAt" IS NULL`,
+      [outboxId],
+    )
+  } finally {
+    client.release()
+  }
 }
 
 async function markDispatchError(pool: LeasePool, outboxId: string, code: string, terminal = false): Promise<void> {
