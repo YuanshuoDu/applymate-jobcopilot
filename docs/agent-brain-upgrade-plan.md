@@ -218,6 +218,12 @@ P2-OUTBOX-1 提交 `57dd0ac9`（2026-09-09）已推送到当前分支：canonica
 
 Astra 独立复核为 2 个文件、16/16 tests；Worker TypeScript、shared build 和 `git diff --check` 均通过。没有 DB schema、provider 或 Web 变更；真实 Redis/PostgreSQL、跨进程恢复和 exactly-once 仍未验证。总体完整验收保持 **1/8（12.5%）**。
 
+## P2-COMPLETION-1 update
+
+P2-COMPLETION-1 提交 `2c27010c`（2026-09-09）已推送到当前分支：root Turn 在完成 final verification 后、写入 final response 或 `turn.completed` 前执行 server-owned completionGate。若同树存在未终态 child，gate 写入 `final.rejected` 与 `business_precondition_failed`，不产生成功完成；gate 返回非法结果或抛错时 fail closed。
+
+`RootTaskStore.checkCompletion` 在租户事务中锁定并校验当前 root Turn 的 owner/session/user/root fence，再查询同 session/turn/root 的 descendant；terminal 状态 completed/failed/interrupted/cancelled/closed 允许完成，queued/running/waiting/未知状态阻止完成，反馈最多 8 个 task ID。canonical runtime 与旧 agent-run executor 均接入该 gate。Astra 独立复核为 3 个文件、42/42 tests；Worker TypeScript 和 `git diff --check` 均通过。真实 PostgreSQL 并发、跨进程恢复和 exactly-once 仍未验证，留待最终统一验收。总体完整验收保持 **1/8（12.5%）**。
+
 ### 4.2 用户可观察的交付节点
 
 八个工程阶段按依赖实施；每次演示同时回答“它现在能替用户完成什么”。下列节点不增加阶段数量，也不表示相关能力已经实现。
