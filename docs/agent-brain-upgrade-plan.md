@@ -206,6 +206,12 @@ P3-12 提交 `33d4bcdd`（2026-09-09）已推送到当前分支：新增 server-
 
 Root 独立复核记录为 9 个文件、69/69 tests；agent-protocol event checks 2/2，agent-protocol build、shared build、Worker TypeScript 和 `git diff --check` 均通过。此切片没有数据库、schema、provider 或 queue 变更；真实 PostgreSQL/RLS、migration、provider、queue、进程重启和 child-parent E2E 仍未验证。总体完整验收保持 **1/8（12.5%）**，P3-12 不计作阶段完成。
 
+## P3-13 update
+
+P3-13 提交 `46a19c38`（2026-09-09）已推送到当前分支：canonical state 在 owner-fenced turn.input 范围内 hydrate 结构化 GoalContract，同时保留兼容的 goal 文本。旧 `{goal}` 输入生成 revision=1、空约束数组和 server-owned `budgetRef=runtime:turn`；结构化 contract 经过 `normalizeGoalContract`，objective 必须匹配 canonical goal，只接受 revision 1，budgetRef 必须是 server-owned `runtime:turn`，非法输入 fail closed，不静默回退文本。planner 现在使用 constraints、successCriteria、knownFacts、unresolvedQuestions 和 approvalBoundaries；实际硬预算仍由 server-owned `budgetSnapshot` 提供。
+
+Astra 独立复核为 3 个文件、29/29 tests；Worker TypeScript、shared build 和 `git diff --check` 均通过。没有数据库、provider、queue、migration 或 Web 变更；当前还没有 goal-update event，只接受 revision 1，真实 PostgreSQL/RLS、provider、queue、进程重启和 child-parent E2E 仍未验证。总体完整验收保持 **1/8（12.5%）**，P3-13 不计作阶段完成。
+
 ### 4.2 用户可观察的交付节点
 
 八个工程阶段按依赖实施；每次演示同时回答“它现在能替用户完成什么”。下列节点不增加阶段数量，也不表示相关能力已经实现。
