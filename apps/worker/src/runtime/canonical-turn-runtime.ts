@@ -12,6 +12,8 @@ import { createWorkerToolRuntime, type ToolLifecycleEvent, type ToolLifecycleSin
 import { createPgTurnEngineStore } from "./turns/turn-engine-store.js"
 import { createToolRouterExecutor } from "./turns/turn-engine-helpers.js"
 import { TurnEngine } from "./turns/turn-engine.js"
+import { PgCoordinationStore } from "./mailbox/store.js"
+import { createPgDurableWaitPort } from "./subagents/durable-wait-store.js"
 import type { TurnBudgetLimits } from "./budget.js"
 import type { TurnExecutor, TurnExecutionResult } from "./turns/turn-queue.js"
 import type { TurnLease } from "./turns/lease.js"
@@ -29,6 +31,8 @@ export type UsageAuthorization = {
 export type CanonicalTurnRuntimeOptions = {
   readonly workerId: string
   readonly consumeWaitOutcomes?: boolean
+  /** Server-derived production gate; user policy cannot enable coordination. */
+  readonly coordinationEnabled?: boolean
   readonly stateLoader?: (pool: Pick<pg.Pool, "connect">, lease: TurnLease, now?: Date) => Promise<CanonicalTurnState>
   readonly modelRuntimeFactory?: (input: { userId: string; config?: AiConfig; state: CanonicalTurnState }) => Promise<HarnessModelRuntime> | HarnessModelRuntime
   readonly authorizeUsage?: (input: { userId: string; sessionId: string; turnId: string; stepId: string; leaseOwnerId: string; leaseVersion: number; featureKey: string; provider: string; model: string }) => Promise<UsageAuthorization> | UsageAuthorization
@@ -160,7 +164,10 @@ export async function createCanonicalTurnRuntime(pool: pg.Pool, options: Canonic
       ? await options.stateLoader(pool, lease, now())
       : await loadCanonicalTurnState(pool, lease, now(), { consumeWaitOutcomes: options.consumeWaitOutcomes === true })
     const selectedPolicy = policy(state.toolPolicySnapshot)
-    const toolCapabilities = capabilities(state.toolPolicySnapshot)
+    const configuredCapabilities = capabilities(state.toolPolicySnapshot)
+    const toolCapabilities = options.coordinationEnabled
+      ? [...new Set([...configuredCapabilities, "canManageChildren"])]
+      : configuredCapabilities.filter(capability => capability !== "canManageChildren")
     const turnStore = options.turnEngineStoreFactory?.(pool) ?? createPgTurnEngineStore(pool)
     let lifecycleSink: ToolLifecycleSink | null = null
     let lifecycleOwner: ExecutionOwner | null = null
@@ -172,7 +179,12 @@ export async function createCanonicalTurnRuntime(pool: pg.Pool, options: Canonic
       if (!lifecycleOwner) throw new Error("tool_result_owner_unavailable")
       return lifecycleOwner
     }
-    const toolRuntime = options.toolRuntimeFactory?.({ pool, policy: selectedPolicy, manager, state }) ?? createWorkerToolRuntime(pool, { sink: sinkProxy, resolveOwner }, selectedPolicy, { manager })
+    const coordination = options.coordinationEnabled ? {
+      manager,
+      store: new PgCoordinationStore(pool),
+      wait: createPgDurableWaitPort(pool),
+    } : undefined
+    const toolRuntime = options.toolRuntimeFactory?.({ pool, policy: selectedPolicy, manager, state }) ?? createWorkerToolRuntime(pool, { sink: sinkProxy, resolveOwner }, selectedPolicy, coordination)
     const allowedActions = toolRuntime.registry.list(toolCapabilities).flatMap((definition) => {
       const name = definition && typeof definition === "object" && "name" in definition ? (definition as { name?: unknown }).name : undefined
       return typeof name === "string" ? [name] : []
@@ -189,7 +201,7 @@ export async function createCanonicalTurnRuntime(pool: pg.Pool, options: Canonic
     const contextBuilder = options.contextBuilderFactory?.({ pool, scope: state.scope }) ?? new StepContextBuilder(inputStore, createPgContextOwnerFence(pool))
     const engine = new TurnEngine({
       lease, scope: state.scope, goal: state.goal, snapshot: state.snapshot, contextBuilder,
-      store: turnStore, model, tools: toolRuntime.registry.list(capabilities(state.toolPolicySnapshot)),
+      store: turnStore, model, tools: toolRuntime.registry.list(toolCapabilities),
       executeTool: createToolRouterExecutor(toolRuntime.router), rootInputId: state.rootInputId, rootTaskId: root.id, taskId: root.id,
       actorRole: (record(state.toolPolicySnapshot).role as PolicyRole | undefined) ?? "orchestrator", capabilities: toolCapabilities,
       validateToolArguments: (name, input) => toolRuntime.registry.validateArguments(name, input, "1"), signal,

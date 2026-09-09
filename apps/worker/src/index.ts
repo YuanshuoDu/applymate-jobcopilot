@@ -77,6 +77,7 @@ async function main() {
     workerId: process.env.WORKER_ID ?? `worker-${process.pid}`,
     authorizeUsage: aiUsageBridgeModule.createWorkerUsageAuthorizer(),
     consumeWaitOutcomes,
+    coordinationEnabled: consumeWaitOutcomes,
   });
   // Child execution is opt-in. Keep tree-budget and child queue construction
   // out of the default startup path until the explicit feature flag is set.

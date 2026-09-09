@@ -123,7 +123,36 @@ function setup(overrides: Record<string, unknown> = {}) {
   return { runtime, roots, tool, getModelCalls: () => calls }
 }
 
+async function rootToolNames(coordinationEnabled: boolean): Promise<string[]> {
+  const requests: HarnessModelRequest[] = []
+  const runtime = await createCanonicalTurnRuntime({ connect: vi.fn() } as never, {
+    workerId: "worker-1", coordinationEnabled, stateLoader: async () => ({ ...state(), toolPolicySnapshot: { capabilities: ["read"] } }),
+    rootTaskStore: rootStore() as never, turnEngineStoreFactory: () => store(), contextBuilderFactory: () => contextBuilder(),
+    modelRuntimeFactory: async () => ({ adapter: {
+      ...model(() => []),
+      async *stream(request: HarnessModelRequest) {
+        requests.push(request)
+        yield { type: "text_delta", text: "done" }
+        yield { type: "completed", finishReason: "stop" }
+      },
+    }, registry: {} as never, candidates: [] }),
+    authorizeUsage: async () => ({ settle: async () => undefined }),
+  })
+  await runtime.execute({ lease, signal: new AbortController().signal })
+  return requests[0]?.tools.flatMap(tool => {
+    if (!tool || typeof tool !== "object" || !("name" in tool) || typeof tool.name !== "string") return []
+    return [tool.name]
+  }) ?? []
+}
+
 describe("createCanonicalTurnRuntime", () => {
+  it("derives root coordination capability from the production gate", async () => {
+    const disabled = await rootToolNames(false)
+    expect(disabled).not.toEqual(expect.arrayContaining(["spawn_subagent", "wait_subagents", "list_subagents", "send_message", "interrupt_subagent", "close_subagent"]))
+    const enabled = await rootToolNames(true)
+    expect(enabled).toEqual(expect.arrayContaining(["spawn_subagent", "wait_subagents", "list_subagents", "send_message", "interrupt_subagent", "close_subagent"]))
+  })
+
   it("settles the root after the real wait transition and releases its task lease", async () => {
     const boundary = waitBoundary()
     const tool = waitingTools()
