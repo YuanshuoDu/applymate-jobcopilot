@@ -19,6 +19,19 @@ import type {
   TurnEnginePlanExecutionHookResult,
 } from "./turn-engine-types.js"
 
+export type TurnEngineCompletionGateResult =
+  | { readonly ok: true }
+  | { readonly ok: false; readonly blocker: string; readonly feedback: string }
+
+export type TurnEngineCompletionGate = (input: {
+  readonly identity: TurnExecutionIdentity
+  readonly scope: TenantScope
+  readonly rootTaskId: string
+  readonly stepId: string
+  readonly signal: AbortSignal
+  readonly now: Date
+}) => Promise<TurnEngineCompletionGateResult> | TurnEngineCompletionGateResult
+
 /** Identity is owner normalized; the loop never receives a raw lease. */
 export type TurnExecutionIdentity = ExecutionOwnerFence
 
@@ -86,6 +99,7 @@ export type TurnExecutionOptions = {
   readonly isOwnershipLost?: (error: unknown, signal: AbortSignal) => boolean
   /** Executes accepted plan commands through a server-owned adapter; omitted keeps legacy behavior. */
   readonly executePlan?: TurnEnginePlanExecutionHook
+  readonly completionGate?: TurnEngineCompletionGate
 }
 
 export type TurnExecutionOutcome = TurnEngineResult

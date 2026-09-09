@@ -6,6 +6,7 @@ import type { TurnBudgetLimits } from "../budget.js"
 import type { BusinessCheck } from "../verifier.js"
 import type { ExecutionOwnerFence, TurnExecutionOwnerFence } from "../execution-owner.js"
 import type { TurnLease } from "./lease.js"
+import type { TurnEngineCompletionGate } from "./turn-execution-types.js"
 
 export type TurnEngineItemType = "agent_message" | "reasoning_summary" | "tool_call" | "tool_result" | "error"
 export type TurnEngineItemPhase = "commentary" | "final_answer" | null
@@ -172,6 +173,7 @@ export type TurnEngineOptions = {
   readonly executeTool: TurnEngineToolExecutor
   /** Optional server-owned plan execution seam; omitted preserves the legacy loop. */
   readonly executePlan?: TurnEnginePlanExecutionHook
+  readonly completionGate?: TurnEngineCompletionGate
   readonly rootInputId?: string
   /** Runtime-owned current task identity. Root turns use rootTaskId. */
   readonly taskId?: string

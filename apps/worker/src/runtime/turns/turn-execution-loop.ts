@@ -134,6 +134,7 @@ export async function runTurnExecutionLoop(options: TurnExecutionOptions): Promi
           )
           throw new TurnEngineError(verification.code, verification.blocker)
         }
+        await assertCompletionAllowed(options, writer, step, signal, now)
         const finalResponse = finalizeTurn({
           goal: options.goal, verification, terminalReason: "goal_satisfied", response: output.text,
           usage: totalTurnUsage(options.resume?.usage, budget.usage()), stepCount: steps, toolCallCount: toolCalls,
@@ -203,6 +204,23 @@ export async function runTurnExecutionLoop(options: TurnExecutionOptions): Promi
     ).catch(() => undefined)
     return { status: "failed", stepCount: steps, toolCallCount: toolCalls, errorCode: code, ...(finalItem ? { finalItemId: finalItem.id } : {}) }
   }
+}
+
+async function assertCompletionAllowed(options: TurnExecutionOptions, writer: TurnExecutionEventWriter, step: TurnEngineStep, signal: AbortSignal, now: () => Date): Promise<void> {
+  if (!options.completionGate) return
+  let decision: Awaited<ReturnType<NonNullable<TurnExecutionOptions["completionGate"]>>>
+  try {
+    decision = await options.completionGate({ identity: options.identity, scope: options.scope, rootTaskId: options.identity.rootTaskId, stepId: step.id, signal, now: now() })
+  } catch {
+    throw new TurnEngineError("invalid_output", "Completion gate failed closed")
+  }
+  if (!decision || typeof decision !== "object" || typeof decision.ok !== "boolean") throw new TurnEngineError("invalid_output", "Completion gate returned an invalid decision")
+  if (decision.ok) return
+  if (typeof decision.blocker !== "string" || typeof decision.feedback !== "string" || decision.blocker.length === 0 || decision.blocker.length > 256 || decision.feedback.length > 512) {
+    throw new TurnEngineError("invalid_output", "Completion gate returned an invalid blocker")
+  }
+  await writer.append("final.rejected", step.id, null, { code: "business_precondition_failed", blocker: decision.blocker, feedback: decision.feedback, taskId: options.identity.taskId }, `final-rejected:${step.id}`)
+  throw new TurnEngineError("business_precondition_failed", decision.blocker)
 }
 
 async function executeTools(

@@ -23,7 +23,7 @@ function identity(kind: TurnExecutionIdentity["kind"], taskId: string, attemptCo
 
 type Fixture = { options: TurnExecutionOptions; events: Array<{ id: string; type: string; itemId: string | null; taskId: string }>; notifications: string[]; planEvents: unknown[]; items: TurnEngineItem[]; finalResponses: string[]; stepTasks: string[]; stepAttempts: number[]; stepStatuses: string[]; requests: HarnessModelRequest[] }
 
-function fixture(owner: TurnExecutionIdentity, toolResult?: TurnEngineToolResult, planHook?: NonNullable<TurnExecutionOptions["executePlan"]>, initialToolObservations: Array<{ id: string; content: unknown }> = [], failPlanObservation = false): Fixture {
+function fixture(owner: TurnExecutionIdentity, toolResult?: TurnEngineToolResult, planHook?: NonNullable<TurnExecutionOptions["executePlan"]>, initialToolObservations: Array<{ id: string; content: unknown }> = [], failPlanObservation = false, completionGate?: NonNullable<TurnExecutionOptions["completionGate"]>): Fixture {
   const events: Fixture["events"] = []
   const planEvents: unknown[] = []
   const notifications: string[] = []
@@ -78,6 +78,7 @@ function fixture(owner: TurnExecutionIdentity, toolResult?: TurnEngineToolResult
     idFactory: prefix => prefix,
     subscribe: event => { notifications.push(event.type); events.push({ id: event.id, type: event.type, itemId: event.itemId, taskId: owner.taskId }) },
     ...(planHook ? { executePlan: planHook } : {}),
+    ...(completionGate ? { completionGate } : {}),
   }
   return { options, events, notifications, planEvents, items, finalResponses, stepTasks, stepAttempts, stepStatuses, requests }
 }
@@ -95,6 +96,23 @@ describe("owner-agnostic turn execution loop", () => {
       { role: "assistant", content: [{ type: "tool_use", id: "call:root-1", name: "jobs.search", input: { location: "Dublin" } }] },
       { role: "tool", content: [{ type: "tool_result", toolUseId: "call:root-1", content: '{"job":"job-1"}' }] },
     ]))
+  })
+
+  it("runs the completion gate before final persistence and blocks an unfinished child tree", async () => {
+    const gate = vi.fn(async () => ({ ok: false as const, blocker: "child_tasks_pending", feedback: "Child work is still running" }))
+    const root = fixture(identity("turn", "root-1"), undefined, undefined, [], false, gate)
+    const result = await runTurnExecutionLoop(root.options)
+    expect(result).toMatchObject({ status: "failed", errorCode: "business_precondition_failed" })
+    expect(gate).toHaveBeenCalledWith(expect.objectContaining({ rootTaskId: "root-1", stepId: expect.any(String), signal: expect.any(Object) }))
+    expect(root.events.some(event => event.type === "final.rejected")).toBe(true)
+    expect(root.events.some(event => event.type === "turn.completed")).toBe(false)
+  })
+
+  it("fails closed when the completion gate throws", async () => {
+    const gate = vi.fn(async () => { throw new Error("database unavailable") })
+    const root = fixture(identity("turn", "root-1"), undefined, undefined, [], false, gate)
+    await expect(runTurnExecutionLoop(root.options)).resolves.toMatchObject({ status: "failed", errorCode: "invalid_output" })
+    expect(root.events.some(event => event.type === "turn.completed")).toBe(false)
   })
 
   it("runs child work under its own task identity without root final persistence or completion", async () => {

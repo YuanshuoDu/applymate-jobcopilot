@@ -43,7 +43,7 @@ function model(script: () => ModelStreamEvent[]): ModelAdapter {
 }
 
 function rootStore() {
-  return { ensure: vi.fn(async () => ({ id: "root-1" } as never)), finish: vi.fn(async () => undefined) }
+  return { ensure: vi.fn(async () => ({ id: "root-1" } as never)), checkCompletion: vi.fn(async () => ({ ok: true as const })), finish: vi.fn(async () => undefined) }
 }
 
 function waitBoundary() {
@@ -302,6 +302,12 @@ describe("createCanonicalTurnRuntime", () => {
     expect(fixture.getModelCalls()).toBe(2)
     expect(fixture.tool.execute).toHaveBeenCalledWith(expect.objectContaining({ taskId: "root-1", rootTaskId: "root-1" }), expect.objectContaining({ toolName: "jobs.search" }))
     expect(fixture.roots.finish).toHaveBeenCalledWith(expect.objectContaining({ rootTaskId: "root-1", result: expect.objectContaining({ status: "completed" }) }))
+  })
+
+  it("passes the server-owned completion gate for the canonical root", async () => {
+    const fixture = setup()
+    await fixture.runtime.then(runtime => runtime.execute({ lease, signal: new AbortController().signal }))
+    expect(fixture.roots.checkCompletion).toHaveBeenCalledWith(expect.objectContaining({ rootTaskId: "root-1", lease }))
   })
 
   it("fails closed before provider invocation when usage authorization is unavailable", async () => {

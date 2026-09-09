@@ -1,11 +1,13 @@
 import type pg from "pg"
 
 import type { TurnEngineResult } from "../turns/turn-engine-types.js"
+import type { TurnEngineCompletionGateResult } from "../turns/turn-execution-types.js"
 import type { TurnLease } from "../turns/lease.js"
 import type { PgSubagentPool, SubagentTaskRecord, SubagentTaskStatus } from "./types.js"
 
 export type RootTaskStore = {
   ensure(input: { lease: TurnLease; goal: string; modelProfileSnapshot?: unknown; toolPolicySnapshot?: unknown; budgetSnapshot?: unknown; allowedActions?: readonly string[]; now?: Date }): Promise<SubagentTaskRecord>
+  checkCompletion?(input: { lease: TurnLease; rootTaskId: string; now?: Date }): Promise<TurnEngineCompletionGateResult>
   finish(input: { lease: TurnLease; rootTaskId: string; result: TurnEngineResult; now?: Date }): Promise<void>
 }
 
@@ -63,6 +65,15 @@ async function transaction<T>(pool: PgSubagentPool, userId: string, work: (clien
 const SELECT_ROOT = `SELECT task.*, session."userId" AS "userId"
   FROM "sub_agent_tasks" task JOIN "agent_sessions" session ON session."id" = task."sessionId"
   WHERE task."id" = $1 AND task."sessionId" = $2 AND task."turnId" = $3`
+
+const TERMINAL_TASK_STATUSES = new Set(["completed", "failed", "interrupted", "cancelled", "closed"])
+
+function completionBlocker(rows: readonly Row[]): TurnEngineCompletionGateResult {
+  const pending = rows.filter(row => !TERMINAL_TASK_STATUSES.has(String(row.status)))
+  if (pending.length === 0) return { ok: true }
+  const ids = pending.slice(0, 8).map(row => String(row.id).slice(0, 128))
+  return { ok: false, blocker: "child_tasks_pending", feedback: `Pending child tasks: ${ids.join(", ")}`.slice(0, 512) }
+}
 
 function status(result: TurnEngineResult): Extract<SubagentTaskStatus, "completed" | "failed" | "interrupted" | "waiting" | "waiting_for_user"> {
   if (result.status === "completed") return "completed"
@@ -123,6 +134,29 @@ export function createPgRootTaskStore(pool: PgSubagentPool): RootTaskStore {
         const created = await client.query<Row>(SELECT_ROOT, [id, lease.sessionId, lease.turnId])
         if (!created.rows[0]) throw new Error("root_task_missing")
         return task(created.rows[0])
+      })
+    },
+    async checkCompletion(input): Promise<TurnEngineCompletionGateResult> {
+      const now = input.now ?? new Date()
+      return transaction(pool, input.lease.userId, async (client) => {
+        const turn = await client.query<Row>(
+          `SELECT "id", "rootTaskId" FROM "agent_turns"
+           WHERE "id" = $1 AND "sessionId" = $2 AND "userId" = $3 AND "rootTaskId" = $6
+             AND "leaseOwnerId" = $4 AND "leaseVersion" = $5 AND "leaseExpiresAt" > $7 AND "status" = 'in_progress'
+           FOR UPDATE`,
+          [input.lease.turnId, input.lease.sessionId, input.lease.userId, input.lease.ownerId, input.lease.leaseVersion, input.rootTaskId, now],
+        )
+        if (!turn.rows[0] || String(turn.rows[0].rootTaskId) !== input.rootTaskId) throw new Error("root_turn_fenced")
+        const descendants = await client.query<Row>(
+          `SELECT task."id", task."status", task."sessionId", task."turnId", task."rootTaskId", session."userId" AS "userId"
+           FROM "sub_agent_tasks" AS task JOIN "agent_sessions" AS session ON session."id" = task."sessionId"
+           WHERE task."sessionId" = $1 AND task."turnId" = $2 AND task."rootTaskId" = $3 AND task."id" <> $3
+             AND (task."status" IS NULL OR task."status" NOT IN ('completed', 'failed', 'interrupted', 'cancelled', 'closed'))
+             AND session."userId" = $4 ORDER BY task."id" LIMIT 9`,
+          [input.lease.sessionId, input.lease.turnId, input.rootTaskId, input.lease.userId],
+        )
+        for (const row of descendants.rows) if (String(row.sessionId) !== input.lease.sessionId || String(row.turnId) !== input.lease.turnId || String(row.rootTaskId) !== input.rootTaskId || String(row.userId) !== input.lease.userId) throw new Error("root_task_fenced")
+        return completionBlocker(descendants.rows)
       })
     },
     async finish(input): Promise<void> {

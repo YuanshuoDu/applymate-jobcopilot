@@ -113,7 +113,7 @@ export async function runCanonicalAgentTurn(
     }, execute: async ({ lease, signal }): Promise<TurnExecutionResult> => {
       const rootTaskStore = createPgRootTaskStore(pool)
       const root = await rootTaskStore.ensure({ lease, goal: base.goal, allowedActions: [PIPELINE_TOOL.name], now: new Date() })
-      const result = await new TurnEngine({ ...base, lease, signal, rootTaskId: root.id, taskId: root.id }).run()
+      const result = await new TurnEngine({ ...base, lease, signal, rootTaskId: root.id, taskId: root.id, completionGate: async () => rootTaskStore.checkCompletion!({ lease, rootTaskId: root.id, now: new Date() }) }).run()
       await rootTaskStore.finish({ lease, rootTaskId: root.id, result, now: new Date() })
       return result
     } },

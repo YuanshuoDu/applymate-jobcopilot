@@ -36,6 +36,21 @@ function fakePool(existing: Record<string, unknown> | null = null, updateCount =
   return { pool: { connect: vi.fn(async () => client) } as never, calls, client }
 }
 
+function completionPool(descendants: Array<Record<string, unknown>>, owned = true) {
+  const calls: string[] = []
+  const client = {
+    query: vi.fn(async (sql: string) => {
+      calls.push(sql)
+      if (sql === "BEGIN" || sql === "COMMIT" || sql === "ROLLBACK" || sql.includes("set_config")) return { rows: [], rowCount: 0 }
+      if (sql.includes('SELECT "id", "rootTaskId" FROM "agent_turns"')) return owned ? { rows: [{ id: "turn-1", rootTaskId: "root-turn-1" }], rowCount: 1 } : { rows: [], rowCount: 0 }
+      if (sql.includes('SELECT task."id", task."status"')) return { rows: descendants, rowCount: descendants.length }
+      return { rows: [], rowCount: 1 }
+    }),
+    release: vi.fn(),
+  }
+  return { pool: { connect: vi.fn(async () => client) } as never, calls }
+}
+
 describe("createPgRootTaskStore", () => {
   it("creates a scoped root with explicit allowed actions and keeps secrets out", async () => {
     const fake = fakePool()
@@ -104,5 +119,23 @@ describe("createPgRootTaskStore", () => {
     const fake = fakePool()
     await createPgRootTaskStore(fake.pool).finish({ lease, rootTaskId: "root-turn-1", result: { status: "waiting_for_dependency", stepCount: 1, toolCallCount: 0 } })
     expect(fake.calls.some(sql => sql.includes('"leaseOwner" = NULL') && sql.includes('"leaseExpiresAt" = NULL'))).toBe(true)
+  })
+
+  it.each(["queued", "running", "waiting"]) ("blocks completion while a %s child remains", async (childStatus) => {
+    const fake = completionPool([{ id: "child-1", sessionId: lease.sessionId, turnId: lease.turnId, rootTaskId: "root-turn-1", userId: lease.userId, status: childStatus }])
+    await expect(createPgRootTaskStore(fake.pool).checkCompletion!({ lease, rootTaskId: "root-turn-1" })).resolves.toMatchObject({ ok: false, blocker: "child_tasks_pending" })
+    expect(fake.calls.some(sql => sql.includes("FOR UPDATE"))).toBe(true)
+  })
+
+  it("allows completion when every descendant is terminal", async () => {
+    const fake = completionPool(["completed", "failed", "interrupted", "cancelled", "closed"].map((status, index) => ({ id: `child-${index}`, sessionId: lease.sessionId, turnId: lease.turnId, rootTaskId: "root-turn-1", userId: lease.userId, status })))
+    await expect(createPgRootTaskStore(fake.pool).checkCompletion!({ lease, rootTaskId: "root-turn-1" })).resolves.toEqual({ ok: true })
+  })
+
+  it("fails closed for a stale owner or foreign descendant row", async () => {
+    const stale = completionPool([], false)
+    await expect(createPgRootTaskStore(stale.pool).checkCompletion!({ lease, rootTaskId: "root-turn-1" })).rejects.toThrow("root_turn_fenced")
+    const foreign = completionPool([{ id: "child-1", sessionId: "other-session", turnId: lease.turnId, rootTaskId: "root-turn-1", userId: lease.userId, status: "running" }])
+    await expect(createPgRootTaskStore(foreign.pool).checkCompletion!({ lease, rootTaskId: "root-turn-1" })).rejects.toThrow("root_task_fenced")
   })
 })
