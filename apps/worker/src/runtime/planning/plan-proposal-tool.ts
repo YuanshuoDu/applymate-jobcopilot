@@ -28,6 +28,8 @@ export type PlanProposalToolOptions = {
   readonly allowedTemplates: readonly string[]
   readonly allowedRoles: readonly string[]
   readonly maxNodes: number
+  /** Recovered durable revision; null means no accepted proposal exists yet. */
+  readonly initialPlanRevision?: number | null
 }
 
 function copyAllowlist(name: string, value: readonly string[]): readonly string[] {
@@ -38,10 +40,11 @@ function copyAllowlist(name: string, value: readonly string[]): readonly string[
 export function createPlanProposalTool(options: PlanProposalToolOptions): RuntimeToolDefinition<PlanProposalToolInput, PlanProposalToolOutput> {
   if (!Number.isSafeInteger(options.goal?.revision) || options.goal.revision < 1) throw new TypeError("Plan goal revision must be a positive integer")
   if (!Number.isSafeInteger(options.maxNodes) || options.maxNodes < 1 || options.maxNodes > PLAN_MAX_NODES) throw new TypeError(`Plan maxNodes must be between 1 and ${PLAN_MAX_NODES}`)
+  if (options.initialPlanRevision !== undefined && options.initialPlanRevision !== null && (!Number.isSafeInteger(options.initialPlanRevision) || options.initialPlanRevision < 1)) throw new TypeError("Invalid initial plan revision")
   const allowedTools = copyAllowlist("tool", options.allowedTools)
   const allowedTemplates = copyAllowlist("template", options.allowedTemplates)
   const allowedRoles = copyAllowlist("role", options.allowedRoles)
-  let planRevision: number | null = null
+  let planRevision: number | null = options.initialPlanRevision ?? null
   return {
     schemaVersion, name: "agent.plan.propose", version: "1", description: "Propose a bounded read-only plan for the current goal",
     capabilities: ["coordination"], inputSchema: PlanProposalEnvelopeSchema, outputSchema: PlanProposalOutputSchema,

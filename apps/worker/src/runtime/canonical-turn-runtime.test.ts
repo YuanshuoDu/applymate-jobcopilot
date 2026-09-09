@@ -21,6 +21,7 @@ function store(events: Array<{ type: string; payload: unknown }> = []): TurnEngi
     startStep: async ({ stepId, ordinal }) => ({ id: stepId, ordinal }), updateStep: async () => undefined,
     createItem: async ({ itemId }) => ({ id: itemId, revision: 0 }), updateItem: async ({ itemId, expectedRevision }) => ({ id: itemId, revision: expectedRevision + 1 }),
     appendEvent: async ({ id, type, payload }) => { events.push({ type, payload }); return { id } }, recordFinalResponse: async () => undefined,
+    appendEvents: async inputs => { events.push(...inputs.map(input => ({ type: input.type, payload: input.payload }))); return inputs.map(input => ({ id: input.id })) },
   }
 }
 
@@ -243,6 +244,16 @@ describe("createCanonicalTurnRuntime", () => {
 
     const noFactory = setup({ planningEnabled: true, planningExecutionEnabled: true })
     await (await noFactory.runtime).execute({ lease, signal: new AbortController().signal })
+  })
+
+  it("passes the recovered plan revision to the proposal and execution bridges", async () => {
+    const factory = vi.fn((input: { initialPlanRevision?: number | null }) => {
+      expect(input.initialPlanRevision).toBe(2)
+      return async () => ({ observations: [] })
+    })
+    const fixture = setup({ planningEnabled: true, planningExecutionEnabled: true, stateLoader: async () => ({ ...state(), planRevision: 2 }), planExecutionFactory: factory })
+    await (await fixture.runtime).execute({ lease, signal: new AbortController().signal })
+    expect(factory).toHaveBeenCalledTimes(1)
   })
 
   it("settles the root after the real wait transition and releases its task lease", async () => {

@@ -196,7 +196,7 @@ export async function createCanonicalTurnRuntime(pool: pg.Pool, options: Canonic
     const planning = options.planningEnabled ? {
       goal: { revision: 1, objective: state.goal, constraints: [], successCriteria: [], knownFacts: [], unresolvedQuestions: [], approvalBoundaries: [], budgetRef: "runtime:turn" },
       allowedTools: ["jobs.search", "jobs.get", "persona.retrieve", "resume.get_base", "application.get_state", "tool_results.read"],
-      allowedTemplates: [], allowedRoles: ["scout", "analyst"], maxNodes: PLAN_MAX_NODES,
+      allowedTemplates: [], allowedRoles: ["scout", "analyst"], maxNodes: PLAN_MAX_NODES, initialPlanRevision: state.planRevision ?? null,
     } : undefined
     const toolRuntime = options.toolRuntimeFactory?.({ pool, policy: selectedPolicy, manager, state }) ?? createWorkerToolRuntime(pool, { sink: sinkProxy, resolveOwner }, selectedPolicy, coordination, undefined, undefined, undefined, planning)
     const allowedActions = toolRuntime.registry.list(toolCapabilities).flatMap((definition) => {
@@ -210,7 +210,7 @@ export async function createCanonicalTurnRuntime(pool: pg.Pool, options: Canonic
     const actorRole = (record(state.toolPolicySnapshot).role as PolicyRole | undefined) ?? "orchestrator"
     const planFactory = options.planExecutionFactory ?? createCanonicalPlanExecutionFactory
     const executePlan = options.planningEnabled === true && options.planningExecutionEnabled === true && planning
-      ? planFactory({ lease, rootTaskId: root.id, taskId: root.id, state, scope: state.scope, router: toolRuntime.router, registry: toolRuntime.registry, policy: selectedPolicy, goal: planning.goal, allowedTools: planning.allowedTools, allowedTemplates: planning.allowedTemplates, allowedRoles: planning.allowedRoles, maxNodes: planning.maxNodes, capabilities: toolCapabilities, actorRole })
+      ? planFactory({ lease, rootTaskId: root.id, taskId: root.id, state, scope: state.scope, router: toolRuntime.router, registry: toolRuntime.registry, policy: selectedPolicy, goal: planning.goal, allowedTools: planning.allowedTools, allowedTemplates: planning.allowedTemplates, allowedRoles: planning.allowedRoles, maxNodes: planning.maxNodes, initialPlanRevision: planning.initialPlanRevision, capabilities: toolCapabilities, actorRole })
       : undefined
     const config = options.modelRuntimeFactory ? undefined : await loadWorkerAiConfig(lease.userId)
     const modelRuntime = await (options.modelRuntimeFactory?.({ userId: lease.userId, config, state }) ?? createHarnessModelRuntime({ primary: config, fallbacks: [], allowEnvironmentFallbacks: false }))

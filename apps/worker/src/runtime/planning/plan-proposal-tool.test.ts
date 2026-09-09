@@ -9,7 +9,7 @@ function plan(overrides: Partial<PlanProposal> = {}): PlanProposal {
   return { schemaVersion: PLAN_PROPOSAL_SCHEMA_VERSION, basedOnGoalRevision: 1, basedOnPlanRevision: null, nodes: [baseNode], completionCriteria: ["review results"], briefRationale: "Bounded read", ...overrides }
 }
 function context() { return { scope: { userId: "user-1" }, sessionId: "session-1", turnId: "turn-1", stepId: "step-1", signal: new AbortController().signal, capabilities: ["canPlan"], reportProgress: async () => undefined } }
-function toolOptions() { return { goal, allowedTools: ["jobs.search", "jobs.get", "persona.retrieve", "resume.get_base", "application.get_state", "tool_results.read"], allowedTemplates: [], allowedRoles: ["scout", "analyst"], maxNodes: 8 } }
+function toolOptions(overrides: Record<string, unknown> = {}) { return { goal, allowedTools: ["jobs.search", "jobs.get", "persona.retrieve", "resume.get_base", "application.get_state", "tool_results.read"], allowedTemplates: [], allowedRoles: ["scout", "analyst"], maxNodes: 8, ...overrides } }
 function tool() { return createPlanProposalTool(toolOptions()) }
 
 describe("plan proposal tool", () => {
@@ -17,6 +17,7 @@ describe("plan proposal tool", () => {
     expect(() => createPlanProposalTool({ ...toolOptions(), maxNodes: 0 })).toThrow("maxNodes")
     expect(() => createPlanProposalTool({ ...toolOptions(), maxNodes: PLAN_MAX_NODES + 1 })).toThrow("maxNodes")
     expect(() => createPlanProposalTool({ ...toolOptions(), goal: { ...goal, revision: 0 } })).toThrow("goal revision")
+    expect(() => createPlanProposalTool(toolOptions({ initialPlanRevision: 0 }))).toThrow("initial plan revision")
   })
 
   it("snapshots server allowlists so later caller mutation cannot widen planning", async () => {
@@ -41,6 +42,13 @@ describe("plan proposal tool", () => {
     await expect(definition.execute(context(), { proposal: plan() })).rejects.toMatchObject({ code: "plan_invalid", safeOutput: { issues: expect.arrayContaining([expect.objectContaining({ code: "plan_revision_conflict" })]) } })
     const accepted = await definition.execute(context(), { proposal: plan({ basedOnPlanRevision: 1, nodes: [{ ...baseNode, localId: "next", objective: "Read next" }] }) })
     expect(accepted).toMatchObject({ planRevision: 2, basedOnPlanRevision: 1 })
+  })
+
+  it("continues CAS from a recovered durable revision", async () => {
+    const definition = createPlanProposalTool(toolOptions({ initialPlanRevision: 2 }))
+    const accepted = await definition.execute(context(), { proposal: plan({ basedOnPlanRevision: 2 }) })
+    expect(accepted).toMatchObject({ planRevision: 3, basedOnPlanRevision: 2 })
+    await expect(definition.execute(context(), { proposal: plan({ basedOnPlanRevision: 2 }) })).rejects.toMatchObject({ code: "plan_invalid" })
   })
 
   it("rejects forged identity, external tools, and unknown delegate roles without dispatching", async () => {

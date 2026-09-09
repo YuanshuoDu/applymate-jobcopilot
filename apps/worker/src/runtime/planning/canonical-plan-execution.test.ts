@@ -29,11 +29,11 @@ function output(value: PlanProposal, overrides: Record<string, unknown> = {}): R
   return { status: "accepted", goalRevision: 1, planRevision: 1, basedOnPlanRevision: null, proposal: value, intents: [], ...overrides }
 }
 
-function fixture(router: { execute(context: ToolRouterContext, request: ToolCallRequest): Promise<ToolExecutionResult> } = { execute: async (_context, request) => ({ ...request, status: "completed", output: { ok: true }, errorCode: null }) }) {
+function fixture(router: { execute(context: ToolRouterContext, request: ToolCallRequest): Promise<ToolExecutionResult> } = { execute: async (_context, request) => ({ ...request, status: "completed", output: { ok: true }, errorCode: null }) }, initialPlanRevision?: number) {
   const options: CanonicalPlanExecutionOptions = {
     goal, allowedTools: ["jobs.search"], allowedTemplates: [], allowedRoles: ["scout"], maxNodes: 8,
     capabilities: ["read", "canPlan"], actorRole: "orchestrator", scope: { userId: "user-1" }, lease,
-    rootTaskId: "root-1", taskId: "root-1", router,
+    rootTaskId: "root-1", taskId: "root-1", initialPlanRevision, router,
     registry: { list: () => [{ name: "jobs.search", version: "1", risk: "read", capabilities: ["read"] }] },
     policy: {} as PolicyEngine,
   }
@@ -78,6 +78,15 @@ describe("createCanonicalPlanExecutionFactory", () => {
     expect(observationCode(await hook(input(valid)))).toBe("revision_conflict")
     expect(observationCode(await fixture()(input(output(proposal([use("unknown", { toolName: "jobs.unknown" })])))))).toBe("invalid_plan")
     expect(observationCode(await fixture()(input(output(proposal([use("ref", { inputRefs: ["prior"] })])))))).toBe("input_reference_unavailable")
+  })
+
+  it("continues the bridge CAS from a recovered revision", async () => {
+    const hook = fixture(undefined, 2)
+    const recoveredProposal = { ...proposal([]), basedOnPlanRevision: 2 }
+    const accepted = await hook(input(output(recoveredProposal, { planRevision: 3, basedOnPlanRevision: 2 })))
+    expect(accepted.observations).toEqual([])
+    const stale = await hook(input(output(recoveredProposal, { planRevision: 3, basedOnPlanRevision: 2 })))
+    expect(observationCode(stale)).toBe("revision_conflict")
   })
 
   it("feeds command failure back and maps request input to a wait", async () => {

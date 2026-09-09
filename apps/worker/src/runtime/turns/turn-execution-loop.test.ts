@@ -43,6 +43,7 @@ function fixture(owner: TurnExecutionIdentity, toolResult?: TurnEngineToolResult
   }
   let calls = 0
   const planInput = { proposal: { schemaVersion: "agent-harness.plan.v1" } }
+  const acceptedPlanOutput = { status: "accepted", goalRevision: 1, planRevision: 1, basedOnPlanRevision: null, proposal: planInput.proposal, intents: [] }
   const model: ModelAdapter = {
     id: "fixture-model", profile,
     async *stream(request: HarnessModelRequest): AsyncGenerator<ModelStreamEvent> {
@@ -70,7 +71,7 @@ function fixture(owner: TurnExecutionIdentity, toolResult?: TurnEngineToolResult
   }
   const options: TurnExecutionOptions = {
     identity: owner, scope: { userId: "user-1" }, goal: "find jobs", snapshot: { system: [], profile: [], steerHistory: [], businessRefs: [], toolObservations: initialToolObservations },
-    contextBuilder, store, model, tools: [{ name: "jobs.search", version: "1" }], executeTool: async ({ call }) => toolResult ?? ({ id: call.id, toolName: call.toolName, toolVersion: call.toolVersion, status: "completed", output: { job: "job-1" }, errorCode: null }),
+    contextBuilder, store, model, tools: [{ name: "jobs.search", version: "1" }], executeTool: async ({ call }) => toolResult ?? ({ id: call.id, toolName: call.toolName, toolVersion: call.toolVersion, status: "completed", output: call.toolName === "agent.plan.propose" ? acceptedPlanOutput : { job: "job-1" }, errorCode: null }),
     idFactory: prefix => prefix,
     subscribe: event => { notifications.push(event.type); events.push({ id: event.id, type: event.type, itemId: event.itemId, taskId: owner.taskId }) },
     ...(planHook ? { executePlan: planHook } : {}),
@@ -164,6 +165,7 @@ describe("owner-agnostic turn execution loop", () => {
     const root = fixture(identity("turn", "root-1"), undefined, hook)
     await expect(runTurnExecutionLoop(root.options)).resolves.toMatchObject({ status: "completed" })
     expect(root.planEvents).toEqual([{ planCallId: "call:root-1", observationId: "plan-observation", content: { marker: "durable" } }])
+    expect(root.events.some(event => event.type === "plan.revision")).toBe(true)
   })
 
   it("fails the turn when a plan observation cannot be persisted", async () => {
@@ -185,6 +187,7 @@ describe("owner-agnostic turn execution loop", () => {
     expect(result.status).toBe("completed")
     expect(root.requests).toHaveLength(2)
     expect(hook).not.toHaveBeenCalled()
+    expect(root.events.some(event => event.type === "plan.revision")).toBe(false)
   })
 
   it.each([

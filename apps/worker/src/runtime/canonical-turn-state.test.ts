@@ -82,6 +82,32 @@ describe("loadCanonicalTurnState", () => {
     expect(eventQuery).toContain('event_session."userId" = $4')
   })
 
+  it("restores the latest valid plan revision and ignores malformed or foreign receipts", async () => {
+    const proposal = { status: "accepted", goalRevision: 1, planRevision: 1, basedOnPlanRevision: null, proposal: { schemaVersion: "agent-harness.plan.v1" }, intents: [] }
+    const fake = pool({
+      turn: { input: { goal: "Find jobs" }, rootTaskId: "root-1", contextSnapshotId: null, modelProfileSnapshot: {}, toolPolicySnapshot: {}, budgetSnapshot: {} },
+      events: [
+        { type: "tool_call.completed", payload: { toolCallId: "legacy-plan", toolName: "agent.plan.propose", output: proposal } },
+        { type: "plan.revision", payload: { planCallId: "receipt-2", goalRevision: 1, planRevision: 2, basedOnPlanRevision: 1 } },
+        { type: "plan.revision", payload: { planCallId: "foreign", goalRevision: 1, planRevision: 99, basedOnPlanRevision: "bad" }, taskId: "child-1" },
+        { type: "plan.revision", payload: { planCallId: "malformed", goalRevision: 1, planRevision: 4, basedOnPlanRevision: 1 } },
+      ],
+    })
+    const value = await loadCanonicalTurnState(fake, lease)
+    expect(value.planRevision).toBe(2)
+    expect(value.snapshot.toolObservations).toEqual(expect.arrayContaining([{ id: "plan-revision:receipt-2", content: { kind: "plan_revision", planCallId: "receipt-2", goalRevision: 1, planRevision: 2, basedOnPlanRevision: 1 } }]))
+  })
+
+  it("falls back to a scoped legacy accepted plan receipt when no revision event exists", async () => {
+    const fake = pool({
+      turn: { input: { goal: "Find jobs" }, rootTaskId: "root-1", contextSnapshotId: null, modelProfileSnapshot: {}, toolPolicySnapshot: {}, budgetSnapshot: {} },
+      events: [{ type: "tool_call.completed", payload: { toolCallId: "legacy-plan", toolName: "agent.plan.propose", output: { status: "accepted", goalRevision: 1, planRevision: 1, basedOnPlanRevision: null, proposal: { schemaVersion: "agent-harness.plan.v1" }, intents: [] } } }],
+    })
+    const value = await loadCanonicalTurnState(fake, lease)
+    expect(value.planRevision).toBe(1)
+    expect(value.snapshot.toolObservations.some(item => item.id === "plan-revision:legacy-plan")).toBe(true)
+  })
+
   it("uses the latest session snapshot and appends ordered role-tagged history after its cursor", async () => {
     const fake = pool({
       turn: { input: { goal: "Continue" }, rootTaskId: null, contextSnapshotId: null, modelProfileSnapshot: {}, toolPolicySnapshot: {}, budgetSnapshot: {} },

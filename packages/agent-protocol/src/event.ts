@@ -19,6 +19,7 @@ export const AgentEventTypeSchema = Type.Union([
   Type.Literal('tool_call.completed'),
   Type.Literal('tool_call.failed'),
   Type.Literal('plan.observation'),
+  Type.Literal('plan.revision'),
   Type.Literal('policy.decision'),
   Type.Literal('approval.requested'),
   Type.Literal('approval.resolved'),

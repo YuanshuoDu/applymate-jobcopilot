@@ -29,6 +29,7 @@ describe('AgentEvent envelopes', () => {
     expect(isKnownAgentEventType('approval.consumed')).toBe(true)
     expect(isKnownAgentEventType('external_action.reserved')).toBe(true)
     expect(isKnownAgentEventType('plan.observation')).toBe(true)
+    expect(isKnownAgentEventType('plan.revision')).toBe(true)
     expect(isKnownAgentEventType('future.event.v3')).toBe(false)
   })
 

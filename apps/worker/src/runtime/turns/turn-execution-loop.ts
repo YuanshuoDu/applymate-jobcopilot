@@ -13,6 +13,7 @@ import { TurnEngineError, toRepositoryJson, type TurnEngineResult, type TurnEngi
 import { executeToolWithItems, publishCommentary, publishFinalResponse, publishReasoningSummary, TurnExecutionEventWriter } from "./turn-execution-events.js"
 import type { TurnExecutionOptions } from "./turn-execution-types.js"
 import { assertExecutionAlive, assertModelAllowance, canEmitTurnCompleted, canPersistFinalResponse, makeExecutionId, resumedBudgetLimits, totalTurnUsage, turnErrorCode, updateExecutionStep } from "./turn-engine-helpers.js"
+import { parsePlanRevisionReceipt, planRevisionObservation } from "../planning/plan-revision-receipt.js"
 
 const DEFAULT_MAX_STEPS = 32
 const PLAN_OBSERVATION_MAX_BYTES = 8 * 1024
@@ -246,6 +247,14 @@ async function executeTools(
     }
     if (result.status === "completed") {
       completedToolResults.push(result)
+      if (call.name === "agent.plan.propose") {
+        const revision = parsePlanRevisionReceipt(result.output, call.id)
+        if (revision) {
+          await writer.append("plan.revision", call.id, null, revision, `plan-revision:${call.id}`)
+          const projection = planRevisionObservation(revision)
+          if (!snapshot.toolObservations.some(observation => observation.id === projection.id)) snapshot = { ...snapshot, toolObservations: [...snapshot.toolObservations, projection] }
+        }
+      }
       if (call.name === "agent.plan.propose" && options.executePlan) {
         const plan = await executePlanHook(options, step, call, result, completedToolResults, snapshot, signal)
         await writer.appendBatch(plan.observations.map(observation => ({

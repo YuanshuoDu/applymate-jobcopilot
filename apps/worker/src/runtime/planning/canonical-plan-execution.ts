@@ -24,6 +24,7 @@ export type CanonicalPlanExecutionOptions = {
   readonly allowedTemplates: readonly string[]
   readonly allowedRoles: readonly string[]
   readonly maxNodes: number
+  readonly initialPlanRevision?: number | null
   readonly capabilities: readonly string[]
   readonly actorRole: PolicyRole
   readonly scope: TenantScope
@@ -155,10 +156,11 @@ function boundedRecords(result: { readonly completed: readonly PlanCommandExecut
 
 export function createCanonicalPlanExecutionFactory(options: CanonicalPlanExecutionOptions): (input: Parameters<TurnEnginePlanExecutionHook>[0]) => Promise<TurnEnginePlanExecutionHookResult> {
   if (!Number.isSafeInteger(options.goal.revision) || options.goal.revision < 1 || !Number.isSafeInteger(options.maxNodes) || options.maxNodes < 1 || options.maxNodes > PLAN_MAX_NODES) throw new TypeError("Invalid server plan execution bounds")
+  if (options.initialPlanRevision !== undefined && options.initialPlanRevision !== null && (!Number.isSafeInteger(options.initialPlanRevision) || options.initialPlanRevision < 1)) throw new TypeError("Invalid initial plan revision")
   const allowedTools = Object.freeze([...options.allowedTools])
   const allowedTemplates = Object.freeze([...options.allowedTemplates])
   const allowedRoles = Object.freeze([...options.allowedRoles])
-  let currentPlanRevision: number | null = null
+  let currentPlanRevision: number | null = options.initialPlanRevision ?? null
   return async input => {
     const baseError = (code: string): TurnEnginePlanExecutionHookResult => ({ observations: [failureObservation(input.call.id, code)] })
     try {
