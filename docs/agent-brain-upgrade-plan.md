@@ -160,7 +160,7 @@ P4 的副作用防绕过约束从第一项领域工具迁入时保留。按用�
 
 额度接近上限时报告：总阶段数、完整验收数与比例、当前工作包、此次新增证据、尚未完成及已提交/推送状态。最高产品验收仍是目标驱动的真实规划、执行、证据反馈和重新规划，而不是界面或状态字段数量。
 
-开发顺序已完成 P3 首个目标驱动接线候选、P3-3 accepted intent materializer、P3-4 runtime execution adapter、P3-5 owner-neutral loop hook、P3-6a TurnEngine/canonical runtime gate、P3-6b 默认 server-owned bridge、P3-7 runtime-owned input hydration/有界 plan observation 持久化、P3-8 原子批量写入候选、P3-9 durable plan revision receipt/restore、P3-10 durable command outcome receipt 和 P3-11 bounded replan guard；下一步是 outbox/queue delivery、recovery 和最终组合验收。2B-1/2B-2 的原生协调工具和 server-side policy gate 仍关闭，P3 planning gate 也默认关闭，且未宣称 child 真实执行。1A 的 PostgreSQL/并发/RLS 欠账不作为启动这些开发工作的前置门槛；已实现、快速检查通过、完整验收通过分别记录。2026-09-09 的有界环境探查确认本机 Docker backend 不可用，未创建数据库或运行迁移；不继续排查宿主环境。最终可采用隔离 CI PostgreSQL service 做集成证明。
+开发顺序已完成 P3 首个目标驱动接线候选、P3-3 accepted intent materializer、P3-4 runtime execution adapter、P3-5 owner-neutral loop hook、P3-6a TurnEngine/canonical runtime gate、P3-6b 默认 server-owned bridge、P3-7 runtime-owned input hydration/有界 plan observation 持久化、P3-8 原子批量写入候选、P3-9 durable plan revision receipt/restore、P3-10 durable command outcome receipt、P3-11 bounded replan guard 和 P3-12 语义重复计划防护；下一步是 outbox/queue delivery、recovery 和最终组合验收。2B-1/2B-2 的原生协调工具和 server-side policy gate 仍关闭，P3 planning gate 也默认关闭，且未宣称 child 真实执行。1A 的 PostgreSQL/并发/RLS 欠账不作为启动这些开发工作的前置门槛；已实现、快速检查通过、完整验收通过分别记录。2026-09-09 的有界环境探查确认本机 Docker backend 不可用，未创建数据库或运行迁移；不继续排查宿主环境。最终可采用隔离 CI PostgreSQL service 做集成证明。
 
 1B 随后的候选代码已接入根运行时：大工具最终结果写入私有存储，实际 registry 注册分块读取，根 Task 创建后绑定当前 owner；输入/进度和异常使用有界清理结果。Astra Review 发现的异常返回绕过路径已由 Luna 修正。初始相关组 14 项、修正后的 router 组 9 项与 Worker 编译通过；真实数据库/跨进程读取延后验证。
 
@@ -199,6 +199,12 @@ P3-9 提交 `fd6f5211`（2026-09-09）已推送到当前分支：agent-protocol 
 P3-10 提交 `ac2c8ed`（2026-09-09）已推送到当前分支：新增已知 `plan.command` 事件和严格有界 command outcome receipt。canonical bridge 对每个已完成/失败 executable command 以及 request-input/propose-completion control barrier，在继续下一命令或返回前通过 owner-scoped `appendEvent` 写入 `planCallId`、`planRevision`、`observationId` 和 bounded plain-JSON content；事件与幂等键由 runtime 确定性生成。canonical state 在 tenant/session/turn/root-task/null-task 范围读取、校验并恢复相同 observation ID，与 `plan.observation` 和 snapshot 去重；sink 失败保持可见，不伪装为成功。Worker focused checks 为 54/54，agent-protocol event checks 为 2/2，agent-protocol build、shared build、Worker TypeScript 与 diff checks 通过。该候选不等于完整阶段完成，整体仍为 **1/8，12.5%**；真实 PostgreSQL/RLS、migration、provider、queue、restart 和 child→parent E2E 尚未验证。
 
 P3-11 提交 `11922aa`（2026-09-09）已推送到当前分支：planning contract 增加 server-owned `PLAN_MAX_REVISIONS=8`，proposal tool 与 canonical bridge 都校验同一上限。恢复到 `initialPlanRevision === maxPlanRevisions` 是合法状态；下一次 proposal 或伪造的超限 accepted output 显式返回 `plan_revision_limit`，超过上限或非法 server option fail closed。canonical runtime 从 server-owned planning config 传入上限，model input 与 policy snapshot 不能提升它。Worker focused checks 为 8 个文件、62/62，agent-protocol event checks 为 2/2，agent-protocol build、shared build、Worker TypeScript 与 diff-check 通过。此次没有 provider、task、queue、数据库或迁移改动；真实 PostgreSQL/RLS、migration、provider、queue、restart 和 child→parent E2E 仍未验证，完整阶段口径保持 **1/8，12.5%**。后续顺序继续处理 bounded replan 后的 durable command outcomes、outbox/queue delivery、recovery 和最终组合验收。
+
+## P3-12 update
+
+P3-12 提交 `33d4bcdd`（2026-09-09）已推送到当前分支：新增 server-owned 语义计划指纹 `sha256:<64 lowercase hex>`。指纹忽略 `basedOnPlanRevision`，保留 `basedOnGoalRevision` 和其他规范化计划语义；proposal tool 与 canonical bridge 都重新计算并校验 `proposalHash`。即使模型更换 call ID，完全相同的计划也会在 router 前以 `plan_no_progress` fail closed，不推进 revision、不执行命令。canonical state 在 tenant/session/turn/root-task 范围恢复有界去重 hash 集合；没有 hash 的旧 receipt 仍可读取。
+
+Root 独立复核记录为 9 个文件、69/69 tests；agent-protocol event checks 2/2，agent-protocol build、shared build、Worker TypeScript 和 `git diff --check` 均通过。此切片没有数据库、schema、provider 或 queue 变更；真实 PostgreSQL/RLS、migration、provider、queue、进程重启和 child-parent E2E 仍未验证。总体完整验收保持 **1/8（12.5%）**，P3-12 不计作阶段完成。
 
 ### 4.2 用户可观察的交付节点
 
