@@ -1,8 +1,8 @@
 import { createHash } from "node:crypto"
 import type pg from "pg"
 import type { ModelAdapter } from "@jobcopilot/agent-model"
-import type { PolicyRole, PolicySnapshot } from "@jobcopilot/agent-protocol"
-import { PolicyEngine } from "@jobcopilot/agent-policy"
+import type { PolicyRole } from "@jobcopilot/agent-protocol"
+import type { PolicyEngine } from "@jobcopilot/agent-policy"
 import { loadWorkerAiConfig, type AiConfig } from "@jobcopilot/shared/llm"
 
 import { createHarnessModelRuntime, type HarnessModelRuntime } from "./harness-model.js"
@@ -23,6 +23,7 @@ import { AgentTreeManager } from "./subagents/manager.js"
 import { PgSubagentTaskStore } from "./subagents/pg-store.js"
 import { createPgRootTaskStore, type RootTaskStore } from "./subagents/root-task-store.js"
 import { executionOwnerFence, type ExecutionOwner, type ExecutionOwnerFence } from "./execution-owner.js"
+import { createCanonicalPolicy } from "./policy/canonical-policy.js"
 
 export type UsageAuthorization = {
   settle(input: { status: "success" | "error"; inputTokens: number; outputTokens: number; estimatedCostUsd: number; errorCode?: string }): Promise<void> | void
@@ -47,11 +48,6 @@ export type CanonicalTurnRuntimeOptions = {
 
 function record(value: unknown): Record<string, unknown> {
   return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {}
-}
-
-function policy(value: unknown): PolicyEngine {
-  const snapshot = record(value)
-  return new PolicyEngine({ snapshot: typeof snapshot.version === "string" && Array.isArray(snapshot.rules) ? snapshot as unknown as PolicySnapshot : undefined })
 }
 
 function capabilities(value: unknown): readonly string[] {
@@ -163,7 +159,7 @@ export async function createCanonicalTurnRuntime(pool: pg.Pool, options: Canonic
     const state = options.stateLoader
       ? await options.stateLoader(pool, lease, now())
       : await loadCanonicalTurnState(pool, lease, now(), { consumeWaitOutcomes: options.consumeWaitOutcomes === true })
-    const selectedPolicy = policy(state.toolPolicySnapshot)
+    const selectedPolicy = createCanonicalPolicy(state.toolPolicySnapshot, options.coordinationEnabled === true)
     const configuredCapabilities = capabilities(state.toolPolicySnapshot)
     const toolCapabilities = options.coordinationEnabled
       ? [...new Set([...configuredCapabilities, "canManageChildren"])]
