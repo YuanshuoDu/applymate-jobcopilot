@@ -196,6 +196,8 @@ P3-8 提交 `4f91a631`（2026-09-09）已推送到当前分支：新增可选 `a
 
 P3-9 提交 `fd6f5211`（2026-09-09）已推送到当前分支：agent-protocol 新增已知 `plan.revision` 事件，Worker 使用严格有界 receipt helper，只接受 plain JSON、合法 ID、revision 与 `basedOnPlanRevision` 关系。owner-neutral loop 仅为非 replay、已完成且 accepted 的 `agent.plan.propose` 结果写入一次 receipt；拒绝、非法和 replay 不推进 revision。canonical state 在 tenant/session/turn/root-task/null-task 范围恢复最新连续合法版本，并对旧的 scoped `tool_call.completed` accepted receipt 做安全 fallback，给恢复模型补充去重的紧凑 revision observation。proposal tool、canonical bridge 和 runtime 从 `initialPlanRevision` 继续 CAS。Worker focused checks 为 49/49，agent-protocol event checks 为 2/2，agent-protocol build、shared build、Worker TypeScript 与 diff checks 通过。process-local revision 欠账已由该候选关闭，但完整阶段仍为 **1/8，12.5%**；command outcomes、outbox/queue delivery、真实 PostgreSQL/RLS、migration、provider、restart 和 child→wait→resume E2E 仍在后续。
 
+P3-10 提交 `ac2c8ed`（2026-09-09）已推送到当前分支：新增已知 `plan.command` 事件和严格有界 command outcome receipt。canonical bridge 对每个已完成/失败 executable command 以及 request-input/propose-completion control barrier，在继续下一命令或返回前通过 owner-scoped `appendEvent` 写入 `planCallId`、`planRevision`、`observationId` 和 bounded plain-JSON content；事件与幂等键由 runtime 确定性生成。canonical state 在 tenant/session/turn/root-task/null-task 范围读取、校验并恢复相同 observation ID，与 `plan.observation` 和 snapshot 去重；sink 失败保持可见，不伪装为成功。Worker focused checks 为 54/54，agent-protocol event checks 为 2/2，agent-protocol build、shared build、Worker TypeScript 与 diff checks 通过。该候选不等于完整阶段完成，整体仍为 **1/8，12.5%**；真实 PostgreSQL/RLS、migration、provider、queue、restart 和 child→parent E2E 尚未验证。
+
 ### 4.2 用户可观察的交付节点
 
 八个工程阶段按依赖实施；每次演示同时回答“它现在能替用户完成什么”。下列节点不增加阶段数量，也不表示相关能力已经实现。
