@@ -91,8 +91,17 @@ export class ToolRouter {
     } catch (error: unknown) {
       const code = this.errorCode(error)
       const phase = code === "cancelled" || code === "timeout" ? "cancelled" : "failed"
-      await this.lifecycle.failed(call, phase, code, { message: error instanceof Error ? error.message : "Tool execution failed" })
-      return { ...request, status: phase === "cancelled" ? "cancelled" : "failed", output: error instanceof ToolExecutionError ? error.safeOutput : undefined, errorCode: code }
+      const structuredOutput = error instanceof ToolExecutionError ? error.safeOutput : undefined
+      const failureDetail = structuredOutput === undefined
+        ? { message: error instanceof Error ? error.message : "Tool execution failed" }
+        : structuredOutput
+      const safeOutput = await this.lifecycle.failed(call, phase, code, failureDetail)
+      return {
+        ...request,
+        status: phase === "cancelled" ? "cancelled" : "failed",
+        ...(structuredOutput === undefined ? {} : { output: safeOutput }),
+        errorCode: code,
+      }
     }
   }
 

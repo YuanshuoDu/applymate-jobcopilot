@@ -20,7 +20,7 @@ import { loadCanonicalTurnState, type CanonicalTurnState } from "./canonical-tur
 import { AgentTreeManager } from "./subagents/manager.js"
 import { PgSubagentTaskStore } from "./subagents/pg-store.js"
 import { createPgRootTaskStore, type RootTaskStore } from "./subagents/root-task-store.js"
-import { executionOwnerFence, type ExecutionOwnerFence } from "./execution-owner.js"
+import { executionOwnerFence, type ExecutionOwner, type ExecutionOwnerFence } from "./execution-owner.js"
 
 export type UsageAuthorization = {
   settle(input: { status: "success" | "error"; inputTokens: number; outputTokens: number; estimatedCostUsd: number; errorCode?: string }): Promise<void> | void
@@ -161,17 +161,23 @@ export async function createCanonicalTurnRuntime(pool: pg.Pool, options: Canonic
     const toolCapabilities = capabilities(state.toolPolicySnapshot)
     const turnStore = options.turnEngineStoreFactory?.(pool) ?? createPgTurnEngineStore(pool)
     let lifecycleSink: ToolLifecycleSink | null = null
+    let lifecycleOwner: ExecutionOwner | null = null
     const sinkProxy: ToolLifecycleSink = { append: async (event) => {
       if (!lifecycleSink) throw new Error("root_task_not_bound")
       await lifecycleSink.append(event)
     } }
-    const toolRuntime = options.toolRuntimeFactory?.({ pool, policy: selectedPolicy, manager, state }) ?? createWorkerToolRuntime(pool, { sink: sinkProxy }, selectedPolicy, { manager })
+    const resolveOwner = () => {
+      if (!lifecycleOwner) throw new Error("tool_result_owner_unavailable")
+      return lifecycleOwner
+    }
+    const toolRuntime = options.toolRuntimeFactory?.({ pool, policy: selectedPolicy, manager, state }) ?? createWorkerToolRuntime(pool, { sink: sinkProxy, resolveOwner }, selectedPolicy, { manager })
     const allowedActions = toolRuntime.registry.list(toolCapabilities).flatMap((definition) => {
       const name = definition && typeof definition === "object" && "name" in definition ? (definition as { name?: unknown }).name : undefined
       return typeof name === "string" ? [name] : []
     })
     const root = await rootTasks.ensure({ lease, goal: state.goal, modelProfileSnapshot: state.modelProfileSnapshot, toolPolicySnapshot: state.toolPolicySnapshot, budgetSnapshot: state.budgetSnapshot, allowedActions, now: now() })
     const owner = executionOwnerFence({ kind: "turn", taskId: root.id, lease })
+    lifecycleOwner = { kind: "turn", taskId: root.id, lease }
     lifecycleSink = options.lifecycleSinkFactory?.({ lease, store: turnStore, owner }) ?? durableLifecycleSink(turnStore, owner)
     const config = options.modelRuntimeFactory ? undefined : await loadWorkerAiConfig(lease.userId)
     const modelRuntime = await (options.modelRuntimeFactory?.({ userId: lease.userId, config, state }) ?? createHarnessModelRuntime({ primary: config, fallbacks: [], allowEnvironmentFallbacks: false }))

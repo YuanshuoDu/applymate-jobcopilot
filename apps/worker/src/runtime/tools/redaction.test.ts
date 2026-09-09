@@ -9,12 +9,11 @@ describe("tool lifecycle redaction", () => {
     expect(safe).toEqual({ email: "[REDACTED]", password: "[REDACTED]", bearer: "Bearer [REDACTED]", value: "[REDACTED]", content: "[REDACTED]", role: "Engineer", message: "token=[REDACTED]" })
   })
 
-  it("stores large sanitized values and returns only a reference", async () => {
+  it("returns bounded metadata without creating an in-memory reference", async () => {
     const references = new InMemoryToolResultReferenceStore()
     const safe = await sanitizeForLifecycle({ description: "x".repeat(9_000), apiKey: "never-store-raw" }, references, 256)
-    expect(safe).toMatchObject({ $ref: expect.stringMatching(/^tool-result:/), sizeBytes: expect.any(Number), sha256: expect.any(String) })
-    const stored = references.get((safe as { $ref: string }).$ref)
-    expect(stored).toMatchObject({ apiKey: "[REDACTED]" })
+    expect(safe).toMatchObject({ $truncated: true, sizeBytes: expect.any(Number), sha256: expect.any(String) })
     expect(JSON.stringify(safe)).not.toContain("never-store-raw")
+    expect(references.get("tool-result:unused")).toBeUndefined()
   })
 })

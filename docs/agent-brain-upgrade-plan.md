@@ -1,6 +1,6 @@
 # ApplyMate Agent Harness：从可执行对话到可监督的任务系统
 
-版本：2026-09-08。性质：后续架构与实施计划，尚未实现的能力均为规划。
+版本：2026-09-09。性质：后续架构与实施计划，尚未实现的能力均为规划。
 
 本计划服务于用户提出的完整目标：Agent 栏目具有长期 session、规划、任务拆分、worker 调度、工具与权限、暂停/恢复、失败重试、状态持久化、事件流、人工审批和可靠结果闭环。它补充现有 V2 roadmap 与 `docs/agent-brain-integration.md`，不另起 Agent V3，也不把一个 PR 的完成等同于整个目标完成。
 
@@ -29,7 +29,7 @@
 | 根/子执行循环 | owner-neutral loop 已提取；测试覆盖子任务身份与后续模型观察 | 真实 child store/executor 与生产启动组合尚未接通 |
 | 结果存储与等待 | 私有工具结果、wait 的两个附加模型及迁移源码已准备 | 生命周期绑定、真实数据库/RLS、持久化等待与唤醒闭环 |
 | Supervisor UI | 共享 timeline、任务树、证据选择、分页已加入；生产构建的桌面/手机中英文 fixture 4/4 通过 | 已登录环境、真实子任务和审批恢复的联调 |
-| CI | `d710a9d` 的主要 CI 曾通过；`2f8c9ce` 暴露新增测试的 TypeScript 错误 | 一行 fixture 类型修复已由 Luna 完成，针对性 2/2 与 Worker build 通过；修复后新 head CI 仍需确认 |
+| CI | P0 基线 `28a4bf0` 已通过完整 CI；`9391232` 的 Tests、类型、构建、Harness、浏览器矩阵均已通过 | 真实数据库 dump rehearsal 跳过，不计作数据库证明；之后的修改另行记录检查范围 |
 | 上线 | PR 仍为 draft | 未合并、未部署、未应用迁移；未宣称生产已具备完整能力 |
 
 测试、类型检查、浏览器 fixture、真实数据库、真实模型和生产运行分别记录，不能互相替代。上述代码进展来自本任务已有调查和验证，本次规划不重复进行全仓审计。
@@ -146,7 +146,7 @@ wait 的 outcome 与 `suspendedAt`、`consumedAt` 分别表达结果和交接状
 | P6 完整工作台 | 实时监督、steer、任务操作、审批与材料版本 | 对应后端能力完成后逐项启用 | 已登录环境端到端，双语和移动端 |
 | P7 验证与发布 | Verifier/Reducer、评测、故障注入、渐进开放 | P1–P6 | 独立数据库/Worker/模型/浏览器证据与发布门槛 |
 
-P4 的副作用防绕过检查从第一项领域工具迁入时开始，不能留到最后才检查。P7 的故障测试也随相应阶段建立，最终阶段负责完整组合验收。
+P4 的副作用防绕过约束从第一项领域工具迁入时保留。按用户 2026-09-09 的最新要求，开发优先：每个切片仅做能快速发现接线、类型或关键边界错误的检查；真实数据库/RLS、并发故障、进程重启、完整浏览器与跨模块回归集中到 P7 组合验收。验证环境尚未就绪不阻塞后续业务接线，也不能据此宣称已验证。
 
 ### 4.1 执行进度口径（2026-09-08 更新）
 
@@ -154,11 +154,29 @@ P4 的副作用防绕过检查从第一项领域工具迁入时开始，不能�
 
 当前完整验收 **1/8，12.5%**。P0 已完成：`28a4bf0` 的 [CI](https://github.com/YuanshuoDu/applymate-jobcopilot/actions/runs/34269901452)、[浏览器矩阵](https://github.com/YuanshuoDu/applymate-jobcopilot/actions/runs/34269901309) 和 [Harness contract/build](https://github.com/YuanshuoDu/applymate-jobcopilot/actions/runs/34269901461) 均已成功。真实数据库 dump rehearsal 跳过，不能算数据库验证。
 
-当前推进 P1 的工作包 1A。根循环、owner-neutral loop 和私有结果源码已有部分基础；真实 child executor/持久化等待仍未接通。P6 已有工作台 fixture 证据，但真实子任务和审批联调尚未满足其完整验收。其余阶段保持未完成。后续新提交仍须通过对应检查，P0 基线通过不代表未来 head 自动通过。
+当前推进 P1 的工作包 1B；1A 候选实现已提交，真实数据库验证记入最终验收清单。根循环、owner-neutral loop 和私有结果源码已有部分基础；真实 child executor/持久化等待仍未接通。P6 已有工作台 fixture 证据，但真实子任务和审批联调尚未满足其完整验收。其余阶段保持未完成。后续新提交仍须记录自身验证状态，P0 基线通过不代表未来 head 自动通过。
 
 2026-09-09：1A 已形成经过 Astra Review 和 Luna 返修的候选代码，覆盖真实 owner 传递、存储锁与任务/attempt 校验、全局步骤序号、根历史过滤及租约修复。两组针对性检查曾通过 26 和 29 项；最终锁/lineage 修复后重跑的 8 项及 Worker build 通过，数量有重叠。真实 PostgreSQL 验证尚缺，P1 未完整验收，阶段比例仍为 1/8。详见集成文档中的 Ownership persistence candidate。
 
 额度接近上限时报告：总阶段数、完整验收数与比例、当前工作包、此次新增证据、尚未完成及已提交/推送状态。最高产品验收仍是目标驱动的真实规划、执行、证据反馈和重新规划，而不是界面或状态字段数量。
+
+开发顺序继续为 1B → 1C → 2A/2B → P3 首个目标驱动切片。1A 的 PostgreSQL/并发/RLS 欠账不作为启动这些开发工作的前置门槛；已实现、快速检查通过、完整验收通过分别记录。2026-09-09 的有界环境探查确认本机 Docker backend 不可用，未创建数据库或运行迁移；不继续排查宿主环境。最终可采用隔离 CI PostgreSQL service 做集成证明。
+
+1B 随后的候选代码已接入根运行时：大工具最终结果写入私有存储，实际 registry 注册分块读取，根 Task 创建后绑定当前 owner；输入/进度和异常使用有界清理结果。Astra Review 发现的异常返回绕过路径已由 Luna 修正。初始相关组 14 项、修正后的 router 组 9 项与 Worker 编译通过；真实数据库/跨进程读取延后验证。下一开发包为 1C，阶段完整验收仍为 1/8。
+
+### 4.2 用户可观察的交付节点
+
+八个工程阶段按依赖实施；每次演示同时回答“它现在能替用户完成什么”。下列节点不增加阶段数量，也不表示相关能力已经实现。
+
+| 节点 | 用户能够观察到的变化 | 必须保留的证明 |
+| --- | --- | --- |
+| P1–P2 结束 | 一个请求可以委派两个独立任务；关闭页面、重启 Worker 后继续等结果 | 实际 task/attempt、持久化结果、恢复前后事件、唯一父任务归并 |
+| P3 首个切片 | 同一 Agent 根据目标选择直接回答、检索或委派；收到不足或矛盾证据时修改计划 | 已接受的目标和计划版本、选取的行动、工具反馈、修订原因、引用 |
+| P3–P4 组合 | “比较职位”和“准备申请材料”触发不同流程；Reviewer 能退回指定材料版本修正 | 各任务输入输出、材料版本、审查意见、修正结果；无依据的职业信息不进入材料 |
+| P5 结束 | 长会话或换模型后仍记得限制、进展和待批准内容；用户纠正旧事实会生效 | 压缩前后约束对照、可解析证据、事实修订和恢复测试 |
+| P6–P7 结束 | 用户在工作台干预、审批、继续，并能核对最终完成与未完成项目 | 真实命令消费、审批版本、执行回执、可追溯统计和异常恢复证据 |
+
+P3 的第一个切片只使用已接通的少量只读能力，不等待所有求职工具迁移、通用 DAG 或完整记忆系统完成。它必须尽早证明目标驱动的决策和反馈调整，随后再扩展任务种类。实施工时要在各工作包的接口调查后估算；不根据源码行数或 Agent 数量承诺日期。
 
 ## 5. P1–P2：先得到一个真的能带队执行的根 Agent
 
@@ -183,7 +201,7 @@ P4 的副作用防绕过检查从第一项领域工具迁入时开始，不能�
 
 具体工作：
 
-- 替换 lifecycle 中大结果的进程内引用，使用已清理、可校验的 durable JSON。
+- 替换 lifecycle 中工具最终输出的进程内引用，使用已清理、可校验的 durable JSON。沿用真实 `(stepId, toolCallId)` 唯一身份；输入、进度和抛出异常的事件保留有界摘要及明确截断信息，不占用或覆盖最终结果，不生成无法跨进程读取的引用。
 - 引用绑定 task/step/toolCall 身份；相同操作重复写入必须返回同一结果，冲突内容不能静默覆盖。
 - 在真实 registry 中启用有权限校验的分块读取工具。
 - 保持当前设计上限：单结果 canonical JSON 1 MiB；读取响应最多 4,096 bytes；超限显式报错，不悄悄丢证据。
@@ -288,6 +306,25 @@ TaskResult
 CustomAgent 逐步迁出 `insertAfter` 的固定插入模式；旧配置通过兼容模板映射，不能删除用户已保存配置。自定义 prompt 可以提供专业方法，不能修改用户身份、审批或预算规则。
 
 验收：同样工具下，“解释一个 JD”“比较三家公司”“准备五份申请材料”采用不同规模和依赖的计划；额外派 Agent 必须由独立任务收益支持。伪造工具、循环依赖、越权输入、重复 spawn、过时 revision 和提前 final 都被拒绝。
+
+### 6.5 第一个“会调整计划”的演示与评测
+
+首个垂直切片沿用已经可运行的 root/child executor、ModelAdapter、ToolRouter、wait 和结果引用，只新增目标/计划提议的校验与接线。模型可以提出 `use_tool`、`delegate`、`revise_plan`、`request_input`、`propose_completion` 等语义；最终协议映射到现有 typed action，不额外建立平行命令系统。用户看到的是简短决策说明、行动和证据。
+
+固定验收目标示例：“找 5 个适合我的 Ireland remote Java 后端职位，列出匹配依据；签证支持没有证据就标为未知。”数字是这个测试目标的成功条件，不是产品默认搜索上限。
+
+| 输入或反馈变化 | 应观察到的决策 | 拒绝的行为 |
+| --- | --- | --- |
+| 只要求解释一个已给出的 JD | 在现有资料充分时直接分析 | 无收益地创建多个 worker |
+| 两个独立合法来源可补足结果 | 在容量和预算内拆分检索，再去重归并 | 给每个 child 复制完整预算或跨范围资料 |
+| 第一轮只有 2 个有效职位 | 保存这 2 个结果，针对缺口选择其他已授权来源；没有可用来源时报告部分完成 | 原样重复同一搜索，或把不足 5 个宣告为目标完成 |
+| 两份资料对签证支持互相矛盾 | 保留冲突，核查更直接的来源；无法核实则标未知 | 为凑够结果自动推断签证支持 |
+| 用户把地域改为 Dublin onsite | 记录新目标版本，重新判断受影响结果与待执行任务 | 继续按旧约束生成材料或使用旧批准 |
+| 重规划连续没有新增有效结果 | 到达持久化的无进展/预算上限后停止，并解释已完成和缺口 | 无限反思、重试或递归派工 |
+
+先用确定性 provider 驱动同一生产执行组合，证明状态和调度正确；再用现有 API 配置做有预算上限的真实模型评测，证明模型确实能产生合适决策。前者不能替代后者，也不能只用关键词路由的固定测试脚本声称模型具备规划能力。两类结果分别记录模型配置、输入版本、计划与修订、工具证据、用量和是否满足成功条件。
+
+此切片通过前不扩展更多角色或规划抽象。若模型经常给出无效或无收益的计划，先调整能力描述、输入上下文、输出 schema 和有界修复策略；不要用更多并行模型调用掩盖问题。
 
 ## 7. P4：把已有求职能力变成大脑的可调用能力
 
@@ -408,9 +445,9 @@ Reducer 从 TaskResults、ToolReceipts、Artifacts、VerifiedFacts、Failures、
 
 - Astra 负责理解、架构、拆分、风险和最终 Review；读代码、实现、debug、类型修复、测试交给显式 Luna xhigh。
 - 同时最多一个 Luna；复用当前 worker，但新任务给精简上下文与准确路径，不复制全部历史。
-- 每项任务一次完成实现和针对性测试；Astra 仅根据具体发现返修。
-- 改测试代码也要运行受影响 package 的类型/build 检查，避免 Vitest 只转译通过却在 CI 编译失败。
-- 日常只跑相关验证；接口/全局配置变化、阶段集成和发布前才扩大检查范围。
+- 每项任务优先完成真实执行接线；Astra 仅根据具体发现返修，不为等待完整验证停下下一项开发。
+- 快速检查按变更选择：少量相关测试或一次受影响 package 的类型/build 检查；不机械地重复两者。已有测试夹具引起类型错误时才针对性修复。
+- 实际数据库/RLS、并发、故障恢复、完整 UI 和跨模块回归集中到最终联调；沿途维护欠账清单。省略验证必须明确记录，不能用代码已提交代替验收通过。
 - 不因额度不足改用其他子智能体模型，不自动兑换额度重置；保存可恢复的已知状态。
 
 ### 产品运行
@@ -447,8 +484,10 @@ No unrelated refactor, dependency/provider addition, public model-ID guess,
 production migration, deployment, real provider call or employer submission.
 No commit, push, PR creation, merge or external message.
 
-Verification:
-[focused tests] + [affected package type/build check]
+Quick check:
+[small focused test or affected package compile check, as appropriate]
+Do not delay the next implementation for a full verification matrix.
+Record real DB, process recovery and end-to-end checks for final integration.
 Use real composition for integration AC; deterministic providers in tests.
 
 Return:
@@ -457,7 +496,7 @@ If a contract is missing, report the concrete dependency before editing
 outside the allowed paths. Do not create a fake working implementation.
 ```
 
-第一项实际开发任务是 1A：真实 step/item owner 与根历史范围。之后 1B、1C、2A、2B 按依赖串行完成；不要把“再画任务树”排在前面。
+1A 的真实 step/item owner 与根历史范围已有候选实现。当前直接开发 1B，随后 1C、2A、2B 按接口依赖串行完成，并尽早进入 P3 的目标驱动切片；不要把更多 UI 或验证基础设施排在执行接线前面。
 
 ## 13. 渐进发布与最终场景
 
