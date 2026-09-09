@@ -3,7 +3,7 @@ import { Buffer } from "node:buffer"
 import type { PolicyEngine } from "@jobcopilot/agent-policy"
 import type { PolicyRole, TenantScope } from "@jobcopilot/agent-protocol"
 
-import { PLAN_MAX_NODES, PLAN_MAX_REVISIONS, isPlainJsonObject, type GoalContract, type GoalContractRef } from "./goal-plan-contract.js"
+import { copyAllowedPlanActions, PLAN_MAX_NODES, PLAN_MAX_REVISIONS, isPlainJsonObject, type GoalContract, type GoalContractRef, type PlanActionKind } from "./goal-plan-contract.js"
 import { PlanDispatchError, dispatchPlanProposal } from "./plan-intent-dispatcher.js"
 import { copyPlanFingerprints, fingerprintPlanProposal, isPlanFingerprint } from "./plan-fingerprint.js"
 import { PlanValidationError, validatePlanProposal } from "./goal-plan-validator.js"
@@ -15,7 +15,6 @@ import type { StepContextSnapshot } from "../context/step-context-builder.js"
 
 const MAX_OBSERVATIONS = 8
 const MAX_RESULT_BYTES = 8 * 1024
-const PLAN_ACTIONS = ["use_tool", "delegate", "request_input", "propose_completion"] as const
 const OUTPUT_KEYS = ["status", "goalRevision", "planRevision", "basedOnPlanRevision", "proposal", "intents", "proposalHash"]
 
 type Registry = { list(capabilities?: readonly string[]): readonly unknown[] }
@@ -27,6 +26,8 @@ export type CanonicalPlanExecutionOptions = {
   readonly allowedTools: readonly string[]
   readonly allowedTemplates: readonly string[]
   readonly allowedRoles: readonly string[]
+  /** Server-owned action capability gate; omitted means all plan actions remain compatible. */
+  readonly allowedPlanActions?: readonly PlanActionKind[]
   readonly maxNodes: number
   readonly initialPlanRevision?: number | null
   readonly capabilities: readonly string[]
@@ -177,6 +178,7 @@ export function createCanonicalPlanExecutionFactory(options: CanonicalPlanExecut
   const allowedTools = Object.freeze([...options.allowedTools])
   const allowedTemplates = Object.freeze([...options.allowedTemplates])
   const allowedRoles = Object.freeze([...options.allowedRoles])
+  const allowedPlanActions = copyAllowedPlanActions(options.allowedPlanActions)
   const seenPlanHashes = new Set(copyPlanFingerprints(options.initialPlanHashes))
   let currentPlanRevision: number | null = options.initialPlanRevision ?? null
   let goalRevision = options.goal.revision
@@ -193,7 +195,7 @@ export function createCanonicalPlanExecutionFactory(options: CanonicalPlanExecut
       const output = accepted(input.result.output, goal.revision, currentPlanRevision, maxPlanRevisions)
       const validation = {
         goalRevision: goal.revision, planRevision: output.basedOnPlanRevision, maxNodes: options.maxNodes,
-        allowedActions: [...PLAN_ACTIONS], allowedTools, allowedTemplates, allowedRoles,
+        allowedActions: allowedPlanActions, allowedTools, allowedTemplates, allowedRoles,
       } as const
       let normalized: ReturnType<typeof validatePlanProposal>
       try { normalized = validatePlanProposal(output.proposal, { goalRevision: goal.revision }) } catch (error: unknown) { if (error instanceof PlanValidationError) throw new CanonicalPlanError("invalid_plan_output"); throw error }

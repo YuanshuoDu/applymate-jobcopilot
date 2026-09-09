@@ -2,7 +2,7 @@ import { Type, type Static } from "@sinclair/typebox"
 import { schemaVersion } from "@jobcopilot/agent-protocol"
 
 import { ToolExecutionError, type RuntimeToolDefinition } from "../tools/types.js"
-import { PLAN_MAX_NODES, PLAN_MAX_REVISIONS, type GoalContract, type GoalContractRef, type PlanProposal } from "./goal-plan-contract.js"
+import { copyAllowedPlanActions, PLAN_MAX_NODES, PLAN_MAX_REVISIONS, type GoalContract, type GoalContractRef, type PlanActionKind, type PlanProposal } from "./goal-plan-contract.js"
 import { copyPlanFingerprints, fingerprintPlanProposal } from "./plan-fingerprint.js"
 import { toRuntimeActionIntents, type RuntimeActionIntent } from "./goal-plan-actions.js"
 import { PlanValidationError, validatePlanProposal } from "./goal-plan-validator.js"
@@ -31,6 +31,8 @@ export type PlanProposalToolOptions = {
   readonly allowedTools: readonly string[]
   readonly allowedTemplates: readonly string[]
   readonly allowedRoles: readonly string[]
+  /** Server-owned action capability gate; omitted means all plan actions remain compatible. */
+  readonly allowedPlanActions?: readonly PlanActionKind[]
   readonly maxNodes: number
   /** Recovered durable revision; null means no accepted proposal exists yet. */
   readonly initialPlanRevision?: number | null
@@ -54,6 +56,7 @@ export function createPlanProposalTool(options: PlanProposalToolOptions): Runtim
   const allowedTools = copyAllowlist("tool", options.allowedTools)
   const allowedTemplates = copyAllowlist("template", options.allowedTemplates)
   const allowedRoles = copyAllowlist("role", options.allowedRoles)
+  const allowedPlanActions = copyAllowedPlanActions(options.allowedPlanActions)
   const seenPlanHashes = new Set(copyPlanFingerprints(options.initialPlanHashes))
   let planRevision: number | null = options.initialPlanRevision ?? null
   let goalRevision = options.goal.revision
@@ -73,7 +76,7 @@ export function createPlanProposalTool(options: PlanProposalToolOptions): Runtim
         if (nextRevision > maxPlanRevisions) throw new ToolExecutionError("plan_revision_limit", "Plan revision limit reached", { maxPlanRevisions })
         const proposal = validatePlanProposal(input.proposal, {
           goalRevision: goal.revision, planRevision, maxNodes: options.maxNodes,
-          allowedActions: ["use_tool", "delegate", "request_input", "propose_completion"], allowedTools,
+          allowedActions: allowedPlanActions, allowedTools,
           allowedTemplates, allowedRoles,
         })
         const proposalHash = fingerprintPlanProposal(proposal)

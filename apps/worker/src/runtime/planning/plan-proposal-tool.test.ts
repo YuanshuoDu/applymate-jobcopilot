@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest"
 
 import { createPlanProposalTool } from "./plan-proposal-tool.js"
-import { PLAN_MAX_NODES, PLAN_MAX_REVISIONS, PLAN_PROPOSAL_SCHEMA_VERSION, type GoalContract, type PlanProposal } from "./goal-plan-contract.js"
+import { PLAN_MAX_NODES, PLAN_MAX_REVISIONS, PLAN_PROPOSAL_SCHEMA_VERSION, type GoalContract, type PlanActionKind, type PlanProposal } from "./goal-plan-contract.js"
 import { fingerprintPlanProposal } from "./plan-fingerprint.js"
 
 const goal: GoalContract = { revision: 1, objective: "Find jobs", constraints: [], successCriteria: ["review results"], knownFacts: [], unresolvedQuestions: [], approvalBoundaries: [], budgetRef: "runtime:turn" }
@@ -31,6 +31,19 @@ describe("plan proposal tool", () => {
     const definition = createPlanProposalTool({ ...toolOptions(), allowedTools })
     allowedTools.push("jobs.get")
     await expect(definition.execute(context(), { proposal: plan({ nodes: [{ ...baseNode, toolName: "jobs.get" }] }) })).rejects.toMatchObject({ code: "plan_invalid" })
+  })
+
+  it("enforces the server-owned plan action capability gate", async () => {
+    const delegateNode = { ...baseNode, localId: "child", kind: "delegate" as const, toolName: undefined, objective: "Review results", role: "scout", taskType: "research" }
+    const disabled = createPlanProposalTool(toolOptions({ allowedPlanActions: ["use_tool"] }))
+    await expect(disabled.execute(context(), { proposal: plan({ nodes: [delegateNode] }) })).rejects.toMatchObject({ code: "plan_invalid", safeOutput: { issues: expect.arrayContaining([expect.objectContaining({ code: "action_not_allowed" })]) } })
+    const enabled = createPlanProposalTool(toolOptions({ allowedPlanActions: ["use_tool", "delegate"] }))
+    await expect(enabled.execute(context(), { proposal: plan({ nodes: [delegateNode] }) })).resolves.toMatchObject({ status: "accepted", intents: [{ kind: "delegate" }] })
+  })
+
+  it("rejects malformed server action capability configuration", () => {
+    expect(() => createPlanProposalTool(toolOptions({ allowedPlanActions: ["unknown"] as unknown as PlanActionKind[] }))).toThrow("plan action allowlist")
+    expect(() => createPlanProposalTool(toolOptions({ allowedPlanActions: null }))).toThrow("plan action allowlist")
   })
 
   it("accepts the first proposal, increments the private plan revision, and returns intents only", async () => {

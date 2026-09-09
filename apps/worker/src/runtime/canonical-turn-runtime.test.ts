@@ -264,6 +264,24 @@ describe("createCanonicalTurnRuntime", () => {
     expect(factory).toHaveBeenCalledTimes(1)
   })
 
+  it("derives plan action capabilities from the server coordination gate", async () => {
+    const disabledFactory = vi.fn((input: { allowedPlanActions?: readonly string[] }) => {
+      expect(input.allowedPlanActions).toEqual(["use_tool", "request_input", "propose_completion"])
+      return async () => ({ observations: [] })
+    })
+    const disabled = setup({ coordinationEnabled: false, planningEnabled: true, planningExecutionEnabled: true, planExecutionFactory: disabledFactory })
+    await (await disabled.runtime).execute({ lease, signal: new AbortController().signal })
+    expect(disabledFactory).toHaveBeenCalledTimes(1)
+
+    const enabledFactory = vi.fn((input: { allowedPlanActions?: readonly string[] }) => {
+      expect(input.allowedPlanActions).toEqual(["use_tool", "delegate", "request_input", "propose_completion"])
+      return async () => ({ observations: [] })
+    })
+    const enabled = setup({ coordinationEnabled: true, planningEnabled: true, planningExecutionEnabled: true, planExecutionFactory: enabledFactory })
+    await (await enabled.runtime).execute({ lease, signal: new AbortController().signal })
+    expect(enabledFactory).toHaveBeenCalledTimes(1)
+  })
+
   it("passes the server-hydrated goal semantics to the planning bridge", async () => {
     const factory = vi.fn((input: { goal: { constraints: readonly string[]; successCriteria: readonly string[]; knownFacts: readonly string[] } }) => {
       expect(input.goal).toMatchObject({ constraints: ["EU only"], successCriteria: ["ranked"], knownFacts: ["Dublin"] })

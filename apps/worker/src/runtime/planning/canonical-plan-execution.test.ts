@@ -3,7 +3,7 @@ import type { PolicyEngine } from "@jobcopilot/agent-policy"
 import type { ToolCallRequest, ToolExecutionResult, ToolRouterContext } from "../tools/types.js"
 import type { StepContextSnapshot } from "../context/step-context-builder.js"
 import { executionOwnerFence } from "../execution-owner.js"
-import { PLAN_PROPOSAL_SCHEMA_VERSION, type GoalContract, type GoalContractRef, type PlanProposal } from "./goal-plan-contract.js"
+import { PLAN_PROPOSAL_SCHEMA_VERSION, type GoalContract, type GoalContractRef, type PlanActionKind, type PlanProposal } from "./goal-plan-contract.js"
 import { fingerprintPlanProposal } from "./plan-fingerprint.js"
 import { createCanonicalPlanExecutionFactory, type CanonicalPlanExecutionOptions } from "./canonical-plan-execution.js"
 import type { PlanCommandReceipt } from "./plan-command-receipt.js"
@@ -31,13 +31,13 @@ function output(value: PlanProposal, overrides: Record<string, unknown> = {}): R
   return { status: "accepted", goalRevision: 1, planRevision: 1, basedOnPlanRevision: null, proposal: value, intents: [], proposalHash: fingerprintPlanProposal(value), ...overrides }
 }
 
-function fixture(router: { execute(context: ToolRouterContext, request: ToolCallRequest): Promise<ToolExecutionResult> } = { execute: async (_context, request) => ({ ...request, status: "completed", output: { ok: true }, errorCode: null }) }, initialPlanRevision?: number, persistOutcome?: (receipt: PlanCommandReceipt) => Promise<void> | void, maxPlanRevisions?: number, initialPlanHashes?: readonly string[], goalRef?: GoalContractRef) {
+function fixture(router: { execute(context: ToolRouterContext, request: ToolCallRequest): Promise<ToolExecutionResult> } = { execute: async (_context, request) => ({ ...request, status: "completed", output: { ok: true }, errorCode: null }) }, initialPlanRevision?: number, persistOutcome?: (receipt: PlanCommandReceipt) => Promise<void> | void, maxPlanRevisions?: number, initialPlanHashes?: readonly string[], goalRef?: GoalContractRef, allowedPlanActions?: readonly PlanActionKind[]) {
   const options: CanonicalPlanExecutionOptions = {
     goal, allowedTools: ["jobs.search"], allowedTemplates: [], allowedRoles: ["scout"], maxNodes: 8,
     capabilities: ["read", "canPlan"], actorRole: "orchestrator", scope: { userId: "user-1" }, lease,
     rootTaskId: "root-1", taskId: "root-1", initialPlanRevision, router,
     registry: { list: () => [{ name: "jobs.search", version: "1", risk: "read", capabilities: ["read"] }] },
-    policy: {} as PolicyEngine, ...(persistOutcome ? { persistOutcome } : {}), ...(maxPlanRevisions === undefined ? {} : { maxPlanRevisions }), ...(initialPlanHashes ? { initialPlanHashes } : {}), ...(goalRef ? { goalRef } : {}),
+    policy: {} as PolicyEngine, ...(persistOutcome ? { persistOutcome } : {}), ...(maxPlanRevisions === undefined ? {} : { maxPlanRevisions }), ...(initialPlanHashes ? { initialPlanHashes } : {}), ...(goalRef ? { goalRef } : {}), ...(allowedPlanActions === undefined ? {} : { allowedPlanActions }),
   }
   return createCanonicalPlanExecutionFactory(options)
 }
@@ -61,7 +61,7 @@ describe("createCanonicalPlanExecutionFactory", () => {
     const requests: ToolCallRequest[] = []
     const contexts: ToolRouterContext[] = []
     const router = { execute: vi.fn(async (context: ToolRouterContext, request: ToolCallRequest) => { contexts.push(context); requests.push(request); return { ...request, status: "completed" as const, output: { ok: true }, errorCode: null } }) }
-    const hook = fixture(router)
+    const hook = fixture(router, undefined, undefined, undefined, undefined, undefined, ["use_tool", "delegate"])
     const result = await hook(input(output(proposal([use("read"), delegate("child", { dependsOn: ["read"] })]))))
     expect(result.wait).toBeUndefined()
     expect(router.execute).toHaveBeenCalledTimes(2)
@@ -70,6 +70,14 @@ describe("createCanonicalPlanExecutionFactory", () => {
     expect(requests[1]?.input).toMatchObject({ role: "scout", taskType: "research" })
     expect(JSON.stringify(requests[1]?.input)).not.toMatch(/userId|taskId|parentTaskId|rootTaskId|lease|budgetLimit|maxBudget/)
     expect(result.observations).toHaveLength(2)
+  })
+
+  it("revalidates accepted output against the server action capability gate", async () => {
+    const router = { execute: vi.fn(async (_context: ToolRouterContext, request: ToolCallRequest) => ({ ...request, status: "completed" as const, output: { ok: true }, errorCode: null })) }
+    const hook = fixture(router, undefined, undefined, undefined, undefined, undefined, ["use_tool"])
+    const result = await hook(input(output(proposal([delegate("child")]))))
+    expect(observationCode(result)).toBe("invalid_plan")
+    expect(router.execute).not.toHaveBeenCalled()
   })
 
   it("persists each command outcome before the next command and includes failures/controls", async () => {

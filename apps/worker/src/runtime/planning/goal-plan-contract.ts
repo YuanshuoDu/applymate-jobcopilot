@@ -22,7 +22,19 @@ export type GoalContractRef = {
   readonly update: (next: GoalContract) => void
 }
 
-export type PlanActionKind = "use_tool" | "delegate" | "request_input" | "propose_completion"
+export const PLAN_ACTION_KINDS = ["use_tool", "delegate", "request_input", "propose_completion"] as const
+export type PlanActionKind = typeof PLAN_ACTION_KINDS[number]
+
+export function copyAllowedPlanActions(value: readonly PlanActionKind[] | undefined): readonly PlanActionKind[] {
+  const candidate: unknown = value === undefined ? PLAN_ACTION_KINDS : value
+  if (!Array.isArray(candidate)) throw new TypeError("Invalid plan action allowlist")
+  const result: PlanActionKind[] = []
+  for (const action of candidate) {
+    if (typeof action !== "string" || !PLAN_ACTION_KINDS.includes(action as PlanActionKind) || result.includes(action as PlanActionKind)) throw new TypeError("Invalid plan action allowlist")
+    result.push(action as PlanActionKind)
+  }
+  return Object.freeze(result)
+}
 
 export type PlanBudgetRequest = string | {
   readonly ref: string
