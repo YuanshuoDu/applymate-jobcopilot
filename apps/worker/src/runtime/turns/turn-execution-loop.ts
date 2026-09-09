@@ -248,7 +248,7 @@ async function executeTools(
     if (result.status === "completed") {
       completedToolResults.push(result)
       if (call.name === "agent.plan.propose") {
-        const revision = parsePlanRevisionReceipt(result.output, call.id)
+        const revision = parsePlanRevisionReceipt(result.output, call.id, { requireProposalHash: true })
         if (revision) {
           await writer.append("plan.revision", call.id, null, revision, `plan-revision:${call.id}`)
           const projection = planRevisionObservation(revision)

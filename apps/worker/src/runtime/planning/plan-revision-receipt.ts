@@ -2,19 +2,23 @@ import { Buffer } from "node:buffer"
 
 import type { RepositoryJsonValue } from "@jobcopilot/agent-protocol"
 
-import { isPlainJsonObject } from "./goal-plan-contract.js"
+import { PLAN_MAX_REVISIONS, isPlainJsonObject } from "./goal-plan-contract.js"
+import { fingerprintPlanProposal, isPlanFingerprint } from "./plan-fingerprint.js"
+import { normalizePlanProposal } from "./goal-plan-validator.js"
 
 const MAX_ID_LENGTH = 240
 const MAX_RECEIPT_BYTES = 64 * 1024
-const OUTPUT_KEYS = ["status", "goalRevision", "planRevision", "basedOnPlanRevision", "proposal", "intents"] as const
-const RECEIPT_KEYS = ["planCallId", "goalRevision", "planRevision", "basedOnPlanRevision"] as const
+const OUTPUT_KEYS = ["status", "goalRevision", "planRevision", "basedOnPlanRevision", "proposal", "intents", "proposalHash"] as const
+const RECEIPT_KEYS = ["planCallId", "goalRevision", "planRevision", "basedOnPlanRevision", "proposalHash"] as const
 
 export type PlanRevisionReceipt = {
   readonly planCallId: string
   readonly goalRevision: number
   readonly planRevision: number
   readonly basedOnPlanRevision: number | null
+  readonly proposalHash?: string
 }
+export type PlanRevisionReceiptParseOptions = { readonly requireProposalHash?: boolean }
 
 export function isBoundedPlanJson(value: unknown, seen = new Set<object>()): boolean {
   if (value === null || typeof value === "string" || typeof value === "boolean") return true
@@ -41,16 +45,24 @@ function metadata(value: Record<string, unknown>, planCallId: string | undefined
   const basedOn = value.basedOnPlanRevision
   if (!validId(id) || !validRevision(value.goalRevision, 1) || !validRevision(value.planRevision, 1) ||
     (basedOn !== null && !validRevision(basedOn, 0)) || value.planRevision !== (basedOn === null ? 1 : basedOn + 1)) return null
-  return { planCallId: id, goalRevision: value.goalRevision, planRevision: value.planRevision, basedOnPlanRevision: basedOn as number | null }
+  const proposalHash = value.proposalHash
+  if (proposalHash !== undefined && !isPlanFingerprint(proposalHash)) return null
+  return { planCallId: id, goalRevision: value.goalRevision, planRevision: value.planRevision, basedOnPlanRevision: basedOn as number | null, ...(proposalHash === undefined ? {} : { proposalHash }) }
 }
 
 /** Parses the server-shaped output of agent.plan.propose and supplies the call id. */
-export function parsePlanRevisionReceipt(value: unknown, planCallId: string): PlanRevisionReceipt | null {
+export function parsePlanRevisionReceipt(value: unknown, planCallId: string, options: PlanRevisionReceiptParseOptions = {}): PlanRevisionReceipt | null {
   if (!isPlainJsonObject(value) || !isBoundedPlanJson(value) || Object.keys(value).some(key => !(OUTPUT_KEYS as readonly string[]).includes(key))) return null
   if (value.status !== "accepted" || !isPlainJsonObject(value.proposal) || !Array.isArray(value.intents) || value.intents.length > 8) return null
+  if (options.requireProposalHash && !isPlanFingerprint(value.proposalHash)) return null
   const encoded = JSON.stringify(value)
   if (encoded === undefined || Buffer.byteLength(encoded, "utf8") > MAX_RECEIPT_BYTES) return null
-  return metadata({ goalRevision: value.goalRevision, planRevision: value.planRevision, basedOnPlanRevision: value.basedOnPlanRevision }, planCallId)
+  if (value.proposalHash !== undefined) {
+    try {
+      if (fingerprintPlanProposal(normalizePlanProposal(value.proposal)) !== value.proposalHash) return null
+    } catch { return null }
+  }
+  return metadata({ goalRevision: value.goalRevision, planRevision: value.planRevision, basedOnPlanRevision: value.basedOnPlanRevision, ...(value.proposalHash === undefined ? {} : { proposalHash: value.proposalHash }) }, planCallId)
 }
 
 export function parsePlanRevisionEvent(value: unknown): PlanRevisionReceipt | null {
@@ -61,6 +73,23 @@ export function parsePlanRevisionEvent(value: unknown): PlanRevisionReceipt | nu
 export function planRevisionObservation(receipt: PlanRevisionReceipt): { id: string; content: RepositoryJsonValue } {
   return {
     id: `plan-revision:${receipt.planCallId}`,
-    content: { kind: "plan_revision", planCallId: receipt.planCallId, goalRevision: receipt.goalRevision, planRevision: receipt.planRevision, basedOnPlanRevision: receipt.basedOnPlanRevision },
+    content: { kind: "plan_revision", planCallId: receipt.planCallId, goalRevision: receipt.goalRevision, planRevision: receipt.planRevision, basedOnPlanRevision: receipt.basedOnPlanRevision, ...(receipt.proposalHash === undefined ? {} : { proposalHash: receipt.proposalHash }) },
   }
+}
+
+type RevisionEvent = { readonly type: unknown; readonly payload: unknown }
+
+export function restorePlanRevisions(events: readonly RevisionEvent[]): { readonly latest: PlanRevisionReceipt | null; readonly hashes: readonly string[] } {
+  let latest: PlanRevisionReceipt | null = null
+  const hashes: string[] = []
+  for (const event of events) {
+    const payload = isPlainJsonObject(event.payload) ? event.payload : {}
+    const candidate = event.type === "plan.revision" ? parsePlanRevisionEvent(payload)
+      : event.type === "tool_call.completed" && payload.toolName === "agent.plan.propose" && typeof payload.toolCallId === "string"
+        ? parsePlanRevisionReceipt(payload.output, payload.toolCallId) : null
+    if (!candidate || candidate.planRevision !== (latest ? latest.planRevision + 1 : 1) || candidate.basedOnPlanRevision !== (latest?.planRevision ?? null)) continue
+    latest = candidate
+    if (candidate.proposalHash && hashes.length < PLAN_MAX_REVISIONS && !hashes.includes(candidate.proposalHash)) hashes.push(candidate.proposalHash)
+  }
+  return { latest, hashes }
 }

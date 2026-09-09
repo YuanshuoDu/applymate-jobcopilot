@@ -3,6 +3,7 @@ import { schemaVersion } from "@jobcopilot/agent-protocol"
 
 import { ToolExecutionError, type RuntimeToolDefinition } from "../tools/types.js"
 import { PLAN_MAX_NODES, PLAN_MAX_REVISIONS, type GoalContract, type PlanProposal } from "./goal-plan-contract.js"
+import { copyPlanFingerprints, fingerprintPlanProposal } from "./plan-fingerprint.js"
 import { toRuntimeActionIntents, type RuntimeActionIntent } from "./goal-plan-actions.js"
 import { PlanValidationError, validatePlanProposal } from "./goal-plan-validator.js"
 
@@ -10,6 +11,7 @@ const PlanProposalEnvelopeSchema = Type.Object({ proposal: Type.Unknown() }, { a
 const PlanProposalOutputSchema = Type.Object({
   status: Type.Literal("accepted"), goalRevision: Type.Integer({ minimum: 1 }), planRevision: Type.Integer({ minimum: 1 }),
   basedOnPlanRevision: Type.Union([Type.Integer({ minimum: 0 }), Type.Null()]), proposal: Type.Unknown(), intents: Type.Array(Type.Unknown(), { maxItems: 8 }),
+  proposalHash: Type.String({ pattern: "^sha256:[0-9a-f]{64}$", minLength: 71, maxLength: 71 }),
 }, { additionalProperties: false })
 
 export type PlanProposalToolInput = Static<typeof PlanProposalEnvelopeSchema>
@@ -20,6 +22,7 @@ export type PlanProposalToolOutput = {
   readonly basedOnPlanRevision: number | null
   readonly proposal: PlanProposal
   readonly intents: readonly RuntimeActionIntent[]
+  readonly proposalHash: string
 }
 
 export type PlanProposalToolOptions = {
@@ -32,6 +35,8 @@ export type PlanProposalToolOptions = {
   readonly initialPlanRevision?: number | null
   /** Server-owned upper bound for accepted revisions. */
   readonly maxPlanRevisions?: number
+  /** Server-owned hashes recovered from prior accepted proposals. */
+  readonly initialPlanHashes?: readonly string[]
 }
 
 function copyAllowlist(name: string, value: readonly string[]): readonly string[] {
@@ -48,6 +53,7 @@ export function createPlanProposalTool(options: PlanProposalToolOptions): Runtim
   const allowedTools = copyAllowlist("tool", options.allowedTools)
   const allowedTemplates = copyAllowlist("template", options.allowedTemplates)
   const allowedRoles = copyAllowlist("role", options.allowedRoles)
+  const seenPlanHashes = new Set(copyPlanFingerprints(options.initialPlanHashes))
   let planRevision: number | null = options.initialPlanRevision ?? null
   return {
     schemaVersion, name: "agent.plan.propose", version: "1", description: "Propose a bounded read-only plan for the current goal",
@@ -62,9 +68,12 @@ export function createPlanProposalTool(options: PlanProposalToolOptions): Runtim
           allowedActions: ["use_tool", "delegate", "request_input", "propose_completion"], allowedTools,
           allowedTemplates, allowedRoles,
         })
+        const proposalHash = fingerprintPlanProposal(proposal)
+        if (seenPlanHashes.has(proposalHash)) throw new ToolExecutionError("plan_no_progress", "Plan proposal repeats an accepted semantic plan", { proposalHash })
         const basedOnPlanRevision = planRevision
         planRevision = nextRevision
-        return { status: "accepted" as const, goalRevision: options.goal.revision, planRevision, basedOnPlanRevision, proposal, intents: toRuntimeActionIntents(proposal) }
+        seenPlanHashes.add(proposalHash)
+        return { status: "accepted" as const, goalRevision: options.goal.revision, planRevision, basedOnPlanRevision, proposal, intents: toRuntimeActionIntents(proposal), proposalHash }
       } catch (error: unknown) {
         if (error instanceof PlanValidationError) throw new ToolExecutionError("plan_invalid", "Plan proposal failed deterministic validation", { issues: error.issues.slice(0, 16).map(issue => ({ path: issue.path.slice(0, 256), code: issue.code.slice(0, 64), message: issue.message.slice(0, 256) })) })
         throw error

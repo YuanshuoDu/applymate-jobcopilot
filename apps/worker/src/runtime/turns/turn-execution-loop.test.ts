@@ -4,6 +4,8 @@ import type { HarnessModelRequest, ModelAdapter, ModelStreamEvent } from "@jobco
 import type { StepContext } from "../context/step-context-builder.js"
 
 import { runTurnExecutionLoop } from "./turn-execution-loop.js"
+import { fingerprintPlanProposal } from "../planning/plan-fingerprint.js"
+import { PLAN_PROPOSAL_SCHEMA_VERSION, type PlanProposal } from "../planning/goal-plan-contract.js"
 import type { TurnEngineItem, TurnEngineStore, TurnEngineToolResult } from "./turn-engine-types.js"
 import type { TurnExecutionIdentity, TurnExecutionOptions, TurnExecutionStore } from "./turn-execution-types.js"
 
@@ -42,8 +44,9 @@ function fixture(owner: TurnExecutionIdentity, toolResult?: TurnEngineToolResult
     recordFinalResponse: async ({ identity, response }) => { finalResponses.push(`${identity.taskId}:${response}`) },
   }
   let calls = 0
-  const planInput = { proposal: { schemaVersion: "agent-harness.plan.v1" } }
-  const acceptedPlanOutput = { status: "accepted", goalRevision: 1, planRevision: 1, basedOnPlanRevision: null, proposal: planInput.proposal, intents: [] }
+  const planProposal: PlanProposal = { schemaVersion: PLAN_PROPOSAL_SCHEMA_VERSION, basedOnGoalRevision: 1, basedOnPlanRevision: null, nodes: [], completionCriteria: [], briefRationale: "fixture" }
+  const planInput = { proposal: planProposal }
+  const acceptedPlanOutput = { status: "accepted", goalRevision: 1, planRevision: 1, basedOnPlanRevision: null, proposal: planInput.proposal, intents: [], proposalHash: fingerprintPlanProposal(planInput.proposal) }
   const model: ModelAdapter = {
     id: "fixture-model", profile,
     async *stream(request: HarnessModelRequest): AsyncGenerator<ModelStreamEvent> {
@@ -181,7 +184,7 @@ describe("owner-agnostic turn execution loop", () => {
 
   it("does not repeat the plan hook for a replayed proposal call", async () => {
     const hook = vi.fn(async () => ({ observations: [{ id: "should-not-appear", content: "replayed" }] }))
-    const persisted = [{ id: "tool-result:call:root-1", content: { toolCallId: "call:root-1", toolName: "agent.plan.propose", input: { proposal: { schemaVersion: "agent-harness.plan.v1" } }, status: "completed", output: { job: "job-1" }, errorCode: null } }]
+    const persisted = [{ id: "tool-result:call:root-1", content: { toolCallId: "call:root-1", toolName: "agent.plan.propose", input: { proposal: { schemaVersion: "agent-harness.plan.v1", basedOnGoalRevision: 1, basedOnPlanRevision: null, nodes: [], completionCriteria: [], briefRationale: "fixture" } }, status: "completed", output: { job: "job-1" }, errorCode: null } }]
     const root = fixture(identity("turn", "root-1"), undefined, hook, persisted)
     const result = await runTurnExecutionLoop(root.options)
     expect(result.status).toBe("completed")

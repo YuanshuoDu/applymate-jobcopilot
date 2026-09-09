@@ -5,7 +5,7 @@ import { parseSnapshotContent } from "./context/context-snapshot-canonical.js"
 import type { StepContextSnapshot } from "./context/step-context-builder.js"
 import type { TurnLease } from "./turns/lease.js"; import type { TurnResumeState } from "./turns/turn-engine-types.js"
 import { consumeDurableWaitOutcomes } from "./subagents/durable-wait-consumer.js"
-import { isBoundedPlanJson, parsePlanRevisionEvent, parsePlanRevisionReceipt, planRevisionObservation, type PlanRevisionReceipt } from "./planning/plan-revision-receipt.js"
+import { isBoundedPlanJson, planRevisionObservation, restorePlanRevisions } from "./planning/plan-revision-receipt.js"
 import { parsePlanCommandReceipt, planCommandObservation } from "./planning/plan-command-receipt.js"
 export type CanonicalTurnState = {
   readonly scope: TenantScope
@@ -17,6 +17,7 @@ export type CanonicalTurnState = {
   readonly rootInputId?: string
   readonly snapshot: StepContextSnapshot
   readonly planRevision?: number | null
+  readonly planProposalHashes?: readonly string[]
   readonly resume?: TurnResumeState
 }
 type Row = Record<string, unknown>; function object(value: unknown): Record<string, unknown> { return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {} }
@@ -83,17 +84,6 @@ function planObservations(events: readonly Row[]): StepContextSnapshot["toolObse
   })
 }
 function planCommandObservations(events: readonly Row[]): StepContextSnapshot["toolObservations"] { return events.filter(event => event.type === "plan.command").flatMap(event => { const receipt = parsePlanCommandReceipt(eventPayload(event.payload)); return receipt ? [planCommandObservation(receipt)] : [] }) }
-function restoredPlanRevision(events: readonly Row[]): PlanRevisionReceipt | null {
-  let latest: PlanRevisionReceipt | null = null
-  for (const event of events) {
-    const payload = eventPayload(event.payload)
-    const candidate = event.type === "plan.revision" ? parsePlanRevisionEvent(payload)
-      : event.type === "tool_call.completed" && payload.toolName === "agent.plan.propose" && typeof payload.toolCallId === "string"
-        ? parsePlanRevisionReceipt(payload.output, payload.toolCallId) : null
-    if (candidate && (!latest || candidate.planRevision > latest.planRevision) && (!latest || candidate.basedOnPlanRevision === latest.planRevision)) latest = candidate
-  }
-  return latest
-}
 function textContent(value: unknown): string | null {
   const row = object(value)
   if (typeof row.content === "string" && row.content.trim()) return row.content.trim()
@@ -194,7 +184,8 @@ export async function loadCanonicalTurnState(pool: Pick<pg.Pool, "connect">, lea
         snapshotThroughSequence = BigInt(String(contextResult.rows[0].throughSequence ?? object(contextResult.rows[0].content).throughSequence ?? 0))
       }
     }
-    const revision = restoredPlanRevision(eventsResult.rows)
+    const revisionState = restorePlanRevisions(eventsResult.rows.map(event => ({ type: event.type, payload: eventPayload(event.payload) })))
+    const revision = revisionState.latest
     const restored = [...observations(itemsResult.rows, eventsResult.rows), ...planObservations(eventsResult.rows), ...planCommandObservations(eventsResult.rows), ...(revision ? [planRevisionObservation(revision)] : [])]
     const seen = new Set(snapshot.toolObservations.map(item => item.id))
     const restoredIds = new Set<string>()
@@ -239,7 +230,7 @@ export async function loadCanonicalTurnState(pool: Pick<pg.Pool, "connect">, lea
       consumedInputIds: Array.isArray(last?.consumedInputIds) ? last.consumedInputIds.filter((id): id is string => typeof id === "string") : [],
       usage,
     } satisfies TurnResumeState : undefined
-    const result = { scope, goal: text(turn.input), modelProfileSnapshot: json(turn.modelProfileSnapshot), toolPolicySnapshot: turn.toolPolicySnapshot ?? {}, budgetSnapshot: turn.budgetSnapshot ?? {}, planRevision: revision?.planRevision ?? null, ...(typeof turn.rootTaskId === "string" ? { rootTaskId: turn.rootTaskId } : {}), ...(rootInput.rows[0] ? { rootInputId: rootInput.rows[0].id } : {}), snapshot, ...(resume ? { resume } : {}) }
+    const result = { scope, goal: text(turn.input), modelProfileSnapshot: json(turn.modelProfileSnapshot), toolPolicySnapshot: turn.toolPolicySnapshot ?? {}, budgetSnapshot: turn.budgetSnapshot ?? {}, planRevision: revision?.planRevision ?? null, planProposalHashes: revisionState.hashes, ...(typeof turn.rootTaskId === "string" ? { rootTaskId: turn.rootTaskId } : {}), ...(rootInput.rows[0] ? { rootInputId: rootInput.rows[0].id } : {}), snapshot, ...(resume ? { resume } : {}) }
     await client.query("COMMIT")
     committed = true
     return result

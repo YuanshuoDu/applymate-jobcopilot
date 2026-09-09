@@ -98,6 +98,22 @@ describe("loadCanonicalTurnState", () => {
     expect(value.snapshot.toolObservations).toEqual(expect.arrayContaining([{ id: "plan-revision:receipt-2", content: { kind: "plan_revision", planCallId: "receipt-2", goalRevision: 1, planRevision: 2, basedOnPlanRevision: 1 } }]))
   })
 
+  it("restores bounded semantic proposal hashes in event order and deduplicates them", async () => {
+    const hashA = `sha256:${"a".repeat(64)}`
+    const hashB = `sha256:${"b".repeat(64)}`
+    const value = await loadCanonicalTurnState(pool({
+      turn: { input: { goal: "Find jobs" }, rootTaskId: "root-1", contextSnapshotId: null, modelProfileSnapshot: {}, toolPolicySnapshot: {}, budgetSnapshot: {} },
+      events: [
+        { type: "plan.revision", payload: { planCallId: "one", goalRevision: 1, planRevision: 1, basedOnPlanRevision: null, proposalHash: hashA } },
+        { type: "plan.revision", payload: { planCallId: "two", goalRevision: 1, planRevision: 2, basedOnPlanRevision: 1, proposalHash: hashB } },
+        { type: "plan.revision", payload: { planCallId: "three", goalRevision: 1, planRevision: 3, basedOnPlanRevision: 2, proposalHash: hashB } },
+        { type: "plan.revision", payload: { planCallId: "bad", goalRevision: 1, planRevision: 4, basedOnPlanRevision: 3, proposalHash: "bad" } },
+      ],
+    }), lease)
+    expect(value.planRevision).toBe(3)
+    expect(value.planProposalHashes).toEqual([hashA, hashB])
+  })
+
   it("restores bounded plan command outcomes with observation deduplication", async () => {
     const command = { planCallId: "plan-1", planRevision: 1, observationId: "plan-result:plan-1:read", content: { kind: "plan_command", status: "completed", output: { found: true } } }
     const fake = pool({

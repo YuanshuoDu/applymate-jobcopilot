@@ -5,6 +5,8 @@ import type { PolicyRole, TenantScope } from "@jobcopilot/agent-protocol"
 
 import { PLAN_MAX_NODES, PLAN_MAX_REVISIONS, isPlainJsonObject, type GoalContract } from "./goal-plan-contract.js"
 import { PlanDispatchError, dispatchPlanProposal } from "./plan-intent-dispatcher.js"
+import { copyPlanFingerprints, fingerprintPlanProposal, isPlanFingerprint } from "./plan-fingerprint.js"
+import { PlanValidationError, validatePlanProposal } from "./goal-plan-validator.js"
 import { PlanCommandExecutionError, executePlanCommands, type PlanCommandExecutionRecord, type PlanCommandExecutionRuntime, type PlanControlRecord } from "./plan-command-executor.js"
 import { createPlanCommandReceipt, type PlanCommandReceipt } from "./plan-command-receipt.js"
 import type { ToolCallRequest, ToolExecutionResult, ToolRouterContext } from "../tools/types.js"
@@ -14,7 +16,7 @@ import type { StepContextSnapshot } from "../context/step-context-builder.js"
 const MAX_OBSERVATIONS = 8
 const MAX_RESULT_BYTES = 8 * 1024
 const PLAN_ACTIONS = ["use_tool", "delegate", "request_input", "propose_completion"] as const
-const OUTPUT_KEYS = ["status", "goalRevision", "planRevision", "basedOnPlanRevision", "proposal", "intents"]
+const OUTPUT_KEYS = ["status", "goalRevision", "planRevision", "basedOnPlanRevision", "proposal", "intents", "proposalHash"]
 
 type Registry = { list(capabilities?: readonly string[]): readonly unknown[] }
 type Router = { execute(context: ToolRouterContext, request: ToolCallRequest): Promise<ToolExecutionResult> }
@@ -38,6 +40,8 @@ export type CanonicalPlanExecutionOptions = {
   readonly persistOutcome?: (receipt: PlanCommandReceipt) => Promise<void> | void
   /** Server-owned upper bound for accepted revisions. */
   readonly maxPlanRevisions?: number
+  /** Server-owned hashes recovered from prior accepted proposals. */
+  readonly initialPlanHashes?: readonly string[]
 }
 
 class CanonicalPlanError extends Error {
@@ -58,7 +62,7 @@ function plainJson(value: unknown, seen = new Set<object>()): boolean {
   return valid
 }
 
-function accepted(value: unknown, goalRevision: number, expectedPlanRevision: number | null, maxPlanRevisions: number): { planRevision: number; basedOnPlanRevision: number | null; proposal: unknown } {
+function accepted(value: unknown, goalRevision: number, expectedPlanRevision: number | null, maxPlanRevisions: number): { planRevision: number; basedOnPlanRevision: number | null; proposal: unknown; proposalHash: string } {
   if (!isPlainJsonObject(value) || !plainJson(value) || Object.keys(value).some(key => !OUTPUT_KEYS.includes(key))) throw new CanonicalPlanError("invalid_plan_output")
   if (value.status !== "accepted" || value.goalRevision !== goalRevision) throw new CanonicalPlanError("revision_conflict")
   const planRevision = value.planRevision
@@ -67,10 +71,10 @@ function accepted(value: unknown, goalRevision: number, expectedPlanRevision: nu
     (basedOnPlanRevision !== null && (typeof basedOnPlanRevision !== "number" || !Number.isSafeInteger(basedOnPlanRevision) || basedOnPlanRevision < 0))) throw new CanonicalPlanError("invalid_plan_output")
   if (planRevision > maxPlanRevisions || (expectedPlanRevision !== null && expectedPlanRevision >= maxPlanRevisions)) throw new CanonicalPlanError("plan_revision_limit")
   if (basedOnPlanRevision !== expectedPlanRevision || planRevision !== (expectedPlanRevision === null ? 1 : expectedPlanRevision + 1)) throw new CanonicalPlanError("revision_conflict")
-  if (!isPlainJsonObject(value.proposal) || !Array.isArray(value.intents) || value.intents.length > MAX_OBSERVATIONS) throw new CanonicalPlanError("invalid_plan_output")
+  if (!isPlainJsonObject(value.proposal) || !Array.isArray(value.intents) || value.intents.length > MAX_OBSERVATIONS || !isPlanFingerprint(value.proposalHash)) throw new CanonicalPlanError("invalid_plan_output")
   const encoded = JSON.stringify(value)
   if (encoded === undefined || Buffer.byteLength(encoded, "utf8") > 64 * 1024) throw new CanonicalPlanError("invalid_plan_output")
-  return { planRevision, basedOnPlanRevision, proposal: value.proposal }
+  return { planRevision, basedOnPlanRevision, proposal: value.proposal, proposalHash: value.proposalHash }
 }
 
 function id(prefix: string, callId: string, localId: string): string {
@@ -172,22 +176,30 @@ export function createCanonicalPlanExecutionFactory(options: CanonicalPlanExecut
   const allowedTools = Object.freeze([...options.allowedTools])
   const allowedTemplates = Object.freeze([...options.allowedTemplates])
   const allowedRoles = Object.freeze([...options.allowedRoles])
+  const seenPlanHashes = new Set(copyPlanFingerprints(options.initialPlanHashes))
   let currentPlanRevision: number | null = options.initialPlanRevision ?? null
   return async input => {
     const baseError = (code: string): TurnEnginePlanExecutionHookResult => ({ observations: [failureObservation(input.call.id, code)] })
     try {
       if (input.result.status !== "completed" || input.result.toolName !== "agent.plan.propose") throw new CanonicalPlanError("invalid_plan_output")
       const output = accepted(input.result.output, options.goal.revision, currentPlanRevision, maxPlanRevisions)
-      const dispatched = dispatchPlanProposal(output.proposal, {
+      const validation = {
         goalRevision: options.goal.revision, planRevision: output.basedOnPlanRevision, maxNodes: options.maxNodes,
         allowedActions: [...PLAN_ACTIONS], allowedTools, allowedTemplates, allowedRoles,
-      }, {
+      } as const
+      let normalized: ReturnType<typeof validatePlanProposal>
+      try { normalized = validatePlanProposal(output.proposal, { goalRevision: options.goal.revision }) } catch (error: unknown) { if (error instanceof PlanValidationError) throw new CanonicalPlanError("invalid_plan_output"); throw error }
+      const computedHash = fingerprintPlanProposal(normalized)
+      if (computedHash !== output.proposalHash) throw new CanonicalPlanError("invalid_plan_output")
+      if (seenPlanHashes.has(computedHash)) throw new CanonicalPlanError("plan_no_progress")
+      const dispatched = dispatchPlanProposal(normalized, validation, {
         resolveToolVersion: name => version(options.registry, options.capabilities, name),
         createToolCallId: localId => id("plan-call", input.call.id, localId),
         createIdempotencyKey: localId => id("plan-idempotency", input.call.id, localId),
         resolveInputRefs: request => resolveInputRefs(input.snapshot, request.inputRefs),
         resolveDelegateActions: () => actions(options.registry, options.capabilities, allowedTools),
       })
+      seenPlanHashes.add(computedHash)
       currentPlanRevision = output.planRevision
       const commandRuntime: PlanCommandExecutionRuntime = {
         router: options.router,

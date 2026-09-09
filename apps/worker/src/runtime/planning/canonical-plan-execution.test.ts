@@ -4,6 +4,7 @@ import type { ToolCallRequest, ToolExecutionResult, ToolRouterContext } from "..
 import type { StepContextSnapshot } from "../context/step-context-builder.js"
 import { executionOwnerFence } from "../execution-owner.js"
 import { PLAN_PROPOSAL_SCHEMA_VERSION, type PlanProposal } from "./goal-plan-contract.js"
+import { fingerprintPlanProposal } from "./plan-fingerprint.js"
 import { createCanonicalPlanExecutionFactory, type CanonicalPlanExecutionOptions } from "./canonical-plan-execution.js"
 import type { PlanCommandReceipt } from "./plan-command-receipt.js"
 
@@ -27,16 +28,16 @@ function proposal(nodes: PlanProposal["nodes"]): PlanProposal {
 }
 
 function output(value: PlanProposal, overrides: Record<string, unknown> = {}): Record<string, unknown> {
-  return { status: "accepted", goalRevision: 1, planRevision: 1, basedOnPlanRevision: null, proposal: value, intents: [], ...overrides }
+  return { status: "accepted", goalRevision: 1, planRevision: 1, basedOnPlanRevision: null, proposal: value, intents: [], proposalHash: fingerprintPlanProposal(value), ...overrides }
 }
 
-function fixture(router: { execute(context: ToolRouterContext, request: ToolCallRequest): Promise<ToolExecutionResult> } = { execute: async (_context, request) => ({ ...request, status: "completed", output: { ok: true }, errorCode: null }) }, initialPlanRevision?: number, persistOutcome?: (receipt: PlanCommandReceipt) => Promise<void> | void, maxPlanRevisions?: number) {
+function fixture(router: { execute(context: ToolRouterContext, request: ToolCallRequest): Promise<ToolExecutionResult> } = { execute: async (_context, request) => ({ ...request, status: "completed", output: { ok: true }, errorCode: null }) }, initialPlanRevision?: number, persistOutcome?: (receipt: PlanCommandReceipt) => Promise<void> | void, maxPlanRevisions?: number, initialPlanHashes?: readonly string[]) {
   const options: CanonicalPlanExecutionOptions = {
     goal, allowedTools: ["jobs.search"], allowedTemplates: [], allowedRoles: ["scout"], maxNodes: 8,
     capabilities: ["read", "canPlan"], actorRole: "orchestrator", scope: { userId: "user-1" }, lease,
     rootTaskId: "root-1", taskId: "root-1", initialPlanRevision, router,
     registry: { list: () => [{ name: "jobs.search", version: "1", risk: "read", capabilities: ["read"] }] },
-    policy: {} as PolicyEngine, ...(persistOutcome ? { persistOutcome } : {}), ...(maxPlanRevisions === undefined ? {} : { maxPlanRevisions }),
+    policy: {} as PolicyEngine, ...(persistOutcome ? { persistOutcome } : {}), ...(maxPlanRevisions === undefined ? {} : { maxPlanRevisions }), ...(initialPlanHashes ? { initialPlanHashes } : {}),
   }
   return createCanonicalPlanExecutionFactory(options)
 }
@@ -121,6 +122,18 @@ describe("createCanonicalPlanExecutionFactory", () => {
     const hook = fixture(undefined, 8)
     const next = await hook(input(output(proposal([]), { planRevision: 9, basedOnPlanRevision: 8 })))
     expect(observationCode(next)).toBe("plan_revision_limit")
+  })
+
+  it("rejects a forged hash and a previously accepted semantic hash before routing", async () => {
+    const router = { execute: vi.fn(async (_context: ToolRouterContext, request: ToolCallRequest) => ({ ...request, status: "completed" as const, output: { ok: true }, errorCode: null })) }
+    const forged = await fixture(router)(input(output(proposal([]), { proposalHash: `sha256:${"b".repeat(64)}` })))
+    expect(observationCode(forged)).toBe("invalid_plan_output")
+    expect(router.execute).not.toHaveBeenCalled()
+    const hash = fingerprintPlanProposal(proposal([]))
+    const duplicateRouter = { execute: vi.fn(async (_context: ToolRouterContext, request: ToolCallRequest) => ({ ...request, status: "completed" as const, output: { ok: true }, errorCode: null })) }
+    const duplicate = await fixture(duplicateRouter, undefined, undefined, undefined, [hash])(input(output(proposal([]))))
+    expect(observationCode(duplicate)).toBe("plan_no_progress")
+    expect(duplicateRouter.execute).not.toHaveBeenCalled()
   })
 
   it("feeds command failure back and maps request input to a wait", async () => {

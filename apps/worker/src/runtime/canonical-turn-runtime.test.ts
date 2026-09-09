@@ -6,12 +6,15 @@ import type { CanonicalTurnState } from "./canonical-turn-state.js"
 import type { TurnEngineStore } from "./turns/turn-engine-types.js"
 import { createCanonicalTurnRuntime } from "./canonical-turn-runtime.js"
 import { createPgRootTaskStore } from "./subagents/root-task-store.js"
+import type { PlanProposal } from "./planning/goal-plan-contract.js"
 import { PLAN_MAX_REVISIONS } from "./planning/goal-plan-contract.js"
+import { fingerprintPlanProposal } from "./planning/plan-fingerprint.js"
 
 const lease = {
   turnId: "turn-1", sessionId: "session-1", ownerId: "worker-1", userId: "user-1", leaseVersion: 2,
   leaseStartedAt: new Date("2026-09-07T00:00:00.000Z"), leaseExpiresAt: new Date("2026-09-07T00:01:00.000Z"),
 }
+const recoveredPlanHash = `sha256:${"a".repeat(64)}`
 
 function state(): CanonicalTurnState {
   return { scope: { userId: "user-1" }, goal: "Find jobs", modelProfileSnapshot: { provider: "fixture", model: "fixture" }, toolPolicySnapshot: {}, budgetSnapshot: { limits: { maxSteps: 4 } }, snapshot: { system: [], profile: [], steerHistory: [], businessRefs: [], toolObservations: [] } }
@@ -152,7 +155,7 @@ async function runDefaultPlanBridge(planningExecutionEnabled: boolean) {
   const calls: string[] = []
   const events: Array<{ type: string; payload: unknown; correlationId?: string; idempotencyKey?: string; owner?: unknown }> = []
   let modelCalls = 0
-  const proposal = {
+  const proposal: PlanProposal = {
     schemaVersion: "agent-harness.plan.v1", basedOnGoalRevision: 1, basedOnPlanRevision: null,
     nodes: [{ localId: "read", kind: "use_tool", objective: "Read jobs", inputRefs: [], dependsOn: [], successCriteria: ["done"], outputSchemaRef: null, toolName: "jobs.search" }],
     completionCriteria: ["finish"], briefRationale: "bounded",
@@ -160,7 +163,7 @@ async function runDefaultPlanBridge(planningExecutionEnabled: boolean) {
   const tool = {
     execute: vi.fn(async (_context: unknown, call: { id: string; toolName: string; toolVersion: string; input: unknown }) => {
       calls.push(call.toolName)
-      return { ...call, status: "completed" as const, output: call.toolName === "agent.plan.propose" ? { status: "accepted", goalRevision: 1, planRevision: 1, basedOnPlanRevision: null, proposal, intents: [] } : { found: true }, errorCode: null }
+      return { ...call, status: "completed" as const, output: call.toolName === "agent.plan.propose" ? { status: "accepted", goalRevision: 1, planRevision: 1, basedOnPlanRevision: null, proposal, intents: [], proposalHash: fingerprintPlanProposal(proposal) } : { found: true }, errorCode: null }
     }),
     registry: {
       list: () => [
@@ -250,12 +253,13 @@ describe("createCanonicalTurnRuntime", () => {
   })
 
   it("passes the recovered plan revision to the proposal and execution bridges", async () => {
-    const factory = vi.fn((input: { initialPlanRevision?: number | null; maxPlanRevisions?: number }) => {
+    const factory = vi.fn((input: { initialPlanRevision?: number | null; initialPlanHashes?: readonly string[]; maxPlanRevisions?: number }) => {
       expect(input.initialPlanRevision).toBe(2)
+      expect(input.initialPlanHashes).toEqual([recoveredPlanHash])
       expect(input.maxPlanRevisions).toBe(PLAN_MAX_REVISIONS)
       return async () => ({ observations: [] })
     })
-    const fixture = setup({ planningEnabled: true, planningExecutionEnabled: true, stateLoader: async () => ({ ...state(), planRevision: 2 }), planExecutionFactory: factory })
+    const fixture = setup({ planningEnabled: true, planningExecutionEnabled: true, stateLoader: async () => ({ ...state(), planRevision: 2, planProposalHashes: [recoveredPlanHash] }), planExecutionFactory: factory })
     await (await fixture.runtime).execute({ lease, signal: new AbortController().signal })
     expect(factory).toHaveBeenCalledTimes(1)
   })
