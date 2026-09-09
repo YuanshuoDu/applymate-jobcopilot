@@ -67,22 +67,40 @@ export async function dispatchPendingSubagentOutbox(pool: PgSubagentPool, queue:
   for (const row of rows) {
     const payload = parseSubagentJobPayload(row.payload)
     if (!payload) {
-      await markDispatch(pool, row.id, "schema_invalid_payload", true)
+      await markDispatchError(pool, row.id, "schema_invalid_payload", true)
       continue
     }
-    await enqueueSubagentTask(queue, payload, 3, row.attemptCount ?? 0)
-    await markDispatch(pool, row.id, null, true)
+    try {
+      await enqueueSubagentTask(queue, payload, 3, row.attemptCount ?? 0)
+    } catch (error: unknown) {
+      await markDispatchError(pool, row.id, "queue_add_failed").catch(() => undefined)
+      throw error
+    }
+    try {
+      await markDispatchPublished(pool, row.id)
+    } catch (error: unknown) {
+      throw Object.assign(new Error("subagent_dispatch_delivery_uncertain", { cause: error }), { code: "subagent_dispatch_delivery_uncertain" })
+    }
     dispatched += 1
   }
   return dispatched
 }
 
-async function markDispatch(pool: PgSubagentPool, id: string, error: string | null, published: boolean): Promise<void> {
+async function markDispatchPublished(pool: PgSubagentPool, id: string): Promise<void> {
+  const client = await pool.connect()
+  try {
+    await client.query(`UPDATE "agent_outbox" SET "publishedAt" = CURRENT_TIMESTAMP,
+      "attemptCount" = "attemptCount" + 1, "lastError" = NULL
+      WHERE "id" = $1 AND "publishedAt" IS NULL`, [id])
+  } finally { client.release() }
+}
+
+async function markDispatchError(pool: PgSubagentPool, id: string, error: string, terminal = false): Promise<void> {
   const client = await pool.connect()
   try {
     await client.query(`UPDATE "agent_outbox" SET "attemptCount" = "attemptCount" + 1,
       "lastError" = $2, "publishedAt" = CASE WHEN $3 THEN CURRENT_TIMESTAMP ELSE "publishedAt" END
-      WHERE "id" = $1 AND "publishedAt" IS NULL`, [id, error, published])
+      WHERE "id" = $1 AND "publishedAt" IS NULL`, [id, error, terminal])
   } finally { client.release() }
 }
 

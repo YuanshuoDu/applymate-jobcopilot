@@ -9,12 +9,13 @@ import type { SubagentJobPayload } from "../runtime/subagents/types.js"
 
 const payload: SubagentJobPayload = { taskId: "task-1", sessionId: "session-1", rootTaskId: "root-1", ownerId: "worker-1" }
 
-function fakePool() {
+function fakePool(markError?: Error) {
   const calls: Array<[string, unknown[]?]> = []
   const client = {
     query: vi.fn(async (sql: string, params?: unknown[]) => {
       calls.push([sql, params])
       if (sql.includes('FROM "agent_outbox"')) return { rows: [{ id: "outbox-1", payload, attemptCount: 0 }], rowCount: 1 }
+      if (markError && sql.startsWith('UPDATE "agent_outbox"')) throw markError
       return { rows: [], rowCount: 1 }
     }),
     release: vi.fn(),
@@ -44,6 +45,22 @@ describe("Subagent queue", () => {
     expect(queue.add).toHaveBeenCalledWith("subagent", payload, { jobId: subagentJobId("task-1", 0), attempts: 3 })
     const mark = fake.calls.find(([sql]) => sql.startsWith("UPDATE"))
     expect(mark?.[0]).toContain('"publishedAt"')
+  })
+
+  it("records queue_add_failed and preserves an unpublished row when Redis enqueue fails", async () => {
+    const fake = fakePool()
+    const queue = { add: vi.fn().mockRejectedValue(new Error("redis unavailable")) }
+    await expect(dispatchPendingSubagentOutbox(fake.pool, queue)).rejects.toThrow("redis unavailable")
+    const mark = fake.calls.find(([sql]) => sql.startsWith("UPDATE"))
+    expect(mark?.[0]).toContain('"publishedAt" = CASE WHEN $3 THEN CURRENT_TIMESTAMP ELSE "publishedAt" END')
+    expect(mark?.[1]).toEqual(["outbox-1", "queue_add_failed", false])
+  })
+
+  it("fails closed when enqueue succeeds but publication bookkeeping is uncertain", async () => {
+    const fake = fakePool(new Error("database unavailable"))
+    const queue = { add: vi.fn().mockResolvedValue(undefined) }
+    await expect(dispatchPendingSubagentOutbox(fake.pool, queue)).rejects.toMatchObject({ code: "subagent_dispatch_delivery_uncertain", message: "subagent_dispatch_delivery_uncertain" })
+    expect(queue.add).toHaveBeenCalledWith("subagent", payload, { jobId: subagentJobId("task-1", 0), attempts: 3 })
   })
 
   it("encodes task IDs and advances the generation after a recovered delivery", async () => {
