@@ -24,7 +24,6 @@ export async function executeSpawn(context: ToolExecutionContext, input: SpawnSu
       userId: context.scope.userId, sessionId: context.sessionId, turnId: context.turnId, parentTaskId,
       role: input.role, taskType: input.taskType, goal: input.goal, constraints: input.constraints,
       successCriteria: input.successCriteria, allowedActions: input.allowedActions, context: input.context,
-      expectedOutputSchema: input.expectedOutputSchema,
     })
   } catch (error: unknown) { throw managerError(error) }
   try {

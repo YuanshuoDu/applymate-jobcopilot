@@ -130,6 +130,23 @@ describe("coordination executors", () => {
     expect(runtime.store.activities).toContain("spawn_subagent")
   })
 
+  it("does not pass an injected expected output schema to the manager", async () => {
+    const runtime = makeRuntime()
+    const input = {
+      idempotencyKey: "spawn-raw",
+      role: "scout",
+      taskType: "inspect",
+      goal: "Inspect the job",
+      expectedOutputSchema: { schemaVersion: "forged", role: "analyst" },
+    } as unknown as SpawnSubagentInput
+
+    await executeSpawn(context(), input, runtime.options)
+
+    const spawn = runtime.manager.spawn as unknown as ReturnType<typeof vi.fn>
+    expect(spawn).toHaveBeenCalledOnce()
+    expect(spawn.mock.calls[0]?.[0]).not.toHaveProperty("expectedOutputSchema")
+  })
+
   it("sends idempotent mailbox messages without implicitly spawning", async () => {
     const runtime = makeRuntime()
     const input: SendMessageInput = { idempotencyKey: "message-1", taskId: "root-1", kind: "result", payload: { ok: true } }

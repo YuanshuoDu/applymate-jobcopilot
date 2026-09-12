@@ -31,7 +31,6 @@ export const SpawnSubagentInputSchema = Type.Object({
   successCriteria: Type.Optional(StringListSchema),
   allowedActions: Type.Optional(StringListSchema),
   context: Type.Optional(Type.Unknown()),
-  expectedOutputSchema: Type.Optional(Type.Unknown()),
   parentTaskId: Type.Optional(IdSchema),
 }, { additionalProperties: false })
 export type SpawnSubagentInput = Static<typeof SpawnSubagentInputSchema>

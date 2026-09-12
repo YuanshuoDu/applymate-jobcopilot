@@ -32,7 +32,7 @@ describe("coordination tool definitions", () => {
     const registry = new ToolRegistry(createCoordinationTools(options))
     const valid = { idempotencyKey: "spawn-1", role: "scout", taskType: "inspect", goal: "Inspect the job" }
     expect(registry.validateArguments("spawn_subagent", valid)).toBe(true)
-    for (const key of ["userId", "sessionId", "ownerId", "path", "rootTaskId"]) {
+    for (const key of ["userId", "sessionId", "ownerId", "path", "rootTaskId", "expectedOutputSchema"]) {
       expect(registry.validateArguments("spawn_subagent", { ...valid, [key]: "forged" })).not.toBe(true)
     }
     expect(registry.validateArguments("spawn_subagent", { ...valid, extra: true })).not.toBe(true)
