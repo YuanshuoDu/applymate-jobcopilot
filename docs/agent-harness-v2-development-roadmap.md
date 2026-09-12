@@ -1405,3 +1405,18 @@ git diff --check
 **独立验证：** 根侧对 canonical plan execution 的 focused 验证 **65/65 passed**；pretest shared build、Worker `tsc` 与 `git diff --check` 均通过。未覆盖 live DB/RLS、provider、Redis/queue、真实进程重启或浏览器/child-parent E2E。
 
 **候选边界：** P3-31 只证明受界限的 canonical scheduler 行为和回归测试，不代表动态 TaskGraph、真实队列/Worker 并发、live provider、生产部署或完整 Harness 已完成。
+
+---
+
+## 27. P3-32 — Durable wait outcome bounded synthesis
+
+**状态与进度口径（2026-09-12）：** P3-32 是 durable wait 结果投影的候选可靠性切片，不代表 P3 完成、完整 Harness 或真实 child-parent 恢复证据。中文升级计划总进度仍按 **P0 已验收 1/8（12.5%）** 统计；本切片不改变该口径。
+
+**实现记录：** 集成提交为 `4ab107fe`。`consumeDurableWaitOutcomes` 现在先建立保留 wait 身份、状态、目标/匹配 task IDs 和每个 child 的 `taskId/status` 的最小投影，再按确定性预算把 child result 与 failure reason 加入；整个 outcome 的 UTF-8 JSON 严格不超过 **8 KiB**，与 canonical plan replay 的 bounded-output 合约一致。大结果会被脱敏并压缩为有限摘要，循环引用、BigInt 或不可序列化值只产生安全的 `Result unavailable`/truncated 结果，不会阻塞恢复或写入原始敏感内容。
+
+- 已消费的 outcome 重新投影前会校验 wait/status/target IDs、匹配 IDs 以及每个预期 child 恰好出现一次；缺失、重复、跨目标或超界数据 fail closed，避免恢复时静默丢掉 child 状态。
+- lease、tenant、root lineage、step 状态、单次 `consumedAt` 更新和现有 SQL/RLS 边界保持不变；没有新增 migration、provider、model 或外部写入。
+
+**独立验证：** durable-wait-consumer focused suite **8/8 passed**；其中包含 8 个大结果的聚合上限、循环/BigInt 结果和 consumed replay。Worker `tsc --noEmit --skipLibCheck`、shared build 与 `git diff --check` 均通过；源文件保持在 250 行以内。
+
+**候选边界：** 本切片只证明 bounded projection 与纯测试回归，不代表 live PostgreSQL/RLS、Redis/queue delivery、真实进程重启、provider、browser 或 child-parent E2E 已验证；P3/Phase 和整体目标仍未完成。
