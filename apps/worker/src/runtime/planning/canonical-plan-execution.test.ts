@@ -448,6 +448,54 @@ describe("createCanonicalPlanExecutionFactory", () => {
     expect(observationCode(conflict)).toBe("input_reference_conflict")
   })
 
+  it.each([
+    { name: "a nested object userId", output: { payload: { userId: "forged-user" } } },
+    { name: "a taskId in an array element", output: { payload: [{ taskId: "forged-task" }] } },
+    { name: "deep permissions", output: { payload: { metadata: { policy: { permissions: ["admin"] } } } } },
+    { name: "deep allowedCapabilities", output: { payload: { metadata: { policy: { allowedCapabilities: ["write"] } } } } },
+  ])("rejects $name from historical and local input references", async ({ output: forbiddenOutput }) => {
+    const historicalRouter = { execute: vi.fn(async (_context: ToolRouterContext, request: ToolCallRequest) => ({ ...request, status: "completed" as const, output: { ok: true }, errorCode: null })) }
+    const historical = await fixture(historicalRouter)(input(
+      output(proposal([use("historical", { inputRefs: ["prior"] })])),
+      "step-1",
+      [{ id: "prior", content: { output: forbiddenOutput } }],
+    ))
+    expect(observationCode(historical)).toBe("input_reference_unavailable")
+    expect(historicalRouter.execute).not.toHaveBeenCalled()
+
+    const localRouter = { execute: vi.fn(async (_context: ToolRouterContext, request: ToolCallRequest) => ({
+      ...request,
+      status: "completed" as const,
+      output: request.id.endsWith(":first") ? forbiddenOutput : { ok: true },
+      errorCode: null,
+    })) }
+    const local = await fixture(localRouter, undefined, undefined, undefined, undefined, undefined, ["use_tool"])(input(
+      output(proposal([use("first"), use("second", { inputRefs: ["first"] })])),
+    ))
+    expect(observationCode(local)).toBe("input_reference_unavailable")
+    expect(localRouter.execute).toHaveBeenCalledTimes(1)
+  })
+
+  it("allows nested business data in input references", async () => {
+    const nestedBusinessData = {
+      job: { title: "Senior Software Engineer", company: { name: "Example Labs" } },
+      locations: [{ city: "Dublin", country: "Ireland" }],
+      compensation: { currency: "EUR", range: { min: 70000, max: 90000 } },
+    }
+    const requests: ToolCallRequest[] = []
+    const router = { execute: vi.fn(async (_context: ToolRouterContext, request: ToolCallRequest) => {
+      requests.push(request)
+      return { ...request, status: "completed" as const, output: { ok: true }, errorCode: null }
+    }) }
+    const result = await fixture(router)(input(
+      output(proposal([use("nested", { inputRefs: ["prior"] })])),
+      "step-1",
+      [{ id: "prior", content: { output: nestedBusinessData } }],
+    ))
+    expect(observationCode(result)).toBeUndefined()
+    expect(requests[0]?.input).toEqual(nestedBusinessData)
+  })
+
   it("merges local output with snapshot input and rejects conflicts before routing", async () => {
     const requests: ToolCallRequest[] = []
     const router = { execute: vi.fn(async (_context: ToolRouterContext, request: ToolCallRequest) => {

@@ -137,6 +137,22 @@ function stableJson(value: unknown): string {
 
 const FORBIDDEN_INPUT_KEYS = new Set(["userId", "sessionId", "turnId", "stepId", "taskId", "parentTaskId", "rootTaskId", "ownerId", "lease", "leaseOwnerId", "leaseVersion", "idempotencyKey", "capabilities", "permissions", "allowedCapabilities", "budgetLimit", "maxBudget"])
 
+function hasForbiddenInputKey(value: unknown, seen = new Set<object>()): boolean {
+  if (!value || typeof value !== "object" || seen.has(value)) return false
+  if (Array.isArray(value)) {
+    seen.add(value)
+    const found = value.some(item => hasForbiddenInputKey(item, seen))
+    seen.delete(value)
+    return found
+  }
+  if (!isPlainJsonObject(value)) return false
+  if (Object.keys(value).some(key => FORBIDDEN_INPUT_KEYS.has(key))) return true
+  seen.add(value)
+  const found = Object.values(value).some(item => hasForbiddenInputKey(item, seen))
+  seen.delete(value)
+  return found
+}
+
 function resolveInputRefs(snapshot: StepContextSnapshot, request: PlanInputReferenceResolutionRequest): Record<string, unknown> {
   const merged: Record<string, unknown> = {}
   for (const ref of request.inputRefs) {
@@ -147,7 +163,7 @@ function resolveInputRefs(snapshot: StepContextSnapshot, request: PlanInputRefer
     const source = hasLocalOutput ? request.outputs.get(ref) : content && Object.prototype.hasOwnProperty.call(content, "output") ? content.output : observation?.content
     if (!isPlainJsonObject(source) || !plainJson(source)) throw new CanonicalPlanError("input_reference_unavailable")
     const encoded = JSON.stringify(source)
-    if (encoded === undefined || Buffer.byteLength(encoded, "utf8") > MAX_RESULT_BYTES || Object.keys(source).some(key => FORBIDDEN_INPUT_KEYS.has(key))) throw new CanonicalPlanError("input_reference_unavailable")
+    if (encoded === undefined || Buffer.byteLength(encoded, "utf8") > MAX_RESULT_BYTES || hasForbiddenInputKey(source)) throw new CanonicalPlanError("input_reference_unavailable")
     for (const key of Object.keys(source).sort()) {
       if (Object.prototype.hasOwnProperty.call(merged, key) && stableJson(merged[key]) !== stableJson(source[key])) throw new CanonicalPlanError("input_reference_conflict")
       merged[key] = source[key]
