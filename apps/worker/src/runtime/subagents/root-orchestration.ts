@@ -1,5 +1,6 @@
 import type { DurableWaitPort } from "../tools/coordination-types.js"
 import { AgentTreeManager } from "./manager.js"
+import { ROLE_RESULT_SCHEMA } from "./role-results.js"
 import { roleContract, type MigratedRole } from "./scout-analyst-contracts.js"
 import type { SubagentTaskRecord, SubagentTaskSpec } from "./types.js"
 
@@ -55,6 +56,7 @@ function roleSpec(input: RootRoleSpawnInput, role: MigratedRole, goal: string): 
     userId: input.userId, sessionId: input.sessionId, turnId: input.turnId, parentTaskId: input.parentTaskId,
     role, taskType: `${role}.read`, goal, context: input.context,
     allowedActions: contract.allowedTools, toolPolicySnapshot: { role, allowedTools: contract.allowedTools, capabilities: contract.capabilities },
+    expectedOutputSchema: { schemaVersion: ROLE_RESULT_SCHEMA, role },
     successCriteria: ["Return structured result with real IDs and evidence", "Do not perform drafts, submissions, browser actions, or external writes"],
   }
 }

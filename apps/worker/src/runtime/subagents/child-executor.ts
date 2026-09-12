@@ -9,6 +9,7 @@ import type { ContextSnapshotAdapter } from "../context/context-snapshot-adapter
 import { createHarnessModelRuntime } from "../harness-model.js"
 import { visibleToolPolicy, getSubagentRolePolicy } from "./role-policy.js"
 import { childContextSnapshot, createChildContextBuilder } from "./child-context.js"
+import { ROLE_RESULT_SCHEMA, validateRoleResult, type StructuredRoleResult } from "./role-results.js"
 import { SubagentLeaseError, type SubagentExecutionResult, type SubagentLease, type SubagentTaskRecord } from "./types.js"
 import type { TurnExecutionStore } from "../turns/turn-execution-types.js"
 import { createToolRouterExecutor } from "../turns/turn-engine-helpers.js"
@@ -28,6 +29,7 @@ export type ChildToolRuntime = {
 
 const MAX_CHILD_FINAL_TEXT_BYTES = 8 * 1024
 const CHILD_FINAL_TEXT_TRUNCATION_MARKER = "...[TRUNCATED]"
+type StructuredRole = "scout" | "analyst"
 
 function utf8Prefix(value: string, maxBytes: number): string {
   let bytes = 0
@@ -46,6 +48,36 @@ function projectChildFinalText(value: string): string {
   if (Buffer.byteLength(redacted, "utf8") <= MAX_CHILD_FINAL_TEXT_BYTES) return redacted
   const markerBytes = Buffer.byteLength(CHILD_FINAL_TEXT_TRUNCATION_MARKER, "utf8")
   return `${utf8Prefix(redacted, MAX_CHILD_FINAL_TEXT_BYTES - markerBytes)}${CHILD_FINAL_TEXT_TRUNCATION_MARKER}`
+}
+
+function expectedStructuredRole(value: unknown, leasedRole: string): StructuredRole | undefined {
+  if (leasedRole !== "scout" && leasedRole !== "analyst" || !value || typeof value !== "object" || Array.isArray(value)) return undefined
+  try {
+    const marker = value as Record<string, unknown>
+    const prototype = Object.getPrototypeOf(value)
+    if ((prototype !== Object.prototype && prototype !== null) || Object.getOwnPropertySymbols(value).length > 0) return undefined
+    if (Object.keys(marker).length !== 2 || marker.schemaVersion !== ROLE_RESULT_SCHEMA || marker.role !== leasedRole) return undefined
+    return leasedRole
+  } catch {
+    return undefined
+  }
+}
+
+function parseStructuredResult(value: string, role: StructuredRole): StructuredRoleResult | undefined {
+  if (Buffer.byteLength(value, "utf8") > MAX_CHILD_FINAL_TEXT_BYTES) return undefined
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(value) as unknown
+  } catch {
+    return undefined
+  }
+  try {
+    const validated = validateRoleResult(parsed, role)
+    const serialized = JSON.stringify(validated)
+    return serialized !== undefined && Buffer.byteLength(serialized, "utf8") <= MAX_CHILD_FINAL_TEXT_BYTES ? validated : undefined
+  } catch {
+    return undefined
+  }
 }
 
 export type ChildExecutorOptions = {
@@ -131,8 +163,18 @@ export function createChildExecutor(options: ChildExecutorOptions): (input: { le
       stepCount: result.stepCount,
       toolCallCount: result.toolCallCount,
       finalItemId: result.finalItemId ?? null,
-      ...(result.status === "completed" && typeof result.finalText === "string" ? { finalText: projectChildFinalText(result.finalText) } : {}),
     }
-    return { status: resultStatus(result.status), result: childResult, failureReason: result.errorCode }
+    const structuredRole = expectedStructuredRole(lease.expectedOutputSchema, lease.role)
+    if (result.status === "completed" && structuredRole) {
+      if (typeof result.finalText !== "string") return { status: "failed", result: childResult, failureReason: "invalid_structured_result" }
+      const structuredResult = parseStructuredResult(result.finalText, structuredRole)
+      if (!structuredResult) return { status: "failed", result: childResult, failureReason: "invalid_structured_result" }
+      return { status: "completed", result: { ...childResult, finalText: projectChildFinalText(result.finalText), structuredResult }, failureReason: result.errorCode }
+    }
+    return {
+      status: resultStatus(result.status),
+      result: { ...childResult, ...(result.status === "completed" && typeof result.finalText === "string" ? { finalText: projectChildFinalText(result.finalText) } : {}) },
+      failureReason: result.errorCode,
+    }
   }
 }

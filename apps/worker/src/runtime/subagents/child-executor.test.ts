@@ -6,6 +6,7 @@ import { Buffer } from "node:buffer"
 
 import { createChildExecutor } from "./child-executor.js"
 import { childContextSnapshot, createChildContextBuilder } from "./child-context.js"
+import { ROLE_RESULT_SCHEMA } from "./role-results.js"
 import type { SubagentLease } from "./types.js"
 import type { TreeBudgetReservation, TreeBudgetReservationStore } from "./tree-budget-types.js"
 import type { TurnExecutionStore } from "../turns/turn-execution-types.js"
@@ -34,6 +35,53 @@ function lease(): SubagentLease {
     modelProfileSnapshot: { provider: "fixture", model: "fixture-model" }, result: null, failureReason: null, attemptCount: 2, maxAttempts: 3, leaseOwner: "worker-1",
     leaseExpiresAt: new Date("2026-09-09T12:00:00.000Z"), interruptRequestedAt: null, budgetSnapshot: { subagentPolicy: { maxAttempts: 3 } }, toolPolicySnapshot: {}, ownerId: "worker-1", signal: new AbortController().signal,
   }
+}
+
+type StructuredRole = "scout" | "analyst"
+
+function structuredLease(role: StructuredRole): SubagentLease {
+  return { ...lease(), role, taskType: `${role}.read`, expectedOutputSchema: { schemaVersion: ROLE_RESULT_SCHEMA, role } }
+}
+
+function validScoutResult() {
+  return {
+    schemaVersion: ROLE_RESULT_SCHEMA, role: "scout" as const, status: "completed" as const,
+    candidates: [{ jobId: "job-1", source: "greenhouse", url: "https://example.test/jobs/job-1", evidenceIds: ["evidence-job-1"] }],
+    evidence: [{ id: "evidence-job-1", kind: "job" as const, ref: "job-1", source: "greenhouse" }], summary: "One matching job",
+  }
+}
+
+function validAnalystResult() {
+  return {
+    schemaVersion: ROLE_RESULT_SCHEMA, role: "analyst" as const, status: "completed" as const,
+    findings: [{ jobId: "job-1", score: 8, evidenceIds: ["evidence-job-1"] }],
+    evidence: [{ id: "evidence-job-1", kind: "job" as const, ref: "job-1", source: "greenhouse" }], summary: "Strong match",
+  }
+}
+
+function finalTextModel(text: string): ModelAdapter {
+  let calls = 0
+  return {
+    id: "fixture-model", profile,
+    async *stream() {
+      calls += 1
+      if (calls === 1) {
+        yield { type: "tool_call_completed", callId: "evidence-call", name: "jobs.search", arguments: {} }
+        yield { type: "completed", finishReason: "tool_calls" }
+      } else {
+        yield { type: "text_delta", text }
+        yield { type: "completed", finishReason: "stop" }
+      }
+    },
+  }
+}
+
+function finalTextExecutor(model: ModelAdapter) {
+  return createChildExecutor({
+    store: executionStore([], []), treeBudget: budgetStore().store, authorizeUsage: async () => ({ settle: async () => undefined }),
+    modelRuntimeFactory: () => model,
+    toolRuntimeFactory: () => ({ definitions: [tool("jobs.search", "jobs")], router: { execute: async (_context, request) => ({ ...request, status: "completed", errorCode: null }) } }),
+  })
 }
 
 function executionStore(events: Array<{ type: string; taskId: string }>, requests: HarnessModelRequest[]): TurnExecutionStore {
@@ -229,8 +277,46 @@ describe("child executor composition", () => {
     expect(JSON.stringify(result.result)).not.toMatch(/userId|sessionId|turnId|stepId|taskId|parentTaskId|rootTaskId|ownerId|lease|capabilit|budget/i)
   })
 
+  it.each([
+    ["scout", validScoutResult],
+    ["analyst", validAnalystResult],
+  ] as const)("projects a validated structured %s result with bound evidence", async (role, makeResult) => {
+    const result = await finalTextExecutor(finalTextModel(JSON.stringify(makeResult())))({ lease: structuredLease(role) })
+    expect(result).toMatchObject({ status: "completed", result: { status: "completed", finalText: expect.any(String), structuredResult: makeResult() } })
+    expect(JSON.stringify(result.result)).not.toMatch(/userId|sessionId|turnId|stepId|taskId|parentTaskId|rootTaskId|ownerId|lease|capabilit|budget/i)
+  })
+
+  it.each([
+    ["invalid JSON", "not-json"],
+    ["fenced markdown", `\`\`\`json\n${JSON.stringify(validScoutResult())}\n\`\`\``],
+    ["extra runtime key", JSON.stringify({ ...validScoutResult(), userId: "forged-user" })],
+    ["missing evidence", JSON.stringify({ ...validScoutResult(), candidates: [{ ...validScoutResult().candidates[0], evidenceIds: [] }] })],
+    ["duplicate evidence", JSON.stringify({ ...validScoutResult(), evidence: [validScoutResult().evidence[0], validScoutResult().evidence[0]] })],
+    ["cross-role result", JSON.stringify({ ...validScoutResult(), role: "analyst" })],
+  ] as const)("fails closed for %s structured output", async (_name, text) => {
+    const result = await finalTextExecutor(finalTextModel(text))({ lease: structuredLease("scout") })
+    expect(result).toMatchObject({ status: "failed", failureReason: "invalid_structured_result" })
+    expect(result.result).not.toHaveProperty("finalText")
+    expect(result.result).not.toHaveProperty("structuredResult")
+  })
+
+  it("fails closed before parsing oversized structured output", async () => {
+    const text = JSON.stringify({ ...validScoutResult(), summary: "x".repeat(9_000) })
+    expect(Buffer.byteLength(text, "utf8")).toBeGreaterThan(8 * 1024)
+    const result = await finalTextExecutor(finalTextModel(text))({ lease: structuredLease("scout") })
+    expect(result).toMatchObject({ status: "failed", failureReason: "invalid_structured_result" })
+    expect(result.result).not.toHaveProperty("finalText")
+    expect(result.result).not.toHaveProperty("structuredResult")
+  })
+
+  it("keeps a valid-looking final text as generic output without a structured marker", async () => {
+    const result = await finalTextExecutor(finalTextModel(JSON.stringify(validScoutResult())))({ lease: lease() })
+    expect(result).toMatchObject({ status: "completed", result: { status: "completed", finalText: JSON.stringify(validScoutResult()) } })
+    expect(result.result).not.toHaveProperty("structuredResult")
+  })
+
   it("does not project final text while a child is waiting", async () => {
-    const child = lease()
+    const child = structuredLease("scout")
     const model: ModelAdapter = {
       id: "fixture-model", profile,
       async *stream() {
@@ -252,6 +338,7 @@ describe("child executor composition", () => {
     const result = await executor({ lease: child })
     expect(result).toMatchObject({ status: "waiting", result: { status: "waiting_for_dependency" } })
     expect(result.result).not.toHaveProperty("finalText")
+    expect(result.result).not.toHaveProperty("structuredResult")
   })
 
   it("releases before the provider when account admission fails", async () => {
