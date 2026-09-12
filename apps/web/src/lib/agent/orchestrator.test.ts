@@ -106,6 +106,16 @@ describe("OrchestratorAgent evaluation", () => {
     expect(result.decision).toBe("abort")
   })
 
+  it("fails closed when the model returns an unknown decision", async () => {
+    mocks.modelChat.mockResolvedValue({ text: '{"decision":"skip","thinking":"Skip ahead"}' })
+    const { agent } = await makeAgent()
+
+    const result = await agent.evaluate("scout", "Found one job", { jobCount: 1 })
+
+    expect(result.decision).not.toBe("proceed")
+    expect(result.decision).toBe("abort")
+  })
+
   it("fails closed when modelChat throws without exposing the provider error", async () => {
     mocks.modelChat.mockRejectedValue(new Error("provider secret token"))
     const { agent, emit } = await makeAgent()
