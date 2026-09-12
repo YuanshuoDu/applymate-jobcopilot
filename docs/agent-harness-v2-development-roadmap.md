@@ -1465,3 +1465,17 @@ git diff --check
 **独立验证：** 根侧 `role-results`、`partial-failure` 与 `aggregation` 验证 **30/30 passed**，`role-handlers` **3/3 passed**；shared build、Worker `tsc` 与 `git diff --check` 均通过。
 
 **候选边界：** 本切片只证明结构化 Scout/Analyst 结果的 schema、递归身份隔离与本地 adapter 回归，不代表 live DB/RLS、Redis/queue、provider、真实进程重启、browser 或 child-parent E2E 已验证；P3/Phase 和整体目标仍未完成。
+
+---
+
+## 31. P4-01 — Bounded child final response projection
+
+**状态与进度口径（2026-09-12）：** P4-01 是 bounded child final response projection 的候选可靠性切片；整体完成度仍为 **P0 accepted 1/8 (12.5%)**，本切片不改变该口径。
+
+**实现记录：** 集成提交为 `e448034a`。`TurnEngineResult.finalText` 是 server-owned 字段，仅在 candidate verifier、plan completion barrier、completion gate 和 final persistence 均通过、即将返回 `completed` 时出现。child executor 只投影 completed child 的 final text，先使用 `redactSensitiveText` 脱敏，再在 UTF-8 code-point 边界确定性截断至不超过 **8 KiB** 并附带截断标记；`waiting_for_dependency`、`waiting_for_user`、failed 和 interrupted 结果不携带 `finalText`。
+
+- durable manager/wait replay 会继续接收 bounded child result；本切片没有覆盖 root lifecycle 或 final-response overwrite，也没有新增 migration、provider、queue schema 或 external write。
+
+**独立验证：** 根侧对 turn loop **47/47** 与 child executor **9/9** 共 **56/56 passed**；shared build、Worker `tsc` 与 `git diff --check` 均通过。
+
+**候选边界：** live PostgreSQL/RLS、Redis/queue、provider、真实进程重启和 child-parent E2E 仍未验证；本切片不能据此宣称完整 Harness、P4/Phase 完成或生产恢复证据。
