@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vitest"
 
 import { loadCanonicalTurnState } from "./canonical-turn-state.js"
+import { buildPlanCompletionFeedbackEvent, PLAN_COMPLETION_FEEDBACK_EVENT_TYPE, planCompletionRecoveryCount } from "./planning/plan-completion-feedback.js"
 
 const lease = {
   turnId: "turn-1", sessionId: "session-1", ownerId: "worker-1", userId: "user-1", leaseVersion: 1,
@@ -119,6 +120,25 @@ describe("loadCanonicalTurnState", () => {
     const eventQuery = fake.client.query.mock.calls.find(([sql]) => typeof sql === "string" && sql.includes('FROM "agent_events"') && sql.includes("tool_call.completed"))?.[0]
     expect(eventQuery).toContain("'plan.observation'")
     expect(eventQuery).toContain('event_session."userId" = $4')
+  })
+
+  it("restores durable completion feedback only for the current plan and deduplicates it", async () => {
+    const feedback = buildPlanCompletionFeedbackEvent({ turnId: "turn-1", stepId: "turn:turn-1:step:0", attempt: 1, planId: "plan-1" })!
+    const fake = pool({
+      turn: { input: { goal: "Find jobs" }, rootTaskId: "root-1", contextSnapshotId: null, modelProfileSnapshot: {}, toolPolicySnapshot: {}, budgetSnapshot: {} },
+      events: [
+        { type: "plan.revision", payload: { planCallId: "plan-1", goalRevision: 1, planRevision: 1, basedOnPlanRevision: null } },
+        { type: PLAN_COMPLETION_FEEDBACK_EVENT_TYPE, payload: feedback },
+        { type: PLAN_COMPLETION_FEEDBACK_EVENT_TYPE, payload: feedback },
+        { type: PLAN_COMPLETION_FEEDBACK_EVENT_TYPE, payload: { ...feedback, planId: "foreign-plan" } },
+        { type: PLAN_COMPLETION_FEEDBACK_EVENT_TYPE, payload: { ...feedback, feedback: "model text" } },
+      ],
+    })
+    const value = await loadCanonicalTurnState(fake, lease)
+    expect(value.snapshot.toolObservations.filter(item => item.id === feedback.observationId)).toHaveLength(1)
+    expect(planCompletionRecoveryCount(value.snapshot.toolObservations, lease.turnId)).toBe(1)
+    const eventQuery = fake.client.query.mock.calls.find(([sql]) => typeof sql === "string" && sql.includes('FROM "agent_events"'))?.[0]
+    expect(eventQuery).toContain(`'${PLAN_COMPLETION_FEEDBACK_EVENT_TYPE}'`)
   })
 
   it("restores the latest valid plan revision and ignores malformed or foreign receipts", async () => {

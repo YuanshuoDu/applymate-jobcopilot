@@ -16,7 +16,7 @@ import { assertExecutionAlive, assertModelAllowance, canEmitTurnCompleted, canPe
 import { parsePlanRevisionReceipt, planRevisionObservation } from "../planning/plan-revision-receipt.js"
 import { goalRevisionObservation, parseGoalRevisionOutput } from "../planning/goal-revision-receipt.js"
 import { verifyPlanCompletion } from "../planning/plan-completion-verifier.js"
-import { buildPlanCompletionFeedback, MAX_PLAN_COMPLETION_RECOVERY_ATTEMPTS, planCompletionRecoveryCount } from "../planning/plan-completion-feedback.js"
+import { buildPlanCompletionFeedback, buildPlanCompletionFeedbackEvent, currentPlanId, MAX_PLAN_COMPLETION_RECOVERY_ATTEMPTS, planCompletionFeedbackIdempotencyKey, PLAN_COMPLETION_FEEDBACK_EVENT_TYPE, planCompletionRecoveryCount } from "../planning/plan-completion-feedback.js"
 import { runContextCompaction } from "../context/context-compaction-runtime.js"
 
 const DEFAULT_MAX_STEPS = 32
@@ -151,7 +151,14 @@ export async function runTurnExecutionLoop(options: TurnExecutionOptions): Promi
           if (usedRecoveryAttempts < planCompletionRecoveryLimit) {
             const feedback = buildPlanCompletionFeedback(step.id, usedRecoveryAttempts + 1)
             if (!feedback) throw new TurnEngineError("invalid_output", "Plan completion feedback could not be built")
-            // P3-27A intentionally keeps recovery feedback in this loop snapshot. P3-27B will add durable replay/restore.
+            const event = buildPlanCompletionFeedbackEvent({ turnId: options.identity.turnId, stepId: step.id, attempt: feedback.content.attempt, planId: currentPlanId(snapshot.toolObservations) })
+            const idempotencyKey = planCompletionFeedbackIdempotencyKey(step.id)
+            if (!event || !idempotencyKey) throw new TurnEngineError("invalid_output", "Plan completion feedback identity could not be built")
+            try {
+              await writer.append(PLAN_COMPLETION_FEEDBACK_EVENT_TYPE, step.id, null, event, idempotencyKey)
+            } catch {
+              throw new TurnEngineError("invalid_output", "Plan completion feedback could not be persisted")
+            }
             snapshot = { ...snapshot, toolObservations: [...snapshot.toolObservations, feedback] }
             continuation = undefined
             continue

@@ -12,7 +12,7 @@ import { createGoalUpdateTool } from "../planning/goal-update-tool.js"
 import { createPlanProposalTool } from "../planning/plan-proposal-tool.js"
 import { createCanonicalPlanExecutionFactory } from "../planning/canonical-plan-execution.js"
 import { createPlanRevisionRecoveryDispatcher, planRevisionObservation } from "../planning/plan-revision-receipt.js"
-import { PLAN_COMPLETION_FEEDBACK_TEXT } from "../planning/plan-completion-feedback.js"
+import { PLAN_COMPLETION_FEEDBACK_EVENT_TYPE, PLAN_COMPLETION_FEEDBACK_TEXT } from "../planning/plan-completion-feedback.js"
 import type { ToolExecutionContext } from "../tools/types.js"
 import type { TurnEngineItem, TurnEngineStore, TurnEngineToolResult } from "./turn-engine-types.js"
 import type { TurnExecutionIdentity, TurnExecutionOptions, TurnExecutionStore } from "./turn-execution-types.js"
@@ -155,6 +155,52 @@ describe("owner-agnostic turn execution loop", () => {
     expect(JSON.stringify(requests[1]?.messages)).toContain(PLAN_COMPLETION_FEEDBACK_TEXT)
     expect(requests[1]?.continuation).toBeUndefined()
     expect(root.events.some(event => event.type === "final.rejected")).toBe(false)
+  })
+
+  it("persists completion feedback before advancing to the recovery model step", async () => {
+    const root = fixture(identity("turn", "root-1"), undefined, async ({ call }) => ({
+      observations: [{ id: `plan-control:${call.id}:finish`, content: { kind: "plan_control", localId: "finish", status: "completion_proposed", dependsOn: ["missing"], completionCriteria: ["done"] } }],
+    }), [{ id: "tool-result:seed", content: { toolCallId: "seed", toolName: "jobs.search", input: {}, status: "completed", output: { job: "job-1" }, errorCode: null } }])
+    const result = await runTurnExecutionLoop({ ...root.options, planCompletionRequired: true, planCompletionRecoveryLimit: 1 })
+    expect(result).toMatchObject({ status: "failed", errorCode: "final_unverified" })
+    const persisted = root.events.filter(event => event.type === PLAN_COMPLETION_FEEDBACK_EVENT_TYPE && event.payload)
+    expect(persisted).toHaveLength(1)
+    expect(persisted[0]).toMatchObject({
+      payload: {
+        observationId: "plan-completion-feedback:turn:turn-1:step:1",
+        turnId: "turn-1",
+        stepId: "turn:turn-1:step:1",
+        attempt: 1,
+        status: "blocked",
+        blocker: "plan_completion_unverified",
+        feedback: PLAN_COMPLETION_FEEDBACK_TEXT,
+        planId: "call:root-1",
+      },
+      idempotencyKey: "turn:turn-1:event:plan-completion-feedback:turn:turn-1:step:1",
+    })
+    const feedbackIndex = root.events.findIndex(event => event.type === PLAN_COMPLETION_FEEDBACK_EVENT_TYPE && event.payload)
+    const nextStepIndex = root.events.findIndex((event, index) => index > feedbackIndex && event.type === "step.started" && event.payload)
+    expect(feedbackIndex).toBeGreaterThanOrEqual(0)
+    expect(nextStepIndex).toBeGreaterThan(feedbackIndex)
+  })
+
+  it("fails closed when durable completion feedback cannot be appended", async () => {
+    const root = fixture(identity("turn", "root-1"), undefined, async ({ call }) => ({
+      observations: [{ id: `plan-control:${call.id}:finish`, content: { kind: "plan_control", localId: "finish", status: "completion_proposed", dependsOn: ["missing"], completionCriteria: ["done"] } }],
+    }), [{ id: "tool-result:seed", content: { toolCallId: "seed", toolName: "jobs.search", input: {}, status: "completed", output: { job: "job-1" }, errorCode: null } }])
+    const appendEvent = root.options.store.appendEvent
+    root.options = {
+      ...root.options,
+      store: {
+        ...root.options.store,
+        appendEvent: async input => input.type === PLAN_COMPLETION_FEEDBACK_EVENT_TYPE ? Promise.reject(new Error("database detail")) : appendEvent(input),
+      },
+    }
+    const result = await runTurnExecutionLoop({ ...root.options, planCompletionRequired: true, planCompletionRecoveryLimit: 1 })
+    expect(result).toMatchObject({ status: "failed", errorCode: "invalid_output" })
+    expect(root.requests).toHaveLength(2)
+    expect(root.events.some(event => event.type === PLAN_COMPLETION_FEEDBACK_EVENT_TYPE)).toBe(false)
+    expect(JSON.stringify(root.events)).not.toContain("database detail")
   })
 
   it("fails closed immediately when the server-owned recovery limit is zero", async () => {
