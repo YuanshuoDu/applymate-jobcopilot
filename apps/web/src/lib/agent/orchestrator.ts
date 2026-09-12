@@ -237,9 +237,12 @@ Respond ONLY in valid JSON (no markdown):
       this.emit('orchestrator_thinking', { stage, thinking: parsed.thinking, decision: parsed.decision })
       return parsed
     } catch {
-      const fallback: OrchestratorDecision = { decision: 'proceed', thinking: 'Continue to the next stage' }
-      this.history.push(`[${stage}] ${summary} → proceed (fallback)`)
-      this.emit('orchestrator_thinking', { stage, thinking: fallback.thinking, decision: 'proceed' })
+      const fallback: OrchestratorDecision = {
+        decision: 'abort',
+        thinking: 'Unable to determine a safe next step; aborting the pipeline',
+      }
+      this.history.push(`[${stage}] ${summary} → abort (fallback)`)
+      this.emit('orchestrator_thinking', { stage, thinking: fallback.thinking, decision: 'abort' })
       return fallback
     }
   }
