@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest"
 
-import { createPlanRevisionRecoveryDispatcher, parsePlanRevisionEvent, parsePlanRevisionReceipt, planRevisionObservation } from "./plan-revision-receipt.js"
+import { createPlanRevisionRecoveryDispatcher, PlanRevisionRecoveryError, parsePlanRevisionEvent, parsePlanRevisionReceipt, planRevisionObservation, recoverPlanRevision } from "./plan-revision-receipt.js"
 import { fingerprintPlanProposal } from "./plan-fingerprint.js"
 
 const proposal = { schemaVersion: "agent-harness.plan.v1" as const, basedOnGoalRevision: 1, basedOnPlanRevision: null, nodes: [], completionCriteria: [], briefRationale: "bounded" }
@@ -38,5 +38,20 @@ describe("plan revision receipt", () => {
     dispatcher.recover({ goalRevision: 1, planRevision: 2, basedOnPlanRevision: 1, proposalHash: acceptedWithHash.proposalHash })
     expect(handler).toHaveBeenCalledWith({ goalRevision: 1, planRevision: 2, basedOnPlanRevision: 1, proposalHash: acceptedWithHash.proposalHash })
     expect(handler.mock.calls[0]?.[0]).not.toHaveProperty("planCallId")
+  })
+
+  it("accepts only a contiguous recovery cursor and maps handler failures to invalid_output", () => {
+    const first = { goalRevision: 1, planRevision: 1, basedOnPlanRevision: null }
+    const second = { goalRevision: 1, planRevision: 2, basedOnPlanRevision: 1 }
+    expect(recoverPlanRevision(null, first)).toBe(1)
+    expect(recoverPlanRevision(1, second)).toBe(2)
+    expect(recoverPlanRevision(1, first)).toBe(1)
+    expect(() => recoverPlanRevision(null, second)).toThrow(PlanRevisionRecoveryError)
+    expect(() => recoverPlanRevision(1, { ...second, planRevision: 3, basedOnPlanRevision: 2 })).toThrow(PlanRevisionRecoveryError)
+    expect(() => recoverPlanRevision(2, { ...first, proposalHash: acceptedWithHash.proposalHash })).toThrow(PlanRevisionRecoveryError)
+
+    const dispatcher = createPlanRevisionRecoveryDispatcher()
+    dispatcher.register(() => { throw new Error("recovery failed") })
+    expect(() => dispatcher.recover(first)).toThrowError(expect.objectContaining({ code: "invalid_output" }))
   })
 })

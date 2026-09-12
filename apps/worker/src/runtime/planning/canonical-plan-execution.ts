@@ -4,12 +4,12 @@ import type { PolicyEngine } from "@jobcopilot/agent-policy"
 import type { PolicyRole, TenantScope } from "@jobcopilot/agent-protocol"
 
 import { copyAllowedPlanActions, PLAN_MAX_NODES, PLAN_MAX_REVISIONS, isPlainJsonObject, type GoalContract, type GoalContractRef, type PlanActionKind } from "./goal-plan-contract.js"
-import { PlanDispatchError, dispatchPlanProposal } from "./plan-intent-dispatcher.js"
+import { PlanDispatchError, dispatchPlanProposal, type PlanDispatchCommand } from "./plan-intent-dispatcher.js"
 import { copyPlanFingerprints, fingerprintPlanProposal, isPlanFingerprint } from "./plan-fingerprint.js"
 import { PlanValidationError, validatePlanProposal } from "./goal-plan-validator.js"
 import { PlanCommandExecutionError, executePlanCommands, type PlanCommandExecutionRecord, type PlanCommandExecutionRuntime, type PlanControlRecord, type PlanInputReferenceResolutionRequest } from "./plan-command-executor.js"
 import { createPlanCommandReceipt, type PlanCommandReceipt } from "./plan-command-receipt.js"
-import { PlanRevisionRecoveryError, type PlanRevisionRecoveryDispatcher } from "./plan-revision-receipt.js"
+import { PlanRevisionRecoveryError, recoverPlanRevision, type PlanRevisionRecoveryDispatcher } from "./plan-revision-receipt.js"
 import type { ToolCallRequest, ToolExecutionResult, ToolRouterContext } from "../tools/types.js"
 import type { TurnEnginePlanExecutionHook, TurnEnginePlanExecutionHookResult } from "../turns/turn-engine-types.js"
 import type { StepContextSnapshot } from "../context/step-context-builder.js"
@@ -67,15 +67,17 @@ function plainJson(value: unknown, seen = new Set<object>()): boolean {
   return valid
 }
 
-function accepted(value: unknown, goalRevision: number, expectedPlanRevision: number | null, maxPlanRevisions: number): { planRevision: number; basedOnPlanRevision: number | null; proposal: unknown; proposalHash: string } {
+function accepted(value: unknown, goalRevision: number, expectedPlanRevision: number | null, maxPlanRevisions: number, replayed: boolean): { planRevision: number; basedOnPlanRevision: number | null; proposal: unknown; proposalHash: string } {
   if (!isPlainJsonObject(value) || !plainJson(value) || Object.keys(value).some(key => !OUTPUT_KEYS.includes(key))) throw new CanonicalPlanError("invalid_plan_output")
   if (value.status !== "accepted" || value.goalRevision !== goalRevision) throw new CanonicalPlanError("revision_conflict")
   const planRevision = value.planRevision
   const basedOnPlanRevision = value.basedOnPlanRevision
   if (typeof planRevision !== "number" || !Number.isSafeInteger(planRevision) || planRevision < 1 ||
     (basedOnPlanRevision !== null && (typeof basedOnPlanRevision !== "number" || !Number.isSafeInteger(basedOnPlanRevision) || basedOnPlanRevision < 0))) throw new CanonicalPlanError("invalid_plan_output")
-  if (planRevision > maxPlanRevisions || (expectedPlanRevision !== null && expectedPlanRevision >= maxPlanRevisions)) throw new CanonicalPlanError("plan_revision_limit")
-  if (basedOnPlanRevision !== expectedPlanRevision || planRevision !== (expectedPlanRevision === null ? 1 : expectedPlanRevision + 1)) throw new CanonicalPlanError("revision_conflict")
+  if (planRevision > maxPlanRevisions || (!replayed && expectedPlanRevision !== null && expectedPlanRevision >= maxPlanRevisions)) throw new CanonicalPlanError("plan_revision_limit")
+  if (planRevision !== (basedOnPlanRevision === null ? 1 : basedOnPlanRevision + 1)) throw new CanonicalPlanError("revision_conflict")
+  if (!replayed && (basedOnPlanRevision !== expectedPlanRevision || planRevision !== (expectedPlanRevision === null ? 1 : expectedPlanRevision + 1))) throw new CanonicalPlanError("revision_conflict")
+  if (replayed && (expectedPlanRevision === null ? basedOnPlanRevision !== null : planRevision !== expectedPlanRevision)) throw new CanonicalPlanError("revision_conflict")
   if (!isPlainJsonObject(value.proposal) || !Array.isArray(value.intents) || value.intents.length > MAX_OBSERVATIONS || !isPlanFingerprint(value.proposalHash)) throw new CanonicalPlanError("invalid_plan_output")
   const encoded = JSON.stringify(value)
   if (encoded === undefined || Buffer.byteLength(encoded, "utf8") > 64 * 1024) throw new CanonicalPlanError("invalid_plan_output")
@@ -180,6 +182,78 @@ function boundedRecords(result: { readonly completed: readonly PlanCommandExecut
   return records.length <= MAX_OBSERVATIONS ? records : [...records.slice(0, MAX_OBSERVATIONS - 1), records[records.length - 1]!]
 }
 
+type ReplayCommandReceipt = {
+  readonly observationId: string
+  readonly status: "completed" | "failed" | "cancelled"
+  readonly output?: unknown
+  readonly errorCode: string | null
+}
+
+function keysOnly(value: Record<string, unknown>, keys: readonly string[]): boolean {
+  return Object.keys(value).every(key => keys.includes(key))
+}
+
+function replayReceipt(snapshot: StepContextSnapshot, callId: string, command: PlanDispatchCommand): ReplayCommandReceipt | null {
+  const control = command.kind === "request_input" || command.kind === "propose_completion"
+  const observationId = id(control ? "plan-control" : "plan-result", callId, command.localId)
+  const matches = snapshot.toolObservations.filter(observation => observation.id === observationId)
+  if (matches.length > 1) throw new CanonicalPlanError("invalid_plan_output")
+  const observation = matches[0]
+  if (!observation) return null
+  const content = row(observation.content)
+  if (!content) throw new CanonicalPlanError("invalid_plan_output")
+  if (control) {
+    if (!keysOnly(content, command.kind === "request_input" ? ["kind", "localId", "status", "question", "approvalBoundary"] : ["kind", "localId", "status", "completionCriteria"]) || content.kind !== "plan_control" || content.localId !== command.localId) throw new CanonicalPlanError("invalid_plan_output")
+    if (command.kind === "request_input") {
+      if (content.status !== "waiting_for_user" || content.question !== command.question ||
+        (command.approvalBoundary === undefined ? content.approvalBoundary !== undefined : content.approvalBoundary !== command.approvalBoundary)) throw new CanonicalPlanError("invalid_plan_output")
+    } else if (content.status !== "completion_proposed" || stableJson(content.completionCriteria) !== stableJson(command.completionCriteria)) throw new CanonicalPlanError("invalid_plan_output")
+    return { observationId, status: "completed", errorCode: null }
+  }
+  if (!keysOnly(content, ["kind", "localId", "commandKind", "dependsOn", "status", "errorCode", "output"]) || content.kind !== "plan_command" || content.localId !== command.localId || content.commandKind !== command.kind || stableJson(content.dependsOn) !== stableJson(command.dependsOn)) throw new CanonicalPlanError("invalid_plan_output")
+  if (content.status !== "completed" && content.status !== "failed" && content.status !== "cancelled") throw new CanonicalPlanError("invalid_plan_output")
+  if (content.errorCode !== null && typeof content.errorCode !== "string") throw new CanonicalPlanError("invalid_plan_output")
+  if (content.status === "completed" && content.errorCode !== null) throw new CanonicalPlanError("invalid_plan_output")
+  if (Object.prototype.hasOwnProperty.call(content, "output") && !plainJson(content.output)) throw new CanonicalPlanError("invalid_plan_output")
+  return { observationId, status: content.status, ...(Object.prototype.hasOwnProperty.call(content, "output") ? { output: content.output } : {}), errorCode: content.errorCode }
+}
+
+function replayRuntime(
+  options: CanonicalPlanExecutionOptions,
+  input: Parameters<TurnEnginePlanExecutionHook>[0],
+  dispatched: ReturnType<typeof dispatchPlanProposal>,
+  planRevision: number,
+): { runtime: PlanCommandExecutionRuntime; observations: Array<{ readonly id: string; readonly content: Record<string, unknown> }> } {
+  const receipts = new Map<string, ReplayCommandReceipt>()
+  for (const command of dispatched.commands) {
+    const receipt = replayReceipt(input.snapshot, input.call.id, command)
+    if (receipt) receipts.set(command.localId, receipt)
+  }
+  const observations: Array<{ readonly id: string; readonly content: Record<string, unknown> }> = []
+  const observe = async (recordValue: PlanCommandExecutionRecord | PlanControlRecord): Promise<void> => {
+    const observation = "result" in recordValue ? recordObservation(input.call.id, recordValue) : controlObservation(input.call.id, recordValue)
+    if (receipts.has(recordValue.localId)) return
+    observations.push(observation)
+    if (options.persistOutcome) await options.persistOutcome(outcomeReceipt(input.call.id, planRevision, recordValue))
+  }
+  return {
+    runtime: {
+      router: {
+        execute: async (context, request) => {
+          const command = dispatched.commands.find(item => "call" in item && item.call.id === request.id)
+          const receipt = command ? receipts.get(command.localId) : undefined
+          if (!receipt) return options.router.execute(context, request)
+          return { ...request, status: receipt.status, ...(Object.prototype.hasOwnProperty.call(receipt, "output") ? { output: receipt.output } : {}), errorCode: receipt.errorCode }
+        },
+      },
+      createContext: request => ({ scope: options.scope, sessionId: options.lease.sessionId, turnId: options.lease.turnId, stepId: `${input.stepId}:plan:${request.localId}`, taskId: options.taskId, rootTaskId: options.rootTaskId, actorRole: options.actorRole, capabilities: [...options.capabilities], signal: input.signal }),
+      resolveInputRefs: request => receipts.has(request.localId) ? {} : resolveInputRefs(input.snapshot, request),
+      observe,
+    },
+    observations,
+  }
+}
+
 export function createCanonicalPlanExecutionFactory(options: CanonicalPlanExecutionOptions): (input: Parameters<TurnEnginePlanExecutionHook>[0]) => Promise<TurnEnginePlanExecutionHookResult> {
   if (!Number.isSafeInteger(options.goal.revision) || options.goal.revision < 1 || !Number.isSafeInteger(options.maxNodes) || options.maxNodes < 1 || options.maxNodes > PLAN_MAX_NODES) throw new TypeError("Invalid server plan execution bounds")
   const maxPlanRevisions = options.maxPlanRevisions ?? PLAN_MAX_REVISIONS
@@ -199,18 +273,12 @@ export function createCanonicalPlanExecutionFactory(options: CanonicalPlanExecut
       seenPlanHashes.clear()
       goalRevision = goal.revision
     }
-    const basedOnPlanRevision = receipt.basedOnPlanRevision
-    if (!Number.isSafeInteger(receipt.planRevision) || receipt.planRevision < 1 || receipt.planRevision > maxPlanRevisions ||
-      (basedOnPlanRevision !== null && (!Number.isSafeInteger(basedOnPlanRevision) || basedOnPlanRevision < 0 || basedOnPlanRevision >= maxPlanRevisions)) ||
-      receipt.planRevision !== (basedOnPlanRevision === null ? 1 : basedOnPlanRevision + 1)) throw new PlanRevisionRecoveryError()
+    recoverPlanRevision(receipt.basedOnPlanRevision, receipt, maxPlanRevisions)
     if (receipt.goalRevision !== goalRevision) return
-    if (receipt.planRevision > (currentPlanRevision ?? 0)) {
-      if (receipt.basedOnPlanRevision !== currentPlanRevision) throw new PlanRevisionRecoveryError()
-      currentPlanRevision = receipt.planRevision
-    } else if (receipt.planRevision === (currentPlanRevision ?? 0) && receipt.basedOnPlanRevision !== (currentPlanRevision === null ? null : currentPlanRevision - 1)) {
-      throw new PlanRevisionRecoveryError()
-    }
-    if (receipt.proposalHash && !seenPlanHashes.has(receipt.proposalHash) && seenPlanHashes.size < maxPlanRevisions) seenPlanHashes.add(receipt.proposalHash)
+    const nextRevision = recoverPlanRevision(currentPlanRevision, receipt, maxPlanRevisions)
+    if (receipt.planRevision !== currentPlanRevision && receipt.proposalHash && seenPlanHashes.has(receipt.proposalHash)) throw new PlanRevisionRecoveryError()
+    currentPlanRevision = nextRevision
+    if (receipt.proposalHash) seenPlanHashes.add(receipt.proposalHash)
   })
   return async input => {
     const baseError = (code: string): TurnEnginePlanExecutionHookResult => ({ observations: [failureObservation(input.call.id, code)] })
@@ -222,7 +290,8 @@ export function createCanonicalPlanExecutionFactory(options: CanonicalPlanExecut
         goalRevision = goal.revision
       }
       if (input.result.status !== "completed" || input.result.toolName !== "agent.plan.propose") throw new CanonicalPlanError("invalid_plan_output")
-      const output = accepted(input.result.output, goal.revision, currentPlanRevision, maxPlanRevisions)
+      const replayed = input.replayed === true
+      const output = accepted(input.result.output, goal.revision, currentPlanRevision, maxPlanRevisions, replayed)
       const validation = {
         goalRevision: goal.revision, planRevision: output.basedOnPlanRevision, maxNodes: options.maxNodes,
         allowedActions: allowedPlanActions, allowedTools, allowedTemplates, allowedRoles,
@@ -231,7 +300,7 @@ export function createCanonicalPlanExecutionFactory(options: CanonicalPlanExecut
       try { normalized = validatePlanProposal(output.proposal, { goalRevision: goal.revision }) } catch (error: unknown) { if (error instanceof PlanValidationError) throw new CanonicalPlanError("invalid_plan_output"); throw error }
       const computedHash = fingerprintPlanProposal(normalized)
       if (computedHash !== output.proposalHash) throw new CanonicalPlanError("invalid_plan_output")
-      if (seenPlanHashes.has(computedHash)) throw new CanonicalPlanError("plan_no_progress")
+      if (!replayed && seenPlanHashes.has(computedHash)) throw new CanonicalPlanError("plan_no_progress")
       const dispatched = dispatchPlanProposal(normalized, validation, {
         resolveToolVersion: name => version(options.registry, options.capabilities, name),
         createToolCallId: localId => id("plan-call", input.call.id, localId),
@@ -239,9 +308,12 @@ export function createCanonicalPlanExecutionFactory(options: CanonicalPlanExecut
         deferInputRefs: true,
         resolveDelegateActions: () => actions(options.registry, options.capabilities, allowedTools),
       })
-      seenPlanHashes.add(computedHash)
-      currentPlanRevision = output.planRevision
-      const commandRuntime: PlanCommandExecutionRuntime = {
+      if (!replayed) {
+        seenPlanHashes.add(computedHash)
+        currentPlanRevision = output.planRevision
+      }
+      const replay = replayed ? replayRuntime(options, input, dispatched, output.planRevision) : undefined
+      const commandRuntime: PlanCommandExecutionRuntime = replay?.runtime ?? {
         router: options.router,
         createContext: request => ({ scope: options.scope, sessionId: options.lease.sessionId, turnId: options.lease.turnId, stepId: `${input.stepId}:plan:${request.localId}`, taskId: options.taskId, rootTaskId: options.rootTaskId, actorRole: options.actorRole, capabilities: [...options.capabilities], signal: input.signal }),
         resolveInputRefs: request => resolveInputRefs(input.snapshot, request),
@@ -249,9 +321,9 @@ export function createCanonicalPlanExecutionFactory(options: CanonicalPlanExecut
       }
       const executed = await executePlanCommands(dispatched, commandRuntime)
       const records = boundedRecords(executed)
-      const observations = records.map(recordValue => recordObservation(input.call.id, recordValue))
+      const observations = replay?.observations ?? records.map(recordValue => recordObservation(input.call.id, recordValue))
       if (executed.blocked) {
-        observations.push(controlObservation(input.call.id, executed.blocked))
+        if (!replay) observations.push(controlObservation(input.call.id, executed.blocked))
         // request_input is a user question; approval waits come from ToolRouter policy decisions.
         return executed.blocked.kind === "request_input"
           ? { observations: observations.slice(0, MAX_OBSERVATIONS), wait: { status: "waiting_for_user", errorCode: "plan_request_input" } }

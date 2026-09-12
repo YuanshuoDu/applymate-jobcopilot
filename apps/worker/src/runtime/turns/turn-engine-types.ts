@@ -80,6 +80,8 @@ export type TurnEnginePlanExecutionHook = (input: {
   readonly call: TurnEngineToolCall
   readonly result: TurnEngineToolResult
   readonly completedToolResults: readonly TurnEngineToolResult[]
+  /** Server-owned marker: replay reconciliation must not advance the normal CAS cursor. */
+  readonly replayed: boolean
   readonly snapshot: StepContextSnapshot
 }) => Promise<TurnEnginePlanExecutionHookResult> | TurnEnginePlanExecutionHookResult
 

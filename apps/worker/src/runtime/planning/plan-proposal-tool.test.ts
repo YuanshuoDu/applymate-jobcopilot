@@ -111,13 +111,13 @@ describe("plan proposal tool", () => {
     await expect(definition.execute(context(), { proposal: plan({ basedOnPlanRevision: 2 }) })).rejects.toMatchObject({ code: "plan_invalid" })
   })
 
-  it("repairs the local revision and fills a missing hash without allowing revision rollback", async () => {
+  it("repairs the local revision and rejects revision rollback", async () => {
     const dispatcher = createPlanRevisionRecoveryDispatcher()
     const recovered = plan()
     const recoveredHash = fingerprintPlanProposal(recovered)
     const definition = createPlanProposalTool(toolOptions({ initialPlanRevision: 1, recoveryDispatcher: dispatcher }))
     dispatcher.recover({ goalRevision: 1, planRevision: 2, basedOnPlanRevision: 1, proposalHash: recoveredHash })
-    dispatcher.recover({ goalRevision: 1, planRevision: 1, basedOnPlanRevision: null, proposalHash: fingerprintPlanProposal(plan({ nodes: [{ ...baseNode, localId: "older" }] })) })
+    expectRecoveryError(() => dispatcher.recover({ goalRevision: 1, planRevision: 1, basedOnPlanRevision: null, proposalHash: fingerprintPlanProposal(plan({ nodes: [{ ...baseNode, localId: "older" }] })) }))
     await expect(definition.execute(context(), { proposal: { ...recovered, basedOnPlanRevision: 2 } })).rejects.toMatchObject({ code: "plan_no_progress", safeOutput: { proposalHash: recoveredHash } })
     const next = await definition.execute(context(), { proposal: plan({ basedOnPlanRevision: 2, nodes: [{ ...baseNode, localId: "next" }] }) })
     expect(next).toMatchObject({ planRevision: 3, basedOnPlanRevision: 2 })

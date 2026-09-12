@@ -43,12 +43,12 @@ function fixture(router: { execute(context: ToolRouterContext, request: ToolCall
   return createCanonicalPlanExecutionFactory(options)
 }
 
-function input(value: unknown, stepId = "step-1", toolObservations: StepContextSnapshot["toolObservations"] = []) {
+function input(value: unknown, stepId = "step-1", toolObservations: StepContextSnapshot["toolObservations"] = [], replayed = false) {
   return {
     identity: executionOwnerFence({ kind: "turn", taskId: "root-1", lease }), scope: { userId: "user-1" }, sessionId: "session-1", turnId: "turn-1", stepId,
     signal: new AbortController().signal, call: { id: "proposal-1", name: "agent.plan.propose", arguments: {} },
     result: { id: "proposal-1", toolName: "agent.plan.propose", toolVersion: "1", status: "completed" as const, output: value, errorCode: null },
-    completedToolResults: [], snapshot: { system: [], profile: [], steerHistory: [], businessRefs: [], toolObservations },
+    completedToolResults: [], replayed, snapshot: { system: [], profile: [], steerHistory: [], businessRefs: [], toolObservations },
   }
 }
 
@@ -139,15 +139,72 @@ describe("createCanonicalPlanExecutionFactory", () => {
     expect(observationCode(stale)).toBe("revision_conflict")
   })
 
-  it("repairs bridge revision and hash state through the replay dispatcher without rollback", async () => {
+  it("rejects bridge revision rollback through the replay dispatcher", async () => {
     const dispatcher = createPlanRevisionRecoveryDispatcher()
     const hook = fixture(undefined, 1, undefined, undefined, undefined, undefined, undefined, dispatcher)
     const recovered = proposal([])
     dispatcher.recover({ goalRevision: 1, planRevision: 2, basedOnPlanRevision: 1, proposalHash: fingerprintPlanProposal(recovered) })
-    dispatcher.recover({ goalRevision: 1, planRevision: 1, basedOnPlanRevision: null, proposalHash: fingerprintPlanProposal(proposal([use("older")])) })
+    expectRecoveryError(() => dispatcher.recover({ goalRevision: 1, planRevision: 1, basedOnPlanRevision: null, proposalHash: fingerprintPlanProposal(proposal([use("older")])) }))
     const nextProposal = { ...proposal([use("next")]), basedOnPlanRevision: 2 }
     const next = await hook(input(output(nextProposal, { planRevision: 3, basedOnPlanRevision: 2 })))
     expect(next.observations).toHaveLength(1)
+  })
+
+  it("replays all persisted plan commands without routing or emitting duplicates", async () => {
+    const router = { execute: vi.fn(async (_context: ToolRouterContext, request: ToolCallRequest) => ({ ...request, status: "completed" as const, output: { unexpected: true }, errorCode: null })) }
+    const command = { id: "plan-result:proposal-1:read", content: { kind: "plan_command", localId: "read", commandKind: "tool_call", dependsOn: [], status: "completed", errorCode: null, output: { jobId: "job-1" } } }
+    const hook = fixture(router)
+    const result = await hook(input(output(proposal([use("read")])), "step-1", [command], true))
+    expect(result).toEqual({ observations: [] })
+    expect(router.execute).not.toHaveBeenCalled()
+  })
+
+  it("accepts a replayed receipt at the current revision bound", async () => {
+    const hook = fixture(undefined, 8)
+    const replayed = { ...proposal([]), basedOnPlanRevision: 7 }
+    const result = await hook(input(output(replayed, { planRevision: 8, basedOnPlanRevision: 7 }), "step-1", [], true))
+    expect(result).toEqual({ observations: [] })
+  })
+
+  it("replays completed outputs into dependent missing commands and persists only the missing observation", async () => {
+    const requests: ToolCallRequest[] = []
+    const receipts: PlanCommandReceipt[] = []
+    const router = { execute: vi.fn(async (_context: ToolRouterContext, request: ToolCallRequest) => { requests.push(request); return { ...request, status: "completed" as const, output: { ok: true }, errorCode: null } }) }
+    const nodes = [use("read"), use("review", { inputRefs: ["read"], dependsOn: ["read"] })]
+    const existing = { id: "plan-result:proposal-1:read", content: { kind: "plan_command", localId: "read", commandKind: "tool_call", dependsOn: [], status: "completed", errorCode: null, output: { jobId: "job-1" } } }
+    const hook = fixture(router, undefined, receipt => { receipts.push(receipt) })
+    const result = await hook(input(output(proposal(nodes)), "step-1", [existing], true))
+    expect(result.observations).toHaveLength(1)
+    expect(result.observations[0]?.id).toBe("plan-result:proposal-1:review")
+    expect(receipts).toHaveLength(1)
+    expect(receipts[0]).toMatchObject({ observationId: "plan-result:proposal-1:review", planRevision: 1 })
+    expect(router.execute).toHaveBeenCalledTimes(1)
+    expect(requests[0]?.input).toEqual({ jobId: "job-1" })
+  })
+
+  it.each(["failed", "cancelled"] as const)("reuses a persisted %s command without routing", async status => {
+    const router = { execute: vi.fn(async (_context: ToolRouterContext, request: ToolCallRequest) => ({ ...request, status: "completed" as const, output: { unexpected: true }, errorCode: null })) }
+    const existing = { id: "plan-result:proposal-1:read", content: { kind: "plan_command", localId: "read", commandKind: "tool_call", dependsOn: [], status, errorCode: "denied", output: { safe: true } } }
+    const result = await fixture(router)(input(output(proposal([use("read", { inputRefs: ["missing"] })])), "step-1", [existing], true))
+    expect(result).toEqual({ observations: [] })
+    expect(router.execute).not.toHaveBeenCalled()
+  })
+
+  it("reuses a persisted request input control and keeps the wait barrier", async () => {
+    const router = { execute: vi.fn() }
+    const ask = { ...baseNode, localId: "ask", kind: "request_input" as const, objective: "Need location", question: "Where?" }
+    const existing = { id: "plan-control:proposal-1:ask", content: { kind: "plan_control", localId: "ask", status: "waiting_for_user", question: "Where?" } }
+    const result = await fixture(router)(input(output(proposal([ask])), "step-1", [existing], true))
+    expect(result).toMatchObject({ observations: [], wait: { status: "waiting_for_user", errorCode: "plan_request_input" } })
+    expect(router.execute).not.toHaveBeenCalled()
+  })
+
+  it("fails closed when a matching persisted command receipt is corrupt", async () => {
+    const router = { execute: vi.fn() }
+    const existing = { id: "plan-result:proposal-1:read", content: { kind: "plan_command", localId: "read", commandKind: "delegate", dependsOn: [], status: "completed", errorCode: null, output: { jobId: "job-1" } } }
+    const result = await fixture(router)(input(output(proposal([use("read")])), "step-1", [existing], true))
+    expect(observationCode(result)).toBe("invalid_plan_output")
+    expect(router.execute).not.toHaveBeenCalled()
   })
 
   it("rejects non-contiguous and over-bound replay recovery without advancing state", async () => {

@@ -269,6 +269,11 @@ async function executeTools(
         }
       }
       if (call.name === "agent.plan.propose") {
+        const persistedResults = snapshot.toolObservations.filter(observation => {
+          const content = observation.content
+          return content !== null && typeof content === "object" && !Array.isArray(content) && "toolCallId" in content && content.toolCallId === call.id && "toolName" in content && content.toolName === call.name
+        })
+        if (persistedResults.length > 1) throw new TurnEngineError("invalid_output", "Plan proposal replay has duplicate persisted results")
         const persisted = findToolResultObservation(snapshot, call.id)
         if (!persisted) throw new TurnEngineError("invalid_output", "Plan proposal replay is missing a persisted result")
         if (persisted.status === "failed" || persisted.status === "cancelled") continue
@@ -277,12 +282,33 @@ async function executeTools(
         if (!revision) throw new TurnEngineError("invalid_output", "Plan proposal returned an invalid persisted receipt")
         const currentGoal = options.goalRef?.get()
         if (currentGoal && revision.goalRevision !== currentGoal.revision) throw new TurnEngineError("invalid_output", "Plan proposal replay does not match the current goal revision")
-        options.recoveryDispatcher?.recover({ goalRevision: revision.goalRevision, planRevision: revision.planRevision, basedOnPlanRevision: revision.basedOnPlanRevision, ...(revision.proposalHash === undefined ? {} : { proposalHash: revision.proposalHash }) })
+        try {
+          options.recoveryDispatcher?.recover({ goalRevision: revision.goalRevision, planRevision: revision.planRevision, basedOnPlanRevision: revision.basedOnPlanRevision, ...(revision.proposalHash === undefined ? {} : { proposalHash: revision.proposalHash }) })
+        } catch {
+          throw new TurnEngineError("invalid_output", "Plan proposal replay recovery failed closed")
+        }
         const projection = planRevisionObservation(revision)
-        const hasProjection = snapshot.toolObservations.some(observation => observation.id === projection.id)
+        const existingProjection = snapshot.toolObservations.find(observation => observation.id === projection.id)
+        if (existingProjection && stableJson(existingProjection.content) !== stableJson(projection.content)) throw new TurnEngineError("invalid_output", "Plan proposal replay has a conflicting revision projection")
+        const hasProjection = existingProjection !== undefined
         if (!hasProjection) {
           await writer.append("plan.revision", call.id, null, revision, `plan-revision:${call.id}`)
           snapshot = { ...snapshot, toolObservations: [...snapshot.toolObservations, projection] }
+        }
+        if (options.executePlan) {
+          const replayedResult: TurnEngineToolResult = { id: call.id, toolName: call.name, toolVersion: "1", status: "completed", output: persisted.output, errorCode: null }
+          const plan = await executePlanHook(options, step, call, replayedResult, [replayedResult], snapshot, signal, true)
+          if (plan.observations.some(observation => {
+            const content = observation.content
+            return content !== null && typeof content === "object" && !Array.isArray(content) && "kind" in content && content.kind === "plan_error"
+          })) throw new TurnEngineError("invalid_output", "Replayed plan execution failed validation")
+          await writer.appendBatch(plan.observations.map(observation => ({
+            type: "plan.observation", correlationId: call.id, itemId: null,
+            payload: { planCallId: call.id, observationId: observation.id, content: observation.content },
+            key: `plan-observation:${call.id}:${observation.id}`,
+          })))
+          if (plan.observations.length > 0) snapshot = { ...snapshot, toolObservations: [...snapshot.toolObservations, ...plan.observations] }
+          if (plan.wait) return { wait: plan.wait, snapshot }
         }
       }
       continue
@@ -313,7 +339,7 @@ async function executeTools(
         }
       }
       if (call.name === "agent.plan.propose" && options.executePlan) {
-        const plan = await executePlanHook(options, step, call, result, completedToolResults, snapshot, signal)
+        const plan = await executePlanHook(options, step, call, result, completedToolResults, snapshot, signal, false)
         await writer.appendBatch(plan.observations.map(observation => ({
           type: "plan.observation", correlationId: call.id, itemId: null,
           payload: { planCallId: call.id, observationId: observation.id, content: observation.content },
@@ -356,12 +382,13 @@ async function executePlanHook(
   completedToolResults: readonly TurnEngineToolResult[],
   snapshot: typeof options.snapshot,
   signal: AbortSignal,
+  replayed: boolean,
 ): Promise<PlanHookResult> {
   let value: Awaited<ReturnType<NonNullable<TurnExecutionOptions["executePlan"]>>>
   try {
     value = await options.executePlan!({
       identity: options.identity, scope: options.scope, sessionId: options.identity.sessionId, turnId: options.identity.turnId,
-      stepId: step.id, signal, call, result, completedToolResults: [...completedToolResults], snapshot,
+      stepId: step.id, signal, call, result, completedToolResults: [...completedToolResults], replayed, snapshot,
     })
   } catch {
     throw new TurnEngineError("invalid_output", "Plan execution hook failed")

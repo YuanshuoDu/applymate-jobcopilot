@@ -38,6 +38,26 @@ export class PlanRevisionRecoveryError extends Error {
 }
 
 /**
+ * Applies one server-owned replay receipt to a local revision cursor.
+ * A receipt already represented by the cursor is idempotent only when its
+ * predecessor metadata and known hash agree; every other non-next revision is
+ * rejected so a replay gap cannot silently advance local state.
+ */
+export function recoverPlanRevision(current: number | null, receipt: PlanRevisionRecovery, maxPlanRevisions = PLAN_MAX_REVISIONS): number {
+  const basedOn = receipt.basedOnPlanRevision
+  if (!validRevision(maxPlanRevisions, 1) || maxPlanRevisions > PLAN_MAX_REVISIONS || (current !== null && (!validRevision(current, 1) || current > maxPlanRevisions)) ||
+    !validRevision(receipt.goalRevision, 1) || !validRevision(receipt.planRevision, 1) || receipt.planRevision > maxPlanRevisions ||
+    (basedOn !== null && (!validRevision(basedOn, 0) || basedOn >= maxPlanRevisions))) throw new PlanRevisionRecoveryError()
+  if (current !== null && receipt.planRevision === current) {
+    if (basedOn !== (current === 1 ? null : current - 1)) throw new PlanRevisionRecoveryError()
+    return current
+  }
+  const expected = current === null ? 1 : current + 1
+  if (basedOn !== current || receipt.planRevision !== expected) throw new PlanRevisionRecoveryError()
+  return receipt.planRevision
+}
+
+/**
  * Dispatches replay repairs to the planning state holders created for one runtime.
  * It deliberately carries no model identity, lease, or budget authority.
  */
@@ -49,7 +69,12 @@ export function createPlanRevisionRecoveryDispatcher(): PlanRevisionRecoveryDisp
       handlers.add(handler)
     },
     recover(receipt) {
-      for (const handler of handlers) handler(receipt)
+      try {
+        for (const handler of handlers) handler(receipt)
+      } catch (error: unknown) {
+        if (error instanceof PlanRevisionRecoveryError) throw error
+        throw new PlanRevisionRecoveryError()
+      }
     },
   }
 }
@@ -77,8 +102,9 @@ function metadata(value: Record<string, unknown>, planCallId: string | undefined
   if (Object.keys(value).some(key => !(RECEIPT_KEYS as readonly string[]).includes(key))) return null
   const id = planCallId ?? value.planCallId
   const basedOn = value.basedOnPlanRevision
-  if (!validId(id) || !validRevision(value.goalRevision, 1) || !validRevision(value.planRevision, 1) ||
+  if (!validId(id) || !validRevision(value.goalRevision, 1) || !validRevision(value.planRevision, 1) || value.planRevision > PLAN_MAX_REVISIONS ||
     (basedOn !== null && !validRevision(basedOn, 0)) || value.planRevision !== (basedOn === null ? 1 : basedOn + 1)) return null
+  if (basedOn !== null && basedOn >= PLAN_MAX_REVISIONS) return null
   const proposalHash = value.proposalHash
   if (proposalHash !== undefined && !isPlanFingerprint(proposalHash)) return null
   return { planCallId: id, goalRevision: value.goalRevision, planRevision: value.planRevision, basedOnPlanRevision: basedOn as number | null, ...(proposalHash === undefined ? {} : { proposalHash }) }
@@ -93,7 +119,8 @@ export function parsePlanRevisionReceipt(value: unknown, planCallId: string, opt
   if (encoded === undefined || Buffer.byteLength(encoded, "utf8") > MAX_RECEIPT_BYTES) return null
   if (value.proposalHash !== undefined) {
     try {
-      if (fingerprintPlanProposal(normalizePlanProposal(value.proposal)) !== value.proposalHash) return null
+      const normalized = normalizePlanProposal(value.proposal)
+      if (normalized.basedOnGoalRevision !== value.goalRevision || normalized.basedOnPlanRevision !== value.basedOnPlanRevision || fingerprintPlanProposal(normalized) !== value.proposalHash) return null
     } catch { return null }
   }
   return metadata({ goalRevision: value.goalRevision, planRevision: value.planRevision, basedOnPlanRevision: value.basedOnPlanRevision, ...(value.proposalHash === undefined ? {} : { proposalHash: value.proposalHash }) }, planCallId)
