@@ -35,6 +35,7 @@ describe("validateBoundStructuredEvidence", () => {
     ["duplicate canonical evidence", { ...validScout(), evidence: [validScout().evidence[0], { ...validScout().evidence[0] }] }],
     ["empty evidence ref", { ...validScout(), candidates: [{ ...validScout().candidates[0], evidenceIds: ["read:job:"] }], evidence: [{ ...validScout().evidence[0], id: "read:job:", ref: "" }] }],
     ["empty evidence source", { ...validScout(), evidence: [{ ...validScout().evidence[0], id: "read:job:job-1", source: " " }] }],
+    ["oversized evidence source", { ...validScout(), evidence: [{ ...validScout().evidence[0], source: "x".repeat(257) }] }],
   ] as const)("rejects %s", (_name, value) => {
     expect(validateBoundStructuredEvidence(value)).toBe(false)
   })
