@@ -3,6 +3,7 @@ import { describe, expect, it } from "vitest"
 import { createPlanProposalTool } from "./plan-proposal-tool.js"
 import { PLAN_MAX_NODES, PLAN_MAX_REVISIONS, PLAN_PROPOSAL_SCHEMA_VERSION, type GoalContract, type PlanActionKind, type PlanProposal } from "./goal-plan-contract.js"
 import { fingerprintPlanProposal } from "./plan-fingerprint.js"
+import { createPlanRevisionRecoveryDispatcher } from "./plan-revision-receipt.js"
 
 const goal: GoalContract = { revision: 1, objective: "Find jobs", constraints: [], successCriteria: ["review results"], knownFacts: [], unresolvedQuestions: [], approvalBoundaries: [], budgetRef: "runtime:turn" }
 const baseNode = { localId: "read", kind: "use_tool" as const, objective: "Read jobs", inputRefs: [], dependsOn: [], successCriteria: ["results"], outputSchemaRef: null, toolName: "jobs.search" }
@@ -101,6 +102,18 @@ describe("plan proposal tool", () => {
     const accepted = await definition.execute(context(), { proposal: plan({ basedOnPlanRevision: 2 }) })
     expect(accepted).toMatchObject({ planRevision: 3, basedOnPlanRevision: 2 })
     await expect(definition.execute(context(), { proposal: plan({ basedOnPlanRevision: 2 }) })).rejects.toMatchObject({ code: "plan_invalid" })
+  })
+
+  it("repairs the local revision and fills a missing hash without allowing revision rollback", async () => {
+    const dispatcher = createPlanRevisionRecoveryDispatcher()
+    const recovered = plan()
+    const recoveredHash = fingerprintPlanProposal(recovered)
+    const definition = createPlanProposalTool(toolOptions({ initialPlanRevision: 1, recoveryDispatcher: dispatcher }))
+    dispatcher.recover({ goalRevision: 1, planRevision: 2, basedOnPlanRevision: 1, proposalHash: recoveredHash })
+    dispatcher.recover({ goalRevision: 1, planRevision: 1, basedOnPlanRevision: null, proposalHash: fingerprintPlanProposal(plan({ nodes: [{ ...baseNode, localId: "older" }] })) })
+    await expect(definition.execute(context(), { proposal: { ...recovered, basedOnPlanRevision: 2 } })).rejects.toMatchObject({ code: "plan_no_progress", safeOutput: { proposalHash: recoveredHash } })
+    const next = await definition.execute(context(), { proposal: plan({ basedOnPlanRevision: 2, nodes: [{ ...baseNode, localId: "next" }] }) })
+    expect(next).toMatchObject({ planRevision: 3, basedOnPlanRevision: 2 })
   })
 
   it("rejects forged identity, external tools, and unknown delegate roles without dispatching", async () => {

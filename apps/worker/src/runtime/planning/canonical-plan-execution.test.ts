@@ -7,6 +7,7 @@ import { PLAN_PROPOSAL_SCHEMA_VERSION, type GoalContract, type GoalContractRef, 
 import { fingerprintPlanProposal } from "./plan-fingerprint.js"
 import { createCanonicalPlanExecutionFactory, type CanonicalPlanExecutionOptions } from "./canonical-plan-execution.js"
 import type { PlanCommandReceipt } from "./plan-command-receipt.js"
+import { createPlanRevisionRecoveryDispatcher, type PlanRevisionRecoveryDispatcher } from "./plan-revision-receipt.js"
 
 const lease = {
   turnId: "turn-1", sessionId: "session-1", ownerId: "worker-1", userId: "user-1", leaseVersion: 2,
@@ -31,13 +32,13 @@ function output(value: PlanProposal, overrides: Record<string, unknown> = {}): R
   return { status: "accepted", goalRevision: 1, planRevision: 1, basedOnPlanRevision: null, proposal: value, intents: [], proposalHash: fingerprintPlanProposal(value), ...overrides }
 }
 
-function fixture(router: { execute(context: ToolRouterContext, request: ToolCallRequest): Promise<ToolExecutionResult> } = { execute: async (_context, request) => ({ ...request, status: "completed", output: { ok: true }, errorCode: null }) }, initialPlanRevision?: number, persistOutcome?: (receipt: PlanCommandReceipt) => Promise<void> | void, maxPlanRevisions?: number, initialPlanHashes?: readonly string[], goalRef?: GoalContractRef, allowedPlanActions?: readonly PlanActionKind[]) {
+function fixture(router: { execute(context: ToolRouterContext, request: ToolCallRequest): Promise<ToolExecutionResult> } = { execute: async (_context, request) => ({ ...request, status: "completed", output: { ok: true }, errorCode: null }) }, initialPlanRevision?: number, persistOutcome?: (receipt: PlanCommandReceipt) => Promise<void> | void, maxPlanRevisions?: number, initialPlanHashes?: readonly string[], goalRef?: GoalContractRef, allowedPlanActions?: readonly PlanActionKind[], recoveryDispatcher?: PlanRevisionRecoveryDispatcher) {
   const options: CanonicalPlanExecutionOptions = {
     goal, allowedTools: ["jobs.search"], allowedTemplates: [], allowedRoles: ["scout"], maxNodes: 8,
     capabilities: ["read", "canPlan"], actorRole: "orchestrator", scope: { userId: "user-1" }, lease,
     rootTaskId: "root-1", taskId: "root-1", initialPlanRevision, router,
     registry: { list: () => [{ name: "jobs.search", version: "1", risk: "read", capabilities: ["read"] }] },
-    policy: {} as PolicyEngine, ...(persistOutcome ? { persistOutcome } : {}), ...(maxPlanRevisions === undefined ? {} : { maxPlanRevisions }), ...(initialPlanHashes ? { initialPlanHashes } : {}), ...(goalRef ? { goalRef } : {}), ...(allowedPlanActions === undefined ? {} : { allowedPlanActions }),
+    policy: {} as PolicyEngine, ...(persistOutcome ? { persistOutcome } : {}), ...(maxPlanRevisions === undefined ? {} : { maxPlanRevisions }), ...(initialPlanHashes ? { initialPlanHashes } : {}), ...(goalRef ? { goalRef } : {}), ...(allowedPlanActions === undefined ? {} : { allowedPlanActions }), ...(recoveryDispatcher ? { recoveryDispatcher } : {}),
   }
   return createCanonicalPlanExecutionFactory(options)
 }
@@ -117,6 +118,17 @@ describe("createCanonicalPlanExecutionFactory", () => {
     expect(accepted.observations).toEqual([])
     const stale = await hook(input(output(recoveredProposal, { planRevision: 3, basedOnPlanRevision: 2 })))
     expect(observationCode(stale)).toBe("revision_conflict")
+  })
+
+  it("repairs bridge revision and hash state through the replay dispatcher without rollback", async () => {
+    const dispatcher = createPlanRevisionRecoveryDispatcher()
+    const hook = fixture(undefined, 1, undefined, undefined, undefined, undefined, undefined, dispatcher)
+    const recovered = proposal([])
+    dispatcher.recover({ goalRevision: 1, planRevision: 2, basedOnPlanRevision: 1, proposalHash: fingerprintPlanProposal(recovered) })
+    dispatcher.recover({ goalRevision: 1, planRevision: 1, basedOnPlanRevision: null, proposalHash: fingerprintPlanProposal(proposal([use("older")])) })
+    const nextProposal = { ...proposal([use("next")]), basedOnPlanRevision: 2 }
+    const next = await hook(input(output(nextProposal, { planRevision: 3, basedOnPlanRevision: 2 })))
+    expect(next.observations).toHaveLength(1)
   })
 
   it("reads a revised goal and resets old plan state through the bridge", async () => {

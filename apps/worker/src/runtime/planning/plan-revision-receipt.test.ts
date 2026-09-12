@@ -1,6 +1,6 @@
-import { describe, expect, it } from "vitest"
+import { describe, expect, it, vi } from "vitest"
 
-import { parsePlanRevisionEvent, parsePlanRevisionReceipt, planRevisionObservation } from "./plan-revision-receipt.js"
+import { createPlanRevisionRecoveryDispatcher, parsePlanRevisionEvent, parsePlanRevisionReceipt, planRevisionObservation } from "./plan-revision-receipt.js"
 import { fingerprintPlanProposal } from "./plan-fingerprint.js"
 
 const proposal = { schemaVersion: "agent-harness.plan.v1" as const, basedOnGoalRevision: 1, basedOnPlanRevision: null, nodes: [], completionCriteria: [], briefRationale: "bounded" }
@@ -29,5 +29,14 @@ describe("plan revision receipt", () => {
   it("parses event metadata and emits a compact observation", () => {
     const receipt = parsePlanRevisionEvent({ planCallId: "call-2", goalRevision: 1, planRevision: 2, basedOnPlanRevision: 1, proposalHash: acceptedWithHash.proposalHash })!
     expect(planRevisionObservation(receipt)).toEqual({ id: "plan-revision:call-2", content: { kind: "plan_revision", ...receipt } })
+  })
+
+  it("dispatches only server-owned recovery metadata to registered handlers", () => {
+    const handler = vi.fn()
+    const dispatcher = createPlanRevisionRecoveryDispatcher()
+    dispatcher.register(handler)
+    dispatcher.recover({ goalRevision: 1, planRevision: 2, basedOnPlanRevision: 1, proposalHash: acceptedWithHash.proposalHash })
+    expect(handler).toHaveBeenCalledWith({ goalRevision: 1, planRevision: 2, basedOnPlanRevision: 1, proposalHash: acceptedWithHash.proposalHash })
+    expect(handler.mock.calls[0]?.[0]).not.toHaveProperty("planCallId")
   })
 })

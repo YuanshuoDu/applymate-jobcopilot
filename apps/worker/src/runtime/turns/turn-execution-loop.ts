@@ -268,6 +268,23 @@ async function executeTools(
           }
         }
       }
+      if (call.name === "agent.plan.propose") {
+        const persisted = findToolResultObservation(snapshot, call.id)
+        if (!persisted) throw new TurnEngineError("invalid_output", "Plan proposal replay is missing a persisted result")
+        if (persisted.status === "failed" || persisted.status === "cancelled") continue
+        if (persisted.status !== "completed") throw new TurnEngineError("invalid_output", "Plan proposal replay has an unknown persisted result status")
+        const revision = parsePlanRevisionReceipt(persisted.output, call.id, { requireProposalHash: true })
+        if (!revision) throw new TurnEngineError("invalid_output", "Plan proposal returned an invalid persisted receipt")
+        const currentGoal = options.goalRef?.get()
+        if (currentGoal && revision.goalRevision !== currentGoal.revision) throw new TurnEngineError("invalid_output", "Plan proposal replay does not match the current goal revision")
+        const projection = planRevisionObservation(revision)
+        const hasProjection = snapshot.toolObservations.some(observation => observation.id === projection.id)
+        if (!hasProjection) {
+          await writer.append("plan.revision", call.id, null, revision, `plan-revision:${call.id}`)
+          snapshot = { ...snapshot, toolObservations: [...snapshot.toolObservations, projection] }
+        }
+        options.recoveryDispatcher?.recover({ goalRevision: revision.goalRevision, planRevision: revision.planRevision, basedOnPlanRevision: revision.basedOnPlanRevision, ...(revision.proposalHash === undefined ? {} : { proposalHash: revision.proposalHash }) })
+      }
       continue
     }
     const result = await executeToolWithItems(options, writer, step, call, now)

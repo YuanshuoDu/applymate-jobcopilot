@@ -28,6 +28,7 @@ import { PLAN_ACTION_KINDS, PLAN_MAX_NODES, PLAN_MAX_REVISIONS, type GoalContrac
 import { createCanonicalPlanExecutionFactory, type CanonicalPlanExecutionOptions } from "./planning/canonical-plan-execution.js"
 import { hydrateGoalContract } from "./planning/goal-contract-hydration.js"
 import type { PlanCommandReceipt } from "./planning/plan-command-receipt.js"
+import { createPlanRevisionRecoveryDispatcher } from "./planning/plan-revision-receipt.js"
 
 export type UsageAuthorization = {
   settle(input: { status: "success" | "error"; inputTokens: number; outputTokens: number; estimatedCostUsd: number; errorCode?: string }): Promise<void> | void
@@ -206,9 +207,10 @@ export async function createCanonicalTurnRuntime(pool: pg.Pool, options: Canonic
     const planningGoal = state.goalContract ?? hydrateGoalContract({ goal: state.goal }).goalContract
     const currentGoal = { value: planningGoal }; const goalRef: GoalContractRef = { get: () => currentGoal.value, update: next => { currentGoal.value = next } }
     const allowedPlanActions = options.coordinationEnabled === true ? PLAN_ACTION_KINDS : PLAN_ACTION_KINDS.filter(action => action !== "delegate")
+    const recoveryDispatcher = options.planningEnabled ? createPlanRevisionRecoveryDispatcher() : undefined
     const planning = options.planningEnabled ? {
       goal: planningGoal, goalRef, allowedTools: ["jobs.search", "jobs.get", "persona.retrieve", "resume.get_base", "application.get_state", "tool_results.read"],
-      allowedTemplates: [], allowedRoles: ["scout", "analyst"], allowedPlanActions, maxNodes: PLAN_MAX_NODES, maxPlanRevisions: PLAN_MAX_REVISIONS, initialPlanRevision: state.planRevision ?? null, initialPlanHashes: state.planProposalHashes ?? [],
+      allowedTemplates: [], allowedRoles: ["scout", "analyst"], allowedPlanActions, maxNodes: PLAN_MAX_NODES, maxPlanRevisions: PLAN_MAX_REVISIONS, initialPlanRevision: state.planRevision ?? null, initialPlanHashes: state.planProposalHashes ?? [], ...(recoveryDispatcher ? { recoveryDispatcher } : {}),
     } : undefined
     const toolRuntime = options.toolRuntimeFactory?.({ pool, policy: selectedPolicy, manager, state }) ?? createWorkerToolRuntime(pool, { sink: sinkProxy, resolveOwner }, selectedPolicy, coordination, undefined, undefined, undefined, planning, planning ? { goal: planning.goal, goalRef } : undefined)
     const allowedActions = toolRuntime.registry.list(toolCapabilities).flatMap((definition) => {
@@ -222,7 +224,7 @@ export async function createCanonicalTurnRuntime(pool: pg.Pool, options: Canonic
     const actorRole = (record(state.toolPolicySnapshot).role as PolicyRole | undefined) ?? "orchestrator"
     const planFactory = options.planExecutionFactory ?? createCanonicalPlanExecutionFactory
     const executePlan = options.planningEnabled === true && options.planningExecutionEnabled === true && planning
-      ? planFactory({ lease, rootTaskId: root.id, taskId: root.id, state, scope: state.scope, router: toolRuntime.router, registry: toolRuntime.registry, policy: selectedPolicy, goal: planning.goal, goalRef, allowedTools: planning.allowedTools, allowedTemplates: planning.allowedTemplates, allowedRoles: planning.allowedRoles, allowedPlanActions: planning.allowedPlanActions, maxNodes: planning.maxNodes, maxPlanRevisions: planning.maxPlanRevisions, initialPlanRevision: planning.initialPlanRevision, initialPlanHashes: planning.initialPlanHashes, capabilities: toolCapabilities, actorRole, persistOutcome: durablePlanCommandSink(turnStore, owner) })
+      ? planFactory({ lease, rootTaskId: root.id, taskId: root.id, state, scope: state.scope, router: toolRuntime.router, registry: toolRuntime.registry, policy: selectedPolicy, goal: planning.goal, goalRef, allowedTools: planning.allowedTools, allowedTemplates: planning.allowedTemplates, allowedRoles: planning.allowedRoles, allowedPlanActions: planning.allowedPlanActions, maxNodes: planning.maxNodes, maxPlanRevisions: planning.maxPlanRevisions, initialPlanRevision: planning.initialPlanRevision, initialPlanHashes: planning.initialPlanHashes, ...(recoveryDispatcher ? { recoveryDispatcher } : {}), capabilities: toolCapabilities, actorRole, persistOutcome: durablePlanCommandSink(turnStore, owner) })
       : undefined
     const config = options.modelRuntimeFactory ? undefined : await loadWorkerAiConfig(lease.userId)
     const modelRuntime = await (options.modelRuntimeFactory?.({ userId: lease.userId, config, state }) ?? createHarnessModelRuntime({ primary: config, fallbacks: [], allowEnvironmentFallbacks: false }))
@@ -237,7 +239,7 @@ export async function createCanonicalTurnRuntime(pool: pg.Pool, options: Canonic
       actorRole, capabilities: toolCapabilities,
       validateToolArguments: (name, input) => toolRuntime.registry.validateArguments(name, input, "1"), signal,
       budget: limits(state.budgetSnapshot), resume: state.resume, now, publishReasoningSummary: false,
-      ...(executePlan ? { executePlan } : {}), ...(rootTasks.checkCompletion ? { completionGate: async () => rootTasks.checkCompletion!({ lease, rootTaskId: root.id, now: now() }) } : {}),
+      ...(executePlan ? { executePlan } : {}), ...(recoveryDispatcher ? { recoveryDispatcher } : {}), ...(rootTasks.checkCompletion ? { completionGate: async () => rootTasks.checkCompletion!({ lease, rootTaskId: root.id, now: now() }) } : {}),
     })
     const result = await engine.run()
     await rootTasks.finish({ lease, rootTaskId: root.id, result, now: now() })

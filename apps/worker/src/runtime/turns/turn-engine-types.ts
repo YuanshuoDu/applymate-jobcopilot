@@ -7,6 +7,7 @@ import type { ExecutionOwnerFence, TurnExecutionOwnerFence } from "../execution-
 import type { TurnLease } from "./lease.js"
 import type { TurnEngineCompletionGate } from "./turn-execution-types.js"
 import type { GoalContractRef } from "../planning/goal-plan-contract.js"
+import type { PlanRevisionRecoveryDispatcher } from "../planning/plan-revision-receipt.js"
 
 export type TurnEngineItemType = "agent_message" | "reasoning_summary" | "tool_call" | "tool_result" | "error"
 export type TurnEngineItemPhase = "commentary" | "final_answer" | null
@@ -173,6 +174,8 @@ export type TurnEngineOptions = {
   readonly executeTool: TurnEngineToolExecutor
   /** Optional server-owned plan execution seam; omitted preserves the legacy loop. */
   readonly executePlan?: TurnEnginePlanExecutionHook
+  /** Runtime-owned replay repair seam; normal plan proposals never call it. */
+  readonly recoveryDispatcher?: PlanRevisionRecoveryDispatcher
   readonly completionGate?: TurnEngineCompletionGate
   readonly rootInputId?: string
   /** Runtime-owned current task identity. Root turns use rootTaskId. */

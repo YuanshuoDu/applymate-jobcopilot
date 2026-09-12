@@ -19,6 +19,7 @@ import type {
   TurnEnginePlanExecutionHookResult,
 } from "./turn-engine-types.js"
 import type { GoalContractRef } from "../planning/goal-plan-contract.js"
+import type { PlanRevisionRecoveryDispatcher } from "../planning/plan-revision-receipt.js"
 
 export type TurnEngineCompletionGateResult =
   | { readonly ok: true }
@@ -101,6 +102,8 @@ export type TurnExecutionOptions = {
   readonly isOwnershipLost?: (error: unknown, signal: AbortSignal) => boolean
   /** Executes accepted plan commands through a server-owned adapter; omitted keeps legacy behavior. */
   readonly executePlan?: TurnEnginePlanExecutionHook
+  /** Runtime-owned replay repair seam; normal plan proposals never call it. */
+  readonly recoveryDispatcher?: PlanRevisionRecoveryDispatcher
   readonly completionGate?: TurnEngineCompletionGate
 }
 

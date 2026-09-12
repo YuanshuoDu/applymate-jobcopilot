@@ -20,6 +20,40 @@ export type PlanRevisionReceipt = {
 }
 export type PlanRevisionReceiptParseOptions = { readonly requireProposalHash?: boolean }
 
+/** Server-owned state supplied only after a persisted receipt has been parsed. */
+export type PlanRevisionRecovery = Pick<PlanRevisionReceipt, "goalRevision" | "planRevision" | "basedOnPlanRevision" | "proposalHash">
+export type PlanRevisionRecoveryHandler = (receipt: PlanRevisionRecovery) => void
+export type PlanRevisionRecoveryDispatcher = {
+  register(handler: PlanRevisionRecoveryHandler): void
+  recover(receipt: PlanRevisionRecovery): void
+}
+
+export class PlanRevisionRecoveryError extends Error {
+  readonly code = "invalid_output" as const
+
+  constructor() {
+    super("Plan revision replay recovery is not a contiguous server revision")
+    this.name = "PlanRevisionRecoveryError"
+  }
+}
+
+/**
+ * Dispatches replay repairs to the planning state holders created for one runtime.
+ * It deliberately carries no model identity, lease, or budget authority.
+ */
+export function createPlanRevisionRecoveryDispatcher(): PlanRevisionRecoveryDispatcher {
+  const handlers = new Set<PlanRevisionRecoveryHandler>()
+  return {
+    register(handler) {
+      if (typeof handler !== "function") throw new TypeError("Plan revision recovery handler must be callable")
+      handlers.add(handler)
+    },
+    recover(receipt) {
+      for (const handler of handlers) handler(receipt)
+    },
+  }
+}
+
 export function isBoundedPlanJson(value: unknown, seen = new Set<object>()): boolean {
   if (value === null || typeof value === "string" || typeof value === "boolean") return true
   if (typeof value === "number") return Number.isFinite(value)
