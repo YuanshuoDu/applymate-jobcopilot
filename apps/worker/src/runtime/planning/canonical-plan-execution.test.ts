@@ -40,16 +40,16 @@ function output(value: PlanProposal, overrides: Record<string, unknown> = {}): R
 function validScoutStructuredResult() {
   return {
     schemaVersion: ROLE_RESULT_SCHEMA, role: "scout" as const, status: "completed" as const,
-    candidates: [{ jobId: "job-1", source: "greenhouse", url: "https://example.test/jobs/job-1", evidenceIds: ["evidence-job-1"] }],
-    evidence: [{ id: "evidence-job-1", kind: "job" as const, ref: "job-1", source: "greenhouse" }], summary: "One matching job",
+    candidates: [{ jobId: "job-1", source: "greenhouse", url: "https://example.test/jobs/job-1", evidenceIds: ["read:job:job-1"] }],
+    evidence: [{ id: "read:job:job-1", kind: "job" as const, ref: "job-1", source: "greenhouse" }], summary: "One matching job",
   }
 }
 
 function validAnalystStructuredResult() {
   return {
     schemaVersion: ROLE_RESULT_SCHEMA, role: "analyst" as const, status: "completed" as const,
-    findings: [{ jobId: "job-1", score: 8, evidenceIds: ["evidence-job-1"] }],
-    evidence: [{ id: "evidence-job-1", kind: "job" as const, ref: "job-1", source: "greenhouse" }], summary: "Strong match",
+    findings: [{ jobId: "job-1", score: 8, evidenceIds: ["read:job:job-1"] }],
+    evidence: [{ id: "read:job:job-1", kind: "job" as const, ref: "job-1", source: "greenhouse" }], summary: "Strong match",
   }
 }
 
@@ -249,6 +249,10 @@ describe("createCanonicalPlanExecutionFactory", () => {
       { ...waitOutcome, content: { ...waitOutcome.content, output: { ...waitOutcome.content.output, tasks: [{ ...waitOutcome.content.output.tasks[0], result: { structuredResult: { ...validAnalystStructuredResult(), findings: [{ ...validAnalystStructuredResult().findings[0], score: 11 }] } } }] } } },
       { ...waitOutcome, content: { ...waitOutcome.content, output: { ...waitOutcome.content.output, tasks: [{ ...waitOutcome.content.output.tasks[0], status: "waiting", result: { structuredResult: validScoutStructuredResult() } }] } } },
       { ...waitOutcome, content: { ...waitOutcome.content, output: { ...waitOutcome.content.output, tasks: [{ ...waitOutcome.content.output.tasks[0], result: { structuredResult: { ...validScoutStructuredResult(), summary: "x".repeat(9_000) } } }] } } },
+      { ...waitOutcome, content: { ...waitOutcome.content, output: { ...waitOutcome.content.output, tasks: [{ ...waitOutcome.content.output.tasks[0], result: { structuredResult: { ...validScoutStructuredResult(), candidates: [{ ...validScoutStructuredResult().candidates[0], evidenceIds: ["evidence-job-1"] }], evidence: [{ ...validScoutStructuredResult().evidence[0], id: "evidence-job-1" }] } } }] } } },
+      { ...waitOutcome, content: { ...waitOutcome.content, output: { ...waitOutcome.content.output, tasks: [{ ...waitOutcome.content.output.tasks[0], result: { structuredResult: { ...validScoutStructuredResult(), evidence: [...validScoutStructuredResult().evidence, { id: "read:source:source-1", kind: "source", ref: "source-1", source: "model" }] } } }] } } },
+      { ...waitOutcome, content: { ...waitOutcome.content, output: { ...waitOutcome.content.output, tasks: [{ ...waitOutcome.content.output.tasks[0], result: { structuredResult: { ...validScoutStructuredResult(), candidates: [{ ...validScoutStructuredResult().candidates[0], evidenceIds: ["read:job:other"] }], evidence: [{ ...validScoutStructuredResult().evidence[0], id: "read:job:other" }] } } }] } } },
+      { ...waitOutcome, content: { ...waitOutcome.content, output: { ...waitOutcome.content.output, tasks: [{ ...waitOutcome.content.output.tasks[0], result: { structuredResult: { ...validScoutStructuredResult(), evidence: [validScoutStructuredResult().evidence[0], { ...validScoutStructuredResult().evidence[0] }] } } }] } } },
     ]
     for (const invalid of invalidWaitOutcomes) {
       const rejected = await hook(input(output(proposalValue), "step-1", [delegateObservation, joinObservation, invalid], true))

@@ -16,6 +16,7 @@ import type { StepContextSnapshot } from "../context/step-context-builder.js"
 import { visibleToolPolicy } from "../subagents/role-policy.js"
 import { validateRoleResult } from "../subagents/role-results.js"
 import { assertMigratedRole, roleContract } from "../subagents/scout-analyst-contracts.js"
+import { validateBoundStructuredEvidence } from "./structured-replay-evidence.js"
 
 const MAX_OBSERVATIONS = 8
 const MAX_RESULT_BYTES = 8 * 1024
@@ -287,7 +288,7 @@ function validStructuredReplayResult(task: Record<string, unknown>): boolean {
   try {
     const structuredResult = validateRoleResult(result.structuredResult)
     const encoded = JSON.stringify(structuredResult)
-    return encoded !== undefined && Buffer.byteLength(encoded, "utf8") <= MAX_RESULT_BYTES
+    return validateBoundStructuredEvidence(structuredResult) && encoded !== undefined && Buffer.byteLength(encoded, "utf8") <= MAX_RESULT_BYTES
   } catch {
     return false
   }
