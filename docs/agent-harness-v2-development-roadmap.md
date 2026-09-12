@@ -1389,3 +1389,19 @@ git diff --check
 **独立验证：** canonical plan execution focused suite **34/34 passed**；workspace dependency build、Worker `tsc --noEmit --skipLibCheck` 和 `git diff --check` 均通过。未覆盖 live DB/RLS、Redis/queue、provider、真实进程重启、浏览器 E2E 或 child-parent E2E。
 
 **候选边界：** 本切片不能作为完整 Harness、P3/Phase 完成或生产安全证明；后续仍需验证实际 child dispatch、持久化恢复和生产组合行为。
+
+---
+
+## 26. P3-31 — Bounded canonical delegate fan-out
+
+**状态与进度口径（2026-09-12）：** P3-31 是 canonical delegate fan-out 的候选切片，不代表完整 Harness、P3/Phase 完成或生产并发证据。中文升级计划总进度仍按 **P0 已验收 1/8（12.5%）** 统计。
+
+**实现记录：** 集成提交为 `1ef54a3f`。canonical execution 使用服务端拥有的 delegate 并发上限 **4**；调用方未提供并发上限时保持默认串行。同一 ready layer 中没有 `inputRefs` 的独立 delegate 可并发运行，但调度器不会跨依赖层提前执行，依赖未完成或不可解析时保持原有阻断语义。
+
+- 并发结果统一按 plan 顺序 deterministic observe，因而 completion projection、output map 和后续依赖解析不受完成时序影响。
+- delegate 失败会 fail closed 并停止继续推进受影响计划；control command 仍是 barrier，按既有 blocked/waiting 语义返回；依赖 delegate 只在其依赖层成功并完成 observe 后解锁。
+- 服务端上限只允许有限值 `1..4`；canonical 路径固定使用 `4`，默认路径仍为串行。该切片没有扩大 tool/role、身份、预算或 external-write 权限边界。
+
+**独立验证：** 根侧对 canonical plan execution 的 focused 验证 **65/65 passed**；pretest shared build、Worker `tsc` 与 `git diff --check` 均通过。未覆盖 live DB/RLS、provider、Redis/queue、真实进程重启或浏览器/child-parent E2E。
+
+**候选边界：** P3-31 只证明受界限的 canonical scheduler 行为和回归测试，不代表动态 TaskGraph、真实队列/Worker 并发、live provider、生产部署或完整 Harness 已完成。
