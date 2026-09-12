@@ -183,7 +183,7 @@ describe("createCanonicalPlanExecutionFactory", () => {
     const proposalValue = proposal([delegate("child"), join(), use("after", { dependsOn: ["join"] })])
     const delegateObservation = { id: "plan-result:proposal-1:child", content: { kind: "plan_command", localId: "child", commandKind: "delegate", dependsOn: [], status: "completed", errorCode: null, output: { taskId: "child-1", rootTaskId: "root-1", parentTaskId: "root-1", status: "queued" } } }
     const joinObservation = { id: "plan-result:proposal-1:join", content: { kind: "plan_command", localId: "join", commandKind: "join", dependsOn: ["child"], status: "completed", errorCode: null, output: { waitId: "wait-1", status: "waiting", taskIds: ["child-1"], matchedTaskIds: [] } } }
-    const waitOutcome = { id: "wait-result:wait-1", content: { toolCallId: "wait:wait-1", toolName: "wait_subagents", input: { taskIds: ["child-1"], mode: "all" }, status: "completed", output: { waitId: "wait-1", status: "ready", targetTaskIds: ["child-1"], matchedTaskIds: ["child-1"], tasks: [] }, errorCode: null } }
+    const waitOutcome = { id: "wait-result:wait-1", content: { toolCallId: "wait:wait-1", toolName: "wait_subagents", input: { taskIds: ["child-1"], mode: "all" }, status: "completed", output: { waitId: "wait-1", status: "ready", targetTaskIds: ["child-1"], matchedTaskIds: ["child-1"], tasks: [{ taskId: "child-1", status: "completed", result: null, failureReason: null }] }, errorCode: null } }
     const router = { execute: vi.fn(async (_context: ToolRouterContext, request: ToolCallRequest) => ({ ...request, status: "completed" as const, output: { ok: true }, errorCode: null })) }
     const hook = fixture(router, undefined, undefined, undefined, undefined, undefined, ["use_tool", "delegate", "join"])
     const waiting = await hook(input(output(proposalValue), "step-1", [delegateObservation, joinObservation], true))
@@ -201,6 +201,11 @@ describe("createCanonicalPlanExecutionFactory", () => {
     expect(router.execute).toHaveBeenCalledTimes(2)
 
     const invalidWaitOutcomes = [
+      { ...waitOutcome, content: { ...waitOutcome.content, output: { ...waitOutcome.content.output, tasks: undefined } } },
+      { ...waitOutcome, content: { ...waitOutcome.content, output: { ...waitOutcome.content.output, tasks: [{ ...waitOutcome.content.output.tasks[0] }, { ...waitOutcome.content.output.tasks[0] }] } } },
+      { ...waitOutcome, content: { ...waitOutcome.content, output: { ...waitOutcome.content.output, tasks: [{ ...waitOutcome.content.output.tasks[0], taskId: "foreign-task" }] } } },
+      { ...waitOutcome, content: { ...waitOutcome.content, output: { ...waitOutcome.content.output, tasks: [{ taskId: "child-1", status: "", result: null, failureReason: null }] } } },
+      { ...waitOutcome, content: { ...waitOutcome.content, output: { ...waitOutcome.content.output, tasks: [{ ...waitOutcome.content.output.tasks[0], result: { taskId: "forged" } }] } } },
       { ...waitOutcome, content: { ...waitOutcome.content, input: { taskIds: ["child-1", "child-1"], mode: "all" } } },
       { ...waitOutcome, content: { ...waitOutcome.content, output: { ...waitOutcome.content.output, targetTaskIds: ["child-1", "child-1"] } } },
       { ...waitOutcome, content: { ...waitOutcome.content, output: { ...waitOutcome.content.output, matchedTaskIds: ["foreign-task"] } } },

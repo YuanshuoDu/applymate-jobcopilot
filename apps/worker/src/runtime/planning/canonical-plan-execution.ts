@@ -271,6 +271,20 @@ function sameIds(left: readonly string[], right: readonly string[]): boolean {
   return left.length === right.length && [...left].sort().every((id, index) => id === [...right].sort()[index])
 }
 
+function validReplayWaitTasks(value: unknown, taskIds: readonly string[]): boolean {
+  if (!Array.isArray(value) || value.length !== taskIds.length) return false
+  const seen = new Set<string>()
+  for (const candidate of value) {
+    const task = row(candidate)
+    if (!task || Object.keys(task).length !== 4 || !keysOnly(task, ["taskId", "status", "result", "failureReason"]) || hasForeignIdentity(task, WAIT_ALLOWED_IDENTITY_KEYS)) return false
+    if (typeof task.taskId !== "string" || !task.taskId.trim() || task.taskId.length > 256 || !taskIds.includes(task.taskId) || seen.has(task.taskId)) return false
+    if (typeof task.status !== "string" || !task.status.trim() || task.status.length > 256 || !Object.prototype.hasOwnProperty.call(task, "result") || !plainJson(task.result) || !boundedJson(task.result) || hasForeignIdentity(task.result)) return false
+    if (task.failureReason !== null && (typeof task.failureReason !== "string" || Buffer.byteLength(task.failureReason, "utf8") > MAX_RESULT_BYTES)) return false
+    seen.add(task.taskId)
+  }
+  return seen.size === taskIds.length
+}
+
 function replayJoinTaskIds(options: CanonicalPlanExecutionOptions, command: PlanJoinCommand, receipts: ReadonlyMap<string, ReplayCommandReceipt>): readonly string[] {
   const taskIds: string[] = []
   for (const ref of command.inputRefs) {
@@ -296,7 +310,7 @@ function replayWaitOutcome(input: Parameters<TurnEnginePlanExecutionHook>[0], op
   const output = row(content.output)
   if (!waitInput || !keysOnly(waitInput, ["taskIds", "mode"]) || hasForeignIdentity(waitInput) || !output || !plainJson(output) || !boundedJson(output) || hasForeignIdentity(output, WAIT_ALLOWED_IDENTITY_KEYS)) throw new CanonicalPlanError("invalid_plan_output")
   const taskIds = replayJoinTaskIds(options, command, receipts)
-  if (!uniqueIds(waitInput.taskIds) || !sameIds(waitInput.taskIds, taskIds) || waitInput.mode !== command.call.input.mode || !uniqueIds(output.targetTaskIds) || !sameIds(output.targetTaskIds, taskIds) || !uniqueIds(output.matchedTaskIds, output.status === "timed_out") || output.matchedTaskIds.some(id => !taskIds.includes(id))) throw new CanonicalPlanError("invalid_plan_output")
+  if (!uniqueIds(waitInput.taskIds) || !sameIds(waitInput.taskIds, taskIds) || waitInput.mode !== command.call.input.mode || !uniqueIds(output.targetTaskIds) || !sameIds(output.targetTaskIds, taskIds) || !uniqueIds(output.matchedTaskIds, output.status === "timed_out") || output.matchedTaskIds.some(id => !taskIds.includes(id)) || !validReplayWaitTasks(output.tasks, taskIds)) throw new CanonicalPlanError("invalid_plan_output")
   if (output.waitId !== waitId || (output.status !== "ready" && output.status !== "timed_out")) throw new CanonicalPlanError("invalid_plan_output")
   return output
 }
