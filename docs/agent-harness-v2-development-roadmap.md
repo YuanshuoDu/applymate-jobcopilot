@@ -1528,24 +1528,6 @@ Server-owned canonical IDs use `read:<kind>:<ref>`; model evidence IDs and sourc
 
 **Candidate boundary:** Live DB/RLS, Redis/queue, provider, restart, browser, and child-parent E2E behavior remain unverified.
 
----
-
-## 37. P4-07 — Server-bound role provenance for structured wait replay
-
-**Candidate status/date (2026-09-12):** P4-07 is recorded as a candidate server-bound role provenance slice; overall progress remains **P0 accepted 1/8 (12.5%)**, unchanged by this slice.
-
-**Implementation:** Commit `63da3b45` makes the durable wait consumer project the sanitized target `role` from the server-owned database task into newly generated outcomes. Canonical replay derives the expected role from the server-owned delegate command and pairs it with the `taskId` returned by that delegate receipt.
-
-Structured replay requires both the task role and `structuredResult.role` to match the canonical delegate role. Missing, malformed, oversized, cross-role, duplicate, or ambiguous role mappings fail closed as `invalid_plan_output`; generic legacy results without `structuredResult` remain compatible without a role.
-
-This slice adds no migration, provider, model, queue, or external-write changes.
-
-**Independent verification:** Canonical replay, durable wait consumer, and structured replay evidence focused tests passed **62/62** (**42 + 9 + 11**); shared build, Worker `tsc --noEmit --skipLibCheck`, and `git diff --check` passed.
-
-**Candidate boundary:** Live DB/RLS, Redis/queue, provider, restart, browser, and child-parent E2E behavior remain unverified.
-
----
-
 ## 35. P4-05 — Server-owned structured contract provenance
 
 **Candidate status/date (2026-09-12):** P4-05 is recorded as a candidate server-owned structured contract slice; overall status remains **P0 accepted 1/8 (12.5%)**, unchanged by this slice.
@@ -1576,5 +1558,21 @@ Each evidence `id`, `ref`, and `source` must be non-empty and no longer than **2
 - This slice adds no DB, provider, queue, or external-write changes.
 
 **Independent verification:** Focused helper and canonical tests passed **51/51** (**11 + 40**); shared build, Worker `tsc --noEmit --skipLibCheck`, and `git diff --check` passed.
+
+**Candidate boundary:** Live DB/RLS, Redis/queue, provider, restart, browser, and child-parent E2E behavior remain unverified.
+
+---
+
+## 37. P4-07 — Server-bound role provenance for structured wait replay
+
+**Candidate status/date (2026-09-12):** P4-07 is recorded as a candidate server-bound role provenance slice; overall progress remains **P0 accepted 1/8 (12.5%)**, unchanged by this slice.
+
+**Implementation:** Commit `63da3b45` makes the durable wait consumer project the sanitized target `role` from the server-owned database task into newly generated outcomes. Canonical replay derives the expected role from the server-owned delegate command and pairs it with the `taskId` returned by that delegate receipt.
+
+Structured replay requires both the task role and `structuredResult.role` to match the canonical delegate role. Missing, malformed, oversized, cross-role, duplicate, or ambiguous role mappings fail closed as `invalid_plan_output`; generic legacy results without `structuredResult` remain compatible without a role.
+
+This slice adds no migration, provider, model, queue, or external-write changes.
+
+**Independent verification:** Canonical replay, durable wait consumer, and structured replay evidence focused tests passed **62/62** (**42 + 9 + 11**); shared build, Worker `tsc --noEmit --skipLibCheck`, and `git diff --check` passed.
 
 **Candidate boundary:** Live DB/RLS, Redis/queue, provider, restart, browser, and child-parent E2E behavior remain unverified.
