@@ -1334,3 +1334,17 @@ git diff --check
 - 这是内存恢复候选：反馈没有写入持久化事件或数据库，进程重启、跨进程 replay 和持久化反馈恢复仍属于 **P3-27B**。因此本节不能用于宣称完整 Harness、重启恢复或生产级完成。
 
 **独立验证：** 根侧对 5 个 P3-27 相关文件验证 **105/105**；Worker TypeScript 检查、`@jobcopilot/shared` build 和 `git diff --check` 均通过。未覆盖 live DB/RLS、queue delivery、provider、process restart 或端到端（E2E）验证；这些边界仍需后续集成证据。
+
+---
+
+## 22. P3-27B — 计划完成反馈持久化候选切片
+
+**状态与进度口径（2026-09-12）：** P3-27A 与 P3-27B 均为候选切片，不代表 P3 完成、完整 Harness 或 Phase 完成。中文升级计划总进度仍按 **P0 已验收 1/8（12.5%）** 统计；本切片不改变该口径。
+
+**实现记录：** P3-27B 代码提交为 `3434006d`，scope 修复为 `7c7a1b2a`。计划完成 barrier recovery 在进入下一模型步前，先追加服务端拥有的 canonical `plan.completion_feedback` event；event 使用稳定的 step idempotency，append 失败则 fail closed，不继续执行恢复。成功追加后才把反馈投影到当前执行快照，并清除 provider continuation；planning gate 与 child gate 语义保持不变。
+
+- canonical state 会查询并恢复 `plan.completion_feedback`，只接受严格匹配当前 `turnId` 与当前 server-owned `planId` 的事件。重复事件保持幂等；相同 observation identity 的冲突 payload、malformed、恶意字段和超出 `0..2` 恢复上限的事件均被过滤或拒绝。
+- 旧的无 `planId` feedback 在新 plan generation 已建立后不计入恢复次数，避免旧计划消耗新计划的恢复预算；当前 plan 切换和 goal revision 会重新计算 scope。
+- P3-27A 的内存恢复与 P3-27B 的 canonical event 恢复都仍是候选切片，不能用于宣称完整 Harness、P3/Phase 完成或真实进程重启恢复。live DB/RLS、Redis/queue、provider、真实进程重启和浏览器/child-parent E2E 仍需独立证据。
+
+**独立验证：** 根侧对 3 个直接文件验证 **70/70 passed**，pretest shared build 通过；Worker TypeScript 与 `git diff --check` 均通过。未覆盖 live DB/RLS、Redis/queue、provider、真实进程重启过程或浏览器/child-parent E2E；总体进度仍为 **1/8（12.5%）**。
