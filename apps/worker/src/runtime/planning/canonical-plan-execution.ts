@@ -192,6 +192,10 @@ export function createCanonicalPlanExecutionFactory(options: CanonicalPlanExecut
       seenPlanHashes.clear()
       goalRevision = goal.revision
     }
+    const basedOnPlanRevision = receipt.basedOnPlanRevision
+    if (!Number.isSafeInteger(receipt.planRevision) || receipt.planRevision < 1 || receipt.planRevision > maxPlanRevisions ||
+      (basedOnPlanRevision !== null && (!Number.isSafeInteger(basedOnPlanRevision) || basedOnPlanRevision < 0 || basedOnPlanRevision >= maxPlanRevisions)) ||
+      receipt.planRevision !== (basedOnPlanRevision === null ? 1 : basedOnPlanRevision + 1)) throw new PlanRevisionRecoveryError()
     if (receipt.goalRevision !== goalRevision) return
     if (receipt.planRevision > (currentPlanRevision ?? 0)) {
       if (receipt.basedOnPlanRevision !== currentPlanRevision) throw new PlanRevisionRecoveryError()

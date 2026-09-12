@@ -3,7 +3,7 @@ import { describe, expect, it } from "vitest"
 import { createPlanProposalTool } from "./plan-proposal-tool.js"
 import { PLAN_MAX_NODES, PLAN_MAX_REVISIONS, PLAN_PROPOSAL_SCHEMA_VERSION, type GoalContract, type PlanActionKind, type PlanProposal } from "./goal-plan-contract.js"
 import { fingerprintPlanProposal } from "./plan-fingerprint.js"
-import { createPlanRevisionRecoveryDispatcher } from "./plan-revision-receipt.js"
+import { createPlanRevisionRecoveryDispatcher, PlanRevisionRecoveryError } from "./plan-revision-receipt.js"
 
 const goal: GoalContract = { revision: 1, objective: "Find jobs", constraints: [], successCriteria: ["review results"], knownFacts: [], unresolvedQuestions: [], approvalBoundaries: [], budgetRef: "runtime:turn" }
 const baseNode = { localId: "read", kind: "use_tool" as const, objective: "Read jobs", inputRefs: [], dependsOn: [], successCriteria: ["results"], outputSchemaRef: null, toolName: "jobs.search" }
@@ -13,6 +13,13 @@ function plan(overrides: Partial<PlanProposal> = {}): PlanProposal {
 function context() { return { scope: { userId: "user-1" }, sessionId: "session-1", turnId: "turn-1", stepId: "step-1", signal: new AbortController().signal, capabilities: ["canPlan"], reportProgress: async () => undefined } }
 function toolOptions(overrides: Record<string, unknown> = {}) { return { goal, allowedTools: ["jobs.search", "jobs.get", "persona.retrieve", "resume.get_base", "application.get_state", "tool_results.read"], allowedTemplates: [], allowedRoles: ["scout", "analyst"], maxNodes: 8, ...overrides } }
 function tool() { return createPlanProposalTool(toolOptions()) }
+
+function expectRecoveryError(action: () => void): void {
+  let caught: unknown
+  try { action() } catch (error: unknown) { caught = error }
+  expect(caught).toBeInstanceOf(PlanRevisionRecoveryError)
+  expect(caught).toMatchObject({ code: "invalid_output" })
+}
 
 describe("plan proposal tool", () => {
   it("rejects invalid server-owned bounds at factory construction", () => {
@@ -114,6 +121,18 @@ describe("plan proposal tool", () => {
     await expect(definition.execute(context(), { proposal: { ...recovered, basedOnPlanRevision: 2 } })).rejects.toMatchObject({ code: "plan_no_progress", safeOutput: { proposalHash: recoveredHash } })
     const next = await definition.execute(context(), { proposal: plan({ basedOnPlanRevision: 2, nodes: [{ ...baseNode, localId: "next" }] }) })
     expect(next).toMatchObject({ planRevision: 3, basedOnPlanRevision: 2 })
+  })
+
+  it("rejects non-contiguous and over-bound replay recovery without advancing state", async () => {
+    const dispatcher = createPlanRevisionRecoveryDispatcher()
+    const definition = createPlanProposalTool(toolOptions({ initialPlanRevision: 1, maxPlanRevisions: 3, recoveryDispatcher: dispatcher }))
+    expectRecoveryError(() => dispatcher.recover({ goalRevision: 1, planRevision: 3, basedOnPlanRevision: 2 }))
+    await expect(definition.execute(context(), { proposal: plan({ basedOnPlanRevision: 1, nodes: [{ ...baseNode, localId: "next" }] }) })).resolves.toMatchObject({ planRevision: 2, basedOnPlanRevision: 1 })
+
+    const boundedDispatcher = createPlanRevisionRecoveryDispatcher()
+    const bounded = createPlanProposalTool(toolOptions({ initialPlanRevision: 2, maxPlanRevisions: 2, recoveryDispatcher: boundedDispatcher }))
+    expectRecoveryError(() => boundedDispatcher.recover({ goalRevision: 1, planRevision: 3, basedOnPlanRevision: 2 }))
+    await expect(bounded.execute(context(), { proposal: plan({ basedOnPlanRevision: 2, nodes: [{ ...baseNode, localId: "bounded" }] }) })).rejects.toMatchObject({ code: "plan_revision_limit" })
   })
 
   it("rejects forged identity, external tools, and unknown delegate roles without dispatching", async () => {

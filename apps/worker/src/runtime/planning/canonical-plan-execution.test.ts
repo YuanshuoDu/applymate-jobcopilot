@@ -7,7 +7,7 @@ import { PLAN_PROPOSAL_SCHEMA_VERSION, type GoalContract, type GoalContractRef, 
 import { fingerprintPlanProposal } from "./plan-fingerprint.js"
 import { createCanonicalPlanExecutionFactory, type CanonicalPlanExecutionOptions } from "./canonical-plan-execution.js"
 import type { PlanCommandReceipt } from "./plan-command-receipt.js"
-import { createPlanRevisionRecoveryDispatcher, type PlanRevisionRecoveryDispatcher } from "./plan-revision-receipt.js"
+import { createPlanRevisionRecoveryDispatcher, PlanRevisionRecoveryError, type PlanRevisionRecoveryDispatcher } from "./plan-revision-receipt.js"
 
 const lease = {
   turnId: "turn-1", sessionId: "session-1", ownerId: "worker-1", userId: "user-1", leaseVersion: 2,
@@ -55,6 +55,13 @@ function input(value: unknown, stepId = "step-1", toolObservations: StepContextS
 function observationCode(result: Awaited<ReturnType<ReturnType<typeof fixture>>>) {
   const value = result.observations[0]?.content
   return value && typeof value === "object" && "errorCode" in value && typeof value.errorCode === "string" ? value.errorCode : undefined
+}
+
+function expectRecoveryError(action: () => void): void {
+  let caught: unknown
+  try { action() } catch (error: unknown) { caught = error }
+  expect(caught).toBeInstanceOf(PlanRevisionRecoveryError)
+  expect(caught).toMatchObject({ code: "invalid_output" })
 }
 
 describe("createCanonicalPlanExecutionFactory", () => {
@@ -129,6 +136,19 @@ describe("createCanonicalPlanExecutionFactory", () => {
     const nextProposal = { ...proposal([use("next")]), basedOnPlanRevision: 2 }
     const next = await hook(input(output(nextProposal, { planRevision: 3, basedOnPlanRevision: 2 })))
     expect(next.observations).toHaveLength(1)
+  })
+
+  it("rejects non-contiguous and over-bound replay recovery without advancing state", async () => {
+    const dispatcher = createPlanRevisionRecoveryDispatcher()
+    const hook = fixture(undefined, 1, undefined, undefined, undefined, undefined, undefined, dispatcher)
+    expectRecoveryError(() => dispatcher.recover({ goalRevision: 1, planRevision: 3, basedOnPlanRevision: 2 }))
+    const nextProposal = { ...proposal([use("next")]), basedOnPlanRevision: 1 }
+    expect(observationCode(await hook(input(output(nextProposal, { planRevision: 2, basedOnPlanRevision: 1 }))))).toBeUndefined()
+
+    const boundedDispatcher = createPlanRevisionRecoveryDispatcher()
+    const bounded = fixture(undefined, 2, undefined, 2, undefined, undefined, undefined, boundedDispatcher)
+    expectRecoveryError(() => boundedDispatcher.recover({ goalRevision: 1, planRevision: 3, basedOnPlanRevision: 2 }))
+    expect(observationCode(await bounded(input(output({ ...proposal([use("bounded")]), basedOnPlanRevision: 2 }, { planRevision: 3, basedOnPlanRevision: 2 }))))).toBe("plan_revision_limit")
   })
 
   it("reads a revised goal and resets old plan state through the bridge", async () => {
