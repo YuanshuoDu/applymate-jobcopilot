@@ -1450,3 +1450,18 @@ git diff --check
 **独立验证：** canonical plan execution focused suite **40/40 passed**；shared build、Worker `tsc` 与 `git diff --check` 均通过。
 
 **候选边界：** 本切片只证明 input reference 的递归身份字段拒绝与普通嵌套业务数据回归，不代表 live DB/RLS、Redis/queue、provider、真实进程重启、browser 或 child-parent E2E 已验证；P3/Phase 和整体目标仍未完成。
+
+---
+
+## 30. P3-35 — Strict structured Scout/Analyst evidence boundary
+
+**状态与进度口径（2026-09-12）：** P3-35 是 Scout/Analyst 结构化业务证据边界的候选安全/可靠性切片，不代表 P3 完成、完整 Harness 或生产隔离证据。中文升级计划总进度仍按 **P0 已验收 1/8（12.5%）** 统计；本切片不改变该口径。
+
+**实现记录：** 集成提交为 `80b95034`。Scout 与 Analyst 结果现在分别使用 exact role-level schema；`evidence`、`candidate`、`finding` 也分别只接受受控字段集合，拒绝额外或缺失字段。结果入口递归拒绝 runtime identity、lease、capability 和 budget keys，并要求 plain JSON、无循环引用和 finite number；job/persona/resume/source 业务字符串与数组保持可用，legacy adapter 生成的合法结果保持兼容。
+
+- 既有 evidence 绑定、真实 job ID、score `0..10`、`completed`/`partial` 状态和成功结果字段保持不变；结构化结果不会携带服务器身份或权限上下文进入 root 业务证据。
+- 仅修改 role result validator 与对应 focused tests，没有新增 migration、provider、model、queue 或 external-write 权限。
+
+**独立验证：** 根侧 `role-results`、`partial-failure` 与 `aggregation` 验证 **30/30 passed**，`role-handlers` **3/3 passed**；shared build、Worker `tsc` 与 `git diff --check` 均通过。
+
+**候选边界：** 本切片只证明结构化 Scout/Analyst 结果的 schema、递归身份隔离与本地 adapter 回归，不代表 live DB/RLS、Redis/queue、provider、真实进程重启、browser 或 child-parent E2E 已验证；P3/Phase 和整体目标仍未完成。
