@@ -88,6 +88,10 @@ function parseDecision(raw: string): Record<string, unknown> | null {
   }
 }
 
+function isOrchestratorDecision(value: unknown): value is OrchestratorDecision['decision'] {
+  return value === 'proceed' || value === 'retry' || value === 'ask_user' || value === 'abort'
+}
+
 // ── OrchestratorAgent ─────────────────────────────────────────────────────────
 
 export class OrchestratorAgent {
@@ -227,15 +231,21 @@ Respond ONLY in valid JSON (no markdown):
 
     try {
       const r      = await modelChat([{ role: 'user', content: prompt }], this.ctx.aiConfig, 400)
-      const parsed = parseDecision(r.text) as OrchestratorDecision | null
-      if (!parsed?.decision) throw new Error('no decision')
+      const parsed = parseDecision(r.text)
+      if (!parsed || !isOrchestratorDecision(parsed.decision)) throw new Error('invalid decision')
+
+      const decision: OrchestratorDecision = {
+        ...parsed,
+        decision: parsed.decision,
+        thinking: typeof parsed.thinking === 'string' ? parsed.thinking : '',
+      }
 
       // Clean thinking field from any preamble too
-      if (parsed.thinking) parsed.thinking = extractFinalSentence(parsed.thinking)
+      if (decision.thinking) decision.thinking = extractFinalSentence(decision.thinking)
 
-      this.history.push(`[${stage}] ${summary} → ${parsed.decision}: ${parsed.thinking}`)
-      this.emit('orchestrator_thinking', { stage, thinking: parsed.thinking, decision: parsed.decision })
-      return parsed
+      this.history.push(`[${stage}] ${summary} → ${decision.decision}: ${decision.thinking}`)
+      this.emit('orchestrator_thinking', { stage, thinking: decision.thinking, decision: decision.decision })
+      return decision
     } catch {
       const fallback: OrchestratorDecision = {
         decision: 'abort',
