@@ -99,4 +99,17 @@ describe("plan completion feedback", () => {
     expect(currentPlanId(observations)).toBe("new")
     expect(currentPlanId(observations.slice(0, 2))).toBeNull()
   })
+
+  it("does not let legacy feedback consume a new plan generation", () => {
+    const legacy = buildPlanCompletionFeedback("turn:turn-1:step:0", 1)!
+    const current = buildPlanCompletionFeedback("turn:turn-1:step:1", 1, "new-plan")!
+    const currentPlan = currentPlanId([
+      legacy,
+      { id: "plan-revision:new-plan", content: { kind: "plan_revision", planCallId: "new-plan", goalRevision: 1, planRevision: 2, basedOnPlanRevision: 1 } },
+      current,
+    ])
+    expect(currentPlan).toBe("new-plan")
+    expect(planCompletionRecoveryCount([legacy], turnId, currentPlan)).toBe(0)
+    expect(planCompletionRecoveryCount([legacy, current], turnId, currentPlan)).toBe(1)
+  })
 })

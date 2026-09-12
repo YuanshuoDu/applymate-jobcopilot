@@ -201,8 +201,9 @@ export async function loadCanonicalTurnState(pool: Pick<pg.Pool, "connect">, lea
     const revisionState = restorePlanRevisions(filterPlanRevisionEvents(eventsResult.rows.map(event => ({ type: event.type, payload: event.payload })), goalState.goalContract.revision).map(event => ({ type: event.type, payload: eventPayload(event.payload) })))
     const revision = revisionState.latest
     const restoredBase = [...observations(itemsResult.rows, eventsResult.rows, goalState.goalContract.revision), ...planObservations(eventsResult.rows), ...planCommandObservations(eventsResult.rows), ...contextCompactionObservations(eventsResult.rows), ...(goalState.receipt ? [goalRevisionObservation(goalState.receipt)] : []), ...(revision ? [planRevisionObservation(revision)] : [])]
-    snapshot = { ...snapshot, toolObservations: sanitizePlanCompletionFeedbackObservations(snapshot.toolObservations, lease.turnId).filter(item => { const content = object(item.content); const output = object(content.output); return (content.kind !== "plan_revision" || content.goalRevision === goalState.goalContract.revision) && (content.toolName !== "agent.plan.propose" || output.status !== "accepted" || output.goalRevision === goalState.goalContract.revision) }) }
-    const currentPlan = currentPlanId([...snapshot.toolObservations, ...restoredBase])
+    const scopedSnapshot = sanitizePlanCompletionFeedbackObservations(snapshot.toolObservations, lease.turnId).filter(item => { const content = object(item.content); const output = object(content.output); return (content.kind !== "plan_revision" || content.goalRevision === goalState.goalContract.revision) && (content.toolName !== "agent.plan.propose" || output.status !== "accepted" || output.goalRevision === goalState.goalContract.revision) })
+    const currentPlan = currentPlanId([...scopedSnapshot, ...restoredBase])
+    snapshot = { ...snapshot, toolObservations: sanitizePlanCompletionFeedbackObservations(scopedSnapshot, lease.turnId, currentPlan) }
     const restoredFeedback = restorePlanCompletionFeedback(eventsResult.rows.map(event => ({ type: event.type, payload: eventPayload(event.payload) })), lease.turnId, currentPlan)
     const restored = [...restoredBase, ...restoredFeedback]
     const seen = new Set(snapshot.toolObservations.map(item => item.id))

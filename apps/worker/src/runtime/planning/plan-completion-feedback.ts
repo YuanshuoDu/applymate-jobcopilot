@@ -13,7 +13,8 @@ const FEEDBACK_ID_PREFIX = "plan-completion-feedback:"
 const MAX_ID_LENGTH = 512
 const MAX_PLAN_ID_LENGTH = 240
 const MAX_PAYLOAD_BYTES = 8 * 1024
-const FEEDBACK_KEYS = ["kind", "status", "attempt", "blocker", "feedback"] as const
+const FEEDBACK_KEYS = ["kind", "status", "attempt", "blocker", "feedback", "planId"] as const
+const REQUIRED_FEEDBACK_KEYS = FEEDBACK_KEYS.filter(key => key !== "planId")
 const EVENT_KEYS = ["observationId", "turnId", "stepId", "attempt", "status", "blocker", "feedback", "planId"] as const
 
 export type PlanCompletionFeedback = {
@@ -22,6 +23,7 @@ export type PlanCompletionFeedback = {
   readonly attempt: number
   readonly blocker: typeof PLAN_COMPLETION_FEEDBACK_BLOCKER
   readonly feedback: typeof PLAN_COMPLETION_FEEDBACK_TEXT
+  readonly planId?: string
 }
 
 export type PlanCompletionFeedbackObservation = {
@@ -60,6 +62,14 @@ function sameEvent(left: PlanCompletionFeedbackEvent, right: PlanCompletionFeedb
     && left.feedback === right.feedback && left.planId === right.planId
 }
 
+function validPlanId(value: unknown): value is string {
+  return validId(value, MAX_PLAN_ID_LENGTH)
+}
+
+function matchesPlan(planId: string | undefined, expectedPlanId: string | null): boolean {
+  return expectedPlanId === null ? planId === undefined : planId === expectedPlanId
+}
+
 function boundedPayload(value: PlanCompletionFeedback): boolean {
   try {
     const encoded = JSON.stringify(value)
@@ -70,15 +80,17 @@ function boundedPayload(value: PlanCompletionFeedback): boolean {
 }
 
 /** Build server-owned feedback for the current step. P3-27A keeps this in-memory. */
-export function buildPlanCompletionFeedback(stepId: string, attempt: number): PlanCompletionFeedbackObservation | null {
+export function buildPlanCompletionFeedback(stepId: string, attempt: number, planId?: string | null): PlanCompletionFeedbackObservation | null {
   if (typeof stepId !== "string" || stepId.trim() !== stepId || stepId.length === 0 || stepId.length > MAX_ID_LENGTH) return null
   if (!Number.isInteger(attempt) || attempt < 1 || attempt > MAX_PLAN_COMPLETION_RECOVERY_ATTEMPTS) return null
+  if (planId !== undefined && planId !== null && !validPlanId(planId)) return null
   const content: PlanCompletionFeedback = {
     kind: PLAN_COMPLETION_FEEDBACK_KIND,
     status: PLAN_COMPLETION_FEEDBACK_STATUS,
     attempt,
     blocker: PLAN_COMPLETION_FEEDBACK_BLOCKER,
     feedback: PLAN_COMPLETION_FEEDBACK_TEXT,
+    ...(planId === undefined || planId === null ? {} : { planId }),
   }
   return boundedPayload(content) ? { id: `${FEEDBACK_ID_PREFIX}${stepId}`, content } : null
 }
@@ -126,11 +138,12 @@ export function parsePlanCompletionFeedback(
   if (!row || typeof row.id !== "string" || row.id.trim() !== row.id || row.id.length <= FEEDBACK_ID_PREFIX.length || row.id.length > MAX_ID_LENGTH + FEEDBACK_ID_PREFIX.length || !row.id.startsWith(FEEDBACK_ID_PREFIX)) return null
   const stepId = row.id.slice(FEEDBACK_ID_PREFIX.length)
   const content = object(row.content)
-  if (!content || Object.keys(content).some(key => !(FEEDBACK_KEYS as readonly string[]).includes(key)) || FEEDBACK_KEYS.some(key => !Object.prototype.hasOwnProperty.call(content, key))) return null
+  if (!content || Object.keys(content).some(key => !(FEEDBACK_KEYS as readonly string[]).includes(key)) || REQUIRED_FEEDBACK_KEYS.some(key => !Object.prototype.hasOwnProperty.call(content, key))) return null
   if (content.kind !== PLAN_COMPLETION_FEEDBACK_KIND || content.status !== PLAN_COMPLETION_FEEDBACK_STATUS || content.blocker !== PLAN_COMPLETION_FEEDBACK_BLOCKER || content.feedback !== PLAN_COMPLETION_FEEDBACK_TEXT) return null
   if (!Number.isInteger(content.attempt) || Number(content.attempt) < 1 || Number(content.attempt) > MAX_PLAN_COMPLETION_RECOVERY_ATTEMPTS) return null
+  if (content.planId !== undefined && !validPlanId(content.planId)) return null
   if (!belongsToTurn(stepId, expectedTurnId)) return null
-  const parsed = buildPlanCompletionFeedback(stepId, Number(content.attempt))
+  const parsed = buildPlanCompletionFeedback(stepId, Number(content.attempt), content.planId as string | undefined)
   return parsed && parsed.id === row.id ? parsed : null
 }
 
@@ -214,6 +227,7 @@ export function restorePlanCompletionFeedback(
     content: {
       kind: PLAN_COMPLETION_FEEDBACK_KIND, status: PLAN_COMPLETION_FEEDBACK_STATUS,
       attempt: event.attempt, blocker: PLAN_COMPLETION_FEEDBACK_BLOCKER, feedback: PLAN_COMPLETION_FEEDBACK_TEXT,
+      ...(event.planId === null ? {} : { planId: event.planId }),
     },
   }))
 }
@@ -222,6 +236,7 @@ export function restorePlanCompletionFeedback(
 export function sanitizePlanCompletionFeedbackObservations(
   observations: StepContextSnapshot["toolObservations"],
   expectedTurnId: string,
+  expectedPlanId?: string | null,
 ): StepContextSnapshot["toolObservations"] {
   if (!Array.isArray(observations)) return []
   const result: Array<StepContextSnapshot["toolObservations"][number] | undefined> = []
@@ -234,6 +249,7 @@ export function sanitizePlanCompletionFeedbackObservations(
     }
     const parsed = parsePlanCompletionFeedback(observation, expectedTurnId)
     if (!parsed || conflicting.has(parsed.id)) continue
+    if (expectedPlanId !== undefined && !matchesPlan(parsed.content.planId, expectedPlanId)) continue
     const index = indexes.get(parsed.id)
     if (index !== undefined) {
       const existing = result[index]
@@ -254,6 +270,7 @@ export function sanitizePlanCompletionFeedbackObservations(
 export function planCompletionRecoveryCount(
   observations: StepContextSnapshot["toolObservations"],
   turnId: string,
+  expectedPlanId?: string | null,
 ): number {
   if (!Array.isArray(observations)) return 0
   const parsed = new Map<string, PlanCompletionFeedbackObservation>()
@@ -261,6 +278,7 @@ export function planCompletionRecoveryCount(
   for (const observation of observations) {
     const candidate = parsePlanCompletionFeedback(observation, turnId)
     if (!candidate || conflicting.has(candidate.id)) continue
+    if (expectedPlanId !== undefined && !matchesPlan(candidate.content.planId, expectedPlanId)) continue
     const existing = parsed.get(candidate.id)
     if (existing && existing.content.attempt !== candidate.content.attempt) {
       parsed.delete(candidate.id)

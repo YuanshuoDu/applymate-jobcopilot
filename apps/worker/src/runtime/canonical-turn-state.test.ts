@@ -123,11 +123,14 @@ describe("loadCanonicalTurnState", () => {
   })
 
   it("restores durable completion feedback only for the current plan and deduplicates it", async () => {
-    const feedback = buildPlanCompletionFeedbackEvent({ turnId: "turn-1", stepId: "turn:turn-1:step:0", attempt: 1, planId: "plan-1" })!
+    const oldFeedback = buildPlanCompletionFeedbackEvent({ turnId: "turn-1", stepId: "turn:turn-1:step:0", attempt: 2, planId: "plan-1" })!
+    const feedback = buildPlanCompletionFeedbackEvent({ turnId: "turn-1", stepId: "turn:turn-1:step:1", attempt: 1, planId: "plan-2" })!
     const fake = pool({
       turn: { input: { goal: "Find jobs" }, rootTaskId: "root-1", contextSnapshotId: null, modelProfileSnapshot: {}, toolPolicySnapshot: {}, budgetSnapshot: {} },
       events: [
         { type: "plan.revision", payload: { planCallId: "plan-1", goalRevision: 1, planRevision: 1, basedOnPlanRevision: null } },
+        { type: PLAN_COMPLETION_FEEDBACK_EVENT_TYPE, payload: oldFeedback },
+        { type: "plan.revision", payload: { planCallId: "plan-2", goalRevision: 1, planRevision: 2, basedOnPlanRevision: 1 } },
         { type: PLAN_COMPLETION_FEEDBACK_EVENT_TYPE, payload: feedback },
         { type: PLAN_COMPLETION_FEEDBACK_EVENT_TYPE, payload: feedback },
         { type: PLAN_COMPLETION_FEEDBACK_EVENT_TYPE, payload: { ...feedback, planId: "foreign-plan" } },
@@ -136,7 +139,11 @@ describe("loadCanonicalTurnState", () => {
     })
     const value = await loadCanonicalTurnState(fake, lease)
     expect(value.snapshot.toolObservations.filter(item => item.id === feedback.observationId)).toHaveLength(1)
+    expect(value.snapshot.toolObservations.some(item => item.id === oldFeedback.observationId)).toBe(false)
+    expect(value.snapshot.toolObservations.find(item => item.id === feedback.observationId)?.content).toMatchObject({ planId: "plan-2" })
     expect(planCompletionRecoveryCount(value.snapshot.toolObservations, lease.turnId)).toBe(1)
+    expect(planCompletionRecoveryCount(value.snapshot.toolObservations, lease.turnId, "plan-2")).toBe(1)
+    expect(planCompletionRecoveryCount(value.snapshot.toolObservations, lease.turnId, "plan-1")).toBe(0)
     const eventQuery = fake.client.query.mock.calls.find(([sql]) => typeof sql === "string" && sql.includes('FROM "agent_events"'))?.[0]
     expect(eventQuery).toContain(`'${PLAN_COMPLETION_FEEDBACK_EVENT_TYPE}'`)
   })

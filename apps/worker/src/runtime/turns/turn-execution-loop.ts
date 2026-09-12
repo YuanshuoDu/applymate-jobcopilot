@@ -147,11 +147,12 @@ export async function runTurnExecutionLoop(options: TurnExecutionOptions): Promi
         }
         const planCompletion = verifyPlanCompletion({ snapshot, required: options.planCompletionRequired === true })
         if (!planCompletion.ok) {
-          const usedRecoveryAttempts = planCompletionRecoveryCount(snapshot.toolObservations, options.identity.turnId)
+          const planId = currentPlanId(snapshot.toolObservations)
+          const usedRecoveryAttempts = planCompletionRecoveryCount(snapshot.toolObservations, options.identity.turnId, planId)
           if (usedRecoveryAttempts < planCompletionRecoveryLimit) {
-            const feedback = buildPlanCompletionFeedback(step.id, usedRecoveryAttempts + 1)
+            const feedback = buildPlanCompletionFeedback(step.id, usedRecoveryAttempts + 1, planId)
             if (!feedback) throw new TurnEngineError("invalid_output", "Plan completion feedback could not be built")
-            const event = buildPlanCompletionFeedbackEvent({ turnId: options.identity.turnId, stepId: step.id, attempt: feedback.content.attempt, planId: currentPlanId(snapshot.toolObservations) })
+            const event = buildPlanCompletionFeedbackEvent({ turnId: options.identity.turnId, stepId: step.id, attempt: feedback.content.attempt, planId })
             const idempotencyKey = planCompletionFeedbackIdempotencyKey(step.id)
             if (!event || !idempotencyKey) throw new TurnEngineError("invalid_output", "Plan completion feedback identity could not be built")
             try {
