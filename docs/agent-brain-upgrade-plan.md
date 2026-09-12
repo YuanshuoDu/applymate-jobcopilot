@@ -236,6 +236,12 @@ Replay 顺序现在是先解析并校验 goal，再执行 recovery，最后才�
 
 本切片没有 live PostgreSQL/RLS、Redis/queue、provider、process restart 或 cross-process child→parent 证据；整体完整验收仍为 **1/8 (12.5%)**。
 
+## P3-17 update
+
+本切片将 canonical planning 接入 Worker 生产启动配置。`ENABLE_AGENT_PLANNING=1` 才会打开规划能力，`ENABLE_AGENT_PLAN_EXECUTION=1` 只在规划已开启时打开计划执行；两个 gate 均由 server-owned 环境配置解析，模型输入、policy snapshot、coordination、child 或 wait 输入不能打开它们。默认值和非精确 `1` 值均为关闭，因此保留已有安全默认路径。
+
+新增的纯 helper 覆盖 undefined/0、单独 execution 和双门控组合；Worker 入口把解析结果传给 `createCanonicalTurnRuntime`，没有改 planning semantics、provider、依赖或迁移。Worker focused flags test **3/3** 通过；本切片不包含真实生产启动、PostgreSQL/RLS、Redis/queue、重启或跨进程证据，整体完成度仍为 **1/8 (12.5%)**。
+
 ## P2-OUTBOX-1 update
 
 P2-OUTBOX-1 提交 `57dd0ac9`（2026-09-09）已推送到当前分支：canonical Turn dispatch 在 `queue.add` 成功后使用同一 outbox row 做 guarded publishedAt/attemptCount/lastError 记账；queue.add 失败记录 `queue_add_failed` 并保持未发布；enqueue 成功但记账不确定时返回 `turn_dispatch_delivery_uncertain`，下一次使用相同 generation/jobId 依靠 BullMQ 幂等。该语义是 at-least-once 加 idempotent job ID，不承诺 exactly-once。

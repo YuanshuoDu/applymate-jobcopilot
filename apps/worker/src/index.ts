@@ -7,6 +7,7 @@ import { bindWorkerControl, getWorkerRuntimeState, restoreWorkerRuntimeState } f
 import { closeSharedRedisConnections } from "./redis.js";
 import { workerHarnessFeatureHealth } from "./admin/harness-health.js";
 import { startAgentWakeupConsumer } from "./runtime/wakeup/consumer.js";
+import { resolveProductionAgentFlags } from "./runtime/production-agent-flags.js";
 
 async function main() {
   const adminHost = resolveWorkerAdminHost();
@@ -73,11 +74,14 @@ async function main() {
 
   const childExecutionEnabled = productionChildRuntimeModule.childExecutionEnabled();
   const consumeWaitOutcomes = process.env.ENABLE_AGENT_WAIT_RESOLVER === "1" && childExecutionEnabled;
+  const planningFlags = resolveProductionAgentFlags();
   const canonicalRuntime = await canonicalRuntimeModule.createCanonicalTurnRuntime(getPool(), {
     workerId: process.env.WORKER_ID ?? `worker-${process.pid}`,
     authorizeUsage: aiUsageBridgeModule.createWorkerUsageAuthorizer(),
     consumeWaitOutcomes,
     coordinationEnabled: consumeWaitOutcomes,
+    planningEnabled: planningFlags.planningEnabled,
+    planningExecutionEnabled: planningFlags.planningExecutionEnabled,
   });
   // Child execution is opt-in. Keep tree-budget and child queue construction
   // out of the default startup path until the explicit feature flag is set.

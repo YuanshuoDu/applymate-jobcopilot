@@ -314,6 +314,12 @@ Replay now parses and checks the goal, performs recovery, and only then appends 
 
 No live PostgreSQL/RLS, Redis/queue, provider, process restart or cross-process child-to-parent evidence was collected. Overall completion remains **1/8 (12.5%)**.
 
+## P3-17 update
+
+The Worker production entry now passes server-owned planning gates into `createCanonicalTurnRuntime`. `ENABLE_AGENT_PLANNING=1` enables canonical planning, while `ENABLE_AGENT_PLAN_EXECUTION=1` can enable execution only when planning is already enabled. Undefined, `0`, and non-exact `1` values remain disabled; model input, policy snapshots, coordination, child execution and wait input cannot turn these gates on. No planning semantics, provider, dependency or migration changed.
+
+The new pure resolver has sibling tests for the default, planning-only, dual-enabled and execution-only cases; the focused test passes **3/3**. This slice has no live production startup, PostgreSQL/RLS, Redis/queue, process restart or cross-process evidence; overall completion remains **1/8 (12.5%)**.
+
 ## P2-OUTBOX-1 update
 
 Commit `57dd0ac9` repairs canonical Turn dispatch bookkeeping after enqueue. A successful `queue.add` is followed by a guarded outbox update using the same row ID, setting `publishedAt`, incrementing `attemptCount` and clearing `lastError`; a second drain therefore does not dispatch the same published row again. Queue-add failure records bounded `queue_add_failed` state while leaving the row unpublished for retry. If enqueue succeeds but the bookkeeping update is uncertain, recovery returns `turn_dispatch_delivery_uncertain` and reuses the same generation/job ID rather than inventing another delivery generation.
