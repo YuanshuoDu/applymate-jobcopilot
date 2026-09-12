@@ -1348,3 +1348,16 @@ git diff --check
 - P3-27A 的内存恢复与 P3-27B 的 canonical event 恢复都仍是候选切片，不能用于宣称完整 Harness、P3/Phase 完成或真实进程重启恢复。live DB/RLS、Redis/queue、provider、真实进程重启和浏览器/child-parent E2E 仍需独立证据。
 
 **独立验证：** 根侧对 3 个直接文件验证 **70/70 passed**，pretest shared build 通过；Worker TypeScript 与 `git diff --check` 均通过。未覆盖 live DB/RLS、Redis/queue、provider、真实进程重启过程或浏览器/child-parent E2E；总体进度仍为 **1/8（12.5%）**。
+
+---
+
+## 23. P3-28 — 计划完成反馈恢复回归候选切片
+
+**状态与进度口径（2026-09-12）：** P3-28 是针对 P3-27A/B 的候选回归切片；P3-27A、P3-27B、P3-28 均不代表 P3 完成、完整 Harness 或 Phase 完成。中文升级计划总进度仍按 **P0 已验收 1/8（12.5%）** 统计。
+
+**实现记录：** 提交为 `8b8db903`。fake lease-loss/crash window 在首轮完成 `plan.completion_feedback` event append 后触发，首轮以 `requeued/lease_lost` 结束；第二轮新建 canonical runtime，通过 `loadCanonicalTurnState` 从同一 event log 恢复。回归断言确认 feedback count 为 `1`、resume step state 恢复、provider continuation 没有复用，且 feedback event 没有重复追加。
+
+- 该切片验证的是 fake harness regression，证明 event append 与 canonical state 恢复之间的模拟租约丢失窗口；它不是 live DB/Redis/queue/provider 证据，也不是实际进程重启、浏览器 E2E 或 child-parent E2E 证据。
+- P3-27A/B 的候选边界仍然有效：恢复上限、current turn/current plan 过滤、稳定幂等和 planning/child gate 语义必须保持；本回归不能用于宣称完整 Harness 或 P3/Phase 完成。
+
+**独立验证：** 根侧对 `canonical-turn-runtime` 与 `turn-execution-loop` 验证 **63/63 passed**；pretest shared build、Worker TypeScript 与 `git diff --check` 均通过。未覆盖 live DB/RLS、Redis/queue、provider、真实进程重启、浏览器 E2E 或 child-parent E2E；总体进度仍为 **1/8（12.5%）**。
