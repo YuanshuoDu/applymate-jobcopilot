@@ -22,7 +22,11 @@ export type PlanRevisionReceiptParseOptions = { readonly requireProposalHash?: b
 
 /** Server-owned state supplied only after a persisted receipt has been parsed. */
 export type PlanRevisionRecovery = Pick<PlanRevisionReceipt, "goalRevision" | "planRevision" | "basedOnPlanRevision" | "proposalHash">
-export type PlanRevisionRecoveryHandler = (receipt: PlanRevisionRecovery) => void
+export type PlanRevisionRecoveryTransition = {
+  readonly commit: () => void
+  readonly rollback: () => void
+}
+export type PlanRevisionRecoveryHandler = (receipt: PlanRevisionRecovery) => void | PlanRevisionRecoveryTransition
 export type PlanRevisionRecoveryDispatcher = {
   register(handler: PlanRevisionRecoveryHandler): void
   recover(receipt: PlanRevisionRecovery): void
@@ -69,9 +73,25 @@ export function createPlanRevisionRecoveryDispatcher(): PlanRevisionRecoveryDisp
       handlers.add(handler)
     },
     recover(receipt) {
+      const transitions: PlanRevisionRecoveryTransition[] = []
+      let committing: PlanRevisionRecoveryTransition | undefined
       try {
-        for (const handler of handlers) handler(receipt)
+        for (const handler of handlers) {
+          const transition = handler(receipt)
+          if (transition === undefined) continue
+          if (!transition || typeof transition.commit !== "function" || typeof transition.rollback !== "function") throw new PlanRevisionRecoveryError()
+          transitions.push(transition)
+        }
+        for (const transition of transitions) {
+          committing = transition
+          transition.commit()
+        }
       } catch (error: unknown) {
+        if (committing) {
+          for (const transition of [...transitions].reverse()) {
+            try { transition.rollback() } catch { /* keep the original recovery failure */ }
+          }
+        }
         if (error instanceof PlanRevisionRecoveryError) throw error
         throw new PlanRevisionRecoveryError()
       }

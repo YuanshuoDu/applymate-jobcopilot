@@ -65,17 +65,49 @@ export function createPlanProposalTool(options: PlanProposalToolOptions): Runtim
   let goalRevision = options.goal.revision
   options.recoveryDispatcher?.register(receipt => {
     const goal = options.goalRef?.get() ?? options.goal
-    if (goal.revision !== goalRevision) {
-      planRevision = null
-      seenPlanHashes.clear()
-      goalRevision = goal.revision
-    }
     recoverPlanRevision(receipt.basedOnPlanRevision, receipt, maxPlanRevisions)
-    if (receipt.goalRevision !== goalRevision) return
-    const nextRevision = recoverPlanRevision(planRevision, receipt, maxPlanRevisions)
-    if (receipt.planRevision !== planRevision && receipt.proposalHash && seenPlanHashes.has(receipt.proposalHash)) throw new PlanRevisionRecoveryError()
-    planRevision = nextRevision
-    if (receipt.proposalHash) seenPlanHashes.add(receipt.proposalHash)
+    const previousPlanRevision = planRevision
+    const previousGoalRevision = goalRevision
+    const previousPlanHashes = [...seenPlanHashes]
+    const goalChanged = goal.revision !== goalRevision
+    const recoveryPlanRevision = goalChanged ? null : planRevision
+    const recoveryPlanHashes = goalChanged ? new Set<string>() : seenPlanHashes
+    if (receipt.goalRevision !== goal.revision) {
+      if (!goalChanged) return
+      return {
+        commit: () => {
+          goalRevision = goal.revision
+          planRevision = null
+          seenPlanHashes.clear()
+        },
+        rollback: () => {
+          goalRevision = previousGoalRevision
+          planRevision = previousPlanRevision
+          seenPlanHashes.clear()
+          for (const hash of previousPlanHashes) seenPlanHashes.add(hash)
+        },
+      }
+    }
+    const nextRevision = recoverPlanRevision(recoveryPlanRevision, receipt, maxPlanRevisions)
+    if (receipt.planRevision === recoveryPlanRevision) {
+      if (receipt.proposalHash && !recoveryPlanHashes.has(receipt.proposalHash)) throw new PlanRevisionRecoveryError()
+    } else if (receipt.proposalHash && recoveryPlanHashes.has(receipt.proposalHash)) throw new PlanRevisionRecoveryError()
+    const nextPlanHashes = new Set(recoveryPlanHashes)
+    if (receipt.proposalHash) nextPlanHashes.add(receipt.proposalHash)
+    return {
+      commit: () => {
+        goalRevision = goal.revision
+        planRevision = nextRevision
+        seenPlanHashes.clear()
+        for (const hash of nextPlanHashes) seenPlanHashes.add(hash)
+      },
+      rollback: () => {
+        goalRevision = previousGoalRevision
+        planRevision = previousPlanRevision
+        seenPlanHashes.clear()
+        for (const hash of previousPlanHashes) seenPlanHashes.add(hash)
+      },
+    }
   })
   return {
     schemaVersion, name: "agent.plan.propose", version: "1", description: "Propose a bounded read-only plan for the current goal",

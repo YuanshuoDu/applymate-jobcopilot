@@ -268,17 +268,49 @@ export function createCanonicalPlanExecutionFactory(options: CanonicalPlanExecut
   let goalRevision = options.goal.revision
   options.recoveryDispatcher?.register(receipt => {
     const goal = options.goalRef?.get() ?? options.goal
-    if (goal.revision !== goalRevision) {
-      currentPlanRevision = null
-      seenPlanHashes.clear()
-      goalRevision = goal.revision
-    }
     recoverPlanRevision(receipt.basedOnPlanRevision, receipt, maxPlanRevisions)
-    if (receipt.goalRevision !== goalRevision) return
-    const nextRevision = recoverPlanRevision(currentPlanRevision, receipt, maxPlanRevisions)
-    if (receipt.planRevision !== currentPlanRevision && receipt.proposalHash && seenPlanHashes.has(receipt.proposalHash)) throw new PlanRevisionRecoveryError()
-    currentPlanRevision = nextRevision
-    if (receipt.proposalHash) seenPlanHashes.add(receipt.proposalHash)
+    const previousPlanRevision = currentPlanRevision
+    const previousGoalRevision = goalRevision
+    const previousPlanHashes = [...seenPlanHashes]
+    const goalChanged = goal.revision !== goalRevision
+    const recoveryPlanRevision = goalChanged ? null : currentPlanRevision
+    const recoveryPlanHashes = goalChanged ? new Set<string>() : seenPlanHashes
+    if (receipt.goalRevision !== goal.revision) {
+      if (!goalChanged) return
+      return {
+        commit: () => {
+          goalRevision = goal.revision
+          currentPlanRevision = null
+          seenPlanHashes.clear()
+        },
+        rollback: () => {
+          goalRevision = previousGoalRevision
+          currentPlanRevision = previousPlanRevision
+          seenPlanHashes.clear()
+          for (const hash of previousPlanHashes) seenPlanHashes.add(hash)
+        },
+      }
+    }
+    const nextRevision = recoverPlanRevision(recoveryPlanRevision, receipt, maxPlanRevisions)
+    if (receipt.planRevision === recoveryPlanRevision) {
+      if (receipt.proposalHash && !recoveryPlanHashes.has(receipt.proposalHash)) throw new PlanRevisionRecoveryError()
+    } else if (receipt.proposalHash && recoveryPlanHashes.has(receipt.proposalHash)) throw new PlanRevisionRecoveryError()
+    const nextPlanHashes = new Set(recoveryPlanHashes)
+    if (receipt.proposalHash) nextPlanHashes.add(receipt.proposalHash)
+    return {
+      commit: () => {
+        goalRevision = goal.revision
+        currentPlanRevision = nextRevision
+        seenPlanHashes.clear()
+        for (const hash of nextPlanHashes) seenPlanHashes.add(hash)
+      },
+      rollback: () => {
+        goalRevision = previousGoalRevision
+        currentPlanRevision = previousPlanRevision
+        seenPlanHashes.clear()
+        for (const hash of previousPlanHashes) seenPlanHashes.add(hash)
+      },
+    }
   })
   return async input => {
     const baseError = (code: string): TurnEnginePlanExecutionHookResult => ({ observations: [failureObservation(input.call.id, code)] })

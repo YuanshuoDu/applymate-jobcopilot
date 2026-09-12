@@ -123,6 +123,16 @@ describe("plan proposal tool", () => {
     expect(next).toMatchObject({ planRevision: 3, basedOnPlanRevision: 2 })
   })
 
+  it("rejects a same-revision recovery with a different proposal hash without polluting state", async () => {
+    const dispatcher = createPlanRevisionRecoveryDispatcher()
+    const definition = createPlanProposalTool(toolOptions({ initialPlanRevision: 1, recoveryDispatcher: dispatcher }))
+    const recovered = plan()
+    dispatcher.recover({ goalRevision: 1, planRevision: 2, basedOnPlanRevision: 1, proposalHash: fingerprintPlanProposal(recovered) })
+    const conflicting = plan({ nodes: [{ ...baseNode, localId: "conflicting" }] })
+    expectRecoveryError(() => dispatcher.recover({ goalRevision: 1, planRevision: 2, basedOnPlanRevision: 1, proposalHash: fingerprintPlanProposal(conflicting) }))
+    await expect(definition.execute(context(), { proposal: { ...conflicting, basedOnPlanRevision: 2 } })).resolves.toMatchObject({ planRevision: 3, basedOnPlanRevision: 2 })
+  })
+
   it("rejects non-contiguous and over-bound replay recovery without advancing state", async () => {
     const dispatcher = createPlanRevisionRecoveryDispatcher()
     const definition = createPlanProposalTool(toolOptions({ initialPlanRevision: 1, maxPlanRevisions: 3, recoveryDispatcher: dispatcher }))

@@ -150,6 +150,18 @@ describe("createCanonicalPlanExecutionFactory", () => {
     expect(next.observations).toHaveLength(1)
   })
 
+  it("rejects a same-revision recovery with a different proposal hash without polluting state", async () => {
+    const dispatcher = createPlanRevisionRecoveryDispatcher()
+    const hook = fixture(undefined, 1, undefined, undefined, undefined, undefined, undefined, dispatcher)
+    const recovered = proposal([])
+    dispatcher.recover({ goalRevision: 1, planRevision: 2, basedOnPlanRevision: 1, proposalHash: fingerprintPlanProposal(recovered) })
+    const conflicting = proposal([use("conflicting")])
+    expectRecoveryError(() => dispatcher.recover({ goalRevision: 1, planRevision: 2, basedOnPlanRevision: 1, proposalHash: fingerprintPlanProposal(conflicting) }))
+    const next = await hook(input(output({ ...conflicting, basedOnPlanRevision: 2 }, { planRevision: 3, basedOnPlanRevision: 2 })))
+    expect(next.observations).toHaveLength(1)
+    expect(observationCode(next)).toBeUndefined()
+  })
+
   it("replays all persisted plan commands without routing or emitting duplicates", async () => {
     const router = { execute: vi.fn(async (_context: ToolRouterContext, request: ToolCallRequest) => ({ ...request, status: "completed" as const, output: { unexpected: true }, errorCode: null })) }
     const command = { id: "plan-result:proposal-1:read", content: { kind: "plan_command", localId: "read", commandKind: "tool_call", dependsOn: [], status: "completed", errorCode: null, output: { jobId: "job-1" } } }

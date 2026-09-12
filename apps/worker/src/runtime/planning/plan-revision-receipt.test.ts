@@ -54,4 +54,13 @@ describe("plan revision receipt", () => {
     dispatcher.register(() => { throw new Error("recovery failed") })
     expect(() => dispatcher.recover(first)).toThrowError(expect.objectContaining({ code: "invalid_output" }))
   })
+
+  it("does not commit an earlier recovery transition when a later handler fails", () => {
+    let state = 0
+    const dispatcher = createPlanRevisionRecoveryDispatcher()
+    dispatcher.register(() => ({ commit: () => { state = 1 }, rollback: () => { state = 0 } }))
+    dispatcher.register(() => { throw new Error("second recovery handler failed") })
+    expect(() => dispatcher.recover({ goalRevision: 1, planRevision: 1, basedOnPlanRevision: null })).toThrowError(expect.objectContaining({ code: "invalid_output" }))
+    expect(state).toBe(0)
+  })
 })
