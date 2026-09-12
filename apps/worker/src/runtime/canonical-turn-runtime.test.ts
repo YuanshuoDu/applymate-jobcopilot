@@ -5,10 +5,15 @@ import type { StepContext } from "./context/step-context-builder.js"
 import type { CanonicalTurnState } from "./canonical-turn-state.js"
 import type { TurnEngineStore } from "./turns/turn-engine-types.js"
 import { createCanonicalTurnRuntime } from "./canonical-turn-runtime.js"
+import { loadCanonicalTurnState } from "./canonical-turn-state.js"
 import { createPgRootTaskStore } from "./subagents/root-task-store.js"
 import type { PlanProposal } from "./planning/goal-plan-contract.js"
 import { PLAN_MAX_REVISIONS } from "./planning/goal-plan-contract.js"
 import { fingerprintPlanProposal } from "./planning/plan-fingerprint.js"
+import { PLAN_COMPLETION_FEEDBACK_EVENT_TYPE, planCompletionRecoveryCount } from "./planning/plan-completion-feedback.js"
+import { reclaimExpiredTurns } from "./turns/recovery-scanner.js"
+import { runTurnJob } from "./turns/turn-queue.js"
+import type { TurnLease } from "./turns/lease.js"
 
 const lease = {
   turnId: "turn-1", sessionId: "session-1", ownerId: "worker-1", userId: "user-1", leaseVersion: 2,
@@ -126,6 +131,115 @@ function setup(overrides: Record<string, unknown> = {}) {
     authorizeUsage: async () => ({ settle: vi.fn(async () => undefined) }), ...overrides,
   })
   return { runtime, roots, tool, getModelCalls: () => calls }
+}
+
+function durableRestartFixture() {
+  type DurableEvent = { id: string; type: string; payload: unknown; idempotencyKey: string; taskId: string | null; itemId: string | null; correlationId: string; causationId: string | null }
+  type DurableStep = { id: string; ordinal: number; attempt: number; inputThroughSequence: bigint; consumedInputIds: string[]; inputTokens: number; outputTokens: number; estimatedCostUsd: number }
+  const feedbackPlan = "plan-1"
+  const durable: { status: "queued" | "in_progress"; ownerId: string | null; leaseVersion: number; leaseStartedAt: Date | null; leaseExpiresAt: Date | null; events: DurableEvent[]; steps: DurableStep[] } = {
+    status: "queued", ownerId: null, leaseVersion: 0, leaseStartedAt: null, leaseExpiresAt: null,
+    events: [
+      { id: "plan-revision-event", type: "plan.revision", payload: { planCallId: feedbackPlan, goalRevision: 1, planRevision: 1, basedOnPlanRevision: null }, idempotencyKey: "seed:plan-revision", taskId: "root-1", itemId: null, correlationId: feedbackPlan, causationId: null },
+      { id: "plan-result-event", type: "plan.observation", payload: { observationId: `plan-result:${feedbackPlan}:read`, content: { kind: "plan_command", localId: "read", commandKind: "tool_call", dependsOn: [], status: "completed", errorCode: null, output: { found: true } } }, idempotencyKey: "seed:plan-result", taskId: "root-1", itemId: null, correlationId: "read", causationId: null },
+      { id: "plan-control-event", type: "plan.observation", payload: { observationId: `plan-control:${feedbackPlan}:finish`, content: { kind: "plan_control", localId: "finish", status: "completion_proposed", dependsOn: ["missing"], completionCriteria: ["done"] } }, idempotencyKey: "seed:plan-control", taskId: "root-1", itemId: null, correlationId: "finish", causationId: null },
+    ],
+    steps: [],
+  }
+  const items = [
+    { type: "tool_call", content: { toolCallId: "evidence-call", toolName: "jobs.search", input: {}, status: "completed" } },
+    { type: "tool_result", content: { toolCallId: "evidence-call", output: { found: true }, errorCode: null } },
+  ]
+  const requests: HarnessModelRequest[] = []
+  let crashWindow = false
+  let executionCount = 0
+  let resolveFeedbackAppend!: () => void
+  const feedbackAppendSettled = new Promise<void>(resolve => { resolveFeedbackAppend = resolve })
+  const loadedStates: CanonicalTurnState[] = []
+  const client = {
+    query: vi.fn(async (sql: string, values?: readonly unknown[]) => {
+      if (sql === "BEGIN" || sql === "COMMIT" || sql === "ROLLBACK" || sql.includes("set_config")) return { rows: [], rowCount: 0 }
+      if (sql.includes("WITH stale AS")) {
+        if (durable.status !== "in_progress" || durable.ownerId !== null || !durable.leaseExpiresAt || durable.leaseExpiresAt > new Date(String(values?.[0]))) return { rows: [], rowCount: 0 }
+        durable.status = "queued"; durable.ownerId = null; durable.leaseStartedAt = null; durable.leaseExpiresAt = null; durable.leaseVersion += 1
+        return { rows: [{ id: "turn-1", sessionId: "session-1", leaseVersion: durable.leaseVersion }], rowCount: 1 }
+      }
+      if (sql.includes('SET "leaseExpiresAt" = LEAST')) {
+        if (crashWindow) return { rows: [], rowCount: 0 }
+        const renewedAt = new Date(String(values?.[5]))
+        return { rows: [{ id: "turn-1", sessionId: "session-1", userId: "user-1", leaseOwnerId: durable.ownerId, leaseVersion: durable.leaseVersion, leaseStartedAt: durable.leaseStartedAt, leaseExpiresAt: new Date(renewedAt.getTime() + Number(values?.[4])) }], rowCount: 1 }
+      }
+      if (sql.includes(`SET "status" = 'in_progress'`)) {
+        if (durable.status !== "queued") return { rows: [], rowCount: 0 }
+        const started = new Date(String(values?.[3])); durable.status = "in_progress"; durable.ownerId = String(values?.[2]); durable.leaseStartedAt = started; durable.leaseExpiresAt = new Date(started.getTime() + Number(values?.[4])); durable.leaseVersion += 1
+        return { rows: [{ id: "turn-1", sessionId: "session-1", userId: "user-1", leaseOwnerId: durable.ownerId, leaseVersion: durable.leaseVersion, leaseStartedAt: durable.leaseStartedAt, leaseExpiresAt: durable.leaseExpiresAt }], rowCount: 1 }
+      }
+      if (sql.includes('SET "status" = $5') && sql.includes('"leaseOwnerId" = NULL')) {
+        durable.status = String(values?.[4]) as typeof durable.status; durable.ownerId = null; durable.leaseExpiresAt = null; return { rows: [], rowCount: 1 }
+      }
+      if (sql.includes('SET "leaseOwnerId" = NULL')) {
+        durable.ownerId = null; durable.leaseExpiresAt = new Date(String(values?.[4])); return { rows: [], rowCount: 1 }
+      }
+      if (sql.includes('FROM "agent_turns"') && sql.includes('"input"')) {
+        const ownerMatches = values?.[3] === durable.ownerId && Number(values?.[4]) === durable.leaseVersion
+        return ownerMatches && durable.status === "in_progress" ? { rows: [{ id: "turn-1", sessionId: "session-1", userId: "user-1", status: durable.status, leaseOwnerId: durable.ownerId, leaseVersion: durable.leaseVersion, leaseExpiresAt: durable.leaseExpiresAt, input: { goal: "Find jobs" }, rootTaskId: "root-1", contextSnapshotId: null, modelProfileSnapshot: { provider: "fixture", model: "fixture" }, toolPolicySnapshot: {}, budgetSnapshot: { limits: { maxSteps: 4 } } }], rowCount: 1 } : { rows: [], rowCount: 0 }
+      }
+      if (sql.includes('MAX("ordinal")')) return { rows: [{ maxOrdinal: Math.max(...durable.steps.map(step => step.ordinal), -1) }], rowCount: 1 }
+      if (sql.includes('FROM "agent_steps"')) return { rows: durable.steps, rowCount: durable.steps.length }
+      if (sql.includes('FROM "agent_events"')) return { rows: durable.events, rowCount: durable.events.length }
+      if (sql.includes('FROM "agent_items"')) return { rows: items, rowCount: items.length }
+      if (sql.includes('FROM "agent_context_snapshots"') || sql.includes('FROM "agent_inputs"')) return { rows: [], rowCount: 0 }
+      return { rows: [], rowCount: 1 }
+    }),
+    release: vi.fn(),
+  }
+  const pool = { connect: vi.fn(async () => client) } as unknown as pg.Pool
+  const append = async (input: Parameters<NonNullable<TurnEngineStore["appendEvent"]>>[0]) => {
+    const existing = durable.events.find(event => event.idempotencyKey === input.idempotencyKey)
+    if (existing) return { id: existing.id }
+    const event: DurableEvent = { id: input.id, type: input.type, payload: input.payload, idempotencyKey: input.idempotencyKey, taskId: input.owner.taskId, itemId: input.itemId, correlationId: input.correlationId, causationId: input.causationId }
+    durable.events.push(event)
+    if (input.type === PLAN_COMPLETION_FEEDBACK_EVENT_TYPE && !crashWindow) {
+      crashWindow = true
+      await new Promise(resolve => setTimeout(resolve, 10))
+      resolveFeedbackAppend()
+    }
+    return { id: event.id }
+  }
+  const store: TurnEngineStore = {
+    startStep: async input => {
+      const step = durable.steps.find(item => item.id === input.stepId)
+      if (step) return { id: step.id, ordinal: step.ordinal }
+      durable.steps.push({ id: input.stepId, ordinal: input.ordinal, attempt: input.attempt, inputThroughSequence: input.inputThroughSequence, consumedInputIds: [...input.consumedInputIds], inputTokens: 0, outputTokens: 0, estimatedCostUsd: 0 })
+      return { id: input.stepId, ordinal: input.ordinal }
+    },
+    updateStep: async input => {
+      const step = durable.steps.find(item => item.id === input.stepId)
+      if (step) { step.inputTokens = input.inputTokens; step.outputTokens = input.outputTokens; step.estimatedCostUsd = input.estimatedCostUsd }
+    },
+    createItem: async input => ({ id: input.itemId, revision: 0 }),
+    updateItem: async input => ({ id: input.itemId, revision: input.expectedRevision + 1 }),
+    appendEvent: append,
+    appendEvents: async inputs => Promise.all(inputs.map(append)),
+    recordFinalResponse: async () => undefined,
+  }
+  const contextBuilderFactory = () => ({ build: async (input: { snapshot: CanonicalTurnState["snapshot"]; sessionId: string; turnId: string; stepId: string }): Promise<StepContext> => ({
+    schemaVersion: "agent-harness.v2", sessionId: input.sessionId, turnId: input.turnId, stepId: input.stepId, inputThroughSequence: 0n, consumedInputIds: [],
+    blocks: input.snapshot.toolObservations.map(item => ({ id: item.id, layer: "tool_observation", role: "data", trust: "external_untrusted", source: "tool_or_subagent", content: item.content as never })), canonicalJson: JSON.stringify(input.snapshot.toolObservations),
+  }) })
+  const createRuntime = () => createCanonicalTurnRuntime(pool, {
+    workerId: "worker-1", planningEnabled: true, planningExecutionEnabled: true, planCompletionRecoveryLimit: 1,
+    stateLoader: async (currentPool, currentLease) => { const loaded = await loadCanonicalTurnState(currentPool, currentLease); loadedStates.push(loaded); return loaded },
+    rootTaskStore: rootStore() as never, toolRuntimeFactory: () => tools() as never, turnEngineStoreFactory: () => store, contextBuilderFactory,
+    modelRuntimeFactory: async () => {
+      const phase = executionCount++
+      const adapter: ModelAdapter = { ...model(() => []), profile: { ...model(() => []).profile, continuationCursor: true }, async *stream(request) { requests.push(request); yield { type: "text_delta", text: phase === 0 ? "draft" : "resume" }; if (phase === 0) yield { type: "continuation", continuation: { cursor: "stale-provider-cursor" } }; yield { type: "completed", finishReason: "stop" } } }
+      return { adapter, registry: {} as never, candidates: [] }
+    },
+    authorizeUsage: async () => ({ settle: async () => undefined }),
+  })
+  const payload = { turnId: "turn-1", sessionId: "session-1", ownerId: "worker-1" }
+  return { durable, pool, createRuntime, feedbackAppendSettled, loadedStates, requests, payload, recoverAt: new Date("2026-09-07T00:02:00.000Z") }
 }
 
 async function rootToolNames(coordinationEnabled: boolean, planningEnabled = false, capabilities = ["read"]): Promise<string[]> {
@@ -444,5 +558,35 @@ describe("createCanonicalTurnRuntime", () => {
     expect(JSON.stringify(events)).not.toContain("sk-secretvalue123")
     expect(pg.pool.query).toHaveBeenCalledWith(expect.stringContaining('FROM "Job"'), expect.any(Array))
     expect(pg.calls.some(sql => sql === "BEGIN")).toBe(true)
+  })
+
+  it("resumes durable plan feedback across lease recovery without reusing provider state", async () => {
+    const fixture = durableRestartFixture()
+    const firstRuntime = await fixture.createRuntime()
+    const first = await runTurnJob(
+      { data: fixture.payload, attemptsMade: 0 },
+      { pool: fixture.pool, execute: firstRuntime.execute, heartbeatMs: 1, now: () => new Date("2026-09-07T00:00:00.000Z") },
+    )
+    expect(first).toEqual({ status: "requeued", reasonCode: "lease_lost" })
+    await fixture.feedbackAppendSettled
+    expect(fixture.durable.events.filter(event => event.type === PLAN_COMPLETION_FEEDBACK_EVENT_TYPE)).toHaveLength(1)
+
+    const reclaimed = await reclaimExpiredTurns(fixture.pool, fixture.recoverAt, 50)
+    expect(reclaimed).toEqual([{ turnId: "turn-1", sessionId: "session-1", previousLeaseVersion: 1 }])
+
+    const secondRuntime = await fixture.createRuntime()
+    const second = await runTurnJob(
+      { data: { ...fixture.payload, ownerId: "worker-2" }, attemptsMade: 1 },
+      { pool: fixture.pool, execute: secondRuntime.execute, heartbeatMs: 999_999, now: () => fixture.recoverAt },
+    )
+    expect(second).toEqual({ status: "failed", summary: "final_unverified" })
+    expect(fixture.loadedStates).toHaveLength(2)
+    expect(planCompletionRecoveryCount(fixture.loadedStates[1]!.snapshot.toolObservations, "turn-1", "plan-1")).toBe(1)
+    expect(fixture.loadedStates[1]!.resume).toMatchObject({ nextOrdinal: 1, stepCount: 1, toolCallCount: 1 })
+    expect(fixture.requests).toHaveLength(2)
+    expect(fixture.requests[1]?.continuation).toBeUndefined()
+    expect(JSON.stringify(fixture.requests[1]?.messages)).toContain("plan_completion_feedback")
+    expect(JSON.stringify(fixture.requests[1]?.messages)).toContain("plan-1")
+    expect(fixture.durable.events.filter(event => event.type === PLAN_COMPLETION_FEEDBACK_EVENT_TYPE)).toHaveLength(1)
   })
 })
