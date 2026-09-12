@@ -6,6 +6,7 @@ import { executionOwnerFence } from "../execution-owner.js"
 import { PLAN_PROPOSAL_SCHEMA_VERSION, type GoalContract, type GoalContractRef, type PlanActionKind, type PlanProposal } from "./goal-plan-contract.js"
 import { fingerprintPlanProposal } from "./plan-fingerprint.js"
 import { createCanonicalPlanExecutionFactory, type CanonicalPlanExecutionOptions } from "./canonical-plan-execution.js"
+import { ROLE_RESULT_SCHEMA } from "../subagents/role-results.js"
 import type { PlanCommandReceipt } from "./plan-command-receipt.js"
 import { createPlanRevisionRecoveryDispatcher, PlanRevisionRecoveryError, type PlanRevisionRecoveryDispatcher } from "./plan-revision-receipt.js"
 
@@ -34,6 +35,22 @@ function proposal(nodes: PlanProposal["nodes"]): PlanProposal {
 
 function output(value: PlanProposal, overrides: Record<string, unknown> = {}): Record<string, unknown> {
   return { status: "accepted", goalRevision: 1, planRevision: 1, basedOnPlanRevision: null, proposal: value, intents: [], proposalHash: fingerprintPlanProposal(value), ...overrides }
+}
+
+function validScoutStructuredResult() {
+  return {
+    schemaVersion: ROLE_RESULT_SCHEMA, role: "scout" as const, status: "completed" as const,
+    candidates: [{ jobId: "job-1", source: "greenhouse", url: "https://example.test/jobs/job-1", evidenceIds: ["evidence-job-1"] }],
+    evidence: [{ id: "evidence-job-1", kind: "job" as const, ref: "job-1", source: "greenhouse" }], summary: "One matching job",
+  }
+}
+
+function validAnalystStructuredResult() {
+  return {
+    schemaVersion: ROLE_RESULT_SCHEMA, role: "analyst" as const, status: "completed" as const,
+    findings: [{ jobId: "job-1", score: 8, evidenceIds: ["evidence-job-1"] }],
+    evidence: [{ id: "evidence-job-1", kind: "job" as const, ref: "job-1", source: "greenhouse" }], summary: "Strong match",
+  }
 }
 
 type FixtureOverrides = {
@@ -200,6 +217,21 @@ describe("createCanonicalPlanExecutionFactory", () => {
     expect(timedOut.wait).toBeUndefined()
     expect(router.execute).toHaveBeenCalledTimes(2)
 
+    for (const structuredResult of [validScoutStructuredResult(), validAnalystStructuredResult()]) {
+      const structuredWaitOutcome = {
+        ...waitOutcome,
+        content: {
+          ...waitOutcome.content,
+          output: {
+            ...waitOutcome.content.output,
+            tasks: [{ ...waitOutcome.content.output.tasks[0], result: { structuredResult } }],
+          },
+        },
+      }
+      const structured = await hook(input(proposalValue, "step-1", [delegateObservation, joinObservation, structuredWaitOutcome], true))
+      expect(structured.wait).toBeUndefined()
+    }
+
     const invalidWaitOutcomes = [
       { ...waitOutcome, content: { ...waitOutcome.content, output: { ...waitOutcome.content.output, tasks: undefined } } },
       { ...waitOutcome, content: { ...waitOutcome.content, output: { ...waitOutcome.content.output, tasks: [{ ...waitOutcome.content.output.tasks[0] }, { ...waitOutcome.content.output.tasks[0] }] } } },
@@ -210,6 +242,13 @@ describe("createCanonicalPlanExecutionFactory", () => {
       { ...waitOutcome, content: { ...waitOutcome.content, output: { ...waitOutcome.content.output, targetTaskIds: ["child-1", "child-1"] } } },
       { ...waitOutcome, content: { ...waitOutcome.content, output: { ...waitOutcome.content.output, matchedTaskIds: ["foreign-task"] } } },
       { ...waitOutcome, content: { ...waitOutcome.content, output: { ...waitOutcome.content.output, tasks: [{ taskId: "child-1", userId: "forged" }] } } },
+      { ...waitOutcome, content: { ...waitOutcome.content, output: { ...waitOutcome.content.output, tasks: [{ ...waitOutcome.content.output.tasks[0], result: { structuredResult: "malformed" } }] } } },
+      { ...waitOutcome, content: { ...waitOutcome.content, output: { ...waitOutcome.content.output, tasks: [{ ...waitOutcome.content.output.tasks[0], result: { structuredResult: { ...validScoutStructuredResult(), userId: "forged" } } }] } } },
+      { ...waitOutcome, content: { ...waitOutcome.content, output: { ...waitOutcome.content.output, tasks: [{ ...waitOutcome.content.output.tasks[0], result: { structuredResult: { ...validScoutStructuredResult(), candidates: [{ ...validScoutStructuredResult().candidates[0], evidenceIds: [] }] } } }] } } },
+      { ...waitOutcome, content: { ...waitOutcome.content, output: { ...waitOutcome.content.output, tasks: [{ ...waitOutcome.content.output.tasks[0], result: { structuredResult: { ...validScoutStructuredResult(), role: "analyst" } } }] } } },
+      { ...waitOutcome, content: { ...waitOutcome.content, output: { ...waitOutcome.content.output, tasks: [{ ...waitOutcome.content.output.tasks[0], result: { structuredResult: { ...validAnalystStructuredResult(), findings: [{ ...validAnalystStructuredResult().findings[0], score: 11 }] } } }] } } },
+      { ...waitOutcome, content: { ...waitOutcome.content, output: { ...waitOutcome.content.output, tasks: [{ ...waitOutcome.content.output.tasks[0], status: "waiting", result: { structuredResult: validScoutStructuredResult() } }] } } },
+      { ...waitOutcome, content: { ...waitOutcome.content, output: { ...waitOutcome.content.output, tasks: [{ ...waitOutcome.content.output.tasks[0], result: { structuredResult: { ...validScoutStructuredResult(), summary: "x".repeat(9_000) } } }] } } },
     ]
     for (const invalid of invalidWaitOutcomes) {
       const rejected = await hook(input(output(proposalValue), "step-1", [delegateObservation, joinObservation, invalid], true))

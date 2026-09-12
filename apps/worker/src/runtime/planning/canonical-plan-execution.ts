@@ -14,6 +14,7 @@ import type { ToolCallRequest, ToolExecutionResult, ToolRouterContext } from "..
 import type { TurnEnginePlanExecutionHook, TurnEnginePlanExecutionHookResult } from "../turns/turn-engine-types.js"
 import type { StepContextSnapshot } from "../context/step-context-builder.js"
 import { visibleToolPolicy } from "../subagents/role-policy.js"
+import { validateRoleResult } from "../subagents/role-results.js"
 import { assertMigratedRole, roleContract } from "../subagents/scout-analyst-contracts.js"
 
 const MAX_OBSERVATIONS = 8
@@ -279,6 +280,19 @@ function boundedJson(value: unknown): boolean {
   }
 }
 
+function validStructuredReplayResult(task: Record<string, unknown>): boolean {
+  const result = row(task.result)
+  if (!result || !Object.prototype.hasOwnProperty.call(result, "structuredResult")) return true
+  if (task.status !== "completed") return false
+  try {
+    const structuredResult = validateRoleResult(result.structuredResult)
+    const encoded = JSON.stringify(structuredResult)
+    return encoded !== undefined && Buffer.byteLength(encoded, "utf8") <= MAX_RESULT_BYTES
+  } catch {
+    return false
+  }
+}
+
 function uniqueIds(value: unknown, allowEmpty = false): value is readonly string[] {
   return Array.isArray(value) && (allowEmpty || value.length > 0) && value.length <= 8 && value.every(item => typeof item === "string" && Boolean(item.trim()) && item.length <= 256) && new Set(value).size === value.length
 }
@@ -294,7 +308,7 @@ function validReplayWaitTasks(value: unknown, taskIds: readonly string[]): boole
     const task = row(candidate)
     if (!task || Object.keys(task).length !== 4 || !keysOnly(task, ["taskId", "status", "result", "failureReason"]) || hasForeignIdentity(task, WAIT_ALLOWED_IDENTITY_KEYS)) return false
     if (typeof task.taskId !== "string" || !task.taskId.trim() || task.taskId.length > 256 || !taskIds.includes(task.taskId) || seen.has(task.taskId)) return false
-    if (typeof task.status !== "string" || !task.status.trim() || task.status.length > 256 || !Object.prototype.hasOwnProperty.call(task, "result") || !plainJson(task.result) || !boundedJson(task.result) || hasForeignIdentity(task.result)) return false
+    if (typeof task.status !== "string" || !task.status.trim() || task.status.length > 256 || !Object.prototype.hasOwnProperty.call(task, "result") || !plainJson(task.result) || !boundedJson(task.result) || hasForeignIdentity(task.result) || !validStructuredReplayResult(task)) return false
     if (task.failureReason !== null && (typeof task.failureReason !== "string" || Buffer.byteLength(task.failureReason, "utf8") > MAX_RESULT_BYTES)) return false
     seen.add(task.taskId)
   }
