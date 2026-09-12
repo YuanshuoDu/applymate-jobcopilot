@@ -13,12 +13,13 @@ function observations(count: number): StepContextSnapshot {
   return { ...base, toolObservations: Array.from({ length: count }, (_, index) => ({ id: `tool-${index}`, content: { text: "x".repeat(500) } })) }
 }
 
-function store(overrides: Partial<ContextSnapshotAdapterStore> = {}): ContextSnapshotAdapterStore & { saved: Array<{ snapshotRef: string; snapshot: StepContextSnapshot }>; loadedInput?: unknown } {
-  const saved: Array<{ snapshotRef: string; snapshot: StepContextSnapshot }> = []
+function store(overrides: Partial<ContextSnapshotAdapterStore> = {}): ContextSnapshotAdapterStore & { saved: Array<{ snapshotRef: string; scope: typeof scope; sessionId: string; turnId: string; stepId: string; idempotencyKey: string; snapshot: StepContextSnapshot }>; loadedInput?: unknown } {
+  const saved: Array<{ snapshotRef: string; scope: typeof scope; sessionId: string; turnId: string; stepId: string; idempotencyKey: string; snapshot: StepContextSnapshot }> = []
   return {
     saved,
-    save: async input => { saved.push({ snapshotRef: input.snapshotRef, snapshot: input.snapshot }); return { snapshotRef: input.snapshotRef, scope: input.scope, sessionId: input.sessionId, turnId: input.turnId } },
+    save: async input => { saved.push(input); return { snapshotRef: input.snapshotRef, scope: input.scope, sessionId: input.sessionId, turnId: input.turnId } },
     load: async input => { return { snapshot: base, scope: input.scope, sessionId: input.sessionId, turnId: input.turnId } },
+    loadByIdempotencyKey: async input => saved.find(item => item.scope.userId === input.scope.userId && item.sessionId === input.sessionId && item.turnId === input.turnId && item.stepId === input.stepId && item.idempotencyKey === input.idempotencyKey) ?? null,
     ...overrides,
   }
 }
@@ -56,6 +57,24 @@ describe("StepContextSnapshot adapter", () => {
     const rebuilt = createContextSnapshotAdapter({ store: backing, observationCountThreshold: 3, keepRecentObservations: 1, summarizer })
     const third = await rebuilt.hook(input)
     expect(third).toMatchObject({ status: "compacted", snapshotRef: first.status === "compacted" ? first.snapshotRef : "" })
+    expect(summarizer).toHaveBeenCalledTimes(1)
+    expect(backing.saved).toHaveLength(1)
+  })
+
+  it("keeps the runtime snapshot ceiling at 256 KiB", async () => {
+    expect(() => createContextSnapshotAdapter({ store: store(), observationCountThreshold: 2, keepRecentObservations: 1, maxSnapshotBytes: 256 * 1024 + 1 })).toThrow("bound")
+    const oversized = { ...base, toolObservations: Array.from({ length: 600 }, (_, index) => ({ id: `large-${index}`, content: { text: "x".repeat(600) } })) }
+    const adapter = createContextSnapshotAdapter({ store: store(), inputTokenThreshold: 1, observationCountThreshold: Number.MAX_SAFE_INTEGER, keepRecentObservations: 1 })
+    await expect(adapter.hook(request(oversized))).rejects.toThrow("exceeds its bound")
+  })
+
+  it("fails closed on a corrupt persisted idempotency hit instead of compacting again", async () => {
+    const summarizer = vi.fn(() => ({ removed: "should not run" }))
+    const backing = store({ loadByIdempotencyKey: async input => ({ snapshotRef: "corrupt", scope: input.scope, sessionId: input.sessionId, turnId: input.turnId, stepId: input.stepId, idempotencyKey: input.idempotencyKey, snapshot: observations(3) }) })
+    const adapter = createContextSnapshotAdapter({ store: backing, observationCountThreshold: 3, keepRecentObservations: 1, summarizer })
+    await expect(adapter.hook(request(observations(3)))).rejects.toThrow("idempotent snapshot")
+    expect(summarizer).not.toHaveBeenCalled()
+    expect(backing.saved).toHaveLength(0)
   })
 
   it("fails closed when summarizer or store fails", async () => {
