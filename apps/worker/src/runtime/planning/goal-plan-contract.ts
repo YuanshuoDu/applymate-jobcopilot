@@ -22,7 +22,7 @@ export type GoalContractRef = {
   readonly update: (next: GoalContract) => void
 }
 
-export const PLAN_ACTION_KINDS = ["use_tool", "delegate", "request_input", "propose_completion"] as const
+export const PLAN_ACTION_KINDS = ["use_tool", "delegate", "join", "request_input", "propose_completion"] as const
 export type PlanActionKind = typeof PLAN_ACTION_KINDS[number]
 
 export function copyAllowedPlanActions(value: readonly PlanActionKind[] | undefined): readonly PlanActionKind[] {
@@ -58,6 +58,8 @@ export type PlanNode = {
   readonly constraints?: readonly string[]
   readonly question?: string
   readonly approvalBoundary?: string
+  readonly joinMode?: "any" | "all"
+  readonly timeoutMs?: number
 }
 
 export type PlanProposal = {

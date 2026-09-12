@@ -2,13 +2,13 @@ import { describe, expect, it, vi } from "vitest"
 
 import { PLAN_PROPOSAL_SCHEMA_VERSION, type PlanProposal } from "./goal-plan-contract.js"
 import { dispatchPlanProposal, type PlanDispatchRuntime, type PlanDispatchResult } from "./plan-intent-dispatcher.js"
-import { executePlanCommands, type PlanCommandExecutionRuntime } from "./plan-command-executor.js"
+import { executePlanCommands, type CommandContextRequest, type PlanCommandExecutionRuntime } from "./plan-command-executor.js"
 import type { PlanValidationContext } from "./goal-plan-validator.js"
 import type { ToolCallRequest, ToolExecutionResult, ToolRouterContext } from "../tools/types.js"
 
 const validation: PlanValidationContext = {
   goalRevision: 1, planRevision: null, maxNodes: 8,
-  allowedActions: ["use_tool", "delegate", "request_input", "propose_completion"],
+  allowedActions: ["use_tool", "delegate", "join", "request_input", "propose_completion"],
   allowedTools: ["jobs.search"], allowedTemplates: [], allowedRoles: ["scout"],
 }
 const base = { inputRefs: [], dependsOn: [], successCriteria: ["done"], outputSchemaRef: null }
@@ -28,7 +28,7 @@ function dispatch(nodes: PlanProposal["nodes"]): PlanDispatchResult {
   }
   return dispatchPlanProposal(proposal(nodes), validation, runtime)
 }
-function context(request: { localId: string; kind: "tool_call" | "delegate" }): ToolRouterContext {
+function context(request: CommandContextRequest): ToolRouterContext {
   return { scope: { userId: "user-1" }, sessionId: "session-1", turnId: "turn-1", stepId: `step:${request.localId}`, actorRole: "orchestrator", capabilities: ["read"], signal: new AbortController().signal }
 }
 function runtime(router: PlanCommandExecutionRuntime["router"], createContext = context): PlanCommandExecutionRuntime {
@@ -41,7 +41,7 @@ function completed(request: ToolCallRequest): ToolExecutionResult {
 describe("executePlanCommands", () => {
   it("executes tool and delegate commands in order through the router", async () => {
     const requests: ToolCallRequest[] = []
-    const contexts: Array<{ localId: string; kind: "tool_call" | "delegate" }> = []
+    const contexts: CommandContextRequest[] = []
     const router = { execute: vi.fn(async (_context: ToolRouterContext, request: ToolCallRequest) => { requests.push(request); return completed(request) }) }
     const plan = dispatch([use("search", { inputRefs: ["goal"] }), delegate("child", { dependsOn: ["search"] })])
     const result = await executePlanCommands(plan, { router, createContext: request => { contexts.push(request); return context(request) } })
@@ -79,6 +79,43 @@ describe("executePlanCommands", () => {
       resolveInputRefs: request => ({ source: request.outputs.get("first") }),
     })).resolves.toMatchObject({ status: "completed" })
     expect(requests[1]?.input).toMatchObject({ role: "scout", context: { source: { childId: "child-1" } } })
+  })
+
+  it.each(["all", "any"] as const)("routes a %s join with server-produced delegate task IDs", async mode => {
+    const requests: ToolCallRequest[] = []
+    const router = { execute: vi.fn(async (_context: ToolRouterContext, request: ToolCallRequest) => {
+      requests.push(request)
+      if (request.toolName === "spawn_subagent") {
+        const taskId = request.id.endsWith(":first") ? "task-1" : "task-2"
+        return { ...request, status: "completed" as const, output: { taskId, rootTaskId: "root-1", parentTaskId: "root-1", status: "queued" }, errorCode: null }
+      }
+      return { ...request, status: "completed" as const, output: { waitId: "wait-1", status: "ready", taskIds: ["task-1", "task-2"], matchedTaskIds: ["task-1", "task-2"] }, errorCode: null }
+    }) }
+    const join = { ...base, localId: "join", kind: "join" as const, objective: "Join children", inputRefs: ["first", "second"], dependsOn: ["first", "second"], joinMode: mode, timeoutMs: 5_000 }
+    const plan = dispatch([delegate("first"), delegate("second"), join])
+    const result = await executePlanCommands(plan, { ...runtime(router), rootTaskId: "root-1" })
+    expect(result.status).toBe("completed")
+    expect(requests[2]?.input).toMatchObject({ taskIds: ["task-1", "task-2"], mode, timeoutMs: 5_000 })
+  })
+
+  it("fails a join before routing when delegate output is missing or duplicated", async () => {
+    for (const outputs of [[{ ok: true }, { taskId: "task-2", rootTaskId: "root-1", parentTaskId: "root-1" }], [{ taskId: "task-1", rootTaskId: "root-1", parentTaskId: "root-1" }, { taskId: "task-1", rootTaskId: "root-1", parentTaskId: "root-1" }], [{ taskId: "task-1" }, { taskId: "task-2", rootTaskId: "root-1", parentTaskId: "root-1" }]]) {
+      const router = { execute: vi.fn(async (_context: ToolRouterContext, request: ToolCallRequest) => ({ ...request, status: "completed" as const, output: request.id.endsWith(":first") ? outputs[0] : outputs[1], errorCode: null })) }
+      const join = { ...base, localId: "join", kind: "join" as const, objective: "Join children", inputRefs: ["first", "second"], dependsOn: ["first", "second"], joinMode: "all" as const, timeoutMs: 5_000 }
+      const plan = dispatch([delegate("first"), delegate("second"), join])
+      await expect(executePlanCommands(plan, { ...runtime(router), rootTaskId: "root-1" })).rejects.toMatchObject({ code: "input_reference_unavailable" })
+      expect(router.execute).toHaveBeenCalledTimes(2)
+    }
+  })
+
+  it("rejects a join command with prefilled task IDs before routing", async () => {
+    const router = { execute: vi.fn(async (_context: ToolRouterContext, request: ToolCallRequest) => ({ ...request, status: "completed" as const, output: { taskId: "task-1", rootTaskId: "root-1", parentTaskId: "root-1" }, errorCode: null })) }
+    const plan = dispatch([delegate("child"), { ...({ ...base, localId: "join", kind: "join" as const, objective: "Join child", inputRefs: ["child"], dependsOn: ["child"], joinMode: "all" as const, timeoutMs: 5_000 }) }])
+    const join = plan.commands.find(command => command.kind === "join")
+    if (!join || join.kind !== "join") throw new Error("join command missing")
+    const forged: PlanDispatchResult = { ...plan, commands: plan.commands.map(command => command.kind === "join" && command.localId === join.localId ? { ...command, call: { ...command.call, input: { ...command.call.input, taskIds: ["forged-task"] } } } : command) }
+    await expect(executePlanCommands(forged, { ...runtime(router), rootTaskId: "root-1" })).rejects.toMatchObject({ code: "invalid_plan" })
+    expect(router.execute).not.toHaveBeenCalled()
   })
 
   it("fails before the router when a referenced output cannot be resolved", async () => {

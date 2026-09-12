@@ -7,7 +7,7 @@ import { copyAllowedPlanActions, PLAN_MAX_NODES, PLAN_MAX_REVISIONS, isPlainJson
 import { PlanDispatchError, dispatchPlanProposal, type PlanDispatchCommand } from "./plan-intent-dispatcher.js"
 import { copyPlanFingerprints, fingerprintPlanProposal, isPlanFingerprint } from "./plan-fingerprint.js"
 import { PlanValidationError, validatePlanProposal } from "./goal-plan-validator.js"
-import { PlanCommandExecutionError, executePlanCommands, type PlanCommandExecutionRecord, type PlanCommandExecutionRuntime, type PlanControlRecord, type PlanInputReferenceResolutionRequest } from "./plan-command-executor.js"
+import { PlanCommandExecutionError, executePlanCommands, type PlanCommandExecutionRecord, type PlanCommandExecutionRuntime, type PlanControlRecord, type PlanInputReferenceResolutionRequest, type PlanJoinCommand } from "./plan-command-executor.js"
 import { createPlanCommandReceipt, type PlanCommandReceipt } from "./plan-command-receipt.js"
 import { PlanRevisionRecoveryError, recoverPlanRevision, type PlanRevisionRecoveryDispatcher } from "./plan-revision-receipt.js"
 import type { ToolCallRequest, ToolExecutionResult, ToolRouterContext } from "../tools/types.js"
@@ -177,8 +177,9 @@ function waitFrom(recordValue: PlanCommandExecutionRecord): TurnEnginePlanExecut
   return undefined
 }
 
-function boundedRecords(result: { readonly completed: readonly PlanCommandExecutionRecord[]; readonly failure?: PlanCommandExecutionRecord }): readonly PlanCommandExecutionRecord[] {
-  const records = result.failure ? [...result.completed, result.failure] : [...result.completed]
+function boundedRecords(result: { readonly completed: readonly PlanCommandExecutionRecord[]; readonly failure?: PlanCommandExecutionRecord; readonly waiting?: PlanCommandExecutionRecord }): readonly PlanCommandExecutionRecord[] {
+  const waiting: PlanCommandExecutionRecord[] = result.waiting ? [result.waiting] : []
+  const records = result.failure ? [...result.completed, result.failure] : [...result.completed, ...waiting]
   return records.length <= MAX_OBSERVATIONS ? records : [...records.slice(0, MAX_OBSERVATIONS - 1), records[records.length - 1]!]
 }
 
@@ -218,6 +219,64 @@ function replayReceipt(snapshot: StepContextSnapshot, callId: string, command: P
   return { observationId, status: content.status, ...(Object.prototype.hasOwnProperty.call(content, "output") ? { output: content.output } : {}), errorCode: content.errorCode }
 }
 
+const JOIN_ALLOWED_IDENTITY_KEYS = new Set(["taskId", "rootTaskId", "parentTaskId"])
+const WAIT_ALLOWED_IDENTITY_KEYS = new Set(["taskId"])
+
+function hasForeignIdentity(value: unknown, allowed = new Set<string>(), seen = new Set<object>()): boolean {
+  if (!value || typeof value !== "object" || seen.has(value)) return false
+  if (Array.isArray(value)) { seen.add(value); const found = value.some(item => hasForeignIdentity(item, allowed, seen)); seen.delete(value); return found }
+  if (!isPlainJsonObject(value)) return false
+  if (Object.keys(value).some(key => FORBIDDEN_INPUT_KEYS.has(key) && !allowed.has(key))) return true
+  seen.add(value); const found = Object.values(value).some(item => hasForeignIdentity(item, allowed, seen)); seen.delete(value); return found
+}
+
+function boundedJson(value: unknown): boolean {
+  try {
+    const encoded = JSON.stringify(value)
+    return encoded !== undefined && Buffer.byteLength(encoded, "utf8") <= MAX_RESULT_BYTES
+  } catch {
+    return false
+  }
+}
+
+function uniqueIds(value: unknown, allowEmpty = false): value is readonly string[] {
+  return Array.isArray(value) && (allowEmpty || value.length > 0) && value.length <= 8 && value.every(item => typeof item === "string" && Boolean(item.trim()) && item.length <= 256) && new Set(value).size === value.length
+}
+
+function sameIds(left: readonly string[], right: readonly string[]): boolean {
+  return left.length === right.length && [...left].sort().every((id, index) => id === [...right].sort()[index])
+}
+
+function replayJoinTaskIds(options: CanonicalPlanExecutionOptions, command: PlanJoinCommand, receipts: ReadonlyMap<string, ReplayCommandReceipt>): readonly string[] {
+  const taskIds: string[] = []
+  for (const ref of command.inputRefs) {
+    const receipt = receipts.get(ref)
+    const output = receipt?.status === "completed" ? row(receipt.output) : null
+    if (!output || !plainJson(output) || !boundedJson(output) || hasForeignIdentity(output, JOIN_ALLOWED_IDENTITY_KEYS) || typeof output.taskId !== "string" || !output.taskId.trim()) throw new CanonicalPlanError("invalid_plan_output")
+    if (options.rootTaskId && (typeof output.rootTaskId !== "string" || !output.rootTaskId.trim() || output.rootTaskId.length > 256 || output.rootTaskId !== options.rootTaskId || typeof output.parentTaskId !== "string" || !output.parentTaskId.trim() || output.parentTaskId.length > 256 || output.parentTaskId !== options.rootTaskId)) throw new CanonicalPlanError("invalid_plan_output")
+    if (taskIds.includes(output.taskId)) throw new CanonicalPlanError("invalid_plan_output")
+    taskIds.push(output.taskId)
+  }
+  if (taskIds.length === 0 || taskIds.length > 8) throw new CanonicalPlanError("invalid_plan_output")
+  return taskIds
+}
+
+function replayWaitOutcome(input: Parameters<TurnEnginePlanExecutionHook>[0], options: CanonicalPlanExecutionOptions, command: PlanJoinCommand, receipts: ReadonlyMap<string, ReplayCommandReceipt>, waitId: string): Record<string, unknown> | undefined {
+  const matches = input.snapshot.toolObservations.filter(observation => observation.id === `wait-result:${waitId}`)
+  if (matches.length > 1) throw new CanonicalPlanError("invalid_plan_output")
+  const observation = matches[0]
+  if (!observation) return undefined
+  const content = row(observation.content)
+  if (!waitId.trim() || waitId.length > 256 || !content || !keysOnly(content, ["toolCallId", "toolName", "input", "status", "output", "errorCode"]) || content.toolCallId !== `wait:${waitId}` || content.toolName !== "wait_subagents" || content.status !== "completed" || content.errorCode !== null) throw new CanonicalPlanError("invalid_plan_output")
+  const waitInput = row(content.input)
+  const output = row(content.output)
+  if (!waitInput || !keysOnly(waitInput, ["taskIds", "mode"]) || hasForeignIdentity(waitInput) || !output || !plainJson(output) || !boundedJson(output) || hasForeignIdentity(output, WAIT_ALLOWED_IDENTITY_KEYS)) throw new CanonicalPlanError("invalid_plan_output")
+  const taskIds = replayJoinTaskIds(options, command, receipts)
+  if (!uniqueIds(waitInput.taskIds) || !sameIds(waitInput.taskIds, taskIds) || waitInput.mode !== command.call.input.mode || !uniqueIds(output.targetTaskIds) || !sameIds(output.targetTaskIds, taskIds) || !uniqueIds(output.matchedTaskIds, output.status === "timed_out") || output.matchedTaskIds.some(id => !taskIds.includes(id))) throw new CanonicalPlanError("invalid_plan_output")
+  if (output.waitId !== waitId || (output.status !== "ready" && output.status !== "timed_out")) throw new CanonicalPlanError("invalid_plan_output")
+  return output
+}
+
 function replayRuntime(
   options: CanonicalPlanExecutionOptions,
   input: Parameters<TurnEnginePlanExecutionHook>[0],
@@ -228,6 +287,10 @@ function replayRuntime(
   for (const command of dispatched.commands) {
     const receipt = replayReceipt(input.snapshot, input.call.id, command)
     if (receipt) receipts.set(command.localId, receipt)
+  }
+  for (const command of dispatched.commands) {
+    const receipt = receipts.get(command.localId)
+    if (command.kind === "join" && receipt?.status === "completed" && row(receipt.output)?.status === "waiting") replayJoinTaskIds(options, command, receipts)
   }
   const observations: Array<{ readonly id: string; readonly content: Record<string, unknown> }> = []
   const observe = async (recordValue: PlanCommandExecutionRecord | PlanControlRecord): Promise<void> => {
@@ -243,10 +306,15 @@ function replayRuntime(
           const command = dispatched.commands.find(item => "call" in item && item.call.id === request.id)
           const receipt = command ? receipts.get(command.localId) : undefined
           if (!receipt) return options.router.execute(context, request)
+          if (command?.kind === "join" && receipt.status === "completed" && row(receipt.output)?.status === "waiting" && typeof row(receipt.output)?.waitId === "string") {
+            const resumed = replayWaitOutcome(input, options, command, receipts, String(row(receipt.output)?.waitId))
+            if (resumed) return { ...request, status: "completed" as const, output: resumed, errorCode: null }
+          }
           return { ...request, status: receipt.status, ...(Object.prototype.hasOwnProperty.call(receipt, "output") ? { output: receipt.output } : {}), errorCode: receipt.errorCode }
         },
       },
       createContext: request => ({ scope: options.scope, sessionId: options.lease.sessionId, turnId: options.lease.turnId, stepId: `${input.stepId}:plan:${request.localId}`, taskId: options.taskId, rootTaskId: options.rootTaskId, actorRole: options.actorRole, capabilities: [...options.capabilities], signal: input.signal }),
+      rootTaskId: options.rootTaskId,
       resolveInputRefs: request => receipts.has(request.localId) ? {} : resolveInputRefs(input.snapshot, request),
       observe,
     },
@@ -338,6 +406,7 @@ export function createCanonicalPlanExecutionFactory(options: CanonicalPlanExecut
         createToolCallId: localId => id("plan-call", input.call.id, localId),
         createIdempotencyKey: localId => id("plan-idempotency", input.call.id, localId),
         deferInputRefs: true,
+        resolveWaitVersion: () => version(options.registry, options.capabilities, "wait_subagents"),
         resolveDelegateActions: () => actions(options.registry, options.capabilities, allowedTools),
       })
       if (!replayed) {
@@ -348,6 +417,7 @@ export function createCanonicalPlanExecutionFactory(options: CanonicalPlanExecut
       const commandRuntime: PlanCommandExecutionRuntime = replay?.runtime ?? {
         router: options.router,
         createContext: request => ({ scope: options.scope, sessionId: options.lease.sessionId, turnId: options.lease.turnId, stepId: `${input.stepId}:plan:${request.localId}`, taskId: options.taskId, rootTaskId: options.rootTaskId, actorRole: options.actorRole, capabilities: [...options.capabilities], signal: input.signal }),
+        rootTaskId: options.rootTaskId,
         resolveInputRefs: request => resolveInputRefs(input.snapshot, request),
         ...(options.persistOutcome ? { observe: async recordValue => options.persistOutcome!(outcomeReceipt(input.call.id, output.planRevision, recordValue)) } : {}),
       }

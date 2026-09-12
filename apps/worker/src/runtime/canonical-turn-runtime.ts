@@ -206,7 +206,7 @@ export async function createCanonicalTurnRuntime(pool: pg.Pool, options: Canonic
     } : undefined
     const planningGoal = state.goalContract ?? hydrateGoalContract({ goal: state.goal }).goalContract
     const currentGoal = { value: planningGoal }; const goalRef: GoalContractRef = { get: () => currentGoal.value, update: next => { currentGoal.value = next } }
-    const allowedPlanActions = options.coordinationEnabled === true ? PLAN_ACTION_KINDS : PLAN_ACTION_KINDS.filter(action => action !== "delegate")
+    const allowedPlanActions = options.coordinationEnabled === true ? PLAN_ACTION_KINDS : PLAN_ACTION_KINDS.filter(action => action !== "delegate" && action !== "join")
     const recoveryDispatcher = options.planningEnabled ? createPlanRevisionRecoveryDispatcher() : undefined
     const planning = options.planningEnabled ? {
       goal: planningGoal, goalRef, allowedTools: ["jobs.search", "jobs.get", "persona.retrieve", "resume.get_base", "application.get_state", "tool_results.read"],

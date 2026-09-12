@@ -24,6 +24,10 @@ function delegate(localId: string, overrides: Record<string, unknown> = {}) {
   return { ...baseNode, localId, kind: "delegate" as const, objective: `Delegate ${localId}`, role: "scout", taskType: "research", ...overrides }
 }
 
+function join(localId = "join", overrides: Record<string, unknown> = {}) {
+  return { ...baseNode, localId, kind: "join" as const, objective: "Join children", inputRefs: ["child"], dependsOn: ["child"], joinMode: "all" as const, timeoutMs: 5_000, ...overrides }
+}
+
 function proposal(nodes: PlanProposal["nodes"]): PlanProposal {
   return { schemaVersion: PLAN_PROPOSAL_SCHEMA_VERSION, basedOnGoalRevision: 1, basedOnPlanRevision: null, nodes, completionCriteria: ["finish"], briefRationale: "bounded" }
 }
@@ -37,7 +41,7 @@ function fixture(router: { execute(context: ToolRouterContext, request: ToolCall
     goal, allowedTools: ["jobs.search"], allowedTemplates: [], allowedRoles: ["scout"], maxNodes: 8,
     capabilities: ["read", "canPlan"], actorRole: "orchestrator", scope: { userId: "user-1" }, lease,
     rootTaskId: "root-1", taskId: "root-1", initialPlanRevision, router,
-    registry: { list: () => [{ name: "jobs.search", version: "1", risk: "read", capabilities: ["read"] }] },
+    registry: { list: () => [{ name: "jobs.search", version: "1", risk: "read", capabilities: ["read"] }, { name: "wait_subagents", version: "1", risk: "internal_write", capabilities: ["coordination"] }] },
     policy: {} as PolicyEngine, ...(persistOutcome ? { persistOutcome } : {}), ...(maxPlanRevisions === undefined ? {} : { maxPlanRevisions }), ...(initialPlanHashes ? { initialPlanHashes } : {}), ...(goalRef ? { goalRef } : {}), ...(allowedPlanActions === undefined ? {} : { allowedPlanActions }), ...(recoveryDispatcher ? { recoveryDispatcher } : {}),
   }
   return createCanonicalPlanExecutionFactory(options)
@@ -90,6 +94,59 @@ describe("createCanonicalPlanExecutionFactory", () => {
     const result = await hook(input(output(proposal([use("read"), use("review", { inputRefs: ["read"] })]))))
     expect(result.observations).toHaveLength(2)
     expect(requests[1]?.input).toEqual({ jobId: "job-1" })
+  })
+
+  it.each(["waiting", "ready", "timed_out"] as const)("handles a join wait result with status %s", async status => {
+    const requests: ToolCallRequest[] = []
+    const router = { execute: vi.fn(async (_context: ToolRouterContext, request: ToolCallRequest) => {
+      requests.push(request)
+      if (request.toolName === "spawn_subagent") return { ...request, status: "completed" as const, output: { taskId: "child-1", rootTaskId: "root-1", parentTaskId: "root-1", status: "queued" }, errorCode: null }
+      return { ...request, status: "completed" as const, output: { waitId: "wait-1", status, taskIds: ["child-1"], matchedTaskIds: status === "waiting" ? [] : ["child-1"] }, errorCode: null }
+    }) }
+    const hook = fixture(router, undefined, undefined, undefined, undefined, undefined, ["delegate", "join"])
+    const result = await hook(input(output(proposal([delegate("child"), join()]))))
+    expect(requests).toHaveLength(2)
+    if (status === "waiting") expect(result.wait).toMatchObject({ status: "waiting_for_dependency", waitId: "wait-1" })
+    else expect(result.wait).toBeUndefined()
+  })
+
+  it("replays a waiting join without rerouting and resumes only from a strict consumed outcome", async () => {
+    const proposalValue = proposal([delegate("child"), join(), use("after", { dependsOn: ["join"] })])
+    const delegateObservation = { id: "plan-result:proposal-1:child", content: { kind: "plan_command", localId: "child", commandKind: "delegate", dependsOn: [], status: "completed", errorCode: null, output: { taskId: "child-1", rootTaskId: "root-1", parentTaskId: "root-1", status: "queued" } } }
+    const joinObservation = { id: "plan-result:proposal-1:join", content: { kind: "plan_command", localId: "join", commandKind: "join", dependsOn: ["child"], status: "completed", errorCode: null, output: { waitId: "wait-1", status: "waiting", taskIds: ["child-1"], matchedTaskIds: [] } } }
+    const waitOutcome = { id: "wait-result:wait-1", content: { toolCallId: "wait:wait-1", toolName: "wait_subagents", input: { taskIds: ["child-1"], mode: "all" }, status: "completed", output: { waitId: "wait-1", status: "ready", targetTaskIds: ["child-1"], matchedTaskIds: ["child-1"], tasks: [] }, errorCode: null } }
+    const router = { execute: vi.fn(async (_context: ToolRouterContext, request: ToolCallRequest) => ({ ...request, status: "completed" as const, output: { ok: true }, errorCode: null })) }
+    const hook = fixture(router, undefined, undefined, undefined, undefined, undefined, ["use_tool", "delegate", "join"])
+    const waiting = await hook(input(output(proposalValue), "step-1", [delegateObservation, joinObservation], true))
+    expect(waiting.wait).toMatchObject({ status: "waiting_for_dependency", waitId: "wait-1" })
+    expect(router.execute).not.toHaveBeenCalled()
+
+    const resumed = await hook(input(output(proposalValue), "step-1", [delegateObservation, joinObservation, waitOutcome], true))
+    expect(resumed.wait).toBeUndefined()
+    expect(router.execute).toHaveBeenCalledTimes(1)
+    expect(router.execute.mock.calls[0]?.[1].toolName).toBe("jobs.search")
+
+    const timedOutOutcome = { ...waitOutcome, content: { ...waitOutcome.content, output: { ...waitOutcome.content.output, status: "timed_out", matchedTaskIds: [] } } }
+    const timedOut = await hook(input(output(proposalValue), "step-1", [delegateObservation, joinObservation, timedOutOutcome], true))
+    expect(timedOut.wait).toBeUndefined()
+    expect(router.execute).toHaveBeenCalledTimes(2)
+
+    const invalidWaitOutcomes = [
+      { ...waitOutcome, content: { ...waitOutcome.content, input: { taskIds: ["child-1", "child-1"], mode: "all" } } },
+      { ...waitOutcome, content: { ...waitOutcome.content, output: { ...waitOutcome.content.output, targetTaskIds: ["child-1", "child-1"] } } },
+      { ...waitOutcome, content: { ...waitOutcome.content, output: { ...waitOutcome.content.output, matchedTaskIds: ["foreign-task"] } } },
+      { ...waitOutcome, content: { ...waitOutcome.content, output: { ...waitOutcome.content.output, tasks: [{ taskId: "child-1", userId: "forged" }] } } },
+    ]
+    for (const invalid of invalidWaitOutcomes) {
+      const rejected = await hook(input(output(proposalValue), "step-1", [delegateObservation, joinObservation, invalid], true))
+      expect(observationCode(rejected)).toBe("invalid_plan_output")
+    }
+    for (const lineage of [{ taskId: "child-1", rootTaskId: "root-1" }, { taskId: "child-1", parentTaskId: "root-1" }]) {
+      const missingLineage = { ...delegateObservation, content: { ...delegateObservation.content, output: lineage } }
+      const rejected = await hook(input(output(proposalValue), "step-1", [missingLineage, joinObservation, waitOutcome], true))
+      expect(observationCode(rejected)).toBe("invalid_plan_output")
+    }
+    expect(router.execute).toHaveBeenCalledTimes(2)
   })
 
   it("revalidates accepted output against the server action capability gate", async () => {

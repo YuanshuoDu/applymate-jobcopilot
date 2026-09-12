@@ -20,10 +20,10 @@ export class PlanValidationError extends Error {
   }
 }
 
-const NODE_KEYS = ["localId", "kind", "objective", "inputRefs", "dependsOn", "successCriteria", "outputSchemaRef", "budgetRequest", "toolName", "tool", "template", "role", "taskType", "constraints", "question", "approvalBoundary"]
+const NODE_KEYS = ["localId", "kind", "objective", "inputRefs", "dependsOn", "successCriteria", "outputSchemaRef", "budgetRequest", "toolName", "tool", "template", "role", "taskType", "constraints", "question", "approvalBoundary", "joinMode", "timeoutMs"]
 const TOP_KEYS = ["schemaVersion", "basedOnGoalRevision", "basedOnPlanRevision", "nodes", "completionCriteria", "briefRationale"]
 const IDENTITY_KEYS = new Set(["userId", "sessionId", "turnId", "stepId", "taskId", "parentTaskId", "rootTaskId", "ownerId", "lease", "leaseOwnerId", "leaseVersion", "idempotencyKey", "capabilities", "permissions", "allowedCapabilities", "budgetLimit", "maxBudget"])
-const KINDS: readonly PlanActionKind[] = ["use_tool", "delegate", "request_input", "propose_completion"]
+const KINDS: readonly PlanActionKind[] = ["use_tool", "delegate", "join", "request_input", "propose_completion"]
 
 function row(value: unknown): Record<string, unknown> | null {
   return isPlainJsonObject(value) ? value : null
@@ -91,6 +91,9 @@ function parseNode(value: unknown, index: number, issues: PlanValidationIssue[])
   const successCriteria = list(parsed.successCriteria, `${path}.successCriteria`, issues, 16, 1_000)
   const outputSchemaRef = parsed.outputSchemaRef === undefined || parsed.outputSchemaRef === null ? null : stringValue(parsed.outputSchemaRef, `${path}.outputSchemaRef`, issues, 256)
   const budgetRequest = budget(parsed.budgetRequest, `${path}.budgetRequest`, issues)
+  const joinModeValue = parsed.joinMode === undefined && kind === "join" ? "all" : parsed.joinMode
+  const joinMode = joinModeValue === undefined ? undefined : stringValue(joinModeValue, `${path}.joinMode`, issues, 8, false)
+  const timeoutMs = parsed.timeoutMs
   const node: PlanNode = {
     localId: localId ?? "", kind: (KINDS.includes(kind as PlanActionKind) ? kind : "propose_completion") as PlanActionKind, objective: objective ?? "", inputRefs, dependsOn, successCriteria, outputSchemaRef,
     ...(budgetRequest === undefined ? {} : { budgetRequest }),
@@ -102,6 +105,8 @@ function parseNode(value: unknown, index: number, issues: PlanValidationIssue[])
     ...(parsed.constraints === undefined ? {} : { constraints: list(parsed.constraints, `${path}.constraints`, issues, 16, 1_000) }),
     ...(parsed.question === undefined ? {} : { question: stringValue(parsed.question, `${path}.question`, issues, 4_000) ?? "" }),
     ...(parsed.approvalBoundary === undefined ? {} : { approvalBoundary: stringValue(parsed.approvalBoundary, `${path}.approvalBoundary`, issues, 1_000) ?? "" }),
+    ...(joinMode === undefined ? {} : { joinMode: joinMode as "any" | "all" }),
+    ...(timeoutMs === undefined ? {} : { timeoutMs: timeoutMs as number }),
   }
   if (!KINDS.includes(kind as PlanActionKind)) add(issues, `${path}.kind`, "unknown_action", "Unsupported plan action kind")
   if (node.kind === "use_tool" && !node.toolName && !node.tool) add(issues, path, "tool_required", "use_tool requires toolName or tool")
@@ -111,6 +116,14 @@ function parseNode(value: unknown, index: number, issues: PlanValidationIssue[])
     if (!node.taskType) add(issues, `${path}.taskType`, "task_type_required", "delegate requires taskType")
   }
   if (node.kind === "request_input" && !node.question) add(issues, `${path}.question`, "question_required", "request_input requires question")
+  if (node.kind === "join") {
+    if (node.inputRefs.length === 0) add(issues, `${path}.inputRefs`, "join_targets_required", "join requires at least one delegate reference")
+    if (node.joinMode !== "any" && node.joinMode !== "all") add(issues, `${path}.joinMode`, "invalid_join_mode", "joinMode must be any or all")
+    if (typeof timeoutMs !== "number" || !Number.isSafeInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > 30_000) add(issues, `${path}.timeoutMs`, "invalid_join_timeout", "timeoutMs must be an integer from 1 to 30000")
+  } else {
+    if (parsed.joinMode !== undefined) add(issues, `${path}.joinMode`, "join_field_forbidden", "joinMode is only valid for join nodes")
+    if (parsed.timeoutMs !== undefined) add(issues, `${path}.timeoutMs`, "join_field_forbidden", "timeoutMs is only valid for join nodes")
+  }
   return node
 }
 
@@ -140,6 +153,13 @@ function graphIssues(nodes: readonly PlanNode[], issues: PlanValidationIssue[]):
   for (const [index, node] of nodes.entries()) for (const dependency of node.dependsOn) {
     if (!ids.has(dependency)) add(issues, `nodes.${index}.dependsOn`, "missing_dependency", `Unknown dependency ${dependency}`)
     if (dependency === node.localId) add(issues, `nodes.${index}.dependsOn`, "self_dependency", "A node cannot depend on itself")
+  }
+  const byId = new Map(nodes.map(node => [node.localId, node]))
+  for (const [index, node] of nodes.entries()) if (node.kind === "join") for (const ref of node.inputRefs) {
+    const target = byId.get(ref)
+    if (!target) add(issues, `nodes.${index}.inputRefs`, "join_target_missing", `Unknown join target ${ref}`)
+    else if (target.kind !== "delegate") add(issues, `nodes.${index}.inputRefs`, "join_target_not_delegate", `Join target ${ref} must be a delegate`)
+    if (!node.dependsOn.includes(ref)) add(issues, `nodes.${index}.dependsOn`, "join_dependency_required", `Join must depend on ${ref}`)
   }
   const state = new Map<string, number>()
   const visit = (node: PlanNode): void => {

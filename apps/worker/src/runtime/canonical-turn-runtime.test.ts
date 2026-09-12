@@ -274,7 +274,7 @@ describe("createCanonicalTurnRuntime", () => {
     expect(disabledFactory).toHaveBeenCalledTimes(1)
 
     const enabledFactory = vi.fn((input: { allowedPlanActions?: readonly string[] }) => {
-      expect(input.allowedPlanActions).toEqual(["use_tool", "delegate", "request_input", "propose_completion"])
+      expect(input.allowedPlanActions).toEqual(["use_tool", "delegate", "join", "request_input", "propose_completion"])
       return async () => ({ observations: [] })
     })
     const enabled = setup({ coordinationEnabled: true, planningEnabled: true, planningExecutionEnabled: true, planExecutionFactory: enabledFactory })

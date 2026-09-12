@@ -11,7 +11,7 @@ function proposal(overrides: Partial<PlanProposal> = {}): PlanProposal {
   return { schemaVersion: PLAN_PROPOSAL_SCHEMA_VERSION, basedOnGoalRevision: 2, basedOnPlanRevision: null, nodes: [node()], completionCriteria: ["results reviewed"], briefRationale: "A bounded read", ...overrides }
 }
 
-const context = { goalRevision: 2, planRevision: null, allowedActions: ["use_tool", "delegate", "request_input", "propose_completion"] as const, allowedTools: ["jobs.search"], allowedTemplates: ["jobs.read"] }
+const context = { goalRevision: 2, planRevision: null, allowedActions: ["use_tool", "delegate", "join", "request_input", "propose_completion"] as const, allowedTools: ["jobs.search"], allowedTemplates: ["jobs.read"] }
 
 describe("goal plan validator", () => {
   it("accepts a bounded proposal with a matching revision CAS", () => {
@@ -71,5 +71,20 @@ describe("goal plan validator", () => {
     const codes = findPlanValidationIssues(invalid, context).map(issue => issue.code)
     expect(codes).toEqual(expect.arrayContaining(["question_required"]))
     expect(codes).not.toContain("role_required")
+  })
+
+  it("accepts an all join with delegate targets and defaults joinMode", () => {
+    const first = node({ localId: "first", kind: "delegate", role: "analyst", taskType: "research", toolName: undefined })
+    const second = node({ localId: "second", kind: "delegate", role: "analyst", taskType: "review", toolName: undefined })
+    const joined = node({ localId: "joined", kind: "join", inputRefs: ["first", "second"], dependsOn: ["first", "second"], timeoutMs: 3_000 })
+    expect(validatePlanProposal(proposal({ nodes: [first, second, joined] }), context).nodes[2]).toMatchObject({ kind: "join", joinMode: "all", timeoutMs: 3_000 })
+  })
+
+  it("rejects joins with invalid targets, mode, timeout, and a disabled coordination gate", () => {
+    const invalid = node({ localId: "joined", kind: "join", inputRefs: ["read", "missing"], dependsOn: ["read"], joinMode: "sometimes" as "any", timeoutMs: 30_001 })
+    const codes = findPlanValidationIssues(proposal({ nodes: [node(), invalid] }), context).map(issue => issue.code)
+    expect(codes).toEqual(expect.arrayContaining(["join_target_not_delegate", "join_target_missing", "join_dependency_required", "invalid_join_mode", "invalid_join_timeout"]))
+    const disabled = findPlanValidationIssues(proposal({ nodes: [invalid] }), { ...context, allowedActions: ["use_tool"] }).map(issue => issue.code)
+    expect(disabled).toContain("action_not_allowed")
   })
 })

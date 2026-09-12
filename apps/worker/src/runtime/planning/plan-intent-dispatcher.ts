@@ -24,6 +24,7 @@ export type PlanDispatchRuntime = {
   readonly resolveInputRefs?: (request: PlanInputReferenceRequest) => unknown
   /** Keep references as runtime-owned inputs until each command is executed. */
   readonly deferInputRefs?: boolean
+  readonly resolveWaitVersion?: () => string | undefined
   readonly resolveDelegateActions?: (role: string) => readonly string[] | undefined
 }
 
@@ -41,6 +42,7 @@ type CommandBase = {
 export type PlanDispatchCommand =
   | (CommandBase & { readonly kind: "tool_call"; readonly call: { readonly id: string; readonly toolName: string; readonly toolVersion: string; readonly input: Record<string, unknown> } })
   | (CommandBase & { readonly kind: "delegate"; readonly call: { readonly id: string; readonly toolName: "spawn_subagent"; readonly toolVersion: "1"; readonly input: { readonly idempotencyKey: string; readonly role: string; readonly taskType: string; readonly goal: string; readonly constraints: readonly string[]; readonly successCriteria: readonly string[]; readonly allowedActions: readonly string[]; readonly context?: Record<string, unknown> } } })
+  | (CommandBase & { readonly kind: "join"; readonly call: { readonly id: string; readonly toolName: "wait_subagents"; readonly toolVersion: "1"; readonly input: { readonly idempotencyKey: string; readonly taskIds: readonly string[]; readonly mode: "any" | "all"; readonly timeoutMs: number } } })
   | (CommandBase & { readonly kind: "request_input"; readonly question: string; readonly approvalBoundary?: string })
   | (CommandBase & { readonly kind: "propose_completion"; readonly completionCriteria: readonly string[] })
 
@@ -142,6 +144,12 @@ function command(node: PlanNode, runtime: PlanDispatchRuntime, planCompletionCri
     const role = node.role ?? ""
     const idempotencyKey = runtimeString(runtime.createIdempotencyKey ? () => runtime.createIdempotencyKey!(node.localId) : undefined, "invalid_plan", "Runtime delegate identity is unavailable")
     return { ...shared, kind: "delegate", call: { id: callId(runtime, node.localId), toolName: "spawn_subagent", toolVersion: "1", input: { idempotencyKey, role, taskType: node.taskType ?? "", goal: node.objective, constraints: [...(node.constraints ?? [])], successCriteria: [...node.successCriteria], allowedActions: actions(runtime, role) } } }
+  }
+  if (node.kind === "join") {
+    const waitVersion = runtime.resolveWaitVersion ? runtimeString(runtime.resolveWaitVersion, "unknown_tool", "Wait tool version is unavailable") : "1"
+    if (waitVersion !== "1") throw new PlanDispatchError("unknown_tool", "Wait tool version is unavailable")
+    const idempotencyKey = runtimeString(runtime.createIdempotencyKey ? () => runtime.createIdempotencyKey!(node.localId) : undefined, "invalid_plan", "Runtime join identity is unavailable")
+    return { ...shared, kind: "join", call: { id: callId(runtime, node.localId), toolName: "wait_subagents", toolVersion: "1", input: { idempotencyKey, taskIds: [], mode: node.joinMode ?? "all", timeoutMs: node.timeoutMs as number } } }
   }
   if (node.kind === "request_input") return { ...shared, kind: "request_input", question: node.question ?? "", ...(node.approvalBoundary ? { approvalBoundary: node.approvalBoundary } : {}) }
   return { ...shared, kind: "propose_completion", completionCriteria: [...new Set([...planCompletionCriteria, ...node.successCriteria])] }
