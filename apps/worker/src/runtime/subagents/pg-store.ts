@@ -14,14 +14,21 @@ import {
 
 type Queryable = Pick<pg.PoolClient, "query">
 
-function json(value: unknown, fallback: unknown): string {
-  try { return JSON.stringify(value ?? fallback) } catch { return JSON.stringify(fallback) }
+function containsSecret(value: unknown): boolean {
+  if (Array.isArray(value)) return value.some(containsSecret)
+  if (!value || typeof value !== "object") return false
+  return Object.entries(value).some(([key, child]) => /api.?key|secret|password|(?:access|refresh).?token|authorization/i.test(key) || containsSecret(child))
+}
+
+function json(value: unknown, fallback: unknown, field = "snapshot"): string {
+  const candidate = value ?? fallback
+  if (containsSecret(candidate)) throw new Error(`${field}_contains_secret`)
+  try { return JSON.stringify(candidate) } catch { return JSON.stringify(fallback) }
 }
 
 function date(value: Date | string | null): Date | null {
   return value ? value instanceof Date ? value : new Date(value) : null
 }
-
 function rowToTask(row: Record<string, unknown>): SubagentTaskRecord {
   return {
     id: String(row.id), userId: String(row.userId), sessionId: String(row.sessionId),
@@ -34,10 +41,9 @@ function rowToTask(row: Record<string, unknown>): SubagentTaskRecord {
     failureReason: row.failureReason ? String(row.failureReason) : null, attemptCount: Number(row.attemptCount),
     maxAttempts: Number(row.maxAttempts), leaseOwner: row.leaseOwner ? String(row.leaseOwner) : null,
     leaseExpiresAt: dateValue(row.leaseExpiresAt), interruptRequestedAt: dateValue(row.interruptRequestedAt),
-    budgetSnapshot: row.budgetSnapshot, toolPolicySnapshot: row.toolPolicySnapshot,
+    modelProfileSnapshot: row.modelProfileSnapshot, budgetSnapshot: row.budgetSnapshot, toolPolicySnapshot: row.toolPolicySnapshot,
   }
 }
-
 async function transaction<T>(pool: PgSubagentPool, work: (client: pg.PoolClient) => Promise<T>): Promise<T> {
   const client = await pool.connect()
   try {
@@ -50,7 +56,6 @@ async function transaction<T>(pool: PgSubagentPool, work: (client: pg.PoolClient
     throw error
   } finally { client.release() }
 }
-
 const SELECT_TASK = `SELECT task.*, session."userId" AS "userId"
   FROM "sub_agent_tasks" task JOIN "agent_sessions" session ON session."id" = task."sessionId"
   WHERE task."id" = $1 AND task."sessionId" = $2`
@@ -71,7 +76,7 @@ export class PgSubagentTaskStore implements SubagentStore {
       const session = await client.query(`SELECT "id" FROM "agent_sessions" WHERE "id" = $1 AND "userId" = $2 FOR UPDATE`, [input.sessionId, input.userId])
       if (!session.rows[0]) throw new Error("Session is unavailable")
       const parent = input.parentTaskId
-        ? await client.query(`SELECT "id", "rootTaskId", "path", "depth", "status", "budgetSnapshot", "toolPolicySnapshot"
+        ? await client.query(`SELECT "id", "rootTaskId", "path", "depth", "status", "allowedActions", "modelProfileSnapshot", "budgetSnapshot", "toolPolicySnapshot"
              FROM "sub_agent_tasks" WHERE "id" = $1 AND "sessionId" = $2 FOR UPDATE`, [input.parentTaskId, input.sessionId])
         : { rows: [] }
       if (input.parentTaskId && !parent.rows[0]) throw new Error("Parent task is unavailable")
@@ -88,14 +93,21 @@ export class PgSubagentTaskStore implements SubagentStore {
       const id = `subagent-${randomUUID()}`
       const rootTaskId = parentRow ? String(parentRow.rootTaskId ?? input.parentTaskId) : id
       const path = parentRow ? `${String(parentRow.path).replace(/\/$/, "")}/${id}` : `/${id}`
-      const inheritedBudget = parentRow ? asObject(parentRow.budgetSnapshot) : asObject(input.budgetSnapshot)
-      const budget = { ...inheritedBudget, subagentPolicy: input.policy }
+      // Tree step limits are shared through AgentTreeBudgetReservation; copying
+      // the parent snapshot here would create a second spendable allowance.
+      const budget = { subagentPolicy: input.policy }
       const toolPolicy = parentRow ? asObject(parentRow.toolPolicySnapshot) : asObject(input.toolPolicySnapshot)
+      const inheritedModel = parentRow?.modelProfileSnapshot
+      const modelProfile = parentRow ? (inheritedModel ?? input.modelProfileSnapshot ?? {}) : (input.modelProfileSnapshot ?? {})
+      const parentActions = parentRow ? actionList(parentRow.allowedActions) : []
+      const requestedActions = actionList(input.allowedActions)
+      if (parentRow && requestedActions.some(action => !parentActions.includes(action))) throw new Error("Child allowed actions exceed parent policy")
+      const allowedActions = parentRow && requestedActions.length === 0 ? parentActions : requestedActions
       const result = await client.query(`${INSERT_TASK} RETURNING "id"`, [
         id, input.sessionId, input.turnId ?? null, rootTaskId, input.parentTaskId ?? null, path, depth,
         input.role, input.taskType, input.goal, json(input.constraints, []), json(input.successCriteria, []),
-        json(input.allowedActions, []), json(input.context, {}), json(input.expectedOutputSchema, {}),
-        json(input.modelProfileSnapshot, {}), json(toolPolicy, {}), json(budget, {}), input.policy.maxAttempts,
+        json(allowedActions, []), json(input.context, {}), json(input.expectedOutputSchema, {}),
+        json(modelProfile, {}, "model_profile"), json(toolPolicy, {}, "tool_policy"), json(budget, {}, "budget"), input.policy.maxAttempts,
       ])
       return this.read(client, result.rows[0].id, input.sessionId)
     })
@@ -106,35 +118,46 @@ export class PgSubagentTaskStore implements SubagentStore {
       const session = await client.query(`SELECT "id" FROM "agent_sessions" WHERE "id" = $1 FOR UPDATE`, [input.sessionId])
       if (!session.rows[0]) return null
       const running = await client.query(`SELECT COUNT(*)::int AS "count" FROM "sub_agent_tasks"
-        WHERE "sessionId" = $1 AND "status" = 'running' AND "leaseExpiresAt" > $2`, [input.sessionId, input.now])
+        WHERE "sessionId" = $1 AND "status" = 'running' AND "leaseExpiresAt" > CURRENT_TIMESTAMP`, [input.sessionId])
       if (Number(running.rows[0]?.count ?? 0) >= input.policy.maxConcurrency) return null
       const updated = await client.query(`UPDATE "sub_agent_tasks"
-        SET "status" = 'running', "leaseOwner" = $3, "leaseExpiresAt" = $4 + ($5 * INTERVAL '1 millisecond'),
-            "attemptCount" = "attemptCount" + 1, "startedAt" = COALESCE("startedAt", $4), "updatedAt" = $4
+        SET "status" = 'running', "leaseOwner" = $3, "leaseExpiresAt" = CURRENT_TIMESTAMP + ($4 * INTERVAL '1 millisecond'),
+            "attemptCount" = "attemptCount" + 1, "startedAt" = COALESCE("startedAt", CURRENT_TIMESTAMP), "updatedAt" = CURRENT_TIMESTAMP
         WHERE "id" = $1 AND "sessionId" = $2 AND "status" = 'queued' AND "interruptRequestedAt" IS NULL
-          AND "attemptCount" < "maxAttempts" AND ("leaseOwner" IS NULL OR "leaseExpiresAt" <= $4)`,
-      [input.taskId, input.sessionId, input.ownerId, input.now, this.leaseMs])
+          AND "attemptCount" < "maxAttempts" AND ("leaseOwner" IS NULL OR "leaseExpiresAt" <= CURRENT_TIMESTAMP)
+          AND EXISTS (SELECT 1 FROM "sub_agent_tasks" AS root JOIN "agent_turns" AS turn ON turn."id" = root."turnId"
+            WHERE root."id" = "sub_agent_tasks"."rootTaskId" AND root."sessionId" = "sub_agent_tasks"."sessionId"
+              AND root."status" NOT IN ('completed', 'failed', 'interrupted', 'cancelled', 'closed')
+              AND turn."id" = "sub_agent_tasks"."turnId" AND turn."sessionId" = "sub_agent_tasks"."sessionId"
+              AND turn."status" NOT IN ('completed', 'failed', 'interrupted', 'cancelled'))`,
+      [input.taskId, input.sessionId, input.ownerId, this.leaseMs])
       if (updated.rowCount !== 1) return null
       return this.read(client, input.taskId, input.sessionId)
     })
   }
 
-  async heartbeat(input: { taskId: string; sessionId: string; ownerId: string; now: Date }): Promise<"renewed" | "interrupted" | "lost"> {
+  async heartbeat(input: { taskId: string; sessionId: string; ownerId: string; attemptCount: number; now: Date }): Promise<"renewed" | "interrupted" | "lost"> {
     const client = await this.pool.connect()
     try {
       const result = await client.query(`UPDATE "sub_agent_tasks"
-        SET "leaseExpiresAt" = LEAST($4 + ($5 * INTERVAL '1 millisecond'),
-          COALESCE("startedAt", $4) + (300000 * INTERVAL '1 millisecond')), "updatedAt" = $4
-        WHERE "id" = $1 AND "sessionId" = $2 AND "leaseOwner" = $3 AND "status" = 'running'
-          AND "leaseExpiresAt" > $4 RETURNING "interruptRequestedAt"`, [input.taskId, input.sessionId, input.ownerId, input.now, this.leaseMs])
+        SET "leaseExpiresAt" = LEAST(CURRENT_TIMESTAMP + ($4 * INTERVAL '1 millisecond'),
+          COALESCE("startedAt", CURRENT_TIMESTAMP) + (300000 * INTERVAL '1 millisecond')), "updatedAt" = CURRENT_TIMESTAMP
+        WHERE "id" = $1 AND "sessionId" = $2 AND "leaseOwner" = $3 AND "attemptCount" = $5 AND "status" = 'running'
+          AND "leaseExpiresAt" > CURRENT_TIMESTAMP AND EXISTS (SELECT 1 FROM "sub_agent_tasks" AS root JOIN "agent_turns" AS turn ON turn."id" = root."turnId"
+            WHERE root."id" = "sub_agent_tasks"."rootTaskId" AND root."sessionId" = "sub_agent_tasks"."sessionId"
+              AND root."status" NOT IN ('completed', 'failed', 'interrupted', 'cancelled', 'closed')
+              AND turn."id" = "sub_agent_tasks"."turnId" AND turn."sessionId" = "sub_agent_tasks"."sessionId"
+              AND turn."status" NOT IN ('completed', 'failed', 'interrupted', 'cancelled')) RETURNING "interruptRequestedAt"`, [input.taskId, input.sessionId, input.ownerId, this.leaseMs, input.attemptCount])
       if (result.rowCount === 1) return result.rows[0].interruptRequestedAt ? "interrupted" : "renewed"
       const state = await client.query(`SELECT "interruptRequestedAt" FROM "sub_agent_tasks"
-        WHERE "id" = $1 AND "sessionId" = $2 AND "leaseOwner" = $3 AND "status" = 'running'`, [input.taskId, input.sessionId, input.ownerId])
+        WHERE "id" = $1 AND "sessionId" = $2 AND "leaseOwner" = $3 AND "attemptCount" = $4 AND "status" = 'running'
+          AND EXISTS (SELECT 1 FROM "sub_agent_tasks" AS root JOIN "agent_turns" AS turn ON turn."id" = root."turnId"
+            WHERE root."id" = "sub_agent_tasks"."rootTaskId" AND turn."status" NOT IN ('completed', 'failed', 'interrupted', 'cancelled'))`, [input.taskId, input.sessionId, input.ownerId, input.attemptCount])
       return state.rows[0]?.interruptRequestedAt ? "interrupted" : "lost"
     } finally { client.release() }
   }
 
-  async finish(input: { taskId: string; sessionId: string; ownerId: string; status: SubagentExecutionResult["status"]; result?: unknown; failureReason?: string; now: Date }): Promise<"completed" | "retrying" | "failed" | "waiting" | "waiting_for_user" | "interrupted" | null> {
+  async finish(input: { taskId: string; sessionId: string; ownerId: string; attemptCount: number; status: SubagentExecutionResult["status"]; result?: unknown; failureReason?: string; now: Date }): Promise<"completed" | "retrying" | "failed" | "waiting" | "waiting_for_user" | "interrupted" | null> {
     return transaction(this.pool, async (client) => {
       const task = await client.query(`${SELECT_TASK} FOR UPDATE`, [input.taskId, input.sessionId])
       const row = task.rows[0] as Record<string, unknown> | undefined
@@ -146,12 +169,32 @@ export class PgSubagentTaskStore implements SubagentStore {
       const updated = await client.query(`UPDATE "sub_agent_tasks" SET "status" = $3, "result" = $4::jsonb,
         "failureReason" = $5, "leaseOwner" = NULL, "leaseExpiresAt" = NULL,
         "completedAt" = CASE WHEN $6 THEN $7 ELSE NULL END, "updatedAt" = $7
-        WHERE "id" = $1 AND "sessionId" = $2 AND "leaseOwner" = $8 AND "status" = 'running'`,
-      [input.taskId, input.sessionId, status, json(input.result, null), input.failureReason ?? null, terminal, input.now, input.ownerId])
+        WHERE "id" = $1 AND "sessionId" = $2 AND "leaseOwner" = $8 AND "status" = 'running'
+          AND "attemptCount" = $9 AND "leaseExpiresAt" > CURRENT_TIMESTAMP
+          AND EXISTS (SELECT 1 FROM "sub_agent_tasks" AS root JOIN "agent_turns" AS turn ON turn."id" = root."turnId"
+            WHERE root."id" = "sub_agent_tasks"."rootTaskId" AND root."sessionId" = "sub_agent_tasks"."sessionId"
+              AND root."status" NOT IN ('completed', 'failed', 'interrupted', 'cancelled', 'closed')
+              AND turn."id" = "sub_agent_tasks"."turnId" AND turn."sessionId" = "sub_agent_tasks"."sessionId"
+              AND turn."status" NOT IN ('completed', 'failed', 'interrupted', 'cancelled'))`,
+      [input.taskId, input.sessionId, status, json(input.result, null), input.failureReason ?? null, terminal, input.now, input.ownerId, input.attemptCount])
       if (updated.rowCount !== 1) return null
       if (interrupted) return "interrupted"
       if (retry) return "retrying"
       return status as "completed" | "failed" | "waiting" | "waiting_for_user"
+    })
+  }
+
+  async release(input: { taskId: string; sessionId: string; ownerId: string; attemptCount: number; now: Date }): Promise<boolean> {
+    return transaction(this.pool, async client => {
+      const updated = await client.query(`UPDATE "sub_agent_tasks"
+        SET "status" = 'queued', "leaseOwner" = NULL, "leaseExpiresAt" = NULL, "updatedAt" = $5
+        WHERE "id" = $1 AND "sessionId" = $2 AND "leaseOwner" = $3 AND "attemptCount" = $4
+          AND "interruptRequestedAt" IS NULL AND "status" = 'running'`,
+      [input.taskId, input.sessionId, input.ownerId, input.attemptCount, input.now])
+      if (updated.rowCount !== 1) return false
+      await client.query(`UPDATE "agent_outbox" SET "publishedAt" = NULL, "attemptCount" = "attemptCount" + 1, "lastError" = NULL
+        WHERE "topic" = 'agent.subagent.dispatch' AND "aggregateId" = $1`, [input.taskId])
+      return true
     })
   }
 
@@ -203,6 +246,10 @@ export class PgSubagentTaskStore implements SubagentStore {
 
 function asObject(value: unknown): Record<string, unknown> {
   return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {}
+}
+
+function actionList(value: unknown): string[] {
+  return Array.isArray(value) ? value.filter((item): item is string => typeof item === "string" && item.trim().length > 0) : []
 }
 
 function dateValue(value: unknown): Date | null {

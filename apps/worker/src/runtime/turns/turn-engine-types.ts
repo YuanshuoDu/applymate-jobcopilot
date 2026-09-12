@@ -1,10 +1,14 @@
 import type { ModelAdapter, ModelCapabilityProfile } from "@jobcopilot/agent-model"
-import type { RepositoryJsonValue, TenantScope } from "@jobcopilot/agent-protocol"
-
+import type { PolicyRole, RepositoryJsonValue, TenantScope } from "@jobcopilot/agent-protocol"
 import type { StepContext, StepContextSnapshot } from "../context/step-context-builder.js"
 import type { TurnBudgetLimits } from "../budget.js"
 import type { BusinessCheck } from "../verifier.js"
+import type { ExecutionOwnerFence, TurnExecutionOwnerFence } from "../execution-owner.js"
 import type { TurnLease } from "./lease.js"
+import type { TurnEngineCompletionGate } from "./turn-execution-types.js"
+import type { GoalContractRef } from "../planning/goal-plan-contract.js"
+import type { PlanRevisionRecoveryDispatcher } from "../planning/plan-revision-receipt.js"
+import type { ContextCompactionHook, ContextCompactionSnapshotLoader } from "../context/context-snapshot-compaction-seam.js"
 
 export type TurnEngineItemType = "agent_message" | "reasoning_summary" | "tool_call" | "tool_result" | "error"
 export type TurnEngineItemPhase = "commentary" | "final_answer" | null
@@ -12,6 +16,8 @@ export type TurnEngineItemStatus = "started" | "streaming" | "completed" | "fail
 
 export type TurnEngineStep = {
   readonly id: string
+  /** Stored order allocated while holding the Turn row lock. */
+  readonly ordinal: number
 }
 
 export type TurnEngineItem = {
@@ -25,6 +31,17 @@ export type TurnEngineEvent = {
   readonly itemId: string | null
   readonly correlationId: string
   readonly causationId: string | null
+  readonly payload: RepositoryJsonValue
+}
+
+export type TurnEngineEventInput = {
+  readonly owner: ExecutionOwnerFence
+  readonly id: string
+  readonly itemId: string | null
+  readonly type: string
+  readonly correlationId: string
+  readonly causationId: string | null
+  readonly idempotencyKey: string
   readonly payload: RepositoryJsonValue
 }
 
@@ -43,9 +60,35 @@ export type TurnEngineToolResult = {
   readonly errorCode: string | null
 }
 
+/** Server-owned result for executing an accepted plan after its proposal receipt. */
+export type TurnEnginePlanExecutionHookResult = {
+  readonly observations: readonly { readonly id: string; readonly content: unknown }[]
+  readonly wait?: {
+    readonly status: "waiting_for_dependency" | "waiting_for_approval" | "waiting_for_user"
+    readonly waitId?: string
+    readonly errorCode?: string
+  }
+}
+
+/** Server-owned seam for executing an accepted plan after its proposal receipt. */
+export type TurnEnginePlanExecutionHook = (input: {
+  readonly identity: ExecutionOwnerFence
+  readonly scope: TenantScope
+  readonly sessionId: string
+  readonly turnId: string
+  readonly stepId: string
+  readonly signal: AbortSignal
+  readonly call: TurnEngineToolCall
+  readonly result: TurnEngineToolResult
+  readonly completedToolResults: readonly TurnEngineToolResult[]
+  /** Server-owned marker: replay reconciliation must not advance the normal CAS cursor. */
+  readonly replayed: boolean
+  readonly snapshot: StepContextSnapshot
+}) => Promise<TurnEnginePlanExecutionHookResult> | TurnEnginePlanExecutionHookResult
+
 export type TurnEngineStore = {
   startStep(input: {
-    lease: TurnLease
+    owner: ExecutionOwnerFence
     stepId: string
     ordinal: number
     attempt: number
@@ -55,7 +98,7 @@ export type TurnEngineStore = {
     now: Date
   }): Promise<TurnEngineStep>
   updateStep(input: {
-    lease: TurnLease
+    owner: ExecutionOwnerFence
     stepId: string
     status: "completed" | "failed" | "interrupted" | "waiting_for_tool" | "waiting_for_approval" | "waiting_for_user"
     finishReason: string | null
@@ -65,9 +108,9 @@ export type TurnEngineStore = {
     estimatedCostUsd: number
     now: Date
   }): Promise<void>
-  waitForUser?(input: { lease: TurnLease; now: Date }): Promise<void>
+  waitForUser?(input: { owner: ExecutionOwnerFence; now: Date }): Promise<void>
   createItem(input: {
-    lease: TurnLease
+    owner: ExecutionOwnerFence
     itemId: string
     stepId: string | null
     type: TurnEngineItemType
@@ -77,7 +120,7 @@ export type TurnEngineStore = {
     now: Date
   }): Promise<TurnEngineItem>
   updateItem(input: {
-    lease: TurnLease
+    owner: ExecutionOwnerFence
     itemId: string
     expectedRevision: number
     status: TurnEngineItemStatus
@@ -87,17 +130,9 @@ export type TurnEngineStore = {
     completedAt: Date | null
     now: Date
   }): Promise<TurnEngineItem>
-  appendEvent(input: {
-    lease: TurnLease
-    id: string
-    itemId: string | null
-    type: string
-    correlationId: string
-    causationId: string | null
-    idempotencyKey: string
-    payload: RepositoryJsonValue
-  }): Promise<{ id: string }>
-  recordFinalResponse(input: { lease: TurnLease; response: string; now: Date }): Promise<void>
+  appendEvent(input: TurnEngineEventInput): Promise<{ id: string }>
+  appendEvents?(inputs: readonly TurnEngineEventInput[]): Promise<readonly { id: string }[]>
+  recordFinalResponse(input: { owner: TurnExecutionOwnerFence; response: string; now: Date }): Promise<void>
 }
 
 export type TurnEngineToolExecutor = (input: {
@@ -105,6 +140,12 @@ export type TurnEngineToolExecutor = (input: {
   sessionId: string
   turnId: string
   stepId: string
+  /** Runtime-owned current task; never accepted from model tool arguments. */
+  taskId?: string
+  /** Runtime-owned root task; never accepted from model tool arguments. */
+  rootTaskId?: string
+  /** Runtime-owned actor role used by the policy engine. */
+  actorRole?: PolicyRole
   signal: AbortSignal
   capabilities?: readonly string[]
   call: { id: string; toolName: string; toolVersion: string; input: unknown }
@@ -115,7 +156,7 @@ export type TurnEngineEventSubscriber = (event: TurnEngineEvent) => void | Promi
 export type TurnEngineOptions = {
   readonly lease: TurnLease
   readonly scope: TenantScope
-  readonly goal: string
+  readonly goal: string; readonly goalRef?: GoalContractRef
   readonly snapshot: StepContextSnapshot
   readonly contextBuilder: {
     build(request: {
@@ -134,8 +175,25 @@ export type TurnEngineOptions = {
   readonly model: ModelAdapter
   readonly tools: readonly unknown[]
   readonly executeTool: TurnEngineToolExecutor
+  /** Optional server-owned plan execution seam; omitted preserves the legacy loop. */
+  readonly executePlan?: TurnEnginePlanExecutionHook
+  /** Runtime-owned replay repair seam; normal plan proposals never call it. */
+  readonly recoveryDispatcher?: PlanRevisionRecoveryDispatcher
+  /** Server-owned barrier required only for the canonical planning execution path. */
+  readonly planCompletionRequired?: boolean
+  /** P3-27A in-memory recovery bound; durable restore is deferred to P3-27B. */
+  readonly planCompletionRecoveryLimit?: number
+  readonly completionGate?: TurnEngineCompletionGate
+  /** Optional server-owned context compaction hook; omitted preserves legacy behavior. */
+  readonly contextCompaction?: ContextCompactionHook
+  readonly contextCompactionLoadSnapshot?: ContextCompactionSnapshotLoader
   readonly rootInputId?: string
-  readonly rootTaskId?: string
+  /** Runtime-owned current task identity. Root turns use rootTaskId. */
+  readonly taskId?: string
+  /** A real durable root task is required; the Turn id is never a substitute. */
+  readonly rootTaskId: string
+  /** Runtime-owned actor role; never supplied by model output. */
+  readonly actorRole?: PolicyRole
   readonly capabilities?: readonly string[]
   readonly validateToolArguments?: (toolName: string, input: unknown) => boolean | string
   readonly signal?: AbortSignal
@@ -149,12 +207,28 @@ export type TurnEngineOptions = {
   readonly expectedEvidence?: readonly string[]
   readonly businessChecks?: readonly BusinessCheck[]
   readonly noProgressRepeatLimit?: number
+  /** Durable state recovered before starting the next fenced execution attempt. */
+  readonly resume?: TurnResumeState
+}
+
+export type TurnResumeState = {
+  readonly nextOrdinal: number
+  readonly stepCount: number
+  readonly toolCallCount: number
+  readonly inputThroughSequence: bigint
+  readonly consumedInputIds: readonly string[]
+  readonly usage: {
+    readonly inputTokens: number
+    readonly outputTokens: number
+    readonly estimatedCostUsd: number
+  }
 }
 
 export type TurnEngineResult = {
   readonly status: "completed" | "waiting_for_dependency" | "waiting_for_approval" | "waiting_for_user" | "interrupted" | "failed"
   readonly stepCount: number
   readonly toolCallCount: number
+  readonly waitId?: string
   readonly finalItemId?: string
   readonly errorCode?: string
 }

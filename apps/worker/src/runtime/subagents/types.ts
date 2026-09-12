@@ -77,6 +77,8 @@ export type SubagentTaskRecord = {
   allowedActions: unknown
   context: unknown
   expectedOutputSchema: unknown
+  /** Server-side model route metadata; credentials are rejected at persistence boundaries. */
+  modelProfileSnapshot?: unknown
   result: unknown | null
   failureReason: string | null
   attemptCount: number
@@ -104,8 +106,9 @@ export type SubagentStore = {
   create(input: SubagentTaskSpec & { policy: SubagentPolicy }): Promise<SubagentTaskRecord>
   get(taskId: string, sessionId: string): Promise<SubagentTaskRecord | null>
   claim(input: { taskId: string; sessionId: string; ownerId: string; policy: SubagentPolicy; now: Date }): Promise<SubagentTaskRecord | null>
-  heartbeat(input: { taskId: string; sessionId: string; ownerId: string; now: Date }): Promise<"renewed" | "interrupted" | "lost">
-  finish(input: { taskId: string; sessionId: string; ownerId: string; status: SubagentExecutionResult["status"]; result?: unknown; failureReason?: string; now: Date }): Promise<"completed" | "retrying" | "failed" | "waiting" | "waiting_for_user" | "interrupted" | null>
+  heartbeat(input: { taskId: string; sessionId: string; ownerId: string; attemptCount: number; now: Date }): Promise<"renewed" | "interrupted" | "lost">
+  finish(input: { taskId: string; sessionId: string; ownerId: string; attemptCount: number; status: SubagentExecutionResult["status"]; result?: unknown; failureReason?: string; now: Date }): Promise<"completed" | "retrying" | "failed" | "waiting" | "waiting_for_user" | "interrupted" | null>
+  release?(input: { taskId: string; sessionId: string; ownerId: string; attemptCount: number; now: Date }): Promise<boolean>
   close(input: { taskId: string; sessionId: string; now: Date }): Promise<boolean>
   interruptTree(input: { sessionId: string; rootTaskId: string; now: Date }): Promise<number>
   recoverExpired(input: { now: Date; limit: number }): Promise<SubagentTaskRecord[]>

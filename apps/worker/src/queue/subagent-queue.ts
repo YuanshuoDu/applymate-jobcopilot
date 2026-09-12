@@ -20,12 +20,16 @@ export type SubagentQueueLike = {
 
 export type SubagentExecutor = (input: { lease: SubagentLease }) => Promise<{ status: "completed" | "waiting" | "waiting_for_user" | "failed"; result?: unknown; failureReason?: string }>
 
-export function subagentJobId(taskId: string): string { return `agent-subagent:${taskId}` }
+/** BullMQ custom IDs reject colon characters; encode user controlled IDs. */
+export function subagentJobId(taskId: string, generation = 0): string {
+  if (!Number.isSafeInteger(generation) || generation < 0) throw new RangeError("Subagent dispatch generation must be a non-negative integer")
+  return `agent-subagent-${Buffer.from(taskId, "utf8").toString("base64url")}-${generation}`
+}
 export function subagentDispatchKey(taskId: string): string { return `subagent-dispatch:${taskId}` }
 
-export async function enqueueSubagentTask(queue: SubagentQueueLike, payload: SubagentJobPayload, attempts = 3): Promise<void> {
+export async function enqueueSubagentTask(queue: SubagentQueueLike, payload: SubagentJobPayload, attempts = 3, generation = 0): Promise<void> {
   if (!parseSubagentJobPayload(payload)) throw new TypeError("Invalid Subagent queue payload")
-  await queue.add("subagent", payload, { jobId: subagentJobId(payload.taskId), attempts })
+  await queue.add("subagent", payload, { jobId: subagentJobId(payload.taskId, generation), attempts })
 }
 
 async function transaction<T>(pool: PgSubagentPool, work: (client: pg.PoolClient) => Promise<T>): Promise<T> {
@@ -44,7 +48,7 @@ async function transaction<T>(pool: PgSubagentPool, work: (client: pg.PoolClient
 export async function persistSubagentDispatch(pool: PgSubagentPool, payload: SubagentJobPayload, resetPublished = false): Promise<void> {
   await transaction(pool, async client => {
     const conflict = resetPublished
-      ? `ON CONFLICT ("idempotencyKey") DO UPDATE SET "payload" = EXCLUDED."payload", "publishedAt" = NULL, "lastError" = NULL`
+      ? `ON CONFLICT ("idempotencyKey") DO UPDATE SET "payload" = EXCLUDED."payload", "publishedAt" = NULL, "lastError" = NULL, "attemptCount" = "agent_outbox"."attemptCount" + 1`
       : `ON CONFLICT ("idempotencyKey") DO NOTHING`
     await client.query(`INSERT INTO "agent_outbox" ("id", "topic", "aggregateId", "idempotencyKey", "payload")
       VALUES ($1, $2, $3, $4, $5::jsonb) ${conflict}`,
@@ -55,7 +59,7 @@ export async function persistSubagentDispatch(pool: PgSubagentPool, payload: Sub
 export async function dispatchPendingSubagentOutbox(pool: PgSubagentPool, queue: SubagentQueueLike, limit = SUBAGENT_MAX_BATCH): Promise<number> {
   if (!Number.isInteger(limit) || limit < 1) throw new RangeError("Subagent dispatch limit must be positive")
   const rows = await transaction(pool, async client => {
-    const result = await client.query<{ id: string; payload: unknown }>(`SELECT "id", "payload" FROM "agent_outbox"
+    const result = await client.query<{ id: string; payload: unknown; attemptCount?: number }>(`SELECT "id", "payload", "attemptCount" FROM "agent_outbox"
       WHERE "topic" = $1 AND "publishedAt" IS NULL ORDER BY "createdAt" ASC, "id" ASC FOR UPDATE SKIP LOCKED LIMIT $2`, [SUBAGENT_DISPATCH_TOPIC, limit])
     return result.rows
   })
@@ -63,22 +67,40 @@ export async function dispatchPendingSubagentOutbox(pool: PgSubagentPool, queue:
   for (const row of rows) {
     const payload = parseSubagentJobPayload(row.payload)
     if (!payload) {
-      await markDispatch(pool, row.id, "schema_invalid_payload", true)
+      await markDispatchError(pool, row.id, "schema_invalid_payload", true)
       continue
     }
-    await enqueueSubagentTask(queue, payload)
-    await markDispatch(pool, row.id, null, true)
+    try {
+      await enqueueSubagentTask(queue, payload, 3, row.attemptCount ?? 0)
+    } catch (error: unknown) {
+      await markDispatchError(pool, row.id, "queue_add_failed").catch(() => undefined)
+      throw error
+    }
+    try {
+      await markDispatchPublished(pool, row.id)
+    } catch (error: unknown) {
+      throw Object.assign(new Error("subagent_dispatch_delivery_uncertain", { cause: error }), { code: "subagent_dispatch_delivery_uncertain" })
+    }
     dispatched += 1
   }
   return dispatched
 }
 
-async function markDispatch(pool: PgSubagentPool, id: string, error: string | null, published: boolean): Promise<void> {
+async function markDispatchPublished(pool: PgSubagentPool, id: string): Promise<void> {
+  const client = await pool.connect()
+  try {
+    await client.query(`UPDATE "agent_outbox" SET "publishedAt" = CURRENT_TIMESTAMP,
+      "attemptCount" = "attemptCount" + 1, "lastError" = NULL
+      WHERE "id" = $1 AND "publishedAt" IS NULL`, [id])
+  } finally { client.release() }
+}
+
+async function markDispatchError(pool: PgSubagentPool, id: string, error: string, terminal = false): Promise<void> {
   const client = await pool.connect()
   try {
     await client.query(`UPDATE "agent_outbox" SET "attemptCount" = "attemptCount" + 1,
       "lastError" = $2, "publishedAt" = CASE WHEN $3 THEN CURRENT_TIMESTAMP ELSE "publishedAt" END
-      WHERE "id" = $1 AND "publishedAt" IS NULL`, [id, error, published])
+      WHERE "id" = $1 AND "publishedAt" IS NULL`, [id, error, terminal])
   } finally { client.release() }
 }
 

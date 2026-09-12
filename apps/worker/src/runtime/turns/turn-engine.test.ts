@@ -24,17 +24,19 @@ function profile() {
 
 function fakeStore() {
   const events: Array<{ id: string; type: string; causationId: string | null; itemId: string | null }> = []
+  const batches: string[][] = []
   const items: Array<{ id: string; type: string; phase: string | null; status: string; revision: number }> = []
   const steps: Array<{ id: string; status: string; errorCode: string | null }> = []
   const value: TurnEngineStore = {
-    startStep: async ({ stepId }) => { steps.push({ id: stepId, status: "streaming", errorCode: null }); return { id: stepId } },
+    startStep: async ({ stepId, ordinal }) => { steps.push({ id: stepId, status: "streaming", errorCode: null }); return { id: stepId, ordinal } },
     updateStep: async ({ stepId, status, errorCode }) => { const step = steps.find((entry) => entry.id === stepId)!; step.status = status; step.errorCode = errorCode },
     createItem: async ({ itemId, type, phase, status }) => { items.push({ id: itemId, type, phase, status, revision: 0 }); return { id: itemId, revision: 0 } },
     updateItem: async ({ itemId, expectedRevision, status }) => { const item = items.find((entry) => entry.id === itemId)!; expect(item.revision).toBe(expectedRevision); item.revision += 1; item.status = status; return { id: itemId, revision: item.revision } },
     appendEvent: async ({ id, type, causationId, itemId }) => { events.push({ id, type, causationId, itemId }); return { id } },
+    appendEvents: async inputs => { batches.push(inputs.map(input => input.id)); for (const input of inputs) events.push({ id: input.id, type: input.type, causationId: input.causationId, itemId: input.itemId }); return inputs.map(input => ({ id: input.id })) },
     recordFinalResponse: vi.fn(async () => undefined),
   }
-  return { value, events, items, steps }
+  return { value, events, batches, items, steps }
 }
 
 function contextBuilder(seen: StepContextSnapshot[]) {
@@ -71,7 +73,7 @@ function baseOptions(overrides: Partial<TurnEngineOptions> = {}) {
     },
   }
   const options: TurnEngineOptions = {
-    lease, scope: { userId: "user-1" }, goal: "Find jobs", snapshot: { system: [], profile: [], steerHistory: [], businessRefs: [], toolObservations: [] },
+    lease, rootTaskId: "root-1", scope: { userId: "user-1" }, goal: "Find jobs", snapshot: { system: [], profile: [], steerHistory: [], businessRefs: [], toolObservations: [] },
     contextBuilder: contextBuilder(snapshots), store: fake.value, model, tools: [{ name: "jobs.search", version: "1" }, { name: "jobs.get", version: "1" }],
     executeTool: async ({ call }) => ({ id: call.id, toolName: call.toolName, toolVersion: call.toolVersion, status: "completed" as const, output: call.toolName === "jobs.search" ? { jobs: [{ id: "job-1" }] } : { job: { id: "job-1", role: "Engineer" } }, errorCode: null }),
     now: () => now, maxSteps: 5,
@@ -154,6 +156,33 @@ describe("TurnEngine", () => {
     expect(executeTool).toHaveBeenCalledWith(expect.objectContaining({ call: expect.objectContaining({ id: "call-2" }) }))
   })
 
+  it("passes the server-owned plan hook through with the fenced turn identity", async () => {
+    let modelCall = 0
+    const executePlan = vi.fn(async (input: Parameters<NonNullable<TurnEngineOptions["executePlan"]>>[0]) => {
+      expect(input.identity).toMatchObject({ kind: "turn", taskId: "root-1", turnId: "turn-1" })
+      expect(input.scope).toEqual({ userId: "user-1" })
+      return { observations: [{ id: "plan-accepted", content: { accepted: true } }] }
+    })
+    const fixture = baseOptions({
+      model: {
+        id: "plan-model", profile: profile(), async *stream() {
+          modelCall += 1
+          if (modelCall === 1) {
+            yield { type: "tool_call_completed", callId: "plan-call", name: "agent.plan.propose", arguments: { proposal: { nodes: [] } } }
+            yield { type: "completed", finishReason: "tool_calls" }
+          } else {
+            yield { type: "text_delta", text: "Plan accepted." }
+            yield { type: "completed", finishReason: "stop" }
+          }
+        },
+      },
+      executePlan,
+    })
+    await expect(new TurnEngine(fixture.options).run()).resolves.toMatchObject({ status: "completed" })
+    expect(executePlan).toHaveBeenCalledTimes(1)
+    expect(fixture.fake.batches[0]?.[0]).toContain("turn:turn-1:event:plan-observation:plan-call:plan-accepted")
+  })
+
   it("fails closed when a replayed call id has different arguments", async () => {
     const executeTool = vi.fn()
     const fixture = baseOptions({
@@ -173,6 +202,17 @@ describe("TurnEngine", () => {
     expect(result).toMatchObject({ status: "failed", errorCode: "budget_exhausted", finalItemId: expect.any(String) })
     expect(fixture.fake.events.some((event) => event.type === "turn.budget_exhausted")).toBe(true)
     expect(fixture.fake.items.filter((item) => item.type === "agent_message" && item.phase === "final_answer")).toHaveLength(1)
+  })
+
+  it("does not invoke the model when a resumed finite model budget has no allowance", async () => {
+    const fixture = baseOptions({
+      budget: { maxInputTokens: 10 },
+      resume: { nextOrdinal: 1, stepCount: 1, toolCallCount: 0, inputThroughSequence: 1n, consumedInputIds: [], usage: { inputTokens: 10, outputTokens: 0, estimatedCostUsd: 0 } },
+      model: { id: "must-not-run", profile: profile(), async *stream() { throw new Error("provider invoked") } },
+    })
+    const result = await new TurnEngine(fixture.options).run()
+    expect(result).toMatchObject({ status: "failed", errorCode: "budget_exhausted" })
+    expect(fixture.requests).toHaveLength(0)
   })
 
   it("stops repeated no-op tool results with a reason-coded event", async () => {

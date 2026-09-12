@@ -53,7 +53,9 @@ describe('Agent workspace responsive layout', () => {
   it('keeps one execution stream and delegates session rendering to the V2 timeline client', () => {
     const retiredChatStreamModule = ['agent', 'chat', 'stream'].join('-')
     expect(source.match(/new EventSource\(/g) ?? []).toHaveLength(1)
-    expect(streamSource).toContain('streamAgentTimeline')
+    expect(source).toContain('useAgentTimeline')
+    expect(source).toContain('<AgentSupervisorPanel')
+    expect(streamSource).not.toContain('streamAgentTimeline')
     expect(streamSource).toContain('sendAgentTurnMessage')
     expect(streamSource).toContain("fetch('/api/agent/sessions'")
     expect(streamSource).not.toContain('/api/agent/chat')

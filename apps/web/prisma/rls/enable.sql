@@ -187,6 +187,10 @@ DROP POLICY IF EXISTS candidate_agent_context_snapshot_isolation ON "agent_conte
 CREATE POLICY candidate_agent_context_snapshot_isolation ON "agent_context_snapshots"
   USING (EXISTS (SELECT 1 FROM "agent_sessions" session WHERE session."id" = "sessionId" AND session."userId" = app_current_user_id()))
   WITH CHECK (EXISTS (SELECT 1 FROM "agent_sessions" session WHERE session."id" = "sessionId" AND session."userId" = app_current_user_id()));
+DROP POLICY IF EXISTS candidate_agent_context_compaction_snapshot_isolation ON "agent_context_compaction_snapshots";
+CREATE POLICY candidate_agent_context_compaction_snapshot_isolation ON "agent_context_compaction_snapshots"
+  USING ("userId" = app_current_user_id() AND EXISTS (SELECT 1 FROM "agent_sessions" session WHERE session."id" = "sessionId" AND session."userId" = app_current_user_id()))
+  WITH CHECK ("userId" = app_current_user_id() AND EXISTS (SELECT 1 FROM "agent_sessions" session WHERE session."id" = "sessionId" AND session."userId" = app_current_user_id()));
 DROP POLICY IF EXISTS candidate_custom_agent_role_isolation ON "CustomAgentRole";
 CREATE POLICY candidate_custom_agent_role_isolation ON "CustomAgentRole" USING ("userId" = app_current_user_id()) WITH CHECK ("userId" = app_current_user_id());
 DROP POLICY IF EXISTS candidate_direction_isolation ON "Direction";

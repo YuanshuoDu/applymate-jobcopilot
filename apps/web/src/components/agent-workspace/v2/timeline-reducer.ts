@@ -58,6 +58,7 @@ export interface TimelineState {
   itemIdsByTaskId: Record<string, string[]>
   processedEventIds: Record<string, true>
   lastSequence: string | null
+  lifecycleRevision: number
   connection: TimelineConnection
   snapshotRequired: boolean
 }
@@ -81,12 +82,22 @@ const KNOWN_EVENT_TYPES = new Set([
   'question.answered', 'question.cancelled', 'external_action.reserved', 'stream.overflow',
 ])
 
+// Status-only events drive supervisor metadata refreshes. Item deltas are
+// intentionally excluded so streamed text does not refetch turns and tasks.
+const LIFECYCLE_EVENT_TYPES = new Set([
+  'turn.started', 'turn.wakeup', 'turn.resumed', 'turn.completed', 'turn.failed',
+  'step.started', 'step.completed', 'item.started', 'item.completed', 'item.failed',
+  'tool_call.started', 'tool_call.completed', 'tool_call.failed',
+  'approval.requested', 'approval.resolved', 'approval.consumed', 'approval.expired',
+  'question.answered', 'question.cancelled', 'external_action.reserved',
+])
+
 export function createTimelineState(sessionId: string): TimelineState {
   return {
     sessionId, events: [], byId: new Map(), byTurnId: new Map(), byToolCallId: new Map(), lastEventId: null,
     transientItems: new Map(), fallbackItems: [],
     itemIds: [], itemsById: {}, itemIdsByTurnId: {}, itemIdsByTaskId: {},
-    processedEventIds: {}, lastSequence: null, connection: 'idle', snapshotRequired: false,
+    processedEventIds: {}, lastSequence: null, lifecycleRevision: 0, connection: 'idle', snapshotRequired: false,
   }
 }
 
@@ -166,7 +177,12 @@ function reduceEvent(state: TimelineState, value: unknown): TimelineState {
     processedEventIds,
     lastSequence: event.sequence && isAfter(event.sequence, state.lastSequence) ? event.sequence : state.lastSequence,
   }
-  next = { ...next, ...appendTimelineEvent(next.events, event), lastEventId: event.id }
+  next = {
+    ...next,
+    ...appendTimelineEvent(next.events, event),
+    lastEventId: event.id,
+    lifecycleRevision: LIFECYCLE_EVENT_TYPES.has(event.type) ? state.lifecycleRevision + 1 : state.lifecycleRevision,
+  }
   if (event.type === 'stream.overflow') return { ...next, snapshotRequired: true, connection: 'reconnecting' }
   if (event.type === 'item.delta') {
     const existingRevision = state.itemsById[event.itemId ?? '']?.revision ?? 0

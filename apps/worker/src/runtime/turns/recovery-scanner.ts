@@ -18,7 +18,7 @@ export type TurnDispatchQueue = {
   add(name: string, payload: TurnJobPayload, options?: { jobId?: string; attempts?: number }): Promise<unknown>
 }
 
-type OutboxRow = { id: string; payload: unknown }
+type OutboxRow = { id: string; payload: unknown; attemptCount?: number }
 type StartedTurnRow = { id: string; sessionId: string }
 type ReclaimedTurn = { turnId: string; sessionId: string; previousLeaseVersion: number }
 
@@ -26,8 +26,14 @@ export function turnDispatchKey(turnId: string): string {
   return `turn-dispatch:${turnId}`
 }
 
-export function turnJobId(turnId: string): string {
-  return `agent-turn:${turnId}`
+/** BullMQ custom IDs cannot contain a colon; generation separates resumed work. */
+export function turnJobId(turnId: string, generation = 0): string {
+  if (!Number.isSafeInteger(generation) || generation < 0) throw new RangeError("Turn dispatch generation must be a non-negative integer")
+  return `agent-turn-${safeJobPart(turnId)}-${generation}`
+}
+
+function safeJobPart(value: string): string {
+  return Buffer.from(value, "utf8").toString("base64url")
 }
 
 function payloadJson(payload: TurnJobPayload): string {
@@ -78,7 +84,7 @@ export async function persistTurnDispatch(
 ): Promise<void> {
   await withTransaction(pool, async (client) => {
     const conflictClause = resetPublished
-      ? `ON CONFLICT ("idempotencyKey") DO UPDATE SET "payload" = EXCLUDED."payload", "publishedAt" = NULL, "lastError" = NULL`
+      ? `ON CONFLICT ("idempotencyKey") DO UPDATE SET "payload" = EXCLUDED."payload", "publishedAt" = NULL, "lastError" = NULL, "attemptCount" = "agent_outbox"."attemptCount" + 1`
       : `ON CONFLICT ("idempotencyKey") DO NOTHING`
     await client.query(
       `INSERT INTO "agent_outbox" ("id", "topic", "aggregateId", "idempotencyKey", "payload")
@@ -122,7 +128,8 @@ async function ensureQueuedTurnDispatches(
         `INSERT INTO "agent_outbox" ("id", "topic", "aggregateId", "idempotencyKey", "payload")
          VALUES ($1, $2, $3, $4, $5::jsonb)
          ON CONFLICT ("idempotencyKey") DO UPDATE
-         SET "payload" = EXCLUDED."payload", "publishedAt" = NULL, "lastError" = NULL`,
+         SET "payload" = EXCLUDED."payload", "publishedAt" = NULL, "lastError" = NULL,
+             "attemptCount" = "agent_outbox"."attemptCount" + 1`,
         [randomUUID(), TURN_DISPATCH_TOPIC, row.id, turnDispatchKey(row.id), payloadJson(payload)],
       )
     }
@@ -135,9 +142,10 @@ export async function dispatchPendingTurnOutbox(
   queue: TurnDispatchQueue,
   limit = TURN_DISPATCH_MAX_BATCH,
 ): Promise<number> {
+  if (!Number.isInteger(limit) || limit < 1) throw new RangeError("Turn dispatch limit must be positive")
   const rows = await withTransaction(pool, async (client) => {
     const result = await client.query<OutboxRow>(
-      `SELECT "id", "payload"
+      `SELECT "id", "payload", "attemptCount"
        FROM "agent_outbox"
        WHERE "topic" = $1 AND "publishedAt" IS NULL
        ORDER BY "createdAt" ASC, "id" ASC
@@ -154,10 +162,37 @@ export async function dispatchPendingTurnOutbox(
       await markDispatchError(pool, row.id, "schema_invalid_payload", true)
       continue
     }
-    await queue.add("turn", payload, { jobId: turnJobId(payload.turnId), attempts: 5 })
+    try {
+      await queue.add("turn", payload, { jobId: turnJobId(payload.turnId, row.attemptCount ?? 0), attempts: 5 })
+    } catch (error: unknown) {
+      await markDispatchError(pool, row.id, "queue_add_failed")
+      throw error
+    }
+    try {
+      await markDispatchPublished(pool, row.id)
+    } catch (error: unknown) {
+      // The BullMQ job may already exist. Keep the row unpublished and reuse
+      // the same generation/job ID on the next scan instead of inventing a new
+      // delivery attempt for an uncertain enqueue.
+      throw new Error("turn_dispatch_delivery_uncertain", { cause: error })
+    }
     dispatched += 1
   }
   return dispatched
+}
+
+async function markDispatchPublished(pool: LeasePool, outboxId: string): Promise<void> {
+  const client = await pool.connect()
+  try {
+    await client.query(
+      `UPDATE "agent_outbox"
+       SET "publishedAt" = CURRENT_TIMESTAMP, "attemptCount" = "attemptCount" + 1, "lastError" = NULL
+       WHERE "id" = $1 AND "publishedAt" IS NULL`,
+      [outboxId],
+    )
+  } finally {
+    client.release()
+  }
 }
 
 async function markDispatchError(pool: LeasePool, outboxId: string, code: string, terminal = false): Promise<void> {

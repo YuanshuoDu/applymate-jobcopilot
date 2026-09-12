@@ -5,6 +5,8 @@ import { runTurnJob, type TurnExecutionResult } from "../runtime/turns/turn-queu
 import { TurnEngine } from "../runtime/turns/turn-engine.js"
 import { toRepositoryJson, type TurnEngineOptions } from "../runtime/turns/turn-engine-types.js"
 import type { LeasePool } from "../runtime/turns/lease.js"
+import { createPgRootTaskStore } from "../runtime/subagents/root-task-store.js"
+import { createPgDurableWaitPort } from "../runtime/subagents/durable-wait-store.js"
 import type { AgentRunTaskPayload } from "./agent-run-queue.js"
 import { pinnedFetch } from "@jobcopilot/shared"
 
@@ -94,7 +96,7 @@ export async function runCanonicalAgentTurn(
 ) {
   const payload = task.data
   if (!payload.turnId) throw new Error("Canonical agent run requires turnId")
-  const base: Omit<TurnEngineOptions, "lease" | "signal"> = {
+  const base: Omit<TurnEngineOptions, "lease" | "signal" | "rootTaskId" | "taskId"> = {
     scope: { userId: payload.userId }, goal: "Run the Agent job pipeline", snapshot: PIPELINE_SNAPSHOT,
     contextBuilder: contextBuilder(), store: createPgTurnEngineStore(pool), model: adapter(), tools: [PIPELINE_TOOL],
     maxSteps: 2, capabilities: ["read", "write", "coordination"],
@@ -106,7 +108,15 @@ export async function runCanonicalAgentTurn(
   }
   const result = await runTurnJob(
     { data: { turnId: payload.turnId, sessionId: payload.sessionId, ownerId: `agent-run:${payload.executionId ?? payload.turnId}` }, attemptsMade: task.attemptsMade },
-    { pool, execute: ({ lease, signal }): Promise<TurnExecutionResult> => new TurnEngine({ ...base, lease, signal }).run() },
+    { pool, waitHandoff: async ({ lease, waitId, now }) => {
+      await createPgDurableWaitPort(pool).suspendAndRelease({ lease, waitId, now })
+    }, execute: async ({ lease, signal }): Promise<TurnExecutionResult> => {
+      const rootTaskStore = createPgRootTaskStore(pool)
+      const root = await rootTaskStore.ensure({ lease, goal: base.goal, allowedActions: [PIPELINE_TOOL.name], now: new Date() })
+      const result = await new TurnEngine({ ...base, lease, signal, rootTaskId: root.id, taskId: root.id, completionGate: async () => rootTaskStore.checkCompletion!({ lease, rootTaskId: root.id, now: new Date() }) }).run()
+      await rootTaskStore.finish({ lease, rootTaskId: root.id, result, now: new Date() })
+      return result
+    } },
   )
   return result
 }

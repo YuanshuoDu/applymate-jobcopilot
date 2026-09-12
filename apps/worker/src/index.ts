@@ -7,6 +7,8 @@ import { bindWorkerControl, getWorkerRuntimeState, restoreWorkerRuntimeState } f
 import { closeSharedRedisConnections } from "./redis.js";
 import { workerHarnessFeatureHealth } from "./admin/harness-health.js";
 import { startAgentWakeupConsumer } from "./runtime/wakeup/consumer.js";
+import { resolveProductionAgentFlags } from "./runtime/production-agent-flags.js";
+import { createProductionContextCompactionOptions } from "./runtime/context/production-context-compaction.js";
 
 async function main() {
   const adminHost = resolveWorkerAdminHost();
@@ -18,6 +20,10 @@ async function main() {
     automationSchedulerModule,
     cloakPoolModule,
     deadLetterModule,
+    canonicalRuntimeModule,
+    aiUsageBridgeModule,
+    productionBootstrapModule,
+    productionChildRuntimeModule,
   ] = await Promise.all([
     import("./db/apply-results.js"),
     import("./queue/apply-queue.js"),
@@ -26,8 +32,12 @@ async function main() {
     import("./queue/automation-scheduler.js"),
     import("./cloak/pool.js"),
     import("./queue/dead-letter.js"),
+    import("./runtime/canonical-turn-runtime.js"),
+    import("./queue/ai-usage-bridge.js"),
+    import("./queue/production-bootstrap.js"),
+    import("./runtime/subagents/production-child-runtime.js"),
   ]);
-  const { ensureApplyResultsTable, closePool } = applyResultsModule;
+  const { ensureApplyResultsTable, closePool, getPool } = applyResultsModule;
   const { applyWorker, applyQueue, connection } = applyQueueModule;
   const { scoutWorker, scoutQueue, SCOUT_QUEUE_NAME } = scoutQueueModule;
   const { agentRunQueue, AGENT_RUN_QUEUE_NAME, closeAgentRunResources } = agentRunQueueModule;
@@ -63,6 +73,41 @@ async function main() {
     process.exit(1);
   }
 
+  const childExecutionEnabled = productionChildRuntimeModule.childExecutionEnabled();
+  const consumeWaitOutcomes = process.env.ENABLE_AGENT_WAIT_RESOLVER === "1" && childExecutionEnabled;
+  const productionFlags = resolveProductionAgentFlags();
+  const pool = getPool();
+  const contextCompactionOptions = createProductionContextCompactionOptions({
+    enabled: productionFlags.contextCompactionEnabled,
+    pool,
+  });
+  const canonicalRuntime = await canonicalRuntimeModule.createCanonicalTurnRuntime(pool, {
+    workerId: process.env.WORKER_ID ?? `worker-${process.pid}`,
+    authorizeUsage: aiUsageBridgeModule.createWorkerUsageAuthorizer(),
+    consumeWaitOutcomes,
+    coordinationEnabled: consumeWaitOutcomes,
+    planningEnabled: productionFlags.planningEnabled,
+    planningExecutionEnabled: productionFlags.planningExecutionEnabled,
+    ...contextCompactionOptions,
+  });
+  // Child execution is opt-in. Keep tree-budget and child queue construction
+  // out of the default startup path until the explicit feature flag is set.
+  const childExecutor = productionChildRuntimeModule.createOptionalProductionChildExecutor({
+    enabled: childExecutionEnabled,
+    pool,
+    ...(childExecutionEnabled && contextCompactionOptions.contextSnapshotAdapter
+      ? { contextSnapshotAdapter: contextCompactionOptions.contextSnapshotAdapter }
+      : {}),
+  });
+  const waitResolver = consumeWaitOutcomes && childExecutor ? {} : undefined;
+  const canonicalBootstrap = await productionBootstrapModule.createProductionWorkerBootstrap({
+    pool,
+    runtime: canonicalRuntime,
+    ...(childExecutor ? { subagents: { execute: childExecutor } } : {}),
+    ...(waitResolver ? { waitResolver } : {}),
+  });
+  console.log("[worker] Canonical Turn consumer and recovery scanner started");
+
   const agentWakeupConsumer = startAgentWakeupConsumer();
   console.log("[worker] Agent Turn wakeup consumer started");
 
@@ -77,6 +122,7 @@ async function main() {
   console.log(`[worker] Listening on queue 'apply-tasks' (concurrency: ${process.env.CLOAK_MAX_WORKERS ?? "1"})`);
   console.log(`[worker] Listening on queue '${SCOUT_QUEUE_NAME}' (concurrency: 1)`);
   console.log(`[worker] Listening on queue '${AGENT_RUN_QUEUE_NAME}' (concurrency: 1)`);
+  console.log("[worker] Listening on queue 'agent-turns' (concurrency: 1)");
   const automationScheduler = startAutomationScheduler();
   console.log(`[worker] Automation scheduler ${automationScheduler.status().enabled ? "started" : "disabled"}`);
 
@@ -125,6 +171,7 @@ async function main() {
     await scoutWorker.close();
     await applyWorker.close();
     await closeAgentRunResources();
+    await canonicalBootstrap.close();
     await closeDeadLetterResources();
     automationScheduler.close();
     await closeAllSlots();

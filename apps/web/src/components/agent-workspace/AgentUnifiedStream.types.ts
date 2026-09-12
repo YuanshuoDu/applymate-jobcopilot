@@ -1,6 +1,7 @@
 import type { ApplyReadyJob } from './ApplyJobCard'
 import type { ComposerJob } from './AgentComposer'
 import type { LogEntry, QuestionOption, RunSummary } from './live-run-types'
+import type { AgentTimelineSnapshot } from './v2/use-agent-timeline'
 
 export interface ComposerJobsResponse {
   jobs: ComposerJob[]
@@ -17,6 +18,7 @@ export interface AgentUnifiedStreamProps {
   autonomousMode: boolean
   resetVersion: number
   resumeSessionId?: string | null
+  timeline: AgentTimelineSnapshot
   onAnswerQuestion: (entry: LogEntry, opt: QuestionOption) => Promise<void> | void
   onAnswerOrchestrator: (questionId: string, answer: string, options?: QuestionOption[]) => Promise<void> | void
   onApplied: (jobId: string, job: ApplyReadyJob) => void
