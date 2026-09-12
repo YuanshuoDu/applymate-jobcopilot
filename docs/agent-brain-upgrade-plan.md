@@ -633,3 +633,11 @@ outside the allowed paths. Do not create a fake working implementation.
 提交 `981ec5f8` 和 `71d4813a` 完成 accepted `agent.plan.propose` 的计划执行重启/回放恢复候选。replayed proposal 使用 server-owned 标记，只消费同一 call 与 deterministic command identity 对应的已持久化合法 receipt；canonical bridge 会严格校验 `plan.command` 和 control receipt，completed output 回填本地依赖输出，缺失 command 按拓扑顺序补跑，并且只持久化本次新增 observation。所有 command 已有合法 receipt 时返回空 observations。proposal tool 与 canonical bridge 的 recovery transition 只有在全部 handler 校验通过后才原子提交；同一 revision 搭配不同 `proposalHash` 会拒绝并保持 hash state 不变。
 
 已持久化的 `failed` 或 `cancelled` command 直接复用，不重新路由；`request_input` 继续保持 waiting control barrier。缺失、损坏、goal mismatch、重复、冲突或非连续 receipt 均以 `invalid_output` fail closed；replay 不推进正常 plan revision cursor，dispatcher 只用于 replay repair。Worker focused 验证为 **4 files / 81 tests**，Worker TypeScript、shared build 和 `git diff --check` 均通过。没有 live PostgreSQL/RLS、Redis/queue、provider、process restart 或 cross-process child→parent E2E 证据，整体完整验收仍为 **1/8 (12.5%)**。
+
+## P3-20 update
+
+Commits `50732010`, `af5eb8f3` and `8d23c395` implement the server-owned `join` plan action for bounded delegate dependency joins. A join references delegate nodes through `inputRefs`, must remain in the topological `dependsOn` graph, supports `any` or `all` mode and a bounded timeout, and materializes only to the server-owned `wait_subagents@1` command with runtime-generated idempotency and task IDs. Delegate outputs are validated for lineage and bounded IDs before the wait is routed; extra runtime identity, missing or duplicate IDs, forged prefilled task IDs and malformed wait inputs fail closed.
+
+The canonical bridge handles the first `waiting` result as a durable dependency handoff, then resumes ready or timed-out joins. Recovery consumes only a strict matching `wait-result:<waitId>` observation, validates target and matched IDs, and never reroutes the prior spawn or wait. Coordination gate-off keeps both delegate and join unavailable while preserving legacy planning behavior. Astra independently verified **6 files / 87 tests**; Worker TypeScript, the shared build and `git diff --check` passed.
+
+No live PostgreSQL/RLS, Redis/queue, provider, process restart or cross-process child-parent E2E was run. Overall completion remains **1/8 (12.5%)**; P3-20 remains a candidate.
