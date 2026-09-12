@@ -671,3 +671,9 @@ Commit `8006f66c8281ec706c66477f8a34a9d656b12b` 将 P3-23 PostgreSQL context sna
 只有 enabled 路径才使用当前 Worker pool 构造 PostgreSQL store 和可复用 context snapshot adapter，并通过 `contextSnapshotAdapter` 注入 `createCanonicalTurnRuntime`。disabled 路径不创建 adapter、不解析配置，也不调用 pool。摘要继续使用 adapter 现有的 deterministic metadata 默认 summarizer，没有新增 LLM/API 调用；256 KiB snapshot 与 8 KiB summary 硬上限保持不变，真实 context、密钥和错误细节不会写入日志或事件。
 
 Root 独立复核 **5 files / 31 focused tests**；实现报告额外包含 Worker regression 后为 34/34。shared build、Worker TypeScript 和 `git diff --check` 均通过。真实 Worker 启动、PostgreSQL/RLS、migration 应用、跨进程重启和跨 Worker adapter E2E 尚未验证；功能仍是 opt-in，总体完成度保持 **1/8（12.5%）**，P3-24 不代表整个 P3 完成。
+
+## P3-25 update
+
+Commit `4b63cbcf2354fb9673329a73842e874d08770d03` 让 server-owned `ContextSnapshotAdapter` 可选地透传到 child execution。`ChildExecutorOptions` 和 `ProductionChildRuntimeOptions` 接收 adapter，并把它的 hook 与带 scope 的 snapshot loader 传入和 root turn 相同的 Turn execution loop。Worker startup 只在 `childExecutionEnabled` 为 true 且 compaction adapter 存在时复用 root adapter 实例（adapter 存在要求 context compaction gate 开启）；默认 child 路径仍关闭。Child owner、attempt、role policy、visible tools、tool visibility filtering 和 shared tree-budget admission 均保持不变；hook 或 loader 错误继续沿用现有 sanitized context-compaction boundary fail closed。
+
+没有新增模型或 LLM/API 调用、表、migration、queue 或 provider 配置。Root focused verification 覆盖 **32 tests**；shared build、Worker TypeScript 和 `git diff --check` 均通过。真实 PostgreSQL/RLS、真实 child queue 或 Worker 启动、跨进程重启以及 child-to-parent E2E 尚未验证。总体完成度保持 **1/8（12.5%）**；P3-25 仍是 candidate。
