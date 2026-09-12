@@ -22,6 +22,8 @@ export type PlanDispatchRuntime = {
   readonly createToolCallId?: (localId: string) => string
   readonly createIdempotencyKey?: (localId: string) => string
   readonly resolveInputRefs?: (request: PlanInputReferenceRequest) => unknown
+  /** Keep references as runtime-owned inputs until each command is executed. */
+  readonly deferInputRefs?: boolean
   readonly resolveDelegateActions?: (role: string) => readonly string[] | undefined
 }
 
@@ -32,11 +34,13 @@ type CommandBase = {
   readonly dependsOn: readonly string[]
   readonly successCriteria: readonly string[]
   readonly outputSchemaRef: string | null
+  /** Internal marker: references must be resolved by the command executor. */
+  readonly inputRefsDeferred?: boolean
 }
 
 export type PlanDispatchCommand =
   | (CommandBase & { readonly kind: "tool_call"; readonly call: { readonly id: string; readonly toolName: string; readonly toolVersion: string; readonly input: Record<string, unknown> } })
-  | (CommandBase & { readonly kind: "delegate"; readonly call: { readonly id: string; readonly toolName: "spawn_subagent"; readonly toolVersion: "1"; readonly input: { readonly idempotencyKey: string; readonly role: string; readonly taskType: string; readonly goal: string; readonly constraints: readonly string[]; readonly successCriteria: readonly string[]; readonly allowedActions: readonly string[] } } })
+  | (CommandBase & { readonly kind: "delegate"; readonly call: { readonly id: string; readonly toolName: "spawn_subagent"; readonly toolVersion: "1"; readonly input: { readonly idempotencyKey: string; readonly role: string; readonly taskType: string; readonly goal: string; readonly constraints: readonly string[]; readonly successCriteria: readonly string[]; readonly allowedActions: readonly string[]; readonly context?: Record<string, unknown> } } })
   | (CommandBase & { readonly kind: "request_input"; readonly question: string; readonly approvalBoundary?: string })
   | (CommandBase & { readonly kind: "propose_completion"; readonly completionCriteria: readonly string[] })
 
@@ -83,6 +87,7 @@ function callId(runtime: PlanDispatchRuntime, localId: string): string {
 
 function input(runtime: PlanDispatchRuntime, node: PlanNode): Record<string, unknown> {
   if (node.inputRefs.length === 0) return {}
+  if (runtime.deferInputRefs) return {}
   let value: unknown
   try { value = runtime.resolveInputRefs?.({ localId: node.localId, inputRefs: [...node.inputRefs], dependsOn: [...node.dependsOn] }) } catch { value = undefined }
   if (!isPlainJsonObject(value) || !plainJsonValue(value)) throw new PlanDispatchError("input_reference_unavailable", "Plan input references are unavailable")
@@ -122,12 +127,12 @@ function topo(nodes: readonly PlanNode[]): readonly PlanNode[] {
   return result
 }
 
-function base(node: PlanNode): CommandBase {
-  return { localId: node.localId, objective: node.objective, inputRefs: [...node.inputRefs], dependsOn: [...node.dependsOn], successCriteria: [...node.successCriteria], outputSchemaRef: node.outputSchemaRef }
+function base(node: PlanNode, runtime: PlanDispatchRuntime): CommandBase {
+  return { localId: node.localId, objective: node.objective, inputRefs: [...node.inputRefs], dependsOn: [...node.dependsOn], successCriteria: [...node.successCriteria], outputSchemaRef: node.outputSchemaRef, ...(runtime.deferInputRefs && node.inputRefs.length > 0 ? { inputRefsDeferred: true } : {}) }
 }
 
 function command(node: PlanNode, runtime: PlanDispatchRuntime, planCompletionCriteria: readonly string[]): PlanDispatchCommand {
-  const shared = base(node)
+  const shared = base(node, runtime)
   if (node.kind === "use_tool") {
     const toolName = node.toolName ?? node.tool
     if (!toolName) throw new PlanDispatchError("unknown_tool", "Plan tool name is unavailable")

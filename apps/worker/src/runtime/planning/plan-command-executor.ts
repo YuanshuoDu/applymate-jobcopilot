@@ -5,8 +5,9 @@ import type { PlanDispatchCommand, PlanDispatchResult } from "./plan-intent-disp
 import type { ToolCallRequest, ToolExecutionResult, ToolRouterContext } from "../tools/types.js"
 
 const MAX_RESULT_BYTES = 8 * 1024
+const MAX_OUTPUTS = PLAN_MAX_NODES
 
-export type PlanCommandExecutionErrorCode = "runtime_unavailable" | "invalid_plan" | "router_result_mismatch" | "observer_failed"
+export type PlanCommandExecutionErrorCode = "runtime_unavailable" | "invalid_plan" | "router_result_mismatch" | "observer_failed" | "input_reference_unavailable" | "input_reference_conflict"
 
 export class PlanCommandExecutionError extends Error {
   constructor(readonly code: PlanCommandExecutionErrorCode, message: string) {
@@ -23,6 +24,12 @@ export type PlanCommandExecutionRecord = {
   readonly dependsOn: readonly string[]
   readonly result: ToolExecutionResult
 }
+export type PlanInputReferenceResolutionRequest = {
+  readonly localId: string
+  readonly inputRefs: readonly string[]
+  readonly dependsOn: readonly string[]
+  readonly outputs: ReadonlyMap<string, unknown>
+}
 export type PlanControlRecord =
   | { readonly localId: string; readonly kind: "request_input"; readonly dependsOn: readonly string[]; readonly question: string; readonly approvalBoundary?: string }
   | { readonly localId: string; readonly kind: "propose_completion"; readonly dependsOn: readonly string[]; readonly completionCriteria: readonly string[] }
@@ -30,6 +37,7 @@ export type PlanControlRecord =
 export type PlanCommandExecutionRuntime = {
   readonly router?: { execute(context: ToolRouterContext, request: ToolCallRequest): Promise<ToolExecutionResult> }
   readonly createContext?: (request: CommandContextRequest) => ToolRouterContext | Promise<ToolRouterContext>
+  readonly resolveInputRefs?: (request: PlanInputReferenceResolutionRequest) => unknown
   readonly observe?: (record: PlanCommandExecutionRecord | PlanControlRecord) => void | Promise<void>
 }
 
@@ -87,6 +95,28 @@ function request(command: ExecutableCommand): ToolCallRequest {
   return command.call
 }
 
+function resolvedRequest(runtime: PlanCommandExecutionRuntime, command: ExecutableCommand, outputs: ReadonlyMap<string, unknown>): ToolCallRequest {
+  const original = request(command)
+  if (command.inputRefs.length === 0) return original
+  if (!runtime.resolveInputRefs) {
+    if (command.inputRefsDeferred) throw new PlanCommandExecutionError("input_reference_unavailable", "Plan input references are unavailable")
+    return original
+  }
+  let resolved: unknown
+  try {
+    resolved = runtime.resolveInputRefs({ localId: command.localId, inputRefs: [...command.inputRefs], dependsOn: [...command.dependsOn], outputs })
+  } catch (error: unknown) {
+    if (error instanceof Error && "code" in error && error.code === "input_reference_conflict") throw new PlanCommandExecutionError("input_reference_conflict", "Plan input references conflict")
+    throw new PlanCommandExecutionError("input_reference_unavailable", "Plan input references are unavailable")
+  }
+  if (!isPlainJsonObject(resolved) || !plainJson(resolved)) throw new PlanCommandExecutionError("input_reference_unavailable", "Plan input references are unavailable")
+  let encoded: string | undefined
+  try { encoded = JSON.stringify(resolved) } catch { encoded = undefined }
+  if (encoded === undefined || Buffer.byteLength(encoded, "utf8") > MAX_RESULT_BYTES) throw new PlanCommandExecutionError("input_reference_unavailable", "Plan input references are unavailable")
+  if (command.kind === "tool_call") return { ...original, input: resolved }
+  return { ...original, input: { ...command.call.input, context: resolved } }
+}
+
 function context(runtime: PlanCommandExecutionRuntime, command: ExecutableCommand): Promise<ToolRouterContext> {
   if (!runtime.createContext) throw new PlanCommandExecutionError("runtime_unavailable", "Plan command context is unavailable")
   let provided: ToolRouterContext | Promise<ToolRouterContext>
@@ -131,13 +161,14 @@ export async function executePlanCommands(plan: PlanDispatchResult, runtime: Pla
   const commands = validatePlanCommands(plan)
   if (!runtime.router || typeof runtime.router.execute !== "function") throw new PlanCommandExecutionError("runtime_unavailable", "Plan command router is unavailable")
   const completed: PlanCommandExecutionRecord[] = []
+  const outputs = new Map<string, unknown>()
   for (const command of commands) {
     if (control(command)) {
       await observe(runtime, command)
       return { status: "blocked", completed, blocked: command }
     }
     if (!executable(command)) throw new PlanCommandExecutionError("invalid_plan", "Plan executable command is invalid")
-    const requestValue = request(command)
+    const requestValue = resolvedRequest(runtime, command, outputs)
     let response: ToolExecutionResult
     try { response = result(await runtime.router.execute(await context(runtime, command), requestValue), requestValue) } catch (error: unknown) {
       if (error instanceof PlanCommandExecutionError) throw error
@@ -146,6 +177,11 @@ export async function executePlanCommands(plan: PlanDispatchResult, runtime: Pla
     const record: PlanCommandExecutionRecord = { localId: command.localId, kind: command.kind, dependsOn: [...command.dependsOn], result: response }
     await observe(runtime, record)
     if (response.status !== "completed") return { status: "failed", completed, failure: record }
+    if (isPlainJsonObject(response.output) && plainJson(response.output)) {
+      let encoded: string | undefined
+      try { encoded = JSON.stringify(response.output) } catch { encoded = undefined }
+      if (encoded !== undefined && Buffer.byteLength(encoded, "utf8") <= MAX_RESULT_BYTES && outputs.size < MAX_OUTPUTS) outputs.set(command.localId, response.output)
+    }
     completed.push(record)
   }
   return { status: "completed", completed }

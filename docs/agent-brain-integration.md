@@ -320,6 +320,12 @@ The Worker production entry now passes server-owned planning gates into `createC
 
 The new pure resolver has sibling tests for the default, planning-only, dual-enabled and execution-only cases; the focused test passes **3/3**. This slice has no live production startup, PostgreSQL/RLS, Redis/queue, process restart or cross-process evidence; overall completion remains **1/8 (12.5%)**.
 
+## P3-18 update
+
+The canonical plan executor now defers `inputRefs` until each command is routed. The default materializer remains compatible, while deferred commands fail closed when no resolver is available. Each execution keeps a bounded local output map: only completed plain JSON object results no larger than 8 KiB can feed later nodes. Delegate references are passed through server-owned `context`, so runtime identity, lease, permission and idempotency fields cannot be overwritten. Missing, conflicting, non-object, oversized or identity-bearing references fail before the router is called.
+
+The canonical bridge merges prior local output with exact snapshot observation IDs, preserving conflict rejection, topological ordering, control barriers, existing permission gates and fail-closed behavior. Luna focused verification passed **3 files / 32 tests**; Worker TypeScript, the shared build and `git diff --check` passed. No live PostgreSQL/RLS, Redis/queue, provider, process restart or cross-process child-to-parent evidence was collected; overall completion remains **1/8 (12.5%)**.
+
 ## P2-OUTBOX-1 update
 
 Commit `57dd0ac9` repairs canonical Turn dispatch bookkeeping after enqueue. A successful `queue.add` is followed by a guarded outbox update using the same row ID, setting `publishedAt`, incrementing `attemptCount` and clearing `lastError`; a second drain therefore does not dispatch the same published row again. Queue-add failure records bounded `queue_add_failed` state while leaving the row unpublished for retry. If enqueue succeeds but the bookkeeping update is uncertain, recovery returns `turn_dispatch_delivery_uncertain` and reuses the same generation/job ID rather than inventing another delivery generation.

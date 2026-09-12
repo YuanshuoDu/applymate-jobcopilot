@@ -52,6 +52,49 @@ describe("executePlanCommands", () => {
     expect(result.completed[0]).toMatchObject({ localId: "search", dependsOn: [], result: { status: "completed", id: "call:search" } })
   })
 
+  it("resolves completed local output before routing a dependent command", async () => {
+    const requests: ToolCallRequest[] = []
+    const router = { execute: vi.fn(async (_context: ToolRouterContext, request: ToolCallRequest) => {
+      requests.push(request)
+      return { ...request, status: "completed" as const, output: request.toolName === "jobs.search" ? { jobId: "job-1" } : { ok: true }, errorCode: null }
+    }) }
+    const plan = dispatch([use("first"), use("second", { inputRefs: ["first"] })])
+    const result = await executePlanCommands(plan, {
+      ...runtime(router),
+      resolveInputRefs: request => ({ observedJob: request.outputs.get("first") }),
+    })
+    expect(result.status).toBe("completed")
+    expect(requests[1]?.input).toEqual({ observedJob: { jobId: "job-1" } })
+  })
+
+  it("passes dependent output to a delegate as server-owned context", async () => {
+    const requests: ToolCallRequest[] = []
+    const router = { execute: vi.fn(async (_context: ToolRouterContext, request: ToolCallRequest) => {
+      requests.push(request)
+      return { ...request, status: "completed" as const, output: { childId: "child-1" }, errorCode: null }
+    }) }
+    const plan = dispatch([use("first"), delegate("child", { inputRefs: ["first"], dependsOn: ["first"] })])
+    await expect(executePlanCommands(plan, {
+      ...runtime(router),
+      resolveInputRefs: request => ({ source: request.outputs.get("first") }),
+    })).resolves.toMatchObject({ status: "completed" })
+    expect(requests[1]?.input).toMatchObject({ role: "scout", context: { source: { childId: "child-1" } } })
+  })
+
+  it("fails before the router when a referenced output cannot be resolved", async () => {
+    const router = { execute: vi.fn(async (_context: ToolRouterContext, request: ToolCallRequest) => ({ ...request, status: "completed" as const, output: { ok: true }, errorCode: null })) }
+    const plan = dispatch([use("first"), use("second", { inputRefs: ["first"] })])
+    await expect(executePlanCommands(plan, { ...runtime(router), resolveInputRefs: () => undefined })).rejects.toMatchObject({ code: "input_reference_unavailable" })
+    expect(router.execute).toHaveBeenCalledTimes(1)
+  })
+
+  it("fails closed for deferred references when no resolver is provided", async () => {
+    const router = { execute: vi.fn(async (_context: ToolRouterContext, request: ToolCallRequest) => ({ ...request, status: "completed" as const, output: { ok: true }, errorCode: null })) }
+    const deferred = dispatchPlanProposal(proposal([use("read", { inputRefs: ["prior"] })]), validation, { resolveToolVersion: () => "1", createToolCallId: id => `call:${id}`, resolveDelegateActions: () => ["jobs.search"], deferInputRefs: true })
+    await expect(executePlanCommands(deferred, runtime(router))).rejects.toMatchObject({ code: "input_reference_unavailable" })
+    expect(router.execute).not.toHaveBeenCalled()
+  })
+
   it("returns a failed status and stops after a failed or cancelled router result", async () => {
     const execute = vi.fn(async (_context: ToolRouterContext, request: ToolCallRequest) => ({ ...request, status: "failed" as const, output: { safe: true }, errorCode: "policy_denied" }))
     const result = await executePlanCommands(dispatch([use("first"), use("second")]), runtime({ execute }))

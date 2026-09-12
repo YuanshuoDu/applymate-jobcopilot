@@ -80,6 +80,18 @@ describe("createCanonicalPlanExecutionFactory", () => {
     expect(result.observations).toHaveLength(2)
   })
 
+  it("passes a prior local result into a dependent tool through the canonical resolver", async () => {
+    const requests: ToolCallRequest[] = []
+    const router = { execute: vi.fn(async (_context: ToolRouterContext, request: ToolCallRequest) => {
+      requests.push(request)
+      return { ...request, status: "completed" as const, output: request.id.endsWith(":read") ? { jobId: "job-1" } : { ok: true }, errorCode: null }
+    }) }
+    const hook = fixture(router, undefined, undefined, undefined, undefined, undefined, ["use_tool"])
+    const result = await hook(input(output(proposal([use("read"), use("review", { inputRefs: ["read"] })]))))
+    expect(result.observations).toHaveLength(2)
+    expect(requests[1]?.input).toEqual({ jobId: "job-1" })
+  })
+
   it("revalidates accepted output against the server action capability gate", async () => {
     const router = { execute: vi.fn(async (_context: ToolRouterContext, request: ToolCallRequest) => ({ ...request, status: "completed" as const, output: { ok: true }, errorCode: null })) }
     const hook = fixture(router, undefined, undefined, undefined, undefined, undefined, ["use_tool"])
@@ -216,7 +228,40 @@ describe("createCanonicalPlanExecutionFactory", () => {
       { id: "left", content: { output: { key: "one" } } }, { id: "right", content: { output: { key: "two" } } },
     ])
     const conflict = await fixture()(conflictInput)
-    expect(observationCode(conflict)).toBe("input_reference_unavailable")
+    expect(observationCode(conflict)).toBe("input_reference_conflict")
+  })
+
+  it("merges local output with snapshot input and rejects conflicts before routing", async () => {
+    const requests: ToolCallRequest[] = []
+    const router = { execute: vi.fn(async (_context: ToolRouterContext, request: ToolCallRequest) => {
+      requests.push(request)
+      return { ...request, status: "completed" as const, output: request.id.endsWith(":first") ? { alpha: 1 } : { ok: true }, errorCode: null }
+    }) }
+    const hook = fixture(router, undefined, undefined, undefined, undefined, undefined, ["use_tool"])
+    const mixed = await hook(input(output(proposal([use("first"), use("second", { inputRefs: ["first", "prior"] })])), "step-1", [{ id: "prior", content: { output: { beta: "two" } } }]))
+    expect(mixed.observations).toHaveLength(2)
+    expect(requests[1]?.input).toEqual({ alpha: 1, beta: "two" })
+
+    const conflictRouter = { execute: vi.fn(async (_context: ToolRouterContext, request: ToolCallRequest) => ({ ...request, status: "completed" as const, output: { key: "one" }, errorCode: null })) }
+    const conflictProposal = proposal([use("first"), use("second", { inputRefs: ["first", "prior"] })])
+    const conflict = await fixture(conflictRouter, undefined, undefined, undefined, undefined, undefined, ["use_tool"])(input(output(conflictProposal), "step-1", [{ id: "prior", content: { output: { key: "two" } } }]))
+    expect(observationCode(conflict)).toBe("input_reference_conflict")
+    expect(conflictRouter.execute).toHaveBeenCalledTimes(1)
+  })
+
+  it("rejects non-object, oversized, and identity-bearing local references before the next router call", async () => {
+    const cases: Array<{ output: unknown; expected: string }> = [
+      { output: ["array"], expected: "input_reference_unavailable" },
+      { output: { payload: "x".repeat(8 * 1024) }, expected: "router_result_mismatch" },
+      { output: { lease: { ownerId: "forged" } }, expected: "input_reference_unavailable" },
+    ]
+    for (const testCase of cases) {
+      const router = { execute: vi.fn(async (_context: ToolRouterContext, request: ToolCallRequest) => ({ ...request, status: "completed" as const, output: request.id.endsWith(":first") ? testCase.output : { ok: true }, errorCode: null })) }
+      const hook = fixture(router, undefined, undefined, undefined, undefined, undefined, ["use_tool"])
+      const result = await hook(input(output(proposal([use("first"), use("second", { inputRefs: ["first"] })]))))
+      expect(observationCode(result)).toBe(testCase.expected)
+      expect(router.execute).toHaveBeenCalledTimes(1)
+    }
   })
 
   it("maps an explicit dependency wait without guessing malformed waits", async () => {

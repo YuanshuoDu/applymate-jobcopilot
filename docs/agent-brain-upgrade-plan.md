@@ -242,6 +242,12 @@ Replay 顺序现在是先解析并校验 goal，再执行 recovery，最后才�
 
 新增的纯 helper 覆盖 undefined/0、单独 execution 和双门控组合；Worker 入口把解析结果传给 `createCanonicalTurnRuntime`，没有改 planning semantics、provider、依赖或迁移。Worker focused flags test **3/3** 通过；本切片不包含真实生产启动、PostgreSQL/RLS、Redis/queue、重启或跨进程证据，整体完成度仍为 **1/8 (12.5%)**。
 
+## P3-18 update
+
+本切片让 canonical plan execution 延迟解析 `inputRefs` 到每个 command 真正路由前。`deferInputRefs` 保持默认 materializer 兼容，同时为 deferred command 标记缺少 resolver 时 fail closed。执行器维护本次 plan 的有界 local output map：只有已完成、plain JSON object、单项不超过 8 KiB 的结果才可被后续 node 引用；delegate 的动态输入进入 server-owned `context`，不会覆盖身份、lease、权限或幂等字段。未解析、冲突、非对象、超界或身份字段引用均在 router 前拒绝。
+
+canonical bridge 现在把 local output 与 snapshot 中 exact observation ID 的 plain JSON object 合并，并保持冲突拒绝、topological order、control barrier、既有权限和 fail-closed 语义。Luna focused 验证 **3 files / 32 tests**，Worker TypeScript、shared build 和 `git diff --check` 通过。尚未验证真实 PostgreSQL/RLS、Redis/queue、provider、process restart 或 cross-process child-to-parent；整体 completion 仍为 **1/8 (12.5%)**。
+
 ## P2-OUTBOX-1 update
 
 P2-OUTBOX-1 提交 `57dd0ac9`（2026-09-09）已推送到当前分支：canonical Turn dispatch 在 `queue.add` 成功后使用同一 outbox row 做 guarded publishedAt/attemptCount/lastError 记账；queue.add 失败记录 `queue_add_failed` 并保持未发布；enqueue 成功但记账不确定时返回 `turn_dispatch_delivery_uncertain`，下一次使用相同 generation/jobId 依靠 BullMQ 幂等。该语义是 at-least-once 加 idempotent job ID，不承诺 exactly-once。

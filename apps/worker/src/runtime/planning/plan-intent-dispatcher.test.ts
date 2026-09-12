@@ -40,6 +40,13 @@ describe("dispatchPlanProposal", () => {
     expect(JSON.stringify(result.commands)).not.toMatch(/userId|taskId|parentTaskId|lease|budgetLimit|maxBudget/)
   })
 
+  it("keeps non-empty input references deferred only when the server requests it", () => {
+    const deferred = dispatchPlanProposal(proposal([use("read", { inputRefs: ["prior"] })]), validation, runtime({ deferInputRefs: true }))
+    expect(deferred.commands[0]).toMatchObject({ inputRefs: ["prior"], call: { input: {} } })
+    const materialized = dispatchPlanProposal(proposal([use("read", { inputRefs: ["prior"] })]), validation, runtime())
+    expect(materialized.commands[0]).toMatchObject({ call: { input: { from: "prior" } } })
+  })
+
   it("fails closed when runtime tool, input, or role callbacks are unavailable", () => {
     expect(() => dispatchPlanProposal(proposal([use("read")]), validation, runtime({ resolveToolVersion: undefined }))).toThrowError(expect.objectContaining({ code: "unknown_tool" }))
     expect(() => dispatchPlanProposal(proposal([use("read", { inputRefs: ["prior"] })]), validation, runtime({ resolveInputRefs: undefined }))).toThrowError(expect.objectContaining({ code: "input_reference_unavailable" }))

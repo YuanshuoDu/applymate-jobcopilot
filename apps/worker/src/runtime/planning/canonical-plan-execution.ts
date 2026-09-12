@@ -7,7 +7,7 @@ import { copyAllowedPlanActions, PLAN_MAX_NODES, PLAN_MAX_REVISIONS, isPlainJson
 import { PlanDispatchError, dispatchPlanProposal } from "./plan-intent-dispatcher.js"
 import { copyPlanFingerprints, fingerprintPlanProposal, isPlanFingerprint } from "./plan-fingerprint.js"
 import { PlanValidationError, validatePlanProposal } from "./goal-plan-validator.js"
-import { PlanCommandExecutionError, executePlanCommands, type PlanCommandExecutionRecord, type PlanCommandExecutionRuntime, type PlanControlRecord } from "./plan-command-executor.js"
+import { PlanCommandExecutionError, executePlanCommands, type PlanCommandExecutionRecord, type PlanCommandExecutionRuntime, type PlanControlRecord, type PlanInputReferenceResolutionRequest } from "./plan-command-executor.js"
 import { createPlanCommandReceipt, type PlanCommandReceipt } from "./plan-command-receipt.js"
 import { PlanRevisionRecoveryError, type PlanRevisionRecoveryDispatcher } from "./plan-revision-receipt.js"
 import type { ToolCallRequest, ToolExecutionResult, ToolRouterContext } from "../tools/types.js"
@@ -109,19 +109,26 @@ function stableJson(value: unknown): string {
   return JSON.stringify(value) ?? "undefined"
 }
 
-function resolveInputRefs(snapshot: StepContextSnapshot, refs: readonly string[]): Record<string, unknown> {
+const FORBIDDEN_INPUT_KEYS = new Set(["userId", "sessionId", "turnId", "stepId", "taskId", "parentTaskId", "rootTaskId", "ownerId", "lease", "leaseOwnerId", "leaseVersion", "idempotencyKey", "capabilities", "permissions", "allowedCapabilities", "budgetLimit", "maxBudget"])
+
+function resolveInputRefs(snapshot: StepContextSnapshot, request: PlanInputReferenceResolutionRequest): Record<string, unknown> {
   const merged: Record<string, unknown> = {}
-  for (const ref of refs) {
-    const observation = snapshot.toolObservations.find(item => item.id === ref)
-    if (!observation) throw new CanonicalPlanError("input_reference_unavailable")
-    const content = row(observation.content)
-    const source = content && Object.prototype.hasOwnProperty.call(content, "output") ? content.output : observation.content
+  for (const ref of request.inputRefs) {
+    const hasLocalOutput = request.outputs.has(ref)
+    const observation = hasLocalOutput ? undefined : snapshot.toolObservations.find(item => item.id === ref)
+    if (!hasLocalOutput && !observation) throw new CanonicalPlanError("input_reference_unavailable")
+    const content = observation ? row(observation.content) : null
+    const source = hasLocalOutput ? request.outputs.get(ref) : content && Object.prototype.hasOwnProperty.call(content, "output") ? content.output : observation?.content
     if (!isPlainJsonObject(source) || !plainJson(source)) throw new CanonicalPlanError("input_reference_unavailable")
+    const encoded = JSON.stringify(source)
+    if (encoded === undefined || Buffer.byteLength(encoded, "utf8") > MAX_RESULT_BYTES || Object.keys(source).some(key => FORBIDDEN_INPUT_KEYS.has(key))) throw new CanonicalPlanError("input_reference_unavailable")
     for (const key of Object.keys(source).sort()) {
       if (Object.prototype.hasOwnProperty.call(merged, key) && stableJson(merged[key]) !== stableJson(source[key])) throw new CanonicalPlanError("input_reference_conflict")
       merged[key] = source[key]
     }
   }
+  const encoded = JSON.stringify(merged)
+  if (encoded === undefined || Buffer.byteLength(encoded, "utf8") > MAX_RESULT_BYTES) throw new CanonicalPlanError("input_reference_unavailable")
   return merged
 }
 
@@ -229,7 +236,7 @@ export function createCanonicalPlanExecutionFactory(options: CanonicalPlanExecut
         resolveToolVersion: name => version(options.registry, options.capabilities, name),
         createToolCallId: localId => id("plan-call", input.call.id, localId),
         createIdempotencyKey: localId => id("plan-idempotency", input.call.id, localId),
-        resolveInputRefs: request => resolveInputRefs(input.snapshot, request.inputRefs),
+        deferInputRefs: true,
         resolveDelegateActions: () => actions(options.registry, options.capabilities, allowedTools),
       })
       seenPlanHashes.add(computedHash)
@@ -237,6 +244,7 @@ export function createCanonicalPlanExecutionFactory(options: CanonicalPlanExecut
       const commandRuntime: PlanCommandExecutionRuntime = {
         router: options.router,
         createContext: request => ({ scope: options.scope, sessionId: options.lease.sessionId, turnId: options.lease.turnId, stepId: `${input.stepId}:plan:${request.localId}`, taskId: options.taskId, rootTaskId: options.rootTaskId, actorRole: options.actorRole, capabilities: [...options.capabilities], signal: input.signal }),
+        resolveInputRefs: request => resolveInputRefs(input.snapshot, request),
         ...(options.persistOutcome ? { observe: async recordValue => options.persistOutcome!(outcomeReceipt(input.call.id, output.planRevision, recordValue)) } : {}),
       }
       const executed = await executePlanCommands(dispatched, commandRuntime)
