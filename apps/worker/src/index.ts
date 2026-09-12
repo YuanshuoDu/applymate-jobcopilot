@@ -8,6 +8,7 @@ import { closeSharedRedisConnections } from "./redis.js";
 import { workerHarnessFeatureHealth } from "./admin/harness-health.js";
 import { startAgentWakeupConsumer } from "./runtime/wakeup/consumer.js";
 import { resolveProductionAgentFlags } from "./runtime/production-agent-flags.js";
+import { createProductionContextCompactionOptions } from "./runtime/context/production-context-compaction.js";
 
 async function main() {
   const adminHost = resolveWorkerAdminHost();
@@ -74,24 +75,30 @@ async function main() {
 
   const childExecutionEnabled = productionChildRuntimeModule.childExecutionEnabled();
   const consumeWaitOutcomes = process.env.ENABLE_AGENT_WAIT_RESOLVER === "1" && childExecutionEnabled;
-  const planningFlags = resolveProductionAgentFlags();
-  const canonicalRuntime = await canonicalRuntimeModule.createCanonicalTurnRuntime(getPool(), {
+  const productionFlags = resolveProductionAgentFlags();
+  const pool = getPool();
+  const contextCompactionOptions = createProductionContextCompactionOptions({
+    enabled: productionFlags.contextCompactionEnabled,
+    pool,
+  });
+  const canonicalRuntime = await canonicalRuntimeModule.createCanonicalTurnRuntime(pool, {
     workerId: process.env.WORKER_ID ?? `worker-${process.pid}`,
     authorizeUsage: aiUsageBridgeModule.createWorkerUsageAuthorizer(),
     consumeWaitOutcomes,
     coordinationEnabled: consumeWaitOutcomes,
-    planningEnabled: planningFlags.planningEnabled,
-    planningExecutionEnabled: planningFlags.planningExecutionEnabled,
+    planningEnabled: productionFlags.planningEnabled,
+    planningExecutionEnabled: productionFlags.planningExecutionEnabled,
+    ...contextCompactionOptions,
   });
   // Child execution is opt-in. Keep tree-budget and child queue construction
   // out of the default startup path until the explicit feature flag is set.
   const childExecutor = productionChildRuntimeModule.createOptionalProductionChildExecutor({
     enabled: childExecutionEnabled,
-    pool: getPool(),
+    pool,
   });
   const waitResolver = consumeWaitOutcomes && childExecutor ? {} : undefined;
   const canonicalBootstrap = await productionBootstrapModule.createProductionWorkerBootstrap({
-    pool: getPool(),
+    pool,
     runtime: canonicalRuntime,
     ...(childExecutor ? { subagents: { execute: childExecutor } } : {}),
     ...(waitResolver ? { waitResolver } : {}),
