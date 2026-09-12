@@ -677,3 +677,9 @@ Root 独立复核 **5 files / 31 focused tests**；实现报告额外包含 Work
 Commit `4b63cbcf2354fb9673329a73842e874d08770d03` 让 server-owned `ContextSnapshotAdapter` 可选地透传到 child execution。`ChildExecutorOptions` 和 `ProductionChildRuntimeOptions` 接收 adapter，并把它的 hook 与带 scope 的 snapshot loader 传入和 root turn 相同的 Turn execution loop。Worker startup 只在 `childExecutionEnabled` 为 true 且 compaction adapter 存在时复用 root adapter 实例（adapter 存在要求 context compaction gate 开启）；默认 child 路径仍关闭。Child owner、attempt、role policy、visible tools、tool visibility filtering 和 shared tree-budget admission 均保持不变；hook 或 loader 错误继续沿用现有 sanitized context-compaction boundary fail closed。
 
 没有新增模型或 LLM/API 调用、表、migration、queue 或 provider 配置。Root focused verification 覆盖 **32 tests**；shared build、Worker TypeScript 和 `git diff --check` 均通过。真实 PostgreSQL/RLS、真实 child queue 或 Worker 启动、跨进程重启以及 child-to-parent E2E 尚未验证。总体完成度保持 **1/8（12.5%）**；P3-25 仍是 candidate。
+
+## P3-26 更新
+
+提交 `5bef2542` 完成 P3-26 candidate：当 canonical root runtime 同时开启 `planningEnabled && planningExecutionEnabled` 时，final response 必须通过 server-owned plan completion barrier。计划必须真实产生同一最新 revision 下唯一的 `plan_control` / `completion_proposed` observation；该 control 携带 server-owned `dependsOn`，并且每个依赖只能精确对应同一 plan 的 `plan-result` observation，且必须在 control 之前 `status=completed`、`errorCode=null`。缺失、失败、重复、跨计划、畸形或顺序错误的 evidence 都 fail closed，并写入 `final.rejected`。`completionCriteria` 只作为有界的模型声明文本保存并可 replay；本切片不把自然语言 criteria 当作已证明的语义条件。`request_input` replay 保持兼容；child runtime 默认不强制。
+
+P3-26 focused evidence 为 **4 个文件 / 95 tests**；shared build、Worker `tsc --noEmit --skipLibCheck`、`git diff --check` 均通过。未做 live DB/RLS、Redis/queue delivery、provider、process restart、browser/child-parent E2E 验证。overall completion 仍为 **1/8（12.5%）**，P3-26 仍是 candidate，不能视为 P3 完成。
