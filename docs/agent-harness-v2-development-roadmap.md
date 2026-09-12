@@ -1543,3 +1543,22 @@ This slice adds no migration, provider, queue, or external-write changes.
 **Independent verification:** `coordination-tools` and `coordination-executors` focused tests passed **10/10**; shared build, Worker `tsc --noEmit --skipLibCheck`, and `git diff --check` passed.
 
 **Candidate boundary:** Live DB/RLS, Redis/queue, provider, restart, browser, and child-parent E2E behavior remain unverified.
+
+---
+
+## 36. P4-06 — Bound structured evidence on durable replay
+
+**Candidate status/date (2026-09-12):** P4-06 is recorded as a candidate durable replay evidence slice; overall progress remains **P0 accepted 1/8 (12.5%)**, unchanged by this slice.
+
+**Implementation:** Commits `e8724eba` and review fix `d5104760` add `apps/worker/src/runtime/planning/structured-replay-evidence.ts` and connect its validator at the canonical `validStructuredReplayResult` replay call point.
+
+Structured replay evidence accepts only `job`, `persona`, or `resume` kinds, with the canonical ID `read:<kind>:<ref>`.
+
+Each evidence `id`, `ref`, and `source` must be non-empty and no longer than **256** characters; the existing role/evidence binding remains authoritative, and the complete structured payload remains bounded to **8 KiB**.
+
+- Legacy model evidence IDs, `source` kind, canonical ID mismatches, duplicate evidence, and oversized claims fail closed as `invalid_plan_output`. Generic results without `structuredResult` remain compatible.
+- This slice adds no DB, provider, queue, or external-write changes.
+
+**Independent verification:** Focused helper and canonical tests passed **51/51** (**11 + 40**); shared build, Worker `tsc --noEmit --skipLibCheck`, and `git diff --check` passed.
+
+**Candidate boundary:** Live DB/RLS, Redis/queue, provider, restart, browser, and child-parent E2E behavior remain unverified.
