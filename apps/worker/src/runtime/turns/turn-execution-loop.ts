@@ -277,13 +277,13 @@ async function executeTools(
         if (!revision) throw new TurnEngineError("invalid_output", "Plan proposal returned an invalid persisted receipt")
         const currentGoal = options.goalRef?.get()
         if (currentGoal && revision.goalRevision !== currentGoal.revision) throw new TurnEngineError("invalid_output", "Plan proposal replay does not match the current goal revision")
+        options.recoveryDispatcher?.recover({ goalRevision: revision.goalRevision, planRevision: revision.planRevision, basedOnPlanRevision: revision.basedOnPlanRevision, ...(revision.proposalHash === undefined ? {} : { proposalHash: revision.proposalHash }) })
         const projection = planRevisionObservation(revision)
         const hasProjection = snapshot.toolObservations.some(observation => observation.id === projection.id)
         if (!hasProjection) {
           await writer.append("plan.revision", call.id, null, revision, `plan-revision:${call.id}`)
           snapshot = { ...snapshot, toolObservations: [...snapshot.toolObservations, projection] }
         }
-        options.recoveryDispatcher?.recover({ goalRevision: revision.goalRevision, planRevision: revision.planRevision, basedOnPlanRevision: revision.basedOnPlanRevision, ...(revision.proposalHash === undefined ? {} : { proposalHash: revision.proposalHash }) })
       }
       continue
     }

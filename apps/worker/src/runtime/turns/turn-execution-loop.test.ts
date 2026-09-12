@@ -381,6 +381,18 @@ describe("owner-agnostic turn execution loop", () => {
     expect(recovered).toHaveBeenCalledTimes(1)
   })
 
+  it("does not persist a plan projection when replay recovery rejects a revision gap", async () => {
+    const dispatcher = createPlanRevisionRecoveryDispatcher()
+    const proposal: PlanProposal = { schemaVersion: PLAN_PROPOSAL_SCHEMA_VERSION, basedOnGoalRevision: 1, basedOnPlanRevision: 2, nodes: [], completionCriteria: [], briefRationale: "gap" }
+    const output = { status: "accepted" as const, goalRevision: 1, planRevision: 3, basedOnPlanRevision: 2, proposal, intents: [], proposalHash: fingerprintPlanProposal(proposal) }
+    const persisted = { id: "tool-result:gap", content: { toolCallId: "gap", toolName: "agent.plan.propose", input: { proposal }, status: "completed", output, errorCode: null } }
+    createPlanProposalTool({ goal: { revision: 1, objective: "Find jobs", constraints: [], successCriteria: [], knownFacts: [], unresolvedQuestions: [], approvalBoundaries: [], budgetRef: "runtime:turn" }, allowedTools: ["jobs.search"], allowedTemplates: [], allowedRoles: ["scout"], maxNodes: 8, initialPlanRevision: 1, maxPlanRevisions: 3, recoveryDispatcher: dispatcher })
+    const root = fixture(identity("turn", "root-1"), undefined, undefined, [persisted], false, undefined, { id: "gap", name: "agent.plan.propose", arguments: { proposal } })
+    const result = await runTurnExecutionLoop({ ...root.options, recoveryDispatcher: dispatcher })
+    expect(result).toMatchObject({ status: "failed", errorCode: "invalid_output" })
+    expect(root.events.some(event => event.type === "plan.revision")).toBe(false)
+  })
+
   it.each([
     { label: "malformed receipt", output: { status: "accepted", goalRevision: 1, planRevision: 1, basedOnPlanRevision: null, proposal: {}, intents: [] } },
     { label: "unknown status", output: { status: "running" } },
