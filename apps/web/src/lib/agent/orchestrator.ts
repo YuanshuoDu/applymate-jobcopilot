@@ -106,6 +106,27 @@ function isPlainNonEmptyObject(value: unknown): value is Record<string, unknown>
   return (prototype === Object.prototype || prototype === null) && Object.keys(value).length > 0
 }
 
+const MAX_DECISION_THINKING_LENGTH = 120
+const MAX_QUESTION_OPTION_COUNT = 20
+const MAX_QUESTION_OPTION_TEXT_LENGTH = 200
+const MAX_QUESTION_ACTION_FIELD_LENGTH = 120
+
+function isQuestionOption(value: unknown): value is QuestionOption {
+  if (!isPlainNonEmptyObject(value)) return false
+  if (!isBoundedNonEmptyText(value.label, MAX_QUESTION_OPTION_TEXT_LENGTH)) return false
+  if (!isBoundedNonEmptyText(value.value, MAX_QUESTION_OPTION_TEXT_LENGTH)) return false
+  if (value.action === undefined) return true
+  return isPlainNonEmptyObject(value.action) &&
+    isBoundedNonEmptyText(value.action.field, MAX_QUESTION_ACTION_FIELD_LENGTH)
+}
+
+function isQuestionOptions(value: unknown): value is QuestionOption[] {
+  return Array.isArray(value) &&
+    value.length > 0 &&
+    value.length <= MAX_QUESTION_OPTION_COUNT &&
+    value.every((option, index) => Object.prototype.hasOwnProperty.call(value, index) && isQuestionOption(option))
+}
+
 // ── OrchestratorAgent ─────────────────────────────────────────────────────────
 
 export class OrchestratorAgent {
@@ -247,7 +268,10 @@ Respond ONLY in valid JSON (no markdown):
       const r      = await modelChat([{ role: 'user', content: prompt }], this.ctx.aiConfig, 400)
       const parsed = parseDecision(r.text)
       if (!parsed || !isOrchestratorDecision(parsed.decision)) throw new Error('invalid decision')
-      if (!isBoundedNonEmptyText(parsed.thinking, 120)) throw new Error('invalid thinking')
+      if (!isBoundedNonEmptyText(parsed.thinking, MAX_DECISION_THINKING_LENGTH)) throw new Error('invalid thinking')
+      if (parsed.ask_options !== undefined && !isQuestionOptions(parsed.ask_options)) {
+        throw new Error('invalid ask options')
+      }
       if (parsed.decision === 'ask_user' && !isNonEmptyText(parsed.ask_question)) {
         throw new Error('invalid ask question')
       }
