@@ -80,7 +80,12 @@ export async function runContextCompaction(input: RuntimeInput): Promise<Runtime
     if (replay.content.status === "failed") throw new TurnEngineError("invalid_output", "Context compaction replay failed closed")
     if (replay.content.status === "unchanged") return { snapshot: input.snapshot }
     if (!input.loadSnapshot || !replay.content.snapshotRef) throw new TurnEngineError("invalid_output", "Compacted snapshot replay is missing a server-owned snapshot loader")
-    const loaded = await input.loadSnapshot({ snapshotRef: replay.content.snapshotRef, scope: input.scope, sessionId: input.sessionId, turnId: input.turnId })
+    let loaded: Awaited<ReturnType<ContextCompactionSnapshotLoader>>
+    try {
+      loaded = await input.loadSnapshot({ snapshotRef: replay.content.snapshotRef, scope: input.scope, sessionId: input.sessionId, turnId: input.turnId })
+    } catch {
+      throw new TurnEngineError("invalid_output", "Compacted snapshot replay failed closed")
+    }
     if (!loadedSnapshotShape(loaded) || loaded.sessionId !== input.sessionId || loaded.turnId !== input.turnId || loaded.scope.userId !== input.scope.userId) throw new TurnEngineError("invalid_output", "Compacted snapshot replay could not load a scoped snapshot")
     if (invariantSnapshot(loaded.snapshot) !== invariantSnapshot(input.snapshot)) throw new TurnEngineError("invalid_output", "Compacted snapshot replay changed protected invariants")
     return { snapshot: appendObservation(loaded.snapshot, replay) }

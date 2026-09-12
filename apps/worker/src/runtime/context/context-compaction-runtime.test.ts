@@ -99,4 +99,15 @@ describe("context compaction runtime seam", () => {
     const value = input(undefined, current, async () => ({ scope: null } as never))
     await expect(runContextCompaction(value.value)).rejects.toMatchObject({ code: "invalid_output" })
   })
+
+  it("sanitizes loader exceptions during replay", async () => {
+    const current: StepContextSnapshot = { ...snapshot, toolObservations: [{ id: "context-compacted:step:0", content: {
+      kind: "context_compacted", status: "compacted", stepId: "step:0", idempotencyKey: "context-compaction:step:0",
+      beforeInputTokens: 1, afterInputTokens: 0, beforeBytes: 1, afterBytes: 0, snapshotRef: "snapshot-compact-1",
+    } }] }
+    const value = input(undefined, current, async () => { throw new Error("sensitive loader details") })
+    const error = await runContextCompaction(value.value).catch(value => value as Error) as unknown as Error
+    expect(error).toMatchObject({ code: "invalid_output", message: "Compacted snapshot replay failed closed" })
+    expect(error.message).not.toContain("sensitive loader details")
+  })
 })
