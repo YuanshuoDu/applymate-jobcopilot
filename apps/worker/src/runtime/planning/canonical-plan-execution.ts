@@ -18,6 +18,7 @@ import { assertMigratedRole, roleContract } from "../subagents/scout-analyst-con
 
 const MAX_OBSERVATIONS = 8
 const MAX_RESULT_BYTES = 8 * 1024
+const CANONICAL_PARALLEL_DELEGATE_LIMIT = 4
 const OUTPUT_KEYS = ["status", "goalRevision", "planRevision", "basedOnPlanRevision", "proposal", "intents", "proposalHash"]
 
 type Registry = { list(capabilities?: readonly string[]): readonly unknown[] }
@@ -337,6 +338,7 @@ function replayRuntime(
         },
       },
       createContext: request => ({ scope: options.scope, sessionId: options.lease.sessionId, turnId: options.lease.turnId, stepId: `${input.stepId}:plan:${request.localId}`, taskId: options.taskId, rootTaskId: options.rootTaskId, actorRole: options.actorRole, capabilities: [...options.capabilities], signal: input.signal }),
+      parallelDelegateLimit: CANONICAL_PARALLEL_DELEGATE_LIMIT,
       rootTaskId: options.rootTaskId,
       resolveInputRefs: request => receipts.has(request.localId) ? {} : resolveInputRefs(input.snapshot, request),
       observe,
@@ -440,6 +442,7 @@ export function createCanonicalPlanExecutionFactory(options: CanonicalPlanExecut
       const commandRuntime: PlanCommandExecutionRuntime = replay?.runtime ?? {
         router: options.router,
         createContext: request => ({ scope: options.scope, sessionId: options.lease.sessionId, turnId: options.lease.turnId, stepId: `${input.stepId}:plan:${request.localId}`, taskId: options.taskId, rootTaskId: options.rootTaskId, actorRole: options.actorRole, capabilities: [...options.capabilities], signal: input.signal }),
+        parallelDelegateLimit: CANONICAL_PARALLEL_DELEGATE_LIMIT,
         rootTaskId: options.rootTaskId,
         resolveInputRefs: request => resolveInputRefs(input.snapshot, request),
         ...(options.persistOutcome ? { observe: async recordValue => options.persistOutcome!(outcomeReceipt(input.call.id, output.planRevision, recordValue)) } : {}),
