@@ -52,6 +52,127 @@ describe("executePlanCommands", () => {
     expect(result.completed[0]).toMatchObject({ localId: "search", dependsOn: [], result: { status: "completed", id: "call:search" } })
   })
 
+  it("keeps delegate execution serial unless the server-owned bound is set", async () => {
+    let active = 0
+    let peak = 0
+    const router = { execute: vi.fn(async (_context: ToolRouterContext, request: ToolCallRequest) => {
+      active++
+      peak = Math.max(peak, active)
+      await Promise.resolve()
+      active--
+      return completed(request)
+    }) }
+    const result = await executePlanCommands(dispatch([delegate("first"), delegate("second")]), runtime(router))
+    expect(result.status).toBe("completed")
+    expect(peak).toBe(1)
+    expect(router.execute.mock.calls.map(call => call[1].id)).toEqual(["call:first", "call:second"])
+  })
+
+  it("starts independent delegates concurrently and observes them in plan order", async () => {
+    let releaseFirst!: () => void
+    const firstGate = new Promise<void>(resolve => { releaseFirst = resolve })
+    let resolveSecondStarted!: () => void
+    const secondStarted = new Promise<void>(resolve => { resolveSecondStarted = resolve })
+    const started: string[] = []
+    const observed: string[] = []
+    const router = { execute: vi.fn(async (_context: ToolRouterContext, request: ToolCallRequest) => {
+      started.push(request.id)
+      if (started.length === 2) resolveSecondStarted()
+      if (request.id === "call:first") await firstGate
+      return completed(request)
+    }) }
+    const execution = executePlanCommands(dispatch([delegate("first"), delegate("second")]), {
+      ...runtime(router), parallelDelegateLimit: 2,
+      observe: record => { observed.push(record.localId) },
+    })
+    await secondStarted
+    expect(started).toEqual(["call:first", "call:second"])
+    releaseFirst()
+    const result = await execution
+    expect(result.status).toBe("completed")
+    expect(observed).toEqual(["first", "second"])
+    expect(result.completed.map(record => record.localId)).toEqual(["first", "second"])
+  })
+
+  it("never exceeds the server-owned delegate concurrency bound", async () => {
+    let active = 0
+    let peak = 0
+    const router = { execute: vi.fn(async (_context: ToolRouterContext, request: ToolCallRequest) => {
+      active++
+      peak = Math.max(peak, active)
+      await Promise.resolve()
+      active--
+      return completed(request)
+    }) }
+    const nodes = Array.from({ length: 8 }, (_, index) => delegate(`child-${index}`))
+    const result = await executePlanCommands(dispatch(nodes), { ...runtime(router), parallelDelegateLimit: 2 })
+    expect(result.status).toBe("completed")
+    expect(router.execute).toHaveBeenCalledTimes(8)
+    expect(peak).toBe(2)
+  })
+
+  it("waits for a dependency layer and keeps a control command as a barrier", async () => {
+    let releaseFirst!: () => void
+    const firstGate = new Promise<void>(resolve => { releaseFirst = resolve })
+    let resolveIndependentStarted!: () => void
+    const independentStarted = new Promise<void>(resolve => { resolveIndependentStarted = resolve })
+    const started: string[] = []
+    const observed: string[] = []
+    const router = { execute: vi.fn(async (_context: ToolRouterContext, request: ToolCallRequest) => {
+      started.push(request.id)
+      if (request.id === "call:independent") resolveIndependentStarted()
+      if (request.id === "call:first") await firstGate
+      return completed(request)
+    }) }
+    const ask = { ...base, localId: "ask", kind: "request_input" as const, objective: "Need input", question: "Where?", dependsOn: ["first", "independent"] }
+    const execution = executePlanCommands(dispatch([delegate("first"), delegate("independent"), delegate("dependent", { dependsOn: ["first"] }), ask]), {
+      ...runtime(router), parallelDelegateLimit: 2,
+      observe: record => { observed.push(record.localId) },
+    })
+    await independentStarted
+    expect(started).toEqual(["call:first", "call:independent"])
+    releaseFirst()
+    const result = await execution
+    expect(result.status).toBe("blocked")
+    expect(started).toEqual(["call:first", "call:independent", "call:dependent"])
+    expect(observed).toEqual(["first", "independent", "dependent", "ask"])
+    expect(router.execute).toHaveBeenCalledTimes(3)
+  })
+
+  it("fails closed after a parallel sibling fails while preserving observation order", async () => {
+    let releaseSecond!: () => void
+    const secondGate = new Promise<void>(resolve => { releaseSecond = resolve })
+    let resolveSecondStarted!: () => void
+    const secondStarted = new Promise<void>(resolve => { resolveSecondStarted = resolve })
+    const observed: string[] = []
+    const router = { execute: vi.fn(async (_context: ToolRouterContext, request: ToolCallRequest) => {
+      if (request.id === "call:second") { resolveSecondStarted(); await secondGate; return completed(request) }
+      return { ...request, status: "failed" as const, errorCode: "policy_denied" }
+    }) }
+    const execution = executePlanCommands(dispatch([delegate("first"), delegate("second")]), {
+      ...runtime(router), parallelDelegateLimit: 2,
+      observe: record => { observed.push(record.localId) },
+    })
+    await secondStarted
+    releaseSecond()
+    const result = await execution
+    expect(result).toMatchObject({ status: "failed", completed: [], failure: { localId: "first", result: { errorCode: "policy_denied" } } })
+    expect(observed).toEqual(["first", "second"])
+  })
+
+  it("surfaces observer failure after attempting sibling observations in order", async () => {
+    const observed: string[] = []
+    const router = { execute: vi.fn(async (_context: ToolRouterContext, request: ToolCallRequest) => completed(request)) }
+    await expect(executePlanCommands(dispatch([delegate("first"), delegate("second")]), {
+      ...runtime(router), parallelDelegateLimit: 2,
+      observe: record => {
+        observed.push(record.localId)
+        if (record.localId === "first") throw new Error("observer unavailable")
+      },
+    })).rejects.toMatchObject({ code: "observer_failed" })
+    expect(observed).toEqual(["first", "second"])
+  })
+
   it("resolves completed local output before routing a dependent command", async () => {
     const requests: ToolCallRequest[] = []
     const router = { execute: vi.fn(async (_context: ToolRouterContext, request: ToolCallRequest) => {

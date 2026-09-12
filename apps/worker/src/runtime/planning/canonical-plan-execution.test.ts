@@ -100,6 +100,25 @@ describe("createCanonicalPlanExecutionFactory", () => {
     expect(result.observations).toHaveLength(2)
   })
 
+  it("enables bounded delegate fan-out for canonical execution", async () => {
+    let releaseFirst!: () => void
+    const firstGate = new Promise<void>(resolve => { releaseFirst = resolve })
+    let resolveSecondStarted!: () => void
+    const secondStarted = new Promise<void>(resolve => { resolveSecondStarted = resolve })
+    const started: string[] = []
+    const router = { execute: vi.fn(async (_context: ToolRouterContext, request: ToolCallRequest) => {
+      started.push(request.id)
+      if (started.length === 2) resolveSecondStarted()
+      if (request.id.endsWith(":first")) await firstGate
+      return { ...request, status: "completed" as const, output: { ok: true }, errorCode: null }
+    }) }
+    const execution = fixture(router)(input(output(proposal([delegate("first"), delegate("second")]))))
+    await secondStarted
+    expect(started).toEqual(["plan-call:proposal-1:first", "plan-call:proposal-1:second"])
+    releaseFirst()
+    await expect(execution).resolves.toMatchObject({ observations: expect.any(Array) })
+  })
+
   it("derives distinct read-only delegate actions from the requested role", async () => {
     const allowedTools = ["jobs.search", "jobs.get", "persona.retrieve", "resume.get_base", "application.get_state", "tool_results.read"]
     const cases = [
