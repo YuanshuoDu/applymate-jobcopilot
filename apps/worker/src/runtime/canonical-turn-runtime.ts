@@ -47,6 +47,8 @@ export type CanonicalTurnRuntimeOptions = {
   readonly planningEnabled?: boolean
   /** Independent server gate for the optional plan execution hook; default is disabled. */
   readonly planningExecutionEnabled?: boolean
+  /** P3-27A bounded in-memory completion recovery; durable restore is deferred to P3-27B. */
+  readonly planCompletionRecoveryLimit?: number
   /** Optional server-owned context compaction seam; omitted preserves legacy behavior. */
   readonly contextCompaction?: TurnEngineOptions["contextCompaction"]
   readonly contextCompactionLoadSnapshot?: TurnEngineOptions["contextCompactionLoadSnapshot"]
@@ -238,6 +240,7 @@ export async function createCanonicalTurnRuntime(pool: pg.Pool, options: Canonic
     const model = modelWithUsage(modelRuntime, lease, authorize)
     const inputStore = createPgInputClaimStore(pool, state.scope)
     const contextBuilder = options.contextBuilderFactory?.({ pool, scope: state.scope }) ?? new StepContextBuilder(inputStore, createPgContextOwnerFence(pool))
+    const planCompletionRequired = options.planningEnabled === true && options.planningExecutionEnabled === true
     const engine = new TurnEngine({
       lease, scope: state.scope, goal: state.goal, goalRef, snapshot: state.snapshot, contextBuilder,
       store: turnStore, model, tools: toolRuntime.registry.list(toolCapabilities),
@@ -248,7 +251,8 @@ export async function createCanonicalTurnRuntime(pool: pg.Pool, options: Canonic
       ...((options.contextSnapshotAdapter?.hook ?? options.contextCompaction) ? { contextCompaction: options.contextSnapshotAdapter?.hook ?? options.contextCompaction } : {}),
       ...((options.contextSnapshotAdapter?.loadSnapshot ?? options.contextCompactionLoadSnapshot) ? { contextCompactionLoadSnapshot: options.contextSnapshotAdapter?.loadSnapshot ?? options.contextCompactionLoadSnapshot } : {}),
       ...(executePlan ? { executePlan } : {}), ...(recoveryDispatcher ? { recoveryDispatcher } : {}),
-      planCompletionRequired: options.planningEnabled === true && options.planningExecutionEnabled === true,
+      planCompletionRequired,
+      ...(planCompletionRequired ? { planCompletionRecoveryLimit: options.planCompletionRecoveryLimit ?? 1 } : {}),
       ...(rootTasks.checkCompletion ? { completionGate: async () => rootTasks.checkCompletion!({ lease, rootTaskId: root.id, now: now() }) } : {}),
     })
     const result = await engine.run()

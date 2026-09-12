@@ -244,6 +244,20 @@ describe("createCanonicalTurnRuntime", () => {
     await expect((await failed.runtime).execute({ lease, signal: new AbortController().signal })).resolves.toMatchObject({ status: "failed", summary: "final_unverified" })
   })
 
+  it("uses one in-memory completion recovery by default and accepts a zero server bound", async () => {
+    const recovered = setup({ planningEnabled: true, planningExecutionEnabled: true })
+    await (await recovered.runtime).execute({ lease, signal: new AbortController().signal })
+    expect(recovered.getModelCalls()).toBe(3)
+
+    const immediate = setup({ planningEnabled: true, planningExecutionEnabled: true, planCompletionRecoveryLimit: 0 })
+    await (await immediate.runtime).execute({ lease, signal: new AbortController().signal })
+    expect(immediate.getModelCalls()).toBe(2)
+
+    const disabled = setup({ planningEnabled: true, planningExecutionEnabled: false, planCompletionRecoveryLimit: 2 })
+    await (await disabled.runtime).execute({ lease, signal: new AbortController().signal })
+    expect(disabled.getModelCalls()).toBe(2)
+  })
+
   it("keeps plan execution behind both server gates and passes server-owned context", async () => {
     const disabledFactory = vi.fn(() => async () => ({ observations: [] }))
     const disabled = setup({ planningEnabled: false, planningExecutionEnabled: true, planExecutionFactory: disabledFactory })

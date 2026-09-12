@@ -16,6 +16,7 @@ import { assertExecutionAlive, assertModelAllowance, canEmitTurnCompleted, canPe
 import { parsePlanRevisionReceipt, planRevisionObservation } from "../planning/plan-revision-receipt.js"
 import { goalRevisionObservation, parseGoalRevisionOutput } from "../planning/goal-revision-receipt.js"
 import { verifyPlanCompletion } from "../planning/plan-completion-verifier.js"
+import { buildPlanCompletionFeedback, MAX_PLAN_COMPLETION_RECOVERY_ATTEMPTS, planCompletionRecoveryCount } from "../planning/plan-completion-feedback.js"
 import { runContextCompaction } from "../context/context-compaction-runtime.js"
 
 const DEFAULT_MAX_STEPS = 32
@@ -40,6 +41,7 @@ export async function runTurnExecutionLoop(options: TurnExecutionOptions): Promi
   const seenCallIds = new Set<string>()
   let lastStep: TurnEngineStep | null = null
   try {
+    const planCompletionRecoveryLimit = resolvePlanCompletionRecoveryLimit(options)
     await writer.append(
       "turn.started", options.identity.turnId, null,
       { goal: options.goal, taskId: options.identity.taskId, rootTaskId: options.identity.rootTaskId },
@@ -145,6 +147,14 @@ export async function runTurnExecutionLoop(options: TurnExecutionOptions): Promi
         }
         const planCompletion = verifyPlanCompletion({ snapshot, required: options.planCompletionRequired === true })
         if (!planCompletion.ok) {
+          const usedRecoveryAttempts = planCompletionRecoveryCount(snapshot.toolObservations, options.identity.turnId)
+          if (usedRecoveryAttempts < planCompletionRecoveryLimit) {
+            const feedback = buildPlanCompletionFeedback(step.id, usedRecoveryAttempts + 1)
+            if (!feedback) throw new TurnEngineError("invalid_output", "Plan completion feedback could not be built")
+            // P3-27A intentionally keeps recovery feedback in this loop snapshot. P3-27B will add durable replay/restore.
+            snapshot = { ...snapshot, toolObservations: [...snapshot.toolObservations, feedback] }
+            continue
+          }
           await writer.append(
             "final.rejected", step.id, null,
             { code: "final_unverified", blocker: planCompletion.blocker, feedback: planCompletion.feedback, taskId: options.identity.taskId },
@@ -222,6 +232,15 @@ export async function runTurnExecutionLoop(options: TurnExecutionOptions): Promi
     ).catch(() => undefined)
     return { status: "failed", stepCount: steps, toolCallCount: toolCalls, errorCode: code, ...(finalItem ? { finalItemId: finalItem.id } : {}) }
   }
+}
+
+function resolvePlanCompletionRecoveryLimit(options: TurnExecutionOptions): number {
+  if (options.planCompletionRequired !== true) return 0
+  const limit = options.planCompletionRecoveryLimit ?? 1
+  if (!Number.isInteger(limit) || limit < 0 || limit > MAX_PLAN_COMPLETION_RECOVERY_ATTEMPTS) {
+    throw new TurnEngineError("invalid_output", "Plan completion recovery limit is outside the server-owned bound")
+  }
+  return limit
 }
 
 async function assertCompletionAllowed(options: TurnExecutionOptions, writer: TurnExecutionEventWriter, step: TurnEngineStep, signal: AbortSignal, now: () => Date): Promise<void> {

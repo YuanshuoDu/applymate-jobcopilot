@@ -107,6 +107,8 @@ export type TurnExecutionOptions = {
   readonly recoveryDispatcher?: PlanRevisionRecoveryDispatcher
   /** Server-owned barrier required only for the canonical planning execution path. */
   readonly planCompletionRequired?: boolean
+  /** P3-27A in-memory recovery bound; durable restore is deferred to P3-27B. */
+  readonly planCompletionRecoveryLimit?: number
   readonly completionGate?: TurnEngineCompletionGate
   /** Optional server-owned context compaction hook; omitted preserves legacy behavior. */
   readonly contextCompaction?: ContextCompactionHook

@@ -12,6 +12,7 @@ import { createGoalUpdateTool } from "../planning/goal-update-tool.js"
 import { createPlanProposalTool } from "../planning/plan-proposal-tool.js"
 import { createCanonicalPlanExecutionFactory } from "../planning/canonical-plan-execution.js"
 import { createPlanRevisionRecoveryDispatcher, planRevisionObservation } from "../planning/plan-revision-receipt.js"
+import { PLAN_COMPLETION_FEEDBACK_TEXT } from "../planning/plan-completion-feedback.js"
 import type { ToolExecutionContext } from "../tools/types.js"
 import type { TurnEngineItem, TurnEngineStore, TurnEngineToolResult } from "./turn-engine-types.js"
 import type { TurnExecutionIdentity, TurnExecutionOptions, TurnExecutionStore } from "./turn-execution-types.js"
@@ -116,6 +117,55 @@ describe("owner-agnostic turn execution loop", () => {
     expect(result).toMatchObject({ status: "failed", errorCode: "final_unverified" })
     expect(root.events).toEqual(expect.arrayContaining([expect.objectContaining({ type: "final.rejected", payload: expect.objectContaining({ code: "final_unverified" }) })]))
     expect(root.events.some(event => event.type === "turn.completed")).toBe(false)
+  })
+
+  it("gives one bounded replan opportunity with fixed feedback in the next model context", async () => {
+    const root = fixture(identity("turn", "root-1"), undefined, async ({ call }) => ({
+      observations: [{ id: `plan-control:${call.id}:finish`, content: { kind: "plan_control", localId: "finish", status: "completion_proposed", dependsOn: [], completionCriteria: ["done"] } }],
+    }), [{ id: "tool-result:seed", content: { toolCallId: "seed", toolName: "jobs.search", input: {}, status: "completed", output: { job: "job-1" }, errorCode: null } }])
+    const proposal: PlanProposal = { schemaVersion: PLAN_PROPOSAL_SCHEMA_VERSION, basedOnGoalRevision: 1, basedOnPlanRevision: null, nodes: [], completionCriteria: [], briefRationale: "replan" }
+    const accepted = { status: "accepted" as const, goalRevision: 1, planRevision: 1, basedOnPlanRevision: null, proposal, intents: [], proposalHash: fingerprintPlanProposal(proposal) }
+    let calls = 0
+    const requests: HarnessModelRequest[] = []
+    root.options = {
+      ...root.options,
+      planCompletionRequired: true,
+      planCompletionRecoveryLimit: 1,
+      model: {
+        ...root.options.model,
+        async *stream(request: HarnessModelRequest): AsyncGenerator<ModelStreamEvent> {
+          requests.push(request)
+          calls += 1
+          if (calls === 2) {
+            yield { type: "tool_call_completed", callId: "replan-call", name: "agent.plan.propose", arguments: { proposal } }
+            yield { type: "completed", finishReason: "tool_calls" }
+          } else {
+            yield { type: "text_delta", text: "done" }
+            yield { type: "completed", finishReason: "stop" }
+          }
+        },
+      },
+      executeTool: async ({ call }) => ({ id: call.id, toolName: call.toolName, toolVersion: "1", status: "completed" as const, output: call.toolName === "agent.plan.propose" ? accepted : { job: "job-1" }, errorCode: null }),
+    }
+    const result = await runTurnExecutionLoop(root.options)
+    expect(result).toMatchObject({ status: "completed", stepCount: 3, toolCallCount: 1 })
+    expect(JSON.stringify(requests[1]?.messages)).toContain("plan_completion_feedback")
+    expect(JSON.stringify(requests[1]?.messages)).toContain(PLAN_COMPLETION_FEEDBACK_TEXT)
+    expect(root.events.some(event => event.type === "final.rejected")).toBe(false)
+  })
+
+  it("fails closed immediately when the server-owned recovery limit is zero", async () => {
+    const root = fixture(identity("turn", "root-1"))
+    const result = await runTurnExecutionLoop({ ...root.options, planCompletionRequired: true, planCompletionRecoveryLimit: 0 })
+    expect(result).toMatchObject({ status: "failed", errorCode: "final_unverified", stepCount: 2 })
+    expect(root.requests).toHaveLength(2)
+  })
+
+  it.each([-1, 3, 1.5, Number.NaN])("fails closed for an out-of-bound recovery limit (%s)", async limit => {
+    const root = fixture(identity("turn", "root-1"))
+    const result = await runTurnExecutionLoop({ ...root.options, planCompletionRequired: true, planCompletionRecoveryLimit: limit })
+    expect(result).toMatchObject({ status: "failed", errorCode: "invalid_output" })
+    expect(root.requests).toHaveLength(0)
   })
 
   it("feeds a persisted tool observation into the next model step", async () => {
