@@ -15,6 +15,7 @@ import type { TurnExecutionOptions } from "./turn-execution-types.js"
 import { assertExecutionAlive, assertModelAllowance, canEmitTurnCompleted, canPersistFinalResponse, makeExecutionId, resumedBudgetLimits, totalTurnUsage, turnErrorCode, updateExecutionStep } from "./turn-engine-helpers.js"
 import { parsePlanRevisionReceipt, planRevisionObservation } from "../planning/plan-revision-receipt.js"
 import { goalRevisionObservation, parseGoalRevisionOutput } from "../planning/goal-revision-receipt.js"
+import { runContextCompaction } from "../context/context-compaction-runtime.js"
 
 const DEFAULT_MAX_STEPS = 32
 const PLAN_OBSERVATION_MAX_BYTES = 8 * 1024
@@ -60,6 +61,12 @@ export async function runTurnExecutionLoop(options: TurnExecutionOptions): Promi
       )
       let stepOutput: ModelStepResult | null = null
       try {
+        snapshot = (await runContextCompaction({
+          hook: options.contextCompaction, loadSnapshot: options.contextCompactionLoadSnapshot, identity: options.identity, scope: options.scope,
+          sessionId: options.identity.sessionId, turnId: options.identity.turnId, stepId: step.id,
+          signal, now: now(), snapshot,
+          append: (payload, key) => writer.append("context.compaction", step.id, null, payload, key),
+        })).snapshot
         const context = await options.contextBuilder.build({
           scope: options.scope, identity: options.identity, stepId: step.id, snapshot,
           rootInputId: ordinal === 0 ? options.rootInputId : undefined, now: now(),

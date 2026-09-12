@@ -8,6 +8,7 @@ import type { TurnLease } from "./lease.js"
 import type { TurnEngineCompletionGate } from "./turn-execution-types.js"
 import type { GoalContractRef } from "../planning/goal-plan-contract.js"
 import type { PlanRevisionRecoveryDispatcher } from "../planning/plan-revision-receipt.js"
+import type { ContextCompactionHook, ContextCompactionSnapshotLoader } from "../context/context-snapshot-compaction-seam.js"
 
 export type TurnEngineItemType = "agent_message" | "reasoning_summary" | "tool_call" | "tool_result" | "error"
 export type TurnEngineItemPhase = "commentary" | "final_answer" | null
@@ -179,6 +180,9 @@ export type TurnEngineOptions = {
   /** Runtime-owned replay repair seam; normal plan proposals never call it. */
   readonly recoveryDispatcher?: PlanRevisionRecoveryDispatcher
   readonly completionGate?: TurnEngineCompletionGate
+  /** Optional server-owned context compaction hook; omitted preserves legacy behavior. */
+  readonly contextCompaction?: ContextCompactionHook
+  readonly contextCompactionLoadSnapshot?: ContextCompactionSnapshotLoader
   readonly rootInputId?: string
   /** Runtime-owned current task identity. Root turns use rootTaskId. */
   readonly taskId?: string

@@ -187,7 +187,7 @@ describe("owner-agnostic turn execution loop", () => {
     const revisionObservation = { id: "goal-revision:2", content: { kind: "goal_revision", goalRevision: 2, basedOnGoalRevision: 1, goalContract } }
     const root = fixture(identity("turn", "root-1"), undefined, undefined, [...persisted, revisionObservation], false, undefined, { name: "agent.goal.update", arguments: input, output: persisted[0]!.content.output })
     const result = await runTurnExecutionLoop(root.options)
-    expect(result.status).toBe("completed")
+    expect(result).toMatchObject({ status: "completed" })
     expect(root.events.some(event => event.type === "goal.revision")).toBe(false)
   })
 
@@ -476,5 +476,38 @@ describe("owner-agnostic turn execution loop", () => {
     const result = await runTurnExecutionLoop(root.options)
     expect(result).toMatchObject({ status: "failed", errorCode: "invalid_output" })
     expect(root.requests).toHaveLength(1)
+  })
+
+  it("runs the optional context compaction hook before the model and persists a bounded projection", async () => {
+    const root = fixture(identity("turn", "root-1"), undefined, undefined, [{ id: "large", content: { text: "x".repeat(1000) } }])
+    const hook: NonNullable<TurnExecutionOptions["contextCompaction"]> = async request => request.stepId.endsWith("step:0")
+      ? { status: "compacted", snapshot: { ...request.snapshot, toolObservations: [] }, snapshotRef: "snapshot-compact-1" }
+      : { status: "unchanged", snapshot: request.snapshot }
+    const result = await runTurnExecutionLoop({ ...root.options, contextCompaction: hook })
+    expect(result.status).toBe("completed")
+    expect(root.events.filter(event => event.type === "context.compaction" && event.payload)).toHaveLength(2)
+    expect(root.events.find(event => event.type === "context.compaction" && event.payload)).toMatchObject({ payload: expect.objectContaining({ status: "compacted", snapshotRef: "snapshot-compact-1" }) })
+  })
+
+  it("fails the turn closed when context compaction fails before model invocation", async () => {
+    const root = fixture(identity("turn", "root-1"))
+    const hook: NonNullable<TurnExecutionOptions["contextCompaction"]> = () => { throw new Error("sensitive hook detail") }
+    const result = await runTurnExecutionLoop({ ...root.options, contextCompaction: hook })
+    expect(result).toMatchObject({ status: "failed", errorCode: "invalid_output" })
+    expect(root.requests).toHaveLength(0)
+    expect(root.events.some(event => event.type === "context.compaction" && (event.payload as Record<string, unknown>)?.status === "failed")).toBe(true)
+    expect(JSON.stringify(root.events)).not.toContain("sensitive hook detail")
+  })
+
+  it("replays a compacted snapshot through the server-owned loader without rerunning the hook", async () => {
+    const persisted = { id: "context-compacted:turn:turn-1:step:0", content: {
+      kind: "context_compacted", status: "compacted", stepId: "turn:turn-1:step:0", idempotencyKey: "context-compaction:turn:turn-1:step:0",
+      beforeInputTokens: 20, afterInputTokens: 8, beforeBytes: 80, afterBytes: 32, snapshotRef: "snapshot-compact-1",
+    } }
+    const root = fixture(identity("turn", "root-1"), undefined, undefined, [persisted])
+    const result = await runTurnExecutionLoop({ ...root.options, contextCompactionLoadSnapshot: async request => ({ snapshot: { system: [], profile: [], steerHistory: [], businessRefs: [], toolObservations: [{ id: "tool-result:call:root-1", content: { toolCallId: "call:root-1", toolName: "jobs.search", input: { location: "Dublin" }, status: "completed", output: { job: "job-1" }, errorCode: null } }] }, scope: request.scope, sessionId: request.sessionId, turnId: request.turnId }) })
+    expect(result.status).toBe("completed")
+    expect(JSON.stringify(root.requests[0]?.messages)).toContain("job-1")
+    expect(root.events.filter(event => event.type === "context.compaction" && event.payload)).toHaveLength(0)
   })
 })

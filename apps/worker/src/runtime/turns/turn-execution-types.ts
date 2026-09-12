@@ -20,6 +20,7 @@ import type {
 } from "./turn-engine-types.js"
 import type { GoalContractRef } from "../planning/goal-plan-contract.js"
 import type { PlanRevisionRecoveryDispatcher } from "../planning/plan-revision-receipt.js"
+import type { ContextCompactionHook, ContextCompactionSnapshotLoader } from "../context/context-snapshot-compaction-seam.js"
 
 export type TurnEngineCompletionGateResult =
   | { readonly ok: true }
@@ -105,6 +106,9 @@ export type TurnExecutionOptions = {
   /** Runtime-owned replay repair seam; normal plan proposals never call it. */
   readonly recoveryDispatcher?: PlanRevisionRecoveryDispatcher
   readonly completionGate?: TurnEngineCompletionGate
+  /** Optional server-owned context compaction hook; omitted preserves legacy behavior. */
+  readonly contextCompaction?: ContextCompactionHook
+  readonly contextCompactionLoadSnapshot?: ContextCompactionSnapshotLoader
 }
 
 export type TurnExecutionOutcome = TurnEngineResult

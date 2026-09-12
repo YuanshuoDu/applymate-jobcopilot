@@ -46,6 +46,9 @@ export type CanonicalTurnRuntimeOptions = {
   readonly planningEnabled?: boolean
   /** Independent server gate for the optional plan execution hook; default is disabled. */
   readonly planningExecutionEnabled?: boolean
+  /** Optional server-owned context compaction seam; omitted preserves legacy behavior. */
+  readonly contextCompaction?: TurnEngineOptions["contextCompaction"]
+  readonly contextCompactionLoadSnapshot?: TurnEngineOptions["contextCompactionLoadSnapshot"]
   /** Optional server-owned override; absent uses the default bridge when both gates are on. */
   readonly planExecutionFactory?: (input: CanonicalPlanExecutionFactoryInput) => TurnEngineOptions["executePlan"] | undefined
   readonly stateLoader?: (pool: Pick<pg.Pool, "connect">, lease: TurnLease, now?: Date) => Promise<CanonicalTurnState>
@@ -239,6 +242,8 @@ export async function createCanonicalTurnRuntime(pool: pg.Pool, options: Canonic
       actorRole, capabilities: toolCapabilities,
       validateToolArguments: (name, input) => toolRuntime.registry.validateArguments(name, input, "1"), signal,
       budget: limits(state.budgetSnapshot), resume: state.resume, now, publishReasoningSummary: false,
+      ...(options.contextCompaction ? { contextCompaction: options.contextCompaction } : {}),
+      ...(options.contextCompactionLoadSnapshot ? { contextCompactionLoadSnapshot: options.contextCompactionLoadSnapshot } : {}),
       ...(executePlan ? { executePlan } : {}), ...(recoveryDispatcher ? { recoveryDispatcher } : {}), ...(rootTasks.checkCompletion ? { completionGate: async () => rootTasks.checkCompletion!({ lease, rootTaskId: root.id, now: now() }) } : {}),
     })
     const result = await engine.run()

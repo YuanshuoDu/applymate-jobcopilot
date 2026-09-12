@@ -137,6 +137,21 @@ describe("loadCanonicalTurnState", () => {
     expect(value.snapshot.toolObservations).toEqual(expect.arrayContaining([{ id: "plan-revision:receipt-2", content: { kind: "plan_revision", planCallId: "receipt-2", goalRevision: 1, planRevision: 2, basedOnPlanRevision: 1 } }]))
   })
 
+  it("restores a bounded context compaction projection for replay", async () => {
+    const fake = pool({
+      turn: { input: { goal: "Find jobs" }, rootTaskId: "root-1", contextSnapshotId: null, modelProfileSnapshot: {}, toolPolicySnapshot: {}, budgetSnapshot: {} },
+      events: [{ type: "context.compaction", payload: {
+        kind: "context_compacted", observationId: "context-compacted:step:0", status: "compacted", stepId: "step:0",
+        idempotencyKey: "context-compaction:step:0", beforeInputTokens: 20, afterInputTokens: 8,
+        beforeBytes: 80, afterBytes: 32, snapshotRef: "snapshot-compact-1",
+      } }],
+    })
+    const value = await loadCanonicalTurnState(fake, lease)
+    expect(value.snapshot.toolObservations).toEqual([expect.objectContaining({ id: "context-compacted:step:0", content: expect.objectContaining({ kind: "context_compacted", snapshotRef: "snapshot-compact-1" }) })])
+    const eventQuery = fake.client.query.mock.calls.find(([sql]) => typeof sql === "string" && sql.includes('FROM "agent_events"'))?.[0]
+    expect(eventQuery).toContain("'context.compaction'")
+  })
+
   it("restores bounded semantic proposal hashes in event order and deduplicates them", async () => {
     const hashA = `sha256:${"a".repeat(64)}`
     const hashB = `sha256:${"b".repeat(64)}`
