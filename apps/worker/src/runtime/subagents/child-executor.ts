@@ -9,7 +9,8 @@ import type { ContextSnapshotAdapter } from "../context/context-snapshot-adapter
 import { createHarnessModelRuntime } from "../harness-model.js"
 import { visibleToolPolicy, getSubagentRolePolicy } from "./role-policy.js"
 import { childContextSnapshot, createChildContextBuilder } from "./child-context.js"
-import { ROLE_RESULT_SCHEMA, validateRoleResult, type StructuredRoleResult } from "./role-results.js"
+import { ROLE_RESULT_SCHEMA } from "./role-results.js"
+import { createObservedEvidenceIndex, parseAndBindStructuredResult, recordReadToolOutput } from "./child-evidence.js"
 import { SubagentLeaseError, type SubagentExecutionResult, type SubagentLease, type SubagentTaskRecord } from "./types.js"
 import type { TurnExecutionStore } from "../turns/turn-execution-types.js"
 import { createToolRouterExecutor } from "../turns/turn-engine-helpers.js"
@@ -58,23 +59,6 @@ function expectedStructuredRole(value: unknown, leasedRole: string): StructuredR
     if ((prototype !== Object.prototype && prototype !== null) || Object.getOwnPropertySymbols(value).length > 0) return undefined
     if (Object.keys(marker).length !== 2 || marker.schemaVersion !== ROLE_RESULT_SCHEMA || marker.role !== leasedRole) return undefined
     return leasedRole
-  } catch {
-    return undefined
-  }
-}
-
-function parseStructuredResult(value: string, role: StructuredRole): StructuredRoleResult | undefined {
-  if (Buffer.byteLength(value, "utf8") > MAX_CHILD_FINAL_TEXT_BYTES) return undefined
-  let parsed: unknown
-  try {
-    parsed = JSON.parse(value) as unknown
-  } catch {
-    return undefined
-  }
-  try {
-    const validated = validateRoleResult(parsed, role)
-    const serialized = JSON.stringify(validated)
-    return serialized !== undefined && Buffer.byteLength(serialized, "utf8") <= MAX_CHILD_FINAL_TEXT_BYTES ? validated : undefined
   } catch {
     return undefined
   }
@@ -145,10 +129,17 @@ export function createChildExecutor(options: ChildExecutorOptions): (input: { le
     if (!policy) return { status: "failed", failureReason: "subagent_role_unknown" }
     const adapter = await (options.modelRuntimeFactory?.({ task: lease }) ?? defaultModel(lease))
     const model = createUsageAwareModelAdapter(adapter, { owner, authorize: options.authorizeUsage, treeBudget: options.treeBudget })
+    const observedEvidence = createObservedEvidenceIndex()
+    const routedTool = createToolRouterExecutor(runtime.router)
+    const executeTool: typeof routedTool = async input => {
+      const toolResult = await routedTool(input)
+      if (toolResult.status === "completed" && toolResult.errorCode === null) recordReadToolOutput(observedEvidence, input.call.toolName, toolResult.output)
+      return toolResult
+    }
     const result = await runTurnExecutionLoop({
       identity: owner, scope: { userId: lease.userId }, goal: lease.goal, snapshot: childContextSnapshot(lease),
       contextBuilder: createChildContextBuilder(lease), store: options.store, model, tools: definitions,
-      executeTool: createToolRouterExecutor(runtime.router), actorRole: policy.actorRole, capabilities: policy.capabilities,
+      executeTool, actorRole: policy.actorRole, capabilities: policy.capabilities,
       validateToolArguments: runtime.validateArguments, signal: lease.signal, now: options.now, publishReasoningSummary: false,
       contextCompaction: options.contextSnapshotAdapter?.hook,
       contextCompactionLoadSnapshot: options.contextSnapshotAdapter?.loadSnapshot,
@@ -167,7 +158,7 @@ export function createChildExecutor(options: ChildExecutorOptions): (input: { le
     const structuredRole = expectedStructuredRole(lease.expectedOutputSchema, lease.role)
     if (result.status === "completed" && structuredRole) {
       if (typeof result.finalText !== "string") return { status: "failed", result: { ...childResult, status: "failed" as const }, failureReason: "invalid_structured_result" }
-      const structuredResult = parseStructuredResult(result.finalText, structuredRole)
+      const structuredResult = parseAndBindStructuredResult(result.finalText, structuredRole, observedEvidence)
       if (!structuredResult) return { status: "failed", result: { ...childResult, status: "failed" as const }, failureReason: "invalid_structured_result" }
       return { status: "completed", result: { ...childResult, finalText: projectChildFinalText(result.finalText), structuredResult }, failureReason: result.errorCode }
     }

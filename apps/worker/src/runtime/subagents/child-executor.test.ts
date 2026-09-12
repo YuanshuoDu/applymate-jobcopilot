@@ -40,7 +40,11 @@ function lease(): SubagentLease {
 type StructuredRole = "scout" | "analyst"
 
 function structuredLease(role: StructuredRole): SubagentLease {
-  return { ...lease(), role, taskType: `${role}.read`, expectedOutputSchema: { schemaVersion: ROLE_RESULT_SCHEMA, role } }
+  return {
+    ...lease(), role, taskType: `${role}.read`,
+    allowedActions: role === "analyst" ? ["jobs.search", "persona.retrieve", "resume.get_base"] : ["jobs.search", "jobs.get"],
+    expectedOutputSchema: { schemaVersion: ROLE_RESULT_SCHEMA, role },
+  }
 }
 
 function validScoutResult() {
@@ -56,6 +60,19 @@ function validAnalystResult() {
     schemaVersion: ROLE_RESULT_SCHEMA, role: "analyst" as const, status: "completed" as const,
     findings: [{ jobId: "job-1", score: 8, evidenceIds: ["evidence-job-1"] }],
     evidence: [{ id: "evidence-job-1", kind: "job" as const, ref: "job-1", source: "greenhouse" }], summary: "Strong match",
+  }
+}
+
+function analystReadEvidenceResult() {
+  return {
+    schemaVersion: ROLE_RESULT_SCHEMA, role: "analyst" as const, status: "completed" as const,
+    findings: [{ jobId: "job-1", score: 8, evidenceIds: ["model-job", "model-fact", "model-resume"] }],
+    evidence: [
+      { id: "model-job", kind: "job" as const, ref: "job-1", source: "model-job-source" },
+      { id: "model-fact", kind: "persona" as const, ref: "fact-1", source: "model-persona-source" },
+      { id: "model-resume", kind: "resume" as const, ref: "resume-1", source: "model-resume-source" },
+    ],
+    summary: "Strong match",
   }
 }
 
@@ -76,11 +93,34 @@ function finalTextModel(text: string): ModelAdapter {
   }
 }
 
-function finalTextExecutor(model: ModelAdapter) {
+function readSequenceModel(text: string, toolNames: readonly string[]): ModelAdapter {
+  let calls = 0
+  return {
+    id: "fixture-model", profile,
+    async *stream() {
+      calls += 1
+      const toolName = toolNames[calls - 1]
+      if (toolName) {
+        yield { type: "tool_call_completed", callId: `read-call-${calls}`, name: toolName, arguments: {} }
+        yield { type: "completed", finishReason: "tool_calls" }
+      } else {
+        yield { type: "text_delta", text }
+        yield { type: "completed", finishReason: "stop" }
+      }
+    },
+  }
+}
+
+function finalTextExecutor(model: ModelAdapter, outputs: Readonly<Record<string, unknown>> = {}) {
   return createChildExecutor({
     store: executionStore([], []), treeBudget: budgetStore().store, authorizeUsage: async () => ({ settle: async () => undefined }),
     modelRuntimeFactory: () => model,
-    toolRuntimeFactory: () => ({ definitions: [tool("jobs.search", "jobs")], router: { execute: async (_context, request) => ({ ...request, status: "completed", errorCode: null }) } }),
+    toolRuntimeFactory: () => ({
+      definitions: [tool("jobs.search", "jobs"), tool("jobs.get", "jobs"), tool("persona.retrieve", "persona"), tool("resume.get_base", "resume")],
+      router: { execute: async (_context, request) => ({
+        ...request, status: "completed", output: outputs[request.toolName] ?? { jobs: [{ id: "job-1", source: "greenhouse" }] }, errorCode: null,
+      }) },
+    }),
   })
 }
 
@@ -282,8 +322,70 @@ describe("child executor composition", () => {
     ["analyst", validAnalystResult],
   ] as const)("projects a validated structured %s result with bound evidence", async (role, makeResult) => {
     const result = await finalTextExecutor(finalTextModel(JSON.stringify(makeResult())))({ lease: structuredLease(role) })
-    expect(result).toMatchObject({ status: "completed", result: { status: "completed", finalText: expect.any(String), structuredResult: makeResult() } })
+    expect(result).toMatchObject({ status: "completed", result: { status: "completed", finalText: expect.any(String), structuredResult: expect.any(Object) } })
+    const childOutput = result.result as { readonly structuredResult?: unknown }
+    expect(childOutput.structuredResult).toMatchObject({
+      evidence: [{ id: "read:job:job-1", kind: "job", ref: "job-1", source: "greenhouse" }],
+    })
+    const projected = childOutput.structuredResult as { readonly candidates?: readonly { readonly evidenceIds: readonly string[] }[]; readonly findings?: readonly { readonly evidenceIds: readonly string[] }[] }
+    expect(projected.candidates?.[0]?.evidenceIds ?? projected.findings?.[0]?.evidenceIds).toEqual(["read:job:job-1"])
     expect(JSON.stringify(result.result)).not.toMatch(/userId|sessionId|turnId|stepId|taskId|parentTaskId|rootTaskId|ownerId|lease|capabilit|budget/i)
+  })
+
+  it("binds analyst persona and resume evidence to successful read records", async () => {
+    const result = await finalTextExecutor(
+      readSequenceModel(JSON.stringify(analystReadEvidenceResult()), ["jobs.search", "persona.retrieve", "resume.get_base"]),
+      {
+        "jobs.search": { jobs: [{ id: "job-1", source: "greenhouse" }] },
+        "persona.retrieve": { facts: [{ id: "fact-1", source: "persona.database" }] },
+        "resume.get_base": { resume: { id: "resume-1" } },
+      },
+    )({ lease: structuredLease("analyst") })
+    expect(result).toMatchObject({ status: "completed", result: { status: "completed", structuredResult: expect.any(Object) } })
+    const projected = (result.result as { readonly structuredResult: { readonly evidence: readonly unknown[]; readonly findings: readonly { readonly evidenceIds: readonly string[] }[] } }).structuredResult
+    expect(projected.evidence).toEqual([
+      { id: "read:job:job-1", kind: "job", ref: "job-1", source: "greenhouse" },
+      { id: "read:persona:fact-1", kind: "persona", ref: "fact-1", source: "persona.database" },
+      { id: "read:resume:resume-1", kind: "resume", ref: "resume-1", source: "resume.get_base" },
+    ])
+    expect(projected.findings[0]?.evidenceIds).toEqual(["read:job:job-1", "read:persona:fact-1", "read:resume:resume-1"])
+  })
+
+  it.each([
+    ["fabricated job", validScoutResult(), ["jobs.search"] as const, {}],
+    ["null jobs.get", validScoutResult(), ["jobs.get"] as const, { "jobs.get": { job: null } }],
+    ["unknown evidence ref", { ...validScoutResult(), evidence: [...validScoutResult().evidence, { id: "unknown", kind: "persona" as const, ref: "fact-404", source: "model" }] }, ["jobs.search"] as const, {}],
+  ] as const)("fails closed for %s without a matching observed record", async (_name, original, toolNames, outputs) => {
+    const value = _name === "fabricated job"
+      ? { ...original, candidates: [{ ...original.candidates[0], jobId: "job-fake" }], evidence: [{ ...original.evidence[0], ref: "job-fake" }] }
+      : original
+    const result = await finalTextExecutor(readSequenceModel(JSON.stringify(value), toolNames), outputs)({ lease: structuredLease("scout") })
+    expect(result).toMatchObject({ status: "failed", result: { status: "failed" }, failureReason: "invalid_structured_result" })
+    expect(result.result).not.toHaveProperty("finalText")
+    expect(result.result).not.toHaveProperty("structuredResult")
+  })
+
+  it("fails closed when two model evidence entries resolve to one observed record", async () => {
+    const value = validScoutResult()
+    const result = {
+      ...value,
+      candidates: [{ ...value.candidates[0], evidenceIds: ["model-one", "model-two"] }],
+      evidence: [
+        { id: "model-one", kind: "job" as const, ref: "job-1", source: "first" },
+        { id: "model-two", kind: "job" as const, ref: "job-1", source: "second" },
+      ],
+    }
+    const output = await finalTextExecutor(finalTextModel(JSON.stringify(result)))({ lease: structuredLease("scout") })
+    expect(output).toMatchObject({ status: "failed", result: { status: "failed" }, failureReason: "invalid_structured_result" })
+    expect(output.result).not.toHaveProperty("structuredResult")
+  })
+
+  it("accepts an empty observed search when the structured result has no claims", async () => {
+    const result = await finalTextExecutor(
+      finalTextModel(JSON.stringify({ schemaVersion: ROLE_RESULT_SCHEMA, role: "scout", status: "completed", candidates: [], evidence: [], summary: "No matches" })),
+      { "jobs.search": { jobs: [] } },
+    )({ lease: structuredLease("scout") })
+    expect(result).toMatchObject({ status: "completed", result: { status: "completed", structuredResult: { candidates: [], evidence: [], summary: "No matches" } } })
   })
 
   it.each([
