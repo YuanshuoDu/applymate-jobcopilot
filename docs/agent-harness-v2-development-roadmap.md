@@ -1527,3 +1527,19 @@ Server-owned canonical IDs use `read:<kind>:<ref>`; model evidence IDs and sourc
 **Independent verification:** Focused tests passed **32/32** (**7 child-evidence + 25 child-executor**); shared build, Worker `tsc --noEmit --skipLibCheck`, and `git diff --check` passed.
 
 **Candidate boundary:** Live DB/RLS, Redis/queue, provider, restart, browser, and child-parent E2E behavior remain unverified.
+
+---
+
+## 35. P4-05 — Server-owned structured contract provenance
+
+**Candidate status/date (2026-09-12):** P4-05 is recorded as a candidate server-owned structured contract slice; overall status remains **P0 accepted 1/8 (12.5%)**, unchanged by this slice.
+
+**Implementation:** Commit `7b33aa79` removes `expectedOutputSchema` from the public `spawn_subagent` schema. With `additionalProperties: false`, model input containing that field is rejected before execution.
+
+`executeSpawn` never forwards `expectedOutputSchema` to `manager.spawn`, including when a raw or cast runtime input attempts to inject it. The server-direct marker path in `root-orchestration.ts` is unchanged.
+
+This slice adds no migration, provider, queue, or external-write changes.
+
+**Independent verification:** `coordination-tools` and `coordination-executors` focused tests passed **10/10**; shared build, Worker `tsc --noEmit --skipLibCheck`, and `git diff --check` passed.
+
+**Candidate boundary:** Live DB/RLS, Redis/queue, provider, restart, browser, and child-parent E2E behavior remain unverified.
