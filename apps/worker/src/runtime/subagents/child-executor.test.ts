@@ -295,7 +295,7 @@ describe("child executor composition", () => {
     ["cross-role result", JSON.stringify({ ...validScoutResult(), role: "analyst" })],
   ] as const)("fails closed for %s structured output", async (_name, text) => {
     const result = await finalTextExecutor(finalTextModel(text))({ lease: structuredLease("scout") })
-    expect(result).toMatchObject({ status: "failed", failureReason: "invalid_structured_result" })
+    expect(result).toMatchObject({ status: "failed", result: { status: "failed" }, failureReason: "invalid_structured_result" })
     expect(result.result).not.toHaveProperty("finalText")
     expect(result.result).not.toHaveProperty("structuredResult")
   })
@@ -304,7 +304,7 @@ describe("child executor composition", () => {
     const text = JSON.stringify({ ...validScoutResult(), summary: "x".repeat(9_000) })
     expect(Buffer.byteLength(text, "utf8")).toBeGreaterThan(8 * 1024)
     const result = await finalTextExecutor(finalTextModel(text))({ lease: structuredLease("scout") })
-    expect(result).toMatchObject({ status: "failed", failureReason: "invalid_structured_result" })
+    expect(result).toMatchObject({ status: "failed", result: { status: "failed" }, failureReason: "invalid_structured_result" })
     expect(result.result).not.toHaveProperty("finalText")
     expect(result.result).not.toHaveProperty("structuredResult")
   })

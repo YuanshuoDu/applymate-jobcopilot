@@ -166,9 +166,9 @@ export function createChildExecutor(options: ChildExecutorOptions): (input: { le
     }
     const structuredRole = expectedStructuredRole(lease.expectedOutputSchema, lease.role)
     if (result.status === "completed" && structuredRole) {
-      if (typeof result.finalText !== "string") return { status: "failed", result: childResult, failureReason: "invalid_structured_result" }
+      if (typeof result.finalText !== "string") return { status: "failed", result: { ...childResult, status: "failed" as const }, failureReason: "invalid_structured_result" }
       const structuredResult = parseStructuredResult(result.finalText, structuredRole)
-      if (!structuredResult) return { status: "failed", result: childResult, failureReason: "invalid_structured_result" }
+      if (!structuredResult) return { status: "failed", result: { ...childResult, status: "failed" as const }, failureReason: "invalid_structured_result" }
       return { status: "completed", result: { ...childResult, finalText: projectChildFinalText(result.finalText), structuredResult }, failureReason: result.errorCode }
     }
     return {
