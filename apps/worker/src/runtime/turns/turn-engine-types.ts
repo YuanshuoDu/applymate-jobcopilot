@@ -230,6 +230,8 @@ export type TurnEngineResult = {
   readonly toolCallCount: number
   readonly waitId?: string
   readonly finalItemId?: string
+  /** Server-owned projection of the verified final response for completed turns. */
+  readonly finalText?: string
   readonly errorCode?: string
 }
 

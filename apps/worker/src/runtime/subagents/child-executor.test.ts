@@ -2,6 +2,7 @@ import { Type } from "@sinclair/typebox"
 import { schemaVersion } from "@jobcopilot/agent-protocol"
 import { describe, expect, it, vi } from "vitest"
 import type { HarnessModelRequest, ModelAdapter, ModelStreamEvent } from "@jobcopilot/agent-model"
+import { Buffer } from "node:buffer"
 
 import { createChildExecutor } from "./child-executor.js"
 import { childContextSnapshot, createChildContextBuilder } from "./child-context.js"
@@ -190,6 +191,67 @@ describe("child executor composition", () => {
     expect(budget.statuses).toEqual(["consumed", "consumed"])
     expect(events.every(event => event.taskId === child.id)).toBe(true)
     expect(events.some(event => event.type === "turn.completed" || event.type === "turn.failed")).toBe(false)
+  })
+
+  it("projects a redacted, bounded final response for a completed child", async () => {
+    const child = lease()
+    const finalText = `Candidate contact: alice@example.com\n${"你".repeat(5_000)}`
+    let calls = 0
+    const model: ModelAdapter = {
+      id: "fixture-model", profile,
+      async *stream() {
+        calls += 1
+        if (calls === 1) {
+          yield { type: "tool_call_completed", callId: "evidence-call", name: "jobs.search", arguments: {} }
+          yield { type: "completed", finishReason: "tool_calls" }
+        } else {
+          yield { type: "text_delta", text: finalText }
+          yield { type: "completed", finishReason: "stop" }
+        }
+      },
+    }
+    const executor = createChildExecutor({
+      store: executionStore([], []), treeBudget: budgetStore().store, authorizeUsage: async () => ({ settle: async () => undefined }),
+      modelRuntimeFactory: () => model,
+      toolRuntimeFactory: () => ({ definitions: [tool("jobs.search", "jobs")], router: { execute: async (_context, request) => ({ ...request, status: "completed", errorCode: null }) } }),
+    })
+
+    const result = await executor({ lease: child })
+    expect(result).toMatchObject({ status: "completed", result: { status: "completed", finalItemId: expect.any(String), finalText: expect.any(String) } })
+    const projected = (result.result as { readonly finalText?: unknown }).finalText
+    expect(typeof projected).toBe("string")
+    if (typeof projected !== "string") throw new Error("child final text was not projected")
+    expect(projected).toContain("[REDACTED_EMAIL]")
+    expect(projected).not.toContain("alice@example.com")
+    expect(projected.endsWith("...[TRUNCATED]")).toBe(true)
+    expect(Buffer.byteLength(projected, "utf8")).toBeLessThanOrEqual(8 * 1024)
+    expect(Buffer.from(projected, "utf8").toString("utf8")).toBe(projected)
+    expect(JSON.stringify(result.result)).not.toMatch(/userId|sessionId|turnId|stepId|taskId|parentTaskId|rootTaskId|ownerId|lease|capabilit|budget/i)
+  })
+
+  it("does not project final text while a child is waiting", async () => {
+    const child = lease()
+    const model: ModelAdapter = {
+      id: "fixture-model", profile,
+      async *stream() {
+        yield { type: "tool_call_completed", callId: "wait-call", name: "jobs.search", arguments: {} }
+        yield { type: "completed", finishReason: "tool_calls" }
+      },
+    }
+    const executor = createChildExecutor({
+      store: executionStore([], []), treeBudget: budgetStore().store, authorizeUsage: async () => ({ settle: async () => undefined }),
+      modelRuntimeFactory: () => model,
+      toolRuntimeFactory: () => ({
+        definitions: [tool("jobs.search", "jobs")],
+        router: { execute: async (_context, request) => ({
+          ...request, status: "completed", output: { status: "waiting", waitId: "wait-1", deadlineAt: "2026-09-12T12:00:00.000Z", matchedTaskIds: [] }, errorCode: null,
+        }) },
+      }),
+    })
+
+    const result = await executor({ lease: child })
+    expect(result).toMatchObject({ status: "waiting", result: { status: "waiting_for_dependency" } })
+    expect(result.result).not.toHaveProperty("finalText")
   })
 
   it("releases before the provider when account admission fails", async () => {

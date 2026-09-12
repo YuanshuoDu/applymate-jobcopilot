@@ -1,6 +1,8 @@
 import type { ModelAdapter } from "@jobcopilot/agent-model"
 import type { PolicyRole } from "@jobcopilot/agent-protocol"
+import { redactSensitiveText } from "@jobcopilot/shared"
 import { loadWorkerAiConfig, type AiConfig } from "@jobcopilot/shared/llm"
+import { Buffer } from "node:buffer"
 
 import { executionOwnerFence } from "../execution-owner.js"
 import type { ContextSnapshotAdapter } from "../context/context-snapshot-adapter.js"
@@ -22,6 +24,28 @@ export type ChildToolRuntime = {
   readonly definitions: readonly ChildPublicDefinition[]
   readonly router: { execute(context: ToolRouterContext, request: ToolCallRequest): Promise<ToolExecutionResult> }
   readonly validateArguments?: (name: string, input: unknown, version?: string) => true | string
+}
+
+const MAX_CHILD_FINAL_TEXT_BYTES = 8 * 1024
+const CHILD_FINAL_TEXT_TRUNCATION_MARKER = "...[TRUNCATED]"
+
+function utf8Prefix(value: string, maxBytes: number): string {
+  let bytes = 0
+  let prefix = ""
+  for (const character of value) {
+    const characterBytes = Buffer.byteLength(character, "utf8")
+    if (bytes + characterBytes > maxBytes) break
+    prefix += character
+    bytes += characterBytes
+  }
+  return prefix
+}
+
+function projectChildFinalText(value: string): string {
+  const redacted = redactSensitiveText(value)
+  if (Buffer.byteLength(redacted, "utf8") <= MAX_CHILD_FINAL_TEXT_BYTES) return redacted
+  const markerBytes = Buffer.byteLength(CHILD_FINAL_TEXT_TRUNCATION_MARKER, "utf8")
+  return `${utf8Prefix(redacted, MAX_CHILD_FINAL_TEXT_BYTES - markerBytes)}${CHILD_FINAL_TEXT_TRUNCATION_MARKER}`
 }
 
 export type ChildExecutorOptions = {
@@ -102,6 +126,13 @@ export function createChildExecutor(options: ChildExecutorOptions): (input: { le
       isOwnershipLost: (error, signal) => signal.aborted || error instanceof SubagentLeaseError,
       signalError: () => new Error("subagent_lease_lost"),
     })
-    return { status: resultStatus(result.status), result: { status: result.status, stepCount: result.stepCount, toolCallCount: result.toolCallCount, finalItemId: result.finalItemId ?? null }, failureReason: result.errorCode }
+    const childResult = {
+      status: result.status,
+      stepCount: result.stepCount,
+      toolCallCount: result.toolCallCount,
+      finalItemId: result.finalItemId ?? null,
+      ...(result.status === "completed" && typeof result.finalText === "string" ? { finalText: projectChildFinalText(result.finalText) } : {}),
+    }
+    return { status: resultStatus(result.status), result: childResult, failureReason: result.errorCode }
   }
 }

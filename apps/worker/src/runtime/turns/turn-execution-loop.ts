@@ -187,7 +187,7 @@ export async function runTurnExecutionLoop(options: TurnExecutionOptions): Promi
             "turn-completed",
           )
         }
-        return { status: "completed", stepCount: steps, toolCallCount: toolCalls, finalItemId: finalItem.id }
+        return { status: "completed", stepCount: steps, toolCallCount: toolCalls, finalItemId: finalItem.id, finalText: output.text }
       } catch (error: unknown) {
         const status = signalWasInterrupted(signal) ? "interrupted" : "failed"
         await updateExecutionStep(options, {
