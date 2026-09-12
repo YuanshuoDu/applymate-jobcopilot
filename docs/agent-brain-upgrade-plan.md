@@ -641,3 +641,11 @@ Commits `50732010`, `af5eb8f3` and `8d23c395` implement the server-owned `join` 
 The canonical bridge handles the first `waiting` result as a durable dependency handoff, then resumes ready or timed-out joins. Recovery consumes only a strict matching `wait-result:<waitId>` observation, validates target and matched IDs, and never reroutes the prior spawn or wait. Coordination gate-off keeps both delegate and join unavailable while preserving legacy planning behavior. Astra independently verified **6 files / 87 tests**; Worker TypeScript, the shared build and `git diff --check` passed.
 
 No live PostgreSQL/RLS, Redis/queue, provider, process restart or cross-process child-parent E2E was run. Overall completion remains **1/8 (12.5%)**; P3-20 remains a candidate.
+
+## P3-21 update
+
+Commits `0d815c36` and `d7dcd630` add an optional server-owned context compaction hook before each canonical model call. The hook receives stable fenced identity, turn/step metadata, the current `StepContextSnapshot`, and bounded token/size estimates. Stable step idempotency prevents duplicate compaction on replay. Results are `unchanged` or `compacted`; protected system/profile/goal/steer-history/business-reference invariants are enforced, allowing only tool observations to change.
+
+The runtime records only a bounded `context_compacted` observation plus a server-owned snapshot reference in `context.compaction`. Canonical state restores the projection, while replay uses a scoped loader carrying snapshot ref, tenant scope, session ID and turn ID. Missing, malformed, cross-scope or throwing loaders fail closed with sanitized diagnostics. Hook failures retain the original snapshot and cannot produce a successful turn. Canonical runtime injection exists, while production hook and loader wiring remain opt-in and default disabled; raw context and error text never enter observations.
+
+Independent focused evidence covers **4 test files / 73 tests**; shared build, Worker TypeScript and `git diff --check` passed. Real PostgreSQL/RLS, Redis/queue, provider, process restart and cross-process loader E2E remain unverified. Nested serialization validation for malformed custom-loader snapshots remains a follow-up. Overall completion remains **1/8 (12.5%)**; P3-21 remains a candidate.
