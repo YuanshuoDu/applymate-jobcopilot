@@ -1588,3 +1588,17 @@ This slice adds no migration, provider, model, queue, or external-write changes.
 **Independent verification:** The focused Worker suite passed **16/16**; the shared package build, Worker `tsc --noEmit --skipLibCheck`, and `git diff --check` also passed.
 
 **Candidate boundary:** Execution-control row synchronization is not part of this slice. Live Redis/PostgreSQL, real Worker startup, restart, provider, browser, and child-parent E2E behavior remain unverified. The canonical automation gate remains opt-in; this slice cannot be used to declare complete Harness, P4/Phase completion, or production recovery evidence.
+
+---
+
+## 39. P4-09 — Canonical execution projection and terminal-root reconciliation
+
+**Candidate status/date (2026-09-13):** P4-09 is recorded as a candidate canonical execution projection and failure-recovery slice; overall progress remains **P0 accepted 1/8 (12.5%)**, unchanged by this slice.
+
+**Implementation:** Commit `67397416` adds an opt-in server-owned projection from canonical Turn outcomes into the existing automation `AgentExecution` control row. The projection sets the tenant context, resolves the execution by session, constrains mutations to the session's `source = 'automation'`, maps completed/failed/dependency-wait/user-wait/interrupted outcomes to the existing control states, preserves cancelled and terminal rows, and keeps `startedAt` stable across retries.
+
+Canonical runtime execution now starts the projection before the engine, finishes the durable root first, and then finishes the projection. If projection finish fails after the root is durable, a lease-fenced optional `RootTaskStore.reconcileTerminal` seam reads and validates the persisted terminal root result on retry; the runtime retries only projection and returns the stored outcome without rerunning the model/engine or finishing the root twice. Legacy root-store test doubles remain compatible when the seam is absent.
+
+**Independent verification:** Focused Worker validation passed **48/48** across canonical execution projection, canonical runtime, and root-task-store tests; the shared package build, Worker `tsc --noEmit --skipLibCheck`, and `git diff --check` also passed.
+
+**Candidate boundary:** The projection is opt-in through existing Worker runtime wiring and only affects sessions selected by its automation-session SQL scope. Live PostgreSQL/RLS, Redis/queue delivery, real Worker startup or restart, provider, browser, and child-parent E2E behavior remain unverified. This candidate does not establish complete Harness, P4/Phase completion, or production acceptance.
