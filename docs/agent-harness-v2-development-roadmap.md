@@ -1361,3 +1361,16 @@ git diff --check
 - P3-27A/B 的候选边界仍然有效：恢复上限、current turn/current plan 过滤、稳定幂等和 planning/child gate 语义必须保持；本回归不能用于宣称完整 Harness 或 P3/Phase 完成。
 
 **独立验证：** 根侧对 `canonical-turn-runtime` 与 `turn-execution-loop` 验证 **63/63 passed**；pretest shared build、Worker TypeScript 与 `git diff --check` 均通过。未覆盖 live DB/RLS、Redis/queue、provider、真实进程重启、浏览器 E2E 或 child-parent E2E；总体进度仍为 **1/8（12.5%）**。
+
+---
+
+## 24. P3-29 — Legacy Orchestrator evaluate fail-closed 候选切片
+
+**状态与进度口径（2026-09-12）：** P3-29 是 legacy Orchestrator evaluate 的候选修复切片，不代表 ModelAdapter 全迁移、动态 TaskGraph、完整 Harness 或 P3/Phase 完成。中文升级计划总进度仍按 **P0 已验收 1/8（12.5%）** 统计。
+
+**实现记录：** 主分支集成提交为 `93f941bc`、`c5a51a23`、`52849bb6`、`8aa3dc3d`；对应原 Worker 提交为 `7dfb6c30`、`d69c608e`、`1c2e3c7e`、`562812cf`。Orchestrator evaluate 对 malformed JSON、缺少 `decision`、unknown decision、缺少/空/超长 `thinking`、`ask_user` 缺少问题、`retry` 缺少/为空/为数组，以及 `ask_options` 非数组、坏 option 或非法 action，均 fail closed 为 `abort`，不再默认 `proceed`；合法 decision 仍保持原有行为。
+
+- 本切片只修复 legacy Orchestrator evaluate 的输入边界和决策默认值，不能作为 ModelAdapter 全迁移、动态 TaskGraph 或完整 Harness 的证据。
+- 根侧独立验证：Web Orchestrator **23/23**，`web exec tsc` 通过，`git diff --check` 通过；未取得 live provider、E2E 或生产证据。
+
+**候选边界：** P3-29 与 P3-27A/B、P3-28 仍是候选切片；不能据此宣称完整 Harness 或 P3/Phase 完成。后续仍需分别验证 ModelAdapter 迁移、动态 TaskGraph、live provider、浏览器/E2E 及生产组合行为。
