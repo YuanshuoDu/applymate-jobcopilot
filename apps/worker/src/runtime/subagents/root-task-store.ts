@@ -2,11 +2,16 @@ import type pg from "pg"
 
 import type { TurnEngineResult } from "../turns/turn-engine-types.js"
 import type { TurnEngineCompletionGateResult } from "../turns/turn-execution-types.js"
+import type { TurnExecutionResult } from "../turns/turn-queue.js"
 import type { TurnLease } from "../turns/lease.js"
 import type { PgSubagentPool, SubagentTaskRecord, SubagentTaskStatus } from "./types.js"
 
+type ReconciledTurnStatus = Exclude<TurnExecutionResult["status"], "queued">
+export type RootTaskReconciliation = { readonly rootTaskId: string; readonly result: Omit<TurnExecutionResult, "status"> & { readonly status: ReconciledTurnStatus } }
+
 export type RootTaskStore = {
   ensure(input: { lease: TurnLease; goal: string; modelProfileSnapshot?: unknown; toolPolicySnapshot?: unknown; budgetSnapshot?: unknown; allowedActions?: readonly string[]; now?: Date }): Promise<SubagentTaskRecord>
+  reconcileTerminal?(input: { lease: TurnLease; now?: Date }): Promise<RootTaskReconciliation | null>
   checkCompletion?(input: { lease: TurnLease; rootTaskId: string; now?: Date }): Promise<TurnEngineCompletionGateResult>
   finish(input: { lease: TurnLease; rootTaskId: string; result: TurnEngineResult; now?: Date }): Promise<void>
 }
@@ -26,6 +31,10 @@ function containsSecret(value: unknown): boolean {
   if (Array.isArray(value)) return value.some(containsSecret)
   if (!value || typeof value !== "object") return false
   return Object.entries(value).some(([key, child]) => /api.?key|secret|password|(?:access|refresh).?token|authorization/i.test(key) || containsSecret(child))
+}
+
+function record(value: unknown): Record<string, unknown> {
+  return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {}
 }
 
 function date(value: unknown): Date | null {
@@ -67,6 +76,37 @@ const SELECT_ROOT = `SELECT task.*, session."userId" AS "userId"
   WHERE task."id" = $1 AND task."sessionId" = $2 AND task."turnId" = $3`
 
 const TERMINAL_TASK_STATUSES = new Set(["completed", "failed", "interrupted", "cancelled", "closed"])
+const TERMINAL_ROOT_STATUSES = new Set(["completed", "failed", "interrupted", "waiting", "waiting_for_user"])
+const TURN_RESULT_STATUSES = new Set(["completed", "failed", "interrupted", "waiting_for_dependency", "waiting_for_approval", "waiting_for_user"])
+
+type TerminalRootRow = { id: unknown; status: unknown; result: unknown; failureReason: unknown }
+
+function boundedText(value: unknown, name: string): string | undefined {
+  if (value === null || value === undefined) return undefined
+  if (typeof value !== "string" || value.trim().length === 0 || Buffer.byteLength(value, "utf8") > 256) throw new Error(`root_terminal_${name}_invalid`)
+  return value
+}
+
+function resultCount(value: unknown, name: string): number {
+  if (!Number.isSafeInteger(value) || Number(value) < 0 || Number(value) > 2_147_483_647) throw new Error(`root_terminal_${name}_invalid`)
+  return Number(value)
+}
+
+function terminalResult(row: TerminalRootRow): RootTaskReconciliation {
+  const rootTaskId = boundedText(row.id, "id")
+  const rootStatus = boundedText(row.status, "status")
+  const payload = record(row.result)
+  const turnStatus = boundedText(payload.status, "result")
+  if (!rootTaskId || !rootStatus || !TERMINAL_ROOT_STATUSES.has(rootStatus) || !turnStatus || !TURN_RESULT_STATUSES.has(turnStatus)) throw new Error("root_terminal_result_invalid")
+  const expectedRootStatus = turnStatus === "waiting_for_dependency" ? "waiting" : turnStatus === "waiting_for_approval" ? "waiting_for_user" : turnStatus
+  if (expectedRootStatus !== rootStatus) throw new Error("root_terminal_status_mismatch")
+  resultCount(payload.stepCount, "step_count")
+  resultCount(payload.toolCallCount, "tool_call_count")
+  const waitId = boundedText(payload.waitId, "wait_id")
+  if (turnStatus === "waiting_for_dependency" && !waitId) throw new Error("root_terminal_wait_id_missing")
+  const summary = boundedText(row.failureReason, "failure_reason")
+  return { rootTaskId, result: { status: turnStatus as ReconciledTurnStatus, ...(summary ? { summary } : {}), ...(waitId ? { waitId } : {}) } }
+}
 
 function completionBlocker(rows: readonly Row[]): TurnEngineCompletionGateResult {
   const pending = rows.filter(row => !TERMINAL_TASK_STATUSES.has(String(row.status)))
@@ -165,7 +205,7 @@ export function createPgRootTaskStore(pool: PgSubagentPool): RootTaskStore {
       // A user wait transitions the Turn before this root settlement runs.
       // Keep every other result fenced to the active in-progress state.
       const waitState = input.result.status === "waiting_for_user"
-      const result = JSON.stringify({ status: input.result.status, stepCount: input.result.stepCount, toolCallCount: input.result.toolCallCount, finalItemId: input.result.finalItemId ?? null })
+      const result = JSON.stringify({ status: input.result.status, stepCount: input.result.stepCount, toolCallCount: input.result.toolCallCount, finalItemId: input.result.finalItemId ?? null, waitId: input.result.waitId ?? null })
       await transaction(pool, input.lease.userId, async (client) => {
         const ownedTurn = await client.query(
            `SELECT "id" FROM "agent_turns" WHERE "id" = $1 AND "sessionId" = $2 AND "userId" = $3
@@ -183,6 +223,25 @@ export function createPgRootTaskStore(pool: PgSubagentPool): RootTaskStore {
           [next, result, input.result.errorCode ?? null, now, input.rootTaskId, input.lease.sessionId, input.lease.turnId, input.lease.ownerId],
         )
         if (updated.rowCount !== 1) throw new Error("root_task_fenced")
+      })
+    },
+    async reconcileTerminal(input): Promise<RootTaskReconciliation | null> {
+      const now = input.now ?? new Date()
+      return transaction(pool, input.lease.userId, async (client) => {
+        const result = await client.query<TerminalRootRow>(
+          `SELECT task."id", task."status", task."result", task."failureReason"
+           FROM "sub_agent_tasks" AS task
+           JOIN "agent_sessions" AS session ON session."id" = task."sessionId"
+           JOIN "agent_turns" AS turn ON turn."id" = task."turnId" AND turn."sessionId" = task."sessionId"
+           WHERE task."id" = task."rootTaskId" AND task."sessionId" = $1 AND task."turnId" = $2
+             AND task."status" IN ('completed', 'failed', 'interrupted', 'waiting', 'waiting_for_user')
+             AND session."userId" = $3 AND turn."userId" = $3
+             AND turn."leaseOwnerId" = $4 AND turn."leaseVersion" = $5
+             AND turn."leaseExpiresAt" > $6 AND turn."status" = 'in_progress'
+           FOR UPDATE OF task`,
+          [input.lease.sessionId, input.lease.turnId, input.lease.userId, input.lease.ownerId, input.lease.leaseVersion, now],
+        )
+        return result.rows[0] ? terminalResult(result.rows[0]) : null
       })
     },
   }

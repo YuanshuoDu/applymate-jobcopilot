@@ -9,6 +9,7 @@ import { workerHarnessFeatureHealth } from "./admin/harness-health.js";
 import { startAgentWakeupConsumer } from "./runtime/wakeup/consumer.js";
 import { resolveProductionAgentFlags } from "./runtime/production-agent-flags.js";
 import { createProductionContextCompactionOptions } from "./runtime/context/production-context-compaction.js";
+import { createCanonicalExecutionProjection } from "./runtime/canonical-execution-projection.js";
 
 async function main() {
   const adminHost = resolveWorkerAdminHost();
@@ -88,6 +89,7 @@ async function main() {
     coordinationEnabled: consumeWaitOutcomes,
     planningEnabled: productionFlags.planningEnabled,
     planningExecutionEnabled: productionFlags.planningExecutionEnabled,
+    executionProjection: createCanonicalExecutionProjection(pool),
     ...contextCompactionOptions,
   });
   // Child execution is opt-in. Keep tree-budget and child queue construction

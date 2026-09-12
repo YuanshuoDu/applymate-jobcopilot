@@ -51,6 +51,20 @@ function completionPool(descendants: Array<Record<string, unknown>>, owned = tru
   return { pool: { connect: vi.fn(async () => client) } as never, calls }
 }
 
+function terminalPool(root: Record<string, unknown> | null) {
+  const calls: Array<{ sql: string; values?: unknown[] }> = []
+  const client = {
+    query: vi.fn(async (sql: string, values?: unknown[]) => {
+      calls.push({ sql, values })
+      if (sql === "BEGIN" || sql === "COMMIT" || sql === "ROLLBACK" || sql.includes("set_config")) return { rows: [], rowCount: 0 }
+      if (sql.includes('FROM "sub_agent_tasks" AS task') && sql.includes('task."id" = task."rootTaskId"')) return { rows: root ? [root] : [], rowCount: root ? 1 : 0 }
+      return { rows: [], rowCount: 1 }
+    }),
+    release: vi.fn(),
+  }
+  return { pool: { connect: vi.fn(async () => client) } as never, calls, client }
+}
+
 describe("createPgRootTaskStore", () => {
   it("creates a scoped root with explicit allowed actions and keeps secrets out", async () => {
     const fake = fakePool()
@@ -117,8 +131,38 @@ describe("createPgRootTaskStore", () => {
 
   it("releases the root lease when a turn enters a wait state", async () => {
     const fake = fakePool()
-    await createPgRootTaskStore(fake.pool).finish({ lease, rootTaskId: "root-turn-1", result: { status: "waiting_for_dependency", stepCount: 1, toolCallCount: 0 } })
+    await createPgRootTaskStore(fake.pool).finish({ lease, rootTaskId: "root-turn-1", result: { status: "waiting_for_dependency", stepCount: 1, toolCallCount: 0, waitId: "wait-1" } })
     expect(fake.calls.some(sql => sql.includes('"leaseOwner" = NULL') && sql.includes('"leaseExpiresAt" = NULL'))).toBe(true)
+    expect(fake.client.query.mock.calls.some(([, values]) => String(values?.[1]).includes('"waitId":"wait-1"'))).toBe(true)
+  })
+
+  it.each([
+    ["completed", "completed", null],
+    ["waiting", "waiting_for_dependency", "wait-1"],
+  ] as const)("reconciles a persisted %s root without rebinding it", async (rootStatus, turnStatus, waitId) => {
+    const fake = terminalPool(row({ status: rootStatus, result: { status: turnStatus, stepCount: 2, toolCallCount: 1, waitId } }))
+    const result = await createPgRootTaskStore(fake.pool).reconcileTerminal!({ lease, now: new Date("2026-09-07T00:00:10.000Z") })
+
+    expect(result).toEqual({ rootTaskId: "root-turn-1", result: { status: turnStatus, ...(waitId ? { waitId } : {}) } })
+    expect(fake.calls[2]?.sql).toContain('session."userId" = $3')
+    expect(fake.calls[2]?.sql).toContain('turn."leaseOwnerId" = $4')
+    expect(fake.calls[2]?.sql).toContain('turn."leaseVersion" = $5')
+    expect(fake.calls[2]?.sql).toContain('turn."status" = \'in_progress\'')
+  })
+
+  it("reconciles a persisted failed result with its bounded failure code", async () => {
+    const fake = terminalPool(row({ status: "failed", result: { status: "failed", stepCount: 1, toolCallCount: 2 }, failureReason: "provider_error" }))
+    await expect(createPgRootTaskStore(fake.pool).reconcileTerminal!({ lease })).resolves.toEqual({ rootTaskId: "root-turn-1", result: { status: "failed", summary: "provider_error" } })
+  })
+
+  it("returns no terminal root when the leased turn has none", async () => {
+    const fake = terminalPool(null)
+    await expect(createPgRootTaskStore(fake.pool).reconcileTerminal!({ lease })).resolves.toBeNull()
+  })
+
+  it("fails closed when a terminal root result is malformed", async () => {
+    const fake = terminalPool(row({ status: "completed", result: { status: "failed", stepCount: 1, toolCallCount: 0 } }))
+    await expect(createPgRootTaskStore(fake.pool).reconcileTerminal!({ lease })).rejects.toThrow("root_terminal_status_mismatch")
   })
 
   it.each(["queued", "running", "waiting"]) ("blocks completion while a %s child remains", async (childStatus) => {

@@ -473,6 +473,46 @@ describe("createCanonicalTurnRuntime", () => {
     expect(fixture.roots.finish).toHaveBeenCalledWith(expect.objectContaining({ rootTaskId: "root-1", result: expect.objectContaining({ status: "completed" }) }))
   })
 
+  it("projects automation control state around canonical execution and fails closed on projection errors", async () => {
+    const projection = { start: vi.fn(async () => undefined), finish: vi.fn(async () => undefined) }
+    const fixture = setup({ executionProjection: projection })
+    const runtime = await fixture.runtime
+
+    await expect(runtime.execute({ lease, signal: new AbortController().signal })).resolves.toMatchObject({ status: "completed" })
+    expect(projection.start).toHaveBeenCalledWith({ userId: "user-1", sessionId: "session-1" })
+    expect(projection.finish).toHaveBeenCalledWith(expect.objectContaining({ userId: "user-1", sessionId: "session-1", result: expect.objectContaining({ status: "completed" }) }))
+    expect(fixture.roots.finish.mock.invocationCallOrder[0]).toBeLessThan(projection.finish.mock.invocationCallOrder[0] ?? Number.MAX_SAFE_INTEGER)
+
+    const failedProjection = { start: vi.fn(async () => { throw new Error("control projection unavailable") }), finish: vi.fn(async () => undefined) }
+    const failed = setup({ executionProjection: failedProjection })
+    const failedRuntime = await failed.runtime
+    await expect(failedRuntime.execute({ lease, signal: new AbortController().signal })).rejects.toThrow("control projection unavailable")
+    expect(failed.getModelCalls()).toBe(0)
+    expect(failed.roots.finish).not.toHaveBeenCalled()
+
+    const failedFinishProjection = { start: vi.fn(async () => undefined), finish: vi.fn(async () => { throw new Error("control result projection unavailable") }) }
+    const failedFinish = setup({ executionProjection: failedFinishProjection })
+    const failedFinishRuntime = await failedFinish.runtime
+    await expect(failedFinishRuntime.execute({ lease, signal: new AbortController().signal })).rejects.toThrow("control result projection unavailable")
+    expect(failedFinish.roots.finish).toHaveBeenCalledTimes(1)
+  })
+
+  it("reconciles a terminal root on projection retry without rerunning the engine", async () => {
+    const roots = { ...rootStore(), reconcileTerminal: vi.fn().mockResolvedValueOnce(null).mockResolvedValueOnce({ rootTaskId: "root-1", result: { status: "failed" as const, summary: "provider_error" } }) }
+    const projection = { start: vi.fn(async () => undefined), finish: vi.fn().mockRejectedValueOnce(new Error("projection unavailable")).mockResolvedValueOnce(undefined) }
+    const fixture = setup({ rootTaskStore: roots, executionProjection: projection })
+    const runtime = await fixture.runtime
+
+    await expect(runtime.execute({ lease, signal: new AbortController().signal })).rejects.toThrow("projection unavailable")
+    await expect(runtime.execute({ lease, signal: new AbortController().signal })).resolves.toEqual({ status: "failed", summary: "provider_error" })
+    expect(roots.reconcileTerminal).toHaveBeenCalledTimes(2)
+    expect(projection.start).toHaveBeenCalledTimes(1)
+    expect(fixture.getModelCalls()).toBe(2)
+    expect(roots.finish).toHaveBeenCalledTimes(1)
+    expect(projection.finish).toHaveBeenCalledTimes(2)
+    expect(projection.finish).toHaveBeenLastCalledWith(expect.objectContaining({ result: { status: "failed", errorCode: "provider_error" } }))
+  })
+
   it("passes the server-owned completion gate for the canonical root", async () => {
     const fixture = setup()
     await fixture.runtime.then(runtime => runtime.execute({ lease, signal: new AbortController().signal }))
