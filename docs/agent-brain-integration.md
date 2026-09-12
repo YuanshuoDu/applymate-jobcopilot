@@ -306,6 +306,14 @@ The proposal tool applies the server-owned action allowlist in its validation co
 
 No live PostgreSQL/RLS, Redis, provider, queue delivery, process restart, cross-process recovery or real child-to-parent execution was run. Those boundaries remain reserved for final integration evidence.
 
+## P3-16 update
+
+Commits `b5f74308`, `6a5e5c15`, `74199b3e` and `af484cb4` add the replay recovery candidate for accepted plan receipts. Each Turn owns a server-side recovery dispatcher that distributes parsed receipt metadata to the proposal tool and canonical plan bridge. Recovery enforces contiguous `basedOnPlanRevision` CAS, the server-owned `maxPlanRevisions` bound and the current goal revision. Out-of-bound or conflicting receipts fail closed with `PlanRevisionRecoveryError` (`invalid_output`) before local revision state can advance.
+
+Replay now parses and checks the goal, performs recovery, and only then appends a missing `plan.revision` projection. An existing projection is left untouched, making repair idempotent. Accepted replayed proposals do not rerun the plan hook, and persisted failed or cancelled plan results continue without rerunning it. Astra independently verified the focused set at **4 files / 65 tests** and the regression set at **5 files / 46 tests**; Worker TypeScript, the shared package build and `git diff --check` passed.
+
+No live PostgreSQL/RLS, Redis/queue, provider, process restart or cross-process child-to-parent evidence was collected. Overall completion remains **1/8 (12.5%)**.
+
 ## P2-OUTBOX-1 update
 
 Commit `57dd0ac9` repairs canonical Turn dispatch bookkeeping after enqueue. A successful `queue.add` is followed by a guarded outbox update using the same row ID, setting `publishedAt`, incrementing `attemptCount` and clearing `lastError`; a second drain therefore does not dispatch the same published row again. Queue-add failure records bounded `queue_add_failed` state while leaving the row unpublished for retry. If enqueue succeeds but the bookkeeping update is uncertain, recovery returns `turn_dispatch_delivery_uncertain` and reuses the same generation/job ID rather than inventing another delivery generation.
