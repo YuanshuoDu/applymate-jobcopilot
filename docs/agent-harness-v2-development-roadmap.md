@@ -1320,3 +1320,17 @@ git diff --check
 上述 Lane 默认作为后续 Issue 规划和单 Issue 内 Subagent 切分依据；在当前“一次一个 Issue”策略下，不同时创建多个竞争性开发分支或 PR。
 
 最先应该交给开发的 Issue 是 **AH2-001**。在它合并之前，不开始新的 unattended external-write 能力。
+
+---
+
+## 21. P3-27A — 计划完成恢复候选切片
+
+**状态与进度口径（2026-09-12）：** P3-27A 记录为候选切片，不代表 P3 完成，也不代表完整 Harness 已交付。中文升级计划总进度仍按 **P0 已验收 1/8（12.5%）** 统计；本切片不改变该口径。
+
+**实现记录：** 代码提交为 `3595f2a1`，后续修复为 `57024914`。当 canonical planning 与 plan execution 同时启用、且计划完成校验失败时，执行循环追加固定的服务端拥有 `plan_completion_feedback` 观察，将其放入当前内存快照并进入下一模型步。恢复前清除 provider continuation，避免下一步复用已经失效的 continuation cursor。
+
+- 服务端拥有的 `planCompletionRecoveryLimit` 只接受整数 `0..2`；canonical planning + execution 默认上限为 `1`，设为 `0` 时立即以 `final_unverified` 失败；规划或执行任一关闭时不进行该恢复。
+- parser 只接受固定 observation ID 前缀、固定 `kind`/`status`/`blocker`/`feedback`、整数 attempt `1..2`、完整且有界的字段集合和 payload。count 只取当前 `turnId` 下通过 parser 的最高有效 attempt；伪造、malformed、越界和跨 turn 观察均被过滤。
+- 这是内存恢复候选：反馈没有写入持久化事件或数据库，进程重启、跨进程 replay 和持久化反馈恢复仍属于 **P3-27B**。因此本节不能用于宣称完整 Harness、重启恢复或生产级完成。
+
+**独立验证：** 根侧对 5 个 P3-27 相关文件验证 **105/105**；Worker TypeScript 检查、`@jobcopilot/shared` build 和 `git diff --check` 均通过。未覆盖 live DB/RLS、queue delivery、provider、process restart 或端到端（E2E）验证；这些边界仍需后续集成证据。
