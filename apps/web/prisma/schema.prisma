@@ -132,6 +132,7 @@ model User {
   agentToolResultReferences   AgentToolResultReference[]
   agentWaitConditions         AgentWaitCondition[]
   agentTreeBudgetReservations AgentTreeBudgetReservation[]
+  agentContextCompactionSnapshots AgentContextCompactionSnapshot[]
   planChanges                 UserPlanChange[]
   planSubscription            UserPlanSubscription?
   featureOverrides            UserFeatureOverride[]
@@ -1868,6 +1869,7 @@ model AgentSession {
   turns              AgentTurn[]
   steps              AgentStep[]
   contextSnapshots AgentContextSnapshot[]
+  contextCompactionSnapshots AgentContextCompactionSnapshot[]
   inputs             AgentInput[]
   items              AgentItem[]
   events             AgentEvent[]
@@ -1927,6 +1929,7 @@ model AgentTurn {
   toolResultReferences AgentToolResultReference[] @relation("AgentToolResultReferenceTurn")
   waitConditions AgentWaitCondition[] @relation("AgentWaitConditionTurn")
   treeBudgetReservations AgentTreeBudgetReservation[] @relation("AgentTreeBudgetReservationTurn")
+  contextCompactionSnapshots AgentContextCompactionSnapshot[]
 
   @@index([sessionId, createdAt])
   @@index([userId, status, updatedAt(sort: Desc)])
@@ -1970,6 +1973,7 @@ model AgentStep {
   toolResultReferences AgentToolResultReference[] @relation("AgentToolResultReferenceStep")
   waitConditions AgentWaitCondition[] @relation("AgentWaitConditionStep")
   treeBudgetReservations AgentTreeBudgetReservation[]
+  contextCompactionSnapshots AgentContextCompactionSnapshot[]
 
   @@unique([turnId, ordinal, attempt])
   @@index([turnId, status, createdAt])
@@ -2003,6 +2007,32 @@ model AgentContextSnapshot {
   @@index([sessionId, createdAt(sort: Desc)])
   @@index([sessionId, throughSequence])
   @@map("agent_context_snapshots")
+}
+
+// Immutable context-compaction snapshots keyed by the complete step
+// idempotency identity. This separate model is the opt-in adapter storage for
+// P3-22 and does not alter the sequence-based context snapshot domain above.
+model AgentContextCompactionSnapshot {
+  id             String   @id @default(cuid())
+  userId         String
+  sessionId      String
+  turnId         String
+  stepId         String
+  idempotencyKey String
+  snapshotRef    String   @unique
+  snapshot       Json
+  byteCount      Int
+  createdAt      DateTime @default(now())
+
+  user    User        @relation(fields: [userId], references: [id], onDelete: Cascade, map: "agent_context_compaction_snapshots_userId_fkey")
+  session AgentSession @relation(fields: [sessionId, userId], references: [id, userId], onDelete: Cascade, map: "agent_context_compaction_snapshots_sessionId_fkey")
+  turn    AgentTurn   @relation(fields: [turnId, sessionId, userId], references: [id, sessionId, userId], onDelete: Cascade, map: "agent_context_compaction_snapshots_turnId_fkey")
+  step    AgentStep   @relation(fields: [stepId, turnId, sessionId], references: [id, turnId, sessionId], onDelete: Cascade, map: "agent_context_compaction_snapshots_stepId_fkey")
+
+  @@unique([userId, sessionId, turnId, stepId, idempotencyKey])
+  @@index([userId, sessionId, turnId, stepId])
+  @@index([sessionId, turnId, createdAt(sort: Desc)])
+  @@map("agent_context_compaction_snapshots")
 }
 
 model AgentInput {
