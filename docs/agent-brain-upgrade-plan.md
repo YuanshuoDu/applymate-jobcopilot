@@ -657,3 +657,9 @@ Commit `010bc5e4` adds a reusable server-owned StepContextSnapshot adapter over 
 The adapter enforces snapshot/summary bounds and strict token/byte reduction, then saves through a tenant/session/turn-scoped snapshot store. It derives a stable SHA-256 snapshotRef from server-owned identity, idempotency and the canonical compacted snapshot, without writing raw context into events. Per-step caching prevents duplicate summarizer/store side effects, and rebuilding the adapter preserves the same reference and idempotency key. Canonical runtime injection is optional, legacy hook/loader parameters remain compatible, and production adapter wiring stays opt-in/default disabled.
 
 Focused validation passed **5 files / 79 tests** (including the P3-21 regression files); shared build, Worker TypeScript and `git diff --check` passed. Real PostgreSQL/RLS, Redis/queue, provider, process restart and cross-process snapshot-store E2E remain unverified. Overall completion remains **1/8 (12.5%)**; P3-22 remains a candidate.
+
+## P3-23 update
+
+提交 `54721906c6db59caf16a71227efbc44a13b3f7d5` 为 opt-in 的 P3-22 adapter 增加持久化 PostgreSQL 存储。新增独立的 `agent_context_compaction_snapshots` 表，并通过显式的 `createPgContextSnapshotAdapterStore(pool)` 创建 adapter store。每次存取都在事务内设置 transaction-local `app.user_id`；user/session/turn/step 通过复合外键绑定，RLS policy 复用同一租户范围。迁移还安装 append-only 不可变 trigger，candidate role 被撤销 `UPDATE` 与 `DELETE` 权限。Worker 对 canonical UTF-8 snapshot 执行 256 KiB 上限。同一完整 identity 的 replay 只有在 snapshotRef 和内容一致时才幂等复用；冲突内容或 identity 不匹配会 fail closed。
+
+adapter/store 默认仍是 opt-in，尚未接入 production bootstrap。验证通过：P3-23 focused **6/6**、adapter+compaction **22/22**、Worker `tsc`、Prisma validate（使用临时占位 `DATABASE_URL`，没有真实数据库连接）以及 `git diff --check`。真实 migration 应用/RLS 权限、跨进程并发、进程重启和跨 Worker E2E 尚未验证。总体完成度保持 **1/8（12.5%）**；P3-23 仍是 candidate，不能宣称整个 P3 完成。
