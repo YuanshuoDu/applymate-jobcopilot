@@ -627,3 +627,9 @@ outside the allowed paths. Do not create a fake working implementation.
 - [OpenAI Codex public repository](https://github.com/openai/codex) 是公开参照，不代表取得 Codex Desktop 或其他产品的私有实现；本计划不承诺复制其全部能力。
 
 参考网页于 2026-09-08 本轮读取。实现顺序、数据边界、工作包与验收门槛是针对 ApplyMate 当前状态作出的架构判断。
+
+## P3-19 update
+
+提交 `981ec5f8` 和 `71d4813a` 完成 accepted `agent.plan.propose` 的计划执行重启/回放恢复候选。replayed proposal 使用 server-owned 标记，只消费同一 call 与 deterministic command identity 对应的已持久化合法 receipt；canonical bridge 会严格校验 `plan.command` 和 control receipt，completed output 回填本地依赖输出，缺失 command 按拓扑顺序补跑，并且只持久化本次新增 observation。所有 command 已有合法 receipt 时返回空 observations。proposal tool 与 canonical bridge 的 recovery transition 只有在全部 handler 校验通过后才原子提交；同一 revision 搭配不同 `proposalHash` 会拒绝并保持 hash state 不变。
+
+已持久化的 `failed` 或 `cancelled` command 直接复用，不重新路由；`request_input` 继续保持 waiting control barrier。缺失、损坏、goal mismatch、重复、冲突或非连续 receipt 均以 `invalid_output` fail closed；replay 不推进正常 plan revision cursor，dispatcher 只用于 replay repair。Worker focused 验证为 **4 files / 81 tests**，Worker TypeScript、shared build 和 `git diff --check` 均通过。没有 live PostgreSQL/RLS、Redis/queue、provider、process restart 或 cross-process child→parent E2E 证据，整体完整验收仍为 **1/8 (12.5%)**。
