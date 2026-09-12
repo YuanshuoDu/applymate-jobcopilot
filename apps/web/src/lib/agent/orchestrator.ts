@@ -92,6 +92,20 @@ function isOrchestratorDecision(value: unknown): value is OrchestratorDecision['
   return value === 'proceed' || value === 'retry' || value === 'ask_user' || value === 'abort'
 }
 
+function isNonEmptyText(value: unknown): value is string {
+  return typeof value === 'string' && value.trim().length > 0
+}
+
+function isBoundedNonEmptyText(value: unknown, maxLength: number): value is string {
+  return isNonEmptyText(value) && value.trim().length <= maxLength
+}
+
+function isPlainNonEmptyObject(value: unknown): value is Record<string, unknown> {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) return false
+  const prototype = Object.getPrototypeOf(value)
+  return (prototype === Object.prototype || prototype === null) && Object.keys(value).length > 0
+}
+
 // ── OrchestratorAgent ─────────────────────────────────────────────────────────
 
 export class OrchestratorAgent {
@@ -233,16 +247,21 @@ Respond ONLY in valid JSON (no markdown):
       const r      = await modelChat([{ role: 'user', content: prompt }], this.ctx.aiConfig, 400)
       const parsed = parseDecision(r.text)
       if (!parsed || !isOrchestratorDecision(parsed.decision)) throw new Error('invalid decision')
+      if (!isBoundedNonEmptyText(parsed.thinking, 120)) throw new Error('invalid thinking')
+      if (parsed.decision === 'ask_user' && !isNonEmptyText(parsed.ask_question)) {
+        throw new Error('invalid ask question')
+      }
+      if (parsed.decision === 'retry' && !isPlainNonEmptyObject(parsed.retry_fix)) {
+        throw new Error('invalid retry fix')
+      }
 
       const decision: OrchestratorDecision = {
         ...parsed,
         decision: parsed.decision,
-        thinking: typeof parsed.thinking === 'string' ? parsed.thinking : '',
+        thinking: extractFinalSentence(parsed.thinking),
       }
 
       // Clean thinking field from any preamble too
-      if (decision.thinking) decision.thinking = extractFinalSentence(decision.thinking)
-
       this.history.push(`[${stage}] ${summary} → ${decision.decision}: ${decision.thinking}`)
       this.emit('orchestrator_thinking', { stage, thinking: decision.thinking, decision: decision.decision })
       return decision
