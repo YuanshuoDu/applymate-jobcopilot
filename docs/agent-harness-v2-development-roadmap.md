@@ -1374,3 +1374,18 @@ git diff --check
 - 根侧独立验证：Web Orchestrator **23/23**，`web exec tsc` 通过，`git diff --check` 通过；未取得 live provider、E2E 或生产证据。
 
 **候选边界：** P3-29 与 P3-27A/B、P3-28 仍是候选切片；不能据此宣称完整 Harness 或 P3/Phase 完成。后续仍需分别验证 ModelAdapter 迁移、动态 TaskGraph、live provider、浏览器/E2E 及生产组合行为。
+
+---
+
+## 25. P3-30 — Canonical delegate role-scoped action allowlist
+
+**状态与进度口径（2026-09-12）：** P3-30 是 canonical planning 的候选安全修复切片，不代表动态 TaskGraph、完整 Harness 或 P3/Phase 完成。中文升级计划总进度仍按 **P0 已验收 1/8（12.5%）** 统计；本切片不改变该口径。
+
+**实现记录：** canonical plan execution 为每个 delegate 按 server-owned 的 scout/analyst 合同与 `visibleToolPolicy` 解析只读动作集合。Scout 只获得 `jobs.search`、`jobs.get`；Analyst 只获得 `jobs.search`、`jobs.get`、`persona.retrieve`、`resume.get_base`。集合仍受 canonical `allowedTools`、registry metadata、read risk/capability/domain 和既有 plan action gate 共同约束；未知角色、无匹配动作和 `tool_results.read` 均 fail closed 为 `role_actions_unavailable`。
+
+- 该切片保持 root/child/coordination gate、plan revision、action bounds 和 child executor 的私有 `tool_results.read` 语义；没有扩大到 nested supervisor 或 external writes。
+- 角色动作集合仅写入 server 生成的 `spawn_subagent` input，模型不能注入租约、身份、预算或能力字段。
+
+**独立验证：** canonical plan execution focused suite **34/34 passed**；workspace dependency build、Worker `tsc --noEmit --skipLibCheck` 和 `git diff --check` 均通过。未覆盖 live DB/RLS、Redis/queue、provider、真实进程重启、浏览器 E2E 或 child-parent E2E。
+
+**候选边界：** 本切片不能作为完整 Harness、P3/Phase 完成或生产安全证明；后续仍需验证实际 child dispatch、持久化恢复和生产组合行为。

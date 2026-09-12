@@ -36,12 +36,28 @@ function output(value: PlanProposal, overrides: Record<string, unknown> = {}): R
   return { status: "accepted", goalRevision: 1, planRevision: 1, basedOnPlanRevision: null, proposal: value, intents: [], proposalHash: fingerprintPlanProposal(value), ...overrides }
 }
 
-function fixture(router: { execute(context: ToolRouterContext, request: ToolCallRequest): Promise<ToolExecutionResult> } = { execute: async (_context, request) => ({ ...request, status: "completed", output: { ok: true }, errorCode: null }) }, initialPlanRevision?: number, persistOutcome?: (receipt: PlanCommandReceipt) => Promise<void> | void, maxPlanRevisions?: number, initialPlanHashes?: readonly string[], goalRef?: GoalContractRef, allowedPlanActions?: readonly PlanActionKind[], recoveryDispatcher?: PlanRevisionRecoveryDispatcher) {
+type FixtureOverrides = {
+  readonly allowedTools?: readonly string[]
+  readonly allowedRoles?: readonly string[]
+}
+
+function readDefinition(name: string, domain: "jobs" | "persona" | "resume" | "application") {
+  return { name, version: "1", risk: "read", capabilities: ["read"], domain, requiredCapabilities: [] }
+}
+
+function fixture(router: { execute(context: ToolRouterContext, request: ToolCallRequest): Promise<ToolExecutionResult> } = { execute: async (_context, request) => ({ ...request, status: "completed", output: { ok: true }, errorCode: null }) }, initialPlanRevision?: number, persistOutcome?: (receipt: PlanCommandReceipt) => Promise<void> | void, maxPlanRevisions?: number, initialPlanHashes?: readonly string[], goalRef?: GoalContractRef, allowedPlanActions?: readonly PlanActionKind[], recoveryDispatcher?: PlanRevisionRecoveryDispatcher, overrides: FixtureOverrides = {}) {
+  const allowedTools = overrides.allowedTools ?? ["jobs.search"]
+  const allowedRoles = overrides.allowedRoles ?? ["scout"]
   const options: CanonicalPlanExecutionOptions = {
-    goal, allowedTools: ["jobs.search"], allowedTemplates: [], allowedRoles: ["scout"], maxNodes: 8,
+    goal, allowedTools, allowedTemplates: [], allowedRoles, maxNodes: 8,
     capabilities: ["read", "canPlan"], actorRole: "orchestrator", scope: { userId: "user-1" }, lease,
     rootTaskId: "root-1", taskId: "root-1", initialPlanRevision, router,
-    registry: { list: () => [{ name: "jobs.search", version: "1", risk: "read", capabilities: ["read"] }, { name: "wait_subagents", version: "1", risk: "internal_write", capabilities: ["coordination"] }] },
+    registry: { list: () => [
+      readDefinition("jobs.search", "jobs"), readDefinition("jobs.get", "jobs"), readDefinition("persona.retrieve", "persona"),
+      readDefinition("resume.get_base", "resume"), readDefinition("application.get_state", "application"),
+      { name: "tool_results.read", version: "1", risk: "read", capabilities: ["read"], domain: "coordination", requiredCapabilities: [] },
+      { name: "wait_subagents", version: "1", risk: "internal_write", capabilities: ["coordination"], domain: "coordination", requiredCapabilities: [] },
+    ] },
     policy: {} as PolicyEngine, ...(persistOutcome ? { persistOutcome } : {}), ...(maxPlanRevisions === undefined ? {} : { maxPlanRevisions }), ...(initialPlanHashes ? { initialPlanHashes } : {}), ...(goalRef ? { goalRef } : {}), ...(allowedPlanActions === undefined ? {} : { allowedPlanActions }), ...(recoveryDispatcher ? { recoveryDispatcher } : {}),
   }
   return createCanonicalPlanExecutionFactory(options)
@@ -79,9 +95,43 @@ describe("createCanonicalPlanExecutionFactory", () => {
     expect(router.execute).toHaveBeenCalledTimes(2)
     expect(requests.map(request => request.toolName)).toEqual(["jobs.search", "spawn_subagent"])
     expect(contexts).toEqual(expect.arrayContaining([expect.objectContaining({ scope: { userId: "user-1" }, taskId: "root-1", rootTaskId: "root-1", stepId: "step-1:plan:read" })]))
-    expect(requests[1]?.input).toMatchObject({ role: "scout", taskType: "research" })
+    expect(requests[1]?.input).toMatchObject({ role: "scout", taskType: "research", allowedActions: ["jobs.search"] })
     expect(JSON.stringify(requests[1]?.input)).not.toMatch(/userId|taskId|parentTaskId|rootTaskId|lease|budgetLimit|maxBudget/)
     expect(result.observations).toHaveLength(2)
+  })
+
+  it("derives distinct read-only delegate actions from the requested role", async () => {
+    const allowedTools = ["jobs.search", "jobs.get", "persona.retrieve", "resume.get_base", "application.get_state", "tool_results.read"]
+    const cases = [
+      { role: "scout", expected: ["jobs.search", "jobs.get"] },
+      { role: "analyst", expected: ["jobs.search", "jobs.get", "persona.retrieve", "resume.get_base"] },
+    ] as const
+
+    for (const testCase of cases) {
+      const requests: ToolCallRequest[] = []
+      const router = { execute: vi.fn(async (_context: ToolRouterContext, request: ToolCallRequest) => {
+        requests.push(request)
+        return { ...request, status: "completed" as const, output: { ok: true }, errorCode: null }
+      }) }
+      const hook = fixture(router, undefined, undefined, undefined, undefined, undefined, ["delegate"], undefined, { allowedTools, allowedRoles: ["scout", "analyst"] })
+      const result = await hook(input(output(proposal([delegate(`${testCase.role}-child`, { role: testCase.role })]))))
+
+      expect(result.observations).toHaveLength(1)
+      expect(requests).toHaveLength(1)
+      expect(requests[0]?.input).toMatchObject({ role: testCase.role, allowedActions: testCase.expected })
+    }
+  })
+
+  it.each([
+    { name: "an unknown role", role: "future-role", allowedTools: ["jobs.search"], allowedRoles: ["future-role"] },
+    { name: "a role with no compatible tools", role: "scout", allowedTools: ["tool_results.read"], allowedRoles: ["scout"] },
+  ])("fails closed for $name delegate actions", async ({ role, allowedTools, allowedRoles }) => {
+    const router = { execute: vi.fn(async (_context: ToolRouterContext, request: ToolCallRequest) => ({ ...request, status: "completed" as const, output: { ok: true }, errorCode: null })) }
+    const hook = fixture(router, undefined, undefined, undefined, undefined, undefined, ["delegate"], undefined, { allowedTools, allowedRoles })
+    const result = await hook(input(output(proposal([delegate("child", { role })]))))
+
+    expect(observationCode(result)).toBe("role_actions_unavailable")
+    expect(router.execute).not.toHaveBeenCalled()
   })
 
   it("passes a prior local result into a dependent tool through the canonical resolver", async () => {

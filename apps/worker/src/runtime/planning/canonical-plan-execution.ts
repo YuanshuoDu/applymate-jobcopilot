@@ -1,7 +1,7 @@
 import { Buffer } from "node:buffer"
 
 import type { PolicyEngine } from "@jobcopilot/agent-policy"
-import type { PolicyRole, TenantScope } from "@jobcopilot/agent-protocol"
+import type { PolicyDomain, PolicyRole, TenantScope } from "@jobcopilot/agent-protocol"
 
 import { copyAllowedPlanActions, PLAN_MAX_NODES, PLAN_MAX_REVISIONS, isPlainJsonObject, type GoalContract, type GoalContractRef, type PlanActionKind } from "./goal-plan-contract.js"
 import { PlanDispatchError, dispatchPlanProposal, type PlanDispatchCommand } from "./plan-intent-dispatcher.js"
@@ -13,6 +13,8 @@ import { PlanRevisionRecoveryError, recoverPlanRevision, type PlanRevisionRecove
 import type { ToolCallRequest, ToolExecutionResult, ToolRouterContext } from "../tools/types.js"
 import type { TurnEnginePlanExecutionHook, TurnEnginePlanExecutionHookResult } from "../turns/turn-engine-types.js"
 import type { StepContextSnapshot } from "../context/step-context-builder.js"
+import { visibleToolPolicy } from "../subagents/role-policy.js"
+import { assertMigratedRole, roleContract } from "../subagents/scout-analyst-contracts.js"
 
 const MAX_OBSERVATIONS = 8
 const MAX_RESULT_BYTES = 8 * 1024
@@ -95,11 +97,32 @@ function version(registry: Registry, capabilities: readonly string[], name: stri
   return definition && isPlainJsonObject(definition) && typeof definition.version === "string" ? definition.version.trim() : undefined
 }
 
-function actions(registry: Registry, capabilities: readonly string[], allowedTools: readonly string[]): readonly string[] {
+const POLICY_DOMAINS: readonly PolicyDomain[] = ["jobs", "persona", "resume", "application", "gmail", "automation", "coordination", "unknown"]
+
+function isPolicyDomain(value: unknown): value is PolicyDomain {
+  return typeof value === "string" && POLICY_DOMAINS.includes(value as PolicyDomain)
+}
+
+function actions(registry: Registry, capabilities: readonly string[], allowedTools: readonly string[], role: string): readonly string[] {
+  let roleAllowedTools: ReadonlySet<string>
+  try {
+    assertMigratedRole(role)
+    roleAllowedTools = new Set(roleContract(role).allowedTools)
+  } catch {
+    return []
+  }
   return [...new Set(registry.list(capabilities).flatMap(item => {
-    if (!isPlainJsonObject(item) || typeof item.name !== "string" || !allowedTools.includes(item.name)) return []
-    if (item.risk !== "read" || !Array.isArray(item.capabilities) || !item.capabilities.includes("read")) return []
-    return [item.name]
+    if (!isPlainJsonObject(item) || typeof item.name !== "string" || !allowedTools.includes(item.name) || !roleAllowedTools.has(item.name)) return []
+    if (item.risk !== "read" || !Array.isArray(item.capabilities) || !item.capabilities.every(capability => capability === "read")) return []
+    if (!isPolicyDomain(item.domain) || !Array.isArray(item.requiredCapabilities) || !item.requiredCapabilities.every(capability => typeof capability === "string")) return []
+    const visible = visibleToolPolicy(role, {
+      name: item.name,
+      risk: "read",
+      domain: item.domain,
+      capabilities: item.capabilities,
+      requiredCapabilities: item.requiredCapabilities,
+    })
+    return visible.visible ? [item.name] : []
   }))]
 }
 
@@ -407,7 +430,7 @@ export function createCanonicalPlanExecutionFactory(options: CanonicalPlanExecut
         createIdempotencyKey: localId => id("plan-idempotency", input.call.id, localId),
         deferInputRefs: true,
         resolveWaitVersion: () => version(options.registry, options.capabilities, "wait_subagents"),
-        resolveDelegateActions: () => actions(options.registry, options.capabilities, allowedTools),
+        resolveDelegateActions: role => actions(options.registry, options.capabilities, allowedTools, role),
       })
       if (!replayed) {
         seenPlanHashes.add(computedHash)
