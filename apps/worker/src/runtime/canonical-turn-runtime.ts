@@ -29,6 +29,7 @@ import { createCanonicalPlanExecutionFactory, type CanonicalPlanExecutionOptions
 import { hydrateGoalContract } from "./planning/goal-contract-hydration.js"
 import type { PlanCommandReceipt } from "./planning/plan-command-receipt.js"
 import { createPlanRevisionRecoveryDispatcher } from "./planning/plan-revision-receipt.js"
+import type { ContextSnapshotAdapter } from "./context/context-snapshot-adapter.js"
 
 export type UsageAuthorization = {
   settle(input: { status: "success" | "error"; inputTokens: number; outputTokens: number; estimatedCostUsd: number; errorCode?: string }): Promise<void> | void
@@ -49,6 +50,8 @@ export type CanonicalTurnRuntimeOptions = {
   /** Optional server-owned context compaction seam; omitted preserves legacy behavior. */
   readonly contextCompaction?: TurnEngineOptions["contextCompaction"]
   readonly contextCompactionLoadSnapshot?: TurnEngineOptions["contextCompactionLoadSnapshot"]
+  /** Reusable server-owned adapter; when supplied it takes precedence over the legacy pair above. */
+  readonly contextSnapshotAdapter?: ContextSnapshotAdapter
   /** Optional server-owned override; absent uses the default bridge when both gates are on. */
   readonly planExecutionFactory?: (input: CanonicalPlanExecutionFactoryInput) => TurnEngineOptions["executePlan"] | undefined
   readonly stateLoader?: (pool: Pick<pg.Pool, "connect">, lease: TurnLease, now?: Date) => Promise<CanonicalTurnState>
@@ -242,8 +245,8 @@ export async function createCanonicalTurnRuntime(pool: pg.Pool, options: Canonic
       actorRole, capabilities: toolCapabilities,
       validateToolArguments: (name, input) => toolRuntime.registry.validateArguments(name, input, "1"), signal,
       budget: limits(state.budgetSnapshot), resume: state.resume, now, publishReasoningSummary: false,
-      ...(options.contextCompaction ? { contextCompaction: options.contextCompaction } : {}),
-      ...(options.contextCompactionLoadSnapshot ? { contextCompactionLoadSnapshot: options.contextCompactionLoadSnapshot } : {}),
+      ...((options.contextSnapshotAdapter?.hook ?? options.contextCompaction) ? { contextCompaction: options.contextSnapshotAdapter?.hook ?? options.contextCompaction } : {}),
+      ...((options.contextSnapshotAdapter?.loadSnapshot ?? options.contextCompactionLoadSnapshot) ? { contextCompactionLoadSnapshot: options.contextSnapshotAdapter?.loadSnapshot ?? options.contextCompactionLoadSnapshot } : {}),
       ...(executePlan ? { executePlan } : {}), ...(recoveryDispatcher ? { recoveryDispatcher } : {}), ...(rootTasks.checkCompletion ? { completionGate: async () => rootTasks.checkCompletion!({ lease, rootTaskId: root.id, now: now() }) } : {}),
     })
     const result = await engine.run()
