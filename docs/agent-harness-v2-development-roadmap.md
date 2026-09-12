@@ -1576,3 +1576,15 @@ This slice adds no migration, provider, model, queue, or external-write changes.
 **Independent verification:** Canonical replay, durable wait consumer, and structured replay evidence focused tests passed **62/62** (**42 + 9 + 11**); shared build, Worker `tsc --noEmit --skipLibCheck`, and `git diff --check` passed.
 
 **Candidate boundary:** Live DB/RLS, Redis/queue, provider, restart, browser, and child-parent E2E behavior remain unverified.
+
+---
+
+## 38. P4-08 — Canonical automation dispatch handoff
+
+**Candidate status/date (2026-09-13):** P4-08 is recorded as a candidate bounded canonical automation dispatch handoff; overall progress remains **P0 accepted 1/8 (12.5%)**, unchanged by this slice.
+
+**Implementation:** Commit `d68b5991` adds the exact server-owned `ENABLE_AGENT_CANONICAL_AUTOMATION=1` gate. For turn-bound `agent-runs` jobs, the Worker uses `enqueueTurn` to persist the durable `agent.turn.dispatch` outbox intent and enqueue the existing `agent-turns` queue with an execution-independent owner and deterministic idempotency/job identity. The untrusted `executionId` is not placed in the canonical payload. Jobs without a `turnId` continue through the authenticated internal Web pipeline; when the gate is off, turn-bound jobs preserve the existing `runCanonicalAgentTurn` adapter behavior. The producer has an explicit close path and constructs no additional Worker.
+
+**Independent verification:** The focused Worker suite passed **16/16**; the shared package build, Worker `tsc --noEmit --skipLibCheck`, and `git diff --check` also passed.
+
+**Candidate boundary:** Execution-control row synchronization is not part of this slice. Live Redis/PostgreSQL, real Worker startup, restart, provider, browser, and child-parent E2E behavior remain unverified. The canonical automation gate remains opt-in; this slice cannot be used to declare complete Harness, P4/Phase completion, or production recovery evidence.
