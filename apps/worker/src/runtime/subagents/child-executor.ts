@@ -3,6 +3,7 @@ import type { PolicyRole } from "@jobcopilot/agent-protocol"
 import { loadWorkerAiConfig, type AiConfig } from "@jobcopilot/shared/llm"
 
 import { executionOwnerFence } from "../execution-owner.js"
+import type { ContextSnapshotAdapter } from "../context/context-snapshot-adapter.js"
 import { createHarnessModelRuntime } from "../harness-model.js"
 import { visibleToolPolicy, getSubagentRolePolicy } from "./role-policy.js"
 import { childContextSnapshot, createChildContextBuilder } from "./child-context.js"
@@ -29,6 +30,8 @@ export type ChildExecutorOptions = {
   readonly authorizeUsage: UsageAwareModelOptions["authorize"]
   readonly modelRuntimeFactory?: (input: { task: SubagentTaskRecord }) => Promise<ModelAdapter> | ModelAdapter
   readonly toolRuntimeFactory: (input: { task: SubagentTaskRecord; lease: SubagentLease; owner: ReturnType<typeof executionOwnerFence> }) => ChildToolRuntime
+  /** Reuses the server-owned context compaction adapter when production enables it. */
+  readonly contextSnapshotAdapter?: ContextSnapshotAdapter
   readonly now?: () => Date
 }
 
@@ -91,6 +94,8 @@ export function createChildExecutor(options: ChildExecutorOptions): (input: { le
       contextBuilder: createChildContextBuilder(lease), store: options.store, model, tools: definitions,
       executeTool: createToolRouterExecutor(runtime.router), actorRole: policy.actorRole, capabilities: policy.capabilities,
       validateToolArguments: runtime.validateArguments, signal: lease.signal, now: options.now, publishReasoningSummary: false,
+      contextCompaction: options.contextSnapshotAdapter?.hook,
+      contextCompactionLoadSnapshot: options.contextSnapshotAdapter?.loadSnapshot,
       // A retry is a new durable attempt. Keep IDs deterministic within that
       // attempt while preventing attempt 1 and attempt 2 collisions.
       idFactory: prefix => `${prefix}:attempt:${lease.attemptCount}`,

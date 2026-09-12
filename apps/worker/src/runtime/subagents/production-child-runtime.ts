@@ -9,6 +9,7 @@ import { createPgTurnEngineStore } from "../turns/turn-engine-store.js"
 import type { TurnExecutionStore } from "../turns/turn-execution-types.js"
 import type { TurnEngineStore } from "../turns/turn-engine-types.js"
 import { durableLifecycleSink } from "../canonical-turn-runtime.js"
+import type { ContextSnapshotAdapter } from "../context/context-snapshot-adapter.js"
 import { createPgTreeBudgetReservationStore } from "./tree-budget-store.js"
 import type { TreeBudgetReservationStore } from "./tree-budget-types.js"
 import { createChildExecutor, type ChildExecutorOptions, type ChildToolRuntime } from "./child-executor.js"
@@ -22,6 +23,7 @@ export type ProductionChildRuntimeOptions = {
   readonly treeBudget?: TreeBudgetReservationStore
   readonly modelRuntimeFactory?: ChildExecutorOptions["modelRuntimeFactory"]
   readonly toolRuntimeFactory?: ChildExecutorOptions["toolRuntimeFactory"]
+  readonly contextSnapshotAdapter?: ContextSnapshotAdapter
 }
 
 function record(value: unknown): Record<string, unknown> { return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {} }
@@ -69,6 +71,7 @@ export function createProductionChildExecutor(options: ProductionChildRuntimeOpt
     store: bindStore(engineStore), treeBudget, authorizeUsage,
     modelRuntimeFactory: options.modelRuntimeFactory,
     toolRuntimeFactory: options.toolRuntimeFactory ?? (({ task, lease, owner }) => defaultTools(options.pool, engineStore, task, lease, owner)),
+    contextSnapshotAdapter: options.contextSnapshotAdapter,
   })
 }
 

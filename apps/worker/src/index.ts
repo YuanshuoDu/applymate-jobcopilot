@@ -95,6 +95,9 @@ async function main() {
   const childExecutor = productionChildRuntimeModule.createOptionalProductionChildExecutor({
     enabled: childExecutionEnabled,
     pool,
+    ...(childExecutionEnabled && contextCompactionOptions.contextSnapshotAdapter
+      ? { contextSnapshotAdapter: contextCompactionOptions.contextSnapshotAdapter }
+      : {}),
   });
   const waitResolver = consumeWaitOutcomes && childExecutor ? {} : undefined;
   const canonicalBootstrap = await productionBootstrapModule.createProductionWorkerBootstrap({

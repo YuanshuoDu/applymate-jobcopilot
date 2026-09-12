@@ -8,6 +8,7 @@ import type { SubagentLease } from "./types.js"
 import type { TreeBudgetReservationStore } from "./tree-budget-types.js"
 import type { TurnEngineStore } from "../turns/turn-engine-types.js"
 import type { PublicToolDefinition } from "../tools/types.js"
+import type { ContextSnapshotAdapter } from "../context/context-snapshot-adapter.js"
 
 const profile = {
   provider: "fixture", model: "fixture-model", nativeTools: true, structuredOutput: true, streaming: true,
@@ -96,5 +97,41 @@ describe("production child runtime", () => {
     expect(toolFactory).toHaveBeenCalledOnce()
     expect(requests[0]?.metadata).toMatchObject({ taskId: child.id, turnId: child.turnId })
     expect(requests[0]?.tools.map(tool => (tool as { name: string }).name)).toEqual(["jobs.search"])
+  })
+
+  it("forwards the context adapter without connecting the pool during enabled construction", async () => {
+    const child = lease(); const order: string[] = []; let modelCalls = 0; const connect = vi.fn(); const pool = { connect } as never
+    const hook = vi.fn<ContextSnapshotAdapter["hook"]>(async input => { order.push("hook"); return { status: "unchanged" as const, snapshot: input.snapshot } })
+    const loadSnapshot = vi.fn<ContextSnapshotAdapter["loadSnapshot"]>(async () => null)
+    const adapter: ContextSnapshotAdapter = {
+      hook, loadSnapshot,
+    }
+    const model: ModelAdapter = {
+      id: "fixture-model", profile,
+      async *stream() {
+        order.push("model"); modelCalls += 1
+        if (modelCalls === 1) {
+          yield { type: "tool_call_completed", callId: "jobs-call", name: "jobs.search", arguments: {} }
+          yield { type: "completed", finishReason: "tool_calls" }
+        } else {
+          yield { type: "text_delta", text: "Jobs read" }
+          yield { type: "completed", finishReason: "stop" }
+        }
+      },
+    }
+    const executor = createOptionalProductionChildExecutor({
+      enabled: true, pool, turnStore: store(), treeBudget: budget(),
+      authorizeUsage: async () => ({ settle: async () => undefined }), modelRuntimeFactory: () => model,
+      toolRuntimeFactory: () => ({ definitions: [publicTool("jobs.search")], router: { execute: async (_context: unknown, request: { id: string; toolName: string; toolVersion: string }) => ({ ...request, status: "completed" as const, output: { job: "job-1" }, errorCode: null }) } }),
+      contextSnapshotAdapter: adapter,
+    })
+
+    expect(connect).not.toHaveBeenCalled()
+    if (!executor) throw new Error("child executor was not created")
+    const result = await executor({ lease: child })
+    expect(result).toMatchObject({ status: "completed" })
+    expect(order).toEqual(["hook", "model", "hook", "model"])
+    expect(hook).toHaveBeenCalledTimes(2)
+    expect(connect).not.toHaveBeenCalled()
   })
 })

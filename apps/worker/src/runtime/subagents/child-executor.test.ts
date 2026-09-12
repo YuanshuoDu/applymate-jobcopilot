@@ -4,10 +4,14 @@ import { describe, expect, it, vi } from "vitest"
 import type { HarnessModelRequest, ModelAdapter, ModelStreamEvent } from "@jobcopilot/agent-model"
 
 import { createChildExecutor } from "./child-executor.js"
+import { childContextSnapshot, createChildContextBuilder } from "./child-context.js"
 import type { SubagentLease } from "./types.js"
 import type { TreeBudgetReservation, TreeBudgetReservationStore } from "./tree-budget-types.js"
 import type { TurnExecutionStore } from "../turns/turn-execution-types.js"
 import type { RuntimeToolDefinition } from "../tools/types.js"
+import type { ContextSnapshotAdapter } from "../context/context-snapshot-adapter.js"
+import { executionOwnerFence } from "../execution-owner.js"
+import { runTurnExecutionLoop } from "../turns/turn-execution-loop.js"
 
 const profile = {
   provider: "fixture", model: "fixture-model", nativeTools: true, structuredOutput: true, streaming: true, continuationCursor: false,
@@ -53,6 +57,107 @@ function budgetStore(failConsumed = false): { store: TreeBudgetReservationStore;
 }
 
 describe("child executor composition", () => {
+  it("runs a server-owned context adapter hook before the child model", async () => {
+    const child = lease(); const order: string[] = []; const requests: HarnessModelRequest[] = []; let modelCalls = 0
+    const hook = vi.fn<ContextSnapshotAdapter["hook"]>(async input => {
+      order.push("hook")
+      expect(input.identity.taskId).toBe(child.id)
+      expect(input.scope.userId).toBe(child.userId)
+      return { status: "unchanged" as const, snapshot: input.snapshot }
+    })
+    const loadSnapshot = vi.fn<ContextSnapshotAdapter["loadSnapshot"]>(async () => null)
+    const adapter: ContextSnapshotAdapter = {
+      hook, loadSnapshot,
+    }
+    const model: ModelAdapter = {
+      id: "fixture-model", profile,
+      async *stream(request) {
+        requests.push(request); order.push("model"); modelCalls += 1
+        if (modelCalls === 1) {
+          yield { type: "tool_call_completed", callId: "context-call", name: "jobs.search", arguments: {} }
+          yield { type: "completed", finishReason: "tool_calls" }
+        } else {
+          yield { type: "text_delta", text: "done" }
+          yield { type: "completed", finishReason: "stop" }
+        }
+      },
+    }
+    const executor = createChildExecutor({
+      store: executionStore([], requests), treeBudget: budgetStore().store, authorizeUsage: async () => ({ settle: async () => undefined }),
+      modelRuntimeFactory: () => model,
+      toolRuntimeFactory: () => ({ definitions: [tool("jobs.search", "jobs")], router: { execute: async (_context, request) => ({ ...request, status: "completed", output: { job: "job-1" }, errorCode: null }) } }),
+      contextSnapshotAdapter: adapter,
+    })
+
+    const result = await executor({ lease: child })
+    expect(result).toMatchObject({ status: "completed", result: { stepCount: 2 } })
+    expect(order).toEqual(["hook", "model", "hook", "model"])
+    expect(hook).toHaveBeenCalledTimes(2)
+    expect(loadSnapshot).not.toHaveBeenCalled()
+  })
+
+  it("fails closed before the child model when the context adapter hook fails", async () => {
+    const child = lease(); let modelCalls = 0
+    const hook = vi.fn<ContextSnapshotAdapter["hook"]>(() => { throw new Error("sensitive adapter detail") })
+    const loadSnapshot = vi.fn<ContextSnapshotAdapter["loadSnapshot"]>(async () => null)
+    const adapter: ContextSnapshotAdapter = {
+      hook, loadSnapshot,
+    }
+    const model: ModelAdapter = {
+      id: "fixture-model", profile,
+      async *stream() {
+        modelCalls += 1
+        yield { type: "completed", finishReason: "stop" }
+      },
+    }
+    const executor = createChildExecutor({
+      store: executionStore([], []), treeBudget: budgetStore().store, authorizeUsage: async () => ({ settle: async () => undefined }),
+      modelRuntimeFactory: () => model,
+      toolRuntimeFactory: () => ({ definitions: [tool("jobs.search", "jobs")], router: { execute: async (_context, request) => ({ ...request, status: "completed", errorCode: null }) } }),
+      contextSnapshotAdapter: adapter,
+    })
+
+    await expect(executor({ lease: child })).resolves.toMatchObject({ status: "failed", failureReason: "invalid_output" })
+    expect(modelCalls).toBe(0)
+    expect(JSON.stringify(hook.mock.results)).not.toContain("sensitive adapter detail")
+  })
+
+  it("fails closed when a child replay loader rejects before model invocation", async () => {
+    const child = lease(); const owner = executionOwnerFence({ kind: "task", lease: child }); const requests: HarnessModelRequest[] = []
+    const stepId = `task:${child.id}:step:0:attempt:${child.attemptCount}`
+    const snapshot = {
+      ...childContextSnapshot(child),
+      toolObservations: [{
+        id: `context-compacted:${stepId}`,
+        content: {
+          kind: "context_compacted", status: "compacted", stepId, idempotencyKey: `context-compaction:${stepId}`,
+          beforeInputTokens: 20, afterInputTokens: 8, beforeBytes: 80, afterBytes: 32, snapshotRef: "snapshot-child-1",
+        },
+      }],
+    }
+    const hook = vi.fn<ContextSnapshotAdapter["hook"]>()
+    const loadSnapshot = vi.fn<ContextSnapshotAdapter["loadSnapshot"]>(async () => { throw new Error("sensitive loader detail") })
+    const adapter: ContextSnapshotAdapter = { hook, loadSnapshot }
+    const model: ModelAdapter = {
+      id: "fixture-model", profile,
+      async *stream() {
+        yield { type: "completed", finishReason: "stop" }
+      },
+    }
+
+    const result = await runTurnExecutionLoop({
+      identity: owner, scope: { userId: child.userId }, goal: child.goal, snapshot,
+      contextBuilder: createChildContextBuilder(child), store: executionStore([], requests), model, tools: [], executeTool: async () => { throw new Error("unreachable") },
+      signal: child.signal, publishReasoningSummary: false, idFactory: prefix => `${prefix}:attempt:${child.attemptCount}`,
+      contextCompaction: adapter.hook, contextCompactionLoadSnapshot: adapter.loadSnapshot,
+    })
+
+    expect(result).toMatchObject({ status: "failed", errorCode: "invalid_output" })
+    expect(loadSnapshot).toHaveBeenCalledWith(expect.objectContaining({ snapshotRef: "snapshot-child-1", sessionId: child.sessionId, turnId: child.turnId }))
+    expect(hook).not.toHaveBeenCalled()
+    expect(requests).toHaveLength(0)
+  })
+
   it("runs model → tool observation → model under child identity and shared reservation", async () => {
     const child = lease(); const events: Array<{ type: string; taskId: string }> = []; const requests: HarnessModelRequest[] = []; const budget = budgetStore(); let calls = 0
     const model: ModelAdapter = {
