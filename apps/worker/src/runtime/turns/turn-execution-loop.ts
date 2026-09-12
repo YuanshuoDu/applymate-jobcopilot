@@ -153,6 +153,7 @@ export async function runTurnExecutionLoop(options: TurnExecutionOptions): Promi
             if (!feedback) throw new TurnEngineError("invalid_output", "Plan completion feedback could not be built")
             // P3-27A intentionally keeps recovery feedback in this loop snapshot. P3-27B will add durable replay/restore.
             snapshot = { ...snapshot, toolObservations: [...snapshot.toolObservations, feedback] }
+            continuation = undefined
             continue
           }
           await writer.append(

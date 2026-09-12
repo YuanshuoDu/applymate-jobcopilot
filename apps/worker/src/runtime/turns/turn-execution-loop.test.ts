@@ -133,6 +133,7 @@ describe("owner-agnostic turn execution loop", () => {
       planCompletionRecoveryLimit: 1,
       model: {
         ...root.options.model,
+        profile: { ...root.options.model.profile, continuationCursor: true },
         async *stream(request: HarnessModelRequest): AsyncGenerator<ModelStreamEvent> {
           requests.push(request)
           calls += 1
@@ -141,6 +142,7 @@ describe("owner-agnostic turn execution loop", () => {
             yield { type: "completed", finishReason: "tool_calls" }
           } else {
             yield { type: "text_delta", text: "done" }
+            if (calls === 1) yield { type: "continuation", continuation: { cursor: "stale-final-cursor" } }
             yield { type: "completed", finishReason: "stop" }
           }
         },
@@ -151,6 +153,7 @@ describe("owner-agnostic turn execution loop", () => {
     expect(result).toMatchObject({ status: "completed", stepCount: 3, toolCallCount: 1 })
     expect(JSON.stringify(requests[1]?.messages)).toContain("plan_completion_feedback")
     expect(JSON.stringify(requests[1]?.messages)).toContain(PLAN_COMPLETION_FEEDBACK_TEXT)
+    expect(requests[1]?.continuation).toBeUndefined()
     expect(root.events.some(event => event.type === "final.rejected")).toBe(false)
   })
 
