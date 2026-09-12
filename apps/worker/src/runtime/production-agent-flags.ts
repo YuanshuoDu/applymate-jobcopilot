@@ -2,6 +2,7 @@ export type ProductionAgentFlags = {
   readonly planningEnabled: boolean
   readonly planningExecutionEnabled: boolean
   readonly contextCompactionEnabled: boolean
+  readonly canonicalAutomationEnabled: boolean
 }
 
 /** Resolve server-owned production gates; model input and policy snapshots cannot change them. */
@@ -11,5 +12,6 @@ export function resolveProductionAgentFlags(env: Record<string, string | undefin
     planningEnabled,
     planningExecutionEnabled: planningEnabled && env.ENABLE_AGENT_PLAN_EXECUTION === "1",
     contextCompactionEnabled: env.ENABLE_AGENT_CONTEXT_COMPACTION === "1",
+    canonicalAutomationEnabled: env.ENABLE_AGENT_CANONICAL_AUTOMATION === "1",
   }
 }
