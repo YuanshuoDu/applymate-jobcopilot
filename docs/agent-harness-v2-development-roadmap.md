@@ -1420,3 +1420,18 @@ git diff --check
 **独立验证：** durable-wait-consumer focused suite **8/8 passed**；其中包含 8 个大结果的聚合上限、循环/BigInt 结果和 consumed replay。Worker `tsc --noEmit --skipLibCheck`、shared build 与 `git diff --check` 均通过；源文件保持在 250 行以内。
 
 **候选边界：** 本切片只证明 bounded projection 与纯测试回归，不代表 live PostgreSQL/RLS、Redis/queue delivery、真实进程重启、provider、browser 或 child-parent E2E 已验证；P3/Phase 和整体目标仍未完成。
+
+---
+
+## 28. P3-33 — Strict replay validation for wait task evidence
+
+**状态与进度口径（2026-09-12）：** P3-33 是 canonical wait replay 证据校验的候选安全切片，不代表 P3 完成、完整 Harness 或生产恢复证据。中文升级计划总进度仍按 **P0 已验收 1/8（12.5%）** 统计；本切片不改变该口径。
+
+**实现记录：** 集成提交为 `3ef27f74`。canonical `replayWaitOutcome` 现在要求持久化 wait outcome 的 `tasks` 数组与 join 目标集合一一对应：每个 child ID 恰好出现一次，entry 只能包含 `taskId/status/result/failureReason` 四个受控字段；status、result JSON/大小和 failure reason 都经过有界校验。任务本身及嵌套 result 中的 runtime identity 字段均 fail closed，避免不完整或伪造的 child evidence 被根 Agent 当成成功依据。
+
+- 保持既有 `ready`/`timed_out`、waitId、目标/匹配 ID、租户/租约和 replay 不重新路由语义；P3-32 生成的 one-task 与 eight-task projection 均可被消费。
+- 仅修改 canonical replay 校验与测试夹具，没有新增 migration、provider、model、queue 或 external-write 权限。
+
+**独立验证：** canonical plan execution focused suite **35/35 passed**；Worker `tsc --noEmit --skipLibCheck`、shared build 和 `git diff --check` 均通过。新增回归覆盖缺失、重复、外部 ID、空 status 和嵌套 identity result。
+
+**候选边界：** 本切片只证明 replay evidence schema 的确定性 fail-closed 校验，不代表 live PostgreSQL/RLS、Redis/queue、真实进程重启、provider、browser 或 child-parent E2E 已验证；P3/Phase 和整体目标仍未完成。
