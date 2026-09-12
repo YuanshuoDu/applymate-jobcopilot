@@ -1479,3 +1479,18 @@ git diff --check
 **独立验证：** 根侧对 turn loop **47/47** 与 child executor **9/9** 共 **56/56 passed**；shared build、Worker `tsc` 与 `git diff --check` 均通过。
 
 **候选边界：** live PostgreSQL/RLS、Redis/queue、provider、真实进程重启和 child-parent E2E 仍未验证；本切片不能据此宣称完整 Harness、P4/Phase 完成或生产恢复证据。
+
+---
+
+## 32. P4-02 — Structured child evidence projection
+
+**状态与进度口径（2026-09-12）：** P4-02 记录为结构化 child evidence projection 的候选切片；整体状态仍为 **P0 accepted 1/8 (12.5%)**，本切片不改变该口径。
+
+**实现记录：** 候选实现提交为 `f62a47dc`，后续状态一致性修复为 `56079bd9`。Root Scout/Analyst orchestration 为每个迁移角色设置服务端拥有的精确 marker `{schemaVersion: ROLE_RESULT_SCHEMA, role}`。child executor 只有在 marker 与 leased role 精确匹配且 turn 已完成时，才对原始 final model text 做严格 JSON parse；超过 **8 KiB**、fenced markdown、额外字段、runtime identity、缺失或重复 evidence、cross-role result、非法 score 等输出均被拒绝，并复用既有 `validateRoleResult` 校验。只有 completed child 的合法结果才会产生有界 `structuredResult`。
+
+- expected structured output malformed 或 invalid 时 fail closed：外层结果和 durable result 内层 status 均为 `failed`，`failureReason` 为 `invalid_structured_result`，且不包含 `finalText` 或 `structuredResult`。没有 marker 的 free-text 仍保持兼容；waiting、failed、interrupted child 不产生 projection。
+- durable manager/wait replay 继续通过 generic bounded `result` 接收该结果，root lifecycle 与 final response 保持不变；没有新增 migration、provider、queue 或 external write。
+
+**独立验证：** child-executor 与 root-orchestration focused tests 合计 **21/21 passed**；shared build、Worker `tsc --noEmit --skipLibCheck` 与 `git diff --check` 均通过。
+
+**候选边界：** live DB/RLS、Redis/queue、provider、真实进程重启、browser 和 child-parent E2E 均未验证；本切片不能据此宣称完整 Harness、P4/Phase 完成或生产恢复证据。
