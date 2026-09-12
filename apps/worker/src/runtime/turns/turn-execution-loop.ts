@@ -15,6 +15,7 @@ import type { TurnExecutionOptions } from "./turn-execution-types.js"
 import { assertExecutionAlive, assertModelAllowance, canEmitTurnCompleted, canPersistFinalResponse, makeExecutionId, resumedBudgetLimits, totalTurnUsage, turnErrorCode, updateExecutionStep } from "./turn-engine-helpers.js"
 import { parsePlanRevisionReceipt, planRevisionObservation } from "../planning/plan-revision-receipt.js"
 import { goalRevisionObservation, parseGoalRevisionOutput } from "../planning/goal-revision-receipt.js"
+import { verifyPlanCompletion } from "../planning/plan-completion-verifier.js"
 import { runContextCompaction } from "../context/context-compaction-runtime.js"
 
 const DEFAULT_MAX_STEPS = 32
@@ -141,6 +142,15 @@ export async function runTurnExecutionLoop(options: TurnExecutionOptions): Promi
             `final-rejected:${step.id}`,
           )
           throw new TurnEngineError(verification.code, verification.blocker)
+        }
+        const planCompletion = verifyPlanCompletion({ snapshot, required: options.planCompletionRequired === true })
+        if (!planCompletion.ok) {
+          await writer.append(
+            "final.rejected", step.id, null,
+            { code: "final_unverified", blocker: planCompletion.blocker, feedback: planCompletion.feedback, taskId: options.identity.taskId },
+            `final-rejected:${step.id}:plan-completion`,
+          )
+          throw new TurnEngineError("final_unverified", planCompletion.blocker)
         }
         await assertCompletionAllowed(options, writer, step, signal, now)
         const finalResponse = finalizeTurn({

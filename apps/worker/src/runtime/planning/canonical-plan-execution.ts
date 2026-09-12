@@ -151,7 +151,7 @@ function recordObservation(callId: string, recordValue: PlanCommandExecutionReco
 function controlObservation(callId: string, control: PlanControlRecord): { id: string; content: Record<string, unknown> } {
   const content = control.kind === "request_input"
     ? { kind: "plan_control", localId: control.localId, status: "waiting_for_user", question: control.question, ...(control.approvalBoundary ? { approvalBoundary: control.approvalBoundary } : {}) }
-    : { kind: "plan_control", localId: control.localId, status: "completion_proposed", completionCriteria: [...control.completionCriteria] }
+    : { kind: "plan_control", localId: control.localId, status: "completion_proposed", dependsOn: [...control.dependsOn], completionCriteria: [...control.completionCriteria] }
   return safeObservation(id("plan-control", callId, control.localId), content)
 }
 
@@ -208,7 +208,7 @@ function replayReceipt(snapshot: StepContextSnapshot, callId: string, command: P
     if (command.kind === "request_input") {
       if (content.status !== "waiting_for_user" || content.question !== command.question ||
         (command.approvalBoundary === undefined ? content.approvalBoundary !== undefined : content.approvalBoundary !== command.approvalBoundary)) throw new CanonicalPlanError("invalid_plan_output")
-    } else if (content.status !== "completion_proposed" || stableJson(content.completionCriteria) !== stableJson(command.completionCriteria)) throw new CanonicalPlanError("invalid_plan_output")
+    } else if (content.status !== "completion_proposed" || stableJson(content.dependsOn) !== stableJson(command.dependsOn) || stableJson(content.completionCriteria) !== stableJson(command.completionCriteria)) throw new CanonicalPlanError("invalid_plan_output")
     return { observationId, status: "completed", errorCode: null }
   }
   if (!keysOnly(content, ["kind", "localId", "commandKind", "dependsOn", "status", "errorCode", "output"]) || content.kind !== "plan_command" || content.localId !== command.localId || content.commandKind !== command.kind || stableJson(content.dependsOn) !== stableJson(command.dependsOn)) throw new CanonicalPlanError("invalid_plan_output")

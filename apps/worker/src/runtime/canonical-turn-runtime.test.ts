@@ -157,7 +157,10 @@ async function runDefaultPlanBridge(planningExecutionEnabled: boolean) {
   let modelCalls = 0
   const proposal: PlanProposal = {
     schemaVersion: "agent-harness.plan.v1", basedOnGoalRevision: 1, basedOnPlanRevision: null,
-    nodes: [{ localId: "read", kind: "use_tool", objective: "Read jobs", inputRefs: [], dependsOn: [], successCriteria: ["done"], outputSchemaRef: null, toolName: "jobs.search" }],
+    nodes: [
+      { localId: "read", kind: "use_tool", objective: "Read jobs", inputRefs: [], dependsOn: [], successCriteria: ["done"], outputSchemaRef: null, toolName: "jobs.search" },
+      { localId: "finish", kind: "propose_completion", objective: "Finish", inputRefs: [], dependsOn: ["read"], successCriteria: ["finish"], outputSchemaRef: null },
+    ],
     completionCriteria: ["finish"], briefRationale: "bounded",
   }
   const tool = {
@@ -219,6 +222,26 @@ describe("createCanonicalTurnRuntime", () => {
     expect(enabled.result.status).toBe("completed")
     expect(enabled.calls).toEqual(["agent.plan.propose", "jobs.search"])
     expect(enabled.events).toEqual(expect.arrayContaining([expect.objectContaining({ type: "plan.command", correlationId: "plan-call", idempotencyKey: expect.stringContaining("plan-command"), owner: expect.objectContaining({ taskId: "root-1" }) })]))
+    expect(enabled.events).toEqual(expect.arrayContaining([expect.objectContaining({
+      type: "plan.command", payload: expect.objectContaining({ content: expect.objectContaining({ kind: "plan_control", localId: "finish", status: "completion_proposed", dependsOn: ["read"] }) }),
+    })]))
+  })
+
+  it("rejects canonical finals when completion evidence is missing or a dependency failed", async () => {
+    const missing = setup({ planningEnabled: true, planningExecutionEnabled: true })
+    await expect((await missing.runtime).execute({ lease, signal: new AbortController().signal })).resolves.toMatchObject({ status: "failed", summary: "final_unverified" })
+
+    const failed = setup({
+      planningEnabled: true, planningExecutionEnabled: true,
+      stateLoader: async () => ({ ...state(), snapshot: {
+        ...state().snapshot,
+        toolObservations: [
+          { id: "plan-result:plan:call:read", content: { kind: "plan_command", localId: "read", commandKind: "tool_call", dependsOn: [], status: "failed", errorCode: "denied" } },
+          { id: "plan-control:plan:call:finish", content: { kind: "plan_control", localId: "finish", status: "completion_proposed", dependsOn: ["read"], completionCriteria: ["finish"] } },
+        ],
+      } }),
+    })
+    await expect((await failed.runtime).execute({ lease, signal: new AbortController().signal })).resolves.toMatchObject({ status: "failed", summary: "final_unverified" })
   })
 
   it("keeps plan execution behind both server gates and passes server-owned context", async () => {

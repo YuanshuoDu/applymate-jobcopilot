@@ -94,6 +94,30 @@ function fixture(owner: TurnExecutionIdentity, toolResult?: TurnEngineToolResult
 }
 
 describe("owner-agnostic turn execution loop", () => {
+  it("requires a server-owned completion proposal with completed same-plan dependencies when enabled", async () => {
+    const root = fixture(identity("turn", "root-1"), undefined, undefined, [
+      { id: "plan-result:plan:call:read", content: { kind: "plan_command", localId: "read", commandKind: "tool_call", dependsOn: [], status: "completed", errorCode: null, output: { job: "job-1" } } },
+      { id: "plan-control:plan:call:finish", content: { kind: "plan_control", localId: "finish", status: "completion_proposed", dependsOn: ["read"], completionCriteria: ["finish"] } },
+    ])
+    const result = await runTurnExecutionLoop({ ...root.options, planCompletionRequired: true })
+    expect(result).toMatchObject({ status: "completed", stepCount: 2, toolCallCount: 1 })
+    expect(root.events.some(event => event.type === "final.rejected")).toBe(false)
+  })
+
+  it.each([
+    { label: "missing proposal", observations: [] },
+    { label: "failed dependency", observations: [
+      { id: "plan-result:plan:call:read", content: { kind: "plan_command", localId: "read", commandKind: "tool_call", dependsOn: [], status: "failed", errorCode: "denied" } },
+      { id: "plan-control:plan:call:finish", content: { kind: "plan_control", localId: "finish", status: "completion_proposed", dependsOn: ["read"], completionCriteria: ["finish"] } },
+    ] },
+  ])("rejects a final response for $label under the completion barrier", async ({ observations }) => {
+    const root = fixture(identity("turn", "root-1"), undefined, undefined, observations)
+    const result = await runTurnExecutionLoop({ ...root.options, planCompletionRequired: true })
+    expect(result).toMatchObject({ status: "failed", errorCode: "final_unverified" })
+    expect(root.events).toEqual(expect.arrayContaining([expect.objectContaining({ type: "final.rejected", payload: expect.objectContaining({ code: "final_unverified" }) })]))
+    expect(root.events.some(event => event.type === "turn.completed")).toBe(false)
+  })
+
   it("feeds a persisted tool observation into the next model step", async () => {
     const root = fixture(identity("turn", "root-1"))
     const result = await runTurnExecutionLoop(root.options)

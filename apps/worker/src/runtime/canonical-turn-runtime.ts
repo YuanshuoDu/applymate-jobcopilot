@@ -247,7 +247,9 @@ export async function createCanonicalTurnRuntime(pool: pg.Pool, options: Canonic
       budget: limits(state.budgetSnapshot), resume: state.resume, now, publishReasoningSummary: false,
       ...((options.contextSnapshotAdapter?.hook ?? options.contextCompaction) ? { contextCompaction: options.contextSnapshotAdapter?.hook ?? options.contextCompaction } : {}),
       ...((options.contextSnapshotAdapter?.loadSnapshot ?? options.contextCompactionLoadSnapshot) ? { contextCompactionLoadSnapshot: options.contextSnapshotAdapter?.loadSnapshot ?? options.contextCompactionLoadSnapshot } : {}),
-      ...(executePlan ? { executePlan } : {}), ...(recoveryDispatcher ? { recoveryDispatcher } : {}), ...(rootTasks.checkCompletion ? { completionGate: async () => rootTasks.checkCompletion!({ lease, rootTaskId: root.id, now: now() }) } : {}),
+      ...(executePlan ? { executePlan } : {}), ...(recoveryDispatcher ? { recoveryDispatcher } : {}),
+      planCompletionRequired: options.planningEnabled === true && options.planningExecutionEnabled === true,
+      ...(rootTasks.checkCompletion ? { completionGate: async () => rootTasks.checkCompletion!({ lease, rootTaskId: root.id, now: now() }) } : {}),
     })
     const result = await engine.run()
     await rootTasks.finish({ lease, rootTaskId: root.id, result, now: now() })

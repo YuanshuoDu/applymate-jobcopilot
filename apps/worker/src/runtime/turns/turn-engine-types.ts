@@ -179,6 +179,8 @@ export type TurnEngineOptions = {
   readonly executePlan?: TurnEnginePlanExecutionHook
   /** Runtime-owned replay repair seam; normal plan proposals never call it. */
   readonly recoveryDispatcher?: PlanRevisionRecoveryDispatcher
+  /** Server-owned barrier required only for the canonical planning execution path. */
+  readonly planCompletionRequired?: boolean
   readonly completionGate?: TurnEngineCompletionGate
   /** Optional server-owned context compaction hook; omitted preserves legacy behavior. */
   readonly contextCompaction?: ContextCompactionHook
