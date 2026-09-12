@@ -1508,3 +1508,22 @@ git diff --check
 **独立验证：** 根侧 canonical-plan-execution focused suite **40/40 passed**；shared build、Worker `tsc --noEmit --skipLibCheck` 与 `git diff --check` 均通过。
 
 **候选边界：** live DB/RLS、Redis/queue、provider、真实进程重启、browser 和 child-parent E2E 均未验证；本切片不能据此宣称完整 Harness、P4/Phase 完成或生产恢复证据。
+
+---
+
+## 34. P4-04 — Server-bound child evidence from read observations
+
+**Candidate status/date (2026-09-12):** P4-04 is recorded as a candidate server-bound child evidence slice; overall status remains **P0 accepted 1/8 (12.5%)**, unchanged by this slice.
+
+**Implementation:** Commit `df223d70` adds the pure `child-evidence` helper and wires it into `child-executor`.
+
+The child records only successful read observations with `status: completed` and `errorCode: null` from `jobs.search`, `jobs.get`, `persona.retrieve`, and `resume.get_base`.
+
+Server-owned canonical IDs use `read:<kind>:<ref>`; model evidence IDs and sources are rewritten from the observed records before the structured result is revalidated.
+
+- Unknown, null, fabricated, conflicting, duplicate, or oversized claims fail closed as `invalid_structured_result`. An empty structured result with no claims is allowed when the observed search is empty.
+- A missing structured marker preserves generic free-text behavior. This slice adds no DB, provider, queue, or external-write changes.
+
+**Independent verification:** Focused tests passed **32/32** (**7 child-evidence + 25 child-executor**); shared build, Worker `tsc --noEmit --skipLibCheck`, and `git diff --check` passed.
+
+**Candidate boundary:** Live DB/RLS, Redis/queue, provider, restart, browser, and child-parent E2E behavior remain unverified.
